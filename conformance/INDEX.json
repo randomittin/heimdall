@@ -1,0 +1,262 @@
+{
+  "_comment": "Heimdall parity-conformance inventory (P2). DEFINED, not yet CI-wired. A future CI step iterates `fixtures[]`, runs each `fixture_path`, and treats nonzero exit as a parity regression. `no_fixture[]` accounts for the remaining kept/renamed/improved PARITY.md rows so coverage of observable-behavior rows is 100%. Source: PARITY.md (74 items). Each fixture maps back to its PARITY row via the `# PARITY-ROW:` header in the file.",
+  "generated": "2026-06-13",
+  "parity_source": "PARITY.md",
+  "baseline_tag": "v1.1.0 (superx)",
+  "totals": {
+    "fixtures": 22,
+    "fixture_asserts": 159,
+    "no_fixture_rows": 14,
+    "findings": 2,
+    "skips": 2,
+    "note": "fixtures[] each map to a PARITY.md kept/renamed/improved row with observable behavior; no_fixture[] accounts for the remaining rows (model-gated, prose-only, net-new-without-baseline, or intentionally-dropped) so coverage is 100%."
+  },
+  "fixtures": [
+    {
+      "row": "audit: no live superx runtime refs (cross-cuts superx->heimdall rename across command/env/statusline/namespace)",
+      "class": "audits",
+      "fixture_path": "conformance/audits/no-superx-runtime.fixture.sh",
+      "asserts": 6,
+      "observable": true,
+      "finding": "hooks.json hardcodes /Users/rj/Downloads/superx as the CLAUDE_PLUGIN_ROOT fallback default in 10 places (inert when CLAUDE_PLUGIN_ROOT is set; stale otherwise)."
+    },
+    {
+      "row": "audit: agent roles resolve under the live namespace (Agents table + slash namespace /superx:*->/hmd:*)",
+      "class": "audits",
+      "fixture_path": "conformance/audits/agents-resolve.fixture.sh",
+      "asserts": 24,
+      "observable": true
+    },
+    {
+      "row": "audit: bench defaults to dry-run, zero token spend (Token-surface + net-new bench command)",
+      "class": "audits",
+      "fixture_path": "conformance/audits/bench-dryrun-default.fixture.sh",
+      "asserts": 7,
+      "observable": true
+    },
+    {
+      "row": "Command superx --help/-h (kept) -> heimdall --help/-h/help",
+      "class": "commands",
+      "fixture_path": "conformance/commands/help.fixture.sh",
+      "asserts": 10,
+      "observable": true
+    },
+    {
+      "row": "Command (none) -> improved(new) heimdall version/-v",
+      "class": "commands",
+      "fixture_path": "conformance/commands/version.fixture.sh",
+      "asserts": 6,
+      "observable": true
+    },
+    {
+      "row": "Command superx --uninstall (improved: guarded removal) -> heimdall --uninstall",
+      "class": "commands",
+      "fixture_path": "conformance/commands/uninstall-guarded.fixture.sh",
+      "asserts": 3,
+      "observable": true
+    },
+    {
+      "row": "Flag (none) -> improved(new) --no-autocommit / --autocommit (toggle)",
+      "class": "commands",
+      "fixture_path": "conformance/commands/autocommit-toggle.fixture.sh",
+      "asserts": 4,
+      "observable": true
+    },
+    {
+      "row": "Commands superx --update/--setup/--team/--auto/--resume (kept/improved) + flags --reinstall/--skip-checkpoint/--no-goal/--skills (improved-new) — routing+usage surface",
+      "class": "commands",
+      "fixture_path": "conformance/commands/flag-surface.fixture.sh",
+      "asserts": 19,
+      "observable": true,
+      "note": "Live paths exec claude/tmux/git-pull; asserts the routing + usage surface only (no model/side-effects), per P2 constraints."
+    },
+    {
+      "row": "Subcmd set on heimdall-state: init/get/set/add-conflict/check-quality-gates/mark-dirty/mark-clean/add-agent/add-tokens/set-budget/budget/migrate/status (kept, all 13) + binary rename superx-state->heimdall-state",
+      "class": "state",
+      "fixture_path": "conformance/state/subcommand-set.fixture.sh",
+      "asserts": 15,
+      "observable": true
+    },
+    {
+      "row": "File superx-state.json (renamed->heimdall-state.json, adopts legacy) + Env SUPERX_STATE_FILE (renamed->HEIMDALL_STATE_FILE, back-compat fallback)",
+      "class": "state",
+      "fixture_path": "conformance/state/legacy-backcompat.fixture.sh",
+      "asserts": 4,
+      "observable": true
+    },
+    {
+      "row": "Subcmd (none) -> improved(new) goal-set/goal-get/goal-clear + state .goal.condition",
+      "class": "state",
+      "fixture_path": "conformance/state/goal-subcommands.fixture.sh",
+      "asserts": 4,
+      "observable": true
+    },
+    {
+      "row": "Config state .budget.{total_tokens,token_limit} (kept) + Behavior token budget warn at 80% (improved bar) + add-tokens/set-budget/budget",
+      "class": "state",
+      "fixture_path": "conformance/state/budget.fixture.sh",
+      "asserts": 4,
+      "observable": true
+    },
+    {
+      "row": "Gates Tests pass / Lint clean / No dirty state (kept) via heimdall-state check-quality-gates (exit 0 pass / 2 block)",
+      "class": "gates",
+      "fixture_path": "conformance/gates/quality-gates.fixture.sh",
+      "asserts": 5,
+      "observable": true
+    },
+    {
+      "row": "Gate Conflict reflection (kept) + Command conflict-log add/list/unresolved/mark-reflected/reflect-all (improved env fallback)",
+      "class": "gates",
+      "fixture_path": "conformance/gates/conflict-reflection.fixture.sh",
+      "asserts": 4,
+      "observable": true
+    },
+    {
+      "row": "Gate Pre-push check-quality-gates (improved: stacked secret/selfscan/oracle/corpus) + Hook PreToolUse Bash on git push (renamed+improved)",
+      "class": "gates",
+      "fixture_path": "conformance/gates/prepush-composition.fixture.sh",
+      "asserts": 8,
+      "observable": true,
+      "note": "Static composition check of hooks/hooks.json; the hook is NOT executed (it would git-push) and NOT modified."
+    },
+    {
+      "row": "Hooks PostToolUse/SessionStart/SessionEnd (renamed+improved): heimdall-state calls + heimdall: commit prefixes + stack-pack/CHECKPOINT/summary-card/parallelism additions",
+      "class": "hooks",
+      "fixture_path": "conformance/hooks/lifecycle-rename.fixture.sh",
+      "asserts": 9,
+      "observable": true,
+      "note": "Static check of hooks/hooks.json; executing them would commit to the repo. Hooks NOT modified."
+    },
+    {
+      "row": "Statusline [SUPERX] prefix (renamed->[HEIMDALL]) + phase (kept) + improved token-bar/glyphs/goal/face + Config statusline.command (kept)",
+      "class": "statusline",
+      "fixture_path": "conformance/statusline/prefix-and-elements.fixture.sh",
+      "asserts": 5,
+      "observable": true
+    },
+    {
+      "row": "Config settings.json agent (renamed superx->heimdall) + env CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS (kept) + statusline.command (kept)",
+      "class": "config",
+      "fixture_path": "conformance/config/settings.fixture.sh",
+      "asserts": 5,
+      "observable": true
+    },
+    {
+      "row": "Command generate-changelog --since/--version/--append (kept, identical flags)",
+      "class": "files",
+      "fixture_path": "conformance/files/generate-changelog.fixture.sh",
+      "asserts": 8,
+      "observable": true,
+      "finding": "bin/generate-changelog uses `declare -A` (bash>=4); fails under macOS-default bash 3.2. Behavioral asserts run only if a bash>=4 is on PATH, else recorded as SKIP+finding."
+    },
+    {
+      "row": "Command detect-skills (kept) — scan installed skills to JSON",
+      "class": "files",
+      "fixture_path": "conformance/files/detect-skills.fixture.sh",
+      "asserts": 2,
+      "observable": true
+    },
+    {
+      "row": "Command authenticity-check npm/github/plugin (kept) — trust score 0-100",
+      "class": "files",
+      "fixture_path": "conformance/files/authenticity-check.fixture.sh",
+      "asserts": 4,
+      "observable": true,
+      "note": "Usage surface asserted offline; live scoring is a documented SKIP (depends on npm/GitHub network)."
+    },
+    {
+      "row": "Config .planning/detected-stack.json (improved/new) written by SessionStart stack-pack detect",
+      "class": "files",
+      "fixture_path": "conformance/files/detected-stack.fixture.sh",
+      "asserts": 3,
+      "observable": true
+    }
+  ],
+  "no_fixture": [
+    {
+      "row": "Command `superx`/`heimdall` run task end-to-end (renamed) + interactive `--agent heimdall` (renamed)",
+      "class": "commands",
+      "observable": false,
+      "rationale": "model-invocation: the end-to-end and interactive forms exec `claude` and require running the model. The rename surface (binary name, --agent heimdall) is covered statically by audits/agents-resolve + commands/flag-surface. The run itself is out of P2 scope (no-model rule)."
+    },
+    {
+      "row": "Command superx --dashboard (intentionally dropped)",
+      "class": "commands",
+      "observable": false,
+      "rationale": "dropped: flag removed; nothing to assert beyond absence. Absence of a web UI is implied by no python server (see Findings); not a kept/renamed/improved row."
+    },
+    {
+      "row": "Flag --dangerously-skip-permissions default (kept) + --auto (kept)",
+      "class": "flags",
+      "observable": false,
+      "rationale": "behavior-only: these set a PERMISSION_FLAG passed to the `claude` launch; observing the effect requires launching the model. The flag's presence/routing is covered by commands/flag-surface (--auto) and is a launch-time argument otherwise."
+    },
+    {
+      "row": "Agents fixer.md / seeker.md (improved-new)",
+      "class": "agents",
+      "observable": false,
+      "rationale": "net-new, prose-only: agent role definitions are markdown specs consumed by the model; their behavior is only observable by invoking the model. Presence + name resolution is covered by audits/agents-resolve (all agents/*.md enumerated)."
+    },
+    {
+      "row": "Gates secret-scan / heimdall-selfscan / oracle-falsify / corpus / bloat-gate / parallel-gate (improved-new)",
+      "class": "gates",
+      "observable": false,
+      "rationale": "net-new with NO superx baseline to meet-or-beat: these are out of strict parity scope (PARITY.md marks them NET-NEW). Their WIRING into the pre-push chain IS asserted by gates/prepush-composition. Standalone behavioral fixtures for the new gates belong to a separate (non-parity) conformance track."
+    },
+    {
+      "row": "Hooks UserPromptSubmit parallel-gate / PreToolUse parallelism-tracker / PostToolUse corpus-capture / git pre-push (improved-new)",
+      "class": "hooks",
+      "observable": false,
+      "rationale": "net-new, no superx baseline: not parity rows. Their presence in hooks.json is incidentally visible to the lifecycle/prepush static checks; dedicated behavioral coverage is a non-parity track."
+    },
+    {
+      "row": "Env COLORTERM/TERM truecolor detection (kept) + CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS (kept)",
+      "class": "env",
+      "observable": false,
+      "rationale": "agent-teams env is asserted by config/settings. COLORTERM/TERM only change ANSI color codes in banners/statusline — a cosmetic branch with no behavioral contract to meet-or-beat; statusline single-line render is already asserted."
+    },
+    {
+      "row": "Config state .agent_history (kept add-agent) / .conflict_log (kept) / .quality_gates flags (kept)",
+      "class": "config",
+      "observable": false,
+      "rationale": "covered transitively: .quality_gates by gates/quality-gates, .conflict_log by gates/conflict-reflection, add-agent by state/subcommand-set (subcommand present). No separate fixture needed."
+    },
+    {
+      "row": "Lib bin/lib/dispatch.sh (kept) / bin/lib/planning.sh (kept)",
+      "class": "state",
+      "observable": false,
+      "rationale": "internal libraries sourced by other bins; no standalone CLI/exit contract. Their effects (queue.jsonl, .planning state) surface through the orchestrator run, which is model-gated and out of P2 scope."
+    },
+    {
+      "row": "Files .planning/STATE.md / PROJECT.md / REQUIREMENTS.md / CONTEXT.md / PLAN-*/SUMMARY-* / dispatch/queue.jsonl (kept) / evals/evals.json (renamed+improved) / .setup-done marker (kept)",
+      "class": "files",
+      "observable": false,
+      "rationale": "these artifacts are WRITTEN by a live orchestrator/planner run (model-gated) or at install time. No deterministic, model-free producer to drive in a fixture. detected-stack.json is the one such artifact with a model-free producer (stack-pack), and IS fixtured."
+    },
+    {
+      "row": "Slash commands /hmd:level/status/maintain/maintain-check/reflect (renamed) + net-new save/autocommit/bench/debloat/demo/designmatch/report-bug",
+      "class": "slash",
+      "observable": false,
+      "rationale": "slash commands are markdown specs the model executes; behavior is model-gated. Their namespace resolution (frontmatter name -> /hmd:<name>) IS asserted statically by audits/agents-resolve."
+    },
+    {
+      "row": "Documented behaviors: hybrid planning / wave parallelism / question-mark protocol / model routing / continuation / acceptance-criteria gates / autonomy levels / maintainer mode / companion auto-install / project-memory CLAUDE.md / recovery",
+      "class": "behavior",
+      "observable": false,
+      "rationale": "prose/model behaviors carried in agent+preamble text; only observable by running the model. The acceptance-criteria GATE mechanism is covered by gates/quality-gates; autonomy-level + maintainer command resolution by audits/agents-resolve; the rest are model-inference behaviors out of P2 scope."
+    },
+    {
+      "row": "Token surface: caveman auto-install / CAVEMAN preamble / CLAUDE.md token section / terse preamble / claude-mem / fresh-context-per-wave / banner claim",
+      "class": "token",
+      "observable": false,
+      "rationale": "preamble/marketing text + companion-plugin install (network) + model-context behaviors. The bench zero-spend design law (the one mechanically checkable token-hygiene claim) IS fixtured by audits/bench-dryrun-default."
+    },
+    {
+      "row": "Intentionally-dropped rows: --dashboard / SUPERX_PORT / CLAUDE_CODE_NO_FLICKER / superx-ui / superx-github.json / pixel web dashboard / GitHub one-click push",
+      "class": "dropped",
+      "observable": false,
+      "rationale": "out of scope: these are `intentionally dropped` or `findings`, not kept/renamed/improved rows. P2 targets kept/renamed/improved-with-observable rows; drops are listed here for 100% accounting only."
+    }
+  ]
+}
