@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # generate-changelog — Auto-generate changelog entries from git commits
 # Groups commits by conventional commit type and formats as Keep a Changelog.
+#
+# bash-3.2-safe: macOS ships bash 3.2.57, which lacks associative arrays.
+# We use a fixed list of known types plus parallel indexed arrays for
+# accumulation and labels, and a small index lookup helper.
 set -euo pipefail
 
 usage() {
@@ -42,31 +46,33 @@ fi
 
 DATE=$(date +%Y-%m-%d)
 
-# Collect commits grouped by type
-declare -A GROUPS
-GROUPS=(
-  [feat]=""
-  [fix]=""
-  [docs]=""
-  [refactor]=""
-  [test]=""
-  [chore]=""
-  [perf]=""
-  [other]=""
-)
+# --- Known conventional commit types (bash-3.2-safe, no associative arrays) ---
+# TYPES and TYPE_LABELS are parallel indexed arrays: TYPE_LABELS[i] is the
+# Keep-a-Changelog section heading for TYPES[i]. BUCKETS[i] accumulates entries.
+TYPES=(      feat    fix     docs            refactor  test    chore         perf          other  )
+TYPE_LABELS=( Added  Fixed   Documentation   Changed   Tests   Maintenance   Performance   Other  )
+BUCKETS=(     ""      ""      ""              ""        ""      ""            ""            ""     )
 
-TYPE_LABELS=(
-  [feat]="Added"
-  [fix]="Fixed"
-  [docs]="Documentation"
-  [refactor]="Changed"
-  [test]="Tests"
-  [chore]="Maintenance"
-  [perf]="Performance"
-  [other]="Other"
-)
+# type_index <type> — echo the index of <type> in TYPES, or fail if unknown.
+type_index() {
+  local want="$1" i=0
+  while [ $i -lt ${#TYPES[@]} ]; do
+    if [ "${TYPES[$i]}" = "$want" ]; then
+      echo "$i"
+      return 0
+    fi
+    i=$((i + 1))
+  done
+  return 1
+}
 
-while IFS= read -r line; do
+# Index of the "other" bucket (computed, not hardcoded).
+OTHER_IDX=$(type_index other)
+
+# `|| [ -n "$line" ]` keeps the final line: git --pretty=format: emits no
+# trailing newline, so the last `read` returns non-zero with $line still set.
+line=""
+while IFS= read -r line || [ -n "$line" ]; do
   # Extract conventional commit type
   if [[ "$line" =~ ^([a-z]+)(\(.+\))?:\ (.+) ]]; then
     type="${BASH_REMATCH[1]}"
@@ -79,38 +85,46 @@ while IFS= read -r line; do
     entry="- ${msg}"
     [ -n "$scope" ] && entry="- **${scope}**: ${msg}"
 
-    if [ -n "${GROUPS[$type]+x}" ]; then
-      GROUPS[$type]+="${entry}"$'\n'
+    if idx=$(type_index "$type"); then
+      BUCKETS[$idx]="${BUCKETS[$idx]}${entry}"$'\n'
     else
-      GROUPS[other]+="${entry}"$'\n'
+      BUCKETS[$OTHER_IDX]="${BUCKETS[$OTHER_IDX]}${entry}"$'\n'
     fi
   else
     # Non-conventional commit
-    [ -n "$line" ] && GROUPS[other]+="- ${line}"$'\n'
+    [ -n "$line" ] && BUCKETS[$OTHER_IDX]="${BUCKETS[$OTHER_IDX]}- ${line}"$'\n'
   fi
 done < <(git log "${SINCE}..HEAD" --pretty=format:"%s" --no-merges 2>/dev/null)
 
 # Build output
 OUTPUT=""
-OUTPUT+="## [${VERSION}] - ${DATE}"$'\n'$'\n'
+OUTPUT="${OUTPUT}## [${VERSION}] - ${DATE}"$'\n'$'\n'
 
+# Section order (matches original): feat fix refactor perf docs test chore other
 for type in feat fix refactor perf docs test chore other; do
-  if [ -n "${GROUPS[$type]}" ]; then
-    OUTPUT+="### ${TYPE_LABELS[$type]}"$'\n'
-    OUTPUT+="${GROUPS[$type]}"$'\n'
+  idx=$(type_index "$type")
+  if [ -n "${BUCKETS[$idx]}" ]; then
+    OUTPUT="${OUTPUT}### ${TYPE_LABELS[$idx]}"$'\n'
+    OUTPUT="${OUTPUT}${BUCKETS[$idx]}"$'\n'
   fi
 done
 
 if [ "$APPEND" = true ] && [ -f "CHANGELOG.md" ]; then
-  # Insert after the first "# Changelog" header line
+  # Insert the new entry just before the first existing "## [" version
+  # heading. The entry is passed via a file (not awk -v) because the macOS
+  # BSD awk rejects newlines inside a -v assignment.
   tmp=$(mktemp)
-  awk -v entry="$OUTPUT" '
+  entryfile=$(mktemp)
+  printf '%s' "$OUTPUT" > "$entryfile"
+  awk -v entryfile="$entryfile" '
     /^## \[/ && !inserted {
-      print entry
+      while ((getline eline < entryfile) > 0) print eline
+      close(entryfile)
       inserted = 1
     }
     { print }
   ' CHANGELOG.md > "$tmp" && mv "$tmp" CHANGELOG.md
+  rm -f "$entryfile"
   echo "Appended ${VERSION} entry to CHANGELOG.md"
 else
   echo "$OUTPUT"
