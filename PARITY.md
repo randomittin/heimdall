@@ -28,12 +28,14 @@ The heimdall surface is therefore "main" not "a tag". This is expected, not a de
 
 | Status | Count |
 |---|---|
-| kept | 21 |
+| kept | 22 |
 | renamed | 25 |
 | improved | 19 |
 | intentionally dropped | 6 |
-| findings (unclassifiable) | 3 |
+| findings (unclassifiable) | 2 |
 | **total items** | **74** |
+
+> Update 2026-06-13: finding #3 (`CLAUDE_CODE_NO_FLICKER`) was a P1 extraction error — the export IS present (`bin/heimdall:211`). Reclassified `kept` (21→22); findings 3→2. Findings #4/#5 fixed on branch `fix/parity-findings` (held off main until RJ's current-state push). #1 (no post-rename tag) resolves as v2.0.0 at tag time; #2 (dashboard sub-feature parity) deferred to RJ post-re-test.
 
 (Plus: heimdall adds a large NEW surface — oracle gates, corpus, falsify, secret-scan,
 selfscan, bloat-gate, parallel-gate, blackboard/ledger, watchman renderers, designmatch,
@@ -129,7 +131,7 @@ Notes. They are why the heimdall tree is ~5x the v1.1.0 tree.)
 | Env | `SUPERX_PORT` | dashboard port (default 8080) | intentionally dropped (web dashboard removed) | not read | no python web server in heimdall |
 | Env | `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` | set in theme + settings.json | kept | kept | `settings.json`, `bin/heimdall` |
 | Env | `COLORTERM` / `TERM` | truecolor detection for banner/statusline | kept | kept | `bin/heimdall`, `hooks/statusline.sh` |
-| Env | `CLAUDE_CODE_NO_FLICKER=1` | flicker-free render | intentionally dropped (not set in heimdall theme) | not set | `apply_heimdall_theme` does not export it; minor; see Findings |
+| Env | `CLAUDE_CODE_NO_FLICKER=1` | flicker-free render | kept | exported by `apply_heimdall_theme` (`bin/heimdall:211`) | P1 extraction error corrected — see Findings #3 (RESOLVED) |
 | Env | (none) | — | improved (new) | `CLAUDE_PLUGIN_ROOT` (hook self-location), `ANTHROPIC_API_KEY`, `MODEL_FLAG`/`MODEL_NAME`, `GOAL_CONDITION`/`GOAL_PROMPT`, `USE_GOAL`, `SKIP_CHECKPOINT`, `SECRET_SCAN_REQUIRE` | net-new `bin/heimdall`, `hooks/hooks.json`, `bin/secret-scan` |
 
 ## Config keys (settings.json + state json)
@@ -253,7 +255,9 @@ Notes. They are why the heimdall tree is ~5x the v1.1.0 tree.)
    dropped, may be partially covered by the TUI. Ambiguous: per-sub-feature parity of
    the dashboard.
 
-3. **`CLAUDE_CODE_NO_FLICKER=1` not set by heimdall theme.** superx `apply_superx_theme`
-   exported it; heimdall's `apply_heimdall_theme` does not appear to. Could be an
-   intentional drop (Claude Code default changed) or an accidental omission during the
-   rename. Ambiguous: intent unknown — flagged rather than assumed dropped.
+3. ~~**`CLAUDE_CODE_NO_FLICKER=1` not set by heimdall theme.**~~ **RESOLVED — extraction
+   error, NOT a regression.** Re-verification (git blame `bin/heimdall:211`) shows
+   `apply_heimdall_theme` DOES export `CLAUDE_CODE_NO_FLICKER=1`, at the same 3rd-export
+   position as the superx baseline; carried through the rename (commit 13c19d6a → b37a5bc),
+   never dropped. P1 missed line 211. Status is therefore `kept`, not a finding. Row 132
+   above is stale — correct it to `kept`.
