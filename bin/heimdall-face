@@ -144,7 +144,7 @@ def make_palette(no_color):
         "idle":       "\033[36m",    # cyan iris band
         "thinking":   "\033[97m",    # white — scanning
         "suspicious": "\033[36m",    # cyan (skeptical, still watching)
-        "passed":     "\033[33m",    # gold sparkle
+        "passed":     "\033[38;2;255;200;80m",    # gold sparkle (install-UX gold, NOT yellow 33)
         "red":        "\033[91m",    # hard red — denial (face.md exact code)
         "sleep":      "\033[90m",    # dim — long idle
         "dim":        "\033[90m",
