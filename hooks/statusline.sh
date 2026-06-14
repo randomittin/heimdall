@@ -1,11 +1,57 @@
 #!/usr/bin/env bash
 # statusline.sh — heimdall HUD for Claude Code's status bar
 # Outputs a SINGLE line: [HEIMDALL] phase | tasks | dispatch | goal | token-bar | gates
+#   …with the live watchman eye-pair (bin/heimdall-face --eyes) prepended.
 # Called by Claude Code via settings.json statusline config.
 # Hard rules: never error, never block the status bar, degrade gracefully if
 # jq/python3 absent. All rendering is shell-side — zero model involvement.
+#
+# Project dir resolution (so the watchman + HUD react to the LIVE session):
+#   1. an explicit "$1" arg (the conformance harness drives an isolated project),
+#   2. else the cwd Claude Code pipes in its statusLine stdin JSON (.cwd /
+#      .workspace.current_dir) — this is how the live session reaches the renderer,
+#   3. else ".". stdin is consumed ONLY when no arg was given, and tolerantly: any
+#      parse/field miss falls through to "." — the status bar must never error.
 
-PROJECT="${1:-.}"
+resolve_project_from_stdin() {
+  # Echoes a project dir parsed from Claude Code's statusLine stdin JSON, or "."
+  # Reads stdin only when it is not a tty (Claude Code pipes the blob); tolerant of
+  # empty / non-JSON / missing fields. Prefers python3, falls back to jq, else ".".
+  [ -t 0 ] && { echo "."; return; }
+  local blob dir=""
+  blob="$(cat 2>/dev/null)"
+  [ -n "$blob" ] || { echo "."; return; }
+  if command -v python3 >/dev/null 2>&1; then
+    dir="$(printf '%s' "$blob" | python3 -c '
+import json, os, sys
+try:
+    b = json.load(sys.stdin)
+except Exception:
+    print("."); sys.exit(0)
+if not isinstance(b, dict):
+    print("."); sys.exit(0)
+cands = [b.get("cwd"), b.get("project_dir")]
+ws = b.get("workspace")
+if isinstance(ws, dict):
+    cands += [ws.get("current_dir"), ws.get("project_dir")]
+for c in cands:
+    if isinstance(c, str) and c and os.path.isdir(c):
+        print(c); sys.exit(0)
+print(".")
+' 2>/dev/null)"
+  elif command -v jq >/dev/null 2>&1; then
+    dir="$(printf '%s' "$blob" | jq -r '
+      (.cwd // .workspace.current_dir // .project_dir // .workspace.project_dir // ".")
+    ' 2>/dev/null)"
+  fi
+  if [ -n "$dir" ] && [ -d "$dir" ]; then echo "$dir"; else echo "."; fi
+}
+
+if [ -n "${1:-}" ]; then
+  PROJECT="$1"
+else
+  PROJECT="$(resolve_project_from_stdin)"
+fi
 PLANNING="$PROJECT/.planning"
 STATE_JSON="$PROJECT/heimdall-state.json"
 

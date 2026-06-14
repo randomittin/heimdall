@@ -128,6 +128,74 @@ def main(argv):
                 "BANNER WIDTH MISMATCH (%s): rows have widths %r — must be equal"
                 % (label, [face.display_width(r) for r in rows]))
 
+    # ── Assertion 8: the statusline 1-line watchman is wcwidth-aligned ──
+    # The Claude Code statusLine renders compact_line / eyes_cluster. The eye glyphs
+    # are width-risky (the sparkle ✦ and pupil ● differ in BYTES from the plain ▄),
+    # so the line must be measured by display width, never byte length. Assert that
+    # the bracketed eye-cluster has an IDENTICAL display width across all six emotions
+    # — otherwise the statusline jitters horizontally each time live state changes.
+    cluster_widths = {}
+    for emo in face.EMOTIONS:
+        cluster = face.eyes_cluster(emo, pal_plain)        # plain → no ANSI to strip
+        cluster_widths[emo] = face.display_width(cluster)
+    distinct_cluster_w = sorted(set(cluster_widths.values()))
+    if len(distinct_cluster_w) != 1:
+        failures.append(
+            "STATUSLINE EYE-CLUSTER WIDTH MISMATCH: widths %r — the eye-pair must be "
+            "equal display-width across all emotions so the statusline never shifts"
+            % cluster_widths)
+    # And prove display width is NOT the same as byte length for a width-risky frame
+    # (the sparkle pupil): if it were, the wcwidth measurement would be doing nothing.
+    sparkle = face.eyes_cluster("passed", pal_plain)
+    if face.display_width(sparkle) == len(sparkle.encode("utf-8")):
+        failures.append(
+            "statusline wcwidth check is vacuous: display_width == utf-8 byte length "
+            "for the sparkle eye-cluster (%r) — the measurement is not exercising "
+            "multibyte glyphs" % sparkle)
+
+    # ── Assertion 9: statusline emotion tracks heimdall-state.json, not randomness ──
+    # The watchman must change ONLY when real quality-gate state changes. Drive the
+    # heimdall-state.json signal mapper across the documented gate states and assert
+    # each maps to the prescribed emotion (failing→red, working→thinking, green→passed,
+    # no signal→"" so the caller degrades to idle). Same input → same output, always.
+    import json as _json
+    import tempfile as _tempfile
+    import shutil as _shutil
+    state_cases = [
+        ({"quality_gates": {"tests_passing": False, "lint_clean": True}}, "red"),
+        ({"quality_gates": {"tests_passing": True, "lint_clean": False}}, "red"),
+        ({"quality_gates": {"tests_passing": True, "lint_clean": True,
+                            "dirty": True}}, "thinking"),
+        ({"quality_gates": {"tests_passing": True, "lint_clean": True,
+                            "dirty": False}}, "passed"),
+        ({"quality_gates": {}}, ""),
+        ({}, ""),
+    ]
+    _tmp = _tempfile.mkdtemp(prefix="heimdall-face-test-")
+    try:
+        for payload, want in state_cases:
+            with open(os.path.join(_tmp, "heimdall-state.json"), "w",
+                      encoding="utf-8") as fh:
+                _json.dump(payload, fh)
+            got = face._state_json_signal(_tmp)
+            if got != want:
+                failures.append(
+                    "state.json signal: payload %r -> %r, want %r"
+                    % (payload, got, want))
+        # No state file at all -> empty signal (degrade to idle), never an error.
+        os.remove(os.path.join(_tmp, "heimdall-state.json"))
+        if face._state_json_signal(_tmp) != "":
+            failures.append("missing heimdall-state.json must yield empty signal")
+        # Determinism: same input twice -> same output (not random/cycling).
+        with open(os.path.join(_tmp, "heimdall-state.json"), "w",
+                  encoding="utf-8") as fh:
+            _json.dump({"quality_gates": {"tests_passing": False}}, fh)
+        if face._state_json_signal(_tmp) != face._state_json_signal(_tmp):
+            failures.append("state.json signal is non-deterministic (changed between "
+                            "two reads of identical state)")
+    finally:
+        _shutil.rmtree(_tmp, ignore_errors=True)
+
     # ── Print the stacked frames (the screenshot artifact) ──
     if not quiet:
         sys.stdout.write("heimdall-face — six emotion frames (plain, equal-width)\n\n")

@@ -19,6 +19,11 @@ THE ONE THING MEASURED, NOT TYPED (heimdall-face.md wcwidth note):
 Usage:
   heimdall-face                      1-line statusline form from current STATE (default)
   heimdall-face --line               same (explicit)
+  heimdall-face --statusline         Claude Code statusLine entrypoint: read the JSON
+                                     blob Claude Code pipes on stdin (session cwd etc.),
+                                     resolve heimdall state in that cwd, emit the 1-line
+                                     watchman (color forced — Claude Code captures
+                                     stdout). Missing/blank stdin → cwd, never errors.
   heimdall-face --eyes               just the bracketed eye-pair cluster from STATE
                                      (what the statusline prepends to its HUD)
   heimdall-face --frame <emotion>    render one 3-line frame (idle|watching|thinking|
@@ -208,6 +213,44 @@ def _gate_state(project, planning):
     return state
 
 
+def _state_json_signal(project):
+    """Emotion from heimdall-state.json quality gates, or "" when absent/unreadable.
+
+    heimdall-state.json is the live session state the rest of heimdall writes
+    (hooks/statusline.sh reads the same quality_gates block). The watchman reacts to
+    it so the eyes change ONLY when real gate state changes — never randomly. Mapping
+    (heimdall-face.md §State→emotion, quality-gate projection):
+      tests failing / lint dirty  → red        (a gate is broken — alert)
+      uncommitted work (dirty)    → thinking    (actively working — focused/scanning)
+      tests pass + lint clean     → passed      (gates green — the approve beat)
+      no signal                   → ""          (caller falls back to STATE.md/idle)
+    Tolerant of every missing field; never raises, never blocks the statusline."""
+    import json
+    for name in ("heimdall-state.json", "superx-state.json"):
+        path = os.path.join(project, name)
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        gates = data.get("quality_gates") or {}
+        if not isinstance(gates, dict):
+            gates = {}
+        tests = gates.get("tests_passing")
+        lint = gates.get("lint_clean")
+        dirty = gates.get("dirty")
+        if tests is False or lint is False:
+            return "red"
+        if dirty is True:
+            return "thinking"
+        if tests is True and lint is True:
+            return "passed"
+        return ""
+    return ""
+
+
 def detect_emotion(project):
     """Resolve (emotion, wave_str) from deterministic state files.
 
@@ -218,6 +261,11 @@ def detect_emotion(project):
       planning / wave executing → thinking
       no active run             → idle
       long idle                 → sleep
+
+    heimdall-state.json quality gates are a secondary live signal: STATE.md phase /
+    spawn-gate state wins when it carries an active verdict; when STATE.md is idle or
+    absent the quality_gates block (tests/lint/dirty) drives the emotion so the eyes
+    react to the live session — failing → red, working → thinking, green → passed.
     """
     planning = os.path.join(project, ".planning")
     text = _read_state_text(planning)
@@ -238,6 +286,12 @@ def detect_emotion(project):
         return "passed", wave
     if has("plan", "planning", "wave", "build", "exec", "executing", "arc", "run"):
         return "thinking", wave
+
+    # STATE.md has no active verdict → let heimdall-state.json quality gates speak.
+    json_emotion = _state_json_signal(project)
+    if json_emotion:
+        return json_emotion, wave
+
     if phase in ("", "idle", "init", "done"):
         if phase in ("", "idle") and _is_long_idle(planning):
             return "sleep", wave
@@ -425,6 +479,48 @@ def render_all(pal):
     return "\n\n".join(blocks)
 
 
+# ── Claude Code statusLine entrypoint ────────────────────────────────────────
+# Claude Code invokes a statusLine command and pipes a JSON session blob to its
+# stdin on each render (cwd, model, workspace, …). The command prints ONE line to
+# stdout = the status line. We read that blob, pull the session cwd (so the watchman
+# reacts to the state of the project the user is actually in), and emit the 1-line
+# face. The blob is advisory: any field may be missing, so every lookup is tolerant
+# and we degrade to the process cwd. A statusline must NEVER error or print blank.
+def _project_from_statusline_stdin():
+    """Resolve the project dir from Claude Code's statusLine stdin JSON.
+
+    Reads stdin if it is not a tty, parses JSON tolerantly, and returns the first of
+    several known cwd fields that points at an existing directory. Falls back to the
+    process cwd (".") when stdin is empty, not JSON, or carries no usable path."""
+    import json
+    raw = ""
+    try:
+        if not sys.stdin.isatty():
+            raw = sys.stdin.read()
+    except (OSError, ValueError):
+        raw = ""
+    if not raw or not raw.strip():
+        return "."
+    try:
+        blob = json.loads(raw)
+    except ValueError:
+        return "."
+    if not isinstance(blob, dict):
+        return "."
+
+    # Claude Code has used both a flat `cwd` and a nested `workspace.current_dir`
+    # across versions; accept every documented shape and ignore anything missing.
+    candidates = [blob.get("cwd"), blob.get("project_dir")]
+    ws = blob.get("workspace")
+    if isinstance(ws, dict):
+        candidates.append(ws.get("current_dir"))
+        candidates.append(ws.get("project_dir"))
+    for cand in candidates:
+        if isinstance(cand, str) and cand and os.path.isdir(cand):
+            return cand
+    return "."
+
+
 # ── CLI ──────────────────────────────────────────────────────────────────────
 def want_color(force_no_color, force_color):
     if force_no_color:
@@ -455,6 +551,8 @@ def main(argv):
             return 0
         elif a == "--line":
             mode = "line"
+        elif a == "--statusline":
+            mode = "statusline"
         elif a == "--eyes":
             mode = "eyes"
         elif a == "--all":
@@ -479,6 +577,14 @@ def main(argv):
             project = a
         i += 1
 
+    # The statusLine surface is colored even though Claude Code captures (pipes) our
+    # stdout, so force color on unless the caller explicitly disabled it or NO_COLOR
+    # / TERM=dumb is set. Resolve the project dir from the piped session JSON.
+    if mode == "statusline":
+        if not force_no_color:
+            force_color = True
+        project = _project_from_statusline_stdin()
+
     color_on = want_color(force_no_color, force_color)
     pal = make_palette(not color_on)
 
@@ -501,7 +607,9 @@ def main(argv):
         sys.stdout.write(render_frame(canon, pal) + "\n")
         return 0
 
-    # mode in (line, eyes): resolve emotion from STATE, emit the form
+    # mode in (line, statusline, eyes): resolve emotion from STATE, emit the form.
+    # `statusline` emits the same compact 1-line watchman as `line` — its only extra
+    # job is reading the session cwd from stdin (done above) and forcing color.
     emotion, wave = detect_emotion(project)
     if mode == "eyes":
         sys.stdout.write(eyes_cluster(emotion, pal) + "\n")

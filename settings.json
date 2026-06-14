@@ -4,6 +4,7 @@
     "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"
   },
   "statusline": {
-    "command": "bash $PLUGIN_DIR/hooks/statusline.sh ."
+    "type": "command",
+    "command": "bash -c 'PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-${PLUGIN_DIR:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}}\"; exec bash \"$PLUGIN/hooks/statusline.sh\"'"
   }
 }
