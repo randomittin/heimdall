@@ -3,7 +3,7 @@
   "env": {
     "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"
   },
-  "statusline": {
+  "statusLine": {
     "type": "command",
     "command": "bash -c 'P=\"${CLAUDE_PLUGIN_ROOT:-$PLUGIN_DIR}\"; [ -n \"$P\" ] && [ -x \"$P/hooks/statusline.sh\" ] && exec bash \"$P/hooks/statusline.sh\"; exit 0'"
   }
