@@ -24,6 +24,10 @@ Usage:
   heimdall-face --frame <emotion>    render one 3-line frame (idle|watching|thinking|
                                      suspicious|passed|gate-passed|red|denial|blink|sleep)
   heimdall-face --all                stack all six 3-line frames (for the test harness)
+  heimdall-face --banner             the launch banner: idle eyes + H E I M D A L L
+                                     wordmark + tagline (install.sh §A3 / bin/heimdall
+                                     startup). Color on → eyes; --no-color/non-TTY →
+                                     wordmark + tagline only. One renderer, reused.
   heimdall-face [DIR]                project dir holding .planning/ (default: .)
   --no-color                         disable ANSI (also auto-disabled when NO_COLOR set,
                                      stdout is not a tty, or TERM=dumb)
@@ -343,6 +347,71 @@ def render_frame(emotion, pal, equalize_width=None):
     return "\n".join(out)
 
 
+# ── The launch banner (A3: idle watchman + wordmark + tagline) ────────────────
+# The everyday launch banner and the install banner are the SAME composition:
+# the idle watchman frame (frame_lines("idle")) floats free — never boxed — beside
+# the wordmark and tagline. It is built here, through the wcwidth padder, so every
+# emitter (bin/heimdall, install.sh, demo) reuses one renderer instead of pasting
+# art. heimdall-install-ux.md §A3 / §Part D "reuse, don't rebuild".
+WORDMARK = "H E I M D A L L"
+TAGLINE = "Nothing ships unproven."
+_BANNER_GAP = "      "  # 6-column gutter between the eyes and the wordmark column
+
+
+def banner_lines(plain=False):
+    """The launch banner rows (no color), each padded to one common display width.
+
+    plain=True → the degraded form (wordmark + tagline only, no eye art) for non-TTY
+    / NO_COLOR surfaces. plain=False → the three idle eye rows with the wordmark on
+    row 1 and the tagline on row 2, every row equalized to the same display width via
+    the wcwidth padder (pad_to) so the eyes and the text never drift apart."""
+    if plain:
+        rows = [WORDMARK, TAGLINE]
+        target = max(display_width(r) for r in rows)
+        return [pad_to(r, target, " ") for r in rows]
+
+    eyes = frame_lines("idle")                     # reuse the idle frame art
+    eye_w = max(display_width(r) for r in eyes)
+    right = ["", WORDMARK, TAGLINE]                # right column, one entry per eye row
+    target = eye_w + display_width(_BANNER_GAP) + max(display_width(r) for r in right)
+    out = []
+    for eye_row, text in zip(eyes, right):
+        line = pad_to(eye_row, eye_w, " ") + _BANNER_GAP + text
+        out.append(pad_to(line, target, " "))
+    return out
+
+
+def render_banner(pal, plain=False):
+    """The launch banner, colored per A3 (dim shade rows, cyan iris row, white
+    wordmark, gold tagline), equal display-width per line. plain skips the eyes."""
+    if plain:
+        rows = banner_lines(plain=True)
+        return "\n".join([
+            "%s%s%s" % (pal["thinking"], rows[0], pal["reset"]),  # white wordmark
+            "%s%s%s" % (pal["passed"], rows[1], pal["reset"]),    # gold tagline
+        ])
+
+    eyes = frame_lines("idle")
+    eye_w = max(display_width(r) for r in eyes)
+    rows = banner_lines(plain=False)
+    iris = pal["idle"]      # cyan iris band (middle row)
+    dim = pal["dim"]        # dim shade rows (top / bottom)
+    white = pal["thinking"]  # white wordmark
+    gold = pal["passed"]    # gold tagline
+    rst = pal["reset"]
+    out = []
+    for idx, (eye_row, full) in enumerate(zip(eyes, rows)):
+        # Split the equalized line back into eye half + right half so each half can
+        # carry its own color without disturbing the measured width.
+        eye_padded = pad_to(eye_row, eye_w, " ")
+        right = full[len(eye_padded):]
+        eye_col = iris if idx == 1 else dim
+        text_col = white if idx == 1 else (gold if idx == 2 else dim)
+        out.append("%s%s%s%s%s%s" % (
+            eye_col, eye_padded, rst, text_col, right, rst))
+    return "\n".join(out)
+
+
 def render_all(pal):
     """All six frames stacked, each labelled. Every frame padded to one common
     width so the equal-width acceptance test sees a uniform block."""
@@ -390,6 +459,8 @@ def main(argv):
             mode = "eyes"
         elif a == "--all":
             mode = "all"
+        elif a == "--banner":
+            mode = "banner"
         elif a == "--frame":
             mode = "frame"
             if i + 1 >= len(argv):
@@ -408,10 +479,16 @@ def main(argv):
             project = a
         i += 1
 
-    pal = make_palette(not want_color(force_no_color, force_color))
+    color_on = want_color(force_no_color, force_color)
+    pal = make_palette(not color_on)
 
     if mode == "all":
         sys.stdout.write(render_all(pal) + "\n")
+        return 0
+
+    if mode == "banner":
+        # Plain (no-color / non-TTY) → wordmark + tagline only; fancy → eyes too.
+        sys.stdout.write(render_banner(pal, plain=not color_on) + "\n")
         return 0
 
     if mode == "frame":

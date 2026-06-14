@@ -111,6 +111,23 @@ def main(argv):
     if red_mid != "█▓▒░▀▄███▄█░░█▄███▄▀░▒▓█":
         failures.append("red frame middle row is not the denial stare: %r" % red_mid)
 
+    # ── Assertion 7: the launch banner is equal display-width per line ──
+    # The everyday launch banner (bin/heimdall print_banner) and the install banner
+    # reuse this one renderer. The eyes carry width-risky block glyphs, so EVERY
+    # rendered line — fancy (eyes + wordmark + tagline) and plain (degraded, no
+    # eyes) — must share one wcwidth-measured display width or the art drifts.
+    for plain in (False, True):
+        rows = face.banner_lines(plain=plain)
+        if not rows:
+            failures.append("banner_lines(plain=%s) returned no rows" % plain)
+            continue
+        bw = {face.display_width(r) for r in rows}
+        if len(bw) != 1:
+            label = "plain" if plain else "fancy"
+            failures.append(
+                "BANNER WIDTH MISMATCH (%s): rows have widths %r — must be equal"
+                % (label, [face.display_width(r) for r in rows]))
+
     # ── Print the stacked frames (the screenshot artifact) ──
     if not quiet:
         sys.stdout.write("heimdall-face — six emotion frames (plain, equal-width)\n\n")
