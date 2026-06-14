@@ -1,0 +1,32 @@
+{
+  "_comment": "Pinned model IDs for each benchmark arm. Fill version fields before the live run.",
+  "_status": "AWAITING-RUN — fill model_id and model_version before executing harness.sh --confirm-spend",
+  "raw": {
+    "arm": "raw",
+    "description": "Plain claude CLI, no agent wrapper, no heimdall plugin, no goal preamble.",
+    "binary": "claude",
+    "model_id": "FILL-BEFORE-RUN",
+    "model_version": "FILL-BEFORE-RUN",
+    "model_pin_notes": "Use exact model string from `claude --version` output at run time."
+  },
+  "superx": {
+    "arm": "superx",
+    "description": "superx last tagged release, wrapping claude with the superx agent.",
+    "binary": "FILL-BEFORE-RUN",
+    "binary_env_var": "SUPERX_BIN",
+    "model_id": "FILL-BEFORE-RUN",
+    "model_version": "FILL-BEFORE-RUN",
+    "superx_tag": "FILL-BEFORE-RUN",
+    "model_pin_notes": "Pin the superx git tag used. Check `superx --version` or tag from the release."
+  },
+  "heimdall": {
+    "arm": "heimdall",
+    "description": "heimdall current HEAD, driven via --agent heimdall --plugin-dir with /goal preamble.",
+    "binary": "claude",
+    "plugin_dir": "<repo root — resolved at run time by harness>",
+    "model_id": "FILL-BEFORE-RUN",
+    "model_version": "FILL-BEFORE-RUN",
+    "heimdall_commit": "FILL-BEFORE-RUN",
+    "model_pin_notes": "Record `git rev-parse HEAD` of heimdall repo at time of run."
+  }
+}
