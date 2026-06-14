@@ -21,6 +21,7 @@ Usage:
 Exit 0 = PASS, 1 = a width mismatch or invariant failure, 2 = harness/load error.
 """
 import os
+import re
 import sys
 import importlib.util
 
@@ -111,6 +112,9 @@ def main(argv):
     if red_mid != "█▓▒░▀▄███▄█░░█▄███▄▀░▒▓█":
         failures.append("red frame middle row is not the denial stare: %r" % red_mid)
 
+    def _strip(s):
+        return face._ANSI_RE.sub("", s)
+
     # ── Assertion 7: the launch banner is equal display-width per line ──
     # The everyday launch banner (bin/heimdall print_banner) and the install banner
     # reuse this one renderer. The eyes carry width-risky block glyphs, so EVERY
@@ -195,6 +199,82 @@ def main(argv):
                             "two reads of identical state)")
     finally:
         _shutil.rmtree(_tmp, ignore_errors=True)
+
+    # ── Assertion 10: the palette is FOUR-COLOR — gold for pass, never yellow 33 ──
+    # v2.0.0 spec: pass = install-UX gold \033[38;2;255;200;80m, NOT ANSI-33 yellow.
+    pal_color = face.make_palette(no_color=False)
+    if pal_color["passed"] != "\033[38;2;255;200;80m":
+        failures.append("passed color is not install-UX gold (got %r) — regressed to "
+                        "off-palette yellow?" % pal_color["passed"])
+    for key, val in pal_color.items():
+        if val == "\033[33m":
+            failures.append("palette key %r uses off-palette yellow \\033[33m" % key)
+
+    # ── Assertion 11: the token gauge is a FIXED-WIDTH symbolic micro-gauge ──
+    # The gauge is a sparkline bar of ▁▃▅▇█ blocks (never words). It must occupy the
+    # SAME display width at every burn level — 0%, 50%, 100% — or the instrument
+    # jitters horizontally as context fills. No signal → omitted silently (empty).
+    gauge_widths = set()
+    for pct in (0, 1, 17, 50, 83, 99, 100):
+        g = face.token_gauge(pct, False, pal_plain)
+        if not g:
+            failures.append("token_gauge(%d) is empty — a real burn pct must render" % pct)
+            continue
+        if "\n" in g:
+            failures.append("token_gauge(%d) is multi-line" % pct)
+        gauge_widths.add(face.display_width(g))
+        if re.search(r"[A-Za-z]", _strip(g)):
+            failures.append("token_gauge(%d) contains letters — must be symbolic: %r"
+                            % (pct, g))
+    if len(gauge_widths) > 1:
+        failures.append("TOKEN GAUGE WIDTH MISMATCH: widths %r — the bar must be a "
+                        "fixed display width at every burn level" % sorted(gauge_widths))
+    if face.token_gauge(None, None, pal_plain) != "":
+        failures.append("token_gauge(None) must be empty (omit when no burn signal)")
+
+    # ── Assertion 12: the full instrument is FIXED display-width across all states ──
+    # instrument_line composes eyes·phase·gate-cluster·token-gauge[·agents]. The eye
+    # glyphs and block chars are width-risky; the instrument must hold a STABLE display
+    # width across idle/thinking/passed/red so the status bar never shifts column when
+    # live state flips turn-to-turn. Hold every non-eye input constant, vary ONLY the
+    # emotion → the width must not move.
+    gc = face.build_gate_cluster_from_gates(
+        {"tests_passing": True, "lint_clean": True, "dirty": False}, pal_plain)
+    instr_widths = {}
+    for emo in ("idle", "thinking", "passed", "red"):
+        line = face.instrument_line(emotion=emo, wave="2/5", gate_cluster=gc,
+                                    burn_pct=50, exceeds=False, agents=0, pal=pal_plain)
+        if "\n" in line:
+            failures.append("instrument_line(%s) is multi-line" % emo)
+        instr_widths[emo] = face.display_width(line)
+    if len(set(instr_widths.values())) != 1:
+        failures.append("INSTRUMENT WIDTH MISMATCH across states: %r — eyes/phase/gates/"
+                        "gauge must hold one display width so the bar never jitters"
+                        % instr_widths)
+
+    # ── Assertion 13: the instrument carries NO roadmap prose (the killed bug) ──
+    # The old HUD leaked STATE.md phase sentences (e.g. "build arc — … next gate = …").
+    # The instrument is symbolic only: no roadmap tokens, no sentence words.
+    sample = _strip(face.instrument_line(
+        emotion="passed", wave="2/5", gate_cluster=gc,
+        burn_pct=50, exceeds=False, agents=3, pal=pal_plain))
+    for marker in ("build arc", "next gate", "stranger", "roadmap", "s-1", "heimdall"):
+        if marker in sample.lower():
+            failures.append("instrument leaked prose %r: %r" % (marker, sample))
+
+    # ── Assertion 14: the gate cluster is symbolic ✓/● colored, never labels-as-prose
+    # One gate failing → that gate carries red ●; all-green → gold ✓. Tolerant of a
+    # gate set that omits fields (only renders the gates actually present in state).
+    gc_fail = face.build_gate_cluster_from_gates(
+        {"tests_passing": True, "lint_clean": False, "dirty": False}, pal_color)
+    if "\033[91m" not in gc_fail:
+        failures.append("failing gate cluster has no red — a failing gate must be red")
+    gc_all = face.build_gate_cluster_from_gates(
+        {"tests_passing": True, "lint_clean": True, "dirty": False}, pal_color)
+    if "\033[38;2;255;200;80m" not in gc_all:
+        failures.append("all-green gate cluster has no gold — a passing gate must be gold")
+    if face.build_gate_cluster_from_gates({}, pal_plain) != "":
+        failures.append("empty gate set must yield empty cluster (omit gracefully)")
 
     # ── Print the stacked frames (the screenshot artifact) ──
     if not quiet:
