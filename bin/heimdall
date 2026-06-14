@@ -280,28 +280,37 @@ spin() {
 }
 
 print_banner() {
-  local P C V G D B R
-  B='\033[1m'
+  local C V G D R
   R='\033[0m'
   if [[ "${COLORTERM:-}" == "truecolor" || "${COLORTERM:-}" == "24bit" ]]; then
-    P='\033[38;2;224;86;160m'; C='\033[38;2;0;212;255m'
+    C='\033[38;2;0;212;255m'
     V='\033[38;2;155;89;182m'; G='\033[38;2;78;204;163m'
     D='\033[38;2;100;100;120m'
   elif [[ "${TERM:-}" == *256color* ]]; then
-    P='\033[38;5;205m'; C='\033[38;5;39m'
+    C='\033[38;5;39m'
     V='\033[38;5;134m'; G='\033[38;5;78m'
     D='\033[38;5;242m'
   else
-    P='\033[35m'; C='\033[36m'; V='\033[34m'; G='\033[32m'; D='\033[37m'
+    C='\033[36m'; V='\033[34m'; G='\033[32m'; D='\033[37m'
   fi
   printf "\n"
-  printf "  ${P}${B}"
-  type_text "░▒▓█" 0.04
-  printf " "
-  type_text "H E I M D A L L" 0.05
-  printf " "
-  type_text "█▓▒░" 0.04
-  printf "${R}  ${D}v1.1.0${R}\n"
+  # ── Watchman banner (heimdall-install-ux.md §A3) ──
+  # Reuse the SINGLE renderer (bin/heimdall-face --banner) that install.sh and the
+  # demo use — idle watchman eyes + wordmark + tagline, wcwidth-padded to equal
+  # display width per line so it aligns across terminals. No hand-typed art here.
+  # TTY → fancy (eyes + color); piped/non-TTY → the renderer degrades to wordmark +
+  # tagline only, so `heimdall "task" | cat` never emits ANSI garbage or breaks.
+  local FACE_BIN="$PLUGIN_DIR/bin/heimdall-face"
+  if [ -x "$FACE_BIN" ]; then
+    local face_flag="--no-color"
+    [ -t 1 ] && face_flag="--color"
+    while IFS= read -r _bl; do
+      printf "  %s\n" "$_bl"
+    done < <("$FACE_BIN" --banner "$face_flag" 2>/dev/null)
+  else
+    # Renderer absent (partial/broken install) → minimal text, never blank.
+    printf "  H E I M D A L L\n  Nothing ships unproven.\n"
+  fi
   sleep 0.1
   printf "  ${V}╭─────────────────────────────────────╮${R}\n"; sleep 0.05
   printf "  ${V}│${R}  ${C}▸${R} autonomous orchestration          ${V}│${R}\n"; sleep 0.05

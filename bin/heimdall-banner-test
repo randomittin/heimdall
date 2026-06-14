@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# heimdall-banner-test — wcwidth acceptance harness for the everyday launch banner.
+#
+# The launch banner (bin/heimdall print_banner) reuses the heimdall-face renderer's
+# idle watchman frame + the wcwidth padder to compose the A3 banner: idle eyes float
+# free beside the H E I M D A L L wordmark and the "Nothing ships unproven." tagline.
+# This harness asserts the load-bearing property — every fancy banner line has an
+# IDENTICAL display width (wcwidth-measured, never char-counted) — so the eyes, the
+# wordmark, and the tagline cannot drift apart across terminals. It also asserts the
+# plain (non-TTY / NO_COLOR) degradation emits the wordmark + tagline with no eye art.
+#
+# Mirrors heimdall-face-test: prints the artifact, asserts, exits 0=PASS / 1=FAIL.
+#
+# Usage:
+#   heimdall-banner-test            run all assertions, print the banner, exit 0/1
+#   heimdall-banner-test --quiet    assertions only, minimal output
+set -euo pipefail
+
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FACE="$DIR/heimdall-face"
+QUIET=0
+[ "${1:-}" = "--quiet" ] && QUIET=1
+
+pass=0; fail=0
+ok()  { printf '  PASS: %s\n' "$1"; pass=$(( pass + 1 )); }
+bad() { printf '  FAIL: %s\n' "$1"; fail=$(( fail + 1 )); }
+
+[ -x "$FACE" ] || { printf 'FATAL: heimdall-face not found/executable at %s\n' "$FACE"; exit 2; }
+
+WORDMARK='H E I M D A L L'
+TAGLINE='Nothing ships unproven.'
+
+# ── [1] CLI --banner --color emits eyes + wordmark + tagline ──
+# --color forces the fancy (eyes) composition even though stdout is piped, exactly
+# how bin/heimdall calls it. --no-color is the plain degradation.
+fancy_out="$("$FACE" --banner --color 2>/dev/null || true)"
+plain_out="$("$FACE" --banner --no-color 2>/dev/null || true)"
+
+echo "[1] --banner renders the watchman idle frame + wordmark + tagline"
+if printf '%s' "$fancy_out" | grep -q "$WORDMARK"; then ok "fancy banner contains the wordmark"; else bad "fancy banner missing wordmark"; fi
+if printf '%s' "$fancy_out" | grep -qF "$TAGLINE"; then ok "fancy banner contains the tagline"; else bad "fancy banner missing tagline"; fi
+# The idle eye rows (heimdall-face frame_lines("idle")) must appear verbatim — proves
+# the banner reuses the existing frame art, not a re-typed copy.
+if printf '%s' "$fancy_out" | grep -q '▀▄▄▄▄▄█░░█▄▄▄▄▄▀'; then ok "fancy banner reuses the idle eye row"; else bad "fancy banner missing idle eye art"; fi
+
+# ── [2] EQUAL DISPLAY WIDTH per fancy banner line (the acceptance test) ──
+# Measured with the SAME wcwidth padder the face uses (display_width), ANSI stripped.
+echo "[2] every fancy banner line has identical display width (wcwidth)"
+width_report="$(WCW_FACE="$FACE" WCW_INPUT="$fancy_out" python3 - <<'PY'
+import os, importlib.util
+face_path = os.environ["WCW_FACE"]
+spec = importlib.util.spec_from_loader("hf", loader=None, origin=face_path)
+mod = importlib.util.module_from_spec(spec)
+with open(face_path, "r", encoding="utf-8") as fh:
+    exec(compile(fh.read(), face_path, "exec"), mod.__dict__)
+text = os.environ["WCW_INPUT"]
+lines = [ln for ln in text.split("\n") if ln.strip() != ""]
+widths = [mod.display_width(ln) for ln in lines]
+uniq = sorted(set(widths))
+if len(lines) < 3:
+    print("FAIL too-few-lines %d" % len(lines)); raise SystemExit(0)
+if len(uniq) == 1:
+    print("PASS %d lines all %d cols" % (len(lines), uniq[0]))
+else:
+    print("FAIL widths=%r" % widths)
+PY
+)"
+case "$width_report" in
+  PASS*) ok "equal display width — ${width_report#PASS }" ;;
+  *)     bad "banner lines NOT equal width — ${width_report#FAIL }" ;;
+esac
+
+# ── [3] plain degradation: wordmark + tagline only, no eye art ──
+echo "[3] plain (--no-color) degradation drops the eye art, keeps wordmark + tagline"
+if printf '%s' "$plain_out" | grep -q "$WORDMARK"; then ok "plain banner contains the wordmark"; else bad "plain banner missing wordmark"; fi
+if printf '%s' "$plain_out" | grep -qF "$TAGLINE"; then ok "plain banner contains the tagline"; else bad "plain banner missing tagline"; fi
+if printf '%s' "$plain_out" | grep -q '▀▄▄▄▄▄█░░█▄▄▄▄▄▀'; then bad "plain banner should NOT include eye art"; else ok "plain banner has no eye art (clean degradation)"; fi
+
+# ── Print the artifact ──
+if [ "$QUIET" -eq 0 ]; then
+  printf '\nfancy banner (--banner --color):\n'
+  printf '%s\n' "$fancy_out"
+  printf '\nplain banner (--banner --no-color):\n'
+  printf '%s\n' "$plain_out"
+  printf '\n'
+fi
+
+# ── Verdict ──
+if [ "$fail" -ne 0 ]; then
+  printf 'BANNER WIDTH ASSERT: FAIL (%d failed, %d passed)\n' "$fail" "$pass"
+  exit 1
+fi
+printf 'BANNER WIDTH ASSERT: PASS (%d assertions)\n' "$pass"
+exit 0
