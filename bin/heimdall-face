@@ -20,10 +20,16 @@ Usage:
   heimdall-face                      1-line statusline form from current STATE (default)
   heimdall-face --line               same (explicit)
   heimdall-face --statusline         Claude Code statusLine entrypoint: read the JSON
-                                     blob Claude Code pipes on stdin (session cwd etc.),
-                                     resolve heimdall state in that cwd, emit the 1-line
-                                     watchman (color forced — Claude Code captures
-                                     stdout). Missing/blank stdin → cwd, never errors.
+                                     blob Claude Code pipes on stdin (session cwd +
+                                     context_window burn), resolve heimdall state in
+                                     that cwd, emit the ONE-LINE dense symbolic
+                                     instrument: <eyes>·<phase>·<gates>·<token-gauge>
+                                     [·<agents>]. Color forced (CC captures stdout).
+                                     Missing/blank stdin → cwd, idle eyes, never errors.
+  heimdall-face --burn <pct>         context-window burn % for the token gauge (the
+                                     shell wrapper passes CC's used_percentage here)
+  heimdall-face --exceeds            mark the token gauge at full red pressure
+                                     (CC's exceeds_200k_tokens)
   heimdall-face --eyes               just the bracketed eye-pair cluster from STATE
                                      (what the statusline prepends to its HUD)
   heimdall-face --frame <emotion>    render one 3-line frame (idle|watching|thinking|
@@ -144,7 +150,7 @@ def make_palette(no_color):
         "idle":       "\033[36m",    # cyan iris band
         "thinking":   "\033[97m",    # white — scanning
         "suspicious": "\033[36m",    # cyan (skeptical, still watching)
-        "passed":     "\033[38;2;255;200;80m",    # gold sparkle (install-UX gold, NOT yellow 33)
+        "passed":     "\033[38;2;255;200;80m",    # install-UX gold (NOT yellow 33)
         "red":        "\033[91m",    # hard red — denial (face.md exact code)
         "sleep":      "\033[90m",    # dim — long idle
         "dim":        "\033[90m",
@@ -213,18 +219,12 @@ def _gate_state(project, planning):
     return state
 
 
-def _state_json_signal(project):
-    """Emotion from heimdall-state.json quality gates, or "" when absent/unreadable.
+def _load_state_json(project):
+    """The parsed heimdall-state.json (or superx-state.json) dict, or {}.
 
-    heimdall-state.json is the live session state the rest of heimdall writes
-    (hooks/statusline.sh reads the same quality_gates block). The watchman reacts to
-    it so the eyes change ONLY when real gate state changes — never randomly. Mapping
-    (heimdall-face.md §State→emotion, quality-gate projection):
-      tests failing / lint dirty  → red        (a gate is broken — alert)
-      uncommitted work (dirty)    → thinking    (actively working — focused/scanning)
-      tests pass + lint clean     → passed      (gates green — the approve beat)
-      no signal                   → ""          (caller falls back to STATE.md/idle)
-    Tolerant of every missing field; never raises, never blocks the statusline."""
+    This is the live session state the rest of heimdall writes (quality_gates,
+    agent_history). Tolerant of every missing field / unreadable file; never raises,
+    never blocks the statusline."""
     import json
     for name in ("heimdall-state.json", "superx-state.json"):
         path = os.path.join(project, name)
@@ -233,21 +233,35 @@ def _state_json_signal(project):
                 data = json.load(fh)
         except (OSError, ValueError):
             continue
-        if not isinstance(data, dict):
-            continue
-        gates = data.get("quality_gates") or {}
-        if not isinstance(gates, dict):
-            gates = {}
-        tests = gates.get("tests_passing")
-        lint = gates.get("lint_clean")
-        dirty = gates.get("dirty")
-        if tests is False or lint is False:
-            return "red"
-        if dirty is True:
-            return "thinking"
-        if tests is True and lint is True:
-            return "passed"
-        return ""
+        if isinstance(data, dict):
+            return data
+    return {}
+
+
+def _state_json_signal(project):
+    """Emotion from heimdall-state.json quality gates, or "" when absent/unreadable.
+
+    The watchman reacts to the live gate block so the eyes change ONLY when real gate
+    state changes — never randomly (heimdall-face.md §State→emotion, quality-gate
+    projection):
+      tests failing / lint dirty  → red        (a gate is broken — alert)
+      uncommitted work (dirty)    → thinking    (actively working — focused/scanning)
+      tests pass + lint clean     → passed      (gates green — the approve beat)
+      no signal                   → ""          (caller falls back to STATE.md/idle)
+    Tolerant of every missing field; never raises."""
+    data = _load_state_json(project)
+    gates = data.get("quality_gates") or {}
+    if not isinstance(gates, dict):
+        gates = {}
+    tests = gates.get("tests_passing")
+    lint = gates.get("lint_clean")
+    dirty = gates.get("dirty")
+    if tests is False or lint is False:
+        return "red"
+    if dirty is True:
+        return "thinking"
+    if tests is True and lint is True:
+        return "passed"
     return ""
 
 
@@ -383,6 +397,195 @@ def compact_line(emotion, wave, pal):
     return sep.join(parts)
 
 
+# ── The dense symbolic instrument (the v2.0.0 statusline HUD) ─────────────────
+# A glanceable one-line instrument that parses in <1s, encoded as symbols/colors/
+# micro-gauges — NOT words. No roadmap prose ever (the killed bug). Render order,
+# left→right by glanceability:  <eyes> · <phase-glyph> · <gate-cluster> · <gauge>
+# [· <agents>].  Every segment is wcwidth-measured so the instrument never jitters
+# column width as live state flips turn-to-turn.
+
+# Each gate that the heimdall-state.json quality_gates block may expose, in fixed
+# render order, with the single disambiguating letter shown beside its symbol so a
+# reader can tell tests from lint from bloat at a glance. Color carries pass/fail.
+_GATE_ORDER = [
+    ("tests_passing", "t"),
+    ("lint_clean",    "l"),
+    ("secrets_clean", "s"),
+    ("bloat_clean",   "b"),
+    ("dirty",         "·"),   # special: inverted sense (dirty True = working, not pass)
+]
+
+
+def build_gate_cluster_from_gates(gates, pal):
+    """A tight glyph row of the quality gates present in `gates`, colored, never
+    labelled-as-prose. Per gate: `t✓` gold when passing, `t●` red when failing. The
+    `dirty` flag is rendered with inverted sense (dirty=True → working, not a fail).
+    Only renders gates that are actually present (bool-valued) in the dict, so a
+    partial gate set degrades gracefully. Empty dict → empty string."""
+    if not isinstance(gates, dict):
+        return ""
+    gold = pal["passed"]
+    red = pal["red"]
+    dim = pal["dim"]
+    rst = pal["reset"]
+    cells = []
+    for key, letter in _GATE_ORDER:
+        val = gates.get(key)
+        if not isinstance(val, bool):
+            continue
+        if key == "dirty":
+            # dirty True → actively working (○, dim); dirty False → clean tree (✓ gold)
+            if val:
+                cells.append("%s%s○%s" % (dim, letter, rst))
+            else:
+                cells.append("%s%s✓%s" % (gold, letter, rst))
+            continue
+        if val:
+            cells.append("%s%s✓%s" % (gold, letter, rst))
+        else:
+            cells.append("%s%s●%s" % (red, letter, rst))
+    return " ".join(cells)
+
+
+def build_gate_cluster(project, pal):
+    """The gate cluster resolved from the project's heimdall-state.json. Tolerant of
+    a missing/unreadable state file (→ empty string, segment omitted)."""
+    data = _load_state_json(project)
+    gates = data.get("quality_gates") or {}
+    return build_gate_cluster_from_gates(gates, pal)
+
+
+# Sparkline ramp: eight levels of fill from near-empty to full. A fixed 5-cell bar
+# uses these so the gauge is a true micro-sparkline, not a coarse 5-state bar.
+_SPARK = "▁▂▃▄▅▆▇█"
+_GAUGE_CELLS = 5            # fixed display width of the bar (never varies)
+
+
+def token_gauge(burn_pct, exceeds, pal):
+    """A fixed-width sparkline micro-gauge of context-window burn, colored by
+    pressure. `burn_pct` is 0..100 (context used %); None → no signal → "" (the
+    segment is omitted silently, never fabricated). `exceeds` True (CC's
+    exceeds_200k_tokens) forces the full-pressure red regardless of pct.
+
+    The bar is always exactly _GAUGE_CELLS columns wide so the instrument holds a
+    stable width at every burn level. Each cell is filled to one of eight sparkline
+    levels proportional to its share of the burn, giving a smooth ramp across the
+    fixed cells. Pressure color: gold/idle low, white mid, red high (or exceeds)."""
+    if burn_pct is None:
+        return ""
+    try:
+        pct = float(burn_pct)
+    except (TypeError, ValueError):
+        return ""
+    if pct < 0:
+        pct = 0.0
+    if pct > 100:
+        pct = 100.0
+
+    # Distribute the burn across the fixed cells: each cell spans 100/_GAUGE_CELLS
+    # percent; a fully-covered cell shows █, a partially-covered cell shows the
+    # proportional sparkline level, later empty cells show the lowest level ▁.
+    span = 100.0 / _GAUGE_CELLS
+    cells = []
+    for i in range(_GAUGE_CELLS):
+        lo = i * span
+        frac = (pct - lo) / span
+        if frac >= 1.0:
+            cells.append(_SPARK[-1])
+        elif frac <= 0.0:
+            cells.append(_SPARK[0])
+        else:
+            level = int(round(frac * (len(_SPARK) - 1)))
+            level = max(0, min(len(_SPARK) - 1, level))
+            cells.append(_SPARK[level])
+    bar = "".join(cells)
+
+    # Pressure color (four-color palette only): low → cyan/idle, mid → white,
+    # high or exceeds-200k → red. Gold is reserved for the pass beat, not burn.
+    if exceeds or pct >= 85:
+        col = pal["red"]
+    elif pct >= 60:
+        col = pal["thinking"]      # white
+    else:
+        col = pal["idle"]          # cyan
+    return "%s%s%s" % (col, bar, pal["reset"])
+
+
+def phase_glyph(wave, pal):
+    """The phase indicator: a wave glyph + `done/total`, e.g. `◷ 2/5`. NOT the
+    STATE.md prose phase. `wave` is the `done/total` string from _wave_progress
+    (empty → "" so the segment is omitted). Symbolic, single line."""
+    if not wave:
+        return ""
+    dim = pal["dim"]
+    rst = pal["reset"]
+    return "%s◷%s %s" % (dim, rst, wave)
+
+
+def agent_count_from_state(project):
+    """Count of currently-running agents from heimdall-state.json agent_history
+    (entries with status == "running"). 0 when absent/unreadable. Never raises."""
+    data = _load_state_json(project)
+    hist = data.get("agent_history")
+    if not isinstance(hist, list):
+        return 0
+    n = 0
+    for entry in hist:
+        if isinstance(entry, dict) and entry.get("status") == "running":
+            n += 1
+    return n
+
+
+def agent_glyph(count, pal):
+    """The active-agent count segment, e.g. `⛭3`. Only rendered when count > 0;
+    otherwise "" so the segment is omitted (never a fabricated zero)."""
+    if not count or count < 1:
+        return ""
+    col = pal["thinking"]      # white — active work
+    rst = pal["reset"]
+    return "%s⛭%d%s" % (col, count, rst)
+
+
+def instrument_line(emotion, wave, gate_cluster, burn_pct, exceeds, agents, pal):
+    """The dense symbolic instrument — one line, tight `·` separators, no prose.
+
+    Render order (glanceability): eyes · phase-glyph · gate-cluster · token-gauge
+    [· agents]. Every segment is optional and omitted gracefully when its signal is
+    absent; only the watchman eyes are always present (the degraded floor). All
+    segments are wcwidth-measured by the callers' renderers, so the line holds a
+    stable display width across states (the eye-cluster is equal-width by design and
+    the gauge is fixed-width by construction). Never multi-line, never errors."""
+    dim = pal["dim"]
+    rst = pal["reset"]
+    sep = " %s·%s " % (dim, rst)
+    parts = [eyes_cluster(emotion, pal)]
+    pg = phase_glyph(wave, pal)
+    if pg:
+        parts.append(pg)
+    if gate_cluster:
+        parts.append(gate_cluster)
+    gauge = token_gauge(burn_pct, exceeds, pal)
+    if gauge:
+        parts.append(gauge)
+    ag = agent_glyph(agents, pal)
+    if ag:
+        parts.append(ag)
+    return sep.join(parts)
+
+
+def render_statusline(project, pal, burn_pct=None, exceeds=False):
+    """The full instrument resolved from project state + caller-supplied token burn.
+
+    The eyes/phase/gates/agents all come from the project's own state files (python's
+    domain); the token-gauge burn comes from Claude Code's statusLine stdin, which
+    only the shell wrapper sees — it passes it in via --burn/--exceeds. Tolerant of
+    every missing signal: a bare project with no state still renders the idle eyes."""
+    emotion, wave = detect_emotion(project)
+    gate_cluster = build_gate_cluster(project, pal)
+    agents = agent_count_from_state(project)
+    return instrument_line(emotion, wave, gate_cluster, burn_pct, exceeds, agents, pal)
+
+
 # ── Renderers ────────────────────────────────────────────────────────────────
 def render_frame(emotion, pal, equalize_width=None):
     """A 3-line frame, colored, every row padded to identical display width.
@@ -481,17 +684,16 @@ def render_all(pal):
 
 # ── Claude Code statusLine entrypoint ────────────────────────────────────────
 # Claude Code invokes a statusLine command and pipes a JSON session blob to its
-# stdin on each render (cwd, model, workspace, …). The command prints ONE line to
-# stdout = the status line. We read that blob, pull the session cwd (so the watchman
-# reacts to the state of the project the user is actually in), and emit the 1-line
-# face. The blob is advisory: any field may be missing, so every lookup is tolerant
-# and we degrade to the process cwd. A statusline must NEVER error or print blank.
-def _project_from_statusline_stdin():
-    """Resolve the project dir from Claude Code's statusLine stdin JSON.
-
-    Reads stdin if it is not a tty, parses JSON tolerantly, and returns the first of
-    several known cwd fields that points at an existing directory. Falls back to the
-    process cwd (".") when stdin is empty, not JSON, or carries no usable path."""
+# stdin on each render (cwd, model, workspace, context_window, …). We read that blob,
+# pull the session cwd (so the watchman reacts to the project the user is in) and the
+# context-window burn (for the token gauge). The blob is advisory: any field may be
+# missing, so every lookup is tolerant and we degrade to the process cwd with no
+# gauge. A statusline must NEVER error or print blank.
+def _statusline_stdin_signals():
+    """Return (project_dir, burn_pct, exceeds) parsed from Claude Code's statusLine
+    stdin JSON. project_dir falls back to "." ; burn_pct/exceeds fall back to
+    None/False when the context-window fields are absent. Fully tolerant: empty
+    stdin, non-JSON, or any missing field degrades silently."""
     import json
     raw = ""
     try:
@@ -500,16 +702,17 @@ def _project_from_statusline_stdin():
     except (OSError, ValueError):
         raw = ""
     if not raw or not raw.strip():
-        return "."
+        return ".", None, False
     try:
         blob = json.loads(raw)
     except ValueError:
-        return "."
+        return ".", None, False
     if not isinstance(blob, dict):
-        return "."
+        return ".", None, False
 
     # Claude Code has used both a flat `cwd` and a nested `workspace.current_dir`
     # across versions; accept every documented shape and ignore anything missing.
+    project = "."
     candidates = [blob.get("cwd"), blob.get("project_dir")]
     ws = blob.get("workspace")
     if isinstance(ws, dict):
@@ -517,8 +720,27 @@ def _project_from_statusline_stdin():
         candidates.append(ws.get("project_dir"))
     for cand in candidates:
         if isinstance(cand, str) and cand and os.path.isdir(cand):
-            return cand
-    return "."
+            project = cand
+            break
+
+    # Context-window burn for the token gauge. CC's `context_window.used_percentage`
+    # is the pre-computed context-fill percent (may be null early in a session); fall
+    # back to deriving it from raw token counts vs the window size when absent. Never
+    # fabricate — leave None if there is no usable signal.
+    burn_pct = None
+    exceeds = bool(blob.get("exceeds_200k_tokens") is True)
+    cw = blob.get("context_window")
+    if isinstance(cw, dict):
+        used = cw.get("used_percentage")
+        if isinstance(used, (int, float)):
+            burn_pct = float(used)
+        else:
+            size = cw.get("context_window_size")
+            inp = cw.get("total_input_tokens")
+            if isinstance(size, (int, float)) and size > 0 \
+                    and isinstance(inp, (int, float)):
+                burn_pct = max(0.0, min(100.0, (float(inp) / float(size)) * 100.0))
+    return project, burn_pct, exceeds
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
@@ -542,6 +764,8 @@ def main(argv):
     project = "."
     force_no_color = False
     force_color = False
+    burn_pct = None
+    exceeds = False
 
     i = 0
     while i < len(argv):
@@ -559,6 +783,17 @@ def main(argv):
             mode = "all"
         elif a == "--banner":
             mode = "banner"
+        elif a == "--burn":
+            if i + 1 >= len(argv):
+                sys.stderr.write("error: --burn needs a percentage\n")
+                return 2
+            try:
+                burn_pct = float(argv[i + 1])
+            except ValueError:
+                burn_pct = None          # tolerant: an unparseable burn → no gauge
+            i += 1
+        elif a == "--exceeds":
+            exceeds = True
         elif a == "--frame":
             mode = "frame"
             if i + 1 >= len(argv):
@@ -578,15 +813,26 @@ def main(argv):
         i += 1
 
     # The statusLine surface is colored even though Claude Code captures (pipes) our
-    # stdout, so force color on unless the caller explicitly disabled it or NO_COLOR
-    # / TERM=dumb is set. Resolve the project dir from the piped session JSON.
+    # stdout, so force color on unless explicitly disabled. Resolve the project dir
+    # and the context-window burn from the piped session JSON. Explicit --burn /
+    # --exceeds (passed by the shell wrapper) override the parsed values.
     if mode == "statusline":
         if not force_no_color:
             force_color = True
-        project = _project_from_statusline_stdin()
+        sl_project, sl_burn, sl_exceeds = _statusline_stdin_signals()
+        if project == ".":
+            project = sl_project
+        if burn_pct is None:
+            burn_pct = sl_burn
+        if not exceeds:
+            exceeds = sl_exceeds
 
     color_on = want_color(force_no_color, force_color)
     pal = make_palette(not color_on)
+
+    if mode == "statusline":
+        sys.stdout.write(render_statusline(project, pal, burn_pct, exceeds) + "\n")
+        return 0
 
     if mode == "all":
         sys.stdout.write(render_all(pal) + "\n")
