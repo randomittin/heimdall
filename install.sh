@@ -43,7 +43,13 @@ plugin_version() {
 # bug the first time a gate is added. Falls back to counting "command" lines,
 # then to a conservative 1.
 gate_count() {
-  local dir="$1" n="" hooks="$dir/hooks/hooks.json"
+  # NB: split the declarations — a single `local dir=… hooks="$dir/…"` expands
+  # $dir (the builtin's args are word-expanded before the locals exist) against
+  # the OUTER scope, which is unset under `set -u` in a clean env → crash. Bind
+  # dir first, then reference it.
+  local dir="$1"
+  local n=""
+  local hooks="$dir/hooks/hooks.json"
   if [ -f "$hooks" ] && command -v jq >/dev/null 2>&1; then
     n=$(jq '[.. | objects | select(has("command"))] | length' "$hooks" 2>/dev/null || echo "")
   fi
