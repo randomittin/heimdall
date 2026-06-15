@@ -51,8 +51,11 @@ def main(argv):
     pal_plain = face.make_palette(no_color=True)
     failures = []
 
-    # ── Assertion 1: the six expected emotions exist ──
-    expected = ["idle", "thinking", "suspicious", "passed", "red", "sleep"]
+    # ── Assertion 1: the seven expected emotions exist ──
+    # `sad` is the uninstall-farewell frame (a downcast / crying watchman); it joins
+    # the set as a full emotion so the equal-width gate below stacks its three rows
+    # alongside the others and asserts they share the one display width.
+    expected = ["idle", "thinking", "suspicious", "passed", "red", "sleep", "sad"]
     if face.EMOTIONS != expected:
         failures.append("emotion set mismatch: got %r want %r"
                         % (face.EMOTIONS, expected))
@@ -111,6 +114,20 @@ def main(argv):
     red_mid = face.frame_lines("red")[1]
     if red_mid != "█▓▒░▀▄███▄█░░█▄███▄▀░▒▓█":
         failures.append("red frame middle row is not the denial stare: %r" % red_mid)
+
+    # ── Assertion 6b: --frame sad renders the downcast / crying farewell middle row ──
+    # The uninstall-farewell frame: lids drop (▄ where idle carries ▀) and a tear ▾
+    # sits under each eye. Its three rows MUST stay equal-width with every other frame
+    # (gated by Assertion 2) — the tear glyph is width-risky, so pin the exact art and
+    # assert its width matches idle so a future glyph swap cannot silently shift it.
+    sad_mid = face.frame_lines("sad")[1]
+    if sad_mid != "█▓▒░▄▄▾▄▄▄█░░█▄▄▄▾▄▄░▒▓█":
+        failures.append("sad frame middle row is not the downcast/crying farewell: %r"
+                        % sad_mid)
+    if face.display_width(sad_mid) != face.display_width(face.frame_lines("idle")[1]):
+        failures.append("sad middle row width %d != idle middle row width %d"
+                        % (face.display_width(sad_mid),
+                           face.display_width(face.frame_lines("idle")[1])))
 
     def _strip(s):
         return face._ANSI_RE.sub("", s)
