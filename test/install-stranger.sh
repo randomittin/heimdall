@@ -122,6 +122,38 @@ else
   ok "hmd demo resolves heimdall-demo (no 'not found')"
 fi
 
+# (1d) DEMO ARC — the deny→fix→pass showcase must actually PLAY end to end. It
+# regressed once: under `set -euo pipefail`, the runtime secret-key generator
+# `tr … </dev/urandom | head -c 40` took SIGPIPE (nonzero pipeline) and aborted
+# the demo right after the gate-inspector frame — so the RED denial, the fix, the
+# GOLD pass and the summary card never rendered (the product's signature moment,
+# silently gone). The arc's narration is TTY-gated, so we drive the INSTALLED demo
+# under a pty (`script`) with --intro, gitleaks on PATH (the catch needs the real
+# gate), and assert BOTH the denial AND the pass stages render. A future early
+# exit between "inspecting" and the pass fails THIS loudly. gitleaks/script absent
+# → skip (the arc legitimately needs the real scanner; we never assert a fake).
+GL_DIR=""; command -v gitleaks >/dev/null 2>&1 && GL_DIR="$(cd "$(dirname "$(command -v gitleaks)")" && pwd)"
+if [ -n "$GL_DIR" ] && command -v script >/dev/null 2>&1; then
+  ARC_OUT="$TMPH/demo-arc.out"; : > "$ARC_OUT"
+  ( script -q "$ARC_OUT" env HOME="$TMPH" PATH="$GL_DIR:$STRANGER_PATH" \
+      "$LAUNCHER" demo --intro --dry >/dev/null 2>&1 ) &
+  _arc_pid=$!
+  ( sleep 40; kill -9 "$_arc_pid" 2>/dev/null; pkill -9 -f heimdall-demo 2>/dev/null ) &
+  _arc_kp=$!
+  wait "$_arc_pid" 2>/dev/null
+  kill "$_arc_kp" 2>/dev/null
+  ARC="$(sed 's/\x1b\[[0-9;]*m//g' "$ARC_OUT" 2>/dev/null)"
+  _deny="$(printf '%s' "$ARC" | grep -ciE 'caught|denial|barred' || true)"
+  _pass="$(printf '%s' "$ARC" | grep -ciE 'gate ✓|Bifröst open|PASS — secret-scan' || true)"
+  if [ "${_deny:-0}" -ge 1 ] && [ "${_pass:-0}" -ge 1 ]; then
+    ok "demo plays the full deny→fix→pass arc (denial + pass stages both render)"
+  else
+    bad "demo arc incomplete — deny=$_deny pass=$_pass (early exit after gate-inspector?)"
+  fi
+else
+  ok "demo-arc check skipped — gitleaks/script unavailable (arc needs the real gate, never faked)"
+fi
+
 # (1b) COMPONENT RESOLUTION (real task path) — prove the launcher resolves every
 # sibling a real `hmd "task"` touches WITHOUT a model call. `hmd version` runs
 # the same $0→readlink→PLUGIN_DIR resolution; then we directly probe that each

@@ -367,12 +367,19 @@ EOF
   # recognizable "sk_live_" prefix is not a contiguous literal in this file.
   local sk_marker sk_entropy planted_key
   sk_marker="sk_""liv""e_"   # "sk_live_" assembled from fragments at runtime
-  sk_entropy="$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c 40)"
+  # NOTE: `head -c 40` closes the pipe at 40 bytes → the upstream `tr` (and the
+  # urandom reader) take SIGPIPE and exit nonzero. Under this script's `set -euo
+  # pipefail`, a nonzero pipeline inside a command substitution would abort the
+  # WHOLE demo right here — silently, just after the gate-inspector frame, before
+  # the deny→fix→pass arc ever renders. The trailing `|| true` swallows that
+  # benign SIGPIPE so the assignment always succeeds; the length guard below still
+  # covers a genuinely short/empty read.
+  sk_entropy="$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c 40 || true)"
   # Fallback if /dev/urandom is unavailable: still ≥30 alphanumeric chars of entropy.
   if [ "${#sk_entropy}" -lt 30 ]; then
-    sk_entropy="$( (date +%s%N; echo $$) | (shasum -a 256 2>/dev/null || md5 2>/dev/null) | LC_ALL=C tr -dc 'A-Za-z0-9' | head -c 40 )"
+    sk_entropy="$( (date +%s%N; echo $$) | (shasum -a 256 2>/dev/null || md5 2>/dev/null) | LC_ALL=C tr -dc 'A-Za-z0-9' | head -c 40 || true )"
     sk_entropy="${sk_entropy}0aA1bB2cC3dD4eE5fF"   # pad to guarantee length/entropy
-    sk_entropy="$(printf '%s' "$sk_entropy" | head -c 40)"
+    sk_entropy="$(printf '%s' "$sk_entropy" | head -c 40 || true)"
   fi
   planted_key="${sk_marker}${sk_entropy}"
   {
