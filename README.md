@@ -11,7 +11,7 @@
 Lead path — one command, zero to running:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/randomittin/heimdall/v2.0.4/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/randomittin/heimdall/v2.0.5/install.sh | bash
 ```
 
 > The branded one-liner `curl -fsSL https://runheimdall.dev/install | bash` is **coming** — it is a 302 to the pinned release tag on GitHub (brand on the line, verifiability intact). Until the redirect is live, the raw GitHub pinned-tag URL above is the working, byte-identical path.
@@ -19,7 +19,7 @@ curl -fsSL https://raw.githubusercontent.com/randomittin/heimdall/v2.0.4/install
 **Prefer to read it first?** (recommended)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/randomittin/heimdall/v2.0.4/install.sh -o install.sh
+curl -fsSL https://raw.githubusercontent.com/randomittin/heimdall/v2.0.5/install.sh -o install.sh
 less install.sh        # short, function-wrapped, no sudo, no prompts, no telemetry —
                        # resolves to a pinned tag, so what you read is what runs
 bash install.sh

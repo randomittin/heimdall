@@ -1,0 +1,39 @@
+{
+  "version": "1.0.0",
+  "project": {
+    "name": "",
+    "phase": "idle",
+    "autonomy_level": 2
+  },
+  "plan": {
+    "sub_projects": [],
+    "dependency_graph": {}
+  },
+  "conflict_log": [],
+  "agent_history": [],
+  "quality_gates": {
+    "tests_passing": false,
+    "lint_clean": false,
+    "last_review": null,
+    "conflict_reflection_done": true,
+    "dirty": false
+  },
+  "maintainer": {
+    "enabled": false,
+    "issue_sources": [],
+    "pending_fixes": [],
+    "release_queue": []
+  },
+  "communication_log": [],
+  "budget": {
+    "total_tokens": 0,
+    "total_agents_spawned": 0,
+    "token_limit": null,
+    "warn_at_percent": 80
+  },
+  "goal": {
+    "condition": null,
+    "set_at": null,
+    "source": null
+  }
+}
