@@ -38,6 +38,33 @@ plugin_version() {
   if [ -n "$v" ]; then printf '%s' "$v"; else printf '?'; fi
 }
 
+# Resolve the ACTUAL installed version the same way bin/heimdall's
+# heimdall_version() does, so the success card can never drift from what was
+# fetched. Resolution order:
+#   1. nearest git tag in the installed clone (git describe --tags --abbrev=0),
+#      normalised to a clean X.Y.Z (strip any -N-gSHA / +meta suffix). The clone
+#      carries the release tags, so this is the source of truth for a real curl
+#      install — NOT the manifest, which can lag the tag between releases.
+#   2. fall back to the manifest "version" field (plugin_version) if the tree has
+#      no tags (e.g. a shallow ref-pinned clone with tags stripped).
+# Prints a bare X.Y.Z (no leading v — the card prints its own "v" prefix), or
+# the manifest value, or "?" if nothing resolves. Never a hardcoded literal.
+resolved_version() {
+  local dir="$1" ver=""
+  # rev-parse (not [ -d .git ]) so this also works inside a git worktree, where
+  # .git is a gitdir-pointer file rather than a directory.
+  if git -C "$dir" rev-parse --git-dir >/dev/null 2>&1; then
+    ver="$(git -C "$dir" describe --tags --abbrev=0 2>/dev/null || true)"
+    if [ -n "$ver" ]; then
+      ver="$(printf '%s' "$ver" | sed -E 's/^v?([0-9]+\.[0-9]+\.[0-9]+).*/\1/')"
+    fi
+  fi
+  if [ -z "$ver" ]; then
+    ver="$(plugin_version "$dir")"   # manifest fallback (already returns ? if absent)
+  fi
+  printf '%s' "$ver"
+}
+
 # Count the gates the plugin actually wires at runtime (the enforced hook
 # commands in hooks/hooks.json). Never hardcode — a fixed count is a stale-doc
 # bug the first time a gate is added. Falls back to counting "command" lines,
@@ -62,16 +89,105 @@ gate_count() {
   printf '%s' "$n"
 }
 
-# Create a hardlink (not a symlink, not an alias) so both names resolve to the
-# same inode and survive non-interactive shells. Fall back to a copy only if
-# hardlinking is impossible (e.g. a cross-device bin dir on a separate FS).
+# ── Component-resolution model (READ THIS before touching link_entry) ─────────
+#
+# The launcher (bin/heimdall) resolves its sibling components — heimdall-demo,
+# heimdall-face, heimdall-city, heimdall-state, heimdall-selfscan, skill-manager,
+# discover-skills, summary-card, … — RELATIVE TO ITS OWN REAL PATH:
+#
+#     SELF="$(readlink -f "$0")"            # follow symlinks to the real file
+#     PLUGIN_DIR="$(dirname "$SELF")/.."    # …/heimdall ; components in …/heimdall/bin
+#
+# So every component MUST sit beside the *real* launcher binary. The full plugin
+# tree (all 50+ bin/ components) is already cloned into $PLUGIN_DIR (~/.heimdall)
+# by the "Fetching Heimdall" step. We therefore make the on-PATH entry points
+# SYMLINKS into that tree — NOT hardlinks.
+#
+#   Why not a hardlink? A hardlink is a second *name* for the same inode with no
+#   link target: `readlink -f ~/.local/bin/hmd` returns ~/.local/bin/hmd itself,
+#   so PLUGIN_DIR resolves to ~/.local and the launcher hunts for siblings in
+#   ~/.local/bin — where only hmd+heimdall live. Result: `hmd demo` →
+#   "demo runner not found at ~/.local/bin/heimdall-demo". (That was the bug.)
+#
+#   A SYMLINK has a target: `readlink -f ~/.local/bin/hmd` follows through to
+#   ~/.heimdall/bin/heimdall, so PLUGIN_DIR resolves to ~/.heimdall and ALL
+#   siblings resolve — exactly what bin/heimdall's existing readlink logic wants
+#   (its own comment: "Follow symlinks to the real file"). Fewest moving parts:
+#   one symlink per entry point, zero copies, the clone is the single source of
+#   truth for every component.
+#
+# The symlink is REQUIRED for sibling resolution and is canonical on macOS/Linux.
+# The copy fallback exists only so a symlink-less filesystem still gets a working
+# launcher on PATH for the simple task path; subcommands that shell out to a
+# sibling (e.g. `hmd demo`) need the symlink, so we never reach the copy in
+# practice. One symlink attempt, then copy — no silent broken-launcher install.
 link_entry() {
   local src="$1" dst="$2"
   rm -f "$dst" 2>/dev/null || true
-  if ! ln "$src" "$dst" 2>/dev/null; then
-    cp "$src" "$dst"
-    chmod +x "$dst"
+  # Absolute symlink: `readlink -f "$dst"` follows it to the real launcher in the
+  # plugin tree, so the launcher's PLUGIN_DIR resolves to ~/.heimdall and every
+  # sibling component is found. This is the guaranteed-correct path.
+  if ln -s "$src" "$dst" 2>/dev/null; then
+    return 0
   fi
+  # Last resort (symlink unsupported): copy. Puts the launcher on PATH but a
+  # copied launcher can't resolve siblings — kept rather than failing install.
+  cp "$src" "$dst"
+  chmod +x "$dst"
+}
+
+# Pick the shell profile the user's interactive shell will actually source, so a
+# PATH export takes effect on the next shell. Order mirrors what login/interactive
+# shells read: zsh → ~/.zshrc, bash → ~/.bashrc (Linux) / ~/.bash_profile (login),
+# falling back to the POSIX ~/.profile. Honors $SHELL; defaults to zsh on macOS.
+# Prints the chosen path (the file need not exist yet — we create it on append).
+profile_for_shell() {
+  local sh; sh="$(basename "${SHELL:-}")"
+  case "$sh" in
+    zsh)  printf '%s' "$HOME/.zshrc" ;;
+    bash)
+      # Prefer an existing bash profile; else ~/.bashrc.
+      if [ -f "$HOME/.bashrc" ]; then printf '%s' "$HOME/.bashrc"
+      elif [ -f "$HOME/.bash_profile" ]; then printf '%s' "$HOME/.bash_profile"
+      else printf '%s' "$HOME/.bashrc"; fi
+      ;;
+    *)
+      # Unknown/empty SHELL: prefer an existing rc, else ~/.profile.
+      if [ -f "$HOME/.zshrc" ]; then printf '%s' "$HOME/.zshrc"
+      elif [ -f "$HOME/.bashrc" ]; then printf '%s' "$HOME/.bashrc"
+      else printf '%s' "$HOME/.profile"; fi
+      ;;
+  esac
+}
+
+# Idempotently ensure $BIN_DIR is on PATH for future shells. If it is ALREADY on
+# the current PATH, do nothing (and signal "already on PATH"). Otherwise append a
+# single guarded export to the user's profile — guarded by a grep so re-running
+# the installer never double-appends. Echoes one of:
+#   already    — bin dir already on PATH; nothing written
+#   appended   — export added to the profile (caller tells user to restart/source)
+#   present    — profile already carried the export (idempotent re-run)
+# Prints ONLY the state word (callers recompute the profile path via
+# profile_for_shell — this runs in a command substitution, so any variable it set
+# would die with the subshell; the state word is the single source of truth).
+ensure_path_on_profile() {
+  local bin_dir="$1" profile
+  # Already active in THIS PATH → future shells inherit it too; no edit needed.
+  case ":${PATH:-}:" in
+    *":$bin_dir:"*) printf 'already'; return 0 ;;
+  esac
+  profile="$(profile_for_shell)"
+  # Match on the bin-dir export, so a profile that already exports this dir (by
+  # any wording) is treated as present — the grep guard that makes re-runs
+  # idempotent (never a double-append).
+  if [ -f "$profile" ] && grep -qF "$bin_dir" "$profile" 2>/dev/null; then
+    printf 'present'; return 0
+  fi
+  {
+    printf '\n# Added by Heimdall installer — put `hmd`/`heimdall` on PATH\n'
+    printf 'export PATH="%s:$PATH"\n' "$bin_dir"
+  } >> "$profile"
+  printf 'appended'
 }
 
 main() {
@@ -83,8 +199,11 @@ main() {
   local REF="${HEIMDALL_REF:-$DEFAULT_REF}"
   local REPO="${HEIMDALL_REPO:-https://github.com/randomittin/heimdall.git}"
 
-  # Install layout. Plugin lives in its own dir; entry points are hardlinked
-  # into a bin dir on PATH. No writes outside these two locations.
+  # Install layout. Plugin (all components) lives in its own dir; the two entry
+  # points are SYMLINKED into a bin dir on PATH (symlink so the launcher's
+  # readlink-based sibling resolution lands back in the plugin dir — see
+  # link_entry). The installer also appends BIN_DIR to the shell profile. No
+  # writes outside these locations + the one profile line.
   local PLUGIN_DIR="$HOME/.heimdall"
   local BIN_DIR="$HOME/.local/bin"
   local MARKETPLACE_NAME="heimdall"
@@ -226,7 +345,7 @@ main() {
   if [ -d "$PLUGIN_DIR/.git" ]; then
     UPGRADING=1
     local CUR_VER
-    CUR_VER=$(plugin_version "$PLUGIN_DIR")
+    CUR_VER=$(resolved_version "$PLUGIN_DIR")
     step_ok "Found Heimdall v$CUR_VER — upgrading"
   fi
 
@@ -273,7 +392,8 @@ main() {
   fi
   step_ok "Installing plugin ($PLUGIN_ID)"
 
-  # Step: link entry points (hmd + heimdall) via HARDLINK (A0.7).
+  # Step: link entry points (hmd + heimdall) via SYMLINK (A0.7) — symlink, not
+  # hardlink, so the launcher resolves its siblings in the plugin dir.
   step_begin "Linking entry points (hmd, heimdall)"
   mkdir -p "$BIN_DIR"
   local SRC="$PLUGIN_DIR/bin/heimdall"
@@ -309,15 +429,21 @@ main() {
   step_ok "Wiring secret-scan + bloat gates"
 
   # ── 5. Success card (A4) ──────────────────────────────────────────────────
-  local VER; VER=$(plugin_version "$PLUGIN_DIR")
+  # VER is the ACTUAL installed version (git tag → manifest), never a literal.
+  local VER; VER=$(resolved_version "$PLUGIN_DIR")
   local PRIMARY="hmd"; [ "$INSTALL_HMD" -eq 1 ] || PRIMARY="heimdall"
+  # Both real install locations, $HOME-collapsed to ~ — the components live in
+  # PLUGIN_DIR, the on-PATH launchers are symlinks in BIN_DIR. The card names
+  # both so it can never contradict where things were actually placed.
   local SHORT_PATH; SHORT_PATH=$(printf '%s' "$PLUGIN_DIR" | sed "s|$HOME|~|")
+  local SHORT_BIN;  SHORT_BIN=$(printf '%s' "$BIN_DIR" | sed "s|$HOME|~|")
   blank
   if [ "$FANCY" -eq 1 ] && [ "$BOXES" -eq 1 ]; then
     printf '   %s┌───────────────────────────────────────────────┐%s\n' "$C_DIM" "$C_RESET"
     printf '   %s│%s  %sHeimdall v%-37s%s%s│%s\n' "$C_DIM" "$C_RESET" "$C_BOLD" "$VER installed" "$C_RESET" "$C_DIM" "$C_RESET"
     printf '   %s│%s  %sgates live · secret-scan armed · %s/%-9s%s%s│%s\n' "$C_DIM" "$C_RESET" "$C_GOLD" "$N" "$N" "$C_RESET" "$C_DIM" "$C_RESET"
-    printf '   %s│%s  path: %-40s%s│%s\n' "$C_DIM" "$C_RESET" "$SHORT_PATH" "$C_DIM" "$C_RESET"
+    printf '   %s│%s  plugin:  %-38s%s│%s\n' "$C_DIM" "$C_RESET" "$SHORT_PATH" "$C_DIM" "$C_RESET"
+    printf '   %s│%s  on PATH: %-38s%s│%s\n' "$C_DIM" "$C_RESET" "$SHORT_BIN/$PRIMARY" "$C_DIM" "$C_RESET"
     printf '   %s│%s%-49s%s│%s\n' "$C_DIM" "$C_RESET" "" "$C_DIM" "$C_RESET"
     printf '   %s│%s  Next:        %s%-34s%s%s│%s\n' "$C_DIM" "$C_RESET" "$C_CYAN" "$PRIMARY demo" "$C_RESET" "$C_DIM" "$C_RESET"
     printf '   %s│%s  In Claude:   /hmd:verify  /hmd:save  …          %s│%s\n' "$C_DIM" "$C_RESET" "$C_DIM" "$C_RESET"
@@ -327,7 +453,8 @@ main() {
   else
     say "Heimdall v$VER installed"
     say "gates live · secret-scan armed · $N/$N"
-    say "path: $SHORT_PATH"
+    say "plugin:  $SHORT_PATH"
+    say "on PATH: $SHORT_BIN/$PRIMARY"
     say ""
     say "Next:        $PRIMARY demo"
     say "In Claude:   /hmd:verify  /hmd:save"
@@ -344,10 +471,35 @@ main() {
   else
     say "   Run:  $PRIMARY demo"
   fi
-  # PATH hint if the bin dir is not already on PATH.
-  case ":$PATH:" in
-    *":$BIN_DIR:"*) : ;;
-    *) printf '   %s(add %s to your PATH to use `%s` directly)%s\n' "$C_DIM" "$BIN_DIR" "$PRIMARY" "$C_RESET" ;;
+  # PATH setup — make `hmd` reachable without the user hand-editing a profile.
+  # ensure_path_on_profile appends a single guarded export to the right shell
+  # profile (idempotent: a grep guard prevents a double-append on re-run). If the
+  # bin dir is already on PATH, it writes nothing and we stay silent.
+  local PATH_STATE
+  PATH_STATE=$(ensure_path_on_profile "$BIN_DIR")
+  case "$PATH_STATE" in
+    appended)
+      # The headline `hmd demo` will be command-not-found until PATH refreshes.
+      # Make this a CLEAR required step, not a dim aside — name the exact action.
+      # Recompute the profile here (the appender ran in a subshell — its vars are
+      # gone); profile_for_shell is pure so it returns the same path it wrote.
+      local PROFILE_FILE; PROFILE_FILE=$(profile_for_shell)
+      local SHORT_PROFILE; SHORT_PROFILE=$(printf '%s' "$PROFILE_FILE" | sed "s|$HOME|~|")
+      blank
+      printf '   %sOne more step%s — added %s to PATH in %s.\n' \
+        "$C_BOLD" "$C_RESET" "$SHORT_BIN" "$SHORT_PROFILE"
+      printf '   Reopen your terminal, or run now:\n'
+      printf '       %sexport PATH="%s:$PATH"%s\n' "$C_CYAN" "$BIN_DIR" "$C_RESET"
+      ;;
+    present)
+      # Profile already carries the export (idempotent re-run): just remind to
+      # open a fresh shell if `hmd` isn't resolving yet. No second line written.
+      printf '   %s(PATH already configured in your profile — reopen your terminal if `%s` isn'\''t found)%s\n' \
+        "$C_DIM" "$PRIMARY" "$C_RESET"
+      ;;
+    already|*)
+      : # bin dir already live on PATH — nothing to say.
+      ;;
   esac
   printf '   %sdone in %ss%s\n' "$C_DIM" "$ELAPSED" "$C_RESET"
   blank
