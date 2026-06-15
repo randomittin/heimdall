@@ -33,7 +33,8 @@ Usage:
   heimdall-face --eyes               just the bracketed eye-pair cluster from STATE
                                      (what the statusline prepends to its HUD)
   heimdall-face --frame <emotion>    render one 3-line frame (idle|watching|thinking|
-                                     suspicious|passed|gate-passed|red|denial|blink|sleep)
+                                     suspicious|passed|gate-passed|red|denial|blink|
+                                     sleep|sad|farewell)
   heimdall-face --all                stack all six 3-line frames (for the test harness)
   heimdall-face --banner             the launch banner: idle eyes + H E I M D A L L
                                      wordmark + tagline (install.sh §A3 / bin/heimdall
@@ -111,6 +112,7 @@ _MID = {
     "blink":     "█▓▒░▀▀▀▀▀▀█░░█▀▀▀▀▀▀░▒▓█",  # eyes shut to a line
     "red":       "█▓▒░▀▄███▄█░░█▄███▄▀░▒▓█",  # wide hard stare — denial
     "suspicious":"█▓▒░▀▄▄▄▄▄█░░█▄▄▄▄▄▀░▒▓█",  # skeptical (brow does the work)
+    "sad":       "█▓▒░▄▄▾▄▄▄█░░█▄▄▄▾▄▄░▒▓█",  # downcast lids + a tear ▾ — farewell
 }
 
 # canonical emotion name ← any accepted alias
@@ -121,6 +123,7 @@ _ALIAS = {
     "passed": "passed", "gate-passed": "passed", "gate_passed": "passed", "pass": "passed",
     "red": "red", "denial": "red", "deny": "red", "fail": "red",
     "blink": "blink", "sleep": "sleep", "asleep": "sleep",
+    "sad": "sad", "farewell": "sad", "goodbye": "sad", "leaving": "sad",
 }
 
 # `sleep` shares the shut-eye middle row with `blink` but is a distinct state for
@@ -128,9 +131,10 @@ _ALIAS = {
 _FRAME_ART = {
     "idle": "idle", "thinking": "thinking", "suspicious": "suspicious",
     "passed": "passed", "red": "red", "blink": "blink", "sleep": "blink",
+    "sad": "sad",
 }
 
-EMOTIONS = ["idle", "thinking", "suspicious", "passed", "red", "sleep"]
+EMOTIONS = ["idle", "thinking", "suspicious", "passed", "red", "sleep", "sad"]
 
 
 def frame_lines(emotion):
@@ -145,7 +149,7 @@ def frame_lines(emotion):
 def make_palette(no_color):
     if no_color:
         return {"idle": "", "thinking": "", "suspicious": "",
-                "passed": "", "red": "", "sleep": "", "dim": "", "reset": ""}
+                "passed": "", "red": "", "sleep": "", "sad": "", "dim": "", "reset": ""}
     return {
         "idle":       "\033[36m",    # cyan iris band
         "thinking":   "\033[97m",    # white — scanning
@@ -153,6 +157,7 @@ def make_palette(no_color):
         "passed":     "\033[38;2;255;200;80m",    # install-UX gold (NOT yellow 33)
         "red":        "\033[91m",    # hard red — denial (face.md exact code)
         "sleep":      "\033[90m",    # dim — long idle
+        "sad":        "\033[90m",    # dim — the uninstall farewell (reuse dim, not new)
         "dim":        "\033[90m",
         "reset":      "\033[0m",
     }
@@ -361,6 +366,7 @@ _LINE_EYES = {
     "passed":     "▀▄✦▄▀",  # sparkle — the approve beat
     "red":        "▀▄█▄▀",  # wide hard stare — denial
     "sleep":      "▀▀▀▀▀",  # shut to a line
+    "sad":        "▄▄▾▄▄",  # downcast lids + a tear ▾ — the farewell
 }
 _LINE_TAG = {
     "idle":       "watching",
@@ -369,6 +375,7 @@ _LINE_TAG = {
     "passed":     "gate ✓",
     "red":        "GATE ✗ — barred",
     "sleep":      "asleep",
+    "sad":        "farewell",
 }
 
 
