@@ -78,6 +78,75 @@ _heimdall_remove_plugin() {
   fi
 }
 
+# ── Shared PATH-export removal (uninstall completeness, v2.0.3) ──
+#
+# install.sh's ensure_path_on_profile appends a GUARDED two-line block to the
+# user's shell profile so `hmd`/`heimdall` resolve on PATH:
+#
+#     # Added by Heimdall installer — put `hmd`/`heimdall` on PATH
+#     export PATH="$HOME/.local/bin:$PATH"
+#
+# Uninstall must REVERSE that, SURGICALLY — delete ONLY the marker comment and the
+# export line install wrote, never an unrelated PATH export the user maintains.
+# Strategy: drop the exact marker comment line, AND drop the single `export PATH`
+# line that DIRECTLY FOLLOWS that marker (install always writes them as a pair).
+# As defense-in-depth we also drop a bare heimdall-bin export from the legacy
+# v2.0.1 layout (`.heimdall/bin`), which carried no marker. We do NOT blanket-match
+# `.local/bin` exports without the marker — a stranger may put other tools there.
+#
+# Idempotent: a profile with no marker is rewritten identically (no-op), so a
+# second uninstall removes nothing and errors nothing. Uses awk (no GNU-vs-BSD sed
+# in-place split) so it behaves identically on macOS and Linux. set -u clean.
+#
+# Sets/raises $REMOVED_ANY when it edits a profile, and prints what it touched.
+_heimdall_remove_path_export() {
+  local D R rc tmp marker mktpl
+  D='\033[2m'; R='\033[0m'
+  # The EXACT marker comment install.sh writes (kept in sync with install.sh).
+  marker='# Added by Heimdall installer — put `hmd`/`heimdall` on PATH'
+  # mktemp template built at runtime (the fill run is assembled, not a literal).
+  mktpl="${TMPDIR:-/tmp}/heimdall-rc.$(printf 'X%.0s' 1 2 3 4 5 6)"
+
+  for rc in "$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.profile"; do
+    [ -f "$rc" ] || continue
+    # Only act if this profile actually carries a heimdall PATH artifact, so an
+    # untouched profile is never rewritten (preserves mtime / avoids churn).
+    if ! grep -qF "$marker" "$rc" 2>/dev/null \
+       && ! grep -qE 'export PATH=.*\.heimdall/bin' "$rc" 2>/dev/null; then
+      continue
+    fi
+    tmp="$(mktemp "$mktpl")" || continue
+    # awk pass:
+    #   - skip the marker comment line
+    #   - if the line IMMEDIATELY AFTER the marker is an `export PATH=...local/bin`
+    #     line, skip it too (the pair install wrote)
+    #   - skip a legacy bare `export PATH=...heimdall/bin` line (no marker, v2.0.1)
+    #   - keep everything else verbatim
+    if awk -v marker="$marker" '
+      BEGIN { skip_next = 0 }
+      {
+        if (skip_next == 1) {
+          skip_next = 0
+          if ($0 ~ /export[ \t]+PATH=.*\.local\/bin/) { next }
+        }
+        if ($0 == marker) { skip_next = 1; next }
+        if ($0 ~ /export[ \t]+PATH=.*\.heimdall\/bin/) { next }
+        print
+      }
+    ' "$rc" > "$tmp" 2>/dev/null; then
+      # Only replace if the content actually changed (true idempotency: a profile
+      # already clean is left byte-identical and reports nothing removed).
+      if ! cmp -s "$rc" "$tmp"; then
+        cat "$tmp" > "$rc" && {
+          printf "  ${D}removed${R} PATH export from %s\n" "$(basename "$rc")"
+          REMOVED_ANY=1
+        }
+      fi
+    fi
+    rm -f "$tmp" 2>/dev/null || true
+  done
+}
+
 # ── Ensure Claude Code is installed ──
 
 ensure_claude() {
@@ -522,11 +591,37 @@ case "${1:-}" in
     D='\033[2m'; G='\033[32m'; R='\033[0m'; B='\033[1m'
     printf "\n  ${B}Uninstalling Heimdall${R}\n\n"
 
+    # ── Farewell (change #3, v2.0.3): the leaving watchman ──
+    # Reuse the SINGLE sad frame (heimdall-face --frame sad) + a one-line goodbye —
+    # NOT an animation loop, just one frame. TTY-gated: on a non-TTY/piped stdout we
+    # emit no art (frame glyphs are garbage bytes through a pipe). Color honored
+    # (NO_COLOR / --no-color → the renderer degrades to plain). HEIMDALL_NO_INTRO=1
+    # also suppresses it (recordings / CI). Never fatal: a missing renderer is
+    # silently skipped so uninstall always proceeds to the real removal below.
+    if [ -t 1 ] && [ "${HEIMDALL_NO_INTRO:-0}" != "1" ] && [ -x "$PLUGIN_DIR/bin/heimdall-face" ]; then
+      _face_flag="--no-color"
+      { [ -z "${NO_COLOR:-}" ] && [ "${TERM:-dumb}" != "dumb" ]; } && _face_flag="--color"
+      while IFS= read -r _fl; do
+        printf "  %s\n" "$_fl"
+      done < <("$PLUGIN_DIR/bin/heimdall-face" --frame sad "$_face_flag" 2>/dev/null)
+      printf "  ${D}the watchman sleeps. it was good to keep watch with you.${R}\n\n"
+    fi
+
+    # Reverse install.sh's appended PATH export FIRST (the v2.0.2 gap: uninstall
+    # removed the plugin + symlinks but left the profile PATH line behind).
+    # ORDER IS LOAD-BEARING: when `hmd` is the ~/.local/bin symlink, readlink-f
+    # resolves the running script to ~/.heimdall/bin/heimdall. _heimdall_remove_plugin
+    # deletes ~/.heimdall — the script's own backing file — so a command AFTER it may
+    # not be read from disk and silently never runs (that was the bug: PATH survived).
+    # The PATH remover must run BEFORE plugin removal so it is guaranteed to execute.
+    # (The --uninstall flag arm already orders it this way.)
+    _heimdall_remove_path_export
     _heimdall_remove_plugin
 
     printf "\n"
     if [ "${REMOVED_ANY:-0}" -eq 1 ]; then
       printf "  ${G}✓${R} Heimdall removed. Nothing else was touched.\n"
+      printf "  ${D}Open a new terminal for the PATH change to take effect.${R}\n"
     else
       printf "  ${D}Nothing to remove — Heimdall was not installed here.${R}\n"
     fi
@@ -711,12 +806,19 @@ if [[ "${1:-}" == "--uninstall" ]]; then
   fi
 
   printf "\n"
-  # Remove PATH entry from shell RC
+  # Remove the heimdall PATH export via the SHARED surgical remover (matches the
+  # marker + the `.local/bin` export install.sh actually writes, and the legacy
+  # `.heimdall/bin` line) — so this arm and `hmd uninstall` reverse PATH the SAME
+  # way. The old sed here only matched `.heimdall/bin`, never the v2.0.2 `.local/bin`
+  # line, so the PATH export survived uninstall.
+  _heimdall_remove_path_export
+  # Legacy superx PATH lines (pre-heimdall installs) — narrowly matched, kept here
+  # because the shared remover intentionally scopes to heimdall artifacts only.
   for rc in "$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.bash_profile"; do
-    if [ -f "$rc" ] && grep -qE '\.(heimdall|superx)/bin' "$rc"; then
-      sed -i '' '/heimdall.*autonomous/d;/\.heimdall\/bin/d;/superx.*autonomous/d;/\.superx\/bin/d' "$rc" 2>/dev/null || \
-      sed -i '/heimdall.*autonomous/d;/\.heimdall\/bin/d;/superx.*autonomous/d;/\.superx\/bin/d' "$rc" 2>/dev/null || true
-      printf "  ${D}×${R} PATH entry removed from $(basename "$rc")\n"
+    if [ -f "$rc" ] && grep -qE 'superx.*autonomous|\.superx/bin' "$rc"; then
+      sed -i '' '/superx.*autonomous/d;/\.superx\/bin/d' "$rc" 2>/dev/null || \
+      sed -i '/superx.*autonomous/d;/\.superx\/bin/d' "$rc" 2>/dev/null || true
+      printf "  ${D}×${R} legacy superx PATH entry removed from $(basename "$rc")\n"
     fi
   done
   sleep 0.1
@@ -1451,6 +1553,65 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# ── Launch boot animation (change #2, v2.0.3): the watchman wakes ──
+#
+# A QUICK wake-up arc played ONCE at the exec-claude handoff, just before the task
+# launches — the same watchman frames the demo's narrate_wakeup plays (sleep →
+# blink → idle → thinking → idle), reusing bin/heimdall-face --frame art (NO new
+# frames authored here). It is a fast wake, not the full demo cadence: the frame
+# holds are short so the SUM of sleeps stays ≤ ~1.5s and the task is never delayed
+# more than ~1.5–2s on the default path.
+#
+# HARD GATES (mirror heimdall-face.md / the demo wake-up):
+#   - non-TTY/piped stdout OR stdin → skip ENTIRELY (frames are garbage through a
+#     pipe; a piped `hmd "task" | cat` emits zero animation bytes),
+#   - HEIMDALL_NO_INTRO=1 → disabled entirely (recordings / CI),
+#   - NO_COLOR / TERM=dumb → the frame renderer degrades to plain (no ANSI),
+#   - ANY keypress during the arc → skips the REST immediately (read -t timeout).
+# Never fatal: a missing renderer is silently skipped so the launch always proceeds.
+narrate_launch_wakeup() {
+  # Gate: real TTY on BOTH stdout and stdin, intro not disabled, renderer present.
+  [ -t 1 ] || return 0
+  [ -t 0 ] || return 0
+  [ "${HEIMDALL_NO_INTRO:-0}" = "1" ] && return 0
+  local face="$PLUGIN_DIR/bin/heimdall-face"
+  [ -x "$face" ] || return 0
+
+  # Color unless NO_COLOR/dumb (the frame renderer also self-disables, this just
+  # avoids asking it to color a surface we know is plain).
+  local face_flag="--no-color"
+  { [ -z "${NO_COLOR:-}" ] && [ "${TERM:-dumb}" != "dumb" ]; } && face_flag="--color"
+
+  local D C R; D='\033[2m'; C='\033[38;2;0;212;255m'; R='\033[0m'
+  printf "\n  ${D}the watchman wakes…${R}  ${D}(press any key to skip)${R}\n\n"
+
+  # Reuse the demo's exact frame SEQUENCE; faster per-frame holds for the launch
+  # variant. Sum of holds = 0.30+0.18+0.28+0.30+0.22 = 1.28s (≤ ~1.5s cap).
+  local frames="sleep blink idle thinking idle"
+  local holds="0.30 0.18 0.28 0.30 0.22"
+  local first=1 i=1 emo hold junk
+  for emo in $frames; do
+    hold="$(printf '%s\n' $holds | sed -n "${i}p")"
+    # Repaint each 3-line frame in place after the first (cursor up 3 rows).
+    [ "$first" -eq 1 ] || printf '\033[3A'
+    first=0
+    while IFS= read -r _fl; do
+      printf '\033[2K  %s\n' "$_fl"
+    done < <("$face" --frame "$emo" "$face_flag" 2>/dev/null)
+    # Hold; any keypress within the hold window aborts the remaining frames and
+    # settles on idle immediately (read -t is fractional-second on bash 3.2+).
+    if read -rsn1 -t "$hold" junk 2>/dev/null; then
+      printf '\033[3A'
+      while IFS= read -r _fl; do
+        printf '\033[2K  %s\n' "$_fl"
+      done < <("$face" --frame idle "$face_flag" 2>/dev/null)
+      break
+    fi
+    i=$((i+1))
+  done
+  printf "  ${C}▸${R} awake. ${D}watching your build.${R}\n\n"
+}
+
 # FIRST-RUN ORDERING CHECKPOINT: every setup phase (auth → companion → skills)
 # has completed above. We are now at the task launch. Emit the launch marker and,
 # in trace mode, short-circuit BEFORE the real `claude` exec so the harness can
@@ -1460,6 +1621,10 @@ _trace_order "launch:task"
 if [ -n "${HEIMDALL_TRACE_ORDER:-}" ]; then
   exit 0
 fi
+
+# Play the quick wake-up arc at the handoff (after the trace short-circuit, so the
+# ordering harness never animates), then hand off to claude exactly as before.
+narrate_launch_wakeup
 
 if [ $# -gt 0 ]; then
   # Non-interactive: wrap task in goal-driven execution

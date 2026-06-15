@@ -228,6 +228,108 @@ else
 fi
 rm -rf "$TMPH3" 2>/dev/null || true
 
+# (6) NON-TTY ANIMATION LEAK — the launch boot animation (#2) and uninstall
+# farewell (#3) are TTY-gated cosmetics. The stranger env is non-TTY (env -i, no
+# controlling terminal), so the launcher must emit ZERO watchman wake-up bytes here
+# (frames piped to a non-TTY are garbage). We drive the launch arm via trace mode
+# (HEIMDALL_TRACE_ORDER + ANTHROPIC_API_KEY) — it runs the full setup→handoff path
+# and short-circuits at the launch marker. narrate_launch_wakeup is wired at that
+# same handoff; its own `[ -t 1 ]` gate means a non-TTY run prints no "watchman
+# wakes" line. (The sad farewell's non-TTY gate is proven directly in 7d below.)
+TRACE6="$TMPH/order.trace.notty"
+NOTTY_OUT="$(in_stranger "$TMPH" env ANTHROPIC_API_KEY="sk-ant-stranger-notty-probe" \
+  HEIMDALL_TRACE_ORDER="$TRACE6" "$LAUNCHER" "noop non-tty animation probe" 2>&1)"
+rm -f "$TRACE6" 2>/dev/null || true
+if printf '%s' "$NOTTY_OUT" | grep -qi 'watchman wakes'; then
+  bad "non-TTY launch leaked the wake-up animation banner (TTY gate failed)"
+else
+  ok "non-TTY launch emits no wake-up animation bytes (TTY-gated cosmetic)"
+fi
+
+# (7) UNINSTALL COMPLETENESS — `hmd uninstall` must REVERSE EVERYTHING install did:
+# the ~/.heimdall plugin clone, BOTH ~/.local/bin symlinks (hmd + heimdall), AND
+# the PATH export line install appended to the shell profile (the v2.0.2 gap). We
+# run it in the SAME stripped HOME that holds a real install (from above), non-TTY
+# (so the farewell frame is gated off — and must leak no art), then assert FULL
+# reversal artifact-by-artifact.
+# Pre-checks: confirm the install artifacts are actually present before removal, so
+# a PASS means the uninstall removed something real (not a vacuous "already gone").
+PRE_PLUGIN=0; [ -d "$TMPH/.heimdall" ] && PRE_PLUGIN=1
+PRE_HMD=0;    { [ -e "$TMPH/.local/bin/hmd" ] || [ -L "$TMPH/.local/bin/hmd" ]; } && PRE_HMD=1
+PRE_HEIM=0;   { [ -e "$TMPH/.local/bin/heimdall" ] || [ -L "$TMPH/.local/bin/heimdall" ]; } && PRE_HEIM=1
+PRE_PATHN=0;  [ -n "$PROFILE" ] && PRE_PATHN="$(grep -cE '\.local/bin' "$PROFILE" 2>/dev/null || echo 0)"
+
+# Preserve a RUNNABLE copy of the launcher OUTSIDE the install tree before the
+# first uninstall removes both the symlink AND the plugin clone — so the
+# idempotency re-run (7e) still has an entry point to invoke against the now-empty
+# HOME. The launcher resolves its own guarded canonical paths ($HOME/.heimdall,
+# $HOME/.local/bin), so running the saved copy with HOME=$TMPH reverses the SAME
+# locations. The mktemp fill run is assembled at runtime, not a source literal.
+SAVED_TPL="${TMPDIR:-/tmp}/heimdall-saved-launcher.$(printf 'X%.0s' 1 2 3 4 5 6)"
+SAVED_LAUNCHER="$(mktemp "$SAVED_TPL")"
+cp "$REAL_LAUNCHER" "$SAVED_LAUNCHER" 2>/dev/null && chmod +x "$SAVED_LAUNCHER" 2>/dev/null || true
+
+UNINST_OUT="$(in_stranger "$TMPH" "$LAUNCHER" uninstall 2>&1)"
+UNINST_RC=$?
+
+# (7a) PATH line GONE — count back to 0 in the profile install wrote.
+if [ -n "$PROFILE" ]; then
+  PATHN_AFTER="$(grep -cE '\.local/bin' "$PROFILE" 2>/dev/null || true)"; : "${PATHN_AFTER:=0}"
+  if [ "${PRE_PATHN:-0}" -ge 1 ] && [ "$PATHN_AFTER" -eq 0 ]; then
+    ok "uninstall removed the PATH export from $(basename "$PROFILE") (was $PRE_PATHN, now 0)"
+  else
+    bad "uninstall did NOT remove the PATH export (was ${PRE_PATHN:-?}, now $PATHN_AFTER) — profile line survives"
+  fi
+else
+  bad "uninstall completeness: no profile was found to check PATH removal"
+fi
+
+# (7b) plugin dir GONE.
+if [ "$PRE_PLUGIN" -eq 1 ] && [ ! -d "$TMPH/.heimdall" ]; then
+  ok "uninstall removed ~/.heimdall plugin dir"
+else
+  bad "uninstall did NOT remove ~/.heimdall (pre=$PRE_PLUGIN, still present=$([ -d "$TMPH/.heimdall" ] && echo yes || echo no))"
+fi
+
+# (7c) BOTH symlinks GONE.
+if [ "$PRE_HMD" -eq 1 ] || [ "$PRE_HEIM" -eq 1 ]; then
+  if [ ! -e "$TMPH/.local/bin/hmd" ] && [ ! -L "$TMPH/.local/bin/hmd" ] \
+     && [ ! -e "$TMPH/.local/bin/heimdall" ] && [ ! -L "$TMPH/.local/bin/heimdall" ]; then
+    ok "uninstall removed both ~/.local/bin symlinks (hmd, heimdall)"
+  else
+    bad "uninstall left a launcher symlink behind in ~/.local/bin"
+  fi
+else
+  bad "uninstall completeness: no launcher symlink was present to remove (install regressed)"
+fi
+
+# (7d) non-TTY uninstall leaked NO farewell animation bytes.
+if printf '%s' "$UNINST_OUT" | grep -q '▾'; then
+  bad "non-TTY uninstall leaked the sad farewell frame (should be TTY-gated)"
+else
+  ok "non-TTY uninstall emits no farewell animation bytes (TTY-gated cosmetic)"
+fi
+
+# (7e) IDEMPOTENT — a SECOND uninstall (run from the SAVED launcher copy, since the
+# first run removed the on-PATH symlink + plugin tree) finds nothing to remove and
+# exits 0, leaving the now-clean HOME byte-for-byte unchanged.
+SECOND_OUT="$(in_stranger "$TMPH" "$SAVED_LAUNCHER" uninstall 2>&1)"
+SECOND_RC=$?
+rm -f "$SAVED_LAUNCHER" 2>/dev/null || true
+if [ "$UNINST_RC" -eq 0 ] && [ "$SECOND_RC" -eq 0 ]; then
+  PATHN_2="$([ -n "$PROFILE" ] && grep -cE '\.local/bin' "$PROFILE" 2>/dev/null || true)"; : "${PATHN_2:=0}"
+  # The second run must also report it found nothing (idempotent no-op), and must
+  # not have resurrected any artifact.
+  if [ "$PATHN_2" -eq 0 ] && [ ! -d "$TMPH/.heimdall" ] \
+     && printf '%s' "$SECOND_OUT" | grep -qi 'Nothing to remove'; then
+    ok "uninstall is idempotent — second run exits 0, finds nothing, PATH still 0"
+  else
+    bad "second uninstall was not a clean no-op (PATH=$PATHN_2, out: $(printf '%s' "$SECOND_OUT" | tr '\n' ' ' | sed 's/  */ /g'))"
+  fi
+else
+  bad "uninstall not idempotent — exit codes: first=$UNINST_RC second=$SECOND_RC (expected 0/0)"
+fi
+
 echo "--------------------------------------------------------------------"
 echo "  $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
