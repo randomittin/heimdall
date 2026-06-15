@@ -195,7 +195,7 @@ main() {
   # Pinned ref. No release tag exists yet, so this defaults to `main`; the
   # README one-liner resolves runheimdall.dev/install to a pinned tag, and the
   # release script templates that tag in here. HEIMDALL_REF overrides for dev.
-  local DEFAULT_REF="v2.0.2"
+  local DEFAULT_REF="v2.0.3"
   local REF="${HEIMDALL_REF:-$DEFAULT_REF}"
   local REPO="${HEIMDALL_REPO:-https://github.com/randomittin/heimdall.git}"
 
