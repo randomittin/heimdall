@@ -184,6 +184,50 @@ else
   ok "after re-install, hmd demo still resolves"
 fi
 
+# (5) FIRST-RUN ORDERING — on a fresh install's first run, auth setup +
+# companion-plugin setup must FULLY COMPLETE before the first task launches.
+# A real first run can't be driven here (no live model call), so we drive the
+# launcher's first-run path with HEIMDALL_TRACE_ORDER=<file>: it emits one
+# ordered marker per phase to that file (setup:auth, setup:companion,
+# setup:skills, launch:task) and short-circuits just before the `claude … -p`
+# exec. The contract this asserts: EVERY setup:* marker precedes launch:task —
+# no interleaving, no setup deferred past the launch. We run on a FRESH HOME so
+# the first-run marker (.setup-done) is absent and the full setup phase fires.
+TMPH3="$(mktemp -d)"
+run_install "$TMPH3" >/dev/null 2>&1
+LAUNCHER3="$TMPH3/.local/bin/hmd"
+[ -e "$LAUNCHER3" ] || LAUNCHER3="$TMPH3/.local/bin/heimdall"
+# Resolve the installed plugin dir, then remove any setup marker so this is a
+# genuine first run (the full auth+companion+skills setup phase must fire).
+REAL_L3="$(in_stranger "$TMPH3" /usr/bin/readlink -f "$LAUNCHER3" 2>/dev/null || echo "$LAUNCHER3")"
+PLUGIN3="$(cd "$(dirname "$REAL_L3")/.." && pwd)"
+rm -f "$PLUGIN3/.setup-done" 2>/dev/null || true
+TRACE3="$TMPH3/order.trace"
+# ANTHROPIC_API_KEY makes ensure_auth a no-op no-login (it returns immediately
+# when a key is present), so we drive the ordering path WITHOUT a live login or
+# model call — the stripped env has no TTY/credentials to log in with. We assert
+# the ORDER of setup vs launch, not a live task.
+in_stranger "$TMPH3" env ANTHROPIC_API_KEY="sk-ant-stranger-ordering-probe" \
+  HEIMDALL_TRACE_ORDER="$TRACE3" "$LAUNCHER3" "noop first-run ordering probe" >/dev/null 2>&1 || true
+if [ ! -f "$TRACE3" ]; then
+  bad "first-run ordering: launcher emitted no trace (HEIMDALL_TRACE_ORDER ignored)"
+else
+  ORDER="$(tr '\n' ' ' < "$TRACE3")"
+  # Line number of each phase marker; every setup phase must precede the launch.
+  L_AUTH="$(grep -n '^setup:auth$'      "$TRACE3" | head -1 | cut -d: -f1)"
+  L_COMP="$(grep -n '^setup:companion$' "$TRACE3" | head -1 | cut -d: -f1)"
+  L_SKIL="$(grep -n '^setup:skills$'    "$TRACE3" | head -1 | cut -d: -f1)"
+  L_LNCH="$(grep -n '^launch:task$'     "$TRACE3" | head -1 | cut -d: -f1)"
+  if [ -z "$L_AUTH" ] || [ -z "$L_COMP" ] || [ -z "$L_SKIL" ] || [ -z "$L_LNCH" ]; then
+    bad "first-run ordering: missing a phase marker (trace: $ORDER)"
+  elif [ "$L_AUTH" -lt "$L_LNCH" ] && [ "$L_COMP" -lt "$L_LNCH" ] && [ "$L_SKIL" -lt "$L_LNCH" ]; then
+    ok "first-run ordering: auth+companion+skills setup complete BEFORE task launch (trace: $ORDER)"
+  else
+    bad "first-run ordering: setup interleaved with/deferred past launch (trace: $ORDER)"
+  fi
+fi
+rm -rf "$TMPH3" 2>/dev/null || true
+
 echo "--------------------------------------------------------------------"
 echo "  $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
