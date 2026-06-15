@@ -5,6 +5,9 @@
   "bin": {
     "runheimdall": "bin/runheimdall.js"
   },
+  "scripts": {
+    "test": "node --test src/"
+  },
   "files": [
     "bin/runheimdall.js",
     "README.md"
