@@ -24,6 +24,19 @@ PLUGIN_DIR="$(cd "$(dirname "$SELF")/.." && pwd)"
 WORK_DIR="$(pwd)"
 SETUP_MARKER="$PLUGIN_DIR/.setup-done"
 
+# ── First-run ordering trace (debug + acceptance harness) ──
+#
+# When HEIMDALL_TRACE_ORDER points at a file, each first-run phase appends one
+# ordered marker to it (setup:auth → setup:companion → setup:skills →
+# launch:task) and the launcher short-circuits just before the real `claude`
+# exec. This is how test/install-stranger.sh proves, WITHOUT a live model call,
+# that auth + companion-plugin setup fully complete BEFORE the first task
+# launches. A no-op when the env var is unset, so normal runs are unaffected.
+_trace_order() {
+  [ -n "${HEIMDALL_TRACE_ORDER:-}" ] || return 0
+  printf '%s\n' "$1" >> "$HEIMDALL_TRACE_ORDER" 2>/dev/null || true
+}
+
 # ── Shared removal path (uninstall subcommand AND legacy --uninstall) ──
 #
 # The ONE guarded removal. Both `hmd uninstall` and `heimdall --uninstall` call
@@ -1125,12 +1138,140 @@ $(head -50 "$ctx")
   fi
 }
 
+# ── Pre-install plugins based on prompt + project files ──
+
+preinstall_plugins() {
+  [ $# -eq 0 ] && return 0
+  prompt_lower=$(echo "$*" | tr '[:upper:]' '[:lower:]')
+  installed=$(claude plugins list 2>/dev/null || echo "")
+
+  _try_install() {
+    echo "$installed" | grep -q "$1" && return 0
+    printf "  \033[38;2;0;212;255m▸ Installing %s\033[0m\n" "$1"
+    claude plugins install "$1" >/dev/null 2>&1 || true
+  }
+
+  # From prompt keywords
+  echo "$prompt_lower" | grep -qE 'react|vue|angular|css|responsive|ui|frontend|component' && _try_install "frontend-design"
+  echo "$prompt_lower" | grep -qE 'docker|k8s|kubernetes|deploy|ci.?cd|pipeline' && _try_install "devops-toolkit"
+  echo "$prompt_lower" | grep -qE 'sql|database|schema|migration|prisma|typeorm' && _try_install "database-toolkit"
+  echo "$prompt_lower" | grep -qE 'seo|meta.?tag|sitemap|robots.?txt' && _try_install "seo"
+  echo "$prompt_lower" | grep -qE 'auth|jwt|oauth|security|owasp|vulnerability' && _try_install "security-scanner"
+  echo "$prompt_lower" | grep -qE 'api|openapi|swagger|rest|graphql' && _try_install "api-design"
+  echo "$prompt_lower" | grep -qE 'slack|notification|webhook' && _try_install "slack"
+  echo "$prompt_lower" | grep -qE 'mcp|tool.?server|model.?context' && _try_install "mcp-server-dev"
+
+  # From project files (if they exist)
+  [ -f "$WORK_DIR/package.json" ] && grep -q "react\|vue\|angular\|svelte" "$WORK_DIR/package.json" 2>/dev/null && _try_install "frontend-design"
+  [ -f "$WORK_DIR/Dockerfile" ] || [ -f "$WORK_DIR/docker-compose.yml" ] && _try_install "devops-toolkit"
+  [ -f "$WORK_DIR/prisma/schema.prisma" ] || [ -f "$WORK_DIR/ormconfig.json" ] && _try_install "database-toolkit"
+
+  # External skill marketplaces (add once, available forever)
+  _try_marketplace() {
+    claude plugins marketplace list 2>/dev/null | grep -q "$1" && return 0
+    printf "  \033[38;2;100;100;120m▸ Adding marketplace: %s\033[0m\n" "$1"
+    claude plugins marketplace add "$1" >/dev/null 2>&1 || true
+  }
+  _try_marketplace "wshobson/agents"
+
+  printf "\n"
+}
+
+# ── Auto-discover and install skills from registry ──
+
+discover_skills() {
+  # Auto-install skills from registry based on task prompt keywords
+  [ $# -eq 0 ] && return 0
+  local prompt_lower skills_dir registry
+  prompt_lower=$(echo "$*" | tr '[:upper:]' '[:lower:]')
+  skills_dir="$HOME/.claude/skills"
+  registry="$PLUGIN_DIR/skills-registry.json"
+
+  [ -f "$registry" ] || return 0
+  command -v python3 &>/dev/null || return 0
+
+  # Match prompt against registry keywords, return repos to install
+  local matches
+  matches=$(python3 -c "
+import json, re, sys
+prompt = '''$prompt_lower'''
+with open('$registry') as f:
+    reg = json.load(f)
+for skill in reg.get('skills', []):
+    for kw in skill.get('keywords', []):
+        if re.search(r'\b' + re.escape(kw) + r'\b', prompt):
+            print(skill['name'] + '|' + skill['repo'])
+            break
+" 2>/dev/null)
+
+  [ -z "$matches" ] && return 0
+
+  while IFS='|' read -r name repo; do
+    local skill_path="$skills_dir/$name"
+    if [ -d "$skill_path" ]; then
+      continue  # already installed
+    fi
+    printf "  \033[38;2;0;212;255m▸ Installing skill: %s\033[0m (%s)\n" "$name" "$repo"
+    mkdir -p "$skills_dir"
+    git clone --depth 1 "https://github.com/${repo}.git" "$skill_path" 2>/dev/null || true
+  done <<< "$matches"
+}
+
+# ── First-run setup phase (ORDERED, gated, completes BEFORE first launch) ──
+#
+# THE ORDERING CONTRACT (the bug this fixes): on a fresh install's first run,
+# authentication setup and ALL companion-plugin/skill setup must FULLY COMPLETE
+# before the first task launches — never interleaved with, never deferred past,
+# the launch. Previously the core companion setup ran up top while the
+# prompt-driven companion-plugin + skill installs (preinstall_plugins,
+# discover_skills) were deferred down to immediately before `claude … -p`,
+# interleaving companion setup with launch sequencing.
+#
+# This wrapper makes the whole phase contiguous and ordered:
+#   1. auth        — ensure_auth (login / API key resolved)
+#   2. companion   — first_run_setup (caveman, superpowers, claude-mem, marketplace)
+#   3. skills      — preinstall_plugins + discover_skills (prompt-driven extras)
+# Each phase emits an ordered trace marker (see _trace_order) so the stranger
+# harness can prove setup precedes launch without a live model call.
+#
+# GATING: the heavy companion+skill installs run only when the first-run marker
+# ($SETUP_MARKER) is ABSENT (genuine first run). first_run_setup itself is
+# idempotent and self-gates on the same marker, so subsequent runs skip the
+# install work and proceed straight to launch. ensure_auth always runs (auth may
+# expire), but is a fast no-op once authenticated.
+complete_first_run_setup() {
+  local is_first_run=0
+  [ -f "$SETUP_MARKER" ] || is_first_run=1
+
+  # 1. AUTH — must resolve before any plugin install (installs may hit the API).
+  ensure_auth
+  _trace_order "setup:auth"
+
+  # 2. COMPANION PLUGINS — caveman / superpowers / claude-mem / marketplace.
+  #    Idempotent + marker-gated inside first_run_setup; touches $SETUP_MARKER.
+  first_run_setup
+  _trace_order "setup:companion"
+
+  # 3. PROMPT-DRIVEN SKILLS/PLUGINS — only the first run pays the install cost;
+  #    later runs already have the marker, so we skip straight past. This keeps
+  #    the "subsequent runs launch directly" contract while guaranteeing first
+  #    run completes the full setup before launch.
+  if [ "$is_first_run" -eq 1 ]; then
+    preinstall_plugins "$@"
+    discover_skills "$@"
+  fi
+  _trace_order "setup:skills"
+}
+
 # ── Main: ensure deps, then launch Claude ──
 
 ensure_node_path
 ensure_claude
-ensure_auth
-first_run_setup
+# ORDERED FIRST-RUN SETUP: auth → companion plugins → skills, all completed here
+# BEFORE the launch path below. Pass the task args so prompt-driven installs see
+# the prompt. select_model still runs in the launch-prep block (it needs the
+# checkpoint settings loaded just below) — it is launch CONFIG, not setup.
+complete_first_run_setup "$@"
 apply_heimdall_theme
 ensure_project_claude_md
 print_banner
@@ -1289,88 +1430,7 @@ except: pass
   printf "  \033[38;2;155;89;182m▸ Model:\033[0m %s\n" "$MODEL_NAME"
 }
 
-# ── Pre-install plugins based on prompt + project files ──
-
-preinstall_plugins() {
-  [ $# -eq 0 ] && return 0
-  prompt_lower=$(echo "$*" | tr '[:upper:]' '[:lower:]')
-  installed=$(claude plugins list 2>/dev/null || echo "")
-
-  _try_install() {
-    echo "$installed" | grep -q "$1" && return 0
-    printf "  \033[38;2;0;212;255m▸ Installing %s\033[0m\n" "$1"
-    claude plugins install "$1" >/dev/null 2>&1 || true
-  }
-
-  # From prompt keywords
-  echo "$prompt_lower" | grep -qE 'react|vue|angular|css|responsive|ui|frontend|component' && _try_install "frontend-design"
-  echo "$prompt_lower" | grep -qE 'docker|k8s|kubernetes|deploy|ci.?cd|pipeline' && _try_install "devops-toolkit"
-  echo "$prompt_lower" | grep -qE 'sql|database|schema|migration|prisma|typeorm' && _try_install "database-toolkit"
-  echo "$prompt_lower" | grep -qE 'seo|meta.?tag|sitemap|robots.?txt' && _try_install "seo"
-  echo "$prompt_lower" | grep -qE 'auth|jwt|oauth|security|owasp|vulnerability' && _try_install "security-scanner"
-  echo "$prompt_lower" | grep -qE 'api|openapi|swagger|rest|graphql' && _try_install "api-design"
-  echo "$prompt_lower" | grep -qE 'slack|notification|webhook' && _try_install "slack"
-  echo "$prompt_lower" | grep -qE 'mcp|tool.?server|model.?context' && _try_install "mcp-server-dev"
-
-  # From project files (if they exist)
-  [ -f "$WORK_DIR/package.json" ] && grep -q "react\|vue\|angular\|svelte" "$WORK_DIR/package.json" 2>/dev/null && _try_install "frontend-design"
-  [ -f "$WORK_DIR/Dockerfile" ] || [ -f "$WORK_DIR/docker-compose.yml" ] && _try_install "devops-toolkit"
-  [ -f "$WORK_DIR/prisma/schema.prisma" ] || [ -f "$WORK_DIR/ormconfig.json" ] && _try_install "database-toolkit"
-
-  # External skill marketplaces (add once, available forever)
-  _try_marketplace() {
-    claude plugins marketplace list 2>/dev/null | grep -q "$1" && return 0
-    printf "  \033[38;2;100;100;120m▸ Adding marketplace: %s\033[0m\n" "$1"
-    claude plugins marketplace add "$1" >/dev/null 2>&1 || true
-  }
-  _try_marketplace "wshobson/agents"
-
-  printf "\n"
-}
-
-# ── Auto-discover and install skills from registry ──
-
-discover_skills() {
-  # Auto-install skills from registry based on task prompt keywords
-  [ $# -eq 0 ] && return 0
-  local prompt_lower skills_dir registry
-  prompt_lower=$(echo "$*" | tr '[:upper:]' '[:lower:]')
-  skills_dir="$HOME/.claude/skills"
-  registry="$PLUGIN_DIR/skills-registry.json"
-
-  [ -f "$registry" ] || return 0
-  command -v python3 &>/dev/null || return 0
-
-  # Match prompt against registry keywords, return repos to install
-  local matches
-  matches=$(python3 -c "
-import json, re, sys
-prompt = '''$prompt_lower'''
-with open('$registry') as f:
-    reg = json.load(f)
-for skill in reg.get('skills', []):
-    for kw in skill.get('keywords', []):
-        if re.search(r'\b' + re.escape(kw) + r'\b', prompt):
-            print(skill['name'] + '|' + skill['repo'])
-            break
-" 2>/dev/null)
-
-  [ -z "$matches" ] && return 0
-
-  while IFS='|' read -r name repo; do
-    local skill_path="$skills_dir/$name"
-    if [ -d "$skill_path" ]; then
-      continue  # already installed
-    fi
-    printf "  \033[38;2;0;212;255m▸ Installing skill: %s\033[0m (%s)\n" "$name" "$repo"
-    mkdir -p "$skills_dir"
-    git clone --depth 1 "https://github.com/${repo}.git" "$skill_path" 2>/dev/null || true
-  done <<< "$matches"
-}
-
 select_model "$@"
-preinstall_plugins "$@"
-discover_skills "$@"
 
 # Write preamble to temp file for --append-system-prompt-file
 # (more reliable than inline for large preambles with special chars)
@@ -1390,6 +1450,16 @@ cleanup() {
   [ -n "$RESTORE_FILE" ] && [ -x "$SKILL_MGR" ] && "$SKILL_MGR" restore "$RESTORE_FILE" 2>/dev/null
 }
 trap cleanup EXIT
+
+# FIRST-RUN ORDERING CHECKPOINT: every setup phase (auth → companion → skills)
+# has completed above. We are now at the task launch. Emit the launch marker and,
+# in trace mode, short-circuit BEFORE the real `claude` exec so the harness can
+# assert setup-precedes-launch without a live model call. Normal runs (no
+# HEIMDALL_TRACE_ORDER) fall straight through to the launch below.
+_trace_order "launch:task"
+if [ -n "${HEIMDALL_TRACE_ORDER:-}" ]; then
+  exit 0
+fi
 
 if [ $# -gt 0 ]; then
   # Non-interactive: wrap task in goal-driven execution
