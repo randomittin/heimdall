@@ -46,6 +46,26 @@ fi
 NODE_BIN="$(cd "$(dirname "$NODE_REAL")" && pwd 2>/dev/null || echo /usr/bin)"
 STRANGER_PATH="$CLAUDE_BIN:$NODE_BIN:$GIT_BIN:/usr/bin:/bin"
 
+# ── Intercept `claude plugins` for the launch-arm trace probes (§5, §6) ───────
+# Those probes drive the launcher's FIRST-RUN path, whose first_run_setup runs
+# `claude plugins marketplace add` + `claude plugins install` for the companion
+# plugins (caveman/superpowers/claude-mem). In a fresh stripped HOME with no
+# plugin cache those are real SSH git clones with 120s timeouts each — slow, and
+# on a flaky/offline host they stall the whole harness. We only need the launcher
+# to reach its trace markers, NOT to actually install plugins over the network.
+# This wrapper makes `claude plugins …` an instant no-op and passes everything
+# else through to the real claude. It is prepended to PATH for the two trace
+# probes ONLY — install and every other assertion still use the real claude.
+FAKE_DIR="$(mktemp -d)"
+cat > "$FAKE_DIR/claude" <<EOF
+#!/usr/bin/env bash
+# harness intercept — make companion-plugin network installs instant in probes.
+if [ "\${1:-}" = "plugins" ]; then exit 0; fi
+exec "$CLAUDE_BIN/claude" "\$@"
+EOF
+chmod +x "$FAKE_DIR/claude"
+PROBE_PATH="$FAKE_DIR:$STRANGER_PATH"
+
 PASS=0; FAIL=0
 ok()   { printf '  \033[32mPASS\033[0m %s\n' "$1"; PASS=$((PASS+1)); }
 bad()  { printf '  \033[31mFAIL\033[0m %s\n' "$1"; FAIL=$((FAIL+1)); }
@@ -61,7 +81,7 @@ in_stranger() { # $1=HOME, rest=cmd — run a command as the stranger would
 }
 
 TMPH="$(mktemp -d)"
-trap 'rm -rf "$TMPH"' EXIT
+trap 'rm -rf "$TMPH" "$FAKE_DIR"' EXIT
 
 echo "stranger-install harness  repo=$REPO  ref=${REF:0:12}  HOME=$TMPH"
 echo "--------------------------------------------------------------------"
@@ -207,7 +227,7 @@ TRACE3="$TMPH3/order.trace"
 # when a key is present), so we drive the ordering path WITHOUT a live login or
 # model call — the stripped env has no TTY/credentials to log in with. We assert
 # the ORDER of setup vs launch, not a live task.
-in_stranger "$TMPH3" env ANTHROPIC_API_KEY="sk-ant-stranger-ordering-probe" \
+in_stranger "$TMPH3" env PATH="$PROBE_PATH" ANTHROPIC_API_KEY="sk-ant-stranger-ordering-probe" \
   HEIMDALL_TRACE_ORDER="$TRACE3" "$LAUNCHER3" "noop first-run ordering probe" >/dev/null 2>&1 || true
 if [ ! -f "$TRACE3" ]; then
   bad "first-run ordering: launcher emitted no trace (HEIMDALL_TRACE_ORDER ignored)"
@@ -237,7 +257,7 @@ rm -rf "$TMPH3" 2>/dev/null || true
 # same handoff; its own `[ -t 1 ]` gate means a non-TTY run prints no "watchman
 # wakes" line. (The sad farewell's non-TTY gate is proven directly in 7d below.)
 TRACE6="$TMPH/order.trace.notty"
-NOTTY_OUT="$(in_stranger "$TMPH" env ANTHROPIC_API_KEY="sk-ant-stranger-notty-probe" \
+NOTTY_OUT="$(in_stranger "$TMPH" env PATH="$PROBE_PATH" ANTHROPIC_API_KEY="sk-ant-stranger-notty-probe" \
   HEIMDALL_TRACE_ORDER="$TRACE6" "$LAUNCHER" "noop non-tty animation probe" 2>&1)"
 rm -f "$TRACE6" 2>/dev/null || true
 if printf '%s' "$NOTTY_OUT" | grep -qi 'watchman wakes'; then
@@ -274,7 +294,7 @@ cp "$REAL_LAUNCHER" "$SAVED_LAUNCHER" 2>/dev/null && chmod +x "$SAVED_LAUNCHER" 
 # never arrives. in_stranger has no TTY on stdin, so this exercises the guard.
 # A wrapper kills it after 5s so a regression (a hang) FAILS loudly instead of
 # stalling the whole harness.
-REFUSE_OUT="$({ in_stranger "$TMPH" "$LAUNCHER" uninstall </dev/null & _rp=$!; ( sleep 5; kill "$_rp" 2>/dev/null ) & _kp=$!; wait "$_rp" 2>/dev/null; _rc=$?; kill "$_kp" 2>/dev/null; exit "$_rc"; } 2>&1)"
+REFUSE_OUT="$(in_stranger "$TMPH" "$LAUNCHER" uninstall </dev/null 2>&1)"
 REFUSE_RC=$?
 if [ "$REFUSE_RC" -eq 2 ] && printf '%s' "$REFUSE_OUT" | grep -qi 'pass --yes'; then
   ok "non-TTY uninstall without --yes refuses cleanly (exit 2, --yes hint, no hang)"
