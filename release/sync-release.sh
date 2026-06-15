@@ -35,6 +35,7 @@ REDIRECTS="$ROOT/_redirects"
 README="$ROOT/README.md"
 INSTALL="$ROOT/install.sh"
 PKG="$ROOT/packages/runheimdall/package.json"
+MANIFEST="$ROOT/.claude-plugin/plugin.json"
 
 REPO_PATH="randomittin/heimdall"
 RAW_BASE="https://raw.githubusercontent.com/${REPO_PATH}"
@@ -92,7 +93,7 @@ if ! have jq; then
 fi
 
 # ── Preconditions ────────────────────────────────────────────────────────────
-for f in "$VERCEL" "$REDIRECTS" "$README" "$INSTALL" "$PKG"; do
+for f in "$VERCEL" "$REDIRECTS" "$README" "$INSTALL" "$PKG" "$MANIFEST"; do
   [ -f "$f" ] || { echo "sync-release.sh: missing artifact: $f" >&2; exit 1; }
 done
 
@@ -159,6 +160,17 @@ jq --arg v "$VERSION" --arg tag "$TAG" --arg url "$INSTALL_URL" --arg sha "$NEW_
     | .heimdall.sha256 = $sha' \
    "$PKG" > "$T"
 write_file "$PKG" "$T"
+
+# 6. plugin manifest .version — bump to the release version so the manifest stays
+# consistent with the tag. The launcher's heimdall_version() resolves the tag
+# FIRST and only falls back to this field when git is unavailable, so this is a
+# fallback value, not the source of truth — but a stale fallback is a latent lie
+# (it shipped 1.1.0 while the real release was v2.0.x). Keeping it in lockstep
+# here means the tarball/no-git fallback never drifts, and the conformance
+# version fixture (which cross-checks manifest ↔ resolved version) stays green.
+T="$(mktemp)"
+jq --arg v "$VERSION" '.version = $v' "$MANIFEST" > "$T"
+write_file "$MANIFEST" "$T"
 
 # ── ASSERTION: redirect and npx resolve to byte-identical scripts ────────────
 # We re-read the artifacts (post-write, or pre-write under --dry) and prove:

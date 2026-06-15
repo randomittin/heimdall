@@ -107,10 +107,25 @@ fi
 # the same $0→readlink→PLUGIN_DIR resolution; then we directly probe that each
 # component the task path invokes exists beside the resolved launcher.
 VER_OUT="$(in_stranger "$TMPH" "$LAUNCHER" version 2>&1)"
-if printf '%s' "$VER_OUT" | grep -qiE 'Heimdall v[0-9]'; then
-  ok "hmd version runs via resolved launcher: $(printf '%s' "$VER_OUT" | grep -iE 'Heimdall v' | head -1 | sed 's/^ *//')"
-else
+VER_LINE="$(printf '%s' "$VER_OUT" | grep -iE 'Heimdall v[0-9]' | head -1 | sed 's/^ *//')"
+# TIGHTENED (was: merely asserts it RUNS). `hmd version` must report the EXACT
+# release version the launcher resolves (git-describe of the installed tree →
+# manifest fallback) — the SAME value the success card shows. It previously read
+# plugin.json directly and reported a hardcoded "Heimdall v1.1.0" for the entire
+# v2.0.x line; this gate makes that drift impossible to re-ship.
+if [ -z "$VER_LINE" ]; then
   bad "hmd version failed to run through the launcher: $VER_OUT"
+elif printf '%s' "$VER_OUT" | grep -qE "Heimdall v${EXPECT_VER}([^0-9]|\$)"; then
+  # Equals the installed release version. Also explicitly reject the stale 1.1.0
+  # whenever the release has moved past it (defense in depth — if EXPECT_VER ever
+  # mis-resolves, a literal 1.1.0 still fails loudly here).
+  if [ "$EXPECT_VER" != "1.1.0" ] && printf '%s' "$VER_OUT" | grep -qE 'Heimdall v1\.1\.0([^0-9]|$)'; then
+    bad "hmd version reports stale hardcoded 1.1.0 (expected v$EXPECT_VER) — plugin.json drift"
+  else
+    ok "hmd version reports release version v$EXPECT_VER (not stale 1.1.0): $VER_LINE"
+  fi
+else
+  bad "hmd version is not the installed release v$EXPECT_VER — got: $VER_LINE"
 fi
 # Resolve PLUGIN_DIR exactly as the launcher does (readlink -f $0 → dirname/..)
 REAL_LAUNCHER="$(in_stranger "$TMPH" /usr/bin/readlink -f "$LAUNCHER" 2>/dev/null || echo "$LAUNCHER")"

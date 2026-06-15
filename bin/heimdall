@@ -301,6 +301,12 @@ heimdall_version() {
     fi
   fi
   if [ -z "$ver" ]; then
+    # Manifest fallback — used ONLY when git is unavailable (e.g. a tarball
+    # install with no .git). plugin.json's .version is NOT the source of truth:
+    # the git tag is. It is a best-effort fallback that release/sync-release.sh
+    # bumps so it stays consistent with the tag (and the conformance version
+    # fixture cross-checks both). Treat a stale value here as a fallback-only
+    # lie-of-last-resort, never as authoritative.
     local manifest="$PLUGIN_DIR/.claude-plugin/plugin.json"
     if [ -f "$manifest" ]; then
       local raw=""
@@ -379,17 +385,18 @@ ENTRY_NAME="$(basename "$0")"   # hmd or heimdall — for self-referential help
 
 case "${1:-}" in
   version|--version|-v|-V)
-    ver="?"
-    if [ -f "$PLUGIN_DIR/.claude-plugin/plugin.json" ]; then
-      if command -v jq >/dev/null 2>&1; then
-        ver="$(jq -r '.version // "?"' "$PLUGIN_DIR/.claude-plugin/plugin.json" 2>/dev/null || echo '?')"
-      else
-        ver="$(grep -oE '"version"[[:space:]]*:[[:space:]]*"[^"]+"' "$PLUGIN_DIR/.claude-plugin/plugin.json" 2>/dev/null | head -1 | sed -E 's/.*"([^"]+)".*/\1/')"
-        [ -n "$ver" ] || ver="?"
-      fi
-    fi
+    # Resolve via the SAME dynamic resolver the banner + install card use, so all
+    # three surfaces report identically and plugin.json's .version can never make
+    # `hmd version` drift (it was hardcoded 1.1.0 and reported a lie). Resolution
+    # order is owned by heimdall_version(): nearest git tag → manifest fallback
+    # ONLY if git is unavailable. Do NOT re-parse plugin.json here.
+    ver="$(heimdall_version)"      # returns vX.Y.Z (or empty if neither source resolves)
+    ver="${ver#v}"                 # strip leading v for the "Heimdall v<...>" format
+    [ -n "$ver" ] || ver="?"
     echo "Heimdall v$ver"
-    if [ -d "$PLUGIN_DIR/.git" ]; then
+    # Use rev-parse (not [ -d .git ]) so the commit line also resolves inside a
+    # git WORKTREE, where .git is a gitdir-pointer FILE rather than a directory.
+    if git -C "$PLUGIN_DIR" rev-parse --git-dir >/dev/null 2>&1; then
       sha="$(git -C "$PLUGIN_DIR" rev-parse --short HEAD 2>/dev/null || echo '')"
       [ -n "$sha" ] && echo "  commit $sha"
     fi
