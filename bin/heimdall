@@ -583,13 +583,33 @@ case "${1:-}" in
     ;;
   uninstall)
     # Remove the plugin dir + BOTH entry points (hmd, heimdall) and nothing
-    # else. This is on the success card, so it must exist. No stdin prompt
-    # (uninstall may run non-interactively); behavior is a confirmation print
-    # of exactly what was removed. The guarded removal lives in the shared
-    # _heimdall_remove_plugin (so --uninstall cannot drift to an unguarded rm).
+    # else. This is on the success card, so it must exist. The guarded removal
+    # lives in the shared _heimdall_remove_plugin (so it cannot drift to an
+    # unguarded rm).
+    #
+    # CONFIRMATION DISCIPLINE (v2.0.4): a safety guard must NEVER hang. We mirror
+    # the same non-TTY discipline install/demo/boot-animation use:
+    #   --yes/-y           → proceed without prompting (CI, scripts, the harness)
+    #   TTY, no --yes      → prompt [y/N] (a human can answer)
+    #   NON-TTY, no --yes  → refuse cleanly: exit 2 with the --yes hint. NEVER
+    #                        read from a stdin that will never arrive (that hangs).
     apply_heimdall_theme 2>/dev/null || true
     D='\033[2m'; G='\033[32m'; R='\033[0m'; B='\033[1m'
     printf "\n  ${B}Uninstalling Heimdall${R}\n\n"
+
+    _uyes=0; for _a in "$@"; do { [ "$_a" = "--yes" ] || [ "$_a" = "-y" ]; } && _uyes=1; done
+    if [ "$_uyes" -ne 1 ]; then
+      if [ -t 0 ]; then
+        read -p "  Remove heimdall from ~/.heimdall and PATH? [y/N] " _confirm
+        if [[ "${_confirm:-n}" != [yY]* ]]; then
+          printf "\n  ${D}Cancelled — nothing removed.${R}\n\n"
+          exit 0
+        fi
+      else
+        printf "  ${D}Non-interactive: pass --yes to confirm uninstall (refusing to prompt).${R}\n" >&2
+        exit 2
+      fi
+    fi
 
     # ── Farewell (change #3, v2.0.3): the leaving watchman ──
     # Reuse the SINGLE sad frame (heimdall-face --frame sad) + a one-line goodbye —

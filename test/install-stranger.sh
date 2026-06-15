@@ -269,7 +269,20 @@ SAVED_TPL="${TMPDIR:-/tmp}/heimdall-saved-launcher.$(printf 'X%.0s' 1 2 3 4 5 6)
 SAVED_LAUNCHER="$(mktemp "$SAVED_TPL")"
 cp "$REAL_LAUNCHER" "$SAVED_LAUNCHER" 2>/dev/null && chmod +x "$SAVED_LAUNCHER" 2>/dev/null || true
 
-UNINST_OUT="$(in_stranger "$TMPH" "$LAUNCHER" uninstall 2>&1)"
+# (7·0) SAFETY: bare `uninstall` (no --yes) in a NON-TTY context must REFUSE
+# cleanly — exit 2 with the --yes hint — and must NOT hang on a stdin read that
+# never arrives. in_stranger has no TTY on stdin, so this exercises the guard.
+# A wrapper kills it after 5s so a regression (a hang) FAILS loudly instead of
+# stalling the whole harness.
+REFUSE_OUT="$({ in_stranger "$TMPH" "$LAUNCHER" uninstall </dev/null & _rp=$!; ( sleep 5; kill "$_rp" 2>/dev/null ) & _kp=$!; wait "$_rp" 2>/dev/null; _rc=$?; kill "$_kp" 2>/dev/null; exit "$_rc"; } 2>&1)"
+REFUSE_RC=$?
+if [ "$REFUSE_RC" -eq 2 ] && printf '%s' "$REFUSE_OUT" | grep -qi 'pass --yes'; then
+  ok "non-TTY uninstall without --yes refuses cleanly (exit 2, --yes hint, no hang)"
+else
+  bad "non-TTY uninstall without --yes did not refuse cleanly (rc=$REFUSE_RC, out: $(printf '%s' "$REFUSE_OUT" | tr '\n' ' '))"
+fi
+
+UNINST_OUT="$(in_stranger "$TMPH" "$LAUNCHER" uninstall --yes 2>&1)"
 UNINST_RC=$?
 
 # (7a) PATH line GONE — count back to 0 in the profile install wrote.
@@ -313,7 +326,7 @@ fi
 # (7e) IDEMPOTENT — a SECOND uninstall (run from the SAVED launcher copy, since the
 # first run removed the on-PATH symlink + plugin tree) finds nothing to remove and
 # exits 0, leaving the now-clean HOME byte-for-byte unchanged.
-SECOND_OUT="$(in_stranger "$TMPH" "$SAVED_LAUNCHER" uninstall 2>&1)"
+SECOND_OUT="$(in_stranger "$TMPH" "$SAVED_LAUNCHER" uninstall --yes 2>&1)"
 SECOND_RC=$?
 rm -f "$SAVED_LAUNCHER" 2>/dev/null || true
 if [ "$UNINST_RC" -eq 0 ] && [ "$SECOND_RC" -eq 0 ]; then
