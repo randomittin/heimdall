@@ -2,7 +2,9 @@
   "mcpServers": {
     "heimdall-ledger": {
       "command": "python3",
-      "args": ["bin/heimdall-ledger-mcp"],
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/bin/heimdall-ledger-mcp"
+      ],
       "env": {}
     }
   }
