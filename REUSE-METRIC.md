@@ -204,3 +204,23 @@ required field, `reuse_pct: null`, and a `reason`:
 
 This component (C1) defines and emits the number. C2 and C4 build on the merged
 record.
+
+## S-6 C4 — Halt-if-low-reuse rule
+
+After a task run emits its reuse record, `check_reuse_halt` (in `bin/heimdall`)
+evaluates `reuse_pct` against the floor **`REUSE_HALT_THRESHOLD` (default 0.30)**:
+
+- `reuse_pct < 0.30` (a genuine low-reuse measurement) → **hard-warn + block
+  auto-continue** with an honest signal naming the `suspected_duplicates`:
+  *"Low reuse (X%) — likely reinventing existing code: [...]. Inspect before
+  proceeding."* (advisory exit code 7). This is a hard-warn, **not** a destructive
+  mid-completion halt — by the time reuse is measured the work exists; the right
+  move is to surface it loudly and require an explicit acknowledgement, not to
+  discard the run.
+- `--force` (or `HEIMDALL_FORCE=1`) → acknowledge and proceed.
+- `reuse_pct = null` (unsupported language / no signal) → **do NOT fire**
+  (absence of signal ≠ low reuse).
+- metric error / degraded record / `HEIMDALL_NO_REUSE_METRIC=1` → **fail-open**
+  (never block a run because analysis broke).
+
+The thesis dogfooded: Heimdall refuses to *silently* ship reinvention.
