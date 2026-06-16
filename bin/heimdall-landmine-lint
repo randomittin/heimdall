@@ -1,0 +1,405 @@
+#!/usr/bin/env bash
+# heimdall-landmine-lint — strict-mode shell landmine detector (FAILS CLOSED).
+#
+# Across the v2.0.x launch, a recurring class of silent-failure bugs bit
+# Heimdall's own shell scripts: strict-mode (`set -euo pipefail`) semantics
+# interacting with an edge case to fail invisibly. Each was caught by a harness
+# assertion AFTER it bit a stranger. This linter catches the CLASS at the gate,
+# so the NEXT one fails the push instead of freezing a stranger's terminal.
+#
+# It is the shell analogue of the gitleaks self-scan: a blocking pre-push check
+# over Heimdall's OWN scripts. It is wired into bin/heimdall-selfscan, so a
+# landmine fails `git push` exactly the way a leaked secret does.
+#
+# Scope (resolved RELATIVE to the repo top — no baked paths, dogfooding class 3):
+#   bin/heimdall, bin/heimdall-*, install.sh, hooks/*.sh, release/*.sh
+#
+# Landmine classes (each finding prints  file:line  CLASS  snippet  → fix-hint):
+#   1 SIGPIPE        a terminal `| head`/`| head -c N` inside $(...)/assignment,
+#                    in a set -e/pipefail script, WITHOUT a trailing `|| true`
+#                    (or `|| echo …`) guard. The demo-abort class.
+#   2 UNGUARDED-VAR  the same-line `local a="$1" b="$a/…"` trap (RHS expanded
+#                    before the local exists → unbound under set -u). High
+#                    confidence only; class 2 is best-effort by design.
+#   3 BAKED-PATH     a machine-specific absolute literal (/Users/<u>, /home/<u>,
+#                    bare /superx) in code — breaks relocation.
+#   4 TTY-READ       an interactive `read`/`read -p` from inherited stdin with no
+#                    `[ -t 0 ]` TTY guard and no `--yes`/-y refusal gate and no
+#                    `-t` timeout. The uninstall-hang class.
+#   5 ORDER-DESTROY  a `_heimdall_remove_plugin`-style self-deletion followed by a
+#                    `source`/`.` of a file under the just-deleted tree. Heuristic;
+#                    documented known-hard (see README block below).
+#
+# Classes 2 and 5 are intentionally HIGH-CONFIDENCE-ONLY: a noisy linter gets
+# disabled and is worse than none. We prefer under-flagging on 2/5 (with the
+# limits documented here) over false positives on the already-guarded tree.
+#
+# Exit codes:
+#   0  clean — no landmine found
+#   1  one or more landmines found (details printed to stdout)
+#   2  usage / cannot resolve scope
+#
+# Usage:
+#   heimdall-landmine-lint                 scan the repo this script lives in
+#   heimdall-landmine-lint --root DIR      scan DIR instead (used by the fixture)
+#   heimdall-landmine-lint FILE [FILE…]    scan explicit files (used by the fixture)
+
+set -euo pipefail
+
+# ── Resolve the repo root (RELOCATABLE — no baked path) ───────────────────────
+ROOT=""
+declare -a EXPLICIT_FILES=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --root) ROOT="${2:-}"; shift 2 ;;
+    -h|--help)
+      sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0 ;;
+    --) shift; while [ $# -gt 0 ]; do EXPLICIT_FILES+=("$1"); shift; done ;;
+    -*) echo "heimdall-landmine-lint: unknown option: $1" >&2; exit 2 ;;
+    *)  EXPLICIT_FILES+=("$1"); shift ;;
+  esac
+done
+
+if [ "${#EXPLICIT_FILES[@]}" -eq 0 ]; then
+  if [ -z "$ROOT" ]; then
+    # The scanner lives at <repo>/bin/heimdall-landmine-lint. Resolve <repo> from
+    # the script's own location first (works even outside a git checkout), then
+    # fall back to the git top. Never bake an absolute path.
+    _self="$0"
+    case "$_self" in
+      */*) : ;;
+      *) _self="$(command -v "$_self" 2>/dev/null || echo "$_self")" ;;
+    esac
+    _bindir="$(cd "$(dirname "$_self")" 2>/dev/null && pwd)"
+    ROOT="$(cd "$_bindir/.." 2>/dev/null && pwd)"
+    if [ -z "$ROOT" ] || [ ! -d "$ROOT/bin" ]; then
+      ROOT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+    fi
+  fi
+  if [ -z "$ROOT" ] || [ ! -d "$ROOT" ]; then
+    echo "heimdall-landmine-lint: cannot resolve repo root (pass --root DIR)" >&2
+    exit 2
+  fi
+fi
+
+# ── Build the in-scope file list ──────────────────────────────────────────────
+declare -a FILES=()
+if [ "${#EXPLICIT_FILES[@]}" -gt 0 ]; then
+  FILES=("${EXPLICIT_FILES[@]}")
+else
+  # bin/heimdall and every bin/heimdall-* component, install.sh, hooks/*.sh,
+  # release/*.sh — but NEVER this linter itself (its comments name every pattern
+  # it hunts for; scanning itself would be a guaranteed false positive).
+  _self_real="$(cd "$(dirname "$0")" 2>/dev/null && pwd)/$(basename "$0")"
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    [ -f "$f" ] || continue
+    _f_real="$(cd "$(dirname "$f")" 2>/dev/null && pwd)/$(basename "$f")"
+    [ "$_f_real" = "$_self_real" ] && continue
+    FILES+=("$f")
+  done <<EOF
+$( {
+    [ -f "$ROOT/bin/heimdall" ] && echo "$ROOT/bin/heimdall"
+    for g in "$ROOT"/bin/heimdall-*; do [ -f "$g" ] && echo "$g"; done
+    [ -f "$ROOT/install.sh" ] && echo "$ROOT/install.sh"
+    for g in "$ROOT"/hooks/*.sh; do [ -f "$g" ] && echo "$g"; done
+    for g in "$ROOT"/release/*.sh; do [ -f "$g" ] && echo "$g"; done
+  } )
+EOF
+fi
+
+if [ "${#FILES[@]}" -eq 0 ]; then
+  echo "heimdall-landmine-lint: no in-scope files found under ${ROOT:-explicit list}" >&2
+  exit 2
+fi
+
+# ── Finding accumulator ───────────────────────────────────────────────────────
+FINDINGS=0
+emit() {
+  # emit FILE LINE CLASS SNIPPET FIXHINT
+  local file="$1" line="$2" class="$3" snip="$4" hint="$5"
+  # Trim the snippet of leading whitespace and clamp length for readability.
+  snip="${snip#"${snip%%[![:space:]]*}"}"
+  if [ "${#snip}" -gt 90 ]; then snip="${snip:0:87}..."; fi
+  printf '%s:%s  %s  %s  → %s\n' "$file" "$line" "$class" "$snip" "$hint"
+  FINDINGS=$((FINDINGS + 1))
+}
+
+# A line is "code-ish" (worth scanning) when its first non-blank char is not `#`.
+# This is a cheap comment filter; it deliberately does NOT try to strip trailing
+# inline comments (that needs a real parser) — the per-class matchers are written
+# to tolerate that by anchoring on the dangerous construct itself.
+is_comment() {
+  case "${1#"${1%%[![:space:]]*}"}" in
+    '#'*) return 0 ;;
+    *)    return 1 ;;
+  esac
+}
+
+# Does this file run under strict mode (set -e and/or pipefail)? Class 1 only
+# bites when the pipeline's nonzero status can abort the script.
+file_is_strict() {
+  grep -qE '^[[:space:]]*set[[:space:]]+-[a-z]*e[a-z]*' "$1" 2>/dev/null && return 0
+  grep -qE '^[[:space:]]*set[[:space:]]+-o[[:space:]]+pipefail' "$1" 2>/dev/null && return 0
+  grep -qE '^[[:space:]]*set[[:space:]]+-[a-z]*o[a-z]*[[:space:]]+pipefail' "$1" 2>/dev/null && return 0
+  return 1
+}
+
+# ── CLASS 1 — SIGPIPE: terminal `| head` inside $(...) / assignment, unguarded ─
+# The bug: `x="$(… | head -c N)"` in a set -e/pipefail script. `head` closes the
+# pipe after N bytes → upstream gets SIGPIPE → nonzero pipeline → set -e aborts.
+# We flag only the HIGH-CONFIDENCE shape:
+#   * the line contains a command substitution `$(` (or is a bare `x=$(…` assign),
+#   * `head` (with or without `-c`/`-n`) is the LAST stage of a pipe on that line
+#     (i.e. immediately followed by `)` / EOL / `;` — its downstream closes),
+#   * there is NO `|| true` / `|| echo` / `|| :` guard after the head stage.
+# A `… | head | sed …` (head not terminal) is NOT flagged: head's downstream
+# keeps reading, so no early close at the substitution boundary.
+scan_sigpipe() {
+  local file="$1" line lineno=0
+  file_is_strict "$file" || return 0
+  while IFS= read -r line; do
+    lineno=$((lineno + 1))
+    is_comment "$line" && continue
+    # Must be inside a command substitution / assignment context.
+    case "$line" in
+      *'$('*|*'`'*) : ;;
+      *) continue ;;
+    esac
+    # Find a `head` that is the terminal stage of a pipe: `| head [...]` followed
+    # only by optional close-paren/backtick/semicolon/whitespace to EOL.
+    # head with a byte/line cap is the canonical early-closer.
+    if printf '%s' "$line" \
+         | grep -qE '\|[[:space:]]*head([[:space:]]+-[cn][[:space:]]*[0-9]+)?[[:space:]]*(\)|`|;|$)'; then
+      # Guarded if a `|| true` / `|| :` / `|| echo` appears AFTER the head stage.
+      if printf '%s' "$line" | grep -qE 'head[^|]*\|\|[[:space:]]*(true|:|echo)'; then
+        continue
+      fi
+      emit "$file" "$lineno" "1-SIGPIPE" "$line" \
+        "terminal '| head' in \$(…) under set -e/pipefail closes the pipe → SIGPIPE aborts; append '|| true'"
+    fi
+  done < "$file"
+}
+
+# ── CLASS 2 — UNGUARDED-VAR: same-line local self-reference (set -u trap) ──────
+# The bug: `local dir="$1" hooks="$dir/.heimdall"` — bash expands the WHOLE rhs
+# of the `local` before any of the names exist, so `$dir` resolves to the OUTER
+# scope (or unbound under set -u). High-confidence pattern: a `local`/`declare`
+# that assigns a name AND, later on the SAME line, dereferences that same name.
+# This is the only class-2 shape we flag (best-effort by design; documented).
+scan_unguarded_var() {
+  local file="$1" line lineno=0
+  while IFS= read -r line; do
+    lineno=$((lineno + 1))
+    is_comment "$line" && continue
+    case "$line" in
+      *local\ *|*declare\ *|*'	'local\ *) : ;;
+      *) continue ;;
+    esac
+    # Pull the declaration body after the `local`/`declare` keyword, then TRUNCATE
+    # at the first `;` — the `local` statement ends there. Bash expands only the
+    # RHS of the local itself before the names exist; a `$name` deref in a LATER
+    # statement on the same line (`local x=1; use $x`) is NOT the trap (x already
+    # exists by then). Truncating at `;` is what keeps this high-confidence.
+    local body
+    body="$(printf '%s' "$line" | sed -E 's/.*\b(local|declare)[[:space:]]+(-[A-Za-z]+[[:space:]]+)*//')"
+    body="${body%%;*}"
+    # Collect names assigned in the statement: tokens of the form  NAME=
+    local names
+    names="$(printf '%s' "$body" | grep -oE '[A-Za-z_][A-Za-z0-9_]*=' | sed 's/=$//' | sort -u || true)"
+    [ -n "$names" ] || continue
+    local nm
+    while IFS= read -r nm; do
+      [ -n "$nm" ] || continue
+      # The trap fires when `$nm` is dereferenced in the RHS of the SAME local —
+      # i.e. AFTER this name's own `nm=` but still inside the local statement.
+      # Take the body from this name's assignment to the next assignment and look
+      # for a deref of nm there; strip the `nm=` itself so the assignment LHS
+      # never counts as a use.
+      local after deref
+      after="$(printf '%s' "$body" | sed -E "s/^.*\b${nm}=//")"
+      deref="$(printf '%s' "$after" | sed -E "s/\b${nm}=//g")"
+      if printf '%s' "$deref" | grep -qE "\\\$\\{?${nm}([^A-Za-z0-9_]|\\})"; then
+        emit "$file" "$lineno" "2-UNGUARDED-VAR" "$line" \
+          "'\$${nm}' is dereferenced in the same 'local' that declares it (RHS expands before the local exists → unbound under set -u); split into two statements"
+        break
+      fi
+    done <<EOF
+$names
+EOF
+  done < "$file"
+}
+
+# ── CLASS 3 — BAKED-PATH: machine-specific absolute literal ───────────────────
+# The bug: hardcoded /Users/…, /home/…, or a bare absolute /superx where a
+# ${VAR:-default} (or $HOME-relative) path belonged → broke when dirs moved.
+# We flag ONLY machine-specific absolutes that pin to a user's home or the old
+# product dir. We do NOT flag `$HOME/.heimdall` (relocatable per-user) nor the
+# `${HEIMDALL_HOME:-$HOME/.heimdall}` guarded form, and we skip sed/grep DELETE
+# patterns that match LEGACY paths for removal (`/\.superx\/bin/d`).
+scan_baked_path() {
+  local file="$1" line lineno=0
+  while IFS= read -r line; do
+    lineno=$((lineno + 1))
+    is_comment "$line" && continue
+    # Skip lines whose absolute literal lives inside a sed/grep address that is
+    # matching a LEGACY path for deletion/substitution (not a path the script
+    # depends on). Heuristic: a `/…/d` or `s/…/` sed verb on the line plus the
+    # superx token preceded by `.` (i.e. `.superx`, the dotdir, not `/superx`).
+    case "$line" in
+      *sed\ *|*grep\ *) _is_sed=1 ;;
+      *) _is_sed=0 ;;
+    esac
+    # /Users/<name>/  or  /home/<name>/  — a real per-machine home literal.
+    if printf '%s' "$line" | grep -qE '/(Users|home)/[A-Za-z][A-Za-z0-9._-]+'; then
+      emit "$file" "$lineno" "3-BAKED-PATH" "$line" \
+        "machine-specific absolute home literal — use \$HOME or a \${VAR:-default} so the script stays relocatable"
+      continue
+    fi
+    # bare /superx as an ABSOLUTE path segment (not `.superx`, not in a sed
+    # delete of a legacy line). The old product root that broke on rename.
+    if printf '%s' "$line" | grep -qE '(^|[^A-Za-z0-9._/])/superx([/"'"'"' ]|$)'; then
+      if [ "$_is_sed" = 1 ]; then continue; fi
+      emit "$file" "$lineno" "3-BAKED-PATH" "$line" \
+        "bare absolute '/superx' (the old product root) — use a \${VAR:-default} relocatable path"
+    fi
+  done < "$file"
+}
+
+# ── CLASS 4 — TTY-READ: interactive read with no TTY/--yes guard ───────────────
+# The bug: a confirmation `read -p "…?"` that, on a non-TTY stdin (piped install,
+# CI), blocks forever. Safe forms we must NOT flag:
+#   * `read … <…` / `read … <<<…` / `read … <<EOF` (reads from a file/herestring),
+#   * `… | while … read …` and `done < <(…)` (reads a pipe, never the terminal),
+#   * `read -t N …` (a timeout caps the wait),
+#   * a `read` guarded by `[ -t 0 ]` within the preceding few lines,
+#   * a `read` in a block already gated by a `--yes`/-y refusal that exits when
+#     stdin is not a TTY (the canonical uninstall pattern).
+# We flag a bare interactive `read`/`read -p` from INHERITED stdin lacking all of
+# those guards.
+scan_tty_read() {
+  local file="$1"
+  local -a lines=()
+  local l
+  while IFS= read -r l; do lines+=("$l"); done < "$file"
+  local n="${#lines[@]}" i
+  for (( i=0; i<n; i++ )); do
+    line="${lines[$i]}"
+    local lineno=$((i + 1))
+    is_comment "$line" && continue
+    # Strip double- and single-quoted string CONTENT so the word "read" inside a
+    # message ("… read claims first …") is never mistaken for the read command.
+    local bare
+    bare="$(printf '%s' "$line" | sed -E "s/\"[^\"]*\"//g; s/'[^']*'//g")"
+    # Must contain a `read` command word (start of line or after ;/&&/|| / `(`).
+    printf '%s' "$bare" | grep -qE '(^|[;&|({]|then|else|do)[[:space:]]*read([[:space:]]|$)' || continue
+    # Skip `read` that pulls from a pipe/file/herestring/process-sub (not stdin):
+    #   trailing `< …`, `<<< …`, `<<EOF`, or the line is the body of `… | while`.
+    case "$bare" in
+      *'<<<'*|*'<<'*|*'< '*|*'<('*) continue ;;
+      *'<'*) continue ;;
+    esac
+    # A `read` consuming a pipe: the `while … read` whose stdin is a pipe. If the
+    # SAME line has a `|` before the `read`, it is not the terminal-stdin hang.
+    case "$bare" in
+      *'|'*read*) continue ;;
+    esac
+    # `read -t N` (timeout) or `read -rsn1 -t` cannot hang.
+    printf '%s' "$bare" | grep -qE 'read([[:space:]]+-[A-Za-z0-9]+)*[[:space:]]+-t([[:space:]]|[0-9])' && continue
+    printf '%s' "$bare" | grep -qE 'read[[:space:]].*[[:space:]]-t[[:space:]]*[0-9]' && continue
+    # Guard search: scan UPWARD to the enclosing scope start (a column-0 `if … then`,
+    # a `funcname() {`, or a closing `fi`/`}`), looking for either a `[ -t 0 ]`
+    # TTY check or a `--yes`/-y refusal gate that exits/returns when stdin is not a
+    # TTY. This covers the canonical uninstall pattern where the refusal sits at the
+    # top of the arm and every later `read` in that arm is reachable only with --yes
+    # OR a real TTY. Scoping to the enclosing block (not a fixed line window) avoids
+    # both false positives (missed far guard) and reaching across unrelated blocks.
+    local guarded=0 j
+    for (( j=i-1; j>=0; j-- )); do
+      local prev="${lines[$j]}"
+      # A comment line is never a guard — and a comment that DESCRIBES the guard
+      # (e.g. "… no [ -t 0 ] guard") must not be mistaken for one.
+      is_comment "$prev" && continue
+      # Enclosing-scope start / boundary at column 0 → stop searching above it,
+      # but inspect the boundary line itself first (an `if [ -t 0 ]; then` guard
+      # lives on that boundary line).
+      if printf '%s' "$prev" | grep -qE '\[\[?[[:space:]]+!?[[:space:]]*-t[[:space:]]+0[[:space:]]'; then guarded=1; break; fi
+      if printf '%s' "$prev" | grep -qE '(ASSUME_YES|_uyes|--yes|-y)' \
+         && printf '%s' "$prev" | grep -qE '(!?[[:space:]]*-t[[:space:]]+0)'; then guarded=1; break; fi
+      case "$prev" in
+        # Boundary: a NEW arm/function opening at column 0 means we've left the
+        # current scope going up — stop (the guard, if any, must be inside it).
+        'if [['*'== "--'*) break ;;
+        [A-Za-z_]*'() {'|[A-Za-z_]*'(){'|[A-Za-z_]*'() {'*) break ;;
+      esac
+    done
+    [ "$guarded" -eq 1 ] && continue
+    emit "$file" "$lineno" "4-TTY-READ" "$line" \
+      "interactive 'read' from inherited stdin with no '[ -t 0 ]' / --yes guard → hangs forever on a non-TTY stdin; gate it with '[ -t 0 ]'"
+  done
+}
+
+# ── CLASS 5 — ORDER-DESTROY: source/. of a file under a just-deleted tree ──────
+# The bug class: a script deletes its own plugin dir / $0 backing file and then
+# references a function or sources a file that no longer exists on disk. Full
+# static detection is HARD (control flow, indirect deletes) — documented as a
+# known-hard heuristic. We flag the HIGH-CONFIDENCE shape only: after a line that
+# calls `_heimdall_remove_plugin` (or `rm -rf "$0"`/`rm -rf "$PLUGIN_DIR"`/
+# `rm -rf "$HOME/.heimdall"`), a LATER line in the SAME scope SOURCES a file
+# (`source X` / `. X`) whose path is under the deleted tree (plugin dir / $HOME/
+# .heimdall). A plain external command after the delete is NOT flagged (that was
+# the correctly-ordered v2.0.x fix).
+scan_order_destroy() {
+  local file="$1"
+  local -a lines=()
+  local l
+  while IFS= read -r l; do lines+=("$l"); done < "$file"
+  local n="${#lines[@]}" i
+  for (( i=0; i<n; i++ )); do
+    line="${lines[$i]}"
+    is_comment "$line" && continue
+    # A self-destruction line.
+    local destroyed=0
+    printf '%s' "$line" | grep -qE '_heimdall_remove_plugin\b' && destroyed=1
+    printf '%s' "$line" | grep -qE 'rm[[:space:]]+-rf[[:space:]]+"?\$(\{)?(0|PLUGIN_DIR|HEIMDALL_HOME)' && destroyed=1
+    printf '%s' "$line" | grep -qE 'rm[[:space:]]+-rf[[:space:]].*\$HOME/\.heimdall' && destroyed=1
+    [ "$destroyed" -eq 1 ] || continue
+    # Scan forward in the same scope for a source/. of a file under the tree.
+    # Stop at the next function definition boundary `}` at column 0 (end of scope).
+    local j
+    for (( j=i+1; j<n; j++ )); do
+      local nxt="${lines[$j]}"
+      case "$nxt" in
+        '}'*) break ;;            # end of the enclosing function — scope closed
+      esac
+      is_comment "$nxt" && continue
+      # `source FILE` or `. FILE` where FILE references the deleted tree.
+      if printf '%s' "$nxt" | grep -qE '(^|[;&]|then|do|else)[[:space:]]*(source|\.)[[:space:]]+' \
+         && printf '%s' "$nxt" | grep -qE '\$(\{)?(PLUGIN_DIR|HEIMDALL_HOME|HOME)|\.heimdall|\$0'; then
+        emit "$file" "$((j + 1))" "5-ORDER-DESTROY" "$nxt" \
+          "sources a file under a tree deleted at line $((i + 1)) (self-destruct then re-source) → the file is gone; move the source BEFORE the delete"
+      fi
+    done
+  done
+}
+
+# ── Run every detector over every in-scope file ───────────────────────────────
+for f in "${FILES[@]}"; do
+  scan_sigpipe        "$f"
+  scan_unguarded_var  "$f"
+  scan_baked_path     "$f"
+  scan_tty_read       "$f"
+  scan_order_destroy  "$f"
+done
+
+if [ "$FINDINGS" -gt 0 ]; then
+  echo "" >&2
+  echo "heimdall-landmine-lint: ${FINDINGS} landmine(s) found — push BLOCKED." >&2
+  echo "Each must be guarded (|| true / \${var:-default} / [ -t 0 ] / reordered) or it" >&2
+  echo "is a silent-failure waiting to bite a stranger. See conventions.md (landmine rule)." >&2
+  exit 1
+fi
+
+echo "heimdall-landmine-lint: clean — no strict-mode landmines in ${#FILES[@]} in-scope script(s)." >&2
+exit 0

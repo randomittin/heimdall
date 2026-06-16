@@ -765,10 +765,23 @@ if [[ "${1:-}" == "--reinstall" || "${1:-}" == "--fix" ]]; then
   printf "\n  \033[38;2;224;86;160m\033[1m░▒▓█ REINSTALLING █▓▒░\033[0m\n\n"
   printf "  This will wipe ~/.heimdall and re-clone from GitHub.\n"
   printf "  Your projects are NOT affected — only the heimdall tool itself.\n\n"
-  read -p "  Proceed? [y/N] " confirm
-  if [[ "${confirm:-n}" != [yY]* ]]; then
-    echo "  Cancelled."
-    exit 0
+  # Zero-stdin contract (same as --uninstall): this wipes ~/.heimdall, so it must
+  # never block on a confirm prompt when piped or in a non-interactive shell.
+  # Parse --yes/-y; if stdin is NOT a TTY and --yes was not given, refuse rather
+  # than hang on a read that no one will answer (the class-4 TTY-read landmine).
+  _ri_yes=0
+  for _a in "$@"; do { [ "$_a" = "--yes" ] || [ "$_a" = "-y" ]; } && _ri_yes=1; done
+  if [ "$_ri_yes" -ne 1 ]; then
+    if [ -t 0 ]; then
+      read -p "  Proceed? [y/N] " confirm
+      if [[ "${confirm:-n}" != [yY]* ]]; then
+        echo "  Cancelled."
+        exit 0
+      fi
+    else
+      echo "heimdall --reinstall: non-interactive; pass --yes to confirm (refusing to prompt)." >&2
+      exit 2
+    fi
   fi
   printf "\n"
   # Remove old install and delegate to the curl installer.
