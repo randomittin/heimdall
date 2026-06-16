@@ -1060,6 +1060,17 @@ if [[ "${1:-}" == "--no-goal" ]]; then
   shift
 fi
 
+# --force: override the S-6 C4 halt-if-low-reuse advisory. A run measured below
+# the reuse floor (likely reinventing existing code) emits a loud warning and a
+# non-zero advisory that blocks auto-continue; --force acknowledges it and exits
+# with the task's real status instead. Consumed here so it never leaks into the
+# task text. (Also honored via HEIMDALL_FORCE=1.)
+REUSE_FORCE="${HEIMDALL_FORCE:-0}"
+if [[ "${1:-}" == "--force" ]]; then
+  REUSE_FORCE=1
+  shift
+fi
+
 # --no-autocommit / --autocommit: toggle auto-commit for this project
 if [[ "${1:-}" == "--no-autocommit" ]]; then
   touch "$WORK_DIR/.heimdall-no-autocommit"
@@ -1670,9 +1681,13 @@ narrate_launch_wakeup
 # status. heimdall-reuse-metric is itself fail-open (degraded record, exit 0), and
 # this wrapper additionally swallows any error so a broken analyzer can never turn
 # a green task run red. Disable with HEIMDALL_NO_REUSE_METRIC=1.
+# Set by emit_reuse_metric to the JSON record path it wrote (empty if no record
+# was emitted — disabled, not a repo, tool missing). check_reuse_halt reads it.
+REUSE_RECORD=""
 emit_reuse_metric() {
   # $1 = pre-run base ref (HEAD captured before the task launched).
   local base="$1"
+  REUSE_RECORD=""
   [ "${HEIMDALL_NO_REUSE_METRIC:-0}" = "1" ] && return 0
   local tool="$PLUGIN_DIR/bin/heimdall-reuse-metric"
   [ -x "$tool" ] || return 0
@@ -1682,7 +1697,100 @@ emit_reuse_metric() {
   # untracked/uncommitted edits are folded in by the tool's working-tree path.
   "$tool" --repo "$WORK_DIR" --base "$base" \
           --task "$USER_TASK" --run-id "$run_id" 2>/dev/null || true
+  local rec="$WORK_DIR/.planning/reuse/$run_id.json"
+  [ -f "$rec" ] && REUSE_RECORD="$rec"
   return 0
+}
+
+# ── S-6 C4: halt-if-low-reuse rule (dogfood the thesis) ───────────────────────
+#
+# After the reuse record is emitted, inspect the MEASURED reuse. If the run is
+# below the reuse floor (REUSE_HALT_THRESHOLD, default 0.30) it is likely
+# REINVENTING existing repo code rather than building on it — the exact failure
+# S-6 exists to refuse to ship silently. The signal:
+#
+#   Low reuse (X%) — likely reinventing existing code: [suspected_duplicates].
+#   Inspect before proceeding.
+#
+# DECISION — hard-warn + require --force, NOT a true mid-completion halt. By the
+# time this runs the task has already finished and may have committed work; a
+# destructive abort would discard real output. Instead we emit a LOUD warning and
+# return a non-zero ADVISORY (rc 7) that blocks auto-continue. Passing --force
+# (or HEIMDALL_FORCE=1) acknowledges the warning and proceeds with the task's
+# real exit status. Threshold + behavior documented in REUSE-METRIC.md.
+#
+# FAIL-OPEN, FAIL-LOUD contract:
+#   - metric ERROR / degraded record / missing record  -> DO NOT halt (analysis
+#     broke; never block a run because measurement failed).
+#   - reuse_pct == null (unsupported language / no code units) -> DO NOT halt
+#     (no signal is not the same as a low-reuse signal).
+#   - reuse_pct is a real number >= threshold            -> DO NOT halt.
+#   - reuse_pct is a real number  <  threshold            -> HALT-WARN (the only
+#     case that fires: a genuine low-reuse MEASUREMENT).
+#   - HEIMDALL_NO_REUSE_METRIC=1 / --force / HEIMDALL_FORCE=1 -> never halt.
+#
+# Returns 0 (proceed) or 7 (advisory: low reuse, not forced). Never aborts via
+# set -e — the caller invokes it with its status captured.
+REUSE_HALT_THRESHOLD="${HEIMDALL_REUSE_HALT_THRESHOLD:-0.30}"
+check_reuse_halt() {
+  [ "${HEIMDALL_NO_REUSE_METRIC:-0}" = "1" ] && return 0
+  [ "$REUSE_FORCE" = "1" ] && return 0
+  local rec="$REUSE_RECORD"
+  [ -n "$rec" ] && [ -f "$rec" ] || return 0          # no record -> fail-open
+  command -v python3 >/dev/null 2>&1 || return 0      # no parser -> fail-open
+
+  # Parse the record with python3 (already a heimdall dependency). Emits one of:
+  #   "ok"                       -> proceed (>= threshold, null, degraded, error)
+  #   "LOW <pct_int> <dups>"     -> fire the halt-warn (real measurement < floor)
+  local verdict
+  verdict="$(python3 - "$rec" "$REUSE_HALT_THRESHOLD" <<'PYEOF'
+import json, sys
+try:
+    with open(sys.argv[1]) as fh:
+        rec = json.load(fh)
+    thr = float(sys.argv[2])
+except Exception:
+    print("ok"); sys.exit(0)                 # unreadable record -> fail-open
+# Degraded analysis never gates a run.
+if rec.get("degraded"):
+    print("ok"); sys.exit(0)
+pct = rec.get("reuse_pct", None)
+# null pct (unsupported language / no code units) is NOT a low-reuse signal.
+if pct is None:
+    print("ok"); sys.exit(0)
+try:
+    pct = float(pct)
+except (TypeError, ValueError):
+    print("ok"); sys.exit(0)                 # non-numeric -> fail-open
+if pct >= thr:
+    print("ok"); sys.exit(0)                 # measured at/above the floor
+dups = rec.get("suspected_duplicates") or []
+names = []
+for d in dups:
+    n = d.get("duplicates") if isinstance(d, dict) else None
+    if n and n not in names:
+        names.append(n)
+print("LOW %d %s" % (round(pct * 100), ",".join(names) if names else "(none named)"))
+PYEOF
+)"
+
+  case "$verdict" in
+    LOW*)
+      local pct_int dup_list
+      pct_int="$(printf '%s' "$verdict" | cut -d' ' -f2)"
+      dup_list="$(printf '%s' "$verdict" | cut -d' ' -f3-)"
+      local Y O R
+      Y='\033[38;2;255;200;80m'; O='\033[1m'; R='\033[0m'
+      printf "\n  ${Y}${O}⚠ Low reuse (%s%%)${R} — likely reinventing existing code: ${Y}%s${R}.\n" \
+        "$pct_int" "$dup_list" >&2
+      printf "    Inspect before proceeding. Record: %s\n" "$rec" >&2
+      printf "    Re-run with ${O}--force${R} (or HEIMDALL_FORCE=1) to proceed past this advisory.\n\n" >&2
+      return 7
+      ;;
+    *)
+      return 0
+      ;;
+  esac
 }
 
 if [ $# -gt 0 ]; then
@@ -1716,6 +1824,19 @@ ${USER_TASK}"
 
   # Completion handler: emit the reuse record over the run's changed files.
   [ -n "$REUSE_BASE" ] && emit_reuse_metric "$REUSE_BASE"
+
+  # S-6 C4: halt-if-low-reuse advisory. Fail-open on any metric problem; fire a
+  # loud warning + non-zero advisory ONLY on a genuine low-reuse measurement that
+  # was not --force'd. When it fires we exit with the advisory code (7) so an
+  # auto-continue loop stops and the reinvention is inspected; otherwise we exit
+  # with the task's real status. Captured without aborting under set -e.
+  set +e
+  check_reuse_halt
+  REUSE_HALT_RC=$?
+  set -e
+  if [ "$REUSE_HALT_RC" -eq 7 ]; then
+    exit 7
+  fi
 
   exit "$TASK_RC"
 else
