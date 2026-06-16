@@ -118,6 +118,41 @@ if [ -n "$bad_identities" ]; then
   exit 1
 fi
 
+# --- strict-mode landmine lint over Heimdall's OWN shell scripts -----------
+# Third blocking check (alongside secrets + identities): a static lint for the
+# strict-mode (`set -euo pipefail`) silent-failure class that bit the v2.0.x
+# launch — terminal `| head` SIGPIPE, same-line `local` self-reference, baked
+# machine paths, non-TTY `read` hangs, source-after-self-delete. A landmine in
+# the in-scope scripts must fail the push exactly the way a leaked secret does.
+# Resolved RELATIVE to the repo top (no baked path — dogfooding class 3); falls
+# back to a PATH lookup the same way the native pre-push hook resolves THIS
+# script. An ABSENT linter is a hard block: a gate that cannot run must not
+# certify a push.
+LINT=""
+_top="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+if [ -n "$_top" ] && [ -x "$_top/bin/heimdall-landmine-lint" ]; then
+  LINT="$_top/bin/heimdall-landmine-lint"
+elif command -v heimdall-landmine-lint >/dev/null 2>&1; then
+  LINT="$(command -v heimdall-landmine-lint)"
+fi
+if [ -z "$LINT" ]; then
+  echo "BLOCKED: heimdall-landmine-lint not found — the strict-mode landmine gate" >&2
+  echo "cannot run, so this push is refused. Restore bin/heimdall-landmine-lint." >&2
+  exit 1
+fi
+LINT_OUT=""
+LINT_RC=0
+LINT_OUT="$("$LINT" 2>&1)" && LINT_RC=0 || LINT_RC=$?
+if [ "$LINT_RC" -ne 0 ]; then
+  echo "BLOCKED: heimdall-landmine-lint found a strict-mode landmine in Heimdall's" >&2
+  echo "OWN shell scripts. A silent-failure landmine must not leave the machine —" >&2
+  echo "guard it (|| true / \${var:-default} / [ -t 0 ] / reorder) before pushing." >&2
+  echo "------------------------------------------------------------" >&2
+  printf '%s\n' "$LINT_OUT" >&2
+  echo "------------------------------------------------------------" >&2
+  exit 1
+fi
+
 # --- success: emit the single detectable signal line ----------------------
-echo "guard: gitleaks=0 · identities=${allowed_count}/${total_count} allowlisted" >&2
+echo "guard: gitleaks=0 · identities=${allowed_count}/${total_count} allowlisted · landmines=0" >&2
 exit 0
