@@ -1646,6 +1646,32 @@ fi
 # ordering harness never animates), then hand off to claude exactly as before.
 narrate_launch_wakeup
 
+# ── S-6 C1: reuse-metric emission (per-run, completion handler) ───────────────
+#
+# After a real `hmd "task"` run finishes, emit the reuse record over the work the
+# run produced (every changed/added code unit since the PRE-RUN HEAD: committed
+# commits + any uncommitted edits). Computes reuse_pct = units that CALL/IMPORT/
+# EXTEND pre-existing repo code over total changed units. See REUSE-METRIC.md.
+#
+# HARD SAFETY (dogfood strict-mode): this NEVER aborts or alters the task's exit
+# status. heimdall-reuse-metric is itself fail-open (degraded record, exit 0), and
+# this wrapper additionally swallows any error so a broken analyzer can never turn
+# a green task run red. Disable with HEIMDALL_NO_REUSE_METRIC=1.
+emit_reuse_metric() {
+  # $1 = pre-run base ref (HEAD captured before the task launched).
+  local base="$1"
+  [ "${HEIMDALL_NO_REUSE_METRIC:-0}" = "1" ] && return 0
+  local tool="$PLUGIN_DIR/bin/heimdall-reuse-metric"
+  [ -x "$tool" ] || return 0
+  git -C "$WORK_DIR" rev-parse --git-dir >/dev/null 2>&1 || return 0
+  local run_id; run_id="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  # --base is the pre-run HEAD so commits made DURING the run are diffed too;
+  # untracked/uncommitted edits are folded in by the tool's working-tree path.
+  "$tool" --repo "$WORK_DIR" --base "$base" \
+          --task "$USER_TASK" --run-id "$run_id" 2>/dev/null || true
+  return 0
+}
+
 if [ $# -gt 0 ]; then
   # Non-interactive: wrap task in goal-driven execution
   USER_TASK="${*}"
@@ -1658,6 +1684,13 @@ ${USER_TASK}"
     GOAL_PROMPT="$USER_TASK"
   fi
 
+  # Snapshot HEAD before the run so the reuse metric diffs exactly the work the
+  # task produces. Empty when WORK_DIR is not a git repo (metric self-skips).
+  REUSE_BASE="$(git -C "$WORK_DIR" rev-parse HEAD 2>/dev/null || echo '')"
+
+  # Run the task. Capture its exit status WITHOUT aborting (set -e is active) so
+  # the reuse record always emits at completion, then re-propagate the real code.
+  set +e
   claude \
     --agent heimdall \
     $PERMISSION_FLAG \
@@ -1665,6 +1698,13 @@ ${USER_TASK}"
     --plugin-dir "$PLUGIN_DIR" \
     --append-system-prompt-file "$PREAMBLE_FILE" \
     -p "$GOAL_PROMPT"
+  TASK_RC=$?
+  set -e
+
+  # Completion handler: emit the reuse record over the run's changed files.
+  [ -n "$REUSE_BASE" ] && emit_reuse_metric "$REUSE_BASE"
+
+  exit "$TASK_RC"
 else
   # Interactive mode: preamble injected via system prompt file, Claude stays interactive
   claude \
