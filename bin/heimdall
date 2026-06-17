@@ -1793,6 +1793,148 @@ PYEOF
   esac
 }
 
+# ── SOURCE TOKEN METER: hmd self-meters its OWN run's usage (see TOKEN-METRIC.md) ─
+#
+# This is the SOURCE meter that C3's spend axis, P3's spend axis, the statusline
+# token gauge, and the ~75%-savings claim all consume. The mechanism: hmd GENERATES
+# a session id (a uuid) up front and passes it via --session-id to the `claude`
+# task launch. The transcript Claude Code writes is therefore at a DETERMINISTIC
+# path — <projects-root>/<cwd-slug>/<session_id>.jsonl — which hmd KNOWS exactly.
+# No glob, no guessing "where/when did the transcript land" (the mechanism that
+# failed twice with spend=0). hmd streams the task NORMALLY (plain stdout — the
+# user still SEES the agent work, the UX is byte-for-byte unchanged; we only add
+# one flag), then at completion reads THAT ONE transcript by its known session_id
+# and emits the locked usage record.
+#
+# emit_usage_record writes the LOCKED schema to $HEIMDALL_USAGE_OUT when set, else
+# to $WORK_DIR/.heimdall/last-run-usage.json:
+#   { session_id, input_tokens, output_tokens, cache_creation_tokens,
+#     cache_read_tokens, total_tokens, total_cost_usd, model, usage_available }
+# where total_tokens = input+output+cache_creation+cache_read. NEVER fabricates: if
+# usage is genuinely unavailable it emits usage_available:false + zeros + a reason,
+# never a fake total. FAIL-OPEN: any failure here NEVER aborts the task run.
+
+# Generate a session id for the run so the transcript path is known up front.
+# uuidgen if present (every macOS + most Linux), else python3's uuid4, else a
+# timestamp+pid fallback that is still unique-enough to name one transcript.
+gen_session_id() {
+  if command -v uuidgen >/dev/null 2>&1; then
+    uuidgen | tr 'A-Z' 'a-z'
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import uuid; print(uuid.uuid4())'
+  else
+    printf 'hmd-%s-%s\n' "$(date -u +%Y%m%d%H%M%S)" "$$"
+  fi
+}
+
+# Resolve where the usage record should be written.
+usage_out_path() {
+  if [ -n "${HEIMDALL_USAGE_OUT:-}" ]; then
+    printf '%s\n' "$HEIMDALL_USAGE_OUT"
+  else
+    printf '%s\n' "$WORK_DIR/.heimdall/last-run-usage.json"
+  fi
+}
+
+# Emit the locked usage record for the run we just controlled.
+#   $1 = the run's session_id (the one we passed via --session-id)
+#   $2 = the model id the run used (the bare model, e.g. claude-opus-4-8)
+# Reads the EXACT transcript for that session_id (no glob), normalizes via
+# heimdall-tokens, and writes the locked schema. Fail-open: never aborts the run.
+emit_usage_record() {
+  local sid="$1" model="$2"
+  local out; out="$(usage_out_path)"
+  local outdir; outdir="$(dirname "$out")"
+  mkdir -p "$outdir" 2>/dev/null || true
+
+  local tok="$PLUGIN_DIR/bin/heimdall-tokens"
+  # The DETERMINISTIC transcript path: <projects-root>/<cwd-slug>/<session_id>.jsonl.
+  # The slug is every non-alphanumeric char of the absolute cwd replaced with '-'
+  # (the same rule heimdall-tokens uses). We KNOW the session_id, so we name the
+  # exact file — never glob the directory.
+  local projects_root="${HEIMDALL_PROJECTS_ROOT:-$HOME/.claude/projects}"
+  local abscwd; abscwd="$(cd "$WORK_DIR" 2>/dev/null && pwd || printf '%s' "$WORK_DIR")"
+  local slug; slug="$(printf '%s' "$abscwd" | sed 's/[^A-Za-z0-9]/-/g')"
+  local transcript="$projects_root/$slug/$sid.jsonl"
+
+  local rec="" available="false" reason=""
+  if [ -x "$tok" ] && [ -f "$transcript" ]; then
+    # Normalize the run's OWN transcript by its known path (deterministic).
+    rec="$("$tok" session "$transcript" 2>/dev/null || true)"
+    if [ -n "$rec" ] && printf '%s' "$rec" | grep -q '"total_tokens"'; then
+      # available iff the meter found at least one usage-bearing turn (turns>0).
+      local turns; turns="$(printf '%s' "$rec" | sed -n 's/.*"turns"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -1)"
+      if [ -n "$turns" ] && [ "$turns" -gt 0 ] 2>/dev/null; then
+        available="true"
+      else
+        reason="transcript present but carried no usage-bearing turns"
+      fi
+    else
+      reason="heimdall-tokens produced no usable record for the session transcript"
+    fi
+  elif [ ! -x "$tok" ]; then
+    reason="heimdall-tokens meter not available at $tok"
+  else
+    reason="session transcript not found at the deterministic path for session_id"
+  fi
+
+  # Build the locked record. When available, pull the measured components from the
+  # normalized meter record; otherwise emit zeros + usage_available:false + reason.
+  # python3 is a hard heimdall dependency; it does the JSON assembly so the cost
+  # null/number distinction and integer coercion are exact (never a fabricated #).
+  if command -v python3 >/dev/null 2>&1; then
+    REC="$rec" python3 - "$out" "$sid" "$model" "$available" "$reason" <<'PYEOF'
+import json, os, sys
+out, sid, model, available, reason = sys.argv[1:6]
+avail = (available == "true")
+rec = {}
+if avail:
+    try:
+        rec = json.loads(os.environ.get("REC", "") or "{}")
+        if not isinstance(rec, dict):
+            rec = {}
+    except Exception:
+        rec = {}
+def i(k):
+    v = rec.get(k, 0)
+    try:
+        n = int(v)
+        return n if n >= 0 else 0
+    except (TypeError, ValueError):
+        return 0
+inp, outp = i("input_tokens"), i("output_tokens")
+cc, cr = i("cache_creation_tokens"), i("cache_read_tokens")
+total = inp + outp + cc + cr
+cost = rec.get("total_cost_usd", None) if avail else None
+emitted_sid = rec.get("session_id") if avail and rec.get("session_id") else sid
+record = {
+    "session_id": emitted_sid,
+    "input_tokens": inp,
+    "output_tokens": outp,
+    "cache_creation_tokens": cc,
+    "cache_read_tokens": cr,
+    "total_tokens": total,
+    "total_cost_usd": cost,
+    "model": model,
+    "usage_available": avail,
+}
+if not avail:
+    record["reason"] = reason or "usage unavailable"
+try:
+    with open(out, "w", encoding="utf-8") as fh:
+        json.dump(record, fh)
+        fh.write("\n")
+except OSError as _e:
+    sys.stderr.write("heimdall: could not write usage record: %s\n" % _e)
+PYEOF
+  fi
+  return 0
+}
+
+# The bare model id (strip the leading "--model ") for the emitted record's `model`
+# field — provenance for which model the metered run used.
+RUN_MODEL="${MODEL_FLAG#--model }"
+
 if [ $# -gt 0 ]; then
   # Non-interactive: wrap task in goal-driven execution
   USER_TASK="${*}"
@@ -1809,18 +1951,30 @@ ${USER_TASK}"
   # task produces. Empty when WORK_DIR is not a git repo (metric self-skips).
   REUSE_BASE="$(git -C "$WORK_DIR" rev-parse HEAD 2>/dev/null || echo '')"
 
+  # SOURCE METER: generate the run's session id NOW so the transcript path is
+  # deterministic. Passing --session-id makes Claude Code write its turns to the
+  # exact file we read at completion (no glob). Streaming is unchanged: the user
+  # still sees the agent work on plain stdout — we only add one flag.
+  RUN_SESSION_ID="$(gen_session_id)"
+
   # Run the task. Capture its exit status WITHOUT aborting (set -e is active) so
-  # the reuse record always emits at completion, then re-propagate the real code.
+  # the reuse + usage records always emit at completion, then re-propagate the
+  # real code.
   set +e
   claude \
     --agent heimdall \
     $PERMISSION_FLAG \
     $MODEL_FLAG \
+    --session-id "$RUN_SESSION_ID" \
     --plugin-dir "$PLUGIN_DIR" \
     --append-system-prompt-file "$PREAMBLE_FILE" \
     -p "$GOAL_PROMPT"
   TASK_RC=$?
   set -e
+
+  # SOURCE METER completion handler: read THIS run's own transcript by its known
+  # session_id and emit the locked usage record. Fail-open — never alters TASK_RC.
+  emit_usage_record "$RUN_SESSION_ID" "$RUN_MODEL"
 
   # Completion handler: emit the reuse record over the run's changed files.
   [ -n "$REUSE_BASE" ] && emit_reuse_metric "$REUSE_BASE"
