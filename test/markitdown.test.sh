@@ -195,6 +195,61 @@ EOF
   fi
 fi
 
+# ── (d) DoS bound — an oversize input is REFUSED before any read (audit #3) ──
+# Decompression-bomb / huge-file defense: a file exceeding HEIMDALL_MD_MAX_BYTES
+# is refused with the security exit code, before the converter opens it.
+BIG="$ROOTDIR/big.html"
+head -c 4096 /dev/zero | tr '\0' a > "$BIG"
+set +e
+OVER_OUT="$(HEIMDALL_MD_MAX_BYTES=100 "$MD" "$BIG" --root "$ROOTDIR" 2>&1)"
+OVER_RC=$?
+set -e
+if [ "$OVER_RC" -eq 4 ] && printf '%s' "$OVER_OUT" | grep -qi 'oversize\|too large'; then
+  ok "(d) oversize input refused (exit 4) before read — DoS size cap holds"
+else
+  bad "(d) oversize not refused (rc=$OVER_RC): $(printf '%s' "$OVER_OUT" | head -1)"
+fi
+
+# ── (e) EMBEDDED-RESOURCE SSRF — the offline session kills ALL egress (audit #1) ──
+# convert_local is local for the top-level file, but a malicious HTML/SVG can embed
+# remote refs (<img src=169.254.169.254...>). The injected offline requests.Session
+# must raise on EVERY outbound request regardless of the installed converter.
+set +e
+EGRESS="$(python3 -c '
+import sys; sys.path.insert(0,"'"$ROOT"'/bin/lib"); import md_convert as m
+s = m.build_offline_session()
+try:
+    s.get("http://169.254.169.254/latest/meta-data/", timeout=2)
+    print("EGRESS-NOT-BLOCKED")
+except Exception as e:
+    print("BLOCKED:" + type(e).__name__)
+' 2>&1)"
+set -e
+if printf '%s' "$EGRESS" | grep -q '^BLOCKED:'; then
+  ok "(e) embedded-URL egress killed: offline session raises ($EGRESS) — no fetch primitive"
+else
+  bad "(e) offline session did not block egress: $EGRESS"
+fi
+
+# ── (f) TIMEOUT — a slow conversion is interrupted, refused cleanly (audit #3) ──
+set +e
+TMO="$(python3 -c '
+import sys, time; sys.path.insert(0,"'"$ROOT"'/bin/lib"); import md_convert as m
+try:
+    m._run_with_timeout(lambda: time.sleep(5), 1)
+    print("NO-TIMEOUT")
+except m.ConversionTimeout:
+    print("TIMEOUT-REFUSED")
+except Exception as e:
+    print("OTHER:" + type(e).__name__)
+' 2>&1)"
+set -e
+if printf '%s' "$TMO" | grep -q 'TIMEOUT-REFUSED'; then
+  ok "(f) slow conversion interrupted + refused cleanly — DoS timeout holds"
+else
+  bad "(f) timeout did not fire: $TMO"
+fi
+
 echo
 echo "  markitdown tests: $PASS passed, $FAIL failed, $SKIPPED skipped"
 [ "$FAIL" -eq 0 ]
