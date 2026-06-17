@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
 # heimdall-s6-sweep — S-6 Component 3 popular-10 cold generalization sweep RUNNER.
 #
-# The spend-gated, capped, staged HARNESS that runs the S-6 C3 breadth proof:
+# The staged, soft-budgeted, dry-default HARNESS that runs the S-6 C3 breadth proof:
 # for each repo in a manifest, cold-clone it, run `hmd "<task>"` against it,
 # measure REUSE over the run's diff (bin/heimdall-reuse-metric), capture
 # WORKING-OUTPUT evidence by running the repo's own baseline_cmd (regression) and
 # the task's assertion_cmd (behavior) and recording PASS/FAIL with the QUOTED
 # output (runnable evidence, NEVER the agent's self-report — R7); a task PASSES
-# only when BOTH commands exit 0. It records the task's token spend, enforces a
-# HARD spend
-# cap (fail-closed), and is SAFE-BY-DEFAULT: with no mode flag it only DRY-RUNS.
+# only when BOTH commands exit 0. It records the task's token spend and measures it
+# against a SOFT WARN BUDGET (a signal, never a gate — crossing it WARNS + flags the
+# entry but the sweep ALWAYS runs every entry to completion). It is SAFE-BY-DEFAULT:
+# with no mode flag it only DRY-RUNS.
 #
 # This harness does NOT decide the verdict — it produces HONEST numbers. A low
 # reuse distribution is surfaced PROMINENTLY as the finding, never massaged.
@@ -49,11 +50,15 @@
 #   --limit N                Run only the first N repos (the dry-1-2 stage).
 #   --confirm-full           REQUIRED to run ALL entries (or more than --limit).
 #                            Without it a full sweep aborts — it can never run the
-#                            whole popular-10 unattended by accident.
-#   --cap N                  HARD token cap across the sweep (default 600000).
-#                            FAIL-CLOSED: before each task, if projected cumulative
-#                            spend would exceed the cap, abort cleanly with a
-#                            PARTIAL report. The cap is never blown.
+#                            whole popular-10 unattended by accident. (This gate
+#                            guards all-vs-`--limit`; it is unrelated to spend.)
+#   --budget N               SOFT WARN budget on cumulative non_cache_tokens
+#                            (default ~3M; 0/off disables). When cumulative spend
+#                            crosses it, the runner prints a WARN line + flags that
+#                            entry budget_exceeded:true, then CONTINUES. It NEVER
+#                            aborts the sweep — a signal, not a gate.
+#   --cap N                  BACK-COMPAT alias for --budget (no longer a hard cap;
+#                            behaves as the soft budget above, no abort).
 #   --run-id ID              Report file stem (default: timestamp).
 #
 # ── Test seams (the ONLY mocking; used by test/s6-sweep.test.sh to stay free) ─
@@ -66,11 +71,12 @@
 #   run the real `hmd` (which self-meters its OWN run's usage AT THE SOURCE and
 #   writes the emitted record to HEIMDALL_USAGE_OUT — set before the run), and read
 #   spend by normalizing THAT emitted record via bin/heimdall-tokens — the GENERAL
-#   model-token meter — (total_tokens = input+output+cache_creation+cache_read).
-#   The transcript-glob (`heimdall-tokens session --cwd`) source is REMOVED: it
-#   guessed where/when a transcript landed and failed twice with spend=0. The full
-#   breakdown is recorded per repo (token_usage); the fail-closed cap enforces on
-#   total_tokens.
+#   model-token meter — (total_tokens = input+output+cache_creation+cache_read;
+#   non_cache_tokens = total minus cache_read). The transcript-glob
+#   (`heimdall-tokens session --cwd`) source is REMOVED: it guessed where/when a
+#   transcript landed and failed twice with spend=0. The full breakdown is recorded
+#   per repo (token_usage); the SOFT WARN budget is measured on cumulative
+#   non_cache_tokens (flag-only, never aborts).
 #
 # ── Output ────────────────────────────────────────────────────────────────────
 #   Machine-readable .planning/s6-sweep/<run-id>.json — per repo: reuse_pct,
@@ -78,8 +84,10 @@
 #   (reuse-% distribution, working-output rate, total spend). Reported honestly,
 #   low numbers included.
 #
-# Exit: 0 clean (incl. dry-run); 2 usage / malformed manifest; nonzero when a real
-#       sweep aborts on the cap or the --confirm-full gate (fail-closed).
+# Exit: 0 clean (incl. dry-run AND a completed real sweep, even when the soft budget
+#       was crossed); 2 usage / malformed manifest; 3 when a full real sweep is
+#       refused without --confirm-full (fail-closed). The soft budget NEVER changes
+#       the exit code — it only warns + flags.
 set -euo pipefail
 
 SELF="$0"
@@ -100,7 +108,7 @@ else
 fi
 B='\033[1m'; R='\033[0m'
 
-usage() { sed -n '2,82p' "$SELF" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,90p' "$SELF" | sed 's/^# \{0,1\}//'; }
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 # DEFAULT_BUDGET — the SOFT WARN budget on non_cache_tokens PER TASK, ~3M tokens.
@@ -277,6 +285,11 @@ if [ "$MODE" = "dry" ]; then
   else
     printf "  plan: a full sweep would run all ${B}%s${R} repos.\n" "$TOTAL_ENTRIES"
   fi
+  if [ "$BUDGET" -gt 0 ]; then
+    printf "  spend estimate : each task is measured against a soft warn budget of ${B}%s${R} non_cache_tokens (source: %s); crossing it WARNS + flags, never halts.\n" "$BUDGET" "$BUDGET_SOURCE"
+  else
+    printf "  spend estimate : soft budget DISABLED (source: %s) — no per-task estimate gate.\n" "$BUDGET_SOURCE"
+  fi
   printf "  ${W}to run for real:${R} re-invoke WITHOUT --dry-run; a FULL sweep additionally requires ${B}--confirm-full${R}.\n"
   printf "  ${D}nothing was cloned, no model was called, zero tokens spent.${R}\n"
   exit 0
@@ -377,10 +390,14 @@ do_token_record() {
     local injected
     injected="$($SPEND_CMD 2>/dev/null || echo 0)"
     case "$injected" in (*[!0-9]*|'') injected=0 ;; esac
+    # The injected integer is the run's spend; it maps to BOTH total_tokens and
+    # non_cache_tokens (the soft budget is judged on non_cache_tokens), with
+    # cache_read 0 so the two coincide under the deterministic seam.
     jq -cn --argjson t "$injected" \
-      '{input_tokens:0, output_tokens:0, cache_creation_tokens:0,
-        cache_read_tokens:0, total_tokens:$t, turns:0, session_id:null,
-        total_cost_usd:null, note:"spend injected via --spend-cmd (test seam)"}'
+      '{input_tokens:$t, output_tokens:0, cache_creation_tokens:0,
+        cache_read_tokens:0, total_tokens:$t, non_cache_tokens:$t, turns:0,
+        session_id:null, total_cost_usd:null, cost_source:"injected",
+        note:"spend injected via --spend-cmd (test seam)"}'
   elif [ -x "$BIN_DIR/heimdall-tokens" ]; then
     # the run's REAL token usage from the EMITTED record it wrote at the source
     # (fail-open: the meter emits a degraded zeros record on any problem, so this
@@ -392,11 +409,19 @@ do_token_record() {
   fi
 }
 
-# The cap-enforced spend figure: the token record's total_tokens (fail-closed cap
-# is checked on this). Degrades to 0 if the record lacks a numeric total_tokens.
+# The recorded spend figure: the token record's total_tokens (the report's
+# total_token_spend sums this). Degrades to 0 if the record lacks a numeric value.
 do_spend() {
   # $1 token-record JSON
   printf '%s' "$1" | jq -r '.total_tokens // 0' 2>/dev/null || echo 0
+}
+
+# The SOFT-BUDGET figure: the token record's non_cache_tokens (the budget is
+# measured on cumulative non_cache_tokens). Falls back to total_tokens when the
+# record predates the non_cache field, then to 0 — never aborts.
+do_non_cache() {
+  # $1 token-record JSON
+  printf '%s' "$1" | jq -r '.non_cache_tokens // .total_tokens // 0' 2>/dev/null || echo 0
 }
 
 # ── clamp a captured command's output so a noisy suite cannot bloat the report ─
@@ -414,12 +439,22 @@ clamp_evidence() {
 RESULTS_FILE="$WORK_ROOT/results.jsonl"
 : > "$RESULTS_FILE"
 TOTAL_SPEND=0
+TOTAL_NON_CACHE=0
 RAN=0
+ANY_BUDGET_EXCEEDED=false
+# ABORTED is retained in the report schema for back-compat (consumers may read it),
+# but it is ALWAYS false now: the soft budget never aborts. The --confirm-full gate
+# is the only refusal and it exits 3 BEFORE this loop is ever reached.
 ABORTED=false
 ABORT_REASON=""
 
-printf "${P}${B}heimdall-s6-sweep${R} — running ${B}%s${R} of %s repos ${D}(cap %s, fail-closed)${R}\n" \
-  "$N_EFFECTIVE" "$TOTAL_ENTRIES" "$CAP" >&2
+if [ "$BUDGET" -gt 0 ]; then
+  printf "${P}${B}heimdall-s6-sweep${R} — running ${B}%s${R} of %s repos ${D}(soft budget %s non_cache_tokens, WARNS only — never aborts)${R}\n" \
+    "$N_EFFECTIVE" "$TOTAL_ENTRIES" "$BUDGET" >&2
+else
+  printf "${P}${B}heimdall-s6-sweep${R} — running ${B}%s${R} of %s repos ${D}(soft budget DISABLED)${R}\n" \
+    "$N_EFFECTIVE" "$TOTAL_ENTRIES" >&2
+fi
 
 i=0
 while [ "$i" -lt "$N_EFFECTIVE" ]; do
@@ -430,16 +465,9 @@ while [ "$i" -lt "$N_EFFECTIVE" ]; do
   assertion="$(jq -r ".[$i].assertion_cmd" "$MANIFEST")"
   expect="$(jq -c ".[$i].reused_symbols_expected // []" "$MANIFEST")"
 
-  # ── HARD CAP, FAIL-CLOSED: before starting, project this task's spend against
-  #    the remaining budget. If we cannot afford even the per-task estimate,
-  #    abort cleanly with a partial report — never start a task that blows it. ──
-  PROJECTED=$(( TOTAL_SPEND + EST_PER_TASK ))
-  if [ "$PROJECTED" -gt "$CAP" ]; then
-    ABORTED=true
-    ABORT_REASON="projected spend $PROJECTED would exceed cap $CAP before task $((i+1))"
-    printf "  ${W}CAP REACHED${R} — %s. Aborting with a partial report.\n" "$ABORT_REASON" >&2
-    break
-  fi
+  # SOFT BUDGET: there is NO pre-task spend gate. Every entry runs to completion
+  # regardless of cumulative spend; the budget is evaluated AFTER each run (below)
+  # purely to WARN + flag budget_exceeded. The sweep never aborts on spend.
 
   printf "  ${C}[%s/%s]${R} %s\n" "$((i+1))" "$N_EFFECTIVE" "$url" >&2
 
@@ -515,17 +543,33 @@ while [ "$i" -lt "$N_EFFECTIVE" ]; do
   # ── token spend for this task: the REAL model-token usage of the run ──
   # do_token_record reads the EMITTED usage record this run wrote at the source
   # (USAGE_OUT, set before do_hmd — no transcript glob) and returns the FULL
-  # breakdown; do_spend pulls total_tokens as the cap figure
-  # (input+output+cache_creation+cache_read — full consumption, conservative). The
-  # whole record is recorded for provenance so the report shows REAL measured
+  # breakdown; do_spend pulls total_tokens (recorded as token_spend) and
+  # do_non_cache pulls non_cache_tokens (the figure the SOFT budget is judged on).
+  # The whole record is recorded for provenance so the report shows REAL measured
   # spend, never 0. Both fail OPEN (degraded zeros record), never aborting.
   TOKEN_REC="$(do_token_record "$USAGE_OUT" 2>/dev/null || echo '{"total_tokens":0,"error":"token record unavailable"}')"
   printf '%s' "$TOKEN_REC" | jq -e . >/dev/null 2>&1 \
     || TOKEN_REC='{"total_tokens":0,"error":"token record was not valid JSON"}'
   SPEND="$(do_spend "$TOKEN_REC" 2>/dev/null || echo 0)"
   case "$SPEND" in (*[!0-9]*|'') SPEND=0 ;; esac
+  NON_CACHE="$(do_non_cache "$TOKEN_REC" 2>/dev/null || echo 0)"
+  case "$NON_CACHE" in (*[!0-9]*|'') NON_CACHE=0 ;; esac
+  SESSION_ID="$(printf '%s' "$TOKEN_REC" | jq -r '.session_id // null' 2>/dev/null || echo null)"
   TOTAL_SPEND=$(( TOTAL_SPEND + SPEND ))
+  TOTAL_NON_CACHE=$(( TOTAL_NON_CACHE + NON_CACHE ))
   RAN=$(( RAN + 1 ))
+
+  # ── SOFT WARN BUDGET (never aborts): if enabled (BUDGET>0) and CUMULATIVE
+  #    non_cache_tokens now exceeds the budget, WARN + flag this entry
+  #    budget_exceeded:true, then CONTINUE. budget_exceeded stays false when the
+  #    budget is disabled or cumulative spend is still under it. ──
+  BUDGET_EXCEEDED=false
+  if [ "$BUDGET" -gt 0 ] && [ "$TOTAL_NON_CACHE" -gt "$BUDGET" ]; then
+    BUDGET_EXCEEDED=true
+    ANY_BUDGET_EXCEEDED=true
+    printf "      ${W}BUDGET WARN${R} — cumulative non_cache_tokens %s exceeds soft budget %s (flagged budget_exceeded; CONTINUING — soft budget never halts).\n" \
+      "$TOTAL_NON_CACHE" "$BUDGET" >&2
+  fi
 
   jq -cn \
      --arg url "$url" --arg sha "$sha" --arg resolved "$RESOLVED_SHA" \
@@ -536,6 +580,7 @@ while [ "$i" -lt "$N_EFFECTIVE" ]; do
      --argjson basepass "$BASELINE_PASS" --arg baserc "$BASELINE_RC" \
      --argjson asrtpass "$ASSERTION_PASS" --arg asrtrc "$ASSERTION_RC" \
      --argjson spend "$SPEND" --argjson tokens "$TOKEN_REC" \
+     --argjson nc "$NON_CACHE" --argjson be "$BUDGET_EXCEEDED" --arg sid "$SESSION_ID" \
      '{repo_url:$url, pinned_sha:$sha, resolved_sha:$resolved,
        task:$task, status:"ran",
        reuse_pct:$reuse, reused_symbols:$syms, reused_symbols_expected:$expect,
@@ -543,10 +588,13 @@ while [ "$i" -lt "$N_EFFECTIVE" ]; do
                        baseline_pass:$basepass, baseline_exit:($baserc|tonumber), baseline_cmd:$baseline,
                        assertion_pass:$asrtpass, assertion_exit:($asrtrc|tonumber), assertion_cmd:$assertion,
                        evidence:$ev},
-       token_spend:$spend, token_usage:$tokens}' >> "$RESULTS_FILE"
+       token_spend:$spend, non_cache_tokens:$nc, budget_exceeded:$be,
+       session_id:(if $sid=="null" then null else $sid end),
+       token_usage:$tokens}' >> "$RESULTS_FILE"
 
-  printf "      reuse=%s  working_output=%s  spend=%s  ${D}(cum %s/%s)${R}\n" \
-    "$REUSE_PCT" "$([ "$WO_PASS" = true ] && echo PASS || echo FAIL)" "$SPEND" "$TOTAL_SPEND" "$CAP" >&2
+  printf "      reuse=%s  working_output=%s  spend=%s  non_cache=%s  ${D}(cum non_cache %s/%s)${R}\n" \
+    "$REUSE_PCT" "$([ "$WO_PASS" = true ] && echo PASS || echo FAIL)" "$SPEND" "$NON_CACHE" "$TOTAL_NON_CACHE" \
+    "$([ "$BUDGET" -gt 0 ] && echo "$BUDGET" || echo off)" >&2
 
   i=$((i+1))
 done
@@ -569,12 +617,15 @@ DIST="$(printf '%s' "$RESULTS_ARR" | jq -c '
 
 jq -n \
   --arg run_id "$RUN_ID" --arg ts "$(date -u +%FT%TZ)" --arg manifest "$MANIFEST" \
-  --argjson cap "$CAP" --argjson total_spend "$TOTAL_SPEND" \
+  --argjson budget "$BUDGET" --arg budget_source "$BUDGET_SOURCE" \
+  --argjson budget_exceeded "$ANY_BUDGET_EXCEEDED" \
+  --argjson total_spend "$TOTAL_SPEND" --argjson total_non_cache "$TOTAL_NON_CACHE" \
   --argjson total_entries "$TOTAL_ENTRIES" --argjson n_effective "$N_EFFECTIVE" \
   --argjson ran "$RAN" --argjson aborted "$ABORTED" --arg abort_reason "$ABORT_REASON" \
   --argjson results "$RESULTS_ARR" --argjson dist "$DIST" \
   '{run_id:$run_id, ts:$ts, manifest:$manifest,
-    cap:$cap, total_token_spend:$total_spend,
+    budget:$budget, budget_source:$budget_source, budget_exceeded:$budget_exceeded,
+    total_token_spend:$total_spend, total_non_cache_tokens:$total_non_cache,
     total_entries:$total_entries, n_effective:$n_effective, ran:$ran,
     aborted:$aborted, abort_reason:$abort_reason,
     distribution:$dist, results:$results}' > "$REPORT"
@@ -590,15 +641,18 @@ RMIN="$(printf '%s' "$DIST" | jq -r '.reuse_min // "n/a"')"
 RMAX="$(printf '%s' "$DIST" | jq -r '.reuse_max // "n/a"')"
 printf "  working output : %s/%s passed  ${D}(runnable evidence, not self-report)${R}\n" "$WO_PASS_N" "$RAN" >&2
 printf "  reuse %%        : median ${B}%s${R}  (min %s, max %s)\n" "$RMED" "$RMIN" "$RMAX" >&2
-printf "  total spend    : %s / %s tokens cap\n" "$TOTAL_SPEND" "$CAP" >&2
+printf "  total spend    : %s total_tokens  (%s non_cache_tokens)\n" "$TOTAL_SPEND" "$TOTAL_NON_CACHE" >&2
+if [ "$BUDGET" -gt 0 ]; then
+  printf "  soft budget    : %s non_cache_tokens (source: %s) — %s\n" "$BUDGET" "$BUDGET_SOURCE" \
+    "$([ "$ANY_BUDGET_EXCEEDED" = true ] && echo "EXCEEDED (warned + flagged; sweep completed)" || echo "within budget")" >&2
+else
+  printf "  soft budget    : DISABLED (source: %s)\n" "$BUDGET_SOURCE" >&2
+fi
 # surface every per-task reuse number so a low distribution cannot hide.
 printf "  per-repo reuse : " >&2
 printf '%s' "$RESULTS_ARR" | jq -r '[.[] | select(.status=="ran") | (.reuse_pct // "null")|tostring] | join("  ")' >&2
 printf "  report         : %s\n" "$REPORT" >&2
 
-if [ "$ABORTED" = true ]; then
-  printf "  ${W}ABORTED (fail-closed): %s${R}\n" "$ABORT_REASON" >&2
-  echo "  partial report written above. Re-run with a higher --cap to continue." >&2
-  exit 4
-fi
+# The soft budget NEVER aborts: the sweep always completes every entry and exits 0.
+# An over-budget run is surfaced above (warned + flagged), not failed.
 exit 0
