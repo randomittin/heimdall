@@ -126,18 +126,27 @@ build / a specific assertion) — never self-report.
 > baseline-green → still-green (no regression) AND the new behavior's targeted
 > assertion passes.
 
-| # | Repo | `hmd` task prompt | Existing symbols the correct solution reuses | Runnable acceptance check |
-|---|------|-------------------|----------------------------------------------|---------------------------|
-| 1 | slugify | "Add a `preserveTrailingDash` option to slugify that, when true, keeps a single trailing `-` in the output." | the core `slugify()` pipeline, the existing `options`-merge + `replacements` handling | `npm test` green AND a new/added AVA case asserting `slugify('foo-', {preserveTrailingDash:true}) === 'foo-'` passes |
-| 2 | p-map | "Add a `pMapValues` helper that maps over an object's values with the same concurrency control as pMap and returns a new object." | `pMap` itself (must call it, not reimplement the concurrency loop), `pMapSkip` | `npm test` green AND added case: `pMapValues({a:1,b:2}, async v=>v*2, {concurrency:1})` resolves `{a:2,b:4}` |
-| 3 | wrap-ansi | "Add a `trim: false` option to wrap-ansi that preserves leading/trailing whitespace on each wrapped line." | the existing `wrapWord` / `wordLengths` internals + the `string-width` import | `npm test` green AND added case asserting whitespace is preserved when `{trim:false}` |
-| 4 | commander.js | "Add a `.requiredOption()` alias method `.mandatoryOption()` that behaves identically and is documented as a synonym." | the existing `requiredOption` / `Option` / `Command` methods (must delegate, not duplicate) | `npm test` (Jest) green AND added test: `.mandatoryOption('-x')` enforces presence exactly like `.requiredOption` |
-| 5 | yocto-queue | "Add a `peek()` method to Queue that returns the value at the head without dequeuing, reusing the existing head-node tracking." | the existing `Queue` class, `enqueue`/`dequeue`, the private `#head` node | `npm test` green AND added AVA case: enqueue `'a'` then `'b'`, `peek() === 'a'` and `size` unchanged |
-| 6 | records | "Add a `.as_csv()` method to RecordCollection that serializes all rows to CSV using existing row access." | `RecordCollection.__iter__` / `.all()`, `Record.as_dict()` / `.keys()` | `pytest` green AND added test: `RecordCollection([...]).as_csv()` returns header+rows |
-| 7 | cachecontrol | "Add an in-memory LRU cache backend with a max-entries cap by subclassing the existing base cache." | `BaseCache` (must subclass), the `DictCache` pattern, controller wiring | `pytest` green AND added test: the LRU backend evicts past the cap and satisfies the `BaseCache` interface (get/set/delete) |
-| 8 | jmespath.py | "Add a built-in `to_upper` function to the JMESPath function registry that uppercases a string argument." | the `@signature` decorator, the `Functions` registry class, existing type-checking | compliance/pytest green AND added case: `search('to_upper(@)', 'abc') == 'ABC'` |
-| 9 | cobra (Go) | "Add a `Command.AliasFor(name)` helper that returns the canonical command an alias resolves to, reusing the existing alias lookup." | existing `Command.Find` / alias resolution fields | `go test ./...` green AND added Go test asserting alias→canonical resolution. **reuse_pct null today.** |
-| 10 | anyhow (Rust) | "Add a `Context::with_note` combinator that attaches a static note to an error, reusing the existing context-chaining machinery." | the existing `Context` trait / `context()` impl | `cargo test` green AND added test asserting the note appears in the error chain. **reuse_pct null today.** |
+> **v2 (post-audit):** 6 of these 10 tasks were swapped after two adversarial audits
+> flagged them as degenerate/gimme (the no-SHA-pin root cause let depth-1 clones drift
+> to HEAD where some of the original features had already shipped). Every task below is
+> SHA-pinned and was validated at its pinned commit: the NEW symbol it adds is absent
+> and the named REUSE TARGET is present. See **§8 Post-audit revision (v2)**. The
+> machine-readable manifest (`…-C3-repos.json`) carries the SHAs and per-repo
+> `validation_at_sha` evidence. Swapped: slugify, wrap-ansi, yocto-queue, commander,
+> records, anyhow. Kept (tightened): jmespath, cobra. Kept as-is: p-map, cachecontrol.
+
+| # | Repo | pinned SHA | `hmd` task prompt | Existing symbols the correct solution reuses | Runnable acceptance check |
+|---|------|-----------|-------------------|----------------------------------------------|---------------------------|
+| 1 | slugify | `7c318bd` | "Add a `maxLength` option to `slugify` that truncates the final slug to at most N characters without leaving a trailing separator." | the `slugify()` pipeline + `removeMootSeparators(string, separator)` | `npm test` (xo+ava) green AND added AVA case `slugify('foo bar baz', {maxLength:7}) === 'foo-bar'` |
+| 2 | p-map | `65aaa8f` | "Add a `pMapValues` helper that maps over an object's values with the same concurrency control as pMap and returns a new object." | `pMap` itself (must call it, not reimplement the concurrency loop), `pMapSkip` | `npm test` green AND added case: `pMapValues({a:1,b:2}, async v=>v*2, {concurrency:1})` resolves `{a:2,b:4}` |
+| 3 | wrap-ansi | `f72a834` | "Add an `ellipsis: true` option that, in hard-wrap mode, replaces the wrapped overflow of a long word with a single trailing `…` on the first row instead of breaking it across rows." | `wrapWord(rows, word, columns)` + `stringWidth` | `npm test` green AND a case asserting a too-long word under `{hard:true, ellipsis:true}` ends in `…` at column width with ANSI intact |
+| 4 | commander.js | `ba6d13d` | "Add a `Command#requiredOptionWithDefault(flags, description, defaultValue)` registering a mandatory option satisfied if either the user supplies it OR the default applies, validated during parse." | `_optionEx` / `createOption` / `makeOptionMandatory` + `_checkForMissingMandatoryOptions` | **`node --test`** green AND added `tests/*.test.js` asserting accepted-when-only-default-present + errors-when-neither |
+| 5 | yocto-queue | `b07eac0` | "Add a `dequeueMany(count)` method that removes and returns up to `count` values from the head as an array, reusing existing dequeue semantics and keeping `size` consistent." | `dequeue()`, `#head`/`#size` | `npm test` (ava+tsd) green AND AVA case: enqueue a,b,c → `dequeueMany(2)` deep-equals `['a','b']`, `size===1`, `peek()==='c'` |
+| 6 | records | `ea42736` | "Add a `RecordCollection.distinct(*columns)` returning a new `RecordCollection` of rows unique on the given column values, reusing existing row access." | `Record.__getitem__`/`Record.keys`, `__iter__`/`all()`, re-wrap `RecordCollection(iter(rows))` | `pip install -e . && pytest` green AND test: `Database(...).query('select 1 as a union all select 1 as a').distinct('a')` yields one row |
+| 7 | cachecontrol | `495b215` | "Add an in-memory LRU cache backend with a max-entries cap by subclassing the existing base cache." | `BaseCache` (must subclass), the `DictCache` pattern, controller wiring | `pytest` green AND added test: the LRU backend evicts past the cap and satisfies the `BaseCache` interface (get/set/delete) |
+| 8 | jmespath.py | `2812594` | "Add a built-in `to_upper` so that the JMESPath expression `to_upper(@)` returns the uppercased form of a string argument." *(reworded: behavior only — no longer names the function-registry mechanism)* | the `@signature` decorator + the function-registration machinery (`Functions`, `TreeInterpreter`) — discovery is part of the probe | `pytest` green AND added case: `search('to_upper(@)', 'abc') == 'ABC'` |
+| 9 | cobra (Go) | `ad460ea` | "Add a `Command.AliasFor(name)` helper that returns the canonical command an alias resolves to, reusing the existing alias lookup." | existing `Command.Find` / `Aliases` fields | `go test ./...` green AND added Go test: a root command with one **direct child** whose `Aliases` include `co` → `AliasFor('co')` returns that child *(single-level alias only — no nested subcommands)*. **reuse_pct null today.** |
+| 10 | anyhow (Rust) | `841522b` | "Add `Context::context_with_code<C>(self, code: i32, context: C)` attaching a numeric code + message, reusing the existing context-attachment machinery so the message still appears via `{:#}` and the chain is walkable via `Error::chain`." | `Error::context` / `ContextError` plumbing | `cargo test` green AND test asserts `format!("{:#}", err)` contains the message AND `err.chain().count()` increased. **reuse_pct null today.** |
 
 > **Why these are reuse-friendly *and* realistic (the planning crux):** each adds a
 > small, plausible feature whose correct shape is "thread through / subclass / call
@@ -301,6 +310,102 @@ approval → full sweep.** Not before.
 
 The machine-readable repo+task+acceptance set for the runner harness is at
 `docs/superpowers/specs/heimdall-S6-C3-repos.json` (consumed only after sign-off).
+
+---
+
+## 8. Post-audit revision (v2) — honest record of what changed and why
+
+This proposal was revised after **two independent adversarial audits** of the v1 task
+set. Both converged on the same conclusion: **6 of the 10 tasks were degenerate or
+gimme** — i.e. not real reuse probes — and the underlying cause was structural, not
+per-task carelessness.
+
+### 8.1 Root cause: no SHA-pinning
+
+v1 named only repo URLs. The sweep clones `--depth 1`, which resolves to **whatever
+`HEAD` is at clone time**. Between proposal-writing and the audit, several of the v1
+"add this feature" targets had **already shipped upstream** — so cloning HEAD turned a
+real "add X" task into a no-op (X already exists → the "correct solution" is to write
+nothing, or the acceptance assertion passes against pre-existing code). A task whose
+feature already exists at the cloned commit measures nothing about reuse. This is the
+systemic defect: **an unpinned manifest does not describe a fixed, auditable task** —
+it describes a moving target.
+
+**Fix (systemic):** every repo in the manifest now carries a full-40-char `"sha"`
+field, resolved `2026-06-17` via `git ls-remote <url> HEAD`. The sweep MUST
+`clone --depth 1` then `git fetch --depth 1 origin <sha> && git checkout <sha>` so the
+audited state is frozen. A `sha_pinning` block documents the protocol; `wave0_preflight`
+gains a `sha_checkout` step that aborts a repo if its pinned SHA is unreachable.
+*(Runner note: `bin/heimdall-s6-sweep` consumes the manifest; if it does not yet honor
+the `sha` field, wiring it in is a follow-up — but the field is captured now so the
+audited state is fixed regardless.)*
+
+The 10 pinned SHAs:
+
+| Repo | SHA |
+|------|-----|
+| slugify | `7c318bd1aa4b4affab29761f15a9604323fe2a3b` |
+| p-map | `65aaa8f4d7e757a5254a146c4c39403efa9e2139` |
+| wrap-ansi | `f72a8343d4841433930786ae951b240a81bfd3a9` |
+| records | `ea4273695cee6da42edf1cb294d1f2a4505470fc` |
+| cachecontrol | `495b215d25568432aeb983c31f696447a777b4b5` |
+| jmespath.py | `2812594e69d43098ef60f81f4efc404c071b0418` |
+| commander.js | `ba6d13ddb4243e5913367734f8c159089ffe7834` |
+| yocto-queue | `b07eac099753833b29d06c614149904445739776` |
+| cobra | `ad460ea8f249db69c943a365fb84f3a59042d54e` |
+| anyhow | `841522b2aa09732fecee40804440d2c35c68c480` |
+
+### 8.2 The 6 swapped tasks (degenerate/gimme → audited (a)-shaped probe)
+
+Each replacement is the reviewers' exact (a)-shaped spec, adjusted only to the manifest
+schema (`task_prompt`, `reused_symbols_expected`, `acceptance_cmd`). Each was **validated
+at its pinned SHA**: the NEW symbol is absent (so it is a real task) AND the named REUSE
+TARGET is present (so reuse is possible). Evidence lives per-repo in the manifest's
+`validation_at_sha`.
+
+| Repo | v1 task (why degenerate) | v2 task | New-symbol ABSENT @ SHA | Reuse-target PRESENT @ SHA |
+|------|--------------------------|---------|-------------------------|----------------------------|
+| slugify | `preserveTrailingDash` — trivial flag, no real pipeline reuse | `maxLength` truncation w/o trailing separator | `grep maxLength index.js` empty | `removeMootSeparators` @ `index.js:15,98`; `slugify()` @ `:46` |
+| wrap-ansi | `trim:false` — trivial passthrough | hard-wrap `ellipsis:true` (`…` instead of breaking the word) | `grep -i ellipsis index.js` empty | `wrapWord(rows,word,columns)` @ `:390+`; `stringWidth` @ `:1,242` |
+| yocto-queue | `peek()` — one-liner read of `#head` | `dequeueMany(count)` reusing `dequeue()` semantics + size consistency | `grep dequeueMany index.js` empty | `dequeue()` @ `:38`; `#head` @ `:16`; `#size` @ `:18` |
+| commander.js | `.mandatoryOption` alias — pure synonym of `requiredOption` | `requiredOptionWithDefault` (mandatory satisfied by user-supplied OR default, parse-validated) | `grep requiredOptionWithDefault lib/*.js` empty | `_optionEx` @ `command.js:732,780`; `createOption` @ `:579`; `makeOptionMandatory`; `_checkForMissingMandatoryOptions` @ `:1237,1598` |
+| records | `.as_csv()` — serialize-rows, weak reuse signal | `RecordCollection.distinct(*columns)` re-wrapping a `RecordCollection` | `grep 'def distinct' records.py` empty | `Record.__getitem__` @ `:48`; `Record.keys` @ `:37`; `__iter__` @ `:118`; `all` @ `:195`; `class RecordCollection` @ `:107` |
+| anyhow | `Context::with_note` — static-string attach, thin | `Context::context_with_code(code, context)` reusing context plumbing; message via `{:#}`, walkable via `chain()` | `grep -rn 'context_with_code\|with_code' src/` empty | `fn context` @ `context.rs:46,91`; `ContextError` @ `:1,115`; `Error::chain` @ `error.rs:441` |
+
+**No replacement landed on a second degenerate task** — every new symbol was confirmed
+absent at its pinned SHA before acceptance.
+
+**Runner correction (commander):** the reviewers asked to "fix the runner field" from
+Jest to `node --test`. At the pinned SHA `ba6d13d` the `package.json` `test` script is
+**already** `node --test && npm run check:type:ts` — the v1 "Jest" label was itself an
+artifact of a drifted clone. The v2 `acceptance_cmd` uses `node --test` (no field needed
+fixing; the SHA-pin makes the runner deterministic).
+
+### 8.3 The 4 kept tasks (2 tightened)
+
+- **p-map**, **cachecontrol** — kept verbatim; the audits flagged no issue.
+- **jmespath** — *tightened*: prompt reworded to describe only the user-facing behavior
+  (`to_upper(@)` uppercases its string argument). It **no longer names the "function
+  registry"** mechanism, so symbol discovery (finding `@signature` + the registration
+  machinery) is part of the probe rather than spoon-fed. Acceptance unchanged.
+- **cobra** — *tightened*: acceptance pinned to a **single-level alias** (a root command
+  with one direct child whose `Aliases` include `co` → `AliasFor('co')` returns that
+  child), removing the nested-subcommand ambiguity the reviewers flagged.
+
+### 8.4 What did NOT change
+
+- **Interpretation bands (§3) are unchanged and remain frozen** at the original sign-off
+  (`locked_unchanged_in_v2: true` in the manifest). The audit corrected the *tasks*, not
+  the *grading*; moving the bands in response to a task fix would defeat their purpose.
+- The 10 repos, the 8-measured/2-probe split, the Go/Rust `reuse_pct: null`-today
+  honesty, the spend staging, and the dry-run-first protocol are all unchanged.
+- `yocto-queue` is in the running set and was therefore removed from `bench_replacements`
+  (it cannot be both a running probe and its own bench fallback).
+
+The deliverable remains an **honest reuse-% distribution + working-output rate over 10
+cold repos**. v2 makes that measurement trustworthy by ensuring all 10 tasks are real
+(non-degenerate) probes against frozen commits — not moving targets that may already
+contain the feature.
 
 ---
 
