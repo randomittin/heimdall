@@ -4,12 +4,22 @@
 # THE SCHEMA BRIDGE. The C3 spec
 # (docs/superpowers/specs/heimdall-S6-C3-repos.json) is a top-level OBJECT keyed
 # `.repos[]` with fields `url` / `language` / `sha` / `task_prompt` /
-# `acceptance_cmd` / `reused_symbols_expected` / `reuse_measured` / `license`.
-# The runner (bin/heimdall-s6-sweep) consumes a FLAT JSON ARRAY whose entries are
-# keyed `repo_url` / `sha` / `lang` / `license` / `task_prompt` /
-# `acceptance_cmd` / `reused_symbols_expected`. The key names DIFFER (url->repo_url,
-# language->lang) and the nesting DIFFERS (object.repos[] -> bare array), so the
-# spec cannot be fed to the runner directly. This emitter flattens + renames.
+# `baseline_cmd` / `assertion_cmd` / `reused_symbols_expected` / `reuse_measured`
+# / `license`. The runner (bin/heimdall-s6-sweep) consumes a FLAT JSON ARRAY whose
+# entries are keyed `repo_url` / `sha` / `lang` / `license` / `task_prompt` /
+# `baseline_cmd` / `assertion_cmd` / `reused_symbols_expected`. The key names DIFFER
+# (url->repo_url, language->lang) and the nesting DIFFERS (object.repos[] -> bare
+# array), so the spec cannot be fed to the runner directly. This emitter flattens +
+# renames.
+#
+# ACCEPTANCE IS TWO RUNNABLE COMMANDS (S-6 C3 Defect 2 fix). The old single
+# `acceptance_cmd` was PROSE ("npm test green AND added case: slugify(...) === ...")
+# that the runner eval'd -> shell syntax error on the '(' -> a bogus working-output
+# FAIL that was a RUNNER error, not a real test result. v3 of the spec replaced it
+# with `baseline_cmd` (the repo's own test/build — regression signal) + `assertion_cmd`
+# (a runnable one-liner that verifies the task-specific behavior; exit 0 = pass). Both
+# carry through verbatim; the runner runs them as DEFINED manifest commands via
+# `bash -c`, never `eval` of free prose.
 #
 # Usage:
 #   heimdall-s6-manifest <spec.json>          # emit the flat manifest to stdout
@@ -22,7 +32,10 @@
 #                                                report know the stack)
 #   license                  <- .license        (carried; reported, not enforced)
 #   task_prompt              <- .task_prompt
-#   acceptance_cmd           <- .acceptance_cmd
+#   baseline_cmd             <- .baseline_cmd    (the repo's own test/build — the
+#                                                regression signal; REQUIRED)
+#   assertion_cmd            <- .assertion_cmd   (runnable task-specific check, exit
+#                                                0 = pass; REQUIRED)
 #   reused_symbols_expected  <- .reused_symbols_expected
 #   reuse_measured           <- .reuse_measured (carried so the runner/report knows
 #                                                cobra+anyhow are working-output-only

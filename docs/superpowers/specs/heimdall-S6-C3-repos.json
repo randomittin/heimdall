@@ -1,11 +1,12 @@
 {
-  "schema": "heimdall-s6-c3/repos+tasks/v2",
-  "status": "PROPOSAL v2 (post-audit) — requires RJ sign-off on repos+tasks+bands before any run",
+  "schema": "heimdall-s6-c3/repos+tasks/v3",
+  "status": "PROPOSAL v3 (post-audit, runnable-acceptance) — requires RJ sign-off on repos+tasks+bands before any run",
   "generated": "2026-06-17",
   "revision": {
-    "version": 2,
-    "reason": "Two adversarial audits flagged 6 of 10 tasks as degenerate/gimme and identified the absence of SHA-pinning as the systemic root cause (depth-1 clones drifted to HEAD, where some of the original features had already shipped, turning real tasks into no-ops).",
-    "fix": "All 10 repos SHA-pinned (sweep must clone --depth 1 then checkout the exact sha). The 6 degenerate/gimme tasks swapped for audited (a)-shaped probes whose NEW symbol is verified absent and whose REUSE TARGET is verified present, both at the pinned SHA. The 4 honest tasks kept (jmespath + cobra tightened). Interpretation bands UNCHANGED (locked at original sign-off).",
+    "version": 3,
+    "reason": "S-6 C3 Defect 2: the per-task `acceptance_cmd` was PROSE ('npm test green AND added case: slugify(...) === ...'). The runner did `eval \"$acc\"` on it → the description is not a command → shell syntax error on the '(' → the working_output FAIL was a RUNNER error, not a real test result. eval-on-unsanitized-prose is itself a landmine-class pattern. (v2's SHA-pin + degenerate-task swaps + tightenings are PRESERVED here verbatim; this revision only fixes the acceptance shape.)",
+    "fix": "The single prose `acceptance_cmd` per task is REPLACED by TWO runnable fields: `baseline_cmd` (the repo's OWN test/build — the regression signal, e.g. `npm test`, `pip install -e . && pytest -q`, `go test ./...`, `cargo test`) and `assertion_cmd` (a real, self-contained one-liner verifying the TASK-SPECIFIC behavior the solution must produce; exit 0 = pass). The runner runs both as DEFINED manifest commands via `bash -c` (like a Makefile target), NEVER `eval` of free prose. working_output PASS = baseline_cmd exits 0 AND assertion_cmd exits 0; both exit codes + quoted output are captured as evidence. SHA pins, task_prompts, reused_symbols_expected, validation_at_sha, and interpretation bands are ALL unchanged.",
+    "acceptance_schema": "Per task: `baseline_cmd` (string — the repo's own green test/build, run first as the regression signal) + `assertion_cmd` (string — a runnable one-liner that constructs its OWN probe against the repo's public API at the pinned SHA and exits 0 iff the task-specific behavior is correct). It is AUTHORITATIVE and self-contained so it does not depend on the agent naming a test correctly. working_output.pass = baseline_pass AND assertion_pass. Both are executed with `bash -c` in the cloned repo — never `eval` of an agent/human description.",
     "validated_at_pinned_sha": true
   },
   "analyzer_grounding": {
@@ -79,7 +80,8 @@
       "why_probe": "Tiny single-purpose util; clear internal slugify core + removeMootSeparators helper. A maxLength-truncation option must thread through the existing pipeline, not re-tokenize.",
       "task_prompt": "Add a maxLength option to slugify that truncates the final slug to at most N characters without leaving a trailing separator.",
       "reused_symbols_expected": ["slugify", "removeMootSeparators"],
-      "acceptance_cmd": "npm test (xo+ava) green AND added AVA case: slugify('foo bar baz', {maxLength:7}) === 'foo-bar'",
+      "baseline_cmd": "npm install --no-audit --no-fund && npm test",
+      "assertion_cmd": "node --input-type=module -e \"import s from './index.js'; const r=s('foo bar baz',{maxLength:7}); if(r!=='foo-bar'){console.error('got',JSON.stringify(r),'want foo-bar');process.exit(1)} const r2=s('foo bar baz',{maxLength:8}); if(/-$/.test(r2)){console.error('trailing separator at maxLength:8 ->',JSON.stringify(r2));process.exit(1)} console.log('ok',r,r2)\"",
       "validation_at_sha": {
         "new_symbol_absent": "grep maxLength index.js -> empty (ABSENT)",
         "reuse_target_present": "removeMootSeparators(string, separator) @ index.js:15,98; slugify() pipeline @ index.js:46 (PRESENT)"
@@ -98,7 +100,8 @@
       "why_probe": "Concurrency util; a variant task must reuse the existing iterator/concurrency machinery, not rewrite it.",
       "task_prompt": "Add a pMapValues helper that maps over an object's values with the same concurrency control as pMap and returns a new object.",
       "reused_symbols_expected": ["pMap", "pMapSkip"],
-      "acceptance_cmd": "npm test green AND added case: pMapValues({a:1,b:2}, async v=>v*2, {concurrency:1}) resolves {a:2,b:4}"
+      "baseline_cmd": "npm install --no-audit --no-fund && npm test",
+      "assertion_cmd": "node --input-type=module -e \"import {pMapValues} from './index.js'; const out=await pMapValues({a:1,b:2}, async v=>v*2, {concurrency:1}); const ok=out&&out.a===2&&out.b===4&&Object.keys(out).length===2&&!Array.isArray(out); if(!ok){console.error('got',JSON.stringify(out),'want {a:2,b:4}');process.exit(1)} console.log('ok',JSON.stringify(out))\""
     },
     {
       "id": "wrap-ansi",
@@ -113,7 +116,8 @@
       "why_probe": "Internal wrapWord/wordLengths helpers + string-width import. An ellipsis option in hard-wrap mode must reuse the existing word-wrap path and width measurement, not re-break the word.",
       "task_prompt": "Add an ellipsis: true option that, in hard-wrap mode, replaces the wrapped overflow of a long word with a single trailing '…' on the first row instead of breaking it across rows.",
       "reused_symbols_expected": ["wrapWord", "stringWidth"],
-      "acceptance_cmd": "npm test (xo+ava+tsd) green AND a case asserting a too-long word under {hard:true, ellipsis:true} ends in '…' at column width with ANSI intact",
+      "baseline_cmd": "npm install --no-audit --no-fund && npm test",
+      "assertion_cmd": "node --input-type=module -e \"import wrapAnsi from './index.js'; import stringWidth from 'string-width'; const out=wrapAnsi('abcdefghijklmnop', 5, {hard:true, ellipsis:true}); const rows=out.split('\\n'); if(rows.length!==1){console.error('expected ellipsis to collapse to one row, got',rows.length,'rows:',JSON.stringify(out));process.exit(1)} const row=rows[0]; if(!row.endsWith('…')){console.error('row does not end with ellipsis:',JSON.stringify(row));process.exit(1)} if(stringWidth(row)>5){console.error('visible width',stringWidth(row),'exceeds column 5:',JSON.stringify(row));process.exit(1)} console.log('ok',JSON.stringify(out))\"",
       "validation_at_sha": {
         "new_symbol_absent": "grep -i ellipsis index.js -> empty (ABSENT)",
         "reuse_target_present": "wrapWord(rows, word, columns) @ index.js:390,396,404; stringWidth import @ index.js:1, used in wordLengths @ index.js:242 (PRESENT)"
@@ -132,7 +136,8 @@
       "why_probe": "Record/RecordCollection/Database classes — textbook reuse target. A distinct() must call existing row access + re-wrap a RecordCollection, not build a new structure.",
       "task_prompt": "Add a RecordCollection.distinct(*columns) returning a new RecordCollection of rows unique on the given column values, reusing existing row access.",
       "reused_symbols_expected": ["Record.__getitem__", "Record.keys", "RecordCollection.__iter__", "RecordCollection.all", "RecordCollection(iter(rows))"],
-      "acceptance_cmd": "pip install -e . && pytest green AND test: Database(...).query('select 1 as a union all select 1 as a').distinct('a') yields one row",
+      "baseline_cmd": "pip install -e . && pytest -q",
+      "assertion_cmd": "python -c \"import records; db=records.Database('sqlite:///:memory:'); rc=db.query('select 1 as a union all select 1 as a').distinct('a'); rows=rc.all(); assert len(rows)==1, ('expected 1 distinct row, got %d' % len(rows)); assert rows[0]['a']==1, rows[0]['a']; import sys; print('ok', len(rows))\"",
       "validation_at_sha": {
         "new_symbol_absent": "grep 'def distinct' records.py -> empty (ABSENT)",
         "reuse_target_present": "Record.__getitem__ @ records.py:48; Record.keys @ records.py:37; RecordCollection.__iter__ @ records.py:118; RecordCollection.all @ records.py:195; class RecordCollection @ records.py:107 (PRESENT)"
@@ -151,7 +156,8 @@
       "why_probe": "CacheController + BaseCache + adapters. Add-a-backend task subclasses BaseCache — extension is the correct solution.",
       "task_prompt": "Add an in-memory LRU cache backend with a max-entries cap by subclassing the existing base cache.",
       "reused_symbols_expected": ["BaseCache", "DictCache", "CacheController"],
-      "acceptance_cmd": "pip install -e . && pytest green AND added test: LRU backend evicts past the cap and satisfies BaseCache get/set/delete"
+      "baseline_cmd": "pip install -e . && pytest -q",
+      "assertion_cmd": "printf '%s\\n' 'import inspect, cachecontrol.caches as C' 'from cachecontrol.cache import BaseCache, DictCache' 'cands=[v for v in vars(C).values() if inspect.isclass(v) and issubclass(v,BaseCache) and v not in (BaseCache,DictCache)]' 'c=None' 'for cls in cands:' '    for kw in (\"max_entries\",\"maxsize\",\"max_size\",\"capacity\",\"maxentries\"):' '        try:' '            c=cls(**{kw:2}); break' '        except TypeError:' '            pass' '    if c is None:' '        try:' '            c=cls(2)' '        except TypeError:' '            pass' '    if c is not None:' '        break' 'assert c is not None, (\"no LRU BaseCache subclass with a cap constructor; candidates=%r\" % [x.__name__ for x in cands])' 'c.set(\"a\",b\"1\"); c.set(\"b\",b\"2\")' 'assert c.get(\"a\")==b\"1\" and c.get(\"b\")==b\"2\", \"get/set broken\"' 'c.set(\"c\",b\"3\")' 'live=[k for k in (\"a\",\"b\",\"c\") if c.get(k) is not None]' 'assert len(live)<=2, (\"cap not enforced; live=%r\" % live)' 'assert c.get(\"c\")==b\"3\", \"newest entry evicted\"' 'c.delete(\"c\"); assert c.get(\"c\") is None, \"delete broken\"' 'print(\"ok\", type(c).__name__, live)' > zz_s6_cc_probe.py && python zz_s6_cc_probe.py ; rc=$?; rm -f zz_s6_cc_probe.py; exit $rc"
     },
     {
       "id": "jmespath",
@@ -166,7 +172,8 @@
       "why_probe": "Add-a-builtin task: the correct solution registers via the existing @signature decorator + function machinery. The prompt now states only the observable behavior so symbol discovery is part of the probe.",
       "task_prompt": "Add a built-in to_upper so that the JMESPath expression to_upper(@) returns the uppercased form of a string argument.",
       "reused_symbols_expected": ["signature", "Functions", "TreeInterpreter"],
-      "acceptance_cmd": "pip install -e . && pytest green AND added case: search('to_upper(@)', 'abc') == 'ABC'"
+      "baseline_cmd": "pip install -e . && pytest -q",
+      "assertion_cmd": "python -c \"import jmespath; r=jmespath.search('to_upper(@)', 'abc'); assert r=='ABC', ('got %r want ABC' % r); print('ok', r)\""
     },
     {
       "id": "commander",
@@ -181,7 +188,8 @@
       "why_probe": "Sprawling canonical CLI. A requiredOptionWithDefault must compose the existing option-creation + mandatory-marking + parse-time mandatory check, not re-implement option parsing.",
       "task_prompt": "Add a Command#requiredOptionWithDefault(flags, description, defaultValue) registering a mandatory option satisfied if either the user supplies it OR the default applies, validated during parse.",
       "reused_symbols_expected": ["_optionEx", "createOption", "makeOptionMandatory", "_checkForMissingMandatoryOptions"],
-      "acceptance_cmd": "node --test green AND added tests/*.test.js asserting accepted-when-only-default-present AND errors-when-neither",
+      "baseline_cmd": "npm install --no-audit --no-fund && node --test",
+      "assertion_cmd": "node -e \"const {Command}=require('./index.js'); const mute={writeErr:()=>'',writeOut:()=>''}; const ok=new Command(); ok.exitOverride().configureOutput(mute); ok.requiredOptionWithDefault('-p, --port <n>','port','8080'); let threw=false; try{ok.parse([],{from:'user'})}catch(e){threw=true} if(threw){console.error('accepted-when-only-default-present FAILED: parse threw though default 8080 should satisfy');process.exit(1)} if(ok.opts().port!=='8080'){console.error('default not applied, got',ok.opts().port);process.exit(1)} const neither=new Command(); neither.exitOverride().configureOutput(mute); neither.requiredOption('-q, --qty <n>','qty'); let threw2=false; try{neither.parse([],{from:'user'})}catch(e){threw2=true} if(!threw2){console.error('errors-when-neither FAILED: missing mandatory option did not error');process.exit(1)} console.log('ok', ok.opts().port)\"",
       "validation_at_sha": {
         "new_symbol_absent": "grep requiredOptionWithDefault lib/*.js -> empty (ABSENT)",
         "reuse_target_present": "_optionEx @ lib/command.js:732,780; createOption (overridable) @ lib/command.js:579; makeOptionMandatory on Option; _checkForMissingMandatoryOptions @ lib/command.js:1237,1598 (PRESENT)",
@@ -201,7 +209,8 @@
       "why_probe": "Tiny linked-list queue. A dequeueMany(count) must reuse the existing dequeue() semantics and #head/#size internals to keep size consistent, not re-walk the list.",
       "task_prompt": "Add a dequeueMany(count) method that removes and returns up to count values from the head as an array, reusing existing dequeue semantics and keeping size consistent.",
       "reused_symbols_expected": ["dequeue", "#head", "#size"],
-      "acceptance_cmd": "npm test (ava+tsd) green AND AVA case: enqueue a,b,c -> dequeueMany(2) deep-equals ['a','b'], size===1, peek()==='c'",
+      "baseline_cmd": "npm install --no-audit --no-fund && npm test",
+      "assertion_cmd": "node --input-type=module -e \"import Queue from './index.js'; const q=new Queue(); q.enqueue('a'); q.enqueue('b'); q.enqueue('c'); const got=q.dequeueMany(2); const eq=Array.isArray(got)&&got.length===2&&got[0]==='a'&&got[1]==='b'; if(!eq){console.error('dequeueMany(2) got',JSON.stringify(got),'want [a,b]');process.exit(1)} if(q.size!==1){console.error('size',q.size,'want 1');process.exit(1)} if(q.peek()!=='c'){console.error('peek',q.peek(),'want c');process.exit(1)} console.log('ok',JSON.stringify(got),q.size,q.peek())\"",
       "validation_at_sha": {
         "new_symbol_absent": "grep dequeueMany index.js -> empty (ABSENT)",
         "reuse_target_present": "dequeue() @ index.js:38; #head @ index.js:16; #size @ index.js:18 (PRESENT)"
@@ -222,7 +231,8 @@
       "why_probe": "Varied-stack representative. Working-output via go test ./...; excluded from reuse median today.",
       "task_prompt": "Add a Command.AliasFor(name) helper that returns the canonical command an alias resolves to, reusing the existing alias lookup.",
       "reused_symbols_expected": ["Command.Find", "Aliases"],
-      "acceptance_cmd": "go test ./... green AND added Go test: a root command with one direct child whose Aliases include 'co' -> AliasFor('co') returns that child (single-level alias only, no nested subcommands)"
+      "baseline_cmd": "go build ./... && go test ./...",
+      "assertion_cmd": "printf '%s\\n' 'package cobra' 'import \\\"testing\\\"' 'func TestS6AliasForProbe(t *testing.T){' '  root:=&Command{Use:\\\"root\\\"}' '  child:=&Command{Use:\\\"commit\\\", Aliases:[]string{\\\"co\\\"}, Run:func(_ *Command,_ []string){}}' '  root.AddCommand(child)' '  got:=root.AliasFor(\\\"co\\\")' '  if got!=child { t.Fatalf(\\\"AliasFor(co)=%v want commit child\\\", got) }' '}' > zz_s6_aliasfor_probe_test.go && go test -run TestS6AliasForProbe ./ ; rc=$?; rm -f zz_s6_aliasfor_probe_test.go; exit $rc"
     },
     {
       "id": "anyhow",
@@ -239,12 +249,13 @@
       "why_probe": "Rust representative. A context_with_code combinator must reuse the existing context-attachment plumbing so the message still surfaces via {:#} and the chain stays walkable. Working-output probe; reuse_pct null today.",
       "task_prompt": "Add Context::context_with_code<C>(self, code: i32, context: C) attaching a numeric code + message, reusing the existing context-attachment machinery so the message still appears via {:#} and the chain is walkable via Error::chain.",
       "reused_symbols_expected": ["Error::context", "ContextError"],
-      "acceptance_cmd": "cargo test green AND test asserts format!(\"{:#}\", err) contains the message AND err.chain().count() increased",
+      "baseline_cmd": "cargo test",
+      "assertion_cmd": "printf '%s\\n' 'use anyhow::{anyhow, Context};' '#[test]' 'fn s6_context_with_code_probe() {' '    let base = anyhow!(\\\"root cause\\\");' '    let n0 = base.chain().count();' '    let res: Result<(), anyhow::Error> = Err(base);' '    let err = res.context_with_code(42, \\\"wrapped message\\\").unwrap_err();' '    let disp = format!(\\\"{:#}\\\", err);' '    assert!(disp.contains(\\\"wrapped message\\\"), \\\"display missing context message: {}\\\", disp);' '    assert!(err.chain().count() > n0, \\\"chain did not grow: {} !> {}\\\", err.chain().count(), n0);' '}' > tests/zz_s6_context_with_code_probe.rs && cargo test --test zz_s6_context_with_code_probe s6_context_with_code_probe ; rc=$?; rm -f tests/zz_s6_context_with_code_probe.rs; exit $rc",
       "validation_at_sha": {
         "new_symbol_absent": "grep -rn 'context_with_code|with_code' src/ -> empty (ABSENT)",
         "reuse_target_present": "fn context @ src/context.rs:46,91; ContextError @ src/context.rs:1,115; Error::chain @ src/error.rs:441 (PRESENT)"
       }
     }
   ],
-  "_count_note": "Exactly 10 repos. Stacks: 5 JS (slugify, p-map, wrap-ansi, commander, yocto-queue), 3 Py (records, cachecontrol, jmespath), 1 Go (cobra), 1 Rust (anyhow). reuse_measured:true = 8 (5 JS + 3 Py) -> reuse-% median over these 8. working-output-only = 2 (cobra, anyhow). v2 swapped 6 tasks (slugify, wrap-ansi, yocto-queue, commander, records, anyhow) for audited (a)-shaped probes; kept 4 (p-map, cachecontrol, jmespath [tightened], cobra [tightened]). All 10 SHA-pinned. yocto-queue is in the running set, therefore removed from bench_replacements."
+  "_count_note": "Exactly 10 repos. Stacks: 5 JS (slugify, p-map, wrap-ansi, commander, yocto-queue), 3 Py (records, cachecontrol, jmespath), 1 Go (cobra), 1 Rust (anyhow). reuse_measured:true = 8 (5 JS + 3 Py) -> reuse-% median over these 8. working-output-only = 2 (cobra, anyhow). v2 swapped 6 tasks (slugify, wrap-ansi, yocto-queue, commander, records, anyhow) for audited (a)-shaped probes; kept 4 (p-map, cachecontrol, jmespath [tightened], cobra [tightened]). All 10 SHA-pinned. yocto-queue is in the running set, therefore removed from bench_replacements. v3 replaced every prose acceptance_cmd with a runnable baseline_cmd + assertion_cmd pair (S-6 C3 Defect 2 fix); the runner runs both as defined manifest commands via bash -c, never eval of prose."
 }
