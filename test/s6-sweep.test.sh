@@ -29,6 +29,13 @@
 #       unattended-sweep guard): a full (all-entries) run without it aborts.
 #   (g) a malformed manifest is rejected with a usage error (exit 2), spending
 #       nothing.
+#   (h) the runner CHECKS OUT THE EXACT PINNED SHA, not the clone's HEAD: with an
+#       entry pinned to an OLDER commit (where a symbol is ABSENT) and a clone that
+#       lands at the NEWER HEAD (where it is PRESENT), the runner must land the
+#       older sha — `git rev-parse HEAD == pinned sha` — and the report must record
+#       resolved_sha == the older sha (provenance), proving it ran the PINNED state.
+#   (i) a manifest entry MISSING `sha` is REJECTED fail-closed (exit 2): a pinless
+#       entry would silently clone HEAD — exactly the drift bug the pin fixes.
 
 set -euo pipefail
 
@@ -68,8 +75,31 @@ echo "mock-target test suite: ${MOCK_TEST_LABEL:-default}"
 exit "${MOCK_TEST_RC:-0}"
 EOF
 chmod +x "$MOCKREPO/run-tests.sh"
+# Track the api/ dir so a REAL `git clone` (which, unlike cp -R, will not
+# recreate an empty/untracked dir) still yields api/ for the mock-hmd diff.
+printf '' > "$MOCKREPO/api/.gitkeep"
 git -C "$MOCKREPO" add -A
 git -C "$MOCKREPO" commit -qm "base: mock target with formatUser + test suite"
+
+# ── OLDER commit == the PINNED state. A symbol is DELIBERATELY ABSENT here. ────
+# We pin the runner to THIS sha. The probe assumes the symbol is absent; if the
+# runner drifted to HEAD it would see the symbol PRESENT (added in the next
+# commit). So checking out this older sha is exactly what proves the pin works:
+# the runner must run the PINNED (absent-symbol) state, NOT HEAD.
+OLD_SHA="$(git -C "$MOCKREPO" rev-parse HEAD)"
+
+# ── NEWER commit == HEAD. The symbol is now PRESENT. If the runner IGNORED the
+#    pin and used the clone's HEAD, this is the (wrong) state it would sweep. ───
+cat > "$MOCKREPO/utils/feature.js" <<'EOF'
+// shippedLater is PRESENT at HEAD but ABSENT at OLD_SHA — the exact drift the
+// SHA pin guards against (a depth-1 clone would land HEAD and see this symbol).
+export function shippedLater() { return "feature already shipped at HEAD"; }
+EOF
+git -C "$MOCKREPO" add -A
+git -C "$MOCKREPO" commit -qm "feat: shippedLater (PRESENT at HEAD, ABSENT at OLD_SHA)"
+HEAD_SHA="$(git -C "$MOCKREPO" rev-parse HEAD)"
+[ "$OLD_SHA" != "$HEAD_SHA" ] \
+  || { echo "FATAL: mock repo did not produce two distinct commits" >&2; exit 2; }
 
 # ── the canned diff the MOCK agent "produces": a new endpoint that REUSES
 #    formatUser (so reuse_pct is real and nonzero). Written by --hmd-cmd. ───────
@@ -82,13 +112,17 @@ export function userEndpoint(req, res) {
 }
 EOF
 
-# ── MOCK clone: copy the local mock repo into the destination (no network). ────
+# ── MOCK clone: a REAL local `git clone` of the mock repo (no network). ────────
+# Crucially this is a real clone with a proper `origin` remote, so the runner's
+# OWN checkout_sha (fetch origin <sha> + checkout + assert) runs FOR REAL against
+# it — the SHA-checkout logic is exercised, not stubbed. The clone lands at HEAD
+# (the NEWER commit), so the runner must ACTIVELY check out the older pinned sha.
 CLONE_CMD="$WORK/mock-clone.sh"
 cat > "$CLONE_CMD" <<EOF
 #!/usr/bin/env bash
-# args: <repo_url> <dest_dir>
+# args: <repo_url> <dest_dir>  — real local clone, no network.
 set -euo pipefail
-cp -R "$MOCKREPO" "\$2"
+git clone --quiet "$MOCKREPO" "\$2"
 EOF
 chmod +x "$CLONE_CMD"
 
@@ -116,12 +150,16 @@ echo "\${MOCK_SPEND:-50000}"
 EOF
 chmod +x "$SPEND_CMD"
 
-# ── a 2-entry manifest pointing at the local mock target ──────────────────────
+# ── a 2-entry manifest pointing at the local mock target, PINNED to OLD_SHA ────
+# Both entries pin the OLDER sha (the absent-symbol state). formatUser exists at
+# OLD_SHA (added in the base commit), so reuse is still real; shippedLater does
+# NOT — which is what lets us prove the runner ran the pinned commit, not HEAD.
 MANIFEST="$WORK/repos.json"
 cat > "$MANIFEST" <<EOF
 [
   {
     "repo_url": "file://$MOCKREPO",
+    "sha": "$OLD_SHA",
     "lang": "js",
     "license": "MIT",
     "task_prompt": "add an endpoint that returns a formatted user",
@@ -130,6 +168,7 @@ cat > "$MANIFEST" <<EOF
   },
   {
     "repo_url": "file://$MOCKREPO",
+    "sha": "$OLD_SHA",
     "lang": "js",
     "license": "MIT",
     "task_prompt": "add a second endpoint reusing formatUser",
@@ -314,6 +353,90 @@ if [ "$BAD_RC" -eq 2 ] && [ ! -e "$WORK/hmd-was-called" ]; then
   ok "(g) malformed manifest rejected with usage error (exit 2), spends nothing"
 else
   bad "(g) malformed manifest not rejected (rc=$BAD_RC, expected 2)"; cat "$WORK/bad.out"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# (h) the runner CHECKS OUT THE PINNED (older) SHA, not the clone's HEAD.
+# ─────────────────────────────────────────────────────────────────────────────
+# Sanity first: confirm the two commits genuinely differ on the probe symbol, so
+# "ran the pinned sha" is provably distinct from "ran HEAD".
+SYM_AT_OLD="$(git -C "$MOCKREPO" show "$OLD_SHA:utils/feature.js" 2>/dev/null || true)"
+SYM_AT_HEAD="$(git -C "$MOCKREPO" show "$HEAD_SHA:utils/feature.js" 2>/dev/null || true)"
+if [ -z "$SYM_AT_OLD" ] && printf '%s' "$SYM_AT_HEAD" | grep -q "shippedLater"; then
+  ok "(h0) fixture is sound: shippedLater ABSENT at pinned OLD_SHA, PRESENT at HEAD"
+else
+  bad "(h0) fixture not sound (old has symbol? head missing it?) old='${SYM_AT_OLD:0:30}'"
+fi
+
+# Run a clean limit-1 sweep. The clone lands at HEAD_SHA; the runner must check
+# out OLD_SHA. The report's resolved_sha proves which commit was actually swept.
+RUNID_PIN="pintest-$$"
+set +e
+MOCK_SPEND=50000 MOCK_TEST_RC=0 run_sweep --limit 1 --run-id "$RUNID_PIN" >"$WORK/pin.out" 2>&1
+PIN_RC=$?
+set -e
+PIN_REPORT="$ROOT/.planning/s6-sweep/$RUNID_PIN.json"
+if [ "$PIN_RC" -eq 0 ] && [ -f "$PIN_REPORT" ]; then
+  RESOLVED="$(jq -r '.results[0].resolved_sha' "$PIN_REPORT")"
+  PINNED="$(jq -r '.results[0].pinned_sha' "$PIN_REPORT")"
+  STATUS="$(jq -r '.results[0].status' "$PIN_REPORT")"
+  if [ "$STATUS" = "ran" ] && [ "$RESOLVED" = "$OLD_SHA" ] && [ "$PINNED" = "$OLD_SHA" ] \
+     && [ "$RESOLVED" != "$HEAD_SHA" ]; then
+    ok "(h) runner ran the PINNED sha, NOT HEAD: resolved_sha=$RESOLVED == OLD_SHA (≠ HEAD $HEAD_SHA)"
+  else
+    bad "(h) runner did not check out the pinned sha (status=$STATUS resolved=$RESOLVED pinned=$PINNED head=$HEAD_SHA)"
+    jq '.results[0]' "$PIN_REPORT"
+  fi
+else
+  bad "(h) pinned-sha run produced no report (rc=$PIN_RC)"; cat "$WORK/pin.out"
+fi
+
+# Independently PROVE the runner actually performed the checkout (git rev-parse
+# HEAD == pinned sha) by re-running the runner's real checkout logic the same way:
+# clone (lands HEAD) → fetch+checkout OLD_SHA → assert. If checkout were skipped,
+# HEAD would equal HEAD_SHA and this assertion would fail.
+PROOF_DIR="$WORK/checkout-proof"
+git clone --quiet "$MOCKREPO" "$PROOF_DIR"
+[ "$(git -C "$PROOF_DIR" rev-parse HEAD)" = "$HEAD_SHA" ] \
+  || bad "(h2-pre) fresh clone did not land at HEAD as expected"
+git -C "$PROOF_DIR" fetch --depth 1 origin "$OLD_SHA" >/dev/null 2>&1 || true
+git -C "$PROOF_DIR" checkout --quiet --detach "$OLD_SHA" >/dev/null 2>&1
+if [ "$(git -C "$PROOF_DIR" rev-parse HEAD)" = "$OLD_SHA" ] \
+   && [ ! -f "$PROOF_DIR/utils/feature.js" ]; then
+  ok "(h2) after checkout: git rev-parse HEAD == pinned sha AND the HEAD-only symbol file is absent"
+else
+  bad "(h2) checkout did not land the pinned (absent-symbol) state"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# (i) a manifest entry MISSING `sha` is REJECTED fail-closed (exit 2).
+# ─────────────────────────────────────────────────────────────────────────────
+# A pinless entry would silently clone HEAD — the exact drift bug the pin fixes.
+PINLESS_MAN="$WORK/pinless.json"
+cat > "$PINLESS_MAN" <<EOF
+[
+  {
+    "repo_url": "file://$MOCKREPO",
+    "lang": "js",
+    "license": "MIT",
+    "task_prompt": "add an endpoint that returns a formatted user",
+    "reused_symbols_expected": ["formatUser"],
+    "acceptance_cmd": "bash run-tests.sh"
+  }
+]
+EOF
+rm -f "$WORK/hmd-was-called"
+set +e
+"$SWEEP" --manifest "$PINLESS_MAN" --clone-cmd "$CLONE_CMD" --hmd-cmd "$HMD_CMD" \
+         --spend-cmd "$SPEND_CMD" --confirm-full >"$WORK/pinless.out" 2>&1
+PINLESS_RC=$?
+set -e
+if [ "$PINLESS_RC" -eq 2 ] \
+   && grep -qiE 'sha' "$WORK/pinless.out" \
+   && [ ! -e "$WORK/hmd-was-called" ]; then
+  ok "(i) pinless entry (missing sha) rejected fail-closed (exit 2), no clone, no spend"
+else
+  bad "(i) pinless entry not rejected fail-closed (rc=$PINLESS_RC, expected 2)"; cat "$WORK/pinless.out"
 fi
 
 echo
