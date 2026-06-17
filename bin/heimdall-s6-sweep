@@ -115,6 +115,19 @@ done
 
 command -v jq >/dev/null 2>&1 || { echo "error: jq is required" >&2; exit 2; }
 [ -n "$MANIFEST" ] || { echo "error: --manifest is required" >&2; usage >&2; exit 2; }
+
+# ── stdin manifest ('-') — the spec-adapter glue ──────────────────────────────
+# `heimdall-s6-manifest spec.json | heimdall-s6-sweep --manifest -` lets the C3
+# spec flow straight into the runner. The runner makes MANY jq passes over the
+# manifest, but a pipe can be read only once, so we copy '-' into a temp regular
+# file up front; every downstream pass then sees an ordinary file and the existing
+# (file-path) contract is unchanged. Cleaned up on exit.
+if [ "$MANIFEST" = "-" ]; then
+  STDIN_MANIFEST="$(mktemp -t s6-sweep-manifest)"
+  trap 'rm -f "$STDIN_MANIFEST"' EXIT
+  cat - > "$STDIN_MANIFEST"
+  MANIFEST="$STDIN_MANIFEST"
+fi
 [ -f "$MANIFEST" ] || { echo "error: manifest not found: $MANIFEST" >&2; exit 2; }
 [ -x "$METRIC" ] || { echo "error: reuse metric not executable at $METRIC" >&2; exit 2; }
 
