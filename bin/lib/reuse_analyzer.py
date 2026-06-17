@@ -72,6 +72,45 @@ def detect_language(path):
     return None
 
 
+# ── test / fixture scoping ──────────────────────────────────────────────────
+#
+# Reuse is a measurement over PRODUCTION code units in the task diff: do the new
+# production units build on pre-existing PRODUCTION repo code, or reinvent it?
+# A repo's own test files and fixtures are NOT "pre-existing repo code" that a
+# task's production units should be credited for reusing — a generic fixture name
+# (`dataset`, `check_id`, a `Cheese` test class) that happens to collide with a
+# call in the changed code is a false reuse signal. So:
+#   - test-file symbols are EXCLUDED from the pre-existing symbol table, and
+#   - test files are EXCLUDED from the changed-unit set — UNLESS the task is
+#     itself a test task (every changed file is a test), in which case the test
+#     units ARE the units to measure (a test that calls an existing helper is
+#     legitimately reusing it).
+# This is purely a SCOPE fix: the heuristic extraction engine is unchanged.
+
+_TEST_DIR_SEG = re.compile(
+    r"(^|/)(tests?|__tests__|spec|specs|fixtures?|testdata|conformance|e2e)(/|$)"
+)
+_TEST_FILE_NAME = re.compile(
+    r"^(test[_\-].*|.*[_\-]test|.*\.test|.*\.spec|.*\.fixture|conftest|test-.*)$"
+)
+
+
+def is_test_path(path):
+    """True if `path` is a test / spec / fixture source file. Matches on a
+    directory segment (a `tests/`, `__tests__/`, `spec/`, `fixtures/`,
+    `conformance/`, `e2e/` component) OR the file's stem (`test_*`, `*_test`,
+    `*.test.*`, `*.spec.*`, `*.fixture.*`, `test-*`, `conftest`)."""
+    norm = path.replace("\\", "/")
+    if _TEST_DIR_SEG.search(norm):
+        return True
+    base = os.path.basename(norm).lower()
+    # match against the full basename (catches compound suffixes like
+    # foo.test.js / bar.spec.ts / baz.fixture.sh) and the single-extension stem
+    # (catches test_records.py -> test_records, conftest.py -> conftest).
+    stem = os.path.splitext(base)[0]
+    return bool(_TEST_FILE_NAME.match(base) or _TEST_FILE_NAME.match(stem))
+
+
 # ── data model ────────────────────────────────────────────────────────────────
 
 
@@ -444,9 +483,16 @@ def self_names_minus(self_names, keep):
 def build_pre_symbols(pre_files):
     """pre_files: dict {path: source} of repo files BEFORE the change.
     Returns the set of pre-existing symbol names (function/class/component +
-    module basenames, so an import of a pre-existing file resolves)."""
+    module basenames, so an import of a pre-existing file resolves).
+
+    Test / fixture files are EXCLUDED: their symbols (test classes, fixture
+    helpers like `dataset` / `check_id`) are not pre-existing PRODUCTION repo
+    code, so crediting a changed unit for "reusing" a fixture name it merely
+    collides with is a false signal (S-6 C3 Defect 3)."""
     syms = set()
     for path, src in pre_files.items():
+        if is_test_path(path):
+            continue
         lang = detect_language(path)
         if lang is None:
             continue
@@ -469,7 +515,25 @@ def analyze(task, changed_files, pre_symbols):
     langs_seen = set()
     unsupported = []
 
+    # Scope the changed-unit set to PRODUCTION units in the diff. Test/fixture
+    # files in the diff are excluded so a production task is not measured over the
+    # repo's existing tests (S-6 C3 Defect 3) — EXCEPT when the task is ITSELF a
+    # test task: if every changed source file is a test, the test units ARE the
+    # units to measure (a test that calls an existing helper legitimately reuses
+    # it). We decide that over the changed SOURCE files only (non-source files like
+    # data/config never carry units and must not flip the all-tests verdict).
+    src_changed = [
+        p for p in changed_files if detect_language(p) is not None
+    ]
+    task_is_all_tests = bool(src_changed) and all(
+        is_test_path(p) for p in src_changed
+    )
+
     for path, src in changed_files.items():
+        if not task_is_all_tests and is_test_path(path):
+            # a test file changed alongside production code — not a production
+            # unit to measure for reuse. Skip it (do not flag as unsupported).
+            continue
         lang = detect_language(path)
         if lang is None:
             unsupported.append(path)

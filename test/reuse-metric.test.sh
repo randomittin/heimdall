@@ -171,6 +171,81 @@ else
   bad "(f) Python reuse not detected"; cat "$REC_F"
 fi
 
+# ── (g) DIFF-SCOPE regression (S-6 C3 Defect 3) ───────────────────────────────
+# THE BUG: reuse was measured against a WHOLE-REPO symbol table that swept the
+# repo's own test fixtures. A task that changed ONE production function whose body
+# happened to call generic names (check_id, dataset) that ALSO exist as TEST
+# FIXTURES got those fixture names credited as "reused repo symbols" — when the
+# only real pre-existing symbol the unit reuses is the production helper.
+#
+# This builds a repo with a LARGE existing codebase + a test file packed with
+# fixtures (Cheese, check_id, _reduce_datetimes, dataset, normalize_record), then
+# changes ONE production function that calls ONE existing production helper plus
+# the generic names. The fix must:
+#   - count exactly ONE changed unit (units_total=1) — the production function,
+#     not any of the repo's existing test fixtures,
+#   - put ONLY the production helper in reused_symbols,
+#   - NEVER surface Cheese / check_id / _reduce_datetimes / dataset (test-fixture
+#     symbols are not pre-existing *repo* code that production should reuse).
+DSREPO="$WORK/dsrepo"
+mkdir -p "$DSREPO/src" "$DSREPO/tests"
+git -C "$DSREPO" init -q
+git -C "$DSREPO" config user.email "test@runheimdall.dev"
+git -C "$DSREPO" config user.name "reuse-diffscope"
+
+# real production helper the task legitimately reuses
+cat > "$DSREPO/src/helpers.py" <<'PYEOF'
+def normalize_record(rec):
+    return {k.lower(): v for k, v in rec.items()}
+
+def archive(rec):
+    return dict(rec)
+PYEOF
+# a LARGE test file full of FIXTURE names (the exact ones the bug leaked)
+cat > "$DSREPO/tests/test_records.py" <<'PYEOF'
+class Cheese:
+    name = "gouda"
+def check_id(x):
+    return x
+def _reduce_datetimes(row):
+    return row
+def dataset():
+    return []
+def normalize_record(rec):
+    return rec
+PYEOF
+git -C "$DSREPO" add -A
+git -C "$DSREPO" commit -qm "base: production helpers + a fat test-fixture file" >/dev/null
+DSBASE="$(git -C "$DSREPO" rev-parse HEAD)"
+
+# TASK: change ONE production function. It reuses the production helper
+# normalize_record and also calls generic names that COLLIDE with test fixtures.
+cat > "$DSREPO/src/records.py" <<'PYEOF'
+from src.helpers import normalize_record
+
+def build_record(raw):
+    rid = check_id(raw)
+    rows = dataset()
+    return normalize_record(raw)
+PYEOF
+"$METRIC" --repo "$DSREPO" --base "$DSBASE" --task diffscope-g --run-id diffscope-g --quiet >/dev/null
+REC_G="$DSREPO/.planning/reuse/diffscope-g.json"
+
+# units_total reflects ONLY the changed production unit (not repo fixtures).
+G_TOTAL="$(jq -r '.units_total' "$REC_G")"
+# reused_symbols must be EXACTLY the production helper — no test-fixture names.
+G_HAS_HELPER="$(jq -r '(.reused_symbols | map(.symbol) | index("normalize_record")) != null' "$REC_G")"
+G_LEAKS="$(jq -r '
+    (.reused_symbols | map(.symbol)) as $s
+    | [ "Cheese","check_id","_reduce_datetimes","dataset" ]
+      | map(. as $f | ($s | index($f)) != null) | any' "$REC_G")"
+if [ "$G_TOTAL" = "1" ] && [ "$G_HAS_HELPER" = "true" ] && [ "$G_LEAKS" = "false" ]; then
+  ok "(g) diff-scoped: units_total=1, reused_symbols=[normalize_record] only — no test fixtures leaked"
+else
+  bad "(g) diff scope leaked: units_total=$G_TOTAL has_helper=$G_HAS_HELPER fixtures_leaked=$G_LEAKS"
+  jq '{units_total, reused_symbols}' "$REC_G"
+fi
+
 echo
 echo "  reuse-metric tests: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
