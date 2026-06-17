@@ -56,3 +56,6 @@ evals/oracles/*/report.json
 .planning/
 .claude/
 evals/benchmark/results.jsonl
+
+# Git worktrees (heimdall isolation)
+.worktrees/
