@@ -232,30 +232,41 @@ else
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
-# (c) HARD SPEND CAP aborts FAIL-CLOSED before blowing the cap, partial report.
+# (c) SOFT WARN BUDGET on non_cache_tokens — WARNS + flags, does NOT halt.
 # ─────────────────────────────────────────────────────────────────────────────
-# Each task "spends" 50k (MOCK_SPEND). With --cap 60000, task 1 (50k) fits, but
-# task 2 would project 100k > 60k => abort BEFORE running task 2. Exactly one
-# task should run; the report is partial; the exit is nonzero (fail-closed).
+# Each task "spends" 50k non_cache_tokens (MOCK_SPEND wraps into both total_tokens
+# and non_cache_tokens). With --budget 60000, task 1 (cum 50k) is UNDER budget,
+# task 2 (cum 100k) CROSSES it. The NEW soft-warn contract: crossing the budget
+# WARNS + sets budget_exceeded:true on the crossing entry, but the sweep STILL
+# RUNS ALL ENTRIES (no abort) — solid work isn't killed mid-flight for an arbitrary
+# line; the CC account limits are the real ceiling. The run exits 0 (a signal, not
+# a gate), aborted stays false, BOTH entries run.
 rm -f "$WORK/hmd-was-called" "$WORK/spend-was-called"
-RUNID_CAP="captest-$$"
+RUNID_CAP="budgettest-$$"
 set +e
-MOCK_SPEND=50000 run_sweep --confirm-full --cap 60000 --run-id "$RUNID_CAP" >"$WORK/cap.out" 2>&1
+MOCK_SPEND=50000 run_sweep --confirm-full --budget 60000 --run-id "$RUNID_CAP" >"$WORK/cap.out" 2>&1
 CAP_RC=$?
 set -e
 CAP_REPORT="$ROOT/.planning/s6-sweep/$RUNID_CAP.json"
-if [ "$CAP_RC" -ne 0 ] && [ -f "$CAP_REPORT" ]; then
+if [ "$CAP_RC" -eq 0 ] && [ -f "$CAP_REPORT" ]; then
   RAN="$(jq '[.results[] | select(.status=="ran")] | length' "$CAP_REPORT")"
   ABORTED="$(jq -r '.aborted' "$CAP_REPORT")"
-  TOTAL_SPEND="$(jq -r '.total_token_spend' "$CAP_REPORT")"
-  if [ "$RAN" = "1" ] && [ "$ABORTED" = "true" ] && [ "$TOTAL_SPEND" -le 60000 ]; then
-    ok "(c) cap fail-closed: aborted before blowing cap (ran=$RAN, spend=$TOTAL_SPEND <= 60000, rc=$CAP_RC)"
+  # entry 0 cum non_cache = 50k (under 60k) => budget_exceeded false.
+  # entry 1 cum non_cache = 100k (over 60k)  => budget_exceeded true.
+  BE0="$(jq -r '.results[0].budget_exceeded' "$CAP_REPORT")"
+  BE1="$(jq -r '.results[1].budget_exceeded' "$CAP_REPORT")"
+  ANYBE="$(jq -r '.budget_exceeded' "$CAP_REPORT")"
+  WARNED=$(grep -qiE 'budget' "$WORK/cap.out" && echo yes || echo no)
+  if [ "$RAN" = "2" ] && [ "$ABORTED" = "false" ] \
+     && [ "$BE0" = "false" ] && [ "$BE1" = "true" ] && [ "$ANYBE" = "true" ] \
+     && [ "$WARNED" = "yes" ]; then
+    ok "(c) soft budget: ALL 2 entries ran (no abort, rc=0); over-budget entry flagged budget_exceeded:true + WARNED; under-budget entry false"
   else
-    bad "(c) cap did not fail-closed correctly (ran=$RAN aborted=$ABORTED spend=$TOTAL_SPEND rc=$CAP_RC)"
-    jq . "$CAP_REPORT"
+    bad "(c) soft budget wrong (ran=$RAN aborted=$ABORTED be0=$BE0 be1=$BE1 any=$ANYBE warned=$WARNED rc=$CAP_RC)"
+    jq . "$CAP_REPORT"; echo "---stderr---"; cat "$WORK/cap.out"
   fi
 else
-  bad "(c) cap run did not abort nonzero with a partial report (rc=$CAP_RC, report=$([ -f "$CAP_REPORT" ] && echo present || echo missing))"
+  bad "(c) soft-budget run did not complete cleanly (rc=$CAP_RC, expected 0; report=$([ -f "$CAP_REPORT" ] && echo present || echo missing))"
   cat "$WORK/cap.out"
 fi
 
@@ -329,19 +340,21 @@ if [ -f "$OK_REPORT" ]; then
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
-# (l) the HARD CAP fail-closes on total_tokens specifically: the (c) cap test
-#     already proved an abort, but here we assert the cap figure that triggered it
-#     is the meter's total_tokens (recorded in token_usage), not a phantom 0.
+# (l) the SOFT BUDGET is measured on non_cache_tokens specifically: the (c) test
+#     proved the flag+warn+no-abort; here we assert the figure the budget is judged
+#     on is the meter's non_cache_tokens (recorded in token_usage), summed across
+#     entries — NOT total_tokens, and NOT a phantom 0. cache_read is excluded.
 # ─────────────────────────────────────────────────────────────────────────────
 if [ -f "$CAP_REPORT" ]; then
-  # the single task that ran before the cap aborted must carry a nonzero
-  # total_tokens that is exactly the recorded total_token_spend (≤ cap).
-  CTU="$(jq -r '[.results[] | select(.status=="ran") | .token_usage.total_tokens] | add // 0' "$CAP_REPORT")"
-  CTOT="$(jq -r '.total_token_spend' "$CAP_REPORT")"
-  if [ "$CTU" -gt 0 ] && [ "$CTU" = "$CTOT" ] && [ "$CTOT" -le 60000 ]; then
-    ok "(l) cap fail-closed on REAL total_tokens (=$CTOT, nonzero, ≤ cap), not a phantom 0"
+  # both entries ran (no abort); the cumulative budget figure is the summed
+  # non_cache_tokens (50k + 50k = 100k), recorded + reported as total_non_cache_tokens.
+  CNC="$(jq -r '[.results[] | select(.status=="ran") | .token_usage.non_cache_tokens] | add // 0' "$CAP_REPORT")"
+  CNCREP="$(jq -r '.total_non_cache_tokens' "$CAP_REPORT")"
+  BUDGET="$(jq -r '.budget' "$CAP_REPORT")"
+  if [ "$CNC" -gt 0 ] && [ "$CNC" = "$CNCREP" ] && [ "$CNC" -gt "$BUDGET" ] && [ "$BUDGET" = "60000" ]; then
+    ok "(l) budget judged on REAL non_cache_tokens (summed=$CNC == report's total_non_cache_tokens, > budget $BUDGET), not total_tokens/phantom-0"
   else
-    bad "(l) cap did not fail-close on the measured total_tokens (total_tokens=$CTU total_spend=$CTOT)"
+    bad "(l) budget not measured on the meter's non_cache_tokens (summed=$CNC reported=$CNCREP budget=$BUDGET)"
     jq '[.results[] | select(.status=="ran") | .token_usage]' "$CAP_REPORT"
   fi
 fi
@@ -579,6 +592,148 @@ if [ "$PINLESS_RC" -eq 2 ] \
   ok "(i) pinless entry (missing sha) rejected fail-closed (exit 2), no clone, no spend"
 else
   bad "(i) pinless entry not rejected fail-closed (rc=$PINLESS_RC, expected 2)"; cat "$WORK/pinless.out"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# (m) FULL-BREAKDOWN reporting: per-repo + summary carry every token component.
+# ─────────────────────────────────────────────────────────────────────────────
+# Run a clean 2-entry sweep with a fake HMD that writes a KNOWN emitted record
+# (the --hmd-cmd seam exports HEIMDALL_USAGE_OUT) so do_token_record reads the REAL
+# meter (NOT --spend-cmd) and the report carries the full normalized breakdown.
+# emitted record: in=1000 out=200 cc=300 cr=8000
+#   total_tokens     = 9500   non_cache_tokens = 1500   total_cost_usd null => DERIVED
+EMIT_HMD="$WORK/mock-hmd-emit.sh"
+cat > "$EMIT_HMD" <<EOF
+#!/usr/bin/env bash
+# args: <repo_dir> <task_prompt> ; HEIMDALL_USAGE_OUT is exported by the runner.
+set -euo pipefail
+: > "$WORK/hmd-was-called"
+cp "$CANNED_DIFF" "\$1/api/users.js"
+cat > "\${HEIMDALL_USAGE_OUT}" <<JSON
+{
+  "session_id": "fake-sess-\$(basename "\$1")",
+  "input_tokens": 1000,
+  "output_tokens": 200,
+  "cache_creation_tokens": 300,
+  "cache_read_tokens": 8000,
+  "total_cost_usd": null,
+  "model": "claude-opus-4-8",
+  "usage_available": true
+}
+JSON
+echo "mock-hmd-emit: wrote emitted record for \$2"
+EOF
+chmod +x "$EMIT_HMD"
+
+RUNID_BD="breakdown-$$"
+set +e
+"$SWEEP" --manifest "$MANIFEST" --clone-cmd "$CLONE_CMD" --hmd-cmd "$EMIT_HMD" \
+         --confirm-full --budget 0 --run-id "$RUNID_BD" >"$WORK/bd.out" 2>&1
+BD_RC=$?
+set -e
+BD_REPORT="$ROOT/.planning/s6-sweep/$RUNID_BD.json"
+if [ "$BD_RC" -eq 0 ] && [ -f "$BD_REPORT" ] && jq -e . "$BD_REPORT" >/dev/null; then
+  # per-repo token_usage carries the FULL breakdown including non_cache + cost_source.
+  if jq -e '
+      .results[0].token_usage as $u
+      | ($u.input_tokens==1000 and $u.output_tokens==200
+         and $u.cache_creation_tokens==300 and $u.cache_read_tokens==8000
+         and $u.total_tokens==9500 and $u.non_cache_tokens==1500
+         and $u.cost_source=="derived" and ($u.total_cost_usd|type=="number"))
+      and (.results[0] | has("budget_exceeded"))
+      and (.results[0] | has("session_id"))
+    ' "$BD_REPORT" >/dev/null; then
+    ok "(m) per-repo full breakdown: in/out/cc/cr + total(9500) + non_cache(1500) + derived cost + session_id + budget_exceeded"
+  else
+    bad "(m) per-repo breakdown incomplete"; jq '.results[0]' "$BD_REPORT"
+  fi
+else
+  bad "(m) breakdown run failed (rc=$BD_RC)"; cat "$WORK/bd.out"
+fi
+
+# (m2) the SUMMARY report rolls up every component across entries.
+if [ -f "$BD_REPORT" ]; then
+  if jq -e '
+      .total_token_spend==19000           # 2 x 9500
+      and .total_non_cache_tokens==3000     # 2 x 1500
+      and has("budget") and has("budget_exceeded")
+      and (.results | all(has("session_id") and (.token_usage | has("non_cache_tokens") and has("cost_source"))))
+    ' "$BD_REPORT" >/dev/null; then
+    ok "(m2) summary rolls up total_token_spend(19000) + total_non_cache_tokens(3000) + budget + budget_exceeded"
+  else
+    bad "(m2) summary rollup missing fields"; jq 'del(.results)' "$BD_REPORT"
+  fi
+fi
+
+# (m3) NO %-saved / tokens-saved headline anywhere (deferred to P3 — needs the
+#      raw-CC baseline arm). Assert neither the report NOR the bin emits it.
+if [ -f "$BD_REPORT" ]; then
+  if ! jq -e 'paths | map(tostring) | join(".") | test("saved|savings|pct_saved|percent_saved";"i")' "$BD_REPORT" >/dev/null 2>&1 \
+     && ! grep -qiE 'saved|savings|%[ ]*saved' "$WORK/bd.out"; then
+    ok "(m3) NO %-saved / tokens-saved headline in report or stdout (savings deferred to P3)"
+  else
+    bad "(m3) a savings headline leaked (must be deferred to P3)"; grep -niE 'saved|savings' "$WORK/bd.out" || true
+  fi
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# (n) budget is CONFIGURABLE via env HEIMDALL_TOKEN_BUDGET (no flag).
+# ─────────────────────────────────────────────────────────────────────────────
+# With non_cache=1500/entry and HEIMDALL_TOKEN_BUDGET=1000, BOTH entries cross =>
+# both flagged, sweep still completes (rc 0).
+RUNID_ENV="envbudget-$$"
+set +e
+HEIMDALL_TOKEN_BUDGET=1000 "$SWEEP" --manifest "$MANIFEST" --clone-cmd "$CLONE_CMD" \
+         --hmd-cmd "$EMIT_HMD" --confirm-full --run-id "$RUNID_ENV" >"$WORK/env.out" 2>&1
+ENV_RC=$?
+set -e
+ENV_REPORT="$ROOT/.planning/s6-sweep/$RUNID_ENV.json"
+if [ "$ENV_RC" -eq 0 ] && [ -f "$ENV_REPORT" ] \
+   && [ "$(jq -r '.budget' "$ENV_REPORT")" = "1000" ] \
+   && [ "$(jq -r '.budget_source' "$ENV_REPORT")" = "env" ] \
+   && [ "$(jq -r '.results[0].budget_exceeded' "$ENV_REPORT")" = "true" ] \
+   && [ "$(jq -r '.budget_exceeded' "$ENV_REPORT")" = "true" ]; then
+  ok "(n) env HEIMDALL_TOKEN_BUDGET=1000 configures the budget (budget_source=env), both entries flagged, sweep completes"
+else
+  bad "(n) env budget not honored (rc=$ENV_RC budget=$(jq -r '.budget // "?"' "$ENV_REPORT" 2>/dev/null))"; cat "$WORK/env.out"
+fi
+
+# (n2) explicit --budget OVERRIDES the env var (flag precedence).
+RUNID_OVR="ovrbudget-$$"
+set +e
+HEIMDALL_TOKEN_BUDGET=1000 "$SWEEP" --manifest "$MANIFEST" --clone-cmd "$CLONE_CMD" \
+         --hmd-cmd "$EMIT_HMD" --confirm-full --budget 999999 --run-id "$RUNID_OVR" >"$WORK/ovr.out" 2>&1
+OVR_RC=$?
+set -e
+OVR_REPORT="$ROOT/.planning/s6-sweep/$RUNID_OVR.json"
+if [ "$OVR_RC" -eq 0 ] && [ -f "$OVR_REPORT" ] \
+   && [ "$(jq -r '.budget' "$OVR_REPORT")" = "999999" ] \
+   && [ "$(jq -r '.budget_source' "$OVR_REPORT")" = "flag" ] \
+   && [ "$(jq -r '.budget_exceeded' "$OVR_REPORT")" = "false" ]; then
+  ok "(n2) --budget flag overrides env (budget=999999, budget_source=flag, nothing flagged)"
+else
+  bad "(n2) flag did not override env (budget=$(jq -r '.budget // "?"' "$OVR_REPORT" 2>/dev/null) src=$(jq -r '.budget_source // "?"' "$OVR_REPORT" 2>/dev/null))"; cat "$WORK/ovr.out"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# (o) budget 0 / off DISABLES the soft budget — nothing is ever flagged.
+# ─────────────────────────────────────────────────────────────────────────────
+# --budget 0 (and "off") means no budget: budget_exceeded false everywhere, even
+# though each entry "spends" non-zero non_cache tokens.
+RUNID_OFF="offbudget-$$"
+set +e
+"$SWEEP" --manifest "$MANIFEST" --clone-cmd "$CLONE_CMD" --hmd-cmd "$EMIT_HMD" \
+         --confirm-full --budget off --run-id "$RUNID_OFF" >"$WORK/off.out" 2>&1
+OFF_RC=$?
+set -e
+OFF_REPORT="$ROOT/.planning/s6-sweep/$RUNID_OFF.json"
+if [ "$OFF_RC" -eq 0 ] && [ -f "$OFF_REPORT" ] \
+   && [ "$(jq -r '.budget' "$OFF_REPORT")" = "0" ] \
+   && [ "$(jq -r '.budget_exceeded' "$OFF_REPORT")" = "false" ] \
+   && [ "$(jq -r '[.results[] | select(.budget_exceeded==true)] | length' "$OFF_REPORT")" = "0" ]; then
+  ok "(o) --budget off disables the soft budget (budget=0, nothing flagged) even with real spend"
+else
+  bad "(o) budget off did not disable flagging (rc=$OFF_RC)"; cat "$WORK/off.out"
 fi
 
 echo

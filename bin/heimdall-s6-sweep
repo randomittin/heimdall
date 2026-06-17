@@ -103,11 +103,16 @@ B='\033[1m'; R='\033[0m'
 usage() { sed -n '2,82p' "$SELF" | sed 's/^# \{0,1\}//'; }
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
+# DEFAULT_BUDGET — the SOFT WARN budget on non_cache_tokens PER TASK, ~3M tokens.
+# It is a SIGNAL, not a gate: crossing it WARNS + flags budget_exceeded but never
+# halts the sweep (RJ: solid work shouldn't be killed mid-flight for an arbitrary
+# line; the CC account limits are the real ceiling). 0 / "off" disables it.
+DEFAULT_BUDGET=3000000
 MANIFEST=""
 MODE="dry"            # dry | run
 LIMIT=""              # empty => all entries
 CONFIRM_FULL=0
-CAP=600000
+BUDGET_FLAG=""        # set by --budget / --cap (back-compat alias); empty => unset
 RUN_ID=""
 CLONE_CMD=""
 HMD_CMD=""
@@ -119,7 +124,10 @@ while [ $# -gt 0 ]; do
     --dry-run|--dry) MODE="dry"; shift ;;
     --confirm-full) CONFIRM_FULL=1; MODE="run"; shift ;;
     --limit)        LIMIT="${2:?--limit needs N}"; MODE="run"; shift 2 ;;
-    --cap)          CAP="${2:?--cap needs N}"; shift 2 ;;
+    # --budget is the soft WARN budget on non_cache_tokens (0/off disables).
+    # --cap is kept as a BACK-COMPAT alias (it no longer hard-aborts — soft now).
+    --budget)       BUDGET_FLAG="${2:?--budget needs N|off}"; shift 2 ;;
+    --cap)          BUDGET_FLAG="${2:?--cap needs N|off}"; shift 2 ;;
     --run-id)       RUN_ID="${2:?--run-id needs a value}"; shift 2 ;;
     --clone-cmd)    CLONE_CMD="${2:?--clone-cmd needs a command}"; shift 2 ;;
     --hmd-cmd)      HMD_CMD="${2:?--hmd-cmd needs a command}"; shift 2 ;;
@@ -131,6 +139,46 @@ done
 
 command -v jq >/dev/null 2>&1 || { echo "error: jq is required" >&2; exit 2; }
 [ -n "$MANIFEST" ] || { echo "error: --manifest is required" >&2; usage >&2; exit 2; }
+
+# ── Resolve the SOFT WARN BUDGET (on non_cache_tokens, per task) ──────────────
+# Precedence: --budget/--cap flag > env HEIMDALL_TOKEN_BUDGET > hmd config key
+# (.planning/settings.json → .s6_sweep.token_budget) > DEFAULT_BUDGET. A value of
+# 0 or "off" (case-insensitive) DISABLES the budget entirely (no flagging, no warn).
+# BUDGET_SOURCE records which layer won, for the report's provenance.
+SETTINGS_FILE="${HEIMDALL_PLANNING_DIR:-$PLUGIN_DIR/.planning}/settings.json"
+normalize_budget() {
+  # $1 raw value -> echoes a non-negative integer (off/empty -> 0); nonzero rc on garbage.
+  local v="$1"
+  case "$v" in
+    [Oo][Ff][Ff]|"") echo 0; return 0 ;;
+    *[!0-9]*) return 1 ;;
+    *) echo "$v"; return 0 ;;
+  esac
+}
+BUDGET=""
+BUDGET_SOURCE=""
+if [ -n "$BUDGET_FLAG" ]; then
+  if ! BUDGET="$(normalize_budget "$BUDGET_FLAG")"; then
+    echo "error: --budget/--cap must be a non-negative integer or 'off'" >&2; exit 2
+  fi
+  BUDGET_SOURCE="flag"
+elif [ -n "${HEIMDALL_TOKEN_BUDGET:-}" ]; then
+  if ! BUDGET="$(normalize_budget "$HEIMDALL_TOKEN_BUDGET")"; then
+    echo "error: HEIMDALL_TOKEN_BUDGET must be a non-negative integer or 'off'" >&2; exit 2
+  fi
+  BUDGET_SOURCE="env"
+else
+  CFG_BUDGET=""
+  if [ -f "$SETTINGS_FILE" ]; then
+    CFG_BUDGET="$(jq -r '.s6_sweep.token_budget // empty' "$SETTINGS_FILE" 2>/dev/null || echo "")"
+  fi
+  if [ -n "$CFG_BUDGET" ] && BUDGET="$(normalize_budget "$CFG_BUDGET")"; then
+    BUDGET_SOURCE="config"
+  else
+    BUDGET="$DEFAULT_BUDGET"
+    BUDGET_SOURCE="default"
+  fi
+fi
 
 # ── stdin manifest ('-') — the spec-adapter glue ──────────────────────────────
 # `heimdall-s6-manifest spec.json | heimdall-s6-sweep --manifest -` lets the C3
@@ -147,7 +195,7 @@ fi
 [ -f "$MANIFEST" ] || { echo "error: manifest not found: $MANIFEST" >&2; exit 2; }
 [ -x "$METRIC" ] || { echo "error: reuse metric not executable at $METRIC" >&2; exit 2; }
 
-case "$CAP" in (*[!0-9]*|'') echo "error: --cap must be a non-negative integer" >&2; exit 2 ;; esac
+# BUDGET is already validated to a non-negative integer in the resolution above.
 if [ -n "$LIMIT" ]; then
   case "$LIMIT" in (*[!0-9]*|'') echo "error: --limit must be a non-negative integer" >&2; exit 2 ;; esac
 fi
@@ -189,20 +237,23 @@ else
   N_EFFECTIVE="$TOTAL_ENTRIES"
 fi
 
-# Per-task spend ESTIMATE for the dry-run plan: the cap divided evenly across all
-# entries, an honest "if the budget were shared equally" figure — the cap is the
-# real bound, this is only a planning estimate.
-EST_PER_TASK=$(( CAP / TOTAL_ENTRIES ))
+# Per-task budget figure for the dry-run plan: the SOFT WARN budget on
+# non_cache_tokens PER TASK (0 means disabled). It does not bound the sweep — it is
+# a signal surfaced per task; the plan just shows what each task is measured against.
+if [ "$BUDGET" -gt 0 ]; then
+  BUDGET_LABEL="soft warn budget ${BUDGET} non_cache_tokens/task (source: ${BUDGET_SOURCE}; WARNS, never halts)"
+else
+  BUDGET_LABEL="soft budget DISABLED (source: ${BUDGET_SOURCE})"
+fi
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DRY-RUN — validate + print the plan + per-task spend estimate. Spend NOTHING.
+# DRY-RUN — validate + print the plan + per-task soft budget. Spend NOTHING.
 # ─────────────────────────────────────────────────────────────────────────────
 if [ "$MODE" = "dry" ]; then
   printf "${P}${B}heimdall-s6-sweep${R} — ${B}DRY-RUN${R} (no clone, no hmd, no spend)\n"
   printf "  manifest : %s\n" "$MANIFEST"
-  printf "  entries  : %s   ${D}(spend cap %s tokens, fail-closed)${R}\n" "$TOTAL_ENTRIES" "$CAP"
-  printf "  estimate : ~%s tokens/task ${D}(cap / entries — planning figure only)${R}\n\n" "$EST_PER_TASK"
-  printf "  ${B}%-3s %-24s %-10s %-6s %-9s %-11s %s${R}\n" "#" "repo_url" "sha" "lang" "license" "est_tokens" "task"
+  printf "  entries  : %s   ${D}(%s)${R}\n\n" "$TOTAL_ENTRIES" "$BUDGET_LABEL"
+  printf "  ${B}%-3s %-24s %-10s %-6s %-9s %-13s %s${R}\n" "#" "repo_url" "sha" "lang" "license" "budget/task" "task"
   i=0
   while [ "$i" -lt "$TOTAL_ENTRIES" ]; do
     url="$(jq -r ".[$i].repo_url" "$MANIFEST")"
@@ -216,7 +267,8 @@ if [ "$MODE" = "dry" ]; then
     stask="$task"; [ "${#stask}" -gt 40 ] && stask="${stask:0:37}..."
     marker=" "
     [ "$i" -lt "$N_EFFECTIVE" ] && marker="${G}▸${R}"
-    printf "  ${marker}%-3s %-24s %-10s %-6s %-9s %-11s %s\n" "$((i+1))" "$surl" "$ssha" "$lang" "$lic" "$EST_PER_TASK" "$stask"
+    budcell="$([ "$BUDGET" -gt 0 ] && echo "$BUDGET" || echo "off")"
+    printf "  ${marker}%-3s %-24s %-10s %-6s %-9s %-13s %s\n" "$((i+1))" "$surl" "$ssha" "$lang" "$lic" "$budcell" "$stask"
     i=$((i+1))
   done
   echo
