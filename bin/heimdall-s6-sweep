@@ -1,0 +1,376 @@
+#!/usr/bin/env bash
+# heimdall-s6-sweep — S-6 Component 3 popular-10 cold generalization sweep RUNNER.
+#
+# The spend-gated, capped, staged HARNESS that runs the S-6 C3 breadth proof:
+# for each repo in a manifest, cold-clone it, run `hmd "<task>"` against it,
+# measure REUSE over the run's diff (bin/heimdall-reuse-metric), capture
+# WORKING-OUTPUT evidence by running the repo's own acceptance_cmd and recording
+# PASS/FAIL with the QUOTED output (runnable evidence, NEVER the agent's
+# self-report — R7), and record the task's token spend. It enforces a HARD spend
+# cap (fail-closed), and is SAFE-BY-DEFAULT: with no mode flag it only DRY-RUNS.
+#
+# This harness does NOT decide the verdict — it produces HONEST numbers. A low
+# reuse distribution is surfaced PROMINENTLY as the finding, never massaged.
+#
+# ── Manifest schema (consumed; emitted later by the C3 proposal agent into
+#    docs/superpowers/specs/heimdall-S6-C3-repos.json) ──────────────────────────
+#   A JSON ARRAY; each entry:
+#     repo_url                 (string)  clone source
+#     lang                     (string)  primary language (for the plan table)
+#     license                  (string)  must be permissive — reported, not enforced
+#     task_prompt              (string)  the realistic task handed to `hmd`
+#     reused_symbols_expected  (array)   symbols a competent solution should reuse
+#     acceptance_cmd           (string)  the repo's OWN test/build — run for evidence
+#   repo_url, task_prompt and acceptance_cmd are REQUIRED; a missing one is a hard
+#   usage error (exit 2) — we never sweep a half-specified manifest.
+#
+# ── Staging (safe-by-default, like `hmd bench`) ───────────────────────────────
+#   (no flags) / --dry-run   Validate manifest + PRINT the plan + per-task spend
+#                            ESTIMATE. No clone, no hmd, no spend. (DEFAULT.)
+#   --limit N                Run only the first N repos (the dry-1-2 stage).
+#   --confirm-full           REQUIRED to run ALL entries (or more than --limit).
+#                            Without it a full sweep aborts — it can never run the
+#                            whole popular-10 unattended by accident.
+#   --cap N                  HARD token cap across the sweep (default 600000).
+#                            FAIL-CLOSED: before each task, if projected cumulative
+#                            spend would exceed the cap, abort cleanly with a
+#                            PARTIAL report. The cap is never blown.
+#   --run-id ID              Report file stem (default: timestamp).
+#
+# ── Test seams (the ONLY mocking; used by test/s6-sweep.test.sh to stay free) ─
+#   --clone-cmd CMD          Override the clone step: `CMD <repo_url> <dest>`.
+#   --hmd-cmd CMD            Override the agent run: `CMD <repo_dir> <task_prompt>`.
+#   --spend-cmd CMD          Override the token-spend source: `CMD` echoes an int.
+#   None of these are used in a real RJ-gated sweep; the defaults clone with git,
+#   run the real `hmd`, and read spend from the heimdall token ledger.
+#
+# ── Output ────────────────────────────────────────────────────────────────────
+#   Machine-readable .planning/s6-sweep/<run-id>.json — per repo: reuse_pct,
+#   working_output{pass,evidence}, token_spend — plus a human summary table
+#   (reuse-% distribution, working-output rate, total spend). Reported honestly,
+#   low numbers included.
+#
+# Exit: 0 clean (incl. dry-run); 2 usage / malformed manifest; nonzero when a real
+#       sweep aborts on the cap or the --confirm-full gate (fail-closed).
+set -euo pipefail
+
+SELF="$0"
+if command -v readlink >/dev/null 2>&1; then
+  SELF="$(readlink -f "$0" 2>/dev/null || readlink "$0" 2>/dev/null || echo "$0")"
+fi
+BIN_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+PLUGIN_DIR="$(cd "$BIN_DIR/.." && pwd)"
+METRIC="$BIN_DIR/heimdall-reuse-metric"
+OUT_DIR="${HEIMDALL_PLANNING_DIR:-$PLUGIN_DIR/.planning}/s6-sweep"
+
+# ── Colors (truecolor with plain fallback, matching the other bins) ───────────
+if [ "${COLORTERM:-}" = "truecolor" ] || [ "${COLORTERM:-}" = "24bit" ] || case "${TERM:-}" in *256color*) true ;; *) false ;; esac; then
+  P='\033[38;2;224;86;160m'; C='\033[38;2;0;212;255m'; G='\033[38;2;78;204;163m'
+  W='\033[38;2;255;200;80m'; D='\033[38;2;100;100;120m'
+else
+  P='\033[35m'; C='\033[36m'; G='\033[32m'; W='\033[33m'; D='\033[37m'
+fi
+B='\033[1m'; R='\033[0m'
+
+usage() { sed -n '2,72p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+# ── Defaults ──────────────────────────────────────────────────────────────────
+MANIFEST=""
+MODE="dry"            # dry | run
+LIMIT=""              # empty => all entries
+CONFIRM_FULL=0
+CAP=600000
+RUN_ID=""
+CLONE_CMD=""
+HMD_CMD=""
+SPEND_CMD=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --manifest)     MANIFEST="${2:?--manifest needs a file}"; shift 2 ;;
+    --dry-run|--dry) MODE="dry"; shift ;;
+    --confirm-full) CONFIRM_FULL=1; MODE="run"; shift ;;
+    --limit)        LIMIT="${2:?--limit needs N}"; MODE="run"; shift 2 ;;
+    --cap)          CAP="${2:?--cap needs N}"; shift 2 ;;
+    --run-id)       RUN_ID="${2:?--run-id needs a value}"; shift 2 ;;
+    --clone-cmd)    CLONE_CMD="${2:?--clone-cmd needs a command}"; shift 2 ;;
+    --hmd-cmd)      HMD_CMD="${2:?--hmd-cmd needs a command}"; shift 2 ;;
+    --spend-cmd)    SPEND_CMD="${2:?--spend-cmd needs a command}"; shift 2 ;;
+    -h|--help)      usage; exit 0 ;;
+    *) echo "error: unknown argument: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+command -v jq >/dev/null 2>&1 || { echo "error: jq is required" >&2; exit 2; }
+[ -n "$MANIFEST" ] || { echo "error: --manifest is required" >&2; usage >&2; exit 2; }
+[ -f "$MANIFEST" ] || { echo "error: manifest not found: $MANIFEST" >&2; exit 2; }
+[ -x "$METRIC" ] || { echo "error: reuse metric not executable at $METRIC" >&2; exit 2; }
+
+case "$CAP" in (*[!0-9]*|'') echo "error: --cap must be a non-negative integer" >&2; exit 2 ;; esac
+if [ -n "$LIMIT" ]; then
+  case "$LIMIT" in (*[!0-9]*|'') echo "error: --limit must be a non-negative integer" >&2; exit 2 ;; esac
+fi
+
+# ── Validate the manifest shape (a half-specified manifest is a hard error) ───
+if ! jq -e 'type == "array" and length > 0' "$MANIFEST" >/dev/null 2>&1; then
+  echo "error: manifest must be a non-empty JSON array of repo entries" >&2
+  exit 2
+fi
+# Every entry must carry the three REQUIRED fields (repo_url, task_prompt,
+# acceptance_cmd) as non-empty strings. jq returns the index of the first bad one.
+BAD_IDX="$(jq -r '
+  [ to_entries[]
+    | select(
+        ((.value.repo_url // "")       | type != "string" or . == "")
+        or ((.value.task_prompt // "")   | type != "string" or . == "")
+        or ((.value.acceptance_cmd // "")| type != "string" or . == "")
+      )
+    | .key ] | (.[0] // "ok")
+' "$MANIFEST")"
+if [ "$BAD_IDX" != "ok" ]; then
+  echo "error: manifest entry $BAD_IDX is missing a required field (repo_url, task_prompt, acceptance_cmd)" >&2
+  exit 2
+fi
+
+TOTAL_ENTRIES="$(jq 'length' "$MANIFEST")"
+
+# Effective number of entries to act on (--limit clamps; empty => all).
+if [ -n "$LIMIT" ] && [ "$LIMIT" -lt "$TOTAL_ENTRIES" ]; then
+  N_EFFECTIVE="$LIMIT"
+else
+  N_EFFECTIVE="$TOTAL_ENTRIES"
+fi
+
+# Per-task spend ESTIMATE for the dry-run plan: the cap divided evenly across all
+# entries, an honest "if the budget were shared equally" figure — the cap is the
+# real bound, this is only a planning estimate.
+EST_PER_TASK=$(( CAP / TOTAL_ENTRIES ))
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DRY-RUN — validate + print the plan + per-task spend estimate. Spend NOTHING.
+# ─────────────────────────────────────────────────────────────────────────────
+if [ "$MODE" = "dry" ]; then
+  printf "${P}${B}heimdall-s6-sweep${R} — ${B}DRY-RUN${R} (no clone, no hmd, no spend)\n"
+  printf "  manifest : %s\n" "$MANIFEST"
+  printf "  entries  : %s   ${D}(spend cap %s tokens, fail-closed)${R}\n" "$TOTAL_ENTRIES" "$CAP"
+  printf "  estimate : ~%s tokens/task ${D}(cap / entries — planning figure only)${R}\n\n" "$EST_PER_TASK"
+  printf "  ${B}%-3s %-28s %-6s %-9s %-12s %s${R}\n" "#" "repo_url" "lang" "license" "est_tokens" "task"
+  i=0
+  while [ "$i" -lt "$TOTAL_ENTRIES" ]; do
+    url="$(jq -r ".[$i].repo_url" "$MANIFEST")"
+    lang="$(jq -r ".[$i].lang // \"?\"" "$MANIFEST")"
+    lic="$(jq -r ".[$i].license // \"?\"" "$MANIFEST")"
+    task="$(jq -r ".[$i].task_prompt" "$MANIFEST")"
+    # short url + short task for the table
+    surl="$url"; [ "${#surl}" -gt 27 ] && surl="...${surl: -24}"
+    stask="$task"; [ "${#stask}" -gt 44 ] && stask="${stask:0:41}..."
+    marker=" "
+    [ "$i" -lt "$N_EFFECTIVE" ] && marker="${G}▸${R}"
+    printf "  ${marker}%-3s %-28s %-6s %-9s %-12s %s\n" "$((i+1))" "$surl" "$lang" "$lic" "$EST_PER_TASK" "$stask"
+    i=$((i+1))
+  done
+  echo
+  if [ -n "$LIMIT" ]; then
+    printf "  plan: run the first ${B}%s${R} of %s repos (the staged dry-1-2 slice).\n" "$N_EFFECTIVE" "$TOTAL_ENTRIES"
+  else
+    printf "  plan: a full sweep would run all ${B}%s${R} repos.\n" "$TOTAL_ENTRIES"
+  fi
+  printf "  ${W}to run for real:${R} re-invoke WITHOUT --dry-run; a FULL sweep additionally requires ${B}--confirm-full${R}.\n"
+  printf "  ${D}nothing was cloned, no model was called, zero tokens spent.${R}\n"
+  exit 0
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# REAL RUN — gated. A full sweep (acting on ALL entries) demands --confirm-full.
+# ─────────────────────────────────────────────────────────────────────────────
+if [ "$N_EFFECTIVE" -ge "$TOTAL_ENTRIES" ] && [ "$CONFIRM_FULL" -ne 1 ]; then
+  echo "error: a FULL sweep over all $TOTAL_ENTRIES repos requires --confirm-full" >&2
+  echo "       (use --limit N to run a smaller staged slice, or --dry-run to preview)" >&2
+  echo "       refusing to sweep the whole set unattended." >&2
+  exit 3
+fi
+
+[ -n "$RUN_ID" ] || RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+mkdir -p "$OUT_DIR"
+REPORT="$OUT_DIR/$RUN_ID.json"
+WORK_ROOT="$(mktemp -d -t "s6-sweep.$(printf 'X%.0s' 1 2 3 4 5 6)")"
+cleanup() { rm -rf "$WORK_ROOT"; }
+trap cleanup EXIT
+
+# ── clone step: injected --clone-cmd, else a real shallow git clone ───────────
+do_clone() {
+  # $1 repo_url ; $2 dest
+  if [ -n "$CLONE_CMD" ]; then
+    $CLONE_CMD "$1" "$2"
+  else
+    git clone --depth 1 "$1" "$2"
+  fi
+}
+
+# ── agent run: injected --hmd-cmd, else the real `hmd "<task>"` in the repo ────
+do_hmd() {
+  # $1 repo_dir ; $2 task_prompt
+  if [ -n "$HMD_CMD" ]; then
+    $HMD_CMD "$1" "$2"
+  else
+    ( cd "$1" && "$BIN_DIR/hmd" "$2" )
+  fi
+}
+
+# ── token spend: injected --spend-cmd, else the heimdall token ledger total ───
+do_spend() {
+  if [ -n "$SPEND_CMD" ]; then
+    $SPEND_CMD
+  elif [ -x "$BIN_DIR/heimdall-ledger" ]; then
+    # the ledger's TOTAL for this run; degrade to 0 if unavailable (never abort).
+    "$BIN_DIR/heimdall-ledger" report 2>/dev/null \
+      | sed -n 's/.*TOTAL: \([0-9][0-9]*\) tokens.*/\1/p' | tail -1
+  else
+    echo 0
+  fi
+}
+
+# results accumulate as a JSON array file (one object appended per task).
+RESULTS_FILE="$WORK_ROOT/results.jsonl"
+: > "$RESULTS_FILE"
+TOTAL_SPEND=0
+RAN=0
+ABORTED=false
+ABORT_REASON=""
+
+printf "${P}${B}heimdall-s6-sweep${R} — running ${B}%s${R} of %s repos ${D}(cap %s, fail-closed)${R}\n" \
+  "$N_EFFECTIVE" "$TOTAL_ENTRIES" "$CAP" >&2
+
+i=0
+while [ "$i" -lt "$N_EFFECTIVE" ]; do
+  url="$(jq -r ".[$i].repo_url" "$MANIFEST")"
+  task="$(jq -r ".[$i].task_prompt" "$MANIFEST")"
+  acc="$(jq -r ".[$i].acceptance_cmd" "$MANIFEST")"
+  expect="$(jq -c ".[$i].reused_symbols_expected // []" "$MANIFEST")"
+
+  # ── HARD CAP, FAIL-CLOSED: before starting, project this task's spend against
+  #    the remaining budget. If we cannot afford even the per-task estimate,
+  #    abort cleanly with a partial report — never start a task that blows it. ──
+  PROJECTED=$(( TOTAL_SPEND + EST_PER_TASK ))
+  if [ "$PROJECTED" -gt "$CAP" ]; then
+    ABORTED=true
+    ABORT_REASON="projected spend $PROJECTED would exceed cap $CAP before task $((i+1))"
+    printf "  ${W}CAP REACHED${R} — %s. Aborting with a partial report.\n" "$ABORT_REASON" >&2
+    break
+  fi
+
+  printf "  ${C}[%s/%s]${R} %s\n" "$((i+1))" "$N_EFFECTIVE" "$url" >&2
+
+  DEST="$WORK_ROOT/repo-$i"
+  CLONE_RC=0
+  do_clone "$url" "$DEST" >/dev/null 2>&1 || CLONE_RC=$?
+  if [ "$CLONE_RC" -ne 0 ] || [ ! -d "$DEST/.git" ]; then
+    jq -cn --arg url "$url" --arg task "$task" \
+       '{repo_url:$url, task:$task, status:"clone-failed", reuse_pct:null,
+         reused_symbols:[], working_output:{pass:false, evidence:"clone failed"},
+         token_spend:0}' >> "$RESULTS_FILE"
+    i=$((i+1)); continue
+  fi
+
+  # snapshot HEAD before the run so the metric diffs the run's changes only.
+  BASE="$(git -C "$DEST" rev-parse HEAD 2>/dev/null || echo "")"
+
+  # ── run the agent against the cold repo ──
+  do_hmd "$DEST" "$task" >/dev/null 2>&1 || true
+
+  # ── measure REUSE over the run's diff (real metric, never canned) ──
+  RID="${RUN_ID}-repo$i"
+  REUSE_JSON="$DEST/.planning/reuse/$RID.json"
+  if [ -n "$BASE" ]; then
+    "$METRIC" --repo "$DEST" --base "$BASE" --task "$task" --run-id "$RID" --quiet >/dev/null 2>&1 || true
+  fi
+  if [ -f "$REUSE_JSON" ]; then
+    REUSE_PCT="$(jq -c '.reuse_pct' "$REUSE_JSON")"
+    REUSE_SYMS="$(jq -c '[.reused_symbols[]?.symbol]' "$REUSE_JSON")"
+  else
+    REUSE_PCT="null"; REUSE_SYMS="[]"
+  fi
+
+  # ── WORKING-OUTPUT EVIDENCE: run the repo's OWN acceptance_cmd, capture the
+  #    exit status + QUOTED output. This is runnable evidence (R7) — we trust the
+  #    test suite's result, NEVER the agent's self-report. ──
+  ACC_OUT="$( ( cd "$DEST" && eval "$acc" ) 2>&1 )" && ACC_RC=0 || ACC_RC=$?
+  if [ "$ACC_RC" -eq 0 ]; then WO_PASS=true; else WO_PASS=false; fi
+  # clamp the evidence to a sane length so a noisy suite cannot bloat the report.
+  EVIDENCE="$ACC_OUT"
+  if [ "${#EVIDENCE}" -gt 4000 ]; then EVIDENCE="${EVIDENCE:0:2000}"$'\n...[truncated]...\n'"${EVIDENCE: -1800}"; fi
+
+  # ── token spend for this task (injected source or the ledger) ──
+  SPEND="$(do_spend 2>/dev/null || echo 0)"
+  case "$SPEND" in (*[!0-9]*|'') SPEND=0 ;; esac
+  TOTAL_SPEND=$(( TOTAL_SPEND + SPEND ))
+  RAN=$(( RAN + 1 ))
+
+  jq -cn \
+     --arg url "$url" --arg task "$task" --arg acc "$acc" \
+     --argjson reuse "$REUSE_PCT" --argjson syms "$REUSE_SYMS" \
+     --argjson expect "$expect" \
+     --argjson wopass "$WO_PASS" --arg ev "$EVIDENCE" --arg accrc "$ACC_RC" \
+     --argjson spend "$SPEND" \
+     '{repo_url:$url, task:$task, status:"ran",
+       reuse_pct:$reuse, reused_symbols:$syms, reused_symbols_expected:$expect,
+       working_output:{pass:$wopass, exit_code:($accrc|tonumber), cmd:$acc, evidence:$ev},
+       token_spend:$spend}' >> "$RESULTS_FILE"
+
+  printf "      reuse=%s  working_output=%s  spend=%s  ${D}(cum %s/%s)${R}\n" \
+    "$REUSE_PCT" "$([ "$WO_PASS" = true ] && echo PASS || echo FAIL)" "$SPEND" "$TOTAL_SPEND" "$CAP" >&2
+
+  i=$((i+1))
+done
+
+# ── assemble the machine-readable report ──────────────────────────────────────
+RESULTS_ARR="$(jq -s '.' "$RESULTS_FILE")"
+
+# reuse distribution + working-output rate over the tasks that actually ran.
+DIST="$(printf '%s' "$RESULTS_ARR" | jq -c '
+  [ .[] | select(.status=="ran") ] as $ran
+  | { ran: ($ran | length),
+      working_output_pass: ([ $ran[] | select(.working_output.pass==true) ] | length),
+      reuse_measured:      [ $ran[] | select(.reuse_pct != null) | .reuse_pct ] }
+  | .working_output_rate = (if .ran>0 then (.working_output_pass / .ran) else null end)
+  | .reuse_median = (if (.reuse_measured|length)>0
+       then (.reuse_measured | sort | .[ (length/2|floor) ]) else null end)
+  | .reuse_min = (.reuse_measured | min)
+  | .reuse_max = (.reuse_measured | max)
+')"
+
+jq -n \
+  --arg run_id "$RUN_ID" --arg ts "$(date -u +%FT%TZ)" --arg manifest "$MANIFEST" \
+  --argjson cap "$CAP" --argjson total_spend "$TOTAL_SPEND" \
+  --argjson total_entries "$TOTAL_ENTRIES" --argjson n_effective "$N_EFFECTIVE" \
+  --argjson ran "$RAN" --argjson aborted "$ABORTED" --arg abort_reason "$ABORT_REASON" \
+  --argjson results "$RESULTS_ARR" --argjson dist "$DIST" \
+  '{run_id:$run_id, ts:$ts, manifest:$manifest,
+    cap:$cap, total_token_spend:$total_spend,
+    total_entries:$total_entries, n_effective:$n_effective, ran:$ran,
+    aborted:$aborted, abort_reason:$abort_reason,
+    distribution:$dist, results:$results}' > "$REPORT"
+
+# ── human summary table — honest, low numbers surfaced prominently ────────────
+echo >&2
+printf "${P}${B}S-6 C3 sweep summary${R}  ${D}(run %s)${R}\n" "$RUN_ID" >&2
+printf "  ran            : %s of %s entries\n" "$RAN" "$TOTAL_ENTRIES" >&2
+WO_RATE="$(printf '%s' "$DIST" | jq -r '.working_output_rate // "n/a"')"
+WO_PASS_N="$(printf '%s' "$DIST" | jq -r '.working_output_pass')"
+RMED="$(printf '%s' "$DIST" | jq -r '.reuse_median // "n/a"')"
+RMIN="$(printf '%s' "$DIST" | jq -r '.reuse_min // "n/a"')"
+RMAX="$(printf '%s' "$DIST" | jq -r '.reuse_max // "n/a"')"
+printf "  working output : %s/%s passed  ${D}(runnable evidence, not self-report)${R}\n" "$WO_PASS_N" "$RAN" >&2
+printf "  reuse %%        : median ${B}%s${R}  (min %s, max %s)\n" "$RMED" "$RMIN" "$RMAX" >&2
+printf "  total spend    : %s / %s tokens cap\n" "$TOTAL_SPEND" "$CAP" >&2
+# surface every per-task reuse number so a low distribution cannot hide.
+printf "  per-repo reuse : " >&2
+printf '%s' "$RESULTS_ARR" | jq -r '[.[] | select(.status=="ran") | (.reuse_pct // "null")|tostring] | join("  ")' >&2
+printf "  report         : %s\n" "$REPORT" >&2
+
+if [ "$ABORTED" = true ]; then
+  printf "  ${W}ABORTED (fail-closed): %s${R}\n" "$ABORT_REASON" >&2
+  echo "  partial report written above. Re-run with a higher --cap to continue." >&2
+  exit 4
+fi
+exit 0
