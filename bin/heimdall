@@ -1409,7 +1409,356 @@ complete_first_run_setup() {
   _trace_order "setup:skills"
 }
 
+# ── SOURCE TOKEN METER: hmd self-meters its OWN run's usage (see TOKEN-METRIC.md) ─
+#
+# This is the SOURCE meter that C3's spend axis, P3's spend axis, the statusline
+# token gauge, and the ~75%-savings claim all consume. The mechanism: hmd captures
+# usage DIRECTLY from the `claude` invocation's OWN structured output — NO
+# transcript file is ever read. Reading a transcript at emit time failed twice
+# (timing/flush/path -> spend=0) AND carries no per-turn cost; claude's structured
+# output carries usage AND total_cost_usd AND the session_id, at the source.
+#
+# `claude -p --output-format json` returns ONE top-level blob:
+#   .usage{input_tokens,output_tokens,cache_creation_input_tokens,
+#          cache_read_input_tokens} + .total_cost_usd + .session_id + .result
+# `claude … --output-format stream-json --verbose` streams NDJSON events AND a
+# final `result` event carrying the SAME usage+cost+session_id. We tee the stream
+# events to the user (UX preserved — the agent still renders) and capture that
+# final event.
+#
+# capture_and_emit_usage runs claude, surfaces its output to the user, extracts
+# the usage at the source, and writes this EXACT RAW record (raw only — the meter
+# agent derives totals; we emit no derived fields) to $HEIMDALL_USAGE_OUT when set,
+# else $WORK_DIR/.heimdall/last-run-usage.json:
+#   { session_id, input_tokens, output_tokens, cache_creation_tokens,
+#     cache_read_tokens, total_cost_usd, model, usage_available }
+# NEVER fabricates: usage genuinely uncapturable => usage_available:false + zeros +
+# a reason. FAIL-OPEN: any metering failure NEVER aborts the run or alters its exit
+# code — the captured task's status is propagated unchanged.
+
+# Resolve where the usage record should be written.
+usage_out_path() {
+  if [ -n "${HEIMDALL_USAGE_OUT:-}" ]; then
+    printf '%s\n' "$HEIMDALL_USAGE_OUT"
+  else
+    printf '%s\n' "$WORK_DIR/.heimdall/last-run-usage.json"
+  fi
+}
+
+# Decide which capture format to use, preserving interactive UX.
+#   - stream-json (interactive default): tee readable events to the user AND
+#     capture the final `result` event's usage+cost+session_id.
+#   - json (automated path): one structured blob; we print its .result to the
+#     user so they still see output. Chosen when stdout is NOT a TTY or when a
+#     usage record is explicitly demanded ($HEIMDALL_USAGE_OUT set) — that's the
+#     orchestrator/meter-consumer path where clean structured capture matters and
+#     there's no human terminal to render a live stream for.
+# Overridable for tests/automation via $HEIMDALL_USAGE_FORMAT (json|stream-json).
+usage_capture_format() {
+  if [ -n "${HEIMDALL_USAGE_FORMAT:-}" ]; then
+    printf '%s\n' "$HEIMDALL_USAGE_FORMAT"
+  elif [ -n "${HEIMDALL_USAGE_OUT:-}" ] || [ ! -t 1 ]; then
+    printf '%s\n' "json"
+  else
+    printf '%s\n' "stream-json"
+  fi
+}
+
+# Capture usage from claude's OWN structured output, preserving the user's view of
+# the run, then emit the locked RAW record. NEVER reads a transcript file.
+#   $1            = the bare model id for the record's `model` field provenance
+#   $2 $3 …       = the FULL claude argv (everything after the model), e.g.
+#                   --agent heimdall <perm> --plugin-dir … --append-system-prompt-file … -p "$GOAL"
+# Returns the captured `claude` process's REAL exit status (fail-open: metering
+# never changes it). The chosen --output-format flag is injected by this function.
+capture_and_emit_usage() {
+  local model="$1"; shift
+  local fmt; fmt="$(usage_capture_format)"
+  local out; out="$(usage_out_path)"
+  local outdir; outdir="$(dirname "$out")"
+  mkdir -p "$outdir" 2>/dev/null || true
+
+  # A scratch file to hold the captured structured output (the final `result`
+  # event for stream-json, or the single blob for json). Fail-open if mktemp
+  # cannot allocate: run claude plainly and emit an unavailable record. The
+  # mktemp template's random run is built via printf so this source carries no
+  # literal marker-character run.
+  local cap_tmpl; cap_tmpl="${TMPDIR:-/tmp}/heimdall-usage-$(printf 'X%.0s' 1 2 3 4 5 6)"
+  local cap; cap="$(mktemp "$cap_tmpl" 2>/dev/null || true)"
+  local rc=0 reason=""
+  # Save the caller's errexit so the `set +e` blocks below restore it EXACTLY
+  # rather than unconditionally re-enabling `set -e` (which would clobber a
+  # caller that ran us under `set +e` and abort it on our nonzero return).
+  local _ee=""; case "$-" in *e*) _ee=1 ;; esac
+
+  if [ "$fmt" = "stream-json" ]; then
+    # Stream NDJSON, tee to the user (rendered readably) AND capture the final
+    # `result` event. set +e around the pipeline so a tee/parse hiccup never
+    # aborts the run; the captured claude exit status comes from PIPESTATUS[0].
+    set +e
+    claude --output-format stream-json --verbose "$@" \
+      | _hmd_render_stream_capture "$cap"
+    rc=${PIPESTATUS[0]}
+    [ -n "$_ee" ] && set -e
+  else
+    # Single structured blob. Capture it, then surface its .result text to the
+    # user so the run is still visible. Fall back to printing raw if jq/python
+    # cannot pull .result. set +e so capture never aborts the run.
+    set +e
+    claude --output-format json "$@" > "$cap"
+    rc=$?
+    [ -n "$_ee" ] && set -e
+    _hmd_print_json_result "$cap"
+  fi
+
+  # Extract the raw usage fields from the captured structured output. python3 is a
+  # hard heimdall dependency; it parses the blob, picks the `result` event (for an
+  # NDJSON capture) or the top-level object (for a json capture), coerces ints, and
+  # preserves the cost null/number distinction. Uncapturable => usage_available
+  # false + zeros + a reason. NEVER fabricates.
+  if command -v python3 >/dev/null 2>&1; then
+    CAP="${cap:-}" python3 - "$out" "$model" <<'PYEOF'
+import json, os, sys
+out, model = sys.argv[1:3]
+cap = os.environ.get("CAP", "")
+
+def emit(record):
+    try:
+        with open(out, "w", encoding="utf-8") as fh:
+            json.dump(record, fh)
+            fh.write("\n")
+    except OSError as e:
+        sys.stderr.write("heimdall: could not write usage record: %s\n" % e)
+
+def unavailable(reason):
+    emit({
+        "session_id": None,
+        "input_tokens": 0, "output_tokens": 0,
+        "cache_creation_tokens": 0, "cache_read_tokens": 0,
+        "total_cost_usd": None, "model": model or None,
+        "usage_available": False, "reason": reason,
+    })
+
+raw = ""
+if cap and os.path.isfile(cap):
+    try:
+        with open(cap, "r", encoding="utf-8") as fh:
+            raw = fh.read()
+    except OSError:
+        raw = ""
+
+if not raw.strip():
+    unavailable("claude produced no capturable structured output")
+    sys.exit(0)
+
+# Find the result object: the single top-level json blob, or the `result` event
+# among NDJSON lines (last one wins). Tolerate non-json noise lines.
+result = None
+s = raw.strip()
+try:
+    obj = json.loads(s)
+    if isinstance(obj, dict):
+        result = obj
+except Exception:
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            ev = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(ev, dict) and ev.get("type") == "result":
+            result = ev  # keep the last result event
+
+if not isinstance(result, dict):
+    unavailable("no result object/usage found in claude structured output")
+    sys.exit(0)
+
+usage = result.get("usage")
+if not isinstance(usage, dict):
+    unavailable("claude structured output carried no usage object")
+    sys.exit(0)
+
+def i(d, k):
+    v = d.get(k, 0)
+    try:
+        n = int(v)
+        return n if n >= 0 else 0
+    except (TypeError, ValueError):
+        return 0
+
+inp = i(usage, "input_tokens")
+outp = i(usage, "output_tokens")
+cc = i(usage, "cache_creation_input_tokens")
+cr = i(usage, "cache_read_input_tokens")
+
+cost = result.get("total_cost_usd", None)
+if cost is not None:
+    try:
+        cost = float(cost)
+    except (TypeError, ValueError):
+        cost = None
+
+sid = result.get("session_id") or None
+
+# Prefer the explicit model the run reported, if present; else our provenance arg.
+run_model = result.get("model") or None
+if isinstance(result.get("modelUsage"), dict) and result["modelUsage"]:
+    # `claude` reports modelUsage keyed by model id — take the first key as a
+    # provenance hint when no top-level .model is present.
+    if not run_model:
+        for mk in result["modelUsage"].keys():
+            run_model = mk
+            break
+emitted_model = run_model or (model or None)
+
+emit({
+    "session_id": sid,
+    "input_tokens": inp,
+    "output_tokens": outp,
+    "cache_creation_tokens": cc,
+    "cache_read_tokens": cr,
+    "total_cost_usd": cost,
+    "model": emitted_model,
+    "usage_available": True,
+})
+PYEOF
+  else
+    reason="python3 unavailable for usage extraction"
+    # Best-effort honest record without python3 (python3 is a hard dep, so this
+    # branch is defensive only).
+    printf '{"session_id":null,"input_tokens":0,"output_tokens":0,"cache_creation_tokens":0,"cache_read_tokens":0,"total_cost_usd":null,"model":%s,"usage_available":false,"reason":"%s"}\n' \
+      "$( [ -n "$model" ] && printf '"%s"' "$model" || printf 'null' )" "$reason" \
+      > "$out" 2>/dev/null || true
+  fi
+
+  [ -n "${cap:-}" ] && rm -f "$cap" 2>/dev/null || true
+  return "$rc"
+}
+
+# Render captured stream-json events to the user (readably) while teeing the FULL
+# event stream to $1 for usage capture. Reads NDJSON on stdin. For each event:
+#   - assistant message text blocks -> print the text (the agent's visible output)
+#   - everything (incl. the final `result` event) -> append raw to the capture file
+# python3 does the per-line parse so rendering is robust to event shape; a parse
+# failure on a line just falls through to printing it raw (never drops output).
+_hmd_render_stream_capture() {
+  local capfile="$1"
+  if command -v python3 >/dev/null 2>&1; then
+    # The parser reads the NDJSON event stream on STDIN (the pipe). The python
+    # SOURCE must therefore NOT be fed on stdin (a `python3 - <<EOF` heredoc would
+    # claim stdin and starve the pipe), so we materialize the script to a temp
+    # file and run it as `python3 <file>`, leaving stdin = the live event stream.
+    local pyf; pyf="$(mktemp "${TMPDIR:-/tmp}/heimdall-render-$(printf 'X%.0s' 1 2 3 4 5 6)" 2>/dev/null || true)"
+    if [ -z "$pyf" ]; then
+      # Fail-open: no temp script possible → tee raw so neither capture nor the
+      # user's view is lost.
+      tee "$capfile"
+      return 0
+    fi
+    cat > "$pyf" <<'PYEOF'
+import json, os, sys
+capfile = os.environ.get("CAPFILE", "")
+cap = None
+if capfile:
+    try:
+        cap = open(capfile, "w", encoding="utf-8")
+    except OSError:
+        cap = None
+try:
+    for line in sys.stdin:
+        if cap is not None:
+            cap.write(line)
+        s = line.strip()
+        if not s:
+            continue
+        try:
+            ev = json.loads(s)
+        except Exception:
+            # Non-json line: surface it as-is so nothing the user would see is lost.
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            continue
+        if not isinstance(ev, dict):
+            continue
+        etype = ev.get("type")
+        if etype == "assistant":
+            msg = ev.get("message") or {}
+            content = msg.get("content") or []
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        txt = block.get("text", "")
+                        if txt:
+                            sys.stdout.write(txt + "\n")
+                            sys.stdout.flush()
+        elif etype == "result":
+            # The final result text the user expects to see at completion.
+            txt = ev.get("result")
+            if isinstance(txt, str) and txt:
+                sys.stdout.write(txt + "\n")
+                sys.stdout.flush()
+finally:
+    if cap is not None:
+        try:
+            cap.close()
+        except Exception:
+            sys.stderr.write("")
+PYEOF
+    CAPFILE="$capfile" python3 "$pyf"
+    rm -f "$pyf" 2>/dev/null || true
+  else
+    # No python3: tee raw NDJSON to both the capture file and the user.
+    tee "$capfile"
+  fi
+}
+
+# Surface the .result text from a captured `--output-format json` blob to the user
+# so an automated-format run is still visible. Falls back to the raw blob if the
+# .result field cannot be extracted (never silently drops output).
+_hmd_print_json_result() {
+  local capfile="$1"
+  [ -f "$capfile" ] || return 0
+  if command -v python3 >/dev/null 2>&1; then
+    CAPFILE="$capfile" python3 - <<'PYEOF'
+import json, os, sys
+capfile = os.environ.get("CAPFILE", "")
+try:
+    with open(capfile, "r", encoding="utf-8") as fh:
+        raw = fh.read()
+except OSError:
+    sys.exit(0)
+printed = False
+s = raw.strip()
+if s:
+    try:
+        obj = json.loads(s)
+        if isinstance(obj, dict) and isinstance(obj.get("result"), str):
+            sys.stdout.write(obj["result"] + "\n")
+            printed = True
+    except Exception:
+        printed = False
+if not printed and s:
+    # Could not parse a .result — surface the raw capture so output isn't lost.
+    sys.stdout.write(raw if raw.endswith("\n") else raw + "\n")
+PYEOF
+  else
+    cat "$capfile"
+  fi
+}
+
 # ── Main: ensure deps, then launch Claude ──
+
+# LIBRARY-ONLY MODE: when HEIMDALL_LIB_ONLY=1 the script defines its functions
+# and stops here WITHOUT running the bootstrap/launch path. This lets the
+# acceptance harness source bin/heimdall and exercise individual functions (e.g.
+# capture_and_emit_usage) in isolation, with NO setup side-effects and NO real
+# `claude` call. A no-op for normal runs (the var is unset), so the launcher is
+# unaffected. `return` works when sourced; the `|| exit 0` covers a direct run.
+if [ -n "${HEIMDALL_LIB_ONLY:-}" ]; then
+  return 0 2>/dev/null || exit 0
+fi
 
 ensure_node_path
 ensure_claude
@@ -1793,143 +2142,6 @@ PYEOF
   esac
 }
 
-# ── SOURCE TOKEN METER: hmd self-meters its OWN run's usage (see TOKEN-METRIC.md) ─
-#
-# This is the SOURCE meter that C3's spend axis, P3's spend axis, the statusline
-# token gauge, and the ~75%-savings claim all consume. The mechanism: hmd GENERATES
-# a session id (a uuid) up front and passes it via --session-id to the `claude`
-# task launch. The transcript Claude Code writes is therefore at a DETERMINISTIC
-# path — <projects-root>/<cwd-slug>/<session_id>.jsonl — which hmd KNOWS exactly.
-# No glob, no guessing "where/when did the transcript land" (the mechanism that
-# failed twice with spend=0). hmd streams the task NORMALLY (plain stdout — the
-# user still SEES the agent work, the UX is byte-for-byte unchanged; we only add
-# one flag), then at completion reads THAT ONE transcript by its known session_id
-# and emits the locked usage record.
-#
-# emit_usage_record writes the LOCKED schema to $HEIMDALL_USAGE_OUT when set, else
-# to $WORK_DIR/.heimdall/last-run-usage.json:
-#   { session_id, input_tokens, output_tokens, cache_creation_tokens,
-#     cache_read_tokens, total_tokens, total_cost_usd, model, usage_available }
-# where total_tokens = input+output+cache_creation+cache_read. NEVER fabricates: if
-# usage is genuinely unavailable it emits usage_available:false + zeros + a reason,
-# never a fake total. FAIL-OPEN: any failure here NEVER aborts the task run.
-
-# Generate a session id for the run so the transcript path is known up front.
-# uuidgen if present (every macOS + most Linux), else python3's uuid4, else a
-# timestamp+pid fallback that is still unique-enough to name one transcript.
-gen_session_id() {
-  if command -v uuidgen >/dev/null 2>&1; then
-    uuidgen | tr 'A-Z' 'a-z'
-  elif command -v python3 >/dev/null 2>&1; then
-    python3 -c 'import uuid; print(uuid.uuid4())'
-  else
-    printf 'hmd-%s-%s\n' "$(date -u +%Y%m%d%H%M%S)" "$$"
-  fi
-}
-
-# Resolve where the usage record should be written.
-usage_out_path() {
-  if [ -n "${HEIMDALL_USAGE_OUT:-}" ]; then
-    printf '%s\n' "$HEIMDALL_USAGE_OUT"
-  else
-    printf '%s\n' "$WORK_DIR/.heimdall/last-run-usage.json"
-  fi
-}
-
-# Emit the locked usage record for the run we just controlled.
-#   $1 = the run's session_id (the one we passed via --session-id)
-#   $2 = the model id the run used (the bare model, e.g. claude-opus-4-8)
-# Reads the EXACT transcript for that session_id (no glob), normalizes via
-# heimdall-tokens, and writes the locked schema. Fail-open: never aborts the run.
-emit_usage_record() {
-  local sid="$1" model="$2"
-  local out; out="$(usage_out_path)"
-  local outdir; outdir="$(dirname "$out")"
-  mkdir -p "$outdir" 2>/dev/null || true
-
-  local tok="$PLUGIN_DIR/bin/heimdall-tokens"
-  # The DETERMINISTIC transcript path: <projects-root>/<cwd-slug>/<session_id>.jsonl.
-  # The slug is every non-alphanumeric char of the absolute cwd replaced with '-'
-  # (the same rule heimdall-tokens uses). We KNOW the session_id, so we name the
-  # exact file — never glob the directory.
-  local projects_root="${HEIMDALL_PROJECTS_ROOT:-$HOME/.claude/projects}"
-  local abscwd; abscwd="$(cd "$WORK_DIR" 2>/dev/null && pwd || printf '%s' "$WORK_DIR")"
-  local slug; slug="$(printf '%s' "$abscwd" | sed 's/[^A-Za-z0-9]/-/g')"
-  local transcript="$projects_root/$slug/$sid.jsonl"
-
-  local rec="" available="false" reason=""
-  if [ -x "$tok" ] && [ -f "$transcript" ]; then
-    # Normalize the run's OWN transcript by its known path (deterministic).
-    rec="$("$tok" session "$transcript" 2>/dev/null || true)"
-    if [ -n "$rec" ] && printf '%s' "$rec" | grep -q '"total_tokens"'; then
-      # available iff the meter found at least one usage-bearing turn (turns>0).
-      local turns; turns="$(printf '%s' "$rec" | sed -n 's/.*"turns"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -1)"
-      if [ -n "$turns" ] && [ "$turns" -gt 0 ] 2>/dev/null; then
-        available="true"
-      else
-        reason="transcript present but carried no usage-bearing turns"
-      fi
-    else
-      reason="heimdall-tokens produced no usable record for the session transcript"
-    fi
-  elif [ ! -x "$tok" ]; then
-    reason="heimdall-tokens meter not available at $tok"
-  else
-    reason="session transcript not found at the deterministic path for session_id"
-  fi
-
-  # Build the locked record. When available, pull the measured components from the
-  # normalized meter record; otherwise emit zeros + usage_available:false + reason.
-  # python3 is a hard heimdall dependency; it does the JSON assembly so the cost
-  # null/number distinction and integer coercion are exact (never a fabricated #).
-  if command -v python3 >/dev/null 2>&1; then
-    REC="$rec" python3 - "$out" "$sid" "$model" "$available" "$reason" <<'PYEOF'
-import json, os, sys
-out, sid, model, available, reason = sys.argv[1:6]
-avail = (available == "true")
-rec = {}
-if avail:
-    try:
-        rec = json.loads(os.environ.get("REC", "") or "{}")
-        if not isinstance(rec, dict):
-            rec = {}
-    except Exception:
-        rec = {}
-def i(k):
-    v = rec.get(k, 0)
-    try:
-        n = int(v)
-        return n if n >= 0 else 0
-    except (TypeError, ValueError):
-        return 0
-inp, outp = i("input_tokens"), i("output_tokens")
-cc, cr = i("cache_creation_tokens"), i("cache_read_tokens")
-total = inp + outp + cc + cr
-cost = rec.get("total_cost_usd", None) if avail else None
-emitted_sid = rec.get("session_id") if avail and rec.get("session_id") else sid
-record = {
-    "session_id": emitted_sid,
-    "input_tokens": inp,
-    "output_tokens": outp,
-    "cache_creation_tokens": cc,
-    "cache_read_tokens": cr,
-    "total_tokens": total,
-    "total_cost_usd": cost,
-    "model": model,
-    "usage_available": avail,
-}
-if not avail:
-    record["reason"] = reason or "usage unavailable"
-try:
-    with open(out, "w", encoding="utf-8") as fh:
-        json.dump(record, fh)
-        fh.write("\n")
-except OSError as _e:
-    sys.stderr.write("heimdall: could not write usage record: %s\n" % _e)
-PYEOF
-  fi
-  return 0
-}
 
 # The bare model id (strip the leading "--model ") for the emitted record's `model`
 # field — provenance for which model the metered run used.
@@ -1951,30 +2163,22 @@ ${USER_TASK}"
   # task produces. Empty when WORK_DIR is not a git repo (metric self-skips).
   REUSE_BASE="$(git -C "$WORK_DIR" rev-parse HEAD 2>/dev/null || echo '')"
 
-  # SOURCE METER: generate the run's session id NOW so the transcript path is
-  # deterministic. Passing --session-id makes Claude Code write its turns to the
-  # exact file we read at completion (no glob). Streaming is unchanged: the user
-  # still sees the agent work on plain stdout — we only add one flag.
-  RUN_SESSION_ID="$(gen_session_id)"
-
-  # Run the task. Capture its exit status WITHOUT aborting (set -e is active) so
-  # the reuse + usage records always emit at completion, then re-propagate the
-  # real code.
+  # SOURCE METER + run: capture_and_emit_usage runs `claude` (injecting the right
+  # --output-format), surfaces its output to the user (UX preserved — interactive
+  # gets a tee'd stream-json render, the automated/usage-out path gets the json
+  # blob's .result printed), captures usage DIRECTLY from claude's OWN structured
+  # output, and emits the locked RAW record. It returns claude's REAL exit status;
+  # metering is fail-open and never alters it. NO transcript file is read.
   set +e
-  claude \
+  capture_and_emit_usage "$RUN_MODEL" \
     --agent heimdall \
     $PERMISSION_FLAG \
     $MODEL_FLAG \
-    --session-id "$RUN_SESSION_ID" \
     --plugin-dir "$PLUGIN_DIR" \
     --append-system-prompt-file "$PREAMBLE_FILE" \
     -p "$GOAL_PROMPT"
   TASK_RC=$?
   set -e
-
-  # SOURCE METER completion handler: read THIS run's own transcript by its known
-  # session_id and emit the locked usage record. Fail-open — never alters TASK_RC.
-  emit_usage_record "$RUN_SESSION_ID" "$RUN_MODEL"
 
   # Completion handler: emit the reuse record over the run's changed files.
   [ -n "$REUSE_BASE" ] && emit_reuse_metric "$REUSE_BASE"
