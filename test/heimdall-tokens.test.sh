@@ -268,6 +268,81 @@ else
   bad "(k) emitted missing record not handled fail-open (rc=$EBADRC)"; printf '%s\n' "$EBADREC"
 fi
 
+# ── (l) non_cache_tokens == input+output+cache_creation (cache_read EXCLUDED) ──
+# The same EMITTED fixture from (i): in=10 out=5 cc=100 cr=900.
+#   total_tokens     = 10+5+100+900 = 1015 (full consumption)
+#   non_cache_tokens = 10+5+100      = 115  (cache_read 900 EXCLUDED — the budget figure)
+if printf '%s' "$EREC" | jq -e '
+    .non_cache_tokens == 115
+    and .total_tokens == 1015
+    and .non_cache_tokens == (.input_tokens + .output_tokens + .cache_creation_tokens)
+  ' >/dev/null 2>&1; then
+  ok "(l) non_cache_tokens == input+output+cache_creation, cache_read excluded (115, vs total 1015)"
+else
+  bad "(l) non_cache_tokens wrong (expected 115, cache_read 900 must be excluded)"; printf '%s\n' "$EREC"
+fi
+
+# non_cache_tokens is present + correct in EVERY mode (session + json carry it too).
+# json fixture (d): in=111 out=22 cc=3333 cr=44444 => non_cache = 111+22+3333 = 3466.
+# session fixture (a): in=600 out=60 cc=3000 cr=22000 => non_cache = 600+60+3000 = 3660.
+if printf '%s' "$JREC" | jq -e '.non_cache_tokens == 3466' >/dev/null 2>&1 \
+   && printf '%s' "$REC" | jq -e '.non_cache_tokens == 3660 and .non_cache_tokens == (.input_tokens + .output_tokens + .cache_creation_tokens)' >/dev/null 2>&1; then
+  ok "(l2) non_cache_tokens present + correct in session (3660) and json (3466) modes"
+else
+  bad "(l2) non_cache_tokens missing/wrong in session or json mode"; printf 'json=%s\nsess=%s\n' "$JREC" "$REC"
+fi
+
+# ── (m) emitted cost PASS-THROUGH: raw record's total_cost_usd is claude's own,
+#       carried verbatim + flagged cost_source=reported. ──
+# The (i) fixture has total_cost_usd 0.0421 → must pass through, marked reported.
+if printf '%s' "$EREC" | jq -e '
+    .total_cost_usd == 0.0421 and .cost_source == "reported"
+  ' >/dev/null 2>&1; then
+  ok "(m) emitted cost present => passed through verbatim + cost_source=reported (0.0421)"
+else
+  bad "(m) emitted reported-cost pass-through wrong"; printf '%s\n' "$EREC"
+fi
+
+# ── (n) emitted cost NULL => DERIVE from the documented opus pricing table. ──
+# rates ($/Mtok): input 5.00, output 25.00, cache_creation 6.25 (1.25x input),
+#                 cache_read 0.50 (0.1x input).
+# fixture: in=1_000_000 out=1_000_000 cc=1_000_000 cr=1_000_000, total_cost_usd null.
+#   derived = 5.00 + 25.00 + 6.25 + 0.50 = 36.75
+EMITTED_NOCOST="$WORK/emitted-nocost.json"
+cat > "$EMITTED_NOCOST" <<'EOF'
+{
+  "session_id": "emit-fixture-7003",
+  "input_tokens": 1000000,
+  "output_tokens": 1000000,
+  "cache_creation_tokens": 1000000,
+  "cache_read_tokens": 1000000,
+  "total_cost_usd": null,
+  "model": "claude-opus-4-8",
+  "usage_available": true
+}
+EOF
+ENC="$("$TOK" emitted "$EMITTED_NOCOST")"
+if printf '%s' "$ENC" | jq -e '
+    .total_cost_usd == 36.75 and .cost_source == "derived"
+  ' >/dev/null 2>&1; then
+  COSTV="$(printf '%s' "$ENC" | jq -r '.total_cost_usd')"
+  ok "(n) emitted cost null => DERIVED from opus rates (\$36.75 = 5+25+6.25+0.5), cost_source=derived ($COSTV)"
+else
+  bad "(n) derived cost wrong (expected 36.75 + cost_source=derived)"; printf '%s\n' "$ENC"
+fi
+
+# the derived cost must NEVER fabricate token counts — the four token components
+# in the derived-cost record must equal the source verbatim (1M each here).
+if printf '%s' "$ENC" | jq -e '
+    .input_tokens == 1000000 and .output_tokens == 1000000
+    and .cache_creation_tokens == 1000000 and .cache_read_tokens == 1000000
+    and .total_tokens == 4000000 and .non_cache_tokens == 3000000
+  ' >/dev/null 2>&1; then
+  ok "(n2) derived-cost record keeps token counts verbatim (never fabricated): total=4M, non_cache=3M"
+else
+  bad "(n2) derived-cost record altered token counts"; printf '%s\n' "$ENC"
+fi
+
 echo
 echo "  heimdall-tokens tests: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

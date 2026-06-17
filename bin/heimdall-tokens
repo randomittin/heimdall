@@ -128,6 +128,35 @@ def _as_float(v):
         return None
 
 
+# ── Documented opus pricing table ($/Mtok) — see TOKEN-METRIC.md ──────────────
+# Used ONLY to DERIVE total_cost_usd when the source carries no cost (the emitted
+# path). Token counts are NEVER fabricated — only cost may be a labeled derived
+# estimate (cost_source == "derived"). cache_creation (the cache WRITE, 5-minute
+# ephemeral TTL) is 1.25x the input price; cache_read is ~0.1x the input price
+# (the steep discount that is exactly why cache_read is excluded from the budget).
+_OPUS_RATE_PER_MTOK = {
+    "input": 5.00,
+    "output": 25.00,
+    "cache_creation": 6.25,   # 1.25 x input  (5-minute ephemeral cache write)
+    "cache_read": 0.50,       # 0.1  x input  (cache read — the steep discount)
+}
+_MTOK = 1_000_000.0
+
+
+def derive_opus_cost(rec):
+    """DERIVE total_cost_usd from the documented opus rates and the MEASURED token
+    components in rec. Never invents token counts — it multiplies the exact
+    measured counts by the published per-Mtok rates. Returns a rounded float.
+    """
+    return round(
+        rec["input_tokens"] * _OPUS_RATE_PER_MTOK["input"] / _MTOK
+        + rec["output_tokens"] * _OPUS_RATE_PER_MTOK["output"] / _MTOK
+        + rec["cache_creation_tokens"] * _OPUS_RATE_PER_MTOK["cache_creation"] / _MTOK
+        + rec["cache_read_tokens"] * _OPUS_RATE_PER_MTOK["cache_read"] / _MTOK,
+        6,
+    )
+
+
 def _empty_record():
     return {
         "input_tokens": 0,
@@ -135,24 +164,43 @@ def _empty_record():
         "cache_creation_tokens": 0,
         "cache_read_tokens": 0,
         "total_tokens": 0,
+        "non_cache_tokens": 0,
         "turns": 0,
         "session_id": None,
         "total_cost_usd": None,
+        "cost_source": None,
     }
 
 
 def _finalize(rec, summed_keys, cost_sum, cost_seen):
-    """Compute total_tokens + settle cost (summed vs honest null+note)."""
+    """Compute total_tokens + non_cache_tokens; settle cost (reported vs null+note).
+
+    total_tokens     = input + output + cache_creation + cache_read (full
+                       consumption — conservative; can only over-count, never hide).
+    non_cache_tokens = input + output + cache_creation (cache_read EXCLUDED — it is
+                       ~80% of tokens at ~10x cheaper; this is the soft-budget figure).
+    cost_source      = "reported" when the cost was summed from the source's own
+                       fields (claude's own figure); None here when no cost is
+                       present (the emitted path may instead DERIVE it and set
+                       cost_source="derived").
+    """
     rec["total_tokens"] = (
         rec["input_tokens"]
         + rec["output_tokens"]
         + rec["cache_creation_tokens"]
         + rec["cache_read_tokens"]
     )
+    rec["non_cache_tokens"] = (
+        rec["input_tokens"]
+        + rec["output_tokens"]
+        + rec["cache_creation_tokens"]
+    )
     if cost_seen:
         rec["total_cost_usd"] = round(cost_sum, 6)
+        rec["cost_source"] = "reported"
     else:
         rec["total_cost_usd"] = None
+        rec["cost_source"] = None
         rec["note"] = (
             "total_cost_usd unavailable: the source carries no per-turn cost "
             "field; not fabricating a figure (token counts are exact)."
@@ -387,12 +435,29 @@ def parse_emitted_record(text):
     if obj.get("reason"):
         rec["reason"] = obj.get("reason")
 
-    # total_tokens is ALWAYS re-derived from the four components in _finalize, so a
-    # missing/tampered source total can never under-report the conservative cap.
+    # total_tokens + non_cache_tokens are ALWAYS re-derived from the four components
+    # in _finalize, so a missing/tampered source total can never under-report them.
+    #
+    # COST: the raw record's total_cost_usd is claude's OWN figure — when present,
+    # carry it through verbatim and flag cost_source="reported". When the raw cost
+    # is null, DERIVE it from the documented opus pricing table (derive_opus_cost),
+    # multiplying the MEASURED token components by the published per-Mtok rates, and
+    # flag cost_source="derived". The derived figure is a labelled ESTIMATE; the
+    # token counts are never fabricated (they are the source's exact measured ones).
     cost = _as_float(obj.get("total_cost_usd"))
     if cost is not None:
         return _finalize(rec, _OUT_KEYS, cost, True)
-    return _finalize(rec, _OUT_KEYS, 0.0, False)
+    # No reported cost — finalize the token components first (this also computes the
+    # non_cache figure), then derive cost from the now-final counts + mark it.
+    rec = _finalize(rec, _OUT_KEYS, 0.0, False)
+    rec["total_cost_usd"] = derive_opus_cost(rec)
+    rec["cost_source"] = "derived"
+    rec["note"] = (
+        "total_cost_usd DERIVED from the documented opus pricing table "
+        "(input $5.00, output $25.00, cache_creation $6.25, cache_read $0.50 "
+        "per Mtok); a labelled estimate. Token counts are exact (measured)."
+    )
+    return rec
 
 
 def cmd_session(argv):
