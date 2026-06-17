@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# heimdall-s6-manifest — spec -> runner manifest ADAPTER for the S-6 C3 sweep.
+#
+# THE SCHEMA BRIDGE. The C3 spec
+# (docs/superpowers/specs/heimdall-S6-C3-repos.json) is a top-level OBJECT keyed
+# `.repos[]` with fields `url` / `language` / `sha` / `task_prompt` /
+# `acceptance_cmd` / `reused_symbols_expected` / `reuse_measured` / `license`.
+# The runner (bin/heimdall-s6-sweep) consumes a FLAT JSON ARRAY whose entries are
+# keyed `repo_url` / `sha` / `lang` / `license` / `task_prompt` /
+# `acceptance_cmd` / `reused_symbols_expected`. The key names DIFFER (url->repo_url,
+# language->lang) and the nesting DIFFERS (object.repos[] -> bare array), so the
+# spec cannot be fed to the runner directly. This emitter flattens + renames.
+#
+# Usage:
+#   heimdall-s6-manifest <spec.json>          # emit the flat manifest to stdout
+#   heimdall-s6-manifest <spec.json> | heimdall-s6-sweep --manifest -   # glue
+#
+# Mapping per .repos[] entry:
+#   repo_url                 <- .url
+#   sha                      <- .sha            (REQUIRED — fail-closed if missing)
+#   lang                     <- .language       (carried so the plan table + the
+#                                                report know the stack)
+#   license                  <- .license        (carried; reported, not enforced)
+#   task_prompt              <- .task_prompt
+#   acceptance_cmd           <- .acceptance_cmd
+#   reused_symbols_expected  <- .reused_symbols_expected
+#   reuse_measured           <- .reuse_measured (carried so the runner/report knows
+#                                                cobra+anyhow are working-output-only
+#                                                -> reuse_pct expected null; NOT dropped)
+#
+# SHA is REQUIRED and fail-closed: a pinless entry would let the runner silently
+# clone HEAD — the exact drift bug the audit's SHA pin fixed. If ANY entry lacks a
+# 40-hex `sha`, ABORT (exit 2) and emit NOTHING — never a half-pinned manifest.
+#
+# ALL entries are emitted (none filtered): the runner runs all 10; cobra+anyhow
+# carry reuse_measured:false so the report treats them as working-output-only.
+#
+# Exit: 0 clean; 2 usage / malformed spec / missing-or-bad sha (fail-closed).
+set -euo pipefail
+
+usage() { sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'; }
+
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+esac
+
+command -v jq >/dev/null 2>&1 || { echo "error: jq is required" >&2; exit 2; }
+
+SPEC="${1:-}"
+[ -n "$SPEC" ] || { echo "error: a spec JSON path is required" >&2; usage >&2; exit 2; }
+[ -f "$SPEC" ] || { echo "error: spec not found: $SPEC" >&2; exit 2; }
+
+# The spec must be an object with a non-empty `.repos` array.
+if ! jq -e '(type == "object") and (.repos | type == "array") and (.repos | length > 0)' "$SPEC" >/dev/null 2>&1; then
+  echo "error: spec must be an object with a non-empty .repos array" >&2
+  exit 2
+fi
+
+# ── SHA pin discipline, fail-closed ───────────────────────────────────────────
+# Every .repos[] entry MUST carry a 40-hex `sha`. A missing/empty/short sha would
+# let the runner drift to HEAD (the audited-absent symbol may already have shipped
+# there), defeating the whole audit. We refuse to emit a half-pinned manifest:
+# report the FIRST offending entry by index/id and abort before writing anything.
+BAD="$(jq -r '
+  [ .repos | to_entries[]
+    | select(((.value.sha // "") | type != "string") or ((.value.sha // "") | test("^[0-9a-f]{40}$") | not))
+    | "\(.key):\(.value.id // .value.url // "<unknown>")" ]
+  | (.[0] // "ok")
+' "$SPEC")"
+if [ "$BAD" != "ok" ]; then
+  idx="${BAD%%:*}"; who="${BAD#*:}"
+  echo "error: spec repo entry $idx ($who) is missing a valid 40-hex 'sha'" >&2
+  echo "       a pinless entry would let the sweep silently clone HEAD — the drift bug the SHA pin fixes (fail-closed)." >&2
+  exit 2
+fi
+
+# ── Flatten + rename .repos[] into the runner's tested entry shape ─────────────
+# Emit ALL entries (no filter). Validate the produced JSON with `jq -e .` before
+# printing — never emit a malformed manifest.
+OUT="$(jq '
+  [ .repos[]
+    | {
+        repo_url:                .url,
+        sha:                     .sha,
+        lang:                    .language,
+        license:                 .license,
+        task_prompt:             .task_prompt,
+        acceptance_cmd:          .acceptance_cmd,
+        reused_symbols_expected: (.reused_symbols_expected // []),
+        reuse_measured:          .reuse_measured
+      }
+  ]
+' "$SPEC")"
+
+printf '%s\n' "$OUT" | jq -e . >/dev/null 2>&1 || {
+  echo "error: produced manifest is not valid JSON (internal)" >&2
+  exit 2
+}
+
+printf '%s\n' "$OUT"
