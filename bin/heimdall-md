@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+# heimdall-md — document → markdown converter for context building.
+#
+# Heimdall calls this when a task references a non-text / non-code document
+# (PDF / docx / xlsx / pptx / html / csv / json / xml / …). It converts the
+# document to clean, token-efficient Markdown the model reads natively, instead
+# of the agent wrestling raw bytes or burning tokens on a vision pass.
+#
+# It is a thin wrapper over bin/lib/md_convert.py, which owns the real work and
+# (critically) the SECURITY guards — narrowest markitdown API (convert_local /
+# convert_stream, never the URL-fetching convert()), path sanitization against
+# an allowed root, and SSRF / remote-URI refusal. Read that file's header for
+# the threat model.
+#
+# OPTIONAL / LAZY: markitdown is NOT a base dependency. If it is absent, this
+# tool prints a clear one-line skip notice and exits 0 (a graceful skip never
+# aborts a calling task run). A SECURITY refusal (remote URI / path escape) is
+# different — it exits nonzero so the caller knows the input was rejected.
+#
+# Usage:
+#   heimdall-md <file> [-o out.md] [--root DIR]
+#   heimdall-md --check                  print 'available' / 'absent' + exit 0
+#   heimdall-md -h | --help
+#
+#   <file>        local document to convert
+#   -o, --out F   write markdown to F instead of stdout
+#   --root DIR    the allowed root the file must live inside (default: cwd)
+#
+# Exit status:
+#   0  converted, OR markitdown absent (graceful skip — caller continues)
+#   2  usage error
+#   4  REFUSED — remote URI / unsafe path (a security gate; NOT a skip)
+#   5  conversion error (the file could not be converted)
+
+set -euo pipefail
+
+# ── Resolve the sibling python lib RELOCATABLY (no baked path) ────────────────
+# Resolve this script's real directory even when invoked through a symlink or a
+# bare name on PATH, then find lib/md_convert.py next to it. Mirrors the
+# resolution pattern used by bin/heimdall-reuse-metric.
+SELF_SRC="$0"
+case "$SELF_SRC" in
+  */*) : ;;
+  *)
+    RESOLVED="$(command -v "$SELF_SRC" 2>/dev/null || true)"
+    [ -n "$RESOLVED" ] && SELF_SRC="$RESOLVED"
+    ;;
+esac
+BIN_DIR="$(cd "$(dirname "$SELF_SRC")" 2>/dev/null && pwd)"
+LIB="$BIN_DIR/lib/md_convert.py"
+
+if [ ! -f "$LIB" ]; then
+  echo "heimdall-md: cannot find lib/md_convert.py next to $BIN_DIR (broken install?)" >&2
+  exit 2
+fi
+
+# ── Locate a python interpreter ───────────────────────────────────────────────
+PY="$(command -v python3 || command -v python || true)"
+if [ -z "$PY" ]; then
+  # No python at all is the same lived experience as "markitdown absent": a
+  # graceful skip, never a crash. The base install does not require python.
+  echo "heimdall-md: python not found — document conversion skipped (optional feature)." >&2
+  exit 0
+fi
+
+usage() {
+  sed -n '30,48p' "$SELF_SRC" | sed 's/^# \{0,1\}//'
+}
+
+# ── Parse args (pass through to the python CLI) ───────────────────────────────
+FILE=""
+OUT=""
+ROOT=""
+CHECK=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o|--out)  OUT="${2:?--out needs a path}"; shift 2 ;;
+    --root)    ROOT="${2:?--root needs a dir}"; shift 2 ;;
+    --check)   CHECK=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    --)        shift; [ $# -gt 0 ] && FILE="$1"; break ;;
+    -*)        echo "heimdall-md: unknown option: $1" >&2; usage >&2; exit 2 ;;
+    *)
+      if [ -z "$FILE" ]; then
+        FILE="$1"; shift
+      else
+        echo "heimdall-md: unexpected extra argument: $1" >&2; exit 2
+      fi
+      ;;
+  esac
+done
+
+# ── --check: report availability without converting ───────────────────────────
+if [ "$CHECK" -eq 1 ]; then
+  # The python --check path never raises; capture status explicitly so set -e
+  # does not abort on a nonzero (there is none here, but be defensive).
+  STATUS="$("$PY" "$LIB" --check 2>/dev/null || true)"
+  if [ -z "$STATUS" ]; then STATUS="absent"; fi
+  printf '%s\n' "$STATUS"
+  exit 0
+fi
+
+if [ -z "$FILE" ]; then
+  usage >&2
+  exit 2
+fi
+
+# ── Build the python argv ─────────────────────────────────────────────────────
+declare -a PYARGS=("$LIB" "$FILE")
+[ -n "$OUT" ]  && PYARGS+=(--out "$OUT")
+[ -n "$ROOT" ] && PYARGS+=(--root "$ROOT")
+
+# ── Run the converter, mapping its exit codes to ours ─────────────────────────
+# The python CLI uses:
+#   0 ok · 2 usage · 3 markitdown-absent (graceful skip) · 4 security-refused ·
+#   5 conversion-error. We collapse 3 → 0 (skip is not a failure) while keeping
+#   the security refusal (4) and conversion error (5) as hard nonzero exits.
+set +e
+"$PY" "${PYARGS[@]}"
+RC=$?
+set -e
+
+case "$RC" in
+  0) exit 0 ;;
+  3)
+    # Graceful skip: markitdown not installed. Tell the caller how to enable it,
+    # then exit cleanly so a task run is never aborted by a missing optional dep.
+    echo "heimdall-md: to enable, install: pip install 'markitdown[pdf,docx,pptx,xlsx]>=0.1.6'" >&2
+    exit 0
+    ;;
+  4) exit 4 ;;   # security refusal — propagate as a hard failure
+  2) exit 2 ;;   # usage
+  *) exit 5 ;;   # any conversion/other error
+esac
