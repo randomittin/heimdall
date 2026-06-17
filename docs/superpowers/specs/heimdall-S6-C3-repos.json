@@ -1,12 +1,24 @@
 {
-  "schema": "heimdall-s6-c3/repos+tasks/v1",
-  "status": "PROPOSAL — requires RJ sign-off on repos+tasks+bands before any run",
+  "schema": "heimdall-s6-c3/repos+tasks/v2",
+  "status": "PROPOSAL v2 (post-audit) — requires RJ sign-off on repos+tasks+bands before any run",
   "generated": "2026-06-17",
+  "revision": {
+    "version": 2,
+    "reason": "Two adversarial audits flagged 6 of 10 tasks as degenerate/gimme and identified the absence of SHA-pinning as the systemic root cause (depth-1 clones drifted to HEAD, where some of the original features had already shipped, turning real tasks into no-ops).",
+    "fix": "All 10 repos SHA-pinned (sweep must clone --depth 1 then checkout the exact sha). The 6 degenerate/gimme tasks swapped for audited (a)-shaped probes whose NEW symbol is verified absent and whose REUSE TARGET is verified present, both at the pinned SHA. The 4 honest tasks kept (jmespath + cobra tightened). Interpretation bands UNCHANGED (locked at original sign-off).",
+    "validated_at_pinned_sha": true
+  },
   "analyzer_grounding": {
     "reuse_measured_languages": ["js", "ts", "jsx", "tsx", "py", "sh", "bash"],
     "unsupported_today": ["go", "rust", "ruby", "java", "c", "cpp"],
     "source": "bin/lib/reuse_analyzer.py:55-57",
     "note": "Unsupported languages emit reuse_pct:null reason:unsupported-language (reuse_analyzer.py:512). Tree-sitter upgrade in-flight (async agent 2026-06-17 09:15, NOT merged to main as of this proposal). If it lands first, go/rust repos graduate to reuse_measured:true."
+  },
+  "sha_pinning": {
+    "enforced": true,
+    "resolved": "2026-06-17 via git ls-remote <url> HEAD",
+    "checkout_protocol": "Sweep MUST: git clone --depth 1 <url> <dir>; git -C <dir> fetch --depth 1 origin <sha>; git -C <dir> checkout <sha>. The audited absent-symbol / present-reuse-target state is frozen at these SHAs.",
+    "runner_followup": "bin/heimdall-s6-sweep consumes this manifest. If the runner does not yet honor the per-repo 'sha' field, wiring it in is a follow-up task; the field is added now so the audited state is captured regardless."
   },
   "spend": {
     "hard_total_cap_tokens": 600000,
@@ -18,6 +30,7 @@
   },
   "interpretation_bands": {
     "frozen_at_signoff": true,
+    "locked_unchanged_in_v2": true,
     "reuse_median_scope": "reuse_measured:true repos only (8: 5 JS + 3 Py; cobra+anyhow excluded). Median is over whichever measured repos survive wave-0 preflight.",
     "working_output_scope": "all 10 repos",
     "GENERALIZES": {
@@ -41,12 +54,12 @@
     "verdict_rule": "BOTH axes must clear for GENERALIZES; working-output gate can veto a high reuse median. A low result is a FINDING, not a failure; bands do not move post-result."
   },
   "wave0_preflight": {
+    "sha_checkout": "clone --depth 1 then checkout the pinned 'sha' before anything else; abort the repo if the SHA is unreachable",
     "license_verify": "confirm LICENSE file is MIT/Apache-2.0/BSD/ISC at the pinned SHA; on mismatch drop repo and use bench replacement",
     "baseline_green": "run the repo's own test/build command at pinned SHA on clean checkout; baseline MUST be green before any task; if red, drop + bench-replace",
     "reuse_emit_check": "for reuse_measured:true repos, confirm a reuse record with non-null reuse_pct emits on a no-op or dry diff"
   },
   "bench_replacements": [
-    {"lang": "js", "repo": "sindresorhus/yocto-queue", "license": "MIT"},
     {"lang": "js", "repo": "chalk/ansi-styles", "license": "MIT"},
     {"lang": "py", "repo": "pallets/click", "license": "BSD-3-Clause"},
     {"lang": "py", "repo": "psf/requests", "license": "Apache-2.0"},
@@ -56,134 +69,148 @@
     {
       "id": "slugify",
       "url": "https://github.com/sindresorhus/slugify",
+      "sha": "7c318bd1aa4b4affab29761f15a9604323fe2a3b",
       "language": "js",
       "license": "MIT",
       "approx_size": "~300 LOC + AVA tests",
       "reuse_measured": true,
       "dry_run": true,
-      "why_probe": "Tiny single-purpose util; clear internal slugify core + replacements map. Add-an-option task obviously extends the existing core.",
-      "task_prompt": "Add a preserveTrailingDash option to slugify that, when true, keeps a single trailing '-' in the output.",
-      "reuse_target_symbols": ["slugify", "options-merge", "replacements"],
-      "acceptance": {
-        "baseline": "npm install && npm test",
-        "working_output": "npm test exits 0 AND added AVA case asserts slugify('foo-', {preserveTrailingDash:true}) === 'foo-'"
+      "audit": "v2-swapped (original preserveTrailingDash task was degenerate/gimme)",
+      "why_probe": "Tiny single-purpose util; clear internal slugify core + removeMootSeparators helper. A maxLength-truncation option must thread through the existing pipeline, not re-tokenize.",
+      "task_prompt": "Add a maxLength option to slugify that truncates the final slug to at most N characters without leaving a trailing separator.",
+      "reused_symbols_expected": ["slugify", "removeMootSeparators"],
+      "acceptance_cmd": "npm test (xo+ava) green AND added AVA case: slugify('foo bar baz', {maxLength:7}) === 'foo-bar'",
+      "validation_at_sha": {
+        "new_symbol_absent": "grep maxLength index.js -> empty (ABSENT)",
+        "reuse_target_present": "removeMootSeparators(string, separator) @ index.js:15,98; slugify() pipeline @ index.js:46 (PRESENT)"
       }
     },
     {
       "id": "p-map",
       "url": "https://github.com/sindresorhus/p-map",
+      "sha": "65aaa8f4d7e757a5254a146c4c39403efa9e2139",
       "language": "js",
       "license": "MIT",
       "approx_size": "~200 LOC + AVA tests",
       "reuse_measured": true,
       "dry_run": false,
+      "audit": "v1-kept (honest task)",
       "why_probe": "Concurrency util; a variant task must reuse the existing iterator/concurrency machinery, not rewrite it.",
       "task_prompt": "Add a pMapValues helper that maps over an object's values with the same concurrency control as pMap and returns a new object.",
-      "reuse_target_symbols": ["pMap", "pMapSkip"],
-      "acceptance": {
-        "baseline": "npm install && npm test",
-        "working_output": "npm test exits 0 AND added case: pMapValues({a:1,b:2}, async v=>v*2, {concurrency:1}) resolves {a:2,b:4}"
-      }
+      "reused_symbols_expected": ["pMap", "pMapSkip"],
+      "acceptance_cmd": "npm test green AND added case: pMapValues({a:1,b:2}, async v=>v*2, {concurrency:1}) resolves {a:2,b:4}"
     },
     {
       "id": "wrap-ansi",
       "url": "https://github.com/chalk/wrap-ansi",
+      "sha": "f72a8343d4841433930786ae951b240a81bfd3a9",
       "language": "js",
       "license": "MIT",
       "approx_size": "~200 LOC + AVA tests",
       "reuse_measured": true,
       "dry_run": false,
-      "why_probe": "Depends on string-width/ansi-styles; internal wordLengths/wrapWord helpers. Wrapping-option task reuses the existing tokenizer.",
-      "task_prompt": "Add a 'trim: false' option to wrap-ansi that preserves leading/trailing whitespace on each wrapped line.",
-      "reuse_target_symbols": ["wrapWord", "wordLengths", "string-width(import)"],
-      "acceptance": {
-        "baseline": "npm install && npm test",
-        "working_output": "npm test exits 0 AND added case asserts whitespace preserved when {trim:false}"
+      "audit": "v2-swapped (original trim:false task was degenerate/gimme)",
+      "why_probe": "Internal wrapWord/wordLengths helpers + string-width import. An ellipsis option in hard-wrap mode must reuse the existing word-wrap path and width measurement, not re-break the word.",
+      "task_prompt": "Add an ellipsis: true option that, in hard-wrap mode, replaces the wrapped overflow of a long word with a single trailing '…' on the first row instead of breaking it across rows.",
+      "reused_symbols_expected": ["wrapWord", "stringWidth"],
+      "acceptance_cmd": "npm test (xo+ava+tsd) green AND a case asserting a too-long word under {hard:true, ellipsis:true} ends in '…' at column width with ANSI intact",
+      "validation_at_sha": {
+        "new_symbol_absent": "grep -i ellipsis index.js -> empty (ABSENT)",
+        "reuse_target_present": "wrapWord(rows, word, columns) @ index.js:390,396,404; stringWidth import @ index.js:1, used in wordLengths @ index.js:242 (PRESENT)"
       }
     },
     {
       "id": "records",
       "url": "https://github.com/kennethreitz/records",
+      "sha": "ea4273695cee6da42edf1cb294d1f2a4505470fc",
       "language": "py",
       "license": "ISC",
       "approx_size": "~600 LOC + pytest",
       "reuse_measured": true,
       "dry_run": true,
-      "why_probe": "Record/RecordCollection/Database classes — textbook reuse target. Export-format task must call existing row access.",
-      "task_prompt": "Add a .as_csv() method to RecordCollection that serializes all rows to CSV using existing row access.",
-      "reuse_target_symbols": ["RecordCollection.__iter__", "RecordCollection.all", "Record.as_dict", "Record.keys"],
-      "acceptance": {
-        "baseline": "pip install -e . && pytest",
-        "working_output": "pytest exits 0 AND added test: RecordCollection([...]).as_csv() returns header+rows"
+      "audit": "v2-swapped (original .as_csv() task was degenerate/gimme)",
+      "why_probe": "Record/RecordCollection/Database classes — textbook reuse target. A distinct() must call existing row access + re-wrap a RecordCollection, not build a new structure.",
+      "task_prompt": "Add a RecordCollection.distinct(*columns) returning a new RecordCollection of rows unique on the given column values, reusing existing row access.",
+      "reused_symbols_expected": ["Record.__getitem__", "Record.keys", "RecordCollection.__iter__", "RecordCollection.all", "RecordCollection(iter(rows))"],
+      "acceptance_cmd": "pip install -e . && pytest green AND test: Database(...).query('select 1 as a union all select 1 as a').distinct('a') yields one row",
+      "validation_at_sha": {
+        "new_symbol_absent": "grep 'def distinct' records.py -> empty (ABSENT)",
+        "reuse_target_present": "Record.__getitem__ @ records.py:48; Record.keys @ records.py:37; RecordCollection.__iter__ @ records.py:118; RecordCollection.all @ records.py:195; class RecordCollection @ records.py:107 (PRESENT)"
       }
     },
     {
       "id": "cachecontrol",
       "url": "https://github.com/psf/cachecontrol",
+      "sha": "495b215d25568432aeb983c31f696447a777b4b5",
       "language": "py",
       "license": "Apache-2.0",
       "approx_size": "~1.5k LOC + pytest",
       "reuse_measured": true,
       "dry_run": false,
+      "audit": "v1-kept (honest task)",
       "why_probe": "CacheController + BaseCache + adapters. Add-a-backend task subclasses BaseCache — extension is the correct solution.",
       "task_prompt": "Add an in-memory LRU cache backend with a max-entries cap by subclassing the existing base cache.",
-      "reuse_target_symbols": ["BaseCache", "DictCache", "CacheController"],
-      "acceptance": {
-        "baseline": "pip install -e . && pytest",
-        "working_output": "pytest exits 0 AND added test: LRU backend evicts past the cap and satisfies BaseCache get/set/delete"
-      }
+      "reused_symbols_expected": ["BaseCache", "DictCache", "CacheController"],
+      "acceptance_cmd": "pip install -e . && pytest green AND added test: LRU backend evicts past the cap and satisfies BaseCache get/set/delete"
     },
     {
       "id": "jmespath",
       "url": "https://github.com/jmespath/jmespath.py",
+      "sha": "2812594e69d43098ef60f81f4efc404c071b0418",
       "language": "py",
       "license": "MIT",
       "approx_size": "~1k LOC + compliance/pytest",
       "reuse_measured": true,
       "dry_run": false,
-      "why_probe": "Lexer/Parser/TreeInterpreter/functions registry. Add-a-builtin task reuses the @signature decorator + function registry.",
-      "task_prompt": "Add a built-in to_upper function to the JMESPath function registry that uppercases a string argument.",
-      "reuse_target_symbols": ["@signature", "Functions(registry)", "TreeInterpreter"],
-      "acceptance": {
-        "baseline": "pip install -e . && pytest",
-        "working_output": "pytest exits 0 AND added case: search('to_upper(@)', 'abc') == 'ABC'"
-      }
+      "audit": "v1-kept + tightened (prompt reworded to describe user-facing behavior only; no longer names the 'function registry' mechanism, to avoid spoon-feeding the implementation)",
+      "why_probe": "Add-a-builtin task: the correct solution registers via the existing @signature decorator + function machinery. The prompt now states only the observable behavior so symbol discovery is part of the probe.",
+      "task_prompt": "Add a built-in to_upper so that the JMESPath expression to_upper(@) returns the uppercased form of a string argument.",
+      "reused_symbols_expected": ["signature", "Functions", "TreeInterpreter"],
+      "acceptance_cmd": "pip install -e . && pytest green AND added case: search('to_upper(@)', 'abc') == 'ABC'"
     },
     {
       "id": "commander",
       "url": "https://github.com/tj/commander.js",
+      "sha": "ba6d13ddb4243e5913367734f8c159089ffe7834",
       "language": "js",
       "license": "MIT",
-      "approx_size": "~2.5k LOC + Jest",
+      "approx_size": "~2.5k LOC + node:test",
       "reuse_measured": true,
       "dry_run": false,
-      "why_probe": "Canonical CLI; Command/Option/Argument classes. Deliberately SPRAWLING — tests reuse when the surface is large (contrast with tiny utils).",
-      "task_prompt": "Add a .requiredOption alias method .mandatoryOption that behaves identically and is documented as a synonym.",
-      "reuse_target_symbols": ["requiredOption", "Option", "Command"],
-      "acceptance": {
-        "baseline": "npm install && npm test",
-        "working_output": "npm test (Jest) exits 0 AND added test: .mandatoryOption('-x') enforces presence exactly like .requiredOption"
+      "audit": "v2-swapped (original .mandatoryOption alias task was degenerate/gimme). Runner note: at the pinned SHA the test script is already 'node --test' (NOT Jest); the v1 'Jest' label came from a drifted clone. acceptance_cmd uses node --test.",
+      "why_probe": "Sprawling canonical CLI. A requiredOptionWithDefault must compose the existing option-creation + mandatory-marking + parse-time mandatory check, not re-implement option parsing.",
+      "task_prompt": "Add a Command#requiredOptionWithDefault(flags, description, defaultValue) registering a mandatory option satisfied if either the user supplies it OR the default applies, validated during parse.",
+      "reused_symbols_expected": ["_optionEx", "createOption", "makeOptionMandatory", "_checkForMissingMandatoryOptions"],
+      "acceptance_cmd": "node --test green AND added tests/*.test.js asserting accepted-when-only-default-present AND errors-when-neither",
+      "validation_at_sha": {
+        "new_symbol_absent": "grep requiredOptionWithDefault lib/*.js -> empty (ABSENT)",
+        "reuse_target_present": "_optionEx @ lib/command.js:732,780; createOption (overridable) @ lib/command.js:579; makeOptionMandatory on Option; _checkForMissingMandatoryOptions @ lib/command.js:1237,1598 (PRESENT)",
+        "runner_field": "package.json test = 'node --test && npm run check:type:ts' (already node --test at this SHA)"
       }
     },
     {
       "id": "yocto-queue",
       "url": "https://github.com/sindresorhus/yocto-queue",
+      "sha": "b07eac099753833b29d06c614149904445739776",
       "language": "js",
       "license": "MIT",
       "approx_size": "~80 LOC + AVA tests",
       "reuse_measured": true,
       "dry_run": false,
-      "why_probe": "Tiny linked-list queue exporting class Queue with enqueue/dequeue/clear. A peek/iterate-extension task must reuse the existing node/size internals, not re-implement the list.",
-      "task_prompt": "Add a peek() method to Queue that returns the value at the head without dequeuing, reusing the existing head-node tracking.",
-      "reuse_target_symbols": ["Queue", "enqueue", "dequeue", "#head"],
-      "acceptance": {
-        "baseline": "npm install && npm test",
-        "working_output": "npm test exits 0 AND added AVA case: a queue with enqueue('a'); enqueue('b'); peek()==='a' and size unchanged"
+      "audit": "v2-swapped (original peek() task was degenerate/gimme)",
+      "why_probe": "Tiny linked-list queue. A dequeueMany(count) must reuse the existing dequeue() semantics and #head/#size internals to keep size consistent, not re-walk the list.",
+      "task_prompt": "Add a dequeueMany(count) method that removes and returns up to count values from the head as an array, reusing existing dequeue semantics and keeping size consistent.",
+      "reused_symbols_expected": ["dequeue", "#head", "#size"],
+      "acceptance_cmd": "npm test (ava+tsd) green AND AVA case: enqueue a,b,c -> dequeueMany(2) deep-equals ['a','b'], size===1, peek()==='c'",
+      "validation_at_sha": {
+        "new_symbol_absent": "grep dequeueMany index.js -> empty (ABSENT)",
+        "reuse_target_present": "dequeue() @ index.js:38; #head @ index.js:16; #size @ index.js:18 (PRESENT)"
       }
     },
     {
       "id": "cobra",
       "url": "https://github.com/spf13/cobra",
+      "sha": "ad460ea8f249db69c943a365fb84f3a59042d54e",
       "language": "go",
       "license": "Apache-2.0",
       "approx_size": "large",
@@ -191,17 +218,16 @@
       "reuse_pct_today": null,
       "reuse_pct_reason": "unsupported-language (go); graduates to measured iff tree-sitter upgrade lands first",
       "dry_run": false,
+      "audit": "v1-kept + tightened (acceptance pinned to a SINGLE-LEVEL alias to avoid nested-subcommand ambiguity)",
       "why_probe": "Varied-stack representative. Working-output via go test ./...; excluded from reuse median today.",
       "task_prompt": "Add a Command.AliasFor(name) helper that returns the canonical command an alias resolves to, reusing the existing alias lookup.",
-      "reuse_target_symbols": ["Command.Find", "alias-resolution"],
-      "acceptance": {
-        "baseline": "go test ./...",
-        "working_output": "go test ./... exits 0 AND added Go test asserts alias->canonical resolution"
-      }
+      "reused_symbols_expected": ["Command.Find", "Aliases"],
+      "acceptance_cmd": "go test ./... green AND added Go test: a root command with one direct child whose Aliases include 'co' -> AliasFor('co') returns that child (single-level alias only, no nested subcommands)"
     },
     {
       "id": "anyhow",
       "url": "https://github.com/dtolnay/anyhow",
+      "sha": "841522b2aa09732fecee40804440d2c35c68c480",
       "language": "rust",
       "license": "MIT OR Apache-2.0",
       "approx_size": "~2k LOC + cargo tests",
@@ -209,14 +235,16 @@
       "reuse_pct_today": null,
       "reuse_pct_reason": "unsupported-language (rust); graduates to measured iff tree-sitter upgrade lands first",
       "dry_run": false,
-      "why_probe": "Rust representative. Working-output via cargo test; small enough to build fast; excluded from reuse median today.",
-      "task_prompt": "Add a Context::with_note combinator that attaches a static note to an error, reusing the existing context-chaining machinery.",
-      "reuse_target_symbols": ["Context(trait)", "context()"],
-      "acceptance": {
-        "baseline": "cargo test",
-        "working_output": "cargo test exits 0 AND added test asserts the note appears in the error chain"
+      "audit": "v2-swapped (original Context::with_note task was degenerate/gimme)",
+      "why_probe": "Rust representative. A context_with_code combinator must reuse the existing context-attachment plumbing so the message still surfaces via {:#} and the chain stays walkable. Working-output probe; reuse_pct null today.",
+      "task_prompt": "Add Context::context_with_code<C>(self, code: i32, context: C) attaching a numeric code + message, reusing the existing context-attachment machinery so the message still appears via {:#} and the chain is walkable via Error::chain.",
+      "reused_symbols_expected": ["Error::context", "ContextError"],
+      "acceptance_cmd": "cargo test green AND test asserts format!(\"{:#}\", err) contains the message AND err.chain().count() increased",
+      "validation_at_sha": {
+        "new_symbol_absent": "grep -rn 'context_with_code|with_code' src/ -> empty (ABSENT)",
+        "reuse_target_present": "fn context @ src/context.rs:46,91; ContextError @ src/context.rs:1,115; Error::chain @ src/error.rs:441 (PRESENT)"
       }
     }
   ],
-  "_count_note": "Exactly 10 repos in the array. Stacks: 5 JS (slugify, p-map, wrap-ansi, commander, yocto-queue), 3 Py (records, cachecontrol, jmespath), 1 Go (cobra), 1 Rust (anyhow). reuse_measured:true = 8 (the 5 JS + 3 Py) -> reuse-% median computed over these 8. working-output-only = 2 (cobra, anyhow) -> excluded from reuse median, counted in working-output rate over all 10. NOTE: interpretation_bands.reuse_median_scope text says '7' as a conservative floor; with yocto-queue promoted to the spine the measured set is 8 — the bands' median is computed over whatever reuse_measured:true repos survive wave-0 preflight (7 or 8). bench_replacements lists yocto-queue too; if it is in the running set it is NOT also a bench item."
+  "_count_note": "Exactly 10 repos. Stacks: 5 JS (slugify, p-map, wrap-ansi, commander, yocto-queue), 3 Py (records, cachecontrol, jmespath), 1 Go (cobra), 1 Rust (anyhow). reuse_measured:true = 8 (5 JS + 3 Py) -> reuse-% median over these 8. working-output-only = 2 (cobra, anyhow). v2 swapped 6 tasks (slugify, wrap-ansi, yocto-queue, commander, records, anyhow) for audited (a)-shaped probes; kept 4 (p-map, cachecontrol, jmespath [tightened], cobra [tightened]). All 10 SHA-pinned. yocto-queue is in the running set, therefore removed from bench_replacements."
 }
