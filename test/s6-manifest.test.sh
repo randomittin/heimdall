@@ -10,7 +10,7 @@
 #   (a) the converter on the REAL spec emits a valid JSON array of EXACTLY 10
 #       entries (jq 'length==10').
 #   (b) every entry carries repo_url (non-empty), sha (40-hex), task_prompt,
-#       acceptance_cmd.
+#       baseline_cmd, assertion_cmd.
 #   (c) url -> repo_url is mapped correctly for a sample entry (slugify).
 #   (d) reuse_measured:false is carried for cobra + anyhow; true for the other 8.
 #   (e) a spec entry MISSING `sha` is REJECTED fail-closed (exit 2), emitting
@@ -58,19 +58,29 @@ else
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
-# (b) every entry has repo_url(non-empty), sha(40-hex), task_prompt, acceptance_cmd.
+# (b) every entry has repo_url(non-empty), sha(40-hex), task_prompt, baseline_cmd,
+#     assertion_cmd — the two RUNNABLE acceptance commands (no prose).
 # ─────────────────────────────────────────────────────────────────────────────
 if jq -e '
     all(.[];
       (.repo_url | type=="string" and (.|length)>0)
       and (.sha | type=="string" and test("^[0-9a-f]{40}$"))
       and (.task_prompt | type=="string" and (.|length)>0)
-      and (.acceptance_cmd | type=="string" and (.|length)>0))
+      and (.baseline_cmd | type=="string" and (.|length)>0)
+      and (.assertion_cmd | type=="string" and (.|length)>0))
   ' "$OUT" >/dev/null 2>&1; then
-  ok "(b) every entry has repo_url(non-empty) + sha(40-hex) + task_prompt + acceptance_cmd"
+  ok "(b) every entry has repo_url(non-empty) + sha(40-hex) + task_prompt + baseline_cmd + assertion_cmd"
 else
   bad "(b) some entry is missing a required field or has a bad sha"
-  jq -c '.[] | {repo_url, sha, task_prompt:(.task_prompt[0:20]), acceptance_cmd:(.acceptance_cmd[0:20])}' "$OUT"
+  jq -c '.[] | {repo_url, sha, task_prompt:(.task_prompt[0:20]), baseline_cmd:(.baseline_cmd[0:20]), assertion_cmd:(.assertion_cmd[0:20])}' "$OUT"
+fi
+
+# the old single prose `acceptance_cmd` must be GONE — proving the v2 split landed.
+if jq -e 'all(.[]; has("acceptance_cmd") | not)' "$OUT" >/dev/null 2>&1; then
+  ok "(b2) old prose acceptance_cmd dropped from every entry (eval-on-prose landmine removed)"
+else
+  bad "(b2) acceptance_cmd still present on some entry"
+  jq -c '.[] | {repo_url, acceptance_cmd}' "$OUT"
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────

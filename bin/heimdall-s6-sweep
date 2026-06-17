@@ -4,9 +4,11 @@
 # The spend-gated, capped, staged HARNESS that runs the S-6 C3 breadth proof:
 # for each repo in a manifest, cold-clone it, run `hmd "<task>"` against it,
 # measure REUSE over the run's diff (bin/heimdall-reuse-metric), capture
-# WORKING-OUTPUT evidence by running the repo's own acceptance_cmd and recording
-# PASS/FAIL with the QUOTED output (runnable evidence, NEVER the agent's
-# self-report — R7), and record the task's token spend. It enforces a HARD spend
+# WORKING-OUTPUT evidence by running the repo's own baseline_cmd (regression) and
+# the task's assertion_cmd (behavior) and recording PASS/FAIL with the QUOTED
+# output (runnable evidence, NEVER the agent's self-report — R7); a task PASSES
+# only when BOTH commands exit 0. It records the task's token spend, enforces a
+# HARD spend
 # cap (fail-closed), and is SAFE-BY-DEFAULT: with no mode flag it only DRY-RUNS.
 #
 # This harness does NOT decide the verdict — it produces HONEST numbers. A low
@@ -22,9 +24,14 @@
 #     license                  (string)  must be permissive — reported, not enforced
 #     task_prompt              (string)  the realistic task handed to `hmd`
 #     reused_symbols_expected  (array)   symbols a competent solution should reuse
-#     acceptance_cmd           (string)  the repo's OWN test/build — run for evidence
-#   repo_url, sha, task_prompt and acceptance_cmd are REQUIRED; a missing one is a
-#   hard usage error (exit 2) — we never sweep a half-specified manifest.
+#     baseline_cmd             (string)  the repo's OWN test/build — the regression
+#                                        signal (exit 0 = the suite still passes)
+#     assertion_cmd            (string)  a runnable task-specific check — exit 0 iff
+#                                        the requested behavior is correct
+#   repo_url, sha, task_prompt, baseline_cmd and assertion_cmd are REQUIRED; a
+#   missing one is a hard usage error (exit 2) — we never sweep a half-specified
+#   manifest. Both commands are DEFINED manifest commands (like a Makefile target),
+#   run via `bash -c`; we NEVER `eval` a free-prose acceptance description.
 #
 # ── SHA pinning (the audit's root-cause fix) ──────────────────────────────────
 #   A --depth 1 clone of a URL yields only HEAD, which DRIFTS over time — features
@@ -141,22 +148,25 @@ if ! jq -e 'type == "array" and length > 0' "$MANIFEST" >/dev/null 2>&1; then
   echo "error: manifest must be a non-empty JSON array of repo entries" >&2
   exit 2
 fi
-# Every entry must carry the four REQUIRED fields (repo_url, sha, task_prompt,
-# acceptance_cmd) as non-empty strings. jq returns the index of the first bad one.
-# `sha` is REQUIRED fail-closed: a pinless entry would silently clone HEAD — the
-# exact drift bug the audit fixed — so we refuse to sweep without it.
+# Every entry must carry the five REQUIRED fields (repo_url, sha, task_prompt,
+# baseline_cmd, assertion_cmd) as non-empty strings. jq returns the index of the
+# first bad one. `sha` is REQUIRED fail-closed: a pinless entry would silently
+# clone HEAD — the exact drift bug the audit fixed — so we refuse to sweep without
+# it. baseline_cmd + assertion_cmd are the two runnable acceptance commands; an
+# entry missing either is fail-closed the same way (we cannot prove the behavior).
 BAD_IDX="$(jq -r '
   [ to_entries[]
     | select(
         ((.value.repo_url // "")       | type != "string" or . == "")
         or ((.value.sha // "")           | type != "string" or . == "")
         or ((.value.task_prompt // "")   | type != "string" or . == "")
-        or ((.value.acceptance_cmd // "")| type != "string" or . == "")
+        or ((.value.baseline_cmd // "")  | type != "string" or . == "")
+        or ((.value.assertion_cmd // "") | type != "string" or . == "")
       )
     | .key ] | (.[0] // "ok")
 ' "$MANIFEST")"
 if [ "$BAD_IDX" != "ok" ]; then
-  echo "error: manifest entry $BAD_IDX is missing a required field (repo_url, sha, task_prompt, acceptance_cmd)" >&2
+  echo "error: manifest entry $BAD_IDX is missing a required field (repo_url, sha, task_prompt, baseline_cmd, assertion_cmd)" >&2
   echo "       a pinless entry would silently clone HEAD — the drift bug the SHA pin fixes (fail-closed)." >&2
   exit 2
 fi
@@ -288,6 +298,17 @@ do_spend() {
   fi
 }
 
+# ── clamp a captured command's output so a noisy suite cannot bloat the report ─
+# Keeps the head + tail and marks the elision; short output passes through whole.
+clamp_evidence() {
+  local s="$1"
+  if [ "${#s}" -gt 2000 ]; then
+    printf '%s' "${s:0:1000}"$'\n...[truncated]...\n'"${s: -900}"
+  else
+    printf '%s' "$s"
+  fi
+}
+
 # results accumulate as a JSON array file (one object appended per task).
 RESULTS_FILE="$WORK_ROOT/results.jsonl"
 : > "$RESULTS_FILE"
@@ -304,7 +325,8 @@ while [ "$i" -lt "$N_EFFECTIVE" ]; do
   url="$(jq -r ".[$i].repo_url" "$MANIFEST")"
   sha="$(jq -r ".[$i].sha" "$MANIFEST")"
   task="$(jq -r ".[$i].task_prompt" "$MANIFEST")"
-  acc="$(jq -r ".[$i].acceptance_cmd" "$MANIFEST")"
+  baseline="$(jq -r ".[$i].baseline_cmd" "$MANIFEST")"
+  assertion="$(jq -r ".[$i].assertion_cmd" "$MANIFEST")"
   expect="$(jq -c ".[$i].reused_symbols_expected // []" "$MANIFEST")"
 
   # ── HARD CAP, FAIL-CLOSED: before starting, project this task's spend against
@@ -370,14 +392,21 @@ while [ "$i" -lt "$N_EFFECTIVE" ]; do
     REUSE_PCT="null"; REUSE_SYMS="[]"
   fi
 
-  # ── WORKING-OUTPUT EVIDENCE: run the repo's OWN acceptance_cmd, capture the
-  #    exit status + QUOTED output. This is runnable evidence (R7) — we trust the
-  #    test suite's result, NEVER the agent's self-report. ──
-  ACC_OUT="$( ( cd "$DEST" && eval "$acc" ) 2>&1 )" && ACC_RC=0 || ACC_RC=$?
-  if [ "$ACC_RC" -eq 0 ]; then WO_PASS=true; else WO_PASS=false; fi
-  # clamp the evidence to a sane length so a noisy suite cannot bloat the report.
-  EVIDENCE="$ACC_OUT"
-  if [ "${#EVIDENCE}" -gt 4000 ]; then EVIDENCE="${EVIDENCE:0:2000}"$'\n...[truncated]...\n'"${EVIDENCE: -1800}"; fi
+  # ── WORKING-OUTPUT EVIDENCE: run the repo's OWN baseline_cmd (regression) then
+  #    the task's assertion_cmd (behavior), capturing each exit status + QUOTED
+  #    output. These are DEFINED manifest commands (like a Makefile target), run
+  #    via `bash -c` in the cloned repo — NOT an `eval` of a free-prose acceptance
+  #    description (the v2 landmine). This is runnable evidence (R7): we trust the
+  #    commands' exit codes, NEVER the agent's self-report. A task PASSES only when
+  #    BOTH the baseline AND the assertion exit 0. ──
+  BASELINE_OUT="$( ( cd "$DEST" && bash -c "$baseline" ) 2>&1 )" && BASELINE_RC=0 || BASELINE_RC=$?
+  if [ "$BASELINE_RC" -eq 0 ]; then BASELINE_PASS=true; else BASELINE_PASS=false; fi
+  ASSERTION_OUT="$( ( cd "$DEST" && bash -c "$assertion" ) 2>&1 )" && ASSERTION_RC=0 || ASSERTION_RC=$?
+  if [ "$ASSERTION_RC" -eq 0 ]; then ASSERTION_PASS=true; else ASSERTION_PASS=false; fi
+  if [ "$BASELINE_PASS" = true ] && [ "$ASSERTION_PASS" = true ]; then WO_PASS=true; else WO_PASS=false; fi
+  # quoted evidence of BOTH commands, clamped so a noisy suite cannot bloat the
+  # report. Each half is clamped independently, then labelled.
+  EVIDENCE="baseline_cmd (exit $BASELINE_RC):"$'\n'"$(clamp_evidence "$BASELINE_OUT")"$'\n'"assertion_cmd (exit $ASSERTION_RC):"$'\n'"$(clamp_evidence "$ASSERTION_OUT")"
 
   # ── token spend for this task (injected source or the ledger) ──
   SPEND="$(do_spend 2>/dev/null || echo 0)"
@@ -387,15 +416,20 @@ while [ "$i" -lt "$N_EFFECTIVE" ]; do
 
   jq -cn \
      --arg url "$url" --arg sha "$sha" --arg resolved "$RESOLVED_SHA" \
-     --arg task "$task" --arg acc "$acc" \
+     --arg task "$task" --arg baseline "$baseline" --arg assertion "$assertion" \
      --argjson reuse "$REUSE_PCT" --argjson syms "$REUSE_SYMS" \
      --argjson expect "$expect" \
-     --argjson wopass "$WO_PASS" --arg ev "$EVIDENCE" --arg accrc "$ACC_RC" \
+     --argjson wopass "$WO_PASS" --arg ev "$EVIDENCE" \
+     --argjson basepass "$BASELINE_PASS" --arg baserc "$BASELINE_RC" \
+     --argjson asrtpass "$ASSERTION_PASS" --arg asrtrc "$ASSERTION_RC" \
      --argjson spend "$SPEND" \
      '{repo_url:$url, pinned_sha:$sha, resolved_sha:$resolved,
        task:$task, status:"ran",
        reuse_pct:$reuse, reused_symbols:$syms, reused_symbols_expected:$expect,
-       working_output:{pass:$wopass, exit_code:($accrc|tonumber), cmd:$acc, evidence:$ev},
+       working_output:{pass:$wopass,
+                       baseline_pass:$basepass, baseline_exit:($baserc|tonumber), baseline_cmd:$baseline,
+                       assertion_pass:$asrtpass, assertion_exit:($asrtrc|tonumber), assertion_cmd:$assertion,
+                       evidence:$ev},
        token_spend:$spend}' >> "$RESULTS_FILE"
 
   printf "      reuse=%s  working_output=%s  spend=%s  ${D}(cum %s/%s)${R}\n" \
