@@ -98,7 +98,8 @@ OUT="$(jq '
         lang:                    .language,
         license:                 .license,
         task_prompt:             .task_prompt,
-        acceptance_cmd:          .acceptance_cmd,
+        baseline_cmd:            .baseline_cmd,
+        assertion_cmd:           .assertion_cmd,
         reused_symbols_expected: (.reused_symbols_expected // []),
         reuse_measured:          .reuse_measured
       }

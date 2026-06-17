@@ -22,9 +22,13 @@
 #       leaving a PARTIAL report — and never runs the task that would blow it.
 #   (d) the report JSON is well-formed with reuse_pct + working_output (pass/fail
 #       + QUOTED evidence) + token_spend per entry.
-#   (e) working_output is captured from RUNNABLE EVIDENCE (the repo's
-#       acceptance_cmd exit status), NOT a self-report: a failing acceptance_cmd
-#       is recorded FAIL even when the agent "succeeded".
+#   (e) working_output is captured from RUNNABLE EVIDENCE (the repo's baseline_cmd
+#       + the task's assertion_cmd exit status), NOT a self-report: a failing
+#       command is recorded FAIL even when the agent "succeeded".
+#   (j) the runner runs BOTH baseline_cmd AND assertion_cmd, and gates
+#       working_output.pass = baseline_pass && assertion_pass: baseline-passes-but-
+#       assertion-fails => pass=false; both-pass => pass=true (the runnable
+#       acceptance split — no eval-on-prose).
 #   (f) --confirm-full is REQUIRED to run more than --limit entries (the
 #       unattended-sweep guard): a full (all-entries) run without it aborts.
 #   (g) a malformed manifest is rejected with a usage error (exit 2), spending
@@ -67,14 +71,24 @@ export function formatUser(user) {
   return user.first + " " + user.last + " <" + user.email + ">";
 }
 EOF
-# the repo's own test suite — the acceptance_cmd runs THIS, and we control its
-# exit status per-scenario via an env var so we can prove evidence-based capture.
+# the repo's own test suite — the baseline_cmd runs THIS (the regression signal),
+# and we control its exit status per-scenario via an env var so we can prove
+# evidence-based capture.
 cat > "$MOCKREPO/run-tests.sh" <<'EOF'
 #!/usr/bin/env bash
 echo "mock-target test suite: ${MOCK_TEST_LABEL:-default}"
-exit "${MOCK_TEST_RC:-0}"
+exit "${MOCK_BASELINE_RC:-0}"
 EOF
 chmod +x "$MOCKREPO/run-tests.sh"
+# the task-specific assertion — the assertion_cmd runs THIS (the behavior check),
+# controlled independently so we can prove BOTH gate working_output (baseline can
+# pass while the assertion fails → pass=false, and both-pass → pass=true).
+cat > "$MOCKREPO/run-assertion.sh" <<'EOF'
+#!/usr/bin/env bash
+echo "mock-target assertion: ${MOCK_ASSERT_LABEL:-default}"
+exit "${MOCK_ASSERT_RC:-0}"
+EOF
+chmod +x "$MOCKREPO/run-assertion.sh"
 # Track the api/ dir so a REAL `git clone` (which, unlike cp -R, will not
 # recreate an empty/untracked dir) still yields api/ for the mock-hmd diff.
 printf '' > "$MOCKREPO/api/.gitkeep"
@@ -164,7 +178,8 @@ cat > "$MANIFEST" <<EOF
     "license": "MIT",
     "task_prompt": "add an endpoint that returns a formatted user",
     "reused_symbols_expected": ["formatUser"],
-    "acceptance_cmd": "bash run-tests.sh"
+    "baseline_cmd": "bash run-tests.sh",
+    "assertion_cmd": "bash run-assertion.sh"
   },
   {
     "repo_url": "file://$MOCKREPO",
@@ -173,7 +188,8 @@ cat > "$MANIFEST" <<EOF
     "license": "MIT",
     "task_prompt": "add a second endpoint reusing formatUser",
     "reused_symbols_expected": ["formatUser"],
-    "acceptance_cmd": "bash run-tests.sh"
+    "baseline_cmd": "bash run-tests.sh",
+    "assertion_cmd": "bash run-assertion.sh"
   }
 ]
 EOF
@@ -246,11 +262,11 @@ fi
 # ─────────────────────────────────────────────────────────────────────────────
 # (d) report JSON well-formed: reuse_pct + working_output + token_spend per entry
 # ─────────────────────────────────────────────────────────────────────────────
-# A full 2-entry run with a generous cap. Acceptance passes (MOCK_TEST_RC=0).
+# A full 2-entry run with a generous cap. Both baseline + assertion pass (rc 0).
 rm -f "$WORK/hmd-was-called" "$WORK/spend-was-called"
 RUNID_OK="oktest-$$"
 set +e
-MOCK_SPEND=50000 MOCK_TEST_RC=0 run_sweep --confirm-full --cap 600000 --run-id "$RUNID_OK" >"$WORK/ok.out" 2>&1
+MOCK_SPEND=50000 MOCK_BASELINE_RC=0 MOCK_ASSERT_RC=0 run_sweep --confirm-full --cap 600000 --run-id "$RUNID_OK" >"$WORK/ok.out" 2>&1
 OK_RC=$?
 set -e
 OK_REPORT="$ROOT/.planning/s6-sweep/$RUNID_OK.json"
@@ -283,26 +299,104 @@ if [ -f "$OK_REPORT" ]; then
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
-# (e) working_output from RUNNABLE EVIDENCE, not self-report: failing
-#     acceptance_cmd => working_output.pass=false even though the agent "ran".
+# (e) working_output from RUNNABLE EVIDENCE, not self-report: a failing baseline
+#     command => working_output.pass=false even though the agent "ran", and the
+#     command's QUOTED output is captured as evidence.
 # ─────────────────────────────────────────────────────────────────────────────
 RUNID_FAIL="failtest-$$"
 set +e
-MOCK_SPEND=50000 MOCK_TEST_RC=1 MOCK_TEST_LABEL="boom" run_sweep \
+MOCK_SPEND=50000 MOCK_BASELINE_RC=1 MOCK_TEST_LABEL="boom" MOCK_ASSERT_RC=0 run_sweep \
     --confirm-full --cap 600000 --run-id "$RUNID_FAIL" >"$WORK/fail.out" 2>&1
 FAIL_RC=$?
 set -e
 FAIL_REPORT="$ROOT/.planning/s6-sweep/$RUNID_FAIL.json"
 if [ -f "$FAIL_REPORT" ]; then
   PASSV="$(jq -r '.results[0].working_output.pass' "$FAIL_REPORT")"
+  BASEV="$(jq -r '.results[0].working_output.baseline_pass' "$FAIL_REPORT")"
   EVID="$(jq -r '.results[0].working_output.evidence' "$FAIL_REPORT")"
-  if [ "$PASSV" = "false" ] && printf '%s' "$EVID" | grep -q "boom"; then
-    ok "(e) working_output from evidence: failing acceptance_cmd => pass=false with quoted output"
+  if [ "$PASSV" = "false" ] && [ "$BASEV" = "false" ] && printf '%s' "$EVID" | grep -q "boom"; then
+    ok "(e) working_output from evidence: failing baseline command => pass=false with quoted output"
   else
-    bad "(e) failing acceptance not captured as evidence (pass=$PASSV)"; jq '.results[0].working_output' "$FAIL_REPORT"
+    bad "(e) failing command not captured as evidence (pass=$PASSV baseline=$BASEV)"; jq '.results[0].working_output' "$FAIL_REPORT"
   fi
 else
   bad "(e) fail-evidence run produced no report (rc=$FAIL_RC)"; cat "$WORK/fail.out"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# (j) the runner runs BOTH baseline_cmd AND assertion_cmd and gates
+#     working_output.pass = baseline_pass && assertion_pass.
+# ─────────────────────────────────────────────────────────────────────────────
+# (j1) baseline PASSES but assertion FAILS => pass=false (the case the old prose
+#      eval could never express — the regression suite was green but the requested
+#      behavior was wrong). Both sub-results are recorded with quoted evidence.
+RUNID_J1="splitfail-$$"
+set +e
+MOCK_SPEND=50000 MOCK_BASELINE_RC=0 MOCK_TEST_LABEL="suite-green" \
+  MOCK_ASSERT_RC=1 MOCK_ASSERT_LABEL="behavior-wrong" run_sweep \
+    --limit 1 --run-id "$RUNID_J1" >"$WORK/j1.out" 2>&1
+J1_RC=$?
+set -e
+J1_REPORT="$ROOT/.planning/s6-sweep/$RUNID_J1.json"
+if [ "$J1_RC" -eq 0 ] && [ -f "$J1_REPORT" ]; then
+  WO="$(jq -c '.results[0].working_output' "$J1_REPORT")"
+  P="$(printf '%s' "$WO" | jq -r '.pass')"
+  BP="$(printf '%s' "$WO" | jq -r '.baseline_pass')"
+  AP="$(printf '%s' "$WO" | jq -r '.assertion_pass')"
+  AX="$(printf '%s' "$WO" | jq -r '.assertion_exit')"
+  EV="$(printf '%s' "$WO" | jq -r '.evidence')"
+  if [ "$P" = "false" ] && [ "$BP" = "true" ] && [ "$AP" = "false" ] && [ "$AX" = "1" ] \
+     && printf '%s' "$EV" | grep -q "suite-green" \
+     && printf '%s' "$EV" | grep -q "behavior-wrong"; then
+    ok "(j1) baseline PASS + assertion FAIL => working_output.pass=false (both run, both quoted)"
+  else
+    bad "(j1) split gating wrong (pass=$P baseline=$BP assertion=$AP assertion_exit=$AX)"; printf '%s\n' "$WO"
+  fi
+else
+  bad "(j1) split-fail run produced no report (rc=$J1_RC)"; cat "$WORK/j1.out"
+fi
+
+# (j2) baseline PASSES and assertion PASSES => pass=true (both gates satisfied).
+RUNID_J2="splitpass-$$"
+set +e
+MOCK_SPEND=50000 MOCK_BASELINE_RC=0 MOCK_ASSERT_RC=0 run_sweep \
+    --limit 1 --run-id "$RUNID_J2" >"$WORK/j2.out" 2>&1
+J2_RC=$?
+set -e
+J2_REPORT="$ROOT/.planning/s6-sweep/$RUNID_J2.json"
+if [ "$J2_RC" -eq 0 ] && [ -f "$J2_REPORT" ]; then
+  WO2="$(jq -c '.results[0].working_output' "$J2_REPORT")"
+  P2="$(printf '%s' "$WO2" | jq -r '.pass')"
+  BP2="$(printf '%s' "$WO2" | jq -r '.baseline_pass')"
+  AP2="$(printf '%s' "$WO2" | jq -r '.assertion_pass')"
+  if [ "$P2" = "true" ] && [ "$BP2" = "true" ] && [ "$AP2" = "true" ]; then
+    ok "(j2) baseline PASS + assertion PASS => working_output.pass=true (both gates satisfied)"
+  else
+    bad "(j2) both-pass gating wrong (pass=$P2 baseline=$BP2 assertion=$AP2)"; printf '%s\n' "$WO2"
+  fi
+else
+  bad "(j2) both-pass run produced no report (rc=$J2_RC)"; cat "$WORK/j2.out"
+fi
+
+# (j3) baseline FAILS but assertion PASSES => pass=false (the regression gate).
+RUNID_J3="basefail-$$"
+set +e
+MOCK_SPEND=50000 MOCK_BASELINE_RC=1 MOCK_ASSERT_RC=0 run_sweep \
+    --limit 1 --run-id "$RUNID_J3" >"$WORK/j3.out" 2>&1
+J3_RC=$?
+set -e
+J3_REPORT="$ROOT/.planning/s6-sweep/$RUNID_J3.json"
+if [ "$J3_RC" -eq 0 ] && [ -f "$J3_REPORT" ]; then
+  P3="$(jq -r '.results[0].working_output.pass' "$J3_REPORT")"
+  BP3="$(jq -r '.results[0].working_output.baseline_pass' "$J3_REPORT")"
+  AP3="$(jq -r '.results[0].working_output.assertion_pass' "$J3_REPORT")"
+  if [ "$P3" = "false" ] && [ "$BP3" = "false" ] && [ "$AP3" = "true" ]; then
+    ok "(j3) baseline FAIL + assertion PASS => working_output.pass=false (regression gate)"
+  else
+    bad "(j3) regression gate wrong (pass=$P3 baseline=$BP3 assertion=$AP3)"; jq '.results[0].working_output' "$J3_REPORT"
+  fi
+else
+  bad "(j3) regression-gate run produced no report (rc=$J3_RC)"; cat "$WORK/j3.out"
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -327,7 +421,7 @@ fi
 rm -f "$WORK/hmd-was-called"
 RUNID_L1="limit1-$$"
 set +e
-MOCK_SPEND=50000 MOCK_TEST_RC=0 run_sweep --limit 1 --run-id "$RUNID_L1" >"$WORK/limit1.out" 2>&1
+MOCK_SPEND=50000 MOCK_BASELINE_RC=0 MOCK_ASSERT_RC=0 run_sweep --limit 1 --run-id "$RUNID_L1" >"$WORK/limit1.out" 2>&1
 L1_RC=$?
 set -e
 L1_REPORT="$ROOT/.planning/s6-sweep/$RUNID_L1.json"
@@ -342,7 +436,7 @@ fi
 # (g) malformed manifest rejected (exit 2), spends nothing.
 # ─────────────────────────────────────────────────────────────────────────────
 BADMAN="$WORK/bad.json"
-echo '[ { "lang": "js" } ]' > "$BADMAN"   # missing repo_url/task_prompt/acceptance_cmd
+echo '[ { "lang": "js" } ]' > "$BADMAN"   # missing repo_url/task_prompt/baseline_cmd/assertion_cmd
 rm -f "$WORK/hmd-was-called"
 set +e
 "$SWEEP" --manifest "$BADMAN" --clone-cmd "$CLONE_CMD" --hmd-cmd "$HMD_CMD" \
@@ -372,7 +466,7 @@ fi
 # out OLD_SHA. The report's resolved_sha proves which commit was actually swept.
 RUNID_PIN="pintest-$$"
 set +e
-MOCK_SPEND=50000 MOCK_TEST_RC=0 run_sweep --limit 1 --run-id "$RUNID_PIN" >"$WORK/pin.out" 2>&1
+MOCK_SPEND=50000 MOCK_BASELINE_RC=0 MOCK_ASSERT_RC=0 run_sweep --limit 1 --run-id "$RUNID_PIN" >"$WORK/pin.out" 2>&1
 PIN_RC=$?
 set -e
 PIN_REPORT="$ROOT/.planning/s6-sweep/$RUNID_PIN.json"
