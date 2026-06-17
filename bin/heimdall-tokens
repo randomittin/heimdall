@@ -1,0 +1,430 @@
+#!/usr/bin/env python3
+# heimdall-tokens — GENERAL model-token accounting meter (the tiktoken-substrate).
+#
+# Reports the REAL per-run model-token usage of an `hmd`/`claude` run from the two
+# no-API-key sources confirmed available under Max auth:
+#
+#   session  — sum a Claude Code SESSION TRANSCRIPT (JSONL). Every assistant turn
+#              carries  message.usage{input_tokens, output_tokens,
+#              cache_creation_input_tokens, cache_read_input_tokens}.  This is
+#              authoritative for the FULL orchestrator `hmd` path (plain stdout,
+#              no json), whose turns are written to
+#              ~/.claude/projects/<cwd-slug>/<session_id>.jsonl.
+#   json     — parse a `claude -p --output-format json` blob's top-level
+#              .usage{...} + .total_cost_usd (the single-shot path).
+#
+# It is GENERAL: consumed by the S-6 C3 sweep's spend source NOW, by P3 later, and
+# it is the substrate behind the ~75%-savings claim. NOT a C3-only hack.
+#
+# THE METRIC (see TOKEN-METRIC.md):
+#   total_tokens = input_tokens + output_tokens
+#                + cache_creation_tokens + cache_read_tokens
+#   — FULL consumption (conservative). The 600k sweep cap is enforced on this.
+#   The comparable headline "spend-per-task" is total_cost_usd; every component is
+#   reported so nothing is hidden (cache_read typically DOMINATES — the caveat).
+#
+# HONESTY (zero fabrication): a token count is always MEASURED from the source. A
+# cost is summed ONLY from per-turn cost fields actually present in the data; when
+# the source carries no cost, total_cost_usd is null + a note — NEVER an invented
+# figure.
+#
+# FAIL-OPEN (the consumer must never be aborted by this tool): a missing or
+# malformed transcript yields a DEGRADED record (all zeros + an `error` note) and
+# exit 0 — the sweep fails open like the rest of the pipeline.
+#
+# Usage:
+#   heimdall-tokens session <jsonl-path>
+#   heimdall-tokens session --cwd <dir> [--since <ts>] [--projects-root <dir>]
+#   heimdall-tokens json <file-or-->            ('-' or omitted reads STDIN)
+#
+#   --cwd <dir>            resolve the NEWEST session JSONL for that cwd's slug
+#                          (<projects-root>/<slug>/*.jsonl, newest by mtime).
+#   --since <epoch|ts>     only consider session files modified at/after this time
+#                          (epoch seconds, or any prefix git/date accepts as @epoch
+#                          — kept simple: epoch seconds only).
+#   --projects-root <dir>  the Claude projects root (default ~/.claude/projects).
+#   -h, --help             this help.
+#
+# Output (both modes, one JSON object on stdout):
+#   {input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens,
+#    total_tokens, turns, session_id, total_cost_usd, [note], [error]}
+#
+# Exit: 0 always for session/json (degraded record on any data problem);
+#       2 only for a usage error (unknown mode / bad flags).
+import json
+import os
+import re
+import sys
+
+
+def eprint(*a):
+    print(*a, file=sys.stderr)
+
+
+def usage(code):
+    # Print the header comment block (lines after the shebang up to the first
+    # blank-comment terminator) so --help mirrors the sibling bins' convention.
+    here = os.path.abspath(__file__)
+    try:
+        with open(here, "r", encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()
+        for ln in lines[1:]:
+            if not ln.startswith("#"):
+                break
+            eprint(ln[1:].rstrip("\n").lstrip(" "))
+    except OSError:
+        eprint("heimdall-tokens — model-token meter (session JSONL + json usage)")
+    sys.exit(code)
+
+
+# The four canonical usage components, as named in the Anthropic usage object.
+_USAGE_KEYS = (
+    "input_tokens",
+    "output_tokens",
+    "cache_creation_input_tokens",
+    "cache_read_input_tokens",
+)
+# The output record's component names (cache_* shortened per the spec'd record).
+_OUT_KEYS = (
+    "input_tokens",
+    "output_tokens",
+    "cache_creation_tokens",
+    "cache_read_tokens",
+)
+# Per-turn cost fields a transcript MIGHT carry, in priority order. None is
+# guaranteed; absence => null + note (we never invent a cost).
+_COST_KEYS = ("costUSD", "total_cost_usd", "cost")
+
+
+def _as_int(v):
+    """A robust non-negative int coercion: bad/missing values count as 0."""
+    try:
+        n = int(v)
+        return n if n >= 0 else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def _as_float(v):
+    try:
+        f = float(v)
+        return f if f >= 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _empty_record():
+    return {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_creation_tokens": 0,
+        "cache_read_tokens": 0,
+        "total_tokens": 0,
+        "turns": 0,
+        "session_id": None,
+        "total_cost_usd": None,
+    }
+
+
+def _finalize(rec, summed_keys, cost_sum, cost_seen):
+    """Compute total_tokens + settle cost (summed vs honest null+note)."""
+    rec["total_tokens"] = (
+        rec["input_tokens"]
+        + rec["output_tokens"]
+        + rec["cache_creation_tokens"]
+        + rec["cache_read_tokens"]
+    )
+    if cost_seen:
+        rec["total_cost_usd"] = round(cost_sum, 6)
+    else:
+        rec["total_cost_usd"] = None
+        rec["note"] = (
+            "total_cost_usd unavailable: the source carries no per-turn cost "
+            "field; not fabricating a figure (token counts are exact)."
+        )
+    return rec
+
+
+def _extract_usage(obj):
+    """Return the usage dict from a transcript/json record, or None.
+
+    Real transcript: usage lives at message.usage on assistant turns.
+    json blob / some shapes: usage at the top level. Tolerate both.
+    """
+    if not isinstance(obj, dict):
+        return None
+    msg = obj.get("message")
+    if isinstance(msg, dict) and isinstance(msg.get("usage"), dict):
+        return msg["usage"]
+    if isinstance(obj.get("usage"), dict):
+        return obj["usage"]
+    return None
+
+
+def _extract_cost(obj):
+    """Return a per-turn cost float if any known cost field is present, else None.
+
+    Checks the top-level record AND the nested message object (transcripts vary).
+    """
+    if not isinstance(obj, dict):
+        return None
+    for k in _COST_KEYS:
+        if k in obj:
+            c = _as_float(obj[k])
+            if c is not None:
+                return c
+    msg = obj.get("message")
+    if isinstance(msg, dict):
+        for k in _COST_KEYS:
+            if k in msg:
+                c = _as_float(msg[k])
+                if c is not None:
+                    return c
+    return None
+
+
+def _slug_for_cwd(cwd):
+    """The Claude projects slug: every non-alphanumeric char -> '-'.
+
+    e.g. $HOME/proj/app -> the home dir + '/proj/app' with every non-alnum -> '-'
+         .../.worktrees/x -> ...--worktrees-x  (the '.' and '/' both -> '-')
+    """
+    return re.sub(r"[^A-Za-z0-9]", "-", cwd)
+
+
+def resolve_session_path(cwd, projects_root, since):
+    """Resolve the NEWEST session JSONL under <projects_root>/<slug>/.
+
+    Returns (path, error_or_None). Never raises.
+    """
+    slug = _slug_for_cwd(os.path.abspath(cwd))
+    sdir = os.path.join(projects_root, slug)
+    if not os.path.isdir(sdir):
+        return None, "no session dir for cwd slug %s under %s" % (slug, projects_root)
+    newest = None
+    newest_mtime = -1.0
+    try:
+        for name in os.listdir(sdir):
+            if not name.endswith(".jsonl"):
+                continue
+            p = os.path.join(sdir, name)
+            try:
+                mt = os.path.getmtime(p)
+            except OSError:
+                continue
+            if since is not None and mt < since:
+                continue
+            if mt > newest_mtime:
+                newest_mtime = mt
+                newest = p
+    except OSError as e:
+        return None, "could not list session dir %s: %s" % (sdir, e)
+    if newest is None:
+        return None, "no session JSONL found under %s (since=%s)" % (sdir, since)
+    return newest, None
+
+
+def sum_session(path):
+    """Sum every assistant turn's usage in a transcript JSONL. Fail-open.
+
+    Returns a complete record dict; on any data problem it returns a DEGRADED
+    record (zeros + an `error` note) — never raises.
+    """
+    rec = _empty_record()
+    if not path or not os.path.isfile(path):
+        rec["error"] = "session transcript not found: %s" % path
+        return _finalize(rec, _OUT_KEYS, 0.0, False)
+
+    turns = 0
+    parsed_any = False
+    cost_sum = 0.0
+    cost_seen = False
+    session_id = None
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for raw in fh:
+                line = raw.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except (ValueError, TypeError):
+                    # a single bad line never aborts the sum — skip it lazily.
+                    continue
+                parsed_any = True
+                if not isinstance(obj, dict):
+                    continue
+                if session_id is None:
+                    sid = obj.get("sessionId") or obj.get("session_id")
+                    if isinstance(sid, str) and sid:
+                        session_id = sid
+                usage = _extract_usage(obj)
+                if usage is None:
+                    continue
+                # only count turns that actually carry a usage object (assistant
+                # turns); user/system turns contribute nothing.
+                turns += 1
+                rec["input_tokens"] += _as_int(usage.get("input_tokens"))
+                rec["output_tokens"] += _as_int(usage.get("output_tokens"))
+                rec["cache_creation_tokens"] += _as_int(
+                    usage.get("cache_creation_input_tokens")
+                )
+                rec["cache_read_tokens"] += _as_int(
+                    usage.get("cache_read_input_tokens")
+                )
+                c = _extract_cost(obj)
+                if c is not None:
+                    cost_sum += c
+                    cost_seen = True
+    except OSError as e:
+        rec = _empty_record()
+        rec["error"] = "could not read session transcript %s: %s" % (path, e)
+        return _finalize(rec, _OUT_KEYS, 0.0, False)
+
+    rec["turns"] = turns
+    rec["session_id"] = session_id
+    if not parsed_any:
+        rec["error"] = (
+            "session transcript %s had no parseable JSON lines (degraded)" % path
+        )
+    return _finalize(rec, _OUT_KEYS, cost_sum, cost_seen)
+
+
+def parse_json_blob(text):
+    """Parse a `claude --output-format json` blob into the record. Fail-open."""
+    rec = _empty_record()
+    try:
+        obj = json.loads(text)
+    except (ValueError, TypeError):
+        rec["error"] = "input is not valid JSON (degraded)"
+        return _finalize(rec, _OUT_KEYS, 0.0, False)
+    if not isinstance(obj, dict):
+        rec["error"] = "JSON top level is not an object (degraded)"
+        return _finalize(rec, _OUT_KEYS, 0.0, False)
+
+    usage = _extract_usage(obj)
+    if usage is None:
+        rec["error"] = "no .usage object in the json blob (degraded)"
+        # still try to recover session_id + cost below.
+    else:
+        rec["input_tokens"] = _as_int(usage.get("input_tokens"))
+        rec["output_tokens"] = _as_int(usage.get("output_tokens"))
+        rec["cache_creation_tokens"] = _as_int(usage.get("cache_creation_input_tokens"))
+        rec["cache_read_tokens"] = _as_int(usage.get("cache_read_input_tokens"))
+        rec["turns"] = 1
+
+    sid = obj.get("session_id") or obj.get("sessionId")
+    if isinstance(sid, str) and sid:
+        rec["session_id"] = sid
+
+    # the single-shot json path carries an authoritative top-level total_cost_usd.
+    cost = None
+    for k in ("total_cost_usd", "costUSD", "cost"):
+        if k in obj:
+            cost = _as_float(obj[k])
+            if cost is not None:
+                break
+    if cost is not None:
+        return _finalize(rec, _OUT_KEYS, cost, True)
+    return _finalize(rec, _OUT_KEYS, 0.0, False)
+
+
+def cmd_session(argv):
+    path = None
+    cwd = None
+    since = None
+    projects_root = os.path.join(
+        os.path.expanduser("~"), ".claude", "projects"
+    )
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--cwd":
+            if i + 1 >= len(argv):
+                eprint("error: --cwd needs a dir")
+                usage(2)
+            cwd = argv[i + 1]
+            i += 2
+        elif a == "--since":
+            if i + 1 >= len(argv):
+                eprint("error: --since needs a value")
+                usage(2)
+            since = _as_float(argv[i + 1])
+            i += 2
+        elif a == "--projects-root":
+            if i + 1 >= len(argv):
+                eprint("error: --projects-root needs a dir")
+                usage(2)
+            projects_root = argv[i + 1]
+            i += 2
+        elif a in ("-h", "--help"):
+            usage(0)
+        elif a.startswith("-") and a != "-":
+            eprint("error: unknown option: %s" % a)
+            usage(2)
+        else:
+            path = a
+            i += 1
+
+    if path is None and cwd is not None:
+        resolved, err = resolve_session_path(cwd, projects_root, since)
+        if resolved is None:
+            rec = _empty_record()
+            rec["error"] = err
+            print(json.dumps(_finalize(rec, _OUT_KEYS, 0.0, False)))
+            return 0
+        path = resolved
+    if path is None:
+        eprint("error: session mode needs a <jsonl-path> or --cwd <dir>")
+        usage(2)
+
+    print(json.dumps(sum_session(path)))
+    return 0
+
+
+def cmd_json(argv):
+    src = "-"
+    for a in argv:
+        if a in ("-h", "--help"):
+            usage(0)
+        elif a.startswith("-") and a != "-":
+            eprint("error: unknown option: %s" % a)
+            usage(2)
+        else:
+            src = a
+    if src == "-":
+        text = sys.stdin.read()
+    else:
+        if not os.path.isfile(src):
+            rec = _empty_record()
+            rec["error"] = "json source not found: %s" % src
+            print(json.dumps(_finalize(rec, _OUT_KEYS, 0.0, False)))
+            return 0
+        try:
+            with open(src, "r", encoding="utf-8", errors="replace") as fh:
+                text = fh.read()
+        except OSError as e:
+            rec = _empty_record()
+            rec["error"] = "could not read json source %s: %s" % (src, e)
+            print(json.dumps(_finalize(rec, _OUT_KEYS, 0.0, False)))
+            return 0
+    print(json.dumps(parse_json_blob(text)))
+    return 0
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        usage(0)
+    mode = argv[0]
+    rest = argv[1:]
+    if mode == "session":
+        return cmd_session(rest)
+    if mode == "json":
+        return cmd_json(rest)
+    eprint("error: unknown mode: %s (expected 'session' or 'json')" % mode)
+    usage(2)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

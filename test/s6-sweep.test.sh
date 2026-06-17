@@ -299,6 +299,54 @@ if [ -f "$OK_REPORT" ]; then
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
+# (k) do_spend reports the REAL token total (not 0) and records the FULL
+#     breakdown for provenance — the heimdall-tokens wiring, exercised through
+#     the deterministic --spend-cmd seam (which the runner wraps into a token
+#     record whose total_tokens == the measured figure).
+# ─────────────────────────────────────────────────────────────────────────────
+# MOCK_SPEND=50000 flows through do_token_record → do_spend as the cap figure AND
+# is recorded in token_usage.total_tokens (provenance). token_spend must be the
+# real 50000, NEVER 0, and must equal token_usage.total_tokens (the cap source).
+if [ -f "$OK_REPORT" ]; then
+  TS0="$(jq -r '.results[0].token_spend' "$OK_REPORT")"
+  TU0="$(jq -r '.results[0].token_usage.total_tokens' "$OK_REPORT")"
+  if [ "$TS0" = "50000" ] && [ "$TU0" = "50000" ] \
+     && jq -e '.results[0] | has("token_usage")' "$OK_REPORT" >/dev/null; then
+    ok "(k) do_spend reports REAL total_tokens (not 0) + records full breakdown: token_spend=$TS0 == token_usage.total_tokens=$TU0"
+  else
+    bad "(k) token spend not flowing from the meter's total_tokens (token_spend=$TS0 token_usage.total_tokens=$TU0)"
+    jq '.results[0] | {token_spend, token_usage}' "$OK_REPORT"
+  fi
+  # the recorded total spend must equal the summed per-task total_tokens (the cap
+  # is enforced on this exact figure).
+  SUM_TU="$(jq '[.results[] | select(.status=="ran") | .token_usage.total_tokens] | add' "$OK_REPORT")"
+  TOTSPEND="$(jq -r '.total_token_spend' "$OK_REPORT")"
+  if [ "$SUM_TU" = "$TOTSPEND" ]; then
+    ok "(k2) total_token_spend == sum of per-task token_usage.total_tokens ($TOTSPEND)"
+  else
+    bad "(k2) total_token_spend ($TOTSPEND) != summed per-task total_tokens ($SUM_TU)"
+  fi
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# (l) the HARD CAP fail-closes on total_tokens specifically: the (c) cap test
+#     already proved an abort, but here we assert the cap figure that triggered it
+#     is the meter's total_tokens (recorded in token_usage), not a phantom 0.
+# ─────────────────────────────────────────────────────────────────────────────
+if [ -f "$CAP_REPORT" ]; then
+  # the single task that ran before the cap aborted must carry a nonzero
+  # total_tokens that is exactly the recorded total_token_spend (≤ cap).
+  CTU="$(jq -r '[.results[] | select(.status=="ran") | .token_usage.total_tokens] | add // 0' "$CAP_REPORT")"
+  CTOT="$(jq -r '.total_token_spend' "$CAP_REPORT")"
+  if [ "$CTU" -gt 0 ] && [ "$CTU" = "$CTOT" ] && [ "$CTOT" -le 60000 ]; then
+    ok "(l) cap fail-closed on REAL total_tokens (=$CTOT, nonzero, ≤ cap), not a phantom 0"
+  else
+    bad "(l) cap did not fail-close on the measured total_tokens (total_tokens=$CTU total_spend=$CTOT)"
+    jq '[.results[] | select(.status=="ran") | .token_usage]' "$CAP_REPORT"
+  fi
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
 # (e) working_output from RUNNABLE EVIDENCE, not self-report: a failing baseline
 #     command => working_output.pass=false even though the agent "ran", and the
 #     command's QUOTED output is captured as evidence.

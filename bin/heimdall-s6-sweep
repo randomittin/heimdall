@@ -61,7 +61,10 @@
 #   --hmd-cmd CMD            Override the agent run: `CMD <repo_dir> <task_prompt>`.
 #   --spend-cmd CMD          Override the token-spend source: `CMD` echoes an int.
 #   None of these are used in a real RJ-gated sweep; the defaults clone with git,
-#   run the real `hmd`, and read spend from the heimdall token ledger.
+#   run the real `hmd`, and read spend from bin/heimdall-tokens — the GENERAL
+#   model-token meter — by summing the run's session transcript (total_tokens =
+#   input+output+cache_creation+cache_read). The full breakdown is recorded per
+#   repo (token_usage), and the fail-closed cap is enforced on total_tokens.
 #
 # ── Output ────────────────────────────────────────────────────────────────────
 #   Machine-readable .planning/s6-sweep/<run-id>.json — per repo: reuse_pct,
@@ -285,17 +288,48 @@ do_hmd() {
   fi
 }
 
-# ── token spend: injected --spend-cmd, else the heimdall token ledger total ───
-do_spend() {
+# ── token spend: injected --spend-cmd, else the REAL model-token usage of the run.
+# The default source is bin/heimdall-tokens (the GENERAL token-accounting meter,
+# also consumed by P3 and the ~75%-savings claim — NOT a C3-only path). The
+# orchestrator `hmd` path writes a SESSION TRANSCRIPT to
+# ~/.claude/projects/<cwd-slug>/<session_id>.jsonl; do_token_record resolves the
+# NEWEST such transcript for the run's cwd (the repo dir) and sums EVERY assistant
+# turn's usage. The cap figure (do_spend) is that record's total_tokens
+# (input+output+cache_creation+cache_read — full consumption, conservative). The
+# FULL breakdown is recorded in the per-repo result for provenance (real measured
+# spend, never 0). Both fail OPEN: an unavailable/malformed transcript degrades to
+# a zeros record (the meter's contract), never aborting the sweep.
+#
+# do_token_record echoes a JSON record (the meter's, or a synthetic one wrapping
+# an injected --spend-cmd integer so the report still carries provenance under the
+# deterministic test seam).
+do_token_record() {
+  # $1 repo_dir (the run's cwd whose session transcript we resolve)
   if [ -n "$SPEND_CMD" ]; then
-    $SPEND_CMD
-  elif [ -x "$BIN_DIR/heimdall-ledger" ]; then
-    # the ledger's TOTAL for this run; degrade to 0 if unavailable (never abort).
-    "$BIN_DIR/heimdall-ledger" report 2>/dev/null \
-      | sed -n 's/.*TOTAL: \([0-9][0-9]*\) tokens.*/\1/p' | tail -1
+    # Test seam: --spend-cmd echoes an integer. Wrap it into a record so the
+    # report's full breakdown is well-formed (total_tokens == the injected int).
+    local injected
+    injected="$($SPEND_CMD 2>/dev/null || echo 0)"
+    case "$injected" in (*[!0-9]*|'') injected=0 ;; esac
+    jq -cn --argjson t "$injected" \
+      '{input_tokens:0, output_tokens:0, cache_creation_tokens:0,
+        cache_read_tokens:0, total_tokens:$t, turns:0, session_id:null,
+        total_cost_usd:null, note:"spend injected via --spend-cmd (test seam)"}'
+  elif [ -x "$BIN_DIR/heimdall-tokens" ]; then
+    # the run's REAL token usage from its session transcript (fail-open: the meter
+    # emits a degraded zeros record on any problem, so this never aborts).
+    "$BIN_DIR/heimdall-tokens" session --cwd "$1" 2>/dev/null \
+      || echo '{"total_tokens":0,"error":"heimdall-tokens invocation failed"}'
   else
-    echo 0
+    echo '{"total_tokens":0,"error":"heimdall-tokens not available"}'
   fi
+}
+
+# The cap-enforced spend figure: the token record's total_tokens (fail-closed cap
+# is checked on this). Degrades to 0 if the record lacks a numeric total_tokens.
+do_spend() {
+  # $1 token-record JSON
+  printf '%s' "$1" | jq -r '.total_tokens // 0' 2>/dev/null || echo 0
 }
 
 # ── clamp a captured command's output so a noisy suite cannot bloat the report ─
@@ -408,8 +442,16 @@ while [ "$i" -lt "$N_EFFECTIVE" ]; do
   # report. Each half is clamped independently, then labelled.
   EVIDENCE="baseline_cmd (exit $BASELINE_RC):"$'\n'"$(clamp_evidence "$BASELINE_OUT")"$'\n'"assertion_cmd (exit $ASSERTION_RC):"$'\n'"$(clamp_evidence "$ASSERTION_OUT")"
 
-  # ── token spend for this task (injected source or the ledger) ──
-  SPEND="$(do_spend 2>/dev/null || echo 0)"
+  # ── token spend for this task: the REAL model-token usage of the run ──
+  # do_token_record resolves this run's session transcript (cwd == the repo dir)
+  # and returns the FULL breakdown; do_spend pulls total_tokens as the cap figure
+  # (input+output+cache_creation+cache_read — full consumption, conservative). The
+  # whole record is recorded for provenance so the report shows REAL measured
+  # spend, never 0. Both fail OPEN (degraded zeros record), never aborting.
+  TOKEN_REC="$(do_token_record "$DEST" 2>/dev/null || echo '{"total_tokens":0,"error":"token record unavailable"}')"
+  printf '%s' "$TOKEN_REC" | jq -e . >/dev/null 2>&1 \
+    || TOKEN_REC='{"total_tokens":0,"error":"token record was not valid JSON"}'
+  SPEND="$(do_spend "$TOKEN_REC" 2>/dev/null || echo 0)"
   case "$SPEND" in (*[!0-9]*|'') SPEND=0 ;; esac
   TOTAL_SPEND=$(( TOTAL_SPEND + SPEND ))
   RAN=$(( RAN + 1 ))
@@ -422,7 +464,7 @@ while [ "$i" -lt "$N_EFFECTIVE" ]; do
      --argjson wopass "$WO_PASS" --arg ev "$EVIDENCE" \
      --argjson basepass "$BASELINE_PASS" --arg baserc "$BASELINE_RC" \
      --argjson asrtpass "$ASSERTION_PASS" --arg asrtrc "$ASSERTION_RC" \
-     --argjson spend "$SPEND" \
+     --argjson spend "$SPEND" --argjson tokens "$TOKEN_REC" \
      '{repo_url:$url, pinned_sha:$sha, resolved_sha:$resolved,
        task:$task, status:"ran",
        reuse_pct:$reuse, reused_symbols:$syms, reused_symbols_expected:$expect,
@@ -430,7 +472,7 @@ while [ "$i" -lt "$N_EFFECTIVE" ]; do
                        baseline_pass:$basepass, baseline_exit:($baserc|tonumber), baseline_cmd:$baseline,
                        assertion_pass:$asrtpass, assertion_exit:($asrtrc|tonumber), assertion_cmd:$assertion,
                        evidence:$ev},
-       token_spend:$spend}' >> "$RESULTS_FILE"
+       token_spend:$spend, token_usage:$tokens}' >> "$RESULTS_FILE"
 
   printf "      reuse=%s  working_output=%s  spend=%s  ${D}(cum %s/%s)${R}\n" \
     "$REUSE_PCT" "$([ "$WO_PASS" = true ] && echo PASS || echo FAIL)" "$SPEND" "$TOTAL_SPEND" "$CAP" >&2
