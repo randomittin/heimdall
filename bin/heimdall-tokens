@@ -36,6 +36,7 @@
 #   heimdall-tokens session <jsonl-path>
 #   heimdall-tokens session --cwd <dir> [--since <ts>] [--projects-root <dir>]
 #   heimdall-tokens json <file-or-->            ('-' or omitted reads STDIN)
+#   heimdall-tokens emitted <file-or-->         ('-' or omitted reads STDIN)
 #
 #   --cwd <dir>            resolve the NEWEST session JSONL for that cwd's slug
 #                          (<projects-root>/<slug>/*.jsonl, newest by mtime).
@@ -44,6 +45,20 @@
 #                          — kept simple: epoch seconds only).
 #   --projects-root <dir>  the Claude projects root (default ~/.claude/projects).
 #   -h, --help             this help.
+#
+# emitted  — read the EMITTED usage record `hmd` writes AT THE SOURCE (the locked
+#            schema {session_id, input_tokens, output_tokens, cache_creation_tokens,
+#            cache_read_tokens, total_tokens, total_cost_usd, model,
+#            usage_available, [reason]}) and return the SAME normalized record this
+#            tool emits everywhere else. This is the mode the S-6 sweep consumes:
+#            `hmd` captures its OWN run's usage at the source (no transcript glob),
+#            writes the record to $HEIMDALL_USAGE_OUT, and the sweep reads it back
+#            via `heimdall-tokens emitted <file>`. The cache_* keys are already the
+#            short names (the source record matches this tool's OUTPUT shape), so
+#            this mode re-derives total_tokens defensively and carries through the
+#            source's session_id/cost/model/usage_available. Fail-open like the
+#            others: a missing/malformed record yields a degraded zeros record,
+#            exit 0.
 #
 # Output (both modes, one JSON object on stdout):
 #   {input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens,
@@ -329,6 +344,57 @@ def parse_json_blob(text):
     return _finalize(rec, _OUT_KEYS, 0.0, False)
 
 
+def parse_emitted_record(text):
+    """Normalize the EMITTED usage record `hmd` writes at the source. Fail-open.
+
+    The emitted record already uses this tool's OUTPUT shape — the short cache_*
+    key names ({input_tokens, output_tokens, cache_creation_tokens,
+    cache_read_tokens, ...}) plus session_id / total_cost_usd / model /
+    usage_available / [reason]. We re-derive total_tokens from the four components
+    defensively (so a tampered/missing total can never under-report the cap figure)
+    and carry the source's session_id, cost, model, and usage_available through.
+    """
+    rec = _empty_record()
+    try:
+        obj = json.loads(text)
+    except (ValueError, TypeError):
+        rec["error"] = "emitted record is not valid JSON (degraded)"
+        return _finalize(rec, _OUT_KEYS, 0.0, False)
+    if not isinstance(obj, dict):
+        rec["error"] = "emitted record top level is not an object (degraded)"
+        return _finalize(rec, _OUT_KEYS, 0.0, False)
+
+    # The emitted record carries the short cache_* names directly (it IS this
+    # tool's output shape). Read them straight; bad/missing values count as 0.
+    rec["input_tokens"] = _as_int(obj.get("input_tokens"))
+    rec["output_tokens"] = _as_int(obj.get("output_tokens"))
+    rec["cache_creation_tokens"] = _as_int(obj.get("cache_creation_tokens"))
+    rec["cache_read_tokens"] = _as_int(obj.get("cache_read_tokens"))
+    # one usage-bearing run == one logical turn for downstream consumers.
+    rec["turns"] = 1
+
+    sid = obj.get("session_id") or obj.get("sessionId")
+    if isinstance(sid, str) and sid:
+        rec["session_id"] = sid
+
+    # carry the source's provenance fields through (model + the availability flag
+    # so a consumer can tell a genuinely-measured 0 from an unavailable run).
+    model = obj.get("model")
+    if isinstance(model, str) and model:
+        rec["model"] = model
+    if "usage_available" in obj:
+        rec["usage_available"] = bool(obj.get("usage_available"))
+    if obj.get("reason"):
+        rec["reason"] = obj.get("reason")
+
+    # total_tokens is ALWAYS re-derived from the four components in _finalize, so a
+    # missing/tampered source total can never under-report the conservative cap.
+    cost = _as_float(obj.get("total_cost_usd"))
+    if cost is not None:
+        return _finalize(rec, _OUT_KEYS, cost, True)
+    return _finalize(rec, _OUT_KEYS, 0.0, False)
+
+
 def cmd_session(argv):
     path = None
     cwd = None
@@ -412,6 +478,36 @@ def cmd_json(argv):
     return 0
 
 
+def cmd_emitted(argv):
+    src = "-"
+    for a in argv:
+        if a in ("-h", "--help"):
+            usage(0)
+        elif a.startswith("-") and a != "-":
+            eprint("error: unknown option: %s" % a)
+            usage(2)
+        else:
+            src = a
+    if src == "-":
+        text = sys.stdin.read()
+    else:
+        if not os.path.isfile(src):
+            rec = _empty_record()
+            rec["error"] = "emitted record not found: %s" % src
+            print(json.dumps(_finalize(rec, _OUT_KEYS, 0.0, False)))
+            return 0
+        try:
+            with open(src, "r", encoding="utf-8", errors="replace") as fh:
+                text = fh.read()
+        except OSError as e:
+            rec = _empty_record()
+            rec["error"] = "could not read emitted record %s: %s" % (src, e)
+            print(json.dumps(_finalize(rec, _OUT_KEYS, 0.0, False)))
+            return 0
+    print(json.dumps(parse_emitted_record(text)))
+    return 0
+
+
 def main(argv):
     if not argv or argv[0] in ("-h", "--help"):
         usage(0)
@@ -421,7 +517,11 @@ def main(argv):
         return cmd_session(rest)
     if mode == "json":
         return cmd_json(rest)
-    eprint("error: unknown mode: %s (expected 'session' or 'json')" % mode)
+    if mode == "emitted":
+        return cmd_emitted(rest)
+    eprint(
+        "error: unknown mode: %s (expected 'session', 'json' or 'emitted')" % mode
+    )
     usage(2)
     return 2
 

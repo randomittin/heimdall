@@ -199,6 +199,75 @@ else
   bad "(h) --cwd resolution did not pick the newest session"; printf '%s\n' "$CREC"
 fi
 
+# ── (i) emitted mode: normalize the SOURCE record hmd writes (the locked schema) ─
+# A synthetic emitted record carrying the short cache_* names + session_id + cost +
+# model + usage_available. emitted mode must return the same normalized record
+# shape, re-deriving total_tokens from the four components.
+#   in=10 out=5 cc=100 cr=900  => total=1015
+EMITTED="$WORK/emitted-known.json"
+cat > "$EMITTED" <<'EOF'
+{
+  "session_id": "emit-fixture-7001",
+  "input_tokens": 10,
+  "output_tokens": 5,
+  "cache_creation_tokens": 100,
+  "cache_read_tokens": 900,
+  "total_tokens": 1015,
+  "total_cost_usd": 0.0421,
+  "model": "claude-opus-4-8",
+  "usage_available": true
+}
+EOF
+EREC="$("$TOK" emitted "$EMITTED")"
+if printf '%s' "$EREC" | jq -e '
+    .input_tokens == 10 and .output_tokens == 5
+    and .cache_creation_tokens == 100 and .cache_read_tokens == 900
+    and .total_tokens == 1015
+    and .total_cost_usd == 0.0421
+    and .session_id == "emit-fixture-7001"
+    and .model == "claude-opus-4-8"
+    and .usage_available == true
+  ' >/dev/null 2>&1; then
+  ok "(i) emitted mode normalizes the source record (total=1015, cost=0.0421, sid+model carried)"
+else
+  bad "(i) emitted mode normalization wrong"; printf '%s\n' "$EREC"
+fi
+
+# total_tokens must be RE-DERIVED from the four components, not trusted from the
+# source: feed a record whose stated total is WRONG and assert the meter recomputes.
+EMITTED_BADTOTAL="$WORK/emitted-badtotal.json"
+cat > "$EMITTED_BADTOTAL" <<'EOF'
+{
+  "session_id": "emit-fixture-7002",
+  "input_tokens": 10,
+  "output_tokens": 5,
+  "cache_creation_tokens": 100,
+  "cache_read_tokens": 900,
+  "total_tokens": 999999,
+  "total_cost_usd": null,
+  "model": "claude-opus-4-8",
+  "usage_available": true
+}
+EOF
+EREC2="$("$TOK" emitted "$EMITTED_BADTOTAL")"
+if printf '%s' "$EREC2" | jq -e '.total_tokens == 1015' >/dev/null 2>&1; then
+  ok "(j) emitted mode RE-DERIVES total_tokens from components (ignores a tampered source total)"
+else
+  bad "(j) emitted total not re-derived"; printf '%s\n' "$EREC2"
+fi
+
+# a malformed / missing emitted record => degraded zeros record, exit 0 (fail-open).
+set +e
+EBADREC="$("$TOK" emitted "$WORK/no-such-emitted.json" 2>/dev/null)"; EBADRC=$?
+set -e
+if [ "$EBADRC" -eq 0 ] && printf '%s' "$EBADREC" | jq -e '
+    .total_tokens == 0 and (.error // "" | length > 0)
+  ' >/dev/null 2>&1; then
+  ok "(k) emitted mode missing record => degraded zeros record, exit 0 (fail-open)"
+else
+  bad "(k) emitted missing record not handled fail-open (rc=$EBADRC)"; printf '%s\n' "$EBADREC"
+fi
+
 echo
 echo "  heimdall-tokens tests: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

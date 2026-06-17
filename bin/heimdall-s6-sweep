@@ -58,13 +58,19 @@
 #
 # ── Test seams (the ONLY mocking; used by test/s6-sweep.test.sh to stay free) ─
 #   --clone-cmd CMD          Override the clone step: `CMD <repo_url> <dest>`.
-#   --hmd-cmd CMD            Override the agent run: `CMD <repo_dir> <task_prompt>`.
+#   --hmd-cmd CMD            Override the agent run: `CMD <repo_dir> <task_prompt>`;
+#                            HEIMDALL_USAGE_OUT is exported into it so a fake hmd
+#                            can write a known emitted usage record deterministically.
 #   --spend-cmd CMD          Override the token-spend source: `CMD` echoes an int.
 #   None of these are used in a real RJ-gated sweep; the defaults clone with git,
-#   run the real `hmd`, and read spend from bin/heimdall-tokens — the GENERAL
-#   model-token meter — by summing the run's session transcript (total_tokens =
-#   input+output+cache_creation+cache_read). The full breakdown is recorded per
-#   repo (token_usage), and the fail-closed cap is enforced on total_tokens.
+#   run the real `hmd` (which self-meters its OWN run's usage AT THE SOURCE and
+#   writes the emitted record to HEIMDALL_USAGE_OUT — set before the run), and read
+#   spend by normalizing THAT emitted record via bin/heimdall-tokens — the GENERAL
+#   model-token meter — (total_tokens = input+output+cache_creation+cache_read).
+#   The transcript-glob (`heimdall-tokens session --cwd`) source is REMOVED: it
+#   guessed where/when a transcript landed and failed twice with spend=0. The full
+#   breakdown is recorded per repo (token_usage); the fail-closed cap enforces on
+#   total_tokens.
 #
 # ── Output ────────────────────────────────────────────────────────────────────
 #   Machine-readable .planning/s6-sweep/<run-id>.json — per repo: reuse_pct,
@@ -94,7 +100,7 @@ else
 fi
 B='\033[1m'; R='\033[0m'
 
-usage() { sed -n '2,72p' "$SELF" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,82p' "$SELF" | sed 's/^# \{0,1\}//'; }
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 MANIFEST=""
@@ -279,32 +285,40 @@ checkout_sha() {
 }
 
 # ── agent run: injected --hmd-cmd, else the real `hmd "<task>"` in the repo ────
+# $3 is the per-repo usage-out path. We export HEIMDALL_USAGE_OUT so the run emits
+# its OWN usage record there AT THE SOURCE (hmd self-meters its session_id+usage;
+# see TOKEN-METRIC.md). The injected --hmd-cmd test seam also sees the env var, so
+# a fake hmd can write a known emitted record to it deterministically.
 do_hmd() {
-  # $1 repo_dir ; $2 task_prompt
+  # $1 repo_dir ; $2 task_prompt ; $3 usage_out path
   if [ -n "$HMD_CMD" ]; then
-    $HMD_CMD "$1" "$2"
+    HEIMDALL_USAGE_OUT="$3" $HMD_CMD "$1" "$2"
   else
-    ( cd "$1" && "$BIN_DIR/hmd" "$2" )
+    ( cd "$1" && HEIMDALL_USAGE_OUT="$3" "$BIN_DIR/hmd" "$2" )
   fi
 }
 
-# ── token spend: injected --spend-cmd, else the REAL model-token usage of the run.
-# The default source is bin/heimdall-tokens (the GENERAL token-accounting meter,
-# also consumed by P3 and the ~75%-savings claim — NOT a C3-only path). The
-# orchestrator `hmd` path writes a SESSION TRANSCRIPT to
-# ~/.claude/projects/<cwd-slug>/<session_id>.jsonl; do_token_record resolves the
-# NEWEST such transcript for the run's cwd (the repo dir) and sums EVERY assistant
-# turn's usage. The cap figure (do_spend) is that record's total_tokens
-# (input+output+cache_creation+cache_read — full consumption, conservative). The
-# FULL breakdown is recorded in the per-repo result for provenance (real measured
-# spend, never 0). Both fail OPEN: an unavailable/malformed transcript degrades to
-# a zeros record (the meter's contract), never aborting the sweep.
+# ── token spend: injected --spend-cmd, else the REAL model-token usage of the run,
+# read from the EMITTED usage record hmd wrote AT THE SOURCE.
 #
-# do_token_record echoes a JSON record (the meter's, or a synthetic one wrapping
-# an injected --spend-cmd integer so the report still carries provenance under the
-# deterministic test seam).
+# The default source is bin/heimdall-tokens (the GENERAL token-accounting meter,
+# also consumed by P3, the statusline gauge, and the ~75%-savings claim — NOT a
+# C3-only path). The mechanism: BEFORE do_hmd, the caller sets HEIMDALL_USAGE_OUT
+# to a per-repo temp path; the run self-meters its OWN session usage and writes the
+# locked record there (no transcript glob — the broken mechanism that failed twice
+# with spend=0 is GONE). do_token_record then normalizes THAT emitted record via
+# `heimdall-tokens emitted <file>`. The cap figure (do_spend) is the record's
+# total_tokens (input+output+cache_creation+cache_read — full consumption,
+# conservative). The FULL breakdown is recorded in the per-repo result for
+# provenance (real measured spend, never 0). Fail OPEN: a missing/malformed emitted
+# record degrades to a zeros record (the meter's contract), never aborting the
+# sweep.
+#
+# do_token_record echoes a JSON record (the meter's normalized emitted record, or a
+# synthetic one wrapping an injected --spend-cmd integer so the report still
+# carries provenance under the deterministic test seam).
 do_token_record() {
-  # $1 repo_dir (the run's cwd whose session transcript we resolve)
+  # $1 usage-out path (where this run emitted its own usage record)
   if [ -n "$SPEND_CMD" ]; then
     # Test seam: --spend-cmd echoes an integer. Wrap it into a record so the
     # report's full breakdown is well-formed (total_tokens == the injected int).
@@ -316,9 +330,10 @@ do_token_record() {
         cache_read_tokens:0, total_tokens:$t, turns:0, session_id:null,
         total_cost_usd:null, note:"spend injected via --spend-cmd (test seam)"}'
   elif [ -x "$BIN_DIR/heimdall-tokens" ]; then
-    # the run's REAL token usage from its session transcript (fail-open: the meter
-    # emits a degraded zeros record on any problem, so this never aborts).
-    "$BIN_DIR/heimdall-tokens" session --cwd "$1" 2>/dev/null \
+    # the run's REAL token usage from the EMITTED record it wrote at the source
+    # (fail-open: the meter emits a degraded zeros record on any problem, so this
+    # never aborts).
+    "$BIN_DIR/heimdall-tokens" emitted "$1" 2>/dev/null \
       || echo '{"total_tokens":0,"error":"heimdall-tokens invocation failed"}'
   else
     echo '{"total_tokens":0,"error":"heimdall-tokens not available"}'
@@ -411,7 +426,10 @@ while [ "$i" -lt "$N_EFFECTIVE" ]; do
   BASE="$(git -C "$DEST" rev-parse HEAD 2>/dev/null || echo "")"
 
   # ── run the agent against the cold repo ──
-  do_hmd "$DEST" "$task" >/dev/null 2>&1 || true
+  # Per-repo usage-out path: the run self-meters its OWN usage AT THE SOURCE and
+  # writes the emitted record here (set BEFORE the run, read after — no glob).
+  USAGE_OUT="$WORK_ROOT/usage-$i.json"
+  do_hmd "$DEST" "$task" "$USAGE_OUT" >/dev/null 2>&1 || true
 
   # ── measure REUSE over the run's diff (real metric, never canned) ──
   RID="${RUN_ID}-repo$i"
@@ -443,12 +461,13 @@ while [ "$i" -lt "$N_EFFECTIVE" ]; do
   EVIDENCE="baseline_cmd (exit $BASELINE_RC):"$'\n'"$(clamp_evidence "$BASELINE_OUT")"$'\n'"assertion_cmd (exit $ASSERTION_RC):"$'\n'"$(clamp_evidence "$ASSERTION_OUT")"
 
   # ── token spend for this task: the REAL model-token usage of the run ──
-  # do_token_record resolves this run's session transcript (cwd == the repo dir)
-  # and returns the FULL breakdown; do_spend pulls total_tokens as the cap figure
+  # do_token_record reads the EMITTED usage record this run wrote at the source
+  # (USAGE_OUT, set before do_hmd — no transcript glob) and returns the FULL
+  # breakdown; do_spend pulls total_tokens as the cap figure
   # (input+output+cache_creation+cache_read — full consumption, conservative). The
   # whole record is recorded for provenance so the report shows REAL measured
   # spend, never 0. Both fail OPEN (degraded zeros record), never aborting.
-  TOKEN_REC="$(do_token_record "$DEST" 2>/dev/null || echo '{"total_tokens":0,"error":"token record unavailable"}')"
+  TOKEN_REC="$(do_token_record "$USAGE_OUT" 2>/dev/null || echo '{"total_tokens":0,"error":"token record unavailable"}')"
   printf '%s' "$TOKEN_REC" | jq -e . >/dev/null 2>&1 \
     || TOKEN_REC='{"total_tokens":0,"error":"token record was not valid JSON"}'
   SPEND="$(do_spend "$TOKEN_REC" 2>/dev/null || echo 0)"
