@@ -1,0 +1,54 @@
+# .gitleaks.toml — Heimdall's gitleaks config (the SINGLE source of truth for the
+# secret scan honored by BOTH bare `gitleaks detect` AND bin/heimdall-selfscan).
+#
+# Why this file exists: Heimdall ships its OWN secret-detection corpus. The
+# secret-scan gate, the demo's deny→fix→retry walkthrough, and the test harnesses
+# all MUST contain secret-SHAPED strings — otherwise they could not prove the
+# gate catches secrets. Those fixtures are not real credentials; they are the
+# test material that proves real credentials get caught.
+#
+# Without this allowlist, a config-blind scan flags Heimdall's own fixtures as
+# leaks (the "14 false positives" that blocked every push). Bare gitleaks
+# auto-discovers this file at the source root, so the human path was already
+# clean; heimdall-selfscan now passes `--config` explicitly so the gate path
+# scans IDENTICALLY. The two AGREE.
+#
+# DISCIPLINE — this is an allowlist, NOT an escape hatch:
+#   - `useDefault = true` keeps the FULL built-in ruleset ON. Real secrets in
+#     real code are still caught. We never disable a rule.
+#   - Allowlisting is by PATH only, scoped to the known fixture-bearing files.
+#     A secret in any non-fixture path (e.g. src/, lib/, a config) still fires.
+#   - Do NOT add broad globs (e.g. `bin/.*`) — that would blind the gate to a
+#     genuinely leaked credential checked in beside a fixture. Add the SPECIFIC
+#     fixture file, with a comment naming the fixture it carries.
+
+title = "Heimdall secret-scan config"
+
+[extend]
+# Keep gitleaks' entire built-in ruleset active. We only ADD an allowlist below;
+# we never remove or weaken a rule.
+useDefault = true
+
+[allowlist]
+description = "Heimdall's own secret-detection fixtures — test material, not real credentials."
+
+# Paths are matched against the file path of each finding. Each entry is a
+# SPECIFIC fixture-bearing file; widen this list only with a named justification.
+paths = [
+  # The demo assembles a gitleaks-shaped Stripe `sk_live_` key at runtime to give
+  # the REAL secret-scan gate a real staged diff to catch in its deny→fix walk.
+  '''bin/heimdall-demo''',
+  # The staged-diff secret-scan gate: its header/docs carry example secret shapes.
+  '''bin/secret-scan''',
+  # The strict-mode landmine linter and its test fixture carry sample patterns.
+  '''bin/heimdall-landmine-lint''',
+  '''test/landmine-lint\.test\.sh''',
+  # The corpus / falsify detection harnesses plant secret-shaped strings to
+  # measure catch-rate; that is their purpose.
+  '''bin/corpus''',
+  '''bin/corpus-capture''',
+  '''bin/falsify''',
+  # This very test plants a real-shaped secret in a throwaway repo to prove
+  # detection still works; allowlist its own path so it is not self-flagged.
+  '''test/selfscan\.test\.sh''',
+]
