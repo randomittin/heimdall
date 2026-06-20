@@ -30,10 +30,17 @@
 #      benign content). The gate must NOT block on heimdall's internals: it must
 #      recognize it is not the heimdall repo and exit 0.
 #
-#   C. STILL-DETECTS — plant a REAL-shaped secret as a committed blob in a
-#      throwaway repo whose top IS made to look like heimdall, and confirm the
-#      secret path is still caught by a config-honoring scan (detection is not
-#      weakened by the allowlist).
+#   C. STILL-DETECTS — under the SHIPPED .gitleaks.toml (the exact config the
+#      gate honors), prove BOTH halves of "the allowlist is a scalpel, not a
+#      blanket": (i) the SAME secret committed to a NON-fixture path (src/) IS
+#      flagged (detection intact, allowlist narrow), AND (ii) a committed COPY of
+#      that secret in an allowlisted fixture path is NOT flagged (the allowlist
+#      works). The secret must be one gitleaks' DEFAULT ruleset actually fires on:
+#      note AWS's canonical doc key AKIA…EXAMPLE is excluded by gitleaks' OWN
+#      built-in example filter regardless of config, so committing it proves
+#      nothing about our allowlist. We use a live Stripe-shaped token (rule
+#      stripe-access-token), assembled at runtime so this file carries no
+#      contiguous literal.
 #
 #   D. ALLOWLIST-IS-NARROW — the shipped .gitleaks.toml must NOT globally disable
 #      any rule; it may only allowlist by PATH/regex. A real secret in a
@@ -116,26 +123,46 @@ mkdir -p "$DETECT"
 # Use the repo's own .gitleaks.toml so we test the EXACT config selfscan honors.
 CFG="$REPO/.gitleaks.toml"
 [ -f "$CFG" ] || { bad "C — .gitleaks.toml missing at repo top; selfscan has no allowlist to honor"; CFG=""; }
+# A real-shaped Stripe live token (rule: stripe-access-token) — one gitleaks'
+# DEFAULT ruleset actually fires on. Assembled from parts so this script carries
+# no contiguous literal. (AWS's AKIA…EXAMPLE doc key is gitleaks-allowlisted by
+# its own built-in example filter, so it can never prove our allowlist's narrowness.)
+sk="sk_live_""4eC39HqLyjWDarjtT1zdp7dc"
+# The non-fixture path the secret must STILL be caught in.
+LEAK_PATH="src/leak.js"
+# An allowlisted fixture path from the shipped .gitleaks.toml — a COPY of the
+# same secret here must NOT be flagged (proves the allowlist actually allowlists).
+FIXTURE_PATH="bin/heimdall-demo"
 (
   cd "$DETECT"
   git init -q
   git config user.email "rj@runheimdall.dev"
   git config user.name "RJ"
-  # A real-shaped AWS key in a NON-fixture path (src/), assembled from parts so
-  # this script carries no contiguous literal.
-  akia="AKIA""IOSFODNN7""EXAMPLE"
-  mkdir -p src
-  printf 'aws_access_key_id = "%s"\n' "$akia" > src/config.txt
-  git add src/config.txt
-  git commit -q -m "real-shaped secret in a non-fixture path"
+  mkdir -p "$(dirname "$LEAK_PATH")" "$(dirname "$FIXTURE_PATH")"
+  printf 'const key = "%s";\n' "$sk" > "$LEAK_PATH"
+  printf 'demo_runtime_key="%s"\n' "$sk" > "$FIXTURE_PATH"
+  git add -A
+  git commit -q -m "real Stripe secret: one in src/ (must fire), one in an allowlisted fixture path (must not)"
 )
 if [ -n "$CFG" ]; then
-  detect_rc=0
-  ( cd "$DETECT" && gitleaks detect --source . --config "$CFG" --log-opts="--all" --no-banner ) >/dev/null 2>&1 || detect_rc=$?
-  if [ "$detect_rc" -ne 0 ]; then
-    ok "real-shaped secret in src/ still CAUGHT under heimdall's config (rc=$detect_rc)"
+  # Capture which files the SHIPPED config flags over committed history. Write the
+  # JSON report to a real file (gitleaks' /dev/stdout report path is unreliable —
+  # the findings can be swallowed), then read back the flagged File paths.
+  RPT="$WORK/detect-report.json"
+  ( cd "$DETECT" && gitleaks detect --source . --config "$CFG" --log-opts="--all" --no-banner --report-format json --report-path "$RPT" ) >/dev/null 2>&1
+  FOUND_FILES="$( [ -f "$RPT" ] && cat "$RPT" || echo '[]' )"
+  # (i) detection intact: the non-fixture src/ path MUST be flagged.
+  if printf '%s' "$FOUND_FILES" | grep -Fq "$LEAK_PATH"; then
+    ok "real Stripe secret in $LEAK_PATH still CAUGHT under heimdall's shipped config"
   else
-    bad "real-shaped secret in src/ NOT caught — allowlist is too broad / detection weakened"
+    bad "real secret in $LEAK_PATH NOT caught — detection weakened / config too broad"
+  fi
+  # (ii) allowlist narrow + actually works: the SAME secret in the allowlisted
+  # fixture path must NOT be flagged.
+  if printf '%s' "$FOUND_FILES" | grep -Fq "$FIXTURE_PATH"; then
+    bad "allowlisted fixture path $FIXTURE_PATH was FLAGGED — the path allowlist is not taking effect"
+  else
+    ok "identical secret in allowlisted $FIXTURE_PATH NOT flagged (allowlist works, scoped to the fixture)"
   fi
 fi
 
