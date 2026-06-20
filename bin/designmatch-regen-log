@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# designmatch-regen-log — thin CLI over bin/lib/regen_log.py.
+#
+# The hash-log is BOTH the change-detection gate AND the provenance record for
+# designmatch v2's regenerate pipeline (READ steps 1-2). This wrapper just locates
+# the Python lib next to itself (relocatable — no baked path) and forwards argv;
+# all logic lives in regen_log.py. The regenerate path calls this to decide whether
+# a screen needs regenerating (`changed`) and to stamp provenance (`record`).
+#
+# Usage (see `--help` / the lib header for the full contract):
+#   designmatch-regen-log [--ledger PATH] hash       <canonical-file>
+#   designmatch-regen-log [--ledger PATH] changed    <screen> <canonical-file>
+#   designmatch-regen-log [--ledger PATH] record     <screen> <canonical-file> <generated-output>
+#   designmatch-regen-log [--ledger PATH] provenance <screen>
+#   designmatch-regen-log [--ledger PATH] list
+#
+# Exit codes (passed through from the lib):
+#   0  ok / changed (regenerate)   1  unchanged (no-op)   2  usage
+#   3  no such recorded screen     4  runtime error (missing canonical / interrupted)
+
+set -euo pipefail
+
+# Resolve this script's own dir (relocatable; works via PATH or a direct path).
+SELF="$0"
+case "$SELF" in
+  */*) : ;;
+  *) SELF="$(command -v "$SELF" 2>/dev/null || echo "$SELF")" ;;
+esac
+BIN_DIR="$(cd "$(dirname "$SELF")" 2>/dev/null && pwd)"
+LIB="$BIN_DIR/lib/regen_log.py"
+
+if [ ! -f "$LIB" ]; then
+  echo "designmatch-regen-log: cannot find lib at $LIB" >&2
+  exit 4
+fi
+
+# Pick a python3 interpreter; fail loudly (not silently) if none is present.
+PY="$(command -v python3 || command -v python || true)"
+if [ -z "$PY" ]; then
+  echo "designmatch-regen-log: python3 not found on PATH" >&2
+  exit 4
+fi
+
+# Forward all args. The lib owns the exit code (0/1/2/3/4) — capture and re-exit
+# with it so the no-op (`unchanged` => 1) and gate semantics survive the wrapper.
+set +e
+"$PY" "$LIB" "$@"
+rc=$?
+set -e
+exit "$rc"
