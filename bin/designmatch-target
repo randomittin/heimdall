@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+# designmatch-target — thin CLI over the language-pluggable target seam
+# (bin/lib/designmatch_targets/). The designmatch v2 regenerate path calls this
+# to GENERATE a fresh component in the target language (RN at launch) from a
+# canonical, and the seam test uses `list` to assert the registry shape.
+#
+# Adding a second target (Flutter/Kotlin/Swift) is implementing the Target
+# interface + a `register(...)` call in a new module under designmatch_targets/ —
+# this CLI and the regen pipeline are NOT edited.
+#
+# Usage:
+#   designmatch-target list                                  # registered targets
+#   designmatch-target generate <target> <screen> <canonical-file> [--out FILE]
+#   designmatch-target ext <target>                          # file extension
+#   designmatch-target -h | --help
+#
+# Exit codes:
+#   0  ok
+#   2  usage error
+#   3  no such target / canonical not found
+#   4  runtime error (missing lib / interpreter)
+
+set -euo pipefail
+
+# Resolve this script's own dir (RELOCATABLE — no baked path).
+SELF="$0"
+case "$SELF" in
+  */*) : ;;
+  *)   SELF="$(command -v "$SELF" 2>/dev/null || echo "$SELF")" ;;
+esac
+BIN_DIR="$(cd "$(dirname "$SELF")" 2>/dev/null && pwd)"
+LIB_DIR="$BIN_DIR/lib"
+
+if [ ! -d "$LIB_DIR/designmatch_targets" ]; then
+  echo "designmatch-target: seam not found at $LIB_DIR/designmatch_targets" >&2
+  exit 4
+fi
+
+PY="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)"
+if [ -z "$PY" ]; then
+  echo "designmatch-target: python3 not found on PATH" >&2
+  exit 4
+fi
+
+usage() { sed -n '2,20p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+CMD="${1:-help}"
+[ $# -gt 0 ] && shift || true
+
+case "$CMD" in
+  -h|--help|help)
+    usage
+    exit 0
+    ;;
+  list)
+    PYTHONPATH="$LIB_DIR${PYTHONPATH:+:$PYTHONPATH}" "$PY" - <<'PY'
+import designmatch_targets as t
+for name in t.available():
+    tgt = t.get_target(name)
+    print("%s\t%s\t%s" % (name, tgt.language, tgt.extension))
+PY
+    ;;
+  ext)
+    [ $# -ge 1 ] || { echo "designmatch-target: ext needs <target>" >&2; exit 2; }
+    TARGET="$1"
+    set +e
+    OUT="$(PYTHONPATH="$LIB_DIR${PYTHONPATH:+:$PYTHONPATH}" "$PY" - "$TARGET" <<'PY' 2>&1
+import sys
+import designmatch_targets as t
+try:
+    print(t.get_target(sys.argv[1]).extension)
+except KeyError as e:
+    sys.stderr.write(str(e) + "\n")
+    sys.exit(3)
+PY
+)"
+    rc=$?
+    set -e
+    printf '%s\n' "$OUT"
+    exit "$rc"
+    ;;
+  generate)
+    [ $# -ge 3 ] || { echo "designmatch-target: generate needs <target> <screen> <canonical-file> [--out FILE]" >&2; exit 2; }
+    TARGET="$1"; SCREEN="$2"; CANON="$3"; shift 3
+    OUT_FILE=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --out) OUT_FILE="${2:-}"; shift 2 ;;
+        *) echo "designmatch-target: unknown flag: $1" >&2; exit 2 ;;
+      esac
+    done
+    [ -f "$CANON" ] || { echo "designmatch-target: canonical not found: $CANON" >&2; exit 3; }
+
+    set +e
+    GEN="$(PYTHONPATH="$LIB_DIR${PYTHONPATH:+:$PYTHONPATH}" "$PY" - "$TARGET" "$SCREEN" "$CANON" <<'PY' 2>&1
+import sys
+import designmatch_targets as t
+
+target_name, screen, canon_path = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    target = t.get_target(target_name)
+except KeyError as e:
+    sys.stderr.write(str(e) + "\n")
+    sys.exit(3)
+with open(canon_path, "r", encoding="utf-8", errors="surrogateescape") as fh:
+    src = fh.read()
+sys.stdout.write(target.generate(src, screen))
+PY
+)"
+    rc=$?
+    set -e
+    if [ "$rc" -ne 0 ]; then
+      printf '%s\n' "$GEN" >&2
+      exit "$rc"
+    fi
+    if [ -n "$OUT_FILE" ]; then
+      mkdir -p "$(dirname "$OUT_FILE")"
+      printf '%s' "$GEN" > "$OUT_FILE"
+      echo "designmatch-target: wrote $OUT_FILE" >&2
+    else
+      printf '%s' "$GEN"
+    fi
+    ;;
+  *)
+    echo "designmatch-target: unknown command: $CMD" >&2
+    usage >&2
+    exit 2
+    ;;
+esac

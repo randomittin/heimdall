@@ -30,13 +30,22 @@ SELF="$0"
 if command -v readlink &>/dev/null; then
   SELF=$(readlink -f "$0" 2>/dev/null || readlink "$0" 2>/dev/null || echo "$0")
 fi
-PLUGIN_DIR="$(cd "$(dirname "$SELF")/.." && pwd)"
+BIN_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+PLUGIN_DIR="$(cd "$BIN_DIR/.." && pwd)"
 SKILL_DIR="$PLUGIN_DIR/skills/designmatch"
 ASSET_VQA="$SKILL_DIR/assets/visual-qa.ts"
 SCRIPT_RENDER="$SKILL_DIR/scripts/render-canonical.js"
 SCRIPT_DIFF="$SKILL_DIR/scripts/visual-diff.js"
 SCRIPT_ITERATE="$SKILL_DIR/scripts/iterate-screen.sh"
 SCRIPT_FETCH="$SKILL_DIR/scripts/fetch-canonical.js"
+
+# designmatch v2 regenerate pipeline — sibling helper CLIs (RELOCATABLE, no baked
+# path). The regen path consumes the ALREADY-MERGED hash-log + behavioral-diff and
+# the language-pluggable target seam; it reuses the EXISTING visual-diff harness
+# ($SCRIPT_DIFF) for the visual half of the dual-gate.
+BIN_REGEN_LOG="$BIN_DIR/designmatch-regen-log"
+BIN_BEHAVIORAL_DIFF="$BIN_DIR/designmatch-behavioral-diff"
+BIN_TARGET="$BIN_DIR/designmatch-target"
 
 red()    { printf "\033[31m%s\033[0m" "$*"; }
 green()  { printf "\033[32m%s\033[0m" "$*"; }
@@ -60,8 +69,21 @@ Usage:
   designmatch render <src> --out <png> [--state <json>] [--screen <n>] [--wait <ms|sel>]
   designmatch diff <canonical.png> <native.png> --out-dir <dir> [--threshold <n>]
   designmatch iterate <ScreenName> [--platform android|ios] [--device <id>]
+  designmatch regen <Screen> --canonical <file> [--old <file>] [--out <file>]
+                    [--migrated <file>] [--target rn] [--ledger <path>]
+                    [--canonical-png <png>] [--native-png <png>] [--visual-result pass|fail]
+  designmatch regen-all [--app-dir <path>] [--target rn] [--ledger <path>]
+  designmatch regen-gate <Screen> --migrated <file> [--tmp-dir <dir>] [--canonical <file>]
+                    [--canonical-png <png>] [--native-png <png>] [--visual-result pass|fail]
   designmatch action-types
   designmatch help
+
+designmatch v2 — REGENERATE (don't retrofit):
+  regen detects a changed design (hash-log), QUARANTINES the old component to tmp
+  (moved, never deleted — the sole behavior source), GENERATES a fresh component
+  in the target language (RN) via the language seam, you MIGRATE behavior back in,
+  then a DUAL-GATE (visual SSIM≥0.95/pixelDiff≤5% AND behavioral-diff K=0 with
+  honest coverage) releases the old file from tmp. Old leaves tmp ONLY on both.
 
 Quick start — URL in, ready-to-translate out:
   designmatch init "https://api.anthropic.com/v1/design/h/HASH?open_file=App.html" \\
@@ -643,6 +665,471 @@ cmd_port() {
   fi
 }
 
+# ═══════════════════════════════════════════════════════════════════════════
+# designmatch v2 — REGENERATE pipeline (regenerate, don't retrofit)
+# ═══════════════════════════════════════════════════════════════════════════
+# Flow (per the v2 spec):
+#   changed? → quarantine old → generate fresh (seam) → migrate → DUAL-GATE → release
+#
+#   a. hash-log `changed <Screen> <canonical>`: exit 1 (unchanged) ⇒ NO-OP (never
+#      churn an unmoved design). Only exit 0 (changed/new) proceeds.
+#   b. QUARANTINE the old component FIRST: MOVE (never delete) to
+#      .designmatch/tmp/<Screen>.<ts>/ + a manifest (what/why/when). The old file
+#      is the SOLE behavior source — it must survive until migration is PROVEN.
+#   c. GENERATE a fresh component in the target language (RN) from the canonical
+#      via the language seam — a NEW file, never by editing the old.
+#   d. MIGRATE behavior (handlers/state/API/nav/effects/props) from the
+#      quarantined old into the fresh. (Migration is agent/structured-port; the
+#      GATE below is what proves it — this pipeline does NOT fake it.)
+#   e. DUAL-GATE: the old file leaves tmp ONLY when BOTH pass —
+#        (visual)     existing SSIM≥0.95 OR pixelDiff≤5% harness, AND
+#        (behavioral) behavioral-diff K==0 with HONEST coverage (low-confidence
+#                     parse never yields a false green).
+#      On pass: release (rm from tmp) + hash-log `record` (advance gate + stamp
+#      provenance). NEVER release on visual-alone.
+#
+# Helpers below keep every path GUARDED and every exit code CAPTURED (landmine-
+# clean). The regen funcs take explicit flags so the deterministic test can drive
+# the whole pipeline without a live RN app / emulator.
+
+# Resolve the per-app .designmatch dir (default: <app-dir>/.designmatch).
+regen_designmatch_dir() {
+  local app_dir="$1"
+  echo "$app_dir/.designmatch"
+}
+
+# Quarantine the old component: MOVE it (never delete) into a timestamped tmp
+# holding dir, and write a manifest of what/why/when. Echoes the tmp dir path on
+# stdout. The old file MUST be gone from its original place afterwards (moved) and
+# present under tmp (recoverable).
+regen_quarantine() {
+  # regen_quarantine <dm_dir> <screen> <old_file> <canonical> <reason>
+  local dm_dir="$1" screen="$2" old_file="$3" canonical="$4" reason="$5"
+  local ts; ts=$(date -u +"%Y%m%dT%H%M%SZ")
+  local tmp_dir="$dm_dir/tmp/$screen.$ts"
+  mkdir -p "$tmp_dir"
+
+  local base; base=$(basename "$old_file")
+  local dest="$tmp_dir/$base"
+  # MOVE — the cardinal rule. Never `rm` the old file here.
+  mv "$old_file" "$dest"
+
+  local now; now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  cat > "$tmp_dir/manifest.json" <<JSON
+{
+  "screen": "$screen",
+  "quarantined_file": "$base",
+  "original_path": "$old_file",
+  "canonical_path": "$canonical",
+  "reason": "$reason",
+  "quarantined_at": "$now",
+  "released": false,
+  "dual_gate": { "visual": null, "behavioral": null }
+}
+JSON
+
+  # Append a per-app quarantine ledger line (jsonl) so multiple screens accrue an
+  # auditable trail of what is/was quarantined and why.
+  mkdir -p "$dm_dir/tmp"
+  printf '{"screen":"%s","tmp_dir":"%s","original_path":"%s","reason":"%s","quarantined_at":"%s"}\n' \
+    "$screen" "$tmp_dir" "$old_file" "$reason" "$now" >> "$dm_dir/tmp/manifest.jsonl"
+
+  echo "$tmp_dir"
+}
+
+# Update a key in a quarantine manifest.json (visual/behavioral verdict, release).
+regen_manifest_set() {
+  # regen_manifest_set <manifest.json> <jq-style python kv assignment script>
+  local manifest="$1" pyset="$2"
+  command -v python3 >/dev/null || return 0
+  python3 - "$manifest" "$pyset" <<'PY' 2>/dev/null || true
+import json, sys
+path, expr = sys.argv[1], sys.argv[2]
+try:
+    with open(path) as fh:
+        m = json.load(fh)
+except Exception:
+    sys.exit(0)
+# expr is "a.b=value" lines separated by ';'
+for assign in expr.split(";"):
+    assign = assign.strip()
+    if not assign or "=" not in assign:
+        continue
+    key, val = assign.split("=", 1)
+    val = val.strip()
+    if val == "true":
+        v = True
+    elif val == "false":
+        v = False
+    elif val == "null":
+        v = None
+    else:
+        try:
+            v = json.loads(val)
+        except Exception:
+            v = val
+    node = m
+    parts = key.strip().split(".")
+    for p in parts[:-1]:
+        node = node.setdefault(p, {})
+    node[parts[-1]] = v
+with open(path, "w") as fh:
+    json.dump(m, fh, indent=2)
+PY
+}
+
+# VISUAL half of the dual-gate. Reuses the EXISTING visual-diff harness
+# ($SCRIPT_DIFF / skills/designmatch/scripts/visual-diff.js: SSIM≥0.95 OR
+# pixelDiff≤5%). Returns 0 = visual pass, 1 = visual fail.
+#   --canonical-png/--native-png → real harness run (exit code is the verdict).
+#   --visual-result pass|fail    → inject the verdict (deterministic test seam;
+#                                  the harness's own metrics.json `pass` is the
+#                                  contract being injected — the behavioral gate
+#                                  is NEVER injected, it is always real).
+regen_visual_gate() {
+  # regen_visual_gate <canonical_png> <native_png> <out_dir> <inject>
+  local canonical_png="$1" native_png="$2" out_dir="$3" inject="$4"
+
+  if [ -n "$inject" ]; then
+    case "$inject" in
+      pass) info "visual gate: injected PASS (test seam — harness contract: SSIM≥0.95 OR pixelDiff≤5%)"; return 0 ;;
+      fail) info "visual gate: injected FAIL (test seam)"; return 1 ;;
+      *) die "invalid --visual-result: $inject (want pass|fail)" ;;
+    esac
+  fi
+
+  command -v node >/dev/null || die "node required for the visual gate (visual-diff harness)"
+  [ -f "$SCRIPT_DIFF" ] || die "missing visual harness: $SCRIPT_DIFF"
+  [ -f "$canonical_png" ] || die "visual gate: canonical png not found: $canonical_png"
+  [ -f "$native_png" ] || die "visual gate: native png not found: $native_png"
+  mkdir -p "$out_dir"
+
+  # Capture the harness exit code (0=pass, 1=fail) without aborting under set -e.
+  set +e
+  node "$SCRIPT_DIFF" --canonical "$canonical_png" --native "$native_png" --out-dir "$out_dir" >/dev/null 2>&1
+  local rc=$?
+  set -e
+  return "$rc"
+}
+
+# BEHAVIORAL half of the dual-gate — ALWAYS REAL (never injected). Runs the merged
+# behavioral-diff over (quarantined-old, migrated-new): K==0 to pass, AND honest
+# coverage (a low-confidence parse is NOT a confident green → blocked/warned).
+# Echoes the record JSON on stdout (caller surfaces coverage). Returns:
+#   0 = behavioral pass (K==0 and confident),  1 = blocked (K>0 OR low-confidence).
+regen_behavioral_gate() {
+  # regen_behavioral_gate <old_file> <new_file>  (echoes record JSON; rc 0/1)
+  local old_file="$1" new_file="$2"
+  [ -x "$BIN_BEHAVIORAL_DIFF" ] || { echo "designmatch: behavioral-diff CLI missing at $BIN_BEHAVIORAL_DIFF" >&2; return 1; }
+
+  set +e
+  local record
+  record="$("$BIN_BEHAVIORAL_DIFF" "$old_file" "$new_file" --quiet)"
+  local bd_rc=$?
+  set -e
+
+  # bd_rc: 0 clean (K==0), 3 blocked (K>0), 2 usage. Map usage to blocked.
+  printf '%s\n' "$record"
+
+  if [ "$bd_rc" -eq 2 ]; then
+    echo "designmatch: behavioral-diff usage error" >&2
+    return 1
+  fi
+
+  # Honest coverage: a low-confidence parse is a FALSE GREEN if we let K==0 pass.
+  # Block on low_confidence even when K==0.
+  local low_conf="false"
+  if command -v python3 >/dev/null; then
+    low_conf="$(printf '%s' "$record" | python3 -c 'import json,sys
+try:
+    r=json.load(sys.stdin)
+    print("true" if r.get("low_confidence") else "false")
+except Exception:
+    print("true")' 2>/dev/null || echo "true")"
+  fi
+
+  if [ "$bd_rc" -eq 0 ] && [ "$low_conf" = "false" ]; then
+    return 0
+  fi
+  return 1
+}
+
+# Surface the behavioral record's coverage honestly to the user.
+regen_print_coverage() {
+  # regen_print_coverage <record-json>
+  local record="$1"
+  command -v python3 >/dev/null || { echo "$record"; return 0; }
+  printf '%s' "$record" | python3 -c 'import json,sys
+try:
+    r=json.load(sys.stdin)
+except Exception:
+    print("coverage: <unparseable behavioral record>"); sys.exit(0)
+print("coverage: %d/%d behavioral units present-and-wired (%.1f%%); K=%d unmatched; backend=%s; parse_confidence=%.3f%s" % (
+    r.get("present_and_wired",0), r.get("extracted",0), r.get("coverage_pct",0.0),
+    r.get("unmatched",0), r.get("backend","?"), r.get("parse_confidence",0.0),
+    "  [LOW-CONFIDENCE — not a confident green]" if r.get("low_confidence") else ""))
+for u in r.get("unmatched_units", []):
+    print("  UNMATCHED %s:%s — %s" % (u.get("category"), u.get("key"), u.get("reason")))' 2>/dev/null || echo "$record"
+}
+
+# The dual-gate decision + release. The old file (under tmp) leaves tmp ONLY when
+# BOTH the visual gate AND the behavioral gate pass. On pass: rm the quarantined
+# old file (release), mark the manifest released, and hash-log `record` to advance
+# the gate + stamp provenance. On any fail: the old file STAYS in tmp (recoverable).
+regen_dual_gate_release() {
+  # regen_dual_gate_release <ledger> <screen> <canonical> <new_path> <tmp_dir> \
+  #                         <old_in_tmp> <visual_rc> <behavioral_rc>
+  local ledger="$1" screen="$2" canonical="$3" new_path="$4" tmp_dir="$5"
+  local old_in_tmp="$6" visual_rc="$7" behavioral_rc="$8"
+  local manifest="$tmp_dir/manifest.json"
+
+  regen_manifest_set "$manifest" \
+    "dual_gate.visual=$([ "$visual_rc" -eq 0 ] && echo true || echo false);dual_gate.behavioral=$([ "$behavioral_rc" -eq 0 ] && echo true || echo false)"
+
+  if [ "$visual_rc" -ne 0 ] || [ "$behavioral_rc" -ne 0 ]; then
+    local why=""
+    [ "$visual_rc" -ne 0 ] && why="visual"
+    [ "$behavioral_rc" -ne 0 ] && why="${why:+$why+}behavioral"
+    echo "$(red "✗") dual-gate BLOCKED ($why failed) — old file STAYS in tmp (recoverable): $old_in_tmp" >&2
+    info "fix the migration, then re-run \`designmatch regen-gate $screen\` to re-evaluate"
+    return 1
+  fi
+
+  # BOTH passed → release the old file from tmp. It is no longer the sole behavior
+  # source (the migration is proven), so removing it now is safe.
+  rm -f "$old_in_tmp"
+  regen_manifest_set "$manifest" "released=true"
+  ok "dual-gate PASSED (visual ✓ + behavioral ✓) — old file released from tmp: $old_in_tmp"
+
+  # Advance the change-detection gate + stamp provenance.
+  set +e
+  "$BIN_REGEN_LOG" --ledger "$ledger" record "$screen" "$canonical" "$new_path" >/dev/null 2>&1
+  local rec_rc=$?
+  set -e
+  if [ "$rec_rc" -eq 0 ]; then
+    ok "hash-log recorded provenance: $screen ← $(basename "$canonical") → $new_path"
+  else
+    echo "$(red "!") hash-log record failed (rc=$rec_rc) — gate not advanced" >&2
+    return 1
+  fi
+  return 0
+}
+
+# regen-gate — run JUST the dual-gate over an already-quarantined old + a migrated
+# new component (used after the migration step, or to re-evaluate a previously
+# blocked screen). The old file is found inside its tmp dir.
+cmd_regen_gate() {
+  local screen="" app_dir="$PWD" ledger="" canonical="" tmp_dir="" migrated=""
+  local canonical_png="" native_png="" visual_inject=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --app-dir)        app_dir="$2"; shift 2 ;;
+      --ledger)         ledger="$2"; shift 2 ;;
+      --canonical)      canonical="$2"; shift 2 ;;
+      --tmp-dir)        tmp_dir="$2"; shift 2 ;;
+      --migrated)       migrated="$2"; shift 2 ;;
+      --canonical-png)  canonical_png="$2"; shift 2 ;;
+      --native-png)     native_png="$2"; shift 2 ;;
+      --visual-result)  visual_inject="$2"; shift 2 ;;
+      -*) die "unknown flag: $1" ;;
+      *)  [ -z "$screen" ] && { screen="$1"; shift; } || die "unexpected arg: $1" ;;
+    esac
+  done
+  [ -n "$screen" ] || die "regen-gate requires <Screen>"
+  app_dir="$(cd "$app_dir" && pwd)"
+  local dm_dir; dm_dir="$(regen_designmatch_dir "$app_dir")"
+  [ -n "$ledger" ] || ledger="$dm_dir/regen-log.json"
+
+  # Resolve tmp_dir: explicit, else the most recent for this screen.
+  if [ -z "$tmp_dir" ]; then
+    tmp_dir="$(find "$dm_dir/tmp" -maxdepth 1 -type d -name "$screen.*" 2>/dev/null | sort | tail -1 || true)"
+  fi
+  [ -n "$tmp_dir" ] && [ -d "$tmp_dir" ] || die "no quarantine tmp dir for screen \"$screen\" under $dm_dir/tmp"
+  local manifest="$tmp_dir/manifest.json"
+  [ -f "$manifest" ] || die "no manifest in $tmp_dir"
+
+  # The quarantined old file = the non-manifest file in tmp_dir.
+  local old_in_tmp
+  old_in_tmp="$(find "$tmp_dir" -maxdepth 1 -type f ! -name 'manifest.json' 2>/dev/null | head -1 || true)"
+  [ -n "$old_in_tmp" ] && [ -f "$old_in_tmp" ] \
+    || die "no quarantined old file in $tmp_dir (already released? — old file is gone, gate cannot re-run)"
+
+  [ -n "$migrated" ] || die "regen-gate requires --migrated <file> (the migrated new component to verify)"
+  [ -f "$migrated" ] || die "migrated component not found: $migrated"
+  [ -n "$canonical" ] || canonical="$(python3 -c "import json;print(json.load(open('$manifest')).get('canonical_path',''))" 2>/dev/null || true)"
+
+  _regen_run_dual_gate "$ledger" "$screen" "$canonical" "$migrated" "$tmp_dir" "$old_in_tmp" \
+    "$canonical_png" "$native_png" "$visual_inject"
+}
+
+# Shared dual-gate driver: runs behavioral (real) + visual (real or injected),
+# prints honest coverage, then releases-or-blocks. Returns the dual-gate rc.
+_regen_run_dual_gate() {
+  local ledger="$1" screen="$2" canonical="$3" migrated="$4" tmp_dir="$5" old_in_tmp="$6"
+  local canonical_png="$7" native_png="$8" visual_inject="$9"
+
+  info "behavioral gate (REAL): behavioral-diff over (quarantined-old, migrated-new)"
+  set +e
+  local record
+  record="$(regen_behavioral_gate "$old_in_tmp" "$migrated")"
+  local behavioral_rc=$?
+  set -e
+  # The record JSON is the last line group; surface coverage honestly.
+  regen_print_coverage "$record"
+
+  info "visual gate: existing SSIM/pixelmatch harness (reused)"
+  set +e
+  regen_visual_gate "$canonical_png" "$native_png" "$tmp_dir/visual" "$visual_inject"
+  local visual_rc=$?
+  set -e
+
+  set +e
+  regen_dual_gate_release "$ledger" "$screen" "$canonical" "$migrated" "$tmp_dir" \
+    "$old_in_tmp" "$visual_rc" "$behavioral_rc"
+  local gate_rc=$?
+  set -e
+  return "$gate_rc"
+}
+
+# regen — the full per-screen pipeline: changed? → quarantine → generate → (migrate)
+# → dual-gate → release. Flags let the deterministic test drive it end-to-end.
+cmd_regen() {
+  local screen="" app_dir="$PWD" ledger="" canonical="" old="" out="" target="rn"
+  local migrated="" canonical_png="" native_png="" visual_inject="" force=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --app-dir)        app_dir="$2"; shift 2 ;;
+      --ledger)         ledger="$2"; shift 2 ;;
+      --canonical)      canonical="$2"; shift 2 ;;
+      --old)            old="$2"; shift 2 ;;
+      --out)            out="$2"; shift 2 ;;
+      --target)         target="$2"; shift 2 ;;
+      --migrated)       migrated="$2"; shift 2 ;;
+      --canonical-png)  canonical_png="$2"; shift 2 ;;
+      --native-png)     native_png="$2"; shift 2 ;;
+      --visual-result)  visual_inject="$2"; shift 2 ;;
+      --force)          force=1; shift ;;
+      -*) die "unknown flag: $1" ;;
+      *)  [ -z "$screen" ] && { screen="$1"; shift; } || die "unexpected arg: $1" ;;
+    esac
+  done
+  [ -n "$screen" ] || die "regen requires <Screen>. Run \`designmatch help\`."
+  app_dir="$(cd "$app_dir" && pwd)"
+  local dm_dir; dm_dir="$(regen_designmatch_dir "$app_dir")"
+  mkdir -p "$dm_dir"
+  [ -n "$ledger" ] || ledger="$dm_dir/regen-log.json"
+  [ -n "$canonical" ] || die "regen requires --canonical <file> (the design source of record)"
+  [ -f "$canonical" ] || die "canonical not found: $canonical"
+
+  # a. CHANGE DETECTION — hash-log gate. exit 1 (unchanged) ⇒ NO-OP.
+  set +e
+  local changed_out
+  changed_out="$("$BIN_REGEN_LOG" --ledger "$ledger" changed "$screen" "$canonical" 2>&1)"
+  local changed_rc=$?
+  set -e
+  if [ "$changed_rc" -eq 1 ] && [ "$force" -eq 0 ]; then
+    ok "no-op: $screen design unchanged (hash-log) — NOT regenerating (no churn)"
+    return 0
+  elif [ "$changed_rc" -ne 0 ] && [ "$changed_rc" -ne 1 ]; then
+    die "hash-log changed failed (rc=$changed_rc): $changed_out"
+  fi
+  info "$screen design CHANGED (or new) → regenerating"
+
+  # b. QUARANTINE the old component FIRST (move, never delete) — if one exists.
+  local tmp_dir="" old_in_tmp=""
+  if [ -n "$old" ] && [ -f "$old" ]; then
+    tmp_dir="$(regen_quarantine "$dm_dir" "$screen" "$old" "$canonical" "regenerated from changed canonical $(basename "$canonical")")"
+    old_in_tmp="$(find "$tmp_dir" -maxdepth 1 -type f ! -name 'manifest.json' 2>/dev/null | head -1)"
+    ok "quarantined old component → $old_in_tmp (MOVED, not deleted — recoverable)"
+  else
+    info "no existing old component (--old) — fresh screen, nothing to quarantine"
+  fi
+
+  # c. GENERATE fresh in the target language (RN) from the canonical via the seam.
+  [ -n "$out" ] || out="$app_dir/src/screens/$screen.$("$BIN_TARGET" ext "$target")"
+  mkdir -p "$(dirname "$out")"
+  set +e
+  "$BIN_TARGET" generate "$target" "$screen" "$canonical" --out "$out" 2>/dev/null
+  local gen_rc=$?
+  set -e
+  [ "$gen_rc" -eq 0 ] || die "generate failed (target=$target, rc=$gen_rc)"
+  ok "generated fresh $target component (behavior-free) → $out"
+
+  # d. MIGRATE — re-attach behavior from the quarantined old into the fresh. The
+  # migration mechanism is agent/structured-port and produces a migrated file; the
+  # pipeline does NOT fake it. If a migrated file is supplied (--migrated), we
+  # proceed straight to the dual-gate against it; otherwise we stop here and hand
+  # off to the migration step (the old file stays safely in tmp meanwhile).
+  if [ -z "$migrated" ]; then
+    info "migration step: port handlers/state/API/nav/effects/props from the quarantined"
+    info "old into $out, then run: designmatch regen-gate $screen --migrated <file> ..."
+    if [ -n "$old_in_tmp" ]; then
+      info "old (behavior source) recoverable at: $old_in_tmp — STAYS until dual-gate passes"
+    fi
+    return 0
+  fi
+  [ -f "$migrated" ] || die "migrated component not found: $migrated"
+
+  # e. DUAL-GATE → release. Old file leaves tmp ONLY on visual AND behavioral pass.
+  if [ -z "$old_in_tmp" ]; then
+    # Fresh screen with no prior behavior: nothing to gate against / release. Just
+    # record provenance so the gate advances.
+    set +e
+    "$BIN_REGEN_LOG" --ledger "$ledger" record "$screen" "$canonical" "$migrated" >/dev/null 2>&1
+    set -e
+    ok "fresh screen finalized + provenance recorded (no old component to gate)"
+    return 0
+  fi
+
+  _regen_run_dual_gate "$ledger" "$screen" "$canonical" "$migrated" "$tmp_dir" "$old_in_tmp" \
+    "$canonical_png" "$native_png" "$visual_inject"
+}
+
+# regen-all — regenerate every screen whose design changed. Pairs each canonical
+# with its old component + migrated component by NAME convention under app-dir
+# (canonical: .designmatch/canonical/<Screen>.canonical.jsx; old:
+# src/screens/<Screen>.tsx). Unchanged screens are no-ops (hash-log gates each).
+cmd_regen_all() {
+  local app_dir="$PWD" ledger="" target="rn" visual_inject=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --app-dir)       app_dir="$2"; shift 2 ;;
+      --ledger)        ledger="$2"; shift 2 ;;
+      --target)        target="$2"; shift 2 ;;
+      --visual-result) visual_inject="$2"; shift 2 ;;
+      -*) die "unknown flag: $1" ;;
+      *) die "unexpected arg: $1" ;;
+    esac
+  done
+  app_dir="$(cd "$app_dir" && pwd)"
+  local dm_dir; dm_dir="$(regen_designmatch_dir "$app_dir")"
+  local canon_dir="$dm_dir/canonical"
+  [ -d "$canon_dir" ] || die "no canonical dir: $canon_dir"
+
+  local canons
+  canons=$(find "$canon_dir" -maxdepth 2 -type f \( -iname '*.canonical.jsx' -o -iname '*.canonical.tsx' \) 2>/dev/null || true)
+  [ -n "$canons" ] || die "no canonicals (*.canonical.jsx) under $canon_dir"
+
+  local count=0 noop=0
+  while IFS= read -r canon; do
+    [ -n "$canon" ] || continue
+    local base name
+    base=$(basename "$canon")
+    name="${base%.canonical.*}"
+    local old="$app_dir/src/screens/$name.tsx"
+    local regen_args=("$name" --app-dir "$app_dir" --canonical "$canon" --target "$target")
+    [ -n "$ledger" ] && regen_args+=(--ledger "$ledger")
+    [ -f "$old" ] && regen_args+=(--old "$old")
+    [ -n "$visual_inject" ] && regen_args+=(--visual-result "$visual_inject")
+    info "regen-all: $name"
+    set +e
+    cmd_regen "${regen_args[@]}"
+    set -e
+    count=$((count + 1))
+  done <<< "$canons"
+  ok "regen-all: processed $count screen(s) (unchanged screens were no-ops via the hash-log)"
+}
+
 main() {
   local cmd="${1:-help}"
   [ $# -gt 0 ] && shift || true
@@ -655,6 +1142,9 @@ main() {
     render)        cmd_render "$@" ;;
     diff)          cmd_diff "$@" ;;
     iterate)       cmd_iterate "$@" ;;
+    regen)         cmd_regen "$@" ;;
+    regen-all)     cmd_regen_all "$@" ;;
+    regen-gate)    cmd_regen_gate "$@" ;;
     action-types)  cmd_action_types ;;
     help|-h|--help) usage ;;
     *) echo "unknown command: $cmd" >&2; usage; exit 1 ;;
