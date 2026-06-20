@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# designmatch-behavioral-diff — thin CLI over bin/lib/behavioral_diff.py.
+#
+# designmatch v2 (step-5 verification): given the OLD component (the sole source
+# of behavior) and the freshly-regenerated NEW component (visually faithful but
+# behaviorally empty), extract the OLD component's BEHAVIORAL SURFACE and verify
+# each unit is PRESENT AND WIRED in the NEW one — AST/structural, not grep.
+#
+# It prints an HONEST coverage record (JSON) on stdout and a one-line human
+# summary on stderr. K>0 (unmatched behavioral units) → the migration is
+# incomplete → the dual-gate caller must BLOCK the tmp-exit (the old file stays
+# recoverable). This CLI reflects that in its exit code so a shell caller can gate
+# on it directly.
+#
+# Usage:
+#   designmatch-behavioral-diff <old-component> <new-component> [--backend NAME]
+#   designmatch-behavioral-diff --json-job <file>      # prebuilt stdin job (testing)
+#   echo '{"old":"...","new":"..."}' | designmatch-behavioral-diff --stdin
+#
+#   --backend NAME   structural (default, primary) | heuristic (degraded floor).
+#                    A future tree-sitter backend registers under its own name.
+#   --quiet          suppress the one-line human summary on stderr
+#   -h, --help       this help
+#
+# Exit status:
+#   0  clean — every old behavioral unit is present-and-wired in new (K=0)
+#   3  BLOCKED — one or more units unmatched (K>0): tmp-exit must NOT proceed
+#   2  usage error
+# A degraded/low-confidence PARSE is reported in the record (backend /
+# parse_confidence / low_confidence), NOT a nonzero exit — only a real migration
+# gap (K>0) blocks. A low-confidence K=0 is surfaced via `low_confidence:true`.
+
+set -euo pipefail
+
+# ── Resolve this script + the python engine (RELOCATABLE, no baked path) ──────
+SELF="$0"
+case "$SELF" in
+  */*) : ;;
+  *)   SELF="$(command -v "$SELF" 2>/dev/null || echo "$SELF")" ;;
+esac
+BIN_DIR="$(cd "$(dirname "$SELF")" 2>/dev/null && pwd)"
+LIB="$BIN_DIR/lib/behavioral_diff.py"
+
+if [ ! -f "$LIB" ]; then
+  echo "designmatch-behavioral-diff: engine not found at $LIB" >&2
+  exit 2
+fi
+
+PY="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)"
+if [ -z "$PY" ]; then
+  echo "designmatch-behavioral-diff: python3 not found on PATH" >&2
+  exit 2
+fi
+
+usage() { sed -n '2,33p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+# ── Parse args ────────────────────────────────────────────────────────────────
+BACKEND="structural"
+QUIET=0
+STDIN_JOB=0
+JSON_JOB=""
+declare -a POS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --backend) BACKEND="${2:-structural}"; shift 2 ;;
+    --quiet)   QUIET=1; shift ;;
+    --stdin)   STDIN_JOB=1; shift ;;
+    --json-job) JSON_JOB="${2:-}"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; while [ $# -gt 0 ]; do POS+=("$1"); shift; done ;;
+    -*) echo "designmatch-behavioral-diff: unknown option: $1" >&2; exit 2 ;;
+    *)  POS+=("$1"); shift ;;
+  esac
+done
+
+# ── Dispatch ──────────────────────────────────────────────────────────────────
+# We capture the engine's exit code rather than letting set -e abort, so the CLI
+# can map it to a clean/blocked/usage status deterministically.
+RC=0
+OUT=""
+if [ -n "$JSON_JOB" ]; then
+  [ -f "$JSON_JOB" ] || { echo "designmatch-behavioral-diff: no such job file: $JSON_JOB" >&2; exit 2; }
+  if [ "$QUIET" -eq 1 ]; then
+    OUT="$("$PY" "$LIB" --backend "$BACKEND" < "$JSON_JOB" 2>/dev/null)" || RC=$?
+  else
+    OUT="$("$PY" "$LIB" --backend "$BACKEND" < "$JSON_JOB")" || RC=$?
+  fi
+elif [ "$STDIN_JOB" -eq 1 ]; then
+  if [ "$QUIET" -eq 1 ]; then
+    OUT="$("$PY" "$LIB" --backend "$BACKEND" 2>/dev/null)" || RC=$?
+  else
+    OUT="$("$PY" "$LIB" --backend "$BACKEND")" || RC=$?
+  fi
+else
+  if [ "${#POS[@]}" -lt 2 ]; then
+    echo "designmatch-behavioral-diff: need <old-component> <new-component>" >&2
+    usage >&2
+    exit 2
+  fi
+  OLD="${POS[0]}"
+  NEW="${POS[1]}"
+  [ -f "$OLD" ] || { echo "designmatch-behavioral-diff: no such file: $OLD" >&2; exit 2; }
+  [ -f "$NEW" ] || { echo "designmatch-behavioral-diff: no such file: $NEW" >&2; exit 2; }
+  if [ "$QUIET" -eq 1 ]; then
+    OUT="$("$PY" "$LIB" "$OLD" "$NEW" --backend "$BACKEND" 2>/dev/null)" || RC=$?
+  else
+    OUT="$("$PY" "$LIB" "$OLD" "$NEW" --backend "$BACKEND")" || RC=$?
+  fi
+fi
+
+# The engine emits the record JSON on stdout; pass it through unchanged.
+printf '%s\n' "$OUT"
+
+# RC: 0 clean, 3 blocked (K>0), 2 usage. Propagate it so a shell dual-gate caller
+# can branch on the behavioral verdict directly.
+exit "$RC"
