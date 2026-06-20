@@ -34,6 +34,10 @@ docs/superpowers/plans/
 # (not .git/) on purpose so a relative core.hooksPath survives a repo move.
 .heimdall/
 
+# designmatch v2 runtime ledger + quarantine (the regen-log.json hash-log and the
+# tmp holding area are per-checkout runtime state, not source — never commit them).
+.designmatch/
+
 # superx runtime artifacts
 .setup-done
 .last-update-from
