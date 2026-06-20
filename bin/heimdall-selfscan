@@ -21,12 +21,28 @@
 # blocking pre-push gate, so a secret or an unknown identity cannot leave the
 # machine (see conventions.md R10).
 #
-# Scope: this repo's FULL git history (all refs, all commits) — not just the
+# Scope: HEIMDALL's FULL git history (all refs, all commits) — not just the
 # staged diff (that is bin/secret-scan's job) and not just the push range.
 #
+# SCOPING — this gate polices HEIMDALL's repo, and ONLY heimdall's. It is wired
+# via core.hooksPath set to a RELATIVE path, so the native pre-push hook fires in
+# EVERY repo that inherits that git config — including unrelated projects. When
+# this runs while pushing a DIFFERENT repo, it must NOT apply heimdall's identity
+# allowlist / secret rules to that foreign repo. It stands down (exit 0): the
+# foreign repo's own gates police the foreign repo. The check is tamper-proof:
+# this script lives at <heimdall-top>/bin/heimdall-selfscan, so "is the repo I'm
+# being run in actually heimdall?" reduces to "does the repo-top of the CWD equal
+# the repo-top that contains THIS script?". A copied/renamed heimdall stays
+# policed; an unrelated repo is left alone.
+#
 # Contract — no escape hatches:
-#   - No .gitleaksignore, no allowlist file, no --redact-suppression. The history
-#     must scan clean NATIVELY. If you need to suppress a finding, scrub history.
+#   - The .gitleaks.toml at the heimdall repo top is an ALLOWLIST, not an
+#     ignore-everything: it extends the FULL default ruleset (useDefault=true)
+#     and only allowlists heimdall's OWN secret-detection FIXTURES by path (the
+#     secret-scan corpus, the demo's runtime sk_live_, the landmine test
+#     strings). It is the SAME config bare `gitleaks detect` auto-discovers, so
+#     the gate and a human's bare scan AGREE. A real secret in real code is still
+#     caught. Suppressing a genuine finding still requires scrubbing history.
 #   - gitleaks absent is a HARD block: a verification tool that cannot scan its
 #     own history must not certify a push. Install it or the push is refused.
 #   - The identity allowlist is intentionally hard-coded here, not configurable:
@@ -52,6 +68,42 @@ set -euo pipefail
 ALLOWED_IDENTITIES="rj@runheimdall.dev
 noreply@anthropic.com"
 
+# --- SCOPING: police HEIMDALL's repo, and ONLY heimdall's -------------------
+# This script lives at <heimdall-top>/bin/heimdall-selfscan. The native pre-push
+# hook is wired via a RELATIVE core.hooksPath, so it fires in every repo that
+# inherits the config — including unrelated projects. We must scan THE HEIMDALL
+# REPO (the one that contains this script), never the foreign repo that merely
+# triggered the hook. If the repo we were invoked in is NOT the heimdall repo,
+# stand down cleanly: that repo's own gates are responsible for it.
+#
+# Resolve the heimdall top from THIS script's own location (canonicalized), then
+# compare it to the repo top of the CWD where the hook fired. Equal → this push
+# IS heimdall, scan it. Different → foreign repo, exit 0 (do not block).
+SELF_SRC="${BASH_SOURCE[0]}"
+# Resolve a symlinked/relative invocation to a real path without readlink -f
+# (absent on macOS): cd into the script's dir and pwd -P.
+SELF_DIR="$(cd "$(dirname "$SELF_SRC")" && pwd -P)"
+# The heimdall top is the parent of bin/ (this script is <top>/bin/<self>).
+HEIMDALL_TOP="$(cd "$SELF_DIR/.." && pwd -P)"
+
+# The repo top of wherever the hook actually fired (the push being performed).
+CWD_TOP="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+if [ -n "$CWD_TOP" ]; then
+  CWD_TOP="$(cd "$CWD_TOP" && pwd -P)"
+fi
+
+if [ "$CWD_TOP" != "$HEIMDALL_TOP" ]; then
+  # Not the heimdall repo (or not a git repo at all). This gate does not police
+  # foreign repos — stand down so an unrelated `git push` is not blocked on
+  # heimdall's history, identities, or landmine lint.
+  echo "guard: heimdall-selfscan not applicable here (not the heimdall repo) — standing down" >&2
+  exit 0
+fi
+
+# From here on, every scan is anchored to $HEIMDALL_TOP, never the CWD, so the
+# gate is identical no matter which subdir of heimdall the hook fired from.
+GL_CONFIG="$HEIMDALL_TOP/.gitleaks.toml"
+
 # --- gitleaks presence check (HARD block) ---------------------------------
 if ! command -v gitleaks >/dev/null 2>&1; then
   cat >&2 <<'EOF'
@@ -68,11 +120,22 @@ EOF
 fi
 
 # --- scan the FULL history for secrets ------------------------------------
-# `gitleaks detect --log-opts=--all` walks every commit on every ref. No
-# allowlist, no .gitleaksignore — the history must be clean natively.
+# `gitleaks detect --log-opts=--all` walks every commit on every ref. We anchor
+# `--source` to the HEIMDALL top (never the CWD) and pass `--config` explicitly
+# so this gate honors the SAME .gitleaks.toml allowlist that bare `gitleaks
+# detect` auto-discovers — the two scans agree. The config extends the full
+# default ruleset (useDefault=true); it only allowlists heimdall's OWN fixture
+# files by path, so real secrets in real code are still caught.
 SCAN_OUT=""
 SCAN_RC=0
-SCAN_OUT=$(gitleaks detect --source . --log-opts="--all" --no-banner 2>&1) && SCAN_RC=0 || SCAN_RC=$?
+if [ -f "$GL_CONFIG" ]; then
+  SCAN_OUT=$(gitleaks detect --source "$HEIMDALL_TOP" --config "$GL_CONFIG" --log-opts="--all" --no-banner 2>&1) && SCAN_RC=0 || SCAN_RC=$?
+else
+  # No config present: scan with the default ruleset, still anchored to the
+  # heimdall top. (The shipped repo carries .gitleaks.toml; this branch only
+  # covers a stripped checkout.)
+  SCAN_OUT=$(gitleaks detect --source "$HEIMDALL_TOP" --log-opts="--all" --no-banner 2>&1) && SCAN_RC=0 || SCAN_RC=$?
+fi
 
 if [ "$SCAN_RC" -ne 0 ]; then
   # Nonzero from gitleaks == leak found (or a hard scan error). Show the finding.
@@ -89,7 +152,7 @@ fi
 # Author AND committer email of every commit on every ref must be allowlisted.
 # `sort -u` collapses to the DISTINCT identities present; any one not in the
 # allowlist is a hard fail.
-IDENTITIES="$(git log --all --format='%ae%n%ce' 2>/dev/null | sort -u | sed '/^$/d')"
+IDENTITIES="$(git -C "$HEIMDALL_TOP" log --all --format='%ae%n%ce' 2>/dev/null | sort -u | sed '/^$/d')"
 
 total_count=0
 allowed_count=0
@@ -129,9 +192,8 @@ fi
 # script. An ABSENT linter is a hard block: a gate that cannot run must not
 # certify a push.
 LINT=""
-_top="$(git rev-parse --show-toplevel 2>/dev/null || true)"
-if [ -n "$_top" ] && [ -x "$_top/bin/heimdall-landmine-lint" ]; then
-  LINT="$_top/bin/heimdall-landmine-lint"
+if [ -x "$HEIMDALL_TOP/bin/heimdall-landmine-lint" ]; then
+  LINT="$HEIMDALL_TOP/bin/heimdall-landmine-lint"
 elif command -v heimdall-landmine-lint >/dev/null 2>&1; then
   LINT="$(command -v heimdall-landmine-lint)"
 fi
