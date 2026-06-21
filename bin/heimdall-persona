@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# heimdall-persona — F1 global, set-once persona (coder | non-coder).
+#
+# The persona is the USER, not the repo: a coder in one project is a coder in
+# every project. So it is stored GLOBALLY, once, and read product-wide to decide
+# tone, defaults, and which paths surface. The first run asks one question; every
+# later run reads the remembered answer and never re-prompts.
+#
+# Storage (relocatable, never a baked path):
+#   ${HEIMDALL_HOME:-$HOME/.heimdall}/persona.json
+#
+# Subcommands:
+#   get               print the persona (coder | non-coder), or 'unset'
+#   set <coder|non-coder>
+#                     persist the global persona (set-once); prints the value
+#   is-set            print true/false; exit 0 if set, 1 if unset (shell-branchable)
+#   path              print the resolved persona.json path
+#   -h, --help        this help
+#
+# HOW A CONSUMER BRANCHES ON IT (propagation contract):
+#   if ! heimdall-persona is-set >/dev/null; then run_onboarding; fi
+#   case "$(heimdall-persona get)" in
+#     coder)     tone=technical;        surface=code-first ;;
+#     non-coder) tone=plain-language;   surface=guided     ;;
+#   esac
+# Python callers import bin/lib/persona_store.py and call get_persona()/is_coder().
+#
+# Exit: 0 ok (or is-set true); 1 is-set false; 2 usage / invalid persona.
+
+set -euo pipefail
+
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+LIB="$(cd "$(dirname "$SELF")/lib" && pwd)/persona_store.py"
+
+if [ ! -f "$LIB" ]; then
+  echo "heimdall-persona: engine not found at $LIB" >&2
+  exit 2
+fi
+
+exec python3 "$LIB" "$@"
