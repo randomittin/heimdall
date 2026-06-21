@@ -1,0 +1,219 @@
+#!/usr/bin/env bash
+# heimdall-comprehend — SI-1 project-context comprehension capsule + orientation cache.
+#
+# A per-repo persisted file caching the agent's COMPREHENSION of a project
+# (architecture, key modules, conventions, entry points, build/test commands)
+# that doubles as the resumable ORIENTATION cache: orient-once, reuse-many.
+# Today every run re-derives project understanding from scratch (tokens); this
+# caches it. First `comprehend` DERIVES + writes the capsule; a later `load` on
+# the UNCHANGED repo returns the cached capsule WITHOUT re-deriving. A structural
+# change (new top-level module / changed manifest / new language) invalidates the
+# capsule via a structural fingerprint → `load` signals stale → re-derive.
+#
+# The real comprehension is a deterministic structural scan (see
+# bin/lib/comprehension.py) — NOT an LLM call. Honest fields, reproducible bytes.
+#
+# RELATIONSHIP TO THE EXISTING CHECKPOINT (reused, not duplicated): this does NOT
+# add a parallel checkpoint store. `.planning/CHECKPOINT.md` (the /hmd:save
+# forward-progress save-state) and `bin/heimdall-capsule` (per-task compaction)
+# are untouched. The comprehension capsule is the orientation cache — "what IS
+# this project" — beneath the checkpoint's "where did we LEAVE OFF". See SI-1.md.
+#
+# Capsule location (gitignored runtime, no baked paths):
+#   ${HEIMDALL_HOME:-<repo>/.heimdall}/context.json   (.heimdall/ is gitignored)
+#
+# Usage:
+#   heimdall-comprehend comprehend <repo-dir> [--print]
+#       Derive the capsule from a structural scan and WRITE it. If a fresh capsule
+#       already exists it is reused (the derivation counter does not advance); a
+#       stale/missing/corrupt one is re-derived (counter advances). --force always
+#       re-derives. Prints the resulting status line on stderr.
+#   heimdall-comprehend load <repo-dir> [--print]
+#       READ the capsule. If FRESH, return it (loaded:cached) WITHOUT re-deriving.
+#       If stale/missing/corrupt, signal it (re-derive needed) and exit nonzero so
+#       a caller can branch — it does NOT silently re-derive on `load`.
+#   heimdall-comprehend show <repo-dir>     print the stored capsule verbatim (or note absence)
+#   heimdall-comprehend status <repo-dir>   print just the status word (fresh|stale|missing|corrupt)
+#   heimdall-comprehend fingerprint <repo-dir>   print the live structural fingerprint
+#   heimdall-comprehend path <repo-dir>     print the resolved capsule path
+#   -h, --help                              this help
+#
+# Exit status:
+#   0  success — capsule derived/written, OR a fresh capsule loaded from cache
+#   3  load: capsule is stale/missing/corrupt — re-derive needed (NOT a crash)
+#   2  usage error / repo not found / python missing
+# It never crashes on a missing or corrupt capsule: that is reported as exit 3.
+
+set -euo pipefail
+
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+LIB="$(cd "$(dirname "$SELF")/lib" && pwd)/comprehension.py"
+
+usage() { sed -n '2,46p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+PY="$(command -v python3 || command -v python || true)"
+if [ -z "$PY" ]; then
+  echo "error: python3 not found (required for the comprehension engine)" >&2
+  exit 2
+fi
+
+[ $# -ge 1 ] || { echo "error: a subcommand is required" >&2; usage >&2; exit 2; }
+
+CMD="$1"; shift || true
+
+case "$CMD" in
+  -h|--help) usage; exit 0 ;;
+esac
+
+# Every remaining subcommand takes <repo-dir> as its first positional.
+[ $# -ge 1 ] || { echo "error: $CMD needs <repo-dir>" >&2; exit 2; }
+REPO="$1"; shift || true
+PRINT=0
+FORCE=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --print) PRINT=1; shift ;;
+    --force) FORCE=1; shift ;;
+    *) echo "error: unknown argument: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+if [ ! -d "$REPO" ]; then
+  echo "error: not a directory: $REPO" >&2
+  exit 2
+fi
+# Absolute, normalized repo path (relocatable — derived from the argument).
+REPO="$(cd "$REPO" && pwd)"
+
+# Capsule home: ${HEIMDALL_HOME:-<repo>/.heimdall}. No baked path; .heimdall/ is
+# gitignored runtime state. The capsule file is context.json under that home.
+HOME_DIR="${HEIMDALL_HOME:-$REPO/.heimdall}"
+CAPSULE="$HOME_DIR/context.json"
+
+# Deterministic-output contract: the engine never reads the clock. The CLI
+# supplies the timestamp (UTC ISO-8601).
+TS="$(date -u +%FT%TZ)"
+
+# ── run the engine for one operation ──────────────────────────────────────────
+# `comprehend`: derive (or reuse a fresh capsule) and write. `load`: classify an
+# existing capsule and emit it only when fresh. All JSON I/O is in python so the
+# shell never parses/quotes capsule contents.
+case "$CMD" in
+  comprehend)
+    mkdir -p "$HOME_DIR" 2>/dev/null || true
+    REPO="$REPO" CAPSULE="$CAPSULE" TS="$TS" FORCE="$FORCE" PRINT="$PRINT" LIB="$LIB" \
+    "$PY" - <<'PYEOF'
+import json, os, sys
+sys.path.insert(0, os.path.dirname(os.environ["LIB"]))
+import comprehension as C
+
+repo = os.environ["REPO"]
+capsule_path = os.environ["CAPSULE"]
+ts = os.environ["TS"]
+force = os.environ["FORCE"] == "1"
+do_print = os.environ["PRINT"] == "1"
+
+status, existing = C.load_status(repo, capsule_path)
+
+if not force and status == "fresh":
+    # Already oriented — reuse. Derivation counter does NOT advance: this is the
+    # orient-once-reuse-many proof at the write path too.
+    capsule = existing
+    action = "reused:cached"
+else:
+    prior = 0
+    if existing and isinstance(existing.get("derivation"), dict):
+        prior = int(existing["derivation"].get("count", 0) or 0)
+    capsule = C.derive(repo, ts, derivations=prior)
+    tmp = capsule_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(capsule, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+    os.replace(tmp, capsule_path)
+    action = "derived:fresh(was:%s)" % status
+
+count = capsule["derivation"]["count"]
+cost = capsule["derivation"]["cost_units"]
+sys.stderr.write(
+    "comprehend: %s — %s\n  ▸ derivation #%d, %d files scanned → %s\n"
+    % (action, repo, count, cost, capsule_path)
+)
+if do_print:
+    json.dump(capsule, sys.stdout, indent=2, sort_keys=True)
+    sys.stdout.write("\n")
+PYEOF
+    ;;
+
+  load)
+    REPO="$REPO" CAPSULE="$CAPSULE" PRINT="$PRINT" LIB="$LIB" \
+    "$PY" - <<'PYEOF'
+import json, os, sys
+sys.path.insert(0, os.path.dirname(os.environ["LIB"]))
+import comprehension as C
+
+repo = os.environ["REPO"]
+capsule_path = os.environ["CAPSULE"]
+do_print = os.environ["PRINT"] == "1"
+
+status, capsule = C.load_status(repo, capsule_path)
+
+if status == "fresh":
+    count = capsule["derivation"]["count"]
+    sys.stderr.write(
+        "load: loaded:cached — fresh capsule (derivation #%d, NOT re-derived)\n  ▸ %s\n"
+        % (count, capsule_path)
+    )
+    if do_print:
+        json.dump(capsule, sys.stdout, indent=2, sort_keys=True)
+        sys.stdout.write("\n")
+    sys.exit(0)
+
+# stale / missing / corrupt → signal re-derive (exit 3), never crash.
+sys.stderr.write(
+    "load: re-derive needed — capsule is %s (run `comprehend %s`)\n  ▸ %s\n"
+    % (status, repo, capsule_path)
+)
+sys.exit(3)
+PYEOF
+    ;;
+
+  show)
+    if [ ! -f "$CAPSULE" ]; then
+      echo "no capsule: $CAPSULE (run \`comprehend $REPO\`)" >&2
+      exit 3
+    fi
+    cat "$CAPSULE"
+    ;;
+
+  status)
+    REPO="$REPO" CAPSULE="$CAPSULE" LIB="$LIB" \
+    "$PY" - <<'PYEOF'
+import os, sys
+sys.path.insert(0, os.path.dirname(os.environ["LIB"]))
+import comprehension as C
+status, _ = C.load_status(os.environ["REPO"], os.environ["CAPSULE"])
+print(status)
+sys.exit(0 if status == "fresh" else 3)
+PYEOF
+    ;;
+
+  fingerprint)
+    REPO="$REPO" LIB="$LIB" \
+    "$PY" - <<'PYEOF'
+import os, sys
+sys.path.insert(0, os.path.dirname(os.environ["LIB"]))
+import comprehension as C
+print(C.fingerprint(os.environ["REPO"]))
+PYEOF
+    ;;
+
+  path)
+    printf '%s\n' "$CAPSULE"
+    ;;
+
+  *)
+    echo "error: unknown subcommand: $CMD" >&2
+    usage >&2
+    exit 2
+    ;;
+esac
