@@ -32,7 +32,11 @@ docs/superpowers/plans/
 # guard install output — per-clone local git-hooks dir wired via core.hooksPath
 # (`hmd guard install`). Install output, not source. Lives in the working tree
 # (not .git/) on purpose so a relative core.hooksPath survives a repo move.
+# Also holds the SI-2 attestation runtime store (.heimdall/attestations/<id>.json):
+# one record per commit/task, emitted by `heimdall-attest` and read by F2–F6 —
+# per-checkout runtime state, never committed.
 .heimdall/
+.heimdall/attestations/
 
 # designmatch v2 runtime ledger + quarantine (the regen-log.json hash-log and the
 # tmp holding area are per-checkout runtime state, not source — never commit them).
