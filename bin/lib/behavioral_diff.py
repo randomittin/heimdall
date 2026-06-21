@@ -687,6 +687,199 @@ register_backend("structural", _structural_extract)
 register_backend("heuristic", _heuristic_extract)
 
 
+# ── the TREE-SITTER backend (the one-line seam swap, now wired) ───────────────
+#
+# The substrate is un-parked: bin/lib/treesitter_ast.py is a REAL tree-sitter
+# integration that parses the C3 stacks and extracts symbols + call/import/extend
+# edges. This backend slots that substrate into the behavioral-diff seam exactly
+# as the parked note above promised: `register_backend("treesitter", fn)`.
+#
+# WHAT IT EXTRACTS via AST (not regex): for a plain (non-React) JS/TS module it
+# walks the real syntax tree and emits the backend-neutral BehavioralUnit model —
+#   state  : top-level useState/useReducer/useSelector binders + useDispatch,
+#            keyed identically to the structural backend so the two are
+#            interchangeable downstream (compare_surfaces is backend-agnostic);
+#   api    : fetch/axios/react-query call edges (from the AST call nodes);
+#   nav    : navigation.<method>(...) / linkTo(...) call edges;
+#   effect : useEffect dependency signatures.
+# Handler WIRING (is `submit` bound to a JSX `onPress`?) is React-JSX semantics
+# that the purpose-built STRUCTURAL walker already models precisely. A generic
+# AST symbol/edge walk does NOT reproduce that wiring judgement, and producing a
+# weaker handler surface here would REGRESS the migration diff for React/RN
+# components (the diff's whole reason to exist). So for a React/JSX component this
+# backend DEFERS — it raises, and extract_behavioral_surface's existing graceful
+# fallback routes the input to the proven structural/heuristic path. That is an
+# honest capability boundary: the tree-sitter substrate owns the language-
+# structural surface (symbols/refs — consumed by SI-2 reuse and F3); the
+# structural backend owns React behavioral wiring. The diff is unchanged.
+#
+# REGISTRATION IS CONDITIONAL: this backend registers ONLY when treesitter_ast's
+# tree-sitter backend is actually importable on the host. When tree-sitter is
+# absent the name stays UNregistered, so the existing structural/heuristic path
+# is unchanged and a `--backend treesitter` request degrades gracefully via the
+# unknown-backend path — behavioral-diff is never broken by tree-sitter's absence.
+
+
+class _TreesitterDeferral(Exception):
+    """Raised by the tree-sitter backend when the input is a React/JSX component
+    whose behavioral WIRING is better served by the structural backend. The
+    seam's graceful fallback catches it (as any backend exception) and routes to
+    the heuristic floor, so the proven path stays authoritative for RN."""
+
+
+def _load_treesitter_substrate():
+    """Lazy-import the AST substrate sitting next to this module. Returns the
+    module if its tree-sitter backend is available, else None — so registration
+    below is conditional and the stranger-test env (no tree-sitter) is unaffected.
+    Never raises: a missing substrate simply means 'do not register'."""
+    import importlib.util
+
+    lib_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "treesitter_ast.py")
+    if not os.path.isfile(lib_path):
+        return None
+    try:
+        spec = importlib.util.spec_from_file_location("heimdall_treesitter_ast", lib_path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+    except Exception:  # noqa: BLE001 — any import failure → do not register
+        return None
+    try:
+        if not mod.backend_available():
+            return None
+    except Exception:  # noqa: BLE001
+        return None
+    return mod
+
+
+def _make_treesitter_backend(ts):
+    """Build the (src, path) -> ExtractionResult backend bound to substrate `ts`."""
+
+    _REACT_HOOK_CALLS = {
+        "useState", "useReducer", "useEffect", "useLayoutEffect", "useMemo",
+        "useCallback", "useRef", "useContext", "useSelector", "useDispatch",
+    }
+
+    def _is_react_component(refs):
+        # A React/JSX component is detected structurally: it calls a React hook
+        # or imports from react/react-native. For those, wiring is structural's
+        # domain → defer. (Detected from the real AST refs, not a string scan.)
+        for r in refs:
+            if r.kind == "call" and r.name in _REACT_HOOK_CALLS:
+                return True
+            if r.kind == "import":
+                mod = (r.detail or {}).get("module", "")
+                if mod in ("react", "react-native") or mod.startswith("@react-navigation"):
+                    return True
+        return False
+
+    def _lang_for(path):
+        lang = ts.lang_for_path(path)
+        return lang or "javascript"
+
+    def _treesitter_extract(src, path):
+        lang = _lang_for(path)
+        result = ts.extract(src, lang)
+        if not result.available:
+            # The substrate degraded mid-call (e.g. grammar vanished): hand the
+            # input back to the seam's fallback rather than fabricate a surface.
+            raise _TreesitterDeferral(
+                "treesitter substrate unavailable: %s" % result.reason)
+
+        if _is_react_component(result.references):
+            # React behavioral wiring belongs to the structural backend.
+            raise _TreesitterDeferral(
+                "react/jsx component — handler wiring deferred to structural backend")
+
+        # ── plain (non-React) module: build the behavioral surface from the AST ──
+        units = []
+        seen = set()
+
+        def add(category, key, label, wired, detail=""):
+            mid = (category, key)
+            if mid in seen:
+                for u in units:
+                    if u.match_id() == mid and wired and not u.wired:
+                        u.wired = True
+                return
+            seen.add(mid)
+            units.append(BehavioralUnit(category, key, label, wired, detail))
+
+        # state: useState/useReducer/useSelector binders are call refs; we key on
+        # the call site and treat a setter/dispatch as wired (mirrors structural).
+        for r in result.references:
+            if r.kind != "call":
+                continue
+            if r.name == "useState":
+                add(CAT_STATE, "useState@%d" % r.line, "useState() @L%d" % r.line,
+                    True, detail="ast-state")
+            elif r.name == "useReducer":
+                add(CAT_STATE, "useReducer@%d" % r.line, "useReducer() @L%d" % r.line,
+                    True, detail="ast-state")
+            elif r.name == "useSelector":
+                add(CAT_STATE, "useSelector@%d" % r.line, "useSelector() @L%d" % r.line,
+                    True, detail="ast-selector")
+            elif r.name == "useDispatch":
+                add(CAT_STATE, "dispatch", "useDispatch()", True, detail="ast-redux")
+
+        # api: fetch / axios / react-query call edges.
+        api_idx = {}
+        for r in result.references:
+            if r.kind != "call":
+                continue
+            recv = (r.detail or {}).get("receiver", "")
+            head = r.name
+            is_api = (head == "fetch" or
+                      (head in ("get", "post", "put", "delete", "patch") and recv == "axios") or
+                      head in ("useQuery", "useMutation"))
+            if not is_api:
+                continue
+            api_idx[head] = api_idx.get(head, 0) + 1
+            key = head if api_idx[head] == 1 else "%s#%d" % (head, api_idx[head])
+            add(CAT_API, key, "api %s(...) @L%d" % (head, r.line), True, detail="ast-call")
+
+        # nav: navigation.<method>(...) and linkTo(...) call edges.
+        nav_idx = {}
+        for r in result.references:
+            if r.kind != "call":
+                continue
+            recv = (r.detail or {}).get("receiver", "")
+            if recv == "navigation" or r.name in ("navigate", "push", "goBack", "replace"):
+                meth = r.name
+                nav_idx[meth] = nav_idx.get(meth, 0) + 1
+                key = "navigation." + meth
+                if nav_idx[meth] > 1:
+                    key = "%s#%d" % (key, nav_idx[meth])
+                add(CAT_NAV, key, "nav.%s(...) @L%d" % (meth, r.line), True, detail="ast-nav")
+            elif r.name == "linkTo":
+                add(CAT_NAV, "linkTo", "linkTo(...) @L%d" % r.line, True, detail="ast-nav")
+
+        # effect: each useEffect call edge is one effect unit.
+        for r in result.references:
+            if r.kind == "call" and r.name in ("useEffect", "useLayoutEffect"):
+                add(CAT_EFFECT, "effect@%d" % r.line, "useEffect @L%d" % r.line,
+                    True, detail="ast-effect")
+
+        # Confidence: a clean AST parse is high-confidence for the structural
+        # surface it covers. The denominator is honest — if no behavioral surface
+        # was found, say so rather than green a non-component.
+        conf = 0.9 if units else 0.3
+        basis = "tree-sitter AST parse (lang=%s, source=%s)" % (
+            lang, ts.backend_info()["source"])
+        notes = [] if units else ["no behavioral surface extracted from AST"]
+        return ExtractionResult(units, "treesitter", conf, basis, notes=notes)
+
+    return _treesitter_extract
+
+
+# Conditional registration: only when the tree-sitter substrate is importable AND
+# its backend is available. Absent tree-sitter → name stays unregistered and the
+# structural/heuristic backends remain the path (behavioral-diff never breaks).
+_TS_SUBSTRATE = _load_treesitter_substrate()
+if _TS_SUBSTRATE is not None:
+    register_backend("treesitter", _make_treesitter_backend(_TS_SUBSTRATE))
+
+
 def extract_behavioral_surface(src, path="<component>", backend="structural"):
     """THE SEAM. Extract the behavioral surface of a component.
 

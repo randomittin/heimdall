@@ -1,0 +1,181 @@
+#!/usr/bin/env bash
+# heimdall-ast — thin CLI over bin/lib/treesitter_ast.py, the AST substrate.
+#
+# Extracts the STRUCTURAL SURFACE of a source file via real tree-sitter parsing
+# of the C3 stacks (JS / TS / TSX / Python / Go / Rust): the definitions
+# (functions/methods/classes/components) and their call/import/extend edges. It
+# is the shared foundation SI-2 reuse, designmatch's behavioral diff, and F3
+# Redum consume — so they answer "does this changed unit call/import/extend a
+# pre-existing repo symbol?" with an AST query instead of a regex guess.
+#
+# This wrapper owns NO logic — the python lib owns the parsing and, critically,
+# the GRACEFUL DEGRADATION: tree-sitter and its grammars are OPTIONAL, lazily
+# imported deps. When they are absent, the lib returns backend:"unavailable" +
+# a reason and the commands below print that JSON and exit 0 (a missing optional
+# dep must never abort a calling task run — the Heimdall pattern). Install with:
+#   python3 -m pip install tree-sitter tree-sitter-languages
+# (or the per-language wheels: tree-sitter-{python,javascript,typescript,go,rust}
+#  — the lib tries the bundle first, then the per-language grammars.)
+#
+# Usage:
+#   heimdall-ast symbols <file> [--lang LANG]   extract definitions   → JSON
+#   heimdall-ast refs    <file> [--lang LANG]   extract call/import/extend edges
+#   heimdall-ast all     <file> [--lang LANG]   both, plus backend status
+#   heimdall-ast check                          print backend availability + exit 0
+#   heimdall-ast -h | --help
+#
+#   <file>      a source file; language is inferred from its extension unless
+#               --lang is given (js|ts|tsx|py|go|rust and their aliases).
+#
+# Exit status:
+#   0  extraction printed (INCLUDING the graceful 'unavailable' degrade — a
+#      missing tree-sitter is reported in the JSON, not a nonzero exit).
+#   2  usage error (bad subcommand / missing file / broken install).
+
+set -euo pipefail
+
+# ── Resolve the sibling python lib RELOCATABLY (no baked path) ────────────────
+# Resolve this script's real directory even when invoked through a symlink or a
+# bare name on PATH, then find lib/treesitter_ast.py next to it. Mirrors the
+# resolution pattern used by bin/heimdall-md.
+SELF_SRC="$0"
+case "$SELF_SRC" in
+  */*) : ;;
+  *)
+    RESOLVED="$(command -v "$SELF_SRC" 2>/dev/null || true)"
+    [ -n "$RESOLVED" ] && SELF_SRC="$RESOLVED"
+    ;;
+esac
+BIN_DIR="$(cd "$(dirname "$SELF_SRC")" 2>/dev/null && pwd)"
+LIB="$BIN_DIR/lib/treesitter_ast.py"
+
+if [ ! -f "$LIB" ]; then
+  echo "heimdall-ast: cannot find lib/treesitter_ast.py next to $BIN_DIR (broken install?)" >&2
+  exit 2
+fi
+
+# ── Locate a python interpreter ───────────────────────────────────────────────
+PY="$(command -v python3 || command -v python || true)"
+if [ -z "$PY" ]; then
+  # No python at all is the same lived experience as "tree-sitter absent": the
+  # substrate degrades to unavailable rather than crashing a caller. Emit the
+  # honest unavailable record and exit 0.
+  printf '{"backend":"unavailable","available":false,"reason":"python not found — AST extraction skipped (optional feature)","symbols":[],"references":[]}\n'
+  exit 0
+fi
+
+usage() {
+  sed -n '21,30p' "$SELF_SRC" | sed 's/^# \{0,1\}//'
+}
+
+# ── Parse subcommand + args ───────────────────────────────────────────────────
+if [ "$#" -lt 1 ]; then
+  usage >&2
+  exit 2
+fi
+
+CMD="$1"
+shift || true
+
+case "$CMD" in
+  -h|--help)
+    usage
+    exit 0
+    ;;
+  check)
+    # Backend availability probe — always exit 0; the JSON carries the verdict.
+    "$PY" - "$LIB" <<'PYEOF'
+import json, runpy, sys
+lib = sys.argv[1]
+ns = runpy.run_path(lib)
+sys.stdout.write(json.dumps(ns["backend_info"](), indent=2) + "\n")
+PYEOF
+    exit 0
+    ;;
+  symbols|refs|all)
+    : # handled below
+    ;;
+  *)
+    echo "heimdall-ast: unknown command '$CMD' (want: symbols | refs | all | check)" >&2
+    usage >&2
+    exit 2
+    ;;
+esac
+
+FILE=""
+LANG=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --lang)
+      LANG="${2:-}"
+      [ -n "$LANG" ] || { echo "heimdall-ast: --lang needs a value" >&2; exit 2; }
+      shift 2
+      ;;
+    --lang=*)
+      LANG="${1#--lang=}"
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    -*)
+      echo "heimdall-ast: unknown option '$1'" >&2
+      exit 2
+      ;;
+    *)
+      if [ -z "$FILE" ]; then
+        FILE="$1"
+      else
+        echo "heimdall-ast: unexpected extra argument '$1'" >&2
+        exit 2
+      fi
+      shift
+      ;;
+  esac
+done
+
+if [ -z "$FILE" ]; then
+  echo "heimdall-ast: $CMD needs a <file>" >&2
+  exit 2
+fi
+if [ ! -f "$FILE" ]; then
+  echo "heimdall-ast: no such file: $FILE" >&2
+  exit 2
+fi
+
+# ── Run the extraction in the python lib ──────────────────────────────────────
+# Args to the python helper: <lib> <cmd> <file> <lang-or-empty>. The lib does the
+# real work; on degrade it returns an 'unavailable' record which we print + exit 0.
+"$PY" - "$LIB" "$CMD" "$FILE" "$LANG" <<'PYEOF'
+import json, runpy, sys
+
+lib, cmd, path, lang = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+lang = lang or None
+ns = runpy.run_path(lib)
+
+res = ns["extract_from_path"](path, lang)
+
+if cmd == "symbols":
+    out = {
+        "lang": res.lang,
+        "backend": res.backend,
+        "available": res.available,
+        "reason": res.reason,
+        "symbols": [s.to_dict() for s in res.symbols],
+    }
+elif cmd == "refs":
+    out = {
+        "lang": res.lang,
+        "backend": res.backend,
+        "available": res.available,
+        "reason": res.reason,
+        "references": [r.to_dict() for r in res.references],
+    }
+else:  # all
+    out = res.to_dict()
+
+sys.stdout.write(json.dumps(out, indent=2) + "\n")
+PYEOF
+
+exit 0
