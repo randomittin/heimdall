@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# heimdall-frontdoor — F1 directory-aware front door + tiered design entry.
+#
+# Orients to WHAT the user has in a directory and returns a routing decision. This
+# is the standalone "orient" classifier the F1 launch path (Wave 2) calls first in
+# the orient -> resume -> persona-check -> onboard-if-cold tree.
+#
+# Default (classify) subcommand — classify the directory into one of:
+#   mid-task-resume    (.planning / checkpoint present)  -> resume
+#   existing-codebase  (git history + source)            -> orient-existing
+#   fresh-project      (manifest/source, no history)     -> orient-fresh
+#   empty-dir          (nothing meaningful)              -> onboard-new
+#
+# design subcommand — resolve the tiered design-path entry:
+#   tier A  inline-variant (DEFAULT)         -> inline-variant
+#   tier B  connect a real design tool       -> designmatch (bin/designmatch)
+#
+# Usage:
+#   heimdall-frontdoor [--json] [DIR]                         classify DIR (default cwd)
+#   heimdall-frontdoor classify [--json] [DIR]                explicit classify
+#   heimdall-frontdoor design [--json] [--source S] [--app-dir D] [TIER]
+#   heimdall-frontdoor -h | --help
+#
+# Exit: 0 on a classification/decision; 2 on usage error.
+
+set -euo pipefail
+
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+LIBDIR="$(cd "$(dirname "$SELF")/lib" && pwd)"
+FD_LIB="$LIBDIR/frontdoor.py"
+DP_LIB="$LIBDIR/design_path.py"
+
+usage() { sed -n '2,30p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+if [ $# -gt 0 ]; then
+  case "$1" in
+    -h|--help|help) usage; exit 0 ;;
+    design)
+      shift
+      if [ ! -f "$DP_LIB" ]; then
+        echo "heimdall-frontdoor: design engine not found at $DP_LIB" >&2
+        exit 2
+      fi
+      exec python3 "$DP_LIB" "$@"
+      ;;
+    classify)
+      shift
+      ;;
+  esac
+fi
+
+if [ ! -f "$FD_LIB" ]; then
+  echo "heimdall-frontdoor: classifier engine not found at $FD_LIB" >&2
+  exit 2
+fi
+exec python3 "$FD_LIB" "$@"
