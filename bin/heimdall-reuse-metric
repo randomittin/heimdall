@@ -27,6 +27,11 @@
 #   --out <file>        explicit output JSON path  (default: <repo>/.planning/reuse/<run-id>.json)
 #   --staged            diff staged changes (--cached) vs base       (default: working tree)
 #   --range <A>..<B>    analyze the diff of an explicit commit range  (sets base=A, after=B)
+#   --engine <name>     symbol/ref engine: auto|treesitter|heuristic  (default: auto)
+#                       auto/treesitter use the tree-sitter AST substrate, falling
+#                       back to the heuristic per-file when a grammar is missing;
+#                       heuristic forces the stdlib-ast/regex engine. Also settable
+#                       via HEIMDALL_REUSE_ENGINE (the --engine flag wins).
 #   --json-job <file>   skip git: feed a prebuilt analyzer job JSON   (testing)
 #   --print             also print the record JSON to stdout
 #   --quiet             suppress the one-line human summary on stderr
@@ -43,7 +48,7 @@ set -euo pipefail
 SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 LIB="$(cd "$(dirname "$SELF")/lib" && pwd)/reuse_analyzer.py"
 
-usage() { sed -n '2,38p' "$SELF" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,44p' "$SELF" | sed 's/^# \{0,1\}//'; }
 
 REPO="$(pwd)"
 BASE="HEAD"
@@ -55,6 +60,7 @@ STAGED=0
 JSON_JOB=""
 PRINT=0
 QUIET=0
+ENGINE="${HEIMDALL_REUSE_ENGINE:-auto}"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -65,6 +71,7 @@ while [ $# -gt 0 ]; do
     --out)      OUT="${2:?--out needs a path}"; shift 2 ;;
     --staged)   STAGED=1; shift ;;
     --range)    R="${2:?--range needs A..B}"; BASE="${R%%..*}"; AFTER="${R##*..}"; shift 2 ;;
+    --engine)   ENGINE="${2:?--engine needs auto|treesitter|heuristic}"; shift 2 ;;
     --json-job) JSON_JOB="${2:?--json-job needs a file}"; shift 2 ;;
     --print)    PRINT=1; shift ;;
     --quiet)    QUIET=1; shift ;;
@@ -72,6 +79,13 @@ while [ $# -gt 0 ]; do
     *) echo "error: unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
+
+case "$ENGINE" in
+  auto|treesitter|heuristic) ;;
+  *) echo "error: --engine must be auto|treesitter|heuristic (got: $ENGINE)" >&2; exit 2 ;;
+esac
+# Export so both the analyzer (job field) and any nested resolve honor it.
+export HEIMDALL_REUSE_ENGINE="$ENGINE"
 
 PY="$(command -v python3 || command -v python || true)"
 if [ -z "$PY" ]; then
@@ -181,7 +195,7 @@ PYEOF
 
   # Pass everything to python via env; python reads file bodies itself through
   # `git show` to avoid shell-quoting source contents.
-  REPO="$REPO" BASE="$BASE" AFTER="$AFTER" STAGED="$STAGED" TASK="$TASK" \
+  REPO="$REPO" BASE="$BASE" AFTER="$AFTER" STAGED="$STAGED" TASK="$TASK" ENGINE="$ENGINE" \
   "$PY" - <<'PYEOF' > "$JOB_FILE"
 import json, os, subprocess, sys
 
@@ -190,6 +204,7 @@ base = os.environ["BASE"]
 after = os.environ["AFTER"]
 staged = os.environ["STAGED"] == "1"
 task = os.environ["TASK"]
+engine = os.environ.get("ENGINE", "auto")
 
 SRC_EXT = {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".py", ".sh", ".bash"}
 
@@ -271,8 +286,8 @@ for p in git("ls-tree", "-r", "--name-only", base).stdout.splitlines():
     if body is not None:
         pre_files[p] = body
 
-json.dump({"task": task, "pre_files": pre_files, "changed_files": changed_files},
-          sys.stdout)
+json.dump({"task": task, "engine": engine, "pre_files": pre_files,
+           "changed_files": changed_files}, sys.stdout)
 PYEOF
   JOB_SRC="$JOB_FILE"
 fi

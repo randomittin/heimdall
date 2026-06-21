@@ -1,0 +1,397 @@
+#!/usr/bin/env bash
+# heimdall-attest — SI-2 commit-time attestation record: emit + read.
+#
+# Emits ONE structured record per commit/task that every downstream feature
+# (F2 Checker, F3 Redum, F4 Collision, F5 Debloat, F6 Team-mode) READS so none of
+# them re-analyze the diff. One emission, many readers.
+#
+# Record schema { claims, contracts, evidence, reuse, risk } (full spec + a sample
+# in SI-2.md; the builder is bin/lib/attestation.py):
+#   claims    — what the change asserts it does, derived from the diff.
+#   contracts — the exported/public symbols it adds or changes (tree-sitter).
+#   evidence  — RUNNABLE proof: the acceptance/test/build commands THIS tool ran
+#               and their real exit codes — never the agent's self-report.
+#   reuse     — THE S-6 reuse record from the unified analyzer (AST substrate).
+#   risk      — reviewer-facing flags derived from the other fields.
+#
+# Records are written to a gitignored runtime store:
+#   ${HEIMDALL_HOME:-<repo>/.heimdall}/attestations/<id>.json
+# (.heimdall/ is gitignored, so attestations never pollute the tree.)
+#
+# Usage:
+#   heimdall-attest emit  [options]            emit a record for a diff
+#   heimdall-attest get   <id> [--repo <dir>]  print the record for an id
+#   heimdall-attest list  [--repo <dir>]       list stored attestation ids
+#   heimdall-attest path  <id> [--repo <dir>]  print the on-disk path for an id
+#
+# emit options:
+#   --repo <dir>      repo to attest                 (default: cwd)
+#   --base <ref>      the BEFORE commit/ref           (default: HEAD)
+#   --range <A>..<B>  attest an explicit commit range (sets base=A, after=B)
+#   --staged          attest staged changes (--cached) vs base
+#   --task <str>      task label                      (default: derived from log)
+#   --id <id>         record id / output stem    (default: <commit>|<runid>)
+#   --engine <name>   reuse engine auto|treesitter|heuristic   (default: auto)
+#   --evidence <cmd>  a runnable proof command; repeatable. Each is EXECUTED in
+#                     the repo and its real exit code recorded under evidence.
+#   --evidence-json <file>  pre-run evidence as JSON [{cmd,exit,...}] (skips run)
+#   --print           also print the record JSON to stdout
+#   --quiet           suppress the one-line human summary on stderr
+#
+# Exit status:
+#   0  record emitted / read (including honest PARTIAL records)
+#   2  usage error
+#   3  get/path: no record for that id
+# emit NEVER exits nonzero on an analysis failure — a PARTIAL record is written so
+# a commit is never blocked by attestation (degrade-gracefully, like the gate).
+
+set -euo pipefail
+
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+BINDIR="$(dirname "$SELF")"
+LIB="$BINDIR/lib/attestation.py"
+
+usage() { sed -n '2,46p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+PY="$(command -v python3 || command -v python || true)"
+if [ -z "$PY" ]; then
+  echo "error: python3 not found (required for attestation)" >&2
+  exit 2
+fi
+
+# ── store location (gitignored runtime, no baked paths) ───────────────────────
+store_dir() {
+  # $1 = repo. Honors HEIMDALL_HOME; defaults to <repo>/.heimdall.
+  local repo="$1"
+  printf '%s/attestations' "${HEIMDALL_HOME:-$repo/.heimdall}"
+}
+
+[ $# -ge 1 ] || { usage >&2; exit 2; }
+SUB="$1"; shift
+
+case "$SUB" in
+  -h|--help) usage; exit 0 ;;
+esac
+
+# ── shared option parsing ─────────────────────────────────────────────────────
+REPO="$(pwd)"
+BASE="HEAD"
+AFTER=""
+STAGED=0
+TASK=""
+ID=""
+ENGINE="${HEIMDALL_REUSE_ENGINE:-auto}"
+PRINT=0
+QUIET=0
+EVIDENCE_CMDS=()
+EVIDENCE_JSON=""
+POSARG=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --repo)          REPO="${2:?--repo needs a dir}"; shift 2 ;;
+    --base)          BASE="${2:?--base needs a ref}"; shift 2 ;;
+    --range)         R="${2:?--range needs A..B}"; BASE="${R%%..*}"; AFTER="${R##*..}"; shift 2 ;;
+    --staged)        STAGED=1; shift ;;
+    --task)          TASK="${2:?--task needs a value}"; shift 2 ;;
+    --id)            ID="${2:?--id needs a value}"; shift 2 ;;
+    --engine)        ENGINE="${2:?--engine needs a value}"; shift 2 ;;
+    --evidence)      EVIDENCE_CMDS+=("${2:?--evidence needs a command}"); shift 2 ;;
+    --evidence-json) EVIDENCE_JSON="${2:?--evidence-json needs a file}"; shift 2 ;;
+    --print)         PRINT=1; shift ;;
+    --quiet)         QUIET=1; shift ;;
+    -h|--help)       usage; exit 0 ;;
+    --*)             echo "error: unknown option: $1" >&2; usage >&2; exit 2 ;;
+    *)               POSARG="$1"; shift ;;
+  esac
+done
+
+case "$ENGINE" in
+  auto|treesitter|heuristic) ;;
+  *) echo "error: --engine must be auto|treesitter|heuristic (got: $ENGINE)" >&2; exit 2 ;;
+esac
+export HEIMDALL_REUSE_ENGINE="$ENGINE"
+
+# ── readers: get / list / path ────────────────────────────────────────────────
+record_path_for() {
+  # $1 = id. Echoes the on-disk record path (does not check existence).
+  printf '%s/%s.json' "$(store_dir "$REPO")" "$1"
+}
+
+if [ "$SUB" = "get" ] || [ "$SUB" = "path" ]; then
+  RID="${POSARG:-}"
+  [ -n "$RID" ] || { echo "error: $SUB needs an <id>" >&2; usage >&2; exit 2; }
+  RPATH="$(record_path_for "$RID")"
+  if [ ! -f "$RPATH" ]; then
+    echo "error: no attestation record for id: $RID (looked in $(store_dir "$REPO"))" >&2
+    exit 3
+  fi
+  if [ "$SUB" = "path" ]; then
+    printf '%s\n' "$RPATH"
+  else
+    cat "$RPATH"
+  fi
+  exit 0
+fi
+
+if [ "$SUB" = "list" ]; then
+  SDIR="$(store_dir "$REPO")"
+  if [ ! -d "$SDIR" ]; then
+    exit 0
+  fi
+  # list ids (basename without .json), newest first; guard the pipe under set -e.
+  ls -1t "$SDIR" 2>/dev/null | sed -n 's/\.json$//p' || true
+  exit 0
+fi
+
+if [ "$SUB" != "emit" ]; then
+  echo "error: unknown subcommand: $SUB" >&2
+  usage >&2
+  exit 2
+fi
+
+# ── emit ──────────────────────────────────────────────────────────────────────
+if ! git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
+  echo "error: --repo is not a git repository: $REPO" >&2
+  exit 2
+fi
+
+# Resolve a stable id: explicit --id, else the after/base commit sha, else a
+# timestamp+pid run-id (uncommitted working tree).
+if [ -z "$ID" ]; then
+  if [ -n "$AFTER" ]; then
+    ID="$(git -C "$REPO" rev-parse --short "$AFTER" 2>/dev/null || true)"
+  elif [ "$STAGED" -eq 0 ]; then
+    ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  else
+    ID="staged-$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo head)-$$"
+  fi
+  [ -n "$ID" ] || ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+fi
+
+if [ -z "$TASK" ]; then
+  TASK="$(git -C "$REPO" log -1 --pretty=%s 2>/dev/null || echo "uncommitted-changes")"
+fi
+
+SDIR="$(store_dir "$REPO")"
+mkdir -p "$SDIR" 2>/dev/null || true
+OUT="$SDIR/$ID.json"
+
+# ── run evidence commands (capture REAL exit codes — never self-report) ───────
+# Each --evidence command is executed in the repo; we record {cmd, exit}. A
+# failing command does NOT abort emission — its non-zero exit is recorded and
+# surfaced as a risk. The pipeline below builds an evidence JSON array.
+EV_TMPL="attest-ev.$(printf 'X%.0s' 1 2 3 4 5 6)"
+EV_FILE="$(mktemp -t "$EV_TMPL")"
+JOB_TMPL="attest-job.$(printf 'X%.0s' 1 2 3 4 5 6)"
+JOB_FILE="$(mktemp -t "$JOB_TMPL")"
+cleanup() { rm -f "$EV_FILE" "$JOB_FILE"; }
+trap cleanup EXIT
+
+if [ -n "$EVIDENCE_JSON" ]; then
+  if [ ! -f "$EVIDENCE_JSON" ]; then
+    echo "error: --evidence-json file not found: $EVIDENCE_JSON" >&2
+    exit 2
+  fi
+  cp "$EVIDENCE_JSON" "$EV_FILE"
+else
+  # Execute each command, capturing exit + a short stdout tail, into a JSON array.
+  printf '[' > "$EV_FILE"
+  FIRST=1
+  for cmd in "${EVIDENCE_CMDS[@]+"${EVIDENCE_CMDS[@]}"}"; do
+    # run in the repo; capture combined output + real exit code (guarded).
+    OUT_TAIL="$(cd "$REPO" && bash -c "$cmd" 2>&1 | tail -n 20 || true)"
+    # the exit code of the command itself (not the tail pipeline).
+    set +e
+    ( cd "$REPO" && bash -c "$cmd" ) >/dev/null 2>&1
+    EV_RC=$?
+    set -e
+    [ "$FIRST" -eq 1 ] || printf ',' >> "$EV_FILE"
+    FIRST=0
+    CMD="$cmd" RC="$EV_RC" TAIL="$OUT_TAIL" "$PY" - >> "$EV_FILE" <<'PYEOF'
+import json, os
+print(json.dumps({
+    "cmd": os.environ["CMD"],
+    "exit": int(os.environ["RC"]),
+    "kind": "evidence",
+    "stdout_tail": os.environ.get("TAIL", "")[-2000:],
+}), end="")
+PYEOF
+  done
+  printf ']' >> "$EV_FILE"
+fi
+
+# ── build the analyzer job {task, commit, engine, pre_files, changed_files, …} ─
+# Python reads file bodies through git (after side = working tree / after-commit;
+# before side = base commit) — the same extraction the reuse metric uses, so the
+# reuse field is computed on the identical diff scope.
+REPO="$REPO" BASE="$BASE" AFTER="$AFTER" STAGED="$STAGED" TASK="$TASK" \
+ID="$ID" ENGINE="$ENGINE" EV_FILE="$EV_FILE" \
+"$PY" - > "$JOB_FILE" <<'PYEOF'
+import json, os, subprocess
+
+repo = os.environ["REPO"]
+base = os.environ["BASE"]
+after = os.environ["AFTER"]
+staged = os.environ["STAGED"] == "1"
+task = os.environ["TASK"]
+commit = os.environ["ID"]
+engine = os.environ.get("ENGINE", "auto")
+
+SRC_EXT = {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".py", ".sh", ".bash"}
+
+
+def is_src(path):
+    return (
+        os.path.splitext(path)[1].lower() in SRC_EXT
+        or "." not in os.path.basename(path)
+    )
+
+
+def git(*args):
+    p = subprocess.run(["git", "-C", repo, *args], capture_output=True)
+    return p.stdout.decode("utf-8", "replace"), p.returncode
+
+
+# changed file names + status letters (added/modified/renamed).
+if after:
+    status_args = ["diff", "--name-status", "--diff-filter=ACMR", base, after]
+elif staged:
+    status_args = ["diff", "--name-status", "--diff-filter=ACMR", "--cached", base]
+else:
+    status_args = ["diff", "--name-status", "--diff-filter=ACMR", base]
+
+statuses = {}
+changed = []
+out, _ = git(*status_args)
+for line in out.splitlines():
+    if not line.strip():
+        continue
+    parts = line.split("\t")
+    code = parts[0].strip()
+    # rename rows are "R100\told\tnew" — the new path is the last field.
+    path = parts[-1].strip()
+    if not path:
+        continue
+    statuses[path] = code[:1]
+    changed.append(path)
+
+# working-tree case: include untracked-but-not-ignored files (new files a real
+# task run writes that are not yet committed/staged) as additions.
+if not after and not staged:
+    unt, _ = git("ls-files", "--others", "--exclude-standard")
+    seen = set(changed)
+    for u in unt.splitlines():
+        u = u.strip()
+        if u and u not in seen:
+            changed.append(u)
+            statuses[u] = "A"
+            seen.add(u)
+
+
+def read_after(path):
+    if after:
+        body, rc = git("show", "%s:%s" % (after, path))
+        return body if rc == 0 else None
+    fp = os.path.join(repo, path)
+    if not after and not staged and os.path.exists(fp):
+        try:
+            with open(fp, "r", errors="replace") as fh:
+                return fh.read()
+        except OSError:
+            return None
+    if staged:
+        body, rc = git("show", ":%s" % path)
+        return body if rc == 0 else None
+    return None
+
+
+def read_base(path):
+    body, rc = git("show", "%s:%s" % (base, path))
+    return body if rc == 0 else None
+
+
+changed_files = {}
+for p in changed:
+    if not is_src(p):
+        # non-source files still belong in claims (with no units); keep an empty
+        # body so claims lists them without a parse.
+        changed_files[p] = ""
+        continue
+    body = read_after(p)
+    if body is not None:
+        changed_files[p] = body
+
+# pre-change symbol table source: every tracked source file at BASE.
+pre_files = {}
+tree, _ = git("ls-tree", "-r", "--name-only", base)
+for p in tree.splitlines():
+    p = p.strip()
+    if not p or not is_src(p):
+        continue
+    body = read_base(p)
+    if body is not None:
+        pre_files[p] = body
+
+with open(os.environ["EV_FILE"], "r", errors="replace") as fh:
+    raw_ev = fh.read().strip()
+try:
+    evidence = json.loads(raw_ev) if raw_ev else []
+except Exception:
+    evidence = []
+
+print(json.dumps({
+    "task": task,
+    "commit": commit,
+    "engine": engine,
+    "pre_files": pre_files,
+    "changed_files": changed_files,
+    "statuses": statuses,
+    "evidence": evidence,
+}))
+PYEOF
+
+# ── build the record (degrade to PARTIAL, never abort) ────────────────────────
+SUMTMP="$(mktemp -t "attest-sum.$(printf 'X%.0s' 1 2 3 4 5 6)")"
+set +e
+REC="$("$PY" "$LIB" < "$JOB_FILE" 2>"$SUMTMP")"
+RC=$?
+SUMMARY="$(cat "$SUMTMP" 2>/dev/null || true)"
+rm -f "$SUMTMP"
+set -e
+
+if [ "$RC" -ne 0 ] || [ -z "$REC" ]; then
+  # The builder itself never raises, but if python died (e.g. OOM) emit an honest
+  # minimal PARTIAL record so a reader still finds something — never block a commit.
+  REC="$(TASK="$TASK" ID="$ID" ENGINE="$ENGINE" "$PY" - <<'PYEOF'
+import json, os
+print(json.dumps({
+    "schema": "si-2.1",
+    "task": os.environ["TASK"],
+    "commit": os.environ["ID"],
+    "engine": os.environ["ENGINE"],
+    "claims": {"summary": "analysis-unavailable", "files": [], "file_count": 0, "unit_count": 0},
+    "contracts": {"summary": "analysis-unavailable", "surface": [], "by_file": []},
+    "evidence": {"checks": [], "ran": 0, "all_passed": False, "reason": "builder-error"},
+    "reuse": {"units_total": 0, "units_reusing": 0, "units_reinventing": 0,
+              "reuse_pct": None, "reused_symbols": [], "suspected_duplicates": [],
+              "engine": os.environ["ENGINE"], "partial": True, "reason": "builder-error"},
+    "risk": {"overall": "info", "flags": [
+        {"level": "info", "code": "partial-analysis", "detail": "attestation builder error — partial record"}]},
+    "partial": True,
+    "partial_reasons": ["builder-error"],
+}, indent=2))
+PYEOF
+)"
+fi
+
+printf '%s\n' "$REC" > "$OUT"
+[ "$PRINT" -eq 1 ] && printf '%s\n' "$REC"
+if [ "$QUIET" -ne 1 ]; then
+  if [ -n "$SUMMARY" ]; then
+    printf '%s\n  ▸ wrote %s\n' "$SUMMARY" "$OUT" >&2
+  else
+    printf 'attest: wrote %s\n' "$OUT" >&2
+  fi
+fi
+exit 0
