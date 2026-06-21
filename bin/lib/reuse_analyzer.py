@@ -50,6 +50,185 @@ import os
 import re
 import sys
 
+# ── tree-sitter substrate (PRIMARY engine) ────────────────────────────────────
+#
+# The reuse metric's symbol/reference DETECTION can run on either of two engines:
+#
+#   • "treesitter" — the PRIMARY engine. Resolves each changed/added unit's
+#     call/import/extend edges from a REAL AST (bin/lib/treesitter_ast.py), the
+#     honest answer to "does this unit reference a pre-existing repo symbol?".
+#   • "heuristic"  — the REQUIRED graceful fallback (the original `ast`/regex
+#     engine below). Used when tree-sitter or a grammar is unavailable (the
+#     stranger-test env ships no tree-sitter) so the analyzer NEVER crashes.
+#
+# The metric DEFINITION (reuse % = changed units that call/import/extend a
+# pre-existing repo symbol ÷ total), the diff-scoping (test/fixture exclusion),
+# and the JSON record fields are IDENTICAL across engines — only the symbol/
+# reference detection differs. The chosen engine is recorded in the record's
+# `"engine"` field so a reader knows which backend produced the numbers.
+#
+# tree-sitter is LAZY-imported via the substrate module (which itself lazy-imports
+# the grammars). A failed import is recorded once and degrades to heuristic.
+
+_TS_STATE = {"checked": False, "mod": None}
+
+
+def _ts_module():
+    """Lazy-load the tree-sitter substrate module (bin/lib/treesitter_ast.py),
+    which lives alongside this file. Returns the module or None if it cannot be
+    imported (degrade to heuristic, never crash)."""
+    if _TS_STATE["checked"]:
+        return _TS_STATE["mod"]
+    _TS_STATE["checked"] = True
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        if here not in sys.path:
+            sys.path.insert(0, here)
+        import treesitter_ast as ts  # noqa: WPS433 — lazy by design
+        _TS_STATE["mod"] = ts
+    except Exception:  # noqa: BLE001 — any import failure → heuristic fallback
+        _TS_STATE["mod"] = None
+    return _TS_STATE["mod"]
+
+
+# Engine selection. "auto" (default) prefers tree-sitter when its backend +
+# grammar are available for the file's language, else heuristic. An explicit
+# "heuristic" forces the fallback (used to prove the contract holds on the
+# stranger-test path); "treesitter" forces the AST engine (degrades per-file to
+# heuristic only when that specific file's grammar is missing — never crashes).
+_FORCE_ENGINE_ENV = "HEIMDALL_REUSE_ENGINE"
+
+
+def resolve_engine(requested=None):
+    """Resolve the engine name to use. Precedence: explicit `requested` arg →
+    the HEIMDALL_REUSE_ENGINE env var → "auto". Returns one of
+    "auto" | "treesitter" | "heuristic"."""
+    val = (requested or os.environ.get(_FORCE_ENGINE_ENV) or "auto").strip().lower()
+    if val not in ("auto", "treesitter", "heuristic"):
+        val = "auto"
+    return val
+
+
+def _ts_lang_for(lang, path):
+    """Map this analyzer's coarse language tag (js|py|sh) + path to a tree-sitter
+    canonical language, or None if the substrate can't parse it (→ heuristic)."""
+    ts = _ts_module()
+    if ts is None:
+        return None
+    if lang == "py":
+        return "python"
+    if lang == "js":
+        # distinguish ts/tsx via extension so the right grammar is used.
+        return ts.lang_for_path(path) or "javascript"
+    return None  # shell + anything else: no tree-sitter grammar → heuristic
+
+
+def _ts_extract_units(src, lang, path):
+    """Tree-sitter extraction producing the SAME (units, module_refs) shape the
+    heuristic `extract_units` returns. Each Unit's `refs` are the call/import/
+    extend edges whose AST line falls inside that unit's span; module-level
+    imports become `module_refs` (credited to a unit only when its body also
+    references the name — the same anti-inflation rule the heuristic applies).
+
+    Returns (units, module_refs) on success, or None when tree-sitter/the grammar
+    is unavailable for this file (caller falls back to the heuristic)."""
+    ts = _ts_module()
+    if ts is None:
+        return None
+    tslang = _ts_lang_for(lang, path)
+    if tslang is None:
+        return None
+    res = ts.extract(src, tslang)
+    if not res.available:
+        return None  # backend/grammar missing for this file → heuristic fallback
+
+    # Sort definitions by span start so attribution can pick the INNERMOST
+    # enclosing unit for a nested def (smallest containing span wins).
+    syms = sorted(res.symbols, key=lambda s: (s.span[0], -s.span[1]))
+    spans = [(s.name, s.span[0], s.span[1]) for s in syms]
+
+    def enclosing_unit_index(line):
+        # the smallest span that contains `line`; -1 if none (module level).
+        best = -1
+        best_size = None
+        for i, (_n, a, b) in enumerate(spans):
+            if a <= line <= b:
+                size = b - a
+                if best_size is None or size < best_size:
+                    best, best_size = i, size
+        return best
+
+    src_lines = src.splitlines()
+
+    def _unit_body(a, b):
+        # 1-based inclusive line span → the unit's source slice.
+        return "\n".join(src_lines[a - 1:b])
+
+    units = [Unit(name, lang, path, src) for (name, _a, _b) in spans]
+    module_refs = set()       # names brought into module scope (imports)
+    module_body_refs = set()  # call/extend refs at module level (top-level glue)
+
+    # SUPPLEMENT: instantiation (`new X(...)`) and JSX-render (`<X .../>`) are real
+    # reuse edges that the substrate's public reference API does not emit as
+    # call/import/extend Refs (a `new_expression`/JSX element is neither). Recover
+    # them per-unit from the unit's AST-bounded body slice so an endpoint that
+    # instantiates a pre-existing model or renders a pre-existing component is
+    # credited identically to one that calls a pre-existing function. This is the
+    # one place the AST engine borrows the heuristic's `new`/JSX matcher to cover
+    # an edge kind the substrate omits — symbol/call/import/extend resolution stays
+    # tree-sitter. (Python has no analogue: instantiation there is a `call`, which
+    # the substrate already emits.)
+    if lang == "js":
+        for i, (_n, a, b) in enumerate(spans):
+            body = _unit_body(a, b)
+            for m in _JS_NEW.finditer(body):
+                units[i].refs.add(m.group(1).split(".")[-1])
+                units[i].refs.add(m.group(1).split(".")[0])
+            for m in _JS_JSX.finditer(body):
+                units[i].refs.add(m.group(1).split(".")[0])
+
+    for ref in res.references:
+        idx = enclosing_unit_index(ref.line)
+        if ref.kind == "import":
+            # an import edge: the imported NAME is available module-wide.
+            module_refs.add(ref.name)
+            module_refs.add(ref.name.split(".")[-1])
+            mod = ref.detail.get("module") if ref.detail else None
+            if mod:
+                base = os.path.basename(mod)
+                module_refs.add(base)
+                module_refs.add(os.path.splitext(base)[0])
+            if idx >= 0:
+                # an import physically inside a unit's span credits that unit
+                # directly (it is in that unit's body).
+                units[idx].refs.add(ref.name)
+                units[idx].refs.add(ref.name.split(".")[-1])
+            continue
+        # call / extend edge: attribute to the enclosing unit, else module glue.
+        nm = ref.name.split(".")[-1]
+        if idx >= 0:
+            units[idx].refs.add(nm)
+        else:
+            module_body_refs.add(nm)
+
+    # Anti-inflation: a unit gets credit for a module-level import only when its
+    # body actually references the imported name (mirrors the heuristic's
+    # `_import_credit`). A sibling unit that never touches the import is not
+    # crediting it.
+    for u in units:
+        u.refs |= (module_refs & u.refs)
+
+    # Top-level glue (refs outside any unit). If there are NO named units but the
+    # module has executable references, synthesize a module unit so a glue-only
+    # diff is still measured (never silently 0/0) — same as the heuristic.
+    if not units and (module_body_refs or module_refs):
+        mu = Unit("<module:%s>" % os.path.basename(path), lang, path, src)
+        mu.refs |= module_body_refs
+        mu.refs |= (module_refs & module_body_refs)
+        units = [mu]
+
+    return units, module_refs
+
 # ── language detection ────────────────────────────────────────────────────────
 
 JS_TS_EXT = {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"}
@@ -378,7 +557,9 @@ def extract_sh_units(src, path):
 #    unit when no named units are found in a SUPPORTED language. ────────────────
 
 
-def extract_units(src, lang, path):
+def extract_units_heuristic(src, lang, path):
+    """The HEURISTIC engine (stdlib `ast` for Python, regex for JS/shell). This is
+    the REQUIRED graceful fallback that always works with zero extra deps."""
     if lang == "py":
         units, module_refs = extract_py_units(src, path)
         if units is None:  # SyntaxError -> cannot AST-parse
@@ -389,6 +570,30 @@ def extract_units(src, lang, path):
     if lang in ("sh", "sh_maybe"):
         return extract_sh_units(src, path)
     return None, None
+
+
+def extract_units(src, lang, path, engine="auto"):
+    """Engine-aware unit extraction. Returns (units, module_refs, engine_used).
+
+    `engine` is one of "auto" | "treesitter" | "heuristic":
+      - "treesitter" / "auto": try the tree-sitter substrate first; if it cannot
+        parse this file's language (no backend, missing grammar, or a non-AST
+        language like shell), fall back to the heuristic — never crash.
+      - "heuristic": force the original stdlib-ast/regex engine.
+
+    The returned `engine_used` is the engine that actually produced the units
+    ("treesitter" or "heuristic"), so the record reports it honestly even when a
+    per-file fallback happened under "auto"/"treesitter"."""
+    if engine in ("auto", "treesitter"):
+        ts_result = _ts_extract_units(src, lang, path)
+        if ts_result is not None:
+            units, module_refs = ts_result
+            return units, module_refs, "treesitter"
+        # forced/auto tree-sitter but this file isn't AST-parseable (e.g. shell,
+        # or grammar missing): fall back to the heuristic for THIS file. The
+        # overall run still reports treesitter if another file used it.
+    units, module_refs = extract_units_heuristic(src, lang, path)
+    return units, module_refs, "heuristic"
 
 
 # ── reuse / reinvention classification ────────────────────────────────────────
@@ -480,10 +685,14 @@ def self_names_minus(self_names, keep):
 # ── public entry: compute the record from changed files + a pre-symbol table ──
 
 
-def build_pre_symbols(pre_files):
+def build_pre_symbols(pre_files, engine="auto"):
     """pre_files: dict {path: source} of repo files BEFORE the change.
     Returns the set of pre-existing symbol names (function/class/component +
     module basenames, so an import of a pre-existing file resolves).
+
+    The same `engine` (tree-sitter primary / heuristic fallback) extracts the
+    pre-existing symbol table so BOTH sides of the comparison are detected by the
+    same backend.
 
     Test / fixture files are EXCLUDED: their symbols (test classes, fixture
     helpers like `dataset` / `check_id`) are not pre-existing PRODUCTION repo
@@ -496,7 +705,7 @@ def build_pre_symbols(pre_files):
         lang = detect_language(path)
         if lang is None:
             continue
-        units, _ = extract_units(src, lang, path)
+        units, _, _used = extract_units(src, lang, path, engine)
         if units:
             for u in units:
                 syms.add(u.name)
@@ -507,13 +716,16 @@ def build_pre_symbols(pre_files):
     return syms
 
 
-def analyze(task, changed_files, pre_symbols):
+def analyze(task, changed_files, pre_symbols, engine="auto"):
     """changed_files: dict {path: source} of the CHANGED/ADDED side of the diff.
-    pre_symbols: set from build_pre_symbols. Returns the record dict."""
+    pre_symbols: set from build_pre_symbols. `engine` selects the symbol/reference
+    detection backend ("auto" | "treesitter" | "heuristic"). Returns the record
+    dict, including an `"engine"` field naming the backend that produced it."""
     all_units = []
     self_names = set()
     langs_seen = set()
     unsupported = []
+    engines_used = set()
 
     # Scope the changed-unit set to PRODUCTION units in the diff. Test/fixture
     # files in the diff are excluded so a production task is not measured over the
@@ -538,17 +750,18 @@ def analyze(task, changed_files, pre_symbols):
         if lang is None:
             unsupported.append(path)
             continue
-        units, _ = extract_units(src, lang, path)
+        units, mod_refs, used = extract_units(src, lang, path, engine)
         if units is None:
             # could not parse a supported language (e.g. py syntax error) — honest
             unsupported.append(path)
             continue
+        engines_used.add(used)
         langs_seen.add("py" if lang == "py" else "js" if lang == "js" else "sh")
         if not units and src.strip():
             # supported language, no named units, but non-empty: one module unit
             u = Unit("<module:%s>" % os.path.basename(path), lang, path, src)
             if lang == "py":
-                u.refs |= (extract_units(src, lang, path)[1] or set())
+                u.refs |= (mod_refs or set())
             elif lang == "js":
                 u.refs |= _js_body_refs(src)
             else:
@@ -561,6 +774,22 @@ def analyze(task, changed_files, pre_symbols):
 
     units_total = len(all_units)
 
+    # The engine that produced the analyzed units. If any unit came from
+    # tree-sitter, report "treesitter" (the run used the AST substrate); only if
+    # every file fell back do we report "heuristic". When nothing was analyzable,
+    # report the requested engine resolution honestly.
+    if engines_used == {"treesitter"} or "treesitter" in engines_used:
+        engine_used = "treesitter"
+    elif engines_used:
+        engine_used = "heuristic"
+    else:
+        req = resolve_engine(engine)
+        engine_used = "heuristic" if req == "heuristic" else (
+            "treesitter" if _ts_module() is not None
+            and getattr(_ts_module(), "backend_available", lambda: False)()
+            else "heuristic"
+        )
+
     if units_total == 0:
         # nothing analyzable. If we saw only unsupported files, be honest.
         record = {
@@ -571,6 +800,7 @@ def analyze(task, changed_files, pre_symbols):
             "reuse_pct": None,
             "reused_symbols": [],
             "suspected_duplicates": [],
+            "engine": engine_used,
         }
         if unsupported:
             record["reason"] = "unsupported-language"
@@ -591,6 +821,7 @@ def analyze(task, changed_files, pre_symbols):
         "reused_symbols": reused_list,
         "suspected_duplicates": suspected,
         "languages": sorted(langs_seen),
+        "engine": engine_used,
     }
     if unsupported:
         record["unsupported_files"] = unsupported
@@ -608,7 +839,7 @@ def human_summary(record):
     dups = len(record["suspected_duplicates"])
     return (
         "reuse: %.0f%% (%d/%d units reuse pre-existing repo code; "
-        "%d reinventing; %d suspected duplicate%s) — task=%r"
+        "%d reinventing; %d suspected duplicate%s) [engine=%s] — task=%r"
         % (
             pct,
             record["units_reusing"],
@@ -616,6 +847,7 @@ def human_summary(record):
             record["units_reinventing"],
             dups,
             "" if dups == 1 else "s",
+            record.get("engine", "?"),
             record["task"],
         )
     )
@@ -625,11 +857,13 @@ def human_summary(record):
 #
 # Job schema (stdin JSON):
 #   { "task": str,
+#     "engine": "auto"|"treesitter"|"heuristic",  # optional; default auto/env
 #     "pre_files":     { path: source, ... },   # repo before the change
 #     "changed_files": { path: source, ... } }  # added/changed side of the diff
 #
 # Emits the record JSON to stdout. The one-line human summary goes to stderr so
-# callers can capture pure JSON on stdout.
+# callers can capture pure JSON on stdout. The engine may also be forced via the
+# HEIMDALL_REUSE_ENGINE env var (the job field takes precedence when present).
 
 
 def main(argv):
@@ -638,8 +872,9 @@ def main(argv):
     task = job.get("task", "")
     pre_files = job.get("pre_files", {})
     changed_files = job.get("changed_files", {})
-    pre_symbols = build_pre_symbols(pre_files)
-    record = analyze(task, changed_files, pre_symbols)
+    engine = resolve_engine(job.get("engine"))
+    pre_symbols = build_pre_symbols(pre_files, engine)
+    record = analyze(task, changed_files, pre_symbols, engine)
     sys.stdout.write(json.dumps(record, indent=2) + "\n")
     sys.stderr.write(human_summary(record) + "\n")
     return 0

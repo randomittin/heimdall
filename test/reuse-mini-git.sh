@@ -101,9 +101,11 @@ git -C "$REPO" commit -qm "base: existing format helper, db client, User model"
 BASE="$(git -C "$REPO" rev-parse HEAD)"
 
 emit() {
-  # $1 run-id ; echoes the record path. Analyzes working tree vs BASE.
-  local rid="$1"
-  "$METRIC" --repo "$REPO" --base "$BASE" --task "$rid" --run-id "$rid" --quiet >/dev/null
+  # $1 run-id ; $2 (optional) engine: auto|treesitter|heuristic. Echoes the
+  # record path. Analyzes working tree vs BASE.
+  local rid="$1" engine="${2:-auto}"
+  "$METRIC" --repo "$REPO" --base "$BASE" --task "$rid" --run-id "$rid" \
+            --engine "$engine" --quiet >/dev/null
   echo "$REPO/.planning/reuse/$rid.json"
 }
 
@@ -245,6 +247,85 @@ reset_tree
 #   of the gated CI suite (it spends + is non-deterministic) — it is the optional
 #   manual confirmation that the controlled result holds against the live model.
 # ─────────────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+# (3) SUBSTRATE-SWAP AGREEMENT — the AST engine and the heuristic engine must
+#     reach the SAME verdict on the C2 fixture: the good solution classifies as
+#     REUSE (formatUser/getUser/User in reused_symbols) and the reinvention
+#     classifies as DUPLICATE (formatUser/getUser in suspected_duplicates +
+#     reuse_pct < 0.30) under BOTH engines. This proves swapping the symbol/
+#     reference DETECTION from regex to tree-sitter preserves the metric's
+#     behavior — the definition, scoping, and verdict are engine-independent.
+# ─────────────────────────────────────────────────────────────────────────────
+good_reuses_under() {
+  # $1 engine -> echoes "yes" if the good diff is classified as reuse.
+  local eng="$1" rec
+  cat > "$REPO/api/users.js" <<'EOF'
+import { getUser } from "../db/client.js";
+import { formatUser } from "../utils/format.js";
+import { User } from "../models/user.js";
+export function loadUser(id) { return getUser(id); }
+export function toUserModel(row) { return new User(row); }
+export function userEndpoint(req, res) {
+  const model = toUserModel(loadUser(req.params.id));
+  res.send(formatUser(model));
+}
+EOF
+  rec="$(emit "agree-good-$eng" "$eng")"
+  jq -r '
+    (.reused_symbols | map(.symbol)) as $s
+    | (($s | index("formatUser")) and ($s | index("getUser"))
+       and ($s | index("User")) and (.reuse_pct >= 0.60)) // false
+    | if . then "yes" else "no" end' "$rec"
+  reset_tree
+}
+
+reinv_dups_under() {
+  # $1 engine -> echoes "yes" if the reinvention diff is classified as duplicate.
+  local eng="$1" rec
+  cat > "$REPO/api/users.js" <<'EOF'
+export function formatUser(user) {
+  return user.first + " " + user.last;
+}
+export function getUser(id) {
+  const rows = { 1: { id: 1, first: "Ada", last: "Lovelace", email: "ada@x.io" } };
+  return rows[id];
+}
+export function validateUser(user) {
+  return user != null && user.email != null;
+}
+export function serializeUser(user) {
+  return JSON.stringify({ name: user.first });
+}
+export function userEndpoint(req, res) {
+  const u = getUser(req.params.id);
+  res.send(formatUser(u));
+}
+EOF
+  rec="$(emit "agree-reinv-$eng" "$eng")"
+  jq -r '
+    (.suspected_duplicates | map(.duplicates)) as $d
+    | (($d | index("formatUser")) and ($d | index("getUser"))
+       and (.reuse_pct < 0.30)) // false
+    | if . then "yes" else "no" end' "$rec"
+  reset_tree
+}
+
+GOOD_TS="$(good_reuses_under treesitter)"
+GOOD_HE="$(good_reuses_under heuristic)"
+REINV_TS="$(reinv_dups_under treesitter)"
+REINV_HE="$(reinv_dups_under heuristic)"
+
+if [ "$GOOD_TS" = "yes" ] && [ "$GOOD_HE" = "yes" ]; then
+  ok "(3a) AST + heuristic AGREE: good solution classifies as reuse under both engines"
+else
+  bad "(3a) engines disagree on the good solution (treesitter=$GOOD_TS heuristic=$GOOD_HE)"
+fi
+if [ "$REINV_TS" = "yes" ] && [ "$REINV_HE" = "yes" ]; then
+  ok "(3b) AST + heuristic AGREE: reinvention classifies as duplicate (<0.30) under both engines"
+else
+  bad "(3b) engines disagree on the reinvention (treesitter=$REINV_TS heuristic=$REINV_HE)"
+fi
 
 echo
 echo "  reuse-mini-git (C2): $PASS passed, $FAIL failed"
