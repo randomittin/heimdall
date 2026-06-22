@@ -146,15 +146,30 @@ _RN_SLICE = re.compile(
 _RN_SELECTOR = re.compile(
     r"\b(?:export\s+)?const\s+(select[A-Z][A-Za-z0-9_]*)\s*=",
 )
-# MMKV / storage key WRITES + named key constants. Three shapes:
+# MMKV / storage key WRITES + named key constants. Shapes detected:
 #   storage.set("<key>", ...) / mmkv.set('<key>', ...)  — a write to a literal key
-#   const X_KEY = "<key>"  / X: "<key>" inside a *_KEYS map               — a named key
+#   const X_KEY = "<key>"                                — a KEY-named const
+#   const ANYNAME = "<dotted.or:namespaced.key>"         — ANY const holding a
+#       storage-key-SHAPED string (a dotted/namespaced literal). This is what
+#       makes the dedup core catch the canonical card-data reinvention: a second
+#       const (e.g. CARD_CACHE = "cards.cache.v1") holding the SAME key string as
+#       the existing CARDS_CACHE_KEY, even though its NAME doesn't contain "KEY".
+#       The reuse unit is the STRING, so two consts with the same value collide.
+#   X: "<key>" inside a *_KEYS map                       — a mapped key entry
 _MMKV_SET = re.compile(
     r"\b(?:storage|mmkv|MMKV)\w*\s*\.\s*(?:set|getString|getNumber|getBoolean|delete)\s*"
     r"\(\s*['\"]([A-Za-z0-9_.\-:]+)['\"]",
 )
+# KEY/KEYS-named const → always a key, value captured verbatim.
 _MMKV_KEY_CONST = re.compile(
     r"\b(?:export\s+)?const\s+([A-Z][A-Z0-9_]*(?:KEY|KEYS)[A-Z0-9_]*)\s*=\s*['\"]([A-Za-z0-9_.\-:]+)['\"]",
+)
+# ANY const whose VALUE is a storage-key-shaped literal: a dotted or colon-
+# namespaced string (at least one '.'/':' separator, e.g. "cards.cache.v1",
+# "user:token"). The separator requirement keeps this from flagging ordinary
+# strings — a bare "hello" is not a key, but "cards.cache.v1" is the storage slot.
+_MMKV_KEY_LITERAL_CONST = re.compile(
+    r"\b(?:export\s+)?const\s+([A-Za-z_$][\w$]*)\s*=\s*['\"]([A-Za-z0-9_\-]+(?:[.:][A-Za-z0-9_\-]+)+)['\"]",
 )
 # a key entry inside a `*_KEYS = { ... }` map: `cards: "cards.cache"`.
 _MMKV_KEY_MAP_ENTRY = re.compile(
@@ -204,6 +219,11 @@ def rn_units(src, path):
         # second const holding the same string is caught.
         add(m.group(2), "mmkv-key", m.start(),
             {"key": m.group(2), "const": m.group(1), "source": "const"})
+    # any const holding a storage-key-shaped (dotted/namespaced) string — catches
+    # a duplicate key under a const whose NAME doesn't contain "KEY".
+    for m in _MMKV_KEY_LITERAL_CONST.finditer(src):
+        add(m.group(2), "mmkv-key", m.start(),
+            {"key": m.group(2), "const": m.group(1), "source": "const-literal"})
     # entries inside a *_KEYS = { ... } map.
     for mm in _MMKV_KEYS_MAP.finditer(src):
         brace = src.find("{", mm.end() - 1)
