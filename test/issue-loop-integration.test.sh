@@ -386,7 +386,12 @@ fi
 #      NON-fixture path, staged -> secret-scan exit non-zero (the finding).
 git -C "$SCAN_REPO" rm -q --cached issue-loop.config.json
 rm -f "$SCAN_REPO/issue-loop.config.json"
-printf '{"connectors":{"github":{"active":true,"repo":"acme/widget","token":"ghp_REDACTED_FAKE_TEST_TOKEN"}}}\n' \
+# Assemble the gitleaks-detectable github-pat at RUNTIME (mirrors test/selfscan.test.sh):
+# the fragments are individually non-matching; only the concatenation is ghp_+36, so
+# this source carries no static secret literal yet the gate-catch proof still fires.
+_GP_PRE="ghp_"; _GP_A="A1b2C3d4E5f6G7h8I9j0"; _GP_B="K1l2M3n4O5p6Q7r8"
+PLANT_TOK="${_GP_PRE}${_GP_A}${_GP_B}"
+printf '{"connectors":{"github":{"active":true,"repo":"acme/widget","token":"'"$PLANT_TOK"'"}}}\n' \
   > "$SCAN_REPO/issue-loop.secrets.json"
 git -C "$SCAN_REPO" add issue-loop.secrets.json
 if ( cd "$SCAN_REPO" && "$SECRET_SCAN" >/dev/null 2>&1 ); then

@@ -227,11 +227,11 @@ fi
 # Configure github active + export the token, then run `show` and assert the
 # secret value never appears in the output (only cred_present + env-var NAME do).
 set +e
-SHOW_OUT="$(TEST_GH_TOKEN="ghp_REDACTED_FAKE_TEST_TOKEN" "$CLI" show --repo "$REPO" 2>&1)"
+SHOW_OUT="$(TEST_GH_TOKEN="REDACTED_SENTINEL_not_a_real_token" "$CLI" show --repo "$REPO" 2>&1)"
 SHOW_RC=$?
 set -e
 if [ "$SHOW_RC" -eq 0 ] \
-   && ! printf '%s' "$SHOW_OUT" | grep -q "ghp_REDACTED_FAKE_TEST_TOKEN" \
+   && ! printf '%s' "$SHOW_OUT" | grep -q "REDACTED_SENTINEL_not_a_real_token" \
    && printf '%s' "$SHOW_OUT" | grep -q '"cred_present"' \
    && printf '%s' "$SHOW_OUT" | grep -q "TEST_GH_TOKEN"; then
   ok "(e) 'show' never echoes the secret; surfaces cred_present + env-var NAME only"
@@ -241,7 +241,7 @@ fi
 
 # With the token set, github is now active -> CLI 'active' lists it (exit 0).
 set +e
-ACTIVE_LIST="$(TEST_GH_TOKEN="ghp_REDACTED_FAKE_TEST_TOKEN" "$CLI" active --repo "$REPO" 2>&1)"
+ACTIVE_LIST="$(TEST_GH_TOKEN="REDACTED_SENTINEL_not_a_real_token" "$CLI" active --repo "$REPO" 2>&1)"
 AL_RC=$?
 set -e
 if [ "$AL_RC" -eq 0 ] && printf '%s' "$ACTIVE_LIST" | grep -qx "github"; then
@@ -291,6 +291,11 @@ cd "$WORK"
 # ── (g) GITLEAKS GATE INTACT — a planted cred in a config path is caught ───────
 # The cred-handling layer must NOT weaken the gate. Stage a fixture config bearing
 # a real-shaped token in a throwaway git repo and assert bin/secret-scan fires.
+# The detectable github-pat is ASSEMBLED AT RUNTIME (mirrors test/selfscan.test.sh):
+# no static ghp_+36 literal lives in this source file, but the concatenation forms
+# a real gitleaks match, so the gate-catch proof holds with no committed secret.
+_GP_PRE="ghp_"; _GP_A="0123456789abcdefghij"; _GP_B="ABCDEFGHIJ012345"
+PLANT_TOK="${_GP_PRE}${_GP_A}${_GP_B}"
 if command -v gitleaks >/dev/null 2>&1; then
   GREPO="$WORK/gitrepo"
   mkdir -p "$GREPO"
@@ -310,7 +315,7 @@ if command -v gitleaks >/dev/null 2>&1; then
     bad "(g) clean config wrongly flagged by gitleaks (rc=$CLEAN_RC)"
   fi
   # now PLANT a real-shaped token -> the gate MUST catch it (exit 1).
-  printf '{ "connectors": { "github": { "token": "ghp_REDACTED_FAKE_TEST_TOKEN" } } }\n' \
+  printf '{ "connectors": { "github": { "token": "'"$PLANT_TOK"'" } } }\n' \
     > "$GREPO/issue-loop.config.json"
   git -C "$GREPO" add issue-loop.config.json
   set +e
@@ -325,7 +330,7 @@ if command -v gitleaks >/dev/null 2>&1; then
 else
   # gitleaks absent: still prove our own token-shape detector catches the plant,
   # so the gate's intent is exercised even on a stripped host.
-  printf '{ "token": "ghp_REDACTED_FAKE_TEST_TOKEN" }\n' > "$WORK/leakcfg.json"
+  printf '{ "token": "'"$PLANT_TOK"'" }\n' > "$WORK/leakcfg.json"
   if grep -qE 'ghp_[A-Za-z0-9]{30,}' "$WORK/leakcfg.json"; then
     ok "(g) gitleaks absent — planted credential still caught by token-shape scan (gate intent holds)"
   else
