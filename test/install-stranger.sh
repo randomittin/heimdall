@@ -321,6 +321,76 @@ SAVED_TPL="${TMPDIR:-/tmp}/heimdall-saved-launcher.$(printf 'X%.0s' 1 2 3 4 5 6)
 SAVED_LAUNCHER="$(mktemp "$SAVED_TPL")"
 cp "$REAL_LAUNCHER" "$SAVED_LAUNCHER" 2>/dev/null && chmod +x "$SAVED_LAUNCHER" 2>/dev/null || true
 
+# (7·0a) RESERVED-SUBCOMMAND NON-TTY CLASS — the launcher-preamble regression.
+# THE BUG (fixed in bin/heimdall, locked here): the F1 launch resolution-order
+# (f1_orient → f1_persona_check → first_run_setup, which includes the companion
+# `npx claude-mem install` probe AND a `read -rt 60` persona prompt) used to run on
+# EVERY invocation — so a RESERVED subcommand like `hmd uninstall --yes` / `version`
+# / `demo` ran the whole launch preamble BEFORE dispatching, and in a non-TTY env
+# that preamble's persona read + companion stall HUNG forever.
+# THE FIX: reserved words dispatch at the top-level `case "${1:-}"` BEFORE any
+# f1_orient/f1_persona_check/first_run_setup runs; the persona prompt is `[ -t 0 ]`-
+# guarded. The resolution-order preamble runs ONLY for real task invocations.
+# THE DISCRIMINATOR this asserts: a reserved subcommand must dispatch STRAIGHT to
+# its handler — NO orient→persona→first-run preamble, NO persona read, NO companion
+# `npx claude-mem install` stall. We run each in the stripped/isolated stranger env
+# (the installed launcher, </dev/null, non-TTY via env -i), each under a REAL
+# watchdog: if a reserved path stalls past a tight bound the watchdog SIGKILLs it
+# and the assertion FAILS LOUD (a hang = FAIL). version + demo --dry are
+# NON-DESTRUCTIVE and run here while the install is still fully intact; the
+# destructive `uninstall --yes` no-hang is asserted at its real invocation below
+# (§7), watchdog-wrapped, in the same isolated HOME.
+#
+# Watchdog runner: launch the reserved cmd in the isolated stranger env, race it
+# against a sleeper; whichever wins, the loser is SIGKILLed. Returns the cmd's rc,
+# or 124 if the watchdog had to SIGKILL it (the hang signal). Output → $RSV_OUT.
+reserved_notty() { # $1=HOME  $2=timeout_s  rest=cmd…
+  local _h="$1" _to="$2"; shift 2
+  local _of; _of="$(mktemp)"
+  ( env -i HOME="$_h" TERM="dumb" PATH="$STRANGER_PATH" "$@" </dev/null >"$_of" 2>&1 ) &
+  local _cp=$!
+  ( sleep "$_to"; kill -9 "$_cp" 2>/dev/null; pkill -9 -P "$_cp" 2>/dev/null; pkill -9 -f heimdall-demo 2>/dev/null ) &
+  local _wp=$!
+  local _rc=0
+  wait "$_cp" 2>/dev/null; _rc=$?
+  if kill -0 "$_wp" 2>/dev/null; then
+    kill "$_wp" 2>/dev/null            # cmd finished first → cancel the sleeping dog
+  else
+    # watchdog already exited → it slept its full bound and SIGKILLed the child.
+    # The killed child reports 137 (128+SIGKILL); normalize to 124 = "hung/killed".
+    [ "$_rc" -eq 137 ] && _rc=124
+  fi
+  RSV_OUT="$(cat "$_of")"; rm -f "$_of"
+  return "$_rc"
+}
+
+# `hmd version` — must complete PROMPTLY and print the version (no preamble, no hang).
+reserved_notty "$TMPH" 25 "$LAUNCHER" version; RSV_RC=$?
+if [ "$RSV_RC" -eq 124 ]; then
+  bad "non-TTY \`hmd version\` HUNG (watchdog killed it) — reserved path ran the launch preamble"
+elif [ "$RSV_RC" -eq 0 ] && printf '%s' "$RSV_OUT" | grep -qiE 'Heimdall v[0-9]'; then
+  ok "non-TTY \`hmd version\` completes promptly + prints version, no preamble/hang ($(printf '%s' "$RSV_OUT" | grep -iE 'Heimdall v[0-9]' | head -1 | sed 's/^ *//'))"
+else
+  bad "non-TTY \`hmd version\` did not complete cleanly (rc=$RSV_RC, out: $(printf '%s' "$RSV_OUT" | tr '\n' ' '))"
+fi
+
+# `hmd demo --dry` — the dry/safe demo path must complete PROMPTLY with NO launch
+# preamble (no persona prompt, no companion install) and NO hang. We point it at a
+# fresh, NON-EXISTENT target dir inside the stranger HOME so the dry scaffold plan
+# runs the full reserved `demo` handler (not the "target already exists" guard).
+DEMO_NOTTY_TGT="$TMPH/reserved-demo-dry"
+rm -rf "$DEMO_NOTTY_TGT" 2>/dev/null || true
+reserved_notty "$TMPH" 30 "$LAUNCHER" demo "$DEMO_NOTTY_TGT" --dry; RSV_RC=$?
+if [ "$RSV_RC" -eq 124 ]; then
+  bad "non-TTY \`hmd demo --dry\` HUNG (watchdog killed it) — reserved path ran the launch preamble"
+elif printf '%s' "$RSV_OUT" | grep -qiE 'watchman wakes|npx claude-mem install'; then
+  bad "non-TTY \`hmd demo --dry\` ran the launch preamble (persona/companion leaked) — reserved dispatch regressed"
+elif [ "$RSV_RC" -eq 0 ]; then
+  ok "non-TTY \`hmd demo --dry\` completes promptly via the dry path, no preamble/hang"
+else
+  bad "non-TTY \`hmd demo --dry\` did not complete cleanly (rc=$RSV_RC, out: $(printf '%s' "$RSV_OUT" | tr '\n' ' ' | sed 's/  */ /g' | cut -c1-200))"
+fi
+
 # (7·0) SAFETY: bare `uninstall` (no --yes) in a NON-TTY context must REFUSE
 # cleanly — exit 2 with the --yes hint — and must NOT hang on a stdin read that
 # never arrives. in_stranger has no TTY on stdin, so this exercises the guard.
@@ -334,8 +404,20 @@ else
   bad "non-TTY uninstall without --yes did not refuse cleanly (rc=$REFUSE_RC, out: $(printf '%s' "$REFUSE_OUT" | tr '\n' ' '))"
 fi
 
-UNINST_OUT="$(in_stranger "$TMPH" "$LAUNCHER" uninstall --yes 2>&1)"
-UNINST_RC=$?
+# (7·0b) RESERVED CLASS — `uninstall --yes` non-TTY must COMPLETE the real removal
+# PROMPTLY (no hang). This is the destructive third member of the reserved class:
+# before the ordering fix it ran the launch preamble (persona read + companion
+# stall) BEFORE dispatching to removal → non-TTY hang. We run the REAL removal in
+# the isolated stranger HOME (env -i HOME=$TMPH, safe — never the real HOME) under
+# the same watchdog: a stall past the bound = SIGKILL = FAIL. Its output/rc feed the
+# §7a–§7e artifact-reversal assertions below unchanged.
+reserved_notty "$TMPH" 30 "$LAUNCHER" uninstall --yes; UNINST_RC=$?
+UNINST_OUT="$RSV_OUT"
+if [ "$UNINST_RC" -eq 124 ]; then
+  bad "non-TTY \`hmd uninstall --yes\` HUNG (watchdog killed it) — reserved path ran the launch preamble"
+else
+  ok "non-TTY \`hmd uninstall --yes\` completes the real removal promptly, no preamble/hang (rc=$UNINST_RC)"
+fi
 
 # (7a) PATH line GONE — count back to 0 in the profile install wrote.
 if [ -n "$PROFILE" ]; then
