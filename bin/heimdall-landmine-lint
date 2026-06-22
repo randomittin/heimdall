@@ -23,9 +23,12 @@
 #                    confidence only; class 2 is best-effort by design.
 #   3 BAKED-PATH     a machine-specific absolute literal (/Users/<u>, /home/<u>,
 #                    bare /superx) in code — breaks relocation.
-#   4 TTY-READ       an interactive `read`/`read -p` from inherited stdin with no
-#                    `[ -t 0 ]` TTY guard and no `--yes`/-y refusal gate and no
-#                    `-t` timeout. The uninstall-hang class.
+#   4 TTY-READ       an interactive PROMPT `read` (`read -p`, `read -rt N -p`, a
+#                    bare `read VAR` soliciting a human answer) from inherited
+#                    stdin with no `[ -t 0 ]` TTY guard and no `--yes`/-y refusal
+#                    gate. A `-t N` TIMEOUT is NOT a sufficient guard — a 60s
+#                    stall PER CALL is still a non-TTY hang in spirit and blocks
+#                    CI. The uninstall-hang AND F1-launcher-persona class.
 #   5 ORDER-DESTROY  a `_heimdall_remove_plugin`-style self-deletion followed by a
 #                    `source`/`.` of a file under the just-deleted tree. Heuristic;
 #                    documented known-hard (see README block below).
@@ -267,17 +270,29 @@ scan_baked_path() {
   done < "$file"
 }
 
-# ── CLASS 4 — TTY-READ: interactive read with no TTY/--yes guard ───────────────
-# The bug: a confirmation `read -p "…?"` that, on a non-TTY stdin (piped install,
-# CI), blocks forever. Safe forms we must NOT flag:
+# ── CLASS 4 — TTY-READ: interactive PROMPT read with no TTY/--yes guard ────────
+# The bug: an interactive PROMPT `read` (`read -p "…?"`, `read -rt 60 -p "…"`, or a
+# bare `read VAR` soliciting a human answer) that, on a non-TTY stdin (piped
+# install, CI, the F1 launch path), blocks the run. The F1 launcher rewrite added
+# `read -rt 60 -p "choose [1/2]…"`; the old class-4 rule SKIPPED any `read -t N`
+# as "guarded", so a 60s-stall-per-call prompt sailed through — the exact class
+# this rule exists to catch. So:
+#   * TIMEOUT IS NOT A GUARD. A `-t N` read still hangs/stalls non-interactively
+#     (60s per invocation; in CI it dead-stalls every call). A timeout-only prompt
+#     is FLAGGED unless it is also `[ -t 0 ]`-guarded. The ONLY sufficient guards
+#     are a `[ -t 0 ]` TTY check or a `--yes`/-y refusal gate around the read.
+# Safe forms we must NOT flag (the discriminator: a STREAM/loop read of file/pipe
+# content vs an interactive PROMPT read asking a human):
 #   * `read … <…` / `read … <<<…` / `read … <<EOF` (reads from a file/herestring),
 #   * `… | while … read …` and `done < <(…)` (reads a pipe, never the terminal),
-#   * `read -t N …` (a timeout caps the wait),
-#   * a `read` guarded by `[ -t 0 ]` within the preceding few lines,
-#   * a `read` in a block already gated by a `--yes`/-y refusal that exits when
-#     stdin is not a TTY (the canonical uninstall pattern).
-# We flag a bare interactive `read`/`read -p` from INHERITED stdin lacking all of
-# those guards.
+#   * `while IFS= read -r line` frame/stream loops (consume a piped/process-sub
+#     stream, never the terminal — bin/heimdall's face-render loops),
+#   * a keypress POLL: `read -rsn1 -t … junk` (a `-s`/-n silent/char read with NO
+#     `-p` prompt — waits for "any key", does not solicit a typed answer),
+#   * a PROMPT read guarded by `[ -t 0 ]` (or a `--yes`/-y refusal) in its scope.
+# We flag an interactive PROMPT read (a `-p` flag in any cluster — `-p`/`-rp`/
+# `-rt N -p` — OR a bare `read [VAR…]` with no stream redirect and no `-s`/-n
+# keypress flags) from INHERITED stdin lacking a `[ -t 0 ]`/`--yes` guard.
 scan_tty_read() {
   local file="$1"
   local -a lines=()
@@ -305,9 +320,29 @@ scan_tty_read() {
     case "$bare" in
       *'|'*read*) continue ;;
     esac
-    # `read -t N` (timeout) or `read -rsn1 -t` cannot hang.
-    printf '%s' "$bare" | grep -qE 'read([[:space:]]+-[A-Za-z0-9]+)*[[:space:]]+-t([[:space:]]|[0-9])' && continue
-    printf '%s' "$bare" | grep -qE 'read[[:space:]].*[[:space:]]-t[[:space:]]*[0-9]' && continue
+    # ── Interactive-PROMPT discriminator ──────────────────────────────────────
+    # Only an interactive PROMPT read can wedge a human-answer wait. A `-t N`
+    # TIMEOUT is deliberately NOT treated as a guard here (a 60s stall per call is
+    # still a non-TTY hang and dead-stalls CI) — the F1 `read -rt 60 -p` is exactly
+    # the prompt the old `-t`-skip let through. Two prompt shapes:
+    #   (a) a `-p` PROMPT flag in any short-flag cluster — `-p`, `-rp`, `-sp`, and
+    #       the F1 `-rt 60 -p` (separate `-p` token). Detected by a `-…p` cluster
+    #       token (a `-` then flag letters ending in `p`).
+    #   (b) a BARE prompt read — `read VAR` / `read` / `read -r VAR` with no stream
+    #       redirect (already filtered above) and no `-s`/-n keypress flags. This
+    #       still reads inherited stdin for a typed answer → hangs on a non-TTY.
+    # A keypress POLL (`-rsn1`, `-s`, `-n` with NO `-p`) is NOT a prompt: it waits
+    # for "any key" (animation-skip), reads into a throwaway, never solicits an
+    # answer. We exempt it so the face-render polls in bin/heimdall stay clean.
+    _is_prompt=0
+    if printf '%s' "$bare" | grep -qE '(^|[[:space:]])-[A-Za-z]*p([[:space:]]|$)'; then
+      _is_prompt=1                                   # (a) explicit -p prompt cluster
+    elif printf '%s' "$bare" | grep -qE '(^|[[:space:]])-[A-Za-z]*[sn][A-Za-z0-9]*([[:space:]]|$)'; then
+      _is_prompt=0                                   # keypress poll (-s/-n, no -p) → not a prompt
+    else
+      _is_prompt=1                                   # (b) bare read soliciting an answer
+    fi
+    [ "$_is_prompt" -eq 1 ] || continue
     # Guard search: scan UPWARD to the enclosing scope start (a column-0 `if … then`,
     # a `funcname() {`, or a closing `fi`/`}`), looking for either a `[ -t 0 ]`
     # TTY check or a `--yes`/-y refusal gate that exits/returns when stdin is not a
@@ -336,7 +371,7 @@ scan_tty_read() {
     done
     [ "$guarded" -eq 1 ] && continue
     emit "$file" "$lineno" "4-TTY-READ" "$line" \
-      "interactive 'read' from inherited stdin with no '[ -t 0 ]' / --yes guard → hangs forever on a non-TTY stdin; gate it with '[ -t 0 ]'"
+      "interactive PROMPT 'read' from inherited stdin with no '[ -t 0 ]' / --yes guard (a '-t N' timeout is NOT a guard — it still stalls every non-TTY call) → hangs/stalls on a non-TTY stdin; gate it with '[ -t 0 ]'"
   done
 }
 

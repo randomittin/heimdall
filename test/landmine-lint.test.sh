@@ -120,6 +120,79 @@ if [ "$RC" -ne 0 ]; then ok "linter exits nonzero on a planted fixture (rc=$RC)"
   else bad "linter exited 0 on a fixture full of landmines"; fi
 
 # ─────────────────────────────────────────────────────────────────────────────
+# A2. CLASS-4 HARDENING — the non-TTY PROMPT-read class, every read form.
+# ─────────────────────────────────────────────────────────────────────────────
+# Regression fence for the F1-launcher gap: the old class-4 rule SKIPPED any
+# `read -t N` as "guarded", so an interactive `read -rt 60 -p "choose [1/2]…"`
+# (a 60s-stall-per-call prompt) sailed through — the exact non-TTY-read class the
+# rule exists to catch. The hardened rule: a TIMEOUT IS NOT A GUARD; only a
+# `[ -t 0 ]` (or --yes/-y refusal) is. This fixture plants every read shape at a
+# known line and asserts each is flagged / NOT flagged. Do NOT reflow the heredoc
+# without updating the EXPECT_* / NOFLAG_* line numbers below.
+FIX4="$FIX_DIR/heimdall-fixture4"
+cat > "$FIX4" <<'FIXTURE4'
+#!/usr/bin/env bash
+set -euo pipefail
+# line 3: header
+unguarded_p() { read -p "Proceed? [y/N] " ans; echo "$ans"; }
+# line 5: read -rt 60 -p — TIMEOUT-ONLY, combined -rt (the F1 launcher shape).
+timeout_combined() { read -rt 60 -p "choose [1/2]: " c || c=1; echo "$c"; }
+# line 7: read -t 60 -rp — TIMEOUT-ONLY, separate -t token, -rp prompt cluster.
+timeout_separate() { read -t 60 -rp "choose: " v || v=1; echo "$v"; }
+guarded_p() {
+  if [ -t 0 ]; then
+    read -p "ok? " g; echo "$g"
+  fi
+}
+stream_loop() {
+  printf 'a\nb\n' | while IFS= read -r ln; do echo "$ln"; done
+}
+file_read() { read -r host < /etc/hostname; echo "$host"; }
+keypress_poll() { read -rsn1 -t 2 junk 2>/dev/null || true; }
+herestring() { read -r x y <<< "1 2"; echo "$x$y"; }
+FIXTURE4
+chmod +x "$FIX4"
+
+# FLAGGED (interactive prompt, no [ -t 0 ]): the -p read, both timeout-only reads.
+EXPECT4_PLAIN=4        # read -p  (no timeout, no guard)
+EXPECT4_TCOMBINED=6    # read -rt 60 -p  (timeout-only, combined -rt)
+EXPECT4_TSEPARATE=8    # read -t 60 -rp  (timeout-only, separate -t)
+# NOT flagged: guarded read-p (12), stream loop (16), file read (18),
+# keypress poll (19), herestring (20).
+NOFLAG4_LINES="12 16 18 19 20"
+
+LINT4_OUT="$("$LINT" "$FIX4" 2>/dev/null || true)"
+
+echo "A2. CLASS-4 HARDENING (non-TTY PROMPT read — timeout is NOT a guard):"
+
+assert_c4_flagged() {
+  # assert_c4_flagged EXPECTED-LINE HUMAN-LABEL
+  local want="$1" label="$2" got
+  got="$(printf '%s\n' "$LINT4_OUT" | grep -F "  4-TTY-READ  " \
+         | sed -E 's/^[^:]*:([0-9]+).*/\1/' | grep -Fx "$want" | head -1 || true)"
+  if [ "$got" = "$want" ]; then ok "$label — flagged at line $want"; \
+    else bad "$label — class 4 NOT flagged at line $want (got lines: $(printf '%s' "$LINT4_OUT" | grep -F '  4-TTY-READ  ' | sed -E 's/^[^:]*:([0-9]+).*/\1/' | tr '\n' ' '))"; fi
+}
+assert_c4_flagged "$EXPECT4_PLAIN"     "read -p (unguarded)"
+assert_c4_flagged "$EXPECT4_TCOMBINED" "read -rt 60 -p (timeout-only, combined)"
+assert_c4_flagged "$EXPECT4_TSEPARATE" "read -t 60 -rp (timeout-only, separate)"
+
+# NO false positives: none of the safe forms may appear as a class-4 finding.
+c4_flagged_lines="$(printf '%s\n' "$LINT4_OUT" | grep -F '  4-TTY-READ  ' | sed -E 's/^[^:]*:([0-9]+).*/\1/' | tr '\n' ' ')"
+nf_clean=1
+for nf in $NOFLAG4_LINES; do
+  case " $c4_flagged_lines " in
+    *" $nf "*) bad "false positive — safe read at line $nf was flagged class 4"; nf_clean=0 ;;
+  esac
+done
+[ "$nf_clean" -eq 1 ] && ok "no false positives on guarded read-p / stream loop / file read / keypress poll / herestring"
+
+# Exactly three class-4 findings expected (the three unguarded prompts).
+c4_count="$(printf '%s\n' "$LINT4_OUT" | grep -cF '  4-TTY-READ  ' || true)"
+if [ "$c4_count" = "3" ]; then ok "exactly 3 class-4 findings (the 3 unguarded prompts)"; \
+  else bad "expected 3 class-4 findings, got $c4_count"; fi
+
+# ─────────────────────────────────────────────────────────────────────────────
 # B. CLEAN-TREE — zero false positives on the real shipped scripts.
 # ─────────────────────────────────────────────────────────────────────────────
 echo "B. CLEAN-TREE (no false positives on the real current tree):"
