@@ -1,0 +1,245 @@
+#!/usr/bin/env bash
+# heimdall-redum — F3 Redum, the redundancy SOLVER (plan-time + commit-time).
+#
+# S-6 / SI-2 MEASURE reuse; Redum FIXES low reuse. Two subcommands mirror the two
+# phases:
+#
+#   heimdall-redum factor  --task "<task>" [--repo DIR] [--base REF]
+#       PLAN-TIME FACTORING. Before the agent builds, surface the EXISTING repo
+#       units the solution SHOULD reuse (so it reuses by design, not luck). Reads
+#       the repo at --base (default HEAD) as the pre-build surface. Prints the
+#       reuse candidates (the names to call) as JSON + a one-line advice on stderr.
+#
+#   heimdall-redum gate  [--repo DIR] [--base REF] [--id ID | --attest FILE]
+#       COMMIT-TIME GATE. Reads SI-2's attestation `reuse` field (it does NOT
+#       re-measure reuse) and flags RESIDUAL redundancy — a change that re-added a
+#       shape the repo already had. Names the existing unit to reuse + WHERE it
+#       lives. Resolves the attestation by --id (an existing record), --attest
+#       (an explicit record file), or emits one fresh via heimdall-attest.
+#       --floor PCT sets the reuse floor (default 0.30); --block makes the gate
+#       FAIL (exit 1) on a residual duplicate (default: flag, exit 0).
+#
+# Reuse, don't rebuild: the reuse measurement is SI-2's (bin/heimdall-attest →
+# reuse field); the dedup matching is the shared core (bin/lib/dedup.py, which
+# F2 Checker's max-tier also fuses onto); the AST surface is tree-sitter
+# (bin/lib/treesitter_ast.py). Redum adds the SOLVER on top.
+#
+# Exit status:
+#   0  factor: candidates printed (or none). gate: OK or FLAG (non-blocking).
+#   1  gate --block: a residual duplicate was found (the gate blocks the commit).
+#   2  usage error.
+
+set -euo pipefail
+
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+BINDIR="$(dirname "$SELF")"
+REDUM_LIB="$BINDIR/lib/redum.py"
+ATTEST="$BINDIR/heimdall-attest"
+
+usage() { sed -n '2,40p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+PY="$(command -v python3 || command -v python || true)"
+if [ -z "$PY" ]; then
+  echo "error: python3 not found (required for redum)" >&2
+  exit 2
+fi
+
+[ $# -ge 1 ] || { usage >&2; exit 2; }
+SUB="$1"; shift
+
+case "$SUB" in
+  -h|--help) usage; exit 0 ;;
+esac
+
+# ── shared option parsing ─────────────────────────────────────────────────────
+REPO="$(pwd)"
+BASE="HEAD"
+TASK=""
+ID=""
+ATTEST_FILE=""
+FLOOR="0.30"
+POLICY="flag"
+WANT_KINDS=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --repo)   REPO="${2:?--repo needs a dir}"; shift 2 ;;
+    --base)   BASE="${2:?--base needs a ref}"; shift 2 ;;
+    --task)   TASK="${2:?--task needs a value}"; shift 2 ;;
+    --id)     ID="${2:?--id needs a value}"; shift 2 ;;
+    --attest) ATTEST_FILE="${2:?--attest needs a file}"; shift 2 ;;
+    --floor)  FLOOR="${2:?--floor needs a value}"; shift 2 ;;
+    --kinds)  WANT_KINDS="${2:?--kinds needs a value}"; shift 2 ;;
+    --block)  POLICY="block"; shift ;;
+    --flag)   POLICY="flag"; shift ;;
+    -h|--help) usage; exit 0 ;;
+    --*)      echo "error: unknown option: $1" >&2; usage >&2; exit 2 ;;
+    *)        echo "error: unexpected argument: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+if ! git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
+  echo "error: --repo is not a git repository: $REPO" >&2
+  exit 2
+fi
+
+# ── build the {pre_files, changed_files} maps via git (the AST surface) ────────
+# Emits a JSON object {pre_files:{path:src}, changed_files:{path:src}} on stdout.
+# pre_files  = every tracked source file at BASE (the pre-build / pre-change repo).
+# changed_files = the working-tree-vs-BASE added/modified/renamed source files.
+build_file_maps() {
+  REPO="$REPO" BASE="$BASE" "$PY" - <<'PYEOF'
+import json, os, subprocess
+
+repo = os.environ["REPO"]
+base = os.environ["BASE"]
+SRC_EXT = {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".py", ".sh", ".bash"}
+
+
+def is_src(path):
+    return (os.path.splitext(path)[1].lower() in SRC_EXT
+            or "." not in os.path.basename(path))
+
+
+def git(*args):
+    p = subprocess.run(["git", "-C", repo, *args], capture_output=True)
+    return p.stdout.decode("utf-8", "replace"), p.returncode
+
+
+# pre-change surface: tracked source files at BASE.
+pre_files = {}
+tree, _ = git("ls-tree", "-r", "--name-only", base)
+for p in tree.splitlines():
+    p = p.strip()
+    if not p or not is_src(p):
+        continue
+    body, rc = git("show", "%s:%s" % (base, p))
+    if rc == 0:
+        pre_files[p] = body
+
+# changed (working tree vs BASE) added/modified/renamed source files.
+changed = []
+statuses = {}
+out, _ = git("diff", "--name-status", "--diff-filter=ACMR", base)
+for line in out.splitlines():
+    if not line.strip():
+        continue
+    parts = line.split("\t")
+    path = parts[-1].strip()
+    if path:
+        changed.append(path)
+        statuses[path] = parts[0].strip()[:1]
+
+# include untracked-but-not-ignored files as additions (a real task run writes
+# new files not yet committed).
+unt, _ = git("ls-files", "--others", "--exclude-standard")
+seen = set(changed)
+for u in unt.splitlines():
+    u = u.strip()
+    if u and u not in seen:
+        changed.append(u)
+        seen.add(u)
+
+changed_files = {}
+for p in changed:
+    if not is_src(p):
+        continue
+    fp = os.path.join(repo, p)
+    if os.path.exists(fp):
+        try:
+            with open(fp, "r", errors="replace") as fh:
+                changed_files[p] = fh.read()
+        except OSError:
+            continue
+
+print(json.dumps({"pre_files": pre_files, "changed_files": changed_files}))
+PYEOF
+}
+
+# ── factor (plan-time) ────────────────────────────────────────────────────────
+if [ "$SUB" = "factor" ]; then
+  [ -n "$TASK" ] || { echo "error: factor needs --task \"<task>\"" >&2; exit 2; }
+  MAPS_TMP="$(mktemp -t "redum-maps.$(printf 'X%.0s' 1 2 3 4 5 6)")"
+  trap 'rm -f "$MAPS_TMP"' EXIT
+  build_file_maps > "$MAPS_TMP"
+  TASK="$TASK" WANT_KINDS="$WANT_KINDS" REDUM_LIB="$REDUM_LIB" \
+  "$PY" - "$MAPS_TMP" <<'PYEOF'
+import json, os, sys
+sys.path.insert(0, os.path.dirname(os.environ["REDUM_LIB"]))
+import redum
+
+with open(sys.argv[1], "r", errors="replace") as fh:
+    maps = json.load(fh)
+task = os.environ["TASK"]
+want = os.environ.get("WANT_KINDS", "").strip()
+want_kinds = [k.strip() for k in want.split(",") if k.strip()] or None
+result = redum.factor_for_task(task, maps.get("pre_files", {}), want_kinds=want_kinds)
+sys.stdout.write(json.dumps(result, indent=2) + "\n")
+sys.stderr.write("redum factor: %s\n" % result["advice"])
+PYEOF
+  exit 0
+fi
+
+# ── gate (commit-time) ────────────────────────────────────────────────────────
+if [ "$SUB" = "gate" ]; then
+  # 1) resolve the SI-2 attestation record (read its reuse field — never re-measure).
+  REC_FILE=""
+  if [ -n "$ATTEST_FILE" ]; then
+    [ -f "$ATTEST_FILE" ] || { echo "error: --attest file not found: $ATTEST_FILE" >&2; exit 2; }
+    REC_FILE="$ATTEST_FILE"
+  elif [ -n "$ID" ]; then
+    REC_FILE="$("$ATTEST" path "$ID" --repo "$REPO" 2>/dev/null || true)"
+    [ -n "$REC_FILE" ] && [ -f "$REC_FILE" ] || {
+      echo "error: no attestation record for id: $ID (emit one first or pass --attest)" >&2
+      exit 2
+    }
+  else
+    # emit a fresh attestation over the working tree vs BASE (the REAL flow).
+    REC_FILE="$(mktemp -t "redum-attest.$(printf 'X%.0s' 1 2 3 4 5 6)").json"
+    "$ATTEST" emit --repo "$REPO" --base "$BASE" --print --quiet > "$REC_FILE" 2>/dev/null || {
+      echo "error: heimdall-attest emit failed (cannot read SI-2 reuse field)" >&2
+      exit 2
+    }
+  fi
+
+  # 2) build the file maps so the gate can NAME the existing unit each residual
+  #    duplicate should reuse (uses the shared dedup core).
+  MAPS_TMP="$(mktemp -t "redum-maps.$(printf 'X%.0s' 1 2 3 4 5 6)")"
+  trap 'rm -f "$MAPS_TMP"' EXIT
+  build_file_maps > "$MAPS_TMP"
+
+  # 3) run the gate over (attestation, file maps).
+  set +e
+  REDUM_LIB="$REDUM_LIB" FLOOR="$FLOOR" POLICY="$POLICY" \
+  "$PY" - "$REC_FILE" "$MAPS_TMP" <<'PYEOF'
+import json, os, sys
+sys.path.insert(0, os.path.dirname(os.environ["REDUM_LIB"]))
+import redum
+
+with open(sys.argv[1], "r", errors="replace") as fh:
+    attestation = json.load(fh)
+with open(sys.argv[2], "r", errors="replace") as fh:
+    maps = json.load(fh)
+
+floor = float(os.environ.get("FLOOR", "0.30"))
+policy = os.environ.get("POLICY", "flag")
+result = redum.gate_attestation(
+    attestation,
+    repo_files=maps.get("pre_files", {}),
+    changed_files=maps.get("changed_files", {}),
+    floor=floor,
+    policy=policy,
+)
+sys.stdout.write(json.dumps(result, indent=2) + "\n")
+sys.stderr.write(result["summary"] + "\n")
+# exit code: block policy + a block verdict → 1 (fail the gate); else 0.
+sys.exit(1 if result["verdict"] == "block" else 0)
+PYEOF
+  RC=$?
+  set -e
+  exit "$RC"
+fi
+
+echo "error: unknown subcommand: $SUB (expected factor|gate)" >&2
+usage >&2
+exit 2
