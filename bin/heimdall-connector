@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+# heimdall-connector — thin CLI over the pluggable source-adapter seam
+# (bin/lib/connectors/). The issue-resolution loop uses the python registry
+# directly; this CLI is the human-facing window into it (and the seam test's
+# shape assertions).
+#
+# A 4th source (Datadog/Jira/...) is implementing the Connector interface + a
+# register(...) call in a new module under connectors/ — this CLI and the loop
+# are NOT edited.
+#
+# Usage:
+#   heimdall-connector list                          # registered connectors
+#   heimdall-connector identity <name>               # static descriptor (no IO)
+#   heimdall-connector health  <name> [--config F]   # active/inactive + reason
+#   heimdall-connector fetch   <name> [--config F] [--since S]  # raw items as JSON
+#   heimdall-connector -h | --help
+#
+# --config F is a JSON file shaped like the issue-loop config (§7): its
+# connectors.<name> block configures the adapter. WITHOUT creds the connector is
+# inactive and fetch returns [] — never a crash (the lazy/optional contract).
+#
+# Exit codes:
+#   0  ok
+#   2  usage error
+#   3  no such connector / config not found
+#   4  runtime error (missing seam / interpreter)
+
+set -euo pipefail
+
+# Resolve this script's own dir (RELOCATABLE — no baked path).
+SELF="$0"
+case "$SELF" in
+  */*) : ;;
+  *)   SELF="$(command -v "$SELF" 2>/dev/null || echo "$SELF")" ;;
+esac
+BIN_DIR="$(cd "$(dirname "$SELF")" 2>/dev/null && pwd)"
+LIB_DIR="$BIN_DIR/lib"
+
+if [ ! -d "$LIB_DIR/connectors" ]; then
+  echo "heimdall-connector: seam not found at $LIB_DIR/connectors" >&2
+  exit 4
+fi
+
+PY="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)"
+if [ -z "$PY" ]; then
+  echo "heimdall-connector: python3 not found on PATH" >&2
+  exit 4
+fi
+
+usage() { sed -n '2,33p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+CMD="${1:-help}"
+[ $# -gt 0 ] && shift || true
+
+# shared option parse (consumes --config / --since from "$@").
+CONFIG=""
+SINCE=""
+parse_opts() {
+  REST=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --config) CONFIG="${2:-}"; shift 2 ;;
+      --since)  SINCE="${2:-}"; shift 2 ;;
+      *)        REST+=("$1"); shift ;;
+    esac
+  done
+}
+
+run_py() {
+  PYTHONPATH="$LIB_DIR${PYTHONPATH:+:$PYTHONPATH}" \
+    HC_CONFIG="$CONFIG" HC_SINCE="$SINCE" "$PY" - "$@"
+}
+
+case "$CMD" in
+  -h|--help|help)
+    usage
+    exit 0
+    ;;
+
+  list)
+    run_py <<'PY'
+import connectors as c
+for name in c.available():
+    ident = c.get(name).identity()
+    print("%s\t%s\t%s" % (ident["name"], ident["label"], ident["kind"]))
+PY
+    ;;
+
+  identity)
+    parse_opts "$@"
+    [ "${#REST[@]}" -ge 1 ] || { echo "heimdall-connector: identity needs <name>" >&2; exit 2; }
+    set +e
+    OUT="$(run_py "${REST[0]}" <<'PY' 2>&1
+import json, sys
+import connectors as c
+try:
+    print(json.dumps(c.get(sys.argv[1]).identity(), sort_keys=True))
+except KeyError as e:
+    sys.stderr.write(str(e) + "\n"); sys.exit(3)
+PY
+)"
+    rc=$?; set -e
+    printf '%s\n' "$OUT"; exit "$rc"
+    ;;
+
+  health)
+    parse_opts "$@"
+    [ "${#REST[@]}" -ge 1 ] || { echo "heimdall-connector: health needs <name>" >&2; exit 2; }
+    [ -z "$CONFIG" ] || [ -f "$CONFIG" ] || { echo "heimdall-connector: config not found: $CONFIG" >&2; exit 3; }
+    set +e
+    OUT="$(run_py "${REST[0]}" <<'PY' 2>&1
+import json, os, sys
+import connectors as c
+try:
+    conn = c.get(sys.argv[1])
+except KeyError as e:
+    sys.stderr.write(str(e) + "\n"); sys.exit(3)
+cfg_path = os.environ.get("HC_CONFIG") or ""
+if cfg_path:
+    with open(cfg_path, "r", encoding="utf-8") as fh:
+        cfg = json.load(fh)
+    block = (cfg.get("connectors") or {}).get(conn.name)
+    if isinstance(block, dict):
+        try:
+            conn.configure(block)
+        except c.ConnectorConfigError as e:
+            print(json.dumps({"name": conn.name, "active": False, "reason": "config error: %s" % e}, sort_keys=True))
+            sys.exit(0)
+print(json.dumps(conn.health(), sort_keys=True))
+PY
+)"
+    rc=$?; set -e
+    printf '%s\n' "$OUT"; exit "$rc"
+    ;;
+
+  fetch)
+    parse_opts "$@"
+    [ "${#REST[@]}" -ge 1 ] || { echo "heimdall-connector: fetch needs <name>" >&2; exit 2; }
+    [ -z "$CONFIG" ] || [ -f "$CONFIG" ] || { echo "heimdall-connector: config not found: $CONFIG" >&2; exit 3; }
+    set +e
+    OUT="$(run_py "${REST[0]}" <<'PY' 2>&1
+import json, os, sys
+import connectors as c
+try:
+    conn = c.get(sys.argv[1])
+except KeyError as e:
+    sys.stderr.write(str(e) + "\n"); sys.exit(3)
+cfg_path = os.environ.get("HC_CONFIG") or ""
+if cfg_path:
+    with open(cfg_path, "r", encoding="utf-8") as fh:
+        cfg = json.load(fh)
+    block = (cfg.get("connectors") or {}).get(conn.name)
+    if isinstance(block, dict):
+        try:
+            conn.configure(block)
+        except c.ConnectorConfigError as e:
+            sys.stderr.write("config error: %s\n" % e)
+            print("[]"); sys.exit(0)
+since = os.environ.get("HC_SINCE") or None
+# Inactive connector -> fetch_issues returns [] (no crash). Raw native items out.
+print(json.dumps(conn.fetch_issues(since), sort_keys=True))
+PY
+)"
+    rc=$?; set -e
+    printf '%s\n' "$OUT"; exit "$rc"
+    ;;
+
+  *)
+    echo "heimdall-connector: unknown command: $CMD" >&2
+    usage >&2
+    exit 2
+    ;;
+esac
