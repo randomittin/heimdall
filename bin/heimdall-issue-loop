@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# heimdall-issue-loop — piece (c): the issue-resolution LOOP state machine.
+#
+# A SEQUENCER of EXISTING machinery (design dossier §4) — it adds no new
+# orchestration primitive. One issue per `run-once`:
+#
+#   pick -> orient(SI-1) -> fix -> GATE -> attest(SI-2) -> [PR-ready | flagged]
+#
+#   • pick   — from the queue (piece b), respecting in-flight idempotency: an
+#              in_flight / resolved / flagged id is NEVER re-picked.
+#   • orient — REUSE SI-1: shells out to `heimdall-comprehend load <repo>`
+#              (exit 0 = capsule reused; exit 3 = `comprehend` then re-load),
+#              then attaches the capsule (.heimdall/context.json) to the fix brief.
+#   • fix    — a real Heimdall task slot with full gates; the loop DRIVES it and
+#              reads the GATE verdict (never the agent's "done" claim).
+#   • GATE   — THE CARDINAL RULE (dossier §5, safety-critical): an issue is
+#              PR-ready ONLY when the deterministic gate PASSES. The verdict is
+#              read ONLY from the SI-2 record's evidence.all_passed (a recorded
+#              REAL exit), NEVER from a self-report. PASS -> pr_ready + the PR
+#              layer hook open_pr (soft-imported; absent layer -> pr_ready + STOP,
+#              no fabricated PR). FAIL -> flagged 'gate-failed', NO PR.
+#   • attest — REUSE SI-2: `heimdall-attest emit --evidence`; the record carries
+#              the runnable evidence the PR will show AND is the gate-verdict source.
+#
+# Usage:
+#   heimdall-issue-loop run-once [--repo DIR] [--base REF] [--evidence CMD]... \
+#                                [--config @FILE|JSON] [--print]
+#       Drive ONE issue through the full state machine. --evidence supplies the
+#       runnable proof commands SI-2 executes (repeatable); their recorded real
+#       exits are the gate verdict. NO evidence -> all_passed False -> FAIL (a fix
+#       with no proof is never PR'd). --print emits the result JSON to stdout.
+#   heimdall-issue-loop run     [--repo DIR] [--base REF] [--evidence CMD]... \
+#                                [--config @FILE|JSON] [--max N]
+#       Drain the queue: run-once until nothing is pickable (or --max issues).
+#   heimdall-issue-loop status  [--repo DIR]
+#       Read-only at-a-glance over the queue buckets + in_flight machine-states.
+#   -h, --help                  this help
+#
+# Exit status:
+#   0  a run completed (including an honest GATE_FAILED / flagged outcome, and an
+#      inert IDLE run when nothing is pickable)
+#   2  usage error / python missing
+# A gate FAILURE is NOT a nonzero exit — it is an honest recorded outcome (the
+# issue is flagged, no PR opened); the loop exits 0 having done the right thing.
+
+set -euo pipefail
+
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+BINDIR="$(dirname "$SELF")"
+LIB="$BINDIR/lib/issue_loop.py"
+
+usage() { sed -n '2,46p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+PY="$(command -v python3 || command -v python || true)"
+if [ -z "$PY" ]; then
+  echo "error: python3 not found (required for the issue loop)" >&2
+  exit 2
+fi
+
+[ -f "$LIB" ] || { echo "error: missing library: $LIB" >&2; exit 2; }
+
+[ $# -ge 1 ] || { usage >&2; exit 2; }
+
+case "$1" in
+  -h|--help) usage; exit 0 ;;
+esac
+
+# Thin wrapper: the lib owns argv parsing + stdout shape (house style — same as
+# bin/heimdall-issue-queue over bin/lib/issue_queue.py). The connectors/queue libs
+# are siblings under bin/lib, so add it to PYTHONPATH for the soft-imports.
+exec env PYTHONPATH="$BINDIR/lib:${PYTHONPATH:-}" "$PY" "$LIB" "$@"
