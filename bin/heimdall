@@ -145,20 +145,32 @@ f1_persona_check() {
     if [ -t 0 ] && [ -t 1 ] && [ "${HEIMDALL_NO_INTRO:-0}" != "1" ] && [ "${F1_ASSUME_YES:-0}" != "1" ]; then
       local P D R reply choice
       P='\033[38;2;224;86;160m'; D='\033[2m'; R='\033[0m'
-      printf "\n  ${P}One-time question${R} — how should Heimdall talk to you?\n"
-      printf "    ${D}1) coder      — technical, code-first, terse${R}\n"
-      printf "    ${D}2) non-coder  — plain-language, guided${R}\n"
-      reply=""
-      # -t timeout so even an interactive prompt can never wedge a slow pipeline:
-      # no answer within the window → defer (leave unset), exactly like no TTY.
-      read -rt 60 -p "  choose [1/2] (default 1): " reply 2>/dev/null || reply=""
-      case "$reply" in
-        2|non-coder|nc) choice="non-coder" ;;
-        *)              choice="coder" ;;
-      esac
-      if "$persona_bin" set "$choice" >/dev/null 2>&1; then
-        F1_PERSONA="$choice"
-        printf "  ${P}▸ Persona set: %s${R} ${D}(remembered globally — asked once)${R}\n\n" "$choice"
+      # Re-check stdin is STILL an interactive TTY immediately before the read.
+      # The outer guard can pass while stdin is redirected away from the terminal
+      # before we get here (a closed/redirected fd in a pipeline, or a launcher
+      # invoked `</dev/null`). A `read -t` timeout is NOT a guard: on a non-TTY
+      # stdin it does not return promptly — it STALLS the whole window (up to 60s)
+      # and can wedge a non-interactive pipeline. So when stdin is not a real TTY
+      # we DEFER entirely here too: skip the prompt, leave the persona unset, and
+      # proceed on the default/guided surface. Never read a stdin that will not
+      # arrive (the v2.0.4 non-TTY-read class).
+      if [ -t 0 ]; then
+        printf "\n  ${P}One-time question${R} — how should Heimdall talk to you?\n"
+        printf "    ${D}1) coder      — technical, code-first, terse${R}\n"
+        printf "    ${D}2) non-coder  — plain-language, guided${R}\n"
+        reply=""
+        # -t timeout is belt-and-suspenders for a wedged INTERACTIVE terminal (a
+        # human walks away mid-prompt); the [ -t 0 ] re-check above is the real
+        # non-TTY guard. No answer within the window → defer (leave unset).
+        read -rt 60 -p "  choose [1/2] (default 1): " reply 2>/dev/null || reply=""
+        case "$reply" in
+          2|non-coder|nc) choice="non-coder" ;;
+          *)              choice="coder" ;;
+        esac
+        if "$persona_bin" set "$choice" >/dev/null 2>&1; then
+          F1_PERSONA="$choice"
+          printf "  ${P}▸ Persona set: %s${R} ${D}(remembered globally — asked once)${R}\n\n" "$choice"
+        fi
       fi
     fi
   elif [ "$F1_PERSONA" != "unset" ]; then
