@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# heimdall-issue-queue — piece (b) of the Heimdall issue-resolution loop: the
+# normalized-issue store, prioritization, and in-flight (no-double-work) tracking.
+#
+# The connectors (piece a) return RAW source items; this tool NORMALIZES them to
+# the ONE internal issue schema, persists them in a prioritized queue, and hands
+# the loop (piece c) the next issue to work — claiming it BEFORE any work so two
+# loop iterations can never fight over one issue.
+#
+# Subcommands:
+#
+#   heimdall-issue-queue normalize --source S --raw @file|JSON [--config C] [--now ISO]
+#       PURE map: one RAW source item -> the normalized issue (schema dossier §2).
+#       --source = github|slack|email. --raw = inline JSON or @path. Prints the
+#       normalized issue JSON. Does NOT touch the store (a dry mapping check).
+#
+#   heimdall-issue-queue ingest --source S --raw @file|JSON [--config C]
+#       Normalize RAW item(s) (a single object or a JSON array) and add them to the
+#       queue. Idempotent: an id already known in ANY bucket is NOT re-queued.
+#       Prints { ingested, submitted }.
+#
+#   heimdall-issue-queue list [--config C] [--state queued|in_flight|resolved|flagged]
+#       List known issues with their current state, queued ones in pick order.
+#
+#   heimdall-issue-queue pick [--config C]
+#       Claim the highest-priority QUEUED issue (score = w_sev*rank + w_age*age +
+#       w_src*source_priority; weights configurable, ties broken by id). Atomically
+#       moves it into in_flight BEFORE returning (claim-before-work). A second pick
+#       returns the NEXT issue — never the one already claimed. Prints { picked }.
+#
+#   heimdall-issue-queue status
+#       Per-bucket counts (queued / in_flight / resolved / flagged / total).
+#
+#   heimdall-issue-queue release --id ID
+#       Return an in_flight id to the queued pool (the honest retry path).
+#
+# Store: ${HEIMDALL_HOME:-<repo>/.heimdall}/issues/queue.json, written atomically
+# (.tmp -> os.replace, sorted keys). --config is inline JSON or @path-to-file and
+# supplies the prioritization weights + per-source priority (dossier §3/§7).
+#
+# Exit status:
+#   0  success.
+#   2  usage error (missing arg / unknown subcommand) or a malformed input.
+
+set -euo pipefail
+
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+BINDIR="$(dirname "$SELF")"
+QUEUE_LIB="$BINDIR/lib/issue_queue.py"
+
+usage() { sed -n '2,44p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+PY="$(command -v python3 || command -v python || true)"
+if [ -z "$PY" ]; then
+  echo "error: python3 not found (required for issue-queue)" >&2
+  exit 2
+fi
+
+if [ ! -f "$QUEUE_LIB" ]; then
+  echo "error: missing lib: $QUEUE_LIB" >&2
+  exit 2
+fi
+
+[ $# -ge 1 ] || { usage >&2; exit 2; }
+
+case "$1" in
+  -h|--help) usage; exit 0 ;;
+esac
+
+# The python lib owns argv parsing + the JSON stdout shape; this wrapper owns only
+# the interpreter resolution + the --help text (house style: heimdall-redum).
+exec "$PY" "$QUEUE_LIB" "$@"
