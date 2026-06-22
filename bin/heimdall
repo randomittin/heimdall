@@ -37,6 +37,165 @@ _trace_order() {
   printf '%s\n' "$1" >> "$HEIMDALL_TRACE_ORDER" 2>/dev/null || true
 }
 
+# ── F1 launch resolution order: orient → resume → persona-check → onboard-if-cold ─
+#
+# The F1 (Onboarding) front-door decision tree, wired into the launch path. Each
+# phase consumes an ALREADY-MERGED standalone piece (it does NOT rebuild them):
+#   orient        — bin/heimdall-frontdoor classify (directory context + route)
+#                   + bin/heimdall-comprehend (SI-1 capsule: load if fresh → reuse,
+#                     stale/missing → derive). Emits the `orient` trace marker.
+#   resume        — if the front door classified mid-task-resume OR a checkpoint
+#                   was loaded (load_checkpoint_context), emit `resume`.
+#   persona-check — bin/heimdall-persona: set-once, never re-prompt. If set → skip.
+#                   If unset → prompt ONCE, but ONLY on a real TTY with intro
+#                   enabled and without --yes; a non-TTY / --yes / HEIMDALL_NO_INTRO
+#                   run NEVER blocks on a stdin read (mirrors the uninstall/demo
+#                   discipline) — it defers the prompt and leaves the persona unset
+#                   so a later interactive run asks. Emits `persona-check`.
+#   onboard-if-cold — onboarding runs ONLY on a cold first-ever run (no first-run
+#                   marker AND the front door routes empty/fresh). A warm run skips
+#                   straight to work. Emits `onboard` (cold) or nothing (warm).
+#
+# Phase state is published into these globals for the launch path + the trace:
+#   F1_CONTEXT        the front-door context word (empty-dir|fresh-project|…)
+#   F1_ROUTE          the front-door route       (onboard-new|orient-fresh|…)
+#   F1_CAPSULE_ACTION reused-cached | derived-fresh | derive-failed | skipped
+#   F1_PERSONA        the resolved persona       (coder|non-coder|unset)
+#   F1_DID_ONBOARD    1 iff onboarding fired this run (cold), else 0
+#
+# Every phase is fail-open: a missing piece, a non-repo dir, or a python hiccup
+# degrades to a sensible default and NEVER aborts the launch (set -e safe).
+
+F1_CONTEXT=""
+F1_ROUTE=""
+F1_CAPSULE_ACTION="skipped"
+F1_PERSONA="unset"
+F1_DID_ONBOARD=0
+
+# orient — classify the directory + load/derive the SI-1 comprehension capsule.
+f1_orient() {
+  local fd="$PLUGIN_DIR/bin/heimdall-frontdoor"
+  local comp="$PLUGIN_DIR/bin/heimdall-comprehend"
+
+  # 1. Directory classification (front door). --json carries context+route+signals;
+  #    we pull just context+route. Fail-open: a missing classifier leaves the
+  #    defaults so the launch proceeds.
+  if [ -x "$fd" ] && command -v python3 >/dev/null 2>&1; then
+    local fd_json
+    fd_json="$("$fd" classify --json "$WORK_DIR" 2>/dev/null || true)"
+    if [ -n "$fd_json" ]; then
+      F1_CONTEXT="$(printf '%s' "$fd_json" | python3 -c 'import json,sys;
+try:
+ d=json.load(sys.stdin); print(d.get("context",""))
+except Exception: print("")' 2>/dev/null)"
+      F1_ROUTE="$(printf '%s' "$fd_json" | python3 -c 'import json,sys;
+try:
+ d=json.load(sys.stdin); print(d.get("route",""))
+except Exception: print("")' 2>/dev/null)"
+    fi
+  fi
+
+  # 2. SI-1 comprehension capsule: load if fresh (reuse → orient-once), else derive.
+  #    `load` exits 3 when stale/missing/corrupt — that is the re-derive signal, NOT
+  #    a crash. `comprehend` then derives (or reuses a still-fresh capsule). We
+  #    record which path was taken so the harness can prove reuse on a warm run.
+  if [ -x "$comp" ] && command -v python3 >/dev/null 2>&1; then
+    if "$comp" load "$WORK_DIR" >/dev/null 2>&1; then
+      F1_CAPSULE_ACTION="reused-cached"
+    else
+      if "$comp" comprehend "$WORK_DIR" >/dev/null 2>&1; then
+        F1_CAPSULE_ACTION="derived-fresh"
+      else
+        F1_CAPSULE_ACTION="derive-failed"
+      fi
+    fi
+  fi
+
+  _trace_order "orient"
+  if [ -n "${HEIMDALL_TRACE_ORDER:-}" ]; then
+    printf "  \033[38;2;0;212;255m▸ Orient\033[0m %s → %s ${F1_CAPSULE_ACTION:+(capsule: %s)}\n" \
+      "${F1_CONTEXT:-unknown}" "${F1_ROUTE:-unknown}" "$F1_CAPSULE_ACTION" >&2 2>/dev/null || true
+  fi
+}
+
+# resume — emit the resume marker iff there is in-flight work to resume.
+#   $1 = "1" when load_checkpoint_context found a checkpoint/state (CHECKPOINT_CONTEXT
+#        non-empty), else "". The front-door mid-task-resume route also counts.
+f1_resume() {
+  local cp_loaded="${1:-}"
+  if [ "$F1_ROUTE" = "resume" ] || [ -n "$cp_loaded" ]; then
+    _trace_order "resume"
+  fi
+}
+
+# persona-check — set-once global persona; prompt at most once, never hang.
+f1_persona_check() {
+  local persona_bin="$PLUGIN_DIR/bin/heimdall-persona"
+  F1_PERSONA="unset"
+  if [ -x "$persona_bin" ]; then
+    F1_PERSONA="$("$persona_bin" get 2>/dev/null || echo unset)"
+  fi
+
+  if [ "$F1_PERSONA" = "unset" ] && [ -x "$persona_bin" ]; then
+    # Prompt ONLY when it is safe to read a real answer: a TTY on both stdin and
+    # stdout, intro not disabled, no --yes assume-yes. Otherwise DEFER — never read
+    # a stdin that will not arrive (the TTY-read landmine). A deferred persona stays
+    # unset so the next interactive run asks once; product code defaults to the
+    # guided (non-coder) surface until then (persona_store.is_coder() → False).
+    if [ -t 0 ] && [ -t 1 ] && [ "${HEIMDALL_NO_INTRO:-0}" != "1" ] && [ "${F1_ASSUME_YES:-0}" != "1" ]; then
+      local P D R reply choice
+      P='\033[38;2;224;86;160m'; D='\033[2m'; R='\033[0m'
+      printf "\n  ${P}One-time question${R} — how should Heimdall talk to you?\n"
+      printf "    ${D}1) coder      — technical, code-first, terse${R}\n"
+      printf "    ${D}2) non-coder  — plain-language, guided${R}\n"
+      reply=""
+      # -t timeout so even an interactive prompt can never wedge a slow pipeline:
+      # no answer within the window → defer (leave unset), exactly like no TTY.
+      read -rt 60 -p "  choose [1/2] (default 1): " reply 2>/dev/null || reply=""
+      case "$reply" in
+        2|non-coder|nc) choice="non-coder" ;;
+        *)              choice="coder" ;;
+      esac
+      if "$persona_bin" set "$choice" >/dev/null 2>&1; then
+        F1_PERSONA="$choice"
+        printf "  ${P}▸ Persona set: %s${R} ${D}(remembered globally — asked once)${R}\n\n" "$choice"
+      fi
+    fi
+  elif [ "$F1_PERSONA" != "unset" ]; then
+    # Already set — read it, never re-prompt.
+    if [ -n "${HEIMDALL_TRACE_ORDER:-}" ]; then
+      printf "  \033[38;2;155;89;182m▸ Persona\033[0m %s \033[2m(set, skipped)\033[0m\n" "$F1_PERSONA" >&2 2>/dev/null || true
+    fi
+  fi
+
+  _trace_order "persona-check"
+}
+
+# onboard-if-cold — run onboarding ONLY on a cold first-ever run.
+#   Cold = no first-run marker ($SETUP_MARKER absent at run start, captured by the
+#   caller into $F1_WAS_FIRST_RUN) AND the front door routes a new project
+#   (empty-dir / fresh-project). A warm run skips: emits nothing, goes to work.
+f1_onboard_if_cold() {
+  F1_DID_ONBOARD=0
+  local is_cold=0
+  if [ "${F1_WAS_FIRST_RUN:-0}" = "1" ]; then
+    case "$F1_CONTEXT" in
+      empty-dir|fresh-project) is_cold=1 ;;
+    esac
+    # No context resolved at all (classifier absent) but a genuine first-run marker
+    # is missing → still treat as cold so a first-ever run is onboarded.
+    [ -z "$F1_CONTEXT" ] && is_cold=1
+  fi
+
+  if [ "$is_cold" = "1" ]; then
+    F1_DID_ONBOARD=1
+    _trace_order "onboard"
+    if [ -n "${HEIMDALL_TRACE_ORDER:-}" ]; then
+      printf "  \033[38;2;78;204;163m▸ Onboard\033[0m cold first run (%s)\n" "${F1_CONTEXT:-new}" >&2 2>/dev/null || true
+    fi
+  fi
+}
+
 # ── Shared removal path (uninstall subcommand AND legacy --uninstall) ──
 #
 # The ONE guarded removal. Both `hmd uninstall` and `heimdall --uninstall` call
@@ -1762,6 +1921,17 @@ fi
 
 ensure_node_path
 ensure_claude
+
+# ── F1 resolution order, phase 1: ORIENT ──────────────────────────────────────
+# Classify the directory (front door) + load/derive the SI-1 comprehension capsule
+# BEFORE setup, so the cold-vs-warm decision (onboard-if-cold) and the resume
+# decision both have the directory context in hand. Capture whether this is a
+# genuine cold first run NOW — before complete_first_run_setup touches the marker —
+# so onboard-if-cold can tell a first-ever run from a warm one.
+F1_WAS_FIRST_RUN=0
+[ -f "$SETUP_MARKER" ] || F1_WAS_FIRST_RUN=1
+f1_orient
+
 # ORDERED FIRST-RUN SETUP: auth → companion plugins → skills, all completed here
 # BEFORE the launch path below. Pass the task args so prompt-driven installs see
 # the prompt. select_model still runs in the launch-prep block (it needs the
@@ -1772,6 +1942,21 @@ ensure_project_claude_md
 print_banner
 check_for_update
 load_checkpoint_context
+
+# ── F1 resolution order, phases 2–4: RESUME → PERSONA-CHECK → ONBOARD-IF-COLD ──
+# These run AFTER setup (auth+companion+skills) so the ORDERING CONTRACT holds:
+# on a cold first run the full setup — INCLUDING the persona prompt — completes
+# BEFORE the first task launches (the stranger-test bug). A warm run: resume fires
+# if there is a checkpoint, persona is already set so persona-check is a no-op
+# skip, and onboard-if-cold does nothing → straight to work.
+#   - resume:  fires iff load_checkpoint_context loaded a checkpoint/state OR the
+#     front door routed mid-task-resume.
+#   - persona-check: set-once; prompts at most once, TTY-gated, never hangs.
+#   - onboard-if-cold: only on a cold first-ever run (no marker + empty/fresh dir).
+F1_ASSUME_YES=0
+f1_resume "${CHECKPOINT_CONTEXT:+1}"
+f1_persona_check
+f1_onboard_if_cold
 
 # Ensure git repo exists — coder agents use worktree isolation which requires git
 if [ ! -d "$WORK_DIR/.git" ] && ! git -C "$WORK_DIR" rev-parse --git-dir &>/dev/null; then
