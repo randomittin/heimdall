@@ -1,0 +1,226 @@
+#!/usr/bin/env bash
+# heimdall-check — F2 Checker, the duplicate-shape CHECKER (commit-time).
+#
+# Answers "did this change re-add a code shape the repo — or another author —
+# already provides?" at three depths. It is FUSED onto the SHARED dedup core
+# (bin/lib/dedup.py): F2's max tier and F3 Redum's gate are the SAME matcher
+# (index_repo_units + match_candidates), F2 adding only the cross-author filter.
+#
+#   heimdall-check  [--repo DIR] [--base REF] [--tier none|basic|max]
+#                   [--attest FILE | --id ID] [--block]
+#
+# TIERS (--tier, default max):
+#   none   PASSTHROUGH. No analysis — an honest no-op for pipelines that disable
+#          the check without removing the call. Always OK.
+#   basic  CHEAP LOCAL checks over the CHANGED files only (no repo index, no git
+#          history): a symbol or RN reuse-unit declared twice across the changed
+#          set. The fast pre-commit smoke check.
+#   max    DEEP cross-author dedup, fused onto dedup.py. Indexes the PRE-CHANGE
+#          repo per author (last-touch author via git log) and flags each added
+#          unit that duplicates an existing unit by a DIFFERENT author. ast-grep
+#          structurally confirms a renamed body when present (graceful-degrade).
+#
+# SI-2 reuse (optional context, NEVER recomputed): pass --attest FILE or --id ID to
+# echo SI-2's reuse_pct into the verdict. F2 reads it; it does not re-measure.
+#
+# Output: the verdict JSON on stdout, a one-line human summary on stderr.
+#
+# Exit status:
+#   0  OK, or duplicates found under the default (flag) policy.
+#   1  --block AND duplicates found (the checker blocks the commit).
+#   2  usage error.
+
+set -euo pipefail
+
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+BINDIR="$(dirname "$SELF")"
+CHECKER_LIB="$BINDIR/lib/checker.py"
+ATTEST="$BINDIR/heimdall-attest"
+
+usage() { sed -n '2,38p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+PY="$(command -v python3 || command -v python || true)"
+if [ -z "$PY" ]; then
+  echo "error: python3 not found (required for checker)" >&2
+  exit 2
+fi
+
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+esac
+
+# ── option parsing ────────────────────────────────────────────────────────────
+REPO="$(pwd)"
+BASE="HEAD"
+TIER="max"
+ID=""
+ATTEST_FILE=""
+POLICY="flag"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --repo)   REPO="${2:?--repo needs a dir}"; shift 2 ;;
+    --base)   BASE="${2:?--base needs a ref}"; shift 2 ;;
+    --tier)   TIER="${2:?--tier needs a value}"; shift 2 ;;
+    --id)     ID="${2:?--id needs a value}"; shift 2 ;;
+    --attest) ATTEST_FILE="${2:?--attest needs a file}"; shift 2 ;;
+    --block)  POLICY="block"; shift ;;
+    --flag)   POLICY="flag"; shift ;;
+    -h|--help) usage; exit 0 ;;
+    --*)      echo "error: unknown option: $1" >&2; usage >&2; exit 2 ;;
+    *)        echo "error: unexpected argument: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+case "$TIER" in
+  none|basic|max) ;;
+  *) echo "error: --tier must be none|basic|max (got: $TIER)" >&2; exit 2 ;;
+esac
+
+if ! git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
+  echo "error: --repo is not a git repository: $REPO" >&2
+  exit 2
+fi
+
+# ── build {pre_files, changed_files, authors} via git ─────────────────────────
+# pre_files  = every tracked source file at BASE (the pre-change repo).
+# changed_files = working-tree-vs-BASE added/modified/renamed source files +
+#                 untracked-not-ignored additions (the real task-run shape).
+# authors    = {path: last-touch author} for each pre_file (drives max-tier
+#              cross-author dedup) + the sentinel "" = the change author.
+build_maps() {
+  REPO="$REPO" BASE="$BASE" TIER="$TIER" "$PY" - <<'PYEOF'
+import json, os, subprocess
+
+repo = os.environ["REPO"]
+base = os.environ["BASE"]
+tier = os.environ["TIER"]
+SRC_EXT = {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".py", ".sh", ".bash"}
+
+
+def is_src(path):
+    return (os.path.splitext(path)[1].lower() in SRC_EXT
+            or "." not in os.path.basename(path))
+
+
+def git(*args):
+    p = subprocess.run(["git", "-C", repo, *args], capture_output=True)
+    return p.stdout.decode("utf-8", "replace"), p.returncode
+
+
+# pre-change surface: tracked source files at BASE.
+pre_files = {}
+authors = {}
+tree, _ = git("ls-tree", "-r", "--name-only", base)
+src_paths = [p.strip() for p in tree.splitlines()
+             if p.strip() and is_src(p.strip())]
+for p in src_paths:
+    body, rc = git("show", "%s:%s" % (base, p))
+    if rc == 0:
+        pre_files[p] = body
+
+# authors only needed for max tier (the cross-author attribution).
+if tier == "max":
+    for p in src_paths:
+        if p not in pre_files:
+            continue
+        # last author to touch the file at/under BASE.
+        out, rc = git("log", "-1", "--format=%ae", base, "--", p)
+        a = out.strip()
+        authors[p] = a or None
+    # the change author (sentinel key "") — who is making this change.
+    out, rc = git("config", "user.email")
+    authors[""] = out.strip() or "__change__"
+
+# changed (working tree vs BASE) added/modified/renamed source files.
+changed = []
+out, _ = git("diff", "--name-status", "--diff-filter=ACMR", base)
+for line in out.splitlines():
+    if not line.strip():
+        continue
+    parts = line.split("\t")
+    path = parts[-1].strip()
+    if path:
+        changed.append(path)
+
+unt, _ = git("ls-files", "--others", "--exclude-standard")
+seen = set(changed)
+for u in unt.splitlines():
+    u = u.strip()
+    if u and u not in seen:
+        changed.append(u)
+        seen.add(u)
+
+changed_files = {}
+for p in changed:
+    if not is_src(p):
+        continue
+    fp = os.path.join(repo, p)
+    if os.path.exists(fp):
+        try:
+            with open(fp, "r", errors="replace") as fh:
+                changed_files[p] = fh.read()
+        except OSError:
+            continue
+
+print(json.dumps({"pre_files": pre_files, "changed_files": changed_files,
+                  "authors": authors}))
+PYEOF
+}
+
+# ── resolve the optional SI-2 reuse field (echoed, never recomputed) ──────────
+REC_FILE=""
+if [ -n "$ATTEST_FILE" ]; then
+  [ -f "$ATTEST_FILE" ] || { echo "error: --attest file not found: $ATTEST_FILE" >&2; exit 2; }
+  REC_FILE="$ATTEST_FILE"
+elif [ -n "$ID" ]; then
+  REC_FILE="$("$ATTEST" path "$ID" --repo "$REPO" 2>/dev/null || true)"
+  [ -n "$REC_FILE" ] && [ -f "$REC_FILE" ] || {
+    echo "error: no attestation record for id: $ID (emit one first or pass --attest)" >&2
+    exit 2
+  }
+fi
+
+MAPS_TMP="$(mktemp -t "check-maps.$(printf 'X%.0s' 1 2 3 4 5 6)")"
+trap 'rm -f "$MAPS_TMP"' EXIT
+build_maps > "$MAPS_TMP"
+
+# ── run the checker over (tier, file maps, optional reuse record) ─────────────
+set +e
+CHECKER_LIB="$CHECKER_LIB" TIER="$TIER" POLICY="$POLICY" REC_FILE="$REC_FILE" \
+"$PY" - "$MAPS_TMP" <<'PYEOF'
+import json, os, sys
+sys.path.insert(0, os.path.dirname(os.environ["CHECKER_LIB"]))
+import checker
+
+with open(sys.argv[1], "r", errors="replace") as fh:
+    maps = json.load(fh)
+
+tier = os.environ["TIER"]
+policy = os.environ["POLICY"]
+
+reuse_field = None
+rec_file = os.environ.get("REC_FILE", "")
+if rec_file and os.path.isfile(rec_file):
+    try:
+        with open(rec_file, "r", errors="replace") as fh:
+            rec = json.load(fh)
+        reuse_field = rec.get("reuse") if isinstance(rec, dict) else None
+    except Exception:
+        reuse_field = None
+
+result = checker.check(
+    tier,
+    maps.get("changed_files", {}),
+    repo_files=maps.get("pre_files", {}),
+    authors=maps.get("authors", {}),
+    reuse_field=reuse_field,
+)
+sys.stdout.write(json.dumps(result, indent=2) + "\n")
+sys.stderr.write(result["summary"] + "\n")
+# exit: block policy + a duplicate verdict → 1; else 0.
+sys.exit(1 if (policy == "block" and result["verdict"] == "duplicate") else 0)
+PYEOF
+RC=$?
+set -e
+exit "$RC"
