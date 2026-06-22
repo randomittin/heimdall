@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# heimdall-issue-pr — piece (d): PR creation + the HUMAN-APPROVAL GATE + write-back.
+#
+# SAFETY-CRITICAL (design dossier §6). Heimdall's autonomy ENDS at the PR: it
+# OPENS the PR and STOPS. There is NO self-merge and NO auto-close, EVER — enforced
+# STRUCTURALLY (no merge verb exists in bin/lib/issue_pr.py). The write-back (close
+# the source + post the resolution back) is a SEPARATE, HUMAN-triggered path; the
+# loop never reaches it.
+#
+# The agent NEVER pushes: `open` builds the PR *artifact* (branch + body carrying
+# the SI-2 record + the `gh pr create` command shape). The live `gh pr create`
+# runs with RJ's creds at RUNTIME. Tests mock the connector + gh — no live creds.
+#
+# Usage:
+#   heimdall-issue-pr open     --issue @file|JSON --record @file|JSON [opts]
+#       Open a PR for a gate-PASS issue. ASSERTS record.evidence.all_passed is
+#       True (a FAIL cannot produce a PR — the cardinal rule). Renders the SI-2
+#       record (claims/contracts/EVIDENCE/reuse/risk) into the PR body so a human
+#       approves a PROVEN fix. Marks the issue PR_OPEN. Does NOT merge/close.
+#
+#   heimdall-issue-pr on-merge --issue @file|JSON [--pr REF] [opts]
+#       The WRITE-BACK — invoked ONLY after a HUMAN has merged the PR. Verifies the
+#       merge, then closes the source issue + posts the resolution back to the
+#       originating connector (Slack thread / GitHub issue / email). Moves the
+#       issue to resolved{merged:true}. NEVER called by the loop.
+#
+#   heimdall-issue-pr status   --id ID
+#       Read-only PR/writeback state for an issue.
+#
+# (There is deliberately NO `merge` subcommand — Heimdall never merges.)
+#
+# Options:
+#   --issue @file|JSON  the normalized issue (piece b shape)
+#   --record @file|JSON the SI-2 attestation record (open only)
+#   --pr REF            the merged PR ref (on-merge; defaults to the recorded pr)
+#   --id ID             the issue id (status)
+#   --repo DIR          the repo whose queue store tracks the issue (default: cwd)
+#   --base BRANCH       the PR base branch (open; default: main)
+#   --print             also print the result JSON to stdout
+#
+# Exit status:
+#   0  ok (PR artifact built / write-back done / status printed)
+#   1  human-gate refusal (open on an unproven change, or write-back of an
+#      un-merged PR) — the gate fails LOUD, never silently
+#   2  usage error
+
+set -euo pipefail
+
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+BINDIR="$(dirname "$SELF")"
+LIB="$BINDIR/lib/issue_pr.py"
+
+usage() { sed -n '2,46p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+PY="$(command -v python3 || command -v python || true)"
+if [ -z "$PY" ]; then
+  echo "error: python3 not found (required for issue-pr)" >&2
+  exit 2
+fi
+
+if [ ! -f "$LIB" ]; then
+  echo "error: missing lib: $LIB" >&2
+  exit 2
+fi
+
+[ $# -ge 1 ] || { usage >&2; exit 2; }
+
+case "$1" in
+  -h|--help) usage; exit 0 ;;
+esac
+
+# Delegate argv to the python CLI core (it owns subcommands + option parsing +
+# the JSON stdout shape). The lib resolves its own sibling imports (issue_queue,
+# connectors) off bin/lib via sys.path.
+exec "$PY" "$LIB" "$@"
