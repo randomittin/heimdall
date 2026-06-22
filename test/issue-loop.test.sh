@@ -153,11 +153,12 @@ fi
 
 echo "── (3) THE CARDINAL RULE — PASS->pr_ready/open_pr ; FAIL->flagged/NO PR ──────"
 
-# (3a) PASS: evidence exits 0 -> pr_ready, open_pr fires once with all_passed=true.
+# (3a) PASS: evidence exits 0 -> pr_ready, the REAL open_pr (piece d) fires.
+# NOTE: we DO NOT prepend the mock pr layer here — the real bin/lib/issue_pr.py is
+# already on PYTHONPATH (the wrapper prepends bin/lib), so the loop drives the REAL
+# pr layer. This is the integration form of the cardinal rule: stronger than a mock.
 seed_issue 3
-PR_SENTINEL="$WORK/sentinel_pass.jsonl"; export PR_SENTINEL
-: > "$PR_SENTINEL"
-OUT="$(PYTHONPATH="$PR_DIR:$PYTHONPATH" run_once "true" --print 2>"$WORK/pass.err")" || true
+OUT="$(run_once "true" --print 2>"$WORK/pass.err")" || true
 if printf '%s' "$OUT" | jq -e '.state == "PR_OPEN" and .pr_ready == true' >/dev/null 2>&1; then
   ok "PASS: gate-pass fix reaches PR_OPEN / pr_ready"
 else
@@ -168,19 +169,37 @@ if printf '%s' "$OUT" | jq -e '.gate.all_passed == true' >/dev/null 2>&1; then
 else
   bad "PASS: gate verdict not sourced from evidence.all_passed"
 fi
-if [ "$(wc -l < "$PR_SENTINEL" | tr -d ' ')" = "1" ] && \
-   jq -e '.all_passed == true' < "$PR_SENTINEL" >/dev/null 2>&1; then
-  ok "PASS: open_pr fired exactly once, handed the all_passed=true record"
+# The REAL pr layer (piece d) is now on PYTHONPATH (the wrapper prepends bin/lib),
+# so the loop drives the REAL open_pr — STRONGER than the old mock double: we assert
+# the REAL observable the real layer leaves behind. open_pr() firing means (a) the
+# loop reports pr_opened==true (the real layer was invoked, not a soft-import miss),
+# and (b) the real layer persisted the issue into the queue's in_flight bucket with
+# machine-state PR_OPEN AND wrote the real PR body file carrying the SI-2 record.
+if printf '%s' "$OUT" | jq -e '.pr_opened == true' >/dev/null 2>&1; then
+  ok "PASS: the REAL open_pr fired (pr_opened==true, real pr layer invoked)"
 else
   bad "PASS: open_pr did NOT fire on a gate-pass (PR layer not invoked)"
 fi
+PASS_ID="$(printf '%s' "$OUT" | jq -r '.issue.id')"
+if "$ROOT/bin/heimdall-issue-loop" status --repo "$REPO" \
+     | jq -e --arg id "$PASS_ID" '.in_flight_states[$id] == "PR_OPEN"' >/dev/null 2>&1; then
+  ok "PASS: real open_pr transitioned the issue to in_flight state PR_OPEN"
+else
+  bad "PASS: issue did not transition to PR_OPEN (real open_pr did not fire)"
+fi
+PASS_BODY="$HEIMDALL_HOME/issues/pr-bodies/$(printf '%s' "$PASS_ID" | tr ':/#' '___').md"
+if [ -s "$PASS_BODY" ] && grep -q 'si-2.1' "$PASS_BODY"; then
+  ok "PASS: real open_pr wrote the PR body carrying the SI-2 attestation"
+else
+  bad "PASS: no real PR body written — open_pr did not run the real pr layer"
+fi
 
-# (3b) FAIL: FLIP the verdict — evidence exits non-zero. The SAME loop must NOT
-#      reach pr_ready, must NOT call open_pr, must flag {reason:'gate-failed'}.
+# (3b) FAIL: FLIP the verdict — evidence exits non-zero. The SAME loop (driving the
+#      REAL pr layer, not a mock) must NOT reach pr_ready, must NOT call open_pr,
+#      must flag {reason:'gate-failed'}. A verdict flip from (3a) changes the
+#      observable (PR_OPEN+body in 3a -> GATE_FAILED+no-body here) — falsifiable.
 seed_issue 4
-PR_SENTINEL="$WORK/sentinel_fail.jsonl"; export PR_SENTINEL
-: > "$PR_SENTINEL"
-OUT="$(PYTHONPATH="$PR_DIR:$PYTHONPATH" run_once "false" --print 2>"$WORK/fail.err")" || true
+OUT="$(run_once "false" --print 2>"$WORK/fail.err")" || true
 if printf '%s' "$OUT" | jq -e '.state == "GATE_FAILED"' >/dev/null 2>&1; then
   ok "FAIL: gate-fail fix lands in GATE_FAILED"
 else
@@ -196,10 +215,17 @@ if printf '%s' "$OUT" | jq -e '.gate.all_passed == false' >/dev/null 2>&1; then
 else
   bad "FAIL: gate verdict not sourced from evidence.all_passed"
 fi
-if [ ! -s "$PR_SENTINEL" ]; then
-  ok "FAIL: open_pr NEVER fired on a gate-fail (no PR on FAIL)"
+if printf '%s' "$OUT" | jq -e '.pr_opened == false' >/dev/null 2>&1; then
+  ok "FAIL: open_pr NEVER fired on a gate-fail (real pr layer not invoked)"
 else
   bad "FAIL: open_pr fired on a gate-FAIL — CARDINAL RULE VIOLATED (PR on a failed gate)"
+fi
+FAIL3B_ID="$(printf '%s' "$OUT" | jq -r '.issue.id')"
+FAIL3B_BODY="$HEIMDALL_HOME/issues/pr-bodies/$(printf '%s' "$FAIL3B_ID" | tr ':/#' '___').md"
+if [ ! -e "$FAIL3B_BODY" ]; then
+  ok "FAIL: no real PR body written on a gate-fail (the real layer never ran)"
+else
+  bad "FAIL: a real PR body leaked on a gate-FAIL — CARDINAL RULE VIOLATED"
 fi
 # the issue is flagged honestly + kept OUT of the resolved path.
 if "$ROOT/bin/heimdall-issue-queue" status --repo "$REPO" | jq -e '.flagged >= 1 and .resolved == 0' >/dev/null 2>&1; then
@@ -224,21 +250,26 @@ else
   bad "double-pick: the loop re-picked an already-claimed/flagged id"
 fi
 
-echo "── (5) soft-import: NO pr layer present -> pr_ready + STOP (no fabricated PR) ─"
+echo "── (5) REAL pr layer: FAIL side — open_pr must NOT fire (cardinal-rule falsif.) ─"
+# The REAL pr layer (piece d) is on PYTHONPATH. This is the falsifiable counterpart
+# to (3a): a gate-FAIL must produce NO real PR observable. A verdict flip (PASS in
+# 3a -> the real PR body + PR_OPEN; FAIL here -> neither) changes the observable,
+# so the test cannot pass on a build that PR's on a failed gate.
 seed_issue 5
-PR_SENTINEL="$WORK/sentinel_soft.jsonl"; export PR_SENTINEL
-: > "$PR_SENTINEL"
-# run WITHOUT the fake pr layer on the path: issue_pr is absent -> soft-import miss.
-OUT="$(run_once "true" --print 2>"$WORK/soft.err")" || true
-if printf '%s' "$OUT" | jq -e '.pr_ready == true and .pr_opened == false' >/dev/null 2>&1; then
-  ok "soft-import: pr_ready marked, pr_opened false (no fabricated PR when layer absent)"
+OUT="$(run_once "false" --print 2>"$WORK/realfail.err")" || true
+if printf '%s' "$OUT" | jq -e '.pr_opened == false and .pr_ready != true' >/dev/null 2>&1; then
+  ok "REAL pr layer: gate-FAIL -> open_pr did NOT fire (pr_opened false, no pr_ready)"
 else
-  bad "soft-import: absent pr layer did not degrade to pr_ready-and-stop"
+  bad "REAL pr layer: open_pr fired on a gate-FAIL — CARDINAL RULE VIOLATED"
 fi
-if [ ! -s "$PR_SENTINEL" ]; then
-  ok "soft-import: no open_pr call fabricated when the layer is absent"
+FAIL_ID="$(printf '%s' "$OUT" | jq -r '.issue.id')"
+FAIL_BODY="$HEIMDALL_HOME/issues/pr-bodies/$(printf '%s' "$FAIL_ID" | tr ':/#' '___').md"
+if [ ! -e "$FAIL_BODY" ] && \
+   "$ROOT/bin/heimdall-issue-loop" status --repo "$REPO" \
+     | jq -e --arg id "$FAIL_ID" '(.in_flight_states[$id] // "absent") != "PR_OPEN"' >/dev/null 2>&1; then
+  ok "REAL pr layer: no PR body written + issue NOT in PR_OPEN on a gate-FAIL"
 else
-  bad "soft-import: a PR was fabricated despite the absent layer"
+  bad "REAL pr layer: a real PR artifact leaked on a gate-FAIL"
 fi
 
 echo
