@@ -35,8 +35,16 @@ docs/superpowers/plans/
 # Also holds the SI-2 attestation runtime store (.heimdall/attestations/<id>.json):
 # one record per commit/task, emitted by `heimdall-attest` and read by F2–F6 —
 # per-checkout runtime state, never committed.
-.heimdall/
+# Ignore the runtime home's CONTENTS (so the real config + secrets + the
+# attestation store never commit) — but as `.heimdall/*` (not `.heimdall/`) so
+# git still DESCENDS into the dir and the single un-ignore below can take effect.
+.heimdall/*
 .heimdall/attestations/
+# EXCEPTION: the issue-loop config EXAMPLE is committed source (structure +
+# env-var NAMES only, never secrets). The REAL config (.heimdall/issue-loop.config.json)
+# and secrets file stay ignored by `.heimdall/*`; only this single .example is
+# un-ignored so it can be committed.
+!.heimdall/issue-loop.config.json.example
 
 # designmatch v2 runtime ledger + quarantine (the regen-log.json hash-log and the
 # tmp holding area are per-checkout runtime state, not source — never commit them).

@@ -1,0 +1,36 @@
+{
+  "//": "EXAMPLE issue-loop config. Copy to .heimdall/issue-loop.config.json (the REAL file, which is gitignored) and replace the bracketed example values. This committed example carries STRUCTURE + non-secret knobs ONLY. Every *_env value is the NAME of an environment variable that holds the real credential at runtime — NEVER the credential itself. No token literal must ever be committed; the gitleaks gate (bin/secret-scan + .gitleaks.toml) fires if one is staged.",
+  "connectors": {
+    "github": {
+      "active": true,
+      "repo": "<owner>/<repo>",
+      "token_env": "HEIMDALL_GH_TOKEN"
+    },
+    "slack": {
+      "active": false,
+      "channel": "<slack-channel-id>",
+      "token_env": "HEIMDALL_SLACK_TOKEN"
+    },
+    "email": {
+      "active": false,
+      "mailbox": "<imap-mailbox-address>",
+      "password_env": "HEIMDALL_MAIL_PW"
+    }
+  },
+  "prioritization": {
+    "weights": {
+      "severity": 3,
+      "age": 1,
+      "source": 1
+    },
+    "source_priority": {
+      "github": 1,
+      "slack": 0,
+      "email": 0
+    }
+  },
+  "in_scope": {
+    "labels": ["bug", "dependencies", "small"],
+    "max_body_chars": 8000
+  }
+}

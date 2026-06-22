@@ -51,4 +51,11 @@ paths = [
   # This very test plants a real-shaped secret in a throwaway repo to prove
   # detection still works; allowlist its own path so it is not self-flagged.
   '''test/selfscan\.test\.sh''',
+  # The issue-loop config/credential test (piece e) plants token-shaped fixtures
+  # to prove (1) the committed .example carries NO real secret and (2) a PLANTED
+  # credential in a config IS caught by the gitleaks gate. The fixtures are test
+  # material, not real credentials. Only this specific test path is allowlisted;
+  # the committed .example + the lib remain fully scanned, so a genuine leak there
+  # still fires.
+  '''test/issue-config\.test\.sh''',
 ]
