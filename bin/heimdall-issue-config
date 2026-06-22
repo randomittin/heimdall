@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+# heimdall-issue-config — piece (e): config + CREDENTIAL handling for the
+# issue-resolution loop. Thin bash wrapper over bin/lib/issue_config.py, mirroring
+# the house style of bin/heimdall-redum + bin/designmatch-target (bash wrapper over
+# a pure python lib, sed-extracted --help, exit-code conventions).
+#
+# SECURITY: this is the auth surface. It NEVER prints a credential value. `show`
+# emits a redacted view (cred_present booleans + the env-var NAME, never the
+# secret). Creds resolve at runtime ONLY from the env var named in the config (or
+# the gitignored .heimdall/issue-loop.secrets.json). The committed config carries
+# env-var NAMES only; the real config (.heimdall/issue-loop.config.json) is
+# gitignored. The gitleaks gate (bin/secret-scan + .gitleaks.toml) catches any
+# planted credential — this tool does not weaken or bypass it.
+#
+# Lazy/optional: an absent config OR an absent connector credential makes that
+# connector INACTIVE, never a crash. With NO connectors active the loop is INERT.
+#
+# Subcommands:
+#   show      [--repo DIR] [--config FILE]   redacted resolved config (no secrets)
+#   validate  [--repo DIR] [--config FILE]   report problems/warnings; exit 1 on a problem
+#   active    [--repo DIR] [--config FILE]   list active connector names, one per line
+#
+# Options:
+#   --repo DIR      repo root (default: cwd). Resolves the config + runtime home.
+#   --config FILE   explicit config file (default: ${HEIMDALL_HOME:-<repo>/.heimdall}/issue-loop.config.json)
+#
+# Exit status:
+#   0  ok (show/active always 0; validate 0 when no problems — inert is valid)
+#   1  validate: a genuine config problem (an active connector with no *_env key)
+#   2  usage error
+#   3  runtime error (python interpreter / lib missing)
+
+set -euo pipefail
+
+# Resolve this script's own dir (RELOCATABLE — no baked path).
+SELF="$0"
+case "$SELF" in
+  */*) : ;;
+  *)   SELF="$(command -v "$SELF" 2>/dev/null || echo "$SELF")" ;;
+esac
+BIN_DIR="$(cd "$(dirname "$SELF")" 2>/dev/null && pwd)"
+LIB_DIR="$BIN_DIR/lib"
+LIB="$LIB_DIR/issue_config.py"
+
+usage() { sed -n '2,38p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+if [ ! -f "$LIB" ]; then
+  echo "heimdall-issue-config: lib not found at $LIB" >&2
+  exit 3
+fi
+
+PY="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)"
+if [ -z "$PY" ]; then
+  echo "heimdall-issue-config: python3 not found on PATH" >&2
+  exit 3
+fi
+
+CMD="${1:-help}"
+[ $# -gt 0 ] && shift || true
+
+case "$CMD" in
+  -h|--help|help) usage; exit 0 ;;
+esac
+
+REPO="$(pwd)"
+CONFIG_FILE=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --repo)   REPO="${2:?--repo needs a dir}"; shift 2 ;;
+    --config) CONFIG_FILE="${2:?--config needs a file}"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    --*) echo "heimdall-issue-config: unknown option: $1" >&2; usage >&2; exit 2 ;;
+    *)   echo "heimdall-issue-config: unexpected argument: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+case "$CMD" in
+  show|validate|active) : ;;
+  *) echo "heimdall-issue-config: unknown command: $CMD (expected show|validate|active)" >&2
+     usage >&2; exit 2 ;;
+esac
+
+set +e
+OUT="$(REPO="$REPO" CONFIG_FILE="$CONFIG_FILE" CMD="$CMD" \
+  PYTHONPATH="$LIB_DIR${PYTHONPATH:+:$PYTHONPATH}" "$PY" - <<'PY' 2>&1
+import json
+import os
+import sys
+
+import issue_config as ic
+
+repo = os.environ["REPO"]
+config_file = os.environ.get("CONFIG_FILE") or None
+cmd = os.environ["CMD"]
+
+# Lazy/optional: load_config NEVER raises on a missing/malformed config — it
+# returns the inert shape. The optional gitignored secrets file likewise degrades
+# to {} when absent. Creds resolve from the real environment at runtime.
+cfg = ic.load_config(repo, path=config_file)
+secrets = ic.load_secrets(repo)
+
+if cmd == "active":
+    for name in ic.active_connectors(cfg, secrets=secrets):
+        print(name)
+    sys.exit(0)
+
+if cmd == "show":
+    # redacted_view carries cred_present booleans + env-var NAMES, NEVER secrets.
+    view = ic.redacted_view(cfg, secrets=secrets)
+    print(json.dumps(view, indent=2, sort_keys=True))
+    sys.exit(0)
+
+if cmd == "validate":
+    result = ic.validate(cfg, secrets=secrets)
+    print(json.dumps(result, indent=2, sort_keys=True))
+    # inert is valid; a genuine problem (active connector, no *_env key) -> exit 1.
+    sys.exit(0 if result["ok"] else 1)
+
+sys.stderr.write("heimdall-issue-config: unhandled command %r\n" % cmd)
+sys.exit(2)
+PY
+)"
+RC=$?
+set -e
+
+printf '%s\n' "$OUT"
+exit "$RC"
