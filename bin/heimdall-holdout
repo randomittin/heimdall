@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# heimdall-holdout — piece (e) of the Heimdall telemetry layer: A/B-HOLDOUT +
+# MEASURED-vs-ESTIMATED reporting. HONESTY-CRITICAL: Heimdall's own
+# "measured-not-asserted" rule, applied to Heimdall's OWN savings claims.
+#
+# A fraction of runs is designated CONTROL (unshaped — the variable under test OFF)
+# vs TREATMENT (the variable ON). The same workload, measured with AND without the
+# variable, is the ONLY way a "saved vs raw-CC" number becomes a measured FACT.
+# A counterfactual with no control sample is NEVER printed as a number — it is
+# labeled `est.` (with a stated basis) or left blank ("—"). This CLI refuses to
+# emit a comparison number it did not measure (structural, not a convention).
+#
+# Subcommands (a thin wrapper over bin/lib/holdout.py — house style: bin/*-redum):
+#
+#   heimdall-holdout assign  --run-id R [--fraction F] [--home H]
+#       DECIDE + RECORD the arm for a run (control|treatment) as a telemetry tag,
+#       so the run's spend is later attributable to its arm. HEIMDALL_HOLDOUT=control
+#       forces the control arm; otherwise --fraction (default 0.0 = all treatment)
+#       is the deterministic per-run share assigned to control. Prints
+#       {"run_id","arm","tagged"}.
+#
+#   heimdall-holdout arm     --run-id R [--fraction F]
+#       DECIDE the arm WITHOUT recording (a dry-run). Prints {"run_id","arm"}.
+#
+#   heimdall-holdout delta   [--metric total_tokens|total_cost_usd] [--min-n N]
+#                            [--home H]
+#       The MEASURED control−treatment delta over REAL token events, WITH a
+#       confidence band per arm (n / mean / spread / stderr) + a band on the delta.
+#       JSON. `measured` is true ONLY when BOTH arms cleared --min-n.
+#
+#   heimdall-holdout figure  [--metric M] [--min-n N]
+#                            [--estimate F --estimate-basis S] [--home H]
+#       The HONEST savings figure for the card's `vs raw-CC` slot — EXACTLY one of:
+#         measured  (a holdout delta with a control sample),
+#         estimated (a labeled `est.` figure WITH a stated --estimate-basis), or
+#         blank     ("—", no baseline).
+#       NEVER a fabricated number. Prints the figure JSON (incl. cost_source
+#       provenance + is_measured_fact) and a rendered one-line string.
+#
+# Exit status:
+#   0  a subcommand produced its JSON (telemetry/holdout NEVER gates the caller).
+#   2  usage error (unknown subcommand / missing required flag).
+
+set -euo pipefail
+
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+BINDIR="$(dirname "$SELF")"
+HOLDOUT_LIB="$BINDIR/lib/holdout.py"
+
+usage() { sed -n '2,46p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+PY="$(command -v python3 || command -v python || true)"
+if [ -z "$PY" ]; then
+  echo "error: python3 not found (required for holdout)" >&2
+  exit 2
+fi
+
+if [ ! -f "$HOLDOUT_LIB" ]; then
+  echo "error: holdout engine missing at $HOLDOUT_LIB" >&2
+  exit 2
+fi
+
+[ $# -ge 1 ] || { usage >&2; exit 2; }
+
+case "$1" in
+  -h|--help) usage; exit 0 ;;
+esac
+
+# The lib's _cli owns argv parsing (subcommand + flags) and the honest-exit policy:
+# it returns 0 on a clean parse, 2 on a usage error. We pass argv through verbatim
+# so the bash wrapper stays a thin shell over the engine (house style).
+exec "$PY" "$HOLDOUT_LIB" "$@"
