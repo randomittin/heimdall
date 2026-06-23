@@ -40,6 +40,12 @@ docs/superpowers/plans/
 # git still DESCENDS into the dir and the single un-ignore below can take effect.
 .heimdall/*
 .heimdall/attestations/
+# The telemetry NDJSON event store (.heimdall/telemetry/events*.ndjson): per-
+# checkout runtime metrics, local-first, NEVER committed. Already covered by
+# `.heimdall/*` above; named explicitly so a future un-ignore exception can never
+# accidentally leak it. The store stays gitleaks-CLEAN-by-construction (the scrubber
+# keeps secrets out) — it is NEVER added to .gitleaks.toml's allowlist.
+.heimdall/telemetry/
 # EXCEPTION: the issue-loop config EXAMPLE is committed source (structure +
 # env-var NAMES only, never secrets). The REAL config (.heimdall/issue-loop.config.json)
 # and secrets file stay ignored by `.heimdall/*`; only this single .example is

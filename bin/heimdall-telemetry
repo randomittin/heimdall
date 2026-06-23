@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# heimdall-telemetry — the ONE general event surface CLI (piece a of the telemetry
+# layer). A thin bash front over bin/lib/telemetry.py, mirroring the house style of
+# bin/heimdall-redum / bin/heimdall-issue-loop (bash wrapper over a bin/lib/*.py
+# engine). install.sh + any bash consumer writes events through THIS wrapper.
+#
+#   heimdall-telemetry emit --type T [opts...]
+#       Append ONE schema-validated, secret-scrubbed event to the NDJSON store
+#       (.heimdall/telemetry/events.ndjson). FIRE-AND-FORGET: it NEVER fails the
+#       caller — a disabled / dropped / write-failed event prints {"emitted":false}
+#       and STILL exits 0 (graceful-degrade, dossier §8). Wrap every call site in
+#       `|| true` anyway as belt-and-suspenders; the wrapper itself is non-raising.
+#       Event keys (the pinned schema, dossier §1):
+#         --type     install_step|phase|gate|token|outcome|commit|issue_state  (req)
+#         --run-id   stable id per hmd/install invocation (run-<uuid4hex>)
+#         --phase    planning|waves|gates|install
+#         --step     setup|auth|companion:caveman|companion:claude-mem|skills|path|…
+#         --outcome  started|succeeded|failed|passed|blocked
+#         --gate     secret-scan|oracle|lint|test|bloat|reuse
+#         --duration-ms N      wall-clock of the step/phase
+#         --commit   SHA       short SHA (type=commit)
+#         --loc      file:line where a gate fired (deny→fix→pass arc)
+#         --error-class / --error-step / --error-detail   SHAPE-only error summary
+#                    (NEVER stdout/stderr/secret/PII — the scrubber rejects those)
+#         --tokens   @file|JSON  the bin/heimdall-tokens JSON, copied VERBATIM
+#         --extra    @file|JSON  small bounded scalar tags ONLY (no free payload)
+#         --home     DIR        the runtime home (default ${HEIMDALL_HOME:-.heimdall})
+#
+#   heimdall-telemetry status [--home DIR]
+#       Read-only at-a-glance over the store (enabled flag, path, counts). Writes
+#       nothing.
+#
+#   heimdall-telemetry new-run-id
+#       Print a fresh run id (run-<uuid4hex>) for one hmd/install invocation.
+#
+# NO-SECRET-BY-CONSTRUCTION (dossier §7): the schema has NO free-payload field;
+# error.detail/extra are length-bounded + gitleaks-pattern-rejected by the lib's
+# _scrub() BEFORE write. The store is plaintext NDJSON so the gitleaks gate scans it
+# natively — it is NEVER added to the .gitleaks.toml allowlist.
+#
+# Exit status:
+#   0  emit (ALWAYS — telemetry never gates the caller), status, new-run-id.
+#   2  usage error (unknown subcommand / python absent).
+
+set -uo pipefail
+
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+BINDIR="$(dirname "$SELF")"
+TELEMETRY_LIB="$BINDIR/lib/telemetry.py"
+
+usage() { sed -n '2,52p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+PY="$(command -v python3 || command -v python || true)"
+if [ -z "$PY" ]; then
+  # python absent: telemetry degrades to a no-op rather than failing the caller.
+  # status/new-run-id need python; emit just reports a non-write and exits 0.
+  case "${1:-}" in
+    emit) echo '{"emitted": false, "reason": "python absent"}'; exit 0 ;;
+    *)    echo "error: python3 not found (required for telemetry status/new-run-id)" >&2; exit 2 ;;
+  esac
+fi
+
+[ -f "$TELEMETRY_LIB" ] || {
+  # the engine is missing (a partial checkout): emit is a no-op, exit 0 (§8).
+  case "${1:-}" in
+    emit) echo '{"emitted": false, "reason": "telemetry lib absent"}'; exit 0 ;;
+    *)    echo "error: telemetry engine not found: $TELEMETRY_LIB" >&2; exit 2 ;;
+  esac
+}
+
+[ $# -ge 1 ] || { usage >&2; exit 2; }
+
+case "$1" in
+  -h|--help) usage; exit 0 ;;
+esac
+
+# Hand the whole argv straight to the engine's CLI core — the lib owns the flag
+# grammar (mirrors how heimdall-redum delegates the heavy lifting to redum.py).
+exec "$PY" "$TELEMETRY_LIB" "$@"
