@@ -534,21 +534,41 @@ first_run_setup() {
     fi
   fi
 
-  # claude-mem (persistent cross-session memory) — instrumented at npm-exec
-  # granularity (the claude-mem question §3): the npx exit code IS the datum, so a
-  # `failed` event carries error.detail="npm exec exit <code>". We do NOT swap
-  # claude-mem here — data-gathering only, so piece (d) can answer "is claude-mem's
-  # npm-exec the dominant install failure point?" with no ambiguity.
+  # claude-mem (persistent cross-session memory) — OPTIONAL companion.
+  #
+  # GRACEFUL-SKIP CONTRACT (friction removal): claude-mem is the single most
+  # failure-prone install step (it shells out to npx → a network npm install).
+  # A failed OR impossible install must NEVER hard-fail or hang the launcher —
+  # Heimdall works without it. So every outcome here is narrated and recovers:
+  #   - npx absent           → can't install → print the optional-skip line, move on
+  #   - npx install nonzero  → print the optional-skip line, move on (no cryptic err)
+  #   - npx install succeeds → confirm it
+  # We do NOT swap claude-mem here (a later data-driven decision). The npx exit
+  # code is still captured at npm-exec granularity for the install_step telemetry
+  # so piece (d) can answer "is claude-mem's npm-exec the dominant failure point?".
+  # The skip line is the EXACT user-facing message the friction-removal spec pins.
   if ! command -v claude-mem &>/dev/null; then
     echo "  + claude-mem (persistent memory across sessions)"
-    if command -v npx &>/dev/null; then
-      local _cm_t0 _cm_rc=0
-      _cm_t0="$(_tele_now_ms)"
-      _tele_install_step companion:claude-mem started
-      npx claude-mem install 2>/dev/null || _cm_rc=$?
+    local _cm_t0; _cm_t0="$(_tele_now_ms)"
+    _tele_install_step companion:claude-mem started
+    if ! command -v npx &>/dev/null; then
+      # No npx → cannot install. This is not an error to halt on: skip gracefully.
+      echo "  claude-mem is an optional companion — skipping (Heimdall works without it)"
+      echo "    (npm/npx not found; install Node.js then run 'npx claude-mem install' to enable it)"
+      _tele_install_step companion:claude-mem failed "$_cm_t0" \
+        npx-absent "npx not on PATH"
+    else
+      local _cm_rc=0
+      # Surface npx output (drop the 2>/dev/null swallow) so a real user sees what
+      # happened instead of a silent stall, but a nonzero exit is NON-FATAL.
+      npx claude-mem install || _cm_rc=$?
       if [ "$_cm_rc" -eq 0 ]; then
         _tele_install_step companion:claude-mem succeeded "$_cm_t0"
       else
+        # Declined or failed → graceful skip with the pinned message + the exact
+        # manual step, never a cryptic error or a hang.
+        echo "  claude-mem is an optional companion — skipping (Heimdall works without it)"
+        echo "    (re-enable anytime: 'npx claude-mem install')"
         _tele_install_step companion:claude-mem failed "$_cm_t0" \
           npm-exec-nonzero "npm exec exit $_cm_rc"
       fi
