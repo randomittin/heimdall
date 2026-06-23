@@ -215,11 +215,16 @@ _tele_now_ms() {
 # Emit ONE install_step event via the cloned wrapper. Args:
 #   $1 tele_bin   path to heimdall-telemetry (absent/non-exec ⇒ silent no-op)
 #   $2 run_id     stable id for this install
-#   $3 step       path (install.sh owns the `path` step)
+#   $3 step       installer step name (fetch|marketplace|plugin|link|gates|path)
 #   $4 outcome    started|succeeded|failed
 #   $5 start_ms   (optional) start ms ⇒ attach duration_ms
 #   $6 err_class  (optional) SHORT error CLASS for a failed event (never a secret)
 #   $7 err_detail (optional) SHAPE summary (scrubbed by the substrate)
+#
+# The store lands under HEIMDALL_HOME when the caller exports it (we point it at
+# $PLUGIN_DIR/.heimdall so events live INSIDE the install footprint — test-visible
+# and swept by `hmd uninstall`'s wholesale plugin-dir removal). Absent that env it
+# falls back to the substrate's repo-root resolution; either way it's fire-and-forget.
 _tele_install_step() {
   local tele_bin="$1" run_id="$2" step="$3" outcome="$4"
   local start_ms="${5:-}" err_class="${6:-}" err_detail="${7:-}"
@@ -400,6 +405,13 @@ main() {
   fi
 
   # ── 4. Narrated steps (A2) ────────────────────────────────────────────────
+  # Every installer-owned step below brackets started→succeeded|failed through the
+  # telemetry wrapper (cloned with the plugin in this very step) so a stall or
+  # failure is visible across the team's machines. The wrapper does not exist until
+  # the fetch lands, so the fetch step's OWN telemetry is emitted right after the
+  # clone succeeds (a fetch that never completes leaves no `succeeded` — its absence
+  # is the signal). HEIMDALL_HOME points the store inside the install footprint.
+  #
   # Step: fetch the plugin at the pinned ref (the only network call).
   if [ "$UPGRADING" -eq 1 ]; then
     step_begin "Updating Heimdall ($REF)"
@@ -426,28 +438,84 @@ main() {
   fi
   chmod +x "$PLUGIN_DIR/bin/"* 2>/dev/null || true
 
-  # Step: register marketplace (the local clone is its own marketplace).
-  step_begin "Registering Heimdall marketplace"
-  if claude plugins marketplace list 2>/dev/null | grep -q "$MARKETPLACE_NAME"; then
-    claude plugins marketplace update "$MARKETPLACE_NAME" >/dev/null 2>&1 || true
-  else
-    claude plugins marketplace add "$PLUGIN_DIR" >/dev/null 2>&1 || true
+  # ── Telemetry world is live (wrapper just cloned) ─────────────────────────
+  # Point the store inside the install footprint so events are test-visible and
+  # swept by uninstall; mint a run id (opaque fallback if the wrapper can't). Then
+  # record the fetch step that just completed — its `succeeded` is the proof the
+  # only network call landed; a missing one across the 8 devs pinpoints a bad ref.
+  export HEIMDALL_HOME="$PLUGIN_DIR/.heimdall"
+  if [ -x "$TELE_BIN" ]; then
+    TELE_RUN_ID="$("$TELE_BIN" new-run-id 2>/dev/null || true)"
   fi
-  step_ok "Registering Heimdall marketplace"
+  [ -n "$TELE_RUN_ID" ] || TELE_RUN_ID="run-install-$$"
+  _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" fetch succeeded
+
+  # Step: register marketplace (the local clone is its own marketplace).
+  #
+  # OPTIONAL step. Registration with the Claude CLI is convenience wiring — the
+  # launcher resolves its components by path regardless, so a registration failure
+  # must NOT abort the install (graceful-degrade, dossier §8). We mark the step
+  # `failed` in telemetry, print a non-fatal note, and CONTINUE. The failure is
+  # injectable for the acceptance harness: HEIMDALL_FORCE_FAIL_OPTIONAL forces this
+  # optional step to fail (graceful: install still completes), and
+  # HEIMDALL_HARD_FAIL_OPTIONAL turns the same forced failure into a hard abort —
+  # the falsifiable variant that proves the graceful path is real (it must go RED).
+  local MKT_T0; MKT_T0="$(_tele_now_ms)"
+  _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" marketplace started
+  step_begin "Registering Heimdall marketplace"
+  local MKT_RC=0
+  if [ -n "${HEIMDALL_FORCE_FAIL_OPTIONAL:-}" ]; then
+    MKT_RC=1   # injected optional-step failure (harness drives the degrade path)
+  elif claude plugins marketplace list 2>/dev/null | grep -q "$MARKETPLACE_NAME"; then
+    claude plugins marketplace update "$MARKETPLACE_NAME" >/dev/null 2>&1 || MKT_RC=$?
+  else
+    claude plugins marketplace add "$PLUGIN_DIR" >/dev/null 2>&1 || MKT_RC=$?
+  fi
+  if [ "$MKT_RC" -eq 0 ]; then
+    _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" marketplace succeeded "$MKT_T0"
+    step_ok "Registering Heimdall marketplace"
+  else
+    _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" marketplace failed "$MKT_T0" \
+      marketplace-register-failed "claude plugins marketplace rc $MKT_RC"
+    # Falsifiable hard-fail variant: prove the graceful branch is the real default.
+    if [ -n "${HEIMDALL_HARD_FAIL_OPTIONAL:-}" ]; then
+      fail "marketplace registration failed (rc $MKT_RC)" \
+        "check the Claude CLI, then re-run the installer" \
+        "plugin fetched at $PLUGIN_DIR"
+    fi
+    step_ok "Registering Heimdall marketplace (skipped)"
+    blank
+    printf '   %s⚠ marketplace registration unavailable — continuing.%s\n' \
+      "$C_GOLD" "$C_RESET"
+    printf '   %s  the launcher resolves components by path; register later with:%s\n' \
+      "$C_DIM" "$C_RESET"
+    printf '   %s  claude plugins marketplace add %s%s\n' \
+      "$C_DIM" "$PLUGIN_DIR" "$C_RESET"
+    blank
+  fi
 
   # Step: install the plugin (hmd@heimdall).
+  local PLG_T0; PLG_T0="$(_tele_now_ms)"
+  _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" plugin started
   step_begin "Installing plugin ($PLUGIN_ID)"
   if ! claude plugins list 2>/dev/null | grep -q "$PLUGIN_ID"; then
     claude plugins install "$PLUGIN_ID" >/dev/null 2>&1 || true
   fi
+  _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" plugin succeeded "$PLG_T0"
   step_ok "Installing plugin ($PLUGIN_ID)"
 
   # Step: link entry points (hmd + heimdall) via SYMLINK (A0.7) — symlink, not
-  # hardlink, so the launcher resolves its siblings in the plugin dir.
+  # hardlink, so the launcher resolves its siblings in the plugin dir. REQUIRED
+  # step: a missing launcher binary is fatal (the fail() below records nothing —
+  # the `link` step's absent `succeeded` is itself the failure signal in telemetry).
+  local LNK_T0; LNK_T0="$(_tele_now_ms)"
+  _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" link started
   step_begin "Linking entry points (hmd, heimdall)"
   mkdir -p "$BIN_DIR"
   local SRC="$PLUGIN_DIR/bin/heimdall"
   if [ ! -x "$SRC" ]; then
+    _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" link failed "$LNK_T0" \
+      launcher-missing "expected executable at \$PLUGIN_DIR/bin/heimdall"
     fail "plugin binary missing at $SRC" \
       "the clone looks incomplete — re-run the installer" \
       "partial clone at $PLUGIN_DIR"
@@ -457,8 +525,10 @@ main() {
   # hmd: canonical, unless a real collider blocked it.
   if [ "$INSTALL_HMD" -eq 1 ]; then
     link_entry "$SRC" "$BIN_DIR/hmd"
+    _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" link succeeded "$LNK_T0"
     step_ok "Linking entry points (hmd, heimdall)"
   else
+    _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" link succeeded "$LNK_T0"
     step_ok "Linking entry point (heimdall)"
     blank
     printf '   %s⚠ hmd already exists at %s — installed `heimdall` only.%s\n' \
@@ -469,9 +539,12 @@ main() {
   fi
 
   # Step: verify gates — N is the RUNTIME gate count, never hardcoded.
+  local GAT_T0; GAT_T0="$(_tele_now_ms)"
+  _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" gates started
   local N
   N=$(gate_count "$PLUGIN_DIR")
   step_begin "Verifying gates"
+  _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" gates succeeded "$GAT_T0"
   step_ok "Verifying gates" "$N/$N"
 
   # Step: confirm secret-scan + bloat gates are wired.
@@ -525,13 +598,11 @@ main() {
   # ensure_path_on_profile appends a single guarded export to the right shell
   # profile (idempotent: a grep guard prevents a double-append on re-run). If the
   # bin dir is already on PATH, it writes nothing and we stay silent.
-  # path step telemetry: bracket the PATH-export write. The wrapper was cloned by
-  # the fetch step, so it's available now. A fresh run id (or an opaque fallback)
-  # correlates this install's `path` step with bin/heimdall's first-run steps.
-  if [ -x "$TELE_BIN" ]; then
-    TELE_RUN_ID="$("$TELE_BIN" new-run-id 2>/dev/null || true)"
-  fi
-  [ -n "$TELE_RUN_ID" ] || TELE_RUN_ID="run-install-$$"
+  # path step telemetry: bracket the PATH-export write. Reuses the SAME TELE_RUN_ID
+  # minted right after the fetch step, so all of this install's steps (fetch →
+  # marketplace → plugin → link → gates → path) share one correlatable run id, and
+  # bin/heimdall's first-run steps can chain off it. (If telemetry was unavailable
+  # at fetch time, TELE_RUN_ID is the opaque run-install-$$ fallback set there.)
   local PATH_T0; PATH_T0="$(_tele_now_ms)"
   _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" path started
 
