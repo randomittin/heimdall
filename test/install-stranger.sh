@@ -256,15 +256,18 @@ fi
 # for EACH owned step so a stall/failure is visible across the team. install.sh
 # points HEIMDALL_HOME at $PLUGIN_DIR/.heimdall, so events land inside the install
 # footprint (test-visible, and swept by uninstall's wholesale plugin-dir removal).
-# We assert the store exists and carries one event per owned step, all under a
-# SINGLE correlatable run id (fetch→marketplace→plugin→link→gates→path).
+# This HOME held TWO installs (the idempotency re-run appends to the same store), so
+# the store legitimately carries multiple run ids — ONE PER INSTALL. The contract is
+# per-install correlation: SOME single run id must cover ALL SIX owned steps
+# (fetch→marketplace→plugin→link→gates→path). We verify that, not a global count.
 TELE_STORE="$TMPH/.heimdall/.heimdall/telemetry/events.ndjson"
 if [ ! -f "$TELE_STORE" ]; then
   bad "install telemetry store absent — no per-step install_step events recorded ($TELE_STORE)"
 else
-  TELE_STEPS="$(python3 - "$TELE_STORE" <<'PY' 2>/dev/null
-import sys, json
-steps=set(); runs=set()
+  TELE_EVAL="$(python3 - "$TELE_STORE" <<'PY' 2>/dev/null
+import sys, json, collections
+REQ={"fetch","marketplace","plugin","link","gates","path"}
+by_run=collections.defaultdict(set); all_steps=set()
 with open(sys.argv[1]) as fh:
     for line in fh:
         line=line.strip()
@@ -272,25 +275,24 @@ with open(sys.argv[1]) as fh:
         try: e=json.loads(line)
         except Exception: continue
         if e.get("event_type")=="install_step" and e.get("step"):
-            steps.add(e["step"]); runs.add(e.get("run_id"))
-print(",".join(sorted(steps)))
-print(len(runs))
-print(";".join(sorted(r for r in runs if r)))
+            all_steps.add(e["step"])
+            if e.get("run_id"): by_run[e["run_id"]].add(e["step"])
+# A run id that covers every required step = per-install correlation holds.
+covering=[r for r,s in by_run.items() if REQ<=s]
+print("OK" if covering else "MISS")
+print(",".join(sorted(all_steps)))
+print(",".join(sorted(REQ-all_steps)))   # any required step never recorded at all
 PY
 )"
-  GOT_STEPS="$(printf '%s' "$TELE_STEPS" | sed -n 1p)"
-  N_RUNS="$(printf '%s' "$TELE_STEPS" | sed -n 2p)"
-  TELE_MISS=""
-  for s in fetch marketplace plugin link gates path; do
-    printf ',%s,' "$GOT_STEPS" | grep -qF ",$s," 2>/dev/null \
-      || case ",$GOT_STEPS," in *",$s,"*) ;; *) TELE_MISS="$TELE_MISS $s";; esac
-  done
-  if [ -n "$TELE_MISS" ]; then
-    bad "install telemetry missing step event(s):$TELE_MISS (recorded: $GOT_STEPS)"
-  elif [ "${N_RUNS:-0}" != "1" ]; then
-    bad "install telemetry steps not under ONE correlatable run id (distinct run ids: ${N_RUNS:-?})"
+  COVER="$(printf '%s' "$TELE_EVAL" | sed -n 1p)"
+  GOT_STEPS="$(printf '%s' "$TELE_EVAL" | sed -n 2p)"
+  NEVER="$(printf '%s' "$TELE_EVAL" | sed -n 3p)"
+  if [ -n "$NEVER" ]; then
+    bad "install telemetry never recorded step(s): $NEVER (recorded: $GOT_STEPS)"
+  elif [ "$COVER" = "OK" ]; then
+    ok "install telemetry records every step under one per-install run id ($GOT_STEPS)"
   else
-    ok "install telemetry records every step under one run id ($GOT_STEPS)"
+    bad "install telemetry steps not correlated under a single per-install run id (recorded: $GOT_STEPS)"
   fi
 fi
 
