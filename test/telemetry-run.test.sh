@@ -298,6 +298,143 @@ if [ -x "$CARD" ]; then
   fi
 fi
 
+# ─────────────────────────────────────────────────────────────────────────────
+# F. END-TO-END DEMO ARC — bin/heimdall-demo emits the REAL per-run record.
+#    The unit proofs above pin the lib's CLI surface; this proof pins the WIRING:
+#    the narrated demo arc (planning→waves→secret-scan blocked→fix→passed) emits
+#    phase+gate+commit+outcome events under ONE run_id, with the deny→fix→pass
+#    gate record (blocked w/ loc → fix phase → passed) the dossier §4 demands, and
+#    materializes its heimdall-state.json from REAL telemetry (no token event ⇒
+#    card stays honest "—", never a fabricated savings number).
+#
+#    The arc only renders under a TTY (should_narrate needs -t 1/-t 0) and its
+#    catch needs a real secret-scan verdict. We drive it under a real PTY via
+#    `script` and route the gate through a FAITHFUL gitleaks wrapper that scans
+#    the STAGED DIFF via the real gitleaks (real scanner, correct staged scope) —
+#    the verdict stays genuine, only the staged-scan invocation is normalized for
+#    the local gitleaks. When `script` or `gitleaks` is unavailable, the proof
+#    SKIPS (counted neither pass nor fail) rather than giving a false signal.
+# ─────────────────────────────────────────────────────────────────────────────
+echo "F. END-TO-END DEMO ARC (real deny→fix→pass record + honest card fill):"
+DEMO="$REPO/bin/heimdall-demo"
+SCRIPT_BIN="$(command -v script || true)"
+GL_BIN="$(command -v gitleaks || true)"
+if [ ! -x "$DEMO" ]; then
+  bad "bin/heimdall-demo not executable at $DEMO"
+elif [ -z "$SCRIPT_BIN" ] || [ -z "$GL_BIN" ]; then
+  printf '  \033[33mSKIP\033[0m demo arc (needs `script` + `gitleaks`; not on PATH)\n'
+else
+  DHOME="$WORK/demo-home"; mkdir -p "$DHOME"
+  DWRAP="$WORK/demo-bin"; mkdir -p "$DWRAP"
+  # Faithful gitleaks wrapper: `gitleaks git --staged …` → scan ONLY the staged
+  # diff through the REAL gitleaks `stdin` mode (correct scope + a genuine
+  # verdict); every other gitleaks invocation passes straight through untouched.
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'if [ "$1" = "git" ]; then shift; git diff --cached | %q stdin --no-banner --redact >/dev/null 2>&1; exit $?; fi\n' "$GL_BIN"
+    printf 'exec %q "$@"\n' "$GL_BIN"
+  } > "$DWRAP/gitleaks"
+  chmod +x "$DWRAP/gitleaks"
+  DLOG="$WORK/demo.log"
+  # Drive the first-run narrated arc once under a real PTY. `script` differs by
+  # platform: BSD/macOS is `script -q FILE CMD…`; GNU is `script -q -c "CMD" FILE`.
+  if "$SCRIPT_BIN" -q "$DLOG" true </dev/null >/dev/null 2>&1; then
+    PATH="$DWRAP:$PATH" HEIMDALL_HOME="$DHOME" TERM=xterm-256color \
+      "$SCRIPT_BIN" -q "$DLOG" bash "$DEMO" --intro </dev/null >/dev/null 2>&1 || true
+  else
+    PATH="$DWRAP:$PATH" HEIMDALL_HOME="$DHOME" TERM=xterm-256color \
+      "$SCRIPT_BIN" -qc "bash '$DEMO' --intro" "$DLOG" </dev/null >/dev/null 2>&1 || true
+  fi
+
+  cat > "$WORK/check_demo.py" <<'PYEOF'
+import os, sys
+sys.path.insert(0, os.path.join(os.environ["REPO"], "bin", "lib"))
+import telemetry
+ev = telemetry.read_events(home=os.environ["DHOME"])
+if not ev:
+    print("NO_EVENTS"); sys.exit(1)
+# one run_id correlates the whole arc
+rids = {e.get("run_id") for e in ev}
+if len(rids) != 1 or None in rids:
+    print("RUNID_NOT_SINGLE=%r" % rids); sys.exit(1)
+types = {e.get("event_type") for e in ev}
+for need in ("phase", "gate", "commit", "outcome"):
+    if need not in types:
+        print("MISSING_TYPE=%s have=%s" % (need, sorted(types))); sys.exit(1)
+# deny→fix→pass: gate blocked(loc) → fix phase → gate passed, in order
+gates = [(i, e) for i, e in enumerate(ev)
+         if e.get("event_type") == "gate" and e.get("gate") == "secret-scan"]
+blk = next((i for i, e in gates if e.get("outcome") == "blocked"), None)
+pas = next((i for i, e in gates if e.get("outcome") == "passed"), None)
+if blk is None:
+    print("NO_BLOCKED"); sys.exit(1)
+if not ev[blk].get("loc"):
+    print("BLOCKED_NO_LOC"); sys.exit(1)
+if pas is None:
+    print("NO_PASSED"); sys.exit(1)
+fix = [i for i, e in enumerate(ev)
+       if e.get("event_type") == "phase" and blk < i < pas]
+if not (blk < pas and fix):
+    print("ARC_ORDER_WRONG blk=%s fix=%s pas=%s" % (blk, fix, pas)); sys.exit(1)
+# outcome passed at the end
+if not any(e.get("event_type") == "outcome" and e.get("outcome") == "passed" for e in ev):
+    print("NO_PASS_OUTCOME"); sys.exit(1)
+# the commit event carries a real short SHA (non-empty)
+csha = [e.get("commit") for e in ev if e.get("event_type") == "commit" and e.get("commit")]
+if not csha:
+    print("NO_COMMIT_SHA"); sys.exit(1)
+print("DEMO_ARC_OK loc=%s sha=%s" % (ev[blk].get("loc"), csha[0]))
+PYEOF
+  rc=0
+  OUT="$(DHOME="$DHOME" "$PY" "$WORK/check_demo.py" 2>&1)" || rc=$?
+  if [ "$rc" -eq 0 ] && printf '%s' "$OUT" | grep -q DEMO_ARC_OK; then
+    ok "demo arc emits one-run_id phase+gate+commit+outcome with deny→fix→pass ($OUT)"
+  else
+    bad "demo arc telemetry wiring failed: $OUT"
+  fi
+
+  # HONESTY: the demo spends no model tokens ⇒ NO token event ⇒ card-data shows
+  # tokens '—' and NO fabricated savings figure anywhere in the run's record.
+  cat > "$WORK/check_demo_honest.py" <<'PYEOF'
+import json, os, sys
+sys.path.insert(0, os.path.join(os.environ["REPO"], "bin", "lib"))
+import telemetry, run_telemetry
+ev = telemetry.read_events(home=os.environ["DHOME"])
+rid = next((e.get("run_id") for e in ev if e.get("run_id")), None)
+cd = run_telemetry.card_data(rid, home=os.environ["DHOME"])
+# no token event ⇒ honest-empty tokens (the card degrades to "—", not a number)
+if cd.get("total_tokens") is not None or cd.get("has_tokens"):
+    print("UNEXPECTED_TOKENS=%r" % cd.get("total_tokens")); sys.exit(1)
+# no event in the whole run carries a fabricated savings / vs-raw-CC figure
+flat = json.dumps(ev).lower()
+for banned in ("raw_cc", "raw-cc", "vs_raw", "savings", "percent_saved"):
+    if banned in flat:
+        print("FABRICATED=%s" % banned); sys.exit(1)
+print("DEMO_HONEST_OK tokens=%r commits=%d" % (cd.get("total_tokens"), cd.get("commits")))
+PYEOF
+  rc=0
+  OUT="$(DHOME="$DHOME" "$PY" "$WORK/check_demo_honest.py" 2>&1)" || rc=$?
+  if [ "$rc" -eq 0 ] && printf '%s' "$OUT" | grep -q DEMO_HONEST_OK; then
+    ok "demo run carries NO token event (card '—') + NO fabricated vs-raw-CC ($OUT)"
+  else
+    bad "demo honesty violated: $OUT"
+  fi
+
+  # The demo no longer hard-codes its state from a literal: the card-state writer
+  # is the data source. Assert the demo source routes the arc through the lib
+  # (the wiring the proof above exercises) — falsifiable if a refactor drops it.
+  # The emit calls may wrap across lines (gate on one, --outcome on the next), so
+  # match the flags directly rather than on a single physical line.
+  if grep -q -- '--outcome blocked' "$DEMO" \
+     && grep -q -- '--outcome passed' "$DEMO" \
+     && grep -q 'tlm gate ' "$DEMO" \
+     && grep -q 'tlm card-state' "$DEMO"; then
+    ok "bin/heimdall-demo routes the deny→fix→pass arc + card fill through the telemetry lib"
+  else
+    bad "bin/heimdall-demo is missing the telemetry wiring calls"
+  fi
+fi
+
 echo
 TOTAL=$((PASS + FAIL))
 printf 'telemetry-run.test.sh: %d passed, %d failed\n' "$PASS" "$FAIL"
