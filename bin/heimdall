@@ -682,10 +682,14 @@ heimdall_version() {
   # Use rev-parse (not [ -d .git ]) so this also resolves inside a git WORKTREE,
   # where .git is a gitdir-pointer FILE rather than a directory.
   if git -C "$PLUGIN_DIR" rev-parse --git-dir >/dev/null 2>&1; then
-    ver="$(git -C "$PLUGIN_DIR" describe --tags --abbrev=0 2>/dev/null || true)"
-    # Normalise: keep only a leading vMAJOR.MINOR.PATCH, drop any suffix.
+    # --match scopes describe to SEMVER tags only: a scratch/backup tag (e.g.
+    # backup/pre-secret-scrub) must NEVER shadow the version string.
+    ver="$(git -C "$PLUGIN_DIR" describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null || true)"
+    # Normalise: keep only a leading vMAJOR.MINOR.PATCH, drop any suffix; blank
+    # anything that is NOT a clean vN.N.N so the deterministic fallback below wins.
     if [ -n "$ver" ]; then
       ver="$(printf '%s' "$ver" | sed -E 's/^v?([0-9]+\.[0-9]+\.[0-9]+).*/v\1/')"
+      printf '%s' "$ver" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$' || ver=""
     fi
   fi
   if [ -z "$ver" ]; then
