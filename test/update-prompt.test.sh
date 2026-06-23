@@ -239,6 +239,35 @@ else
   bad "T6 hmd update: expected manual-step message on a dev checkout, got: $OUT6"
 fi
 
+# ── T7: F1 cold-user onboarding orients a newcomer + points to the demo ───────
+# A cold first-ever run (no marker + empty/fresh dir) must, on a real TTY, tell a
+# newcomer what Heimdall is and what to run next (`hmd demo --run`) — and stay
+# SILENT on a non-TTY/piped surface (never blocks, never reads stdin).
+ONBOARD_DRIVER='cd "'"$REPO"'"; HEIMDALL_LIB_ONLY=1 bash -c "source ./bin/heimdall; F1_WAS_FIRST_RUN=1; F1_CONTEXT=empty-dir; f1_onboard_if_cold"'
+# Non-TTY (piped): orientation prose must NOT appear.
+OUT7_PIPE="$(eval "$ONBOARD_DRIVER" 2>&1)"
+# TTY (pty via `script`): orientation prose MUST appear and name the demo.
+if command -v script >/dev/null 2>&1; then
+  OUT7_TTY="$(script -q /dev/null bash -c "$ONBOARD_DRIVER" 2>&1)"
+else
+  OUT7_TTY=""   # no pty tool → skip the TTY half gracefully
+fi
+pipe_clean=0
+printf '%s' "$OUT7_PIPE" | grep -q "New here" || pipe_clean=1
+if [ "$pipe_clean" -eq 1 ]; then
+  ok "T7a onboarding: silent on a non-TTY surface (no prompt, no orientation prose)"
+else
+  bad "T7a onboarding: orientation leaked to a non-TTY surface: $OUT7_PIPE"
+fi
+if [ -z "$OUT7_TTY" ] && ! command -v script >/dev/null 2>&1; then
+  ok "T7b onboarding: (skipped — no pty tool to render the TTY path)"
+elif printf '%s' "$OUT7_TTY" | grep -q "New here" \
+     && printf '%s' "$OUT7_TTY" | grep -q "hmd demo --run"; then
+  ok "T7b onboarding: cold TTY run orients the newcomer + points to hmd demo --run"
+else
+  bad "T7b onboarding: cold TTY run did not orient + point to the demo: $OUT7_TTY"
+fi
+
 echo ""
 echo "  ── $PASS passed, $FAIL failed ──"
 echo ""

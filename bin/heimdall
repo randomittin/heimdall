@@ -218,21 +218,26 @@ f1_persona_check() {
       # proceed on the default/guided surface. Never read a stdin that will not
       # arrive (the v2.0.4 non-TTY-read class).
       if [ -t 0 ]; then
-        printf "\n  ${P}One-time question${R} — how should Heimdall talk to you?\n"
-        printf "    ${D}1) coder      — technical, code-first, terse${R}\n"
-        printf "    ${D}2) non-coder  — plain-language, guided${R}\n"
+        # CLARITY over flavor: say exactly what each choice CHANGES, so a real
+        # user who doesn't already know which to pick can decide. This is ONLY a
+        # communication-style preference — it does not limit what Heimdall can do,
+        # and it can be changed later.
+        printf "\n  ${P}One-time question${R} — how should Heimdall explain its work to you?\n"
+        printf "    ${D}This only changes the wording of explanations, not what Heimdall can do.${R}\n"
+        printf "    ${D}1) coder      — technical and terse: shows code, commands, file paths${R}\n"
+        printf "    ${D}2) non-coder  — plain language: explains what it's doing in everyday terms${R}\n"
         reply=""
         # -t timeout is belt-and-suspenders for a wedged INTERACTIVE terminal (a
         # human walks away mid-prompt); the [ -t 0 ] re-check above is the real
         # non-TTY guard. No answer within the window → defer (leave unset).
-        read -rt 60 -p "  choose [1/2] (default 1): " reply 2>/dev/null || reply=""
+        read -rt 60 -p "  choose [1/2] (default 1 = coder): " reply 2>/dev/null || reply=""
         case "$reply" in
           2|non-coder|nc) choice="non-coder" ;;
           *)              choice="coder" ;;
         esac
         if "$persona_bin" set "$choice" >/dev/null 2>&1; then
           F1_PERSONA="$choice"
-          printf "  ${P}▸ Persona set: %s${R} ${D}(remembered globally — asked once)${R}\n\n" "$choice"
+          printf "  ${P}▸ Talking to you as: %s${R} ${D}(remembered — asked once; change anytime)${R}\n\n" "$choice"
         fi
       fi
     fi
@@ -267,6 +272,28 @@ f1_onboard_if_cold() {
     _trace_order "onboard"
     if [ -n "${HEIMDALL_TRACE_ORDER:-}" ]; then
       printf "  \033[38;2;78;204;163m▸ Onboard\033[0m cold first run (%s)\n" "${F1_CONTEXT:-new}" >&2 2>/dev/null || true
+    fi
+
+    # COLD-USER ORIENTATION (friction removal): a first-ever user — in an empty
+    # dir, a fresh project, or an existing codebase — needs to know, in plain
+    # terms, WHAT Heimdall is and WHAT TO DO NEXT. Without this the cold run only
+    # emitted a test-only trace marker and the newcomer saw nothing. We point them
+    # at the known-good first experience: `hmd demo --run`.
+    #
+    # TTY-gated + never blocks: printed only on a real terminal with intro enabled
+    # (a non-TTY / CI / HEIMDALL_NO_INTRO run prints nothing). It NEVER reads stdin
+    # and never prompts — it cannot hang. The demo command is safe-by-default (dry
+    # unless --run), so pointing at `--run` is the deliberate watch-it-build path.
+    if [ -t 1 ] && [ "${HEIMDALL_NO_INTRO:-0}" != "1" ]; then
+      local G C D B R
+      G='\033[38;2;78;204;163m'; C='\033[38;2;0;212;255m'
+      D='\033[2m'; B='\033[1m'; R='\033[0m'
+      printf "\n  ${B}New here?${R} Heimdall is an autonomous build agent — you describe a task,\n"
+      printf "  it plans, writes the code, runs the tests, and commits the result for you.\n\n"
+      printf "  ${B}Best first step${R} — watch it build something real, end to end:\n"
+      printf "    ${C}hmd demo --run${R}  ${D}— scaffolds a Todo API + frontend + tests and builds it${R}\n\n"
+      printf "  ${D}Or just tell it what you want:${R}  ${C}hmd \"build a CLI that renames files\"${R}\n"
+      printf "  ${G}▸${R} ${D}Heimdall writes every file in THIS directory. Nothing ships unproven.${R}\n\n"
     fi
   fi
 }
