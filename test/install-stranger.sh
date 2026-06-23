@@ -236,6 +236,107 @@ else
   ok "after re-install, hmd demo still resolves"
 fi
 
+# (8) STEP NARRATION — every installer-owned step must announce itself in the
+# install transcript, so a stranger watching a curl|bash never faces a silent gap
+# between "started the script" and "done". We assert the captured CARD names each
+# owned step (download/setup → register → plugin → link → gates). A removed or
+# renamed-to-silence step fails THIS loudly (the anti-silent-hang guarantee).
+NARRATE_MISS=""
+for label in 'Fetching Heimdall' 'Registering Heimdall marketplace' \
+             'Installing plugin' 'Linking entry point' 'Verifying gates'; do
+  printf '%s' "$CARD" | grep -qF "$label" || NARRATE_MISS="$NARRATE_MISS | $label"
+done
+if [ -z "$NARRATE_MISS" ]; then
+  ok "every installer step is narrated in the transcript (download→register→plugin→link→gates)"
+else
+  bad "installer step(s) not narrated — missing:$NARRATE_MISS"
+fi
+
+# (9) INSTALL TELEMETRY PER STEP — the installer must record an install_step event
+# for EACH owned step so a stall/failure is visible across the team. install.sh
+# points HEIMDALL_HOME at $PLUGIN_DIR/.heimdall, so events land inside the install
+# footprint (test-visible, and swept by uninstall's wholesale plugin-dir removal).
+# This HOME held TWO installs (the idempotency re-run appends to the same store), so
+# the store legitimately carries multiple run ids — ONE PER INSTALL. The contract is
+# per-install correlation: SOME single run id must cover ALL SIX owned steps
+# (fetch→marketplace→plugin→link→gates→path). We verify that, not a global count.
+TELE_STORE="$TMPH/.heimdall/.heimdall/telemetry/events.ndjson"
+if [ ! -f "$TELE_STORE" ]; then
+  bad "install telemetry store absent — no per-step install_step events recorded ($TELE_STORE)"
+else
+  TELE_EVAL="$(python3 - "$TELE_STORE" <<'PY' 2>/dev/null
+import sys, json, collections
+REQ={"fetch","marketplace","plugin","link","gates","path"}
+by_run=collections.defaultdict(set); all_steps=set()
+with open(sys.argv[1]) as fh:
+    for line in fh:
+        line=line.strip()
+        if not line: continue
+        try: e=json.loads(line)
+        except Exception: continue
+        if e.get("event_type")=="install_step" and e.get("step"):
+            all_steps.add(e["step"])
+            if e.get("run_id"): by_run[e["run_id"]].add(e["step"])
+# A run id that covers every required step = per-install correlation holds.
+covering=[r for r,s in by_run.items() if REQ<=s]
+print("OK" if covering else "MISS")
+print(",".join(sorted(all_steps)))
+print(",".join(sorted(REQ-all_steps)))   # any required step never recorded at all
+PY
+)"
+  COVER="$(printf '%s' "$TELE_EVAL" | sed -n 1p)"
+  GOT_STEPS="$(printf '%s' "$TELE_EVAL" | sed -n 2p)"
+  NEVER="$(printf '%s' "$TELE_EVAL" | sed -n 3p)"
+  if [ -n "$NEVER" ]; then
+    bad "install telemetry never recorded step(s): $NEVER (recorded: $GOT_STEPS)"
+  elif [ "$COVER" = "OK" ]; then
+    ok "install telemetry records every step under one per-install run id ($GOT_STEPS)"
+  else
+    bad "install telemetry steps not correlated under a single per-install run id (recorded: $GOT_STEPS)"
+  fi
+fi
+
+# (10) GRACEFUL OPTIONAL-STEP FAILURE — a failed OPTIONAL step (marketplace
+# registration) must NOT break the install. We drive a FRESH stranger HOME with
+# HEIMDALL_FORCE_FAIL_OPTIONAL=1 (install.sh's injectable optional-failure hook):
+# the install must still COMPLETE — success card rendered, both launchers linked,
+# `hmd demo` still resolving — with a non-fatal degrade note instead of an abort.
+TMPH_G="$(mktemp -d)"
+GRACE_CARD="$(env -i HOME="$TMPH_G" TERM="dumb" PATH="$STRANGER_PATH" \
+  HEIMDALL_REPO="$REPO" HEIMDALL_REF="$REF" HEIMDALL_NO_COLOR=1 \
+  HEIMDALL_FORCE_FAIL_OPTIONAL=1 bash "$REPO/install.sh" 2>&1)"
+GRACE_RC=$?
+GLNK="$TMPH_G/.local/bin/hmd"; [ -e "$GLNK" ] || GLNK="$TMPH_G/.local/bin/heimdall"
+if [ "$GRACE_RC" -eq 0 ] \
+   && printf '%s' "$GRACE_CARD" | grep -qiE 'Heimdall v[0-9].* installed' \
+   && [ -e "$GLNK" ]; then
+  GDEMO="$(in_stranger "$TMPH_G" "$GLNK" demo --dry 2>&1)"
+  if printf '%s' "$GDEMO" | grep -qi 'demo runner not found'; then
+    bad "graceful-degrade: install completed but hmd demo broke after optional-step failure"
+  else
+    ok "optional-step failure degrades gracefully — install completes, card renders, launcher works"
+  fi
+else
+  bad "optional-step failure BROKE the install (rc=$GRACE_RC, card present=$(printf '%s' "$GRACE_CARD" | grep -qiE 'Heimdall v[0-9].* installed' && echo yes || echo no))"
+fi
+
+# (10b) FALSIFIABLE GRACEFUL-DEGRADE — the degrade guarantee must be PROVABLE, not
+# vacuous. The SAME injected optional-step failure, with HEIMDALL_HARD_FAIL_OPTIONAL=1,
+# must turn the soft-skip into a HARD abort: a non-zero exit and NO success card.
+# If this variant still "succeeds", §10's graceful pass means nothing — so this RED
+# variant going GREEN here would itself be the regression. (We assert the abort.)
+HARD_CARD="$(env -i HOME="$TMPH_G" TERM="dumb" PATH="$STRANGER_PATH" \
+  HEIMDALL_REPO="$REPO" HEIMDALL_REF="$REF" HEIMDALL_NO_COLOR=1 \
+  HEIMDALL_FORCE_FAIL_OPTIONAL=1 HEIMDALL_HARD_FAIL_OPTIONAL=1 bash "$REPO/install.sh" 2>&1)"
+HARD_RC=$?
+if [ "$HARD_RC" -ne 0 ] \
+   && ! printf '%s' "$HARD_CARD" | grep -qiE 'Heimdall v[0-9].* installed'; then
+  ok "graceful-degrade is falsifiable — forced hard-fail-on-optional aborts (rc=$HARD_RC, no card)"
+else
+  bad "graceful-degrade NOT falsifiable — hard-fail variant did not abort (rc=$HARD_RC, card present=$(printf '%s' "$HARD_CARD" | grep -qiE 'Heimdall v[0-9].* installed' && echo yes || echo no))"
+fi
+rm -rf "$TMPH_G" 2>/dev/null || true
+
 # (5) FIRST-RUN ORDERING — on a fresh install's first run, auth setup +
 # companion-plugin setup must FULLY COMPLETE before the first task launches.
 # A real first run can't be driven here (no live model call), so we drive the
