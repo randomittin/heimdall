@@ -51,6 +51,33 @@ if _HERE not in sys.path:
 
 import issue_queue  # piece (b); sibling on sys.path
 
+
+# ── telemetry seam: the loop is CONSUMER #1 of the ONE event surface (dossier §2) ─
+# Soft-import the general telemetry surface, mirroring how the PR layer is soft-
+# imported below: if bin/lib/telemetry.py is ABSENT (a partial checkout) the loop
+# runs IDENTICALLY — _emit_telemetry becomes a no-op. The loop NEVER keeps a
+# parallel recording; it emits at the SAME transition points the queue already
+# records (set_state / flag / gate verdict). emit() is itself fire-and-forget and
+# never-raises, so a telemetry fault can never fail the loop (dossier §8).
+try:
+    import telemetry  # piece (a); the ONE general event surface
+except Exception:  # noqa: BLE001 — absent/broken telemetry must never break the loop
+    telemetry = None
+
+
+def _emit_telemetry(event_type, **kw):
+    """Emit ONE event through the general surface if it is present. A no-op when the
+    telemetry lib is absent (soft-import miss) — the loop's behavior is identical
+    either way. Never raises: telemetry.emit already swallows everything, and this
+    guards the soft-import miss. The loop reads its verdict from the SAME recorded
+    real exit the cardinal rule already reads — telemetry only OBSERVES it."""
+    if telemetry is None:
+        return False
+    try:
+        return telemetry.emit(event_type, **kw)
+    except Exception:  # noqa: BLE001 — defence in depth; the loop never depends on this
+        return False
+
 # ── machine states (dossier §4) ───────────────────────────────────────────────
 
 IDLE = "IDLE"              # nothing pickable — the loop is inert this iteration
@@ -253,6 +280,10 @@ def run_once(repo, base="HEAD", evidence_cmds=None, cfg=None,
     in_flight/flagged/resolved buckets."""
     q = issue_queue.IssueQueue(repo=repo)
 
+    # one run_id per run_once invocation — the key telemetry consumers correlate a
+    # loop iteration by (dossier §2). A stable id even when telemetry is disabled.
+    loop_run_id = telemetry.new_run_id() if telemetry is not None else None
+
     # ── pick (REUSE piece b: claim-before-work idempotency) ───────────────────
     issue = q.pick(cfg=cfg, now=now)
     if issue is None:
@@ -267,24 +298,35 @@ def run_once(repo, base="HEAD", evidence_cmds=None, cfg=None,
         # ── orient (REUSE SI-1) ───────────────────────────────────────────────
         orient_result = orient(repo)
         q.set_state(issue_id, ORIENTED)
+        _emit_telemetry("issue_state", run_id=loop_run_id, phase="waves",
+                        outcome=ORIENTED, extra={"issue_id": issue_id})
 
         # ── fix (the real Heimdall task slot; its return is NOT the verdict) ──
         runner = fix_runner or default_fix_runner
         fix_result = runner(issue, orient_result, repo)
         q.set_state(issue_id, FIXED)
+        _emit_telemetry("issue_state", run_id=loop_run_id, phase="waves",
+                        outcome=FIXED, extra={"issue_id": issue_id})
 
         # ── attest (REUSE SI-2) + GATE ────────────────────────────────────────
         record = attest(repo, base, evidence_cmds,
                         task="issue-loop:" + issue_id)
 
         return _gate_and_finish(
-            q, issue, orient_result, fix_result, record,
+            q, issue, orient_result, fix_result, record, loop_run_id,
         )
     except Exception as exc:  # noqa: BLE001 — no path silently drops an issue
         # honest ERRORED transition: flag out-of-scope, never leave it claimed
         # nor silently resolved (dossier §4 failure transitions).
         q.flag(issue_id, "out-of-scope",
                evidence_ref="error:%s" % type(exc).__name__)
+        # observe the honest ERRORED transition (the error CLASS only — a SHAPE
+        # summary, never the exception payload; the scrubber bounds it anyway).
+        _emit_telemetry(
+            "issue_state", run_id=loop_run_id, phase="waves", outcome=ERRORED,
+            error={"class": type(exc).__name__, "step": "issue-loop"},
+            extra={"issue_id": issue_id},
+        )
         return {
             "state": ERRORED,
             "issue": issue,
@@ -295,7 +337,8 @@ def run_once(repo, base="HEAD", evidence_cmds=None, cfg=None,
         }
 
 
-def _gate_and_finish(q, issue, orient_result, fix_result, record):
+def _gate_and_finish(q, issue, orient_result, fix_result, record,
+                     loop_run_id=None):
     """THE CARDINAL RULE wiring, made STRUCTURAL (dossier §5):
 
       verdict = read_verdict(record)          # record.evidence.all_passed ONLY
@@ -314,9 +357,21 @@ def _gate_and_finish(q, issue, orient_result, fix_result, record):
         "checks": (record.get("evidence") or {}).get("checks", []),
     }
 
+    # observe the gate verdict (dossier §2): emit a `gate` event reading the SAME
+    # recorded real exit the cardinal rule reads (record.evidence.all_passed) — NOT
+    # a new verdict source. passed→the change is PR-ready; blocked→flagged.
+    _emit_telemetry(
+        "gate", run_id=loop_run_id, phase="gates", gate="oracle",
+        outcome="passed" if all_passed is True else "blocked",
+        extra={"issue_id": issue_id},
+    )
+
     if all_passed is True:
         # ── PASS path — the ONLY path that can reach the PR layer ─────────────
         q.set_state(issue_id, ATTESTED)
+        _emit_telemetry("issue_state", run_id=loop_run_id, phase="waves",
+                        outcome=ATTESTED, gate="oracle",
+                        extra={"issue_id": issue_id})
         pr_opened = False
         open_pr = _soft_import_open_pr()
         if open_pr is not None:
@@ -327,6 +382,8 @@ def _gate_and_finish(q, issue, orient_result, fix_result, record):
             pr_opened = True
         # else: SOFT-IMPORT miss — mark pr_ready and STOP. Do NOT fabricate a PR.
         q.set_state(issue_id, PR_OPEN, pr="pr-ready:" + issue_id)
+        _emit_telemetry("issue_state", run_id=loop_run_id, phase="waves",
+                        outcome=PR_OPEN, extra={"issue_id": issue_id})
         return {
             "state": PR_OPEN,
             "issue": issue,
@@ -340,6 +397,9 @@ def _gate_and_finish(q, issue, orient_result, fix_result, record):
 
     # ── FAIL path — GATE_FAILED -> flagged honestly; NO PR is ever opened ─────
     q.set_state(issue_id, GATE_FAILED)
+    _emit_telemetry("issue_state", run_id=loop_run_id, phase="waves",
+                    outcome=GATE_FAILED, gate="oracle",
+                    extra={"issue_id": issue_id})
     q.flag(issue_id, "gate-failed", evidence_ref=gate["evidence_ref"])
     return {
         "state": GATE_FAILED,
