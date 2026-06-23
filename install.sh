@@ -190,6 +190,51 @@ ensure_path_on_profile() {
   printf 'appended'
 }
 
+# ── Install-step telemetry (dossier §3 + §8) ────────────────────────────────
+#
+# install.sh's own step — the PATH export — emits started→succeeded|failed +
+# duration_ms + an error CLASS (never a secret value) through the substrate's bash
+# wrapper, which is cloned into $PLUGIN_DIR/bin by the fetch step BEFORE this fires.
+# Fire-and-forget: the wrapper always exits 0, and every call is `|| true`-guarded,
+# so telemetry can NEVER fail or block the install (the comment in this file's
+# header — "no telemetry" — refers to NETWORK/remote telemetry; this is local-only,
+# off-by-default-capable, on-machine data the user fully controls). A disabled or
+# absent telemetry world (HEIMDALL_TELEMETRY=off / no wrapper) is a perfect no-op,
+# so the stranger-test install path is byte-for-byte identical.
+
+# Current wall-clock ms. macOS `date` has no %3N (prints a literal N), so prefer
+# python3 and fall back to whole-second precision — never a bogus literal-N value.
+_tele_now_ms() {
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null && return 0
+  fi
+  local s; s="$(date +%s 2>/dev/null || echo 0)"
+  printf '%s' "$(( s * 1000 ))"
+}
+
+# Emit ONE install_step event via the cloned wrapper. Args:
+#   $1 tele_bin   path to heimdall-telemetry (absent/non-exec ⇒ silent no-op)
+#   $2 run_id     stable id for this install
+#   $3 step       path (install.sh owns the `path` step)
+#   $4 outcome    started|succeeded|failed
+#   $5 start_ms   (optional) start ms ⇒ attach duration_ms
+#   $6 err_class  (optional) SHORT error CLASS for a failed event (never a secret)
+#   $7 err_detail (optional) SHAPE summary (scrubbed by the substrate)
+_tele_install_step() {
+  local tele_bin="$1" run_id="$2" step="$3" outcome="$4"
+  local start_ms="${5:-}" err_class="${6:-}" err_detail="${7:-}"
+  [ -n "$tele_bin" ] && [ -x "$tele_bin" ] || return 0
+  local args=(emit --type install_step --phase install \
+    --run-id "$run_id" --step "$step" --outcome "$outcome")
+  if [ -n "$start_ms" ]; then
+    local now; now="$(_tele_now_ms)"
+    args+=(--duration-ms "$(( now - start_ms ))")
+  fi
+  [ -n "$err_class" ]  && args+=(--error-class "$err_class")
+  [ -n "$err_detail" ] && args+=(--error-detail "$err_detail")
+  "$tele_bin" "${args[@]}" >/dev/null 2>&1 || true
+}
+
 main() {
   # ── Configuration ────────────────────────────────────────────────────────
   # Pinned ref. No release tag exists yet, so this defaults to `main`; the
@@ -208,6 +253,11 @@ main() {
   local BIN_DIR="$HOME/.local/bin"
   local MARKETPLACE_NAME="heimdall"
   local PLUGIN_ID="hmd@heimdall"
+
+  # Telemetry wrapper lives in the cloned plugin tree (resolved AFTER the fetch
+  # step populates PLUGIN_DIR). Resolved lazily at the `path` fire-point below.
+  local TELE_BIN="$PLUGIN_DIR/bin/heimdall-telemetry"
+  local TELE_RUN_ID=""
 
   local START_TS; START_TS=$(date +%s)
 
@@ -475,8 +525,24 @@ main() {
   # ensure_path_on_profile appends a single guarded export to the right shell
   # profile (idempotent: a grep guard prevents a double-append on re-run). If the
   # bin dir is already on PATH, it writes nothing and we stay silent.
-  local PATH_STATE
-  PATH_STATE=$(ensure_path_on_profile "$BIN_DIR")
+  # path step telemetry: bracket the PATH-export write. The wrapper was cloned by
+  # the fetch step, so it's available now. A fresh run id (or an opaque fallback)
+  # correlates this install's `path` step with bin/heimdall's first-run steps.
+  if [ -x "$TELE_BIN" ]; then
+    TELE_RUN_ID="$("$TELE_BIN" new-run-id 2>/dev/null || true)"
+  fi
+  [ -n "$TELE_RUN_ID" ] || TELE_RUN_ID="run-install-$$"
+  local PATH_T0; PATH_T0="$(_tele_now_ms)"
+  _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" path started
+
+  local PATH_STATE PATH_RC=0
+  PATH_STATE=$(ensure_path_on_profile "$BIN_DIR") || PATH_RC=$?
+  if [ "$PATH_RC" -eq 0 ]; then
+    _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" path succeeded "$PATH_T0"
+  else
+    _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" path failed "$PATH_T0" \
+      path-export-failed "ensure_path_on_profile exit $PATH_RC"
+  fi
   case "$PATH_STATE" in
     appended)
       # The headline `hmd demo` will be command-not-found until PATH refreshes.
