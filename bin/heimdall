@@ -37,6 +37,69 @@ _trace_order() {
   printf '%s\n' "$1" >> "$HEIMDALL_TRACE_ORDER" 2>/dev/null || true
 }
 
+# ── Install-step telemetry (dossier §3 + §8) ──
+#
+# Each install/first-run step emits a `started` then a `succeeded`/`failed`
+# install_step event (with step id + duration_ms + an error CLASS, never a secret
+# value) through the substrate's bash wrapper. The wrapper is fire-and-forget: it
+# NEVER fails the caller (always exit 0), and a disabled/absent telemetry world is
+# a perfect no-op. Every call is additionally `|| true`-guarded so a telemetry
+# fault can never abort setup. This is data-gathering ONLY — it pinpoints WHERE an
+# install fails (the claude-mem question) and changes install behaviour not at all.
+TELEMETRY_BIN="$PLUGIN_DIR/bin/heimdall-telemetry"
+
+# A stable run id for THIS launcher invocation, shared across every step event so
+# piece (d) can stitch one install's steps together. Resolved lazily + once.
+_tele_run_id() {
+  if [ -z "${HEIMDALL_INSTALL_RUN_ID:-}" ]; then
+    if [ -x "$TELEMETRY_BIN" ]; then
+      HEIMDALL_INSTALL_RUN_ID="$("$TELEMETRY_BIN" new-run-id 2>/dev/null || true)"
+    fi
+    # Fallback id if the wrapper/python is absent — keeps step events correlated
+    # even in a degraded env; the value is opaque + non-secret.
+    [ -n "${HEIMDALL_INSTALL_RUN_ID:-}" ] || HEIMDALL_INSTALL_RUN_ID="run-install-$$"
+    export HEIMDALL_INSTALL_RUN_ID
+  fi
+  printf '%s' "$HEIMDALL_INSTALL_RUN_ID"
+}
+
+# Current wall-clock in milliseconds. macOS `date` has no %3N (it prints a literal
+# 'N'), so we use python3 when present and fall back to whole-second precision via
+# `date +%s` * 1000 — never a bogus literal-N string.
+_tele_now_ms() {
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null && return 0
+  fi
+  local s; s="$(date +%s 2>/dev/null || echo 0)"
+  printf '%s' "$(( s * 1000 ))"
+}
+
+# Emit ONE install_step event. Args:
+#   $1 step      setup|auth|companion:caveman|companion:claude-mem|skills|
+#                path|launch-readiness
+#   $2 outcome   started|succeeded|failed
+#   $3 start_ms  (optional) the _tele_now_ms captured at `started`; when present
+#                we attach duration_ms = now - start_ms
+#   $4 err_class (optional) a SHORT error CLASS for a `failed` event (e.g.
+#                npm-exec-nonzero, plugin-install-failed) — NEVER a secret value
+#                or raw stdout; the substrate scrubber rejects anything secret-shaped
+#   $5 err_detail(optional) a SHAPE summary (e.g. "npm exec exit 1") — scrubbed
+# Fire-and-forget: the wrapper always exits 0; the extra `|| true` is belt-and-
+# suspenders so a missing wrapper / python never aborts the install.
+_tele_install_step() {
+  [ -x "$TELEMETRY_BIN" ] || return 0
+  local step="$1" outcome="$2" start_ms="${3:-}" err_class="${4:-}" err_detail="${5:-}"
+  local args=(emit --type install_step --phase install \
+    --run-id "$(_tele_run_id)" --step "$step" --outcome "$outcome")
+  if [ -n "$start_ms" ]; then
+    local now; now="$(_tele_now_ms)"
+    args+=(--duration-ms "$(( now - start_ms ))")
+  fi
+  [ -n "$err_class" ]  && args+=(--error-class "$err_class")
+  [ -n "$err_detail" ] && args+=(--error-detail "$err_detail")
+  "$TELEMETRY_BIN" "${args[@]}" >/dev/null 2>&1 || true
+}
+
 # ── F1 launch resolution order: orient → resume → persona-check → onboard-if-cold ─
 #
 # The F1 (Onboarding) front-door decision tree, wired into the launch path. Each
@@ -344,8 +407,15 @@ ensure_claude() {
 # ── Ensure Claude Code is authenticated ──
 
 ensure_auth() {
+  # auth step telemetry: bracket the whole resolution (each return is a distinct
+  # outcome). started → (succeeded | failed). Records WHERE auth lands without ever
+  # carrying a token/credential value (the schema has no payload field).
+  local _auth_t0; _auth_t0="$(_tele_now_ms)"
+  _tele_install_step auth started
+
   # Skip if API key is set via environment
   if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+    _tele_install_step auth succeeded "$_auth_t0"
     return 0
   fi
 
@@ -365,6 +435,7 @@ except Exception:
     print('false')
 " 2>/dev/null)
     if [ "$has_account" = "true" ]; then
+      _tele_install_step auth succeeded "$_auth_t0"
       return 0
     fi
   fi
@@ -388,10 +459,12 @@ except Exception:
     print('false')
 " 2>/dev/null)
     if [ "$has_account" = "true" ]; then
+      _tele_install_step auth succeeded "$_auth_t0"
       return 0
     fi
   fi
 
+  _tele_install_step auth failed "$_auth_t0" auth-not-authenticated "claude login did not establish an account"
   echo "  Error: Authentication failed. Run 'claude login' manually."
   exit 1
 }
@@ -422,35 +495,97 @@ first_run_setup() {
   fi
   echo "First run — setting up companion plugins..."
 
-  # caveman (token compression)
+  # setup step telemetry brackets the whole first-run sequence (the umbrella
+  # phase). The companion/skills/launch-readiness sub-steps below each emit their
+  # OWN started/succeeded|failed so aggregate (piece d) can pinpoint exactly which
+  # one failed — the setup umbrella alone would hide it.
+  local _setup_t0; _setup_t0="$(_tele_now_ms)"
+  _tele_install_step setup started
+
+  # caveman (token compression) — its OWN step (companion:caveman).
   if ! claude plugins list 2>/dev/null | grep -q "caveman"; then
     echo "  + caveman (token compression)"
+    local _cav_t0 _cav_rc=0
+    _cav_t0="$(_tele_now_ms)"
+    _tele_install_step companion:caveman started
     claude plugins marketplace add JuliusBrussee/caveman 2>/dev/null || true
-    claude plugins install caveman@caveman 2>/dev/null || true
-  fi
-
-  # superpowers (brainstorming, debugging)
-  if ! claude plugins list 2>/dev/null | grep -q "superpowers"; then
-    echo "  + superpowers (brainstorming, debugging)"
-    claude plugins marketplace add anthropics/claude-plugins-official 2>/dev/null || true
-    claude plugins install superpowers 2>/dev/null || true
-  fi
-
-  # claude-mem (persistent cross-session memory)
-  if ! command -v claude-mem &>/dev/null; then
-    echo "  + claude-mem (persistent memory across sessions)"
-    if command -v npx &>/dev/null; then
-      npx claude-mem install 2>/dev/null || true
+    claude plugins install caveman@caveman 2>/dev/null || _cav_rc=$?
+    if [ "$_cav_rc" -eq 0 ]; then
+      _tele_install_step companion:caveman succeeded "$_cav_t0"
+    else
+      _tele_install_step companion:caveman failed "$_cav_t0" \
+        plugin-install-failed "claude plugins install caveman exit $_cav_rc"
     fi
   fi
 
-  # heimdall marketplace
+  # superpowers (brainstorming, debugging) — part of the `skills` step.
+  if ! claude plugins list 2>/dev/null | grep -q "superpowers"; then
+    echo "  + superpowers (brainstorming, debugging)"
+    local _sp_t0 _sp_rc=0
+    _sp_t0="$(_tele_now_ms)"
+    _tele_install_step skills started
+    claude plugins marketplace add anthropics/claude-plugins-official 2>/dev/null || true
+    claude plugins install superpowers 2>/dev/null || _sp_rc=$?
+    if [ "$_sp_rc" -eq 0 ]; then
+      _tele_install_step skills succeeded "$_sp_t0"
+    else
+      _tele_install_step skills failed "$_sp_t0" \
+        plugin-install-failed "claude plugins install superpowers exit $_sp_rc"
+    fi
+  fi
+
+  # claude-mem (persistent cross-session memory) — instrumented at npm-exec
+  # granularity (the claude-mem question §3): the npx exit code IS the datum, so a
+  # `failed` event carries error.detail="npm exec exit <code>". We do NOT swap
+  # claude-mem here — data-gathering only, so piece (d) can answer "is claude-mem's
+  # npm-exec the dominant install failure point?" with no ambiguity.
+  if ! command -v claude-mem &>/dev/null; then
+    echo "  + claude-mem (persistent memory across sessions)"
+    if command -v npx &>/dev/null; then
+      local _cm_t0 _cm_rc=0
+      _cm_t0="$(_tele_now_ms)"
+      _tele_install_step companion:claude-mem started
+      npx claude-mem install 2>/dev/null || _cm_rc=$?
+      if [ "$_cm_rc" -eq 0 ]; then
+        _tele_install_step companion:claude-mem succeeded "$_cm_t0"
+      else
+        _tele_install_step companion:claude-mem failed "$_cm_t0" \
+          npm-exec-nonzero "npm exec exit $_cm_rc"
+      fi
+    fi
+  fi
+
+  # heimdall marketplace — part of the `skills` step (marketplace registration).
   if ! claude plugins marketplace list 2>/dev/null | grep -q "heimdall-marketplace"; then
     echo "  + heimdall marketplace"
-    claude plugins marketplace add randomittin/heimdall-marketplace 2>/dev/null || true
+    local _mk_t0 _mk_rc=0
+    _mk_t0="$(_tele_now_ms)"
+    _tele_install_step skills started
+    claude plugins marketplace add randomittin/heimdall-marketplace 2>/dev/null || _mk_rc=$?
+    if [ "$_mk_rc" -eq 0 ]; then
+      _tele_install_step skills succeeded "$_mk_t0"
+    else
+      _tele_install_step skills failed "$_mk_t0" \
+        marketplace-add-failed "claude plugins marketplace add heimdall exit $_mk_rc"
+    fi
   fi
 
   touch "$SETUP_MARKER"
+  _tele_install_step setup succeeded "$_setup_t0"
+
+  # launch-readiness: a post-marker probe that the setup artifacts are in place
+  # (the marker exists ⇒ subsequent launches short-circuit first_run_setup). This
+  # is the end-of-setup readiness datum piece (d) reads to confirm an install
+  # actually reached a launchable state.
+  local _lr_t0; _lr_t0="$(_tele_now_ms)"
+  _tele_install_step launch-readiness started
+  if [ -f "$SETUP_MARKER" ]; then
+    _tele_install_step launch-readiness succeeded "$_lr_t0"
+  else
+    _tele_install_step launch-readiness failed "$_lr_t0" \
+      setup-marker-absent "setup marker not written"
+  fi
+
   echo "Setup complete."
   echo ""
 }
