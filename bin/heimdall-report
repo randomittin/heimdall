@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# heimdall-report — piece (d) of the Heimdall telemetry layer: the AGGREGATE
+# query/view surface. Read-only: it answers FROM the recorded event store, it never
+# writes an event. Two views close the "Heimdall measures everything except itself"
+# loop with real data — a per-run DETAIL and across-run TRENDS.
+#
+# Subcommands (a thin wrapper over bin/lib/report.py — house style: bin/*-redum):
+#
+#   heimdall-report run <run_id> [--json] [--home H]
+#       PER-RUN DETAIL. One run's timeline: its phases, the gates that fired
+#       (passed|failed|blocked) with the file:line each fired at, the SUMMED token
+#       spend (carrying cost_source provenance — never a fabricated number), the
+#       atomic commits it produced, and the task outcome. Human table by default;
+#       --json for structured downstream/CI output.
+#
+#   heimdall-report [aggregate] [--json] [--home H]
+#       AGGREGATE TRENDS across runs+installs (`aggregate` is the default):
+#         - gate-firing FREQUENCY  — count by gate × outcome (which gates earn their
+#           keep / which never fire).
+#         - FAILURE patterns       — count by error.class × the step/gate it occurred
+#           at; the top failing gates/steps.
+#         - TOKEN trends           — per-run total_tokens over time + the cache-hit
+#           ratio; the spend curve.
+#         - INSTALL drop-off       — per install step: failed/started ratio. The
+#           claude-mem evidence row (where installs fail across runs).
+#       Human report by default; --json for structured output.
+#
+# HONESTY (§6): any cost/savings figure is sourced ONLY from a token event's
+# MEASURED total_cost_usd carrying its cost_source provenance. This surface NEVER
+# authors a "vs raw-CC" delta (that measured comparison is heimdall-holdout's job).
+# A run with no token event shows tokens as "—", never a fabricated number.
+#
+# GRACEFUL (§8): an absent/empty store (or disabled telemetry → no events) renders
+# an honest "no data yet", never a crash. The report never gates the caller.
+#
+# Exit status:
+#   0  a subcommand produced its view (the report NEVER gates the caller).
+#   2  usage error (unknown subcommand / missing required <run_id>).
+
+set -euo pipefail
+
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+BINDIR="$(dirname "$SELF")"
+REPORT_LIB="$BINDIR/lib/report.py"
+
+usage() { sed -n '2,46p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+PY="$(command -v python3 || command -v python || true)"
+if [ -z "$PY" ]; then
+  echo "error: python3 not found (required for report)" >&2
+  exit 2
+fi
+
+if [ ! -f "$REPORT_LIB" ]; then
+  echo "error: report engine missing at $REPORT_LIB" >&2
+  exit 2
+fi
+
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+esac
+
+# The lib's _cli owns argv parsing (subcommand + run_id + flags) and the honest-exit
+# policy: it returns 0 on a clean render, 2 on a usage error. We pass argv through
+# verbatim so the bash wrapper stays a thin shell over the engine (house style).
+# No args ⇒ the lib defaults to the aggregate view.
+exec "$PY" "$REPORT_LIB" "$@"
