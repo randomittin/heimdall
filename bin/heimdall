@@ -218,21 +218,26 @@ f1_persona_check() {
       # proceed on the default/guided surface. Never read a stdin that will not
       # arrive (the v2.0.4 non-TTY-read class).
       if [ -t 0 ]; then
-        printf "\n  ${P}One-time question${R} — how should Heimdall talk to you?\n"
-        printf "    ${D}1) coder      — technical, code-first, terse${R}\n"
-        printf "    ${D}2) non-coder  — plain-language, guided${R}\n"
+        # CLARITY over flavor: say exactly what each choice CHANGES, so a real
+        # user who doesn't already know which to pick can decide. This is ONLY a
+        # communication-style preference — it does not limit what Heimdall can do,
+        # and it can be changed later.
+        printf "\n  ${P}One-time question${R} — how should Heimdall explain its work to you?\n"
+        printf "    ${D}This only changes the wording of explanations, not what Heimdall can do.${R}\n"
+        printf "    ${D}1) coder      — technical and terse: shows code, commands, file paths${R}\n"
+        printf "    ${D}2) non-coder  — plain language: explains what it's doing in everyday terms${R}\n"
         reply=""
         # -t timeout is belt-and-suspenders for a wedged INTERACTIVE terminal (a
         # human walks away mid-prompt); the [ -t 0 ] re-check above is the real
         # non-TTY guard. No answer within the window → defer (leave unset).
-        read -rt 60 -p "  choose [1/2] (default 1): " reply 2>/dev/null || reply=""
+        read -rt 60 -p "  choose [1/2] (default 1 = coder): " reply 2>/dev/null || reply=""
         case "$reply" in
           2|non-coder|nc) choice="non-coder" ;;
           *)              choice="coder" ;;
         esac
         if "$persona_bin" set "$choice" >/dev/null 2>&1; then
           F1_PERSONA="$choice"
-          printf "  ${P}▸ Persona set: %s${R} ${D}(remembered globally — asked once)${R}\n\n" "$choice"
+          printf "  ${P}▸ Talking to you as: %s${R} ${D}(remembered — asked once; change anytime)${R}\n\n" "$choice"
         fi
       fi
     fi
@@ -267,6 +272,28 @@ f1_onboard_if_cold() {
     _trace_order "onboard"
     if [ -n "${HEIMDALL_TRACE_ORDER:-}" ]; then
       printf "  \033[38;2;78;204;163m▸ Onboard\033[0m cold first run (%s)\n" "${F1_CONTEXT:-new}" >&2 2>/dev/null || true
+    fi
+
+    # COLD-USER ORIENTATION (friction removal): a first-ever user — in an empty
+    # dir, a fresh project, or an existing codebase — needs to know, in plain
+    # terms, WHAT Heimdall is and WHAT TO DO NEXT. Without this the cold run only
+    # emitted a test-only trace marker and the newcomer saw nothing. We point them
+    # at the known-good first experience: `hmd demo --run`.
+    #
+    # TTY-gated + never blocks: printed only on a real terminal with intro enabled
+    # (a non-TTY / CI / HEIMDALL_NO_INTRO run prints nothing). It NEVER reads stdin
+    # and never prompts — it cannot hang. The demo command is safe-by-default (dry
+    # unless --run), so pointing at `--run` is the deliberate watch-it-build path.
+    if [ -t 1 ] && [ "${HEIMDALL_NO_INTRO:-0}" != "1" ]; then
+      local G C D B R
+      G='\033[38;2;78;204;163m'; C='\033[38;2;0;212;255m'
+      D='\033[2m'; B='\033[1m'; R='\033[0m'
+      printf "\n  ${B}New here?${R} Heimdall is an autonomous build agent — you describe a task,\n"
+      printf "  it plans, writes the code, runs the tests, and commits the result for you.\n\n"
+      printf "  ${B}Best first step${R} — watch it build something real, end to end:\n"
+      printf "    ${C}hmd demo --run${R}  ${D}— scaffolds a Todo API + frontend + tests and builds it${R}\n\n"
+      printf "  ${D}Or just tell it what you want:${R}  ${C}hmd \"build a CLI that renames files\"${R}\n"
+      printf "  ${G}▸${R} ${D}Heimdall writes every file in THIS directory. Nothing ships unproven.${R}\n\n"
     fi
   fi
 }
@@ -534,21 +561,41 @@ first_run_setup() {
     fi
   fi
 
-  # claude-mem (persistent cross-session memory) — instrumented at npm-exec
-  # granularity (the claude-mem question §3): the npx exit code IS the datum, so a
-  # `failed` event carries error.detail="npm exec exit <code>". We do NOT swap
-  # claude-mem here — data-gathering only, so piece (d) can answer "is claude-mem's
-  # npm-exec the dominant install failure point?" with no ambiguity.
+  # claude-mem (persistent cross-session memory) — OPTIONAL companion.
+  #
+  # GRACEFUL-SKIP CONTRACT (friction removal): claude-mem is the single most
+  # failure-prone install step (it shells out to npx → a network npm install).
+  # A failed OR impossible install must NEVER hard-fail or hang the launcher —
+  # Heimdall works without it. So every outcome here is narrated and recovers:
+  #   - npx absent           → can't install → print the optional-skip line, move on
+  #   - npx install nonzero  → print the optional-skip line, move on (no cryptic err)
+  #   - npx install succeeds → confirm it
+  # We do NOT swap claude-mem here (a later data-driven decision). The npx exit
+  # code is still captured at npm-exec granularity for the install_step telemetry
+  # so piece (d) can answer "is claude-mem's npm-exec the dominant failure point?".
+  # The skip line is the EXACT user-facing message the friction-removal spec pins.
   if ! command -v claude-mem &>/dev/null; then
     echo "  + claude-mem (persistent memory across sessions)"
-    if command -v npx &>/dev/null; then
-      local _cm_t0 _cm_rc=0
-      _cm_t0="$(_tele_now_ms)"
-      _tele_install_step companion:claude-mem started
-      npx claude-mem install 2>/dev/null || _cm_rc=$?
+    local _cm_t0; _cm_t0="$(_tele_now_ms)"
+    _tele_install_step companion:claude-mem started
+    if ! command -v npx &>/dev/null; then
+      # No npx → cannot install. This is not an error to halt on: skip gracefully.
+      echo "  claude-mem is an optional companion — skipping (Heimdall works without it)"
+      echo "    (npm/npx not found; install Node.js then run 'npx claude-mem install' to enable it)"
+      _tele_install_step companion:claude-mem failed "$_cm_t0" \
+        npx-absent "npx not on PATH"
+    else
+      local _cm_rc=0
+      # Surface npx output (drop the 2>/dev/null swallow) so a real user sees what
+      # happened instead of a silent stall, but a nonzero exit is NON-FATAL.
+      npx claude-mem install || _cm_rc=$?
       if [ "$_cm_rc" -eq 0 ]; then
         _tele_install_step companion:claude-mem succeeded "$_cm_t0"
       else
+        # Declined or failed → graceful skip with the pinned message + the exact
+        # manual step, never a cryptic error or a hang.
+        echo "  claude-mem is an optional companion — skipping (Heimdall works without it)"
+        echo "    (re-enable anytime: 'npx claude-mem install')"
         _tele_install_step companion:claude-mem failed "$_cm_t0" \
           npm-exec-nonzero "npm exec exit $_cm_rc"
       fi
@@ -985,6 +1032,27 @@ if [[ "${1:-}" == "--update" ]]; then
   if [ -d "$PLUGIN_DIR/.git" ]; then
     local_hash=$(git -C "$PLUGIN_DIR" rev-parse HEAD 2>/dev/null)
     local_short="${local_hash:0:7}"
+
+    # DEV-CHECKOUT GUARD: the auto-update below does `git reset --hard origin/main`,
+    # which is safe for the canonical clean ~/.heimdall clone but would DESTROY a
+    # dev/editable checkout that has local commits or uncommitted edits. If this
+    # install can't be safely auto-updated, print the correct MANUAL step instead
+    # of guessing — never silently clobber a contributor's working tree.
+    dirty_tree=0
+    [ -n "$(git -C "$PLUGIN_DIR" status --porcelain 2>/dev/null)" ] && dirty_tree=1
+    ahead_count=$(git -C "$PLUGIN_DIR" rev-list origin/main..HEAD --count 2>/dev/null || echo 0)
+    case "$ahead_count" in ''|*[!0-9]*) ahead_count=0 ;; esac
+    if [ "$dirty_tree" -eq 1 ] || [ "$ahead_count" -gt 0 ]; then
+      printf "  ${W}This looks like a development checkout${R} ${D}(%s)${R}\n" "$PLUGIN_DIR"
+      [ "$dirty_tree" -eq 1 ]    && printf "    ${D}• uncommitted local changes present${R}\n"
+      [ "$ahead_count" -gt 0 ]   && printf "    ${D}• %s local commit(s) ahead of origin/main${R}\n" "$ahead_count"
+      printf "\n  ${B}Auto-update is disabled here${R} to avoid discarding your work.\n"
+      printf "  Update manually:\n\n"
+      printf "    ${C}cd %s && git pull --ff-only${R}\n" "$PLUGIN_DIR"
+      printf "  ${D}or, for a clean reinstall of the released build:${R}\n"
+      printf "    ${C}hmd --reinstall${R}\n\n"
+      exit 0
+    fi
 
     # Animated fetch
     printf "  ${D}[1/2]${R} ${B}Sync${R}\n"
@@ -1517,24 +1585,168 @@ for s in reg.get('skills', []):
   exit 0
 fi
 
-# ── Check for updates (non-blocking, fast) ──
+# ── Update check (version-accurate, daily-cached, background, non-blocking) ──
+#
+# The OLD check ran `git fetch` on EVERY launch (a blocking network call that
+# slowed every startup) and gated on a commit-count "N commits behind" — which
+# printed a meaningless "0 commits behind" on a current install and could not
+# tell a real user which RELEASE they were missing. This replacement:
+#
+#   1. Compares the installed SEMVER (heimdall_version → vX.Y.Z) against the
+#      latest PUBLISHED release tag (the highest `v[0-9]*` tag on origin). The
+#      notice fires iff installed < latest by version — never on a current
+#      install, never a false "behind".
+#   2. NEVER blocks launch on the network. The network probe (ls-remote) runs
+#      DETACHED in the background and only writes the cache for the NEXT launch.
+#      This launch reads ONLY the cache file (a local read) and prints from it.
+#   3. Checks at most ONCE PER DAY: a fresh cache (<24h) is reused verbatim with
+#      zero network; a stale/missing cache prints whatever it last knew, then
+#      kicks the background refresh. So a second launch the same day hits cache.
+#   4. SKIPS ENTIRELY when not safe/wanted: non-TTY/CI (stdout not a terminal),
+#      HEIMDALL_NO_UPDATE_CHECK=1, or a stateless run (HEIMDALL_NO_INTRO=1). It
+#      never reads stdin and never prompts, so it can never hang.
+#   5. Emits an install_step telemetry event (step=update-check) for the probe,
+#      reusing the existing fire-and-forget layer.
+#
+# Cache file: $HOME/.heimdall/update-check.json (the runtime home), holding
+#   { "checked_epoch": N, "installed": "vX.Y.Z", "latest": "vA.B.C" }
+
+# The runtime home for hmd state (cache, telemetry). Honors $HEIMDALL_HOME so a
+# stranger/test can redirect it; defaults to ~/.heimdall.
+_update_cache_file() {
+  printf '%s\n' "${HEIMDALL_HOME:-$HOME/.heimdall}/update-check.json"
+}
+
+# Compare two vX.Y.Z strings. Echoes "behind" iff $1 (installed) is strictly an
+# OLDER version than $2 (latest); echoes "current" otherwise (equal, ahead, or
+# either side unparseable — we never cry "behind" without a clean comparison).
+_update_semver_cmp() {
+  local installed="$1" latest="$2"
+  command -v python3 >/dev/null 2>&1 || { printf 'current\n'; return 0; }
+  INST="$installed" LATE="$latest" python3 - <<'PYEOF'
+import os, re, sys
+def parse(v):
+    m = re.match(r'^v?(\d+)\.(\d+)\.(\d+)$', (v or '').strip())
+    return tuple(int(x) for x in m.groups()) if m else None
+inst = parse(os.environ.get('INST', ''))
+late = parse(os.environ.get('LATE', ''))
+# Only a clean parse of BOTH sides can produce a "behind"; anything else is
+# "current" so a malformed/empty version never triggers a false notice.
+print('behind' if inst and late and inst < late else 'current')
+PYEOF
+}
+
+# Resolve the latest PUBLISHED release tag from origin (the highest semver tag).
+# This is the ONLY network call in the update path; the caller runs it DETACHED.
+# Prints a clean vX.Y.Z, or nothing if it cannot resolve (so the cache writer
+# simply records no "latest" and the next launch shows no false notice).
+_update_latest_remote_tag() {
+  git -C "$PLUGIN_DIR" rev-parse --git-dir >/dev/null 2>&1 || return 0
+  local tags
+  # ls-remote does NOT mutate the local repo (no fetch/reset) and lists every
+  # published tag ref; we keep only clean vMAJOR.MINOR.PATCH tags and pick the
+  # highest by version sort. --match scopes to semver tags (mirrors the hardened
+  # describe --match), so a scratch/backup tag can never masquerade as "latest".
+  tags="$(git -C "$PLUGIN_DIR" ls-remote --tags --refs origin 'v[0-9]*' 2>/dev/null \
+            | sed -E 's#.*refs/tags/##' \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true)"
+  [ -n "$tags" ] || return 0
+  printf '%s\n' "$tags" | sort -t. -k1.2,1n -k2,2n -k3,3n | tail -1
+}
+
+# Background cache refresh: probe the remote, write the cache for the NEXT
+# launch, emit one telemetry event. Detached by the caller (& + disown) so it
+# NEVER blocks this launch. Fail-open: any error leaves the cache untouched.
+_update_refresh_cache() {
+  local installed="$1" cache="$2"
+  local _t0; _t0="$(_tele_now_ms)"
+  _tele_install_step update-check started
+  local latest; latest="$(_update_latest_remote_tag)"
+  if [ -z "$latest" ]; then
+    _tele_install_step update-check failed "$_t0" \
+      remote-tag-unresolved "ls-remote produced no semver tag"
+    return 0
+  fi
+  local dir; dir="$(dirname "$cache")"
+  mkdir -p "$dir" 2>/dev/null || true
+  local now; now="$(date +%s 2>/dev/null || echo 0)"
+  # Write atomically (temp + mv) so a concurrent reader never sees half a file.
+  local tmp="${cache}.tmp.$$"
+  printf '{"checked_epoch":%s,"installed":"%s","latest":"%s"}\n' \
+    "$now" "$installed" "$latest" > "$tmp" 2>/dev/null \
+    && mv -f "$tmp" "$cache" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+  _tele_install_step update-check succeeded "$_t0"
+}
+
+# Read the cached result and, if installed < cached-latest, print ONE non-blocking
+# notice. Pure local read — no network. Silent when current or no usable cache.
+_update_print_from_cache() {
+  local installed="$1" cache="$2"
+  [ -f "$cache" ] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+  local latest
+  latest="$(CACHE="$cache" python3 - <<'PYEOF'
+import json, os, sys
+try:
+    with open(os.environ['CACHE']) as fh:
+        d = json.load(fh)
+    print(d.get('latest', '') or '')
+except Exception:
+    print('')
+PYEOF
+)"
+  [ -n "$latest" ] || return 0
+  if [ "$(_update_semver_cmp "$installed" "$latest")" = "behind" ]; then
+    # ONE line, informative, never halting. Names BOTH versions + the exact
+    # command, so a stranger knows precisely what to run.
+    printf "  \033[38;2;255;200;80mHeimdall %s available (you have %s) — update: hmd update\033[0m\n\n" \
+      "$latest" "$installed"
+  fi
+}
 
 check_for_update() {
-  [ -d "$PLUGIN_DIR/.git" ] || return 0
-  # Fetch every run (fast, non-blocking)
-  git -C "$PLUGIN_DIR" fetch origin --force --quiet 2>/dev/null || return 0
-  local local_hash=$(git -C "$PLUGIN_DIR" rev-parse HEAD 2>/dev/null)
-  local remote_hash=$(git -C "$PLUGIN_DIR" rev-parse origin/main 2>/dev/null)
-  [ -n "$remote_hash" ] || return 0
-  # behind = commits on origin/main not yet in HEAD. This is the ONLY signal that
-  # an update exists — NOT hash inequality. When HEAD is AHEAD of (or diverged
-  # from) origin/main the hashes differ but behind==0, so a hash-only gate would
-  # falsely print "Update available (0 commits behind)". Gate strictly on an
-  # INTEGER count > 0 so zero-behind is silent (already current).
-  local behind=$(git -C "$PLUGIN_DIR" rev-list HEAD..origin/main --count 2>/dev/null || echo 0)
-  case "$behind" in ''|*[!0-9]*) behind=0 ;; esac
-  if [ "$behind" -gt 0 ]; then
-    printf "  \033[38;2;255;200;80m⚡ Update available (%s commits behind). Run: heimdall --update\033[0m\n\n" "$behind"
+  # OPT-OUT / non-interactive / stateless → skip entirely. Never prompts, never
+  # reads stdin, never blocks: a CI or piped run does zero update work.
+  [ "${HEIMDALL_NO_UPDATE_CHECK:-0}" = "1" ] && return 0
+  [ "${HEIMDALL_NO_INTRO:-0}" = "1" ] && return 0
+  [ -t 1 ] || return 0
+  git -C "$PLUGIN_DIR" rev-parse --git-dir >/dev/null 2>&1 || return 0
+
+  local installed; installed="$(heimdall_version)"
+  # No resolvable installed version → nothing to compare; stay silent.
+  [ -n "$installed" ] || return 0
+
+  local cache; cache="$(_update_cache_file)"
+
+  # Is the cache fresh (checked within the last 24h)? A fresh cache is reused
+  # with NO network at all (the daily-cache contract). Stale/missing → we still
+  # print from whatever the cache last knew, then kick a background refresh that
+  # only affects the NEXT launch.
+  local fresh=0
+  if [ -f "$cache" ] && command -v python3 >/dev/null 2>&1; then
+    fresh="$(CACHE="$cache" python3 - <<'PYEOF'
+import json, os, time
+try:
+    with open(os.environ['CACHE']) as fh:
+        d = json.load(fh)
+    age = time.time() - float(d.get('checked_epoch', 0))
+    print('1' if 0 <= age < 86400 else '0')
+except Exception:
+    print('0')
+PYEOF
+)"
+  fi
+
+  # Always print from the cache we have (a local read, instant). On a current
+  # install or an empty cache this prints nothing.
+  _update_print_from_cache "$installed" "$cache"
+
+  # Stale or missing cache → refresh in the BACKGROUND for next launch. Detached
+  # (&) and disowned so this launch never waits on the network. A fresh cache
+  # skips the network entirely (≤ once/day).
+  if [ "$fresh" != "1" ]; then
+    ( _update_refresh_cache "$installed" "$cache" ) >/dev/null 2>&1 &
+    disown 2>/dev/null || true
   fi
 }
 
