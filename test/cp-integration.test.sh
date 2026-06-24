@@ -652,3 +652,91 @@ ajget() { "$PY" -c "import json; print(json.load(open('$AUDIT_OUT')).get('$1'))"
 # the real CLI exports the same audit store (the bin/heimdall-control-plane seam).
 CLI_REFUSED="$("$CLI" audit --event dispatch_refused --export --home "$HEIMDALL_HOME" 2>/dev/null | grep -c dispatch_refused || true)"
 [ "${CLI_REFUSED:-0}" -ge 3 ] && ok "#7 the CLI 'audit --event dispatch_refused --export' streams the refusal rows ($CLI_REFUSED)" || bad "#7 CLI audit export did not surface the refusals ($CLI_REFUSED)"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# #8 CONTROL != FLEET (CARDINAL, §2) — the isolated job worker runs against an
+#    IsolatedContext that REFUSES every read of the PKI private key (keys.json) and
+#    the audit log (audit.ndjson), and whose env is SCRUBBED of the server's secret-
+#    bearing vars. A control-plane compromise must NOT equal a fleet compromise.
+#    Falsifiable: a build where the worker COULD read the key flips a refused-flag.
+# ──────────────────────────────────────────────────────────────────────────────
+echo
+echo "#8 CONTROL != FLEET (isolated worker cannot read PKI key / audit log, §2) [CARDINAL]"
+
+ISO_OUT="$WORK/iso.out"
+# plant a fake server-secret env var; the scrubbed env handed to a job must DROP it.
+LIB="$LIB" CP_SERVER_SECRET="$PLANTED_SECRET" "$PY" - >"$ISO_OUT" 2>"$WORK/iso.err" <<'PYEOF'
+import json, os, sys
+sys.path.insert(0, os.environ["LIB"])
+import cp_worker as W
+import cp_handlers as H
+import cp_jobstore as J
+home = os.environ["HEIMDALL_HOME"]
+out = {}
+
+# the worker's own isolation self-check: every control-plane read REFUSED.
+refused = W.assert_isolated_cannot_read_control_plane("iso-probe", home=home)
+out["keys_refused"]   = refused.get(os.path.join("control-plane", "auth", "keys.json"))
+out["audit_refused"]  = refused.get(os.path.join("control-plane", "audit", "audit.ndjson"))
+out["escape_refused"] = refused.get(os.path.join("..", "control-plane", "auth", "keys.json"))
+out["bare_keys_refused"]  = refused.get("keys.json")
+out["bare_audit_refused"] = refused.get("audit.ndjson")
+out["env_scrubbed_flag"]  = refused.get("env_scrubbed")
+out["all_refused"] = all(v is True for v in refused.values())
+
+# the scrubbed env handed to a job must carry NONE of the server's secret-bearing vars —
+# the planted CP_SERVER_SECRET must NOT survive into the job's process env.
+import cp_server as S
+ctx = S.make_context("iso-env-probe", home=home)
+env = ctx.scrubbed_env()
+out["server_secret_in_job_env"] = ("CP_SERVER_SECRET" in env)
+out["job_env_keys"] = sorted(env.keys())
+
+# a REAL allowlisted handler still runs to DONE inside the isolated context — isolation
+# is a WALL (denies control-plane reads), not a BRICK (bounded named work proceeds).
+jid = J.create_job("run-task-X", {"task_id": "iso-real"},
+                   instance_haid="haid:rj.instance", home=home)
+final = W.run_job(jid, actor_haid="haid:rj.instance", home=home, checkpoints=2)
+out["valid_isolated_job_done"] = (final.get("state") == "done")
+
+sys.stdout.write(json.dumps(out))
+PYEOF
+
+[ -s "$ISO_OUT" ] || { echo "FATAL: isolation harness produced no output" >&2; cat "$WORK/iso.err" >&2; exit 2; }
+isjget() { "$PY" -c "import json; print(json.load(open('$ISO_OUT')).get('$1'))"; }
+
+[ "$(isjget keys_refused)" = "True" ] && ok "#8 read of control-plane/auth/keys.json (the PKI private key) REFUSED" || bad "#8 PKI key read NOT refused"
+[ "$(isjget audit_refused)" = "True" ] && ok "#8 read of control-plane/audit/audit.ndjson (the audit log) REFUSED" || bad "#8 audit log read NOT refused"
+[ "$(isjget escape_refused)" = "True" ] && ok "#8 scratch-dir escape (../control-plane/...) to the key dir REFUSED" || bad "#8 scratch escape NOT refused"
+[ "$(isjget bare_keys_refused)" = "True" ] && [ "$(isjget bare_audit_refused)" = "True" ] && ok "#8 bare keys.json / audit.ndjson reads REFUSED" || bad "#8 a bare control-plane read leaked"
+[ "$(isjget server_secret_in_job_env)" = "False" ] && [ "$(isjget env_scrubbed_flag)" = "True" ] \
+  && ok "#8 the planted server secret is SCRUBBED from the job's env (no control-plane credential in a job process)" \
+  || bad "#8 a server secret survived into the isolated job env"
+[ "$(isjget valid_isolated_job_done)" = "True" ] && ok "#8 a VALID handler still runs to done INSIDE the isolated context (a wall, not a brick)" || bad "#8 a valid isolated job did not complete"
+# FALSIFIABILITY: every control-plane read refused — a breach would flip a flag to False.
+[ "$(isjget all_refused)" = "True" ] \
+  && ok "#8 FALSIFIABLE: every control-plane read refused — a worker that COULD read the key reds this" \
+  || bad "#8 not falsifiable (a control-plane read was permitted)"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# FINAL — no orphan worker processes left behind (the detached worker is reaped),
+# then the gate verdict. Exit 0 = the whole wired cross-piece flow holds.
+# ──────────────────────────────────────────────────────────────────────────────
+echo
+echo "FINAL — no orphan worker processes + gate verdict"
+ORPHANS=0
+for p in $WORKER_PIDS; do
+  if kill -0 "$p" 2>/dev/null; then
+    ORPHANS=$((ORPHANS+1))
+  fi
+done
+# the flight worker is a short job; it has long since exited by now. (The trap also
+# kills any survivor on EXIT — but at the gate's end there should be none.)
+[ "$ORPHANS" -eq 0 ] && ok "FINAL no orphan worker processes survive the run (detached worker reaped)" || bad "FINAL $ORPHANS orphan worker process(es) still alive"
+
+echo
+echo "============================================================"
+printf "cp-integration: %d passed, %d failed\n" "$PASS" "$FAIL"
+echo "============================================================"
+[ "$FAIL" -eq 0 ] || exit 1
+exit 0
