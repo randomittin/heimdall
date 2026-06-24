@@ -69,9 +69,6 @@ set -euo pipefail
 SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 BIN_DIR="$(cd "$(dirname "$SELF")" && pwd)"
 LIB="$BIN_DIR/lib/collision.py"
-PLUGIN_DIR="$(cd "$BIN_DIR/.." && pwd)"
-PLANNING_DIR="${HEIMDALL_PLANNING_DIR:-$PLUGIN_DIR/.planning}"
-COLLISIONS_DIR="$PLANNING_DIR/ledger/collisions"
 
 usage() { sed -n '2,63p' "$SELF" | sed 's/^# \{0,1\}//'; }
 
@@ -126,6 +123,15 @@ if ! git -C "$REPO" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   echo "error: --repo is not a git repository: $REPO" >&2
   exit 2
 fi
+
+# The collision store lives in the REPO under inspection (it is per-repo,
+# git-tracked the same way claims/ and activity/ are), keyed by the current
+# branch's slug → one writer per file, conflict-free merges. HEIMDALL_PLANNING_DIR
+# overrides the location (tests / non-standard layouts); otherwise it is the
+# target repo's own .planning. NOT plugin-relative — a record about feat-a's
+# collisions belongs in feat-a's repo, not wherever the binary happens to live.
+PLANNING_DIR="${HEIMDALL_PLANNING_DIR:-$REPO/.planning}"
+COLLISIONS_DIR="$PLANNING_DIR/ledger/collisions"
 
 # Filesystem-safe slug for a branch name (matches heimdall-claim's haid_slug:
 # '/' and ':' → '_', so a feat/x branch maps to a legal filename).
