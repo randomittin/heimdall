@@ -341,6 +341,15 @@ def serve(host="127.0.0.1", port=8787, *, home=None, enforce_revocation=True):
     + a gitignored ${HEIMDALL_HOME}/control-plane/ state tree, no external DB."""
     from http.server import HTTPServer
 
+    # ASSEMBLE the control plane (§10): plug every capability piece's routes into the
+    # seam, re-drive orphaned jobs (§4 replay-on-boot), and start the per-minute
+    # scheduler tick clock (§6). Without this the running server exposes ONLY the
+    # built-in /dispatch — boot() is what makes /ingest, /dashboard, /schedules,
+    # /jobs/*, /approvals/* and /notifications reachable over the wire.
+    import cp_boot
+
+    cp_boot.boot(home=home)
+
     handler_cls = _build_handler_class(home, enforce_revocation)
     httpd = HTTPServer((host, port), handler_cls)
     try:
