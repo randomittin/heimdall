@@ -90,6 +90,15 @@ evals/oracles/*/report.json
 !.planning/ledger/
 .planning/ledger/*
 !.planning/ledger/activity/
+# TEAM MODE P3 collision store (.planning/ledger/collisions/{branch-slug}.json):
+# one record per current-branch scan of same-target-CHANGED collisions vs
+# siblings. Tracked + synced across checkouts the same way claims/ and activity/
+# are — one writer per file (keyed by the current branch's slug) → conflict-free
+# merges. Records carry ONLY branch names + target (file/symbol) names + a
+# classification (safe-textual vs flag-human); NEVER code, diffs, or secrets, so
+# the gitleaks gate over these paths finds nothing (heimdall-collision writes the
+# surface verdict, not the source).
+!.planning/ledger/collisions/
 .claude/
 evals/benchmark/results.jsonl
 
