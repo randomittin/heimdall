@@ -261,3 +261,74 @@ B3_ABS_TEXT="$(HEIMDALL_HOME="$EMPTY_HOME" "$COMPREHEND" recall "$GR" 2>/dev/nul
 [ "$B3_ABS_RC" -eq 0 ] && ok "absent-store recall exit 0 (no crash on a clean install)" || bad "absent-store recall exit $B3_ABS_RC (want 0)"
 [ "$B3_ABS_AVAIL" = "False" ] && ok "absent store → available=False (identical to today, no regression)" || bad "absent-store available=$B3_ABS_AVAIL (want False)"
 printf '%s' "$B3_ABS_TEXT" | grep -q "none" && ok "absent store → the honest one-line 'none' block (additive note, not a section)" || bad "absent store did not render the 'none' note"
+
+# ═════════════════════════════════════════════════════════════════════════════
+# BLOCK 4 — BENCH HONEST  (the measured metrics table; CARDINAL: no fabricated number)
+# ═════════════════════════════════════════════════════════════════════════════
+# heimdall-vm-bench builds a REAL throwaway 3-commit fixture repo and scores all four
+# methods (verified-memory vs decay / llm-judge / drift) against the SAME git-true
+# labels. Two honesty properties are gated:
+#   • every comparison figure carries a provenance tag (measured | estimated | blank);
+#     the llm-judge arm is a labeled DOUBLE → its delta renders `est.` + basis, NEVER a
+#     bare measured number; a value with NO provenance is STRUCTURALLY REFUSED to '—'
+#     (require_provenance) — a fabricated number cannot print. THIS is the cardinal.
+#   • the win/tie/null verdict is printed HONESTLY: verified-memory ties the llm-judge
+#     double at stale-retrieval (does not strictly beat every baseline) → the run flags
+#     a NULL result, reported as a finding, not buried (dossier §4).
+echo "BLOCK 4 — BENCH HONEST (measured table; CARDINAL: no fabricated number):"
+
+B4_JSON="$("$BENCH" run --json 2>/dev/null)"; B4_RC=$?
+B4_TABLE="$("$BENCH" run 2>/dev/null)"
+[ "$B4_RC" -eq 0 ] && ok "bench run exit 0 (built the fixture repo, scored all 4 methods)" || bad "bench run exit $B4_RC (want 0)"
+
+# 4a. the measured table renders: header + a row per method, over real built commits.
+printf '%s' "$B4_TABLE" | grep -q "Verified-Memory BENCHMARK" && ok "metrics table header rendered" || bad "metrics table header missing"
+printf '%s' "$B4_TABLE" | grep -q "built commits:" && ok "table cites the REAL built fixture commits (staleness from a real git op, not a flag flip)" || bad "table missing the built-commits line"
+for m in verified-memory decay llm-judge drift; do
+  printf '%s' "$B4_TABLE" | grep -q "$m" && ok "table has the $m row" || bad "table missing the $m row"
+done
+
+# 4b. CARDINAL — NO FABRICATED NUMBER. Two falsifiable proofs:
+#   (i) the llm-judge arm is a labeled estimate → its rendered delta carries `est.`,
+#       NEVER a bare measured number. A bare llm-judge delta would mean an estimate was
+#       passed off as measured (a fabrication) → reds the gate.
+B4_LLM_PROV="$(printf '%s' "$B4_JSON" | python3 -c "import sys,json;print(json.load(sys.stdin)['deltas']['llm-judge']['stale_retrieval']['provenance'])" 2>/dev/null)"
+B4_LLM_RENDERED="$(printf '%s' "$B4_JSON" | python3 -c "import sys,json;print(json.load(sys.stdin)['deltas']['llm-judge']['stale_retrieval_rendered'])" 2>/dev/null)"
+[ "$B4_LLM_PROV" = "estimated" ] && ok "llm-judge delta provenance=estimated (a labeled double, never a measured LLM run)" || bad "llm-judge provenance=$B4_LLM_PROV (want estimated)"
+case "$B4_LLM_RENDERED" in *est.*) ok "CARDINAL: llm-judge delta renders WITH 'est.' + basis — an estimate is never shown bare ($B4_LLM_RENDERED)";; *) bad "CARDINAL FAIL: llm-judge delta rendered without 'est.': $B4_LLM_RENDERED — an estimate passed off as measured";; esac
+
+#  (ii) the structural REFUSAL itself: feed require_provenance/render_figure a figure
+#       carrying a VALUE but NO provenance (a fabricated number) — the engine MUST
+#       render it '—', never the bare number. This proves a baseless figure cannot
+#       print as a fact (the honesty guard is structural, not cosmetic).
+B4_REFUSE="$(python3 - "$REPO" <<'PY'
+import sys, os
+sys.path.insert(0, os.path.join(sys.argv[1], "bin", "lib"))
+import vm_bench as B
+fabricated = {"value": 0.42, "provenance": None, "basis": None, "band": None}  # a baseless number
+prov, val = B.require_provenance(fabricated)
+rendered = B.render_figure(fabricated)
+# also confirm a properly-measured figure DOES render its number (the guard is not just
+# blanking everything — it refuses ONLY the unprovenanced).
+import holdout
+measured = {"value": 0.8, "provenance": holdout.COST_MEASURED, "basis": "m", "band": None}
+print("%s|%s|%s|%s" % (prov, val, rendered, B.render_figure(measured)))
+PY
+)"
+B4_REFUSE_PROV="${B4_REFUSE%%|*}"
+B4_REFUSE_RENDERED="$(printf '%s' "$B4_REFUSE" | cut -d'|' -f3)"
+B4_MEASURED_RENDERED="$(printf '%s' "$B4_REFUSE" | cut -d'|' -f4)"
+[ "$B4_REFUSE_PROV" = "None" ] && ok "require_provenance REFUSES a value with no provenance (returns None — a fabricated delta is not render-eligible)" || bad "require_provenance returned prov=$B4_REFUSE_PROV for an unprovenanced value (want None)"
+[ "$B4_REFUSE_RENDERED" = "—" ] && ok "CARDINAL: a baseless figure renders '—', NEVER the invented number 0.42 (structural honesty guard)" || bad "CARDINAL FAIL: a baseless figure rendered '$B4_REFUSE_RENDERED' (a fabricated number printed)"
+[ "$B4_MEASURED_RENDERED" = "0.8" ] && ok "a genuinely-measured figure still renders its number (the guard refuses ONLY the unprovenanced, not everything)" || bad "a measured figure rendered '$B4_MEASURED_RENDERED' (want 0.8 — the guard over-blanked)"
+
+# 4c. the verdict is printed HONESTLY (win/tie/null). On this fixture verified-memory
+# TIES the llm-judge double at stale-retrieval (both 0.0) → it does NOT strictly beat
+# every baseline → the run flags a NULL result, surfaced as a finding, not buried.
+B4_NULL="$(printf '%s' "$B4_JSON" | python3 -c "import sys,json;print(json.load(sys.stdin)['headline']['null_result'])" 2>/dev/null)"
+B4_LLM_VERDICT="$(printf '%s' "$B4_JSON" | python3 -c "import sys,json;print(json.load(sys.stdin)['deltas']['llm-judge']['verdict'])" 2>/dev/null)"
+B4_DECAY_VERDICT="$(printf '%s' "$B4_JSON" | python3 -c "import sys,json;print(json.load(sys.stdin)['deltas']['decay']['verdict'])" 2>/dev/null)"
+[ "$B4_NULL" = "True" ] && ok "headline null_result=True printed honestly (ties llm-judge → not a clean sweep) — reported, not buried" || bad "null_result=$B4_NULL (want True on this fixture)"
+[ "$B4_LLM_VERDICT" = "null-tie" ] && ok "llm-judge verdict=null-tie (honest: verified-memory ties, does not beat, the double here)" || bad "llm-judge verdict=$B4_LLM_VERDICT (want null-tie)"
+[ "$B4_DECAY_VERDICT" = "verified-memory-wins" ] && ok "decay verdict=verified-memory-wins (a measured, real win where it exists)" || bad "decay verdict=$B4_DECAY_VERDICT (want verified-memory-wins)"
+printf '%s' "$B4_TABLE" | grep -q "NULL NOTE" && ok "the table prints the NULL NOTE — the honest finding is surfaced in the human output" || bad "table did not print the NULL NOTE"
