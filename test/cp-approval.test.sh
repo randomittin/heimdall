@@ -94,7 +94,13 @@ res_a = Ap.approve(owner, aid_a)
 out["f1_state"] = Ap.get(aid_a)["state"]
 out["f1_dispatched"] = bool(res_a.get("dispatched"))
 out["f1_status"] = res_a.get("status")
-disp_a = [r for r in Au.search(event="dispatch") if r.get("action_id") == aid_a and r.get("outcome") == "ok"]
+# the approved action ran THROUGH cp_server.dispatch, which mints its own action_id;
+# the approval record correlates the two via dispatched_action_id. Assert the §9
+# dispatch row exists for THAT dispatched child id (the audit trail is linkable).
+disp_child = res_a.get("dispatched_action_id")
+out["f1_dispatched_child_recorded"] = Ap.get(aid_a).get("dispatched_action_id") == disp_child
+disp_a = [r for r in Au.search(event="dispatch")
+          if r.get("action_id") == disp_child and r.get("outcome") == "ok"]
 out["f1_dispatch_audit_rows"] = len(disp_a)
 
 # ── F2. OWNER denies (rejects) a pending action -> not dispatched ──────────────
@@ -193,7 +199,7 @@ else
 fi
 
 echo "F. OWNER APPROVE / DENY (§7)"
-[ "$(jget f1_state)" = "approved" ] && [ "$(jget f1_dispatched)" = "True" ] && [ "$(jget f1_status)" = "200" ] && [ "$(jget f1_dispatch_audit_rows)" -ge 1 ] && ok "F1 owner approve -> DISPATCHES (200) + audited" || bad "F1 owner approve did not dispatch"
+[ "$(jget f1_state)" = "approved" ] && [ "$(jget f1_dispatched)" = "True" ] && [ "$(jget f1_status)" = "200" ] && [ "$(jget f1_dispatched_child_recorded)" = "True" ] && [ "$(jget f1_dispatch_audit_rows)" -ge 1 ] && ok "F1 owner approve -> DISPATCHES (200) + audited (correlated child id)" || bad "F1 owner approve did not dispatch"
 [ "$(jget f2_state)" = "rejected" ] && [ "$(jget f2_dispatched)" = "False" ] && [ "$(jget f2_dispatch_audit_rows)" = "0" ] && ok "F2 owner deny -> NOT dispatched + audited" || bad "F2 owner deny dispatched anyway"
 
 echo "G. OWNER OVERRIDE (§7, human-authority thesis)"
