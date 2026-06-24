@@ -76,6 +76,20 @@ skills/designmatch/scripts/package-lock.json
 # Oracle-gate runtime artifacts: report.json is run.sh's typed OUTPUT, not source
 evals/oracles/*/report.json
 .planning/
+# TEAM MODE P1 — the activity store is git-backed shared state (TM-1: git IS the
+# coordination substrate). `.planning/` is broadly ignored above, so git won't
+# descend to un-ignore a child unless each path segment is re-included first; we
+# re-include the chain down to the activity dir, then un-ignore its records.
+# Each instance's per-HAID activity record (.planning/ledger/activity/{slug}.json)
+# is then tracked + synced across checkouts the same way claims/ is — one writer
+# per file → conflict-free merges. The secret-scan gate (gitleaks) still scans
+# these paths; the records are scrubbed secret-free by construction (heimdall-
+# activity rejects any secret-shaped field before writing).
+!.planning/
+.planning/*
+!.planning/ledger/
+.planning/ledger/*
+!.planning/ledger/activity/
 .claude/
 evals/benchmark/results.jsonl
 

@@ -1,0 +1,472 @@
+#!/usr/bin/env bash
+# heimdall-activity — TEAM MODE P1 (Shared Awareness): the git-backed activity record.
+#
+# The lowest-risk, INFORMATIONAL foundation of team mode. Every `hmd` instance
+# PUBLISHES one small record of what it is doing — who, which task, which files,
+# how many agents, on which branch — and READS its siblings' records to answer
+# "who is working where". No server; git is the shared state (TM-1: branch
+# topology IS the awareness data, there is no parallel store).
+#
+# One file per HAID: .planning/ledger/activity/{haid-slug}.json — one writer per
+# file → conflict-free git merges (the exact pattern bin/heimdall-claim uses for
+# claims/). A second instance never contends on a shared blob; git just unions the
+# per-dev files across checkouts.
+#
+# Record schema (jq-valid, one object — identity + files + task ONLY, NEVER code
+# or secrets):
+#   { "haid", "human", "active_task", "files_touched": [globs + "file#symbol"],
+#     "agents_running", "branch", "heartbeat", "ttl_minutes": 30 }
+# A record is ACTIVE while now < heartbeat + ttl_minutes (the SAME liveness rule
+# heimdall-claim uses). Past that it is TTL-expired: a crashed/exited instance's
+# record AGES OUT of the active view and is removed by `reap` — a dead peer must
+# never show "working" forever.
+#
+# REUSE, not rebuild:
+#   - heimdall-haid   provides the HAID identity + heartbeat/TTL backbone.
+#   - heimdall-claim  provides the surface-overlap engine; `activity overlap` is a
+#                     `claim check`-shaped run, but INFORMATIONAL — it WARNS when a
+#                     sibling touches a file you touch and ALWAYS exits 0. P1 never
+#                     blocks an edit (no exit-3 collision gate).
+#   - bin/lib/telemetry's _scrub discipline is mirrored here: the task / files
+#     fields are SHAPE-bounded + secret-rejecting by construction, so a credential
+#     can never enter the git-tracked store (PRIVACY: identity + files + task only).
+#
+# HONEST SCOPE: this is COOPERATIVE awareness among consenting hmd instances. It is
+# not a lock and not a security boundary — it informs, it never enforces.
+#
+# Solo / feature-off: with HEIMDALL_TEAM=off (or 0/false/no/disabled) `publish` is
+# a graceful no-op (exit 0, no record written) and the read views show nothing new
+# — behaviour is byte-identical to a no-team world. Opt-in, lazy, graceful.
+#
+# Usage:
+#   heimdall-activity publish --task <ref> [--files <surface>]... [--agents N]
+#                             [--branch B] [--ttl <min>] [--haid <h>]
+#                                 write/refresh THIS instance's activity record
+#   heimdall-activity heartbeat [--haid <h>]   bump this record's heartbeat (stay alive)
+#   heimdall-activity retract [--haid <h>]      drop this instance's record (clean exit)
+#   heimdall-activity list [--json]             active sibling records (TTL-filtered)
+#   heimdall-activity show [--haid <h>] [--json]   one instance's record
+#   heimdall-activity overlap [--haid <h>]      WARN where THIS record's files
+#                                               intersect a sibling's (exit 0 always)
+#   heimdall-activity reap                      remove every TTL-expired record now
+#   -h, --help
+#
+# Conventions (match bin/heimdall-claim — pure bash + jq + coreutils, bash 3.2):
+#   - jq required; absence is a hard exit 2
+#   - all writes atomic (mktemp + mv) under an mkdir-based lock
+#   - deterministic, human-readable output for auditability
+#
+# Exit: 0 ok (incl. overlap warnings — informational); 2 usage/IO error.
+set -euo pipefail
+
+# ── Path resolution (mirrors bin/heimdall-claim) ─────────────────────────────
+SELF="$0"
+if command -v readlink >/dev/null 2>&1; then
+  SELF="$(readlink -f "$0" 2>/dev/null || readlink "$0" 2>/dev/null || echo "$0")"
+fi
+BIN_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+PLUGIN_DIR="$(cd "$BIN_DIR/.." && pwd)"
+PLANNING_DIR="${HEIMDALL_PLANNING_DIR:-$PLUGIN_DIR/.planning}"
+LEDGER_DIR="$PLANNING_DIR/ledger"
+ACTIVITY_DIR="$LEDGER_DIR/activity"
+DECISIONS_FILE="$LEDGER_DIR/decisions.md"
+LOCK_FILE="$ACTIVITY_DIR.lock"
+LOCK_TIMEOUT=10
+HAID_BIN="$BIN_DIR/heimdall-haid"
+CLAIM_BIN="$BIN_DIR/heimdall-claim"
+DEFAULT_TTL=30
+
+command -v jq >/dev/null 2>&1 || { echo "error: jq is required" >&2; exit 2; }
+
+usage() { sed -n '2,62p' "$SELF" | sed 's/^# \{0,1\}//'; }
+ts() { date -u +%FT%TZ; }
+now_epoch() { date +%s; }
+
+# ── Feature flag — solo/off is byte-identical to today ───────────────────────
+# team_enabled → 1 unless HEIMDALL_TEAM is an off-ish value. Default ON (opt-in is
+# at the hmd level; the binary itself defaults on so an explicit `publish` works),
+# but an OFF value makes publish a graceful no-op so a solo world never writes.
+team_enabled() {
+  local flag
+  flag="$(printf '%s' "${HEIMDALL_TEAM:-}" | tr '[:upper:]' '[:lower:]')"
+  case "$flag" in
+    off|0|false|no|disabled) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+# Parse an ISO8601 UTC timestamp to epoch seconds (portable: GNU date, BSD date,
+# jq fallback) — identical helper to heimdall-claim's iso_to_epoch.
+iso_to_epoch() {
+  local iso="$1" e
+  e="$(date -u -d "$iso" +%s 2>/dev/null || true)"
+  [ -n "$e" ] && { printf '%s' "$e"; return 0; }
+  e="$(date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$iso" +%s 2>/dev/null || true)"
+  [ -n "$e" ] && { printf '%s' "$e"; return 0; }
+  jq -rn --arg t "$iso" '($t | fromdateiso8601?) // empty' 2>/dev/null || true
+}
+
+# ── Locking (mkdir-based; atomic, no flock dependency) — mirrors heimdall-claim ─
+acquire_lock() {
+  local attempts=0
+  while ! mkdir "$LOCK_FILE" 2>/dev/null; do
+    attempts=$((attempts + 1))
+    if [ "$attempts" -ge "$LOCK_TIMEOUT" ]; then
+      if [ -d "$LOCK_FILE" ]; then
+        local age
+        age=$(( $(date +%s) - $(stat -f %m "$LOCK_FILE" 2>/dev/null || stat -c %Y "$LOCK_FILE" 2>/dev/null || echo 0) ))
+        if [ "$age" -gt 30 ]; then
+          echo "Breaking stale lock (${age}s old)" >&2
+          rmdir "$LOCK_FILE" 2>/dev/null || true
+          mkdir "$LOCK_FILE" 2>/dev/null && return 0
+        fi
+      fi
+      echo "error: could not acquire lock on $ACTIVITY_DIR after ${LOCK_TIMEOUT}s" >&2
+      exit 2
+    fi
+    sleep 1
+  done
+}
+release_lock() { rmdir "$LOCK_FILE" 2>/dev/null || true; }
+
+ensure_dirs() { mkdir -p "$ACTIVITY_DIR"; }
+
+# Atomic write: render stdin to a temp file then mv into place. Caller holds lock.
+atomic_write() {
+  local dest="$1" tmp template
+  template="${TMPDIR:-/tmp}/activity.$(printf 'X%.0s' 1 2 3 4 5 6)"
+  tmp="$(mktemp "$template")"
+  cat > "$tmp"
+  mv -f "$tmp" "$dest"
+}
+
+# ── Identity ─────────────────────────────────────────────────────────────────
+# HAID resolution: an explicit HEIMDALL_HAID override wins (the same escape hatch
+# heimdall-claim exposes via --haid, here as an env so two instances can be
+# simulated on one machine), else derive via heimdall-haid current.
+current_haid() {
+  if [ -n "${HEIMDALL_HAID:-}" ]; then
+    printf '%s' "$HEIMDALL_HAID"
+    return 0
+  fi
+  [ -x "$HAID_BIN" ] || { echo "error: heimdall-haid not found at $HAID_BIN" >&2; exit 2; }
+  "$HAID_BIN" current
+}
+haid_human() { printf '%s' "$1" | sed -E 's/^haid:([a-z0-9-]+)\..*/\1/'; }
+haid_slug()  { printf '%s' "$1" | tr '/:' '__'; }
+record_path() { printf '%s/%s.json' "$ACTIVITY_DIR" "$(haid_slug "$1")"; }
+
+# ── Secret-by-construction scrub (mirrors bin/lib/telemetry.py _scrub, §7) ────
+# A task/files value over the bound, or matching a gitleaks high-signal pattern,
+# or shaped like an assigned credential, is REJECTED (the whole publish is refused)
+# — a credential can never enter the git-tracked store. We reject (not truncate):
+# a truncated secret is still a leak. Bound mirrors telemetry's _SCRUB_MAX (120).
+SCRUB_MAX=120
+# High-signal secret patterns (extended-regex; the families telemetry._scrub names).
+# Each is matched with grep -E; a hit on ANY rejects the value.
+secret_shaped() {
+  local v="$1"
+  [ "${#v}" -gt "$SCRUB_MAX" ] && return 0
+  # assigned-credential shape: key = long-opaque-RHS
+  printf '%s' "$v" | grep -Eiq '(token|secret|password|passwd|pwd|api[_-]?key|apikey|access[_-]?key|auth|bearer|credential|private[_-]?key)[[:space:]]*[=:][[:space:]]*[^[:space:]]{16,}' && return 0
+  printf '%s' "$v" | grep -Eq 'ghp_[A-Za-z0-9]{36}' && return 0           # GitHub PAT
+  printf '%s' "$v" | grep -Eq 'gh[oprsu]_[A-Za-z0-9]{36}' && return 0     # other GitHub tokens
+  printf '%s' "$v" | grep -Eq 'AKIA[0-9A-Z]{16}' && return 0             # AWS access key id
+  printf '%s' "$v" | grep -Eq 'sk_(live|test)_[A-Za-z0-9]{16,}' && return 0  # Stripe secret
+  printf '%s' "$v" | grep -Eq 'xox[baprs]-[A-Za-z0-9-]{10,}' && return 0  # Slack token
+  printf '%s' "$v" | grep -Eq -- '-----BEGIN[ A-Z]*PRIVATE KEY-----' && return 0  # PEM key
+  printf '%s' "$v" | grep -Eq 'eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}' && return 0  # JWT
+  return 1
+}
+# reject_if_secret <field-label> <value> — exit 2 if the value is secret-shaped,
+# naming the field. The publish is refused outright (no record written): the
+# strongest privacy guarantee is no leaky record at all.
+reject_if_secret() {
+  local label="$1" v="$2"
+  if secret_shaped "$v"; then
+    echo "error: refusing to publish — $label looks like it carries a secret/credential." >&2
+    echo "       the activity record holds identity + files + task ONLY, never secrets." >&2
+    exit 2
+  fi
+}
+
+# ── Liveness (mirrors heimdall-claim claim_active) ───────────────────────────
+# record_active <file> → 0 if now < heartbeat + ttl_minutes*60.
+record_active() {
+  local f="$1" hb ttl hb_e exp now
+  [ -f "$f" ] || return 1
+  hb="$(jq -r '.heartbeat // empty' "$f" 2>/dev/null || true)"
+  ttl="$(jq -r '.ttl_minutes // 30' "$f" 2>/dev/null || echo 30)"
+  [ -n "$hb" ] || return 1
+  hb_e="$(iso_to_epoch "$hb")"
+  [ -n "$hb_e" ] || return 1
+  exp=$(( hb_e + ttl * 60 ))
+  now="$(now_epoch)"
+  [ "$now" -lt "$exp" ]
+}
+
+note_decision() {
+  local title="$1" body="$2"
+  mkdir -p "$LEDGER_DIR"
+  {
+    printf '\n## %s — %s\n\n' "$(ts)" "$title"
+    printf '%s\n' "$body"
+  } >> "$DECISIONS_FILE"
+}
+
+# Reap TTL-expired records; note each in decisions.md. Caller holds the lock.
+reap_expired() {
+  local f haid task
+  [ -d "$ACTIVITY_DIR" ] || return 0
+  for f in "$ACTIVITY_DIR"/*.json; do
+    [ -e "$f" ] || continue
+    if ! record_active "$f"; then
+      haid="$(jq -r '.haid // "unknown"' "$f" 2>/dev/null || echo unknown)"
+      task="$(jq -r '.active_task // "unknown"' "$f" 2>/dev/null || echo unknown)"
+      rm -f "$f"
+      note_decision "activity age-out (TTL/heartbeat expired)" \
+        "Activity record for \`$haid\` (task \`$task\`) exceeded its TTL / heartbeat window and was aged out by \`heimdall-activity reap\`. The instance is treated as exited/crashed."
+    fi
+  done
+  return 0
+}
+
+# ── Subcommands ──────────────────────────────────────────────────────────────
+[ $# -ge 1 ] || { echo "error: a subcommand is required" >&2; usage >&2; exit 2; }
+cmd="$1"; shift || true
+
+case "$cmd" in
+  -h|--help)
+    usage; exit 0 ;;
+
+  publish)
+    # Solo / feature-off: a graceful no-op so a no-team world is byte-identical.
+    if ! team_enabled; then
+      echo "team mode off (HEIMDALL_TEAM) — activity publish is a no-op"
+      exit 0
+    fi
+    task=""; agents=1; branch=""; ttl="$DEFAULT_TTL"; haid_override=""; files=()
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --task)   task="${2:?--task needs a value}"; shift 2 ;;
+        --files)  files+=("${2:?--files needs a value}"); shift 2 ;;
+        --agents) agents="${2:?--agents needs a value}"; shift 2 ;;
+        --branch) branch="${2:?--branch needs a value}"; shift 2 ;;
+        --ttl)    ttl="${2:?--ttl needs a value}"; shift 2 ;;
+        --haid)   haid_override="${2:?--haid needs a value}"; shift 2 ;;
+        -*) echo "error: unknown flag: $1" >&2; exit 2 ;;
+        *)  echo "error: unexpected argument: $1" >&2; exit 2 ;;
+      esac
+    done
+    [ -n "$task" ] || { echo "error: publish needs --task <ref>" >&2; exit 2; }
+    case "$agents" in (*[!0-9]*|'') echo "error: --agents must be a non-negative integer" >&2; exit 2 ;; esac
+    case "$ttl" in (*[!0-9]*|'') echo "error: --ttl must be a positive integer (minutes)" >&2; exit 2 ;; esac
+    [ "$ttl" -ge 1 ] || { echo "error: --ttl must be >= 1" >&2; exit 2; }
+
+    # PRIVACY GATE: reject a secret-shaped task or files surface BEFORE any write.
+    reject_if_secret "the --task" "$task"
+    for s in ${files[@]+"${files[@]}"}; do
+      reject_if_secret "a --files surface" "$s"
+    done
+    # branch is derived/operational metadata but scrub it too (defence in depth).
+    [ -n "$branch" ] && reject_if_secret "the --branch" "$branch"
+
+    if [ -n "$haid_override" ]; then haid="$haid_override"; else haid="$(current_haid)"; fi
+    human="$(haid_human "$haid")"
+    # If branch unset, best-effort read the current git branch (operational only).
+    if [ -z "$branch" ]; then
+      branch="$(git -C "$PLUGIN_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
+    fi
+
+    ensure_dirs
+    acquire_lock; trap release_lock EXIT
+    reap_expired
+
+    now="$(ts)"
+    if [ "${#files[@]}" -gt 0 ]; then
+      files_json="$(printf '%s\n' "${files[@]}" | jq -R . | jq -s .)"
+    else
+      files_json='[]'
+    fi
+    jq -n \
+      --arg haid "$haid" --arg human "$human" \
+      --arg task "$task" --argjson files "$files_json" \
+      --argjson agents "$agents" --arg branch "$branch" \
+      --arg now "$now" --argjson ttl "$ttl" \
+      '{haid:$haid, human:$human, active_task:$task, files_touched:$files,
+        agents_running:$agents, branch:$branch, heartbeat:$now, ttl_minutes:$ttl}' \
+      | atomic_write "$(record_path "$haid")"
+    release_lock; trap - EXIT
+    echo "published activity for $haid (task $task, ${agents} agent(s), branch $branch, ttl ${ttl}m)"
+    ;;
+
+  heartbeat)
+    haid=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --haid) haid="${2:?--haid needs a value}"; shift 2 ;;
+        *) echo "error: unknown flag: $1" >&2; exit 2 ;;
+      esac
+    done
+    [ -n "$haid" ] || haid="$(current_haid)"
+    ensure_dirs
+    acquire_lock; trap release_lock EXIT
+    f="$(record_path "$haid")"
+    if [ ! -f "$f" ]; then
+      release_lock; trap - EXIT
+      echo "error: no activity record for $haid (publish first)" >&2; exit 2
+    fi
+    jq --arg now "$(ts)" '.heartbeat = $now' "$f" | atomic_write "$f"
+    release_lock; trap - EXIT
+    echo "heartbeat bumped for $haid"
+    ;;
+
+  retract)
+    haid=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --haid) haid="${2:?--haid needs a value}"; shift 2 ;;
+        *) echo "error: unknown flag: $1" >&2; exit 2 ;;
+      esac
+    done
+    [ -n "$haid" ] || haid="$(current_haid)"
+    ensure_dirs
+    acquire_lock; trap release_lock EXIT
+    f="$(record_path "$haid")"
+    if [ -f "$f" ]; then
+      rm -f "$f"
+      release_lock; trap - EXIT
+      echo "retracted activity record for $haid"
+    else
+      release_lock; trap - EXIT
+      echo "no activity record for $haid"
+    fi
+    ;;
+
+  list)
+    as_json=""
+    [ "${1:-}" = "--json" ] && as_json=1
+    ensure_dirs
+    files=()
+    for f in "$ACTIVITY_DIR"/*.json; do
+      [ -e "$f" ] || continue
+      record_active "$f" && files+=("$f")
+    done
+    if [ -n "$as_json" ]; then
+      if [ "${#files[@]}" -eq 0 ]; then echo '[]'; else jq -s '.' "${files[@]}"; fi
+      exit 0
+    fi
+    if [ "${#files[@]}" -eq 0 ]; then echo "(no active team activity)"; exit 0; fi
+    echo "ACTIVE TEAM ACTIVITY (${#files[@]})"
+    jq -r '"  \(.human) → \(.active_task)\tbranch:\(.branch)\tagents:\(.agents_running)\thb:\(.heartbeat)\n    files: \(.files_touched | join(", "))"' "${files[@]}"
+    ;;
+
+  show)
+    haid=""; as_json=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --haid) haid="${2:?--haid needs a value}"; shift 2 ;;
+        --json) as_json=1; shift ;;
+        *) echo "error: unknown flag: $1" >&2; exit 2 ;;
+      esac
+    done
+    [ -n "$haid" ] || haid="$(current_haid)"
+    ensure_dirs
+    f="$(record_path "$haid")"
+    if [ ! -f "$f" ]; then
+      [ -n "$as_json" ] && echo 'null' || echo "no activity record for $haid"
+      exit 0
+    fi
+    if [ -n "$as_json" ]; then jq '.' "$f"; else
+      jq -r '"haid: \(.haid)\nhuman: \(.human)\ntask: \(.active_task)\nbranch: \(.branch)\nagents: \(.agents_running)\nttl: \(.ttl_minutes)m\nheartbeat: \(.heartbeat)\nfiles:\n" + (.files_touched | map("  - " + .) | join("\n"))' "$f"
+    fi
+    ;;
+
+  overlap)
+    # INFORMATIONAL overlap: where THIS instance's files_touched intersect a
+    # sibling's. Reuses heimdall-claim's surface-overlap engine (via `claim check`
+    # semantics) but NEVER blocks — it warns and ALWAYS exits 0. P1 is advisory.
+    haid=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --haid) haid="${2:?--haid needs a value}"; shift 2 ;;
+        *) echo "error: unknown flag: $1" >&2; exit 2 ;;
+      esac
+    done
+    [ -n "$haid" ] || haid="$(current_haid)"
+    ensure_dirs
+    f="$(record_path "$haid")"
+    if [ ! -f "$f" ] || ! record_active "$f"; then
+      echo "(no active record for $haid — nothing to compare)"
+      exit 0
+    fi
+    # The overlap test reuses heimdall-claim's surfaces_overlap by sourcing it,
+    # but to avoid coupling to its argv we re-implement the same file-prefix nest
+    # check inline (identical semantics): two surfaces collide when their file
+    # parts overlap (literal equality or directory-prefix nesting either way).
+    surface_file() { printf '%s' "${1%%#*}"; }
+    glob_prefix() {
+      local g="$1"
+      case "$g" in
+        */\*\*) printf '%s' "${g%/\*\*}" ;;
+        \*\*)   printf '%s' "" ;;
+        *\**)   printf '%s' "${g%/*}" ;;
+        *)      printf '%s' "$g" ;;
+      esac
+    }
+    files_overlap() {
+      local a b pa pb; a="$(surface_file "$1")"; b="$(surface_file "$2")"
+      [ "$a" = "$b" ] && return 0
+      pa="$(glob_prefix "$a")"; pb="$(glob_prefix "$b")"
+      [ -z "$pa" ] && return 0
+      [ -z "$pb" ] && return 0
+      case "$b" in "$pa"/*|"$pa") return 0 ;; esac
+      case "$a" in "$pb"/*|"$pb") return 0 ;; esac
+      case "$pb" in "$pa"/*|"$pa") return 0 ;; esac
+      case "$pa" in "$pb"/*|"$pb") return 0 ;; esac
+      return 1
+    }
+    mine=()
+    while IFS= read -r s; do [ -n "$s" ] && mine+=("$s"); done < <(jq -r '.files_touched[]?' "$f" 2>/dev/null)
+    warned=0
+    for of in "$ACTIVITY_DIR"/*.json; do
+      [ -e "$of" ] || continue
+      other_haid="$(jq -r '.haid // empty' "$of" 2>/dev/null || true)"
+      [ -n "$other_haid" ] || continue
+      [ "$other_haid" = "$haid" ] && continue
+      record_active "$of" || continue
+      other_human="$(jq -r '.human // "?"' "$of" 2>/dev/null || echo '?')"
+      other_task="$(jq -r '.active_task // "?"' "$of" 2>/dev/null || echo '?')"
+      while IFS= read -r osurf; do
+        [ -n "$osurf" ] || continue
+        for s in ${mine[@]+"${mine[@]}"}; do
+          if files_overlap "$s" "$osurf"; then
+            printf '⚠ %s'"'"'s agent (%s) is also in %s\n' "$other_human" "$other_task" "$osurf"
+            warned=$((warned + 1))
+          fi
+        done
+      done < <(jq -r '.files_touched[]?' "$of" 2>/dev/null)
+    done
+    if [ "$warned" -eq 0 ]; then
+      echo "clear: no sibling is touching your files"
+    fi
+    exit 0  # ALWAYS 0 — overlap is informational, it NEVER blocks
+    ;;
+
+  reap)
+    ensure_dirs
+    acquire_lock; trap release_lock EXIT
+    before=0
+    for f in "$ACTIVITY_DIR"/*.json; do [ -e "$f" ] && before=$((before + 1)); done
+    reap_expired
+    after=0
+    for f in "$ACTIVITY_DIR"/*.json; do [ -e "$f" ] && after=$((after + 1)); done
+    release_lock; trap - EXIT
+    echo "aged out $((before - after)) expired record(s); $after active record(s) remain"
+    ;;
+
+  *)
+    echo "error: unknown subcommand: $cmd" >&2
+    usage >&2
+    exit 2 ;;
+esac
