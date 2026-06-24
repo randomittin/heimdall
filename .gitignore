@@ -99,6 +99,15 @@ evals/oracles/*/report.json
 # the gitleaks gate over these paths finds nothing (heimdall-collision writes the
 # surface verdict, not the source).
 !.planning/ledger/collisions/
+# TEAM MODE P2 — the gate-verdict store is git-backed shared state, same as the
+# activity store above. P2 (bin/heimdall-gate-surface) republishes SI-2's recorded
+# verdict (gate names + pass/fail/blocked + a receipt loc) — secret-free by
+# construction — into one per-HAID file (.planning/ledger/verdicts/{slug}.json) so
+# a sibling checkout reads "what is PROVEN/BLOCKED where". The chain down to
+# ledger/ is already re-included above; un-ignore the verdicts dir + its records.
+# gitleaks still scans these paths; the summary carries no code/secret (the
+# publisher scrubs every field through the telemetry _scrub discipline).
+!.planning/ledger/verdicts/
 .claude/
 evals/benchmark/results.jsonl
 

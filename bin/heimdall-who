@@ -17,20 +17,25 @@
 # HAID's claim/commit counts. For now it reports identity + liveness, which is
 # the attribution backbone those counts will hang off.
 #
-# TEAM MODE P1 (Shared Awareness): the `team` subcommand JOINs three git-backed
-# stores — the HAID registry (identity + liveness), the claims store, and the new
-# activity store (bin/heimdall-activity) — into one "who's-working-where" view:
-#   "sarah → auth/ (login refactor)   raj → payments/ (3 agents)".
-# It SURFACES an overlap warning (⚠) where two instances touch the same files —
-# INFORMATIONAL, never a block: the team view always exits 0. Solo / feature-off
-# (no activity records, or HEIMDALL_TEAM=off) → the plain default view below is
-# byte-identical to today.
+# TEAM MODE P1+P2 (Shared Awareness + Gate Surface): the `team` subcommand JOINs
+# the git-backed stores — the HAID registry (identity + liveness), the claims
+# store, the activity store (bin/heimdall-activity), AND the gate-verdict store
+# (bin/heimdall-gate-surface) — into one "who's-working-where + what's-PROVEN-where"
+# view:
+#   "sarah → auth/ (login refactor)  ·  PROVEN ✓ (12 gates)
+#    raj   → payments/ (3 agents)    ·  BLOCKED ⛔ (secret-scan, cards.ts:5)
+#    priya → api/ (rate limits)      ·  pending".
+# P1 SURFACES an overlap warning (⚠) where two instances touch the same files;
+# P2 appends each dev's REAL gate verdict (PROVEN/BLOCKED/pending — never a
+# fabricated pass). All INFORMATIONAL, never a block: the team view always exits 0.
+# Solo / feature-off (no activity/verdict records, or HEIMDALL_TEAM=off) → the
+# plain default view below is byte-identical to today.
 #
 # Usage:
 #   heimdall-who                       table: HAID, human, role, status, heartbeat
 #   heimdall-who --json                machine-readable array of the same
 #   heimdall-who --stale-after <secs>  override the staleness window (default 1800)
-#   heimdall-who team [--json]         JOIN agents × claims × activity (P1 view)
+#   heimdall-who team [--json] [--gates]   JOIN agents × claims × activity × verdicts
 #   -h, --help
 #
 # Exit: 0 ok; 2 usage/IO error.
@@ -45,32 +50,60 @@ PLUGIN_DIR="$(cd "$BIN_DIR/.." && pwd)"
 PLANNING_DIR="${HEIMDALL_PLANNING_DIR:-$PLUGIN_DIR/.planning}"
 REGISTRY_FILE="$PLANNING_DIR/ledger/agents.json"
 ACTIVITY_BIN="$BIN_DIR/heimdall-activity"
+GATE_SURFACE_BIN="$BIN_DIR/heimdall-gate-surface"
 HAID_BIN="$BIN_DIR/heimdall-haid"
 
 command -v jq >/dev/null 2>&1 || { echo "error: jq is required" >&2; exit 2; }
 
-usage() { sed -n '2,33p' "$SELF" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,39p' "$SELF" | sed 's/^# \{0,1\}//'; }
 
-# ── TEAM VIEW (P1) — JOIN agents × claims × activity ─────────────────────────
-# Read-only. Delegates the activity read + overlap to bin/heimdall-activity (the
-# one writer/reader of the activity store) so this view never re-derives the
-# store's schema. ALWAYS exits 0 (informational). Graceful with no records.
+# ── TEAM VIEW (P1 + P2) — JOIN agents × claims × activity × VERDICTS ──────────
+# Read-only. Delegates the activity read + overlap to bin/heimdall-activity and
+# the gate-verdict read to bin/heimdall-gate-surface (each is the one writer/reader
+# of its store) so this view never re-derives a store's schema. ALWAYS exits 0
+# (informational). Graceful with no records.
+#
+# P2 GATES column: P1 answered "who is working where"; P2 adds "what is PROVEN
+# where". Each active dev's roster line carries their gate verdict, JOINed by HAID
+# against the verdicts/ store: PROVEN ✓ (N gates) · BLOCKED ⛔ (gate, loc) · or an
+# HONEST "pending" when no verdict has been published yet (never an invented pass).
+# `--gates` is accepted for symmetry with the dossier (`hmd team --gates`) but the
+# verdict is shown unconditionally — the gate surface IS the team wedge.
 team_view() {
-  local as_json=""
+  local as_json="" want_gates=""
   while [ $# -gt 0 ]; do
     case "$1" in
-      --json) as_json=1; shift ;;
+      --json)  as_json=1; shift ;;
+      --gates) want_gates=1; shift ;;
       *) echo "error: unknown argument to team: $1" >&2; exit 2 ;;
     esac
   done
+  : "$want_gates"  # accepted flag; gates are surfaced unconditionally below
   if [ ! -x "$ACTIVITY_BIN" ]; then
     if [ -n "$as_json" ]; then echo '[]'; else echo "(activity reader unavailable — no team view)"; fi
     exit 0
   fi
-  local recs
+  local recs verdicts
   recs="$(HEIMDALL_PLANNING_DIR="$PLANNING_DIR" "$ACTIVITY_BIN" list --json 2>/dev/null || echo '[]')"
+  # Read the git-tracked verdict store (P2). Absent / empty → an empty array, so a
+  # P1-only world (no verdicts published) renders every active dev as "pending".
+  if [ -x "$GATE_SURFACE_BIN" ]; then
+    verdicts="$(HEIMDALL_PLANNING_DIR="$PLANNING_DIR" "$GATE_SURFACE_BIN" list --json 2>/dev/null || echo '[]')"
+  else
+    verdicts='[]'
+  fi
   if [ -n "$as_json" ]; then
-    printf '%s\n' "$recs"
+    # JOIN each activity record with its gate verdict (by HAID) so a JSON consumer
+    # sees the merged "who + what's proven" record. A dev with no verdict carries
+    # gate:{verdict:"pending"} — honest, never a fabricated pass.
+    printf '%s' "$recs" | jq --argjson verdicts "$verdicts" '
+      ($verdicts | map({(.haid): .}) | add // {}) as $vbyhaid
+      | map(. + {gate: (
+          ($vbyhaid[.haid]) as $v
+          | if $v == null then {verdict: "pending"}
+            else {verdict: $v.verdict, gates_total: $v.gates_total,
+                  gates_passed: $v.gates_passed, gates_failed: $v.gates_failed,
+                  failing_gates: ($v.failing_gates // []), loc: $v.loc} end)})'
     exit 0
   fi
   local count
@@ -80,9 +113,20 @@ team_view() {
     exit 0
   fi
   echo "TEAM ACTIVITY ($count working)"
-  printf '%s' "$recs" | jq -r '
-    sort_by(.human)[]
-    | "  \(.human) → \((.files_touched | if length>0 then (.[0] | sub("/\\*\\*$";"/") | sub("#.*$";"")) else "?" end)) (\(.active_task)\(if (.agents_running // 1) > 1 then ", \(.agents_running) agents" else "" end))"
+  # Roster line + GATES column: JOIN activity × verdict by HAID. PROVEN/BLOCKED are
+  # the REAL recorded verdict; a missing verdict is honestly "pending".
+  printf '%s' "$recs" | jq -r --argjson verdicts "$verdicts" '
+    ($verdicts | map({(.haid): .}) | add // {}) as $vbyhaid
+    | sort_by(.human)[]
+    | . as $r
+    | ($vbyhaid[$r.haid]) as $v
+    | ($r.files_touched | if length>0 then (.[0] | sub("/\\*\\*$";"/") | sub("#.*$";"")) else "?" end) as $surface
+    | (if $v == null then "pending"
+       elif $v.verdict == "PROVEN" then "PROVEN ✓ (\($v.gates_passed) gates)"
+       elif $v.verdict == "BLOCKED" then "BLOCKED ⛔ (\(($v.failing_gates // []) | join(", "))\(if $v.loc then ", \($v.loc)" else "" end))"
+       elif $v.verdict == "PENDING" then "pending"
+       else ($v.verdict // "pending") end) as $gate
+    | "  \($r.human) → \($surface) (\($r.active_task)\(if ($r.agents_running // 1) > 1 then ", \($r.agents_running) agents" else "" end))  ·  \($gate)"
   '
   # Overlap warnings: ask the activity reader, per active instance, whether its
   # files intersect a sibling's. Informational — printed under the roster, never
