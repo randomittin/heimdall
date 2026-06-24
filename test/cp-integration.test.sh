@@ -93,3 +93,92 @@ echo "============================================================"
 echo "CONTROL-PLANE END-TO-END INTEGRATION GATE (§11)"
 echo "  home=$HEIMDALL_HOME"
 echo "============================================================"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# #1 THE FLIGHT FIX (CARDINAL, §4/§2) — a client STARTS a server-hosted job, the
+#    CLIENT PROCESS EXITS, the job CONTINUES in a DETACHED OS process (separate
+#    session, parented to the OS — NOT inline start_route), and a FRESH process
+#    reads state=done + the result. Falsifiable: a job killed on client exit reds F2.
+# ──────────────────────────────────────────────────────────────────────────────
+echo
+echo "#1 THE FLIGHT FIX (job survives client disconnect, §4) [CARDINAL]"
+
+# The DETACHED worker: a standalone process that drives ONE job to done off the durable
+# cp_jobstore log. It sleeps first so the CLIENT is provably gone before completion —
+# proving the job does NOT depend on the client connection (the §4 L97 detach contract).
+cat >"$WORK/flight_worker.py" <<'PYEOF'
+import os, sys, time
+sys.path.insert(0, os.environ["LIB"])
+import cp_worker as W
+job_id = sys.argv[1]
+time.sleep(0.5)  # the client surely exits before the job completes.
+W.run_job(job_id, actor_haid="haid:rj.mbp-7f3a",
+          home=os.environ["HEIMDALL_HOME"], checkpoints=2)
+PYEOF
+
+# The CLIENT: enqueues the job, spawns the worker DETACHED (start_new_session=True so
+# killing/exiting the client never kills the worker), prints the job_id + worker pid,
+# then EXITS. After this returns, the client is GONE — the job must still complete.
+cat >"$WORK/flight_client.py" <<'PYEOF'
+import os, sys, subprocess
+sys.path.insert(0, os.environ["LIB"])
+import cp_jobstore as J
+home = os.environ["HEIMDALL_HOME"]
+job_id = J.create_job("run-task-X", {"task_id": "flight-job"},
+                      instance_haid="haid:rj.mbp-7f3a", home=home)
+proc = subprocess.Popen(
+    [sys.executable, os.path.join(os.environ["WORK"], "flight_worker.py"), job_id],
+    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    start_new_session=True,  # DETACH: its own session, parented to the OS not the client.
+)
+print("%s %d" % (job_id, proc.pid))
+PYEOF
+
+WORK="$WORK" "$PY" "$WORK/flight_client.py" >"$WORK/flight.out" 2>"$WORK/flight.err"
+JOB_ID="$(awk '{print $1}' "$WORK/flight.out")"
+WORKER_PID="$(awk '{print $2}' "$WORK/flight.out")"
+WORKER_PIDS="$WORKER_PIDS $WORKER_PID"   # register for reaping in the trap.
+# the CLIENT process has now EXITED — the command above returned, the client is gone.
+if [ -n "$JOB_ID" ] && [ -n "$WORKER_PID" ]; then
+  ok "#1 F1 client started job ($JOB_ID), spawned DETACHED worker (pid $WORKER_PID), then EXITED"
+else
+  bad "#1 F1 client did not return a job_id + detached worker pid"
+  cat "$WORK/flight.err" >&2
+fi
+
+# A FRESH client process (no shared memory with the starter or the worker) polls the
+# durable store until done/timeout — proving the flight fix from a true reconnect.
+cat >"$WORK/flight_poll.py" <<'PYEOF'
+import os, sys, time
+sys.path.insert(0, os.environ["LIB"])
+import cp_jobstore as J
+home = os.environ["HEIMDALL_HOME"]
+job_id = sys.argv[1]
+deadline = time.time() + 12
+state = result_status = None
+while time.time() < deadline:
+    folded = J.read_job(job_id, home)
+    if folded:
+        state = folded.get("state")
+        r = folded.get("result")
+        result_status = r.get("status") if isinstance(r, dict) else r
+        if state in ("done", "cancelled"):
+            break
+    time.sleep(0.1)
+print("%s|%s" % (state, result_status))
+PYEOF
+
+FLIGHT_POLL="$("$PY" "$WORK/flight_poll.py" "$JOB_ID" 2>"$WORK/flight_poll.err")"
+FINAL_STATE="${FLIGHT_POLL%%|*}"
+RESULT_STATUS="${FLIGHT_POLL#*|}"
+[ "$FINAL_STATE" = "done" ] \
+  && ok "#1 F2 a FRESH process reads state=done (job ran server-side after client exit)" \
+  || bad "#1 F2 fresh process did NOT read done (got '$FINAL_STATE') — job died on disconnect"
+[ "$RESULT_STATUS" = "prepared" ] \
+  && ok "#1 F2 the FRESH process reads the job RESULT (status=prepared)" \
+  || bad "#1 F2 result not surfaced to the reconnecting process (got '$RESULT_STATUS')"
+# F3 — falsifiability: `done` was reached by a process that never saw the worker; a
+# build where the job died on client exit would leave it queued/running here (RED).
+[ "$FINAL_STATE" = "done" ] \
+  && ok "#1 F3 FALSIFIABLE: a disconnect-killed job would be non-done here — only a truly server-side job passes" \
+  || bad "#1 F3 not falsifiable"
