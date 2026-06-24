@@ -183,3 +183,33 @@ case "$B1_R1_REASON" in *PostgresStore*|*"no longer"*|*absent*) ok "stale reason
 grep -q '"status":"live"' "$STORE" \
   && ok "stored snapshot still says live → the stale verdict is from the READ re-check, not the store" \
   || bad "store no longer holds the original live snapshot (cannot prove read-time derivation)"
+
+# ═════════════════════════════════════════════════════════════════════════════
+# BLOCK 2 — RECONCILE→GIT-WINS  (conflict resolved by ground truth, dossier §3)
+# ═════════════════════════════════════════════════════════════════════════════
+# Two entries on the shared db/store.py ref: the now-stale Postgres entry (E1, from
+# block 1) and a fresh live MySQL entry (E2). reconcile must let GIT decide: the lone
+# git-live entry (MySQL) wins, decided_by=git, the stale one demoted — no human, no
+# vote. This is the §3 auto-resolve (all-but-one stale → git decides). Genuine intent
+# (>=2 mutually-live) is the only thing that escalates, which §3 reserves for humans.
+echo "BLOCK 2 — RECONCILE→GIT-WINS (conflict decided by git, not a vote):"
+
+# write E2 on the NOW-live MySQL symbol at M → verified live at write.
+mem write --claim "datastore is MySQL, touches db/store.py:MySQLStore" \
+          --commit "$M_SHA" --ref "db/store.py:MySQLStore:class"
+E2_ID="$(jget "['entry']['id']")"
+B2_E2_STATUS="$(jget "['entry']['status']")"
+[ "$B2_E2_STATUS" = "live" ] && ok "fresh MySQL entry written live at M" || bad "MySQL write status=$B2_E2_STATUS (want live)"
+
+# reconcile the stale Postgres entry (E1) against the live MySQL entry (E2). git wins.
+mem reconcile --id "$E1_ID" --id "$E2_ID"
+B2_VERDICT="$(jget "['verdict']")"
+B2_DECIDED="$(jget "['decided_by']")"
+B2_WINNER_SYM="$(jget "['winner']['refs'][0]['symbol']")"
+B2_WINNER_ID="$(jget "['winner']['id']")"
+B2_STALE_N="$(jget "['stale'].__len__()")"
+[ "$B2_VERDICT" = "auto-resolved" ] && ok "verdict=auto-resolved (all-but-one stale → git decides, no human)" || bad "verdict=$B2_VERDICT (want auto-resolved)"
+[ "$B2_DECIDED" = "git" ] && ok "decided_by=git (ground truth, not a vote / not an LLM)" || bad "decided_by=$B2_DECIDED (want git)"
+[ "$B2_WINNER_SYM" = "MySQLStore" ] && ok "winner is the git-live MySQL entry (Postgres demoted)" || bad "winner symbol=$B2_WINNER_SYM (want MySQLStore)"
+[ "$B2_WINNER_ID" = "$E2_ID" ] && ok "winner id is E2 (the live entry), not the stale E1" || bad "winner id=$B2_WINNER_ID (want E2 $E2_ID)"
+[ "$B2_STALE_N" = "1" ] && ok "exactly one entry demoted to stale (the displaced Postgres claim)" || bad "stale set size=$B2_STALE_N (want 1)"
