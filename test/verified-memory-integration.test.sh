@@ -386,3 +386,61 @@ if [ "$B5_SCANNED" = "no" ] && command -v gitleaks >/dev/null 2>&1; then
   B5_SCANNED="yes"
 fi
 [ "$B5_SCANNED" = "no" ] && ok "(no secret scanner installed — the grep-absence assertion above is the hard gate)"
+
+# ═════════════════════════════════════════════════════════════════════════════
+# BLOCK 6 — WEIGHT = READOUT  (a stored weight disagreeing with git is overridden, §1)
+# ═════════════════════════════════════════════════════════════════════════════
+# weight is a READOUT of the git-check, recomputed at READ — never a stored decaying
+# number (dossier §1). Hand-author a store line whose stored weight is a deliberate lie
+# (0.99) and stored status a lie (live), pointing at a symbol that is GONE at HEAD
+# (PostgresStore, removed by the block-1 mutation). The read-time re-verify must OVERRIDE
+# both: status→stale, weight→0 — never the stored 0.99. A deliberately-wrong stored
+# weight cannot leak through the read path.
+echo "BLOCK 6 — WEIGHT = READOUT (stored weight overridden by the read-time git-readout):"
+
+# append a lie line directly to the store: stored weight 0.99 + stored status live, on a
+# symbol git proves gone. (A direct store write — the point is the READ ignores it.)
+LIE_ID="vm-storedweightlie01"
+python3 - "$STORE" "$M_SHA" "$LIE_ID" <<'PY'
+import json, sys
+store, commit, lid = sys.argv[1], sys.argv[2], sys.argv[3]
+line = json.dumps({
+    "id": lid,
+    "claim": "a stored weight is a guess until the git-check recomputes it at read",
+    "commit_ref": commit,
+    "refs": [{"path": "db/store.py", "symbol": "PostgresStore", "kind": "class"}],  # GONE at HEAD
+    "weight": 0.99,                       # the deliberate lie
+    "verified_at": "2020-01-01T00:00:00+00:00",
+    "status": "live",                     # the deliberate lie
+    "provenance": "measured",
+    "schema_version": "vm-1.0",
+}, sort_keys=True, separators=(",", ":"))
+with open(store, "a", encoding="utf-8") as fh:
+    fh.write(line + "\n")
+PY
+
+# 6a. via the memory CLI get: the read-time readout overrides the stored lie.
+mem get --id "$LIE_ID"
+B6_STATUS="$(jget "['status']")"
+B6_WEIGHT="$(jget "['weight']")"
+[ "$B6_STATUS" = "stale" ] && ok "stored status='live' OVERRIDDEN to stale by the read-time git-check (the stored opinion is never trusted)" || bad "status=$B6_STATUS (the stored 'live' leaked through)"
+awk "BEGIN{exit !($B6_WEIGHT == 0 && $B6_WEIGHT != 0.99)}" && ok "weight=$B6_WEIGHT is the read-time readout (0 because git says stale), NOT the stored lie 0.99" || bad "weight=$B6_WEIGHT (the stored 0.99 was not recomputed)"
+
+# 6b. and through the WIRED read path (comprehend recall) the lie is surfaced stale,
+# never ranked among the live — the override holds across the seam, not just in the CLI.
+recall --json
+B6_R_STALE_SYMS="$(printf '%s' "$OUT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(','.join((e.get('refs') or [{}])[0].get('symbol','') for e in d['stale']))" 2>/dev/null)"
+B6_R_LIVE_SYMS="$(printf '%s' "$OUT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(','.join((e.get('refs') or [{}])[0].get('symbol','') for e in d['live']))" 2>/dev/null)"
+case "$B6_R_STALE_SYMS" in *PostgresStore*) ok "the lie surfaces in the STALE set via the read path (PostgresStore is gone at HEAD)";; *) bad "the lie did not appear stale in recall (stale syms: $B6_R_STALE_SYMS)";; esac
+case "$B6_R_LIVE_SYMS" in *PostgresStore*) bad "the lie leaked into the LIVE set via the read path (stored 0.99 was honored)";; *) ok "the lie is NOT in the live set — a deliberately-wrong stored weight cannot leak through the seam";; esac
+
+# ═════════════════════════════════════════════════════════════════════════════
+# FOOTER — the gate verdict (exit 0 iff every block held)
+# ═════════════════════════════════════════════════════════════════════════════
+echo
+if [ "$FAIL" -eq 0 ]; then
+  printf '\033[32mINTEGRATION GATE PASSED — all %d assertions across the 6 wired blocks\033[0m\n' "$PASS"
+  exit 0
+fi
+printf '\033[31mINTEGRATION GATE FAILED — %d/%d assertions failed\033[0m\n' "$FAIL" "$((PASS + FAIL))"
+exit 1
