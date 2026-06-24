@@ -433,3 +433,110 @@ if [ "$(rjget unknown_status)" = "422" ] && [ "$(rjget smuggle_status)" = "422" 
 else
   bad "#4 not falsifiable (arbitrary + valid did not distinguish)"
 fi
+
+# ──────────────────────────────────────────────────────────────────────────────
+# #5 PKI (§3) — instance<->server comms are SIGNED + VERIFIED over the REAL wired
+#    http server (cp_server.serve). A request signed with the registered instance key
+#    is accepted; a FORGED (bad-sig) request and an UNSIGNED request are REJECTED (401)
+#    at the auth chokepoint, before any dispatch. This drives the actual socket, not
+#    just the in-process verify — proving the wired channel is authenticated.
+# ──────────────────────────────────────────────────────────────────────────────
+echo
+echo "#5 PKI (instance<->server signed+verified over the REAL http server, §3)"
+
+PKI_OUT="$WORK/pki.out"
+LIB="$LIB" "$PY" - >"$PKI_OUT" 2>"$WORK/pki.err" <<'PYEOF'
+import json, os, sys, threading, time
+import urllib.request, urllib.error
+sys.path.insert(0, os.environ["LIB"])
+import cp_auth as K
+import cp_server as S
+home = os.environ["HEIMDALL_HOME"]
+out = {}
+
+if not K.crypto_available():
+    # graceful-degrade: the module loaded, reports unavailable, does not crash.
+    out["crypto_available"] = False
+    try:
+        K.generate_keypair()
+        out["degrade_ok"] = False
+    except K.AuthError as e:
+        out["degrade_ok"] = (e.reason == "crypto_unavailable")
+    sys.stdout.write(json.dumps(out)); sys.exit(0)
+
+out["crypto_available"] = True
+out["backend"] = K.backend_name()
+
+# register a REAL ephemeral instance key with the server's key registry.
+haid = "haid:rj.instance-pki"
+priv, pub = K.generate_keypair()
+K.register_key(haid, pub, home=home)
+
+# bind a free port + start the WIRED server in a background thread (revocation off so
+# we exercise PURE PKI — no agents.json CLI dependency; the dossier's documented flag).
+import http.server, socket
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+sock.bind(("127.0.0.1", 0))
+port = sock.getsockname()[1]
+sock.close()
+
+handler_cls = S._build_handler_class(home, False)  # enforce_revocation=False (pure PKI)
+httpd = http.server.HTTPServer(("127.0.0.1", port), handler_cls)
+t = threading.Thread(target=httpd.serve_forever, daemon=True)
+t.start()
+time.sleep(0.2)
+base = "http://127.0.0.1:%d" % port
+
+
+def post_dispatch(body_bytes, *, haid_hdr=None, sig=None):
+    req = urllib.request.Request(base + "/dispatch", data=body_bytes, method="POST")
+    if haid_hdr is not None:
+        req.add_header("X-Heimdall-HAID", haid_hdr)
+    if sig is not None:
+        req.add_header("X-Heimdall-Signature", sig)
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status, resp.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+
+
+body = json.dumps({"action_type": "sync-queue", "params": {"queue": "issue"}}).encode()
+
+# (a) a SIGNED request with the registered key -> accepted (the dispatch runs, 200).
+msg = K.canonical_message("POST", "/dispatch", body)
+sig = K.sign(priv, msg)
+st_ok, _ = post_dispatch(body, haid_hdr=haid, sig=sig)
+out["signed_status"] = st_ok           # 200 (authenticated + dispatched)
+
+# (b) a FORGED request — a signature over DIFFERENT bytes -> 401 bad_signature.
+forged_sig = K.sign(priv, K.canonical_message("POST", "/dispatch", b'{"x":"other"}'))
+st_forged, _ = post_dispatch(body, haid_hdr=haid, sig=forged_sig)
+out["forged_status"] = st_forged       # 401
+
+# (c) an UNSIGNED request (no signature header) -> 401 missing_signature.
+st_unsigned, _ = post_dispatch(body, haid_hdr=haid, sig=None)
+out["unsigned_status"] = st_unsigned   # 401
+
+# (d) an UNKNOWN HAID (no registered key) with a sig -> 401 unknown_haid.
+st_unknown, _ = post_dispatch(body, haid_hdr="haid:nobody.unregistered", sig=sig)
+out["unknown_haid_status"] = st_unknown  # 401
+
+httpd.shutdown()
+httpd.server_close()
+sys.stdout.write(json.dumps(out))
+PYEOF
+
+[ -s "$PKI_OUT" ] || { echo "FATAL: PKI harness produced no output" >&2; cat "$WORK/pki.err" >&2; exit 2; }
+pjget() { "$PY" -c "import json; print(json.load(open('$PKI_OUT')).get('$1'))"; }
+
+if [ "$(pjget crypto_available)" = "True" ]; then
+  [ "$(pjget signed_status)" = "200" ] \
+    && ok "#5 a SIGNED request (registered key) is accepted over the real server (backend: $(pjget backend))" \
+    || bad "#5 a valid signed request was not accepted ($(pjget signed_status))"
+  [ "$(pjget forged_status)" = "401" ] && ok "#5 a FORGED (bad-sig) request is REJECTED (401)" || bad "#5 forged request not rejected ($(pjget forged_status))"
+  [ "$(pjget unsigned_status)" = "401" ] && ok "#5 an UNSIGNED request is REJECTED (401)" || bad "#5 unsigned request not rejected ($(pjget unsigned_status))"
+  [ "$(pjget unknown_haid_status)" = "401" ] && ok "#5 an UNKNOWN-HAID request is REJECTED (401)" || bad "#5 unknown-HAID request not rejected ($(pjget unknown_haid_status))"
+else
+  [ "$(pjget degrade_ok)" = "True" ] && ok "#5 (degrade) no crypto lib -> graceful crypto_unavailable, no crash" || bad "#5 (degrade) did not degrade gracefully"
+fi
