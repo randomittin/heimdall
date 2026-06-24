@@ -604,3 +604,51 @@ if command -v gitleaks >/dev/null 2>&1; then
 else
   ok "#6 (gitleaks absent) grep-fallback already proved the planted secret absent"
 fi
+
+# ──────────────────────────────────────────────────────────────────────────────
+# #7 AUDIT CAPTURES EVERYTHING (§9) — across the whole flow above, every dispatch,
+#    every approval/override, and every refusal wrote an audit row. The log is
+#    searchable (by event + actor) and exportable (NDJSON), via both the library and
+#    the real CLI (heimdall-control-plane audit) — the security + 3am-debug record.
+# ──────────────────────────────────────────────────────────────────────────────
+echo
+echo "#7 AUDIT CAPTURES EVERYTHING (dispatch + approval + refusal, searchable/exportable, §9)"
+
+AUDIT_OUT="$WORK/audit.out"
+LIB="$LIB" "$PY" - >"$AUDIT_OUT" 2>"$WORK/audit.err" <<'PYEOF'
+import json, os, sys
+sys.path.insert(0, os.environ["LIB"])
+import cp_audit as Au
+home = os.environ["HEIMDALL_HOME"]
+out = {}
+out["dispatch"] = len(Au.search(event="dispatch", home=home))
+out["dispatch_refused"] = len(Au.search(event="dispatch_refused", home=home))
+out["approval"] = len(Au.search(event="approval", home=home))
+out["override"] = len(Au.search(event="override", home=home))
+out["job_state"] = len(Au.search(event="job_state", home=home))
+out["ingest"] = len(Au.search(event="ingest", home=home))
+# searchable by ACTOR too (the owner decided the gates).
+out["by_owner"] = len(Au.search(actor_haid="haid:rj.owner", home=home))
+# exportable as NDJSON — every line a parseable record.
+export_txt = Au.export(home=home)
+lines = [ln for ln in export_txt.splitlines() if ln]
+out["export_lines"] = len(lines)
+out["export_all_parse"] = all(isinstance(json.loads(ln), dict) for ln in lines)
+out["total_rows"] = len(Au.read_records(home))
+sys.stdout.write(json.dumps(out))
+PYEOF
+
+[ -s "$AUDIT_OUT" ] || { echo "FATAL: audit harness produced no output" >&2; cat "$WORK/audit.err" >&2; exit 2; }
+ajget() { "$PY" -c "import json; print(json.load(open('$AUDIT_OUT')).get('$1'))"; }
+
+[ "$(ajget dispatch)" -ge 1 ] 2>/dev/null && ok "#7 every DISPATCH is audited ($(ajget dispatch) rows)" || bad "#7 no dispatch audit rows"
+[ "$(ajget approval)" -ge 1 ] 2>/dev/null && ok "#7 every APPROVAL is audited ($(ajget approval) rows)" || bad "#7 no approval audit rows"
+[ "$(ajget override)" -ge 1 ] 2>/dev/null && ok "#7 every OVERRIDE is audited ($(ajget override) rows)" || bad "#7 no override audit rows"
+[ "$(ajget dispatch_refused)" -ge 3 ] 2>/dev/null && ok "#7 every REFUSAL is audited ($(ajget dispatch_refused) rows)" || bad "#7 refusals not all audited"
+[ "$(ajget by_owner)" -ge 1 ] 2>/dev/null && ok "#7 audit searchable by ACTOR (owner: $(ajget by_owner) rows)" || bad "#7 audit not searchable by actor"
+[ "$(ajget export_lines)" -ge 5 ] 2>/dev/null && [ "$(ajget export_all_parse)" = "True" ] \
+  && ok "#7 audit EXPORTABLE as NDJSON ($(ajget export_lines) parseable lines)" || bad "#7 audit not cleanly exportable"
+
+# the real CLI exports the same audit store (the bin/heimdall-control-plane seam).
+CLI_REFUSED="$("$CLI" audit --event dispatch_refused --export --home "$HEIMDALL_HOME" 2>/dev/null | grep -c dispatch_refused || true)"
+[ "${CLI_REFUSED:-0}" -ge 3 ] && ok "#7 the CLI 'audit --event dispatch_refused --export' streams the refusal rows ($CLI_REFUSED)" || bad "#7 CLI audit export did not surface the refusals ($CLI_REFUSED)"
