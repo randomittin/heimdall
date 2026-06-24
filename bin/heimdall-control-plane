@@ -28,6 +28,17 @@
 #       Search the append-only audit log (§9); --export streams matching rows as
 #       NDJSON. Searchable + exportable, the security + 3am-debug record.
 #
+#   heimdall-control-plane jobs [--json] [--home DIR]
+#       List every server-hosted job + its durable replayed state (§4). Read-only.
+#   heimdall-control-plane schedules [--json] [--home DIR]
+#       List stored cron schedules fired by the per-minute tick driver (§6). Read-only.
+#   heimdall-control-plane approvals [--json] [--home DIR]
+#       List the pending owner-gate queue (§7). Read-only — never decides.
+#   heimdall-control-plane notify [--haid HAID] [--json] [--home DIR]
+#       Poll an instance's notification inbox (§8): DATA only, never a command.
+#   heimdall-control-plane dashboard [--json] [--home DIR]
+#       The cross-dev observe roll-up (§5). Read-only.
+#
 #   -h, --help
 #
 # Conventions (match bin/ — bash + python3, graceful when a dep is absent):
@@ -47,7 +58,7 @@ BIN_DIR="$(cd "$(dirname "$SELF")" && pwd)"
 LIB_DIR="$BIN_DIR/lib"
 HAID_CLI="$BIN_DIR/heimdall-haid"
 
-usage() { sed -n '2,45p' "$SELF" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,55p' "$SELF" | sed 's/^# \{0,1\}//'; }
 
 PY="$(command -v python3 || command -v python || true)"
 if [ -z "$PY" ]; then
@@ -75,9 +86,11 @@ SINCE=""
 UNTIL=""
 EXPORT=""
 NO_REVOCATION=""
+JSON=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
+    --json)        JSON="1"; shift ;;
     --host)        HOST="${2:?--host needs a value}"; shift 2 ;;
     --port)        PORT="${2:?--port needs a value}"; shift 2 ;;
     --home)        HOME_DIR="${2:?--home needs a dir}"; shift 2 ;;
@@ -201,6 +214,106 @@ if os.environ.get("EXPORT"):
 else:
     rows = cp_audit.search(home, **filters) if filters else cp_audit.read_records(home)
     sys.stdout.write(json.dumps(rows, indent=2, sort_keys=True) + "\n")
+PYEOF
+    ;;
+
+  jobs)
+    # Read-only view of every server-hosted job + its durable state (§4). The state is
+    # replayed from the append-only log, the same view the running server serves.
+    LIB_DIR="$LIB_DIR" HOME_DIR="$HOME_DIR" JSON="$JSON" "$PY" - <<'PYEOF'
+import json, os, sys
+sys.path.insert(0, os.environ["LIB_DIR"])
+import cp_jobstore
+home = os.environ.get("HOME_DIR") or None
+rows = cp_jobstore.list_jobs(home)
+if os.environ.get("JSON"):
+    sys.stdout.write(json.dumps(rows, indent=2, sort_keys=True) + "\n")
+elif not rows:
+    sys.stdout.write("no jobs yet\n")
+else:
+    for j in rows:
+        sys.stdout.write("%s  %-9s  %s\n"
+                         % (j.get("job_id", "?"), j.get("state", "?"),
+                            j.get("action_type", "?")))
+PYEOF
+    ;;
+
+  schedules)
+    # Read-only view of stored cron schedules (§6). Each fires its allowlisted dispatch
+    # autonomously via the server's per-minute tick driver.
+    LIB_DIR="$LIB_DIR" HOME_DIR="$HOME_DIR" JSON="$JSON" "$PY" - <<'PYEOF'
+import json, os, sys
+sys.path.insert(0, os.environ["LIB_DIR"])
+import cp_scheduler
+home = os.environ.get("HOME_DIR") or None
+rows = cp_scheduler.list_schedules(home)
+if os.environ.get("JSON"):
+    sys.stdout.write(json.dumps(rows, indent=2, sort_keys=True) + "\n")
+elif not rows:
+    sys.stdout.write("no schedules yet\n")
+else:
+    for s in rows:
+        sys.stdout.write("%s  %-12s  %-10s  %s\n"
+                         % (s.get("schedule_id", "?"), s.get("cron", "?"),
+                            "enabled" if s.get("enabled") else "disabled",
+                            s.get("action_type", "?")))
+PYEOF
+    ;;
+
+  approvals)
+    # Read-only view of the pending owner-gate queue (§7): irreversible dispatches
+    # waiting on an owner approve/reject. Read-only — never decides.
+    LIB_DIR="$LIB_DIR" HOME_DIR="$HOME_DIR" JSON="$JSON" "$PY" - <<'PYEOF'
+import json, os, sys
+sys.path.insert(0, os.environ["LIB_DIR"])
+import cp_approval
+home = os.environ.get("HOME_DIR") or None
+rows = cp_approval.list_pending(home)
+if os.environ.get("JSON"):
+    sys.stdout.write(json.dumps(rows, indent=2, sort_keys=True) + "\n")
+elif not rows:
+    sys.stdout.write("no pending approvals\n")
+else:
+    for a in rows:
+        sys.stdout.write("%s  %-18s  by %s\n"
+                         % (a.get("approval_id", "?"), a.get("action_type", "?"),
+                            a.get("requested_by", "?")))
+PYEOF
+    ;;
+
+  notify)
+    # Read-only poll of an instance's notification inbox (§8): DATA only, never a
+    # command. Polls the resolved instance HAID (or --haid).
+    TARGET_HAID="$(resolve_haid)"
+    LIB_DIR="$LIB_DIR" HOME_DIR="$HOME_DIR" JSON="$JSON" TARGET_HAID="$TARGET_HAID" \
+    "$PY" - <<'PYEOF'
+import json, os, sys
+sys.path.insert(0, os.environ["LIB_DIR"])
+import cp_notify
+home = os.environ.get("HOME_DIR") or None
+target = os.environ["TARGET_HAID"]
+rows = cp_notify.poll(target, home)
+if os.environ.get("JSON"):
+    sys.stdout.write(json.dumps(rows, indent=2, sort_keys=True) + "\n")
+elif not rows:
+    sys.stdout.write("no notifications for %s\n" % target)
+else:
+    for n in rows:
+        sys.stdout.write("%s  %s\n" % (n.get("kind", "?"), json.dumps(n.get("data", {}))))
+PYEOF
+    ;;
+
+  dashboard)
+    # The cross-dev observe roll-up (§5). Delegates to the dashboard lib CLI; --json
+    # for the structured view, text otherwise. Read-only.
+    DASH_ARGS=()
+    [ -n "$JSON" ] && DASH_ARGS+=(--json)
+    [ -n "$HOME_DIR" ] && DASH_ARGS+=(--home "$HOME_DIR")
+    LIB_DIR="$LIB_DIR" "$PY" - "${DASH_ARGS[@]}" <<'PYEOF'
+import os, sys
+sys.path.insert(0, os.environ["LIB_DIR"])
+import cp_dashboard
+sys.exit(cp_dashboard._cli(sys.argv[1:]))
 PYEOF
     ;;
 
