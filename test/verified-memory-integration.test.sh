@@ -213,3 +213,51 @@ B2_STALE_N="$(jget "['stale'].__len__()")"
 [ "$B2_WINNER_SYM" = "MySQLStore" ] && ok "winner is the git-live MySQL entry (Postgres demoted)" || bad "winner symbol=$B2_WINNER_SYM (want MySQLStore)"
 [ "$B2_WINNER_ID" = "$E2_ID" ] && ok "winner id is E2 (the live entry), not the stale E1" || bad "winner id=$B2_WINNER_ID (want E2 $E2_ID)"
 [ "$B2_STALE_N" = "1" ] && ok "exactly one entry demoted to stale (the displaced Postgres claim)" || bad "stale set size=$B2_STALE_N (want 1)"
+
+# ═════════════════════════════════════════════════════════════════════════════
+# BLOCK 3 — READ-PATH WIRED  (SI-1 capsule surfaces git-verified memory, dossier §6 D)
+# ═════════════════════════════════════════════════════════════════════════════
+# The cross-piece seam: heimdall-comprehend recall reads the SAME store (via
+# HEIMDALL_HOME) that heimdall-memory wrote, and surfaces each remembered claim WITH its
+# git-verified status — LIVE shown live, STALE shown stale (NEVER served as live). Read-
+# time re-verification runs inside the read path, so the now-stale Postgres claim is
+# surfaced stale and the live MySQL claim is surfaced live. And the no-regression half:
+# an ABSENT store → recall is identical to today (a clean install is unaffected).
+echo "BLOCK 3 — READ-PATH WIRED (heimdall-comprehend recall surfaces verified memory):"
+
+# 3a. recall --json over the populated, shared store → available, with the live/stale
+# partition computed at READ time (disjoint by construction).
+recall --json
+B3_AVAIL="$(jget "['available']")"
+B3_LIVE_N="$(jget "['counts']['live']")"
+B3_STALE_N="$(jget "['counts']['stale']")"
+B3_LIVE_SYM="$(jget "['live'][0]['refs'][0]['symbol']")"
+B3_LIVE_STATUS="$(jget "['live'][0]['status']")"
+B3_STALE_STATUS="$(jget "['stale'][0]['status']")"
+[ "$RC" -eq 0 ] && ok "recall exit 0 over the shared store" || bad "recall exit $RC (want 0)"
+[ "$B3_AVAIL" = "True" ] && ok "recall available=True (the seam: comprehend resolved the memory CLI's store via HEIMDALL_HOME)" || bad "recall available=$B3_AVAIL (want True — the seam did not connect)"
+[ "$B3_LIVE_N" = "1" ] && ok "1 live entry surfaced (the MySQL claim, git-confirmed)" || bad "live count=$B3_LIVE_N (want 1)"
+[ "$B3_STALE_N" = "1" ] && ok "1 stale entry surfaced MARKED stale (the displaced Postgres claim)" || bad "stale count=$B3_STALE_N (want 1)"
+[ "$B3_LIVE_SYM" = "MySQLStore" ] && ok "the live-set entry targets the git-live MySQLStore" || bad "live entry symbol=$B3_LIVE_SYM (want MySQLStore)"
+[ "$B3_LIVE_STATUS" = "live" ] && ok "live entry shown WITH status=live (read-time readout)" || bad "live entry status=$B3_LIVE_STATUS (want live)"
+[ "$B3_STALE_STATUS" = "stale" ] && ok "stale entry shown WITH status=stale — never promoted into the live set (disjoint by construction)" || bad "stale entry status=$B3_STALE_STATUS (want stale)"
+
+# 3b. the rendered capsule block (text mode) visibly separates LIVE from STALE so the
+# agent treats a stale memory as stale (verify against ground truth before acting).
+recall
+B3_TEXT="$OUT"
+printf '%s' "$B3_TEXT" | grep -q "LIVE — git-confirmed" && ok "capsule block renders a LIVE section (git-confirmed survivors)" || bad "capsule block missing the LIVE section"
+printf '%s' "$B3_TEXT" | grep -q "do NOT act on them" && ok "capsule block renders the STALE warning (do NOT act on stale memory)" || bad "capsule block missing the STALE warning"
+printf '%s' "$B3_TEXT" | grep -qi "MySQLStore" && ok "capsule surfaces the live MySQL claim by its ref" || bad "capsule does not surface the live MySQL ref"
+
+# 3c. NO-REGRESSION — an ABSENT store → recall behaves EXACTLY as today (a clean install
+# is unaffected). Point HEIMDALL_HOME at an empty home with no memory store: available
+# must be False and the text block the honest one-line 'none' note, exit 0 (no crash).
+EMPTY_HOME="$WORK/empty-home"
+mkdir -p "$EMPTY_HOME"
+B3_ABS_JSON="$(HEIMDALL_HOME="$EMPTY_HOME" "$COMPREHEND" recall "$GR" --json 2>/dev/null)"; B3_ABS_RC=$?
+B3_ABS_AVAIL="$(printf '%s' "$B3_ABS_JSON" | python3 -c "import sys,json;print(json.load(sys.stdin)['available'])" 2>/dev/null)"
+B3_ABS_TEXT="$(HEIMDALL_HOME="$EMPTY_HOME" "$COMPREHEND" recall "$GR" 2>/dev/null)"
+[ "$B3_ABS_RC" -eq 0 ] && ok "absent-store recall exit 0 (no crash on a clean install)" || bad "absent-store recall exit $B3_ABS_RC (want 0)"
+[ "$B3_ABS_AVAIL" = "False" ] && ok "absent store → available=False (identical to today, no regression)" || bad "absent-store available=$B3_ABS_AVAIL (want False)"
+printf '%s' "$B3_ABS_TEXT" | grep -q "none" && ok "absent store → the honest one-line 'none' block (additive note, not a section)" || bad "absent store did not render the 'none' note"
