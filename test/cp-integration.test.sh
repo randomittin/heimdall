@@ -540,3 +540,67 @@ if [ "$(pjget crypto_available)" = "True" ]; then
 else
   [ "$(pjget degrade_ok)" = "True" ] && ok "#5 (degrade) no crypto lib -> graceful crypto_unavailable, no crash" || bad "#5 (degrade) did not degrade gracefully"
 fi
+
+# ──────────────────────────────────────────────────────────────────────────────
+# #6 NO-SECRET (§5/§9) — a RUNTIME-ASSEMBLED secret pushed via ingest is scrubbed at
+#    the boundary (build_event re-run server-side) so it never enters the observe
+#    store; and gitleaks over the whole control-plane store tree (observe + audit +
+#    jobs + approvals + notify) is CLEAN — no secret by construction AND by gate.
+# ──────────────────────────────────────────────────────────────────────────────
+echo
+echo "#6 NO-SECRET (planted secret scrubbed at ingest; stores gitleaks-clean, §5/§9)"
+
+INGEST_OUT="$WORK/ingest.out"
+PLANTED_SECRET="$PLANTED_SECRET" LIB="$LIB" "$PY" - >"$INGEST_OUT" 2>"$WORK/ingest.err" <<'PYEOF'
+import json, os, sys
+sys.path.insert(0, os.environ["LIB"])
+import cp_ingest as I
+home = os.environ["HEIMDALL_HOME"]
+secret = os.environ["PLANTED_SECRET"]
+haid = "haid:rj.instance-observe"
+out = {}
+
+# push a batch of telemetry events with the planted secret jammed into free-ish fields.
+# the server RE-RUNS build_event + _scrub on each line — the secret must NOT survive.
+events = [
+    {"event_type": "token", "run_id": "r1", "tokens": {"in": 10, "out": 5},
+     "extra": {"leak": "token is %s right here" % secret}},
+    {"event_type": "outcome", "run_id": "r1", "outcome": "ok",
+     "error": {"class": "X", "msg": "secret %s in the message" % secret}},
+]
+res = I.ingest_batch(haid, events, home=home)
+out["received"] = res["received"]
+out["stored"] = res["stored"]
+
+# read the stored partition back: the planted secret must be ABSENT (scrubbed at boundary).
+stored = I.read_instance(haid, home)
+blob = json.dumps(stored)
+out["secret_in_observe_store"] = (secret in blob)
+out["observe_lines"] = len(stored)
+
+sys.stdout.write(json.dumps(out))
+PYEOF
+
+[ -s "$INGEST_OUT" ] || { echo "FATAL: ingest harness produced no output" >&2; cat "$WORK/ingest.err" >&2; exit 2; }
+ijget() { "$PY" -c "import json; print(json.load(open('$INGEST_OUT')).get('$1'))"; }
+
+[ "$(ijget stored)" -ge 1 ] 2>/dev/null && ok "#6 the ingest batch stored events ($(ijget stored)/$(ijget received)) — the boundary accepted on-schema lines" || bad "#6 ingest stored nothing"
+[ "$(ijget secret_in_observe_store)" = "False" ] && ok "#6 the RUNTIME-ASSEMBLED secret is SCRUBBED/ABSENT from the observe store" || bad "#6 the planted secret leaked into the observe store"
+
+# the planted secret must also be ABSENT from EVERY control-plane store on disk.
+if grep -rqF "$PLANTED_SECRET" "$CP_HOME" 2>/dev/null; then
+  bad "#6 the planted secret is present somewhere under the control-plane store tree"
+else
+  ok "#6 the planted secret is absent from EVERY control-plane store (grep over the tree)"
+fi
+
+# gitleaks over the whole control-plane store tree -> CLEAN (the secret gate stays armed).
+if command -v gitleaks >/dev/null 2>&1; then
+  if gitleaks detect --no-git --source "$CP_HOME" >/dev/null 2>&1; then
+    ok "#6 gitleaks detect over the control-plane stores -> CLEAN"
+  else
+    bad "#6 gitleaks found a secret in the control-plane stores"
+  fi
+else
+  ok "#6 (gitleaks absent) grep-fallback already proved the planted secret absent"
+fi
