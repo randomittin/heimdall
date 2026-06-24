@@ -332,3 +332,57 @@ B4_DECAY_VERDICT="$(printf '%s' "$B4_JSON" | python3 -c "import sys,json;print(j
 [ "$B4_LLM_VERDICT" = "null-tie" ] && ok "llm-judge verdict=null-tie (honest: verified-memory ties, does not beat, the double here)" || bad "llm-judge verdict=$B4_LLM_VERDICT (want null-tie)"
 [ "$B4_DECAY_VERDICT" = "verified-memory-wins" ] && ok "decay verdict=verified-memory-wins (a measured, real win where it exists)" || bad "decay verdict=$B4_DECAY_VERDICT (want verified-memory-wins)"
 printf '%s' "$B4_TABLE" | grep -q "NULL NOTE" && ok "the table prints the NULL NOTE — the honest finding is surfaced in the human output" || bad "table did not print the NULL NOTE"
+
+# ═════════════════════════════════════════════════════════════════════════════
+# BLOCK 5 — PRIVACY  (no-secret-by-construction; CARDINAL: secret-absent from the store)
+# ═════════════════════════════════════════════════════════════════════════════
+# A credential must not enter the memory store BY CONSTRUCTION (dossier §7): every claim
+# field passes the telemetry _scrub shape gate at write, so a secret-shaped claim is
+# REJECTED (exit 3), never stored. The planted token is RUNTIME-ASSEMBLED from
+# individually-non-matching fragments (heimdall-fixture-secret-convention.md) so THIS
+# test source + git history stay gitleaks-clean while the runtime value is a real match
+# the gate must catch.
+echo "BLOCK 5 — PRIVACY (runtime-assembled secret REJECTED + absent; CARDINAL secret-absent):"
+
+# RUNTIME-ASSEMBLE a GitHub-PAT-shaped token (ghp_ + 36 chars). No fragment is itself a
+# gitleaks match; only the concatenation forms the detectable token. Never a static
+# literal in source (the convention's gate-proof pattern).
+_GP_PRE="ghp_"; _GP_A="0123456789abcdefghij"; _GP_B="klmnopqrstuvwxyz0123"
+SECRET="${_GP_PRE}${_GP_A}${_GP_B}"   # ghp_ + 40 chars assembled at runtime → a real PAT match
+
+# the store byte-length BEFORE the planted write — to prove nothing was appended.
+B5_BEFORE_BYTES="$(wc -c < "$STORE" 2>/dev/null | tr -d ' ')"
+
+# attempt to write a claim carrying the secret — the _scrub gate must REJECT it (exit 3).
+mem write --claim "leaked deploy token is $SECRET embedded in db/store.py" \
+          --commit "$M_SHA" --ref "db/store.py:MySQLStore:class"
+B5_OK="$(jget "['ok']")"
+B5_REASON="$(jget "['reason']")"
+[ "$B5_OK" = "False" ] && ok "secret-shaped claim REJECTED (ok=False) — not stored with the secret quietly removed" || bad "secret claim ok=$B5_OK (want False — a credential entered the store)"
+[ "$RC" -eq 3 ] && ok "exit 3 (the honest secret/shape-gate refusal, distinct from a disk error's exit 2)" || bad "exit $RC (want 3 for a gate rejection)"
+case "$B5_REASON" in *gate*) ok "rejection reason names the secret/shape gate";; *) bad "reason=$B5_REASON (want a gate reason)";; esac
+
+# CARDINAL — the secret is ABSENT from the store. The grep is the hard assertion.
+if grep -q "$SECRET" "$STORE" 2>/dev/null; then
+  bad "CARDINAL FAIL: the secret token IS present in the store — gitleaks would fire"
+else
+  ok "CARDINAL: the secret token is ABSENT from the store (no-secret-by-construction)"
+fi
+
+# the rejected write appended NOTHING — the store is byte-identical to before.
+B5_AFTER_BYTES="$(wc -c < "$STORE" 2>/dev/null | tr -d ' ')"
+[ "$B5_BEFORE_BYTES" = "$B5_AFTER_BYTES" ] && ok "the rejected write appended ZERO bytes (store unchanged: $B5_AFTER_BYTES)" || bad "store grew on a rejected write ($B5_BEFORE_BYTES → $B5_AFTER_BYTES)"
+
+# belt-and-braces: a real secret scanner over the store exits clean. Prefer the repo
+# scanner, fall back to gitleaks, skip honestly if neither is installed (the grep above
+# is the hard gate; the scanner is the confirmation).
+B5_SCANNED="no"
+if [ -x "$REPO/bin/secret-scan" ]; then
+  if "$REPO/bin/secret-scan" "$STORE" >/dev/null 2>&1; then ok "bin/secret-scan over the store exits clean"; else bad "bin/secret-scan flagged the store"; fi
+  B5_SCANNED="yes"
+fi
+if [ "$B5_SCANNED" = "no" ] && command -v gitleaks >/dev/null 2>&1; then
+  if gitleaks detect --no-git --source "$STORE" >/dev/null 2>&1; then ok "gitleaks detect over the store exits clean"; else bad "gitleaks detect flagged the store"; fi
+  B5_SCANNED="yes"
+fi
+[ "$B5_SCANNED" = "no" ] && ok "(no secret scanner installed — the grep-absence assertion above is the hard gate)"
