@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 import time
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -422,15 +423,47 @@ def _job_id_from(request, payload):
     return None
 
 
+def _detach_run(runner, job_id, *, actor_haid=None, home=None, base_env=None):
+    """Drive ONE job off the durable record in a BACKGROUND daemon thread — THE FLIGHT
+    FIX's detach (§4 L97). start_route returns the job_id to the (possibly disconnecting)
+    client the instant this thread is launched; the thread runs the job to completion
+    against the same fsync'd cp_jobstore log, so a reconnecting client reads status=done.
+
+    A thread (NOT a forked subprocess) is deliberate: every transition the runner drives
+    stays in THIS process's durable jobstore writes — one store, one fsync discipline, no
+    cross-process log interleave. daemon=True so a hosting process can exit without the
+    thread pinning it; the durable log is the source of truth, and resume_orphans re-drives
+    anything left `running` after a restart.
+
+    The runner's refusal paths (ActionRefused / IsolationRefused / IllegalTransition) and
+    any handler fault are ALREADY durably recorded + audited by run_job before they
+    propagate — so the thread target swallows them: there is no client socket left to
+    surface them on, and re-raising would only spam an uncaught-thread-exception to stderr.
+    The job's outcome lives in the log, which is the contract."""
+    def _target():
+        try:
+            runner(job_id, actor_haid=actor_haid, home=home, base_env=base_env)
+        except (ActionRefused, IsolationRefused, jobstore.IllegalTransition):
+            return  # already audited + durably recorded by run_job; no socket to raise on.
+        except Exception:  # noqa: BLE001 — a handler fault is audited in run_job; the
+            return         # job state reflects it. Don't crash the daemon thread.
+
+    t = threading.Thread(
+        target=_target, name="cp-job-%s" % job_id, daemon=True)
+    t.start()
+    return t
+
+
 def start_route(identity, request, *, home=None, base_env=None, run=None):
     """POST /jobs — START a server-hosted job. Validates action_type+params through the
     §1 allowlist, ENQUEUES a durable job (cp_jobstore.create_job), and returns the
     job_id IMMEDIATELY. THE FLIGHT FIX: the client may disconnect the moment it has the
     job_id — the worker runs the job server-side off the durable record.
 
-    `run` is the worker entry the server schedules (default run_job); the server passes
-    a thread-scheduling wrapper so start returns without blocking on the job. A bad
-    action_type / smuggled command is refused HERE (422) before any job is created."""
+    `run` is the worker entry that drives the job (default run_job); start_route itself
+    detaches it onto a background daemon thread (_detach_run) so this handler returns
+    WITHOUT blocking on the job — an override is for tests that inject an alternate runner.
+    A bad action_type / smuggled command is refused HERE (422) before any job is created."""
     actor = _haid_of(identity)
     payload = _json_body(request)
     action_type = payload.get("action_type")
@@ -448,8 +481,11 @@ def start_route(identity, request, *, home=None, base_env=None, run=None):
         return cp_server.Response(500, {"error": "job_store_unavailable"})
     cp_audit.write("job_state", actor_haid=actor, action_type=action_type,
                    job_id=job_id, outcome="ok", detail="queued", home=home)
+    # THE DETACH (§4 L97): drive the job in a BACKGROUND daemon thread so this HTTP
+    # handler returns the job_id IMMEDIATELY — the client may disconnect the instant it
+    # has the id while the worker runs the job to completion against the durable store.
     runner = run if run is not None else run_job
-    runner(job_id, actor_haid=actor, home=home, base_env=base_env)
+    _detach_run(runner, job_id, actor_haid=actor, home=home, base_env=base_env)
     return cp_server.Response(
         200, {"started": True, "job_id": job_id, "state": jobstore.STATE_QUEUED})
 
