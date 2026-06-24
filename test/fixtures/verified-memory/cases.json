@@ -1,0 +1,150 @@
+{
+  "_doc": "Labeled benchmark cases. Each case = a MemoryEntry retrieved at a given commit, with its GIT-TRUE label (the ground truth EVERY method is scored against) and STALE type. created_at_commit gives the entry's birth commit (the decay baseline ages from here); current_db names the live datastore at read_at_commit (the drift/LLM-judge baselines compare claim-text against it). git_true is computed to match what a real git-check yields against the synthetic repo — it is the mechanical truth, never a hand-asserted 'win'.",
+  "min_n_per_arm": 2,
+  "cases": [
+    {
+      "id": "E1-at-P",
+      "type": "clean",
+      "read_at_commit": "P",
+      "created_at_commit": "P",
+      "current_db": "postgres",
+      "git_true": "live",
+      "entry": {
+        "id": "vm-e1-postgres",
+        "claim": "datastore is Postgres, touches db/store.py:PostgresStore",
+        "commit_ref": "P",
+        "refs": [{"path": "db/store.py", "symbol": "PostgresStore", "kind": "class"}],
+        "schema_version": "vm-1.0"
+      }
+    },
+    {
+      "id": "E1-at-M",
+      "type": "type-I",
+      "read_at_commit": "M",
+      "created_at_commit": "P",
+      "current_db": "mysql",
+      "git_true": "stale",
+      "entry": {
+        "id": "vm-e1-postgres",
+        "claim": "datastore is Postgres, touches db/store.py:PostgresStore",
+        "commit_ref": "P",
+        "refs": [{"path": "db/store.py", "symbol": "PostgresStore", "kind": "class"}],
+        "schema_version": "vm-1.0"
+      }
+    },
+    {
+      "id": "E1-at-N",
+      "type": "type-I",
+      "read_at_commit": "N",
+      "created_at_commit": "P",
+      "current_db": "nosql",
+      "git_true": "stale",
+      "entry": {
+        "id": "vm-e1-postgres",
+        "claim": "datastore is Postgres, touches db/store.py:PostgresStore",
+        "commit_ref": "P",
+        "refs": [{"path": "db/store.py", "symbol": "PostgresStore", "kind": "class"}],
+        "schema_version": "vm-1.0"
+      }
+    },
+    {
+      "id": "E2-at-M",
+      "type": "clean",
+      "read_at_commit": "M",
+      "created_at_commit": "M",
+      "current_db": "mysql",
+      "git_true": "live",
+      "entry": {
+        "id": "vm-e2-mysql",
+        "claim": "datastore is MySQL, touches db/store.py:MySQLStore",
+        "commit_ref": "M",
+        "refs": [{"path": "db/store.py", "symbol": "MySQLStore", "kind": "class"}],
+        "schema_version": "vm-1.0"
+      }
+    },
+    {
+      "id": "E2-at-N",
+      "type": "type-I",
+      "read_at_commit": "N",
+      "created_at_commit": "M",
+      "current_db": "nosql",
+      "git_true": "stale",
+      "entry": {
+        "id": "vm-e2-mysql",
+        "claim": "datastore is MySQL, touches db/store.py:MySQLStore",
+        "commit_ref": "M",
+        "refs": [{"path": "db/store.py", "symbol": "MySQLStore", "kind": "class"}],
+        "schema_version": "vm-1.0"
+      }
+    },
+    {
+      "id": "E3-at-N",
+      "type": "clean",
+      "read_at_commit": "N",
+      "created_at_commit": "N",
+      "current_db": "nosql",
+      "git_true": "live",
+      "entry": {
+        "id": "vm-e3-nosql",
+        "claim": "datastore is NoSQL, touches db/store.py:NoSQLStore",
+        "commit_ref": "N",
+        "refs": [{"path": "db/store.py", "symbol": "NoSQLStore", "kind": "class"}],
+        "schema_version": "vm-1.0"
+      }
+    },
+    {
+      "id": "ORD-postgres-at-M",
+      "type": "type-II",
+      "read_at_commit": "M",
+      "created_at_commit": "P",
+      "current_db": "mysql",
+      "git_true": "stale",
+      "entry": {
+        "id": "vm-ord-postgres",
+        "claim": "OrderService depends on the Postgres datastore via db/store.py:PostgresStore, imported in services/orders.py",
+        "commit_ref": "P",
+        "refs": [
+          {"path": "services/orders.py", "symbol": "OrderService", "kind": "class"},
+          {"path": "db/store.py", "symbol": "PostgresStore", "kind": "class"}
+        ],
+        "schema_version": "vm-1.0"
+      }
+    },
+    {
+      "id": "ORD-mysql-at-N",
+      "type": "type-II",
+      "read_at_commit": "N",
+      "created_at_commit": "M",
+      "current_db": "nosql",
+      "git_true": "stale",
+      "entry": {
+        "id": "vm-ord-mysql",
+        "claim": "OrderService depends on the MySQL datastore via db/store.py:MySQLStore, imported in services/orders.py",
+        "commit_ref": "M",
+        "refs": [
+          {"path": "services/orders.py", "symbol": "OrderService", "kind": "class"},
+          {"path": "db/store.py", "symbol": "MySQLStore", "kind": "class"}
+        ],
+        "schema_version": "vm-1.0"
+      }
+    },
+    {
+      "id": "ORD-nosql-at-N",
+      "type": "clean",
+      "read_at_commit": "N",
+      "created_at_commit": "N",
+      "current_db": "nosql",
+      "git_true": "live",
+      "entry": {
+        "id": "vm-ord-nosql",
+        "claim": "OrderService depends on the NoSQL datastore via db/store.py:NoSQLStore, imported in services/orders.py",
+        "commit_ref": "N",
+        "refs": [
+          {"path": "services/orders.py", "symbol": "OrderService", "kind": "class"},
+          {"path": "db/store.py", "symbol": "NoSQLStore", "kind": "class"}
+        ],
+        "schema_version": "vm-1.0"
+      }
+    }
+  ]
+}
