@@ -1,0 +1,181 @@
+#!/usr/bin/env bash
+# heimdall-branch-context — SI-3, the git-backed branch-context reader (own-first).
+#
+# SI-3 is the substrate team-mode P3 (the collision-resolver) and team-awareness
+# QUERY read. It answers, cheaply and mechanically (git plumbing — merge-base,
+# diff --name-only, rev-list; NO LLM): "for THIS target (file / symbol), which
+# OTHER branches in the repo also touched it — framed relative to MY current
+# branch?" WITHOUT drowning the agent in sibling-branch noise.
+#
+# OWN-BRANCH-FIRST: the current branch's context is PRIMARY. `own` is the cheap
+# default (what THIS branch changed vs its merge-base). Other-branch context is
+# NOT dumped — it is surfaced ON DEMAND by `query <target>`, and every result is
+# framed own-branch-first (the current branch is the `own` anchor; siblings hang
+# off it as `other_branches`, and ONLY siblings that actually touched the queried
+# target appear). Solo (one branch) → own context only, no siblings, no crash.
+#
+# Cross-branch detection ALSO reads SI-2's attestation `reuse` record: when a
+# sibling branch carries a COMMITTED attestation (JSON with the SI-2
+# {contracts,reuse} shape), `query` enriches that sibling's entry with the
+# reuse/contract surface it declares for the target. Optional — its absence never
+# suppresses the git-mechanical overlap.
+#
+# The engine is bin/lib/branch_context.py (deterministic, git-only). This CLI owns
+# argument parsing + JSON I/O.
+#
+# Usage:
+#   heimdall-branch-context own [--repo DIR] [--print]
+#       The PRIMARY default: the current branch's own context — what it changed vs
+#       its nearest-sibling merge-base (or the repo root when solo). Prints the
+#       own-context JSON on stdout; a one-line summary on stderr.
+#
+#   heimdall-branch-context query <target> [--repo DIR] [--no-symbols] [--no-attest]
+#       ON-DEMAND cross-branch query for a target. <target> is a file path
+#       ("src/auth.ts") or a file#symbol ("src/auth.ts#handleLogin"). Surfaces the
+#       OTHER branches that also touched it, framed own-branch-first; flags a
+#       CROSS-BRANCH OVERLAP when a sibling touched the SAME target the current
+#       branch did (the collision signal P3 reads). Exit 0 always (informational);
+#       the overlap is in the JSON (`overlap_count`) + the stderr summary.
+#       --no-symbols skips per-symbol (tree-sitter) resolution (file-level only).
+#       --no-attest  skips the committed-attestation enrichment.
+#
+#   heimdall-branch-context branches [--repo DIR]
+#       The local branch set (one per line) + a marker on the current branch.
+#
+#   heimdall-branch-context current [--repo DIR]
+#       Just the current branch name (or "(detached)").
+#
+#   -h, --help    this help
+#
+# Exit status:
+#   0  success (own context emitted, query emitted — overlap is data, not an error)
+#   2  usage error / not a git repo / python missing
+# It never crashes on a solo repo, a detached HEAD, or a missing tree-sitter: those
+# degrade to an honest own-only / file-level result.
+
+set -euo pipefail
+
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+LIB="$(cd "$(dirname "$SELF")/lib" && pwd)/branch_context.py"
+
+usage() { sed -n '2,57p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+PY="$(command -v python3 || command -v python || true)"
+if [ -z "$PY" ]; then
+  echo "error: python3 not found (required for the branch-context engine)" >&2
+  exit 2
+fi
+
+[ $# -ge 1 ] || { echo "error: a subcommand is required" >&2; usage >&2; exit 2; }
+
+CMD="$1"; shift || true
+case "$CMD" in
+  -h|--help) usage; exit 0 ;;
+esac
+
+# ── shared option parsing ──────────────────────────────────────────────────────
+REPO="$(pwd)"
+PRINT=0
+WITH_SYMBOLS=1
+WITH_ATTEST=1
+TARGET=""
+
+# `query` takes a positional <target> before the flags.
+if [ "$CMD" = "query" ]; then
+  [ $# -ge 1 ] || { echo "error: query needs a <target> (path or path#symbol)" >&2; exit 2; }
+  case "$1" in
+    --*) echo "error: query needs a <target> before any flag" >&2; exit 2 ;;
+    *) TARGET="$1"; shift ;;
+  esac
+fi
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --repo)       REPO="${2:?--repo needs a dir}"; shift 2 ;;
+    --print)      PRINT=1; shift ;;
+    --no-symbols) WITH_SYMBOLS=0; shift ;;
+    --no-attest)  WITH_ATTEST=0; shift ;;
+    -h|--help)    usage; exit 0 ;;
+    --*)          echo "error: unknown option: $1" >&2; usage >&2; exit 2 ;;
+    *)            echo "error: unexpected argument: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+if [ ! -d "$REPO" ]; then
+  echo "error: not a directory: $REPO" >&2
+  exit 2
+fi
+REPO="$(cd "$REPO" && pwd)"
+
+if ! git -C "$REPO" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  echo "error: --repo is not a git repository: $REPO" >&2
+  exit 2
+fi
+
+case "$CMD" in
+  own)
+    REPO="$REPO" PRINT="$PRINT" LIB="$LIB" "$PY" - <<'PYEOF'
+import json, os, sys
+sys.path.insert(0, os.path.dirname(os.environ["LIB"]))
+import branch_context as B
+
+repo = os.environ["REPO"]
+do_print = os.environ["PRINT"] == "1"
+
+ctx = B.own_context(repo)
+sys.stderr.write(B.own_summary(ctx) + "\n")
+# `own` always prints its JSON (it IS the output); --print is accepted for parity.
+json.dump(ctx, sys.stdout, indent=2, sort_keys=True)
+sys.stdout.write("\n")
+PYEOF
+    ;;
+
+  query)
+    REPO="$REPO" TARGET="$TARGET" WITH_SYMBOLS="$WITH_SYMBOLS" \
+    WITH_ATTEST="$WITH_ATTEST" LIB="$LIB" "$PY" - <<'PYEOF'
+import json, os, sys
+sys.path.insert(0, os.path.dirname(os.environ["LIB"]))
+import branch_context as B
+
+repo = os.environ["REPO"]
+target = os.environ["TARGET"]
+with_symbols = os.environ["WITH_SYMBOLS"] == "1"
+with_attest = os.environ["WITH_ATTEST"] == "1"
+
+res = B.query_target(repo, target, with_symbols=with_symbols,
+                     with_attestation=with_attest)
+sys.stderr.write(B.query_summary(res) + "\n")
+json.dump(res, sys.stdout, indent=2, sort_keys=True)
+sys.stdout.write("\n")
+PYEOF
+    ;;
+
+  branches)
+    REPO="$REPO" LIB="$LIB" "$PY" - <<'PYEOF'
+import os, sys
+sys.path.insert(0, os.path.dirname(os.environ["LIB"]))
+import branch_context as B
+
+repo = os.environ["REPO"]
+cur = B.current_branch(repo)
+for b in B.local_branches(repo):
+    mark = " *" if b == cur else ""
+    sys.stdout.write("%s%s\n" % (b, mark))
+PYEOF
+    ;;
+
+  current)
+    REPO="$REPO" LIB="$LIB" "$PY" - <<'PYEOF'
+import os, sys
+sys.path.insert(0, os.path.dirname(os.environ["LIB"]))
+import branch_context as B
+print(B.current_branch(os.environ["REPO"]) or "(detached)")
+PYEOF
+    ;;
+
+  *)
+    echo "error: unknown subcommand: $CMD (expected own|query|branches|current)" >&2
+    usage >&2
+    exit 2
+    ;;
+esac
