@@ -36,6 +36,16 @@
 #   heimdall-comprehend status <repo-dir>   print just the status word (fresh|stale|missing|corrupt)
 #   heimdall-comprehend fingerprint <repo-dir>   print the live structural fingerprint
 #   heimdall-comprehend path <repo-dir>     print the resolved capsule path
+#   heimdall-comprehend recall <repo-dir> [--json]
+#       SURFACE this repo's git-verified MEMORY for the orientation read path (VM
+#       piece D). Each remembered claim is shown WITH its git-verified status —
+#       LIVE entries (git-confirmed, ranked by the read-time weight readout) and
+#       STALE entries (marked, NEVER served as live). Verification runs AT READ
+#       TIME (verified_memory.list_entries re-checks every claim against git), so a
+#       claim that no longer matches git is surfaced stale, not as a live fact.
+#       --json emits the full readout; default emits the rendered capsule block.
+#       No memory store / verified-memory absent → an honest "none" line (the
+#       comprehend capsule is otherwise IDENTICAL to today — no regression, no crash).
 #   -h, --help                              this help
 #
 # Exit status:
@@ -47,9 +57,14 @@
 set -euo pipefail
 
 SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
-LIB="$(cd "$(dirname "$SELF")/lib" && pwd)/comprehension.py"
+LIBDIR="$(cd "$(dirname "$SELF")/lib" && pwd)"
+LIB="$LIBDIR/comprehension.py"
+# VM piece D: the verified-memory read-path seam, surfaced by `recall` and appended
+# to the assembled `comprehend` capsule. Resolved relative to the same lib dir (no
+# baked path). Its absence degrades gracefully — the readout is then a "none" line.
+READPATH="$LIBDIR/vm_readpath.py"
 
-usage() { sed -n '2,46p' "$SELF" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,55p' "$SELF" | sed 's/^# \{0,1\}//'; }
 
 PY="$(command -v python3 || command -v python || true)"
 if [ -z "$PY" ]; then
@@ -70,10 +85,12 @@ esac
 REPO="$1"; shift || true
 PRINT=0
 FORCE=0
+JSON=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --print) PRINT=1; shift ;;
     --force) FORCE=1; shift ;;
+    --json) JSON=1; shift ;;
     *) echo "error: unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
@@ -93,6 +110,35 @@ CAPSULE="$HOME_DIR/context.json"
 # Deterministic-output contract: the engine never reads the clock. The CLI
 # supplies the timestamp (UTC ISO-8601).
 TS="$(date -u +%FT%TZ)"
+
+# ── verified-memory read-path readout (VM piece D) ────────────────────────────
+# Emit this repo's git-verified memory readout for the orientation read path. Each
+# remembered claim is surfaced WITH its git-verified status — LIVE (git-confirmed,
+# ranked by the read-time weight readout) and STALE (marked, never served as live).
+# Verification runs AT READ TIME inside the lib (verified_memory.list_entries
+# re-checks each claim against git). $1 = "text"|"json" output format.
+#
+# GRACEFUL: the lib degrades to an empty/"none" readout when verified-memory is
+# absent or no store exists, so this never disrupts the existing comprehend output
+# and never crashes (no regression on a solo / clean install). If the lib file
+# itself is missing we emit the same honest "none" line — never an error. Output is
+# captured (no inherited TTY); the `|| true` keeps strict-mode from aborting on a
+# nonzero (the readout is advisory, never a gate).
+vm_readout() {
+  local fmt="${1:-text}"
+  if [ ! -f "$READPATH" ]; then
+    if [ "$fmt" = "json" ]; then
+      printf '%s\n' '{"available": false, "reason": "vm_readpath lib not installed", "live": [], "stale": []}'
+    else
+      printf '%s\n' '── verified memory (git-checked at read) ──'
+      printf '%s\n' '  (none — verified-memory read path not installed)'
+    fi
+    return 0
+  fi
+  local out
+  out="$("$PY" "$READPATH" readout --repo "$REPO" "--$fmt" 2>/dev/null || true)"
+  printf '%s\n' "$out"
+}
 
 # ── run the engine for one operation ──────────────────────────────────────────
 # `comprehend`: derive (or reuse a fresh capsule) and write. `load`: classify an
@@ -142,6 +188,26 @@ if do_print:
     json.dump(capsule, sys.stdout, indent=2, sort_keys=True)
     sys.stdout.write("\n")
 PYEOF
+    # APPEND the verified-memory read-path block to the assembled capsule. The
+    # agent's git-verified memory about THIS repo is surfaced alongside the
+    # orientation capsule — each claim shown WITH its git-verified status (live /
+    # stale) so a stale memory is treated as stale (verify against ground truth
+    # before acting). Written to stderr so the capsule JSON on stdout stays pristine
+    # (a --print consumer reads clean JSON). Graceful: absent store / VM layer → a
+    # one-line "none" note, the existing comprehend output is otherwise identical.
+    vm_readout text >&2
+    ;;
+
+  recall)
+    # VM piece D read path: surface this repo's git-verified memory (LIVE ranked by
+    # read-time weight, STALE marked, never served as live) for the orientation read
+    # path. --json → full readout; default → the rendered capsule block. Graceful:
+    # absent store / VM layer → an honest "none" readout, exit 0 (no crash).
+    if [ "$JSON" -eq 1 ]; then
+      vm_readout json
+    else
+      vm_readout text
+    fi
     ;;
 
   load)
