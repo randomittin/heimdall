@@ -1,0 +1,211 @@
+#!/usr/bin/env bash
+# heimdall-control-plane — the thin CLI over the control-plane substrate (piece a).
+#
+# DESIGN DOSSIER §3/§10 (authoritative). House style: a thin bin/heimdall-* bash CLI
+# over the bin/lib/cp_*.py engine (mirrors bin/heimdall-redum / bin/heimdall-holdout).
+# This CLI starts the server and manages per-instance PKI identity + the audit view.
+#
+# Subcommands:
+#   heimdall-control-plane serve [--host H] [--port N] [--home DIR] [--no-revocation]
+#       Start the stateless server (§10): authenticates every request (§3), routes
+#       the built-in /dispatch (§1) + any registered seam routes, audits (§9).
+#       Self-hostable: one process + a gitignored ${HEIMDALL_HOME}/control-plane/
+#       state tree, no external DB. Blocks until interrupted.
+#
+#   heimdall-control-plane identity [--haid HAID] [--owner] [--home DIR]
+#       Generate an Ed25519 keypair for THIS instance, bind the PUBLIC key to the
+#       instance HAID in the control-plane key registry (§3), and print the keypair
+#       (private seed for the instance to keep locally; public already registered).
+#       --owner flags a distinguished gate-override identity (§7). Without --haid the
+#       instance HAID is derived via heimdall-haid current.
+#
+#   heimdall-control-plane status [--home DIR]
+#       Print the substrate status as JSON: crypto backend, allowlist action types,
+#       registered routes, audit row count, store paths. Read-only.
+#
+#   heimdall-control-plane audit [--actor HAID] [--event E] [--action-type T]
+#                                [--since ISO] [--until ISO] [--export] [--home DIR]
+#       Search the append-only audit log (§9); --export streams matching rows as
+#       NDJSON. Searchable + exportable, the security + 3am-debug record.
+#
+#   -h, --help
+#
+# Conventions (match bin/ — bash + python3, graceful when a dep is absent):
+#   - crypto deps (cryptography|pynacl) are OPTIONAL: serve/status work without them;
+#     `identity` reports the degraded message rather than crashing.
+#   - all state under ${HEIMDALL_HOME:-<repo>/.heimdall}/control-plane/ (gitignored).
+#
+# Exit: 0 ok; 2 usage/IO error; 3 a degraded-crypto identity request.
+set -euo pipefail
+
+# ── path resolution (mirrors bin/heimdall-redum) ──────────────────────────────
+SELF="$0"
+if command -v readlink >/dev/null 2>&1; then
+  SELF="$(readlink -f "$0" 2>/dev/null || readlink "$0" 2>/dev/null || echo "$0")"
+fi
+BIN_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+LIB_DIR="$BIN_DIR/lib"
+HAID_CLI="$BIN_DIR/heimdall-haid"
+
+usage() { sed -n '2,45p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+PY="$(command -v python3 || command -v python || true)"
+if [ -z "$PY" ]; then
+  echo "error: python3 not found (required for the control plane)" >&2
+  exit 2
+fi
+
+[ $# -ge 1 ] || { usage >&2; exit 2; }
+SUB="$1"; shift
+
+case "$SUB" in
+  -h|--help) usage; exit 0 ;;
+esac
+
+# ── shared option parsing ─────────────────────────────────────────────────────
+HOST="127.0.0.1"
+PORT="8787"
+HOME_DIR=""
+HAID=""
+OWNER=""
+EVENT=""
+ACTOR=""
+ACTION_TYPE=""
+SINCE=""
+UNTIL=""
+EXPORT=""
+NO_REVOCATION=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --host)        HOST="${2:?--host needs a value}"; shift 2 ;;
+    --port)        PORT="${2:?--port needs a value}"; shift 2 ;;
+    --home)        HOME_DIR="${2:?--home needs a dir}"; shift 2 ;;
+    --haid)        HAID="${2:?--haid needs a value}"; shift 2 ;;
+    --owner)       OWNER="1"; shift ;;
+    --event)       EVENT="${2:?--event needs a value}"; shift 2 ;;
+    --actor)       ACTOR="${2:?--actor needs a value}"; shift 2 ;;
+    --action-type) ACTION_TYPE="${2:?--action-type needs a value}"; shift 2 ;;
+    --since)       SINCE="${2:?--since needs a value}"; shift 2 ;;
+    --until)       UNTIL="${2:?--until needs a value}"; shift 2 ;;
+    --export)      EXPORT="1"; shift ;;
+    --no-revocation) NO_REVOCATION="1"; shift ;;
+    -h|--help)     usage; exit 0 ;;
+    --*)           echo "error: unknown option: $1" >&2; usage >&2; exit 2 ;;
+    *)             echo "error: unexpected argument: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+# Resolve the instance HAID for the identity command (derive when not given).
+resolve_haid() {
+  if [ -n "$HAID" ]; then printf '%s' "$HAID"; return 0; fi
+  if [ -x "$HAID_CLI" ]; then "$HAID_CLI" current; return 0; fi
+  echo "error: no --haid given and heimdall-haid not available to derive one" >&2
+  exit 2
+}
+
+case "$SUB" in
+  serve)
+    LIB_DIR="$LIB_DIR" HOST="$HOST" PORT="$PORT" HOME_DIR="$HOME_DIR" \
+    NO_REVOCATION="$NO_REVOCATION" "$PY" - <<'PYEOF'
+import os, sys
+sys.path.insert(0, os.environ["LIB_DIR"])
+import cp_server
+home = os.environ.get("HOME_DIR") or None
+enforce = not os.environ.get("NO_REVOCATION")
+host = os.environ.get("HOST", "127.0.0.1")
+port = int(os.environ.get("PORT", "8787"))
+sys.stderr.write("heimdall-control-plane serving on %s:%d (home=%s, revocation=%s)\n"
+                 % (host, port, home or "default", "on" if enforce else "off"))
+sys.exit(cp_server.serve(host=host, port=port, home=home,
+                         enforce_revocation=enforce))
+PYEOF
+    ;;
+
+  identity)
+    INSTANCE_HAID="$(resolve_haid)"
+    set +e
+    LIB_DIR="$LIB_DIR" INSTANCE_HAID="$INSTANCE_HAID" OWNER="$OWNER" \
+    HOME_DIR="$HOME_DIR" "$PY" - <<'PYEOF'
+import json, os, sys
+sys.path.insert(0, os.environ["LIB_DIR"])
+import cp_auth
+haid = os.environ["INSTANCE_HAID"]
+owner = bool(os.environ.get("OWNER"))
+home = os.environ.get("HOME_DIR") or None
+if not cp_auth.crypto_available():
+    sys.stdout.write(json.dumps({
+        "ok": False, "haid": haid,
+        "reason": "crypto_unavailable",
+        "detail": "install `cryptography` or `pynacl` to enable PKI identity",
+    }) + "\n")
+    sys.exit(3)
+priv, pub = cp_auth.generate_keypair()
+stored = cp_auth.register_key(haid, pub, owner=owner, home=home)
+sys.stdout.write(json.dumps({
+    "ok": True, "haid": haid, "owner": owner, "backend": cp_auth.backend_name(),
+    "public_key": pub, "private_key": priv, "registered": stored,
+    "note": "keep private_key local; public_key is registered with the server",
+}, indent=2) + "\n")
+sys.exit(0)
+PYEOF
+    RC=$?
+    set -e
+    exit "$RC"
+    ;;
+
+  status)
+    LIB_DIR="$LIB_DIR" HOME_DIR="$HOME_DIR" "$PY" - <<'PYEOF'
+import json, os, sys
+sys.path.insert(0, os.environ["LIB_DIR"])
+import cp_allowlist, cp_audit, cp_auth, cp_server
+home = os.environ.get("HOME_DIR") or None
+out = {
+    "crypto_backend": cp_auth.backend_name(),
+    "crypto_available": cp_auth.crypto_available(),
+    "allowlist_actions": cp_allowlist.action_types(),
+    "registered_routes": ["%s %s" % (m, p) for m, p in cp_server.registered_routes()],
+    "audit_rows": len(cp_audit.read_records(home)),
+    "audit_path": cp_audit.audit_path(home),
+    "keys_path": cp_auth.keys_path(home),
+}
+sys.stdout.write(json.dumps(out, indent=2, sort_keys=True) + "\n")
+PYEOF
+    ;;
+
+  audit)
+    LIB_DIR="$LIB_DIR" HOME_DIR="$HOME_DIR" ACTOR="$ACTOR" EVENT="$EVENT" \
+    ACTION_TYPE="$ACTION_TYPE" SINCE="$SINCE" UNTIL="$UNTIL" EXPORT="$EXPORT" \
+    "$PY" - <<'PYEOF'
+import json, os, sys
+sys.path.insert(0, os.environ["LIB_DIR"])
+import cp_audit
+home = os.environ.get("HOME_DIR") or None
+
+
+def opt(name):
+    v = os.environ.get(name)
+    return v if v else None
+
+
+filters = {
+    "actor_haid": opt("ACTOR"),
+    "event": opt("EVENT"),
+    "action_type": opt("ACTION_TYPE"),
+    "since": opt("SINCE"),
+    "until": opt("UNTIL"),
+}
+filters = {k: v for k, v in filters.items() if v is not None}
+if os.environ.get("EXPORT"):
+    sys.stdout.write(cp_audit.export(home, **filters))
+else:
+    rows = cp_audit.search(home, **filters) if filters else cp_audit.read_records(home)
+    sys.stdout.write(json.dumps(rows, indent=2, sort_keys=True) + "\n")
+PYEOF
+    ;;
+
+  *)
+    echo "error: unknown subcommand: $SUB" >&2
+    usage >&2
+    exit 2 ;;
+esac
