@@ -244,3 +244,108 @@ njget() { "$PY" -c "import json; print(json.load(open('$NOTIFY_OUT')).get('$1'))
 [ "$(njget no_command_key_in_payload)" = "True" ] && ok "#2 payload has NO command/executable field (closed schema)" || bad "#2 a command field leaked into the payload"
 [ "$(njget smuggled_cmd_stripped)" = "True" ] && ok "#2 smuggled cmd/exec keys STRIPPED from extra (no command channel by accretion)" || bad "#2 a smuggled command survived in extra"
 [ "$(njget no_inbox_payload_executes)" = "True" ] && ok "#2 every inbox payload is DATA (none executes)" || bad "#2 an inbox payload executes"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# #3 OWNER-GATED ACTION (§7) — a requires_gate action (run-suite) does NOT dispatch;
+#    it surfaces to the OWNER as `pending`. A NON-owner approve is REJECTED. The OWNER
+#    APPROVES -> it dispatches (audited). A second gated action: the owner OVERRIDES
+#    (force-approve) -> it dispatches, the override audited. Non-gated still runs direct.
+# ──────────────────────────────────────────────────────────────────────────────
+echo
+echo "#3 OWNER-GATED ACTION (gate + owner approve/override + non-owner rejected, §7)"
+
+GATE_OUT="$WORK/gate.out"
+LIB="$LIB" "$PY" - >"$GATE_OUT" 2>"$WORK/gate.err" <<'PYEOF'
+import json, os, sys
+sys.path.insert(0, os.environ["LIB"])
+import cp_approval as Ap
+import cp_auth as K
+home = os.environ["HEIMDALL_HOME"]
+out = {}
+
+owner    = K.Identity("haid:rj.owner", owner=True)
+nonowner = K.Identity("haid:dev.laptop", owner=False)
+
+# 1. submit a requires_gate action (run-suite). It MUST NOT dispatch — it enters pending.
+sub = Ap.submit(owner, "run-suite", {"suite": "integration"}, home=home)
+out["gated_state"] = sub.get("state")            # pending
+out["gated_dispatched"] = sub.get("dispatched")  # False
+out["gated_verdict"] = sub.get("verdict")        # PENDING
+action_id = sub.get("action_id")
+
+# the queue surfaces it to the owner (it is the one pending action).
+pending = Ap.list_pending(home)
+out["pending_count"] = len(pending)
+out["pending_is_ours"] = any(p.get("action_id") == action_id for p in pending)
+
+# 2. a NON-owner attempt to approve the gate MUST be REJECTED (AuthError not_owner), and
+#    it MUST NOT dispatch — the gate stays pending.
+try:
+    Ap.approve(nonowner, action_id, home=home)
+    out["nonowner_rejected"] = False
+except K.AuthError as e:
+    out["nonowner_rejected"] = (e.reason == "not_owner")
+out["still_pending_after_nonowner"] = (
+    (Ap.get(action_id, home) or {}).get("state") == "pending")
+
+# 3. the OWNER APPROVES -> the action DISPATCHES through the normal §1 path (audited).
+appr = Ap.approve(owner, action_id, home=home)
+out["approved_state"] = appr.get("state")        # approved
+out["approved_dispatched"] = appr.get("dispatched")
+out["approved_status"] = appr.get("status")      # 200
+out["approved_verdict"] = appr.get("verdict")    # PROVEN
+
+# re-deciding a now-terminal record is refused (a gate is decided exactly once).
+try:
+    Ap.approve(owner, action_id, home=home)
+    out["stale_redecide_refused"] = False
+except Ap.ApprovalError as e:
+    out["stale_redecide_refused"] = (e.reason == "stale_decision")
+
+# 4. a SECOND gated action: the owner OVERRIDES (force-approve) -> it dispatches; the
+#    override is itself a signed, audited act (authority exercised, never hidden).
+sub2 = Ap.submit(owner, "run-suite", {"suite": "oracle"}, home=home)
+aid2 = sub2.get("action_id")
+ovr = Ap.override(owner, aid2, force="approve", home=home)
+out["override_state"] = ovr.get("state")         # overridden
+out["override_dispatched"] = ovr.get("dispatched")
+out["override_verdict"] = ovr.get("verdict")     # PROVEN
+
+# a NON-owner override is also rejected (the override is owner-only too).
+sub3 = Ap.submit(owner, "run-suite", {"suite": "unit"}, home=home)
+aid3 = sub3.get("action_id")
+try:
+    Ap.override(nonowner, aid3, force="approve", home=home)
+    out["nonowner_override_rejected"] = False
+except K.AuthError as e:
+    out["nonowner_override_rejected"] = (e.reason == "not_owner")
+
+# 5. a NON-gated action submitted dispatches IMMEDIATELY (it never enters the queue) —
+#    proving the gate is selective (gate the irreversible, pass the ordinary).
+subng = Ap.submit(owner, "sync-queue", {"queue": "issue"}, home=home)
+out["nongated_dispatched"] = subng.get("dispatched")
+out["nongated_in_queue"] = subng.get("requires_gate")  # False
+
+sys.stdout.write(json.dumps(out))
+PYEOF
+
+[ -s "$GATE_OUT" ] || { echo "FATAL: gate harness produced no output" >&2; cat "$WORK/gate.err" >&2; exit 2; }
+gjget() { "$PY" -c "import json; print(json.load(open('$GATE_OUT')).get('$1'))"; }
+
+[ "$(gjget gated_state)" = "pending" ] && [ "$(gjget gated_dispatched)" = "False" ] \
+  && ok "#3 a requires_gate action does NOT dispatch — it surfaces as pending" \
+  || bad "#3 gated action dispatched instead of surfacing for approval"
+[ "$(gjget pending_is_ours)" = "True" ] && ok "#3 the gated action is in the owner's approval queue" || bad "#3 gated action not in the pending queue"
+[ "$(gjget nonowner_rejected)" = "True" ] && ok "#3 a NON-owner approve is REJECTED (not_owner)" || bad "#3 a non-owner approved a gate"
+[ "$(gjget still_pending_after_nonowner)" = "True" ] && ok "#3 the gate stays pending after the rejected non-owner attempt" || bad "#3 non-owner attempt mutated the gate"
+[ "$(gjget approved_state)" = "approved" ] && [ "$(gjget approved_dispatched)" = "True" ] && [ "$(gjget approved_status)" = "200" ] \
+  && ok "#3 OWNER APPROVES -> the action DISPATCHES (status 200, verdict $(gjget approved_verdict))" \
+  || bad "#3 owner approval did not dispatch the action"
+[ "$(gjget stale_redecide_refused)" = "True" ] && ok "#3 a gate is decided exactly once (re-decide refused)" || bad "#3 a terminal gate was re-decided"
+[ "$(gjget override_state)" = "overridden" ] && [ "$(gjget override_dispatched)" = "True" ] \
+  && ok "#3 OWNER OVERRIDES (force-approve) -> dispatches (verdict $(gjget override_verdict)), override audited" \
+  || bad "#3 owner override did not dispatch"
+[ "$(gjget nonowner_override_rejected)" = "True" ] && ok "#3 a NON-owner override is REJECTED (not_owner)" || bad "#3 a non-owner overrode a gate"
+[ "$(gjget nongated_dispatched)" = "True" ] && [ "$(gjget nongated_in_queue)" = "False" ] \
+  && ok "#3 a NON-gated action dispatches immediately (the gate is selective)" \
+  || bad "#3 a non-gated action was wrongly queued"
