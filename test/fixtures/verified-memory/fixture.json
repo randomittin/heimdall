@@ -1,0 +1,29 @@
+{
+  "_doc": "The 3-commit Postgres->MySQL->NoSQL synthetic migration. Each commit lists the files written at that commit (full body). The benchmark builds a throwaway git repo by replaying these commits in order, so staleness is induced by a REAL git operation. Commit keys (P,M,N) are referenced by cases.json/conflict.json as read_at_commit.",
+  "commits": [
+    {
+      "key": "P",
+      "message": "P: postgres adapter",
+      "files": {
+        "db/store.py": "class PostgresStore:\n    def connect(self):\n        return 'postgres'\n\n    def query(self, sql):\n        return self.connect() + ':' + sql\n",
+        "services/orders.py": "from db.store import PostgresStore\n\n\nclass OrderService:\n    def __init__(self):\n        self.store = PostgresStore()\n\n    def total(self):\n        return self.store.query('select sum(amount) from orders')\n"
+      }
+    },
+    {
+      "key": "M",
+      "message": "M: mysql adapter",
+      "files": {
+        "db/store.py": "class MySQLStore:\n    def connect(self):\n        return 'mysql'\n\n    def query(self, sql):\n        return self.connect() + ':' + sql\n",
+        "services/orders.py": "from db.store import MySQLStore\n\n\nclass OrderService:\n    def __init__(self):\n        self.store = MySQLStore()\n\n    def total(self):\n        return self.store.query('select sum(amount) from orders')\n"
+      }
+    },
+    {
+      "key": "N",
+      "message": "N: nosql adapter (one path still names the old store)",
+      "files": {
+        "db/store.py": "class NoSQLStore:\n    def connect(self):\n        return 'nosql'\n\n    def find(self, query):\n        return self.connect() + ':' + str(query)\n",
+        "services/orders.py": "from db.store import NoSQLStore\n\n\nclass OrderService:\n    def __init__(self):\n        self.store = NoSQLStore()\n\n    def total(self):\n        return self.store.find({'agg': 'sum', 'field': 'amount'})\n\n    def legacy_total(self):\n        from db.store import MySQLStore\n        return MySQLStore().query('select sum(amount) from orders')\n"
+      }
+    }
+  ]
+}

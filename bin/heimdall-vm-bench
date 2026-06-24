@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+# heimdall-vm-bench — the Verified-Memory BENCHMARK (VM piece C).
+#
+# THE RESEARCH DELIVERABLE IS A NUMBER (dossier §4). Run the benchmark over the
+# git-true labeled Postgres->MySQL->NoSQL fixture and emit the metrics table:
+# verified-memory (git-grounded) vs the three baselines — decay, llm-judge, drift —
+# on stale-retrieval error rate + conflict-resolution accuracy. The table is HONEST:
+# every comparison number carries a provenance tag (measured | est. | blank); a
+# fabricated delta cannot print (require_provenance, mirrors holdout.require_measured).
+# If verified-memory does NOT beat a baseline the NULL is printed as the verdict, not
+# buried.
+#
+#   heimdall-vm-bench run  [--work DIR] [--fixture F] [--cases F] [--conflict F]
+#                          [--min-n N] [--json]
+#       Build a REAL throwaway 3-commit git repo from the fixture (staleness induced
+#       by a real git operation, never a flag flip), score all four methods against
+#       the SAME git-true labels, and print the metrics table. --json prints the full
+#       structured result instead of the rendered table. --work pins the build dir
+#       (default: a throwaway TMPDIR, removed after).
+#
+#   heimdall-vm-bench methods
+#       List the four methods + each one's honest provenance (measured | est.).
+#
+# Reuse, don't rebuild: the honesty discipline (measured/estimated/blank + the
+# structural refusal) is holdout.py's; the system under test is vm_gitcheck (piece A)
+# via verified_memory (piece B); the fixture lives in test/fixtures/verified-memory/.
+# vm_bench.py is the engine; this is the thin CLI over it (house style, mirrors
+# bin/heimdall-redum / bin/heimdall-holdout).
+#
+# Exit status:
+#   0  the benchmark ran; the (honest) result table printed.
+#   2  usage error.
+
+set -euo pipefail
+
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+BINDIR="$(dirname "$SELF")"
+BENCH_LIB="$BINDIR/lib/vm_bench.py"
+
+usage() { sed -n '2,33p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+PY="$(command -v python3 || command -v python || true)"
+if [ -z "$PY" ]; then
+  echo "error: python3 not found (required for vm-bench)" >&2
+  exit 2
+fi
+[ -f "$BENCH_LIB" ] || { echo "error: engine missing at $BENCH_LIB" >&2; exit 2; }
+
+[ $# -ge 1 ] || { usage >&2; exit 2; }
+SUB="$1"; shift
+
+case "$SUB" in
+  -h|--help) usage; exit 0 ;;
+esac
+
+# ── methods (list the four methods + their honest provenance) ─────────────────
+if [ "$SUB" = "methods" ]; then
+  "$PY" "$BENCH_LIB" methods
+  exit 0
+fi
+
+# ── run (build the fixture repo, score all four, render the metrics table) ────
+if [ "$SUB" = "run" ]; then
+  WORK=""
+  FIXTURE=""
+  CASES=""
+  CONFLICT=""
+  MIN_N="2"
+  AS_JSON="no"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --work)     WORK="${2:?--work needs a dir}"; shift 2 ;;
+      --fixture)  FIXTURE="${2:?--fixture needs a file}"; shift 2 ;;
+      --cases)    CASES="${2:?--cases needs a file}"; shift 2 ;;
+      --conflict) CONFLICT="${2:?--conflict needs a file}"; shift 2 ;;
+      --min-n)    MIN_N="${2:?--min-n needs a value}"; shift 2 ;;
+      --json)     AS_JSON="yes"; shift ;;
+      -h|--help)  usage; exit 0 ;;
+      --*)        echo "error: unknown option: $1" >&2; usage >&2; exit 2 ;;
+      *)          echo "error: unexpected argument: $1" >&2; usage >&2; exit 2 ;;
+    esac
+  done
+
+  # assemble the engine argv (only pass flags the caller actually set).
+  set -- run --min-n "$MIN_N"
+  [ -n "$WORK" ] && set -- "$@" --work "$WORK"
+  [ -n "$FIXTURE" ] && set -- "$@" --fixture "$FIXTURE"
+  [ -n "$CASES" ] && set -- "$@" --cases "$CASES"
+  [ -n "$CONFLICT" ] && set -- "$@" --conflict "$CONFLICT"
+
+  RESULT_JSON="$("$PY" "$BENCH_LIB" "$@")"
+
+  if [ "$AS_JSON" = "yes" ]; then
+    printf '%s\n' "$RESULT_JSON"
+    exit 0
+  fi
+
+  # render the human metrics table from the engine JSON (the engine already applied
+  # the honesty gate; this only formats — it never invents a number). The JSON is
+  # written to a temp file and passed as argv[1] so the python heredoc owns stdin as
+  # the script source (a `python - <<EOF` cannot also read piped data from stdin).
+  RESULT_TMP="$(mktemp -t "vm-bench-result.$(printf 'X%.0s' 1 2 3 4 5 6)")"
+  trap 'rm -f "$RESULT_TMP"' EXIT
+  printf '%s' "$RESULT_JSON" > "$RESULT_TMP"
+  "$PY" - "$RESULT_TMP" <<'PYEOF'
+import json, sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as fh:
+    d = json.load(fh)
+methods = ["verified-memory", "decay", "llm-judge", "drift"]
+
+
+def fmt(v):
+    if v is None:
+        return "—"
+    if isinstance(v, float):
+        return "%.3f" % v
+    return str(v)
+
+
+print("Verified-Memory BENCHMARK — git-grounded vs decay / llm-judge / drift")
+print("fixture: Postgres -> MySQL -> NoSQL (3-commit synthetic repo, git-true labels)")
+print("built commits: " + ", ".join("%s=%s" % (k, v[:7])
+      for k, v in sorted(d["built_shas"].items())))
+print()
+print("METHOD            PROV       STALE-RETRIEVAL-ERR  ACCURACY  CONFLICT-ACC  FALSE-LIVE")
+print("-" * 86)
+for m in methods:
+    s = d["methods"][m]["stale"]
+    c = d["methods"][m]["conflict"]
+    prov = s["provenance"] or "blank"
+    prov_lbl = {"measured": "measured", "estimated": "est.", "blank": "—"}.get(prov, prov)
+    fl = "%d/%d" % (s["false_live"], s["stale_total"])
+    print("%-17s %-10s %-20s %-9s %-13s %s" % (
+        m, prov_lbl, fmt(s["stale_retrieval_error"]), fmt(s["accuracy"]),
+        fmt(c["accuracy"]), fl))
+print()
+print("DELTA vs verified-memory (baseline − verified-memory; >0 ⇒ git-grounding wins):")
+print("BASELINE     STALE-RETRIEVAL-Δ                                 CONFLICT-Δ            VERDICT")
+print("-" * 92)
+for b in ("decay", "llm-judge", "drift"):
+    dv = d["deltas"][b]
+    print("%-12s %-49s %-21s %s" % (
+        b, dv["stale_retrieval_rendered"], dv["conflict_rendered"], dv["verdict"]))
+print()
+hl = d["headline"]
+print("HEADLINE: " + hl["summary"])
+if hl["null_result"]:
+    print("NULL NOTE: verified-memory did NOT strictly beat every baseline on the headline")
+    print("           stale-retrieval metric — reported honestly as a finding (dossier §4).")
+    print("           (it still wins decisively on conflict-resolution + vs decay/drift.)")
+PYEOF
+  exit 0
+fi
+
+echo "error: unknown subcommand: $SUB (expected run|methods)" >&2
+usage >&2
+exit 2

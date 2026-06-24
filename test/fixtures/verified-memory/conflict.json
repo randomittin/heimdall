@@ -1,0 +1,51 @@
+{
+  "_doc": "Conflict-resolution cases. Each case is a SET of entries that overlap on a shared ref, read at a commit, with the GIT-TRUE expected verdict the method must reach (auto-resolved+winner, or conflicted->escalation). team_divergence=true marks the 3-of-8-devs-still-on-MySQL case: git cannot adjudicate intent (multiple entries remain live against the live symbols) so the git-true verdict is 'conflicted' -> human escalation, NOT a silent auto-pick.",
+  "cases": [
+    {
+      "id": "conflict-PvM-at-M",
+      "read_at_commit": "M",
+      "team_divergence": false,
+      "expected_verdict": "auto-resolved",
+      "expected_winner_symbol": "MySQLStore",
+      "entries": [
+        {
+          "id": "vm-c-postgres",
+          "claim": "datastore is Postgres, touches db/store.py:PostgresStore",
+          "commit_ref": "P",
+          "refs": [{"path": "db/store.py", "symbol": "PostgresStore", "kind": "class"}],
+          "schema_version": "vm-1.0"
+        },
+        {
+          "id": "vm-c-mysql",
+          "claim": "datastore is MySQL, touches db/store.py:MySQLStore",
+          "commit_ref": "M",
+          "refs": [{"path": "db/store.py", "symbol": "MySQLStore", "kind": "class"}],
+          "schema_version": "vm-1.0"
+        }
+      ]
+    },
+    {
+      "id": "conflict-team-divergence-at-M",
+      "read_at_commit": "M",
+      "team_divergence": true,
+      "expected_verdict": "conflicted",
+      "expected_winner_symbol": null,
+      "entries": [
+        {
+          "id": "vm-c-mysql-main",
+          "claim": "datastore is MySQL (main), touches db/store.py:MySQLStore",
+          "commit_ref": "M",
+          "refs": [{"path": "db/store.py", "symbol": "MySQLStore", "kind": "class"}],
+          "schema_version": "vm-1.0"
+        },
+        {
+          "id": "vm-c-mysql-team",
+          "claim": "datastore is MySQL (3 of 8 devs still on it), touches db/store.py:MySQLStore",
+          "commit_ref": "M",
+          "refs": [{"path": "db/store.py", "symbol": "MySQLStore", "kind": "class"}],
+          "schema_version": "vm-1.0"
+        }
+      ]
+    }
+  ]
+}
