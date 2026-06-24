@@ -109,5 +109,77 @@ recall() {
   fi
 }
 
-# pull a value out of the captured JSON (OUT) by python index expression.
+# pull a value out of the captured JSON (OUT) by python index expression. The index
+# strings below are static literals authored in THIS file over trusted CLI JSON output
+# (no external input) — the eval mirrors the established harness in
+# test/verified-memory.test.sh:75; it is a test-only JSON accessor, not a code path.
 jget() { printf '%s' "$OUT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(eval('d'+sys.argv[1]))" "$1" 2>/dev/null; }
+
+# ── seed the live fixture: commit P (the Postgres adapter) ────────────────────
+# db/store.py declares PostgresStore — the symbol the first claim's ref targets. At P,
+# a claim about PostgresStore is git-true LIVE.
+P_SHA="$(gitcommit db/store.py "class PostgresStore:
+    def connect(self):
+        return 'postgres'
+
+    def query(self, sql):
+        return self.connect() + ':' + sql" "P: postgres adapter")"
+
+# ═════════════════════════════════════════════════════════════════════════════
+# BLOCK 1 — WRITE→STALE→READ  (THE CARDINAL CORE; falsifiable: stale-detected-at-read)
+# ═════════════════════════════════════════════════════════════════════════════
+# Write an entry that matches HEAD (live), then MUTATE git with a REAL commit so the
+# claim no longer holds, then GET the SAME id with NO re-write between. Read-time
+# re-verification must catch the staleness against git and return the entry MARKED
+# stale — never served as live. A stale-that-reads-live REDS the gate (the exact
+# false-live failure mode verified-memory exists to kill).
+echo "BLOCK 1 — WRITE→STALE→READ (read-time re-verification, the core):"
+
+# 1a. WRITE — claim matches HEAD at P → stored live, weight>0, verified at WRITE time.
+mem write --claim "datastore is Postgres, touches db/store.py:PostgresStore" \
+          --commit "$P_SHA" --ref "db/store.py:PostgresStore:class"
+B1_OK="$(jget "['ok']")"
+E1_ID="$(jget "['entry']['id']")"
+B1_WSTATUS="$(jget "['entry']['status']")"
+B1_WWEIGHT="$(jget "['entry']['weight']")"
+[ "$B1_OK" = "True" ] && ok "write ok=True, persisted to the shared store" || bad "write ok=$B1_OK (want True)"
+[ "$RC" -eq 0 ] && ok "write exit 0" || bad "write exit $RC (want 0)"
+[ "$B1_WSTATUS" = "live" ] && ok "write-time status=live (verified against git AT WRITE)" || bad "write-time status=$B1_WSTATUS (want live)"
+awk "BEGIN{exit !($B1_WWEIGHT > 0)}" && ok "write-time weight=$B1_WWEIGHT (>0 readout)" || bad "write-time weight=$B1_WWEIGHT (want >0)"
+[ -f "$STORE" ] && ok "store NDJSON created at the isolated home (the seam's shared store)" || bad "store not created at $STORE"
+
+# 1b. READ before mutation — get the same id; with NO git change it re-verifies live.
+mem get --id "$E1_ID"
+B1_R0_STATUS="$(jget "['status']")"
+[ "$B1_R0_STATUS" = "live" ] && ok "read before mutation → live (claim still matches HEAD)" || bad "pre-mutation read status=$B1_R0_STATUS (want live)"
+
+# 1c. MUTATE git — a REAL commit advances db/store.py: PostgresStore → MySQLStore. The
+# claim's ref symbol is now GONE at HEAD. This is a real git operation, not a flag flip.
+M_SHA="$(gitcommit db/store.py "class MySQLStore:
+    def connect(self):
+        return 'mysql'
+
+    def query(self, sql):
+        return self.connect() + ':' + sql" "M: mysql adapter (PostgresStore gone)")"
+[ "$M_SHA" != "$P_SHA" ] && ok "git mutated by a REAL commit (HEAD advanced P→M)" || bad "git did not advance (M_SHA==P_SHA)"
+
+# 1d. READ after mutation, NO re-write — read-time re-verification must mark it stale.
+# This is the CARDINAL, FALSIFIABLE assertion: the SAME entry, no write between, must
+# come back stale because git says PostgresStore is gone — detected AT READ.
+mem get --id "$E1_ID"
+B1_R1_STATUS="$(jget "['status']")"
+B1_R1_WEIGHT="$(jget "['weight']")"
+B1_R1_REASON="$(jget "['reason']")"
+[ "$B1_R1_STATUS" = "stale" ] \
+  && ok "CARDINAL: read-time re-verify → status=stale (PostgresStore gone at HEAD); a stale entry served as LIVE would RED the gate" \
+  || bad "CARDINAL FAIL: post-mutation read status=$B1_R1_STATUS (want stale) — a stale entry was served as live"
+awk "BEGIN{exit !($B1_R1_WEIGHT == 0)}" && ok "read-time weight=0 because git says stale (not because time passed)" || bad "post-mutation weight=$B1_R1_WEIGHT (want 0)"
+case "$B1_R1_REASON" in *PostgresStore*|*"no longer"*|*absent*) ok "stale reason cites the git evidence: $B1_R1_REASON";; *) bad "stale reason does not cite git evidence: $B1_R1_REASON";; esac
+
+# 1e. PROVENANCE OF THE STALENESS — the on-disk store STILL holds the original live
+# snapshot. So the stale verdict came from the READ-TIME re-check, not a stored value
+# (the stored status is never trusted). This is what makes #1 an integration proof, not
+# a stored-flag read.
+grep -q '"status":"live"' "$STORE" \
+  && ok "stored snapshot still says live → the stale verdict is from the READ re-check, not the store" \
+  || bad "store no longer holds the original live snapshot (cannot prove read-time derivation)"
