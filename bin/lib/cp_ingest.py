@@ -1,0 +1,317 @@
+#!/usr/bin/env python3
+# cp_ingest.py — piece (b) of the Heimdall control plane: OBSERVE INGEST (§5).
+#
+# DESIGN DOSSIER §5/§10/§11 (authoritative). Instances PUSH their `hmd report`
+# telemetry (a batch of NDJSON events) to the server; the server writes them to the
+# observability store, partitioned by instance HAID. The dashboard (cp_dashboard.py)
+# reads that store. THIS module is DATA INGEST ONLY — it NEVER executes anything.
+#
+# THE FOUR CARDINAL PROPERTIES this module pins (each falsifiable in the test):
+#
+#   1. PKI-VERIFIED (§3) — ingest is wired in behind cp_server's auth chokepoint:
+#      register_route("POST", "/ingest", ...) receives the ALREADY-verified Identity
+#      (the server ran cp_auth.verify_identity before the route runs). An unsigned /
+#      forged / unknown push never reaches the handler — it is a 401 at the server
+#      seam. The handler is reached ONLY by an authenticated instance, and it stores
+#      under THAT instance's verified HAID (a client cannot write another dev's
+#      partition — the store key is the verified identity, never a body field).
+#
+#   2. NO-SECRET-BY-CONSTRUCTION (§5/§7) — the server RE-RUNS telemetry.build_event
+#      on EVERY pushed line server-side. A line that is off-schema (event_type not in
+#      EVENT_TYPES) is DROPPED; every free-ish field passes through telemetry._scrub
+#      (bounded + secret-rejected). A client CANNOT inject a secret-bearing or
+#      off-schema line — the discipline is enforced at the BOUNDARY, not trusted from
+#      the client. The store is gitleaks-clean by construction (scrub) AND by gate
+#      (the wave-3 / piece-b secret-scan over the store).
+#
+#   3. DATA-ONLY, EXECUTES NOTHING (§2/§5) — ingest writes events; it has NO dispatch
+#      path, calls NO handler, resolves NO action_type, runs NO subprocess. There is
+#      no `action_type`/`cmd`/`exec`/`handler` field in the ingest wire schema and no
+#      code path from this module into cp_handlers / cp_server.dispatch. A pushed
+#      payload is rendered as STORED DATA, never as a thing to run. This preserves the
+#      §2 control/data-plane line: instances push data in, they never push commands.
+#
+#   4. PARTITIONED + AUDITED (§5/§9) — the store lands at
+#      ${HEIMDALL_HOME}/control-plane/observe/<instance_haid>/events.ndjson (NDJSON so
+#      gitleaks scans it as plaintext). Every accepted batch writes one cp_audit
+#      `ingest` row (params-shape only — counts, never values).
+#
+# THE INTERFACE the server + dashboard BIND to (stable):
+#   register(*, home=None)                 — wire POST /ingest into cp_server's seam.
+#   ingest_route(identity, request, ...)   — the route handler (verified Identity in).
+#   ingest_batch(instance_haid, events, ...) -> dict — the pure boundary: re-run
+#                                            build_event per line, store, audit.
+#   observe_dir / instance_store_path      — the partitioned store layout.
+#   stored_instances(home) / read_instance(haid, home) — the dashboard read path.
+#
+# stdlib-only (json/os/sys) + the sibling substrate (cp_server/cp_auth/cp_audit) and
+# the reused telemetry layer — minimal self-host deps, never re-derives discipline.
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+
+import cp_audit     # REUSE the §9 audit writer — one `ingest` row per accepted batch.
+import cp_auth      # the Identity shape the verified route receives (§3).
+import cp_server    # REUSE register_route + Response — the registration seam (§10).
+import issue_queue  # REUSE heimdall_home() — the store root, never re-derived.
+import telemetry    # REUSE build_event + _scrub — no-secret-by-construction (§5/§7).
+
+# ── store layout (partitioned by the VERIFIED instance HAID — §5) ──────────────
+#
+# Mirrors telemetry.py's own store choice (an NDJSON events.ndjson) so the dashboard
+# can read each partition with the EXACT same line-scan telemetry/report use. The
+# partition KEY is the instance HAID the server VERIFIED — never a client-supplied
+# field, so a push cannot land in another dev's partition.
+
+# A conservative slug for a HAID used as a directory name. A HAID is a deterministic
+# identity name (`haid:rj.mbp-7f3a`); we keep [A-Za-z0-9._-] and map everything else
+# (the `:` and `/role`) to `_` so the partition dir is filesystem-safe + bounded.
+_SLUG_MAX = 80
+
+
+def _slug(haid):
+    """A filesystem-safe, bounded directory slug for a HAID. Keeps the identity name
+    readable (so the store is human-greppable) while refusing any path-traversal or
+    odd char. Returns 'unknown' for an empty/None HAID (an unattributed batch still
+    stores, but never escapes its partition)."""
+    raw = str(haid or "").strip()
+    if not raw:
+        return "unknown"
+    out = []
+    for ch in raw[:_SLUG_MAX]:
+        out.append(ch if (ch.isalnum() or ch in "._-") else "_")
+    slug = "".join(out).strip("._-")
+    return slug or "unknown"
+
+
+def observe_dir(home=None):
+    """The observe store root: ${HEIMDALL_HOME}/control-plane/observe/."""
+    base = home if home else issue_queue.heimdall_home()
+    return os.path.join(base, "control-plane", "observe")
+
+
+def instance_dir(instance_haid, home=None):
+    """One instance's partition dir under the observe store (slugged HAID)."""
+    return os.path.join(observe_dir(home), _slug(instance_haid))
+
+
+def instance_store_path(instance_haid, home=None):
+    """Absolute path to one instance's append-only observe NDJSON log."""
+    return os.path.join(instance_dir(instance_haid, home), "events.ndjson")
+
+
+# ── the no-secret boundary: re-run build_event server-side per pushed line (§5) ─
+
+
+def _rebuild_event(line):
+    """Re-run telemetry.build_event on ONE pushed event dict SERVER-SIDE. This is the
+    no-secret-by-construction boundary: a client cannot inject an off-schema or
+    secret-bearing line, because the server rebuilds the event from the pinned schema
+    keys — every free-ish field passes through telemetry._scrub (bounded + secret-
+    rejected) and an event_type not in EVENT_TYPES yields None (the line is DROPPED).
+
+    Returns the clean, scrubbed event dict, or None when the line is dropped (not a
+    dict, or an off-schema event_type). Pure — no IO, never executes anything."""
+    if not isinstance(line, dict):
+        return None
+    # Pull ONLY the pinned schema keys; an unknown wire field is ignored entirely
+    # (it never reaches the store). build_event re-validates + scrubs each.
+    return telemetry.build_event(
+        line.get("event_type"),
+        run_id=line.get("run_id"),
+        phase=line.get("phase"),
+        step=line.get("step"),
+        outcome=line.get("outcome"),
+        gate=line.get("gate"),
+        tokens=line.get("tokens"),
+        duration_ms=line.get("duration_ms"),
+        commit=line.get("commit"),
+        error=line.get("error"),
+        loc=line.get("loc"),
+        extra=line.get("extra"),
+    )
+
+
+def _append_events(instance_haid, events, home=None):
+    """Append already-rebuilt (clean) event dicts to the instance's observe NDJSON log
+    (one open('a') + one line each + flush — mirrors telemetry._append). Returns the
+    count written, or 0 on any IO failure (the ingest degrades to a dropped batch
+    rather than crashing the request — the handler surfaces that)."""
+    if not events:
+        return 0
+    try:
+        ldir = instance_dir(instance_haid, home)
+        os.makedirs(ldir, exist_ok=True)
+        path = os.path.join(ldir, "events.ndjson")
+        with open(path, "a", encoding="utf-8") as fh:
+            for ev in events:
+                fh.write(json.dumps(ev, sort_keys=True, separators=(",", ":")) + "\n")
+            fh.flush()
+        return len(events)
+    except OSError:
+        return 0
+
+
+# ── the pure ingest boundary (re-run build_event → store → audit — §5/§9) ──────
+
+
+def ingest_batch(instance_haid, events, *, home=None):
+    """THE ingest boundary (§5): take a pushed batch of telemetry event dicts under a
+    VERIFIED instance HAID, RE-RUN telemetry.build_event on each (the no-secret /
+    on-schema boundary), STORE the clean events in that instance's partition, and
+    AUDIT the batch. DATA ONLY — never resolves an action_type, never runs a handler,
+    never spawns a process.
+
+    Returns a result dict:
+      {"instance_haid", "received", "stored", "dropped", "audit_id", "path"}
+    where `received` is the count pushed, `stored` the count that survived the
+    rebuild + write, `dropped` = received − stored (off-schema / secret-bearing lines
+    the boundary refused). Never raises into the caller — a bad batch degrades to
+    dropped lines, not a crash."""
+    received = len(events) if isinstance(events, (list, tuple)) else 0
+    clean = []
+    if isinstance(events, (list, tuple)):
+        for line in events:
+            ev = _rebuild_event(line)
+            if ev is not None:
+                clean.append(ev)
+    stored = _append_events(instance_haid, clean, home=home)
+    # AUDIT one ingest row — params-SHAPE only (counts), never the pushed values.
+    audit_id = cp_audit.write(
+        "ingest", actor_haid=instance_haid,
+        params={"received": received, "stored": stored},
+        outcome="ok" if stored else "refused",
+        detail="observe batch ingested", home=home,
+    )
+    return {
+        "instance_haid": instance_haid,
+        "received": received,
+        "stored": stored,
+        "dropped": received - stored,
+        "audit_id": audit_id,
+        "path": instance_store_path(instance_haid, home),
+    }
+
+
+# ── the route handler (verified Identity in — the server already authed it, §3) ─
+
+
+def _parse_events(request):
+    """Extract the pushed event LIST from a request dict. The wire body is JSON:
+    either a bare list of event dicts, or {"events": [...]}. Returns the list (or []
+    for a malformed / empty body). Tolerant — a bad body yields no events, never a
+    crash. Recognizes NOTHING executable: there is no action_type/cmd/handler key in
+    this schema and none is honored even if a client sends one."""
+    body = request.get("body") if isinstance(request, dict) else None
+    if body is None:
+        return []
+    if isinstance(body, (bytes, bytearray)):
+        try:
+            body = body.decode("utf-8")
+        except (UnicodeDecodeError, AttributeError):
+            return []
+    if isinstance(body, str):
+        try:
+            body = json.loads(body or "null")
+        except (ValueError, TypeError):
+            return []
+    if isinstance(body, list):
+        return body
+    if isinstance(body, dict):
+        evs = body.get("events")
+        return evs if isinstance(evs, list) else []
+    return []
+
+
+def ingest_route(identity, request, *, home=None):
+    """The POST /ingest route handler (§5). The server ran the §3 auth chokepoint
+    BEFORE this runs, so `identity` is a VERIFIED cp_auth.Identity — an unsigned /
+    forged / unknown / revoked push never reaches here (it is a 401 at the seam). The
+    store partition key is identity.haid (the VERIFIED HAID), NEVER a body field — a
+    client cannot write into another instance's partition.
+
+    Re-runs build_event per line (no-secret boundary), stores, audits, returns a
+    cp_server.Response. DATA ONLY — it dispatches nothing, runs no handler, never
+    executes. Returns 200 with the batch summary on a write, 422 when no usable
+    event survived (an all-dropped batch is refused, audited)."""
+    haid = identity.haid if isinstance(identity, cp_auth.Identity) else identity
+    events = _parse_events(request)
+    result = ingest_batch(haid, events, home=home)
+    if result["stored"] <= 0:
+        return cp_server.Response(
+            422,
+            {"ingested": False, "reason": "no_storable_events",
+             "received": result["received"], "stored": 0,
+             "dropped": result["dropped"]},
+            audit_id=result["audit_id"],
+        )
+    return cp_server.Response(
+        200,
+        {"ingested": True, "instance_haid": haid,
+         "received": result["received"], "stored": result["stored"],
+         "dropped": result["dropped"]},
+        audit_id=result["audit_id"],
+    )
+
+
+def register(*, home=None):
+    """Wire POST /ingest into cp_server's registration seam (§10) WITHOUT editing
+    cp_server. Returns the registered (method, path) key. The handler closes over the
+    runtime `home` so a self-host deployment / a test can pin its store root. After
+    this, an authenticated instance POSTing /ingest reaches ingest_route with its
+    verified Identity. Idempotent — re-registering replaces the route."""
+    return cp_server.register_route(
+        "POST", "/ingest",
+        lambda identity, request: ingest_route(identity, request, home=home),
+    )
+
+
+# ── the dashboard read path: stored instances + per-instance events (§5) ───────
+
+
+def stored_instances(home=None):
+    """The list of instance partition slugs present in the observe store (the devs
+    who have pushed). Read-only; an absent store yields [] (honest empty). The
+    dashboard groups its cross-dev aggregate over these."""
+    root = observe_dir(home)
+    try:
+        names = sorted(
+            n for n in os.listdir(root)
+            if os.path.isdir(os.path.join(root, n))
+        )
+    except OSError:
+        return []
+    return names
+
+
+def read_instance(instance_slug, home=None):
+    """Stream one instance partition's stored events (the dashboard's per-dev scan).
+    `instance_slug` is a directory slug from stored_instances (already partition-safe).
+    Tolerant: a bad line is skipped, an absent partition yields []. Read-only — never
+    writes, never executes."""
+    out = []
+    path = os.path.join(observe_dir(home), _slug(instance_slug), "events.ndjson")
+    if not os.path.isfile(path):
+        return out
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for raw in fh:
+                line = raw.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except (ValueError, TypeError):
+                    continue
+                if isinstance(obj, dict):
+                    out.append(obj)
+    except OSError:
+        return out
+    return out
