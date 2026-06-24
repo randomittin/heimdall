@@ -1,0 +1,233 @@
+#!/usr/bin/env bash
+# heimdall-collision — TEAM MODE P3 (F4), the same-target-CHANGED collision
+# detector + surfacer. DISTINCT from F3 Redum:
+#
+#   Redum (heimdall-redum)  = "you both MADE your own X" — REDUNDANT CREATION.
+#   Collision (this binary) = "you both TOUCHED X" — SAME-THING-CHANGED: two
+#                             branches edited the SAME existing function/file/
+#                             symbol. Redum dedupes new work; collision surfaces a
+#                             coordination conflict on shared work.
+#
+# NOT heimdall-resolve: that is the SYMBOL TABLE (F12→path compression), NOT a
+# merge resolver. This is a NEW binary built on SI-3 (bin/heimdall-branch-context)
+# + the collision engine (bin/lib/collision.py). It does NOT extend heimdall-resolve.
+#
+# A QUERY ON SI-3, OWN-BRANCH-FIRST: detection is SI-3's git-mechanical branch
+# reader (merge-base / diff --name-only / tree-sitter changed-symbols). This
+# binary classifies each overlap SI-3 surfaces and frames it relative to the
+# CURRENT branch ("your handleLogin vs feat-b's handleLogin").
+#
+# SURFACE OVER AUTO-MERGE (the "nothing ships unproven" ethos): a collision is
+# CLASSIFIED, never silently merged —
+#   • safe-textual → the two branches changed DISJOINT line regions, or made the
+#     IDENTICAL change: a three-way textual merge applies cleanly. Reported as
+#     auto-resolvable; the binary still writes NO merged file (the merge tool /
+#     human applies it — the binary's job is the honest verdict, not the merge).
+#   • flag-human   → the SAME function/symbol body DIVERGED: a SEMANTIC collision.
+#     It MUST go to a human. A divergent same-symbol body is NEVER classified safe.
+#
+# SOLO/OFF → IDENTICAL: one branch → no siblings → 0 collisions, no record, no
+# crash (the mandatory Heimdall solo-sacrosanct pattern).
+#
+# SECRET-FREE STORE: the git-tracked record (.planning/ledger/collisions/) carries
+# ONLY branch names + target (file/symbol) names + the classification — NEVER
+# code, diffs, or blobs. gitleaks-clean by construction.
+#
+# The engine is bin/lib/collision.py (deterministic, git + tree-sitter, no LLM).
+# This CLI owns argument parsing, JSON I/O, and the record write.
+#
+# Usage:
+#   heimdall-collision scan [--repo DIR] [--no-symbols] [--record] [--quiet]
+#       The PRIMARY default: detect EVERY same-target-CHANGED collision for the
+#       current branch (each file it changed that a sibling also changed), framed
+#       own-branch-first. Prints the scan JSON on stdout; a one-line summary on
+#       stderr. --record also writes the secret-free record to the collisions
+#       store. Exit 0 always (informational); the verdicts are in the JSON.
+#
+#   heimdall-collision query <target> [--repo DIR] [--no-symbols] [--quiet]
+#       Detect collisions for ONE <target> — a file ("src/auth.ts") or a
+#       file#symbol ("src/auth.ts#handleLogin"). Surfaces the sibling branches
+#       that changed the SAME target, classified. Exit 0 always.
+#
+#   heimdall-collision record [--repo DIR] [--no-symbols]
+#       Run a scan and WRITE the secret-free record for the current branch to
+#       .planning/ledger/collisions/{branch-slug}.json (one writer per file →
+#       conflict-free git merges). Prints the record path. No record on a solo
+#       repo (nothing to record).
+#
+#   -h, --help    this help
+#
+# Exit status:
+#   0  success (scan/query emitted, record written — a collision is DATA, not an
+#      error; surfacing it is the whole point)
+#   2  usage error / not a git repo / python missing
+# It never crashes on a solo repo, a detached HEAD, or a missing tree-sitter:
+# those degrade to an honest empty / file-level result.
+
+set -euo pipefail
+
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+BIN_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+LIB="$BIN_DIR/lib/collision.py"
+
+usage() { sed -n '2,63p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+PY="$(command -v python3 || command -v python || true)"
+if [ -z "$PY" ]; then
+  echo "error: python3 not found (required for the collision engine)" >&2
+  exit 2
+fi
+
+[ $# -ge 1 ] || { echo "error: a subcommand is required" >&2; usage >&2; exit 2; }
+
+CMD="$1"; shift || true
+case "$CMD" in
+  -h|--help) usage; exit 0 ;;
+esac
+
+# ── shared option parsing ──────────────────────────────────────────────────────
+REPO="$(pwd)"
+WITH_SYMBOLS=1
+DO_RECORD=0
+QUIET=0
+TARGET=""
+
+# `query` takes a positional <target> before the flags.
+if [ "$CMD" = "query" ]; then
+  [ $# -ge 1 ] || { echo "error: query needs a <target> (path or path#symbol)" >&2; exit 2; }
+  case "$1" in
+    --*) echo "error: query needs a <target> before any flag" >&2; exit 2 ;;
+    *) TARGET="$1"; shift ;;
+  esac
+fi
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --repo)       REPO="${2:?--repo needs a dir}"; shift 2 ;;
+    --no-symbols) WITH_SYMBOLS=0; shift ;;
+    --record)     DO_RECORD=1; shift ;;
+    --quiet)      QUIET=1; shift ;;
+    -h|--help)    usage; exit 0 ;;
+    --*)          echo "error: unknown option: $1" >&2; usage >&2; exit 2 ;;
+    *)            echo "error: unexpected argument: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+if [ ! -d "$REPO" ]; then
+  echo "error: not a directory: $REPO" >&2
+  exit 2
+fi
+REPO="$(cd "$REPO" && pwd)"
+
+if ! git -C "$REPO" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  echo "error: --repo is not a git repository: $REPO" >&2
+  exit 2
+fi
+
+# The collision store lives in the REPO under inspection (it is per-repo,
+# git-tracked the same way claims/ and activity/ are), keyed by the current
+# branch's slug → one writer per file, conflict-free merges. HEIMDALL_PLANNING_DIR
+# overrides the location (tests / non-standard layouts); otherwise it is the
+# target repo's own .planning. NOT plugin-relative — a record about feat-a's
+# collisions belongs in feat-a's repo, not wherever the binary happens to live.
+PLANNING_DIR="${HEIMDALL_PLANNING_DIR:-$REPO/.planning}"
+COLLISIONS_DIR="$PLANNING_DIR/ledger/collisions"
+
+# Filesystem-safe slug for a branch name (matches heimdall-claim's haid_slug:
+# '/' and ':' → '_', so a feat/x branch maps to a legal filename).
+branch_slug() { printf '%s' "$1" | tr '/:' '__'; }
+
+case "$CMD" in
+  scan)
+    REPO="$REPO" WITH_SYMBOLS="$WITH_SYMBOLS" DO_RECORD="$DO_RECORD" \
+    QUIET="$QUIET" COLLISIONS_DIR="$COLLISIONS_DIR" LIB="$LIB" "$PY" - <<'PYEOF'
+import json, os, sys, datetime
+sys.path.insert(0, os.path.dirname(os.environ["LIB"]))
+import collision as C
+
+repo = os.environ["REPO"]
+with_symbols = os.environ["WITH_SYMBOLS"] == "1"
+do_record = os.environ["DO_RECORD"] == "1"
+quiet = os.environ["QUIET"] == "1"
+
+res = C.scan(repo, with_symbols=with_symbols)
+if not quiet:
+    sys.stderr.write(C.scan_summary(res) + "\n")
+json.dump(res, sys.stdout, indent=2, sort_keys=True)
+sys.stdout.write("\n")
+
+if do_record and not res.get("solo"):
+    rec = C.record_for(res)
+    rec["recorded_at"] = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    cur = rec.get("current") or "detached"
+    slug = cur.replace("/", "_").replace(":", "_")
+    cdir = os.environ["COLLISIONS_DIR"]
+    os.makedirs(cdir, exist_ok=True)
+    dest = os.path.join(cdir, slug + ".json")
+    tmp = dest + ".tmp.%d" % os.getpid()
+    with open(tmp, "w") as fh:
+        json.dump(rec, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+    os.replace(tmp, dest)
+    sys.stderr.write("collision record written: %s\n" % dest)
+PYEOF
+    ;;
+
+  query)
+    REPO="$REPO" TARGET="$TARGET" WITH_SYMBOLS="$WITH_SYMBOLS" \
+    QUIET="$QUIET" LIB="$LIB" "$PY" - <<'PYEOF'
+import json, os, sys
+sys.path.insert(0, os.path.dirname(os.environ["LIB"]))
+import collision as C
+
+repo = os.environ["REPO"]
+target = os.environ["TARGET"]
+with_symbols = os.environ["WITH_SYMBOLS"] == "1"
+quiet = os.environ["QUIET"] == "1"
+
+res = C.detect_target(repo, target, with_symbols=with_symbols)
+if not quiet:
+    sys.stderr.write(C.target_summary(res) + "\n")
+json.dump(res, sys.stdout, indent=2, sort_keys=True)
+sys.stdout.write("\n")
+PYEOF
+    ;;
+
+  record)
+    REPO="$REPO" WITH_SYMBOLS="$WITH_SYMBOLS" \
+    COLLISIONS_DIR="$COLLISIONS_DIR" LIB="$LIB" "$PY" - <<'PYEOF'
+import json, os, sys, datetime
+sys.path.insert(0, os.path.dirname(os.environ["LIB"]))
+import collision as C
+
+repo = os.environ["REPO"]
+with_symbols = os.environ["WITH_SYMBOLS"] == "1"
+
+res = C.scan(repo, with_symbols=with_symbols)
+sys.stderr.write(C.scan_summary(res) + "\n")
+if res.get("solo"):
+    sys.stderr.write("solo repo — no siblings, no collision record written\n")
+    sys.exit(0)
+
+rec = C.record_for(res)
+rec["recorded_at"] = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+cur = rec.get("current") or "detached"
+slug = cur.replace("/", "_").replace(":", "_")
+cdir = os.environ["COLLISIONS_DIR"]
+os.makedirs(cdir, exist_ok=True)
+dest = os.path.join(cdir, slug + ".json")
+tmp = dest + ".tmp.%d" % os.getpid()
+with open(tmp, "w") as fh:
+    json.dump(rec, fh, indent=2, sort_keys=True)
+    fh.write("\n")
+os.replace(tmp, dest)
+print(dest)
+PYEOF
+    ;;
+
+  *)
+    echo "error: unknown subcommand: $CMD (expected scan|query|record)" >&2
+    usage >&2
+    exit 2
+    ;;
+esac
