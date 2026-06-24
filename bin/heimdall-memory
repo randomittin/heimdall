@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# heimdall-memory — Verified-Memory CLI (VM piece B), the thin wrapper over
+# bin/lib/verified_memory.py. Code memory where staleness is DECIDED by git, not
+# estimated by a decay timer: a memory entry is a checkable claim, and every READ
+# re-verifies that claim against git ground truth (the load-bearing novelty —
+# staleness bites at retrieval, months after write).
+#
+#   heimdall-memory write --repo DIR --claim "<claim>" --commit REF \
+#                         [--ref PATH[:SYMBOL[:KIND]] ...] [--id ID] \
+#                         [--provenance measured|estimated|null]
+#       CREATE/UPDATE an entry and VERIFY it against git AT WRITE TIME. The entry is
+#       persisted with the DERIVED status + weight-as-readout — never a hand-set
+#       weight stored as truth. The claim passes the telemetry secret/shape gate;
+#       a secret-shaped claim is REJECTED (exit 3), never stored. --id updates an
+#       existing entry (a new revision appended to the audit log).
+#
+#   heimdall-memory get --repo DIR --id ID
+#       RETRIEVE an entry with READ-TIME RE-VERIFICATION. The stored status is never
+#       trusted: the git-check re-runs on read, so a stale entry is returned MARKED
+#       stale (status=stale, weight=0), never served as live. This is the core.
+#
+#   heimdall-memory list --repo DIR [--status live|stale|conflicted] [--live-only]
+#       LIST every current entry (latest revision per id), each re-verified at read
+#       time, sorted by the read-time weight readout. --live-only drops every
+#       non-live entry (the served-context view that must never leak a stale entry).
+#
+#   heimdall-memory verify --repo DIR --id ID
+#       RE-VERIFY one stored entry against git, including the read-time cache stats.
+#
+#   heimdall-memory reconcile --repo DIR --id ID [--id ID ...]
+#       RECONCILE a conflicting set toward git (git wins). All-but-one stale →
+#       auto-resolve (the lone git-live entry wins). >=2 mutually-live contradictory
+#       claims → conflicted → human escalation (the only intent question git can't
+#       answer). decided_by is always "git".
+#
+# The store is gitignored runtime NDJSON at
+#   ${HEIMDALL_HOME:-<repo>/.heimdall}/memory/entries.ndjson
+# (REUSE issue_queue.heimdall_home — never re-derive). NDJSON so gitleaks scans it
+# natively; every claim passes the telemetry _scrub gate so the store stays clean.
+#
+# Reuse, don't rebuild: the git-check is piece A (bin/lib/vm_gitcheck.py); the
+# runtime home is issue_queue.heimdall_home; the secret gate is telemetry._scrub.
+# Piece B adds only the store + lifecycle on top.
+#
+# Exit status:
+#   0  success (write persisted / entry retrieved / list / verify / reconcile).
+#   2  usage error, missing entry, or store write failure.
+#   3  write REJECTED by the secret/shape gate (an honest refusal, not a crash).
+
+set -euo pipefail
+
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+BINDIR="$(dirname "$SELF")"
+ENGINE="$BINDIR/lib/verified_memory.py"
+
+usage() { sed -n '2,46p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+PY="$(command -v python3 || command -v python || true)"
+if [ -z "$PY" ]; then
+  echo "error: python3 not found (required for heimdall-memory)" >&2
+  exit 2
+fi
+if [ ! -f "$ENGINE" ]; then
+  echo "error: engine missing at $ENGINE" >&2
+  exit 2
+fi
+
+[ $# -ge 1 ] || { usage >&2; exit 2; }
+
+case "$1" in
+  -h|--help) usage; exit 0 ;;
+esac
+
+# The bash wrapper owns argv presentation; the python engine owns parsing + the
+# JSON stdout shape + the exit codes (write|get|list|verify|reconcile). Pass argv
+# straight through so the two stay in lock-step (no duplicated flag list to drift).
+exec "$PY" "$ENGINE" "$@"
