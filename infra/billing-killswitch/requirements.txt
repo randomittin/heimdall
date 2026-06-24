@@ -1,0 +1,6 @@
+# Cloud Billing kill-switch — pinned GCP libs the import path uses.
+# main.py imports googleapiclient.discovery (the discovery client for
+# cloudbilling v1). google-auth is the transitive auth backend the Functions
+# runtime uses to authenticate the service account; pinned for reproducibility.
+google-api-python-client==2.137.0
+google-auth==2.32.0
