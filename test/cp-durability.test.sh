@@ -36,6 +36,25 @@
 # The test PRINTS which mode it used.
 #
 # Exit 0 = both contrast halves hold. Nonzero = the durability gate failed (prints which).
+#
+# REAL-EMULATOR VALIDATION (recorded so the evidence is durable). The gate was run against
+# the REAL google.cloud.firestore client (pinned google-cloud-firestore==2.16.1, matching
+# deploy/requirements-firestore.txt) talking to a LIVE local Firestore emulator — exercising
+# real transaction / @firestore.transactional / order_by(seq).stream() / subcollection /
+# doc-id semantics, not the in-process fake. It reported MODE=emulator, 9/9 PASS, both halves
+# (local LOST, firestore SURVIVED); the SHIPPED FirestoreBackend needed NO code change for the
+# real client. Falsifiability was re-confirmed against the real client (keying the Firestore
+# root to HEIMDALL_HOME flips the firestore half RED). To reproduce locally (ZERO real GCP):
+#
+#   gcloud components install cloud-firestore-emulator     # needs a Java 21+ JRE on PATH
+#   pip install google-cloud-firestore==2.16.1 --break-system-packages
+#   gcloud emulators firestore start --host-port=localhost:8085 &   # reap it when done
+#   export FIRESTORE_EMULATOR_HOST=localhost:8085
+#   bash test/cp-durability.test.sh                        # prints "MODE=emulator"
+#
+# IMPORTANT: the emulator's JVM requires a Java 21+ JRE. With an older JRE the self-started
+# emulator (mode 1 below) fails to boot; that failure is now PRINTED (not a silent fake), and
+# a caller-set FIRESTORE_EMULATOR_HOST (mode 0) forces real mode regardless of the self-start.
 
 set -uo pipefail
 
@@ -79,8 +98,36 @@ export HEIMDALL_FIRESTORE_ROOT="durability_gate"
 export HEIMDALL_FIRESTORE_PROJECT="cp-durability-test"
 
 # ── decide the mode: emulator (real client + emulator) vs faithful in-process fake ──
+#
+# Mode precedence (most explicit wins):
+#   (0) EXTERNAL EMULATOR — FIRESTORE_EMULATOR_HOST already set by the caller AND the real
+#       client lib installed → FORCE real "emulator" mode against that pre-started emulator.
+#       The test does NOT start or own the emulator here; the caller is (the documented
+#       flow: `gcloud emulators firestore start --host-port=localhost:8085 & ;
+#       export FIRESTORE_EMULATOR_HOST=localhost:8085 ; bash test/cp-durability.test.sh`).
+#       This guarantees a set host + installed client can NEVER silently degrade to the
+#       fake — the gap an internal-emulator boot failure (e.g. a too-old JRE) used to hide.
+#       No EMU_PID is captured (we did not start it) so cleanup leaves it to the caller.
+#   (1) SELF-STARTED EMULATOR — else, if gcloud's emulator + the client are both present,
+#       start the emulator ourselves, point the client at it, reap it in the trap. If our
+#       emulator fails to boot/advertise (e.g. the Java 21+ JRE it needs is absent) we
+#       PRINT why and fall through — the degrade is now VISIBLE, not silent.
+#   (2) FAKE — else, the faithful in-process double.
 MODE=""
-if command -v gcloud >/dev/null 2>&1 \
+
+# (0) EXTERNAL EMULATOR — caller pre-started one and exported its host.
+if [ -n "${FIRESTORE_EMULATOR_HOST:-}" ] \
+   && "$PY" -c "import google.cloud.firestore" >/dev/null 2>&1; then
+  # Honor the caller's emulator verbatim. We did NOT start it → keep EMU_PID empty so the
+  # trap does not kill a process we do not own.
+  EMU_PID=""
+  MODE="emulator"
+  echo "cp-durability: using caller-provided FIRESTORE_EMULATOR_HOST=$FIRESTORE_EMULATOR_HOST (real client, external emulator)"
+fi
+
+# (1) SELF-STARTED EMULATOR — only when the caller did not pre-set a host.
+if [ -z "$MODE" ] \
+   && command -v gcloud >/dev/null 2>&1 \
    && gcloud beta emulators firestore --help >/dev/null 2>&1 \
    && "$PY" -c "import google.cloud.firestore" >/dev/null 2>&1; then
   # EMULATOR MODE — start the emulator, capture its host, point the client at it.
@@ -98,6 +145,13 @@ if command -v gcloud >/dev/null 2>&1 \
     export FIRESTORE_EMULATOR_HOST="$EMU_HOST"
     MODE="emulator"
   else
+    # The self-started emulator never advertised (commonly: the emulator needs a Java 21+
+    # JRE and the one on PATH is older). Make the degrade VISIBLE, not a silent fake.
+    echo "cp-durability: self-started emulator did not advertise $EMU_HOST — falling back to fake." >&2
+    echo "cp-durability: emulator log tail:" >&2
+    tail -3 "$EXT/emu.log" >&2 2>/dev/null || true
+    echo "cp-durability: to force REAL mode, start an emulator yourself and export FIRESTORE_EMULATOR_HOST (needs a Java 21+ JRE on PATH)." >&2
+    [ -n "$EMU_PID" ] && kill "$EMU_PID" >/dev/null 2>&1
     EMU_PID=""
   fi
 fi
