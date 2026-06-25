@@ -59,16 +59,18 @@ Rules (enforced, not advisory):
 | Holds | server PKI keys, owner identity, audit log, allowlist | NO control-plane secrets reachable from inside a job |
 | Never | reaches into a dev laptop to execute (that is **RCE — REFUSED**) | — |
 
-**The line:** the server runs ITS OWN jobs in an **isolated execution env** (a sandboxed worker: separate process + dropped privileges + scrubbed env + no mount of the server's key dir / audit store / DB creds). A job dispatched via the allowlist executes there. The server **NEVER** opens a reverse channel into an instance to make it run something — instances *pull* notifications (§8, data) and *push* telemetry (§5), they never *receive commands*.
+**The line:** the server runs ITS OWN jobs in an **isolated execution env** (worker: scrubbed env allowlist + path-deny + per-job scratch `HEIMDALL_HOME`, proven by integration test cardinal #8). A job dispatched via the allowlist executes there. The server **NEVER** opens a reverse channel into an instance to make it run something — instances *pull* notifications (§8, data) and *push* telemetry (§5), they never *receive commands*.
 
-**Isolation invariant (must be real, not aspirational):** a job process cannot read the control plane's PKI private key, the audit DB, or another job's workspace. Enforced by: dedicated low-priv `cp-worker` uid, `HEIMDALL_HOME` pointed at a per-job scratch dir, env allowlist (only the job's validated params + a scoped token), no inbound socket to the control DB. **A control-plane compromise must NOT equal a fleet compromise** — that is the whole point of the separation.
+**Current isolation level:** in-process Python (env allowlist + path deny). Sufficient for the internal ~7-8 dev team — tested, not aspirational. **OS-level sandbox** (separate process + dropped privileges + container boundary) is the seam in `cp_worker.py`; it is built when job execution is opened to external/untrusted users. See ADR-2 in `heimdall-control-plane-decisions.md`.
+
+**Isolation invariant (must be real, not aspirational):** a job process cannot read the control plane's PKI private key, the audit DB, or another job's workspace. Currently enforced by: in-process env allowlist (only validated params + scoped token), path-deny for PKI key dir + audit store, `HEIMDALL_HOME` pointed at a per-job scratch dir, no inbound socket to the control DB. Proven by integration test cardinal #8. When external users are added: upgrade to dedicated low-priv `cp-worker` uid + subprocess boundary (seam: `cp_worker.py`). **A control-plane compromise must NOT equal a fleet compromise** — that is the whole point of the separation.
 
 ---
 
 ## 3. PKI AUTH (HAID is the basis; keys are the gap)
 
 - **Per-instance identity = HAID** (`haid:rj.mbp-7f3a`), already deterministic + stable per checkout. PKI **binds an Ed25519 keypair to each HAID**: instance generates a keypair on `register`, sends the public key, server stores `{haid → pubkey, status}` extending `agents.json`'s registry.
-- **All instance↔server comms encrypted** — TLS for transport; every request **signed** with the instance private key, server verifies against the registered pubkey. Unsigned / bad-sig / unknown-HAID → 401.
+- **All instance↔server comms authenticated (Ed25519 PKI signing) and encrypted in transit (Cloud Run TLS).** Every request is **signed** with the instance private key; server verifies against the registered pubkey. Unsigned / bad-sig / unknown-HAID → 401. TLS termination is provided by Cloud Run — the control plane MUST NOT be exposed on plain HTTP outside Cloud Run. PKI signing proves identity and integrity; Cloud Run TLS provides confidentiality in transit. Together they satisfy the "authenticated and encrypted" requirement. (Decision: ADR-1 in `heimdall-control-plane-decisions.md`.)
 - **Revocation reuses HAID's enforcement primitive verbatim:** `heimdall-haid revoke <haid>` → server refuses that HAID's signed requests (the existing `check` exits nonzero → 401). No new revocation machinery — PKI inherits it.
 - **Owner identity** for gate-override (§7) = a distinguished HAID flagged `owner:true` in the registry; override requires an owner-signed approval.
 - **OAuth/SSO seam (architect, do NOT build):** auth verification sits behind one `cp_auth.verify_identity(request) -> Identity` chokepoint. Internal uses HAID-signature; the external path later swaps in an OIDC verifier returning the same `Identity` shape. Single seam = no scatter. The OIDC verifier is a named interface point, not built now.
@@ -216,7 +218,7 @@ Disjointness: every file has exactly one owning piece. Waves 2(b)-(f) touch no s
 | job survives client disconnect (flight fix) | Start `run-task` job, kill the client process, poll `GET /jobs/{id}` → reaches `done`. |
 | dispatches ONLY allowlisted types; **arbitrary refused (falsifiable)** | POST `action_type:"shell"` → 422 + audit `dispatch_refused`; AND POST valid `run-suite` → dispatches. (Distinguishes refuse-arbitrary from refuse-all → the gate can go RED.) |
 | irreversible needs owner approval + owner can override | `run-suite` (requires_gate) blocks at `pending`; owner-signed `approve` → runs; separate case owner `override` of a `rejected` → runs + audit flags override. |
-| instance↔server PKI-encrypted | Unsigned `POST /ingest` → 401; bad-sig → 401; valid sig → 200. |
+| instance↔server PKI-authenticated + TLS-encrypted (Cloud Run) | Unsigned `POST /ingest` → 401; bad-sig → 401; valid sig → 200. (PKI = identity/integrity; TLS = confidentiality in transit. Never plain HTTP. See ADR-1.) |
 | telemetry store no-secret-by-construction | Push a batch w/ a planted secret-shaped value → stored line is scrubbed; `bin/secret-scan` over the store exits clean. |
 | audit captures every dispatch/approval | After the flow, grep `audit.ndjson` for the dispatch, the approval, and the refusal rows. |
 
@@ -243,7 +245,7 @@ Disjointness: every file has exactly one owning piece. Waves 2(b)-(f) touch no s
 | Risk | Prob | Impact | Mitigation | Owner-task |
 |---|---|---|---|---|
 | Allowlist not truly bounded — a param smuggles a command, or a "flexible" action-type leaks a shell | med | **critical** | `ActionSpec` typed+bounded+pattern params; NO command-string field in any wire schema; falsifiable refusal test that must go RED; new action = reviewed source commit only | (a) allowlist + wave-3 gate |
-| Job-env isolation aspirational not real — a job reads the control-plane key/audit | med | **critical** | dedicated low-priv `cp-worker` uid + scrubbed env allowlist + per-job scratch `HEIMDALL_HOME` + no inbound socket to control DB; explicit isolation-invariant test | (d) worker |
+| Job-env isolation aspirational not real — a job reads the control-plane key/audit | med | **critical** | In-process: env allowlist + path-deny + per-job scratch `HEIMDALL_HOME` + no inbound socket to control DB; proven by integration test cardinal #8 (isolation cardinal must stay green). OS-level sandbox (separate process + dropped privs) built when external users added — seam is `cp_worker.py`. See ADR-2. | (d) worker |
 | Detach/resume loses state on server restart | med | high | state = fold of append-only NDJSON job log; replay-on-boot; reconnect test after simulated restart | (d) jobstore |
 | HAID has no keys today — PKI bolt-on is incomplete | high | high | Ed25519 bind at register; reuse HAID `revoke` as cert-revocation; auth chokepoint test (unsigned/bad-sig/revoked → 401) | (a) cp_auth |
 | Client can inject off-schema / secret telemetry at ingest | med | high | re-run `build_event`+`_scrub` server-side at the boundary; `secret-scan` over store in wave-3 | (b) ingest |
