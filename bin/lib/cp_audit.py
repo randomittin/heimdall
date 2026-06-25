@@ -9,6 +9,11 @@
 # STORE — NDJSON at ${HEIMDALL_HOME}/control-plane/audit/audit.ndjson. NDJSON (not
 # SQLite) so `bin/secret-scan` (gitleaks) scans it natively as plaintext — the
 # secret gate stays armed on the store, mirroring telemetry.py's choice (§9 L155).
+# The bytes are written THROUGH a StateBackend (cp_state, Wave 0): the same compact
+# flush-only NDJSON append + tolerant store-ordered scan, byte-identical on the local
+# backend, durable on Cloud Run when the Wave-2 FirestoreBackend lands — without
+# editing this store. The backend owns the home root + makedirs; the audit no longer
+# re-derives heimdall_home itself (the rel key "audit/audit.ndjson" resolves there).
 #
 # NO-SECRET-BY-CONSTRUCTION — REUSE telemetry._scrub verbatim (never re-derive the
 # secret discipline). The `detail` field passes through _scrub: bounded to <=120
@@ -39,7 +44,13 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
-import issue_queue   # REUSE heimdall_home() — the store lands in the same runtime home.
+import cp_state     # the pluggable persistence backend (Wave 0). The audit log writes
+                   # its append-only NDJSON THROUGH a StateBackend (get_backend) so the
+                   # same flush-only append + tolerant scan becomes durable on Cloud Run
+                   # (Wave 2 FirestoreBackend) WITHOUT editing this store. The local
+                   # backend is byte-identical to the prior NDJSON-to-HEIMDALL_HOME path,
+                   # and it owns heimdall_home() resolution (the audit no longer needs
+                   # issue_queue directly — the backend re-derives the runtime home).
 import telemetry     # REUSE _scrub — the no-secret-by-construction discipline (§9).
 
 # ── schema constants (the pinned audit contract — §9) ─────────────────────────
@@ -68,18 +79,38 @@ AUDIT_OUTCOMES = ("ok", "refused", "error")
 _DETAIL_MAX = telemetry._SCRUB_MAX  # 120 (single source of truth for the bound).
 
 
-# ── store location (REUSE issue_queue.heimdall_home — never re-derive) ─────────
+# ── store location + backend (the persistence SEAM — Wave 0) ───────────────────
+#
+# The audit log addresses its store by paths RELATIVE to ${HEIMDALL_HOME}/control-plane/
+# (the StateBackend rel namespace): the audit dir is "audit/", the log is
+# "audit/audit.ndjson". The backend owns the home root + makedirs + the byte shape;
+# audit_dir/audit_path remain the public absolute-path accessors (now derived from the
+# backend's path(), so they stay byte-identical to the prior layout — and secret-scan
+# keeps a real filesystem path to gitleaks-scan).
+
+# the rel sub-dir the audit log lives under, within control-plane/.
+_AUDIT_REL_DIR = "audit"
+
+# the store-relative path of the append-only audit log: audit/audit.ndjson.
+_AUDIT_REL = os.path.join(_AUDIT_REL_DIR, "audit.ndjson")
+
+
+def _backend(home=None):
+    """The StateBackend for the audit log (HEIMDALL_STATE_BACKEND, default local). `home`
+    pins the store root exactly as every audit accessor's `home=` arg always has."""
+    return cp_state.get_backend(home=home)
 
 
 def audit_dir(home=None):
-    """The audit store dir: ${HEIMDALL_HOME}/control-plane/audit/."""
-    base = home if home else issue_queue.heimdall_home()
-    return os.path.join(base, "control-plane", "audit")
+    """The audit store dir: ${HEIMDALL_HOME}/control-plane/audit/ (the backend's absolute
+    path for the audit rel-dir — unchanged on the local backend)."""
+    return _backend(home).path(_AUDIT_REL_DIR)
 
 
 def audit_path(home=None):
-    """Absolute path to the append-only audit log."""
-    return os.path.join(audit_dir(home), "audit.ndjson")
+    """Absolute path to the append-only audit log (the backend's absolute path for the
+    audit/audit.ndjson rel key — unchanged on the local backend)."""
+    return _backend(home).path(_AUDIT_REL)
 
 
 def _now_iso():
@@ -202,18 +233,14 @@ def write(event, *, actor_haid=None, action_type=None, action_id=None, job_id=No
 def _append(record, home):
     """Write one JSON line to audit.ndjson. Returns True on success, False on any IO
     failure (the audit degrades to a dropped row rather than crashing the request —
-    but a security deployment should monitor for a False here)."""
-    try:
-        ldir = audit_dir(home)
-        os.makedirs(ldir, exist_ok=True)
-        path = os.path.join(ldir, "audit.ndjson")
-        line = json.dumps(record, sort_keys=True, separators=(",", ":"))
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write(line + "\n")
-            fh.flush()
-        return True
-    except OSError:
-        return False
+    but a security deployment should monitor for a False here).
+
+    Routed THROUGH the StateBackend (Wave 0): append_line writes the same compact JSON
+    line with the same flush-only discipline the audit has always used (fsync=False —
+    the audit flushes, it does NOT os.fsync; that durability tier is the §4 jobstore's).
+    Byte-identical on the local backend; the SAME append becomes Cloud-Run-durable when
+    the Wave-2 backend lands."""
+    return _backend(home).append_line(_AUDIT_REL, record, fsync=False)
 
 
 # ── the §1 convenience writers (the cardinal dispatch/refusal pair) ────────────
@@ -247,26 +274,12 @@ def record_refusal(actor_haid, action_type, *, reason=None, params=None,
 
 def read_records(home=None):
     """Stream every audit record from audit.ndjson, parsing each. Tolerant: a bad
-    line is skipped, an absent store yields []. Read-only — never writes."""
-    out = []
-    path = audit_path(home)
-    if not os.path.isfile(path):
-        return out
-    try:
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
-            for raw in fh:
-                line = raw.strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except (ValueError, TypeError):
-                    continue
-                if isinstance(obj, dict):
-                    out.append(obj)
-    except OSError:
-        return out
-    return out
+    line is skipped, an absent store yields []. Read-only — never writes.
+
+    Routed THROUGH the StateBackend (Wave 0): read_lines returns the same tolerant,
+    store-ordered scan (blank/unparseable/non-dict lines skipped, absent store -> [])
+    the audit has always done — the search/export semantics are unchanged."""
+    return _backend(home).read_lines(_AUDIT_REL)
 
 
 def search(home=None, *, actor_haid=None, event=None, action_type=None,
