@@ -43,7 +43,10 @@ PYEOF
 [ -n "$A" ] && ok "A liveness() -> 200, body keys are only {status,version}: $A" \
             || bad "A liveness() did not return a clean 200 body"
 
-# ── B. readiness is 200 ready after boot (routes registered + stores reachable) ─
+# ── B. readiness is 200 ready after boot, LOCAL backend (default) inits cleanly ──
+# Default backend is "local": get_backend() + the cheap read-only probe both succeed, so
+# backend_ready is True and /readyz is 200. This is the happy path the incident broke for
+# firestore but which must stay green for the shipped local-disk dev/test path.
 B="$(LIB="$LIB" "$PY" - <<'PYEOF'
 import os, sys, json
 sys.path.insert(0, os.environ["LIB"])
@@ -56,13 +59,19 @@ assert b["status"] == "ready", b
 assert b["booted"] is True, b
 assert b["stores_reachable"] is True, b
 assert b["routes_registered"] >= 15, b
+assert b["backend"] == "local", b           # default selected backend
+assert b["backend_ready"] is True, b        # the SELECTED backend actually initialized
+assert "reason" not in b, b                 # no reason code on a ready body
 assert b["version"], b
-# content-free: only status booleans + counts + version, no secret-shaped values.
-assert set(b.keys()) == {"status","booted","routes_registered","stores_reachable","version"}, b
+# content-free: only status booleans + counts + the bare backend NAME + version. No key,
+# token, path, or exception text — a fixed, secret-free key set.
+assert set(b.keys()) == {
+    "status","booted","routes_registered","stores_reachable",
+    "backend","backend_ready","version"}, b
 print(json.dumps(b))
 PYEOF
 )"
-[ -n "$B" ] && ok "B readiness() after boot -> 200 ready (routes>=15, stores reachable): $B" \
+[ -n "$B" ] && ok "B readiness() after boot, LOCAL backend -> 200 ready (backend_ready true): $B" \
             || bad "B readiness() did not report ready after boot"
 
 # ── C. readiness is 503 when NOT booted (no routes registered) ─────────────────
@@ -80,6 +89,87 @@ PYEOF
 )"
 [ -n "$C" ] && ok "C readiness() before boot -> 503 not_ready: $C" \
             || bad "C readiness() did not 503 when unbooted"
+
+# ── G. THE INCIDENT: SELECTED backend cannot initialize -> /readyz 503, traffic held ─
+# Reproduces the production miss: HEIMDALL_STATE_BACKEND=firestore but the firestore
+# client lib cannot import (missing dep -> BackendUnavailable from _build_client). Before
+# this fix /readyz returned 200 (it only checked the local audit dir, which was writable)
+# and Cloud Run routed live traffic to a broken instance. Now readiness probes the
+# SELECTED backend's init and MUST 503 with a reason code + the backend name, and the body
+# MUST carry NO secret/path/exception text. The missing-dep import is simulated with a
+# meta_path blocker so the test is hermetic (does not depend on whether the lib is
+# installed). HEIMDALL_CP_PKI_KEY is supplied so boot() succeeds in the firestore/cloud
+# profile (exactly the incident: PKI key present, backend dep missing) and we isolate the
+# BACKEND signal — i.e. it is the backend probe, not boot, that flips readiness to 503.
+G="$(LIB="$LIB" HEIMDALL_STATE_BACKEND=firestore \
+     HEIMDALL_CP_PKI_KEY="$("$PY" -c 'import base64;print(base64.b64encode(b"0"*32).decode())')" \
+     "$PY" - <<'PYEOF'
+import os, sys, json, importlib.abc
+sys.path.insert(0, os.environ["LIB"])
+# Simulate the missing google-cloud-firestore dep: block its lazy import so the
+# FirestoreBackend client build raises BackendUnavailable, exactly as in the incident.
+class _Block(importlib.abc.MetaPathFinder):
+    def find_spec(self, name, path, target=None):
+        if name == "google.cloud.firestore" or name.startswith("google.cloud.firestore."):
+            raise ImportError("simulated missing google-cloud-firestore dep")
+        return None
+sys.meta_path.insert(0, _Block())
+import cp_boot, cp_diag
+# boot succeeds (PKI key present); the backend dep is what is missing.
+cp_boot.boot(home=os.environ["HEIMDALL_HOME"], start_tick=False, resume=False)
+r = cp_diag.readiness(home=os.environ["HEIMDALL_HOME"])
+assert r.status == 503, (r.status, r.body)
+b = r.body
+assert b["status"] == "not_ready", b
+assert b["booted"] is True, b               # boot DID run -> isolates the backend signal
+assert b["backend"] == "firestore", b       # names WHICH backend failed (bare token)
+assert b["backend_ready"] is False, b
+assert b["reason"] == "backend_unavailable", b   # a known backend-init failure raised
+# NO secret/path/exception text anywhere in the body (content-free reason code only).
+blob = json.dumps(b)
+import re
+assert not re.search(r"google\\.cloud|/[A-Za-z]+/|ImportError|Traceback|BEGIN|private|secret|/home/|/Users/", blob), b
+print(blob)
+PYEOF
+)"
+[ -n "$G" ] && ok "G INCIDENT firestore dep missing -> 503 backend_unavailable, no leak: $G" \
+            || bad "G readiness did not 503 when the SELECTED backend could not init"
+
+# ── H. a HUNG backend client (no fail-fast) -> 503 within the timeout, never hangs ─
+# firestore.Client() can BLOCK on ADC/metadata lookups when creds are absent — it does
+# not fail fast — so the readiness probe is timeout-bounded. We inject a fake backend
+# whose init seam (_db) and read both sleep far past the timeout, and assert readiness
+# RETURNS a 503 {reason:backend_init_failed} within a small wall-clock budget rather than
+# hanging the handler (which would wedge Cloud Run's probe). Hermetic: no firestore lib,
+# no network — pure monkeypatch of get_backend. os._exit at the end so the abandoned
+# daemon probe thread cannot block the test interpreter's teardown.
+H="$(LIB="$LIB" HEIMDALL_STATE_BACKEND=firestore "$PY" - <<'PYEOF'
+import os, sys, json, time
+sys.path.insert(0, os.environ["LIB"])
+import cp_state, cp_diag
+class _Hung:
+    # init seam + read both block far past the readiness timeout.
+    def _db(self): time.sleep(60)
+    def read_lines(self, rel): time.sleep(60); return []
+    # path() refused like a real non-filesystem backend (so _stores_reachable is N/A).
+    def path(self, rel): raise cp_state.BackendUnavailable("no local path (fake firestore)")
+cp_state.get_backend = lambda home=None, backend=None: _Hung()
+t0 = time.time()
+r = cp_diag.readiness(home=os.environ["HEIMDALL_HOME"])
+dt = time.time() - t0
+assert r.status == 503, (r.status, r.body)
+assert r.body["backend"] == "firestore", r.body
+assert r.body["backend_ready"] is False, r.body
+assert r.body["reason"] == "backend_init_failed", r.body   # the timeout/hang variant
+# the handler must return bounded (timeout ~3s) — a hung probe must NOT hang readiness.
+assert dt < 5.0, "readiness hung %.1fs (timeout not enforced)" % dt
+out = "%s dt=%.2fs" % (json.dumps(r.body), dt)
+sys.stdout.write(out + "\n"); sys.stdout.flush()
+os._exit(0)  # abandon the stuck daemon probe thread without blocking interpreter exit.
+PYEOF
+)"
+[ -n "$H" ] && ok "H hung backend client -> 503 backend_init_failed within timeout: $H" \
+            || bad "H readiness hung or did not 503 on a backend that never inits"
 
 # ── D. diag routes register into the seam (idempotent, ON TOP of the 15) ────────
 D="$(LIB="$LIB" "$PY" - <<'PYEOF'
