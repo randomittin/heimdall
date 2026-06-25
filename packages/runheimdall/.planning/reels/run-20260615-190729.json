@@ -1,0 +1,9 @@
+{
+  "name": "run-20260615-190729",
+  "ts": "2026-06-15T13:37:29Z",
+  "artifacts": ["run-20260615-190729.txt"],
+  "has_asciinema": false,
+  "has_agg": false,
+  "has_ffmpeg": false,
+  "note": "asciinema not installed — emitted endframe (run-20260615-190729.txt) only. Install asciinema (+ agg) for an animated reel."
+}
