@@ -63,7 +63,13 @@ import cp_allowlist
 import cp_audit
 import cp_auth
 import cp_server
-import issue_queue  # REUSE heimdall_home() — the approvals store lands in the runtime home.
+import cp_state     # the pluggable persistence backend (Wave 0/1). The approval store's
+                   # atomic per-action_id JSON write/read/enumerate runs THROUGH a
+                   # StateBackend (get_backend) so the same tmp+os.replace put / json read /
+                   # sorted listing becomes durable on Cloud Run (Wave 2 FirestoreBackend)
+                   # WITHOUT changing this store. The local backend is byte-identical to the
+                   # prior JSON-to-HEIMDALL_HOME path, and it owns heimdall_home() resolution
+                   # (the approval store no longer needs issue_queue directly).
 
 
 # ── the approval state model (§7) ──────────────────────────────────────────────
@@ -127,20 +133,44 @@ def _require_owner(identity):
 # NDJSON-sibling layout: one JSON file per action_id under the runtime home's
 # control-plane/approvals/ (mirrors cp_auth's keys.json + cp_audit's audit store
 # atomic-write discipline). One writer per file ⇒ no contention on the queue.
+#
+# The store is addressed by paths RELATIVE to ${HEIMDALL_HOME}/control-plane/ (the
+# StateBackend rel namespace): the approvals dir is "approvals/", one action's record is
+# "approvals/{action_id}.json". The backend owns the home root + makedirs + the atomic
+# tmp+os.replace / indent=2 byte shape; approvals_dir/_record_path remain the public
+# absolute-path accessors (now derived from the backend's path(), so they stay
+# byte-identical to the prior layout).
+
+# the rel sub-dir all approval records live under, within control-plane/.
+_APPROVALS_REL = "approvals"
+
+
+def _backend(home=None):
+    """The StateBackend for the approval store (HEIMDALL_STATE_BACKEND, default local).
+    `home` pins the store root exactly as every approval accessor's `home=` arg always
+    has."""
+    return cp_state.get_backend(home=home)
+
+
+def _approval_rel(action_id):
+    """The store-relative path of one action's approval record: approvals/{action_id}.json.
+    action_id is server-minted (act-<uuid>), so it is filename-safe by construction; we
+    still basename-guard it so a crafted id can never escape the approvals dir."""
+    safe = os.path.basename(str(action_id))
+    return os.path.join(_APPROVALS_REL, safe + ".json")
 
 
 def approvals_dir(home=None):
-    """The approvals store dir: ${HEIMDALL_HOME}/control-plane/approvals/."""
-    base = home if home else issue_queue.heimdall_home()
-    return os.path.join(base, "control-plane", "approvals")
+    """The approvals store dir: ${HEIMDALL_HOME}/control-plane/approvals/ (the backend's
+    absolute path for the approvals rel-dir — unchanged on the local backend)."""
+    return _backend(home).path(_APPROVALS_REL)
 
 
 def _record_path(action_id, home=None):
     """The on-disk path for one action's approval record. action_id is server-minted
     (act-<uuid>), so it is filename-safe by construction; we still basename-guard it so
     a crafted id can never escape the approvals dir."""
-    safe = os.path.basename(str(action_id))
-    return os.path.join(approvals_dir(home), safe + ".json")
+    return _backend(home).path(_approval_rel(action_id))
 
 
 def _now_iso():
@@ -152,48 +182,36 @@ def _now_iso():
 
 
 def _write_record(record, home=None):
-    """Atomic write of one approval record (mktemp + os.replace), mirroring cp_auth's
-    discipline. Returns True on success, False on an IO failure."""
-    ddir = approvals_dir(home)
-    try:
-        os.makedirs(ddir, exist_ok=True)
-        path = _record_path(record["action_id"], home)
-        tmp = path + ".tmp.%d" % os.getpid()
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(record, fh, sort_keys=True, indent=2)
-            fh.flush()
-        os.replace(tmp, path)
-        return True
-    except OSError:
-        return False
+    """Atomic write of one approval record (tmp + os.replace, indent=2), mirroring
+    cp_auth's discipline. Returns True on success, False on an IO failure.
+
+    Routed THROUGH the StateBackend (Wave 1): put_record writes the same atomic
+    tmp+os.replace, json.dump(sort_keys=True, indent=2) keyed record the approval store
+    has always written — so the .json file is byte-identical on the local backend, and
+    the SAME atomic put becomes Cloud-Run-durable when the Wave-2 backend lands."""
+    return _backend(home).put_record(_approval_rel(record["action_id"]), record)
 
 
 def get(action_id, home=None):
     """Read one approval record, or None if no such pending/decided action exists.
-    Read-only; tolerant of a missing/corrupt file (returns None)."""
-    path = _record_path(action_id, home)
-    if not os.path.isfile(path):
-        return None
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            obj = json.load(fh)
-    except (OSError, ValueError):
-        return None
-    return obj if isinstance(obj, dict) else None
+    Read-only; tolerant of a missing/corrupt file (returns None).
+
+    Routed THROUGH the StateBackend (Wave 1): get_record returns the same single keyed
+    JSON record (or None when absent/corrupt) the approval store has always read."""
+    return _backend(home).get_record(_approval_rel(action_id))
 
 
 def list_pending(home=None):
     """Every action currently awaiting an owner decision (state == pending), oldest
     first by submit ts. This is the queue the owner sees (§7 / NOTIFY §8 fires on submit).
-    Read-only; tolerant of an absent store ([])."""
-    ddir = approvals_dir(home)
-    if not os.path.isdir(ddir):
-        return []
+    Read-only; tolerant of an absent store ([]).
+
+    Routed THROUGH the StateBackend (Wave 1): list_names returns the same sorted,
+    suffix-filtered enumeration; we strip the .json suffix to recover the action_id and
+    re-fold each record's state, exactly as before."""
     out = []
-    for name in os.listdir(ddir):
-        if not name.endswith(".json"):
-            continue
-        rec = get(name[:-5], home)
+    for name in _backend(home).list_names(_APPROVALS_REL, suffix=".json"):
+        rec = get(name[: -len(".json")], home)
         if rec and rec.get("state") == STATE_PENDING:
             out.append(rec)
     out.sort(key=lambda r: r.get("submitted_at") or "")
