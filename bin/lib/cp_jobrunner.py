@@ -84,6 +84,31 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 
+# ── loud logging to stderr (the Cloud Run log sink) ────────────────────────────────
+#
+# WHY THIS EXISTS (the "deployed-but-silent" incident). On prod the Cloud Run Job stayed
+# `queued` AND the service logs were SILENT — dispatch() caught the API exception and returned
+# {dispatched:False} with NO trace, so no run could name WHY (wrong job name? 403? quota?
+# ImportError?). The fix is observability first: every dispatch step prints to stderr, which
+# Cloud Run captures into the service logs, so the next prod run's logs NAME the exact failure.
+#
+# We write straight to sys.stderr with a `cp_jobrunner:` prefix — the SAME mechanism cp_boot
+# uses (cp_boot.py: `sys.stderr.write("cp_boot: ... ")`), so it lands in Cloud Run logs the
+# same way, with no logging-config dependency. We NEVER log env/credentials (a RunJobRequest
+# carries none, and we only ever format the resource name + override args + the exception).
+
+def _log(msg):
+    """Write one LOUD diagnostic line to stderr (Cloud Run captures stderr into the service
+    logs). Prefixed `cp_jobrunner:` to match cp_boot's stderr convention. Best-effort: a
+    logging failure must NEVER break dispatch (the contract), so a write error is swallowed
+    and dispatch proceeds — the log is a diagnostic aid, not part of the execution path."""
+    try:
+        sys.stderr.write("cp_jobrunner: %s\n" % msg)
+        sys.stderr.flush()
+    except Exception:  # noqa: BLE001 — diagnostic only; a logging failure must not break dispatch.
+        return  # swallow the write error; dispatch continues regardless of the log.
+
+
 # ── env vars that select / configure the runner (the one place they are named) ─────
 
 # Selects the runner impl. {thread (default local/dev/test), subprocess, cloudrun-job}.
@@ -362,20 +387,47 @@ class CloudRunJobRunner(JobRunner):
         )
 
     def dispatch(self, job_id, *, actor_haid=None, home=None, base_env=None):
+        # START: name the runner + the job_id + the resource name we will call. Resolving the
+        # resource name can raise (no project) — log that loudly too and fail closed, never crash.
+        # This first line means a queued job's dispatch ATTEMPT is traceable in the logs from the
+        # very start, even if everything after it fails (the "deployed-but-silent" class — killed).
+        try:
+            resource_name = self.job_resource_name()
+        except JobRunnerError as exc:
+            _log("dispatch START runner=%s job_id=%s — NO RESOURCE: %s"
+                 % (self.name, job_id, exc))
+            _log("ERROR no_project: %s — returning dispatched:False, job stays queued" % exc)
+            return {"dispatched": False, "runner": self.name,
+                    "error": "no_project", "detail": str(exc),
+                    "job_name": self._job_name}
+        _log("dispatch START runner=%s job_id=%s resource=%s region=%s"
+             % (self.name, job_id, resource_name, self._region))
+
         try:
             # Lazy import: google-cloud-run is needed ONLY here, only when this runner is the
             # SELECTED one at runtime — the thread/subprocess paths stay pure-stdlib.
             from google.cloud import run_v2
         except ImportError as exc:
+            # LOUD: the dep is missing in the deployed image — name it so the next run sees it.
+            _log("ERROR run_v2 unavailable: %s — google-cloud-run not importable; "
+                 "returning dispatched:False, job %s stays queued" % (exc, job_id))
             return {"dispatched": False, "runner": self.name,
                     "error": "run_v2_unavailable", "detail": str(exc),
                     "job_name": self._job_name}
+
         try:
             request = self.build_request(job_id)
         except JobRunnerError as exc:
+            _log("ERROR no_project: %s — cannot build RunJobRequest; returning "
+                 "dispatched:False, job %s stays queued" % (exc, job_id))
             return {"dispatched": False, "runner": self.name,
                     "error": "no_project", "detail": str(exc),
                     "job_name": self._job_name}
+
+        # CALL: name the exact run_v2 call + resource + override args BEFORE we make it, so a
+        # call that then hangs/403s/quotas is still attributable in the logs to this line.
+        _log("calling run_v2 JobsClient.run_job name=%s args=[run-job,%s]"
+             % (resource_name, job_id))
         try:
             # ADC: no explicit credentials — the runtime SA's Application Default Credentials
             # (already carrying run.jobs.run) authenticate the call. run_job kicks off the
@@ -384,9 +436,20 @@ class CloudRunJobRunner(JobRunner):
             client = run_v2.JobsClient()
             client.run_job(request=request)
         except Exception as exc:  # noqa: BLE001 — never crash start_route; report + leave queued.
+            # THE CARDINAL: never swallow silently. Log the FULL exception type + message at
+            # error level (a PermissionDenied/NotFound/InvalidArgument from the API carries the
+            # 403/404/quota reason in str(exc)) so the next prod run's logs name the exact cause.
+            detail = "%s: %s" % (type(exc).__name__, exc)
+            _log("ERROR run_job FAILED for job %s name=%s: %s — returning dispatched:False, "
+                 "job stays queued (resume/retry re-drives)" % (job_id, resource_name, detail))
             return {"dispatched": False, "runner": self.name,
-                    "error": "run_job_failed", "detail": "%s: %s" % (type(exc).__name__, exc),
+                    "error": "run_job_failed", "detail": detail,
                     "job_name": self._job_name}
+
+        # SUCCESS: the LRO was accepted (the execution is CREATED) — a healthy dispatch is
+        # visible in the logs too, not just failures, so a working prod run is confirmable.
+        _log("dispatched: execution create accepted for job %s name=%s"
+             % (job_id, resource_name))
         return {"dispatched": True, "runner": self.name, "mode": "cloud-run-job",
                 "job_name": self._job_name, "region": self._region}
 
