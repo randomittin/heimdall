@@ -195,16 +195,33 @@ PYEOF
     LIB_DIR="$LIB_DIR" HOME_DIR="$HOME_DIR" "$PY" - <<'PYEOF'
 import json, os, sys
 sys.path.insert(0, os.environ["LIB_DIR"])
-import cp_allowlist, cp_audit, cp_auth, cp_server
+import cp_allowlist, cp_audit, cp_auth, cp_server, cp_state
 home = os.environ.get("HOME_DIR") or None
+
+
+def _fs_path(fn):
+    """Resolve a filesystem path accessor BEST-EFFORT. The *_path() accessors route to the
+    SELECTED backend's path(), which a non-filesystem backend (firestore) REFUSES
+    (BackendUnavailable) — an external store has no local file to point at. A path is purely
+    informational here, so under such a backend we report None instead of letting path()
+    refusal crash `status` (the same path()-under-firestore class fixed in
+    cp_selfcheck/cp_diag). The audit_rows COUNT below reads THROUGH read_records and works on
+    every backend regardless."""
+    try:
+        return fn(home)
+    except cp_state.BackendUnavailable:
+        return None
+
+
 out = {
     "crypto_backend": cp_auth.backend_name(),
     "crypto_available": cp_auth.crypto_available(),
     "allowlist_actions": cp_allowlist.action_types(),
     "registered_routes": ["%s %s" % (m, p) for m, p in cp_server.registered_routes()],
     "audit_rows": len(cp_audit.read_records(home)),
-    "audit_path": cp_audit.audit_path(home),
-    "keys_path": cp_auth.keys_path(home),
+    "audit_path": _fs_path(cp_audit.audit_path),
+    "keys_path": _fs_path(cp_auth.keys_path),
+    "state_backend": (os.environ.get(cp_state.BACKEND_ENV) or cp_state.BACKEND_LOCAL).strip().lower(),
 }
 sys.stdout.write(json.dumps(out, indent=2, sort_keys=True) + "\n")
 PYEOF
