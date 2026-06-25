@@ -82,7 +82,7 @@ die()  { printf '\033[31mFATAL\033[0m %s\n' "$1" >&2; exit 2; }
 # per-instance HAID from the container HOSTNAME -> the cold-start read-back below cannot
 # verify (instance B registered a DIFFERENT name than the one we sign as).
 if [ -z "${CLIENT_HAID:-}" ] || [ -z "$(printf '%s' "${CLIENT_HAID:-}" | tr -d '[:space:]')" ]; then
-  die "CLIENT_HAID is empty — the server's pinned HAID. It is read from the deployed HEIMDALL_CP_SERVER_HAID env; an empty value means the service was deployed WITHOUT that var. Redeploy with it (gcloud run services update \"\$SERVICE\" --region=\"\$REGION\" --update-env-vars=HEIMDALL_CP_SERVER_HAID=haid:heimdall.cp-prod-0001), then re-run. See deploy/cloud-run/README.md §3 'Stable identity: both halves must be pinned'."
+  die "CLIENT_HAID is empty — the server's pinned HAID. It is read from the deployed HEIMDALL_CP_SERVER_HAID env; an empty value means the service was deployed WITHOUT that var. Redeploy with it (gcloud run services update \"\$SERVICE\" --region=\"\$REGION\" --update-env-vars=HEIMDALL_CP_SERVER_HAID=cp-server), then re-run. The value is stored+matched verbatim (no haid: prefix required); use the SAME literal the service is deployed with. See deploy/cloud-run/README.md §3 'Stable identity: both halves must be pinned'."
 fi
 # Trim any stray whitespace from the gcloud-extracted value (defensive).
 CLIENT_HAID="$(printf '%s' "$CLIENT_HAID" | tr -d '[:space:]')"
