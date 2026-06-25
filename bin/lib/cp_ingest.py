@@ -345,14 +345,29 @@ def stored_instances(home=None):
     who have pushed). Read-only; an absent store yields [] (honest empty). The
     dashboard groups its cross-dev aggregate over these.
 
-    Routed THROUGH the StateBackend (Wave 1): list_names returns the SAME sorted
-    enumeration of names directly under observe/. We keep the dir-only guard (a
-    partition is a directory holding events.ndjson) so a stray non-dir entry is
-    skipped exactly as before — byte-identical to the prior listdir+isdir filter."""
+    Routed THROUGH the StateBackend: list_names returns the SAME sorted enumeration of
+    the immediate children of observe/ (the per-instance partition directories) on EVERY
+    backend — on Firestore the nested partition is recovered as a synthetic subdirectory
+    name (see FirestoreBackend.list_names). The partition guard is a BACKEND-SAFE
+    existence check on the partition's events log (backend.exists of <slug>/events.ndjson)
+    rather than os.path.isdir(backend.path(...)):
+
+      • FIRESTORE-SAFE — FirestoreBackend.path() RAISES BackendUnavailable by design (a
+        firestore-backed rel has no local file). The old os.path.isdir(backend.path(...))
+        guard therefore raised on the live cross-dev DASHBOARD read whenever the observe
+        store held a partition — the firestore-only read-path incident this fixes. exists()
+        is served by every backend (LocalBackend.exists = os.path.exists; Firestore checks
+        the node/prefix), so the dashboard read never raises.
+
+      • LOCAL-EQUIVALENT — a real partition IS a directory holding events.ndjson, so
+        "<slug>/events.ndjson exists" selects exactly the partitions the prior isdir guard
+        kept (every slug stored_instances returns has an events log — the contract the
+        cross-dev read and cp-observe's per-slug events.ndjson read both rely on). A stray
+        non-partition entry under observe/ (no events log) is skipped, as before."""
     backend = _backend(home)
     names = []
     for name in backend.list_names(_OBSERVE_REL):
-        if os.path.isdir(backend.path(os.path.join(_OBSERVE_REL, name))):
+        if backend.exists(_events_rel(name)):
             names.append(name)
     return names
 
