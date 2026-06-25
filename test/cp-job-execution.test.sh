@@ -429,6 +429,17 @@ def override_args(request):
     return list(cos[0].args)
 
 
+def override_env(request):
+    """Pull the container override env out of a RunJobRequest as a {name: value} dict (the
+    STORAGE-IDENTITY carrier — the vars that pin which Firestore (backend, project, root, db)
+    the OUT-OF-PROCESS Cloud Run Job writes to, so its `done` lands in the SAME doc the
+    dispatching service later reads). Empty dict when there is no env override."""
+    cos = list(request.overrides.container_overrides)
+    if len(cos) != 1:
+        return {}
+    return {e.name: e.value for e in list(cos[0].env)}
+
+
 # ── build 1: defaults only (default job name, default region), project set so the resource
 #    name is buildable (the resource REQUIRES a project — no project => no execution). ──────
 os.environ.pop("HEIMDALL_CP_JOB_NAME", None)
@@ -521,6 +532,76 @@ print("PASS D8: invariant holds for alternate id — override args == ['run-job'
       if alt_ok else
       "FAIL D8: override args for alternate id are %r (expected ['run-job', '%s'])"
       % (args_alt, ALT_ID))
+
+# ── build 3: STORAGE-IDENTITY ENV PROPAGATION (the write/read-doc-mismatch fix) ────────────
+#    THE INCIDENT this guards: the Cloud Run JOB execution and the SERVICE compute a Firestore
+#    doc path from (backend, project, root, db) — and three of those coordinates are read from
+#    PER-INSTANCE ENV (HEIMDALL_STATE_BACKEND / HEIMDALL_FIRESTORE_PROJECT / HEIMDALL_FIRESTORE_ROOT,
+#    plus GOOGLE_CLOUD_PROJECT as the firestore.Client() project fallback). dispatch() overrides
+#    only the JOB's ARGS, NOT its env, so the Job container used whatever was baked into the job
+#    at create-time while the service used its own deploy-time env. Any drift => the Job wrote
+#    `done` to a doc the service never reads => job succeeds (exit 0) but GET /jobs never sees done.
+#    THE FIX: build_request also pins, as a container ENV override, the storage-identity vars the
+#    DISPATCHING SERVICE itself resolved — so the out-of-process Job writes to the IDENTICAL
+#    (backend, project, root, db) the service reads, by construction. These guards pin that.
+os.environ["HEIMDALL_STATE_BACKEND"] = "firestore"
+os.environ["HEIMDALL_FIRESTORE_PROJECT"] = "svc-fs-project"
+os.environ["HEIMDALL_FIRESTORE_ROOT"] = "svc_root_coll"
+os.environ["GOOGLE_CLOUD_PROJECT"] = "svc-gcp-project"
+os.environ.pop("HEIMDALL_FIRESTORE_DATABASE", None)
+
+runner_env = cp_jobrunner.CloudRunJobRunner()
+req_env = runner_env.build_request(TEST_JOB_ID)
+env_map = override_env(req_env)
+
+# D9 — the storage-identity vars the SERVICE resolved are present in the JOB's env override,
+#      with the SERVICE's exact values — so the Job writes to the SAME Firestore the service reads.
+d9 = (env_map.get("HEIMDALL_STATE_BACKEND") == "firestore"
+      and env_map.get("HEIMDALL_FIRESTORE_PROJECT") == "svc-fs-project"
+      and env_map.get("HEIMDALL_FIRESTORE_ROOT") == "svc_root_coll"
+      and env_map.get("GOOGLE_CLOUD_PROJECT") == "svc-gcp-project")
+print("PASS D9: container env override pins the service's storage identity "
+      "(backend/firestore-project/root/gcp-project) — Job writes the SAME doc the service reads"
+      if d9 else
+      "FAIL D9: env override missing/mismatched storage identity: %r" % env_map)
+
+# D10 (FALSIFIER) — the override is NON-EMPTY when the service env carries a firestore identity.
+#      A regression that drops the env override (back to args-only) leaves the Job to write
+#      wherever ITS baked env points — the exact write/read doc mismatch. This catches it.
+d10 = bool(env_map)
+print("PASS D10 (falsifier): the env override is NON-EMPTY — the Job is NOT left to its own baked env"
+      if d10 else
+      "FAIL D10 (falsifier): the env override is EMPTY — the Job writes to its own env's doc, "
+      "not the service's; the write/read mismatch is back")
+
+# D11 — the args override is UNCHANGED by the env addition (run-job,<id> still exactly carried),
+#      so adding env propagation did not regress the subcommand fusion.
+args_env = override_args(req_env)
+d11 = (args_env == ["run-job", TEST_JOB_ID])
+print("PASS D11: args override still == ['run-job', '%s'] alongside the env override" % TEST_JOB_ID
+      if d11 else
+      "FAIL D11: args override changed to %r when env propagation was added" % (args_env,))
+
+# D12 — a var the service does NOT set is NOT injected as a blank (which would OVERRIDE a value
+#      the Job legitimately baked). Only vars actually present in the service env propagate.
+#      HEIMDALL_FIRESTORE_DATABASE is unset above, so it must be ABSENT from the override.
+d12 = ("HEIMDALL_FIRESTORE_DATABASE" not in env_map)
+print("PASS D12: an UNSET service var (HEIMDALL_FIRESTORE_DATABASE) is NOT injected blank — "
+      "no clobbering the Job's own value with an empty string"
+      if d12 else
+      "FAIL D12: an unset service var was injected as blank %r — would clobber the Job's baked value"
+      % env_map.get("HEIMDALL_FIRESTORE_DATABASE"))
+
+# D13 — when the service sets HEIMDALL_FIRESTORE_DATABASE (a named, non-default db), it DOES
+#      propagate — the database coordinate of the doc path is pinned too, not just project/root.
+os.environ["HEIMDALL_FIRESTORE_DATABASE"] = "cp-named-db"
+req_db = cp_jobrunner.CloudRunJobRunner().build_request(TEST_JOB_ID)
+env_db = override_env(req_db)
+d13 = (env_db.get("HEIMDALL_FIRESTORE_DATABASE") == "cp-named-db")
+print("PASS D13: a SET HEIMDALL_FIRESTORE_DATABASE propagates (the db coordinate is pinned too)"
+      if d13 else
+      "FAIL D13: HEIMDALL_FIRESTORE_DATABASE did not propagate when set: %r" % env_db)
+os.environ.pop("HEIMDALL_FIRESTORE_DATABASE", None)
 PYEOF
 
 # Run the request-shape assertions and map PASS/FAIL/SKIP lines to the test's counters.
@@ -580,9 +661,15 @@ def _install_fake_run_v2(*, raise_on_run):
     builds a real RunJobRequest via these classes, then calls JobsClient.run_job(request=...)."""
     run_v2 = types.ModuleType("google.cloud.run_v2")
 
+    class EnvVar:
+        def __init__(self, name=None, value=None):
+            self.name = name
+            self.value = value
+
     class ContainerOverride:
-        def __init__(self, args=None):
+        def __init__(self, args=None, env=None):
             self.args = list(args or [])
+            self.env = list(env or [])  # storage-identity propagation (the write/read-doc fix).
 
     class Overrides:
         def __init__(self, container_overrides=None):
@@ -597,6 +684,7 @@ def _install_fake_run_v2(*, raise_on_run):
     # enclosing function's locals during its own namespace evaluation).
     Overrides.ContainerOverride = ContainerOverride
     RunJobRequest.Overrides = Overrides
+    run_v2.EnvVar = EnvVar
 
     calls = {"requests": [], "clients": 0}
 
