@@ -160,11 +160,28 @@ if not cp_auth.crypto_available():
         "detail": "install `cryptography` or `pynacl` to enable PKI identity",
     }) + "\n")
     sys.exit(3)
-priv, pub = cp_auth.generate_keypair()
+# THE GAP FIX wired at the identity boundary. When HEIMDALL_CP_PKI_KEY is present (the
+# deploy's --set-secrets seed) DERIVE the DETERMINISTIC keypair from it — the SAME pair
+# every instance/cold-start — instead of minting a fresh random key. In the cloud profile
+# an absent/invalid seed makes load_signing_key RAISE (fail-closed): we refuse rather than
+# mint a per-instance key. Locally with no seed/cloud-signal, keep the dev mint path.
+seeded = bool(os.environ.get(cp_auth.PKI_KEY_ENV)) or cp_auth.cloud_profile()
+try:
+    if seeded:
+        priv, pub = cp_auth.load_signing_key()   # raises (fail-closed) in cloud w/o seed.
+        source = "seed"
+    else:
+        priv, pub = cp_auth.generate_keypair()    # dev mint (no seed, local profile).
+        source = "minted"
+except cp_auth.AuthError as err:
+    sys.stdout.write(json.dumps({
+        "ok": False, "haid": haid, "reason": err.reason, "detail": err.detail,
+    }) + "\n")
+    sys.exit(3)
 stored = cp_auth.register_key(haid, pub, owner=owner, home=home)
 sys.stdout.write(json.dumps({
     "ok": True, "haid": haid, "owner": owner, "backend": cp_auth.backend_name(),
-    "public_key": pub, "private_key": priv, "registered": stored,
+    "public_key": pub, "private_key": priv, "registered": stored, "key_source": source,
     "note": "keep private_key local; public_key is registered with the server",
 }, indent=2) + "\n")
 sys.exit(0)

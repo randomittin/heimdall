@@ -66,10 +66,13 @@ class BootResult:
     """What boot() wired — for status/CLI/tests. Carries the registered route keys
     (per piece), the orphan jobs it re-drove, and whether the tick thread started."""
 
-    def __init__(self, routes, resumed, tick_started):
+    def __init__(self, routes, resumed, tick_started, server_identity=None):
         self.routes = routes              # {piece -> [(METHOD, path), ...]}
         self.resumed = resumed            # [(job_id, final_state), ...]
         self.tick_started = tick_started  # bool
+        # The deterministic server signing identity established at boot (no private seed in
+        # it — only the seeded/haid/public_key/registered status). None when not computed.
+        self.server_identity = server_identity
 
     def to_dict(self):
         return {
@@ -81,6 +84,7 @@ class BootResult:
                 {"job_id": jid, "state": state} for (jid, state) in self.resumed
             ],
             "tick_started": self.tick_started,
+            "server_identity": self.server_identity,
             "registered_routes": [
                 "%s %s" % (m, p) for (m, p) in cp_server.registered_routes()
             ],
@@ -195,6 +199,16 @@ def boot(server=cp_server, *, home=None, base_env=None, start_tick=True,
 
     `start_tick=False` / `resume=False` let a test wire routes WITHOUT a clock or a
     replay (deterministic). Idempotent: routes replace, the tick thread is singleton."""
+    # 0. SERVER IDENTITY — establish the deterministic signing identity from the PKI seed
+    #    BEFORE anything else (the GAP fix wired). When HEIMDALL_CP_PKI_KEY is present the
+    #    server derives the SAME keypair every cold-start and re-binds its HAID→pubkey in
+    #    the registry, so PKI identity is stable across Cloud Run instances. In the cloud
+    #    profile an absent/invalid seed makes ensure_server_identity RAISE (fail-closed) —
+    #    we let it propagate so the boot refuses to serve with an unstable identity rather
+    #    than silently minting a per-instance key. Locally (no seed, no cloud signal) it is
+    #    a no-op and the dev `identity` mint path still owns registration.
+    server_identity = cp_auth.ensure_server_identity(home=home)
+
     routes = {}
 
     # 1. ASSEMBLE — every piece plugs its routes into the live seam. The home-aware
@@ -223,7 +237,7 @@ def boot(server=cp_server, *, home=None, base_env=None, start_tick=True,
         thread, _ = start_tick_thread(home=home, base_env=base_env)
         tick_started = thread is not None
 
-    return BootResult(routes, resumed, tick_started)
+    return BootResult(routes, resumed, tick_started, server_identity=server_identity)
 
 
 # Allow a quick local introspection: `python3 cp_boot.py` wires against the default

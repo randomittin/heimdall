@@ -45,7 +45,6 @@
 from __future__ import annotations
 
 import base64
-import json
 import os
 import subprocess
 import sys
@@ -54,7 +53,13 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
-import issue_queue  # REUSE heimdall_home() for the key-registry store root.
+import cp_state  # the pluggable persistence backend (Wave 1). The HAID->pubkey key
+               # registry's atomic keyed JSON read/write runs THROUGH a StateBackend
+               # (get_backend) — exactly like cp_approval — so the same tmp+os.replace
+               # put / json read becomes durable on Cloud Run (Firestore backend) WITHOUT
+               # changing this module. The local backend is byte-identical to the prior
+               # keys.json-to-HEIMDALL_HOME path, and it owns heimdall_home() resolution
+               # (the registry no longer needs issue_queue / direct json IO here).
 
 # ── crypto backend (Ed25519 via `cryptography`, else PyNaCl, else degrade) ─────
 #
@@ -155,6 +160,178 @@ def generate_keypair():
     return _b64(raw_priv), _b64(raw_pub)
 
 
+# ── the server's signing identity from the Secret-Manager seed (the GAP fix) ───
+#
+# THE BUG THIS CLOSES. The control plane must sign/verify with a STABLE identity
+# across every Cloud Run instance + cold-start. generate_keypair() mints a FRESH
+# random key per call, so each instance ran a DIFFERENT key universe with an EMPTY
+# registry → PKI identity was broken on the deploy target. The deploy injects the
+# Ed25519 PRIVATE SEED from Secret Manager as env HEIMDALL_CP_PKI_KEY
+# (deploy/cloud-run/README.md §2/§3, `--set-secrets="HEIMDALL_CP_PKI_KEY=cp-pki-key:latest"`).
+# load_signing_key() reads THAT seed and DETERMINISTICALLY derives the SAME keypair
+# every instance/cold-start — a reproducible server identity rooted in the secret.
+
+# The env var the deploy's --set-secrets populates (deploy/cloud-run/README.md §2).
+PKI_KEY_ENV = "HEIMDALL_CP_PKI_KEY"
+
+
+def cloud_profile():
+    """True iff we are running in the Cloud Run / durable deploy profile, where a
+    missing PKI seed is a HARD failure (never silently mint a fresh key). Detected via
+    TWO independent signals, either of which means "deployed, not a laptop":
+
+      * K_SERVICE — Cloud Run sets this automatically on every instance/job (the
+        platform's own marker that we are inside a Cloud Run container).
+      * HEIMDALL_STATE_BACKEND=firestore — the documented deploy env-var
+        (deploy/cloud-run/README.md §3 --set-env-vars): selecting the durable Firestore
+        backend is the operator declaring "this is the durable deployment".
+
+    Locally (neither signal set) cloud_profile() is False and the dev mint path
+    (generate_keypair via `identity`) is preserved verbatim. The signal is documented
+    here so the fail-closed boundary is unambiguous."""
+    if os.environ.get("K_SERVICE"):
+        return True
+    backend = (os.environ.get("HEIMDALL_STATE_BACKEND") or "").strip().lower()
+    return backend == "firestore"
+
+
+def load_signing_key(seed_b64=None):
+    """Derive the server's DETERMINISTIC Ed25519 signing identity from the PKI seed
+    (HEIMDALL_CP_PKI_KEY, base64 of a 32-byte private seed). Returns
+    (private_b64, public_b64) — the SAME pair every call/instance/cold-start for a given
+    seed, because the keypair is a pure function of the seed (Ed25519's public key is
+    derived from the private seed). This is what makes the server identity stable across
+    Cloud Run instances: the registry HAID→pubkey binding rebuilds identically on every
+    cold start.
+
+    `seed_b64` overrides the env (for tests / explicit wiring); otherwise the value of
+    HEIMDALL_CP_PKI_KEY is used.
+
+    FAIL-CLOSED in the cloud profile (cloud_profile() True): if the seed is ABSENT or
+    INVALID we RAISE AuthError — we NEVER fall back to minting a fresh random key (that
+    is the exact bug: a per-instance key universe). Locally (not cloud profile) an absent
+    seed raises the SAME AuthError too — there is no silent mint here; the dev mint path
+    stays in `generate_keypair()`/`identity`, and a caller that explicitly asks to load a
+    seed must supply one. Raises AuthError('crypto_unavailable') in degraded mode (a key
+    cannot be faked — fail CLOSED with a clear message)."""
+    if not crypto_available():
+        raise AuthError("crypto_unavailable",
+                        "install `cryptography` or `pynacl` to load the PKI signing key")
+    raw_seed = seed_b64 if seed_b64 is not None else os.environ.get(PKI_KEY_ENV)
+    if not raw_seed:
+        # Absent seed. In the cloud profile this is a HARD refusal — the server MUST NOT
+        # boot with an unstable identity. The message names the env + the fix.
+        if cloud_profile():
+            raise AuthError(
+                "pki_key_absent",
+                "%s is not set in the cloud profile — refusing to mint a fresh per-instance"
+                " key (set --set-secrets=%s=cp-pki-key:latest)" % (PKI_KEY_ENV, PKI_KEY_ENV))
+        raise AuthError(
+            "pki_key_absent",
+            "%s is not set — no seed to derive the signing key from" % PKI_KEY_ENV)
+    try:
+        seed = _unb64(raw_seed)
+    except Exception as exc:  # noqa: BLE001 — undecodable base64 is an invalid seed.
+        raise AuthError("pki_key_invalid",
+                        "%s is not valid base64" % PKI_KEY_ENV) from exc
+    if len(seed) != 32:
+        # Ed25519 private seeds are exactly 32 bytes; anything else cannot derive a key.
+        raise AuthError(
+            "pki_key_invalid",
+            "%s must decode to a 32-byte Ed25519 seed (got %d bytes)" % (
+                PKI_KEY_ENV, len(seed)))
+    try:
+        if _BACKEND == "cryptography":
+            priv = _CrPriv.from_private_bytes(seed)
+            raw_pub = priv.public_key().public_bytes(
+                encoding=_cr_ser.Encoding.Raw,
+                format=_cr_ser.PublicFormat.Raw,
+            )
+        else:  # pynacl — derive the verify key from the same seed.
+            sk = _nacl_signing.SigningKey(seed)
+            raw_pub = bytes(sk.verify_key)
+    except AuthError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — a malformed seed that decoded but won't load.
+        raise AuthError("pki_key_invalid",
+                        "%s did not derive a valid Ed25519 key" % PKI_KEY_ENV) from exc
+    # private_b64 is the seed itself (the same shape generate_keypair returns), public_b64
+    # the deterministically-derived public key — identical for identical seeds.
+    return _b64(seed), _b64(raw_pub)
+
+
+# The env override for the server's own HAID (the identity the seeded pubkey binds to).
+# Cloud Run has no `.planning/ledger` checkout for `heimdall-haid current` to read, so the
+# deploy can pin the server HAID explicitly; absent it, we derive via the CLI (local/dev).
+SERVER_HAID_ENV = "HEIMDALL_CP_SERVER_HAID"
+
+
+def server_haid(home=None):
+    """The HAID the server's deterministic signing identity binds to. Resolution order:
+      1. HEIMDALL_CP_SERVER_HAID (explicit pin — the deploy sets this since a Cloud Run
+         image carries no `.planning/ledger` checkout for the CLI to read).
+      2. `heimdall-haid current` — the deterministic per-checkout identity NAME (local/dev).
+    Returns the HAID string, or None when neither is available (no CLI + no pin) — the
+    caller then skips seeded registration rather than guessing an identity."""
+    pinned = os.environ.get(SERVER_HAID_ENV)
+    if pinned:
+        return pinned.strip() or None
+    cli = os.path.join(os.path.dirname(_HERE), "heimdall-haid")
+    if not os.path.isfile(cli):
+        return None
+    try:
+        proc = subprocess.run(
+            [cli, "current"], capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    haid = (proc.stdout or "").strip()
+    return haid or None
+
+
+def ensure_server_identity(home=None, *, owner=True):
+    """ESTABLISH the server's deterministic signing identity at boot (the GAP fix wired).
+    When HEIMDALL_CP_PKI_KEY is present, derive the seeded keypair (load_signing_key) and
+    register its public key under the server HAID, so the SAME HAID→pubkey binding rebuilds
+    on EVERY cold start (no per-instance key universe). `owner=True` flags the server's own
+    identity as owner (it drives owner-scoped scheduler ticks / gate decisions, §6/§7).
+
+    Returns a dict the boot path can surface (NO secret in it — never the private seed):
+      {"seeded": bool, "haid": <server haid|None>, "public_key": <b64|None>,
+       "registered": bool, "reason": <str>}.
+
+    Behavior by profile:
+      * Seed present  → derive + register the seeded pubkey deterministically (seeded=True).
+        If no server HAID resolves, seeded=True but registered=False (reason names it) —
+        the keypair is still deterministic; only the binding could not be written.
+      * Cloud profile + seed ABSENT/INVALID → load_signing_key RAISES (fail-closed); this
+        function lets that AuthError propagate so the boot refuses an unstable identity.
+      * Local profile + seed absent → seeded=False (the dev `identity` mint path stays the
+        source of registrations; boot does not mint here). A clear, non-fatal reason."""
+    if not crypto_available():
+        return {"seeded": False, "haid": None, "public_key": None,
+                "registered": False, "reason": "crypto_unavailable"}
+    has_seed = bool(os.environ.get(PKI_KEY_ENV))
+    if not has_seed and not cloud_profile():
+        # Local dev, no seed: do NOT mint here — the `identity` CLI owns dev registration.
+        return {"seeded": False, "haid": None, "public_key": None,
+                "registered": False, "reason": "no_seed_local_profile"}
+    # Seed present, OR cloud profile (where an absent/invalid seed MUST fail-closed):
+    # load_signing_key raises AuthError in the cloud profile when the seed is missing —
+    # we let it propagate (the boot refuses rather than running an unstable identity).
+    _priv, pub = load_signing_key()
+    haid = server_haid(home)
+    if not haid:
+        return {"seeded": True, "haid": None, "public_key": pub,
+                "registered": False, "reason": "no_server_haid"}
+    stored = register_key(haid, pub, owner=owner, home=home)
+    return {"seeded": True, "haid": haid, "public_key": pub,
+            "registered": bool(stored),
+            "reason": "registered" if stored else "registry_write_failed"}
+
+
 def sign(private_b64, message):
     """Sign `message` (bytes or str) with the base64 Ed25519 private seed. Returns the
     base64 signature. Raises AuthError('crypto_unavailable') in degraded mode (a
@@ -213,13 +390,32 @@ def verify_raw(public_b64, message, sig_b64):
 # governs PKI verification with no extra machinery (§3 revocation reuse).
 
 
+# The store-relative paths (relative to ${HEIMDALL_HOME}/control-plane/, the StateBackend
+# rel namespace): the auth dir is "auth/", the registry is "auth/keys.json". The backend
+# owns the home root + makedirs + the atomic tmp+os.replace / indent=2 byte shape; auth_dir
+# and keys_path stay the public absolute-path accessors (now sourced from backend.path(),
+# so they remain byte-identical to the prior layout on the local backend).
+_AUTH_REL = "auth"
+_KEYS_REL = os.path.join(_AUTH_REL, "keys.json")
+
+
+def _backend(home=None):
+    """The StateBackend for the key registry (HEIMDALL_STATE_BACKEND, default local).
+    `home` pins the store root exactly as every registry accessor's `home=` arg always
+    has — exactly like cp_approval._backend."""
+    return cp_state.get_backend(home=home)
+
+
 def auth_dir(home=None):
-    base = home if home else issue_queue.heimdall_home()
-    return os.path.join(base, "control-plane", "auth")
+    """The auth store dir: ${HEIMDALL_HOME}/control-plane/auth/ (the backend's absolute
+    path for the auth rel-dir — unchanged on the local backend)."""
+    return _backend(home).path(_AUTH_REL)
 
 
 def keys_path(home=None):
-    return os.path.join(auth_dir(home), "keys.json")
+    """The on-disk path of the HAID->pubkey registry: control-plane/auth/keys.json (the
+    backend's absolute path — byte-identical to the prior layout on the local backend)."""
+    return _backend(home).path(_KEYS_REL)
 
 
 def _empty_registry():
@@ -227,34 +423,26 @@ def _empty_registry():
 
 
 def _load_keys(home=None):
-    path = keys_path(home)
-    if not os.path.isfile(path):
-        return _empty_registry()
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            obj = json.load(fh)
-    except (OSError, ValueError):
-        return _empty_registry()
+    """Read the HAID->pubkey registry, or an empty registry when absent/corrupt/off-schema.
+    Routed THROUGH the StateBackend (Wave 1): get_record returns the same single keyed JSON
+    record (or None when absent/corrupt) the registry has always read — byte-identical on
+    the local backend, Firestore-durable when HEIMDALL_STATE_BACKEND=firestore."""
+    obj = _backend(home).get_record(_KEYS_REL)
     if isinstance(obj, dict) and isinstance(obj.get("keys"), dict):
         return obj
     return _empty_registry()
 
 
 def _store_keys(reg, home=None):
-    """Atomic write of the key registry (mktemp + replace), mirroring agents.json's
-    atomic-write discipline. Returns True on success."""
-    ldir = auth_dir(home)
-    try:
-        os.makedirs(ldir, exist_ok=True)
-        path = keys_path(home)
-        tmp = path + ".tmp.%d" % os.getpid()
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(reg, fh, sort_keys=True, indent=2)
-            fh.flush()
-        os.replace(tmp, path)
-        return True
-    except OSError:
-        return False
+    """Atomic write of the key registry, mirroring cp_approval's discipline. Returns True
+    on success, False on an IO failure.
+
+    Routed THROUGH the StateBackend (Wave 1): put_record writes the same atomic
+    tmp+os.replace, json.dump(sort_keys=True, indent=2) keyed record the registry has always
+    written — so keys.json is byte-identical on the local backend, and the SAME atomic put
+    becomes Cloud-Run-durable (pubkeys survive scale-to-zero) when the Firestore backend is
+    selected."""
+    return _backend(home).put_record(_KEYS_REL, reg)
 
 
 def register_key(haid, public_b64, *, owner=False, home=None):
