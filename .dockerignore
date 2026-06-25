@@ -1,0 +1,64 @@
+# Keep the build context lean + secret-free. Only bin/ + bin/lib/ are COPYed
+# (see Dockerfile); everything else is excluded so it never enters the image
+# layers, the build cache, or any pushed artifact.
+
+# Version control + history
+.git
+.gitignore
+.gitleaks.toml
+
+# Planning + agent scratch (the ~60 stale worktrees the spec calls out)
+.planning
+.claude/worktrees
+.claude
+.heimdall
+
+# Tests + eval fixtures (not part of the runtime; can carry sample payloads)
+test
+tests
+evals
+conformance
+sentinels
+heimdall-demo-app
+
+# Other packages / sub-projects not part of the control-plane runtime
+packages
+infra
+agents
+skills
+commands
+hooks
+docs
+release
+sentinels
+
+# Python + node build artifacts and caches
+__pycache__
+**/__pycache__
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache
+node_modules
+**/node_modules
+
+# Editor / OS noise
+.DS_Store
+*.swp
+*.log
+
+# Docs + meta that the runtime never reads
+*.md
+LICENSE
+vercel.json
+_redirects
+index.js
+package.json
+
+# Never ship local secrets / keys / env files into the build context
+*.pem
+*.key
+*.env
+.env
+.env.*
+**/*.private
