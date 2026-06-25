@@ -771,6 +771,91 @@ bash test/verify-flight-fix-dryrun.test.sh
 
 ---
 
+## 8. Inspecting the Firestore doc directly (`heimdall-cp-inspect`)
+
+When a job's **execution succeeds** (the Cloud Run Job ran to completion and wrote
+`state=done`) but the **service cannot read `done` back** (GET `/jobs` reports the
+job as not-done), the question is *write-path vs read-path*: did the Job write the
+done line to a **different Firestore doc** than the service reads (a doc-key / root-
+collection / project / **database** mismatch between the two containers), or is the
+service simply pointed at the wrong store? `gcloud firestore documents get` is not
+always available; `bin/heimdall-cp-inspect` answers the question by reading the
+**exact doc the control-plane code uses** — it imports the real `cp_state_firestore`
+`rel→doc` mapping (it does *not* re-derive the encoding), so the doc it inspects is
+byte-for-byte the doc `cp_jobstore` reads and `cp_worker` writes. It is **read-only**
+(never mutates Firestore) and prints **no secrets**.
+
+Three subcommands:
+
+```bash
+bin/heimdall-cp-inspect job <job_id>   # resolved doc path + ordered lines + folded state
+                                       #   + "TERMINAL state=done present: yes/no"
+                                       #   exit 0 iff done is present, 1 otherwise
+bin/heimdall-cp-inspect list-jobs      # every doc id under the jobs namespace
+                                       #   (catches a doc-key mismatch — the smoking gun)
+bin/heimdall-cp-inspect env            # the firestore store location THIS process resolves
+```
+
+**(A) Locally, against the emulator** (no GCP spend — the agent validated the tool this
+way against the in-process Firestore double, `test/cp-inspect.test.sh`, before prod):
+
+```bash
+gcloud emulators firestore start --host-port=localhost:8085 &   # needs a Java 21+ JRE
+export FIRESTORE_EMULATOR_HOST=localhost:8085
+export HEIMDALL_STATE_BACKEND=firestore HEIMDALL_FIRESTORE_PROJECT=demo-local
+bin/heimdall-cp-inspect env
+bin/heimdall-cp-inspect job <job_id>
+bin/heimdall-cp-inspect list-jobs
+```
+
+**(B) In prod, to inspect the failing job's doc** — from a machine with ADC + the
+project (the same creds/dep the deploy uses), pointed at the **same backend env the
+service runs with**:
+
+```bash
+export HEIMDALL_STATE_BACKEND=firestore
+export GOOGLE_CLOUD_PROJECT=<the deploy project>
+export HEIMDALL_FIRESTORE_ROOT=<the deploy root collection, if overridden>
+# (and the same Firestore DATABASE the service uses — see (C))
+gcloud auth application-default login        # if ADC is not already present
+bin/heimdall-cp-inspect job <failing_job_id>
+```
+
+If the doc **exists** and shows `state=done` here but the service reports not-done,
+the service reads a *different store* than this env resolves → go to (C). If the doc
+is **absent** / has no done line here, the Job's write did not land where this env
+reads → run `list-jobs` to see which doc id the Job actually wrote.
+
+**(C) To DIFF the resolved Firestore location between the Job container and the
+Service** (the prime suspect — a project / **database** / root-collection mismatch):
+
+```bash
+# `env` INSIDE the Cloud Run JOB's container+env (one-off execution):
+gcloud run jobs execute <job-name> --region <region> \
+  --args=heimdall-cp-inspect,env --wait
+gcloud logging read \
+  'resource.type=cloud_run_job AND textPayload:"cp-inspect env"' \
+  --limit 50 --format='value(textPayload)'
+
+# `env` as the SERVICE sees it — inspect the service's env block, or run a one-off
+# Job that inherits the SAME env the service has:
+gcloud run services describe <service-name> --region <region> \
+  --format='value(spec.template.spec.containers[0].env)'
+```
+
+DIFF the two `env` outputs. If `HEIMDALL_STATE_BACKEND`, the project, the root
+collection, or the **resolved database** differ between the Job and the Service, that
+difference **is** the read/write split — the Job writes one store, the service reads
+another. (Firestore's default database is `(default)`; a service or Job pinned to a
+**named** database via `FIRESTORE_DATABASE` / a client arg reads a wholly separate
+keyspace, so a doc written to `(default)` is invisible from the named one.)
+
+> Validate locally first: `bash test/cp-inspect.test.sh` → `cp-inspect: PASS` (exit 0).
+> It seeds a job, writes `done` via the real `cp_jobstore` write path over a Firestore
+> backend, then proves `job`/`list-jobs`/`env` read it back from the same resolved doc.
+
+---
+
 ## Gate summary
 
 - **Build context is secret-free** — `.dockerignore` excludes `.git`, the
