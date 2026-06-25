@@ -255,6 +255,78 @@ def load_signing_key(seed_b64=None):
     return _b64(seed), _b64(raw_pub)
 
 
+# The env override for the server's own HAID (the identity the seeded pubkey binds to).
+# Cloud Run has no `.planning/ledger` checkout for `heimdall-haid current` to read, so the
+# deploy can pin the server HAID explicitly; absent it, we derive via the CLI (local/dev).
+SERVER_HAID_ENV = "HEIMDALL_CP_SERVER_HAID"
+
+
+def server_haid(home=None):
+    """The HAID the server's deterministic signing identity binds to. Resolution order:
+      1. HEIMDALL_CP_SERVER_HAID (explicit pin — the deploy sets this since a Cloud Run
+         image carries no `.planning/ledger` checkout for the CLI to read).
+      2. `heimdall-haid current` — the deterministic per-checkout identity NAME (local/dev).
+    Returns the HAID string, or None when neither is available (no CLI + no pin) — the
+    caller then skips seeded registration rather than guessing an identity."""
+    pinned = os.environ.get(SERVER_HAID_ENV)
+    if pinned:
+        return pinned.strip() or None
+    cli = os.path.join(os.path.dirname(_HERE), "heimdall-haid")
+    if not os.path.isfile(cli):
+        return None
+    try:
+        proc = subprocess.run(
+            [cli, "current"], capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    haid = (proc.stdout or "").strip()
+    return haid or None
+
+
+def ensure_server_identity(home=None, *, owner=True):
+    """ESTABLISH the server's deterministic signing identity at boot (the GAP fix wired).
+    When HEIMDALL_CP_PKI_KEY is present, derive the seeded keypair (load_signing_key) and
+    register its public key under the server HAID, so the SAME HAID→pubkey binding rebuilds
+    on EVERY cold start (no per-instance key universe). `owner=True` flags the server's own
+    identity as owner (it drives owner-scoped scheduler ticks / gate decisions, §6/§7).
+
+    Returns a dict the boot path can surface (NO secret in it — never the private seed):
+      {"seeded": bool, "haid": <server haid|None>, "public_key": <b64|None>,
+       "registered": bool, "reason": <str>}.
+
+    Behavior by profile:
+      * Seed present  → derive + register the seeded pubkey deterministically (seeded=True).
+        If no server HAID resolves, seeded=True but registered=False (reason names it) —
+        the keypair is still deterministic; only the binding could not be written.
+      * Cloud profile + seed ABSENT/INVALID → load_signing_key RAISES (fail-closed); this
+        function lets that AuthError propagate so the boot refuses an unstable identity.
+      * Local profile + seed absent → seeded=False (the dev `identity` mint path stays the
+        source of registrations; boot does not mint here). A clear, non-fatal reason."""
+    if not crypto_available():
+        return {"seeded": False, "haid": None, "public_key": None,
+                "registered": False, "reason": "crypto_unavailable"}
+    has_seed = bool(os.environ.get(PKI_KEY_ENV))
+    if not has_seed and not cloud_profile():
+        # Local dev, no seed: do NOT mint here — the `identity` CLI owns dev registration.
+        return {"seeded": False, "haid": None, "public_key": None,
+                "registered": False, "reason": "no_seed_local_profile"}
+    # Seed present, OR cloud profile (where an absent/invalid seed MUST fail-closed):
+    # load_signing_key raises AuthError in the cloud profile when the seed is missing —
+    # we let it propagate (the boot refuses rather than running an unstable identity).
+    _priv, pub = load_signing_key()
+    haid = server_haid(home)
+    if not haid:
+        return {"seeded": True, "haid": None, "public_key": pub,
+                "registered": False, "reason": "no_server_haid"}
+    stored = register_key(haid, pub, owner=owner, home=home)
+    return {"seeded": True, "haid": haid, "public_key": pub,
+            "registered": bool(stored),
+            "reason": "registered" if stored else "registry_write_failed"}
+
+
 def sign(private_b64, message):
     """Sign `message` (bytes or str) with the base64 Ed25519 private seed. Returns the
     base64 signature. Raises AuthError('crypto_unavailable') in degraded mode (a
