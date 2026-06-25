@@ -30,6 +30,14 @@
 #
 #   heimdall-control-plane jobs [--json] [--home DIR]
 #       List every server-hosted job + its durable replayed state (§4). Read-only.
+#   heimdall-control-plane run-job <job_id> [--actor HAID] [--home DIR]
+#       RUN ONE server-hosted job to completion, SYNCHRONOUSLY (not a thread) — the
+#       OUT-OF-PROCESS execution entrypoint (§4 flight fix on Cloud Run). This is the
+#       command the Cloud Run Job container runs (and the SubprocessRunner spawns): it
+#       loads the durable job record, drives cp_worker.run_job against the selected
+#       StateBackend (firestore in prod), and BLOCKS until the job reaches a terminal
+#       state. Exit 0 iff the job reached `done`; nonzero on refusal / isolation
+#       violation / a non-done terminal (the dispatcher leaves it for resume/retry).
 #   heimdall-control-plane schedules [--json] [--home DIR]
 #       List stored cron schedules fired by the per-minute tick driver (§6). Read-only.
 #   heimdall-control-plane approvals [--json] [--home DIR]
@@ -65,7 +73,7 @@ BIN_DIR="$(cd "$(dirname "$SELF")" && pwd)"
 LIB_DIR="$BIN_DIR/lib"
 HAID_CLI="$BIN_DIR/heimdall-haid"
 
-usage() { sed -n '2,56p' "$SELF" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,64p' "$SELF" | sed 's/^# \{0,1\}//'; }
 
 PY="$(command -v python3 || command -v python || true)"
 if [ -z "$PY" ]; then
@@ -94,6 +102,7 @@ UNTIL=""
 EXPORT=""
 NO_REVOCATION=""
 JSON=""
+JOB_ID=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -112,7 +121,10 @@ while [ $# -gt 0 ]; do
     --no-revocation) NO_REVOCATION="1"; shift ;;
     -h|--help)     usage; exit 0 ;;
     --*)           echo "error: unknown option: $1" >&2; usage >&2; exit 2 ;;
-    *)             echo "error: unexpected argument: $1" >&2; usage >&2; exit 2 ;;
+    *)             # the first bare positional is the run-job <job_id> target; any further
+                   # positional is a usage error (every other subcommand is option-only).
+                   if [ -z "$JOB_ID" ]; then JOB_ID="$1"; shift;
+                   else echo "error: unexpected argument: $1" >&2; usage >&2; exit 2; fi ;;
   esac
 done
 
@@ -277,6 +289,63 @@ else:
                          % (j.get("job_id", "?"), j.get("state", "?"),
                             j.get("action_type", "?")))
 PYEOF
+    ;;
+
+  run-job)
+    # RUN ONE job to completion, SYNCHRONOUSLY — the OUT-OF-PROCESS execution entrypoint
+    # (§4 flight fix on Cloud Run). This is the container command the Cloud Run Job runs and
+    # the cp_jobrunner.SubprocessRunner spawns: it drives cp_worker.run_job (NOT a thread)
+    # against the SELECTED StateBackend (firestore in prod), BLOCKING until the job reaches a
+    # terminal state, then exits 0 iff `done`. A queued job left undriven by the (throttled /
+    # scaled-to-zero) service instance is brought to completion HERE, in a process whose
+    # lifetime is independent of the request that started it. The §1 allowlist + §2 isolation
+    # gates fire inside run_job exactly as for the in-thread run — this entrypoint runs no
+    # arbitrary command, only the durable job's allowlisted, isolated handler.
+    [ -n "$JOB_ID" ] || { echo "error: run-job needs a <job_id>" >&2; usage >&2; exit 2; }
+    set +e
+    LIB_DIR="$LIB_DIR" HOME_DIR="$HOME_DIR" JOB_ID="$JOB_ID" ACTOR="$ACTOR" "$PY" - <<'PYEOF'
+import os, sys
+sys.path.insert(0, os.environ["LIB_DIR"])
+import cp_jobstore
+import cp_worker
+home = os.environ.get("HOME_DIR") or None
+job_id = os.environ["JOB_ID"]
+actor = os.environ.get("ACTOR") or None
+
+# The job MUST already exist in the durable store (create_job ran in start_route before the
+# dispatch). An unknown id is an operator/dispatch error — fail loudly, do not invent a job.
+folded = cp_jobstore.read_job(job_id, home)
+if folded is None:
+    sys.stderr.write("run-job: no such job %s in the store\n" % job_id)
+    sys.exit(2)
+
+try:
+    # SYNCHRONOUS run-to-completion (NOT _detach_run / a thread): this process IS the durable
+    # execution. run_job is idempotent — a job already running/terminal is a no-op return, so a
+    # double-dispatch (e.g. a retry) cannot double-run it.
+    final = cp_worker.run_job(job_id, actor_haid=actor, home=home)
+except cp_worker.ActionRefused as exc:
+    # the job named an action the §1 allowlist refuses — already cancelled + audited in run_job.
+    sys.stderr.write("run-job: %s refused (%s)\n" % (job_id, exc))
+    sys.exit(3)
+except cp_worker.IsolationRefused as exc:
+    # the §2 boundary fired — the job reached for a control-plane resource; failed + audited.
+    sys.stderr.write("run-job: %s isolation violation (%s)\n" % (job_id, exc))
+    sys.exit(4)
+except cp_jobstore.IllegalTransition as exc:
+    sys.stderr.write("run-job: %s illegal transition (%s)\n" % (job_id, exc))
+    sys.exit(5)
+
+state = (final or {}).get("state") if final else None
+sys.stderr.write("run-job: %s -> %s\n" % (job_id, state))
+# Exit 0 iff the job reached `done`. A non-done terminal (cancelled, or parked-paused) is a
+# nonzero exit so a wrapping Cloud Run Job execution / the dispatcher sees the job did not
+# complete and resume/retry can re-drive it.
+sys.exit(0 if state == cp_jobstore.STATE_DONE else 1)
+PYEOF
+    RC=$?
+    set -e
+    exit "$RC"
     ;;
 
   schedules)
