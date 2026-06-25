@@ -132,6 +132,55 @@ PROJECT_ENV = "GOOGLE_CLOUD_PROJECT"
 REGION_ENVS = ("HEIMDALL_CP_JOB_REGION", "CLOUD_RUN_REGION", "FUNCTION_REGION")
 REGION_DEFAULT = "us-central1"
 
+# ── STORAGE-IDENTITY ENV (the write/read doc-path fix) ─────────────────────────────
+#
+# THE INCIDENT this closes. A job's durable state is one Firestore doc whose path is
+# (firestore-project, database, root-collection, encode_rel("jobs/<id>.ndjson")). The doc-id
+# encoding is PURE (a function of the rel only). But THREE of the path's coordinates are read
+# from PER-INSTANCE ENV by cp_state_firestore.FirestoreBackend:
+#   • the backend selector   HEIMDALL_STATE_BACKEND      (firestore vs local)
+#   • the firestore project  HEIMDALL_FIRESTORE_PROJECT  (else firestore.Client() falls back
+#                            and GOOGLE_CLOUD_PROJECT     to GOOGLE_CLOUD_PROJECT / ADC metadata)
+#   • the root collection    HEIMDALL_FIRESTORE_ROOT      (default "heimdall_cp")
+#   • the database (optional) HEIMDALL_FIRESTORE_DATABASE (default "(default)")
+# CloudRunJobRunner.dispatch overrides only the Job's ARGS, never its env, so the out-of-process
+# Cloud Run Job container wrote to whatever identity was baked into `heimdall-long-job` at
+# create-time while the dispatching SERVICE read from its own deploy-time identity. ANY drift
+# between those two deploy steps => the Job writes `done` to a doc the service never reads =>
+# run-job exits 0 (the Job DID reach done) yet GET /jobs polls forever and never sees it.
+#
+# THE FIX — make the doc identity travel WITH the dispatch: the Job execution INHERITS the
+# storage-identity env the dispatching service itself resolved (propagated as a container ENV
+# override), so the Job writes to the IDENTICAL (backend, project, root, db) the service reads —
+# by construction, independent of how the two deploy steps' env happened to be set. The doc is
+# then purely (root, rel) for the SAME job across both processes, which is the contract.
+#
+# Only vars actually PRESENT in the dispatching env propagate (an unset var is NOT injected as a
+# blank that would clobber a value the Job legitimately baked). HEIMDALL_HOME is deliberately
+# EXCLUDED: a Firestore doc path is keyed to the project/db/root, never to the home (the whole
+# durability property), so the Job's own home is irrelevant and must not be forced.
+STORAGE_IDENTITY_ENVS = (
+    "HEIMDALL_STATE_BACKEND",
+    "HEIMDALL_FIRESTORE_PROJECT",
+    "HEIMDALL_FIRESTORE_ROOT",
+    "HEIMDALL_FIRESTORE_DATABASE",
+    "GOOGLE_CLOUD_PROJECT",
+)
+
+
+def _storage_identity_env():
+    """The (name, value) pairs of the storage-identity env vars PRESENT in this (the dispatching
+    service's) process environment — the coordinates that pin which Firestore doc a job's state
+    lands in. Returned as a list of (name, value), in STORAGE_IDENTITY_ENVS order, for the vars
+    actually set; an unset var is omitted (never injected blank). The Cloud Run Job execution
+    inherits exactly these, so it writes to the SAME doc the service reads (the write/read fix)."""
+    pairs = []
+    for name in STORAGE_IDENTITY_ENVS:
+        val = os.environ.get(name)
+        if val is not None and val != "":
+            pairs.append((name, val))
+    return pairs
+
 
 class JobRunnerError(RuntimeError):
     """Raised by the factory for an unknown HEIMDALL_JOB_RUNNER (fail closed). A dispatch
@@ -318,13 +367,21 @@ class CloudRunJobRunner(JobRunner):
             name="projects/<project>/locations/<region>/jobs/<job-name>",
             overrides=RunJobRequest.Overrides(
                 container_overrides=[
-                    RunJobRequest.Overrides.ContainerOverride(args=["run-job", <job_id>]),
+                    RunJobRequest.Overrides.ContainerOverride(
+                        args=["run-job", <job_id>],
+                        env=[EnvVar(<storage-identity var>, <service's value>), ...]),
                 ],
             ),
         )
 
     The container override carries BOTH the `run-job` subcommand AND the job_id as the
-    container's args, so the execution runs `run-job <job_id>` against the durable record.
+    container's args, so the execution runs `run-job <job_id>` against the durable record. It
+    ALSO propagates the dispatching service's STORAGE-IDENTITY env (HEIMDALL_STATE_BACKEND /
+    HEIMDALL_FIRESTORE_PROJECT / HEIMDALL_FIRESTORE_ROOT / HEIMDALL_FIRESTORE_DATABASE /
+    GOOGLE_CLOUD_PROJECT) as a container ENV override — see STORAGE_IDENTITY_ENVS — so the Job
+    writes its durable `done` to the IDENTICAL Firestore doc the service later reads. Without
+    this, the Job used whatever identity was baked into it at create-time and a drift from the
+    service's deploy-time identity left `done` in a doc the service never polled (the incident).
     run_job returns an LRO (long-running operation); we do NOT .result()-block on completion
     — dispatch returns as soon as the execution is CREATED (the flight fix). `build_request`
     constructs the RunJobRequest WITHOUT calling GCP, so tests assert the exact shape (the
@@ -374,14 +431,24 @@ class CloudRunJobRunner(JobRunner):
         truth for the request. run_v2 is imported HERE (lazily): only code on the cloudrun-job
         path ever needs google-cloud-run installed."""
         from google.cloud import run_v2  # lazy: only the prod runner needs google-cloud-run.
+        # STORAGE-IDENTITY ENV PROPAGATION (the write/read doc-path fix): the Job execution
+        # inherits the storage-identity env the dispatching SERVICE resolved, so its durable
+        # `done` lands in the SAME Firestore doc the service reads — by construction, not by
+        # hoping the job-create and service-deploy steps set matching env. Only vars actually
+        # set in this process propagate (an unset var is omitted, never injected blank).
+        env_override = [
+            run_v2.EnvVar(name=name, value=value)
+            for name, value in _storage_identity_env()
+        ]
         return run_v2.RunJobRequest(
             name=self.job_resource_name(),
             overrides=run_v2.RunJobRequest.Overrides(
                 container_overrides=[
                     # The override replaces the container's args for THIS execution so its
-                    # command becomes `run-job <job_id>` — BOTH the subcommand and the id.
+                    # command becomes `run-job <job_id>` — BOTH the subcommand and the id — and
+                    # pins the storage identity so the Job writes the doc the service reads.
                     run_v2.RunJobRequest.Overrides.ContainerOverride(
-                        args=["run-job", job_id]),
+                        args=["run-job", job_id], env=env_override),
                 ],
             ),
         )

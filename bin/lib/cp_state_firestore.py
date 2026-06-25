@@ -80,6 +80,15 @@ DEFAULT_ROOT = "heimdall_cp"
 # Read live from the standard GCP env so the deploy wires it via env at deploy time.
 FIRESTORE_PROJECT_ENV = "HEIMDALL_FIRESTORE_PROJECT"
 
+# The Firestore DATABASE the store is keyed to. A doc's full address is
+# (project, database, root-collection, doc-id); the database is the third coordinate and was
+# previously PINNED to "(default)" because the client was built with no database= arg. If a
+# deploy uses a NAMED database (not "(default)"), the writer and the reader MUST agree on it or
+# they address different keyspaces — the same write/read-doc mismatch class the project/root
+# coordinates have. Overridable via env so the deploy sets it once; unset -> the client's own
+# default ("(default)"), the prior behavior, so existing deploys are byte-for-byte unchanged.
+FIRESTORE_DATABASE_ENV = "HEIMDALL_FIRESTORE_DATABASE"
+
 # The rel-segment separator. Firestore doc ids may not contain "/", so a rel's "/" is
 # encoded to this token. Real rel segments are job ids / store names / "<id>.ndjson" /
 # "<id>.json" — none contain "__", so the encoding is reversible and collision-free.
@@ -120,7 +129,7 @@ class FirestoreBackend(cp_state.StateBackend):
     is the entire durability property: a fresh instance with a new ephemeral home reads
     the same state back from Firestore."""
 
-    def __init__(self, *, client=None, root=None, project=None):
+    def __init__(self, *, client=None, root=None, project=None, database=None):
         # The home arg the factory threads through is intentionally IGNORED for storage:
         # a Firestore backend must NOT key persistence to a per-instance home, or it
         # would lose its durability property. We keep no home reference at all.
@@ -131,6 +140,12 @@ class FirestoreBackend(cp_state.StateBackend):
         )
         self._root_name = root if root is not None else (
             os.environ.get(FIRESTORE_ROOT_ENV) or DEFAULT_ROOT
+        )
+        # The DATABASE coordinate of the doc path (the third of (project, database, root, doc)).
+        # Unset -> None -> the client's own default ("(default)"), preserving prior behavior; a
+        # named db (set via env or arg) is honored so writer and reader address the SAME db.
+        self._database = database if database is not None else (
+            os.environ.get(FIRESTORE_DATABASE_ENV) or None
         )
 
     # ── the client seam (lazy real client OR an injected test double) ──────────────
@@ -150,9 +165,16 @@ class FirestoreBackend(cp_state.StateBackend):
                 "deploy/requirements-firestore.txt) or use the default 'local' backend."
                 % exc
             )
+        # Build the client honoring whichever of (project, database) is pinned. The database
+        # is the third doc-path coordinate: a named db (HEIMDALL_FIRESTORE_DATABASE) must be
+        # passed so the writer and reader address the SAME db; unset -> omit the kwarg -> the
+        # client's "(default)" db, the prior behavior (existing deploys unchanged).
+        kwargs = {}
         if self._project:
-            return firestore.Client(project=self._project)
-        return firestore.Client()
+            kwargs["project"] = self._project
+        if self._database:
+            kwargs["database"] = self._database
+        return firestore.Client(**kwargs)
 
     def _db(self):
         """The Firestore client, built once and cached. An injected test double is used
