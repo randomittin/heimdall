@@ -14,6 +14,60 @@ control plane to Cloud Run. The container itself is built from the repo-root
 
 ---
 
+## ⚠️ REBUILD REQUIRED — the deployed image MUST come from current `main`
+
+A prior incident shipped a **stale, pre-Wave-2 image**: in that image the
+`bin/lib/cp_state.py` `get_backend` firestore branch only `raise`d
+`BackendUnavailable` ("reserved for Wave 2"), so with
+`HEIMDALL_STATE_BACKEND=firestore` set the control plane logged
+`cp_boot: tick error: BackendUnavailable` every 60s and never reached durable
+state. **You MUST rebuild the image from current `main` before deploying** — a
+redeploy of the old image will reproduce the incident.
+
+Two distinct fixes both have to be in the deployed image:
+
+1. **The Wave-2 backend code** — current `main`'s `get_backend` firestore branch
+   returns a real `cp_state_firestore.FirestoreBackend()` (no "reserved for
+   Wave 2" `raise`). Confirm before deploy:
+
+   ```bash
+   # Expect: the firestore branch imports cp_state_firestore and returns
+   # FirestoreBackend() — NOT a BackendUnavailable raise.
+   grep -n "import cp_state_firestore" bin/lib/cp_state.py
+   grep -n "return cp_state_firestore.FirestoreBackend()" bin/lib/cp_state.py
+   ```
+
+2. **The Firestore client in the image** — the `Dockerfile` now installs
+   `google-cloud-firestore==2.16.1` (matching `deploy/requirements-firestore.txt`)
+   in the same pip layer as `cryptography`, plus a **build-time guard**
+   (`RUN python -c "import google.cloud.firestore, cryptography"`) so a missing
+   dep **fails the build** instead of shipping a broken image. Confirm before
+   deploy:
+
+   ```bash
+   # Expect: the firestore pin AND the import guard are both present.
+   grep -n "google-cloud-firestore" Dockerfile
+   grep -n 'python -c "import google.cloud.firestore' Dockerfile
+   ```
+
+### Post-deploy verification
+
+After the rebuilt image is live, the incident signature must be **gone**:
+
+```bash
+# The BackendUnavailable tick error must STOP appearing in the logs.
+gcloud run services logs read "${SERVICE}" --region="${REGION}" --limit=100 \
+  | grep -F "cp_boot: tick error: BackendUnavailable" \
+  && echo "STILL BROKEN — image is stale or missing google-cloud-firestore" \
+  || echo "OK — firestore factory path is live, no BackendUnavailable ticks"
+```
+
+A clean run (no `BackendUnavailable` lines) means the firestore factory path is
+live: `get_backend` returned `FirestoreBackend`, the client imported, and durable
+state is being read/written across scale-to-zero.
+
+---
+
 ## 0. Prerequisites (one-time, per project)
 
 ```bash

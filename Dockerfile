@@ -30,9 +30,20 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 # Install the control-plane runtime deps. cryptography provides the Ed25519
-# backend cp_auth.py prefers; the server engine is otherwise stdlib-only.
+# backend cp_auth.py prefers; google-cloud-firestore is the durable Cloud Run
+# state backend (HEIMDALL_STATE_BACKEND=firestore selects it — cp_state.get_backend
+# lazily imports cp_state_firestore.FirestoreBackend, which imports
+# google.cloud.firestore). Without this pin the backend factory raises
+# BackendUnavailable every cp_boot tick. Inlined here (one layer, no deploy/ COPY)
+# so a .dockerignore exclusion of deploy/ cannot silently drop the dep. The pin
+# MUST match deploy/requirements-firestore.txt (the source of truth: 2.16.1).
 # Pinned for reproducible builds.
-RUN pip install --no-cache-dir "cryptography==42.0.8"
+RUN pip install --no-cache-dir "cryptography==42.0.8" "google-cloud-firestore==2.16.1"
+
+# Build-time dependency guard: import the deps the runtime needs at BUILD time so a
+# missing/incompatible pin FAILS THE BUILD here (cheapest place to catch it) instead
+# of shipping an image that raises BackendUnavailable on every cp_boot tick at runtime.
+RUN python -c "import google.cloud.firestore, cryptography; print('deps OK')"
 
 # Non-root runtime user (Cloud Run best practice; least privilege).
 RUN groupadd --system heimdall \
