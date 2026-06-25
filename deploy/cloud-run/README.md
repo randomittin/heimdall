@@ -147,6 +147,16 @@ injected into the running container as a mounted secret at deploy time.
 > secret — it is a plain identity **name** — but it **must be pinned** in §3/§4
 > alongside the seed. See _"Stable identity: both halves must be pinned"_ at the
 > end of §3.
+>
+> **The canonical pinned value is `cp-server`** (the value live on the deployed
+> service). `cp_auth.server_haid` stores and matches this string **verbatim** — it
+> does **no** normalization, prefix-stripping, lowercasing, or format validation
+> (`bin/lib/cp_auth.py:278` returns `pinned.strip() or None`; `register_key` and
+> `verify` use it as an opaque registry key). So the **only** requirement is that
+> every instance pins the **identical literal** and the verify client signs as that
+> **same literal** — the `haid:` prefix is **not** required on this path. Any stable
+> string works; we standardize on **`cp-server`** so the runbook matches production
+> and no redeploy is needed.
 
 ### Create the secret container (no value committed anywhere)
 
@@ -196,15 +206,19 @@ gcloud run deploy "${SERVICE}" \
   --port=8080 \
   --no-allow-unauthenticated \
   --set-secrets="HEIMDALL_CP_PKI_KEY=cp-pki-key:latest" \
-  --set-env-vars="HEIMDALL_STATE_BACKEND=firestore,GOOGLE_CLOUD_PROJECT=${PROJECT_ID},HEIMDALL_CP_SERVER_HAID=haid:heimdall.cp-prod-0001"
+  --set-env-vars="HEIMDALL_STATE_BACKEND=firestore,GOOGLE_CLOUD_PROJECT=${PROJECT_ID},HEIMDALL_CP_SERVER_HAID=cp-server"
 ```
 
-> **`HEIMDALL_CP_SERVER_HAID` pins the server's identity NAME — choose one value
-> and keep it constant forever.** Here it is `haid:heimdall.cp-prod-0001` (a plain
-> identity name, **not** a secret — fine to commit and to read back via
-> `gcloud run services describe`). RJ picks this value **once** and **never changes
-> it** across redeploys. See _"Stable identity: both halves must be pinned"_ below
-> for why an unpinned name silently breaks cross-instance auth.
+> **`HEIMDALL_CP_SERVER_HAID=cp-server` is REQUIRED in every deploy command.** The
+> code reads it at boot (`cp_auth.server_haid`, `bin/lib/cp_auth.py:269`); **absent,
+> the server derives an unstable per-instance HAID from the container `HOSTNAME`** —
+> different on every Cloud Run instance — so cross-instance signature verification
+> breaks. It is stored and matched **verbatim** (no `haid:` prefix needed, no
+> normalization), so `cp-server` is correct as-is; the only rule is to use the
+> **identical literal** everywhere and never change it across redeploys. It is a
+> plain identity name, **not** a secret — fine to commit and to read back via
+> `gcloud run services describe`. See _"Stable identity: both halves must be pinned"_
+> below for why an unpinned name silently breaks cross-instance auth.
 
 What each flag buys:
 
@@ -234,14 +248,19 @@ every Cloud Run instance and every cold start for signatures to verify:
    derives the *same* keypair from the *same* seed on every instance
    (`bin/lib/cp_auth.py` `load_signing_key`). ✅ already pinned via `--set-secrets`.
 2. **The name** — the HAID the key binds to. Resolved by `cp_auth.server_haid`
-   (`bin/lib/cp_auth.py:269`): it reads `HEIMDALL_CP_SERVER_HAID` **first**, else
-   derives a HAID via the `heimdall-haid` CLI — which uses the container
-   **`HOSTNAME`**, *different on every Cloud Run instance*. ⇒ Without the env var,
-   each instance registers a **different** `haid → pubkey` binding (an unstable,
-   per-instance name), so a request signed as instance A's HAID **fails to verify**
-   on instance B even though the *key* is identical. Pinning
-   `HEIMDALL_CP_SERVER_HAID` makes every instance register the **identical**
-   `server_haid → pubkey(seed)` binding at boot (`ensure_server_identity`).
+   (`bin/lib/cp_auth.py:269`): it reads `HEIMDALL_CP_SERVER_HAID` **first** and
+   returns it **verbatim** (`pinned.strip() or None`, `bin/lib/cp_auth.py:278` — no
+   prefix, no lowercasing, no format check), else derives a HAID via the
+   `heimdall-haid` CLI — which uses the container **`HOSTNAME`**, *different on every
+   Cloud Run instance*. ⇒ Without the env var, each instance registers a
+   **different** `haid → pubkey` binding (an unstable, per-instance name), so a
+   request signed as instance A's HAID **fails to verify** on instance B even though
+   the *key* is identical. Pinning `HEIMDALL_CP_SERVER_HAID=cp-server` makes every
+   instance register the **identical** `server_haid → pubkey(seed)` binding at boot
+   (`ensure_server_identity`). Because the value is matched verbatim, the canonical
+   `haid:{human}.{machine}-{hash4}` format is **not** enforced here — `cp-server` is
+   a valid, stable name as-is; what matters is that it is identical on every instance
+   and that the verify client signs as that same literal.
 
 > **Why this matters for the flight-fix.** The flight-fix proof (§7) signs a
 > request as the server's own HAID, then reads the job back from a **fresh**
@@ -258,10 +277,10 @@ every Cloud Run instance and every cold start for signatures to verify:
 >
 > ```bash
 > gcloud run services update "${SERVICE}" --region="${REGION}" \
->   --update-env-vars="HEIMDALL_CP_SERVER_HAID=haid:heimdall.cp-prod-0001"
+>   --update-env-vars="HEIMDALL_CP_SERVER_HAID=cp-server"
 > ```
 >
-> (Choose the **same** value you committed to in §3 and never change it. If a
+> (Use the **same** `cp-server` value committed to in §3 and never change it. If a
 > rebuild is also pending for other reasons — see the rebuild section above — the
 > full `gcloud run deploy` in §3, which already carries the var, covers both.)
 
@@ -281,10 +300,10 @@ gcloud run jobs create heimdall-long-job \
   --task-timeout=3600 \
   --max-retries=1 \
   --set-secrets="HEIMDALL_CP_PKI_KEY=cp-pki-key:latest" \
-  --set-env-vars="HEIMDALL_STATE_BACKEND=firestore,GOOGLE_CLOUD_PROJECT=${PROJECT_ID},HEIMDALL_CP_SERVER_HAID=haid:heimdall.cp-prod-0001"
+  --set-env-vars="HEIMDALL_STATE_BACKEND=firestore,GOOGLE_CLOUD_PROJECT=${PROJECT_ID},HEIMDALL_CP_SERVER_HAID=cp-server"
 ```
 
-> The Job pins the **same** `HEIMDALL_CP_SERVER_HAID` as the service (§3) — the
+> The Job pins the **same** `HEIMDALL_CP_SERVER_HAID=cp-server` as the service (§3) — the
 > long-running Job and the request-serving service share one stable server
 > identity, so a job kicked off through the service and run by the Job both
 > register the identical `server_haid → pubkey(seed)` binding. Keep this value in
