@@ -45,7 +45,6 @@
 from __future__ import annotations
 
 import base64
-import json
 import os
 import subprocess
 import sys
@@ -54,7 +53,13 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
-import issue_queue  # REUSE heimdall_home() for the key-registry store root.
+import cp_state  # the pluggable persistence backend (Wave 1). The HAID->pubkey key
+               # registry's atomic keyed JSON read/write runs THROUGH a StateBackend
+               # (get_backend) — exactly like cp_approval — so the same tmp+os.replace
+               # put / json read becomes durable on Cloud Run (Firestore backend) WITHOUT
+               # changing this module. The local backend is byte-identical to the prior
+               # keys.json-to-HEIMDALL_HOME path, and it owns heimdall_home() resolution
+               # (the registry no longer needs issue_queue / direct json IO here).
 
 # ── crypto backend (Ed25519 via `cryptography`, else PyNaCl, else degrade) ─────
 #
@@ -385,13 +390,32 @@ def verify_raw(public_b64, message, sig_b64):
 # governs PKI verification with no extra machinery (§3 revocation reuse).
 
 
+# The store-relative paths (relative to ${HEIMDALL_HOME}/control-plane/, the StateBackend
+# rel namespace): the auth dir is "auth/", the registry is "auth/keys.json". The backend
+# owns the home root + makedirs + the atomic tmp+os.replace / indent=2 byte shape; auth_dir
+# and keys_path stay the public absolute-path accessors (now sourced from backend.path(),
+# so they remain byte-identical to the prior layout on the local backend).
+_AUTH_REL = "auth"
+_KEYS_REL = os.path.join(_AUTH_REL, "keys.json")
+
+
+def _backend(home=None):
+    """The StateBackend for the key registry (HEIMDALL_STATE_BACKEND, default local).
+    `home` pins the store root exactly as every registry accessor's `home=` arg always
+    has — exactly like cp_approval._backend."""
+    return cp_state.get_backend(home=home)
+
+
 def auth_dir(home=None):
-    base = home if home else issue_queue.heimdall_home()
-    return os.path.join(base, "control-plane", "auth")
+    """The auth store dir: ${HEIMDALL_HOME}/control-plane/auth/ (the backend's absolute
+    path for the auth rel-dir — unchanged on the local backend)."""
+    return _backend(home).path(_AUTH_REL)
 
 
 def keys_path(home=None):
-    return os.path.join(auth_dir(home), "keys.json")
+    """The on-disk path of the HAID->pubkey registry: control-plane/auth/keys.json (the
+    backend's absolute path — byte-identical to the prior layout on the local backend)."""
+    return _backend(home).path(_KEYS_REL)
 
 
 def _empty_registry():
@@ -399,34 +423,26 @@ def _empty_registry():
 
 
 def _load_keys(home=None):
-    path = keys_path(home)
-    if not os.path.isfile(path):
-        return _empty_registry()
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            obj = json.load(fh)
-    except (OSError, ValueError):
-        return _empty_registry()
+    """Read the HAID->pubkey registry, or an empty registry when absent/corrupt/off-schema.
+    Routed THROUGH the StateBackend (Wave 1): get_record returns the same single keyed JSON
+    record (or None when absent/corrupt) the registry has always read — byte-identical on
+    the local backend, Firestore-durable when HEIMDALL_STATE_BACKEND=firestore."""
+    obj = _backend(home).get_record(_KEYS_REL)
     if isinstance(obj, dict) and isinstance(obj.get("keys"), dict):
         return obj
     return _empty_registry()
 
 
 def _store_keys(reg, home=None):
-    """Atomic write of the key registry (mktemp + replace), mirroring agents.json's
-    atomic-write discipline. Returns True on success."""
-    ldir = auth_dir(home)
-    try:
-        os.makedirs(ldir, exist_ok=True)
-        path = keys_path(home)
-        tmp = path + ".tmp.%d" % os.getpid()
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(reg, fh, sort_keys=True, indent=2)
-            fh.flush()
-        os.replace(tmp, path)
-        return True
-    except OSError:
-        return False
+    """Atomic write of the key registry, mirroring cp_approval's discipline. Returns True
+    on success, False on an IO failure.
+
+    Routed THROUGH the StateBackend (Wave 1): put_record writes the same atomic
+    tmp+os.replace, json.dump(sort_keys=True, indent=2) keyed record the registry has always
+    written — so keys.json is byte-identical on the local backend, and the SAME atomic put
+    becomes Cloud-Run-durable (pubkeys survive scale-to-zero) when the Firestore backend is
+    selected."""
+    return _backend(home).put_record(_KEYS_REL, reg)
 
 
 def register_key(haid, public_b64, *, owner=False, home=None):
