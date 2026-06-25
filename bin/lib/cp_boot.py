@@ -93,28 +93,24 @@ class BootResult:
 
 def _owner_haids(home=None):
     """The registered HAIDs flagged owner:true — the identities the tick driver fires
-    schedules AS (§6/§7). Read from the auth key registry via cp_auth's PUBLIC keys_path
-    (we never reach into its private loader). An absent/garbled registry yields [] — a
-    server with no owners simply has no autonomous tick principal, which is honest.
+    schedules AS (§6/§7). Resolved THROUGH cp_auth.owner_haids, which reads the key
+    registry via the StateBackend (get_record), NOT via keys_path()/open().
+
+    THE INCIDENT THIS FIXES (live, firestore deploy). This used to enumerate owners by
+    cp_auth.keys_path(home) + open()ing that file. keys_path() routes to backend.path(),
+    and FirestoreBackend.path() RAISES BackendUnavailable by design (a firestore-backed
+    rel has no local file). So under HEIMDALL_STATE_BACKEND=firestore the per-minute tick
+    raised every 60s, even though /readyz (which probes via _db()/read_lines, never path())
+    reported the backend ready — the tick's data-access path diverged from the probe's.
+    The fix is in THIS caller: the owner registry is a keyed JSON record, so we read it
+    with the firestore-safe record accessor instead of a filesystem path. An absent/garbled
+    registry still yields [] — a server with no owners simply has no autonomous tick
+    principal, which is honest.
 
     A schedule is owned by the owner_haid that created it; tick(identity, ...) fires as
     one identity per call, so the driver loops the owners and ticks once per owner — each
     owner's due schedules fire AS that owner (the create-time gate they passed)."""
-    path = cp_auth.keys_path(home)
-    if not os.path.isfile(path):
-        return []
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            reg = json.load(fh)
-    except (OSError, ValueError):
-        return []
-    keys = reg.get("keys") if isinstance(reg, dict) else None
-    if not isinstance(keys, dict):
-        return []
-    return sorted(
-        haid for haid, entry in keys.items()
-        if isinstance(entry, dict) and entry.get("owner")
-    )
+    return cp_auth.owner_haids(home)
 
 
 def run_tick(*, home=None, base_env=None, now=None, approved_action_types=None):

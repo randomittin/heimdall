@@ -471,6 +471,26 @@ def is_owner(haid, home=None):
     return bool(entry.get("owner")) if isinstance(entry, dict) else False
 
 
+def owner_haids(home=None):
+    """The SORTED HAIDs flagged owner:true in the key registry — the identities the §6
+    scheduler tick fires schedules AS. Read THROUGH the StateBackend (_load_keys ->
+    get_record), NEVER through keys_path()/open(): the registry is a keyed JSON record,
+    and a non-filesystem backend (FirestoreBackend) REFUSES path() by design, so any
+    caller that enumerated owners by opening keys.json on disk crashed under
+    HEIMDALL_STATE_BACKEND=firestore (the live per-minute tick incident). This accessor is
+    firestore-safe — it uses the SAME tolerant registry read every other reader here uses,
+    so an absent/garbled registry yields [] (a server with no owners simply has no
+    autonomous tick principal, which is honest), and it returns the identical sorted set on
+    the local and firestore backends. cp_boot.run_tick enumerates owners through HERE."""
+    keys = _load_keys(home).get("keys")
+    if not isinstance(keys, dict):
+        return []
+    return sorted(
+        haid for haid, entry in keys.items()
+        if isinstance(entry, dict) and entry.get("owner")
+    )
+
+
 # ── revocation: REUSE heimdall-haid's agents.json status (§3, no new machinery) ─
 
 
