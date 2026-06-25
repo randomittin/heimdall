@@ -212,14 +212,21 @@ class SubprocessRunner(JobRunner):
         """Open the per-job run log for the detached child's stdout/stderr, or fall back to
         /dev/null. Returns an open file object the caller closes after Popen (Popen dup's the
         fd into the child, so the parent can close its handle immediately). Best-effort: a
-        failure to create the log never blocks the dispatch — the job runs either way."""
+        failure to create the log never blocks the dispatch — the job runs either way.
+
+        The on-disk run log is a LocalBackend convenience. A non-filesystem backend
+        (FirestoreBackend, the prod store on Cloud Run) has NO local path: job_path() ->
+        backend.path() raises cp_state.BackendUnavailable there. That is EXPECTED, not an
+        error — so we fall back to /dev/null and the detached child still spawns and runs.
+        We catch broadly (OSError + BackendUnavailable + any backend init error): the log is
+        a debugging aid only, and per the contract a log failure must NEVER block dispatch."""
         try:
             import cp_jobstore
             log_path = cp_jobstore.job_path(job_id, home) + ".run.log"
             os.makedirs(os.path.dirname(log_path), exist_ok=True)
             return open(log_path, "ab")
-        except OSError:
-            return open(os.devnull, "ab")
+        except Exception:  # noqa: BLE001 — best-effort log; a non-filesystem backend (Firestore)
+            return open(os.devnull, "ab")  # has no local path -> /dev/null, dispatch proceeds.
 
     def dispatch(self, job_id, *, actor_haid=None, home=None, base_env=None):
         cmd = [self._cli, "run-job", job_id]
