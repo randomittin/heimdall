@@ -44,6 +44,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import tempfile
 import uuid
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -124,12 +125,36 @@ def _route(method, path):
 # ── the §2 isolated-context builder ────────────────────────────────────────────
 
 
+def _scratch_base(home):
+    """The directory the per-job scratch tree roots under. An EXPLICIT `home` (or a
+    set HEIMDALL_HOME, which issue_queue.heimdall_home() honors) ALWAYS wins —
+    byte-identical to the historical path, so the prod config (HEIMDALL_HOME=/app/state)
+    is unchanged.
+
+    THE HARDENING: when NEITHER is supplied, issue_queue.heimdall_home() falls back to
+    <repo>/.heimdall — a path that on a Cloud Run Job is the READ-ONLY container rootfs.
+    os.makedirs against it raises PermissionError, run_job re-raises, and the run-job
+    entrypoint exits 1 with the job stuck `running`. The scratch is ephemeral per-
+    execution anyway, so with no home/HEIMDALL_HOME we root it under a GUARANTEED-
+    writable temp base (tempfile.gettempdir()/heimdall-scratch) instead. This only
+    changes behavior when home is absent — the configured path never moves."""
+    if home:
+        return home
+    if os.environ.get("HEIMDALL_HOME"):
+        return issue_queue.heimdall_home()
+    return os.path.join(tempfile.gettempdir(), "heimdall-scratch")
+
+
 def make_context(action_id, *, home=None, base_env=None):
     """Build a §2 IsolatedContext for one isolated dispatch: a per-job scratch dir
     under the runtime home's control-plane/scratch/<action_id>/ + a fresh scoped
     token. The context's scrubbed env + path-deny enforce the control/data-plane
-    line; the worker (piece d) is the low-priv process that runs inside it."""
-    base = home if home else issue_queue.heimdall_home()
+    line; the worker (piece d) is the low-priv process that runs inside it.
+
+    When no home/HEIMDALL_HOME is supplied the scratch base defaults to a guaranteed-
+    writable temp dir (_scratch_base) so a Cloud Run Job whose home is absent does not
+    hit the read-only rootfs — the scratch is ephemeral per-execution regardless."""
+    base = _scratch_base(home)
     scratch = os.path.join(base, "control-plane", "scratch", action_id)
     os.makedirs(scratch, exist_ok=True)
     token = "jobtok-" + uuid.uuid4().hex
