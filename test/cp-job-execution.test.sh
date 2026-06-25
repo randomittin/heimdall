@@ -532,6 +532,182 @@ while IFS= read -r line; do
   esac
 done < <("$PY" "$ARGV_PY" 2>&1)
 
+# ── E. DISPATCH LOGS LOUD, NEVER SILENT — the "deployed-but-silent" class, killed ─────
+echo
+echo "E. CloudRunJobRunner.dispatch logs LOUD on failure (no silent swallow) + on success"
+
+# THE RECURRING CLASS (the incident): on prod the Cloud Run Job stays queued AND the service
+# logs are SILENT — dispatch() caught the exception and returned {dispatched:False} with no
+# trace, so no run found WHY. This section proves dispatch now (a) returns dispatched:False
+# WITH the error detail in the dict AND (b) LOGS the full exception to stderr (Cloud Run
+# captures stderr), so the next prod run's logs name the exact failure. We INJECT a fake
+# run_v2 whose JobsClient.run_job RAISES a PermissionDenied-like error (the 403 the spec
+# worries about), capture stderr, and assert the detail appears in BOTH places. We also drive
+# the SUCCESS path with a recording fake and assert the run_job call + resource name are logged.
+LOUD_PY="$EXT/dispatch_loud.py"
+cat >"$LOUD_PY" <<'PYEOF'
+import io
+import os
+import sys
+import types
+import contextlib
+
+sys.path.insert(0, os.environ["LIB"])
+
+# Force the prod runner's env to be buildable (a resource name needs a project + region).
+os.environ["GOOGLE_CLOUD_PROJECT"] = "loud-proj"
+os.environ["HEIMDALL_CP_JOB_REGION"] = "us-central1"
+os.environ["HEIMDALL_CP_JOB_NAME"] = "heimdall-long-job"
+for _k in ("CLOUD_RUN_REGION", "FUNCTION_REGION"):
+    os.environ.pop(_k, None)
+
+import cp_jobrunner
+
+JOB_ID = "job-loud-log-TEST"
+EXPECT_NAME = "projects/loud-proj/locations/us-central1/jobs/heimdall-long-job"
+PERM_MSG = "403 caller lacks run.jobs.run on the job"
+
+
+class _FakePermissionDenied(Exception):
+    """Stand-in for google.api_core.exceptions.PermissionDenied — dispatch must log its
+    type name + message LOUD, never swallow it."""
+
+
+def _install_fake_run_v2(*, raise_on_run):
+    """Bind a fake google.cloud.run_v2 with the message classes build_request needs and a
+    JobsClient whose run_job EITHER raises (raise_on_run=True) or records the request and
+    returns an LRO double (the success path). Faithful to the shipped dispatch shape — it
+    builds a real RunJobRequest via these classes, then calls JobsClient.run_job(request=...)."""
+    run_v2 = types.ModuleType("google.cloud.run_v2")
+
+    class ContainerOverride:
+        def __init__(self, args=None):
+            self.args = list(args or [])
+
+    class Overrides:
+        def __init__(self, container_overrides=None):
+            self.container_overrides = list(container_overrides or [])
+
+    class RunJobRequest:
+        def __init__(self, name=None, overrides=None):
+            self.name = name
+            self.overrides = overrides
+
+    # Wire the nested type references AFTER definition (a class body cannot see an
+    # enclosing function's locals during its own namespace evaluation).
+    Overrides.ContainerOverride = ContainerOverride
+    RunJobRequest.Overrides = Overrides
+
+    calls = {"requests": [], "clients": 0}
+
+    class JobsClient:
+        def __init__(self, *args, **kwargs):
+            calls["clients"] += 1   # real body: record construction (no ADC, no network).
+
+        def run_job(self, request=None):
+            calls["requests"].append(request)
+            if raise_on_run:
+                raise _FakePermissionDenied(PERM_MSG)
+            return types.SimpleNamespace(operation="lro-double")  # an LRO; dispatch must NOT .result()
+
+    run_v2.RunJobRequest = RunJobRequest
+    run_v2.JobsClient = JobsClient
+
+    # Bind google + google.cloud package shells, then attach run_v2 so
+    # `from google.cloud import run_v2` inside dispatch/build_request resolves to OUR fake.
+    for _name in ("google", "google.cloud"):
+        if _name not in sys.modules:
+            pkg = types.ModuleType(_name)
+            pkg.__path__ = []
+            sys.modules[_name] = pkg
+    sys.modules["google.cloud"].run_v2 = run_v2
+    sys.modules["google.cloud.run_v2"] = run_v2
+    return calls
+
+
+def _run_dispatch(*, raise_on_run):
+    """Call CloudRunJobRunner.dispatch with the fake run_v2 installed, CAPTURING stderr (the
+    Cloud Run log sink). Returns (result_dict, stderr_text, recorded_calls)."""
+    calls = _install_fake_run_v2(raise_on_run=raise_on_run)
+    runner = cp_jobrunner.CloudRunJobRunner()
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        result = runner.dispatch(JOB_ID, actor_haid="haid:tester", home=None)
+    return result, err.getvalue(), calls
+
+
+# ── E-FAIL: run_job raises a 403 → dispatch returns dispatched:False WITH detail, AND logs LOUD ──
+res_fail, err_fail, _ = _run_dispatch(raise_on_run=True)
+
+# E1 — dispatch did NOT crash and reported failure in the returned dict (never raised into caller).
+e1 = (isinstance(res_fail, dict) and res_fail.get("dispatched") is False)
+print("PASS E1: dispatch returned dispatched:False (never raised into start_route)" if e1 else
+      "FAIL E1: dispatch result is %r (expected a dict with dispatched:False)" % (res_fail,))
+
+# E2 — the returned dict CARRIES the error detail (a caller/audit can see WHY, not just the log).
+detail_fail = "%s %s" % (res_fail.get("error"), res_fail.get("detail")) if isinstance(res_fail, dict) else ""
+e2 = (isinstance(res_fail, dict) and res_fail.get("error")
+      and (PERM_MSG in (res_fail.get("detail") or "")
+           or "PermissionDenied" in (res_fail.get("detail") or "")
+           or "_FakePermissionDenied" in (res_fail.get("detail") or "")))
+print("PASS E2: the result dict carries the error detail (%r) — caller/audit sees the failure"
+      % detail_fail if e2 else
+      "FAIL E2: result dict lacks the exception detail (error=%r detail=%r)"
+      % (res_fail.get("error") if isinstance(res_fail, dict) else None,
+         res_fail.get("detail") if isinstance(res_fail, dict) else None))
+
+# E3 (THE CARDINAL) — the exception detail was LOGGED to stderr (no silent swallow). Cloud Run
+#      captures stderr, so the next prod run's logs name the 403. This is the recurring class killed.
+e3 = (PERM_MSG in err_fail and ("cp_jobrunner" in err_fail))
+print("PASS E3 (cardinal): the 403 detail was LOGGED to stderr ('%s' present, cp_jobrunner prefix) "
+      "— NOT silently swallowed" % PERM_MSG if e3 else
+      "FAIL E3 (cardinal): the exception detail is ABSENT from stderr (silent swallow!). "
+      "stderr=%r" % err_fail)
+
+# E4 — the loud log names the exception TYPE too (PermissionDenied-like), so a 403 is
+#      distinguishable from a NotFound/InvalidArgument at a glance in the logs.
+e4 = ("_FakePermissionDenied" in err_fail or "PermissionDenied" in err_fail)
+print("PASS E4: the loud log names the exception TYPE (403/PermissionDenied-like) for triage"
+      if e4 else
+      "FAIL E4: the exception type is not named in stderr — cannot tell a 403 from a 404. "
+      "stderr=%r" % err_fail)
+
+# ── E-SUCCESS: run_job succeeds → dispatch logs the run_job CALL + the resolved resource name ──
+res_ok, err_ok, calls_ok = _run_dispatch(raise_on_run=False)
+
+# E5 — the success path dispatched (the LRO was accepted; dispatch did NOT .result()-block).
+e5 = (isinstance(res_ok, dict) and res_ok.get("dispatched") is True
+      and len(calls_ok["requests"]) == 1)
+print("PASS E5: success path returns dispatched:True and called run_job exactly once (no .result() block)"
+      if e5 else
+      "FAIL E5: success path result=%r calls=%d (expected dispatched:True, exactly one run_job call)"
+      % (res_ok, len(calls_ok["requests"])))
+
+# E6 — the success path LOGS the run_job call AND the resolved resource name, so a healthy
+#      dispatch is visible in the logs too (start/call/success — not just failures).
+e6 = (EXPECT_NAME in err_ok and "run_job" in err_ok)
+print("PASS E6: success path LOGS the run_job call + the resource name (%s) — dispatch is observable "
+      "even when it works" % EXPECT_NAME if e6 else
+      "FAIL E6: success stderr missing the run_job call or resource name. stderr=%r" % err_ok)
+
+# E7 — the START log names the job_id + the resolved resource name (so a queued job's dispatch
+#      attempt is traceable from the very first line, before any call). Asserted on the success run.
+e7 = (JOB_ID in err_ok and EXPECT_NAME in err_ok)
+print("PASS E7: the dispatch START log names job_id (%s) + the resource name — the attempt is traceable"
+      % JOB_ID if e7 else
+      "FAIL E7: the start log does not name the job_id + resource name. stderr=%r" % err_ok)
+PYEOF
+
+# Run the loud-log assertions with a CLEAN env (no inherited HEIMDALL_JOB_RUNNER / K_SERVICE)
+# so the fake run_v2 is the only google.cloud.run_v2 in play, and map PASS/FAIL to counters.
+while IFS= read -r line; do
+  case "$line" in
+    PASS*)  ok  "${line#PASS }" ;;
+    FAIL*)  bad "${line#FAIL }" ;;
+    SKIP*)  printf "  \033[33mSKIP\033[0m %s\n" "${line#SKIP }" ;;
+  esac
+done < <(env -u HEIMDALL_JOB_RUNNER -u K_SERVICE "$PY" "$LOUD_PY" 2>&1)
+
 # ── verdict ──
 echo
 echo "============================================================"
