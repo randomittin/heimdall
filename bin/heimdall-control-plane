@@ -38,6 +38,13 @@
 #       Poll an instance's notification inbox (§8): DATA only, never a command.
 #   heimdall-control-plane dashboard [--json] [--home DIR]
 #       The cross-dev observe roll-up (§5). Read-only.
+#   heimdall-control-plane diagnose [--json] [--home DIR]
+#       Operator self-check (§C): run every cp_selfcheck probe against the local
+#       control-plane state tree and print a PASS/FAIL table (text) or a structured
+#       report (--json). Read-only — inspects state, mutates nothing, NEVER prints
+#       secret/key material (status + paths only). Exits nonzero iff a CRITICAL
+#       check fails (crypto backend, PKI key registry, audit + state stores
+#       writable, allowlist sane); advisory checks are reported but never fail it.
 #
 #   -h, --help
 #
@@ -58,7 +65,7 @@ BIN_DIR="$(cd "$(dirname "$SELF")" && pwd)"
 LIB_DIR="$BIN_DIR/lib"
 HAID_CLI="$BIN_DIR/heimdall-haid"
 
-usage() { sed -n '2,55p' "$SELF" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,56p' "$SELF" | sed 's/^# \{0,1\}//'; }
 
 PY="$(command -v python3 || command -v python || true)"
 if [ -z "$PY" ]; then
@@ -315,6 +322,30 @@ sys.path.insert(0, os.environ["LIB_DIR"])
 import cp_dashboard
 sys.exit(cp_dashboard._cli(sys.argv[1:]))
 PYEOF
+    ;;
+
+  diagnose)
+    # Operator self-check (§C). Runs every cp_selfcheck probe against the local
+    # state tree and prints a PASS/FAIL table (or --json). Read-only — never mutates,
+    # never prints secret/key material (the no-secret discipline §5/§7). Exits nonzero
+    # iff a CRITICAL check fails so a wrapping script can gate on a sane control plane.
+    set +e
+    LIB_DIR="$LIB_DIR" HOME_DIR="$HOME_DIR" JSON="$JSON" "$PY" - <<'PYEOF'
+import json, os, sys
+sys.path.insert(0, os.environ["LIB_DIR"])
+import cp_selfcheck
+home = os.environ.get("HOME_DIR") or None
+report = cp_selfcheck.run_all(home)
+if os.environ.get("JSON"):
+    sys.stdout.write(json.dumps(report, indent=2, sort_keys=True) + "\n")
+else:
+    sys.stdout.write(cp_selfcheck.render_table(report))
+# nonzero exit iff a CRITICAL check failed (advisory failures do NOT fail the run).
+sys.exit(0 if report["ok"] else 1)
+PYEOF
+    RC=$?
+    set -e
+    exit "$RC"
     ;;
 
   *)
