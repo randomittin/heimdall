@@ -285,9 +285,12 @@ def get_backend(home=None, backend=None):
     (threaded through from the store's `home=` arg).
 
       "local"     -> LocalBackend (the byte-identical NDJSON-to-HEIMDALL_HOME path).
-      "firestore" -> RESERVED FOR WAVE 2. Raises BackendUnavailable naming Wave 2 — the
-                     Firestore adapter (§A2) is a later wave; selecting it now is an
-                     honest not-yet-built boundary, never a silent fallback to local.
+      "firestore" -> FirestoreBackend (Wave 2): the SAME 7 operations, persisted in
+                     Google Cloud Firestore — an EXTERNAL store keyed to the Firestore
+                     project/database, NOT to ${HEIMDALL_HOME}. That external-ness is
+                     the durability property: a fresh Cloud Run instance with a wiped
+                     ephemeral home reads the same state back. Imported LAZILY so a
+                     local user never loads the firestore dep.
 
     An unknown backend name raises ValueError (fail closed — never guess a backend)."""
     name = (backend if backend is not None
@@ -295,11 +298,13 @@ def get_backend(home=None, backend=None):
     if name == BACKEND_LOCAL:
         return LocalBackend(home=home)
     if name == BACKEND_FIRESTORE:
-        raise BackendUnavailable(
-            "HEIMDALL_STATE_BACKEND=firestore is reserved for Wave 2 (the §A2 "
-            "Firestore/Secret-Manager adapter) and is not built yet. Use the default "
-            "'local' backend for dev/test."
-        )
+        # Lazy import: the firestore adapter (and its google-cloud-firestore dep) is
+        # pulled in ONLY when the firestore backend is actually selected, so the default
+        # local path never requires the dep. The home arg is intentionally not used for
+        # storage by FirestoreBackend (persistence is keyed to the Firestore project,
+        # not the home) — it is accepted for factory-signature parity only.
+        import cp_state_firestore
+        return cp_state_firestore.FirestoreBackend()
     raise ValueError(
         "unknown %s=%r (expected 'local' or 'firestore')" % (BACKEND_ENV, name)
     )

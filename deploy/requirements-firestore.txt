@@ -1,0 +1,17 @@
+# Durable-backend (Firestore) runtime dependency — Wave 2.
+#
+# bin/lib/cp_state_firestore.FirestoreBackend talks to Google Cloud Firestore when
+# HEIMDALL_STATE_BACKEND=firestore. The shipped backend imports google.cloud.firestore
+# LAZILY (only when the firestore backend is actually selected), so the default 'local'
+# backend never needs this dep — installing it is required ONLY for the durable Cloud
+# Run deployment, not for dev/test/laptop use.
+#
+# The client also routes to the Firestore emulator automatically when
+# FIRESTORE_EMULATOR_HOST is set (used by test/cp-durability.test.sh when an emulator is
+# available), so this single pin serves both the real deploy and the emulator path.
+#
+# Pinned for reproducible image builds, matching the Dockerfile's pin discipline
+# (cryptography==42.0.8). Deploy owner: pip-install this in the image alongside the
+# existing cryptography pin (do NOT inline into the Dockerfile from here — the Dockerfile
+# is owned by a separate concern; this file is the pinned source of truth it consumes).
+google-cloud-firestore==2.16.1
