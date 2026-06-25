@@ -460,10 +460,17 @@ def start_route(identity, request, *, home=None, base_env=None, run=None):
     job_id IMMEDIATELY. THE FLIGHT FIX: the client may disconnect the moment it has the
     job_id — the worker runs the job server-side off the durable record.
 
-    `run` is the worker entry that drives the job (default run_job); start_route itself
-    detaches it onto a background daemon thread (_detach_run) so this handler returns
-    WITHOUT blocking on the job — an override is for tests that inject an alternate runner.
-    A bad action_type / smuggled command is refused HERE (422) before any job is created."""
+    `run` is an OPTIONAL test override of the worker entry that drives the job: when given,
+    start_route keeps the legacy in-process detach (_detach_run) so a test can inject an
+    alternate runner and observe its effect IN-PROCESS. When NOT given (the production path),
+    start_route DISPATCHES via cp_jobrunner.get_job_runner(...).dispatch(...) — which selects
+    HOW the job runs: an in-process daemon thread on a laptop, or a real Cloud Run Job
+    execution OUT OF PROCESS on Cloud Run. This is THE FIX: the in-process thread is
+    starved/killed by Cloud Run's CPU-throttle-outside-requests + scale-to-zero, leaving the
+    job `queued` forever; the JobRunner runs it in a unit of work whose lifetime is
+    independent of this request. Either way the handler returns the job_id WITHOUT blocking —
+    the client may disconnect the instant it has the id. A bad action_type / smuggled command
+    is refused HERE (422) before any job is created."""
     actor = _haid_of(identity)
     payload = _json_body(request)
     action_type = payload.get("action_type")
@@ -481,13 +488,26 @@ def start_route(identity, request, *, home=None, base_env=None, run=None):
         return cp_server.Response(500, {"error": "job_store_unavailable"})
     cp_audit.write("job_state", actor_haid=actor, action_type=action_type,
                    job_id=job_id, outcome="ok", detail="queued", home=home)
-    # THE DETACH (§4 L97): drive the job in a BACKGROUND daemon thread so this HTTP
-    # handler returns the job_id IMMEDIATELY — the client may disconnect the instant it
-    # has the id while the worker runs the job to completion against the durable store.
-    runner = run if run is not None else run_job
-    _detach_run(runner, job_id, actor_haid=actor, home=home, base_env=base_env)
+    # THE DISPATCH (§4 L97 — out-of-process-capable): kick off the job's execution so this
+    # HTTP handler returns the job_id IMMEDIATELY (the client may disconnect at once). The
+    # JobRunner selects HOW it runs: in-process daemon thread (local/dev — the legacy path),
+    # a detached subprocess (the local out-of-process proof), or a real Cloud Run Job
+    # execution (prod) — the latter two surviving the throttle/scale-to-zero that kills the
+    # in-thread model. dispatch never blocks on the job + never raises here; a dispatch
+    # failure leaves the job `queued` for resume_orphans / a retry to re-drive.
+    #
+    # A `run` override is the legacy in-process test seam: it injects an alternate worker
+    # entry whose effect must be observable IN THIS process, so it keeps the _detach_run path.
+    if run is not None:
+        _detach_run(run, job_id, actor_haid=actor, home=home, base_env=base_env)
+        dispatched = {"dispatched": True, "runner": "thread-override"}
+    else:
+        import cp_jobrunner
+        dispatched = cp_jobrunner.get_job_runner(home=home).dispatch(
+            job_id, actor_haid=actor, home=home, base_env=base_env)
     return cp_server.Response(
-        200, {"started": True, "job_id": job_id, "state": jobstore.STATE_QUEUED})
+        200, {"started": True, "job_id": job_id, "state": jobstore.STATE_QUEUED,
+              "dispatch": dispatched})
 
 
 def status_route(identity, request, *, home=None):
