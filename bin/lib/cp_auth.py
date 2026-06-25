@@ -155,6 +155,106 @@ def generate_keypair():
     return _b64(raw_priv), _b64(raw_pub)
 
 
+# ── the server's signing identity from the Secret-Manager seed (the GAP fix) ───
+#
+# THE BUG THIS CLOSES. The control plane must sign/verify with a STABLE identity
+# across every Cloud Run instance + cold-start. generate_keypair() mints a FRESH
+# random key per call, so each instance ran a DIFFERENT key universe with an EMPTY
+# registry → PKI identity was broken on the deploy target. The deploy injects the
+# Ed25519 PRIVATE SEED from Secret Manager as env HEIMDALL_CP_PKI_KEY
+# (deploy/cloud-run/README.md §2/§3, `--set-secrets="HEIMDALL_CP_PKI_KEY=cp-pki-key:latest"`).
+# load_signing_key() reads THAT seed and DETERMINISTICALLY derives the SAME keypair
+# every instance/cold-start — a reproducible server identity rooted in the secret.
+
+# The env var the deploy's --set-secrets populates (deploy/cloud-run/README.md §2).
+PKI_KEY_ENV = "HEIMDALL_CP_PKI_KEY"
+
+
+def cloud_profile():
+    """True iff we are running in the Cloud Run / durable deploy profile, where a
+    missing PKI seed is a HARD failure (never silently mint a fresh key). Detected via
+    TWO independent signals, either of which means "deployed, not a laptop":
+
+      * K_SERVICE — Cloud Run sets this automatically on every instance/job (the
+        platform's own marker that we are inside a Cloud Run container).
+      * HEIMDALL_STATE_BACKEND=firestore — the documented deploy env-var
+        (deploy/cloud-run/README.md §3 --set-env-vars): selecting the durable Firestore
+        backend is the operator declaring "this is the durable deployment".
+
+    Locally (neither signal set) cloud_profile() is False and the dev mint path
+    (generate_keypair via `identity`) is preserved verbatim. The signal is documented
+    here so the fail-closed boundary is unambiguous."""
+    if os.environ.get("K_SERVICE"):
+        return True
+    backend = (os.environ.get("HEIMDALL_STATE_BACKEND") or "").strip().lower()
+    return backend == "firestore"
+
+
+def load_signing_key(seed_b64=None):
+    """Derive the server's DETERMINISTIC Ed25519 signing identity from the PKI seed
+    (HEIMDALL_CP_PKI_KEY, base64 of a 32-byte private seed). Returns
+    (private_b64, public_b64) — the SAME pair every call/instance/cold-start for a given
+    seed, because the keypair is a pure function of the seed (Ed25519's public key is
+    derived from the private seed). This is what makes the server identity stable across
+    Cloud Run instances: the registry HAID→pubkey binding rebuilds identically on every
+    cold start.
+
+    `seed_b64` overrides the env (for tests / explicit wiring); otherwise the value of
+    HEIMDALL_CP_PKI_KEY is used.
+
+    FAIL-CLOSED in the cloud profile (cloud_profile() True): if the seed is ABSENT or
+    INVALID we RAISE AuthError — we NEVER fall back to minting a fresh random key (that
+    is the exact bug: a per-instance key universe). Locally (not cloud profile) an absent
+    seed raises the SAME AuthError too — there is no silent mint here; the dev mint path
+    stays in `generate_keypair()`/`identity`, and a caller that explicitly asks to load a
+    seed must supply one. Raises AuthError('crypto_unavailable') in degraded mode (a key
+    cannot be faked — fail CLOSED with a clear message)."""
+    if not crypto_available():
+        raise AuthError("crypto_unavailable",
+                        "install `cryptography` or `pynacl` to load the PKI signing key")
+    raw_seed = seed_b64 if seed_b64 is not None else os.environ.get(PKI_KEY_ENV)
+    if not raw_seed:
+        # Absent seed. In the cloud profile this is a HARD refusal — the server MUST NOT
+        # boot with an unstable identity. The message names the env + the fix.
+        if cloud_profile():
+            raise AuthError(
+                "pki_key_absent",
+                "%s is not set in the cloud profile — refusing to mint a fresh per-instance"
+                " key (set --set-secrets=%s=cp-pki-key:latest)" % (PKI_KEY_ENV, PKI_KEY_ENV))
+        raise AuthError(
+            "pki_key_absent",
+            "%s is not set — no seed to derive the signing key from" % PKI_KEY_ENV)
+    try:
+        seed = _unb64(raw_seed)
+    except Exception as exc:  # noqa: BLE001 — undecodable base64 is an invalid seed.
+        raise AuthError("pki_key_invalid",
+                        "%s is not valid base64" % PKI_KEY_ENV) from exc
+    if len(seed) != 32:
+        # Ed25519 private seeds are exactly 32 bytes; anything else cannot derive a key.
+        raise AuthError(
+            "pki_key_invalid",
+            "%s must decode to a 32-byte Ed25519 seed (got %d bytes)" % (
+                PKI_KEY_ENV, len(seed)))
+    try:
+        if _BACKEND == "cryptography":
+            priv = _CrPriv.from_private_bytes(seed)
+            raw_pub = priv.public_key().public_bytes(
+                encoding=_cr_ser.Encoding.Raw,
+                format=_cr_ser.PublicFormat.Raw,
+            )
+        else:  # pynacl — derive the verify key from the same seed.
+            sk = _nacl_signing.SigningKey(seed)
+            raw_pub = bytes(sk.verify_key)
+    except AuthError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — a malformed seed that decoded but won't load.
+        raise AuthError("pki_key_invalid",
+                        "%s did not derive a valid Ed25519 key" % PKI_KEY_ENV) from exc
+    # private_b64 is the seed itself (the same shape generate_keypair returns), public_b64
+    # the deterministically-derived public key — identical for identical seeds.
+    return _b64(seed), _b64(raw_pub)
+
+
 def sign(private_b64, message):
     """Sign `message` (bytes or str) with the base64 Ed25519 private seed. Returns the
     base64 signature. Raises AuthError('crypto_unavailable') in degraded mode (a
