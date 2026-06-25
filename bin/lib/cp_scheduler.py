@@ -63,7 +63,13 @@ if _HERE not in sys.path:
 import cp_allowlist  # THE dispatch gate — a schedule MUST be an allowlisted action.
 import cp_audit      # §9 — a refused create + a fired dispatch both audit.
 import cp_server     # §1 dispatch core + the register_route seam (we never edit it).
-import issue_queue   # REUSE heimdall_home() — the store lands in the same runtime home.
+import cp_state      # the pluggable persistence backend (Wave 0). The scheduler writes
+                   # its append-only schedule log THROUGH a StateBackend (get_backend) so
+                   # the same flush-only append/scan/fold becomes durable on Cloud Run
+                   # (Wave-2 FirestoreBackend) WITHOUT changing this store. The local
+                   # backend is byte-identical to the prior NDJSON-to-HEIMDALL_HOME path,
+                   # and it owns heimdall_home() resolution (the scheduler no longer needs
+                   # issue_queue directly — the backend re-derives the runtime home).
 
 
 # ── error type (a bad cron / bad schedule shape — distinct from a dispatch refusal) ─
@@ -197,18 +203,37 @@ def parse_cron(expr):
     return Cron(sets[0], sets[1], sets[2], sets[3], sets[4], expr)
 
 
-# ── the schedule store (append-only NDJSON; live set = fold of the log — §6/§4) ─
+# ── the schedule store (append-only NDJSON; live set = fold of the log — §6/§4) ──
+#
+# The scheduler addresses its store by paths RELATIVE to ${HEIMDALL_HOME}/control-plane/
+# (the StateBackend rel namespace): the schedules dir is "schedules/", the append-only
+# log is "schedules/schedules.ndjson". The backend owns the home root + makedirs + the
+# byte shape; schedules_dir/schedules_path remain the public absolute-path accessors
+# (now derived from the backend's path(), so they stay byte-identical to the prior
+# layout).
+
+# the rel sub-dir all schedule events live under, within control-plane/.
+_SCHEDULES_REL = "schedules"
+
+# the store-relative path of the single append-only schedule log.
+_SCHEDULES_LOG_REL = os.path.join(_SCHEDULES_REL, "schedules.ndjson")
+
+
+def _backend(home=None):
+    """The StateBackend for the scheduler (HEIMDALL_STATE_BACKEND, default local). `home`
+    pins the store root exactly as every scheduler accessor's `home=` arg always has."""
+    return cp_state.get_backend(home=home)
 
 
 def schedules_dir(home=None):
-    """The schedule store dir: ${HEIMDALL_HOME}/control-plane/schedules/."""
-    base = home if home else issue_queue.heimdall_home()
-    return os.path.join(base, "control-plane", "schedules")
+    """The schedule store dir: ${HEIMDALL_HOME}/control-plane/schedules/ (the backend's
+    absolute path for the schedules rel-dir — unchanged on the local backend)."""
+    return _backend(home).path(_SCHEDULES_REL)
 
 
 def schedules_path(home=None):
     """Absolute path to the append-only schedule log."""
-    return os.path.join(schedules_dir(home), "schedules.ndjson")
+    return _backend(home).path(_SCHEDULES_LOG_REL)
 
 
 def _now_iso():
@@ -222,42 +247,25 @@ def _now_iso():
 
 def _append(record, home):
     """Append one JSON line to schedules.ndjson. Returns True on success, False on any
-    IO failure (a create surfaces a False as an IO error rather than a silent drop)."""
-    try:
-        ldir = schedules_dir(home)
-        os.makedirs(ldir, exist_ok=True)
-        path = os.path.join(ldir, "schedules.ndjson")
-        line = json.dumps(record, sort_keys=True, separators=(",", ":"))
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write(line + "\n")
-            fh.flush()
-        return True
-    except OSError:
-        return False
+    IO failure (a create surfaces a False as an IO error rather than a silent drop).
+
+    Routed THROUGH the StateBackend (Wave 0): append_line writes the same compact JSON
+    line with the same flush-only discipline this log has always used (fsync=False — only
+    the §4 jobstore fsyncs; the schedule log, like cp_audit, flushes only). Byte-identical
+    on the local backend; Cloud-Run-durable when the Wave-2 backend lands."""
+    return _backend(home).append_line(_SCHEDULES_LOG_REL, record)
 
 
 def _read_events(home=None):
     """Stream every schedule event (create/update/delete) from the log, in order.
-    Tolerant: a bad line is skipped, an absent store yields []. Read-only."""
-    out = []
-    path = schedules_path(home)
-    if not os.path.isfile(path):
-        return out
-    try:
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
-            for raw in fh:
-                line = raw.strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except (ValueError, TypeError):
-                    continue
-                if isinstance(obj, dict) and obj.get("schedule_id"):
-                    out.append(obj)
-    except OSError:
-        return out
-    return out
+    Tolerant: a bad line is skipped, an absent store yields []. Read-only.
+
+    Routed THROUGH the StateBackend (Wave 0): read_lines returns the same tolerant,
+    store-ordered scan of dict lines; we keep the prior schedule_id filter so a line
+    without a schedule_id is ignored exactly as before — the fold semantics are
+    unchanged."""
+    return [ev for ev in _backend(home).read_lines(_SCHEDULES_LOG_REL)
+            if ev.get("schedule_id")]
 
 
 def _fold(home=None):
