@@ -65,9 +65,10 @@
 # files to its pre-migration self — proven by the cp suites staying green.
 #
 # THE FACTORY — get_backend() selects the impl from HEIMDALL_STATE_BACKEND
-# (default "local"). "firestore" is RESERVED for Wave 2 and raises BackendUnavailable
-# naming Wave 2 if selected now — an honest not-yet-built boundary, never a silent
-# fallback to local.
+# (default "local"). "firestore" returns FirestoreBackend (cp_state_firestore, Wave 2),
+# lazy-imported so the local path never needs the google-cloud-firestore dep. There is
+# NEVER a silent fallback to local: a firestore selection whose client/dep cannot load
+# raises BackendUnavailable loudly rather than degrading to the wrong store.
 #
 # stdlib-only (json/os) + issue_queue (REUSE heimdall_home) — mirrors every store's
 # dependency shape, no third-party dep, self-hostable.
@@ -86,7 +87,7 @@ if _HERE not in sys.path:
 import issue_queue  # REUSE heimdall_home() — the store root, never re-derived.
 
 # The env var that selects the backend impl. "local" (default) is the byte-identical
-# NDJSON-to-HEIMDALL_HOME behavior; "firestore" is reserved for Wave 2.
+# NDJSON-to-HEIMDALL_HOME behavior; "firestore" selects the durable FirestoreBackend.
 BACKEND_ENV = "HEIMDALL_STATE_BACKEND"
 BACKEND_LOCAL = "local"
 BACKEND_FIRESTORE = "firestore"
@@ -98,11 +99,11 @@ CONTROL_PLANE_DIR = "control-plane"
 
 
 class BackendUnavailable(RuntimeError):
-    """Raised when a backend is selected that is not built yet (HEIMDALL_STATE_BACKEND=
-    firestore before Wave 2 lands its adapter), or when a backend cannot serve a
-    method (e.g. path() on a non-filesystem backend). It is an honest not-yet-built
-    boundary that names exactly what is missing, never a silent degrade to a different
-    backend — the request fails loudly with the reason rather than writing to the wrong
+    """Raised when a selected backend cannot be initialized (e.g. HEIMDALL_STATE_BACKEND=
+    firestore but the google-cloud-firestore client/dep is unavailable in the runtime),
+    or when a backend cannot serve a method (e.g. path() on a non-filesystem backend). It
+    is an honest failure boundary that names exactly what is missing, never a silent
+    degrade to a different backend — the request fails loudly with the reason rather than writing to the wrong
     store."""
 
 
