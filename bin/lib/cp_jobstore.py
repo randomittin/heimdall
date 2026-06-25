@@ -48,7 +48,6 @@
 from __future__ import annotations
 
 import datetime
-import json
 import os
 import sys
 import uuid
@@ -57,7 +56,13 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
-import issue_queue  # REUSE heimdall_home() — the store lands in the same runtime home.
+import cp_state     # the pluggable persistence backend (Wave 0). The jobstore writes
+                   # its append-only log THROUGH a StateBackend (get_backend) so the
+                   # same fsync'd append/scan/enumerate becomes durable on Cloud Run
+                   # (Wave 2 FirestoreBackend) WITHOUT changing this store. The local
+                   # backend is byte-identical to the prior NDJSON-to-HEIMDALL_HOME path,
+                   # and it owns heimdall_home() resolution (the jobstore no longer needs
+                   # issue_queue directly — the backend re-derives the runtime home).
 
 # ── schema constants (the pinned job contract — §4) ───────────────────────────
 
@@ -108,18 +113,38 @@ class IllegalTransition(Exception):
             "illegal transition %s: %s -> %s" % (job_id, frm, to))
 
 
-# ── store location (REUSE issue_queue.heimdall_home — never re-derive) ─────────
+# ── store location + backend (the persistence SEAM — Wave 0) ───────────────────
+#
+# The jobstore addresses its store by paths RELATIVE to ${HEIMDALL_HOME}/control-plane/
+# (the StateBackend rel namespace): the jobs dir is "jobs/", one job's log is
+# "jobs/{job_id}.ndjson". The backend owns the home root + makedirs + the byte shape;
+# jobs_dir/job_path remain the public absolute-path accessors (now derived from the
+# backend's path(), so they stay byte-identical to the prior layout).
+
+# the rel sub-dir all job logs live under, within control-plane/.
+_JOBS_REL = "jobs"
+
+
+def _backend(home=None):
+    """The StateBackend for the jobstore (HEIMDALL_STATE_BACKEND, default local). `home`
+    pins the store root exactly as every jobstore accessor's `home=` arg always has."""
+    return cp_state.get_backend(home=home)
+
+
+def _job_rel(job_id):
+    """The store-relative path of one job's append-only log: jobs/{job_id}.ndjson."""
+    return os.path.join(_JOBS_REL, "%s.ndjson" % job_id)
 
 
 def jobs_dir(home=None):
-    """The job store dir: ${HEIMDALL_HOME}/control-plane/jobs/."""
-    base = home if home else issue_queue.heimdall_home()
-    return os.path.join(base, "control-plane", "jobs")
+    """The job store dir: ${HEIMDALL_HOME}/control-plane/jobs/ (the backend's absolute
+    path for the jobs rel-dir — unchanged on the local backend)."""
+    return _backend(home).path(_JOBS_REL)
 
 
 def job_path(job_id, home=None):
     """Absolute path to one job's append-only NDJSON log. One job = one file."""
-    return os.path.join(jobs_dir(home), "%s.ndjson" % job_id)
+    return _backend(home).path(_job_rel(job_id))
 
 
 def _now_iso():
@@ -141,21 +166,15 @@ def new_job_id():
 
 def _append_line(job_id, record, home=None):
     """Append one JSON line to {job_id}.ndjson, creating the store dir if needed.
-    Returns True on a durable write (flushed), False on any IO failure. This is the
-    ONLY way the log grows — every public mutator funnels through here so the file
-    stays append-only with a single writer per job (§4 L94)."""
-    try:
-        ldir = jobs_dir(home)
-        os.makedirs(ldir, exist_ok=True)
-        path = os.path.join(ldir, "%s.ndjson" % job_id)
-        line = json.dumps(record, sort_keys=True, separators=(",", ":"))
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write(line + "\n")
-            fh.flush()
-            os.fsync(fh.fileno())  # durability: the state survives a hard crash/restart.
-        return True
-    except OSError:
-        return False
+    Returns True on a durable write (flushed + fsync'd), False on any IO failure. This
+    is the ONLY way the log grows — every public mutator funnels through here so the
+    file stays append-only with a single writer per job (§4 L94).
+
+    Routed THROUGH the StateBackend (Wave 0): append_line writes the same compact JSON
+    line and, with fsync=True, the same os.fsync durability discipline the jobstore has
+    always used — so the state survives a hard crash/restart on the local backend, and
+    the SAME durable append becomes Cloud-Run-durable when the Wave-2 backend lands."""
+    return _backend(home).append_line(_job_rel(job_id), record, fsync=True)
 
 
 def append_event(job_id, *, ev, state=None, progress=None, result=None,
@@ -220,26 +239,11 @@ def create_job(action_type, params, *, instance_haid=None, job_id=None, home=Non
 def _read_lines(job_id, home=None):
     """Stream the parsed event lines for a job in store order. Tolerant: a bad line is
     skipped, an absent log yields []. Read-only — this is the replay the fold runs on
-    EVERY read, so a fresh process (post-restart) reconstructs live state from disk."""
-    path = job_path(job_id, home)
-    out = []
-    if not os.path.isfile(path):
-        return out
-    try:
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
-            for raw in fh:
-                line = raw.strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except (ValueError, TypeError):
-                    continue
-                if isinstance(obj, dict):
-                    out.append(obj)
-    except OSError:
-        return out
-    return out
+    EVERY read, so a fresh process (post-restart) reconstructs live state from disk.
+
+    Routed THROUGH the StateBackend (Wave 0): read_lines returns the same tolerant,
+    store-ordered scan the jobstore has always done — the fold semantics are unchanged."""
+    return _backend(home).read_lines(_job_rel(job_id))
 
 
 def fold_state(job_id, home=None):
@@ -368,17 +372,14 @@ def list_job_ids(home=None):
     """The sorted list of job_ids present in the store (one .ndjson file each).
     Tolerant of an absent store ([]). The restart-replay driver iterates these to
     re-fold every job's live state on boot — and to find jobs that were `running`
-    when the process died, for the worker to resume."""
-    ldir = jobs_dir(home)
+    when the process died, for the worker to resume.
+
+    Routed THROUGH the StateBackend (Wave 0): list_names returns the same sorted,
+    suffix-filtered enumeration; we strip the .ndjson suffix to recover the job_id,
+    exactly as before."""
     out = []
-    try:
-        if not os.path.isdir(ldir):
-            return out
-        for name in sorted(os.listdir(ldir)):
-            if name.endswith(".ndjson"):
-                out.append(name[: -len(".ndjson")])
-    except OSError:
-        return out
+    for name in _backend(home).list_names(_JOBS_REL, suffix=".ndjson"):
+        out.append(name[: -len(".ndjson")])
     return out
 
 
