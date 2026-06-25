@@ -632,16 +632,39 @@ in Firestore (the external store), not the wiped ephemeral home — i.e.
 > STEP 2b is **gcloud-only** and **skips cleanly** in the local dry run (no real
 > Cloud Run Job to query), so the dry run is unaffected.
 
+> **STEP 5 waits for async Job completion + Firestore visibility — and a signed
+> `GET /jobs` `state=done` from a FRESH instance is the read-back proof.** Because
+> `run_v2` `run_job` is **async** (the Job **provisions ~36s + runs**, then its
+> terminal `done` write must become **visible in Firestore**), the cold-start
+> read-back must wait long enough for the durable write to land before failing.
+> STEP 5 therefore polls the signed `GET /jobs` for **this `job_id`** until it reads
+> back **`state=done`** (or terminal) from the **fresh** post-scale-to-zero instance,
+> for up to **`STEP5_POLL_SECONDS` (default 180s)** — the ~180s window that covers
+> provision + run + the Firestore write becoming visible. Only if it stays
+> non-terminal past the **full** window is STEP 5 a real failure. When STEP 2b has
+> already confirmed the **execution SUCCEEDED**, the Job has finished and the durable
+> write appears shortly, so STEP 5 polls the same generous window for that `done` to
+> land — and a confirmed `done` read back from a fresh instance is **STEP 5 PASS**.
+> The verdict is **fully GREEN** when **both** hold: the execution **succeeded**
+> (STEP 2b) **and** the signed `GET /jobs` reads **`state=done`** from a **fresh
+> instance** (STEP 5) — that signed read is the durable read-back proof. The local
+> dry run keeps a short read-back window via the legacy `COLD_POLL_SECONDS` alias
+> (the in-process fake completes + writes instantly), so it is unaffected; the
+> longer real-poll path skips cleanly without gcloud.
+
 **The FAIL → PASS transition this fix delivers.** Before the out-of-process
 runner, the flight-fix script **FAILED**: the in-process job stayed queued, never
 reached `done`, and the read-back returned a non-terminal job. After deploying
 with `HEIMDALL_JOB_RUNNER=cloudrun-job` (§3), the `heimdall-long-job` Job (§4),
 and the `run.jobs.run` IAM grant (§4.1), the same script goes **PASS** — the job
 now reaches `done` via a Cloud Run Job execution, and that terminal state reads
-back from a fresh instance. A persistent `FAIL` ⇒ either the runner is still
-in-process (job never reaches `done` — check `HEIMDALL_JOB_RUNNER` and that an
-execution actually ran, §6), or the state did not survive the instance replace
-(stale image / wrong backend / non-deterministic scale).
+back from a fresh instance. With the **180s STEP-5 read-back window**, STEP 5 itself
+goes **green** on a real completing run — the signed `GET /jobs` reads `state=done`
+from the fresh instance within the window, rather than the verdict relying on a
+reconciled NOTE. A persistent `FAIL` ⇒ either the runner is still in-process (job
+never reaches `done` — check `HEIMDALL_JOB_RUNNER` and that an execution actually
+ran, §6), or the state did not survive the instance replace (stale image / wrong
+backend / non-deterministic scale) past the full `STEP5_POLL_SECONDS` window.
 
 > **One-liner — check a Job execution ran for the dispatched `job_id`.** After
 > the script reports its `job_id`, confirm at least one `heimdall-long-job`
