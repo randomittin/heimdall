@@ -56,6 +56,17 @@ import cp_auth
 import cp_handlers
 import issue_queue  # REUSE heimdall_home() for the per-job scratch root.
 
+# The control-plane version. The single source of truth for the server_version banner
+# AND the version string the unauthenticated health probes (cp_diag) surface, so the
+# two never drift. Non-sensitive by construction (it identifies the build, nothing else).
+SERVER_VERSION = "1.0"
+
+# Cloud Run injects the port to listen on via $PORT and expects the container to bind
+# 0.0.0.0 (the spec, §A1). These are the fallbacks when neither an explicit value nor
+# the env supplies one — 0.0.0.0:8080 is the Cloud Run convention.
+DEFAULT_HOST = "0.0.0.0"
+DEFAULT_PORT = 8080
+
 
 # ── the Response shape (the structured result every entry returns — §1/§9) ─────
 
@@ -260,8 +271,13 @@ def _build_handler_class(home, enforce_revocation):
     and routes everything else through the registration seam (b-f's routes)."""
     from http.server import BaseHTTPRequestHandler
 
+    # Lazy import (cp_diag imports cp_server at module top — importing it here, at
+    # serve-time inside the factory, avoids the import cycle while keeping the health
+    # short-circuit available to every request the handler serves).
+    import cp_diag
+
     class _CPHandler(BaseHTTPRequestHandler):
-        server_version = "HeimdallControlPlane/1.0"
+        server_version = "HeimdallControlPlane/" + SERVER_VERSION
 
         def log_message(self, fmt, *args):
             """Silence the default stderr access log (the audit log is the record)."""
@@ -296,6 +312,14 @@ def _build_handler_class(home, enforce_revocation):
         def _handle(self, method):
             body = self._read_body()
             request = self._request_dict(method, body)
+            # UNAUTHENTICATED health probes (§A) — answered BEFORE the auth chokepoint.
+            # Cloud Run's liveness/readiness probes are issued by the platform, unsigned;
+            # routing them through §3 would 401 every probe and the instance would never
+            # go ready. cp_diag's bodies are content-free by construction (status +
+            # version only), so serving them pre-auth leaks nothing.
+            if cp_diag.is_health_path(method, self.path):
+                self._send(cp_diag.handle(method, self.path, home=home))
+                return
             # §3 auth chokepoint — every request, exactly once.
             try:
                 identity = authenticate(
@@ -334,12 +358,45 @@ def _build_handler_class(home, enforce_revocation):
     return _CPHandler
 
 
-def serve(host="127.0.0.1", port=8787, *, home=None, enforce_revocation=True):
+def resolve_bind(*, host=None, port=None, env=None):
+    """Resolve the (host, port) to bind, honoring the Cloud Run contract (§A1). An
+    EXPLICIT value always wins; when one is not given it falls back to the environment
+    ($PORT — Cloud Run injects it; $HOST for self-host override) and finally to the
+    0.0.0.0:8080 Cloud Run default. `env` is the environment mapping (defaults to
+    os.environ) — passed explicitly so a test can resolve without mutating the process.
+
+    The precedence, per axis: explicit arg > env var > module default. This is the ONE
+    place the listen address is decided, so the container, the CLI, and a direct call
+    all agree on it. A non-integer $PORT falls through to the default rather than
+    crashing the boot (a malformed PORT must not take the instance down)."""
+    e = env if env is not None else os.environ
+    eff_host = host if host else (e.get("HOST") or DEFAULT_HOST)
+    if port is not None:
+        eff_port = int(port)
+    else:
+        raw = e.get("PORT")
+        try:
+            eff_port = int(raw) if raw not in (None, "") else DEFAULT_PORT
+        except (TypeError, ValueError):
+            eff_port = DEFAULT_PORT
+    return eff_host, eff_port
+
+
+def serve(host=None, port=None, *, home=None, enforce_revocation=True):
     """Start the stdlib http.server control plane (§10). Blocks, serving until
     interrupted. Authenticates every request (§3), routes the built-in /dispatch
     (§1) + the registered seam routes (b-f), audits (§9). Self-hostable: one process
-    + a gitignored ${HEIMDALL_HOME}/control-plane/ state tree, no external DB."""
+    + a gitignored ${HEIMDALL_HOME}/control-plane/ state tree, no external DB.
+
+    Binds per the Cloud Run contract (§A1): `host`/`port` default to None and resolve
+    through resolve_bind — an explicit value wins, else $HOST/$PORT, else 0.0.0.0:8080.
+    Cloud Run injects $PORT and requires a 0.0.0.0 bind; passing no host/port makes the
+    container Just Work, while the test harness (which passes an explicit port) is
+    unaffected. The two unauthenticated health probes (/healthz, /readyz — cp_diag) are
+    answered pre-auth so the platform liveness/readiness checks reach them unsigned."""
     from http.server import HTTPServer
+
+    host, port = resolve_bind(host=host, port=port)
 
     # ASSEMBLE the control plane (§10): plug every capability piece's routes into the
     # seam, re-drive orphaned jobs (§4 replay-on-boot), and start the per-minute
