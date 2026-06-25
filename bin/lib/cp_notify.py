@@ -152,6 +152,21 @@ def inbox_path(target_haid, home=None):
     return _backend(home).path(_inbox_rel(target_haid))
 
 
+def _inbox_path_or_none(target_haid, home=None):
+    """The local on-disk path of a HAID's inbox, or None when the selected backend has no
+    local file for it. On the LOCAL backend this is the real path; on a non-filesystem
+    backend (FirestoreBackend) path() RAISES BackendUnavailable by design (the inbox is an
+    external doc, not an on-disk file) — and the notify/deliver path (reached from
+    dispatch / job_complete / approval) must NOT raise over a cosmetic path lookup (the
+    firestore-only incident class). The notification is already durably appended via
+    append_line; this returns None on firestore so deliver_inbox's result carries an
+    honest 'no local file' instead of crashing the request path."""
+    try:
+        return inbox_path(target_haid, home)
+    except cp_state.BackendUnavailable:
+        return None
+
+
 def _now_iso():
     """Current UTC time as a second-precision ISO-8601 string (§8 ts field)."""
     return (
@@ -249,7 +264,12 @@ def deliver_inbox(target_haid, notification, home=None):
     backend = _backend(home)
     if not backend.append_line(_inbox_rel(target_haid), notification, fsync=False):
         return {"ok": False, "reason": "io_error"}
-    return {"ok": True, "path": backend.path(_inbox_rel(target_haid))}
+    # The inbox local path is informational only (poll() reads via the backend, never this
+    # field). Resolve it firestore-safe: None when the backend has no local file
+    # (FirestoreBackend refuses path() by design), never a raise on the deliver/notify
+    # request path (the firestore-only incident class — the line is already durably
+    # appended above). On the local backend this stays the real on-disk path, unchanged.
+    return {"ok": True, "path": _inbox_path_or_none(target_haid, home)}
 
 
 def poll(target_haid, home=None, limit=_POLL_MAX):

@@ -148,6 +148,21 @@ def instance_store_path(instance_haid, home=None):
     return _backend(home).path(_events_rel(instance_haid))
 
 
+def _instance_store_path_or_none(instance_haid, home=None):
+    """The local on-disk path of an instance's observe log, or None when the selected
+    backend has no local file for it. On the LOCAL backend this is the real path; on a
+    non-filesystem backend (FirestoreBackend) path() RAISES BackendUnavailable by design
+    (a firestore-backed rel is an external doc, not an on-disk tree) — and a REQUEST
+    handler must NOT raise over a cosmetic path lookup (the firestore-only incident
+    class). The events are already durably stored via append_line; this returns None on
+    firestore so ingest_batch's result carries an honest 'no local file' instead of
+    crashing the POST /ingest path."""
+    try:
+        return instance_store_path(instance_haid, home)
+    except cp_state.BackendUnavailable:
+        return None
+
+
 # ── the no-secret boundary: re-run build_event server-side per pushed line (§5) ─
 
 
@@ -242,7 +257,10 @@ def ingest_batch(instance_haid, events, *, home=None):
         "stored": stored,
         "dropped": received - stored,
         "audit_id": audit_id,
-        "path": instance_store_path(instance_haid, home),
+        # Informational only — the POST /ingest route does NOT read this field. Resolved
+        # firestore-safe: None when the backend has no local file (FirestoreBackend),
+        # never a raise on the request path (the firestore-only incident class).
+        "path": _instance_store_path_or_none(instance_haid, home),
     }
 
 
