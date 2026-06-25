@@ -44,6 +44,7 @@ if _HERE not in sys.path:
 import cp_approval
 import cp_auth
 import cp_dashboard
+import cp_diag
 import cp_ingest
 import cp_notify
 import cp_scheduler
@@ -206,6 +207,10 @@ def boot(server=cp_server, *, home=None, base_env=None, start_tick=True,
     routes["jobs"] = list(cp_worker.register_job_routes(home=home, base_env=base_env))
     routes["approvals"] = list(cp_approval.register(home=home))
     routes["notifications"] = [cp_notify.register_notify_routes(server.register_route)]
+    # The unauthenticated Cloud Run health probes (§A). Registered into the seam for
+    # status/CLI visibility (registered_routes() reflects /healthz + /readyz); the LIVE
+    # serving of these two bypasses the seam and runs pre-auth in cp_server. Idempotent.
+    routes["diagnostics"] = list(cp_diag.register(server, home=home))
 
     # 2. RESUME — re-drive jobs left mid-flight when the process died (§4 replay-on-boot).
     resumed = []
