@@ -325,10 +325,28 @@ def _build_handler_class(home, enforce_revocation):
         def _request_dict(self, method, body_bytes):
             """Assemble the request dict the auth chokepoint verifies: the HAID +
             signature travel in headers, the canonical signed message is METHOD\\n
-            PATH\\nBODY (cp_auth.canonical_message)."""
+            PATH\\nBODY (cp_auth.canonical_message). `path` is the FULL self.path —
+            INCLUDING any ?query — because that is exactly what the client signed
+            (cp_auth.canonical_message signs the full path-with-query). The signature
+            therefore covers the query and is tamper-evident.
+
+            For handler convenience the request also carries a parsed `query` dict (the
+            ?key=value pairs of self.path) so a handler can read e.g. job_id from the
+            query WITHOUT re-parsing the path. ROUTING is a SEPARATE concern: _handle
+            routes on the query-STRIPPED path (so "/jobs?job_id=X" still matches the
+            "/jobs" route) while signing/verification + this dict keep the FULL path."""
+            from urllib.parse import urlsplit, parse_qs
+            split = urlsplit(self.path)
+            # parse_qs -> {key: [v, ...]}; flatten to {key: first-value} for the handler.
+            flat_query = {k: v[0] for k, v in parse_qs(split.query).items() if v}
             return {
                 "method": method,
+                # the FULL path-with-query AS TRANSMITTED — what the client signed.
                 "path": self.path,
+                # the path WITHOUT the ?query — what the router matches a route on.
+                "route_path": split.path,
+                # the parsed ?key=value pairs (first value each) for handlers.
+                "query": flat_query,
                 "body": body_bytes,
                 "haid": self.headers.get("X-Heimdall-HAID"),
                 "signature": self.headers.get("X-Heimdall-Signature"),
@@ -337,23 +355,29 @@ def _build_handler_class(home, enforce_revocation):
         def _handle(self, method):
             body = self._read_body()
             request = self._request_dict(method, body)
+            # The path the ROUTER matches on: the request path WITHOUT any ?query, so a
+            # GFE-safe GET /jobs?job_id=<id> still resolves the "/jobs" route. The
+            # SIGNATURE (authenticate, below) verifies over the FULL self.path-with-query
+            # in `request["path"]` — the two concerns are split deliberately.
+            route_path = request["route_path"]
             # UNAUTHENTICATED health probes (§A) — answered BEFORE the auth chokepoint.
             # Cloud Run's liveness/readiness probes are issued by the platform, unsigned;
             # routing them through §3 would 401 every probe and the instance would never
             # go ready. cp_diag's bodies are content-free by construction (status +
             # version only), so serving them pre-auth leaks nothing.
-            if cp_diag.is_health_path(method, self.path):
-                self._send(cp_diag.handle(method, self.path, home=home))
+            if cp_diag.is_health_path(method, route_path):
+                self._send(cp_diag.handle(method, route_path, home=home))
                 return
-            # §3 auth chokepoint — every request, exactly once.
+            # §3 auth chokepoint — every request, exactly once. Verifies over the FULL
+            # path-with-query (request["path"]) — the bytes the client signed.
             try:
                 identity = authenticate(
                     request, home=home, enforce_revocation=enforce_revocation)
             except cp_auth.AuthError as err:
                 self._send(Response(401, {"error": err.reason}))
                 return
-            # built-in §1 dispatch entry.
-            if method == "POST" and self.path == "/dispatch":
+            # built-in §1 dispatch entry (matched on the query-stripped path).
+            if method == "POST" and route_path == "/dispatch":
                 try:
                     payload = json.loads(body or b"{}")
                 except (ValueError, TypeError):
@@ -367,8 +391,10 @@ def _build_handler_class(home, enforce_revocation):
                 )
                 self._send(resp)
                 return
-            # the registration seam — b-f's routes.
-            route = _route(method, self.path)
+            # the registration seam — b-f's routes (matched on the query-stripped path,
+            # so GET /jobs?job_id=<id> resolves the "/jobs" route; the handler reads the
+            # query via request["query"]).
+            route = _route(method, route_path)
             if route is not None:
                 self._send(route(identity, request))
                 return

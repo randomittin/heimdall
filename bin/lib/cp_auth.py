@@ -551,7 +551,24 @@ def verify(haid, message, sig_b64, *, home=None, enforce_revocation=True):
 def canonical_message(method, path, body):
     """The canonical bytes an instance SIGNS and the server VERIFIES for a request:
     METHOD\\nPATH\\n<body-bytes>. Deterministic + unambiguous so the signed payload
-    is exactly the request (no field can be swapped post-signature). Pure."""
+    is exactly the request (no field can be swapped post-signature). Pure.
+
+    `path` is the FULL request path AS TRANSMITTED — INCLUDING any ?query string
+    (e.g. "/jobs?job_id=job-abc"). The query is therefore part of the signed bytes
+    and is tamper-evident: a request whose query was altered after signing will not
+    verify. For a query-LESS path (POST /dispatch, POST /jobs, approvals) the bytes
+    are byte-identical to the historical form (the path simply has no "?query"), so
+    those signatures are UNAFFECTED — the change is regression-safe.
+
+    WHY the query lives here (the GFE/Cloud-Run fix): a signed read used to carry its
+    job_id in the GET request BODY, but Google's GFE / Cloud Run ingress REJECTS a
+    GET-with-a-body as malformed (HTTP 400, never reaching the container). Moving the
+    job_id to a query param (GET /jobs?job_id=<id> with an EMPTY body) is GFE-safe, and
+    signing the full path-with-query keeps the read authenticated + tamper-evident. The
+    client and the server MUST canonicalize the SAME full path-with-query or every
+    signed request 401s — this is the single source of truth for both sides. The server
+    verifies over self.path (the full path incl. query) while ROUTING on the
+    query-stripped path; the client signs the identical full path-with-query it sends."""
     head = ("%s\n%s\n" % ((method or "").upper(), path or "")).encode("utf-8")
     return head + _as_bytes(body)
 
