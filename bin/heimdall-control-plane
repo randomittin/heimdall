@@ -301,7 +301,16 @@ PYEOF
     # lifetime is independent of the request that started it. The §1 allowlist + §2 isolation
     # gates fire inside run_job exactly as for the in-thread run — this entrypoint runs no
     # arbitrary command, only the durable job's allowlisted, isolated handler.
-    [ -n "$JOB_ID" ] || { echo "error: run-job needs a <job_id>" >&2; usage >&2; exit 2; }
+    # A BARE `run-job` with no job_id is the Cloud Run Job's DEFAULT-ARGS invocation (or an
+    # accidental bare `gcloud run jobs execute`): there is no job to run, so it is a CLEAN
+    # no-op, NOT an error. Exiting nonzero here marks the Cloud Run execution red FAILED (the
+    # alarming-but-benign krdp7 signature). Exit 0 with a clear message instead. A SUPPLIED but
+    # unknown id stays a real error (exit 2 + "no such job") inside the python below — that is a
+    # genuine dispatch/operator bug worth surfacing.
+    if [ -z "$JOB_ID" ]; then
+      echo "run-job: no job_id supplied (default-args invocation) — nothing to run"
+      exit 0
+    fi
     set +e
     LIB_DIR="$LIB_DIR" HOME_DIR="$HOME_DIR" JOB_ID="$JOB_ID" ACTOR="$ACTOR" "$PY" - <<'PYEOF'
 import os, sys
