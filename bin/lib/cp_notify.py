@@ -49,7 +49,6 @@
 from __future__ import annotations
 
 import datetime
-import json
 import os
 import sys
 import uuid
@@ -58,7 +57,13 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
-import issue_queue   # REUSE heimdall_home() — the inbox store lands in the runtime home.
+import cp_state      # the pluggable persistence backend (Wave 0). The inbox is an
+                    # append-only NDJSON log written THROUGH a StateBackend
+                    # (get_backend) so the same flush-only append/scan becomes durable
+                    # on Cloud Run (Wave-2 FirestoreBackend) WITHOUT changing this store.
+                    # The local backend is byte-identical to the prior NDJSON-to-
+                    # HEIMDALL_HOME path, and it owns heimdall_home() resolution (notify
+                    # no longer needs issue_queue directly — the backend re-derives home).
 import telemetry     # REUSE _scrub — the no-secret-by-construction discipline (§8).
 import cp_audit      # REUSE the audit writer — every send is audited (§8/§9).
 import connectors    # REUSE the egress (slack/email) — notify sends OUT, never rebuilds it.
@@ -104,13 +109,24 @@ _COMMAND_KEYS = frozenset({
 _POLL_MAX = 500
 
 
-# ── store location (REUSE issue_queue.heimdall_home — never re-derive) ─────────
+# ── store location + backend (the persistence SEAM — Wave 0/§8) ───────────────
+#
+# The notify inbox addresses its store by paths RELATIVE to
+# ${HEIMDALL_HOME}/control-plane/ (the StateBackend rel namespace): the notify dir is
+# "notify/", one HAID's inbox is "notify/{inbox_name}.ndjson". The backend owns the
+# home root + makedirs + the byte shape; notify_dir/inbox_path remain the public
+# absolute-path accessors (now derived from the backend's path(), so they stay
+# byte-identical to the prior layout).
+
+# the rel sub-dir all notification inboxes live under, within control-plane/.
+_NOTIFY_REL = "notify"
 
 
-def notify_dir(home=None):
-    """The notify inbox store dir: ${HEIMDALL_HOME}/control-plane/notify/."""
-    base = home if home else issue_queue.heimdall_home()
-    return os.path.join(base, "control-plane", "notify")
+def _backend(home=None):
+    """The StateBackend for the notify inbox (HEIMDALL_STATE_BACKEND, default local).
+    `home` pins the store root exactly as every notify accessor's `home=` arg always
+    has — threaded straight through, no re-derivation of heimdall_home() here."""
+    return cp_state.get_backend(home=home)
 
 
 def _inbox_name(target_haid):
@@ -120,9 +136,20 @@ def _inbox_name(target_haid):
     return safe or "anon"
 
 
+def _inbox_rel(target_haid):
+    """The store-relative path of one HAID's append-only inbox: notify/{name}.ndjson."""
+    return os.path.join(_NOTIFY_REL, _inbox_name(target_haid) + ".ndjson")
+
+
+def notify_dir(home=None):
+    """The notify inbox store dir: ${HEIMDALL_HOME}/control-plane/notify/ (the backend's
+    absolute path for the notify rel-dir — unchanged on the local backend)."""
+    return _backend(home).path(_NOTIFY_REL)
+
+
 def inbox_path(target_haid, home=None):
     """Absolute path to a target HAID's append-only notification inbox (NDJSON)."""
-    return os.path.join(notify_dir(home), _inbox_name(target_haid) + ".ndjson")
+    return _backend(home).path(_inbox_rel(target_haid))
 
 
 def _now_iso():
@@ -214,17 +241,15 @@ def deliver_inbox(target_haid, notification, home=None):
     pure data line, no execution semantics."""
     if not isinstance(notification, dict) or not notification.get("kind"):
         return {"ok": False, "reason": "not_a_notification"}
-    try:
-        ndir = notify_dir(home)
-        os.makedirs(ndir, exist_ok=True)
-        path = inbox_path(target_haid, home)
-        line = json.dumps(notification, sort_keys=True, separators=(",", ":"))
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write(line + "\n")
-            fh.flush()
-        return {"ok": True, "path": path}
-    except OSError as exc:
-        return {"ok": False, "reason": "io_error: %s" % type(exc).__name__}
+    # Routed THROUGH the StateBackend (Wave 0): append_line writes the SAME compact JSON
+    # line (json.dumps(sort_keys=True, separators=(",",":")) + "\n") and flush-ONLY
+    # discipline (fsync=False — notify flushes, never fsyncs, like §9 audit) the inbox
+    # has always used, after owning makedirs itself. False on any IO failure -> the
+    # inbox degrades to a dropped line, never crashes a send (byte-identical behavior).
+    backend = _backend(home)
+    if not backend.append_line(_inbox_rel(target_haid), notification, fsync=False):
+        return {"ok": False, "reason": "io_error"}
+    return {"ok": True, "path": backend.path(_inbox_rel(target_haid))}
 
 
 def poll(target_haid, home=None, limit=_POLL_MAX):
@@ -235,24 +260,12 @@ def poll(target_haid, home=None, limit=_POLL_MAX):
     This is the entire instance-receive path: an instance PULLS its notifications and
     RENDERS them. There is no command in the data, and nothing here runs the data —
     the inverse-of-RCE holds at the read side too."""
-    path = inbox_path(target_haid, home)
-    if not os.path.isfile(path):
-        return []
-    out = []
-    try:
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
-            for raw in fh:
-                line = raw.strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except (ValueError, TypeError):
-                    continue
-                if isinstance(obj, dict) and obj.get("kind") in KINDS:
-                    out.append(obj)
-    except OSError:
-        return out
+    # Routed THROUGH the StateBackend (Wave 0): read_lines returns the SAME tolerant,
+    # store-ordered scan of dict lines (bad line skipped, absent inbox -> []). The
+    # kind-filter (only KINDS payloads count as notifications) and the poll limit stay
+    # at the call site — unchanged behavior, the backend just owns the byte read.
+    out = [obj for obj in _backend(home).read_lines(_inbox_rel(target_haid))
+           if obj.get("kind") in KINDS]
     return out[-limit:] if limit and len(out) > limit else out
 
 
