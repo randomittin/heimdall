@@ -68,6 +68,62 @@ state is being read/written across scale-to-zero.
 
 ---
 
+## Execution model — long jobs run OUT OF PROCESS as Cloud Run Jobs
+
+**Long jobs do NOT run inside the request-serving service.** They run as a
+separate **Cloud Run Job** (`heimdall-long-job`), **run-to-completion**, one
+execution per job. The service only **dispatches** the execution and returns the
+`job_id` immediately; the Job process does the work and writes durable state to
+Firestore.
+
+**Why not in-process.** An earlier design ran the job on a background daemon
+thread inside the service. On Cloud Run that **starves**: after a request
+returns, Cloud Run **throttles the instance's CPU to near-zero** and, with
+`--min-instances=0`, **scales the instance to zero** entirely — so the daemon
+thread stops making progress and the job **stays queued forever**. This was the
+"jobs stay queued on Cloud Run" incident. A Cloud Run **Job** is a first-class
+run-to-completion workload: it gets **full CPU for its whole runtime** (no
+post-response throttle), is **independent of any request lifecycle**, and the
+service can still **scale to zero** between dispatches. Bonus: Cloud Run Jobs
+give **free retries** (`--max-retries`) and a bounded **task timeout**
+(`--task-timeout`).
+
+**The runner is env-selected.** The control plane picks a `JobRunner`
+implementation from `HEIMDALL_JOB_RUNNER`:
+
+| `HEIMDALL_JOB_RUNNER` | Runner                  | Where it's for                              |
+| --------------------- | ----------------------- | ------------------------------------------- |
+| `thread`              | in-process thread       | local dev / tests (no Cloud Run throttle)   |
+| `subprocess`          | local child process     | local run-to-completion, no GCP             |
+| `cloudrun-job`        | Cloud Run Job execution | **production on Cloud Run**                 |
+
+When unset, the runner **auto-selects `cloudrun-job` if `K_SERVICE` is present**
+(Cloud Run injects `K_SERVICE` into every service container), else falls back to
+a local runner. In production we **pin `HEIMDALL_JOB_RUNNER=cloudrun-job`
+explicitly** on the service (§3) so dispatch behavior never depends on
+autodetection.
+
+**The dispatch + the entrypoint.** When the service receives a job, the
+`cloudrun-job` runner shells out to:
+
+```bash
+gcloud run jobs execute heimdall-long-job --region "${REGION}" --args run-job,<JOB_ID>
+```
+
+That overrides the Job container's args for this one execution so it runs the
+**run-to-completion entrypoint**:
+
+```
+heimdall-control-plane run-job <job_id>
+```
+
+which loads the job from durable state, runs it to terminal `done`, and exits.
+The Job's image is the **same image** as the service (§4) — only the per-execution
+args differ. The service's runtime SA needs permission to **execute** the Job
+(`run.jobs.run`); see §4.1.
+
+---
+
 ## 0. Prerequisites (one-time, per project)
 
 ```bash
@@ -106,6 +162,11 @@ gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
   --member="serviceAccount:${RUNTIME_SA}" \
   --role="roles/secretmanager.secretAccessor"
 ```
+
+> **The runtime SA also needs `run.jobs.run`** to dispatch long jobs to the
+> `heimdall-long-job` Cloud Run Job (the `cloudrun-job` runner shells out to
+> `gcloud run jobs execute`). That binding is in **§4.1** — set up after the Job
+> exists. `roles/run.invoker` does **not** grant it.
 
 ---
 
@@ -206,8 +267,17 @@ gcloud run deploy "${SERVICE}" \
   --port=8080 \
   --no-allow-unauthenticated \
   --set-secrets="HEIMDALL_CP_PKI_KEY=cp-pki-key:latest" \
-  --set-env-vars="HEIMDALL_STATE_BACKEND=firestore,GOOGLE_CLOUD_PROJECT=${PROJECT_ID},HEIMDALL_CP_SERVER_HAID=cp-server"
+  --set-env-vars="HEIMDALL_STATE_BACKEND=firestore,GOOGLE_CLOUD_PROJECT=${PROJECT_ID},HEIMDALL_CP_SERVER_HAID=cp-server,HEIMDALL_JOB_RUNNER=cloudrun-job"
 ```
+
+> **`HEIMDALL_JOB_RUNNER=cloudrun-job` is REQUIRED on the service.** It selects
+> the production runner that dispatches long jobs to the `heimdall-long-job`
+> Cloud Run Job instead of an in-process thread (see _"Execution model"_ above).
+> Cloud Run injects `K_SERVICE`, so the runner would auto-select `cloudrun-job`
+> anyway — but we **pin it explicitly** so dispatch never depends on
+> autodetection. Without it (or with `thread`), jobs run on a starved daemon
+> thread and **stay queued** — the exact incident this fixes. Like the HAID it
+> is a plain name, **not** a secret.
 
 > **`HEIMDALL_CP_SERVER_HAID=cp-server` is REQUIRED in every deploy command.** The
 > code reads it at boot (`cp_auth.server_haid`, `bin/lib/cp_auth.py:269`); **absent,
@@ -235,9 +305,12 @@ What each flag buys:
   signing **key** (seed) from Secret Manager as an env var **at runtime only**. The
   value is never in the image, the repo, or this runbook.
 - `--set-env-vars` — selects the Firestore state backend (the A2 adapter), passes
-  the project for the Firestore client, and **pins the server identity name**
-  (`HEIMDALL_CP_SERVER_HAID`). The seed pins the key; this pins the name — together
-  they are the full, stable server identity (see below).
+  the project for the Firestore client, **pins the server identity name**
+  (`HEIMDALL_CP_SERVER_HAID`), and **pins the production job runner**
+  (`HEIMDALL_JOB_RUNNER=cloudrun-job`, so long jobs dispatch to the
+  `heimdall-long-job` Cloud Run Job instead of a starved in-process thread). The
+  seed pins the key; the HAID pins the name — together they are the full, stable
+  server identity (see below).
 
 ### Stable identity: both halves must be pinned
 
@@ -288,26 +361,133 @@ every Cloud Run instance and every cold start for signatures to verify:
 
 ## 4. Server-hosted long jobs (the flight fix in production — §A4)
 
-The 400k-call class of job runs as a **Cloud Run Job** (run-to-completion,
-independent of the client, $0 when not running). Client kicks it off,
-disconnects, the job finishes server-side.
+The 400k-call class of job runs as a **Cloud Run Job** (`heimdall-long-job`,
+run-to-completion, independent of the client, $0 when not running). The service
+kicks it off, the client disconnects, the Job finishes server-side and writes
+its terminal state to Firestore. See _"Execution model"_ at the top for **why**
+this is out-of-process (an in-process thread starves under Cloud Run's
+post-response CPU throttle + scale-to-zero).
+
+The Job runs the **same image** as the service. Its container command is the
+run-to-completion entrypoint `heimdall-control-plane run-job`; the **per-job
+`<job_id>` is supplied at execution time** by the service's dispatch
+(`--args run-job,<JOB_ID>`, §4.2), overriding the default args. Create (or, if
+it already exists, update) it:
 
 ```bash
 gcloud run jobs create heimdall-long-job \
   --source=. \
   --region="${REGION}" \
   --service-account="${RUNTIME_SA}" \
+  --command="heimdall-control-plane" \
+  --args="run-job" \
   --task-timeout=3600 \
   --max-retries=1 \
   --set-secrets="HEIMDALL_CP_PKI_KEY=cp-pki-key:latest" \
   --set-env-vars="HEIMDALL_STATE_BACKEND=firestore,GOOGLE_CLOUD_PROJECT=${PROJECT_ID},HEIMDALL_CP_SERVER_HAID=cp-server"
 ```
 
+> **Re-running this command?** `gcloud run jobs create` fails if the Job already
+> exists — the existing runbook half-provisioned `heimdall-long-job`. To change
+> the image/env/flags on an existing Job, swap `create` → `update` (same flags,
+> `--source=.` rebuilds the image):
+>
+> ```bash
+> gcloud run jobs update heimdall-long-job \
+>   --source=. \
+>   --region="${REGION}" \
+>   --service-account="${RUNTIME_SA}" \
+>   --command="heimdall-control-plane" \
+>   --args="run-job" \
+>   --task-timeout=3600 \
+>   --max-retries=1 \
+>   --set-secrets="HEIMDALL_CP_PKI_KEY=cp-pki-key:latest" \
+>   --set-env-vars="HEIMDALL_STATE_BACKEND=firestore,GOOGLE_CLOUD_PROJECT=${PROJECT_ID},HEIMDALL_CP_SERVER_HAID=cp-server"
+> ```
+
+What each Job flag buys:
+
+- `--command="heimdall-control-plane" --args="run-job"` — the **default**
+  container command/args. Each execution **overrides `--args`** to
+  `run-job,<JOB_ID>` (§4.2), so the container runs `heimdall-control-plane
+  run-job <job_id>` — the run-to-completion entrypoint that loads the job from
+  durable state, runs it to `done`, and exits.
+- `--max-retries=1` — **free retry.** Cloud Run re-runs a failed execution; the
+  entrypoint is restart-safe because all state is in Firestore, not local disk.
+- `--task-timeout=3600` — bounds a single execution to 1h (raise for the 400k
+  class if needed). A Job, unlike the service, has **no `--timeout=300` request
+  cap** — it runs to completion with full CPU.
+- `--set-secrets`/`--set-env-vars` — **identical** PKI seed, Firestore backend,
+  project, and server HAID as the service (§3), so the Job and the service share
+  one stable `server_haid → pubkey(seed)` identity.
+
+> **The Job intentionally does NOT set `HEIMDALL_JOB_RUNNER`.** The runner env is
+> a **dispatch** selector — only the **service** dispatches. The Job is the
+> **executor**: it runs `run-job <job_id>` directly to completion and must never
+> re-dispatch to another Cloud Run Job. (Cloud Run does **not** inject
+> `K_SERVICE` into Job containers, so even the autodetect default stays local — but
+> we leave the var unset rather than relying on that.)
+
 > The Job pins the **same** `HEIMDALL_CP_SERVER_HAID=cp-server` as the service (§3) — the
 > long-running Job and the request-serving service share one stable server
 > identity, so a job kicked off through the service and run by the Job both
 > register the identical `server_haid → pubkey(seed)` binding. Keep this value in
 > lockstep with §3.
+
+### 4.1 IAM — the service must be allowed to EXECUTE the Job
+
+The service's runtime SA dispatches the Job with `gcloud run jobs execute`, which
+calls the Cloud Run Admin API's **`run.jobs.run`** permission. **`roles/run.invoker`
+is NOT enough** — `run.invoker` only allows *invoking a service* (sending it an
+HTTP request); it does **not** grant `run.jobs.run`, so the dispatch fails with a
+`403 PERMISSION_DENIED` on the Job. Grant the runtime SA a role that includes
+`run.jobs.run`.
+
+**Least privilege (recommended) — a custom role with exactly the one permission,
+bound on the project:**
+
+```bash
+gcloud iam roles create heimdallJobRunner \
+  --project="${PROJECT_ID}" \
+  --title="Heimdall Job Runner" \
+  --description="Execute the heimdall-long-job Cloud Run Job" \
+  --permissions="run.jobs.run"
+
+gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+  --member="serviceAccount:${RUNTIME_SA}" \
+  --role="projects/${PROJECT_ID}/roles/heimdallJobRunner"
+```
+
+**Quick path (broader) — the predefined `roles/run.developer`**, which **includes**
+`run.jobs.run` (along with other Cloud Run write permissions you don't strictly
+need just to execute a Job):
+
+```bash
+gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+  --member="serviceAccount:${RUNTIME_SA}" \
+  --role="roles/run.developer"
+```
+
+> **Least-privilege note.** Prefer the custom `run.jobs.run`-only role: the
+> runtime SA only ever needs to **execute** a pre-provisioned Job, never to
+> create/update/delete Cloud Run resources. `roles/run.developer` works but
+> grants far more than dispatch. Whichever you pick, this is **in addition to**
+> the `roles/datastore.user` + `roles/secretmanager.secretAccessor` bindings the
+> runtime SA already holds (§0).
+
+### 4.2 Dispatch — how the service executes the Job per job
+
+The `cloudrun-job` runner (selected by `HEIMDALL_JOB_RUNNER=cloudrun-job` on the
+service, §3) runs this exact command for each job, overriding the Job's default
+args so the container runs `heimdall-control-plane run-job <JOB_ID>`:
+
+```bash
+gcloud run jobs execute heimdall-long-job --region "${REGION}" --args run-job,<JOB_ID>
+```
+
+Each call creates one **execution** of `heimdall-long-job`. The service returns
+the `job_id` immediately; the execution runs to `done` independently and writes
+durable state to Firestore.
 
 ---
 
@@ -349,7 +529,22 @@ gcloud run services describe "${SERVICE}" --region="${REGION}" \
 # -> 5
 
 # A Cloud Run Job survives client disconnect (kick off, disconnect, it completes).
-gcloud run jobs execute heimdall-long-job --region="${REGION}"
+# This is the SAME dispatch the service's cloudrun-job runner issues per job —
+# the per-execution args override the Job's default to run `run-job <JOB_ID>`.
+gcloud run jobs execute heimdall-long-job --region="${REGION}" --args run-job,<JOB_ID>
+
+# The runtime SA can EXECUTE the Job (run.jobs.run via §4.1) — if this 403s, the
+# IAM grant in §4.1 is missing (roles/run.invoker is NOT enough).
+gcloud run jobs executions list --job=heimdall-long-job --region="${REGION}" --limit=5
+
+# Confirm a real execution ran for a given job_id: list executions and check at
+# least one is Succeeded (the job reached `done` via the Cloud Run Job, not a
+# starved in-process thread). Replace <JOB_ID> with the dispatched id.
+gcloud run jobs executions list --job=heimdall-long-job --region="${REGION}" \
+  --format="value(metadata.name,status.completionTime,status.succeededCount)" \
+  | grep -q . \
+  && echo "OK — at least one heimdall-long-job execution ran (job dispatched out-of-process)" \
+  || echo "NONE — no execution ran; dispatch failed (check HEIMDALL_JOB_RUNNER on the service + run.jobs.run IAM in §4.1)"
 ```
 
 Expected cost (scoped Heimdall account, kill-switch capped): ~$5–20/mo for
@@ -389,15 +584,60 @@ state **from a fresh instance** is the flight-fix holding in production.
 >   || echo "MISSING — redeploy with HEIMDALL_CP_SERVER_HAID before verifying"
 > ```
 
+> **PRECONDITION — the out-of-process runner must be live too.** Before this
+> incident fix, the job ran on an in-process thread and **stayed queued** (never
+> reached `done`) under Cloud Run's CPU throttle + scale-to-zero, so the
+> flight-fix proof **FAILED**: the read-back found a job stuck in its initial
+> state, not a terminal one. The fix makes the job run as a `heimdall-long-job`
+> Cloud Run Job. For the proof to **PASS**, three things must be live: (a)
+> `HEIMDALL_JOB_RUNNER=cloudrun-job` on the service (§3), (b) the
+> `heimdall-long-job` Job exists (§4), and (c) the runtime SA has `run.jobs.run`
+> (§4.1). Quick check that the runner is pinned:
+>
+> ```bash
+> gcloud run services describe "${SERVICE}" --region="${REGION}" \
+>   --format='value(spec.template.spec.containers[0].env)' \
+>   | tr ',' '\n' | grep -q 'HEIMDALL_JOB_RUNNER=cloudrun-job' \
+>   && echo "OK — cloudrun-job runner is pinned (jobs dispatch out-of-process)" \
+>   || echo "MISSING — set HEIMDALL_JOB_RUNNER=cloudrun-job (§3) or jobs stay queued on a starved thread"
+> ```
+
 ### What it proves
 
-`PASS` ⇒ a `job_id` started over `POST /jobs` resolved its **durable terminal
-state** via `GET /jobs` from a **fresh instance** *after* the serving instance was
-torn down. The only way that read succeeds is if the state lived in Firestore (the
-external store), not the wiped ephemeral home — i.e. `HEIMDALL_STATE_BACKEND=firestore`
-is live and the image is current (no `BackendUnavailable` ticks; see the rebuild
-section above). `FAIL` ⇒ the state did **not** survive the instance replace
+`PASS` ⇒ a `job_id` started over `POST /jobs` was **dispatched to the
+`heimdall-long-job` Cloud Run Job**, ran **to terminal `done`** out-of-process,
+and resolved its **durable terminal state** via `GET /jobs` from a **fresh
+instance** *after* the serving instance was torn down. Two properties are proven
+at once: (1) the job **reaches `done`** — a Cloud Run Job execution appears in
+`gcloud run jobs executions list --job=heimdall-long-job` and finishes (it is
+**not** stuck queued on a throttled in-process thread); and (2) its state lived
+in Firestore (the external store), not the wiped ephemeral home — i.e.
+`HEIMDALL_STATE_BACKEND=firestore` is live and the image is current (no
+`BackendUnavailable` ticks; see the rebuild section above).
+
+**The FAIL → PASS transition this fix delivers.** Before the out-of-process
+runner, the flight-fix script **FAILED**: the in-process job stayed queued, never
+reached `done`, and the read-back returned a non-terminal job. After deploying
+with `HEIMDALL_JOB_RUNNER=cloudrun-job` (§3), the `heimdall-long-job` Job (§4),
+and the `run.jobs.run` IAM grant (§4.1), the same script goes **PASS** — the job
+now reaches `done` via a Cloud Run Job execution, and that terminal state reads
+back from a fresh instance. A persistent `FAIL` ⇒ either the runner is still
+in-process (job never reaches `done` — check `HEIMDALL_JOB_RUNNER` and that an
+execution actually ran, §6), or the state did not survive the instance replace
 (stale image / wrong backend / non-deterministic scale).
+
+> **One-liner — check a Job execution ran for the dispatched `job_id`.** After
+> the script reports its `job_id`, confirm at least one `heimdall-long-job`
+> execution exists and succeeded (proof the job ran out-of-process, not on a
+> starved thread):
+>
+> ```bash
+> gcloud run jobs executions list --job=heimdall-long-job --region="${REGION}" \
+>   --format="value(metadata.name,status.succeededCount)" \
+>   | grep -q . \
+>   && echo "OK — a heimdall-long-job execution ran (job reached done out-of-process)" \
+>   || echo "NONE — no execution ran; the job never dispatched (the pre-fix queued-forever signature)"
+> ```
 
 ### How RJ runs it (live URL, RJ's creds)
 
