@@ -236,11 +236,32 @@ class FirestoreBackend(cp_state.StateBackend):
     # ── enumeration / presence (list_names / exists) ──────────────────────────────
 
     def list_names(self, rel_dir, *, suffix=""):
-        """The SORTED basenames of every node directly under `rel_dir`, filtered by
+        """The SORTED IMMEDIATE-CHILD names directly under `rel_dir`, filtered by
         `suffix`. Recovered by scanning the root collection for doc ids sharing the
-        encoded "<rel_dir>__" prefix and taking the single segment after it (a basename,
-        never a nested path). Mirrors LocalBackend.list_names (sorted, suffix-filtered,
-        absent → [])."""
+        encoded "<rel_dir>__" prefix and taking the FIRST segment after it. This mirrors
+        LocalBackend.list_names (which is os.listdir of the rel dir): the immediate child
+        is a LEAF basename when the node sits directly under rel_dir, OR a synthetic
+        SUBDIRECTORY name when the node is nested deeper (the dir has no doc of its own in
+        Firestore's flat keyspace, so it is recovered from its descendants' doc ids).
+
+        Why the FIRST segment, not "leaf or nothing": the observe store is NESTED —
+        observe/<slug>/events.ndjson encodes to "observe__<slug>__events.ndjson". The
+        immediate child of "observe/" is the directory "<slug>", exactly as os.listdir of
+        a local observe/ returns the slug DIRECTORIES (not the deeper events.ndjson). A
+        leaf-only rule returned [] here and the cross-dev dashboard silently showed zero
+        instances under firestore (the firestore-only read-path defect this fixes).
+
+        Suffix semantics match LocalBackend's os.listdir + endswith filter EXACTLY: a
+        synthetic subdirectory name carries no file suffix, so a non-empty `suffix` never
+        matches it (just as a local dir entry "<slug>" never ends with ".ndjson"); a
+        suffix filter therefore selects only LEAF children, the flat-store case (jobs/
+        approvals enumerate with suffix and get leaf doc names, unchanged).
+
+        Limitation (pre-existing, not introduced here): a rel SEGMENT that itself contains
+        the "__" separator (e.g. an instance slug derived from a HAID with two adjacent
+        non-alnum chars) is ambiguous under this flat encoding for BOTH read/write and this
+        enumeration. Production instance slugs derive single "_" runs from "haid:<id>"; the
+        firestore encoding header documents the "no __ in a segment" assumption."""
         prefix = _dir_prefix(rel_dir)
         names = set()
         try:
@@ -249,11 +270,21 @@ class FirestoreBackend(cp_state.StateBackend):
                 if not doc_id.startswith(prefix):
                     continue
                 rest = doc_id[len(prefix):]
-                # Only DIRECT children: a basename has no further _SEP (no deeper nesting).
-                if _SEP in rest:
-                    continue
                 if not rest:
                     continue
+                # The immediate child under rel_dir: a leaf basename when the node sits
+                # directly here, or a synthetic subdirectory name (first segment) when the
+                # node is nested deeper. os.listdir(rel_dir) returns the SAME on local.
+                head, sep, _tail = rest.partition(_SEP)
+                if sep:
+                    # rest had a deeper segment -> `head` is a subdirectory name. A dir
+                    # carries no file suffix, so a suffix filter excludes it (matching the
+                    # local os.listdir behavior where a dir entry never ends with .ndjson).
+                    if suffix:
+                        continue
+                    names.add(head)
+                    continue
+                # `rest` is a leaf basename directly under rel_dir.
                 if suffix and not rest.endswith(suffix):
                     continue
                 names.add(rest)
