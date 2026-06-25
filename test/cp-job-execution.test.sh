@@ -390,14 +390,18 @@ else
   bad "the gate does NOT distinguish the models (thread=$THREAD_STATE subprocess=$SUB2_STATE)"
 fi
 
-# ── D. CloudRunJobRunner argv shape — the prod dispatch contract ─────────────────────
+# ── D. CloudRunJobRunner run_v2 request shape — the prod dispatch contract ───────────
 echo
-echo "D. CloudRunJobRunner argv shape (the prod dispatch contract)"
+echo "D. CloudRunJobRunner run_v2 RunJobRequest shape (the prod dispatch contract)"
 
-# Write a temp script that calls build_command and emits one token per line, plus
-# labelled assertions as PASS/FAIL lines — all assertions run in Python so bash does
-# not need to parse the argv token list.  Uses the temp-file pattern established above.
-ARGV_PY="$EXT/assert_argv.py"
+# The deployed image has NO gcloud SDK, so CloudRunJobRunner.dispatch goes straight to the
+# Cloud Run Jobs REST API: it builds a run_v2.RunJobRequest (build_request) and hands it to
+# JobsClient.run_job over the runtime SA's ADC. run_v2 MESSAGE CONSTRUCTION IS OFFLINE (no
+# network, no GCP, no spend), so we assert the EXACT request shape build_request produces —
+# the real run_v2 types, zero dispatch. We exercise the REAL google-cloud-run message
+# classes (the suite driver installs the pinned google-cloud-run==0.10.19); if run_v2 is not
+# importable we SKIP with a loud note rather than silently passing.
+ARGV_PY="$EXT/assert_request.py"
 cat >"$ARGV_PY" <<'PYEOF'
 import os
 import sys
@@ -405,116 +409,126 @@ import sys
 sys.path.insert(0, os.environ["LIB"])
 import cp_jobrunner
 
+# run_v2 message construction is offline; if the dep is absent the prod path cannot be
+# exercised faithfully — emit SKIP lines (the suite driver should install the pin).
+try:
+    from google.cloud import run_v2  # noqa: F401 — presence probe only.
+except ImportError as exc:
+    print("SKIP D: google-cloud-run not importable (%s) — install the pinned "
+          "google-cloud-run==0.10.19 to exercise the real run_v2 RunJobRequest shape" % exc)
+    sys.exit(0)
+
 TEST_JOB_ID = "job-argv-regression-TEST"
 
-# ── build 1: defaults only (no project env, default job name, default region) ────────
-env_clean = {}
-os.environ.pop("GOOGLE_CLOUD_PROJECT", None)
+
+def override_args(request):
+    """Pull the container override args out of a RunJobRequest (the run-job,<id> carrier)."""
+    cos = list(request.overrides.container_overrides)
+    if len(cos) != 1:
+        return None
+    return list(cos[0].args)
+
+
+# ── build 1: defaults only (default job name, default region), project set so the resource
+#    name is buildable (the resource REQUIRES a project — no project => no execution). ──────
 os.environ.pop("HEIMDALL_CP_JOB_NAME", None)
 os.environ.pop("HEIMDALL_CP_JOB_REGION", None)
 os.environ.pop("CLOUD_RUN_REGION", None)
 os.environ.pop("FUNCTION_REGION", None)
+os.environ["GOOGLE_CLOUD_PROJECT"] = "proj-default"
 
 runner_def = cp_jobrunner.CloudRunJobRunner()
-cmd_def = runner_def.build_command(TEST_JOB_ID)
+req_def = runner_def.build_request(TEST_JOB_ID)
 
-# D1 — the verb is 'gcloud run jobs execute <job-name>' (first 5 tokens)
-verb_ok = (cmd_def[:5] == ["gcloud", "run", "jobs", "execute", "heimdall-long-job"])
-print("PASS D1: verb is 'gcloud run jobs execute heimdall-long-job'" if verb_ok else
-      "FAIL D1: wrong verb/job-name: %r" % cmd_def[:5])
+# D1 — the request name is the fully-qualified resource:
+#      projects/<project>/locations/<region>/jobs/<job-name>, defaults filled from env.
+expect_name_def = "projects/proj-default/locations/us-central1/jobs/heimdall-long-job"
+name_ok = (req_def.name == expect_name_def)
+print("PASS D1: request name is '%s' (project/region/job-name from env+defaults)"
+      % expect_name_def if name_ok else
+      "FAIL D1: request name is %r (expected %r)" % (req_def.name, expect_name_def))
 
-# D2 — the --args token contains 'run-job,<job_id>' as a single adjacent token
-# (CloudRunJobRunner encodes both the subcommand and the id in ONE comma-joined token)
+# D2 — the container override args are EXACTLY ['run-job', <job_id>] — the override carries
+#      BOTH the subcommand AND the id, so the execution runs `run-job <job_id>`.
+args_def = override_args(req_def)
+args_ok = (args_def == ["run-job", TEST_JOB_ID])
+print("PASS D2: container override args == ['run-job', '%s'] (subcommand + id, exactly two)"
+      % TEST_JOB_ID if args_ok else
+      "FAIL D2: container override args are %r (expected ['run-job', '%s'])"
+      % (args_def, TEST_JOB_ID))
+
+# D3 (FALSIFIER) — the args are NOT the bare [job_id]. A regression that drops 'run-job'
+#      (args == [job_id]) means the container runs its DEFAULT command (serve), the run-job
+#      subcommand is never received, and every prod dispatch silently fails. This catches it.
+not_bare = (args_def != [TEST_JOB_ID])
+print("PASS D3 (falsifier): args are NOT bare [job_id] — the 'run-job' subcommand is mandatory"
+      if not_bare else
+      "FAIL D3 (falsifier): args dropped 'run-job' and are bare %r — prod dispatch would no-op"
+      % args_def)
+
+# D4 (FALSIFIER) — the SECOND arg is EXACTLY the job_id passed in (not blank, not wrong).
+#      A regression to a blank/empty/wrong id would dispatch the wrong execution; this pins it.
+second_arg = args_def[1] if (args_def and len(args_def) == 2) else None
+id_ok = (second_arg == TEST_JOB_ID and second_arg != "")
+print("PASS D4 (falsifier): the id arg is EXACTLY '%s' (not blank, not wrong)" % TEST_JOB_ID
+      if id_ok else
+      "FAIL D4 (falsifier): the id arg is %r (expected exactly '%s')"
+      % (second_arg, TEST_JOB_ID))
+
+# D5 — no project => no resource name => build_request raises JobRunnerError (turned into
+#      {dispatched: False} by dispatch, never a crash). Pinning the fail-closed behavior.
+os.environ.pop("GOOGLE_CLOUD_PROJECT", None)
+runner_noproj = cp_jobrunner.CloudRunJobRunner(project=None)
+raised = False
 try:
-    args_idx = cmd_def.index("--args")
-    args_val = cmd_def[args_idx + 1]
-except ValueError:
-    args_val = None
-args_ok = (args_val == "run-job,%s" % TEST_JOB_ID)
-print("PASS D2: --args token is 'run-job,%s' (subcommand+id adjacent)" % TEST_JOB_ID
-      if args_ok else
-      "FAIL D2: --args value is %r (expected 'run-job,%s')" % (args_val, TEST_JOB_ID))
+    runner_noproj.build_request(TEST_JOB_ID)
+except cp_jobrunner.JobRunnerError:
+    raised = True
+print("PASS D5: build_request raises JobRunnerError when no project is set (fail closed)"
+      if raised else
+      "FAIL D5: build_request did NOT raise without a project — resource name is unbuildable")
 
-# D3 — the EXACT job_id appears fused with 'run-job,' — not as a bare standalone token.
-# The falsifier: if someone regresses build_command to pass job_id standalone (e.g.
-# --args <job_id> without run-job,) the container never receives the run-job subcommand
-# and every prod dispatch silently fails (Cloud Run runs the container's default CMD).
-bare_id_tokens = [t for t in cmd_def if t == TEST_JOB_ID]
-no_bare = (len(bare_id_tokens) == 0)
-print("PASS D3 (falsifier): job_id does NOT appear as a bare token — 'run-job,' prefix is mandatory"
-      if no_bare else
-      "FAIL D3 (falsifier): job_id appears bare without 'run-job,' prefix: %r" % cmd_def)
-
-# D4 — --wait=false is present (non-blocking dispatch == the flight fix)
-wait_ok = ("--wait=false" in cmd_def)
-print("PASS D4: --wait=false present (non-blocking dispatch — the flight fix)"
-      if wait_ok else
-      "FAIL D4: --wait=false absent from argv: %r" % cmd_def)
-
-# D5 — default region is 'us-central1' when no region env is set
-region_idx = cmd_def.index("--region") if "--region" in cmd_def else -1
-region_val = cmd_def[region_idx + 1] if region_idx >= 0 else None
-region_ok = (region_val == "us-central1")
-print("PASS D5: default region is 'us-central1'" if region_ok else
-      "FAIL D5: default region is %r (expected 'us-central1')" % region_val)
-
-# D6 — no --project flag when GOOGLE_CLOUD_PROJECT is absent
-proj_absent_ok = ("--project" not in cmd_def)
-print("PASS D6: --project absent when GOOGLE_CLOUD_PROJECT unset"
-      if proj_absent_ok else
-      "FAIL D6: --project present even when GOOGLE_CLOUD_PROJECT unset: %r" % cmd_def)
-
-# ── build 2: custom job name + region + project ───────────────────────────────────────
+# ── build 2: custom job name + region + project all propagate into the resource name ───────
 os.environ["HEIMDALL_CP_JOB_NAME"] = "my-custom-job"
 os.environ["HEIMDALL_CP_JOB_REGION"] = "europe-west1"
 os.environ["GOOGLE_CLOUD_PROJECT"] = "my-gcp-project"
 
 runner_cust = cp_jobrunner.CloudRunJobRunner()
-cmd_cust = runner_cust.build_command(TEST_JOB_ID)
+req_cust = runner_cust.build_request(TEST_JOB_ID)
 
-# D7 — custom job name propagates to the execute argv
-job_name_ok = (cmd_cust[4] == "my-custom-job")
-print("PASS D7: HEIMDALL_CP_JOB_NAME propagates to argv (my-custom-job)"
-      if job_name_ok else
-      "FAIL D7: job name in argv is %r (expected my-custom-job)" % cmd_cust[4])
+# D6 — custom project + region + job name all flow into the resource name.
+expect_name_cust = "projects/my-gcp-project/locations/europe-west1/jobs/my-custom-job"
+name_cust_ok = (req_cust.name == expect_name_cust)
+print("PASS D6: custom project/region/job-name propagate -> '%s'" % expect_name_cust
+      if name_cust_ok else
+      "FAIL D6: request name is %r (expected %r)" % (req_cust.name, expect_name_cust))
 
-# D8 — region from HEIMDALL_CP_JOB_REGION propagates
-region_cust_idx = cmd_cust.index("--region") if "--region" in cmd_cust else -1
-region_cust = cmd_cust[region_cust_idx + 1] if region_cust_idx >= 0 else None
-region_cust_ok = (region_cust == "europe-west1")
-print("PASS D8: HEIMDALL_CP_JOB_REGION propagates to --region europe-west1"
-      if region_cust_ok else
-      "FAIL D8: --region is %r (expected europe-west1)" % region_cust)
+# D7 — the args invariant holds under the custom env too (override is env-independent).
+args_cust = override_args(req_cust)
+args_cust_ok = (args_cust == ["run-job", TEST_JOB_ID])
+print("PASS D7: override args still ['run-job', '%s'] under custom env" % TEST_JOB_ID
+      if args_cust_ok else
+      "FAIL D7: override args under custom env are %r (expected ['run-job', '%s'])"
+      % (args_cust, TEST_JOB_ID))
 
-# D9 — project from GOOGLE_CLOUD_PROJECT propagates as --project
-proj_idx = cmd_cust.index("--project") if "--project" in cmd_cust else -1
-proj_val = cmd_cust[proj_idx + 1] if proj_idx >= 0 else None
-proj_ok = (proj_val == "my-gcp-project")
-print("PASS D9: GOOGLE_CLOUD_PROJECT propagates to --project my-gcp-project"
-      if proj_ok else
-      "FAIL D9: --project value is %r (expected my-gcp-project)" % proj_val)
-
-# D10 — the critical invariant holds for a DIFFERENT job_id: 'run-job,' prefix always fused.
-# Regression guard: if build_command ever splits the token or drops the subcommand for any
-# id, this catches it.
+# D8 — the invariant holds for a DIFFERENT job_id: the exact id is fused with 'run-job',
+#      never split, never dropped. Regression guard across ids.
 ALT_ID = "job-00000000000000000000000000000000"
-cmd_alt = runner_cust.build_command(ALT_ID)
-try:
-    alt_args_idx = cmd_alt.index("--args")
-    alt_args_val = cmd_alt[alt_args_idx + 1]
-except ValueError:
-    alt_args_val = None
-alt_fused = (alt_args_val == "run-job,%s" % ALT_ID)
-print("PASS D10: invariant holds for alternate job_id — 'run-job,%s' fused" % ALT_ID
-      if alt_fused else
-      "FAIL D10: --args for alternate id is %r (run-job prefix dropped)" % alt_args_val)
+req_alt = runner_cust.build_request(ALT_ID)
+args_alt = override_args(req_alt)
+alt_ok = (args_alt == ["run-job", ALT_ID])
+print("PASS D8: invariant holds for alternate id — override args == ['run-job', '%s']" % ALT_ID
+      if alt_ok else
+      "FAIL D8: override args for alternate id are %r (expected ['run-job', '%s'])"
+      % (args_alt, ALT_ID))
 PYEOF
 
-# Run the argv assertions and map PASS/FAIL lines to the test's ok/bad counters.
+# Run the request-shape assertions and map PASS/FAIL/SKIP lines to the test's counters.
 while IFS= read -r line; do
   case "$line" in
     PASS*)  ok  "${line#PASS }" ;;
     FAIL*)  bad "${line#FAIL }" ;;
+    SKIP*)  printf "  \033[33mSKIP\033[0m %s\n" "${line#SKIP }" ;;
   esac
 done < <("$PY" "$ARGV_PY" 2>&1)
 
