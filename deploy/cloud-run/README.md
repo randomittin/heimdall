@@ -138,6 +138,16 @@ injected into the running container as a mounted secret at deploy time.
 | ------------ | -------------------------------------------- | ---------------------- |
 | `cp-pki-key` | Ed25519 **private** signing seed (base64)    | env `HEIMDALL_CP_PKI_KEY` |
 
+> **The seed is only HALF the identity.** `cp-pki-key` pins the **key** (the
+> public/private Ed25519 material, derived deterministically from the seed —
+> `cp_auth.load_signing_key`). It does **not** pin the **name** the key binds to.
+> The server registers `server_haid → pubkey(seed)` at boot (`ensure_server_identity`),
+> and `server_haid` is resolved from the **`HEIMDALL_CP_SERVER_HAID`** env var
+> (`cp_auth.server_haid`, `bin/lib/cp_auth.py:269`). That env var is **not** a
+> secret — it is a plain identity **name** — but it **must be pinned** in §3/§4
+> alongside the seed. See _"Stable identity: both halves must be pinned"_ at the
+> end of §3.
+
 ### Create the secret container (no value committed anywhere)
 
 ```bash
@@ -186,8 +196,15 @@ gcloud run deploy "${SERVICE}" \
   --port=8080 \
   --no-allow-unauthenticated \
   --set-secrets="HEIMDALL_CP_PKI_KEY=cp-pki-key:latest" \
-  --set-env-vars="HEIMDALL_STATE_BACKEND=firestore,GOOGLE_CLOUD_PROJECT=${PROJECT_ID}"
+  --set-env-vars="HEIMDALL_STATE_BACKEND=firestore,GOOGLE_CLOUD_PROJECT=${PROJECT_ID},HEIMDALL_CP_SERVER_HAID=haid:heimdall.cp-prod-0001"
 ```
+
+> **`HEIMDALL_CP_SERVER_HAID` pins the server's identity NAME — choose one value
+> and keep it constant forever.** Here it is `haid:heimdall.cp-prod-0001` (a plain
+> identity name, **not** a secret — fine to commit and to read back via
+> `gcloud run services describe`). RJ picks this value **once** and **never changes
+> it** across redeploys. See _"Stable identity: both halves must be pinned"_ below
+> for why an unpinned name silently breaks cross-instance auth.
 
 What each flag buys:
 
@@ -201,10 +218,52 @@ What each flag buys:
 - `--no-allow-unauthenticated` — **not open to the internet.** Access requires
   Cloud Run IAM auth, layered on top of the app-level PKI signing.
 - `--set-secrets="HEIMDALL_CP_PKI_KEY=cp-pki-key:latest"` — injects the PKI
-  signing key from Secret Manager as an env var **at runtime only**. The value
-  is never in the image, the repo, or this runbook.
-- `--set-env-vars` — selects the Firestore state backend (the A2 adapter) and
-  passes the project for the Firestore client.
+  signing **key** (seed) from Secret Manager as an env var **at runtime only**. The
+  value is never in the image, the repo, or this runbook.
+- `--set-env-vars` — selects the Firestore state backend (the A2 adapter), passes
+  the project for the Firestore client, and **pins the server identity name**
+  (`HEIMDALL_CP_SERVER_HAID`). The seed pins the key; this pins the name — together
+  they are the full, stable server identity (see below).
+
+### Stable identity: both halves must be pinned
+
+The control plane's identity is **two** things, and **both** must be stable across
+every Cloud Run instance and every cold start for signatures to verify:
+
+1. **The key** — the Ed25519 keypair. Pinned by `cp-pki-key`: `load_signing_key`
+   derives the *same* keypair from the *same* seed on every instance
+   (`bin/lib/cp_auth.py` `load_signing_key`). ✅ already pinned via `--set-secrets`.
+2. **The name** — the HAID the key binds to. Resolved by `cp_auth.server_haid`
+   (`bin/lib/cp_auth.py:269`): it reads `HEIMDALL_CP_SERVER_HAID` **first**, else
+   derives a HAID via the `heimdall-haid` CLI — which uses the container
+   **`HOSTNAME`**, *different on every Cloud Run instance*. ⇒ Without the env var,
+   each instance registers a **different** `haid → pubkey` binding (an unstable,
+   per-instance name), so a request signed as instance A's HAID **fails to verify**
+   on instance B even though the *key* is identical. Pinning
+   `HEIMDALL_CP_SERVER_HAID` makes every instance register the **identical**
+   `server_haid → pubkey(seed)` binding at boot (`ensure_server_identity`).
+
+> **Why this matters for the flight-fix.** The flight-fix proof (§7) signs a
+> request as the server's own HAID, then reads the job back from a **fresh**
+> instance after scale-to-zero. That read only verifies if the fresh instance
+> registered the **same** `haid → pubkey` the signer used. The seed alone is not
+> enough — the *name* must match too. Pin both halves and the identity is
+> reproducible: `server_haid → pubkey(seed)` is byte-identical on every cold start.
+
+> **⚠️ RJ must redeploy with `HEIMDALL_CP_SERVER_HAID` set BEFORE running the §7
+> flight-fix verify** — and for correct cross-instance identity in general. This is
+> **not** a full image rebuild: a `--set-env-vars` update (which rolls a new
+> revision) is enough to set the var on a service that is already on the current
+> image:
+>
+> ```bash
+> gcloud run services update "${SERVICE}" --region="${REGION}" \
+>   --update-env-vars="HEIMDALL_CP_SERVER_HAID=haid:heimdall.cp-prod-0001"
+> ```
+>
+> (Choose the **same** value you committed to in §3 and never change it. If a
+> rebuild is also pending for other reasons — see the rebuild section above — the
+> full `gcloud run deploy` in §3, which already carries the var, covers both.)
 
 ---
 
@@ -222,8 +281,14 @@ gcloud run jobs create heimdall-long-job \
   --task-timeout=3600 \
   --max-retries=1 \
   --set-secrets="HEIMDALL_CP_PKI_KEY=cp-pki-key:latest" \
-  --set-env-vars="HEIMDALL_STATE_BACKEND=firestore,GOOGLE_CLOUD_PROJECT=${PROJECT_ID}"
+  --set-env-vars="HEIMDALL_STATE_BACKEND=firestore,GOOGLE_CLOUD_PROJECT=${PROJECT_ID},HEIMDALL_CP_SERVER_HAID=haid:heimdall.cp-prod-0001"
 ```
+
+> The Job pins the **same** `HEIMDALL_CP_SERVER_HAID` as the service (§3) — the
+> long-running Job and the request-serving service share one stable server
+> identity, so a job kicked off through the service and run by the Job both
+> register the identical `server_haid → pubkey(seed)` binding. Keep this value in
+> lockstep with §3.
 
 ---
 
@@ -272,6 +337,117 @@ Expected cost (scoped Heimdall account, kill-switch capped): ~$5–20/mo for
 7–8 devs. Scale-to-zero dashboard + occasional Cloud Run Jobs + Firestore
 (free tier covers most) + Scheduler. Hard-capped at ₹10,000 by the tested
 kill-switch.
+
+---
+
+## 7. Prove the flight-fix on the live target (`verify-flight-fix.sh`)
+
+`deploy/cloud-run/verify-flight-fix.sh` is the **copy-pasteable proof** that durable
+server-hosted jobs work on the **real** Cloud Run + Firestore target — not the
+emulator, not a laptop. It starts a signed job, confirms it persists, **replaces
+the serving instance** (so the next request hits a *fresh* instance with no local
+state), then reads the same job back. A read-back that resolves the job's durable
+state **from a fresh instance** is the flight-fix holding in production.
+
+> This is **RJ's** to run — it needs creds and the live URL. The agent that wrote
+> it validated the script's logic locally (firestore mode, across a process
+> restart); the prod run below is pure execution.
+
+> **PRECONDITION — pin `HEIMDALL_CP_SERVER_HAID` first.** The script signs as the
+> server's **own** HAID, read back from the deployed env. If the service was
+> deployed *before* `HEIMDALL_CP_SERVER_HAID` was added (§3), the var is empty and
+> the script cannot resolve a stable HAID — and even if it could, the per-instance
+> derived name would make the cold-start read-back fail to verify. **Redeploy with
+> the pinned var first** (the `gcloud run services update --update-env-vars=...` in
+> §3's _"Stable identity"_ note is enough — no image rebuild), then run this. Quick
+> check that the var is live:
+>
+> ```bash
+> gcloud run services describe "${SERVICE}" --region="${REGION}" \
+>   --format='value(spec.template.spec.containers[0].env)' \
+>   | tr ',' '\n' | grep -q HEIMDALL_CP_SERVER_HAID \
+>   && echo "OK — server HAID is pinned" \
+>   || echo "MISSING — redeploy with HEIMDALL_CP_SERVER_HAID before verifying"
+> ```
+
+### What it proves
+
+`PASS` ⇒ a `job_id` started over `POST /jobs` resolved its **durable terminal
+state** via `GET /jobs` from a **fresh instance** *after* the serving instance was
+torn down. The only way that read succeeds is if the state lived in Firestore (the
+external store), not the wiped ephemeral home — i.e. `HEIMDALL_STATE_BACKEND=firestore`
+is live and the image is current (no `BackendUnavailable` ticks; see the rebuild
+section above). `FAIL` ⇒ the state did **not** survive the instance replace
+(stale image / wrong backend / non-deterministic scale).
+
+### How RJ runs it (live URL, RJ's creds)
+
+```bash
+export PROJECT_ID="heimdall-control-plane"
+export REGION="us-central1"
+export SERVICE="heimdall-control-plane"
+
+# The live Cloud Run https URL.
+export BASE_URL="$(gcloud run services describe "${SERVICE}" \
+  --region="${REGION}" --format='value(status.url)')"
+
+# The registered identity to sign as = the server's OWN HAID (the deploy pins it via
+# HEIMDALL_CP_SERVER_HAID; boot() registers server_haid -> pubkey(cp-pki-key)).
+export CLIENT_HAID="$(gcloud run services describe "${SERVICE}" --region="${REGION}" \
+  --format='value(spec.template.spec.containers[0].env)' \
+  | tr ',' '\n' | grep HEIMDALL_CP_SERVER_HAID | cut -d= -f2)"
+
+# The PKI seed = the SAME cp-pki-key the server signs with (read from Secret Manager,
+# straight into the env — never written to disk). The script NEVER prints it.
+export PKI_SEED="$(gcloud secrets versions access latest --secret=cp-pki-key)"
+
+# Cloud Run IAM bearer (the service is --no-allow-unauthenticated).
+export ID_TOKEN="$(gcloud auth print-identity-token)"
+
+bash deploy/cloud-run/verify-flight-fix.sh
+# Expect: "VERDICT: PASS — the job_id resolved its DURABLE state from a FRESH
+#          instance after scale-to-zero." (exit 0)
+```
+
+### The scale-to-zero step (how the instance is replaced)
+
+The script defaults to `SCALE_TO_ZERO=revision`: it rolls a **no-op new revision**
+(`gcloud run services update --revision-suffix=flightfix-<stamp> --update-env-vars=...`),
+which routes 100% of traffic to a new revision and **tears down the old serving
+instance** — deterministic and fast. The trade-off vs. `SCALE_TO_ZERO=wait` (rely
+on the `--min-instances=0` idle scale-down, ~up to 15 min, non-deterministic) is
+documented in the script header: the revision rollout *provably* replaces the
+instance now, which is exactly the property the proof needs (a fresh instance with
+no local state). A third mode, `SCALE_TO_ZERO=command` + `SCALE_CMD`, runs an
+operator-supplied replacement command (gcloud-free) — that is the seam the local
+dry run uses to restart the server against the same external store.
+
+### Where the job lands in Firestore
+
+The job's state log maps (per `bin/lib/cp_state_firestore.py`) to one node document:
+
+```
+rel: jobs/<job_id>.ndjson
+doc: <HEIMDALL_FIRESTORE_ROOT>/jobs__<job_id>.ndjson      # root default: heimdall_cp
+     (appended NDJSON lines live in that doc's "lines" subcollection)
+```
+
+The script **prints this path**, and — when `PROJECT_ID` is set and `gcloud` is
+present — confirms the doc with `gcloud firestore documents describe`.
+
+### Local dry run (no GCP, no spend — already validated by the agent)
+
+`test/verify-flight-fix-dryrun.test.sh` runs `verify-flight-fix.sh` against a
+**local** wired server in firestore mode (the in-process Firestore fake / a caller
+emulator), simulating scale-to-zero by **restarting the server process** against
+the same external store (fresh process = fresh instance; the durable store
+persists). It reports `PASS` when the job survives the restart and is read back
+from the external store — validating the script's logic end-to-end before prod:
+
+```bash
+bash test/verify-flight-fix-dryrun.test.sh
+# Expect: "verify-flight-fix-dryrun: PASS" (exit 0)
+```
 
 ---
 
