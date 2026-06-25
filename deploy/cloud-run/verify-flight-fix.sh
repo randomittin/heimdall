@@ -701,6 +701,18 @@ fi
 # ──────────────────────────────────────────────────────────────────────────────
 say
 say "STEP 5 — cold-start read-back: signed GET /jobs for the SAME job_id [THE FLIGHT FIX]"
+# READ-PATH CONTRACT (audited). The read below sends job_id in the request BODY
+# ({"job_id":...}) and parses state from b["job"]["state"] — EXACTLY what the live
+# handler expects + emits: cp_worker.status_route reads the job_id via _job_id_from
+# (payload["job_id"] FIRST), folds the durable log (cp_jobstore.read_job -> fold_state),
+# and returns Response(200, {"job": folded}) where folded carries "state". The send +
+# parse are CONTRACT-CORRECT (the local dry run round-trips this exact shape across a
+# fresh process and reads back state=done). So if STEP 5 reads state=None for a job
+# whose Firestore doc HAS done, the divergence is NOT a verify-parse bug — it is the
+# live SERVICE read-path (a fresh instance reading the wrong home/store, or async
+# timing). The DECISIVE one-off distinguisher is deploy/cloud-run/get-job.sh: it sends
+# this identical signed GET /jobs for a single job_id and prints the RAW response + the
+# parsed state, so done-vs-None on the live wire pinpoints which side is at fault.
 if [ "$EXEC_SUCCEEDED" = "yes" ]; then
   say "  STEP 2b confirmed the execution SUCCEEDED — polling up to ${STEP5_POLL_SECONDS}s for the"
   say "  terminal 'done' write to become visible in Firestore + read back from the FRESH instance."
