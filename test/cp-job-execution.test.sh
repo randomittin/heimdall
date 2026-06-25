@@ -390,6 +390,134 @@ else
   bad "the gate does NOT distinguish the models (thread=$THREAD_STATE subprocess=$SUB2_STATE)"
 fi
 
+# ── D. CloudRunJobRunner argv shape — the prod dispatch contract ─────────────────────
+echo
+echo "D. CloudRunJobRunner argv shape (the prod dispatch contract)"
+
+# Write a temp script that calls build_command and emits one token per line, plus
+# labelled assertions as PASS/FAIL lines — all assertions run in Python so bash does
+# not need to parse the argv token list.  Uses the temp-file pattern established above.
+ARGV_PY="$EXT/assert_argv.py"
+cat >"$ARGV_PY" <<'PYEOF'
+import os
+import sys
+
+sys.path.insert(0, os.environ["LIB"])
+import cp_jobrunner
+
+TEST_JOB_ID = "job-argv-regression-TEST"
+
+# ── build 1: defaults only (no project env, default job name, default region) ────────
+env_clean = {}
+os.environ.pop("GOOGLE_CLOUD_PROJECT", None)
+os.environ.pop("HEIMDALL_CP_JOB_NAME", None)
+os.environ.pop("HEIMDALL_CP_JOB_REGION", None)
+os.environ.pop("CLOUD_RUN_REGION", None)
+os.environ.pop("FUNCTION_REGION", None)
+
+runner_def = cp_jobrunner.CloudRunJobRunner()
+cmd_def = runner_def.build_command(TEST_JOB_ID)
+
+# D1 — the verb is 'gcloud run jobs execute <job-name>' (first 5 tokens)
+verb_ok = (cmd_def[:5] == ["gcloud", "run", "jobs", "execute", "heimdall-long-job"])
+print("PASS D1: verb is 'gcloud run jobs execute heimdall-long-job'" if verb_ok else
+      "FAIL D1: wrong verb/job-name: %r" % cmd_def[:5])
+
+# D2 — the --args token contains 'run-job,<job_id>' as a single adjacent token
+# (CloudRunJobRunner encodes both the subcommand and the id in ONE comma-joined token)
+try:
+    args_idx = cmd_def.index("--args")
+    args_val = cmd_def[args_idx + 1]
+except ValueError:
+    args_val = None
+args_ok = (args_val == "run-job,%s" % TEST_JOB_ID)
+print("PASS D2: --args token is 'run-job,%s' (subcommand+id adjacent)" % TEST_JOB_ID
+      if args_ok else
+      "FAIL D2: --args value is %r (expected 'run-job,%s')" % (args_val, TEST_JOB_ID))
+
+# D3 — the EXACT job_id appears fused with 'run-job,' — not as a bare standalone token.
+# The falsifier: if someone regresses build_command to pass job_id standalone (e.g.
+# --args <job_id> without run-job,) the container never receives the run-job subcommand
+# and every prod dispatch silently fails (Cloud Run runs the container's default CMD).
+bare_id_tokens = [t for t in cmd_def if t == TEST_JOB_ID]
+no_bare = (len(bare_id_tokens) == 0)
+print("PASS D3 (falsifier): job_id does NOT appear as a bare token — 'run-job,' prefix is mandatory"
+      if no_bare else
+      "FAIL D3 (falsifier): job_id appears bare without 'run-job,' prefix: %r" % cmd_def)
+
+# D4 — --wait=false is present (non-blocking dispatch == the flight fix)
+wait_ok = ("--wait=false" in cmd_def)
+print("PASS D4: --wait=false present (non-blocking dispatch — the flight fix)"
+      if wait_ok else
+      "FAIL D4: --wait=false absent from argv: %r" % cmd_def)
+
+# D5 — default region is 'us-central1' when no region env is set
+region_idx = cmd_def.index("--region") if "--region" in cmd_def else -1
+region_val = cmd_def[region_idx + 1] if region_idx >= 0 else None
+region_ok = (region_val == "us-central1")
+print("PASS D5: default region is 'us-central1'" if region_ok else
+      "FAIL D5: default region is %r (expected 'us-central1')" % region_val)
+
+# D6 — no --project flag when GOOGLE_CLOUD_PROJECT is absent
+proj_absent_ok = ("--project" not in cmd_def)
+print("PASS D6: --project absent when GOOGLE_CLOUD_PROJECT unset"
+      if proj_absent_ok else
+      "FAIL D6: --project present even when GOOGLE_CLOUD_PROJECT unset: %r" % cmd_def)
+
+# ── build 2: custom job name + region + project ───────────────────────────────────────
+os.environ["HEIMDALL_CP_JOB_NAME"] = "my-custom-job"
+os.environ["HEIMDALL_CP_JOB_REGION"] = "europe-west1"
+os.environ["GOOGLE_CLOUD_PROJECT"] = "my-gcp-project"
+
+runner_cust = cp_jobrunner.CloudRunJobRunner()
+cmd_cust = runner_cust.build_command(TEST_JOB_ID)
+
+# D7 — custom job name propagates to the execute argv
+job_name_ok = (cmd_cust[4] == "my-custom-job")
+print("PASS D7: HEIMDALL_CP_JOB_NAME propagates to argv (my-custom-job)"
+      if job_name_ok else
+      "FAIL D7: job name in argv is %r (expected my-custom-job)" % cmd_cust[4])
+
+# D8 — region from HEIMDALL_CP_JOB_REGION propagates
+region_cust_idx = cmd_cust.index("--region") if "--region" in cmd_cust else -1
+region_cust = cmd_cust[region_cust_idx + 1] if region_cust_idx >= 0 else None
+region_cust_ok = (region_cust == "europe-west1")
+print("PASS D8: HEIMDALL_CP_JOB_REGION propagates to --region europe-west1"
+      if region_cust_ok else
+      "FAIL D8: --region is %r (expected europe-west1)" % region_cust)
+
+# D9 — project from GOOGLE_CLOUD_PROJECT propagates as --project
+proj_idx = cmd_cust.index("--project") if "--project" in cmd_cust else -1
+proj_val = cmd_cust[proj_idx + 1] if proj_idx >= 0 else None
+proj_ok = (proj_val == "my-gcp-project")
+print("PASS D9: GOOGLE_CLOUD_PROJECT propagates to --project my-gcp-project"
+      if proj_ok else
+      "FAIL D9: --project value is %r (expected my-gcp-project)" % proj_val)
+
+# D10 — the critical invariant holds for a DIFFERENT job_id: 'run-job,' prefix always fused.
+# Regression guard: if build_command ever splits the token or drops the subcommand for any
+# id, this catches it.
+ALT_ID = "job-00000000000000000000000000000000"
+cmd_alt = runner_cust.build_command(ALT_ID)
+try:
+    alt_args_idx = cmd_alt.index("--args")
+    alt_args_val = cmd_alt[alt_args_idx + 1]
+except ValueError:
+    alt_args_val = None
+alt_fused = (alt_args_val == "run-job,%s" % ALT_ID)
+print("PASS D10: invariant holds for alternate job_id — 'run-job,%s' fused" % ALT_ID
+      if alt_fused else
+      "FAIL D10: --args for alternate id is %r (run-job prefix dropped)" % alt_args_val)
+PYEOF
+
+# Run the argv assertions and map PASS/FAIL lines to the test's ok/bad counters.
+while IFS= read -r line; do
+  case "$line" in
+    PASS*)  ok  "${line#PASS }" ;;
+    FAIL*)  bad "${line#FAIL }" ;;
+  esac
+done < <("$PY" "$ARGV_PY" 2>&1)
+
 # ── verdict ──
 echo
 echo "============================================================"
