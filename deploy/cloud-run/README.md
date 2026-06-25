@@ -769,6 +769,54 @@ bash test/verify-flight-fix-dryrun.test.sh
 # Expect: "verify-flight-fix-dryrun: PASS" (exit 0)
 ```
 
+### One-off read-back probe for a single job (`get-job.sh` — the decisive distinguisher)
+
+`deploy/cloud-run/get-job.sh` sends the **exact same** signed `GET /jobs` that
+`verify-flight-fix.sh` STEP 5 sends — for **one** `job_id` — against the live
+service, and prints both the **raw HTTP response** and the **parsed `state`**. It is
+the complement to `heimdall-cp-inspect` (§8): `inspect` reads the Firestore doc
+**directly** (bypassing the service), while `get-job.sh` exercises the **service's
+own HTTP read-path** — so together they isolate *write-path/store* from
+*read-path/wire*. Use it when STEP 5 reads `state=None` for a job whose doc **has**
+`done`.
+
+The read contract it exercises (identical to STEP 5, audited against
+`cp_worker.status_route`): `job_id` travels in the request **body**
+(`{"job_id":...}`), which is exactly how `status_route` reads it (`_job_id_from` →
+`payload["job_id"]` first); the response is `{"job": {... "state": ... }}` (the
+folded `cp_jobstore.read_job` view), and the probe parses `state` from
+`b["job"]["state"]` — the same path the verify uses. (The dry run round-trips this
+exact shape across a fresh process and reads back `done`, so the send + parse are
+contract-correct.)
+
+```bash
+export BASE_URL="$(gcloud run services describe heimdall-control-plane \
+                     --region=us-central1 --format='value(status.url)')"
+export CLIENT_HAID="$(gcloud run services describe heimdall-control-plane \
+                       --region=us-central1 \
+                       --format='value(spec.template.spec.containers[0].env)' \
+                       | tr ',' '\n' | grep HEIMDALL_CP_SERVER_HAID | cut -d= -f2)"
+export PKI_SEED="$(gcloud secrets versions access latest --secret=cp-pki-key)"
+export ID_TOKEN="$(gcloud auth print-identity-token)"   # --no-allow-unauthenticated
+bash deploy/cloud-run/get-job.sh job-d8884
+```
+
+Read the verdict the probe prints:
+
+- **`DONE` (HTTP 200, `state=done`)** → the **service** returns `done`. The verify
+  parses this exact shape and the dry run proves the round-trip reads `done`, so an
+  earlier STEP-5 `None` was **not** a service or a parse bug — re-run the verify; any
+  residual `None` on a *fresh* job is timing (raise `STEP5_POLL_SECONDS`), not parse.
+- **`NONE` (HTTP 404 `no_such_job`, or 200 with `state=null`)** → the **service**
+  read-path cannot resolve `done` for that `job_id` though its doc has it (per §8) →
+  a **service-side** read-path / store issue (a fresh instance reading the wrong
+  home/store), **not** a verify bug. Cross-check with `heimdall-cp-inspect env` (§8C).
+- **`NONE` (HTTP 401)** → `CLIENT_HAID`/`PKI_SEED` is not the registered identity, or
+  the `ID_TOKEN` bearer is missing for a `--no-allow-unauthenticated` service.
+
+The probe talks **only HTTP**, contains **no secret literal**, and never prints the
+`PKI_SEED` (read in-process from the env, never argv).
+
 ---
 
 ## 8. Inspecting the Firestore doc directly (`heimdall-cp-inspect`)
