@@ -181,6 +181,155 @@ else
   echo "  (skipped C1 — needs crypto to generate a real seed)"
 fi
 
+# ── D. FIRESTORE-BACKED: diagnose is BACKEND-AWARE (no BackendUnavailable) ──────
+# THE PATH()-UNDER-FIRESTORE CLASS (the same break already fixed on the serving paths).
+# Several diagnose checks resolve store locations through a *_dir()/keys_path() accessor,
+# each of which routes to backend.path() — and FirestoreBackend RAISES BackendUnavailable
+# on path() by design (an external store has no local file to point at). So an operator who
+# runs `diagnose` against a firestore-backed deploy — exactly when they want to debug that
+# deploy — used to crash the run. This proves the fix: every check is backend-aware
+# (mirrors cp_diag._stores_reachable), so diagnose runs CLEAN under
+# HEIMDALL_STATE_BACKEND=firestore and reports a coherent verdict, never a crash.
+
+# D1: run cp_selfcheck.run_all() against a FAKE firestore backend (path() refused like the
+# real one; the read/get ops serve cleanly) — the hermetic unit, no firestore lib needed.
+# NONE of the checks may raise; the backend-probed CRITICAL checks pass on a healthy backend.
+# Mirrors cp-diag.test.sh's fake-backend harness.
+D1="$(LIB="$REPO/bin/lib" HEIMDALL_STATE_BACKEND=firestore "$PY" - <<'PYEOF'
+import os, sys, json
+sys.path.insert(0, os.environ["LIB"])
+import cp_state, cp_selfcheck
+# A fake firestore-shaped backend: path() is REFUSED exactly like FirestoreBackend.path(),
+# while the read/write/get ops serve a healthy (empty) external store. get_record returns a
+# populated key registry so pki_key passes — proving the registry is read THROUGH the backend
+# (get_record), not a local file (keys_path -> path()).
+class _Fake:
+    def _db(self): return None
+    def read_lines(self, rel): return []
+    def get_record(self, rel):
+        if rel.endswith("keys.json"):
+            return {"version": "1.0.0", "keys": {"haid-fs-dev": {"pubkey": "x", "owner": False}}}
+        return None
+    def list_names(self, rel_dir, *, suffix=""): return []
+    def exists(self, rel): return False
+    def append_line(self, rel, record, *, fsync=False): return True
+    def put_record(self, rel, record): return True
+    def path(self, rel):
+        raise cp_state.BackendUnavailable("FirestoreBackend has no local path for %r" % rel)
+cp_state.get_backend = lambda home=None, backend=None: _Fake()
+# run_all must NOT raise BackendUnavailable (the bug) — every check is backend-aware.
+report = cp_selfcheck.run_all()
+assert isinstance(report, dict) and report.get("checks"), report
+ids = {c["id"]: c for c in report["checks"]}
+# the four checks that used to crash through path() must now be present + structured.
+for cid in ("stores_reachable", "audit_writable", "pki_key", "config_sane"):
+    c = ids.get(cid)
+    assert c is not None, "missing check %s" % cid
+    assert isinstance(c["ok"], bool) and isinstance(c["status"], str) and c["status"], c
+# on a HEALTHY firestore backend the backend-probed critical checks PASS (the backend serves).
+for cid in ("stores_reachable", "audit_writable", "pki_key"):
+    assert ids[cid]["ok"], "%s should pass on a healthy firestore backend: %r" % (cid, ids[cid])
+# render_table must not raise either (it walks the same secret-free report).
+txt = cp_selfcheck.render_table(report)
+assert "PASS" in txt or "FAIL" in txt, txt
+print(json.dumps({"overall": report["overall"],
+                  "stores": ids["stores_reachable"]["status"],
+                  "pki": ids["pki_key"]["status"]}))
+PYEOF
+)"
+[ -n "$D1" ] && ok "D1 run_all() under a firestore backend runs WITHOUT BackendUnavailable, critical checks pass: $D1" \
+             || bad "D1 diagnose crashed or misreported under a firestore backend (path()-under-firestore class)"
+
+# D2: a firestore backend whose key registry is EMPTY → pki_key still FAILS critically
+# (the check reads the registry THROUGH get_record, so it inspects real backend state, not
+# canned) — and the run still does not crash. Proves the backend-aware path stays honest.
+D2="$(LIB="$REPO/bin/lib" HEIMDALL_STATE_BACKEND=firestore "$PY" - <<'PYEOF'
+import os, sys, json
+sys.path.insert(0, os.environ["LIB"])
+import cp_state, cp_selfcheck
+class _FakeEmpty:
+    def _db(self): return None
+    def read_lines(self, rel): return []
+    def get_record(self, rel): return None          # empty registry
+    def list_names(self, rel_dir, *, suffix=""): return []
+    def exists(self, rel): return False
+    def append_line(self, rel, record, *, fsync=False): return True
+    def put_record(self, rel, record): return True
+    def path(self, rel):
+        raise cp_state.BackendUnavailable("no local path")
+cp_state.get_backend = lambda home=None, backend=None: _FakeEmpty()
+report = cp_selfcheck.run_all()                      # must not raise
+pk = [c for c in report["checks"] if c["id"] == "pki_key"][0]
+assert not pk["ok"], "pki_key must fail on an empty firestore registry: %r" % pk
+assert report["overall"] == "fail" and "pki_key" in report["critical_failures"], report
+print(json.dumps({"pki_ok": pk["ok"], "overall": report["overall"]}))
+PYEOF
+)"
+[ -n "$D2" ] && ok "D2 empty firestore key registry → pki_key FAILS (reads via get_record, no crash): $D2" \
+             || bad "D2 pki_key did not honestly fail on an empty firestore registry"
+
+# D3: a firestore backend that CANNOT serve (read/get RAISE) → the backend-probed critical
+# checks FAIL — a genuine backend error is still surfaced, never swallowed into a false pass.
+D3="$(LIB="$REPO/bin/lib" HEIMDALL_STATE_BACKEND=firestore "$PY" - <<'PYEOF'
+import os, sys, json
+sys.path.insert(0, os.environ["LIB"])
+import cp_state, cp_selfcheck
+class _FakeBroken:
+    def _db(self): raise cp_state.BackendUnavailable("client cannot init")
+    def read_lines(self, rel): raise cp_state.BackendUnavailable("client cannot init")
+    def get_record(self, rel): raise cp_state.BackendUnavailable("client cannot init")
+    def list_names(self, rel_dir, *, suffix=""): raise cp_state.BackendUnavailable("client cannot init")
+    def exists(self, rel): return False
+    def append_line(self, rel, record, *, fsync=False): return False
+    def put_record(self, rel, record): return False
+    def path(self, rel): raise cp_state.BackendUnavailable("no local path")
+cp_state.get_backend = lambda home=None, backend=None: _FakeBroken()
+report = cp_selfcheck.run_all()                      # must not crash even on a broken backend
+ids = {c["id"]: c for c in report["checks"]}
+assert not ids["stores_reachable"]["ok"], "a broken backend must fail stores_reachable: %r" % ids["stores_reachable"]
+assert not ids["audit_writable"]["ok"], "a broken backend must fail audit_writable: %r" % ids["audit_writable"]
+print(json.dumps({"stores": ids["stores_reachable"]["ok"], "audit": ids["audit_writable"]["ok"]}))
+PYEOF
+)"
+[ -n "$D3" ] && ok "D3 a broken firestore backend → backend-probed checks FAIL (genuine error surfaced): $D3" \
+             || bad "D3 a broken firestore backend was wrongly reported reachable"
+
+# D4: the REAL CLI under HEIMDALL_STATE_BACKEND=firestore with the firestore lib import
+# BLOCKED (the incident shape: backend selected, google-cloud-firestore dep missing). The
+# `diagnose` command must still RUN and emit a JSON report — never an uncaught
+# BackendUnavailable traceback. Hermetic via a usercustomize meta_path blocker on PYTHONPATH
+# (mirrors cp-diag.test.sh G), so it does not depend on whether the lib is installed. The
+# point is narrow and strong: the operator's debug tool does not crash on the very deploy it
+# is meant to diagnose.
+BLOCKER="$WORK/blocker"
+mkdir -p "$BLOCKER"
+cat >"$BLOCKER/usercustomize.py" <<'PYEOF'
+import importlib.abc, sys
+class _Block(importlib.abc.MetaPathFinder):
+    def find_spec(self, name, path, target=None):
+        if name == "google.cloud.firestore" or name.startswith("google.cloud.firestore."):
+            raise ImportError("simulated missing google-cloud-firestore dep")
+        return None
+sys.meta_path.insert(0, _Block())
+PYEOF
+set +e
+PYTHONPATH="$BLOCKER${PYTHONPATH:+:$PYTHONPATH}" HEIMDALL_STATE_BACKEND=firestore \
+  "$CLI" diagnose --json --home "$HEIMDALL_HOME" >"$WORK/diagfs.json" 2>"$WORK/diagfs.err"
+DFS_RC=$?
+set -e
+if grep -qE "BackendUnavailable|Traceback" "$WORK/diagfs.err"; then
+  bad "D4 the real diagnose CLI crashed under HEIMDALL_STATE_BACKEND=firestore (BackendUnavailable/Traceback)"; cat "$WORK/diagfs.err" >&2
+else
+  "$PY" - "$WORK/diagfs.json" <<'PYEOF' && ok "D4 REAL CLI diagnose under firestore (dep blocked) RUNS, emits a report, no BackendUnavailable: $(cat "$WORK/diagfs.json" | tr -d '\n' | cut -c1-120)" || bad "D4 diagnose --json under firestore did not emit a structured report"
+import json, sys
+obj = json.load(open(sys.argv[1]))
+assert isinstance(obj, dict) and obj.get("checks"), obj
+ids = {c["id"] for c in obj["checks"]}
+for cid in ("stores_reachable", "audit_writable", "pki_key", "config_sane"):
+    assert cid in ids, "missing %s in %r" % (cid, sorted(ids))
+PYEOF
+fi
+
 echo
 echo "============================================================"
 printf "cp-diagnose: %d passed, %d failed\n" "$PASS" "$FAIL"

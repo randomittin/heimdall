@@ -122,34 +122,41 @@ def check_crypto_backend():
 
 
 def check_pki_key(home=None):
-    """The HAID->pubkey registry exists, loads, and holds >=1 key (§3). An empty or
-    absent registry means no instance can authenticate. CRITICAL. We COUNT entries
-    to prove presence — never read a pubkey byte, and private seeds never live here
-    at all (the instance keeps its seed locally)."""
+    """The HAID->pubkey registry loads and holds >=1 key (§3). An empty or absent
+    registry means no instance can authenticate. CRITICAL. We COUNT entries to prove
+    presence — never read a pubkey byte, and private seeds never live here at all (the
+    instance keeps its seed locally).
+
+    BACKEND-AWARE. The registry is read THROUGH the StateBackend (cp_auth._load_keys ->
+    get_record), so the COUNT works on any backend — firestore-durable or local. Only the
+    PATH the row reports is filesystem-specific: keys_path() routes to backend.path(),
+    which a non-filesystem backend (firestore) REFUSES (BackendUnavailable). So we resolve
+    the path BEST-EFFORT (omitting it under firestore — a path is the only filesystem-bound
+    field) and decide presence by the backend-served COUNT, not by os.path.isfile()."""
     import cp_auth
-    path = cp_auth.keys_path(home)
-    present = os.path.isfile(path)
+    import cp_state
+    # Path is filesystem-specific and purely informational; a non-filesystem backend has
+    # none. Resolve best-effort so the row keeps a path on local and simply omits it on
+    # firestore — never let path() refusal crash the check.
+    path = None
+    try:
+        path = cp_auth.keys_path(home)
+    except cp_state.BackendUnavailable:
+        path = None
+    # Presence + count come from the backend-served registry (get_record), which works on
+    # every backend. _load_keys folds an absent/corrupt/off-schema registry to {} keys.
     count = 0
     loadable = True
-    if present:
-        try:
-            # _load_keys never raises (returns an empty registry on bad JSON); we
-            # detect an unloadable/corrupt file by comparing against the on-disk
-            # presence: a present-but-unparseable file folds to an empty registry.
-            reg = cp_auth._load_keys(home)
-            count = len(reg.get("keys", {}))
-            if count == 0 and os.path.getsize(path) > 0:
-                # a non-empty file that yields zero keys is corrupt/off-schema.
-                loadable = False
-        except Exception:  # noqa: BLE001 — any unexpected read error → not loadable.
-            loadable = False
-    ok = present and loadable and count >= 1
-    if not present:
-        status = "no key registry yet — no instance identity is registered"
-    elif not loadable:
+    try:
+        reg = cp_auth._load_keys(home)
+        count = len(reg.get("keys", {}))
+    except Exception:  # noqa: BLE001 — any unexpected backend/read error → not loadable.
+        loadable = False
+    ok = loadable and count >= 1
+    if not loadable:
         status = "key registry present but unreadable/off-schema"
     elif count == 0:
-        status = "key registry present but empty — no registered identities"
+        status = "no registered identities — the key registry is empty or absent"
     else:
         status = "%d registered identit%s in the key registry" % (
             count, "y" if count == 1 else "ies")
@@ -164,12 +171,42 @@ def check_pki_key(home=None):
 
 
 def check_audit_writable(home=None):
-    """The append-only audit store dir (§9) is present/creatable + writable. The
-    audit log is the security + 3am-debug record; an unwritable store loses it.
-    CRITICAL. We probe by creating the dir + a throwaway temp file we remove — we
-    NEVER read an existing audit row (content stays in the store)."""
+    """The append-only audit store (§9) is reachable + writable. The audit log is the
+    security + 3am-debug record; an unwritable store loses it. CRITICAL.
+
+    BACKEND-AWARE (same path()-under-firestore class as stores_reachable). audit_dir() /
+    audit_path() resolve through the SELECTED backend's path(), which FirestoreBackend
+    REFUSES (BackendUnavailable) — there is no local audit dir to stat. So:
+
+      • LOCAL backend  — keep the writable-dir probe (create dir + a throwaway temp file
+        we remove; we NEVER read an existing audit row).
+      • Non-filesystem backend (firestore) — probe writability with a backend-safe
+        read-only op (read_lines of the audit rel proves the backend can serve the store)
+        rather than a local-dir stat. PASS when the backend answers; FAIL only on a real
+        backend error."""
     import cp_audit
-    ddir = cp_audit.audit_dir(home)
+    import cp_state
+    try:
+        ddir = cp_audit.audit_dir(home)
+        apath = cp_audit.audit_path(home)
+    except cp_state.BackendUnavailable:
+        # Non-filesystem backend: no local audit dir. Reachability is decided by a
+        # backend-safe read-only op (read_lines of the audit log rel -> [] when absent).
+        backend = cp_state.get_backend(home=home)
+        try:
+            backend.read_lines("audit/audit.ndjson")
+            ok, detail = True, ""
+        except Exception as exc:  # noqa: BLE001 — a real backend error -> not reachable.
+            ok, detail = False, type(exc).__name__
+        return _result(
+            "audit_writable",
+            critical=True,
+            ok=ok,
+            status=("firestore: backend probe authoritative, local-dir N/A — audit store "
+                    "reachable" if ok else
+                    "firestore audit store unreachable: %s" % detail),
+            remedy="ensure the selected state backend can initialize and serve, then re-run",
+        )
     ok, detail = _probe_writable(ddir)
     return _result(
         "audit_writable",
@@ -178,27 +215,70 @@ def check_audit_writable(home=None):
         status=("audit store is writable" if ok else
                 "audit store is NOT writable: %s" % detail),
         remedy="ensure HEIMDALL_HOME is set to a writable path and re-run",
-        path=cp_audit.audit_path(home),
+        path=apath,
     )
 
 
 def check_stores_reachable(home=None):
-    """Every durable cp_* state dir is creatable + writable: jobs (§4), schedules
-    (§6), approvals (§7), notify (§8), observe (§5). CRITICAL — these are the
-    substrate's persistence. We probe writability (create dir + temp file), never
-    read a stored record."""
-    import cp_approval
-    import cp_ingest
-    import cp_jobstore
-    import cp_notify
-    import cp_scheduler
-    dirs = {
-        "jobs": cp_jobstore.jobs_dir(home),
-        "schedules": cp_scheduler.schedules_dir(home),
-        "approvals": cp_approval.approvals_dir(home),
-        "notify": cp_notify.notify_dir(home),
-        "observe": cp_ingest.observe_dir(home),
+    """Every durable cp_* state store is reachable: jobs (§4), schedules (§6), approvals
+    (§7), notify (§8), observe (§5). CRITICAL — these are the substrate's persistence.
+
+    BACKEND-AWARE (mirrors cp_diag._stores_reachable). Each store's *_dir() accessor
+    resolves through the SELECTED backend's path() — and a non-filesystem backend
+    (FirestoreBackend) REFUSES path() by design (BackendUnavailable): there is no local dir
+    to probe for writability. That refusal is NOT an unreachable-store signal. So:
+
+      • LOCAL backend  — keep the byte-identical writable-dir probe (create dir + a
+        throwaway temp file we remove); never read a stored record.
+      • Non-filesystem backend (firestore) — do NOT call path()/*_dir(). Probe reachability
+        with a cheap, read-only StateBackend op (read_lines of a per-store health rel) that
+        proves the backend can SERVE without mutating it. PASS when the backend answers;
+        FAIL only on a genuine backend error (the op raises)."""
+    import cp_state
+    # rel keys for each store (relative to control-plane/) — used ONLY for the backend-safe
+    # read-only probe under a non-filesystem backend. Local keeps its writable-dir probe.
+    store_rels = {
+        "jobs": "jobs/_selfcheck_probe.ndjson",
+        "schedules": "schedules/_selfcheck_probe.ndjson",
+        "approvals": "approvals/_selfcheck_probe.ndjson",
+        "notify": "notify/_selfcheck_probe.ndjson",
+        "observe": "observe/_selfcheck_probe.ndjson",
     }
+    try:
+        import cp_approval
+        import cp_ingest
+        import cp_jobstore
+        import cp_notify
+        import cp_scheduler
+        dirs = {
+            "jobs": cp_jobstore.jobs_dir(home),
+            "schedules": cp_scheduler.schedules_dir(home),
+            "approvals": cp_approval.approvals_dir(home),
+            "notify": cp_notify.notify_dir(home),
+            "observe": cp_ingest.observe_dir(home),
+        }
+    except cp_state.BackendUnavailable:
+        # Non-filesystem backend: no local dirs to probe. Reachability is governed by a
+        # backend-safe read-only op per store (read_lines of an absent health rel -> []).
+        backend = cp_state.get_backend(home=home)
+        failed = []
+        for name, rel in sorted(store_rels.items()):
+            try:
+                backend.read_lines(rel)
+            except Exception as exc:  # noqa: BLE001 — a real backend error -> unreachable.
+                failed.append("%s (%s)" % (name, type(exc).__name__))
+        ok = not failed
+        return _result(
+            "stores_reachable",
+            critical=True,
+            ok=ok,
+            status=("firestore: backend probe authoritative, local-dir N/A — all %d state "
+                    "stores reachable: %s"
+                    % (len(store_rels), ", ".join(sorted(store_rels))))
+            if ok else
+            ("firestore backend unreachable for state store(s): %s" % "; ".join(failed)),
+            remedy="ensure the selected state backend can initialize and serve, then re-run",
+        )
     failed = []
     for name, ddir in sorted(dirs.items()):
         good, detail = _probe_writable(ddir)
@@ -256,12 +336,35 @@ def check_allowlist_sane():
 def check_config_sane(home=None):
     """HEIMDALL_HOME resolves to a usable absolute path and the control-plane subtree
     sits under it. Advisory — surfaces a mis-pointed home before it bites a check
-    above. Reports the resolved PATH (a path is not a secret), never env contents."""
+    above. Reports the resolved PATH (a path is not a secret), never env contents.
+
+    BACKEND-AWARE. The "control-plane tree sits under home" check is a LOCAL-FILESYSTEM
+    invariant: cp_audit.audit_dir() resolves the on-disk control-plane root through the
+    SELECTED backend's path(), which a non-filesystem backend (firestore) REFUSES
+    (BackendUnavailable). Under firestore there is no local control-plane tree to locate
+    under home, so the layout check does not apply — we assert only that home resolves and
+    report that the local-tree check is N/A. We still never crash on path() refusal."""
     import cp_audit
+    import cp_state
     import issue_queue
     base = home if home else issue_queue.heimdall_home()
     abspath = os.path.abspath(base) if base else ""
-    cp_root = os.path.dirname(cp_audit.audit_dir(home))  # …/control-plane
+    try:
+        cp_root = os.path.dirname(cp_audit.audit_dir(home))  # …/control-plane
+    except cp_state.BackendUnavailable:
+        # Non-filesystem backend: no local control-plane tree. The layout invariant is
+        # filesystem-only; on firestore it does not apply. Sanity = home resolves.
+        ok = bool(abspath)
+        return _result(
+            "config_sane",
+            critical=False,
+            ok=ok,
+            status=("home resolves; control-plane tree is firestore-backed "
+                    "(local-tree layout check N/A)" if ok else
+                    "HEIMDALL_HOME does not resolve to an absolute path"),
+            remedy="set HEIMDALL_HOME to a writable directory (or pass --home)",
+            path=abspath,
+        )
     under = bool(cp_root) and os.path.abspath(cp_root).startswith(abspath)
     ok = bool(abspath) and under
     return _result(
