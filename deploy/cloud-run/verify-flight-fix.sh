@@ -11,7 +11,8 @@
 # not the home. THIS script proves it END-TO-END against the live target:
 #
 #   1. SIGN + POST /jobs against $BASE_URL                 -> capture job_id (non-blocking).
-#   2. Poll signed GET /jobs (job_id in body) until done   -> the durable state is present.
+#   2. Poll signed GET /jobs?job_id=<id> until done        -> the durable state is present.
+#      (job_id in the QUERY, EMPTY body — the GFE-safe shape; a GET body is rejected 400.)
 #   2b.(gcloud-only) poll the heimdall-long-job EXECUTIONS  -> a succeeded execution carrying
 #      list for a SUCCEEDED execution carrying this job_id     this job_id is the AUTHORITATIVE
 #      -> the job dispatched + ran OUT-OF-PROCESS. run_v2 dispatch is ASYNC (the Job provisions
@@ -168,13 +169,23 @@ Run IAM Authorization: Bearer header for a --no-allow-unauthenticated service.
 
 CLI: remote_client.py <verb> [args...] -> a single JSON line on stdout.
   start <action_type> <task_id>   POST /jobs (signed) -> {status, latency, job_id, state}
-  status <job_id>                 GET  /jobs {job_id in body} (signed) -> {status, state, result, http_ok}
+  status <job_id>                 GET  /jobs?job_id=<id> (signed, EMPTY body) -> {status, state, result, http_ok}
+
+THE GFE-SAFE READ SHAPE. The status read is GET /jobs?job_id=<id> with an EMPTY
+body — the job_id rides the QUERY STRING, not the body. Google's GFE / Cloud Run
+ingress REJECTS a GET-with-a-body as malformed (HTTP 400, never reaching the
+container), so a body-carrying GET never even hit the service in prod (the 8th
+break). The signature covers the FULL path-with-query (canonical_message signs
+METHOD\\nPATH\\nBODY and PATH now includes ?job_id=<id>), so the read stays
+authenticated + tamper-evident. The POST /jobs start stays query-less + body-
+carrying (POST bodies are fine) -> its canonical bytes are unchanged.
 """
 import json
 import os
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 sys.path.insert(0, os.environ["LIB"])
@@ -188,14 +199,24 @@ ID_TOKEN = os.environ.get("ID_TOKEN") or ""
 
 def request(method, path, body=b"", *, timeout=20):
     """Sign (METHOD\\nPATH\\nBODY) with the seed for HAID and drive a real HTTPS request.
-    Returns (status, parsed_body_dict). A transport error returns (0, {"error": ...})."""
+    Returns (status, parsed_body_dict). A transport error returns (0, {"error": ...}).
+
+    `path` is the FULL path AS TRANSMITTED — including any ?query — because the signature
+    covers it (canonical_message signs METHOD\\nPATH\\nBODY with the query IN the path).
+    An EMPTY body is sent as a TRUE bodyless request (data=None) so a GFE-safe GET
+    /jobs?job_id=<id> carries no body — Google's GFE rejects a GET-with-a-body (HTTP 400)."""
     if isinstance(body, str):
         body = body.encode("utf-8")
     url = BASE + path
-    req = urllib.request.Request(url, data=body, method=method)
+    # data=None for an empty body -> a true bodyless request (no Content-Length framing),
+    # which is the GFE-safe shape for the GET read; a non-empty body is attached as data.
+    data = body if body else None
+    req = urllib.request.Request(url, data=data, method=method)
     req.add_header("X-Heimdall-HAID", HAID)
-    req.add_header("Content-Type", "application/json")
-    # The application-layer PKI signature (independent of Cloud Run's TLS/IAM).
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+    # The application-layer PKI signature (independent of Cloud Run's TLS/IAM). Signed over
+    # the full path-with-query + the (possibly empty) body — the server verifies the same.
     msg = K.canonical_message(method, path, body)
     req.add_header("X-Heimdall-Signature", K.sign(SEED, msg))
     # Optional Cloud Run IAM bearer (when the service is --no-allow-unauthenticated).
@@ -229,8 +250,10 @@ def main(argv):
                "job_id": b.get("job_id"), "state": b.get("state"),
                "error": b.get("error")}
     elif verb == "status":
-        body = json.dumps({"job_id": argv[1]}).encode()
-        st, b = request("GET", "/jobs", body)
+        # GFE-SAFE: job_id in the QUERY, EMPTY body. The signature covers the full
+        # path-with-query (request() signs canonical_message("GET", path, b"")).
+        path = "/jobs?" + urllib.parse.urlencode({"job_id": argv[1]})
+        st, b = request("GET", path, b"")
         job = b.get("job") or {}
         result = job.get("result")
         out = {"status": st,
@@ -701,18 +724,23 @@ fi
 # ──────────────────────────────────────────────────────────────────────────────
 say
 say "STEP 5 — cold-start read-back: signed GET /jobs for the SAME job_id [THE FLIGHT FIX]"
-# READ-PATH CONTRACT (audited). The read below sends job_id in the request BODY
-# ({"job_id":...}) and parses state from b["job"]["state"] — EXACTLY what the live
-# handler expects + emits: cp_worker.status_route reads the job_id via _job_id_from
-# (payload["job_id"] FIRST), folds the durable log (cp_jobstore.read_job -> fold_state),
-# and returns Response(200, {"job": folded}) where folded carries "state". The send +
-# parse are CONTRACT-CORRECT (the local dry run round-trips this exact shape across a
-# fresh process and reads back state=done). So if STEP 5 reads state=None for a job
-# whose Firestore doc HAS done, the divergence is NOT a verify-parse bug — it is the
-# live SERVICE read-path (a fresh instance reading the wrong home/store, or async
-# timing). The DECISIVE one-off distinguisher is deploy/cloud-run/get-job.sh: it sends
-# this identical signed GET /jobs for a single job_id and prints the RAW response + the
-# parsed state, so done-vs-None on the live wire pinpoints which side is at fault.
+# READ-PATH CONTRACT (audited). The read below is GFE-SAFE: it sends job_id in the
+# QUERY STRING (GET /jobs?job_id=<id>) with an EMPTY body, and parses state from
+# b["job"]["state"] — EXACTLY what the live handler expects + emits: cp_worker.status_route
+# reads the job_id via _job_id_from (request["query"]["job_id"] FIRST), folds the durable
+# log (cp_jobstore.read_job -> fold_state), and returns Response(200, {"job": folded}) where
+# folded carries "state". WHY the query, not the body: Google's GFE / Cloud Run ingress
+# REJECTS a GET-with-a-body as malformed (HTTP 400, never reaching the container) — the 8th
+# prod-only break — so the prior body-based read never even hit the service. The signature
+# covers the FULL path-with-query (canonical_message signs METHOD\nPATH\nBODY with the query
+# IN the path), so the read stays authenticated + tamper-evident. The send + parse are
+# CONTRACT-CORRECT (the local dry run round-trips this exact query shape across a fresh
+# process and reads back state=done). So if STEP 5 reads state=None for a job whose Firestore
+# doc HAS done, the divergence is NOT a verify-parse bug — it is the live SERVICE read-path
+# (a fresh instance reading the wrong home/store, or async timing). The DECISIVE one-off
+# distinguisher is deploy/cloud-run/get-job.sh: it sends this identical signed GET
+# /jobs?job_id=<id> for a single job_id and prints the RAW response + the parsed state, so
+# done-vs-None on the live wire pinpoints which side is at fault.
 if [ "$EXEC_SUCCEEDED" = "yes" ]; then
   say "  STEP 2b confirmed the execution SUCCEEDED — polling up to ${STEP5_POLL_SECONDS}s for the"
   say "  terminal 'done' write to become visible in Firestore + read back from the FRESH instance."
