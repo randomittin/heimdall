@@ -311,53 +311,30 @@ echo
 export HEIMDALL_STATE_BACKEND="firestore"
 
 # ============================================================================
-# PART A — run-job (job-instance) writes `done` to the EXACT doc the service reads.
+# PART A — run-job (job-instance) writes "done" to the EXACT doc the service reads.
 # ============================================================================
 echo "PART A — run-job (job-instance env+home) -> done -> fresh service-instance reads done"
 
-# Seed a QUEUED job via the SERVICE-SIDE create path (the rel the service writes/reads). We use
-# an allowlisted no-op action so run_job drives it straight to done with no external effect.
+# The allowlisted action that drives a queued job straight to done with NO external GCP effect —
+# the SAME 'run-task-X' (+ task_id) seed cp-job-execution and cp-durability both prove reaches
+# done (requires_gate=False, isolated=True). We reuse their proven seed verbatim rather than
+# discovering an action at runtime (the prior ALLOWED_ACTIONS probe was wrong: the real registry
+# is cp_allowlist.ALLOWLIST). task_id is the bounded id-shaped slug run-task-X validates.
+ACTION_TYPE="run-task-X"
+TASK_ID="writeread-job"
+
+# Seed a QUEUED job via the SERVICE-SIDE create path (the rel the service writes/reads). create_job
+# writes the genesis queued line via the backend the read path later folds (cp_jobstore.read_job).
 SEED_PY="$EXT/seed.py"
 cat >"$SEED_PY" <<'PYEOF'
 import os, sys
 sys.path.insert(0, os.environ["LIB"])
 import cp_jobstore as J
 home = os.environ["HEIMDALL_HOME"]
-# the service-side create path: create_job writes the genesis queued line via the backend rel
-# the read path later folds. action_type must be allowlisted (resolve to a real handler).
-jid = J.create_job(os.environ["ACTION_TYPE"], {}, instance_haid="haid:service", home=home)
+jid = J.create_job(os.environ["ACTION_TYPE"], {"task_id": os.environ["TASK_ID"]},
+                   instance_haid="haid:service", home=home)
 print(jid or "NONE")
 PYEOF
-
-# Discover an allowlisted action that resolves to a registered handler (so run_job reaches done,
-# not an ActionRefused). We ask the substrate itself rather than hard-coding an action name.
-PICK_PY="$EXT/pick_action.py"
-cat >"$PICK_PY" <<'PYEOF'
-import os, sys
-sys.path.insert(0, os.environ["LIB"])
-import cp_allowlist, cp_handlers
-# find an allowlisted action whose handler is registered and which validates with empty params.
-for action in getattr(cp_allowlist, "ALLOWED_ACTIONS", {}) or {}:
-    try:
-        plan = cp_allowlist.validate(action, {})
-    except Exception:
-        continue
-    try:
-        cp_handlers.resolve(plan["handler"])
-    except Exception:
-        continue
-    print(action)
-    break
-else:
-    print("NONE")
-PYEOF
-ACTION_TYPE="$("$PY" "$PICK_PY" 2>/dev/null | tr -d '[:space:]')"
-if [ -z "$ACTION_TYPE" ] || [ "$ACTION_TYPE" = "NONE" ]; then
-  bad "A0 could not find an allowlisted action with a registered handler validating empty params"
-  ACTION_TYPE=""
-else
-  ok "A0 picked allowlisted action '$ACTION_TYPE' (validates + handler registered) for the seed job"
-fi
 
 # The READER: the GET /jobs read path (cp_jobstore.read_job == the fold status_route calls),
 # run in a SEPARATE process with the SERVICE-INSTANCE env+home.
@@ -371,57 +348,102 @@ folded = J.read_job(sys.argv[1], home)
 print("MISSING" if not folded else "FOUND|%s" % folded.get("state"))
 PYEOF
 
-if [ -n "$ACTION_TYPE" ]; then
-  # (1) SERVICE creates the queued job (service env + service home).
-  JID="$(HEIMDALL_HOME="$HOME_SVC" ACTION_TYPE="$ACTION_TYPE" "$PY" "$SEED_PY" 2>"$EXT/seed.err" | tr -d '[:space:]')"
-  if [ -n "$JID" ] && [ "$JID" != "NONE" ]; then
-    ok "A1 service created queued job ($JID) via create_job (service home, firestore)"
+# ── A1 service creates the queued job (service env: the SHARED storage identity + service home) ──
+JID="$(HEIMDALL_HOME="$HOME_SVC" ACTION_TYPE="$ACTION_TYPE" TASK_ID="$TASK_ID" \
+       "$PY" "$SEED_PY" 2>"$EXT/seed.err" | tr -d '[:space:]')"
+if [ -n "$JID" ] && [ "$JID" != "NONE" ]; then
+  ok "A1 service created queued job ($JID) via create_job (service home, firestore, action=$ACTION_TYPE)"
+else
+  bad "A1 service failed to create the seed job"; cat "$EXT/seed.err" >&2
+  JID=""
+fi
+
+# ── A2 the JOB-INSTANCE drives it to done with the REAL run-job CLI (the EXACT Cloud Run Job
+#    container command). We ARE a Cloud Run Job (K_SERVICE set). HEIMDALL_JOB_RUNNER=subprocess
+#    would re-dispatch, so the run-job subcommand runs DIRECTLY. The job-instance gets a DIFFERENT
+#    ephemeral home than the seeding step (no shared local disk — they agree ONLY via the external
+#    store's doc identity) BUT the SAME storage identity (HEIMDALL_FIRESTORE_ROOT/PROJECT, inherited
+#    from the top-of-file export) — this is the CORRECT deploy the dispatch env-override guarantees. ──
+if [ -n "$JID" ]; then
+  K_SERVICE="cp-long-job" HEIMDALL_HOME="$HOME_JOB" \
+    "$CLI" run-job "$JID" --home "$HOME_JOB" --actor "haid:job-instance" \
+    >"$EXT/runjob.out" 2>"$EXT/runjob.err"
+  RUNJOB_RC=$?
+  if [ "$RUNJOB_RC" -eq 0 ]; then
+    ok "A2 run-job (job-instance home, K_SERVICE set, SAME storage identity) drove $JID to done — exit 0 (done reached)"
   else
-    bad "A1 service failed to create the seed job"; cat "$EXT/seed.err" >&2
+    bad "A2 run-job exited $RUNJOB_RC (expected 0 == done). stderr:"; tail -5 "$EXT/runjob.err" >&2
   fi
 
-  # (2) the JOB-INSTANCE drives it with the REAL run-job CLI — K_SERVICE set (we ARE a Cloud Run
-  #     Job), HEIMDALL_JOB_RUNNER=subprocess would re-dispatch, so we run the run-job subcommand
-  #     DIRECTLY (the exact command the Cloud Run Job container's entrypoint runs). A DIFFERENT
-  #     ephemeral home than the seeding step proves the job-instance and service-instance share
-  #     NO local disk — they can only agree via the external store's doc identity.
-  if [ -n "${JID:-}" ] && [ "$JID" != "NONE" ]; then
-    set +e
-    K_SERVICE="cp-long-job" HEIMDALL_HOME="$HOME_JOB" \
-      "$CLI" run-job "$JID" --home "$HOME_JOB" --actor "haid:job-instance" \
-      >"$EXT/runjob.out" 2>"$EXT/runjob.err"
-    RUNJOB_RC=$?
-    set -e 2>/dev/null || true
-    if [ "$RUNJOB_RC" -eq 0 ]; then
-      ok "A2 run-job (job-instance home, K_SERVICE set) drove $JID to done — exit 0 (done reached)"
-    else
-      bad "A2 run-job exited $RUNJOB_RC (expected 0 == done). stderr:"; tail -5 "$EXT/runjob.err" >&2
-    fi
-
-    # (3) THE CARDINAL — a FRESH service-instance (service env + a home that is NOT the job's home)
-    #     reads the job via the GET /jobs read path. It MUST see state=done. This is the half the
-    #     incident lost: execution succeeded yet the service never read done.
-    rm -rf "$HOME_SVC"   # the service instance that reads is fresh (scale-to-zero) — new home.
-    READ_RES="$(HEIMDALL_HOME="$HOME_SVC" "$PY" "$READ_PY" "$JID" 2>"$EXT/read.err")"
-    READ_FOUND="${READ_RES%%|*}"
-    READ_STATE="$(echo "$READ_RES" | cut -d'|' -f2)"
+  # ── A3 THE CARDINAL — a FRESH service-instance (service env + a home that is NOT the job's home)
+  #    reads the job via the GET /jobs read path. It MUST see state=done. This is the half the
+  #    incident lost: execution succeeded yet the service never read done. The service and the job
+  #    shared the SAME storage identity, so the doc is shared and done is cross-readable. ──
+  rm -rf "$HOME_SVC"   # the service instance that reads is fresh (scale-to-zero) — new home.
+  READ_RES="$(HEIMDALL_HOME="$HOME_SVC" "$PY" "$READ_PY" "$JID" 2>"$EXT/read.err")"
+  READ_FOUND="${READ_RES%%|*}"
+  READ_STATE="$(echo "$READ_RES" | cut -d'|' -f2)"
+  if [ "$READ_FOUND" = "FOUND" ] && [ "$READ_STATE" = "done" ]; then
     if [ "$MODE" = "emulator" ]; then
-      if [ "$READ_FOUND" = "FOUND" ] && [ "$READ_STATE" = "done" ]; then
-        ok "A3 (CARDINAL) fresh service-instance reads state=done from the SAME doc run-job wrote (real client)"
-      else
-        bad "A3 (CARDINAL) service-instance did NOT read done (got '$READ_RES') — run-job wrote a doc the service does not read"
-        cat "$EXT/read.err" >&2
-      fi
+      ok "A3 (CARDINAL) fresh service-instance reads state=done from the SAME doc run-job wrote (real client)"
     else
-      if [ "$READ_FOUND" = "FOUND" ] && [ "$READ_STATE" = "done" ]; then
-        ok "A3 fresh service-instance reads state=done (fake — cannot prove real-client doc resolution)"
-        note "A3 ran under the in-process FAKE: it cannot prove the REAL client's project/database doc resolution. Run with a Firestore emulator (Java 21+) to prove the real-client path."
-      else
-        bad "A3 service-instance did NOT read done under the fake (got '$READ_RES')"
-        cat "$EXT/read.err" >&2
-      fi
+      ok "A3 (CARDINAL) fresh service-instance reads state=done from the SAME doc run-job wrote (fake)"
+      note "A3 ran under the in-process FAKE: it cannot prove the REAL client's project/database doc resolution. Run with a Firestore emulator (Java 21+) to prove the real-client path."
     fi
+  else
+    bad "A3 (CARDINAL) service-instance did NOT read done (got '$READ_RES') — run-job wrote a doc the service does not read"
+    cat "$EXT/read.err" >&2
   fi
+fi
+
+# ── A4/A5 THE FALSIFIER (the bug would bite WITHOUT the dispatch env-override) ───────────────────
+#    Prove the gate is real: seed a SECOND job, then run-job it under a DIFFERENT storage identity
+#    (a DIFFERENT HEIMDALL_FIRESTORE_ROOT — the doc's root-collection coordinate) than the service
+#    reads with. This is EXACTLY the pre-fix prod situation: the Job's baked env drifted from the
+#    service's, so the Job's `done` lands in a doc the service never polls. The fresh service-
+#    instance reading with ITS (the original) identity MUST then NOT see done — the write/read doc
+#    MISMATCH. Contrast with A3 (SAME identity => readable): that contrast is the falsifier that
+#    proves the dispatch env-override (same identity by construction) closes the prod bug.
+#    NOTE: under the FAKE only HEIMDALL_FIRESTORE_ROOT varies the doc (the fake Client ignores
+#    project/database); under the emulator project/database/root all vary the doc. Varying ROOT is
+#    the mode-independent falsifier, so we vary ROOT (and DATABASE too, harmless under the fake).
+MISMATCH_ROOT="writeread_gate_DRIFTED"
+MISMATCH_DB="cp-drifted-db"
+# Model the incident faithfully: the Job runs end-to-end under ITS OWN (drifted) baked identity —
+# it seeds-then-drives the job to done in the DRIFTED doc (run-job exits 0, execution SUCCEEDS) —
+# while the SERVICE reads with ITS identity. So the genesis AND the done both land under the
+# drifted root; the service, polling its own root, sees neither. (Seeding under the drifted root
+# is what lets the Job find+drive the job; the bug is purely that its done-doc != the service's
+# read-doc. A pre-fix args-only dispatch leaves exactly this drift in place.)
+JID2="$(HEIMDALL_HOME="$HOME_JOB" ACTION_TYPE="$ACTION_TYPE" TASK_ID="$TASK_ID" \
+        HEIMDALL_FIRESTORE_ROOT="$MISMATCH_ROOT" HEIMDALL_FIRESTORE_DATABASE="$MISMATCH_DB" \
+        "$PY" "$SEED_PY" 2>"$EXT/seed2.err" | tr -d '[:space:]')"
+if [ -n "$JID2" ] && [ "$JID2" != "NONE" ]; then
+  # run-job under the SAME DRIFTED identity it was seeded under (the Job's baked env, disagreeing
+  # with the service — the mismatch the dispatch env-override exists to eliminate).
+  K_SERVICE="cp-long-job" HEIMDALL_HOME="$HOME_JOB" \
+    HEIMDALL_FIRESTORE_ROOT="$MISMATCH_ROOT" HEIMDALL_FIRESTORE_DATABASE="$MISMATCH_DB" \
+    "$CLI" run-job "$JID2" --home "$HOME_JOB" --actor "haid:job-instance" \
+    >"$EXT/runjob2.out" 2>"$EXT/runjob2.err"
+  RUNJOB2_RC=$?
+  # the Job DID reach done in ITS (drifted) doc — run-job exits 0, exactly like the incident
+  # (execution SUCCEEDED). The bug is not that the job failed; it is that done is in the WRONG doc.
+  if [ "$RUNJOB2_RC" -eq 0 ]; then
+    ok "A4 (falsifier setup) run-job under a DRIFTED identity also exited 0 (the Job reached done in ITS OWN doc — execution succeeded, just like the incident)"
+  else
+    bad "A4 (falsifier setup) drifted run-job exited $RUNJOB2_RC (expected 0 == done in its own doc)"; tail -5 "$EXT/runjob2.err" >&2
+  fi
+  # the fresh service-instance reads with ITS identity (the original ROOT/DB, NOT the drifted one).
+  rm -rf "$HOME_SVC"
+  READ_RES2="$(HEIMDALL_HOME="$HOME_SVC" "$PY" "$READ_PY" "$JID2" 2>"$EXT/read2.err")"
+  READ_STATE2="$(echo "$READ_RES2" | cut -d'|' -f2)"
+  if [ "$READ_RES2" = "MISSING" ] || [ "$READ_STATE2" != "done" ]; then
+    ok "A5 (CARDINAL falsifier) with a DRIFTED job identity the fresh service-instance does NOT read done (got '$READ_RES2') — done landed in a doc the service never polls. THIS is the incident; the dispatch env-override (A3, SAME identity => done readable) is what prevents it"
+  else
+    bad "A5 (CARDINAL falsifier) the service read done DESPITE a drifted storage identity (got '$READ_RES2') — the gate cannot distinguish a shared doc from a mismatched one; the falsifier is not real"
+  fi
+else
+  bad "A4 (falsifier setup) failed to seed the second (drift) job"; cat "$EXT/seed2.err" >&2
 fi
 
 echo
@@ -497,7 +519,8 @@ echo
 # ── verdict ──────────────────────────────────────────────────────────────────
 echo "============================================================"
 echo "cp-job-writeread ($MODE): $PASS passed, $FAIL failed"
-echo "  A: run-job's `done` is cross-readable by a fresh service-instance (the doc is shared)"
+echo "  A: run-job's done is cross-readable by a fresh service-instance (the doc is shared);"
+echo "     a DRIFTED identity is NOT (falsifier) — the dispatch env-override prevents the drift"
 echo "  B: the dispatch propagates the storage identity, so write doc == read doc by construction"
 echo "============================================================"
 [ "$FAIL" -eq 0 ] || exit 1
