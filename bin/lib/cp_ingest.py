@@ -60,7 +60,14 @@ if _HERE not in sys.path:
 import cp_audit     # REUSE the §9 audit writer — one `ingest` row per accepted batch.
 import cp_auth      # the Identity shape the verified route receives (§3).
 import cp_server    # REUSE register_route + Response — the registration seam (§10).
-import issue_queue  # REUSE heimdall_home() — the store root, never re-derived.
+import cp_state     # the pluggable persistence backend (Wave 0). The observe store
+                   # writes/reads its per-instance NDJSON THROUGH a StateBackend
+                   # (get_backend) so the same flush-only append / tolerant scan /
+                   # sorted enumeration becomes durable on Cloud Run (Wave 2
+                   # FirestoreBackend) WITHOUT changing this store. The local backend is
+                   # byte-identical to the prior NDJSON-to-HEIMDALL_HOME path, and it
+                   # owns heimdall_home() resolution + the control-plane/ root (so this
+                   # store no longer needs issue_queue directly).
 import telemetry    # REUSE build_event + _scrub — no-secret-by-construction (§5/§7).
 
 # ── store layout (partitioned by the VERIFIED instance HAID — §5) ──────────────
@@ -91,20 +98,54 @@ def _slug(haid):
     return slug or "unknown"
 
 
+# ── store location + backend (the persistence SEAM — Wave 0/1) ─────────────────
+#
+# The observe store addresses its bytes by paths RELATIVE to
+# ${HEIMDALL_HOME}/control-plane/ (the StateBackend rel namespace): the observe root is
+# "observe/", one instance's partition is "observe/<slug>/", one instance's append-only
+# log is "observe/<slug>/events.ndjson". The backend owns the home root + makedirs + the
+# byte shape; observe_dir/instance_dir/instance_store_path remain the public absolute-
+# path accessors (now derived from the backend's path(), so they stay byte-identical to
+# the prior layout and the cp suites' on-disk reads keep working).
+
+# the rel sub-dir all instance partitions live under, within control-plane/.
+_OBSERVE_REL = "observe"
+
+# the per-instance log file name (one append-only NDJSON per partition).
+_EVENTS_FILE = "events.ndjson"
+
+
+def _backend(home=None):
+    """The StateBackend for the observe store (HEIMDALL_STATE_BACKEND, default local).
+    `home` pins the store root exactly as every observe accessor's `home=` arg always
+    has (the backend re-derives heimdall_home when home is None)."""
+    return cp_state.get_backend(home=home)
+
+
+def _instance_rel(instance_haid):
+    """The store-relative dir of one instance's partition: observe/<slug>/."""
+    return os.path.join(_OBSERVE_REL, _slug(instance_haid))
+
+
+def _events_rel(instance_haid):
+    """The store-relative path of one instance's log: observe/<slug>/events.ndjson."""
+    return os.path.join(_instance_rel(instance_haid), _EVENTS_FILE)
+
+
 def observe_dir(home=None):
-    """The observe store root: ${HEIMDALL_HOME}/control-plane/observe/."""
-    base = home if home else issue_queue.heimdall_home()
-    return os.path.join(base, "control-plane", "observe")
+    """The observe store root: ${HEIMDALL_HOME}/control-plane/observe/ (the backend's
+    absolute path for the observe rel-dir — unchanged on the local backend)."""
+    return _backend(home).path(_OBSERVE_REL)
 
 
 def instance_dir(instance_haid, home=None):
     """One instance's partition dir under the observe store (slugged HAID)."""
-    return os.path.join(observe_dir(home), _slug(instance_haid))
+    return _backend(home).path(_instance_rel(instance_haid))
 
 
 def instance_store_path(instance_haid, home=None):
     """Absolute path to one instance's append-only observe NDJSON log."""
-    return os.path.join(instance_dir(instance_haid, home), "events.ndjson")
+    return _backend(home).path(_events_rel(instance_haid))
 
 
 # ── the no-secret boundary: re-run build_event server-side per pushed line (§5) ─
@@ -141,22 +182,27 @@ def _rebuild_event(line):
 
 def _append_events(instance_haid, events, home=None):
     """Append already-rebuilt (clean) event dicts to the instance's observe NDJSON log
-    (one open('a') + one line each + flush — mirrors telemetry._append). Returns the
+    (one compact JSON line each + flush — mirrors telemetry._append). Returns the
     count written, or 0 on any IO failure (the ingest degrades to a dropped batch
-    rather than crashing the request — the handler surfaces that)."""
+    rather than crashing the request — the handler surfaces that).
+
+    Routed THROUGH the StateBackend (Wave 1): append_line writes the SAME compact
+    json.dumps(sort_keys=True, separators=(",", ":")) line and the SAME flush-only
+    discipline (fsync=False — the observe log flushes only, never fsync'd, exactly as
+    before; only the §4 jobstore uses fsync=True). The backend owns the makedirs + the
+    control-plane/ root, so the bytes written are byte-identical to the prior path. A
+    failed line degrades the whole batch to 0 (the prior open-mid-write OSError did the
+    same — a partial write was reported as a dropped batch, never a crash)."""
     if not events:
         return 0
-    try:
-        ldir = instance_dir(instance_haid, home)
-        os.makedirs(ldir, exist_ok=True)
-        path = os.path.join(ldir, "events.ndjson")
-        with open(path, "a", encoding="utf-8") as fh:
-            for ev in events:
-                fh.write(json.dumps(ev, sort_keys=True, separators=(",", ":")) + "\n")
-            fh.flush()
-        return len(events)
-    except OSError:
-        return 0
+    rel = _events_rel(instance_haid)
+    backend = _backend(home)
+    written = 0
+    for ev in events:
+        if not backend.append_line(rel, ev, fsync=False):
+            return 0
+        written += 1
+    return written
 
 
 # ── the pure ingest boundary (re-run build_event → store → audit — §5/§9) ──────
@@ -279,15 +325,17 @@ def register(*, home=None):
 def stored_instances(home=None):
     """The list of instance partition slugs present in the observe store (the devs
     who have pushed). Read-only; an absent store yields [] (honest empty). The
-    dashboard groups its cross-dev aggregate over these."""
-    root = observe_dir(home)
-    try:
-        names = sorted(
-            n for n in os.listdir(root)
-            if os.path.isdir(os.path.join(root, n))
-        )
-    except OSError:
-        return []
+    dashboard groups its cross-dev aggregate over these.
+
+    Routed THROUGH the StateBackend (Wave 1): list_names returns the SAME sorted
+    enumeration of names directly under observe/. We keep the dir-only guard (a
+    partition is a directory holding events.ndjson) so a stray non-dir entry is
+    skipped exactly as before — byte-identical to the prior listdir+isdir filter."""
+    backend = _backend(home)
+    names = []
+    for name in backend.list_names(_OBSERVE_REL):
+        if os.path.isdir(backend.path(os.path.join(_OBSERVE_REL, name))):
+            names.append(name)
     return names
 
 
@@ -295,23 +343,10 @@ def read_instance(instance_slug, home=None):
     """Stream one instance partition's stored events (the dashboard's per-dev scan).
     `instance_slug` is a directory slug from stored_instances (already partition-safe).
     Tolerant: a bad line is skipped, an absent partition yields []. Read-only — never
-    writes, never executes."""
-    out = []
-    path = os.path.join(observe_dir(home), _slug(instance_slug), "events.ndjson")
-    if not os.path.isfile(path):
-        return out
-    try:
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
-            for raw in fh:
-                line = raw.strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except (ValueError, TypeError):
-                    continue
-                if isinstance(obj, dict):
-                    out.append(obj)
-    except OSError:
-        return out
-    return out
+    writes, never executes.
+
+    Routed THROUGH the StateBackend (Wave 1): read_lines returns the SAME tolerant,
+    store-ordered scan (bad line skipped, absent -> []) the observe store has always
+    done — the dashboard aggregate semantics are unchanged. _events_rel applies the
+    same _slug, so the partition addressed is byte-identical to the prior path."""
+    return _backend(home).read_lines(_events_rel(instance_slug))
