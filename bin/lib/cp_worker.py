@@ -411,15 +411,40 @@ def _json_body(request):
 
 
 def _job_id_from(request, payload):
-    """Resolve the target job_id from the request path (/jobs/<id>/<verb>) or the body.
-    Path-first so a REST shape works; body fallback for a direct call."""
+    """Resolve the target job_id, in this precedence order:
+      1. the QUERY STRING — request["query"]["job_id"], i.e. GET /jobs?job_id=<id>.
+         This is the GFE-SAFE read shape: Google's GFE / Cloud Run ingress REJECTS a
+         GET-with-a-body (HTTP 400, never reaches the container), so a deployed signed
+         read MUST carry job_id in the query, NOT the body. The server signs+verifies
+         the full path-with-query, so the query'd job_id is authenticated + tamper-
+         evident. The parsed query is handed in by cp_server._request_dict; when the
+         server didn't parse it (a direct/in-process call), we parse the request path's
+         own ?query as a fallback so the query shape resolves either way.
+      2. the BODY — payload["job_id"]. Back-compat for a direct/local call (and the
+         legacy body-based GET that local test HTTP servers still accept).
+      3. the REST PATH — /jobs/<id>/<verb>. The path-shaped form.
+    A GFE-safe GET /jobs?job_id=<id> with an EMPTY body resolves via (1)."""
+    # 1. the query string (the GFE-safe shape) — server-parsed first, then path-parsed.
+    if isinstance(request, dict):
+        q = request.get("query")
+        if isinstance(q, dict) and q.get("job_id"):
+            return q.get("job_id")
+    path = request.get("path") if isinstance(request, dict) else None
+    if isinstance(path, str) and "?" in path:
+        from urllib.parse import urlsplit, parse_qs
+        vals = parse_qs(urlsplit(path).query).get("job_id")
+        if vals and vals[0]:
+            return vals[0]
+    # 2. the body (back-compat for a direct/local call).
     if isinstance(payload, dict) and payload.get("job_id"):
         return payload.get("job_id")
-    path = request.get("path") if isinstance(request, dict) else None
-    if isinstance(path, str) and path.startswith("/jobs/"):
-        rest = path[len("/jobs/"):].strip("/").split("/")
-        if rest and rest[0]:
-            return rest[0]
+    # 3. the REST path (/jobs/<id>/<verb>) — strip any ?query before splitting.
+    if isinstance(path, str):
+        bare = path.split("?", 1)[0]
+        if bare.startswith("/jobs/"):
+            rest = bare[len("/jobs/"):].strip("/").split("/")
+            if rest and rest[0]:
+                return rest[0]
     return None
 
 

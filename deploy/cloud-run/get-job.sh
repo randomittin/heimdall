@@ -10,9 +10,10 @@
 #   (b) the live SERVICE's GET /jobs read-path returns None for a job whose durable
 #       record says done (a service-side bug, the cp_worker/jobstore read path).
 # This probe is the distinguisher. It reuses the EXACT signer + request shape the
-# verify uses (cp_auth.canonical_message + cp_auth.sign; job_id in the request BODY;
-# the same X-Heimdall-HAID / X-Heimdall-Signature headers; the optional Cloud Run IAM
-# bearer), so its result is what the verify's STEP-5 read sees on the wire:
+# verify uses (cp_auth.canonical_message + cp_auth.sign; job_id in the QUERY STRING with
+# an EMPTY body — the GFE-safe GET /jobs?job_id=<id>; the same X-Heimdall-HAID /
+# X-Heimdall-Signature headers; the optional Cloud Run IAM bearer), so its result is what
+# the verify's STEP-5 read sees on the wire:
 #
 #   * RAW response shows {"job": {... "state":"done" ...}}  -> the SERVICE returns done.
 #     Then any None the verify printed was a VERIFY-SIDE parse artifact — but the verify
@@ -73,9 +74,12 @@ BASE_URL="${BASE_URL%/}"               # strip a trailing slash for clean concat
 ID_TOKEN="${ID_TOKEN:-}"               # optional Cloud Run IAM bearer.
 
 # ── THE REUSED HAID-SIGNING HTTP CLIENT (the shipped cp_auth signer over urllib) ─────
-# Byte-for-byte the SAME signed GET /jobs verify-flight-fix.sh STEP 5 sends: job_id in
-# the request BODY, signature over canonical_message("GET","/jobs",body). The seed is
-# read from PKI_SEED in-process (never an argv — argv shows in `ps`) and never printed.
+# Byte-for-byte the SAME signed GET /jobs verify-flight-fix.sh STEP 5 sends: the GFE-SAFE
+# shape — job_id in the QUERY STRING (GET /jobs?job_id=<id>) with an EMPTY body, signature
+# over canonical_message("GET","/jobs?job_id=<id>",b""). Google's GFE / Cloud Run ingress
+# REJECTS a GET-with-a-body (HTTP 400, never reaching the container), so the read MUST carry
+# job_id in the query, not the body. The seed is read from PKI_SEED in-process (never an
+# argv — argv shows in `ps`) and never printed.
 WORK="$(mktemp -d -t "get-job.$(printf 'X%.0s' 1 2 3 4 5 6)")"
 cleanup() { rm -rf "$WORK"; }
 trap cleanup EXIT
@@ -84,6 +88,11 @@ PROBE="$WORK/probe_client.py"
 cat >"$PROBE" <<'PYEOF'
 """probe_client.py — the SAME signed GET /jobs that verify-flight-fix.sh STEP 5 sends,
 isolated to ONE job_id, printing BOTH the raw HTTP body and the parsed state.
+
+THE GFE-SAFE SHAPE: GET /jobs?job_id=<id> with an EMPTY body — the job_id rides the
+QUERY STRING, not the body, because Google's GFE / Cloud Run ingress REJECTS a
+GET-with-a-body (HTTP 400, never reaching the container). The signature covers the FULL
+path-with-query (canonical_message signs METHOD\\nPATH\\nBODY, PATH incl. ?job_id=<id>).
 
 Reuses cp_auth.canonical_message + cp_auth.sign (the shipped signer). The Ed25519 seed
 is read from PKI_SEED in-process only and never logged. An optional ID_TOKEN env adds the
@@ -100,6 +109,7 @@ import json
 import os
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 
 sys.path.insert(0, os.environ["LIB"])
@@ -113,12 +123,18 @@ JOB_ID = os.environ["PROBE_JOB_ID"]
 
 
 def main():
-    method, path = "GET", "/jobs"
-    body = json.dumps({"job_id": JOB_ID}).encode("utf-8")
+    # GFE-SAFE: job_id in the QUERY, EMPTY body. The signature covers the full
+    # path-with-query (canonical_message("GET", "/jobs?job_id=<id>", b"")).
+    method = "GET"
+    path = "/jobs?" + urllib.parse.urlencode({"job_id": JOB_ID})
+    body = b""
     url = BASE + path
-    req = urllib.request.Request(url, data=body, method=method)
+    # data=None -> urllib sends a TRUE bodyless GET (no Content-Length framing). Passing
+    # data=b"" can still attach an (empty) body; the whole point is a GET GFE will accept.
+    req = urllib.request.Request(url, data=None, method=method)
     req.add_header("X-Heimdall-HAID", HAID)
-    req.add_header("Content-Type", "application/json")
+    # The signed bytes use an EMPTY body; the server verifies canonical_message over the
+    # same full path-with-query + empty body.
     msg = K.canonical_message(method, path, body)
     req.add_header("X-Heimdall-Signature", K.sign(SEED, msg))
     if ID_TOKEN:
@@ -190,10 +206,10 @@ printf '  %s\n' "job_id=$PROBE_JOB_ID"
 printf '  %s\n' "(PKI_SEED is set and will NOT be printed)"
 printf '%s\n' "============================================================"
 printf '\n'
-printf '%s\n' "REQUEST (the EXACT shape verify-flight-fix.sh STEP 5 sends):"
-printf '  %s\n' "GET /jobs"
-printf '  %s\n' "body: {\"job_id\":\"$PROBE_JOB_ID\"}      <- job_id in the BODY (status_route reads payload['job_id'])"
-printf '  %s\n' "headers: X-Heimdall-HAID, X-Heimdall-Signature (over canonical_message GET\\n/jobs\\nBODY)${ID_TOKEN:+, Authorization: Bearer <id-token>}"
+printf '%s\n' "REQUEST (the EXACT GFE-safe shape verify-flight-fix.sh STEP 5 sends):"
+printf '  %s\n' "GET /jobs?job_id=$PROBE_JOB_ID      <- job_id in the QUERY, EMPTY body (status_route reads request['query']['job_id'])"
+printf '  %s\n' "(no body — a GET-with-a-body is rejected HTTP 400 by Google's GFE / Cloud Run ingress)"
+printf '  %s\n' "headers: X-Heimdall-HAID, X-Heimdall-Signature (over canonical_message GET\\n/jobs?job_id=<id>\\n<empty>)${ID_TOKEN:+, Authorization: Bearer <id-token>}"
 printf '\n'
 printf '%s\n' "RAW RESPONSE BODY (verbatim from the live service):"
 printf '  HTTP %s\n' "${HTTP_STATUS:-?}"
