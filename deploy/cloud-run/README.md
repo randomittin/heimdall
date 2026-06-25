@@ -615,6 +615,23 @@ in Firestore (the external store), not the wiped ephemeral home — i.e.
 `HEIMDALL_STATE_BACKEND=firestore` is live and the image is current (no
 `BackendUnavailable` ticks; see the rebuild section above).
 
+> **The execution status is the AUTHORITATIVE PASS signal — not the job-record
+> poll.** `run_v2` `run_job` is **async**: the dispatched Cloud Run Job
+> **provisions** (~36s observed) and only **then** runs, so the signed
+> `GET /jobs` job-record poll (STEP 2) can expire while the Job is still
+> provisioning even though it **did** dispatch and **will** complete. The script
+> therefore runs **STEP 2b**: it polls `gcloud run jobs executions list
+> --job=heimdall-long-job` for an execution that **carries this `job_id`** (or was
+> created at/after the dispatch instant) and reaches **`succeededCount=1`**. A
+> succeeded execution = the job ran out-of-process, and that is the **ground-truth**
+> PASS signal. If STEP 2's job-record poll times out **but** STEP 2b (or the STEP-5
+> read-back) confirms the job ran, the script treats the timeout as an
+> **async-provisioning timing artifact, NOT a dispatch failure**, and the verdict
+> stays **PASS**. STEP 2's poll default is now **180s** (was 60s) to cover
+> provision+run; raise `POLL_SECONDS` / `EXEC_POLL_SECONDS` for slower cold starts.
+> STEP 2b is **gcloud-only** and **skips cleanly** in the local dry run (no real
+> Cloud Run Job to query), so the dry run is unaffected.
+
 **The FAIL → PASS transition this fix delivers.** Before the out-of-process
 runner, the flight-fix script **FAILED**: the in-process job stayed queued, never
 reached `done`, and the read-back returned a non-terminal job. After deploying
@@ -668,11 +685,10 @@ bash deploy/cloud-run/verify-flight-fix.sh
 #          instance after scale-to-zero." (exit 0)
 ```
 
-### The scale-to-zero step (how the instance is replaced)
+### The scale-to-zero step (how the instance is replaced — and why it PRESERVES the image)
 
 The script defaults to `SCALE_TO_ZERO=revision`: it rolls a **no-op new revision**
-(`gcloud run services update --revision-suffix=flightfix-<stamp> --update-env-vars=...`),
-which routes 100% of traffic to a new revision and **tears down the old serving
+that routes 100% of traffic to a fresh revision and **tears down the old serving
 instance** — deterministic and fast. The trade-off vs. `SCALE_TO_ZERO=wait` (rely
 on the `--min-instances=0` idle scale-down, ~up to 15 min, non-deterministic) is
 documented in the script header: the revision rollout *provably* replaces the
@@ -680,6 +696,28 @@ instance now, which is exactly the property the proof needs (a fresh instance wi
 no local state). A third mode, `SCALE_TO_ZERO=command` + `SCALE_CMD`, runs an
 operator-supplied replacement command (gcloud-free) — that is the seam the local
 dry run uses to restart the server against the same external store.
+
+> **STEP 4 PRESERVES the served image digest — it never rolls the service back.**
+> A bare `gcloud run services update` that does **not** pass `--image` resolves the
+> image reference afresh; if the service was last deployed from a mutable tag
+> (`:latest`) or a `--source` build, the new revision can pull a **different/older
+> digest** than the one serving. In the prod incident the verify's own STEP-4
+> rollout reverted the service to a **pre-`run_v2` image** mid-test, so the
+> subsequently-dispatched job hit a revision **without** the dispatch fix → **zero
+> executions**, corrupting the test. The fixed STEP 4 now:
+> 1. **captures** the currently-serving (100%-traffic) revision's exact image
+>    **digest first** (`gcloud run services describe` → the 100%-traffic revision →
+>    `gcloud run revisions describe --format='value(spec.containers[0].image)'`);
+> 2. rolls the no-op revision **pinned to that exact digest** (`--image <digest>`),
+>    so Cloud Run **reuses the same immutable image** (scale-to-zero **without**
+>    changing the served code); and
+> 3. **asserts** the new 100%-traffic revision serves the **same** digest it
+>    started on — a drift **FAILS** the run loudly (`STEP-4 image DRIFTED: ...`)
+>    rather than silently testing a stale image.
+>
+> `SCALE_TO_ZERO=wait` is the other image-untouching path (it never rolls a
+> revision at all). `SCALE_TO_ZERO=command` (the dry-run seam) does not touch
+> gcloud, so the digest-pin logic is **skipped cleanly** locally.
 
 ### Where the job lands in Firestore
 

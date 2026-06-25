@@ -12,11 +12,20 @@
 #
 #   1. SIGN + POST /jobs against $BASE_URL                 -> capture job_id (non-blocking).
 #   2. Poll signed GET /jobs (job_id in body) until done   -> the durable state is present.
+#   2b.(gcloud-only) poll the heimdall-long-job EXECUTIONS  -> a succeeded execution carrying
+#      list for a SUCCEEDED execution carrying this job_id     this job_id is the AUTHORITATIVE
+#      -> the job dispatched + ran OUT-OF-PROCESS. run_v2 dispatch is ASYNC (the Job provisions
+#      ~36s then runs), so this execution-status signal — not the tight job-record poll — is the
+#      true PASS signal; a timed-out STEP-2 poll alongside a succeeded execution is a TIMING
+#      ARTIFACT, not a dispatch failure. Skipped cleanly in local/dry-run (no gcloud).
 #   3. (optional, gated on gcloud) confirm the job doc      -> in REAL Firestore (the
 #      cp_state_firestore rel->doc mapping); PRINT the doc path either way.
 #   4. SCALE TO ZERO — replace the serving instance deterministically so the next request
 #      hits a FRESH instance with NO local state (the old instance's memory + ephemeral
-#      disk are GONE).
+#      disk are GONE). IMAGE-PRESERVING: the rollout captures the currently-serving 100%-
+#      traffic digest FIRST and PINS the no-op revision to that exact `--image <digest>`, then
+#      ASSERTS the served digest is unchanged after — so STEP 4 can never silently roll the
+#      service back to an older image mid-test (the prod STEP-4 rollback bug, fixed).
 #   5. After cold-start, signed GET /jobs for the SAME job_id -> the job + its folded state
 #      come back, read from Firestore by an instance that never ran the job. THE FLIGHT FIX.
 #   6. PASS/FAIL verdict — PASS iff the durable state resolved from a fresh instance after
@@ -97,9 +106,19 @@ BASE_URL="${BASE_URL%/}"
 PROJECT_ID="${PROJECT_ID:-}"                       # for the optional Firestore doc check.
 REGION="${REGION:-us-central1}"                    # the Cloud Run region (scale-to-zero step).
 SERVICE="${SERVICE:-heimdall-control-plane}"       # the Cloud Run service name.
+JOB_NAME="${JOB_NAME:-heimdall-long-job}"          # the Cloud Run Job the service dispatches to.
 FIRESTORE_ROOT="${HEIMDALL_FIRESTORE_ROOT:-heimdall_cp}"   # the cp_state_firestore root collection.
-POLL_SECONDS="${POLL_SECONDS:-60}"                 # max seconds to wait for a terminal state.
+# POLL_SECONDS default is 180 (was 60): run_v2 run_job is ASYNC — the dispatched Cloud Run Job
+# then PROVISIONS (~36s observed) and only then RUNS. A 60s job-record poll can expire while the
+# Job is still provisioning even though it DID dispatch + complete; 180s covers provision+run so a
+# timing-tight Job is no longer misread as a dispatch failure. The authoritative PASS signal is the
+# EXECUTION STATUS (STEP 2b), not just this job-record poll. The local dry run overrides this to a
+# short value (the in-process fake completes instantly).
+POLL_SECONDS="${POLL_SECONDS:-180}"                # max seconds to wait for a terminal state.
 COLD_POLL_SECONDS="${COLD_POLL_SECONDS:-30}"       # max seconds to wait for the post-cold read.
+# EXEC_POLL_SECONDS — how long STEP 2b waits for a heimdall-long-job EXECUTION to reach
+# succeededCount=1. Covers the async provision (~36s) + run; gcloud-only, skipped in local/dry-run.
+EXEC_POLL_SECONDS="${EXEC_POLL_SECONDS:-180}"
 ACTION_TYPE="${ACTION_TYPE:-run-task-X}"           # an allowlisted action (the wired-gate default).
 # ID_TOKEN is optional: required when the service is --no-allow-unauthenticated (Cloud Run IAM).
 ID_TOKEN="${ID_TOKEN:-}"
@@ -239,6 +258,11 @@ say "============================================================"
 # ──────────────────────────────────────────────────────────────────────────────
 say
 say "STEP 1 — sign + POST /jobs (start a server-hosted job)"
+# Stamp the dispatch instant (RFC3339 UTC) BEFORE the POST so STEP 2b can scope the executions
+# list to a NEW execution created at/after this dispatch — distinguishing it from any stale,
+# pre-existing manual execution (e.g. the old krdp7 in the incident). Best-effort: if the local
+# `date` lacks -u/RFC3339 support the stamp is empty and STEP 2b falls back to a job_id-arg match.
+DISPATCH_TS="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)"
 sign_call start "$ACTION_TYPE" "flight-fix-prod-$(date +%s)" >"$WORK/start.out" 2>"$WORK/start.err"
 START_STATUS="$(jget status <"$WORK/start.out")"
 JOB_ID="$(jget job_id <"$WORK/start.out")"
@@ -274,13 +298,136 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
   if [ "$FINAL_STATE" = "done" ] || [ "$FINAL_STATE" = "cancelled" ]; then break; fi
   "$PY" -c "import time;time.sleep(1)"
 done
+# STEP2_TIMED_OUT: the job-record poll expired without a terminal state. We do NOT immediately
+# FAIL on it — run_v2 dispatch is async, so a tight poll can expire while the Job is still
+# provisioning+running even though it DID dispatch + complete. STEP 2b (the execution-status
+# check) + STEP 5 (the durable read-back) reconcile this: if either confirms the job actually
+# ran, a timed-out STEP-2 poll is a TIMING ARTIFACT, not a dispatch failure (resolved below).
+STEP2_TIMED_OUT="no"
 if [ "$FINAL_STATE" = "done" ]; then
   pass "the job reached a durable terminal state (state=done, result=$RESULT_STATUS) — persisted in Firestore"
 elif [ "$FINAL_STATE" = "cancelled" ]; then
   pass "the job reached a durable terminal state (state=cancelled) — persisted in Firestore"
   say "  note: cancelled is terminal+durable; the flight-fix read-back below still applies."
 else
-  fail "the job did not reach a terminal state within ${POLL_SECONDS}s (last state='$FINAL_STATE')"
+  STEP2_TIMED_OUT="yes"
+  say "  the job-record poll did NOT read a terminal state within ${POLL_SECONDS}s (last state='$FINAL_STATE')."
+  say "  NOT failing yet — STEP 2b (execution status) + STEP 5 (durable read-back) decide whether"
+  say "  this is an async-provisioning timing artifact or a real dispatch failure."
+fi
+
+# ──────────────────────────────────────────────────────────────────────────────
+# STEP 2b — THE AUTHORITATIVE PASS SIGNAL: poll the Cloud Run Job EXECUTIONS list for a
+#   heimdall-long-job execution that (a) carries THIS job_id in its container args, or
+#   (b) was created at/after the STEP-1 dispatch (DISPATCH_TS) — reaching succeededCount=1.
+#
+#   WHY this, not just the STEP-2 job-record poll: run_v2 run_job is ASYNC. The dispatched
+#   Job PROVISIONS (~36s observed) then RUNS, so the job-record can still read non-terminal
+#   when a tight poll expires even though the Job DID dispatch and DID complete. The EXECUTION
+#   STATUS is ground truth: a succeeded execution carrying this job_id PROVES the dispatch
+#   fired and the job ran out-of-process. A succeeded execution here turns a tight STEP-2 poll
+#   into a recognised TIMING ARTIFACT (not a dispatch failure) — see the verdict logic.
+#
+#   gcloud-ONLY. Skipped cleanly when gcloud is absent OR SCALE_TO_ZERO=command (the local/dry-
+#   run path, which has no real Cloud Run Job to query) — EXEC_CHECKED stays "skipped" and the
+#   verdict relies on STEP 2 + STEP 5 exactly as before, so the dry run is unaffected.
+# ──────────────────────────────────────────────────────────────────────────────
+say
+say "STEP 2b — poll heimdall-long-job EXECUTIONS for a succeeded execution carrying this job_id"
+EXEC_CHECKED="skipped"
+EXEC_SUCCEEDED="no"
+EXEC_NAME=""
+if [ "${SCALE_TO_ZERO:-revision}" = "command" ]; then
+  say "  (skipped — SCALE_TO_ZERO=command is the local/dry-run path; no real Cloud Run Job to query.)"
+elif ! command -v gcloud >/dev/null 2>&1; then
+  say "  (skipped — gcloud not available; run from RJ's creds to use the execution-status PASS signal.)"
+else
+  # Helper: parse the executions-list JSON and pick the FIRST execution that is ours
+  # (job_id in container args, or createTime >= DISPATCH_TS) AND has succeededCount>=1.
+  # Prints "<name>" on a match, nothing otherwise. Robust to schema variance across gcloud
+  # versions (succeededCount can live under status; args under the template's container).
+  EXEC_PICK_PY="$WORK/exec_pick.py"
+  cat >"$EXEC_PICK_PY" <<'PYEOF'
+import json
+import sys
+
+
+def _succeeded(ex):
+    st = ex.get("status") or {}
+    for src in (st, ex):
+        v = src.get("succeededCount")
+        if isinstance(v, int) and v >= 1:
+            return True
+    return False
+
+
+def _args_blob(ex):
+    """Flatten everything that might hold the container args/command into one string."""
+    out = []
+    spec = ex.get("spec") or {}
+    tmpl = (spec.get("template") or {}).get("spec") or {}
+    for c in tmpl.get("containers") or []:
+        out += list(c.get("args") or [])
+        out += list(c.get("command") or [])
+    # Fallback: stringify the whole record so an args match still works if the path differs.
+    out.append(json.dumps(ex))
+    return " ".join(str(x) for x in out)
+
+
+def _create_time(ex):
+    md = ex.get("metadata") or {}
+    return md.get("creationTimestamp") or (ex.get("status") or {}).get("startTime") or ""
+
+
+def main():
+    job_id = sys.argv[1]
+    dispatch_ts = sys.argv[2] if len(sys.argv) > 2 else ""
+    try:
+        data = json.load(sys.stdin)
+    except (ValueError, TypeError):
+        return 0
+    if isinstance(data, dict):
+        data = [data]
+    for ex in data:
+        if not isinstance(ex, dict):
+            continue
+        if not _succeeded(ex):
+            continue
+        carries_job = job_id and job_id in _args_blob(ex)
+        ct = _create_time(ex)
+        after_dispatch = bool(dispatch_ts) and bool(ct) and ct >= dispatch_ts
+        if carries_job or after_dispatch:
+            name = (ex.get("metadata") or {}).get("name") or ex.get("name") or "<unnamed>"
+            sys.stdout.write(str(name))
+            return 0
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+PYEOF
+  exec_deadline=$(( $(date +%s) + EXEC_POLL_SECONDS ))
+  while [ "$(date +%s)" -lt "$exec_deadline" ]; do
+    if gcloud run jobs executions list \
+         --job="$JOB_NAME" \
+         --region="$REGION" \
+         ${PROJECT_ID:+--project="$PROJECT_ID"} \
+         --format=json >"$WORK/execs.out" 2>"$WORK/execs.err"; then
+      EXEC_NAME="$("$PY" "$EXEC_PICK_PY" "$JOB_ID" "$DISPATCH_TS" <"$WORK/execs.out")"
+      if [ -n "$EXEC_NAME" ]; then break; fi
+    fi
+    "$PY" -c "import time;time.sleep(3)"
+  done
+  if [ -n "$EXEC_NAME" ]; then
+    EXEC_CHECKED="checked"
+    EXEC_SUCCEEDED="yes"
+    pass "a heimdall-long-job EXECUTION succeeded for this dispatch ($EXEC_NAME, succeededCount>=1) — the job ran out-of-process"
+  else
+    EXEC_CHECKED="checked"
+    fail "no SUCCEEDED heimdall-long-job execution for this job_id within ${EXEC_POLL_SECONDS}s — dispatch may not have fired (the pre-fix queued-forever signature)"
+    say "  hint: check HEIMDALL_JOB_RUNNER=cloudrun-job on the service + run.jobs.run IAM (deploy/cloud-run/README.md §4.1)."
+    [ -s "$WORK/execs.err" ] && tail -3 "$WORK/execs.err" >&2
+  fi
 fi
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -324,12 +471,26 @@ fi
 #   job (its memory + ephemeral /tmp home) is GONE; the next GET /jobs is served by a brand
 #   new container that NEVER saw the job locally — it can only answer from Firestore.
 #
+#   ⚠️ IMAGE-PRESERVATION (the STEP-4 rollback bug, fixed). A bare `gcloud run services update`
+#   that does NOT pass `--image` resolves the service's image reference afresh — if the service
+#   was last deployed from a mutable tag (`...:latest`) or a `--source` build, the new revision
+#   can pull a DIFFERENT/OLDER digest than the one currently serving. In the prod incident the
+#   verify's own STEP-4 rollout reverted the service to a PRE-run_v2 image mid-test, so the
+#   subsequently-dispatched job hit a revision WITHOUT the dispatch fix -> zero executions, and
+#   the test corrupted itself. THE FIX: capture the CURRENTLY-serving (100%-traffic) revision's
+#   exact image DIGEST FIRST, then roll the no-op revision with `--image <that exact digest>` so
+#   Cloud Run REUSES the same immutable digest (scale-to-zero WITHOUT changing the served image).
+#   After the rollout we ASSERT the new 100%-traffic revision serves the SAME digest we started
+#   on — if it drifted, we FAIL loudly rather than silently testing a stale image.
+#
 #   TRADE-OFF (documented): the alternative is to simply WAIT OUT the idle scale-down with
 #   --min-instances=0 (no request for ~15 min -> the instance is reclaimed). That is the
 #   "purest" cold start but NON-deterministic (the idle window is not contractual and can
-#   be minutes). A new-revision rollout is DETERMINISTIC and fast: it provably replaces the
-#   serving instance now, which is exactly the property we need (fresh instance, no local
-#   state). We default to the revision rollout; set SCALE_TO_ZERO=wait to use the idle path.
+#   be minutes) AND it never touches the image at all (no rollback risk). A new-revision rollout
+#   pinned to the captured digest is DETERMINISTIC, fast, AND image-preserving: it provably
+#   replaces the serving instance now while keeping the exact same digest, which is exactly the
+#   property we need (fresh instance, no local state, same code under test). We default to the
+#   digest-pinned revision rollout; set SCALE_TO_ZERO=wait to use the image-untouching idle path.
 #
 #   A THIRD mode, SCALE_TO_ZERO=command, runs an operator-supplied SCALE_CMD that replaces
 #   the serving instance by whatever means the operator controls — gcloud-free. The local
@@ -370,13 +531,87 @@ elif command -v gcloud >/dev/null 2>&1; then
     say "  to cover your idle window, or simply re-run STEP 5 after the instance is reclaimed."
     COLD_FORCED="wait"
   else
-    say "  method=revision — deploying a no-op new revision to TEAR DOWN the old serving instance."
-    # A no-op env annotation bump that forces a new revision WITHOUT changing behavior:
-    # we stamp a unique verify marker env + revision suffix (idempotent, behavior-neutral).
+    say "  method=revision — deploying a no-op new revision (PINNED to the serving digest) to TEAR"
+    say "  DOWN the old serving instance WITHOUT changing the served image."
+    # ── helper: resolve the digest of the revision currently serving 100% of traffic ──
+    # status.traffic gives the revision(s) + percent; we pick the one at 100% (or the highest),
+    # then read THAT revision's container image (a sha256 digest once the service has rolled at
+    # least once with a digest pin). Prints the image string, or "" if it can't be resolved.
+    SERVE_DIGEST_PY="$WORK/serve_digest.py"
+    cat >"$SERVE_DIGEST_PY" <<'PYEOF'
+import json
+import sys
+
+
+def main():
+    # argv[1] = the `gcloud run services describe --format=json` blob.
+    try:
+        with open(sys.argv[1], "r", encoding="utf-8") as fh:
+            svc = json.load(fh)
+    except (OSError, ValueError, IndexError):
+        return 0
+    status = svc.get("status") or {}
+    # Pick the revision carrying the most traffic (prefer an explicit 100%).
+    best_rev, best_pct = None, -1
+    for t in status.get("traffic") or []:
+        pct = t.get("percent")
+        pct = pct if isinstance(pct, int) else -1
+        rev = t.get("revisionName") or t.get("latestRevision") and status.get("latestReadyRevisionName")
+        if rev and pct > best_pct:
+            best_rev, best_pct = rev, pct
+    # The describe blob carries the *latest template* image, but to be exact we want the image of
+    # the 100%-traffic revision. The service template image is the right answer when traffic is on
+    # the latest ready revision; fall back to it. (A precise per-revision lookup is done by the
+    # caller via `gcloud run revisions describe` when best_rev is known.)
+    spec = svc.get("spec") or {}
+    tmpl = (spec.get("template") or {}).get("spec") or {}
+    containers = tmpl.get("containers") or []
+    tmpl_image = containers[0].get("image") if containers else ""
+    sys.stdout.write(json.dumps({"revision": best_rev or "", "percent": best_pct,
+                                 "template_image": tmpl_image or ""}))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+PYEOF
+    # Capture the serving revision FIRST, then read THAT revision's exact image digest.
+    CURRENT_DIGEST=""
+    SERVE_REV=""
+    if gcloud run services describe "$SERVICE" \
+         --region="$REGION" \
+         ${PROJECT_ID:+--project="$PROJECT_ID"} \
+         --format=json >"$WORK/svc_before.out" 2>"$WORK/svc_before.err"; then
+      SERVE_INFO="$("$PY" "$SERVE_DIGEST_PY" "$WORK/svc_before.out")"
+      SERVE_REV="$("$PY" -c "import json,sys;print(json.loads(sys.argv[1]).get('revision') or '')" "$SERVE_INFO" 2>/dev/null)"
+      if [ -n "$SERVE_REV" ]; then
+        # The AUTHORITATIVE per-revision image (a sha256 digest on a digest-pinned service).
+        CURRENT_DIGEST="$(gcloud run revisions describe "$SERVE_REV" \
+           --region="$REGION" \
+           ${PROJECT_ID:+--project="$PROJECT_ID"} \
+           --format="value(spec.containers[0].image)" 2>/dev/null | tr -d '[:space:]')"
+      fi
+      if [ -z "$CURRENT_DIGEST" ]; then
+        # Fall back to the service template image when the per-revision lookup is unavailable.
+        CURRENT_DIGEST="$("$PY" -c "import json,sys;print(json.loads(sys.argv[1]).get('template_image') or '')" "$SERVE_INFO" 2>/dev/null | tr -d '[:space:]')"
+      fi
+    fi
+    if [ -n "$CURRENT_DIGEST" ]; then
+      say "  captured the currently-serving image to PIN the rollout to: $CURRENT_DIGEST"
+      say "  (serving revision: ${SERVE_REV:-<unknown>}) — the rollout will REUSE this exact digest."
+    else
+      say "  WARNING: could not capture the serving image digest — the rollout will proceed WITHOUT"
+      say "  an --image pin, which risks the STEP-4 image-rollback bug. Ensure gcloud has run.viewer"
+      say "  on the service so the digest can be captured + asserted. Proceeding (best-effort)."
+    fi
+    # A no-op env marker that forces a new revision WITHOUT changing behavior, PINNED to the
+    # captured digest so the served image is byte-identical across the rollout (no rebuild, no
+    # rollback to an older digest). The `--image` pin is the core of the BUG-1 fix.
     STAMP="$(date +%Y%m%d-%H%M%S)"
     if gcloud run services update "$SERVICE" \
          --region="$REGION" \
          ${PROJECT_ID:+--project="$PROJECT_ID"} \
+         ${CURRENT_DIGEST:+--image="$CURRENT_DIGEST"} \
          --update-env-vars="HEIMDALL_FLIGHTFIX_VERIFY=${STAMP}" \
          --revision-suffix="flightfix-${STAMP}" \
          >"$WORK/scale.out" 2>"$WORK/scale.err"; then
@@ -384,6 +619,32 @@ elif command -v gcloud >/dev/null 2>&1; then
       COLD_FORCED="revision"
       # Give Cloud Run a moment to finish routing 100% to the new revision + reap the old.
       "$PY" -c "import time;time.sleep(8)"
+      # ── ASSERT the served image did NOT drift: the new 100%-traffic revision must serve the
+      #    SAME digest we captured before. This catches the STEP-4 image-rollback bug directly.
+      if [ -n "$CURRENT_DIGEST" ]; then
+        if gcloud run services describe "$SERVICE" \
+             --region="$REGION" \
+             ${PROJECT_ID:+--project="$PROJECT_ID"} \
+             --format=json >"$WORK/svc_after.out" 2>/dev/null; then
+          AFTER_INFO="$("$PY" "$SERVE_DIGEST_PY" "$WORK/svc_after.out")"
+          AFTER_REV="$("$PY" -c "import json,sys;print(json.loads(sys.argv[1]).get('revision') or '')" "$AFTER_INFO" 2>/dev/null)"
+          AFTER_DIGEST=""
+          if [ -n "$AFTER_REV" ]; then
+            AFTER_DIGEST="$(gcloud run revisions describe "$AFTER_REV" \
+               --region="$REGION" \
+               ${PROJECT_ID:+--project="$PROJECT_ID"} \
+               --format="value(spec.containers[0].image)" 2>/dev/null | tr -d '[:space:]')"
+          fi
+          [ -z "$AFTER_DIGEST" ] && AFTER_DIGEST="$("$PY" -c "import json,sys;print(json.loads(sys.argv[1]).get('template_image') or '')" "$AFTER_INFO" 2>/dev/null | tr -d '[:space:]')"
+          if [ "$AFTER_DIGEST" = "$CURRENT_DIGEST" ]; then
+            pass "image PRESERVED across scale-to-zero — the served digest is UNCHANGED ($AFTER_DIGEST)"
+          else
+            fail "STEP-4 image DRIFTED: served digest changed from '$CURRENT_DIGEST' to '$AFTER_DIGEST' — the rollback bug. The test is now exercising a DIFFERENT image than it started on; re-pin the service to the intended digest and re-run."
+          fi
+        else
+          say "  (could not re-describe the service to assert the digest — non-fatal; the rollout pinned --image, so drift is unlikely.)"
+        fi
+      fi
     else
       fail "could not roll a new revision (gcloud run services update failed) — see stderr"
       [ -s "$WORK/scale.err" ] && tail -5 "$WORK/scale.err" >&2
@@ -432,6 +693,23 @@ else
 fi
 
 # ──────────────────────────────────────────────────────────────────────────────
+# RECONCILE the deferred STEP-2 timeout. run_v2 dispatch is async, so a tight job-record poll
+# can expire while the job is still provisioning+running. We now know the two authoritative
+# signals — the EXECUTION status (STEP 2b) and the durable read-back (STEP 5). If EITHER
+# confirms the job ran, a timed-out STEP-2 poll is a TIMING ARTIFACT (the job DID dispatch +
+# complete; the poll was just shorter than provision+run) and must NOT fail the verdict. Only
+# when NEITHER signal confirms the job ran is the STEP-2 timeout a real dispatch failure.
+# ──────────────────────────────────────────────────────────────────────────────
+if [ "$STEP2_TIMED_OUT" = "yes" ]; then
+  if [ "$EXEC_SUCCEEDED" = "yes" ] || [ "$DURABLE_BACK" = "yes" ]; then
+    say
+    say "  NOTE — STEP-2 job-record poll timed out, but the job DID run: $( [ "$EXEC_SUCCEEDED" = "yes" ] && echo "a heimdall-long-job execution succeeded (STEP 2b)" || echo "a fresh instance read its durable terminal state (STEP 5)" ). This is an async-provisioning TIMING ARTIFACT (the job dispatched + completed; the poll was tighter than provision+run), NOT a dispatch failure. Raise POLL_SECONDS to silence it."
+  else
+    fail "the job did not reach a terminal state within ${POLL_SECONDS}s AND no execution succeeded AND the read-back did not resolve — a real dispatch failure, not a timing artifact"
+  fi
+fi
+
+# ──────────────────────────────────────────────────────────────────────────────
 # VERDICT — PASS iff the durable state resolved from a fresh instance post-scale-to-zero.
 # ──────────────────────────────────────────────────────────────────────────────
 say
@@ -439,6 +717,7 @@ say "============================================================"
 say "verify-flight-fix: $PASS passed, $FAIL failed"
 say "  job_id:            $JOB_ID"
 say "  firestore doc:     $DOC_PATH"
+say "  execution status:  $EXEC_CHECKED${EXEC_SUCCEEDED:+ (succeeded=$EXEC_SUCCEEDED)}${EXEC_NAME:+ -> $EXEC_NAME}"
 say "  scale-to-zero:     $COLD_FORCED"
 say "  durable read-back: $DURABLE_BACK"
 if [ "$DURABLE_BACK" = "yes" ] && [ "$FAIL" -eq 0 ]; then
