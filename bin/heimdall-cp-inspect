@@ -1,0 +1,551 @@
+#!/usr/bin/env python3
+# heimdall-cp-inspect — READ-ONLY Firestore doc inspector for the control plane.
+#
+# WHY THIS EXISTS (the incident it settles). A run-job EXECUTION succeeded (the Cloud
+# Run Job ran the job to completion and wrote a terminal state=done line) but the
+# SERVICE could not read state=done back: GET /jobs reported the job as not-done. That
+# is a WRITE-PATH-vs-READ-PATH split — either the Job wrote the done line to a DIFFERENT
+# Firestore doc than the service reads (a doc-key / root-collection / project / database
+# mismatch between the two containers), or the service is pointed at the wrong store. To
+# settle it RJ needs to SEE the actual production Firestore document for a job — but
+# `gcloud firestore documents get` is not available to him. This tool reads the EXACT
+# doc the control-plane code uses (it imports the REAL rel->doc mapping from
+# cp_state_firestore, never reimplementing the encoding) over the same google-cloud-
+# firestore client + ADC the deploy already uses, and prints what is actually there.
+#
+# IT IS AUTHORITATIVE BY CONSTRUCTION. It does NOT hard-code "jobs__<id>.ndjson" or the
+# root-collection name; it calls cp_state_firestore.FirestoreBackend's own
+# _encode_rel / _node / _root mapping, so the doc it inspects is BYTE-FOR-BYTE the doc
+# cp_jobstore reads and cp_worker writes. If this tool and the service disagree on which
+# doc a job lives in, that disagreement is the bug — and this tool surfaces it.
+#
+# READ-ONLY. It never calls set()/put_record()/append_line() — only get()/stream()/
+# read_lines()/fold_state(). It cannot mutate Firestore. It prints NO secrets: a job log
+# carries only the job's own bounded scalars (state/progress/result/action_type), never a
+# PKI key / audit row / server secret (the §2 no-secret-by-construction property of the
+# jobstore), and the `env` subcommand prints only env-var NAMES + non-sensitive values
+# (backend selector, project id, root collection, database id, emulator host) — never a
+# credential or an ADC key path.
+#
+# LAZY DEP. google.cloud.firestore is imported only by FirestoreBackend's own lazy
+# _build_client (on first store touch). Importing this script — or running `env`, which
+# touches no store — never requires the firestore dep. If the dep is absent or ADC is
+# unset, the failure is an honest, named error (BackendUnavailable / a clear message),
+# never a silent wrong answer.
+#
+# ──────────────────────────────────────────────────────────────────────────────────
+# SUBCOMMANDS
+#
+#   heimdall-cp-inspect job <job_id> [--json]
+#       Resolve "jobs/<job_id>.ndjson" to its Firestore doc via the REAL backend
+#       mapping, read the node doc + its ordered "lines" subcollection over the client
+#       (ADC / FIRESTORE_EMULATOR_HOST), and print: the resolved doc path (root
+#       collection + doc id + project + database), whether the doc exists, the ordered
+#       NDJSON lines, and the FOLDED state (via cp_jobstore.fold_state over the same
+#       backend). Prints, unmissably: "TERMINAL state=done present: yes/no".
+#
+#   heimdall-cp-inspect list-jobs [--json]
+#       List ALL doc ids under the jobs namespace (root collection, "jobs__" prefix), so
+#       RJ can see whether the Job wrote to a DIFFERENT doc id than the service expects —
+#       the smoking gun for a doc-key mismatch.
+#
+#   heimdall-cp-inspect env [--json]
+#       Print the firestore env THIS process sees: HEIMDALL_STATE_BACKEND,
+#       GOOGLE_CLOUD_PROJECT / HEIMDALL_FIRESTORE_PROJECT, HEIMDALL_FIRESTORE_ROOT, the
+#       database id the client resolves, FIRESTORE_EMULATOR_HOST. Run it INSIDE the job
+#       container and INSIDE the service and DIFF the output to see if the two resolve to
+#       a DIFFERENT store location — the prime suspect for the read/write split.
+#
+# ──────────────────────────────────────────────────────────────────────────────────
+# HOW RJ RUNS IT
+#
+#   (A) Locally, to test the tool against a Firestore EMULATOR (no GCP spend):
+#         gcloud emulators firestore start --host-port=localhost:8085 &   # needs Java 21+
+#         export FIRESTORE_EMULATOR_HOST=localhost:8085
+#         export HEIMDALL_STATE_BACKEND=firestore
+#         export HEIMDALL_FIRESTORE_PROJECT=demo-local          # any id; emulator ignores auth
+#         bin/heimdall-cp-inspect env
+#         bin/heimdall-cp-inspect job <job_id>
+#         bin/heimdall-cp-inspect list-jobs
+#       (The agent validated the tool this way against the in-process Firestore fake —
+#        see test/cp-inspect.test.sh — so the read path is proven before prod.)
+#
+#   (B) In prod, to inspect the FAILING job's doc — from a machine with ADC + the
+#       project (the same creds/dep the deploy uses), pointed at the SAME backend env the
+#       service runs with:
+#         export HEIMDALL_STATE_BACKEND=firestore
+#         export GOOGLE_CLOUD_PROJECT=<the deploy project>
+#         export HEIMDALL_FIRESTORE_ROOT=<the deploy root collection, if overridden>
+#         # (and the same Firestore DATABASE the service uses — see (C))
+#         gcloud auth application-default login        # if ADC is not already present
+#         bin/heimdall-cp-inspect job <failing_job_id>
+#       Read "doc exists" + the lines + "TERMINAL state=done present". If the doc exists
+#       and shows state=done HERE but the service reports not-done, the service reads a
+#       DIFFERENT store than this env resolves — go to (C). If the doc is ABSENT or has
+#       NO done line here, the Job's WRITE did not land where this env reads — run
+#       list-jobs to find which doc id the Job actually wrote.
+#
+#   (C) To DIFF the resolved firestore location between the JOB container and the
+#       SERVICE (the prime suspect — a project / database / root-collection mismatch):
+#         # one-off run of `env` INSIDE the Cloud Run JOB's container+env:
+#         gcloud run jobs execute <job-name> --region <region> \
+#           --args=heimdall-cp-inspect,env --wait
+#         #   (then read the execution logs:)
+#         gcloud logging read \
+#           'resource.type=cloud_run_job AND textPayload:"cp-inspect env"' \
+#           --limit 50 --format='value(textPayload)'
+#         # and `env` as the SERVICE sees it — exec into / curl a debug path, or run a
+#         # one-off Cloud Run Job that inherits the SAME env block the SERVICE has:
+#         gcloud run services describe <service-name> --region <region> \
+#           --format='value(spec.template.spec.containers[0].env)'
+#       DIFF the two `env` outputs. If HEIMDALL_STATE_BACKEND, the project, the root
+#       collection, or the resolved DATABASE differ between the Job and the Service, that
+#       difference IS the read/write split: the Job writes to one store, the service
+#       reads another. (Firestore's default database is "(default)"; a service or job
+#       pinned to a NAMED database via FIRESTORE_DATABASE / a client arg reads a wholly
+#       separate keyspace — a doc written to "(default)" is invisible from the named one.)
+#
+# stdlib (argparse/json/os/sys) + the SHIPPED cp_state / cp_state_firestore / cp_jobstore
+# substrate. No new third-party dep beyond the google-cloud-firestore the deploy already
+# carries (and that one is lazy, only when a store is actually touched).
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import threading
+
+# Resolve bin/lib (the cp_* substrate) onto sys.path exactly as every other bin/ python
+# entrypoint does, so `import cp_state` resolves against the SHIPPED modules.
+_BIN = os.path.dirname(os.path.abspath(__file__))
+_LIB = os.path.join(_BIN, "lib")
+if _LIB not in sys.path:
+    sys.path.insert(0, _LIB)
+
+import cp_state            # the backend factory + BackendUnavailable (read for env names).
+import cp_state_firestore  # the REAL rel->doc mapping (authoritative; never reimplemented).
+import cp_jobstore         # fold_state / _job_rel (the SAME fold the service runs on read).
+
+
+# The Firestore default database id when none is pinned. A client built without an
+# explicit database talks to "(default)"; a deploy that pins a NAMED database reads a
+# wholly separate keyspace, so the resolved database id is a prime diff target for (C).
+_DEFAULT_DATABASE = "(default)"
+
+# The standard GCP project env the firestore client honors when HEIMDALL_FIRESTORE_PROJECT
+# is unset (firestore.Client() reads GOOGLE_CLOUD_PROJECT / GCLOUD_PROJECT / ADC project).
+_GCP_PROJECT_ENVS = ("GOOGLE_CLOUD_PROJECT", "GCLOUD_PROJECT", "GCP_PROJECT")
+
+# The env the google client honors to pin a NON-default Firestore database (a named db is
+# a separate keyspace — the read/write split suspect in (C)).
+_FIRESTORE_DATABASE_ENV = "FIRESTORE_DATABASE"
+
+# The emulator-routing env (when set, the client talks to a local emulator, not prod).
+_EMULATOR_ENV = "FIRESTORE_EMULATOR_HOST"
+
+# How long the lazy firestore.Client() build may take before we declare the backend
+# unreachable. firestore.Client() can BLOCK on ADC / metadata-server lookups when
+# credentials are absent (it does NOT fail fast — the same hang cp_diag._backend_ready
+# bounds), so the build MUST be timeout-bounded or an unconfigured machine would hang the
+# inspector instead of printing an honest error. A healthy ADC build returns well inside
+# this window; the timeout only catches the pathological "no creds -> hung lookup" case.
+_CLIENT_BUILD_TIMEOUT_S = 8.0
+
+
+def _build_client_bounded(backend):
+    """Force the SHIPPED FirestoreBackend's lazy client build under a hard timeout, in a
+    daemon thread. Returns (ok, error_text): ok=True when the client came up within the
+    window; otherwise error_text names what went wrong (a BackendUnavailable message, an
+    exception summary, or a timeout note). NEVER hangs the caller: a build that blocks past
+    the timeout abandons the daemon thread (it dies with the process) and reports a timeout.
+
+    This mirrors cp_diag._backend_ready's bounded-init discipline — the inspector must not
+    inherit firestore.Client()'s no-ADC hang."""
+    result = {"ok": False, "error": None}
+
+    def _worker():
+        try:
+            backend._db()
+            result["ok"] = True
+        except cp_state.BackendUnavailable as exc:
+            result["error"] = str(exc)
+        except Exception as exc:  # noqa: BLE001 — surface ANY client-build failure honestly.
+            result["error"] = "%s: %s" % (type(exc).__name__, exc)
+
+    t = threading.Thread(target=_worker, name="cp-inspect-client-build", daemon=True)
+    t.start()
+    t.join(_CLIENT_BUILD_TIMEOUT_S)
+    if t.is_alive():
+        return False, (
+            "firestore.Client() did not come up within %.0fs — it is blocking (commonly on "
+            "missing ADC / a metadata-server lookup). Set Application Default Credentials "
+            "(gcloud auth application-default login) and the project "
+            "(GOOGLE_CLOUD_PROJECT / HEIMDALL_FIRESTORE_PROJECT), or point at an emulator "
+            "(FIRESTORE_EMULATOR_HOST)." % _CLIENT_BUILD_TIMEOUT_S
+        )
+    return result["ok"], result["error"]
+
+
+def _require_firestore_backend():
+    """Build the SHIPPED FirestoreBackend (so the inspector uses the EXACT mapping the
+    control plane uses), failing with an honest, named error when the backend cannot
+    come up (missing google-cloud-firestore dep, or ADC/project unset). Returns the
+    backend. NEVER silently falls back to the local backend — that would inspect a file
+    tree, not Firestore, and answer the wrong question."""
+    # We do NOT consult HEIMDALL_STATE_BACKEND here: the whole point of this tool is to
+    # inspect FIRESTORE, so we construct the FirestoreBackend directly (it reads
+    # HEIMDALL_FIRESTORE_ROOT / HEIMDALL_FIRESTORE_PROJECT for its location, exactly as the
+    # factory's firestore branch does). If the dep is absent, _db() raises BackendUnavailable.
+    backend = cp_state_firestore.FirestoreBackend()
+    # Force the lazy client build NOW (timeout-bounded) so a missing dep / unset ADC / a
+    # blocking metadata lookup surfaces as a clear error here, not as a tolerant empty read
+    # deep inside a subcommand (which would look like "the doc is absent" — a wrong answer).
+    ok, error = _build_client_bounded(backend)
+    if not ok:
+        _die(
+            "cannot reach Firestore: %s\n"
+            "  -> install google-cloud-firestore (deploy/requirements-firestore.txt), "
+            "ensure ADC is set (gcloud auth application-default login) and the project "
+            "(GOOGLE_CLOUD_PROJECT / HEIMDALL_FIRESTORE_PROJECT) is set, then retry."
+            % (error or "the firestore client could not be built")
+        )
+    return backend
+
+
+def _resolved_database(backend):
+    """The Firestore database id the client resolves. Read from the live client when it
+    exposes _database (the google client does), else from FIRESTORE_DATABASE, else the
+    "(default)" database. This is a PRIME diff target: a service and a job pinned to
+    different databases read separate keyspaces (the read/write split suspect)."""
+    # Prefer the live client's own resolved database id (authoritative — it is what the
+    # client will actually query). The google client stores it on _database.
+    client = getattr(backend, "_client", None)
+    for attr in ("_database", "_database_string_internal", "_database_string"):
+        val = getattr(client, attr, None)
+        if isinstance(val, str) and val:
+            return val
+    return os.environ.get(_FIRESTORE_DATABASE_ENV) or _DEFAULT_DATABASE
+
+
+def _resolved_project(backend):
+    """The Firestore project the client is keyed to: the backend's resolved project
+    (HEIMDALL_FIRESTORE_PROJECT) if pinned, else the live client's project (which the
+    google client derives from GOOGLE_CLOUD_PROJECT / GCLOUD_PROJECT / the ADC default)."""
+    if getattr(backend, "_project", None):
+        return backend._project
+    client = getattr(backend, "_client", None)
+    proj = getattr(client, "project", None)
+    if isinstance(proj, str) and proj:
+        return proj
+    for env in _GCP_PROJECT_ENVS:
+        if os.environ.get(env):
+            return os.environ[env]
+    return None
+
+
+def _doc_location(backend, rel):
+    """The resolved Firestore location of a store-relative path, via the REAL backend
+    mapping (cp_state_firestore._encode_rel / FirestoreBackend._root / _node). This is the
+    AUTHORITATIVE doc identity — the same doc cp_jobstore reads and cp_worker writes."""
+    doc_id = cp_state_firestore._encode_rel(rel)          # the real, reversible encoding.
+    root_name = backend._root_name                        # heimdall_cp or HEIMDALL_FIRESTORE_ROOT.
+    return {
+        "rel": rel,
+        "root_collection": root_name,
+        "doc_id": doc_id,
+        "doc_path": "%s/%s" % (root_name, doc_id),
+        "project": _resolved_project(backend),
+        "database": _resolved_database(backend),
+        "lines_subcollection": cp_state_firestore._LINES_SUBCOLLECTION,
+    }
+
+
+def _read_lines_over_backend(backend, rel):
+    """Read the rel's ordered NDJSON lines over the SHIPPED backend (the same
+    order_by(seq).stream() the service's read path uses). Read-only."""
+    return backend.read_lines(rel)
+
+
+def _fold_over_backend(job_id):
+    """Fold the job's state via the SHIPPED cp_jobstore.fold_state, which runs over the
+    SELECTED backend (cp_state.get_backend). To make that the FirestoreBackend, this tool
+    pins HEIMDALL_STATE_BACKEND=firestore in-process before calling fold — so the fold the
+    service runs on read is the SAME fold we report here. Returns the fold dict or None."""
+    # The fold path resolves its backend through HEIMDALL_STATE_BACKEND; pin it to
+    # firestore for THIS process so fold_state runs over Firestore (not the local files).
+    os.environ[cp_state.BACKEND_ENV] = cp_state.BACKEND_FIRESTORE
+    return cp_jobstore.fold_state(job_id)
+
+
+def _terminal_done_present(lines, folded):
+    """True iff a TERMINAL state=done is present — the exact question the incident asks.
+    We check BOTH the raw lines (an explicit ev=state/state=done line is the write the Job
+    makes) AND the fold (the state the service computes), and report done present if EITHER
+    shows it: a raw done line that the fold also honors is the healthy case; a raw done line
+    the fold does NOT reflect would itself be a fold bug worth seeing."""
+    raw_done = any(
+        rec.get("ev") == cp_jobstore.EV_STATE and rec.get("state") == cp_jobstore.STATE_DONE
+        for rec in lines
+    )
+    folded_done = bool(folded) and folded.get("state") == cp_jobstore.STATE_DONE
+    return raw_done or folded_done, raw_done, folded_done
+
+
+def _die(msg):
+    """Print an error to stderr and exit nonzero. No secret material is ever in `msg`."""
+    sys.stderr.write("heimdall-cp-inspect: %s\n" % msg)
+    raise SystemExit(2)
+
+
+# ── env: the resolved firestore location THIS process sees (the (C) diff input) ──────
+
+
+def _env_report():
+    """The firestore env this process resolves — NAMES + non-sensitive values only. Never
+    a credential / ADC key path. Build a backend (no store touch needed for the static env;
+    a client build is attempted so the resolved database/project reflect the LIVE client,
+    but a build failure degrades to the env-only view rather than dying — `env` must work
+    even where the dep/ADC is absent, so RJ can still diff the raw selectors)."""
+    backend = cp_state_firestore.FirestoreBackend()
+    # Bounded build: env must report even without dep/ADC (so RJ can diff the raw selectors),
+    # and must NOT hang on a blocking metadata lookup — so a failed/slow build degrades to the
+    # env-only view with the reason recorded, never a 2-minute hang.
+    client_built, build_error = _build_client_bounded(backend)
+
+    gcp_project = None
+    for env in _GCP_PROJECT_ENVS:
+        if os.environ.get(env):
+            gcp_project = os.environ[env]
+            break
+
+    return {
+        "HEIMDALL_STATE_BACKEND": os.environ.get(cp_state.BACKEND_ENV) or cp_state.BACKEND_LOCAL,
+        "GOOGLE_CLOUD_PROJECT": gcp_project,
+        "HEIMDALL_FIRESTORE_PROJECT": os.environ.get(cp_state_firestore.FIRESTORE_PROJECT_ENV),
+        "HEIMDALL_FIRESTORE_ROOT": backend._root_name,
+        "HEIMDALL_FIRESTORE_ROOT_default": cp_state_firestore.DEFAULT_ROOT,
+        "FIRESTORE_DATABASE": os.environ.get(_FIRESTORE_DATABASE_ENV),
+        "FIRESTORE_EMULATOR_HOST": os.environ.get(_EMULATOR_ENV),
+        "resolved_project": _resolved_project(backend),
+        "resolved_database": _resolved_database(backend),
+        "firestore_client_built": client_built,
+        "firestore_client_error": build_error,
+    }
+
+
+def _print_env_text(rep):
+    print("=== heimdall-cp-inspect env — the firestore store location THIS process sees ===")
+    print("  (run this INSIDE the job container AND the service, then DIFF the two)")
+    print("")
+    order = [
+        "HEIMDALL_STATE_BACKEND",
+        "GOOGLE_CLOUD_PROJECT",
+        "HEIMDALL_FIRESTORE_PROJECT",
+        "HEIMDALL_FIRESTORE_ROOT",
+        "HEIMDALL_FIRESTORE_ROOT_default",
+        "FIRESTORE_DATABASE",
+        "FIRESTORE_EMULATOR_HOST",
+    ]
+    for key in order:
+        val = rep.get(key)
+        print("  %-32s = %s" % (key, "(unset)" if val is None else val))
+    print("")
+    print("  --- the location the firestore client RESOLVES (the diff target) ---")
+    print("  %-32s = %s" % ("resolved_project", rep.get("resolved_project") or "(none)"))
+    print("  %-32s = %s" % ("resolved_database", rep.get("resolved_database")))
+    print("  %-32s = %s" % ("firestore_client_built", rep.get("firestore_client_built")))
+    if rep.get("firestore_client_error"):
+        print("  %-32s = %s" % ("firestore_client_error", rep["firestore_client_error"]))
+
+
+# ── job: the resolved doc + its lines + the fold + the done verdict ─────────────────
+
+
+def _job_report(job_id):
+    backend = _require_firestore_backend()
+    rel = cp_jobstore._job_rel(job_id)                 # the REAL "jobs/<id>.ndjson" rel.
+    loc = _doc_location(backend, rel)
+    exists = backend.exists(rel)
+    lines = _read_lines_over_backend(backend, rel)
+    folded = _fold_over_backend(job_id)
+    done_present, raw_done, folded_done = _terminal_done_present(lines, folded)
+    return {
+        "job_id": job_id,
+        "location": loc,
+        "doc_exists": exists,
+        "line_count": len(lines),
+        "lines": lines,
+        "folded": folded,
+        "terminal_done_present": done_present,
+        "raw_done_line_present": raw_done,
+        "folded_state_done": folded_done,
+    }
+
+
+def _print_job_text(rep):
+    loc = rep["location"]
+    print("=== heimdall-cp-inspect job %s ===" % rep["job_id"])
+    print("")
+    print("  --- resolved Firestore doc (via the REAL cp_state_firestore mapping) ---")
+    print("  rel                 : %s" % loc["rel"])
+    print("  project             : %s" % (loc["project"] or "(none — ADC/project unresolved)"))
+    print("  database            : %s" % loc["database"])
+    print("  root collection     : %s" % loc["root_collection"])
+    print("  doc id              : %s" % loc["doc_id"])
+    print("  doc path            : %s" % loc["doc_path"])
+    print("  lines subcollection : %s/%s/%s" % (
+        loc["root_collection"], loc["doc_id"], loc["lines_subcollection"]))
+    print("")
+    print("  doc exists          : %s" % ("yes" if rep["doc_exists"] else "NO"))
+    print("  line count          : %d" % rep["line_count"])
+    print("")
+    print("  --- ordered NDJSON lines (store order, ascending seq) ---")
+    if rep["lines"]:
+        for i, rec in enumerate(rep["lines"]):
+            print("  [%03d] %s" % (i, json.dumps(rec, sort_keys=True, separators=(",", ":"))))
+    else:
+        print("  (no lines — the doc's 'lines' subcollection is empty or absent)")
+    print("")
+    print("  --- folded state (cp_jobstore.fold_state over the SAME backend) ---")
+    if rep["folded"] is not None:
+        f = rep["folded"]
+        print("  state               : %s" % f.get("state"))
+        print("  action_type         : %s" % f.get("action_type"))
+        print("  progress            : %s" % f.get("progress"))
+        print("  events              : %s" % f.get("events"))
+        print("  ts (last)           : %s" % f.get("ts"))
+    else:
+        print("  (fold is None — no log for this job_id at this resolved location)")
+    print("")
+    verdict = "yes" if rep["terminal_done_present"] else "no"
+    print("  TERMINAL state=done present: %s" % verdict)
+    if rep["terminal_done_present"] and not rep["folded_state_done"]:
+        print("  (NOTE: a raw done LINE is present but the FOLD does not report done — "
+              "that is a fold-path discrepancy, itself worth investigating.)")
+    if not rep["doc_exists"]:
+        print("  (NOTE: doc ABSENT at this location — if the Job ran, it wrote ELSEWHERE. "
+              "Run `list-jobs` to see which doc ids actually exist, and `env` to diff "
+              "this location against the service's.)")
+
+
+# ── list-jobs: every doc id under the jobs namespace (the doc-key-mismatch smoking gun) ─
+
+
+def _list_jobs_report():
+    backend = _require_firestore_backend()
+    # The job_ids the SHIPPED enumeration recovers (list_names over the "jobs" rel-dir,
+    # the same path the service's /jobs list builds on) — names with the .ndjson suffix
+    # stripped, exactly as cp_jobstore.list_job_ids returns them.
+    job_ids = cp_jobstore.list_job_ids()
+    # Also surface the RAW doc ids under the jobs prefix, so a doc whose id does NOT match
+    # the expected "jobs__<id>.ndjson" shape (a mis-encoded write) is still visible — the
+    # enumeration above would silently drop a non-".ndjson" doc, but a doc-key mismatch is
+    # EXACTLY the thing we must not hide. We read raw ids straight off the root collection.
+    raw_ids = _raw_job_doc_ids(backend)
+    loc_root = backend._root_name
+    return {
+        "root_collection": loc_root,
+        "project": _resolved_project(backend),
+        "database": _resolved_database(backend),
+        "job_ids": job_ids,
+        "raw_doc_ids_under_jobs_prefix": raw_ids,
+    }
+
+
+def _raw_job_doc_ids(backend):
+    """The RAW doc ids under the encoded "jobs__" prefix, straight off the root collection
+    (so a mis-encoded / unexpected doc id is visible, not silently dropped by the suffix
+    filter). Read-only stream of the root collection."""
+    prefix = cp_state_firestore._dir_prefix(cp_jobstore._JOBS_REL)  # "jobs__"
+    out = []
+    try:
+        for snap in backend._root().stream():
+            if snap.id.startswith(prefix):
+                out.append(snap.id)
+    except Exception as exc:  # noqa: BLE001 — surface a read failure honestly.
+        _die("failed to stream the root collection %r: %s: %s" % (
+            backend._root_name, type(exc).__name__, exc))
+    return sorted(out)
+
+
+def _print_list_jobs_text(rep):
+    print("=== heimdall-cp-inspect list-jobs ===")
+    print("  root collection : %s" % rep["root_collection"])
+    print("  project         : %s" % (rep["project"] or "(none)"))
+    print("  database        : %s" % rep["database"])
+    print("")
+    print("  --- job_ids (cp_jobstore enumeration — what the service's /jobs list sees) ---")
+    if rep["job_ids"]:
+        for jid in rep["job_ids"]:
+            print("    %s" % jid)
+    else:
+        print("    (none)")
+    print("")
+    print("  --- RAW doc ids under the 'jobs__' prefix (catches a mis-encoded doc key) ---")
+    if rep["raw_doc_ids_under_jobs_prefix"]:
+        for did in rep["raw_doc_ids_under_jobs_prefix"]:
+            print("    %s" % did)
+    else:
+        print("    (none — no doc under the jobs namespace at this resolved location)")
+
+
+# ── CLI ──────────────────────────────────────────────────────────────────────────
+
+
+def _build_parser():
+    p = argparse.ArgumentParser(
+        prog="heimdall-cp-inspect",
+        description="READ-ONLY Firestore doc inspector for the control plane: read the "
+                    "EXACT doc the control-plane code uses (via the real cp_state_firestore "
+                    "rel->doc mapping) and report its state. Settles write-path-vs-read-path.",
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    p_job = sub.add_parser(
+        "job", help="inspect one job's resolved Firestore doc + lines + folded state")
+    p_job.add_argument("job_id", help="the job id (e.g. job-<uuid4hex>)")
+    p_job.add_argument("--json", action="store_true", help="emit the report as JSON")
+
+    p_list = sub.add_parser(
+        "list-jobs", help="list every doc id under the jobs namespace (doc-key-mismatch check)")
+    p_list.add_argument("--json", action="store_true", help="emit the report as JSON")
+
+    p_env = sub.add_parser(
+        "env", help="print the resolved firestore store location THIS process sees")
+    p_env.add_argument("--json", action="store_true", help="emit the report as JSON")
+
+    return p
+
+
+def main(argv=None):
+    args = _build_parser().parse_args(argv)
+    if args.cmd == "env":
+        rep = _env_report()
+        if args.json:
+            print(json.dumps(rep, sort_keys=True, indent=2))
+        else:
+            _print_env_text(rep)
+        return 0
+    if args.cmd == "job":
+        rep = _job_report(args.job_id)
+        if args.json:
+            print(json.dumps(rep, sort_keys=True, indent=2))
+        else:
+            _print_job_text(rep)
+        # Exit code mirrors the incident question: 0 iff a terminal done is present at this
+        # resolved location, 1 otherwise — so RJ can script the prod check.
+        return 0 if rep["terminal_done_present"] else 1
+    if args.cmd == "list-jobs":
+        rep = _list_jobs_report()
+        if args.json:
+            print(json.dumps(rep, sort_keys=True, indent=2))
+        else:
+            _print_list_jobs_text(rep)
+        return 0
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
