@@ -115,7 +115,29 @@ FIRESTORE_ROOT="${HEIMDALL_FIRESTORE_ROOT:-heimdall_cp}"   # the cp_state_firest
 # EXECUTION STATUS (STEP 2b), not just this job-record poll. The local dry run overrides this to a
 # short value (the in-process fake completes instantly).
 POLL_SECONDS="${POLL_SECONDS:-180}"                # max seconds to wait for a terminal state.
-COLD_POLL_SECONDS="${COLD_POLL_SECONDS:-30}"       # max seconds to wait for the post-cold read.
+# STEP5_POLL_SECONDS — how long the STEP-5 cold-start read-back polls the signed GET /jobs for
+# THIS job_id to come back state=done from a FRESH instance. Default 180 (was an effective 30s
+# via COLD_POLL_SECONDS). WHY generous: run_v2 run_job is ASYNC — the dispatched Cloud Run Job
+# PROVISIONS (~36s observed) + RUNS, then the terminal `done` write must become VISIBLE in
+# Firestore before a fresh instance can read it back. A 30s window can close while the async Job
+# is still finishing (or its terminal Firestore write is still propagating) even though the job
+# DID complete — exactly the STEP-5 read-back timing artifact this raises. 180s covers
+# provision+run+write so the read-back goes GREEN on a real completing run instead of timing out.
+# The local dry run overrides this (via COLD_POLL_SECONDS, the legacy alias) to a short value —
+# the in-process fake completes + writes instantly, so a long window is unnecessary there.
+# Back-compat: COLD_POLL_SECONDS is the OLD name for this window. If the caller set
+# COLD_POLL_SECONDS but NOT STEP5_POLL_SECONDS, honor the old value so existing callers (incl.
+# the dry run's COLD_POLL_SECONDS=20) keep the read-back window they expect.
+if [ -n "${STEP5_POLL_SECONDS:-}" ]; then
+  STEP5_POLL_SECONDS="$STEP5_POLL_SECONDS"          # explicit STEP5_POLL_SECONDS always wins.
+elif [ -n "${COLD_POLL_SECONDS:-}" ]; then
+  STEP5_POLL_SECONDS="$COLD_POLL_SECONDS"           # legacy alias when STEP5 is unset.
+else
+  STEP5_POLL_SECONDS="180"                          # generous default: covers provision+run+write.
+fi
+# Keep COLD_POLL_SECONDS defined + in lockstep (the STEP-4 `wait`-method help text still names it
+# as the read-back window); mirror the resolved STEP-5 window so the two never disagree.
+COLD_POLL_SECONDS="$STEP5_POLL_SECONDS"             # max seconds to wait for the post-cold read.
 # EXEC_POLL_SECONDS — how long STEP 2b waits for a heimdall-long-job EXECUTION to reach
 # succeededCount=1. Covers the async provision (~36s) + run; gcloud-only, skipped in local/dry-run.
 EXEC_POLL_SECONDS="${EXEC_POLL_SECONDS:-180}"
@@ -527,7 +549,7 @@ elif command -v gcloud >/dev/null 2>&1; then
     say "  method=wait — relying on --min-instances=0 idle scale-down (NON-deterministic)."
     say "  Set --min-instances=0 on the service, send no traffic, and wait out the idle window"
     say "  (typically up to ~15 min) before the read-back below. This script will poll the"
-    say "  read-back for up to ${COLD_POLL_SECONDS}s; for the wait method, raise COLD_POLL_SECONDS"
+    say "  read-back for up to ${STEP5_POLL_SECONDS}s; for the wait method, raise STEP5_POLL_SECONDS"
     say "  to cover your idle window, or simply re-run STEP 5 after the instance is reclaimed."
     COLD_FORCED="wait"
   else
@@ -663,33 +685,66 @@ fi
 # ──────────────────────────────────────────────────────────────────────────────
 # STEP 5 — THE FLIGHT-FIX PROOF: after cold-start, signed GET /jobs for the SAME
 #   job_id resolves the job + its folded state — read from Firestore by a FRESH
-#   instance that never ran the job locally.
+#   instance that never ran the job locally. This is the DURABLE READ-BACK proof:
+#   a signed GET /jobs that asserts state=done is readable from Firestore by an
+#   instance that never ran the job.
+#
+#   TIMING: the read-back polls for up to STEP5_POLL_SECONDS (default 180s). run_v2
+#   run_job is ASYNC — the dispatched Cloud Run Job PROVISIONS (~36s) + RUNS, then its
+#   terminal `done` write must become VISIBLE in Firestore before a FRESH instance can
+#   read it back. A short window can close while the async Job is still finishing even
+#   though it DID complete (the STEP-5 read-back timing artifact). The 180s window covers
+#   provision+run+write so a real completing run reads back `done` and STEP 5 goes GREEN —
+#   not merely a reconciled NOTE. When STEP 2b already confirmed the EXECUTION SUCCEEDED
+#   (EXEC_SUCCEEDED=yes), the Job has finished and the durable write appears shortly; we
+#   poll the full window for that `done` to land, and a confirmed `done` = STEP 5 PASS.
 # ──────────────────────────────────────────────────────────────────────────────
 say
 say "STEP 5 — cold-start read-back: signed GET /jobs for the SAME job_id [THE FLIGHT FIX]"
+if [ "$EXEC_SUCCEEDED" = "yes" ]; then
+  say "  STEP 2b confirmed the execution SUCCEEDED — polling up to ${STEP5_POLL_SECONDS}s for the"
+  say "  terminal 'done' write to become visible in Firestore + read back from the FRESH instance."
+else
+  say "  polling the signed GET /jobs read-back for up to ${STEP5_POLL_SECONDS}s (async Job"
+  say "  provision ~36s + run + the terminal Firestore write becoming visible to a fresh instance)."
+fi
 COLD_STATE=""
 COLD_RESULT=""
 COLD_HTTP_OK=""
-deadline=$(( $(date +%s) + COLD_POLL_SECONDS ))
+deadline=$(( $(date +%s) + STEP5_POLL_SECONDS ))
 while [ "$(date +%s)" -lt "$deadline" ]; do
   sign_call status "$JOB_ID" >"$WORK/cold.out" 2>/dev/null
   COLD_HTTP_OK="$(jget http_ok <"$WORK/cold.out")"
   COLD_STATE="$(jget state <"$WORK/cold.out")"
   COLD_RESULT="$(jget result <"$WORK/cold.out")"
-  # We want the durable terminal state back (done/cancelled) from the fresh instance.
+  # We want the durable terminal state back (done/cancelled) from the fresh instance. We poll
+  # the FULL window so a real async Job that is still provisioning/running (or whose terminal
+  # Firestore write has not yet propagated) is given time to land `done` — only a window that
+  # closes with the job STILL non-terminal is a genuine read-back failure.
   if [ "$COLD_STATE" = "done" ] || [ "$COLD_STATE" = "cancelled" ]; then break; fi
-  "$PY" -c "import time;time.sleep(1)"
+  "$PY" -c "import time;time.sleep(2)"
 done
 
 DURABLE_BACK="no"
 if [ "$COLD_HTTP_OK" = "True" ] && { [ "$COLD_STATE" = "done" ] || [ "$COLD_STATE" = "cancelled" ]; }; then
   DURABLE_BACK="yes"
   pass "a FRESH instance resolved the job's durable state (state=$COLD_STATE, result=$COLD_RESULT) from Firestore"
+  pass "DURABLE READ-BACK: signed GET /jobs for $JOB_ID reads state=$COLD_STATE from Firestore on a fresh instance — the flight-fix read-back proof"
+  if [ "$EXEC_SUCCEEDED" = "yes" ] && [ "$COLD_STATE" = "done" ]; then
+    pass "FULLY GREEN: execution SUCCEEDED (STEP 2b) AND a fresh instance reads state=done (STEP 5) — both halves of the flight-fix proven on the live target"
+  fi
   pass "FALSIFIABLE: with the LOCAL backend (or a stale pre-Wave-2 image) this read would 404 — only durable Firestore state survives the instance replace"
 else
-  fail "the fresh instance did NOT resolve the job after scale-to-zero (http_ok=$COLD_HTTP_OK, state='$COLD_STATE')"
-  say "  this is the durability-broken signature: either the image is stale (BackendUnavailable ticks,"
-  say "  see deploy/cloud-run/README.md) or HEIMDALL_STATE_BACKEND=firestore is not set on the service."
+  fail "the fresh instance did NOT resolve the job after scale-to-zero within ${STEP5_POLL_SECONDS}s (http_ok=$COLD_HTTP_OK, state='$COLD_STATE')"
+  if [ "$EXEC_SUCCEEDED" = "yes" ]; then
+    say "  NOTE: STEP 2b confirmed the execution SUCCEEDED, yet the read-back stayed non-terminal for"
+    say "  the FULL ${STEP5_POLL_SECONDS}s window — the Job ran but its durable 'done' state did not read"
+    say "  back. Suspect HEIMDALL_STATE_BACKEND=firestore not set on the SERVICE (the fresh instance"
+    say "  reads the wrong store), or raise STEP5_POLL_SECONDS if the write is merely slow to propagate."
+  else
+    say "  this is the durability-broken signature: either the image is stale (BackendUnavailable ticks,"
+    say "  see deploy/cloud-run/README.md) or HEIMDALL_STATE_BACKEND=firestore is not set on the service."
+  fi
 fi
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -719,10 +774,13 @@ say "  job_id:            $JOB_ID"
 say "  firestore doc:     $DOC_PATH"
 say "  execution status:  $EXEC_CHECKED${EXEC_SUCCEEDED:+ (succeeded=$EXEC_SUCCEEDED)}${EXEC_NAME:+ -> $EXEC_NAME}"
 say "  scale-to-zero:     $COLD_FORCED"
-say "  durable read-back: $DURABLE_BACK"
+say "  durable read-back: $DURABLE_BACK${COLD_STATE:+ (state=$COLD_STATE)}  [polled up to ${STEP5_POLL_SECONDS}s]"
 if [ "$DURABLE_BACK" = "yes" ] && [ "$FAIL" -eq 0 ]; then
   say "VERDICT: PASS — the job_id resolved its DURABLE state from a FRESH instance after"
   say "         scale-to-zero. The flight-fix holds on the real Cloud Run + Firestore target."
+  if [ "$EXEC_SUCCEEDED" = "yes" ] && [ "$COLD_STATE" = "done" ]; then
+    say "         FULLY GREEN: STEP 2b execution SUCCEEDED + STEP 5 read state=done from a fresh instance."
+  fi
   say "============================================================"
   exit 0
 else
