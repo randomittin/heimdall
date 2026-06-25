@@ -46,12 +46,19 @@
 #                         OF PROCESS: the child outlives the request handler and the serving
 #                         process, proving the out-of-process model locally for $0. This is
 #                         the local stand-in for a Cloud Run Job execution — SAME contract.
-#   CloudRunJobRunner   — dispatch a real Cloud Run Job execution
-#                         (`gcloud run jobs execute <job> --region <r> --args run-job,<id>
-#                         --wait=false`). The container runs run-job to completion off the
-#                         durable Firestore record, independent of the throttled/scaled-to-
-#                         zero service instance. gcloud is exec'd ONLY when this runner is
-#                         actually selected at runtime — never in tests.
+#   CloudRunJobRunner   — dispatch a real Cloud Run Job execution via the Cloud Run Jobs
+#                         REST API (google.cloud.run_v2.JobsClient.run_job) with an
+#                         arg-override so the container's command becomes `run-job <id>`.
+#                         The container runs run-job to completion off the durable Firestore
+#                         record, independent of the throttled/scaled-to-zero service
+#                         instance. The deployed image (python:3.12-slim) has NO gcloud SDK,
+#                         so dispatch goes straight to the API over the runtime SA's ADC —
+#                         no external binary. run_v2 is imported LAZILY, ONLY when this
+#                         runner is actually selected at runtime — never in tests, never on
+#                         the thread/subprocess paths (so local/dev/test never need
+#                         google-cloud-run installed). run_job returns an LRO; dispatch
+#                         returns as soon as the execution is CREATED (it does NOT block on
+#                         completion — the flight fix).
 #
 # THE FACTORY — get_job_runner() selects the impl from HEIMDALL_JOB_RUNNER, defaulting to
 # `thread` for local/dev/test, and AUTO-selecting `cloudrun-job` when K_SERVICE is set
@@ -59,10 +66,11 @@
 # unknown name raises ValueError (fail closed — never guess a runner), mirroring
 # cp_state.get_backend's fail-closed posture.
 #
-# stdlib-only (os/sys/subprocess) + the sibling cp_worker (REUSE _detach_run / run_job —
-# the thread runner and the run-job entrypoint both call into the kept helpers). No
-# third-party dep, self-hostable; gcloud is the ONLY external tool, and only the cloud
-# runner touches it.
+# stdlib-only (os/sys/subprocess) for the thread/subprocess paths + the sibling cp_worker
+# (REUSE _detach_run / run_job — the thread runner and the run-job entrypoint both call into
+# the kept helpers). The ONLY third-party dep is google-cloud-run, imported LAZILY inside the
+# cloudrun-job dispatch path so it is needed only on the prod Cloud Run runner — the
+# self-hostable local/dev/test paths stay pure-stdlib.
 
 from __future__ import annotations
 
@@ -267,34 +275,51 @@ class SubprocessRunner(JobRunner):
 class CloudRunJobRunner(JobRunner):
     """Dispatch a real Cloud Run Job execution to run the job OUT OF PROCESS, independent of
     the throttled / scaled-to-zero service instance. The Cloud Run Job (`heimdall-long-job`
-    by default, HEIMDALL_CP_JOB_NAME) is a container whose entrypoint is this CLI; we execute
-    it with an arg-override so its command is `run-job <job_id>` — it runs the job to
-    completion off the durable Firestore record, billed for its whole run, then exits. The
-    service instance is free to die the moment start_route returns the job_id.
+    by default, HEIMDALL_CP_JOB_NAME) is a container whose entrypoint is this CLI; we run it
+    with an arg-override so its command is `run-job <job_id>` — it runs the job to completion
+    off the durable Firestore record, billed for its whole run, then exits. The service
+    instance is free to die the moment start_route returns the job_id.
 
-    The command shape (gcloud):
-        gcloud run jobs execute <job-name> \\
-            --region <region> --project <project> \\
-            --args run-job,<job_id> --wait=false --format json
+    WHY THE API, NOT gcloud. The deployed image is python:3.12-slim + bash + cryptography +
+    google-cloud-firestore (Dockerfile) — it has NO gcloud SDK. Shelling `gcloud run jobs
+    execute` in the container fails with `gcloud: not found`, so the dispatch returns False
+    and the job is NEVER dispatched to a Cloud Run Job → it stays `queued` forever. The fix:
+    dispatch over the Cloud Run Jobs REST API (google.cloud.run_v2.JobsClient.run_job) — no
+    external binary. Auth is the runtime SA's Application Default Credentials (ADC), which
+    already carries run.jobs.run; we pass NO explicit credentials (the client resolves ADC).
 
-    --wait=false so dispatch does NOT block on the execution finishing (the flight fix). The
+    The request shape (run_v2):
+        RunJobRequest(
+            name="projects/<project>/locations/<region>/jobs/<job-name>",
+            overrides=RunJobRequest.Overrides(
+                container_overrides=[
+                    RunJobRequest.Overrides.ContainerOverride(args=["run-job", <job_id>]),
+                ],
+            ),
+        )
+
+    The container override carries BOTH the `run-job` subcommand AND the job_id as the
+    container's args, so the execution runs `run-job <job_id>` against the durable record.
+    run_job returns an LRO (long-running operation); we do NOT .result()-block on completion
+    — dispatch returns as soon as the execution is CREATED (the flight fix). `build_request`
+    constructs the RunJobRequest WITHOUT calling GCP, so tests assert the exact shape (the
+    resource name + the override args) with zero GCP and zero spend; `dispatch` builds the
+    same request and hands it to the client for real in prod.
+
     region/project/job-name are read from env (REGION_ENVS / GOOGLE_CLOUD_PROJECT /
-    HEIMDALL_CP_JOB_NAME), set once by the deploy. gcloud is exec'd ONLY here, ONLY when this
-    runner is selected at runtime — `build_command` constructs the argv WITHOUT running it, so
-    tests can assert the exact command shape with zero GCP and zero spend, and `dispatch`
-    runs it for real in prod.
+    HEIMDALL_CP_JOB_NAME), set once by the deploy. run_v2 is imported LAZILY inside the client
+    path so the thread/subprocess runners (local/dev/test) NEVER need google-cloud-run.
 
-    On ANY gcloud failure (non-zero exit, gcloud absent) dispatch returns
-    {"dispatched": False, "error": ...} and the job stays `queued` — resume_orphans / a retry
-    re-drives it. start_route NEVER crashes on a dispatch failure."""
+    On ANY failure (google-cloud-run not importable, missing project, API error) dispatch
+    returns {"dispatched": False, "error": ...} and the job stays `queued` — resume_orphans /
+    a retry re-drives it. start_route NEVER crashes on a dispatch failure."""
 
     name = RUNNER_CLOUDRUN
 
-    def __init__(self, *, job_name=None, project=None, region=None, gcloud="gcloud"):
+    def __init__(self, *, job_name=None, project=None, region=None):
         self._job_name = job_name or os.environ.get(JOB_NAME_ENV) or JOB_NAME_DEFAULT
         self._project = project or os.environ.get(PROJECT_ENV) or None
         self._region = region or self._region_from_env() or REGION_DEFAULT
-        self._gcloud = gcloud
 
     @staticmethod
     def _region_from_env():
@@ -304,39 +329,63 @@ class CloudRunJobRunner(JobRunner):
                 return val.strip()
         return None
 
-    def build_command(self, job_id):
-        """Construct the gcloud argv for the execution WITHOUT running it — the exact command
-        dispatch will exec. Separated so tests assert the shape (region/project/job-name/args)
-        with zero GCP, and dispatch shares one source of truth for the command."""
-        cmd = [
-            self._gcloud, "run", "jobs", "execute", self._job_name,
-            "--region", self._region,
-        ]
-        if self._project:
-            cmd += ["--project", self._project]
-        # --args overrides the container's command per-execution so it runs `run-job <id>`;
-        # --wait=false returns immediately (the flight fix — never block start_route).
-        cmd += ["--args", "run-job,%s" % job_id, "--wait=false", "--format", "json"]
-        return cmd
+    def job_resource_name(self):
+        """The fully-qualified Cloud Run Job resource:
+        projects/<project>/locations/<region>/jobs/<job-name>. The project is required —
+        without GOOGLE_CLOUD_PROJECT (or an explicit project) there is no resource to run, so
+        we raise here and dispatch turns it into {"dispatched": False, ...} (never a crash)."""
+        if not self._project:
+            raise JobRunnerError(
+                "no project: set %s (or pass project=) to build the Cloud Run Job resource name"
+                % PROJECT_ENV)
+        return "projects/%s/locations/%s/jobs/%s" % (
+            self._project, self._region, self._job_name)
+
+    def build_request(self, job_id):
+        """Construct the run_v2.RunJobRequest for the execution WITHOUT calling GCP — the exact
+        request dispatch will hand to the client. run_v2 message construction is purely offline
+        (no network), so tests assert the shape (resource name + the ["run-job", job_id]
+        container override) with zero GCP and zero spend, and dispatch shares one source of
+        truth for the request. run_v2 is imported HERE (lazily): only code on the cloudrun-job
+        path ever needs google-cloud-run installed."""
+        from google.cloud import run_v2  # lazy: only the prod runner needs google-cloud-run.
+        return run_v2.RunJobRequest(
+            name=self.job_resource_name(),
+            overrides=run_v2.RunJobRequest.Overrides(
+                container_overrides=[
+                    # The override replaces the container's args for THIS execution so its
+                    # command becomes `run-job <job_id>` — BOTH the subcommand and the id.
+                    run_v2.RunJobRequest.Overrides.ContainerOverride(
+                        args=["run-job", job_id]),
+                ],
+            ),
+        )
 
     def dispatch(self, job_id, *, actor_haid=None, home=None, base_env=None):
-        cmd = self.build_command(job_id)
         try:
-            # The ONLY place gcloud is exec'd, and only when this runner is the SELECTED
-            # one at runtime. A short timeout: `execute --wait=false` returns as soon as the
-            # execution is CREATED, not when it finishes. capture so a failure detail is
-            # returned (never printed to a non-existent client socket).
-            proc = subprocess.run(  # noqa: S603 — fixed gcloud argv built above, no shell.
-                cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True,
-                timeout=120, check=False)
-        except (OSError, subprocess.SubprocessError) as exc:
+            # Lazy import: google-cloud-run is needed ONLY here, only when this runner is the
+            # SELECTED one at runtime — the thread/subprocess paths stay pure-stdlib.
+            from google.cloud import run_v2
+        except ImportError as exc:
             return {"dispatched": False, "runner": self.name,
-                    "error": "gcloud_unavailable", "detail": str(exc),
+                    "error": "run_v2_unavailable", "detail": str(exc),
                     "job_name": self._job_name}
-        if proc.returncode != 0:
+        try:
+            request = self.build_request(job_id)
+        except JobRunnerError as exc:
             return {"dispatched": False, "runner": self.name,
-                    "error": "gcloud_execute_failed", "returncode": proc.returncode,
-                    "detail": (proc.stderr or "").strip()[:500],
+                    "error": "no_project", "detail": str(exc),
+                    "job_name": self._job_name}
+        try:
+            # ADC: no explicit credentials — the runtime SA's Application Default Credentials
+            # (already carrying run.jobs.run) authenticate the call. run_job kicks off the
+            # execution and returns an LRO; we do NOT .result()-block on it (the flight fix) —
+            # dispatch returns as soon as the execution is CREATED.
+            client = run_v2.JobsClient()
+            client.run_job(request=request)
+        except Exception as exc:  # noqa: BLE001 — never crash start_route; report + leave queued.
+            return {"dispatched": False, "runner": self.name,
+                    "error": "run_job_failed", "detail": "%s: %s" % (type(exc).__name__, exc),
                     "job_name": self._job_name}
         return {"dispatched": True, "runner": self.name, "mode": "cloud-run-job",
                 "job_name": self._job_name, "region": self._region}

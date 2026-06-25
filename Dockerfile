@@ -34,16 +34,21 @@ RUN apt-get update \
 # state backend (HEIMDALL_STATE_BACKEND=firestore selects it — cp_state.get_backend
 # lazily imports cp_state_firestore.FirestoreBackend, which imports
 # google.cloud.firestore). Without this pin the backend factory raises
-# BackendUnavailable every cp_boot tick. Inlined here (one layer, no deploy/ COPY)
-# so a .dockerignore exclusion of deploy/ cannot silently drop the dep. The pin
-# MUST match deploy/requirements-firestore.txt (the source of truth: 2.16.1).
-# Pinned for reproducible builds.
-RUN pip install --no-cache-dir "cryptography==42.0.8" "google-cloud-firestore==2.16.1"
+# BackendUnavailable every cp_boot tick. google-cloud-run is the durable EXECUTION
+# path: CloudRunJobRunner.dispatch (cp_jobrunner) runs the long job via the Cloud Run
+# Jobs REST API (google.cloud.run_v2.JobsClient.run_job) over the runtime SA's ADC.
+# This image has NO gcloud SDK on purpose — without run_v2 the prod dispatch returns
+# {dispatched: False} and the job stays queued forever. Inlined here (one layer, no
+# deploy/ COPY) so a .dockerignore exclusion of deploy/ cannot silently drop a dep. The
+# pins MUST match deploy/requirements-firestore.txt (the source of truth: firestore
+# 2.16.1, run 0.10.19). Pinned for reproducible builds.
+RUN pip install --no-cache-dir "cryptography==42.0.8" "google-cloud-firestore==2.16.1" "google-cloud-run==0.10.19"
 
 # Build-time dependency guard: import the deps the runtime needs at BUILD time so a
 # missing/incompatible pin FAILS THE BUILD here (cheapest place to catch it) instead
-# of shipping an image that raises BackendUnavailable on every cp_boot tick at runtime.
-RUN python -c "import google.cloud.firestore, cryptography; print('deps OK')"
+# of shipping an image that raises BackendUnavailable on every cp_boot tick (firestore)
+# or returns {dispatched: False} on every prod job dispatch (run_v2) at runtime.
+RUN python -c "import google.cloud.firestore, google.cloud.run_v2, cryptography; print('deps OK')"
 
 # Non-root runtime user (Cloud Run best practice; least privilege).
 RUN groupadd --system heimdall \
