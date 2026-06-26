@@ -124,12 +124,38 @@ if [ "$MODE" = "guided" ]; then
 fi
 
 REBUILD_TAG="${REGION}-docker.pkg.dev/${PROJECT_ID}/heimdall/heimdall-control-plane:${HEAD_SHA}"
+
+# ensure_ar_repo <full-image-tag> — idempotently ensure the Artifact Registry docker repo
+# that <full-image-tag> targets EXISTS before a build pushes into it. The repo is the path
+# segment after the project id (…/${PROJECT_ID}/<repo>/<image>:<tag>). guided: describe ->
+# present, skip; absent -> create (docker format, ${REGION}). plan: PRINT describe+create and
+# mutate NOTHING (run() no-ops). Without this the push fails: name unknown: Repository "<repo>"
+# not found (the repo is not auto-created by `builds submit --tag`).
+ensure_ar_repo() {
+  local tag="$1" repo
+  repo="${tag##*.pkg.dev/${PROJECT_ID}/}"   # -> <repo>/<image>:<tag>
+  repo="${repo%%/*}"                          # -> <repo>
+  [ -n "${repo}" ] && [ "${repo}" != "${tag}" ] \
+    || die "STEP 2: could not derive the Artifact Registry repo from tag '${tag}'."
+  note "ensure Artifact Registry repo '${repo}' exists (${REGION}, docker) before the push:"
+  if [ "$MODE" = "guided" ] \
+     && gcloud artifacts repositories describe "${repo}" --location="${REGION}" --project="${PROJECT_ID}" >/dev/null 2>&1; then
+    say "  AR repo ${repo} already exists — skipping create"
+    return 0
+  fi
+  show "gcloud artifacts repositories describe ${repo} --location=${REGION} --project=${PROJECT_ID}"
+  run gcloud artifacts repositories create "${repo}" \
+    --repository-format=docker --location="${REGION}" --project="${PROJECT_ID}" \
+    || die "STEP 2: could not create Artifact Registry repo '${repo}' (${REGION}) — the build push would fail with: name unknown: Repository \"${repo}\" not found."
+}
+
 if [ -n "${LIVE_IMAGE}" ] && printf '%s' "${LIVE_IMAGE}" | grep -qF ":${HEAD_SHA}"; then
   say "STEP 2 SKIP — gated service already serves a current-main (${HEAD_SHA}) image:"
   note "${LIVE_IMAGE}"
 else
   [ -n "${LIVE_IMAGE}" ] && note "gated currently serves: ${LIVE_IMAGE} (not current-main ${HEAD_SHA}) — rebuilding"
   note "build the current-main image to Artifact Registry, then redeploy the gated service onto it:"
+  ensure_ar_repo "${REBUILD_TAG}"   # the target AR repo must EXIST before the push (else: Repository not found)
   run gcloud builds submit "${REPO_ROOT}" --project="${PROJECT_ID}" --tag="${REBUILD_TAG}" \
     || die "STEP 2: gcloud builds submit failed — gated image not rebuilt."
   # Redeploy the gated service onto the freshly-built image (README §3 envelope), pinned
