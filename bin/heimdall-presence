@@ -10,15 +10,27 @@
 #   heimdall-presence beat            send a heartbeat for THIS repo's project + identity.
 #   heimdall-presence roster [--json] print the ONLINE team for THIS repo's project.
 #
-# IDENTITY / PROJECT / WIRE (resolved, with env + flag overrides):
+# ZERO-CONFIG. A dev's FIRST beat/roster auto-resolves everything — the dev exports
+# NOTHING. The CP url comes from a shipped local config, the signing key is auto-generated
+# + auto-enrolled + persisted on first use, the project id is stable across clones, and the
+# handle comes from heimdall-identity. Manual env overrides still win where set.
+#
+# IDENTITY / PROJECT / WIRE (resolved; flag > env > config/derive):
 #   identity HAID : --haid > $HMD_HAID > `heimdall-identity current` (if present)
 #                 > `heimdall-haid current`.
-#   project       : --project > $HMD_PROJECT > the git remote basename > the repo dir name.
-#   server URL    : --url > $HEIMDALL_CP_URL > $BASE_URL.
-#   signing seed  : $HEIMDALL_CP_PKI_KEY > $PKI_SEED  (base64 Ed25519 seed; in-process
-#                   only, NEVER printed/logged/argv'd). The dev's haid->pubkey must be
-#                   registered on the server (heimdall-control-plane identity) to verify.
-#   beat data     : --handle/$HMD_HANDLE, --verdict/$HMD_VERDICT, --file/$HMD_FILE.
+#   project       : --project > the NORMALIZED git remote (host+path, scheme/user/port
+#                   stripped, .git dropped, lowercased — so every CLONE of one remote shares
+#                   ONE project id) > $HMD_PROJECT > the repo dir name.
+#   server URL    : --url > $HEIMDALL_CP_URL > $BASE_URL > local config
+#                   ${HOME}/.heimdall/cp-endpoint.json `.url` > none (offline).
+#   signing seed  : $HEIMDALL_CP_PKI_KEY > $PKI_SEED > persisted ${HOME}/.heimdall/pki/
+#                   <haid>.seed (mode 0600) > AUTO-BOOTSTRAP — keygen (cp_auth), POST
+#                   {url}/enroll {haid, pubkey, handle} with the config's enroll_token,
+#                   persist the seed 0600, reuse it thereafter. The seed lives in-process +
+#                   the 0600 file ONLY — NEVER printed/logged/argv'd. A failed enroll is
+#                   throttled (an mtime stamp) so it never hammers the server per render.
+#   handle        : --handle > $HMD_HANDLE > `heimdall-identity --handle`.
+#   beat data     : --verdict/$HMD_VERDICT, --file/$HMD_FILE.
 #
 # GRACEFUL DEGRADE (the statusline reads this — it MUST never traceback). With NO URL or
 # NO seed, or on ANY transport/auth failure, `roster` prints a CLEAN EMPTY roster ([] for
@@ -62,7 +74,42 @@ beat_noop() { exit 0; }   # an unconfigured/failed beat is a silent no-op (offli
 [ -n "$PY" ] || { [ "$SUB" = "roster" ] && emit_empty_roster || beat_noop; }
 [ -f "$LIB/cp_auth.py" ] || { [ "$SUB" = "roster" ] && emit_empty_roster || beat_noop; }
 
-# ── resolve identity / project / wire (flag > env > derive) ────────────────────
+# ── local config (${HOME}/.heimdall/cp-endpoint.json) — the shipped CP endpoint ──
+# Zero-config: the install ships {url, enroll_token} here so a dev exports NOTHING. Parsed
+# via python (already required above) so there is no jq dependency on the degrade path.
+HMD_DIR="${HOME:-}/.heimdall"
+CONFIG_FILE="$HMD_DIR/cp-endpoint.json"
+CFG_URL=""; CFG_TOKEN=""
+if [ -n "${HOME:-}" ] && [ -f "$CONFIG_FILE" ]; then
+  CFG_OUT="$("$PY" - "$CONFIG_FILE" 2>/dev/null <<'PYEOF' || true
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    sys.stdout.write((d.get("url") or "") + "\n" + (d.get("enroll_token") or "") + "\n")
+except Exception:
+    sys.stdout.write("\n\n")
+PYEOF
+)"
+  CFG_URL="$(printf '%s\n' "$CFG_OUT" | sed -n '1p')"
+  CFG_TOKEN="$(printf '%s\n' "$CFG_OUT" | sed -n '2p')"
+fi
+
+# Normalize a git remote URL to a STABLE project id: host+path, with scheme/userinfo/port
+# stripped, an scp-style "host:path" colon -> "/", a trailing .git dropped, lowercased. All
+# clones of one remote (https or ssh, any user/port) collapse to ONE id, so teammates on
+# other machines/clones land in the SAME project.
+normalize_remote() {
+  printf '%s' "$1" \
+    | sed -e 's#^[a-zA-Z][a-zA-Z0-9+.-]*://##' \
+          -e 's#^[^@/]*@##' \
+          -e 's#:[0-9][0-9]*/#/#' \
+          -e 's#:#/#' \
+          -e 's#\.git$##' \
+          -e 's#/$##' \
+    | tr '[:upper:]' '[:lower:]'
+}
+
+# ── resolve identity / project / wire (flag > env > config/derive) ─────────────
 [ -n "$HAID" ] || HAID="${HMD_HAID:-}"
 if [ -z "$HAID" ]; then
   if [ -x "$IDENTITY_CLI" ]; then HAID="$("$IDENTITY_CLI" current 2>/dev/null || true)"; fi
@@ -71,29 +118,47 @@ if [ -z "$HAID" ] && [ -x "$HAID_CLI" ]; then
   HAID="$("$HAID_CLI" current 2>/dev/null || true)"
 fi
 
-# project = the repo name: an explicit override, else the git remote basename, else the
-# working tree's top-level dir name. Derived from CWD so the project tracks the repo the
-# dev is actually in (not the heimdall checkout that hosts this script).
-[ -n "$PROJECT" ] || PROJECT="${HMD_PROJECT:-}"
+# project = STABLE across clones: --project flag wins; else the NORMALIZED git remote (so
+# every clone of one remote shares ONE id, putting teammates in the SAME project); else
+# $HMD_PROJECT; else the working tree's top-level dir name. Derived from CWD so the project
+# tracks the repo the dev is in (not the heimdall checkout that hosts this script).
 if [ -z "$PROJECT" ]; then
   REMOTE_URL="$(git config --get remote.origin.url 2>/dev/null || true)"
-  if [ -n "$REMOTE_URL" ]; then
-    PROJECT="$(basename "$REMOTE_URL" .git)"
-  else
+  [ -n "$REMOTE_URL" ] && PROJECT="$(normalize_remote "$REMOTE_URL")"
+  [ -n "$PROJECT" ] || PROJECT="${HMD_PROJECT:-}"
+  if [ -z "$PROJECT" ]; then
     TOP="$(git rev-parse --show-toplevel 2>/dev/null || true)"
     [ -n "$TOP" ] && PROJECT="$(basename "$TOP")"
   fi
 fi
 
 [ -n "$URL" ] || URL="${HEIMDALL_CP_URL:-${BASE_URL:-}}"
+[ -n "$URL" ] || URL="$CFG_URL"
+ENROLL_TOKEN="$CFG_TOKEN"   # the bootstrap enroll credential (config-only; never derived).
 SEED="${HEIMDALL_CP_PKI_KEY:-${PKI_SEED:-}}"
 [ -n "$HANDLE" ]  || HANDLE="${HMD_HANDLE:-}"
+if [ -z "$HANDLE" ] && [ -x "$IDENTITY_CLI" ]; then
+  HANDLE="$("$IDENTITY_CLI" --handle 2>/dev/null || true)"
+fi
 [ -n "$VERDICT" ] || VERDICT="${HMD_VERDICT:-}"
 [ -n "$FILE" ]    || FILE="${HMD_FILE:-}"
 
-# OFFLINE / UNCONFIGURED -> clean degrade (no URL, no seed, or no identity). The
-# statusline relies on this: presence is a best-effort overlay, never a hard dependency.
-if [ -z "$URL" ] || [ -z "$SEED" ] || [ -z "$HAID" ] || [ -z "$PROJECT" ]; then
+# Per-(machine,repo) seed + enroll-throttle paths, keyed by haid (slugged so ':' and '/'
+# never break the filename). The seed material lives ONLY in this 0600 file + the signing
+# process — the bash side handles the PATH, never the seed bytes.
+PKI_DIR=""; SEED_FILE=""; ENROLL_STAMP=""
+if [ -n "${HOME:-}" ] && [ -n "$HAID" ]; then
+  PKI_DIR="$HMD_DIR/pki"
+  HAID_SLUG="$(printf '%s' "$HAID" | tr '/:' '__')"
+  SEED_FILE="$PKI_DIR/$HAID_SLUG.seed"
+  ENROLL_STAMP="$PKI_DIR/$HAID_SLUG.enroll-attempt"
+fi
+
+# OFFLINE / UNCONFIGURED -> clean degrade. We need a URL, an identity, and a project; the
+# SEED may legitimately be ABSENT here — the client auto-bootstraps it in-process below
+# (persisted 0600 seed, else keygen+enroll). With no URL/identity/project there is nothing
+# to do. The statusline relies on this: presence is a best-effort overlay, never a hard dep.
+if [ -z "$URL" ] || [ -z "$HAID" ] || [ -z "$PROJECT" ]; then
   case "$SUB" in
     roster) emit_empty_roster ;;
     beat)   beat_noop ;;
@@ -101,34 +166,38 @@ if [ -z "$URL" ] || [ -z "$SEED" ] || [ -z "$HAID" ] || [ -z "$PROJECT" ]; then
 fi
 
 # ── the signed HTTP client (REUSE the shipped cp_auth signer over urllib) ──────
-# The seed is read from the SEED env in-process (NEVER argv — argv shows in `ps`) and is
-# never printed. POST /presence carries the heartbeat body; GET /roster?project=<p> is the
-# GFE-safe read (job_id-style: project in the QUERY, EMPTY body — Google's GFE rejects a
-# GET-with-a-body). The signature covers the FULL path-with-query (canonical_message), so
-# the read is authenticated + tamper-evident. Mirrors deploy/cloud-run remote_client.py.
+# The seed is resolved IN-PROCESS (env > the 0600 seed file > auto-bootstrap) and is NEVER
+# argv'd (argv shows in `ps`) or printed — only the seed-file PATH crosses from bash. POST
+# /presence carries the heartbeat body; GET /roster?project=<p> is the GFE-safe read
+# (job_id-style: project in the QUERY, EMPTY body — Google's GFE rejects a GET-with-a-body).
+# The signature covers the FULL path-with-query (canonical_message), so the read is
+# authenticated + tamper-evident. Mirrors deploy/cloud-run remote_client.py.
 run_client() {
   LIB="$LIB" PRES_URL="$URL" PRES_HAID="$HAID" PRES_SEED="$SEED" \
+  PRES_SEED_FILE="$SEED_FILE" PRES_ENROLL_TOKEN="$ENROLL_TOKEN" \
+  PRES_ENROLL_STAMP="$ENROLL_STAMP" PRES_THROTTLE="${HMD_ENROLL_THROTTLE:-180}" \
   PRES_PROJECT="$PROJECT" PRES_HANDLE="$HANDLE" PRES_VERDICT="$VERDICT" \
   PRES_FILE="$FILE" PRES_VERB="$1" PRES_JSON="$JSON" "$PY" - <<'PYEOF'
+import contextlib
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 
 sys.path.insert(0, os.environ["LIB"])
-import cp_auth as K  # the SHIPPED Ed25519 signer — never re-implemented.
+import cp_auth as K  # the SHIPPED Ed25519 signer + keygen — never re-implemented.
 
 BASE = os.environ["PRES_URL"].rstrip("/")
 HAID = os.environ["PRES_HAID"]
-SEED = os.environ["PRES_SEED"]            # base64 Ed25519 seed; in-process only.
 VERB = os.environ["PRES_VERB"]
 AS_JSON = bool(os.environ.get("PRES_JSON"))
 
 
-def request(method, path, body=b"", *, timeout=10):
-    """Sign canonical_message(METHOD, PATH, BODY) with the seed and drive an HTTPS request.
+def request(method, path, body, seed, *, timeout=10):
+    """Sign canonical_message(METHOD, PATH, BODY) with `seed` and drive an HTTPS request.
     `path` is the FULL path AS TRANSMITTED (incl. any ?query — the signature covers it).
     An EMPTY body is sent as a TRUE bodyless request (data=None) so a GFE-safe GET carries
     no body. Returns (status, parsed_dict); a transport error returns (0, {})."""
@@ -139,7 +208,7 @@ def request(method, path, body=b"", *, timeout=10):
     req.add_header("X-Heimdall-HAID", HAID)
     if data is not None:
         req.add_header("Content-Type", "application/json")
-    req.add_header("X-Heimdall-Signature", K.sign(SEED, K.canonical_message(method, path, body)))
+    req.add_header("X-Heimdall-Signature", K.sign(seed, K.canonical_message(method, path, body)))
     token = os.environ.get("ID_TOKEN") or ""   # optional Cloud Run IAM bearer.
     if token:
         req.add_header("Authorization", "Bearer " + token)
@@ -155,6 +224,104 @@ def request(method, path, body=b"", *, timeout=10):
             return exc.code, {}
     except Exception:  # noqa: BLE001 — any transport/TLS/DNS fault degrades to offline.
         return 0, {}
+
+
+# ── seed resolution + auto-bootstrap (zero-config: keygen -> enroll -> persist) ──
+
+
+def _enroll(body, token, *, timeout=10):
+    """The bootstrap enroll: POST /enroll {haid, pubkey, handle} with the config's
+    enroll_token in X-Heimdall-Enroll-Token. UNSIGNED by design — this is the chicken-and-
+    egg step that REGISTERS the key, so no signature exists yet; the token is the bootstrap
+    credential. Returns the HTTP status (0 on any transport error)."""
+    req = urllib.request.Request(BASE + "/enroll", data=body, method="POST")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("X-Heimdall-HAID", HAID)
+    req.add_header("X-Heimdall-Enroll-Token", token)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            resp.read()
+            return resp.status
+    except urllib.error.HTTPError as exc:
+        return exc.code
+    except Exception:  # noqa: BLE001 — offline / DNS / TLS -> a failed enroll.
+        return 0
+
+
+def _persisted_seed():
+    """The base64 seed from the per-(machine,repo) 0600 file, or '' if absent/unreadable.
+    Read here so the seed material stays in this process + the file ONLY (never bash/argv)."""
+    path = os.environ.get("PRES_SEED_FILE") or ""
+    if not path or not os.path.exists(path):
+        return ""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+def _bootstrap_seed():
+    """Auto-enroll once: keygen (cp_auth) -> POST /enroll with the token -> persist the seed
+    0600 -> return it. Throttled by an mtime stamp so a FAILING enroll does NOT hammer the
+    server every render. Silent + non-fatal: ANY failure returns '' (the caller degrades to
+    offline). Runs at most once — a later render finds the persisted seed and skips this."""
+    token = os.environ.get("PRES_ENROLL_TOKEN") or ""
+    seed_file = os.environ.get("PRES_SEED_FILE") or ""
+    if not token or not seed_file:
+        return ""   # no bootstrap credential / nowhere to persist -> stay offline.
+    stamp = os.environ.get("PRES_ENROLL_STAMP") or ""
+    throttle = float(os.environ.get("PRES_THROTTLE") or "180")
+    now = time.time()
+    # Back off if we attempted recently — a failed enroll must not retry every render.
+    if stamp and os.path.exists(stamp):
+        recent = False
+        with contextlib.suppress(OSError):
+            recent = (now - os.path.getmtime(stamp)) < throttle
+        if recent:
+            return ""
+    try:
+        os.makedirs(os.path.dirname(seed_file), mode=0o700, exist_ok=True)
+    except OSError:
+        return ""
+    # Stamp the attempt BEFORE the network call so a crash/failure still throttles.
+    if stamp:
+        with contextlib.suppress(OSError), open(stamp, "w", encoding="utf-8") as fh:
+            fh.write("%f" % now)
+    try:
+        priv_b64, pub_b64 = K.generate_keypair()  # REUSE — never hand-roll Ed25519.
+    except Exception:  # noqa: BLE001 — crypto unavailable / keygen fault -> offline.
+        return ""
+    body = json.dumps({
+        "haid": HAID,
+        "pubkey": pub_b64,
+        "handle": os.environ.get("PRES_HANDLE") or None,
+    }).encode("utf-8")
+    if not 200 <= _enroll(body, token) < 300:
+        return ""   # enroll refused/offline -> no seed (the stamp throttles the retry).
+    # Persist the seed 0600 (created restrictively; never world/group-readable).
+    try:
+        fd = os.open(seed_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, priv_b64.encode("ascii"))
+        finally:
+            os.close(fd)
+        os.chmod(seed_file, 0o600)
+    except OSError:
+        return ""
+    return priv_b64
+
+
+def resolve_seed():
+    """The signing seed: $HEIMDALL_CP_PKI_KEY/$PKI_SEED (PRES_SEED) > the persisted 0600
+    seed > AUTO-BOOTSTRAP (keygen + enroll + persist). '' when none resolves -> offline."""
+    env_seed = os.environ.get("PRES_SEED") or ""
+    if env_seed:
+        return env_seed
+    persisted = _persisted_seed()
+    if persisted:
+        return persisted
+    return _bootstrap_seed()
 
 
 def render_roster(rows):
@@ -176,6 +343,14 @@ def render_roster(rows):
 
 
 def main():
+    # Resolve the signing seed IN-PROCESS (env > persisted 0600 > auto-bootstrap). When no
+    # seed resolves (offline / enroll failed / throttled), degrade cleanly: an empty roster
+    # / a no-op beat. The statusline must NEVER break on a virgin, unenrolled checkout.
+    seed = resolve_seed()
+    if not seed:
+        if VERB == "roster":
+            render_roster([])
+        return 0
     if VERB == "beat":
         body = json.dumps({
             "project": os.environ.get("PRES_PROJECT") or "",
@@ -183,14 +358,14 @@ def main():
             "verdict": os.environ.get("PRES_VERDICT") or None,
             "file": os.environ.get("PRES_FILE") or None,
         }).encode()
-        st, _ = request("POST", "/presence", body)
+        request("POST", "/presence", body, seed)
         # A beat is fire-and-forget: success or not, never surface an error to the caller
         # (the statusline must not break on a flaky beat). Exit 0 always.
         return 0
     if VERB == "roster":
         project = os.environ.get("PRES_PROJECT") or ""
         path = "/roster?" + urllib.parse.urlencode({"project": project})
-        st, b = request("GET", path, b"")
+        st, b = request("GET", path, b"", seed)
         rows = b.get("roster") if isinstance(b, dict) else None
         render_roster(rows if isinstance(rows, list) else [])
         return 0
@@ -219,9 +394,13 @@ heimdall-presence — server-synced team presence
   heimdall-presence beat              send a heartbeat for this repo's project + identity
   heimdall-presence roster [--json]   print the online team for this repo's project
 
-Overrides: --haid --project --url --handle --verdict --file
-Env: HMD_HAID HMD_PROJECT HMD_HANDLE HMD_VERDICT HMD_FILE
-     HEIMDALL_CP_URL|BASE_URL  HEIMDALL_CP_PKI_KEY|PKI_SEED
+ZERO-CONFIG: with ${HOME}/.heimdall/cp-endpoint.json shipped, the first beat/roster
+auto-resolves the url, auto-generates+enrolls+persists a 0600 signing key, derives a
+stable project id from the git remote, and reads the handle from heimdall-identity — the
+dev exports NOTHING. Overrides still win:
+  Overrides: --haid --project --url --handle --verdict --file
+  Env: HMD_HAID HMD_PROJECT HMD_HANDLE HMD_VERDICT HMD_FILE HMD_ENROLL_THROTTLE
+       HEIMDALL_CP_URL|BASE_URL  HEIMDALL_CP_PKI_KEY|PKI_SEED
 Offline/unconfigured degrades cleanly (empty roster, no-op beat, exit 0).
 USAGE
     ;;
