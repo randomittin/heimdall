@@ -66,6 +66,48 @@ Scaffolds a real full-stack task, builds it, ends with a summary card and a foll
 
 ---
 
+## Viral statusline — watchman, team wall, gate animation
+
+Heimdall's status bar is a full-width, four-row watchman HUD. It renders entirely shell-side (zero model, zero context cost) and reads Claude Code's `statusLine` JSON on stdin. Three surfaces, by how far they spread:
+
+**Your sigil — the identity hook.** Every Heimdall identity (`HAID`) gets a unique, deterministic pixel watchman: same identity, same sigil, forever. It anchors the left of the line, prints big on the install card, and shares as a postable block:
+
+```bash
+python3 sentinels/hmd-sigil.py --seed $HMD_HAID --size large   # share/banner render
+bash hooks/hmd-banner.sh --share                               # postable "my watchman" card
+```
+
+The seed is your **HAID by default** — automatic, stable, no PII in the art. Works solo on day one, before any teammate shows up.
+
+**The team watch wall — the headline, and the moat.** When teammates also run `hmd` in the same repo, the bottom row becomes a live wall of their watchmen and what each agent is doing — gate state colored in, a teammate's cell flashing red the instant their gate denies. Nobody else can render this; it needs Heimdall's coordination substrate. The wall is empty until your team joins, so the feature recruits your team for you.
+
+Presence is **opt-in per repo** — each running `hmd` heartbeats `<repo>/.heimdall/team/<haid>.json` (TTL ~30s; a stale file means the agent left). Names live in the repo's team dir and never leave it; default off for non-team repos. The watchman watches your gates, not your team. At squad scale the wall caps at the **~6 most-recently-active** teammates plus a `+N more` tail so a wide terminal never wraps.
+
+**The deny flash — the clip.** When a gate blocks, `hmd-gate-anim.sh` redraws the big watchman inline: a scanning pulse settling to a green sparkle on pass, or three red beats and `✗ BIFRÖST CLOSED` on deny. TTY-only — in CI or a pipe it collapses to one clean final frame so logs stay readable.
+
+```bash
+bash sentinels/hmd-gate-anim.sh deny "oracle/falsify" $HMD_HAID
+```
+
+**Wiring** (`settings.json`):
+
+```json
+{
+  "statusLine":         {"type":"command","command":"bash ${CLAUDE_PLUGIN_ROOT}/hooks/statusline.sh"},
+  "subagentStatusLine": {"type":"command","command":"bash ${CLAUDE_PLUGIN_ROOT}/sentinels/hmd-subagent-statusline.sh"}
+}
+```
+
+`hooks/statusline.sh` drives the full-width watchman and falls back to the legacy single line if `python3` is missing — it never errors, never blocks. Already a ccstatusline (9.2k★) user? Keep your line and drop the watchman in as a Custom Command widget:
+
+```bash
+python3 sentinels/hmd-statusline.py --widget   # just the watchman + verdict segment
+```
+
+The sigil ships solo-first (viral-cheap, no team required); the watch wall is the team-gated headline that lights up once presence is wired into your gate hooks.
+
+---
+
 ## Running on your own work
 
 ```bash
