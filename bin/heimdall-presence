@@ -1,0 +1,229 @@
+#!/usr/bin/env bash
+# heimdall-presence — the dev-side client for SERVER-SYNCED TEAM PRESENCE.
+#
+# WHAT IT IS. A dev's hmd reports WHERE it is working (a heartbeat) to the control plane,
+# and any dev can read the ONLINE team for the current project. Presence is synced
+# THROUGH the server (cp_presence on the StateBackend seam — Firestore-durable on Cloud
+# Run), not via local files, so a dev sees teammates on OTHER machines.
+#
+# SUBCOMMANDS
+#   heimdall-presence beat            send a heartbeat for THIS repo's project + identity.
+#   heimdall-presence roster [--json] print the ONLINE team for THIS repo's project.
+#
+# IDENTITY / PROJECT / WIRE (resolved, with env + flag overrides):
+#   identity HAID : --haid > $HMD_HAID > `heimdall-identity current` (if present)
+#                 > `heimdall-haid current`.
+#   project       : --project > $HMD_PROJECT > the git remote basename > the repo dir name.
+#   server URL    : --url > $HEIMDALL_CP_URL > $BASE_URL.
+#   signing seed  : $HEIMDALL_CP_PKI_KEY > $PKI_SEED  (base64 Ed25519 seed; in-process
+#                   only, NEVER printed/logged/argv'd). The dev's haid->pubkey must be
+#                   registered on the server (heimdall-control-plane identity) to verify.
+#   beat data     : --handle/$HMD_HANDLE, --verdict/$HMD_VERDICT, --file/$HMD_FILE.
+#
+# GRACEFUL DEGRADE (the statusline reads this — it MUST never traceback). With NO URL or
+# NO seed, or on ANY transport/auth failure, `roster` prints a CLEAN EMPTY roster ([] for
+# --json) and exits 0; `beat` is a silent no-op and exits 0. Offline is normal, not an
+# error. The signing path REUSES the shipped cp_auth signer — never hand-rolled Ed25519.
+
+set -uo pipefail
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(cd "$SELF_DIR/.." && pwd)"
+LIB="$REPO/bin/lib"
+HAID_CLI="$SELF_DIR/heimdall-haid"
+IDENTITY_CLI="$SELF_DIR/heimdall-identity"   # forward-compat: preferred when present.
+
+PY="$(command -v python3 || command -v python || true)"
+
+# ── parse argv (subcommand + option-style overrides) ───────────────────────────
+SUB="${1:-}"; shift || true
+HAID=""; PROJECT=""; URL=""; HANDLE=""; VERDICT=""; FILE=""; JSON=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --haid)    HAID="${2:?--haid needs a value}"; shift 2 ;;
+    --project) PROJECT="${2:?--project needs a value}"; shift 2 ;;
+    --url)     URL="${2:?--url needs a value}"; shift 2 ;;
+    --handle)  HANDLE="${2:?--handle needs a value}"; shift 2 ;;
+    --verdict) VERDICT="${2:?--verdict needs a value}"; shift 2 ;;
+    --file)    FILE="${2:?--file needs a value}"; shift 2 ;;
+    --json)    JSON="1"; shift ;;
+    *) echo "heimdall-presence: unexpected argument: $1" >&2; exit 2 ;;
+  esac
+done
+
+# `roster --json` with nothing configured must STILL emit a clean empty roster — define
+# the offline emitters up front so every degrade path is one call (no traceback, exit 0).
+emit_empty_roster() {
+  if [ -n "$JSON" ]; then printf '[]\n'; else printf 'presence: no teammates online\n'; fi
+  exit 0
+}
+beat_noop() { exit 0; }   # an unconfigured/failed beat is a silent no-op (offline is fine).
+
+[ -n "$PY" ] || { [ "$SUB" = "roster" ] && emit_empty_roster || beat_noop; }
+[ -f "$LIB/cp_auth.py" ] || { [ "$SUB" = "roster" ] && emit_empty_roster || beat_noop; }
+
+# ── resolve identity / project / wire (flag > env > derive) ────────────────────
+[ -n "$HAID" ] || HAID="${HMD_HAID:-}"
+if [ -z "$HAID" ]; then
+  if [ -x "$IDENTITY_CLI" ]; then HAID="$("$IDENTITY_CLI" current 2>/dev/null || true)"; fi
+fi
+if [ -z "$HAID" ] && [ -x "$HAID_CLI" ]; then
+  HAID="$("$HAID_CLI" current 2>/dev/null || true)"
+fi
+
+# project = the repo name: an explicit override, else the git remote basename, else the
+# working tree's top-level dir name. Derived from CWD so the project tracks the repo the
+# dev is actually in (not the heimdall checkout that hosts this script).
+[ -n "$PROJECT" ] || PROJECT="${HMD_PROJECT:-}"
+if [ -z "$PROJECT" ]; then
+  REMOTE_URL="$(git config --get remote.origin.url 2>/dev/null || true)"
+  if [ -n "$REMOTE_URL" ]; then
+    PROJECT="$(basename "$REMOTE_URL" .git)"
+  else
+    TOP="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+    [ -n "$TOP" ] && PROJECT="$(basename "$TOP")"
+  fi
+fi
+
+[ -n "$URL" ] || URL="${HEIMDALL_CP_URL:-${BASE_URL:-}}"
+SEED="${HEIMDALL_CP_PKI_KEY:-${PKI_SEED:-}}"
+[ -n "$HANDLE" ]  || HANDLE="${HMD_HANDLE:-}"
+[ -n "$VERDICT" ] || VERDICT="${HMD_VERDICT:-}"
+[ -n "$FILE" ]    || FILE="${HMD_FILE:-}"
+
+# OFFLINE / UNCONFIGURED -> clean degrade (no URL, no seed, or no identity). The
+# statusline relies on this: presence is a best-effort overlay, never a hard dependency.
+if [ -z "$URL" ] || [ -z "$SEED" ] || [ -z "$HAID" ] || [ -z "$PROJECT" ]; then
+  case "$SUB" in
+    roster) emit_empty_roster ;;
+    beat)   beat_noop ;;
+  esac
+fi
+
+# ── the signed HTTP client (REUSE the shipped cp_auth signer over urllib) ──────
+# The seed is read from the SEED env in-process (NEVER argv — argv shows in `ps`) and is
+# never printed. POST /presence carries the heartbeat body; GET /roster?project=<p> is the
+# GFE-safe read (job_id-style: project in the QUERY, EMPTY body — Google's GFE rejects a
+# GET-with-a-body). The signature covers the FULL path-with-query (canonical_message), so
+# the read is authenticated + tamper-evident. Mirrors deploy/cloud-run remote_client.py.
+run_client() {
+  LIB="$LIB" PRES_URL="$URL" PRES_HAID="$HAID" PRES_SEED="$SEED" \
+  PRES_PROJECT="$PROJECT" PRES_HANDLE="$HANDLE" PRES_VERDICT="$VERDICT" \
+  PRES_FILE="$FILE" PRES_VERB="$1" PRES_JSON="$JSON" "$PY" - <<'PYEOF'
+import json
+import os
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+sys.path.insert(0, os.environ["LIB"])
+import cp_auth as K  # the SHIPPED Ed25519 signer — never re-implemented.
+
+BASE = os.environ["PRES_URL"].rstrip("/")
+HAID = os.environ["PRES_HAID"]
+SEED = os.environ["PRES_SEED"]            # base64 Ed25519 seed; in-process only.
+VERB = os.environ["PRES_VERB"]
+AS_JSON = bool(os.environ.get("PRES_JSON"))
+
+
+def request(method, path, body=b"", *, timeout=10):
+    """Sign canonical_message(METHOD, PATH, BODY) with the seed and drive an HTTPS request.
+    `path` is the FULL path AS TRANSMITTED (incl. any ?query — the signature covers it).
+    An EMPTY body is sent as a TRUE bodyless request (data=None) so a GFE-safe GET carries
+    no body. Returns (status, parsed_dict); a transport error returns (0, {})."""
+    if isinstance(body, str):
+        body = body.encode("utf-8")
+    data = body if body else None
+    req = urllib.request.Request(BASE + path, data=data, method=method)
+    req.add_header("X-Heimdall-HAID", HAID)
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+    req.add_header("X-Heimdall-Signature", K.sign(SEED, K.canonical_message(method, path, body)))
+    token = os.environ.get("ID_TOKEN") or ""   # optional Cloud Run IAM bearer.
+    if token:
+        req.add_header("Authorization", "Bearer " + token)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read()
+            return resp.status, (json.loads(raw) if raw else {})
+    except urllib.error.HTTPError as exc:
+        raw = exc.read()
+        try:
+            return exc.code, (json.loads(raw) if raw else {})
+        except (ValueError, TypeError):
+            return exc.code, {}
+    except Exception:  # noqa: BLE001 — any transport/TLS/DNS fault degrades to offline.
+        return 0, {}
+
+
+def render_roster(rows):
+    """Print the online team. --json -> the raw roster list; else one line per dev:
+    <handle-or-haid>  <verdict>  <file>  (<age>s ago)."""
+    if AS_JSON:
+        sys.stdout.write(json.dumps(rows, indent=2, sort_keys=True) + "\n")
+        return
+    if not rows:
+        sys.stdout.write("presence: no teammates online\n")
+        return
+    for r in rows:
+        who = r.get("handle") or r.get("haid") or "?"
+        verdict = r.get("verdict") or "-"
+        where = r.get("file") or "-"
+        age = r.get("age_seconds")
+        age_s = ("%ss ago" % age) if age is not None else ""
+        sys.stdout.write("%-24s  %-12s  %-28s  %s\n" % (who, verdict, where, age_s))
+
+
+def main():
+    if VERB == "beat":
+        body = json.dumps({
+            "project": os.environ.get("PRES_PROJECT") or "",
+            "handle": os.environ.get("PRES_HANDLE") or None,
+            "verdict": os.environ.get("PRES_VERDICT") or None,
+            "file": os.environ.get("PRES_FILE") or None,
+        }).encode()
+        st, _ = request("POST", "/presence", body)
+        # A beat is fire-and-forget: success or not, never surface an error to the caller
+        # (the statusline must not break on a flaky beat). Exit 0 always.
+        return 0
+    if VERB == "roster":
+        project = os.environ.get("PRES_PROJECT") or ""
+        path = "/roster?" + urllib.parse.urlencode({"project": project})
+        st, b = request("GET", path, b"")
+        rows = b.get("roster") if isinstance(b, dict) else None
+        render_roster(rows if isinstance(rows, list) else [])
+        return 0
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception:  # noqa: BLE001 — never traceback; degrade to offline/empty.
+        if AS_JSON:
+            sys.stdout.write("[]\n")
+        elif VERB == "roster":
+            sys.stdout.write("presence: no teammates online\n")
+        sys.exit(0)
+PYEOF
+}
+
+case "$SUB" in
+  beat)   run_client beat ;;
+  roster) run_client roster ;;
+  ""|-h|--help|help)
+    cat <<'USAGE'
+heimdall-presence — server-synced team presence
+
+  heimdall-presence beat              send a heartbeat for this repo's project + identity
+  heimdall-presence roster [--json]   print the online team for this repo's project
+
+Overrides: --haid --project --url --handle --verdict --file
+Env: HMD_HAID HMD_PROJECT HMD_HANDLE HMD_VERDICT HMD_FILE
+     HEIMDALL_CP_URL|BASE_URL  HEIMDALL_CP_PKI_KEY|PKI_SEED
+Offline/unconfigured degrades cleanly (empty roster, no-op beat, exit 0).
+USAGE
+    ;;
+  *) echo "heimdall-presence: unknown subcommand '$SUB' (try: beat | roster)" >&2; exit 2 ;;
+esac
