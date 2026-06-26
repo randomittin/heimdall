@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
-# ship.sh — scan, push, and verify origin in one step ("step 1", automated).
+# ship.sh — bump, scan, push, verify, and release in one step ("step 1", automated).
 #
 # Runs the full routine you've been doing by hand:
+#   0. VERSION BUMP — bump .claude-plugin/plugin.json (default: patch), commit it.
+#      This is what makes auto-update fire: bin/heimdall-autoupdate compares the
+#      installed plugin.json version to the GitHub releases/latest tag, so a ship
+#      MUST advance the version + publish a Release or no client rolls forward.
 #   1. preview the commits about to ship (origin/BRANCH..HEAD)
 #   2. local gitleaks scan over FULL history — stop & do NOT push if anything is found
 #   3. git push origin BRANCH  (the repo's own pre-push guard also fires here)
@@ -9,13 +13,20 @@
 #        (a) gitleaks clean on the pushed history
 #        (b) every author+committer email is on the identity allowlist
 #        (c) origin HEAD matches local HEAD
+#   5. TAG + GitHub RELEASE (only AFTER R9 passes — release only verified-clean
+#      history): git tag vX.Y.Z, push the tag, gh release create --generate-notes.
 #
 # Stops at the first failure. Nothing is pushed if the local scan finds leaks.
 # Exit 0 = everything green.
 #
 # Usage:
-#   release/ship.sh            full: scan -> push -> R9 verify
-#   release/ship.sh --check    local scan + pending-commit preview, do NOT push
+#   release/ship.sh            full: patch-bump -> scan -> push -> R9 -> tag+release
+#   release/ship.sh --minor    bump the minor version instead of patch
+#   release/ship.sh --major    bump the major version
+#   release/ship.sh --version X.Y.Z   set an explicit version
+#   release/ship.sh --no-bump  ship without bumping (no new version/tag/release)
+#   release/ship.sh --print-next   print the next version per the bump flag, exit (no mutation)
+#   release/ship.sh --check    local scan + pending-commit preview, do NOT push/bump
 #   release/ship.sh -h         this help
 
 set -euo pipefail
@@ -37,24 +48,74 @@ die()  { printf '\n  %s✗ %s%s\n' "$RED" "$*" "$R" >&2; exit 1; }
 
 usage() {
   cat <<'USAGE'
-ship.sh — scan, push, and verify in one step.
+ship.sh — bump, scan, push, verify, and release in one step.
 
-  release/ship.sh           full: local secret scan -> push origin -> R9 fresh-clone verify
-  release/ship.sh --check   local secret scan + show pending commits, do NOT push
-  release/ship.sh -h        this help
+  release/ship.sh              patch-bump -> scan -> push -> R9 verify -> tag + GitHub release
+  release/ship.sh --minor      bump minor instead of patch
+  release/ship.sh --major      bump major
+  release/ship.sh --version X.Y.Z   set an explicit version
+  release/ship.sh --no-bump    ship without a version bump (no tag/release)
+  release/ship.sh --print-next print the next version (no mutation), exit
+  release/ship.sh --check      local secret scan + show pending commits, do NOT push/bump
+  release/ship.sh -h           this help
 
 Stops at the first failure. Nothing is pushed if the local scan finds leaks.
 USAGE
 }
 
-# ── Args ─────────────────────────────────────────────────────────────────────
-CHECK_ONLY=0
-case "${1:-}" in
-  --check|--check-only) CHECK_ONLY=1 ;;
-  -h|--help) usage; exit 0 ;;
-  "") : ;;
-  *) die "unknown arg: ${1:-}  (try --check or -h)" ;;
-esac
+# ── Version helpers ──────────────────────────────────────────────────────────
+PLUGIN_MANIFEST=".claude-plugin/plugin.json"   # the SOLE authoritative plugin version (audit 6634)
+
+read_version() {  # echo the current plugin.json version (X.Y.Z); die on a non-semver value
+  local v
+  v="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([0-9]*\.[0-9]*\.[0-9]*\)".*/\1/p' "$PLUGIN_MANIFEST" | head -1)"
+  printf '%s' "$v" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || die "plugin.json version not semver: '${v:-<none>}'"
+  printf '%s' "$v"
+}
+
+compute_next() {  # $1=current X.Y.Z, $2=kind(patch|minor|major|explicit), $3=explicit value
+  local cur="$1" kind="$2" explicit="${3:-}"
+  local MA MI PA; IFS=. read -r MA MI PA <<<"$cur"
+  case "$kind" in
+    patch)    printf '%s.%s.%s' "$MA" "$MI" "$((PA+1))" ;;
+    minor)    printf '%s.%s.0'  "$MA" "$((MI+1))" ;;
+    major)    printf '%s.0.0'   "$((MA+1))" ;;
+    explicit) printf '%s' "$explicit" ;;
+  esac
+}
+
+write_version() {  # $1=new version — rewrite plugin.json's version field in place (atomic)
+  local new="$1" tmp="${PLUGIN_MANIFEST}.bump.$$"
+  sed "s/\(\"version\"[[:space:]]*:[[:space:]]*\"\)[0-9]*\.[0-9]*\.[0-9]*\(\"\)/\1${new}\2/" \
+    "$PLUGIN_MANIFEST" > "$tmp" || { rm -f "$tmp"; die "version rewrite failed"; }
+  grep -Eq "\"version\"[[:space:]]*:[[:space:]]*\"${new}\"" "$tmp" \
+    || { rm -f "$tmp"; die "version rewrite did not take (manifest format unexpected)"; }
+  mv "$tmp" "$PLUGIN_MANIFEST"
+}
+
+# ── Args (multi-flag: parse every argument, not just $1) ─────────────────────
+CHECK_ONLY=0; BUMP_KIND="patch"; EXPLICIT_VERSION=""; DO_BUMP=1; PRINT_NEXT=0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --check|--check-only) CHECK_ONLY=1 ;;
+    --minor) BUMP_KIND="minor" ;;
+    --major) BUMP_KIND="major" ;;
+    --no-bump) DO_BUMP=0 ;;
+    --print-next) PRINT_NEXT=1 ;;
+    --version) BUMP_KIND="explicit"; EXPLICIT_VERSION="${2:-}"; shift
+               printf '%s' "$EXPLICIT_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' \
+                 || die "--version needs X.Y.Z (got '${EXPLICIT_VERSION:-}')" ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "unknown arg: $1  (try -h)" ;;
+  esac
+  shift
+done
+
+# --print-next: compute + print, mutate NOTHING.
+if [ "$PRINT_NEXT" -eq 1 ]; then
+  _root="$(git rev-parse --show-toplevel 2>/dev/null)" || die "not in a git repo"
+  cd "$_root"; compute_next "$(read_version)" "$BUMP_KIND" "$EXPLICIT_VERSION"; echo; exit 0
+fi
 
 # ── Preflight ────────────────────────────────────────────────────────────────
 command -v git      >/dev/null 2>&1 || die "git not found"
@@ -76,6 +137,29 @@ printf '%sorigin: %s%s\n' "$D" "$REMOTE_URL" "$R"
 
 # Refresh the remote ref so the pending-commit preview is accurate (non-fatal).
 git fetch origin "$BRANCH" --quiet 2>/dev/null || true
+
+# ── 0. Version bump (skipped on --check / --no-bump) ─────────────────────────
+# Runs BEFORE the scan/push so the bump commit ships and is R9-verified. The TAG +
+# GitHub Release come AFTER R9 (only verified-clean history is released). This is
+# what advances releases/latest so bin/heimdall-autoupdate rolls clients forward.
+NEW_VERSION=""; TAG=""
+if [ "$CHECK_ONLY" -eq 0 ] && [ "$DO_BUMP" -eq 1 ]; then
+  step "Version bump"
+  CUR_VERSION="$(read_version)"
+  NEW_VERSION="$(compute_next "$CUR_VERSION" "$BUMP_KIND" "$EXPLICIT_VERSION")"
+  TAG="v$NEW_VERSION"
+  [ "$NEW_VERSION" = "$CUR_VERSION" ] && die "next version equals current ($CUR_VERSION) — nothing to bump"
+  if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null 2>&1 \
+     || git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+    die "tag $TAG already exists (local or origin) — refusing to re-release $NEW_VERSION"
+  fi
+  write_version "$NEW_VERSION"
+  git add "$PLUGIN_MANIFEST"
+  git commit --no-verify -q -m "chore(release): $TAG" || die "bump commit failed"
+  ok "bumped $CUR_VERSION → $NEW_VERSION (commit $(git rev-parse --short HEAD))"
+elif [ "$DO_BUMP" -eq 0 ]; then
+  warn "--no-bump: shipping without a version bump (no tag/release)"
+fi
 
 # ── Preview what will ship ───────────────────────────────────────────────────
 step "Pending commits (origin/$BRANCH..HEAD)"
@@ -143,3 +227,23 @@ ok "R9 HEAD matches: $LOCAL_HEAD"
 
 printf '\n%s%s✓ Shipped & verified%s — pushed origin/%s, R9 clean (gitleaks 0, identities ok, HEAD matched).\n' \
   "$G" "$B" "$R" "$BRANCH"
+
+# ── 5. Tag + GitHub Release (ONLY after R9 passed — release verified-clean history) ──
+# This advances GitHub releases/latest, which is what bin/heimdall-autoupdate reads
+# to roll clients forward. Without a published Release the version lags and no client
+# updates — so a gh-absent run WARNS loudly with the exact command, never silently skips.
+if [ -n "$TAG" ]; then
+  step "Tag + GitHub Release ($TAG)"
+  git tag "$TAG" || die "git tag $TAG failed"
+  git push origin "$TAG" || die "pushing tag $TAG failed"
+  ok "tagged + pushed $TAG"
+  if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+    gh release create "$TAG" --generate-notes --title "$TAG" \
+      || die "gh release create $TAG failed — tag is pushed; run: gh release create $TAG --generate-notes --title $TAG"
+    ok "published GitHub Release $TAG — auto-update's releases/latest now advances"
+  else
+    warn "gh CLI absent or unauthenticated — tag $TAG is pushed but the GitHub RELEASE was NOT published."
+    warn "auto-update reads releases/latest, so it will LAG until you run:"
+    warn "  gh release create $TAG --generate-notes --title $TAG"
+  fi
+fi
