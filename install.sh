@@ -19,6 +19,11 @@
 #   HEIMDALL_NO_COLOR   set to force plain mode (NO_COLOR also honored)
 #   HEIMDALL_NO_INTRO   reserved for first-run demo; ignored here
 #   HEIMDALL_FORCE_HMD  install the `hmd` entry point even if a collider exists
+#   HEIMDALL_CP_URL     team control-plane URL → cp-endpoint.json (else TTY prompt)
+#   HEIMDALL_ENROLL_TOKEN  one-time enroll token (SECRET) → 0600 cp-endpoint.json;
+#                          never echoed, never tracked. Set once; presence is then
+#                          automatic. No gcloud/Secret-Manager — supplied by the env.
+#   HEIMDALL_FORCE      rewrite cp-endpoint.json even if values are unchanged
 #
 set -euo pipefail
 
@@ -277,6 +282,99 @@ elif custom:
 else:
     print("skipped")
 PY
+}
+
+# Drop the per-dev control-plane endpoint config so SERVER-SYNCED TEAM PRESENCE
+# auto-resolves with ZERO manual exports. bin/heimdall-presence reads the CP url +
+# enroll token from $HOME/.heimdall/cp-endpoint.json and persists per-dev Ed25519
+# signing seeds under $HOME/.heimdall/pki/<haid>.seed (0600, client-generated +
+# enrolled on first session). This installs ONLY the url+token config + the seed dir.
+#
+# SECRET HANDLING. The url is team-specific but NOT secret; the enroll token IS a
+# secret — it is written mode 0600 into the $HOME store (OUT of any repo), NEVER a
+# tracked file (gitignored both at the install-clone root and the in-repo .heimdall/
+# case — see .gitignore). The caller resolves url/token from the env (preferred) or a
+# TTY-gated prompt and passes them in; this function never prompts (it runs in a
+# command substitution) and never echoes the token.
+#
+# IDEMPOTENT + MERGE. Provided non-empty values win; an empty value preserves whatever
+# is already configured (a url-only or token-only install merges into the existing
+# file). An unchanged config rewrites nothing unless $4=force. Prints ONE state word:
+#   configured  — wrote/updated cp-endpoint.json (enrollment is automatic next session)
+#   current     — already configured with these values; nothing written
+#   absent      — no url/token given and no existing config; nothing touched (caller
+#                 prints how to set it later — install never hangs or fails for this)
+#   skipped     — python3 unavailable for a merge and not a fresh both-provided write
+ensure_cp_endpoint() {
+  local plugin_dir="$1" url="$2" tok="$3" force="${4:-}"
+  local cfg="$plugin_dir/cp-endpoint.json"
+  local pki="$plugin_dir/pki"
+  # Nothing provided and nothing already there → clean skip, touch NOTHING.
+  if [ -z "$url" ] && [ -z "$tok" ] && [ ! -f "$cfg" ]; then
+    printf 'absent'; return 0
+  fi
+  # Per-dev secret stores live under the plugin home: dir 0700, seeds 0600 (the seeds
+  # themselves are written by the client). mkdir/chmod are idempotent.
+  mkdir -p "$plugin_dir" 2>/dev/null || true
+  chmod 0700 "$plugin_dir" 2>/dev/null || true
+  mkdir -p "$pki" 2>/dev/null || true
+  chmod 0700 "$pki" 2>/dev/null || true
+  if command -v python3 >/dev/null 2>&1; then
+    HMD_CP_CFG="$cfg" HMD_CP_URL="$url" HMD_CP_TOK="$tok" HMD_CP_FORCE="$force" \
+      python3 - <<'PY' 2>/dev/null || { printf 'skipped'; return 0; }
+import json, os, sys, tempfile
+cfg   = os.environ["HMD_CP_CFG"]
+url   = os.environ.get("HMD_CP_URL", "").strip()
+tok   = os.environ.get("HMD_CP_TOK", "").strip()
+force = os.environ.get("HMD_CP_FORCE", "")
+try:
+    with open(cfg) as fh:
+        data = json.load(fh)
+    if not isinstance(data, dict):
+        data = {}
+except Exception:
+    data = {}
+old = dict(data)
+# Provided non-empty value wins; empty preserves the existing one (partial merge).
+eff_url = url or data.get("url", "")
+eff_tok = tok or data.get("enroll_token", "")
+data["url"] = eff_url
+data["enroll_token"] = eff_tok
+changed = (old.get("url", "") != eff_url) or (old.get("enroll_token", "") != eff_tok)
+if not os.path.exists(cfg):
+    changed = True
+if not changed and not force:
+    print("current"); sys.exit(0)
+d = os.path.dirname(cfg) or "."
+fd, tmp = tempfile.mkstemp(dir=d, prefix=".cp-endpoint.", suffix=".tmp")
+try:
+    with os.fdopen(fd, "w") as fh:
+        json.dump(data, fh, indent=2)
+        fh.write("\n")
+    os.chmod(tmp, 0o600)            # secret token → owner-only before it lands
+    os.replace(tmp, cfg)
+except Exception:
+    try: os.unlink(tmp)
+    except OSError: pass
+    print("skipped"); sys.exit(0)
+print("configured")
+PY
+    return 0
+  fi
+  # python3 absent (rare — telemetry+statusline both need it): write only a FRESH
+  # both-provided config (no merge possible without a JSON parser), else skip. The
+  # temp-name X-run is assembled at runtime (never a source literal).
+  if [ -n "$url" ] && [ -n "$tok" ] && [ ! -f "$cfg" ]; then
+    local xs tmp
+    xs="$(printf 'X%.0s' 1 2 3 4 5 6)"
+    tmp="$(mktemp "$plugin_dir/.cp-endpoint.$xs" 2>/dev/null)" || { printf 'skipped'; return 0; }
+    if printf '{\n  "url": "%s",\n  "enroll_token": "%s"\n}\n' "$url" "$tok" > "$tmp" 2>/dev/null \
+       && chmod 0600 "$tmp" 2>/dev/null && mv "$tmp" "$cfg" 2>/dev/null; then
+      printf 'configured'; return 0
+    fi
+    rm -f "$tmp" 2>/dev/null || true
+  fi
+  printf 'skipped'
 }
 
 # ── Install-step telemetry (dossier §3 + §8) ────────────────────────────────
@@ -645,6 +743,55 @@ main() {
     current)     step_ok "Activating statusline HUD" "active" ;;
     kept-custom) step_ok "Activating statusline HUD" "kept your custom line" ;;
     *)           step_ok "Activating statusline HUD" "skipped (needs python3)" ;;
+  esac
+
+  # Step: configure the control-plane endpoint so SERVER-SYNCED TEAM PRESENCE
+  # auto-resolves for THIS dev with zero manual exports. The url + enroll token come
+  # from the install env (HEIMDALL_CP_URL + HEIMDALL_ENROLL_TOKEN — preferred for a
+  # scripted/team install) or, ONLY on a real interactive TTY, a one-time prompt; a
+  # non-interactive run with no env (curl|bash, whose stdin is the script pipe — or
+  # CI) skips cleanly with guidance and NEVER hangs. The token is a SECRET: read
+  # without echo, written 0600 into $HOME/.heimdall (gitignored, out of any repo),
+  # never printed. OPTIONAL/graceful — a skip or failure never aborts the install.
+  local CP_URL="${HEIMDALL_CP_URL:-}"
+  local CP_TOK="${HEIMDALL_ENROLL_TOKEN:-}"
+  local CP_FORCE=""
+  [ -n "${HEIMDALL_FORCE:-}" ] && CP_FORCE=1
+  step_begin "Configuring control-plane endpoint"
+  # Prompt ONLY on an interactive TTY, and only when the env did not supply a value
+  # and no config exists yet. Under curl|bash / CI, [ -t 0 ] is false → no read, no
+  # hang. The token read is silent (-s) so it never lands in the terminal scrollback.
+  if [ -z "$CP_URL" ] && [ -z "$CP_TOK" ] && [ ! -f "$PLUGIN_DIR/cp-endpoint.json" ] && [ -t 0 ]; then
+    printf '\n   %sTeam control-plane URL%s (blank to skip presence setup): ' "$C_WHITE" "$C_RESET"
+    IFS= read -r CP_URL || CP_URL=""
+    if [ -n "$CP_URL" ]; then
+      printf '   %sTeam enroll token%s (hidden): ' "$C_WHITE" "$C_RESET"
+      IFS= read -rs CP_TOK || CP_TOK=""
+      printf '\n'
+    fi
+  fi
+  local CP_STATE; CP_STATE="$(ensure_cp_endpoint "$PLUGIN_DIR" "$CP_URL" "$CP_TOK" "$CP_FORCE")"
+  case "$CP_STATE" in
+    configured)
+      step_ok "Configuring control-plane endpoint" "enrolls on first session" ;;
+    current)
+      step_ok "Configuring control-plane endpoint" "already set" ;;
+    absent)
+      step_ok "Configuring control-plane endpoint" "skipped"
+      # SHORT_PATH is computed later (success card); derive a local one here.
+      local CP_SHORT; CP_SHORT=$(printf '%s' "$PLUGIN_DIR" | sed "s|$HOME|~|")
+      blank
+      printf '   %s⚠ no control-plane endpoint set — team presence stays offline.%s\n' \
+        "$C_GOLD" "$C_RESET"
+      printf '   %s  configure it any time (no re-install needed):%s\n' "$C_DIM" "$C_RESET"
+      printf '   %s    HEIMDALL_CP_URL=<url> HEIMDALL_ENROLL_TOKEN=<token> bash install.sh%s\n' \
+        "$C_DIM" "$C_RESET"
+      printf '   %s  (writes %s/cp-endpoint.json, 0600; enrollment is automatic thereafter)%s\n' \
+        "$C_DIM" "$CP_SHORT" "$C_RESET"
+      blank
+      ;;
+    *)
+      step_ok "Configuring control-plane endpoint" "skipped (needs python3)" ;;
   esac
 
   # Step: verify gates — N is the RUNTIME gate count, never hardcoded.

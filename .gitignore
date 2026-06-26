@@ -51,6 +51,28 @@ docs/superpowers/plans/
 # and secrets file stay ignored by `.heimdall/*`; only this single .example is
 # un-ignored so it can be committed.
 !.heimdall/issue-loop.config.json.example
+# EXCEPTION: the control-plane endpoint EXAMPLE is committed source (shape + env-var
+# NAMES only, never a real url/token). The REAL config + the per-dev signing seeds
+# stay ignored (below); only this single .example is un-ignored so it can be committed.
+!.heimdall/cp-endpoint.json.example
+
+# CONTROL-PLANE PRESENCE SECRETS — the per-dev CP endpoint config (url + enroll TOKEN)
+# and the Ed25519 signing SEEDS. The canonical store is $HOME/.heimdall — OUT of any
+# dev repo — but $HOME/.heimdall IS the installed plugin clone (a checkout of THIS
+# repo), so these land at the clone's repo ROOT, which `.heimdall/*` above does NOT
+# cover. Ignore them at the root so a stray `git add .` in the install clone can NEVER
+# stage a dev's enroll token or seed. (The .example template above is the only
+# committed form; the real token lives 0600 in $HOME, never tracked.)
+/cp-endpoint.json
+/pki/
+/identity.json
+/*.seed
+# Belt-and-suspenders for a dev who creates them under an in-repo .heimdall/ (already
+# covered by `.heimdall/*`, named here so an un-ignore exception can never leak them).
+.heimdall/cp-endpoint.json
+.heimdall/pki/
+.heimdall/identity.json
+.heimdall/*.seed
 
 # designmatch v2 runtime ledger + quarantine (the regen-log.json hash-log and the
 # tmp holding area are per-checkout runtime state, not source — never commit them).
