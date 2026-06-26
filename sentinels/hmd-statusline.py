@@ -89,6 +89,7 @@ def main():
     # ── sigil anchor (verdict colors the eyes; blink animates) ──
     sig = SIG.render(haid, eye_override=eye, pad="")  # 4 rows, 9 cols
     SW = 9
+    ANCHOR = SW + 2  # sigil(9 cols) + 2-space gutter, prefixed on EVERY row
 
     # context bar
     bcol = RD if pct >= 90 else AM if pct >= 70 else GR
@@ -124,7 +125,9 @@ def main():
             wall_segs.append(seg)
 
     def line(left, right):
-        gap = cols - vis(left) - vis(right) - 2
+        # account for the sigil anchor prefixed on every row, so the right
+        # block pins to COLUMNS instead of overflowing by the anchor width.
+        gap = cols - ANCHOR - vis(left) - vis(right)
         return left + (" " * max(1, gap)) + right
 
     out = []

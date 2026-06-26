@@ -6,10 +6,9 @@
 # ASSERT: empty stdin -> exit 0, >=4 rows; --widget -> one segment line; deny
 #   verdict colors the line ("bifröst closed"); a fresh teammate file -> the watch
 #   wall names them; a stale (old ts) file -> teammate dropped.
-# FINDING: rows right-pin the body to COLUMNS but PREPEND the 9-col sigil anchor
-#   (+2 pad) without subtracting it, so a content row's visible width is
-#   COLUMNS + 11, not <= COLUMNS. We assert the real guarantee (<= COLUMNS+ANCHOR)
-#   and NOTE the overflow — a width-math bug in hmd-statusline.py:line().
+# GUARANTEE: every output row's visible width is <= COLUMNS. line() subtracts
+#   the 9-col sigil anchor (+2 gutter) prefixed on every row, so the right-pinned
+#   verdict block lands exactly at COLUMNS and never overflows.
 ROW="statusline:viral-statusline"
 source "$(dirname "${BASH_SOURCE[0]}")/../_lib.sh"
 
@@ -33,11 +32,12 @@ assert_exit 0 "$EC" "empty stdin exits 0"
 NL="$(printf '%s\n' "$OUT" | grep -c '')"
 if [ "$NL" -ge 4 ]; then ok "renders >=4 rows (got $NL)"; else bad "rendered $NL rows (want >=4)"; fi
 
-# ── 2) width: content rows <= COLUMNS + sigil anchor (the real guarantee) ──
+# ── 2) width: EVERY row's visible width <= COLUMNS (sigil anchor included) ──
+# Regression guard for the line() width-math bug: line() must subtract the
+# 9-col sigil anchor (+2 gutter) so the right block pins to COLUMNS, never over.
 MW="$(printf '%s' "$OUT" | maxw)"
-if [ "$MW" -le $(( COLS + ANCHOR )) ]; then ok "max row width $MW <= COLUMNS($COLS)+anchor($ANCHOR)"
-else bad "max row width $MW exceeds COLUMNS+anchor ($(( COLS + ANCHOR )))"; fi
-if [ "$MW" -gt "$COLS" ]; then note "rows overflow COLUMNS by $(( MW - COLS )) (sigil anchor not subtracted in line()) — hmd-statusline.py width-math finding"; fi
+if [ "$MW" -le "$COLS" ]; then ok "max row width $MW <= COLUMNS($COLS)"
+else bad "max row width $MW exceeds COLUMNS($COLS) by $(( MW - COLS )) — line() must subtract the sigil anchor"; fi
 
 # ── 3) --widget: one ccstatusline-coexistence segment line ──
 WID="$(printf '{}' | COLUMNS=$COLS python3 "$SL" --widget)"; WEC=$?
