@@ -75,6 +75,24 @@ show()  { printf '\033[2m  $ %s\033[0m\n' "$*"; }
 # that returns 0 (so a trailing `|| die` never fires for a command we deliberately skipped).
 run()   { show "$*"; [ "$MODE" = "guided" ] || return 0; "$@"; }
 
+# retry() — re-run a command up to N times with linear backoff, tolerating the
+# transient GCP IAM "does not exist"/400 propagation race a freshly-created SA
+# triggers on the FIRST grant that references it. gcloud add-iam-policy-binding is
+# idempotent, so a re-grant of an already-present binding is a no-op success. In
+# plan mode the wrapped `run` returns 0 immediately → one pass, zero mutation.
+retry() {
+  local tries="$1"; shift
+  local n=1 rc=0
+  while :; do
+    "$@" && return 0
+    rc=$?
+    [ "$n" -ge "$tries" ] && return "$rc"
+    warn "  (attempt ${n}/${tries} failed rc=${rc}; retry in $((n*2))s — likely IAM propagation race)"
+    sleep "$((n*2))"
+    n=$((n+1))
+  done
+}
+
 command -v gcloud >/dev/null 2>&1 || die "gcloud not found — install the Cloud SDK and authenticate."
 
 say "==> heimdall go-live (${MODE} mode) — RUNBOOK steps 2–7"
@@ -300,23 +318,68 @@ step "STEP 4 — public least-privilege SA + the no-dispatch proof (RUNBOOK §3)
 note "deploy-public-surface.sh (step 5) also creates+grants this SA idempotently; here we"
 note "establish it early and PROVE it cannot dispatch before any public deploy."
 
-# 4a — create the SA (idempotent) + grant exactly datastore + the two secretAccessors.
-if [ "$MODE" = "guided" ] && gcloud iam service-accounts describe "${PUBLIC_SA}" --project="${PROJECT_ID}" >/dev/null 2>&1; then
-  say "  SA ${PUBLIC_SA} already exists — skipping create"
-else
-  run gcloud iam service-accounts create "${PUBLIC_SA_NAME}" --project="${PROJECT_ID}" \
-    --display-name="Heimdall CP PUBLIC surface (presence/enroll/health — least privilege)" \
-    || { [ "$MODE" = "guided" ] && warn "  (create returned nonzero — likely exists; continuing)"; }
-fi
-run gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+# 4a — ENSURE the SA (idempotent: a re-run of go-live.sh must NOT die on an
+# already-existing SA), WAIT for it to PROPAGATE (GCP IAM is eventually consistent —
+# a freshly-created SA is invisible to grants for a few seconds), THEN grant
+# datastore + the two secretAccessors with RETRY (the first grant races the SA's
+# propagation → transient 400 "does not exist"; retry until it lands).
+
+# ensure_public_sa() — describe-first; create only if absent; distinguish a REAL
+# create failure from a benign "already exists" (a concurrent create raced us).
+ensure_public_sa() {
+  if [ "$MODE" != "guided" ]; then
+    run gcloud iam service-accounts create "${PUBLIC_SA_NAME}" --project="${PROJECT_ID}" \
+      --display-name="Heimdall CP PUBLIC surface (presence/enroll/health — least privilege)"
+    return 0
+  fi
+  if gcloud iam service-accounts describe "${PUBLIC_SA}" --project="${PROJECT_ID}" >/dev/null 2>&1; then
+    say "  SA ${PUBLIC_SA} already exists — skipping create (idempotent re-run)"
+    return 0
+  fi
+  local err
+  show "gcloud iam service-accounts create ${PUBLIC_SA_NAME} --project=${PROJECT_ID} --display-name='Heimdall CP PUBLIC surface (...)'"
+  if err="$(gcloud iam service-accounts create "${PUBLIC_SA_NAME}" --project="${PROJECT_ID}" \
+              --display-name="Heimdall CP PUBLIC surface (presence/enroll/health — least privilege)" 2>&1)"; then
+    say "  SA ${PUBLIC_SA} created"
+  elif printf '%s' "${err}" | grep -qiE 'already[ _]?exists'; then
+    say "  SA ${PUBLIC_SA} already exists (create raced) — continuing"
+  else
+    die "STEP 4: SA create failed (NOT an already-exists error): ${err}"
+  fi
+}
+
+# wait_sa_propagate() — poll describe until the SA is visible, so the grants below
+# don't race its propagation. Bounded: ≤10 polls × 6s ≈ 60s, then die.
+wait_sa_propagate() {
+  if [ "$MODE" != "guided" ]; then
+    show "gcloud iam service-accounts describe ${PUBLIC_SA} --project=${PROJECT_ID}   # poll until visible (≤10×6s)"
+    note "  (plan) at guided run this POLLS describe until the SA propagates before any grant (≤10 tries, 6s apart, ≤60s)"
+    return 0
+  fi
+  local n=1 max=10
+  while [ "$n" -le "$max" ]; do
+    if gcloud iam service-accounts describe "${PUBLIC_SA}" --project="${PROJECT_ID}" >/dev/null 2>&1; then
+      say "  SA ${PUBLIC_SA} visible — propagated after ${n} poll(s)"
+      return 0
+    fi
+    note "  SA not yet visible (poll ${n}/${max}) — sleeping 6s for IAM propagation"
+    sleep 6
+    n=$((n+1))
+  done
+  die "STEP 4: SA ${PUBLIC_SA} never became visible after ${max} polls (~60s) — IAM propagation stalled."
+}
+
+ensure_public_sa
+wait_sa_propagate
+retry 5 run gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
   --member="serviceAccount:${PUBLIC_SA}" --role="roles/datastore.user" \
-  || die "STEP 4: datastore.user grant failed."
-run gcloud secrets add-iam-policy-binding "${ENROLL_SECRET}" --project="${PROJECT_ID}" \
+  || die "STEP 4: datastore.user grant failed after retries."
+retry 5 run gcloud secrets add-iam-policy-binding "${ENROLL_SECRET}" --project="${PROJECT_ID}" \
   --member="serviceAccount:${PUBLIC_SA}" --role="roles/secretmanager.secretAccessor" \
-  || die "STEP 4: secretAccessor on ${ENROLL_SECRET} grant failed."
-run gcloud secrets add-iam-policy-binding "${PUBLIC_PKI_SECRET}" --project="${PROJECT_ID}" \
+  || die "STEP 4: secretAccessor on ${ENROLL_SECRET} grant failed after retries."
+retry 5 run gcloud secrets add-iam-policy-binding "${PUBLIC_PKI_SECRET}" --project="${PROJECT_ID}" \
   --member="serviceAccount:${PUBLIC_SA}" --role="roles/secretmanager.secretAccessor" \
-  || die "STEP 4: secretAccessor on ${PUBLIC_PKI_SECRET} grant failed."
+  || die "STEP 4: secretAccessor on ${PUBLIC_PKI_SECRET} grant failed after retries."
 note "(NO run.jobs.run / heimdallJobRunner / run.developer granted — public SA cannot dispatch)"
 
 # 4b — the no-dispatch ASSERTION. Query the SA's project roles; expand each role's
