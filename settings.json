@@ -6,5 +6,9 @@
   "statusLine": {
     "type": "command",
     "command": "bash -c 'P=\"${CLAUDE_PLUGIN_ROOT:-$PLUGIN_DIR}\"; [ -n \"$P\" ] && [ -x \"$P/hooks/statusline.sh\" ] && exec bash \"$P/hooks/statusline.sh\"; exit 0'"
+  },
+  "subagentStatusLine": {
+    "type": "command",
+    "command": "bash -c 'P=\"${CLAUDE_PLUGIN_ROOT:-$PLUGIN_DIR}\"; [ -n \"$P\" ] && [ -x \"$P/sentinels/hmd-subagent-statusline.sh\" ] && exec bash \"$P/sentinels/hmd-subagent-statusline.sh\"; exit 0'"
   }
 }
