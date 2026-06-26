@@ -73,11 +73,17 @@ def main():
     eye_rgb, vcol, vglyph, vword = VERDICT[verdict]
     passed, total = st.get("passed"), st.get("total")
     cols = int(os.environ.get("COLUMNS") or 120)
+    RMARGIN = 6  # right safety gutter: clears Claude Code's scrollbar + edge padding so the verdict never clips off-screen
 
-    # ── animation: blink every ~5s for one frame; scanning dims the eyes ──
+    # ── animation: the watchman keeps a bright WHITE eye glint so the face
+    # always reads. The verdict is shown by the right block + bar + bifröst
+    # text — NOT by recoloring the eyes: a verdict-colored eye washes into a
+    # same-hue body (e.g. cyan 'watching' eyes on a teal sigil) and erases the
+    # face. Blink shuts the eyes one frame every ~5s; scanning gives a dim
+    # pulse. (The dramatic red deny-flash lives in hmd-gate-anim.sh, not here.)
     t = int(time.time())
     blink = (t % 5 == 0)
-    eye = None if blink else eye_rgb
+    eye = (38, 44, 53) if blink else None        # None -> default white glint
     if verdict == "scanning" and (t % 2 == 0): eye = (120, 80, 6)  # dim pulse
 
     if "--widget" in sys.argv:
@@ -96,20 +102,46 @@ def main():
     fill = pct // 10
     bar = f"{bcol}{'▓'*fill}{FAINT}{'░'*(10-fill)}{X} {bcol}{pct}%{X}"
 
+    # token gauge (honest: absolute input tokens from CC, else derived from %×size)
+    def human(n):
+        if not n: return None
+        return f"{n//1000}k" if n >= 1000 else str(n)
+    tin = cw.get("total_input_tokens")
+    size = cw.get("context_window_size")
+    if not tin and pct and size: tin = int(size * pct / 100)
+    toks = human(tin)
+    tok_seg = f"{SEP}{DIM}↓{toks}{X}" if toks else ""
+
+    # ledger claim count (live coordination signal — count claim files, no subprocess)
+    def ledger_claims(p):
+        d = os.path.join(p, ".planning", "ledger", "claims")
+        try: return sum(1 for n in os.listdir(d) if n.endswith(".json"))
+        except Exception: return 0
+    claims = ledger_claims(cwd)
+    claim_seg = f" {FAINT}·{X} {DIM}ledger {claims} claim{'s' if claims != 1 else ''}{X}" if claims else ""
+
+    # inline eye bracket — the watchman's eyes, verdict-colored, anchoring the name
+    eye_glyph = {"pass": "●", "deny": "✗", "scanning": "◦", "watching": "●"}.get(verdict, "●")
+    eyes_inline = f"{CY}▐{X}{vcol}{eye_glyph} {eye_glyph}{X}{CY}▌{X}"
+
     # right-aligned verdict block
     r1 = f"{vcol}{BOLD}{vglyph} {vword}{X}" + (f" {vcol}{passed}/{total}{X}" if passed is not None else "")
     bifrost = (f"{GR}bifröst open{X}" if verdict=="pass" else
                f"{RD}bifröst closed{X}" if verdict=="deny" else f"{DIM}watching{X}")
-    r2 = f"{bifrost}"
+    r2 = f"{bifrost}{claim_seg}"
 
     # left info rows
-    l1 = f"{CY}{BOLD}HEIMDALL{X}{SEP}{DIM}{haid}{X}{SEP}{DIM}{model}{X}"
-    l2 = f"{bar}{SEP}{AM}{repo}:main{X}"
+    l1 = f"{eyes_inline} {CY}{BOLD}HEIMDALL{X}{SEP}{DIM}{haid}{X}{SEP}{DIM}{model}{X}"
+    l2 = f"{bar}{SEP}{AM}{repo}:main{X}{tok_seg}"
 
-    # team wall (only when teammates present)
+    # team wall (only when teammates present) — cap at the 6 most-recently
+    # active so a big team can't overflow the row; surplus shows as "+N more".
     team = team_presence(cwd)
     wall_segs = []
     if team:
+        team = sorted(team, key=lambda t: t.get("ts", 0), reverse=True)
+        extra = max(0, len(team) - 6)
+        team = sorted(team[:6], key=lambda t: t.get("name", ""))
         wall_segs.append(f"{FAINT}── watch ──{X}")
         for m in team:
             v = m.get("verdict", "working")
@@ -123,11 +155,19 @@ def main():
             if v == "deny":  # the moment — make it pop
                 seg = f"{RD}▕{X}{g} {RD}{BOLD}{m.get('name','?')} ✗ BIFRÖST{(' '+f) if f else ''}{X}{RD}▏{X}"
             wall_segs.append(seg)
+        if extra:
+            wall_segs.append(f"{DIM}+{extra} more{X}")
+        # your own watchman closes the wall
+        you_state = {"pass": "✓", "deny": "✗", "scanning": "◦"}.get(verdict, "⚡")
+        you_word  = {"pass": "proven", "deny": "blocked", "scanning": "scanning"}.get(verdict, "working")
+        wall_segs.append(f"{SIG.glyph(haid)} {BOLD}you{X} {DIM}{you_state} {you_word}{X}")
 
     def line(left, right):
-        # account for the sigil anchor prefixed on every row, so the right
-        # block pins to COLUMNS instead of overflowing by the anchor width.
-        gap = cols - ANCHOR - vis(left) - vis(right)
+        # account for the sigil anchor prefixed on every row AND a right safety
+        # gutter, so the right block pins inside the usable width — Claude Code
+        # reserves the far-right edge (scrollbar + padding) and clips anything
+        # rendered at exactly COLUMNS.
+        gap = cols - ANCHOR - RMARGIN - vis(left) - vis(right)
         return left + (" " * max(1, gap)) + right
 
     out = []

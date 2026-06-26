@@ -18,8 +18,9 @@ FACE_BIN="$HERE/../bin/heimdall-face"
 
 # ── Width: the watchman right-pins the verdict against COLUMNS. tput needs a tty
 # (CC pipes stdout) so it usually fails here → fall back to 120. ──
-COLS="$(tput cols 2>/dev/null)"
-case "$COLS" in ''|*[!0-9]*) COLS=120 ;; esac
+COLS="${COLUMNS:-}"                                        # honor a width CC already exported
+case "$COLS" in ''|*[!0-9]*) COLS="$(tput cols 2>/dev/null)" ;; esac   # else tput (when a tty is reachable)
+case "$COLS" in ''|*[!0-9]*) COLS=120 ;; esac             # else safe default
 export COLUMNS="$COLS"
 
 # ── Color detection (legacy fallback honors it via --color/--no-color) ──
