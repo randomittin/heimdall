@@ -13,6 +13,12 @@ execution model) lives in [`README.md`](./README.md) §5b. **This runbook is the
 operational sequence** — run it top to bottom. Every step is a real command or a
 hard gate; do not skip a gate.
 
+> **GUIDED OPERATOR.** [`go-live.sh`](./go-live.sh) chains steps 2–7 below under
+> your own authenticated `gcloud` shell — it prints each command, runs it, and
+> stops on the first failure (it never holds a credential and never logs a secret
+> value). Review the whole sequence with no spend via `bash go-live.sh --plan`;
+> run it for real with `bash go-live.sh` (after the §3 kill-switch gate).
+
 > **DEPLOY IS SPEND-GATED.** The two `gcloud run deploy` steps incur spend. Run
 > them **only after** the billing kill-switch tests are green (the ₹10,000 cap),
 > exactly as [`README.md`](./README.md) §3 requires. `--max-instances=5` caps
