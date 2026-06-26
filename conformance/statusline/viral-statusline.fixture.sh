@@ -83,13 +83,17 @@ rm -f "$WS/.heimdall/team/nadia.json"
 # wall HANDLE (RJ's call). Setting an identity must reflect on BOTH the sigil
 # anchor (seed) and the info row (handle); a different identity changes the sigil. ──
 if [ -x "$BIN/heimdall-identity" ]; then
+  # NB: the statusline resolves identity via bin/heimdall-identity, which keys off
+  # git-toplevel($cwd)/.heimdall unless HEIMDALL_IDENTITY_DIR overrides. $WS is created
+  # INSIDE this git repo, so the render MUST inherit the SAME store override (else it
+  # reads the repo's real .heimdall, not the test identity). Pass it on the render too.
   HEIMDALL_IDENTITY_DIR="$WS/.heimdall" "$BIN/heimdall-identity" --set tester --seed tester >/dev/null 2>&1
-  ID_OUT="$(printf '%s' "$JSON" | COLUMNS=$COLS HMD_NOW=7 python3 "$SL")"
+  ID_OUT="$(printf '%s' "$JSON" | HEIMDALL_IDENTITY_DIR="$WS/.heimdall" COLUMNS=$COLS HMD_NOW=7 python3 "$SL")"
   ID_PLAIN="$(printf '%s' "$ID_OUT" | sed -E 's/\x1b\[[0-9;]*m//g')"
   assert_contains "$ID_PLAIN" "tester" "identity handle 'tester' shows on the info row"
   SIG_A="$(printf '%s' "$ID_OUT" | head -1)"
   HEIMDALL_IDENTITY_DIR="$WS/.heimdall" "$BIN/heimdall-identity" --set someoneelse --seed someoneelse >/dev/null 2>&1
-  SIG_B="$(printf '%s' "$JSON" | COLUMNS=$COLS HMD_NOW=7 python3 "$SL" | head -1)"
+  SIG_B="$(printf '%s' "$JSON" | HEIMDALL_IDENTITY_DIR="$WS/.heimdall" COLUMNS=$COLS HMD_NOW=7 python3 "$SL" | head -1)"
   if [ "$SIG_A" != "$SIG_B" ]; then ok "sigil seed is file-controlled (changes with identity)"
   else bad "sigil row identical across identities — seed not sourced from heimdall-identity"; fi
   rm -f "$WS/.heimdall/identity.json"
