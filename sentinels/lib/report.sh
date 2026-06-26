@@ -93,6 +93,15 @@ sentinel_report() {
       >"$out"
   fi
   echo "report: $out  (status=$status)"
+
+  # Drive the watchman HUD off the verdict (best-effort; never blocks/errors).
+  # One sink covers every sentinel: pass->pass, fail->deny, else->watching.
+  # gate name = gate_id with the "sentinel-" prefix stripped for a clean label.
+  local _evt _verd _gate
+  _evt="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)/hmd-gate-event.sh"
+  case "$status" in pass) _verd=pass ;; fail) _verd=deny ;; *) _verd=watching ;; esac
+  _gate="${gate_id#sentinel-}"
+  [ -x "$_evt" ] && "$_evt" "$_verd" "$_gate" >/dev/null 2>&1 || true
 }
 
 # Map a sentinel status to the process exit code per the contract above.
