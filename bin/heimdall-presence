@@ -23,8 +23,12 @@
 #                   ONE project id) > $HMD_PROJECT > the repo dir name.
 #   server URL    : --url > $HEIMDALL_CP_URL > $BASE_URL > local config
 #                   ${HOME}/.heimdall/cp-endpoint.json `.url` > none (offline).
-#   signing seed  : $HEIMDALL_CP_PKI_KEY > $PKI_SEED > persisted ${HOME}/.heimdall/pki/
-#                   <haid>.seed (mode 0600) > AUTO-BOOTSTRAP — keygen (cp_auth), POST
+#   signing seed  : $HMD_PRESENCE_SEED (dev-scoped override, testing only) > persisted
+#                   ${HOME}/.heimdall/pki/<haid>.seed (mode 0600) > AUTO-BOOTSTRAP — keygen
+#                   (cp_auth), POST
+#                   SECURITY: the dev signs as ITSELF with its OWN per-dev key; it MUST NOT
+#                   read $HEIMDALL_CP_PKI_KEY (the SERVER's Secret-Manager identity seed —
+#                   server-only, never on a dev path).
 #                   {url}/enroll {haid, pubkey, handle} with the config's enroll_token,
 #                   persist the seed 0600, reuse it thereafter. The seed lives in-process +
 #                   the 0600 file ONLY — NEVER printed/logged/argv'd. A failed enroll is
@@ -135,7 +139,7 @@ fi
 [ -n "$URL" ] || URL="${HEIMDALL_CP_URL:-${BASE_URL:-}}"
 [ -n "$URL" ] || URL="$CFG_URL"
 ENROLL_TOKEN="$CFG_TOKEN"   # the bootstrap enroll credential (config-only; never derived).
-SEED="${HEIMDALL_CP_PKI_KEY:-${PKI_SEED:-}}"
+SEED="${HMD_PRESENCE_SEED:-}"   # dev-scoped override only; NEVER the server's $HEIMDALL_CP_PKI_KEY
 [ -n "$HANDLE" ]  || HANDLE="${HMD_HANDLE:-}"
 if [ -z "$HANDLE" ] && [ -x "$IDENTITY_CLI" ]; then
   HANDLE="$("$IDENTITY_CLI" --handle 2>/dev/null || true)"
@@ -313,8 +317,9 @@ def _bootstrap_seed():
 
 
 def resolve_seed():
-    """The signing seed: $HEIMDALL_CP_PKI_KEY/$PKI_SEED (PRES_SEED) > the persisted 0600
-    seed > AUTO-BOOTSTRAP (keygen + enroll + persist). '' when none resolves -> offline."""
+    """The signing seed: $HMD_PRESENCE_SEED (PRES_SEED — dev-scoped override) > the
+    persisted 0600 seed > AUTO-BOOTSTRAP (keygen + enroll + persist). '' -> offline.
+    NEVER the server's $HEIMDALL_CP_PKI_KEY (Secret-Manager identity, server-only)."""
     env_seed = os.environ.get("PRES_SEED") or ""
     if env_seed:
         return env_seed
@@ -400,7 +405,7 @@ stable project id from the git remote, and reads the handle from heimdall-identi
 dev exports NOTHING. Overrides still win:
   Overrides: --haid --project --url --handle --verdict --file
   Env: HMD_HAID HMD_PROJECT HMD_HANDLE HMD_VERDICT HMD_FILE HMD_ENROLL_THROTTLE
-       HEIMDALL_CP_URL|BASE_URL  HEIMDALL_CP_PKI_KEY|PKI_SEED
+       HEIMDALL_CP_URL|BASE_URL  HMD_PRESENCE_SEED (dev key override; server's HEIMDALL_CP_PKI_KEY is NOT read)
 Offline/unconfigured degrades cleanly (empty roster, no-op beat, exit 0).
 USAGE
     ;;

@@ -160,7 +160,11 @@ else
 fi
 
 # ── (3) NO SECRET LEAK — the token must appear in NO tracked file, NO .example ──
-LEAK_TRACKED="$(cd "$REPO" && git grep -lF "$CP_TOKEN" -- $(git ls-files) 2>/dev/null)"
+# Exclude THIS test's own file: CP_TOKEN is an obviously-fake fixture literal defined
+# here; the assertion is that install/.example/cp-endpoint.json never carry it, not that
+# the test fixture can't name its own value. (secret-scan stays clean — it's not real.)
+SELF="test/install-cp-endpoint.test.sh"
+LEAK_TRACKED="$(cd "$REPO" && git grep -lF "$CP_TOKEN" -- $(git ls-files) 2>/dev/null | grep -vxF "$SELF")"
 LEAK_EXAMPLE="$(grep -lF "$CP_TOKEN" "$REPO/.heimdall/cp-endpoint.json.example" 2>/dev/null || true)"
 # Generic guard: the example must not carry anything that smells like a real token
 # (a long opaque alnum run) — only the bracketed example shape.
