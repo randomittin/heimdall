@@ -203,7 +203,15 @@ preflight() {
     fi
     say "    PREFLIGHT P4 ok: public PKI seed is a distinct throwaway (${PUBLIC_PKI_SECRET}) under HAID ${PUBLIC_SERVER_HAID}"
   else
-    say "    PREFLIGHT P4 ok: NO server PKI seed shipped to the public service (least exposure — default)"
+    # P5 — a Cloud Run public service is fail-closed at boot without a seed
+    # (cp_auth.load_signing_key raises pki_key_absent when K_SERVICE is set; audit
+    # verdict (b) in .planning/ref/public-surface-pki-need.md). A seedless public
+    # deploy would simply never go ready. Refuse it: PUBLIC_PKI_SECRET is REQUIRED,
+    # and P4 above guarantees it is a DISTINCT throwaway (never the real cp-pki-key).
+    die "PREFLIGHT P5: PUBLIC_PKI_SECRET is unset. A Cloud Run public service is
+       fail-closed at boot without a server seed, so it would never become ready.
+       Set PUBLIC_PKI_SECRET to a DISTINCT THROWAWAY secret (never ${GATED_PKI_SECRET});
+       see GO-LIVE-RUNBOOK §2.3 for minting cp-pki-key-public."
   fi
 }
 

@@ -135,23 +135,26 @@ python3 -c 'import secrets,sys; sys.stdout.write(secrets.token_urlsafe(32))' \
 `cp-enroll-token` **only** — a per-secret binding, so the public SA cannot read
 `cp-pki-key` or any other project secret.
 
-### 2.3 ⚠️ CONDITIONAL — a public PKI seed (DEFAULT: do **not** ship one)
+### 2.3 ✅ REQUIRED — a DISTINCT throwaway public PKI seed (audit verdict (b))
 
-> **Decision pending the parallel PKI-need audit:
-> `.planning/ref/public-surface-pki-need.md`.** The audit determines whether the
-> public service needs a server PKI seed **only to boot**
-> (`cp_auth.ensure_server_identity`). Finalize this section to the audit's verdict.
+> **Resolved by `.planning/ref/public-surface-pki-need.md` — verdict (b).** The
+> public service needs a server PKI seed **only to BOOT**: `cp_boot` calls
+> `cp_auth.ensure_server_identity` unconditionally, and `load_signing_key` is
+> **fail-closed in the cloud profile** (`K_SERVICE` set ⇒ no seed ⇒ boot raises
+> `pki_key_absent`). So a Cloud Run public service **cannot start without a seed** —
+> but **no public route uses the server private key** (presence/roster verify dev
+> signatures against the per-dev registry; enroll gates on the bootstrap token; no
+> public route mints a server-signed artifact).
 >
-> - **DEFAULT (this runbook's posture): ship NO server PKI seed to the public
->   service.** Presence/roster verify dev signatures against the per-dev key
->   registry in Firestore; no public route mints a server-signed artifact, so the
->   internet-facing service holds the minimum. `deploy-public-surface.sh` ships
->   only `HEIMDALL_ENROLL_TOKEN` and registers no server identity.
-> - **IF the audit concludes the public service needs a seed only to boot:** use a
->   **DISTINCT THROWAWAY** seed — **never** the real `cp-pki-key` — under a
->   **DISTINCT server identity name**, so the public boot registration can never
->   clobber the gated `cp-server → pubkey(real-seed)` binding in the shared
->   registry. Provision it and hand it to the deploy via env:
+> **Therefore: ship a DISTINCT THROWAWAY seed — NEVER the real `cp-pki-key`.** The
+> public service gets its own boot identity under a **distinct HAID**; a compromise
+> of the internet-facing service leaks only a throwaway identity + the rotatable
+> enroll token, never the gated server identity. The real `cp-pki-key` stays
+> server-only on the gated service (§2.1). `PREFLIGHT P4` + `P5` make a seedless or
+> real-seed public deploy impossible (a seedless public service would fail-closed at
+> boot; the real seed on the internet is the exact exposure we refuse).
+>
+> Provision the distinct throwaway seed and hand it to the deploy via env:
 >
 >   ```bash
 >   gcloud secrets create cp-pki-key-public --replication-policy=automatic
@@ -167,10 +170,13 @@ python3 -c 'import secrets,sys; sys.stdout.write(secrets.token_urlsafe(32))' \
 >   PY
 >   ```
 >
->   Then in Step 5: `export PUBLIC_PKI_SECRET="cp-pki-key-public"` (and optionally
+>   Then in Step 5: `export PUBLIC_PKI_SECRET="cp-pki-key-public"` (REQUIRED — a
+>   Cloud Run public deploy without it is refused by PREFLIGHT P5; and optionally
 >   `PUBLIC_SERVER_HAID`, default `cp-public-server`). **PREFLIGHT P4 hard-refuses**
 >   if `PUBLIC_PKI_SECRET` is `cp-pki-key` or if the public HAID equals the gated
->   `cp-server` — the wrong-seed deploy is impossible.
+>   `cp-server`; **PREFLIGHT P5 hard-refuses** a public deploy with NO
+>   `PUBLIC_PKI_SECRET` (a seedless public service would fail-closed at boot) — both
+>   the wrong-seed and the no-seed deploys are impossible.
 
 ---
 
@@ -238,7 +244,7 @@ gated service's current 100%-traffic digest:
 ```bash
 # (Optional) pin an explicit digest instead of auto-resolving the gated service's:
 #   export IMAGE="<region>-docker.pkg.dev/${PROJECT_ID}/<repo>/<img>@sha256:<hash>"
-# (Conditional, per Step 2.3) ship a throwaway public seed:
+# (REQUIRED, per Step 2.3 — verdict (b)) ship the DISTINCT throwaway public seed:
 #   export PUBLIC_PKI_SECRET="cp-pki-key-public"
 
 bash deploy/cloud-run/deploy-public-surface.sh apply
@@ -441,7 +447,7 @@ The gated `heimdall-control-plane`, its `heimdall-cp-run` SA, `cp-pki-key`, and 
 ## Go-live checklist (every box before token distribution)
 
 - [ ] Gated service live on a current-`main` immutable image (README §3–§4).
-- [ ] `cp-enroll-token` secret created; PKI-seed decision finalized to the audit (Step 2.3).
+- [ ] `cp-enroll-token` secret created (public service only); distinct throwaway `cp-pki-key-public` seed provisioned under a distinct HAID — never the real `cp-pki-key` (Step 2.3, verdict (b)).
 - [ ] `deploy-public-surface.sh plan` reviewed — P1–P4 present, no dispatch role granted.
 - [ ] `deploy-public-surface.sh apply` succeeded; image pinned to a `@sha256:` digest.
 - [ ] **GATE:** `check-public-surface.sh` → PASS (Step 6.1).
