@@ -6,7 +6,10 @@
 # ASSERT: determinism (same --seed --debug twice == byte-identical); width
 #   stability (compact = 9 grid cols, large = 18, every text-row equal width);
 #   the watchman eyes (debug grid row index 3 = exactly two symmetric '@');
-#   glyph mode renders one visible cell.
+#   glyph mode renders one visible cell; CURATED seed rj == the embedded mockup
+#   grid + the universal full-cell eye punch; eyes render as a FULL white cell
+#   (EYE 240;248;255 as both fg and bg on the eye text-row, not a half sliver);
+#   solid silhouette (OFF renders the DIM #13151d block, never a blank space).
 ROW="statusline:viral-sigil"
 source "$(dirname "${BASH_SOURCE[0]}")/../_lib.sh"
 
@@ -54,6 +57,42 @@ else bad "watchman eyes: row 3 has $AT '@' (want 2): $ROW3"; fi
 REV="$(printf '%s' "$ROW3" | rev)"
 if [ "$ROW3" = "$REV" ]; then ok "watchman eyes: row 3 vertically symmetric (palindrome)"
 else bad "watchman eyes: row 3 asymmetric ($ROW3 != $REV)"; fi
+
+# ── 3b) CURATED grid: seed rj == embedded mockup grid + full-cell eye punch ──
+# The 4 mockup identities ship their exact hand-authored grids. grid_for then
+# applies the universal P1 fix: cols 2 & 6 are lifted to a FULL eye cell across
+# rows 2+3 (so the half-block render emits a crisp white square, not a sliver).
+# This is rj's mockup grid with that punch -> deterministic, must match byte-for-byte.
+EXPECT_RJ="$(cat <<'GRID'
+###·#·###
+·###·###·
+·#@#·#@#·
+··@···@··
+···###···
+#########
+····#····
+##·#·#·##
+GRID
+)"
+GOT_RJ="$(python3 "$SIG" --seed rj --debug)"
+if [ "$GOT_RJ" = "$EXPECT_RJ" ]; then ok "curated rj: debug grid == embedded mockup + eye punch"
+else bad "curated rj: debug grid drifted from curated:
+$GOT_RJ"; fi
+
+# ── 3c) FULL white eye cell: EYE 240;248;255 as BOTH fg and bg on the eye text-row ──
+# render() pairs grid rows (2,3) into text-row index 1; a full-cell eye there means
+# the eye glint appears as foreground AND background -> a solid white square.
+EYEROW="$(python3 "$SIG" --seed "$SEED" --size compact | sed -n '2p')"
+if printf '%s' "$EYEROW" | grep -qF '38;2;240;248;255' \
+   && printf '%s' "$EYEROW" | grep -qF '48;2;240;248;255'; then
+  ok "eyes: full white cell (EYE fg+bg) on the eye text-row"
+else bad "eyes: EYE 240;248;255 not present as both fg+bg on eye text-row"; fi
+
+# ── 3d) solid silhouette: OFF renders the DIM #13151d (19;21;29) filled block ──
+COMPACT="$(python3 "$SIG" --seed "$SEED" --size compact)"
+if printf '%s' "$COMPACT" | grep -qF '19;21;29'; then
+  ok "silhouette: OFF renders a DIM filled block (not transparent)"
+else bad "silhouette: DIM 19;21;29 absent -> OFF still transparent"; fi
 
 # ── 4) glyph mode: a single visible cell for the team wall ──
 GW="$(python3 "$SIG" --seed "$SEED" --glyph | python3 -c 'import sys,re

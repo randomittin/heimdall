@@ -9,6 +9,21 @@ Same seed -> same sigil, forever. Used three ways:
 
 Render is ANSI half-blocks (each text cell = 2 vertical pixels via ▀/▄), so a
 9x8 grid is 9 cols x 4 text-rows and stays width-stable in any monospace terminal.
+A 2:1 monospace cell + half-block = each pixel is ~square (see .planning/ref).
+
+Two ways a grid is born — a HYBRID that always yields a clean, legible face:
+  - CURATED   : 4 hand-authored mockup identities (rj/nadia/arjun/priya) ship
+                their exact grids + hue, so those seeds match the design 1:1.
+  - GENERATED : every other seed (real HAIDs are arbitrary) is built on a fixed
+                watchman TEMPLATE — crown / helm / brow / dark visor / cheeks /
+                shoulders / base. The hash varies only TEXTURE within the
+                template's lit bands, mirrored about col 4. No free bit placement
+                -> a face, never a blob.
+
+Both paths then get the universal watchman finish: a carved-dark visor band and
+FULL-CELL white square eyes (cols 2 & 6 punched across rows 2+3 = one whole text
+cell each), and OFF pixels render as a DIM FILLED block (#13151d) so the face has
+a solid silhouette / bounding box instead of fraying into transparent space.
 
   python3 hmd-sigil.py --seed rj-a3f9 --size compact
   python3 hmd-sigil.py --seed nadia   --size large
@@ -16,45 +31,88 @@ Render is ANSI half-blocks (each text cell = 2 vertical pixels via ▀/▄), so 
 """
 import hashlib, sys, argparse
 
-# cyberpunk body palette — each identity locks one hue. retune to runheimdall.dev.
-BODY = [
-    (34, 211, 238),   # cyan
-    (34, 197, 94),    # green
-    (167, 139, 250),  # violet  (matches the hmd:heimdall powerline tag)
-    (245, 158, 11),   # amber
-    (244, 114, 182),  # pink
-    (56, 189, 248),   # sky
-    (45, 212, 191),   # teal
-    (251, 113, 133),  # rose
+# ── curated identities (canonical mockup) — 4 hand-authored 8x9 faces + fixed hue.
+#    pixel values: 0=off, 1=body hue, 2=eye. these seeds match the design pixel-for-pixel.
+CURATED_GRIDS = {
+    'rj':    ["111010111", "011101110", "011101110", "002000200",
+              "000111000", "111111111", "000010000", "110101011"],
+    'nadia': ["110111011", "011111110", "110101011", "002000200",
+              "000111000", "011101110", "110000011", "000010000"],
+    'arjun': ["010111010", "111111111", "110010011", "002000200",
+              "111010111", "010101010", "101000101", "001111100"],
+    'priya': ["111000111", "010000010", "111101111", "002000200",
+              "111101111", "010010010", "001101100", "101111101"],
+}
+CURATED_HUES = {
+    'rj':    (45, 212, 191),    # teal
+    'nadia': (245, 158, 11),    # amber
+    'arjun': (167, 139, 250),   # violet
+    'priya': (244, 114, 182),   # pink
+}
+
+# generated seeds draw their hue from the SAME 4-color identity palette — the
+# terminal never shows an off-brand body color the mockup never uses.
+GEN_HUES = [(45, 212, 191), (245, 158, 11), (167, 139, 250), (244, 114, 182)]
+
+# watchman TEMPLATE — half-grid (cols 0..4, col 4 = mirror axis), 8 rows. codes:
+#   '1' body (always lit)   '.' off (always dark)   '~' texture (hash decides, low density)
+# eye columns (full cols 2 & 6) are force-punched after build; rows 2/3 here only
+# reserve clear negative space — the punch writes the real eyes.
+TEMPLATE = [
+    "..~11",  # row0 crown      — center helm cap, textured shoulder
+    ".11..",  # row1 helm       — ear-guards
+    ".1.~1",  # row2 brow       — brow band; eye col (2) kept clear -> punched
+    ".....",  # row3 visor      — all dark; eyes punched at cols 2 & 6
+    "1..1.",  # row4 cheek      — jaw + cheekbone; eye col clear (space under eyes)
+    "...1.",  # row5 shoulders  — body rising to center
+    "1..~.",  # row6 torso      — narrow body sides
+    ".1..1",  # row7 base       — footing
 ]
-EYE = (240, 248, 255)   # bright eye glint
-OFF = None              # transparent (terminal bg)
+
+EYE = (240, 248, 255)   # bright eye glint (aliceblue)
+DIM = (19, 21, 29)       # OFF pixel — a DIM FILLED cell (#13151d) -> solid silhouette
+OFF = None               # legacy transparent sentinel (kept for color()/glyph back-compat)
+
+W, H = 9, 8
+
+def _apply_watchman(g):
+    """Universal finish on ANY grid (curated or generated): carve a full-dark
+    visor band, then punch FULL-CELL white square eyes at cols 2 & 6.
+    Eyes span grid rows 2+3 so they fill one whole text cell (render pairs
+    rows (2,3) into text-row 1) -> a crisp white ▀+white-bg square, not a sliver."""
+    for c in range(W):
+        g[3][c] = 0                 # carve the visor dark so eyes pop
+    for col in (2, W - 1 - 2):      # cols 2 and 6, mirrored
+        g[2][col] = 2               # top half of the eye cell
+        g[3][col] = 2               # bottom half of the eye cell
+    return g
 
 def grid_for(seed, eye_override=None):
-    """9x8 vertically-symmetric watchman. Eyes forced for brand identity."""
-    h = hashlib.sha256(seed.encode()).digest()
-    W, H = 9, 8
-    g = [[0] * W for _ in range(H)]
-    half = W // 2  # 4 generated cols + 1 center, mirrored
-    bit = 0
-    for r in range(H):
-        for c in range(half + 1):
-            byte = h[(bit // 8) % len(h)]
-            on = (byte >> (bit % 8)) & 1
-            # density + a helm bias: top rows lean lit on the outer edge (a crown)
-            lit = on
-            if r == 0 and c <= 1:
-                lit = (byte >> 2) & 1 or on
-            g[r][c] = 1 if lit else 0
-            g[r][W - 1 - c] = g[r][c]  # mirror
-            bit += 1
-    # carve the visor band dark so eyes read
-    for c in range(W):
-        g[3][c] = 0
-    # forced eyes (value 2) — symmetric, this is what makes every sigil a *watchman*
-    g[3][2] = 2; g[3][W - 1 - 2] = 2
-    # body hue from hash; eye color can be overridden (team verdict colors the eyes)
-    hue = BODY[h[0] % len(BODY)]
+    """9x8 vertically-symmetric watchman. Curated for the 4 mockup seeds,
+    template-generated (clean, framed eyes) for everything else."""
+    if seed in CURATED_GRIDS:
+        g = [[int(ch) for ch in row] for row in CURATED_GRIDS[seed]]
+        hue = CURATED_HUES[seed]
+    else:
+        h = hashlib.sha256(seed.encode()).digest()
+        g = [[0] * W for _ in range(H)]
+        half = W // 2  # cols 0..3 + center col 4, then mirror
+        bit = 0
+        for r in range(H):
+            for c in range(half + 1):
+                code = TEMPLATE[r][c]
+                if code == '1':
+                    v = 1
+                elif code == '~':
+                    byte = h[(bit // 8) % len(h)]
+                    v = (byte >> (bit % 8)) & 1   # texture bit, low density per template
+                    bit += 1
+                else:
+                    v = 0
+                g[r][c] = v
+                g[r][W - 1 - c] = v               # mirror about col 4
+        hue = GEN_HUES[h[0] % len(GEN_HUES)]
+    _apply_watchman(g)
     eye = eye_override or EYE
     return g, hue, eye
 
@@ -65,47 +123,42 @@ def color(rgb, layer):  # layer: 'fg' or 'bg'
     return f'\033[{code};2;{rgb[0]};{rgb[1]};{rgb[2]}m'
 
 def cell_color(v, hue, eye):
-    return {0: OFF, 1: hue, 2: eye}[v]
+    # 0 -> DIM filled block (silhouette), 1 -> body hue, 2 -> eye glint
+    return {0: DIM, 1: hue, 2: eye}[v]
+
+def _cell(top, bot):
+    """One text cell from a top/bot pixel pair. OFF (None) stays transparent;
+    everything else is a filled half-block so the face has a solid bounding box."""
+    if top is None and bot is None:
+        return ' '
+    if bot is None:
+        return color(top, 'fg') + '▀' + '\033[0m'
+    if top is None:
+        return color(bot, 'fg') + '▄' + '\033[0m'
+    return color(top, 'fg') + color(bot, 'bg') + '▀' + '\033[0m'
 
 def render(seed, eye_override=None, pad='  '):
     g, hue, eye = grid_for(seed, eye_override)
-    H = len(g)
     out = []
     for tr in range(0, H, 2):  # two pixel-rows per text-row
         line = pad
-        for c in range(len(g[0])):
+        for c in range(W):
             top = cell_color(g[tr][c], hue, eye)
             bot = cell_color(g[tr + 1][c], hue, eye) if tr + 1 < H else OFF
-            if top is None and bot is None:
-                line += ' '
-            elif bot is None:
-                line += color(top, 'fg') + '▀' + '\033[0m'
-            elif top is None:
-                line += color(bot, 'fg') + '▄' + '\033[0m'
-            else:
-                line += color(top, 'fg') + color(bot, 'bg') + '▀' + '\033[0m'
+            line += _cell(top, bot)
         out.append(line)
     return out
 
 def render_large(seed, eye_override=None, pad='  '):
     """2x horizontal scale for share/banner — each pixel becomes ██-ish width."""
     g, hue, eye = grid_for(seed, eye_override)
-    H = len(g)
     out = []
     for tr in range(0, H, 2):
         line = pad
-        for c in range(len(g[0])):
+        for c in range(W):
             top = cell_color(g[tr][c], hue, eye)
             bot = cell_color(g[tr + 1][c], hue, eye) if tr + 1 < H else OFF
-            for _ in range(2):  # double width
-                if top is None and bot is None:
-                    line += ' '
-                elif bot is None:
-                    line += color(top, 'fg') + '▀' + '\033[0m'
-                elif top is None:
-                    line += color(bot, 'fg') + '▄' + '\033[0m'
-                else:
-                    line += color(top, 'fg') + color(bot, 'bg') + '▀' + '\033[0m'
+            line += _cell(top, bot) * 2  # double width
         out.append(line)
     return out
 
@@ -120,7 +173,7 @@ if __name__ == '__main__':
     ap.add_argument('--seed', required=True)
     ap.add_argument('--size', choices=['compact', 'large'], default='compact')
     ap.add_argument('--glyph', action='store_true')
-    ap.add_argument('--debug', action='store_true')  # print #/. grid
+    ap.add_argument('--debug', action='store_true')  # print ·/#/@ grid
     a = ap.parse_args()
     if a.glyph:
         print(glyph(a.seed)); sys.exit(0)
