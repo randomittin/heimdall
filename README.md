@@ -98,6 +98,8 @@ bash sentinels/hmd-gate-anim.sh deny "oracle/falsify" $HMD_HAID
 }
 ```
 
+`install.sh` wires this for you — it registers both entries into your `~/.claude/settings.json` (honoring `$CLAUDE_CONFIG_DIR`) using the **absolute installed path**, idempotently and without clobbering a `statusLine` you set yourself. The `${CLAUDE_PLUGIN_ROOT}` form above is the plugin-hook spelling; a user-level statusLine resolves no such variable, so the installer fills in the resolved absolute path — which is why the HUD now reaches every dev, not just whoever hand-wired it in dev setup.
+
 `hooks/statusline.sh` drives the full-width watchman and falls back to the legacy single line if `python3` is missing — it never errors, never blocks. Already a ccstatusline (9.2k★) user? Keep your line and drop the watchman in as a Custom Command widget:
 
 ```bash

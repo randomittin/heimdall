@@ -190,6 +190,95 @@ ensure_path_on_profile() {
   printf 'appended'
 }
 
+# Idempotently register Heimdall's statusLine + subagentStatusLine into the
+# user's Claude Code settings so the watchman HUD activates for EVERY dev via the
+# install — not only whoever hand-wired it during dev setup. THIS is the RJ-only
+# bug: statusLine is a USER/PROJECT setting (Claude Code does NOT apply a plugin's
+# own settings.json to it), so the working registration lived solely in one dev's
+# personal ~/.claude/settings.json and a stranger install never replicated it.
+#
+# The command is the ABSOLUTE installed path — NOT ${CLAUDE_PLUGIN_ROOT}, which is
+# unset outside a plugin-hook context (an unresolved var renders nothing). It is
+# guarded by `[ -x … ] … ; exit 0` so a missing script or non-TTY is a clean no-op,
+# never an error or a hang (the render scripts themselves are already CI-safe).
+# A stale entry left after `hmd uninstall` is therefore a harmless guarded no-op.
+#
+# Honors $CLAUDE_CONFIG_DIR (Claude Code's config override) → $HOME/.claude. Merges
+# via python3 so every other settings key is preserved; a missing python3 is a no-op
+# (the watchman render itself needs python3 — registering an unrenderable line would
+# be pointless). NEVER clobbers a user's OWN custom statusLine: writes only when the
+# key is absent or already points at a heimdall statusline script (refreshing a stale
+# path). Prints ONE state word (runs in a command substitution):
+#   registered  — wrote/refreshed our statusLine
+#   current     — already the canonical value; nothing written
+#   kept-custom — user has a non-heimdall statusLine; left untouched
+#   skipped     — python3 unavailable or the write failed; nothing written
+ensure_statusline_registered() {
+  local plugin_dir="$1"
+  command -v python3 >/dev/null 2>&1 || { printf 'skipped'; return 0; }
+  local cfg="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+  mkdir -p "$cfg" 2>/dev/null || true
+  HMD_SL_PLUGIN="$plugin_dir" HMD_SL_SETTINGS="$cfg/settings.json" \
+    python3 - <<'PY' 2>/dev/null || { printf 'skipped'; return 0; }
+import json, os, sys, tempfile
+
+plugin = os.environ["HMD_SL_PLUGIN"]
+path   = os.environ["HMD_SL_SETTINGS"]
+
+def cmd(rel):
+    p = plugin + "/" + rel
+    # Mirror the proven working dev form: absolute path, [ -x ] guard, exit 0.
+    return "bash -c '[ -x \"%s\" ] && exec bash \"%s\"; exit 0'" % (p, p)
+
+WANT = {
+    "statusLine":         {"marker": "hooks/statusline.sh",
+                           "value": {"type": "command", "command": cmd("hooks/statusline.sh")}},
+    "subagentStatusLine": {"marker": "hmd-subagent-statusline.sh",
+                           "value": {"type": "command", "command": cmd("sentinels/hmd-subagent-statusline.sh")}},
+}
+
+try:
+    with open(path) as fh:
+        data = json.load(fh)
+    if not isinstance(data, dict):
+        data = {}
+except Exception:
+    data = {}
+
+wrote = custom = False
+for key, spec in WANT.items():
+    cur = data.get(key)
+    ours = cur is None or (isinstance(cur, dict) and spec["marker"] in (cur.get("command") or ""))
+    if not ours:
+        custom = True
+        continue
+    if cur != spec["value"]:
+        data[key] = spec["value"]
+        wrote = True
+
+if wrote:
+    d = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".settings.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            json.dump(data, fh, indent=2)
+            fh.write("\n")
+        os.replace(tmp, path)
+    except Exception:
+        try: os.unlink(tmp)
+        except OSError: pass
+        print("skipped"); sys.exit(0)
+
+sl = data.get("statusLine")
+if isinstance(sl, dict) and WANT["statusLine"]["marker"] in (sl.get("command") or ""):
+    print("registered" if wrote else "current")
+elif custom:
+    print("kept-custom")
+else:
+    print("skipped")
+PY
+}
+
 # ── Install-step telemetry (dossier §3 + §8) ────────────────────────────────
 #
 # install.sh's own step — the PATH export — emits started→succeeded|failed +
@@ -252,8 +341,11 @@ main() {
   # Install layout. Plugin (all components) lives in its own dir; the two entry
   # points are SYMLINKED into a bin dir on PATH (symlink so the launcher's
   # readlink-based sibling resolution lands back in the plugin dir — see
-  # link_entry). The installer also appends BIN_DIR to the shell profile. No
-  # writes outside these locations + the one profile line.
+  # link_entry). The installer also appends BIN_DIR to the shell profile and
+  # registers the statusLine HUD into the user's Claude Code settings.json
+  # (idempotent, $CLAUDE_CONFIG_DIR-aware, never clobbering a custom statusLine —
+  # see ensure_statusline_registered). No writes outside these locations, the one
+  # profile line, and that settings.json statusLine entry.
   local PLUGIN_DIR="$HOME/.heimdall"
   local BIN_DIR="$HOME/.local/bin"
   local MARKETPLACE_NAME="heimdall"
@@ -537,6 +629,23 @@ main() {
       "$C_DIM" "$C_RESET"
     blank
   fi
+
+  # Step: activate the statusline HUD by registering it in the user's Claude Code
+  # settings.json — so the watchman animation reaches EVERY dev through the install,
+  # not just whoever hand-wired it in dev setup (the RJ-only bug). OPTIONAL/graceful
+  # (dossier §8): a write failure or a missing python3 must never abort the install —
+  # ensure_statusline_registered returns a state word and always exits 0.
+  local SL_T0; SL_T0="$(_tele_now_ms)"
+  _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" statusline started
+  step_begin "Activating statusline HUD"
+  local SL_STATE; SL_STATE="$(ensure_statusline_registered "$PLUGIN_DIR")"
+  _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" statusline succeeded "$SL_T0"
+  case "$SL_STATE" in
+    registered)  step_ok "Activating statusline HUD" "registered" ;;
+    current)     step_ok "Activating statusline HUD" "active" ;;
+    kept-custom) step_ok "Activating statusline HUD" "kept your custom line" ;;
+    *)           step_ok "Activating statusline HUD" "skipped (needs python3)" ;;
+  esac
 
   # Step: verify gates — N is the RUNTIME gate count, never hardcoded.
   local GAT_T0; GAT_T0="$(_tele_now_ms)"
