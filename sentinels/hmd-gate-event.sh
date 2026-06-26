@@ -27,16 +27,24 @@ VERDICT="${1:-watching}"; GATE="${2:-gate}"; PASSED="${3:-}"; TOTAL="${4:-}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 
-# ── identity: heimdall-haid > HMD_HAID > USER > "you" ────────────────────────
-seed() {
+# ── identity: FILE-controlled via bin/heimdall-identity (the sigil SEED + the wall
+# HANDLE). Falls back to heimdall-haid > HMD_HAID > USER > "you" if the bin is absent. ──
+seed_fallback() {
   local h
   if [ -x "$ROOT/bin/heimdall-haid" ]; then
     h="$("$ROOT/bin/heimdall-haid" current 2>/dev/null)" && [ -n "$h" ] && { printf '%s' "$h"; return; }
   fi
   printf '%s' "${HMD_HAID:-${USER:-you}}"
 }
-HAID="$(seed)"
-# file-safe slug for the team heartbeat filename (haids carry ':' and '/').
+ID_BIN="$ROOT/bin/heimdall-identity"
+HAID=""; HANDLE=""
+if [ -x "$ID_BIN" ]; then
+  HAID="$("$ID_BIN" 2>/dev/null)" || HAID=""
+  HANDLE="$("$ID_BIN" --handle 2>/dev/null)" || HANDLE=""
+fi
+[ -n "$HAID" ]   || HAID="$(seed_fallback)"   # SEED feeds the sigil + the heartbeat identity
+[ -n "$HANDLE" ] || HANDLE="$HAID"            # HANDLE is the display name on the wall
+# file-safe slug for the team heartbeat filename (haids/seeds carry ':' and '/').
 SLUG="$(printf '%s' "$HAID" | tr -c 'A-Za-z0-9._-' '-')"
 
 # ── state verdict mapping (scan -> scanning) ─────────────────────────────────
@@ -71,7 +79,7 @@ if [ -f "$DIR/team/CONSENT" ]; then
   out="$DIR/team/$SLUG.json"
   tmp="$DIR/team/.hb.$$.$RANDOM"
   printf '{"haid":"%s","name":"%s","agent":"%s","verdict":"%s","file":"%s","claim":"%s","ts":%s}\n' \
-    "$HAID" "$HAID" "$AGENT" "$TEAM_VERDICT" "$GATE" "$GATE" "$NOW" >"$tmp" 2>/dev/null \
+    "$HAID" "$HANDLE" "$AGENT" "$TEAM_VERDICT" "$GATE" "$GATE" "$NOW" >"$tmp" 2>/dev/null \
     && mv -f "$tmp" "$out" 2>/dev/null || rm -f "$tmp" 2>/dev/null
 fi
 

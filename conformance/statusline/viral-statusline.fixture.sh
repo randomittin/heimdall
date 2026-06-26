@@ -77,6 +77,52 @@ printf '{"haid":"nadia-1","name":"nadia","agent":"coder","verdict":"working","fi
 STALE="$(printf '%s' "$JSON" | COLUMNS=$COLS python3 "$SL" | sed -E 's/\x1b\[[0-9;]*m//g')"
 if grep -qF 'nadia' <<<"$STALE"; then bad "stale teammate still on the wall (TTL not enforced)"
 else ok "stale teammate dropped from the wall"; fi
+rm -f "$WS/.heimdall/team/nadia.json"
+
+# ── 7) FILE-controlled identity: bin/heimdall-identity is the sigil SEED + the
+# wall HANDLE (RJ's call). Setting an identity must reflect on BOTH the sigil
+# anchor (seed) and the info row (handle); a different identity changes the sigil. ──
+if [ -x "$BIN/heimdall-identity" ]; then
+  HEIMDALL_IDENTITY_DIR="$WS/.heimdall" "$BIN/heimdall-identity" --set tester --seed tester >/dev/null 2>&1
+  ID_OUT="$(printf '%s' "$JSON" | COLUMNS=$COLS HMD_NOW=7 python3 "$SL")"
+  ID_PLAIN="$(printf '%s' "$ID_OUT" | sed -E 's/\x1b\[[0-9;]*m//g')"
+  assert_contains "$ID_PLAIN" "tester" "identity handle 'tester' shows on the info row"
+  SIG_A="$(printf '%s' "$ID_OUT" | head -1)"
+  HEIMDALL_IDENTITY_DIR="$WS/.heimdall" "$BIN/heimdall-identity" --set someoneelse --seed someoneelse >/dev/null 2>&1
+  SIG_B="$(printf '%s' "$JSON" | COLUMNS=$COLS HMD_NOW=7 python3 "$SL" | head -1)"
+  if [ "$SIG_A" != "$SIG_B" ]; then ok "sigil seed is file-controlled (changes with identity)"
+  else bad "sigil row identical across identities — seed not sourced from heimdall-identity"; fi
+  rm -f "$WS/.heimdall/identity.json"
+else
+  note "heimdall-identity bin absent — skipping file-seed assertions"
+fi
+
+# ── 8) SERVER-SYNCED roster: a populated roster cache fills the wall with ONLINE
+# teammates (other machines), marked with a green online pip; the local team/*.json
+# file path stays the OFFLINE fallback when the cache is absent (sections 5/6).
+# Isolated workspace + a FRESH cache mtime so roster_presence serves it without a
+# background refetch that could clobber the seeded rows. ──
+WIDE=200
+WS8="$(mk_workspace)"; mkdir -p "$WS8/.heimdall"
+JSON8='{"workspace":{"current_dir":"'"$WS8"'"}}'
+python3 - "$WS8/.heimdall/.roster-cache.json" <<'PY'
+import json,sys
+json.dump([
+  {"handle":"riku","haid":"haid:riku","verdict":"working","file":"sync.go","age_seconds":4},
+  {"handle":"vera","haid":"haid:vera","verdict":"pass","file":"core.py","age_seconds":9},
+], open(sys.argv[1],"w"))
+PY
+ROSTER="$(printf '%s' "$JSON8" | COLUMNS=$WIDE HMD_NOW=7 python3 "$SL")"
+ROSTER_PLAIN="$(printf '%s' "$ROSTER" | sed -E 's/\x1b\[[0-9;]*m//g')"
+assert_contains "$ROSTER_PLAIN" "riku" "server roster -> online teammate 'riku' on the wall"
+assert_contains "$ROSTER_PLAIN" "vera" "server roster -> online teammate 'vera' on the wall"
+# the green online pip (GR ●) marks who is actually online now (roster, not file).
+if printf '%s' "$ROSTER" | grep -qF $'\033[38;2;34;197;94m●'; then ok "online status shown (green pip on roster members)"
+else bad "no online pip on roster members"; fi
+# roster row stays width-safe at the wide terminal (<= COLUMNS).
+RMW="$(printf '%s' "$ROSTER" | maxw)"
+if [ "$RMW" -le "$WIDE" ]; then ok "roster wall width $RMW <= COLUMNS($WIDE)"; else bad "roster wall width $RMW exceeds COLUMNS($WIDE)"; fi
+rm -rf "$WS8"
 
 rm -rf "$WS"
 finish

@@ -11,9 +11,10 @@ Ships via plugin settings.json:
 Modes:
   --widget   emit only the watchman+verdict segment (ccstatusline coexistence)
 """
-import sys, os, json, time, re, hashlib, importlib.util
+import sys, os, json, time, re, hashlib, importlib.util, subprocess, shlex
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+BIN_DIR = os.path.normpath(os.path.join(HERE, "..", "bin"))  # heimdall-identity / heimdall-presence live here
 spec = importlib.util.spec_from_file_location("hmd_sigil", os.path.join(HERE, "hmd_sigil.py"))
 SIG = importlib.util.module_from_spec(spec); spec.loader.exec_module(SIG)
 
@@ -36,8 +37,87 @@ def gate_state(cwd):
         with open(p) as f: return json.load(f)
     except Exception: return {}
 
+def identity(cwd, fallback):
+    """Sigil SEED + display HANDLE from bin/heimdall-identity (RJ's call: identity is a
+    file each dev controls, not a derived HAID). One `--json` call resolves both. Any
+    absence/error/timeout falls back to the OLD HMD_HAID/USER seed so the line never breaks."""
+    seed = handle = None
+    bin_path = os.path.join(BIN_DIR, "heimdall-identity")
+    try:
+        if os.access(bin_path, os.X_OK):
+            r = subprocess.run([bin_path, "--json"], cwd=cwd, timeout=1.0,
+                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            rec = json.loads(r.stdout.decode("utf-8", "replace") or "{}")
+            seed = (rec.get("seed") or "").strip() or None
+            handle = (rec.get("handle") or "").strip() or None
+    except Exception:
+        seed = handle = None   # any fault → drop to the env fallback below
+    return (seed or fallback), (handle or seed or fallback)
+
+def _quiet_rm(path):
+    try: os.remove(path)
+    except OSError: return
+
+def _roster_cache_path(cwd): return os.path.join(cwd, ".heimdall", ".roster-cache.json")
+
+def _spawn_roster_refresh(cwd):
+    """Fire-and-forget background refresh of the server roster cache. The child does the
+    (possibly slow) signed network read, then atomically renames into place — so the 3s
+    statusline NEVER blocks on the network. A lock file throttles concurrent refreshers."""
+    bin_path = os.path.join(BIN_DIR, "heimdall-presence")
+    if not os.access(bin_path, os.X_OK): return
+    cache = _roster_cache_path(cwd); lock = cache + ".lock"
+    try:
+        if os.path.exists(lock) and time.time() - os.path.getmtime(lock) < 8: return
+        os.makedirs(os.path.dirname(cache), exist_ok=True)
+        open(lock, "w").close()
+    except Exception:
+        return
+    tmp = cache + ".%d.tmp" % os.getpid()
+    cmd = ("%s roster --json > %s 2>/dev/null && mv -f %s %s; rm -f %s" %
+           (shlex.quote(bin_path), shlex.quote(tmp), shlex.quote(tmp),
+            shlex.quote(cache), shlex.quote(lock)))
+    try:
+        subprocess.Popen(["/bin/sh", "-c", cmd], cwd=cwd, start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         stdin=subprocess.DEVNULL)
+    except Exception:
+        _quiet_rm(lock)   # spawn failed → drop the throttle so the next render can retry
+
+def roster_presence(cwd, fresh_for=4):
+    """SERVER-synced ONLINE team (devs on OTHER machines, within the server TTL). Serves a
+    short-TTL cache INSTANTLY and refreshes it in the background; an empty/missing cache
+    returns [] so team_presence can fall back to local files. Never blocks, never raises."""
+    cache = _roster_cache_path(cwd); rows = None; age = None
+    try:
+        age = time.time() - os.path.getmtime(cache)
+        with open(cache) as f: rows = json.load(f)
+    except Exception:
+        rows = None
+    if age is None or age >= fresh_for:
+        _spawn_roster_refresh(cwd)   # this render uses the prior cache (or empty); next render sees fresh
+    if not isinstance(rows, list): return []
+    now = time.time(); out = []
+    for r in rows:
+        if not isinstance(r, dict): continue
+        a = r.get("age_seconds")
+        ts = (now - a) if isinstance(a, (int, float)) else r.get("ts", now)
+        out.append({
+            "name": r.get("handle") or r.get("haid") or "?",
+            "haid": r.get("haid"),
+            "verdict": r.get("verdict") or "working",
+            "file": r.get("file") or "",
+            "ts": ts,
+            "online": True,   # the roster is who is actually ONLINE now
+        })
+    return out
+
 def team_presence(cwd, ttl=30):
-    """Read .heimdall/team/*.json — each running hmd heartbeats its own file."""
+    """Prefer the SERVER roster (online team across machines), else the local
+    .heimdall/team/*.json heartbeat files (OFFLINE fallback) when the control plane is
+    unreachable/unconfigured — the watch wall always renders, empty never means a hang."""
+    roster = roster_presence(cwd)
+    if roster: return roster
     d = os.path.join(cwd, ".heimdall", "team"); out = []
     try: names = os.listdir(d)
     except Exception: return out
@@ -66,7 +146,10 @@ def main():
     cw = data.get("context_window") or {}
     pct = int(cw.get("used_percentage") or 0)
     repo = ((data.get("workspace") or {}).get("repo") or {}).get("name") or os.path.basename(cwd)
-    haid = os.environ.get("HMD_HAID") or os.environ.get("USER") or "you"
+    # identity is FILE-controlled (bin/heimdall-identity): seed feeds the sigil, handle
+    # shows on the wall. Falls back to the old HMD_HAID/USER resolution if the bin errors.
+    fallback = os.environ.get("HMD_HAID") or os.environ.get("USER") or "you"
+    seed, handle = identity(cwd, fallback)
 
     st = gate_state(cwd)
     verdict = st.get("verdict", "watching")
@@ -98,7 +181,7 @@ def main():
         return
 
     # ── sigil anchor (squint animates; eyes stay visible in every frame) ──
-    sig = SIG.render(haid, eye_override=eye, pad="")  # 4 rows, 9 cols
+    sig = SIG.render(seed, eye_override=eye, pad="")  # 4 rows, 9 cols
     SW = 9
     ANCHOR = SW + 2  # sigil(9 cols) + 2-space gutter, prefixed on EVERY row
 
@@ -136,36 +219,56 @@ def main():
     r2 = f"{bifrost}{claim_seg}"
 
     # left info rows
-    l1 = f"{eyes_inline} {TEAL}{BOLD}HEIMDALL{X}{SEP}{DIM}{haid}{X}{SEP}{DIM}{model}{X}"
+    l1 = f"{eyes_inline} {TEAL}{BOLD}HEIMDALL{X}{SEP}{DIM}{handle}{X}{SEP}{DIM}{model}{X}"
     l2 = f"{bar}{SEP}{AM}{repo}:main{X}{tok_seg}"
 
-    # team wall (only when teammates present) — cap at the 6 most-recently
-    # active so a big team can't overflow the row; surplus shows as "+N more".
+    # team wall (only when teammates present). WIDTH-AWARE capacity: fit as many of the
+    # most-recently-active teammates as the row width allows (COLUMNS minus the sigil
+    # anchor + right gutter), then "+N more" for the overflow — no clip past the gutter.
     team = team_presence(cwd)
     wall_segs = []
     if team:
         team = sorted(team, key=lambda t: t.get("ts", 0), reverse=True)
-        extra = max(0, len(team) - 6)
-        team = sorted(team[:6], key=lambda t: t.get("name", ""))
-        wall_segs.append(f"{FAINT}── watch ──{X}")
-        for m in team:
+
+        def member_seg(m):  # the per-teammate render — formula unchanged, + an online pip
             v = m.get("verdict", "working")
             col = {"pass":GR,"done":GR,"deny":RD,"working":AM,"watching":CY}.get(v, CY)
             ergb = {"pass":(34,197,94),"done":(34,197,94),"deny":(239,68,68),"working":(245,158,11)}.get(v)
             g = SIG.glyph(m.get("name","?"), eye_override=ergb)
             state = ({"pass":"✓","done":"✓","deny":"✗","working":"⚡"}.get(v,"◦"))
             f = m.get("file","")
+            # online status: a server-roster teammate is live NOW (green ●); a local
+            # file-fallback heartbeat shows a faint ◦.
+            pip = f"{GR}●{X}" if m.get("online") else f"{FAINT}◦{X}"
             label = f"{m.get('name','?')} {col}{state}{(' '+f) if f else ''}{X}"
-            seg = f"{g} {label}"
+            seg = f"{pip} {g} {label}"
             if v == "deny":  # the moment — make it pop
-                seg = f"{RD}▕{X}{g} {RD}{BOLD}{m.get('name','?')} ✗ BIFRÖST{(' '+f) if f else ''}{X}{RD}▏{X}"
-            wall_segs.append(seg)
-        if extra:
-            wall_segs.append(f"{DIM}+{extra} more{X}")
-        # your own watchman closes the wall
+                seg = f"{RD}▕{X}{pip} {g} {RD}{BOLD}{m.get('name','?')} ✗ BIFRÖST{(' '+f) if f else ''}{X}{RD}▏{X}"
+            return seg
+
+        header = f"{FAINT}── watch ──{X}"
         you_state = {"pass": "✓", "deny": "✗", "scanning": "◦"}.get(verdict, "⚡")
         you_word  = {"pass": "proven", "deny": "blocked", "scanning": "scanning"}.get(verdict, "working")
-        wall_segs.append(f"{SIG.glyph(haid)} {BOLD}you{X} {DIM}{you_state} {you_word}{X}")
+        you_seg = f"{SIG.glyph(seed)} {BOLD}you{X} {DIM}{you_state} {you_word}{X}"  # your watchman closes the wall
+
+        JOIN = 2                                   # the "  " between wall segments
+        budget = max(0, cols - (SW + 2) - RMARGIN) # usable row width: COLUMNS − sigil anchor − gutter
+        used = vis(header) + JOIN + vis(you_seg)   # header + the you-closer are always shown
+        chosen = []
+        for m in team:
+            seg = member_seg(m)
+            if chosen and used + JOIN + vis(seg) > budget: break
+            chosen.append((m, seg)); used += JOIN + vis(seg)
+        extra = len(team) - len(chosen)
+        while extra > 0 and chosen and used + JOIN + vis(f"{DIM}+{extra} more{X}") > budget:
+            m, seg = chosen.pop(); used -= JOIN + vis(seg); extra += 1   # make room for the "+N more" tag
+
+        wall_segs.append(header)
+        for m, seg in sorted(chosen, key=lambda ms: ms[0].get("name", "")):
+            wall_segs.append(seg)
+        if extra > 0:
+            wall_segs.append(f"{DIM}+{extra} more{X}")
+        wall_segs.append(you_seg)
 
     def line(left, right):
         # account for the sigil anchor prefixed on every row AND a right safety
