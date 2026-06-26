@@ -47,6 +47,7 @@ import cp_dashboard
 import cp_diag
 import cp_ingest
 import cp_notify
+import cp_presence
 import cp_scheduler
 import cp_server
 import cp_worker
@@ -217,6 +218,10 @@ def boot(server=cp_server, *, home=None, base_env=None, start_tick=True,
     routes["jobs"] = list(cp_worker.register_job_routes(home=home, base_env=base_env))
     routes["approvals"] = list(cp_approval.register(home=home))
     routes["notifications"] = [cp_notify.register_notify_routes(server.register_route)]
+    # Team presence (§presence): POST /presence heartbeat + GET /roster?project=<p>.
+    # External-keyed on the StateBackend seam, so the online team survives scale-to-zero
+    # (Firestore-durable) — a dev on a fresh instance reads heartbeats another dev wrote.
+    routes["presence"] = list(cp_presence.register(home=home))
     # The unauthenticated Cloud Run health probes (§A). Registered into the seam for
     # status/CLI visibility (registered_routes() reflects /healthz + /readyz); the LIVE
     # serving of these two bypasses the seam and runs pre-auth in cp_server. Idempotent.
