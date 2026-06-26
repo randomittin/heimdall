@@ -11,7 +11,14 @@
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 export HMD_SIGIL_DIR="$HERE"
-SEED="${HMD_HAID:-${USER:-you}}"
+# identity is FILE-controlled (bin/heimdall-identity): the SEED feeds the sigil, the
+# HANDLE is the share/wall name. Fall back to the old HMD_HAID/USER seed if the bin errs.
+IDENTITY_BIN="$HERE/../bin/heimdall-identity"
+SEED="${HMD_HAID:-${USER:-you}}"; HANDLE="$SEED"
+if [ -x "$IDENTITY_BIN" ]; then
+  _s="$("$IDENTITY_BIN" 2>/dev/null)" && [ -n "$_s" ] && SEED="$_s"
+  _h="$("$IDENTITY_BIN" --handle 2>/dev/null)" && [ -n "$_h" ] && HANDLE="$_h"
+fi
 
 CY=$'\033[38;2;34;211;238m'; GR=$'\033[38;2;34;197;94m'; DIM=$'\033[38;2;90;100;114m'
 EYEC=$'\033[38;2;240;248;255m'; B=$'\033[1m'; X=$'\033[0m'
@@ -58,7 +65,7 @@ hmd_share() {
   printf '\n'
   face "$OPEN" large
   printf '\n'
-  printf '  %b\n' "${CY}${B}@${SEED}${X}   ${DIM}your watchman${X}"
+  printf '  %b\n' "${CY}${B}@${HANDLE}${X}   ${DIM}your watchman${X}"
   printf '  %b\n' "$TAGLINE"
   printf '\n'
 }
