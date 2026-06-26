@@ -149,5 +149,27 @@ if grep -qF 'invite your team' <<<"$POP"; then bad "populated wall still shows t
 else ok "populated wall has no tease (real wall renders)"; fi
 rm -f "$WS/.heimdall/team/kai.json"
 
+# ── 12) AUTO-BEAT: the render fires a throttled, detached heartbeat so THIS dev
+# appears on teammates' walls (the roster read alone never announced us). It must
+# never block the render (CP unreachable), and must throttle (~1 beat / 20s). ──
+if [ -x "$BIN/heimdall-presence" ]; then
+  WSB="$(mk_workspace)"; mkdir -p "$WSB/.heimdall"
+  JSONB='{"workspace":{"current_dir":"'"$WSB"'"}}'
+  T0="$(python3 -c 'import time;print(int(time.time()*1000))')"
+  printf '%s' "$JSONB" | HEIMDALL_CP_URL="http://127.0.0.1:1" COLUMNS=$COLS python3 "$SL" >/dev/null 2>&1
+  T1="$(python3 -c 'import time;print(int(time.time()*1000))')"
+  if [ "$(( T1 - T0 ))" -lt 2000 ]; then ok "auto-beat render non-blocking on unreachable CP ($(( T1 - T0 ))ms)"
+  else bad "render blocked on the heartbeat ($(( T1 - T0 ))ms)"; fi
+  if [ -f "$WSB/.heimdall/.beat-stamp" ]; then ok "auto-beat dropped a heartbeat stamp"
+  else bad "no .beat-stamp — render did not beat"; fi
+  M1="$(stat -f %m "$WSB/.heimdall/.beat-stamp" 2>/dev/null || stat -c %Y "$WSB/.heimdall/.beat-stamp" 2>/dev/null)"
+  printf '%s' "$JSONB" | HEIMDALL_CP_URL="http://127.0.0.1:1" COLUMNS=$COLS python3 "$SL" >/dev/null 2>&1
+  M2="$(stat -f %m "$WSB/.heimdall/.beat-stamp" 2>/dev/null || stat -c %Y "$WSB/.heimdall/.beat-stamp" 2>/dev/null)"
+  if [ "$M1" = "$M2" ]; then ok "auto-beat throttled (no re-beat within the 20s window)"
+  else bad "auto-beat not throttled (stamp bumped on immediate re-render)"; fi
+else
+  note "heimdall-presence bin absent — skipping auto-beat assertions"
+fi
+
 rm -rf "$WS"
 finish

@@ -84,6 +84,33 @@ def _spawn_roster_refresh(cwd):
     except Exception:
         _quiet_rm(lock)   # spawn failed → drop the throttle so the next render can retry
 
+def _beat_stamp_path(cwd): return os.path.join(cwd, ".heimdall", ".beat-stamp")
+
+def _spawn_beat(cwd, handle, verdict):
+    """Fire-and-forget heartbeat to the CP so THIS dev shows up on teammates' walls.
+    Detached + non-blocking like the roster refresh; THROTTLED to ~1 beat / 20s via a
+    stamp file (well under the server's ~45s online TTL, but ~1 process / 20s, not per
+    3s render). heimdall-presence is a silent no-op when the CP is unconfigured/offline,
+    so this is always safe. Never blocks the render, never raises."""
+    bin_path = os.path.join(BIN_DIR, "heimdall-presence")
+    if not os.access(bin_path, os.X_OK): return
+    stamp = _beat_stamp_path(cwd)
+    try:
+        if os.path.exists(stamp) and time.time() - os.path.getmtime(stamp) < 20: return
+        os.makedirs(os.path.dirname(stamp), exist_ok=True)
+        open(stamp, "w").close()   # refresh the throttle BEFORE spawning → one beat per window
+    except Exception:
+        return
+    pv = {"pass": "pass", "deny": "deny", "scanning": "working",
+          "watching": "watching"}.get(verdict, "working")
+    env = dict(os.environ, HMD_HANDLE=(handle or ""), HMD_VERDICT=pv)
+    try:
+        subprocess.Popen([bin_path, "beat"], cwd=cwd, env=env, start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         stdin=subprocess.DEVNULL)
+    except Exception:
+        return
+
 def roster_presence(cwd, fresh_for=4):
     """SERVER-synced ONLINE team (devs on OTHER machines, within the server TTL). Serves a
     short-TTL cache INSTANTLY and refreshes it in the background; an empty/missing cache
@@ -179,6 +206,10 @@ def main():
         cnt = f" {passed}/{total}" if passed is not None else ""
         sys.stdout.write(f"{CY}▐{X}{vcol}{eyes}{X}{CY}▌{X} {vcol}{vglyph} {vword}{cnt}{X}")
         return
+
+    # keep THIS dev present on teammates' walls: a throttled, detached heartbeat (the
+    # roster read alone never announced us). Fire-and-forget — never blocks the render.
+    _spawn_beat(cwd, handle, verdict)
 
     # ── sigil anchor (squint animates; eyes stay visible in every frame) ──
     sig = SIG.render(seed, eye_override=eye, pad="")  # 4 rows, 9 cols
