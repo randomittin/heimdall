@@ -1,0 +1,225 @@
+#!/usr/bin/env bash
+# heimdall-feedback — file a team-feedback GitHub issue from inside hmd.
+#
+# A team dev runs `heimdall-feedback "<message>"` to raise an issue on the repo
+# carrying ONLY their words + minimal context (hmd version, optional command/
+# phase). It REUSES the issue-loop's GitHub plumbing — bin/lib/issue_config.py
+# (config load + credential resolution from the *_env name, never a literal) and
+# bin/lib/connectors/github.py (the same urllib auth + POST + lazy/optional
+# degradation as the loop's writeback). NO new GitHub HTTP client is built here.
+#
+# THE NO-SECRET DISCIPLINE: feedback is the dev's words — never session content,
+# code, or secrets. The message is scanned for credential SHAPES before anything
+# is sent; a hit REFUSES the submission (nothing is filed). Only the message + a
+# tiny version/phase footer ever reach GitHub.
+#
+# Usage:
+#   heimdall-feedback "<message>" [--repo DIR] [--config FILE]
+#                                 [--label L]... [--command C] [--phase P]
+#                                 [--dry-run]
+#
+# Options:
+#   --repo DIR     repo root resolving the issue-loop config + the github block
+#                  (default: cwd). The issue target is that block's `repo`.
+#   --config FILE  explicit issue-loop config file (default:
+#                  ${HEIMDALL_HOME:-<repo>/.heimdall}/issue-loop.config.json).
+#   --label L      extra label (repeatable). `feedback` + `from-hmd` are always
+#                  applied so submissions are filterable.
+#   --command C    the hmd command in play (minimal context, optional).
+#   --phase P      the hmd phase in play (minimal context, optional).
+#   --dry-run      build + scan + PRINT the issue payload as JSON; file nothing.
+#                  (CI / testing: asserts the payload without hitting GitHub.)
+#   -h | --help    this help.
+#
+# Exit codes:
+#   0  filed (or dry-run printed the payload)
+#   1  github connector not configured / inactive, or the create call failed
+#   2  usage error
+#   3  runtime error (python / lib missing)
+#   5  refused — a credential shape was detected in the message (no-secret guard)
+
+set -euo pipefail
+
+# Resolve this script's own dir (RELOCATABLE — no baked path).
+SELF="$0"
+case "$SELF" in
+  */*) : ;;
+  *)   SELF="$(command -v "$SELF" 2>/dev/null || echo "$SELF")" ;;
+esac
+BIN_DIR="$(cd "$(dirname "$SELF")" 2>/dev/null && pwd)"
+LIB_DIR="$BIN_DIR/lib"
+PLUGIN_ROOT="${CLAUDE_PLUGIN_ROOT:-$(cd "$BIN_DIR/.." && pwd)}"
+
+usage() { sed -n '2,46p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+  "" ) echo "heimdall-feedback: a <message> is required" >&2; usage >&2; exit 2 ;;
+esac
+
+if [ ! -f "$LIB_DIR/issue_config.py" ] || [ ! -d "$LIB_DIR/connectors" ]; then
+  echo "heimdall-feedback: issue-loop seam not found under $LIB_DIR" >&2
+  exit 3
+fi
+
+PY="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)"
+if [ -z "$PY" ]; then
+  echo "heimdall-feedback: python3 not found on PATH" >&2
+  exit 3
+fi
+
+# All parsing/logic lives in python (robust quoting); the message + flags are
+# forwarded verbatim as argv. Default repo root = cwd.
+HF_REPO_DEFAULT="$(pwd)" \
+HF_PLUGIN_ROOT="$PLUGIN_ROOT" \
+PYTHONPATH="$LIB_DIR${PYTHONPATH:+:$PYTHONPATH}" \
+  "$PY" - "$@" <<'PY'
+import json
+import os
+import re
+import sys
+
+import issue_config as ic
+import connectors as conn
+
+
+def die(code, msg):
+    sys.stderr.write("heimdall-feedback: %s\n" % msg)
+    sys.exit(code)
+
+
+# ── parse argv (first non-flag positional = the message) ───────────────────────
+args = sys.argv[1:]
+message = None
+repo = os.environ.get("HF_REPO_DEFAULT") or os.getcwd()
+config_file = None
+extra_labels = []
+command = None
+phase = None
+dry_run = False
+
+i = 0
+while i < len(args):
+    a = args[i]
+    if a == "--repo":
+        i += 1; repo = args[i] if i < len(args) else die(2, "--repo needs a dir")
+    elif a == "--config":
+        i += 1; config_file = args[i] if i < len(args) else die(2, "--config needs a file")
+    elif a == "--label":
+        i += 1
+        if i >= len(args):
+            die(2, "--label needs a value")
+        extra_labels.append(args[i])
+    elif a == "--command":
+        i += 1; command = args[i] if i < len(args) else die(2, "--command needs a value")
+    elif a == "--phase":
+        i += 1; phase = args[i] if i < len(args) else die(2, "--phase needs a value")
+    elif a == "--dry-run":
+        dry_run = True
+    elif a.startswith("--"):
+        die(2, "unknown option: %s" % a)
+    elif message is None:
+        message = a
+    else:
+        die(2, "unexpected extra argument: %r (quote the message)" % a)
+    i += 1
+
+if not message or not message.strip():
+    die(2, "a non-empty <message> is required")
+message = message.strip()
+
+# ── NO-SECRET GUARD: refuse a message bearing a credential SHAPE ───────────────
+# Feedback is the dev's WORDS. We scan for high-value secret shapes only (not the
+# mere word "token") so honest prose passes but a pasted credential is refused.
+_SECRET_PATTERNS = [
+    (r"ghp_[A-Za-z0-9]{30,}", "GitHub personal access token"),
+    (r"gh[osru]_[A-Za-z0-9]{30,}", "GitHub token"),
+    (r"github_pat_[A-Za-z0-9_]{40,}", "GitHub fine-grained PAT"),
+    (r"sk_live_[A-Za-z0-9]{16,}", "Stripe live key"),
+    (r"sk_test_[A-Za-z0-9]{16,}", "Stripe test key"),
+    (r"xox[baprs]-[A-Za-z0-9-]{10,}", "Slack token"),
+    (r"AKIA[0-9A-Z]{16}", "AWS access key id"),
+    (r"AIza[0-9A-Za-z_\-]{35}", "Google API key"),
+    (r"-----BEGIN [A-Z ]*PRIVATE KEY-----", "private key block"),
+    (r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}", "JWT"),
+    (r"(?i)\b(?:secret|password|passwd|api[_-]?key|access[_-]?token)\b\s*[:=]\s*\S{8,}",
+     "inline secret assignment"),
+]
+for pat, what in _SECRET_PATTERNS:
+    if re.search(pat, message):
+        die(5, "refused — the message looks like it contains a %s. Feedback is "
+               "your words only; strip the secret and resubmit." % what)
+
+# ── minimal context (NO session content, NO code) ─────────────────────────────
+def hmd_version():
+    pj = os.path.join(os.environ.get("HF_PLUGIN_ROOT", ""), ".claude-plugin", "plugin.json")
+    try:
+        with open(pj, "r", encoding="utf-8") as fh:
+            return str(json.load(fh).get("version") or "unknown")
+    except (OSError, ValueError):
+        return "unknown"
+
+
+version = hmd_version()
+
+# Title: "feedback: " + the first line, capped so it stays a tight summary.
+first_line = message.splitlines()[0].strip()
+TITLE_CAP = 72
+prefix = "feedback: "
+room = TITLE_CAP - len(prefix)
+title = prefix + (first_line if len(first_line) <= room else first_line[: room - 1].rstrip() + "…")
+
+# Body: the dev's message, then a tiny context footer. Nothing else.
+context = ["- hmd version: `%s`" % version]
+if command:
+    context.append("- command: `%s`" % command)
+if phase:
+    context.append("- phase: `%s`" % phase)
+body = "%s\n\n---\n_Filed via `hmd feedback` — the dev's words + minimal context only (no session content)._\n%s\n" % (
+    message, "\n".join(context),
+)
+
+labels = ["feedback", "from-hmd"] + [l for l in extra_labels if l.strip()]
+# de-dupe, preserve order
+seen = set()
+labels = [l for l in labels if not (l in seen or seen.add(l))]
+
+# ── dry-run: print the payload, file nothing (CI / mockable assertion) ─────────
+if dry_run:
+    print(json.dumps({"repo": None, "title": title, "body": body, "labels": labels},
+                     indent=2, sort_keys=True))
+    sys.exit(0)
+
+# ── resolve the github connector via the SHARED issue-loop config layer ────────
+cfg = ic.load_config(repo, path=config_file)
+secrets = ic.load_secrets(repo)
+gh_block = (cfg.get("connectors") or {}).get("github")
+if not isinstance(gh_block, dict):
+    die(1, "github connector is not configured. Add a connectors.github block to "
+           "%s (see .heimdall/issue-loop.config.json.example)." % ic.config_path(repo))
+
+token = ic.resolve_cred(gh_block, secrets=secrets)
+if not token:
+    env_name = gh_block.get("token_env") or "<token_env>"
+    die(1, "github connector has no credential. Export the %s env var (or add it "
+           "to the gitignored secrets file) and retry." % env_name)
+
+# Hand the resolved block (+ token) to the SAME connector the loop uses.
+gh = conn.get("github")
+block = dict(gh_block)
+block["token"] = token
+try:
+    gh.configure(block)
+except conn.ConnectorConfigError as e:
+    die(1, "github connector config error: %s" % e)
+
+if not gh.health().get("active"):
+    die(1, "github connector is inactive: %s" % gh.health().get("reason"))
+
+result = gh.create_issue(title, body, labels=labels)
+if not result.get("ok"):
+    die(1, "could not file the issue: %s" % (result.get("reason") or "unknown error"))
+
+print("filed as issue #%s" % result.get("number"))
+print(result.get("url"))
+PY
