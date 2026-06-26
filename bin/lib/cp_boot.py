@@ -45,6 +45,7 @@ import cp_approval
 import cp_auth
 import cp_dashboard
 import cp_diag
+import cp_enroll
 import cp_ingest
 import cp_notify
 import cp_presence
@@ -222,6 +223,11 @@ def boot(server=cp_server, *, home=None, base_env=None, start_tick=True,
     # External-keyed on the StateBackend seam, so the online team survives scale-to-zero
     # (Firestore-durable) — a dev on a fresh instance reads heartbeats another dev wrote.
     routes["presence"] = list(cp_presence.register(home=home))
+    # Token-gated self-enroll (§pki-bootstrap): POST /enroll binds a dev's first-run pubkey to
+    # its HAID with ZERO manual steps, after which its signed presence beats verify. Wired into
+    # the PRE-AUTH public seam (the caller has no key to sign with yet) and gated by the
+    # server-side HEIMDALL_ENROLL_TOKEN secret — fail-closed when that secret is unset.
+    routes["enroll"] = list(cp_enroll.register(home=home))
     # The unauthenticated Cloud Run health probes (§A). Registered into the seam for
     # status/CLI visibility (registered_routes() reflects /healthz + /readyz); the LIVE
     # serving of these two bypasses the seam and runs pre-auth in cp_server. Idempotent.
