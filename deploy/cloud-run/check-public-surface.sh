@@ -87,6 +87,30 @@ grep -qF -- '--allow-unauthenticated' "${DEPLOY_SH}" \
   && pass "public deploy is --allow-unauthenticated (zero-config reachable)" \
   || fail "public deploy is missing --allow-unauthenticated"
 
+# ── 4. RUNBOOK doc-lint — the go-live runbook references the real scripts + route set ─
+# The runbook drives the deploy; if it drifts from the real script names or the canonical
+# public route set, an operator follows stale instructions. Assert the references are real.
+RUNBOOK="${SELF_DIR}/GO-LIVE-RUNBOOK.md"
+if [ -f "${RUNBOOK}" ]; then
+  grep -qF 'deploy-public-surface.sh' "${RUNBOOK}" \
+    && pass "runbook references deploy-public-surface.sh" \
+    || fail "runbook does not reference deploy-public-surface.sh"
+  grep -qF 'check-public-surface.sh' "${RUNBOOK}" \
+    && pass "runbook references check-public-surface.sh (the required gate)" \
+    || fail "runbook does not reference check-public-surface.sh"
+  grep -qF "${CANON}" "${RUNBOOK}" \
+    && pass "runbook carries the identical canonical public route set" \
+    || fail "runbook is missing the canonical public route set '${CANON}'"
+  # No gated route may appear in the runbook's documented public-set line either.
+  RB_PUBLIC_LINE="$(grep -F "${CANON}" "${RUNBOOK}" | head -1)"
+  for r in "${GATED_ROUTES[@]}"; do
+    printf '%s' "${RB_PUBLIC_LINE}" | grep -qF "${r}" \
+      && fail "gated route ${r} leaked into the runbook's documented public set"
+  done
+else
+  fail "missing ${RUNBOOK} (the go-live runbook the deploy sequence depends on)"
+fi
+
 echo
 if [ "${FAILED}" -eq 0 ]; then
   printf '\033[32mcheck-public-surface: PASS\033[0m\n'; exit 0
