@@ -98,6 +98,29 @@ class GithubConnector(Connector):
         url = out.get("html_url") if isinstance(out, dict) else None
         return {"ok": bool(url), "url": url}
 
+    def create_issue(
+        self, title: str, body: str, labels: Optional[List[str]] = None
+    ) -> dict:
+        """Open a NEW issue on the configured repo. Reuses the SAME auth + urllib
+        POST machinery + degradation contract as post_resolution/close_issue: an
+        inactive connector (no token) -> {ok: False, reason: 'inactive'} (no
+        network call, no crash); a network/auth failure -> {ok: False} with a
+        reason. On success -> {ok: True, number, url}. Labels absent from the repo
+        are created by GitHub's issues API automatically."""
+        if not self.health()["active"]:
+            return {"ok": False, "reason": "inactive"}
+        title = (title or "").strip()
+        if not title:
+            return {"ok": False, "reason": "empty title"}
+        payload: dict = {"title": title, "body": body or ""}
+        if labels:
+            payload["labels"] = [str(l) for l in labels if str(l).strip()]
+        out = self._post("/repos/%s/issues" % self._repo, payload)
+        if not isinstance(out, dict):
+            return {"ok": False, "reason": "no response (network or auth failure)"}
+        url = out.get("html_url")
+        return {"ok": bool(url), "number": out.get("number"), "url": url}
+
     def close_issue(self, raw_ref: dict) -> dict:
         if not self.health()["active"]:
             return {"ok": False, "reason": "inactive"}
