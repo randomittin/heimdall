@@ -97,6 +97,16 @@ class Response:
 
 _ROUTES = {}
 
+# The PRE-AUTH (public) seam — routes served BEFORE the §3 auth chokepoint. The chokepoint
+# 401s any unsigned request, but a few routes MUST answer unsigned: the health probes (cp_diag,
+# special-cased pre-auth below) and ENROLLMENT (cp_enroll — a dev's FIRST run has NO registered
+# key yet, so it cannot sign). A public route carries its OWN gate inside its handler (enroll's
+# bootstrap token), so opting a path out of PKI is the explicit, introspectable act of
+# registering it HERE. Public handlers take `fn(request) -> Response` — there is NO verified
+# identity pre-auth. Kept disjoint from _ROUTES so a public handler is never invoked with the
+# post-auth (identity, request) shape.
+_PUBLIC_ROUTES = {}
+
 
 def register_route(method, path, fn):
     """Register a route handler for (METHOD, path). `fn(identity, request) -> Response`
@@ -113,13 +123,34 @@ def register_route(method, path, fn):
     return key
 
 
+def register_public_route(method, path, fn):
+    """Register a PRE-AUTH (public) route handler for (METHOD, path) — served BEFORE the §3
+    auth chokepoint. `fn(request) -> Response` receives the parsed request dict ONLY (there is
+    no verified identity pre-auth). Use this ONLY for a route that cannot be PKI-signed (the
+    caller has no registered key yet — enrollment) AND that carries its OWN gate inside the
+    handler (a bootstrap token). The key is recorded so registered_routes() reflects it (the
+    surface stays honest). Returns the (method, path) key. Re-registering replaces it."""
+    key = ((method or "").upper(), path or "")
+    if not key[0] or not key[1]:
+        raise ValueError("register_public_route needs a method and a path")
+    if not callable(fn):
+        raise ValueError("route handler must be callable")
+    _PUBLIC_ROUTES[key] = fn
+    return key
+
+
 def registered_routes():
-    """The sorted list of registered (method, path) route keys — for status/CLI."""
-    return sorted(_ROUTES.keys())
+    """The sorted list of registered (method, path) route keys — for status/CLI. Includes
+    both the authenticated seam routes and the pre-auth public routes."""
+    return sorted(set(_ROUTES.keys()) | set(_PUBLIC_ROUTES.keys()))
 
 
 def _route(method, path):
     return _ROUTES.get(((method or "").upper(), path or ""))
+
+
+def _public_route(method, path):
+    return _PUBLIC_ROUTES.get(((method or "").upper(), path or ""))
 
 
 # ── the §2 isolated-context builder ────────────────────────────────────────────
@@ -350,6 +381,11 @@ def _build_handler_class(home, enforce_revocation):
                 "body": body_bytes,
                 "haid": self.headers.get("X-Heimdall-HAID"),
                 "signature": self.headers.get("X-Heimdall-Signature"),
+                # The bootstrap token a PRE-AUTH enroll caller may carry in a header (the body
+                # field is the alternative). A normal signed request never sets it; the §3
+                # chokepoint ignores it (verify_identity reads only haid/signature/method/
+                # path/body), so lifting it here is inert for every authenticated route.
+                "enroll_token": self.headers.get("X-Heimdall-Enroll-Token"),
             }
 
         def _handle(self, method):
@@ -367,6 +403,15 @@ def _build_handler_class(home, enforce_revocation):
             # version only), so serving them pre-auth leaks nothing.
             if cp_diag.is_health_path(method, route_path):
                 self._send(cp_diag.handle(method, route_path, home=home))
+                return
+            # PRE-AUTH public routes (enrollment, §pki-bootstrap) — answered BEFORE the §3
+            # chokepoint because the caller has NO registered key to sign with yet. A public
+            # route carries its OWN gate inside the handler (enroll's bootstrap token); routing
+            # it through §3 would 401 a legitimate first-run enroll. Matched on the query-
+            # stripped path, like every other route; the handler takes (request) only.
+            public = _public_route(method, route_path)
+            if public is not None:
+                self._send(public(request))
                 return
             # §3 auth chokepoint — every request, exactly once. Verifies over the FULL
             # path-with-query (request["path"]) — the bytes the client signed.
