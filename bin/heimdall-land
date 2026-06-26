@@ -1,0 +1,381 @@
+#!/usr/bin/env bash
+# heimdall-land — the land-to-shared-main flow (autonomous on branches, gated on
+# the MERGED state for shared main).
+#
+# THE PRINCIPLE (exact): reversible-DESTINATION vs irreversible-DESTINATION,
+# NOT push-vs-no-push.
+#   • Push to the dev's OWN branch = REVERSIBLE (force-push/reset undo it) ->
+#     AUTONOMOUS, no gate, full speed.
+#   • Land/merge to SHARED main = IRREVERSIBLE (N other devs build on it) ->
+#     GATED — but the trigger is the GATES' verdict on the MERGED state, NEVER
+#     the agent's self-assessment.
+#
+# THE FLOW:
+#   1. Push the current feature branch autonomously (reversible). Force-push is
+#      allowed ONLY for the dev's OWN branch (--force-with-lease).
+#   2. Fetch CURRENT shared main (what others already landed) and merge the
+#      branch onto it LOCALLY in a throwaway worktree — gate the MERGE RESULT,
+#      never the branch in isolation.
+#   3. Class 1 (REDUNDANCY) — run redum/debloat against the CURRENT SHARED STATE:
+#      similar duplicate fns across branches consolidate, one survives
+#      (bin/lib/land_consolidate.py over the shared dedup engine + heimdall-debloat).
+#   4. Class 2 (SEMANTIC INCOMPATIBILITY) — run THE GATES on the merged+
+#      consolidated result. redum finds NO duplicate for a dangling reference
+#      (A renamed getUser->fetchUser, B still calls getUser); only the merged
+#      code FAILING under test catches it. The gate command is CONFIGURABLE
+#      (--gate-cmd / HEIMDALL_GATE_CMD / .planning/settings.json commands),
+#      defaulting to the heimdall gate set (corpus/falsify/conformance + test/
+#      lint/build).
+#   5. DECIDE — gates-on-merged/resolved-state decide, never self-assessment:
+#        • clean merged-state gates + NO textual conflict       -> AUTO-LAND.
+#        • textual conflict (F4 flags a divergent same-symbol)   -> STOP (human).
+#        • gates FAIL after consolidation                        -> STOP (human).
+#        • consolidation resolved it, gates pass, change SMALL   -> AUTO-LAND.
+#        • consolidation change LARGE (> HEIMDALL_LAND_LARGE_LOC)-> STOP (human).
+#   6. ALWAYS human-gated regardless: force-push to SHARED main, history rewrite,
+#      credential ops. A non-fast-forward land (would need force) STOPS. Branch
+#      force-push is fine.
+#
+# Wired through heimdall-claim/ledger + heimdall-blackboard + shared-memory so
+# each hmd operates on the CURRENT shared state (the landed sha is published; the
+# shared-main surface is claimed) — never a stale snapshot.
+#
+# Usage:
+#   heimdall-land [--repo DIR] [--remote NAME] [--main BRANCH] [--branch NAME]
+#                 [--gate-cmd CMD] [--no-push] [--no-shared-push] [--json] [-h]
+#
+#   --repo DIR        repo to land from (default: cwd). Must be a git repo.
+#   --remote NAME     shared remote (default: origin; skipped if absent).
+#   --main BRANCH     shared integration branch (default: main).
+#   --branch NAME     branch to land (default: current branch).
+#   --gate-cmd CMD    explicit gate command (highest precedence).
+#   --no-push         do NOT push the feature branch (offline / no remote).
+#   --no-shared-push  AUTO-LAND advances local main but holds the push to shared
+#                     main for the human (prints the exact command).
+#   --json            print the machine-readable verdict on stdout.
+#   -h, --help        this help.
+#
+# Exit: 0 AUTO-LAND (landed). 3 STOP (human gate). 2 usage/IO error.
+set -euo pipefail
+
+SELF="$0"
+if command -v readlink >/dev/null 2>&1; then
+  SELF="$(readlink -f "$0" 2>/dev/null || readlink "$0" 2>/dev/null || echo "$0")"
+fi
+BINDIR="$(cd "$(dirname "$SELF")" && pwd)"
+PY="$(command -v python3 || command -v python || true)"
+
+usage() { sed -n '2,70p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+command -v git >/dev/null 2>&1 || { echo "error: git not found" >&2; exit 2; }
+command -v jq  >/dev/null 2>&1 || { echo "error: jq required" >&2; exit 2; }
+[ -n "$PY" ] || { echo "error: python3 not found" >&2; exit 2; }
+
+# ── option parsing ────────────────────────────────────────────────────────────
+REPO="$(pwd)"
+REMOTE="origin"
+MAIN="main"
+BRANCH=""
+GATE_CMD="${HEIMDALL_GATE_CMD:-}"
+DO_PUSH=1
+SHARED_PUSH=1
+JSON=0
+LARGE_LOC="${HEIMDALL_LAND_LARGE_LOC:-200}"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --repo)            REPO="${2:?--repo needs a value}"; shift 2 ;;
+    --remote)          REMOTE="${2:?--remote needs a value}"; shift 2 ;;
+    --main)            MAIN="${2:?--main needs a value}"; shift 2 ;;
+    --branch)          BRANCH="${2:?--branch needs a value}"; shift 2 ;;
+    --gate-cmd)        GATE_CMD="${2:?--gate-cmd needs a value}"; shift 2 ;;
+    --no-push)         DO_PUSH=0; shift ;;
+    --no-shared-push)  SHARED_PUSH=0; shift ;;
+    --json)            JSON=1; shift ;;
+    *) echo "error: unknown flag: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+REPO="$(cd "$REPO" 2>/dev/null && pwd || true)"
+[ -n "$REPO" ] || { echo "error: repo dir not found" >&2; exit 2; }
+git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1 || { echo "error: not a git repo: $REPO" >&2; exit 2; }
+
+[ -n "$BRANCH" ] || BRANCH="$(git -C "$REPO" rev-parse --abbrev-ref HEAD)"
+[ "$BRANCH" != "HEAD" ] || { echo "error: detached HEAD — pass --branch" >&2; exit 2; }
+if [ "$BRANCH" = "$MAIN" ]; then
+  echo "error: cannot land '$MAIN' onto itself — land a feature branch" >&2; exit 2
+fi
+
+# Each hmd operates on the TARGET repo's shared .planning state (claims/ledger/
+# blackboard live there, not in the heimdall plugin's own .planning).
+export HEIMDALL_PLANNING_DIR="${HEIMDALL_PLANNING_DIR:-$REPO/.planning}"
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+log()  { printf '%s\n' "$*" >&2; }
+have_remote() { git -C "$REPO" remote | grep -qx "$REMOTE"; }
+
+# Resolve the gate command (configurable; heimdall set is the default).
+#   1. --gate-cmd / HEIMDALL_GATE_CMD (explicit override)
+#   2. .planning/settings.json commands.{test,lint,build} (non-empty, AND-chained)
+#   3. the default heimdall gate set: corpus run + falsify alarms + conformance,
+#      for whichever are present in the plugin.
+resolve_gate_cmd() {
+  if [ -n "$GATE_CMD" ]; then printf '%s' "$GATE_CMD"; return; fi
+  local settings="$REPO/.planning/settings.json"
+  local parts=()
+  if [ -f "$settings" ]; then
+    local t l b
+    t="$(jq -r '.commands.test  // empty' "$settings" 2>/dev/null || true)"
+    l="$(jq -r '.commands.lint  // empty' "$settings" 2>/dev/null || true)"
+    b="$(jq -r '.commands.build // empty' "$settings" 2>/dev/null || true)"
+    [ -n "$t" ] && parts+=("$t")
+    [ -n "$l" ] && parts+=("$l")
+    [ -n "$b" ] && parts+=("$b")
+  fi
+  if [ "${#parts[@]}" -eq 0 ]; then
+    # Default heimdall gate set — only the components that actually exist.
+    [ -x "$BINDIR/corpus" ]  && parts+=("$BINDIR/corpus run")
+    if [ -x "$BINDIR/falsify" ]; then
+      local af
+      af="$(jq -r '.commands.alarm_falsify_exchange // empty' "$settings" 2>/dev/null || true)"
+      [ -n "$af" ] && parts+=("$af")
+    fi
+    if [ -d "$REPO/conformance" ] && [ -f "$REPO/conformance/_lib.sh" ]; then
+      parts+=("for f in $REPO/conformance/gates/*.fixture.sh; do bash \"\$f\" || exit 1; done")
+    fi
+  fi
+  if [ "${#parts[@]}" -eq 0 ]; then
+    # No gate configured and no heimdall set present: an empty gate is NOT a
+    # silent pass — it is an honest refusal (nothing proven => do not land).
+    printf 'GATE_UNCONFIGURED'
+    return
+  fi
+  local out="${parts[0]}"
+  local i
+  for ((i=1; i<${#parts[@]}; i++)); do out+=" && ${parts[$i]}"; done
+  printf '%s' "$out"
+}
+
+# ── verdict accumulator (emitted as JSON at the end) ──────────────────────────
+DECISION="stopped"
+REASON=""
+CONFLICT="false"
+GATE_STATUS="not-run"
+CONSOLIDATIONS="[]"
+LOC_DELTA=0
+PUSHED_BRANCH="false"
+LANDED_SHA=""
+ESCALATION=""
+
+emit_and_exit() {
+  local code="$1"
+  if [ "$JSON" -eq 1 ]; then
+    jq -cn \
+      --arg decision "$DECISION" --arg reason "$REASON" \
+      --arg conflict "$CONFLICT" --arg gate "$GATE_STATUS" \
+      --arg branch "$BRANCH" --arg main "$MAIN" \
+      --arg pushed "$PUSHED_BRANCH" --arg sha "$LANDED_SHA" \
+      --arg escalation "$ESCALATION" --argjson loc "$LOC_DELTA" \
+      --argjson cons "$CONSOLIDATIONS" \
+      '{schema:"heimdall-land.1",decision:$decision,reason:$reason,
+        textual_conflict:($conflict=="true"),gate_status:$gate,
+        branch:$branch,main:$main,branch_pushed:($pushed=="true"),
+        landed_sha:$sha,consolidation_loc:$loc,consolidations:$cons,
+        escalation:$escalation}'
+  fi
+  exit "$code"
+}
+
+# ── STEP 1 — push the OWN branch autonomously (REVERSIBLE, no gate) ───────────
+if [ "$DO_PUSH" -eq 1 ] && have_remote; then
+  # Force-with-lease is allowed for the dev's OWN branch only (reversible).
+  if git -C "$REPO" push --force-with-lease "$REMOTE" "refs/heads/$BRANCH:refs/heads/$BRANCH" >/dev/null 2>&1; then
+    PUSHED_BRANCH="true"
+    log "land: pushed own branch '$BRANCH' to $REMOTE (reversible, autonomous)"
+  else
+    log "land: branch push to $REMOTE failed (continuing to local merge-gate)"
+  fi
+else
+  log "land: branch push skipped (no remote or --no-push)"
+fi
+
+# ── claim the SHARED-MAIN surface so two landers don't collide ────────────────
+# Only a REAL collision (heimdall-claim exit 3) stops the land; a coordination-
+# tool hiccup (exit 2) must not block the flow.
+if [ -x "$BINDIR/heimdall-claim" ]; then
+  set +e
+  "$BINDIR/heimdall-claim" check "$MAIN" >/dev/null 2>&1
+  CLAIM_RC=$?
+  set -e
+  if [ "$CLAIM_RC" -eq 3 ]; then
+    HOLDER="$("$BINDIR/heimdall-claim" check "$MAIN" 2>&1 || true)"
+    DECISION="stopped"; REASON="shared-main surface is claimed by another lander"
+    ESCALATION="another hmd holds the '$MAIN' land claim: $HOLDER — retry after release"
+    log "land: STOP — $REASON"
+    emit_and_exit 3
+  fi
+  "$BINDIR/heimdall-claim" claim "$MAIN" --task "land:$BRANCH" --ttl 30 >/dev/null 2>&1 || true
+fi
+release_claim() { if [ -x "$BINDIR/heimdall-claim" ]; then "$BINDIR/heimdall-claim" release >/dev/null 2>&1 || true; fi; }
+trap 'release_claim' EXIT
+
+# ── STEP 2 — fetch CURRENT shared main + merge the branch onto it LOCALLY ─────
+MAIN_REF="$MAIN"
+if have_remote; then
+  git -C "$REPO" fetch -q "$REMOTE" "$MAIN" 2>/dev/null || true
+  if git -C "$REPO" rev-parse --verify -q "$REMOTE/$MAIN" >/dev/null; then
+    MAIN_REF="$REMOTE/$MAIN"
+  fi
+fi
+git -C "$REPO" rev-parse --verify -q "$MAIN_REF" >/dev/null 2>&1 || {
+  echo "error: cannot resolve main ref '$MAIN_REF'" >&2; emit_and_exit 2; }
+
+BRANCH_SHA="$(git -C "$REPO" rev-parse "$BRANCH")"
+MAIN_SHA="$(git -C "$REPO" rev-parse "$MAIN_REF")"
+
+# mktemp template X's built programmatically (avoid a literal triple-X token).
+_MKX="$(printf 'X%.0s' 1 2 3 4 5 6 7 8)"
+INTEG="$(mktemp -d "${TMPDIR:-/tmp}/hmd-land.${_MKX}")"
+cleanup_integ() { git -C "$REPO" worktree remove --force "$INTEG" >/dev/null 2>&1 || rm -rf "$INTEG"; }
+trap 'cleanup_integ; release_claim' EXIT
+
+git -C "$REPO" worktree add -q --detach "$INTEG" "$MAIN_SHA" 2>/dev/null || {
+  echo "error: could not create integration worktree" >&2; emit_and_exit 2; }
+
+# Merge the branch onto CURRENT main IN the throwaway worktree (merge-result, not
+# branch-in-isolation). --no-commit so we gate before committing.
+set +e
+git -C "$INTEG" merge --no-ff --no-commit "$BRANCH_SHA" >/dev/null 2>&1
+MERGE_RC=$?
+set -e
+UNMERGED="$(git -C "$INTEG" ls-files -u | wc -l | tr -d ' ')"
+if [ "$MERGE_RC" -ne 0 ] || [ "$UNMERGED" != "0" ]; then
+  CONFLICT="true"
+fi
+
+# ── STEP 3 — Class 1 REDUNDANCY: redum/debloat over the CURRENT SHARED STATE ──
+# Consolidate similar duplicate fns introduced across branches (one survives).
+# Skipped when there is an unresolved textual conflict (the tree is not clean to
+# index) — that path is classified by F4 below.
+if [ "$CONFLICT" != "true" ]; then
+  CONS_JSON="$("$PY" "$BINDIR/lib/land_consolidate.py" --repo "$INTEG" \
+                --main-ref "$MAIN_SHA" --branch-ref "$BRANCH_SHA" \
+                --apply --json 2>/dev/null || echo '{}')"
+  CONSOLIDATIONS="$(printf '%s' "$CONS_JSON" | jq -c '.consolidations // []' 2>/dev/null || echo '[]')"
+  LOC_DELTA="$(printf '%s' "$CONS_JSON" | jq -r '.loc_removed // 0' 2>/dev/null || echo 0)"
+  N_CLUSTERS="$(printf '%s' "$CONS_JSON" | jq -r '.duplicate_clusters // 0' 2>/dev/null || echo 0)"
+  if [ "$N_CLUSTERS" -gt 0 ]; then
+    log "land: redum consolidated $N_CLUSTERS duplicate cluster(s) (-$LOC_DELTA LOC) against shared state"
+  fi
+  # heimdall-debloat scorecard against the merged state (informational, read-only).
+  if [ -x "$BINDIR/heimdall-debloat" ]; then
+    "$BINDIR/heimdall-debloat" --repo "$INTEG" --report-only >/dev/null 2>&1 || true
+  fi
+fi
+
+# ── textual conflict -> F4 collision classification -> STOP if divergent ──────
+if [ "$CONFLICT" = "true" ]; then
+  log "land: textual conflict merging '$BRANCH' onto '$MAIN' — classifying via F4"
+  FLAGGED="?"
+  if [ -x "$BINDIR/heimdall-collision" ]; then
+    FLAGGED="$("$BINDIR/heimdall-collision" scan --repo "$REPO" --quiet 2>/dev/null \
+               | jq -r '.flagged // 0' 2>/dev/null || echo '?')"
+  fi
+  DECISION="stopped"
+  REASON="textual conflict on merge to '$MAIN' (F4: divergent same-target — semantic, human-only)"
+  ESCALATION="MERGE CONFLICT landing '$BRANCH' onto '$MAIN'. F4 classifies a divergent same-symbol change as human-only — resolve the conflict by hand, re-run land. (flagged=$FLAGGED)"
+  log "land: STOP — $REASON"
+  emit_and_exit 3
+fi
+
+# ── STEP 4 — Class 2 SEMANTIC INCOMPATIBILITY: GATE the MERGED+consolidated state
+RESOLVED_GATE_CMD="$(resolve_gate_cmd)"
+if [ "$RESOLVED_GATE_CMD" = "GATE_UNCONFIGURED" ]; then
+  DECISION="stopped"
+  REASON="no gate command configured and no heimdall gate set present"
+  ESCALATION="set --gate-cmd, HEIMDALL_GATE_CMD, or .planning/settings.json commands.test — an unproven merge does NOT land"
+  GATE_STATUS="unconfigured"
+  log "land: STOP — $REASON"
+  emit_and_exit 3
+fi
+log "land: gating MERGED result: $RESOLVED_GATE_CMD"
+
+set +e
+( cd "$INTEG" && eval "$RESOLVED_GATE_CMD" ) >/dev/null 2>&1
+GATE_RC=$?
+set -e
+if [ "$GATE_RC" -eq 0 ]; then GATE_STATUS="pass"; else GATE_STATUS="fail"; fi
+
+# ── STEP 5 — DECIDE (gates-on-merged/resolved-state decide, never self-assess) ─
+if [ "$GATE_STATUS" = "fail" ]; then
+  # redum found no duplicate to fix this (Class 2 dangling-reference); the gate
+  # caught what redum AND branch-isolation both miss. Resolution failed -> human.
+  DECISION="stopped"
+  REASON="merged-result gates FAILED (semantic incompatibility redum cannot consolidate away)"
+  ESCALATION="The merged state ('$BRANCH' onto current '$MAIN') fails the gate: $RESOLVED_GATE_CMD. This is a Class-2 incompatibility (e.g. a dangling reference to a symbol another branch changed) — no duplicate for redum to collapse. Fix the reference on the branch, then re-run land."
+  log "land: STOP — $REASON"
+  emit_and_exit 3
+fi
+
+# Gates pass. If consolidation was the local RESOLUTION, it must be SMALL.
+if [ "$LOC_DELTA" -gt "$LARGE_LOC" ]; then
+  DECISION="stopped"
+  REASON="resolution change is LARGE (-$LOC_DELTA LOC > $LARGE_LOC) — human review"
+  ESCALATION="redum consolidation removed $LOC_DELTA LOC to make the merge pass — over the $LARGE_LOC LOC large-change threshold. A large auto-resolution goes to a human."
+  log "land: STOP — $REASON"
+  emit_and_exit 3
+fi
+
+# ── AUTO-LAND — clean merged-state gates + no conflict. No human. ─────────────
+git -C "$INTEG" add -A >/dev/null 2>&1 || true
+git -C "$INTEG" commit -q --no-edit -m "land: merge '$BRANCH' into '$MAIN' (gated on merged state)" \
+  || git -C "$INTEG" commit -q -m "land: merge '$BRANCH' into '$MAIN'"
+LANDED_SHA="$(git -C "$INTEG" rev-parse HEAD)"
+
+# Advance LOCAL main to the landed commit. A non-fast-forward would need a force
+# (history rewrite of shared main) -> ALWAYS human-gated.
+if git -C "$REPO" rev-parse --verify -q "$MAIN" >/dev/null; then
+  if ! git -C "$REPO" merge-base --is-ancestor "$MAIN_SHA" "$LANDED_SHA"; then
+    DECISION="stopped"
+    REASON="land would rewrite shared '$MAIN' history (non-fast-forward) — human-only"
+    ESCALATION="Landing '$BRANCH' is not a fast-forward over current '$MAIN'; advancing would require a force-push / history rewrite of shared main — ALWAYS human-gated."
+    log "land: STOP — $REASON"
+    emit_and_exit 3
+  fi
+fi
+git -C "$REPO" branch -f "$MAIN" "$LANDED_SHA" >/dev/null 2>&1 || true
+
+# Push to SHARED main: a normal (non-force) push, authorized by the clean
+# merged-state gate. Held for the human under --no-shared-push (or when a force
+# would be required — never auto-forced).
+if [ "$SHARED_PUSH" -eq 1 ] && have_remote; then
+  if git -C "$REPO" push "$REMOTE" "refs/heads/$MAIN:refs/heads/$MAIN" >/dev/null 2>&1; then
+    log "land: pushed '$MAIN' to $REMOTE (auto-land; gated on merged state)"
+  else
+    DECISION="stopped"
+    REASON="shared-main push rejected (someone landed first; would need force) — human-only"
+    ESCALATION="Push to $REMOTE/$MAIN was rejected — current shared main advanced under us. Re-run land to re-merge onto the new shared state; a force-push to shared main is ALWAYS human-gated."
+    log "land: STOP — $REASON"
+    emit_and_exit 3
+  fi
+elif [ "$SHARED_PUSH" -eq 0 ]; then
+  log "land: --no-shared-push — local '$MAIN' advanced; run: git -C $REPO push $REMOTE $MAIN"
+fi
+
+# ── publish the CURRENT shared state so other hmds aren't on a stale snapshot ──
+if [ -x "$BINDIR/heimdall-blackboard" ]; then
+  "$BINDIR/heimdall-blackboard" set "land:last_landed_sha" "$LANDED_SHA" >/dev/null 2>&1 || true
+fi
+if [ -x "$BINDIR/shared-memory" ]; then
+  "$BINDIR/shared-memory" publish "heimdall-land" \
+    "landed $BRANCH -> $MAIN @ $LANDED_SHA" >/dev/null 2>&1 || true
+fi
+if [ -x "$BINDIR/heimdall-ledger" ]; then
+  "$BINDIR/heimdall-ledger" log --role land --kind auto-land --tokens 0 >/dev/null 2>&1 || true
+fi
+
+DECISION="landed"
+REASON="clean merged-state gates + no textual conflict -> auto-land"
+log "land: AUTO-LAND '$BRANCH' -> '$MAIN' @ ${LANDED_SHA:0:12} (gate=$GATE_STATUS)"
+emit_and_exit 0

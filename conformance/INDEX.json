@@ -4,8 +4,8 @@
   "parity_source": "PARITY.md",
   "baseline_tag": "v1.1.0 (superx)",
   "totals": {
-    "fixtures": 22,
-    "fixture_asserts": 159,
+    "fixtures": 23,
+    "fixture_asserts": 172,
     "no_fixture_rows": 14,
     "findings": 2,
     "skips": 2,
@@ -119,6 +119,14 @@
       "asserts": 8,
       "observable": true,
       "note": "Static composition check of hooks/hooks.json; the hook is NOT executed (it would git-push) and NOT modified."
+    },
+    {
+      "row": "Gate land-to-shared-main (net-new): reversible OWN-branch push (autonomous) vs irreversible shared-main land (gated on the MERGED result); both conflict classes (redum REDUNDANCY + merged-result INCOMPATIBILITY); configurable gate cmd; force-push/non-ff to shared main stays human-gated",
+      "class": "gates",
+      "fixture_path": "conformance/gates/land-reversibility.fixture.sh",
+      "asserts": 13,
+      "observable": true,
+      "note": "Static wiring check of bin/heimdall-land (no merge executed). Behavioral both-class proof: test/land-flow.test.sh (throwaway repos, 18 asserts)."
     },
     {
       "row": "Hooks PostToolUse/SessionStart/SessionEnd (renamed+improved): heimdall-state calls + heimdall: commit prefixes + stack-pack/CHECKPOINT/summary-card/parallelism additions",
