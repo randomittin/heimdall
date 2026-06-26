@@ -206,17 +206,24 @@ def main():
         try: return sum(1 for n in os.listdir(d) if n.endswith(".json"))
         except Exception: return 0
     claims = ledger_claims(cwd)
-    claim_seg = f" {FAINT}·{X} {DIM}ledger {claims} claim{'s' if claims != 1 else ''}{X}" if claims else ""
+    claim_txt = f"{DIM}ledger {claims} claim{'s' if claims != 1 else ''}{X}" if claims else ""
+    claim_seg = f" {FAINT}·{X} {claim_txt}" if claim_txt else ""  # with leading separator, appended after bifröst
 
     # inline eye bracket `▐ ● ● ▌` — brand teal, NOT verdict-colored (§3 row0; a
     # verdict hue washes the eyes into the body). Verdict reads from the right block.
     eyes_inline = f"{TEAL}▐ ● ● ▌{X}"
 
-    # right-aligned verdict block
-    r1 = f"{vcol}{BOLD}{vglyph} {vword}{X}" + (f" {vcol}{passed}/{total}{X}" if passed is not None else "")
-    bifrost = (f"{GR}bifröst open{X}" if verdict=="pass" else
-               f"{RD}bifröst closed{X}" if verdict=="deny" else f"{DIM}watching{X}")
-    r2 = f"{bifrost}{claim_seg}"
+    # right-aligned verdict block. IDLE (verdict==watching, no gate verdict) showed
+    # "watching" TWICE — r1 glyph-word AND r2 bifröst-else. Dedup: idle shows it ONCE.
+    idle = (verdict == "watching" and passed is None)
+    if idle:
+        r1 = f"{DIM}◦ watching{X}"          # single calm idle marker, top-right
+        r2 = claim_txt                       # ledger claim if any, else EMPTY — never a 2nd "watching"
+    else:
+        r1 = f"{vcol}{BOLD}{vglyph} {vword}{X}" + (f" {vcol}{passed}/{total}{X}" if passed is not None else "")
+        bifrost = (f"{GR}bifröst open{X}" if verdict=="pass" else
+                   f"{RD}bifröst closed{X}" if verdict=="deny" else f"{DIM}watching{X}")
+        r2 = f"{bifrost}{claim_seg}"
 
     # left info rows
     l1 = f"{eyes_inline} {TEAL}{BOLD}HEIMDALL{X}{SEP}{DIM}{handle}{X}{SEP}{DIM}{model}{X}"
@@ -286,7 +293,12 @@ def main():
         out.append(f"{_sig(sig,2,CY)}  " + wall)
         out.append(f"{_sig(sig,3,CY)}  ")
     else:
-        out.append(f"{_sig(sig,2,CY)}  ")
+        # SOLO TEASE: the wall is empty (no roster, no team files). Fill the dead row
+        # with a faint invite — sells the team feature, drives the growth loop. Single
+        # row, width-safe (<= COLUMNS − sigil anchor − gutter): dropped if it can't fit.
+        tease = f"{FAINT}── watch ── invite your team · hmd team join{X}"
+        if vis(tease) > max(0, cols - ANCHOR - RMARGIN): tease = ""
+        out.append(f"{_sig(sig,2,CY)}  " + tease)
         out.append(f"{_sig(sig,3,CY)}  ")
     sys.stdout.write("\n".join(out) + "\n")
 

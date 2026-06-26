@@ -128,5 +128,26 @@ RMW="$(printf '%s' "$ROSTER" | maxw)"
 if [ "$RMW" -le "$WIDE" ]; then ok "roster wall width $RMW <= COLUMNS($WIDE)"; else bad "roster wall width $RMW exceeds COLUMNS($WIDE)"; fi
 rm -rf "$WS8"
 
+# ── 9) IDLE dedup: solo + no gate verdict -> "watching" appears AT MOST ONCE.
+# The bug stacked it TWICE (r1 glyph-word + r2 bifröst-else); the idle right block
+# now shows a single calm "◦ watching" and r2 carries the ledger claim (or empty). ──
+IDLE="$(printf '%s' "$JSON" | COLUMNS=$COLS HMD_NOW=7 python3 "$SL" | sed -E 's/\x1b\[[0-9;]*m//g')"
+WCNT="$(printf '%s' "$IDLE" | grep -o 'watching' | grep -c '')"
+if [ "$WCNT" -le 1 ]; then ok "idle render shows 'watching' at most once (got $WCNT)"
+else bad "idle render shows 'watching' $WCNT times — dedup failed"; fi
+
+# ── 10) SOLO TEASE: an empty wall (no roster + no team files) fills the dead row
+# with a faint team invite — sells the wall, drives the team-growth loop. ──
+assert_contains "$IDLE" "invite your team" "empty-wall solo render teases the team invite"
+assert_grep 'watch' "$IDLE" "solo tease carries the '── watch ──' styling"
+
+# ── 11) populated wall has NO tease: the real watch wall replaces the invite. ──
+NOWP="$(python3 -c 'import time;print(int(time.time()))')"
+printf '{"haid":"kai-1","name":"kai","agent":"coder","verdict":"working","file":"db.ts","ts":%s}' "$NOWP" > "$WS/.heimdall/team/kai.json"
+POP="$(printf '%s' "$JSON" | COLUMNS=$COLS python3 "$SL" | sed -E 's/\x1b\[[0-9;]*m//g')"
+if grep -qF 'invite your team' <<<"$POP"; then bad "populated wall still shows the solo tease"
+else ok "populated wall has no tease (real wall renders)"; fi
+rm -f "$WS/.heimdall/team/kai.json"
+
 rm -rf "$WS"
 finish
