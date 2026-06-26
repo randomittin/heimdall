@@ -1,0 +1,183 @@
+#!/usr/bin/env bash
+# heimdall-identity — the canonical watchman identity/sigil-seed resolver.
+#
+# RJ's call: a dev's watchman identity is a FILE each dev controls, not a derived
+# HAID. This bin is THE source of truth every other surface calls (the statusline
+# sigil, the presence/team wall) to answer two questions:
+#
+#   - what SEED feeds the sigil generator?   (sentinels/hmd_sigil.py --seed <this>)
+#   - what HANDLE shows on the wall?         (the human-chosen name)
+#
+# Identity file (per-repo):  <repo>/.heimdall/identity.json
+#   { "handle": "<chosen-name>", "seed": "<seed-string>", "created": <epoch> }
+#   handle — the display name shown on the watch wall.
+#   seed   — what feeds the sigil. A chosen vanity handle == a shareable sigil,
+#            so `--set <handle>` defaults the seed to the handle (same handle ->
+#            same seed -> same sigil, forever, on every machine).
+#
+# Resolution is DETERMINISTIC and NEVER errors — every path falls through to a
+# usable string so the statusline can render even on a virgin checkout.
+#
+#   SEED   (no args):  identity.json .seed (else .handle) -> $HMD_HAID
+#                      -> heimdall-haid current -> $USER -> "you"
+#   HANDLE (--handle): identity.json .handle -> derived short name
+#                      (human local-part of the resolved HAID/seed) -> $USER -> "you"
+#
+# Usage:
+#   heimdall-identity                       print the resolved SEED (for the sigil)
+#   heimdall-identity --handle              print the display HANDLE (the wall name)
+#   heimdall-identity whoami                print handle + seed + source (human)
+#   heimdall-identity --set <handle> [--seed <seed>]
+#                                           write/update <repo>/.heimdall/identity.json
+#   heimdall-identity --json                emit {handle,seed,source} (machine read)
+#   -h, --help
+#
+# --json composes with whoami / --set (always the resolved record). Repo root is
+# the git toplevel of $PWD (else $PWD); override the store with HEIMDALL_IDENTITY_DIR.
+#
+# Conventions (match bin/ — pure bash + jq + coreutils, macOS bash 3.2):
+#   - jq required; absence is a hard exit 2
+#   - --set writes atomically (mktemp + mv)
+#   - reads never error; only --set / bad flags can exit nonzero
+#
+# Exit: 0 ok; 2 usage/IO error.
+set -euo pipefail
+
+SELF="$0"
+if command -v readlink >/dev/null 2>&1; then
+  SELF="$(readlink -f "$0" 2>/dev/null || readlink "$0" 2>/dev/null || echo "$0")"
+fi
+BIN_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+HAID_BIN="$BIN_DIR/heimdall-haid"
+
+command -v jq >/dev/null 2>&1 || { echo "error: jq is required" >&2; exit 2; }
+
+usage() { sed -n '2,46p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+# ── Store location ────────────────────────────────────────────────────────────
+# Per-repo: <git toplevel of $PWD>/.heimdall/identity.json. HEIMDALL_IDENTITY_DIR
+# overrides the dir wholesale (tests + non-git trees).
+repo_root() { git rev-parse --show-toplevel 2>/dev/null || pwd; }
+IDENTITY_DIR="${HEIMDALL_IDENTITY_DIR:-$(repo_root)/.heimdall}"
+IDENTITY_FILE="$IDENTITY_DIR/identity.json"
+
+# ── Primitives ────────────────────────────────────────────────────────────────
+# slug: lowercase, keep [a-z0-9_-], collapse the rest to '-', trim, cap length
+# (mirrors heimdall-haid's slug; underscores kept so a HAID human part survives).
+slug() {
+  printf '%s' "$1" \
+    | tr '[:upper:]' '[:lower:]' \
+    | tr -c 'a-z0-9_-' '-' \
+    | sed -e 's/-\{1,\}/-/g' -e 's/^-//' -e 's/-$//' \
+    | cut -c1-32
+}
+
+# The human local-part of a HAID string ("haid:rj.mbp-7f3a/role" -> "rj"); if the
+# input is not a HAID it is returned slugged as-is (a plain handle/USER).
+short_from() {
+  case "$1" in
+    haid:*) printf '%s' "$1" | sed -E 's/^haid:([a-z0-9_-]+)\..*/\1/' ;;
+    *)      slug "$1" ;;
+  esac
+}
+
+# Read a string field from the identity file, empty if absent/unreadable.
+id_field() {
+  [ -f "$IDENTITY_FILE" ] || { printf ''; return 0; }
+  jq -r --arg k "$1" '.[$k] // "" | tostring' "$IDENTITY_FILE" 2>/dev/null || printf ''
+}
+
+# A best-effort HAID for the fallback chain: $HMD_HAID, else heimdall-haid current.
+haid_hint() {
+  if [ -n "${HMD_HAID:-}" ]; then printf '%s' "$HMD_HAID"; return 0; fi
+  [ -x "$HAID_BIN" ] && "$HAID_BIN" current 2>/dev/null || printf ''
+}
+
+# ── Resolution (deterministic, never errors) ──────────────────────────────────
+# Each echoes "<source> <value>" — source is a fixed single-word token, so the
+# caller splits off the first word (source) and the remainder is the value (which
+# may itself contain spaces).
+resolve_seed() {
+  local v
+  v="$(id_field seed)";   [ -n "$v" ] && { printf 'identity-file %s' "$v"; return 0; }
+  v="$(id_field handle)"; [ -n "$v" ] && { printf 'identity-file %s' "$v"; return 0; }
+  [ -n "${HMD_HAID:-}" ] && { printf 'HMD_HAID %s' "$HMD_HAID"; return 0; }
+  if [ -x "$HAID_BIN" ]; then
+    v="$("$HAID_BIN" current 2>/dev/null || true)"
+    [ -n "$v" ] && { printf 'heimdall-haid %s' "$v"; return 0; }
+  fi
+  v="${USER:-${LOGNAME:-}}"; [ -n "$v" ] && { printf 'USER %s' "$v"; return 0; }
+  printf 'default you'
+}
+
+resolve_handle() {
+  local v hint
+  v="$(id_field handle)"; [ -n "$v" ] && { printf 'identity-file %s' "$v"; return 0; }
+  hint="$(haid_hint)"
+  if [ -n "$hint" ]; then
+    v="$(short_from "$hint")"
+    [ -n "$v" ] && { printf 'derived %s' "$v"; return 0; }
+  fi
+  v="${USER:-${LOGNAME:-}}"; [ -n "$v" ] && { printf 'USER %s' "$v"; return 0; }
+  printf 'default you'
+}
+
+# ── --set (atomic write) ──────────────────────────────────────────────────────
+set_identity() {
+  local handle="$1" seed="$2"
+  [ -n "$handle" ] || { echo "error: --set needs a <handle>" >&2; exit 2; }
+  [ -n "$seed" ] || seed="$handle"   # vanity handle == shareable sigil seed
+  mkdir -p "$IDENTITY_DIR"
+  local tmp template
+  template="${TMPDIR:-/tmp}/hmdid.$(printf 'X%.0s' 1 2 3 4 5 6)"
+  tmp="$(mktemp "$template")"
+  if jq -n --arg h "$handle" --arg s "$seed" --argjson c "$(date +%s)" \
+      '{handle:$h, seed:$s, created:$c}' > "$tmp"; then
+    mv -f "$tmp" "$IDENTITY_FILE"
+  else
+    rm -f "$tmp"
+    echo "error: failed to write $IDENTITY_FILE" >&2
+    exit 2
+  fi
+}
+
+# ── argv ──────────────────────────────────────────────────────────────────────
+WANT_HANDLE=""; WANT_WHOAMI=""; WANT_JSON=""; DO_SET=""; SET_HANDLE=""; SET_SEED=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help)  usage; exit 0 ;;
+    --handle)   WANT_HANDLE=1; shift ;;
+    --json)     WANT_JSON=1; shift ;;
+    whoami)     WANT_WHOAMI=1; shift ;;
+    --set)      DO_SET=1; SET_HANDLE="${2:-}"; shift 2 || { echo "error: --set needs a <handle>" >&2; exit 2; } ;;
+    --seed)     SET_SEED="${2:-}"; shift 2 || { echo "error: --seed needs a value" >&2; exit 2; } ;;
+    *) echo "error: unknown argument: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+[ -n "$DO_SET" ] && set_identity "$SET_HANDLE" "$SET_SEED"
+
+# Resolve once; the first word is the source token, the remainder is the value.
+SEED_R="$(resolve_seed)";     SEED_SRC="${SEED_R%% *}";   SEED="${SEED_R#* }"
+HANDLE_R="$(resolve_handle)"; HANDLE_SRC="${HANDLE_R%% *}"; HANDLE="${HANDLE_R#* }"
+
+# --json: the full machine-readable record (source = the SEED's origin, the bit
+# tools care about — where the sigil seed came from).
+if [ -n "$WANT_JSON" ]; then
+  jq -n --arg h "$HANDLE" --arg s "$SEED" --arg hs "$HANDLE_SRC" --arg ss "$SEED_SRC" \
+    '{handle:$h, seed:$s, source:$ss, handle_source:$hs}'
+  exit 0
+fi
+
+if [ -n "$WANT_WHOAMI" ]; then
+  printf 'handle: %s\nseed:   %s\nsource: %s\n' "$HANDLE" "$SEED" "$SEED_SRC"
+  exit 0
+fi
+
+if [ -n "$WANT_HANDLE" ]; then
+  printf '%s\n' "$HANDLE"
+  exit 0
+fi
+
+# Default: the resolved SEED for the sigil.
+printf '%s\n' "$SEED"
