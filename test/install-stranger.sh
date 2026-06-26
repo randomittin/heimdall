@@ -218,6 +218,67 @@ if [ -n "$PROFILE" ]; then
   fi
 fi
 
+# (4b) STATUSLINE ACTIVATION — the watchman HUD must activate for a STRANGER via
+# the install, not only whoever hand-wired it in dev setup. THE RJ-ONLY BUG: the
+# working statusLine registration lived solely in one dev's personal
+# ~/.claude/settings.json, and the install never replicated it — so every other
+# dev's enter-box stayed bare. install.sh now registers statusLine +
+# subagentStatusLine into the user's Claude Code settings.json (honoring
+# CLAUDE_CONFIG_DIR → ~/.claude) at the ABSOLUTE installed path. A fresh stranger
+# HOME (env -i, no pre-existing settings) proves the install does it for everyone.
+SETTINGS="$TMPH/.claude/settings.json"
+SL_PLUGIN="$TMPH/.heimdall"
+if [ -f "$SETTINGS" ]; then
+  SL_EVAL="$(python3 - "$SETTINGS" "$SL_PLUGIN" <<'PY' 2>/dev/null
+import json, sys
+path, plugin = sys.argv[1], sys.argv[2]
+try:
+    d = json.load(open(path))
+except Exception:
+    print("noparse"); sys.exit(0)
+sl = (d.get("statusLine") or {}).get("command", "")
+sa = (d.get("subagentStatusLine") or {}).get("command", "")
+ok_sl = (plugin + "/hooks/statusline.sh") in sl
+ok_sa = (plugin + "/sentinels/hmd-subagent-statusline.sh") in sa
+# Absolute installed path, NOT an unresolved ${CLAUDE_PLUGIN_ROOT} (which renders
+# nothing in a user-level statusLine) — the distinction the fix turns on.
+no_unresolved = "CLAUDE_PLUGIN_ROOT" not in sl and "CLAUDE_PLUGIN_ROOT" not in sa
+print("OK" if (ok_sl and ok_sa and no_unresolved) else "MISS sl=%s sa=%s unresolved-free=%s" % (ok_sl, ok_sa, no_unresolved))
+PY
+)"
+  if [ "$SL_EVAL" = "OK" ]; then
+    ok "statusline activated for stranger — statusLine + subagentStatusLine wired into ~/.claude/settings.json at the installed path"
+  else
+    bad "statusline NOT activated in stranger settings.json ($SL_EVAL)"
+  fi
+else
+  bad "no ~/.claude/settings.json written by install — statusline stays RJ-only ($SETTINGS)"
+fi
+
+# (4c) STATUSLINE NON-TTY SAFE — the registered command must render AND exit 0 on
+# a non-TTY (CI) without hanging. We run the installed statusline.sh exactly as CC
+# would (a JSON blob on stdin, non-TTY env) under a watchdog; a stall = FAIL.
+SL_SCRIPT="$SL_PLUGIN/hooks/statusline.sh"
+if [ -x "$SL_SCRIPT" ]; then
+  SL_OUT_F="$(mktemp)"
+  ( printf '{"cwd":"%s"}' "$TMPH" | env -i HOME="$TMPH" TERM="dumb" PATH="$STRANGER_PATH" \
+      bash "$SL_SCRIPT" >"$SL_OUT_F" 2>&1 ) &
+  _slp=$!
+  ( sleep 15; kill -9 "$_slp" 2>/dev/null ) & _slk=$!
+  wait "$_slp" 2>/dev/null; SL_RC=$?
+  if kill -0 "$_slk" 2>/dev/null; then kill "$_slk" 2>/dev/null; else [ "$SL_RC" -eq 137 ] && SL_RC=124; fi
+  rm -f "$SL_OUT_F"
+  if [ "$SL_RC" -eq 124 ]; then
+    bad "statusline.sh HUNG on non-TTY (watchdog killed it)"
+  elif [ "$SL_RC" -eq 0 ]; then
+    ok "statusline.sh renders + exits 0 on non-TTY (CI-safe, no hang)"
+  else
+    bad "statusline.sh exited nonzero on non-TTY (rc=$SL_RC)"
+  fi
+else
+  bad "installed statusline.sh missing/not executable ($SL_SCRIPT)"
+fi
+
 # ── Idempotency: a second install in the SAME HOME must not double-append ──────
 run_install "$TMPH" >/dev/null 2>&1
 if [ -n "$PROFILE" ]; then
@@ -234,6 +295,25 @@ if printf '%s' "$DEMO2" | grep -qi 'demo runner not found'; then
   bad "after re-install, hmd demo regressed to 'not found'"
 else
   ok "after re-install, hmd demo still resolves"
+fi
+
+# Statusline registration is idempotent too — the second install must leave EXACTLY
+# one statusLine entry pointing at the installed path (a JSON key, so it can never
+# double-append, but a regression that drops or rewrites it to an unresolved var
+# would fail here).
+if [ -f "$SETTINGS" ]; then
+  SL_EVAL2="$(python3 - "$SETTINGS" "$SL_PLUGIN" <<'PY' 2>/dev/null
+import json, sys
+d = json.load(open(sys.argv[1])); plugin = sys.argv[2]
+sl = (d.get("statusLine") or {}).get("command", "")
+print("OK" if (plugin + "/hooks/statusline.sh") in sl and "CLAUDE_PLUGIN_ROOT" not in sl else "MISS")
+PY
+)"
+  if [ "$SL_EVAL2" = "OK" ]; then
+    ok "second install keeps the statusLine registration intact (idempotent)"
+  else
+    bad "second install altered/dropped the statusLine registration ($SL_EVAL2)"
+  fi
 fi
 
 # (8) STEP NARRATION — every installer-owned step must announce itself in the
