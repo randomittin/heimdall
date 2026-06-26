@@ -39,6 +39,19 @@ MW="$(printf '%s' "$OUT" | maxw)"
 if [ "$MW" -le "$COLS" ]; then ok "max row width $MW <= COLUMNS($COLS)"
 else bad "max row width $MW exceeds COLUMNS($COLS) by $(( MW - COLS )) — line() must subtract the sigil anchor"; fi
 
+# ── 2b) SQUINT, not blink: eyes visible in EVERY frame (P3 screenshot guard) ──
+# A still can land on any animation frame. The old blink shut the eyes to a
+# near-black (38;44;53) ~20% of frames -> an eyeless still. Squint dims to a
+# muted white (150;160;175) and NEVER goes dark. HMD_NOW pins the clock:
+# t%5==0 -> squint frame, else -> bright white glint (240;248;255). The eye
+# color codes appear ONLY in the sigil rows, so a raw grep proves eye presence.
+SQUINT_OUT="$(printf '{}' | HMD_NOW=5 COLUMNS=$COLS python3 "$SL")"   # 5%5==0 -> squint
+BRIGHT_OUT="$(printf '{}' | HMD_NOW=7 COLUMNS=$COLS python3 "$SL")"   # 7%5!=0 -> bright
+assert_contains "$SQUINT_OUT" "150;160;175" "squint frame -> dimmed-white eyes still visible"
+assert_contains "$BRIGHT_OUT" "240;248;255" "non-squint frame -> bright white eye glint"
+if grep -qF '38;44;53' <<<"$SQUINT_OUT"; then bad "squint emitted the old near-black eye (eyeless-still risk)"
+else ok "squint never emits a fully-dark eye (no eyeless still)"; fi
+
 # ── 3) --widget: one ccstatusline-coexistence segment line ──
 WID="$(printf '{}' | COLUMNS=$COLS python3 "$SL" --widget)"; WEC=$?
 assert_exit 0 "$WEC" "--widget exits 0"

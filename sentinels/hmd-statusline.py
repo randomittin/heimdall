@@ -20,6 +20,7 @@ SIG = importlib.util.module_from_spec(spec); spec.loader.exec_module(SIG)
 # palette
 CY="\033[38;2;34;211;238m"; GR="\033[38;2;34;197;94m"; RD="\033[38;2;239;68;68m"
 AM="\033[38;2;245;158;11m"; DIM="\033[38;2;90;100;114m"; FAINT="\033[38;2;58;65;77m"
+TEAL="\033[38;2;45;212;191m"  # #2dd4bf — brand wordmark + eye bracket (mockup §3 teal)
 BOLD="\033[1m"; X="\033[0m"
 SEP=f"{FAINT} │ {X}"
 ANSI = re.compile(r"\033\[[0-9;]*m")
@@ -79,12 +80,16 @@ def main():
     # always reads. The verdict is shown by the right block + bar + bifröst
     # text — NOT by recoloring the eyes: a verdict-colored eye washes into a
     # same-hue body (e.g. cyan 'watching' eyes on a teal sigil) and erases the
-    # face. Blink shuts the eyes one frame every ~5s; scanning gives a dim
-    # pulse. (The dramatic red deny-flash lives in hmd-gate-anim.sh, not here.)
-    t = int(time.time())
-    blink = (t % 5 == 0)
-    eye = (38, 44, 53) if blink else None        # None -> default white glint
-    if verdict == "scanning" and (t % 2 == 0): eye = (120, 80, 6)  # dim pulse
+    # face. SQUINT, not blink: every ~5s the eyes DIM to a muted white, they
+    # NEVER go dark. A still can land on any frame, so a full-dark blink could
+    # be captured eyeless — a squint keeps the watchman's eyes visible in EVERY
+    # frame. Scanning gets the same gentle dim pulse. HMD_NOW overrides the
+    # clock for deterministic conformance. (The red deny-flash lives in
+    # hmd-gate-anim.sh, not here.)
+    t = int(os.environ.get("HMD_NOW") or time.time())
+    SQUINT = (150, 160, 175)                      # muted white — dimmed, never dark
+    eye = SQUINT if (t % 5 == 0) else None        # None -> default bright white glint
+    if verdict == "scanning" and (t % 2 == 0): eye = SQUINT  # subtle dim pulse, still visible
 
     if "--widget" in sys.argv:
         eyes = {"pass":"^ ^","deny":"O O","scanning":". .","watching":"• •"}[verdict]
@@ -92,14 +97,14 @@ def main():
         sys.stdout.write(f"{CY}▐{X}{vcol}{eyes}{X}{CY}▌{X} {vcol}{vglyph} {vword}{cnt}{X}")
         return
 
-    # ── sigil anchor (verdict colors the eyes; blink animates) ──
+    # ── sigil anchor (squint animates; eyes stay visible in every frame) ──
     sig = SIG.render(haid, eye_override=eye, pad="")  # 4 rows, 9 cols
     SW = 9
     ANCHOR = SW + 2  # sigil(9 cols) + 2-space gutter, prefixed on EVERY row
 
     # context bar
     bcol = RD if pct >= 90 else AM if pct >= 70 else GR
-    fill = pct // 10
+    fill = min(10, round(pct / 10))  # 38% -> 4 cells (mockup §3), not floor(3)
     bar = f"{bcol}{'▓'*fill}{FAINT}{'░'*(10-fill)}{X} {bcol}{pct}%{X}"
 
     # token gauge (honest: absolute input tokens from CC, else derived from %×size)
@@ -120,9 +125,9 @@ def main():
     claims = ledger_claims(cwd)
     claim_seg = f" {FAINT}·{X} {DIM}ledger {claims} claim{'s' if claims != 1 else ''}{X}" if claims else ""
 
-    # inline eye bracket — the watchman's eyes, verdict-colored, anchoring the name
-    eye_glyph = {"pass": "●", "deny": "✗", "scanning": "◦", "watching": "●"}.get(verdict, "●")
-    eyes_inline = f"{CY}▐{X}{vcol}{eye_glyph} {eye_glyph}{X}{CY}▌{X}"
+    # inline eye bracket `▐ ● ● ▌` — brand teal, NOT verdict-colored (§3 row0; a
+    # verdict hue washes the eyes into the body). Verdict reads from the right block.
+    eyes_inline = f"{TEAL}▐ ● ● ▌{X}"
 
     # right-aligned verdict block
     r1 = f"{vcol}{BOLD}{vglyph} {vword}{X}" + (f" {vcol}{passed}/{total}{X}" if passed is not None else "")
@@ -131,7 +136,7 @@ def main():
     r2 = f"{bifrost}{claim_seg}"
 
     # left info rows
-    l1 = f"{eyes_inline} {CY}{BOLD}HEIMDALL{X}{SEP}{DIM}{haid}{X}{SEP}{DIM}{model}{X}"
+    l1 = f"{eyes_inline} {TEAL}{BOLD}HEIMDALL{X}{SEP}{DIM}{haid}{X}{SEP}{DIM}{model}{X}"
     l2 = f"{bar}{SEP}{AM}{repo}:main{X}{tok_seg}"
 
     # team wall (only when teammates present) — cap at the 6 most-recently
