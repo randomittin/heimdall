@@ -185,6 +185,7 @@ run_client() {
 import contextlib
 import json
 import os
+import secrets
 import sys
 import time
 import urllib.error
@@ -357,11 +358,17 @@ def main():
             render_roster([])
         return 0
     if VERB == "beat":
+        # nonce + ts ride INSIDE the signed body (the signature covers it) so the server's
+        # replay-nonce gate can prove this is a LIVE, first-use beat — a captured beat cannot
+        # be replayed (the nonce is single-use within the freshness window). Unforgeable
+        # because signed; only replayable, which the gate catches.
         body = json.dumps({
             "project": os.environ.get("PRES_PROJECT") or "",
             "handle": os.environ.get("PRES_HANDLE") or None,
             "verdict": os.environ.get("PRES_VERDICT") or None,
             "file": os.environ.get("PRES_FILE") or None,
+            "nonce": secrets.token_hex(16),
+            "ts": int(time.time()),
         }).encode()
         request("POST", "/presence", body, seed)
         # A beat is fire-and-forget: success or not, never surface an error to the caller

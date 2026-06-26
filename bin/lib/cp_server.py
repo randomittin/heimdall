@@ -55,6 +55,9 @@ import cp_allowlist
 import cp_audit
 import cp_auth
 import cp_handlers
+import cp_publicsurface  # THE PUBLIC-SURFACE BOUNDARY (allowlist 404 + the enroll/presence
+                         # abuse gates). One-way dependency: this module imports it; it never
+                         # imports cp_server (the gates return (status, body) tuples we wrap).
 import issue_queue  # REUSE heimdall_home() for the per-job scratch root.
 
 # The control-plane version. The single source of truth for the server_version banner
@@ -386,6 +389,14 @@ def _build_handler_class(home, enforce_revocation):
                 # chokepoint ignores it (verify_identity reads only haid/signature/method/
                 # path/body), so lifting it here is inert for every authenticated route.
                 "enroll_token": self.headers.get("X-Heimdall-Enroll-Token"),
+                # The rate-limit IP source for the PUBLIC surface (cp_publicsurface.client_ip
+                # owns the policy of choosing between them). x_forwarded_for is the raw header
+                # — on Cloud Run the GFE appends the caller, FIRST hop is the original client;
+                # peer_ip is the TCP socket's remote address (the self-host/direct case). Both
+                # are inert on the gated surface (the gates only run when public-surface-on).
+                "x_forwarded_for": self.headers.get("X-Forwarded-For"),
+                "peer_ip": (self.client_address[0]
+                            if getattr(self, "client_address", None) else None),
             }
 
         def _handle(self, method):
@@ -396,6 +407,17 @@ def _build_handler_class(home, enforce_revocation):
             # SIGNATURE (authenticate, below) verifies over the FULL self.path-with-query
             # in `request["path"]` — the two concerns are split deliberately.
             route_path = request["route_path"]
+            # ── PUBLIC-SURFACE BOUNDARY (§public-surface) ── On the --allow-unauthenticated
+            # public service (HEIMDALL_PUBLIC_SURFACE=1) ONLY the public allowlist exists:
+            # every gated route (dispatch/jobs/approval/owner/audit/scheduler/…) returns a
+            # FLAT 404 — indistinguishable from nonexistent — enforced HERE at the routing
+            # layer, BEFORE health/public/auth, so a gated route never resolves, parses, or
+            # authenticates on the public surface. Default (flag unset) = no-op (the gated
+            # IAM service is byte-for-byte unchanged).
+            if (cp_publicsurface.public_surface_enabled()
+                    and not cp_publicsurface.is_public_route(method, route_path)):
+                self._send(Response(404, {"error": "no_such_route"}))
+                return
             # UNAUTHENTICATED health probes (§A) — answered BEFORE the auth chokepoint.
             # Cloud Run's liveness/readiness probes are issued by the platform, unsigned;
             # routing them through §3 would 401 every probe and the instance would never
@@ -411,8 +433,25 @@ def _build_handler_class(home, enforce_revocation):
             # stripped path, like every other route; the handler takes (request) only.
             public = _public_route(method, route_path)
             if public is not None:
+                # PUBLIC-SURFACE abuse gate for pre-auth enroll (per-IP + per-token + the
+                # deployment-wide enroll budget): a leaked bootstrap token cannot flood
+                # /enroll or grow the key registry unbounded. Inert on the gated surface.
+                if (cp_publicsurface.public_surface_enabled()
+                        and (method, route_path) == ("POST", "/enroll")):
+                    refusal = cp_publicsurface.check_enroll(request, home=home)
+                    if refusal is not None:
+                        self._send(Response(*refusal))
+                        return
                 self._send(public(request))
                 return
+            # PUBLIC-SURFACE presence flood shed (pre-auth, cheap): drop an over-limit IP's
+            # beat BEFORE spending crypto on signature verify. Inert on the gated surface.
+            if (cp_publicsurface.public_surface_enabled()
+                    and (method, route_path) == ("POST", "/presence")):
+                refusal = cp_publicsurface.check_presence_pre_auth(request, home=home)
+                if refusal is not None:
+                    self._send(Response(*refusal))
+                    return
             # §3 auth chokepoint — every request, exactly once. Verifies over the FULL
             # path-with-query (request["path"]) — the bytes the client signed.
             try:
@@ -421,6 +460,15 @@ def _build_handler_class(home, enforce_revocation):
             except cp_auth.AuthError as err:
                 self._send(Response(401, {"error": err.reason}))
                 return
+            # PUBLIC-SURFACE post-auth presence gates (need the VERIFIED haid): per-haid
+            # rate-limit + replay-nonce over the signed beat body. Inert on the gated surface.
+            if (cp_publicsurface.public_surface_enabled()
+                    and (method, route_path) == ("POST", "/presence")):
+                refusal = cp_publicsurface.check_presence_post_auth(
+                    identity, request, home=home)
+                if refusal is not None:
+                    self._send(Response(*refusal))
+                    return
             # built-in §1 dispatch entry (matched on the query-stripped path).
             if method == "POST" and route_path == "/dispatch":
                 try:
