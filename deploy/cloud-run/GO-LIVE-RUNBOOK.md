@@ -48,13 +48,16 @@ The two-service split has three ways to go catastrophically wrong. Each is now a
    outage of operator tooling). → **PREFLIGHT P1** refuses if the public service
    name equals the gated service name. The script sets the flag **only** on the
    service it deploys, and it can never be pointed at the gated service.
-3. **The real server PKI seed shipped to the internet.** → By **default the
-   public service is given NO server PKI seed** (`cp-pki-key` stays server-only).
-   If a seed is ever needed (pending audit — see Step 2), **PREFLIGHT P4** refuses
-   to reuse `cp-pki-key` and forces a distinct throwaway seed under a distinct
-   server identity name.
+3. **The real server PKI seed shipped to the internet — or a seedless public boot.**
+   Audit verdict (b): the public service needs a server seed **only to boot**, but
+   no public route uses the server private key — so it gets a **DISTINCT throwaway
+   seed** (`cp-pki-key-public`), never the real `cp-pki-key` (which stays
+   server-only). → **PREFLIGHT P4** refuses reusing `cp-pki-key` (or the gated
+   server HAID); **PREFLIGHT P5** refuses a public deploy with NO seed (it would
+   fail-closed at boot and never go ready). Both the real-seed and the no-seed
+   deploys are impossible.
 
-You can confirm all four refusals fire without spending anything:
+You can confirm all refusals fire without spending anything:
 
 ```bash
 cd deploy/cloud-run
@@ -67,6 +70,9 @@ PUBLIC_SA_NAME=heimdall-cp-run bash deploy-public-surface.sh plan; echo "exit=$?
 
 # P4 — refuses the real server seed on the public service
 PUBLIC_PKI_SECRET=cp-pki-key bash deploy-public-surface.sh plan; echo "exit=$?"            # -> FATAL P4, exit=2
+
+# P5 — refuses a seedless public deploy (a distinct throwaway seed is REQUIRED)
+( unset PUBLIC_PKI_SECRET; bash deploy-public-surface.sh plan ); echo "exit=$?"            # -> FATAL P5, exit=2
 ```
 
 ---
