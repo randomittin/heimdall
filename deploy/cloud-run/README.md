@@ -515,6 +515,169 @@ TLS (transport) + PKI signing (application) together satisfy "encrypted."
 
 ---
 
+## 5b. The two-service split — public presence surface vs gated control plane
+
+### The problem: the IAM wall blocks zero-config onboarding
+
+The control plane (§3) is deployed `--no-allow-unauthenticated`. That is the
+right posture for everything sensitive — dispatch, jobs, approvals, owner, audit,
+scheduler — because Cloud Run IAM 401s any request without a bearer token, layered
+*under* the app-level PKI signing. But it has a sharp edge: **a brand-new dev with
+no `gcloud` and no IAM grant cannot reach `POST /enroll`** to bootstrap their PKI
+key. Enrollment is the pre-auth route a first-run client hits *before* it has a key
+to sign with (`cp_enroll`, wired into the public seam in `cp_boot`); if the platform
+401s it at the IAM layer, zero-config presence is impossible. We refuse to make the
+gated service `--allow-unauthenticated` (that would expose dispatch to the internet),
+so the fix is to **split the surface across two Cloud Run services built from the
+SAME image**.
+
+### The two services
+
+| | `heimdall-control-plane` (gated, §3) | `heimdall-cp-public` (`deploy-public-surface.sh`) |
+| --- | --- | --- |
+| Auth | `--no-allow-unauthenticated` (IAM bearer required) | `--allow-unauthenticated` (zero-config reachable) |
+| Surface | FULL gated service (default — `HEIMDALL_PUBLIC_SURFACE` unset) | PUBLIC routes ONLY (`HEIMDALL_PUBLIC_SURFACE=1`) |
+| Routes served | dispatch, jobs, approvals, owner, audit, scheduler, ingest, dashboard, notifications, **+ all public routes** | **`POST /enroll, POST /presence, GET /roster, GET /healthz, GET /readyz`** — every gated route 404s |
+| Runtime SA | `heimdall-cp-run` — datastore + secrets + **`run.jobs.run`** | `heimdall-cp-public-run` — datastore + 2 secrets, **NO `run.jobs.run`** |
+| Image | `--source=.` (§3) | the **same** image (pin the gated digest, or `--source=.` from the same commit) |
+| Clients | RJ's operator tools (`get-job.sh`, `verify-flight-fix.sh`, `heimdall-cp-inspect`) | the dev's `heimdall-presence` client |
+
+The **public route set** the public service serves is exactly:
+
+```
+POST /enroll, POST /presence, GET /roster, GET /healthz, GET /readyz
+```
+
+Everything else — dispatch, jobs, approval, owner, audit, scheduler, ingest,
+dashboard, notifications — is **hard-refused with 404 (as if the route does not
+exist)** on the public service.
+
+### The security boundary is enforced at BOTH layers (defense in depth)
+
+The boundary "public = presence/enroll/health ONLY; gated = everything sensitive"
+holds at **two independent layers** — either one alone refuses dispatch:
+
+1. **App layer — `HEIMDALL_PUBLIC_SURFACE=1`.** The server honors this env var and
+   serves ONLY the public route set, 404-ing every gated route. This is the
+   **app-layer enforcement** implemented in the server (owned by the core-boundary
+   work, NOT this runbook); `deploy-public-surface.sh` only *sets the env var*.
+   Default (unset, as on the gated service) = the full gated surface as today.
+2. **IAM/SA layer — a least-privilege public SA.** The public service runs as
+   `heimdall-cp-public-run`, which has **NO `run.jobs.run` and NO Cloud Run dispatch
+   role**. Long-job dispatch (the `cloudrun-job` runner shelling
+   `gcloud run jobs execute`, §4.2) requires `run.jobs.run`; without it, **even a
+   server bug that exposed `/dispatch` on the public service could not kick off a
+   Cloud Run Job** — the execute call 403s. The public SA *literally cannot run a
+   job.*
+
+Belt and braces: the app-layer 404 and the IAM 403 are independent walls. A failure
+of one (a regressed surface gate, or a missing env var) is still backstopped by the
+other.
+
+### Why the public service still needs secrets (and only two)
+
+Three of the five public routes are not free-for-all, so the public service is
+granted read access to exactly two secrets — **at the secret resource level, not
+project-wide**, so it cannot read any other secret the project holds:
+
+- **`POST /presence` + `GET /roster` are PKI-signed.** They verify the dev's Ed25519
+  signature against the key registry, and the server registers its own stable
+  identity at boot (`cp_auth.ensure_server_identity`). → needs **`HEIMDALL_CP_PKI_KEY`**
+  (the `cp-pki-key` seed, §2) + the pinned `HEIMDALL_CP_SERVER_HAID=cp-server` name.
+- **`POST /enroll` is token-gated, fail-closed.** It verifies the presented bootstrap
+  token against the server secret; absent the secret, `cp_enroll.server_enroll_token()`
+  returns `None` and enroll refuses every request (`enroll_disabled`). → needs
+  **`HEIMDALL_ENROLL_TOKEN`** (the `cp-enroll-token` secret, below).
+
+The public SA gets `roles/datastore.user` too — presence heartbeats + roster reads
+are durable on the Firestore-backed StateBackend (so the online team survives
+scale-to-zero), and enroll writes the bootstrapped pubkey to the key registry.
+
+### The enroll-token secret (one-time, used by both services' enroll route)
+
+`HEIMDALL_ENROLL_TOKEN` is the same Secret-Manager seam as the PKI key — generated
+locally, piped to Secret Manager, never written to a file:
+
+```bash
+gcloud secrets create cp-enroll-token --replication-policy=automatic
+python3 -c 'import secrets,sys; sys.stdout.write(secrets.token_urlsafe(32))' \
+  | gcloud secrets versions add cp-enroll-token --data-file=-
+```
+
+> The gated `heimdall-control-plane` also has the enroll route wired (it serves the
+> full surface), but it is dormant unless `HEIMDALL_ENROLL_TOKEN` is set there too —
+> `cp_enroll` is fail-closed. Devs enroll through the **public** service; the gated
+> service's IAM wall makes its enroll route unreachable to a keyless dev anyway.
+
+### Deploy command #1 — the gated service (unchanged)
+
+Exactly §3 above. `--no-allow-unauthenticated`, full surface, `heimdall-cp-run` SA
+with `run.jobs.run` (§4.1). **This script does not touch it.**
+
+### Deploy command #2 — the public service
+
+`deploy/cloud-run/deploy-public-surface.sh` creates the least-privilege SA, grants it
+exactly datastore + the two secrets (NEVER `run.jobs.run`), and deploys
+`heimdall-cp-public` `--allow-unauthenticated` with `HEIMDALL_PUBLIC_SURFACE=1`. It
+defaults to **`plan` mode** (prints the exact commands, deploys nothing — safe to
+review and the doc-consistency check runs it); pass **`apply`** to deploy (spend-
+incurring — run only after the §3 kill-switch gate):
+
+```bash
+# Review the exact SA + IAM + deploy commands without touching the project:
+bash deploy/cloud-run/deploy-public-surface.sh plan
+
+# Pin the SAME immutable image the gated service serves (recommended) — capture its
+# 100%-traffic revision's digest, then deploy the public service from that digest:
+GATED_REV="$(gcloud run services describe heimdall-control-plane --region=us-central1 \
+  --format='value(status.traffic[0].revisionName)')"
+export IMAGE="$(gcloud run revisions describe "${GATED_REV}" --region=us-central1 \
+  --format='value(spec.containers[0].image)')"
+bash deploy/cloud-run/deploy-public-surface.sh apply
+
+# (Or, without a pinned digest, build from the SAME commit as the gated deploy:
+#  unset IMAGE; bash deploy/cloud-run/deploy-public-surface.sh apply  → uses --source=.)
+```
+
+Pinning `IMAGE` to the gated service's digest guarantees the two services run the
+**byte-identical** image (same discipline as `verify-flight-fix.sh` STEP 4). The
+public service differs from the gated one in **only** three ways: the auth posture
+(`--allow-unauthenticated`), the runtime SA (least-privilege), and one env var
+(`HEIMDALL_PUBLIC_SURFACE=1` + the enroll-token secret).
+
+### Point the clients at the right service
+
+```bash
+# The dev's presence client -> the PUBLIC service (zero-config, no IAM bearer needed).
+export HEIMDALL_CP_URL="$(gcloud run services describe heimdall-cp-public \
+  --region=us-central1 --format='value(status.url)')"
+heimdall-presence ...        # POST /presence + GET /roster + first-run POST /enroll
+
+# RJ's operator tools -> the GATED service (dispatch/jobs live there; the public 404s them).
+export BASE_URL="$(gcloud run services describe heimdall-control-plane \
+  --region=us-central1 --format='value(status.url)')"
+bash deploy/cloud-run/get-job.sh <job_id>
+```
+
+`heimdall-presence` resolves its URL as `--url > $HEIMDALL_CP_URL > $BASE_URL`
+(`bin/heimdall-presence`), so exporting `HEIMDALL_CP_URL` to the public URL is all a
+dev needs. The operator tools read `BASE_URL` (the gated URL).
+
+### Consistency check (no creds, no spend)
+
+`deploy/cloud-run/check-public-surface.sh` is the runnable guard: it `bash -n`s the
+deploy script (+ `shellcheck` if installed), asserts the canonical public route set
+is byte-identical in the script and this README, asserts **no gated route leaks into
+the documented public set**, and asserts the public deploy never grants a dispatch
+role and always sets `HEIMDALL_PUBLIC_SURFACE=1` + `--allow-unauthenticated`:
+
+```bash
+bash deploy/cloud-run/check-public-surface.sh
+# Expect: "check-public-surface: PASS" (exit 0)
+```
+
+---
+
 ## 6. Verify the deploy (§A5)
 
 ```bash
