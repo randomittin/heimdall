@@ -56,19 +56,30 @@ import cp_ratelimit  # the fixed-window abuse gate (RateLimiter.allow + enroll_b
 
 # ── THE CANONICAL PUBLIC ROUTE SET (single source of truth) ─────────────────────────────
 #
-# This MUST stay byte-identical to deploy/cloud-run/deploy-public-surface.sh's
-# PUBLIC_SURFACE_ROUTES and to README.md's split section (check-public-surface.sh asserts the
-# parity). Each entry is (METHOD, query-stripped path). When public_surface_enabled(), these
-# are the ONLY routes cp_server serves; everything else is a flat 404 at the routing layer.
+# The SIGNED + health route set below mirrors deploy/cloud-run/deploy-public-surface.sh's
+# PUBLIC_SURFACE_ROUTES and README.md's split section (check-public-surface.sh asserts that
+# canonical string). Each entry is (METHOD, query-stripped path). When public_surface_enabled(),
+# these are the ONLY routes cp_server serves; everything else is a flat 404 at the routing layer.
 #   POST /enroll    — token-gated PKI bootstrap (pre-auth; cp_enroll).
 #   POST /presence  — the signed heartbeat (cp_presence; rate-limited + replay-checked here).
 #   GET  /roster    — the online-team read (cp_presence; signed, a read so no nonce).
 #   GET  /healthz   — the Cloud Run liveness probe (pre-auth; cp_diag).
 #   GET  /readyz    — the Cloud Run readiness probe (pre-auth; cp_diag).
+#
+# PLUS the UNAUTHENTICATED browser-read seam (app-layer only — NOT a signed/IAM route, so it is
+# additive to the gcloud display string above; the static heimdall-site dashboard fetches it):
+#   GET     /roster-public — the ONLINE roster for a project, UNSIGNED + per-IP rate-limited +
+#       CORS, projected to handle/verdict/file/age_seconds ONLY (no haid/pubkey/secret, no
+#       write). A browser cannot PKI-sign, so the signed GET /roster 401s it; this is its read.
+#   OPTIONS /roster-public — the CORS preflight for the above (204 + CORS headers).
+# Both are READ-ONLY: there is deliberately NO (POST, /roster-public) — the public surface
+# exposes no unauthenticated write.
 PUBLIC_ROUTES = frozenset({
     ("POST", "/enroll"),
     ("POST", "/presence"),
     ("GET", "/roster"),
+    ("GET", "/roster-public"),
+    ("OPTIONS", "/roster-public"),
     ("GET", "/healthz"),
     ("GET", "/readyz"),
 })
@@ -146,6 +157,13 @@ def _presence_haid_window():  return _int_env("HEIMDALL_PRESENCE_HAID_WINDOW", 6
 # The replay-nonce freshness window for a signed beat (cp_nonce.accept). 300s gives generous
 # clock-skew slack while bounding a captured beat's replay life to 5 minutes.
 def _presence_nonce_window(): return _int_env("HEIMDALL_PRESENCE_NONCE_WINDOW", 300)
+
+# /roster-public — the UNAUTHENTICATED browser read. A blunt per-IP cap sheds a scrape flood;
+# 60/min is generous for a dashboard polling every few seconds while bounding abuse. The read
+# is cheap and exposes only the already-public online roster, and there is NO identity on this
+# surface to key on — so one loose per-IP gate is the whole policy. Env-tunable.
+def _roster_read_limit():  return _int_env("HEIMDALL_ROSTER_IP_LIMIT", 60)
+def _roster_read_window(): return _int_env("HEIMDALL_ROSTER_IP_WINDOW", 60)
 
 
 # ── the public-surface predicates (what cp_server's router consults) ────────────────────
@@ -328,4 +346,21 @@ def check_presence_post_auth(identity, request, *, home=None, now=None):
         # A stale/replayed beat is not a live first-use signed message — refuse 401 (the same
         # status the §3 chokepoint uses for a beat that fails the freshness/first-use proof).
         return (401, {"error": "replay_" + reason})
+    return None
+
+
+def check_roster_read(request, *, home=None, now=None):
+    """PUBLIC-SURFACE per-IP flood gate for the UNAUTHENTICATED GET /roster-public read. The
+    browser dashboard cannot sign, so there is no identity to key on — a single per-IP fixed-
+    window cap (scope "roster_read") is the whole gate; the read is cheap and exposes only the
+    already-public online roster. Returns None to let the read proceed, or (429, body) to refuse.
+    Reuses cp_ratelimit exactly like the enroll/presence gates (FAIL-OPEN on a backend hiccup —
+    an abuse gate must never lock out a legit dashboard)."""
+    limiter = cp_ratelimit.RateLimiter(home=home)
+    ip = client_ip(request)
+    ok, retry = limiter.allow(
+        "roster_read", ip, now=now,
+        limit=_roster_read_limit(), window=_roster_read_window())
+    if not ok:
+        return (429, _rate_limited_body("roster_read", retry))
     return None

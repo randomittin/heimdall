@@ -73,7 +73,10 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 import cp_auth     # the verified Identity shape the heartbeat route receives (§3).
-import cp_server   # REUSE register_route + Response — the §10 registration seam.
+import cp_publicsurface  # the PUBLIC-SURFACE boundary: public_surface_enabled() gates the
+                         # unauthenticated /roster-public read, check_roster_read() rate-limits
+                         # it. One-way dep (cp_publicsurface imports neither this nor cp_server).
+import cp_server   # REUSE register_route + register_public_route + Response — the §10 seam.
 import cp_state    # the pluggable persistence backend — presence writes/reads its keyed
                    # JSON record THROUGH a StateBackend (get_backend) so the same atomic
                    # put / tolerant get / sorted enumeration becomes Firestore-durable on
@@ -350,12 +353,87 @@ def roster_route(identity, request, *, home=None):
         200, {"project": project, "roster": roster(project, home=home)})
 
 
+# ── the UNAUTHENTICATED browser read (GET /roster-public — the static dashboard's read) ──
+#
+# WHY A SECOND ROSTER ROUTE. The signed GET /roster needs a PKI signature; a BROWSER cannot
+# sign, so the static heimdall-site dashboard would 401. This route is the unauthenticated,
+# rate-limited, READ-ONLY public read of the SAME TTL-filtered online roster — served PRE-AUTH
+# (like the health probes) but ONLY on the public surface, projected so it leaks no identity.
+
+# CORS for the unauthenticated browser read (GET/OPTIONS /roster-public). The roster is read-
+# only public data, so Access-Control-Allow-Origin:* lets the static dashboard (a DIFFERENT
+# origin) fetch it; the preflight additionally advertises the allowed method/headers.
+_CORS_HEADERS = {"Access-Control-Allow-Origin": "*"}
+_CORS_PREFLIGHT_HEADERS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, OPTIONS",
+    "Access-Control-Allow-Headers": "*",
+    "Access-Control-Max-Age": "86400",
+}
+
+
+def _public_view(record):
+    """Project ONE online roster record to the PUBLIC, NO-SECRET browser view: handle / verdict
+    / file / age_seconds ONLY. Drops haid (the identity), ts, and every other field — the public
+    read renders status, never an identity or a key. The fields are already scrubbed at write
+    time (build_record -> _clean -> telemetry._scrub), so no secret can reach here either."""
+    return {
+        "handle": record.get("handle"),
+        "verdict": record.get("verdict"),
+        "file": record.get("file"),
+        "age_seconds": record.get("age_seconds"),
+    }
+
+
+def roster_public_route(request, *, home=None):
+    """GET /roster-public?project=<id> — the UNAUTHENTICATED, rate-limited, READ-ONLY online
+    roster for the static web dashboard (a browser cannot PKI-sign, so the signed GET /roster
+    401s it). Served PRE-AUTH, but ONLY on the public surface (public_surface_enabled()); off it
+    the route does not exist (404), so the gated IAM service is unchanged.
+
+    Exposes ONLY handle/verdict/file/age_seconds per ONLINE dev (the SAME TTL-filtered fold
+    roster() computes) — NEVER the haid, a pubkey, or any secret, and it is a READ (no presence
+    write seam exists on the public surface). Every reply carries Access-Control-Allow-Origin:*
+    so a different-origin static site can fetch it.
+
+    400 when project is missing/empty; an unknown project is a 200 with an empty online list
+    (honest empty, not an error); 429 when the per-IP read-flood cap trips. DATA only — runs
+    nothing, never backend.path() (roster() is list_names + get_record, firestore-safe)."""
+    if not cp_publicsurface.public_surface_enabled():
+        # Off the public surface this unauthenticated read does not exist — 404 like any other
+        # gated route, so the IAM-gated service stays byte-for-byte as before.
+        return cp_server.Response(404, {"error": "no_such_route"}, headers=_CORS_HEADERS)
+    refusal = cp_publicsurface.check_roster_read(request, home=home)
+    if refusal is not None:
+        status, body = refusal
+        return cp_server.Response(status, body, headers=_CORS_HEADERS)
+    project = _query_project(request, None)
+    if not project:
+        return cp_server.Response(
+            400, {"error": "no_project", "online": []}, headers=_CORS_HEADERS)
+    online = [_public_view(view) for view in roster(project, home=home)]
+    return cp_server.Response(
+        200, {"project": project, "online": online}, headers=_CORS_HEADERS)
+
+
+def roster_public_preflight(request):
+    """OPTIONS /roster-public — the CORS preflight for the browser read. Returns 204 + the CORS
+    headers so a different-origin static site may then issue the GET. Served pre-auth on the
+    public surface only; 404s on the gated service exactly as the GET does (no preflight for a
+    route that does not exist there)."""
+    if not cp_publicsurface.public_surface_enabled():
+        return cp_server.Response(404, {"error": "no_such_route"})
+    return cp_server.Response(204, None, headers=_CORS_PREFLIGHT_HEADERS)
+
+
 def register(*, home=None):
     """Wire POST /presence (heartbeat) + GET /roster (online team) into cp_server's
-    registration seam (§10) WITHOUT editing cp_server. The handlers close over the
-    runtime `home` so a self-host deployment / a test can pin its store root. Returns the
-    registered (method, path) keys. Idempotent — re-registering replaces the routes.
-    Mirrors cp_ingest.register / cp_worker.register_job_routes exactly."""
+    registration seam (§10), and the UNAUTHENTICATED GET/OPTIONS /roster-public browser read
+    into the PRE-AUTH public seam (register_public_route — the static dashboard cannot sign),
+    all WITHOUT editing cp_server. The handlers close over the runtime `home` so a self-host
+    deployment / a test can pin its store root. Returns the registered (method, path) keys.
+    Idempotent — re-registering replaces the routes. Mirrors cp_ingest.register /
+    cp_enroll.register (pre-auth public routes) exactly."""
     keys = []
     keys.append(cp_server.register_route(
         "POST", "/presence",
@@ -363,4 +441,12 @@ def register(*, home=None):
     keys.append(cp_server.register_route(
         "GET", "/roster",
         lambda identity, request: roster_route(identity, request, home=home)))
+    # The UNAUTHENTICATED browser read + its CORS preflight (pre-auth; public-surface-only,
+    # self-gated inside the handlers; per-IP rate-limited; READ-ONLY — no public write seam).
+    keys.append(cp_server.register_public_route(
+        "GET", "/roster-public",
+        lambda request: roster_public_route(request, home=home)))
+    keys.append(cp_server.register_public_route(
+        "OPTIONS", "/roster-public",
+        lambda request: roster_public_preflight(request)))
     return keys

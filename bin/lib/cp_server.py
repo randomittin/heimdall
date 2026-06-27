@@ -81,10 +81,14 @@ class Response:
     testable without a server. status follows the dossier's mapping: 200 ok, 401
     auth fail, 422 refused dispatch, 500 handler error."""
 
-    def __init__(self, status, body, *, audit_id=None):
+    def __init__(self, status, body, *, audit_id=None, headers=None):
         self.status = status
         self.body = body
         self.audit_id = audit_id
+        # Optional extra response headers (e.g. the CORS allow-origin the UNAUTHENTICATED public
+        # browser read GET/OPTIONS /roster-public needs). A plain {name: value} dict; empty by
+        # default so every existing Response is byte-identical on the wire.
+        self.headers = dict(headers) if headers else {}
 
     def to_dict(self):
         return {"status": self.status, "body": self.body, "audit_id": self.audit_id}
@@ -349,12 +353,23 @@ def _build_handler_class(home, enforce_revocation):
             return self.rfile.read(length)
 
         def _send(self, response):
-            payload = json.dumps(response.body).encode("utf-8")
+            # A 204 (or an explicit None body) carries NO JSON payload — the no-content reply a
+            # CORS preflight (OPTIONS /roster-public) returns. Everything else serializes JSON.
+            if response.status == 204 or response.body is None:
+                payload = b""
+            else:
+                payload = json.dumps(response.body).encode("utf-8")
             self.send_response(response.status)
-            self.send_header("Content-Type", "application/json")
+            if payload:
+                self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(payload)))
+            # Extra headers (CORS for the public browser read) — emitted verbatim. Empty for
+            # every existing Response, so the gated/health/dispatch wire is unchanged.
+            for name, value in response.headers.items():
+                self.send_header(name, value)
             self.end_headers()
-            self.wfile.write(payload)
+            if payload:
+                self.wfile.write(payload)
 
         def _request_dict(self, method, body_bytes):
             """Assemble the request dict the auth chokepoint verifies: the HAID +
@@ -498,6 +513,12 @@ def _build_handler_class(home, enforce_revocation):
 
         def do_GET(self):
             self._handle("GET")
+
+        def do_OPTIONS(self):
+            # CORS preflight (OPTIONS /roster-public). Routed exactly like GET/POST: the public
+            # boundary + the pre-auth public route seam answer it. A pre-auth public OPTIONS
+            # handler returns 204 + the CORS headers a browser checks before the real GET.
+            self._handle("OPTIONS")
 
     return _CPHandler
 
