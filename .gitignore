@@ -10,10 +10,8 @@ __pycache__/
 *.pyc
 .venv/
 venv/
-
 # Node
 node_modules/
-
 # superx runtime state — never commit, contains user data
 superx-state.json
 superx-session.json
@@ -21,14 +19,11 @@ superx-history.json
 superx-checkpoint.json
 superx-github.json
 superx-workspace/
-
 # claude-code internals
 .claude/agent-memory/
-
 # user-generated docs (research/plans/specs from real tasks)
 docs/analysis/
 docs/superpowers/plans/
-
 # guard install output — per-clone local git-hooks dir wired via core.hooksPath
 # (`hmd guard install`). Install output, not source. Lives in the working tree
 # (not .git/) on purpose so a relative core.hooksPath survives a repo move.
@@ -55,7 +50,6 @@ docs/superpowers/plans/
 # NAMES only, never a real url/token). The REAL config + the per-dev signing seeds
 # stay ignored (below); only this single .example is un-ignored so it can be committed.
 !.heimdall/cp-endpoint.json.example
-
 # CONTROL-PLANE PRESENCE SECRETS — the per-dev CP endpoint config (url + enroll TOKEN)
 # and the Ed25519 signing SEEDS. The canonical store is $HOME/.heimdall — OUT of any
 # dev repo — but $HOME/.heimdall IS the installed plugin clone (a checkout of THIS
@@ -77,11 +71,9 @@ docs/superpowers/plans/
 .heimdall/identity.json
 .heimdall/team.json
 .heimdall/*.seed
-
 # designmatch v2 runtime ledger + quarantine (the regen-log.json hash-log and the
 # tmp holding area are per-checkout runtime state, not source — never commit them).
 .designmatch/
-
 # superx runtime artifacts
 .setup-done
 .last-update-from
@@ -89,16 +81,13 @@ docs/superpowers/plans/
 .planning/dispatch/
 .planning/metrics.jsonl
 .planning/routing-overrides.json
-
 # logs
 *.log
 /tmp/superx-*
-
 # Playwright/npm artifacts from local smoke tests of designmatch scripts
 skills/designmatch/scripts/node_modules/
 skills/designmatch/scripts/package.json
 skills/designmatch/scripts/package-lock.json
-
 # Oracle-gate runtime artifacts: report.json is run.sh's typed OUTPUT, not source
 evals/oracles/*/report.json
 .planning/
@@ -136,6 +125,5 @@ evals/oracles/*/report.json
 !.planning/ledger/verdicts/
 .claude/
 evals/benchmark/results.jsonl
-
 # Git worktrees (heimdall isolation)
 .worktrees/
