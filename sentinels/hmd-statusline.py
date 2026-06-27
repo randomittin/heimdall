@@ -330,7 +330,7 @@ def main():
         # SOLO TEASE: the wall is empty (no roster, no team files). Fill the dead row
         # with a faint invite — sells the team feature, drives the growth loop. Single
         # row, width-safe (<= COLUMNS − sigil anchor − gutter): dropped if it can't fit.
-        tease = f"{FAINT}── watch ── invite your team · hmd team join{X}"
+        tease = f"{FAINT}── watch ── invite your team · hmd invite{X}"
         if vis(tease) > max(0, cols - ANCHOR - RMARGIN): tease = ""
         out.append(f"{_sig(sig,2,CY)}  " + tease)
         out.append(f"{_sig(sig,3,CY)}  ")
