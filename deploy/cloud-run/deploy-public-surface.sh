@@ -32,21 +32,24 @@
 #      IMPOSSIBLE (hard refusal), not merely discouraged.
 # Either layer alone refuses dispatch; both together is the belt-and-braces boundary.
 #
-# ENROLL MODE — OPEN (tokenless, bounded) by DEFAULT, TOKEN-GATED on demand.
-#   • OPEN  (HEIMDALL_ENROLL_OPEN=1, the default here): zero-config onboarding — a dev sets
-#     NOTHING, /enroll needs no token. It is NOT unbounded: the server bounds tokenless
-#     enroll by the per-IP rate limit (HEIMDALL_ENROLL_IP_LIMIT/WINDOW), a deployment-wide
-#     enroll budget (HEIMDALL_ENROLL_BUDGET_MAX/WINDOW), and a HARD registry-size cap
-#     (HEIMDALL_ENROLL_MAX_KEYS). The `cp-enroll-token` secret is OPTIONAL in open mode:
-#     mounted for defense-in-depth IF it exists, and a missing token NEVER fails the deploy.
-#   • TOKEN (HEIMDALL_ENROLL_OPEN=0, the viral/public phase): /enroll is token-gated,
-#     fail-closed — the service needs HEIMDALL_ENROLL_TOKEN (the `cp-enroll-token` secret) to
-#     verify the bootstrap token; absent, enroll refuses every request. In token mode the
-#     secret is REQUIRED (an absent token = a dead enroll route → the deploy refuses).
+# ENROLL MODE — TOKEN-GATED by DEFAULT (the public/viral phase), OPEN (tokenless, bounded)
+# on demand for zero-config internal onboarding.
+#   • TOKEN (HEIMDALL_ENROLL_OPEN=0, the DEFAULT here — the viral/public phase): /enroll is
+#     token-gated, fail-closed — the service needs HEIMDALL_ENROLL_TOKEN (the `cp-enroll-token`
+#     secret) to verify the bootstrap token; absent, enroll refuses every request. In token mode
+#     the secret is REQUIRED (an absent token = a dead enroll route → the deploy refuses). The
+#     abuse-control caps below — per-IP rate limit (HEIMDALL_ENROLL_IP_LIMIT/WINDOW), a
+#     deployment-wide enroll budget (HEIMDALL_ENROLL_BUDGET_MAX/WINDOW), and a HARD registry-size
+#     cap (HEIMDALL_ENROLL_MAX_KEYS) — STILL apply ON TOP of the token gate (defense in depth):
+#     a LEAKED token still cannot flood enroll or bloat the registry past the cap.
+#   • OPEN  (HEIMDALL_ENROLL_OPEN=1, the zero-config internal alternative): a dev sets NOTHING,
+#     /enroll needs no token. It is NOT unbounded — the SAME per-IP / budget / registry caps bound
+#     tokenless enroll. The `cp-enroll-token` secret is OPTIONAL in open mode: mounted for defense-
+#     in-depth IF it exists, and a missing token NEVER fails the deploy.
 # Whenever the secret IS mounted it is granted at the SECRET RESOURCE level (per-secret IAM),
-# NOT project-wide, so it cannot read any other secret the project holds. Open enroll does NOT
-# relax the boundary or the SA — see the GO-LIVE-RUNBOOK open-enroll section for the residual
-# risk and how to flip back to token mode.
+# NOT project-wide, so it cannot read any other secret the project holds. Flipping the enroll
+# mode NEVER relaxes the boundary or the SA — see the GO-LIVE-RUNBOOK enroll-model section for
+# the open-mode residual risk and the mode-flip instructions.
 #
 # THE SERVER PKI SEED IS *NOT* SHIPPED TO THE PUBLIC SERVICE BY DEFAULT. The real server
 # identity seed (`cp-pki-key`) stays SERVER-ONLY on the gated service. The public surface
@@ -85,15 +88,16 @@ PUBLIC_SA="${PUBLIC_SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
 # NEVER run as this identity — PREFLIGHT P2 hard-refuses if PUBLIC_SA resolves to it.
 GATED_SA="${GATED_SA:-heimdall-cp-run@${PROJECT_ID}.iam.gserviceaccount.com}"
 ENROLL_SECRET="${ENROLL_SECRET:-cp-enroll-token}"          # enroll bootstrap-token verifier
-# ── OPEN-ENROLL mode (tokenless onboarding) + its TIGHT abuse-control envs ─────────────
-# HEIMDALL_ENROLL_OPEN=1 (DEFAULT) → the public service accepts TOKENLESS /enroll, so a dev
-# onboards with ZERO config (no token to mint or distribute). It is NOT unbounded — the
-# server bounds tokenless enroll by the per-IP rate limit, a deployment-wide enroll budget,
-# AND a HARD registry-size cap. In open mode the cp-enroll-token secret is OPTIONAL (mounted
-# for defense-in-depth IF it exists; absent NEVER fails the deploy). Set ENROLL_OPEN=0 for the
-# viral/public phase (token REQUIRED, secret mandatory). Every knob is env-overridable; the
-# defaults are TIGHT (mirrors cp_publicsurface.py's _int_env fallbacks, conservatively lower).
-ENROLL_OPEN="${ENROLL_OPEN:-1}"                            # 1=tokenless+bounded, 0=token-gated
+# ── ENROLL mode (TOKEN-gated by DEFAULT) + the TIGHT abuse-control envs (apply in BOTH modes) ─
+# HEIMDALL_ENROLL_OPEN=0 (DEFAULT) → the public service TOKEN-gates /enroll (the viral/public
+# phase): a caller must present the bootstrap token, the cp-enroll-token secret is REQUIRED, and
+# enroll is fail-closed without it. The abuse-control caps below — per-IP rate limit, the
+# deployment-wide enroll budget, AND the HARD registry-size cap — ALWAYS apply, in token mode TOO,
+# so a LEAKED token still cannot flood enroll or bloat the registry past the cap. Set ENROLL_OPEN=1
+# for the zero-config internal alternative (TOKENLESS onboarding; the same caps bound it; the
+# cp-enroll-token secret is OPTIONAL). Every knob is env-overridable; the defaults are TIGHT
+# (mirrors cp_publicsurface.py's _int_env fallbacks, conservatively lower).
+ENROLL_OPEN="${ENROLL_OPEN:-0}"                            # 0=token-gated (default), 1=tokenless+bounded
 ENROLL_IP_LIMIT="${ENROLL_IP_LIMIT:-5}"                    # new enrolls per client-IP per window
 ENROLL_IP_WINDOW="${ENROLL_IP_WINDOW:-60}"                 # the per-IP window (seconds)
 ENROLL_MAX_KEYS="${ENROLL_MAX_KEYS:-1000}"                 # HARD cap on the key-registry size
@@ -134,7 +138,7 @@ say "==> heimdall-cp-public deploy (${MODE} mode)"
 say "    project=${PROJECT_ID} region=${REGION} public-service=${PUBLIC_SERVICE}"
 say "    public SA=${PUBLIC_SA} (LEAST PRIVILEGE — no run.jobs.run, no dispatch IAM)"
 say "    public surface = {${PUBLIC_SURFACE_ROUTES}}  (HEIMDALL_PUBLIC_SURFACE=1)"
-say "    enroll mode = HEIMDALL_ENROLL_OPEN=${ENROLL_OPEN} (1=tokenless+bounded; caps IP=${ENROLL_IP_LIMIT}/${ENROLL_IP_WINDOW}s, budget=${ENROLL_BUDGET_MAX}/${ENROLL_BUDGET_WINDOW}s, registry=${ENROLL_MAX_KEYS})"
+say "    enroll mode = HEIMDALL_ENROLL_OPEN=${ENROLL_OPEN} (0=token-gated [default], 1=tokenless+bounded; caps IP=${ENROLL_IP_LIMIT}/${ENROLL_IP_WINDOW}s, budget=${ENROLL_BUDGET_MAX}/${ENROLL_BUDGET_WINDOW}s — apply in BOTH modes, registry=${ENROLL_MAX_KEYS})"
 
 # ── PREFLIGHT — the dangerous mistakes are made IMPOSSIBLE here, not just documented ──
 # P1/P2 are pure string checks (always enforced, no creds). P3 probes live IAM: a found
@@ -381,16 +385,24 @@ say "    (NO run.jobs.run / heimdallJobRunner / run.developer granted — public
 # Enroll token ONLY when MOUNT_ENROLL_TOKEN (present, or required in token mode). PKI seed
 # ONLY on the conditional throwaway path. HEIMDALL_PUBLIC_SURFACE=1 is set ONLY here (the
 # public service); PREFLIGHT P1 guarantees this script can never target the gated service, so
-# the flag never leaks onto it. The OPEN-ENROLL env (HEIMDALL_ENROLL_OPEN + the abuse-control
-# caps) is the server contract for tokenless+bounded enroll; it is ALWAYS set, so the server
-# knows the mode explicitly (ENROLL_OPEN=0 flips back to token-gated, secret-mandatory).
+# the flag never leaks onto it. ENROLL MODE: in TOKEN mode (the DEFAULT) HEIMDALL_ENROLL_OPEN is
+# LEFT UNSET — cp_enroll/cp_publicsurface default to the fail-closed token gate when it is absent
+# (the canonical token-mode config, no regression); in OPEN mode it is set explicitly to 1. The
+# abuse-control caps are set in BOTH modes (defense in depth — they bound enroll even with a
+# valid/leaked token in token mode).
 add_secret() { [ -n "${SECRETS}" ] && SECRETS="${SECRETS},$1" || SECRETS="$1"; }
 SECRETS=""
 [ "${MOUNT_ENROLL_TOKEN}" = "1" ] && add_secret "HEIMDALL_ENROLL_TOKEN=${ENROLL_SECRET}:latest"
 ENVVARS="HEIMDALL_PUBLIC_SURFACE=1,HEIMDALL_STATE_BACKEND=firestore,GOOGLE_CLOUD_PROJECT=${PROJECT_ID}"
-# Open-enroll mode + TIGHT abuse-control caps (the server contract). Bounds tokenless enroll
-# by per-IP rate, the deployment-wide budget, and the HARD registry-size cap.
-ENVVARS="${ENVVARS},HEIMDALL_ENROLL_OPEN=${ENROLL_OPEN}"
+# ENROLL MODE flag — set ONLY in open mode. Token mode (default) leaves HEIMDALL_ENROLL_OPEN unset
+# (the server's fail-closed token gate is the absent-env default), so the public deploy carries NO
+# open-enroll flag in the viral/public phase.
+if enroll_open; then
+  ENVVARS="${ENVVARS},HEIMDALL_ENROLL_OPEN=1"
+fi
+# TIGHT abuse-control caps (the server contract) — set in BOTH modes. Bound enroll by per-IP rate,
+# the deployment-wide budget, and the HARD registry-size cap, so a leaked/valid token in token
+# mode still cannot flood enroll or grow the registry past the cap.
 ENVVARS="${ENVVARS},HEIMDALL_ENROLL_IP_LIMIT=${ENROLL_IP_LIMIT},HEIMDALL_ENROLL_IP_WINDOW=${ENROLL_IP_WINDOW}"
 ENVVARS="${ENVVARS},HEIMDALL_ENROLL_MAX_KEYS=${ENROLL_MAX_KEYS}"
 ENVVARS="${ENVVARS},HEIMDALL_ENROLL_BUDGET_MAX=${ENROLL_BUDGET_MAX},HEIMDALL_ENROLL_BUDGET_WINDOW=${ENROLL_BUDGET_WINDOW}"
@@ -403,7 +415,7 @@ fi
 if enroll_open; then
   say "    enroll: OPEN (tokenless, bounded) — IP=${ENROLL_IP_LIMIT}/${ENROLL_IP_WINDOW}s, budget=${ENROLL_BUDGET_MAX}/${ENROLL_BUDGET_WINDOW}s, registry cap=${ENROLL_MAX_KEYS} keys"
 else
-  say "    enroll: TOKEN-GATED (HEIMDALL_ENROLL_OPEN=${ENROLL_OPEN}) — cp-enroll-token REQUIRED"
+  say "    enroll: TOKEN-GATED (default; HEIMDALL_ENROLL_OPEN left UNSET on the deploy) — cp-enroll-token REQUIRED; abuse caps (IP=${ENROLL_IP_LIMIT}/${ENROLL_IP_WINDOW}s, budget=${ENROLL_BUDGET_MAX}/${ENROLL_BUDGET_WINDOW}s, registry=${ENROLL_MAX_KEYS}) STILL apply"
 fi
 [ "${MOUNT_ENROLL_TOKEN}" = "1" ] \
   && say "    secrets: enroll-token (${ENROLL_SECRET}) mounted${PUBLIC_PKI_SECRET:+ + DISTINCT throwaway PKI seed (${PUBLIC_PKI_SECRET})}" \
@@ -415,9 +427,11 @@ fi
 #   • --allow-unauthenticated   — reachable with NO Cloud Run IAM bearer (zero-config dev).
 #   • --service-account public SA — the least-privilege identity (cannot dispatch).
 #   • HEIMDALL_PUBLIC_SURFACE=1  — the APP-LAYER gate: serve public routes, 404 the rest.
-#   • HEIMDALL_ENROLL_OPEN=1     — tokenless onboarding, bounded by the abuse-control caps.
+#   • HEIMDALL_ENROLL_OPEN       — enroll mode (0=token-gated DEFAULT; 1=tokenless). The
+#                                  abuse-control caps bound enroll in BOTH modes.
 #   • HEIMDALL_ENROLL_TOKEN      — from cp-enroll-token, mounted ONLY when present/required
-#                                  (open mode tolerates it absent — see resolve_enroll_token).
+#                                  (REQUIRED in token mode; open mode tolerates it absent —
+#                                  see resolve_enroll_token).
 # NOTE: HEIMDALL_JOB_RUNNER is intentionally NOT set — the public surface 404s /dispatch
 # and /jobs, so the runner is never reached; and even if it were, the missing run.jobs.run
 # IAM blocks the execute. The two layers are independent.

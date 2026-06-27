@@ -43,11 +43,11 @@ PUBLIC_SA_NAME="${PUBLIC_SA_NAME:-heimdall-cp-public-run}"
 PUBLIC_SA="${PUBLIC_SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
 # Secret NAMES only — never values. (RUNBOOK §2.)
 ENROLL_SECRET="${ENROLL_SECRET:-cp-enroll-token}"
-# Enroll mode forwarded to deploy-public-surface.sh (STEP 5). 1=OPEN (tokenless+bounded,
-# zero-config onboarding — the enroll token is OPTIONAL); 0=token-gated (viral/public phase,
-# cp-enroll-token REQUIRED). The deploy script owns the abuse-control caps + the optional-token
-# resolution; this only forwards the mode.
-ENROLL_OPEN="${ENROLL_OPEN:-1}"
+# Enroll mode forwarded to deploy-public-surface.sh (STEP 5). 0=token-gated (the DEFAULT — the
+# viral/public phase, cp-enroll-token REQUIRED); 1=OPEN (tokenless+bounded, zero-config internal
+# onboarding — the enroll token is OPTIONAL). The deploy script owns the abuse-control caps (they
+# apply in BOTH modes) + the token resolution; this only forwards the mode.
+ENROLL_OPEN="${ENROLL_OPEN:-0}"
 PUBLIC_PKI_SECRET="${PUBLIC_PKI_SECRET:-cp-pki-key-public}"   # DISTINCT throwaway (verdict (b))
 GATED_PKI_SECRET="${GATED_PKI_SECRET:-cp-pki-key}"            # the REAL server seed — gated-only
 PUBLIC_SERVER_HAID="${PUBLIC_SERVER_HAID:-cp-public-server}"
@@ -296,18 +296,28 @@ provision_secret() {
 }
 
 # ── 3a. enroll token (RUNBOOK §2.2) ──
-# OPTIONAL in OPEN mode (ENROLL_OPEN=1, the default): /enroll is tokenless+bounded, so you may
-# SKIP minting — open enroll still works without the token, and deploy-public-surface.sh does
-# NOT fail when cp-enroll-token is absent in open mode. Mint it only for defense-in-depth (the
-# token path stays available) or when flipping to token mode (ENROLL_OPEN=0, where it is
-# REQUIRED). A decline below is therefore safe in open mode.
+# REQUIRED in TOKEN mode (ENROLL_OPEN=0, the DEFAULT — the viral/public phase): /enroll is
+# fail-closed, so the public deploy (STEP 5) REFUSES an absent cp-enroll-token. Mint it below
+# (a decline is then enforced as a hard stop). OPTIONAL only in OPEN mode (ENROLL_OPEN=1):
+# /enroll is tokenless+bounded, so you may SKIP minting — open enroll still works without the
+# token and deploy-public-surface.sh does NOT fail when it is absent. The abuse-control caps
+# (per-IP / budget / registry) bound enroll in BOTH modes regardless.
 if [ "${ENROLL_OPEN}" = "1" ]; then
   note "ENROLL_OPEN=1 (open mode) — cp-enroll-token is OPTIONAL; you may decline the mint below (tokenless enroll still works)."
 else
-  note "ENROLL_OPEN=${ENROLL_OPEN} (token mode) — cp-enroll-token is REQUIRED; mint it below or the public deploy refuses."
+  note "ENROLL_OPEN=${ENROLL_OPEN} (token mode, the default) — cp-enroll-token is REQUIRED; mint it below or the public deploy refuses."
 fi
 provision_secret "${ENROLL_SECRET}" \
-  "bootstrap token verifier for /enroll — OPTIONAL in open mode, REQUIRED in token mode (public service)" mint_token
+  "bootstrap token verifier for /enroll — REQUIRED in token mode (default), OPTIONAL in open mode (public service)" mint_token
+
+# TOKEN MODE (the default) — the enroll token is REQUIRED: STEP 5's deploy-public-surface.sh
+# REFUSES an absent token (a dead enroll route). Enforce it HERE so a declined / still-missing
+# mint fails EARLY (before STEP 5's spend), not after the gated rebuild. In OPEN mode
+# (ENROLL_OPEN=1) a missing token is fine (tokenless enroll), so this gate is token-mode-only.
+if [ "${ENROLL_OPEN}" != "1" ] && [ "$MODE" = "guided" ]; then
+  secret_present "${ENROLL_SECRET}" \
+    || die "STEP 3: token mode (ENROLL_OPEN=${ENROLL_OPEN}) REQUIRES ${ENROLL_SECRET}, but it is still absent (mint declined?). Mint it (RUNBOOK §2.2) before continuing — the public deploy refuses without it. Or set ENROLL_OPEN=1 for tokenless open enroll."
+fi
 
 # ── 3b. distinct throwaway public PKI seed (RUNBOOK §2.3, verdict (b)) ──
 [ "${PUBLIC_PKI_SECRET}" != "${GATED_PKI_SECRET}" ] || die "STEP 3: PUBLIC_PKI_SECRET == ${GATED_PKI_SECRET} — refusing to reuse the real server seed on the internet-facing service."
@@ -444,10 +454,11 @@ step "STEP 5 — deploy the public surface (REUSE deploy-public-surface.sh; P1�
 # Hand the distinct throwaway seed to the deploy via env (RUNBOOK §2.3 / §5). The VALUE is
 # never passed — only the secret NAME. deploy-public-surface.sh resolves the gated digest.
 DP_MODE="plan"; [ "$MODE" = "guided" ] && DP_MODE="apply"
-# ENROLL_OPEN is forwarded so the public service deploys in the chosen mode (open by default).
-# In open mode deploy-public-surface.sh mounts cp-enroll-token only IF it exists and never
-# fails when it is absent; it always sets the abuse-control caps (per-IP/budget/registry).
-note "enroll mode forwarded: HEIMDALL_ENROLL_OPEN=${ENROLL_OPEN} (1=tokenless+bounded; the token is optional in open mode)"
+# ENROLL_OPEN is forwarded so the public service deploys in the chosen mode (token-gated by
+# DEFAULT). In token mode deploy-public-surface.sh REQUIRES cp-enroll-token (refuses if absent);
+# in open mode it mounts the token only IF it exists and never fails when absent. EITHER way it
+# always sets the abuse-control caps (per-IP/budget/registry) — they apply in BOTH modes.
+note "enroll mode forwarded: HEIMDALL_ENROLL_OPEN=${ENROLL_OPEN} (0=token-gated [default], 1=tokenless; the abuse caps apply in BOTH modes)"
 show "ENROLL_OPEN=${ENROLL_OPEN} PUBLIC_PKI_SECRET=${PUBLIC_PKI_SECRET} PUBLIC_SERVER_HAID=${PUBLIC_SERVER_HAID} bash ${DEPLOY_PUBLIC} ${DP_MODE}"
 PROJECT_ID="${PROJECT_ID}" REGION="${REGION}" \
 GATED_SERVICE="${GATED_SERVICE}" PUBLIC_SERVICE="${PUBLIC_SERVICE}" \
