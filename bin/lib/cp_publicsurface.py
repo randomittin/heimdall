@@ -51,6 +51,8 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
+import cp_auth       # derive_team_id / default_team_id / team_member_count — the team-scoped
+                    # enroll re-key + the net-new-team detection for the team-create caps.
 import cp_nonce      # the replay/freshness gate for the signed presence beat (accept()).
 import cp_ratelimit  # the fixed-window abuse gate (RateLimiter.allow + enroll_budget_ok).
 
@@ -66,20 +68,26 @@ import cp_ratelimit  # the fixed-window abuse gate (RateLimiter.allow + enroll_b
 #   GET  /healthz   — the Cloud Run liveness probe (pre-auth; cp_diag).
 #   GET  /readyz    — the Cloud Run readiness probe (pre-auth; cp_diag).
 #
-# PLUS the UNAUTHENTICATED browser-read seam (app-layer only — NOT a signed/IAM route, so it is
+# PLUS the TEAM-PRIVATE browser-read seam (app-layer only — NOT a signed/IAM route, so it is
 # additive to the gcloud display string above; the static heimdall-site dashboard fetches it):
-#   GET     /roster-public — the ONLINE roster for a project, UNSIGNED + per-IP rate-limited +
-#       CORS, projected to handle/verdict/file/age_seconds ONLY (no haid/pubkey/secret, no
-#       write). A browser cannot PKI-sign, so the signed GET /roster 401s it; this is its read.
-#   OPTIONS /roster-public — the CORS preflight for the above (204 + CORS headers).
-# Both are READ-ONLY: there is deliberately NO (POST, /roster-public) — the public surface
-# exposes no unauthenticated write.
+#   GET     /roster-team — the ONLINE roster for (project, team), authorized by the
+#       X-Heimdall-Team-Secret HEADER (hashed -> team_id server-side); per-IP rate-limited +
+#       CORS, FULL member view incl. haid. No secret header -> 403. A browser cannot PKI-sign,
+#       so the signed GET /roster 401s it; this is its read.
+#   OPTIONS /roster-team — the CORS preflight (204 + CORS incl. Access-Control-Allow-Headers:
+#       X-Heimdall-Team-Secret).
+#   GET     /roster-public — RETIRED: the old fully-public roster leaked activity to anyone, so
+#       it now 403s on the public surface (kept in the allowlist so it returns 403, not a flat
+#       404 — the closed leak is explicit). team.html moved to /roster-team.
+# All READ-ONLY: there is deliberately NO (POST, /roster-team) — the public surface exposes no
+# unauthenticated write.
 PUBLIC_ROUTES = frozenset({
     ("POST", "/enroll"),
     ("POST", "/presence"),
     ("GET", "/roster"),
+    ("GET", "/roster-team"),
+    ("OPTIONS", "/roster-team"),
     ("GET", "/roster-public"),
-    ("OPTIONS", "/roster-public"),
     ("GET", "/healthz"),
     ("GET", "/readyz"),
 })
@@ -145,6 +153,18 @@ def _enroll_token_limit():   return _int_env("HEIMDALL_ENROLL_TOKEN_LIMIT", 30)
 def _enroll_token_window():  return _int_env("HEIMDALL_ENROLL_TOKEN_WINDOW", 60)
 def _enroll_budget_max():    return _int_env("HEIMDALL_ENROLL_BUDGET_MAX", 50)
 def _enroll_budget_window(): return _int_env("HEIMDALL_ENROLL_BUDGET_WINDOW", 3600)
+# /enroll PER-TEAM bucket (re-keyed on the derived team_id, not the deprecated bootstrap token):
+# a single (possibly leaked) team_secret cannot hammer /enroll even rotating IPs. Same limits as
+# the per-token bucket; team_id is already a hash, re-hashed by cp_ratelimit before it is a key.
+def _enroll_team_limit():    return _int_env("HEIMDALL_ENROLL_TEAM_LIMIT", 30)
+def _enroll_team_window():   return _int_env("HEIMDALL_ENROLL_TEAM_WINDOW", 60)
+# TEAM-CREATE caps (Risk 5b — unbounded team creation on the open edge). A net-new team_id (no
+# existing member/record) counts against BOTH a per-IP create bucket AND a deployment-wide
+# distinct-team ceiling, so an attacker rotating fresh secrets cannot explode the store/registry.
+def _team_create_ip_limit():     return _int_env("HEIMDALL_TEAM_CREATE_IP_LIMIT", 5)
+def _team_create_ip_window():    return _int_env("HEIMDALL_TEAM_CREATE_IP_WINDOW", 3600)
+def _team_create_budget_max():   return _int_env("HEIMDALL_TEAM_CREATE_BUDGET_MAX", 50)
+def _team_create_budget_window():return _int_env("HEIMDALL_TEAM_CREATE_BUDGET_WINDOW", 3600)
 
 # /presence — per-IP (pre-verify, blunt flood shed) and per-haid (post-verify) caps. A dev
 # beats ~2/min; behind a corporate NAT many devs share one IP, so the per-IP cap is loose and
