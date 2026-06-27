@@ -448,16 +448,20 @@ bash "${CHECK_PUBLIC}" || die "STEP 6: check-public-surface.sh FAILED — STOP. 
 say "STEP 6 ok — check-public-surface PASS"
 
 # ════════════════════════════════════════════════════════════════════════════════════
-# STEP 7 — LIVE VERIFY (RUNBOOK §7). Public POST /dispatch -> 404 (boundary holds);
-# gated unauthenticated curl (NO id token) -> 401/403 (the edge still demands IAM).
+# STEP 7 — LIVE VERIFY (RUNBOOK §7). Public /readyz -> 200 booted (alive; /healthz is
+# GFE-404'd externally so we probe /readyz); public POST /dispatch -> APP 404
+# {no_such_route} (boundary holds — body-checked so a GFE edge 404 can't false-green);
+# public POST /presence -> 401 (allowlist reaches the app); gated unauthenticated curl
+# (NO id token) -> 401/403 (the edge still demands IAM).
 # Both must pass. In plan mode these are PRINTED, not executed (creds-optional).
 # ════════════════════════════════════════════════════════════════════════════════════
 step "STEP 7 — live boundary verify (RUNBOOK §7 — both must pass)"
 
 if [ "$MODE" != "guided" ]; then
   note "(plan) at guided run this resolves the public+gated URLs and runs:"
-  show "curl -s -o /dev/null -w '%{http_code}' -X POST \"\${PUBLIC_URL}/dispatch\" -H 'Content-Type: application/json' -d '{}'   # expect 404"
-  show "curl -s -o /dev/null -w '%{http_code}' \"\${PUBLIC_URL}/healthz\"   # expect 200"
+  show "curl -s -w '\\n%{http_code}' \"\${PUBLIC_URL}/readyz\"   # expect 200 + booted:true (NOT /healthz — GFE 404s it)"
+  show "curl -s -w '\\n%{http_code}' -X POST \"\${PUBLIC_URL}/dispatch\" -d '{}'   # expect app 404 {no_such_route} (boundary)"
+  show "curl -s -o /dev/null -w '%{http_code}' -X POST \"\${PUBLIC_URL}/presence\" -d '{}'   # expect 401 (allowlist reaches app)"
   show "curl -s -o /dev/null -w '%{http_code}' -X POST \"\${GATED_URL}/dispatch\" -H 'Content-Type: application/json' -d '{}'   # expect 401/403 (NO bearer)"
   say "==> plan complete — nothing was deployed and no mutating gcloud ran."
   exit 0
@@ -470,21 +474,50 @@ PUBLIC_URL="$(gcloud run services describe "${PUBLIC_SERVICE}" --region="${REGIO
 [ -n "${PUBLIC_URL}" ] || die "STEP 7: public service has no URL — deploy may not be live."
 note "public URL: ${PUBLIC_URL}"
 
-# 7.1 — a gated route is 404 on the PUBLIC surface (app-layer boundary).
-show "curl -s -o /dev/null -w '%{http_code}' -X POST ${PUBLIC_URL}/dispatch -H 'Content-Type: application/json' -d '{}'"
-PUB_DISPATCH="$(curl -s -o /dev/null -w '%{http_code}' -X POST "${PUBLIC_URL}/dispatch" \
+# 7.0 — the public surface is ALIVE: GET /readyz -> 200 from OUR app (booted +
+# backend_ready). NOTE: we probe /readyz, NOT /healthz — Google's Cloud Run edge
+# 404s an external GET /healthz before it reaches the container (a GFE quirk: the
+# request never gets an x-cloud-trace-context; /readyz is served by the SAME
+# is_health_path handler and IS reachable). /readyz is also the stronger signal:
+# it forces the backend init and fail-closes (503) on a broken store.
+show "curl -s -w '\\n%{http_code}' ${PUBLIC_URL}/readyz"
+PUB_READY_RAW="$(curl -s -w '\n%{http_code}' "${PUBLIC_URL}/readyz" 2>/dev/null || true)"
+PUB_READY_CODE="$(printf '%s' "${PUB_READY_RAW}" | tail -n1)"
+PUB_READY_BODY="$(printf '%s' "${PUB_READY_RAW}" | sed '$d')"
+note "public GET /readyz -> ${PUB_READY_CODE}  ${PUB_READY_BODY}"
+[ "${PUB_READY_CODE}" = "200" ] \
+  || die "STEP 7.0: public GET /readyz returned ${PUB_READY_CODE}, expected 200 — the public surface is not ready. STOP."
+printf '%s' "${PUB_READY_BODY}" | grep -q '"booted": *true' \
+  || die "STEP 7.0: /readyz did not report booted:true — the container is not serving our app. STOP."
+say "  ok — public GET /readyz -> 200 booted (public surface is alive + backend ready)"
+
+# 7.1 — a gated route is 404 on the PUBLIC surface, FROM OUR APP (the boundary), not
+# a GFE edge 404. We assert the JSON body {"error":"no_such_route"} so a GFE/edge
+# 404 (HTML, never reached the container) can NEVER be a false-green for the boundary.
+show "curl -s ${PUBLIC_URL}/dispatch -X POST -H 'Content-Type: application/json' -d '{}'   # expect app JSON 404"
+PUB_DISPATCH_RAW="$(curl -s -w '\n%{http_code}' -X POST "${PUBLIC_URL}/dispatch" \
                   -H 'Content-Type: application/json' -d '{}' 2>/dev/null || true)"
-note "public POST /dispatch -> ${PUB_DISPATCH}"
+PUB_DISPATCH="$(printf '%s' "${PUB_DISPATCH_RAW}" | tail -n1)"
+PUB_DISPATCH_BODY="$(printf '%s' "${PUB_DISPATCH_RAW}" | sed '$d')"
+note "public POST /dispatch -> ${PUB_DISPATCH}  ${PUB_DISPATCH_BODY}"
 [ "${PUB_DISPATCH}" = "404" ] \
   || die "STEP 7.1: public POST /dispatch returned ${PUB_DISPATCH}, expected 404 — the boundary LEAKED. STOP."
-say "  ok — public POST /dispatch -> 404 (gated route does not resolve on the public surface)"
+printf '%s' "${PUB_DISPATCH_BODY}" | grep -q 'no_such_route' \
+  || die "STEP 7.1: /dispatch 404 was NOT the app boundary (no 'no_such_route' body — a GFE/edge 404). The boundary is UNVERIFIED. STOP."
+say "  ok — public POST /dispatch -> app 404 {no_such_route} (boundary holds: gated route does not resolve)"
 
-show "curl -s -o /dev/null -w '%{http_code}' ${PUBLIC_URL}/healthz"
-PUB_HEALTH="$(curl -s -o /dev/null -w '%{http_code}' "${PUBLIC_URL}/healthz" 2>/dev/null || true)"
-note "public GET /healthz -> ${PUB_HEALTH}"
-[ "${PUB_HEALTH}" = "200" ] \
-  || die "STEP 7.1: public GET /healthz returned ${PUB_HEALTH}, expected 200 — the public surface is not alive. STOP."
-say "  ok — public GET /healthz -> 200 (public surface is alive)"
+# 7.1b — a REAL public route is REACHABLE (reaches the app): POST /presence with no
+# signature -> 401 (the §3 chokepoint), proving the surface serves the allowlist (not
+# a service that 404s everything). 401 = reached the app; a 404 here would mean the
+# allowlist itself isn't being served.
+show "curl -s -o /dev/null -w '%{http_code}' -X POST ${PUBLIC_URL}/presence -d '{}'   # expect 401 (reached app, needs sig)"
+PUB_PRESENCE="$(curl -s -o /dev/null -w '%{http_code}' -X POST "${PUBLIC_URL}/presence" \
+                  -H 'Content-Type: application/json' -d '{}' 2>/dev/null || true)"
+note "public POST /presence -> ${PUB_PRESENCE}"
+case "${PUB_PRESENCE}" in
+  401|429) say "  ok — public POST /presence -> ${PUB_PRESENCE} (allowlisted route reaches the app)";;
+  *) die "STEP 7.1b: public POST /presence returned ${PUB_PRESENCE}, expected 401 — the public allowlist is not being served. STOP.";;
+esac
 
 # 7.2 — the GATED service still DEMANDS the IAM token (Cloud Run edge). NO id token sent.
 show "gcloud run services describe ${GATED_SERVICE} --region=${REGION} --project=${PROJECT_ID} --format='value(status.url)'"
