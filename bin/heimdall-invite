@@ -1,0 +1,204 @@
+#!/usr/bin/env bash
+# heimdall-invite — the TEAM-JOIN viral loop: print a teammate's ONE-COMMAND join.
+#
+# WHAT IT IS. The growth-loop primitive behind the statusline wall tease ("invite
+# your team · hmd invite"). A dev runs `heimdall-invite` and gets a ready-to-share
+# one-liner that drops a teammate straight onto THIS dev's team — the canonical
+# curl|bash installer with this team's control-plane URL + enroll token inlined:
+#
+#   curl -fsSL https://raw.githubusercontent.com/<repo>/<ref>/install.sh \
+#     | HEIMDALL_CP_URL='<url>' HEIMDALL_ENROLL_TOKEN='<token>' bash
+#
+# The teammate pastes that ONE line; install.sh consumes HEIMDALL_CP_URL +
+# HEIMDALL_ENROLL_TOKEN into their 0600 cp-endpoint.json and presence auto-enrolls
+# on their first session. The wall recruits the team.
+#
+# WHERE THE WIRE COMES FROM. url + enroll_token resolve from the dev's OWN
+# ${HOME}/.heimdall/cp-endpoint.json (the team they are configured for — the SAME
+# file bin/heimdall-presence reads). An OPEN-MODE team (url, no token) emits the
+# URL-only join (no secret needed) + a note. The install repo/ref mirror the
+# canonical README one-liner: repo from plugin.json, ref from the installed clone's
+# release tag (else the manifest version, else `main`); HEIMDALL_REF overrides.
+#
+# SECURITY — the enroll token IS a secret. It is the dev's OWN token, deliberately
+# shared with a teammate, so heimdall-invite PRINTS it to the terminal (stdout)
+# ONLY. It is NEVER written to a tracked/committed file, a log, or anything in the
+# repo, and NEVER passed in the argv of another command (argv shows in `ps` + can be
+# logged) — the token crosses only this process's variables and the final stdout
+# write. A "⚠ contains your team enroll token" caveat prints above the join so the
+# dev knows what they are sharing. (gitleaks/secret-scan stays clean: no literal.)
+#
+# CLEAN DEGRADE. No config / no url / no HOME -> a helpful "how to set it up"
+# message and exit 0 (never a traceback). `--qr` renders a scannable QR of the join
+# ONLY if `qrencode` is present; it degrades silently when absent.
+#
+# Usage:
+#   heimdall-invite            print the one-command team-join for a teammate
+#   heimdall-invite --qr       also render a QR of the join (needs `qrencode`)
+#   -h | --help                this help
+#
+# Exit: 0 always on the happy + degrade paths (offline/unconfigured is normal); 2
+# on a bad flag.
+set -uo pipefail
+
+# ── resolve this script's own dir (RELOCATABLE — symlink-followed, no baked path).
+SELF="$0"
+if command -v readlink >/dev/null 2>&1; then
+  SELF="$(readlink -f "$0" 2>/dev/null || readlink "$0" 2>/dev/null || echo "$0")"
+fi
+BIN_DIR="$(cd "$(dirname "$SELF")" 2>/dev/null && pwd)"
+PLUGIN_ROOT="${CLAUDE_PLUGIN_ROOT:-$(cd "$BIN_DIR/.." 2>/dev/null && pwd)}"
+MANIFEST="$PLUGIN_ROOT/.claude-plugin/plugin.json"
+
+usage() { sed -n '2,46p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+# ── argv ───────────────────────────────────────────────────────────────────────
+WANT_QR=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --qr)      WANT_QR=1; shift ;;
+    *) echo "heimdall-invite: unexpected argument: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+PY="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)"
+
+# ── helpful "not configured" message (degrade path — always exit 0) ────────────
+no_config() {
+  cat <<'MSG'
+heimdall-invite: no team control-plane is configured for you yet, so there is
+nothing to invite a teammate to.
+
+Set one up (no re-install needed — writes ~/.heimdall/cp-endpoint.json, 0600):
+
+    HEIMDALL_CP_URL=<your-team-url> HEIMDALL_ENROLL_TOKEN=<your-team-token> \
+      bash <(curl -fsSL https://raw.githubusercontent.com/randomittin/heimdall/main/install.sh)
+
+Then re-run `heimdall-invite` to get a one-command join to share with your team.
+MSG
+  exit 0
+}
+
+# ── resolve HOME + the dev's OWN cp-endpoint config ────────────────────────────
+[ -n "${HOME:-}" ] || no_config
+CONFIG_FILE="$HOME/.heimdall/cp-endpoint.json"
+[ -f "$CONFIG_FILE" ] || no_config
+
+# Parse {url, enroll_token} from the config. Prefer python3 (matches
+# heimdall-presence), then jq, then a grep fallback — so there is no hard dep on a
+# single parser. The token is read into a VARIABLE only; it never crosses argv.
+read_cfg_field() {
+  # $1 = json key; prints the string value (empty if absent/unreadable).
+  local key="$1"
+  if [ -n "$PY" ]; then
+    HMD_INV_CFG="$CONFIG_FILE" HMD_INV_KEY="$key" "$PY" - <<'PYEOF' 2>/dev/null
+import json, os, sys
+try:
+    d = json.load(open(os.environ["HMD_INV_CFG"]))
+    sys.stdout.write(str(d.get(os.environ["HMD_INV_KEY"]) or ""))
+except Exception:
+    sys.stdout.write("")
+PYEOF
+  elif command -v jq >/dev/null 2>&1; then
+    jq -r --arg k "$key" '.[$k] // "" | tostring' "$CONFIG_FILE" 2>/dev/null || true
+  else
+    grep -oE "\"$key\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" "$CONFIG_FILE" 2>/dev/null \
+      | head -1 | sed -E 's/.*:[[:space:]]*"([^"]*)".*/\1/' || true
+  fi
+}
+
+URL="$(read_cfg_field url)"
+TOKEN="$(read_cfg_field enroll_token)"
+[ -n "$URL" ] || no_config   # a config with no url is not an invitable team.
+
+# ── resolve the install repo slug (owner/name) + ref, mirroring the README/
+# install.sh one-liner. NEITHER touches the token (no secret ever enters argv). ──
+resolve_repo_slug() {
+  local raw=""
+  if [ -f "$MANIFEST" ]; then
+    if command -v jq >/dev/null 2>&1; then
+      raw="$(jq -r '.repository // .homepage // ""' "$MANIFEST" 2>/dev/null || true)"
+    elif [ -n "$PY" ]; then
+      raw="$(HMD_INV_CFG="$MANIFEST" "$PY" - <<'PYEOF' 2>/dev/null
+import json, os, sys
+try:
+    d = json.load(open(os.environ["HMD_INV_CFG"]))
+    sys.stdout.write(str(d.get("repository") or d.get("homepage") or ""))
+except Exception:
+    sys.stdout.write("")
+PYEOF
+)"
+    fi
+  fi
+  # github.com/<owner>/<name>(.git) -> owner/name ; fall back to the canonical slug.
+  local slug
+  slug="$(printf '%s' "$raw" \
+    | sed -E -e 's#^[a-z]+\+?[a-z]*://##' -e 's#^git@##' \
+             -e 's#github\.com[:/]##' -e 's#\.git$##' -e 's#/$##')"
+  case "$slug" in
+    */*) printf '%s' "$slug" ;;
+    *)   printf 'randomittin/heimdall' ;;
+  esac
+}
+
+resolve_ref() {
+  # HEIMDALL_REF wins (a dev can pin); else the installed clone's nearest release
+  # tag (normalized to vX.Y.Z), else the manifest version (v-prefixed), else main.
+  if [ -n "${HEIMDALL_REF:-}" ]; then printf '%s' "$HEIMDALL_REF"; return 0; fi
+  local ver=""
+  if git -C "$PLUGIN_ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+    ver="$(git -C "$PLUGIN_ROOT" describe --tags --abbrev=0 2>/dev/null || true)"
+  fi
+  if [ -z "$ver" ] && [ -f "$MANIFEST" ]; then
+    if command -v jq >/dev/null 2>&1; then
+      ver="$(jq -r '.version // ""' "$MANIFEST" 2>/dev/null || true)"
+    elif [ -n "$PY" ]; then
+      ver="$(HMD_INV_CFG="$MANIFEST" "$PY" - <<'PYEOF' 2>/dev/null
+import json, os, sys
+try:
+    d = json.load(open(os.environ["HMD_INV_CFG"]))
+    sys.stdout.write(str(d.get("version") or ""))
+except Exception:
+    sys.stdout.write("")
+PYEOF
+)"
+    fi
+  fi
+  # Normalize a bare X.Y.Z to vX.Y.Z; keep an existing v-prefix; empty -> main.
+  case "$ver" in
+    "")                       printf 'main' ;;
+    v[0-9]*)                  printf '%s' "$ver" ;;
+    [0-9]*.[0-9]*.[0-9]*)     printf 'v%s' "$ver" ;;
+    *)                        printf '%s' "$ver" ;;
+  esac
+}
+
+REPO_SLUG="$(resolve_repo_slug)"
+REF="$(resolve_ref)"
+INSTALL_URL="https://raw.githubusercontent.com/$REPO_SLUG/$REF/install.sh"
+
+# ── build the join one-liner. The URL is team-specific but NOT secret; the token
+# IS — both are inlined ONLY into this string, written ONLY to stdout below. ─────
+if [ -n "$TOKEN" ]; then
+  JOIN="curl -fsSL $INSTALL_URL | HEIMDALL_CP_URL='$URL' HEIMDALL_ENROLL_TOKEN='$TOKEN' bash"
+  printf 'Share this ONE command with a teammate to put them on your team:\n\n'
+  printf '\xe2\x9a\xa0 contains your team enroll token — share only with teammates\n\n'
+  printf '%s\n' "$JOIN"
+else
+  # Open-mode team: url only, no enroll secret needed.
+  JOIN="curl -fsSL $INSTALL_URL | HEIMDALL_CP_URL='$URL' bash"
+  printf 'Share this ONE command with a teammate to put them on your team:\n\n'
+  printf '%s\n' "$JOIN"
+  printf '\n(open-mode team — no enroll token needed)\n'
+fi
+
+# ── optional QR of the join. Only if `qrencode` is present; degrade silently when
+# absent. The join is piped via STDIN (printf is a shell builtin) so the secret
+# token NEVER appears in qrencode's argv (which `ps` would expose). ──────────────
+if [ -n "$WANT_QR" ] && command -v qrencode >/dev/null 2>&1; then
+  printf '\n'
+  printf '%s' "$JOIN" | qrencode -t ANSIUTF8 2>/dev/null || true
+fi
+
+exit 0
