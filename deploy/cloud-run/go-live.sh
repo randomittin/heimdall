@@ -167,9 +167,23 @@ ensure_ar_repo() {
     return 0
   fi
   show "gcloud artifacts repositories describe ${repo} --location=${REGION} --project=${PROJECT_ID}"
-  run gcloud artifacts repositories create "${repo}" \
-    --repository-format=docker --location="${REGION}" --project="${PROJECT_ID}" \
-    || die "STEP 2: could not create Artifact Registry repo '${repo}' (${REGION}) — the build push would fail with: name unknown: Repository \"${repo}\" not found."
+  show "gcloud artifacts repositories create ${repo} --repository-format=docker --location=${REGION} --project=${PROJECT_ID}"
+  [ "$MODE" = "guided" ] || return 0
+  # IDEMPOTENT create: the describe above may have failed for a NON-absence reason
+  # (e.g. an expired cred triggering a mid-command reauth), so we fall through to
+  # create — but ALREADY_EXISTS then means the repo IS present, which is exactly the
+  # goal. Treat ALREADY_EXISTS as success; only a real failure dies. (Was: any
+  # describe miss -> create -> ALREADY_EXISTS -> FATAL on a reauth.)
+  local _cre
+  _cre="$(gcloud artifacts repositories create "${repo}" \
+            --repository-format=docker --location="${REGION}" --project="${PROJECT_ID}" 2>&1)" \
+    && { say "  AR repo ${repo} created"; return 0; }
+  if printf '%s' "${_cre}" | grep -qiE 'ALREADY_EXISTS|already exists'; then
+    say "  AR repo ${repo} already exists — proceeding (create was idempotent)"
+    return 0
+  fi
+  printf '%s\n' "${_cre}" >&2
+  die "STEP 2: could not create Artifact Registry repo '${repo}' (${REGION}) — the build push would fail with: name unknown: Repository \"${repo}\" not found."
 }
 
 if [ -n "${LIVE_IMAGE}" ] && printf '%s' "${LIVE_IMAGE}" | grep -qF ":${HEAD_SHA}"; then
