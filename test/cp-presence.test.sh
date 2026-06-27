@@ -268,6 +268,13 @@ echo "============================================================"
 echo
 
 PROJECT="acme/widget"
+# The team partition handle (32-hex, the derive_team_id() shape). Presence is now keyed by
+# (project, team_id, haid): record_presence + roster both take team_id, resolved server-side
+# from the caller's binding (cp_auth.registered_team), NEVER a body field. This suite threads
+# ONE team so the durability/TTL/cross-dev/external-keying proofs hold under the new keying;
+# cross-team ISOLATION is the dedicated cp-team-isolation gate.
+TEAM_ID="0123456789abcdef0123456789abcdef"
+export TEAM_ID
 DEV_A="haid:rj.mbp-7f3a"
 DEV_B="haid:sam.air-91c2"
 DEV_C="haid:lee.box-44de"
@@ -281,6 +288,7 @@ import os, sys
 sys.path.insert(0, os.environ["LIB"])
 import cp_presence as P
 res = P.record_presence(os.environ["PRES_HAID"], project=os.environ["PRES_PROJECT"],
+                        team_id=os.environ["TEAM_ID"],
                         handle="rj", verdict="building", file="src/app.py")
 print("ok" if res.get("ok") else "fail:%s" % res.get("reason"))
 PYEOF
@@ -295,7 +303,7 @@ A_READ="$(PRES_PROJECT="$PROJECT" "$PY" - <<'PYEOF' 2>"$EXT/a_read.err"
 import json, os, sys
 sys.path.insert(0, os.environ["LIB"])
 import cp_presence as P
-r = P.roster(os.environ["PRES_PROJECT"])
+r = P.roster(os.environ["PRES_PROJECT"], os.environ["TEAM_ID"])
 print(json.dumps([x.get("haid") for x in r]))
 PYEOF
 )"
@@ -315,13 +323,14 @@ import os, sys
 sys.path.insert(0, os.environ["LIB"])
 import cp_presence as P
 P.record_presence(os.environ["PRES_HAID"], project=os.environ["PRES_PROJECT"],
+                  team_id=os.environ["TEAM_ID"],
                   handle="sam", verdict="reviewing", file="api/routes.py")
 PYEOF
 B_READ="$(PRES_PROJECT="$PROJECT" "$PY" - <<'PYEOF' 2>/dev/null
 import json, os, sys
 sys.path.insert(0, os.environ["LIB"])
 import cp_presence as P
-print(json.dumps(sorted(x.get("haid") for x in P.roster(os.environ["PRES_PROJECT"]))))
+print(json.dumps(sorted(x.get("haid") for x in P.roster(os.environ["PRES_PROJECT"], os.environ["TEAM_ID"]))))
 PYEOF
 )"
 if printf '%s' "$B_READ" | grep -q "$DEV_A" && printf '%s' "$B_READ" | grep -q "$DEV_B"; then
@@ -343,10 +352,11 @@ import json, os, sys
 sys.path.insert(0, os.environ["LIB"])
 import cp_presence as P
 proj = os.environ["PRES_PROJECT"]
-P.record_presence(os.environ["PRES_HAID"], project=proj, handle="lee",
-                  verdict="idle", file="-", ts=1000.0)
-stale = [x.get("haid") for x in P.roster(proj, now=2000.0)]          # 1000s old > 45s TTL
-fresh = [x.get("haid") for x in P.roster(proj, now=1000.0 + 10.0)]   # 10s old < 45s TTL
+P.record_presence(os.environ["PRES_HAID"], project=proj, team_id=os.environ["TEAM_ID"],
+                  handle="lee", verdict="idle", file="-", ts=1000.0)
+tid = os.environ["TEAM_ID"]
+stale = [x.get("haid") for x in P.roster(proj, tid, now=2000.0)]          # 1000s old > 45s TTL
+fresh = [x.get("haid") for x in P.roster(proj, tid, now=1000.0 + 10.0)]   # 10s old < 45s TTL
 print(json.dumps({"stale": stale, "fresh": fresh}))
 PYEOF
 )"
@@ -382,7 +392,7 @@ import cp_presence as P
 # A reader on the LOCAL backend (home-keyed, NOT the external firestore store) sees NONE of
 # the firestore-written heartbeats — the cross-dev read existed ONLY because of the external
 # keying. This is the falsifier: a home-keyed presence store would leak these in here.
-print(json.dumps([x.get("haid") for x in P.roster(os.environ["PRES_PROJECT"])]))
+print(json.dumps([x.get("haid") for x in P.roster(os.environ["PRES_PROJECT"], os.environ["TEAM_ID"])]))
 PYEOF
 )"
 if [ "$D_READ" = "[]" ]; then

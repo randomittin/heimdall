@@ -1,26 +1,30 @@
 #!/usr/bin/env bash
-# cp-roster-public-deployed.test.sh — THE DEPLOYED-SHAPE PUBLIC ROSTER READ: a REAL
+# cp-roster-team-deployed.test.sh — THE DEPLOYED-SHAPE TEAM-PRIVATE ROSTER READ: a REAL
 # `heimdall-control-plane serve` subprocess on the PUBLIC surface (HEIMDALL_PUBLIC_SURFACE=1)
-# under firestore, read by an UNSIGNED browser-shaped GET over a real socket.
+# under firestore, read by a browser-shaped GET presenting X-Heimdall-Team-Secret over a socket.
 #
-# WHAT THIS GATES (the static-dashboard path, end to end). cp-roster-public.test.sh proves the
-# handler in process; this proves the WIRE the browser hits: a SIGNED beat seeds presence, then
-# an UNSIGNED GET /roster-public?project=<p> (no X-Heimdall-* headers, the shape a browser
-# `fetch()` sends) returns the dev — sig NOT required, CORS set, no identity/secret leaked.
+# WHAT THIS GATES (the static-dashboard path, end to end). cp-roster-team.test.sh proves the
+# handler in process; this proves the WIRE the browser hits: a SIGNED beat seeds presence into a
+# team, then GET /roster-team?project=<p> with the team_secret in the X-Heimdall-Team-Secret
+# HEADER returns the dev (full member view incl. haid) — scoped to the derived team_id. No header
+# -> 403; the team_secret is never echoed; the RETIRED /roster-public -> 403. The deployment's
+# DEFAULT team secret is pinned so the owner (identity-CLI-registered, no team binding) lands in
+# team_id = derive(TEAM_SECRET), the same id the header read derives.
 #
 #   #1 register an OWNER signing identity (keys written THROUGH the firestore backend).
 #   #2 BOOT the REAL serve subprocess on the PUBLIC surface (HEIMDALL_PUBLIC_SURFACE=1) under
-#      firestore.
+#      firestore (HEIMDALL_DEFAULT_TEAM_SECRET pinned -> the owner's default team).
 #   #3 a SIGNED beat (POST /presence with the {nonce, ts} the public surface's replay gate
-#      requires) seeds the dev — recorded under the verified haid.
-#   #4 the UNSIGNED GET /roster-public?project=<p> returns the dev (handle/verdict/file/age) —
-#      no signature, 200, CORS header set, the dev present. [CARDINAL]
-#   #5 NO SECRET / NO HAID in the unsigned body (a secret-looking field was scrubbed at write).
-#   #6 a missing project -> 400.
-#   #7 an OPTIONS /roster-public preflight -> 204 + Access-Control-Allow-Origin:*.
+#      requires) seeds the dev — recorded under the verified haid, in the default team partition.
+#   #4 GET /roster-team?project=<p> + X-Heimdall-Team-Secret returns the dev (full view incl.
+#      haid), 200, CORS set; NO header -> 403. [CARDINAL]
+#   #5 NO raw secret in the body (team_secret + a secret-looking field both absent; haid IS
+#      present — the member view exposes it by design).
+#   #6 a missing project (with the secret header) -> 400.
+#   #7 an OPTIONS /roster-team preflight -> 204 + CORS incl. Allow-Headers: X-Heimdall-Team-Secret.
 #   #8 a per-IP read flood -> 429 (limit set low via env for determinism).
-#   #9 BOUNDARY — an unsigned POST /dispatch (a gated route) -> 404 (the boundary holds), AND
-#      an unsigned POST /roster-public -> 404 (READ-ONLY — there is no public write seam).
+#   #9 BOUNDARY — an unsigned POST /dispatch (a gated route) -> 404 (the boundary holds), an
+#      unsigned POST /roster-team -> 404 (READ-ONLY), and the RETIRED GET /roster-public -> 403.
 #
 # DISCIPLINE (mirrors cp-presence-deployed / cp-enroll-deployed): isolated throwaway home +
 # EXTERNAL store dir; firestore via emulator if available, else the faithful in-process fake;
@@ -274,13 +278,20 @@ export HEIMDALL_STATE_BACKEND="firestore"
 export HEIMDALL_ROSTER_IP_LIMIT=5
 
 echo "============================================================"
-echo "DEPLOYED-SHAPE ROSTER-PUBLIC GATE (MODE=$MODE)"
+echo "DEPLOYED-SHAPE ROSTER-TEAM GATE (MODE=$MODE)"
 echo "  home=$HEIMDALL_HOME  root=$HEIMDALL_FIRESTORE_ROOT"
 echo "============================================================"
 echo
 
 PROJECT="acme/widget"
 SECRET_LIKE="AKIAIOSFODNN7EXAMPLE"   # fake secret pattern; MUST be scrubbed, never in the read.
+# The TEAM SECRET the browser presents in X-Heimdall-Team-Secret. We pin it as the deployment's
+# DEFAULT team secret so the owner (registered via the identity CLI, no explicit team binding)
+# resolves to team_id = derive(TEAM_SECRET) — the SAME id the header read derives — so a member's
+# beat and the browser's secret-header read address ONE partition. (>= 32 chars.)
+TEAM_SECRET="team-secret-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+export HEIMDALL_DEFAULT_TEAM_SECRET="$TEAM_SECRET"
+export PROJECT SECRET_LIKE TEAM_SECRET
 
 # A tiny status-only HTTP probe (browser-shaped: NO signing headers). Prints "STATUS".
 httpstat(){ "$PY" - "$@" <<'PY'
@@ -334,11 +345,11 @@ fi
 
 # ──────────────────────────────────────────────────────────────────────────────
 # #3 a SIGNED beat seeds the dev (POST /presence with the {nonce, ts} the public surface's
-#    replay gate requires). Recorded under the verified haid.
+#    replay gate requires). Recorded under the verified haid, in the DEFAULT team partition.
 # ──────────────────────────────────────────────────────────────────────────────
 echo
 echo "#3 a signed beat seeds the dev (POST /presence, with nonce+ts for the public replay gate)"
-export CP_PORT CP_HAID="$OWNER_HAID" CP_PRIV="$OWNER_PRIV" PROJECT SECRET_LIKE
+export CP_PORT CP_HAID="$OWNER_HAID" CP_PRIV="$OWNER_PRIV"
 BEAT_STATUS="$("$PY" - <<'PYEOF' 2>"$EXT/beat.err"
 import json, os, secrets, sys, time, urllib.request, urllib.error
 sys.path.insert(0, os.environ["LIB"])
@@ -367,23 +378,22 @@ PYEOF
   || { bad "#3 the signed beat was not accepted (got '$BEAT_STATUS')"; cat "$EXT/beat.err" >&2; }
 
 # ──────────────────────────────────────────────────────────────────────────────
-# #4 the UNSIGNED GET /roster-public returns the dev (browser shape: NO signing headers).
-#    [CARDINAL]
+# #4 the SECRET-HEADER GET /roster-team returns the dev (full member view incl. haid). The
+#    browser presents X-Heimdall-Team-Secret over real HTTP; the server derives team_id and
+#    returns ONLY that partition. [CARDINAL]
 # ──────────────────────────────────────────────────────────────────────────────
 echo
-echo "#4 the UNSIGNED GET /roster-public?project returns the dev + CORS set [CARDINAL]"
+echo "#4 GET /roster-team + X-Heimdall-Team-Secret returns the dev (full view incl. haid) + CORS [CARDINAL]"
 export CP_URL
 R_OUT="$("$PY" - <<'PYEOF' 2>/dev/null
 import json, os, sys, urllib.parse, urllib.request, urllib.error
 base = os.environ["CP_URL"]; proj = os.environ["PROJECT"]
-url = base + "/roster-public?" + urllib.parse.urlencode({"project": proj})
-# NO X-Heimdall-* headers — exactly what a browser fetch() sends.
+url = base + "/roster-team?" + urllib.parse.urlencode({"project": proj})
 req = urllib.request.Request(url, method="GET")
+req.add_header("X-Heimdall-Team-Secret", os.environ["TEAM_SECRET"])
 try:
     with urllib.request.urlopen(req, timeout=8) as r:
-        raw = r.read().decode()
-        cors = r.headers.get("Access-Control-Allow-Origin")
-        print(json.dumps({"status": r.status, "cors": cors, "body": raw}))
+        print(json.dumps({"status": r.status, "cors": r.headers.get("Access-Control-Allow-Origin"), "body": r.read().decode()}))
 except urllib.error.HTTPError as e:
     print(json.dumps({"status": e.code, "cors": None, "body": e.read().decode()}))
 except Exception as e:  # noqa: BLE001
@@ -392,65 +402,83 @@ PYEOF
 )"
 R_STATUS="$(printf '%s' "$R_OUT" | "$PY" -c "import json,sys;print(json.load(sys.stdin)['status'])" 2>/dev/null)"
 R_CORS="$(printf '%s' "$R_OUT" | "$PY" -c "import json,sys;print(json.load(sys.stdin)['cors'])" 2>/dev/null)"
-R_HAS_DEV="$(printf '%s' "$R_OUT" | "$PY" -c "import json,sys;o=json.loads(json.load(sys.stdin)['body']);print(any(r.get('handle')=='rj' for r in o.get('online',[])))" 2>/dev/null)"
+R_HAS_DEV="$(printf '%s' "$R_OUT" | OWNER_HAID="$OWNER_HAID" "$PY" -c "import json,os,sys;o=json.loads(json.load(sys.stdin)['body']);print(any(r.get('haid')==os.environ['OWNER_HAID'] for r in o.get('online',[])))" 2>/dev/null)"
 if [ "$R_STATUS" = "200" ] && [ "$R_HAS_DEV" = "True" ]; then
-  ok "#4 the UNSIGNED read returns the seeded dev over real HTTP — no signature required (200) [CARDINAL]"
+  ok "#4 the secret-header read returns the seeded dev over real HTTP (full member view incl. haid) [CARDINAL]"
 else
-  bad "#4 the unsigned read did not return the dev (out=$R_OUT)"
+  bad "#4 the secret-header read did not return the dev (out=$R_OUT)"
 fi
 [ "$R_CORS" = "*" ] \
-  && ok "#4b Access-Control-Allow-Origin:* present on the unsigned GET (browser can read it)" \
-  || bad "#4b the CORS header was missing on the unsigned GET (got '$R_CORS')"
+  && ok "#4b Access-Control-Allow-Origin:* present on the secret-header GET (browser can read it)" \
+  || bad "#4b the CORS header was missing on the GET (got '$R_CORS')"
+
+# #4c NO secret header -> 403 (the capability is required; never an empty 200).
+N4="$(httpstat GET "$CP_URL/roster-team?project=$PROJECT")"
+[ "$N4" = "403" ] \
+  && ok "#4c GET /roster-team with NO secret header -> 403 (outsider sees nothing)" \
+  || bad "#4c a no-header team read did not 403 (got '$N4')"
 
 # ──────────────────────────────────────────────────────────────────────────────
-# #5 NO SECRET / NO HAID in the unsigned body.
+# #5 NO raw SECRET leaks into the body (haid IS present — the member view exposes it by design).
 # ──────────────────────────────────────────────────────────────────────────────
 echo
-echo "#5 NO secret + NO haid leaks into the unsigned body"
+echo "#5 NO secret leaks into the body (the team_secret + a secret-looking field are never echoed)"
 R_BODY="$(printf '%s' "$R_OUT" | "$PY" -c "import json,sys;print(json.load(sys.stdin)['body'])" 2>/dev/null)"
 if printf '%s' "$R_BODY" | grep -q "$SECRET_LIKE"; then
-  bad "#5 the secret-looking value reached the unsigned body (body=$R_BODY)"
+  bad "#5a the secret-looking value reached the body (body=$R_BODY)"
 else
-  ok "#5a the secret-looking field was scrubbed — NO secret in the unsigned body"
+  ok "#5a the secret-looking field was scrubbed — NO secret in the body"
 fi
-if printf '%s' "$R_BODY" | grep -q "haid"; then
-  bad "#5 the unsigned body leaked a haid (body=$R_BODY)"
+if printf '%s' "$R_BODY" | grep -qF "$TEAM_SECRET"; then
+  bad "#5b the presented team_secret was echoed into the body (body=$R_BODY)"
 else
-  ok "#5b NO 'haid' in the unsigned body — the identity is never exposed"
+  ok "#5b the team_secret is NEVER echoed in the body (no-secret-by-construction)"
 fi
 
 # ──────────────────────────────────────────────────────────────────────────────
-# #6 a missing project -> 400.
+# #6 a missing project (WITH the secret header) -> 400.
 # ──────────────────────────────────────────────────────────────────────────────
 echo
-echo "#6 a missing project -> 400"
-M6="$(httpstat GET "$CP_URL/roster-public")"
+echo "#6 a missing project (with the secret header) -> 400"
+M6="$("$PY" - <<'PYEOF' 2>/dev/null
+import os, sys, urllib.request, urllib.error
+req = urllib.request.Request(os.environ["CP_URL"] + "/roster-team", method="GET")
+req.add_header("X-Heimdall-Team-Secret", os.environ["TEAM_SECRET"])
+try:
+    print(urllib.request.urlopen(req, timeout=6).status)
+except urllib.error.HTTPError as e:
+    print(e.code)
+except Exception:
+    print(0)
+PYEOF
+)"
 [ "$M6" = "400" ] \
-  && ok "#6 GET /roster-public with no project -> 400" \
+  && ok "#6 GET /roster-team with a secret header but no project -> 400" \
   || bad "#6 a missing project did not 400 (got '$M6')"
 
 # ──────────────────────────────────────────────────────────────────────────────
-# #7 an OPTIONS preflight -> 204 + CORS.
+# #7 an OPTIONS preflight -> 204 + CORS incl. Allow-Headers: X-Heimdall-Team-Secret.
 # ──────────────────────────────────────────────────────────────────────────────
 echo
-echo "#7 an OPTIONS /roster-public preflight -> 204 + CORS"
+echo "#7 an OPTIONS /roster-team preflight -> 204 + CORS incl. Allow-Headers"
 P7="$("$PY" - <<'PYEOF' 2>/dev/null
 import os, sys, urllib.request, urllib.error
 base = os.environ["CP_URL"]
-req = urllib.request.Request(base + "/roster-public", method="OPTIONS")
+req = urllib.request.Request(base + "/roster-team", method="OPTIONS")
 try:
     with urllib.request.urlopen(req, timeout=6) as r:
-        print("%s|%s" % (r.status, r.headers.get("Access-Control-Allow-Origin")))
+        print("%s|%s|%s" % (r.status, r.headers.get("Access-Control-Allow-Origin"), r.headers.get("Access-Control-Allow-Headers")))
 except urllib.error.HTTPError as e:
-    print("%s|%s" % (e.code, e.headers.get("Access-Control-Allow-Origin")))
+    print("%s|%s|%s" % (e.code, e.headers.get("Access-Control-Allow-Origin"), e.headers.get("Access-Control-Allow-Headers")))
 except Exception as e:  # noqa: BLE001
-    print("ERR:%s|" % type(e).__name__)
+    print("ERR:%s||" % type(e).__name__)
 PYEOF
 )"
-if [ "${P7%%|*}" = "204" ] && [ "${P7##*|}" = "*" ]; then
-  ok "#7 OPTIONS /roster-public -> 204 + Access-Control-Allow-Origin:* (preflight passes)"
+P7_STATUS="${P7%%|*}"; P7_REST="${P7#*|}"; P7_ORIGIN="${P7_REST%%|*}"; P7_AH="${P7_REST#*|}"
+if [ "$P7_STATUS" = "204" ] && [ "$P7_ORIGIN" = "*" ] && printf '%s' "$P7_AH" | grep -q "X-Heimdall-Team-Secret"; then
+  ok "#7 OPTIONS /roster-team -> 204 + Allow-Origin:* + Allow-Headers carries X-Heimdall-Team-Secret"
 else
-  bad "#7 the preflight did not return 204+CORS (got '$P7')"
+  bad "#7 the preflight did not return 204+CORS+Allow-Headers (got '$P7')"
 fi
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -460,26 +488,42 @@ echo
 echo "#8 a per-IP read flood -> 429 (limit=5)"
 HIT429=0
 for i in $(seq 1 20); do
-  c="$(httpstat GET "$CP_URL/roster-public?project=$PROJECT")"
+  c="$("$PY" - <<'PYEOF' 2>/dev/null
+import os, sys, urllib.parse, urllib.request, urllib.error
+url = os.environ["CP_URL"] + "/roster-team?" + urllib.parse.urlencode({"project": os.environ["PROJECT"]})
+req = urllib.request.Request(url, method="GET")
+req.add_header("X-Heimdall-Team-Secret", os.environ["TEAM_SECRET"])
+try:
+    print(urllib.request.urlopen(req, timeout=6).status)
+except urllib.error.HTTPError as e:
+    print(e.code)
+except Exception:
+    print(0)
+PYEOF
+)"
   [ "$c" = "429" ] && { HIT429=1; break; }
 done
 [ "$HIT429" = "1" ] \
   && ok "#8 the per-IP read flood trips 429 (the roster_read gate is wired over the wire)" \
-  || bad "#8 no 429 under 20 rapid unsigned reads at limit=5 (rate-limit not wired?)"
+  || bad "#8 no 429 under 20 rapid reads at limit=5 (rate-limit not wired?)"
 
 # ──────────────────────────────────────────────────────────────────────────────
-# #9 BOUNDARY — a gated route 404s; POST /roster-public 404s (READ-ONLY, no write seam).
+# #9 BOUNDARY — a gated route 404s; POST /roster-team 404s; the RETIRED /roster-public -> 403.
 # ──────────────────────────────────────────────────────────────────────────────
 echo
-echo "#9 boundary: a gated route 404s + POST /roster-public 404s (read-only)"
+echo "#9 boundary: gated route 404 + POST /roster-team 404 (read-only) + /roster-public retired 403"
 G9="$(httpstat POST "$CP_URL/dispatch" '{}')"
 [ "$G9" = "404" ] \
   && ok "#9a an unsigned POST /dispatch (gated) -> 404 on the public surface (the boundary holds)" \
   || bad "#9a a gated route did not 404 (got '$G9' — the boundary leaked)"
-W9="$(httpstat POST "$CP_URL/roster-public" '{"project":"acme/widget","handle":"evil"}')"
+W9="$(httpstat POST "$CP_URL/roster-team" '{"project":"acme/widget","handle":"evil"}')"
 [ "$W9" = "404" ] \
-  && ok "#9b an unsigned POST /roster-public -> 404 — READ-ONLY, there is no public write seam" \
-  || bad "#9b POST /roster-public did not 404 (got '$W9' — a write seam leaked)"
+  && ok "#9b an unsigned POST /roster-team -> 404 — READ-ONLY, there is no public write seam" \
+  || bad "#9b POST /roster-team did not 404 (got '$W9' — a write seam leaked)"
+RP9="$(httpstat GET "$CP_URL/roster-public?project=$PROJECT")"
+[ "$RP9" = "403" ] \
+  && ok "#9c the RETIRED GET /roster-public -> 403 over real HTTP (the old fully-public leak is closed)" \
+  || bad "#9c /roster-public did not 403 (got '$RP9' — the old public roster leak is NOT closed)"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # FOOTER — reap the serve subprocess; the gate verdict.
@@ -501,7 +545,7 @@ fi
 
 echo
 echo "============================================================"
-printf "cp-roster-public-deployed (%s): %d passed, %d failed\n" "$MODE" "$PASS" "$FAIL"
+printf "cp-roster-team-deployed (%s): %d passed, %d failed\n" "$MODE" "$PASS" "$FAIL"
 echo "============================================================"
 [ "$FAIL" -eq 0 ] || exit 1
 exit 0
