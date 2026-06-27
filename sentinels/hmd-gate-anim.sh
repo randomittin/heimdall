@@ -51,22 +51,25 @@ fi
 printf '\n'
 case "$VERDICT" in
   scan|deny|pass)
-    # 1) scanning pulse (amber, eyes blinking)
-    for fr in '245;158;11' '' '245;158;11' '120;80;6'; do
+    # 1) scanning track: the eyes narrow/track via an amber brightness pulse —
+    #    a bright look, a steady watch, a narrowed squint. EVERY frame is a lit,
+    #    visible amber eye (never blank/dark), so a still is never eyeless.
+    for fr in '245;158;11' '252;205;110' '245;158;11' '200;120;20'; do
       face "$fr"; printf '  %b\n' "${AM}▸ scanning ${GATE}…${X}"; up; sleep 0.14
     done ;;
 esac
 case "$VERDICT" in
   deny)
-    # 2) the flash: wide red eyes, three quick beats
-    for fr in '239;68;68' '90;10;10' '239;68;68'; do
+    # 2) the flash: WIDE red eyes blow open — three quick beats, every frame a
+    #    bright red eye (never a dark/eyeless beat), the alarm IS the eyes.
+    for fr in '239;68;68' '255;130;130' '239;68;68'; do
       face "$fr"; printf '  %b\n' "${RD}${B}✗ BIFRÖST CLOSED${X}"; up; sleep 0.10
     done
     face '239;68;68'; final_caption ;;
   pass)
-    # 2) settle to green + a sparkle beat
+    # 2) settle to green, then a bright SPARKLE in the eyes (pure white) and back
     face '34;197;94'; printf '  %b\n' "${GR}…${X}"; up; sleep 0.18
-    face '240;248;255'; printf '  %b\n' "${GR}✦${X}"; up; sleep 0.12
+    face '255;255;255'; printf '  %b\n' "${GR}✦${X}"; up; sleep 0.12
     face '34;197;94'; final_caption ;;
   scan)
     face '245;158;11'; final_caption ;;
