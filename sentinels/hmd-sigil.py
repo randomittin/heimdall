@@ -15,10 +15,11 @@ Two ways a grid is born — a HYBRID that always yields a clean, legible face:
   - CURATED   : 4 hand-authored mockup identities (rj/nadia/arjun/priya) ship
                 their exact grids + hue, so those seeds match the design 1:1.
   - GENERATED : every other seed (real HAIDs are arbitrary) is built on a fixed
-                watchman TEMPLATE — crown / helm / brow / dark visor / cheeks /
-                shoulders / base. The hash varies only TEXTURE within the
-                template's lit bands, mirrored about col 4. No free bit placement
-                -> a face, never a blob.
+                guardian-sprite TEMPLATE — domed helm / framed visor / armed torso
+                / two legs. The fixed cells carve the SAME little sentinel for every
+                seed; the hash only flips a few TEXTURE cells that EXTEND the build
+                (crest, ear-guards, arms, hip flare, stance), mirrored about col 4.
+                No free bit placement -> a recognizable creature, never a blob.
 
 Both paths then get the universal watchman finish: a carved-dark visor band and
 FULL-CELL white square eyes (cols 2 & 6 punched across rows 2+3 = one whole text
@@ -54,19 +55,25 @@ CURATED_HUES = {
 # terminal never shows an off-brand body color the mockup never uses.
 GEN_HUES = [(45, 212, 191), (245, 158, 11), (167, 139, 250), (244, 114, 182)]
 
-# watchman TEMPLATE — half-grid (cols 0..4, col 4 = mirror axis), 8 rows. codes:
-#   '1' body (always lit)   '.' off (always dark)   '~' texture (hash decides, low density)
+# guardian-sprite TEMPLATE — half-grid (cols 0..4, col 4 = mirror axis), 8 rows.
+# codes: '1' body (always lit)   '.' off (always dark)   '~' texture (hash decides).
+# The fixed '1'/'.' cells carve a recognizable little SENTINEL/INVADER silhouette —
+# domed helm, framed visor, an armed torso, two legs — so EVERY seed is the same
+# creature, never a random blob. Each '~' only ever EXTENDS an adjacent solid run
+# (a wider crest, ear-guard tips, arms out, a hip flare, a wider stance) so a texture
+# bit varies the guardian's build/livery per seed WITHOUT ever leaving an isolated
+# dot. 5 texture cells -> 32 silhouettes x 4 identity hues = 128 distinct sprites.
 # eye columns (full cols 2 & 6) are force-punched after build; rows 2/3 here only
 # reserve clear negative space — the punch writes the real eyes.
 TEMPLATE = [
-    "..~11",  # row0 crown      — center helm cap, textured shoulder
-    ".11..",  # row1 helm       — ear-guards
-    ".1.~1",  # row2 brow       — brow band; eye col (2) kept clear -> punched
-    ".....",  # row3 visor      — all dark; eyes punched at cols 2 & 6
-    "1..1.",  # row4 cheek      — jaw + cheekbone; eye col clear (space under eyes)
-    "...1.",  # row5 shoulders  — body rising to center
-    "1..~.",  # row6 torso      — narrow body sides
-    ".1..1",  # row7 base       — footing
+    "..~11",  # row0 crown    — domed helm cap; ~col2 = crest / wider crown (3 -> 5 wide)
+    "~1111",  # row1 helm      — full helm dome; ~col0 = ear-guard tips (7 -> 9 wide)
+    "1...1",  # row2 brow      — helm edges frame the eyes; eye col (2) clear -> punched
+    ".....",  # row3 visor     — all dark; eyes punched at cols 2 & 6
+    "~.111",  # row4 shoulders — chest plate; ~col0 = pauldrons / arms out (5 -> 7 wide)
+    ".1.11",  # row5 torso     — body core with tucked arms (fixed solid, never dotty)
+    "..~11",  # row6 hips      — lower torso; ~col2 = belt / hip flare (3 -> 5 wide)
+    ".11~.",  # row7 legs      — two legs; ~col3 = wider planted stance (narrow -> wide)
 ]
 
 EYE = (240, 248, 255)   # bright eye glint (aliceblue)
