@@ -377,6 +377,113 @@ PY
   printf 'skipped'
 }
 
+# ── Per-repo TEAM secret (the multi-tenant team-invite path) ─────────────────
+#
+# A team = a high-entropy SECRET scoped to a repo; presence is visible ONLY to
+# holders of that secret (docs/specs/2026-06-27-multi-tenant-teams.md §6). The
+# team-invite one-liner is
+#     curl -fsSL <install.sh> | HEIMDALL_TEAM_SECRET='<secret>' bash
+# so a teammate who pastes it lands in the INVITER's team instead of falling
+# through to client auto-solo (their OWN team). This consumes HEIMDALL_TEAM_SECRET
+# from the install env and writes it to the JOINING dev's PER-REPO store
+#     <repo>/.heimdall/team.json   { "team_secret": <s>, "created": <epoch> }   0600
+# NOT the global ~/.heimdall/cp-endpoint.json — the CP URL is global, the team
+# secret is per-repo (a dev may be on different teams in different repos), so it
+# sits next to the per-repo identity.json. Mirrors bin/heimdall-team's writer
+# byte-for-byte (0600 file, {team_secret,created} shape, secret crosses to python
+# via the ENV, never argv).
+#
+# SECRET HYGIENE: the secret is written ONLY to team.json (0600); it crosses to
+# python via the ENVIRONMENT, never argv (argv shows in `ps`); it is NEVER echoed,
+# logged, or committed (.gitignore). The store is the git toplevel of the
+# invocation CWD (install.sh never cd's), else the CWD; HEIMDALL_TEAM_DIR overrides
+# the dir wholesale (tests + non-git trees) — same convention as bin/heimdall-team.
+#
+# IDEMPOTENT. No secret supplied → clean skip (the dev gets client auto-solo),
+# touch NOTHING. A secret < 32 chars → reject (a weak hand-typed secret could
+# collide into another team). An already-configured team.json with the SAME secret
+# → nothing written; a DIFFERENT secret → the install-supplied secret WINS (so the
+# invite takes precedence over an auto-solo team a prior presence beat minted).
+# Prints ONE state word:
+#   configured  — wrote/updated team.json (presence is scoped to this team)
+#   current     — already configured with this exact secret; nothing written
+#   absent      — no secret supplied; nothing touched (auto-solo handles presence)
+#   weak        — secret shorter than the 32-char minimum; nothing written
+#   skipped     — python3 unavailable for a merge and not a fresh write, or IO error
+ensure_team_secret() {
+  local secret="$1" force="${2:-}"
+  # Nothing provided → clean skip (auto-solo handles presence). Touch NOTHING.
+  [ -n "$secret" ] || { printf 'absent'; return 0; }
+  # A weak/hand-typed secret could collide into another team — reject below MIN.
+  if [ "${#secret}" -lt 32 ]; then printf 'weak'; return 0; fi
+  # Per-repo store (mirrors bin/heimdall-team): git toplevel of the invocation
+  # CWD, else the CWD; HEIMDALL_TEAM_DIR overrides wholesale (tests/non-git trees).
+  local team_dir team_file
+  if [ -n "${HEIMDALL_TEAM_DIR:-}" ]; then
+    team_dir="$HEIMDALL_TEAM_DIR"
+  else
+    team_dir="$(git rev-parse --show-toplevel 2>/dev/null || pwd)/.heimdall"
+  fi
+  team_file="$team_dir/team.json"
+  mkdir -p "$team_dir" 2>/dev/null || { printf 'skipped'; return 0; }
+  chmod 0700 "$team_dir" 2>/dev/null || true
+  if command -v python3 >/dev/null 2>&1; then
+    HMD_TEAM_FILE="$team_file" HMD_TEAM_SEC="$secret" HMD_TEAM_FORCE="$force" \
+      python3 - <<'PY' 2>/dev/null || { printf 'skipped'; return 0; }
+import json, os, sys, time, tempfile
+path  = os.environ["HMD_TEAM_FILE"]
+sec   = os.environ["HMD_TEAM_SEC"]
+force = os.environ.get("HMD_TEAM_FORCE", "")
+try:
+    with open(path) as fh:
+        data = json.load(fh)
+    if not isinstance(data, dict):
+        data = {}
+except Exception:
+    data = {}
+old = data.get("team_secret", "")
+# Same secret already configured → nothing to do (unless forced).
+if old == sec and not force:
+    print("current"); sys.exit(0)
+# A new/different secret stamps a fresh 'created'; a forced same-secret rewrite
+# preserves the existing epoch.
+created = data.get("created")
+if old != sec or not isinstance(created, (int, float)):
+    created = int(time.time())
+out = json.dumps({"team_secret": sec, "created": int(created)}) + "\n"
+d = os.path.dirname(path) or "."
+fd, tmp = tempfile.mkstemp(dir=d, prefix=".team.", suffix=".tmp")
+try:
+    with os.fdopen(fd, "w") as fh:
+        fh.write(out)
+    os.chmod(tmp, 0o600)            # secret -> owner-only BEFORE it lands
+    os.replace(tmp, path)
+except Exception:
+    try: os.unlink(tmp)
+    except OSError: pass
+    print("skipped"); sys.exit(0)
+print("configured")
+PY
+    return 0
+  fi
+  # python3 absent (rare — telemetry+statusline both need it): write a FRESH 0600
+  # file only when none exists (an idempotency/merge check needs the JSON parser);
+  # else skip rather than risk clobbering. The secret reaches the file via a printf
+  # BUILTIN (no child process), so it never crosses any argv.
+  if [ ! -f "$team_file" ]; then
+    local xs tmp now
+    xs="$(printf 'X%.0s' 1 2 3 4 5 6)"
+    tmp="$(mktemp "$team_dir/.team.$xs" 2>/dev/null)" || { printf 'skipped'; return 0; }
+    now="$(date +%s 2>/dev/null || echo 0)"
+    if printf '{"team_secret": "%s", "created": %s}\n' "$secret" "$now" > "$tmp" 2>/dev/null \
+       && chmod 0600 "$tmp" 2>/dev/null && mv "$tmp" "$team_file" 2>/dev/null; then
+      printf 'configured'; return 0
+    fi
+    rm -f "$tmp" 2>/dev/null || true
+  fi
+  printf 'skipped'
+}
+
 # ── Install-step telemetry (dossier §3 + §8) ────────────────────────────────
 #
 # install.sh's own step — the PATH export — emits started→succeeded|failed +
@@ -827,6 +934,27 @@ main() {
       ;;
     *)
       step_ok "Configuring control-plane endpoint" "skipped (needs python3)" ;;
+  esac
+
+  # Step: join a TEAM if a team-invite secret was supplied. A teammate who pastes
+  #   curl -fsSL <install.sh> | HEIMDALL_TEAM_SECRET='<secret>' bash
+  # must land in the INVITER's team — not fall through to client auto-solo (their
+  # OWN team), which silently breaks "teammates join the same team". The secret is
+  # consumed from the install env ONLY, written 0600 to the joining dev's per-repo
+  # <repo>/.heimdall/team.json, and NEVER echoed/logged/argv'd/committed. No env →
+  # clean skip (the dev gets auto-solo); OPTIONAL/graceful — a skip or weak/failed
+  # write never aborts the install. force re-stamps an existing same-secret file.
+  local TEAM_SEC="${HEIMDALL_TEAM_SECRET:-}"
+  local TEAM_FORCE=""
+  [ -n "${HEIMDALL_FORCE:-}" ] && TEAM_FORCE=1
+  step_begin "Joining team"
+  local TEAM_STATE; TEAM_STATE="$(ensure_team_secret "$TEAM_SEC" "$TEAM_FORCE")"
+  case "$TEAM_STATE" in
+    configured) step_ok "Joining team" "presence scoped to your team" ;;
+    current)    step_ok "Joining team" "already joined" ;;
+    absent)     step_ok "Joining team" "solo (no invite)" ;;
+    weak)       step_ok "Joining team" "skipped (secret too short)" ;;
+    *)          step_ok "Joining team" "skipped" ;;
   esac
 
   # Step: verify gates — N is the RUNTIME gate count, never hardcoded.

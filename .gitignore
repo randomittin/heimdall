@@ -66,12 +66,16 @@ docs/superpowers/plans/
 /cp-endpoint.json
 /pki/
 /identity.json
+/team.json
 /*.seed
 # Belt-and-suspenders for a dev who creates them under an in-repo .heimdall/ (already
 # covered by `.heimdall/*`, named here so an un-ignore exception can never leak them).
+# team.json is the per-repo TEAM SECRET install.sh writes for the team-invite path
+# (HEIMDALL_TEAM_SECRET) — a bearer capability; it must never be committed.
 .heimdall/cp-endpoint.json
 .heimdall/pki/
 .heimdall/identity.json
+.heimdall/team.json
 .heimdall/*.seed
 
 # designmatch v2 runtime ledger + quarantine (the regen-log.json hash-log and the
