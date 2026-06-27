@@ -1,7 +1,7 @@
 {
   "//": "EXAMPLE control-plane endpoint config for SERVER-SYNCED TEAM PRESENCE. The REAL file lives at $HOME/.heimdall/cp-endpoint.json (mode 0600, OUT of any repo) and is written by install.sh from HEIMDALL_CP_URL + HEIMDALL_ENROLL_TOKEN (or an interactive prompt). bin/heimdall-presence auto-resolves the CP url + enroll token from it so a dev needs ZERO manual exports; the per-dev Ed25519 signing seed is generated+enrolled+persisted under $HOME/.heimdall/pki/<haid>.seed (0600) on first session. This committed example carries STRUCTURE ONLY.",
   "//url": "The control-plane base URL (https://heimdall-control-plane-<hash>.run.app). NOT a secret — but team-specific, so it is not committed; set it via HEIMDALL_CP_URL at install or paste it when prompted.",
-  "url": "https://heimdall-control-plane-<hash>.run.app",
+  "url": "https://heimdall-cp-public-eqfrs7sfuq-uc.a.run.app",
   "//enroll_token": "The team bootstrap/enroll token the client presents ONCE to register its haid->pubkey on the server. This IS a secret — NEVER commit a real value (the gitleaks gate fires if one is staged). Set it via HEIMDALL_ENROLL_TOKEN at install or paste it (no echo) when prompted.",
   "enroll_token": "<team-enroll-token>"
 }

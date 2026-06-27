@@ -22,7 +22,9 @@
 #                   stripped, .git dropped, lowercased — so every CLONE of one remote shares
 #                   ONE project id) > $HMD_PROJECT > the repo dir name.
 #   server URL    : --url > $HEIMDALL_CP_URL > $BASE_URL > local config
-#                   ${HOME}/.heimdall/cp-endpoint.json `.url` > none (offline).
+#                   ${HOME}/.heimdall/cp-endpoint.json `.url` > the SHIPPED DEFAULT
+#                   (DEFAULT_CP_URL — the public surface, baked in since the URL is not a
+#                   secret, so a dev sets NOTHING for the URL; only the token is distributed).
 #   signing seed  : $HMD_PRESENCE_SEED (dev-scoped override, testing only) > persisted
 #                   ${HOME}/.heimdall/pki/<haid>.seed (mode 0600) > AUTO-BOOTSTRAP — keygen
 #                   (cp_auth), POST
@@ -138,6 +140,12 @@ fi
 
 [ -n "$URL" ] || URL="${HEIMDALL_CP_URL:-${BASE_URL:-}}"
 [ -n "$URL" ] || URL="$CFG_URL"
+# Shipped DEFAULT public-surface URL (lowest precedence — every source above overrides it).
+# The CP URL is NOT a secret (a public --allow-unauthenticated Cloud Run endpoint), so it is
+# baked in: a dev needs ZERO config for the URL; only the enroll TOKEN (a secret, never
+# committed) is distributed. Override per-team with --url / $HEIMDALL_CP_URL / the config.
+DEFAULT_CP_URL="https://heimdall-cp-public-eqfrs7sfuq-uc.a.run.app"
+[ -n "$URL" ] || URL="$DEFAULT_CP_URL"
 ENROLL_TOKEN="$CFG_TOKEN"   # the bootstrap enroll credential (config-only; never derived).
 SEED="${HMD_PRESENCE_SEED:-}"   # dev-scoped override only; NEVER the server's $HEIMDALL_CP_PKI_KEY
 [ -n "$HANDLE" ]  || HANDLE="${HMD_HANDLE:-}"
