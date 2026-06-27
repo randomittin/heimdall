@@ -404,6 +404,13 @@ def _build_handler_class(home, enforce_revocation):
                 # chokepoint ignores it (verify_identity reads only haid/signature/method/
                 # path/body), so lifting it here is inert for every authenticated route.
                 "enroll_token": self.headers.get("X-Heimdall-Enroll-Token"),
+                # The TEAM secret a caller may carry in a header — the bearer capability that
+                # scopes a team (cp_enroll derives team_id at enroll; cp_presence derives it for
+                # the browser /roster-team read). Kept in a HEADER (not the URL query) so it is
+                # never written to access logs / Referer / history (Risk 2). A normal signed
+                # request never sets it; the §3 chokepoint ignores it, so lifting it is inert
+                # for every authenticated route.
+                "team_secret": self.headers.get("X-Heimdall-Team-Secret"),
                 # The rate-limit IP source for the PUBLIC surface (cp_publicsurface.client_ip
                 # owns the policy of choosing between them). x_forwarded_for is the raw header
                 # — on Cloud Run the GFE appends the caller, FIRST hop is the original client;

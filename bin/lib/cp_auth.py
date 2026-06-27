@@ -45,6 +45,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import os
 import subprocess
 import sys
@@ -445,15 +446,87 @@ def _store_keys(reg, home=None):
     return _backend(home).put_record(_KEYS_REL, reg)
 
 
-def register_key(haid, public_b64, *, owner=False, home=None):
+# ── TEAM IDENTITY (multi-tenant team presence — the partition handle) ───────────
+#
+# A TEAM is a self-generated high-entropy `team_secret` scoped to a repo. Its NON-SECRET
+# handle is team_id = a one-way hash of the secret. ALL presence is partitioned by team_id;
+# the registry binds each member's HAID to their team_id. The raw secret is NEVER stored —
+# it is consumed once to COMPUTE the key and discarded, so a server/DB compromise leaks
+# team_ids (partition handles) but never the secrets. There is NO secret comparison anywhere
+# on the server (the "verifier" doubles as the partition key) — no stored secret, no oracle.
+#
+# THE DERIVATION CONTRACT (client + site + server MUST agree byte-for-byte):
+#   team_id = sha256(b"heimdall-team\x00" + team_secret.encode("utf-8")).hexdigest()[:32]
+# The domain-separation prefix "heimdall-team\0" stops this hash aliasing any other
+# sha256(secret) use in the system; the 32-hex (128-bit) truncation matches the codebase's
+# _HASH_HEX and is filesystem-/Firestore-safe as a path segment (hex -> no "_", never the
+# "__" run FirestoreBackend reserves).
+
+# The domain-separation prefix (a NUL-terminated tag). MUST match the client + team.html.
+_TEAM_ID_PREFIX = b"heimdall-team\x00"
+
+# The team_id hex width (128 bits). Mirrors cp_ratelimit/cp_nonce _HASH_HEX = 32.
+_TEAM_ID_HEX = 32
+
+# A configured DEFAULT-TEAM secret (back-compat). When set, the single-tenant deploy becomes
+# one team whose secret is this value; absent it, the legacy HEIMDALL_ENROLL_TOKEN is used as
+# the default-team secret (the live deploy keeps working as one default team — §migration).
+DEFAULT_TEAM_SECRET_ENV = "HEIMDALL_DEFAULT_TEAM_SECRET"
+
+# The legacy global bootstrap token (cp_enroll.ENROLL_TOKEN_ENV). Referenced by literal here
+# (cp_auth must not import cp_enroll — cp_enroll imports cp_auth) so the default team derives
+# from the SAME secret the live single-tenant deploy already configures.
+_LEGACY_ENROLL_TOKEN_ENV = "HEIMDALL_ENROLL_TOKEN"
+
+
+def derive_team_id(team_secret):
+    """The NON-SECRET partition handle for a team_secret:
+        sha256(b"heimdall-team\\x00" + team_secret).hexdigest()[:32].
+    Pure — no IO, no store. Returns None for an empty/None secret (no team). The raw secret
+    is hashed here and never returned/stored/logged — the caller discards it after this call.
+    The client (bin/heimdall-presence) and the web (team.html) compute the IDENTICAL value,
+    so a member writes/reads exactly their own partition."""
+    if not team_secret:
+        return None
+    raw = _TEAM_ID_PREFIX + str(team_secret).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()[:_TEAM_ID_HEX]
+
+
+def default_team_id():
+    """The reserved DEFAULT team_id for back-compat (§migration): derive_team_id of
+    HEIMDALL_DEFAULT_TEAM_SECRET when set, else of the legacy HEIMDALL_ENROLL_TOKEN. None
+    when NEITHER is configured (no default team — enroll then fails closed unless an explicit
+    team_secret is presented). Read fresh from the env each call so a deploy can flip it
+    without a code change. A registry binding with no team_id field reads as THIS id, so the
+    existing single-tenant deploy keeps working as one default team."""
+    secret = os.environ.get(DEFAULT_TEAM_SECRET_ENV)
+    if secret and secret.strip():
+        return derive_team_id(secret.strip())
+    tok = os.environ.get(_LEGACY_ENROLL_TOKEN_ENV)
+    if tok and tok.strip():
+        return derive_team_id(tok.strip())
+    return None
+
+
+def register_key(haid, public_b64, *, owner=False, team_id=None, project=None, home=None):
     """Bind an Ed25519 public key to a HAID (the `register` step, §3). Upserts the
-    {haid -> {pubkey, owner}} entry. Returns True on a stored write. The instance
-    generated the keypair and sends ONLY public_b64 — the private seed never leaves
-    the instance. `owner=True` flags a distinguished gate-override identity (§7)."""
+    {haid -> {pubkey, owner, team_id?, project?}} entry. Returns True on a stored write. The
+    instance generated the keypair and sends ONLY public_b64 — the private seed never leaves
+    the instance. `owner=True` flags a distinguished gate-override identity (§7).
+
+    `team_id`/`project` are ADDITIVE (multi-tenant teams): when supplied they are stored as
+    the member's team partition handle + active repo; when None they are omitted (a binding
+    with no team_id reads as default_team_id() — additive, non-destructive, no migration). The
+    raw team_secret is NEVER passed here — only its derived, non-secret team_id."""
     if not haid or not public_b64:
         return False
     reg = _load_keys(home)
-    reg["keys"][haid] = {"pubkey": public_b64, "owner": bool(owner)}
+    entry = {"pubkey": public_b64, "owner": bool(owner)}
+    if team_id is not None:
+        entry["team_id"] = team_id
+    if project is not None:
+        entry["project"] = project
+    reg["keys"][haid] = entry
     return _store_keys(reg, home)
 
 
@@ -463,6 +536,49 @@ def registered_pubkey(haid, home=None):
     if isinstance(entry, dict):
         return entry.get("pubkey")
     return None
+
+
+def registered_team_field(haid, home=None):
+    """The RAW team_id field on a HAID's binding, or None when the binding lacks it (or the
+    haid is unregistered). Unlike registered_team(), this does NOT fall back to the default
+    team — it is the literal stored value, used to detect an idempotent vs a team-switch
+    re-enroll (cp_enroll)."""
+    entry = _load_keys(home)["keys"].get(haid)
+    if isinstance(entry, dict):
+        return entry.get("team_id")
+    return None
+
+
+def registered_team(haid, home=None):
+    """The team_id a HAID belongs to — the load-bearing isolation key for presence (§4/§5).
+    Resolution: the binding's team_id field when present, else default_team_id() (a binding
+    lacking team_id, OR an unregistered haid, reads as the default team — back-compat). NEVER
+    taken from a request body; a beat/read scopes to THIS value, so a member can only ever
+    write/read their own team."""
+    tid = registered_team_field(haid, home=home)
+    if tid:
+        return tid
+    return default_team_id()
+
+
+def team_member_count(team_id, home=None):
+    """The number of registry bindings belonging to `team_id` (the per-team member cap input,
+    cp_enroll). Counts a binding's resolved team (its team_id field, else default_team_id), so
+    legacy no-team_id bindings count toward the default team exactly as they are read. Firestore-
+    safe (tolerant get_record-based registry read, never backend.path()). 0 for a never-seen
+    team (no members yet) — the net-new-team signal the team-create caps key on."""
+    keys = _load_keys(home).get("keys")
+    if not isinstance(keys, dict) or not team_id:
+        return 0
+    default = default_team_id()
+    n = 0
+    for entry in keys.values():
+        if not isinstance(entry, dict):
+            continue
+        tid = entry.get("team_id") or default
+        if tid == team_id:
+            n += 1
+    return n
 
 
 def is_owner(haid, home=None):

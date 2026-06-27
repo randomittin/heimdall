@@ -105,6 +105,32 @@ _OPEN_TRUTHY = {"1", "true", "yes", "on"}
 ENROLL_MAX_KEYS_ENV = "HEIMDALL_ENROLL_MAX_KEYS"
 _DEFAULT_MAX_KEYS = 1000
 
+# ── TEAM SECRET (multi-tenant team presence — the bootstrap capability) ─────────
+#
+# A team_secret is a high-entropy bearer capability scoping a team (a repo's roster). It both
+# AUTHORIZES the enroll AND SCOPES the team: the server derives team_id = cp_auth.derive_team_id
+# (one-way), binds haid -> team_id, and DISCARDS the raw secret (never at rest, never logged,
+# never echoed). The header path keeps the secret out of any body log.
+
+# The header the CALLER may carry the team secret in (the body field is the alternative).
+# cp_server lifts this header into request["team_secret"]; documented here as the wire name.
+TEAM_SECRET_HEADER = "X-Heimdall-Team-Secret"
+
+# The body field the CALLER may carry the team secret in (alternative to the header — the
+# POST-with-a-body /enroll shape is GFE-safe, so the body path works over real Cloud Run HTTP).
+TEAM_SECRET_BODY_FIELD = "team_secret"
+
+# MINIMUM accepted team_secret length (chars). 256-bit CSPRNG secrets are 43 base64url chars;
+# rejecting anything shorter than 32 stops a hand-typed weak secret colliding into another
+# team. A shorter secret -> team_secret_weak (422).
+TEAM_SECRET_MIN_LEN = 32
+
+# The PER-TEAM member cap (RJ ruling 4): a NET-NEW haid is refused once a team already holds
+# this many bindings -> team_full (429). Bounds how much one (possibly leaked) secret can bloat
+# the registry. Env-tunable; a typo/non-positive falls back to the default (never a 0 hard gate).
+TEAM_MAX_MEMBERS_ENV = "HEIMDALL_TEAM_MAX_MEMBERS"
+_DEFAULT_TEAM_MAX_MEMBERS = 100
+
 # An Ed25519 public key is exactly 32 raw bytes; a submitted pubkey must decode to this or it
 # cannot be a valid verification key and we refuse to store garbage.
 _ED25519_PUBKEY_BYTES = 32
@@ -158,6 +184,40 @@ def _registry_key_count(home=None):
     return len(keys) if isinstance(keys, dict) else 0
 
 
+def team_max_members():
+    """The PER-TEAM member cap (HEIMDALL_TEAM_MAX_MEMBERS), or _DEFAULT_TEAM_MAX_MEMBERS when
+    unset / malformed / non-positive (a typo must never silently become a 0/negative hard gate).
+    Bounds how many NET-NEW haids one (possibly leaked) team_secret can register into its team."""
+    raw = os.environ.get(TEAM_MAX_MEMBERS_ENV)
+    if raw is None:
+        return _DEFAULT_TEAM_MAX_MEMBERS
+    try:
+        val = int(raw)
+    except (TypeError, ValueError):
+        return _DEFAULT_TEAM_MAX_MEMBERS
+    return val if val > 0 else _DEFAULT_TEAM_MAX_MEMBERS
+
+
+def _resolve_team_id(team_secret):
+    """Resolve the team_id this enroll binds to, from the presented team_secret OR the
+    configured default team. Returns (team_id, reason):
+      • a too-short secret -> (None, "team_secret_weak").
+      • a valid secret     -> (derive_team_id(secret), None) — the raw secret is DISCARDED here.
+      • no secret + a configured default team -> (default_team_id(), None) — back-compat: the
+        single-tenant deploy enrolls every dev into one default team (§migration).
+      • no secret + NO default team -> (None, "team_required") — FAIL-CLOSED (never an
+        unpartitioned binding).
+    Pure of the registry; the raw secret never leaves this function."""
+    if team_secret:
+        if len(str(team_secret)) < TEAM_SECRET_MIN_LEN:
+            return (None, "team_secret_weak")
+        return (cp_auth.derive_team_id(team_secret), None)
+    default = cp_auth.default_team_id()
+    if default:
+        return (default, None)
+    return (None, "team_required")
+
+
 def _token_matches(provided):
     """Constant-time compare of a caller-presented token against the server secret. Returns
     False when EITHER the server secret is unset (fail-closed — checked by the caller before
@@ -183,34 +243,37 @@ def _valid_pubkey(pubkey):
     return len(raw) == _ED25519_PUBKEY_BYTES
 
 
-def enroll(haid, pubkey, *, provided_token, handle=None, home=None):
-    """THE testable self-enroll core. Token-gate, validate, and idempotently bind haid->pubkey
-    in the cp_auth registry. Returns a dict — {"ok": True, "haid": haid} on success, or
-    {"ok": False, "reason": <code>} on a refusal. NO secret is ever in the returned dict.
+def enroll(haid, pubkey, *, provided_token, team_secret=None, handle=None,
+           project=None, home=None):
+    """THE testable self-enroll core. Token-gate, validate, resolve the TEAM, and bind
+    haid -> {pubkey, owner:false, team_id, project} in the cp_auth registry. Returns a dict —
+    {"ok": True, "haid": haid, "team_id": <id>} on success, or {"ok": False, "reason": <code>}
+    on a refusal. NO secret (bootstrap token OR team_secret) is ever in the returned dict.
 
-    `handle` is accepted as optional client metadata (the dev's display name) for API/forward
-    compatibility; the registry binds haid->pubkey only (its schema is owned by cp_auth), so
-    handle is not persisted here — it is read and discarded, never echoed.
+    `team_secret` is the team bootstrap capability (header X-Heimdall-Team-Secret or body
+    field): the server derives team_id = cp_auth.derive_team_id(secret) and DISCARDS the raw
+    secret (never at rest, never echoed). An absent secret maps to the configured default team
+    (back-compat); no secret + no default team -> fail closed (team_required).
+
+    `handle` is accepted as optional client metadata (display name); the registry schema is
+    owned by cp_auth, so handle is read and discarded, never echoed. `project` (the dev's
+    normalized repo id) is persisted on the binding (additive).
 
     The gate order (each a hard stop, fail-closed first):
-      1-2. TOKEN GATE — enforced UNLESS open mode (enroll_open()) is enabled:
-         1. enroll_disabled  — the SERVER verifier secret is unset. We refuse EVERY enroll and
-            NEVER allow-all. The reason names the cloud profile so a deployed instance refused
-            for a missing secret is distinguishable from a bad token.
-         2. bad_enroll_token — the presented token is absent or does not match (constant-time).
-         In OPEN mode both are SKIPPED (tokenless onboarding); a configured+presented token is
-         still accepted (token mode is not broken), the gate is just not required. The registry
-         cap (6.5) + the rate limits (cp_publicsurface) are the load-bearing controls there.
+      1-2. TOKEN GATE — enforced UNLESS open mode (enroll_open()): enroll_disabled (no server
+         secret) / bad_enroll_token (presented token absent or mismatched, constant-time).
       3. malformed        — haid or pubkey is missing.
       4. invalid_pubkey   — pubkey is not base64 of a 32-byte Ed25519 key.
-      5. haid_pubkey_conflict — haid is already registered to a DIFFERENT pubkey (409): a
-         registered identity is never silently rebound, so neither a leaked token NOR an open
-         enroll can hijack an already-enrolled dev.
-      6. (idempotent) same haid + SAME pubkey -> ok without a rewrite (never hits the cap).
-      6.5. enroll_registry_full — a NET-NEW haid is refused once the registry already holds
-         enroll_max_keys() bindings. Bounds total registry GROWTH regardless of rate; only
-         net-new keys count (idempotent/conflict already returned above).
-      7. register the NEW binding through cp_auth.register_key (StateBackend seam, no path())."""
+      4.5. TEAM GATE — team_secret_weak (presented secret < TEAM_SECRET_MIN_LEN) / team_required
+         (no secret AND no default team configured -> never an unpartitioned binding).
+      5. haid_pubkey_conflict — haid already registered to a DIFFERENT pubkey (409): a stolen
+         secret can NEVER move someone else's enrolled HAID into the attacker's team.
+      6. SAME pubkey re-enroll — a key holder may move their OWN HAID between teams (they hold
+         the private key, so it is not a hijack): the team_id is UPDATED. An unchanged
+         team_id+project is idempotent (no rewrite). Never hits a cap.
+      6.5. CAPS (net-new haid only): team_full (the team already holds team_max_members()
+         bindings) then enroll_registry_full (the global registry-size ceiling).
+      7. register the binding through cp_auth.register_key (StateBackend seam, no path())."""
     # 1-2. THE TOKEN GATE — enforced UNLESS open mode is on. Open UNSET reproduces EXACTLY the
     #      historical fail-closed behavior (no regression); open ON makes enroll tokenless.
     if not enroll_open():
@@ -229,29 +292,49 @@ def enroll(haid, pubkey, *, provided_token, handle=None, home=None):
     if not _valid_pubkey(pubkey):
         return {"ok": False, "reason": "invalid_pubkey"}
 
-    # 5-6. Idempotency / conflict against the EXISTING binding (firestore-safe registry read).
+    # 4.5. THE TEAM GATE — resolve the team_id this binding belongs to (the raw secret is
+    #      consumed + discarded inside _resolve_team_id). A weak secret / no-team-and-no-default
+    #      is fail-closed; otherwise team_id is the partition handle stored on the binding.
+    team_id, team_reason = _resolve_team_id(team_secret)
+    if team_reason is not None:
+        return {"ok": False, "reason": team_reason}
+
+    # 5-6. Conflict / OWN-key team-switch against the EXISTING binding (firestore-safe read).
     existing = cp_auth.registered_pubkey(haid, home=home)
     if existing is not None:
-        if existing == pubkey:
-            # Same key re-enroll: a harmless re-run, already bound. No rewrite — and never
-            # blocked by the registry cap (an existing identity's re-enroll is always allowed).
-            return {"ok": True, "haid": haid}
-        # A DIFFERENT key for an already-registered haid — refuse (no silent rebind/hijack).
-        return {"ok": False, "reason": "haid_pubkey_conflict"}
+        if existing != pubkey:
+            # A DIFFERENT key for an already-registered haid — refuse (no rebind/hijack). A
+            # leaked team_secret can never move someone else's HAID into the attacker's team.
+            return {"ok": False, "reason": "haid_pubkey_conflict"}
+        # SAME key: the holder of the private key may move their OWN HAID between teams. If the
+        # team_id (and project) are unchanged this is an idempotent re-run (no rewrite); else we
+        # re-stamp the binding's team_id/project. Never blocked by a cap (not a net-new haid).
+        cur_entry = cp_auth._load_keys(home)["keys"].get(haid) or {}
+        cur_team = cur_entry.get("team_id")
+        cur_project = cur_entry.get("project")
+        eff_project = project if project is not None else cur_project
+        if cur_team == team_id and eff_project == cur_project:
+            return {"ok": True, "haid": haid, "team_id": team_id}
+        if not cp_auth.register_key(haid, pubkey, owner=False, team_id=team_id,
+                                    project=eff_project, home=home):
+            return {"ok": False, "reason": "registry_write_failed"}
+        return {"ok": True, "haid": haid, "team_id": team_id}
 
-    # 6.5. THE HARD REGISTRY-SIZE CAP. Only a NET-NEW haid reaches here (idempotent + conflict
-    #      already returned), so the cap NEVER blocks an existing identity's re-enroll — it bounds
-    #      total registry GROWTH so an open/leaked enroll surface cannot grow the registry past
-    #      enroll_max_keys(), regardless of rate or key/IP rotation.
+    # 6.5. CAPS — a NET-NEW haid only (idempotent/conflict/switch already returned above).
+    #      PER-TEAM first (bounds how much one secret can bloat its team), then the GLOBAL
+    #      registry ceiling (bounds total growth regardless of rate / key-IP rotation).
+    if cp_auth.team_member_count(team_id, home=home) >= team_max_members():
+        return {"ok": False, "reason": "team_full"}
     if _registry_key_count(home) >= enroll_max_keys():
         return {"ok": False, "reason": "enroll_registry_full"}
 
     # 7. Register the NEW binding. Enrolled devs are NOT owners (owner is the server identity,
     #    cp_auth.ensure_server_identity); a self-enroll — token OR open — never grants
     #    gate-override authority (owner=False is re-asserted here, unconditionally).
-    if not cp_auth.register_key(haid, pubkey, owner=False, home=home):
+    if not cp_auth.register_key(haid, pubkey, owner=False, team_id=team_id,
+                                project=project, home=home):
         return {"ok": False, "reason": "registry_write_failed"}
-    return {"ok": True, "haid": haid}
+    return {"ok": True, "haid": haid, "team_id": team_id}
 
 
 # The reason-code -> HTTP status map. Token/auth refusals are 401, a key conflict is 409, a
@@ -266,6 +349,9 @@ _STATUS_BY_REASON = {
     "malformed": 422,
     "invalid_pubkey": 422,
     "haid_pubkey_conflict": 409,
+    "team_secret_weak": 422,
+    "team_required": 422,
+    "team_full": 429,
     "enroll_registry_full": 429,
     "registry_write_failed": 500,
 }
@@ -307,23 +393,45 @@ def _presented_token(request, payload):
     return None
 
 
+def _presented_team_secret(request, payload):
+    """Resolve the caller-presented TEAM secret: the header (lifted by cp_server into
+    request["team_secret"]) wins, else the body field. Returns None when neither is present
+    (the core then maps to the default team or fails closed). NEVER logged/echoed — it is
+    hashed to team_id and discarded inside enroll()."""
+    if isinstance(request, dict):
+        header_sec = request.get("team_secret")
+        if header_sec:
+            return header_sec
+    if isinstance(payload, dict):
+        body_sec = payload.get(TEAM_SECRET_BODY_FIELD)
+        if body_sec:
+            return body_sec
+    return None
+
+
 def enroll_route(request, *, home=None):
     """POST /enroll — the PRE-AUTH self-enroll handler (served BEFORE the §3 chokepoint; the
     caller has no registered key to sign with yet). `request` is the cp_server request dict;
-    the body is JSON {haid, pubkey, handle?, enroll_token?} and the token may instead ride the
-    X-Heimdall-Enroll-Token header. Runs the token-gated enroll() core and maps its reason to
-    an HTTP status. The body is ONLY {ok, haid} on success / {ok:false, reason} on refusal —
-    never the server secret, never the PKI key. DATA only — dispatches nothing."""
+    the body is JSON {haid, pubkey, handle?, project?, enroll_token?, team_secret?} and the
+    bootstrap token / team secret may instead ride the X-Heimdall-Enroll-Token /
+    X-Heimdall-Team-Secret headers. Runs the gated enroll() core and maps its reason to an
+    HTTP status. The body is ONLY {ok, haid, team_id} on success / {ok:false, reason} on
+    refusal — never the server secret, the team secret, or the PKI key. DATA only — dispatches
+    nothing."""
     payload = _parse_body(request)
     result = enroll(
         payload.get("haid"),
         payload.get("pubkey"),
         provided_token=_presented_token(request, payload),
+        team_secret=_presented_team_secret(request, payload),
         handle=payload.get("handle"),
+        project=payload.get("project"),
         home=home,
     )
     if result.get("ok"):
-        return cp_server.Response(200, {"ok": True, "haid": result.get("haid")})
+        return cp_server.Response(
+            200, {"ok": True, "haid": result.get("haid"),
+                  "team_id": result.get("team_id")})
     reason = result.get("reason", "refused")
     status = _STATUS_BY_REASON.get(reason, 400)
     return cp_server.Response(status, {"ok": False, "reason": reason})
