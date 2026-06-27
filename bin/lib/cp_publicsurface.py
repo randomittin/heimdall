@@ -277,6 +277,23 @@ def _enroll_token(request, payload):
     return ""
 
 
+def _team_secret(request, payload):
+    """The caller-presented TEAM secret (for the per-team enroll bucket + the team-create caps):
+    the header (cp_server lifts it into request["team_secret"]) wins, else the body's team_secret
+    field, else None (no secret -> the configured default team, or nothing to scope). The raw
+    secret is NEVER stored/logged here — it is hashed to team_id by cp_auth.derive_team_id and
+    only that non-secret handle (re-hashed again by cp_ratelimit) ever touches the limiter."""
+    if isinstance(request, dict):
+        header_sec = request.get("team_secret")
+        if header_sec:
+            return str(header_sec)
+    if isinstance(payload, dict):
+        body_sec = payload.get("team_secret")
+        if body_sec:
+            return str(body_sec)
+    return None
+
+
 # ── the abuse gates (return None to allow, or (status, body) to refuse) ─────────────────
 #
 # Each gate returns None when the request may proceed, or a (status:int, body:dict) tuple
@@ -321,6 +338,40 @@ def check_enroll(request, *, home=None, now=None):
         # The deployment-wide ceiling. retry_after is one budget window (the conservative
         # back-off when the global budget is spent).
         return (429, _rate_limited_body("enroll_budget", _enroll_budget_window()))
+
+    # 4-5. TEAM-SCOPED gates (multi-tenant). The team_secret rides a header (cp_server lifts it
+    #      to request["team_secret"]) or the body; we derive the NON-SECRET team_id and key on
+    #      it — the raw secret never touches the limiter (team_id is already a hash, re-hashed by
+    #      cp_ratelimit before it is a key). No secret -> the configured default team (back-compat);
+    #      no secret AND no default -> enroll() fails team_required downstream, so there is nothing
+    #      to scope and we skip the team gates here.
+    secret = _team_secret(request, payload)
+    team_id = cp_auth.derive_team_id(secret) if secret else cp_auth.default_team_id()
+    if team_id:
+        # 4. PER-TEAM bucket — a single (leaked) team_secret cannot hammer /enroll even rotating
+        #    IPs (§3: re-key the per-token bucket on team_id, the durable partition handle).
+        ok, retry = limiter.allow(
+            "enroll_team", team_id, now=now,
+            limit=_enroll_team_limit(), window=_enroll_team_window())
+        if not ok:
+            return (429, _rate_limited_body("enroll_team", retry))
+        # 5. TEAM-CREATE caps (Risk 5b) — a NET-NEW team_id (no members/records yet) counts
+        #    against a per-IP create bucket AND a deployment-wide distinct-team ceiling, so an
+        #    attacker rotating fresh secrets cannot explode the registry/store. An EXISTING team
+        #    (>=1 member) is exempt — only team CREATION is capped (team_member_count is the
+        #    firestore-safe net-new signal). team_create_budget is a single global counter,
+        #    mirroring enroll_budget_ok.
+        if cp_auth.team_member_count(team_id, home=home) == 0:
+            ok, retry = limiter.allow(
+                "team_create_ip", ip, now=now,
+                limit=_team_create_ip_limit(), window=_team_create_ip_window())
+            if not ok:
+                return (429, _rate_limited_body("team_create_ip", retry))
+            ok, retry = limiter.allow(
+                "team_create_budget", "global", now=now,
+                limit=_team_create_budget_max(), window=_team_create_budget_window())
+            if not ok:
+                return (429, _rate_limited_body("team_create_budget", retry))
     return None
 
 
