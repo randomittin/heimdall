@@ -6,7 +6,7 @@ live as **two Cloud Run services from one image**:
 | Service | Posture | Surface | Runtime SA |
 | --- | --- | --- | --- |
 | `heimdall-control-plane` (**gated**) | `--no-allow-unauthenticated` | full surface (dispatch, jobs, approvals, owner, audit, scheduler, … **+** the public routes) | `heimdall-cp-run` — datastore + secrets + **`run.jobs.run`** |
-| `heimdall-cp-public` (**public**) | `--allow-unauthenticated` | **public routes only** — `POST /enroll, POST /presence, GET /roster, GET /healthz, GET /readyz`; every gated route 404s | `heimdall-cp-public-run` — datastore + (REQUIRED in token mode) enroll-token secret, **NO `run.jobs.run`** |
+| `heimdall-cp-public` (**public**) | `--allow-unauthenticated` | **public routes only** — `POST /enroll, POST /presence, GET /roster, GET /healthz, GET /readyz`; every gated route 404s. Also serves **`GET /roster-public?project=<id>`** (+ `OPTIONS` preflight) — unauthenticated, rate-limited, CORS browser read for the web dashboard; projects handles/verdicts/files only, no secrets, no writes (presence WRITES stay signed). | `heimdall-cp-public-run` — datastore + (REQUIRED in token mode) enroll-token secret, **NO `run.jobs.run`** |
 
 > **ENROLL IS TOKEN-GATED by default — the public/viral phase.** The public service
 > deploys with `HEIMDALL_ENROLL_OPEN` **left unset** (the server's fail-closed token

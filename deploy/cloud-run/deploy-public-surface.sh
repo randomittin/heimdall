@@ -138,6 +138,7 @@ say "==> heimdall-cp-public deploy (${MODE} mode)"
 say "    project=${PROJECT_ID} region=${REGION} public-service=${PUBLIC_SERVICE}"
 say "    public SA=${PUBLIC_SA} (LEAST PRIVILEGE — no run.jobs.run, no dispatch IAM)"
 say "    public surface = {${PUBLIC_SURFACE_ROUTES}}  (HEIMDALL_PUBLIC_SURFACE=1)"
+say "    + UNAUTHENTICATED read: GET /roster-public?project=<id> (+ OPTIONS preflight) — rate-limited, CORS, projects handles/verdicts/files only (no haid/pubkey/secrets); presence WRITES stay signed"
 say "    enroll mode = HEIMDALL_ENROLL_OPEN=${ENROLL_OPEN} (0=token-gated [default], 1=tokenless+bounded; caps IP=${ENROLL_IP_LIMIT}/${ENROLL_IP_WINDOW}s, budget=${ENROLL_BUDGET_MAX}/${ENROLL_BUDGET_WINDOW}s — apply in BOTH modes, registry=${ENROLL_MAX_KEYS})"
 
 # ── PREFLIGHT — the dangerous mistakes are made IMPOSSIBLE here, not just documented ──
