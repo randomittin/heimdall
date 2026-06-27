@@ -329,8 +329,13 @@ CP_URL="http://127.0.0.1:$CP_PORT"
 #    VERIFIED haid in firestore.
 # ──────────────────────────────────────────────────────────────────────────────
 echo
+# The shipped client signs with the OWNER's key via the documented HMD_PRESENCE_SEED override
+# (the dev-scoped seed input — the SAME key #5 drives as CP_PRIV). OWNER_HAID is PRE-REGISTERED
+# in #1, so the client's auto-bootstrap-enroll would 409 (no rebind of an enrolled identity) and
+# yield no seed -> a silent no-op beat; the enroll bootstrap is gated + tested in cp-enroll. This
+# gate guards the WIRE (sign -> verify -> store-under-verified-haid -> signed GET /roster read).
 echo "#3 the shipped client beats (signed POST /presence) under firestore"
-HEIMDALL_CP_URL="$CP_URL" HMD_HAID="$OWNER_HAID" \
+HEIMDALL_CP_URL="$CP_URL" HMD_HAID="$OWNER_HAID" HMD_PRESENCE_SEED="$OWNER_PRIV" \
 HMD_HANDLE="rj" HMD_VERDICT="building" HMD_FILE="src/app.py" \
   "$PRES_CLI" beat --project "$PROJECT" >"$EXT/beat.out" 2>"$EXT/beat.err"
 BEAT_RC=$?
@@ -347,7 +352,7 @@ BEAT_RC=$?
 # ──────────────────────────────────────────────────────────────────────────────
 echo
 echo "#4 the shipped client reads the roster (signed GET /roster?project) -> sees the dev [CARDINAL]"
-HEIMDALL_CP_URL="$CP_URL" HMD_HAID="$OWNER_HAID" \
+HEIMDALL_CP_URL="$CP_URL" HMD_HAID="$OWNER_HAID" HMD_PRESENCE_SEED="$OWNER_PRIV" \
   "$PRES_CLI" roster --json --project "$PROJECT" >"$EXT/roster.out" 2>"$EXT/roster.err"
 ROSTER_HAS_OWNER="$("$PY" - <<PYEOF 2>/dev/null
 import json
@@ -404,7 +409,7 @@ PYEOF
 echo
 echo "#6 graceful degrade: a 401'd client prints an empty roster + exits 0 (no traceback)"
 BAD_SEED="$("$PY" -c "import base64;print(base64.b64encode(bytes((i*3+1)%256 for i in range(32))).decode())")"
-HEIMDALL_CP_URL="$CP_URL" HMD_HAID="$OWNER_HAID" HEIMDALL_CP_PKI_KEY="$BAD_SEED" \
+HEIMDALL_CP_URL="$CP_URL" HMD_HAID="$OWNER_HAID" HMD_PRESENCE_SEED="$BAD_SEED" \
   "$PRES_CLI" roster --json --project "$PROJECT" >"$EXT/degrade.out" 2>"$EXT/degrade.err"
 DEGRADE_RC=$?
 DEGRADE_BODY="$(tr -d '[:space:]' <"$EXT/degrade.out")"
