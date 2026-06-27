@@ -51,6 +51,8 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
+import cp_auth       # derive_team_id / default_team_id / team_member_count — the team-scoped
+                    # enroll re-key + the net-new-team detection for the team-create caps.
 import cp_nonce      # the replay/freshness gate for the signed presence beat (accept()).
 import cp_ratelimit  # the fixed-window abuse gate (RateLimiter.allow + enroll_budget_ok).
 
@@ -66,20 +68,26 @@ import cp_ratelimit  # the fixed-window abuse gate (RateLimiter.allow + enroll_b
 #   GET  /healthz   — the Cloud Run liveness probe (pre-auth; cp_diag).
 #   GET  /readyz    — the Cloud Run readiness probe (pre-auth; cp_diag).
 #
-# PLUS the UNAUTHENTICATED browser-read seam (app-layer only — NOT a signed/IAM route, so it is
+# PLUS the TEAM-PRIVATE browser-read seam (app-layer only — NOT a signed/IAM route, so it is
 # additive to the gcloud display string above; the static heimdall-site dashboard fetches it):
-#   GET     /roster-public — the ONLINE roster for a project, UNSIGNED + per-IP rate-limited +
-#       CORS, projected to handle/verdict/file/age_seconds ONLY (no haid/pubkey/secret, no
-#       write). A browser cannot PKI-sign, so the signed GET /roster 401s it; this is its read.
-#   OPTIONS /roster-public — the CORS preflight for the above (204 + CORS headers).
-# Both are READ-ONLY: there is deliberately NO (POST, /roster-public) — the public surface
-# exposes no unauthenticated write.
+#   GET     /roster-team — the ONLINE roster for (project, team), authorized by the
+#       X-Heimdall-Team-Secret HEADER (hashed -> team_id server-side); per-IP rate-limited +
+#       CORS, FULL member view incl. haid. No secret header -> 403. A browser cannot PKI-sign,
+#       so the signed GET /roster 401s it; this is its read.
+#   OPTIONS /roster-team — the CORS preflight (204 + CORS incl. Access-Control-Allow-Headers:
+#       X-Heimdall-Team-Secret).
+#   GET     /roster-public — RETIRED: the old fully-public roster leaked activity to anyone, so
+#       it now 403s on the public surface (kept in the allowlist so it returns 403, not a flat
+#       404 — the closed leak is explicit). team.html moved to /roster-team.
+# All READ-ONLY: there is deliberately NO (POST, /roster-team) — the public surface exposes no
+# unauthenticated write.
 PUBLIC_ROUTES = frozenset({
     ("POST", "/enroll"),
     ("POST", "/presence"),
     ("GET", "/roster"),
+    ("GET", "/roster-team"),
+    ("OPTIONS", "/roster-team"),
     ("GET", "/roster-public"),
-    ("OPTIONS", "/roster-public"),
     ("GET", "/healthz"),
     ("GET", "/readyz"),
 })
@@ -145,6 +153,18 @@ def _enroll_token_limit():   return _int_env("HEIMDALL_ENROLL_TOKEN_LIMIT", 30)
 def _enroll_token_window():  return _int_env("HEIMDALL_ENROLL_TOKEN_WINDOW", 60)
 def _enroll_budget_max():    return _int_env("HEIMDALL_ENROLL_BUDGET_MAX", 50)
 def _enroll_budget_window(): return _int_env("HEIMDALL_ENROLL_BUDGET_WINDOW", 3600)
+# /enroll PER-TEAM bucket (re-keyed on the derived team_id, not the deprecated bootstrap token):
+# a single (possibly leaked) team_secret cannot hammer /enroll even rotating IPs. Same limits as
+# the per-token bucket; team_id is already a hash, re-hashed by cp_ratelimit before it is a key.
+def _enroll_team_limit():    return _int_env("HEIMDALL_ENROLL_TEAM_LIMIT", 30)
+def _enroll_team_window():   return _int_env("HEIMDALL_ENROLL_TEAM_WINDOW", 60)
+# TEAM-CREATE caps (Risk 5b — unbounded team creation on the open edge). A net-new team_id (no
+# existing member/record) counts against BOTH a per-IP create bucket AND a deployment-wide
+# distinct-team ceiling, so an attacker rotating fresh secrets cannot explode the store/registry.
+def _team_create_ip_limit():     return _int_env("HEIMDALL_TEAM_CREATE_IP_LIMIT", 5)
+def _team_create_ip_window():    return _int_env("HEIMDALL_TEAM_CREATE_IP_WINDOW", 3600)
+def _team_create_budget_max():   return _int_env("HEIMDALL_TEAM_CREATE_BUDGET_MAX", 50)
+def _team_create_budget_window():return _int_env("HEIMDALL_TEAM_CREATE_BUDGET_WINDOW", 3600)
 
 # /presence — per-IP (pre-verify, blunt flood shed) and per-haid (post-verify) caps. A dev
 # beats ~2/min; behind a corporate NAT many devs share one IP, so the per-IP cap is loose and
@@ -257,6 +277,23 @@ def _enroll_token(request, payload):
     return ""
 
 
+def _team_secret(request, payload):
+    """The caller-presented TEAM secret (for the per-team enroll bucket + the team-create caps):
+    the header (cp_server lifts it into request["team_secret"]) wins, else the body's team_secret
+    field, else None (no secret -> the configured default team, or nothing to scope). The raw
+    secret is NEVER stored/logged here — it is hashed to team_id by cp_auth.derive_team_id and
+    only that non-secret handle (re-hashed again by cp_ratelimit) ever touches the limiter."""
+    if isinstance(request, dict):
+        header_sec = request.get("team_secret")
+        if header_sec:
+            return str(header_sec)
+    if isinstance(payload, dict):
+        body_sec = payload.get("team_secret")
+        if body_sec:
+            return str(body_sec)
+    return None
+
+
 # ── the abuse gates (return None to allow, or (status, body) to refuse) ─────────────────
 #
 # Each gate returns None when the request may proceed, or a (status:int, body:dict) tuple
@@ -301,6 +338,40 @@ def check_enroll(request, *, home=None, now=None):
         # The deployment-wide ceiling. retry_after is one budget window (the conservative
         # back-off when the global budget is spent).
         return (429, _rate_limited_body("enroll_budget", _enroll_budget_window()))
+
+    # 4-5. TEAM-SCOPED gates (multi-tenant). The team_secret rides a header (cp_server lifts it
+    #      to request["team_secret"]) or the body; we derive the NON-SECRET team_id and key on
+    #      it — the raw secret never touches the limiter (team_id is already a hash, re-hashed by
+    #      cp_ratelimit before it is a key). No secret -> the configured default team (back-compat);
+    #      no secret AND no default -> enroll() fails team_required downstream, so there is nothing
+    #      to scope and we skip the team gates here.
+    secret = _team_secret(request, payload)
+    team_id = cp_auth.derive_team_id(secret) if secret else cp_auth.default_team_id()
+    if team_id:
+        # 4. PER-TEAM bucket — a single (leaked) team_secret cannot hammer /enroll even rotating
+        #    IPs (§3: re-key the per-token bucket on team_id, the durable partition handle).
+        ok, retry = limiter.allow(
+            "enroll_team", team_id, now=now,
+            limit=_enroll_team_limit(), window=_enroll_team_window())
+        if not ok:
+            return (429, _rate_limited_body("enroll_team", retry))
+        # 5. TEAM-CREATE caps (Risk 5b) — a NET-NEW team_id (no members/records yet) counts
+        #    against a per-IP create bucket AND a deployment-wide distinct-team ceiling, so an
+        #    attacker rotating fresh secrets cannot explode the registry/store. An EXISTING team
+        #    (>=1 member) is exempt — only team CREATION is capped (team_member_count is the
+        #    firestore-safe net-new signal). team_create_budget is a single global counter,
+        #    mirroring enroll_budget_ok.
+        if cp_auth.team_member_count(team_id, home=home) == 0:
+            ok, retry = limiter.allow(
+                "team_create_ip", ip, now=now,
+                limit=_team_create_ip_limit(), window=_team_create_ip_window())
+            if not ok:
+                return (429, _rate_limited_body("team_create_ip", retry))
+            ok, retry = limiter.allow(
+                "team_create_budget", "global", now=now,
+                limit=_team_create_budget_max(), window=_team_create_budget_window())
+            if not ok:
+                return (429, _rate_limited_body("team_create_budget", retry))
     return None
 
 

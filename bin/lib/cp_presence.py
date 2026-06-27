@@ -150,15 +150,20 @@ def _slug(value):
     return slug or "unknown"
 
 
-def _project_rel(project):
-    """The store-relative dir of one project's presence records: presence/<slug>/."""
-    return os.path.join(_PRESENCE_REL, _slug(project))
+def _team_rel(project, team_id):
+    """The store-relative dir of one (project, team) partition's presence records:
+    presence/<project_slug>/<team_id_slug>/. team_id is 32-hex (a safe single-"_"-free path
+    segment on both backends); _slug guards None -> "unknown". This 3-level partition is the
+    load-bearing isolation key — a roster read addresses exactly ONE such dir, so team A never
+    enumerates team B's records."""
+    return os.path.join(_PRESENCE_REL, _slug(project), _slug(team_id))
 
 
-def _record_rel(project, haid):
-    """The store-relative path of one dev's presence record under a project:
-    presence/<project_slug>/<haid_slug>.json."""
-    return os.path.join(_project_rel(project), _slug(haid) + _RECORD_SUFFIX)
+def _record_rel(project, team_id, haid):
+    """The store-relative path of one dev's presence record under a (project, team):
+    presence/<project_slug>/<team_id_slug>/<haid_slug>.json. The record KEY stays the verified
+    haid (a dev cannot overwrite a teammate's record); team_id is the partition."""
+    return os.path.join(_team_rel(project, team_id), _slug(haid) + _RECORD_SUFFIX)
 
 
 # ── the presence record (the CLOSED, DATA-ONLY, secret-scrubbed schema) ────────
@@ -194,15 +199,17 @@ def build_record(haid, *, project, handle=None, verdict=None, file=None, ts=None
     }
 
 
-def record_presence(haid, *, project, handle=None, verdict=None, file=None,
+def record_presence(haid, *, project, team_id, handle=None, verdict=None, file=None,
                     home=None, ts=None):
     """STORE one dev's heartbeat: build the scrubbed record and atomically upsert it under
-    (project, haid) via put_record (last-write-wins — a fresher beat overwrites the dev's
-    prior record). The partition KEY is `haid` (the server-verified identity at the route
-    boundary), never a body field — a dev cannot write another dev's record.
+    (project, team_id, haid) via put_record (last-write-wins — a fresher beat overwrites the
+    dev's prior record). The partition KEY is (project, team_id) and the record KEY is `haid`
+    (the server-verified identity at the route boundary). `team_id` is resolved from the
+    caller's REGISTRY BINDING (cp_auth.registered_team), NEVER a body field — so a member can
+    only beat into THEIR team.
 
-    Returns {ok, haid, project} on a stored write, {ok: False, reason} on an IO failure
-    (the store degrades, never crashes a heartbeat). DATA only — executes nothing.
+    Returns {ok, haid, project, team_id} on a stored write, {ok: False, reason} on an IO
+    failure (the store degrades, never crashes a heartbeat). DATA only — executes nothing.
 
     Routed THROUGH the StateBackend: put_record writes the SAME atomic tmp+os.replace,
     json.dump(sort_keys=True, indent=2) keyed record cp_approval / cp_auth write — so the
@@ -213,9 +220,10 @@ def record_presence(haid, *, project, handle=None, verdict=None, file=None,
         return {"ok": False, "reason": "no_haid"}
     record = build_record(haid, project=project, handle=handle, verdict=verdict,
                           file=file, ts=ts)
-    if not _backend(home).put_record(_record_rel(project, haid), record):
+    if not _backend(home).put_record(_record_rel(project, team_id, haid), record):
         return {"ok": False, "reason": "io_error"}
-    return {"ok": True, "haid": haid, "project": record.get("project")}
+    return {"ok": True, "haid": haid, "project": record.get("project"),
+            "team_id": team_id}
 
 
 def is_online(record, *, now=None, ttl=None):
@@ -232,16 +240,22 @@ def is_online(record, *, now=None, ttl=None):
     return (when - ts) <= window
 
 
-def roster(project, *, home=None, now=None, ttl=None):
-    """The ONLINE devs for a project: the fold of the latest heartbeat per dev, filtered
-    to those within the TTL, sorted by haid for a stable view. Read-only; an absent
-    project store yields [] (honest empty). Each returned record carries an added
+def roster(project, team_id, *, home=None, now=None, ttl=None):
+    """The ONLINE devs for a (project, team): the fold of the latest heartbeat per dev,
+    filtered to those within the TTL, sorted by haid for a stable view. Read-only; an absent
+    partition yields [] (honest empty — a nonexistent team and an idle team are
+    indistinguishable, no existence oracle). Each returned record carries an added
     "online": True and "age_seconds" (now - ts, rounded) for the renderer.
 
-    Routed THROUGH the StateBackend: list_names returns the SAME sorted enumeration of a
-    project's dev-record basenames on EVERY backend (leaf .json names directly under
-    presence/<project>/ — FirestoreBackend recovers them from the flat doc-id prefix),
-    and get_record returns the SAME tolerant keyed read (None when absent/corrupt). A
+    `team_id` SCOPES the read to exactly ONE partition dir (presence/<project>/<team_id>/) —
+    the isolation guarantee: a read for team A never enumerates team B's records. The caller
+    resolves team_id from the signed member's binding OR the presented secret's hash; it is
+    NEVER taken on trust from a request body.
+
+    Routed THROUGH the StateBackend: list_names returns the SAME sorted enumeration of the
+    partition's dev-record basenames on EVERY backend (leaf .json names directly under
+    presence/<project>/<team_id>/ — FirestoreBackend recovers them from the flat doc-id
+    prefix), and get_record returns the SAME tolerant keyed read (None when absent/corrupt). A
     BACKEND-SAFE read end to end: NEVER backend.path() (FirestoreBackend refuses it) —
     list_names + get_record are served by every backend, so the cross-dev roster read
     never raises under firestore (the firestore-only read-path incident class)."""
@@ -249,8 +263,9 @@ def roster(project, *, home=None, now=None, ttl=None):
     when = now if now is not None else time.time()
     window = ttl if ttl is not None else ttl_seconds()
     out = []
-    for name in backend.list_names(_project_rel(project), suffix=_RECORD_SUFFIX):
-        rel = os.path.join(_project_rel(project), name)
+    team_dir = _team_rel(project, team_id)
+    for name in backend.list_names(team_dir, suffix=_RECORD_SUFFIX):
+        rel = os.path.join(team_dir, name)
         record = backend.get_record(rel)
         if not is_online(record, now=when, ttl=window):
             continue
@@ -327,57 +342,77 @@ def beat_route(identity, request, *, home=None):
     if not project:
         return cp_server.Response(
             422, {"recorded": False, "reason": "no_project"})
+    # team_id from the VERIFIED identity's registry binding (NEVER the body) — a member can
+    # only beat into THEIR team. A binding with no team_id reads as the default team (§migration).
+    team_id = cp_auth.registered_team(haid, home=home)
     result = record_presence(
-        haid, project=project, handle=payload.get("handle"),
+        haid, project=project, team_id=team_id, handle=payload.get("handle"),
         verdict=payload.get("verdict"), file=payload.get("file"), home=home)
     if not result.get("ok"):
         return cp_server.Response(
             500, {"recorded": False, "reason": result.get("reason", "io_error")})
     return cp_server.Response(
-        200, {"recorded": True, "haid": haid, "project": result.get("project")})
+        200, {"recorded": True, "haid": haid, "project": result.get("project"),
+              "team_id": team_id})
 
 
 def roster_route(identity, request, *, home=None):
-    """GET /roster?project=<p> — the ONLINE devs for a project, from ANY signed client
+    """GET /roster?project=<p> — the ONLINE devs for the CALLER'S OWN team on a project
     (§presence). The project rides the QUERY STRING with an EMPTY body (the GFE-safe read
-    shape; the signature covers the full path-with-query). Reads the durable per-dev
-    records and folds the roster (replay-on-read), so a fresh client — or a fresh instance
-    after scale-to-zero — sees the team another dev's heartbeats built. 422 when no
-    project is supplied. DATA only — runs nothing."""
+    shape; the signature covers the full path-with-query). team_id is resolved from the
+    VERIFIED caller's registry binding (cp_auth.registered_team) — so a signed member sees
+    ONLY their own team's roster. This REPLACES the prior behavior where any signed dev saw
+    any project's full roster (the cross-team leak): team_id is the load-bearing scope, taken
+    from the binding, never the request. Reads the durable per-dev records and folds the
+    roster (replay-on-read). 422 when no project is supplied. DATA only — runs nothing."""
+    haid = identity.haid if isinstance(identity, cp_auth.Identity) else identity
     payload = _parse_body(request)
     project = _query_project(request, payload)
     if not project:
         return cp_server.Response(
             422, {"reason": "no_project", "roster": []})
+    team_id = cp_auth.registered_team(haid, home=home)
     return cp_server.Response(
-        200, {"project": project, "roster": roster(project, home=home)})
+        200, {"project": project, "team_id": team_id,
+              "roster": roster(project, team_id, home=home)})
 
 
-# ── the UNAUTHENTICATED browser read (GET /roster-public — the static dashboard's read) ──
+# ── the TEAM-PRIVATE browser read (GET /roster-team — the static dashboard's read) ──
 #
-# WHY A SECOND ROSTER ROUTE. The signed GET /roster needs a PKI signature; a BROWSER cannot
-# sign, so the static heimdall-site dashboard would 401. This route is the unauthenticated,
-# rate-limited, READ-ONLY public read of the SAME TTL-filtered online roster — served PRE-AUTH
-# (like the health probes) but ONLY on the public surface, projected so it leaks no identity.
+# WHY THIS ROUTE. The signed GET /roster needs a PKI signature; a BROWSER cannot sign, so the
+# static heimdall-site dashboard would 401. /roster-team is the unauthenticated-at-the-edge,
+# rate-limited, READ-ONLY read whose APP-LAYER auth is the TEAM SECRET presented in the
+# X-Heimdall-Team-Secret HEADER: the server hashes it to team_id (cp_auth.derive_team_id) and
+# returns ONLY that partition's roster — the FULL member view INCLUDING haid (members are
+# entitled to see each other's haid + activity per the requirement). No header -> 403 (NOT an
+# empty 200). A presented team_id (the hash, not the pre-image) hashes again to a WRONG
+# partition -> empty: team_id is INERT, never a capability. The secret rides a HEADER, never the
+# URL query (a query leaks to access logs / Referer / history — Risk 2).
+#
+# THE OLD /roster-public IS GONE. It was fully public (handles/verdicts/files to anyone); under
+# the private model the team read exposes haid + activity, which must NOT be public. /roster-team
+# REPLACES it; /roster-public now returns 403 on the public surface (the old leak is closed).
 
-# CORS for the unauthenticated browser read (GET/OPTIONS /roster-public). The roster is read-
-# only public data, so Access-Control-Allow-Origin:* lets the static dashboard (a DIFFERENT
-# origin) fetch it; the preflight additionally advertises the allowed method/headers.
+# CORS for the browser read. Access-Control-Allow-Origin:* lets a different-origin static site
+# SEND the request; it can only READ the response with the user's explicit secret (no cookies /
+# ambient credential, so `*` is safe). The preflight advertises the custom secret header.
 _CORS_HEADERS = {"Access-Control-Allow-Origin": "*"}
 _CORS_PREFLIGHT_HEADERS = {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, OPTIONS",
-    "Access-Control-Allow-Headers": "*",
+    "Access-Control-Allow-Headers": "X-Heimdall-Team-Secret",
     "Access-Control-Max-Age": "86400",
 }
 
 
-def _public_view(record):
-    """Project ONE online roster record to the PUBLIC, NO-SECRET browser view: handle / verdict
-    / file / age_seconds ONLY. Drops haid (the identity), ts, and every other field — the public
-    read renders status, never an identity or a key. The fields are already scrubbed at write
-    time (build_record -> _clean -> telemetry._scrub), so no secret can reach here either."""
+def _team_view(record):
+    """Project ONE online roster record to the MEMBER view: haid + handle + verdict + file +
+    age_seconds. This INCLUDES haid (the deliberate difference from the old public view) — but
+    only a PROVEN member (a caller who presented the team secret) ever receives it. The free
+    fields are already scrubbed at write time (build_record -> _clean -> telemetry._scrub), so
+    no secret can reach here; ts is dropped (age_seconds carries the freshness)."""
     return {
+        "haid": record.get("haid"),
         "handle": record.get("handle"),
         "verdict": record.get("verdict"),
         "file": record.get("file"),
@@ -385,55 +420,71 @@ def _public_view(record):
     }
 
 
-def roster_public_route(request, *, home=None):
-    """GET /roster-public?project=<id> — the UNAUTHENTICATED, rate-limited, READ-ONLY online
-    roster for the static web dashboard (a browser cannot PKI-sign, so the signed GET /roster
-    401s it). Served PRE-AUTH, but ONLY on the public surface (public_surface_enabled()); off it
-    the route does not exist (404), so the gated IAM service is unchanged.
+def roster_team_route(request, *, home=None):
+    """GET /roster-team?project=<id> — the TEAM-PRIVATE browser read. App-layer auth is the
+    team secret in the X-Heimdall-Team-Secret HEADER (cp_server lifts it to
+    request["team_secret"]); the server derives team_id and returns the FULL member view
+    (incl. haid) for (project, team_id). Served PRE-AUTH, but ONLY on the public surface; off
+    it the route does not exist (404), so the gated IAM service is unchanged.
 
-    Exposes ONLY handle/verdict/file/age_seconds per ONLINE dev (the SAME TTL-filtered fold
-    roster() computes) — NEVER the haid, a pubkey, or any secret, and it is a READ (no presence
-    write seam exists on the public surface). Every reply carries Access-Control-Allow-Origin:*
-    so a different-origin static site can fetch it.
-
-    400 when project is missing/empty; an unknown project is a 200 with an empty online list
-    (honest empty, not an error); 429 when the per-IP read-flood cap trips. DATA only — runs
-    nothing, never backend.path() (roster() is list_names + get_record, firestore-safe)."""
+    No secret header -> 403 (NOT an empty 200 — the read demands the capability). A presented
+    team_id (the hash) -> a wrong partition -> empty (team_id is inert). A random/unknown secret
+    -> a partition with no records -> {online: []} (no existence oracle: a nonexistent team and
+    an idle team are indistinguishable). 400 when project is missing; 429 when the per-IP
+    read-flood cap trips. DATA only — runs nothing, never backend.path()."""
     if not cp_publicsurface.public_surface_enabled():
-        # Off the public surface this unauthenticated read does not exist — 404 like any other
-        # gated route, so the IAM-gated service stays byte-for-byte as before.
         return cp_server.Response(404, {"error": "no_such_route"}, headers=_CORS_HEADERS)
     refusal = cp_publicsurface.check_roster_read(request, home=home)
     if refusal is not None:
         status, body = refusal
         return cp_server.Response(status, body, headers=_CORS_HEADERS)
+    secret = request.get("team_secret") if isinstance(request, dict) else None
+    if not secret:
+        # No capability presented — 403 (never an empty 200 that would mask the missing auth).
+        return cp_server.Response(
+            403, {"error": "team_secret_required", "online": []}, headers=_CORS_HEADERS)
     project = _query_project(request, None)
     if not project:
         return cp_server.Response(
             400, {"error": "no_project", "online": []}, headers=_CORS_HEADERS)
-    online = [_public_view(view) for view in roster(project, home=home)]
+    # Hash the presented secret to the partition handle (one-way; no secret-to-secret compare,
+    # no stored secret). The raw secret is consumed here and never stored/echoed.
+    team_id = cp_auth.derive_team_id(secret)
+    online = [_team_view(view) for view in roster(project, team_id, home=home)]
     return cp_server.Response(
         200, {"project": project, "online": online}, headers=_CORS_HEADERS)
 
 
-def roster_public_preflight(request):
-    """OPTIONS /roster-public — the CORS preflight for the browser read. Returns 204 + the CORS
-    headers so a different-origin static site may then issue the GET. Served pre-auth on the
-    public surface only; 404s on the gated service exactly as the GET does (no preflight for a
-    route that does not exist there)."""
+def roster_team_preflight(request):
+    """OPTIONS /roster-team — the CORS preflight for the browser read. Returns 204 + the CORS
+    headers (incl. Access-Control-Allow-Headers: X-Heimdall-Team-Secret) so a different-origin
+    static site may then issue the GET with the secret header. Public-surface only; 404s on the
+    gated service exactly as the GET does."""
     if not cp_publicsurface.public_surface_enabled():
         return cp_server.Response(404, {"error": "no_such_route"})
     return cp_server.Response(204, None, headers=_CORS_PREFLIGHT_HEADERS)
 
 
+def roster_public_route(request, *, home=None):
+    """GET /roster-public — RETIRED. The old fully-public roster leaked handles/verdicts/files
+    to anyone; the private team model forbids that, so this read is GONE. On the public surface
+    it returns 403 (the leak is closed; team.html moved to /roster-team); off the public surface
+    it 404s like any other non-existent route. NEVER returns a roster."""
+    if not cp_publicsurface.public_surface_enabled():
+        return cp_server.Response(404, {"error": "no_such_route"}, headers=_CORS_HEADERS)
+    return cp_server.Response(
+        403, {"error": "roster_public_retired", "online": []}, headers=_CORS_HEADERS)
+
+
 def register(*, home=None):
-    """Wire POST /presence (heartbeat) + GET /roster (online team) into cp_server's
-    registration seam (§10), and the UNAUTHENTICATED GET/OPTIONS /roster-public browser read
-    into the PRE-AUTH public seam (register_public_route — the static dashboard cannot sign),
-    all WITHOUT editing cp_server. The handlers close over the runtime `home` so a self-host
-    deployment / a test can pin its store root. Returns the registered (method, path) keys.
-    Idempotent — re-registering replaces the routes. Mirrors cp_ingest.register /
-    cp_enroll.register (pre-auth public routes) exactly."""
+    """Wire POST /presence (heartbeat) + GET /roster (the caller's-own-team read) into
+    cp_server's registration seam (§10), and the TEAM-PRIVATE GET/OPTIONS /roster-team browser
+    read into the PRE-AUTH public seam (register_public_route — the static dashboard cannot
+    sign), all WITHOUT editing cp_server. The retired GET /roster-public stays registered so it
+    returns 403 (not a flat 404) on the public surface — the old leak is closed explicitly. The
+    handlers close over the runtime `home` so a self-host deployment / a test can pin its store
+    root. Returns the registered (method, path) keys. Idempotent — re-registering replaces the
+    routes. Mirrors cp_ingest.register / cp_enroll.register (pre-auth public routes) exactly."""
     keys = []
     keys.append(cp_server.register_route(
         "POST", "/presence",
@@ -441,12 +492,16 @@ def register(*, home=None):
     keys.append(cp_server.register_route(
         "GET", "/roster",
         lambda identity, request: roster_route(identity, request, home=home)))
-    # The UNAUTHENTICATED browser read + its CORS preflight (pre-auth; public-surface-only,
-    # self-gated inside the handlers; per-IP rate-limited; READ-ONLY — no public write seam).
+    # The TEAM-PRIVATE browser read + its CORS preflight (pre-auth; public-surface-only,
+    # self-gated inside the handlers; secret-header authorized; per-IP rate-limited; READ-ONLY).
+    keys.append(cp_server.register_public_route(
+        "GET", "/roster-team",
+        lambda request: roster_team_route(request, home=home)))
+    keys.append(cp_server.register_public_route(
+        "OPTIONS", "/roster-team",
+        lambda request: roster_team_preflight(request)))
+    # The RETIRED public read — kept registered so it 403s (not 404s) on the public surface.
     keys.append(cp_server.register_public_route(
         "GET", "/roster-public",
         lambda request: roster_public_route(request, home=home)))
-    keys.append(cp_server.register_public_route(
-        "OPTIONS", "/roster-public",
-        lambda request: roster_public_preflight(request)))
     return keys
