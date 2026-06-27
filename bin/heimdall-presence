@@ -31,7 +31,8 @@
 #                   SECURITY: the dev signs as ITSELF with its OWN per-dev key; it MUST NOT
 #                   read $HEIMDALL_CP_PKI_KEY (the SERVER's Secret-Manager identity seed —
 #                   server-only, never on a dev path).
-#                   {url}/enroll {haid, pubkey, handle} with the config's enroll_token,
+#                   {url}/enroll {haid, pubkey, handle} (the config's enroll_token rides ONLY
+#                   IF configured — an OPEN server enrolls tokenless, so ZERO dev config),
 #                   persist the seed 0600, reuse it thereafter. The seed lives in-process +
 #                   the 0600 file ONLY — NEVER printed/logged/argv'd. A failed enroll is
 #                   throttled (an mtime stamp) so it never hammers the server per render.
@@ -243,14 +244,17 @@ def request(method, path, body, seed, *, timeout=10):
 
 
 def _enroll(body, token, *, timeout=10):
-    """The bootstrap enroll: POST /enroll {haid, pubkey, handle} with the config's
-    enroll_token in X-Heimdall-Enroll-Token. UNSIGNED by design — this is the chicken-and-
-    egg step that REGISTERS the key, so no signature exists yet; the token is the bootstrap
-    credential. Returns the HTTP status (0 on any transport error)."""
+    """The bootstrap enroll: POST /enroll {haid, pubkey, handle}. UNSIGNED by design — this
+    is the chicken-and-egg step that REGISTERS the key, so no signature exists yet. The
+    config's enroll_token rides in X-Heimdall-Enroll-Token ONLY WHEN ONE IS CONFIGURED; an
+    OPEN server (HEIMDALL_ENROLL_OPEN=1) accepts a tokenless enroll, so a token is OMITTED
+    when absent (a token-mode server still gets it). Returns the HTTP status (0 on any
+    transport error)."""
     req = urllib.request.Request(BASE + "/enroll", data=body, method="POST")
     req.add_header("Content-Type", "application/json")
     req.add_header("X-Heimdall-HAID", HAID)
-    req.add_header("X-Heimdall-Enroll-Token", token)
+    if token:
+        req.add_header("X-Heimdall-Enroll-Token", token)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             resp.read()
@@ -275,14 +279,19 @@ def _persisted_seed():
 
 
 def _bootstrap_seed():
-    """Auto-enroll once: keygen (cp_auth) -> POST /enroll with the token -> persist the seed
-    0600 -> return it. Throttled by an mtime stamp so a FAILING enroll does NOT hammer the
-    server every render. Silent + non-fatal: ANY failure returns '' (the caller degrades to
-    offline). Runs at most once — a later render finds the persisted seed and skips this."""
+    """Auto-enroll once: keygen (cp_auth) -> POST /enroll -> persist the seed 0600 -> return
+    it. Throttled by an mtime stamp so a FAILING enroll does NOT hammer the server every
+    render. Silent + non-fatal: ANY failure returns '' (the caller degrades to offline). Runs
+    at most once — a later render finds the persisted seed and skips this.
+
+    TOKEN-OPTIONAL: bootstrap proceeds whenever there is a URL (always — a shipped default)
+    and a place to persist the seed. The enroll token is sent ONLY IF configured, so an OPEN
+    server (HEIMDALL_ENROLL_OPEN=1) auto-enrolls a dev with ZERO config; a token-mode server
+    still works because a configured token is still sent."""
     token = os.environ.get("PRES_ENROLL_TOKEN") or ""
     seed_file = os.environ.get("PRES_SEED_FILE") or ""
-    if not token or not seed_file:
-        return ""   # no bootstrap credential / nowhere to persist -> stay offline.
+    if not BASE or not seed_file:
+        return ""   # no URL / nowhere to persist the seed -> stay offline.
     stamp = os.environ.get("PRES_ENROLL_STAMP") or ""
     throttle = float(os.environ.get("PRES_THROTTLE") or "180")
     now = time.time()
