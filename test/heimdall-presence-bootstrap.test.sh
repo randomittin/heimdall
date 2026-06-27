@@ -99,12 +99,13 @@ class Handler(BaseHTTPRequestHandler):
         body = self._body()
         if path == "/enroll":
             tok = self.headers.get("X-Heimdall-Enroll-Token") or ""
+            team = self.headers.get("X-Heimdall-Team-Secret") or ""
             try:
                 d = json.loads(body or b"{}")
             except Exception:
                 d = {}
-            record("enroll token=%s haid=%s pubkey=%s"
-                   % (tok, d.get("haid"), bool(d.get("pubkey"))))
+            record("enroll token=%s team=%s haid=%s pubkey=%s"
+                   % (tok, team, d.get("haid"), bool(d.get("pubkey"))))
             if ENROLL_FAIL:
                 self._send(500, {"error": "boom"})   # exercise the client enroll-throttle
                 return
@@ -176,7 +177,7 @@ run_presence() {
   ( cd "$PROJ_REPO" \
     && env -u HEIMDALL_CP_URL -u BASE_URL -u HEIMDALL_CP_PKI_KEY -u PKI_SEED \
            -u HMD_PROJECT -u HMD_HAID -u HMD_HANDLE \
-           HOME="$HOME_T" "$BIN" "$@" )
+           HOME="$HOME_T" HEIMDALL_TEAM_DIR="$HOME_T/.heimdall" "$BIN" "$@" )
 }
 
 # same clean-env runner but with a CALLER-CHOSEN HOME (so a fresh HOME == a virgin checkout
@@ -186,7 +187,8 @@ run_in() {
   ( cd "$PROJ_REPO" \
     && env -u HEIMDALL_CP_URL -u BASE_URL -u HEIMDALL_CP_PKI_KEY -u PKI_SEED \
            -u HMD_PROJECT -u HMD_HAID -u HMD_HANDLE \
-           HOME="$h" HMD_ENROLL_THROTTLE="${HMD_ENROLL_THROTTLE:-}" "$BIN" "$@" )
+           HOME="$h" HEIMDALL_TEAM_DIR="$h/.heimdall" \
+           HMD_ENROLL_THROTTLE="${HMD_ENROLL_THROTTLE:-}" "$BIN" "$@" )
 }
 
 echo "============================================================"
@@ -267,6 +269,45 @@ if [ "$CRYPTO" = "1" ]; then
     bad "H the configured token was not sent; log:"; sed 's/^/    /' "$MOCK_LOG" >&2
   fi
 
+  # ── TM. RULING 1b AUTO-SOLO: no team.json -> mint one 0600 + send it in the enroll header ──
+  # The first beat above (A) ran with NO team.json under $HOME_T/.heimdall (a virgin
+  # checkout). The client must have AUTO-MINTED a solo team (0600 team.json, 43-char
+  # secret) and sent that secret in the X-Heimdall-Team-Secret header at /enroll —
+  # the secret travels ONCE at enroll and lives in NO file but team.json.
+  echo
+  echo "TM. auto-solo: a virgin checkout mints a 0600 team.json + sends it in the enroll header"
+  TEAM_JSON="$HOME_T/.heimdall/team.json"
+  TEAM_SECRET="$("$PY" - "$TEAM_JSON" 2>/dev/null <<'PYEOF' || true
+import json, sys
+try:
+    sys.stdout.write(json.load(open(sys.argv[1])).get("team_secret") or "")
+except Exception:
+    sys.stdout.write("")
+PYEOF
+)"
+  TEAM_PERM="$(stat -f '%Lp' "$TEAM_JSON" 2>/dev/null || stat -c '%a' "$TEAM_JSON" 2>/dev/null || echo '?')"
+  if [ -f "$TEAM_JSON" ] && [ "$TEAM_PERM" = "600" ] && [ "${#TEAM_SECRET}" -eq 43 ]; then
+    ok "TM1 auto-solo minted a 0600 team.json carrying a 43-char secret (${#TEAM_SECRET} chars)"
+  else
+    bad "TM1 auto-solo did not mint a 0600 43-char team.json (perm=$TEAM_PERM len=${#TEAM_SECRET})"
+  fi
+  if [ -n "$TEAM_SECRET" ] && grep -qF "team=$TEAM_SECRET " "$MOCK_LOG"; then
+    ok "TM2 /enroll carried the X-Heimdall-Team-Secret header = the minted team secret"
+  else
+    bad "TM2 the enroll did not carry the minted team secret; log:"; sed 's/^/    /' "$MOCK_LOG" >&2
+  fi
+  if [ -n "$TEAM_SECRET" ]; then
+    LEAK="$(grep -rlF "$TEAM_SECRET" "$HOME_T" 2>/dev/null | grep -vF "$TEAM_JSON" || true)"
+    if [ -z "$LEAK" ]; then
+      ok "TM3 the team secret appears in NO file under HOME but team.json (seed/config/stamp carry none)"
+    else
+      bad "TM3 the team secret LEAKED to file(s):
+$LEAK"
+    fi
+  else
+    bad "TM3 skipped — no team secret resolved"
+  fi
+
   # ── G. ZERO-CONFIG OPEN ENROLL: no token in config + an OPEN server -> auto-enroll, token OMITTED ──
   echo
   echo "G. TOKENLESS open-enroll: a dev with NO token + an OPEN server auto-enrolls (token omitted)"
@@ -326,7 +367,8 @@ echo "F. NO config -> clean empty roster + no-op beat + exit 0 (no traceback)"
 HOME_BARE="$WORK/home_bare"; mkdir -p "$HOME_BARE"   # no cp-endpoint.json, no seed
 R_OUT="$( cd "$PROJ_REPO" \
   && env -u HEIMDALL_CP_URL -u BASE_URL -u HEIMDALL_CP_PKI_KEY -u PKI_SEED \
-       HOME="$HOME_BARE" "$BIN" roster --json 2>"$WORK/bare_roster.err" )"; R_EX="$?"
+       HOME="$HOME_BARE" HEIMDALL_TEAM_DIR="$HOME_BARE/.heimdall" \
+       "$BIN" roster --json 2>"$WORK/bare_roster.err" )"; R_EX="$?"
 if [ "$R_OUT" = "[]" ] && [ "$R_EX" = "0" ] && [ ! -s "$WORK/bare_roster.err" ]; then
   ok "F1 no-config roster --json -> [] , exit 0, EMPTY stderr (no traceback)"
 else
@@ -334,7 +376,8 @@ else
 fi
 ( cd "$PROJ_REPO" \
   && env -u HEIMDALL_CP_URL -u BASE_URL -u HEIMDALL_CP_PKI_KEY -u PKI_SEED \
-       HOME="$HOME_BARE" "$BIN" beat 2>"$WORK/bare_beat.err" ); BARE_BEAT_EX="$?"
+       HOME="$HOME_BARE" HEIMDALL_TEAM_DIR="$HOME_BARE/.heimdall" \
+       "$BIN" beat 2>"$WORK/bare_beat.err" ); BARE_BEAT_EX="$?"
 if [ "$BARE_BEAT_EX" = "0" ] && [ ! -s "$WORK/bare_beat.err" ]; then
   ok "F2 no-config beat -> silent no-op, exit 0, EMPTY stderr"
 else
