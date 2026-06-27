@@ -6,15 +6,20 @@ live as **two Cloud Run services from one image**:
 | Service | Posture | Surface | Runtime SA |
 | --- | --- | --- | --- |
 | `heimdall-control-plane` (**gated**) | `--no-allow-unauthenticated` | full surface (dispatch, jobs, approvals, owner, audit, scheduler, … **+** the public routes) | `heimdall-cp-run` — datastore + secrets + **`run.jobs.run`** |
-| `heimdall-cp-public` (**public**) | `--allow-unauthenticated` | **public routes only** — `POST /enroll, POST /presence, GET /roster, GET /healthz, GET /readyz`; every gated route 404s | `heimdall-cp-public-run` — datastore + (optional) enroll-token secret, **NO `run.jobs.run`** |
+| `heimdall-cp-public` (**public**) | `--allow-unauthenticated` | **public routes only** — `POST /enroll, POST /presence, GET /roster, GET /healthz, GET /readyz`; every gated route 404s | `heimdall-cp-public-run` — datastore + (REQUIRED in token mode) enroll-token secret, **NO `run.jobs.run`** |
 
-> **ENROLL IS OPEN (tokenless) by default — and abuse-bounded.** The public service
-> deploys with `HEIMDALL_ENROLL_OPEN=1`: a dev onboards with **zero config** (no
-> enroll token to mint or distribute). Open enroll is **not** unbounded — it is
-> capped by a per-IP rate limit, a deployment-wide enroll budget, and a **hard
-> registry-size cap**, and enrolled keys are **presence-only** (`owner=False`). The
-> full security model, the **residual risk**, and how to **flip back to token mode**
-> for a viral/public phase are in [**§ Open-enroll security model**](#open-enroll-security-model-the-honest-threat-model) below.
+> **ENROLL IS TOKEN-GATED by default — the public/viral phase.** The public service
+> deploys with `HEIMDALL_ENROLL_OPEN` **left unset** (the server's fail-closed token
+> gate is the absent-env default): `/enroll` **requires** the `cp-enroll-token`
+> bootstrap token, so presence is authenticated to "someone who was given the token".
+> The token-gate is **defense-in-depth**, not the only control — a per-IP rate limit,
+> a deployment-wide enroll budget, and a **hard registry-size cap** apply **on top of
+> it in token mode too**, so a **leaked** token still cannot flood `/enroll` or bloat
+> the registry, and enrolled keys are **presence-only** (`owner=False`). For
+> **zero-config internal onboarding** there is an **open (tokenless) alternative**
+> (`ENROLL_OPEN=1`) — the same caps bound it, the token is optional; its full security
+> model, the **residual risk**, and how to **flip between modes** are in
+> [**§ Enroll security model**](#enroll-security-model-the-honest-threat-model) below.
 
 The deep rationale (why the split exists, the defense-in-depth boundary, the
 execution model) lives in [`README.md`](./README.md) §5b. **This runbook is the
@@ -137,21 +142,20 @@ at the secret-resource level (never project-wide).**
 exactly as [`README.md`](./README.md) §2 describes, and is read **only** by the
 gated `heimdall-control-plane` runtime SA. **The public service does not get it.**
 
-### 2.2 The enroll bootstrap token `cp-enroll-token` — OPTIONAL in open mode
+### 2.2 The enroll bootstrap token `cp-enroll-token` — REQUIRED by default (token mode)
 
-> **OPTIONAL when `HEIMDALL_ENROLL_OPEN=1` (the default).** In open mode `/enroll`
-> is tokenless+bounded, so **you may skip this step entirely** — open enroll works
-> without the token, and `deploy-public-surface.sh` does **not** fail when the secret
-> is absent in open mode. Mint it only (a) for **defense-in-depth** (mounting it keeps
-> the token path available alongside open enroll), or (b) when you intend to **flip to
-> token mode** (`ENROLL_OPEN=0`), where the token is **REQUIRED** (see § Open-enroll
-> security model → "Flip back to token mode"). In token mode `/enroll` is fail-closed:
-> without the secret, `cp_enroll.server_enroll_token()` returns `None` and enroll
-> refuses every request.
+> **REQUIRED in the default token mode (`HEIMDALL_ENROLL_OPEN` unset).** `/enroll` is
+> fail-closed: without the secret, `cp_enroll.server_enroll_token()` returns `None` and
+> enroll refuses every request — so `deploy-public-surface.sh` **refuses the deploy**
+> when `cp-enroll-token` is absent in token mode (a dead enroll route). **Mint it before
+> go-live** (the step below). It becomes **OPTIONAL only in the open (tokenless)
+> alternative** (`ENROLL_OPEN=1`): there `/enroll` is tokenless+bounded, so you may skip
+> this step — open enroll works without the token and the deploy does not fail when it is
+> absent (see § Enroll security model → "Switch to open (tokenless) enroll"). The
+> abuse-control caps (per-IP / budget / registry) apply in **both** modes regardless.
 
-If you do mint it (token mode, or defense-in-depth), create it once (generated
-locally, piped straight to Secret Manager, never written to a file — the same seam as
-the PKI key):
+Mint it once (generated locally, piped straight to Secret Manager, never written to a
+file — the same seam as the PKI key):
 
 ```bash
 gcloud secrets create cp-enroll-token --replication-policy=automatic 2>/dev/null \
@@ -209,16 +213,21 @@ python3 -c 'import secrets,sys; sys.stdout.write(secrets.token_urlsafe(32))' \
 
 ---
 
-## Open-enroll security model (the honest threat model)
+## Enroll security model (the honest threat model)
 
-The public service deploys with **`HEIMDALL_ENROLL_OPEN=1`** so a dev onboards with
-**zero config** — no enroll token to mint, distribute, or rotate. This section states
-**exactly** what open enroll does and does **not** protect, with no hand-waving.
+**Token mode is the default** for the public/viral phase: the public service deploys with
+**`HEIMDALL_ENROLL_OPEN` left unset**, so `/enroll` is **fail-closed and token-gated** —
+only a holder of the `cp-enroll-token` value can enroll, and presence is authenticated to
+"someone who was given the token". An **open (tokenless) alternative** (`ENROLL_OPEN=1`)
+exists for zero-config internal onboarding. This section states **exactly** what each mode
+does and does **not** protect, with no hand-waving.
 
-### What bounds tokenless enroll
+### What bounds enroll (in BOTH modes)
 
-Open enroll is **not** "anyone can do anything". A tokenless `POST /enroll` is bounded
-by **five independent controls**, each set by `deploy-public-surface.sh` (env-overridable):
+Enroll is bounded by **five independent controls**, each set by `deploy-public-surface.sh`
+(env-overridable). Controls **1–3 + 5 apply in BOTH modes**; control 4 (presence-only)
+holds in both as well. In the default **token mode** the bootstrap-token gate sits **on
+top** of these as a sixth control — so even a **leaked** token is still bounded by 1–3:
 
 1. **Per-IP rate limit** — `HEIMDALL_ENROLL_IP_LIMIT` new enrolls per
    `HEIMDALL_ENROLL_IP_WINDOW` (default **5 / 60s**). A single client IP cannot hammer
@@ -226,65 +235,84 @@ by **five independent controls**, each set by `deploy-public-surface.sh` (env-ov
    client, which the GFE makes hard to spoof.)
 2. **Deployment-wide enroll budget** — `HEIMDALL_ENROLL_BUDGET_MAX` new enrolls per
    `HEIMDALL_ENROLL_BUDGET_WINDOW` (default **50 / 3600s**), one global counter across
-   the fleet. Even rotating through many IPs, total new enrollments per window are
-   capped.
+   the fleet. Even rotating through many IPs (or a leaked token), total new enrollments
+   per window are capped.
 3. **Hard registry-size cap** — `HEIMDALL_ENROLL_MAX_KEYS` (default **1000**). Once the
    key registry reaches the cap, new enrollments are refused outright — the registry
-   cannot grow without bound no matter how long an attacker churns.
-4. **Enrolled keys are presence-only (`owner=False`).** A tokenless enrollee gets a
-   plain presence identity. It is **not** an owner, cannot dispatch, cannot approve,
-   cannot touch any gated route — the public-surface boundary (404s every gated route)
-   and the least-privilege SA (no `run.jobs.run`) block everything except
-   presence/roster. Enrolling buys **nothing** beyond "appear on the presence wall".
+   cannot grow without bound no matter how long an attacker (or a leaked token) churns.
+4. **Enrolled keys are presence-only (`owner=False`).** An enrollee gets a plain presence
+   identity. It is **not** an owner, cannot dispatch, cannot approve, cannot touch any
+   gated route — the public-surface boundary (404s every gated route) and the
+   least-privilege SA (no `run.jobs.run`) block everything except presence/roster.
+   Enrolling buys **nothing** beyond "appear on the presence wall".
 5. **Presence TTL makes spoofed presence ephemeral.** Presence is a TTL'd heartbeat; a
    spoofed-but-valid presence entry **decays on its own** the moment the griefer stops
    beating (and each beat is itself per-IP + per-haid rate-limited and replay-nonce
    checked). There is no durable artifact to clean up.
 
-### The residual risk (stated plainly)
+### Why token mode is the default (the viral/public phase)
 
-Open enroll is **not zero-risk**, and we do not pretend otherwise. With a tokenless
-public enroll, **anyone who can reach the URL can register a presence identity for a
-known project** — and a public repo's git-remote is guessable, so the project key is
-not a secret. Therefore:
+In the default token mode `/enroll` is **fail-closed**: without `cp-enroll-token` the
+deploy refuses (a dead enroll route), and with it, **only a holder of the token value can
+enroll**. The presence wall is therefore an **authenticated attestation** — "someone who
+was given the token is online" — not merely advisory. That is the right posture for a
+public/viral surface where the URL is reachable by anyone on the internet. The
+abuse-control caps (1–3) **still apply on top of the token gate**, so a **leaked** token is
+defense-in-depth-bounded: it cannot flood `/enroll` past the per-IP/budget caps nor grow
+the registry past the hard cap, and it can never enroll anything but a presence-only
+(`owner=False`) identity.
+
+### The residual risk of the OPEN (tokenless) alternative (stated plainly)
+
+The open alternative (`ENROLL_OPEN=1`) is **not zero-risk**, and we do not pretend
+otherwise. With a tokenless public enroll, **anyone who can reach the URL can register a
+presence identity for a known project** — and a public repo's git-remote is guessable, so
+the project key is not a secret. Therefore, in open mode:
 
 > A griefer **can** post **ephemeral, spoofed presence** to a project's presence wall —
 > appearing "online" as a fabricated dev. This is **bounded** by the per-IP/budget/
 > registry caps (controls 1–3), **non-escalating** (control 4: presence-only,
 > `owner=False`, no gated access, no dispatch), and **ephemeral** (control 5: it decays
-> via presence TTL). It is **not zero** — the presence wall of an open deployment is
+> via presence TTL). It is **not zero** — the presence wall of an **open** deployment is
 > **advisory, not authenticated attestation of who is online**.
 
-That is the deliberate trade for zero-config internal onboarding. If your deployment
-cannot tolerate spoofed presence (a public/viral phase, or an org that treats the
-presence wall as authoritative), **flip back to token mode** below.
+That is the deliberate trade for zero-config internal onboarding. **For a public/viral
+phase, stay in the default token mode** (the token gate closes exactly this gap). Use open
+mode only on an internal deployment that can tolerate advisory presence.
 
-### Flip back to token mode (the viral/public phase)
+### Switch to open (tokenless) enroll (the zero-config internal alternative)
 
-Token mode makes `/enroll` fail-closed: only a holder of the `cp-enroll-token` value
-can enroll, so presence is authenticated to "someone who was given the token".
+If you want zero-config onboarding (no token to mint or distribute) and accept the residual
+risk above, set `ENROLL_OPEN=1` and redeploy:
 
-1. **Mint the token** (RUNBOOK §2.2) if it does not exist — in token mode the secret is
-   **REQUIRED** (an absent token = a dead enroll route; `deploy-public-surface.sh`
-   **refuses** the deploy).
-2. **Set `ENROLL_OPEN=0`** and redeploy the public service:
+```bash
+ENROLL_OPEN=1 bash deploy/cloud-run/deploy-public-surface.sh apply
+# or via the guided operator:
+ENROLL_OPEN=1 bash deploy/cloud-run/go-live.sh
+```
 
-   ```bash
-   ENROLL_OPEN=0 bash deploy/cloud-run/deploy-public-surface.sh apply
-   # or via the guided operator:
-   ENROLL_OPEN=0 bash deploy/cloud-run/go-live.sh
-   ```
+This sets `HEIMDALL_ENROLL_OPEN=1` on the service; `cp-enroll-token` becomes **optional**
+(mounted for defense-in-depth if it exists, never required). Tokenless enroll now works,
+bounded by controls 1–5.
 
-   This sets `HEIMDALL_ENROLL_OPEN=0` on the service and mounts `cp-enroll-token`.
-   Tokenless enroll is now refused; the abuse-control caps (controls 1–3) still apply
-   on top of the token gate.
-3. **Distribute the token out-of-band** (RUNBOOK §8) — password manager / secrets
-   channel, never in chat or plaintext.
+### Flip back to the default token mode
 
-To go back to open enroll, set `ENROLL_OPEN=1` (or unset it — `1` is the default) and
-redeploy. **The boundary and the SA are identical in both modes** — flipping the enroll
-mode never relaxes the public-surface 404 boundary, the least-privilege SA, the digest
-pin, or the P1–P5 preflights. Only the enroll gate changes.
+Set `ENROLL_OPEN=0` (or unset it — token mode is the default) and redeploy:
+
+```bash
+ENROLL_OPEN=0 bash deploy/cloud-run/deploy-public-surface.sh apply
+# or via the guided operator:
+ENROLL_OPEN=0 bash deploy/cloud-run/go-live.sh
+```
+
+In token mode `cp-enroll-token` is **REQUIRED** (mint it first — RUNBOOK §2.2 — or the
+deploy refuses) and is mounted; tokenless enroll is refused; the abuse-control caps (1–3)
+still apply on top of the token gate. **Distribute the token out-of-band** (RUNBOOK §8) —
+password manager / secrets channel, never in chat or plaintext.
+
+**The boundary and the SA are identical in both modes** — flipping the enroll mode never
+relaxes the public-surface 404 boundary, the least-privilege SA, the digest pin, or the
+P1–P5 preflights. Only the enroll gate changes.
 
 ---
 
@@ -303,10 +331,11 @@ Read the plan output. It must show:
 - `PREFLIGHT P1 … P4` lines (P3 prints `WARN … will be ENFORCED at apply` when run
   offline — that is expected; the probe runs for real at `apply`).
 - `(NO run.jobs.run / heimdallJobRunner / run.developer granted — public SA cannot dispatch)`.
-- `enroll mode = HEIMDALL_ENROLL_OPEN=1 …` and `enroll: OPEN (tokenless, bounded) — IP=…,
-  budget=…, registry cap=…` (the open-enroll caps; set `ENROLL_OPEN=0` for token mode).
-- `enroll-token: OPTIONAL (open mode) …` — apply mounts `cp-enroll-token` only if it exists;
-  in token mode (`ENROLL_OPEN=0`) this reads `REQUIRED`.
+- `enroll mode = HEIMDALL_ENROLL_OPEN=0 …` and `enroll: TOKEN-GATED (default; HEIMDALL_ENROLL_OPEN
+  left UNSET on the deploy) — cp-enroll-token REQUIRED; abuse caps (IP=…, budget=…, registry=…)
+  STILL apply` (the caps apply in token mode too; set `ENROLL_OPEN=1` for the open alternative).
+- `enroll-token: REQUIRED (token mode) …` — apply mounts `cp-enroll-token` (and the deploy
+  refuses if it is absent); in open mode (`ENROLL_OPEN=1`) this reads `OPTIONAL`.
 
 If the public SA already exists from a prior run, prove **now** (before deploy) that
 it lacks dispatch — this is the same probe PREFLIGHT P3 enforces at apply:
@@ -368,10 +397,10 @@ At `apply` the script:
 3. creates the least-privilege SA and grants datastore (+ the enroll-token secret
    **only when it is mounted** — present, or required in token mode);
 4. deploys `heimdall-cp-public` `--allow-unauthenticated` with
-   `HEIMDALL_PUBLIC_SURFACE=1` and the open-enroll env
-   (`HEIMDALL_ENROLL_OPEN=1` + the abuse-control caps — per-IP / budget /
-   `HEIMDALL_ENROLL_MAX_KEYS`). See § Open-enroll security model for the model and the
-   token-mode flip.
+   `HEIMDALL_PUBLIC_SURFACE=1`, `cp-enroll-token` mounted (token mode is the default —
+   `HEIMDALL_ENROLL_OPEN` is **left unset**), and the abuse-control caps — per-IP / budget /
+   `HEIMDALL_ENROLL_MAX_KEYS` (set in **both** modes). See § Enroll security model for the
+   model and the open-mode switch.
 
 Capture the public URL:
 
@@ -560,8 +589,8 @@ The gated `heimdall-control-plane`, its `heimdall-cp-run` SA, `cp-pki-key`, and 
 ## Go-live checklist (every box before token distribution)
 
 - [ ] Gated service live on a current-`main` immutable image (README §3–§4).
-- [ ] Enroll mode chosen: **open** (`HEIMDALL_ENROLL_OPEN=1`, default — tokenless, `cp-enroll-token` OPTIONAL) or **token** (`ENROLL_OPEN=0` — `cp-enroll-token` REQUIRED, see § Open-enroll security model). Residual risk of open mode acknowledged (ephemeral spoofed presence, bounded + non-escalating).
-- [ ] (Token mode or defense-in-depth) `cp-enroll-token` secret created; distinct throwaway `cp-pki-key-public` seed provisioned under a distinct HAID — never the real `cp-pki-key` (Step 2.3, verdict (b)).
+- [ ] Enroll mode chosen: **token** (default — `HEIMDALL_ENROLL_OPEN` unset, `cp-enroll-token` REQUIRED + mounted; the recommended public/viral posture) or the **open** alternative (`ENROLL_OPEN=1` — tokenless, `cp-enroll-token` OPTIONAL, see § Enroll security model; residual risk of open mode acknowledged — ephemeral spoofed presence, bounded + non-escalating). Abuse caps (per-IP / budget / registry) apply in **both** modes.
+- [ ] `cp-enroll-token` secret created (REQUIRED in the default token mode); distinct throwaway `cp-pki-key-public` seed provisioned under a distinct HAID — never the real `cp-pki-key` (Step 2.3, verdict (b)).
 - [ ] `deploy-public-surface.sh plan` reviewed — P1–P4 present, no dispatch role granted.
 - [ ] `deploy-public-surface.sh apply` succeeded; image pinned to a `@sha256:` digest.
 - [ ] **GATE:** `check-public-surface.sh` → PASS (Step 6.1).
