@@ -44,12 +44,12 @@ bad() { FAIL=$((FAIL+1)); printf "  \033[31mFAIL\033[0m %s\n" "$1"; }
 CRYPTO="$("$PY" -c "import sys;sys.path.insert(0,'$LIB');import cp_auth;print('1' if cp_auth.crypto_available() else '0')" 2>/dev/null || echo 0)"
 
 WORK="$(mktemp -d -t "presence-bootstrap.$(printf 'X%.0s' 1 2 3 4 5 6)")"
-MOCK_PID=""
+MOCK_PIDS=""   # every mock instance we launch (primary + the open-mode / fail-mode helpers)
 cleanup() {
-  if [ -n "$MOCK_PID" ]; then
-    kill "$MOCK_PID" >/dev/null 2>&1 || true
-    wait "$MOCK_PID" 2>/dev/null || true   # reap quietly so no "Terminated" notice prints
-  fi
+  for p in $MOCK_PIDS; do
+    kill "$p" >/dev/null 2>&1 || true
+    wait "$p" 2>/dev/null || true   # reap quietly so no "Terminated" notice prints
+  done
   rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -68,6 +68,9 @@ from urllib.parse import urlsplit, parse_qs
 
 LOG = os.environ["MOCK_LOG"]
 TOKEN = os.environ.get("MOCK_TOKEN", "")
+# OPEN mode == empty TOKEN (HEIMDALL_ENROLL_OPEN on the real server): a tokenless enroll is
+# accepted. ENROLL_FAIL makes /enroll return 500 so the client's enroll-throttle is exercised.
+ENROLL_FAIL = os.environ.get("MOCK_ENROLL_FAIL", "") == "1"
 
 
 def record(line):
@@ -102,7 +105,10 @@ class Handler(BaseHTTPRequestHandler):
                 d = {}
             record("enroll token=%s haid=%s pubkey=%s"
                    % (tok, d.get("haid"), bool(d.get("pubkey"))))
-            if TOKEN and tok != TOKEN:
+            if ENROLL_FAIL:
+                self._send(500, {"error": "boom"})   # exercise the client enroll-throttle
+                return
+            if TOKEN and tok != TOKEN:   # TOKEN empty == OPEN mode: tokenless enroll accepted
                 self._send(401, {"error": "bad_token"})
                 return
             self._send(200, {"ok": True})
@@ -131,17 +137,25 @@ sys.stdout.flush()
 srv.serve_forever()
 PYEOF
 
-MOCK_LOG="$MOCK_LOG" MOCK_TOKEN="$TOKEN" "$PY" "$WORK/mock_cp.py" >"$WORK/port.txt" 2>"$WORK/mock.err" &
-MOCK_PID=$!
-PORT=""
-for _ in $(seq 1 50); do
-  PORT="$(sed -n '1p' "$WORK/port.txt" 2>/dev/null || true)"
-  [ -n "$PORT" ] && break
-  kill -0 "$MOCK_PID" >/dev/null 2>&1 || break
-  "$PY" -c "import time;time.sleep(0.1)"
-done
-[ -n "$PORT" ] || { echo "FATAL: mock CP never bound a port" >&2; cat "$WORK/mock.err" >&2; exit 2; }
-URL="http://127.0.0.1:$PORT"
+# launch_mock <logfile> <token> <fail> -> echoes the bound base URL, tracks the pid for
+# cleanup. token="" == OPEN mode (tokenless enroll accepted); fail="1" == /enroll returns 500.
+PORT_SEQ=0
+launch_mock() {
+  PORT_SEQ=$((PORT_SEQ+1)); local pf="$WORK/port.$PORT_SEQ.txt"; : >"$pf"
+  MOCK_LOG="$1" MOCK_TOKEN="$2" MOCK_ENROLL_FAIL="${3:-}" \
+    "$PY" "$WORK/mock_cp.py" >"$pf" 2>>"$WORK/mock.err" &
+  local pid=$!; MOCK_PIDS="$MOCK_PIDS $pid"; local p=""
+  for _ in $(seq 1 50); do
+    p="$(sed -n '1p' "$pf" 2>/dev/null || true)"
+    [ -n "$p" ] && break
+    kill -0 "$pid" >/dev/null 2>&1 || break
+    "$PY" -c "import time;time.sleep(0.1)"
+  done
+  [ -n "$p" ] || { echo "FATAL: mock CP never bound a port" >&2; cat "$WORK/mock.err" >&2; exit 2; }
+  printf 'http://127.0.0.1:%s\n' "$p"
+}
+
+URL="$(launch_mock "$MOCK_LOG" "$TOKEN" "")"
 
 # the shipped local config — the ONLY thing a zero-config dev has (no env exports).
 mkdir -p "$HOME_T/.heimdall"
@@ -163,6 +177,16 @@ run_presence() {
     && env -u HEIMDALL_CP_URL -u BASE_URL -u HEIMDALL_CP_PKI_KEY -u PKI_SEED \
            -u HMD_PROJECT -u HMD_HAID -u HMD_HANDLE \
            HOME="$HOME_T" "$BIN" "$@" )
+}
+
+# same clean-env runner but with a CALLER-CHOSEN HOME (so a fresh HOME == a virgin checkout
+# that re-bootstraps against its own config) and a pass-through enroll throttle.
+run_in() {
+  local h="$1"; shift
+  ( cd "$PROJ_REPO" \
+    && env -u HEIMDALL_CP_URL -u BASE_URL -u HEIMDALL_CP_PKI_KEY -u PKI_SEED \
+           -u HMD_PROJECT -u HMD_HAID -u HMD_HANDLE \
+           HOME="$h" HMD_ENROLL_THROTTLE="${HMD_ENROLL_THROTTLE:-}" "$BIN" "$@" )
 }
 
 echo "============================================================"
@@ -232,6 +256,65 @@ if [ "$CRYPTO" = "1" ]; then
     ok "C the roster carried project=github.com/acme/widget (normalized remote — clones share one id)"
   else
     bad "C the roster project id was not the normalized remote; log:"; sed 's/^/    /' "$MOCK_LOG" >&2
+  fi
+
+  # ── H. a CONFIGURED token is still SENT (token-mode servers keep working) ──
+  echo
+  echo "H. a configured enroll_token is still sent on the POST (token-mode unaffected)"
+  if grep -q "^enroll token=$TOKEN " "$MOCK_LOG"; then
+    ok "H the token-mode enroll carried X-Heimdall-Enroll-Token=$TOKEN (token still sent when present)"
+  else
+    bad "H the configured token was not sent; log:"; sed 's/^/    /' "$MOCK_LOG" >&2
+  fi
+
+  # ── G. ZERO-CONFIG OPEN ENROLL: no token in config + an OPEN server -> auto-enroll, token OMITTED ──
+  echo
+  echo "G. TOKENLESS open-enroll: a dev with NO token + an OPEN server auto-enrolls (token omitted)"
+  OPEN_LOG="$WORK/open.log"; : > "$OPEN_LOG"
+  URL_OPEN="$(launch_mock "$OPEN_LOG" "" "")"   # token="" -> OPEN server (tokenless enroll OK)
+  HOME_OPEN="$WORK/home_open"; mkdir -p "$HOME_OPEN/.heimdall"
+  cat > "$HOME_OPEN/.heimdall/cp-endpoint.json" <<EOF
+{"url":"$URL_OPEN"}
+EOF
+  run_in "$HOME_OPEN" beat 2>"$WORK/open_beat.err"; GBX="$?"
+  OSEED="$(ls "$HOME_OPEN/.heimdall/pki/"*.seed 2>/dev/null | head -1 || true)"
+  if [ "$GBX" = "0" ] && [ -n "$OSEED" ] && [ -s "$OSEED" ]; then
+    ok "G1 tokenless beat exited 0 and PERSISTED a seed with ZERO config ($OSEED)"
+  else
+    bad "G1 tokenless beat did not bootstrap (exit=$GBX, seed='$OSEED')"; cat "$WORK/open_beat.err" >&2
+  fi
+  OPEN_N="$(grep -c '^enroll ' "$OPEN_LOG" 2>/dev/null || echo 0)"
+  if [ "$OPEN_N" = "1" ] && grep -q "^enroll token= .* pubkey=True" "$OPEN_LOG"; then
+    ok "G2 /enroll called once with an EMPTY token (the token was OMITTED from the POST) + a public key"
+  else
+    bad "G2 open enroll wrong (count=$OPEN_N, expected empty token); log:"; sed 's/^/    /' "$OPEN_LOG" >&2
+  fi
+
+  # ── T. ENROLL THROTTLE: a FAILED enroll backs off — a 2nd beat within the window does NOT re-POST ──
+  echo
+  echo "T. enroll throttle: a failed enroll stamps an attempt; a 2nd beat within the window does NOT retry"
+  FAIL_LOG="$WORK/fail.log"; : > "$FAIL_LOG"
+  URL_FAIL="$(launch_mock "$FAIL_LOG" "$TOKEN" "1")"   # /enroll always 500 -> enroll fails
+  HOME_THR="$WORK/home_thr"; mkdir -p "$HOME_THR/.heimdall"
+  cat > "$HOME_THR/.heimdall/cp-endpoint.json" <<EOF
+{"url":"$URL_FAIL","enroll_token":"$TOKEN"}
+EOF
+  HMD_ENROLL_THROTTLE=9999 run_in "$HOME_THR" beat 2>/dev/null   # 1st: enroll attempted, fails
+  STAMP_FILE="$(ls "$HOME_THR/.heimdall/pki/"*.enroll-attempt 2>/dev/null | head -1 || true)"
+  FAIL_N1="$(grep -c '^enroll ' "$FAIL_LOG" 2>/dev/null || echo 0)"
+  MT1="$(stat -f '%m' "$STAMP_FILE" 2>/dev/null || stat -c '%Y' "$STAMP_FILE" 2>/dev/null || echo '?')"
+  HMD_ENROLL_THROTTLE=9999 run_in "$HOME_THR" beat 2>/dev/null   # 2nd: must be throttled (no re-POST)
+  FAIL_N2="$(grep -c '^enroll ' "$FAIL_LOG" 2>/dev/null || echo 0)"
+  MT2="$(stat -f '%m' "$STAMP_FILE" 2>/dev/null || stat -c '%Y' "$STAMP_FILE" 2>/dev/null || echo '?')"
+  if [ -n "$STAMP_FILE" ] && [ "$FAIL_N1" = "1" ]; then
+    ok "T1 a failed enroll attempted /enroll ONCE and wrote the throttle stamp ($STAMP_FILE)"
+  else
+    bad "T1 first failed enroll wrong (stamp='$STAMP_FILE', count=$FAIL_N1); log:"; sed 's/^/    /' "$FAIL_LOG" >&2
+  fi
+  if [ "$FAIL_N2" = "1" ] && [ "$MT1" = "$MT2" ] && [ "$MT1" != "?" ]; then
+    ok "T2 the 2nd beat within the window did NOT re-POST /enroll (count still 1) and left the stamp UNCHANGED"
+  else
+    bad "T2 the throttle did not hold (count $FAIL_N1->$FAIL_N2, stamp mtime $MT1->$MT2)"
   fi
 else
   echo "A-E SKIPPED: no Ed25519 backend (cryptography/pynacl) — bootstrap keygen unavailable here."

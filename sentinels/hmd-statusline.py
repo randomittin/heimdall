@@ -59,70 +59,72 @@ def _quiet_rm(path):
     except OSError: return
 
 def _roster_cache_path(cwd): return os.path.join(cwd, ".heimdall", ".roster-cache.json")
-
-def _spawn_roster_refresh(cwd):
-    """Fire-and-forget background refresh of the server roster cache. The child does the
-    (possibly slow) signed network read, then atomically renames into place — so the 3s
-    statusline NEVER blocks on the network. A lock file throttles concurrent refreshers."""
-    bin_path = os.path.join(BIN_DIR, "heimdall-presence")
-    if not os.access(bin_path, os.X_OK): return
-    cache = _roster_cache_path(cwd); lock = cache + ".lock"
-    try:
-        if os.path.exists(lock) and time.time() - os.path.getmtime(lock) < 8: return
-        os.makedirs(os.path.dirname(cache), exist_ok=True)
-        open(lock, "w").close()
-    except Exception:
-        return
-    tmp = cache + ".%d.tmp" % os.getpid()
-    cmd = ("%s roster --json > %s 2>/dev/null && mv -f %s %s; rm -f %s" %
-           (shlex.quote(bin_path), shlex.quote(tmp), shlex.quote(tmp),
-            shlex.quote(cache), shlex.quote(lock)))
-    try:
-        subprocess.Popen(["/bin/sh", "-c", cmd], cwd=cwd, start_new_session=True,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                         stdin=subprocess.DEVNULL)
-    except Exception:
-        _quiet_rm(lock)   # spawn failed → drop the throttle so the next render can retry
-
 def _beat_stamp_path(cwd): return os.path.join(cwd, ".heimdall", ".beat-stamp")
 
-def _spawn_beat(cwd, handle, verdict):
-    """Fire-and-forget heartbeat to the CP so THIS dev shows up on teammates' walls.
-    Detached + non-blocking like the roster refresh; THROTTLED to ~1 beat / 20s via a
-    stamp file (well under the server's ~45s online TTL, but ~1 process / 20s, not per
-    3s render). heimdall-presence is a silent no-op when the CP is unconfigured/offline,
-    so this is always safe. Never blocks the render, never raises."""
+def _spawn_presence(cwd, handle, verdict):
+    """ONE coordinated, fire-and-forget presence fork per render. Cheap STAT-ONLY throttle
+    gates decide what is due — the beat stamp (~20s, under the server's ~45s TTL) and the
+    roster cache (~4s) + refresher lock (~8s) — BEFORE anything is spawned, so a throttled
+    (cold/offline) render is a pure stat → return with ZERO subprocesses. When BOTH a beat
+    and a roster refresh come due they ride ONE /bin/sh child (one fork, not two); when only
+    one is due only that runs. Throttle stamps are written BEFORE the fork so a crash still
+    backs off (one attempt per window). Detached, non-blocking, never raises — the statusline
+    must never hang or break on presence; heimdall-presence is itself a no-op when offline."""
     bin_path = os.path.join(BIN_DIR, "heimdall-presence")
     if not os.access(bin_path, os.X_OK): return
-    stamp = _beat_stamp_path(cwd)
+    now = time.time()
+    cache = _roster_cache_path(cwd); lock = cache + ".lock"; stamp = _beat_stamp_path(cwd)
+    # stat-only "is it due?" gates — NO process is spawned just to decide.
+    try: beat_due = not (os.path.exists(stamp) and now - os.path.getmtime(stamp) < 20)
+    except Exception: beat_due = False
     try:
-        if os.path.exists(stamp) and time.time() - os.path.getmtime(stamp) < 20: return
-        os.makedirs(os.path.dirname(stamp), exist_ok=True)
-        open(stamp, "w").close()   # refresh the throttle BEFORE spawning → one beat per window
+        fresh  = os.path.exists(cache) and now - os.path.getmtime(cache) < 4
+        locked = os.path.exists(lock)  and now - os.path.getmtime(lock)  < 8
+        roster_due = (not fresh) and (not locked)
+    except Exception:
+        roster_due = False
+    if not beat_due and not roster_due:
+        return   # everything throttled → the fast no-op path: zero forks.
+    try:
+        os.makedirs(os.path.join(cwd, ".heimdall"), exist_ok=True)
     except Exception:
         return
-    pv = {"pass": "pass", "deny": "deny", "scanning": "working",
-          "watching": "watching"}.get(verdict, "working")
-    env = dict(os.environ, HMD_HANDLE=(handle or ""), HMD_VERDICT=pv)
+    pieces = []; env = dict(os.environ)
+    if beat_due:
+        try: open(stamp, "w").close()   # claim the beat window BEFORE the fork → one per 20s
+        except Exception: beat_due = False
+    if beat_due:
+        pv = {"pass": "pass", "deny": "deny", "scanning": "working",
+              "watching": "watching"}.get(verdict, "working")
+        env["HMD_HANDLE"] = handle or ""; env["HMD_VERDICT"] = pv
+        pieces.append("%s beat >/dev/null 2>&1" % shlex.quote(bin_path))
+    if roster_due:
+        try: open(lock, "w").close()    # claim the refresher lock BEFORE the fork
+        except Exception: roster_due = False
+    if roster_due:
+        tmp = cache + ".%d.tmp" % os.getpid()
+        pieces.append("%s roster --json > %s 2>/dev/null && mv -f %s %s; rm -f %s" %
+                      (shlex.quote(bin_path), shlex.quote(tmp), shlex.quote(tmp),
+                       shlex.quote(cache), shlex.quote(lock)))
+    if not pieces: return
     try:
-        subprocess.Popen([bin_path, "beat"], cwd=cwd, env=env, start_new_session=True,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                         stdin=subprocess.DEVNULL)
+        subprocess.Popen(["/bin/sh", "-c", "; ".join(pieces)], cwd=cwd, env=env,
+                         start_new_session=True, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
     except Exception:
-        return
+        if roster_due: _quiet_rm(lock)   # spawn failed → drop the lock so the next render retries
 
-def roster_presence(cwd, fresh_for=4):
-    """SERVER-synced ONLINE team (devs on OTHER machines, within the server TTL). Serves a
-    short-TTL cache INSTANTLY and refreshes it in the background; an empty/missing cache
-    returns [] so team_presence can fall back to local files. Never blocks, never raises."""
-    cache = _roster_cache_path(cwd); rows = None; age = None
+def roster_presence(cwd):
+    """SERVER-synced ONLINE team (devs on OTHER machines, within the server TTL), served
+    INSTANTLY from a short-TTL cache. The background refresh that keeps the cache warm is
+    driven by _spawn_presence (coordinated with the beat into ONE fork); here we only READ.
+    An empty/missing cache returns [] so team_presence falls back to local files. Never
+    blocks, never raises."""
+    cache = _roster_cache_path(cwd); rows = None
     try:
-        age = time.time() - os.path.getmtime(cache)
         with open(cache) as f: rows = json.load(f)
     except Exception:
         rows = None
-    if age is None or age >= fresh_for:
-        _spawn_roster_refresh(cwd)   # this render uses the prior cache (or empty); next render sees fresh
     if not isinstance(rows, list): return []
     now = time.time(); out = []
     for r in rows:
@@ -207,9 +209,10 @@ def main():
         sys.stdout.write(f"{CY}▐{X}{vcol}{eyes}{X}{CY}▌{X} {vcol}{vglyph} {vword}{cnt}{X}")
         return
 
-    # keep THIS dev present on teammates' walls: a throttled, detached heartbeat (the
-    # roster read alone never announced us). Fire-and-forget — never blocks the render.
-    _spawn_beat(cwd, handle, verdict)
+    # keep THIS dev present on teammates' walls AND warm the roster cache in ONE fork: a
+    # throttled, detached beat + roster refresh (the roster read alone never announced us).
+    # Stat-only throttle gates → ZERO forks when both are throttled. Never blocks the render.
+    _spawn_presence(cwd, handle, verdict)
 
     # ── sigil anchor (squint animates; eyes stay visible in every frame) ──
     sig = SIG.render(seed, eye_override=eye, pad="")  # 4 rows, 9 cols

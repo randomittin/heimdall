@@ -480,6 +480,109 @@ else
   bad "H cp_enroll.py has $PATH_CALLS real .path() call(s) — FirestoreBackend.path() RAISES on a serving path"
 fi
 
+# ──────────────────────────────────────────────────────────────────────────────
+# I. OPEN MODE: HEIMDALL_ENROLL_OPEN=1, NO token presented (server token STILL set) -> a fresh
+#    haid enrolls; the enrolled key then signs a presence message that VERIFIES against the
+#    registered pubkey. Proves tokenless onboarding works AND the key is usable at the §3 chokepoint.
+# ──────────────────────────────────────────────────────────────────────────────
+echo
+echo "I. OPEN MODE: HEIMDALL_ENROLL_OPEN=1, NO token -> fresh haid enrolls + the key signs/verifies"
+I_OUT="$(env HEIMDALL_ENROLL_OPEN=1 "$PY" - <<'PYEOF' 2>"$EXT/i.err"
+import os, sys, json
+sys.path.insert(0, os.environ["LIB"])
+import cp_enroll, cp_auth
+# Server token is STILL configured (env), but NO token is presented — open mode must allow it.
+priv, pub = cp_auth.generate_keypair()
+haid = "haid:opendev.box-aa01"
+r = cp_enroll.enroll(haid, pub, provided_token=None)
+got = cp_auth.registered_pubkey(haid)
+owner = cp_auth.is_owner(haid)
+msg = cp_auth.canonical_message("POST", "/presence", b"{}")
+sig = cp_auth.sign(priv, msg)
+verified = bool(got) and cp_auth.verify_raw(got, msg, sig)
+print(json.dumps({"ok": r.get("ok"), "reason": r.get("reason"),
+                  "bound": got == pub, "owner": owner, "verified": verified}))
+PYEOF
+)"
+I_OK="$(printf '%s' "$I_OUT" | "$PY" -c "import json,sys;print(json.load(sys.stdin).get('ok'))" 2>/dev/null)"
+I_BOUND="$(printf '%s' "$I_OUT" | "$PY" -c "import json,sys;print(json.load(sys.stdin).get('bound'))" 2>/dev/null)"
+I_OWNER="$(printf '%s' "$I_OUT" | "$PY" -c "import json,sys;print(json.load(sys.stdin).get('owner'))" 2>/dev/null)"
+I_VERIFIED="$(printf '%s' "$I_OUT" | "$PY" -c "import json,sys;print(json.load(sys.stdin).get('verified'))" 2>/dev/null)"
+if [ "$I_OK" = "True" ] && [ "$I_BOUND" = "True" ] && [ "$I_VERIFIED" = "True" ] && [ "$I_OWNER" = "False" ]; then
+  ok "I1 open mode: a TOKENLESS enroll binds the haid (owner=False) and the key signs+verifies (durable firestore)"
+else
+  bad "I1 open-mode tokenless enroll/verify failed (out='$I_OUT')"; cat "$EXT/i.err" >&2
+fi
+
+# ──────────────────────────────────────────────────────────────────────────────
+# J. REGISTRY CAP [FALSIFIABLE]: with HEIMDALL_ENROLL_MAX_KEYS=start+3, three NET-NEW haids
+#    enroll OK, the 4th (which would exceed the cap) is REFUSED (enroll_registry_full); an
+#    EXISTING haid re-enroll is STILL ok (never blocked by the cap). Remove the cap check ->
+#    the 4th wrongly succeeds -> this section FLIPS RED.
+# ──────────────────────────────────────────────────────────────────────────────
+echo
+echo "J. REGISTRY CAP: the (cap+1)th NET-NEW haid -> refused (enroll_registry_full); existing re-enroll ok [FALSIFIABLE]"
+J_OUT="$("$PY" - <<'PYEOF' 2>"$EXT/j.err"
+import os, sys, json
+sys.path.insert(0, os.environ["LIB"])
+import cp_enroll, cp_auth
+token = os.environ["HEIMDALL_ENROLL_TOKEN"]
+start = cp_enroll._registry_key_count()
+os.environ["HEIMDALL_ENROLL_MAX_KEYS"] = str(start + 3)   # room for exactly 3 more net-new keys
+_, pub = cp_auth.generate_keypair()
+res = []
+for i in range(4):                                        # 3 fit, the 4th must be refused
+    res.append(cp_enroll.enroll("haid:capdev.box-%02d" % i, pub, provided_token=token))
+# an EXISTING haid re-enroll (same key) is never blocked by the cap, even now that it is full:
+reenroll = cp_enroll.enroll("haid:capdev.box-00", pub, provided_token=token)
+print(json.dumps({
+    "net_new_ok": all(r.get("ok") for r in res[:3]),
+    "capped_reason": res[3].get("reason"),
+    "capped_ok": res[3].get("ok"),
+    "reenroll_ok": reenroll.get("ok"),
+}))
+PYEOF
+)"
+J_NEWOK="$(printf '%s' "$J_OUT" | "$PY" -c "import json,sys;print(json.load(sys.stdin).get('net_new_ok'))" 2>/dev/null)"
+J_REASON="$(printf '%s' "$J_OUT" | "$PY" -c "import json,sys;print(json.load(sys.stdin).get('capped_reason'))" 2>/dev/null)"
+J_CAPOK="$(printf '%s' "$J_OUT" | "$PY" -c "import json,sys;print(json.load(sys.stdin).get('capped_ok'))" 2>/dev/null)"
+J_REOK="$(printf '%s' "$J_OUT" | "$PY" -c "import json,sys;print(json.load(sys.stdin).get('reenroll_ok'))" 2>/dev/null)"
+if [ "$J_NEWOK" = "True" ] && [ "$J_REASON" = "enroll_registry_full" ] && [ "$J_CAPOK" != "True" ] && [ "$J_REOK" = "True" ]; then
+  ok "J1 FALSIFIABLE: 3 net-new fit, the 4th is refused (enroll_registry_full), existing re-enroll still ok — remove the cap => RED"
+else
+  bad "J1 the registry cap did not bound net-new growth (out='$J_OUT')"; cat "$EXT/j.err" >&2
+fi
+
+# ──────────────────────────────────────────────────────────────────────────────
+# K. OPEN-MODE RATE: a per-IP flood through cp_publicsurface.check_enroll (NO token presented)
+#    trips the per-IP cap -> 429. Proves the limiter fires tokenlessly in open mode (the
+#    load-bearing flood control), at the tightened open-mode per-IP default (5).
+# ──────────────────────────────────────────────────────────────────────────────
+echo
+echo "K. OPEN-MODE RATE: a tokenless per-IP flood through check_enroll -> 429 (no token needed to trip it)"
+K_OUT="$(env HEIMDALL_ENROLL_OPEN=1 "$PY" - <<'PYEOF' 2>"$EXT/k.err"
+import os, sys, json
+sys.path.insert(0, os.environ["LIB"])
+import cp_publicsurface
+# NO enroll token in the request — the per-IP cap (open default 5) is the load-bearing limit.
+req = {"peer_ip": "203.0.113.9",
+       "body": json.dumps({"haid": "haid:flood", "pubkey": "x"})}
+statuses = []
+for _ in range(7):                       # 5 allowed, then refused for the same IP+window
+    r = cp_publicsurface.check_enroll(req, now=1000.0)
+    statuses.append(None if r is None else r[0])
+print(json.dumps({"statuses": statuses, "ip_limit": cp_publicsurface._enroll_ip_limit()}))
+PYEOF
+)"
+K_LIMIT="$(printf '%s' "$K_OUT" | "$PY" -c "import json,sys;print(json.load(sys.stdin).get('ip_limit'))" 2>/dev/null)"
+K_ALLOWED="$(printf '%s' "$K_OUT" | "$PY" -c "import json,sys;s=json.load(sys.stdin)['statuses'];print(sum(1 for x in s if x is None))" 2>/dev/null)"
+K_REFUSED="$(printf '%s' "$K_OUT" | "$PY" -c "import json,sys;s=json.load(sys.stdin)['statuses'];print(429 in s)" 2>/dev/null)"
+if [ "$K_LIMIT" = "5" ] && [ "$K_ALLOWED" = "5" ] && [ "$K_REFUSED" = "True" ]; then
+  ok "K1 open mode: a tokenless per-IP flood is rate-limited -> 429 after the tightened cap (5) — the limiter fires with NO token"
+else
+  bad "K1 the open-mode per-IP flood was not rate-limited tokenlessly (out='$K_OUT')"; cat "$EXT/k.err" >&2
+fi
+
 echo
 echo "============================================================"
 printf "cp-enroll (%s): %d passed, %d failed\n" "$MODE" "$PASS" "$FAIL"

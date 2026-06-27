@@ -32,11 +32,21 @@
 #      IMPOSSIBLE (hard refusal), not merely discouraged.
 # Either layer alone refuses dispatch; both together is the belt-and-braces boundary.
 #
-# WHY THE PUBLIC SERVICE STILL NEEDS A SECRET. POST /enroll is TOKEN-GATED, fail-closed —
-# the service needs HEIMDALL_ENROLL_TOKEN (the `cp-enroll-token` secret) to verify the
-# bootstrap token; absent, enroll refuses every request (cp_enroll.server_enroll_token()
-# -> None -> enroll_disabled). It is granted at the SECRET RESOURCE level (per-secret IAM),
-# NOT project-wide, so it cannot read any other secret the project holds.
+# ENROLL MODE — OPEN (tokenless, bounded) by DEFAULT, TOKEN-GATED on demand.
+#   • OPEN  (HEIMDALL_ENROLL_OPEN=1, the default here): zero-config onboarding — a dev sets
+#     NOTHING, /enroll needs no token. It is NOT unbounded: the server bounds tokenless
+#     enroll by the per-IP rate limit (HEIMDALL_ENROLL_IP_LIMIT/WINDOW), a deployment-wide
+#     enroll budget (HEIMDALL_ENROLL_BUDGET_MAX/WINDOW), and a HARD registry-size cap
+#     (HEIMDALL_ENROLL_MAX_KEYS). The `cp-enroll-token` secret is OPTIONAL in open mode:
+#     mounted for defense-in-depth IF it exists, and a missing token NEVER fails the deploy.
+#   • TOKEN (HEIMDALL_ENROLL_OPEN=0, the viral/public phase): /enroll is token-gated,
+#     fail-closed — the service needs HEIMDALL_ENROLL_TOKEN (the `cp-enroll-token` secret) to
+#     verify the bootstrap token; absent, enroll refuses every request. In token mode the
+#     secret is REQUIRED (an absent token = a dead enroll route → the deploy refuses).
+# Whenever the secret IS mounted it is granted at the SECRET RESOURCE level (per-secret IAM),
+# NOT project-wide, so it cannot read any other secret the project holds. Open enroll does NOT
+# relax the boundary or the SA — see the GO-LIVE-RUNBOOK open-enroll section for the residual
+# risk and how to flip back to token mode.
 #
 # THE SERVER PKI SEED IS *NOT* SHIPPED TO THE PUBLIC SERVICE BY DEFAULT. The real server
 # identity seed (`cp-pki-key`) stays SERVER-ONLY on the gated service. The public surface
@@ -75,6 +85,20 @@ PUBLIC_SA="${PUBLIC_SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
 # NEVER run as this identity — PREFLIGHT P2 hard-refuses if PUBLIC_SA resolves to it.
 GATED_SA="${GATED_SA:-heimdall-cp-run@${PROJECT_ID}.iam.gserviceaccount.com}"
 ENROLL_SECRET="${ENROLL_SECRET:-cp-enroll-token}"          # enroll bootstrap-token verifier
+# ── OPEN-ENROLL mode (tokenless onboarding) + its TIGHT abuse-control envs ─────────────
+# HEIMDALL_ENROLL_OPEN=1 (DEFAULT) → the public service accepts TOKENLESS /enroll, so a dev
+# onboards with ZERO config (no token to mint or distribute). It is NOT unbounded — the
+# server bounds tokenless enroll by the per-IP rate limit, a deployment-wide enroll budget,
+# AND a HARD registry-size cap. In open mode the cp-enroll-token secret is OPTIONAL (mounted
+# for defense-in-depth IF it exists; absent NEVER fails the deploy). Set ENROLL_OPEN=0 for the
+# viral/public phase (token REQUIRED, secret mandatory). Every knob is env-overridable; the
+# defaults are TIGHT (mirrors cp_publicsurface.py's _int_env fallbacks, conservatively lower).
+ENROLL_OPEN="${ENROLL_OPEN:-1}"                            # 1=tokenless+bounded, 0=token-gated
+ENROLL_IP_LIMIT="${ENROLL_IP_LIMIT:-5}"                    # new enrolls per client-IP per window
+ENROLL_IP_WINDOW="${ENROLL_IP_WINDOW:-60}"                 # the per-IP window (seconds)
+ENROLL_MAX_KEYS="${ENROLL_MAX_KEYS:-1000}"                 # HARD cap on the key-registry size
+ENROLL_BUDGET_MAX="${ENROLL_BUDGET_MAX:-50}"              # deployment-wide new enrolls / window
+ENROLL_BUDGET_WINDOW="${ENROLL_BUDGET_WINDOW:-3600}"       # the enroll-budget window (seconds)
 # CONDITIONAL server-PKI seed for the public service. DEFAULT EMPTY = no PKI seed shipped
 # (the real cp-pki-key stays SERVER-ONLY). Set ONLY if the PKI-need audit says the public
 # service needs a boot seed — and then to a DISTINCT THROWAWAY secret, never `cp-pki-key`.
@@ -110,6 +134,7 @@ say "==> heimdall-cp-public deploy (${MODE} mode)"
 say "    project=${PROJECT_ID} region=${REGION} public-service=${PUBLIC_SERVICE}"
 say "    public SA=${PUBLIC_SA} (LEAST PRIVILEGE — no run.jobs.run, no dispatch IAM)"
 say "    public surface = {${PUBLIC_SURFACE_ROUTES}}  (HEIMDALL_PUBLIC_SURFACE=1)"
+say "    enroll mode = HEIMDALL_ENROLL_OPEN=${ENROLL_OPEN} (1=tokenless+bounded; caps IP=${ENROLL_IP_LIMIT}/${ENROLL_IP_WINDOW}s, budget=${ENROLL_BUDGET_MAX}/${ENROLL_BUDGET_WINDOW}s, registry=${ENROLL_MAX_KEYS})"
 
 # ── PREFLIGHT — the dangerous mistakes are made IMPOSSIBLE here, not just documented ──
 # P1/P2 are pure string checks (always enforced, no creds). P3 probes live IAM: a found
@@ -217,6 +242,44 @@ preflight() {
 
 preflight
 
+# ── enroll-token mode resolution — OPTIONAL in open mode, REQUIRED in token mode ───────
+# Open enroll makes the cp-enroll-token secret OPTIONAL: it is still granted+mounted for
+# defense-in-depth IF it exists, but an ABSENT token NEVER fails an open-mode deploy (the
+# server enrolls tokenless, bounded by the per-IP/budget/registry caps). In token mode the
+# secret is REQUIRED — an absent token = a dead enroll route, so the deploy refuses.
+# MOUNT_ENROLL_TOKEN gates BOTH the secretAccessor grant (section 1) and the secret mount
+# (section 2), so a tokenless open deploy grants and mounts NOTHING enroll-token-related.
+enroll_open() {
+  case "${ENROLL_OPEN}" in 1|true|yes|on|TRUE|YES|ON|True|Yes|On) return 0;; *) return 1;; esac
+}
+MOUNT_ENROLL_TOKEN=0
+resolve_enroll_token() {
+  if [ "$MODE" = "apply" ]; then
+    if gcloud secrets describe "${ENROLL_SECRET}" --project="${PROJECT_ID}" >/dev/null 2>&1; then
+      MOUNT_ENROLL_TOKEN=1
+      say "    enroll-token: ${ENROLL_SECRET} present — granting + mounting it (defense-in-depth token mode stays available alongside open)"
+    elif enroll_open; then
+      MOUNT_ENROLL_TOKEN=0
+      warn "enroll-token ${ENROLL_SECRET} ABSENT — OPEN mode (HEIMDALL_ENROLL_OPEN=${ENROLL_OPEN}): deploying TOKENLESS (no token grant/mount). Enroll is bounded by the per-IP/budget/registry caps."
+    else
+      die "enroll-token ${ENROLL_SECRET} is ABSENT and ENROLL_OPEN=${ENROLL_OPEN} (token mode).
+       Token-gated enroll would REFUSE every request — a dead enroll route. Mint cp-enroll-token
+       (GO-LIVE-RUNBOOK §2.2), or set ENROLL_OPEN=1 for tokenless open enroll."
+    fi
+  else
+    # plan (creds-optional, cannot probe Secret Manager): describe what apply will do. In open
+    # mode the token is OPTIONAL — apply mounts it IFF the secret exists; we PRINT the grant/
+    # mount so the plan shows the defense-in-depth path. In token mode the token is REQUIRED.
+    MOUNT_ENROLL_TOKEN=1
+    if enroll_open; then
+      say "    enroll-token: OPTIONAL (open mode, HEIMDALL_ENROLL_OPEN=${ENROLL_OPEN}) — apply mounts ${ENROLL_SECRET} IFF it exists; tokenless enroll works if absent"
+    else
+      say "    enroll-token: REQUIRED (token mode, HEIMDALL_ENROLL_OPEN=${ENROLL_OPEN}) — apply mounts ${ENROLL_SECRET}"
+    fi
+  fi
+}
+resolve_enroll_token
+
 # ── resolve the image to an IMMUTABLE DIGEST (never a floating tag, never from-source) ──
 # The public service must run the byte-identical image the gated service serves, pinned by
 # digest (the deploy-arc lesson). In `apply` this resolution is HARD — a non-digest is fatal.
@@ -291,12 +354,18 @@ run gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
 
 # Secret access — granted at the SECRET RESOURCE level (NOT project-wide), so the public
 # SA can read ONLY the secret(s) it needs and no other secret in the project. The enroll
-# token is always needed (token-gated enroll). The PKI seed is granted ONLY when a distinct
-# throwaway public seed is configured (PREFLIGHT P4 guarantees it is not the real seed).
-run gcloud secrets add-iam-policy-binding "${ENROLL_SECRET}" \
-  --project="${PROJECT_ID}" \
-  --member="serviceAccount:${PUBLIC_SA}" \
-  --role="roles/secretmanager.secretAccessor"
+# token is granted ONLY when it is being mounted (MOUNT_ENROLL_TOKEN — present, or required
+# in token mode); an open-mode tokenless deploy grants no enroll-token accessor at all. The
+# PKI seed is granted ONLY when a distinct throwaway public seed is configured (PREFLIGHT P4
+# guarantees it is not the real seed).
+if [ "${MOUNT_ENROLL_TOKEN}" = "1" ]; then
+  run gcloud secrets add-iam-policy-binding "${ENROLL_SECRET}" \
+    --project="${PROJECT_ID}" \
+    --member="serviceAccount:${PUBLIC_SA}" \
+    --role="roles/secretmanager.secretAccessor"
+else
+  say "    enroll-token ${ENROLL_SECRET} absent + open mode — skipping its accessor grant (tokenless enroll)"
+fi
 if [ -n "${PUBLIC_PKI_SECRET}" ]; then
   run gcloud secrets add-iam-policy-binding "${PUBLIC_PKI_SECRET}" \
     --project="${PROJECT_ID}" \
@@ -309,20 +378,36 @@ fi
 say "    (NO run.jobs.run / heimdallJobRunner / run.developer granted — public SA cannot dispatch)"
 
 # ── 2. assemble the per-service secrets + env (least exposure) ────────────────────────
-# Enroll token always. PKI seed ONLY on the conditional throwaway path. HEIMDALL_PUBLIC_
-# SURFACE=1 is set ONLY here (the public service); PREFLIGHT P1 guarantees this script can
-# never target the gated service, so the flag never leaks onto it.
-SECRETS="HEIMDALL_ENROLL_TOKEN=${ENROLL_SECRET}:latest"
+# Enroll token ONLY when MOUNT_ENROLL_TOKEN (present, or required in token mode). PKI seed
+# ONLY on the conditional throwaway path. HEIMDALL_PUBLIC_SURFACE=1 is set ONLY here (the
+# public service); PREFLIGHT P1 guarantees this script can never target the gated service, so
+# the flag never leaks onto it. The OPEN-ENROLL env (HEIMDALL_ENROLL_OPEN + the abuse-control
+# caps) is the server contract for tokenless+bounded enroll; it is ALWAYS set, so the server
+# knows the mode explicitly (ENROLL_OPEN=0 flips back to token-gated, secret-mandatory).
+add_secret() { [ -n "${SECRETS}" ] && SECRETS="${SECRETS},$1" || SECRETS="$1"; }
+SECRETS=""
+[ "${MOUNT_ENROLL_TOKEN}" = "1" ] && add_secret "HEIMDALL_ENROLL_TOKEN=${ENROLL_SECRET}:latest"
 ENVVARS="HEIMDALL_PUBLIC_SURFACE=1,HEIMDALL_STATE_BACKEND=firestore,GOOGLE_CLOUD_PROJECT=${PROJECT_ID}"
+# Open-enroll mode + TIGHT abuse-control caps (the server contract). Bounds tokenless enroll
+# by per-IP rate, the deployment-wide budget, and the HARD registry-size cap.
+ENVVARS="${ENVVARS},HEIMDALL_ENROLL_OPEN=${ENROLL_OPEN}"
+ENVVARS="${ENVVARS},HEIMDALL_ENROLL_IP_LIMIT=${ENROLL_IP_LIMIT},HEIMDALL_ENROLL_IP_WINDOW=${ENROLL_IP_WINDOW}"
+ENVVARS="${ENVVARS},HEIMDALL_ENROLL_MAX_KEYS=${ENROLL_MAX_KEYS}"
+ENVVARS="${ENVVARS},HEIMDALL_ENROLL_BUDGET_MAX=${ENROLL_BUDGET_MAX},HEIMDALL_ENROLL_BUDGET_WINDOW=${ENROLL_BUDGET_WINDOW}"
 if [ -n "${PUBLIC_PKI_SECRET}" ]; then
   # CONDITIONAL (PKI-need audit verdict) — distinct throwaway seed + distinct server HAID,
   # so the public boot identity can never clobber the gated server's registry binding.
-  SECRETS="${SECRETS},HEIMDALL_CP_PKI_KEY=${PUBLIC_PKI_SECRET}:latest"
+  add_secret "HEIMDALL_CP_PKI_KEY=${PUBLIC_PKI_SECRET}:latest"
   ENVVARS="${ENVVARS},HEIMDALL_CP_SERVER_HAID=${PUBLIC_SERVER_HAID}"
-  say "    secrets: enroll-token + DISTINCT throwaway PKI seed (${PUBLIC_PKI_SECRET}); server HAID=${PUBLIC_SERVER_HAID}"
-else
-  say "    secrets: enroll-token ONLY — no server PKI seed on the public service (least exposure)"
 fi
+if enroll_open; then
+  say "    enroll: OPEN (tokenless, bounded) — IP=${ENROLL_IP_LIMIT}/${ENROLL_IP_WINDOW}s, budget=${ENROLL_BUDGET_MAX}/${ENROLL_BUDGET_WINDOW}s, registry cap=${ENROLL_MAX_KEYS} keys"
+else
+  say "    enroll: TOKEN-GATED (HEIMDALL_ENROLL_OPEN=${ENROLL_OPEN}) — cp-enroll-token REQUIRED"
+fi
+[ "${MOUNT_ENROLL_TOKEN}" = "1" ] \
+  && say "    secrets: enroll-token (${ENROLL_SECRET}) mounted${PUBLIC_PKI_SECRET:+ + DISTINCT throwaway PKI seed (${PUBLIC_PKI_SECRET})}" \
+  || say "    secrets: NO enroll-token (open + absent)${PUBLIC_PKI_SECRET:+ — DISTINCT throwaway PKI seed (${PUBLIC_PKI_SECRET}) only}"
 
 # ── 3. deploy the PUBLIC service ─────────────────────────────────────────────────────
 # Same resource envelope as the gated §3 (max-instances caps fan-out, scale-to-zero idle), but:
@@ -330,7 +415,9 @@ fi
 #   • --allow-unauthenticated   — reachable with NO Cloud Run IAM bearer (zero-config dev).
 #   • --service-account public SA — the least-privilege identity (cannot dispatch).
 #   • HEIMDALL_PUBLIC_SURFACE=1  — the APP-LAYER gate: serve public routes, 404 the rest.
-#   • HEIMDALL_ENROLL_TOKEN      — from cp-enroll-token, so token-gated enroll can verify.
+#   • HEIMDALL_ENROLL_OPEN=1     — tokenless onboarding, bounded by the abuse-control caps.
+#   • HEIMDALL_ENROLL_TOKEN      — from cp-enroll-token, mounted ONLY when present/required
+#                                  (open mode tolerates it absent — see resolve_enroll_token).
 # NOTE: HEIMDALL_JOB_RUNNER is intentionally NOT set — the public surface 404s /dispatch
 # and /jobs, so the runner is never reached; and even if it were, the missing run.jobs.run
 # IAM blocks the execute. The two layers are independent.
