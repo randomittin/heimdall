@@ -23,7 +23,14 @@ fi
 CY=$'\033[38;2;34;211;238m'; GR=$'\033[38;2;34;197;94m'; DIM=$'\033[38;2;90;100;114m'
 EYEC=$'\033[38;2;240;248;255m'; B=$'\033[1m'; X=$'\033[0m'
 TAGLINE="${CY}${B}HEIMDALL${X} ${DIM}· nothing ships unproven${X}"
+TAGLINE_PLAIN="HEIMDALL · nothing ships unproven"   # ANSI-free, for piped/non-TTY paste
 N=4   # compact sigil row count
+
+# The PUBLIC join URL printed on the share card. PUBLIC by design — the project's
+# front door, NOT a team secret and NEVER the enroll token. Overridable for
+# self-hosters via HEIMDALL_PUBLIC_URL; defaults to the canonical site (the same
+# host install.sh's curl one-liner uses).
+PUBLIC_URL="${HEIMDALL_PUBLIC_URL:-https://runheimdall.dev}"
 
 # face <eye-rgb "r;g;b" or ""> [size]  — render the watchman sigil
 face() {
@@ -35,6 +42,26 @@ e = os.environ.get("HMD_EYE", "")
 eye = tuple(int(x) for x in e.split(";")) if e else None
 fn = m.render_large if os.environ.get("HMD_SIZE") == "large" else m.render
 print("\n".join(fn(sys.argv[1], eye_override=eye, pad="  ")))
+PY
+}
+
+# face_mono — the ANSI-FREE watchman, for the piped/non-TTY share block. The
+# colored half-block sigil is unreadable as plain text (every cell is a filled
+# block; without color the face vanishes into a rectangle), so a pasteable card
+# needs a monochrome glyph map. Uses the SAME deterministic grid (grid_for) the
+# colored renderer uses — same seed -> same face — and maps each full-resolution
+# pixel to a 2-wide glyph: off=blank (the face floats, no boxy frame), body=▓▓
+# (medium shade), eye=██ (the bright glint). Trailing blanks are trimmed so the
+# block pastes clean into GitHub / HN with no ragged whitespace. NO escape codes.
+face_mono() {
+  python3 - "$SEED" <<'PY'
+import sys, os, importlib.util
+spec = importlib.util.spec_from_file_location("s", os.path.join(os.environ["HMD_SIGIL_DIR"], "hmd_sigil.py"))
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+g, _hue, _eye = m.grid_for(sys.argv[1])
+GLYPH = {0: "  ", 1: "▓▓", 2: "██"}  # off / body / eye-glint
+for row in g:
+    print(("  " + "".join(GLYPH[v] for v in row)).rstrip())
 PY
 }
 
@@ -61,13 +88,33 @@ hmd_wake() {
   printf '\n'
 }
 
+# hmd_share — the postable "claim your watchman" card. Carries ONLY public
+# material: the deterministic sigil art, the public HANDLE, the tagline, and the
+# PUBLIC join URL. NEVER a secret (no cp-endpoint / enroll token is read here).
+#   TTY      → colored large sigil (renders in a terminal / screen-recording).
+#   non-TTY  → ANSI-free block (pastes as clean text into GitHub / HN).
 hmd_share() {
-  printf '\n'
-  face "$OPEN" large
-  printf '\n'
-  printf '  %b\n' "${CY}${B}@${HANDLE}${X}   ${DIM}your watchman${X}"
-  printf '  %b\n' "$TAGLINE"
-  printf '\n'
+  if is_tty; then
+    printf '\n'
+    face "$OPEN" large
+    printf '\n'
+    printf '  %b\n' "${CY}${B}@${HANDLE}${X}   ${DIM}your watchman${X}"
+    printf '  %b\n' "$TAGLINE"
+    printf '  %b\n' "${DIM}join${X}  ${CY}${PUBLIC_URL}${X}"
+    printf '\n'
+    printf '  %b\n' "${DIM}my Heimdall watchman — ${PUBLIC_URL}${X}"
+    printf '\n'
+  else
+    printf '\n'
+    face_mono
+    printf '\n'
+    printf '  @%s — your watchman\n' "$HANDLE"
+    printf '  %s\n' "$TAGLINE_PLAIN"
+    printf '  join  %s\n' "$PUBLIC_URL"
+    printf '\n'
+    printf '  my Heimdall watchman — %s\n' "$PUBLIC_URL"
+    printf '\n'
+  fi
 }
 
 case "${1:-}" in

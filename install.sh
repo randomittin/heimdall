@@ -427,6 +427,41 @@ _tele_install_step() {
   "$tele_bin" "${args[@]}" >/dev/null 2>&1 || true
 }
 
+# Render the dev's watchman sigil for the success card — the "claim your
+# watchman" moment. Truecolor ANSI half-blocks, so it is ONLY meaningful on a
+# real terminal: callers MUST gate on FANCY (TTY + color) or it is garbage in a
+# pipe/CI. Resolves the sigil SEED from the installed identity bin ($USER
+# fallback — heimdall-identity never errors) and renders the compact face via
+# the SINGLE sigil renderer (sentinels/hmd_sigil.py). Missing python3 / sigil
+# script is a clean no-op (prints nothing) — never an error. No secret is read
+# or printed: the seed is a public handle/username, never the enroll token.
+render_sigil() {
+  local plugin_dir="$1"
+  local sigil="$plugin_dir/sentinels/hmd_sigil.py"
+  local idbin="$plugin_dir/bin/heimdall-identity"
+  command -v python3 >/dev/null 2>&1 || return 0
+  [ -f "$sigil" ] || return 0
+  local seed=""
+  [ -x "$idbin" ] && seed="$("$idbin" 2>/dev/null || true)"
+  [ -n "$seed" ] || seed="${USER:-you}"
+  HMD_SIGIL="$sigil" python3 - "$seed" <<'PY' 2>/dev/null || true
+import sys, os, importlib.util
+spec = importlib.util.spec_from_file_location("s", os.environ["HMD_SIGIL"])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+for line in m.render(sys.argv[1], pad="   "):
+    print(line)
+PY
+}
+
+# The display HANDLE for the success card's watchman label. Resolves via the
+# installed identity bin ($USER fallback); never errors. Prints the bare handle.
+sigil_handle() {
+  local idbin="$1/bin/heimdall-identity" h=""
+  [ -x "$idbin" ] && h="$("$idbin" --handle 2>/dev/null || true)"
+  [ -n "$h" ] || h="${USER:-you}"
+  printf '%s' "$h"
+}
+
 main() {
   # ── Configuration ────────────────────────────────────────────────────────
   # Pinned ref. No release tag exists yet, so this defaults to `main`; the
@@ -839,6 +874,26 @@ main() {
     say "In Claude:   /hmd:verify  /hmd:save"
     say "Docs:        runheimdall.dev"
     say "Uninstall:   $PRIMARY uninstall"
+  fi
+
+  # ── 5b. Claim your watchman (the identity hook) ───────────────────────────
+  # The "claim your watchman" moment: show the dev THEIR deterministic sigil and
+  # the two ways to spread it — `hmd invite` (recruit the team) and the share
+  # card (post it). TTY-ONLY (FANCY): the sigil is truecolor half-blocks that
+  # would be garbage in a pipe/CI, so a non-interactive install (curl|bash / CI)
+  # renders NONE of this — a clean no-op. No secret is read or printed (the sigil
+  # seed is a public handle/username, never the enroll token).
+  if [ "$FANCY" -eq 1 ]; then
+    local WM_HANDLE; WM_HANDLE="$(sigil_handle "$PLUGIN_DIR")"
+    blank
+    printf '   %s%sYour watchman%s  %s@%s%s %s— claim it.%s\n' \
+      "$C_BOLD" "$C_WHITE" "$C_RESET" "$C_CYAN" "$WM_HANDLE" "$C_RESET" "$C_DIM" "$C_RESET"
+    render_sigil "$PLUGIN_DIR"
+    blank
+    printf '   %srecruit your team%s   %s%s invite%s\n' \
+      "$C_DIM" "$C_RESET" "$C_CYAN" "$PRIMARY" "$C_RESET"
+    printf '   %spost your watchman%s  %s%s/sentinels/hmd-banner.sh --share%s\n' \
+      "$C_DIM" "$C_RESET" "$C_CYAN" "$SHORT_PATH" "$C_RESET"
   fi
 
   # ── 6. Next step + runtime ────────────────────────────────────────────────
