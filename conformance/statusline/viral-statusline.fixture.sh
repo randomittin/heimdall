@@ -7,15 +7,15 @@
 #   verdict colors the line ("bifröst closed"); a fresh teammate file -> the watch
 #   wall names them; a stale (old ts) file -> teammate dropped.
 # GUARANTEE: every output row's visible width is <= COLUMNS. line() subtracts
-#   the 9-col sigil anchor (+2 gutter) prefixed on every row, so the right-pinned
-#   verdict block lands exactly at COLUMNS and never overflows.
+#   the 8-col square sigil anchor (+2 gutter) prefixed on every row, so the
+#   right-pinned verdict block lands exactly at COLUMNS and never overflows.
 ROW="statusline:viral-statusline"
 source "$(dirname "${BASH_SOURCE[0]}")/../_lib.sh"
 
 SL="$PLUGIN_ROOT/sentinels/hmd-statusline.py"
 assert_file "$SL" "hmd-statusline.py present"
 
-ANCHOR=11   # sigil gutter prepended to content rows: 9 grid cols + 2-space pad
+ANCHOR=10   # sigil gutter prepended to content rows: 8 square grid cols + 2-space pad
 COLS=120
 
 # max visible width across all output rows (ANSI-stripped, true char count)
@@ -34,23 +34,51 @@ if [ "$NL" -ge 4 ]; then ok "renders >=4 rows (got $NL)"; else bad "rendered $NL
 
 # ── 2) width: EVERY row's visible width <= COLUMNS (sigil anchor included) ──
 # Regression guard for the line() width-math bug: line() must subtract the
-# 9-col sigil anchor (+2 gutter) so the right block pins to COLUMNS, never over.
+# 8-col square sigil anchor (+2 gutter) so the right block pins to COLUMNS, never over.
 MW="$(printf '%s' "$OUT" | maxw)"
 if [ "$MW" -le "$COLS" ]; then ok "max row width $MW <= COLUMNS($COLS)"
 else bad "max row width $MW exceeds COLUMNS($COLS) by $(( MW - COLS )) — line() must subtract the sigil anchor"; fi
 
-# ── 2b) SQUINT, not blink: eyes visible in EVERY frame (P3 screenshot guard) ──
-# A still can land on any animation frame. The old blink shut the eyes to a
-# near-black (38;44;53) ~20% of frames -> an eyeless still. Squint dims to a
-# muted white (150;160;175) and NEVER goes dark. HMD_NOW pins the clock:
-# t%5==0 -> squint frame, else -> bright white glint (240;248;255). The eye
-# color codes appear ONLY in the sigil rows, so a raw grep proves eye presence.
-SQUINT_OUT="$(printf '{}' | HMD_NOW=5 COLUMNS=$COLS python3 "$SL")"   # 5%5==0 -> squint
-BRIGHT_OUT="$(printf '{}' | HMD_NOW=7 COLUMNS=$COLS python3 "$SL")"   # 7%5!=0 -> bright
-assert_contains "$SQUINT_OUT" "150;160;175" "squint frame -> dimmed-white eyes still visible"
-assert_contains "$BRIGHT_OUT" "240;248;255" "non-squint frame -> bright white eye glint"
-if grep -qF '38;44;53' <<<"$SQUINT_OUT"; then bad "squint emitted the old near-black eye (eyeless-still risk)"
-else ok "squint never emits a fully-dark eye (no eyeless still)"; fi
+# ── 2b) RICHER EYE ANIMATION, never eyeless (P3 screenshot guard) ──────────────
+# The eyes are the watchman's signature, so they animate — but every phase is a
+# LIGHT color and the eyes stay VISIBLE in EVERY frame (a still can land on any
+# frame; the eyeless-capture lesson holds). A deterministic 12-tick cycle:
+#   phase 0      -> BLINK  (120;128;145) eyes nearly closed, dimmed but visible
+#   phase 4,8    -> LOOK   (255;255;255) a bright glint passes across the eyes
+#   else         -> GLINT  (240;248;255) the steady bright watch
+# HMD_NOW pins the clock. The 4 eye colors are eye-EXCLUSIVE (no other element
+# emits them), so a raw grep proves eye presence per frame.
+BLINK_OUT="$(printf '{}'  | HMD_NOW=0  COLUMNS=$COLS python3 "$SL")"   # 0%12==0  -> blink
+LOOK_OUT="$(printf '{}'   | HMD_NOW=4  COLUMNS=$COLS python3 "$SL")"   # 4%12==4  -> look
+GLINT_OUT="$(printf '{}'  | HMD_NOW=1  COLUMNS=$COLS python3 "$SL")"   # 1%12==1  -> glint
+assert_contains "$BLINK_OUT" "120;128;145" "blink frame -> dimmed-but-visible eyes (never dark)"
+assert_contains "$LOOK_OUT"  "255;255;255" "look frame -> a bright glint passes across the eyes"
+assert_contains "$GLINT_OUT" "240;248;255" "steady frame -> bright white watch-glint"
+# never the old near-black blink (38;44;53) on ANY of these frames -> no eyeless still
+for F in "$BLINK_OUT" "$LOOK_OUT" "$GLINT_OUT"; do
+  if grep -qF '38;44;53' <<<"$F"; then bad "a frame emitted the old near-black eye (eyeless-still risk)"; fi
+done
+ok "no frame emits a fully-dark eye (no eyeless still)"
+
+# ── 2c) EYES IN EVERY FRAME: sweep the whole 12-tick cycle; each frame MUST carry
+# one of the eye-light colors (the never-eyeless guarantee across the full cycle). ──
+EYELESS=0
+for T in 0 1 2 3 4 5 6 7 8 9 10 11; do
+  FR="$(printf '{}' | HMD_NOW=$T COLUMNS=$COLS python3 "$SL")"
+  if grep -qE '120;128;145|255;255;255|240;248;255|150;160;175' <<<"$FR"; then :; else
+    EYELESS=1; bad "frame t=$T has NO visible eye color (eyeless!)"
+  fi
+done
+[ "$EYELESS" = 0 ] && ok "eyes visible in EVERY frame across the 12-tick cycle (never eyeless)"
+
+# ── 2d) SCANNING verdict -> a faster look-pulse (LOOK on even ticks, SQUINT on odd),
+# both LIGHT colors so the actively-scanning watchman never goes eyeless either. ──
+printf '{"verdict":"scanning"}' > "$WS/.heimdall/statusline.json"
+SCAN_EVEN="$(printf '%s' "$JSON" | HMD_NOW=2 COLUMNS=$COLS python3 "$SL")"   # even -> LOOK
+SCAN_ODD="$(printf '%s'  "$JSON" | HMD_NOW=3 COLUMNS=$COLS python3 "$SL")"   # odd  -> SQUINT
+assert_contains "$SCAN_EVEN" "255;255;255" "scanning even tick -> bright look-pulse eyes"
+assert_contains "$SCAN_ODD"  "150;160;175" "scanning odd tick -> alert squint eyes (still visible)"
+rm -f "$WS/.heimdall/statusline.json"
 
 # ── 3) --widget: one ccstatusline-coexistence segment line ──
 WID="$(printf '{}' | COLUMNS=$COLS python3 "$SL" --widget)"; WEC=$?

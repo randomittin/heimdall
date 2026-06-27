@@ -188,20 +188,30 @@ def main():
     cols = int(os.environ.get("COLUMNS") or 120)
     RMARGIN = 6  # right safety gutter: clears Claude Code's scrollbar + edge padding so the verdict never clips off-screen
 
-    # ── animation: the watchman keeps a bright WHITE eye glint so the face
-    # always reads. The verdict is shown by the right block + bar + bifröst
-    # text — NOT by recoloring the eyes: a verdict-colored eye washes into a
-    # same-hue body (e.g. cyan 'watching' eyes on a teal sigil) and erases the
-    # face. SQUINT, not blink: every ~5s the eyes DIM to a muted white, they
-    # NEVER go dark. A still can land on any frame, so a full-dark blink could
-    # be captured eyeless — a squint keeps the watchman's eyes visible in EVERY
-    # frame. Scanning gets the same gentle dim pulse. HMD_NOW overrides the
-    # clock for deterministic conformance. (The red deny-flash lives in
-    # hmd-gate-anim.sh, not here.)
+    # ── eye animation: the watchman's eyes are the signature, so they animate —
+    # but NEVER off the verdict (a verdict-colored eye washes into a same-hue body
+    # and erases the face; the verdict reads from the right block + bar + bifröst
+    # text). And NEVER fully dark: a still can land on ANY frame, so every phase is
+    # a LIGHT color and the eyes stay visible in EVERY frame (the eyeless-capture
+    # lesson holds). A cheap, deterministic 12-tick cycle (~36s at the 3s refresh)
+    # keeps the watchman alive in a screen recording, richer than a lone squint:
+    #   • BLINK  — one tick the eyes dim to a near-closed muted slate (still visible)
+    #   • LOOK   — a couple of ticks a brighter glint passes across the eyes (a scan)
+    #   • GLINT  — the steady bright white watch the rest of the time
+    # Scanning verdict overrides with a faster look-pulse so the watchman reads as
+    # actively scanning. HMD_NOW overrides the clock for deterministic conformance.
+    # (The red deny-flash / pass-sparkle live in hmd-gate-anim.sh, not here.)
     t = int(os.environ.get("HMD_NOW") or time.time())
-    SQUINT = (150, 160, 175)                      # muted white — dimmed, never dark
-    eye = SQUINT if (t % 5 == 0) else None        # None -> default bright white glint
-    if verdict == "scanning" and (t % 2 == 0): eye = SQUINT  # subtle dim pulse, still visible
+    GLINT  = (240, 248, 255)   # steady bright white watch-glint (the default eye)
+    LOOK   = (255, 255, 255)   # pure-white pulse — a light passing across the eyes
+    BLINK  = (120, 128, 145)   # a blink: eyes nearly closed, dimmed but STILL VISIBLE
+    SQUINT = (150, 160, 175)   # alert squint — muted white, never dark
+    phase = t % 12
+    if phase == 0:          eye = BLINK       # ~1 frame in 12: a quick blink
+    elif phase in (4, 8):   eye = LOOK        # periodic bright look/scan pulse
+    else:                   eye = GLINT       # steady bright watch
+    if verdict == "scanning":                 # actively scanning -> faster look-pulse
+        eye = LOOK if (t % 2 == 0) else SQUINT
 
     if "--widget" in sys.argv:
         eyes = {"pass":"^ ^","deny":"O O","scanning":". .","watching":"• •"}[verdict]
@@ -215,9 +225,9 @@ def main():
     _spawn_presence(cwd, handle, verdict)
 
     # ── sigil anchor (squint animates; eyes stay visible in every frame) ──
-    sig = SIG.render(seed, eye_override=eye, pad="")  # 4 rows, 9 cols
-    SW = 9
-    ANCHOR = SW + 2  # sigil(9 cols) + 2-space gutter, prefixed on EVERY row
+    sig = SIG.render(seed, eye_override=eye, pad="")  # 4 rows, 8 cols (square sprite)
+    SW = 8
+    ANCHOR = SW + 2  # sigil(8 cols) + 2-space gutter, prefixed on EVERY row
 
     # context bar
     bcol = RD if pct >= 90 else AM if pct >= 70 else GR
@@ -337,7 +347,7 @@ def main():
     sys.stdout.write("\n".join(out) + "\n")
 
 def _sig(rows, i, fallback):
-    return rows[i] if i < len(rows) else "         "
+    return rows[i] if i < len(rows) else "        "   # 8-space blank = square sigil width
 
 if __name__ == "__main__":
     main()
