@@ -1,0 +1,234 @@
+#!/usr/bin/env bash
+# heimdall-team — per-repo TEAM secret manager (the CLIENT side of multi-tenant
+# team presence).
+#
+# WHAT A TEAM IS. A team = a high-entropy SECRET scoped to a repo. Presence (a
+# teammate's HAID + online + current file/edits) is visible ONLY to holders of
+# that secret; cross-team and outsiders see NOTHING. The secret is a bearer
+# capability — its NON-secret handle is
+#
+#     team_id = sha256(b"heimdall-team\0" + team_secret).hexdigest()[:32]
+#
+# a one-way hash the server keys every presence partition on. Knowing team_id
+# (it appears in storage keys) never yields the secret.
+#
+# WHERE IT LIVES. Per-repo in <repo>/.heimdall/team.json (mode 0600, gitignored),
+# next to the per-repo identity.json — because a dev may be on DIFFERENT teams in
+# different repos. The control-plane URL stays GLOBAL in ~/.heimdall/cp-endpoint.json
+# (it is not a secret). Shape:
+#     { "team_secret": "<base64url-43>", "created": <epoch> }
+#
+# ZERO-CONFIG. You do not have to run this at all: heimdall-presence AUTO-MINTS a
+# solo team on first beat/roster (ruling 1b) so a dev starts in their own private
+# team and sees only themselves until they share/invite. Run `new` to mint + share
+# deliberately, `join` to enroll into a teammate's team, `show` to inspect.
+#
+# Subcommands:
+#   heimdall-team new [--force]   mint a team_secret -> <repo>/.heimdall/team.json
+#                                 (0600); print the secret + the heimdall-invite
+#                                 join one-liner. Refuses to clobber an existing
+#                                 team.json without --force.
+#   heimdall-team join <secret>   write <repo>/.heimdall/team.json with a teammate's
+#                                 secret (>=32 chars) — join their team.
+#   heimdall-team show [--json]   print the NON-SECRET team_id + whether configured.
+#                                 NEVER prints the secret.
+#   -h, --help
+#
+# SECURITY. The secret is written ONLY to team.json (0600). It NEVER crosses the
+# argv of a child process (argv shows in `ps`) — it travels bash->python via the
+# ENVIRONMENT only — is never logged, and never committed (.gitignore). `new`
+# prints it to stdout ONCE (the owner must see it to share, with a caveat); `show`
+# never prints it; `join` takes it as this CLI's own argv (the documented entry
+# point) but re-exposes it to nothing.
+#
+# Store: <git toplevel of $PWD>/.heimdall/team.json. HEIMDALL_TEAM_DIR overrides
+# the dir wholesale (tests + non-git trees). Mirrors bin/heimdall-identity.
+#
+# Exit: 0 ok; 2 usage / refuse-clobber / weak-secret / IO error.
+set -uo pipefail
+
+SELF="$0"
+if command -v readlink >/dev/null 2>&1; then
+  SELF="$(readlink -f "$0" 2>/dev/null || readlink "$0" 2>/dev/null || echo "$0")"
+fi
+BIN_DIR="$(cd "$(dirname "$SELF")" 2>/dev/null && pwd)"
+INVITE_CLI="$BIN_DIR/heimdall-invite"
+
+PY="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)"
+[ -n "$PY" ] || { echo "heimdall-team: python3 is required" >&2; exit 2; }
+
+usage() { sed -n '2,46p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+# ── Store location (per-repo, mirrors heimdall-identity) ────────────────────────
+repo_root() { git rev-parse --show-toplevel 2>/dev/null || pwd; }
+TEAM_DIR="${HEIMDALL_TEAM_DIR:-$(repo_root)/.heimdall}"
+TEAM_FILE="$TEAM_DIR/team.json"
+
+# ── Primitives (secret crosses to python via ENV, never argv) ───────────────────
+# Mint 32 random bytes -> base64url (43 chars, no padding) == secrets.token_urlsafe(32).
+mint_secret() { "$PY" -c 'import secrets; print(secrets.token_urlsafe(32))'; }
+
+# team_id = sha256("heimdall-team\0"+secret)[:32] — MUST match the server byte-for-byte.
+team_id_of() { # $1 = secret (via env, not argv)
+  HMD_TEAM_SEC="$1" "$PY" - <<'PYEOF'
+import hashlib, os
+s = os.environ["HMD_TEAM_SEC"]
+print(hashlib.sha256(b"heimdall-team\x00" + s.encode("utf-8")).hexdigest()[:32])
+PYEOF
+}
+
+# Read the configured secret (empty if absent/unreadable). Used internally only —
+# the value is never printed; only team_id_of() output is shown to the user.
+read_secret() {
+  [ -f "$TEAM_FILE" ] || { printf ''; return 0; }
+  HMD_TEAM_FILE="$TEAM_FILE" "$PY" - <<'PYEOF'
+import json, os, sys
+try:
+    d = json.load(open(os.environ["HMD_TEAM_FILE"]))
+    s = d.get("team_secret")
+    sys.stdout.write(s if isinstance(s, str) else "")
+except Exception:
+    sys.stdout.write("")
+PYEOF
+}
+
+# Read the created epoch (empty if absent). Non-secret.
+read_created() {
+  [ -f "$TEAM_FILE" ] || { printf ''; return 0; }
+  HMD_TEAM_FILE="$TEAM_FILE" "$PY" - <<'PYEOF'
+import json, os, sys
+try:
+    c = json.load(open(os.environ["HMD_TEAM_FILE"])).get("created")
+    sys.stdout.write(str(int(c)) if isinstance(c, (int, float)) else "")
+except Exception:
+    sys.stdout.write("")
+PYEOF
+}
+
+# Atomically write team.json 0600 with the given secret (secret via env, not argv).
+write_team() { # $1 = secret
+  mkdir -p "$TEAM_DIR" 2>/dev/null || { echo "heimdall-team: cannot create $TEAM_DIR" >&2; exit 2; }
+  if ! HMD_TEAM_SEC="$1" HMD_TEAM_FILE="$TEAM_FILE" "$PY" - <<'PYEOF'
+import json, os, sys, time
+sec = os.environ["HMD_TEAM_SEC"]
+path = os.environ["HMD_TEAM_FILE"]
+data = json.dumps({"team_secret": sec, "created": int(time.time())}) + "\n"
+# O_CREAT|O_TRUNC at 0600 so the secret is never momentarily world-readable.
+fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+try:
+    os.write(fd, data.encode("utf-8"))
+finally:
+    os.close(fd)
+os.chmod(path, 0o600)
+PYEOF
+  then
+    echo "heimdall-team: failed to write $TEAM_FILE" >&2
+    exit 2
+  fi
+}
+
+# ── argv ────────────────────────────────────────────────────────────────────────
+[ "$#" -ge 1 ] || { usage >&2; exit 2; }
+SUB="$1"; shift || true
+
+case "$SUB" in
+  -h|--help|help|"")
+    usage; exit 0 ;;
+
+  new)
+    FORCE=""
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --force) FORCE=1; shift ;;
+        *) echo "heimdall-team new: unexpected argument: $1" >&2; exit 2 ;;
+      esac
+    done
+    if [ -f "$TEAM_FILE" ] && [ -z "$FORCE" ]; then
+      cat >&2 <<EOF
+heimdall-team: a team is already configured for this repo:
+    $TEAM_FILE
+Refusing to overwrite it (that would orphan you from the current team).
+Re-mint anyway with:   heimdall-team new --force
+Or inspect it with:    heimdall-team show
+EOF
+      exit 2
+    fi
+    SECRET="$(mint_secret)"
+    [ -n "$SECRET" ] || { echo "heimdall-team: failed to mint a secret" >&2; exit 2; }
+    write_team "$SECRET"
+    TID="$(team_id_of "$SECRET")"
+    printf 'Minted a new team for this repo (team_id %s).\n' "$TID"
+    printf 'Stored 0600 in %s\n\n' "$TEAM_FILE"
+    printf '\xe2\x9a\xa0 the line below contains your TEAM SECRET — share only with teammates\n'
+    printf '  (it lets a teammate see your team presence; treat it like a password)\n\n'
+    # The join one-liner distributes the team secret. heimdall-invite reads the
+    # team.json we just wrote (same HEIMDALL_TEAM_DIR/repo) and prints HEIMDALL_TEAM_SECRET=...
+    if [ -x "$INVITE_CLI" ]; then
+      "$INVITE_CLI" || true
+    fi
+    exit 0 ;;
+
+  join)
+    SECRET="${1:-}"
+    [ -n "$SECRET" ] || { echo "heimdall-team join: needs a <secret> argument" >&2; exit 2; }
+    if [ "${#SECRET}" -lt 32 ]; then
+      echo "heimdall-team: refusing a weak team secret (<32 chars) — a hand-typed weak" >&2
+      echo "secret could collide into another team. Ask your teammate for the full secret" >&2
+      echo "(heimdall-team new mints a 43-char one)." >&2
+      exit 2
+    fi
+    write_team "$SECRET"
+    TID="$(team_id_of "$SECRET")"
+    printf 'Joined team %s for this repo.\n' "$TID"
+    printf 'Stored 0600 in %s\n' "$TEAM_FILE"
+    printf 'Presence will scope to this team on your next beat/roster.\n'
+    exit 0 ;;
+
+  show)
+    AS_JSON=""
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --json) AS_JSON=1; shift ;;
+        *) echo "heimdall-team show: unexpected argument: $1" >&2; exit 2 ;;
+      esac
+    done
+    SECRET="$(read_secret)"
+    if [ -n "$SECRET" ]; then
+      TID="$(team_id_of "$SECRET")"
+      CREATED="$(read_created)"
+      if [ -n "$AS_JSON" ]; then
+        HMD_TEAM_TID="$TID" HMD_TEAM_CREATED="$CREATED" HMD_TEAM_FILE="$TEAM_FILE" "$PY" - <<'PYEOF'
+import json, os
+created = os.environ.get("HMD_TEAM_CREATED") or ""
+print(json.dumps({
+    "configured": True,
+    "team_id": os.environ["HMD_TEAM_TID"],
+    "created": int(created) if created.isdigit() else None,
+    "path": os.environ["HMD_TEAM_FILE"],
+}))
+PYEOF
+      else
+        printf 'configured: yes\n'
+        printf 'team_id:    %s\n' "$TID"
+        [ -n "$CREATED" ] && printf 'created:    %s\n' "$CREATED"
+        printf 'store:      %s\n' "$TEAM_FILE"
+        printf '(the team secret is never printed — see %s)\n' "$TEAM_FILE"
+      fi
+    else
+      if [ -n "$AS_JSON" ]; then
+        printf '{"configured": false, "team_id": null, "created": null, "path": "%s"}\n' "$TEAM_FILE"
+      else
+        printf 'configured: no\n'
+        printf 'No team is configured for this repo yet.\n'
+        printf 'Mint one with:  heimdall-team new\n'
+        printf 'Or join one:    heimdall-team join <secret>\n'
+        printf '(heimdall-presence also auto-mints a solo team on first run.)\n'
+      fi
+    fi
+    exit 0 ;;
+
+  *)
+    echo "heimdall-team: unknown subcommand '$SUB' (try: new | join | show)" >&2
+    usage >&2
+    exit 2 ;;
+esac

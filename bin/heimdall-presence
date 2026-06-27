@@ -178,6 +178,60 @@ if [ -z "$URL" ] || [ -z "$HAID" ] || [ -z "$PROJECT" ]; then
   esac
 fi
 
+# ── per-repo TEAM secret (multi-tenant presence) — RULING 1b AUTO-SOLO ──────────
+# The team secret lives PER-REPO in <repo>/.heimdall/team.json (0600, gitignored),
+# NOT the global cp-endpoint.json (a dev may be on different teams in different
+# repos). It is sent ONCE in the X-Heimdall-Team-Secret header at /enroll; signed
+# beats/reads thereafter carry NO secret (membership is server-side — the signed
+# GET /roster returns the caller's team). If team.json is ABSENT we AUTO-MINT one
+# SILENTLY (same shape as `heimdall-team new`) so a dev is ZERO-CONFIG and starts
+# in their OWN solo team (sees only themselves until they share/invite). The secret
+# crosses bash->python via the ENVIRONMENT only — NEVER argv (argv shows in `ps`).
+TEAM_DIR="${HEIMDALL_TEAM_DIR:-}"
+if [ -z "$TEAM_DIR" ]; then
+  TEAM_TOP="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+  if [ -n "$TEAM_TOP" ]; then TEAM_DIR="$TEAM_TOP/.heimdall"; else TEAM_DIR="$PWD/.heimdall"; fi
+fi
+TEAM_FILE="$TEAM_DIR/team.json"
+TEAM_SECRET=""
+# Resolve the configured secret, else AUTO-MINT one 0600 (silent, non-fatal). All
+# IO is python-side so there is no jq dependency on this path; any failure leaves
+# TEAM_SECRET empty (enroll then omits the header — graceful, never a traceback).
+TEAM_SECRET="$(HMD_TEAM_DIR_R="$TEAM_DIR" HMD_TEAM_FILE_R="$TEAM_FILE" "$PY" - 2>/dev/null <<'PYEOF' || true
+import json, os, secrets, sys, time
+team_dir = os.environ["HMD_TEAM_DIR_R"]
+path = os.environ["HMD_TEAM_FILE_R"]
+# 1) read an existing secret.
+if os.path.exists(path):
+    try:
+        s = json.load(open(path)).get("team_secret")
+        if isinstance(s, str) and s:
+            sys.stdout.write(s)
+            sys.exit(0)
+    except Exception:
+        pass  # corrupt/unreadable -> fall through to mint a fresh one.
+# 2) AUTO-SOLO mint: write team.json 0600 with a fresh 43-char base64url secret.
+try:
+    os.makedirs(team_dir, mode=0o700, exist_ok=True)
+    sec = secrets.token_urlsafe(32)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        os.write(fd, (json.dumps({"team_secret": sec, "created": int(time.time())}) + "\n").encode("utf-8"))
+    finally:
+        os.close(fd)
+    os.chmod(path, 0o600)
+    sys.stdout.write(sec)
+except FileExistsError:
+    # a concurrent mint won the race -> read it back.
+    try:
+        sys.stdout.write(json.load(open(path)).get("team_secret") or "")
+    except Exception:
+        sys.stdout.write("")
+except Exception:
+    sys.stdout.write("")  # nowhere to persist / crypto fault -> stay header-less.
+PYEOF
+)"
+
 # ── the signed HTTP client (REUSE the shipped cp_auth signer over urllib) ──────
 # The seed is resolved IN-PROCESS (env > the 0600 seed file > auto-bootstrap) and is NEVER
 # argv'd (argv shows in `ps`) or printed — only the seed-file PATH crosses from bash. POST
@@ -190,7 +244,8 @@ run_client() {
   PRES_SEED_FILE="$SEED_FILE" PRES_ENROLL_TOKEN="$ENROLL_TOKEN" \
   PRES_ENROLL_STAMP="$ENROLL_STAMP" PRES_THROTTLE="${HMD_ENROLL_THROTTLE:-180}" \
   PRES_PROJECT="$PROJECT" PRES_HANDLE="$HANDLE" PRES_VERDICT="$VERDICT" \
-  PRES_FILE="$FILE" PRES_VERB="$1" PRES_JSON="$JSON" "$PY" - <<'PYEOF'
+  PRES_FILE="$FILE" PRES_VERB="$1" PRES_JSON="$JSON" PRES_TEAM_SECRET="$TEAM_SECRET" \
+  "$PY" - <<'PYEOF'
 import contextlib
 import json
 import os
@@ -249,12 +304,22 @@ def _enroll(body, token, *, timeout=10):
     config's enroll_token rides in X-Heimdall-Enroll-Token ONLY WHEN ONE IS CONFIGURED; an
     OPEN server (HEIMDALL_ENROLL_OPEN=1) accepts a tokenless enroll, so a token is OMITTED
     when absent (a token-mode server still gets it). Returns the HTTP status (0 on any
-    transport error)."""
+    transport error).
+
+    MULTI-TENANT: the per-repo TEAM SECRET (PRES_TEAM_SECRET, from <repo>/.heimdall/
+    team.json — auto-minted if absent) rides the X-Heimdall-Team-Secret HEADER (kept
+    out of any body log). The server hashes it to a team_id, binds this HAID to that
+    team, and DISCARDS the raw secret — it is sent ONCE here at enroll; signed beats/
+    reads thereafter carry NO secret (membership is server-side). Omitted when empty
+    (a single-tenant/back-compat server maps an absent secret to its default team)."""
     req = urllib.request.Request(BASE + "/enroll", data=body, method="POST")
     req.add_header("Content-Type", "application/json")
     req.add_header("X-Heimdall-HAID", HAID)
     if token:
         req.add_header("X-Heimdall-Enroll-Token", token)
+    team_secret = os.environ.get("PRES_TEAM_SECRET") or ""
+    if team_secret:
+        req.add_header("X-Heimdall-Team-Secret", team_secret)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             resp.read()
