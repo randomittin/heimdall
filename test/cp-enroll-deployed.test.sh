@@ -464,6 +464,85 @@ else
 fi
 
 # ──────────────────────────────────────────────────────────────────────────────
+# #8 OPEN MODE end-to-end on the wire: a TOKENLESS open-mode enroll (HEIMDALL_ENROLL_OPEN=1,
+#    no token presented) registers a fresh dev key in the SAME firestore the live server reads;
+#    a signed beat from that key BEFORE enroll 401s (baseline) and AFTER enroll VERIFIES (200) at
+#    the §3 chokepoint over a real socket. Proves open onboarding yields a chokepoint-usable key.
+# ──────────────────────────────────────────────────────────────────────────────
+echo
+echo "#8 OPEN MODE: tokenless enroll (HEIMDALL_ENROLL_OPEN=1) -> the enrolled key signs a beat over the wire -> 200"
+DEV2_KEYS="$("$PY" - <<'PYEOF' 2>/dev/null
+import os, sys, json
+sys.path.insert(0, os.environ["LIB"])
+import cp_auth
+priv, pub = cp_auth.generate_keypair()
+print(json.dumps({"priv": priv, "pub": pub}))
+PYEOF
+)"
+DEV2_PRIV="$("$PY" -c "import json,sys;print(json.loads(sys.argv[1])['priv'])" "$DEV2_KEYS")"
+DEV2_PUB="$("$PY" -c "import json,sys;print(json.loads(sys.argv[1])['pub'])" "$DEV2_KEYS")"
+DEV2_HAID="haid:opendev.box-77c2"
+export DEV2_PRIV DEV2_PUB DEV2_HAID
+
+# Baseline: the dev2 key is NOT trusted before the open enroll (signed beat -> 401).
+OPEN_PRE="$(beat_status "$DEV2_HAID" "$DEV2_PRIV")"
+# TOKENLESS open-mode enroll (in-process, HEIMDALL_ENROLL_OPEN=1) writing to the shared firestore
+# the live server reads. The server's own env has NO open flag + a token set — the enrolled key
+# is verified by the server purely on its signature, independent of HOW it was registered.
+OPEN_ENROLL="$(env HEIMDALL_ENROLL_OPEN=1 "$PY" - <<'PYEOF' 2>/dev/null
+import os, sys, json
+sys.path.insert(0, os.environ["LIB"])
+import cp_enroll
+print(json.dumps(cp_enroll.enroll(os.environ["DEV2_HAID"], os.environ["DEV2_PUB"], provided_token=None)))
+PYEOF
+)"
+OPEN_OK="$(printf '%s' "$OPEN_ENROLL" | "$PY" -c "import json,sys;print(json.load(sys.stdin).get('ok'))" 2>/dev/null)"
+OPEN_POST="$(beat_status "$DEV2_HAID" "$DEV2_PRIV")"
+if [ "$OPEN_PRE" = "401" ] && [ "$OPEN_OK" = "True" ] && [ "$OPEN_POST" = "200" ]; then
+  ok "#8 open mode: a TOKENLESS enroll (pre-beat 401) makes the key chokepoint-usable (post-beat 200) over the wire under firestore"
+else
+  bad "#8 open-mode tokenless enroll did not yield a usable key (pre='$OPEN_PRE', enroll='$OPEN_ENROLL', post='$OPEN_POST')"; cat "$EXT/serve.err" >&2
+fi
+
+# ──────────────────────────────────────────────────────────────────────────────
+# #9 REGISTRY CAP [FALSIFIABLE] under the deployed firestore store: with the cap pinned to the
+#    current key count, the NEXT net-new haid is REFUSED (enroll_registry_full) and a signed beat
+#    from it still 401s (nothing registered). Remove the cap check -> it would enroll + verify => RED.
+# ──────────────────────────────────────────────────────────────────────────────
+echo
+echo "#9 REGISTRY CAP: with the cap at the current count, a net-new haid is refused + stays untrusted [FALSIFIABLE]"
+CAP_KEYS="$("$PY" - <<'PYEOF' 2>/dev/null
+import os, sys, json
+sys.path.insert(0, os.environ["LIB"])
+import cp_auth
+priv, pub = cp_auth.generate_keypair()
+print(json.dumps({"priv": priv, "pub": pub}))
+PYEOF
+)"
+CAP_PRIV="$("$PY" -c "import json,sys;print(json.loads(sys.argv[1])['priv'])" "$CAP_KEYS")"
+CAP_PUB="$("$PY" -c "import json,sys;print(json.loads(sys.argv[1])['pub'])" "$CAP_KEYS")"
+CAP_HAID="haid:capfull.box-99"
+export CAP_PRIV CAP_PUB CAP_HAID
+CAP_OUT="$("$PY" - <<'PYEOF' 2>/dev/null
+import os, sys, json
+sys.path.insert(0, os.environ["LIB"])
+import cp_enroll
+# Pin the cap to the CURRENT key count -> the registry is already full for net-new keys.
+os.environ["HEIMDALL_ENROLL_MAX_KEYS"] = str(cp_enroll._registry_key_count())
+r = cp_enroll.enroll(os.environ["CAP_HAID"], os.environ["CAP_PUB"],
+                     provided_token=os.environ["HEIMDALL_ENROLL_TOKEN"])
+print(json.dumps(r))
+PYEOF
+)"
+CAP_REASON="$(printf '%s' "$CAP_OUT" | "$PY" -c "import json,sys;d=json.load(sys.stdin);print(d.get('reason') if not d.get('ok') else 'OK')" 2>/dev/null)"
+CAP_BEAT="$(beat_status "$CAP_HAID" "$CAP_PRIV")"
+if [ "$CAP_REASON" = "enroll_registry_full" ] && [ "$CAP_BEAT" = "401" ]; then
+  ok "#9 FALSIFIABLE: a net-new enroll at the cap is refused (enroll_registry_full) + the haid stays untrusted (beat 401) — remove the cap => RED"
+else
+  bad "#9 the registry cap did not refuse a net-new enroll at capacity (reason='$CAP_REASON', beat='$CAP_BEAT')"
+fi
+
+# ──────────────────────────────────────────────────────────────────────────────
 # FOOTER — reap the serve subprocess; the gate verdict.
 # ──────────────────────────────────────────────────────────────────────────────
 echo

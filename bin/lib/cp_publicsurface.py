@@ -105,9 +105,30 @@ def _int_env(name, default):
     return val if val > 0 else default
 
 
+# Open-enroll mode (HEIMDALL_ENROLL_OPEN truthy — cp_enroll.ENROLL_OPEN_ENV). When on, /enroll
+# is TOKENLESS, so the per-(enroll-token) gate is moot (no token to key on) and the per-IP cap +
+# the deployment-wide enroll_budget become the LOAD-BEARING limits. Read directly here (no
+# cp_enroll import — this module stays handler-free) and used only to pick a TIGHTER per-IP
+# default; both limits stay env-tunable. Mirrors public_surface_enabled()'s truthy parse.
+_ENROLL_OPEN_ENV = "HEIMDALL_ENROLL_OPEN"
+
+
+def _enroll_open():
+    """True iff HEIMDALL_ENROLL_OPEN is set truthy — the per-IP enroll cap then defaults TIGHTER
+    (the load-bearing flood control on a tokenless surface). Unset -> the standard token-mode
+    default. Env-tunable either way (an explicit HEIMDALL_ENROLL_IP_LIMIT always wins)."""
+    raw = os.environ.get(_ENROLL_OPEN_ENV)
+    if not raw:
+        return False
+    return raw.strip().lower() in _TRUTHY
+
+
 # /enroll — per-IP and per-(enroll-token-hash) blunt gates + the deployment-wide new-enroll
-# ceiling. Enroll is a once-ever act, so even a generous per-key cap stops a flood.
-def _enroll_ip_limit():      return _int_env("HEIMDALL_ENROLL_IP_LIMIT", 10)
+# ceiling. Enroll is a once-ever act, so even a generous per-key cap stops a flood. In OPEN mode
+# the per-IP default is tightened (5 vs 10) because it is the load-bearing limit once the token
+# gate is off; the enroll_budget is the deployment-wide ceiling that bounds total new enrolls
+# regardless of how many IPs an attacker rotates through. All overridable from the env.
+def _enroll_ip_limit():      return _int_env("HEIMDALL_ENROLL_IP_LIMIT", 5 if _enroll_open() else 10)
 def _enroll_ip_window():     return _int_env("HEIMDALL_ENROLL_IP_WINDOW", 60)
 def _enroll_token_limit():   return _int_env("HEIMDALL_ENROLL_TOKEN_LIMIT", 30)
 def _enroll_token_window():  return _int_env("HEIMDALL_ENROLL_TOKEN_WINDOW", 60)
