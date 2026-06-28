@@ -141,3 +141,19 @@ See [CHANGELOG.md](CHANGELOG.md) for release history.
 ## License
 
 [MIT](LICENSE)
+
+## Self-maintenance (auto-update + self-heal)
+
+hmd keeps itself and its host current, in the background, on session start — both are
+throttled (~24h), detached (never block the session), idempotent, and opt-out:
+
+- **Plugin auto-update** (`bin/heimdall-autoupdate`): checks the installed version vs the
+  latest GitHub release; if newer, re-runs the latest installer in the background (takes
+  effect next launch; never hot-swaps the running session). Off: `HEIMDALL_NO_AUTOUPDATE=1`
+  or `~/.heimdall/no-autoupdate`.
+- **Claude Code self-heal** (`bin/heimdall-cc-selfheal`): on a NATIVE Claude Code install,
+  auto-repairs the "✘ Auto-update failed" class — a stale npm-global `@anthropic-ai/claude-code`
+  conflicting with the native updater. It removes ONLY that conflicting package, ensures
+  `autoUpdates:true`, and re-runs `claude update`. Never touches an npm/brew-managed install,
+  never uninstalls anything else, never touches credentials. Off: `HEIMDALL_NO_SELFHEAL=1`
+  or `~/.heimdall/no-selfheal`. Inspect: `heimdall-cc-selfheal status`.

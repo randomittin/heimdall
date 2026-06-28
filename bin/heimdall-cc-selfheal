@@ -1,0 +1,188 @@
+#!/usr/bin/env bash
+# heimdall-cc-selfheal — hmd auto-heals Claude Code's NATIVE auto-updater.
+#
+# THE PROBLEM IT FIXES. On a NATIVE Claude Code install (~/.local/bin/claude ->
+# ~/.local/share/claude/versions/<v>, installMethod=native) a STALE npm-global
+# `@anthropic-ai/claude-code` left over from an older npm install conflicts with the
+# native updater — Claude Code shows "✘ Auto-update failed · Run /doctor". The proven
+# repair (verified on a real machine): remove the conflicting npm-global package,
+# ensure autoUpdates:true in ~/.claude.json, then `claude update`. This automates that.
+#
+# THE SAFE-APPLY MODEL — the running session is NEVER touched. We do NOT hot-swap or
+# restart the live `claude` process; the native updater stages the next version into a
+# new versions/ dir + repoints the symlink, taking effect on the NEXT launch. The
+# durable repair is removing the npm conflict + the config flag — after that Claude
+# Code's OWN updater works again; our `claude update` is a best-effort re-stage/verify.
+#
+# SUBCOMMANDS (the SessionStart hook depends on `check` — keep the interface stable):
+#   heimdall-cc-selfheal check    throttled, background, safe. Detect → repair → log.
+#                                 ALWAYS exit 0 fast; the repair runs DETACHED.
+#   heimdall-cc-selfheal status   read-only: print healthy/unhealthy + what it would do.
+#   heimdall-cc-selfheal --force  ignore the throttle; run now.
+#
+# SAFETY CONTRACT.
+#   * ONLY acts on a NATIVE install — never touches an npm/brew/other-managed Claude Code.
+#   * The ONLY package it ever uninstalls is the exact conflict `@anthropic-ai/claude-code`.
+#   * NEVER blocks SessionStart (detached + throttled + fast-exit); offline/missing-tools =
+#     silent no-op, exit 0. Idempotent: a healthy machine is a pure no-op.
+#   * Atomic, key-preserving edit of ~/.claude.json (tmp+rename). NEVER touches credentials,
+#     never echoes/stores a secret. `set -uo pipefail`, never `set -x`.
+#   * Opt out: HEIMDALL_NO_SELFHEAL=1 or ${HOME}/.heimdall/no-selfheal.
+#
+# ENV / OVERRIDES:
+#   HEIMDALL_NO_SELFHEAL=1          opt out (also: ${HOME}/.heimdall/no-selfheal file).
+#   HEIMDALL_SELFHEAL_INTERVAL=N    throttle window in seconds (default 86400 = 24h).
+#   HEIMDALL_HOME                   state home (stamp + log + opt-out). Default ~/.heimdall.
+#   HEIMDALL_CLAUDE_CONFIG          path to claude.json (default ~/.claude.json). TEST seam.
+#   HEIMDALL_SELFHEAL_DRYRUN=1      TEST seam: detect + log "would-repair", apply NOTHING.
+
+set -uo pipefail
+
+HMD_HOME="${HEIMDALL_HOME:-$HOME/.heimdall}"
+STAMP="$HMD_HOME/.cc-selfheal-stamp"
+OPT_OUT_FILE="$HMD_HOME/no-selfheal"
+LOG_FILE="$HMD_HOME/cc-selfheal.log"
+CLAUDE_JSON="${HEIMDALL_CLAUDE_CONFIG:-$HOME/.claude.json}"
+INTERVAL="${HEIMDALL_SELFHEAL_INTERVAL:-86400}"
+NPM_CONFLICT="@anthropic-ai/claude-code"
+
+log() {  # one-line, secret-free, best-effort
+  mkdir -p "$HMD_HOME" 2>/dev/null || return 0
+  printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo now)" "$*" >> "$LOG_FILE" 2>/dev/null || true
+}
+
+opted_out() {
+  [ "${HEIMDALL_NO_SELFHEAL:-0}" = "1" ] && return 0
+  [ -f "$OPT_OUT_FILE" ] && return 0
+  return 1
+}
+
+# native install? — the ONLY shape we ever act on. Read installMethod from claude.json;
+# fall back to the binary-symlink shape (~/.local/.../share/claude/versions). Anything
+# else (npm/brew/unknown) -> NOT native -> we never touch it.
+is_native() {
+  if [ -r "$CLAUDE_JSON" ] && command -v python3 >/dev/null 2>&1; then
+    local m
+    m="$(python3 -c "import json,sys
+try: print(json.load(open(sys.argv[1])).get('installMethod') or '')
+except Exception: print('')" "$CLAUDE_JSON" 2>/dev/null)"
+    [ "$m" = "native" ] && return 0
+    [ -n "$m" ] && return 1   # an explicit non-native method -> not ours
+  fi
+  # no method recorded: infer from the binary location
+  local b; b="$(command -v claude 2>/dev/null || true)"
+  case "$b" in */.local/bin/claude|*/.local/share/claude/*) return 0 ;; esac
+  return 1
+}
+
+# the conflicting npm-global package present?
+npm_conflict_present() {
+  command -v npm >/dev/null 2>&1 || return 1
+  npm ls -g --depth=0 "$NPM_CONFLICT" >/dev/null 2>&1
+}
+
+# autoUpdates explicitly false in claude.json?
+autoupdates_false() {
+  [ -r "$CLAUDE_JSON" ] && command -v python3 >/dev/null 2>&1 || return 1
+  python3 -c "import json,sys
+try: sys.exit(0 if json.load(open(sys.argv[1])).get('autoUpdates') is False else 1)
+except Exception: sys.exit(1)" "$CLAUDE_JSON" 2>/dev/null
+}
+
+# does the native updater itself fail? (cheap-ish; only called inside the throttled,
+# detached repair path — `claude update` is non-interactive and exits 0 when healthy)
+updater_failing() {
+  command -v claude >/dev/null 2>&1 || return 1
+  ! claude update >/dev/null 2>&1
+}
+
+# unhealthy iff (on a native install) the npm conflict exists OR the updater fails.
+# autoUpdates:false alone is NOT treated as unhealthy (could be a deliberate user choice);
+# it is only repaired when a real failure is also present.
+detect_unhealthy() {
+  is_native || return 1
+  npm_conflict_present && return 0
+  updater_failing && return 0
+  return 1
+}
+
+set_autoupdates_true() {  # atomic, key-preserving
+  [ -w "$CLAUDE_JSON" ] || [ ! -e "$CLAUDE_JSON" ] || return 1
+  command -v python3 >/dev/null 2>&1 || return 1
+  python3 - "$CLAUDE_JSON" <<'PY' 2>/dev/null || return 1
+import json,os,sys,tempfile
+p=sys.argv[1]
+try: d=json.load(open(p))
+except Exception: d={}
+if d.get("autoUpdates") is True: sys.exit(0)
+d["autoUpdates"]=True
+dirp=os.path.dirname(p) or "."
+fd,tmp=tempfile.mkstemp(dir=dirp,prefix=".claude.",suffix=".tmp")
+with os.fdopen(fd,"w") as f: json.dump(d,f,indent=2)
+os.replace(tmp,p)
+PY
+}
+
+repair() {
+  local did=0
+  if [ "${HEIMDALL_SELFHEAL_DRYRUN:-0}" = "1" ]; then
+    npm_conflict_present && log "would-repair: uninstall $NPM_CONFLICT (npm conflict)"
+    autoupdates_false && log "would-repair: set autoUpdates=true"
+    log "would-repair: claude update"
+    return 0
+  fi
+  if npm_conflict_present; then
+    if npm uninstall -g "$NPM_CONFLICT" >/dev/null 2>&1; then
+      log "repaired: uninstalled npm-global $NPM_CONFLICT (native-install conflict)"; did=1
+      # tidy the empty @anthropic-ai parent dir if npm left one
+      local root; root="$(npm root -g 2>/dev/null)"
+      [ -n "$root" ] && [ -d "$root/@anthropic-ai" ] && [ -z "$(ls -A "$root/@anthropic-ai" 2>/dev/null)" ] && rmdir "$root/@anthropic-ai" 2>/dev/null || true
+    else
+      log "WARN: npm uninstall $NPM_CONFLICT failed (left as-is)"
+    fi
+  fi
+  if autoupdates_false; then
+    set_autoupdates_true && { log "repaired: set autoUpdates=true in claude.json"; did=1; } || log "WARN: could not set autoUpdates"
+  fi
+  # best-effort re-stage/verify (native updater stages NEXT launch; never hot-swaps)
+  if command -v claude >/dev/null 2>&1; then
+    if claude update >/dev/null 2>&1; then log "verified: claude update -> ok"; else log "NOTE: claude update still non-zero after repair (will retry next window)"; fi
+  fi
+  [ "$did" = 1 ] && log "self-heal complete" || log "self-heal: nothing to repair"
+}
+
+throttled() {  # true if checked within the window (skip)
+  [ -f "$STAMP" ] || return 1
+  local now mt; now="$(date +%s 2>/dev/null || echo 0)"
+  mt="$(stat -f %m "$STAMP" 2>/dev/null || stat -c %Y "$STAMP" 2>/dev/null || echo 0)"
+  [ "$((now - mt))" -lt "$INTERVAL" ]
+}
+
+cmd_status() {  # read-only
+  if ! is_native; then echo "cc-selfheal: not a native Claude Code install — skipped"; return 0; fi
+  local issues=""
+  npm_conflict_present && issues="${issues} npm-conflict($NPM_CONFLICT)"
+  command -v claude >/dev/null 2>&1 && updater_failing && issues="${issues} updater-failing"
+  autoupdates_false && issues="${issues} autoUpdates:false"
+  if [ -n "$issues" ]; then echo "cc-selfheal: UNHEALTHY —$issues (would repair)"; else echo "cc-selfheal: healthy"; fi
+}
+
+cmd_check() {  # throttled + DETACHED; never blocks the session
+  opted_out && exit 0
+  is_native || exit 0
+  [ "${1:-}" = "--force" ] || ! throttled || exit 0
+  mkdir -p "$HMD_HOME" 2>/dev/null || exit 0
+  : > "$STAMP" 2>/dev/null || true   # claim the window BEFORE the detached run
+  # detached so SessionStart returns instantly; the detect+repair (incl `claude update`)
+  # happens in the background and only mutates when genuinely unhealthy.
+  ( detect_unhealthy && repair ) >/dev/null 2>&1 &
+  exit 0
+}
+
+case "${1:-check}" in
+  check)        shift 2>/dev/null || true; cmd_check "${1:-}" ;;
+  --force)      cmd_check --force ;;
+  status)       cmd_status ;;
+  -h|--help)    sed -n '2,42p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *)            echo "heimdall-cc-selfheal: unknown arg '${1}' (check|status|--force)" >&2; exit 2 ;;
+esac

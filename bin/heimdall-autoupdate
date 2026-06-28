@@ -1,0 +1,323 @@
+#!/usr/bin/env bash
+# heimdall-autoupdate — hmd keeps ITSELF current, safely, in the background.
+#
+# WHAT IT IS. The SessionStart hook calls `heimdall-autoupdate check`. We resolve the
+# INSTALLED version vs the LATEST published release; if a real upgrade exists we re-run
+# the LATEST tag's idempotent installer DETACHED (curl … | bash &) and return at once.
+# install.sh updates the plugin files for the NEXT session — we do NOT hot-swap the
+# CURRENTLY running session (see "THE SAFE-APPLY MODEL"). Auto-update is ON by default;
+# the off switch is HEIMDALL_NO_AUTOUPDATE=1 or ${HOME}/.heimdall/no-autoupdate.
+#
+# THE SAFE-APPLY MODEL — why the current session is NEVER broken.
+#   A running hmd session has already SOURCED its scripts; its behaviour is fixed for the
+#   life of the process. We never edit, reload, or restart that live process. We only ask
+#   the LATEST installer to refresh the on-disk plugin tree in the BACKGROUND. install.sh
+#   is the ATOMIC unit of apply: it is idempotent (a re-run upgrades cleanly), it PRESERVES
+#   user config (cp-endpoint.json + pki seeds survive a re-run), and a partial/aborted run
+#   leaves the previous install intact (its own fetch step fails closed). So the worst case
+#   is "no upgrade this time"; there is no half-applied state and no live-session breakage.
+#   The upgrade simply takes effect the NEXT time `hmd` launches.
+#
+# SUBCOMMANDS (the SessionStart hook depends on `check` — keep the interface stable):
+#   heimdall-autoupdate check      throttled, background, safe. Resolve installed vs latest;
+#                                  if newer, background-apply; else no-op. ALWAYS exit 0 fast.
+#   heimdall-autoupdate --force    ignore the throttle; check now (still background-applies).
+#   heimdall-autoupdate status     print installed + latest + whether an update is pending.
+#                                  A read-only inspection — never applies.
+#
+# SAFETY CONTRACT.
+#   * NEVER blocks SessionStart: short network timeouts (~5s), the apply is detached.
+#   * Offline / API-fail / parse-fail = SILENT no-op, exit 0. Offline is normal, not an error.
+#   * Never partially applies (install.sh is the atomic unit); never downgrades; never
+#     reinstalls the same version (apply iff latest > installed by SEMVER).
+#   * NO auth — the repo is public; we NEVER send a token to GitHub.
+#   * NEVER echoes or stores a secret. `set -uo pipefail`, never `set -x`.
+#
+# ENV / OVERRIDES (all HEIMDALL_*):
+#   HEIMDALL_NO_AUTOUPDATE=1        opt out (also: ${HOME}/.heimdall/no-autoupdate file).
+#   HEIMDALL_UPDATE_INTERVAL=86400  throttle window in seconds (default 24h).
+#   HEIMDALL_LATEST_OVERRIDE=X.Y.Z  TEST seam: inject the "latest" version, skip the network.
+#   HEIMDALL_AUTOUPDATE_DRYRUN=1    TEST seam: resolve + decide, but DON'T detach the installer
+#                                   (logs "would-apply" instead). Never used in production.
+#   HEIMDALL_HOME                   state home (stamp + log + opt-out file). Default ~/.heimdall.
+
+set -uo pipefail
+
+SELF="${BASH_SOURCE[0]}"
+if command -v readlink >/dev/null 2>&1; then
+  SELF="$(readlink -f "$SELF" 2>/dev/null || readlink "$SELF" 2>/dev/null || echo "$SELF")"
+fi
+SELF_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+PLUGIN_DIR="$(cd "$SELF_DIR/.." && pwd)"
+
+# The GitHub repo (owner/name) the installer + manifest both point at. Public — NO auth.
+REPO_SLUG="randomittin/heimdall"
+RELEASES_API="https://api.github.com/repos/${REPO_SLUG}/releases/latest"
+LSREMOTE_URL="https://github.com/${REPO_SLUG}"
+INSTALL_RAW_BASE="https://raw.githubusercontent.com/${REPO_SLUG}"
+
+# State home (stamp + log + opt-out file) — honors $HEIMDALL_HOME so a test/stranger can
+# redirect it; defaults to the per-user ~/.heimdall (where presence + cache already live).
+HMD_HOME="${HEIMDALL_HOME:-$HOME/.heimdall}"
+STAMP="$HMD_HOME/.last-update-check"
+OPT_OUT_FILE="$HMD_HOME/no-autoupdate"
+LOG_FILE="$HMD_HOME/autoupdate.log"
+
+INTERVAL="${HEIMDALL_UPDATE_INTERVAL:-86400}"   # default 24h between background checks.
+
+# ── tiny helpers ───────────────────────────────────────────────────────────────
+
+# One-line, secret-free outcome log (best-effort; never fails the caller).
+log_line() {
+  mkdir -p "$HMD_HOME" 2>/dev/null || return 0
+  local ts; ts="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo '?')"
+  printf '%s %s\n' "$ts" "$1" >> "$LOG_FILE" 2>/dev/null || true
+}
+
+# Strip a leading v and any suffix → a bare X.Y.Z (or '' if not clean semver).
+norm_semver() {
+  printf '%s' "${1:-}" \
+    | sed -E 's/^[[:space:]]*v?([0-9]+\.[0-9]+\.[0-9]+).*/\1/' \
+    | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' || true
+}
+
+# ── installed version (mirror bin/heimdall's heimdall_version resolution) ────────
+# git tag (source of truth) → manifest fallback. Returns a bare X.Y.Z (no leading v),
+# or '' if nothing resolves. Falls back to THIS repo's manifest when the plugin dir has
+# no resolvable tag (e.g. a tarball install).
+installed_version() {
+  local ver=""
+  if git -C "$PLUGIN_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+    ver="$(git -C "$PLUGIN_DIR" describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null || true)"
+    ver="$(norm_semver "$ver")"
+  fi
+  if [ -z "$ver" ]; then
+    local manifest="$PLUGIN_DIR/.claude-plugin/plugin.json"
+    if [ -f "$manifest" ]; then
+      local raw=""
+      if command -v jq >/dev/null 2>&1; then
+        raw="$(jq -r '.version // empty' "$manifest" 2>/dev/null || true)"
+      else
+        raw="$(grep -oE '"version"[[:space:]]*:[[:space:]]*"[^"]+"' "$manifest" 2>/dev/null \
+               | head -1 | sed -E 's/.*"([^"]+)".*/\1/')"
+      fi
+      ver="$(norm_semver "$raw")"
+    fi
+  fi
+  printf '%s' "$ver"
+}
+
+# ── latest version ───────────────────────────────────────────────────────────────
+# Resolution order:
+#   1. HEIMDALL_LATEST_OVERRIDE (the TEST seam — never hits the network).
+#   2. GitHub releases/latest → .tag_name (no auth; ~5s timeout).
+#   3. git ls-remote --tags → highest semver (fallback when the API is unreachable).
+# Prints a bare X.Y.Z, or '' if nothing resolves (caller treats '' as a clean no-op).
+latest_version() {
+  local override; override="$(norm_semver "${HEIMDALL_LATEST_OVERRIDE:-}")"
+  if [ -n "$override" ]; then
+    printf '%s' "$override"; return 0
+  fi
+
+  local tag=""
+  # 2. Releases API. -f fails on HTTP errors, --max-time bounds the call so an
+  # unreachable/slow API can never stall SessionStart. NO Authorization header.
+  if command -v curl >/dev/null 2>&1; then
+    local body
+    body="$(curl -fsSL --max-time 5 -H 'Accept: application/vnd.github+json' \
+              "$RELEASES_API" 2>/dev/null || true)"
+    if [ -n "$body" ]; then
+      if command -v jq >/dev/null 2>&1; then
+        tag="$(printf '%s' "$body" | jq -r '.tag_name // empty' 2>/dev/null || true)"
+      else
+        tag="$(printf '%s' "$body" \
+                | grep -oE '"tag_name"[[:space:]]*:[[:space:]]*"[^"]+"' \
+                | head -1 | sed -E 's/.*"([^"]+)".*/\1/')"
+      fi
+    fi
+  fi
+  tag="$(norm_semver "$tag")"
+  if [ -n "$tag" ]; then printf '%s' "$tag"; return 0; fi
+
+  # 3. ls-remote fallback (no local mutation). Highest clean vMAJOR.MINOR.PATCH tag.
+  if command -v git >/dev/null 2>&1; then
+    local tags
+    tags="$(GIT_TERMINAL_PROMPT=0 git ls-remote --tags --refs "$LSREMOTE_URL" 'v[0-9]*' 2>/dev/null \
+              | sed -E 's#.*refs/tags/##' \
+              | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true)"
+    if [ -n "$tags" ]; then
+      tag="$(printf '%s' "$tags" | sort -t. -k1.2,1n -k2,2n -k3,3n | tail -1)"
+      tag="$(norm_semver "$tag")"
+      [ -n "$tag" ] && { printf '%s' "$tag"; return 0; }
+    fi
+  fi
+  printf ''
+}
+
+# ── semver compare ───────────────────────────────────────────────────────────────
+# Echo "newer" iff $2 (latest) is strictly a greater version than $1 (installed);
+# echo "same" otherwise (equal, downgrade, or either side unparseable). A malformed/
+# empty version can NEVER trigger an apply — we only upgrade on a clean strict-greater.
+semver_is_newer() {
+  local installed; installed="$(norm_semver "$1")"
+  local latest;    latest="$(norm_semver "$2")"
+  [ -n "$installed" ] && [ -n "$latest" ] || { printf 'same'; return 0; }
+  if command -v python3 >/dev/null 2>&1; then
+    INST="$installed" LATE="$latest" python3 - <<'PYEOF'
+import os
+def parse(v): return tuple(int(x) for x in v.split('.'))
+inst = parse(os.environ['INST']); late = parse(os.environ['LATE'])
+print('newer' if late > inst else 'same')
+PYEOF
+    return 0
+  fi
+  # Pure-shell fallback (no python3): field-by-field numeric compare.
+  local i1 i2 i3 l1 l2 l3
+  IFS=. read -r i1 i2 i3 <<EOF
+$installed
+EOF
+  IFS=. read -r l1 l2 l3 <<EOF
+$latest
+EOF
+  if [ "$l1" -gt "$i1" ] 2>/dev/null \
+     || { [ "$l1" -eq "$i1" ] && [ "$l2" -gt "$i2" ]; } 2>/dev/null \
+     || { [ "$l1" -eq "$i1" ] && [ "$l2" -eq "$i2" ] && [ "$l3" -gt "$i3" ]; } 2>/dev/null; then
+    printf 'newer'
+  else
+    printf 'same'
+  fi
+}
+
+# ── throttle ───────────────────────────────────────────────────────────────────
+# True (0) when a check ran within $INTERVAL seconds — skip this one. Stamp mtime is
+# the clock; a missing/old stamp → not throttled. --force bypasses this entirely.
+is_throttled() {
+  [ -f "$STAMP" ] || return 1
+  local now mtime age
+  now="$(date +%s 2>/dev/null || echo 0)"
+  mtime="$(stat -f %m "$STAMP" 2>/dev/null || stat -c %Y "$STAMP" 2>/dev/null || echo 0)"
+  age=$(( now - mtime ))
+  [ "$age" -ge 0 ] && [ "$age" -lt "$INTERVAL" ]
+}
+
+# Refresh the throttle stamp (a check ran). Best-effort.
+touch_stamp() {
+  mkdir -p "$HMD_HOME" 2>/dev/null || return 0
+  : > "$STAMP" 2>/dev/null || true
+}
+
+# ── opt-out ────────────────────────────────────────────────────────────────────
+# Honored FIRST, before any work. Env switch OR the opt-out file → clean no-op.
+opted_out() {
+  [ "${HEIMDALL_NO_AUTOUPDATE:-0}" = "1" ] && return 0
+  [ -f "$OPT_OUT_FILE" ] && return 0
+  return 1
+}
+
+# ── apply (the atomic, detached, NEXT-session upgrade) ──────────────────────────
+# Re-run the LATEST tag's idempotent installer DETACHED so it never blocks SessionStart.
+# install.sh updates the on-disk plugin for the NEXT session; the current process is
+# untouched. The DRYRUN seam stops short of detaching (for the test) and logs would-apply.
+apply_update() {
+  local latest="$1"
+  local ref="v${latest}"
+  local url="${INSTALL_RAW_BASE}/${ref}/install.sh"
+
+  if [ "${HEIMDALL_AUTOUPDATE_DRYRUN:-0}" = "1" ]; then
+    log_line "would-apply $latest via $url (dryrun)"
+    return 0
+  fi
+
+  command -v curl >/dev/null 2>&1 || { log_line "apply-skip $latest no-curl"; return 0; }
+
+  log_line "apply $latest (background, next session) via $ref"
+  # Detached + fully backgrounded: the installer's stdout/stderr go to the log, it runs
+  # in its own session (setsid when available) so it survives this process exiting and
+  # never holds SessionStart open. NO auth header — the install.sh fetch is public.
+  if command -v setsid >/dev/null 2>&1; then
+    setsid bash -c "curl -fsSL '$url' | bash >>'$LOG_FILE' 2>&1" >/dev/null 2>&1 &
+  else
+    ( curl -fsSL "$url" | bash >>"$LOG_FILE" 2>&1 ) >/dev/null 2>&1 &
+  fi
+  disown 2>/dev/null || true
+}
+
+# ── core: resolve installed vs latest, decide, maybe apply ──────────────────────
+# Shared by `check` and `--force`. $1 = "force" to bypass the throttle. ALWAYS exit 0.
+run_check() {
+  local force="${1:-}"
+
+  opted_out && { exit 0; }
+
+  if [ "$force" != "force" ] && is_throttled; then
+    exit 0   # checked recently — silent skip, no network.
+  fi
+  # A check is RUNNING → refresh the stamp now (even on a forced run) so the next
+  # throttled check honors the window from this moment.
+  touch_stamp
+
+  local installed latest
+  installed="$(installed_version)"
+  latest="$(latest_version)"
+
+  # Can't resolve either side (offline / parse-fail / no version) → clean no-op.
+  if [ -z "$installed" ] || [ -z "$latest" ]; then
+    log_line "check no-op (installed=${installed:-?} latest=${latest:-?})"
+    exit 0
+  fi
+
+  if [ "$(semver_is_newer "$installed" "$latest")" = "newer" ]; then
+    apply_update "$latest"
+  else
+    log_line "check current (installed=$installed latest=$latest)"
+  fi
+  exit 0
+}
+
+# ── status (read-only inspection — NEVER applies) ───────────────────────────────
+cmd_status() {
+  local installed latest pending
+  installed="$(installed_version)"
+  latest="$(latest_version)"
+  if [ -n "$installed" ] && [ -n "$latest" ] \
+     && [ "$(semver_is_newer "$installed" "$latest")" = "newer" ]; then
+    pending="yes"
+  else
+    pending="no"
+  fi
+  printf 'installed: %s\n' "${installed:-unknown}"
+  printf 'latest:    %s\n' "${latest:-unknown}"
+  printf 'pending:   %s\n' "$pending"
+  if opted_out; then
+    printf 'autoupdate: off (opted out)\n'
+  else
+    printf 'autoupdate: on\n'
+  fi
+  exit 0
+}
+
+# ── dispatch ─────────────────────────────────────────────────────────────────────
+SUB="${1:-check}"
+case "$SUB" in
+  check)        run_check ;;
+  --force|force) run_check force ;;
+  status)       cmd_status ;;
+  -h|--help|help)
+    cat <<'USAGE'
+heimdall-autoupdate — hmd keeps itself current, safely, in the background
+
+  heimdall-autoupdate check      throttled background check; background-applies if newer (default)
+  heimdall-autoupdate --force    ignore the throttle and check now (still background-applies)
+  heimdall-autoupdate status     print installed + latest + whether an update is pending
+
+Auto-update is ON by default. Opt out: HEIMDALL_NO_AUTOUPDATE=1 or a file at
+${HOME}/.heimdall/no-autoupdate. Throttle window: HEIMDALL_UPDATE_INTERVAL (default 86400s).
+Applies by re-running the latest release's idempotent install.sh detached — the upgrade
+takes effect the NEXT session; the running session is never touched. Offline = clean no-op.
+USAGE
+    ;;
+  *)
+    echo "heimdall-autoupdate: unknown subcommand '$SUB' (try: check | --force | status)" >&2
+    exit 2
+    ;;
+esac
