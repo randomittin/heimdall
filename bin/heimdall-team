@@ -208,13 +208,92 @@ if m:
 PYEOF
 }
 
+# ── zero-command default launch (the team should "just be there") ───────────────
+# best-effort privacy check used ONLY by the zero-command paths to DECIDE whether to
+# attempt a share — WITHOUT triggering `share`'s hard refusal/exit. Returns 0 ONLY
+# when gh PROVES the repo is private; ANY doubt (gh absent/unauth, public, non-github,
+# no origin, not a repo) -> 1. This is the leak guard for the auto paths: we never even
+# ATTEMPT a share unless privacy is proven here first.
+repo_is_private() {
+  command -v gh >/dev/null 2>&1 || return 1
+  local root origin slug priv
+  root="$(git rev-parse --show-toplevel 2>/dev/null || true)"; [ -n "$root" ] || return 1
+  origin="$(git -C "$root" remote get-url origin 2>/dev/null || true)"; [ -n "$origin" ] || return 1
+  slug="$(github_slug_of "$origin")"; [ -n "$slug" ] || return 1
+  priv="$(gh api "repos/$slug" --jq .private 2>/dev/null || true)"
+  [ "$priv" = "true" ]
+}
+
+log_auto() { # best-effort, secret-free
+  mkdir -p "$HOME/.heimdall" 2>/dev/null || return 0
+  printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo now)" "$*" \
+    >> "$HOME/.heimdall/team-auto.log" 2>/dev/null || true
+}
+
+# bare `hmd team` (no subcommand) — SMART dispatch: share if already initiated, else
+# mint + (in a verified-private repo) share, else keep personal. Reuses the exact
+# autojoin-green `share` path (bash "$SELF" share) — no divergent share logic.
+cmd_dispatch() {
+  if [ -f "$SHARED_FILE" ]; then bash "$SELF" show; return 0; fi
+  local sec; sec="$(_resolve secret)"
+  if [ -z "$sec" ]; then
+    sec="$(mint_secret)"; [ -n "$sec" ] || { echo "heimdall-team: failed to mint a secret" >&2; return 2; }
+    write_team "$sec" "new"
+    printf 'Minted a personal team for this repo (team_id %s).\n' "$(team_id_of "$sec")"
+  fi
+  if repo_is_private; then
+    bash "$SELF" share
+  else
+    printf 'Kept your team PERSONAL (not a verified-private GitHub repo — not shared).\n'
+    printf 'Presence works. To auto-join collaborators, run this inside a PRIVATE repo:  hmd team share\n'
+  fi
+}
+
+# `hmd team auto` — the zero-COMMAND SessionStart entry. ALWAYS ensures a solo team so
+# presence works with no command at all; then CONSERVATIVELY auto-shares ONLY when:
+# inside a git repo, heimdall is ALREADY active here, not yet shared, not throttled,
+# and the repo is VERIFIABLY PRIVATE (the leak guard). Never pushes, never blocks,
+# idempotent. Opt out: HEIMDALL_NO_TEAM_AUTOSHARE=1 or ~/.heimdall/no-team-autoshare.
+cmd_auto() {
+  [ "${HEIMDALL_NO_TEAM_AUTOSHARE:-0}" = "1" ] && exit 0
+  [ -f "$HOME/.heimdall/no-team-autoshare" ] && exit 0
+  # capture heimdall-ACTIVE *before* our own solo mint (else we'd mark ourselves active).
+  local active=0 m
+  for m in "$TEAM_FILE" "$TEAM_DIR/identity.json" .planning/heimdall-state.json heimdall-state.json superx-state.json; do
+    [ -e "$m" ] && { active=1; break; }
+  done
+  # ALWAYS ensure a solo team (zero-config presence).
+  if [ -z "$(_resolve secret)" ]; then
+    local sec; sec="$(mint_secret)"; [ -n "$sec" ] && write_team "$sec" "auto-solo"
+  fi
+  # conservative auto-share gate.
+  git rev-parse --show-toplevel >/dev/null 2>&1 || exit 0
+  [ "$active" = 1 ] || exit 0
+  [ -f "$SHARED_FILE" ] && exit 0
+  local stamp="$HOME/.heimdall/.team-auto-stamp" interval="${HEIMDALL_TEAM_AUTO_THROTTLE:-86400}"
+  if [ -f "$stamp" ]; then
+    local now mt; now="$(date +%s 2>/dev/null || echo 0)"
+    mt="$(stat -f %m "$stamp" 2>/dev/null || stat -c %Y "$stamp" 2>/dev/null || echo 0)"
+    [ "$((now - mt))" -lt "$interval" ] && exit 0
+  fi
+  mkdir -p "$HOME/.heimdall" 2>/dev/null && : > "$stamp" 2>/dev/null || true  # claim window before work
+  repo_is_private || exit 0   # THE LEAK GUARD — never auto-share on a public/unverifiable repo
+  bash "$SELF" share >/dev/null 2>&1 && log_auto "auto-shared team in $(repo_root)"
+  exit 0
+}
+
 # ── argv ────────────────────────────────────────────────────────────────────────
-[ "$#" -ge 1 ] || { usage >&2; exit 2; }
-SUB="$1"; shift || true
+SUB="${1:-}"; shift 2>/dev/null || true
 
 case "$SUB" in
-  -h|--help|help|"")
+  -h|--help|help)
     usage; exit 0 ;;
+
+  ""|dispatch)
+    cmd_dispatch; exit $? ;;
+
+  auto)
+    cmd_auto ;;
 
   new)
     FORCE=""
