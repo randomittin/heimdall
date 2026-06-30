@@ -71,6 +71,13 @@ docs/superpowers/plans/
 .heimdall/identity.json
 .heimdall/team.json
 .heimdall/*.seed
+# EXCEPTION: team.shared.json is the TEAM's SHARED secret, INTENTIONALLY TRACKED +
+# committed by `hmd team share` — but ONLY into a verified-PRIVATE repo (the
+# collaborator-clone boundary is the access control; `share` HARD-REFUSES on a public
+# repo). It must NOT be ignored so a collaborator who pulls it auto-joins the team.
+# (The PERSONAL team.json above stays ignored — it is a per-dev secret, never shared.)
+# Placed AFTER the `.heimdall/*` ignore + the team.json ignore so nothing re-ignores it.
+!.heimdall/team.shared.json
 # designmatch v2 runtime ledger + quarantine (the regen-log.json hash-log and the
 # tmp holding area are per-checkout runtime state, not source — never commit them).
 .designmatch/
