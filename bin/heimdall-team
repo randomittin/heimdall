@@ -23,6 +23,25 @@
 # team and sees only themselves until they share/invite. Run `new` to mint + share
 # deliberately, `join` to enroll into a teammate's team, `show` to inspect.
 #
+# TWO TEAM FILES (distinct on purpose):
+#   <repo>/.heimdall/team.json         PERSONAL/local — a dev's own team (0600,
+#                                      gitignored). Auto-solo minted if absent.
+#   <repo>/.heimdall/team.shared.json  the TEAM's SHARED secret, TRACKED/committed
+#                                      (ONLY ever in a PRIVATE repo). Collaborators
+#                                      who clone/pull it AUTO-JOIN that team — the
+#                                      collaborator-clone boundary IS the access
+#                                      control. Written ONLY by `share`, gated on a
+#                                      verified-PRIVATE repo (never public).
+#
+# RESOLUTION PRECEDENCE (heimdall-team show + heimdall-presence agree byte-for-byte):
+#   1. an EXPLICIT personal team.json (source new|join) — a deliberate `team new`/
+#      `team join` override always wins (the dev chose this team on purpose).
+#   2. team.shared.json — the committed team (auto-join for a collaborator).
+#   3. an auto-solo personal team.json (source auto-solo / legacy).
+#   4. nothing -> heimdall-presence auto-mints a solo team.
+#   So a teammate who clones a private repo carrying team.shared.json AUTO-JOINS it,
+#   while a dev who deliberately ran `team join <other>` keeps their own choice.
+#
 # Subcommands:
 #   heimdall-team new [--force]   mint a team_secret -> <repo>/.heimdall/team.json
 #                                 (0600); print the secret + the heimdall-invite
@@ -30,21 +49,29 @@
 #                                 team.json without --force.
 #   heimdall-team join <secret>   write <repo>/.heimdall/team.json with a teammate's
 #                                 secret (>=32 chars) — join their team.
-#   heimdall-team show [--json]   print the NON-SECRET team_id + whether configured.
-#                                 NEVER prints the secret.
+#   heimdall-team share [--rotate]  COMMIT this repo's team secret to a verified-
+#                                 PRIVATE repo as team.shared.json so collaborators
+#                                 auto-join on pull. HARD-REFUSES on a PUBLIC repo
+#                                 or when privacy can't be verified (gh absent/
+#                                 unauth). --rotate mints a fresh secret + re-commits.
+#   heimdall-team show [--json]   print the NON-SECRET team_id + its source (shared|
+#                                 personal|solo) + whether configured. NEVER the secret.
 #   -h, --help
 #
-# SECURITY. The secret is written ONLY to team.json (0600). It NEVER crosses the
+# SECURITY. The personal secret is written ONLY to team.json (0600). team.shared.json
+# is the ONE intentional commit of a secret — gated HARD on a verified-PRIVATE repo
+# (the collaborator-clone boundary), refused on public. The secret NEVER crosses the
 # argv of a child process (argv shows in `ps`) — it travels bash->python via the
-# ENVIRONMENT only — is never logged, and never committed (.gitignore). `new`
-# prints it to stdout ONCE (the owner must see it to share, with a caveat); `show`
-# never prints it; `join` takes it as this CLI's own argv (the documented entry
-# point) but re-exposes it to nothing.
+# ENVIRONMENT only — is never logged. `new` prints it to stdout ONCE (the owner must
+# see it to share, with a caveat); `show` never prints it; `join` takes it as this
+# CLI's own argv (the documented entry point) but re-exposes it to nothing; `share`
+# never prints it (it commits it to the private repo only).
 #
 # Store: <git toplevel of $PWD>/.heimdall/team.json. HEIMDALL_TEAM_DIR overrides
 # the dir wholesale (tests + non-git trees). Mirrors bin/heimdall-identity.
 #
-# Exit: 0 ok; 2 usage / refuse-clobber / weak-secret / IO error.
+# Exit: 0 ok; 2 usage / refuse-clobber / weak-secret / IO error; non-zero on a
+# share PRIVACY REFUSAL (public repo or privacy unverifiable).
 set -uo pipefail
 
 SELF="$0"
@@ -57,12 +84,15 @@ INVITE_CLI="$BIN_DIR/heimdall-invite"
 PY="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)"
 [ -n "$PY" ] || { echo "heimdall-team: python3 is required" >&2; exit 2; }
 
-usage() { sed -n '2,46p' "$SELF" | sed 's/^# \{0,1\}//'; }
+# Print the header comment block as help (shift-proof: lines 2..the line before
+# `set -uo pipefail`, with the leading `# ` stripped).
+usage() { sed -n '2,/^set -uo pipefail/p' "$SELF" | sed -e '$d' -e 's/^# \{0,1\}//'; }
 
 # ── Store location (per-repo, mirrors heimdall-identity) ────────────────────────
 repo_root() { git rev-parse --show-toplevel 2>/dev/null || pwd; }
 TEAM_DIR="${HEIMDALL_TEAM_DIR:-$(repo_root)/.heimdall}"
 TEAM_FILE="$TEAM_DIR/team.json"
+SHARED_FILE="$TEAM_DIR/team.shared.json"   # the TRACKED team secret (private repos only)
 
 # ── Primitives (secret crosses to python via ENV, never argv) ───────────────────
 # Mint 32 random bytes -> base64url (43 chars, no padding) == secrets.token_urlsafe(32).
@@ -77,42 +107,20 @@ print(hashlib.sha256(b"heimdall-team\x00" + s.encode("utf-8")).hexdigest()[:32])
 PYEOF
 }
 
-# Read the configured secret (empty if absent/unreadable). Used internally only —
-# the value is never printed; only team_id_of() output is shown to the user.
-read_secret() {
-  [ -f "$TEAM_FILE" ] || { printf ''; return 0; }
-  HMD_TEAM_FILE="$TEAM_FILE" "$PY" - <<'PYEOF'
-import json, os, sys
-try:
-    d = json.load(open(os.environ["HMD_TEAM_FILE"]))
-    s = d.get("team_secret")
-    sys.stdout.write(s if isinstance(s, str) else "")
-except Exception:
-    sys.stdout.write("")
-PYEOF
-}
-
-# Read the created epoch (empty if absent). Non-secret.
-read_created() {
-  [ -f "$TEAM_FILE" ] || { printf ''; return 0; }
-  HMD_TEAM_FILE="$TEAM_FILE" "$PY" - <<'PYEOF'
-import json, os, sys
-try:
-    c = json.load(open(os.environ["HMD_TEAM_FILE"])).get("created")
-    sys.stdout.write(str(int(c)) if isinstance(c, (int, float)) else "")
-except Exception:
-    sys.stdout.write("")
-PYEOF
-}
-
-# Atomically write team.json 0600 with the given secret (secret via env, not argv).
-write_team() { # $1 = secret
+# Atomically write team.json 0600 with the given secret + a `source` tag (secret via
+# env, never argv). `source` (new|join|auto-solo) lets the resolver tell a DELIBERATE
+# team choice from an auto-solo mint — an explicit choice wins over a shared team.
+write_team() { # $1 = secret  $2 = source (new|join)
   mkdir -p "$TEAM_DIR" 2>/dev/null || { echo "heimdall-team: cannot create $TEAM_DIR" >&2; exit 2; }
-  if ! HMD_TEAM_SEC="$1" HMD_TEAM_FILE="$TEAM_FILE" "$PY" - <<'PYEOF'
+  if ! HMD_TEAM_SEC="$1" HMD_TEAM_SRC="${2:-}" HMD_TEAM_FILE="$TEAM_FILE" "$PY" - <<'PYEOF'
 import json, os, sys, time
 sec = os.environ["HMD_TEAM_SEC"]
+src = os.environ.get("HMD_TEAM_SRC") or ""
 path = os.environ["HMD_TEAM_FILE"]
-data = json.dumps({"team_secret": sec, "created": int(time.time())}) + "\n"
+rec = {"team_secret": sec, "created": int(time.time())}
+if src:
+    rec["source"] = src
+data = json.dumps(rec) + "\n"
 # O_CREAT|O_TRUNC at 0600 so the secret is never momentarily world-readable.
 fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
 try:
@@ -125,6 +133,79 @@ PYEOF
     echo "heimdall-team: failed to write $TEAM_FILE" >&2
     exit 2
   fi
+}
+
+# Write the TRACKED team.shared.json with the given secret (secret via env, never
+# argv). This is the ONE intentional commit of a secret — the caller MUST have already
+# verified the repo is PRIVATE. Mode 0644 (it is committed; the access boundary is the
+# private repo + collaborator clone, NOT the file mode).
+write_shared() { # $1 = secret
+  mkdir -p "$TEAM_DIR" 2>/dev/null || { echo "heimdall-team: cannot create $TEAM_DIR" >&2; exit 2; }
+  if ! HMD_TEAM_SEC="$1" HMD_SHARED_FILE="$SHARED_FILE" "$PY" - <<'PYEOF'
+import json, os, sys, time
+sec = os.environ["HMD_TEAM_SEC"]
+path = os.environ["HMD_SHARED_FILE"]
+data = json.dumps({"team_secret": sec, "created": int(time.time())}) + "\n"
+fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+try:
+    os.write(fd, data.encode("utf-8"))
+finally:
+    os.close(fd)
+PYEOF
+  then
+    echo "heimdall-team: failed to write $SHARED_FILE" >&2
+    exit 2
+  fi
+}
+
+# ── team-secret resolution (PRECEDENCE: explicit-personal > shared > solo) ───────
+# Single source of truth, shared by `show` + `share`; heimdall-presence implements
+# the IDENTICAL precedence inline. WANT=secret prints the raw secret (internal only —
+# captured into a var, never echoed); WANT=info prints "source\ncreated\npath" (NO
+# secret) for display.
+_resolve() { # $1 = secret|info
+  HMD_PERSONAL="$TEAM_FILE" HMD_SHARED="$SHARED_FILE" HMD_WANT="$1" "$PY" - <<'PYEOF'
+import json, os, sys
+def rd(p):
+    try:
+        d = json.load(open(p))
+        s = d.get("team_secret")
+    except Exception:
+        return "", "", None, ""
+    if isinstance(s, str) and s:
+        src = d.get("source")
+        return s, (src if isinstance(src, str) else ""), d.get("created"), p
+    return "", "", None, ""
+ps, psrc, pc, pp = rd(os.environ["HMD_PERSONAL"])
+ss, _ssrc, sc, sp = rd(os.environ["HMD_SHARED"])
+# 1) a DELIBERATE personal choice (new|join) always wins; 2) the committed shared
+# team (auto-join); 3) an auto-solo / legacy personal team; 4) nothing.
+if ps and psrc in ("new", "join"):
+    source, secret, created, path = "personal", ps, pc, pp
+elif ss:
+    source, secret, created, path = "shared", ss, sc, sp
+elif ps:
+    source, secret, created, path = "solo", ps, pc, pp
+else:
+    source, secret, created, path = "", "", None, ""
+if os.environ["HMD_WANT"] == "secret":
+    sys.stdout.write(secret)
+else:
+    c = str(int(created)) if isinstance(created, (int, float)) else ""
+    sys.stdout.write(source + "\n" + c + "\n" + path)
+PYEOF
+}
+
+# Resolve owner/repo (a github slug) from a remote URL — https / ssh / scp forms.
+github_slug_of() { # $1 = remote url
+  HMD_ORIGIN="$1" "$PY" - <<'PYEOF'
+import os, re, sys
+u = (os.environ.get("HMD_ORIGIN") or "").strip()
+u = re.sub(r"\.git$", "", u)
+m = re.search(r"github\.com[:/]+([^/]+)/(.+)$", u)
+if m:
+    sys.stdout.write(m.group(1) + "/" + m.group(2).rstrip("/"))
+PYEOF
 }
 
 # ── argv ────────────────────────────────────────────────────────────────────────
@@ -155,7 +236,7 @@ EOF
     fi
     SECRET="$(mint_secret)"
     [ -n "$SECRET" ] || { echo "heimdall-team: failed to mint a secret" >&2; exit 2; }
-    write_team "$SECRET"
+    write_team "$SECRET" "new"
     TID="$(team_id_of "$SECRET")"
     printf 'Minted a new team for this repo (team_id %s).\n' "$TID"
     printf 'Stored 0600 in %s\n\n' "$TEAM_FILE"
@@ -177,11 +258,132 @@ EOF
       echo "(heimdall-team new mints a 43-char one)." >&2
       exit 2
     fi
-    write_team "$SECRET"
+    write_team "$SECRET" "join"
     TID="$(team_id_of "$SECRET")"
     printf 'Joined team %s for this repo.\n' "$TID"
     printf 'Stored 0600 in %s\n' "$TEAM_FILE"
     printf 'Presence will scope to this team on your next beat/roster.\n'
+    exit 0 ;;
+
+  share)
+    ROTATE=""
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --rotate) ROTATE=1; shift ;;
+        *) echo "heimdall-team share: unexpected argument: $1" >&2; exit 2 ;;
+      esac
+    done
+
+    # share REQUIRES a git repo (it commits the shared secret into it).
+    REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+    if [ -z "$REPO_ROOT" ]; then
+      echo "heimdall-team share: not inside a git repository — nothing to share into." >&2
+      exit 2
+    fi
+    ORIGIN="$(git -C "$REPO_ROOT" remote get-url origin 2>/dev/null || true)"
+    if [ -z "$ORIGIN" ]; then
+      echo "heimdall-team share: this repo has no 'origin' remote — cannot resolve the" >&2
+      echo "GitHub repo to verify it is private. Add an origin remote, then retry." >&2
+      exit 2
+    fi
+    SLUG="$(github_slug_of "$ORIGIN")"
+    if [ -z "$SLUG" ]; then
+      echo "heimdall-team share: origin ($ORIGIN) is not a github.com remote — cannot" >&2
+      echo "verify privacy via gh. Refusing (will not risk leaking the team secret)." >&2
+      exit 2
+    fi
+
+    # ── THE CARDINAL CONTROL: verify the repo is PRIVATE before committing a secret. ──
+    # Committing the team secret to a PUBLIC repo would expose the whole team's private
+    # presence to the world — the exact thing the multi-tenant model prevents. If we
+    # cannot PROVE the repo is private, we REFUSE (fail closed, never risk a leak).
+    if ! command -v gh >/dev/null 2>&1; then
+      cat >&2 <<'EOF'
+heimdall-team share: the GitHub CLI `gh` is not installed, so I cannot verify this
+repo is PRIVATE. Committing the team secret to a PUBLIC repo would leak your whole
+team's private presence to the world — so I refuse rather than risk it.
+
+Install + authenticate gh (https://cli.github.com), then retry:
+    gh auth login
+Or distribute the secret out-of-band with:  hmd invite
+EOF
+      exit 1
+    fi
+    PRIV="$(gh api "repos/$SLUG" --jq .private 2>/dev/null || true)"
+    case "$PRIV" in
+      true)
+        : ;;  # verified PRIVATE -> proceed.
+      false)
+        cat >&2 <<EOF
+heimdall-team share: REFUSING — $SLUG is a PUBLIC repo.
+
+Committing the team secret to a PUBLIC repo would expose your entire team's private
+presence (every teammate's HAID + activity) to the WORLD. That is exactly what the
+multi-tenant team model exists to prevent. NOTHING was written or committed.
+
+Make the repo private (gh repo edit $SLUG --visibility private), or distribute the
+secret out-of-band with:  hmd invite
+EOF
+        exit 1 ;;
+      *)
+        cat >&2 <<EOF
+heimdall-team share: could not verify that $SLUG is PRIVATE (gh returned no answer —
+not authenticated, no access, or offline). I will NOT commit the team secret unless I
+can PROVE the repo is private. NOTHING was written or committed.
+
+Authenticate gh and confirm access:  gh auth login && gh api repos/$SLUG --jq .private
+Or distribute the secret out-of-band with:  hmd invite
+EOF
+        exit 1 ;;
+    esac
+
+    # PRIVATE-verified. Determine the secret to share.
+    if [ -n "$ROTATE" ]; then
+      SECRET="$(mint_secret)"
+      [ -n "$SECRET" ] || { echo "heimdall-team share: failed to mint a secret" >&2; exit 2; }
+      # --rotate overwrites the LOCAL personal team.json too (a deliberate new team).
+      write_team "$SECRET" "new"
+    else
+      SECRET="$(_resolve secret)"
+      if [ -z "$SECRET" ]; then
+        # No team configured yet -> mint one and persist it locally too, so the owner's
+        # personal team and the shared team agree.
+        SECRET="$(mint_secret)"
+        [ -n "$SECRET" ] || { echo "heimdall-team share: failed to mint a secret" >&2; exit 2; }
+        write_team "$SECRET" "new"
+      fi
+    fi
+
+    write_shared "$SECRET"
+
+    # Force-add past any .gitignore (in the owner's repo team.shared.json may be ignored
+    # by a `.heimdall/*` pattern) and commit. --no-verify so the owner's OWN secret-scan
+    # pre-commit hook does not block THIS sanctioned, private-repo-gated secret commit.
+    if ! git -C "$REPO_ROOT" add -f "$SHARED_FILE" 2>/dev/null; then
+      echo "heimdall-team share: failed to git-add $SHARED_FILE" >&2
+      exit 2
+    fi
+    if [ -n "$ROTATE" ]; then
+      COMMIT_MSG="chore(team): rotate the team secret shared with repo collaborators (private repo)"
+    else
+      COMMIT_MSG="chore(team): share team secret with repo collaborators (private repo)"
+    fi
+    if ! git -C "$REPO_ROOT" commit --no-verify -m "$COMMIT_MSG" -- "$SHARED_FILE" >/dev/null 2>&1; then
+      echo "heimdall-team share: git commit failed (nothing changed, or no commit identity" >&2
+      echo "configured). The shared file is staged at $SHARED_FILE; commit it manually." >&2
+      exit 2
+    fi
+
+    TID="$(team_id_of "$SECRET")"
+    if [ -n "$ROTATE" ]; then
+      printf 'Rotated + re-shared the team (team_id %s) for %s.\n' "$TID" "$SLUG"
+      printf 'The previous team_id ages out in one presence TTL; collaborators re-join on next pull.\n'
+    else
+      printf 'Shared the team (team_id %s) with collaborators of %s.\n' "$TID" "$SLUG"
+    fi
+    printf 'Committed (tracked) %s — NOT pushed (push when ready).\n' "$SHARED_FILE"
+    printf 'Collaborators now AUTO-JOIN this team on their next pull. No secret paste needed.\n'
+    printf 'Rotate the team secret later with:  hmd team share --rotate\n'
     exit 0 ;;
 
   show)
@@ -192,16 +394,23 @@ EOF
         *) echo "heimdall-team show: unexpected argument: $1" >&2; exit 2 ;;
       esac
     done
-    SECRET="$(read_secret)"
+    # Resolve via the shared precedence (explicit-personal > shared > solo). The
+    # secret is read separately into a var (for team_id only) and NEVER printed.
+    INFO="$(_resolve info)"
+    SOURCE="$(printf '%s' "$INFO" | sed -n '1p')"
+    CREATED="$(printf '%s' "$INFO" | sed -n '2p')"
+    SRCPATH="$(printf '%s' "$INFO" | sed -n '3p')"
+    SECRET="$(_resolve secret)"
     if [ -n "$SECRET" ]; then
       TID="$(team_id_of "$SECRET")"
-      CREATED="$(read_created)"
       if [ -n "$AS_JSON" ]; then
-        HMD_TEAM_TID="$TID" HMD_TEAM_CREATED="$CREATED" HMD_TEAM_FILE="$TEAM_FILE" "$PY" - <<'PYEOF'
+        HMD_TEAM_TID="$TID" HMD_TEAM_CREATED="$CREATED" HMD_TEAM_SOURCE="$SOURCE" \
+        HMD_TEAM_FILE="$SRCPATH" "$PY" - <<'PYEOF'
 import json, os
 created = os.environ.get("HMD_TEAM_CREATED") or ""
 print(json.dumps({
     "configured": True,
+    "source": os.environ["HMD_TEAM_SOURCE"],
     "team_id": os.environ["HMD_TEAM_TID"],
     "created": int(created) if created.isdigit() else None,
     "path": os.environ["HMD_TEAM_FILE"],
@@ -209,14 +418,15 @@ print(json.dumps({
 PYEOF
       else
         printf 'configured: yes\n'
+        printf 'source:     %s\n' "$SOURCE"
         printf 'team_id:    %s\n' "$TID"
         [ -n "$CREATED" ] && printf 'created:    %s\n' "$CREATED"
-        printf 'store:      %s\n' "$TEAM_FILE"
-        printf '(the team secret is never printed — see %s)\n' "$TEAM_FILE"
+        printf 'store:      %s\n' "$SRCPATH"
+        printf '(the team secret is never printed — see %s)\n' "$SRCPATH"
       fi
     else
       if [ -n "$AS_JSON" ]; then
-        printf '{"configured": false, "team_id": null, "created": null, "path": "%s"}\n' "$TEAM_FILE"
+        printf '{"configured": false, "source": null, "team_id": null, "created": null, "path": "%s"}\n' "$TEAM_FILE"
       else
         printf 'configured: no\n'
         printf 'No team is configured for this repo yet.\n'
@@ -228,7 +438,7 @@ PYEOF
     exit 0 ;;
 
   *)
-    echo "heimdall-team: unknown subcommand '$SUB' (try: new | join | show)" >&2
+    echo "heimdall-team: unknown subcommand '$SUB' (try: new | join | share | show)" >&2
     usage >&2
     exit 2 ;;
 esac
