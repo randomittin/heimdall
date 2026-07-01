@@ -38,6 +38,12 @@
 # which analysis tools happen to be installed.
 #
 # Usage:
+#   heimdall-debloat report [<path>]     one-word bloat SCORECARD on any repo: runs
+#                                        the read-only scorecard pass, writes
+#                                        BLOAT-REPORT.md, and prints a shareable,
+#                                        screenshot-ready SCORECARD card. Friendly
+#                                        alias of --report-only; makes NO changes.
+#                                        [<path>] defaults to the current directory.
 #   heimdall-debloat [--repo <root>] [options]
 #
 #   --repo <root>        repo to debloat (default: cwd). Must be a git repo.
@@ -79,7 +85,7 @@ fi
 BIN_DIR="$(cd "$(dirname "$SELF")" && pwd)"
 PLUGIN_DIR="$(cd "$BIN_DIR/.." && pwd)"
 
-usage() { sed -n '2,72p' "$SELF" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,77p' "$SELF" | sed 's/^# \{0,1\}//'; }
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -179,6 +185,25 @@ PRINT_JSON=0
 # env HEIMDALL_LAZY_LADDER=0 flips the default off; --ladder is the explicit override.
 LADDER_MODE="on"
 case "${HEIMDALL_LAZY_LADDER:-}" in 0|off|false|no|OFF|FALSE|No) LADDER_MODE="off" ;; esac
+
+# ── Subcommand: `report [<path>]` — the one-word "bloat scorecard on any repo"
+# entrypoint. It is a friendly alias for --report-only (runs ONLY the read-only
+# scorecard pass, writes BLOAT-REPORT.md, makes NO changes) that additionally
+# prints the shareable SCORECARD card. A LEADING `report` token is consumed here,
+# with an optional positional <path> right after it; every existing flag (including
+# --report-only / --report <path>) keeps working unchanged for back-compat.
+SUBCMD_REPORT=0
+if [ $# -gt 0 ] && [ "$1" = "report" ]; then
+  SUBCMD_REPORT=1
+  REPORT_ONLY=1
+  shift
+  # An optional positional path immediately after `report` (anything not a flag)
+  # is the repo to score — sugar for `--repo <path>`.
+  if [ $# -gt 0 ] && [ "${1#-}" = "$1" ]; then
+    REPO="$1"; shift
+  fi
+fi
+
 while [ $# -gt 0 ]; do
   case "$1" in
     --repo)         REPO="${2:?--repo needs a path}"; shift 2 ;;
@@ -389,6 +414,133 @@ SCORECARD_JSON="$(jq -nc \
 
 if [ "$PRINT_JSON" = "1" ]; then
   printf '%s\n' "$SCORECARD_JSON"
+fi
+
+# ── The shareable BLOAT SCORECARD card ────────────────────────────────────────
+# A screenshot-ready, one-frame scorecard of the 5 axes, each with a real value +
+# a ✓/⚠/✗ glyph, an overall verdict, and the repo name. Numbers come STRAIGHT from
+# the bloat-gate run above (the same data that BLOAT-REPORT.md is built from) — an
+# axis whose tool is absent honestly reads "skipped: needs <tool>", never a faked
+# number. Color detection mirrors bin/summary-card; a non-tty (pipe / CI) prints
+# clean plain text with zero ANSI. Value/label fields stay ASCII so the columns
+# line up regardless of the terminal's multibyte handling.
+print_scorecard_card() {
+  local P C G Wc RED D B R BP
+  if ! [ -t 1 ]; then
+    P=''; C=''; G=''; Wc=''; RED=''; D=''; B=''; R=''
+  elif [[ "${COLORTERM:-}" == "truecolor" || "${COLORTERM:-}" == "24bit" || "${TERM:-}" == *256color* ]]; then
+    P=$'\033[38;2;224;86;160m'; C=$'\033[38;2;0;212;255m'; G=$'\033[38;2;78;204;163m'
+    Wc=$'\033[38;2;255;200;80m'; RED=$'\033[38;2;255;95;110m'; D=$'\033[38;2;100;100;120m'
+    B=$'\033[1m'; R=$'\033[0m'
+  else
+    P=$'\033[35m'; C=$'\033[36m'; G=$'\033[32m'; Wc=$'\033[33m'; RED=$'\033[31m'; D=$'\033[37m'
+    B=$'\033[1m'; R=$'\033[0m'
+  fi
+  BP="${B}${P}"
+
+  local WIDTH=62 LABELW=17 VALW=38
+  local OKG="✓" WARNG="⚠" FAILG="✗" SKIPG="–"
+  local n_pass=0 n_warn=0 n_fail=0 n_skip=0
+  local -a LAB VAL GLY GCO VCO
+  local v g gc vc tool ratio
+
+  # Axis 1 — dead / unreferenced exports.
+  if [ "$SC_DEAD_STATUS" = "ran" ]; then
+    v="${SC_DEAD_COUNT:-0} dead export(s)"
+    if [ "${SC_DEAD_COUNT:-0}" -eq 0 ]; then g="$OKG"; gc="$G"; vc="$R"; n_pass=$((n_pass+1))
+    elif [ "${SC_DEAD_COUNT:-0}" -le 10 ]; then g="$WARNG"; gc="$Wc"; vc="$R"; n_warn=$((n_warn+1))
+    else g="$FAILG"; gc="$RED"; vc="$R"; n_fail=$((n_fail+1)); fi
+  else
+    tool="$SC_DEAD_TOOL"; { [ -z "$tool" ] || [ "$tool" = "none" ]; } && tool="ts-prune/knip/vulture"
+    v="skipped: needs ${tool}"; g="$SKIPG"; gc="$D"; vc="$D"; n_skip=$((n_skip+1))
+  fi
+  LAB+=("Dead exports"); VAL+=("$v"); GLY+=("$g"); GCO+=("$gc"); VCO+=("$vc")
+
+  # Axis 2 — duplication %.
+  if [ "$SC_DUP_STATUS" = "ran" ] && [ "$SC_DUP_PCT" != "null" ]; then
+    v="${SC_DUP_PCT}% duplicated"
+    if awk -v p="$SC_DUP_PCT" 'BEGIN{exit !(p+0 < 3)}'; then g="$OKG"; gc="$G"; vc="$R"; n_pass=$((n_pass+1))
+    elif awk -v p="$SC_DUP_PCT" 'BEGIN{exit !(p+0 <= 10)}'; then g="$WARNG"; gc="$Wc"; vc="$R"; n_warn=$((n_warn+1))
+    else g="$FAILG"; gc="$RED"; vc="$R"; n_fail=$((n_fail+1)); fi
+  else
+    v="skipped: needs jscpd"; g="$SKIPG"; gc="$D"; vc="$D"; n_skip=$((n_skip+1))
+  fi
+  LAB+=("Duplication"); VAL+=("$v"); GLY+=("$g"); GCO+=("$gc"); VCO+=("$vc")
+
+  # Axis 3 — cyclomatic complexity.
+  if [ "$SC_CC_STATUS" = "ran" ]; then
+    v="max cyclomatic ${SC_CC_MAX:-0}"
+    if [ "${SC_CC_MAX:-0}" -le 12 ]; then g="$OKG"; gc="$G"; vc="$R"; n_pass=$((n_pass+1))
+    elif [ "${SC_CC_MAX:-0}" -le 20 ]; then g="$WARNG"; gc="$Wc"; vc="$R"; n_warn=$((n_warn+1))
+    else g="$FAILG"; gc="$RED"; vc="$R"; n_fail=$((n_fail+1)); fi
+  else
+    v="skipped: needs radon/lizard"; g="$SKIPG"; gc="$D"; vc="$D"; n_skip=$((n_skip+1))
+  fi
+  LAB+=("Complexity"); VAL+=("$v"); GLY+=("$g"); GCO+=("$gc"); VCO+=("$vc")
+
+  # Axis 4 — dependency creep.
+  if [ "$SC_DEP_STATUS" = "ran" ]; then
+    v="${SC_DEP_NEW:-0} new dep line(s)"
+    if [ "${SC_DEP_NEW:-0}" -eq 0 ]; then g="$OKG"; gc="$G"; vc="$R"; n_pass=$((n_pass+1))
+    elif [ "${SC_DEP_NEW:-0}" -le 5 ]; then g="$WARNG"; gc="$Wc"; vc="$R"; n_warn=$((n_warn+1))
+    else g="$FAILG"; gc="$RED"; vc="$R"; n_fail=$((n_fail+1)); fi
+  else
+    v="skipped: needs a lockfile"; g="$SKIPG"; gc="$D"; vc="$D"; n_skip=$((n_skip+1))
+  fi
+  LAB+=("Dependency creep"); VAL+=("$v"); GLY+=("$g"); GCO+=("$gc"); VCO+=("$vc")
+
+  # Axis 5 — LOC budget (size + the deterministically-proved removable share).
+  if [ "$SC_DEAD_STATUS" = "ran" ] || [ "$SC_DUP_STATUS" = "ran" ]; then
+    v="${SC_LOC:-0} LOC, ~${CAND_TOTAL:-0} removable"
+    ratio="$(awk -v c="${CAND_TOTAL:-0}" -v l="${SC_LOC:-0}" 'BEGIN{if(l+0<=0){print 0}else{printf "%d",(c*100)/l}}')"
+    if [ "$ratio" -lt 5 ]; then g="$OKG"; gc="$G"; vc="$R"; n_pass=$((n_pass+1))
+    elif [ "$ratio" -le 20 ]; then g="$WARNG"; gc="$Wc"; vc="$R"; n_warn=$((n_warn+1))
+    else g="$FAILG"; gc="$RED"; vc="$R"; n_fail=$((n_fail+1)); fi
+  else
+    v="${SC_LOC:-0} LOC (est. needs dead/dup tool)"; g="$SKIPG"; gc="$D"; vc="$D"; n_skip=$((n_skip+1))
+  fi
+  LAB+=("LOC budget"); VAL+=("$v"); GLY+=("$g"); GCO+=("$gc"); VCO+=("$vc")
+
+  # Overall verdict — only measured axes drive the grade; an all-skipped run is
+  # honestly inconclusive rather than a fake green.
+  local verdict vcol
+  if [ "$n_fail" -gt 0 ]; then verdict="BLOATED"; vcol="$RED"
+  elif [ "$n_warn" -gt 0 ]; then verdict="NEEDS TRIMMING"; vcol="$Wc"
+  elif [ "$n_pass" -gt 0 ]; then verdict="LEAN"; vcol="$G"
+  else verdict="INCONCLUSIVE - no analysis tools installed"; vcol="$D"; fi
+
+  local i dashes="" line labp valp lab val gly gco vco
+  for ((i=0;i<WIDTH;i++)); do dashes+="─"; done
+  local repo_name; repo_name="$(basename "$REPO")"
+
+  printf '\n'
+  printf '%s┌%s┐%s\n' "$D" "$dashes" "$R"
+  printf -v line '%-*s' "$WIDTH" "  BLOAT SCORECARD"; line="${line:0:WIDTH}"
+  printf '%s│%s%s%s%s%s│%s\n' "$D" "$R" "$BP" "$line" "$R" "$D" "$R"
+  local rr="  repo: ${repo_name}"; rr="${rr:0:WIDTH}"
+  printf -v line '%-*s' "$WIDTH" "$rr"; line="${line:0:WIDTH}"
+  printf '%s│%s%s%s%s%s│%s\n' "$D" "$R" "$C" "$line" "$R" "$D" "$R"
+  printf '%s├%s┤%s\n' "$D" "$dashes" "$R"
+  for ((i=0;i<${#LAB[@]};i++)); do
+    lab="${LAB[$i]}"; val="${VAL[$i]}"; gly="${GLY[$i]}"; gco="${GCO[$i]}"; vco="${VCO[$i]}"
+    lab="${lab:0:LABELW}"; val="${val:0:VALW}"
+    printf -v labp '%-*s' "$LABELW" "$lab"
+    printf -v valp '%-*s' "$VALW" "$val"
+    printf '%s│%s  %s%s%s %s%s%s %s%s%s  %s│%s\n' \
+      "$D" "$R" "$C" "$labp" "$R" "$vco" "$valp" "$R" "$gco" "$gly" "$R" "$D" "$R"
+  done
+  printf '%s├%s┤%s\n' "$D" "$dashes" "$R"
+  local vr="  VERDICT: ${verdict}"; vr="${vr:0:WIDTH}"
+  printf -v line '%-*s' "$WIDTH" "$vr"; line="${line:0:WIDTH}"
+  printf '%s│%s%s%s%s%s│%s\n' "$D" "$R" "$B$vcol" "$line" "$R" "$D" "$R"
+  printf '%s└%s┘%s\n' "$D" "$dashes" "$R"
+  printf '\n'
+}
+
+# Print the card on the `report` subcommand (always) or when --report-only is run
+# interactively (a tty). Piped / CI output is plain text (ANSI-clean) by detection.
+if [ "${SUBCMD_REPORT:-0}" = "1" ] || { [ "$REPORT_ONLY" = "1" ] && [ -t 1 ]; }; then
+  print_scorecard_card
 fi
 
 # ── --report-only STOPS here (zero-risk). Assert the tree is untouched. ───────
