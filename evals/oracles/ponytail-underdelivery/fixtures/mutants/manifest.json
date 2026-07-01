@@ -1,0 +1,49 @@
+{
+  "domain": "ponytail-underdelivery",
+  "fixture_kind": "mutants",
+  "purpose": "Each mutant is a candidate implementation of the SAME small feature (roman(n), integer 1..3999 -> Roman numeral) that has been UNDER-DELIVERED in one of the exact ways the ponytail lazy-ladder could cause: the hard part skipped, a required acceptance criterion silently dropped, or terse-but-broken. `bin/falsify ponytail-underdelivery` runs the acceptance-oracle gate (run.sh) against the golden candidate (expect PASS) then every mutant (expect REJECT). Falsifiability score = mutants rejected / total, conditioned on golden passing; a P0 gate requires 1.0. A mutant the gate fails to reject would prove ponytail could sneak an under-delivered shortcut past the oracle floor — that is the user's #1 fear, and a surviving mutant BLOCKS the build. The gate is non-bypassable: minimalism cannot ship a shortcut because the shortcut fails acceptance.",
+  "golden": "../golden/candidate.mjs",
+  "acceptance_oracle": "../golden/acceptance.json",
+  "candidate_contract": "An ES module exporting default function roman(n) returning the canonical numeral string. run.sh imports the candidate and grades roman(n) against every case in acceptance.json, reporting the FIRST failing case as first_divergence {file, step, expected, actual}.",
+  "mutants": [
+    {
+      "name": "hard-part-skipped",
+      "file": "hard-part-skipped.mjs",
+      "under_delivery_mode": "(a) hard part skipped",
+      "defect": "Only the additive symbols are delivered; the subtractive-notation branch (IV, IX, XL, XC, CD, CM) was never built. Returns non-empty output for every input so it looks done, but 4 -> IIII, 9 -> VIIII.",
+      "ladder_risk_modeled": "Agent reads rung 1 ('does this need to exist?') as license to skip the hard sub-capability and calls the half-built thing lazy=done.",
+      "must_turn_red_gate": "acceptance-oracle",
+      "first_fail_case": "roman(4)",
+      "reject_contract": "acceptance case roman(4): expected 'IV', candidate returns 'IIII' -> gate status=fail at step 'roman(4)'",
+      "blind_to": [
+        "the additive-only cases (1, 3, 8) which it gets right"
+      ]
+    },
+    {
+      "name": "criterion-dropped",
+      "file": "criterion-dropped.mjs",
+      "under_delivery_mode": "(b) required acceptance criterion silently dropped",
+      "defect": "Subtractive notation is fully correct, but the required 1..3999 range was quietly narrowed to 1..999 (thousands support removed). roman(1000) -> '' instead of 'M'.",
+      "ladder_risk_modeled": "YAGNI applied to SCOPE instead of gold-plating: 'nobody needs four-digit numbers' silently drops a required capability.",
+      "must_turn_red_gate": "acceptance-oracle",
+      "first_fail_case": "roman(1000)",
+      "reject_contract": "acceptance case roman(1000): expected 'M', candidate returns '' -> gate status=fail at step 'roman(1000)'",
+      "blind_to": [
+        "every case below 1000, which it handles correctly"
+      ]
+    },
+    {
+      "name": "terse-but-broken",
+      "file": "terse-but-broken.mjs",
+      "under_delivery_mode": "(c) small-but-broken (terse diff that fails acceptance)",
+      "defect": "Smallest one-liner reduce with the full map and full range, but an off-by-one (`n > value` where it must be `n >= value`) collapses exact-match boundaries: roman(1) -> '', roman(4) -> '', roman(1000) -> ''.",
+      "ladder_risk_modeled": "'Ponytail can make the diff smaller; it can NEVER make a failing acceptance pass by being terse.' Small is not the same as done.",
+      "must_turn_red_gate": "acceptance-oracle",
+      "first_fail_case": "roman(1)",
+      "reject_contract": "acceptance case roman(1): expected 'I', candidate returns '' -> gate status=fail at step 'roman(1)'",
+      "blind_to": [
+        "nothing — it fails on the very first case"
+      ]
+    }
+  ]
+}

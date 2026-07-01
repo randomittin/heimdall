@@ -1,0 +1,6 @@
+{
+  "id": "ponytail-underdelivery",
+  "name": "Ponytail under-delivery guard — acceptance-oracle gate on a delivered feature",
+  "trigger": "per-wave",
+  "severity": "hard"
+}
