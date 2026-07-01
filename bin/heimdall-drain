@@ -1,0 +1,201 @@
+#!/usr/bin/env bash
+# heimdall-drain — the LOCAL work-queue drainer (the `watch` loop for the local
+# continuous-intake queue). NOTE ON NAMING: `bin/heimdall-watch` is already taken
+# by the H-3 sentinel watch-mode feature (run sentinels on human commits), so this
+# distinct drainer is `heimdall-drain` to avoid clobbering that tool.
+#
+# It REUSES the merged pieces; it does NOT reimplement them:
+#   backpressure  bin/agent-pool wait     (block until a concurrency slot is free)
+#   the queue     bin/heimdall-queue      (pick / complete / fail / reap)
+#   the executor  bin/session-fork single (runs `claude -p` for the picked prompt)
+#   the verdict   attestation seam        (PROVEN|BLOCKED — never a self-report)
+#
+# The drain loop, per drained task:
+#   reap crashed claims (ttl) -> agent-pool wait (backpressure) -> queue pick
+#   --highest -> run the prompt via session-fork -> ATTEST the run -> queue
+#   complete <id> --verdict PROVEN|BLOCKED   (or, on an executor failure, queue
+#   fail <id> which requeues or flags-as-poison so a crash never infinite-retries).
+#
+# Usage:
+#   heimdall-drain [--concurrency N] [--forever | --drain-empty] [--repo R]
+#                  [--sleep S] [--by HAID] [--max N]
+#
+#   --drain-empty     drain until the queue is empty, then EXIT 0 (default).
+#   --forever         never exit; sleep --sleep seconds on an empty queue and poll.
+#   --concurrency N   pool size for backpressure (agent-pool init/resize; default 4).
+#   --sleep S         poll interval in --forever mode (default 2s).
+#   --by HAID         the claimant id recorded on each pick (default: watch-$$).
+#   --max N           drain at most N tasks then exit (0 = unlimited; default 0).
+#   --repo R          repo passed to the attestation seam (default: cwd).
+#
+# ENV SEAMS (hermetic tests + real extension points — never a mock in prod):
+#   HEIMDALL_WATCH_FORK          command to EXECUTE a task; the prompt is passed as
+#                                a single trailing arg. Default: session-fork single.
+#   HEIMDALL_WATCH_VERDICT_CMD   command that prints the verdict (PROVEN|BLOCKED) for
+#                                the just-run task; the item id is passed as arg 1,
+#                                the prompt as arg 2. Default: the attestation path
+#                                below (heimdall-attest evidence.all_passed).
+#   HEIMDALL_HOME                the queue/attestation runtime home.
+#
+# Honest verdict: the recorded verdict comes from the attestation/verdict seam over
+# the real run, NOT from the executor claiming success.
+
+set -uo pipefail
+
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+BINDIR="$(dirname "$SELF")"
+QUEUE="$BINDIR/heimdall-queue"
+AGENT_POOL="$BINDIR/agent-pool"
+SESSION_FORK="$BINDIR/session-fork"
+ATTEST="$BINDIR/heimdall-attest"
+
+PY="$(command -v python3 || command -v python || true)"
+[ -n "$PY" ] || { echo "error: python3 not found" >&2; exit 2; }
+[ -x "$QUEUE" ] || { echo "error: missing $QUEUE" >&2; exit 2; }
+
+usage() { sed -n '2,42p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+CONCURRENCY=4
+MODE="drain-empty"
+SLEEP_S=2
+BY="watch-$$"
+MAX=0
+REPO="$(pwd)"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --concurrency) CONCURRENCY="${2:?--concurrency needs N}"; shift 2 ;;
+    --forever)     MODE="forever"; shift ;;
+    --drain-empty) MODE="drain-empty"; shift ;;
+    --sleep)       SLEEP_S="${2:?--sleep needs S}"; shift 2 ;;
+    --by)          BY="${2:?--by needs a HAID}"; shift 2 ;;
+    --max)         MAX="${2:?--max needs N}"; shift 2 ;;
+    --repo)        REPO="${2:?--repo needs a dir}"; shift 2 ;;
+    -h|--help)     usage; exit 0 ;;
+    *)             echo "error: unknown option: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+# jq-free JSON field reader over stdin.
+jget() {
+  "$PY" -c 'import json,sys
+try:
+    d=json.load(sys.stdin)
+except Exception:
+    print(""); sys.exit(0)
+for k in sys.argv[1].split("."):
+    if k=="": continue
+    if isinstance(d,list):
+        d=d[int(k)] if -len(d)<=int(k)<len(d) else None
+    elif isinstance(d,dict):
+        d=d.get(k)
+    else:
+        d=None
+    if d is None: break
+print("" if d is None else (json.dumps(d) if isinstance(d,(dict,list,bool)) else d))' "$1"
+}
+
+# ── backpressure: init the pool once, then `wait` for a slot before each pick ───
+# agent-pool is best-effort backpressure — a missing/uninitialized pool must never
+# wedge the drainer, so every pool call is guarded and degrades to "proceed".
+pool_ready=0
+if [ -x "$AGENT_POOL" ]; then
+  if "$AGENT_POOL" status >/dev/null 2>&1; then
+    "$AGENT_POOL" resize "$CONCURRENCY" >/dev/null 2>&1 || true
+  else
+    "$AGENT_POOL" init --max "$CONCURRENCY" >/dev/null 2>&1 || true
+  fi
+  "$AGENT_POOL" status >/dev/null 2>&1 && pool_ready=1
+fi
+
+backpressure_wait() {
+  [ "$pool_ready" -eq 1 ] || return 0
+  "$AGENT_POOL" wait >/dev/null 2>&1 || true
+}
+
+# ── the verdict resolver (attestation, never self-report) ──────────────────────
+# Seam first (tests + extension). Default: emit an attestation record over the
+# repo and read evidence.all_passed -> PROVEN|BLOCKED. Honest: no evidence commands
+# means nothing was proven -> BLOCKED (we never fabricate a PROVEN).
+resolve_verdict() {
+  local id="$1" prompt="$2"
+  if [ -n "${HEIMDALL_WATCH_VERDICT_CMD:-}" ]; then
+    local out
+    out="$(HEIMDALL_WATCH_VERDICT_CMD="" bash -c "$HEIMDALL_WATCH_VERDICT_CMD \"\$1\" \"\$2\"" _ "$id" "$prompt" 2>/dev/null || true)"
+    case "$out" in
+      *PROVEN*)  echo "PROVEN";  return 0 ;;
+      *BLOCKED*) echo "BLOCKED"; return 0 ;;
+      *)         echo "BLOCKED"; return 0 ;;
+    esac
+  fi
+  if [ -x "$ATTEST" ] && git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
+    local rec passed
+    rec="$("$ATTEST" emit --repo "$REPO" --print --quiet --id "watch-$id" 2>/dev/null || true)"
+    passed="$(printf '%s' "$rec" | jget evidence.all_passed)"
+    [ "$passed" = "true" ] && { echo "PROVEN"; return 0; }
+    echo "BLOCKED"; return 0
+  fi
+  # No attestation available -> honest BLOCKED (unproven).
+  echo "BLOCKED"
+}
+
+# ── the executor (session-fork by default; seam overrides for tests) ───────────
+run_task() {
+  local prompt="$1"
+  if [ -n "${HEIMDALL_WATCH_FORK:-}" ]; then
+    HEIMDALL_WATCH_FORK="" bash -c "$HEIMDALL_WATCH_FORK \"\$1\"" _ "$prompt"
+    return $?
+  fi
+  if [ -x "$SESSION_FORK" ]; then
+    "$SESSION_FORK" single "$prompt"
+    return $?
+  fi
+  echo "error: no executor (set HEIMDALL_WATCH_FORK or provide session-fork)" >&2
+  return 2
+}
+
+# ── the drain loop ─────────────────────────────────────────────────────────────
+drained=0
+while true; do
+  # 1. reap crashed claims so a dead in-flight item returns to the pick set.
+  "$QUEUE" reap >/dev/null 2>&1 || true
+
+  # 2. backpressure — block until a concurrency slot frees up.
+  backpressure_wait
+
+  # 3. claim the highest-priority queued item (atomic claim-before-work).
+  picked="$("$QUEUE" pick --by "$BY" 2>/dev/null || true)"
+  id="$(printf '%s' "$picked" | jget picked.id)"
+
+  if [ -z "$id" ]; then
+    # queue empty
+    if [ "$MODE" = "forever" ]; then
+      sleep "$SLEEP_S"
+      continue
+    fi
+    break   # --drain-empty: nothing left -> exit
+  fi
+
+  prompt="$(printf '%s' "$picked" | jget picked.prompt)"
+  [ -n "$prompt" ] || prompt="$(printf '%s' "$picked" | jget picked.task_ref)"
+
+  # 4. execute the task.
+  if run_task "$prompt"; then
+    # 5. GATE + attest -> the honest verdict, then record it on the task.
+    verdict="$(resolve_verdict "$id" "$prompt")"
+    "$QUEUE" complete "$id" --verdict "$verdict" >/dev/null 2>&1 || true
+    printf 'drained %s -> %s\n' "$id" "$verdict"
+  else
+    # executor failed -> requeue for another attempt, or flag-as-poison.
+    "$QUEUE" fail "$id" >/dev/null 2>&1 || true
+    printf 'failed %s -> requeued/flagged\n' "$id"
+  fi
+
+  drained=$((drained + 1))
+  if [ "$MAX" -gt 0 ] && [ "$drained" -ge "$MAX" ]; then
+    break
+  fi
+done
+
+printf 'watch: drained %d task(s)\n' "$drained"
+exit 0
