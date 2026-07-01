@@ -86,7 +86,7 @@ fi
 # ── 3) inline animation — interactive only (non-TTY must not hang) ───────────
 if [ -t 1 ]; then
   case "$VERDICT" in
-    pass|deny|scan) "$HERE/hmd-gate-anim.sh" "$VERDICT" "$GATE" "$HAID" 2>/dev/null || true ;;
+    pass|deny|scan) "$HERE/hmd-gate-anim.sh" "$VERDICT" "$GATE" "$HAID" || true ;;
   esac
 fi
 

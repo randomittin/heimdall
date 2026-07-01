@@ -137,7 +137,7 @@ mkdir -p "$(dirname "$OUT_RESOLVED")" 2>/dev/null || true
 
 # ── job assembly: build the analyzer job JSON {task, pre_files, changed_files} ─
 JOB_FILE=""
-cleanup() { [ -n "$JOB_FILE" ] && rm -f "$JOB_FILE"; }
+cleanup() { [ -n "$JOB_FILE" ] && rm -f "$JOB_FILE"; return 0; }
 trap cleanup EXIT
 
 if [ -n "$JSON_JOB" ]; then
