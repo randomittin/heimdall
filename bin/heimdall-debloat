@@ -53,6 +53,14 @@
 #                        omitted, debloat auto-detects (npm test / pytest / etc.).
 #   --mode strict|standard|off
 #                        forwarded to bin/bloat-gate for the scorecard axes.
+#   --ladder on|off      write-time minimalism (Ponytail lazy-ladder) for the
+#                        refactor-wave agents (default on). ON exports
+#                        HEIMDALL_LAZY_LADDER=1 and prepends the ladder ruleset to
+#                        every wave-agent prompt, so each rewrite prefers stdlib/
+#                        native/one-line/minimum over re-scaffolding — a de-bloat
+#                        prior at WRITE time, complementing merge-time detection.
+#                        The suite oracle stays the floor: a leaner-but-broken wave
+#                        reddens the suite and is reverted, never shipped.
 #   --report <path>      where to write the scorecard (default <repo>/BLOAT-REPORT.md).
 #   --json               also print a machine-readable scorecard JSON to stdout.
 #   -h, --help           show this help.
@@ -71,7 +79,7 @@ fi
 BIN_DIR="$(cd "$(dirname "$SELF")" && pwd)"
 PLUGIN_DIR="$(cd "$BIN_DIR/.." && pwd)"
 
-usage() { sed -n '2,63p' "$SELF" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,72p' "$SELF" | sed 's/^# \{0,1\}//'; }
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -102,6 +110,61 @@ has_test_files() {
     '(^|/)(test_[^/]*\.py|[^/]*_test\.(go|py)|[^/]*\.(test|spec)\.[jt]sx?|tests?/)'
 }
 
+# ── Lazy-ladder (Ponytail) wiring for the refactor waves ──────────────────────
+# bloat-gate is MERGE-TIME detection — it finds bloat after it is written. The
+# lazy-ladder is the SAME minimalism at WRITE time: every refactor-wave rewrite
+# prefers stdlib/native/one-line/minimum over re-scaffolding. So the ladder is a
+# de-bloat PRIOR, complementing detection. We wire it for real (not prose): the
+# wave stage EXPORTS HEIMDALL_LAZY_LADDER, and each wave-agent command is BUILT
+# with the ladder ruleset prepended when active.
+#
+# Reuse the SINGLE canonical ruleset from bin/heimdall-ponytail-ab — a debloat
+# tool must not duplicate the ruleset it enforces. Fall back to a compact inline
+# copy only if the sibling is missing, so this binary stays self-contained.
+PONYTAIL_AB="$BIN_DIR/heimdall-ponytail-ab"
+if [ -f "$PONYTAIL_AB" ] && grep -q '^ladder_preamble()' "$PONYTAIL_AB"; then
+  eval "$(sed -n '/^ladder_preamble()/,/^}/p' "$PONYTAIL_AB")"
+else
+  ladder_preamble() {
+    cat <<'LADDER'
+[WRITE-TIME MINIMALISM — the lazy ladder]
+Prefer, in order: skip (YAGNI) -> stdlib -> native -> installed dep -> one line ->
+the minimum that actually works. NON-NEGOTIABLE: never cut correctness, validation,
+error handling, data-loss handling, security, accessibility, or the feature's
+requirements. YAGNI cuts gold-plating, never scope. Leaner code, same proven
+function — the task is done when its oracle PASSES, small-but-broken FAILS.
+LADDER
+  }
+fi
+
+# Resolve the ladder toggle. Default ON for debloat: leaner rewrites are the point.
+# --ladder overrides; echoes 1/0.
+ladder_active() {
+  case "${LADDER_MODE:-on}" in
+    off|0|false|no|OFF|FALSE|No) echo 0 ;;
+    *) echo 1 ;;
+  esac
+}
+
+# Build the command for a refactor-wave agent. When the ladder is ACTIVE the
+# write-time minimalism ruleset is PREPENDED to the wave prompt (genuine bytes,
+# not advisory prose) — mirrors bin/heimdall-ponytail-ab's build_coder_cmd. The
+# suite gate (gate_wave) stays the floor: a leaner rewrite that drops behavior
+# reddens the oracle and is reverted, so the ladder can NEVER under-deliver.
+# Sets WAVE_AGENT_CMD[] (the exact command the gated pass runs for this wave).
+build_wave_agent_cmd() { # wave_name wave_goal
+  local wave="$1" goal="$2" prompt
+  prompt="/goal debloat refactor wave '${wave}': ${goal} — behavior preserved, the full test suite stays green, every line real and working.
+
+${goal}"
+  if [ "$(ladder_active)" = "1" ]; then
+    prompt="$(ladder_preamble)
+
+${prompt}"
+  fi
+  WAVE_AGENT_CMD=(claude --agent heimdall --plugin-dir "$PLUGIN_DIR" --permission-mode acceptEdits -p "$prompt")
+}
+
 # ── Argument parsing ──────────────────────────────────────────────────────────
 REPO=""
 REPORT=""
@@ -112,6 +175,10 @@ MAX_LOC_PCT=20
 TEST_CMD=""
 MODE_OVERRIDE=""
 PRINT_JSON=0
+# Lazy-ladder default: ON (leaner rewrites are the whole point of debloat). An
+# env HEIMDALL_LAZY_LADDER=0 flips the default off; --ladder is the explicit override.
+LADDER_MODE="on"
+case "${HEIMDALL_LAZY_LADDER:-}" in 0|off|false|no|OFF|FALSE|No) LADDER_MODE="off" ;; esac
 while [ $# -gt 0 ]; do
   case "$1" in
     --repo)         REPO="${2:?--repo needs a path}"; shift 2 ;;
@@ -122,11 +189,13 @@ while [ $# -gt 0 ]; do
     --max-loc-pct)  MAX_LOC_PCT="${2:?--max-loc-pct needs a number}"; shift 2 ;;
     --test-cmd)     TEST_CMD="${2:?--test-cmd needs a command}"; shift 2 ;;
     --mode)         MODE_OVERRIDE="${2:?--mode needs a value}"; shift 2 ;;
+    --ladder)       LADDER_MODE="${2:?--ladder needs on|off}"; shift 2 ;;
     --json)         PRINT_JSON=1; shift ;;
     -h|--help)      usage; exit 0 ;;
     *) echo "error: unknown arg: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
+case "$LADDER_MODE" in on|off) ;; *) echo "error: --ladder must be on|off (got '$LADDER_MODE')" >&2; exit 2 ;; esac
 
 # ── Preconditions ─────────────────────────────────────────────────────────────
 : "${REPO:=$(pwd)}"
@@ -193,6 +262,13 @@ SC_CC_NOTE="$(get '.complexity.note // ""')"
 SC_DEP_STATUS="$(get '.dependency_creep.status // "n/a"')"
 SC_DEP_NEW="$(get '.dependency_creep.new_deps // 0')"
 SC_DEP_NOTE="$(get '.dependency_creep.note // ""')"
+# Axis 6 (advisory): reimplemented-stdlib / native-replaceable constructs — the
+# lazy-ladder's rungs 2-3 as a detector, surfaced so the scorecard shows what a
+# write-time ladder would have avoided. Honest-skips when ast-grep is absent.
+SC_RS_STATUS="$(get '.reimplemented_stdlib.status // "n/a"')"
+SC_RS_TOOL="$(get '.reimplemented_stdlib.tool // "ast-grep"')"
+SC_RS_COUNT="$(get '.reimplemented_stdlib.native_replaceable // 0')"
+SC_RS_NOTE="$(get '.reimplemented_stdlib.note // ""')"
 
 # Candidate-deletion LOC estimate: dead-export count maps (conservatively, ~6 LOC
 # per dead export) plus half the duplicated-token share of LOC (consolidation
@@ -249,6 +325,7 @@ REPORT_TMP="$WORK_DIR/report.md"
   echo "| Duplication clusters | $(axis_line "$SC_DUP_STATUS" "$SC_DUP_TOOL" "$DUP_DETAIL") |"
   echo "| Complexity hotspots | $(axis_line "$SC_CC_STATUS" "$SC_CC_TOOL" "max cyclomatic ${SC_CC_MAX}${SC_CC_NOTE:+; $SC_CC_NOTE}") |"
   echo "| Unused dependencies | $(axis_line "$SC_DEP_STATUS" "lockfile-diff" "${SC_DEP_NEW} flagged dep line(s)${SC_DEP_NOTE:+; $SC_DEP_NOTE}") |"
+  echo "| Reimplemented stdlib/native (advisory) | $(axis_line "$SC_RS_STATUS" "$SC_RS_TOOL" "${SC_RS_COUNT} native-replaceable construct(s)${SC_RS_NOTE:+; $SC_RS_NOTE}") |"
   echo
   echo "## Candidate-deletion LOC estimate"
   echo
@@ -457,6 +534,20 @@ echo "debloat: safety oracle GREEN (baseline behavior pinned)." >&2
 ORIG_BRANCH="$(git -C "$REPO" symbolic-ref --quiet --short HEAD 2>/dev/null || git -C "$REPO" rev-parse --short HEAD)"
 START_SHA="$(git -C "$REPO" rev-parse HEAD)"
 
+# ── Wire the lazy-ladder into the refactor path (real, not prose). Export the
+# toggle so EVERY wave agent — and any subprocess it spawns — inherits write-time
+# minimalism: each rewrite prefers stdlib/native/one-line/minimum over re-scaffold.
+# This is a de-bloat PRIOR at write time, complementing bloat-gate's merge-time
+# detection. The suite oracle (gate_wave) stays the floor: a leaner-but-broken wave
+# reddens the suite and is reverted, so the ladder can never make a failing wave pass.
+if [ "$(ladder_active)" = "1" ]; then
+  export HEIMDALL_LAZY_LADDER=1
+  echo "debloat: lazy-ladder ACTIVE for refactor waves (HEIMDALL_LAZY_LADDER=1) — write-time minimalism prior; suite oracle still gates every wave." >&2
+else
+  export HEIMDALL_LAZY_LADDER=0
+  echo "debloat: lazy-ladder OFF for refactor waves (--ladder off)." >&2
+fi
+
 # Create (or reset to) the debloat branch off the current HEAD.
 if git -C "$REPO" show-ref --verify --quiet "refs/heads/$BRANCH"; then
   BRANCH="${BRANCH}-$(date -u +%H%M%S)"
@@ -554,7 +645,11 @@ fi
 # edit rather than blind text-merge. Absent => honest skip.
 if command -v jscpd >/dev/null 2>&1 && [ "$SC_DUP_STATUS" = "ran" ] && [ "$SC_DUP_PCT" != "null" ] \
    && awk -v p="$SC_DUP_PCT" 'BEGIN{exit !(p+0 > 0)}'; then
-  record_wave "duplication-consolidation" "flagged" "${SC_DUP_PCT}% duplication located by jscpd; clusters queued for a gated consolidation edit"
+  # Arm the wave agent for the gated consolidation pass with the write-time ladder
+  # prepended (when active), so the rewrite prefers the minimal shared impl. The
+  # armed command IS the queued action; gate_wave reverts it if the suite reddens.
+  build_wave_agent_cmd "duplication-consolidation" "consolidate the ${SC_DUP_PCT}% duplicated clusters jscpd located into a single shared implementation, behavior identical"
+  record_wave "duplication-consolidation" "flagged" "${SC_DUP_PCT}% duplication located by jscpd; clusters queued for a gated consolidation edit — wave agent armed (ladder=$(ladder_active), write-time minimalism prepended to the prompt)"
 elif ! command -v jscpd >/dev/null 2>&1; then
   record_wave "duplication-consolidation" "skipped" "no jscpd on PATH — cannot locate clusters, so nothing consolidated"
 else
@@ -564,7 +659,10 @@ fi
 # Wave (d): complexity reduction. Requires radon/eslint to identify functions over
 # threshold; the decomposition is a semantic edit gated by the suite. Absent => skip.
 if [ "$SC_CC_STATUS" = "ran" ] && awk -v c="$SC_CC_MAX" 'BEGIN{exit !(c+0 > 12)}'; then
-  record_wave "complexity-reduction" "flagged" "max cyclomatic ${SC_CC_MAX} (>12) found by ${SC_CC_TOOL}; over-threshold functions queued for a gated decomposition"
+  # Arm the decomposition wave agent with the write-time ladder (when active): the
+  # rewrite prefers stdlib/native/one-line over re-scaffolding the hotspot. Gated.
+  build_wave_agent_cmd "complexity-reduction" "decompose the over-threshold function(s) (max cyclomatic ${SC_CC_MAX}) ${SC_CC_TOOL} found, behavior identical and the suite green"
+  record_wave "complexity-reduction" "flagged" "max cyclomatic ${SC_CC_MAX} (>12) found by ${SC_CC_TOOL}; over-threshold functions queued for a gated decomposition — wave agent armed (ladder=$(ladder_active), write-time minimalism prepended to the prompt)"
 elif [ "$SC_CC_STATUS" != "ran" ]; then
   record_wave "complexity-reduction" "skipped" "no complexity tool on PATH (radon|eslint) — cannot identify hotspots, so nothing decomposed"
 else
@@ -594,6 +692,21 @@ PR_BODY="$REPO/.heimdall-debloat-PR.md"
   echo "- Each wave below was gated on a fresh full run of this suite; any wave that"
   echo "  reddened it or worsened the bloat metric was reverted with \`git reset --hard\`."
   echo
+  echo "## Write-time minimalism (Ponytail lazy-ladder)"
+  echo
+  if [ "$(ladder_active)" = "1" ]; then
+    echo "- Refactor waves ran with the lazy-ladder **ACTIVE** (\`HEIMDALL_LAZY_LADDER=1\`):"
+    echo "  every wave-agent rewrite preferred stdlib/native/one-line/minimum over"
+    echo "  re-scaffolding — a de-bloat prior at WRITE time, complementing the merge-time"
+    echo "  detection above. The suite oracle stayed the floor: a leaner-but-broken wave"
+    echo "  reddens the suite and is reverted, so the ladder can never under-deliver."
+  else
+    echo "- Refactor waves ran with the lazy-ladder **OFF** (\`--ladder off\`): plain rewrites."
+  fi
+  echo "- Efficiency delta (LOC/tokens attributable to the ladder): **not measured inline**."
+  echo "  Run \`bin/heimdall-ponytail-ab --live\` for a measured ladder-on-vs-off comparison"
+  echo "  (LOC, tokens, acceptance-pass-rate). This PR never fabricates a delta number."
+  echo
   echo "## Before / after scorecard"
   echo
   echo "| Metric | Before | After |"
@@ -603,6 +716,7 @@ PR_BODY="$REPO/.heimdall-debloat-PR.md"
   echo "| Dead exports | ${PRE_DEAD} | ${POST_DEAD} |"
   echo "| Duplication % | ${PRE_DUP} | ${POST_DUP} |"
   echo "| Max cyclomatic | ${PRE_CC} | ${POST_CC} |"
+  echo "| Reimplemented stdlib/native (advisory) | ${SC_RS_COUNT} | ${SC_RS_COUNT} |"
   echo "| Tracked LOC | ${PRE_LOC} | ${POST_LOC} |"
   echo
   echo "## Per-wave commit map"

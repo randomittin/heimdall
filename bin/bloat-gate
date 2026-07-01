@@ -273,6 +273,37 @@ if [ -n "$ESTIMATE" ] && awk -v e="$ESTIMATE" 'BEGIN{exit !(e+0 > 0)}'; then
   LOC_NOTE="new LOC ${LOC_ADDED} vs estimate ${ESTIMATE} => ratio ${LOC_RATIO}x (bar ${TH_LOC}x)"
 fi
 
+# ── Axis 6: reimplemented-stdlib / native-replaceable constructs (ADVISORY) ────
+# The lazy-ladder's rungs 2-3 turned into a DETECTOR: hand-rolled code that a
+# stdlib/native feature already does (e.g. a deep clone via JSON.parse(JSON.
+# stringify(x)) where the native structuredClone(x) exists). Detection is
+# STRUCTURAL + deterministic via ast-grep — comments and string literals are not
+# AST expressions, so a match is a real construct, never a fabricated grep hit.
+# ADVISORY only (mirrors dependency_creep): it FLAGS, it never auto-fails, so the
+# gate verdict is byte-identical with or without this axis. Tool absent => honest
+# skip naming the tool (the same contract every other axis obeys).
+RS_STATUS="n/a"; RS_COUNT=0; RS_TOOL="ast-grep"; RS_NOTE="no JS/TS files changed in range"
+# The rung-2/3 patterns: a hand-rolled construct that a native/stdlib call replaces.
+# Structural (ast-grep) so no false positives inside strings/comments.
+RS_PATTERNS='JSON.parse(JSON.stringify($X))'
+if [ "${#JS_TS[@]}" -gt 0 ]; then
+  if command -v ast-grep >/dev/null 2>&1; then
+    RS_STATUS="ran"
+    RS_NOTE="native/stdlib already does this (e.g. JSON.parse(JSON.stringify(x)) -> structuredClone(x))"
+    rs_total=0
+    while IFS= read -r pat; do
+      [ -n "$pat" ] || continue
+      c="$( cd "$REPO" && ast-grep run --pattern "$pat" --json "${JS_TS[@]}" 2>/dev/null | jq 'length' 2>/dev/null || echo 0 )"
+      [ -n "$c" ] && [ "$c" != "null" ] || c=0
+      rs_total=$(( rs_total + c ))
+    done <<< "$RS_PATTERNS"
+    RS_COUNT="$rs_total"
+  else
+    RS_STATUS="skipped"
+    RS_NOTE="no ast-grep on PATH — cannot STRUCTURALLY prove a construct native-replaceable, so none flagged (install ast-grep)"
+  fi
+fi
+
 # ── simplification delta (set by sentinels/bloat.sh after an LLM pass; read
 #    from env so a re-run can record "−N lines after simplification"). 0 if unset.
 SIMPLIFY_DELTA="${HEIMDALL_BLOAT_SIMPLIFY_DELTA:-0}"
@@ -285,6 +316,7 @@ metrics="$(jq -nc \
   --arg cs "$CC_STATUS" --argjson cm "${CC_MAX:-0}" --arg ct "$CC_TOOL" --arg cn "$CC_NOTE" --argjson cth "${TH_CC:-12}" --argjson cov "${CC_OVER:-0}" \
   --arg eps "$DEP_STATUS" --argjson en "${DEP_NEW:-0}" --argjson ef "$DEP_FILES_JSON" --arg enote "$DEP_NOTE" \
   --arg ls "$LOC_STATUS" --argjson la "${LOC_ADDED:-0}" --arg lr "${LOC_RATIO:-}" --argjson lov "${LOC_OVER:-0}" --arg lnote "$LOC_NOTE" --argjson lth "${TH_LOC:-1.8}" --arg est "${ESTIMATE:-}" \
+  --arg rss "$RS_STATUS" --argjson rsc "${RS_COUNT:-0}" --arg rst "$RS_TOOL" --arg rsn "$RS_NOTE" \
   --argjson sd "${SIMPLIFY_DELTA:-0}" \
   --argjson nfiles "${#CHANGED[@]}" \
   '{
@@ -294,6 +326,7 @@ metrics="$(jq -nc \
     complexity:  {status:$cs,  tool:$ct, max_new_cc:$cm, threshold:$cth, over:($cov==1), note:$cn},
     dependency_creep: {status:$eps, new_deps:$en, lockfiles:$ef, note:$enote},
     loc_budget:  {status:$ls,  added:$la, estimate:(if $est=="" then null else ($est|tonumber) end), ratio:(if $lr=="" then null else ($lr|tonumber) end), threshold_ratio:$lth, over:($lov==1), note:$lnote},
+    reimplemented_stdlib: {status:$rss, tool:$rst, native_replaceable:$rsc, advisory:true, note:$rsn},
     simplification_delta_lines:$sd
   }')"
 
