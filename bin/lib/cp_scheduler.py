@@ -384,6 +384,37 @@ def set_enabled(schedule_id, enabled, home=None):
     return updated
 
 
+# ── the maintainer schedule-registration path (a typed convenience over create) ─
+#
+# The maintainer autopilot runs on a cron exactly like run-suite: a schedule whose
+# action_type is the ALLOWLISTED "run-maintainer-cycle". This helper is a TYPED wrapper
+# over create_schedule — it assembles the bounded param dict {repo, max, budget_tokens?}
+# and creates the schedule through the SAME §1 create-time gate (cp_allowlist.validate).
+# It grants NO bypass: an off-slug repo / out-of-range max / a smuggled extra key is still
+# refused by the allowlist (RefusedDispatch -> 422 + audit, never persisted), and tick()
+# fires it through the identical cp_server.dispatch path every other schedule uses. There
+# is no free-form prompt/cmd here — the loop builds the prompt from the queued issue.
+
+MAINTAINER_ACTION_TYPE = "run-maintainer-cycle"
+
+
+def register_maintainer_schedule(identity, repo, max_cycles, cron, *,
+                                budget_tokens=None, enabled=True,
+                                schedule_id=None, home=None):
+    """Register a cron schedule for the maintainer autopilot (action_type
+    "run-maintainer-cycle"). Assembles the typed, bounded params (repo slug, bounded max,
+    OPTIONAL bounded budget_tokens) and creates the schedule through create_schedule — the
+    SAME §1 allowlist gate. Raises cp_allowlist.RefusedDispatch (off-allowlist / off-slug /
+    out-of-range / smuggled key) or ScheduleError (bad cron / shape) exactly as
+    create_schedule does — it does NOT swallow them. Returns the stored schedule entry."""
+    params = {"repo": repo, "max": max_cycles}
+    if budget_tokens is not None:
+        params["budget_tokens"] = budget_tokens
+    return create_schedule(
+        identity, MAINTAINER_ACTION_TYPE, params, cron,
+        enabled=enabled, schedule_id=schedule_id, home=home)
+
+
 # ── FIRE — the tick (dispatch every due schedule through the §1 allowlist path) ─
 
 
