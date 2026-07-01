@@ -6,7 +6,30 @@
 # Usage: summary-card [PROJECT_DIR]   (defaults to cwd)
 set -uo pipefail
 
-PROJECT="${1:-.}"
+# ── Arg parse: [--receipt] [PROJECT_DIR] (flag may precede OR follow the dir) ──
+# Default mode is the existing end-of-run "card". `--receipt` renders the flagship
+# Run Receipt — the single shareable proof artifact. Both accept a project dir.
+MODE="card"
+PROJECT="."
+for _arg in "$@"; do
+  case "$_arg" in
+    --receipt) MODE="receipt" ;;
+    -h|--help) MODE="help" ;;
+    *) PROJECT="$_arg" ;;
+  esac
+done
+if [ "$MODE" = "help" ]; then
+  echo "usage: summary-card [--receipt] [PROJECT_DIR]"
+  echo "  (no flag)   end-of-run summary card"
+  echo "  --receipt   the Heimdall Run Receipt — one shareable proof artifact"
+  exit 0
+fi
+
+# This script's bin/ dir + plugin root (for sibling emitters + sentinels/hmd-sigil.py).
+_SELF_SC="${BASH_SOURCE[0]:-$0}"
+BINDIR="$(cd "$(dirname "$_SELF_SC")" 2>/dev/null && pwd || echo .)"
+ROOT="$(dirname "$BINDIR")"
+
 PLANNING="$PROJECT/.planning"
 STATE_MD="$PLANNING/STATE.md"
 # Prefer heimdall-state.json; fall back to legacy superx-state.json (back-compat).
@@ -293,6 +316,338 @@ GATES_COLORED="${D}tests:${R}${TESTS_LBL} ${D}lint:${R}${LINT_LBL} ${DIRTY_LBL}"
 
 TOKENS_PLAIN="${SPENT} spent  (vs ~${EST_LBL} raw-CC est.)"
 TOKENS_COLORED="${C}${SPENT}${R} ${D}spent${R}  ${D}(vs ~${R}${W}${EST_LBL}${R} ${D}raw-CC est.)${R}"
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  HEIMDALL RUN RECEIPT (`--receipt`) — the flagship shareable proof artifact.
+#
+#  One screenshot bundling a whole run's proof: swarm + every gate + leaner-code
+#  + cost, sigil-branded. Every field is REAL-or-OMITTED — pulled live from the
+#  deterministic emitters, never fabricated. A gate that FAILED renders ✗/red;
+#  the receipt tells the truth about a bad run too. Reads files/JSON only — no
+#  network, no model calls. Degrades to clean plain text in a pipe / CI.
+#
+#  Data seam (env override → real default): each source can be pinned via a
+#  HEIMDALL_RECEIPT_* env var (used by the test-suite fixtures); with none set it
+#  reads the production locations + sibling emitters.
+# ══════════════════════════════════════════════════════════════════════════════
+
+_PY_RCPT="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)"
+
+# Codepoint length of a plain string (visible columns; our glyphs are width-1).
+rvis() { local s="$1"; printf "%s" "${#s}"; }
+rsp()  { local n="$1" o="" i; for ((i=0;i<n;i++)); do o="$o "; done; printf "%s" "$o"; }
+
+render_receipt() {
+  # ── strict-tty colour gate: a pipe / CI / NO_COLOR / --plain → zero ANSI ──
+  local rcolor=0
+  if [ -t 1 ] && [ -z "${HEIMDALL_RECEIPT_PLAIN:-}" ] && [ -z "${NO_COLOR:-}" ] && [ -z "${CI:-}" ]; then
+    rcolor=1
+  fi
+  local rP rC rG rW rRED rD rB rR
+  if [ "$rcolor" = 1 ]; then
+    rP='\033[38;2;224;86;160m'; rC='\033[38;2;0;212;255m'; rG='\033[38;2;78;204;163m'
+    rW='\033[38;2;255;200;80m'; rRED='\033[38;2;255;95;110m'; rD='\033[38;2;120;120;140m'
+    rB='\033[1m'; rR='\033[0m'
+    if [[ "${COLORTERM:-}" != "truecolor" && "${COLORTERM:-}" != "24bit" && "${TERM:-}" != *256color* ]]; then
+      rP='\033[35m'; rC='\033[36m'; rG='\033[32m'; rW='\033[33m'; rRED='\033[31m'; rD='\033[90m'
+    fi
+  else
+    rP=''; rC=''; rG=''; rW=''; rRED=''; rD=''; rB=''; rR=''
+  fi
+
+  local VW=40           # value-field width (visible cols)
+  local INNER=49        # cols between the ║ borders
+
+  # ── identity / machine brand + corner sigil ──
+  local seed who
+  who="${HEIMDALL_RECEIPT_WHO:-}"
+  if [ -z "$who" ]; then
+    local u h
+    u="$(id -un 2>/dev/null || whoami 2>/dev/null || echo user)"
+    h="$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo host)"
+    h="$(printf '%s' "$h" | tr '[:upper:]' '[:lower:]')"
+    who="${u}.${h}"
+  fi
+  who="$(trunc "$who" 14)"
+  seed="${who%%.*}"
+  local sigil_mark="◈" sigil_glyph="◈"
+  if [ "$rcolor" = 1 ] && [ -n "$_PY_RCPT" ] && [ -f "$ROOT/sentinels/hmd-sigil.py" ]; then
+    local g; g="$("$_PY_RCPT" "$ROOT/sentinels/hmd-sigil.py" --seed "$seed" --glyph 2>/dev/null | head -1)"
+    [ -n "$g" ] && sigil_glyph="$g"
+  fi
+
+  # ══ ROW 1 · TASK ══
+  local task_plain; task_plain="$(trunc "$TASK" "$VW")"
+  local task_col="${rC}${task_plain}${rR}"
+
+  # ══ ROW 2 · SWARM (agent-pool status) ══
+  local pool_json="" swarm_plain="" swarm_col=""
+  local psrc="${HEIMDALL_RECEIPT_POOL_JSON:-}"
+  if [ -n "$psrc" ]; then
+    [ -f "$psrc" ] && pool_json="$(cat "$psrc" 2>/dev/null)"
+  elif [ -x "$BINDIR/agent-pool" ]; then
+    pool_json="$("$BINDIR/agent-pool" status 2>/dev/null)"
+  fi
+  local swarm_raw=""
+  if [ -n "$pool_json" ] && [ -n "$_PY_RCPT" ]; then
+    swarm_raw="$(printf '%s' "$pool_json" | "$_PY_RCPT" -c '
+import json,sys
+try: d=json.load(sys.stdin)
+except Exception: print("0|"); sys.exit(0)
+ag=d.get("agents",{}) or {}
+roles={}; order=[]
+for a in ag.values():
+    t=a.get("type","?"); s=a.get("status","")
+    if t not in roles: roles[t]="active"; order.append(t)
+    if s=="done": roles[t]="done"
+print(str(len(ag))+"|"+",".join("%s:%s"%(t,roles[t]) for t in order))
+' 2>/dev/null)"
+  fi
+  local swarm_n="${swarm_raw%%|*}"; local swarm_roles="${swarm_raw#*|}"
+  if [ -n "$swarm_raw" ] && [ "${swarm_n:-0}" -gt 0 ] 2>/dev/null; then
+    swarm_plain="⟳${swarm_n} agents ▸ "
+    swarm_col="${rC}⟳${swarm_n} agents${rR} ${rD}▸${rR} "
+    local IFS_OLD="$IFS"; IFS=','
+    local pair; for pair in $swarm_roles; do
+      [ -n "$pair" ] || continue
+      local rn="${pair%%:*}" rs="${pair#*:}" gl gc
+      if [ "$rs" = "done" ]; then gl="✓"; gc="$rG"; else gl="⟳"; gc="$rW"; fi
+      swarm_plain="${swarm_plain}${rn}${gl} "
+      swarm_col="${swarm_col}${rD}${rn}${rR}${gc}${gl}${rR} "
+    done
+    IFS="$IFS_OLD"
+    swarm_plain="${swarm_plain% }"
+  else
+    swarm_plain="n/a"; swarm_col="${rD}n/a${rR}"
+  fi
+
+  # ══ ROW 3 · GATES (falsify · corpus · stub) + gate-health for the Bifröst ══
+  local gates_red=0 gates_ran=0
+  # falsify — passing/total over evals/oracles/*/report.json
+  local oradir="${HEIMDALL_RECEIPT_ORACLE_DIR:-$ROOT/evals/oracles}"
+  local f_seg_p="" f_col="" f_pass=0 f_tot=0
+  if [ -n "$_PY_RCPT" ] && [ -d "$oradir" ]; then
+    local fr; fr="$("$_PY_RCPT" -c '
+import json,sys,glob,os
+d=sys.argv[1]; p=t=0
+for r in sorted(glob.glob(os.path.join(d,"*","report.json"))):
+    try: st=json.load(open(r)).get("status","")
+    except Exception: continue
+    t+=1
+    if st=="pass": p+=1
+print("%d %d"%(p,t))
+' "$oradir" 2>/dev/null)"
+    f_pass="${fr%% *}"; f_tot="${fr##* }"
+  fi
+  if [ "${f_tot:-0}" -gt 0 ] 2>/dev/null; then
+    gates_ran=1
+    local score; score="$(awk -v p="$f_pass" -v t="$f_tot" 'BEGIN{printf "%.1f", (t>0)?p/t:0}')"
+    f_seg_p="falsify ${f_pass}/${f_tot}=${score}"
+    if [ "$f_pass" -ge "$f_tot" ]; then f_col="${rG}${f_seg_p}${rR}"; else f_col="${rRED}${f_seg_p}✗${rR}"; f_seg_p="${f_seg_p}✗"; gates_red=1; fi
+  else
+    f_seg_p="falsify n/a"; f_col="${rD}${f_seg_p}${rR}"
+  fi
+  # corpus — X/Y caught from CORPUS-STATUS.md
+  local cstat="${HEIMDALL_RECEIPT_CORPUS_STATUS:-$ROOT/evals/corpus/CORPUS-STATUS.md}"
+  local c_seg_p="" c_col=""
+  if [ -f "$cstat" ]; then
+    local cxy; cxy="$(grep -oE '[0-9]+/[0-9]+ caught' "$cstat" 2>/dev/null | head -1)"
+    cxy="${cxy% caught}"
+    if [ -n "$cxy" ]; then
+      gates_ran=1
+      local cnum="${cxy%%/*}" cden="${cxy##*/}"
+      c_seg_p="corpus ${cxy}"
+      if [ "${cnum:-0}" -ge "${cden:-0}" ] 2>/dev/null; then c_col="${rG}${c_seg_p}${rR}"; else c_col="${rRED}${c_seg_p}✗${rR}"; c_seg_p="${c_seg_p}✗"; gates_red=1; fi
+    fi
+  fi
+  [ -n "$c_seg_p" ] || { c_seg_p="corpus n/a"; c_col="${rD}${c_seg_p}${rR}"; }
+  # stub — verify-edits --json (warnings=0 & verdict!=FAIL → clean)
+  local sgate_json="" sg_src="${HEIMDALL_RECEIPT_STUB_JSON:-}"
+  if [ -n "$sg_src" ]; then
+    [ -f "$sg_src" ] && sgate_json="$(cat "$sg_src" 2>/dev/null)"
+  elif [ -x "$BINDIR/verify-edits" ]; then
+    sgate_json="$("$BINDIR/verify-edits" --json 2>/dev/null)"
+  fi
+  local nf_seg_p="" nf_col="" nf_parsed=""
+  if [ -n "$sgate_json" ] && [ -n "$_PY_RCPT" ]; then
+    nf_parsed="$(printf '%s' "$sgate_json" | "$_PY_RCPT" -c '
+import json,sys
+try: d=json.load(sys.stdin)
+except Exception: sys.exit(1)
+print("%s %s"%(d.get("warnings",-1), d.get("verdict","")))
+' 2>/dev/null)"
+  fi
+  if [ -n "$nf_parsed" ]; then
+    gates_ran=1
+    local nf_warn="${nf_parsed%% *}" nf_verd="${nf_parsed##* }"
+    if [ "$nf_verd" = "FAIL" ] || { [ "${nf_warn:-0}" -gt 0 ] 2>/dev/null; }; then
+      nf_seg_p="stub✗"; nf_col="${rRED}${nf_seg_p}${rR}"; gates_red=1
+    else
+      nf_seg_p="stub✓"; nf_col="${rG}${nf_seg_p}${rR}"
+    fi
+  else
+    nf_seg_p="stub n/a"; nf_col="${rD}${nf_seg_p}${rR}"
+  fi
+  local gates_plain="${f_seg_p} · ${c_seg_p} · ${nf_seg_p}"
+  local gates_col="${f_col}${rD} · ${rR}${c_col}${rD} · ${rR}${nf_col}"
+
+  # ══ ROW 4 · BIFRÖST — open only when every gate that RAN is green ══
+  local bi_plain bi_col
+  if [ "$gates_red" = 1 ]; then
+    bi_plain="✗ CLOSED — a gate is red, held back"
+    bi_col="${rRED}${rB}✗ CLOSED${rR}${rRED} — a gate is red, held back${rR}"
+  elif [ "$gates_ran" = 1 ]; then
+    bi_plain="✓ OPEN — nothing shipped unproven"
+    bi_col="${rG}${rB}✓ OPEN${rR}${rG} — nothing shipped unproven${rR}"
+  else
+    bi_plain="— no gates ran"
+    bi_col="${rD}${bi_plain}${rR}"
+  fi
+
+  # ══ ROW 5 · LEANER — LOC ladder delta (ponytail A/B) · reuse score ══
+  local pony="${HEIMDALL_RECEIPT_PONYTAIL:-}"
+  if [ -z "$pony" ]; then
+    local pd="$ROOT/evals/ponytail-ab"
+    if [ -d "$pd" ]; then
+      pony="$(ls -t "$pd"/*.jsonl 2>/dev/null | grep -v 'schema.sample' | head -1)"
+    fi
+  fi
+  local loc_seg=""
+  if [ -n "$pony" ] && [ -f "$pony" ] && [ -n "$_PY_RCPT" ]; then
+    local pct; pct="$("$_PY_RCPT" -c '
+import json,sys
+on=[];off=[]
+for line in open(sys.argv[1]):
+    line=line.strip()
+    if not line: continue
+    try: o=json.loads(line)
+    except Exception: continue
+    l=o.get("loc")
+    if not isinstance(l,(int,float)): continue
+    m=o.get("mode")
+    (on if m=="on" else off if m=="off" else []).append(l)
+if on and off:
+    mon=sum(on)/len(on); moff=sum(off)/len(off)
+    if moff>0: print("%d"%round((moff-mon)/moff*100)); sys.exit(0)
+print("NA")
+' "$pony" 2>/dev/null)"
+    if [ -n "$pct" ] && [ "$pct" != "NA" ]; then
+      if [ "$pct" -gt 0 ] 2>/dev/null; then loc_seg="−${pct}% LOC (ladder on)"
+      elif [ "$pct" -lt 0 ] 2>/dev/null; then loc_seg="+$(( -pct ))% LOC (ladder on)"
+      else loc_seg="±0% LOC (ladder on)"; fi
+    fi
+  fi
+  local reuse_dir="${HEIMDALL_RECEIPT_REUSE_DIR:-$PROJECT/.planning/reuse}"
+  local reuse_seg=""
+  if [ -d "$reuse_dir" ] && [ -n "$_PY_RCPT" ]; then
+    local rnew; rnew="$(ls -t "$reuse_dir"/*.json 2>/dev/null | head -1)"
+    if [ -n "$rnew" ]; then
+      local rp; rp="$("$_PY_RCPT" -c '
+import json,sys
+try: v=json.load(open(sys.argv[1])).get("reuse_pct")
+except Exception: v=None
+print(("%g"%v) if isinstance(v,(int,float)) else "NA")
+' "$rnew" 2>/dev/null)"
+      if [ -n "$rp" ] && [ "$rp" != "NA" ]; then reuse_seg="reuse ${rp}"; fi
+    fi
+  fi
+  local lean_plain lean_col
+  if [ -n "$loc_seg" ] && [ -n "$reuse_seg" ]; then
+    lean_plain="${loc_seg} · ${reuse_seg}"
+    lean_col="${rG}${loc_seg}${rR}${rD} · ${rR}${rC}${reuse_seg}${rR}"
+  elif [ -n "$loc_seg" ]; then
+    lean_plain="$loc_seg"; lean_col="${rG}${loc_seg}${rR}"
+  elif [ -n "$reuse_seg" ]; then
+    lean_plain="$reuse_seg"; lean_col="${rC}${reuse_seg}${rR}"
+  else
+    lean_plain="n/a"; lean_col="${rD}n/a${rR}"
+  fi
+
+  # ══ ROW 6 · COST — real tokens · HONEST vs-raw-CC (holdout: measured|est.|—) ══
+  local tok="${HEIMDALL_RECEIPT_TOKENS:-$ST_TOTAL}" tokdisp
+  if [ -z "$tok" ] || [ "$tok" = "-" ]; then
+    tokdisp="—"
+  else
+    tokdisp="$(fmt_tokens "$tok" | sed 's/\.0k/k/; s/\.0M/M/')"
+  fi
+  # vs-raw-CC — SOURCED ONLY from heimdall-holdout figure. A counterfactual with
+  # no control sample is NEVER a number: it renders blank (—) or a labeled est.
+  local hj="${HEIMDALL_RECEIPT_HOLDOUT_JSON:-}" hjson=""
+  if [ -n "$hj" ]; then
+    [ -f "$hj" ] && hjson="$(cat "$hj" 2>/dev/null)"
+  elif [ -x "$BINDIR/heimdall-holdout" ]; then
+    hjson="$("$BINDIR/heimdall-holdout" figure 2>/dev/null)"
+  fi
+  local cc_src="none" cc_rendered="—"
+  if [ -n "$hjson" ] && [ -n "$_PY_RCPT" ]; then
+    local hparsed; hparsed="$(printf '%s' "$hjson" | "$_PY_RCPT" -c '
+import json,sys
+try: d=json.load(sys.stdin)
+except Exception: sys.exit(1)
+print((d.get("cost_source") or "none"))
+print(d.get("rendered") or "—")
+' 2>/dev/null)"
+    if [ -n "$hparsed" ]; then
+      cc_src="$(printf '%s' "$hparsed" | sed -n '1p')"
+      cc_rendered="$(printf '%s' "$hparsed" | sed -n '2p')"
+      [ -n "$cc_rendered" ] || cc_rendered="—"
+    fi
+  fi
+  local cc_slot cc_color
+  case "$cc_src" in
+    measured)  cc_slot="${cc_rendered} vs raw CC"; cc_color="$rG" ;;
+    estimated) cc_slot="${cc_rendered} vs raw CC*"; cc_color="$rW" ;;
+    *)         cc_slot="— vs raw CC*"; cc_color="$rD" ;;
+  esac
+  local cost_plain="${tokdisp} tok · ${cc_slot}"
+  local cost_col="${rC}${tokdisp}${rR} ${rD}tok · ${rR}${cc_color}${cc_slot}${rR}"
+
+  # ── box drawing ──
+  local title="HEIMDALL RUN RECEIPT"
+  local mid=$(( INNER - 2 - ${#title} - 1 - (${#who} + 5) ))
+  [ "$mid" -lt 1 ] && mid=1
+  local hfill=""; local i; for ((i=0;i<mid;i++)); do hfill="${hfill}═"; done
+  local url="runheimdall.dev/proof"
+  local ffill_n=$(( INNER - 3 - ${#url} - 1 )); [ "$ffill_n" -lt 1 ] && ffill_n=1
+  local ffill=""; for ((i=0;i<ffill_n;i++)); do ffill="${ffill}═"; done
+
+  printf "\n"
+  if [ "$rcolor" = 1 ]; then
+    printf "%b\n" "${rD}╔═ ${rB}${rP}${title}${rR}${rD} ${hfill} ${rR}${sigil_glyph}${rD} ${who} ═╗${rR}"
+  else
+    printf "%s\n" "╔═ ${title} ${hfill} ${sigil_mark} ${who} ═╗"
+  fi
+  rrow "TASK"    "$task_plain"  "$task_col"    "$rD" "$rR"
+  rrow "SWARM"   "$swarm_plain" "$swarm_col"   "$rD" "$rR"
+  rrow "GATES"   "$gates_plain" "$gates_col"   "$rD" "$rR"
+  rrow "BIFRÖST" "$bi_plain"    "$bi_col"      "$rD" "$rR"
+  rrow "LEANER"  "$lean_plain"  "$lean_col"    "$rD" "$rR"
+  rrow "COST"    "$cost_plain"  "$cost_col"    "$rD" "$rR"
+  if [ "$rcolor" = 1 ]; then
+    printf "%b\n" "${rD}╚═ ${rC}${url}${rR}${rD} ${ffill}╝${rR}"
+  else
+    printf "%s\n" "╚═ ${url} ${ffill}╝"
+  fi
+  printf "\n"
+}
+
+# rrow LABEL PLAIN COLORED DIM RESET — one receipt content row, padded to width.
+# Truncates an over-long value (dropping colour to keep the border aligned).
+rrow() {
+  local label="$1" plain="$2" colored="$3" rD="$4" rR="$5"
+  local VW=40
+  if [ "${#plain}" -gt "$VW" ]; then
+    plain="$(trunc "$plain" "$VW")"; colored="$plain"
+  fi
+  local pad=$(( VW - ${#plain} )); [ "$pad" -lt 0 ] && pad=0
+  local lpad=$(( 7 - ${#label} )); [ "$lpad" -lt 0 ] && lpad=0
+  printf "%b\n" "${rD}║${rR} ${rD}${label}$(rsp "$lpad")${rR} ${colored}$(rsp "$pad")${rD}║${rR}"
+}
+
+if [ "$MODE" = "receipt" ]; then
+  render_receipt
+  exit 0
+fi
 
 printf "\n"
 printf "%b┌%s┐%b\n" "$D" "$(hr "─")" "$R"
