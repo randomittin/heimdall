@@ -1,0 +1,313 @@
+#!/usr/bin/env python3
+# heimdall-queue-mcp — MCP interop server for the LOCAL work queue (the third
+# intake frontend, alongside the `heimdall-queue add` CLI and the `serve` webhook).
+#
+# A real MCP stdio JSON-RPC 2.0 server (same wire contract + framing as
+# bin/heimdall-ledger-mcp) exposing ONE tool, `queue_add`, that ingests a work
+# item into the LOCAL append-only log by shelling out to `bin/heimdall-queue add`.
+# The queue CLI is the single source of truth for the durable store, dedup, and
+# the schema — this server is a THIN wrapper and never reimplements them.
+#
+# CRITICAL: every item goes to the LOCAL work.jsonl. This server NEVER routes an
+# arbitrary task prompt through the Cloud Run PKI control-plane (which refuses
+# arbitrary prompts by security design). The local queue is the correct home for
+# arbitrary task bodies.
+#
+# Transport: newline-delimited / Content-Length-framed JSON-RPC 2.0 over stdio.
+# Protocol: MCP 2024-11-05. Zero third-party deps (Python 3 standard library only).
+#
+# Run:  bin/heimdall-queue-mcp            (speaks JSON-RPC on stdin/stdout)
+import json
+import os
+import subprocess
+import sys
+
+PROTOCOL_VERSION = "2024-11-05"
+TOOL_SCHEMA_VERSION = "1.0.0"
+SERVER_NAME = "heimdall-queue-mcp"
+
+SELF = os.path.realpath(__file__)
+BIN_DIR = os.path.dirname(SELF)
+QUEUE_BIN = os.path.join(BIN_DIR, "heimdall-queue")
+
+_KINDS = ("task", "issue", "review")
+
+
+class QueueError(Exception):
+    """A delegated CLI call failed; carries the captured stderr for the client."""
+
+    def __init__(self, message, detail=""):
+        super().__init__(message)
+        self.detail = detail
+
+
+def run_queue(args):
+    """Run bin/heimdall-queue with args; return parsed JSON stdout. Raise on nonzero."""
+    if not os.access(QUEUE_BIN, os.X_OK):
+        raise QueueError("queue CLI not executable: %s" % QUEUE_BIN)
+    proc = subprocess.run(
+        [QUEUE_BIN] + args,
+        capture_output=True,
+        text=True,
+        env=dict(os.environ),
+    )
+    if proc.returncode != 0:
+        raise QueueError(
+            "heimdall-queue %s exited %d" % (" ".join(args), proc.returncode),
+            detail=(proc.stderr or proc.stdout).strip(),
+        )
+    try:
+        return json.loads(proc.stdout or "{}")
+    except json.JSONDecodeError as exc:
+        raise QueueError("heimdall-queue returned non-JSON", detail=str(exc))
+
+
+def tool_queue_add(args, _haid):
+    """Ingest one work item into the LOCAL queue via `heimdall-queue add`.
+
+    Idempotent by dedup_hash: a duplicate ingest of live-or-resolved work is a
+    no-op (added=false). The item is attributed source=mcp.
+    """
+    prompt = args.get("prompt")
+    task_ref = args.get("task_ref")
+    if not (isinstance(prompt, str) and prompt.strip()) and not (
+        isinstance(task_ref, str) and task_ref.strip()
+    ):
+        raise QueueError("queue_add requires a non-empty 'prompt' or 'task_ref'")
+    kind = args.get("kind", "task")
+    if kind not in _KINDS:
+        raise QueueError("'kind' must be one of %s" % ", ".join(_KINDS))
+    cli = ["add"]
+    if prompt is not None:
+        cli.append(prompt)
+    cli += ["--kind", kind, "--source", "mcp"]
+    repo = args.get("repo")
+    if isinstance(repo, str) and repo:
+        cli += ["--repo", repo]
+    priority = args.get("priority")
+    if priority is not None:
+        if not isinstance(priority, int) or not (0 <= priority <= 9):
+            raise QueueError("'priority' must be an integer 0-9")
+        cli += ["--priority", str(priority)]
+    ttl = args.get("ttl_s")
+    if ttl is not None:
+        if not isinstance(ttl, int) or ttl < 1:
+            raise QueueError("'ttl_s' must be a positive integer")
+        cli += ["--ttl", str(ttl)]
+    max_attempts = args.get("max_attempts")
+    if max_attempts is not None:
+        if not isinstance(max_attempts, int) or max_attempts < 1:
+            raise QueueError("'max_attempts' must be a positive integer")
+        cli += ["--max-attempts", str(max_attempts)]
+    if isinstance(task_ref, str) and task_ref:
+        cli += ["--task-ref", task_ref]
+    result = run_queue(cli)
+    return {
+        "id": result.get("id"),
+        "added": result.get("added"),
+        "dedup_hash": result.get("dedup_hash"),
+        "priority": result.get("priority"),
+        "state": result.get("state"),
+        "source": "mcp",
+    }
+
+
+TOOLS = {
+    "queue_add": {
+        "handler": tool_queue_add,
+        "description": "Add a work item (a task prompt, or an issue/review "
+        "reference) to the LOCAL Heimdall work queue for the drainer to pick up "
+        "and prove. Idempotent by dedup_hash = sha256(prompt+repo): a duplicate "
+        "ingest is a no-op. Writes ONLY to the local append-only log — never the "
+        "PKI control-plane.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "prompt": {
+                    "type": "string",
+                    "description": "The task body to run (for kind=task).",
+                },
+                "task_ref": {
+                    "type": "string",
+                    "description": "A reference to external work (for kind=issue|review).",
+                },
+                "kind": {
+                    "type": "string",
+                    "enum": list(_KINDS),
+                    "description": "task | issue | review (default task).",
+                },
+                "repo": {
+                    "type": "string",
+                    "description": "Target repo (part of the dedup hash).",
+                },
+                "priority": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 9,
+                    "description": "0-9, 9 = highest (drained first). Default 5.",
+                },
+                "ttl_s": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Seconds a claim may live before it is reaped as crashed.",
+                },
+                "max_attempts": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Poison budget: flagged after this many attempts.",
+                },
+            },
+            "additionalProperties": False,
+        },
+    },
+}
+
+
+def tools_list_payload():
+    return {
+        "tools": [
+            {
+                "name": name,
+                "description": spec["description"],
+                "inputSchema": spec["inputSchema"],
+            }
+            for name, spec in TOOLS.items()
+        ]
+    }
+
+
+def make_error(req_id, code, message, data=None):
+    err = {"code": code, "message": message}
+    if data is not None:
+        err["data"] = data
+    return {"jsonrpc": "2.0", "id": req_id, "error": err}
+
+
+def make_result(req_id, result):
+    return {"jsonrpc": "2.0", "id": req_id, "result": result}
+
+
+class Session:
+    def __init__(self):
+        self.client_identity = None
+        self.initialized = False
+
+
+def handle_initialize(session, params):
+    client_info = (params or {}).get("clientInfo") or {}
+    session.client_identity = client_info.get("name") or "mcp-client"
+    session.initialized = True
+    return {
+        "protocolVersion": PROTOCOL_VERSION,
+        "capabilities": {"tools": {"listChanged": False}},
+        "serverInfo": {"name": SERVER_NAME, "version": TOOL_SCHEMA_VERSION},
+        "instructions": (
+            "Heimdall LOCAL work-queue intake over MCP. queue_add ingests a work "
+            "item into the local append-only log for the drainer to prove. Never "
+            "routes arbitrary prompts through the control-plane."
+        ),
+    }
+
+
+def handle_tools_call(session, params):
+    params = params or {}
+    name = params.get("name")
+    arguments = params.get("arguments") or {}
+    spec = TOOLS.get(name)
+    if spec is None:
+        raise QueueError("unknown tool: %s" % name)
+    haid = arguments.get("client_identity") or session.client_identity or "mcp-client"
+    payload = spec["handler"](arguments, haid)
+    text = json.dumps(payload, indent=2, sort_keys=True)
+    return {
+        "content": [{"type": "text", "text": text}],
+        "structuredContent": payload,
+        "isError": False,
+    }
+
+
+def dispatch(session, request):
+    if not isinstance(request, dict) or request.get("jsonrpc") != "2.0":
+        return make_error(None, -32600, "Invalid Request: not JSON-RPC 2.0")
+    method = request.get("method")
+    req_id = request.get("id")
+    params = request.get("params")
+    is_notification = "id" not in request
+
+    try:
+        if method == "initialize":
+            result = handle_initialize(session, params)
+        elif method == "notifications/initialized":
+            return None
+        elif method == "ping":
+            result = {}
+        elif method == "tools/list":
+            result = tools_list_payload()
+        elif method == "tools/call":
+            result = handle_tools_call(session, params)
+        else:
+            if is_notification:
+                return None
+            return make_error(req_id, -32601, "Method not found: %s" % method)
+    except QueueError as exc:
+        if is_notification:
+            return None
+        if method == "tools/call":
+            text = json.dumps({"error": str(exc), "detail": exc.detail}, indent=2)
+            return make_result(
+                req_id,
+                {"content": [{"type": "text", "text": text}], "isError": True},
+            )
+        return make_error(req_id, -32603, str(exc), data=exc.detail or None)
+    except Exception as exc:  # defensive: never crash the loop on one bad request
+        if is_notification:
+            return None
+        return make_error(req_id, -32603, "internal error: %s" % exc)
+
+    if is_notification:
+        return None
+    return make_result(req_id, result)
+
+
+def read_messages(stream):
+    buf = stream
+    for raw in iter(buf.readline, ""):
+        line = raw.strip()
+        if not line:
+            continue
+        if line.lower().startswith("content-length:"):
+            try:
+                length = int(line.split(":", 1)[1].strip())
+            except ValueError:
+                continue
+            while True:
+                hdr = buf.readline()
+                if hdr.strip() == "":
+                    break
+            body = buf.read(length)
+            try:
+                yield json.loads(body)
+            except json.JSONDecodeError:
+                yield {"__parse_error__": True}
+            continue
+        try:
+            yield json.loads(line)
+        except json.JSONDecodeError:
+            yield {"__parse_error__": True}
+
+
+def main():
+    session = Session()
+    out = sys.stdout
+    for request in read_messages(sys.stdin):
+        if isinstance(request, dict) and request.get("__parse_error__"):
+            resp = make_error(None, -32700, "Parse error")
+        else:
+            resp = dispatch(session, request)
+        if resp is not None:
+            out.write(json.dumps(resp) + "\n")
+            out.flush()
+
+
+if __name__ == "__main__":
+    main()

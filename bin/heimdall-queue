@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# heimdall-queue — the LOCAL continuous-intake work queue CLI (thin wrapper over
+# bin/lib/work_queue.py). ALL intake — this CLI, the MCP `queue_add` tool, and the
+# `serve` webhook — writes to ONE local append-only log:
+#   ${HEIMDALL_HOME:-<repo>/.heimdall}/queue/work.jsonl
+# It is DISTINCT from the Cloud Run control-plane: arbitrary task prompts are
+# NEVER routed through the PKI allowlist. This is local durability only.
+#
+# Subcommands:
+#
+#   heimdall-queue add "<prompt>" [--kind task|issue|review] [--repo R]
+#                  [--priority 0-9] [--source cli|mcp|webhook] [--ttl S]
+#                  [--max-attempts N] [--task-ref REF]
+#       Ingest one work item. Idempotent by dedup_hash = sha256(prompt+repo): a
+#       duplicate ingest of live-or-resolved work is a NO-OP (added=false). Prints
+#       { id, added, dedup_hash, state, priority }.
+#
+#   heimdall-queue pick [--by HAID] [--now ISO]
+#       Claim the highest-priority QUEUED item (attempts++), atomically moving it
+#       to CLAIMED before returning it (claim-before-work — two concurrent picks
+#       never double-pick). Prints { picked: item|null }.
+#
+#   heimdall-queue complete <id> --verdict PROVEN|BLOCKED
+#       Record the ATTESTED verdict and move the item to DONE. Prints { completed,
+#       item }. The verdict is the attestation's — never the executor's self-report.
+#
+#   heimdall-queue fail <id>
+#       An executor failure: requeue for another attempt, or FLAG as poison if the
+#       attempt budget is spent. Prints { item }.
+#
+#   heimdall-queue reap [--now ISO]
+#       Reap crashed claims (claimed_at + ttl_s < now): requeue or flag-as-poison.
+#       Prints { reaped: [ids] }.
+#
+#   heimdall-queue get <id>            Print one item (exit 3 if unknown).
+#   heimdall-queue list [--state S]    List items (queued ones in pick order).
+#   heimdall-queue status              Counts + HUD line { depth, draining, last_verdict }.
+#   heimdall-queue serve [--port N] [--host H] [--portfile F]
+#       Run the LOCAL webhook: POST /queue {prompt,...} -> the same work.jsonl.
+#
+# Exit status: 0 success; 2 usage/validation error; 3 get: unknown id.
+
+set -euo pipefail
+
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+BINDIR="$(dirname "$SELF")"
+QUEUE_LIB="$BINDIR/lib/work_queue.py"
+
+usage() { sed -n '2,44p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+PY="$(command -v python3 || command -v python || true)"
+if [ -z "$PY" ]; then
+  echo "error: python3 not found (required for heimdall-queue)" >&2
+  exit 2
+fi
+
+if [ ! -f "$QUEUE_LIB" ]; then
+  echo "error: missing lib: $QUEUE_LIB" >&2
+  exit 2
+fi
+
+case "${1:-}" in
+  -h|--help|"") usage; exit 0 ;;
+esac
+
+# The python lib owns argv parsing + the JSON stdout shape; this wrapper owns only
+# resolution of the lib path + the python interpreter.
+exec "$PY" "$QUEUE_LIB" "$@"
