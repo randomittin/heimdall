@@ -1,0 +1,92 @@
+# heimdall-maintainer-job.yaml — the Cloud Run Job manifest for UNATTENDED maintainer
+# dispatch (Arch B, fully-cloud). Apply with:
+#
+#   gcloud run jobs replace deploy/cloud-run/heimdall-maintainer-job.yaml --region=us-central1
+#
+# This runs the SAME run-to-completion entrypoint as heimdall-long-job
+# (`heimdall-control-plane run-job`); each execution overrides the container args to
+# `run-job,<JOB_ID>` (the dispatcher supplies the per-job id). The difference from
+# heimdall-long-job is (1) an image carrying the maintainer toolchain (git + gh CLI +
+# claude CLI) and (2) the LLM auth + PR-bot secrets mounted as env. See MAINTAINER-RUNBOOK.md.
+#
+# DIGEST-PINNED (required): the `image` below MUST be a content-addressed
+# `...@sha256:<digest>` reference, never a mutable tag — a Job must pin exactly what runs
+# so a re-tag cannot silently change it. Resolve the digest per MAINTAINER-RUNBOOK.md §3.2
+# and paste it in before `gcloud run jobs replace`.
+#
+# BOTH AUTH PATHS: the env block below mounts CLAUDE_CODE_OAUTH_TOKEN (preferred — the
+# operator's subscription, from `claude setup-token`). To use the metered API key
+# INSTEAD, replace that one env entry with the ANTHROPIC_API_KEY block shown commented
+# below. Mount only ONE — the handler prefers OAuth when both are present, but there is no
+# need to provision both. NEVER commit a token value here; these are Secret Manager refs.
+
+apiVersion: run.googleapis.com/v1
+kind: Job
+metadata:
+  name: heimdall-maintainer-job
+  labels:
+    heimdall-component: maintainer
+  annotations:
+    run.googleapis.com/launch-stage: GA
+spec:
+  template:
+    spec:
+      # --max-retries=1 -> a failed execution is retried once (restart-safe: all durable
+      # state is in Firestore, not local disk).
+      taskCount: 1
+      parallelism: 1
+      template:
+        spec:
+          maxRetries: 1
+          # --task-timeout=3600 -> bound one maintainer execution to 1h. A Job has no
+          # request timeout; it runs to completion with full CPU (unlike the service).
+          timeoutSeconds: 3600
+          # the runtime SA MUST hold roles/datastore.user + secretmanager.secretAccessor
+          # on the mounted secrets (RUNBOOK §3.1). It does NOT need run.jobs.run — that is
+          # the DISPATCHER's permission, not the executor's.
+          serviceAccountName: heimdall-cp-run@heimdall-control-plane.iam.gserviceaccount.com
+          containers:
+              # DIGEST-PINNED image carrying git + gh + the claude CLI on top of the
+              # control-plane image. Replace with the resolved @sha256 digest.
+            - image: us-central1-docker.pkg.dev/heimdall-control-plane/heimdall/heimdall-maintainer@sha256:REPLACE_WITH_DIGEST
+              # the run-to-completion entrypoint; each execution overrides args -> run-job,<JOB_ID>.
+              command:
+                - heimdall-control-plane
+              args:
+                - run-job
+              env:
+                # ── control-plane identity (identical seed + server HAID as the service) ──
+                - name: HEIMDALL_STATE_BACKEND
+                  value: firestore
+                - name: GOOGLE_CLOUD_PROJECT
+                  value: heimdall-control-plane
+                - name: HEIMDALL_CP_SERVER_HAID
+                  value: cp-server
+                - name: HEIMDALL_CP_PKI_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: cp-pki-key
+                      key: latest
+                # ── LLM auth (PREFERRED: OAuth subscription token) — env only, never logged ──
+                - name: CLAUDE_CODE_OAUTH_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: heimdall-cc-oauth-token
+                      key: latest
+                # ── metered fallback — use INSTEAD of the OAuth block above (mount only one) ──
+                # - name: ANTHROPIC_API_KEY
+                #   valueFrom:
+                #     secretKeyRef:
+                #       name: heimdall-anthropic-api-key
+                #       key: latest
+                # ── the scoped PR bot token: the loop OPENS heimdall/* PRs with it; it never
+                #    pushes main / merges (a human merges). issue_pr.py reads this var. ──
+                - name: HEIMDALL_PR_BOT_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: heimdall-pr-bot-token
+                      key: latest
+              resources:
+                limits:
+                  cpu: "1"
+                  memory: 1Gi

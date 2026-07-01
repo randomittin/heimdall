@@ -130,12 +130,37 @@ class Int:
         return value
 
 
+class Opt:
+    """Marks a DECLARED param as OPTIONAL: absent from the request -> skipped (NOT a
+    missing_param refusal); present -> validated by the inner bounded type. Optionality
+    NEVER relaxes the command-smuggle wall — an UNKNOWN key is still refused (extra_param)
+    exactly as before; Opt only lets a declared param be omitted. The inner spec is a real
+    bounded type (Str/Enum/Int); Opt adds NO free-string escape hatch (it forwards to the
+    inner validate, which still enforces the maxlen/pattern/range). By construction an
+    optional param cannot be an arbitrary command string any more than a required one."""
+
+    def __init__(self, inner):
+        if not hasattr(inner, "validate"):
+            raise ValueError("Opt requires a bounded param type exposing validate()")
+        self.inner = inner
+
+    def validate(self, name, value):
+        return self.inner.validate(name, value)
+
+
 # ── shared whitelist patterns (identifier-shaped, never shell-shaped) ──────────
 #
 # A task id is a short slug: lowercase alnum + dash, nothing else. Crucially this
 # excludes EVERY shell metacharacter (; | & $ ` > < ( ) space quotes), so a command
 # payload cannot pass an id-shaped Str param — the falsifiable smuggle attempt RED.
 TASK_ID_RE = r"[a-z0-9][a-z0-9-]{0,63}"
+
+# A repo slug: <owner>/<name>, each side ASCII word-chars + dot + dash, exactly ONE
+# slash. ASCII-explicit (not \w) so a unicode homoglyph cannot ride in. Like TASK_ID_RE
+# this excludes EVERY shell metacharacter (; | & $ ` > < ( ) space quotes) AND whitespace,
+# so a command payload cannot pass the repo param — the falsifiable smuggle attempt stays
+# RED. The single required slash bounds it to one owner/name pair (no deep path).
+REPO_SLUG_RE = r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+"
 
 
 # ── ActionSpec (the registry entry — §1) ──────────────────────────────────────
@@ -195,6 +220,10 @@ class ActionSpec:
         clean = {}
         for pname, spec in self.params.items():
             if pname not in params:
+                # an OPTIONAL param (Opt) may be omitted — skip it; a REQUIRED one absent
+                # is a refusal. Optionality does NOT weaken the extra-key wall above.
+                if isinstance(spec, Opt):
+                    continue
                 raise RefusedDispatch("missing_param", "missing %s" % pname)
             clean[pname] = spec.validate(pname, params[pname])
         return clean
@@ -229,6 +258,27 @@ _ALLOWLIST = {
         handler="cp_handlers.run_suite",
         params={"suite": Enum("unit", "integration", "oracle")},
         requires_gate=True,
+        isolated=True,
+    ),
+    # run-maintainer-cycle: drive N bounded maintainer cycles of the durable autopilot
+    # loop (bin/heimdall-maintain-loop) against ONE repo. THE SECURITY SPINE HOLDS BY
+    # CONSTRUCTION: the params are typed+bounded SCALARS only — a repo slug (owner/name,
+    # no shell metachars), a bounded cycle count, an OPTIONAL bounded token budget. There
+    # is NO free-form prompt/cmd/shell/exec param, and validate_params REFUSES any extra
+    # key (extra_param), so a control-plane breach can NEVER smuggle a prompt or command
+    # through this action. The maintainer prompt is built INSIDE heimdall-maintain-loop
+    # from the queued GitHub issue — NEVER a control-plane param. isolated=True (runs in
+    # the §2 low-priv job env); requires_gate=False (the loop is itself budget/approval/
+    # stop-guarded and only OPENS PRs on scoped heimdall/* branches — it never pushes main
+    # or merges, so a human still gates the merge).
+    "run-maintainer-cycle": ActionSpec(
+        handler="cp_handlers.run_maintainer_cycle",
+        params={
+            "repo": Str(maxlen=128, pattern=REPO_SLUG_RE),
+            "max": Int(lo=1, hi=100),
+            "budget_tokens": Opt(Int(lo=1, hi=100_000_000)),
+        },
+        requires_gate=False,
         isolated=True,
     ),
 }
