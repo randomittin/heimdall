@@ -1,0 +1,453 @@
+#!/usr/bin/env bash
+# heimdall-ponytail-ab — measure HEIMDALL'S OWN delta from the Ponytail lazy-ladder.
+#
+# Spec: heimdall-ponytail-integration-spec.md §"Measure Heimdall's OWN delta" and
+# §Acceptance. We do NOT inherit ponytail's 54% number — we MEASURE our real delta,
+# or report blank. On a set of real tasks, run the coder path WITH vs WITHOUT the
+# lazy-ladder active and record, per task x mode: LOC changed, tokens used, and —
+# MOST IMPORTANTLY — the acceptance/oracle result (pass/fail).
+#
+# The headline metric is the UNDER-DELIVERY CHECK, quantified: acceptance-pass-rate
+# must NOT drop with the ladder ON. If ON's pass-rate falls below OFF's, the ladder
+# is too aggressive (rung 1 is eating scope) and this harness flags it loudly.
+#
+# REUSE, don't reinvent (spec: "Don't build a new verify layer"):
+#   - Task/case source  = evals/benchmark/tasks/*.json  (the SAME corpus bin/benchmark uses)
+#   - Acceptance/oracle  = each task's own verify[] commands (pass iff ALL pass)
+#   - Token accounting    = bin/heimdall-tokens (the real meter), no re-parsing
+#   - Coder path shape    = mirrors bin/benchmark's heimdall arm (claude --agent heimdall)
+#
+# THE LADDER TOGGLE (real, not faked): the coder path reads env HEIMDALL_LAZY_LADDER.
+#   HEIMDALL_LAZY_LADDER=1  -> ladder ACTIVE: the write-time minimalism ruleset (the
+#                             6-rung ladder + the "lazy, not negligent" carve-outs) is
+#                             prepended to the coder prompt AND exported to the run.
+#   HEIMDALL_LAZY_LADDER=0  -> ladder INACTIVE: no ladder text, plain prompt.
+# The env-var CONTRACT is defined here (evals/ponytail-ab/SCHEMA.md) and READ where
+# this harness assembles the coder prompt (build_coder_cmd). If/when the coder-agent
+# prompt file later reads the same env var, the contract is byte-identical, so this
+# A/B stays valid. Setting the var without the injection would be faking it — we do
+# BOTH: export the var AND branch the actual prompt bytes on it.
+#
+# Safe by default: no flags => a DRY pass. Validates the suite, emits the JSONL
+# SCHEMA, prints the capture plan + an n=0 (blank) summary. Spends ZERO API tokens.
+# Opt into real measurement with --live. Mirrors bin/heimdall-bench's dry/live shape.
+#
+# Usage:
+#   heimdall-ponytail-ab                 Dry: validate + schema + capture plan (no API)
+#   heimdall-ponytail-ab --dry           Same as above (explicit)
+#   heimdall-ponytail-ab --live          Run each task ladder on+off, measure for real
+#   heimdall-ponytail-ab --task <id>     Restrict to one task
+#   heimdall-ponytail-ab --model <id>    Pin a model id (passed to the claude CLI)
+#   heimdall-ponytail-ab --summary <f>   Print the on/off summary from an existing JSONL
+#   heimdall-ponytail-ab --out <path>    Where to write results.jsonl (default under evals/)
+#   heimdall-ponytail-ab -h|--help
+#
+# Honesty: every number is measured (LOC from git, tokens from heimdall-tokens,
+# acceptance from the task's own verify[]). A mode with no runs reports blank / n=0,
+# never a fabricated rate. Nothing is hardcoded; ponytail's 54% is never inherited.
+set -euo pipefail
+
+# ── Resolve paths (bin/heimdall-ponytail-ab -> heimdall/) ─────────────────────
+SELF="$0"
+if command -v readlink >/dev/null 2>&1; then
+  SELF="$(readlink -f "$0" 2>/dev/null || readlink "$0" 2>/dev/null || echo "$0")"
+fi
+BIN_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+PLUGIN_DIR="$(cd "$BIN_DIR/.." && pwd)"
+TASKS_DIR="$PLUGIN_DIR/evals/benchmark/tasks"        # REUSE the bench corpus
+OUT_DIR="$PLUGIN_DIR/evals/ponytail-ab"
+RESULTS_JSONL="$OUT_DIR/results.jsonl"
+SCHEMA_SAMPLE="$OUT_DIR/schema.sample.jsonl"
+TOK="$BIN_DIR/heimdall-tokens"                        # REUSE the token meter
+
+# ── Colors (truecolor with plain fallback, matching the sibling bins) ─────────
+if [[ "${COLORTERM:-}" == "truecolor" || "${COLORTERM:-}" == "24bit" || "${TERM:-}" == *256color* ]]; then
+  P='\033[38;2;224;86;160m'; C='\033[38;2;0;212;255m'; V='\033[38;2;155;89;182m'
+  G='\033[38;2;78;204;163m'; D='\033[38;2;100;100;120m'; W='\033[38;2;255;200;80m'
+else
+  P='\033[35m'; C='\033[36m'; V='\033[34m'; G='\033[32m'; D='\033[37m'; W='\033[33m'
+fi
+B='\033[1m'; R='\033[0m'
+
+command -v jq >/dev/null 2>&1 || { printf "error: jq is required\n" >&2; exit 2; }
+
+usage() { sed -n '2,44p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+# ── The write-time lazy-ladder ruleset (spec §"The two layers" + §carve-outs). ─
+# This is the EXACT text injected into the coder prompt when the ladder is ACTIVE.
+# It governs HOW MUCH code (implementation verbosity), never WHETHER the feature
+# ships — the carve-outs make that non-negotiable, and the oracle gate is the floor.
+ladder_preamble() {
+  cat <<'LADDER'
+[WRITE-TIME MINIMALISM — the lazy ladder]
+Before writing code, stop at the FIRST rung that holds:
+  1. Does this need to exist? -> no: skip it (YAGNI).
+  2. Does the standard library do it? -> use it.
+  3. Is it a native platform feature? -> use it.
+  4. Does an installed dependency do it? -> use it.
+  5. Is it one line? -> one line.
+  6. Only then: the minimum that actually works.
+
+[LAZY, NOT NEGLIGENT — non-negotiable carve-outs]
+Minimalism applies to IMPLEMENTATION VERBOSITY only — never to correctness,
+input/trust-boundary validation, error handling, data-loss handling, security,
+accessibility, or the feature's actual requirements. Rung 1 ("need to exist?")
+targets SUPERFLUOUS scaffolding (the extra wrapper, the config class, a library
+where a one-liner works) — NEVER the user's requested capability, a requirement,
+or an acceptance criterion. YAGNI cuts gold-plating, never scope. A required
+feature is never skipped, never left unfinished, never called done while half-built.
+The task is done when its acceptance/oracle PASSES, not when the diff is small —
+small-but-broken FAILS. Leaner code, same proven function.
+LADDER
+}
+
+# ── Ladder toggle contract: read HEIMDALL_LAZY_LADDER (default off). Echoes 1/0. ─
+ladder_active() {
+  case "${HEIMDALL_LAZY_LADDER:-0}" in
+    1|on|true|yes|ON|TRUE|Yes) echo 1 ;;
+    *) echo 0 ;;
+  esac
+}
+
+# ── Args ──────────────────────────────────────────────────────────────────────
+MODE="dry"            # dry | live
+ONLY_TASK=""
+MODEL=""
+SUMMARY_FILE=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry)      MODE="dry"; shift ;;
+    --live)     MODE="live"; shift ;;
+    --task)     ONLY_TASK="${2:?--task needs an id}"; shift 2 ;;
+    --model)    MODEL="${2:?--model needs an id}"; shift 2 ;;
+    --out)      RESULTS_JSONL="${2:?--out needs a path}"; shift 2 ;;
+    --summary)  MODE="summary"; SUMMARY_FILE="${2:?--summary needs a jsonl path}"; shift 2 ;;
+    -h|--help)  usage; exit 0 ;;
+    *) printf "  ${P}x${R} Unknown flag: ${B}%s${R}\n" "$1" >&2
+       printf "  ${D}Run ${C}heimdall-ponytail-ab --help${D} for usage.${R}\n" >&2
+       exit 2 ;;
+  esac
+done
+
+# ── Task validation (REUSE bin/benchmark's required-field contract). ──────────
+validate_task() {
+  jq -e '.id and .title and .category and .prompt and (.verify|type=="array")' "$1" >/dev/null 2>&1
+}
+
+# Collect selected task files into SELECTED[].
+SELECTED=()
+collect_tasks() {
+  [ -d "$TASKS_DIR" ] || { printf "  ${P}x${R} tasks dir not found: %s\n" "$TASKS_DIR" >&2; exit 2; }
+  local tf id
+  while IFS= read -r tf; do
+    [ -n "$tf" ] || continue
+    validate_task "$tf" || { printf "  ${P}x${R} task %s missing fields (id,title,category,prompt,verify[])\n" "$tf" >&2; exit 2; }
+    id="$(jq -r '.id' "$tf")"
+    if [ -n "$ONLY_TASK" ] && [ "$id" != "$ONLY_TASK" ]; then continue; fi
+    SELECTED+=("$tf")
+  done < <(find "$TASKS_DIR" -maxdepth 1 -name '*.json' | sort)
+  if [ -n "$ONLY_TASK" ] && [ "${#SELECTED[@]}" -eq 0 ]; then
+    printf "  ${P}x${R} no task with id '%s' in %s\n" "$ONLY_TASK" "$TASKS_DIR" >&2
+    exit 2
+  fi
+  [ "${#SELECTED[@]}" -gt 0 ] || { printf "  ${P}x${R} no task files in %s\n" "$TASKS_DIR" >&2; exit 2; }
+}
+
+# ── Portable canonical dir (macOS bash 3.2 has no realpath). ───────────────────
+canonical_dir() {
+  ( cd "$1" 2>/dev/null && pwd -P ) 2>/dev/null && return 0
+  python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$1" 2>/dev/null && return 0
+  return 1
+}
+
+# ── Materialize a fresh git-backed workspace for a task (mirrors bin/benchmark's
+#    materialize_workspace: seed_files first, then setup[], then a baseline commit
+#    so LOC is a real git diff against a known baseline). Echoes the workspace. ──
+materialize_workspace() {
+  local f="$1" ws tmpl xrun relpath dest parent ws_real parent_real probe
+  xrun="$(printf 'X%.0s' 1 2 3 4 5 6)"
+  tmpl="${TMPDIR:-/tmp}/heimdall-ponytail-ab.${xrun}"
+  ws="$(mktemp -d "$tmpl")"
+  if jq -e '.seed_files' "$f" >/dev/null 2>&1; then
+    ws_real="$(canonical_dir "$ws")" || { printf "error: cannot resolve workspace\n" >&2; rm -rf "$ws"; return 1; }
+    while IFS= read -r relpath; do
+      case "$relpath" in
+        /*|*..*|*$'\n'*|"") printf "error: unsafe seed_files key: %s\n" "$relpath" >&2; rm -rf "$ws"; return 1 ;;
+      esac
+      dest="$ws/$relpath"; parent="$(dirname "$dest")"
+      probe="$parent"; while [ ! -d "$probe" ]; do probe="$(dirname "$probe")"; done
+      parent_real="$(canonical_dir "$probe")" || { rm -rf "$ws"; return 1; }
+      case "$parent_real/" in "$ws_real/"*) ;; *) printf "error: seed key escapes ws: %s\n" "$relpath" >&2; rm -rf "$ws"; return 1 ;; esac
+      mkdir -p "$parent"
+      jq -r --arg k "$relpath" '.seed_files[$k]' "$f" > "$dest"
+    done < <(jq -r '.seed_files | keys[]' "$f")
+  fi
+  (
+    cd "$ws"
+    git init -q
+    git config user.email ab@heimdall.local
+    git config user.name heimdall-ponytail-ab
+    if jq -e '.setup' "$f" >/dev/null 2>&1; then
+      while IFS= read -r step; do
+        [ "$step" = "__SEED__" ] && continue
+        bash -c "$step" || { printf "setup step failed: %s\n" "$step" >&2; exit 1; }
+      done < <(jq -r '.setup[]' "$f")
+    fi
+    git add -A >/dev/null 2>&1 || true
+    git commit -q -m "ab baseline" >/dev/null 2>&1 || true
+  ) >&2 || { rm -rf "$ws"; return 1; }
+  echo "$ws"
+}
+
+# ── LOC changed = added + deleted lines in the git diff against the baseline. ──
+# git add -A first so brand-new files count; binary files (numstat "-") excluded.
+measure_loc() {
+  local ws="$1"
+  ( cd "$ws" && git add -A >/dev/null 2>&1 || true )
+  ( cd "$ws" && git diff --cached --numstat HEAD 2>/dev/null ) | awk '
+    $1 ~ /^[0-9]+$/ { a += $1 }
+    $2 ~ /^[0-9]+$/ { d += $2 }
+    END { print (a + d) + 0 }'
+}
+
+# ── Run the task's verify[] = the ACCEPTANCE / ORACLE gate. Sets VPASS/VTOTAL. ─
+# acceptance_pass is true iff EVERY verify command passes AND there is >=1 to run.
+run_verify() {
+  local f="$1" ws="$2" cmd pass=0 total=0
+  while IFS= read -r cmd; do
+    total=$((total + 1))
+    if ( cd "$ws" && bash -c "$cmd" >/dev/null 2>&1 ); then pass=$((pass + 1)); fi
+  done < <(jq -r '.verify[]' "$f")
+  VPASS="$pass"; VTOTAL="$total"
+}
+
+# ── Build the coder command for a run. READS the ladder toggle here — this is
+#    the "where the coder path assembles its prompt" seam. Sets CODER_CMD[]. ────
+build_coder_cmd() {
+  local prompt="$1" goal ladder
+  ladder="$(ladder_active)"
+  CODER_CMD=(claude --output-format json --permission-mode acceptEdits)
+  [ -n "$MODEL" ] && CODER_CMD+=(--model "$MODEL")
+  goal="/goal ${prompt} — fully implemented, all tests pass, lint clean, every line real and working
+
+${prompt}"
+  if [ "$ladder" = "1" ]; then
+    # Ladder ACTIVE: prepend the write-time minimalism ruleset. The prompt bytes
+    # genuinely differ by mode — that is what makes the toggle real, not faked.
+    goal="$(ladder_preamble)
+
+${goal}"
+  fi
+  CODER_CMD+=(--agent heimdall --plugin-dir "$PLUGIN_DIR" -p "$goal")
+}
+
+# ── Execute ONE task in ONE ladder mode, live. Emits a JSONL record. ──────────
+run_one_live() {
+  local f="$1" ladder="$2" id prompt ws out tokens loc accept
+  id="$(jq -r '.id' "$f")"
+  prompt="$(jq -r '.prompt' "$f")"
+  ws="$(HEIMDALL_LAZY_LADDER="$ladder" materialize_workspace "$f")" \
+    || { printf "  ${P}x${R} materialize failed for %s\n" "$id" >&2; return 1; }
+  WORKSPACES+=("$ws")
+
+  # Export the toggle for the run AND branch the prompt bytes on it (build_coder_cmd).
+  export HEIMDALL_LAZY_LADDER="$ladder"
+  build_coder_cmd "$prompt"
+  out="$( cd "$ws" && "${CODER_CMD[@]}" 2>/dev/null )" || true
+  unset HEIMDALL_LAZY_LADDER
+
+  # Tokens via the REUSED meter (bin/heimdall-tokens json -); blank -> 0 honestly.
+  if [ -n "$out" ] && printf '%s' "$out" | jq -e '.usage' >/dev/null 2>&1; then
+    tokens="$(printf '%s' "$out" | "$TOK" json - 2>/dev/null | jq -r '.total_tokens // 0')"
+  else
+    tokens=0
+  fi
+  loc="$(measure_loc "$ws")"
+  run_verify "$f" "$ws"
+  if [ "$VTOTAL" -gt 0 ] && [ "$VPASS" -eq "$VTOTAL" ]; then accept=true; else accept=false; fi
+
+  emit_record "$id" "$ladder" "$loc" "$tokens" "$accept" "$VPASS" "$VTOTAL" "live"
+}
+
+# ── Emit one JSONL record (mirrors .planning/metrics.jsonl one-object-per-line). ─
+# The 3 headline fields per mode: loc, tokens, acceptance_pass.
+emit_record() {
+  local id="$1" ladder="$2" loc="$3" tokens="$4" accept="$5" vpass="$6" vtotal="$7" runmode="$8"
+  local modestr; [ "$ladder" = "1" ] && modestr="on" || modestr="off"
+  jq -c -n \
+    --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --arg task "$id" --arg mode "$modestr" --argjson ladder "$ladder" \
+    --argjson loc "$loc" --argjson tokens "$tokens" --argjson accept "$accept" \
+    --argjson vpass "$vpass" --argjson vtotal "$vtotal" --arg runmode "$runmode" \
+    '{ts:$ts, metric:"ponytail-ab", task:$task, mode:$mode, ladder:($ladder==1),
+      loc:$loc, tokens:$tokens, acceptance_pass:$accept,
+      verify:{passed:$vpass, total:$vtotal}, run_mode:$runmode}' >> "$RESULTS_JSONL"
+}
+
+# ── Summary engine (SINGLE source of truth for dry / live / --summary). Reads a
+#    JSONL and prints mean LOC delta, mean token delta, and pass-rate on/off. A
+#    mode with zero runs prints blank / n=0 — NEVER a fabricated number. ────────
+summarize_json() {  # jsonl_path -> compact JSON summary on stdout
+  jq -s '
+    def rate($n;$p): if $n==0 then null else (1000*$p/$n | round / 10) end;
+    (map(select(.mode=="on")))  as $on
+    | (map(select(.mode=="off"))) as $off
+    | ($on|length)  as $on_n
+    | ($off|length) as $off_n
+    | ([ $on[]  | select(.acceptance_pass==true) ]|length) as $on_pass
+    | ([ $off[] | select(.acceptance_pass==true) ]|length) as $off_pass
+    | (group_by(.task) | map({
+        on:(map(select(.mode=="on"))[0]),
+        off:(map(select(.mode=="off"))[0])
+      })) as $pairs
+    | ([ $pairs[] | select(.on!=null and .off!=null and (.on.loc!=null) and (.off.loc!=null))
+         | (.off.loc - .on.loc) ]) as $locd
+    | ([ $pairs[] | select(.on!=null and .off!=null and (.on.tokens!=null) and (.off.tokens!=null))
+         | (.off.tokens - .on.tokens) ]) as $tokd
+    | { on_n:$on_n, off_n:$off_n, on_pass:$on_pass, off_pass:$off_pass,
+        on_rate: rate($on_n;$on_pass), off_rate: rate($off_n;$off_pass),
+        loc_delta_n: ($locd|length),
+        loc_delta_mean: (if ($locd|length)==0 then null else (($locd|add) / ($locd|length)) end),
+        tok_delta_n: ($tokd|length),
+        tok_delta_mean: (if ($tokd|length)==0 then null else (($tokd|add) / ($tokd|length)) end) }
+  ' "$1" 2>/dev/null \
+  || echo '{"on_n":0,"off_n":0,"on_pass":0,"off_pass":0,"on_rate":null,"off_rate":null,"loc_delta_n":0,"loc_delta_mean":null,"tok_delta_n":0,"tok_delta_mean":null}'
+}
+
+print_summary() {  # jsonl_path
+  local jf="$1" sj
+  # An absent/empty file summarizes cleanly to all-zero / blank.
+  [ -f "$jf" ] || jf="/dev/null"
+  sj="$(summarize_json "$jf")"
+  g() { printf '%s' "$sj" | jq -r "$1"; }
+  local on_n off_n on_pass off_pass on_rate off_rate ld_n ld_m td_n td_m
+  on_n="$(g '.on_n')"; off_n="$(g '.off_n')"
+  on_pass="$(g '.on_pass')"; off_pass="$(g '.off_pass')"
+  on_rate="$(g '.on_rate')"; off_rate="$(g '.off_rate')"
+  ld_n="$(g '.loc_delta_n')"; ld_m="$(g '.loc_delta_mean')"
+  td_n="$(g '.tok_delta_n')"; td_m="$(g '.tok_delta_mean')"
+
+  fmt_rate() { if [ "$1" = "null" ]; then printf 'n=0 (blank — not measured)'; else printf '%s%%' "$1"; fi; }
+  fmt_num()  { if [ "$2" = "0" ] || [ "$1" = "null" ]; then printf 'n=0 (blank — not measured)'; else printf '%s  (n=%s)' "$1" "$2"; fi; }
+
+  printf "\n  ${B}A/B summary — Heimdall's OWN ponytail delta${R} ${D}(measured, not inherited)${R}\n"
+  printf "  ${V}───────────────────────────────────────────────────────────${R}\n"
+  printf "  ${B}acceptance-pass-rate  ladder ON ${R} :  %s  ${D}(%s/%s)${R}\n" "$(fmt_rate "$on_rate")"  "$on_pass"  "$on_n"
+  printf "  ${B}acceptance-pass-rate  ladder OFF${R} :  %s  ${D}(%s/%s)${R}\n" "$(fmt_rate "$off_rate")" "$off_pass" "$off_n"
+  printf "  ${D}mean LOC delta   (off - on)${R}      :  %s\n" "$(fmt_num "$ld_m" "$ld_n")"
+  printf "  ${D}mean token delta (off - on)${R}      :  %s\n" "$(fmt_num "$td_m" "$td_n")"
+
+  # THE headline guard: pass-rate must NOT drop with the ladder ON.
+  if [ "$on_rate" != "null" ] && [ "$off_rate" != "null" ]; then
+    if awk -v a="$on_rate" -v b="$off_rate" 'BEGIN{exit !(a+0 < b+0)}'; then
+      printf "  ${P}${B}! UNDER-DELIVERY${R} ${P}ladder ON pass-rate %s%% BELOW OFF %s%% -> ladder too aggressive; tune rung 1 scope.${R}\n" "$on_rate" "$off_rate"
+    else
+      printf "  ${G}ok under-delivery guard holds${R} ${D}(ladder ON pass-rate did not drop below OFF).${R}\n"
+    fi
+  else
+    printf "  ${D}under-delivery guard: n=0 — no live pass-rate to compare yet (run --live).${R}\n"
+  fi
+  printf "\n"
+}
+
+# ── --summary MODE: print a summary from an existing JSONL and exit. ──────────
+if [ "$MODE" = "summary" ]; then
+  [ -f "$SUMMARY_FILE" ] || { printf "  ${P}x${R} no such JSONL: %s\n" "$SUMMARY_FILE" >&2; exit 2; }
+  print_summary "$SUMMARY_FILE"
+  exit 0
+fi
+
+# ── Banner ────────────────────────────────────────────────────────────────────
+printf "\n"
+printf "  ${P}${B}░▒▓█${R} ${C}${B}H E I M D A L L   ×   P O N Y T A I L   A / B${R} ${P}${B}█▓▒░${R}\n"
+printf "  ${V}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${R}\n"
+printf "  ${D}Measure Heimdall's OWN lazy-ladder delta — LOC, tokens, and the${R}\n"
+printf "  ${D}one that matters: acceptance-pass-rate must NOT drop with the ladder ON.${R}\n\n"
+
+collect_tasks
+
+if [ "$MODE" = "dry" ]; then
+  # ── DRY: validate suite, emit the JSONL SCHEMA sample, print the capture plan,
+  #    and an n=0 (blank) summary. Zero API spend, nothing measured. ───────────
+  mkdir -p "$OUT_DIR"
+  printf "  ${W}>${R} ${D}No mode given (or --dry) — running ${C}--dry${D}: validate + schema + plan, ${B}zero API spend${R}${D}.${R}\n"
+  printf "  ${D}  Add ${C}--live${D} to measure for real.${R}\n\n"
+
+  printf "  ${B}Task suite${R} ${D}(reused from evals/benchmark/tasks — the SAME corpus as bin/benchmark)${R}\n"
+  printf "  %-28s  %-26s  %s\n" "TASK ID" "CATEGORY" "VERIFY (acceptance) STEPS"
+  printf "  %-28s  %-26s  %s\n" "----------------------------" "--------------------------" "-------------------------"
+  for f in "${SELECTED[@]}"; do
+    printf "  %-28s  %-26s  %s\n" "$(jq -r '.id' "$f")" "$(jq -r '.category' "$f")" "$(jq -r '.verify|length' "$f")"
+  done
+  printf "\n"
+
+  # Ladder toggle wiring evidence: show that the prompt bytes genuinely differ.
+  ON_LINES="$(ladder_preamble | wc -l | tr -d ' ')"
+  printf "  ${B}Ladder toggle wiring${R} ${D}(env HEIMDALL_LAZY_LADDER — read in build_coder_cmd)${R}\n"
+  printf "  ${D}  HEIMDALL_LAZY_LADDER=1  -> ladder ON : prepends %s lines of write-time minimalism ruleset to the coder prompt (real byte difference).${R}\n" "$ON_LINES"
+  printf "  ${D}  HEIMDALL_LAZY_LADDER=0  -> ladder OFF: plain coder prompt, no ladder text.${R}\n"
+  printf "  ${D}  The var is ALSO exported to the run, so a coder-agent prompt that reads it sees the same contract.${R}\n\n"
+
+  # Emit the JSONL SCHEMA sample: one record per mode (on + off), each carrying the
+  # 3 headline fields. Values are null — dry measures NOTHING, and a null is honest
+  # (never a fabricated number). This is the schema consumers/tests read.
+  : > "$SCHEMA_SAMPLE"
+  for mode in on off; do
+    [ "$mode" = "on" ] && ld=1 || ld=0
+    jq -c -n \
+      --arg task "<TASK_ID>" --arg mode "$mode" --argjson ladder "$ld" \
+      '{ts:"<ISO-8601-UTC>", metric:"ponytail-ab", task:$task, mode:$mode, ladder:($ladder==1),
+        loc:null, tokens:null, acceptance_pass:null,
+        verify:{passed:null, total:null}, run_mode:"dry",
+        _note:"schema sample — loc/tokens/acceptance_pass are measured only under --live"}' >> "$SCHEMA_SAMPLE"
+  done
+  printf "  ${B}JSONL schema${R} ${D}(one object per task × mode; 3 headline fields: loc, tokens, acceptance_pass)${R}\n"
+  printf "  ${D}  written to: %s${R}\n" "$SCHEMA_SAMPLE"
+  while IFS= read -r line; do printf "  %s\n" "$line"; done < "$SCHEMA_SAMPLE"
+  printf "\n"
+
+  printf "  ${B}Capture plan${R} ${D}(what --live WOULD measure per task × ladder mode)${R}\n"
+  printf "  ${D}  loc              git diff --numstat against the task's baseline commit (added+deleted)${R}\n"
+  printf "  ${D}  tokens           bin/heimdall-tokens json -  ->  .total_tokens  (the REUSED meter)${R}\n"
+  printf "  ${D}  acceptance_pass  run the task's verify[] in the workspace; true iff ALL pass (the oracle gate)${R}\n\n"
+
+  # n=0 summary from an EMPTY set — proves the blank path (never a made-up rate).
+  EMPTY_TMP="$(mktemp)"; : > "$EMPTY_TMP"
+  print_summary "$EMPTY_TMP"
+  rm -f "$EMPTY_TMP"
+
+  printf "  ${D}Dry run complete. No workspaces created, no API calls, no agents spawned.${R}\n"
+  printf "  ${D}Run with ${C}--live${D} to actually measure (this spends API tokens).${R}\n\n"
+  exit 0
+fi
+
+# ── LIVE: prerequisites ───────────────────────────────────────────────────────
+command -v claude >/dev/null 2>&1 || { printf "  ${P}x${R} claude CLI not found (needed for --live)\n" >&2; exit 2; }
+[ -x "$TOK" ] || { printf "  ${P}x${R} token meter not executable: %s\n" "$TOK" >&2; exit 2; }
+mkdir -p "$OUT_DIR"
+: > "$RESULTS_JSONL"
+
+WORKSPACES=()
+cleanup_ws() { local w; for w in "${WORKSPACES[@]:-}"; do [ -n "$w" ] && rm -rf "$w"; done; }
+trap cleanup_ws EXIT
+
+printf "  ${B}Live A/B${R} ${D}— %s task(s), each run ladder ON and ladder OFF${R}\n\n" "${#SELECTED[@]}"
+printf "  %-28s  %-4s  %8s  %10s  %s\n" "TASK" "MODE" "LOC" "TOKENS" "ACCEPT"
+printf "  %-28s  %-4s  %8s  %10s  %s\n" "----------------------------" "----" "--------" "----------" "------"
+for f in "${SELECTED[@]}"; do
+  id="$(jq -r '.id' "$f")"
+  for ld in 1 0; do
+    run_one_live "$f" "$ld" || continue
+    [ "$ld" = "1" ] && mlabel="on" || mlabel="off"
+    last="$(tail -1 "$RESULTS_JSONL")"
+    printf "  %-28s  %-4s  %8s  %10s  %s\n" \
+      "$id" "$mlabel" \
+      "$(printf '%s' "$last" | jq -r '.loc')" \
+      "$(printf '%s' "$last" | jq -r '.tokens')" \
+      "$(printf '%s' "$last" | jq -r 'if .acceptance_pass then "PASS" else "FAIL" end')"
+  done
+done
+
+printf "\n  ${D}wrote %s  (%s records)${R}\n" "$RESULTS_JSONL" "$(wc -l < "$RESULTS_JSONL" | tr -d ' ')"
+print_summary "$RESULTS_JSONL"
+exit 0
