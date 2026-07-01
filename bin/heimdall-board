@@ -1,0 +1,469 @@
+#!/usr/bin/env bash
+# heimdall-board — the live TEAM WALL: one screenshot-worthy board that JOINs the
+# whole coordination substrate into a single presence × claims × tasks × gate view.
+#
+# It answers, at a glance: "who is on the team right now, what surface are they in,
+# which task are they carrying, and is it PROVEN, BLOCKED, or still working?"
+#
+# REUSE, not rebuild — every number is READ from a store that already computes it:
+#   - heimdall-who team --json  → the presence roster JOINed with each dev's REAL
+#                                 gate verdict (activity × verdicts, by HAID).
+#   - heimdall-claim list       → the live surface claims (who holds what).
+#   - heimdall-task list        → the task records (title / state / assignee).
+#   - .planning/reuse/*.json    → the reuse-metric scores (for --leaderboard).
+# The board never re-derives a store's schema; it renders the JOIN.
+#
+# HONEST RECONCILIATION: the git-ledger (claims) and the presence roster (activity)
+# are TWO substrates that can disagree. The board never asserts a false unified
+# state — a dev who HOLDS a claim but is NOT currently broadcasting presence is
+# shown as a "stale claim", surfaced separately, not silently merged into "online".
+#
+# DEGRADES: solo (no teammates broadcasting) → the board shows just you, still
+# useful. Missing presence/verdict/reuse → that column reads "—", never a fake.
+#
+# The truecolor box style is borrowed from bin/summary-card (same palette + border
+# family). A pipe / CI / NO_COLOR / --plain strips ALL ANSI → clean plain text.
+#
+# Usage:
+#   heimdall-board                 the live team wall (presence × claim × task × gate)
+#   heimdall-board --leaderboard   the gate-pass-rate + reuse ranking per teammate
+#   heimdall-board --json          the merged board model as JSON (no rendering)
+#   heimdall-board --plain         force plain text (no ANSI), even on a tty
+#   -h, --help
+#
+# Exit: 0 always (informational — a board never blocks); 2 usage error.
+set -uo pipefail
+
+SELF="$0"
+if command -v readlink >/dev/null 2>&1; then
+  SELF="$(readlink -f "$0" 2>/dev/null || readlink "$0" 2>/dev/null || echo "$0")"
+fi
+BIN_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+PLUGIN_DIR="$(cd "$BIN_DIR/.." && pwd)"
+PLANNING_DIR="${HEIMDALL_PLANNING_DIR:-$PLUGIN_DIR/.planning}"
+REUSE_DIR="$PLANNING_DIR/reuse"
+WHO_BIN="$BIN_DIR/heimdall-who"
+CLAIM_BIN="$BIN_DIR/heimdall-claim"
+TASK_BIN="$BIN_DIR/heimdall-task"
+HAID_BIN="$BIN_DIR/heimdall-haid"
+SIGIL_PY="$PLUGIN_DIR/sentinels/hmd-sigil.py"
+
+command -v jq >/dev/null 2>&1 || { echo "error: jq is required" >&2; exit 2; }
+PY="$(command -v python3 || command -v python || true)"
+[ -n "$PY" ] || { echo "error: python3 is required" >&2; exit 2; }
+
+usage() { sed -n '2,38p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+MODE="board"
+PLAIN=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help)     usage; exit 0 ;;
+    --leaderboard) MODE="leaderboard"; shift ;;
+    --json)        MODE="json"; shift ;;
+    --plain)       PLAIN=1; shift ;;
+    *) echo "error: unknown argument: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+# ── strict-tty colour gate (mirrors summary-card's receipt): a pipe / CI / NO_COLOR
+# / --plain → zero ANSI. Truecolor when the terminal advertises it. ─────────────
+COLOR=0
+if [ "$PLAIN" -eq 0 ] && [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ -z "${CI:-}" ]; then
+  COLOR=1
+fi
+TRUECOLOR=0
+if [ "$COLOR" -eq 1 ]; then
+  case "${COLORTERM:-}:${TERM:-}" in
+    truecolor:*|24bit:*|*:*256color*) TRUECOLOR=1 ;;
+  esac
+fi
+
+# ── Gather the substrate (all read-only; each store is TTL-filtered by its bin) ─
+TEAM_JSON='[]'
+if [ -x "$WHO_BIN" ]; then
+  TEAM_JSON="$(HEIMDALL_PLANNING_DIR="$PLANNING_DIR" "$WHO_BIN" team --json 2>/dev/null || echo '[]')"
+fi
+[ -n "$TEAM_JSON" ] || TEAM_JSON='[]'
+
+CLAIMS_JSON='[]'
+if [ -x "$CLAIM_BIN" ]; then
+  CLAIMS_JSON="$(HEIMDALL_PLANNING_DIR="$PLANNING_DIR" "$CLAIM_BIN" list --json 2>/dev/null || echo '[]')"
+fi
+[ -n "$CLAIMS_JSON" ] || CLAIMS_JSON='[]'
+
+TASKS_JSON='[]'
+if [ -x "$TASK_BIN" ]; then
+  TASKS_JSON="$(HEIMDALL_PLANNING_DIR="$PLANNING_DIR" "$TASK_BIN" list --json 2>/dev/null || echo '[]')"
+fi
+[ -n "$TASKS_JSON" ] || TASKS_JSON='[]'
+
+# Reuse records → a compact [{task, reuse_pct}] list (leaderboard join source).
+REUSE_JSON='[]'
+if [ -d "$REUSE_DIR" ]; then
+  REUSE_JSON="$(jq -s '[.[] | {task: (.task // ""), reuse_pct: .reuse_pct}]' "$REUSE_DIR"/*.json 2>/dev/null || echo '[]')"
+fi
+[ -n "$REUSE_JSON" ] || REUSE_JSON='[]'
+
+# Current instance HAID (best-effort) — used ONLY to render a useful solo board
+# ("just you") when nobody else is broadcasting.
+CURRENT_HAID=""
+if [ -n "${HEIMDALL_HAID:-}" ]; then
+  CURRENT_HAID="$HEIMDALL_HAID"
+elif [ -x "$HAID_BIN" ]; then
+  CURRENT_HAID="$("$HAID_BIN" current 2>/dev/null || true)"
+fi
+
+# ── Sigil resolution: for each human seed, the bare (ANSI-stripped) glyph from
+# sentinels/hmd-sigil.py. Colour is applied by the renderer, so the plain path
+# stays ANSI-clean. Precomputed here (bash) → passed to the renderer as a map. ──
+sigil_glyph() {
+  local seed="$1" g=""
+  if [ -n "$PY" ] && [ -f "$SIGIL_PY" ]; then
+    g="$("$PY" "$SIGIL_PY" --seed "$seed" --glyph 2>/dev/null | head -1 \
+        | sed -E $'s/\033\\[[0-9;]*m//g' | tr -d '[:space:]')"
+  fi
+  [ -n "$g" ] || g="◉"
+  printf '%s' "$g"
+}
+
+HUMANS="$(printf '%s\n%s\n' "$TEAM_JSON" "$CLAIMS_JSON" \
+  | jq -r -s 'add // [] | [.[].human] | unique | .[]' 2>/dev/null || true)"
+if [ -n "$CURRENT_HAID" ]; then
+  CUR_HUMAN="$(printf '%s' "$CURRENT_HAID" | sed -E 's/^haid:([a-z0-9-]+)\..*/\1/')"
+  HUMANS="$(printf '%s\n%s\n' "$HUMANS" "$CUR_HUMAN")"
+fi
+SIGILS_JSON='{}'
+while IFS= read -r hu; do
+  [ -n "$hu" ] || continue
+  g="$(sigil_glyph "$hu")"
+  SIGILS_JSON="$(printf '%s' "$SIGILS_JSON" | jq -c --arg h "$hu" --arg g "$g" '. + {($h): $g}')"
+done <<EOF
+$(printf '%s\n' "$HUMANS" | sort -u)
+EOF
+
+# ── Render (python3): JOIN the substrate, draw the box in summary-card's style ──
+TEAM_JSON="$TEAM_JSON" CLAIMS_JSON="$CLAIMS_JSON" TASKS_JSON="$TASKS_JSON" \
+REUSE_JSON="$REUSE_JSON" SIGILS_JSON="$SIGILS_JSON" \
+BOARD_MODE="$MODE" BOARD_COLOR="$COLOR" BOARD_TRUECOLOR="$TRUECOLOR" \
+CURRENT_HAID="$CURRENT_HAID" \
+"$PY" - <<'PYEOF'
+import json, os, sys
+
+def loadenv(k):
+    try:
+        return json.loads(os.environ.get(k, "") or "null")
+    except Exception:
+        return None
+
+team    = loadenv("TEAM_JSON")   or []
+claims  = loadenv("CLAIMS_JSON") or []
+tasks   = loadenv("TASKS_JSON")  or []
+reuse   = loadenv("REUSE_JSON")  or []
+sigils  = loadenv("SIGILS_JSON") or {}
+mode    = os.environ.get("BOARD_MODE", "board")
+color   = os.environ.get("BOARD_COLOR") == "1"
+truecol = os.environ.get("BOARD_TRUECOLOR") == "1"
+cur_haid = os.environ.get("CURRENT_HAID", "") or ""
+
+# ── palette (mirrors bin/summary-card) ───────────────────────────────────────
+if color and truecol:
+    P='\033[38;2;224;86;160m'; C='\033[38;2;0;212;255m'; G='\033[38;2;78;204;163m'
+    W='\033[38;2;255;200;80m'; RED='\033[38;2;255;95;110m'; D='\033[38;2;120;120;140m'
+    B='\033[1m'; R='\033[0m'
+elif color:
+    P='\033[35m'; C='\033[36m'; G='\033[32m'; W='\033[33m'; RED='\033[31m'; D='\033[90m'
+    B='\033[1m'; R='\033[0m'
+else:
+    P=C=G=W=RED=D=B=R=''
+
+def human_of(haid):
+    if not haid:
+        return "?"
+    h = haid
+    if h.startswith("haid:"):
+        h = h[5:]
+    return h.split(".")[0].split("/")[0] or "?"
+
+def clean_surface(s):
+    if not s:
+        return ""
+    # a glob like auth/** → auth/ ; keep file#symbol intact (it's the useful part)
+    if s.endswith("/**"):
+        return s[:-2]
+    return s
+
+def trunc(s, n):
+    s = s if s is not None else ""
+    if len(s) <= n:
+        return s
+    if n <= 1:
+        return s[:n]
+    return s[:n-1] + "…"
+
+# ── build per-HAID index of each substrate ──────────────────────────────────
+team_by = {t.get("haid"): t for t in team if t.get("haid")}
+claims_by = {}
+for c in claims:
+    if c.get("haid"):
+        claims_by[c["haid"]] = c
+# tasks grouped by assignee; pick the "current" one by board-state priority.
+STATE_PRI = {"doing": 0, "review": 1, "todo": 2, "done": 3}
+tasks_by = {}
+for t in tasks:
+    a = t.get("assignee_haid")
+    if not a:
+        continue
+    tasks_by.setdefault(a, []).append(t)
+def pick_task(haid):
+    lst = tasks_by.get(haid) or []
+    if not lst:
+        return None
+    return sorted(lst, key=lambda x: (STATE_PRI.get(x.get("state"), 9),
+                                      x.get("updated_at", "")))[0]
+
+# reuse: best (max) non-null reuse_pct for a given task label.
+def reuse_for(labels):
+    best = None
+    for r in reuse:
+        rt = r.get("task") or ""
+        rp = r.get("reuse_pct")
+        if rp is None:
+            continue
+        if rt and rt in labels:
+            try:
+                v = float(rp)
+            except Exception:
+                continue
+            if best is None or v > best:
+                best = v
+    return best
+
+# union of HAIDs across presence + claims (the roster).
+haids = []
+for h in list(team_by.keys()) + list(claims_by.keys()):
+    if h and h not in haids:
+        haids.append(h)
+# solo fallback: nobody broadcasting → show just the current instance ("you").
+solo_you = False
+if not haids and cur_haid:
+    haids = [cur_haid]
+    solo_you = True
+
+rows = []
+for haid in haids:
+    t = team_by.get(haid)
+    c = claims_by.get(haid)
+    present = t is not None
+    human = human_of(haid)
+    agents = (t or {}).get("agents_running", 1) if present else None
+    # surface: live activity first, else the held claim.
+    surface = ""
+    if present:
+        ft = t.get("files_touched") or []
+        if ft:
+            surface = clean_surface(ft[0])
+    claim_surface = ""
+    if c:
+        cs = c.get("claimed_surfaces") or []
+        if cs:
+            claim_surface = cs[0]
+    if not surface:
+        surface = claim_surface
+    # task: assigned task record (board-state priority), else the activity label.
+    task_rec = pick_task(haid)
+    if task_rec:
+        task_label = task_rec.get("task_id") or task_rec.get("title") or "?"
+        task_state = task_rec.get("state") or "?"
+        task_gate = task_rec.get("gate") or "pending"
+    else:
+        task_label = (t or {}).get("active_task") if present else None
+        task_state = None
+        task_gate = None
+    # verdict: the REAL gate verdict from the presence JOIN (never fabricated).
+    gate = (t or {}).get("gate") or {}
+    verdict = gate.get("verdict") if present else None
+    gp = gate.get("gates_passed")
+    gt = gate.get("gates_total")
+    failing = gate.get("failing_gates") or []
+    loc = gate.get("loc")
+    # stale: holds a claim but is NOT currently broadcasting presence.
+    stale = (not present) and (c is not None)
+    # task label set (for reuse join): the activity task + the task title.
+    labels = set()
+    if present and t.get("active_task"):
+        labels.add(t.get("active_task"))
+    if task_rec and task_rec.get("title"):
+        labels.add(task_rec.get("title"))
+    rows.append(dict(haid=haid, human=human, present=present, agents=agents,
+                     surface=surface, claim_surface=claim_surface,
+                     task_label=task_label, task_state=task_state,
+                     task_gate=task_gate, verdict=verdict, gp=gp, gt=gt,
+                     failing=failing, loc=loc, stale=stale, labels=labels,
+                     reuse=reuse_for(labels)))
+
+# stable order: present-first, then by human name.
+rows.sort(key=lambda x: (0 if x["present"] else 1, x["human"]))
+
+# ── JSON mode: emit the merged model, no rendering ───────────────────────────
+if mode == "json":
+    out = []
+    for r in rows:
+        rr = dict(r); rr["labels"] = sorted(r["labels"])
+        out.append(rr)
+    print(json.dumps(out, indent=2))
+    sys.exit(0)
+
+# ── box drawing (summary-card receipt border family) ─────────────────────────
+INNER = 68  # visible cols between the ║ borders
+
+def hfill(n, ch="═"):
+    return ch * max(1, n)
+
+def box_top(title, right):
+    # total visible width must equal a content row (INNER + 3). Fixed chars in
+    # "╔═ <title> <fill> <right> ═╗" total 8; the fill absorbs the remainder.
+    mid = (INNER + 3) - 8 - len(title) - len(right)
+    if color:
+        return f"{D}╔═ {B}{P}{title}{R}{D} {hfill(mid)} {R}{C}{right}{R}{D} ═╗{R}"
+    else:
+        return f"╔═ {title} {hfill(mid)} {right} ═╗"
+
+def box_bot(footer):
+    # "╚═ <footer> <fill>╝" fixed chars total 5.
+    mid = (INNER + 3) - 5 - len(footer)
+    if color:
+        return f"{D}╚═ {C}{footer}{R}{D} {hfill(mid)}╝{R}"
+    else:
+        return f"╚═ {footer} {hfill(mid)}╝"
+
+def box_row(plain, colored):
+    pad = INNER - len(plain)
+    if pad < 0:
+        pad = 0
+    if color:
+        return f"{D}║{R} {colored}{' ' * pad}{D}║{R}"
+    else:
+        return f"║ {plain}{' ' * pad}║"
+
+def box_sep():
+    if color:
+        return f"{D}╟{'─' * (INNER + 1)}╢{R}"
+    else:
+        return f"╟{'─' * (INNER + 1)}╢"
+
+def sig(human):
+    g = sigils.get(human) or "◉"
+    return g
+
+lines = []
+
+if mode == "board":
+    online = sum(1 for r in rows if r["present"])
+    right = f"◈ {online} online"
+    lines.append("")
+    lines.append(box_top("HEIMDALL TEAM BOARD", right))
+    if not rows:
+        p = "(no teammates broadcasting — solo, and no local identity)"
+        lines.append(box_row(p, f"{D}{p}{R}"))
+    for r in rows:
+        # ── field widths: sigil(1)+sp + human(8)+sp + surface(26)+sp + task(15)+sp + verdict(rest)
+        g = sig(r["human"])
+        human_p = trunc(r["human"], 8).ljust(8)
+        surf_p = trunc(r["surface"] or "—", 26).ljust(26)
+        if r["task_label"]:
+            tl = trunc(r["task_label"], 15)
+            if r["task_state"]:
+                tl = trunc(f"{r['task_label']}[{r['task_state']}]", 15)
+        else:
+            tl = "—"
+        task_p = tl.ljust(15)
+        # verdict glyph — the REAL gate state, honest labels.
+        if not r["present"] and r["stale"]:
+            vlabel, vcol = "stale⚠", W
+        elif r["verdict"] == "PROVEN":
+            vlabel, vcol = "PROVEN ✓", G
+        elif r["verdict"] == "BLOCKED":
+            vlabel, vcol = "BLOCKED ✗", RED
+        elif r["present"]:
+            vlabel, vcol = "working ⟳", C
+        else:
+            vlabel, vcol = "—", D
+        # plain assembly
+        plain = f"{g} {human_p} {surf_p} {task_p} {vlabel}"
+        # colored assembly (same spacing/lengths → identical visible width)
+        gc = f"{C}{g}{R}" if r["present"] else f"{D}{g}{R}"
+        human_c = f"{B}{human_p}{R}"
+        surf_c = f"{D}{surf_p}{R}"
+        task_c = f"{W}{task_p}{R}"
+        vlabel_c = f"{vcol}{vlabel}{R}"
+        colored = f"{gc} {human_c} {surf_c} {task_c} {vlabel_c}"
+        lines.append(box_row(plain, colored))
+
+    # ── reconciliation footer: claims held with NO live presence (stale) ──
+    stales = [r for r in rows if r["stale"]]
+    if stales:
+        lines.append(box_sep())
+        for r in stales:
+            surf = r["claim_surface"] or r["surface"] or "?"
+            msg = f"⚠ {r['human']} holds {trunc(surf, 40)} but is not present (stale claim)"
+            lines.append(box_row(trunc(msg, INNER), f"{W}{trunc(msg, INNER)}{R}"))
+    lines.append(box_bot("runheimdall.dev/board"))
+    lines.append("")
+
+elif mode == "leaderboard":
+    # rank by (gate pass-rate desc, reuse desc). Only teammates with a REAL
+    # verdict get a pass-rate; the rest rank last with "—" (never a fake 0/100).
+    def pass_rate(r):
+        if r["verdict"] in ("PROVEN", "BLOCKED") and r["gt"]:
+            try:
+                return r["gp"] / r["gt"]
+            except Exception:
+                return None
+        return None
+    lb = []
+    for r in rows:
+        pr = pass_rate(r)
+        lb.append(dict(human=r["human"], present=r["present"], pr=pr,
+                       verdict=r["verdict"], reuse=r["reuse"], gp=r["gp"], gt=r["gt"]))
+    lb.sort(key=lambda x: (-(x["pr"] if x["pr"] is not None else -1),
+                           -(x["reuse"] if x["reuse"] is not None else -1),
+                           x["human"]))
+    lines.append("")
+    lines.append(box_top("HEIMDALL TEAM LEADERBOARD", "◈ gate × reuse"))
+    if not lb:
+        p = "(no teammates with published verdicts yet)"
+        lines.append(box_row(p, f"{D}{p}{R}"))
+    rank = 0
+    for x in lb:
+        rank += 1
+        g = sig(x["human"])
+        rank_p = f"{rank}.".ljust(3)
+        human_p = trunc(x["human"], 10).ljust(10)
+        if x["pr"] is not None:
+            pr_txt = f"{round(x['pr']*100)}% ({x['gp']}/{x['gt']})"
+            pr_col = G if x["pr"] >= 1.0 else (RED if x["pr"] < 0.5 else W)
+        else:
+            pr_txt = "—"
+            pr_col = D
+        pr_p = trunc(pr_txt, 14).ljust(14)
+        if x["reuse"] is not None:
+            ru_txt = f"reuse {round(x['reuse']*100)}%"
+            ru_col = C
+        else:
+            ru_txt = "reuse —"
+            ru_col = D
+        ru_p = trunc(ru_txt, 12).ljust(12)
+        vd = x["verdict"] or ("working" if x["present"] else "—")
+        vsym = "✓" if x["verdict"] == "PROVEN" else ("✗" if x["verdict"] == "BLOCKED" else "·")
+        vd_txt = f"{vsym} {vd}"
+        plain = f"{rank_p} {g} {human_p} {pr_p} {ru_p} {vd_txt}"
+        colored = (f"{D}{rank_p}{R} {C}{g}{R} {B}{human_p}{R} "
+                   f"{pr_col}{pr_p}{R} {ru_col}{ru_p}{R} {D}{vd_txt}{R}")
+        lines.append(box_row(plain, colored))
+    lines.append(box_bot("runheimdall.dev/board"))
+    lines.append("")
+
+sys.stdout.write("\n".join(lines) + "\n")
+PYEOF
+exit 0

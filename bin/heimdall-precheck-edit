@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# heimdall-precheck-edit — conflict PRE-WARNING for a file about to be edited.
+#
+# The cheapest possible collision PREVENTION: before an edit lands, ask the
+# git-backed claim ledger (bin/heimdall-claim) whether a LIVE teammate already
+# holds the file (or a symbol in it). If so, print one advisory line —
+#   "⚠ sarah's agent holds auth/login.tsx#handleSubmit"
+# — so the human sees the imminent stomp BEFORE it happens. That is the whole job.
+#
+# COOPERATIVE, NOT A LOCK — sold as PREVENTION, never PROTECTION. This is a
+# warning, not a wall. A determined writer edits anyway: this script NEVER hard-
+# blocks a human (it does not emit the exit-2 "deny" a PreToolUse hook uses), it
+# only surfaces who else is in the file. The claim ledger it reads is a
+# cooperating-agents convention, not a security boundary — real enforcement is
+# GitHub branch protection + CODEOWNERS, not this.
+#
+# CHEAP — a single local `heimdall-claim check` (a JSON/SQLite-free ledger read
+# over .planning/ledger/claims/). No network, no model, no git fetch.
+#
+# INPUT (either form):
+#   heimdall-precheck-edit <file>            explicit path
+#   echo '<PreToolUse-json>' | heimdall-precheck-edit
+#                                            reads .tool_input.file_path (the shape
+#                                            a Claude Code PreToolUse(Edit) hook
+#                                            feeds on stdin). --file <p> also works.
+#
+# EXIT (advisory — safe to wire into a hook; none of these blocks a human):
+#   0  the file is free, OR nothing to check, OR the ledger is unavailable
+#      (fail-OPEN — a tool hiccup must never stop an edit)
+#   3  a live teammate holds the file/symbol (warning printed to stderr). A
+#      PreToolUse hook treats a non-2 nonzero as NON-blocking: the warning shows,
+#      the human proceeds. Exit 3 mirrors heimdall-claim check's collision code.
+#
+# -h, --help
+set -euo pipefail
+
+SELF="$0"
+if command -v readlink >/dev/null 2>&1; then
+  SELF="$(readlink -f "$0" 2>/dev/null || readlink "$0" 2>/dev/null || echo "$0")"
+fi
+BIN_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+CLAIM_BIN="$BIN_DIR/heimdall-claim"
+
+usage() { sed -n '2,45p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+FILE=""
+STDIN_ALLOWED=1
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --file) FILE="${2:?--file needs a path}"; shift 2; STDIN_ALLOWED=0 ;;
+    -*) echo "error: unknown flag: $1" >&2; exit 2 ;;
+    *)  FILE="$1"; shift; STDIN_ALLOWED=0 ;;
+  esac
+done
+
+# No explicit path → try the PreToolUse JSON on stdin (only if piped, never block
+# on an interactive tty waiting for input).
+if [ -z "$FILE" ] && [ "$STDIN_ALLOWED" -eq 1 ] && [ ! -t 0 ]; then
+  INPUT="$(cat 2>/dev/null || true)"
+  if [ -n "$INPUT" ] && command -v jq >/dev/null 2>&1; then
+    FILE="$(printf '%s' "$INPUT" | jq -r '.tool_input.file_path // .tool_input.path // empty' 2>/dev/null || true)"
+  fi
+fi
+
+# Nothing to check → advisory no-op (fail-open).
+[ -n "$FILE" ] || exit 0
+
+# The ledger read must be cheap and non-fatal. If the claim bin or jq is missing,
+# fail OPEN: a precheck can never be the reason an edit is stopped.
+[ -x "$CLAIM_BIN" ] || exit 0
+command -v jq >/dev/null 2>&1 || exit 0
+
+# Normalize a repo-relative surface: heimdall-claim's overlap engine compares
+# ledger surface strings, which are stored repo-relative (e.g. auth/login.tsx).
+# Strip a leading ./; an absolute path is passed through (the engine still matches
+# on suffix nesting for a literal claim, and a warning is better than silence).
+SURFACE="${FILE#./}"
+
+set +e
+OUT="$("$CLAIM_BIN" check "$SURFACE" 2>&1)"
+RC=$?
+set -e
+
+# rc 3 = a live teammate holds an overlapping surface → warn (never block).
+if [ "$RC" -eq 3 ]; then
+  # heimdall-claim check reports lines like:
+  #   '<req>' overlaps '<held>' held by <haid> (human <human>, task <task>)
+  # Reshape each into: "⚠ <human>'s agent holds <held>".
+  printed=0
+  while IFS= read -r line; do
+    case "$line" in
+      *"overlaps"*"held by"*)
+        held="$(printf '%s' "$line" | sed -E "s/.*overlaps '([^']*)' held by .*/\1/")"
+        human="$(printf '%s' "$line" | sed -E 's/.*\(human ([^,]*),.*/\1/')"
+        [ -n "$human" ] || human="another agent"
+        [ -n "$held" ] || held="$SURFACE"
+        printf "⚠ %s's agent holds %s\n" "$human" "$held" >&2
+        printed=1 ;;
+    esac
+  done <<EOF
+$OUT
+EOF
+  # Defensive: if the format ever changes and nothing parsed, still emit a warning
+  # (advisory value over silence) rather than swallow the collision.
+  if [ "$printed" -eq 0 ]; then
+    printf "⚠ a live teammate holds a surface overlapping %s\n" "$SURFACE" >&2
+  fi
+  printf "  (advisory — this warns, it does not block. A determined writer proceeds.)\n" >&2
+  exit 3
+fi
+
+# rc 0 = clear. Any other rc (usage/IO) → fail-open. Either way, allow the edit.
+exit 0
