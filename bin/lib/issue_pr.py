@@ -30,12 +30,26 @@
 #   silently. A PR a human approves is a PROVEN fix: its body renders the runnable
 #   evidence (the recorded real exits), not a claim.
 #
-# ── THE AGENT NEVER PUSHES ─────────────────────────────────────────────────────
-#   RJ holds the GitHub creds. open_pr builds the PR *artifact* — the branch name,
-#   the rendered body, and the `gh pr create` command shape — and persists it into
-#   the queue store (in_flight[id].pr). The live `gh pr create` runs with RJ's
-#   creds at RUNTIME. In tests a fake connector / mock gh stands in — no live
-#   creds, no network, no real PR.
+# ── THE AGENT NEVER PUSHES WITH RJ's CREDS (scoped PR-only bot token) ──────────
+#   HARD CONSTRAINT (project-wide): the agent NEVER pushes/publishes with RJ's
+#   personal creds; RJ holds all credentials. open_pr builds the PR *artifact* —
+#   the branch name (ALWAYS heimdall/*), the rendered body, and the `gh pr create`
+#   command shape — and persists it into the queue store (in_flight[id].pr).
+#
+#   The SOLE production PR-open path is the SCOPED BOT-TOKEN runner (gh_bot_runner):
+#   it authenticates `gh` as a bot identity read from env HEIMDALL_PR_BOT_TOKEN — a
+#   GitHub App installation token / fine-grained PAT scoped to contents:write on
+#   refs/heads/heimdall/* + pull_requests:write, with NO push to main and NO merge.
+#   That scope is enforced SERVER-SIDE by GitHub: the token physically cannot push
+#   to main nor merge a PR. This is how an unattended PR-open reconciles with "RJ
+#   holds the creds" — the bot (NOT RJ's personal creds) opens a PR from a
+#   heimdall/* branch, and a HUMAN merges.
+#
+#   The token is passed to `gh` via the GH_TOKEN child-env var — NEVER on the argv
+#   (which is recorded/ps-visible) and NEVER printed/logged (no-secret-logging
+#   discipline). When HEIMDALL_PR_BOT_TOKEN is ABSENT we fall back to record-only
+#   (build the artifact, push NOTHING) — we NEVER push with personal creds. In
+#   tests a fake connector / mock gh stands in — no live creds, no network, no PR.
 #
 # This is a LIBRARY (pure-ish orchestration + a thin connector/gh seam). The bash
 # CLI (bin/heimdall-issue-pr) owns argv + stdout shape.
@@ -304,11 +318,13 @@ def open_pr(issue, record, repo=None, base="main", gh_runner=None):
                 body payload). open_pr ASSERTS record.evidence.all_passed is True.
     repo:       the repo whose queue store tracks the issue (default: cwd's repo).
     base:       the PR base branch (default 'main').
-    gh_runner:  callable(argv:list) -> dict invoked to actually create the PR. In
-                production this is the `gh pr create` runner that uses RJ's creds.
-                In tests a mock stands in — NO live gh, NO network, NO real PR.
-                Defaults to a runner that records the create-command WITHOUT
-                executing it (the agent never pushes; RJ's creds open it later).
+    gh_runner:  callable(argv:list) -> dict invoked to actually create the PR.
+                Defaults to gh_bot_runner: the SCOPED PR-only bot-token runner
+                (HEIMDALL_PR_BOT_TOKEN — contents:write on refs/heads/heimdall/* +
+                pull_requests:write, NO push to main, NO merge). With no bot token
+                present it degrades to record-only (build the artifact, push
+                NOTHING) — the agent NEVER pushes with RJ's personal creds. In tests
+                a mock stands in — NO live gh, NO network, NO real PR.
 
     This function does NOT merge (no merge verb exists), does NOT close the source
     issue, and does NOT call post_resolution. It opens + stops. Full stop. The
@@ -337,9 +353,10 @@ def open_pr(issue, record, repo=None, base="main", gh_runner=None):
     body_file = _write_body_file(issue_id, body, repo)
     create_command = build_gh_create_command(issue, title, body_file, base=base)
 
-    # open the PR via the runner (mock in tests; RJ's creds at runtime). The
-    # default runner does NOT push — it records the create-command shape only.
-    runner = gh_runner or _default_gh_runner
+    # open the PR via the runner (mock in tests; the scoped bot token at runtime).
+    # Default = gh_bot_runner: pushes the heimdall/* branch + opens the PR under the
+    # bot identity, or (no bot token) records the shape only — NEVER personal creds.
+    runner = gh_runner or gh_bot_runner
     gh_result = runner(create_command)
 
     # mark the issue PR_OPEN in the queue store. We do NOT mark it resolved and we
@@ -378,24 +395,170 @@ def _default_gh_runner(create_command):
     }
 
 
-def live_gh_runner(create_command):
-    """A runner that DOES execute `gh pr create` (for RJ's runtime, where the creds
-    live). Captures gh's stdout (the PR url) + real exit code. Tests NEVER use this
-    — they inject a mock. Returns { ok, url, exit, stdout }."""
+def gh_bot_runner(argv):
+    """The PR-ONLY SCOPED BOT-TOKEN runner — the SOLE production PR-open path (the
+    agent NEVER pushes with RJ's personal creds). It authenticates `gh` as a bot
+    identity read from env HEIMDALL_PR_BOT_TOKEN: a GitHub App installation token /
+    fine-grained PAT scoped to contents:write on refs/heads/heimdall/* +
+    pull_requests:write — NO push to main, NO merge. That scope is enforced
+    SERVER-SIDE by GitHub, so this token physically cannot push to main nor merge a
+    PR; an unattended PR-open reconciles with "RJ holds the creds" (the bot opens the
+    PR from a heimdall/* branch; a human merges).
+
+    The token is passed to `gh` via the GH_TOKEN child-env var — NEVER on the argv
+    (which is recorded/ps-visible) and NEVER printed/logged. Any inherited personal
+    GITHUB_TOKEN is scrubbed so ONLY the scoped bot identity is ever used.
+
+    When HEIMDALL_PR_BOT_TOKEN is ABSENT we fall back to the record-only default —
+    we NEVER push with personal creds. Returns { ok, pushed, url, exit, command,
+    identity }; `command` is the shlex-joined argv WITHOUT the token (the token
+    lives only in the child env)."""
+    token = os.environ.get("HEIMDALL_PR_BOT_TOKEN")
+    if not token:
+        # no scoped bot identity available -> NEVER fall through to personal creds.
+        return _default_gh_runner(argv)
     proc = subprocess.run(
-        create_command,
+        argv,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        env=_bot_env(token),
     )
-    url = (proc.stdout or "").strip().splitlines()
+    out = (proc.stdout or "").strip().splitlines()
     return {
         "ok": proc.returncode == 0,
         "pushed": proc.returncode == 0,
-        "url": url[-1] if url else None,
+        "url": out[-1] if out else None,
         "exit": proc.returncode,
-        "stdout": proc.stdout,
-        "command": " ".join(shlex.quote(t) for t in create_command),
+        # NB: the token is NOT here — it travelled via GH_TOKEN in the child env only.
+        "command": " ".join(shlex.quote(t) for t in argv),
+        "identity": "heimdall-pr-bot",
+    }
+
+
+def _bot_env(token):
+    """Build the child-process env for the scoped bot identity: inject the token as
+    GH_TOKEN (so `gh` authenticates as the bot), and SCRUB any inherited personal
+    GITHUB_TOKEN plus the raw HEIMDALL_PR_BOT_TOKEN so the personal creds can never
+    be what pushes and the child can never echo the raw token. The token lives in
+    the ENV only, never on argv — so it is never logged/recorded."""
+    env = dict(os.environ)
+    env.pop("GITHUB_TOKEN", None)
+    env.pop("HEIMDALL_PR_BOT_TOKEN", None)
+    env["GH_TOKEN"] = token
+    return env
+
+
+# ── post_receipt: the "merged AND proven" artifact (ATTESTATION-SOURCED) ───────
+
+
+def build_receipt_body(record):
+    """Render the 'merged AND proven' receipt: the SI-2 attestation VERDICT block a
+    human (and the audit trail) read off the RECORDED REAL EXITS — the runnable proof
+    commands + their real exit codes + the all_passed verdict + the attestation /
+    comprehension-capsule reference. ATTESTATION-SOURCED, NEVER an agent claim: it
+    re-renders record.evidence verbatim. Pure function — no IO."""
+    lines = [
+        "## Heimdall receipt — merged AND proven",
+        "",
+        "This fix is backed by the SI-2 attestation below: the verdict is read from "
+        "the **recorded real exit codes**, never an agent self-report.",
+        "",
+        _render_evidence(record),
+        "",
+        _render_capsule_ref(record),
+    ]
+    return "\n".join(lines)
+
+
+def _render_capsule_ref(record):
+    """Render the comprehension-capsule / attestation reference the receipt links
+    back to — sourced from the SI-2 record (its task label + attested commit, plus a
+    capsule ref when the record carries one). This ties the proof back to the
+    comprehension the fix was oriented on."""
+    task = record.get("task") or "(unknown task)"
+    commit = record.get("commit") or "(uncommitted)"
+    capsule = record.get("capsule") or record.get("capsule_ref")
+    lines = ["## Attestation reference"]
+    lines.append("")
+    lines.append("- task: `%s`" % task)
+    lines.append("- attested commit: `%s`" % commit)
+    if capsule:
+        lines.append("- comprehension capsule: `%s`" % capsule)
+    else:
+        lines.append(
+            "- comprehension capsule: linked via the attestation task/commit above"
+        )
+    return "\n".join(lines)
+
+
+def build_gh_comment_command(pr_ref, body_file):
+    """Build the `gh pr comment` command shape (argv tokens) that posts the receipt
+    onto the opened PR. body comes from a file so the (large) receipt body never has
+    to be shell-quoted inline. NEVER executed here — the bot-token runner runs it."""
+    return ["gh", "pr", "comment", str(pr_ref), "--body-file", body_file]
+
+
+def _write_receipt_file(record, body, repo):
+    """Persist the rendered receipt body under the gitignored runtime home so the
+    `gh pr comment --body-file` reads the exact receipt. Atomic write, mirroring the
+    PR-body / queue-store discipline."""
+    home = issue_queue.heimdall_home(repo)
+    rc_dir = os.path.join(home, "issues", "pr-receipts")
+    os.makedirs(rc_dir, exist_ok=True)
+    stem = str(record.get("commit") or record.get("task") or "receipt")
+    safe = (
+        stem.replace(":", "_").replace("/", "_").replace("#", "_").replace(" ", "_")
+    )
+    path = os.path.join(rc_dir, safe + ".md")
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(body)
+        if not body.endswith("\n"):
+            fh.write("\n")
+    os.replace(tmp, path)
+    return path
+
+
+def post_receipt(record, pr_ref, repo=None, gh_runner=None):
+    """Post the SI-2 attestation VERDICT block as a comment on the opened PR — the
+    'merged AND proven' receipt (the overnight artifact).
+
+    The verdict is ATTESTATION-SOURCED (record.evidence — the recorded real exits),
+    NEVER an agent claim; build_receipt_body re-renders it verbatim.
+
+    Defence-in-depth (cardinal rule): a receipt attests a PROVEN fix, so post_receipt
+    REFUSES a record whose evidence.all_passed != True — a proof-less fix gets no
+    'proven' receipt (raise HumanGateError). A missing pr_ref is also refused (there
+    is no PR to attach the proof to). Posts via the scoped bot-token runner by
+    default (the agent never pushes with personal creds); tests inject a mock.
+
+    Returns { ok, pr_ref, body, receipt_file, comment_command, gh, all_passed }."""
+    all_passed = (record.get("evidence") or {}).get("all_passed")
+    if all_passed is not True:
+        raise HumanGateError(
+            "refusing to post a 'proven' receipt for %r: evidence.all_passed is %r, "
+            "not True — the receipt attests a PROVEN fix (cardinal rule)"
+            % (record.get("task"), all_passed)
+        )
+    if not pr_ref:
+        raise HumanGateError(
+            "refusing to post a receipt with no PR ref — there is no opened PR to "
+            "attach the proof to"
+        )
+    body = build_receipt_body(record)
+    receipt_file = _write_receipt_file(record, body, repo)
+    comment_command = build_gh_comment_command(pr_ref, receipt_file)
+    runner = gh_runner or gh_bot_runner
+    gh_result = runner(comment_command)
+    return {
+        "ok": bool((gh_result or {}).get("ok", True)),
+        "pr_ref": pr_ref,
+        "body": body,
+        "receipt_file": receipt_file,
+        "comment_command": comment_command,
+        "gh": gh_result,
+        "all_passed": True,
     }
 
 
@@ -561,6 +724,7 @@ def _cli(argv):
     """CLI core. Subcommands:
       open     --issue @file|JSON --record @file|JSON [--repo R] [--base B] [--print]
       on-merge --issue @file|JSON [--pr REF] [--repo R] [--print]
+      receipt  --record @file|JSON --pr REF [--repo R] [--print]
       status   --id ID [--repo R]
     Returns an exit code; prints JSON to stdout, human notes to stderr.
 
@@ -616,6 +780,26 @@ def _cli(argv):
                 result["resolution_posted"],
                 result["merged"],
             )
+        )
+        return 0
+
+    if sub == "receipt":
+        if not args.record or not args.pr:
+            print("error: receipt needs --record and --pr", file=sys.stderr)
+            return 2
+        record = _load_json_arg(args.record)
+        try:
+            result = post_receipt(record, args.pr, repo=repo)
+        except HumanGateError as exc:
+            print("error: %s" % exc, file=sys.stderr)
+            return 1
+        if args.do_print:
+            printable = dict(result)
+            printable.pop("body", None)  # full body is on disk (receipt_file)
+            print(json.dumps(printable, indent=2, sort_keys=True))
+        sys.stderr.write(
+            "issue-pr receipt: posted merged-AND-proven receipt to %s "
+            "(all_passed=%s)\n" % (result["pr_ref"], result["all_passed"])
         )
         return 0
 
