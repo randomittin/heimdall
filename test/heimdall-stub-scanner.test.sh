@@ -22,10 +22,16 @@
 #     *.json data file whose value is the string "placeholder", a comment that
 #     merely contains the word "stub".
 #
+# It ALSO asserts the BLOCK RECEIPT (H-receipt): when the gate fires it does not
+# just exit 2 — it emits a screenshot-ready JSON receipt on the `error` key that
+# NAMES the matched stub-shape and the FILE PATH. Those assertions prove the
+# message carries both the shape label and the FPATH, for multiple shapes.
+#
 # FALSIFIABILITY: the test drives whatever command is CURRENTLY in hooks.json.
 # Revert the gate to the raw-word grep and the NOW-ALLOWED cases go RED — so this
 # suite fails the instant the over-eager scanner returns. (That is exactly the
-# RED baseline observed before the fix.)
+# RED baseline observed before the fix.) Strip the shape/path out of the receipt
+# and the RECEIPT cases go RED.
 set -u
 
 TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -60,6 +66,32 @@ run_case() {
   fi
 }
 
+# run_receipt <name> <file_path> <content> <want_shape>
+# The gate is more than a boolean: when it BLOCKS it emits a receipt on the `error`
+# key. This asserts the receipt is valid JSON, a hard block (rc 2), and that the
+# error text names BOTH the matched stub-shape AND the exact file path (FPATH) —
+# so "Heimdall blocked a <shape> @ <path>" is a postable moment, not a bare 401.
+run_receipt() {
+  name="$1"; fpath="$2"; content="$3"; want_shape="$4"
+  json="$(jq -n --arg fp "$fpath" --arg c "$content" \
+    '{tool_name:"Write", tool_input:{file_path:$fp, content:$c}}')"
+  out="$(printf '%s' "$json" | bash -c "$CMD" 2>/dev/null)"
+  rc=$?
+  err="$(printf '%s' "$out" | jq -r '.error // empty' 2>/dev/null)"
+  ok=1
+  [ "$rc" -eq 2 ] || ok=0                       # hard block
+  [ -n "$err" ] || ok=0                          # valid JSON with an .error key
+  case "$err" in *"$want_shape"*) : ;; *) ok=0 ;; esac   # names the SHAPE
+  case "$err" in *"$fpath"*) : ;; *) ok=0 ;; esac        # names the PATH (FPATH)
+  if [ "$ok" -eq 1 ]; then
+    pass=$((pass + 1))
+    printf 'PASS [recpt] %-24s shape=%-22s @ %s\n' "$name" "$want_shape" "$fpath"
+  else
+    fail=$((fail + 1))
+    printf 'FAIL [recpt rc=%s] %s\n  err=%s\n' "$rc" "$name" "$err"
+  fi
+}
+
 echo "== STILL BLOCKED: real unfinished-code shapes =="
 run_case block "js empty named fn body"       "src/foo.js"  'function foo(){}'
 run_case block "js empty arrow body"          "src/foo.js"  'const f = () => {}'
@@ -81,6 +113,13 @@ run_case allow "json data value placeholder"  "config/data.json"                
 run_case allow "word stub in a code comment"  "src/real.js"                               'const x = 1; // this is not a stub, it is real and complete'
 run_case allow "txt talking about shim/XXX"   "notes.txt"                                 'The shim/stub/XXX/placeholder words are fine here.'
 run_case allow "real complete function"       "src/real.js"                               'function add(a, b){ return a + b; }'
+
+echo
+echo "== RECEIPT: block message names the matched SHAPE + the FILE PATH =="
+run_receipt "empty-body receipt"     "src/widget.js"  'function render(){}'                     "empty function body"
+run_receipt "pass-only receipt"      "src/svc.py"     "$(printf 'def handle():\n    pass\n')"   "pass-only body"
+run_receipt "not-impl throw receipt" "src/api.js"     'throw new Error("not implemented")'      "not-implemented throw"
+run_receipt "code-comment receipt"   "src/util.js"    '// TODO: wire this up'                   "code-comment TODO/FIXME"
 
 echo
 echo "----"
