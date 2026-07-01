@@ -53,6 +53,10 @@
 #   falsify <domain> --assert-score <S>    exit 0 ONLY IF golden passes AND every
 #                                          mutant is correctly handled (score>=S)
 #   falsify <domain> --mutant <name>       run one named mutant fixture
+#   falsify <domain> --card                run the sweep, then render a shareable
+#                                          truecolor mutation KILL-CARD (real data)
+#   falsify --demo                         run the bundled ponytail-underdelivery
+#                                          oracle + kill-card, zero setup (the wow)
 #   -h, --help                             show help
 #
 # Exit codes: 0 = all assertions held; nonzero = golden failed, a mutant
@@ -66,21 +70,29 @@ if command -v readlink >/dev/null 2>&1; then
 fi
 BIN_DIR="$(cd "$(dirname "$SELF")" && pwd)"
 PLUGIN_DIR="$(cd "$BIN_DIR/.." && pwd)"
-ORACLES_DIR="$PLUGIN_DIR/evals/oracles"
+# Oracle root defaults to the shipped set; HEIMDALL_ORACLES_DIR lets a caller point
+# falsify at an alternate oracle tree (used by test/heimdall-falsify-card.test.sh to
+# grade a throwaway WEAKENED copy so a mutant genuinely survives — proving the card
+# can render a sub-1.0 board). It never changes default behavior.
+ORACLES_DIR="${HEIMDALL_ORACLES_DIR:-$PLUGIN_DIR/evals/oracles}"
 
 command -v jq >/dev/null 2>&1 || { echo "error: jq is required" >&2; exit 2; }
 
-usage() { sed -n '2,56p' "$SELF"; }
+usage() { sed -n '2,60p' "$SELF"; }
 
 # ── Args ──
 DOMAIN=""
 ASSERT_SCORE=""
 ONE_MUTANT=""
+CARD=""
+DEMO=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --assert-score) ASSERT_SCORE="${2:?--assert-score needs a value (e.g. 1.0)}"; shift 2 ;;
     --mutant)       ONE_MUTANT="${2:?--mutant needs a name}"; shift 2 ;;
+    --card)         CARD="1"; shift ;;
+    --demo)         DEMO="1"; shift ;;
     -h|--help)      usage; exit 0 ;;
     --*)            echo "error: unknown flag: $1" >&2; usage >&2; exit 2 ;;
     *)
@@ -89,6 +101,25 @@ while [ $# -gt 0 ]; do
       ;;
   esac
 done
+
+# ── --demo: the zero-setup wow. Runs falsify on the bundled, fastest deterministic
+#    oracle (ponytail-underdelivery) and always renders the kill-card. Self-
+#    contained: the only extra dep beyond jq (already required above) is node, which
+#    the oracle needs to grade candidates. If node is missing we degrade HONESTLY —
+#    we say what to install, we never print a fake card. ─────────────────────────
+if [ -n "$DEMO" ]; then
+  if [ -n "$DOMAIN" ] && [ "$DOMAIN" != "ponytail-underdelivery" ]; then
+    echo "error: --demo runs the bundled ponytail-underdelivery oracle; omit the domain arg" >&2
+    exit 2
+  fi
+  DOMAIN="ponytail-underdelivery"
+  CARD="1"
+  if ! command -v node >/dev/null 2>&1; then
+    echo "falsify --demo needs node to grade the bundled oracle." >&2
+    echo "install node (https://nodejs.org) to run the live demo, then re-run: bin/falsify --demo" >&2
+    exit 3
+  fi
+fi
 
 [ -n "$DOMAIN" ] || { echo "error: <domain> is required" >&2; usage >&2; exit 2; }
 
@@ -183,6 +214,25 @@ report_first_divergence() {
   ' "$report" 2>/dev/null || echo "(unreadable report)"
 }
 
+# Compact one-line divergence for the kill-card cell (ASCII, screenshot-tight).
+# e.g. "roman(4) exp=IV got=IIII". Empty actual renders honestly as got= .
+report_div_compact() {
+  local report="$1"
+  jq -r '
+    .first_divergence as $d
+    | if $d == null then "(no divergence)"
+      elif ($d | type) == "object"
+      then "\($d.step) exp=\($d.expected) got=\($d.actual)"
+      else ($d | tostring) end
+  ' "$report" 2>/dev/null || echo "(unreadable)"
+}
+
+# ── Kill-card capture state (populated by golden_check + kill_mutant) ──
+GOLDEN_STATUS=""          # pass | fail | <status> | missing
+MUT_LAST_STATUS=""        # KILLED | SURVIVED | ERROR (last kill_mutant call)
+MUT_LAST_DETAIL=""        # compact one-line reason for the card cell
+MUT_LAST_IS_GUARD=""      # true | false
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  Golden check + per-mutant kill check, both driven through run.sh + report.json.
 #  kill_mutant returns:
@@ -195,7 +245,7 @@ golden_check() {
   # Run the domain's gate against its own golden fixture via run.sh and read the
   # typed status: it MUST be "pass". A "fail" means the gate is over-strict
   # (false-RED) and is itself broken.
-  [ -f "$GOLDEN_INPUT" ] || { echo "  golden missing: $GOLDEN_INPUT" >&2; return 1; }
+  [ -f "$GOLDEN_INPUT" ] || { GOLDEN_STATUS="missing"; echo "  golden missing: $GOLDEN_INPUT" >&2; return 1; }
   echo "  golden: ${GOLDEN_INPUT#"$PLUGIN_DIR"/}"
 
   # R-2 falsifiability precondition: where a separate truth log is used, the truth
@@ -218,9 +268,11 @@ golden_check() {
   status="$(report_status "$report")"
   rm -f "$report"
   if [ "$status" = "pass" ]; then
+    GOLDEN_STATUS="pass"
     echo "  golden GREEN: run.sh report.json status=pass (gate not over-strict)"
     return 0
   fi
+  GOLDEN_STATUS="${status:-none}"
   echo "  golden report.json status='${status:-<none>}' (expected pass) — gate is over-strict (false-RED)" >&2
   return 1
 }
@@ -244,13 +296,16 @@ kill_mutant() {
   local report status
   report="$(run_gate "$fixture")"
   status="$(report_status "$report")"
+  MUT_LAST_IS_GUARD="$is_guard"
 
   if [ "$status" = "fail" ]; then
     # Gate went RED on this mutant -> KILLED. The gate (run.sh) made this call.
+    MUT_LAST_STATUS="KILLED"
     if [ "$is_guard" = "true" ]; then
       # False-green regression guard: the gate correctly detected the tautological
       # construction and rejected it as non-falsifiable. The build-blocking reject
       # contract line IS the kill for a guard.
+      MUT_LAST_DETAIL="rejected non-falsifiable construction"
       echo "  mutant '$name' is a false-green regression guard (tautological gate construction)"
       echo "  gate detected the non-falsifiable construction (report.json status=fail) and rejected it"
       echo "    first_divergence: $(report_first_divergence "$report")"
@@ -258,6 +313,7 @@ kill_mutant() {
     else
       # Real defect mutant: report the kill from the structured first_divergence
       # field (NOT scraped stdout).
+      MUT_LAST_DETAIL="$(report_div_compact "$report")"
       echo "  mutant '$name' KILLED: gate went RED (report.json status=fail)"
       echo "    first_divergence: $(report_first_divergence "$report")"
     fi
@@ -269,8 +325,12 @@ kill_mutant() {
     # Gate stayed GREEN on this mutant -> SURVIVED -> false-green. For a guard this
     # means run.sh failed to detect the tautological construction.
     rm -f "$report"
+    MUT_LAST_STATUS="SURVIVED"
     if [ "$is_guard" = "true" ]; then
+      MUT_LAST_DETAIL="guard-detection dead (stayed GREEN)"
       echo "  mutant '$name' SURVIVED: gate did NOT detect the tautological construction (report.json status=pass) — the guard-detection is dead"
+    else
+      MUT_LAST_DETAIL="gate stayed GREEN (false-green)"
     fi
     echo "  $GUARD_REJECT_LINE"
     return 1
@@ -278,6 +338,8 @@ kill_mutant() {
 
   # No usable status: run.sh produced no valid report (IO/usage error).
   rm -f "$report"
+  MUT_LAST_STATUS="ERROR"
+  MUT_LAST_DETAIL="run.sh emitted no valid report.json"
   echo "  mutant '$name' ERROR: run.sh produced no valid report.json status (got '${status:-<none>}')" >&2
   return 1
 }
@@ -290,6 +352,155 @@ all_mutants() { jq -r '.mutants[].name' "$MANIFEST"; }
 # annotation that records they were NOT short-circuited.
 guard_count() {
   jq -r '[.mutants[] | select(.is_false_green_regression_guard == true)] | length' "$MANIFEST"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  The mutation KILL-CARD — a shareable, screenshot-ready receipt of the run.
+#  Renders a truecolor box: the golden PASS line, a grid of mutants each with a
+#  ✓KILLED / ✗SURVIVED glyph + its kill pinpoint, the headline SCORE, and a one-
+#  line verdict. EVERY value is read from the REAL run captured above — nothing is
+#  fabricated. Colors are STRICTLY tty-gated: piped/CI output carries NO escape
+#  codes (pipe-clean), so it pastes into logs/markdown safely.
+#
+#  Card capture arrays are populated by the sweep before this is called:
+#    card_names[i] card_status[i] card_detail[i]   (parallel, one per mutant)
+#  plus GOLDEN_STATUS, and the killed/total/score/survived_names sweep locals.
+# ═══════════════════════════════════════════════════════════════════════════
+card_names=()
+card_status=()
+card_detail=()
+
+render_card() {
+  local killed_n="$1" total_n="$2" score_s="$3" survivors_n="$4"
+
+  # ── strict tty-gated palette: literal \033 sequences expanded via printf %b.
+  #    NON-tty (pipe/CI) => every color is empty => ZERO escape codes emitted. ──
+  local P C G W RED D B R
+  local is256=""; case "${TERM:-}" in *256color*) is256="1" ;; esac
+  if [ -t 1 ] && { [ "${COLORTERM:-}" = "truecolor" ] || [ "${COLORTERM:-}" = "24bit" ] || [ -n "$is256" ]; }; then
+    P='\033[38;2;224;86;160m'; C='\033[38;2;0;212;255m'; G='\033[38;2;78;204;163m'
+    W='\033[38;2;255;200;80m'; RED='\033[38;2;255;95;110m'; D='\033[38;2;100;100;120m'
+    B='\033[1m'; R='\033[0m'
+  elif [ -t 1 ]; then
+    P='\033[35m'; C='\033[36m'; G='\033[32m'; W='\033[33m'; RED='\033[31m'; D='\033[37m'
+    B='\033[1m'; R='\033[0m'
+  else
+    P=''; C=''; G=''; W=''; RED=''; D=''; B=''; R=''
+  fi
+
+  # Fixed-1-column glyphs. ASCII stand-ins are used ONLY for width math so the box
+  # stays aligned in any locale (bash ${#} counts bytes under C locale); the pretty
+  # glyph is substituted at render time and occupies the same single column.
+  local i
+
+  # widest mutant name -> aligned name column
+  local NW=4 n
+  if [ "${#card_names[@]}" -gt 0 ]; then
+    for n in "${card_names[@]}"; do [ "${#n}" -gt "$NW" ] && NW="${#n}"; done
+  fi
+
+  # Build each mutant row's ASCII measure-text (status+name+detail) + its colors.
+  local -a row_text row_glyph row_color
+  if [ "${#card_names[@]}" -gt 0 ]; then
+    for i in $(seq 0 $(( ${#card_names[@]} - 1 ))); do
+      local st="${card_status[$i]}" nm="${card_names[$i]}" dt="${card_detail[$i]}"
+      local glyph gcol slabel
+      case "$st" in
+        KILLED)   glyph="✓"; gcol="$G";   slabel="KILLED" ;;
+        SURVIVED) glyph="✗"; gcol="$RED"; slabel="SURVIVED" ;;
+        *)        glyph="!"; gcol="$W";   slabel="ERROR" ;;
+      esac
+      row_glyph+=("$glyph")
+      row_color+=("$gcol")
+      row_text+=("$(printf '%-8s %-*s %s' "$slabel" "$NW" "$nm" "$dt")")
+    done
+  fi
+
+  # ── ASCII measure-strings for every line (locale-safe widths) ──
+  local title_plain="heimdall | falsify - mutation kill-card"
+  local title_disp="heimdall · falsify — mutation kill-card"
+
+  local gdisp gcolor gbase gtext
+  gbase="$(basename "$GOLDEN_INPUT")"
+  if [ "$GOLDEN_STATUS" = "pass" ]; then gdisp="PASS"; gcolor="$G"; else gdisp="FAIL"; gcolor="$RED"; fi
+  gtext="$(printf 'golden   %-4s  %s' "$gdisp" "$gbase")"
+
+  local score_plain scolor
+  score_plain="$(printf 'SCORE    %s/%s = %s' "$killed_n" "$total_n" "$score_s")"
+
+  # Verdict: honest, one line. ASCII plain for width; pretty (BIFRÖST/—) for display,
+  # same display-column count so alignment holds.
+  local v_plain v_disp v_color
+  if [ "$GOLDEN_STATUS" != "pass" ]; then
+    v_plain="BIFROST FALSE-RED - gate rejects its own golden; score void"
+    v_disp="BIFRÖST FALSE-RED — gate rejects its own golden; score void"
+    v_color="$RED"; scolor="$RED"
+  elif [ "$survivors_n" -eq 0 ]; then
+    v_plain="BIFROST holds - no mutant survived; the gate can fail (falsifiable)"
+    v_disp="BIFRÖST holds — no mutant survived; the gate can fail (falsifiable)"
+    v_color="$G"; scolor="$G"
+  else
+    v_plain="$(printf 'BIFROST BREACHED - %s mutant(s) SURVIVED; gate non-falsifiable' "$survivors_n")"
+    v_disp="$(printf 'BIFRÖST BREACHED — %s mutant(s) SURVIVED; gate non-falsifiable' "$survivors_n")"
+    v_color="$RED"; scolor="$RED"
+  fi
+
+  # ── size the box to the widest line (inner content width) ──
+  local WIDTH=56 vis
+  vis=$(( 1 + ${#title_plain} ));  [ "$vis" -gt "$WIDTH" ] && WIDTH="$vis"
+  vis=$(( 2 + ${#gtext} ));        [ "$vis" -gt "$WIDTH" ] && WIDTH="$vis"
+  vis=$(( 2 + ${#score_plain} ));  [ "$vis" -gt "$WIDTH" ] && WIDTH="$vis"
+  vis=$(( 2 + ${#v_plain} ));      [ "$vis" -gt "$WIDTH" ] && WIDTH="$vis"
+  if [ "${#row_text[@]}" -gt 0 ]; then
+    for i in $(seq 0 $(( ${#row_text[@]} - 1 ))); do
+      vis=$(( 4 + ${#row_text[$i]} ));  [ "$vis" -gt "$WIDTH" ] && WIDTH="$vis"
+    done
+  fi
+  WIDTH=$(( WIDTH + 2 ))   # a little breathing room on the right
+
+  # ── renderers ──
+  local hbar=""; for ((i=0; i<WIDTH; i++)); do hbar="${hbar}─"; done
+  emit() { # <visible-cols> <rendered-inner (printf %b)>
+    local v="$1" rendered="$2"
+    local pad=$(( WIDTH - v ))
+    [ "$pad" -lt 0 ] && pad=0
+    printf '%b│%b' "$D" "$R"
+    printf '%b' "$rendered"
+    [ "$pad" -gt 0 ] && printf '%*s' "$pad" ""
+    printf '%b│%b\n' "$D" "$R"
+  }
+
+  printf '\n'
+  printf '%b┌%s┐%b\n' "$D" "$hbar" "$R"
+  emit "$(( 1 + ${#title_plain} ))" " ${B}${P}${title_disp}${R}"
+  printf '%b├%s┤%b\n' "$D" "$hbar" "$R"
+  emit "$(( 2 + ${#gtext} ))" "  ${D}golden   ${R}${gcolor}${gdisp}${R}  ${C}${gbase}${R}"
+  printf '%b├%s┤%b\n' "$D" "$hbar" "$R"
+  if [ "${#row_text[@]}" -gt 0 ]; then
+    for i in $(seq 0 $(( ${#row_text[@]} - 1 ))); do
+      emit "$(( 4 + ${#row_text[$i]} ))" \
+        "  ${row_color[$i]}${row_glyph[$i]} ${row_text[$i]}${R}"
+    done
+  else
+    emit 20 "  ${D}(no mutants graded)${R}"
+  fi
+  printf '%b├%s┤%b\n' "$D" "$hbar" "$R"
+  emit "$(( 2 + ${#score_plain} ))" \
+    "  ${B}${scolor}SCORE${R}    ${B}${scolor}${killed_n}/${total_n} = ${score_s}${R}"
+  emit "$(( 2 + ${#v_plain} ))" "  ${B}${v_color}${v_disp}${R}"
+  printf '%b└%s┘%b\n' "$D" "$hbar" "$R"
+
+  # ── cheap sigil corner-brand: only in an interactive terminal (keeps pipe clean),
+  #    only when python3 + the sigil script are present. Purely decorative — its
+  #    absence never changes the card or the exit code. ──
+  if [ -t 1 ] && command -v python3 >/dev/null 2>&1 && [ -f "$PLUGIN_DIR/sentinels/hmd-sigil.py" ]; then
+    local sig
+    if sig="$(python3 "$PLUGIN_DIR/sentinels/hmd-sigil.py" --seed heimdall-falsify --size compact 2>/dev/null)"; then
+      printf '%b   watchman · BIFRÖST gate%b\n' "$D" "$R"
+      printf '%s\n' "$sig"
+    fi
+  fi
+  printf '\n'
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -327,6 +538,12 @@ if [ "$golden_rc" -ne 0 ]; then
   echo "GOLDEN FAILED: the gate rejects its own known-correct golden fixture."
   echo "The gate is over-strict (false-RED) and is itself broken; score is undefined."
   echo "SCORE: 0/0 (golden precondition failed)"
+  # Honest card even on failure: it shows golden FAIL + a FALSE-RED verdict, never
+  # a fabricated green board. No mutants were graded, so the grid is empty.
+  if [ -n "$CARD" ]; then
+    [ "$GOLDEN_STATUS" = "pass" ] && GOLDEN_STATUS="fail"
+    render_card 0 0 "0.0000" 0
+  fi
   exit 1
 fi
 
@@ -343,6 +560,10 @@ while IFS= read -r m; do
   else
     survived_names+=("$m")
   fi
+  # Capture the real per-mutant verdict for the kill-card (never fabricated).
+  card_names+=("$m")
+  card_status+=("$MUT_LAST_STATUS")
+  card_detail+=("$MUT_LAST_DETAIL")
 done < <(all_mutants)
 echo ""
 
@@ -363,6 +584,11 @@ else
 fi
 if [ "${#survived_names[@]}" -gt 0 ]; then
   echo "SURVIVED: ${survived_names[*]}"
+fi
+
+# ── the kill-card (opt-in via --card / always on --demo). Real data only. ──
+if [ -n "$CARD" ]; then
+  render_card "$killed" "$total" "$score" "${#survived_names[@]}"
 fi
 
 # ── assertion ──
