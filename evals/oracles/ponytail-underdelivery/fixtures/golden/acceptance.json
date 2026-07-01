@@ -1,0 +1,22 @@
+{
+  "feature": "roman",
+  "contract": "roman(n) converts an integer 1..3999 to its canonical Roman numeral string. Full spec: subtractive notation (IV, IX, XL, XC, CD, CM) is REQUIRED, and the full 1..3999 range (thousands via M) is REQUIRED. This is the acceptance ORACLE the gate grades every candidate implementation against — it is fixed truth, applied identically to golden and to every under-delivery mutant.",
+  "cases": [
+    { "n": 1,    "expected": "I" },
+    { "n": 3,    "expected": "III" },
+    { "n": 4,    "expected": "IV" },
+    { "n": 8,    "expected": "VIII" },
+    { "n": 9,    "expected": "IX" },
+    { "n": 14,   "expected": "XIV" },
+    { "n": 40,   "expected": "XL" },
+    { "n": 49,   "expected": "XLIX" },
+    { "n": 90,   "expected": "XC" },
+    { "n": 400,  "expected": "CD" },
+    { "n": 900,  "expected": "CM" },
+    { "n": 944,  "expected": "CMXLIV" },
+    { "n": 1000, "expected": "M" },
+    { "n": 1994, "expected": "MCMXCIV" },
+    { "n": 2024, "expected": "MMXXIV" },
+    { "n": 3999, "expected": "MMMCMXCIX" }
+  ]
+}

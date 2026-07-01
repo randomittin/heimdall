@@ -123,6 +123,14 @@ case "$DOMAIN" in
   exchange-lob) GOLDEN_INPUT="$GOLDEN_DIR/order-stream.json" ;;
   emulator-gb)  GOLDEN_INPUT="$GOLDEN_DIR/trace.gbdoctor"
                 GOLDEN_TRUTH="$GOLDEN_DIR/trace.truth.gbdoctor" ;;
+  # ponytail-underdelivery: the golden INPUT is the fully-delivered candidate
+  # implementation; the acceptance ORACLE is run.sh's internal default --truth
+  # (fixtures/golden/acceptance.json), applied identically to golden and every
+  # mutant, so NO separate GOLDEN_TRUTH is wired here. Input (the code) and truth
+  # (the fixed expected-output table) are different KINDS of artifact — this is
+  # not an X-vs-X self-comparison: a broken candidate fails the golden check
+  # (proven by test/heimdall-underdelivery-guard.test.sh's corrupt-and-confirm).
+  ponytail-underdelivery) GOLDEN_INPUT="$GOLDEN_DIR/candidate.mjs" ;;
   *) echo "error: no golden fixture wired for domain '$DOMAIN'" >&2; exit 2 ;;
 esac
 
