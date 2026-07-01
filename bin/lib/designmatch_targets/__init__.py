@@ -78,6 +78,8 @@ def is_registered(name: str) -> bool:
     return name in _REGISTRY
 
 
-# RN is the ONLY target at launch. A new language adds its own module + register
-# call; this import line is the single place the launch set is declared.
+# Launch targets. A new language adds its own module + register call; these
+# import lines are the single place the launch set is declared. `rn` renders on a
+# real device (adb/xcrun); `web` renders device-free via Playwright.
 from . import rn  # noqa: E402,F401  (import side effect: registers "rn")
+from . import web  # noqa: E402,F401  (import side effect: registers "web")

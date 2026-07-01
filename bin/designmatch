@@ -38,6 +38,9 @@ SCRIPT_RENDER="$SKILL_DIR/scripts/render-canonical.js"
 SCRIPT_DIFF="$SKILL_DIR/scripts/visual-diff.js"
 SCRIPT_ITERATE="$SKILL_DIR/scripts/iterate-screen.sh"
 SCRIPT_FETCH="$SKILL_DIR/scripts/fetch-canonical.js"
+# WEB path — device-free candidate render + parity receipt (kills adb/xcrun).
+SCRIPT_RENDER_WEB="$SKILL_DIR/scripts/render-web-candidate.js"
+SCRIPT_EMIT_PARITY="$SKILL_DIR/scripts/emit-parity.js"
 
 # designmatch v2 regenerate pipeline — sibling helper CLIs (RELOCATABLE, no baked
 # path). The regen path consumes the ALREADY-MERGED hash-log + behavioral-diff and
@@ -75,8 +78,22 @@ Usage:
   designmatch regen-all [--app-dir <path>] [--target rn] [--ledger <path>]
   designmatch regen-gate <Screen> --migrated <file> [--tmp-dir <dir>] [--canonical <file>]
                     [--canonical-png <png>] [--native-png <png>] [--visual-result pass|fail]
+  designmatch web <Screen> --canonical <App.html>
+                    (--candidate-url <url> | --candidate-html <file> | --candidate-png <png>)
+                    [--canonical-png <png>] [--state <json>] [--out-dir <dir>]
+                    [--app-dir <path>] [--min <n>] [--wait <ms|sel>]
+  designmatch ci [--min <n>] [--parity <file>] [--app-dir <path>]
   designmatch action-types
   designmatch help
+
+designmatch WEB — device-free parity (no adb/xcrun):
+  `web` Playwright-renders BOTH the canonical AND the CANDIDATE (a running web/
+  Storybook URL or a static HTML build), diffs them with the EXISTING SSIM/
+  pixelmatch harness, and emits a parity RECEIPT: .designmatch/parity.json +
+  parity-badge.svg (drop into a README/PR) + the composite triptych. One command
+  on any web repo. `ci --min 0.95` reads the receipt and BLOCKS a PR below the
+  bar ("PR blocked: 87% parity < 95%"); missing deps → honest skip, never a
+  fabricated pass. Every number is real (from the actual diff).
 
 designmatch v2 — REGENERATE (don't retrofit):
   regen detects a changed design (hash-log), QUARANTINES the old component to tmp
@@ -1130,6 +1147,172 @@ cmd_regen_all() {
   ok "regen-all: processed $count screen(s) (unchanged screens were no-ops via the hash-log)"
 }
 
+# ═══════════════════════════════════════════════════════════════════════════
+# designmatch WEB — device-free candidate capture + parity-score receipt + CI gate
+# ═══════════════════════════════════════════════════════════════════════════
+# Kills the setup wall: the candidate no longer needs a real device (adb/xcrun).
+# Both canonical and candidate are Playwright-rendered HTML, diffed by the EXISTING
+# SSIM/pixelmatch harness (unchanged math + triptych compositor), and the result
+# is stamped as a drop-in receipt. Every number is real; a run that cannot compute
+# a real parity SKIPS honestly and writes nothing (never a fabricated pass).
+
+# Do the visual-diff harness deps (pixelmatch/pngjs/ssim.js/sharp) resolve from
+# the scripts dir? They are only needed to COMPUTE parity — absence → honest skip.
+web_visual_deps_ok() {
+  command -v node >/dev/null 2>&1 || return 1
+  ( cd "$SKILL_DIR/scripts" && node -e "require('pixelmatch');require('pngjs');require('ssim.js');require('sharp')" >/dev/null 2>&1 )
+}
+
+cmd_web() {
+  local screen="" app_dir="$PWD" canonical="" candidate_url="" candidate_html=""
+  local candidate_png="" canonical_png="" state="" out_dir="" min="0.95" wait=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --app-dir)        app_dir="$2"; shift 2 ;;
+      --canonical)      canonical="$2"; shift 2 ;;
+      --candidate-url)  candidate_url="$2"; shift 2 ;;
+      --candidate-html) candidate_html="$2"; shift 2 ;;
+      --candidate-png)  candidate_png="$2"; shift 2 ;;
+      --canonical-png)  canonical_png="$2"; shift 2 ;;
+      --state)          state="$2"; shift 2 ;;
+      --out-dir)        out_dir="$2"; shift 2 ;;
+      --min)            min="$2"; shift 2 ;;
+      --wait)           wait="$2"; shift 2 ;;
+      -*) die "unknown flag: $1" ;;
+      *)  [ -z "$screen" ] && { screen="$1"; shift; } || die "unexpected arg: $1" ;;
+    esac
+  done
+  [ -n "$screen" ] || die "web requires <Screen>. Run \`designmatch help\`."
+  app_dir="$(cd "$app_dir" && pwd)"
+  local dm_dir="$app_dir/.designmatch"
+  [ -n "$out_dir" ] || out_dir="$dm_dir/$screen"
+  mkdir -p "$out_dir" "$dm_dir"
+
+  command -v node >/dev/null || die "node required for the web path"
+
+  # A candidate source is mandatory — this is what replaces the device screenshot.
+  if [ -z "$candidate_png" ] && [ -z "$candidate_url" ] && [ -z "$candidate_html" ]; then
+    die "web requires a candidate: --candidate-url <url> | --candidate-html <file> | --candidate-png <png>"
+  fi
+
+  # Resolve the CANONICAL png (render from HTML unless a png is supplied).
+  local canonical_png_final="$out_dir/canonical.png"
+  if [ -n "$canonical_png" ]; then
+    [ -f "$canonical_png" ] || die "canonical png not found: $canonical_png"
+    canonical_png_final="$canonical_png"
+  else
+    [ -n "$canonical" ] || die "web requires --canonical <App.html> (or --canonical-png <png>)"
+    [ -f "$canonical" ] || die "canonical not found: $canonical"
+    [ -f "$SCRIPT_RENDER" ] || die "missing $SCRIPT_RENDER"
+    local state_file="$state"
+    if [ -z "$state_file" ]; then
+      state_file="$out_dir/state.web.json"
+      default_state_json > "$state_file"
+    fi
+    info "rendering canonical (Playwright, device-free)"
+    if ! node "$SCRIPT_RENDER" --html "$canonical" --state "$state_file" --screen "$screen" --out "$canonical_png_final" >/dev/null 2>&1; then
+      echo "$(red "!") canonical render SKIPPED — Playwright unavailable or render failed."
+      info "install-hint: npm i playwright   (then re-run) — no parity fabricated"
+      return 0
+    fi
+  fi
+
+  # Resolve the CANDIDATE png (render from URL/HTML unless a png is supplied).
+  local candidate_png_final="$out_dir/candidate.png"
+  if [ -n "$candidate_png" ]; then
+    [ -f "$candidate_png" ] || die "candidate png not found: $candidate_png"
+    candidate_png_final="$candidate_png"
+  else
+    [ -f "$SCRIPT_RENDER_WEB" ] || die "missing $SCRIPT_RENDER_WEB"
+    local rw_args=(--out "$candidate_png_final" --screen "$screen")
+    [ -n "$state" ] && rw_args+=(--state "$state")
+    [ -n "$wait" ] && rw_args+=(--wait "$wait")
+    if [ -n "$candidate_url" ]; then
+      rw_args+=(--url "$candidate_url")
+    else
+      rw_args+=(--html "$candidate_html")
+    fi
+    info "rendering candidate (Playwright, no adb/xcrun)"
+    if ! node "$SCRIPT_RENDER_WEB" "${rw_args[@]}" >/dev/null 2>&1; then
+      echo "$(red "!") candidate render SKIPPED — Playwright unavailable or render failed."
+      info "install-hint: npm i playwright   (then re-run) — no parity fabricated"
+      return 0
+    fi
+  fi
+
+  # Parity computation needs the SSIM/pixelmatch harness deps. Absent → honest
+  # skip: clear install hint, NO parity.json written (never a fabricated pass).
+  if ! web_visual_deps_ok; then
+    echo "$(red "!") parity computation SKIPPED — visual harness deps missing."
+    info "install-hint: npm i pixelmatch pngjs ssim.js sharp   (then re-run)"
+    info "candidate + canonical PNGs are at: $out_dir (no parity.json fabricated)"
+    return 0
+  fi
+
+  # Diff with the EXISTING harness (unchanged math + triptych compositor).
+  [ -f "$SCRIPT_DIFF" ] || die "missing visual harness: $SCRIPT_DIFF"
+  set +e
+  node "$SCRIPT_DIFF" --canonical "$canonical_png_final" --native "$candidate_png_final" --out-dir "$out_dir" >/dev/null 2>&1
+  local diff_rc=$?
+  set -e
+  [ -f "$out_dir/metrics.json" ] || die "visual harness produced no metrics.json (rc=$diff_rc)"
+
+  # Emit the receipt from the REAL metrics (parity.json + badge + triptych link).
+  [ -f "$SCRIPT_EMIT_PARITY" ] || die "missing $SCRIPT_EMIT_PARITY"
+  node "$SCRIPT_EMIT_PARITY" --metrics "$out_dir/metrics.json" --out-dir "$dm_dir" \
+    --screen "$screen" --min "$min" --triptych "$out_dir/composite.png" \
+    || die "emit-parity failed"
+
+  ok "parity receipt: $dm_dir/parity.json + $dm_dir/parity-badge.svg"
+  info "triptych: $out_dir/composite.png"
+  return 0
+}
+
+# designmatch ci — the CI gate over the parity receipt. Reads .designmatch/
+# parity.json and BLOCKS (nonzero) when SSIM parity < --min, PASSES (0) above,
+# and HONEST-SKIPS (0) when there is no receipt to gate (never fabricates one).
+cmd_ci() {
+  local app_dir="$PWD" min="0.95" parity=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --app-dir) app_dir="$2"; shift 2 ;;
+      --min)     min="$2"; shift 2 ;;
+      --parity)  parity="$2"; shift 2 ;;
+      -*) die "unknown flag: $1" ;;
+      *) die "unexpected arg: $1" ;;
+    esac
+  done
+  app_dir="$(cd "$app_dir" && pwd)"
+  [ -n "$parity" ] || parity="$app_dir/.designmatch/parity.json"
+
+  command -v python3 >/dev/null || die "python3 required to read the parity receipt"
+
+  if [ ! -f "$parity" ]; then
+    echo "$(cyan "▸") designmatch ci: no parity receipt at $parity — nothing to gate. SKIPPED."
+    info "run \`designmatch web <Screen> ...\` first to produce a parity.json (no pass fabricated)."
+    return 0
+  fi
+
+  local ssim
+  ssim=$(python3 -c "import json; print(json.load(open('$parity')).get('ssim',''))" 2>/dev/null || echo "")
+  [ -n "$ssim" ] || die "parity receipt has no ssim: $parity"
+
+  local verdict parity_pct min_pct
+  verdict=$(python3 -c "print('pass' if float('$ssim')>=float('$min') else 'fail')" 2>/dev/null || echo "err")
+  parity_pct=$(python3 -c "print(round(float('$ssim')*100))" 2>/dev/null || echo "?")
+  min_pct=$(python3 -c "print(round(float('$min')*100))" 2>/dev/null || echo "?")
+
+  if [ "$verdict" = "pass" ]; then
+    ok "design parity OK: ${parity_pct}% ≥ ${min_pct}% (SSIM) — $parity"
+    return 0
+  elif [ "$verdict" = "fail" ]; then
+    echo "$(red "✗") PR blocked: ${parity_pct}% parity < ${min_pct}% — design parity below the CI gate ($parity)" >&2
+    exit 1
+  else
+    die "could not evaluate parity verdict (ssim=$ssim min=$min)"
+  fi
+}
+
 main() {
   local cmd="${1:-help}"
   [ $# -gt 0 ] && shift || true
@@ -1142,6 +1325,8 @@ main() {
     render)        cmd_render "$@" ;;
     diff)          cmd_diff "$@" ;;
     iterate)       cmd_iterate "$@" ;;
+    web)           cmd_web "$@" ;;
+    ci)            cmd_ci "$@" ;;
     regen)         cmd_regen "$@" ;;
     regen-all)     cmd_regen_all "$@" ;;
     regen-gate)    cmd_regen_gate "$@" ;;

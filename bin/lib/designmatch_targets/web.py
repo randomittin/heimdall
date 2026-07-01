@@ -1,0 +1,183 @@
+#!/usr/bin/env python3
+# web.py — the Web/HTML target for the designmatch v2 language seam.
+#
+# Purpose: kill the device dependency. The `rn` target translates a canonical
+# into a React Native component that only a real Android/iOS device can render
+# (adb/xcrun — the setup wall). The `web` target instead emits a SELF-CONTAINED
+# STATIC HTML candidate at the locked designmatch viewport (1080x2444) that
+# Playwright renders with NO device. So BOTH the canonical AND the candidate are
+# Playwright-rendered HTML → one command on any machine, no emulator.
+#
+# Like `rn`, this is a code-gen Target implementing the same interface: it reads
+# the canonical's JSX element tree and re-expresses it as plain HTML, preserving
+# the visible text + element kinds. It is VISUAL-only by design — no handlers,
+# no state, no API/nav (the seam's contract). It does NOT claim AST behavioral
+# parity; it is a faithful structural candidate you can render and diff.
+#
+# The emitted document sets `window.__APP_READY__ = true` so the standard
+# designmatch render wait (`waitForFunction __APP_READY__`) fires for a generated
+# candidate exactly as it does for a canonical bundle.
+#
+# Determinism: `generate` is a pure function of (canonical_src, screen) — no
+# clock, no IO, no randomness (provenance/timestamps are the pipeline's job).
+
+from __future__ import annotations
+
+import re
+
+from . import Target, register
+from .rn import _component_name, _strip_jsx_return
+
+# Locked designmatch viewport (matches render-canonical.js VIEWPORT_*).
+VIEWPORT_WIDTH = 1080
+VIEWPORT_HEIGHT = 2444
+
+# Web tags whose immediate text content is user-visible and must survive into the
+# candidate (headings, paragraphs, inline text, labels, and the LABELS of
+# buttons/links — the canonical's CTAs).
+_TEXT_TAGS = {
+    "h1", "h2", "h3", "h4", "h5", "h6",
+    "p", "span", "label", "li", "a", "button",
+}
+# Void/self-representing tags we map to concrete HTML controls.
+_INPUT_TAGS = {"input", "textarea"}
+_IMAGE_TAGS = {"img"}
+# Structural containers (emit an empty box; no text of their own).
+_CONTAINER_TAGS = {
+    "div", "section", "header", "footer", "main", "nav",
+    "article", "aside", "ul", "ol", "form",
+}
+
+_KNOWN_TAGS = _TEXT_TAGS | _INPUT_TAGS | _IMAGE_TAGS | _CONTAINER_TAGS
+
+_TAG_RE = re.compile(r"<\s*([a-zA-Z][a-zA-Z0-9]*)\b([^>]*?)(/?)>", re.DOTALL)
+
+
+def _html_escape(text: str) -> str:
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+def _collect(jsx: str):
+    """Ordered list of (tag, visible_text) the canonical's JSX implies. Only
+    known web tags are kept; visible_text is the shallow immediate text (up to
+    the next '<' or '{') for text-bearing tags, else ''."""
+    out = []
+    for mt in _TAG_RE.finditer(jsx):
+        tag = mt.group(1).lower()
+        if tag not in _KNOWN_TAGS:
+            continue
+        text = ""
+        if tag in _TEXT_TAGS:
+            rest = jsx[mt.end():]
+            inner = re.match(r"\s*([^<{][^<{]*)", rest)
+            if inner:
+                text = inner.group(1).strip()
+        out.append((tag, text))
+    return out
+
+
+def _render_body(tags) -> str:
+    """Re-express the collected element tree as flat HTML. Each element becomes a
+    concrete HTML node preserving its visible text; behavior is deliberately
+    absent (no onclick, no href target)."""
+    lines = []
+    indent = "      "
+    for tag, text in tags:
+        if tag in _TEXT_TAGS:
+            label = _html_escape(text) if text else ""
+            cls = "dm-text"
+            if tag in ("a", "button"):
+                cls = "dm-pressable"
+                lines.append(
+                    '%s<button class="%s" type="button">%s</button>'
+                    % (indent, cls, label)
+                )
+            else:
+                htag = tag if re.match(r"h[1-6]$", tag) else "p"
+                lines.append('%s<%s class="%s">%s</%s>' % (indent, htag, cls, label, htag))
+        elif tag in _INPUT_TAGS:
+            lines.append('%s<input class="dm-input" />' % indent)
+        elif tag in _IMAGE_TAGS:
+            lines.append('%s<div class="dm-image" role="img" aria-label="image"></div>' % indent)
+        else:  # container
+            lines.append('%s<div class="dm-view"></div>' % indent)
+    if not lines:
+        lines.append('%s<p class="dm-text"></p>' % indent)
+    return "\n".join(lines)
+
+
+class WebTarget(Target):
+    name = "web"
+    language = "Web/HTML"
+    extension = "html"
+
+    def generate(self, canonical_src: str, screen: str) -> str:
+        comp = _component_name(screen)
+        jsx = _strip_jsx_return(canonical_src)
+        tags = _collect(jsx)
+        body = _render_body(tags)
+
+        # Header stamp: this file is DERIVED FROM THE CANONICAL, visual-only, and
+        # renderable by Playwright with no device.
+        head_comment = (
+            "<!-- %s — REGENERATED by designmatch v2 (target: Web/HTML).\n"
+            "     Derived from the canonical design — visually faithful, device-free.\n"
+            "     Playwright renders this at %dx%d; NO adb/xcrun required.\n"
+            "     Visual-only: no handlers/state/API/nav (behavior lives elsewhere). -->"
+        ) % (comp, VIEWPORT_WIDTH, VIEWPORT_HEIGHT)
+
+        css = (
+            "    html, body { margin: 0; padding: 0; }\n"
+            "    body { width: %(w)dpx; min-height: %(h)dpx; background: #ffffff;\n"
+            "           font-family: -apple-system, Segoe UI, Roboto, sans-serif; color: #111; }\n"
+            "    .dm-screen { width: %(w)dpx; min-height: %(h)dpx; box-sizing: border-box;\n"
+            "                 display: flex; flex-direction: column; padding: 24px; gap: 12px; }\n"
+            "    .dm-view { display: block; }\n"
+            "    .dm-text { margin: 0; font-size: 18px; line-height: 1.4; }\n"
+            "    h1.dm-text { font-size: 34px; font-weight: 700; }\n"
+            "    h2.dm-text { font-size: 28px; font-weight: 700; }\n"
+            "    .dm-pressable { display: inline-flex; align-items: center; justify-content: center;\n"
+            "                    padding: 14px 18px; border: 1px solid #ccc; border-radius: 10px;\n"
+            "                    background: #f3f3f3; font-size: 18px; cursor: default; }\n"
+            "    .dm-input { padding: 14px; border: 1px solid #ccc; border-radius: 10px;\n"
+            "                font-size: 18px; }\n"
+            "    .dm-image { width: 100%%; height: 180px; background: #e6e6e6; border-radius: 10px; }\n"
+        ) % {"w": VIEWPORT_WIDTH, "h": VIEWPORT_HEIGHT}
+
+        return (
+            "<!DOCTYPE html>\n"
+            '<html lang="en">\n'
+            "<head>\n"
+            '  <meta charset="utf-8" />\n'
+            '  <meta name="viewport" content="width=%(w)d, height=%(h)d, initial-scale=1" />\n'
+            "  <title>%(comp)s — designmatch web candidate</title>\n"
+            "%(headc)s\n"
+            "  <style>\n%(css)s  </style>\n"
+            "</head>\n"
+            "<body>\n"
+            '  <main class="dm-screen" data-screen="%(comp)s">\n'
+            "%(body)s\n"
+            "  </main>\n"
+            "  <script>\n"
+            "    // Signal render-readiness for the designmatch Playwright wait.\n"
+            "    window.__APP_READY__ = true;\n"
+            "  </script>\n"
+            "</body>\n"
+            "</html>\n"
+        ) % {
+            "w": VIEWPORT_WIDTH,
+            "h": VIEWPORT_HEIGHT,
+            "comp": comp,
+            "headc": head_comment,
+            "css": css,
+            "body": body,
+        }
+
+
+# Self-register the web target (the 2nd target — added by IMPLEMENTING the
+# interface, NOT by editing the regenerate pipeline).
+register(WebTarget())
