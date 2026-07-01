@@ -1,0 +1,321 @@
+#!/usr/bin/env bash
+# heimdall-task — TEAM MODE: the task record primitive (the one missing store).
+#
+# The coordination substrate already knows WHO is here (heimdall-haid), WHERE
+# they are editing (heimdall-claim), what they're DOING (heimdall-activity), and
+# what is PROVEN (heimdall-gate-surface). The missing primitive is the unit of
+# WORK itself — a durable, shareable task record the team can assign, move across
+# a board, and gate. This provides it.
+#
+# One file per task: .planning/ledger/tasks/{task-id}.json — one writer per file
+# → conflict-free git merges (the EXACT pattern heimdall-claim/activity/verdicts
+# use for claims/, activity/, verdicts/). Two instances never contend on a shared
+# blob; git simply unions the per-task files across checkouts.
+#
+# Record schema (jq-valid, one object):
+#   { "task_id", "title", "assignee_haid", "state": todo|doing|review|done,
+#     "surfaces": [globs + "file#symbol" refs], "gate": pending|PROVEN|BLOCKED,
+#     "created_at", "updated_at", "by_haid" }
+# `surfaces` links a task to the SAME surface strings heimdall-claim uses, so a
+# board can JOIN a task to a live claim (same haid, same surface). `--claim` on
+# add/assign additionally places a real advisory claim (best-effort) for those
+# surfaces under the current identity.
+#
+# HONEST SCOPE: this is COOPERATIVE task tracking among consenting hmd instances,
+# stored in git. It is not a lock and not a security boundary — it records intent
+# and progress, it never enforces.
+#
+# Usage:
+#   heimdall-task add --title <t> [--surface <s>]... [--assignee <haid>]
+#                     [--gate pending|PROVEN|BLOCKED] [--id <id>] [--claim]
+#                                      create a task (state=todo, gate=pending)
+#   heimdall-task assign <task-id> --haid <haid> [--claim]
+#                                      set the assignee (and optionally claim)
+#   heimdall-task state <task-id> <todo|doing|review|done>
+#                                      move the task across the board
+#   heimdall-task gate <task-id> <pending|PROVEN|BLOCKED>
+#                                      record the task's gate verdict
+#   heimdall-task list [--json]        all task records
+#   heimdall-task show <task-id> [--json]   one task record
+#   -h, --help
+#
+# Conventions (match bin/heimdall-claim — pure bash + jq + coreutils, bash 3.2):
+#   - jq required; absence is a hard exit 2
+#   - all writes atomic (mktemp + mv) under an mkdir-based lock
+#   - deterministic, human-readable output for auditability
+#
+# Exit: 0 ok; 2 usage/IO error.
+set -euo pipefail
+
+# ── Path resolution (mirrors bin/heimdall-activity) ──────────────────────────
+SELF="$0"
+if command -v readlink >/dev/null 2>&1; then
+  SELF="$(readlink -f "$0" 2>/dev/null || readlink "$0" 2>/dev/null || echo "$0")"
+fi
+BIN_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+PLUGIN_DIR="$(cd "$BIN_DIR/.." && pwd)"
+PLANNING_DIR="${HEIMDALL_PLANNING_DIR:-$PLUGIN_DIR/.planning}"
+LEDGER_DIR="$PLANNING_DIR/ledger"
+TASKS_DIR="$LEDGER_DIR/tasks"
+LOCK_FILE="$TASKS_DIR.lock"
+LOCK_TIMEOUT=10
+HAID_BIN="$BIN_DIR/heimdall-haid"
+CLAIM_BIN="$BIN_DIR/heimdall-claim"
+
+command -v jq >/dev/null 2>&1 || { echo "error: jq is required" >&2; exit 2; }
+
+usage() { sed -n '2,52p' "$SELF" | sed 's/^# \{0,1\}//'; }
+ts() { date -u +%FT%TZ; }
+
+# ── Locking (mkdir-based; mirrors heimdall-claim) ────────────────────────────
+acquire_lock() {
+  local attempts=0
+  while ! mkdir "$LOCK_FILE" 2>/dev/null; do
+    attempts=$((attempts + 1))
+    if [ "$attempts" -ge "$LOCK_TIMEOUT" ]; then
+      if [ -d "$LOCK_FILE" ]; then
+        local age
+        age=$(( $(date +%s) - $(stat -f %m "$LOCK_FILE" 2>/dev/null || stat -c %Y "$LOCK_FILE" 2>/dev/null || echo 0) ))
+        if [ "$age" -gt 30 ]; then
+          echo "Breaking stale lock (${age}s old)" >&2
+          rmdir "$LOCK_FILE" 2>/dev/null || true
+          mkdir "$LOCK_FILE" 2>/dev/null && return 0
+        fi
+      fi
+      echo "error: could not acquire lock on $TASKS_DIR after ${LOCK_TIMEOUT}s" >&2
+      exit 2
+    fi
+    sleep 1
+  done
+}
+release_lock() { rmdir "$LOCK_FILE" 2>/dev/null || true; }
+
+ensure_dirs() { mkdir -p "$TASKS_DIR"; }
+
+atomic_write() {
+  local dest="$1" tmp template
+  template="${TMPDIR:-/tmp}/task.$(printf 'X%.0s' 1 2 3 4 5 6)"
+  tmp="$(mktemp "$template")"
+  cat > "$tmp"
+  mv -f "$tmp" "$dest"
+}
+
+# ── Identity (mirrors heimdall-activity — HEIMDALL_HAID override wins) ────────
+current_haid() {
+  if [ -n "${HEIMDALL_HAID:-}" ]; then
+    printf '%s' "$HEIMDALL_HAID"
+    return 0
+  fi
+  [ -x "$HAID_BIN" ] || { echo "error: heimdall-haid not found at $HAID_BIN" >&2; exit 2; }
+  "$HAID_BIN" current
+}
+
+# ── Slug + task-id derivation ────────────────────────────────────────────────
+# A task-id is a filesystem-safe stem: slug(title) truncated + a short hash of
+# (title + creation timestamp + pid) so two same-titled tasks never collide.
+slug() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' \
+    | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//' | cut -c1-40
+}
+hash4() {
+  local digest
+  if command -v shasum >/dev/null 2>&1; then
+    digest="$(printf '%s' "$1" | shasum -a 256 | cut -d' ' -f1)"
+  else
+    digest="$(printf '%s' "$1" | sha256sum | cut -d' ' -f1)"
+  fi
+  printf '%s' "${digest:0:4}"
+}
+# task-id chars must be filesystem-safe (the id IS the filename stem).
+valid_id() {
+  case "$1" in
+    ''|*[!a-zA-Z0-9_-]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+task_path() { printf '%s/%s.json' "$TASKS_DIR" "$1"; }
+
+require_task() {
+  local id="$1" f
+  f="$(task_path "$id")"
+  [ -f "$f" ] || { echo "error: no task '$id' (see: heimdall-task list)" >&2; exit 2; }
+  printf '%s' "$f"
+}
+
+valid_state() {
+  case "$1" in todo|doing|review|done) return 0 ;; *) return 1 ;; esac
+}
+valid_gate() {
+  case "$1" in pending|PROVEN|BLOCKED) return 0 ;; *) return 1 ;; esac
+}
+
+# Place an advisory claim for the task's surfaces (best-effort — never fatal).
+maybe_claim() {
+  local task_ref="$1"; shift
+  [ -x "$CLAIM_BIN" ] || return 0
+  [ "$#" -ge 1 ] || return 0
+  HEIMDALL_PLANNING_DIR="$PLANNING_DIR" "$CLAIM_BIN" claim "$@" --task "$task_ref" >/dev/null 2>&1 || true
+}
+
+# ── Subcommands ──────────────────────────────────────────────────────────────
+[ $# -ge 1 ] || { echo "error: a subcommand is required" >&2; usage >&2; exit 2; }
+cmd="$1"; shift || true
+
+case "$cmd" in
+  -h|--help)
+    usage; exit 0 ;;
+
+  add)
+    title=""; assignee=""; gate="pending"; id=""; do_claim=0; surfaces=()
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --title)    title="${2:?--title needs a value}"; shift 2 ;;
+        --surface)  surfaces+=("${2:?--surface needs a value}"); shift 2 ;;
+        --assignee) assignee="${2:?--assignee needs a value}"; shift 2 ;;
+        --gate)     gate="${2:?--gate needs a value}"; shift 2 ;;
+        --id)       id="${2:?--id needs a value}"; shift 2 ;;
+        --claim)    do_claim=1; shift ;;
+        -*) echo "error: unknown flag: $1" >&2; exit 2 ;;
+        *)  echo "error: unexpected argument: $1" >&2; exit 2 ;;
+      esac
+    done
+    [ -n "$title" ] || { echo "error: add needs --title <t>" >&2; exit 2; }
+    valid_gate "$gate" || { echo "error: --gate must be pending|PROVEN|BLOCKED" >&2; exit 2; }
+    if [ -n "$id" ]; then
+      valid_id "$id" || { echo "error: --id must be filesystem-safe [A-Za-z0-9_-]" >&2; exit 2; }
+    else
+      id="$(slug "$title")-$(hash4 "$title-$(ts)-$$")"
+      valid_id "$id" || id="task-$(hash4 "$title-$(ts)-$$")"
+    fi
+
+    by_haid="$(current_haid)"
+    ensure_dirs
+    acquire_lock; trap release_lock EXIT
+    f="$(task_path "$id")"
+    if [ -f "$f" ]; then
+      release_lock; trap - EXIT
+      echo "error: task '$id' already exists (use a distinct --id)" >&2; exit 2
+    fi
+    now="$(ts)"
+    if [ "${#surfaces[@]}" -gt 0 ]; then
+      surfaces_json="$(printf '%s\n' "${surfaces[@]}" | jq -R . | jq -s .)"
+    else
+      surfaces_json='[]'
+    fi
+    jq -n \
+      --arg id "$id" --arg title "$title" \
+      --arg assignee "$assignee" --arg state "todo" \
+      --argjson surfaces "$surfaces_json" --arg gate "$gate" \
+      --arg now "$now" --arg by "$by_haid" \
+      '{task_id:$id, title:$title,
+        assignee_haid:(if $assignee=="" then null else $assignee end),
+        state:$state, surfaces:$surfaces, gate:$gate,
+        created_at:$now, updated_at:$now, by_haid:$by}' \
+      | atomic_write "$f"
+    release_lock; trap - EXIT
+    [ "$do_claim" -eq 1 ] && [ "${#surfaces[@]}" -gt 0 ] && maybe_claim "$id" "${surfaces[@]}"
+    echo "added task '$id' (state todo, gate $gate)"
+    printf '  title: %s\n' "$title"
+    [ "${#surfaces[@]}" -gt 0 ] && printf '  surface: %s\n' "${surfaces[@]}"
+    ;;
+
+  assign)
+    id="${1:-}"; [ -n "$id" ] || { echo "error: assign needs <task-id>" >&2; exit 2; }
+    shift || true
+    haid=""; do_claim=0
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --haid)  haid="${2:?--haid needs a value}"; shift 2 ;;
+        --claim) do_claim=1; shift ;;
+        *) echo "error: unknown flag: $1" >&2; exit 2 ;;
+      esac
+    done
+    [ -n "$haid" ] || { echo "error: assign needs --haid <haid>" >&2; exit 2; }
+    by_haid="$(current_haid)"
+    ensure_dirs
+    acquire_lock; trap release_lock EXIT
+    f="$(require_task "$id")"
+    jq --arg haid "$haid" --arg now "$(ts)" --arg by "$by_haid" \
+      '.assignee_haid = $haid | .updated_at = $now | .by_haid = $by' "$f" \
+      | atomic_write "$f"
+    surfaces=()
+    while IFS= read -r s; do [ -n "$s" ] && surfaces+=("$s"); done < <(jq -r '.surfaces[]?' "$f" 2>/dev/null)
+    release_lock; trap - EXIT
+    [ "$do_claim" -eq 1 ] && [ "${#surfaces[@]}" -gt 0 ] && maybe_claim "$id" "${surfaces[@]}"
+    echo "assigned task '$id' → $haid"
+    ;;
+
+  state)
+    id="${1:-}"; [ -n "$id" ] || { echo "error: state needs <task-id> <state>" >&2; exit 2; }
+    new_state="${2:-}"; [ -n "$new_state" ] || { echo "error: state needs a new state (todo|doing|review|done)" >&2; exit 2; }
+    valid_state "$new_state" || { echo "error: state must be todo|doing|review|done" >&2; exit 2; }
+    by_haid="$(current_haid)"
+    ensure_dirs
+    acquire_lock; trap release_lock EXIT
+    f="$(require_task "$id")"
+    jq --arg st "$new_state" --arg now "$(ts)" --arg by "$by_haid" \
+      '.state = $st | .updated_at = $now | .by_haid = $by' "$f" \
+      | atomic_write "$f"
+    release_lock; trap - EXIT
+    echo "task '$id' → state $new_state"
+    ;;
+
+  gate)
+    id="${1:-}"; [ -n "$id" ] || { echo "error: gate needs <task-id> <verdict>" >&2; exit 2; }
+    new_gate="${2:-}"; [ -n "$new_gate" ] || { echo "error: gate needs a verdict (pending|PROVEN|BLOCKED)" >&2; exit 2; }
+    valid_gate "$new_gate" || { echo "error: gate must be pending|PROVEN|BLOCKED" >&2; exit 2; }
+    by_haid="$(current_haid)"
+    ensure_dirs
+    acquire_lock; trap release_lock EXIT
+    f="$(require_task "$id")"
+    jq --arg g "$new_gate" --arg now "$(ts)" --arg by "$by_haid" \
+      '.gate = $g | .updated_at = $now | .by_haid = $by' "$f" \
+      | atomic_write "$f"
+    release_lock; trap - EXIT
+    echo "task '$id' → gate $new_gate"
+    ;;
+
+  list)
+    as_json=""
+    [ "${1:-}" = "--json" ] && as_json=1
+    ensure_dirs
+    files=()
+    for f in "$TASKS_DIR"/*.json; do
+      [ -e "$f" ] || continue
+      files+=("$f")
+    done
+    if [ -n "$as_json" ]; then
+      if [ "${#files[@]}" -eq 0 ]; then echo '[]'; else jq -s 'sort_by(.created_at)' "${files[@]}"; fi
+      exit 0
+    fi
+    if [ "${#files[@]}" -eq 0 ]; then echo "(no tasks)"; exit 0; fi
+    echo "TASKS (${#files[@]})"
+    jq -s -r 'sort_by(.created_at)[] |
+      def sym: if .gate=="PROVEN" then "✓" elif .gate=="BLOCKED" then "✗" else "·" end;
+      "  [\(.state)] \(.task_id)  \(sym) \(.gate)\n    \(.title)"
+      + (if .assignee_haid then "\n    → \(.assignee_haid | sub("^haid:";"") | sub("\\..*$";""))" else "" end)
+      + (if (.surfaces // []) | length > 0 then "\n    surfaces: \(.surfaces | join(", "))" else "" end)' \
+      "${files[@]}"
+    ;;
+
+  show)
+    id="${1:-}"; [ -n "$id" ] || { echo "error: show needs <task-id>" >&2; exit 2; }
+    shift || true
+    as_json=""
+    [ "${1:-}" = "--json" ] && as_json=1
+    ensure_dirs
+    f="$(task_path "$id")"
+    if [ ! -f "$f" ]; then
+      [ -n "$as_json" ] && echo 'null' || echo "no task '$id'"
+      exit 0
+    fi
+    if [ -n "$as_json" ]; then jq '.' "$f"; else
+      jq -r '"task_id: \(.task_id)\ntitle: \(.title)\nstate: \(.state)\ngate: \(.gate)\nassignee: \(.assignee_haid // "unassigned")\ncreated: \(.created_at)\nupdated: \(.updated_at)\nsurfaces:\n" + ((.surfaces // []) | map("  - " + .) | join("\n"))' "$f"
+    fi
+    ;;
+
+  *)
+    echo "error: unknown subcommand: $cmd" >&2
+    usage >&2
+    exit 2 ;;
+esac
