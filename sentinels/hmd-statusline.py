@@ -18,11 +18,31 @@ BIN_DIR = os.path.normpath(os.path.join(HERE, "..", "bin"))  # heimdall-identity
 spec = importlib.util.spec_from_file_location("hmd_sigil", os.path.join(HERE, "hmd_sigil.py"))
 SIG = importlib.util.module_from_spec(spec); spec.loader.exec_module(SIG)
 
-# palette
-CY="\033[38;2;34;211;238m"; GR="\033[38;2;34;197;94m"; RD="\033[38;2;239;68;68m"
-AM="\033[38;2;245;158;11m"; DIM="\033[38;2;90;100;114m"; FAINT="\033[38;2;58;65;77m"
-TEAL="\033[38;2;45;212;191m"  # #2dd4bf — brand wordmark + eye bracket (mockup §3 teal)
-BOLD="\033[1m"; X="\033[0m"
+# ── color mode ───────────────────────────────────────────────────────────────
+# CC's statusLine is non-TTY but truecolor, so we can't lean on isatty alone.
+# hooks/statusline.sh already resolves the terminal's color capability and passes
+# --color / --no-color; we honor that first, then the NO_COLOR standard, then a
+# truecolor/256color env, then isatty. When color is OFF every palette code is the
+# empty string, so every f-string collapses to clean plain text — no ANSI garbage
+# in CI/pipes (mirrors hmd-gate-anim.sh's non-TTY collapse). The sigil pixels and
+# per-agent glyphs (which emit ANSI regardless) are guarded separately below.
+def _use_color():
+    a = sys.argv
+    if "--no-color" in a or "--plain" in a: return False
+    if os.environ.get("NO_COLOR") is not None: return False
+    if "--color" in a: return True
+    if (os.environ.get("COLORTERM") or "") in ("truecolor", "24bit"): return True
+    if "256color" in (os.environ.get("TERM") or ""): return True
+    try: return sys.stdout.isatty()
+    except Exception: return False
+USE_COLOR = _use_color()
+def _c(s): return s if USE_COLOR else ""
+
+# palette (empty in no-color mode → f-strings render as plain text)
+CY=_c("\033[38;2;34;211;238m"); GR=_c("\033[38;2;34;197;94m"); RD=_c("\033[38;2;239;68;68m")
+AM=_c("\033[38;2;245;158;11m"); DIM=_c("\033[38;2;90;100;114m"); FAINT=_c("\033[38;2;58;65;77m")
+TEAL=_c("\033[38;2;45;212;191m")  # #2dd4bf — brand wordmark + eye bracket (mockup §3 teal)
+BOLD=_c("\033[1m"); X=_c("\033[0m")
 SEP=f"{FAINT} │ {X}"
 ANSI = re.compile(r"\033\[[0-9;]*m")
 def vis(s): return len(ANSI.sub("", s))
@@ -168,6 +188,169 @@ VERDICT = {  # verdict -> (eye color rgb, ansi col, glyph, word)
  "watching": ((34,211,238), CY, "◦", "watching"),
 }
 
+def sig_glyph(seed, rgb=None):
+    """One identity cell — the watchman ◉ from hmd_sigil, verdict-tinted. In
+    no-color mode SIG.glyph would still emit ANSI, so return a bare ◉ instead."""
+    if not USE_COLOR: return "◉"
+    try: return SIG.glyph(seed, eye_override=rgb)
+    except Exception: return f"{DIM}◉{X}"
+
+# ── the parallel-agent SWARM: the REAL live-agent set, never fabricated ────────
+# Roster   = bin/agent-pool (active agents: id, role/type, pid) under ~/.heimdall.
+# Surface  = the claim ledger (.planning/ledger/claims/*.json — an agent's current
+#            claimed file) with bin/shared-memory (ns swarm-file) as fallback.
+# Verdict  = bin/shared-memory (ns swarm-gate) — each agent's live gate verdict —
+#            falling back to "working" for a live-but-unreported agent.
+# All reads are plain file / SQLite reads (no subprocess, no network) so the
+# statusline stays a few milliseconds on every render.
+
+def _home(): return os.path.expanduser("~")
+
+def _agent_pool_file():
+    """Mirror agent-pool._resolve_pool_file: ~/.heimdall, adopting a pre-existing
+    legacy ~/.superx pool. HOME-relative, so tests isolate by redirecting HOME."""
+    new = os.path.join(_home(), ".heimdall", "agent-pool.json")
+    legacy = os.path.join(_home(), ".superx", "agent-pool.json")
+    if not os.path.exists(new) and os.path.exists(legacy): return legacy
+    return new
+
+def active_swarm_agents():
+    """The live roster from agent-pool: only status=='active' agents, and only
+    those whose PID is still alive (a dead-but-unreaped entry is NOT a real agent
+    — never render a ghost tile). Returns ([{id, role, started_at}], max_agents)."""
+    try:
+        with open(_agent_pool_file()) as f: pool = json.load(f)
+    except Exception:
+        return [], 0
+    if not isinstance(pool, dict): return [], 0
+    agents = pool.get("agents") or {}
+    if not isinstance(agents, dict): return [], 0
+    mx = pool.get("max_agents") or 0
+    out = []
+    for aid, info in agents.items():
+        if not isinstance(info, dict) or info.get("status") != "active": continue
+        pid = info.get("pid")
+        if isinstance(pid, int):
+            try: os.kill(pid, 0)
+            except ProcessLookupError: continue      # dead → not a real live agent
+            except Exception: pass                    # PermissionError etc. → alive
+        out.append({"id": aid, "role": (info.get("type") or "agent"),
+                    "started_at": info.get("started_at") or ""})
+    out.sort(key=lambda a: (a["started_at"], a["id"]))
+    return out, mx
+
+def _slug(s):  # match heimdall-haid's slug: alnum runs → '-', lowercased, trimmed
+    return re.sub(r"[^A-Za-z0-9]+", "-", s or "").strip("-").lower()
+
+def _iso_epoch(s):
+    try:
+        from datetime import datetime
+        return datetime.fromisoformat((s or "").strip().replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
+
+def swarm_claims(cwd):
+    """Current claimed surface per haid, from the coordination ledger. Honors
+    HEIMDALL_PLANNING_DIR (tests + non-default checkouts), else <cwd>/.planning.
+    TTL-expired claims are skipped so a stale surface never renders."""
+    base = os.environ.get("HEIMDALL_PLANNING_DIR") or os.path.join(cwd, ".planning")
+    d = os.path.join(base, "ledger", "claims")
+    out = {}
+    try: names = os.listdir(d)
+    except Exception: return out
+    now = time.time()
+    for n in names:
+        if not n.endswith(".json"): continue
+        try:
+            with open(os.path.join(d, n)) as f: c = json.load(f)
+        except Exception: continue
+        if not isinstance(c, dict): continue
+        hb = c.get("heartbeat") or c.get("claimed_at")
+        ttl = c.get("ttl_minutes") or 90
+        e = _iso_epoch(hb) if hb else None
+        if e and now > e + ttl * 60: continue          # expired → not active
+        surfs = [s for s in (c.get("claimed_surfaces") or []) if isinstance(s, str)]
+        rec = {"task": c.get("task_ref") or "", "surface": surfs[0] if surfs else ""}
+        haid = c.get("haid") or ""
+        if haid: out[haid] = rec; out[_slug(haid)] = rec
+    return out
+
+def swarm_shared(ns):
+    """A namespace snapshot from bin/shared-memory's SQLite (read-only, expiry
+    honored). Empty/missing DB → {}. Never blocks (0.5s busy timeout)."""
+    dbp = (os.environ.get("HEIMDALL_MEMORY_DB") or os.environ.get("SUPERX_MEMORY_DB")
+           or os.path.join(_home(), ".heimdall", "shared-memory.db"))
+    if not os.path.exists(dbp):
+        legacy = os.path.join(_home(), ".superx", "shared-memory.db")
+        if os.path.exists(legacy): dbp = legacy
+        else: return {}
+    out = {}
+    try:
+        import sqlite3
+        conn = sqlite3.connect("file:%s?mode=ro" % dbp, uri=True, timeout=0.5)
+        now = time.time()
+        for k, v, exp in conn.execute(
+                "SELECT key, value, expires_at FROM memory WHERE namespace=?", (ns,)):
+            if exp is not None and exp < now: continue
+            out[k] = v
+        conn.close()
+    except Exception:
+        return {}
+    return out
+
+_VERDICT_ALIAS = {
+    "pass":"pass","proven":"pass","green":"pass","done":"pass","ok":"pass",
+    "deny":"deny","blocked":"deny","fail":"deny","failed":"deny","closed":"deny",
+    "working":"working","active":"working","running":"working","busy":"working",
+    "scan":"scanning","scanning":"scanning",
+    "watching":"watching","idle":"watching",
+}
+def _norm_verdict(v): return _VERDICT_ALIAS.get((v or "").strip().lower(), "working")
+
+def _swarm_v(v):  # normalized verdict -> (eye rgb, ansi col, glyph, word)
+    return {
+        "pass":     ((34,197,94),  GR, "✓", "proven"),
+        "deny":     ((239,68,68),  RD, "✗", "BIFRÖST"),
+        "working":  ((245,158,11), AM, "⟳", "working"),
+        "scanning": ((245,158,11), AM, "◦", "scanning"),
+        "watching": ((34,211,238), CY, "◦", "watching"),
+    }[v]
+
+def swarm_block(cwd):
+    """Build the SWARM block rows (header + one aligned row per live agent), or
+    None when 1-or-fewer agents are active (→ the normal HUD is untouched). Each
+    row is spectacle + receipt: mini-sigil · role · gate glyph · current file."""
+    agents, mx = active_swarm_agents()
+    if len(agents) < 2: return None
+    gate = swarm_shared("swarm-gate"); files = swarm_shared("swarm-file")
+    claims = swarm_claims(cwd)
+    def _lookup(m, aid): return m.get(aid) or m.get(_slug(aid))
+    entries = []
+    for a in agents:
+        aid = a["id"]
+        v = _norm_verdict(_lookup(gate, aid) or "working")
+        cl = _lookup(claims, aid) or {}
+        surface = (cl.get("surface") or cl.get("task")
+                   or _lookup(files, aid) or "")
+        entries.append((a, v, surface))
+    role_w = min(13, max(len(a["role"]) for a, _, _ in entries))
+    word_w = max(len(_swarm_v(v)[3]) for _, v, _ in entries)
+    rows = []
+    for a, v, surface in entries:
+        rgb, col, glyph, word = _swarm_v(v)
+        g = sig_glyph(a["id"], rgb)
+        role = a["role"][:role_w].ljust(role_w)
+        verdict = f"{col}{BOLD}{glyph} {word.ljust(word_w)}{X}"
+        surf = f" {FAINT}·{X} {DIM}{surface}{X}" if surface else ""
+        if v == "deny":  # the screenshot moment — bracket it red so the block reads
+            rows.append(f"{RD}▕{X}{g} {DIM}{role}{X} {verdict}{surf}{RD}▏{X}")
+        else:
+            rows.append(f"{g} {DIM}{role}{X} {verdict}{surf}")
+    n = len(agents)
+    cap = f"/{mx}" if mx else ""
+    header = f"{FAINT}── swarm {n}{cap} active ──{X}"
+    return [header] + rows
+
 def main():
     data = read_json()
     cwd = (data.get("workspace") or {}).get("current_dir") or data.get("cwd") or os.getcwd()
@@ -225,7 +408,9 @@ def main():
     _spawn_presence(cwd, handle, verdict)
 
     # ── sigil anchor (squint animates; eyes stay visible in every frame) ──
-    sig = SIG.render(seed, eye_override=eye, pad="")  # 4 rows, 8 cols (square sprite)
+    # In no-color mode the sprite's ANSI half-blocks would be garbage, so collapse
+    # the anchor to blank columns (keeps the 8-wide alignment, emits no escapes).
+    sig = SIG.render(seed, eye_override=eye, pad="") if USE_COLOR else ["        "] * 4
     SW = 8
     ANCHOR = SW + 2  # sigil(8 cols) + 2-space gutter, prefixed on EVERY row
 
@@ -285,7 +470,7 @@ def main():
             v = m.get("verdict", "working")
             col = {"pass":GR,"done":GR,"deny":RD,"working":AM,"watching":CY}.get(v, CY)
             ergb = {"pass":(34,197,94),"done":(34,197,94),"deny":(239,68,68),"working":(245,158,11)}.get(v)
-            g = SIG.glyph(m.get("name","?"), eye_override=ergb)
+            g = sig_glyph(m.get("name","?"), ergb)
             state = ({"pass":"✓","done":"✓","deny":"✗","working":"⚡"}.get(v,"◦"))
             f = m.get("file","")
             # online status: a server-roster teammate is live NOW (green ●); a local
@@ -300,7 +485,7 @@ def main():
         header = f"{FAINT}── watch ──{X}"
         you_state = {"pass": "✓", "deny": "✗", "scanning": "◦"}.get(verdict, "⚡")
         you_word  = {"pass": "proven", "deny": "blocked", "scanning": "scanning"}.get(verdict, "working")
-        you_seg = f"{SIG.glyph(seed)} {BOLD}you{X} {DIM}{you_state} {you_word}{X}"  # your watchman closes the wall
+        you_seg = f"{sig_glyph(seed)} {BOLD}you{X} {DIM}{you_state} {you_word}{X}"  # your watchman closes the wall
 
         JOIN = 2                                   # the "  " between wall segments
         budget = max(0, cols - (SW + 2) - RMARGIN) # usable row width: COLUMNS − sigil anchor − gutter
@@ -328,6 +513,19 @@ def main():
         # rendered at exactly COLUMNS.
         gap = cols - ANCHOR - RMARGIN - vis(left) - vis(right)
         return left + (" " * max(1, gap)) + right
+
+    # ── SWARM MODE: >1 agent live → the top two rows (brand + gate) stay, and the
+    # bottom rows become the live agent roster (spectacle + per-agent receipt).
+    # 1-or-fewer agents → fall through to the unchanged team-wall / solo behavior.
+    swarm = swarm_block(cwd)
+    if swarm:
+        out = []
+        out.append(f"{_sig(sig,0,CY)}  " + line(l1, r1))
+        out.append(f"{_sig(sig,1,CY)}  " + line(l2, r2))
+        for i, seg in enumerate(swarm):
+            out.append(f"{_sig(sig, 2+i, CY)}  " + seg)
+        sys.stdout.write("\n".join(out) + "\n")
+        return
 
     out = []
     out.append(f"{_sig(sig,0,CY)}  " + line(l1, r1))

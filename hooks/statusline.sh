@@ -40,7 +40,9 @@ BLOB=""
 # ── PRIMARY: the full-width watchman ──
 # Capture first; emit only on success (nonempty). Any failure falls through.
 if command -v python3 >/dev/null 2>&1 && [ -f "$WATCHMAN" ]; then
-  WM="$(printf '%s' "$BLOB" | python3 "$WATCHMAN" 2>/dev/null)"
+  # hand the watchman the SAME color verdict the legacy fallback honors, so the
+  # swarm block + HUD collapse to clean plain text in CI/pipes with no truecolor.
+  WM="$(printf '%s' "$BLOB" | python3 "$WATCHMAN" "$COLOR_FLAG" 2>/dev/null)"
   if [ -n "$WM" ]; then
     printf '%s\n' "$WM"
     exit 0
