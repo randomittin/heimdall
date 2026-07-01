@@ -78,6 +78,49 @@ Additional standards:
 - Write meaningful commit messages using conventional commits.
 - Ensure your changes don't break existing functionality.
 
+## Write-Time Minimalism — The Lazy Ladder
+
+*Adapted from the Ponytail ruleset (MIT). Applies at generation time; composes with — never overrides — the Zero-Tolerance rule above.*
+
+Before writing code, stop at the FIRST rung that holds:
+1. **Does this need to exist?** → no: skip it (YAGNI).
+2. **Stdlib does it?** → use the stdlib.
+3. **Native platform feature does it?** → use the platform.
+4. **An installed dependency does it?** → use the dependency.
+5. **One line?** → write the one line.
+6. **Only then** → the minimum that actually works.
+
+### Carve-outs (NON-NEGOTIABLE) — "lazy, not negligent"
+
+Minimalism applies to **IMPLEMENTATION VERBOSITY ONLY**. It NEVER applies to, and may NEVER trim:
+- correctness
+- input / trust-boundary validation
+- error handling
+- data-loss handling
+- security
+- accessibility
+- the feature's actual requirements / acceptance criteria
+
+Terser code, never weaker guarantees.
+
+### Rung-1 scope — what "does this need to exist?" targets
+
+Rung 1 targets **SUPERFLUOUS scaffolding** — the wrapper component, the config class, the date-picker lib when `<input type=date>` works, the abstraction with one caller. It NEVER targets the user's requested capability.
+
+- You may NEVER skip a required feature, requirement, or acceptance criterion under YAGNI.
+- **YAGNI cuts gold-plating, never scope.**
+
+### Composition with the Zero-Tolerance rule (read this so you can't misread rung 1)
+
+"Skip" (rung 1) means **do not build superfluous scaffolding**. It does NOT — ever — mean fake or half-build the feature. The Zero-Tolerance rule above stands unweakened: every forbidden marker it lists (unfinished-work comments, empty bodies, not-implemented throws, fake data) remains banned. Concretely:
+- Superfluous scaffolding → **skip it** (don't write it at all).
+- Required feature → **implement it fully** (the ladder only makes the real implementation leaner).
+- Can't do it minimally AND completely? → completeness wins; report the tension, never fake it.
+
+### The floor
+
+A task is DONE when its acceptance / oracle **passes** — NOT when the diff is small. Small-but-broken FAILS. Minimalism can NEVER make a failing acceptance criterion "pass" by being terse. The acceptance gate is the floor the ladder can't go below.
+
 ## Pattern Discipline
 
 Before inventing a new pattern, find an existing exemplar in the codebase and reference it by `file:line`. Example: "Following the singleton pattern in `src/services/AuthService.ts:14` for the new `BillingService`." If no exemplar exists and the orchestrator did not specify one, flag it in your status as DONE_WITH_CONCERNS so the next reviewer can decide whether to canonize the new pattern.
