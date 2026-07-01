@@ -6,6 +6,21 @@
 # Usage: summary-card [PROJECT_DIR]   (defaults to cwd)
 set -uo pipefail
 
+# ── --heartbeat verb: print the autopilot one-line receipt and exit ──
+# Renders the maintainer autopilot heartbeat (from .planning/CHECKPOINT.md via
+# bin/heimdall-maintain-loop). A missing loop bin / checkpoint yields a safe "—".
+if [ "${1:-}" = "--heartbeat" ]; then
+  shift
+  HB_PROJECT="${1:-.}"
+  HB_BINDIR="$(cd "$(dirname "$0")" && pwd)"
+  if [ -x "$HB_BINDIR/heimdall-maintain-loop" ]; then
+    "$HB_BINDIR/heimdall-maintain-loop" heartbeat --repo "$HB_PROJECT" 2>/dev/null || echo "autopilot: —"
+  else
+    echo "autopilot: —"
+  fi
+  exit 0
+fi
+
 PROJECT="${1:-.}"
 PLANNING="$PROJECT/.planning"
 STATE_MD="$PLANNING/STATE.md"
@@ -239,6 +254,23 @@ if [ -d "$REEL_DIR" ]; then
   done
 fi
 
+# ── Autopilot heartbeat line — the maintainer loop's durable receipt (H-6). ──
+# Rendered ONLY when a CHECKPOINT.md carries an autopilot block; a pure render of
+# the last machine-readable header via bin/heimdall-maintain-loop. "—" otherwise.
+HEARTBEAT_LINE=""
+SC_BINDIR="$(cd "$(dirname "$0")" && pwd)"
+if [ -f "$PLANNING/CHECKPOINT.md" ] \
+   && grep -q 'heimdall-autopilot' "$PLANNING/CHECKPOINT.md" 2>/dev/null \
+   && [ -x "$SC_BINDIR/heimdall-maintain-loop" ]; then
+  HEARTBEAT_LINE="$("$SC_BINDIR/heimdall-maintain-loop" heartbeat --repo "$PROJECT" 2>/dev/null || echo "")"
+  # strip the leading "autopilot: " label — the row already names the axis.
+  HEARTBEAT_LINE="${HEARTBEAT_LINE#autopilot: }"
+  # a bare sentinel is not worth a row.
+  case "$HEARTBEAT_LINE" in
+    "no checkpoint yet"|"—"|"") HEARTBEAT_LINE="" ;;
+  esac
+fi
+
 # ── Box rendering ──
 # Fixed inner width; pad/truncate each line's visible text to fit.
 WIDTH=54
@@ -327,6 +359,11 @@ if [ -n "$REEL_LINE" ]; then
   REEL_SHORT="reels/$(basename "$REEL_LINE")"
   REEL_T=$(trunc "$REEL_SHORT" 44)
   row "reel" "$REEL_T" "${P}${REEL_T}${R}"
+fi
+# ── Autopilot row (H-6) — the maintainer loop heartbeat, only when checkpointed ──
+if [ -n "$HEARTBEAT_LINE" ]; then
+  HB_T=$(trunc "$HEARTBEAT_LINE" 44)
+  row "autopilot" "$HB_T" "${C}${HB_T}${R}"
 fi
 printf "%b└%s┘%b\n" "$D" "$(hr "─")" "$R"
 printf "\n"

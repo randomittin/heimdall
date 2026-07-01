@@ -69,6 +69,11 @@ Commands:
   goal-set <condition> [source]  Set active goal condition
   goal-clear                     Clear active goal
   goal-get                       Get current goal condition
+  maintainer-budget [<tokens>]   Get/set the maintainer autopilot budget cap
+  autopilot-get <field>          Read .maintainer.autopilot.<field>
+  autopilot-set <field> <json>   Set .maintainer.autopilot.<field>
+  autopilot-set-all <json-obj>   Merge fields into .maintainer.autopilot (preserves rest)
+  autopilot-approve <issue-id>   Record a human decision so the loop stops parking it
   migrate                       Migrate state file to latest schema version
   status                        Print a formatted status summary
 EOF
@@ -111,7 +116,14 @@ cmd_init() {
     "enabled": false,
     "issue_sources": [],
     "pending_fixes": [],
-    "release_queue": []
+    "release_queue": [],
+    "budget_tokens": 600000,
+    "autopilot": {
+      "cycle": 0,
+      "stop": null,
+      "last_heartbeat": null,
+      "approvals": []
+    }
   },
   "communication_log": [],
   "budget": {
@@ -346,6 +358,16 @@ cmd_migrate() {
     changed=1
   fi
 
+  # v1.2.0 → v1.3.0: add the maintainer autopilot budget + checkpoint fields
+  if ! jq -e '.maintainer.budget_tokens' "$tmp" >/dev/null 2>&1; then
+    jq '.maintainer += {"budget_tokens": 600000}' "$tmp" > "${tmp}.new" && mv "${tmp}.new" "$tmp"
+    changed=1
+  fi
+  if ! jq -e '.maintainer.autopilot' "$tmp" >/dev/null 2>&1; then
+    jq '.maintainer += {"autopilot": {"cycle": 0, "stop": null, "last_heartbeat": null, "approvals": []}}' "$tmp" > "${tmp}.new" && mv "${tmp}.new" "$tmp"
+    changed=1
+  fi
+
   # Update version
   if [ "$changed" -eq 1 ]; then
     jq '.version = "1.2.0"' "$tmp" > "${tmp}.new" && mv "${tmp}.new" "$tmp"
@@ -390,6 +412,72 @@ cmd_goal_get() {
   jq -r '.goal.condition // "none"' "$STATE_FILE"
 }
 
+# ── Maintainer autopilot accessors (used by bin/heimdall-maintain-loop) ───────
+
+cmd_maintainer_budget() {
+  ensure_state
+  # No value -> get the current cap; a value -> set it. Default cap is 600000.
+  local value="${1:-}"
+  if [ -z "$value" ]; then
+    jq -r '.maintainer.budget_tokens // 600000' "$STATE_FILE"
+    return 0
+  fi
+  acquire_lock
+  local tmp
+  tmp=$(mktemp)
+  jq --argjson v "$value" '.maintainer = (.maintainer // {}) | .maintainer.budget_tokens = $v' \
+    "$STATE_FILE" > "$tmp" && mv "$tmp" "$STATE_FILE"
+  release_lock
+  echo "Maintainer budget cap set to $value tokens"
+}
+
+cmd_autopilot_get() {
+  ensure_state
+  local field="${1:?autopilot field required (cycle|stop|last_heartbeat|approvals)}"
+  jq -r --arg f "$field" '.maintainer.autopilot[$f] // "null" | if type=="object" or type=="array" then tojson else . end' "$STATE_FILE"
+}
+
+cmd_autopilot_set() {
+  ensure_state
+  acquire_lock
+  local field="${1:?autopilot field required}"
+  local value="${2:?json value required}"
+  local tmp
+  tmp=$(mktemp)
+  jq --arg f "$field" --argjson v "$value" \
+    '.maintainer = (.maintainer // {}) | .maintainer.autopilot = ((.maintainer.autopilot // {}) | .[$f] = $v)' \
+    "$STATE_FILE" > "$tmp" && mv "$tmp" "$STATE_FILE"
+  release_lock
+}
+
+cmd_autopilot_set_all() {
+  ensure_state
+  acquire_lock
+  # Merge a JSON object of autopilot fields (cycle/stop/last_heartbeat) into
+  # .maintainer.autopilot, PRESERVING any keys not in the payload (e.g. approvals).
+  local obj="${1:?autopilot JSON object required}"
+  local tmp
+  tmp=$(mktemp)
+  jq --argjson o "$obj" \
+    '.maintainer = (.maintainer // {}) | .maintainer.autopilot = ((.maintainer.autopilot // {}) + $o)' \
+    "$STATE_FILE" > "$tmp" && mv "$tmp" "$STATE_FILE"
+  release_lock
+}
+
+cmd_autopilot_approve() {
+  ensure_state
+  acquire_lock
+  # Record a human decision for an issue id so the loop stops parking it.
+  local id="${1:?issue id required}"
+  local tmp
+  tmp=$(mktemp)
+  jq --arg id "$id" \
+    '.maintainer = (.maintainer // {}) | .maintainer.autopilot = ((.maintainer.autopilot // {}) | .approvals = ((.approvals // []) + [$id] | unique))' \
+    "$STATE_FILE" > "$tmp" && mv "$tmp" "$STATE_FILE"
+  release_lock
+  echo "Approved: $id"
+}
+
 # Dispatch
 case "${1:-}" in
   init)               cmd_init ;;
@@ -406,6 +494,11 @@ case "${1:-}" in
   goal-set)           cmd_goal_set "${2:-}" "${3:-}" ;;
   goal-clear)         cmd_goal_clear ;;
   goal-get)           cmd_goal_get ;;
+  maintainer-budget)  cmd_maintainer_budget "${2:-}" ;;
+  autopilot-get)      cmd_autopilot_get "${2:-}" ;;
+  autopilot-set)      cmd_autopilot_set "${2:-}" "${3:-}" ;;
+  autopilot-set-all)  cmd_autopilot_set_all "${2:-}" ;;
+  autopilot-approve)  cmd_autopilot_approve "${2:-}" ;;
   migrate)            cmd_migrate ;;
   status)             cmd_status ;;
   *)                  usage; exit 1 ;;
