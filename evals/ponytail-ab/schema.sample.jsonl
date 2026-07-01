@@ -1,0 +1,2 @@
+{"ts":"<ISO-8601-UTC>","metric":"ponytail-ab","task":"<TASK_ID>","mode":"on","ladder":true,"loc":null,"tokens":null,"acceptance_pass":null,"verify":{"passed":null,"total":null},"run_mode":"dry","_note":"schema sample — loc/tokens/acceptance_pass are measured only under --live"}
+{"ts":"<ISO-8601-UTC>","metric":"ponytail-ab","task":"<TASK_ID>","mode":"off","ladder":false,"loc":null,"tokens":null,"acceptance_pass":null,"verify":{"passed":null,"total":null},"run_mode":"dry","_note":"schema sample — loc/tokens/acceptance_pass are measured only under --live"}
