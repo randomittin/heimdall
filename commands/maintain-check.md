@@ -1,39 +1,22 @@
 ---
 name: maintain-check
-description: Run one maintainer cycle — scan for issues, triage, fix, and queue releases. Use --dry-run to preview without executing.
+description: Run one durable maintainer autopilot cycle — budget-gated, stop-guarded, checkpointed. Use --dry-run to preview without executing.
 argument-hint: [--dry-run]
 disable-model-invocation: true
 ---
 
 # Maintainer Check Cycle
 
-Run a single maintainer cycle. This is the command that `/loop` or `/schedule` calls repeatedly.
+Run a single maintainer autopilot cycle. This is the command `/loop` or `/schedule`
+calls repeatedly. The heavy lifting is NOT prose LLM steps — it is delegated to the
+deterministic engine `bin/heimdall-maintain-loop`, which wraps the honest issue loop
+(`bin/heimdall-issue-loop` → pick → orient → fix → GATE → attest → PR). The engine
+owns the parts that must never drift: the token BUDGET CAP, the run-away STOP
+conditions, the approval PARK, agent-pool BACKPRESSURE, and the machine-readable
+CHECKPOINT receipt that lets a fresh session resume after death/compaction.
 
-## Dry-Run Mode
-
-If `$ARGUMENTS` contains `--dry-run`:
-- Run all scan and triage steps normally
-- Show what would happen for each issue (which agents would spawn, which branches would be created, what severity/confidence classification)
-- Do NOT actually spawn agents, create branches, create PRs, or modify state
-- Format output as a preview:
-
-```
-DRY RUN — Maintainer Check Preview
-=====================================
-
-Issues found: 5
-  #42 Safari login crash        → Critical x High  → WOULD: hotfix agent + human approval
-  #38 Typo in error msg         → Low x High       → WOULD: auto-fix, batch into patch
-  #45 API 500 on empty body     → High x High      → WOULD: fix + PR + request review
-  #47 Missing rate limiting     → High x Medium    → WOULD: investigate then fix
-  #51 Update dependencies       → Medium x Medium  → WOULD: investigate, queue
-
-Release queue: 2 items → WOULD: batch into v1.2.4
-
-No changes made. Run without --dry-run to execute.
-```
-
-This is useful for building trust before enabling full auto-fix.
+Your job here is thin: gate on enablement, run ONE cycle (or preview it), and report
+the receipt. Do not re-implement scan/triage/fix in prose — the engine is authoritative.
 
 ## Pre-flight
 
@@ -43,102 +26,94 @@ heimdall-state get '.maintainer.enabled'
 ```
 If `false`, respond: "Maintainer mode is off. Run `/hmd:maintain` to enable." and stop.
 
-2. Read the full maintainer guide for reference:
-   Read `skills/heimdall/references/maintainer-guide.md`
+## Dry-Run Mode
 
-## Cycle Steps
-
-### Step 1: Scan for new issues
-
-Check all configured issue sources:
+If `$ARGUMENTS` contains `--dry-run`, DO NOT execute or mutate anything. Show the plan:
 
 ```bash
-# Get configured sources
-heimdall-state get '.maintainer.issue_sources'
+# What the next drain WOULD do — budget snapshot + queued issues in pick order +
+# the action each would take (park for approval vs fix+gate+PR). Mutates nothing.
+heimdall-maintain-loop plan --repo .
+
+# The current queue buckets + in-flight machine states (read-only).
+heimdall-issue-loop status --repo .
 ```
 
-**For GitHub issues:**
+Render the preview from that JSON (issues found, per-issue WOULD-action, whether the
+run would STOP on budget/empty-queue, and the release-queue state). Example shape:
+
+```
+DRY RUN — Maintainer Autopilot Preview
+======================================
+enabled: true   budget: 12,400 / 600,000 tokens (2%)   over: false
+
+Queued (pick order):
+  github:acme/api#45  High     → WOULD: fix + GATE + PR
+  github:acme/api#42  Critical → WOULD: park for human approval (approval-wait)
+  github:acme/api#38  Low      → WOULD: fix + GATE + PR
+
+Would stop: (none — work remains)
+
+No changes made. Run without --dry-run to execute.
+```
+
+## Execute One Cycle
+
+Otherwise, run exactly ONE cycle through the engine. The engine checks the budget
+BEFORE running (an over-cap or unreadable meter STOPS without spending), picks the
+highest-priority issue, drives the full fix→GATE→attest→PR path, and appends the
+autopilot header block to `.planning/CHECKPOINT.md`:
+
 ```bash
-gh issue list --state open --json number,title,body,labels,createdAt --limit 20
+# --max 1 = one issue this cycle. --evidence supplies the runnable gate command(s)
+# SI-2 executes (the repo's real test/acceptance command); their recorded real exit
+# is the gate verdict (the cardinal rule — never a self-report). Pass the project's
+# actual gate command here, e.g. --evidence "npm test" (repeatable).
+heimdall-maintain-loop run --repo . --max 1 --evidence "<project gate command>"
 ```
 
-**For error logs** (if "logs" is in issue_sources):
-- Check for log paths in `heimdall-state get '.maintainer.log_paths'`
-- Parse recent entries for ERROR/FATAL patterns
-- Create synthetic issues for new error patterns
+The engine returns a JSON summary `{cycles, stop, tally, last, budget, heartbeat}`.
+Possible `stop` values and what they mean:
 
-**For Elastic/Sentry** (if configured):
-- Check configured endpoints in `heimdall-state get '.maintainer.error_tracking'`
+| stop | meaning | what to do |
+|------|---------|------------|
+| `null` | paused with work remaining (e.g. --max reached) | re-arm next cycle |
+| `budget` | token cap hit (or meter unreadable) | STOP — do not spend more |
+| `empty-queue` | nothing pickable | idle until new issues arrive |
+| `repeated-failure` | N consecutive gate failures on distinct issues | STOP — escalate to a human |
+| `disabled` | maintainer is off | nothing ran |
 
-### Step 2: Filter already-tracked issues
+A per-issue **approval-wait** park (severity ≥ critical, no recorded decision) does
+NOT stop the loop — that issue is flagged for a human and the loop continues with the
+others. Record a decision with `heimdall-state autopilot-approve <issue-id>` to let a
+future cycle pick it up.
 
-Compare scanned issues against `maintainer.pending_fixes` — skip any already being worked on.
+## Communicate
 
-### Step 3: Triage each new issue
+Report the one-line receipt (only if there was activity):
 
-For each new issue, classify using the routing matrix from the maintainer guide:
-
-1. **Classify severity**: Critical / High / Medium / Low
-   - Read the issue body, labels, and any linked error logs
-   - Critical: service down, data loss, security breach
-   - High: major feature broken
-   - Medium: minor bug, non-blocking
-   - Low: typo, cosmetic, minor improvement
-
-2. **Classify confidence**: High / Medium / Low
-   - High: clear root cause, straightforward fix
-   - Medium: likely cause, needs investigation
-   - Low: unclear, needs human input
-
-3. **Route based on matrix**:
-
-   | Route | Action |
-   |-------|--------|
-   | Critical x Any | Alert user immediately. Spawn hotfix coder agent on a `hotfix/<issue>` branch. Require human approval before merge. |
-   | High x High | Spawn coder agent on `fix/<issue>-<desc>` branch. Run test + lint + review agents. Create PR requesting human review. |
-   | High x Medium | Spawn architect agent to investigate first. If root cause found, spawn coder. Create PR. |
-   | Medium/Low x High | Spawn coder agent. Run quality pipeline. Add to release queue for batched patch. |
-   | Medium/Low x Medium | Spawn architect to investigate. If fixable, add to release queue. |
-   | Any x Low | Add to `maintainer.pending_fixes` with status "needs-human". Alert user with context. |
-
-### Step 4: Track state
-
-For each issue being worked on:
 ```bash
-# Add to pending_fixes
-heimdall-state set '.maintainer.pending_fixes += [{"issue": <NUMBER>, "status": "<status>", "severity": "<severity>", "confidence": "<confidence>", "branch": "<branch-name>"}]'
+heimdall-maintain-loop heartbeat --repo .
+# e.g. "autopilot: cycle 47 · 12 fixed · 2 flagged · 1 PR · budget 36% · last PASS gh-412"
 ```
 
-### Step 5: Check release queue
+- **Fixes / PRs**: quote the heartbeat (fixed / flagged / PR counts + last verdict).
+- **Stopped**: name the `stop` reason and whether a human is needed (budget / repeated-failure).
+- **Parked**: "Parked #<N> for human approval — decide with `heimdall-state autopilot-approve`."
 
-If there are 3+ items in `maintainer.release_queue`, or if the oldest item is more than 24 hours old:
+If Slack skills are available and the user has opted in, post the heartbeat to the
+configured channel.
 
-1. Collect all queued fixes
-2. Merge all fix branches into a `release/v<next-patch>` branch
-3. Run full test suite on the release branch
-4. If tests pass:
-   - Bump version in package.json / pyproject.toml / Cargo.toml (whichever exists)
-   - Generate changelog entry from PR descriptions
-   - Create release tag: `git tag v<version>`
-   - Create GitHub release: `gh release create v<version> --generate-notes`
-   - Clear the release queue
-   - Communicate: "Released v<version> with <N> fixes: <brief list>"
-5. If tests fail:
-   - Remove the failing fix from the batch
-   - Retry the release without it
-   - Flag the failing fix for investigation
+## Resume / Re-arm
 
-### Step 6: Communicate
+The engine writes a durable checkpoint every transition, so a brand-new session can
+tell whether to keep going. On SessionStart the orchestrator consults:
 
-After the cycle, post a summary (only if there was activity):
+```bash
+heimdall-maintain-loop resume-hint --repo .
+```
 
-- **New issues found**: "Found <N> new issues. <breakdown by severity>."
-- **Fixes in progress**: "<N> fixes being worked on."
-- **Release ready**: "Patch v<version> ready with <N> fixes."
-- **Needs help**: "Stuck on #<N> — <brief context>."
-
-If Slack skills are available and the user has opted in, post the summary to the configured channel.
-
-### Step 7: Done
-
-The cycle is complete. If running via `/loop`, it will repeat at the configured interval.
+It prints the `/loop 30m /hmd:maintain-check` re-arm line ONLY when the checkpoint has
+`stop: null` + maintainer enabled + budget remaining; otherwise it prints nothing (a
+finished or over-budget run does not auto-resurrect). If running via `/loop`, this
+cycle repeats at the configured interval until a terminal STOP.

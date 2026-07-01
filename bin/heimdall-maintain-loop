@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# heimdall-maintain-loop — the DURABLE maintainer AUTOPILOT loop.
+#
+# A survivable WRAPPER around the honest issue engine (bin/heimdall-issue-loop ->
+# bin/lib/issue_loop.py). It drives issue_loop.run_once one-or-N cycles with the
+# guarantees a bare `/loop` lacks: a hard BUDGET CAP, run-away STOP conditions, an
+# approval PARK, agent-pool BACKPRESSURE, and a machine-readable CHECKPOINT receipt
+# so a fresh session (post death / compaction) knows exactly where it was.
+#
+# Usage:
+#   heimdall-maintain-loop run [--repo DIR] [--base REF] [--evidence CMD]... \
+#         [--config @FILE|JSON] [--max N] [--budget-tokens N] [--max-failures N] \
+#         [--planning-dir DIR]
+#       Drain the queue one issue per cycle until a STOP condition trips (budget /
+#       empty-queue / repeated-failure) or --max cycles run. Each transition appends
+#       an autopilot header block to .planning/CHECKPOINT.md. The budget is checked
+#       BEFORE every cycle — an over-cap or unreadable meter STOPS without running.
+#   heimdall-maintain-loop plan [--repo DIR] [--config C] [--budget-tokens N]
+#       Read-only DRY-RUN: the budget, the queued issues in pick order, and what
+#       each WOULD do (park vs fix). Mutates nothing.
+#   heimdall-maintain-loop heartbeat [--repo DIR] [--planning-dir DIR]
+#       Render the last checkpoint block as ONE line receipt (wired into summary-card).
+#   heimdall-maintain-loop resume-hint [--repo DIR] [--planning-dir DIR]
+#       Print the /loop re-arm line IFF the checkpoint has stop:null + maintainer
+#       enabled + budget remaining; otherwise print nothing (SessionStart stays quiet).
+#   heimdall-maintain-loop status [--repo DIR]
+#       The queue status + the budget snapshot + the last checkpoint block.
+#   -h, --help                  this help.
+#
+# Exit status:
+#   0  a command completed (including an honest STOP / disabled / IDLE outcome)
+#   2  usage error / python missing
+
+set -euo pipefail
+
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+BINDIR="$(dirname "$SELF")"
+LIB="$BINDIR/lib/maintain_loop.py"
+
+usage() { sed -n '2,37p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+PY="$(command -v python3 || command -v python || true)"
+if [ -z "$PY" ]; then
+  echo "error: python3 not found (required for the maintain loop)" >&2
+  exit 2
+fi
+
+[ -f "$LIB" ] || { echo "error: missing library: $LIB" >&2; exit 2; }
+
+[ $# -ge 1 ] || { usage >&2; exit 2; }
+
+case "$1" in
+  -h|--help) usage; exit 0 ;;
+esac
+
+# Thin wrapper: the lib owns argv parsing + stdout shape (house style — same split
+# as bin/heimdall-issue-loop over bin/lib/issue_loop.py). The queue/loop libs are
+# siblings under bin/lib, so add it to PYTHONPATH for the imports/soft-imports.
+exec env PYTHONPATH="$BINDIR/lib:${PYTHONPATH:-}" "$PY" "$LIB" "$@"
