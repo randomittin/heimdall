@@ -29,6 +29,10 @@ LLM credential injected **by env only** (never argv, never logged). The differen
 purely *which process env carries the token* — the operator's shell (A) or the
 Secret-Manager-mounted Job env (B).
 
+> **You don't have to pick one.** [§6 **Hybrid**](#6-hybrid-runner-selection-prefer-rjs-box-auto-fall-back-to-the-cloud)
+> runs Arch A **when RJ's box is up** and auto-falls-back to Arch B **when it isn't** —
+> a cycle is **never dropped**. It is the default (`HEIMDALL_MAINTAINER_RUNNER=hybrid`).
+
 ---
 
 ## 1. Auth reality — prefer OAuth, fall back to the API key
@@ -221,6 +225,74 @@ gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
 ## 5. Verify (no spend)
 
 ```bash
-bash test/heimdall-cp-maintainer.test.sh   # hermetic: mocks the loop + gh, $0
+bash test/heimdall-cp-maintainer.test.sh       # hermetic: mocks the loop + gh, $0
 # → cp-maintainer: N passed, 0 failed  (smuggle REJECTED; token-never-logged proven)
+
+bash test/heimdall-cp-hybrid-runner.test.sh     # hermetic: mocks both runners + clock, $0
+# → cp-hybrid-runner: N passed, 0 failed
+#   (fresh beat→Arch A · stale/absent→Arch B · unclaimed→FAILOVER · none→PARK; never dropped;
+#    each decision logs ONE reason line; token reaches the child env yet no recorded surface)
 ```
+
+---
+
+## 6. Hybrid runner selection (prefer RJ's box, auto-fall-back to the cloud)
+
+Hybrid is the **default** (`HEIMDALL_MAINTAINER_RUNNER=hybrid`). It prefers **Arch A**
+(RJ's box, \$0) **while that box is up**, and auto-falls-back to **Arch B** (the Cloud Run
+Job) when it is not — **without ever dropping a cycle**. The selection is deterministic
+and reads **no credential** — only a liveness beat, the policy env, and the durable job
+state.
+
+### 6.1 How the box proves it is up — the runner beat (DATA-ONLY, no token)
+
+RJ's box advertises liveness by beating a **signed, TTL'd `maintainer-runner` presence
+record** to the control plane — the **same `cp_presence` substrate** the dev roster uses,
+under a distinct kind so it never mixes with the team roster. The beat is **DATA-ONLY**
+(`runner_id` + `repo` + `handle` + `ts`) — **no token, no command** rides it, by
+construction (secret-scrubbed on write). Run it on a **cron on RJ's box** (~every 30–60s):
+
+```bash
+# on RJ's box — advertise this runner as UP for the repo (cron every ~30-45s):
+* * * * * cd /path/to/heimdall && bin/heimdall-maintain-loop runner-beat \
+  --repo randomittin/heimdall --runner-id "$(hostname)" --handle rj-laptop >/dev/null 2>&1
+# (crontab's finest granularity is 1 min; for a tighter cadence run a `while sleep 30` loop
+#  under a supervisor, or a systemd timer. Keep the cadence < the TTL — see 6.3.)
+```
+
+Each beat upserts one record; the selector reads it back and treats the box as **UP** iff
+the newest beat is **fresher than the TTL**. Stop the cron (or the box dies) → the beat
+goes stale → the selector routes to the cloud on its own. No explicit "I'm down" signal.
+
+### 6.2 The decision (deterministic, logged, credential-free)
+
+With `HEIMDALL_MAINTAINER_RUNNER=hybrid`, each due `run-maintainer-cycle` tick:
+
+1. **fresh beat within TTL** → **Arch A** (`SubprocessRunner`, runs on the machine hosting
+   the dispatcher — RJ's box — at \$0).
+2. **no fresh beat**, cloud configured (a resolvable `GOOGLE_CLOUD_PROJECT` +
+   `HEIMDALL_CP_JOB_NAME`) → **Arch B** (a Cloud Run Job execution).
+3. **no fresh beat AND no cloud** → **PARK**: the durable job stays `queued`, re-drivable by
+   the next tick / `resume_orphans`. Flagged, **never dropped**.
+
+**Never-drop failover.** Under hybrid, if Arch A is picked but the job is **not claimed**
+(its durable state never leaves `queued`) within the **claim grace window** — the box went
+down *between* the beat and the claim — the cycle **fails over to Arch B**. If Arch B is
+unconfigured too, it **parks** (still never dropped). Every decision (SELECT / FAILOVER /
+PARK) emits **exactly one** token-free reason line to stderr (the Cloud Run log sink), so a
+run always names **which arm ran and why**.
+
+For hybrid to *have* both arms, run the dispatching control plane with the local
+`subprocess` runner available (`HEIMDALL_JOB_RUNNER=subprocess`, §2.3) **and** the Cloud Run
+Job configured as the fallback (`GOOGLE_CLOUD_PROJECT` + `HEIMDALL_CP_JOB_NAME`, §3).
+
+### 6.3 The knobs
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `HEIMDALL_MAINTAINER_RUNNER` | `hybrid` | `hybrid` (prefer A, fall back to B) · `local` (**force** Arch A) · `cloud` (**force** Arch B). An unknown value falls back to `hybrid` (logged). |
+| `HEIMDALL_MAINTAINER_RUNNER_TTL_SECONDS` | `90` | A beat fresher than this = the box is UP. Keep the beat **cadence < TTL** — 90s gives ~2 missed beats of slack for a 30–45s cron before the box is treated as down. |
+| `HEIMDALL_MAINTAINER_CLAIM_GRACE_SECONDS` | `30` | How long a dispatched Arch-A job may stay `queued` before hybrid fails over to Arch B (the box's worker should claim a fresh job well within this). |
+
+Force a single arm when you want it: `HEIMDALL_MAINTAINER_RUNNER=local` pins Arch A (RJ's
+box only — no cloud fallback), `=cloud` pins Arch B (zero-touch, ignores the beat).
