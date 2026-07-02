@@ -24,7 +24,7 @@ OUT2="$(OAUTH_TOKEN=SECRET-XYZ BOT_TOKEN=SECRET-XYZ bash "$S" --dry-run --cloud 
 printf '%s' "$OUT2" | grep -q 'SECRET-XYZ' && bad "token value leaked to stdout" || ok "no token value on stdout"
 
 # 4. --local mode omits gcloud from the plan's Arch-A section start
-bash "$S" --dry-run --local --repo acme/widgets 2>&1 | grep -q 'Arch A' && ok "local mode plans Arch A" || bad "local mode missing"
+OUT3="$(bash "$S" --dry-run --local --repo acme/widgets 2>&1)"; printf '%s' "$OUT3" | grep -q 'Arch A' && ok "local mode plans Arch A" || bad "local mode missing"
 
 echo "──────────"; echo "deploy-maintainer: $P passed, $F failed"
 [ "$F" = 0 ] || exit 1
