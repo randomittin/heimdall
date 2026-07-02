@@ -458,6 +458,30 @@ def tick(identity, now=None, *, home=None, approved_action_types=None,
     for entry in due_schedules(when, home=home):
         action_type = entry["action_type"]
         params = entry.get("params") or {}
+        # THE MAINTAINER ARM (§hybrid) — run-maintainer-cycle is dispatched through the
+        # HYBRID runner selector, NOT the synchronous §1 core: the cycle is a durable job
+        # that must run OUT OF PROCESS on whichever arm is available (the operator's box
+        # when it is up, else a Cloud Run Job), and must NEVER be dropped if the box dies.
+        # The selector still re-validates the params through cp_allowlist.validate (the §1
+        # gate holds — it decides WHERE the cycle runs, never WHAT), enqueues the durable
+        # job, dispatches to the chosen arm, and fails over / parks so a cycle is never lost.
+        if action_type == MAINTAINER_ACTION_TYPE:
+            import cp_maintainer_runner  # lazy — avoid an import cycle at scheduler load.
+            outcome = cp_maintainer_runner.dispatch_maintainer_cycle(
+                identity, params, home=home, base_env=base_env, now=when)
+            fired.append({
+                "schedule_id": entry["schedule_id"],
+                "action_type": action_type,
+                "status": outcome.get("http_status", 200),
+                "action_id": outcome.get("job_id"),
+                "audit_id": outcome.get("audit_id"),
+                "arm": outcome.get("arm"),
+                "reason": outcome.get("reason"),
+                "runner": outcome.get("runner"),
+                "parked": outcome.get("parked", False),
+                "failover": outcome.get("failover", False),
+            })
+            continue
         # DISPATCH through the §1 core — re-validates against cp_allowlist (an entry
         # that drifted off-allowlist, or a now-removed action_type, is refused HERE,
         # never run) and writes the §9 audit dispatch/refusal row.

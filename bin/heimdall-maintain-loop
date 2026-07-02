@@ -25,6 +25,14 @@
 #       enabled + budget remaining; otherwise print nothing (SessionStart stays quiet).
 #   heimdall-maintain-loop status [--repo DIR]
 #       The queue status + the budget snapshot + the last checkpoint block.
+#   heimdall-maintain-loop runner-beat [--repo OWNER/NAME] [--runner-id ID]
+#   heimdall-maintain-loop register-runner [--repo OWNER/NAME] [--runner-id ID]
+#       Register a self-hosted RUNNER LIVENESS beat with the control plane (Arch A). Run
+#       this from the operator's box on a cron (~every 30-60s): it upserts a signed,
+#       TTL'd "maintainer-runner" presence beat (reusing the cp_presence substrate) so the
+#       HYBRID dispatch routes the maintainer cycle to THIS box while it is up, and falls
+#       back to a Cloud Run Job (Arch B) when the beat goes stale. --runner-id defaults to
+#       the hostname; --repo scopes the beat to one repo (omit to advertise for any repo).
 #   -h, --help                  this help.
 #
 # Exit status:
@@ -37,7 +45,7 @@ SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 BINDIR="$(dirname "$SELF")"
 LIB="$BINDIR/lib/maintain_loop.py"
 
-usage() { sed -n '2,37p' "$SELF" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,45p' "$SELF" | sed 's/^# \{0,1\}//'; }
 
 PY="$(command -v python3 || command -v python || true)"
 if [ -z "$PY" ]; then
@@ -51,6 +59,36 @@ fi
 
 case "$1" in
   -h|--help) usage; exit 0 ;;
+  runner-beat|register-runner)
+    # THE SELF-HOSTED RUNNER LIVENESS BEAT (Arch A). Reuse the cp_presence heartbeat
+    # substrate via cp_maintainer_runner.record_runner_beat — a DATA-ONLY, secret-scrubbed,
+    # TTL'd "maintainer-runner" presence record the control plane's hybrid selector reads to
+    # decide whether to route the cycle to THIS box. NO token touches the beat by construction
+    # (only runner_id + repo + ts are stored). The operator runs this on a cron on his box.
+    shift
+    exec env PYTHONPATH="$BINDIR/lib:${PYTHONPATH:-}" "$PY" - "$@" <<'PYEOF'
+import argparse
+import json
+import socket
+import sys
+
+import cp_maintainer_runner as mr
+
+ap = argparse.ArgumentParser(prog="heimdall-maintain-loop runner-beat", add_help=True)
+ap.add_argument("--repo", default=None,
+                help="OWNER/NAME to scope the beat to (omit to advertise for any repo)")
+ap.add_argument("--runner-id", dest="runner_id", default=None,
+                help="stable id for this box (default: hostname)")
+ap.add_argument("--handle", default=None, help="optional human label for the runner")
+ap.add_argument("--home", default=None, help="control-plane HEIMDALL_HOME override")
+args = ap.parse_args()
+
+runner_id = args.runner_id or socket.gethostname() or "self-hosted-runner"
+res = mr.record_runner_beat(runner_id, repo=args.repo, handle=args.handle, home=args.home)
+print(json.dumps(res, sort_keys=True))
+sys.exit(0 if res.get("ok") else 1)
+PYEOF
+    ;;
 esac
 
 # Thin wrapper: the lib owns argv parsing + stdout shape (house style — same split
