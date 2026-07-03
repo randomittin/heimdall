@@ -38,7 +38,15 @@ PROJECT_ID="${PROJECT_ID:-heimdall-control-plane}"
 REGION="${REGION:-us-central1}"
 GATED_SERVICE="${GATED_SERVICE:-heimdall-control-plane}"
 PUBLIC_SERVICE="${PUBLIC_SERVICE:-heimdall-cp-public}"
-RUNTIME_SA="${RUNTIME_SA:-heimdall-cp-run@${PROJECT_ID}.iam.gserviceaccount.com}"
+# GATED runtime SA — the identity the gated control-plane service RUNS AS. NOT a hardcoded
+# truncated 'heimdall-cp-run' name never existed → the live iam.serviceAccounts.actAs
+# PERMISSION_DENIED). resolve_gated_sa() (called from the banner below) AUTO-DETECTS it from the
+# deployed gated service's serviceAccountName just before STEP 2; an explicit GATED_SA/RUNTIME_SA
+# env OVERRIDES it for a FRESH project where the service does not exist yet; else it falls back to
+# the default heimdall-cp-runtime@<project> (the REAL gated runtime SA name).
+GATED_SA_OVERRIDE="${GATED_SA:-${RUNTIME_SA:-}}"
+DEFAULT_GATED_SA="heimdall-cp-runtime@${PROJECT_ID}.iam.gserviceaccount.com"
+RUNTIME_SA="${GATED_SA_OVERRIDE:-${DEFAULT_GATED_SA}}"
 PUBLIC_SA_NAME="${PUBLIC_SA_NAME:-heimdall-cp-public-run}"
 PUBLIC_SA="${PUBLIC_SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
 # Secret NAMES only — never values. (RUNBOOK §2.)
@@ -98,10 +106,44 @@ retry() {
   done
 }
 
+# resolve_gated_sa — set RUNTIME_SA (the gated service-account the STEP-2 redeploy runs under),
+# in precedence order, mirroring deploy-public-rr.sh's resolve_runtime_sa:
+#   1. an explicit GATED_SA/RUNTIME_SA override (used verbatim — the escape hatch for a FRESH
+#      project where the gated service does not exist yet to auto-detect from).
+#   2. the deployed gated service's ACTUAL serviceAccountName (spec.template.spec.serviceAccountName
+#      from `gcloud run services describe`) — a redeploy keeps the identity it already runs as.
+#   3. the default heimdall-cp-runtime@<project> (the REAL gated runtime SA name) if the service is
+#      absent. The old truncated 'heimdall-cp-run' default never existed → actAs PERMISSION_DENIED.
+# In plan mode this runs ZERO gcloud (creds-optional): it prints the auto-detect intent + the
+# default it would fall back to. Sets the global RUNTIME_SA.
+resolve_gated_sa() {
+  if [ -n "${GATED_SA_OVERRIDE}" ]; then
+    RUNTIME_SA="${GATED_SA_OVERRIDE}"
+    note "gated runtime SA (explicit GATED_SA/RUNTIME_SA override): ${RUNTIME_SA}"
+    return 0
+  fi
+  if [ "$MODE" != "guided" ]; then
+    RUNTIME_SA="${DEFAULT_GATED_SA}"
+    note "gated runtime SA: AUTO-DETECTED at guided run from ${GATED_SERVICE} (spec.template.spec.serviceAccountName); default ${RUNTIME_SA} if the service is absent"
+    return 0
+  fi
+  local sa
+  sa="$(gcloud run services describe "${GATED_SERVICE}" --region="${REGION}" --project="${PROJECT_ID}" \
+          --format='value(spec.template.spec.serviceAccountName)' 2>/dev/null || true)"
+  if [ -n "${sa}" ]; then
+    RUNTIME_SA="${sa}"
+    note "gated runtime SA (auto-detected from deployed ${GATED_SERVICE}): ${RUNTIME_SA}"
+  else
+    RUNTIME_SA="${DEFAULT_GATED_SA}"
+    note "gated runtime SA (${GATED_SERVICE} not deployed yet — default): ${RUNTIME_SA}  (override with GATED_SA=<email>)"
+  fi
+}
+
 command -v gcloud >/dev/null 2>&1 || die "gcloud not found — install the Cloud SDK and authenticate."
 
 say "==> heimdall go-live (${MODE} mode) — RUNBOOK steps 2–7"
 note "project=${PROJECT_ID} region=${REGION}"
+resolve_gated_sa
 note "gated=${GATED_SERVICE} (SA ${RUNTIME_SA})   public=${PUBLIC_SERVICE} (SA ${PUBLIC_SA})"
 if [ "$MODE" = "plan" ]; then
   warn "PLAN/CHECK mode — prints the full sequence and runs ZERO mutating gcloud (no spend, creds-optional)."

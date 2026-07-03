@@ -131,7 +131,7 @@ args differ. The service's runtime SA needs permission to **execute** the Job
 export PROJECT_ID="heimdall-control-plane"        # the scoped Heimdall GCP project
 export REGION="us-central1"
 export SERVICE="heimdall-control-plane"
-export RUNTIME_SA="heimdall-cp-run@${PROJECT_ID}.iam.gserviceaccount.com"
+export RUNTIME_SA="heimdall-cp-runtime@${PROJECT_ID}.iam.gserviceaccount.com"
 
 gcloud config set project "${PROJECT_ID}"
 

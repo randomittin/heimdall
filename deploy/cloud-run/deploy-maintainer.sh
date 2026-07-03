@@ -24,7 +24,7 @@ set -euo pipefail
 MODE="hybrid"; DRY=0; REPO=""; PROJECT="heimdall-control-plane"; REGION="us-central1"
 MAXN="3"; CRON="*/30 * * * *"; SCHEDULE=""
 JOB="heimdall-maintainer-job"
-RUNTIME_SA="heimdall-cp-run@${PROJECT}.iam.gserviceaccount.com"
+RUNTIME_SA="heimdall-cp-runtime@${PROJECT}.iam.gserviceaccount.com"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 LOOP="$ROOT/bin/heimdall-maintain-loop"

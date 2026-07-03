@@ -86,7 +86,7 @@ PUBLIC_SA_NAME="${PUBLIC_SA_NAME:-heimdall-cp-public-run}" # least-privilege run
 PUBLIC_SA="${PUBLIC_SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
 # The gated service's dispatch-capable runtime SA (README §0). The public surface must
 # NEVER run as this identity — PREFLIGHT P2 hard-refuses if PUBLIC_SA resolves to it.
-GATED_SA="${GATED_SA:-heimdall-cp-run@${PROJECT_ID}.iam.gserviceaccount.com}"
+GATED_SA="${GATED_SA:-heimdall-cp-runtime@${PROJECT_ID}.iam.gserviceaccount.com}"
 ENROLL_SECRET="${ENROLL_SECRET:-cp-enroll-token}"          # enroll bootstrap-token verifier
 # ── ENROLL mode (TOKEN-gated by DEFAULT) + the TIGHT abuse-control envs (apply in BOTH modes) ─
 # HEIMDALL_ENROLL_OPEN=0 (DEFAULT) → the public service TOKEN-gates /enroll (the viral/public
