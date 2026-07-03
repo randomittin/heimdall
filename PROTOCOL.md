@@ -295,11 +295,20 @@ bin/heimdall-claim list      # → the claim, task_ref carries the cursor HAID
 
 ## Client registration (`.mcp.json`)
 
-A drop-in `.mcp.json` at the repo root registers the server with any MCP host:
+A drop-in `.mcp.json` at the repo root registers the server with any MCP host.
+The command path must resolve **independently of the host's working directory** —
+Claude Code launches plugin MCP servers with cwd = the *user's project*, not the
+plugin root, so a cwd-relative path (`bin/heimdall-ledger-mcp`) fails to launch
+(`-32000`, issue #2). Use the plugin-root variable Claude Code expands:
 
 ```json
-{ "mcpServers": { "heimdall-ledger": { "command": "bin/heimdall-ledger-mcp" } } }
+{ "mcpServers": { "heimdall-ledger": {
+    "command": "python3",
+    "args": ["${CLAUDE_PLUGIN_ROOT}/bin/heimdall-ledger-mcp"]
+} } }
 ```
 
-Point Cursor / Copilot / Claude Code at it; the host speaks `initialize` →
-`tools/list` → `tools/call` and the client joins the ledger with full attribution.
+For a generic MCP host (Cursor / Copilot) that does not expand
+`${CLAUDE_PLUGIN_ROOT}`, point `args` at the **absolute** install path instead.
+The host then speaks `initialize` → `tools/list` → `tools/call` and the client
+joins the ledger with full attribution.
