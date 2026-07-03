@@ -48,7 +48,7 @@ RUN pip install --no-cache-dir "cryptography==42.0.8" "google-cloud-firestore==2
 # missing/incompatible pin FAILS THE BUILD here (cheapest place to catch it) instead
 # of shipping an image that raises BackendUnavailable on every cp_boot tick (firestore)
 # or returns {dispatched: False} on every prod job dispatch (run_v2) at runtime.
-RUN python -c "import google.cloud.firestore, google.cloud.run_v2, google.cloud.secretmanager, cryptography; print("deps OK")"
+RUN python -c "import google.cloud.firestore, google.cloud.run_v2, google.cloud.secretmanager, cryptography; print('deps OK')"
 
 # Non-root runtime user (Cloud Run best practice; least privilege).
 RUN groupadd --system heimdall \
