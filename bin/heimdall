@@ -906,6 +906,22 @@ case "${1:-}" in
     fi
     exec "$DEMO_BIN" "$@"
     ;;
+  rr)
+    # `hmd rr` — remote-run: hand a task off from the LOCAL Heimdall to the
+    # CLOUD-hosted maintainer (the GCE VM) so heavy work runs remotely, not
+    # locally. The local hmd stays the orchestrator/UI; `rr` dispatches EXECUTION
+    # to the cloud hmd. Delegate to the sibling bin/rr, passing through all
+    # remaining args (the task/subcommand + flags: --dry-run, --issue, --repo,
+    # --local, setup, status).
+    shift
+    RR_BIN="$PLUGIN_DIR/bin/rr"
+    if [ ! -x "$RR_BIN" ]; then
+      echo "  Error: rr (remote-run) not found at $RR_BIN" >&2
+      echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+      exit 1
+    fi
+    exec "$RR_BIN" "$@"
+    ;;
   guard)
     # `hmd guard install` — wire the NATIVE git pre-push hook into the git repo
     # at the current directory. The hook runs on EVERY push (human or agent),
