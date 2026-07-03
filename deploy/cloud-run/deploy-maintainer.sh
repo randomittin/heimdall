@@ -11,6 +11,12 @@
 #   deploy-maintainer.sh --repo <owner/repo> [--local|--cloud|--hybrid] [--dry-run] \
 #                        [--project <id>] [--region <r>] [--max <N>] [--cron "<expr>"] \
 #                        [--schedule "<cron>"]
+#   RECOMMENDED bot identity — a GitHub App (no user seat, auto-scoped, revocable, PRs
+#   from the App; per-cycle 1-hour installation tokens minted by bin/heimdall-gh-app-token):
+#     [--gh-app --gh-app-id <N> --gh-app-installation-id <N> --gh-app-key-file <path.pem>]
+#     Provisions HEIMDALL_GH_APP_* (Arch A: a 0600 key file + env; Arch B: Secret Manager +
+#     Job env). The static HEIMDALL_PR_BOT_TOKEN (a fine-grained PAT) stays the FALLBACK
+#     when --gh-app is omitted. See deploy/github-app/setup-bot.sh to create the App.
 #   --hybrid (default) sets up Arch A (this box) AND Arch B (cloud fallback).
 #   --local  Arch A only (no gcloud).   --cloud  Arch B only.
 #   --schedule "<cron>" REGISTERS the maintainer cron with the control plane so the
@@ -23,7 +29,9 @@ set -euo pipefail
 
 MODE="hybrid"; DRY=0; REPO=""; PROJECT="heimdall-control-plane"; REGION="us-central1"
 MAXN="3"; CRON="*/30 * * * *"; SCHEDULE=""
+GH_APP=0; GH_APP_ID=""; GH_APP_INSTALL_ID=""; GH_APP_KEY_FILE=""
 JOB="heimdall-maintainer-job"
+GH_APP_KEY_SECRET="heimdall-gh-app-private-key"
 RUNTIME_SA="heimdall-cp-run@${PROJECT}.iam.gserviceaccount.com"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
@@ -31,8 +39,9 @@ LOOP="$ROOT/bin/heimdall-maintain-loop"
 CP_CLI="$ROOT/bin/heimdall-control-plane"
 YAML="$HERE/heimdall-maintainer-job.yaml"
 ENVFILE="$HOME/.heimdall/maintainer.env"
+GH_APP_KEY_STORE="$HOME/.heimdall/gh-app-private-key.pem"
 
-usage() { sed -n '2,21p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,28p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 while [ $# -gt 0 ]; do case "$1" in
   --local|--cloud|--hybrid) MODE="${1#--}"; shift ;;
   --dry-run) DRY=1; shift ;;
@@ -42,6 +51,10 @@ while [ $# -gt 0 ]; do case "$1" in
   --max) MAXN="${2:?}"; shift 2 ;;
   --cron) CRON="${2:?}"; shift 2 ;;
   --schedule) SCHEDULE="${2:?}"; shift 2 ;;
+  --gh-app) GH_APP=1; shift ;;
+  --gh-app-id) GH_APP_ID="${2:?}"; shift 2 ;;
+  --gh-app-installation-id) GH_APP_INSTALL_ID="${2:?}"; shift 2 ;;
+  --gh-app-key-file) GH_APP_KEY_FILE="${2:?}"; shift 2 ;;
   -h|--help) usage; exit 0 ;;
   *) echo "unknown arg: $1" >&2; usage >&2; exit 2 ;;
 esac; done
@@ -87,9 +100,22 @@ collect_secrets() {
   claude setup-token || die "claude setup-token failed"
   printf 'Paste the CLAUDE_CODE_OAUTH_TOKEN (sk-ant-oat-...): '; read -rs OAUTH_TOKEN; echo
   [ -n "$OAUTH_TOKEN" ] || die "no OAuth token entered"
-  printf 'Paste the HEIMDALL_PR_BOT_TOKEN (scoped: contents:write on heimdall/*, pull_requests:write; NO main, NO merge): '
-  read -rs BOT_TOKEN; echo
-  [ -n "$BOT_TOKEN" ] || die "no bot token entered"
+  if [ "$GH_APP" = 1 ]; then
+    # RECOMMENDED: a GitHub App bot identity. The App id + installation id come from
+    # args; the private key from a file (never prompted — a PEM is multi-line). The
+    # static PAT becomes an OPTIONAL fallback (press Enter to skip).
+    [ -n "$GH_APP_ID" ] && [ -n "$GH_APP_INSTALL_ID" ] \
+      || die "--gh-app needs --gh-app-id <N> and --gh-app-installation-id <N>"
+    [ -f "$GH_APP_KEY_FILE" ] \
+      || die "--gh-app needs --gh-app-key-file <path.pem> (an existing App private key)"
+    say "GitHub App PR-bot: id=$GH_APP_ID install=$GH_APP_INSTALL_ID (per-cycle 1h tokens; no user seat)"
+    printf 'Optional static HEIMDALL_PR_BOT_TOKEN fallback (press Enter to skip): '
+    read -rs BOT_TOKEN; echo
+  else
+    printf 'Paste the HEIMDALL_PR_BOT_TOKEN (scoped: contents:write on heimdall/*, pull_requests:write; NO main, NO merge): '
+    read -rs BOT_TOKEN; echo
+    [ -n "$BOT_TOKEN" ] || die "no bot token entered"
+  fi
 }
 
 # ── Arch A: local runner on this box ─────────────────────────────────────────
@@ -97,11 +123,22 @@ arch_a() {
   say "Arch A — local runner on this machine"
   if [ "$DRY" != 1 ]; then
     mkdir -p "$(dirname "$ENVFILE")"
+    if [ "$GH_APP" = 1 ]; then
+      # copy the App private key to a 0600 store the env file points at (never inline a
+      # multi-line PEM into the env file). HEIMDALL_GH_APP_PRIVATE_KEY_FILE feeds the minter.
+      ( umask 177; cp "$GH_APP_KEY_FILE" "$GH_APP_KEY_STORE" ); chmod 600 "$GH_APP_KEY_STORE"
+    fi
     ( umask 177; {
         printf 'export HEIMDALL_JOB_RUNNER=subprocess\n'
         printf 'export HEIMDALL_MAINTAINER_RUNNER=hybrid\n'
         printf 'export CLAUDE_CODE_OAUTH_TOKEN=%q\n' "$OAUTH_TOKEN"
-        printf 'export HEIMDALL_PR_BOT_TOKEN=%q\n' "$BOT_TOKEN"
+        if [ "$GH_APP" = 1 ]; then
+          printf 'export HEIMDALL_GH_APP_ID=%q\n' "$GH_APP_ID"
+          printf 'export HEIMDALL_GH_APP_INSTALLATION_ID=%q\n' "$GH_APP_INSTALL_ID"
+          printf 'export HEIMDALL_GH_APP_PRIVATE_KEY_FILE=%q\n' "$GH_APP_KEY_STORE"
+        fi
+        # the static PAT is written only when present (App creds are the primary path).
+        [ -n "$BOT_TOKEN" ] && printf 'export HEIMDALL_PR_BOT_TOKEN=%q\n' "$BOT_TOKEN"
       } > "$ENVFILE" )
     chmod 600 "$ENVFILE"
     say "wrote $ENVFILE (mode 600 — contents never printed)"
@@ -111,7 +148,12 @@ arch_a() {
     run "$LOOP" runner-beat --repo "$REPO"
     run "$LOOP" run --max 1 --repo "$ROOT"
   else
-    run "umask 177; write $ENVFILE (HEIMDALL_JOB_RUNNER, HEIMDALL_MAINTAINER_RUNNER, tokens) chmod 600"
+    if [ "$GH_APP" = 1 ]; then
+      run "umask 177; cp <App key.pem> $GH_APP_KEY_STORE chmod 600"
+      run "umask 177; write $ENVFILE (HEIMDALL_JOB_RUNNER, HEIMDALL_MAINTAINER_RUNNER, CLAUDE_CODE_OAUTH_TOKEN, HEIMDALL_GH_APP_ID, HEIMDALL_GH_APP_INSTALLATION_ID, HEIMDALL_GH_APP_PRIVATE_KEY_FILE, [static HEIMDALL_PR_BOT_TOKEN fallback]) chmod 600"
+    else
+      run "umask 177; write $ENVFILE (HEIMDALL_JOB_RUNNER, HEIMDALL_MAINTAINER_RUNNER, tokens) chmod 600"
+    fi
     run "$LOOP runner-beat --repo $REPO"
     run "$LOOP run --max 1 --repo $ROOT"
   fi
@@ -140,10 +182,31 @@ mksecret() { # $1 secret name  $2 token-var-name (value via stdin, never argv)
     --member="serviceAccount:${RUNTIME_SA}" --role=roles/secretmanager.secretAccessor >/dev/null
   say "secret $name: version added + accessor granted"
 }
+mksecret_file() { # $1 secret name  $2 file path (streamed via --data-file, never argv)
+  local name="$1" file="$2"
+  run "gcloud secrets create $name --replication-policy=automatic --project=$PROJECT  (|| exists)"
+  [ "$DRY" = 1 ] && { run "gcloud secrets versions add $name --data-file=<App key.pem> --project=$PROJECT"; return 0; }
+  gcloud secrets create "$name" --replication-policy=automatic --project="$PROJECT" 2>/dev/null || true
+  gcloud secrets versions add "$name" --data-file="$file" --project="$PROJECT" >/dev/null
+  gcloud secrets add-iam-policy-binding "$name" --project="$PROJECT" \
+    --member="serviceAccount:${RUNTIME_SA}" --role=roles/secretmanager.secretAccessor >/dev/null
+  say "secret $name: version added + accessor granted"
+}
 arch_b() {
   say "Arch B — Cloud Run Job (project=$PROJECT region=$REGION)"
   mksecret heimdall-cc-oauth-token OAUTH_TOKEN
-  mksecret heimdall-pr-bot-token   BOT_TOKEN
+  if [ "$GH_APP" = 1 ]; then
+    # RECOMMENDED bot identity — the App private key as a secret; App id + installation id
+    # as (non-secret) Job env. The Job mints a fresh 1h installation token per cycle.
+    mksecret_file "$GH_APP_KEY_SECRET" "$GH_APP_KEY_FILE"
+    say "GitHub App PR-bot (recommended): wire the maintainer Job with —"
+    printf '  \033[90m--set-secrets="HEIMDALL_GH_APP_PRIVATE_KEY=%s:latest"\033[0m\n' "$GH_APP_KEY_SECRET"
+    printf '  \033[90m--set-env-vars="HEIMDALL_GH_APP_ID=%s,HEIMDALL_GH_APP_INSTALLATION_ID=%s"\033[0m\n' "$GH_APP_ID" "$GH_APP_INSTALL_ID"
+  fi
+  # the static PAT secret is the fallback — created in dry-run (shape) or when a PAT was entered.
+  if [ "$DRY" = 1 ] || [ -n "$BOT_TOKEN" ]; then
+    mksecret heimdall-pr-bot-token   BOT_TOKEN
+  fi
   # image toolchain gate: the base long-job image lacks git/gh/claude — refuse a broken deploy
   say "verify the maintainer image carries git + gh + claude"
   if [ "$DRY" != 1 ]; then
