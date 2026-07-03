@@ -231,9 +231,9 @@ _Filed by \`rr\` (remote-run) for the cloud maintainer. The bot opens the PR; a 
   local existing listing
   listing="$(gh issue list --repo "$CFG_REPO" --label maintainer --state open \
              --json number,title --limit 100 2>/dev/null || echo '[]')"
-  existing="$(RR_TITLE="$title" "$PY" - <<PYEOF
+  existing="$(RR_TITLE="$title" RR_LISTING="$listing" "$PY" - <<'PYEOF'
 import json, os, sys
-raw = '''$listing'''
+raw = os.environ.get("RR_LISTING", "")
 try:
     data = json.loads(raw) if raw.strip() else []
 except Exception:
