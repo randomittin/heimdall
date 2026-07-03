@@ -1,0 +1,400 @@
+#!/usr/bin/env bash
+# rr — remote-run: hand a task off from the LOCAL Heimdall to the CLOUD-hosted
+# maintainer (the GCE VM) so heavy work runs remotely, not locally. The local
+# `hmd` stays the orchestrator/UI; `rr` dispatches EXECUTION to the cloud hmd.
+#
+# THE HANDOFF (default VM mode):
+#   1. FILE the task as a durable, auditable maintainer ISSUE (the maintainer's
+#      native queue): `gh issue create --repo <R> --label maintainer ...`. The
+#      resulting PR links back to it. Idempotent — an identical OPEN issue is
+#      REUSED, never re-filed.
+#   2. HAND OFF to the cloud executor — SSH to the configured VM and run the
+#      maintainer THERE, detached, so `rr` returns fast:
+#        gcloud compute ssh <vm> --zone <z> --project <p> --tunnel-through-iap \
+#          --command "export PATH=/opt/heimdall/bin:\$PATH;
+#                     export HEIMDALL_MAINTAINER_RUNNER=hybrid HEIMDALL_JOB_RUNNER=subprocess;
+#                     nohup heimdall-maintain-loop run --repo <clone-dir> --max <N> \
+#                       >> \$HOME/.heimdall/rr.log 2>&1 &"
+#      The VM already holds its own claude + gh + bot creds — `rr` NEVER passes a
+#      secret over argv or logs one. The bot OPENS PRs on heimdall/* branches; a
+#      human merges (unchanged).
+#   3. REPORT — the issue URL, "dispatched to <vm>", and how to watch it.
+#
+# SUBCOMMANDS:
+#   rr setup --vm <name> --zone <z> --project <p> [--repo <default>] [--mode vm|control-plane]
+#         Write ~/.heimdall/remote.json (the cloud target). No secret is ever stored.
+#   rr "<task>" [--repo <owner/repo>] [--max N] [--dry-run]
+#         File the maintainer issue (idempotent) + dispatch to the cloud executor.
+#   rr --issue <N> [--repo R] [--max N] [--dry-run]
+#         Skip filing; dispatch the maintainer to DRAIN an existing issue.
+#   rr status [--repo R] [--dry-run]
+#         Recent dispatches + open maintainer PRs (gh pr list) + the remote rr.log tail.
+#   rr --local [...]
+#         FALLBACK: run heimdall-maintain-loop LOCALLY (clearly noted — not cloud).
+#
+# FLAGS: --repo <owner/repo> · --max <N> (default 3) · --mode vm|control-plane ·
+#        --vm/--zone/--project (setup or per-call override) · --dry-run · --local ·
+#        -h/--help. --dry-run everywhere PRINTS the gh + ssh plan and executes
+#        nothing (no creds needed).
+#
+# MODES:
+#   vm             (default MVP) — SSH to the VM, run the maintainer there.
+#   control-plane  (alt) — instead of SSH, register the bounded, allowlisted
+#                  run-maintainer-cycle via `heimdall-control-plane
+#                  schedule-maintainer` (the per-minute tick fires it; the hybrid
+#                  runner routes it). Reuses the existing §1 allowlist path.
+#
+# Exit status: 0 ok · 2 usage error · 1 fail-closed (no remote / missing tool).
+set -euo pipefail
+
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+BINDIR="$(dirname "$SELF")"
+REMOTE_JSON="$HOME/.heimdall/remote.json"
+DISPATCH_LOG="$HOME/.heimdall/rr-dispatch.log"
+
+PY="$(command -v python3 || command -v python || true)"
+
+# ── house-style helpers (mirrors deploy/gce/provision-maintainer-vm.sh) ────────
+say()  { printf '\033[36m▸ %s\033[0m\n' "$*"; }
+warn() { printf '\033[33m! %s\033[0m\n' "$*" >&2; }
+die()  { printf '\033[31m✗ %s\033[0m\n' "$*" >&2; exit "${2:-1}"; }
+# plan: print a command line in --dry-run (a $-prefixed grey line); NEVER a secret.
+plan() { printf '  \033[90m$ %s\033[0m\n' "$*"; }
+
+usage() { sed -n '2,60p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+# validate a repo slug (owner/name, no shell metacharacters) — same gate provision uses.
+valid_repo() { printf '%s' "$1" | grep -qE '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'; }
+
+# derive_title — a deterministic, single-line, ≤72-char title from the task body
+# (deterministic so the idempotency lookup is stable across runs).
+derive_title() {
+  local t="$1"
+  t="${t%%$'\n'*}"
+  t="$(printf '%s' "$t" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+  if [ "${#t}" -gt 72 ]; then t="${t:0:69}..."; fi
+  printf '%s' "$t"
+}
+
+# ── arg parse (subcommand may lead; flags in any order) ────────────────────────
+CMD=""            # setup | status | "" (task/dispatch flow)
+TASK=""
+ISSUE=""
+REPO_OVERRIDE=""
+MAXN=""
+MODE_OVERRIDE=""
+VM_OVERRIDE=""
+ZONE_OVERRIDE=""
+PROJECT_OVERRIDE=""
+DRY=0
+LOCAL=0
+
+case "${1:-}" in
+  setup|status) CMD="$1"; shift ;;
+  -h|--help)    usage; exit 0 ;;
+esac
+
+while [ $# -gt 0 ]; do case "$1" in
+  --dry-run)   DRY=1;                    shift ;;
+  --local)     LOCAL=1;                  shift ;;
+  --issue)     ISSUE="${2:?--issue needs N}";       shift 2 ;;
+  --repo)      REPO_OVERRIDE="${2:?--repo needs owner/repo}"; shift 2 ;;
+  --max)       MAXN="${2:?--max needs N}";          shift 2 ;;
+  --mode)      MODE_OVERRIDE="${2:?--mode needs vm|control-plane}"; shift 2 ;;
+  --vm)        VM_OVERRIDE="${2:?--vm needs name}"; shift 2 ;;
+  --zone)      ZONE_OVERRIDE="${2:?--zone needs zone}";       shift 2 ;;
+  --project)   PROJECT_OVERRIDE="${2:?--project needs id}";   shift 2 ;;
+  -h|--help)   usage; exit 0 ;;
+  --)          shift; break ;;
+  -*)          die "unknown flag: $1 (see: rr --help)" 2 ;;
+  *)           if [ -z "$TASK" ]; then TASK="$1"; else TASK="$TASK $1"; fi; shift ;;
+esac; done
+
+# ── remote-target resolution ───────────────────────────────────────────────────
+# Built-in defaults mirror deploy/gce/provision-maintainer-vm.sh so a --dry-run
+# plan is printable WITHOUT a configured remote; a REAL cloud dispatch still
+# requires remote.json (fail-closed — never SSH a guessed VM with real creds).
+REMOTE_CONFIGURED=0
+CFG_VM="heimdall-maintainer-vm"
+CFG_ZONE="us-central1-a"
+CFG_PROJECT="heimdall-control-plane"
+CFG_REPO="randomittin/heimdall"
+CFG_MODE="vm"
+
+load_remote() {
+  [ -f "$REMOTE_JSON" ] || return 1
+  [ -n "$PY" ] || die "python3 required to read $REMOTE_JSON"
+  local vals
+  vals="$("$PY" - "$REMOTE_JSON" <<'PYEOF'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(1)
+def g(k, dv=""):
+    v = d.get(k)
+    return str(v) if v is not None else dv
+print("\t".join([g("vm"), g("zone"), g("project"), g("repo"), g("mode", "vm")]))
+PYEOF
+)" || return 1
+  IFS=$'\t' read -r r_vm r_zone r_project r_repo r_mode <<<"$vals"
+  [ -n "$r_vm" ]      && CFG_VM="$r_vm"
+  [ -n "$r_zone" ]    && CFG_ZONE="$r_zone"
+  [ -n "$r_project" ] && CFG_PROJECT="$r_project"
+  [ -n "$r_repo" ]    && CFG_REPO="$r_repo"
+  [ -n "$r_mode" ]    && CFG_MODE="$r_mode"
+  REMOTE_CONFIGURED=1
+  return 0
+}
+
+load_remote || true
+
+# apply per-call overrides on top of remote.json / defaults.
+[ -n "$REPO_OVERRIDE" ]    && CFG_REPO="$REPO_OVERRIDE"
+[ -n "$MODE_OVERRIDE" ]    && CFG_MODE="$MODE_OVERRIDE"
+[ -n "$VM_OVERRIDE" ]      && CFG_VM="$VM_OVERRIDE"
+[ -n "$ZONE_OVERRIDE" ]    && CFG_ZONE="$ZONE_OVERRIDE"
+[ -n "$PROJECT_OVERRIDE" ] && CFG_PROJECT="$PROJECT_OVERRIDE"
+[ -z "$MAXN" ] && MAXN="3"
+printf '%s' "$MAXN" | grep -qE '^[0-9]+$' || die "--max must be a non-negative integer (got: $MAXN)" 2
+
+# ── SETUP — write ~/.heimdall/remote.json (the cloud target; no secret) ────────
+do_setup() {
+  [ -n "$VM_OVERRIDE" ]      || die "setup needs --vm <name>" 2
+  [ -n "$ZONE_OVERRIDE" ]    || die "setup needs --zone <zone>" 2
+  [ -n "$PROJECT_OVERRIDE" ] || die "setup needs --project <id>" 2
+  local mode="${MODE_OVERRIDE:-vm}"
+  case "$mode" in vm|control-plane) ;; *) die "--mode must be vm|control-plane (got: $mode)" 2 ;; esac
+  local repo="${REPO_OVERRIDE:-}"
+  [ -z "$repo" ] || valid_repo "$repo" || die "--repo must be owner/name (got: $repo)" 2
+  [ -n "$PY" ] || die "python3 required to write remote.json"
+
+  if [ "$DRY" = 1 ]; then
+    say "dry-run: would write $REMOTE_JSON:"
+    plan "vm=$VM_OVERRIDE zone=$ZONE_OVERRIDE project=$PROJECT_OVERRIDE repo=${repo:-<none>} mode=$mode"
+    warn "dry-run: nothing written."
+    return 0
+  fi
+
+  mkdir -p "$HOME/.heimdall"; chmod 700 "$HOME/.heimdall" 2>/dev/null || true
+  VM="$VM_OVERRIDE" ZONE="$ZONE_OVERRIDE" PROJECT="$PROJECT_OVERRIDE" \
+  REPO="$repo" MODE="$mode" DEST="$REMOTE_JSON" "$PY" - <<'PYEOF'
+import json, os
+dest = os.environ["DEST"]
+cfg = {
+    "vm": os.environ["VM"],
+    "zone": os.environ["ZONE"],
+    "project": os.environ["PROJECT"],
+    "repo": os.environ.get("REPO") or "",
+    "mode": os.environ.get("MODE") or "vm",
+}
+with open(dest, "w") as f:
+    json.dump(cfg, f, indent=2, sort_keys=True)
+    f.write("\n")
+PYEOF
+  # remote.json holds NO secret by construction, but keep it owner-only anyway.
+  chmod 600 "$REMOTE_JSON" 2>/dev/null || true
+  say "wrote $REMOTE_JSON (cloud target: vm=$VM_OVERRIDE zone=$ZONE_OVERRIDE project=$PROJECT_OVERRIDE mode=$mode)"
+  say "next: rr \"<task>\" --dry-run   # preview the local→cloud handoff plan"
+}
+
+# ── FILE the maintainer issue (idempotent) ─────────────────────────────────────
+# Sets ISSUE_REF (a human "#N"/URL) for the report. In --dry-run it PRINTS the
+# plan and touches nothing.
+ISSUE_REF=""
+file_issue() {
+  [ -n "$TASK" ] || die "no task given — usage: rr \"<task>\" [--repo R]" 2
+  local title body
+  title="$(derive_title "$TASK")"
+  body="$TASK
+
+## Acceptance
+- [ ] Change implemented; the project's tests pass
+- [ ] Lint clean (zero warnings)
+- [ ] PR opened on a heimdall/* branch, linking this issue
+
+_Filed by \`rr\` (remote-run) for the cloud maintainer. The bot opens the PR; a human merges._"
+
+  if [ "$DRY" = 1 ]; then
+    say "would file the maintainer issue (idempotent — an identical OPEN issue is reused):"
+    plan "gh issue list --repo $CFG_REPO --label maintainer --state open --json number,title --limit 100  # dedup by title"
+    plan "gh issue create --repo $CFG_REPO --label maintainer --title \"$title\" --body <task + acceptance>"
+    ISSUE_REF="(dry-run: not filed)"
+    return 0
+  fi
+
+  command -v gh >/dev/null 2>&1 || die "gh not found — install the GitHub CLI (https://cli.github.com)"
+  gh auth status >/dev/null 2>&1 || die "gh not authenticated — run: gh auth login"
+  valid_repo "$CFG_REPO" || die "invalid repo slug: $CFG_REPO (set --repo owner/name)" 2
+
+  # idempotency: reuse an OPEN maintainer issue with the exact same title.
+  local existing listing
+  listing="$(gh issue list --repo "$CFG_REPO" --label maintainer --state open \
+             --json number,title --limit 100 2>/dev/null || echo '[]')"
+  existing="$(RR_TITLE="$title" "$PY" - <<PYEOF
+import json, os, sys
+raw = '''$listing'''
+try:
+    data = json.loads(raw) if raw.strip() else []
+except Exception:
+    data = []
+t = os.environ["RR_TITLE"]
+for it in data:
+    if it.get("title") == t:
+        print(it.get("number"))
+        break
+PYEOF
+)"
+  if [ -n "$existing" ]; then
+    ISSUE_REF="#$existing"
+    say "reusing existing OPEN maintainer issue $ISSUE_REF (idempotent — not re-filed)"
+    return 0
+  fi
+
+  local url
+  url="$(gh issue create --repo "$CFG_REPO" --label maintainer \
+         --title "$title" --body "$body")"
+  ISSUE_REF="$url"
+  say "filed maintainer issue: $url"
+}
+
+# ── DISPATCH to the cloud executor ─────────────────────────────────────────────
+# The remote command: put /opt/heimdall/bin on PATH, pin the hybrid runner +
+# subprocess job runner, and run a bounded maintain-loop cycle DETACHED (nohup &)
+# so ssh — and `rr` — return fast. $HOME/$PATH stay literal (expand on the VM).
+build_remote_cmd() {
+  local clone_dir="\$HOME/heimdall-work/${CFG_REPO##*/}"
+  printf '%s' "export PATH=/opt/heimdall/bin:\$PATH; export HEIMDALL_MAINTAINER_RUNNER=hybrid HEIMDALL_JOB_RUNNER=subprocess; mkdir -p \$HOME/.heimdall; nohup heimdall-maintain-loop run --repo $clone_dir --max $MAXN >> \$HOME/.heimdall/rr.log 2>&1 &"
+}
+
+dispatch_vm() {
+  local remote_cmd; remote_cmd="$(build_remote_cmd)"
+  if [ "$DRY" = 1 ]; then
+    say "would hand off to the cloud executor (SSH to $CFG_VM, run the maintainer there, detached):"
+    plan "gcloud compute ssh $CFG_VM --zone $CFG_ZONE --project $CFG_PROJECT --tunnel-through-iap --command \"$remote_cmd\""
+    return 0
+  fi
+  command -v gcloud >/dev/null 2>&1 || die "gcloud not found — install the Google Cloud SDK (https://cloud.google.com/sdk)"
+  say "dispatching to $CFG_VM ($CFG_ZONE / $CFG_PROJECT) — maintainer runs on the VM, detached"
+  gcloud compute ssh "$CFG_VM" --zone "$CFG_ZONE" --project "$CFG_PROJECT" \
+    --tunnel-through-iap --command "$remote_cmd"
+  printf '%s\tvm=%s\trepo=%s\tissue=%s\tmax=%s\n' \
+    "$(date -u +%FT%TZ)" "$CFG_VM" "$CFG_REPO" "${ISSUE_REF:-?}" "$MAXN" >> "$DISPATCH_LOG"
+}
+
+# control-plane mode (alt): reuse the bounded §1 allowlist path. Register the
+# allowlisted run-maintainer-cycle via heimdall-control-plane; the per-minute tick
+# fires it and the hybrid runner routes it. This is the control-plane equivalent
+# of the VM one-shot (a bounded, typed, refuse-on-bad-params dispatch).
+dispatch_control_plane() {
+  local cp="$BINDIR/heimdall-control-plane"
+  local cron="* * * * *"
+  if [ "$DRY" = 1 ]; then
+    say "would dispatch via the control-plane bounded allowlist (run-maintainer-cycle):"
+    plan "heimdall-control-plane schedule-maintainer --repo $CFG_REPO --cron \"$cron\" --max $MAXN"
+    return 0
+  fi
+  [ -x "$cp" ] || die "control-plane CLI not found at $cp"
+  say "dispatching via the control-plane (bounded run-maintainer-cycle for $CFG_REPO)"
+  "$cp" schedule-maintainer --repo "$CFG_REPO" --cron "$cron" --max "$MAXN"
+  printf '%s\tcontrol-plane\trepo=%s\tissue=%s\tmax=%s\n' \
+    "$(date -u +%FT%TZ)" "$CFG_REPO" "${ISSUE_REF:-?}" "$MAXN" >> "$DISPATCH_LOG"
+}
+
+dispatch_cloud() {
+  # fail-closed: a REAL cloud dispatch needs a configured target — never SSH a
+  # guessed VM with the operator's live creds.
+  if [ "$DRY" != 1 ] && [ "$REMOTE_CONFIGURED" != 1 ]; then
+    die "no remote target configured — run: rr setup --vm <name> --zone <z> --project <p> [--repo <default>]"
+  fi
+  case "$CFG_MODE" in
+    vm)             dispatch_vm ;;
+    control-plane)  dispatch_control_plane ;;
+    *)              die "unknown mode '$CFG_MODE' (expected vm|control-plane)" 2 ;;
+  esac
+}
+
+# ── LOCAL fallback — run heimdall-maintain-loop on THIS box (clearly not cloud) ─
+dispatch_local() {
+  local loop="$BINDIR/heimdall-maintain-loop"
+  # local --repo is a working DIRECTORY (a path override) or the current dir.
+  local repo_dir="."
+  [ -n "$REPO_OVERRIDE" ] && repo_dir="$REPO_OVERRIDE"
+  warn "running LOCAL, not cloud (no cloud dispatch — this box does the work)"
+  local cmd="HEIMDALL_MAINTAINER_RUNNER=hybrid HEIMDALL_JOB_RUNNER=subprocess $loop run --repo $repo_dir --max $MAXN"
+  if [ "$DRY" = 1 ]; then
+    say "would run the maintainer LOCALLY (fallback — not the cloud VM):"
+    plan "$cmd"
+    return 0
+  fi
+  [ -x "$loop" ] || die "local maintain-loop not found at $loop"
+  say "running maintainer LOCALLY on this box (repo=$repo_dir, max=$MAXN)"
+  HEIMDALL_MAINTAINER_RUNNER=hybrid HEIMDALL_JOB_RUNNER=subprocess \
+    "$loop" run --repo "$repo_dir" --max "$MAXN"
+}
+
+# ── STATUS — recent dispatches + open maintainer PRs + the remote log tail ─────
+do_status() {
+  say "recent rr dispatches:"
+  if [ -s "$DISPATCH_LOG" ]; then
+    tail -n 10 "$DISPATCH_LOG" | sed 's/^/    /'
+  else
+    printf '    (none yet)\n'
+  fi
+
+  say "open maintainer PRs:"
+  if [ "$DRY" = 1 ]; then
+    plan "gh pr list --repo $CFG_REPO --label maintainer --state open"
+  elif command -v gh >/dev/null 2>&1; then
+    gh pr list --repo "$CFG_REPO" --label maintainer --state open 2>/dev/null | sed 's/^/    /' || true
+  else
+    warn "gh not found — skipping the PR list"
+  fi
+
+  say "remote maintainer log (rr.log tail on $CFG_VM):"
+  if [ "$DRY" = 1 ]; then
+    plan "gcloud compute ssh $CFG_VM --zone $CFG_ZONE --project $CFG_PROJECT --tunnel-through-iap --command \"tail -n 20 \$HOME/.heimdall/rr.log\""
+  elif [ "$REMOTE_CONFIGURED" = 1 ] && [ "$CFG_MODE" = vm ] && command -v gcloud >/dev/null 2>&1; then
+    gcloud compute ssh "$CFG_VM" --zone "$CFG_ZONE" --project "$CFG_PROJECT" \
+      --tunnel-through-iap --command "tail -n 20 \$HOME/.heimdall/rr.log 2>/dev/null || echo '(no remote log yet)'" \
+      2>/dev/null | sed 's/^/    /' || warn "could not reach the VM (is it up + IAP authorized?)"
+  else
+    printf '    (configure a vm-mode remote to tail the cloud log — rr setup ...)\n'
+  fi
+}
+
+# ── main flow (task/issue → file + dispatch) ───────────────────────────────────
+main_dispatch() {
+  if [ "$LOCAL" = 1 ]; then
+    dispatch_local
+    return 0
+  fi
+
+  # fail-closed BEFORE filing: a real cloud dispatch with no configured target
+  # must not leave a filed issue behind.
+  if [ "$DRY" != 1 ] && [ "$REMOTE_CONFIGURED" != 1 ]; then
+    die "no remote target configured — run: rr setup --vm <name> --zone <z> --project <p> [--repo <default>]"
+  fi
+
+  if [ -n "$ISSUE" ]; then
+    printf '%s' "$ISSUE" | grep -qE '^[0-9]+$' || die "--issue must be a number (got: $ISSUE)" 2
+    ISSUE_REF="#$ISSUE"
+    say "dispatching maintainer to drain existing issue $ISSUE_REF"
+  else
+    file_issue
+  fi
+
+  dispatch_cloud
+
+  echo
+  say "handoff complete — issue: ${ISSUE_REF:-?} · dispatched to: $([ "$CFG_MODE" = vm ] && echo "$CFG_VM" || echo control-plane)"
+  say "watch it:  rr status   ·   gh pr list --repo $CFG_REPO --label maintainer"
+}
+
+case "$CMD" in
+  setup)  do_setup ;;
+  status) do_status ;;
+  "")     main_dispatch ;;
+  *)      die "unknown subcommand: $CMD" 2 ;;
+esac
+exit 0
