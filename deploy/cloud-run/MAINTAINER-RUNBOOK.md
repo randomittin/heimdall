@@ -101,6 +101,30 @@ to completion independent of the request-serving service (the same out-of-proces
 as `heimdall-long-job`; see README §4). The **auth token comes from Secret Manager**,
 injected into the Job container env.
 
+> **⭐ One command does ALL of Arch B — `deploy-arch-b.sh`.**
+>
+> ```bash
+> deploy/cloud-run/deploy-arch-b.sh --repo <owner/repo> --project <gcp-project>
+> #   [--region us-central1] [--tag <t>] [--dry-run]
+> ```
+>
+> It runs the whole pipeline in order, idempotently: **(a)** preflight → **(b)** ensure the
+> Artifact Registry `heimdall` repo exists → **(c)** `docker build -f Dockerfile.maintainer`
+> + `docker push` the maintainer image (git + gh + claude + the heimdall bins) → **(d)**
+> resolve the pushed **digest** (`gcloud artifacts docker images describe
+> --format='value(image_summary.digest)'`) and **pin** it into
+> [`heimdall-maintainer-job.yaml`](./heimdall-maintainer-job.yaml) (backs the manifest up to
+> `*.bak`, then seds the `heimdall-maintainer@sha256:` image line in place) → **(e)** hand off
+> to [`deploy-maintainer.sh --cloud`](./deploy-maintainer.sh) for the **secrets + `run jobs
+> replace` + IAM** (this is where every token is minted — via `claude setup-token` + `read
+> -rs`, never echoed; `deploy-arch-b.sh` handles NO token itself) → **(f)** `gcloud run jobs
+> describe` to verify. `--dry-run` prints the full plan and executes nothing (needs no creds
+> or Docker). Build it **from the repo ROOT** so `COPY bin/` resolves — the script does this
+> for you. Proof: `bash test/heimdall-deploy-arch-b.test.sh` (hermetic, $0).
+>
+> The manual §3.1–§3.3 steps below are the underlying operations `deploy-arch-b.sh`
+> automates — keep them as reference / for a partial re-run.
+>
 > **Image requirement.** The maintainer Job's container must carry the maintainer
 > toolchain the loop shells out to: **git, the `gh` CLI, and the `claude` CLI** (plus
 > their runtimes). The base `heimdall-long-job` image (python-slim) does **not** ship
