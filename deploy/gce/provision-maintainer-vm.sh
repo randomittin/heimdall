@@ -31,7 +31,14 @@
 #                              [--machine-type <t>] [--private] [--dry-run]
 #   provision-maintainer-vm.sh install-maintainer --repo <owner/repo> [--project <id>] \
 #                              [--zone <z>] [--vm <name>] [--max <N>] [--cron "<expr>"] \
-#                              [--clone-path <dir>] [--dry-run]
+#                              [--clone-path <dir>] [--dry-run] \
+#                              [--gh-app --gh-app-id <N> --gh-app-installation-id <N> \
+#                               --gh-app-key-file <path.pem>]
+#     RECOMMENDED bot identity — a GitHub App (no user seat, auto-scoped, PRs from the
+#     App). --gh-app streams the App private key to a 0600 file ON the VM (over ssh STDIN,
+#     never argv) and writes HEIMDALL_GH_APP_* into the 0600 env file; the maintainer mints
+#     a fresh 1-hour installation token per cycle. The static HEIMDALL_PR_BOT_TOKEN (a
+#     fine-grained PAT) stays the FALLBACK when --gh-app is omitted.
 #   provision-maintainer-vm.sh verify [--project <id>] [--zone <z>] [--vm <name>] [--dry-run]
 #
 #   EGRESS (provision): default gives the VM an ephemeral EXTERNAL IP (fast, works immediately). An
@@ -66,6 +73,11 @@ CRON="*/30 * * * *"
 CLONE_PATH=""
 DRY=0
 PRIVATE=0
+GH_APP=0
+GH_APP_ID=""
+GH_APP_INSTALL_ID=""
+GH_APP_KEY_FILE=""
+GH_APP_KEY_REMOTE_REL=".heimdall/gh-app-private-key.pem"   # 0600 key on the VM, rel to HOME
 
 # The heimdall repo the VM clones to get bin/heimdall-maintain-loop + bin/lib on PATH. Public
 # clone = the simplest reproducible path (no creds needed at startup); documented in the header.
@@ -99,6 +111,10 @@ while [ $# -gt 0 ]; do case "$1" in
   --cron)         CRON="${2:?}";         shift 2 ;;
   --clone-path)   CLONE_PATH="${2:?}";   shift 2 ;;
   --private)      PRIVATE=1;             shift ;;
+  --gh-app)       GH_APP=1;              shift ;;
+  --gh-app-id)    GH_APP_ID="${2:?}";    shift 2 ;;
+  --gh-app-installation-id) GH_APP_INSTALL_ID="${2:?}"; shift 2 ;;
+  --gh-app-key-file) GH_APP_KEY_FILE="${2:?}"; shift 2 ;;
   --dry-run)      DRY=1;                 shift ;;
   -h|--help)      usage; exit 0 ;;
   *) echo "unknown arg: $1" >&2; usage >&2; exit 2 ;;
@@ -440,20 +456,61 @@ RELAY
 # STDIN (a pipe), where a remote `cat > envfile` under `umask 177` writes it 0600. In --dry-run
 # NO token is prompted or transmitted — only the shape of the plan is printed.
 ssh_write_envfile() {
-  local remote_cmd
+  local remote_cmd key_remote_cmd
   # the remote side: create ~/.heimdall (0700), write the env file from stdin under a 0600 umask.
   remote_cmd="umask 177; mkdir -p \"\$HOME/.heimdall\"; chmod 700 \"\$HOME/.heimdall\"; cat > \"\$HOME/$ENVFILE_REL\"; chmod 600 \"\$HOME/$ENVFILE_REL\""
+  # the remote side for the App private key: write it 0600 from stdin (a multi-line PEM).
+  key_remote_cmd="umask 177; mkdir -p \"\$HOME/.heimdall\"; chmod 700 \"\$HOME/.heimdall\"; cat > \"\$HOME/$GH_APP_KEY_REMOTE_REL\"; chmod 600 \"\$HOME/$GH_APP_KEY_REMOTE_REL\""
   if [ "$DRY" = 1 ]; then
-    say "   write the 0600 env file on the VM (bot token streamed over ssh STDIN — never argv):"
-    printf '  \033[90m$ printf %%s <envfile-with-HEIMDALL_PR_BOT_TOKEN> | gcloud compute ssh %s --zone %s --project %s --tunnel-through-iap --command %s\033[0m\n' \
+    say "   write the 0600 env file on the VM (secrets streamed over ssh STDIN — never argv):"
+    printf '  \033[90m$ printf %%s <envfile> | gcloud compute ssh %s --zone %s --project %s --tunnel-through-iap --command %s\033[0m\n' \
       "$VM" "$ZONE" "$PROJECT" "'$remote_cmd'"
-    echo "      env file contents (token line value redacted):"
+    echo "      env file contents (secret values redacted):"
     printf '        export HEIMDALL_JOB_RUNNER=subprocess\n'
     printf '        export HEIMDALL_MAINTAINER_RUNNER=hybrid\n'
-    printf '        export HEIMDALL_PR_BOT_TOKEN=****\n'
+    if [ "$GH_APP" = 1 ]; then
+      say "   RECOMMENDED: stream the App private key to a 0600 file on the VM (over ssh STDIN):"
+      printf '  \033[90m$ cat <App key.pem> | gcloud compute ssh %s --zone %s --project %s --tunnel-through-iap --command %s\033[0m\n' \
+        "$VM" "$ZONE" "$PROJECT" "'$key_remote_cmd'"
+      printf '        export HEIMDALL_GH_APP_ID=%s\n' "${GH_APP_ID:-<N>}"
+      printf '        export HEIMDALL_GH_APP_INSTALLATION_ID=%s\n' "${GH_APP_INSTALL_ID:-<N>}"
+      printf '        export HEIMDALL_GH_APP_PRIVATE_KEY_FILE="$HOME/%s"\n' "$GH_APP_KEY_REMOTE_REL"
+      printf '        export HEIMDALL_PR_BOT_TOKEN=****   # optional static PAT fallback\n'
+    else
+      printf '        export HEIMDALL_PR_BOT_TOKEN=****\n'
+    fi
     return 0
   fi
-  # real path: prompt the token silently, then PIPE the full env-file body into ssh stdin.
+
+  # ── RECOMMENDED App path — stream the private key to a 0600 file, write App env ─────
+  if [ "$GH_APP" = 1 ]; then
+    [ -n "$GH_APP_ID" ] && [ -n "$GH_APP_INSTALL_ID" ] \
+      || die "--gh-app needs --gh-app-id <N> and --gh-app-installation-id <N>"
+    [ -f "$GH_APP_KEY_FILE" ] \
+      || die "--gh-app needs --gh-app-key-file <path.pem> (an existing App private key)"
+    # the PEM rides the ssh STDIN pipe only — never an argv/--command element, never echoed.
+    cat "$GH_APP_KEY_FILE" \
+      | gcloud compute ssh "$VM" --zone "$ZONE" --project "$PROJECT" --tunnel-through-iap \
+          --command "$key_remote_cmd"
+    say "   wrote ~/$GH_APP_KEY_REMOTE_REL on the VM (mode 600 — App private key, never printed)."
+    # optional static PAT fallback (press Enter to skip).
+    local BOT_TOKEN=""
+    printf 'Optional static HEIMDALL_PR_BOT_TOKEN fallback (press Enter to skip): '
+    read -rs BOT_TOKEN; echo
+    # App id + installation id are non-secret; the key PATH expands from $HOME when sourced.
+    {
+      printf 'export HEIMDALL_JOB_RUNNER=subprocess\nexport HEIMDALL_MAINTAINER_RUNNER=hybrid\n'
+      printf 'export HEIMDALL_GH_APP_ID=%q\nexport HEIMDALL_GH_APP_INSTALLATION_ID=%q\n' "$GH_APP_ID" "$GH_APP_INSTALL_ID"
+      printf 'export HEIMDALL_GH_APP_PRIVATE_KEY_FILE="$HOME/%s"\n' "$GH_APP_KEY_REMOTE_REL"
+      [ -n "$BOT_TOKEN" ] && printf 'export HEIMDALL_PR_BOT_TOKEN=%q\n' "$BOT_TOKEN"
+    } | gcloud compute ssh "$VM" --zone "$ZONE" --project "$PROJECT" --tunnel-through-iap \
+          --command "$remote_cmd"
+    BOT_TOKEN=""
+    say "   wrote ~/$ENVFILE_REL on the VM (mode 600 — App creds; contents never printed here)."
+    return 0
+  fi
+
+  # ── FALLBACK static-PAT path — prompt the token, PIPE the env-file body into ssh stdin ─
   local BOT_TOKEN=""
   printf 'Paste the HEIMDALL_PR_BOT_TOKEN (scoped: contents:write on heimdall/*, pull_requests:write; NO main, NO merge): '
   read -rs BOT_TOKEN; echo

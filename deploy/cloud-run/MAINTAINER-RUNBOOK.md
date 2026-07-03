@@ -472,3 +472,94 @@ prints `VERIFY-FAIL` (see `/var/log/heimdall-toolchain.log`) and exits nonzero.
 > **Cron vs systemd.** The script installs a **cron** (matches `deploy-maintainer.sh` §2, 1-min
 > granularity for the beat). For a tighter beat cadence, replace the beat line with a systemd
 > timer / a `while sleep 30` supervised loop (keep the cadence **< the 90s TTL** — §6.3).
+
+---
+
+## 8. The dedicated PR-bot credential — GitHub App (recommended) vs fine-grained PAT
+
+The maintainer opens PRs **as a bot identity**, **never** as the operator's personal
+account (`issue_pr.gh_bot_runner` authenticates `gh` with `HEIMDALL_PR_BOT_TOKEN`, on
+`heimdall/*` branches only — **never pushes `main`, never merges**; a human merges).
+There are two ways to be that bot. **A GitHub App is recommended**; a fine-grained PAT on
+a dedicated bot account is the simpler **fallback**.
+
+### 8.1 GitHub App — recommended (no user seat, auto-scoped, revocable)
+
+A **GitHub App** is a first-class bot identity: **no user seat consumed**, permissions
+**auto-scoped** to exactly what it was granted, **revocable** in one click, and PRs are
+attributed to the **App**. Its one wrinkle: an **installation token expires after 1
+hour**, so a static token cannot back a long-running loop. The maintainer therefore
+**mints a fresh installation token per cycle** from the App's private key
+(`bin/lib/maintain_loop.py :: apply_pr_bot_token` → `bin/heimdall-gh-app-token`: App JWT
+(RS256) → `POST /app/installations/<id>/access_tokens` → the token is exported as
+`HEIMDALL_PR_BOT_TOKEN` for that cycle, then expires harmlessly).
+
+**Create + wire it with one script:**
+
+```bash
+# 0. print the App-setup plan (manifest + exact permissions + install + verify), no creds:
+deploy/github-app/setup-bot.sh --dry-run --repo randomittin/heimdall
+
+# 1. create the App from the printed manifest, install it on the target repo ONLY, then
+#    verify + persist the creds (mints a test token via bin/heimdall-gh-app-token):
+deploy/github-app/setup-bot.sh --configure \
+  --app-id <APP_ID> --installation-id <INSTALLATION_ID> \
+  --private-key-file <path/to/app-private-key.pem> --repo randomittin/heimdall
+#   → writes a 0600 store (~/.heimdall/gh-app.env + gh-app-private-key.pem).
+#   Add --cloud --project <gcp-project> to write the key to Secret Manager instead.
+```
+
+**The EXACT App permissions to grant — and NOTHING else:**
+
+| Permission | Level | Why |
+|---|---|---|
+| **Contents** | Read and write | push the `heimdall/*` fix branch |
+| **Pull requests** | Read and write | open the PR + post the proof-receipt comment |
+| **Metadata** | Read-only | mandatory baseline (auto-selected) |
+
+**Deny everything else** — critically **no Administration** (so the App cannot edit
+branch protection or repo settings), **no Workflows/Actions**, no Members, no
+Deployments. Install the App on **the target repo(s) only** (never "All repositories").
+As a server-side backstop for "never push `main`, never merge", add a **branch protection
+rule on `main`** requiring a PR + review that the App cannot bypass (GitHub App
+permissions are not branch-scoped, so branch protection + no-Administration is what pins
+"no direct `main` push / no self-merge").
+
+**Config the runner reads** (any of: a sourced 0600 env file, the process env, or
+Secret-Manager-mounted env):
+
+| Env var | Meaning |
+|---|---|
+| `HEIMDALL_GH_APP_ID` | the App's numeric App ID |
+| `HEIMDALL_GH_APP_INSTALLATION_ID` | the installation id on the target repo(s) |
+| `HEIMDALL_GH_APP_PRIVATE_KEY` **or** `HEIMDALL_GH_APP_PRIVATE_KEY_FILE` | the App private key (inline PEM, or a path to a 0600 `.pem`) |
+
+When `HEIMDALL_GH_APP_ID` is set, the loop **mints per cycle**; when it is absent it uses
+the static `HEIMDALL_PR_BOT_TOKEN` (below). Provisioning wires this for you:
+`deploy/cloud-run/deploy-maintainer.sh --gh-app --gh-app-id <N> --gh-app-installation-id
+<N> --gh-app-key-file <pem>` (Arch A → 0600 file; Arch B → Secret Manager), and
+`deploy/gce/provision-maintainer-vm.sh install-maintainer … --gh-app …` (VM → the key
+streamed over ssh STDIN into a 0600 file). Verify offline:
+`bash test/heimdall-gh-app-token.test.sh`.
+
+### 8.2 Fine-grained PAT on a dedicated bot account — the simple fallback
+
+The simplest path (no App, no per-cycle minting) is a **dedicated bot GitHub account**
+with a **fine-grained PAT** scoped to the repo:
+
+1. Create a **separate GitHub account** for the bot (this **consumes a user seat** on an
+   org — the trade-off vs. the App). Give it push access to the target repo.
+2. Mint a **fine-grained PAT** (Settings → Developer settings → Fine-grained tokens),
+   scoped to **only** `randomittin/heimdall`, with **Repository permissions: Contents:
+   Read and write** + **Pull requests: Read and write** — nothing else. Set a short
+   expiry and rotate.
+3. Export it as the bot token:
+
+   ```bash
+   export HEIMDALL_PR_BOT_TOKEN="github_pat_...<the fine-grained PAT>..."
+   ```
+
+This is **static** (no hourly refresh) and requires **no** `HEIMDALL_GH_APP_*` — the loop
+uses it directly. The downsides vs. the App: it **consumes a user seat**, PRs come from
+the **bot user** (not an App), and scope is per-token rather than centrally managed. Prefer
+the **App (§8.1) for teams**; the PAT is the quickest way for a solo operator to start.

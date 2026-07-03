@@ -94,6 +94,69 @@ def _state_bin():
     )
 
 
+def _gh_app_token_bin():
+    """bin/heimdall-gh-app-token — the GitHub-App INSTALLATION-token minter. An env seam
+    lets tests substitute a hermetic fake minter (no live App / network)."""
+    return os.environ.get("HEIMDALL_GH_APP_TOKEN_BIN") or os.path.join(
+        _bindir(), "heimdall-gh-app-token"
+    )
+
+
+# ── the DEDICATED BOT credential per cycle (GitHub App token, PAT fallback) ────
+#
+# A GitHub App INSTALLATION token EXPIRES AFTER 1 HOUR, so a static token cannot back a
+# long-running loop. When App creds are configured (HEIMDALL_GH_APP_ID set), we MINT A
+# FRESH installation token EACH CYCLE via bin/heimdall-gh-app-token and export it as
+# HEIMDALL_PR_BOT_TOKEN — so issue_pr.gh_bot_runner (which reads that env) authenticates
+# `gh` as the App's bot identity, unchanged. When App creds are ABSENT we keep the
+# static HEIMDALL_PR_BOT_TOKEN (a fine-grained PAT) — the simpler fallback. The minted
+# token is NEVER logged; only a token-free credential-path label is surfaced.
+
+
+def mint_pr_bot_token():
+    """Mint a fresh GitHub-App installation token via bin/heimdall-gh-app-token, or
+    None when App creds are not configured / the mint fails. NEVER logs the token — on
+    failure it emits only a token-free reason line so the caller can fall back."""
+    if not os.environ.get("HEIMDALL_GH_APP_ID"):
+        return None
+    tok_bin = _gh_app_token_bin()
+    try:
+        proc = subprocess.run(
+            [tok_bin],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except OSError as exc:
+        sys.stderr.write(
+            "maintain-loop: gh-app token minter unavailable (%s); falling back to the "
+            "static HEIMDALL_PR_BOT_TOKEN if present\n" % exc
+        )
+        return None
+    if proc.returncode != 0:
+        # the minter already printed a key-free diagnostic to ITS stderr; surface a
+        # one-line, token-free note and let the caller fall back.
+        sys.stderr.write(
+            "maintain-loop: gh-app token mint failed (rc=%d); falling back to the "
+            "static HEIMDALL_PR_BOT_TOKEN if present\n" % proc.returncode
+        )
+        return None
+    token = (proc.stdout or "").strip()
+    return token or None
+
+
+def apply_pr_bot_token():
+    """Per-cycle credential resolution. If App creds are configured, mint a fresh
+    installation token and EXPORT it as HEIMDALL_PR_BOT_TOKEN (so issue_pr opens the PR
+    as the App bot). Else leave any static HEIMDALL_PR_BOT_TOKEN (PAT) in place. Returns
+    the active credential path: 'app' | 'static' | 'none'. The token is never logged."""
+    token = mint_pr_bot_token()
+    if token:
+        os.environ["HEIMDALL_PR_BOT_TOKEN"] = token
+        return "app"
+    return "static" if os.environ.get("HEIMDALL_PR_BOT_TOKEN") else "none"
+
+
 # ── state file (mirrors bin/heimdall-state resolution) ────────────────────────
 
 
@@ -597,6 +660,11 @@ def run(repo, base="HEAD", evidence_cmds=None, cfg=None, max_cycles=0,
             last = {"issue": top_id, "verdict": "PARKED", "pr": None, "cycle_ms": 0}
             emit("parked %s (needs human approval); continue" % top_id, None)
             continue  # a park is not a cycle, not a failure — keep draining others
+
+        # ── DEDICATED BOT credential: mint a FRESH App installation token for THIS
+        #    cycle (App creds set) or keep the static PAT. The 1-hour App-token expiry
+        #    is why this is per-cycle. issue_pr reads HEIMDALL_PR_BOT_TOKEN unchanged.
+        apply_pr_bot_token()
 
         # ── BACKPRESSURE: claim a fixer slot (best-effort) ────────────────────
         slot = _pool_acquire(cycle)
