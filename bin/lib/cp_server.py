@@ -483,6 +483,17 @@ def _build_handler_class(home, enforce_revocation):
                 if refusal is not None:
                     self._send(Response(*refusal))
                     return
+            # PUBLIC-SURFACE /team/cred + /team/install flood shed (pre-auth, cheap): drop an
+            # over-limit IP's signed registration BEFORE spending crypto on signature verify. The
+            # bucket scope names the route so the two register windows stay distinct. Inert on the
+            # gated surface (the per-team cap + replay-nonce run post-auth, below).
+            if (cp_publicsurface.public_surface_enabled() and method == "POST"
+                    and route_path in ("/team/cred", "/team/install")):
+                scope = "team_cred" if route_path == "/team/cred" else "team_install"
+                refusal = cp_publicsurface.check_team_write_pre_auth(request, scope, home=home)
+                if refusal is not None:
+                    self._send(Response(*refusal))
+                    return
             # §3 auth chokepoint — every request, exactly once. Verifies over the FULL
             # path-with-query (request["path"]) — the bytes the client signed.
             try:
@@ -515,6 +526,28 @@ def _build_handler_class(home, enforce_revocation):
                         return
                 self._send(Response(*cp_publicsurface.enqueue_rr_task(
                     identity, request, home=home)))
+                return
+            # PUBLIC TEAM-SCOPED REGISTRATION writes (INV-1/2/4/6/8 — the last-mile onboarding):
+            # POST /team/cred write-forwards the caller's OWN model credential into its own team
+            # partition (the ONLY public route that takes a secret — write-only, never read back,
+            # never logged); POST /team/install records the caller-team's GitHub App installation.
+            # Both are SIGNED (verified by the §3 chokepoint above) + team-scoped: team_id is ALWAYS
+            # registered_team(haid), never a body field. On the public surface the per-team rate cap
+            # (INV-7) + replay-nonce (INV-8) run first (inert on the gated service, like /presence).
+            if method == "POST" and route_path in ("/team/cred", "/team/install"):
+                scope = "team_cred" if route_path == "/team/cred" else "team_install"
+                if cp_publicsurface.public_surface_enabled():
+                    refusal = cp_publicsurface.check_team_write_post_auth(
+                        identity, request, scope, home=home)
+                    if refusal is not None:
+                        self._send(Response(*refusal))
+                        return
+                if route_path == "/team/cred":
+                    self._send(Response(*cp_publicsurface.register_team_cred(
+                        identity, request, home=home)))
+                else:
+                    self._send(Response(*cp_publicsurface.register_team_install(
+                        identity, request, home=home)))
                 return
             # built-in §1 dispatch entry (matched on the query-stripped path).
             if method == "POST" and route_path == "/dispatch":
