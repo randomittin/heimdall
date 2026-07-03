@@ -35,18 +35,20 @@ account, never `main`, never a merge. RJ holds the App's private key.
    You may pre-fill from the manifest that `deploy/github-app/setup-bot.sh` (default/plan mode)
    prints.
 
-2. **Repository permissions — grant EXACTLY these three, and NOTHING else:**
+2. **Repository permissions — grant EXACTLY these four, and NOTHING else:**
 
    | permission | level | why |
    |------------|-------|-----|
-   | **Contents** | Read and write | push the `heimdall/*` fix branch |
+   | **Contents** | Read and write | push the `heimdall/*` fix branch (+ read repo code) |
+   | **Issues** | Read and write | READ the issue queue (the connector's work source) + comment "resolved by #N" + close the resolved issue |
    | **Pull requests** | Read and write | open the PR + post the proof-receipt comment |
    | **Metadata** | Read-only | mandatory baseline for any App (auto-selected) |
 
    **DENY everything else.** In particular: **no Administration** (so the App cannot touch branch
-   protection or repo settings), **no Workflows/Actions**, **no Members**, **no Deployments**,
-   **no Contents:admin**, **no merge** capability beyond what a human review gate allows. Subscribe
-   to **no events** (the maintainer polls; it needs no webhooks).
+   protection or repo settings), **no Workflows/Actions** (no CI mutation — supply-chain safety),
+   **no Commit statuses / Checks** (the gate runs tests **locally**; it never reads CI status),
+   **no Members**, **no Deployments**, **no Contents:admin**, **no merge** capability beyond what a
+   human review gate allows. Subscribe to **no events** (the maintainer polls; it needs no webhooks).
 
 3. **Public installability:** under "Where can this GitHub App be installed?", select
    **"Any account"** — this makes the App public so other developers can install it on their own

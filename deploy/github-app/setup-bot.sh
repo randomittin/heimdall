@@ -2,7 +2,7 @@
 # setup-bot.sh — stand up (or wire in) the Heimdall maintainer's DEDICATED PR-BOT as a
 # GitHub App. This is the clean, no-user-seat, auto-scoped, revocable identity RJ chose:
 # the maintainer opens PRs AS THE APP (never as the operator's personal account), scoped
-# to Contents + Pull requests write on the target repo(s) — NEVER main, NEVER merge.
+# to Contents + Issues + Pull requests write on the target repo(s) — NEVER main, NEVER merge.
 #
 # RUN BY THE OPERATOR (RJ) on his own machine. The agent never runs this. Secret
 # discipline mirrors deploy/cloud-run/deploy-maintainer.sh: the App private key is read
@@ -61,11 +61,15 @@ run()  { if [ "$DRY" = 1 ]; then printf '  \033[90m$ %s\033[0m\n' "$*"; else "$@
 
 # ── the App manifest (the permissions the App is created with) ────────────────
 # GitHub App PERMISSIONS to grant — and ONLY these:
-#   • Contents: Read and write   — push the heimdall/* fix branch.
+#   • Contents: Read and write      — push the heimdall/* fix branch (+ read repo code).
+#   • Issues: Read and write        — READ the issue queue (the connector's work source),
+#                                     comment "resolved by #N" + close the resolved issue.
 #   • Pull requests: Read and write — open the PR (+ post the proof receipt comment).
-#   • Metadata: Read-only        — mandatory baseline for any App (auto).
+#   • Metadata: Read-only           — mandatory baseline for any App (auto).
 # DENY everything else. In particular: NO Administration (so the App can NOT edit branch
-# protection or repo settings), NO Workflows/Actions, NO Members, NO Deployments.
+# protection or repo settings), NO Workflows/Actions (no CI mutation — supply-chain safety),
+# NO Commit statuses / Checks (the gate runs tests LOCALLY; it never reads CI status),
+# NO Members, NO Deployments.
 print_manifest() {
   local name="heimdall-pr-bot"
   cat <<MANIFEST
@@ -75,6 +79,7 @@ print_manifest() {
   "public": false,
   "default_permissions": {
     "contents": "write",
+    "issues": "write",
     "pull_requests": "write",
     "metadata": "read"
   },
@@ -101,12 +106,14 @@ print_plan() {
   echo
 
   say "2. Grant EXACTLY these repository PERMISSIONS — and nothing more:"
-  echo "     • Contents: Read and write      → push the heimdall/* fix branch"
+  echo "     • Contents: Read and write      → push the heimdall/* fix branch (+ read code)"
+  echo "     • Issues: Read and write        → READ the issue queue + comment/close resolved"
   echo "     • Pull requests: Read and write → open the PR + post the proof receipt"
   echo "     • Metadata: Read-only           → mandatory baseline (auto-selected)"
   echo "   DENIED (do NOT grant): no Administration (cannot touch branch protection or"
-  echo "     repo settings), no Workflows/Actions, no Members, no Deployments, no merge"
-  echo "     permission beyond what a human review gate allows."
+  echo "     repo settings), no Workflows/Actions (no CI mutation), no Commit statuses/Checks"
+  echo "     (the gate runs tests locally; it never reads CI status), no Members, no"
+  echo "     Deployments, no merge permission beyond what a human review gate allows."
   echo
 
   say "3. Install the App on the TARGET REPO(S) ONLY (never 'All repositories'):"

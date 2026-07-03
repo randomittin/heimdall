@@ -112,7 +112,7 @@ collect_secrets() {
     printf 'Optional static HEIMDALL_PR_BOT_TOKEN fallback (press Enter to skip): '
     read -rs BOT_TOKEN; echo
   else
-    printf 'Paste the HEIMDALL_PR_BOT_TOKEN (scoped: contents:write on heimdall/*, pull_requests:write; NO main, NO merge): '
+    printf 'Paste the HEIMDALL_PR_BOT_TOKEN (scoped: contents:write on heimdall/*, issues:write, pull_requests:write; NO main, NO merge): '
     read -rs BOT_TOKEN; echo
     [ -n "$BOT_TOKEN" ] || die "no bot token entered"
   fi
