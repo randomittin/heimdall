@@ -52,9 +52,14 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 import cp_auth       # derive_team_id / default_team_id / team_member_count — the team-scoped
-                    # enroll re-key + the net-new-team detection for the team-create caps.
-import cp_nonce      # the replay/freshness gate for the signed presence beat (accept()).
+                    # enroll re-key + the net-new-team detection for the team-create caps; AND
+                    # registered_team — the server-side team_id for the signed /rr-task enqueue.
+import cp_nonce      # the replay/freshness gate for the signed presence beat + /rr-task (accept()).
 import cp_ratelimit  # the fixed-window abuse gate (RateLimiter.allow + enroll_budget_ok).
+import cp_team_queue  # the ENQUEUE-ONLY sink for the public /rr-task route (INV-6). This module
+                     # holds NO credential and NO dispatch capability — a signed /rr-task writes
+                     # a bounded, scrubbed row to the CALLER'S OWN team partition and STOPS; the
+                     # gated worker (cp_maintainer_runner) is the only side that dispatches.
 
 # ── THE CANONICAL PUBLIC ROUTE SET (single source of truth) ─────────────────────────────
 #
@@ -79,11 +84,19 @@ import cp_ratelimit  # the fixed-window abuse gate (RateLimiter.allow + enroll_b
 #   GET     /roster-public — RETIRED: the old fully-public roster leaked activity to anyone, so
 #       it now 403s on the public surface (kept in the allowlist so it returns 403, not a flat
 #       404 — the closed leak is explicit). team.html moved to /roster-team.
-# All READ-ONLY: there is deliberately NO (POST, /roster-team) — the public surface exposes no
-# unauthenticated write.
+# PLUS the SIGNED ENQUEUE-ONLY write seam (INV-6, the public multi-tenant intake):
+#   POST /rr-task — a SIGNED, team-scoped enqueue. It goes through the §3 auth chokepoint (a
+#       signature is REQUIRED — it is NOT a pre-auth public route, so an unsigned/forged request
+#       is a 401), the caller's team_id is derived SERVER-SIDE from the verified binding (INV-1),
+#       and the handler writes ONE bounded, scrubbed DATA row to the CALLER'S OWN team queue and
+#       STOPS. It holds NO credential and has NO dispatch capability — a compromised public
+#       surface can enqueue (to its own partition, rate-/replay-capped) but never dispatch or read
+#       a cred (INV-6, defeats A10). Execution happens on the gated worker, which holds the creds.
+# All OTHER entries are READ-ONLY: there is deliberately no other unauthenticated write.
 PUBLIC_ROUTES = frozenset({
     ("POST", "/enroll"),
     ("POST", "/presence"),
+    ("POST", "/rr-task"),
     ("GET", "/roster"),
     ("GET", "/roster-team"),
     ("OPTIONS", "/roster-team"),
@@ -184,6 +197,16 @@ def _presence_nonce_window(): return _int_env("HEIMDALL_PRESENCE_NONCE_WINDOW", 
 # surface to key on — so one loose per-IP gate is the whole policy. Env-tunable.
 def _roster_read_limit():  return _int_env("HEIMDALL_ROSTER_IP_LIMIT", 60)
 def _roster_read_window(): return _int_env("HEIMDALL_ROSTER_IP_WINDOW", 60)
+
+# /rr-task — the SIGNED enqueue write (INV-6/7/8). Per-IP (pre-verify blunt flood shed) AND
+# per-TEAM (post-verify, keyed on the caller's server-derived team_id) fixed-window caps bound a
+# single tenant's enqueue rate (INV-7), plus a replay-nonce over the signed body (INV-8). All
+# env-tunable; conservative defaults sized for a human/bot filing tasks, not a flood.
+def _rr_task_ip_limit():     return _int_env("HEIMDALL_RR_TASK_IP_LIMIT", 60)
+def _rr_task_ip_window():    return _int_env("HEIMDALL_RR_TASK_IP_WINDOW", 60)
+def _rr_task_team_limit():   return _int_env("HEIMDALL_RR_TASK_TEAM_LIMIT", 30)
+def _rr_task_team_window():  return _int_env("HEIMDALL_RR_TASK_TEAM_WINDOW", 60)
+def _rr_task_nonce_window(): return _int_env("HEIMDALL_RR_TASK_NONCE_WINDOW", 300)
 
 
 # ── the public-surface predicates (what cp_server's router consults) ────────────────────
@@ -434,4 +457,107 @@ def check_roster_read(request, *, home=None, now=None):
         limit=_roster_read_limit(), window=_roster_read_window())
     if not ok:
         return (429, _rate_limited_body("roster_read", retry))
+    return None
+
+
+# ── the SIGNED ENQUEUE-ONLY /rr-task route (INV-6/7/8 — the public multi-tenant intake) ──────
+#
+# THE INTAKE/EXECUTION SPLIT (INV-6). /rr-task is the ONLY public write beyond enroll/presence.
+# It is SIGNED (the §3 chokepoint verifies the Ed25519 signature BEFORE these run — an
+# unsigned/forged request is a 401, INV-8), its team_id is derived SERVER-SIDE from the verified
+# binding (INV-1), and the handler writes ONE bounded, scrubbed DATA row to the CALLER'S OWN team
+# queue and STOPS. This module holds NO credential and calls NO dispatcher — the enqueue sink is
+# cp_team_queue.enqueue, nothing else. A compromised public surface can therefore enqueue (to its
+# own partition, rate-/replay-capped) but can NEVER dispatch a job or read a cred (INV-6, A10).
+
+
+def _rr_task_body(request):
+    """The task DATA a signed /rr-task carries, as a bounded {text, severity?, priority?} dict
+    (INV-5). The text is taken from the first present of `task`/`text`/`prompt`/`body`; the
+    optional severity/priority ride through to the queue's prioritizer. This is DATA, never a
+    free-form allowlist param — cp_team_queue.enqueue scrubs (secret-redacts) + trims it before
+    persistence, so no secret and no oversized payload can ever land in a queue row."""
+    payload = _body_dict(request)
+    text = None
+    for key in ("task", "text", "prompt", "body"):
+        if payload.get(key) is not None:
+            text = payload.get(key)
+            break
+    task = {"text": text}
+    if payload.get("severity") is not None:
+        task["severity"] = payload.get("severity")
+    if payload.get("priority") is not None:
+        task["priority"] = payload.get("priority")
+    return task
+
+
+def check_rr_task_pre_auth(request, *, home=None, now=None):
+    """PUBLIC-SURFACE per-IP flood gate for POST /rr-task, applied BEFORE the §3 signature verify
+    so a blunt flood is shed CHEAPLY (no crypto spent on an over-limit IP). Returns None to
+    proceed to auth, or (429, body) to refuse. The per-team cap + replay-nonce run AFTER identity
+    is known (check_rr_task_post_auth)."""
+    limiter = cp_ratelimit.RateLimiter(home=home)
+    ip = client_ip(request)
+    ok, retry = limiter.allow(
+        "rr_task_ip", ip, now=now,
+        limit=_rr_task_ip_limit(), window=_rr_task_ip_window())
+    if not ok:
+        return (429, _rate_limited_body("rr_task_ip", retry))
+    return None
+
+
+def check_rr_task_post_auth(identity, request, *, home=None, now=None):
+    """PUBLIC-SURFACE gates for POST /rr-task that need the VERIFIED identity (run AFTER the §3
+    chokepoint, so `identity.haid` is proven and the body is signature-covered):
+      1. per-TEAM rate-limit (INV-7) — keyed on the caller's SERVER-DERIVED team_id
+         (cp_auth.registered_team), so a single tenant cannot flood the intake even rotating
+         members/IPs; over-limit -> 429.
+      2. replay-nonce (INV-8) — the signed body carries {nonce, ts}; cp_nonce.accept decides
+         freshness (|ts-now| <= window) + first-use ((haid, nonce) unseen). A stale ts or a
+         replayed nonce -> 401 (the captured signed bytes cannot be resent).
+    Returns None to let the enqueue run, or (429, body) / (401, body) to refuse."""
+    haid = getattr(identity, "haid", None) or identity
+    team_id = cp_auth.registered_team(str(haid), home=home)
+    # Key the per-team bucket on the team_id when it resolves, else on the haid (a no-team caller
+    # still counts against a bucket — the enqueue itself fail-closes on the missing team).
+    team_key = team_id if team_id else ("haid:" + str(haid))
+    limiter = cp_ratelimit.RateLimiter(home=home)
+    ok, retry = limiter.allow(
+        "rr_task_team", team_key, now=now,
+        limit=_rr_task_team_limit(), window=_rr_task_team_window())
+    if not ok:
+        return (429, _rate_limited_body("rr_task_team", retry))
+
+    payload = _body_dict(request)
+    nonce = payload.get("nonce")
+    ts = payload.get("ts")
+    accepted, reason = cp_nonce.accept(
+        "rr-task", str(haid), nonce, ts, now=now, window=_rr_task_nonce_window())
+    if not accepted:
+        return (401, {"error": "replay_" + reason})
+    return None
+
+
+def enqueue_rr_task(identity, request, *, home=None, now=None):
+    """THE enqueue-only handler for a signed POST /rr-task (INV-6/INV-1/INV-3/INV-5). Returns a
+    (status, body) tuple cp_server wraps in a Response — NEVER a dispatch, NEVER a cred read.
+
+    Flow:
+      1. team_id = cp_auth.registered_team(identity.haid) — the caller's SERVER-DERIVED partition
+         (INV-1). A body `team_id` field is IGNORED (it is never read here). No team resolves ->
+         403 fail-closed (INV-3) — nothing is enqueued.
+      2. cp_team_queue.enqueue(team_id, task) — the task is bounded + secret-scrubbed DATA (INV-5,
+         enforced inside enqueue). It lands in EXACTLY the caller's OWN partition; there is no
+         parameter by which it could reach another team's queue.
+    The `now` arg is accepted for signature symmetry with the gates (unused here — enqueue stamps
+    its own created_at)."""
+    haid = getattr(identity, "haid", None) or identity
+    team_id = cp_auth.registered_team(str(haid), home=home)   # INV-1 — server-derived, never the body.
+    if not team_id:
+        return (403, {"error": "no_team"})                    # INV-3 fail-closed.
+    result = cp_team_queue.enqueue(team_id, _rr_task_body(request), home=home)
+    if not result.get("ok"):
+        return (422, {"error": result.get("reason", "enqueue_failed"), "team_id": team_id})
+    return (200, {"enqueued": True, "id": result.get("id"),
+                  "added": result.get("added"), "team_id": team_id})
     return None
