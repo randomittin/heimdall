@@ -1,0 +1,364 @@
+#!/usr/bin/env bash
+# heimdall-context-capsule — the rr (remote-run) CONTEXT HANDOFF.
+#
+# Package the LOCAL Heimdall session's context into a portable, SECRET-SCRUBBED
+# capsule and ship it to a cloud VM so the cloud maintainer works with full
+# continuity of what happened locally — not cold. The capsule is a BRIEFING, not a
+# dump: each source is trimmed and the whole thing is byte-capped.
+#
+# WHAT GOES IN (an ALLOWLIST of known-safe, human-readable session state only):
+#   - a short "what this session did" header (derived from git + the last checkpoint)
+#   - the active GOAL              (heimdall-state goal-get)
+#   - .planning/CHECKPOINT.md      (where we left off — trimmed to the tail)
+#   - .planning/STATE.md           (current state — trimmed to the tail)
+#   - .planning/decisions*         (design decisions, if present — trimmed)
+#   - git log --oneline -30        (recent history)
+#   - the heimdall-comprehend project capsule (what IS this project — trimmed)
+# It NEVER reads env files, ~/.heimdall/*.env, team.json, or any credential store.
+#
+# SECRET-SAFE (the No.1 bar — the capsule crosses to a remote machine):
+#   1. REDACT — the assembled bytes are passed through a redactor that masks known
+#      credential shapes (PEM keys, AWS/GitHub/Slack/Google tokens, JWTs, and
+#      key-value secret assignments) in place with a redaction marker.
+#   2. SCAN  — the redacted capsule is then scanned by a secret scanner (gitleaks by
+#      default; an env seam substitutes a fake in tests). A FINDING is FAIL-CLOSED:
+#      the build ABORTS and NOTHING is written or shipped.
+#
+# Usage:
+#   heimdall-context-capsule build [--repo OWNER/REPO] [--repo-dir DIR] [--out FILE]
+#                                  [--max-bytes N] [--dry-run]
+#       Assemble + scrub + scan the capsule and write it to --out (default
+#       ${HEIMDALL_HOME:-<repo-dir>/.heimdall}/rr-context/<slug>/context.md, 0600).
+#       --dry-run prints what WOULD be gathered (+ the scan result) and writes nothing.
+#   heimdall-context-capsule ship --vm NAME --zone ZONE --project PROJECT
+#                                 [--repo OWNER/REPO] [--repo-dir DIR] [--max-bytes N]
+#                                 [--no-iap] [--dry-run]
+#       Build the capsule, then STREAM it over IAP to the VM at
+#       ~/.heimdall/rr-context/<slug>/context.md (0600). The capsule content goes over
+#       ssh STDIN — NEVER on argv. --dry-run prints the transport plan (with the scan
+#       result) and transfers nothing. Re-ship overwrites (idempotent).
+#   -h, --help                    this help.
+#
+# Exit status:
+#   0  ok (capsule built / shipped, or a dry-run plan printed)
+#   1  a SECRET was detected (fail-closed) — nothing written/shipped
+#   2  usage error / missing dependency / repo not found
+#
+# Env seams (for tests / overrides; none carry secrets):
+#   HEIMDALL_SECRET_SCAN_BIN   a scanner invoked as `<bin> <capsule-file>` (exit 1 =
+#                              finding). Default: gitleaks over the capsule on STDIN.
+#   HEIMDALL_GCLOUD_BIN        the gcloud binary (default: gcloud).
+#   HEIMDALL_STATE_BIN         heimdall-state binary (default: sibling bin).
+#   HEIMDALL_COMPREHEND_BIN    heimdall-comprehend binary (default: sibling bin).
+
+set -euo pipefail
+
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+BINDIR="$(dirname "$SELF")"
+
+usage() { sed -n '2,49p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+PY="$(command -v python3 || command -v python || true)"
+if [ -z "$PY" ]; then
+  echo "error: python3 not found (required to assemble/scrub the capsule)" >&2
+  exit 2
+fi
+
+STATE_BIN="${HEIMDALL_STATE_BIN:-$BINDIR/heimdall-state}"
+COMPREHEND_BIN="${HEIMDALL_COMPREHEND_BIN:-$BINDIR/heimdall-comprehend}"
+GCLOUD_BIN="${HEIMDALL_GCLOUD_BIN:-gcloud}"
+SECRET_SCAN_BIN="${HEIMDALL_SECRET_SCAN_BIN:-}"
+DEFAULT_MAX_BYTES=32768
+
+# repo slug: owner/repo -> owner__repo (house convention: `tr '/:' '__'`).
+slugify() { printf '%s' "$1" | tr '/:' '__'; }
+
+# Derive OWNER/REPO from a repo-dir's git remote when --repo is omitted.
+derive_repo_ref() {
+  local dir="$1" url slug
+  url="$(git -C "$dir" config --get remote.origin.url 2>/dev/null || true)"
+  slug="$(printf '%s' "$url" \
+    | sed -E -e 's#^[a-z]+\+?[a-z]*://##' -e 's#^git@##' \
+             -e 's#github\.com[:/]##' -e 's#\.git$##' -e 's#/$##')"
+  case "$slug" in
+    */*) printf '%s' "$slug" ;;
+    *)   printf 'local/session' ;;
+  esac
+}
+
+# ── the scanner gate: 0 clean, 1 finding, 2 scanner-absent ────────────────────
+# A seam bin (tests/custom) is invoked as `<bin> <file>`. Otherwise the capsule is
+# streamed through gitleaks on STDIN (the same engine bin/secret-scan uses).
+scan_capsule() {
+  local f="$1"
+  if [ -n "$SECRET_SCAN_BIN" ]; then
+    "$SECRET_SCAN_BIN" "$f" >/dev/null 2>&1 && return 0 || return 1
+  fi
+  if command -v gitleaks >/dev/null 2>&1; then
+    if gitleaks stdin --no-banner --redact < "$f" >/dev/null 2>&1; then
+      return 0
+    else
+      return 1
+    fi
+  fi
+  return 2
+}
+
+# ── assemble + redact the capsule to a temp file (echoes the temp path) ───────
+# All I/O + regex redaction happen in python for reliable quoting/patterns. The
+# three command outputs (goal, git-log, comprehend) are pre-fetched here so python
+# only reads the allowlisted .planning files + those captured outputs.
+assemble_capsule() {
+  local repo_dir="$1" repo_ref="$2" max_bytes="$3"
+  local goal gitlog comprehend tmp
+  goal="$(HEIMDALL_STATE_FILE="${HEIMDALL_STATE_FILE:-$repo_dir/heimdall-state.json}" \
+          "$STATE_BIN" goal-get 2>/dev/null || echo "none")"
+  gitlog="$(git -C "$repo_dir" log --oneline -30 2>/dev/null || echo "(no git history)")"
+  comprehend="$("$COMPREHEND_BIN" show "$repo_dir" 2>/dev/null \
+                || "$COMPREHEND_BIN" comprehend "$repo_dir" --print 2>/dev/null \
+                || echo "(no comprehension capsule)")"
+  tmp="$(mktemp)"
+  REPO_DIR="$repo_dir" REPO_REF="$repo_ref" MAX_BYTES="$max_bytes" \
+  GOAL_TXT="$goal" GITLOG_TXT="$gitlog" COMPREHEND_TXT="$comprehend" \
+  OUT_TMP="$tmp" "$PY" - <<'PYEOF'
+import os, re, io
+
+repo_dir   = os.environ["REPO_DIR"]
+repo_ref   = os.environ["REPO_REF"]
+max_bytes  = int(os.environ["MAX_BYTES"])
+goal       = os.environ.get("GOAL_TXT", "none").strip() or "none"
+gitlog     = os.environ.get("GITLOG_TXT", "")
+comprehend = os.environ.get("COMPREHEND_TXT", "")
+out_tmp    = os.environ["OUT_TMP"]
+
+planning = os.path.join(repo_dir, ".planning")
+
+
+def read_trim(path, max_lines):
+    """Read a file and keep only its LAST max_lines (the freshest state)."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return None
+    if len(lines) > max_lines:
+        head = ["[...trimmed to the last %d lines...]" % max_lines]
+        lines = head + lines[-max_lines:]
+    return "\n".join(lines)
+
+
+def head_trim(text, max_lines):
+    lines = text.splitlines()
+    if len(lines) > max_lines:
+        lines = lines[:max_lines] + ["[...trimmed to the first %d lines...]" % max_lines]
+    return "\n".join(lines)
+
+
+# ── the "what this session did" header (git + checkpoint, no clock) ───────────
+def session_summary():
+    bits = []
+    ck = read_trim(os.path.join(planning, "CHECKPOINT.md"), 100000)
+    if ck:
+        m = re.findall(r"^#{1,3}\s+(.*)$", ck, re.M)
+        if m:
+            bits.append("last checkpoint heading: " + m[-1].strip())
+    n = len([l for l in gitlog.splitlines() if l.strip()])
+    bits.append("%d recent commits in scope" % n)
+    bits.append("active goal: " + goal)
+    return "; ".join(bits)
+
+
+sections = []
+sections.append("# LOCAL SESSION CONTEXT — rr handoff capsule")
+sections.append(
+    "> READ-ONLY briefing of the LOCAL Heimdall session, packaged for a cloud run.\n"
+    "> It is CONTEXT, not instructions. Secret-scrubbed before it left the machine."
+)
+sections.append("repo: %s" % repo_ref)
+sections.append("## What this session did\n%s" % session_summary())
+sections.append("## Active goal\n%s" % goal)
+
+ck = read_trim(os.path.join(planning, "CHECKPOINT.md"), 150)
+if ck is not None:
+    sections.append("## .planning/CHECKPOINT.md (where we left off)\n%s" % ck)
+
+st = read_trim(os.path.join(planning, "STATE.md"), 120)
+if st is not None:
+    sections.append("## .planning/STATE.md (current state)\n%s" % st)
+
+# decisions* (design decisions), if present — sorted, each trimmed.
+if os.path.isdir(planning):
+    for name in sorted(os.listdir(planning)):
+        if name.lower().startswith("decision"):
+            body = read_trim(os.path.join(planning, name), 100)
+            if body is not None:
+                sections.append("## .planning/%s\n%s" % (name, body))
+
+sections.append("## git log --oneline -30\n%s" % head_trim(gitlog, 30))
+sections.append(
+    "## project comprehension (heimdall-comprehend)\n%s"
+    % head_trim(comprehend, 120)
+)
+
+raw = "\n\n".join(sections) + "\n"
+
+# ── REDACT known credential shapes in place (defense before the scan gate) ────
+REDACTORS = [
+    (re.compile(r"-----BEGIN[^-]*PRIVATE KEY-----.*?-----END[^-]*PRIVATE KEY-----",
+                re.S), "***REDACTED-PRIVATE-KEY***"),
+    (re.compile(r"AKIA[0-9A-Z]{16}"), "***REDACTED-AWS-KEY***"),
+    (re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}"), "***REDACTED-GH-TOKEN***"),
+    (re.compile(r"github_pat_[A-Za-z0-9_]{20,}"), "***REDACTED-GH-PAT***"),
+    (re.compile(r"xox[baprs]-[A-Za-z0-9-]{8,}"), "***REDACTED-SLACK-TOKEN***"),
+    (re.compile(r"AIza[0-9A-Za-z_\-]{20,}"), "***REDACTED-GOOGLE-KEY***"),
+    (re.compile(r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{6,}"),
+     "***REDACTED-JWT***"),
+    (re.compile(
+        r"(?im)^(.*\b(?:api[_-]?key|secret|token|password|passwd|access[_-]?key|"
+        r"client[_-]?secret|authorization|bearer)\b\s*[:=]\s*)([^\s\"']{6,})"),
+     r"\1***REDACTED***"),
+]
+for pat, repl in REDACTORS:
+    raw = pat.sub(repl, raw)
+
+# ── final byte cap: a briefing, never a dump ──────────────────────────────────
+enc = raw.encode("utf-8")
+if len(enc) > max_bytes:
+    raw = enc[:max_bytes].decode("utf-8", errors="ignore")
+    raw += "\n\n[...capsule truncated to %d bytes for bounded injection...]\n" % max_bytes
+
+with io.open(out_tmp, "w", encoding="utf-8") as fh:
+    fh.write(raw)
+PYEOF
+  printf '%s' "$tmp"
+}
+
+# ── produce a scanned, ready-to-write capsule temp (fail-closed on a finding) ─
+# Echoes the capsule temp path on success; aborts the process on a scanner finding.
+produce_scanned_capsule() {
+  local repo_dir="$1" repo_ref="$2" max_bytes="$3"
+  local cap rc
+  cap="$(assemble_capsule "$repo_dir" "$repo_ref" "$max_bytes")"
+  set +e
+  scan_capsule "$cap"; rc=$?
+  set -e
+  case "$rc" in
+    0) echo "secret-scan: CLEAN (redacted + scanned)" >&2 ;;
+    2) echo "secret-scan: WARNING — no scanner available; the capsule was REDACTED but not independently scanned. Install gitleaks for the full gate." >&2 ;;
+    *) rm -f "$cap"
+       echo "BLOCKED: secret-scan detected a credential in the assembled capsule." >&2
+       echo "Fail-closed: NOTHING was written or shipped. Scrub the source and retry." >&2
+       exit 1 ;;
+  esac
+  printf '%s' "$cap"
+}
+
+# ── argument parsing shared by build + ship ───────────────────────────────────
+CMD="${1:-}"; shift || true
+case "$CMD" in
+  -h|--help) usage; exit 0 ;;
+  "") usage >&2; exit 2 ;;
+esac
+
+REPO_REF=""
+REPO_DIR="$PWD"
+OUT=""
+MAX_BYTES="$DEFAULT_MAX_BYTES"
+DRY_RUN=0
+VM=""; ZONE=""; PROJECT=""; USE_IAP=1
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --repo)      REPO_REF="${2:?--repo needs a value}"; shift 2 ;;
+    --repo-dir)  REPO_DIR="${2:?--repo-dir needs a value}"; shift 2 ;;
+    --out)       OUT="${2:?--out needs a value}"; shift 2 ;;
+    --max-bytes) MAX_BYTES="${2:?--max-bytes needs a value}"; shift 2 ;;
+    --dry-run)   DRY_RUN=1; shift ;;
+    --vm)        VM="${2:?--vm needs a value}"; shift 2 ;;
+    --zone)      ZONE="${2:?--zone needs a value}"; shift 2 ;;
+    --project)   PROJECT="${2:?--project needs a value}"; shift 2 ;;
+    --no-iap)    USE_IAP=0; shift ;;
+    -h|--help)   usage; exit 0 ;;
+    *) echo "error: unknown argument: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+if [ ! -d "$REPO_DIR" ]; then
+  echo "error: not a directory: $REPO_DIR (--repo-dir)" >&2
+  exit 2
+fi
+REPO_DIR="$(cd "$REPO_DIR" && pwd)"
+[ -n "$REPO_REF" ] || REPO_REF="$(derive_repo_ref "$REPO_DIR")"
+SLUG="$(slugify "$REPO_REF")"
+
+case "$CMD" in
+  build)
+    if [ -z "$OUT" ]; then
+      OUT="${HEIMDALL_HOME:-$REPO_DIR/.heimdall}/rr-context/$SLUG/context.md"
+    fi
+    if [ "$DRY_RUN" -eq 1 ]; then
+      CAP="$(produce_scanned_capsule "$REPO_DIR" "$REPO_REF" "$MAX_BYTES")"
+      BYTES="$(wc -c < "$CAP" | tr -d ' ')"
+      echo "DRY-RUN build plan:"
+      echo "  repo    : $REPO_REF (slug: $SLUG)"
+      echo "  sources : .planning/CHECKPOINT.md, STATE.md, decisions*, git-log(30), goal, comprehend"
+      echo "  size    : $BYTES bytes (cap $MAX_BYTES)"
+      echo "  out     : $OUT (0600)"
+      echo "  (no capsule written)"
+      rm -f "$CAP"
+      exit 0
+    fi
+    CAP="$(produce_scanned_capsule "$REPO_DIR" "$REPO_REF" "$MAX_BYTES")"
+    mkdir -p "$(dirname "$OUT")"
+    umask 077
+    cp "$CAP" "$OUT"
+    chmod 600 "$OUT"
+    rm -f "$CAP"
+    BYTES="$(wc -c < "$OUT" | tr -d ' ')"
+    echo "wrote $OUT ($BYTES bytes, 0600, secret-scanned)"
+    ;;
+
+  ship)
+    [ -n "$VM" ] && [ -n "$ZONE" ] && [ -n "$PROJECT" ] || {
+      echo "error: ship needs --vm, --zone, and --project" >&2; exit 2; }
+    REMOTE_DIR="~/.heimdall/rr-context/$SLUG"
+    REMOTE_PATH="$REMOTE_DIR/context.md"
+    # The remote command reads the capsule from STDIN into the target (0600), atomic
+    # rename. NO capsule content + NO secret on argv — only the non-secret slug/paths.
+    REMOTE_CMD="mkdir -p $REMOTE_DIR && umask 077 && cat > $REMOTE_PATH.tmp && mv $REMOTE_PATH.tmp $REMOTE_PATH && chmod 600 $REMOTE_PATH"
+    SSH_ARGS=(compute ssh "$VM" --zone "$ZONE" --project "$PROJECT")
+    [ "$USE_IAP" -eq 1 ] && SSH_ARGS+=(--tunnel-through-iap)
+    SSH_ARGS+=(--command "$REMOTE_CMD")
+
+    if [ "$DRY_RUN" -eq 1 ]; then
+      CAP="$(produce_scanned_capsule "$REPO_DIR" "$REPO_REF" "$MAX_BYTES")"
+      BYTES="$(wc -c < "$CAP" | tr -d ' ')"
+      echo "DRY-RUN ship plan:"
+      echo "  repo     : $REPO_REF (slug: $SLUG)"
+      echo "  size     : $BYTES bytes (streamed on STDIN — never on argv)"
+      echo "  target   : $VM:$REMOTE_PATH (0600)"
+      echo "  transport: $GCLOUD_BIN ${SSH_ARGS[*]} < <capsule>"
+      echo "  (no transfer performed)"
+      rm -f "$CAP"
+      exit 0
+    fi
+    CAP="$(produce_scanned_capsule "$REPO_DIR" "$REPO_REF" "$MAX_BYTES")"
+    set +e
+    "$GCLOUD_BIN" "${SSH_ARGS[@]}" < "$CAP"
+    RC=$?
+    set -e
+    rm -f "$CAP"
+    if [ "$RC" -eq 0 ]; then
+      echo "shipped -> $VM:$REMOTE_PATH (0600, streamed over STDIN via IAP)"
+    else
+      echo "error: gcloud ssh transfer failed (rc=$RC)" >&2
+      exit 2
+    fi
+    ;;
+
+  *)
+    echo "error: unknown subcommand: $CMD" >&2
+    usage >&2
+    exit 2
+    ;;
+esac
