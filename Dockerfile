@@ -42,13 +42,13 @@ RUN apt-get update \
 # deploy/ COPY) so a .dockerignore exclusion of deploy/ cannot silently drop a dep. The
 # pins MUST match deploy/requirements-firestore.txt (the source of truth: firestore
 # 2.16.1, run 0.10.19). Pinned for reproducible builds.
-RUN pip install --no-cache-dir "cryptography==42.0.8" "google-cloud-firestore==2.16.1" "google-cloud-run==0.10.19"
+RUN pip install --no-cache-dir "cryptography==42.0.8" "google-cloud-firestore==2.16.1" "google-cloud-run==0.10.19" "google-cloud-secret-manager==2.20.2"
 
 # Build-time dependency guard: import the deps the runtime needs at BUILD time so a
 # missing/incompatible pin FAILS THE BUILD here (cheapest place to catch it) instead
 # of shipping an image that raises BackendUnavailable on every cp_boot tick (firestore)
 # or returns {dispatched: False} on every prod job dispatch (run_v2) at runtime.
-RUN python -c "import google.cloud.firestore, google.cloud.run_v2, cryptography; print('deps OK')"
+RUN python -c "import google.cloud.firestore, google.cloud.run_v2, google.cloud.secretmanager, cryptography; print("deps OK")"
 
 # Non-root runtime user (Cloud Run best practice; least privilege).
 RUN groupadd --system heimdall \

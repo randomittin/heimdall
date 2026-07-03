@@ -22,3 +22,4 @@
 # run 0.10.19). Deploy owner: pip-install these in the image alongside the cryptography pin.
 google-cloud-firestore==2.16.1
 google-cloud-run==0.10.19
+google-cloud-secret-manager==2.20.2
