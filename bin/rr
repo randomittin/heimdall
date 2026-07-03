@@ -21,10 +21,16 @@
 #   3. REPORT — the issue URL, "dispatched to <vm>", and how to watch it.
 #
 # SUBCOMMANDS:
-#   rr setup --vm <name> --zone <z> --project <p> [--repo <default>] [--mode vm|control-plane]
-#         Write ~/.heimdall/remote.json (the cloud target). No secret is ever stored.
+#   rr setup --vm <name> --zone <z> --project <p> [--repo <default>] [--mode vm]
+#         Write ~/.heimdall/remote.json (the VM cloud target). No secret is ever stored.
+#   rr setup --mode control-plane [--endpoint <url>] [--enroll-token <t>] [--repo <default>]
+#         Write ~/.heimdall/remote.json {mode:control-plane}; with --endpoint, also
+#         update the shared ~/.heimdall/cp-endpoint.json {url, enroll_token?}. The
+#         enroll token is the ONLY secret and lives 0600 in cp-endpoint.json — never argv'd back.
 #   rr "<task>" [--repo <owner/repo>] [--max N] [--dry-run]
 #         File the maintainer issue (idempotent) + dispatch to the cloud executor.
+#   rr "<task>" --mode control-plane [--repo <owner/repo>] [--dry-run]
+#         SIGN + POST the task to the CP's public ENQUEUE-ONLY route POST /rr-task.
 #   rr --issue <N> [--repo R] [--max N] [--dry-run]
 #         Skip filing; dispatch the maintainer to DRAIN an existing issue.
 #   rr status [--repo R] [--dry-run]
@@ -33,16 +39,19 @@
 #         FALLBACK: run heimdall-maintain-loop LOCALLY (clearly noted — not cloud).
 #
 # FLAGS: --repo <owner/repo> · --max <N> (default 3) · --mode vm|control-plane ·
-#        --vm/--zone/--project (setup or per-call override) · --dry-run · --local ·
-#        -h/--help. --dry-run everywhere PRINTS the gh + ssh plan and executes
-#        nothing (no creds needed).
+#        --vm/--zone/--project (vm setup or per-call override) · --endpoint <url> ·
+#        --enroll-token <t> (control-plane setup) · --dry-run · --local · -h/--help.
+#        --dry-run everywhere PRINTS the plan (gh+ssh, or the signed POST /rr-task
+#        body) and executes nothing (no creds/network needed).
 #
 # MODES:
 #   vm             (default MVP) — SSH to the VM, run the maintainer there.
-#   control-plane  (alt) — instead of SSH, register the bounded, allowlisted
-#                  run-maintainer-cycle via `heimdall-control-plane
-#                  schedule-maintainer` (the per-minute tick fires it; the hybrid
-#                  runner routes it). Reuses the existing §1 allowlist path.
+#   control-plane  (alt) — instead of SSH, SIGN the task with the per-dev Ed25519 key
+#                  (the SAME one heimdall-presence bootstraps + persists 0600) and POST
+#                  it to the CP's public ENQUEUE-ONLY route `POST /rr-task`. team_id is
+#                  derived SERVER-SIDE from the signed binding (INV-1) — the client sends
+#                  NO team_id and holds no cred beyond its own signing seed. A human's
+#                  GitHub App turns the drained task into a PR.
 #
 # Exit status: 0 ok · 2 usage error · 1 fail-closed (no remote / missing tool).
 set -euo pipefail
@@ -51,6 +60,12 @@ SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 BINDIR="$(dirname "$SELF")"
 REMOTE_JSON="$HOME/.heimdall/remote.json"
 DISPATCH_LOG="$HOME/.heimdall/rr-dispatch.log"
+LIB="$BINDIR/lib"                                   # the shipped cp_auth Ed25519 signer lives here.
+CP_ENDPOINT_JSON="$HOME/.heimdall/cp-endpoint.json" # the CP {url, enroll_token} — SAME file heimdall-presence reads.
+# Shipped DEFAULT public-surface URL (lowest precedence — the config/flag/env override it).
+# The CP URL is NOT a secret (a public Cloud Run endpoint), so it is baked in — same default
+# heimdall-presence ships, so a dev needs ZERO url config; only the enroll TOKEN is distributed.
+DEFAULT_CP_URL="https://heimdall-cp-public-eqfrs7sfuq-uc.a.run.app"
 
 PY="$(command -v python3 || command -v python || true)"
 
@@ -86,6 +101,8 @@ MODE_OVERRIDE=""
 VM_OVERRIDE=""
 ZONE_OVERRIDE=""
 PROJECT_OVERRIDE=""
+ENDPOINT_OVERRIDE=""       # control-plane: the CP public-surface URL (setup / per-call).
+ENROLL_TOKEN_OVERRIDE=""   # control-plane: the bootstrap enroll token (setup-only).
 DRY=0
 LOCAL=0
 
@@ -104,6 +121,8 @@ while [ $# -gt 0 ]; do case "$1" in
   --vm)        VM_OVERRIDE="${2:?--vm needs name}"; shift 2 ;;
   --zone)      ZONE_OVERRIDE="${2:?--zone needs zone}";       shift 2 ;;
   --project)   PROJECT_OVERRIDE="${2:?--project needs id}";   shift 2 ;;
+  --endpoint)  ENDPOINT_OVERRIDE="${2:?--endpoint needs a url}";       shift 2 ;;
+  --enroll-token) ENROLL_TOKEN_OVERRIDE="${2:?--enroll-token needs a value}"; shift 2 ;;
   -h|--help)   usage; exit 0 ;;
   --)          shift; break ;;
   -*)          die "unknown flag: $1 (see: rr --help)" 2 ;;
@@ -160,11 +179,14 @@ printf '%s' "$MAXN" | grep -qE '^[0-9]+$' || die "--max must be a non-negative i
 
 # ── SETUP — write ~/.heimdall/remote.json (the cloud target; no secret) ────────
 do_setup() {
+  local mode="${MODE_OVERRIDE:-vm}"
+  case "$mode" in vm|control-plane) ;; *) die "--mode must be vm|control-plane (got: $mode)" 2 ;; esac
+  # control-plane targets the signed public enqueue route, not a VM — it needs no
+  # vm/zone/project (only an optional --endpoint + --enroll-token for the CP wire).
+  if [ "$mode" = control-plane ]; then do_setup_cp; return; fi
   [ -n "$VM_OVERRIDE" ]      || die "setup needs --vm <name>" 2
   [ -n "$ZONE_OVERRIDE" ]    || die "setup needs --zone <zone>" 2
   [ -n "$PROJECT_OVERRIDE" ] || die "setup needs --project <id>" 2
-  local mode="${MODE_OVERRIDE:-vm}"
-  case "$mode" in vm|control-plane) ;; *) die "--mode must be vm|control-plane (got: $mode)" 2 ;; esac
   local repo="${REPO_OVERRIDE:-}"
   [ -z "$repo" ] || valid_repo "$repo" || die "--repo must be owner/name (got: $repo)" 2
   [ -n "$PY" ] || die "python3 required to write remote.json"
@@ -196,6 +218,69 @@ PYEOF
   chmod 600 "$REMOTE_JSON" 2>/dev/null || true
   say "wrote $REMOTE_JSON (cloud target: vm=$VM_OVERRIDE zone=$ZONE_OVERRIDE project=$PROJECT_OVERRIDE mode=$mode)"
   say "next: rr \"<task>\" --dry-run   # preview the local→cloud handoff plan"
+}
+
+# ── SETUP (control-plane) — remote.json {mode:control-plane, repo} + optional CP wire ──
+# The control-plane target is the signed public enqueue route, not a VM: no
+# vm/zone/project. When --endpoint is given we (also) update the SHARED CP config
+# ~/.heimdall/cp-endpoint.json that heimdall-presence reads, MERGING url (and the
+# enroll_token when --enroll-token is given) into it — existing keys are preserved.
+# NO secret lands in remote.json; the enroll token lives ONLY in the 0600 cp-endpoint.json
+# and is NEVER echoed (passed to python via the ENV, never argv-logged/printed).
+do_setup_cp() {
+  local repo="${REPO_OVERRIDE:-}"
+  [ -z "$repo" ] || valid_repo "$repo" || die "--repo must be owner/name (got: $repo)" 2
+  [ -n "$PY" ] || die "python3 required to write remote.json"
+  local endpoint="$ENDPOINT_OVERRIDE"
+  local tok="${ENROLL_TOKEN_OVERRIDE:-${RR_ENROLL_TOKEN:-}}"
+
+  if [ "$DRY" = 1 ]; then
+    say "dry-run: would write $REMOTE_JSON (mode=control-plane repo=${repo:-<none>}):"
+    plan "mode=control-plane repo=${repo:-<none>}"
+    if [ -n "$endpoint" ]; then
+      say "dry-run: would update $CP_ENDPOINT_JSON:"
+      plan "url=$endpoint${tok:+ enroll_token=<redacted>}"
+    fi
+    warn "dry-run: nothing written."
+    return 0
+  fi
+
+  mkdir -p "$HOME/.heimdall"; chmod 700 "$HOME/.heimdall" 2>/dev/null || true
+  REPO="$repo" DEST="$REMOTE_JSON" "$PY" - <<'PYEOF'
+import json, os
+cfg = {"vm": "", "zone": "", "project": "",
+       "repo": os.environ.get("REPO") or "", "mode": "control-plane"}
+with open(os.environ["DEST"], "w") as f:
+    json.dump(cfg, f, indent=2, sort_keys=True)
+    f.write("\n")
+PYEOF
+  chmod 600 "$REMOTE_JSON" 2>/dev/null || true
+  say "wrote $REMOTE_JSON (control-plane target: repo=${repo:-<none>})"
+
+  if [ -n "$endpoint" ]; then
+    # MERGE {url, enroll_token?} into the shared CP config, preserving other keys.
+    CP_URL="$endpoint" CP_TOKEN="$tok" DEST="$CP_ENDPOINT_JSON" "$PY" - <<'PYEOF'
+import json, os
+dest = os.environ["DEST"]
+try:
+    with open(dest) as f:
+        cfg = json.load(f)
+    if not isinstance(cfg, dict):
+        cfg = {}
+except Exception:
+    cfg = {}
+cfg["url"] = os.environ["CP_URL"]
+tok = os.environ.get("CP_TOKEN") or ""
+if tok:
+    cfg["enroll_token"] = tok   # a secret — persisted 0600 below, NEVER echoed.
+with open(dest, "w") as f:
+    json.dump(cfg, f, indent=2, sort_keys=True)
+    f.write("\n")
+PYEOF
+    chmod 600 "$CP_ENDPOINT_JSON" 2>/dev/null || true
+    say "updated $CP_ENDPOINT_JSON (url set${tok:+, enroll token stored 0600 — not shown})"
+  fi
+  say "next: rr \"<task>\" --mode control-plane --dry-run   # preview the signed enqueue plan"
 }
 
 # ── FILE the maintainer issue (idempotent) ─────────────────────────────────────
@@ -294,23 +379,202 @@ dispatch_vm() {
     "$(date -u +%FT%TZ)" "$CFG_VM" "$CFG_REPO" "${ISSUE_REF:-?}" "$MAXN" >> "$DISPATCH_LOG"
 }
 
-# control-plane mode (alt): reuse the bounded §1 allowlist path. Register the
-# allowlisted run-maintainer-cycle via heimdall-control-plane; the per-minute tick
-# fires it and the hybrid runner routes it. This is the control-plane equivalent
-# of the VM one-shot (a bounded, typed, refuse-on-bad-params dispatch).
-dispatch_control_plane() {
-  local cp="$BINDIR/heimdall-control-plane"
-  local cron="* * * * *"
+# ── CONTROL-PLANE mode — the SIGNED, ENQUEUE-ONLY public-surface client ────────
+# Instead of SSHing a VM, `rr --mode control-plane` SIGNS a bounded task with the
+# per-dev Ed25519 key and POSTs it to the CP's public route `POST /rr-task`. The
+# route is ENQUEUE-ONLY: it writes ONE bounded, secret-scrubbed DATA row to the
+# CALLER'S OWN team queue (team_id is derived SERVER-SIDE from the signed binding,
+# INV-1) and stops — it dispatches NOTHING and reads NO cred. A human's GitHub App
+# turns the drained task into a PR.
+#
+# The signing key + enroll binding are the SAME ones heimdall-presence bootstraps
+# and persists (0600 ${HOME}/.heimdall/pki/<haid>.seed), so enrolling once serves
+# both. This client REUSES the shipped cp_auth signer over urllib exactly as
+# heimdall-presence does — Ed25519 is NEVER re-implemented — and the seed/enroll
+# secret cross bash→python via the ENVIRONMENT/heredoc ONLY, never argv (argv
+# shows in `ps`) and never a log.
+
+# resolve_cp_wire — sets CP_URL, CP_HAID, CP_SEED_FILE from the SAME sources
+# heimdall-presence uses (flag/env > cp-endpoint.json > shipped default; identity
+# from heimdall-identity/heimdall-haid; the per-(machine,haid) 0600 seed path).
+CP_URL=""; CP_HAID=""; CP_SEED_FILE=""
+resolve_cp_wire() {
+  # URL precedence: --endpoint > $HEIMDALL_CP_URL/$BASE_URL > cp-endpoint.json .url > default.
+  local cfg_url=""
+  if [ -n "$PY" ] && [ -f "$CP_ENDPOINT_JSON" ]; then
+    cfg_url="$("$PY" - "$CP_ENDPOINT_JSON" 2>/dev/null <<'PYEOF' || true
+import json, sys
+try:
+    print((json.load(open(sys.argv[1])).get("url") or ""))
+except Exception:
+    print("")
+PYEOF
+)"
+  fi
+  CP_URL="$ENDPOINT_OVERRIDE"
+  [ -n "$CP_URL" ] || CP_URL="${HEIMDALL_CP_URL:-${BASE_URL:-}}"
+  [ -n "$CP_URL" ] || CP_URL="$cfg_url"
+  [ -n "$CP_URL" ] || CP_URL="$DEFAULT_CP_URL"
+
+  # identity: $HMD_HAID > heimdall-identity current > heimdall-haid current (as presence resolves it).
+  CP_HAID="${HMD_HAID:-}"
+  if [ -z "$CP_HAID" ] && [ -x "$BINDIR/heimdall-identity" ]; then
+    CP_HAID="$("$BINDIR/heimdall-identity" current 2>/dev/null || true)"
+  fi
+  if [ -z "$CP_HAID" ] && [ -x "$BINDIR/heimdall-haid" ]; then
+    CP_HAID="$("$BINDIR/heimdall-haid" current 2>/dev/null || true)"
+  fi
+
+  # the per-(machine,haid) 0600 seed path — the SAME slug/layout heimdall-presence persists.
+  if [ -n "${HOME:-}" ] && [ -n "$CP_HAID" ]; then
+    local slug; slug="$(printf '%s' "$CP_HAID" | tr '/:' '__')"
+    CP_SEED_FILE="$HOME/.heimdall/pki/$slug.seed"
+  fi
+}
+
+# dispatch_cp — sign + POST the bounded task (+context capsule) to POST /rr-task.
+dispatch_cp() {
+  [ -n "$TASK" ] || die "no task given — usage: rr \"<task>\" --mode control-plane" 2
+  resolve_cp_wire
+  local capsule="$BINDIR/heimdall-context-capsule"
+
   if [ "$DRY" = 1 ]; then
-    say "would dispatch via the control-plane bounded allowlist (run-maintainer-cycle):"
-    plan "heimdall-control-plane schedule-maintainer --repo $CFG_REPO --cron \"$cron\" --max $MAXN"
+    # Build the EXACT client payload (no seed/network needed) so the plan shows the
+    # real, bounded body — its context is a marker here (the capsule is only run on a
+    # REAL dispatch, so a dry-run executes nothing). The body carries NO team_id.
+    local body_json
+    body_json="$(CP_TASK="$TASK" \
+                 CP_CONTEXT="<context-capsule: secret-scrubbed, up to 8000 chars>" \
+                 RR_CP_DUMP_BODY=1 cp_client_py)"
+    say "would SIGN + POST the task to the control-plane ENQUEUE-ONLY route (no VM, no GitHub issue):"
+    plan "ensure enrolled: $BINDIR/heimdall-presence beat   # bootstraps the 0600 Ed25519 key + /enroll if absent (seed: ${CP_SEED_FILE:-<haid-derived>})"
+    plan "POST $CP_URL/rr-task   body=$body_json   # SIGNED X-Heimdall-Signature over canonical_message(POST,/rr-task,body)"
+    say "INV-1: team_id is derived SERVER-SIDE from the signed binding — the client sends NO team_id."
+    say "watch: the PR will appear on $CFG_REPO via your GitHub App once the CP task is drained."
     return 0
   fi
-  [ -x "$cp" ] || die "control-plane CLI not found at $cp"
-  say "dispatching via the control-plane (bounded run-maintainer-cycle for $CFG_REPO)"
-  "$cp" schedule-maintainer --repo "$CFG_REPO" --cron "$cron" --max "$MAXN"
-  printf '%s\tcontrol-plane\trepo=%s\tissue=%s\tmax=%s\n' \
-    "$(date -u +%FT%TZ)" "$CFG_REPO" "${ISSUE_REF:-?}" "$MAXN" >> "$DISPATCH_LOG"
+
+  [ -n "$PY" ] || die "python3 required for the control-plane client"
+  [ -f "$LIB/cp_auth.py" ] || die "cp_auth signer not found at $LIB (broken install)"
+  [ -n "$CP_HAID" ] || die "no Heimdall identity resolved — enroll first: run \`heimdall-presence beat\` (or set \$HMD_HAID)"
+
+  # ensure enrolled: reuse heimdall-presence's bootstrap enroll path (keygen → POST
+  # /enroll → persist the 0600 seed) so this device holds a signing key bound to its
+  # team. Best-effort + idempotent — a already-enrolled device is a no-op.
+  if [ -z "$CP_SEED_FILE" ] || [ ! -f "$CP_SEED_FILE" ]; then
+    if [ -x "$BINDIR/heimdall-presence" ]; then
+      say "enrolling this device with the control plane (first use)…"
+      "$BINDIR/heimdall-presence" beat >/dev/null 2>&1 || true
+    fi
+  fi
+  [ -n "$CP_SEED_FILE" ] && [ -f "$CP_SEED_FILE" ] \
+    || die "not enrolled — no signing key at ${CP_SEED_FILE:-<haid-derived>}. Enroll first: run \`heimdall-presence beat\` (needs a reachable CP + the enroll token)"
+
+  # build the context capsule (bounded, ALREADY secret-scrubbed by the capsule). Best-effort:
+  # a capsule failure must NOT block the enqueue. Opt out with RR_NO_CONTEXT=1.
+  local ctx=""
+  if [ "${RR_NO_CONTEXT:-0}" != 1 ] && [ -x "$capsule" ]; then
+    ctx="$("$capsule" build --repo "$CFG_REPO" 2>/dev/null || true)"
+  fi
+
+  say "signing + posting the task to the control plane ($CP_URL/rr-task)…"
+  local resp kind a b
+  resp="$(CP_TASK="$TASK" CP_CONTEXT="$ctx" cp_client_py)"
+  IFS=$'\t' read -r kind a b <<<"$resp"
+  case "$kind" in
+    OK)
+      say "task ENQUEUED to the control plane — id: ${a:-?}  (team: ${b:-server-derived}, INV-1)"
+      say "watch: the PR will appear on $CFG_REPO via your GitHub App once the task is drained."
+      printf '%s\tcontrol-plane\trepo=%s\tid=%s\tteam=%s\n' \
+        "$(date -u +%FT%TZ)" "$CFG_REPO" "${a:-?}" "${b:-?}" >> "$DISPATCH_LOG"
+      ;;
+    HTTP)
+      case "$a" in
+        401) die "signature REJECTED (401) — this device's key isn't recognized. Re-enroll: heimdall-presence beat" ;;
+        403) die "repo NOT covered / no team (403) — this device isn't bound to a team that covers $CFG_REPO" ;;
+        422) die "task refused (422) — the enqueue rejected the payload (${b:-bounds/scrub})" ;;
+        429) die "rate limited (429) — too many tasks too fast; retry shortly" ;;
+        *)   die "control-plane refused the task (HTTP $a): ${b:-}" ;;
+      esac
+      ;;
+    ERR)
+      case "$a" in
+        no_seed) die "not enrolled — no usable signing key. Enroll first: run \`heimdall-presence beat\`" ;;
+        connect) die "could not reach the control plane at $CP_URL (offline / DNS / TLS). Check the endpoint + your network." ;;
+        *)       die "control-plane client error (${a:-unknown})" ;;
+      esac
+      ;;
+    *) die "control-plane client returned an unexpected result: $resp" ;;
+  esac
+}
+
+# cp_client_py — the signed-HTTP client, mirroring heimdall-presence's run_client:
+# it REUSES the shipped cp_auth signer over urllib. Inputs cross via the ENV ONLY
+# (CP_URL/CP_HAID/CP_SEED_FILE/CP_TASK/CP_CONTEXT + LIB) — NEVER argv. It builds the
+# bounded body {text, context?, nonce, ts} (NO team_id — INV-1), signs
+# canonical_message(POST,/rr-task,body), and POSTs. With RR_CP_DUMP_BODY set it
+# prints the literal body JSON and stops BEFORE any seed read / network (the dry-run
+# plan uses this). Emits one tab-record: `OK\t<id>\t<team_id>` on 2xx, `HTTP\t<code>\t<err>`
+# on an HTTP refusal, or `ERR\t<reason>` on no-seed/transport fault.
+cp_client_py() {
+  LIB="$LIB" CP_URL="$CP_URL" CP_HAID="$CP_HAID" CP_SEED_FILE="$CP_SEED_FILE" \
+  "$PY" - <<'PYEOF'
+import json, os, secrets, sys, time
+import urllib.error, urllib.request
+
+# Build the bounded client body FIRST — {text, context?, nonce, ts}. NO team_id: the
+# server derives the team from the signed binding (INV-1). context is trimmed to a
+# sane cap so an oversized capsule can never bloat a queue row (INV-5; the server
+# also scrubs+trims). nonce+ts ride INSIDE the signed body so the replay-nonce gate
+# can prove this is a LIVE, first-use enqueue.
+ctx = os.environ.get("CP_CONTEXT") or ""
+if len(ctx) > 8000:
+    ctx = ctx[:8000]
+body_obj = {"text": os.environ.get("CP_TASK") or "",
+            "nonce": secrets.token_hex(16), "ts": int(time.time())}
+if ctx:
+    body_obj["context"] = ctx
+body = json.dumps(body_obj).encode("utf-8")
+
+if os.environ.get("RR_CP_DUMP_BODY"):
+    # dry-run: show the LITERAL payload; no seed read, no network.
+    sys.stdout.write(body.decode("utf-8"))
+    sys.exit(0)
+
+# Read the persisted 0600 seed HERE (in-process) so the seed bytes never touch
+# bash/argv — only the seed-file PATH crossed from the shell.
+try:
+    with open(os.environ["CP_SEED_FILE"], "r", encoding="utf-8") as fh:
+        seed = fh.read().strip()
+except OSError:
+    sys.stdout.write("ERR\tno_seed"); sys.exit(0)
+if not seed:
+    sys.stdout.write("ERR\tno_seed"); sys.exit(0)
+
+sys.path.insert(0, os.environ["LIB"])
+import cp_auth as K  # the SHIPPED Ed25519 signer — never re-implemented.
+
+BASE = os.environ["CP_URL"].rstrip("/")
+path = "/rr-task"
+req = urllib.request.Request(BASE + path, data=body, method="POST")
+req.add_header("Content-Type", "application/json")
+req.add_header("X-Heimdall-HAID", os.environ["CP_HAID"])
+req.add_header("X-Heimdall-Signature", K.sign(seed, K.canonical_message("POST", path, body)))
+try:
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        raw = resp.read()
+        d = json.loads(raw) if raw else {}
+        sys.stdout.write("OK\t%s\t%s" % (d.get("id") or "", d.get("team_id") or ""))
+except urllib.error.HTTPError as exc:
+    raw = exc.read()
+    try:
+        d = json.loads(raw) if raw else {}
+    except Exception:
+        d = {}
+    sys.stdout.write("HTTP\t%d\t%s" % (exc.code, d.get("error") or ""))
+except Exception:  # noqa: BLE001 — any transport/TLS/DNS fault is a connect failure.
+    sys.stdout.write("ERR\tconnect")
+PYEOF
 }
 
 dispatch_cloud() {
@@ -321,7 +585,7 @@ dispatch_cloud() {
   fi
   case "$CFG_MODE" in
     vm)             dispatch_vm ;;
-    control-plane)  dispatch_control_plane ;;
+    control-plane)  dispatch_cp ;;
     *)              die "unknown mode '$CFG_MODE' (expected vm|control-plane)" 2 ;;
   esac
 }
@@ -379,6 +643,14 @@ do_status() {
 main_dispatch() {
   if [ "$LOCAL" = 1 ]; then
     dispatch_local
+    return 0
+  fi
+
+  # control-plane: the SIGNED enqueue IS the intake — no GitHub issue is filed (the
+  # CP queue is the maintainer's native queue here). Dispatch straight to the signed
+  # POST /rr-task client; it self-guards (enroll-first, dry-run, clear HTTP errors).
+  if [ "$CFG_MODE" = control-plane ]; then
+    dispatch_cp
     return 0
   fi
 
