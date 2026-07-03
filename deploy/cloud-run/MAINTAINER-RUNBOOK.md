@@ -380,16 +380,35 @@ relayed to your browser** and **pasted back on the VM**. No pre-minted token eve
 ```bash
 deploy/gce/provision-maintainer-vm.sh provision \
   --project heimdall-control-plane --zone us-central1-a [--vm heimdall-maintainer-vm] \
-  [--machine-type e2-small] [--dry-run]
+  [--machine-type e2-small] [--private] [--dry-run]
 ```
 
 Creates a small **e2-small Debian 12** VM (guarded: `instances describe … || create`) with a
 **startup script** that installs the full toolchain — **git + gh + Node 20 + the `claude` CLI +
 python3 with the pinned `cryptography`/`firestore`/`run` deps** (identical pins to
 `Dockerfile.maintainer`) — and clones the **public** heimdall repo to `/opt/heimdall`, exporting
-`bin/` on PATH via `/etc/profile.d`. **Egress-only**: no inbound firewall rule (SSH reaches the
-VM over **IAP**, which needs no public ingress). Then it **prints the interactive login relay for
-RJ to run himself**:
+`bin/` on PATH via `/etc/profile.d`.
+
+> **⚠️ Egress is mandatory — this is the bug that bit a live run.** A GCE VM with **no external
+> IP and no Cloud NAT has NO route to the internet**, so the startup script dies at the first
+> `apt-get`/`npm`/`git clone` with *"Network is unreachable"* — **nothing installs**. Provision
+> therefore gives the VM **internet egress**:
+> - **default** → an **ephemeral EXTERNAL IP** (fast, works immediately);
+> - `--private` → **no external IP**, egress via a **Cloud Router + NAT** (`heimdall-maintainer-router`
+>   + `heimdall-maintainer-nat`, guarded/idempotent for the region) — no public IP on the VM.
+>
+> The startup script is **idempotent + re-runnable**: it retries `apt-get update` (and every
+> network fetch), tees to **`/var/log/heimdall-toolchain.log`**, and writes the ready marker
+> **`/var/log/heimdall-toolchain-ready` only on full success** — so `verify` (§7.3) can self-heal.
+
+**IAP auto-setup** (previously a manual step — the operator hit SSH **4033 'not authorized'**):
+provision idempotently ensures the **`allow-iap-ssh`** firewall (ingress **tcp:22** from
+**`35.235.240.0/20`**), **enables the `compute`/`iap` APIs**, and grants (or prints, if it lacks
+project-IAM-admin) the operator's **`roles/iap.tunnelResourceAccessor`**. If the active account is
+a **service account** (`*.gserviceaccount.com`, e.g. a CI SA) the script **warns loudly** that
+these steps will `PERMISSION_DENIED` and to `gcloud auth login` as a human owner first.
+
+Then it **prints the interactive login relay for RJ to run himself**:
 
 ```bash
 # 1. SSH in over the IAP tunnel (no public IP needed):
@@ -431,6 +450,20 @@ Over `gcloud compute ssh --command` (IAP), on the VM:
 
 The maintainer **OPENS PRs** via the bot token on `heimdall/*` branches — it **never pushes
 `main`, never merges**. **RJ merges** (§4).
+
+### 7.3 `verify` — confirm (and self-heal) the toolchain
+
+```bash
+deploy/gce/provision-maintainer-vm.sh verify \
+  --project heimdall-control-plane --zone us-central1-a [--vm heimdall-maintainer-vm] [--dry-run]
+```
+
+SSHes in over IAP and checks the **`/var/log/heimdall-toolchain-ready`** marker plus
+**`claude --version`** and `git`/`gh`/`heimdall-maintain-loop` on PATH. **If the marker is absent**
+(a transient first-boot failure, or one fixed by adding egress after the fact), it **re-runs the
+startup script** via `sudo google_metadata_script_runner startup` and **re-checks** — so the
+toolchain **self-heals WITHOUT recreating the VM**. Exit 0 = `VERIFY-OK`; a still-broken toolchain
+prints `VERIFY-FAIL` (see `/var/log/heimdall-toolchain.log`) and exits nonzero.
 
 > **Secret discipline.** The OAuth login is interactive + manual (the script never touches the
 > OAuth secret). The bot token is `read -rs` → **ssh STDIN pipe** → 0600 file on the VM. No
