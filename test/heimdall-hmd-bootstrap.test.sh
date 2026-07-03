@@ -1,29 +1,41 @@
 #!/usr/bin/env bash
 #
 # heimdall-hmd-bootstrap.test.sh — proves the `hmd` first-run bootstrap completes
-# in ONE invocation, non-interactively, and is idempotent.
+# in ONE invocation, non-interactively, is idempotent, and survives the two
+# live-VM failure modes.
 #
-# THE BUG THIS LOCKS DOWN: on a fresh machine the launcher needed TWO `hmd` runs.
-# Run 1 hit `ensure_auth`, dropped into an interactive `claude login`, and `exit 1`
-# aborted the whole bootstrap BEFORE companion setup ran or the first-run marker
-# was written. Run 2 then did companion setup, which BLOCKED on the claude-mem
-# `Ok to proceed? (y)` npm confirm. Auth-check and companion-setup were effectively
-# mutually exclusive per run, and both blocked on prompts.
+# THE BUGS THIS LOCKS DOWN:
+#   ORIGINAL: on a fresh machine the launcher needed TWO `hmd` runs. Run 1 hit
+#   `ensure_auth`, dropped into an interactive `claude login`, and `exit 1` aborted
+#   the whole bootstrap BEFORE companion setup ran or the first-run marker was
+#   written. Run 2 then blocked on the claude-mem `Ok to proceed? (y)` npm confirm.
 #
-# THE FIX PROVEN HERE (all in a single invocation):
-#   1. companion plugins (caveman, superpowers, claude-mem, heimdall marketplace)
-#      install — recorded by PATH fakes — DECOUPLED from auth state,
-#   2. the claude-mem confirm is AUTO-answered (`npx --yes … < <(yes)`) → NO block,
-#   3. the first-run marker is written,
-#   4. an UNAUTHENTICATED state prints the deferred sign-in instruction WITHOUT
-#      aborting setup or the marker,
-#   5. a SECOND invocation does NOT re-run companion setup (idempotent).
+#   LIVE-VM #1 (marker in a root-owned install dir): the repo was `sudo git
+#   clone`'d (root-owned) and hmd runs as a normal user, so `touch
+#   "$PLUGIN_DIR/.setup-done"` failed `Permission denied` → the marker never
+#   landed → first-run setup re-ran forever. FIX: the marker lives in the
+#   USER-writable home ($HEIMDALL_HOME | ~/.heimdall), NEVER the install dir; an
+#   existing legacy marker is migrated so upgraded installs are not re-run.
 #
-# HERMETIC: no real network / npm / claude. `claude`, `npx` are recording fakes on
-# PATH; claude-mem is deliberately absent so its install branch runs; the launcher
-# short-circuits at the `launch:task` trace marker before any real `claude … -p`.
-# Each launcher invocation runs under a watchdog so a regression that re-introduces
-# a blocking prompt fails as a HANG rather than wedging the suite.
+#   LIVE-VM #2 (claude-mem interactive wizard + bun): `npx claude-mem install`
+#   launches a multi-prompt wizard (email/IDE/runtime/provider/model) and needs
+#   `bun`. Force-feeding `yes` still ran the wizard and aborted
+#   `bun-missing-after-install`. FIX: attempt claude-mem ONLY when a real TTY AND
+#   bun are both present; otherwise SKIP cleanly WITHOUT launching the installer.
+#
+# THE PROOFS HERE (all hermetic — `claude`/`npx`/`bun` are recording PATH fakes;
+# claude-mem is absent so its branch runs; the launcher short-circuits at the
+# `launch:task` trace marker before any real `claude … -p`; every run is under a
+# 30s watchdog so a re-introduced blocking prompt fails as a HANG, not a wedge):
+#   1. FRESH first run — READ-ONLY install dir, unauthenticated, non-TTY — ONE
+#      invocation installs companions, writes the marker to the USER home (NOT the
+#      repo dir), and defers auth without aborting.
+#   2. claude-mem is SKIPPED on a non-TTY box — the installer is NEVER invoked.
+#   3. IDEMPOTENT re-run (same home) — companion setup does NOT re-run.
+#   4. LEGACY-marker MIGRATION — an old repo-dir marker is honored as already-set-up.
+#   5. claude-mem SKIPPED even when bun IS present but there is no TTY (the TTY is
+#      required, not just bun).
+#   6. claude-mem IS attempted when a real TTY (pty) AND bun are both present.
 #
 # Exit 0 = every proof holds. Nonzero = a proof failed (prints which).
 
@@ -35,15 +47,17 @@ REPO="$(cd "$SELF_DIR/.." && pwd)"
 PASS=0; FAIL=0
 ok()  { printf '  \033[32mPASS\033[0m %s\n' "$1"; PASS=$((PASS + 1)); }
 bad() { printf '  \033[31mFAIL\033[0m %s\n' "$1"; FAIL=$((FAIL + 1)); }
+note(){ printf '  \033[33mNOTE\033[0m %s\n' "$1"; }
 
 need() { command -v "$1" >/dev/null 2>&1 || { echo "FATAL: $1 not found on PATH"; exit 2; }; }
 need git; need python3; need yes
 
 [ -x "$REPO/bin/heimdall" ] || { echo "FATAL: bin/heimdall not executable"; exit 2; }
 
-# ── Isolated plugin tree (the first-run marker lands HERE, never the real repo) ──
+# ── Isolated plugin tree (the install dir; the marker must NOT land here) ──
 # The copied launcher resolves its own PLUGIN_DIR from its location, so
-# PLUGIN_DIR = $TPLUG and SETUP_MARKER = $TPLUG/.setup-done — freely deletable.
+# PLUGIN_DIR = $TPLUG. With the fix the first-run marker lands in $HEIMDALL_HOME,
+# never $TPLUG — which is exactly what lets a READ-ONLY $TPLUG still complete setup.
 TPLUG="$(mktemp -d)"
 mkdir -p "$TPLUG/bin" "$TPLUG/.claude-plugin"
 cp -R "$REPO/bin/." "$TPLUG/bin/"
@@ -66,11 +80,9 @@ echo "claude \$*" >> "$CALLS"
 exit 0
 EOF
 
-# `npx` — records argv, THEN reads one line of stdin to model the claude-mem
-# `Ok to proceed? (y)` confirm. With the fix the launcher feeds a \`yes\` stream on
-# stdin, so the read returns "y" immediately; we record what we saw so the test can
-# PROVE the confirm was auto-answered (npx-stdin:y) rather than left to block. The
-# -t guard means the fake itself can never hang the suite.
+# `npx` — records argv, then reads one line of stdin with a hard timeout so the
+# fake itself can NEVER hang the suite, and exits 0. It is only ever reached when
+# the launcher's TTY+bun gate has ALREADY decided claude-mem may be attempted.
 cat > "$FAKE_DIR/npx" <<EOF
 #!/usr/bin/env bash
 echo "npx \$*" >> "$CALLS"
@@ -83,33 +95,57 @@ fi
 exit 0
 EOF
 chmod +x "$FAKE_DIR/claude" "$FAKE_DIR/npx"
-# NOTE: NO `claude-mem` fake on PATH ⇒ `command -v claude-mem` fails ⇒ the launcher
-# runs the claude-mem install branch (the step under test).
+# NOTE: NO `claude-mem` fake ⇒ `command -v claude-mem` fails ⇒ the claude-mem
+# branch (the step under test) runs.
 
-# PATH: our fakes FIRST, then the real dirs holding python3 + git + coreutils the
-# launcher genuinely needs. No real claude/npx/claude-mem is reachable.
+# `bun` fake lives in its OWN dir so PATH can include or EXCLUDE it independently —
+# that is how we flip the "bun present / absent" half of the claude-mem gate.
+BUN_DIR="$(mktemp -d)"
+cat > "$BUN_DIR/bun" <<EOF
+#!/usr/bin/env bash
+echo "bun \$*" >> "$CALLS"
+exit 0
+EOF
+chmod +x "$BUN_DIR/bun"
+
+# PATH: fakes FIRST, then the real dirs holding python3 + git + coreutils. No real
+# claude/npx/claude-mem/bun is reachable. PATH_NOBUN omits bun; PATH_BUN prepends it.
 SYS="$(dirname "$(command -v python3)"):$(dirname "$(command -v git)"):/usr/bin:/bin"
-PROBE_PATH="$FAKE_DIR:$SYS"
+PATH_NOBUN="$FAKE_DIR:$SYS"
+PATH_BUN="$BUN_DIR:$FAKE_DIR:$SYS"
 
-WD1="$(mktemp -d)"; WD2="$(mktemp -d)"
-HH1="$(mktemp -d)/.heimdall"; HH2="$(mktemp -d)/.heimdall"
+trap 'chmod -R u+w "$TPLUG" 2>/dev/null || true; rm -rf "$TPLUG" "$FAKE_DIR" "$BUN_DIR" 2>/dev/null || true' EXIT
 
-trap 'rm -rf "$TPLUG" "$FAKE_DIR" "$WD1" "$WD2" "$HH1" "$HH2" 2>/dev/null || true' EXIT
-
-# run_bootstrap WORKDIR HEIMDALL_HOME STDOUT_CAPTURE — drive the launcher's main
-# first-run path UNAUTHENTICATED (no ANTHROPIC_API_KEY, a fresh empty HOME so there
-# is no ~/.claude.json ⇒ heimdall_is_authed is false), non-TTY, stdin </dev/null so
-# an unguarded prompt-read would hang. HEIMDALL_TRACE_ORDER short-circuits before
-# the real `claude … -p`. Runs under a 30s watchdog: prints "HANG" and returns 124
-# if the launcher does not finish (a re-introduced blocking prompt).
-run_bootstrap() {
-  local wd="$1" hh="$2" out="$3" trace; trace="$(mktemp)"
-  env -i HOME="$(dirname "$hh")" TERM="dumb" PATH="$PROBE_PATH" \
-    HEIMDALL_HOME="$hh" HEIMDALL_NO_INTRO=1 HEIMDALL_NO_REUSE_METRIC=1 \
-    HEIMDALL_TRACE_ORDER="$trace" \
-    bash -c "cd '$wd' && exec '$LAUNCHER' 'noop bootstrap probe'" \
-    </dev/null >"$out" 2>&1 &
-  local pid=$!
+# run_launcher MODE WORKDIR HEIMDALL_HOME STDOUT_CAPTURE PATH — drive the launcher's
+# first-run path UNAUTHENTICATED (no ANTHROPIC_API_KEY, a fresh empty HOME so
+# heimdall_is_authed is false). HEIMDALL_TRACE_ORDER short-circuits before the real
+# `claude … -p`. MODE=notty runs backgrounded with stdin </dev/null (an unguarded
+# prompt would hang); MODE=tty runs under `script`, which allocates a pty so the
+# launcher sees [ -t 0 ] && [ -t 1 ] TRUE. Both run under a 30s watchdog: prints
+# "HANG" and returns 124 if the launcher does not finish.
+run_launcher() {
+  local mode="$1" wd="$2" hh="$3" out="$4" path="$5" trace; trace="$(mktemp)"
+  local pid
+  if [ "$mode" = "tty" ]; then
+    local runner="$FAKE_DIR/pty-runner.sh"
+    cat > "$runner" <<RUN
+#!/usr/bin/env bash
+exec env -i HOME="$(dirname "$hh")" TERM="dumb" PATH="$path" \
+  HEIMDALL_HOME="$hh" HEIMDALL_NO_INTRO=1 HEIMDALL_NO_REUSE_METRIC=1 \
+  HEIMDALL_TRACE_ORDER="$trace" \
+  bash -c "cd '$wd' && exec '$LAUNCHER' 'noop bootstrap probe'"
+RUN
+    chmod +x "$runner"
+    script -q /dev/null "$runner" </dev/null >"$out" 2>&1 &
+    pid=$!
+  else
+    env -i HOME="$(dirname "$hh")" TERM="dumb" PATH="$path" \
+      HEIMDALL_HOME="$hh" HEIMDALL_NO_INTRO=1 HEIMDALL_NO_REUSE_METRIC=1 \
+      HEIMDALL_TRACE_ORDER="$trace" \
+      bash -c "cd '$wd' && exec '$LAUNCHER' 'noop bootstrap probe'" \
+      </dev/null >"$out" 2>&1 &
+    pid=$!
+  fi
   local waited=0
   while kill -0 "$pid" 2>/dev/null; do
     sleep 0.2
@@ -130,20 +166,33 @@ echo "hmd-bootstrap harness  repo=$REPO"
 echo "--------------------------------------------------------------------"
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
-# ║ 1. FRESH FIRST RUN — no marker, UNAUTHENTICATED — ONE invocation does all. ║
+# ║ 1. FRESH FIRST RUN — READ-ONLY install dir, UNAUTHENTICATED, non-TTY.      ║
+# ║    ONE invocation completes setup and writes the marker to the USER home.  ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
-rm -f "$TPLUG/.setup-done"                 # genuine cold first run
+WD1="$(mktemp -d)"; HOME1="$(mktemp -d)"; HH1="$HOME1/.heimdall"
+rm -f "$TPLUG/.setup-done"                 # genuine cold first run (no legacy marker)
+chmod -R a-w "$TPLUG"                       # SIMULATE a root-owned / read-only install dir
 OUT1="$FAKE_DIR/run1.out"
 : > "$CALLS"
-HANG1="$(run_bootstrap "$WD1" "$HH1" "$OUT1")"; RC1=$?
+HANG1="$(run_launcher notty "$WD1" "$HH1" "$OUT1" "$PATH_NOBUN")"; RC1=$?
 
 if [ "$RC1" -eq 124 ] || [ "$HANG1" = "HANG" ]; then
-  bad "fresh run BLOCKED/hung (a companion-setup prompt was not auto-answered)"
+  bad "fresh run BLOCKED/hung on a READ-ONLY install dir"
 else
-  ok "fresh run completed in ONE invocation without blocking (exit $RC1)"
+  ok "fresh run completed in ONE invocation on a READ-ONLY install dir (exit $RC1)"
 fi
 
-# 1a. Companion plugins installed — the fakes recorded each install call.
+# 1a. The marker was written to the USER home — NOT the (read-only) install dir.
+[ -f "$HH1/setup-done" ] \
+  && ok "marker written to the USER home (\$HEIMDALL_HOME/setup-done)" \
+  || bad "marker NOT written to \$HEIMDALL_HOME (out: $(tr '\n' ' ' < "$OUT1" | tail -c 200))"
+[ ! -f "$TPLUG/.setup-done" ] \
+  && ok "marker NOT written into the install/repo dir (never touches PLUGIN_DIR)" \
+  || bad "marker leaked into the install dir (\$PLUGIN_DIR/.setup-done)"
+
+chmod -R u+w "$TPLUG"                        # restore write for the remaining scenarios
+
+# 1b. Companion plugins installed — the fakes recorded each install call.
 grep -q 'claude plugins install caveman@caveman' "$CALLS" \
   && ok "companion: caveman install recorded" \
   || bad "companion: caveman install NOT recorded (calls: $(tr '\n' ';' < "$CALLS"))"
@@ -153,55 +202,116 @@ grep -q 'claude plugins install superpowers' "$CALLS" \
 grep -q 'claude plugins marketplace add randomittin/heimdall-marketplace' "$CALLS" \
   && ok "companion: heimdall marketplace add recorded" \
   || bad "companion: heimdall marketplace add NOT recorded"
-grep -q 'npx --yes claude-mem install' "$CALLS" \
-  && ok "companion: claude-mem installed NON-INTERACTIVELY (npx --yes)" \
-  || bad "companion: claude-mem install missing/interactive (no 'npx --yes')"
 
-# 1b. The claude-mem confirm was AUTO-answered (fed 'y' via the yes-stream), never
-#     left to block on a TTY read.
-grep -q '^npx-stdin:y' "$CALLS" \
-  && ok "claude-mem confirm auto-answered ('y' fed on stdin) — never blocked" \
-  || bad "claude-mem confirm NOT auto-answered (stdin: $(grep '^npx-stdin' "$CALLS" || echo none))"
-
-# 1c. The first-run marker was written — even though the user is unauthenticated.
-[ -f "$TPLUG/.setup-done" ] \
-  && ok "first-run marker written despite deferred auth" \
-  || bad "first-run marker NOT written"
-
-# 1d. Deferred-auth: a clear, headless-friendly sign-in instruction printed, and it
-#     did NOT abort setup (proven by 1a-1c passing in the same run).
+# 1c. Deferred-auth: a clear, headless-friendly sign-in instruction printed, and it
+#     did NOT abort setup (proven by the marker + companions above in the same run).
 grep -q 'Not signed in to Claude Code' "$OUT1" \
   && ok "deferred-auth: clear 'not signed in' instruction printed" \
-  || bad "deferred-auth: sign-in instruction missing (out: $(tr '\n' ' ' < "$OUT1" | tail -c 200))"
-grep -q 'setup-token' "$OUT1" \
-  && ok "deferred-auth: headless 'claude setup-token' path mentioned" \
-  || bad "deferred-auth: headless setup-token path not mentioned"
+  || bad "deferred-auth: sign-in instruction missing"
 grep -qi 'Running claude login' "$OUT1" \
   && bad "deferred-auth: still ran interactive 'claude login' (must NOT)" \
   || ok "deferred-auth: did NOT drop into interactive 'claude login'"
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
-# ║ 2. IDEMPOTENT RE-RUN — marker present ⇒ companion setup does NOT re-run.   ║
+# ║ 2. claude-mem SKIPPED on a non-TTY box — the installer is NEVER invoked.   ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
-# Marker from run 1 is still present. A second invocation must skip the companion
-# install flow entirely (no re-clone/re-install noise, no npm confirm).
+if grep -q 'claude-mem' "$CALLS"; then
+  bad "claude-mem installer was INVOKED on a non-TTY box (calls: $(grep -i 'npx\|claude-mem' "$CALLS" | tr '\n' ';'))"
+else
+  ok "claude-mem installer NOT invoked on a non-TTY box (zero claude-mem calls)"
+fi
+grep -q "optional companion — skipped" "$OUT1" \
+  && ok "claude-mem: graceful one-line skip note printed (never fatal)" \
+  || bad "claude-mem: skip note missing (out: $(tr '\n' ' ' < "$OUT1" | tail -c 200))"
+
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║ 3. IDEMPOTENT RE-RUN — SAME home ⇒ companion setup does NOT re-run.        ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+WD2="$(mktemp -d)"
 OUT2="$FAKE_DIR/run2.out"
 : > "$CALLS"
-HANG2="$(run_bootstrap "$WD2" "$HH2" "$OUT2")"; RC2=$?
+HANG2="$(run_launcher notty "$WD2" "$HH1" "$OUT2" "$PATH_NOBUN")"; RC2=$?  # SAME HH1
 
 if [ "$RC2" -eq 124 ] || [ "$HANG2" = "HANG" ]; then
   bad "re-run BLOCKED/hung"
 else
   ok "re-run completed without blocking (exit $RC2)"
 fi
-if grep -q 'plugins install caveman\|npx --yes claude-mem install' "$CALLS"; then
+if grep -q 'plugins install caveman\|claude-mem' "$CALLS"; then
   bad "re-run RE-TRIGGERED companion setup (calls: $(tr '\n' ';' < "$CALLS"))"
 else
-  ok "re-run did NOT re-run companion setup (idempotent)"
+  ok "re-run did NOT re-run companion setup (idempotent, marker-gated on the user home)"
 fi
-[ -f "$TPLUG/.setup-done" ] \
-  && ok "re-run left the first-run marker intact" \
-  || bad "re-run lost the first-run marker"
+[ -f "$HH1/setup-done" ] \
+  && ok "re-run left the user-home marker intact" \
+  || bad "re-run lost the user-home marker"
+
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║ 4. LEGACY-marker MIGRATION — old repo-dir marker ⇒ treated as set-up.      ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+WD3="$(mktemp -d)"; HOME3="$(mktemp -d)"; HH3="$HOME3/.heimdall"
+: > "$TPLUG/.setup-done"                     # OLD marker present in the install dir
+[ ! -f "$HH3/setup-done" ] || rm -f "$HH3/setup-done"   # fresh user home (no new marker)
+OUT3="$FAKE_DIR/run3.out"
+: > "$CALLS"
+HANG3="$(run_launcher notty "$WD3" "$HH3" "$OUT3" "$PATH_NOBUN")"; RC3=$?
+
+if [ "$RC3" -eq 124 ] || [ "$HANG3" = "HANG" ]; then
+  bad "migration run BLOCKED/hung"
+else
+  ok "migration run completed without blocking (exit $RC3)"
+fi
+if grep -q 'plugins install caveman\|claude-mem' "$CALLS"; then
+  bad "migration: companion setup RE-RAN (legacy marker not honored) (calls: $(tr '\n' ';' < "$CALLS"))"
+else
+  ok "migration: legacy repo-dir marker honored — companion setup did NOT re-run"
+fi
+[ -f "$HH3/setup-done" ] \
+  && ok "migration: user-home marker written from the legacy marker" \
+  || bad "migration: user-home marker NOT written"
+rm -f "$TPLUG/.setup-done"
+
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║ 5. claude-mem SKIPPED with bun PRESENT but NO TTY (the TTY is required).   ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+WD4="$(mktemp -d)"; HOME4="$(mktemp -d)"; HH4="$HOME4/.heimdall"
+OUT4="$FAKE_DIR/run4.out"
+: > "$CALLS"
+HANG4="$(run_launcher notty "$WD4" "$HH4" "$OUT4" "$PATH_BUN")"; RC4=$?  # bun ON path, non-TTY
+
+if [ "$RC4" -eq 124 ] || [ "$HANG4" = "HANG" ]; then
+  bad "bun-present non-TTY run BLOCKED/hung"
+else
+  ok "bun-present non-TTY run completed (exit $RC4)"
+fi
+if grep -q 'claude-mem' "$CALLS"; then
+  bad "claude-mem invoked with bun present but NO TTY (TTY must be required too)"
+else
+  ok "claude-mem SKIPPED with bun present but no TTY — TTY is required, not just bun"
+fi
+
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║ 6. claude-mem ATTEMPTED when a real TTY (pty) AND bun are both present.    ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+if ! command -v script >/dev/null 2>&1; then
+  note "TTY case skipped — 'script' (pty allocator) not on PATH"
+else
+  WD5="$(mktemp -d)"; HOME5="$(mktemp -d)"; HH5="$HOME5/.heimdall"
+  OUT5="$FAKE_DIR/run5.out"
+  : > "$CALLS"
+  HANG5="$(run_launcher tty "$WD5" "$HH5" "$OUT5" "$PATH_BUN")"; RC5=$?  # bun + pty
+
+  if [ "$HANG5" = "HANG" ] || [ "$RC5" -eq 124 ]; then
+    bad "TTY+bun run BLOCKED/hung"
+  else
+    ok "TTY+bun run completed without blocking (exit $RC5)"
+  fi
+  if grep -q 'npx --yes claude-mem install' "$CALLS"; then
+    ok "claude-mem ATTEMPTED (npx --yes claude-mem install) when TTY + bun both present"
+  else
+    bad "claude-mem NOT attempted despite TTY + bun (calls: $(grep -i 'npx\|bun\|claude-mem' "$CALLS" | tr '\n' ';'))"
+  fi
+fi
 
 echo "--------------------------------------------------------------------"
 printf 'hmd-bootstrap: %d passed, %d failed\n' "$PASS" "$FAIL"
