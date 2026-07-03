@@ -513,13 +513,15 @@ deploy/github-app/setup-bot.sh --configure \
 
 | Permission | Level | Why |
 |---|---|---|
-| **Contents** | Read and write | push the `heimdall/*` fix branch |
+| **Contents** | Read and write | push the `heimdall/*` fix branch (+ read repo code) |
+| **Issues** | Read and write | READ the issue queue (the connector's work source) + comment "resolved by #N" + close the resolved issue |
 | **Pull requests** | Read and write | open the PR + post the proof-receipt comment |
 | **Metadata** | Read-only | mandatory baseline (auto-selected) |
 
 **Deny everything else** — critically **no Administration** (so the App cannot edit
-branch protection or repo settings), **no Workflows/Actions**, no Members, no
-Deployments. Install the App on **the target repo(s) only** (never "All repositories").
+branch protection or repo settings), **no Workflows/Actions** (no CI mutation), **no
+Commit statuses / Checks** (the gate runs tests locally; it never reads CI status), no
+Members, no Deployments. Install the App on **the target repo(s) only** (never "All repositories").
 As a server-side backstop for "never push `main`, never merge", add a **branch protection
 rule on `main`** requiring a PR + review that the App cannot bypass (GitHub App
 permissions are not branch-scoped, so branch protection + no-Administration is what pins
@@ -551,7 +553,9 @@ with a **fine-grained PAT** scoped to the repo:
    org — the trade-off vs. the App). Give it push access to the target repo.
 2. Mint a **fine-grained PAT** (Settings → Developer settings → Fine-grained tokens),
    scoped to **only** `randomittin/heimdall`, with **Repository permissions: Contents:
-   Read and write** + **Pull requests: Read and write** — nothing else. Set a short
+   Read and write** + **Issues: Read and write** + **Pull requests: Read and write** —
+   nothing else. (Issues is required: the same bot identity reads the issue queue and
+   comments/closes resolved issues, so its token must carry Issues scope too.) Set a short
    expiry and rotate.
 3. Export it as the bot token:
 

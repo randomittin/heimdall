@@ -18,7 +18,8 @@
 #   2. POST {api-base}/app/installations/<installation-id>/access_tokens with
 #      Authorization: Bearer <that JWT> — GitHub returns a fresh installation token
 #      scoped to the permissions + repos the App was granted (contents:write on
-#      heimdall/* + pull_requests:write; NO main push, NO merge — enforced server-side).
+#      heimdall/* + issues:write + pull_requests:write; NO main push, NO merge — enforced
+#      server-side). Issues:write backs the connector's read/comment/close of the queue.
 #   3. print ONLY the token to stdout (for capture into an env var).
 #
 # SECRET DISCIPLINE (the #1 bar). The private key is read from env / a 0600 file ONLY —
@@ -173,7 +174,7 @@ def mint_installation_token(app_id, installation_id, private_pem, api_base=None,
         _die(
             "GitHub installation-token request failed: HTTP %s%s — check "
             "HEIMDALL_GH_APP_ID, HEIMDALL_GH_APP_INSTALLATION_ID, and that the App is "
-            "installed on the target repo(s) with Contents+Pull requests write."
+            "installed on the target repo(s) with Contents+Issues+Pull requests write."
             % (exc.code, (" (%s)" % detail) if detail else ""),
             1,
         )

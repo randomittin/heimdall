@@ -512,7 +512,7 @@ ssh_write_envfile() {
 
   # ── FALLBACK static-PAT path — prompt the token, PIPE the env-file body into ssh stdin ─
   local BOT_TOKEN=""
-  printf 'Paste the HEIMDALL_PR_BOT_TOKEN (scoped: contents:write on heimdall/*, pull_requests:write; NO main, NO merge): '
+  printf 'Paste the HEIMDALL_PR_BOT_TOKEN (scoped: contents:write on heimdall/*, issues:write, pull_requests:write; NO main, NO merge): '
   read -rs BOT_TOKEN; echo
   [ -n "$BOT_TOKEN" ] || die "no bot token entered"
   # printf is a shell BUILTIN — the token never crosses an argv of any child process; it goes

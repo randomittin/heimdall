@@ -122,7 +122,7 @@ class H(BaseHTTPRequestHandler):
             out = json.dumps({
                 "token": "ghs_FAKEINSTALLTOKEN_deadbeef",
                 "expires_at": "2099-01-01T00:00:00Z",
-                "permissions": {"contents": "write", "pull_requests": "write"},
+                "permissions": {"contents": "write", "issues": "write", "pull_requests": "write"},
             }).encode()
             self.send_response(201)
         else:
