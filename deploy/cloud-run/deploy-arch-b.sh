@@ -21,7 +21,7 @@
 #   f. verify           — gcloud run jobs describe heimdall-maintainer-job
 #
 # Usage:
-#   deploy-arch-b.sh --repo <owner/repo> [--project heimdall-cp-prod] \
+#   deploy-arch-b.sh --repo <owner/repo> [--project heimdall-control-plane] \
 #                    [--region us-central1] [--tag <t>] [--schedule "<cron>"] [--dry-run]
 #   --schedule "<cron>" is passed through to deploy-maintainer.sh --cloud, which registers
 #            the maintainer cron with the control plane (idempotent) so the per-minute tick
@@ -33,7 +33,7 @@ set -euo pipefail
 # ── defaults (project per operator; the existing infra references heimdall-control-plane —
 #    see the mismatch guard in preflight) ─────────────────────────────────────
 REPO=""
-PROJECT="heimdall-cp-prod"
+PROJECT="heimdall-control-plane"
 REGION="us-central1"
 TAG=""
 SCHEDULE=""
