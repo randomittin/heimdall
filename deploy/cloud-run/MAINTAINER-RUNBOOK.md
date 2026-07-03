@@ -268,6 +268,37 @@ Job) when it is not — **without ever dropping a cycle**. The selection is dete
 and reads **no credential** — only a liveness beat, the policy env, and the durable job
 state.
 
+> **⭐ One command makes the maintainer autonomous — `schedule-maintainer`.**
+>
+> The per-minute **tick** already runs inside the deployed control-plane service; it just
+> needs a **schedule** to fire. Register one and the tick dispatches `run-maintainer-cycle`
+> on its own — the hybrid selector then routes each cycle to RJ's box or the Cloud Run Job.
+>
+> ```bash
+> # register (or update-in-place) the maintainer cron — idempotent, no duplicates:
+> bin/heimdall-control-plane schedule-maintainer \
+>   --repo randomittin/heimdall --cron "*/30 * * * *" --max 3 [--budget-tokens 40000]
+> #   → prints: created maintainer schedule sch-… : run-maintainer-cycle for … (cron=…)
+> ```
+>
+> - **Idempotent.** Re-running with the **same `--repo` + `--cron`** updates the existing
+>   schedule **in place** (same `schedule_id`) — it never stacks duplicates. Change `--max`
+>   / `--budget-tokens` and re-run to adjust; the entry is rewritten, not doubled.
+> - **Typed + bounded, never a command.** The verb registers **only** the allowlisted
+>   `run-maintainer-cycle` action (repo slug, `1..100` max, optional token budget). A bad
+>   `--repo` / `--cron` / out-of-range `--max` is **refused** and **nothing** is persisted.
+>   There is no free-form prompt/cmd — the prompt is built **inside the loop** from the
+>   queued issue (§4). Registered **as the server identity** (`HEIMDALL_CP_SERVER_HAID` /
+>   `heimdall-haid current`) — the same identity the tick fires as.
+> - **`--dry-run`** prints the registration and writes nothing.
+> - **Fully-cloud (Arch B).** So an absent local runner routes the tick to the **Cloud Run
+>   Job**, run the control-plane **service** with `HEIMDALL_MAINTAINER_RUNNER=cloud` (force
+>   the Job) or `hybrid` (prefer the box, fall back to the Job). `deploy-maintainer.sh
+>   --cloud --schedule "<cron>"` (and `deploy-arch-b.sh --schedule "<cron>"`) call this verb
+>   for you after the Job is deployed, and set that env — the **last manual step** for a
+>   fully-cloud, unattended maintainer is now automated. List what is registered with
+>   `bin/heimdall-control-plane schedules`.
+
 ### 6.1 How the box proves it is up — the runner beat (DATA-ONLY, no token)
 
 RJ's box advertises liveness by beating a **signed, TTL'd `maintainer-runner` presence

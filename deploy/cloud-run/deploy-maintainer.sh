@@ -9,23 +9,30 @@
 #
 # Usage:
 #   deploy-maintainer.sh --repo <owner/repo> [--local|--cloud|--hybrid] [--dry-run] \
-#                        [--project <id>] [--region <r>] [--max <N>] [--cron "<expr>"]
+#                        [--project <id>] [--region <r>] [--max <N>] [--cron "<expr>"] \
+#                        [--schedule "<cron>"]
 #   --hybrid (default) sets up Arch A (this box) AND Arch B (cloud fallback).
 #   --local  Arch A only (no gcloud).   --cloud  Arch B only.
+#   --schedule "<cron>" REGISTERS the maintainer cron with the control plane so the
+#            per-minute tick fires run-maintainer-cycle autonomously (heimdall-control-plane
+#            schedule-maintainer — idempotent). Without it, schedule registration stays
+#            manual (see MAINTAINER-RUNBOOK.md §6). For --cloud, the tick reaches the Job
+#            when HEIMDALL_MAINTAINER_RUNNER=cloud|hybrid (an absent local runner -> the Job).
 #   --dry-run prints the full plan, executes nothing, needs NO creds/tokens.
 set -euo pipefail
 
 MODE="hybrid"; DRY=0; REPO=""; PROJECT="heimdall-control-plane"; REGION="us-central1"
-MAXN="3"; CRON="*/30 * * * *"
+MAXN="3"; CRON="*/30 * * * *"; SCHEDULE=""
 JOB="heimdall-maintainer-job"
 RUNTIME_SA="heimdall-cp-run@${PROJECT}.iam.gserviceaccount.com"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 LOOP="$ROOT/bin/heimdall-maintain-loop"
+CP_CLI="$ROOT/bin/heimdall-control-plane"
 YAML="$HERE/heimdall-maintainer-job.yaml"
 ENVFILE="$HOME/.heimdall/maintainer.env"
 
-usage() { sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,21p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 while [ $# -gt 0 ]; do case "$1" in
   --local|--cloud|--hybrid) MODE="${1#--}"; shift ;;
   --dry-run) DRY=1; shift ;;
@@ -34,6 +41,7 @@ while [ $# -gt 0 ]; do case "$1" in
   --region) REGION="${2:?}"; shift 2 ;;
   --max) MAXN="${2:?}"; shift 2 ;;
   --cron) CRON="${2:?}"; shift 2 ;;
+  --schedule) SCHEDULE="${2:?}"; shift 2 ;;
   -h|--help) usage; exit 0 ;;
   *) echo "unknown arg: $1" >&2; usage >&2; exit 2 ;;
 esac; done
@@ -149,7 +157,32 @@ arch_b() {
   run "gcloud iam roles create heimdallJobRunner --project=$PROJECT --permissions=run.jobs.run  (|| exists)"
   run "gcloud projects add-iam-policy-binding $PROJECT --member=serviceAccount:${RUNTIME_SA} --role=projects/$PROJECT/roles/heimdallJobRunner"
   say "cloud job '$JOB' deployed. Hybrid tick fires it when your box is down."
-  warn "schedule registration (per-minute tick fires run-maintainer-cycle): see MAINTAINER-RUNBOOK.md §6 — register the cron schedule via the control plane, or rely on Arch A cron with Arch B as failover."
+  if [ -z "$SCHEDULE" ]; then
+    warn "schedule registration (per-minute tick fires run-maintainer-cycle): pass --schedule \"<cron>\" to register it now (heimdall-control-plane schedule-maintainer), or see MAINTAINER-RUNBOOK.md §6."
+  fi
+}
+
+# ── register the maintainer cron with the control plane (the tick fires it) ───
+# When --schedule is given, register an ALLOWLISTED run-maintainer-cycle schedule via the
+# control-plane verb so the per-minute tick fires it autonomously — IDEMPOTENT (same repo+cron
+# updates in place, never duplicates). For --cloud, the tick must reach the Cloud Run Job when
+# no local runner beats: HEIMDALL_MAINTAINER_RUNNER=cloud|hybrid selects CloudRunJobRunner. The
+# schedule store is the control plane's (set HEIMDALL_STATE_BACKEND=firestore + project for a
+# cloud control plane). No token is handled here — the schedule carries only typed scalars.
+register_schedule() {
+  [ -n "$SCHEDULE" ] || return 0
+  say "register the maintainer cron '$SCHEDULE' with the control plane (tick fires run-maintainer-cycle)"
+  [ -x "$CP_CLI" ] || die "heimdall-control-plane not found/executable at $CP_CLI"
+  if [ "$MODE" = cloud ]; then
+    if [ "$DRY" = 1 ]; then
+      run "export HEIMDALL_MAINTAINER_RUNNER=cloud  # absent local runner -> tick uses the Cloud Run Job"
+    else
+      export HEIMDALL_MAINTAINER_RUNNER=cloud
+      say "HEIMDALL_MAINTAINER_RUNNER=cloud (an absent local runner routes the tick to the Cloud Run Job)"
+    fi
+    warn "ensure the deployed control-plane SERVICE runs with HEIMDALL_MAINTAINER_RUNNER=cloud|hybrid so its tick reaches the Job (MAINTAINER-RUNBOOK.md §6)."
+  fi
+  run "$CP_CLI" schedule-maintainer --repo "$REPO" --cron "$SCHEDULE" --max "$MAXN"
 }
 
 case "$MODE" in
@@ -157,6 +190,7 @@ case "$MODE" in
   cloud)  collect_secrets; arch_b ;;
   hybrid) collect_secrets; arch_a; arch_b ;;
 esac
+register_schedule
 echo; say "done ($MODE)."
 [ "$DRY" = 1 ] && warn "dry-run: nothing executed. Re-run without --dry-run to apply."
 exit 0

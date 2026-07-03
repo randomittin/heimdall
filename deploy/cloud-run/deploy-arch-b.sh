@@ -22,7 +22,11 @@
 #
 # Usage:
 #   deploy-arch-b.sh --repo <owner/repo> [--project heimdall-cp-prod] \
-#                    [--region us-central1] [--tag <t>] [--dry-run]
+#                    [--region us-central1] [--tag <t>] [--schedule "<cron>"] [--dry-run]
+#   --schedule "<cron>" is passed through to deploy-maintainer.sh --cloud, which registers
+#            the maintainer cron with the control plane (idempotent) so the per-minute tick
+#            fires run-maintainer-cycle autonomously — the last manual step for a fully-cloud
+#            unattended maintainer (see MAINTAINER-RUNBOOK.md §6).
 #   --dry-run prints the FULL plan, executes nothing, needs NO creds/tokens/Docker.
 set -euo pipefail
 
@@ -32,6 +36,7 @@ REPO=""
 PROJECT="heimdall-cp-prod"
 REGION="us-central1"
 TAG=""
+SCHEDULE=""
 DRY=0
 
 AR_REPO="heimdall"            # the Artifact Registry docker repo (matches the yaml image path)
@@ -44,12 +49,13 @@ DOCKERFILE="$HERE/Dockerfile.maintainer"
 YAML="$HERE/heimdall-maintainer-job.yaml"
 DEPLOY_MAINTAINER="$HERE/deploy-maintainer.sh"
 
-usage() { sed -n '19,27p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '23,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 while [ $# -gt 0 ]; do case "$1" in
   --repo)    REPO="${2:?}";    shift 2 ;;
   --project) PROJECT="${2:?}"; shift 2 ;;
   --region)  REGION="${2:?}";  shift 2 ;;
   --tag)     TAG="${2:?}";     shift 2 ;;
+  --schedule) SCHEDULE="${2:?}"; shift 2 ;;
   --dry-run) DRY=1;            shift ;;
   -h|--help) usage; exit 0 ;;
   *) echo "unknown arg: $1" >&2; usage >&2; exit 2 ;;
@@ -151,6 +157,7 @@ fi
 # ── e. deploy (REUSE deploy-maintainer.sh --cloud: secrets + job replace + IAM) ──
 say "e. deploy — deploy-maintainer.sh --cloud (mints secrets, job replace, IAM)"
 DM_ARGS=(--cloud --repo "$REPO" --project "$PROJECT" --region "$REGION")
+[ -n "$SCHEDULE" ] && DM_ARGS+=(--schedule "$SCHEDULE")
 [ "$DRY" = 1 ] && DM_ARGS+=(--dry-run)
 run "$DEPLOY_MAINTAINER" "${DM_ARGS[@]}"
 

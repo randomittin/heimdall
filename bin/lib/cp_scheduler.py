@@ -415,6 +415,51 @@ def register_maintainer_schedule(identity, repo, max_cycles, cron, *,
         enabled=enabled, schedule_id=schedule_id, home=home)
 
 
+def _norm_cron(expr):
+    """Whitespace-normalize a cron expr for IDENTITY comparison ("*/30  *  * * *" and
+    "*/30 * * * *" are the SAME schedule). Collapses runs of whitespace to a single space
+    and strips ends. Non-string coerces to "" (never matches a stored expr)."""
+    return " ".join(expr.split()) if isinstance(expr, str) else ""
+
+
+def find_maintainer_schedule(owner_haid, repo, cron, home=None):
+    """The live run-maintainer-cycle schedule OWNED by `owner_haid` for this exact
+    (repo, cron) pair, or None. The IDENTITY key of a maintainer schedule (§6): the same
+    owner + repo + normalized cron = the SAME schedule (re-registering updates it in place,
+    never duplicates). Read-only; a param mismatch (max / budget) is NOT part of the key —
+    those are the mutable payload an update rewrites. Returns the stored entry dict or None."""
+    want_cron = _norm_cron(cron)
+    for entry in list_schedules(home, owner_haid=owner_haid,
+                                action_type=MAINTAINER_ACTION_TYPE):
+        eparams = entry.get("params") or {}
+        if eparams.get("repo") == repo and _norm_cron(entry.get("cron")) == want_cron:
+            return entry
+    return None
+
+
+def upsert_maintainer_schedule(identity, repo, max_cycles, cron, *,
+                               budget_tokens=None, enabled=True, home=None):
+    """IDEMPOTENT register of the maintainer autopilot cron (§6). If a run-maintainer-cycle
+    schedule already exists for this owner + repo + cron, UPDATE IT IN PLACE (reuse its
+    schedule_id — the append-only log's last-write-wins fold rewrites the entry, so the live
+    set never gains a duplicate); otherwise CREATE a new one. Re-running with the same
+    (repo, cron) is a no-duplicate update (max / budget_tokens / enabled are refreshed); the
+    stored owner is the SAME server identity the tick fires as.
+
+    Goes through the identical §1 create-time gate as register_maintainer_schedule (an
+    off-slug repo / out-of-range max / smuggled key is REFUSED, never persisted). Returns a
+    dict {entry, created}: `entry` the stored schedule, `created` True on a fresh create /
+    False on an in-place update. Raises cp_allowlist.RefusedDispatch / ScheduleError exactly
+    as create_schedule does (the caller maps them to the CLI's 422 / usage error)."""
+    owner_haid = identity.haid if hasattr(identity, "haid") else identity
+    existing = find_maintainer_schedule(owner_haid, repo, cron, home=home)
+    sid = existing["schedule_id"] if existing else None
+    entry = register_maintainer_schedule(
+        identity, repo, max_cycles, cron, budget_tokens=budget_tokens,
+        enabled=enabled, schedule_id=sid, home=home)
+    return {"entry": entry, "created": existing is None}
+
+
 # ── FIRE — the tick (dispatch every due schedule through the §1 allowlist path) ─
 
 
