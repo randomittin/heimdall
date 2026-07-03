@@ -60,6 +60,21 @@ import cp_team_queue  # the ENQUEUE-ONLY sink for the public /rr-task route (INV
                      # holds NO credential and NO dispatch capability — a signed /rr-task writes
                      # a bounded, scrubbed row to the CALLER'S OWN team partition and STOPS; the
                      # gated worker (cp_maintainer_runner) is the only side that dispatches.
+import cp_team_creds  # the PER-TEAM MODEL-CREDENTIAL store (BYO-credential onboarding — POST /team/cred).
+                     # THE INV-6 REASONING (write-forward ≠ "holding a cred"): the signed handler
+                     # WRITE-FORWARDS the caller's OWN cred into EXACTLY the caller's server-derived
+                     # team_id partition (Secret Manager in cloud) and STOPS. It NEVER reads a cred back
+                     # (cp_team_creds exposes get/env_for_team only to the GATED worker — no read route
+                     # lives on this surface), NEVER echoes/logs the secret, and — because team_id is
+                     # server-derived (INV-1), never a request field — can NEVER write ANOTHER team's
+                     # partition. So a popped public surface holds nothing at rest, cannot read any
+                     # cred, and cannot dispatch: INV-6's blast-radius property (no OTHER tenant's cred,
+                     # no exec) is preserved. The INV-6 grep obligation still holds — this surface names
+                     # no cred-selection / dispatch call; register_team_cred calls ONLY put_team_cred.
+import cp_ghinstall  # the PER-TEAM GitHub App INSTALLATION map (POST /team/install). installation_id +
+                     # repo slugs are NON-secret (design §2 — the App private key is the single global
+                     # secret, held only by the gated minter). The handler records the caller-team's
+                     # install keyed by the server-derived team_id (INV-1); it mints/holds NO token.
 
 # ── THE CANONICAL PUBLIC ROUTE SET (single source of truth) ─────────────────────────────
 #
@@ -92,11 +107,30 @@ import cp_team_queue  # the ENQUEUE-ONLY sink for the public /rr-task route (INV
 #       STOPS. It holds NO credential and has NO dispatch capability — a compromised public
 #       surface can enqueue (to its own partition, rate-/replay-capped) but never dispatch or read
 #       a cred (INV-6, defeats A10). Execution happens on the gated worker, which holds the creds.
+# PLUS the SIGNED, TEAM-SCOPED REGISTRATION writes (the LAST-MILE onboarding — what a public tenant
+# needs before the worker can find its cred + install at dispatch, cp_maintainer_runner.py):
+#   POST /team/cred    — a SIGNED WRITE-FORWARD of the CALLER'S OWN model credential (a
+#       claude-setup-token OAuth token or an ANTHROPIC_API_KEY) into EXACTLY the caller's
+#       server-derived team_id partition (Secret Manager in cloud). It goes through the §3 auth
+#       chokepoint (a signature is REQUIRED — unsigned/forged is a 401, INV-8), team_id is derived
+#       SERVER-SIDE (INV-1) so a body team_id is ignored, and the handler calls ONLY
+#       cp_team_creds.put_team_cred and STOPS — it NEVER reads a cred back, NEVER echoes/logs the
+#       secret (INV-4), and can NEVER write another team's partition (INV-2). Write-forwarding the
+#       caller's own cred is NOT "holding a cred": nothing is at rest here, no read route exists,
+#       no dispatch happens — so INV-6's blast-radius property is intact (a popped public surface
+#       still leaks no OTHER tenant's cred + no exec). This is the ONLY public route that TAKES a
+#       secret, and it does so write-only into the caller's own partition. Fail-closed: no team -> 403.
+#   POST /team/install — a SIGNED registration of the CALLER-team's GitHub App installation_id +
+#       covered repo(s) (NON-secret, design §2). team_id is server-derived (INV-1); the handler
+#       records the map keyed by that team and STOPS — it mints/holds NO token. Fail-closed: no team
+#       -> 403; a bad installation_id / repo slug -> 422.
 # All OTHER entries are READ-ONLY: there is deliberately no other unauthenticated write.
 PUBLIC_ROUTES = frozenset({
     ("POST", "/enroll"),
     ("POST", "/presence"),
     ("POST", "/rr-task"),
+    ("POST", "/team/cred"),
+    ("POST", "/team/install"),
     ("GET", "/roster"),
     ("GET", "/roster-team"),
     ("OPTIONS", "/roster-team"),
@@ -207,6 +241,19 @@ def _rr_task_ip_window():    return _int_env("HEIMDALL_RR_TASK_IP_WINDOW", 60)
 def _rr_task_team_limit():   return _int_env("HEIMDALL_RR_TASK_TEAM_LIMIT", 30)
 def _rr_task_team_window():  return _int_env("HEIMDALL_RR_TASK_TEAM_WINDOW", 60)
 def _rr_task_nonce_window(): return _int_env("HEIMDALL_RR_TASK_NONCE_WINDOW", 300)
+
+# /team/cred + /team/install — the SIGNED, team-scoped REGISTRATION writes (INV-6/8, the last-mile
+# onboarding). Registration is a rare, near-one-shot act (a tenant sets its cred/install once, then
+# rotates occasionally), so the caps are TIGHTER than /rr-task: a per-IP (pre-verify blunt flood
+# shed) + a per-TEAM (post-verify, keyed on the caller's server-derived team_id) fixed-window cap,
+# plus a replay-nonce over the signed body (INV-8). Both /team/* routes share these limits; the
+# bucket SCOPE string ("team_cred"/"team_install") keeps their windows distinct for telemetry. All
+# env-tunable; conservative defaults sized for onboarding + occasional rotation, not a flood.
+def _team_write_ip_limit():     return _int_env("HEIMDALL_TEAM_WRITE_IP_LIMIT", 20)
+def _team_write_ip_window():    return _int_env("HEIMDALL_TEAM_WRITE_IP_WINDOW", 60)
+def _team_write_team_limit():   return _int_env("HEIMDALL_TEAM_WRITE_TEAM_LIMIT", 10)
+def _team_write_team_window():  return _int_env("HEIMDALL_TEAM_WRITE_TEAM_WINDOW", 60)
+def _team_write_nonce_window(): return _int_env("HEIMDALL_TEAM_WRITE_NONCE_WINDOW", 300)
 
 
 # ── the public-surface predicates (what cp_server's router consults) ────────────────────
@@ -560,4 +607,131 @@ def enqueue_rr_task(identity, request, *, home=None, now=None):
         return (422, {"error": result.get("reason", "enqueue_failed"), "team_id": team_id})
     return (200, {"enqueued": True, "id": result.get("id"),
                   "added": result.get("added"), "team_id": team_id})
+
+
+# ── the SIGNED, TEAM-SCOPED REGISTRATION writes (last-mile onboarding — POST /team/cred + /team/install) ──
+#
+# THE ONBOARDING SPLIT (INV-1/2/4/6). These two writes are what a public tenant needs BEFORE the
+# gated worker can find its cred + install at dispatch (cp_maintainer_runner.py — env_for_team +
+# mint_token_for_team). Both are SIGNED (the §3 chokepoint verifies the Ed25519 signature BEFORE
+# these handlers run, so an unsigned/forged request is a 401, INV-8), team_id is derived SERVER-SIDE
+# from the verified binding (INV-1 — a body team_id is IGNORED), and each handler writes EXACTLY the
+# caller's OWN partition and STOPS. /team/cred is the ONLY public route that takes a SECRET, and it
+# WRITE-FORWARDS the caller's own cred into that team's store (Secret Manager in cloud) without ever
+# reading it back, echoing it, or logging it (INV-4) — which is why it does not breach INV-6's
+# "no cred" property (nothing at rest here, no read route, no dispatch; a popped surface still leaks
+# no OTHER tenant's cred + no exec). /team/install carries only NON-secret installation_id + repos.
+
+
+def check_team_write_pre_auth(request, scope, *, home=None, now=None):
+    """PUBLIC-SURFACE per-IP flood gate for a signed POST /team/cred|/team/install, applied BEFORE the
+    §3 signature verify so a blunt flood is shed CHEAPLY (no crypto spent on an over-limit IP). `scope`
+    is "team_cred" or "team_install" so the two routes bucket independently. Returns None to proceed to
+    auth, or (429, body) to refuse. The per-team cap + replay-nonce run AFTER identity is known
+    (check_team_write_post_auth)."""
+    limiter = cp_ratelimit.RateLimiter(home=home)
+    ip = client_ip(request)
+    ok, retry = limiter.allow(
+        scope + "_ip", ip, now=now,
+        limit=_team_write_ip_limit(), window=_team_write_ip_window())
+    if not ok:
+        return (429, _rate_limited_body(scope + "_ip", retry))
     return None
+
+
+def check_team_write_post_auth(identity, request, scope, *, home=None, now=None):
+    """PUBLIC-SURFACE gates for a signed POST /team/cred|/team/install that need the VERIFIED identity
+    (run AFTER the §3 chokepoint, so `identity.haid` is proven and the body is signature-covered):
+      1. per-TEAM rate-limit (INV-7) — keyed on the caller's SERVER-DERIVED team_id
+         (cp_auth.registered_team), so a single tenant cannot flood registration even rotating
+         members/IPs; over-limit -> 429.
+      2. replay-nonce (INV-8) — the signed body carries {nonce, ts}; cp_nonce.accept decides freshness
+         (|ts-now| <= window) + first-use ((haid, nonce) unseen). A stale ts or a replayed nonce -> 401
+         (a captured signed registration cannot be resent).
+    `scope` ("team_cred"/"team_install") namespaces BOTH the rate bucket AND the nonce, so a cred nonce
+    can never be replayed as an install (and vice-versa). Returns None to let the handler run, or
+    (429, body) / (401, body) to refuse."""
+    haid = getattr(identity, "haid", None) or identity
+    team_id = cp_auth.registered_team(str(haid), home=home)
+    # Key the per-team bucket on the team_id when it resolves, else on the haid (a no-team caller still
+    # counts against a bucket — the handler itself fail-closes 403 on the missing team).
+    team_key = team_id if team_id else ("haid:" + str(haid))
+    limiter = cp_ratelimit.RateLimiter(home=home)
+    ok, retry = limiter.allow(
+        scope + "_team", team_key, now=now,
+        limit=_team_write_team_limit(), window=_team_write_team_window())
+    if not ok:
+        return (429, _rate_limited_body(scope + "_team", retry))
+
+    payload = _body_dict(request)
+    nonce = payload.get("nonce")
+    ts = payload.get("ts")
+    accepted, reason = cp_nonce.accept(
+        scope, str(haid), nonce, ts, now=now, window=_team_write_nonce_window())
+    if not accepted:
+        return (401, {"error": "replay_" + reason})
+    return None
+
+
+def register_team_cred(identity, request, *, home=None, now=None):
+    """THE write-forward handler for a signed POST /team/cred (INV-1/INV-2/INV-4/INV-6). Returns a
+    (status, body) tuple cp_server wraps in a Response — NEVER reads a cred back, NEVER echoes/logs
+    the secret.
+
+    Flow:
+      1. team_id = cp_auth.registered_team(identity.haid) — the caller's SERVER-DERIVED partition
+         (INV-1). A body `team_id` field is IGNORED. No team resolves -> 403 fail-closed (INV-3).
+      2. Read {kind, secret} from the signed body; kind must be a known cred kind, secret a non-empty
+         str (else 422 — bounded, no partial write).
+      3. cp_team_creds.put_team_cred(team_id, kind, secret) — WRITE-FORWARDS the secret into EXACTLY
+         the caller's OWN partition (Secret Manager in cloud). The secret is consumed only into the
+         store; it is NEVER placed in the response (which carries only the non-secret kind/env_name/
+         team_id) and this handler never logs it (INV-4).
+    The `now` arg is accepted for signature symmetry with the gates (unused here)."""
+    haid = getattr(identity, "haid", None) or identity
+    team_id = cp_auth.registered_team(str(haid), home=home)   # INV-1 — server-derived, never the body.
+    if not team_id:
+        return (403, {"error": "no_team"})                    # INV-3 fail-closed.
+    payload = _body_dict(request)
+    kind = payload.get("kind")
+    secret = payload.get("secret")
+    if kind not in cp_team_creds.ENV_FOR_KIND:
+        return (422, {"error": "bad_kind", "team_id": team_id})
+    if not isinstance(secret, str) or not secret:
+        return (422, {"error": "missing_secret", "team_id": team_id})
+    if not cp_team_creds.put_team_cred(team_id, kind, secret, home=home):
+        return (422, {"error": "store_failed", "team_id": team_id})
+    # The response carries ONLY non-secret confirmation — never the secret (INV-4).
+    return (200, {"stored": True, "kind": kind,
+                  "env_name": cp_team_creds.ENV_FOR_KIND[kind], "team_id": team_id})
+
+
+def register_team_install(identity, request, *, home=None, now=None):
+    """THE registration handler for a signed POST /team/install (INV-1/INV-2). Records the CALLER-team's
+    GitHub App installation_id + covered repo(s) — NON-secret (design §2) — keyed by the server-derived
+    team_id, then STOPS (mints/holds NO token). Returns a (status, body) tuple.
+
+    Flow:
+      1. team_id = cp_auth.registered_team(identity.haid) (INV-1). No team -> 403 fail-closed (INV-3).
+      2. Read installation_id + repos (accepts `repos` list OR a single `repo` slug) from the signed
+         body — a body team_id is IGNORED.
+      3. cp_ghinstall.set_team_installation(team_id, installation_id, repos) — validated (positive int
+         installation_id, owner/name repo slugs) + written to the caller's OWN partition. A bad
+         installation_id / repo -> 422 with the fail-closed reason.
+    The `now` arg is accepted for signature symmetry with the gates (unused here)."""
+    haid = getattr(identity, "haid", None) or identity
+    team_id = cp_auth.registered_team(str(haid), home=home)   # INV-1 — server-derived, never the body.
+    if not team_id:
+        return (403, {"error": "no_team"})                    # INV-3 fail-closed.
+    payload = _body_dict(request)
+    installation_id = payload.get("installation_id")
+    repos = payload.get("repos")
+    if repos is None:
+        repos = payload.get("repo")   # single-slug convenience (the common one-repo-per-team MVP).
+    try:
+        record = cp_ghinstall.set_team_installation(
+            team_id, installation_id, repos, home=home)
+    except cp_ghinstall.GhInstallError as exc:
+        return (422, {"error": exc.reason, "team_id": team_id})
+    return (200, {"stored": True, "installation_id": record["installation_id"],
+                  "repos": record["repos"], "team_id": team_id})

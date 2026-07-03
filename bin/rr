@@ -31,6 +31,14 @@
 #         File the maintainer issue (idempotent) + dispatch to the cloud executor.
 #   rr "<task>" --mode control-plane [--repo <owner/repo>] [--dry-run]
 #         SIGN + POST the task to the CP's public ENQUEUE-ONLY route POST /rr-task.
+#   rr connect [--gh-app-installation-id <id>] [--repo <owner/repo>] [--api-key] [--dry-run]
+#         LAST-MILE tenant onboarding: SIGN + register, for THIS device's team (team_id
+#         derived SERVER-SIDE from the signed binding, INV-1), the two things the CP
+#         worker consumes at dispatch — (a) the team's BYO Claude credential (from
+#         $CLAUDE_CODE_OAUTH_TOKEN / $ANTHROPIC_API_KEY, else prompted with `read -rs`,
+#         hidden) -> POST /team/cred (write-only, never read back / logged), and (b) the
+#         GitHub App installation_id + repo -> POST /team/install. The secret rides the
+#         ENV to python, NEVER argv/log. --dry-run prints the plan with the secret REDACTED.
 #   rr --issue <N> [--repo R] [--max N] [--dry-run]
 #         Skip filing; dispatch the maintainer to DRAIN an existing issue.
 #   rr status [--repo R] [--dry-run]
@@ -40,9 +48,10 @@
 #
 # FLAGS: --repo <owner/repo> · --max <N> (default 3) · --mode vm|control-plane ·
 #        --vm/--zone/--project (vm setup or per-call override) · --endpoint <url> ·
-#        --enroll-token <t> (control-plane setup) · --dry-run · --local · -h/--help.
+#        --enroll-token <t> (control-plane setup) · --gh-app-installation-id <id> (connect) ·
+#        --api-key (connect: force the api_key cred kind) · --dry-run · --local · -h/--help.
 #        --dry-run everywhere PRINTS the plan (gh+ssh, or the signed POST /rr-task
-#        body) and executes nothing (no creds/network needed).
+#        / /team/cred / /team/install body) and executes nothing (no creds/network needed).
 #
 # MODES:
 #   vm             (default MVP) — SSH to the VM, run the maintainer there.
@@ -103,11 +112,13 @@ ZONE_OVERRIDE=""
 PROJECT_OVERRIDE=""
 ENDPOINT_OVERRIDE=""       # control-plane: the CP public-surface URL (setup / per-call).
 ENROLL_TOKEN_OVERRIDE=""   # control-plane: the bootstrap enroll token (setup-only).
+CONNECT_INSTALL_ID=""      # connect: the GitHub App installation_id to register (POST /team/install).
+FORCE_API_KEY=0            # connect: force the api_key cred kind (default = oauth_token / setup-token).
 DRY=0
 LOCAL=0
 
 case "${1:-}" in
-  setup|status) CMD="$1"; shift ;;
+  setup|status|connect) CMD="$1"; shift ;;
   -h|--help)    usage; exit 0 ;;
 esac
 
@@ -123,6 +134,8 @@ while [ $# -gt 0 ]; do case "$1" in
   --project)   PROJECT_OVERRIDE="${2:?--project needs id}";   shift 2 ;;
   --endpoint)  ENDPOINT_OVERRIDE="${2:?--endpoint needs a url}";       shift 2 ;;
   --enroll-token) ENROLL_TOKEN_OVERRIDE="${2:?--enroll-token needs a value}"; shift 2 ;;
+  --gh-app-installation-id) CONNECT_INSTALL_ID="${2:?--gh-app-installation-id needs a numeric id}"; shift 2 ;;
+  --api-key)   FORCE_API_KEY=1;          shift ;;
   -h|--help)   usage; exit 0 ;;
   --)          shift; break ;;
   -*)          die "unknown flag: $1 (see: rr --help)" 2 ;;
@@ -577,6 +590,202 @@ except Exception:  # noqa: BLE001 — any transport/TLS/DNS fault is a connect f
 PYEOF
 }
 
+# ── CONNECT — the SIGNED, team-scoped TENANT ONBOARDING client (last-mile) ──────
+# `rr connect` registers, for the caller's OWN team (team_id derived SERVER-SIDE from
+# the signed binding, INV-1 — the client sends NO team_id), the two things the CP
+# worker consumes at dispatch: (a) the team's BYO Claude credential -> POST /team/cred,
+# and (b) the team's GitHub App installation -> POST /team/install. Both are SIGNED with
+# the per-dev Ed25519 key (the SAME one heimdall-presence bootstraps + persists 0600),
+# reusing the shipped cp_auth signer over urllib — Ed25519 is NEVER re-implemented.
+#
+# THE SECRET (the Claude token) is read from $CLAUDE_CODE_OAUTH_TOKEN / $ANTHROPIC_API_KEY,
+# else prompted with `read -rs` (input hidden, not echoed). It crosses bash->python via the
+# ENVIRONMENT ONLY — NEVER argv (argv shows in `ps`) and NEVER a log. --dry-run prints the
+# signed-POST plan with the secret REDACTED and runs nothing (no seed read, no network).
+do_connect() {
+  resolve_cp_wire
+  local repo="${REPO_OVERRIDE:-$CFG_REPO}"
+  [ -z "$repo" ] || valid_repo "$repo" || die "--repo must be owner/name (got: $repo)" 2
+  if [ -n "$CONNECT_INSTALL_ID" ]; then
+    printf '%s' "$CONNECT_INSTALL_ID" | grep -qE '^[0-9]+$' \
+      || die "--gh-app-installation-id must be a positive integer (got: $CONNECT_INSTALL_ID)" 2
+  fi
+  # the cred kind for the plan/POST: api_key iff forced OR only ANTHROPIC_API_KEY is set.
+  local cred_kind="oauth_token"
+  if [ "$FORCE_API_KEY" = 1 ]; then
+    cred_kind="api_key"
+  elif [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+    cred_kind="api_key"
+  fi
+
+  if [ "$DRY" = 1 ]; then
+    local cred_body install_body
+    cred_body="$(CP_REG_PATH=/team/cred CP_REG_KIND="$cred_kind" RR_CP_DUMP_BODY=1 cp_register_py)"
+    say "would SIGN + POST the tenant credential to the onboarding route (write-only, never read back):"
+    plan "ensure enrolled: $BINDIR/heimdall-presence beat   # bootstraps the 0600 Ed25519 key + /enroll if absent (seed: ${CP_SEED_FILE:-<haid-derived>})"
+    plan "POST $CP_URL/team/cred   body=$cred_body   # SIGNED; secret REDACTED here + sent via env, NEVER argv/log; team_id server-derived (INV-1)"
+    if [ -n "$CONNECT_INSTALL_ID" ]; then
+      install_body="$(CP_REG_PATH=/team/install CP_INSTALL_ID="$CONNECT_INSTALL_ID" CP_INSTALL_REPO="$repo" RR_CP_DUMP_BODY=1 cp_register_py)"
+      say "would SIGN + POST the GitHub App installation (installation_id + repo — NON-secret):"
+      plan "POST $CP_URL/team/install   body=$install_body   # SIGNED; team_id server-derived (INV-1)"
+    else
+      warn "no --gh-app-installation-id given — skipping /team/install (add it to bind your repo)."
+    fi
+    say "INV-1: team_id is derived SERVER-SIDE from the signed binding — the client sends NO team_id."
+    warn "dry-run: nothing sent."
+    return 0
+  fi
+
+  [ -n "$PY" ] || die "python3 required for the control-plane onboarding client"
+  [ -f "$LIB/cp_auth.py" ] || die "cp_auth signer not found at $LIB (broken install)"
+  [ -n "$CP_HAID" ] || die "no Heimdall identity resolved — enroll first: run \`heimdall-presence beat\` (or set \$HMD_HAID)"
+
+  # ensure enrolled (the SAME bootstrap path dispatch_cp uses): keygen -> /enroll -> 0600 seed.
+  if [ -z "$CP_SEED_FILE" ] || [ ! -f "$CP_SEED_FILE" ]; then
+    if [ -x "$BINDIR/heimdall-presence" ]; then
+      say "enrolling this device with the control plane (first use)…"
+      "$BINDIR/heimdall-presence" beat >/dev/null 2>&1 || true
+    fi
+  fi
+  [ -n "$CP_SEED_FILE" ] && [ -f "$CP_SEED_FILE" ] \
+    || die "not enrolled — no signing key at ${CP_SEED_FILE:-<haid-derived>}. Enroll first: run \`heimdall-presence beat\`"
+
+  # resolve the cred secret — env first, else prompt hidden. NEVER echoed; crosses to python via env.
+  local cred_secret=""
+  if [ "$cred_kind" = oauth_token ] && [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+    cred_secret="$CLAUDE_CODE_OAUTH_TOKEN"; say "using CLAUDE_CODE_OAUTH_TOKEN from the environment (oauth_token)"
+  elif [ "$cred_kind" = api_key ] && [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+    cred_secret="$ANTHROPIC_API_KEY"; say "using ANTHROPIC_API_KEY from the environment (api_key)"
+  else
+    local label="Claude OAuth token (run: claude setup-token)"
+    [ "$cred_kind" = api_key ] && label="Anthropic API key"
+    printf '%s' "Paste your $label (input hidden, not echoed): " >&2
+    read -rs cred_secret || true; printf '\n' >&2
+  fi
+  [ -n "$cred_secret" ] || die "no credential provided — set CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_API_KEY or paste when prompted"
+
+  say "signing + posting the tenant credential to the control plane ($CP_URL/team/cred)…"
+  local resp kind a b
+  resp="$(CP_REG_PATH=/team/cred CP_REG_KIND="$cred_kind" CP_CRED_SECRET="$cred_secret" cp_register_py)"
+  unset cred_secret   # drop the secret from the shell as soon as the env-scoped call returns.
+  IFS=$'\t' read -r kind a b <<<"$resp"
+  case "$kind" in
+    OK)  say "credential STORED for your team (kind: ${a:-?}, team: ${b:-server-derived}, INV-1) — never echoed/logged" ;;
+    HTTP)
+      case "$a" in
+        401) die "signature REJECTED (401) — this device's key isn't recognized. Re-enroll: heimdall-presence beat" ;;
+        403) die "no team (403) — this device isn't bound to a team. Enroll first: heimdall-presence beat" ;;
+        422) die "credential refused (422): ${b:-bad kind/secret}" ;;
+        429) die "rate limited (429) — too many registrations too fast; retry shortly" ;;
+        *)   die "control-plane refused the credential (HTTP $a): ${b:-}" ;;
+      esac ;;
+    ERR)
+      case "$a" in
+        no_seed) die "not enrolled — no usable signing key. Enroll first: heimdall-presence beat" ;;
+        connect) die "could not reach the control plane at $CP_URL (offline / DNS / TLS)" ;;
+        *)       die "control-plane client error (${a:-unknown})" ;;
+      esac ;;
+    *) die "control-plane client returned an unexpected result: $resp" ;;
+  esac
+
+  # (b) register the GitHub App installation when an id was given.
+  if [ -n "$CONNECT_INSTALL_ID" ]; then
+    [ -n "$repo" ] || die "an installation needs a repo — pass --repo owner/name" 2
+    say "registering your GitHub App installation ($CP_URL/team/install)…"
+    local iresp ikind ia ib
+    iresp="$(CP_REG_PATH=/team/install CP_INSTALL_ID="$CONNECT_INSTALL_ID" CP_INSTALL_REPO="$repo" cp_register_py)"
+    IFS=$'\t' read -r ikind ia ib <<<"$iresp"
+    case "$ikind" in
+      OK)  say "installation STORED (installation_id: ${ia:-$CONNECT_INSTALL_ID}, repo: $repo, team: ${ib:-server-derived})" ;;
+      HTTP)
+        case "$ia" in
+          401) die "signature REJECTED (401) on /team/install — re-enroll: heimdall-presence beat" ;;
+          403) die "no team (403) on /team/install — enroll first: heimdall-presence beat" ;;
+          422) die "installation refused (422): ${ib:-bad installation_id/repo}" ;;
+          429) die "rate limited (429) on /team/install — retry shortly" ;;
+          *)   die "control-plane refused the installation (HTTP $ia): ${ib:-}" ;;
+        esac ;;
+      ERR) die "control-plane client error on /team/install (${ia:-unknown})" ;;
+      *)   die "control-plane client returned an unexpected result: $iresp" ;;
+    esac
+    say "connected — your team now has a cred + install. Try: rr \"fix issue #1\" --mode control-plane --repo $repo"
+  else
+    say "credential set. Add --gh-app-installation-id <id> --repo owner/name to also bind your repo."
+  fi
+}
+
+# cp_register_py — the signed-HTTP onboarding client (mirrors cp_client_py): REUSES the shipped
+# cp_auth signer over urllib. Inputs cross via the ENV ONLY (CP_URL/CP_HAID/CP_SEED_FILE/CP_REG_PATH
+# + the per-route fields) — NEVER argv. For /team/cred the body is {kind, secret, nonce, ts} (the
+# secret from CP_CRED_SECRET, env-only); for /team/install it is {installation_id, repos, nonce, ts}.
+# With RR_CP_DUMP_BODY set it prints the body JSON — with the secret REDACTED — and stops BEFORE any
+# seed read / network (the dry-run plan uses this). Emits one tab-record: `OK\t<a>\t<team_id>` on 2xx
+# (a = kind for cred, installation_id for install), `HTTP\t<code>\t<err>` on an HTTP refusal, or
+# `ERR\t<reason>` on no-seed/transport.
+cp_register_py() {
+  LIB="$LIB" CP_URL="$CP_URL" CP_HAID="$CP_HAID" CP_SEED_FILE="$CP_SEED_FILE" \
+  "$PY" - <<'PYEOF'
+import json, os, secrets, sys, time
+import urllib.error, urllib.request
+
+path = os.environ.get("CP_REG_PATH") or ""
+nonce = secrets.token_hex(16); ts = int(time.time())
+
+if path == "/team/cred":
+    kind = os.environ.get("CP_REG_KIND") or "oauth_token"
+    if os.environ.get("RR_CP_DUMP_BODY"):
+        # dry-run: REDACT the secret; no seed read, no network.
+        sys.stdout.write(json.dumps({"kind": kind, "secret": "<redacted>",
+                                     "nonce": nonce, "ts": ts})); sys.exit(0)
+    body_obj = {"kind": kind, "secret": os.environ.get("CP_CRED_SECRET") or "",
+                "nonce": nonce, "ts": ts}
+elif path == "/team/install":
+    repo = os.environ.get("CP_INSTALL_REPO") or ""
+    body_obj = {"installation_id": os.environ.get("CP_INSTALL_ID") or "",
+                "repos": [repo] if repo else [], "nonce": nonce, "ts": ts}
+    if os.environ.get("RR_CP_DUMP_BODY"):
+        sys.stdout.write(json.dumps(body_obj)); sys.exit(0)
+else:
+    sys.stdout.write("ERR\tbad_path"); sys.exit(0)
+
+body = json.dumps(body_obj).encode("utf-8")
+
+# Read the persisted 0600 seed HERE (in-process) so the seed bytes never touch bash/argv —
+# only the seed-file PATH crossed from the shell.
+try:
+    with open(os.environ["CP_SEED_FILE"], "r", encoding="utf-8") as fh:
+        seed = fh.read().strip()
+except OSError:
+    sys.stdout.write("ERR\tno_seed"); sys.exit(0)
+if not seed:
+    sys.stdout.write("ERR\tno_seed"); sys.exit(0)
+
+sys.path.insert(0, os.environ["LIB"])
+import cp_auth as K  # the SHIPPED Ed25519 signer — never re-implemented.
+
+BASE = os.environ["CP_URL"].rstrip("/")
+req = urllib.request.Request(BASE + path, data=body, method="POST")
+req.add_header("Content-Type", "application/json")
+req.add_header("X-Heimdall-HAID", os.environ["CP_HAID"])
+req.add_header("X-Heimdall-Signature", K.sign(seed, K.canonical_message("POST", path, body)))
+try:
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        raw = resp.read()
+        d = json.loads(raw) if raw else {}
+        a = (d.get("kind") if path == "/team/cred" else d.get("installation_id")) or ""
+        sys.stdout.write("OK\t%s\t%s" % (a, d.get("team_id") or ""))
+except urllib.error.HTTPError as exc:
+    raw = exc.read()
+    try:
+        d = json.loads(raw) if raw else {}
+    except Exception:
+        d = {}
+    sys.stdout.write("HTTP\t%d\t%s" % (exc.code, d.get("error") or ""))
+except Exception:  # noqa: BLE001 — any transport/TLS/DNS fault is a connect failure.
+    sys.stdout.write("ERR\tconnect")
+PYEOF
+}
+
 dispatch_cloud() {
   # fail-closed: a REAL cloud dispatch needs a configured target — never SSH a
   # guessed VM with the operator's live creds.
@@ -676,9 +885,10 @@ main_dispatch() {
 }
 
 case "$CMD" in
-  setup)  do_setup ;;
-  status) do_status ;;
-  "")     main_dispatch ;;
-  *)      die "unknown subcommand: $CMD" 2 ;;
+  setup)   do_setup ;;
+  status)  do_status ;;
+  connect) do_connect ;;
+  "")      main_dispatch ;;
+  *)       die "unknown subcommand: $CMD" 2 ;;
 esac
 exit 0
