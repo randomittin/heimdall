@@ -150,6 +150,22 @@ GUARD_REJECT_LINE="REJECTED: mutant survived"
 # red. exchange-lob derives its serial-replay reference from the input's `orders`
 # (reference/matcher.mjs), so it takes no separate truth file.
 GOLDEN_TRUTH=""
+# A domain MAY self-describe its golden fixture in gate.json (`golden_input`, relative
+# to the domain dir; optional `golden_truth` for a separate independently-derived truth
+# log). This is the generic path for any NEW oracle — it needs no edit here. The
+# hardcoded switch below remains the source of truth for the original domains that
+# predate the field (backwards-compatible: a gate.json without `golden_input` falls
+# through to the switch, so existing domains are unchanged).
+GATE_JSON="$DOMAIN_DIR/gate.json"
+GOLDEN_INPUT_REL=""
+if [ -f "$GATE_JSON" ]; then
+  GOLDEN_INPUT_REL="$(jq -r '.golden_input // empty' "$GATE_JSON" 2>/dev/null || true)"
+fi
+if [ -n "$GOLDEN_INPUT_REL" ]; then
+  GOLDEN_INPUT="$DOMAIN_DIR/$GOLDEN_INPUT_REL"
+  GOLDEN_TRUTH_REL="$(jq -r '.golden_truth // empty' "$GATE_JSON" 2>/dev/null || true)"
+  [ -n "$GOLDEN_TRUTH_REL" ] && GOLDEN_TRUTH="$DOMAIN_DIR/$GOLDEN_TRUTH_REL"
+else
 case "$DOMAIN" in
   exchange-lob) GOLDEN_INPUT="$GOLDEN_DIR/order-stream.json" ;;
   emulator-gb)  GOLDEN_INPUT="$GOLDEN_DIR/trace.gbdoctor"
@@ -164,6 +180,7 @@ case "$DOMAIN" in
   ponytail-underdelivery) GOLDEN_INPUT="$GOLDEN_DIR/candidate.mjs" ;;
   *) echo "error: no golden fixture wired for domain '$DOMAIN'" >&2; exit 2 ;;
 esac
+fi
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  The structured seam: invoke run.sh, read the typed report.json.
