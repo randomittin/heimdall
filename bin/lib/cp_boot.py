@@ -133,6 +133,22 @@ def run_tick(*, home=None, base_env=None, now=None, approved_action_types=None):
             identity, when, home=home, base_env=base_env,
             approved_action_types=approved_action_types,
         ))
+    # DRAIN (§4 multi-tenant intake): on the public multi-tenant deploy the gated tick ALSO
+    # sweeps each team's enqueue-only /rr-task queue -> dispatch through the repo<->team authz
+    # gate + per-team env (cp_maintainer_runner.drain_all_team_queues). Lazy import (avoid a
+    # load-time cycle) + flag-gated (HEIMDALL_RR_TENANT_AUTHZ), so the single-tenant tick is
+    # byte-for-byte unchanged when the flag is off.
+    import cp_maintainer_runner  # lazy — mirrors cp_scheduler's lazy import of the same module.
+    if cp_maintainer_runner.tenant_authz_enabled():
+        for drain in cp_maintainer_runner.drain_all_team_queues(
+                home=home, base_env=base_env, now=when):
+            fired.append({
+                "schedule_id": None,
+                "action_type": cp_maintainer_runner.MAINTAINER_ACTION_TYPE,
+                "status": 200,
+                "team_drain": drain.get("team_id"),
+                "processed": drain.get("processed", 0),
+            })
     return fired
 
 

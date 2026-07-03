@@ -196,6 +196,22 @@ def get_installation(team_id, *, home=None):
         raise GhInstallError("no_installation", "stored installation_id is invalid")
 
 
+def known_team_ids(*, home=None):
+    """The SORTED team_ids that have a bound GitHub App installation (the DISPATCHABLE teams
+    — the drain iterates these to sweep each team's queue, INV-2/§4 drain wiring). Enumerates
+    the install partition ("gh-install/<team_id>.json") via the StateBackend's list_names —
+    the SAME firestore-safe record enumeration cp_presence uses (never backend.path()). A team
+    with queued work but NO installation is intentionally absent (it can authorize nothing, so
+    it is not dispatchable — a drain over it would only ever fail-closed). Tolerant: an absent
+    store yields []."""
+    out = []
+    for name in _backend(home).list_names(_INSTALL_DIR, suffix=".json"):
+        tid = name[:-len(".json")] if name.endswith(".json") else name
+        if tid:
+            out.append(tid)
+    return sorted(set(out))
+
+
 def covered_repos(team_id, *, home=None):
     """The SORTED owner/name slugs the caller-team's installation covers, or [] when the team
     has no install record. Read-only, tolerant — the authz predicate builds on this."""

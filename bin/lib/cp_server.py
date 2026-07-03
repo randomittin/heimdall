@@ -474,6 +474,15 @@ def _build_handler_class(home, enforce_revocation):
                 if refusal is not None:
                     self._send(Response(*refusal))
                     return
+            # PUBLIC-SURFACE /rr-task flood shed (pre-auth, cheap): drop an over-limit IP's
+            # signed-enqueue attempt BEFORE spending crypto on signature verify. Inert on the
+            # gated surface (the per-team cap + replay-nonce run post-auth, below).
+            if (cp_publicsurface.public_surface_enabled()
+                    and (method, route_path) == ("POST", "/rr-task")):
+                refusal = cp_publicsurface.check_rr_task_pre_auth(request, home=home)
+                if refusal is not None:
+                    self._send(Response(*refusal))
+                    return
             # §3 auth chokepoint — every request, exactly once. Verifies over the FULL
             # path-with-query (request["path"]) — the bytes the client signed.
             try:
@@ -491,6 +500,22 @@ def _build_handler_class(home, enforce_revocation):
                 if refusal is not None:
                     self._send(Response(*refusal))
                     return
+            # PUBLIC ENQUEUE-ONLY route (INV-6/7/8): POST /rr-task is SIGNED (verified by the §3
+            # chokepoint above) + team-scoped. On the public surface the per-team rate cap
+            # (INV-7) + replay-nonce (INV-8) run first (inert on the gated service, like
+            # /presence); then the ENQUEUE-ONLY handler writes ONE bounded, scrubbed row to the
+            # caller's OWN team partition and STOPS — it holds NO cred and dispatches NOTHING
+            # (INV-6). enqueue_rr_task returns a (status, body) tuple we wrap in a Response.
+            if method == "POST" and route_path == "/rr-task":
+                if cp_publicsurface.public_surface_enabled():
+                    refusal = cp_publicsurface.check_rr_task_post_auth(
+                        identity, request, home=home)
+                    if refusal is not None:
+                        self._send(Response(*refusal))
+                        return
+                self._send(Response(*cp_publicsurface.enqueue_rr_task(
+                    identity, request, home=home)))
+                return
             # built-in §1 dispatch entry (matched on the query-stripped path).
             if method == "POST" and route_path == "/dispatch":
                 try:

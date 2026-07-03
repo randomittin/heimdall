@@ -59,12 +59,152 @@ if _HERE not in sys.path:
 
 import cp_allowlist   # THE §1 gate — re-validate the maintainer params at dispatch (defense in depth).
 import cp_audit       # §9 — a dispatch / failover / park writes a job_state row (params-shape, no token).
+import cp_auth        # INV-1 — the SINGLE source of team_id (registered_team from the enroll binding).
+import cp_ghinstall   # INV-11/INV-2/A5 — the repo<->team authz predicate + the per-team install token.
 import cp_jobrunner   # the runner impls: SubprocessRunner (Arch A) + CloudRunJobRunner (Arch B).
 import cp_jobstore    # the durable job store — the cycle EXISTS here the moment it is dispatched.
 import cp_presence    # REUSE the presence heartbeat substrate (store/scrub/TTL) — NO parallel liveness infra.
+import cp_ratelimit   # INV-7 — the per-team dispatch-rate cap on the drain (reuse the fixed-window bucket).
+import cp_team_creds  # INV-2/INV-4 — the per-team model credential (env-only injection into that team's job).
+import cp_team_queue  # §4 drain — the team-partitioned work queue the gated tick drains per team.
 
 # The allowlisted maintainer action_type (the SAME one cp_scheduler / cp_allowlist name).
 MAINTAINER_ACTION_TYPE = "run-maintainer-cycle"
+
+
+# ── the W2 repo<->team AUTHZ KEYSTONE (INV-11/INV-1/INV-2/INV-3, the multi-tenant gate) ──────
+#
+# THE KEYSTONE (docs/specs/2026-07-03-rr-isolation-invariants.md, INV-11 / matrix A1+A5). Before
+# a maintainer cycle becomes a durable job, the server asserts the requested `repo` is bound to
+# the CALLER'S team_id in the GH-install map. A caller naming another team's repo is a 403
+# fail-closed refusal, before any side effect (no job row, no runner dispatch). Without this the
+# App would open a PR on tenant B's repo using B's installation on A's say-so.
+#
+# THE SOURCE OF team_id (INV-1). The operative team is ALWAYS server-derived — from the caller's
+# verified enroll binding via cp_auth.registered_team(haid) on the request/scheduler path — NEVER
+# a request field (the allowlist already refuses an extra `team_id` param, so there is no wire
+# channel). The trusted server-side DRAIN passes the partition's own team_id directly (server-
+# derived from the queue it is draining), never a body field; that is the ONLY caller that sets
+# the `team_id` argument.
+#
+# THE PER-TEAM EXECUTION ENV (INV-2/INV-4). On an allowed dispatch the job env is assembled PER
+# TEAM: that team's model cred (cp_team_creds.env_for_team) + that team's minted App install token
+# (cp_ghinstall.mint_token_for_team -> HEIMDALL_PR_BOT_TOKEN), merged onto a baseline SCRUBBED of
+# every credential-bearing var — so no other tenant's (nor the operator's ambient) secret can ride
+# into this team's job. Secrets travel by ENV ONLY (never argv/log/response); the token is minted
+# fresh at dispatch and returned solely for env injection.
+#
+# ADDITIVE (single-tenant unchanged). The gate is opt-in via HEIMDALL_RR_TENANT_AUTHZ (a deploy
+# decision, like HEIMDALL_PUBLIC_SURFACE). When OFF (RJ's single-user box), dispatch is byte-for-
+# byte as before — the base_env passes straight through and no team resolution runs. When ON (the
+# public multi-tenant deploy), the gate is enforced fail-closed on every dispatch.
+
+# The opt-in switch for the multi-tenant repo<->team authz gate + per-team env (a deploy decision).
+TENANT_AUTHZ_ENV = "HEIMDALL_RR_TENANT_AUTHZ"
+
+# The truthy spellings that ENABLE the gate (mirrors cp_publicsurface._TRUTHY). Anything else
+# (unset / "" / "0" / "false") leaves the single-tenant path unchanged (additive).
+_TRUTHY = {"1", "true", "yes", "on"}
+
+# The env var the per-team App install token lands under for the maintainer child (the SAME name
+# cp_handlers.MAINTAINER_ENV_PASSTHROUGH reads — issue_pr.py opens heimdall/* PRs with it).
+_PR_BOT_TOKEN_ENV = "HEIMDALL_PR_BOT_TOKEN"
+
+# Conservative per-team dispatch-rate cap on the drain (INV-7): at most N dispatches per window
+# per team (reuse cp_ratelimit fixed-window buckets, keyed on the hashed team_id). Env-tunable.
+_DRAIN_RATE_ENV = "HEIMDALL_RR_DISPATCH_RATE"
+_DRAIN_RATE_WINDOW_ENV = "HEIMDALL_RR_DISPATCH_WINDOW"
+_DRAIN_RATE_DEFAULT = 30
+_DRAIN_RATE_WINDOW_DEFAULT = 60
+# The max tasks one drain pass claims per team (bounds a single sweep; the next tick continues).
+_DRAIN_MAX_ENV = "HEIMDALL_RR_DRAIN_MAX"
+_DRAIN_MAX_DEFAULT = 10
+# A conservative per-team per-cycle model-spend cap (INV-7) — reuse the maintain-loop budget cap.
+_TEAM_BUDGET_ENV = "HEIMDALL_RR_TEAM_BUDGET_TOKENS"
+_TEAM_BUDGET_DEFAULT = 600_000
+
+
+def tenant_authz_enabled(env=None):
+    """True iff HEIMDALL_RR_TENANT_AUTHZ is set truthy — this deploy enforces the multi-tenant
+    repo<->team authz gate + assembles the per-team execution env on every maintainer dispatch.
+    Unset / "" / "0" / "false" -> False (the single-tenant path, byte-for-byte unchanged)."""
+    e = env if env is not None else os.environ
+    raw = e.get(TENANT_AUTHZ_ENV)
+    if not raw:
+        return False
+    return raw.strip().lower() in _TRUTHY
+
+
+def _int_env(name, default):
+    """A positive int from the env, falling back to `default` for unset/malformed/non-positive."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        val = int(raw)
+    except (TypeError, ValueError):
+        return default
+    return val if val > 0 else default
+
+
+def _team_secret_env_names():
+    """The credential-bearing env vars that MUST be stripped from a base env before a per-team
+    overlay (INV-2/INV-4): the two model-auth vars (cp_team_creds owns their names) + the App PR
+    bot token. Stripping them guarantees no other tenant's — nor the operator's ambient — cred
+    can survive into this team's job; only the explicitly-overlaid per-team values remain."""
+    return set(cp_team_creds.ENV_FOR_KIND.values()) | {_PR_BOT_TOKEN_ENV}
+
+
+def _deny(actor, repo, reason, home):
+    """A fail-closed 403 refusal outcome (INV-3): audit the denial (params-SHAPE only — the repo
+    slug is non-secret, no token anywhere) and return the outcome dict WITHOUT any side effect
+    (no job row, no dispatch). `reason` is a short machine code (no_team | repo_not_covered |
+    no_team_cred | mint_<code>)."""
+    aid = cp_audit.record_refusal(actor, MAINTAINER_ACTION_TYPE, reason=reason,
+                                  params={"repo": repo}, home=home)
+    _log("DENY repo=%s reason=%s (INV-11 repo<->team authz) — no job created" % (repo, reason))
+    return {"dispatched": False, "refused": True, "reason": reason,
+            "arm": None, "parked": False, "failover": False,
+            "http_status": 403, "audit_id": aid}
+
+
+def _authorize_and_build_env(actor, repo, base_env, *, home, team_id=None):
+    """THE keystone gate + per-team env assembly (INV-11/INV-1/INV-2/INV-3/INV-4). Runs BEFORE
+    any side effect. Returns (refusal, team_env):
+      * refusal is None on ALLOW, and team_env is the assembled per-team job env.
+      * refusal is a 403 outcome dict on DENY (team_env None) — no job, no dispatch.
+
+    team_id resolution (INV-1): the explicit `team_id` (the trusted server-side DRAIN passes the
+    partition's own id) wins; otherwise it is derived from the caller's verified binding via
+    cp_auth.registered_team(actor). It is NEVER read from the request params (the allowlist
+    refuses an extra team_id key upstream, so there is no wire channel).
+
+    The checks, each fail-closed:
+      1. team resolves            -> else DENY no_team (INV-3).
+      2. team_covers_repo(repo)   -> else DENY repo_not_covered (INV-11 — the IDOR defeat).
+      3. team has a model cred     -> else DENY no_team_cred (INV-2/INV-3).
+      4. mint the team's App token -> a GhInstallError DENIES mint_<code> (fail-closed).
+    On ALLOW, the per-team env = base scrubbed of every credential var, overlaid with EXACTLY
+    this team's model cred + minted install token (INV-2/INV-4)."""
+    tid = team_id if team_id else cp_auth.registered_team(actor, home=home)   # INV-1
+    if not tid:
+        return (_deny(actor, repo, "no_team", home), None)                    # INV-3
+    if not cp_ghinstall.team_covers_repo(tid, repo, home=home):
+        return (_deny(actor, repo, "repo_not_covered", home), None)           # INV-11 keystone
+    if not cp_team_creds.has_cred(tid, home=home):
+        return (_deny(actor, repo, "no_team_cred", home), None)               # INV-2/INV-3
+    try:
+        token = cp_ghinstall.mint_token_for_team(tid, repo, home=home)        # INV-2/A5
+    except cp_ghinstall.GhInstallError as exc:
+        return (_deny(actor, repo, "mint_" + exc.reason, home), None)         # fail-closed
+    # Assemble the per-team env: start from the caller base, DROP every credential-bearing var
+    # (no cross-tenant / operator secret rides in), then overlay EXACTLY this team's cred + token.
+    team_env = dict(base_env if base_env is not None else os.environ)
+    for name in _team_secret_env_names():
+        team_env.pop(name, None)
+    team_env.update(cp_team_creds.env_for_team(tid, home=home))               # INV-2 the team's cred
+    team_env[_PR_BOT_TOKEN_ENV] = token                                       # INV-2/A5 the team's token
+    return (None, team_env)
 
 
 # ── loud, token-free selection logging (cp_jobrunner._log convention) ──────────────
@@ -380,7 +520,7 @@ def dispatch_maintainer_cycle(identity, params, *, home=None, base_env=None, now
                               policy_name=None, actor_haid=None,
                               local_runner=None, cloud_runner=None,
                               cloud_ok=None, runner_live=None,
-                              grace_seconds=None, claimed=None):
+                              grace_seconds=None, claimed=None, team_id=None):
     """Dispatch ONE maintainer cycle to the HYBRID-selected runner, never dropping it.
 
     The flow (each step a hard guarantee):
@@ -416,6 +556,19 @@ def dispatch_maintainer_cycle(identity, params, *, home=None, base_env=None, now
     clean = plan["params"]
     repo = clean.get("repo")
 
+    # 1b. THE W2 KEYSTONE — repo<->team AUTHZ gate + per-team env (INV-11/INV-1/INV-2/INV-3).
+    #     Runs BEFORE create_job so a cross-tenant / no-team / no-cred dispatch produces NO job
+    #     row and NO runner call. Opt-in (HEIMDALL_RR_TENANT_AUTHZ): OFF -> single-tenant path
+    #     unchanged (base_env passes straight through, exactly as before). ON -> fail-closed,
+    #     and `dispatch_env` becomes the assembled per-team env (that team's cred + install token,
+    #     scrubbed of every other tenant's / the operator's ambient secret).
+    dispatch_env = base_env
+    if tenant_authz_enabled():
+        refusal, dispatch_env = _authorize_and_build_env(
+            actor, repo, base_env, home=home, team_id=team_id)
+        if refusal is not None:
+            return refusal   # 403 fail-closed — no job, no dispatch (INV-3/INV-11).
+
     # 2. SELECT the arm (deterministic + reason).
     decision = select_runner_arm(repo, home=home, now=now, policy_name=policy_name,
                                  cloud_ok=cloud_ok, runner_live=runner_live)
@@ -443,7 +596,7 @@ def dispatch_maintainer_cycle(identity, params, *, home=None, base_env=None, now
     chosen = lr if decision.arm == ARM_LOCAL else cr
     _log("SELECT job=%s repo=%s arm=%s runner=%s reason=%s"
          % (job_id, repo, decision.arm, chosen.name, decision.reason))
-    result = chosen.dispatch(job_id, actor_haid=actor, home=home, base_env=base_env)
+    result = chosen.dispatch(job_id, actor_haid=actor, home=home, base_env=dispatch_env)
     cp_audit.write("job_state", actor_haid=actor, action_type=MAINTAINER_ACTION_TYPE,
                    job_id=job_id, outcome="ok",
                    detail="dispatched:%s:%s" % (decision.arm, chosen.name), home=home)
@@ -476,7 +629,7 @@ def dispatch_maintainer_cycle(identity, params, *, home=None, base_env=None, now
                 outcome.update(parked)
                 outcome["runner_live"] = decision.runner_live
                 return outcome
-            fres = cr.dispatch(job_id, actor_haid=actor, home=home, base_env=base_env)
+            fres = cr.dispatch(job_id, actor_haid=actor, home=home, base_env=dispatch_env)
             cp_audit.write("job_state", actor_haid=actor,
                            action_type=MAINTAINER_ACTION_TYPE, job_id=job_id,
                            outcome="ok", detail="failover:%s:%s" % (ARM_CLOUD, cr.name),
@@ -489,3 +642,90 @@ def dispatch_maintainer_cycle(identity, params, *, home=None, base_env=None, now
             })
 
     return outcome
+
+
+# ── the DRAIN: the gated tick sweeps each team's queue -> dispatch through the gate (§4/INV-7) ─
+#
+# THE INTAKE/EXECUTION SPLIT (INV-6). The public surface can only ENQUEUE (cp_publicsurface's
+# signed /rr-task writes a team-scoped queue row and STOPS). The GATED side — which holds the
+# per-team creds + the App key — is where a queued task becomes a dispatched maintainer cycle.
+# The drain is that gated half: for each dispatchable team it claims queued tasks and dispatches
+# them through the SAME repo<->team authz gate + per-team env as any other dispatch. The team_id
+# it passes is SERVER-DERIVED (the partition it is draining), never a request field (INV-1).
+#
+# BOUNDED (INV-7). Each pass claims at most _DRAIN_MAX tasks per team, and each dispatch consumes
+# one unit of a per-team fixed-window rate bucket (cp_ratelimit, keyed on the hashed team_id), so
+# one team cannot monopolize the tick. Each dispatched cycle also carries a conservative per-team
+# budget_tokens cap (reusing the maintain-loop budget cap) bounding its model spend.
+
+
+def _drain_budget_tokens():
+    """The conservative per-team per-cycle model-spend cap for a drained dispatch (INV-7),
+    HEIMDALL_RR_TEAM_BUDGET_TOKENS (default 600k). Clamped to the allowlist Int range so it is
+    always a valid run-maintainer-cycle param."""
+    val = _int_env(_TEAM_BUDGET_ENV, _TEAM_BUDGET_DEFAULT)
+    return max(1, min(val, 100_000_000))
+
+
+def drain_team_queue(team_id, *, home=None, base_env=None, now=None, policy_name=None,
+                     max_dispatch=None, budget_tokens=None,
+                     local_runner=None, cloud_runner=None,
+                     cloud_ok=None, runner_live=None, grace_seconds=None, claimed=None):
+    """Drain ONE team's queue: claim up to _DRAIN_MAX queued tasks and dispatch each as a
+    maintainer cycle against the team's OWN repo, through the repo<->team authz gate + per-team
+    env. `team_id` is the SERVER-DERIVED partition handle (never a request field, INV-1); it is
+    passed straight to dispatch_maintainer_cycle's `team_id`, so the gate authorizes THIS team.
+
+    Bounded per pass (INV-7): a per-team fixed-window rate bucket caps dispatch throughput; the
+    sweep stops at the rate cap or when the queue empties. A dispatched task is marked complete
+    in the queue (moved out of the pick pool); a task whose team has no covered repo is skipped
+    (nothing to dispatch against — the queue keeps it for a later tick once an install binds).
+
+    Returns {team_id, processed, task_ids, arms} — the drain outcome for the tick's run log."""
+    repos = cp_ghinstall.covered_repos(team_id, home=home)
+    if not repos:
+        return {"team_id": team_id, "processed": 0, "task_ids": [], "arms": [],
+                "reason": "no_covered_repo"}
+    repo = repos[0]   # MVP: one repo per team (design OUT OF SCOPE: multi-repo per team).
+    cap = max_dispatch if max_dispatch is not None else _int_env(_DRAIN_MAX_ENV, _DRAIN_MAX_DEFAULT)
+    budget = budget_tokens if budget_tokens is not None else _drain_budget_tokens()
+    limiter = cp_ratelimit.RateLimiter(home=home)
+    rate = _int_env(_DRAIN_RATE_ENV, _DRAIN_RATE_DEFAULT)
+    window = _int_env(_DRAIN_RATE_WINDOW_ENV, _DRAIN_RATE_WINDOW_DEFAULT)
+
+    processed = 0
+    task_ids = []
+    arms = []
+    while processed < cap:
+        # INV-7 — per-team dispatch-rate cap (keyed on the hashed team_id). Over cap -> stop the
+        # sweep (the remaining tasks stay queued, re-drivable next tick).
+        ok, _ = limiter.allow("rr_dispatch", team_id, now=now, limit=rate, window=window)
+        if not ok:
+            break
+        task = cp_team_queue.pick(team_id, home=home)
+        if task is None:
+            break   # the partition's queue is drained.
+        params = {"repo": repo, "max": 1, "budget_tokens": budget}
+        outcome = dispatch_maintainer_cycle(
+            team_id, params, home=home, base_env=base_env, now=now,
+            policy_name=policy_name, actor_haid=team_id, team_id=team_id,
+            local_runner=local_runner, cloud_runner=cloud_runner,
+            cloud_ok=cloud_ok, runner_live=runner_live,
+            grace_seconds=grace_seconds, claimed=claimed)
+        # The task is handled — record the arm as its verdict and move it out of the pick pool.
+        cp_team_queue.complete(team_id, task.get("id"),
+                               "dispatched:%s" % outcome.get("arm"), home=home)
+        processed += 1
+        task_ids.append(task.get("id"))
+        arms.append(outcome.get("arm"))
+    return {"team_id": team_id, "processed": processed,
+            "task_ids": task_ids, "arms": arms}
+
+
+def drain_all_team_queues(*, home=None, base_env=None, now=None, policy_name=None):
+    """Drain EVERY dispatchable team's queue once (the gated tick's per-team sweep, §4 drain
+    wiring). Enumerates the teams with a bound installation (cp_ghinstall.known_team_ids) — the
+    only teams a dispatch could authorize — and drains each through the authz gate + per-team
+    env. Returns the list of per-team drain outcomes. A no-op ([]) when no team has an install."""
+    return [drain_team_queue(tid, home=home, base_env=base_env, now=now, policy_name=policy_name)
+            for tid in cp_ghinstall.known_team_ids(home=home)]
