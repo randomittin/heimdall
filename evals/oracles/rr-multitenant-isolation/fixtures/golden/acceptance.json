@@ -1,0 +1,48 @@
+{
+  "feature": "rr-multitenant-isolation",
+  "note": "The fixed cross-tenant attack sequence. Every attack MUST be DENIED. This is the reference the differential-style denial oracle grades against — independent of the candidate model. Weakening this table (dropping an attack case) lets the mutant that only flips that case SURVIVE, which is exactly how test/heimdall-rr-isolation-oracle.test.sh proves the acceptance table is load-bearing (falsify score drops below 1.0).",
+  "cases": [
+    {
+      "n": "A1-idor-repo",
+      "expected": "DENY",
+      "invariant": "INV-11",
+      "attack": "team A signs a dispatch naming team B's repo slug (IDOR via repo slug)"
+    },
+    {
+      "n": "A1-spoof-team-id",
+      "expected": "DENY",
+      "invariant": "INV-1",
+      "attack": "team A spoofs a request team_id=B to operate as team B"
+    },
+    {
+      "n": "A2-cred-read",
+      "expected": "DENY",
+      "invariant": "INV-2 (cred)",
+      "attack": "team A's job resolves team B's (or a shared global) model cred"
+    },
+    {
+      "n": "A3-queue-drain",
+      "expected": "DENY",
+      "invariant": "INV-2/3 (queue)",
+      "attack": "team A reads/drains team B's task queue partition"
+    },
+    {
+      "n": "A5-install-swap",
+      "expected": "DENY",
+      "invariant": "A5",
+      "attack": "team A supplies team B's installation_id to PR on B's repo"
+    },
+    {
+      "n": "A10-public-dispatch",
+      "expected": "DENY",
+      "invariant": "INV-6",
+      "attack": "a compromised public surface dispatches or reads a credential"
+    },
+    {
+      "n": "enqueue-cross-partition",
+      "expected": "DENY",
+      "invariant": "INV-1",
+      "attack": "team A enqueues a task into team B's partition"
+    }
+  ]
+}

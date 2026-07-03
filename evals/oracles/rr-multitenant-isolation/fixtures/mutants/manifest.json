@@ -1,0 +1,70 @@
+{
+  "domain": "rr-multitenant-isolation",
+  "fixture_kind": "mutants",
+  "purpose": "Each mutant is the SAME isolation candidate (fixtures/model.mjs) with EXACTLY ONE cross-tenant isolation gate removed — modeling a real attack from the W0 ledger §3 RED-line table (docs/specs/2026-07-03-rr-isolation-invariants.md). With the gate gone, the cross-tenant attack it stops SUCCEEDS (the candidate returns ALLOW where the fixed all-DENY acceptance oracle demands DENY), so run.sh goes RED and reports the attack that succeeded as first_divergence. `bin/falsify rr-multitenant-isolation` runs the golden (expect PASS — every attack DENIED) then every mutant (expect REJECT — the dropped gate's attack caught). Falsifiability score = mutants rejected / total, conditioned on golden passing; this P0 isolation gate requires 1.0. A surviving mutant would prove an isolation gate is NOT load-bearing and BLOCKS the build. This is the meta-proof the multi-tenant isolation is real, not tautological: drop any gate -> the oracle goes RED.",
+  "golden": "../golden/candidate.mjs",
+  "acceptance_oracle": "../golden/acceptance.json",
+  "candidate_contract": "An ES module exporting default function evaluate(attackId) -> 'DENY' | 'ALLOW' for each cross-tenant attack id in the acceptance oracle. run.sh imports the candidate and grades evaluate(attackId) against every case (all expected 'DENY'), reporting the FIRST attack that returned ALLOW as first_divergence {file, step, expected:'DENY', actual:'ALLOW'}.",
+  "mutants": [
+    {
+      "name": "drop-team-covers-repo",
+      "file": "drop-team-covers-repo.mjs",
+      "invariant": "INV-11",
+      "gate_dropped": "cp_ghinstall.team_covers_repo (repo<->team authz, the keystone)",
+      "attack_that_succeeds": "A1/A5 IDOR via repo slug — team A dispatches team B's repo",
+      "must_turn_red_gate": "cross-tenant-denial",
+      "first_fail_case": "A1-idor-repo",
+      "reject_contract": "attack A1-idor-repo: expected DENY, candidate returns ALLOW -> gate status=fail at step 'A1-idor-repo'"
+    },
+    {
+      "name": "accept-request-team-id",
+      "file": "accept-request-team-id.mjs",
+      "invariant": "INV-1",
+      "gate_dropped": "server-derived team_id (cp_auth.registered_team); reads team_id from the request body",
+      "attack_that_succeeds": "A1 spoof — team A sets team_id=B and operates as team B",
+      "must_turn_red_gate": "cross-tenant-denial",
+      "first_fail_case": "A1-spoof-team-id",
+      "reject_contract": "attack A1-spoof-team-id: expected DENY, candidate returns ALLOW -> gate status=fail at step 'A1-spoof-team-id'"
+    },
+    {
+      "name": "drop-cred-partition-key",
+      "file": "drop-cred-partition-key.mjs",
+      "invariant": "INV-2 (cred)",
+      "gate_dropped": "per-team cred key (cp_team_creds.env_for_team); resolves a global cred",
+      "attack_that_succeeds": "A2 — team A's job runs on team B's / a shared model cred",
+      "must_turn_red_gate": "cross-tenant-denial",
+      "first_fail_case": "A2-cred-read",
+      "reject_contract": "attack A2-cred-read: expected DENY, candidate returns ALLOW -> gate status=fail at step 'A2-cred-read'"
+    },
+    {
+      "name": "drop-queue-partition-key",
+      "file": "drop-queue-partition-key.mjs",
+      "invariant": "INV-2/3 (queue)",
+      "gate_dropped": "the (team_id, repo) queue partition key (cp_team_queue); repo-keyed only",
+      "attack_that_succeeds": "A3 — team A drains team B's task queue for the same repo name",
+      "must_turn_red_gate": "cross-tenant-denial",
+      "first_fail_case": "A3-queue-drain",
+      "reject_contract": "attack A3-queue-drain: expected DENY, candidate returns ALLOW -> gate status=fail at step 'A3-queue-drain'"
+    },
+    {
+      "name": "resolve-install-from-param",
+      "file": "resolve-install-from-param.mjs",
+      "invariant": "A5",
+      "gate_dropped": "server-side installation_id resolution (cp_ghinstall.get_installation); honors a wire param",
+      "attack_that_succeeds": "A5 — team A wields team B's installation_id to PR on B's repo",
+      "must_turn_red_gate": "cross-tenant-denial",
+      "first_fail_case": "A5-install-swap",
+      "reject_contract": "attack A5-install-swap: expected DENY, candidate returns ALLOW -> gate status=fail at step 'A5-install-swap'"
+    },
+    {
+      "name": "public-surface-dispatch",
+      "file": "public-surface-dispatch.mjs",
+      "invariant": "INV-6",
+      "gate_dropped": "the enqueue-only public boundary (cp_publicsurface); grants cred + dispatch",
+      "attack_that_succeeds": "A10 — a compromised public surface dispatches / reads a credential",
+      "must_turn_red_gate": "cross-tenant-denial",
+      "first_fail_case": "A10-public-dispatch",
+      "reject_contract": "attack A10-public-dispatch: expected DENY, candidate returns ALLOW -> gate status=fail at step 'A10-public-dispatch'"
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+{
+  "id": "rr-multitenant-isolation",
+  "name": "rr multi-tenant cross-tenant-denial oracle (differential-style isolation gate)",
+  "trigger": "per-wave",
+  "severity": "hard",
+  "golden_input": "fixtures/golden/candidate.mjs"
+}
