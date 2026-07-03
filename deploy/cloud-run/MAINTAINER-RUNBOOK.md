@@ -140,7 +140,7 @@ the Job to use (you need only one; the handler prefers OAuth if both are present
 ```bash
 export PROJECT_ID="heimdall-cp-prod"
 export REGION="us-central1"
-export RUNTIME_SA="heimdall-cp-run@${PROJECT_ID}.iam.gserviceaccount.com"
+export RUNTIME_SA="heimdall-cp-runtime@${PROJECT_ID}.iam.gserviceaccount.com"
 
 # (A) the OAuth token (preferred) -> env CLAUDE_CODE_OAUTH_TOKEN
 gcloud secrets create heimdall-cc-oauth-token --replication-policy=automatic --project="${PROJECT_ID}"

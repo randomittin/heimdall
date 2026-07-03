@@ -31,8 +31,12 @@ MODE="hybrid"; DRY=0; REPO=""; PROJECT="heimdall-cp-prod"; REGION="us-central1"
 MAXN="3"; CRON="*/30 * * * *"; SCHEDULE=""
 GH_APP=0; GH_APP_ID=""; GH_APP_INSTALL_ID=""; GH_APP_KEY_FILE=""
 JOB="heimdall-maintainer-job"
+<<<<<<< HEAD
 GH_APP_KEY_SECRET="heimdall-gh-app-private-key"
-RUNTIME_SA="heimdall-cp-run@${PROJECT}.iam.gserviceaccount.com"
+RUNTIME_SA="heimdall-cp-runtime@${PROJECT}.iam.gserviceaccount.com"
+=======
+RUNTIME_SA="heimdall-cp-runtime@${PROJECT}.iam.gserviceaccount.com"
+>>>>>>> worktree-agent-a24e7a0339a33fd97
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 LOOP="$ROOT/bin/heimdall-maintain-loop"

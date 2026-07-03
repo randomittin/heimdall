@@ -103,7 +103,7 @@ The sequence (each step guarded + idempotent — safe to re-run):
    `iap`.
 2. **gh-app** — App id → `heimdall-gh-app-id`; the private-key PEM is **streamed from the file to
    `gcloud` stdin** (never argv, never logged) → `heimdall-gh-app-private-key`; the runtime SA
-   (`heimdall-cp-run@…`) is granted `secretAccessor` on each (per-secret IAM, least privilege).
+   (`heimdall-cp-runtime@…`) is granted `secretAccessor` on each (per-secret IAM, least privilege).
 3. **deploy** — reuses `go-live.sh` (gated rebuild → least-privilege public surface → live boundary
    verify; digest-pinned), then sets `HEIMDALL_RR_TENANT_AUTHZ=1` + `HEIMDALL_TEAM_CRED_STORE=secretmanager`
    on **both** services.

@@ -35,7 +35,7 @@ ROOT="$(cd "$HERE/../.." && pwd)"
 MINT="$ROOT/bin/heimdall-gh-app-token"
 DEFAULT_STORE="$HOME/.heimdall/gh-app.env"
 KEY_STORE="$HOME/.heimdall/gh-app-private-key.pem"
-RUNTIME_SA="heimdall-cp-run@${PROJECT}.iam.gserviceaccount.com"
+RUNTIME_SA="heimdall-cp-runtime@${PROJECT}.iam.gserviceaccount.com"
 KEY_SECRET="heimdall-gh-app-private-key"
 
 usage() { sed -n '/^# Usage:/,/\[--store <path>\] \[--dry-run\]/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
@@ -47,7 +47,7 @@ while [ $# -gt 0 ]; do case "$1" in
   --installation-id)  INSTALL_ID="${2:?}"; shift 2 ;;
   --private-key-file) KEY_FILE="${2:?}"; shift 2 ;;
   --repo)             REPO="${2:?}"; shift 2 ;;
-  --project)          PROJECT="${2:?}"; RUNTIME_SA="heimdall-cp-run@${PROJECT}.iam.gserviceaccount.com"; shift 2 ;;
+  --project)          PROJECT="${2:?}"; RUNTIME_SA="heimdall-cp-runtime@${PROJECT}.iam.gserviceaccount.com"; shift 2 ;;
   --store)            STORE="${2:?}"; shift 2 ;;
   -h|--help)          usage; exit 0 ;;
   *) echo "unknown arg: $1" >&2; usage >&2; exit 2 ;;

@@ -101,7 +101,7 @@ fi
 # consistency guard: the yaml's serviceAccountName + GOOGLE_CLOUD_PROJECT reference a
 # project; if --project differs, the image-pin (below) keeps the image path in sync but
 # those two fields are OUT of this script's pin scope — warn the operator to align them.
-_yaml_proj="$(grep -oE 'heimdall-cp-run@[A-Za-z0-9-]+\.iam' "$YAML" | head -1 | sed -E 's/^heimdall-cp-run@([A-Za-z0-9-]+)\.iam$/\1/')"
+_yaml_proj="$(grep -oE 'heimdall-cp-runtime@[A-Za-z0-9-]+\.iam' "$YAML" | head -1 | sed -E 's/^heimdall-cp-runtime@([A-Za-z0-9-]+)\.iam$/\1/')"
 if [ -n "$_yaml_proj" ] && [ "$_yaml_proj" != "$PROJECT" ]; then
   warn "the manifest's serviceAccountName/GOOGLE_CLOUD_PROJECT reference '$_yaml_proj', but --project=$PROJECT."
   warn "this script pins the IMAGE path to $PROJECT; also update serviceAccountName + GOOGLE_CLOUD_PROJECT in $YAML to $PROJECT before a real deploy (RUNBOOK §3.2)."

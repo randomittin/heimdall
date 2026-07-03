@@ -97,7 +97,7 @@ export PROJECT_ID="heimdall-cp-prod"
 export REGION="us-central1"
 export GATED_SERVICE="heimdall-control-plane"
 export PUBLIC_SERVICE="heimdall-cp-public"
-export GATED_SA="heimdall-cp-run@${PROJECT_ID}.iam.gserviceaccount.com"
+export GATED_SA="heimdall-cp-runtime@${PROJECT_ID}.iam.gserviceaccount.com"
 export PUBLIC_SA="heimdall-cp-public-run@${PROJECT_ID}.iam.gserviceaccount.com"
 
 gcloud config set project "${PROJECT_ID}"
