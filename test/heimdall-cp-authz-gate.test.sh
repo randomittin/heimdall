@@ -299,13 +299,69 @@ j() { printf '%s' "$R" | "$PY" -c "import json,sys;print(json.load(sys.stdin).ge
   && ok "DRAIN the gated drain picks team A's queue -> dispatches through the gate; B's partition untouched" \
   || bad "DRAIN wiring did not drain A / leaked into B (R=$R)"
 
-# ── INV-6 grep proof: cp_publicsurface holds NO credential + NO dispatch capability ──
+# ── INV-6 (REFINED) proof: cp_publicsurface's CODE holds NO cred-READ + NO dispatch symbol ──
+#
+# THE REFINEMENT (docs/specs/2026-07-03-rr-isolation-invariants.md INV-6, clarified 2026-07-04).
+# The public surface MAY write-forward the caller's OWN cred (cp_team_creds.put_team_cred) into the
+# caller's SERVER-DERIVED team_id partition (INV-1/2/4) — that is NOT "holding a cred": the surface
+# cannot read the cred back, cannot reach another team's partition, and cannot dispatch. What WOULD
+# break isolation is a cred-READ (get_team_cred / env_for_team) or a DISPATCH (select_maintainer_auth
+# / .dispatch / mint_token_for_team) on this surface. The refined check FORBIDS exactly those and
+# ALLOWS the write-forward. Unlike the old whole-file grep (which false-positived on the module's
+# PROSE explaining WHY the write-forward is safe — comments at cp_publicsurface.py:67,113,615,616),
+# this scans CODE ONLY: tokenize drops COMMENT + STRING (docstring) tokens, so only real code
+# identifiers count. A real read/dispatch CALL in code still fails (proven falsifiable below).
 echo
-if grep -nE "select_maintainer_auth|\.dispatch\(|mint_token_for_team|env_for_team|HEIMDALL_PR_BOT_TOKEN|CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_API_KEY" "$LIB/cp_publicsurface.py" >/dev/null 2>&1; then
-  bad "INV-6 cp_publicsurface.py references a credential/dispatch symbol (must be enqueue-only)"
-  grep -nE "select_maintainer_auth|\.dispatch\(|mint_token_for_team|env_for_team|HEIMDALL_PR_BOT_TOKEN|CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_API_KEY" "$LIB/cp_publicsurface.py" >&2
+cat > "$EXT/inv6_scan.py" <<'PYEOF'
+import sys, tokenize
+# Cred-READ + DISPATCH identifiers that break INV-6 if they appear in CODE on the public surface.
+# The write-forward put_team_cred is DELIBERATELY ABSENT here (it is PERMITTED). NAME tokens only, so
+# comments (COMMENT tokens) and docstrings/string literals (STRING tokens) — the module's prose — are
+# ignored; only real code identifiers are flagged.
+FORBID = {"get_team_cred", "env_for_team",                               # cred READ
+          "select_maintainer_auth", "mint_token_for_team", "dispatch"}   # DISPATCH
+with open(sys.argv[1], "rb") as f:
+    for tok in tokenize.tokenize(f.readline):
+        if tok.type == tokenize.NAME and tok.string in FORBID:
+            print("%d:%s" % (tok.start[0], tok.string))
+PYEOF
+
+PS_HITS="$("$PY" "$EXT/inv6_scan.py" "$LIB/cp_publicsurface.py")"
+if [ -n "$PS_HITS" ]; then
+  bad "INV-6 cp_publicsurface.py CODE references a cred-READ/dispatch symbol (write-forward is allowed; read/dispatch is NOT)"
+  printf '%s\n' "$PS_HITS" | sed 's/^/    /' >&2
 else
-  ok "INV-6 cp_publicsurface.py holds NO cred + NO dispatch symbol (grep-clean, enqueue-only)"
+  ok "INV-6 cp_publicsurface.py CODE holds NO cred-READ (get_team_cred/env_for_team) + NO dispatch symbol; write-forward put_team_cred permitted"
+fi
+
+# FALSIFIER (the refinement is NOT weakened-to-nothing): a cred-READ CALL added to the public surface
+# IS caught. Scan a synthetic module that reads a cred back — the scanner MUST flag it.
+cat > "$EXT/inv6_falsifier.py" <<'PYEOF'
+import cp_team_creds
+def leak(identity, team_id, home=None):
+    # a cred-READ on the public surface — exactly what INV-6 forbids.
+    cred = cp_team_creds.get_team_cred(team_id, home=home)
+    return {"secret": cred}
+PYEOF
+FAL_HITS="$("$PY" "$EXT/inv6_scan.py" "$EXT/inv6_falsifier.py")"
+if printf '%s' "$FAL_HITS" | grep -q "get_team_cred"; then
+  ok "INV-6 FALSIFIER: a cred-READ (get_team_cred) added to the public surface IS caught — the refined check is load-bearing, not deleted"
+else
+  bad "INV-6 FALSIFIER did not fire — the refined check is a no-op that would miss a real cred read (hits=$FAL_HITS)"
+fi
+
+# PRECISION (the exact false positive the old grep hit): a COMMENT/PROSE mention of the forbidden
+# symbols is correctly IGNORED — the refined check is strict on CODE, quiet on prose.
+cat > "$EXT/inv6_prose.py" <<'PYEOF'
+# The gated worker uses get_team_cred / env_for_team / mint_token_for_team and may .dispatch() —
+# this module only DOCUMENTS them, referencing NONE in code. Prose must not trip the gate.
+_OK = 1
+PYEOF
+PROSE_HITS="$("$PY" "$EXT/inv6_scan.py" "$EXT/inv6_prose.py")"
+if [ -z "$PROSE_HITS" ]; then
+  ok "INV-6 the refined check IGNORES comment/docstring PROSE (the old grep's false positive) — code-only, not word-match"
+else
+  bad "INV-6 the refined check false-positived on prose (hits=$PROSE_HITS)"
 fi
 
 # ── INV-1 grep proof: cp_maintainer_runner never reads team_id from the request params ──

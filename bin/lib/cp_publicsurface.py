@@ -699,6 +699,12 @@ def register_team_cred(identity, request, *, home=None, now=None):
         return (422, {"error": "bad_kind", "team_id": team_id})
     if not isinstance(secret, str) or not secret:
         return (422, {"error": "missing_secret", "team_id": team_id})
+    # REFINED INV-6 (docs/specs/2026-07-03-rr-isolation-invariants.md, clarified 2026-07-04): this is a
+    # WRITE-FORWARD, not a cred READ. put_team_cred WRITES the caller's OWN secret into EXACTLY the
+    # caller's server-derived team_id partition (INV-1 above) and returns only a bool. This surface
+    # NEVER calls a cred READ (get_team_cred/env_for_team) and NEVER dispatches — so a popped public
+    # surface still cannot read ANY cred (its own or another team's) and cannot exec. The write-forward
+    # is the ONLY cred symbol reachable in this module's CODE (the authz-gate test asserts exactly that).
     if not cp_team_creds.put_team_cred(team_id, kind, secret, home=home):
         return (422, {"error": "store_failed", "team_id": team_id})
     # The response carries ONLY non-secret confirmation — never the secret (INV-4).
