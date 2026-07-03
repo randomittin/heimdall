@@ -62,6 +62,9 @@ run()  { if [ "$DRY" = 1 ]; then printf '  \033[90m$ %s\033[0m\n' "$*"; else "$@
 # ── the App manifest (the permissions the App is created with) ────────────────
 # GitHub App PERMISSIONS to grant — and ONLY these:
 #   • Contents: Read and write      — push the heimdall/* fix branch (+ read repo code).
+#   • Actions: Read                 — SEE CI/workflow-run failures (read-only; forward-compat
+#                                    for auto-fixing CI). Workflow-FILE edits need Workflows:write
+#                                    (deferred — a per-team opt-in gate, off by default).
 #   • Issues: Read and write        — READ the issue queue (the connector's work source),
 #                                     comment "resolved by #N" + close the resolved issue.
 #   • Pull requests: Read and write — open the PR (+ post the proof receipt comment).
@@ -81,6 +84,7 @@ print_manifest() {
     "contents": "write",
     "issues": "write",
     "pull_requests": "write",
+    "actions": "read",
     "metadata": "read"
   },
   "default_events": []
@@ -107,6 +111,7 @@ print_plan() {
 
   say "2. Grant EXACTLY these repository PERMISSIONS — and nothing more:"
   echo "     • Contents: Read and write      → push the heimdall/* fix branch (+ read code)"
+  echo "     • Actions: Read                 → see CI/workflow-run failures (read-only)"
   echo "     • Issues: Read and write        → READ the issue queue + comment/close resolved"
   echo "     • Pull requests: Read and write → open the PR + post the proof receipt"
   echo "     • Metadata: Read-only           → mandatory baseline (auto-selected)"
