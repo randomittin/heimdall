@@ -138,7 +138,7 @@ Mirror the existing `cp-pki-key` seed pattern. Create **whichever** credential y
 the Job to use (you need only one; the handler prefers OAuth if both are present):
 
 ```bash
-export PROJECT_ID="heimdall-control-plane"
+export PROJECT_ID="heimdall-cp-prod"
 export REGION="us-central1"
 export RUNTIME_SA="heimdall-cp-run@${PROJECT_ID}.iam.gserviceaccount.com"
 
@@ -379,7 +379,7 @@ relayed to your browser** and **pasted back on the VM**. No pre-minted token eve
 
 ```bash
 deploy/gce/provision-maintainer-vm.sh provision \
-  --project heimdall-control-plane --zone us-central1-a [--vm heimdall-maintainer-vm] \
+  --project heimdall-cp-prod --zone us-central1-a [--vm heimdall-maintainer-vm] \
   [--machine-type e2-small] [--private] [--dry-run]
 ```
 
@@ -413,7 +413,7 @@ Then it **prints the interactive login relay for RJ to run himself**:
 ```bash
 # 1. SSH in over the IAP tunnel (no public IP needed):
 gcloud compute ssh heimdall-maintainer-vm --zone us-central1-a \
-  --project heimdall-control-plane --tunnel-through-iap
+  --project heimdall-cp-prod --tunnel-through-iap
 #    (confirm the toolchain landed:  ls -l /var/log/heimdall-toolchain-ready )
 
 # 2. on the VM — headless Linux can't open a browser, so claude PRINTS a URL + CODE:
@@ -432,7 +432,7 @@ The creds now **persist on the VM** at `~/.claude/.credentials.json` (a portable
 
 ```bash
 deploy/gce/provision-maintainer-vm.sh install-maintainer --repo <owner/repo> \
-  --project heimdall-control-plane --zone us-central1-a [--vm heimdall-maintainer-vm] \
+  --project heimdall-cp-prod --zone us-central1-a [--vm heimdall-maintainer-vm] \
   [--max 3] [--cron "*/30 * * * *"] [--clone-path <dir>] [--dry-run]
 ```
 
@@ -455,7 +455,7 @@ The maintainer **OPENS PRs** via the bot token on `heimdall/*` branches — it *
 
 ```bash
 deploy/gce/provision-maintainer-vm.sh verify \
-  --project heimdall-control-plane --zone us-central1-a [--vm heimdall-maintainer-vm] [--dry-run]
+  --project heimdall-cp-prod --zone us-central1-a [--vm heimdall-maintainer-vm] [--dry-run]
 ```
 
 SSHes in over IAP and checks the **`/var/log/heimdall-toolchain-ready`** marker plus

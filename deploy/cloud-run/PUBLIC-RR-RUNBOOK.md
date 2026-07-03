@@ -2,7 +2,7 @@
 
 The human step-by-step that pairs with `deploy/cloud-run/deploy-public-rr.sh`. RJ runs this on
 his own machine, with his own `gcloud` (authenticated as a **human owner**, never a service
-account) and the **GitHub App he creates**. Project: `heimdall-control-plane`.
+account) and the **GitHub App he creates**. Project: `heimdall-cp-prod`.
 
 **What "public RR" is.** Any developer installs a GitHub App on their own repo, runs
 `claude setup-token`, and enrolls into the control plane with a shared enroll token. They then
@@ -70,7 +70,7 @@ Authenticate as a **human owner** first (the script refuses a `*.gserviceaccount
 
 ```bash
 gcloud auth login                    # a HUMAN owner — NOT a service account
-gcloud config set project heimdall-control-plane
+gcloud config set project heimdall-cp-prod
 ```
 
 ### B.1 — Dry run first (no creds, no side effects)
@@ -89,7 +89,7 @@ Prints the entire W4 plan — APIs → App secrets → deploy (`go-live.sh` + `H
 deploy/cloud-run/deploy-public-rr.sh \
   --gh-app-id <APP_ID> \
   --gh-app-key-file ~/.heimdall/heimdall-maintainer.pem \
-  --project heimdall-control-plane \
+  --project heimdall-cp-prod \
   --region  us-central1 \
   --endpoint https://<your-public-service-url>      # optional; used only in the onboarding print
 ```
@@ -118,14 +118,14 @@ The sequence (each step guarded + idempotent — safe to re-run):
 privately with each onboarding user:
 
 ```bash
-gcloud secrets versions access latest --secret=cp-enroll-token --project=heimdall-control-plane
+gcloud secrets versions access latest --secret=cp-enroll-token --project=heimdall-cp-prod
 ```
 
 Also grab the public service URL to hand out:
 
 ```bash
 gcloud run services describe heimdall-cp-public --region=us-central1 \
-  --project=heimdall-control-plane --format='value(status.url)'
+  --project=heimdall-cp-prod --format='value(status.url)'
 ```
 
 ---

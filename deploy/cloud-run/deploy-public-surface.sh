@@ -78,7 +78,7 @@ set -euo pipefail
 PUBLIC_SURFACE_ROUTES="POST /enroll, POST /presence, GET /roster, GET /healthz, GET /readyz"
 
 # ── config (every value overridable from the env; defaults match README §0) ──────────
-PROJECT_ID="${PROJECT_ID:-heimdall-control-plane}"
+PROJECT_ID="${PROJECT_ID:-heimdall-cp-prod}"
 REGION="${REGION:-us-central1}"
 GATED_SERVICE="${GATED_SERVICE:-heimdall-control-plane}"   # the existing IAM-gated service
 PUBLIC_SERVICE="${PUBLIC_SERVICE:-heimdall-cp-public}"     # the service THIS script deploys

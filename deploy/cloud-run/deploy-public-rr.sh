@@ -43,7 +43,7 @@
 #
 # Usage:
 #   deploy/cloud-run/deploy-public-rr.sh --gh-app-id <N> --gh-app-key-file <path.pem> \
-#       [--project heimdall-control-plane] [--region us-central1] \
+#       [--project heimdall-cp-prod] [--region us-central1] \
 #       [--endpoint <public-url>] [--enroll-open] [--dry-run]
 #   --dry-run prints the WHOLE W4 plan (APIs → secrets → deploy → byoc → enroll → verify),
 #             executes nothing, and needs NO creds/keys/tokens.
@@ -53,7 +53,7 @@
 set -euo pipefail
 
 # ── defaults ─────────────────────────────────────────────────────────────────
-PROJECT="heimdall-control-plane"
+PROJECT="heimdall-cp-prod"
 REGION="us-central1"
 GH_APP_ID=""
 GH_APP_KEY_FILE=""

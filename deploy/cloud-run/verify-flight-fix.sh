@@ -41,7 +41,7 @@
 # ── HOW RJ RUNS IT (live target, RJ's creds) ──────────────────────────────────────────
 #   export BASE_URL="$(gcloud run services describe heimdall-control-plane \
 #                        --region=us-central1 --format='value(status.url)')"
-#   export PROJECT_ID="heimdall-control-plane"
+#   export PROJECT_ID="heimdall-cp-prod"
 #   export CLIENT_HAID="$(gcloud run services describe heimdall-control-plane \
 #                          --region=us-central1 \
 #                          --format='value(spec.template.spec.containers[0].env)' \

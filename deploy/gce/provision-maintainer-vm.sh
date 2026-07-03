@@ -63,7 +63,7 @@ set -euo pipefail
 
 # ── defaults ─────────────────────────────────────────────────────────────────
 CMD=""
-PROJECT="heimdall-control-plane"
+PROJECT="heimdall-cp-prod"
 ZONE="us-central1-a"
 VM="heimdall-maintainer-vm"
 MACHINE_TYPE="e2-small"

@@ -28,7 +28,7 @@
 set -euo pipefail
 
 DRY=0; CONFIGURE=0; CLOUD=0
-APP_ID=""; INSTALL_ID=""; KEY_FILE=""; REPO=""; PROJECT="heimdall-control-plane"
+APP_ID=""; INSTALL_ID=""; KEY_FILE=""; REPO=""; PROJECT="heimdall-cp-prod"
 STORE=""
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"

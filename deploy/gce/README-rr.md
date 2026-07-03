@@ -31,7 +31,7 @@ work runs remotely, not on your box.
 
 ```
 rr setup --vm heimdall-maintainer-vm --zone us-central1-a \
-         --project heimdall-control-plane --repo owner/repo [--mode vm|control-plane]
+         --project heimdall-cp-prod --repo owner/repo [--mode vm|control-plane]
 ```
 
 Writes `~/.heimdall/remote.json` (mode `0600`; **holds no secret** by
@@ -40,7 +40,7 @@ construction — only `vm`/`zone`/`project`/`repo`/`mode`):
 ```json
 {
   "mode": "vm",
-  "project": "heimdall-control-plane",
+  "project": "heimdall-cp-prod",
   "repo": "owner/repo",
   "vm": "heimdall-maintainer-vm",
   "zone": "us-central1-a"

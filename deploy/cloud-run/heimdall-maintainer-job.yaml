@@ -44,11 +44,11 @@ spec:
           # the runtime SA MUST hold roles/datastore.user + secretmanager.secretAccessor
           # on the mounted secrets (RUNBOOK §3.1). It does NOT need run.jobs.run — that is
           # the DISPATCHER's permission, not the executor's.
-          serviceAccountName: heimdall-cp-run@heimdall-control-plane.iam.gserviceaccount.com
+          serviceAccountName: heimdall-cp-run@heimdall-cp-prod.iam.gserviceaccount.com
           containers:
               # DIGEST-PINNED image carrying git + gh + the claude CLI on top of the
               # control-plane image. Replace with the resolved @sha256 digest.
-            - image: us-central1-docker.pkg.dev/heimdall-control-plane/heimdall/heimdall-maintainer@sha256:REPLACE_WITH_DIGEST
+            - image: us-central1-docker.pkg.dev/heimdall-cp-prod/heimdall/heimdall-maintainer@sha256:REPLACE_WITH_DIGEST
               # the run-to-completion entrypoint; each execution overrides args -> run-job,<JOB_ID>.
               command:
                 - heimdall-control-plane
@@ -59,7 +59,7 @@ spec:
                 - name: HEIMDALL_STATE_BACKEND
                   value: firestore
                 - name: GOOGLE_CLOUD_PROJECT
-                  value: heimdall-control-plane
+                  value: heimdall-cp-prod
                 - name: HEIMDALL_CP_SERVER_HAID
                   value: cp-server
                 - name: HEIMDALL_CP_PKI_KEY
