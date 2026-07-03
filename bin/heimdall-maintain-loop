@@ -10,14 +10,24 @@
 # Usage:
 #   heimdall-maintain-loop run [--repo DIR] [--base REF] [--evidence CMD]... \
 #         [--config @FILE|JSON] [--max N] [--budget-tokens N] [--max-failures N] \
-#         [--planning-dir DIR]
+#         [--planning-dir DIR] [--context FILE] [--context-max-bytes N] [--dry-run]
 #       Drain the queue one issue per cycle until a STOP condition trips (budget /
 #       empty-queue / repeated-failure) or --max cycles run. Each transition appends
 #       an autopilot header block to .planning/CHECKPOINT.md. The budget is checked
 #       BEFORE every cycle — an over-cap or unreadable meter STOPS without running.
-#   heimdall-maintain-loop plan [--repo DIR] [--config C] [--budget-tokens N]
+#       --context FILE ingests the rr LOCAL-SESSION-CONTEXT capsule (see
+#       bin/heimdall-context-capsule): it PREPENDS the capsule as a clearly-delimited
+#       read-only "LOCAL SESSION CONTEXT" briefing to EACH fix cycle's prompt so the
+#       cloud bot has continuity with the local session. Omit --context to auto-detect
+#       the shipped capsule at ~/.heimdall/rr-context/<slug>/context.md. It is a
+#       briefing, not instructions — the issue is still the task. Without a capsule the
+#       loop is byte-identical to before. --dry-run previews the plan (incl. the
+#       context that WOULD be prepended) and executes nothing.
+#   heimdall-maintain-loop plan [--repo DIR] [--config C] [--budget-tokens N] \
+#         [--context FILE] [--context-max-bytes N]
 #       Read-only DRY-RUN: the budget, the queued issues in pick order, and what
-#       each WOULD do (park vs fix). Mutates nothing.
+#       each WOULD do (park vs fix). With a resolved context capsule it also surfaces
+#       the read-only briefing block that WOULD be prepended. Mutates nothing.
 #   heimdall-maintain-loop heartbeat [--repo DIR] [--planning-dir DIR]
 #       Render the last checkpoint block as ONE line receipt (wired into summary-card).
 #   heimdall-maintain-loop resume-hint [--repo DIR] [--planning-dir DIR]
@@ -45,7 +55,7 @@ SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 BINDIR="$(dirname "$SELF")"
 LIB="$BINDIR/lib/maintain_loop.py"
 
-usage() { sed -n '2,45p' "$SELF" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,50p' "$SELF" | sed 's/^# \{0,1\}//'; }
 
 PY="$(command -v python3 || command -v python || true)"
 if [ -z "$PY" ]; then
