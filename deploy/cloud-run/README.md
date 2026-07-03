@@ -128,7 +128,7 @@ args differ. The service's runtime SA needs permission to **execute** the Job
 
 ```bash
 # Pick the target project + region once; every command below reuses them.
-export PROJECT_ID="heimdall-control-plane"        # the scoped Heimdall GCP project
+export PROJECT_ID="heimdall-cp-prod"        # the scoped Heimdall GCP project
 export REGION="us-central1"
 export SERVICE="heimdall-control-plane"
 export RUNTIME_SA="heimdall-cp-run@${PROJECT_ID}.iam.gserviceaccount.com"
@@ -845,7 +845,7 @@ backend / non-deterministic scale) past the full `STEP5_POLL_SECONDS` window.
 ### How RJ runs it (live URL, RJ's creds)
 
 ```bash
-export PROJECT_ID="heimdall-control-plane"
+export PROJECT_ID="heimdall-cp-prod"
 export REGION="us-central1"
 export SERVICE="heimdall-control-plane"
 

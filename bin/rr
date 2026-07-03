@@ -136,7 +136,7 @@ esac; done
 REMOTE_CONFIGURED=0
 CFG_VM="heimdall-maintainer-vm"
 CFG_ZONE="us-central1-a"
-CFG_PROJECT="heimdall-control-plane"
+CFG_PROJECT="heimdall-cp-prod"
 CFG_REPO="randomittin/heimdall"
 CFG_MODE="vm"
 

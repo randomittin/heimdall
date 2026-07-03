@@ -93,7 +93,7 @@ PUBLIC_PKI_SECRET=cp-pki-key bash deploy-public-surface.sh plan; echo "exit=$?" 
 ## 0. Prerequisites (one-time, per project)
 
 ```bash
-export PROJECT_ID="heimdall-control-plane"
+export PROJECT_ID="heimdall-cp-prod"
 export REGION="us-central1"
 export GATED_SERVICE="heimdall-control-plane"
 export PUBLIC_SERVICE="heimdall-cp-public"

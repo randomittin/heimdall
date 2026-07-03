@@ -27,7 +27,7 @@
 #   --dry-run prints the full plan, executes nothing, needs NO creds/tokens.
 set -euo pipefail
 
-MODE="hybrid"; DRY=0; REPO=""; PROJECT="heimdall-control-plane"; REGION="us-central1"
+MODE="hybrid"; DRY=0; REPO=""; PROJECT="heimdall-cp-prod"; REGION="us-central1"
 MAXN="3"; CRON="*/30 * * * *"; SCHEDULE=""
 GH_APP=0; GH_APP_ID=""; GH_APP_INSTALL_ID=""; GH_APP_KEY_FILE=""
 JOB="heimdall-maintainer-job"

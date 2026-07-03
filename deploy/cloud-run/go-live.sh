@@ -34,7 +34,7 @@ DEPLOY_PUBLIC="${SELF_DIR}/deploy-public-surface.sh"
 CHECK_PUBLIC="${SELF_DIR}/check-public-surface.sh"
 
 # ── config (every value overridable from the env; defaults match the RUNBOOK §0) ─────
-PROJECT_ID="${PROJECT_ID:-heimdall-control-plane}"
+PROJECT_ID="${PROJECT_ID:-heimdall-cp-prod}"
 REGION="${REGION:-us-central1}"
 GATED_SERVICE="${GATED_SERVICE:-heimdall-control-plane}"
 PUBLIC_SERVICE="${PUBLIC_SERVICE:-heimdall-cp-public}"
