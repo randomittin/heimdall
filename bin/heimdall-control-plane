@@ -40,6 +40,18 @@
 #       violation / a non-done terminal (the dispatcher leaves it for resume/retry).
 #   heimdall-control-plane schedules [--json] [--home DIR]
 #       List stored cron schedules fired by the per-minute tick driver (§6). Read-only.
+#   heimdall-control-plane schedule-maintainer --repo <owner/repo> --cron "<expr>"
+#                          [--max N] [--budget-tokens N] [--dry-run] [--home DIR]
+#       Register (IDEMPOTENTLY) the maintainer autopilot cron (§6): the per-minute tick
+#       fires an ALLOWLISTED run-maintainer-cycle dispatch at the due minute, which the
+#       hybrid runner routes to the operator's box (Arch A) or the Cloud Run Job (Arch B —
+#       set HEIMDALL_MAINTAINER_RUNNER=cloud|hybrid so an absent local runner uses the Job).
+#       Registered AS the server identity (HEIMDALL_CP_SERVER_HAID / heimdall-haid current)
+#       — the SAME identity the tick fires as. Typed + bounded by the run-maintainer-cycle
+#       allowlist (repo slug, 1..100 max, optional token budget); a bad repo/cron/max is
+#       REFUSED, never persisted. Re-registering the same repo+cron UPDATES IN PLACE (never
+#       duplicates). It registers ONLY the allowlisted action — NEVER a free-form command.
+#       --dry-run prints the registration and writes NOTHING. Prints the schedule_id + cron.
 #   heimdall-control-plane approvals [--json] [--home DIR]
 #       List the pending owner-gate queue (§7). Read-only — never decides.
 #   heimdall-control-plane notify [--haid HAID] [--json] [--home DIR]
@@ -73,7 +85,7 @@ BIN_DIR="$(cd "$(dirname "$SELF")" && pwd)"
 LIB_DIR="$BIN_DIR/lib"
 HAID_CLI="$BIN_DIR/heimdall-haid"
 
-usage() { sed -n '2,64p' "$SELF" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,76p' "$SELF" | sed 's/^# \{0,1\}//'; }
 
 PY="$(command -v python3 || command -v python || true)"
 if [ -z "$PY" ]; then
@@ -103,6 +115,11 @@ EXPORT=""
 NO_REVOCATION=""
 JSON=""
 JOB_ID=""
+REPO=""
+CRON=""
+MAXN="3"
+BUDGET_TOKENS=""
+DRY_RUN=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -119,6 +136,11 @@ while [ $# -gt 0 ]; do
     --until)       UNTIL="${2:?--until needs a value}"; shift 2 ;;
     --export)      EXPORT="1"; shift ;;
     --no-revocation) NO_REVOCATION="1"; shift ;;
+    --repo)        REPO="${2:?--repo needs a value}"; shift 2 ;;
+    --cron)        CRON="${2:?--cron needs an expression}"; shift 2 ;;
+    --max)         MAXN="${2:?--max needs a value}"; shift 2 ;;
+    --budget-tokens) BUDGET_TOKENS="${2:?--budget-tokens needs a value}"; shift 2 ;;
+    --dry-run)     DRY_RUN="1"; shift ;;
     -h|--help)     usage; exit 0 ;;
     --*)           echo "error: unknown option: $1" >&2; usage >&2; exit 2 ;;
     *)             # the first bare positional is the run-job <job_id> target; any further
@@ -377,6 +399,123 @@ else:
                             "enabled" if s.get("enabled") else "disabled",
                             s.get("action_type", "?")))
 PYEOF
+    ;;
+
+  schedule-maintainer)
+    # Register (IDEMPOTENTLY) the maintainer autopilot cron (§6). The per-minute tick fires
+    # an ALLOWLISTED run-maintainer-cycle dispatch at the due minute; the hybrid runner routes
+    # it to the operator's box (Arch A) or the Cloud Run Job (Arch B). Registered AS the server
+    # identity — the SAME identity the tick fires as. Typed + bounded by the run-maintainer-cycle
+    # allowlist; a bad repo/cron/max is REFUSED (never persisted). Same repo+cron -> update in
+    # place (never duplicated). NEVER a free-form command — only the allowlisted action.
+    [ -n "$REPO" ] || { echo "error: schedule-maintainer needs --repo <owner/repo>" >&2; usage >&2; exit 2; }
+    [ -n "$CRON" ] || { echo "error: schedule-maintainer needs --cron \"<expr>\"" >&2; usage >&2; exit 2; }
+    set +e
+    LIB_DIR="$LIB_DIR" HOME_DIR="$HOME_DIR" REPO="$REPO" CRON="$CRON" MAXN="$MAXN" \
+    BUDGET_TOKENS="$BUDGET_TOKENS" DRY_RUN="$DRY_RUN" HAID="$HAID" JSON="$JSON" "$PY" - <<'PYEOF'
+import json, os, sys
+sys.path.insert(0, os.environ["LIB_DIR"])
+import cp_allowlist, cp_auth, cp_scheduler
+home = os.environ.get("HOME_DIR") or None
+repo = os.environ["REPO"]
+cron = os.environ["CRON"]
+as_json = bool(os.environ.get("JSON"))
+dry = bool(os.environ.get("DRY_RUN"))
+
+
+def _fail(msg, code=2):
+    sys.stderr.write("schedule-maintainer: %s\n" % msg)
+    sys.exit(code)
+
+
+# max / budget are ALWAYS integers to the typed allowlist (Int); a non-int is a usage error
+# refused BEFORE the store is touched (the CLI mirrors the allowlist's own bounds refusal).
+try:
+    max_cycles = int(os.environ["MAXN"])
+except (KeyError, ValueError):
+    _fail("--max must be an integer 1..100 (got %r)" % os.environ.get("MAXN"))
+budget = None
+raw_budget = os.environ.get("BUDGET_TOKENS") or ""
+if raw_budget:
+    try:
+        budget = int(raw_budget)
+    except ValueError:
+        _fail("--budget-tokens must be an integer (got %r)" % raw_budget)
+
+# Resolve the SERVER identity the tick fires as: an explicit --haid wins, else the deploy's
+# HEIMDALL_CP_SERVER_HAID pin / `heimdall-haid current` (cp_auth.server_haid). Without one we
+# cannot own the schedule as the server — refuse rather than guess an identity.
+haid = (os.environ.get("HAID") or "").strip() or cp_auth.server_haid(home)
+if not haid:
+    _fail("no server identity — set HEIMDALL_CP_SERVER_HAID (deploy pin) or pass --haid, "
+          "so the schedule is owned by the identity the tick fires as")
+identity = cp_auth.Identity(haid, owner=True)
+
+if dry:
+    # DRY-RUN: validate the params through the §1 allowlist (so a bad repo/cron/max still
+    # fails loudly) but write NOTHING to the store.
+    try:
+        params = {"repo": repo, "max": max_cycles}
+        if budget is not None:
+            params["budget_tokens"] = budget
+        cp_allowlist.validate(cp_scheduler.MAINTAINER_ACTION_TYPE, params)
+        cp_scheduler.parse_cron(cron)
+    except cp_allowlist.RefusedDispatch as ref:
+        _fail("refused: %s (%s) — nothing registered" % (ref.reason, ref.detail))
+    except cp_scheduler.ScheduleError as err:
+        _fail("bad cron: %s (%s) — nothing registered" % (err.reason, err.detail))
+    existing = cp_scheduler.find_maintainer_schedule(haid, repo, cron, home=home)
+    plan = {
+        "dry_run": True, "would_register": True,
+        "action_type": cp_scheduler.MAINTAINER_ACTION_TYPE,
+        "owner_haid": haid, "repo": repo, "cron": cron, "max": max_cycles,
+        "budget_tokens": budget,
+        "would_update_in_place": bool(existing),
+        "schedule_id": existing["schedule_id"] if existing else None,
+    }
+    if as_json:
+        sys.stdout.write(json.dumps(plan, indent=2, sort_keys=True) + "\n")
+    else:
+        sys.stdout.write(
+            "DRY-RUN: would %s run-maintainer-cycle for %s (cron=%r, max=%d%s) as %s — "
+            "NOTHING written\n" % (
+                "UPDATE" if existing else "register", repo, cron, max_cycles,
+                ("" if budget is None else ", budget_tokens=%d" % budget), haid))
+    sys.exit(0)
+
+# REGISTER (idempotent): same owner+repo+cron -> update in place, else create. The typed §1
+# gate refuses an off-slug repo / out-of-range max / bad cron here — never persisted.
+try:
+    result = cp_scheduler.upsert_maintainer_schedule(
+        identity, repo, max_cycles, cron, budget_tokens=budget, home=home)
+except cp_allowlist.RefusedDispatch as ref:
+    _fail("refused: %s (%s) — nothing registered" % (ref.reason, ref.detail))
+except cp_scheduler.ScheduleError as err:
+    _fail("bad cron: %s (%s) — nothing registered" % (err.reason, err.detail))
+entry = result["entry"]
+out = {
+    "registered": True, "created": result["created"],
+    "schedule_id": entry["schedule_id"], "action_type": entry["action_type"],
+    "cron": entry["cron"], "repo": entry["params"].get("repo"),
+    "max": entry["params"].get("max"),
+    "budget_tokens": entry["params"].get("budget_tokens"),
+    "owner_haid": entry["owner_haid"], "enabled": entry["enabled"],
+}
+if as_json:
+    sys.stdout.write(json.dumps(out, indent=2, sort_keys=True) + "\n")
+else:
+    sys.stdout.write(
+        "%s maintainer schedule %s: run-maintainer-cycle for %s (cron=%r, max=%s%s)\n"
+        % ("created" if result["created"] else "updated (idempotent)",
+           entry["schedule_id"], entry["params"].get("repo"), entry["cron"],
+           entry["params"].get("max"),
+           ("" if entry["params"].get("budget_tokens") is None
+            else ", budget_tokens=%s" % entry["params"].get("budget_tokens"))))
+sys.exit(0)
+PYEOF
+    RC=$?
+    set -e
+    exit "$RC"
     ;;
 
   approvals)
