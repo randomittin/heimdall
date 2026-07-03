@@ -65,7 +65,7 @@ CP_ENDPOINT_JSON="$HOME/.heimdall/cp-endpoint.json" # the CP {url, enroll_token}
 # Shipped DEFAULT public-surface URL (lowest precedence — the config/flag/env override it).
 # The CP URL is NOT a secret (a public Cloud Run endpoint), so it is baked in — same default
 # heimdall-presence ships, so a dev needs ZERO url config; only the enroll TOKEN is distributed.
-DEFAULT_CP_URL="https://heimdall-cp-public-eqfrs7sfuq-uc.a.run.app"
+DEFAULT_CP_URL="https://heimdall-cp-public-203927696193.us-central1.run.app"
 
 PY="$(command -v python3 || command -v python || true)"
 
