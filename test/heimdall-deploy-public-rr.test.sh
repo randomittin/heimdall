@@ -15,6 +15,12 @@
 #   4. HUMAN account passes the account check (the control — no SA warning) then stops on the
 #        next real gate (project describe), proving the SA branch is account-specific.
 #   5. BAD ARGS rejected — an unknown flag exits 2; a real run missing --gh-app-id exits nonzero.
+#   6. RUNTIME SA IS AUTO-DETECTED, NOT HARDCODED — the plan RESOLVES the runtime SA from the
+#        deployed gated service (spec.template.spec.serviceAccountName) with a <projectNumber>-
+#        compute@developer.gserviceaccount.com fallback; the hardcoded heimdall-cp-run@ name NEVER
+#        appears; every secret create is idempotent (|| echo … exists); and --runtime-sa <email>
+#        overrides the auto-detect (the grant members use the override verbatim). This guards the
+#        live break (the hardcoded SA did not exist → the secretAccessor binding 400'd).
 set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -77,6 +83,18 @@ plan_has "rr setup --mode control-plane"            "prints the user onboarding 
 plan_has "/rr-task"                                  "verify probes the /rr-task route"
 plan_has "no_such_route"                             "verify asserts the gated-route 404 boundary"
 plan_has "6. verify"                                 "verify step present"
+# 1b. runtime SA is AUTO-DETECTED (not hardcoded) + secret creates are IDEMPOTENT (same dry-run OUT).
+plan_has "spec.template.spec.serviceAccountName"     "resolves the runtime SA from the deployed gated service"
+plan_has "compute@developer.gserviceaccount.com"     "default-compute SA fallback when the gated SA is empty"
+plan_has "projectNumber"                              "derives the compute SA from the project number"
+plan_has "(secret heimdall-gh-app-id exists)"        "gh-app-id secret create is idempotent (|| exists)"
+plan_has "(secret heimdall-gh-app-private-key exists)" "gh-app key secret create is idempotent (|| exists)"
+plan_has "(secret cp-enroll-token exists)"           "enroll-token secret create is idempotent (|| exists)"
+plan_has "serviceAccount:<RESOLVED-RUNTIME-SA>"      "grants bind the RESOLVED SA, not a hardcoded one"
+# the hardcoded runtime SA that caused the live break must NEVER appear in the plan.
+if printf '%s' "$OUT" | grep -qF "heimdall-cp-run@"; then
+  bad "HARDCODED SA LEAK — heimdall-cp-run@ appears in the plan (the exact live-deploy bug)"
+else ok "no hardcoded heimdall-cp-run@ SA anywhere in the plan"; fi
 # ordering: preflight before deploy before verify.
 if printf '%s' "$OUT" | grep -nF -e "1. preflight" -e "3. deploy" -e "6. verify" | awk -F: '{print $1}' \
      | { read -r a; read -r b; read -r c; [ "$a" -lt "$b" ] && [ "$b" -lt "$c" ]; }; then
@@ -119,6 +137,22 @@ run_sut "PATH=/usr/bin:/bin" --   # real run, no creds
 if [ "$RC" != "0" ] && printf '%s' "$OUT" | grep -q "gh-app-id"; then
   ok "real run missing --gh-app-id -> refused (exit=$RC)"
 else bad "real run missing creds not refused (exit=$RC)"; fi
+
+# ── 6. --runtime-sa <email> overrides the auto-detect (dry-run) ────────────────────────────
+OVR="custom-runtime@heimdall-cp-prod.iam.gserviceaccount.com"
+OUT="$(PATH="/usr/bin:/bin" bash "$SUT" --dry-run --runtime-sa "$OVR" --gh-app-id 1 --gh-app-key-file "$KEYF" 2>&1)"; RC=$?
+[ "$RC" = "0" ] && ok "dry-run with --runtime-sa exits 0" || bad "dry-run --runtime-sa exit=$RC (expected 0)"
+printf '%s' "$OUT" | grep -qF "explicit --runtime-sa" \
+  && ok "--runtime-sa is reported as the explicit override" \
+  || bad "--runtime-sa override not reported"
+# every grant member must be the override, and the auto-detect sentinel must NOT be emitted.
+if printf '%s' "$OUT" | grep -qF "serviceAccount:${OVR}" \
+   && ! printf '%s' "$OUT" | grep -qF "serviceAccount:<RESOLVED-RUNTIME-SA>"; then
+  ok "grants bind the --runtime-sa override verbatim (no auto-detect sentinel)"
+else bad "--runtime-sa override not used for the grant members"; fi
+printf '%s' "$OUT" | grep -qF "spec.template.spec.serviceAccountName" \
+  && bad "--runtime-sa given but the plan still runs the auto-detect describe" \
+  || ok "--runtime-sa short-circuits the gated-service describe"
 
 echo "──────────────────────────────────────────"
 echo "heimdall-deploy-public-rr: $PASS passed, $FAIL failed"

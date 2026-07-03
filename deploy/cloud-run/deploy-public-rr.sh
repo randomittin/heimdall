@@ -44,9 +44,14 @@
 # Usage:
 #   deploy/cloud-run/deploy-public-rr.sh --gh-app-id <N> --gh-app-key-file <path.pem> \
 #       [--project heimdall-cp-prod] [--region us-central1] \
-#       [--endpoint <public-url>] [--enroll-open] [--dry-run]
+#       [--endpoint <public-url>] [--runtime-sa <email>] [--enroll-open] [--dry-run]
 #   --dry-run prints the WHOLE W4 plan (APIs → secrets → deploy → byoc → enroll → verify),
 #             executes nothing, and needs NO creds/keys/tokens.
+#   --runtime-sa <email> OVERRIDES the auto-detected runtime SA. By DEFAULT this script reads the
+#             runtime SA the deployed gated service (heimdall-control-plane) ACTUALLY runs as, and
+#             if that service uses the project DEFAULT compute SA, resolves
+#             <projectNumber>-compute@developer.gserviceaccount.com. Pass this ONLY to force a
+#             specific identity (used verbatim for every secretAccessor / secretmanager.admin grant).
 #   --gh-app-id + --gh-app-key-file are REQUIRED for a real run (step 2); a --dry-run needs
 #             neither. --enroll-open forwards HEIMDALL_ENROLL_OPEN=1 (tokenless+bounded
 #             enroll); the DEFAULT is token-gated (the viral/public phase).
@@ -60,6 +65,7 @@ GH_APP_KEY_FILE=""
 ENDPOINT=""
 ENROLL_OPEN=0
 DRY=0
+RUNTIME_SA_OVERRIDE=""   # --runtime-sa <email>; empty ⇒ auto-detect from the deployed gated service
 
 # ── fixed W4 identifiers (env-var names + secret names + service names) ───────
 RR_AUTHZ_ENV="HEIMDALL_RR_TENANT_AUTHZ"          # =1 turns ON the multi-tenant authz + /rr-task
@@ -83,13 +89,19 @@ while [ $# -gt 0 ]; do case "$1" in
   --project)         PROJECT="${2:?}";         shift 2 ;;
   --region)          REGION="${2:?}";          shift 2 ;;
   --endpoint)        ENDPOINT="${2:?}";        shift 2 ;;
+  --runtime-sa)      RUNTIME_SA_OVERRIDE="${2:?}"; shift 2 ;;
   --enroll-open)     ENROLL_OPEN=1;            shift ;;
   --dry-run)         DRY=1;                    shift ;;
   -h|--help)         usage; exit 0 ;;
   *) echo "unknown arg: $1" >&2; usage >&2; exit 2 ;;
 esac; done
 
-RUNTIME_SA="heimdall-cp-run@${PROJECT}.iam.gserviceaccount.com"
+# RUNTIME_SA is resolved (NOT hardcoded) by resolve_runtime_sa() below, right before step 2 —
+# it is the deployed gated service's ACTUAL runtime SA, with a project-default-compute-SA fallback
+# and an explicit --runtime-sa override. Hardcoding a fixed cp-run SA name was the live-deploy bug
+# (that SA was never created). Seed with a sentinel so an accidental early use is visibly wrong
+# rather than a stale real-looking address.
+RUNTIME_SA="<UNRESOLVED-RUNTIME-SA>"
 
 say()  { printf '\033[36m▸ %s\033[0m\n' "$*"; }
 warn() { printf '\033[33m! %s\033[0m\n' "$*" >&2; }
@@ -99,6 +111,60 @@ run()  { if [ "$DRY" = 1 ]; then printf '  \033[90m$ %s\033[0m\n' "$*"; else "$@
 # show: print a command WITHOUT running it (used to preview a secret-piping pipeline whose
 # real form must never be executed with the value on argv — the value flows over stdin only).
 show() { printf '  \033[90m$ %s\033[0m\n' "$*"; }
+
+# resolve_runtime_sa — determine the runtime SA to grant, in precedence order:
+#   1. --runtime-sa <email>            (explicit operator override, used verbatim).
+#   2. the deployed gated service's serviceAccountName (what heimdall-control-plane ACTUALLY runs
+#      as) — spec.template.spec.serviceAccountName from `gcloud run services describe`.
+#   3. if that is EMPTY, the service runs under the project DEFAULT compute SA, which we derive as
+#      <projectNumber>-compute@developer.gserviceaccount.com.
+# The old hardcoded cp-run SA (…@${PROJECT}.iam.gserviceaccount.com) never existed in prod → step
+# 2's secretAccessor binding failed. In --dry-run we PRINT the describe/resolve commands and set a sentinel value (zero
+# gcloud calls). Sets the global RUNTIME_SA.
+resolve_runtime_sa() {
+  if [ -n "$RUNTIME_SA_OVERRIDE" ]; then
+    RUNTIME_SA="$RUNTIME_SA_OVERRIDE"
+    say "  runtime SA (explicit --runtime-sa): ${RUNTIME_SA}"
+    return 0
+  fi
+  if [ "$DRY" = 1 ]; then
+    show "gcloud run services describe ${GATED_SERVICE} --region=${REGION} --project=${PROJECT} --format='value(spec.template.spec.serviceAccountName)'   # the gated service's ACTUAL runtime SA"
+    show "# if EMPTY (the gated service uses the project default compute SA), derive it:"
+    show "PROJNUM=\$(gcloud projects describe ${PROJECT} --format='value(projectNumber)'); RUNTIME_SA=\"\${PROJNUM}-compute@developer.gserviceaccount.com\""
+    RUNTIME_SA="<RESOLVED-RUNTIME-SA>"
+    say "  runtime SA is auto-detected at apply from ${GATED_SERVICE} (default-compute fallback); plan uses ${RUNTIME_SA}"
+    return 0
+  fi
+  local sa
+  sa="$(gcloud run services describe "$GATED_SERVICE" --region="$REGION" --project="$PROJECT" \
+          --format='value(spec.template.spec.serviceAccountName)' 2>/dev/null || true)"
+  if [ -n "$sa" ]; then
+    RUNTIME_SA="$sa"
+    say "  runtime SA (auto-detected from deployed ${GATED_SERVICE}): ${RUNTIME_SA}"
+    return 0
+  fi
+  local projnum
+  projnum="$(gcloud projects describe "$PROJECT" --format='value(projectNumber)' 2>/dev/null || true)"
+  [ -n "$projnum" ] || die "resolve_runtime_sa: ${GATED_SERVICE} exposes no explicit runtime SA AND the project number could not be read to derive the default compute SA. Pass --runtime-sa <email> explicitly."
+  RUNTIME_SA="${projnum}-compute@developer.gserviceaccount.com"
+  say "  runtime SA (${GATED_SERVICE} runs under the project DEFAULT compute SA): ${RUNTIME_SA}"
+}
+
+# create_secret_idem <name> — create the Secret Manager container, IDEMPOTENTLY. A re-run after a
+# partial deploy MUST NOT die on ALREADY_EXISTS: swallow gcloud's stderr and report the pre-existing
+# secret instead of failing. In --dry-run print the guarded create form (no gcloud call).
+create_secret_idem() {
+  local name="$1"
+  if [ "$DRY" = 1 ]; then
+    show "gcloud secrets create ${name} --replication-policy=automatic --project=${PROJECT} 2>/dev/null || echo '  (secret ${name} exists)'"
+    return 0
+  fi
+  if gcloud secrets create "$name" --replication-policy=automatic --project="$PROJECT" 2>/dev/null; then
+    say "  secret ${name} created"
+  else
+    echo "  (secret ${name} exists)"
+  fi
+}
 
 # ── arg validation (fail-closed, before any side effect) ─────────────────────
 printf '%s' "$PROJECT" | grep -qE '^[a-z][a-z0-9-]{4,28}[a-z0-9]$' \
@@ -168,9 +234,14 @@ fi
 #    runtime SA secretAccessor per-secret (least privilege — not project-wide).
 # ════════════════════════════════════════════════════════════════════════════
 say "2. GitHub App creds → Secret Manager (id=${GH_APP_ID_SECRET}, key=${GH_APP_KEY_SECRET})"
+# Resolve the runtime SA to grant BEFORE any binding — auto-detected from the deployed gated
+# service (default-compute fallback), or the explicit --runtime-sa override. This is the fix for
+# the live break: the old hardcoded cp-run SA name did not exist, so the bindings below 400'd.
+say "  resolve the runtime SA to grant (auto-detect from ${GATED_SERVICE}, or --runtime-sa override):"
+resolve_runtime_sa
 put_app_secrets() {
   # App ID (numeric, non-secret, but held as a secret for a single wiring seam).
-  run gcloud secrets create "$GH_APP_ID_SECRET" --replication-policy=automatic --project="$PROJECT" || true
+  create_secret_idem "$GH_APP_ID_SECRET"
   show "printf %s '<APP_ID>' | gcloud secrets versions add ${GH_APP_ID_SECRET} --data-file=- --project=${PROJECT}"
   if [ "$DRY" != 1 ]; then
     printf '%s' "$GH_APP_ID" | gcloud secrets versions add "$GH_APP_ID_SECRET" --data-file=- --project="$PROJECT" >/dev/null \
@@ -180,7 +251,7 @@ put_app_secrets() {
     --member="serviceAccount:${RUNTIME_SA}" --role=roles/secretmanager.secretAccessor
 
   # Private-key PEM — STREAMED from the file to gcloud STDIN (never argv, never printed).
-  run gcloud secrets create "$GH_APP_KEY_SECRET" --replication-policy=automatic --project="$PROJECT" || true
+  create_secret_idem "$GH_APP_KEY_SECRET"
   show "gcloud secrets versions add ${GH_APP_KEY_SECRET} --data-file=- --project=${PROJECT} < <APP_KEY_FILE.pem>"
   if [ "$DRY" != 1 ]; then
     gcloud secrets versions add "$GH_APP_KEY_SECRET" --data-file=- --project="$PROJECT" < "$GH_APP_KEY_FILE" >/dev/null \
@@ -246,7 +317,7 @@ if [ "$ENROLL_OPEN" = 1 ]; then
   say "  --enroll-open: HEIMDALL_ENROLL_OPEN=1 (tokenless+bounded). Minting is OPTIONAL; skipping the mint."
   say "  users still enroll tokenless (the per-IP / budget / registry caps bound it in BOTH modes)."
 else
-  run gcloud secrets create "$ENROLL_SECRET" --replication-policy=automatic --project="$PROJECT" || true
+  create_secret_idem "$ENROLL_SECRET"
   show "python3 -c 'import secrets,sys; sys.stdout.write(secrets.token_urlsafe(32))' | gcloud secrets versions add ${ENROLL_SECRET} --data-file=- --project=${PROJECT}"
   if [ "$DRY" != 1 ]; then
     python3 -c 'import secrets,sys; sys.stdout.write(secrets.token_urlsafe(32))' \
