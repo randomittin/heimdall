@@ -269,12 +269,24 @@ build_remote_cmd() {
 
 dispatch_vm() {
   local remote_cmd; remote_cmd="$(build_remote_cmd)"
+  local capsule="$BINDIR/heimdall-context-capsule"
   if [ "$DRY" = 1 ]; then
+    if [ "${RR_NO_CONTEXT:-0}" != 1 ] && [ -x "$capsule" ]; then
+      plan "$capsule ship --vm $CFG_VM --zone $CFG_ZONE --project $CFG_PROJECT --repo $CFG_REPO   # ship session context so the cloud bot has continuity"
+    fi
     say "would hand off to the cloud executor (SSH to $CFG_VM, run the maintainer there, detached):"
     plan "gcloud compute ssh $CFG_VM --zone $CFG_ZONE --project $CFG_PROJECT --tunnel-through-iap --command \"$remote_cmd\""
     return 0
   fi
   command -v gcloud >/dev/null 2>&1 || die "gcloud not found — install the Google Cloud SDK (https://cloud.google.com/sdk)"
+  # Ship the LOCAL session context capsule so the cloud maintainer has continuity
+  # (secret-scrubbed by the capsule; maintain-loop --context auto-detects it). Best-effort:
+  # a capsule failure must NOT block the dispatch. Opt out with RR_NO_CONTEXT=1.
+  if [ "${RR_NO_CONTEXT:-0}" != 1 ] && [ -x "$capsule" ]; then
+    say "shipping local session context to $CFG_VM (continuity for the cloud bot)"
+    "$capsule" ship --vm "$CFG_VM" --zone "$CFG_ZONE" --project "$CFG_PROJECT" --repo "$CFG_REPO" \
+      || warn "context capsule ship failed (non-fatal — the bot runs without local context)"
+  fi
   say "dispatching to $CFG_VM ($CFG_ZONE / $CFG_PROJECT) — maintainer runs on the VM, detached"
   gcloud compute ssh "$CFG_VM" --zone "$CFG_ZONE" --project "$CFG_PROJECT" \
     --tunnel-through-iap --command "$remote_cmd"
