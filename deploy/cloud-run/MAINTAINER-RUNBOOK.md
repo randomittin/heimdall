@@ -351,3 +351,91 @@ Job configured as the fallback (`GOOGLE_CLOUD_PROJECT` + `HEIMDALL_CP_JOB_NAME`,
 
 Force a single arm when you want it: `HEIMDALL_MAINTAINER_RUNNER=local` pins Arch A (RJ's
 box only — no cloud fallback), `=cloud` pins Arch B (zero-touch, ignores the beat).
+
+---
+
+## 7. GCE VM (interactive cloud login) — "OpenClaw-in-cloud"
+
+An **alternative to the §1.1 `setup-token` / §3.1 Secret-Manager path**. Instead of minting a
+long-lived OAuth token and mounting it as a secret, this runs **Arch A on a persistent GCE VM**
+and authenticates with an **interactive `claude` login done *on* the VM** — the login **code is
+relayed to your browser** and **pasted back on the VM**. No pre-minted token ever exists.
+
+> **Why a VM, not a Cloud Run Job?** Cloud Run Jobs are **batch / non-interactive** — there is no
+> TTY to paste a login code into. An interactive `claude auth login` code-relay **requires a
+> persistent machine you SSH into**. So this is **Arch A relocated onto a cloud VM**: the VM holds
+> the subscription creds (a portable Linux `~/.claude/.credentials.json`), runs
+> `bin/heimdall-maintain-loop`, and **beats runner-liveness** (§6.1) so the hybrid selector routes
+> the cycle to it. Works because RJ is a **personal Max** org with **no `forceLoginMethod` block**
+> (subscription OAuth authorizes headless runs — §1).
+
+> **⭐ One script, two phases — `deploy/gce/provision-maintainer-vm.sh`.** RJ runs it with his own
+> gcloud creds. The OAuth login is **interactive + manual**: the script only **prints** the relay
+> steps — it never handles the OAuth secret. `--dry-run` prints the whole plan (create VM +
+> startup script + login relay + install plan) and needs **no** gcloud/ssh/creds. Proof:
+> `bash test/heimdall-provision-vm.test.sh` (hermetic, `$0`).
+
+### 7.1 Phase 1 — `provision` (create the VM + get the login relay)
+
+```bash
+deploy/gce/provision-maintainer-vm.sh provision \
+  --project heimdall-control-plane --zone us-central1-a [--vm heimdall-maintainer-vm] \
+  [--machine-type e2-small] [--dry-run]
+```
+
+Creates a small **e2-small Debian 12** VM (guarded: `instances describe … || create`) with a
+**startup script** that installs the full toolchain — **git + gh + Node 20 + the `claude` CLI +
+python3 with the pinned `cryptography`/`firestore`/`run` deps** (identical pins to
+`Dockerfile.maintainer`) — and clones the **public** heimdall repo to `/opt/heimdall`, exporting
+`bin/` on PATH via `/etc/profile.d`. **Egress-only**: no inbound firewall rule (SSH reaches the
+VM over **IAP**, which needs no public ingress). Then it **prints the interactive login relay for
+RJ to run himself**:
+
+```bash
+# 1. SSH in over the IAP tunnel (no public IP needed):
+gcloud compute ssh heimdall-maintainer-vm --zone us-central1-a \
+  --project heimdall-control-plane --tunnel-through-iap
+#    (confirm the toolchain landed:  ls -l /var/log/heimdall-toolchain-ready )
+
+# 2. on the VM — headless Linux can't open a browser, so claude PRINTS a URL + CODE:
+claude          # (or:  claude auth login )  → prints a URL and a login CODE
+
+# 3. open that URL in YOUR OWN browser, sign in (personal Max), copy the code,
+#    and PASTE it back at the prompt on the VM.
+
+# 4. verify the subscription auth works headless:
+claude -p "ok" --          # a normal reply on your subscription (not a 401)
+```
+
+The creds now **persist on the VM** at `~/.claude/.credentials.json` (a portable OAuth file).
+
+### 7.2 Phase 2 — `install-maintainer` (after the login succeeds)
+
+```bash
+deploy/gce/provision-maintainer-vm.sh install-maintainer --repo <owner/repo> \
+  --project heimdall-control-plane --zone us-central1-a [--vm heimdall-maintainer-vm] \
+  [--max 3] [--cron "*/30 * * * *"] [--clone-path <dir>] [--dry-run]
+```
+
+Over `gcloud compute ssh --command` (IAP), on the VM:
+
+- **prompts for `HEIMDALL_PR_BOT_TOKEN`** (`read -rs`, never echoed) and streams it over **ssh
+  STDIN** into a **0600 env file** `~/.heimdall/maintainer.env`
+  (`HEIMDALL_JOB_RUNNER=subprocess`, `HEIMDALL_MAINTAINER_RUNNER=hybrid`, the bot token) — the
+  token is **never an argv/`--command` element**, never logged;
+- **clones the target repo** on the VM (the DIR the loop's `run --max` drains against);
+- installs a **cron** (idempotent, dedup on the `heimdall-maintainer-` marker): **runner-beat
+  every minute** (Arch-A liveness so the hybrid selector picks this VM — §6.1) **+** a bounded
+  `heimdall-maintain-loop run --max N` cycle on `--cron`;
+- **smoke**: one `runner-beat` + a `claude -p "ok"` liveness check.
+
+The maintainer **OPENS PRs** via the bot token on `heimdall/*` branches — it **never pushes
+`main`, never merges**. **RJ merges** (§4).
+
+> **Secret discipline.** The OAuth login is interactive + manual (the script never touches the
+> OAuth secret). The bot token is `read -rs` → **ssh STDIN pipe** → 0600 file on the VM. No
+> `echo $TOKEN`, no `set -x`, no token in any argv or log. Same bar as `deploy-maintainer.sh`.
+
+> **Cron vs systemd.** The script installs a **cron** (matches `deploy-maintainer.sh` §2, 1-min
+> granularity for the beat). For a tighter beat cadence, replace the beat line with a systemd
+> timer / a `while sleep 30` supervised loop (keep the cadence **< the 90s TTL** — §6.3).
