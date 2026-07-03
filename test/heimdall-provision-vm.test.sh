@@ -119,6 +119,51 @@ grep -qE 'ssh_write_envfile|env_stdin|\| *(run +)?gcloud compute ssh|BOT_TOKEN[^
   && ok "G token reaches the VM via ssh STDIN (pipe), not argv" \
   || bad "G no stdin-pipe path for the token to the VM (must not be an argv element)"
 
+echo "== H. egress: default = external IP, --private = Cloud NAT =="
+# ROOT-CAUSE GUARD: an egress-only VM with NO external IP and NO Cloud NAT has NO internet route —
+# apt/npm/git ALL fail at first boot. Default MUST give egress via an ephemeral EXTERNAL IP.
+printf '%s' "$P1" | grep -qiE 'external ip' && ok "default plan: VM gets an EXTERNAL IP (internet egress)" || bad "default plan: MISSING external-IP egress"
+if printf '%s' "$P1" | grep -q -- '--no-address'; then bad "default plan: still passes --no-address (NO egress → the live break)"; else ok "default plan: no --no-address (VM has egress)"; fi
+# --private = the secure path: NO external IP, egress via a Cloud Router + NAT instead.
+PPRIV="$(PATH="$SHIMDIR:$PATH" "$S" --dry-run provision --private 2>&1)"; RCP=$?
+[ "$RCP" = 0 ] && ok "dry-run provision --private exited 0" || bad "dry-run provision --private exited $RCP (expected 0)"
+[ ! -f "$SENTINEL" ] && ok "--private dry-run invoked no real gcloud/ssh" || bad "--private dry-run INVOKED a real tool: $(cat "$SENTINEL" 2>/dev/null)"
+printf '%s' "$PPRIV" | grep -qiE 'routers create|routers nats create|cloud nat|nats create' && ok "--private plan: Cloud Router + NAT for egress" || bad "--private plan: MISSING Cloud NAT"
+printf '%s' "$PPRIV" | grep -q -- '--no-address' && ok "--private plan: VM has NO external IP (--no-address, NAT egress)" || bad "--private plan: expected --no-address alongside NAT"
+
+echo "== I. IAP auto-setup in the plan (firewall + IAM + APIs) =="
+hasreP1(){ printf '%s' "$P1" | grep -qE "$1" && ok "plan shows: $2" || bad "plan MISSING: $2"; }
+hasreP1 'allow-iap-ssh'                 "IAP firewall rule allow-iap-ssh"
+hasreP1 '35\.235\.240\.0/20'            "IAP source range 35.235.240.0/20"
+hasreP1 'tcp:22'                        "IAP firewall opens tcp:22"
+hasreP1 'tunnelResourceAccessor'        "IAP IAM grant roles/iap.tunnelResourceAccessor"
+hasreP1 'services enable|compute\.googleapis\.com' "enables the compute/iap APIs (guarded)"
+
+echo "== J. service-account preflight warning fires =="
+# a *.gserviceaccount.com active account (e.g. a CI SA) must trigger a LOUD warning — API-enable /
+# IAM / firewall steps will PERMISSION_DENIED; the operator must gcloud auth login as a human owner.
+SA="$(HEIMDALL_ACTIVE_ACCOUNT=ci-bot@heimdall.iam.gserviceaccount.com PATH="$SHIMDIR:$PATH" "$S" --dry-run provision 2>&1)"
+if printf '%s' "$SA" | grep -qiE 'service account|gserviceaccount' && printf '%s' "$SA" | grep -qiE 'auth login|permission'; then
+  ok "J SA account triggers a loud preflight warning (auth login as human owner)"
+else
+  bad "J no SA-account preflight warning fired for a *.gserviceaccount.com account"
+fi
+[ ! -f "$SENTINEL" ] && ok "J SA preflight used the env override, invoked no real gcloud (dry-run)" || bad "J SA preflight INVOKED a real tool: $(cat "$SENTINEL" 2>/dev/null)"
+HU="$(HEIMDALL_ACTIVE_ACCOUNT=rj@example.com PATH="$SHIMDIR:$PATH" "$S" --dry-run provision 2>&1)"
+printf '%s' "$HU" | grep -qiE 'active account.*service account' && bad "J a human account was wrongly flagged as a service account" || ok "J a human account is NOT flagged as a service account"
+
+echo "== K. verify self-heals a missing toolchain marker =="
+V="$(PATH="$SHIMDIR:$PATH" "$S" --dry-run verify 2>&1)"; RCV=$?
+[ "$RCV" = 0 ] && ok "dry-run verify exited 0" || bad "dry-run verify exited $RCV (expected 0)"
+[ ! -f "$SENTINEL" ] && ok "dry-run verify invoked no real gcloud/ssh" || bad "dry-run verify INVOKED a real tool: $(cat "$SENTINEL" 2>/dev/null)"
+printf '%s' "$V" | grep -qE 'heimdall-toolchain-ready' && ok "verify checks the /var/log/heimdall-toolchain-ready marker" || bad "verify MISSING the toolchain-ready marker check"
+printf '%s' "$V" | grep -qE 'google_metadata_script_runner startup' && ok "verify RE-RUNS the startup script when the marker is absent (self-heal, no recreate)" || bad "verify MISSING the startup-rerun self-heal"
+printf '%s' "$V" | grep -qE 'claude --version' && ok "verify checks 'claude --version'" || bad "verify MISSING the claude --version check"
+
+echo "== L. no secret echoed in the NEW paths (private + verify) =="
+PFV="$(HEIMDALL_PR_BOT_TOKEN=SECRET-XYZ PATH="$SHIMDIR:$PATH" "$S" --dry-run verify 2>&1)"
+if printf '%s%s' "$PPRIV" "$PFV" | grep -q 'SECRET-XYZ'; then bad "L a fake bot-token value leaked in a new dry-run path"; else ok "L no token value in --private / verify dry-run output"; fi
+
 echo
 echo "provision-vm: $PASS passed, $FAIL failed"
 rm -rf "$SHIMDIR"
