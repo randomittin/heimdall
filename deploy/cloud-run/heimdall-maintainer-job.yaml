@@ -44,11 +44,7 @@ spec:
           # the runtime SA MUST hold roles/datastore.user + secretmanager.secretAccessor
           # on the mounted secrets (RUNBOOK §3.1). It does NOT need run.jobs.run — that is
           # the DISPATCHER's permission, not the executor's.
-<<<<<<< HEAD
           serviceAccountName: heimdall-cp-runtime@heimdall-cp-prod.iam.gserviceaccount.com
-=======
-          serviceAccountName: heimdall-cp-runtime@heimdall-control-plane.iam.gserviceaccount.com
->>>>>>> worktree-agent-a24e7a0339a33fd97
           containers:
               # DIGEST-PINNED image carrying git + gh + the claude CLI on top of the
               # control-plane image. Replace with the resolved @sha256 digest.
