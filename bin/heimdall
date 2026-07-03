@@ -433,21 +433,14 @@ ensure_claude() {
 
 # ── Ensure Claude Code is authenticated ──
 
-ensure_auth() {
-  # auth step telemetry: bracket the whole resolution (each return is a distinct
-  # outcome). started → (succeeded | failed). Records WHERE auth lands without ever
-  # carrying a token/credential value (the schema has no payload field).
-  local _auth_t0; _auth_t0="$(_tele_now_ms)"
-  _tele_install_step auth started
-
-  # Skip if API key is set via environment
-  if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
-    _tele_install_step auth succeeded "$_auth_t0"
-    return 0
-  fi
-
-  # Check Claude Code's stored OAuth account (tokens live in system keychain,
-  # but accountUuid in .claude.json confirms a successful login)
+# heimdall_is_authed — TRUE (return 0) iff a usable credential is already present:
+#   - ANTHROPIC_API_KEY in the environment, OR
+#   - a stored OAuth account in ~/.claude.json (accountUuid confirms a completed
+#     login; the tokens themselves live in the system keychain).
+# Pure probe: NO prompt, NO login, NO side effects. Reused by ensure_auth and by
+# any caller that wants to branch on auth state without triggering a login.
+heimdall_is_authed() {
+  [ -n "${ANTHROPIC_API_KEY:-}" ] && return 0
   local claude_cfg="$HOME/.claude.json"
   if [ -f "$claude_cfg" ] && command -v python3 &>/dev/null; then
     local has_account
@@ -461,39 +454,52 @@ try:
 except Exception:
     print('false')
 " 2>/dev/null)
-    if [ "$has_account" = "true" ]; then
-      _tele_install_step auth succeeded "$_auth_t0"
-      return 0
-    fi
+    [ "$has_account" = "true" ] && return 0
+  fi
+  return 1
+}
+
+# ensure_auth — NON-FATAL, NON-BLOCKING auth resolution.
+#
+# THE FIRST-RUN BUG THIS FIXES: this step used to run `claude login` INTERACTIVELY
+# and `exit 1` when no account got established. On a fresh VM that login dropped
+# into an interactive flow the user ^C'd — aborting the WHOLE bootstrap BEFORE
+# companion setup ran and BEFORE the first-run marker was written. So `hmd` had to
+# be run TWICE (run 1 = auth-then-abort, run 2 = companion setup, which then blocked
+# on the claude-mem npm confirm). The auth branch and the companion-setup branch
+# were effectively mutually exclusive per invocation.
+#
+# THE FIX: auth NEVER aborts the bootstrap and NEVER blocks on an interactive login.
+#   - authed (API key or stored account) → silent no-op (the normal warm path).
+#   - not authed → print a CLEAR, headless-friendly one-line sign-in instruction and
+#     RETURN 0. The caller runs companion setup FIRST (marker already written), so a
+#     deferred/absent login can never undo setup, and a later `hmd` (once the user
+#     signs in) goes STRAIGHT to work — never back into setup. The subsequent
+#     `claude … -p` launch handles its own auth prompt if the user has not yet.
+# Always returns 0. Emits auth telemetry: succeeded when authed, a NON-FATAL
+# auth-deferred datum when sign-in is still pending (never a token/secret value).
+ensure_auth() {
+  local _auth_t0; _auth_t0="$(_tele_now_ms)"
+  _tele_install_step auth started
+
+  if heimdall_is_authed; then
+    _tele_install_step auth succeeded "$_auth_t0"
+    return 0
   fi
 
-  # Not authenticated — prompt login
-  printf "\n  \033[38;2;255;200;80m⚠ Not authenticated with Claude Code.\033[0m\n"
-  printf "  Running claude login...\n\n"
-  claude login
+  # Not authenticated — DEFER, never block. Print the sign-in instruction, covering
+  # BOTH the browser login and the headless code-relay / setup-token path for a
+  # server/VM with no browser, then continue so setup + marker complete regardless.
+  local W C D R
+  W='\033[38;2;255;200;80m'; C='\033[38;2;0;212;255m'; D='\033[2m'; R='\033[0m'
+  printf "\n  ${W}⚠ Not signed in to Claude Code yet — setup is otherwise complete.${R}\n"
+  printf "  To start running tasks, sign in ONCE, then re-run your command:\n"
+  printf "    ${C}claude${R}              ${D}opens login (a server/VM with no browser prints a code-relay link to open elsewhere)${R}\n"
+  printf "    ${C}claude setup-token${R}  ${D}headless / no browser — generates a token to paste${R}\n"
+  printf "  ${D}(Or export ANTHROPIC_API_KEY to skip interactive login entirely.)${R}\n\n"
 
-  # Verify login succeeded
-  if [ -f "$claude_cfg" ] && command -v python3 &>/dev/null; then
-    local has_account
-    has_account=$(python3 -c "
-import json
-try:
-    with open('$claude_cfg') as f:
-        cfg = json.load(f)
-    acct = cfg.get('oauthAccount', {})
-    print('true' if acct.get('accountUuid') else 'false')
-except Exception:
-    print('false')
-" 2>/dev/null)
-    if [ "$has_account" = "true" ]; then
-      _tele_install_step auth succeeded "$_auth_t0"
-      return 0
-    fi
-  fi
-
-  _tele_install_step auth failed "$_auth_t0" auth-not-authenticated "claude login did not establish an account"
-  echo "  Error: Authentication failed. Run 'claude login' manually."
-  exit 1
+  _tele_install_step auth failed "$_auth_t0" auth-deferred "sign-in deferred to user; bootstrap continued"
+  return 0
 }
 
 # ── Ensure node is in PATH (nvm lazy-loads, hooks don't inherit it) ──
@@ -588,7 +594,14 @@ first_run_setup() {
       local _cm_rc=0
       # Surface npx output (drop the 2>/dev/null swallow) so a real user sees what
       # happened instead of a silent stall, but a nonzero exit is NON-FATAL.
-      npx claude-mem install || _cm_rc=$?
+      #
+      # NON-INTERACTIVE (the claude-mem `Ok to proceed? (y)` fix): `npx --yes`
+      # auto-confirms npx's own package-fetch prompt, and reading stdin from a `yes`
+      # stream auto-answers any y/n the installer itself raises — so first-run setup
+      # NEVER blocks on a TTY confirm (the second-run stall the user hit). The
+      # process-substitution redirect is NOT a pipeline, so pipefail can't be tripped
+      # by `yes` closing with SIGPIPE, and the exit code stays that of npx.
+      npx --yes claude-mem install < <(yes) || _cm_rc=$?
       if [ "$_cm_rc" -eq 0 ]; then
         _tele_install_step companion:claude-mem succeeded "$_cm_t0"
       else
@@ -1267,8 +1280,8 @@ if [[ "${1:-}" == "--setup" ]]; then
   rm -f "$SETUP_MARKER"
   ensure_node_path
   ensure_claude
-  ensure_auth
   first_run_setup
+  ensure_auth
   exit 0
 fi
 
@@ -1276,8 +1289,8 @@ fi
 if [[ "${1:-}" == "--resume" || "${1:-}" == "-r" ]]; then
   ensure_node_path
   ensure_claude
-  ensure_auth
   first_run_setup
+  ensure_auth
   apply_heimdall_theme 2>/dev/null || true
   print_banner 2>/dev/null || true
 
@@ -1350,8 +1363,8 @@ fi
 if [[ "${1:-}" == "--team" ]]; then
   ensure_node_path
   ensure_claude
-  ensure_auth
   first_run_setup
+  ensure_auth
   apply_heimdall_theme 2>/dev/null || true
   print_banner 2>/dev/null || true
 
@@ -1911,16 +1924,20 @@ complete_first_run_setup() {
   local is_first_run=0
   [ -f "$SETUP_MARKER" ] || is_first_run=1
 
-  # 1. AUTH — must resolve before any plugin install (installs may hit the API).
-  ensure_auth
-  _trace_order "setup:auth"
+  # ORDERING (the single-pass first-run fix): companion plugins + skills run FIRST
+  # and are DECOUPLED from auth; auth runs LAST and is non-fatal. So ONE `hmd`
+  # leaves the machine fully set up (plugins + marker) even when the user has not
+  # signed in yet — a deferred/^C'd login can no longer abort setup or block the
+  # marker, which is what forced the old two-run dance.
 
-  # 2. COMPANION PLUGINS — caveman / superpowers / claude-mem / marketplace.
-  #    Idempotent + marker-gated inside first_run_setup; touches $SETUP_MARKER.
+  # 1. COMPANION PLUGINS — caveman / superpowers / claude-mem / marketplace.
+  #    git/npm based, need NO Claude auth, so they run first + unconditionally.
+  #    Idempotent + marker-gated inside first_run_setup; touches $SETUP_MARKER on
+  #    success, so the first-run marker is written before we even reach auth.
   first_run_setup
   _trace_order "setup:companion"
 
-  # 3. PROMPT-DRIVEN SKILLS/PLUGINS — only the first run pays the install cost;
+  # 2. PROMPT-DRIVEN SKILLS/PLUGINS — only the first run pays the install cost;
   #    later runs already have the marker, so we skip straight past. This keeps
   #    the "subsequent runs launch directly" contract while guaranteeing first
   #    run completes the full setup before launch.
@@ -1929,6 +1946,14 @@ complete_first_run_setup() {
     discover_skills "$@"
   fi
   _trace_order "setup:skills"
+
+  # 3. AUTH LAST — NON-FATAL / NON-BLOCKING. If not signed in, ensure_auth prints
+  #    the deferred sign-in instruction and returns 0 WITHOUT an interactive login,
+  #    so this single invocation is already fully set up. Auth may expire, so this
+  #    runs every launch, but is a fast no-op once authed. The setup:auth marker
+  #    is still emitted BEFORE persona-check/launch (the F1 ordering contract).
+  ensure_auth
+  _trace_order "setup:auth"
 }
 
 # ── SOURCE TOKEN METER: hmd self-meters its OWN run's usage (see TOKEN-METRIC.md) ─
