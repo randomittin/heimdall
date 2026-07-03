@@ -290,6 +290,12 @@ fi
 REPO_DIR="$(cd "$REPO_DIR" && pwd)"
 [ -n "$REPO_REF" ] || REPO_REF="$(derive_repo_ref "$REPO_DIR")"
 SLUG="$(slugify "$REPO_REF")"
+# SECURITY: SLUG is interpolated into the remote ssh --command; a slug with shell
+# metachars would be command injection on the VM (esp. for untrusted multi-tenant repo
+# slugs). Restrict to a strict allowlist — reject anything else, empty, or dot-dirs.
+case "$SLUG" in
+  ''|.|..|*[!A-Za-z0-9._-]*) echo "heimdall-context-capsule: unsafe repo slug: '$SLUG' (from '$REPO_REF')" >&2; exit 2 ;;
+esac
 
 case "$CMD" in
   build)
@@ -325,6 +331,9 @@ case "$CMD" in
     REMOTE_PATH="$REMOTE_DIR/context.md"
     # The remote command reads the capsule from STDIN into the target (0600), atomic
     # rename. NO capsule content + NO secret on argv — only the non-secret slug/paths.
+    # SECURITY: $SLUG is the only interpolated variable and it is allowlisted above to
+    # [A-Za-z0-9._-] (no shell metachars / quotes / spaces possible), so this interpolation
+    # cannot be command-injected. ~ is left unquoted so the remote shell expands it.
     REMOTE_CMD="mkdir -p $REMOTE_DIR && umask 077 && cat > $REMOTE_PATH.tmp && mv $REMOTE_PATH.tmp $REMOTE_PATH && chmod 600 $REMOTE_PATH"
     SSH_ARGS=(compute ssh "$VM" --zone "$ZONE" --project "$PROJECT")
     [ "$USE_IAP" -eq 1 ] && SSH_ARGS+=(--tunnel-through-iap)
