@@ -75,6 +75,15 @@ import cp_ghinstall  # the PER-TEAM GitHub App INSTALLATION map (POST /team/inst
                      # repo slugs are NON-secret (design §2 — the App private key is the single global
                      # secret, held only by the gated minter). The handler records the caller-team's
                      # install keyed by the server-derived team_id (INV-1); it mints/holds NO token.
+import cp_credforward  # LEAST-PRIVILEGE cred WRITE-FORWARD (POST /team/cred). On the internet-facing
+                      # public surface with the Secret-Manager cred store, the public SA lacks
+                      # secretmanager.admin/create — so register_team_cred does NOT write the secret
+                      # here; it FORWARDS the SIGNED request to the privileged GATED service over an
+                      # authenticated Cloud Run call (the gated runtime SA holds secretmanager.admin),
+                      # and the cred only TRANSITS (never read back, never logged — INV-6). This module
+                      # names NO cred-READ / dispatch symbol; forward_cred_write proxies the WRITE to the
+                      # privileged half over TLS. On the gated service / a local store it is a no-op
+                      # (should_forward_cred_write False) and the direct put_team_cred write runs.
 
 # ── THE CANONICAL PUBLIC ROUTE SET (single source of truth) ─────────────────────────────
 #
@@ -699,13 +708,30 @@ def register_team_cred(identity, request, *, home=None, now=None):
         return (422, {"error": "bad_kind", "team_id": team_id})
     if not isinstance(secret, str) or not secret:
         return (422, {"error": "missing_secret", "team_id": team_id})
-    # REFINED INV-6 (docs/specs/2026-07-03-rr-isolation-invariants.md, clarified 2026-07-04): this is a
-    # WRITE-FORWARD, not a cred READ. put_team_cred WRITES the caller's OWN secret into EXACTLY the
-    # caller's server-derived team_id partition (INV-1 above) and returns only a bool. This surface
-    # NEVER calls a cred READ (get_team_cred/env_for_team) and NEVER dispatches — so a popped public
-    # surface still cannot read ANY cred (its own or another team's) and cannot exec. The write-forward
-    # is the ONLY cred symbol reachable in this module's CODE (the authz-gate test asserts exactly that).
-    if not cp_team_creds.put_team_cred(team_id, kind, secret, home=home):
+    # LEAST-PRIVILEGE WRITE PLACEMENT (the /team/cred 503 fix). On the internet-facing PUBLIC surface
+    # with the Secret-Manager cred store, the public SA (heimdall-cp-public-run@) is DELIBERATELY
+    # least-privilege and holds NO secretmanager.admin/create — so a DIRECT put_team_cred here (which
+    # must CREATE + version a per-team Secret Manager secret) RAISES PermissionDenied and crashed the
+    # handler into a bare 503. We do NOT grant the public SA secret-admin (that would let an
+    # internet-facing surface create arbitrary secrets — the whole point of the two-service split).
+    # Instead we FORWARD the SIGNED request to the privileged GATED service over an authenticated
+    # Cloud Run service-to-service call: the gated handler (runtime SA WITH secretmanager.admin)
+    # re-verifies the SAME Ed25519 signature (§3 chokepoint), re-derives team_id SERVER-SIDE (INV-1),
+    # and does the SM write. The cred only TRANSITS here (INV-6) — never read back, never logged.
+    # forward_cred_write returns the gated (status, body) verbatim on a round-trip, or a STRUCTURED
+    # (502, {error, detail}) on a forward failure — never a bare 503, never the secret.
+    if cp_credforward.should_forward_cred_write():
+        return cp_credforward.forward_cred_write(request)
+    # DIRECT WRITE — the GATED service itself (public flag unset), or a local/self-host store the
+    # running SA CAN write. put_team_cred WRITE-FORWARDS the caller's OWN secret into EXACTLY the
+    # caller's server-derived team_id partition (INV-1) and returns only a bool; this surface NEVER
+    # calls a cred READ (get_team_cred/env_for_team) and NEVER dispatches. A store fault is caught and
+    # surfaced as a STRUCTURED error (never a bare 503, never the secret in the body/log — INV-4).
+    try:
+        stored = cp_team_creds.put_team_cred(team_id, kind, secret, home=home)
+    except Exception as exc:  # noqa: BLE001 — a store fault is a STRUCTURED error, never a crash.
+        return (502, {"error": "store_error", "detail": type(exc).__name__, "team_id": team_id})
+    if not stored:
         return (422, {"error": "store_failed", "team_id": team_id})
     # The response carries ONLY non-secret confirmation — never the secret (INV-4).
     return (200, {"stored": True, "kind": kind,

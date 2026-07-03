@@ -14,6 +14,7 @@ drains the team queue and opens a PR **as the App**. Two W4 deploy decisions tur
 |-----|-------|--------|
 | `HEIMDALL_RR_TENANT_AUTHZ` | `1` | turns ON the multi-tenant authz gate + the `POST /rr-task` enqueue route |
 | `HEIMDALL_TEAM_CRED_STORE` | `secretmanager` | each team's Claude cred (BYOC) lands in its own per-team Secret-Manager secret |
+| `HEIMDALL_GATED_SERVICE_URL` | the gated service URL | **on the public service only** — where `POST /team/cred` forwards its privileged Secret-Manager write (step 3c) |
 
 **Smallest honest MVP.** BYO-credential (each user pays their own Claude tokens via
 `claude setup-token`) + your-repos-first (each user installs the App on **their** repo and enrolls
@@ -106,15 +107,30 @@ The sequence (each step guarded + idempotent — safe to re-run):
    (`heimdall-cp-runtime@…`) is granted `secretAccessor` on each (per-secret IAM, least privilege).
 3. **deploy** — reuses `go-live.sh` (gated rebuild → least-privilege public surface → live boundary
    verify; digest-pinned), then sets `HEIMDALL_RR_TENANT_AUTHZ=1` + `HEIMDALL_TEAM_CRED_STORE=secretmanager`
-   on **both** services.
-4. **byoc** — confirms the store selector is live and grants the runtime SA the role to **create**
-   per-team secrets at enroll time (project-scoped `secretmanager.admin`). Each user's Claude cred
-   lands in its **own** per-team secret; the raw secret only ever lives in Secret Manager.
+   on **both** services (**3b**), then wires the **cred write-forward** (**3c**, see below).
+   - **3c — least-privilege cred write-forward (the `/team/cred` 503 fix).** `POST /team/cred` must
+     **create + version** a per-team Secret Manager secret, which needs `secretmanager.admin`. The
+     internet-facing **public** SA (`heimdall-cp-public-run@…`) is deliberately least-privilege and
+     holds **no** secret-admin — a direct write there raises `PermissionDenied` → a **bare 503**. We
+     do **not** grant the public SA secret-admin (that would let a public surface create arbitrary
+     secrets). Instead the public surface **forwards** the signed `/team/cred` to the **gated**
+     service (which runs as the admin-holding runtime SA and does the write). Step 3c makes the
+     **narrow** grant — `roles/run.invoker` on the **gated service only** — and sets
+     `HEIMDALL_GATED_SERVICE_URL` on the public service so the forward knows the target. The gated
+     handler **re-verifies the same Ed25519 signature** and **re-derives `team_id` server-side**
+     (INV-1); the cred only **transits** the public surface (never read back, never logged — INV-6).
+4. **byoc** — confirms the store selector is live and grants the **gated runtime SA** the role to
+   **create** per-team secrets at enroll time (project-scoped `secretmanager.admin`). The **public**
+   SA is **deliberately NOT** granted this — the write executes on the gated SA via the 3c forward.
+   Each user's Claude cred lands in its **own** per-team secret; the raw secret only ever lives in
+   Secret Manager.
 5. **enroll** — mints `cp-enroll-token` (python3 → stdin → `gcloud`; the value never leaves the pipe,
    so this is safe in CI). Skipped when `--enroll-open` (tokenless+bounded enroll).
 6. **verify** — public reachability (`GET /healthz`, falling back to `GET /readyz` → `200 booted`);
-   an **unsigned** `POST /rr-task` → `401/403` (the signed-enqueue chokepoint holds); a gated route
-   (`POST /dispatch`) → app `404 {no_such_route}` on the public surface (the boundary holds).
+   an **unsigned** `POST /rr-task` → `401/403` (the signed-enqueue chokepoint holds); an **unsigned**
+   `POST /team/cred` → `401/403` (route served, chokepoint holds, **no 5xx handler crash** — the
+   503-fix smoke); a gated route (`POST /dispatch`) → app `404 {no_such_route}` on the public surface
+   (the boundary holds).
 
 **Distribute the enroll token OUT-OF-BAND.** The script never prints it. Read it once, share it
 privately with each onboarding user:
@@ -129,6 +145,47 @@ Also grab the public service URL to hand out:
 gcloud run services describe heimdall-cp-public --region=us-central1 \
   --project=heimdall-cp-prod --format='value(status.url)'
 ```
+
+---
+
+## B.1 Hotfix the LIVE deployment — `/team/cred` 503 (IAM + env only, no full redeploy)
+
+If the public surface is already live and `POST /team/cred` returns a **503 with an empty body**,
+the least-privilege public SA is trying (and failing) to create a Secret Manager secret. Apply the
+step-3c write-forward wiring with three **targeted** `gcloud` commands (no image rebuild needed for
+the IAM + env; the *code* fix ships with the next deploy of the image that contains `cp_credforward`):
+
+```bash
+PROJECT=heimdall-cp-prod
+REGION=us-central1
+
+# 1. resolve the least-privilege public SA + the gated service URL
+PUBLIC_SA=$(gcloud run services describe heimdall-cp-public --region="$REGION" --project="$PROJECT" \
+  --format='value(spec.template.spec.serviceAccountName)')
+GATED_URL=$(gcloud run services describe heimdall-control-plane --region="$REGION" --project="$PROJECT" \
+  --format='value(status.url)')
+
+# 2. NARROW grant: the public SA may INVOKE the gated service ONLY (roles/run.invoker on that
+#    service resource) — NOT secretmanager.admin. This is the whole least-privilege point.
+gcloud run services add-iam-policy-binding heimdall-control-plane --region="$REGION" --project="$PROJECT" \
+  --member="serviceAccount:${PUBLIC_SA}" --role=roles/run.invoker
+
+# 3. point the public surface's /team/cred forward at the gated service
+gcloud run services update heimdall-cp-public --region="$REGION" --project="$PROJECT" \
+  --update-env-vars="HEIMDALL_GATED_SERVICE_URL=${GATED_URL}"
+```
+
+**Verify** (unsigned → the §3 chokepoint, never a 5xx crash):
+
+```bash
+PUBLIC_URL=$(gcloud run services describe heimdall-cp-public --region="$REGION" --project="$PROJECT" --format='value(status.url)')
+curl -s -o /dev/null -w '%{http_code}\n' -X POST "$PUBLIC_URL/team/cred" -H 'Content-Type: application/json' -d '{}'
+# expect 401/403 (route served, chokepoint holds). A 5xx means the code image predates cp_credforward
+# — redeploy the public service on the new image (deploy-public-rr.sh / go-live.sh), then re-run steps 1–3.
+```
+
+The gated runtime SA (`heimdall-cp-runtime@…`) must already hold `secretmanager.admin` (step 4). The
+public SA never gets it — the SM write executes on the gated SA via the forward.
 
 ---
 

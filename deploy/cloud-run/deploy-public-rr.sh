@@ -71,6 +71,7 @@ RUNTIME_SA_OVERRIDE=""   # --runtime-sa <email>; empty ⇒ auto-detect from the 
 RR_AUTHZ_ENV="HEIMDALL_RR_TENANT_AUTHZ"          # =1 turns ON the multi-tenant authz + /rr-task
 TEAM_CRED_STORE_ENV="HEIMDALL_TEAM_CRED_STORE"   # =secretmanager selects the BYOC store
 TEAM_CRED_STORE_VAL="secretmanager"
+GATED_URL_ENV="HEIMDALL_GATED_SERVICE_URL"       # on the PUBLIC service: where /team/cred forwards to
 GH_APP_ID_SECRET="heimdall-gh-app-id"            # non-secret id, held as a secret for parity
 GH_APP_KEY_SECRET="heimdall-gh-app-private-key"  # the App PEM (matches setup-bot.sh)
 ENROLL_SECRET="cp-enroll-token"                  # the /enroll bootstrap-token verifier
@@ -293,6 +294,44 @@ done
 say "  ${RR_AUTHZ_ENV}=1 turns ON the multi-tenant authz gate + POST /rr-task (public enqueue-only, SIGNED)."
 say "  the gated worker drains per-team queues + holds the per-team creds; the public surface writes rows only."
 
+# ── 3c. LEAST-PRIVILEGE cred WRITE-FORWARD wiring (the /team/cred 503 fix) ──────────────────────
+# POST /team/cred must CREATE + version a per-team Secret Manager secret (BYOC). The PUBLIC service
+# runs as the LEAST-PRIVILEGE heimdall-cp-public-run@ SA, which DELIBERATELY holds NO
+# secretmanager.admin/create — so a direct write there raises PermissionDenied and 503s (the live
+# break). We do NOT grant the internet-facing public SA secret-admin (that would let a public surface
+# create arbitrary secrets). Instead the public surface FORWARDS the SIGNED /team/cred to the GATED
+# service (which runs as the admin-holding runtime SA and does the SM write). This step wires exactly
+# that, with a NARROW grant — roles/run.invoker on the GATED service ONLY, never secret-admin:
+#   1. resolve the PUBLIC service's runtime SA + the GATED service's URL.
+#   2. grant the PUBLIC SA roles/run.invoker ON THE GATED SERVICE (service-scoped, not project-wide).
+#   3. set HEIMDALL_GATED_SERVICE_URL on the PUBLIC service so the forward knows the target.
+say "3c. least-privilege cred write-forward: PUBLIC SA -> run.invoker on the GATED service (NOT secret-admin) + ${GATED_URL_ENV}"
+PUBLIC_SA="<UNRESOLVED-PUBLIC-SA>"
+GATED_URL="<UNRESOLVED-GATED-URL>"
+if [ "$DRY" = 1 ]; then
+  show "PUBLIC_SA=\$(gcloud run services describe ${PUBLIC_SERVICE} --region=${REGION} --project=${PROJECT} --format='value(spec.template.spec.serviceAccountName)')   # the least-priv public SA"
+  show "GATED_URL=\$(gcloud run services describe ${GATED_SERVICE} --region=${REGION} --project=${PROJECT} --format='value(status.url)')   # the gated service URL to forward to"
+  show "gcloud run services add-iam-policy-binding ${GATED_SERVICE} --region=${REGION} --project=${PROJECT} --member=\"serviceAccount:\${PUBLIC_SA}\" --role=roles/run.invoker   # NARROW: invoke the gated service ONLY, NOT secret-admin"
+  show "gcloud run services update ${PUBLIC_SERVICE} --region=${REGION} --project=${PROJECT} --update-env-vars=\"${GATED_URL_ENV}=\${GATED_URL}\""
+  say "  (dry-run) the public SA gains ONLY run.invoker on ${GATED_SERVICE}; it NEVER gets secretmanager.admin."
+else
+  PUBLIC_SA="$(gcloud run services describe "$PUBLIC_SERVICE" --region="$REGION" --project="$PROJECT" \
+                --format='value(spec.template.spec.serviceAccountName)' 2>/dev/null || true)"
+  [ -n "$PUBLIC_SA" ] || die "step 3c: could not resolve ${PUBLIC_SERVICE}'s runtime SA — is the public service deployed?"
+  GATED_URL="$(gcloud run services describe "$GATED_SERVICE" --region="$REGION" --project="$PROJECT" \
+                --format='value(status.url)' 2>/dev/null || true)"
+  [ -n "$GATED_URL" ] || die "step 3c: could not resolve ${GATED_SERVICE}'s URL — is the gated service deployed?"
+  say "  public SA=${PUBLIC_SA}; gated URL=${GATED_URL}"
+  # NARROW grant: run.invoker on the GATED SERVICE resource ONLY (service-scoped IAM, least privilege).
+  run gcloud run services add-iam-policy-binding "$GATED_SERVICE" --region="$REGION" --project="$PROJECT" \
+    --member="serviceAccount:${PUBLIC_SA}" --role=roles/run.invoker
+  # Point the public surface's forward at the gated service.
+  run gcloud run services update "$PUBLIC_SERVICE" --region="$REGION" --project="$PROJECT" \
+    --update-env-vars="${GATED_URL_ENV}=${GATED_URL}"
+  say "  ${PUBLIC_SERVICE} now forwards POST /team/cred to ${GATED_SERVICE} over an authenticated Cloud Run call."
+  say "  the public SA holds run.invoker on the gated service ONLY — it can invoke it, NOT create secrets."
+fi
+
 # ════════════════════════════════════════════════════════════════════════════
 # 4. PER-TEAM BYOC STORE — the selector env is set (step 3b). Ensure the runtime
 #    SA can CREATE per-team secrets at enroll time (cp_team_creds writes each
@@ -305,6 +344,9 @@ say "  grant the runtime SA the role to CREATE + version those per-team secrets 
 run gcloud projects add-iam-policy-binding "$PROJECT" \
   --member="serviceAccount:${RUNTIME_SA}" --role=roles/secretmanager.admin
 [ "$DRY" = 1 ] || say "  ${RUNTIME_SA} can now create/version per-team BYOC secrets (project-scoped secretmanager.admin)."
+say "  NOTE: this secretmanager.admin grant is for the GATED runtime SA ONLY. The internet-facing"
+say "  PUBLIC SA is DELIBERATELY NOT granted it — /team/cred forwards to the gated SA (step 3c), so"
+say "  the SM write executes with privilege WITHOUT expanding the public surface's blast radius."
 warn "  NOTE: secretmanager.admin is scoped to project ${PROJECT} ONLY. If you run other secrets"
 warn "  in this project that this SA must NOT manage, put the CP in its own project (recommended)."
 
@@ -378,6 +420,19 @@ case "$RT" in
   401|403|429) say "  ok — unsigned POST /rr-task -> ${RT} (the §3 signed-enqueue chokepoint refuses it)" ;;
   404) die "step 6.1: public POST /rr-task -> 404 — the /rr-task route is NOT being served (is ${RR_AUTHZ_ENV}=1 live?). STOP." ;;
   *)   die "step 6.1: public POST /rr-task -> ${RT}, expected 401/403 — an UNSIGNED enqueue was NOT refused. STOP." ;;
+esac
+
+# 6.1b — the /team/cred route is SERVED + the §3 chokepoint holds (the 503-fix smoke). An UNSIGNED
+# POST /team/cred must be a 401/403 (the signed-write chokepoint), NOT a 404 (route not served) and
+# NOT a 5xx (the handler crashed — the exact live break). A 5xx here means the fix did not take.
+TC="$(curl -s -o /dev/null -w '%{http_code}' -X POST "${PUBLIC_URL}/team/cred" \
+        -H 'Content-Type: application/json' -d '{}' 2>/dev/null || true)"
+say "  public POST /team/cred (unsigned) -> ${TC}"
+case "$TC" in
+  401|403|429) say "  ok — unsigned POST /team/cred -> ${TC} (route served, §3 chokepoint refuses; no handler crash)" ;;
+  404) die "step 6.1b: public POST /team/cred -> 404 — the route is NOT being served. STOP." ;;
+  5*)  die "step 6.1b: public POST /team/cred -> ${TC} (5xx) — the handler CRASHED (the 503 fix did not take: is ${GATED_URL_ENV} set + run.invoker granted? see step 3c). STOP." ;;
+  *)   die "step 6.1b: public POST /team/cred -> ${TC}, expected 401/403 — an UNSIGNED write was NOT refused. STOP." ;;
 esac
 
 # 6.2 — the boundary holds: a gated route (POST /dispatch) is 404 on the public surface,

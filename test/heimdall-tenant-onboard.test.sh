@@ -60,7 +60,14 @@ mkdir -p "$HOME_T"
 : >"$CALL_LOG"
 export EXT
 SERVER_PID=""
-cleanup() { [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null || true; rm -rf "$EXT"; }
+GATED_PID=""       # section 8: the FAKE privileged GATED service (writes the cred with admin).
+PUBSM_PID=""       # section 8: the least-priv PUBLIC surface in SECRET-MANAGER mode (forwards).
+cleanup() {
+  for p in "$SERVER_PID" "$GATED_PID" "$PUBSM_PID"; do
+    [ -n "$p" ] && kill "$p" 2>/dev/null || true
+  done
+  rm -rf "$EXT"
+}
 trap cleanup EXIT
 
 # ── the FAKE minter (mirrors heimdall-cp-ghinstall.test.sh): echoes ONLY a deterministic token to
@@ -350,6 +357,218 @@ printf '%s' "$RR_OUT" | grep -q "redacted" && printf '%s' "$RR_OUT" | grep -q "/
   && printf '%s' "$RR_OUT" | grep -q "/team/install" && printf '%s' "$RR_OUT" | grep -q "424242" \
   && ok "7.2 the plan shows the POST /team/cred (redacted) + POST /team/install (id 424242) shape" \
   || bad "7.2 the dry-run plan is missing the redacted-secret / route / install-id markers"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 8. LEAST-PRIVILEGE WRITE-FORWARD (the /team/cred 503 fix). On the internet-facing PUBLIC surface
+#    with the SECRET-MANAGER cred store, the public SA (heimdall-cp-public-run@) lacks
+#    secretmanager.admin/create — a DIRECT put_team_cred would raise PermissionDenied and crash into
+#    a bare 503. The fix: the public surface FORWARDS the SIGNED /team/cred to the privileged GATED
+#    service, which does the SM write with its admin-holding runtime SA. Here we prove the WRITE is
+#    ROUTED to the privileged path (never attempted on the least-priv public SA), the cred lands in
+#    the CALLER's server-derived partition (a spoofed body team_id is ignored), and it never leaks.
+#    Hermetic: a SECOND cp serve (LOCAL store, NO public surface) stands in for the gated service;
+#    HEIMDALL_FORWARD_ID_TOKEN stands in for the Cloud Run metadata ID token (off-Cloud-Run). The
+#    Cloud Run run.invoker bearer is a PLATFORM IAM concern, not an app check — the fake gated
+#    ignores it and re-verifies the SAME Ed25519 signature + re-derives team_id (INV-1).
+# ══════════════════════════════════════════════════════════════════════════════
+echo "8. LEAST-PRIVILEGE WRITE-FORWARD — public-SM /team/cred routes the WRITE to the privileged gated service"
+
+wait_up() {  # $1 = base url; polls /healthz for a 200
+  for _ in $(seq 1 60); do
+    c="$("$PY" - "$1" <<'PY' 2>/dev/null || true
+import sys, urllib.request, urllib.error
+try:
+    print(urllib.request.urlopen(sys.argv[1] + "/healthz", timeout=2).status)
+except urllib.error.HTTPError as e:
+    print(e.code)
+except Exception:
+    print(0)
+PY
+)"
+    [ "$c" = "200" ] && return 0
+    "$PY" -c "import time;time.sleep(0.25)"
+  done
+  return 1
+}
+
+GATED_PORT="$("$PY" -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')"
+GATED_URL="http://127.0.0.1:$GATED_PORT"
+# the FAKE privileged GATED service: NO public surface, LOCAL cred store (stands in for the SM-admin
+# runtime SA that CAN write). It re-verifies the signature, re-derives team_id, WRITES the cred.
+HEIMDALL_TEAM_CRED_STORE=local "$CLI" serve --host 127.0.0.1 --port "$GATED_PORT" --home "$HEIMDALL_HOME" --no-revocation \
+  >"$EXT/gated.out" 2>"$EXT/gated.err" &
+GATED_PID=$!
+
+PUBSM_PORT="$("$PY" -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')"
+PUBSM_URL="http://127.0.0.1:$PUBSM_PORT"
+export PUBSM_URL
+# the least-privilege PUBLIC surface in SECRET-MANAGER mode: it CANNOT create SM secrets, so /team/cred
+# MUST forward. HEIMDALL_FORWARD_ID_TOKEN stands in for the metadata ID token (no metadata server off
+# Cloud Run); HEIMDALL_GATED_SERVICE_URL points the forward at the fake gated service.
+HEIMDALL_PUBLIC_SURFACE=1 HEIMDALL_TEAM_CRED_STORE=secretmanager \
+  HEIMDALL_GATED_SERVICE_URL="$GATED_URL" HEIMDALL_FORWARD_ID_TOKEN="test-id-token" \
+  "$CLI" serve --host 127.0.0.1 --port "$PUBSM_PORT" --home "$HEIMDALL_HOME" --no-revocation \
+  >"$EXT/pubsm.out" 2>"$EXT/pubsm.err" &
+PUBSM_PID=$!
+
+if wait_up "$GATED_URL" && wait_up "$PUBSM_URL"; then
+  ok "8.0 fake GATED (local store, admin stand-in) + PUBLIC-SM (secretmanager, forwarding) surfaces are live"
+else
+  bad "8.0 the gated / public-SM surfaces did not come up"; cat "$EXT/gated.err" "$EXT/pubsm.err" >&2
+fi
+
+D8_OUT="$EXT/driver8.out"; D8_ERR="$EXT/driver8.err"
+"$PY" - >"$D8_OUT" 2>"$D8_ERR" <<'PYEOF'
+import json, os, secrets, sys, time
+import urllib.error, urllib.request
+sys.path.insert(0, os.environ["LIB"])
+import cp_auth as A
+import cp_team_creds as TC
+
+PUBSM = os.environ["PUBSM_URL"].rstrip("/")
+H = os.environ["HEIMDALL_HOME"]
+# team C bound in the SHARED registry; a DIFFERENT team the body will try to spoof.
+SC = secrets.token_urlsafe(24); tidC = A.derive_team_id(SC)
+SPOOF = A.derive_team_id(secrets.token_urlsafe(24))
+HC = "haid:tenant.carol"
+privC, pubC = A.generate_keypair()
+A.register_key(HC, pubC, team_id=tidC)
+CRED_C = "sk-ant-oat01-" + secrets.token_urlsafe(40)
+
+body = json.dumps({"nonce": secrets.token_hex(16), "ts": int(time.time()),
+                   "kind": "oauth_token", "secret": CRED_C, "team_id": SPOOF}).encode("utf-8")
+req = urllib.request.Request(PUBSM + "/team/cred", data=body, method="POST")
+req.add_header("Content-Type", "application/json")
+req.add_header("X-Heimdall-HAID", HC)
+req.add_header("X-Heimdall-Signature", A.sign(privC, A.canonical_message("POST", "/team/cred", body)))
+try:
+    with urllib.request.urlopen(req, timeout=10) as r:
+        st = r.status; resp = json.loads(r.read() or b"{}")
+except urllib.error.HTTPError as e:
+    st = e.code
+    try:
+        resp = json.loads(e.read() or b"{}")
+    except Exception:
+        resp = {}
+
+out = {}
+out["status"] = st
+out["resp_is_tidC"] = (resp.get("team_id") == tidC)      # server-derived, NOT the spoofed body team.
+out["spoof_not_used"] = (resp.get("team_id") != SPOOF)
+out["resp_no_secret"] = (CRED_C not in json.dumps(resp))
+# the cred landed in C's OWN partition — WRITTEN BY THE GATED process (local store), read back here.
+out["stored_under_C"] = TC.has_cred(tidC, home=H)
+out["not_stored_spoof"] = (TC.has_cred(SPOOF, home=H) is False)
+out["roundtrip_env"] = (TC.env_for_team(tidC, home=H).get("CLAUDE_CODE_OAUTH_TOKEN") == CRED_C)
+
+with open(os.path.join(os.environ["EXT"], "cred_c.secret"), "w") as fh:
+    fh.write(CRED_C)
+with open(os.path.join(os.environ["EXT"], "tid_c.txt"), "w") as fh:
+    fh.write(tidC)
+sys.stdout.write(json.dumps(out))
+PYEOF
+
+if [ ! -s "$D8_OUT" ]; then bad "8.x forward driver produced no output"; cat "$D8_ERR" >&2; fi
+j8() { "$PY" -c "import json;print(json.load(open('$D8_OUT')).get('$1'))" 2>/dev/null; }
+
+[ "$(j8 status)" = "200" ] && [ "$(j8 resp_is_tidC)" = "True" ] && [ "$(j8 spoof_not_used)" = "True" ] \
+  && [ "$(j8 stored_under_C)" = "True" ] && [ "$(j8 not_stored_spoof)" = "True" ] && [ "$(j8 roundtrip_env)" = "True" ] \
+  && ok "8.1 public-SM POST /team/cred FORWARDED the write to the gated service -> stored under the caller's server-derived team (spoofed body team_id IGNORED); env_for_team round-trips" \
+  || bad "8.1 the forward did not land the cred under the caller's own team (see $D8_OUT)"
+
+# the forwarded cred must NEVER appear in EITHER server's log, the response, or the driver summary.
+CRED_C_VAL="$(cat "$EXT/cred_c.secret" 2>/dev/null)"
+LEAK8=0
+grep -qF -- "$CRED_C_VAL" "$EXT/pubsm.out" "$EXT/pubsm.err" "$EXT/gated.out" "$EXT/gated.err" "$D8_OUT" "$D8_ERR" 2>/dev/null && LEAK8=1
+[ "$LEAK8" -eq 0 ] && [ "$(j8 resp_no_secret)" = "True" ] \
+  && ok "8.2 the forwarded cred NEVER appears in the public-SM log, the gated log, the response, or the driver summary (transit-only, INV-6)" \
+  || bad "8.2 the forwarded cred LEAKED into a log/response/summary"
+
+# POSITIVE CONTROL: the cred IS in C's store partition — written by the GATED (privileged) process,
+# proving the WRITE really executed on the privileged path (not the least-priv public SA).
+TID_C="$(cat "$EXT/tid_c.txt" 2>/dev/null)"
+STORE_C="$HEIMDALL_HOME/control-plane/team-creds/$TID_C/oauth_token.json"
+if grep -qF -- "$CRED_C_VAL" "$STORE_C" 2>/dev/null; then
+  ok "8.3 POSITIVE CONTROL: C's cred IS in its own 0600 partition (the GATED privileged write landed via the forward; the leak-grep is real)"
+else
+  bad "8.3 positive control failed — the forwarded write did not reach C's partition ($STORE_C)"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 9. FAIL LOUD, NEVER LEAK — the forward decision logic + a STRUCTURED error (never a bare 503) on any
+#    forward/write failure. In-process (hermetic, no servers): proves should_forward_cred_write routes
+#    correctly, a forward failure is a structured secret-free 502, and a DIRECT store fault in
+#    register_team_cred is surfaced (not raised as the bare-503 crash the live break was).
+# ══════════════════════════════════════════════════════════════════════════════
+echo "9. FAIL LOUD — forward decision routing + STRUCTURED error on failure (never a bare 503, never the secret)"
+D9_OUT="$EXT/driver9.out"; D9_ERR="$EXT/driver9.err"
+"$PY" - >"$D9_OUT" 2>"$D9_ERR" <<'PYEOF'
+import json, os, secrets, socket, sys
+sys.path.insert(0, os.environ["LIB"])
+import cp_auth as A
+import cp_credforward as CF
+import cp_publicsurface as PS
+import cp_team_creds as TC
+
+out = {}
+
+# routing: PUBLIC + SecretManager -> forward; GATED (flag off) -> write in place; local store -> in place.
+os.environ["HEIMDALL_PUBLIC_SURFACE"] = "1"; os.environ["HEIMDALL_TEAM_CRED_STORE"] = "secretmanager"
+out["forward_when_public_sm"] = (CF.should_forward_cred_write() is True)
+os.environ["HEIMDALL_PUBLIC_SURFACE"] = "0"
+out["no_forward_when_gated"] = (CF.should_forward_cred_write() is False)
+os.environ["HEIMDALL_PUBLIC_SURFACE"] = "1"; os.environ["HEIMDALL_TEAM_CRED_STORE"] = "local"
+out["no_forward_when_local"] = (CF.should_forward_cred_write() is False)
+
+req = {"haid": "haid:x", "signature": "sig", "body": b'{"kind":"oauth_token","secret":"unused_secret_x"}'}
+
+# forward UNCONFIGURED (no gated URL) -> structured 502, no crash, no secret.
+os.environ.pop("HEIMDALL_GATED_SERVICE_URL", None)
+st, body = CF.forward_cred_write(req)
+out["unconfigured_502"] = (st == 502 and body.get("error") == "cred_forward_unconfigured")
+
+# forward UNREACHABLE (a closed port) -> structured 502, no crash.
+s = socket.socket(); s.bind(("127.0.0.1", 0)); dead = s.getsockname()[1]; s.close()
+os.environ["HEIMDALL_GATED_SERVICE_URL"] = "http://127.0.0.1:%d" % dead
+os.environ["HEIMDALL_FORWARD_ID_TOKEN"] = "tok"
+st, body = CF.forward_cred_write(req)
+out["unreachable_502"] = (st == 502 and body.get("error") == "cred_forward_unreachable")
+out["no_secret_in_errors"] = ("unused_secret_x" not in json.dumps(body))
+
+# a DIRECT store fault in register_team_cred -> STRUCTURED 502 (not a raised crash / bare 503, no secret).
+os.environ["HEIMDALL_PUBLIC_SURFACE"] = "0"; os.environ["HEIMDALL_TEAM_CRED_STORE"] = "local"
+H = os.environ["HEIMDALL_HOME"]
+Hd = "haid:store.fault"; _priv, pub = A.generate_keypair()
+tid = A.derive_team_id(secrets.token_urlsafe(16))
+A.register_key(Hd, pub, team_id=tid)
+_orig = TC.put_team_cred
+def _boom(*a, **k):
+    raise RuntimeError("simulated SM failure")
+TC.put_team_cred = _boom
+try:
+    st, body = PS.register_team_cred(A.Identity(Hd),
+        {"body": json.dumps({"kind": "oauth_token", "secret": "sekret_value_y"}).encode("utf-8")}, home=H)
+    out["store_fault_structured"] = (st == 502 and body.get("error") == "store_error"
+                                     and "sekret_value_y" not in json.dumps(body))
+except Exception as exc:  # noqa: BLE001 — a RAISED exception here IS the bare-503 bug.
+    out["store_fault_structured"] = False
+    out["store_fault_exc"] = type(exc).__name__
+finally:
+    TC.put_team_cred = _orig
+
+sys.stdout.write(json.dumps(out))
+PYEOF
+
+j9() { "$PY" -c "import json;print(json.load(open('$D9_OUT')).get('$1'))" 2>/dev/null; }
+[ "$(j9 forward_when_public_sm)" = "True" ] && [ "$(j9 no_forward_when_gated)" = "True" ] && [ "$(j9 no_forward_when_local)" = "True" ] \
+  && ok "9.1 forward routing: PUBLIC+SecretManager -> forward to the privileged gated service; GATED or local store -> write in place (never the public SA attempting SM-admin)" \
+  || bad "9.1 should_forward_cred_write routing is wrong (see $D9_OUT)"
+[ "$(j9 unconfigured_502)" = "True" ] && [ "$(j9 unreachable_502)" = "True" ] && [ "$(j9 no_secret_in_errors)" = "True" ] \
+  && ok "9.2 a forward failure (unconfigured / unreachable) returns a STRUCTURED 502 {error,detail} — never a bare 503, never the secret" \
+  || bad "9.2 a forward failure was not a structured, secret-free 502 (see $D9_OUT)"
+[ "$(j9 store_fault_structured)" = "True" ] \
+  && ok "9.3 a DIRECT store fault in register_team_cred returns a STRUCTURED 502 {store_error} (not a raised crash / bare 503, no secret)" \
+  || bad "9.3 a store fault was not surfaced as a structured error (exc=$(j9 store_fault_exc), see $D9_OUT)"
 
 echo
 echo "============================================================"
