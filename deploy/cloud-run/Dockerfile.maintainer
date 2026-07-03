@@ -1,0 +1,149 @@
+# Heimdall MAINTAINER Cloud Run Job image (Arch B — fully-cloud maintainer dispatch).
+#
+# Spec: deploy/cloud-run/MAINTAINER-RUNBOOK.md §3 (Arch B). This image runs the SAME
+# run-to-completion entrypoint as the control-plane image (`heimdall-control-plane
+# run-job`), but ALSO carries the maintainer toolchain the loop shells out to:
+#   • git            — bin/lib/issue_pr.py stages/branches heimdall/* fixes
+#   • gh (GitHub CLI)— bin/lib/issue_pr.py OPENS PRs with it (never pushes main / merges)
+#   • claude (CLI)   — the coder/fix dispatch runs headless `claude` against the
+#                      operator's subscription (CLAUDE_CODE_OAUTH_TOKEN) or the metered
+#                      API key (ANTHROPIC_API_KEY) — injected by env, never baked here
+#   • python3 + pins — the durable Firestore state backend + Cloud Run Jobs execution
+#                      path (identical pins to the control-plane image, see below)
+#
+# The base `heimdall-long-job` / control-plane image (deploy target of the repo-root
+# Dockerfile) deliberately ships NONE of git/gh/claude — so the maintainer Job needs its
+# OWN image. Rather than `FROM` a mutable control-plane tag (unreproducible, and it may
+# not be pullable at build time), this Dockerfile rebuilds from the SAME pinned base
+# (python:3.12-slim) and re-applies the control-plane runtime contract (bash + the exact
+# pinned deps + the non-root user + `COPY bin/` + PATH/HEIMDALL_HOME) so it is fully
+# self-contained and reproducible, then layers the maintainer toolchain on top. Every
+# pin below MUST match the repo-root Dockerfile + deploy/requirements-firestore.txt.
+#
+# Build (from the repo ROOT so `COPY bin/` sees the CLIs; .dockerignore keeps the context
+# lean — only bin/ is copied):
+#   docker build -f deploy/cloud-run/Dockerfile.maintainer \
+#     -t us-central1-docker.pkg.dev/<project>/heimdall/heimdall-maintainer:<tag> .
+# One-command build+push+pin+deploy: deploy/cloud-run/deploy-arch-b.sh (RUNBOOK §3).
+#
+# Layer order is cache-friendly: slow, rarely-changing system/toolchain layers first;
+# the fast-changing `COPY bin/` last, so a bin edit does not re-run apt/npm/pip.
+
+# Base image pinned by minor (3.12 line, slim) — identical to the repo-root Dockerfile.
+FROM python:3.12-slim
+
+# ── System toolchain (git + the runtimes gh/claude need) ─────────────────────
+# bash: heimdall-control-plane + heimdall-maintain-loop are bash CLIs (the slim base
+#   ships dash as /bin/sh, not bash — install it explicitly).
+# git: the maintainer branches + stages fixes (bin/lib/issue_pr.py).
+# ca-certificates + curl + gnupg: fetch + verify the gh and NodeSource apt keyrings
+#   over TLS below. No --no-install-recommends surprises; apt lists cleaned in-layer to
+#   keep the image lean and secret-free.
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y \
+        bash \
+        git \
+        ca-certificates \
+        curl \
+        gnupg \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── GitHub CLI (gh) — the maintainer OPENS PRs with it ───────────────────────
+# Installed from GitHub's OFFICIAL apt repository (the method GitHub documents):
+# fetch their signing key into a dedicated keyring, register the repo pinned to that
+# keyring, then apt-get install. This is a real, verifiable install — not a raw binary
+# download. apt lists cleaned in-layer.
+RUN mkdir -p -m 755 /etc/apt/keyrings \
+    && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+        -o /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+    && chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+        > /etc/apt/sources.list.d/github-cli.list \
+    && apt-get update \
+    && apt-get install --no-install-recommends -y gh \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Node.js (for npm) ────────────────────────────────────────────────────────
+# The claude CLI is distributed on npm (@anthropic-ai/claude-code) exactly as the repo's
+# install.sh installs it (`npm install -g @anthropic-ai/claude-code`), so the image needs
+# a Node runtime. Installed from NodeSource pinned to the 20.x LTS line (reproducible),
+# apt lists cleaned in-layer.
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install --no-install-recommends -y nodejs \
+    && rm -rf /var/lib/apt/lists/* \
+    && node --version && npm --version
+
+# ── claude CLI (headless `claude`) ───────────────────────────────────────────
+# Same package + method as install.sh. Pinnable for reproducible builds via
+# --build-arg CLAUDE_CODE_VERSION=<x.y.z>; defaults to the latest published CLI. The
+# next RUN is a BUILD-TIME GATE that FAILS the build if the CLI is missing or older than
+# install.sh's CLAUDE_MIN (1.0.0) — catching a broken toolchain here, not at Job runtime.
+ARG CLAUDE_CODE_VERSION=latest
+RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
+
+# Toolchain gate: prove git + gh + claude are all present and claude >= CLAUDE_MIN.
+# A missing/old CLI aborts the build (exit 1) rather than shipping an image whose
+# maintainer cycle would fail at Job runtime.
+RUN git --version && gh --version && claude --version \
+    && ver="$(claude --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)" \
+    && min="1.0.0" \
+    && if [ "$(printf '%s\n%s\n' "$min" "$ver" | sort -V | head -1)" != "$min" ]; then \
+         echo "FATAL: claude $ver is older than required $min" >&2; exit 1; \
+       fi \
+    && echo "toolchain OK: git + gh + claude $ver"
+
+# ── Control-plane runtime deps (IDENTICAL pins to the repo-root Dockerfile) ──
+# cryptography: the Ed25519 backend cp_auth.py requires in prod.
+# google-cloud-firestore: the durable Cloud Run state backend (HEIMDALL_STATE_BACKEND=
+#   firestore -> cp_state_firestore.FirestoreBackend).
+# google-cloud-run: the durable EXECUTION path (cp_jobrunner.CloudRunJobRunner.dispatch
+#   -> google.cloud.run_v2.JobsClient.run_job over the runtime SA's ADC).
+# Pins MUST match deploy/requirements-firestore.txt (firestore 2.16.1, run 0.10.19) and
+# the repo-root Dockerfile (cryptography 42.0.8) EXACTLY.
+RUN pip install --no-cache-dir \
+        "cryptography==42.0.8" \
+        "google-cloud-firestore==2.16.1" \
+        "google-cloud-run==0.10.19"
+
+# Build-time dependency guard: import the deps at BUILD time so a missing/incompatible
+# pin FAILS THE BUILD here instead of raising BackendUnavailable on every cp_boot tick
+# (firestore) or returning {dispatched: False} on every dispatch (run_v2) at runtime.
+RUN python -c "import google.cloud.firestore, google.cloud.run_v2, cryptography; print('deps OK')"
+
+# ── Non-root runtime user (Cloud Run best practice; least privilege) ─────────
+# Identical to the repo-root Dockerfile; --home-dir /app so tools resolve $HOME under the
+# app root (we point HOME/CLAUDE_CONFIG_DIR at the writable state dir below).
+RUN groupadd --system heimdall \
+    && useradd --system --gid heimdall --home-dir /app --no-create-home heimdall
+
+WORKDIR /app
+
+# Copy only what the control plane + maintainer loop need: the bin/ CLIs and the
+# bin/lib/ engine. .dockerignore keeps .git, worktrees, tests, and fixtures out of the
+# context — this is the LAST heavy step so a bin edit does not re-run apt/npm/pip.
+COPY bin/ /app/bin/
+
+# Make the CLIs invocable by name and create the writable per-instance state dir (also
+# the runtime user's HOME + claude config dir), owned by the runtime user.
+RUN chmod -R a+rx /app/bin \
+    && mkdir -p /app/state/.claude \
+    && chown -R heimdall:heimdall /app/state
+
+# PATH puts the heimdall bins + the global npm bin (claude) ahead of the system path.
+# HOME/CLAUDE_CONFIG_DIR point at the writable state dir so git + claude can write config
+# as the non-root user. HEIMDALL_HOME is the ephemeral per-instance scratch path.
+ENV PATH="/app/bin:/usr/local/bin:${PATH}" \
+    HOME="/app/state" \
+    CLAUDE_CONFIG_DIR="/app/state/.claude" \
+    HEIMDALL_HOME="/app/state" \
+    PYTHONDONTWRITEBYTECODE="1" \
+    PYTHONUNBUFFERED="1"
+
+USER heimdall
+
+# Default entrypoint mirrors heimdall-maintainer-job.yaml (command: heimdall-control-plane,
+# args: run-job). Each Job EXECUTION overrides args -> run-job,<JOB_ID> (the dispatcher
+# supplies the per-job id), so the container runs `heimdall-control-plane run-job <JOB_ID>`
+# to completion. This is a Job image (no long-lived server / EXPOSE).
+ENTRYPOINT ["heimdall-control-plane"]
+CMD ["run-job"]
