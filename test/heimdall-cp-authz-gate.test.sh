@@ -401,6 +401,99 @@ else
   ok "INV-1 cp_maintainer_runner.py never reads team_id from the request params (grep-clean)"
 fi
 
+# ── MINT-FAILURE DIAGNOSTICS: the drain log finally NAMES the underlying mint cause + TIMES it ──
+#
+# THE PROBLEM (the "debugging blind" incident). A gated-CP drain repeatedly logged
+# `REFUSED reason=mint_mint_failed` / `DENY reason=mint_mint_failed` but NEVER the underlying
+# detail — locally the identical secrets minted fine, so the container failure cause was unknown.
+# GhInstallError carries `code` AND a short SECRET-FREE `detail` (the trimmed minter stderr), but
+# only the code reached the log (and DOUBLE-prefixed: "mint_"+"mint_failed"). We now (a) append the
+# scrubbed detail + (b) a monotonic mint_ms to the REFUSED/DENY LOG LINE (log-only — never the
+# durable retry note), and (c) fix the double-prefix so the reason reads `mint_failed` ONCE.
+# A parametric FAILING minter (exits non-zero with a chosen stderr) drives the real mint path.
+echo
+cat > "$EXT/fail-minter" <<'PYEOF'
+#!/usr/bin/env python3
+import os, sys
+sys.stderr.write(os.environ.get("FAKE_MINT_STDERR", "mint failed") + "\n")
+raise SystemExit(int(os.environ.get("FAKE_MINT_EXIT", "1")))
+PYEOF
+chmod +x "$EXT/fail-minter"
+export FAIL_MINTER="$EXT/fail-minter"
+
+cat > "$EXT/mintfail_fixture.py" <<'PYEOF'
+import json, os, sys, io, contextlib
+sys.path.insert(0, os.environ["LIB"])
+import cp_ghinstall as GH, cp_team_creds as TC, cp_team_queue as TQ
+import cp_maintainer_runner as MR, cp_jobstore as JS
+
+H = os.environ["HEIMDALL_HOME"]
+now = 1_700_000_000.0
+os.environ["HEIMDALL_RR_TENANT_AUTHZ"] = "1"
+out = {}
+
+# A team with a COVERED repo AND a model cred -> the authz gate reaches the MINT step, where the
+# (failing) minter is what denies. team_id is passed server-derived (the drain), no binding needed.
+tidM = "mintfailteamaaaaaaaaaaaaaaaaaaaa"
+GH.set_team_installation(tidM, 9009, "acme/m-repo", home=H)
+TC.put_team_cred(tidM, "oauth_token", "M_OAUTH_SECRET_zzz", home=H)
+
+# Point the mint at the FAILING minter (child inherits os.environ, so FAKE_MINT_* propagate).
+os.environ["HEIMDALL_GH_APP_TOKEN_BIN"] = os.environ["FAIL_MINTER"]
+os.environ["FAKE_MINT_EXIT"] = "1"
+
+def drain_capture():
+    buf = io.StringIO()
+    with contextlib.redirect_stderr(buf):
+        MR.drain_team_queue(tidM, home=H, base_env={}, now=now, policy_name="local",
+                            runner_live=True, cloud_ok=False, grace_seconds=0)
+    return buf.getvalue()
+
+# ── CASE 1: a real minter failure (HTTP 401, multi-line) -> the drain REFUSED/DENY log NAMES the
+#    cause, carries mint_ms=, reads reason=mint_failed ONCE, and creates NO job row.
+os.environ["FAKE_MINT_STDERR"] = ("heimdall-gh-app-token: GitHub returned 401 Bad credentials\n"
+                                  "check the App private key / installation id")
+TQ.enqueue(tidM, "a task whose mint fails with 401", home=H)
+jobs_before = set(JS.list_job_ids(H))
+logA = drain_capture()
+out["case1_no_job"]        = (len(set(JS.list_job_ids(H)) - jobs_before) == 0)
+out["case1_has_mint_ms"]   = ("mint_ms=" in logA)
+out["case1_has_detail"]    = ('detail="' in logA)
+out["case1_names_cause"]   = ("401 Bad credentials" in logA)
+out["case1_reason_single"] = ("reason=mint_failed" in logA and "mint_mint_failed" not in logA)
+out["case1_refused_line"]  = ("REFUSED" in logA)
+
+# ── CASE 2 (SCRUB FALSIFIER): a minter whose stderr carries a token-ish ghs_ run MUST be scrubbed
+#    from the log — <redacted> present, the raw token ABSENT — while detail=/mint_ms= still surface.
+os.environ["FAKE_MINT_STDERR"] = "heimdall-gh-app-token: leaked ghs_DEADBEEFCAFE1234567890 into stderr"
+TQ.enqueue(tidM, "a task whose mint leaks a token-ish string", home=H)
+logB = drain_capture()
+out["case2_token_scrubbed"] = ("ghs_DEADBEEFCAFE1234567890" not in logB)
+out["case2_redacted_shown"] = ("<redacted>" in logB)
+out["case2_still_detail"]   = ('detail="' in logB and "mint_ms=" in logB)
+
+print(json.dumps(out))
+PYEOF
+
+RM="$("$PY" "$EXT/mintfail_fixture.py" 2>"$EXT/mf.err")"
+if [ -s "$EXT/mf.err" ]; then echo "  (mintfail python stderr:)"; sed 's/^/    /' "$EXT/mf.err" >&2; fi
+jm() { printf '%s' "$RM" | "$PY" -c "import json,sys;print(json.load(sys.stdin).get('$1'))" 2>/dev/null; }
+
+[ "$(jm case1_has_mint_ms)" = "True" ] && [ "$(jm case1_has_detail)" = "True" ] \
+  && [ "$(jm case1_names_cause)" = "True" ] && [ "$(jm case1_refused_line)" = "True" ] \
+  && ok "DIAG a mint-failure drain log carries detail= AND mint_ms= AND NAMES the cause (401 Bad credentials) — no longer debugging blind" \
+  || bad "DIAG the mint-failure log lacks detail=/mint_ms=/cause (RM=$RM)"
+[ "$(jm case1_reason_single)" = "True" ] \
+  && ok "DIAG the double-prefix is fixed: the reason reads mint_failed ONCE (never mint_mint_failed)" \
+  || bad "DIAG the reason is still double-prefixed (RM=$RM)"
+[ "$(jm case1_no_job)" = "True" ] \
+  && ok "DIAG a mint failure creates NO job row (fail-closed unchanged — the detail is log-only)" \
+  || bad "DIAG a mint failure leaked a job row (RM=$RM)"
+[ "$(jm case2_token_scrubbed)" = "True" ] && [ "$(jm case2_redacted_shown)" = "True" ] \
+  && [ "$(jm case2_still_detail)" = "True" ] \
+  && ok "DIAG SCRUB FALSIFIER: a ghs_ token-ish run in the minter stderr is <redacted> from the log (raw token absent), detail=/mint_ms= still present" \
+  || bad "DIAG SCRUB FALSIFIER: a token-ish detail was NOT scrubbed from the log (RM=$RM)"
+
 echo
 echo "============================================================"
 printf "heimdall-cp-authz-gate: %d passed, %d failed\n" "$PASS" "$FAIL"
