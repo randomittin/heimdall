@@ -238,6 +238,29 @@ out["drain_made_jobs"] = (len(set(JS.list_job_ids(H)) - jobs_pre) >= 1)
 kt = set(GH.known_team_ids(home=H))
 out["known_teams"] = (tidA in kt and tidB in kt)
 
+# ── DRAIN RETRY SEMANTICS (the never-consume fix) + OBSERVABILITY. A drained task whose
+#    dispatch is REFUSED (arm=None, NO job created) must be RE-QUEUED, never permanently
+#    consumed to `done` — otherwise the content-deterministic re-enqueue no-ops and the
+#    tick drains nothing, silently (the live prod incident). tidC has a COVERED repo but NO
+#    model cred -> the authz gate DENIES no_team_cred (arm=None, no job). Also assert the
+#    drain emits a LOUD per-cycle log line naming the team + the retry outcome.
+import io, contextlib
+SC = "team-secret-C-cccccccccccccccccccccccccccc"
+tidC = A.derive_team_id(SC)
+GH.set_team_installation(tidC, 3003, "acme/c-repo", home=H)   # covered repo, but NO team cred
+TQ.enqueue(tidC, "a task that is refused for lack of a team cred", home=H)
+jobs_before_c = set(JS.list_job_ids(H))
+_buf = io.StringIO()
+with contextlib.redirect_stderr(_buf):
+    drC = MR.drain_team_queue(tidC, home=H, base_env={}, now=now, policy_name="hybrid",
+                              cloud_ok=False, runner_live=False)
+_logtext = _buf.getvalue()
+rowsC = TQ.list(tidC, home=H)
+out["drain_refused_not_done"] = all(r.get("state") != "done" for r in rowsC)
+out["drain_refused_requeued"] = (TQ.depth(tidC, home=H) == 1)          # re-queued, not consumed
+out["drain_refused_no_job"]   = (len(set(JS.list_job_ids(H)) - jobs_before_c) == 0)
+out["drain_logs_cycle"]       = ("drain" in _logtext and tidC[:8] in _logtext)
+
 print(json.dumps(out))
 PYEOF
 
@@ -298,6 +321,13 @@ j() { printf '%s' "$R" | "$PY" -c "import json,sys;print(json.load(sys.stdin).ge
   && [ "$(j drain_untouched_B)" = "True" ] && [ "$(j drain_made_jobs)" = "True" ] && [ "$(j known_teams)" = "True" ] \
   && ok "DRAIN the gated drain picks team A's queue -> dispatches through the gate; B's partition untouched" \
   || bad "DRAIN wiring did not drain A / leaked into B (R=$R)"
+[ "$(j drain_refused_not_done)" = "True" ] && [ "$(j drain_refused_requeued)" = "True" ] \
+  && [ "$(j drain_refused_no_job)" = "True" ] \
+  && ok "RETRY a drain dispatch that is REFUSED (arm=None, no job) is RE-QUEUED, never consumed to done (the silent-drain root-cause fix)" \
+  || bad "RETRY a refused drain task was permanently consumed / made a phantom job (R=$R)"
+[ "$(j drain_logs_cycle)" = "True" ] \
+  && ok "OBSERVABILITY the drain emits a LOUD per-cycle log line naming the team + retry outcome (loud failures over silent degrade)" \
+  || bad "OBSERVABILITY the drain cycle was silent (R=$R)"
 
 # ── INV-6 (REFINED) proof: cp_publicsurface's CODE holds NO cred-READ + NO dispatch symbol ──
 #

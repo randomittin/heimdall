@@ -225,6 +225,13 @@ def _log(msg):
         return
 
 
+def _team_tag(team_id):
+    """A short, log-safe handle for a team_id: its first 8 chars. The team_id is already a
+    non-secret 32-hex derived id (never the team secret), so this is a brevity trim, not a
+    redaction — it keeps drain log lines scannable while naming exactly which partition ran."""
+    return str(team_id if team_id is not None else "")[:8]
+
+
 # ── the self-hosted runner heartbeat (a DISTINCT presence kind — reuse cp_presence) ─
 #
 # The operator's box beats liveness under a presence kind SEPARATE from the team roster, so a
@@ -677,15 +684,31 @@ def drain_team_queue(team_id, *, home=None, base_env=None, now=None, policy_name
     passed straight to dispatch_maintainer_cycle's `team_id`, so the gate authorizes THIS team.
 
     Bounded per pass (INV-7): a per-team fixed-window rate bucket caps dispatch throughput; the
-    sweep stops at the rate cap or when the queue empties. A dispatched task is marked complete
-    in the queue (moved out of the pick pool); a task whose team has no covered repo is skipped
-    (nothing to dispatch against — the queue keeps it for a later tick once an install binds).
+    sweep stops at the rate cap or when the queue empties. A task whose team has no covered repo
+    is skipped (nothing to dispatch against — the queue keeps it for a later tick once an install
+    binds).
 
-    Returns {team_id, processed, task_ids, arms} — the drain outcome for the tick's run log."""
+    THE NEVER-CONSUME-A-FAILED-TASK DISCIPLINE (the silent-drain fix, 2026-07-04). A task is
+    marked complete (done) ONLY when the dispatch DURABLY started work — i.e. a job row exists
+    (outcome.job_id). A dispatch that did NOT durably start work — REFUSED (authz/allowlist deny:
+    arm=None, no job), the job store was unavailable (no job), or the dispatch RAISED — RETURNS
+    the task to the pick pool via cp_team_queue.retry (attempts++), or moves it to the terminal
+    `dead` bucket at the attempts cap. This is why the old bug can't recur: a refused dispatch no
+    longer silently consumes the task to `done` (which the content-deterministic re-enqueue would
+    then no-op), so the warm tick can never again "drain nothing" against a lost task.
+
+    LOUD (observability). Every picked task emits ONE token-free stderr line naming the team,
+    the task id, and the outcome (DISPATCHED arm=/job=, REFUSED reason=, or DISPATCH-RAISED
+    type=) plus the retry/dead result — so a future silent drain is impossible: the logs say why.
+
+    Returns {team_id, processed, task_ids, arms, retried, dead} — the drain outcome for the
+    tick's run log."""
     repos = cp_ghinstall.covered_repos(team_id, home=home)
     if not repos:
+        _log("drain team=%s SKIP reason=no_covered_repo (nothing to dispatch against)"
+             % _team_tag(team_id))
         return {"team_id": team_id, "processed": 0, "task_ids": [], "arms": [],
-                "reason": "no_covered_repo"}
+                "retried": [], "dead": [], "reason": "no_covered_repo"}
     repo = repos[0]   # MVP: one repo per team (design OUT OF SCOPE: multi-repo per team).
     cap = max_dispatch if max_dispatch is not None else _int_env(_DRAIN_MAX_ENV, _DRAIN_MAX_DEFAULT)
     budget = budget_tokens if budget_tokens is not None else _drain_budget_tokens()
@@ -696,6 +719,9 @@ def drain_team_queue(team_id, *, home=None, base_env=None, now=None, policy_name
     processed = 0
     task_ids = []
     arms = []
+    retried = []
+    dead = []
+    seen = set()   # ids handled THIS pass — a retried task must not re-drive within one pass.
     while processed < cap:
         # INV-7 — per-team dispatch-rate cap (keyed on the hashed team_id). Over cap -> stop the
         # sweep (the remaining tasks stay queued, re-drivable next tick).
@@ -705,21 +731,54 @@ def drain_team_queue(team_id, *, home=None, base_env=None, now=None, policy_name
         task = cp_team_queue.pick(team_id, home=home)
         if task is None:
             break   # the partition's queue is drained.
+        tid = task.get("id")
+        if tid in seen:
+            # We wrapped around to a task retry() already returned to `queued` this pass. Defer
+            # it to the NEXT tick WITHOUT burning an attempt (requeue, not retry), then stop —
+            # so one pass can never chew through a task's whole attempts budget in a tight loop.
+            cp_team_queue.requeue(team_id, tid, home=home)
+            break
+        seen.add(tid)
         params = {"repo": repo, "max": 1, "budget_tokens": budget}
-        outcome = dispatch_maintainer_cycle(
-            team_id, params, home=home, base_env=base_env, now=now,
-            policy_name=policy_name, actor_haid=team_id, team_id=team_id,
-            local_runner=local_runner, cloud_runner=cloud_runner,
-            cloud_ok=cloud_ok, runner_live=runner_live,
-            grace_seconds=grace_seconds, claimed=claimed)
-        # The task is handled — record the arm as its verdict and move it out of the pick pool.
-        cp_team_queue.complete(team_id, task.get("id"),
-                               "dispatched:%s" % outcome.get("arm"), home=home)
+        try:
+            outcome = dispatch_maintainer_cycle(
+                team_id, params, home=home, base_env=base_env, now=now,
+                policy_name=policy_name, actor_haid=team_id, team_id=team_id,
+                local_runner=local_runner, cloud_runner=cloud_runner,
+                cloud_ok=cloud_ok, runner_live=runner_live,
+                grace_seconds=grace_seconds, claimed=claimed)
+        except Exception as exc:  # noqa: BLE001 — a dispatch fault must NOT consume the task.
+            # The dispatch raised BEFORE (or without) durably starting work -> retry, never done.
+            # Log ONLY the exception TYPE (never str(exc)/base_env — could carry a token).
+            res = cp_team_queue.retry(
+                team_id, tid, "dispatch raised: %s" % type(exc).__name__, home=home)
+            (dead if res.get("state") == "dead" else retried).append(tid)
+            _log("drain team=%s task=%s DISPATCH-RAISED type=%s -> %s(attempts=%s)"
+                 % (_team_tag(team_id), tid, type(exc).__name__,
+                    res.get("state"), res.get("attempts")))
+            processed += 1
+            task_ids.append(tid)
+            continue
+        # DURABLE work started IFF a job row exists (create_job returned an id). A REFUSED /
+        # job-store-unavailable outcome has NO job_id -> the task is NOT consumed to done.
+        if outcome.get("job_id"):
+            cp_team_queue.complete(team_id, tid,
+                                   "dispatched:%s" % outcome.get("arm"), home=home)
+            arms.append(outcome.get("arm"))
+            _log("drain team=%s task=%s DISPATCHED arm=%s job=%s"
+                 % (_team_tag(team_id), tid, outcome.get("arm"), outcome.get("job_id")))
+        else:
+            reason = outcome.get("reason") or "no_durable_work"
+            res = cp_team_queue.retry(
+                team_id, tid, "dispatch refused: %s" % reason, home=home)
+            (dead if res.get("state") == "dead" else retried).append(tid)
+            _log("drain team=%s task=%s REFUSED reason=%s -> %s(attempts=%s)"
+                 % (_team_tag(team_id), tid, reason,
+                    res.get("state"), res.get("attempts")))
         processed += 1
-        task_ids.append(task.get("id"))
-        arms.append(outcome.get("arm"))
+        task_ids.append(tid)
     return {"team_id": team_id, "processed": processed,
-            "task_ids": task_ids, "arms": arms}
+            "task_ids": task_ids, "arms": arms, "retried": retried, "dead": dead}
 
 
 def drain_all_team_queues(*, home=None, base_env=None, now=None, policy_name=None):

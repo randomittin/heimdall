@@ -97,6 +97,26 @@ _TASK_MAX_CHARS = 4000
 # the requirement is "an oversized or secret-shaped task is trimmed/redacted").
 _REDACTION = "[REDACTED]"
 
+# ── BOUNDED RETRY (the never-permanently-consume-a-failed-task discipline) ──────────
+#
+# WHY THIS EXISTS (the live silent-drain incident, 2026-07-04). The gated drain used to
+# complete() every picked task REGARDLESS of the dispatch outcome. When a dispatch was
+# REFUSED (arm=None, no job created — e.g. the maintainer Job didn't exist yet, or an
+# authz DENY), the task was still moved to `done`. Because the task id is content-
+# deterministic (sha256 of the scrubbed text), the idempotent re-enqueue of the SAME text
+# then no-oped — so the queue had NO pending task, and the warm per-minute tick correctly
+# drained nothing, SILENTLY. The task was permanently lost to a terminal `done` state it
+# never actually reached.
+#
+# THE FIX. A dispatch that did not durably kick off work must RETURN the task to the pick
+# pool (retry), bounded by an `attempts` counter so a deterministically-failing task cannot
+# loop forever — at the cap it moves to a terminal `dead` bucket (gave up, flagged, re-
+# openable) rather than re-queuing endlessly. A fresh enqueue of the same text RE-OPENS a
+# dead task (the operator asking to retry after fixing the root cause). A genuinely-
+# dispatched `done` task is NEVER re-opened (idempotency preserved).
+_MAX_ATTEMPTS_ENV = "HEIMDALL_RR_TASK_MAX_ATTEMPTS"
+_MAX_ATTEMPTS_DEFAULT = 5
+
 
 # ── small helpers ──────────────────────────────────────────────────────────────
 
@@ -145,6 +165,17 @@ def _now_iso():
         .replace(microsecond=0)
         .isoformat()
     )
+
+
+def _max_attempts(explicit=None):
+    """The bounded-retry cap: an explicit positive `explicit` wins; else
+    HEIMDALL_RR_TASK_MAX_ATTEMPTS; else _MAX_ATTEMPTS_DEFAULT. A malformed / non-positive
+    env value falls back to the default (never crashes a retry)."""
+    if isinstance(explicit, int) and explicit > 0:
+        return explicit
+    raw = os.environ.get(_MAX_ATTEMPTS_ENV)
+    parsed = issue_queue._to_int(raw) if raw else 0
+    return parsed if parsed > 0 else _MAX_ATTEMPTS_DEFAULT
 
 
 def _backend(home=None):
@@ -270,13 +301,15 @@ class _PartitionLock:
 
 def _empty_store(team_id):
     """An empty partition record. Buckets: queued (the pick pool, dedup by id), in_flight
-    (claimed by a pick, out of the pick set), done (completed with a verdict)."""
+    (claimed by a pick, out of the pick set), done (dispatched with a verdict), dead (retries
+    exhausted — a terminal bounded-retry state, re-openable by a fresh enqueue)."""
     return {
         "schema_version": _SCHEMA_VERSION,
         "team_id": team_id,
         "queued": {},
         "in_flight": {},
         "done": {},
+        "dead": {},
     }
 
 
@@ -287,7 +320,11 @@ def _load(backend, team_id):
     rec = backend.get_record(_queue_rel(team_id))
     if not isinstance(rec, dict):
         return _empty_store(team_id)
-    for bucket in ("queued", "in_flight", "done"):
+    # MIGRATE forward: a record written before the bounded-retry design lacks the `dead`
+    # bucket. setdefault-ing every bucket (incl. `dead`) heals a partial/old partition to
+    # the current shape WITHOUT a KeyError and without dropping data — an old queue keeps
+    # its queued/in_flight/done items and simply gains an empty dead:{}.
+    for bucket in ("queued", "in_flight", "done", "dead"):
         if not isinstance(rec.get(bucket), dict):
             rec[bucket] = {}
     rec.setdefault("schema_version", _SCHEMA_VERSION)
@@ -310,12 +347,18 @@ def enqueue(team_id, task, *, home=None):
     `task` is a string OR a dict ({text|prompt|body, severity?, priority?}). The task text
     is DATA — scrubbed (secret-redacted) + trimmed (<=_TASK_MAX_CHARS) — and NEVER executed.
 
-    Idempotent: a task whose scrubbed text hashes to an id already known in ANY bucket
-    (queued / in_flight / done) is NOT re-queued — a duplicate enqueue returns added=False.
+    Idempotent: a task whose scrubbed text hashes to an id already known in the queued /
+    in_flight / done buckets is NOT re-queued — a duplicate enqueue returns added=False. A
+    successfully-DISPATCHED (done) task is therefore NEVER re-opened (idempotency preserved).
     Held under the partition lock so two identical concurrent enqueues cannot both win.
 
-    Returns {ok, id, added, team_id}. added=False means a dedup no-op (ok is still True).
-    An empty task (no text after scrub) is refused: {ok: False, reason: 'empty_task'}."""
+    RE-OPEN A DEAD TASK: if the id is in the terminal `dead` bucket (bounded retry exhausted),
+    a fresh enqueue of the same text REVIVES it — moves it back to `queued`, resets attempts
+    to 0, and returns added=True + reopened=True. This is the operator's "I fixed the root
+    cause, retry it" path: a task that gave up is re-drivable by re-submitting the same text.
+
+    Returns {ok, id, added, team_id[, reopened]}. added=False means a dedup no-op (ok is still
+    True). An empty task (no text after scrub) is refused: {ok: False, reason: 'empty_task'}."""
     team_id = _require_team(team_id)
     scrubbed = _scrub_text(_task_text(task))
     if not scrubbed.strip():
@@ -327,10 +370,20 @@ def enqueue(team_id, task, *, home=None):
         "text": scrubbed,
         "priority_signal": _priority_signal(task),
         "created_at": _now_iso(),
+        "attempts": 0,
     }
     backend = _backend(home)
     with _PartitionLock(team_id, home):
         store = _load(backend, team_id)
+        # RE-OPEN: a fresh enqueue of a dead task's text revives it (attempts reset to 0).
+        if tid in store["dead"]:
+            store["dead"].pop(tid, None)
+            store["queued"][tid] = item
+            ok = _save(backend, team_id, store)
+            if not ok:
+                return {"ok": False, "reason": "io_error", "id": tid, "team_id": team_id}
+            return {"ok": True, "id": tid, "added": True, "reopened": True,
+                    "team_id": team_id}
         if tid in store["queued"] or tid in store["in_flight"] or tid in store["done"]:
             return {"ok": True, "id": tid, "added": False, "team_id": team_id}
         store["queued"][tid] = item
@@ -396,11 +449,90 @@ def complete(team_id, id, verdict, *, home=None):
         return {"ok": True, "id": id, "verdict": clean_verdict, "team_id": team_id}
 
 
+def retry(team_id, id, reason=None, *, max_attempts=None, home=None):
+    """RETURN a task whose dispatch did NOT durably start work to the pick pool, bounded by an
+    `attempts` counter — the never-permanently-consume-a-failed-task discipline (the silent-
+    drain fix). Scoped to THIS partition.
+
+    Pops the id from in_flight (the normal path — the task was picked, then its dispatch was
+    refused) or from queued, INCREMENTS its attempts, then:
+      • attempts < cap  -> returns it to `queued` (re-pickable next tick), state='queued';
+      • attempts >= cap -> moves it to the terminal `dead` bucket (bounded — a
+        deterministically-failing task cannot re-queue forever), state='dead'. A dead task is
+        re-openable ONLY by a fresh enqueue of the same text (the operator's explicit retry).
+
+    The cap is _max_attempts(max_attempts) — an explicit positive arg, else
+    HEIMDALL_RR_TASK_MAX_ATTEMPTS, else the default. `reason` is scrubbed (never stores a
+    secret) and kept as the last error for observability. An id unknown in this partition
+    returns {ok: False, reason: 'unknown_id'} — you cannot retry another team's task.
+
+    Returns {ok, id, state, attempts, team_id[, error]}."""
+    team_id = _require_team(team_id)
+    if not id:
+        return {"ok": False, "reason": "no_id", "team_id": team_id}
+    cap = _max_attempts(max_attempts)
+    clean_error = telemetry._scrub(reason) if reason is not None else None
+    backend = _backend(home)
+    with _PartitionLock(team_id, home):
+        store = _load(backend, team_id)
+        rec = store["in_flight"].pop(id, None)
+        item = rec.get("item") if isinstance(rec, dict) else None
+        if item is None:
+            item = store["queued"].pop(id, None)
+        if not isinstance(item, dict):
+            return {"ok": False, "reason": "unknown_id", "id": id, "team_id": team_id}
+        attempts = issue_queue._to_int(item.get("attempts", 0)) + 1
+        item["attempts"] = attempts
+        item["last_error"] = clean_error
+        if attempts >= cap:
+            store["dead"][id] = {"item": item, "reason": clean_error,
+                                 "attempts": attempts, "at": _now_iso()}
+            state = "dead"
+        else:
+            item["retry_at"] = _now_iso()
+            store["queued"][id] = item
+            state = "queued"
+        ok = _save(backend, team_id, store)
+        if not ok:
+            return {"ok": False, "reason": "io_error", "id": id, "team_id": team_id}
+        return {"ok": True, "id": id, "state": state, "attempts": attempts,
+                "error": clean_error, "team_id": team_id}
+
+
+def requeue(team_id, id, *, home=None):
+    """DEFER a claimed (in_flight) task back to `queued` WITHOUT burning an attempt — for a
+    non-failure re-drive (e.g. the drain wrapped around to a task it already handled this pass,
+    or a benign back-pressure defer). Distinct from retry(), which is the FAILURE path that
+    increments attempts toward the dead cap. Scoped to THIS partition.
+
+    Pops the id from in_flight and returns it to queued unchanged. An id already in queued is a
+    no-op success. An id unknown in this partition returns {ok: False, reason: 'unknown_id'}.
+
+    Returns {ok, id, state, team_id}."""
+    team_id = _require_team(team_id)
+    if not id:
+        return {"ok": False, "reason": "no_id", "team_id": team_id}
+    backend = _backend(home)
+    with _PartitionLock(team_id, home):
+        store = _load(backend, team_id)
+        rec = store["in_flight"].pop(id, None)
+        item = rec.get("item") if isinstance(rec, dict) else None
+        if item is None:
+            if id in store["queued"]:
+                return {"ok": True, "id": id, "state": "queued", "team_id": team_id}
+            return {"ok": False, "reason": "unknown_id", "id": id, "team_id": team_id}
+        store["queued"][id] = item
+        ok = _save(backend, team_id, store)
+        if not ok:
+            return {"ok": False, "reason": "io_error", "id": id, "team_id": team_id}
+        return {"ok": True, "id": id, "state": "queued", "team_id": team_id}
+
+
 def list(team_id, *, home=None, cfg=None):  # noqa: A001 — the public API name is `list`.
     """LIST every item in THIS team's partition, queued ones first in pick order (reusing
-    issue_queue.pick_order), then in_flight, then done. Each row is
-    {id, state, item[, verdict]}. Read-only. A list can ONLY ever enumerate this team_id's
-    partition — team B's items live in a different record and never appear here."""
+    issue_queue.pick_order), then in_flight, then done, then dead. Each row is
+    {id, state, item[, verdict|reason]}. Read-only. A list can ONLY ever enumerate this
+    team_id's partition — team B's items live in a different record and never appear here."""
     team_id = _require_team(team_id)
     store = _load(_backend(home), team_id)
     rows = []
@@ -413,6 +545,10 @@ def list(team_id, *, home=None, cfg=None):  # noqa: A001 — the public API name
         rows.append({"id": cid, "state": "done",
                      "item": rec.get("item") if isinstance(rec, dict) else None,
                      "verdict": rec.get("verdict") if isinstance(rec, dict) else None})
+    for cid, rec in store["dead"].items():
+        rows.append({"id": cid, "state": "dead",
+                     "item": rec.get("item") if isinstance(rec, dict) else None,
+                     "reason": rec.get("reason") if isinstance(rec, dict) else None})
     return rows
 
 
