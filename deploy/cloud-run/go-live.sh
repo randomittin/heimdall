@@ -247,7 +247,7 @@ else
     --max-instances=5 --min-instances=1 --cpu=1 --memory=512Mi \
     --timeout=300 --concurrency=80 --port=8080 \
     --no-allow-unauthenticated \
-    --set-secrets="HEIMDALL_CP_PKI_KEY=${GATED_PKI_SECRET}:latest" \
+    --set-secrets="HEIMDALL_CP_PKI_KEY=${GATED_PKI_SECRET}:latest,HEIMDALL_GH_APP_ID=heimdall-gh-app-id:latest,HEIMDALL_GH_APP_PRIVATE_KEY=heimdall-gh-app-private-key:latest" \
     --set-env-vars="HEIMDALL_STATE_BACKEND=firestore,GOOGLE_CLOUD_PROJECT=${PROJECT_ID},HEIMDALL_CP_SERVER_HAID=cp-server,HEIMDALL_JOB_RUNNER=cloudrun-job,HEIMDALL_CP_JOB_NAME=heimdall-maintainer-job" \
     || die "STEP 2: gated redeploy failed — public step 5 would pin a stale digest, aborting."
   say "STEP 2 ok — gated service redeployed on current-main ${HEAD_SHA}"
