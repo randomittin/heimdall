@@ -244,7 +244,7 @@ else
     --region="${REGION}" \
     --project="${PROJECT_ID}" \
     --service-account="${RUNTIME_SA}" \
-    --max-instances=5 --min-instances=0 --cpu=1 --memory=512Mi \
+    --max-instances=5 --min-instances=1 --cpu=1 --memory=512Mi \
     --timeout=300 --concurrency=80 --port=8080 \
     --no-allow-unauthenticated \
     --set-secrets="HEIMDALL_CP_PKI_KEY=${GATED_PKI_SECRET}:latest" \
