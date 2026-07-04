@@ -74,7 +74,11 @@ if [ "$DRY" != 1 ]; then
   need gh "install GitHub CLI (https://cli.github.com)"
   if [ "$MODE" != "local" ]; then
     need gcloud "install the Google Cloud SDK"
-    need docker "install Docker (needed to build the maintainer image)"
+    # NO docker here: this script never builds locally. Arch B's image is built + pushed +
+    # digest-pinned UPSTREAM by deploy-arch-b.sh (via docker/Cloud Build on the operator box),
+    # and --cloud mode only does `gcloud run jobs replace` + IAM + secret mint against that
+    # already-pinned image (the manifest-digest gate below refuses an un-pinned sentinel).
+    # Requiring docker here falsely blocked the arch-b -> deploy-maintainer.sh --cloud handoff.
     gcloud auth print-access-token >/dev/null 2>&1 || die "run: gcloud auth login"
   fi
 fi

@@ -26,5 +26,18 @@ printf '%s' "$OUT2" | grep -q 'SECRET-XYZ' && bad "token value leaked to stdout"
 # 4. --local mode omits gcloud from the plan's Arch-A section start
 OUT3="$(bash "$S" --dry-run --local --repo acme/widgets 2>&1)"; printf '%s' "$OUT3" | grep -q 'Arch A' && ok "local mode plans Arch A" || bad "local mode missing"
 
+# 5. --cloud preflight needs NO docker (image built + pinned upstream by arch-b; this script
+#    only does jobs-replace + IAM + secret mint). Non-dry cloud run with fake claude/gh/gcloud
+#    on PATH but docker ABSENT must PASS preflight and reach token collection — never die on
+#    "missing 'docker'". Falsifiable: reintroducing `need docker` makes preflight die instead.
+FAKEBIN="$(mktemp -d)"
+for t in claude gh gcloud; do printf '#!/usr/bin/env bash\nexit 0\n' > "$FAKEBIN/$t"; chmod +x "$FAKEBIN/$t"; done
+# docker is deliberately absent from FAKEBIN — it must NOT be required by cloud preflight.
+OUT5="$(PATH="$FAKEBIN:/usr/bin:/bin" bash "$S" --cloud --repo acme/widgets </dev/null 2>&1)"; rc5=$?
+printf '%s' "$OUT5" | grep -q "missing 'docker'" && bad "cloud preflight still requires docker" || ok "cloud preflight requires NO docker"
+# reaching the OAuth mint prompt proves preflight passed (collect_secrets runs only after it).
+printf '%s' "$OUT5" | grep -q 'CLAUDE_CODE_OAUTH_TOKEN' && ok "cloud run passed preflight -> reached token collection (no docker gate)" || bad "cloud run did not reach token collection (blocked before secrets)"
+rm -rf "$FAKEBIN"
+
 echo "──────────"; echo "deploy-maintainer: $P passed, $F failed"
 [ "$F" = 0 ] || exit 1
