@@ -169,6 +169,62 @@ else
   ok "no secret is ever echoed (seed + enroll token stay off every surface)"
 fi
 
+# ── (7) MODE RESOLUTION — a BARE call (no --mode) honors remote.json mode ───────
+# The effective mode is: --mode flag > remote.json .mode > built-in default (vm).
+# So a bare `rr "<task>"` against a remote.json {mode:control-plane} MUST route to
+# the signed POST /rr-task cp path — NOT the gcloud-ssh VM path. (Regression guard:
+# the tab-joined field read collapsed the empty vm/zone/project so mode was lost.)
+cat > "$HOME/.heimdall/remote.json" <<'J'
+{"mode":"control-plane","repo":"acme/widget","vm":"","zone":"","project":""}
+J
+bare_cp="$("$RR" "resolve-from-config task" --dry-run 2>&1 | strip_ansi)"
+if echo "$bare_cp" | grep -q "POST" && echo "$bare_cp" | grep -q "/rr-task"; then
+  ok "bare rr (no --mode) honors remote.json mode=control-plane → signed POST /rr-task"
+else
+  bad "bare cp-mode did not route to the /rr-task plan: $bare_cp"
+fi
+if echo "$bare_cp" | grep -q "gcloud compute ssh"; then
+  bad "cp-mode plan contains 'gcloud compute ssh' (VM path leaked into control-plane)"
+else
+  ok "cp-mode plan NEVER contains 'gcloud compute ssh'"
+fi
+# the capsule must ride the API request BODY (a context field), NEVER an ssh/scp ship.
+cap_body="$(printf '%s\n' "$bare_cp" | grep -o 'body={.*}' | head -n1)"
+if echo "$bare_cp" | grep -qiE 'capsule[^\n]*ship|scp '; then
+  bad "cp-mode ships the context capsule via ssh/scp (must ride the API body)"
+elif echo "$cap_body" | grep -q '"context"'; then
+  ok "context capsule rides the API request body (context field) in cp mode — no SSH"
+else
+  bad "context capsule is not an API field in cp mode: $cap_body"
+fi
+
+# ── (8) --mode vm OVERRIDES remote.json mode=control-plane → ssh plan ───────────
+vm_over="$("$RR" "vm override task" --mode vm --dry-run 2>&1 | strip_ansi)"
+if echo "$vm_over" | grep -q "gcloud compute ssh" && ! echo "$vm_over" | grep -q "/rr-task"; then
+  ok "--mode vm overrides remote.json mode=control-plane → ssh plan"
+else
+  bad "--mode vm did not override to the ssh plan: $vm_over"
+fi
+
+# ── (9) mode=vm config parses correct fields; --mode control-plane overrides it ─
+# Proves the per-line parse keeps vm/zone/project positional (no collapse): the ssh
+# plan targets the CONFIGURED vm-x, not a shifted repo slug.
+cat > "$HOME/.heimdall/remote.json" <<'J'
+{"mode":"vm","repo":"acme/widget","vm":"vm-x","zone":"z-x","project":"p-x"}
+J
+bare_vm="$("$RR" "vm config task" --dry-run 2>&1 | strip_ansi)"
+if echo "$bare_vm" | grep -q "gcloud compute ssh vm-x" && ! echo "$bare_vm" | grep -q "/rr-task"; then
+  ok "bare rr honors remote.json mode=vm → ssh plan with CONFIGURED fields (no field-collapse)"
+else
+  bad "bare vm-mode did not route to ssh vm-x (field-collapse regression?): $bare_vm"
+fi
+cp_over="$("$RR" "cp override task" --mode control-plane --dry-run 2>&1 | strip_ansi)"
+if echo "$cp_over" | grep -q "/rr-task" && ! echo "$cp_over" | grep -q "gcloud compute ssh"; then
+  ok "--mode control-plane overrides remote.json mode=vm → signed POST /rr-task"
+else
+  bad "--mode control-plane did not override the vm config: $cp_over"
+fi
+
 echo
 echo "════════════════════════════════════════════════════════════════════════════"
 printf "rr-cp: \033[32m%d passed\033[0m, " "$PASS"

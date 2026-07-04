@@ -166,10 +166,21 @@ except Exception:
 def g(k, dv=""):
     v = d.get(k)
     return str(v) if v is not None else dv
-print("\t".join([g("vm"), g("zone"), g("project"), g("repo"), g("mode", "vm")]))
+for _v in (g("vm"), g("zone"), g("project"), g("repo"), g("mode", "vm")):
+    print(_v)
 PYEOF
 )" || return 1
-  IFS=$'\t' read -r r_vm r_zone r_project r_repo r_mode <<<"$vals"
+  # Read each field on its OWN line with `IFS= read` so EMPTY fields are preserved
+  # POSITIONALLY. A single tab-joined line + `IFS=$'\t' read` would COLLAPSE leading/
+  # adjacent empties (tab is IFS-whitespace): in control-plane mode vm/zone/project
+  # are "", so repo shifted into r_vm and mode into r_zone — silently dropping
+  # mode=control-plane and making a bare `rr "<task>"` fall through to the VM path.
+  { IFS= read -r r_vm
+    IFS= read -r r_zone
+    IFS= read -r r_project
+    IFS= read -r r_repo
+    IFS= read -r r_mode
+  } <<<"$vals"
   [ -n "$r_vm" ]      && CFG_VM="$r_vm"
   [ -n "$r_zone" ]    && CFG_ZONE="$r_zone"
   [ -n "$r_project" ] && CFG_PROJECT="$r_project"
@@ -369,7 +380,9 @@ dispatch_vm() {
   local remote_cmd; remote_cmd="$(build_remote_cmd)"
   local capsule="$BINDIR/heimdall-context-capsule"
   if [ "$DRY" = 1 ]; then
-    if [ "${RR_NO_CONTEXT:-0}" != 1 ] && [ -x "$capsule" ]; then
+    # capsule-ship-over-SSH is VM-MODE ONLY. In control-plane mode the capsule rides
+    # the signed POST body (dispatch_cp builds it as an API field) — NEVER SSH/scp.
+    if [ "$CFG_MODE" = vm ] && [ "${RR_NO_CONTEXT:-0}" != 1 ] && [ -x "$capsule" ]; then
       plan "$capsule ship --vm $CFG_VM --zone $CFG_ZONE --project $CFG_PROJECT --repo $CFG_REPO   # ship session context so the cloud bot has continuity"
     fi
     say "would hand off to the cloud executor (SSH to $CFG_VM, run the maintainer there, detached):"
@@ -380,7 +393,8 @@ dispatch_vm() {
   # Ship the LOCAL session context capsule so the cloud maintainer has continuity
   # (secret-scrubbed by the capsule; maintain-loop --context auto-detects it). Best-effort:
   # a capsule failure must NOT block the dispatch. Opt out with RR_NO_CONTEXT=1.
-  if [ "${RR_NO_CONTEXT:-0}" != 1 ] && [ -x "$capsule" ]; then
+  # VM-MODE ONLY: control-plane never SSHes — its capsule rides the signed API body.
+  if [ "$CFG_MODE" = vm ] && [ "${RR_NO_CONTEXT:-0}" != 1 ] && [ -x "$capsule" ]; then
     say "shipping local session context to $CFG_VM (continuity for the cloud bot)"
     "$capsule" ship --vm "$CFG_VM" --zone "$CFG_ZONE" --project "$CFG_PROJECT" --repo "$CFG_REPO" \
       || warn "context capsule ship failed (non-fatal — the bot runs without local context)"
