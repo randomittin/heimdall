@@ -782,9 +782,29 @@ def drain_team_queue(team_id, *, home=None, base_env=None, now=None, policy_name
 
 
 def drain_all_team_queues(*, home=None, base_env=None, now=None, policy_name=None):
-    """Drain EVERY dispatchable team's queue once (the gated tick's per-team sweep, §4 drain
-    wiring). Enumerates the teams with a bound installation (cp_ghinstall.known_team_ids) — the
-    only teams a dispatch could authorize — and drains each through the authz gate + per-team
-    env. Returns the list of per-team drain outcomes. A no-op ([]) when no team has an install."""
+    """Drain EVERY team that has queued work once (the gated tick's per-team sweep, §4 drain
+    wiring). Enumerates the UNION of:
+      • the teams that actually HAVE a queued partition (cp_team_queue.known_team_ids) — the
+        partitions a public /rr-task enqueue wrote to, keyed by the caller's SERVER-DERIVED
+        team_id; AND
+      • the teams with a bound GitHub App installation (cp_ghinstall.known_team_ids) — the
+        teams a dispatch can authorize.
+    and drains each through the repo<->team authz gate + per-team env.
+
+    WHY THE UNION (the write-here/read-there drain gap, 2026-07-04). Enumerating ONLY the install
+    set stranded a task whose enqueue-derived team_id was not in it: the enqueue wrote
+    teamq/<team_id>/queue.json but the drain never swept that partition (it scanned the install
+    team, pick() of it returned nothing, processed=0 — the loud tick's teams_scanned counted the
+    install team while the real partition sat unread). Unioning the QUEUE partitions in means
+    EVERY partition that received a write is swept: a queued-but-uninstalled team is enumerated
+    and SKIPped gracefully (no_covered_repo — the task is preserved + VISIBLE + LOUD, never
+    stranded); once an install binds, the SAME queued task drains and is picked. Isolation is
+    unchanged — each drain_team_queue only ever reads ITS OWN partition (INV-2), the team_id is
+    the server-derived partition handle (never a request field, INV-1).
+
+    Returns the list of per-team drain outcomes (sorted, de-duplicated teams). A no-op ([]) when
+    no team has queued work AND no team has an install."""
+    team_ids = set(cp_team_queue.known_team_ids(home=home))
+    team_ids |= set(cp_ghinstall.known_team_ids(home=home))
     return [drain_team_queue(tid, home=home, base_env=base_env, now=now, policy_name=policy_name)
-            for tid in cp_ghinstall.known_team_ids(home=home)]
+            for tid in sorted(team_ids)]

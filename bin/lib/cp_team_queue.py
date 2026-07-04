@@ -558,3 +558,34 @@ def depth(team_id, *, home=None):
     team_id = _require_team(team_id)
     store = _load(_backend(home), team_id)
     return len(store["queued"])
+
+
+def known_team_ids(*, home=None):
+    """The SORTED team_ids that currently have AT LEAST ONE queued (unclaimed) task in their
+    partition — the teams a drain MUST sweep to pick every /rr-task write.
+
+    WHY THIS EXISTS (the write-here/read-there drain gap, 2026-07-04). A public /rr-task enqueue
+    writes to the CALLER'S OWN partition teamq/<team_id>/queue.json (team_id server-derived from
+    the signed binding). The gated drain used to enumerate ONLY the teams with a bound GitHub App
+    installation (cp_ghinstall.known_team_ids) — the INSTALL set. A task whose enqueue-derived
+    team_id was NOT in that install set landed in a partition the drain NEVER swept: the task was
+    invisible (teams_scanned enumerated the install team, pick() of it returned nothing, the real
+    partition was never read). This accessor is the MISSING enumeration source: the drain unions
+    it with the install set so EVERY partition that actually received a write is swept.
+
+    Enumerates the queue store's OWN namespace (backend.list_names(teamq/) → the per-team
+    partition dir names) — the SAME firestore-safe record enumeration cp_ghinstall.known_team_ids
+    and cp_presence use (never backend.path()). A partition dir name IS the team_id (a 32-hex
+    derive_team_id value is slug-identity, exactly as cp_ghinstall keys its records), so it is the
+    partition handle the drain passes straight to pick(). Only NON-EMPTY-queued partitions are
+    returned, so a fully-drained partition (all tasks done/dead) is not needlessly re-swept.
+    Read-only, tolerant: an absent store yields []."""
+    backend = _backend(home)
+    out = set()
+    for name in backend.list_names(_TEAMQ_REL):
+        # `name` is the partition dir (the team_id slug). Load its record and include the team
+        # ONLY when it has queued (pickable) work — a drained/empty partition is skipped.
+        rec = backend.get_record(_queue_rel(name))
+        if isinstance(rec, dict) and isinstance(rec.get("queued"), dict) and rec["queued"]:
+            out.add(name)
+    return sorted(out)
