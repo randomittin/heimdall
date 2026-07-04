@@ -94,8 +94,10 @@ if _HERE not in sys.path:
 #
 # We write straight to sys.stderr with a `cp_jobrunner:` prefix — the SAME mechanism cp_boot
 # uses (cp_boot.py: `sys.stderr.write("cp_boot: ... ")`), so it lands in Cloud Run logs the
-# same way, with no logging-config dependency. We NEVER log env/credentials (a RunJobRequest
-# carries none, and we only ever format the resource name + override args + the exception).
+# same way, with no logging-config dependency. We NEVER log env/credentials: the RunJobRequest
+# DOES carry a per-execution container env override (the storage-identity pin + the per-team cred
+# on the multi-tenant path), but that env rides the request to the API over TLS/ADC only — the log
+# lines format ONLY the resource name + the run-job override args + the exception, never the env.
 
 def _log(msg):
     """Write one LOUD diagnostic line to stderr (Cloud Run captures stderr into the service
@@ -180,6 +182,31 @@ def _storage_identity_env():
         if val is not None and val != "":
             pairs.append((name, val))
     return pairs
+
+
+def _container_env_pairs(base_env=None):
+    """The (name, value) env pairs to apply as a Cloud Run Job execution's PER-EXECUTION container
+    env override. This is the MULTI-TENANT credential seam: the gated per-team drain assembles THAT
+    team's job env — its Claude model cred + its freshly-minted GitHub App install token — as
+    `base_env`, and this execution must run with it (never a fixed single-tenant secret, never
+    another team's). We start from base_env (the per-team env the dispatcher already scrubbed of
+    every OTHER tenant's / the operator's ambient cred), then OVERLAY the dispatching service's
+    STORAGE-IDENTITY env so the write/read-doc invariant still holds by construction (the Job writes
+    the SAME Firestore doc the service reads) regardless of base_env — the storage-identity keys
+    WIN their final value. Values are coerced to str; a None value is dropped (never injected blank).
+    An empty/None base_env reduces to exactly _storage_identity_env() — the single-tenant behavior is
+    byte-unchanged. Built FRESH per call from the caller's base_env, so two teams dispatched through
+    the same runner get two DISTINCT env sets — no cross-tenant leak."""
+    merged = {}
+    if base_env:
+        for name, value in base_env.items():
+            if value is None:
+                continue
+            merged[str(name)] = str(value)
+    # storage-identity OVERRIDES (the write/read-doc fix) — applied last so it wins its own keys.
+    for name, value in _storage_identity_env():
+        merged[name] = value
+    return list(merged.items())
 
 
 class JobRunnerError(RuntimeError):
@@ -369,24 +396,32 @@ class CloudRunJobRunner(JobRunner):
                 container_overrides=[
                     RunJobRequest.Overrides.ContainerOverride(
                         args=["run-job", <job_id>],
-                        env=[EnvVar(<storage-identity var>, <service's value>), ...]),
+                        env=[EnvVar(<per-team cred / storage-identity var>, <value>), ...]),
                 ],
             ),
         )
 
     The container override carries BOTH the `run-job` subcommand AND the job_id as the
-    container's args, so the execution runs `run-job <job_id>` against the durable record. It
-    ALSO propagates the dispatching service's STORAGE-IDENTITY env (HEIMDALL_STATE_BACKEND /
-    HEIMDALL_FIRESTORE_PROJECT / HEIMDALL_FIRESTORE_ROOT / HEIMDALL_FIRESTORE_DATABASE /
-    GOOGLE_CLOUD_PROJECT) as a container ENV override — see STORAGE_IDENTITY_ENVS — so the Job
-    writes its durable `done` to the IDENTICAL Firestore doc the service later reads. Without
-    this, the Job used whatever identity was baked into it at create-time and a drift from the
-    service's deploy-time identity left `done` in a doc the service never polled (the incident).
+    container's args, so the execution runs `run-job <job_id>` against the durable record. Its
+    ENV override (see _container_env_pairs) carries TWO layers, per execution:
+      • the PER-EXECUTION job env `base_env` — on the MULTI-TENANT gated path this is the draining
+        team's Claude model cred + its freshly-minted GitHub App install token (already scrubbed of
+        every other tenant's / the operator's ambient secret), so THIS execution runs with THIS
+        team's cred, never a fixed single-tenant secret baked into the Job and never another team's;
+      • OVERLAID with the dispatching service's STORAGE-IDENTITY env (HEIMDALL_STATE_BACKEND /
+        HEIMDALL_FIRESTORE_PROJECT / HEIMDALL_FIRESTORE_ROOT / HEIMDALL_FIRESTORE_DATABASE /
+        GOOGLE_CLOUD_PROJECT — see STORAGE_IDENTITY_ENVS), which WINS its own keys so the Job writes
+        its durable `done` to the IDENTICAL Firestore doc the service later reads. Without the
+        storage-identity layer, the Job used whatever identity was baked in at create-time and a
+        drift from the service's deploy-time identity left `done` in a doc the service never polled
+        (the incident); without the base_env layer, the gated Job would run with no team cred.
+    The override is built FRESH per dispatch from THIS call's base_env, so two teams dispatched
+    through the same runner get two DISTINCT env sets — no cross-tenant credential leak.
     run_job returns an LRO (long-running operation); we do NOT .result()-block on completion
     — dispatch returns as soon as the execution is CREATED (the flight fix). `build_request`
     constructs the RunJobRequest WITHOUT calling GCP, so tests assert the exact shape (the
-    resource name + the override args) with zero GCP and zero spend; `dispatch` builds the
-    same request and hands it to the client for real in prod.
+    resource name + the override args + the env override) with zero GCP and zero spend; `dispatch`
+    builds the same request and hands it to the client for real in prod.
 
     region/project/job-name are read from env (REGION_ENVS / GOOGLE_CLOUD_PROJECT /
     HEIMDALL_CP_JOB_NAME), set once by the deploy. run_v2 is imported LAZILY inside the client
@@ -423,22 +458,31 @@ class CloudRunJobRunner(JobRunner):
         return "projects/%s/locations/%s/jobs/%s" % (
             self._project, self._region, self._job_name)
 
-    def build_request(self, job_id):
+    def build_request(self, job_id, base_env=None):
         """Construct the run_v2.RunJobRequest for the execution WITHOUT calling GCP — the exact
         request dispatch will hand to the client. run_v2 message construction is purely offline
         (no network), so tests assert the shape (resource name + the ["run-job", job_id]
-        container override) with zero GCP and zero spend, and dispatch shares one source of
-        truth for the request. run_v2 is imported HERE (lazily): only code on the cloudrun-job
-        path ever needs google-cloud-run installed."""
+        container override + the env override) with zero GCP and zero spend, and dispatch shares
+        one source of truth for the request. run_v2 is imported HERE (lazily): only code on the
+        cloudrun-job path ever needs google-cloud-run installed.
+
+        `base_env` is the PER-EXECUTION job env the dispatcher assembled for THIS run — on the
+        multi-tenant gated path it is the draining team's Claude model cred + its minted GitHub App
+        install token (already scrubbed of every other tenant's / the operator's ambient secret).
+        It is threaded into the container ENV override so THIS execution runs with THIS team's cred
+        (never a fixed single-tenant secret baked into the Job, never another team's). base_env=None
+        reduces to the storage-identity-only override (the single-tenant behavior is unchanged)."""
         from google.cloud import run_v2  # lazy: only the prod runner needs google-cloud-run.
-        # STORAGE-IDENTITY ENV PROPAGATION (the write/read doc-path fix): the Job execution
-        # inherits the storage-identity env the dispatching SERVICE resolved, so its durable
-        # `done` lands in the SAME Firestore doc the service reads — by construction, not by
-        # hoping the job-create and service-deploy steps set matching env. Only vars actually
-        # set in this process propagate (an unset var is omitted, never injected blank).
+        # PER-EXECUTION CONTAINER ENV OVERRIDE (_container_env_pairs): base_env (the per-team cred +
+        # minted token — the MULTI-TENANT seam) OVERLAID with the STORAGE-IDENTITY env the dispatching
+        # SERVICE resolved (the write/read doc-path fix — the Job's durable `done` lands in the SAME
+        # Firestore doc the service reads, by construction). Built fresh per call from THIS dispatch's
+        # base_env, so two teams get two DISTINCT env sets — no cross-tenant credential leak. The env
+        # rides the RunJobRequest to the Cloud Run Jobs API over TLS/ADC; it is NEVER logged (dispatch
+        # logs only the resource name + the run-job args), so no credential reaches the log sink.
         env_override = [
             run_v2.EnvVar(name=name, value=value)
-            for name, value in _storage_identity_env()
+            for name, value in _container_env_pairs(base_env)
         ]
         return run_v2.RunJobRequest(
             name=self.job_resource_name(),
@@ -483,7 +527,9 @@ class CloudRunJobRunner(JobRunner):
                     "job_name": self._job_name}
 
         try:
-            request = self.build_request(job_id)
+            # Thread base_env (the per-team cred + minted install token on the multi-tenant path)
+            # into the request's container env override so THIS execution runs with THIS team's cred.
+            request = self.build_request(job_id, base_env=base_env)
         except JobRunnerError as exc:
             _log("ERROR no_project: %s — cannot build RunJobRequest; returning "
                  "dispatched:False, job %s stays queued" % (exc, job_id))
