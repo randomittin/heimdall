@@ -6,19 +6,27 @@
 # This runs the SAME run-to-completion entrypoint as heimdall-long-job
 # (`heimdall-control-plane run-job`); each execution overrides the container args to
 # `run-job,<JOB_ID>` (the dispatcher supplies the per-job id). The difference from
-# heimdall-long-job is (1) an image carrying the maintainer toolchain (git + gh CLI +
-# claude CLI) and (2) the LLM auth + PR-bot secrets mounted as env. See MAINTAINER-RUNBOOK.md.
+# heimdall-long-job is an image carrying the maintainer toolchain (git + gh CLI + claude
+# CLI). See MAINTAINER-RUNBOOK.md.
 #
 # DIGEST-PINNED (required): the `image` below MUST be a content-addressed
 # `...@sha256:<digest>` reference, never a mutable tag — a Job must pin exactly what runs
 # so a re-tag cannot silently change it. Resolve the digest per MAINTAINER-RUNBOOK.md §3.2
-# and paste it in before `gcloud run jobs replace`.
+# and paste it in before `gcloud run jobs replace` (deploy-arch-b.sh does this automatically).
 #
-# BOTH AUTH PATHS: the env block below mounts CLAUDE_CODE_OAUTH_TOKEN (preferred — the
-# operator's subscription, from `claude setup-token`). To use the metered API key
-# INSTEAD, replace that one env entry with the ANTHROPIC_API_KEY block shown commented
-# below. Mount only ONE — the handler prefers OAuth when both are present, but there is no
-# need to provision both. NEVER commit a token value here; these are Secret Manager refs.
+# MULTITENANT LLM/PR AUTH — NOT baked into this base manifest. The per-team LLM token
+# (CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY) and the PR-bot token (HEIMDALL_PR_BOT_TOKEN)
+# are supplied PER EXECUTION by the DISPATCHER's env override (cp_maintainer_runner /
+# CloudRunJobRunner — the other agent's domain), scoped to the team the cycle runs for. They
+# are DELIBERATELY absent below so `gcloud run jobs replace` does NOT fail on secrets that may
+# not exist for every team, and so no single team's token is baked into a shared base Job.
+# NEVER commit a token value here.
+#
+# JOB-NAME ALIGNMENT: cp_jobrunner.CloudRunJobRunner defaults to 'heimdall-long-job'
+# (JOB_NAME_DEFAULT), overridable ONLY via env HEIMDALL_CP_JOB_NAME (JOB_NAME_ENV). This Job
+# is named 'heimdall-maintainer-job', so the control-plane SERVICE that fires the maintainer
+# tick MUST run with HEIMDALL_CP_JOB_NAME=heimdall-maintainer-job (MAINTAINER-RUNBOOK.md §3),
+# else the cycle dispatches to heimdall-long-job (which lacks git/gh/claude) and fails.
 
 apiVersion: run.googleapis.com/v1
 kind: Job
@@ -67,25 +75,11 @@ spec:
                     secretKeyRef:
                       name: cp-pki-key
                       key: latest
-                # ── LLM auth (PREFERRED: OAuth subscription token) — env only, never logged ──
-                - name: CLAUDE_CODE_OAUTH_TOKEN
-                  valueFrom:
-                    secretKeyRef:
-                      name: heimdall-cc-oauth-token
-                      key: latest
-                # ── metered fallback — use INSTEAD of the OAuth block above (mount only one) ──
-                # - name: ANTHROPIC_API_KEY
-                #   valueFrom:
-                #     secretKeyRef:
-                #       name: heimdall-anthropic-api-key
-                #       key: latest
-                # ── the scoped PR bot token: the loop OPENS heimdall/* PRs with it; it never
-                #    pushes main / merges (a human merges). issue_pr.py reads this var. ──
-                - name: HEIMDALL_PR_BOT_TOKEN
-                  valueFrom:
-                    secretKeyRef:
-                      name: heimdall-pr-bot-token
-                      key: latest
+                # ── per-team LLM + PR-bot auth is NOT here (see header) ──────────────────────
+                # CLAUDE_CODE_OAUTH_TOKEN (or ANTHROPIC_API_KEY) and HEIMDALL_PR_BOT_TOKEN are
+                # injected PER EXECUTION by the dispatcher's env override, scoped to the team the
+                # cycle runs for — never baked into this shared base Job (multitenant-safe: a
+                # `jobs replace` here does not depend on any team's token secret existing).
               resources:
                 limits:
                   cpu: "1"

@@ -5,8 +5,10 @@
 #   A. SYNTAX: `bash -n` is clean on deploy-arch-b.sh AND deploy-maintainer.sh (both scripts).
 #   B. DRY-RUN NEEDS NO CREDS: fake gcloud+docker shims that FAIL-on-invoke are prepended to
 #      PATH; the --dry-run run must EXIT 0 and NEVER invoke either (the whole plan is printed).
-#   C. FULL PLAN PRINTED, IN ORDER: AR create -> docker build -> docker push -> digest resolve
-#      (image_summary.digest) -> yaml @sha256 pin -> deploy-maintainer.sh --cloud -> jobs describe.
+#   C. FULL PLAN PRINTED, IN ORDER: AR create -> gcloud builds submit (Cloud Build, -f
+#      Dockerfile.maintainer — NO local docker) -> digest resolve (image_summary.digest) ->
+#      yaml @sha256 pin -> deploy-maintainer.sh --cloud -> jobs describe. The plan runs NO
+#      local `docker build`/`docker push` (the deployability-without-docker guarantee).
 #   D. PIN STEP IS PRESENT: the script backs up the yaml and seds the heimdall-maintainer@sha256
 #      image line in place (grep-provable in the source).
 #   E. REUSE, NOT DUPLICATE: the deploy step delegates to deploy-maintainer.sh --cloud; this
@@ -54,22 +56,28 @@ echo "== C. the FULL Arch-B plan is printed, in order =="
 has() { printf '%s' "$OUT" | grep -qF "$1" && ok "plan shows: $2" || bad "plan MISSING: $2"; }
 hasre() { printf '%s' "$OUT" | grep -qE "$1" && ok "plan shows: $2" || bad "plan MISSING: $2"; }
 hasre 'artifacts repositories create heimdall'                 "b. AR repo create (|| exists)"
-has  'docker build -f'                                         "c. docker build -f Dockerfile.maintainer"
-has  'docker push'                                             "c. docker push to AR"
+has  'gcloud builds submit'                                    "c. Cloud Build submit (no local docker)"
+has  'Dockerfile.maintainer'                                   "c. builds the maintainer Dockerfile via Cloud Build"
 has  "image_summary.digest"                                    "d. digest resolve (image_summary.digest)"
 hasre 'heimdall-maintainer@sha256:'                            "d. yaml image @sha256 pin target"
 has  'deploy-maintainer.sh --cloud'                            "e. REUSE deploy-maintainer.sh --cloud"
 hasre 'run jobs describe heimdall-maintainer-job'              "f. verify jobs describe"
-# ordering: build precedes push precedes pin precedes deploy precedes verify
+# the docker->Cloud Build switch: the plan must NOT run a LOCAL docker build/push (falsifiable:
+# a reverted script that shells out to `$ docker build`/`$ docker push` fails this).
+if printf '%s' "$OUT" | grep -qE '\$ docker (build|push)'; then
+  bad "c. plan still runs LOCAL docker build/push (must build on Cloud Build)"
+else
+  ok "c. plan runs NO local docker build/push (Cloud Build only — deployable without docker)"
+fi
+# ordering: Cloud Build submit precedes digest-pin precedes deploy precedes verify
 order_ok=1
-b=$(printf '%s' "$OUT" | grep -n 'docker build'    | head -1 | cut -d: -f1)
-p=$(printf '%s' "$OUT" | grep -n 'docker push'     | head -1 | cut -d: -f1)
+cb=$(printf '%s' "$OUT" | grep -n 'gcloud builds submit' | head -1 | cut -d: -f1)
 pin=$(printf '%s' "$OUT" | grep -n 'image_summary.digest' | head -1 | cut -d: -f1)
 dep=$(printf '%s' "$OUT" | grep -n 'deploy-maintainer.sh --cloud' | head -1 | cut -d: -f1)
 ver=$(printf '%s' "$OUT" | grep -n 'run jobs describe' | head -1 | cut -d: -f1)
-[ -n "$b" ] && [ -n "$p" ] && [ -n "$pin" ] && [ -n "$dep" ] && [ -n "$ver" ] \
-  && [ "$b" -lt "$p" ] && [ "$p" -lt "$pin" ] && [ "$pin" -lt "$dep" ] && [ "$dep" -lt "$ver" ] || order_ok=0
-[ "$order_ok" = 1 ] && ok "plan order: build < push < digest-pin < deploy < verify" || bad "plan steps out of order (b=$b p=$p pin=$pin dep=$dep ver=$ver)"
+[ -n "$cb" ] && [ -n "$pin" ] && [ -n "$dep" ] && [ -n "$ver" ] \
+  && [ "$cb" -lt "$pin" ] && [ "$pin" -lt "$dep" ] && [ "$dep" -lt "$ver" ] || order_ok=0
+[ "$order_ok" = 1 ] && ok "plan order: cloud-build < digest-pin < deploy < verify" || bad "plan steps out of order (cb=$cb pin=$pin dep=$dep ver=$ver)"
 
 echo "== D. the yaml digest-pin step is present in the source =="
 grep -qE 'cp "\$YAML" "\$\{YAML\}\.bak"' "$ARCHB" && ok "D backs up the manifest before pinning" || bad "D no manifest backup before pin"

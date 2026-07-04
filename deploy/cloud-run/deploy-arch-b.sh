@@ -7,14 +7,16 @@
 # secret logic — deploy-maintainer.sh owns every token: prompted silently, never echoed,
 # stdin-piped to gcloud. No token is ever read, assigned, or printed in THIS script).
 #
-# RUN BY THE OPERATOR (RJ) on his own machine with his gcloud creds + Docker. The agent
-# never runs this. No token is ever handled here — the only secrets in Arch B are minted
-# INSIDE deploy-maintainer.sh.
+# RUN BY THE OPERATOR (RJ) on his own machine with his gcloud creds — NO local Docker: the
+# image is built on Cloud Build (`gcloud builds submit`), never a local docker daemon. The
+# agent never runs this. No token is ever handled here — the only secrets in Arch B are
+# minted INSIDE deploy-maintainer.sh.
 #
 # Order (idempotent, re-runnable, secret-safe):
-#   a. preflight        — gcloud + docker present, authed, project set, files present
+#   a. preflight        — gcloud present, authed, project set, files present (no docker needed)
 #   b. AR repo ensure   — gcloud artifacts repositories create <repo>  (|| already exists)
-#   c. build + push     — docker build -f Dockerfile.maintainer  ->  tag  ->  docker push
+#   c. build + push     — gcloud builds submit (Cloud Build; inline config -f Dockerfile.maintainer)
+#                         -> AR. Cloud Build's worker runs the build + push; no local docker.
 #   d. digest resolve   — gcloud artifacts docker images describe --format image_summary.digest
 #      + PIN            — back up the yaml, then sed the image@sha256 line in place
 #   e. deploy (reuse)   — deploy-maintainer.sh --cloud --repo <r> --project <p> --region <g>
@@ -46,6 +48,7 @@ JOB="heimdall-maintainer-job"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 DOCKERFILE="$HERE/Dockerfile.maintainer"
+DOCKERFILE_REL="${DOCKERFILE#$ROOT/}"   # path to the Dockerfile RELATIVE to the Cloud Build context (ROOT)
 YAML="$HERE/heimdall-maintainer-job.yaml"
 DEPLOY_MAINTAINER="$HERE/deploy-maintainer.sh"
 
@@ -94,8 +97,9 @@ say "a. preflight"
 [ -f "$YAML" ]             || die "job manifest not found: $YAML"
 [ -x "$DEPLOY_MAINTAINER" ] || die "deploy-maintainer.sh not found/executable: $DEPLOY_MAINTAINER (Arch-B prerequisite — see MAINTAINER-RUNBOOK.md §3)"
 if [ "$DRY" != 1 ]; then
+  # gcloud ONLY — the image is built on Cloud Build (`gcloud builds submit`), so no local
+  # docker daemon is required. RJ's machine needs the Cloud SDK + the Cloud Build API enabled.
   need gcloud "install the Google Cloud SDK (https://cloud.google.com/sdk)"
-  need docker "install Docker (needed to build + push the maintainer image)"
   gcloud auth print-access-token >/dev/null 2>&1 || die "run: gcloud auth login"
 fi
 # consistency guard: the yaml's serviceAccountName + GOOGLE_CLOUD_PROJECT reference a
@@ -120,13 +124,30 @@ else
       --repository-format=docker --location="${REGION}" --project="${PROJECT}"
   fi
 fi
-# make the local docker client able to push to this AR host (idempotent).
-run gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
 
-# ── c. build + push the maintainer image ─────────────────────────────────────
-say "c. build + push ${IMAGE}:${TAG}  (context=${ROOT}, -f ${DOCKERFILE})"
-run docker build -f "$DOCKERFILE" -t "${IMAGE}:${TAG}" "$ROOT"
-run docker push "${IMAGE}:${TAG}"
+# ── c. build + push the maintainer image VIA CLOUD BUILD (no local docker) ────
+# `gcloud builds submit --tag` can only build a root-context `Dockerfile`; the maintainer
+# needs a CUSTOM Dockerfile path (deploy/cloud-run/Dockerfile.maintainer). So we hand Cloud
+# Build a minimal inline build config that runs the build on Cloud Build's OWN worker and
+# pushes the result to Artifact Registry (the `images:` block). RJ needs NO local docker —
+# only gcloud + the Cloud Build API. The context is the repo ROOT so `COPY bin/` resolves;
+# .gcloudignore/.dockerignore keep the upload lean.
+say "c. build + push ${IMAGE}:${TAG} via Cloud Build  (context=${ROOT}, -f ${DOCKERFILE_REL})"
+if [ "$DRY" = 1 ]; then
+  run "gcloud builds submit ${ROOT} --project=${PROJECT} --config=<inline cloudbuild.yaml: build -f ${DOCKERFILE_REL} -> ${IMAGE}:${TAG}, images: push to AR>  # Cloud Build worker builds+pushes; NO local docker"
+else
+  CLOUDBUILD_CFG="${TMPDIR:-/tmp}/heimdall-maint-cloudbuild.$$-${RANDOM}.yaml"
+  # minimal config: build the maintainer Dockerfile on Cloud Build, then push to AR (images:).
+  cat > "$CLOUDBUILD_CFG" <<YAML
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args: ["build", "-f", "${DOCKERFILE_REL}", "-t", "${IMAGE}:${TAG}", "."]
+images:
+  - "${IMAGE}:${TAG}"
+YAML
+  run gcloud builds submit "$ROOT" --project="$PROJECT" --config="$CLOUDBUILD_CFG"
+  rm -f "$CLOUDBUILD_CFG"
+fi
 
 # ── d. resolve the pushed digest + PIN it into the yaml ──────────────────────
 say "d. resolve digest + pin into $(basename "$YAML")"
@@ -164,6 +185,14 @@ run "$DEPLOY_MAINTAINER" "${DM_ARGS[@]}"
 # ── f. verify ────────────────────────────────────────────────────────────────
 say "f. verify"
 run gcloud run jobs describe "$JOB" --region="$REGION" --project="$PROJECT"
+
+# ── job-name alignment reminder (dispatcher <-> this manifest) ────────────────
+# cp_jobrunner.CloudRunJobRunner defaults to job name 'heimdall-long-job'
+# (cp_jobrunner.JOB_NAME_DEFAULT), overridable ONLY via env HEIMDALL_CP_JOB_NAME
+# (cp_jobrunner.JOB_NAME_ENV). This manifest deploys '${JOB}', so the CONTROL-PLANE
+# SERVICE that fires the maintainer tick MUST run with HEIMDALL_CP_JOB_NAME=${JOB}, else
+# the cycle dispatches to heimdall-long-job (no git/gh/claude) and fails at runtime.
+warn "dispatcher alignment: set HEIMDALL_CP_JOB_NAME=${JOB} on the control-plane SERVICE that runs the maintainer tick (cp_jobrunner defaults to heimdall-long-job otherwise). See MAINTAINER-RUNBOOK.md §3."
 
 echo
 say "done (Arch B)."
