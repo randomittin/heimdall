@@ -1,0 +1,625 @@
+#!/usr/bin/env python3
+# heimdall-self-improve — the DELIBERATE self-improvement loop for the maintainer.
+#
+# autoresearch (karpathy) applied to Heimdall's OWN capability: after N maintenance
+# cycles, step back and run cheap, BOUNDED experiments on how the maintainer routes
+# and plans work — then keep an improvement ONLY when a measured delta beats a
+# baseline on enough samples. Never vibes. See docs/analysis/autoresearch-distilled.md.
+#
+# The mechanical parts live here (the SKILL — skills/self-improve/SKILL.md — owns the
+# judgement of WHICH hypothesis to run). This CLI is stdlib-only python3, matching the
+# bin/lib house split where the wrapper is thin and the logic is one file.
+#
+# THE LOOP (autoresearch's five invariants, ported):
+#   1. collect  — read .planning/metrics.jsonl task records + optional queue dead/done
+#                 stats; compute the ONE comparable scalar per (task_type,model):
+#                 first-attempt PASS-RATE (+ avg retries, avg wall-secs).
+#   2. hypotheses — cluster failures / model-tier-vs-outcome / retry-reasons into
+#                 testable candidates, each with its measured baseline evidence.
+#   3. experiment start — apply a BOUNDED routing-override variant (the next matching
+#                 tasks get it), snapshot the baseline + the prior override, log OPEN.
+#   4. experiment evaluate — read the post-start metrics for the variant, compute the
+#                 delta, and KEEP iff samples >= min AND delta_pass_rate >= min_delta.
+#                 Otherwise DISCARD and ROLL BACK the override. (the falsifier)
+#   5. the experiment LOG (.planning/experiments.jsonl) is the accumulated knowledge.
+#
+# The evaluator is the recorded task OUTCOMES (from the real gate), never a self-report
+# — the routing change being tested cannot grade its own homework (invariant 4).
+#
+# Usage:
+#   heimdall-self-improve collect     [--repo DIR] [--metrics FILE] [--queue-stats FILE]
+#   heimdall-self-improve hypotheses  [--repo DIR] [--metrics FILE] [--queue-stats FILE]
+#                                     [--min-samples N] [--max-pass-rate FLOAT]
+#   heimdall-self-improve experiment start    --hypothesis ID [--repo DIR]
+#                                     [--min-samples N] [--min-delta FLOAT] [--from JSON|@FILE]
+#   heimdall-self-improve experiment evaluate --id EXP [--repo DIR] [--metrics FILE]
+#   heimdall-self-improve experiment rollback --id EXP [--repo DIR]
+#   heimdall-self-improve status      [--repo DIR]
+#   -h | --help
+#
+# Paths (all under <repo>/.planning, all overridable):
+#   metrics.jsonl           task-outcome records (read).   routing-overrides.json (r/w).
+#   experiments.jsonl       the experiment log (append).   queue-stats.json (read, opt).
+#
+# A task-outcome metric record (one JSON line; non-"task" records are ignored):
+#   {"ts":"...","metric":"task","task_type":"lint","model":"sonnet",
+#    "outcome":"pass"|"fail","retries":0,"wall_secs":42, ...}
+# (schema per agents/heimdall.md "Pattern Learning (SONA-inspired)").
+#
+# Exit status: 0 ok · 2 usage · 3 runtime (bad json / missing input) · 4 no-op (empty).
+
+import argparse
+import json
+import os
+import sys
+import time
+from collections import defaultdict
+
+DEF_MIN_SAMPLES = 3          # min variant observations before a verdict is allowed
+DEF_MIN_DELTA = 0.10         # required pass-rate improvement to KEEP (measured, not vibes)
+DEF_MAX_PASS_RATE = 0.80     # a task_type at/above this pass-rate is "healthy" — no hypo
+SCHEMA_VERSION = 1
+
+
+def _now():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _planning_dir(repo):
+    return os.path.join(repo, ".planning")
+
+
+def _p(repo, name):
+    return os.path.join(_planning_dir(repo), name)
+
+
+def _die(msg, code=3):
+    sys.stderr.write("error: %s\n" % msg)
+    raise SystemExit(code)
+
+
+def _read_jsonl(path):
+    """Tolerant JSONL reader: skip blank lines, hard-fail on malformed content."""
+    out = []
+    if not path or not os.path.exists(path):
+        return out
+    with open(path, "r", encoding="utf-8") as fh:
+        for i, line in enumerate(fh, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(json.loads(line))
+            except (ValueError, TypeError):
+                _die("malformed JSON at %s:%d" % (path, i))
+    return out
+
+
+def _append_jsonl(path, rec):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(rec, sort_keys=True) + "\n")
+
+
+def _read_json(path, default=None):
+    if not path or not os.path.exists(path):
+        return default
+    with open(path, "r", encoding="utf-8") as fh:
+        txt = fh.read().strip()
+    if not txt:
+        return default
+    try:
+        return json.loads(txt)
+    except (ValueError, TypeError):
+        _die("malformed JSON in %s" % path)
+
+
+def _write_json(path, obj):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps(obj, indent=2, sort_keys=True) + "\n")
+    os.replace(tmp, path)
+
+
+def _resolve_from(spec):
+    """--from accepts inline JSON or @file (like the maintain loop's --config)."""
+    if spec is None:
+        return None
+    if spec.startswith("@"):
+        return _read_json(spec[1:]) or {}
+    try:
+        return json.loads(spec)
+    except (ValueError, TypeError):
+        _die("--from must be JSON or @FILE, got: %r" % spec, 2)
+
+
+# ── aggregation: the ONE comparable scalar per (task_type, model) ─────────────
+
+def _task_records(metrics_path, since_ts=None):
+    recs = []
+    for r in _read_jsonl(metrics_path):
+        if not isinstance(r, dict) or r.get("metric") != "task":
+            continue
+        if not r.get("task_type") or not r.get("model"):
+            continue
+        if since_ts is not None and str(r.get("ts", "")) < since_ts:
+            continue
+        recs.append(r)
+    return recs
+
+
+def _aggregate(recs):
+    """(task_type, model) -> {samples, passes, pass_rate, avg_retries, avg_secs}."""
+    acc = defaultdict(lambda: {"samples": 0, "passes": 0, "retries": 0, "secs": 0.0})
+    for r in recs:
+        key = (r["task_type"], r["model"])
+        a = acc[key]
+        a["samples"] += 1
+        if str(r.get("outcome", "")).lower() == "pass":
+            a["passes"] += 1
+        a["retries"] += int(r.get("retries", 0) or 0)
+        a["secs"] += float(r.get("wall_secs", 0) or 0)
+    out = {}
+    for (tt, model), a in acc.items():
+        n = a["samples"]
+        out[(tt, model)] = {
+            "task_type": tt,
+            "model": model,
+            "samples": n,
+            "passes": a["passes"],
+            "pass_rate": round(a["passes"] / n, 4) if n else 0.0,
+            "avg_retries": round(a["retries"] / n, 4) if n else 0.0,
+            "avg_secs": round(a["secs"] / n, 2) if n else 0.0,
+        }
+    return out
+
+
+# Cheaper-tier ladder: an experiment either escalates a failing tier or tries a
+# cheaper tier when a type always passes (the two moves agents/heimdall.md calls out).
+_TIER_ORDER = ["haiku", "sonnet", "opus"]
+
+
+def _escalate(model):
+    if model in _TIER_ORDER and _TIER_ORDER.index(model) < len(_TIER_ORDER) - 1:
+        return _TIER_ORDER[_TIER_ORDER.index(model) + 1]
+    return None
+
+
+def _cheapen(model):
+    if model in _TIER_ORDER and _TIER_ORDER.index(model) > 0:
+        return _TIER_ORDER[_TIER_ORDER.index(model) - 1]
+    return None
+
+
+# ── collect ───────────────────────────────────────────────────────────────────
+
+def cmd_collect(args):
+    metrics = args.metrics or _p(args.repo, "metrics.jsonl")
+    qstats = args.queue_stats or _p(args.repo, "queue-stats.json")
+    agg = _aggregate(_task_records(metrics))
+    rows = sorted(agg.values(), key=lambda r: (r["task_type"], r["model"]))
+    queue = _read_json(qstats, default=None)
+    out = {
+        "schema": SCHEMA_VERSION,
+        "generated": _now(),
+        "metrics_path": metrics,
+        "task_types": sorted({r["task_type"] for r in rows}),
+        "cells": rows,
+        "queue_stats": queue,
+        "total_task_records": sum(r["samples"] for r in rows),
+    }
+    print(json.dumps(out, indent=2, sort_keys=True))
+    return 0
+
+
+# ── hypotheses ──────────────────────────────────────────────────────────────────
+
+def _dead_clusters(queue):
+    """Retry/failure-reason clusters from queue dead stats -> review-precheck hypos."""
+    if not isinstance(queue, dict):
+        return []
+    dead = queue.get("dead") or []
+    clusters = []
+    for d in dead:
+        if not isinstance(d, dict):
+            continue
+        reason = d.get("reason")
+        if not reason:
+            continue
+        clusters.append({
+            "reason": reason,
+            "task_type": d.get("task_type"),
+            "count": int(d.get("count", 1) or 1),
+        })
+    clusters.sort(key=lambda c: (-c["count"], c["reason"]))
+    return clusters
+
+
+def cmd_hypotheses(args):
+    metrics = args.metrics or _p(args.repo, "metrics.jsonl")
+    qstats = args.queue_stats or _p(args.repo, "queue-stats.json")
+    min_samples = args.min_samples
+    healthy = args.max_pass_rate
+    agg = _aggregate(_task_records(metrics))
+    queue = _read_json(qstats, default=None)
+
+    hypos = []
+
+    for (tt, model), cell in sorted(agg.items()):
+        if cell["samples"] < min_samples:
+            continue  # not enough evidence — autoresearch invariant: no verdict w/o samples
+        pr = cell["pass_rate"]
+        # (A) failing tier -> escalate. The high-value routing move.
+        if pr < healthy:
+            up = _escalate(model)
+            if up and (tt, up) != (tt, model):
+                hypos.append({
+                    "id": "hyp-esc-%s-%s" % (tt, model),
+                    "kind": "routing",
+                    "subject": tt,
+                    "observation": "%s on %s: pass_rate=%.2f over %d tasks (avg_retries=%.2f)"
+                                   % (tt, model, pr, cell["samples"], cell["avg_retries"]),
+                    "proposal": {"task_type": tt, "from_model": model, "to_model": up},
+                    "rationale": "pass_rate %.2f < healthy %.2f -> escalate tier to cut retries"
+                                 % (pr, healthy),
+                    "baseline": cell,
+                    "expected": "pass_rate up by >= min_delta on next matching tasks",
+                    "testable": True,
+                })
+        # (B) always-passing type -> try a cheaper tier for the same outcome (cost win).
+        elif pr >= 0.99 and cell["avg_retries"] == 0.0:
+            down = _cheapen(model)
+            if down:
+                hypos.append({
+                    "id": "hyp-cheap-%s-%s" % (tt, model),
+                    "kind": "routing",
+                    "subject": tt,
+                    "observation": "%s on %s: pass_rate=1.00 over %d tasks, zero retries"
+                                   % (tt, model, cell["samples"]),
+                    "proposal": {"task_type": tt, "from_model": model, "to_model": down},
+                    "rationale": "flawless on %s -> try cheaper %s, keep only if pass_rate holds"
+                                 % (model, down),
+                    "baseline": cell,
+                    "expected": "pass_rate stays >= baseline on the cheaper tier",
+                    "testable": True,
+                })
+
+    # (C) retry-reason clusters -> non-routing precheck suggestions (surfaced, not auto-applied).
+    for c in _dead_clusters(queue):
+        hypos.append({
+            "id": "hyp-precheck-%s" % c["reason"],
+            "kind": "precheck",
+            "subject": c.get("task_type") or c["reason"],
+            "observation": "%d dead task(s) share reason=%s" % (c["count"], c["reason"]),
+            "proposal": {"add_precheck_for": c["reason"], "task_type": c.get("task_type")},
+            "rationale": "recurring dead-reason cluster -> add a pre-check / .planning/skills pattern",
+            "baseline": {"reason": c["reason"], "count": c["count"]},
+            "expected": "fewer dead tasks with this reason after the precheck lands",
+            "testable": False,  # measured downstream via dead-count, not a routing A/B
+        })
+
+    out = {
+        "schema": SCHEMA_VERSION,
+        "generated": _now(),
+        "min_samples": min_samples,
+        "healthy_pass_rate": healthy,
+        "hypotheses": hypos,
+        "count": len(hypos),
+    }
+    print(json.dumps(out, indent=2, sort_keys=True))
+    return 0
+
+
+# ── routing-overrides.json read/write ──────────────────────────────────────────
+
+def _load_overrides(repo):
+    o = _read_json(_p(repo, "routing-overrides.json"), default=None)
+    if o is None:
+        return {"schema": SCHEMA_VERSION, "overrides": {}}
+    o.setdefault("overrides", {})
+    return o
+
+
+def _save_overrides(repo, o):
+    o["updated"] = _now()
+    _write_json(_p(repo, "routing-overrides.json"), o)
+
+
+# ── experiment start ────────────────────────────────────────────────────────────
+
+def _find_hypothesis(args, hyp_id):
+    """Re-derive the hypothesis set and pick by id (single source of truth)."""
+    ns = argparse.Namespace(repo=args.repo, metrics=None, queue_stats=None,
+                            min_samples=args.min_samples, max_pass_rate=DEF_MAX_PASS_RATE)
+    metrics = _p(args.repo, "metrics.jsonl")
+    qstats = _p(args.repo, "queue-stats.json")
+    ns.metrics, ns.queue_stats = metrics, qstats
+    # rebuild inline (avoid printing): reuse cmd_hypotheses logic via a capture
+    import io
+    buf = io.StringIO()
+    old = sys.stdout
+    sys.stdout = buf
+    try:
+        cmd_hypotheses(ns)
+    finally:
+        sys.stdout = old
+    data = json.loads(buf.getvalue())
+    for h in data["hypotheses"]:
+        if h["id"] == hyp_id:
+            return h
+    return None
+
+
+def cmd_experiment_start(args):
+    override_spec = _resolve_from(args.from_spec)
+    hyp = None
+    if override_spec is None:
+        hyp = _find_hypothesis(args, args.hypothesis)
+        if hyp is None:
+            _die("hypothesis %r not found in current candidates (re-run hypotheses)" % args.hypothesis, 3)
+        if hyp["kind"] != "routing" or not hyp.get("testable"):
+            _die("hypothesis %r is not a testable routing experiment" % args.hypothesis, 3)
+        prop = hyp["proposal"]
+        subject = prop["task_type"]
+        variant_model = prop["to_model"]
+        baseline = hyp["baseline"]
+    else:
+        # explicit override (advanced / non-routing carriers): --from provides the shape.
+        subject = override_spec["task_type"]
+        variant_model = override_spec["to_model"]
+        baseline = override_spec.get("baseline", {"pass_rate": 0.0, "samples": 0})
+
+    ov = _load_overrides(args.repo)
+    prev = ov["overrides"].get(subject)  # for reversibility
+    exp_id = "exp-%s-%s" % (time.strftime("%Y%m%d%H%M%S", time.gmtime()), subject)
+    ov["overrides"][subject] = {
+        "model": variant_model,
+        "reason": "self-improve experiment (unvalidated)",
+        "experiment": exp_id,
+        "status": "open",
+        "applied": _now(),
+    }
+    _save_overrides(args.repo, ov)
+
+    rec = {
+        "id": exp_id,
+        "status": "open",
+        "kind": "routing",
+        "hypothesis_id": args.hypothesis if hyp else "explicit",
+        "subject": subject,
+        "baseline": {
+            "model": baseline.get("model"),
+            "samples": baseline.get("samples", 0),
+            "pass_rate": baseline.get("pass_rate", 0.0),
+            "avg_retries": baseline.get("avg_retries"),
+            "avg_secs": baseline.get("avg_secs"),
+        },
+        "variant": {"model": variant_model},
+        "prev_override": prev,        # None if there was none -> rollback = delete key
+        "threshold": {"min_samples": args.min_samples, "min_delta_pass_rate": args.min_delta},
+        "started_ts": _now(),
+        "decided_ts": None,
+        "result": None,
+    }
+    _append_jsonl(_p(args.repo, "experiments.jsonl"), rec)
+    print(json.dumps({"started": exp_id, "subject": subject,
+                      "variant_model": variant_model,
+                      "override_applied": True,
+                      "reversible": True}, indent=2, sort_keys=True))
+    return 0
+
+
+# ── experiment log helpers ──────────────────────────────────────────────────────
+
+def _experiments(repo):
+    return _read_jsonl(_p(repo, "experiments.jsonl"))
+
+
+def _latest_state(repo, exp_id):
+    """Fold the append-only log to the latest record for exp_id (last write wins)."""
+    latest = None
+    for r in _experiments(repo):
+        if r.get("id") == exp_id:
+            latest = r
+    return latest
+
+
+# ── experiment evaluate — THE FALSIFIER ─────────────────────────────────────────
+
+def cmd_experiment_evaluate(args):
+    exp = _latest_state(args.repo, args.id)
+    if exp is None:
+        _die("experiment %r not found in log" % args.id, 3)
+    if exp.get("status") != "open":
+        _die("experiment %r already decided (%s)" % (args.id, exp.get("status")), 3)
+
+    metrics = args.metrics or _p(args.repo, "metrics.jsonl")
+    subject = exp["subject"]
+    variant_model = exp["variant"]["model"]
+    started = exp["started_ts"]
+    thr = exp["threshold"]
+
+    # ONLY post-start records for the variant on the subject count (bounded, comparable).
+    recs = [r for r in _task_records(metrics, since_ts=started)
+            if r["task_type"] == subject and r["model"] == variant_model]
+    agg = _aggregate(recs).get((subject, variant_model))
+    v_samples = agg["samples"] if agg else 0
+    v_pass_rate = agg["pass_rate"] if agg else 0.0
+    v_retries = agg["avg_retries"] if agg else None
+    base_pr = float(exp["baseline"].get("pass_rate") or 0.0)
+    delta = round(v_pass_rate - base_pr, 4)
+
+    min_samples = int(thr["min_samples"])
+    min_delta = float(thr["min_delta_pass_rate"])
+
+    # THE RULE (autoresearch keep/discard, made falsifiable):
+    #   KEEP iff enough variant samples AND a measured pass-rate delta over baseline.
+    #   No samples, too few, or non-positive delta -> DISCARD + ROLL BACK. Never vibes.
+    if v_samples < min_samples:
+        decision, why = "discard", ("insufficient variant samples: %d < %d (no verdict allowed)"
+                                    % (v_samples, min_samples))
+    elif delta >= min_delta:
+        decision, why = "keep", ("measured pass_rate delta %+.4f >= min_delta %.4f over %d samples"
+                                 % (delta, min_delta, v_samples))
+    else:
+        decision, why = "discard", ("measured pass_rate delta %+.4f < min_delta %.4f (not an improvement)"
+                                    % (delta, min_delta))
+
+    result = {
+        "samples": v_samples,
+        "variant_pass_rate": v_pass_rate,
+        "variant_avg_retries": v_retries,
+        "baseline_pass_rate": base_pr,
+        "delta_pass_rate": delta,
+        "decision": decision,
+        "reason": why,
+    }
+
+    ov = _load_overrides(args.repo)
+    if decision == "keep":
+        cur = ov["overrides"].get(subject)
+        if cur and cur.get("experiment") == args.id:
+            cur["status"] = "validated"
+            cur["reason"] = "self-improve VALIDATED: %s" % why
+            cur["validated"] = _now()
+            cur["delta_pass_rate"] = delta
+            _save_overrides(args.repo, ov)
+        persisted = True
+    else:
+        # ROLL BACK: restore the prior override for the subject (reversibility).
+        cur = ov["overrides"].get(subject)
+        if cur and cur.get("experiment") == args.id:
+            if exp.get("prev_override") is not None:
+                ov["overrides"][subject] = exp["prev_override"]
+            else:
+                del ov["overrides"][subject]
+            _save_overrides(args.repo, ov)
+        persisted = False
+
+    decided = dict(exp)
+    decided["status"] = decision + "ed" if decision == "discard" else "kept"
+    decided["decided_ts"] = _now()
+    decided["result"] = result
+    _append_jsonl(_p(args.repo, "experiments.jsonl"), decided)
+
+    print(json.dumps({"id": args.id, "decision": decision, "persisted": persisted,
+                      "result": result}, indent=2, sort_keys=True))
+    return 0
+
+
+# ── experiment rollback (manual reversal of an open experiment) ─────────────────
+
+def cmd_experiment_rollback(args):
+    exp = _latest_state(args.repo, args.id)
+    if exp is None:
+        _die("experiment %r not found in log" % args.id, 3)
+    subject = exp["subject"]
+    ov = _load_overrides(args.repo)
+    cur = ov["overrides"].get(subject)
+    rolled = False
+    if cur and cur.get("experiment") == args.id:
+        if exp.get("prev_override") is not None:
+            ov["overrides"][subject] = exp["prev_override"]
+        else:
+            del ov["overrides"][subject]
+        _save_overrides(args.repo, ov)
+        rolled = True
+    decided = dict(exp)
+    decided["status"] = "rolledback"
+    decided["decided_ts"] = _now()
+    decided["result"] = {"decision": "rollback", "reason": "manual rollback"}
+    _append_jsonl(_p(args.repo, "experiments.jsonl"), decided)
+    print(json.dumps({"id": args.id, "rolled_back": rolled, "subject": subject},
+                     indent=2, sort_keys=True))
+    return 0
+
+
+# ── status ──────────────────────────────────────────────────────────────────────
+
+def cmd_status(args):
+    ov = _load_overrides(args.repo)
+    # fold log to latest-per-id
+    latest = {}
+    for r in _experiments(args.repo):
+        if r.get("id"):
+            latest[r["id"]] = r
+    exps = sorted(latest.values(), key=lambda r: r.get("started_ts") or "")
+    buckets = defaultdict(int)
+    for e in exps:
+        buckets[e.get("status", "?")] += 1
+    validated = {k: v for k, v in ov.get("overrides", {}).items()
+                 if isinstance(v, dict) and v.get("status") == "validated"}
+    out = {
+        "schema": SCHEMA_VERSION,
+        "generated": _now(),
+        "overrides_active": ov.get("overrides", {}),
+        "validated_overrides": validated,
+        "experiments_by_status": dict(buckets),
+        "open_experiments": [e["id"] for e in exps if e.get("status") == "open"],
+        "total_experiments": len(exps),
+    }
+    print(json.dumps(out, indent=2, sort_keys=True))
+    return 0
+
+
+# ── argv ────────────────────────────────────────────────────────────────────────
+
+def build_parser():
+    ap = argparse.ArgumentParser(
+        prog="heimdall-self-improve",
+        description="Deliberate, falsifiable self-improvement loop for the maintainer "
+                    "(autoresearch applied to Heimdall's own routing/planning).")
+    ap.add_argument("--repo", default=".", help="repo root (default: cwd)")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    c = sub.add_parser("collect", help="aggregate metrics into the comparable scalar")
+    c.add_argument("--metrics"); c.add_argument("--queue-stats", dest="queue_stats")
+    c.set_defaults(fn=cmd_collect)
+
+    h = sub.add_parser("hypotheses", help="emit testable hypothesis candidates")
+    h.add_argument("--metrics"); h.add_argument("--queue-stats", dest="queue_stats")
+    h.add_argument("--min-samples", type=int, default=DEF_MIN_SAMPLES)
+    h.add_argument("--max-pass-rate", type=float, default=DEF_MAX_PASS_RATE,
+                   help="pass-rate at/above which a task_type is healthy (no hypothesis)")
+    h.set_defaults(fn=cmd_hypotheses)
+
+    e = sub.add_parser("experiment", help="start / evaluate / rollback a bounded experiment")
+    esub = e.add_subparsers(dest="ecmd", required=True)
+
+    es = esub.add_parser("start", help="apply a bounded routing-override variant")
+    es.add_argument("--hypothesis", required=True)
+    es.add_argument("--min-samples", type=int, default=DEF_MIN_SAMPLES)
+    es.add_argument("--min-delta", type=float, default=DEF_MIN_DELTA)
+    es.add_argument("--from", dest="from_spec", default=None,
+                    help="explicit override JSON or @FILE (advanced)")
+    es.set_defaults(fn=cmd_experiment_start)
+
+    ev = esub.add_parser("evaluate", help="measure the delta and keep/discard (the falsifier)")
+    ev.add_argument("--id", required=True); ev.add_argument("--metrics")
+    ev.set_defaults(fn=cmd_experiment_evaluate)
+
+    er = esub.add_parser("rollback", help="revert an open experiment's override")
+    er.add_argument("--id", required=True)
+    er.set_defaults(fn=cmd_experiment_rollback)
+
+    s = sub.add_parser("status", help="active overrides + experiment ledger summary")
+    s.set_defaults(fn=cmd_status)
+
+    return ap
+
+
+def main(argv):
+    ap = build_parser()
+    args = ap.parse_args(argv)
+    args.repo = os.path.abspath(args.repo)
+    if not os.path.isdir(args.repo):
+        _die("repo not a directory: %s" % args.repo, 2)
+    return args.fn(args)
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main(sys.argv[1:]))
+    except BrokenPipeError:
+        raise SystemExit(0)

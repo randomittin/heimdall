@@ -106,6 +106,27 @@ Group related small fixes into patch releases:
 5. Create release tag + GitHub release
 6. Clear the release queue
 
+## Self-Improvement (every Nth cycle)
+
+Maintainer mode is not only reactive — it improves its OWN capability over time. After every
+`self_improve.every` completed cycles (default 10), the loop steps back and runs ONE bounded
+self-improvement experiment through the `self-improve` skill (`bin/heimdall-self-improve`):
+
+1. **Collect** the comparable scalar — first-attempt AC pass-rate per `(task_type, model)` — from
+   `.planning/metrics.jsonl` + queue dead/done stats.
+2. **Hypothesize** — escalate a failing tier, cheapen a flawless one, or flag a recurring
+   dead-reason cluster for a pre-check / new `.planning/skills/*.md` pattern.
+3. **Experiment (bounded)** — apply a routing-override variant to `.planning/routing-overrides.json`
+   (which the planner reads for model-tier assignment); the next cycles run the variant.
+4. **Evaluate (measured)** — KEEP the override only if a measured pass-rate delta beats the baseline
+   on enough samples; otherwise **roll it back**. Validated wins land as routing overrides, new
+   `.planning/skills/*.md` patterns, or a `heimdall-feedback` ISSUE suggesting a repo-level fix.
+
+This is [karpathy/autoresearch](https://github.com/karpathy/autoresearch) applied to Heimdall's own
+routing — falsifiability over vibes. Details: `skills/self-improve/SKILL.md`,
+`docs/analysis/autoresearch-distilled.md`. Invoked automatically by `/hmd:maintain-check` on the Nth
+cycle, or on demand via `/hmd:self-improve`.
+
 ## Communication
 
 Maintainer mode communicates progress naturally:
