@@ -297,8 +297,14 @@ def mint_token_for_team(team_id, repo, *, home=None, timeout=45):
     if proc.returncode != 0:
         # The minter guarantees its stderr is key-free AND token-free (it prints ONLY the
         # token to stdout). We surface a trimmed stderr for diagnosis and DISCARD stdout.
-        detail = (proc.stderr or "").strip().splitlines()
-        note = detail[-1][:200] if detail else "no detail"
+        # KEEP the FIRST meaningful line(s): the minter's _die diagnostics are FRONT-loaded
+        # (the CAUSE is line 1 — "cannot read the private key", "GitHub returned 401", a
+        # timeout, an OSError), so preserve up to 3 non-empty lines / 200 chars rather than the
+        # LAST line alone (which trimmed a multi-line diagnostic down to uselessness). When
+        # stderr is empty we still NAME the exit code so the failure is never mute.
+        lines = [ln.strip() for ln in (proc.stderr or "").splitlines() if ln.strip()]
+        note = (" | ".join(lines[:3])[:200] if lines
+                else "minter exited %d with no stderr" % proc.returncode)
         raise GhInstallError("mint_failed", note)
 
     token = (proc.stdout or "").strip()

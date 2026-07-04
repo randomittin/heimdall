@@ -50,6 +50,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 import time
 
@@ -155,17 +156,32 @@ def _team_secret_env_names():
     return set(cp_team_creds.ENV_FOR_KIND.values()) | {_PR_BOT_TOKEN_ENV}
 
 
-def _deny(actor, repo, reason, home):
+def _deny(actor, repo, reason, home, *, detail=None, mint_ms=None):
     """A fail-closed 403 refusal outcome (INV-3): audit the denial (params-SHAPE only — the repo
     slug is non-secret, no token anywhere) and return the outcome dict WITHOUT any side effect
     (no job row, no dispatch). `reason` is a short machine code (no_team | repo_not_covered |
-    no_team_cred | mint_<code>)."""
+    no_team_cred | mint_<code>).
+
+    For a MINT failure the caller also passes the GhInstallError `detail` (the trimmed,
+    token-free minter stderr — the actual cause: bad key parse / HTTP 401/404 / timeout /
+    OSError) and the measured `mint_ms`. Both are appended to the LOG LINE ONLY (never the
+    machine `reason`, never any durable verdict), scrubbed belt-and-suspenders — so the drain
+    log finally NAMES the underlying mint cause + the mint duration (proves/kills the CPU-
+    throttle-timeout theory: a 45s wall == throttled timeout; a fast fail == a real error)."""
     aid = cp_audit.record_refusal(actor, MAINTAINER_ACTION_TYPE, reason=reason,
                                   params={"repo": repo}, home=home)
-    _log("DENY repo=%s reason=%s (INV-11 repo<->team authz) — no job created" % (repo, reason))
+    scrubbed = _scrub_detail(detail)
+    extra = ""
+    if mint_ms is not None:
+        extra += " mint_ms=%d" % mint_ms
+    if scrubbed:
+        extra += ' detail="%s"' % scrubbed
+    _log("DENY repo=%s reason=%s%s (INV-11 repo<->team authz) — no job created"
+         % (repo, reason, extra))
     return {"dispatched": False, "refused": True, "reason": reason,
             "arm": None, "parked": False, "failover": False,
-            "http_status": 403, "audit_id": aid}
+            "http_status": 403, "audit_id": aid,
+            "detail": scrubbed or None, "mint_ms": mint_ms}
 
 
 def _authorize_and_build_env(actor, repo, base_env, *, home, team_id=None):
@@ -193,10 +209,21 @@ def _authorize_and_build_env(actor, repo, base_env, *, home, team_id=None):
         return (_deny(actor, repo, "repo_not_covered", home), None)           # INV-11 keystone
     if not cp_team_creds.has_cred(tid, home=home):
         return (_deny(actor, repo, "no_team_cred", home), None)               # INV-2/INV-3
+    _mint_t0 = time.monotonic()
     try:
         token = cp_ghinstall.mint_token_for_team(tid, repo, home=home)        # INV-2/A5
     except cp_ghinstall.GhInstallError as exc:
-        return (_deny(actor, repo, "mint_" + exc.reason, home), None)         # fail-closed
+        # TIME the mint even on failure — mint_ms proves/kills the CPU-throttle-timeout theory
+        # (a ~45s wall == the minter hit its subprocess timeout under throttle; a fast fail ==
+        # a real error the detail names). Fix the historical DOUBLE-prefix: exc.reason is
+        # already the mint step's code (e.g. "mint_failed"), so only namespace codes that are
+        # NOT already mint_-prefixed (no_installation / repo_not_covered) -> the reason reads
+        # "mint_failed" ONCE, never "mint_mint_failed".
+        mint_ms = int((time.monotonic() - _mint_t0) * 1000)
+        code = exc.reason
+        reason = code if code.startswith("mint_") else ("mint_" + code)
+        return (_deny(actor, repo, reason, home,
+                      detail=exc.detail, mint_ms=mint_ms), None)              # fail-closed
     # Assemble the per-team env: start from the caller base, DROP every credential-bearing var
     # (no cross-tenant / operator secret rides in), then overlay EXACTLY this team's cred + token.
     team_env = dict(base_env if base_env is not None else os.environ)
@@ -223,6 +250,31 @@ def _log(msg):
         sys.stderr.flush()
     except Exception:  # noqa: BLE001 — diagnostic only; a write error must not break dispatch.
         return
+
+
+# A token-ish shape scrubber for a diagnostic detail before it reaches a LOG line. The
+# GhInstallError detail is ALREADY token-free by the minter contract (the minter prints ONLY
+# the token to stdout; the note is trimmed stderr) — this is belt-and-suspenders: even if a
+# future minter regression leaked a GitHub token / PEM header into stderr, it never reaches
+# the Cloud Run log. Matches GitHub token prefixes (ghs_/ghp_/gho_/ghu_/ghr_ + fine-grained
+# github_pat_) and a PEM BEGIN header.
+_TOKENISH_RX = re.compile(
+    r"(gh[oprsu]_[A-Za-z0-9]{6,}|github_pat_[A-Za-z0-9_]{6,}|-----BEGIN[^\n]*)")
+
+# The hard cap on a logged detail (~200 chars keeps ONE scannable log line).
+_DETAIL_MAX_CHARS = 200
+
+
+def _scrub_detail(detail, max_chars=_DETAIL_MAX_CHARS):
+    """Make a GhInstallError detail LOG-SAFE: (a) redact any token-ish run (belt-and-
+    suspenders — the detail is already token-free by contract), (b) collapse newlines/runs so
+    a multi-line minter diagnostic fits ONE log line, (c) hard-cap to `max_chars`. Returns ""
+    for an empty/None detail. Idempotent — safe to re-run on an already-scrubbed string."""
+    if not detail:
+        return ""
+    text = _TOKENISH_RX.sub("<redacted>", str(detail))
+    text = " ".join(text.split())   # collapse newlines + whitespace runs -> one log-safe line
+    return text[:max_chars]
 
 
 def _team_tag(team_id):
@@ -772,8 +824,20 @@ def drain_team_queue(team_id, *, home=None, base_env=None, now=None, policy_name
             res = cp_team_queue.retry(
                 team_id, tid, "dispatch refused: %s" % reason, home=home)
             (dead if res.get("state") == "dead" else retried).append(tid)
-            _log("drain team=%s task=%s REFUSED reason=%s -> %s(attempts=%s)"
-                 % (_team_tag(team_id), tid, reason,
+            # LOG-ONLY diagnostics — NEVER the durable retry note above (which stays the bounded
+            # `reason`, so the content-deterministic re-enqueue can't grow). For a mint refusal
+            # the outcome carries the scrubbed minter detail + the measured mint_ms: this is what
+            # finally NAMES the underlying failure (bad key parse / HTTP 401/404 / timeout) in the
+            # drain log instead of the opaque mint_mint_failed code, and proves/kills the CPU-
+            # throttle-timeout theory. detail was already scrubbed in _deny; re-scrub is idempotent.
+            extra = ""
+            if outcome.get("mint_ms") is not None:
+                extra += " mint_ms=%d" % outcome["mint_ms"]
+            _detail = _scrub_detail(outcome.get("detail"))
+            if _detail:
+                extra += ' detail="%s"' % _detail
+            _log("drain team=%s task=%s REFUSED reason=%s%s -> %s(attempts=%s)"
+                 % (_team_tag(team_id), tid, reason, extra,
                     res.get("state"), res.get("attempts")))
         processed += 1
         task_ids.append(tid)
