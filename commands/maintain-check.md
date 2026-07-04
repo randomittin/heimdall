@@ -104,6 +104,33 @@ heimdall-maintain-loop heartbeat --repo .
 If Slack skills are available and the user has opted in, post the heartbeat to the
 configured channel.
 
+## Self-Improvement — every Nth cycle
+
+The maintainer doesn't only fix issues; it improves its OWN capability over time. After every
+`self_improve.every` completed cycles (default 10 — the checkpoint carries `cycle`), step back and
+run ONE bounded self-improvement experiment via the `self-improve` skill / `bin/heimdall-self-improve`:
+
+```bash
+# fire only on the Nth cycle (cheap, deterministic, no-op otherwise):
+CYCLE=$(heimdall-maintain-loop heartbeat --repo . | grep -oE 'cycle [0-9]+' | grep -oE '[0-9]+')
+EVERY=$(heimdall-state get '.maintainer.self_improve.every' 2>/dev/null); EVERY=${EVERY:-10}
+if [ -n "$CYCLE" ] && [ "$EVERY" -gt 0 ] && [ $((CYCLE % EVERY)) -eq 0 ]; then
+  # 1) surface testable hypotheses from the accumulated evidence
+  heimdall-self-improve hypotheses --repo . --min-samples 3
+  # 2) evaluate any OPEN experiment whose variant has now accrued enough samples
+  #    (KEEP only on a measured delta; else it rolls the override back — the falsifier)
+  for exp in $(heimdall-self-improve status --repo . | jq -r '.open_experiments[]?'); do
+    heimdall-self-improve experiment evaluate --id "$exp" --repo .
+  done
+fi
+```
+
+Then invoke the `self-improve` skill to pick the single highest-value hypothesis and `experiment
+start` it (bounded — the next cycles run the variant). An "improvement" persists ONLY with a measured
+pass-rate delta over its baseline; otherwise the override is rolled back. See
+`skills/self-improve/SKILL.md` and `docs/analysis/autoresearch-distilled.md`. This is a deliberate
+step-back BETWEEN fix batches — never mid-fix.
+
 ## Resume / Re-arm
 
 The engine writes a durable checkpoint every transition, so a brand-new session can
