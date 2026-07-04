@@ -403,6 +403,7 @@ echo "D. CloudRunJobRunner run_v2 RunJobRequest shape (the prod dispatch contrac
 # importable we SKIP with a loud note rather than silently passing.
 ARGV_PY="$EXT/assert_request.py"
 cat >"$ARGV_PY" <<'PYEOF'
+import json
 import os
 import sys
 
@@ -602,6 +603,89 @@ print("PASS D13: a SET HEIMDALL_FIRESTORE_DATABASE propagates (the db coordinate
       if d13 else
       "FAIL D13: HEIMDALL_FIRESTORE_DATABASE did not propagate when set: %r" % env_db)
 os.environ.pop("HEIMDALL_FIRESTORE_DATABASE", None)
+
+# ── build 4: PER-TEAM CREDENTIAL ENV PROPAGATION (the MULTI-TENANT correctness fix) ─────────
+#    THE INCIDENT this guards: on the gated image HEIMDALL_JOB_RUNNER=cloudrun-job dispatches the
+#    maintainer Job via THIS runner. The gated tick drains a PER-TEAM queue and assembles THAT
+#    team's job env — its Claude model cred + its freshly-minted GitHub App install token — as
+#    `base_env`, handed to dispatch(base_env=...). If build_request does NOT thread base_env into
+#    the container ENV override, the Cloud Run Job execution runs with NO team cred (or whatever
+#    single-tenant secret was baked into the Job at create-time): it FAILS, or WORSE runs under the
+#    WRONG team's identity — a tenant-isolation break. THE FIX: build_request applies base_env as a
+#    per-execution container ENV override (the storage-identity pin still WINS its own keys), so
+#    THIS execution runs with THIS draining team's cred — built fresh per dispatched cycle.
+#    (storage-identity from build 3 is still set: backend=firestore / project=svc-fs-project /
+#    root=svc_root_coll / gcp=svc-gcp-project; DB just unset.)
+TEAM_A_ENV = {"CLAUDE_CODE_OAUTH_TOKEN": "A_OAUTH_SECRET_zzz",
+              "HEIMDALL_PR_BOT_TOKEN": "ghs_instA_acme_a_repo"}
+TEAM_B_ENV = {"ANTHROPIC_API_KEY": "B_APIKEY_SECRET_qqq",
+              "HEIMDALL_PR_BOT_TOKEN": "ghs_instB_acme_b_repo"}
+
+runner_team = cp_jobrunner.CloudRunJobRunner()
+try:
+    req_a = runner_team.build_request(TEST_JOB_ID, base_env=TEAM_A_ENV)
+    env_a = override_env(req_a)
+    args_a = override_args(req_a)
+    _accepts_base_env = True
+except TypeError as exc:
+    env_a, args_a = {}, None
+    _accepts_base_env = False
+    print("FAIL D14: build_request does NOT accept base_env (%s) — the draining team's Claude "
+          "cred + minted App token can NEVER reach the Cloud Run Job execution (multi-tenant break)"
+          % exc)
+
+if _accepts_base_env:
+    # D14 — team A's cred + minted install token are threaded into the container ENV override.
+    d14 = (env_a.get("CLAUDE_CODE_OAUTH_TOKEN") == "A_OAUTH_SECRET_zzz"
+           and env_a.get("HEIMDALL_PR_BOT_TOKEN") == "ghs_instA_acme_a_repo")
+    print("PASS D14: build_request(base_env=teamA) threads teamA's Claude cred + minted App token "
+          "into the container ENV override — the execution runs with THIS team's cred" if d14 else
+          "FAIL D14: teamA's cred/token missing from the env override: %r" % env_a)
+
+    # D15 — the storage-identity pin STILL rides alongside the team cred (base_env did NOT clobber
+    #       the write/read-doc fix): backend/project/root are the service's, next to the team's cred.
+    d15 = (env_a.get("HEIMDALL_STATE_BACKEND") == "firestore"
+           and env_a.get("HEIMDALL_FIRESTORE_PROJECT") == "svc-fs-project"
+           and env_a.get("HEIMDALL_FIRESTORE_ROOT") == "svc_root_coll")
+    print("PASS D15: the storage-identity pin STILL rides alongside the team cred — base_env "
+          "ENRICHES the override, it does not replace the doc-path fix" if d15 else
+          "FAIL D15: storage-identity was lost when base_env was added: %r" % env_a)
+
+    # D16 — the args override is UNCHANGED (run-job,<id> still exactly carried) with base_env present.
+    d16 = (args_a == ["run-job", TEST_JOB_ID])
+    print("PASS D16: args override still == ['run-job', '%s'] with the team env override" % TEST_JOB_ID
+          if d16 else
+          "FAIL D16: args override changed to %r when base_env was threaded" % (args_a,))
+
+    # D17 (PER-EXECUTION ISOLATION) — a request built for team B carries B's cred, and team A's key
+    #       appears NOWHERE in it. Two teams -> two DISTINCT env sets from the SAME runner instance.
+    req_b = runner_team.build_request("job-teamB-TEST", base_env=TEAM_B_ENV)
+    env_b = override_env(req_b)
+    d17 = (env_b.get("ANTHROPIC_API_KEY") == "B_APIKEY_SECRET_qqq"
+           and env_b.get("HEIMDALL_PR_BOT_TOKEN") == "ghs_instB_acme_b_repo"
+           and "CLAUDE_CODE_OAUTH_TOKEN" not in env_b)
+    print("PASS D17 (isolation): team B's request carries B's cred/token and NONE of team A's — "
+          "each execution's override is built fresh per team" if d17 else
+          "FAIL D17 (isolation): team B's env override is wrong/leaky: %r" % env_b)
+
+    # D18 (FALSIFIER — the tenant-isolation break) — team A's SECRET VALUE must appear NOWHERE in
+    #       team B's request. If build_request leaked A's cred into B's execution (a shared/stale
+    #       override), one tenant would run under another's identity. This catches that exact break.
+    d18 = ("A_OAUTH_SECRET_zzz" not in json.dumps(env_b))
+    print("PASS D18 (falsifier): team A's cred value appears NOWHERE in team B's request env — "
+          "no cross-tenant credential leak between executions" if d18 else
+          "FAIL D18 (falsifier): team A's cred LEAKED into team B's execution env: %r" % env_b)
+
+    # D19 (BACKWARD-COMPAT) — base_env=None behaves EXACTLY as before: only the storage-identity
+    #       pin, no team-cred keys injected. The single-tenant path is byte-unchanged.
+    req_none = runner_team.build_request(TEST_JOB_ID, base_env=None)
+    env_none = override_env(req_none)
+    d19 = ("CLAUDE_CODE_OAUTH_TOKEN" not in env_none
+           and "HEIMDALL_PR_BOT_TOKEN" not in env_none
+           and env_none.get("HEIMDALL_STATE_BACKEND") == "firestore")
+    print("PASS D19: base_env=None -> only the storage-identity pin, no team-cred keys "
+          "(single-tenant path unchanged)" if d19 else
+          "FAIL D19: base_env=None changed the override shape: %r" % env_none)
 PYEOF
 
 # Run the request-shape assertions and map PASS/FAIL/SKIP lines to the test's counters.
@@ -784,6 +868,59 @@ e7 = (JOB_ID in err_ok and EXPECT_NAME in err_ok)
 print("PASS E7: the dispatch START log names job_id (%s) + the resource name — the attempt is traceable"
       % JOB_ID if e7 else
       "FAIL E7: the start log does not name the job_id + resource name. stderr=%r" % err_ok)
+
+
+# ── E8-E10: the REAL dispatch THREADS base_env into the RunJobRequest (the multi-tenant seam) ──
+#    The gated drain hands dispatch(base_env=<team env>) the draining team's cred; dispatch must
+#    build the request WITH that env so the Cloud Run Job execution runs under THAT team's identity.
+#    We reuse the recording fake run_v2 and read the RECORDED request's container env override back —
+#    proving the wiring end to end (dispatch -> build_request(base_env=...)), not just build_request.
+def _dispatch_capture_env(base_env):
+    calls = _install_fake_run_v2(raise_on_run=False)
+    runner = cp_jobrunner.CloudRunJobRunner()
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        result = runner.dispatch(JOB_ID, actor_haid="haid:tester", home=None, base_env=base_env)
+    envm = {}
+    reqs = calls["requests"]
+    if reqs:
+        cos = list(reqs[0].overrides.container_overrides)
+        if len(cos) == 1:
+            envm = {e.name: e.value for e in list(cos[0].env)}
+    return result, err.getvalue(), envm
+
+
+_TEAM_A = {"CLAUDE_CODE_OAUTH_TOKEN": "A_OAUTH_dispatch_zzz",
+           "HEIMDALL_PR_BOT_TOKEN": "ghs_instA_dispatch"}
+_TEAM_B = {"ANTHROPIC_API_KEY": "B_APIKEY_dispatch_qqq",
+           "HEIMDALL_PR_BOT_TOKEN": "ghs_instB_dispatch"}
+
+res_a2, err_a2, env_a2 = _dispatch_capture_env(_TEAM_A)
+
+# E8 — the REAL dispatch threads base_env: team A's cred + minted token reach the recorded request.
+e8 = (isinstance(res_a2, dict) and res_a2.get("dispatched") is True
+      and env_a2.get("CLAUDE_CODE_OAUTH_TOKEN") == "A_OAUTH_dispatch_zzz"
+      and env_a2.get("HEIMDALL_PR_BOT_TOKEN") == "ghs_instA_dispatch")
+print("PASS E8: the REAL dispatch threads base_env into the RunJobRequest — team A's cred + minted "
+      "token reach the recorded Cloud Run Job execution env" if e8 else
+      "FAIL E8: dispatch did NOT thread base_env into the request env override: %r" % env_a2)
+
+# E9 (isolation) — dispatching team B yields B's cred and NONE of team A's — per-execution, not shared.
+res_b2, err_b2, env_b2 = _dispatch_capture_env(_TEAM_B)
+e9 = (env_b2.get("ANTHROPIC_API_KEY") == "B_APIKEY_dispatch_qqq"
+      and "CLAUDE_CODE_OAUTH_TOKEN" not in env_b2
+      and "A_OAUTH_dispatch_zzz" not in "".join(str(v) for v in env_b2.values()))
+print("PASS E9 (isolation): dispatching team B yields B's cred and none of team A's — the override "
+      "is per-execution, not shared across teams" if e9 else
+      "FAIL E9 (isolation): team B's dispatch env is leaky/wrong: %r" % env_b2)
+
+# E10 (SECRET HYGIENE) — the team cred VALUE is NEVER written to stderr (the Cloud Run log sink).
+#       dispatch logs only the resource name + args, never the env — a secret must not reach a log.
+e10 = ("A_OAUTH_dispatch_zzz" not in err_a2 and "B_APIKEY_dispatch_qqq" not in err_b2
+       and "ghs_instA_dispatch" not in err_a2 and "ghs_instB_dispatch" not in err_b2)
+print("PASS E10 (secret hygiene): the team cred value appears in NO dispatch log line — env rides "
+      "the request only, never the stderr log sink" if e10 else
+      "FAIL E10 (secret hygiene): a team cred value LEAKED into a dispatch log line")
 PYEOF
 
 # Run the loud-log assertions with a CLEAN env (no inherited HEIMDALL_JOB_RUNNER / K_SERVICE)
