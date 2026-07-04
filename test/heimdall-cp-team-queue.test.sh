@@ -354,6 +354,96 @@ jh(){ printf '%s' "$H_OUT" | "$PY" -c "import json,sys;print(json.load(sys.stdin
 [ "$(jh critical_first)" = "True" ] \
   && ok "H1 pick selects the higher-severity item first (reuses issue_queue.pick_order)" || bad "H1 priority order wrong (H_OUT=$H_OUT)"
 
+# ──────────────────────────────────────────────────────────────────────────────
+# I. RETRY SEMANTICS — a task whose dispatch FAILED must NOT be permanently consumed.
+#    retry() returns a claimed (in_flight) task to `queued`, bumping a bounded `attempts`
+#    counter; at the cap it moves to a terminal `dead` bucket instead of re-queuing
+#    forever. A fresh enqueue of the SAME content-deterministic text RE-OPENS a dead task
+#    (the human is asking to retry it). A genuinely-dispatched `done` task is NOT re-opened
+#    (idempotency preserved). requeue() defers an in_flight task WITHOUT burning an attempt.
+#    THE BUG THIS GUARDS: drain used to complete() every picked task regardless of dispatch
+#    outcome, so a refused dispatch (arm=None, no job) permanently consumed the task -> the
+#    idempotent re-enqueue no-oped -> the queue had no pending task -> the warm tick drained
+#    nothing, silently. Retry keeps a failed task re-drivable.
+# ──────────────────────────────────────────────────────────────────────────────
+echo
+echo "I. retry semantics (bounded re-queue -> dead -> re-open; requeue defers)"
+I_OUT="$("$PY" - <<'PYEOF' 2>"$WORK/i.err"
+import json, os, sys
+sys.path.insert(0, os.environ["LIB"])
+import cp_team_queue as Q
+T = "22222222222222222222222222222222"
+# retry: pick -> retry -> back in queued (attempts=1), re-pickable.
+e = Q.enqueue(T, "flaky task that fails dispatch")
+p1 = Q.pick(T)
+r1 = Q.retry(T, p1["id"], "dispatch refused: no_team_cred", max_attempts=3)
+depth_after_retry = Q.depth(T)          # 1 (returned to the pick pool, not consumed)
+p2 = Q.pick(T)                          # re-pickable
+# drive to the cap (cap=3): the 3rd retry is terminal -> dead.
+r2 = Q.retry(T, p2["id"], "again", max_attempts=3)   # attempts=2 -> queued
+p3 = Q.pick(T)
+r3 = Q.retry(T, p3["id"], "again", max_attempts=3)   # attempts=3 -> dead
+depth_after_dead = Q.depth(T)           # 0 (no pending item — it gave up, bounded)
+rows = Q.list(T)
+dead_row = [row for row in rows if row.get("state") == "dead"]
+# re-open: a fresh enqueue of the SAME text revives the dead task (attempts reset to 0).
+e_reopen = Q.enqueue(T, "flaky task that fails dispatch")
+depth_after_reopen = Q.depth(T)         # 1
+p4 = Q.pick(T)
+print(json.dumps({
+    "retry_requeued": (r1.get("ok") is True and r1.get("state") == "queued" and r1.get("attempts") == 1),
+    "depth_after_retry_1": depth_after_retry == 1,
+    "repick_after_retry": bool(p2 and p2["id"] == e["id"]),
+    "attempts_tracked": bool(p2 and p2.get("attempts") == 1),
+    "dead_at_cap": (r3.get("ok") is True and r3.get("state") == "dead" and r3.get("attempts") == 3),
+    "depth_zero_when_dead": depth_after_dead == 0,
+    "dead_listed": (len(dead_row) == 1 and dead_row[0]["id"] == e["id"]),
+    "enqueue_reopens_dead": (e_reopen.get("added") is True and e_reopen.get("reopened") is True),
+    "depth_after_reopen_1": depth_after_reopen == 1,
+    "reopened_attempts_reset": bool(p4 and p4.get("attempts") == 0),
+}))
+PYEOF
+)"
+if [ -s "$WORK/i.err" ]; then cat "$WORK/i.err" >&2; fi
+ji(){ printf '%s' "$I_OUT" | "$PY" -c "import json,sys;print(json.load(sys.stdin).get('$1'))" 2>/dev/null; }
+[ "$(ji retry_requeued)" = "True" ] && [ "$(ji depth_after_retry_1)" = "True" ] \
+  && [ "$(ji repick_after_retry)" = "True" ] && [ "$(ji attempts_tracked)" = "True" ] \
+  && ok "I1 retry() returns a failed task to the pick pool (attempts=1), never permanently consumed" || bad "I1 retry did not re-queue (I_OUT=$I_OUT)"
+[ "$(ji dead_at_cap)" = "True" ] && [ "$(ji depth_zero_when_dead)" = "True" ] && [ "$(ji dead_listed)" = "True" ] \
+  && ok "I2 at the attempts cap the task moves to a terminal 'dead' state (bounded retry, no infinite loop)" || bad "I2 retry did not bound to dead (I_OUT=$I_OUT)"
+[ "$(ji enqueue_reopens_dead)" = "True" ] && [ "$(ji depth_after_reopen_1)" = "True" ] && [ "$(ji reopened_attempts_reset)" = "True" ] \
+  && ok "I3 a fresh enqueue of the same text RE-OPENS a dead task (attempts reset) — the re-submit unblock path" || bad "I3 enqueue did not re-open a dead task (I_OUT=$I_OUT)"
+
+echo
+echo "I(cont). requeue defers without burning an attempt; a DONE task is NOT re-opened"
+J_OUT="$("$PY" - <<'PYEOF' 2>"$WORK/j.err"
+import json, os, sys
+sys.path.insert(0, os.environ["LIB"])
+import cp_team_queue as Q
+T = "33333333333333333333333333333333"
+e = Q.enqueue(T, "deferred task")
+p1 = Q.pick(T)
+Q.retry(T, p1["id"], "fail1")               # attempts=1, back to queued
+p2 = Q.pick(T)
+rq = Q.requeue(T, p2["id"])                  # defer, NO attempt burn
+p3 = Q.pick(T)
+# a genuinely-dispatched (done) task is NOT re-opened by a fresh enqueue (idempotency held).
+Q.complete(T, p3["id"], "dispatched:cloud")
+e2 = Q.enqueue(T, "deferred task")           # same text -> dedup no-op (done, not reopened)
+print(json.dumps({
+    "requeue_ok": (rq.get("ok") is True and rq.get("state") == "queued"),
+    "requeue_no_attempt_burn": bool(p3 and p3.get("attempts") == 1),
+    "done_not_reopened": (e2.get("added") is False and not e2.get("reopened")),
+}))
+PYEOF
+)"
+if [ -s "$WORK/j.err" ]; then cat "$WORK/j.err" >&2; fi
+jj(){ printf '%s' "$J_OUT" | "$PY" -c "import json,sys;print(json.load(sys.stdin).get('$1'))" 2>/dev/null; }
+[ "$(jj requeue_ok)" = "True" ] && [ "$(jj requeue_no_attempt_burn)" = "True" ] \
+  && ok "I4 requeue() defers an in_flight task back to queued WITHOUT incrementing attempts" || bad "I4 requeue burned an attempt or failed (J_OUT=$J_OUT)"
+[ "$(jj done_not_reopened)" = "True" ] \
+  && ok "I5 a successfully-dispatched (done) task is NOT re-opened by a duplicate enqueue (idempotency preserved)" || bad "I5 a done task was wrongly re-opened (J_OUT=$J_OUT)"
+
 echo
 echo "============================================================"
 printf "cp-team-queue: %d passed, %d failed\n" "$PASS" "$FAIL"

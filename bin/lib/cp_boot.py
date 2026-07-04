@@ -115,6 +115,29 @@ def _owner_haids(home=None):
     return cp_auth.owner_haids(home)
 
 
+def _stderr(msg):
+    """Write one LOUD diagnostic line to stderr (Cloud Run captures stderr into the service
+    logs). Best-effort: a logging failure is swallowed so it can NEVER break the tick."""
+    try:
+        sys.stderr.write("%s\n" % msg)
+        sys.stderr.flush()
+    except Exception:  # noqa: BLE001 — diagnostic only; a write error must not break the tick.
+        return
+
+
+def _exc_line(exc):
+    """Format a swallowed exception as `Type: <scrubbed message>` — the silent-drain lesson
+    says a swallowed fault must say WHY, but a message could carry a secret, so the message is
+    run through telemetry's scrub (lazy import; falls back to the bare type name if unavailable).
+    Never a bare swallow, never a raw token."""
+    try:
+        import telemetry
+        msg = telemetry._scrub(str(exc))
+    except Exception:  # noqa: BLE001 — the log line must survive a scrub/import failure.
+        return type(exc).__name__
+    return "%s: %s" % (type(exc).__name__, msg)
+
+
 def run_tick(*, home=None, base_env=None, now=None, approved_action_types=None):
     """Fire one scheduler tick for EVERY registered owner identity (§6). Returns the
     flat list of fired-dispatch outcomes across all owners (the run log a caller — the
@@ -140,14 +163,33 @@ def run_tick(*, home=None, base_env=None, now=None, approved_action_types=None):
     # byte-for-byte unchanged when the flag is off.
     import cp_maintainer_runner  # lazy — mirrors cp_scheduler's lazy import of the same module.
     if cp_maintainer_runner.tenant_authz_enabled():
-        for drain in cp_maintainer_runner.drain_all_team_queues(
-                home=home, base_env=base_env, now=when):
+        drains = cp_maintainer_runner.drain_all_team_queues(
+            home=home, base_env=base_env, now=when)
+        # LOUD per-cycle drain log (the silent-drain lesson: a swallowed drain is why a live
+        # task got stuck). One header line naming how many teams were scanned, then the
+        # per-team drain_team_queue lines (DISPATCHED / REFUSED / DEAD) already emitted inside
+        # the drain. This runs INSIDE the gated image, so the fix only reaches prod on a
+        # rebuild+redeploy (deploy-public-rr.sh) — the warm loud tick then drains + dispatches.
+        _drain_scanned = len(drains)
+        _drain_dispatched = sum(len(d.get("arms") or []) for d in drains)
+        _drain_retried = sum(len(d.get("retried") or []) for d in drains)
+        _drain_dead = sum(len(d.get("dead") or []) for d in drains)
+        _stderr("cp_boot: drain cycle: teams_scanned=%d dispatched=%d retried=%d dead=%d"
+                % (_drain_scanned, _drain_dispatched, _drain_retried, _drain_dead))
+        for drain in drains:
+            _stderr("cp_boot: drain team=%s processed=%d dispatched=%d retried=%d dead=%d%s"
+                    % (str(drain.get("team_id"))[:8], drain.get("processed", 0),
+                       len(drain.get("arms") or []), len(drain.get("retried") or []),
+                       len(drain.get("dead") or []),
+                       (" reason=%s" % drain.get("reason")) if drain.get("reason") else ""))
             fired.append({
                 "schedule_id": None,
                 "action_type": cp_maintainer_runner.MAINTAINER_ACTION_TYPE,
                 "status": 200,
                 "team_drain": drain.get("team_id"),
                 "processed": drain.get("processed", 0),
+                "retried": len(drain.get("retried") or []),
+                "dead": len(drain.get("dead") or []),
             })
     return fired
 
@@ -162,13 +204,13 @@ def _tick_loop(stop_event, *, home, base_env, interval, on_tick):
         try:
             fired = run_tick(home=home, base_env=base_env)
         except Exception as exc:  # noqa: BLE001 — the clock must survive a bad tick.
-            sys.stderr.write("cp_boot: tick error: %s\n" % type(exc).__name__)
+            _stderr("cp_boot: tick error: %s" % _exc_line(exc))
             continue
         if on_tick is not None and fired:
             try:
                 on_tick(fired)
             except Exception as exc:  # noqa: BLE001 — observer fault never stops clock.
-                sys.stderr.write("cp_boot: on_tick error: %s\n" % type(exc).__name__)
+                _stderr("cp_boot: on_tick error: %s" % _exc_line(exc))
 
 
 def start_tick_thread(*, home=None, base_env=None,
