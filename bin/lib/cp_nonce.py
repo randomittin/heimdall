@@ -227,7 +227,24 @@ def accept(scope, key, nonce, ts, *, now=None, window=DEFAULT_WINDOW_SECONDS, ba
         # and we never lock out a dev.
         be.put_record(rel, {_FIELD_TS: float(ts)})
         return (True, "ok")
-    except Exception:  # noqa: BLE001 — FAIL-OPEN: a transient backend error never refuses a beat.
+    except Exception as exc:  # noqa: BLE001 — FAIL-OPEN: a backend error never refuses a beat.
+        # DECISION (F6, 2026-07-06 audit): we deliberately fail OPEN, not closed. The tradeoff is
+        # availability > replay-window: locking out a legit signed beat on a transient store hiccup
+        # is worse than a bounded replay, because the STALE check above is PURE and ALWAYS enforced
+        # — even with the seen-set store fully down, a captured beat is useless once +/-window (300s)
+        # freshness elapses. So a replay during a store outage is bounded to that +/-300s window, not
+        # unbounded. But the fail-open must be OBSERVABLE: emit ONE loud stderr line so an outage-
+        # window replay attempt is at least visible in the logs. Token-free by construction — we log
+        # only the caller-controlled `scope` + the exception TYPE, never the raw key/nonce (a haid /
+        # opaque secret material). Guarded so a logging error can NEVER break the fail-open return.
+        try:
+            sys.stderr.write(
+                "cp_nonce: FAIL-OPEN replay-check on backend error (scope=%s type=%s) — "
+                "replay bounded to +/-%ss freshness; abuse visible but not blocked\n"
+                % (_scope_slug(scope), type(exc).__name__, window))
+            sys.stderr.flush()
+        except Exception:  # noqa: BLE001 — diagnostic only; must not defeat the fail-open return.
+            return (True, "ok")
         return (True, "ok")
 
 

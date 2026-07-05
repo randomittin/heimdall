@@ -31,9 +31,12 @@
 #                    env on BOTH services: HEIMDALL_RR_TENANT_AUTHZ=1 (authz gate + /rr-task)
 #                    and HEIMDALL_TEAM_CRED_STORE=secretmanager (BYOC). Digest-pinned by
 #                    go-live/deploy-public-surface — this script does not re-pin.
-#   4. byoc        — confirm the per-team cred store selector is live + grant the runtime SA
-#                    the role it needs to CREATE per-team secrets at enroll time. Each user's
-#                    Claude cred lands in its OWN per-team Secret-Manager secret.
+#   4. byoc        — confirm the per-team cred store selector is live + grant the runtime SA the
+#                    NARROWED least-privilege IAM (F2 audit): a custom create-only role + a
+#                    conditional admin scoped to the heimdall-tc-* per-team-secret PREFIX + a
+#                    per-secret accessor on cp-pki-key; EMIT the revoke of the old project-scope
+#                    secretmanager.admin/secretAccessor. Each user's Claude cred lands in its OWN
+#                    per-team Secret-Manager secret; the SA can touch NOTHING outside that prefix.
 #   5. enroll      — mint the cp-enroll-token (reuse the go-live seam) so users can
 #                    `rr setup --mode control-plane --enroll-token <t>`. Distribution is
 #                    OUT-OF-BAND — the value is never printed (CI-safe).
@@ -51,7 +54,7 @@
 #             runtime SA the deployed gated service (heimdall-control-plane) ACTUALLY runs as, and
 #             if that service uses the project DEFAULT compute SA, resolves
 #             <projectNumber>-compute@developer.gserviceaccount.com. Pass this ONLY to force a
-#             specific identity (used verbatim for every secretAccessor / secretmanager.admin grant).
+#             specific identity (used verbatim for every secretAccessor grant + the narrowed F2 grants).
 #   --gh-app-id + --gh-app-key-file are REQUIRED for a real run (step 2); a --dry-run needs
 #             neither. --enroll-open forwards HEIMDALL_ENROLL_OPEN=1 (tokenless+bounded
 #             enroll); the DEFAULT is token-gated (the viral/public phase).
@@ -77,6 +80,22 @@ GH_APP_KEY_SECRET="heimdall-gh-app-private-key"  # the App PEM (matches setup-bo
 ENROLL_SECRET="cp-enroll-token"                  # the /enroll bootstrap-token verifier
 GATED_SERVICE="heimdall-control-plane"
 PUBLIC_SERVICE="heimdall-cp-public"
+
+# ── F2 (2026-07-06 security audit): the NARROWED per-team secret IAM shape ─────
+# The runtime SA used to hold PROJECT-scope roles/secretmanager.admin — it could read/destroy/
+# setIamPolicy EVERY secret (cp-pki-key signing key, the gh-app private key, every tenant's
+# cred). We replace that blast radius with least-privilege: (1) a custom role granting ONLY
+# secretmanager.secrets.create at project level (an IAM Condition cannot scope CREATE — the
+# secret does not exist yet, so its future name is unknowable — hence a project-level create
+# permission with NO read/version/delete/setIam); (2) roles/secretmanager.admin CONDITIONALLY
+# bound to the per-team secret PREFIX ONLY (add-version / access / get / delete on heimdall-tc-*
+# and NOTHING else); (3) an explicit per-secret secretAccessor on cp-pki-key (the one fixed
+# secret the gated SA mounts that lacked an explicit binding — it was reachable only via the
+# project-scope grant we are removing, so it MUST be granted per-secret or the gated service
+# loses its signing key on boot). The two broad project-scope grants are then REVOKED.
+TEAM_SECRET_PREFIX="heimdall-tc-"                     # cp_team_creds._sm_secret_id -> heimdall-tc-<team_id>-<kind>
+TEAM_SECRET_CREATOR_ROLE="heimdallTeamSecretCreator" # custom role: ONLY secretmanager.secrets.create (project-level)
+PKI_KEY_SECRET="cp-pki-key"                          # the server signing key the gated SA mounts (needs per-secret accessor)
 REQUIRED_APIS="run.googleapis.com secretmanager.googleapis.com artifactregistry.googleapis.com iap.googleapis.com"
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -337,18 +356,85 @@ fi
 #    SA can CREATE per-team secrets at enroll time (cp_team_creds writes each
 #    user's Claude cred into its OWN per-team Secret-Manager secret).
 # ════════════════════════════════════════════════════════════════════════════
-say "4. per-team BYOC store (${TEAM_CRED_STORE_ENV}=${TEAM_CRED_STORE_VAL})"
+say "4. per-team BYOC store (${TEAM_CRED_STORE_ENV}=${TEAM_CRED_STORE_VAL}) — NARROWED IAM (F2)"
 say "  cp_team_creds writes each team's Claude cred to a DEDICATED per-team secret"
-say "  (id derived per (team_id, kind)); the raw secret rides Secret Manager only, never the state row."
-say "  grant the runtime SA the role to CREATE + version those per-team secrets at enroll time:"
+say "  (id ${TEAM_SECRET_PREFIX}<team_id>-<kind>); the raw secret rides Secret Manager only, never the state row."
+
+# Resolve the project NUMBER — Secret Manager IAM Conditions evaluate resource.name using the
+# project NUMBER (projects/<NUMBER>/secrets/...), NOT the project id. We match BOTH forms in the
+# condition (|| the id form) so the binding is robust regardless of how resource.name renders.
+if [ "$DRY" = 1 ]; then
+  show "PROJNUM=\$(gcloud projects describe ${PROJECT} --format='value(projectNumber)')   # IAM Conditions key on the project NUMBER"
+  PROJNUM="<PROJECT-NUMBER>"
+else
+  PROJNUM="$(gcloud projects describe "$PROJECT" --format='value(projectNumber)' 2>/dev/null || true)"
+  [ -n "$PROJNUM" ] || die "step 4: could not resolve the project number for ${PROJECT} (needed for the Secret Manager IAM Condition). Fix access + re-run."
+  say "  project number: ${PROJNUM} (Secret Manager IAM Conditions key on it)"
+fi
+# The CEL condition: admin ONLY on secrets whose name begins with the per-team prefix. Matches the
+# version-level resource name too (projects/<N>/secrets/heimdall-tc-.../versions/<v>) since it also
+# begins with the prefix. Covers BOTH the number and id renderings of resource.name.
+COND_TITLE="heimdall-team-secrets-only"
+COND_DESC="F2 audit: admin limited to per-team BYOC secrets (${TEAM_SECRET_PREFIX}*); never cp-pki-key / gh-app / enroll-token"
+COND_EXPR="resource.name.startsWith(\"projects/${PROJNUM}/secrets/${TEAM_SECRET_PREFIX}\") || resource.name.startsWith(\"projects/${PROJECT}/secrets/${TEAM_SECRET_PREFIX}\")"
+
+# 4a. Per-secret secretAccessor on cp-pki-key — the ONE fixed secret the gated SA mounts that has
+#     NO explicit binding today (it is reachable ONLY via the project-scope grant we revoke in 4e).
+#     Grant it per-secret FIRST so the gated service never loses its signing key across the swap.
+say "  4a. per-secret secretAccessor on ${PKI_KEY_SECRET} (the signing key the gated SA mounts — no explicit binding today):"
+run gcloud secrets add-iam-policy-binding "$PKI_KEY_SECRET" --project="$PROJECT" \
+  --member="serviceAccount:${RUNTIME_SA}" --role=roles/secretmanager.secretAccessor
+
+# 4b. Custom role: ONLY secretmanager.secrets.create at PROJECT level (create cannot be scoped by
+#     an IAM Condition — the secret's future name is unknowable pre-create). Idempotent (create,
+#     else update the permission set).
+say "  4b. custom role ${TEAM_SECRET_CREATOR_ROLE} (ONLY secretmanager.secrets.create, project-level):"
+if [ "$DRY" = 1 ]; then
+  show "gcloud iam roles create ${TEAM_SECRET_CREATOR_ROLE} --project=${PROJECT} --title='Heimdall Team Secret Creator' --description='Create per-team BYOC secrets only; no read/version/delete/setIam.' --permissions=secretmanager.secrets.create --stage=GA 2>/dev/null || gcloud iam roles update ${TEAM_SECRET_CREATOR_ROLE} --project=${PROJECT} --permissions=secretmanager.secrets.create"
+else
+  if gcloud iam roles create "$TEAM_SECRET_CREATOR_ROLE" --project="$PROJECT" \
+       --title='Heimdall Team Secret Creator' \
+       --description='Create per-team BYOC secrets only; no read/version/delete/setIam.' \
+       --permissions=secretmanager.secrets.create --stage=GA 2>/dev/null; then
+    say "    custom role ${TEAM_SECRET_CREATOR_ROLE} created"
+  else
+    gcloud iam roles update "$TEAM_SECRET_CREATOR_ROLE" --project="$PROJECT" \
+      --permissions=secretmanager.secrets.create >/dev/null 2>&1 \
+      && say "    custom role ${TEAM_SECRET_CREATOR_ROLE} already existed — permission set reconciled" \
+      || warn "    could not create OR update ${TEAM_SECRET_CREATOR_ROLE} (check IAM admin rights); create capability may be missing."
+  fi
+fi
 run gcloud projects add-iam-policy-binding "$PROJECT" \
-  --member="serviceAccount:${RUNTIME_SA}" --role=roles/secretmanager.admin
-[ "$DRY" = 1 ] || say "  ${RUNTIME_SA} can now create/version per-team BYOC secrets (project-scoped secretmanager.admin)."
-say "  NOTE: this secretmanager.admin grant is for the GATED runtime SA ONLY. The internet-facing"
-say "  PUBLIC SA is DELIBERATELY NOT granted it — /team/cred forwards to the gated SA (step 3c), so"
-say "  the SM write executes with privilege WITHOUT expanding the public surface's blast radius."
-warn "  NOTE: secretmanager.admin is scoped to project ${PROJECT} ONLY. If you run other secrets"
-warn "  in this project that this SA must NOT manage, put the CP in its own project (recommended)."
+  --member="serviceAccount:${RUNTIME_SA}" \
+  --role="projects/${PROJECT}/roles/${TEAM_SECRET_CREATOR_ROLE}"
+
+# 4c. Conditional secretmanager.admin on the per-team PREFIX ONLY (add-version / access / get /
+#     delete on heimdall-tc-* — and NOTHING else). delete is why we use admin here, not just
+#     secretVersionAdder+secretAccessor: delete_team_cred needs secretmanager.secrets.delete.
+say "  4c. conditional roles/secretmanager.admin scoped to ${TEAM_SECRET_PREFIX}* (version/access/get/delete on team secrets ONLY):"
+run gcloud projects add-iam-policy-binding "$PROJECT" \
+  --member="serviceAccount:${RUNTIME_SA}" \
+  --role=roles/secretmanager.admin \
+  --condition="title=${COND_TITLE},description=${COND_DESC},expression=${COND_EXPR}"
+[ "$DRY" = 1 ] || say "    ${RUNTIME_SA} can create (4b) + version/access/delete per-team BYOC secrets (4c) — and NOTHING outside ${TEAM_SECRET_PREFIX}*."
+
+say "  NOTE: this narrowed grant is for the GATED runtime SA ONLY. The internet-facing PUBLIC SA is"
+say "  DELIBERATELY NOT granted it — /team/cred forwards to the gated SA (step 3c), so the SM write"
+say "  executes with privilege WITHOUT expanding the public surface's blast radius."
+
+# 4d/4e. REVOKE the OLD broad project-scope grants (the F2 blast radius). Destructive + must be run
+#     AFTER 4a–4c have landed (so no capability gap), hence EMITTED for the operator to run, not
+#     auto-executed mid-deploy. --condition=None targets the UNCONDITIONAL bindings, leaving the new
+#     conditional admin (4c) intact.
+warn "  4d/4e. REVOKE the OLD broad project-scope grants (run AFTER verifying 4a–4c landed + the gated"
+warn "  service still boots — these remove the F2 blast radius; --condition=None targets the UNCONDITIONAL"
+warn "  binding so the new conditional admin from 4c survives):"
+show "gcloud projects remove-iam-policy-binding ${PROJECT} --member=\"serviceAccount:${RUNTIME_SA}\" --role=roles/secretmanager.admin --condition=None"
+show "gcloud projects remove-iam-policy-binding ${PROJECT} --member=\"serviceAccount:${RUNTIME_SA}\" --role=roles/secretmanager.secretAccessor --condition=None"
+say "  after the revoke the runtime SA holds: create (custom role) + admin-on-${TEAM_SECRET_PREFIX}* (conditional)"
+say "  + per-secret secretAccessor on cp-pki-key / heimdall-gh-app-id / heimdall-gh-app-private-key ONLY."
+say "  The existing team 6ca551f2 secret (${TEAM_SECRET_PREFIX}6ca551f2...-oauth-token) already matches the"
+say "  prefix condition — NO migration or legacy grant is needed; it stays readable/versionable/deletable."
 
 # ════════════════════════════════════════════════════════════════════════════
 # 5. ENROLL TOKEN — mint cp-enroll-token (reuse the go-live seam: python3 → stdin

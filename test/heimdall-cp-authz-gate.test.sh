@@ -472,6 +472,17 @@ out["case2_token_scrubbed"] = ("ghs_DEADBEEFCAFE1234567890" not in logB)
 out["case2_redacted_shown"] = ("<redacted>" in logB)
 out["case2_still_detail"]   = ('detail="' in logB and "mint_ms=" in logB)
 
+# ── CASE 3 (SCRUB FALSIFIER, Anthropic): a minter whose stderr carries an sk-ant- OAuth/API key
+#    MUST be scrubbed too — parity with the sibling cp_handlers._SECRET_SCRUB (F5). <redacted>
+#    present, the raw key ABSENT, while detail=/mint_ms= still surface. This is the falsifier that
+#    would GO RED if _TOKENISH_RX omitted the sk-ant- alternative (the pre-fix state).
+os.environ["FAKE_MINT_STDERR"] = "heimdall-gh-app-token: leaked sk-ant-oat01-DEADBEEFcafe0123_WXYZ into stderr"
+TQ.enqueue(tidM, "a task whose mint leaks an sk-ant- key", home=H)
+logC = drain_capture()
+out["case3_sk_ant_scrubbed"] = ("sk-ant-oat01-DEADBEEFcafe0123_WXYZ" not in logC)
+out["case3_redacted_shown"]  = ("<redacted>" in logC)
+out["case3_still_detail"]    = ('detail="' in logC and "mint_ms=" in logC)
+
 print(json.dumps(out))
 PYEOF
 
@@ -493,6 +504,10 @@ jm() { printf '%s' "$RM" | "$PY" -c "import json,sys;print(json.load(sys.stdin).
   && [ "$(jm case2_still_detail)" = "True" ] \
   && ok "DIAG SCRUB FALSIFIER: a ghs_ token-ish run in the minter stderr is <redacted> from the log (raw token absent), detail=/mint_ms= still present" \
   || bad "DIAG SCRUB FALSIFIER: a token-ish detail was NOT scrubbed from the log (RM=$RM)"
+[ "$(jm case3_sk_ant_scrubbed)" = "True" ] && [ "$(jm case3_redacted_shown)" = "True" ] \
+  && [ "$(jm case3_still_detail)" = "True" ] \
+  && ok "DIAG SCRUB FALSIFIER (Anthropic F5): an sk-ant- key in the minter stderr is <redacted> from the log (raw key absent), detail=/mint_ms= still present" \
+  || bad "DIAG SCRUB FALSIFIER: an sk-ant- key was NOT scrubbed from the log (F5 _TOKENISH_RX parity; RM=$RM)"
 
 echo
 echo "============================================================"
