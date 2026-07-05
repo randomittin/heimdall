@@ -116,11 +116,16 @@ _FIELD_TTL_AT = "ttl_at"
 #                   a record older than the window is already treated as absent).
 #   • "ratelimit" — a fixed-window counter bucket is never read again once the window rolls
 #                   over (cp_ratelimit: a stale bucket self-expires logically).
+#   • "team_daily" — a per-team daily spend-cap bucket (cp_daily_budget) is a fixed UTC-day
+#                    window counter that is never read again once the day rolls over — the SAME
+#                    self-expiring shape as a ratelimit bucket, so it is TTL-eligible too. The
+#                    24h horizon is >> the time a live day-bucket is still read (< 24h after its
+#                    first write), so a bucket is only ever reaped long after its day is over.
 # EVERY other root (jobs, approvals, presence, audit, teamq, …) is durable-forever and MUST NOT
 # carry a ttl_at field, so the SINGLE collection-group TTL policy on `ttl_at` expires ONLY these
-# two doc families and never touches a job log or an approval record. `heimdall_cp` being one
+# doc families and never touches a job log or an approval record. `heimdall_cp` being one
 # flat collection is exactly why the discriminator is the field's PRESENCE, not the collection.
-_TTL_ELIGIBLE_ROOTS = frozenset(("nonce", "ratelimit"))
+_TTL_ELIGIBLE_ROOTS = frozenset(("nonce", "ratelimit", "team_daily"))
 
 # The default TTL horizon (seconds from write) for an eligible doc. 24h is >> the presence
 # freshness window (300s, cp_nonce.DEFAULT_WINDOW_SECONDS) and the enroll/presence rate windows

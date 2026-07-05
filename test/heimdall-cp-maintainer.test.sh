@@ -442,6 +442,212 @@ else
   bad "H2 silent failure still swallowed (error_tail='$H2TAIL')"
 fi
 
+echo "== I. the PER-TEAM DAILY SPEND CEILING (prod-readiness audit item #2, INV-7 cost cap) =="
+# THE $78k–389k/day/team GAP: the rate cap bounds a SHORT window, the per-dispatch cap bounds
+# ONE dispatch, but neither is a DAILY ceiling. cp_daily_budget adds a durable per-team UTC-day
+# counter of (dispatches, tokens), enforced at the dispatch chokepoint (cp_maintainer_runner).
+# Proven HERMETICALLY (no GCP, no network, $0) with:
+#   I1  dispatch N=cap -> N+1 REFUSED reason=team-daily-cap, NO job row (the count ceiling).
+#   I2  FALSIFIER: team B is UNAFFECTED while team A is capped (per-team isolation, not a global
+#       kill — a build sharing one counter across teams would RED this).
+#   I3  UTC rollover: the same team is FRESH the next UTC day (fake clock, no real sleep).
+#   I4  the TOKEN ceiling refuses independently (reserve 600k × 3 = 1.8M ok, 4th 2.4M > 2M cap).
+#   I5  the DRAIN DEFERS a capped task via requeue -> NO attempt burn (attempts stays 0), distinct
+#       from the retry() failure path — a capped task waits for tomorrow, it is not a failed task.
+#   I6  FIRESTORE-FAKE PARITY: the identical counter behavior through a FirestoreBackend with an
+#       injected in-process fake client (get/put_record only — never path(), firestore-safe).
+IOUT="$WORK/harness_i.json"
+LIB="$LIB" WORK="$WORK" "$PY" - >"$IOUT" 2>"$WORK/harness_i.err" <<'PYEOF'
+import json, os, sys
+sys.path.insert(0, os.environ["LIB"])
+import cp_daily_budget as B
+import cp_maintainer_runner as M
+import cp_team_queue as Q
+
+WORK = os.environ["WORK"]
+REPO = "randomittin/heimdall"
+IHOME = os.path.join(WORK, "ihome")            # a fresh store root for the daily-cap section.
+os.makedirs(IHOME, exist_ok=True)
+DAY0 = 100 * 86400 + 3600                       # a fixed instant: day 100, 01:00 UTC.
+out = {}
+
+
+class FakeRunner:
+    """A hermetic runner double: reports a successful dispatch, executes nothing, needs no GCP."""
+    def __init__(self, name):
+        self.name = name
+
+    def dispatch(self, job_id, *, actor_haid=None, home=None, base_env=None):
+        return {"dispatched": True, "job_id": job_id}
+
+
+LR = FakeRunner("fake-local")
+CR = FakeRunner("fake-cloud")
+
+
+def do_dispatch(team_id, *, now, home=IHOME):
+    """Drive the REAL chokepoint dispatch_maintainer_cycle with injected runners (policy=local,
+    tenant-authz OFF, explicit team_id -> the daily cap keys on it without any mint)."""
+    return M.dispatch_maintainer_cycle(
+        team_id, {"repo": REPO, "max": 1}, home=home, base_env={}, now=now,
+        policy_name="local", actor_haid=team_id, team_id=team_id,
+        local_runner=LR, cloud_runner=CR)
+
+
+# ── I1: dispatch N=cap -> N+1 REFUSED reason=team-daily-cap, no job row ──────────
+os.environ["HEIMDALL_TEAM_DAILY_DISPATCH_MAX"] = "3"
+os.environ["HEIMDALL_TEAM_DAILY_TOKEN_BUDGET"] = "100000000"   # huge -> isolate the count dim.
+teamA = "team-A-" + ("d" * 8)
+allowed = []
+for _ in range(3):
+    r = do_dispatch(teamA, now=DAY0)
+    allowed.append(bool(r.get("job_id")) and not r.get("refused"))
+capped = do_dispatch(teamA, now=DAY0)                          # the N+1'th
+out["I1_first_N_allowed"] = all(allowed) and len(allowed) == 3
+out["I1_capped_refused"] = (capped.get("refused") is True
+                            and capped.get("reason") == "team-daily-cap")
+out["I1_capped_no_job"] = (capped.get("job_id") is None)
+out["I1_capped_status"] = capped.get("http_status")
+out["I1_capped_dim"] = capped.get("limit_dim")
+
+# ── I2: FALSIFIER — team B is UNAFFECTED while team A is capped (per-team isolation) ─
+teamB = "team-B-" + ("e" * 8)
+rb = do_dispatch(teamB, now=DAY0)
+out["I2_teamB_allowed_while_A_capped"] = (bool(rb.get("job_id")) and not rb.get("refused"))
+
+# ── I3: UTC rollover — team A is FRESH the next UTC day (fake clock) ─────────────
+rn = do_dispatch(teamA, now=DAY0 + 86400)
+out["I3_rollover_resets"] = (bool(rn.get("job_id")) and not rn.get("refused"))
+# and STILL capped later the SAME first day (no accidental global reset).
+rstill = do_dispatch(teamA, now=DAY0 + 60)
+out["I3_same_day_still_capped"] = (rstill.get("reason") == "team-daily-cap")
+
+# ── I4: the TOKEN ceiling refuses independently (counter unit, dispatch cap wide open) ─
+lim = B.DailyTeamBudget(home=IHOME)
+teamT = "team-T-" + ("f" * 8)
+tok_allowed = []
+for _ in range(3):
+    d = lim.check_and_consume(teamT, tokens=600_000, dispatch_max=1000,
+                              token_budget=2_000_000, now=DAY0)
+    tok_allowed.append(d.ok)
+d4 = lim.check_and_consume(teamT, tokens=600_000, dispatch_max=1000,
+                           token_budget=2_000_000, now=DAY0)
+out["I4_token_first3_ok"] = all(tok_allowed) and len(tok_allowed) == 3
+out["I4_token_4th_refused"] = (not d4.ok and d4.limit_dim == "tokens")
+out["I4_token_usage_18M"] = (lim.usage(teamT, now=DAY0) == (3, 1_800_000))
+
+# ── I5: the DRAIN DEFERS a capped task via requeue -> NO attempt burn ────────────
+os.environ["HEIMDALL_TEAM_DAILY_DISPATCH_MAX"] = "3"
+os.environ["HEIMDALL_TEAM_DAILY_TOKEN_BUDGET"] = "100000000"
+DHOME = os.path.join(WORK, "dhome")            # a fresh root so the drain counter starts at 0.
+os.makedirs(DHOME, exist_ok=True)
+teamD = "team-D-" + ("a" * 8)
+# The drain resolves the team's repo via cp_ghinstall.covered_repos — pin it hermetically.
+_orig_covered = M.cp_ghinstall.covered_repos
+M.cp_ghinstall.covered_repos = lambda tid, home=None: [REPO]
+try:
+    for i in range(4):
+        Q.enqueue(teamD, "daily-cap drain task number %d" % i, home=DHOME)
+    res = M.drain_team_queue(
+        teamD, home=DHOME, base_env={}, now=DAY0, policy_name="local",
+        local_runner=LR, cloud_runner=CR)
+finally:
+    M.cp_ghinstall.covered_repos = _orig_covered
+out["I5_processed"] = res.get("processed")                     # 3 dispatched
+out["I5_deferred_count"] = len(res.get("deferred") or [])      # 1 deferred
+out["I5_no_retry_no_dead"] = (not res.get("retried") and not res.get("dead"))
+# the deferred task is back in queued with attempts UNBURNED (0) — the requeue, not retry, proof.
+deferred_id = (res.get("deferred") or [None])[0]
+rows = {r["id"]: r for r in Q.list(teamD, home=DHOME)}
+drow = rows.get(deferred_id) or {}
+out["I5_deferred_queued"] = (drow.get("state") == "queued")
+out["I5_deferred_attempts_0"] = (
+    ((drow.get("item") or {}).get("attempts")) == 0)
+
+# ── I6: FIRESTORE-FAKE PARITY — identical counter behavior through FirestoreBackend ─
+import cp_state_firestore as FS
+
+
+class _Snap:
+    def __init__(self, data):
+        self._d = data
+        self.exists = data is not None
+
+    def to_dict(self):
+        return dict(self._d) if self._d is not None else None
+
+
+class _DocRef:
+    def __init__(self, store, key):
+        self._s = store
+        self._k = key
+
+    def set(self, doc):
+        self._s[self._k] = dict(doc)
+
+    def get(self):
+        return _Snap(self._s.get(self._k))
+
+
+class _CollRef:
+    def __init__(self, store, name):
+        self._s = store
+        self._n = name
+
+    def document(self, doc_id):
+        return _DocRef(self._s, (self._n, doc_id))
+
+
+class _FakeClient:
+    def __init__(self):
+        self._s = {}
+
+    def collection(self, name):
+        return _CollRef(self._s, name)
+
+
+be = FS.FirestoreBackend(client=_FakeClient(), root="heimdall_cp", project="p")
+flim = B.DailyTeamBudget(backend=be)
+teamF = "team-F-" + ("b" * 8)
+fs_allowed = []
+for _ in range(3):
+    fs_allowed.append(flim.check_and_consume(
+        teamF, tokens=1, dispatch_max=3, token_budget=10**9, now=DAY0).ok)
+fcap = flim.check_and_consume(teamF, tokens=1, dispatch_max=3, token_budget=10**9, now=DAY0)
+out["I6_fs_first3_ok"] = all(fs_allowed) and len(fs_allowed) == 3
+out["I6_fs_capped"] = (not fcap.ok and fcap.limit_dim == "dispatch")
+# per-team isolation + rollover ALSO hold under firestore (parity with local).
+out["I6_fs_teamG_unaffected"] = flim.check_and_consume(
+    "team-G-cccccccc", tokens=1, dispatch_max=3, token_budget=10**9, now=DAY0).ok
+out["I6_fs_rollover"] = flim.check_and_consume(
+    teamF, tokens=1, dispatch_max=3, token_budget=10**9, now=DAY0 + 86400).ok
+
+print(json.dumps(out, indent=2, sort_keys=True))
+PYEOF
+
+iget() { "$PY" -c 'import json,sys; d=json.load(open(sys.argv[1])); v=d.get(sys.argv[2]); print(json.dumps(v) if not isinstance(v,str) else v)' "$IOUT" "$1"; }
+
+if [ ! -s "$IOUT" ]; then echo "FATAL: I harness produced no output" >&2; cat "$WORK/harness_i.err" >&2; exit 2; fi
+
+{ [ "$(iget I1_first_N_allowed)" = "true" ] && [ "$(iget I1_capped_refused)" = "true" ] && [ "$(iget I1_capped_no_job)" = "true" ]; } \
+  && ok "I1 dispatch N=3=cap allowed, N+1 REFUSED reason=team-daily-cap (status=$(iget I1_capped_status) dim=$(iget I1_capped_dim)), NO job row" \
+  || bad "I1 daily dispatch cap wrong (firstN=$(iget I1_first_N_allowed) refused=$(iget I1_capped_refused) no_job=$(iget I1_capped_no_job))"
+[ "$(iget I2_teamB_allowed_while_A_capped)" = "true" ] \
+  && ok "I2 FALSIFIER: team B dispatches fine WHILE team A is capped (per-team isolation, not a global kill)" \
+  || bad "I2 team B was affected by team A's cap — the counter is NOT per-team isolated"
+{ [ "$(iget I3_rollover_resets)" = "true" ] && [ "$(iget I3_same_day_still_capped)" = "true" ]; } \
+  && ok "I3 UTC rollover: team A FRESH next UTC day, STILL capped the same first day (fake clock)" \
+  || bad "I3 rollover wrong (next_day_fresh=$(iget I3_rollover_resets) same_day_capped=$(iget I3_same_day_still_capped))"
+{ [ "$(iget I4_token_first3_ok)" = "true" ] && [ "$(iget I4_token_4th_refused)" = "true" ] && [ "$(iget I4_token_usage_18M)" = "true" ]; } \
+  && ok "I4 TOKEN ceiling: 3×600k=1.8M allowed, 4th (2.4M>2M) REFUSED (dim=tokens); usage=(3,1.8M)" \
+  || bad "I4 token ceiling wrong (first3=$(iget I4_token_first3_ok) 4th=$(iget I4_token_4th_refused) usage=$(iget I4_token_usage_18M))"
+{ [ "$(iget I5_processed)" = "3" ] && [ "$(iget I5_deferred_count)" = "1" ] && [ "$(iget I5_deferred_queued)" = "true" ] && [ "$(iget I5_deferred_attempts_0)" = "true" ] && [ "$(iget I5_no_retry_no_dead)" = "true" ]; } \
+  && ok "I5 DRAIN defers a capped task via requeue -> attempts UNBURNED (0), queued, not retried/dead (waits for tomorrow)" \
+  || bad "I5 drain deferral wrong (processed=$(iget I5_processed) deferred=$(iget I5_deferred_count) queued=$(iget I5_deferred_queued) attempts0=$(iget I5_deferred_attempts_0) clean=$(iget I5_no_retry_no_dead))"
+{ [ "$(iget I6_fs_first3_ok)" = "true" ] && [ "$(iget I6_fs_capped)" = "true" ] && [ "$(iget I6_fs_teamG_unaffected)" = "true" ] && [ "$(iget I6_fs_rollover)" = "true" ]; } \
+  && ok "I6 FIRESTORE-FAKE PARITY: same cap/isolation/rollover through FirestoreBackend (get/put_record only, never path())" \
+  || bad "I6 firestore parity broke (first3=$(iget I6_fs_first3_ok) capped=$(iget I6_fs_capped) isolation=$(iget I6_fs_teamG_unaffected) rollover=$(iget I6_fs_rollover))"
+
 echo
 echo "cp-maintainer: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
