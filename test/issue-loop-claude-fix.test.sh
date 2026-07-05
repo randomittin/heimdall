@@ -80,13 +80,21 @@ chmod +x "$FAKEBIN/gh"
 # ── build a throwaway repo with an executable acceptance script gating on the edit ────
 new_repo() {
   # $1 = name ; $2 = run_tests body. Prints the repo path.
+  # bug #21: the PR path now COMMITS + PUSHES the heimdall/* branch to `origin` BEFORE
+  # `gh pr create`. Give the clone a real (local, bare) origin so the push lands
+  # hermetically — no network, no live GitHub, the bot token authenticates nothing over a
+  # file:// remote. The bare remote also lets a caller assert the branch actually reached
+  # the remote (git -C <bare> log heimdall/issue/...).
   local name="$1" rt="$2"
   local repo="$WORK/$name"
+  local bare="$WORK/$name.git"
+  git init --bare -q "$bare"
   mkdir -p "$repo"
   git -C "$repo" init -q
   git -C "$repo" config user.email t@t
   git -C "$repo" config user.name t
   git -C "$repo" config commit.gpgsign false
+  git -C "$repo" remote add origin "$bare"
   printf 'app v1\n' > "$repo/app.py"
   printf '%s' "$rt" > "$repo/run_tests.sh"
   chmod +x "$repo/run_tests.sh"
@@ -170,6 +178,20 @@ if grep -q 'pr create' "$GH_LOG"; then
   ok "the PR path was INVOKED — the fake gh recorded a \`pr create\`"
 else
   bad "the fake gh recorded no \`pr create\` (PR path not invoked): $(cat "$GH_LOG")"
+fi
+# bug #21: the heimdall/* branch was COMMITTED + PUSHED to the (local, bare) origin —
+# a PR now references a branch that ACTUALLY reached the remote (not an empty/dangling ref).
+BARE1="$WORK/pass_repo.git"
+BRANCH1="heimdall/issue/github-acme-widget-20"
+if git -C "$BARE1" rev-parse --verify "refs/heads/$BRANCH1" >/dev/null 2>&1; then
+  ok "the fix branch ($BRANCH1) was PUSHED to origin (bug #21: the branch exists on the remote)"
+else
+  bad "the fix branch never reached origin — a PR would reference a non-existent branch (bug #21)"
+fi
+if git -C "$BARE1" show "$BRANCH1:app.py" 2>/dev/null | grep -q FIXED; then
+  ok "the pushed branch CARRIES the fix edit (app.py contains FIXED on the remote branch)"
+else
+  bad "the pushed branch is empty/missing the fix edit — the PR would be empty"
 fi
 
 echo "── (2) FALSIFIER — no-edit claude -> ./run_tests.sh red -> GATE_FAILED, NO PR ────────"

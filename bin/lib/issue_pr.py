@@ -58,6 +58,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -77,12 +78,40 @@ PR_OPEN = "PR_OPEN"
 # The canonical Heimdall domain (README + share card); NOT a secret, NEVER a token.
 HEIMDALL_LANDING_URL = "https://runheimdall.dev"
 
+# ── the bot COMMITTER identity for the fix commit pushed onto the heimdall/* branch ──
+#   The commit that carries the fix is authored + committed by a BOT handle (never a real
+#   person, never RJ). This mirrors the scoped-bot-token PUSH identity (gh_bot_runner's
+#   "heimdall-pr-bot"): the branch is the bot's, the commit is the bot's, and a HUMAN
+#   merges. The noreply email is the canonical GitHub App/[bot] shape so the commit is
+#   attributed to the bot on GitHub, not to whatever git identity the runner box carries.
+PR_BOT_COMMITTER_NAME = "heimdall-maintainer[bot]"
+PR_BOT_COMMITTER_EMAIL = "heimdall-maintainer[bot]@users.noreply.github.com"
+
+# GitHub token / PEM shapes redacted from any git/gh error BEFORE it is surfaced. The
+# token rides the child ENV (never argv/URL), but a misconfigured remote could echo a
+# credential-bearing URL — belt-and-suspenders, mirroring maintain_loop._GIT_TOKENISH_RX.
+_GIT_TOKENISH_RX = re.compile(
+    r"(gh[oprsu]_[A-Za-z0-9]{6,}|github_pat_[A-Za-z0-9_]{6,}"
+    r"|x-access-token:[^@\s]+|-----BEGIN[^\n]*)")
+
+# A PR url (…/pull/<n>) parsed out of `gh pr create` output — used to recover the
+# EXISTING PR's url when gh reports the branch already has an open PR (idempotency).
+_PR_URL_RX = re.compile(r"https://\S+?/pull/\d+")
+
 
 class HumanGateError(Exception):
     """Raised when a caller tries to drive a state transition the human-approval
     gate forbids: opening a PR on an UNPROVEN change (all_passed != True), or
     writing back a PR a human has NOT actually merged. The gate fails LOUD, never
     silently doing the forbidden thing."""
+
+
+class PushError(Exception):
+    """Raised when committing the working-tree fix onto the heimdall/* branch or pushing
+    that branch to origin FAILS. The message is ALWAYS token-scrubbed (a git/gh URL or
+    stderr can carry a credential) and names a git error, never a Python traceback. When
+    this is raised open_pr has made NO `gh pr create` attempt — a PR is never opened
+    against a branch that did not reach the remote (bug #21). The loop flags the issue."""
 
 
 # ── connector access (the originating source we route the resolution back to) ──
@@ -312,6 +341,191 @@ def build_gh_create_command(issue, title, body_file, base="main"):
     ]
 
 
+# ── commit + push the fix onto the heimdall/* branch (bug #21: a PR needs a branch) ──
+#   open_pr used to build `gh pr create --head heimdall/issue/<id>` while NOTHING ever
+#   created/pushed that branch — the loop's working-tree edits were left uncommitted and
+#   unpushed, so a live PASS would open a PR against a ref the remote never saw (empty /
+#   failing PR). The branch is created + committed + pushed HERE, THEN gh pr create runs.
+#
+#   Auth rides the SAME scoped-bot-token-via-env discipline as maintain_loop's clone: the
+#   token is injected into the child ENV (GH_TOKEN for `gh`; HEIMDALL_GIT_ASKPASS_TOKEN
+#   for the plain-git push's askpass helper, username fixed to x-access-token), NEVER on
+#   argv and NEVER inside a logged URL. The commit is authored + committed by the BOT
+#   identity (PR_BOT_COMMITTER_*), never a real person. HARD SAFETY: the branch is ALWAYS
+#   under heimdall/* — a non-heimdall / main / base ref is REFUSED before any push, and we
+#   push ONLY that one ref (never main, never a merge). Re-runs FORCE-update the bot's own
+#   branch (safe — it is the bot's namespace), so a second cycle on the same issue is
+#   idempotent rather than a fatal non-fast-forward.
+
+# The GIT_ASKPASS helper for the plain-git push fallback — the SAME shape maintain_loop
+# uses. It reads the token from the env ONLY (HEIMDALL_GIT_ASKPASS_TOKEN) so it is safe on
+# disk (it never contains the token); the username is the fixed x-access-token GitHub
+# expects for an installation / fine-grained-PAT token.
+_ASKPASS_BODY = (
+    "#!/bin/sh\n"
+    "# Heimdall PR-bot git askpass: emit the scoped bot token for the password prompt and\n"
+    "# the fixed username for the username prompt. The token rides HEIMDALL_GIT_ASKPASS_TOKEN\n"
+    "# in the env ONLY — never on argv, never written into any git config or URL.\n"
+    'case "$1" in\n'
+    "  Username*|username*) printf 'x-access-token\\n' ;;\n"
+    "  *) printf '%s\\n' \"${HEIMDALL_GIT_ASKPASS_TOKEN:-}\" ;;\n"
+    "esac\n"
+)
+
+
+def _scrub_git_error(text):
+    """Make a git/gh error LOG-SAFE: redact any token-ish run, collapse whitespace to one
+    line, hard-cap it. Returns '' for empty. Idempotent. Mirrors maintain_loop's scrubber
+    so a push failure surfaced to the loop/CLI can never carry a credential."""
+    if not text:
+        return ""
+    scrubbed = _GIT_TOKENISH_RX.sub("<redacted>", str(text))
+    return " ".join(scrubbed.split())[:300]
+
+
+def _resolve_repo(repo):
+    """The workspace working-tree the fix landed in: the given repo, else the cwd (the
+    loop invokes the coder with cwd=<workspace>, so the edits live there). Absolute."""
+    return os.path.abspath(repo) if repo else os.getcwd()
+
+
+def _ensure_push_askpass(repo):
+    """Write (once) the tiny GIT_ASKPASS helper INSIDE the clone's .git dir and return its
+    path, or None on an IO failure. Placing it under .git keeps it out of the working tree
+    (so `git add -A` never stages it) and out of the pushed branch. The helper reads the
+    token from the env — it never contains the token."""
+    try:
+        gitdir = os.path.join(repo, ".git")
+        if not os.path.isdir(gitdir):
+            # a worktree / submodule points .git at a file; fall back to the repo root.
+            gitdir = repo
+        path = os.path.join(gitdir, "heimdall-pr-askpass.sh")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(_ASKPASS_BODY)
+        os.chmod(path, 0o700)
+    except OSError:
+        return None
+    return path
+
+
+def _bot_push_env(repo, token):
+    """The child env for the `git push` of the heimdall/* branch as the SCOPED PR bot — the
+    SAME token-via-env discipline as _bot_env / maintain_loop._bot_clone_env. The bot token
+    is injected as GH_TOKEN (for any `gh`-driven credential helper) AND exposed to the
+    GIT_ASKPASS helper via HEIMDALL_GIT_ASKPASS_TOKEN (username x-access-token). The RAW
+    HEIMDALL_PR_BOT_TOKEN and any inherited personal GITHUB_TOKEN are SCRUBBED so ONLY the
+    scoped bot identity ever pushes and the child can never echo the raw token. The token
+    rides the ENV only — never argv, never a logged URL. GIT_TERMINAL_PROMPT=0 makes a
+    missing credential fail LOUD instead of hanging on an interactive prompt."""
+    env = dict(os.environ)
+    env.pop("HEIMDALL_PR_BOT_TOKEN", None)
+    env.pop("GITHUB_TOKEN", None)
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GH_TOKEN"] = token
+    helper = _ensure_push_askpass(repo)
+    if helper:
+        env["GIT_ASKPASS"] = helper
+        env["HEIMDALL_GIT_ASKPASS_TOKEN"] = token
+    return env
+
+
+def _git(repo, args, env=None):
+    """Run `git -C <repo> <args>` capturing stdout+stderr (text). Never raises on a
+    non-zero exit — the caller branches on returncode + scrubs stderr."""
+    return subprocess.run(
+        ["git", "-C", repo] + list(args),
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+    )
+
+
+def _commit_message(issue):
+    """A conventional commit message naming the issue (the audit trail on the branch)."""
+    issue_id = issue.get("id", "issue")
+    title = issue.get("title") or issue_id
+    return (
+        "fix: %s\n\n"
+        "Resolves %s — opened by Heimdall's issue-resolution loop on a gate-PASS fix.\n"
+        % (title, issue_id)
+    )
+
+
+def _commit_and_push_branch(issue, branch, repo, base, token):
+    """Create/reset the heimdall/* branch at HEAD, stage + commit the working-tree fix as
+    the BOT identity, and push the branch to origin (scoped bot token via env). This is the
+    step bug #21 was missing: a `gh pr create --head <branch>` is meaningless unless the
+    branch actually reached the remote.
+
+    HARD SAFETY (enforced BEFORE any git write): `branch` MUST be under heimdall/* and MUST
+    NOT be main/master nor the PR base — we NEVER push main and NEVER touch a non-bot ref.
+    We push ONLY this one ref, with --force (the bot's OWN namespace — a re-run idempotently
+    force-updates the same branch; there is no merge and no main push, so a force here is
+    scoped and safe). A commit is made ONLY when `git add -A` staged real changes; when the
+    fix is already committed (HEAD carries it) we skip the commit and push HEAD's branch.
+
+    On ANY git failure raises PushError with the SCRUBBED git error (never a token, never a
+    traceback). Returns { pushed, branch, commit, committed } on success."""
+    repo = _resolve_repo(repo)
+    # ── SAFETY GATE: the branch is ALWAYS the bot's heimdall/* namespace, never main ──
+    if not isinstance(branch, str) or not branch.startswith("heimdall/"):
+        raise PushError(
+            "refusing to push %r: a fix branch is ALWAYS under heimdall/* (never main, "
+            "never a non-bot ref)" % branch)
+    if branch in ("main", "master") or branch == base:
+        raise PushError(
+            "refusing to push %r: it collides with main/base — Heimdall NEVER pushes main"
+            % branch)
+
+    # ── 1) create/reset the branch at HEAD, carrying the uncommitted working-tree edits ─
+    r = _git(repo, ["checkout", "-B", branch])
+    if r.returncode != 0:
+        raise PushError(
+            "could not create branch %s in %s: %s"
+            % (branch, repo, _scrub_git_error(r.stderr) or "git checkout -B failed"))
+
+    # ── 2) stage ALL working-tree edits (scope: this clone only) ──────────────────────
+    r = _git(repo, ["add", "-A"])
+    if r.returncode != 0:
+        raise PushError(
+            "could not stage the fix in %s: %s"
+            % (repo, _scrub_git_error(r.stderr) or "git add -A failed"))
+
+    # ── 3) commit iff there are staged changes — as the BOT identity ──────────────────
+    # `git diff --cached --quiet` exits 1 when something is staged, 0 when nothing is.
+    committed = False
+    staged = _git(repo, ["diff", "--cached", "--quiet"])
+    if staged.returncode == 1:
+        r = _git(repo, [
+            "-c", "user.name=%s" % PR_BOT_COMMITTER_NAME,
+            "-c", "user.email=%s" % PR_BOT_COMMITTER_EMAIL,
+            "commit", "--no-verify", "-m", _commit_message(issue),
+        ])
+        if r.returncode != 0:
+            raise PushError(
+                "could not commit the fix in %s: %s"
+                % (repo, _scrub_git_error(r.stderr) or "git commit failed"))
+        committed = True
+    elif staged.returncode != 0:
+        raise PushError(
+            "could not inspect the staged fix in %s: %s"
+            % (repo, _scrub_git_error(staged.stderr) or "git diff --cached failed"))
+
+    head = _git(repo, ["rev-parse", "HEAD"])
+    commit_sha = (head.stdout or "").strip() if head.returncode == 0 else None
+
+    # ── 4) push ONLY the heimdall/* branch to origin (scoped bot token via env) ────────
+    # --force: the bot's own namespace, so a re-run force-updates the SAME branch (idempotent).
+    # This is scoped to heimdall/* (guarded above) — never main, never a merge.
+    push = _git(repo, ["push", "--force", "origin",
+                       "%s:refs/heads/%s" % (branch, branch)],
+                env=_bot_push_env(repo, token))
+    if push.returncode != 0:
+        raise PushError(
+            "push of %s to origin failed: %s"
+            % (branch, _scrub_git_error(push.stderr) or "git push exited nonzero"))
+
+    return {"pushed": True, "branch": branch, "commit": commit_sha, "committed": committed}
+
+
 # ── open_pr: the terminal loop action — OPEN + STOP. Never merges, never closes ─
 
 
@@ -378,9 +592,22 @@ def open_pr(issue, record, repo=None, base="main", gh_runner=None):
     body_file = _write_body_file(issue_id, body, repo)
     create_command = build_gh_create_command(issue, title, body_file, base=base)
 
-    # open the PR via the runner (mock in tests; the scoped bot token at runtime).
-    # Default = gh_bot_runner: pushes the heimdall/* branch + opens the PR under the
-    # bot identity, or (no bot token) records the shape only — NEVER personal creds.
+    # ── bug #21: COMMIT + PUSH the fix onto the heimdall/* branch BEFORE opening the PR ─
+    # `gh pr create --head heimdall/issue/<id>` is meaningless unless that branch actually
+    # reached the remote. When a scoped bot token is present we create+commit+push the
+    # branch here (bot identity, token via env — NEVER personal creds, NEVER main). A
+    # push/commit failure raises PushError -> NO `gh pr create` is attempted (no PR against
+    # a branch the remote never saw) and the loop flags the issue. With NO bot token we are
+    # in record-only mode (gh_bot_runner also degrades to record-only): we build the
+    # artifact + push NOTHING — the agent never pushes with RJ's personal creds.
+    token = os.environ.get("HEIMDALL_PR_BOT_TOKEN")
+    push_result = None
+    if token:
+        push_result = _commit_and_push_branch(issue, branch, repo, base, token)
+
+    # open the PR via the runner (mock in tests; the scoped bot-token `gh` at runtime).
+    # Default = gh_bot_runner: opens the PR under the bot identity against the branch the
+    # push above landed, or (no bot token) records the create-command shape only.
     runner = gh_runner or gh_bot_runner
     gh_result = runner(create_command)
 
@@ -397,6 +624,7 @@ def open_pr(issue, record, repo=None, base="main", gh_runner=None):
         "body": body,
         "body_file": body_file,
         "create_command": create_command,
+        "push": push_result,
         "gh": gh_result,
         "all_passed": True,
         # explicit, auditable proof of the human gate: open_pr opened + stopped.
@@ -450,6 +678,22 @@ def gh_bot_runner(argv):
         env=_bot_env(token),
     )
     out = (proc.stdout or "").strip().splitlines()
+    # IDEMPOTENCY: a re-run on the same issue re-pushes the branch and re-runs `gh pr
+    # create`; gh EXITS NON-ZERO when an open PR already exists for the head branch. That
+    # is SUCCESS for us — the PR is already open. Detect "already exists", recover the
+    # existing PR url from gh's message, and return ok=True (never a spurious failure).
+    combined = "%s\n%s" % (proc.stdout or "", proc.stderr or "")
+    if proc.returncode != 0 and "already exists" in combined.lower():
+        existing = _PR_URL_RX.search(combined)
+        return {
+            "ok": True,
+            "pushed": True,
+            "already_exists": True,
+            "url": existing.group(0) if existing else (out[-1] if out else None),
+            "exit": proc.returncode,
+            "command": " ".join(shlex.quote(t) for t in argv),
+            "identity": "heimdall-pr-bot",
+        }
     return {
         "ok": proc.returncode == 0,
         "pushed": proc.returncode == 0,
@@ -781,6 +1025,11 @@ def _cli(argv):
             result = open_pr(issue, record, repo=repo, base=args.base)
         except HumanGateError as exc:
             print("error: %s" % exc, file=sys.stderr)
+            return 1
+        except PushError as exc:
+            # the branch commit/push failed -> NO PR was attempted (bug #21). Loud +
+            # scrubbed, exit 1 — the same shape a HumanGateError refusal takes.
+            print("error: branch push failed, no PR opened: %s" % exc, file=sys.stderr)
             return 1
         _emit_open(result, args.do_print)
         return 0
