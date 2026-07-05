@@ -61,6 +61,7 @@ if _HERE not in sys.path:
 import cp_allowlist   # THE §1 gate — re-validate the maintainer params at dispatch (defense in depth).
 import cp_audit       # §9 — a dispatch / failover / park writes a job_state row (params-shape, no token).
 import cp_auth        # INV-1 — the SINGLE source of team_id (registered_team from the enroll binding).
+import cp_daily_budget # INV-7 — the per-team DAILY spend ceiling (durable UTC-day counter, cost cap).
 import cp_ghinstall   # INV-11/INV-2/A5 — the repo<->team authz predicate + the per-team install token.
 import cp_jobrunner   # the runner impls: SubprocessRunner (Arch A) + CloudRunJobRunner (Arch B).
 import cp_jobstore    # the durable job store — the cycle EXISTS here the moment it is dispatched.
@@ -124,6 +125,25 @@ _DRAIN_MAX_DEFAULT = 10
 _TEAM_BUDGET_ENV = "HEIMDALL_RR_TEAM_BUDGET_TOKENS"
 _TEAM_BUDGET_DEFAULT = 600_000
 
+# ── the per-team DAILY spend ceiling (INV-7 durable cost cap; prod-readiness audit item #2) ──
+#
+# The per-cycle rate cap (_DRAIN_RATE) + the per-dispatch token cap (_TEAM_BUDGET) bound one
+# dispatch and the SHORT-window rate, but neither is a DAILY ceiling: a team dispatching at the
+# rate cap all day burned ~$78k–389k/day before the lagging $10k billing kill-switch tripped.
+# This adds the missing PROACTIVE per-team daily ceiling — a durable UTC-day counter of
+# (dispatches, tokens), checked HERE at the dispatch chokepoint (the same place the token is
+# minted), so a runaway team is capped BEFORE the spend, per-team, not fleet-wide-after-the-fact.
+# Env-tunable; the counter rolls over at UTC midnight and is Firestore-durable (cp_daily_budget).
+_TEAM_DAILY_DISPATCH_ENV = "HEIMDALL_TEAM_DAILY_DISPATCH_MAX"
+_TEAM_DAILY_DISPATCH_DEFAULT = 20          # dispatches/team/day
+_TEAM_DAILY_TOKEN_ENV = "HEIMDALL_TEAM_DAILY_TOKEN_BUDGET"
+_TEAM_DAILY_TOKEN_DEFAULT = 2_000_000      # tokens/team/day (the per-dispatch 600k cap stays)
+
+# The machine reason a daily-cap refusal carries — the drain keys on it to DEFER (requeue, no
+# attempt burn) rather than RETRY (which would burn the task's bounded attempts budget). A capped
+# task is not a FAILED task: it simply has to wait for tomorrow's UTC rollover.
+TEAM_DAILY_CAP_REASON = "team-daily-cap"
+
 
 def tenant_authz_enabled(env=None):
     """True iff HEIMDALL_RR_TENANT_AUTHZ is set truthy — this deploy enforces the multi-tenant
@@ -154,6 +174,45 @@ def _team_secret_env_names():
     bot token. Stripping them guarantees no other tenant's — nor the operator's ambient — cred
     can survive into this team's job; only the explicitly-overlaid per-team values remain."""
     return set(cp_team_creds.ENV_FOR_KIND.values()) | {_PR_BOT_TOKEN_ENV}
+
+
+def team_daily_caps():
+    """The active per-team daily ceilings (dispatch_max, token_budget) — env-tunable via
+    HEIMDALL_TEAM_DAILY_DISPATCH_MAX (default 20/team/day) + HEIMDALL_TEAM_DAILY_TOKEN_BUDGET
+    (default 2,000,000/team/day). _int_env clamps a malformed / non-positive override back to the
+    default, so a misconfig never silently disables the ceiling."""
+    return (_int_env(_TEAM_DAILY_DISPATCH_ENV, _TEAM_DAILY_DISPATCH_DEFAULT),
+            _int_env(_TEAM_DAILY_TOKEN_ENV, _TEAM_DAILY_TOKEN_DEFAULT))
+
+
+def _daily_cap_refusal(cap_team, reserve_tokens, *, home, now):
+    """CHECK (and, when within budget, CONSUME) this team's daily spend ceiling at the dispatch
+    chokepoint. Returns None on ALLOW (the daily counters were incremented — the dispatch may
+    proceed), or a REFUSAL outcome dict on a cap hit (nothing consumed — the dispatch is denied
+    BEFORE any job row exists, so it burns no attempt and leaves no orphan job).
+
+    `reserve_tokens` is this dispatch's token RESERVATION (its budget_tokens cap) — the amount
+    charged against the daily token budget up front. On a cap hit we emit ONE loud, token-free
+    log line naming which ceiling was hit + the day-to-date usage, and return a 429 refusal whose
+    reason is TEAM_DAILY_CAP_REASON (the drain keys on it to DEFER without burning an attempt).
+    A fail-open (backend error) ALLOWS and is logged inside cp_daily_budget."""
+    dispatch_max, token_budget = team_daily_caps()
+    decision = cp_daily_budget.DailyTeamBudget(home=home).check_and_consume(
+        cap_team, tokens=reserve_tokens, dispatch_max=dispatch_max,
+        token_budget=token_budget, now=now)
+    if decision.ok:
+        return None
+    _log("REFUSED team=%s reason=%s dim=%s dispatches=%d/%d tokens=%d/%d retry_after=%ds "
+         "(INV-7 daily spend cap) — no job created; deferrable (no attempt burn)"
+         % (_team_tag(cap_team), TEAM_DAILY_CAP_REASON, decision.limit_dim,
+            decision.dispatches, decision.dispatch_max,
+            decision.tokens, decision.token_budget, decision.retry_after))
+    return {"dispatched": False, "refused": True, "reason": TEAM_DAILY_CAP_REASON,
+            "arm": None, "parked": False, "failover": False, "http_status": 429,
+            "limit_dim": decision.limit_dim, "retry_after": decision.retry_after,
+            "daily_dispatches": decision.dispatches, "daily_tokens": decision.tokens,
+            "daily_dispatch_max": decision.dispatch_max,
+            "daily_token_budget": decision.token_budget}
 
 
 def _deny(actor, repo, reason, home, *, detail=None, mint_ms=None):
@@ -630,6 +689,26 @@ def dispatch_maintainer_cycle(identity, params, *, home=None, base_env=None, now
         if refusal is not None:
             return refusal   # 403 fail-closed — no job, no dispatch (INV-3/INV-11).
 
+    # 1c. THE PER-TEAM DAILY SPEND CEILING (INV-7 durable cost cap; audit item #2). Runs AFTER
+    #     authz (so a 403-worthy dispatch never consumes budget) but BEFORE create_job (so a
+    #     capped dispatch produces NO job row and burns NO attempt). The ceiling is per-TEAM, so
+    #     it applies whenever a team_id is resolvable: the trusted server-side DRAIN always passes
+    #     the partition's team_id (the multi-tenant blast-radius path this defends), and the
+    #     request/scheduler path derives it via cp_auth when the tenant-authz gate is on. A single-
+    #     tenant box with no resolvable team (tenant-authz OFF, RJ's own subscription) is
+    #     unaffected — byte-for-byte as before, exactly like the keystone's additive discipline.
+    cap_team = team_id if team_id else (
+        cp_auth.registered_team(actor, home=home) if tenant_authz_enabled() else None)
+    if cap_team:
+        # The token RESERVATION charged against the daily budget: this dispatch's budget_tokens
+        # cap when present, else the per-dispatch default (the 600k per-dispatch ceiling).
+        reserve = clean.get("budget_tokens")
+        if not isinstance(reserve, int) or reserve <= 0:
+            reserve = _TEAM_BUDGET_DEFAULT
+        refusal = _daily_cap_refusal(cap_team, reserve, home=home, now=now)
+        if refusal is not None:
+            return refusal   # 429 daily-cap — no job, no dispatch; deferrable (no attempt burn).
+
     # 2. SELECT the arm (deterministic + reason).
     decision = select_runner_arm(repo, home=home, now=now, policy_name=policy_name,
                                  cloud_ok=cloud_ok, runner_live=runner_live)
@@ -762,7 +841,7 @@ def drain_team_queue(team_id, *, home=None, base_env=None, now=None, policy_name
         _log("drain team=%s SKIP reason=no_covered_repo (nothing to dispatch against)"
              % _team_tag(team_id))
         return {"team_id": team_id, "processed": 0, "task_ids": [], "arms": [],
-                "retried": [], "dead": [], "reason": "no_covered_repo"}
+                "retried": [], "dead": [], "deferred": [], "reason": "no_covered_repo"}
     repo = repos[0]   # MVP: one repo per team (design OUT OF SCOPE: multi-repo per team).
     cap = max_dispatch if max_dispatch is not None else _int_env(_DRAIN_MAX_ENV, _DRAIN_MAX_DEFAULT)
     budget = budget_tokens if budget_tokens is not None else _drain_budget_tokens()
@@ -775,6 +854,7 @@ def drain_team_queue(team_id, *, home=None, base_env=None, now=None, policy_name
     arms = []
     retried = []
     dead = []
+    deferred = []  # tasks DEFERRED by the daily spend cap — requeued WITHOUT burning an attempt.
     seen = set()   # ids handled THIS pass — a retried task must not re-drive within one pass.
     while processed < cap:
         # INV-7 — per-team dispatch-rate cap (keyed on the hashed team_id). Over cap -> stop the
@@ -831,6 +911,19 @@ def drain_team_queue(team_id, *, home=None, base_env=None, now=None, policy_name
             arms.append(outcome.get("arm"))
             _log("drain team=%s task=%s DISPATCHED arm=%s job=%s"
                  % (_team_tag(team_id), tid, outcome.get("arm"), outcome.get("job_id")))
+        elif outcome.get("reason") == TEAM_DAILY_CAP_REASON:
+            # DAILY SPEND CAP — this is NOT a failed task, it simply has to wait for the UTC
+            # rollover. DEFER it (requeue -> back to `queued` unchanged, NO attempt burn) so its
+            # bounded attempts budget is untouched; a capped task must never be driven toward the
+            # `dead` bucket. The whole day's budget for this team is now spent, so every further
+            # dispatch would also be capped -> STOP the sweep (the remaining tasks stay queued,
+            # re-drivable after tomorrow's rollover). Not counted as `processed` (no work started).
+            cp_team_queue.requeue(team_id, tid, home=home)
+            deferred.append(tid)
+            _log("drain team=%s task=%s DEFERRED reason=%s (no attempt burn) -> requeued for the "
+                 "next UTC day; stopping sweep (daily budget spent)"
+                 % (_team_tag(team_id), tid, TEAM_DAILY_CAP_REASON))
+            break
         else:
             reason = outcome.get("reason") or "no_durable_work"
             res = cp_team_queue.retry(
@@ -854,7 +947,8 @@ def drain_team_queue(team_id, *, home=None, base_env=None, now=None, policy_name
         processed += 1
         task_ids.append(tid)
     return {"team_id": team_id, "processed": processed,
-            "task_ids": task_ids, "arms": arms, "retried": retried, "dead": dead}
+            "task_ids": task_ids, "arms": arms, "retried": retried, "dead": dead,
+            "deferred": deferred}
 
 
 def drain_all_team_queues(*, home=None, base_env=None, now=None, policy_name=None):
