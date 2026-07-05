@@ -803,6 +803,12 @@ def _persist_autopilot(repo, cycle, stop, heartbeat):
 HEIMDALL_MAINTAIN_WORKDIR_ENV = "HEIMDALL_MAINTAIN_WORKDIR"
 
 STOP_WORKSPACE = "workspace-error"   # the workspace could not be resolved / cloned.
+STOP_QUEUE_SYNC = "queue-sync-error"  # GitHub issue-list failed — LOUD, not silent-empty.
+
+# The GitHub label that marks an issue as maintainer-owned work. Only OPEN issues
+# carrying this label are ingested into the queue (the maintainer's inbox).
+DEFAULT_MAINTAINER_LABEL = "maintainer"
+DEFAULT_ISSUE_SYNC_LIMIT = 50
 
 # One slug segment: starts alnum, then alnum/._- only. Rejects "", ".", "..", any "/" or
 # "\", and every shell metachar/whitespace — so a segment can never traverse or escape the
@@ -1031,6 +1037,104 @@ def resolve_workspace(repo_arg, *, allow_clone=True):
     return workdir
 
 
+# ── GITHUB INGEST: populate the queue from OPEN maintainer-labeled issues ──────
+#
+# The loop DRAINS a queue; this is what FILLS it. Without a sync step nothing ever
+# feeds the queue from GitHub, so every cloud cycle stops empty-queue while the target
+# repo has open work waiting (the observed cloud-run break). sync pulls the OPEN issues
+# labeled `maintainer`, maps each through issue_queue.normalize (the SINGLE mapping
+# owner — so ids/severity/age match every other ingest path byte-for-byte), and ingests
+# them. Dedup is the queue's job: ingest() is idempotent by id, so a re-sync of the same
+# issues adds nothing (and an id already in_flight/resolved/flagged is never re-queued).
+#
+# Auth rides the SCOPED PR-bot token via the child ENV exactly the way the clone does
+# (GH_TOKEN for `gh`, any inherited personal GITHUB_TOKEN SCRUBBED) — never on argv,
+# never in a logged URL. A list failure is LOUD (QueueSyncError -> STOP_QUEUE_SYNC),
+# never a silent empty-queue.
+
+
+class QueueSyncError(Exception):
+    """GitHub issue-list could not be run or parsed. The message is token-scrubbed and
+    names the gh error, never a Python traceback and never a credential."""
+
+
+def _github_slug_for_sync(raw_repo, repo):
+    """The owner/name slug to list issues for: the raw `--repo` arg when it already IS a
+    slug (the cloud shape), else the resolved checkout's git remote (the workstation
+    shape). None when neither yields a slug — the caller then skips the sync (a local
+    throwaway repo with no GitHub remote genuinely has nothing to pull)."""
+    try:
+        owner, name = _parse_repo_slug(raw_repo)
+        return "%s/%s" % (owner, name)
+    except WorkspaceError:
+        return _remote_owner_name(repo)
+
+
+def sync_queue_from_github(repo_slug, repo=None, cfg=None,
+                           label=DEFAULT_MAINTAINER_LABEL,
+                           limit=DEFAULT_ISSUE_SYNC_LIMIT, env=None):
+    """List OPEN issues labeled `label` on `repo_slug` via `gh`, normalize each through
+    issue_queue.normalize("github", ...), and ingest them into the queue under `repo`.
+
+    Auth rides the bot token in the child ENV (GH_TOKEN), NEVER argv — the same discipline
+    as the clone. Returns {"listed": N, "ingested": M} (M = NEWLY queued; ingest dedups by
+    id, so a re-sync of known ids adds 0). Raises QueueSyncError (token-scrubbed) when gh
+    is absent, exits non-zero, or emits unparseable JSON — the caller maps that to a LOUD
+    STOP_QUEUE_SYNC, never a silent empty-queue."""
+    owner, name = _parse_repo_slug(repo_slug)   # refuse a bad slug before shelling out
+    slug = "%s/%s" % (owner, name)
+    if not shutil.which("gh"):
+        raise QueueSyncError(
+            "gh CLI not found on PATH — cannot list issues for %s" % slug)
+    argv = ["gh", "issue", "list", "--repo", slug, "--state", "open",
+            "--label", label, "--json", "number,title,body,labels,createdAt",
+            "--limit", str(int(limit))]
+    child_env = env if env is not None else _bot_clone_env(with_askpass=False)
+    try:
+        proc = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              text=True, env=child_env)
+    except OSError as exc:
+        raise QueueSyncError(
+            "could not run gh issue list for %s: %s"
+            % (slug, _scrub_git_error(str(exc))))
+    if proc.returncode != 0:
+        note = _scrub_git_error(proc.stderr) or ("gh exited %d" % proc.returncode)
+        raise QueueSyncError("gh issue list for %s failed: %s" % (slug, note))
+    out = (proc.stdout or "").strip()
+    try:
+        items = json.loads(out) if out else []
+    except ValueError as exc:
+        raise QueueSyncError(
+            "gh issue list for %s returned unparseable JSON: %s"
+            % (slug, _scrub_git_error(str(exc))))
+    if not isinstance(items, list):
+        raise QueueSyncError(
+            "gh issue list for %s did not return a JSON array" % slug)
+    normalized = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        number = it.get("number")
+        if number is None:
+            continue
+        raw_item = {
+            "repo": slug,
+            "number": number,
+            "title": it.get("title") or "",
+            "body": it.get("body") or "",
+            "labels": it.get("labels") or [],
+            "created_at": it.get("createdAt") or it.get("created_at"),
+            "html_url": it.get("url")
+            or ("https://github.com/%s/issues/%s" % (slug, number)),
+        }
+        normalized.append(issue_queue.normalize("github", raw_item, cfg))
+    q = issue_queue.IssueQueue(repo=repo)
+    ingested = q.ingest_many(normalized)
+    if ingested:
+        q.save()
+    return {"listed": len(normalized), "ingested": ingested}
+
+
 # ── the AUTOPILOT run loop (drives issue_loop.run_once cycle-by-cycle) ─────────
 
 
@@ -1143,6 +1247,31 @@ def run(repo, base="HEAD", evidence_cmds=None, cfg=None, max_cycles=0,
     )
     if context_block is not None:
         fix_runner = make_context_fix_runner(context_block, inner=fix_runner)
+
+    # ── GITHUB INGEST (fill BEFORE the first pick): a maintainer with an EMPTY queue
+    #    always looks at GitHub — that IS its job. When nothing is queued, pull the OPEN
+    #    maintainer-labeled issues and ingest them (idempotent dedup by id), so both the
+    #    EXPLICIT (rr) and SCHEDULED paths populate the queue the loop then drains. A
+    #    list FAILURE is LOUD (stop=queue-sync-error, a scrubbed note) — never a silent
+    #    empty-queue. No open maintainer issues -> 0 ingested -> the genuine empty-queue
+    #    stop below (unchanged). A repo with no GitHub remote/slug -> nothing to sync.
+    if not _peek_queued(repo, cfg):
+        sync_slug = _github_slug_for_sync(raw_repo, repo)
+        if sync_slug:
+            try:
+                sync_queue_from_github(sync_slug, repo=repo, cfg=cfg)
+            except QueueSyncError as exc:
+                note = "queue sync failed: %s" % _scrub_git_error(str(exc))
+                sys.stderr.write("maintain-loop: %s\n" % note)
+                return {
+                    "cycles": 0,
+                    "stop": STOP_QUEUE_SYNC,
+                    "tally": tally,
+                    "last": None,
+                    "budget": budget,
+                    "results": [],
+                    "note": note,
+                }
 
     cycle = 0
     fail_streak = 0

@@ -437,9 +437,18 @@ GH_ARGV_LOG="$WORK/gh_argv.log"; : > "$GH_ARGV_LOG"
 GH_ENV_LOG="$WORK/gh_env.log"; : > "$GH_ENV_LOG"
 cat > "$FAKEBIN/gh" <<GHEOF
 #!/usr/bin/env bash
-# fake gh — record argv + GH_TOKEN-in-env, fabricate a checkout on \`repo clone\`.
+# fake gh — record argv + GH_TOKEN-in-env, fabricate a checkout on \`repo clone\`,
+# and serve a canned/failing \`issue list\` (the queue-sync seam).
 printf '%s\n' "\$*" >> "$GH_ARGV_LOG"
 [ -n "\${GH_TOKEN:-}" ] && printf 'GH_TOKEN_PRESENT\n' >> "$GH_ENV_LOG"
+if [ "\${1:-}" = "issue" ] && [ "\${2:-}" = "list" ]; then
+  if [ -n "\${GH_ISSUE_LIST_FAIL:-}" ]; then
+    printf 'gh: could not resolve to a Repository (simulated)\n' >&2
+    exit 1
+  fi
+  cat "\${GH_ISSUE_LIST_JSON:-/dev/null}"
+  exit 0
+fi
 if [ "\${1:-}" = "repo" ] && [ "\${2:-}" = "clone" ]; then
   slug="\$3"; dest="\$4"
   mkdir -p "\$dest"
@@ -585,6 +594,125 @@ else
   bad "the slug validator is wrong (result=$PY_TRAV)"
 fi
 
+# ── the GITHUB-INGEST issues fixture (what the fake `gh issue list` serves) ────
+# Two OPEN maintainer-labeled issues; #1 is OLDER so it outranks #2 on age (both share
+# severity), which is what the pick order must choose first.
+ISSUES2="$WORK/issues2.json"
+cat > "$ISSUES2" <<'JSON'
+[{"number":1,"title":"first bug","body":"broken one","labels":[{"name":"maintainer"}],"createdAt":"2024-01-01T00:00:00Z"},
+ {"number":2,"title":"second bug","body":"broken two","labels":[{"name":"maintainer"}],"createdAt":"2024-01-02T00:00:00Z"}]
+JSON
+SYNC_SLUG="randomittin/heimdall-maintainer-test"
+
+echo "── (16) GITHUB INGEST — empty queue + gh returns 2 issues -> ingested, cycle runs ─"
+# The ROOT-CAUSE fix: an EMPTY queue looks at GitHub BEFORE the first pick. Fresh HOME
+# (nothing seeded), bare SLUG, --explicit — the loop clones, syncs the 2 OPEN maintainer
+# issues into the queue, then drains (picks the oldest, #1). Token rides GH_TOKEN in the
+# env, never argv.
+S16_HOME="$WORK/sync_home"; mkdir -p "$S16_HOME"
+: > "$GH_ARGV_LOG"; : > "$GH_ENV_LOG"
+OUT="$(env HEIMDALL_HOME="$S16_HOME" \
+      HEIMDALL_TOKENS_BIN="$METER_SMALL" \
+      HEIMDALL_PR_BOT_TOKEN="$BOT_TOKEN" \
+      GH_ISSUE_LIST_JSON="$ISSUES2" \
+      PATH="$FAKEBIN:$PATH" \
+      "$CMD" run --repo "$SYNC_SLUG" --explicit --max 1 --evidence "true" 2>/dev/null)"
+if [ "$(jget "$OUT" '.stop')" != "empty-queue" ] && [ "$(jget "$OUT" '.cycles')" -ge 1 ] \
+   && [ "$(jget "$OUT" '.tally.fixed')" -ge 1 ]; then
+  ok "empty queue + gh 2 issues -> ingested + cycle PROCEEDED (stop=$(jget "$OUT" '.stop') fixed=$(jget "$OUT" '.tally.fixed'))"
+else
+  bad "sync did not populate/proceed (stop=$(jget "$OUT" '.stop') cycles=$(jget "$OUT" '.cycles') fixed=$(jget "$OUT" '.tally.fixed'))"
+fi
+PICKED="$(jget "$OUT" '.last.issue')"
+if printf '%s' "$PICKED" | grep -q '#1$'; then
+  ok "picked the OLDEST ingested issue first (#1): $PICKED"
+else
+  bad "wrong pick order (expected the #1 issue, got: $PICKED)"
+fi
+QST16="$(HEIMDALL_HOME="$S16_HOME" "$QCMD" status --repo "$SYNC_SLUG")"
+if [ "$(jget "$QST16" '.total')" = "2" ] && [ "$(jget "$QST16" '.queued')" = "1" ]; then
+  ok "both issues ingested (total 2); #1 claimed, #2 still queued (1)"
+else
+  bad "queue not populated as expected (total=$(jget "$QST16" '.total') queued=$(jget "$QST16" '.queued'))"
+fi
+if grep -q "issue list --repo $SYNC_SLUG --state open --label maintainer" "$GH_ARGV_LOG"; then
+  ok "gh argv: issue list --repo <slug> --state open --label maintainer"
+else
+  bad "gh issue list argv wrong: $(cat "$GH_ARGV_LOG")"
+fi
+if ! grep -q "$BOT_TOKEN" "$GH_ARGV_LOG"; then
+  ok "the bot token is NEVER in gh argv (falsifier: a token in argv would fail this grep)"
+else
+  bad "the bot token LEAKED into gh argv: $(cat "$GH_ARGV_LOG")"
+fi
+if grep -q 'GH_TOKEN_PRESENT' "$GH_ENV_LOG"; then
+  ok "the bot token rode the ENV (GH_TOKEN) into gh issue list — never argv"
+else
+  bad "gh issue list auth did NOT ride the env (GH_TOKEN absent)"
+fi
+
+echo "── (17) SYNC FAILURE — gh list fails -> stop=queue-sync-error (NOT empty-queue) ─"
+# A list failure must be LOUD: the loop STOPS with a named, scrubbed note — never a
+# silent empty-queue (which would hide a broken GitHub read as "no work").
+S17_HOME="$WORK/sync_fail_home"; mkdir -p "$S17_HOME"
+: > "$GH_ARGV_LOG"
+OUT="$(env HEIMDALL_HOME="$S17_HOME" \
+      HEIMDALL_TOKENS_BIN="$METER_SMALL" \
+      HEIMDALL_PR_BOT_TOKEN="$BOT_TOKEN" \
+      GH_ISSUE_LIST_FAIL=1 \
+      PATH="$FAKEBIN:$PATH" \
+      "$CMD" run --repo "$SYNC_SLUG" --explicit --max 1 --evidence "true" 2>/dev/null)"
+if [ "$(jget "$OUT" '.stop')" = "queue-sync-error" ] && [ "$(jget "$OUT" '.cycles')" = "0" ]; then
+  ok "gh list failure -> STOP(queue-sync-error), 0 cycles"
+else
+  bad "list failure not surfaced (stop=$(jget "$OUT" '.stop') cycles=$(jget "$OUT" '.cycles'))"
+fi
+if [ "$(jget "$OUT" '.stop')" != "empty-queue" ]; then
+  ok "FALSIFIER: a sync failure is NOT mislabeled empty-queue (a real break is never hidden)"
+else
+  bad "a sync failure was silently reported as empty-queue"
+fi
+NOTE17="$(jget "$OUT" '.note')"
+if printf '%s' "$NOTE17" | grep -q 'queue sync failed' && ! printf '%s' "$NOTE17" | grep -q "$BOT_TOKEN"; then
+  ok "the summary carries a named, token-scrubbed note: $NOTE17"
+else
+  bad "sync-error note missing or leaked a token: $NOTE17"
+fi
+
+echo "── (18) IDEMPOTENT RE-SYNC — same issues -> 2 ingested then 0 (dedup by id) ──────"
+IDEM_HOME="$WORK/idem_home"; mkdir -p "$IDEM_HOME"
+PY_IDEM="$("$PY" -c '
+import os, sys
+os.environ["PATH"] = sys.argv[1] + os.pathsep + os.environ.get("PATH", "")
+os.environ["HEIMDALL_HOME"] = sys.argv[2]
+os.environ["GH_ISSUE_LIST_JSON"] = sys.argv[3]
+os.environ["HEIMDALL_PR_BOT_TOKEN"] = "ghs_x"
+import maintain_loop as m
+r1 = m.sync_queue_from_github("acme/widget")
+r2 = m.sync_queue_from_github("acme/widget")
+print("OK" if (r1["listed"] == 2 and r1["ingested"] == 2 and r2["ingested"] == 0) else "BAD:%r/%r" % (r1, r2))
+' "$FAKEBIN" "$IDEM_HOME" "$ISSUES2" 2>&1)"
+if [ "$PY_IDEM" = "OK" ]; then
+  ok "re-sync of the same 2 issues ingests 0 the second time (idempotent, no dupes)"
+else
+  bad "re-sync was not idempotent (result=$PY_IDEM)"
+fi
+
+echo "── (19) NO OPEN ISSUES — gh returns [] -> genuine empty-queue stop (unchanged) ──"
+S19_HOME="$WORK/sync_none_home"; mkdir -p "$S19_HOME"
+EMPTY_ISSUES="$WORK/issues_empty.json"; printf '[]\n' > "$EMPTY_ISSUES"
+OUT="$(env HEIMDALL_HOME="$S19_HOME" \
+      HEIMDALL_TOKENS_BIN="$METER_SMALL" \
+      HEIMDALL_PR_BOT_TOKEN="$BOT_TOKEN" \
+      GH_ISSUE_LIST_JSON="$EMPTY_ISSUES" \
+      PATH="$FAKEBIN:$PATH" \
+      "$CMD" run --repo "$SYNC_SLUG" --explicit --max 1 --evidence "true" 2>/dev/null)"
+if [ "$(jget "$OUT" '.stop')" = "empty-queue" ] && [ "$(jget "$OUT" '.cycles')" = "0" ]; then
+  ok "no OPEN maintainer issues -> genuine STOP(empty-queue), 0 cycles (behavior preserved)"
+else
+  bad "no-issues case regressed (stop=$(jget "$OUT" '.stop') cycles=$(jget "$OUT" '.cycles'))"
+fi
+
 echo
 echo "════════════════════════════════════════════════════════════════════════════"
 printf "maintain-loop: \033[32m%d passed\033[0m, " "$PASS"
@@ -593,4 +721,4 @@ if [ "$FAIL" -gt 0 ]; then
   exit 1
 fi
 printf "%d failed\n" "$FAIL"
-echo "ALL GREEN — budget-cap can't-burn-tokens · stop-guards · checkpoint · heartbeat · resume · disabled · approval-park · explicit-rr-authz · env-override · fresh-home-budget · fail-closed-after-usage · cloud-clone-workspace · workstation-parity · slug-traversal-refused"
+echo "ALL GREEN — budget-cap can't-burn-tokens · stop-guards · checkpoint · heartbeat · resume · disabled · approval-park · explicit-rr-authz · env-override · fresh-home-budget · fail-closed-after-usage · cloud-clone-workspace · workstation-parity · slug-traversal-refused · github-ingest · sync-error-loud · idempotent-resync · no-issues-empty-queue"
