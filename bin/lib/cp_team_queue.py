@@ -188,6 +188,21 @@ def _now_iso():
     )
 
 
+def _stderr(msg):
+    """Emit ONE loud line to stderr (Cloud Run folds stderr into the service log stream). Best-
+    effort: a logging failure is swallowed so it can NEVER break a queue op. Used by pick() to
+    surface a TERMINALLY-EXHAUSTED CAS claim loop — a silent None from an exhausted pick is
+    exactly how the live silent-drain (bug #19) hid: the partition VERIFIABLY held a queued task
+    but every claim lost the compare-and-swap and pick returned None with no signal, so the
+    drain logged processed=0 forever. Prefixed 'cp_team_queue:' like the other control-plane
+    loud lines (cp_boot/cp_maintainer_runner)."""
+    try:
+        sys.stderr.write("cp_team_queue: %s\n" % msg)
+        sys.stderr.flush()
+    except Exception:  # noqa: BLE001 — diagnostic only; a write error must not break a queue op.
+        return
+
+
 def _max_attempts(explicit=None):
     """The bounded-retry cap: an explicit positive `explicit` wins; else
     HEIMDALL_RR_TASK_MAX_ATTEMPTS; else _MAX_ATTEMPTS_DEFAULT. A malformed / non-positive
@@ -350,9 +365,15 @@ def _load(backend, team_id):
         if not isinstance(rec.get(bucket), dict):
             rec[bucket] = {}
     rec.setdefault("schema_version", _SCHEMA_VERSION)
-    # MIGRATE forward the optimistic-concurrency version: a record written before the CAS
-    # design lacks `rev`; treat its absence as version 0, so the first CAS write stamps rev=1.
-    rec.setdefault("rev", 0)
+    # MIGRATE + NORMALIZE the optimistic-concurrency version (bug #19). A record written by the
+    # OLD pre-CAS code lacks `rev` entirely (rev=None when read), and a partial/legacy write may
+    # carry a null or malformed `rev`. All THREE cases must fold to the SAME integer the backends'
+    # put_record_if compares (cp_state._rev_of): missing OR null OR malformed -> 0. A bare
+    # setdefault("rev", 0) heals a MISSING key but leaves a PRESENT-but-null `rev` as None — which
+    # would then flow into expected_rev as a non-integer and diverge from the stored-rev the CAS
+    # reads. Normalizing here with the SAME _rev_of the CAS compare uses makes the loaded rev
+    # byte-identical to what put_record_if will read back, on BOTH the local and firestore backends.
+    rec["rev"] = cp_state._rev_of(rec)
     rec["team_id"] = team_id
     return rec
 
@@ -375,7 +396,11 @@ def _cas(backend, team_id, mutate, *, home=None):
     and, on the next mutate, selects a DIFFERENT (or no) task — the double-claim is impossible."""
     for _ in range(_CAS_MAX_ATTEMPTS):
         store = _load(backend, team_id)
-        expected_rev = issue_queue._to_int(store.get("rev", 0))
+        # expected_rev is derived with the SAME cp_state._rev_of the backends' put_record_if
+        # reads the STORED rev with — a single source of truth for "what version is this record?".
+        # A legacy rev-less / null-rev record folds to 0 here AND in the CAS compare, so the write
+        # commits (bug #19: a mismatch would make the CAS never commit -> pick claims NOTHING).
+        expected_rev = cp_state._rev_of(store)
         result, needs_write = mutate(store)
         if not needs_write:
             return result, True
@@ -466,9 +491,19 @@ def pick(team_id, *, home=None, cfg=None):
         return chosen, True
 
     with _PartitionLock(team_id, home):
-        result, _ok = _cas(backend, team_id, _mutate, home=home)
-    # result is the claimed item, or None on an empty queue / exhausted CAS race (the loser
-    # that could not win a claim within the bound legitimately returns None — nothing claimed).
+        result, ok = _cas(backend, team_id, _mutate, home=home)
+    if not ok:
+        # LOUD (bug #19). An EMPTY queue returns (None, ok=True) — a legitimate "nothing to do",
+        # NOT logged. But a TERMINALLY-EXHAUSTED CAS returns (None, ok=False): the partition HAD a
+        # task to claim, yet every attempt lost the compare-and-swap (a real concurrent claim race
+        # OR the backend write kept failing — the firestore transactional put_record_if swallows
+        # its errors to False). Both map to a None return, so a silent None conflated "queue empty"
+        # with "could not claim a present task" — exactly how the live drain picked NOTHING from a
+        # partition that verifiably held a queued task, every cycle, with no signal. Surface it.
+        _stderr("pick CAS conflict/exhausted team=%s attempts=%d"
+                % (str(team_id)[:8], _CAS_MAX_ATTEMPTS))
+        return None
+    # result is the claimed item, or None on an empty queue (ok=True) — nothing to claim.
     return result
 
 
