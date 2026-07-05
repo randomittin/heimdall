@@ -505,12 +505,18 @@ dispatch_cp() {
   fi
 
   say "signing + posting the task to the control plane ($CP_URL/rr-task)…"
-  local resp kind a b
+  local resp kind a b added
   resp="$(CP_TASK="$TASK" CP_CONTEXT="$ctx" cp_client_py)"
-  IFS=$'\t' read -r kind a b <<<"$resp"
+  IFS=$'\t' read -r kind a b added <<<"$resp"
   case "$kind" in
     OK)
       say "task ENQUEUED to the control plane — id: ${a:-?}  (team: ${b:-server-derived}, INV-1)"
+      # An idempotent no-op: the identical scrubbed text is already queued/in-flight/done,
+      # so nothing new was enqueued. Say so LOUD — a stranger re-running the same task
+      # (seeing no PR yet) must not mistake a dedup for a fresh submission.
+      if [ "$added" = false ]; then
+        say "note: identical task already processed (id ${a:-?}) — reword the task to submit a fresh one"
+      fi
       say "watch: the PR will appear on $CFG_REPO via your GitHub App once the task is drained."
       printf '%s\tcontrol-plane\trepo=%s\tid=%s\tteam=%s\n' \
         "$(date -u +%FT%TZ)" "$CFG_REPO" "${a:-?}" "${b:-?}" >> "$DISPATCH_LOG"
@@ -541,8 +547,9 @@ dispatch_cp() {
 # bounded body {text, context?, nonce, ts} (NO team_id — INV-1), signs
 # canonical_message(POST,/rr-task,body), and POSTs. With RR_CP_DUMP_BODY set it
 # prints the literal body JSON and stops BEFORE any seed read / network (the dry-run
-# plan uses this). Emits one tab-record: `OK\t<id>\t<team_id>` on 2xx, `HTTP\t<code>\t<err>`
-# on an HTTP refusal, or `ERR\t<reason>` on no-seed/transport fault.
+# plan uses this). Emits one tab-record: `OK\t<id>\t<team_id>\t<added>` on 2xx (added is
+# `true` for a fresh enqueue, `false` for an idempotent dedup no-op, `` when unknown),
+# `HTTP\t<code>\t<err>` on an HTTP refusal, or `ERR\t<reason>` on no-seed/transport fault.
 cp_client_py() {
   LIB="$LIB" CP_URL="$CP_URL" CP_HAID="$CP_HAID" CP_SEED_FILE="$CP_SEED_FILE" \
   "$PY" - <<'PYEOF'
@@ -591,7 +598,13 @@ try:
     with urllib.request.urlopen(req, timeout=15) as resp:
         raw = resp.read()
         d = json.loads(raw) if raw else {}
-        sys.stdout.write("OK\t%s\t%s" % (d.get("id") or "", d.get("team_id") or ""))
+        # `added` distinguishes a FRESH enqueue (true) from an idempotent dedup no-op
+        # (false — the same scrubbed text is already queued/in-flight/done). The server
+        # reports it verbatim; emit it as a 4th field so the caller can surface the
+        # "already processed" notice. Missing/unknown -> "" (no notice claimed).
+        added = d.get("added")
+        added_s = "true" if added is True else ("false" if added is False else "")
+        sys.stdout.write("OK\t%s\t%s\t%s" % (d.get("id") or "", d.get("team_id") or "", added_s))
 except urllib.error.HTTPError as exc:
     raw = exc.read()
     try:
@@ -832,8 +845,48 @@ dispatch_local() {
     "$loop" run --repo "$repo_dir" --max "$MAXN"
 }
 
+# ── STATUS (control-plane) — the ACTIONABLE per-task read for CP mode ──────────
+# The CP's per-team queue is NOT publicly readable — there is no public task-status
+# route (the enqueue-only public surface deliberately exposes NO queue read; a
+# team-scoped state read would be a new signed GFE-safe route + read primitive +
+# isolation gate, materially more than a drop-in and NOT part of the shipped surface).
+# So `rr status [<task-id>]` prints the ACTIONABLE fallback: the task id (when given),
+# the server-derived team note, the exact `gh pr list` that shows the PR the drain
+# opens, and the drain-cycle explanation (incl. the `rr connect` prerequisite) so a
+# user knows WHERE the result appears and WHY it might not have yet.
+do_status_cp() {
+  say "recent rr dispatches:"
+  if [ -s "$DISPATCH_LOG" ]; then
+    tail -n 10 "$DISPATCH_LOG" | sed 's/^/    /'
+  else
+    printf '    (none yet)\n'
+  fi
+
+  [ -n "$TASK" ] && say "task id: $TASK"
+  say "team: server-derived from your enrolled identity (INV-1 — the client holds no team_id)"
+  say "the control plane's per-team queue is NOT publicly readable; a drained task becomes a PR on $CFG_REPO."
+
+  say "watch for the PR the drain opens:"
+  if [ "$DRY" = 1 ]; then
+    plan "gh pr list --repo $CFG_REPO --state open"
+  elif command -v gh >/dev/null 2>&1; then
+    gh pr list --repo "$CFG_REPO" --state open 2>/dev/null | sed 's/^/    /' || true
+  else
+    plan "gh pr list --repo $CFG_REPO --state open   # install gh: https://cli.github.com"
+  fi
+
+  say "drain cycle: rr signs + enqueues your task → the gated worker (holding your team's Claude cred + GitHub App install) drains the queue and opens the PR as the App → a human merges."
+  say "no PR yet? ensure you ran \`rr connect\` — it registers your team's cred + App install; without it the task enqueues but STRANDS (no install to open the PR)."
+}
+
 # ── STATUS — recent dispatches + open maintainer PRs + the remote log tail ─────
 do_status() {
+  # control-plane mode has no VM / SSH log to tail — its status is the per-task read.
+  if [ "$CFG_MODE" = control-plane ]; then
+    do_status_cp
+    return 0
+  fi
+
   say "recent rr dispatches:"
   if [ -s "$DISPATCH_LOG" ]; then
     tail -n 10 "$DISPATCH_LOG" | sed 's/^/    /'

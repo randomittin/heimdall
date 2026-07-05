@@ -203,8 +203,8 @@ Give each user: the **public URL** and the **enroll token** (privately).
    claude setup-token
    ```
 
-   Their cred is captured into their **own per-team** Secret-Manager secret at enroll — they pay
-   their own tokens (BYOC MVP).
+   Their cred is registered into their **own per-team** Secret-Manager secret by `rr connect`
+   (step 4) — they pay their own tokens (BYOC MVP).
 
 3. **Enroll + wire the control plane:**
 
@@ -216,14 +216,32 @@ Give each user: the **public URL** and the **enroll token** (privately).
    and enrolls their `haid` into their team. The enroll token is a **bootstrap** credential (used
    once to join) — never their signing key.
 
-4. **Run a task:**
+4. **Connect the team's credential + App installation (REQUIRED — do not skip):**
+
+   ```bash
+   rr connect --gh-app-installation-id <installation-id> --repo <owner/name>
+   ```
+
+   `rr setup` only enrolls the identity — it does **not** register the team's Claude credential or
+   its GitHub App installation. `rr connect` is the last mile: it signs and POSTs the BYO Claude
+   cred (`POST /team/cred`, write-only, never read back) and the App installation
+   (`POST /team/install`), both team-scoped (`team_id` derived server-side, INV-1). Find the
+   installation id in the App install URL (`…/settings/installations/<id>`) or under **Settings →
+   Applications → the App → Configure**.
+
+   > **Why this step is mandatory (the stranded-team trap).** If a user runs `rr setup` then a task
+   > WITHOUT `rr connect`, the task enqueues to a team that has **no install token** — the gated
+   > worker cannot open a PR for it, so the row sits unread, **no PR ever appears, and nothing errors**.
+   > `rr connect` is what turns an enrolled identity into a team the worker can actually drain.
+
+5. **Run a task:**
 
    ```bash
    rr "fix the flaky test in payments and open a PR"
    ```
 
    `rr` signs the task and POSTs it to `/rr-task`. The gated worker drains their team's queue and the
-   App opens the PR on **their** repo. A human merges.
+   App opens the PR on **their** repo. A human merges. Check progress any time with `rr status`.
 
 ---
 
