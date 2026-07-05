@@ -57,6 +57,14 @@ import cp_worker
 # so a per-minute tick fires every schedule on the minute it becomes due, no finer.
 TICK_INTERVAL_SECONDS = 60.0
 
+# PERIODIC RESUME (audit §3a fix (a)). resume_orphans runs at boot, but with min-instances=1
+# the gated instance stays warm for days, so a boot-only replay almost never re-runs — a job
+# stuck `queued` (a failed cloudrun-job dispatch) or `running` (a dead job-container) sits
+# stuck indefinitely. So the tick ALSO runs a resume pass every Nth wake. At the 60s cadence
+# every 5th tick is ~5 minutes — frequent enough to reclaim a dead job promptly, rare enough
+# not to add load. The pass is idempotent (run_job no-ops non-orphan states).
+_RESUME_EVERY_TICKS = 5
+
 # At-most-one tick thread per process. boot() may be called more than once (a test
 # re-wiring, a re-import); the route registration is idempotent but a second clock
 # would double-fire schedules. This guards the singleton.
@@ -194,18 +202,41 @@ def run_tick(*, home=None, base_env=None, now=None, approved_action_types=None):
     return fired
 
 
+def _maybe_resume(tick_count, *, home=None, base_env=None, every=_RESUME_EVERY_TICKS):
+    """Every `every`-th tick, run ONE resume pass (re-drive queued orphans + reclaim
+    stuck-running jobs, cp_worker.resume_orphans_pass) and emit the LOUD resume line
+    `cp_boot: resume pass: requeued=N reclaimed=N`. Returns the pass dict on a resume
+    tick, or None on a non-resume tick. Split out of the loop so the cadence is unit-
+    testable with a plain counter (no threads, no wall clock) — audit §3a fix (a)."""
+    if every <= 0 or tick_count % every != 0:
+        return None
+    result = cp_worker.resume_orphans_pass(home=home, base_env=base_env)
+    _stderr("cp_boot: resume pass: requeued=%d reclaimed=%d"
+            % (result.get("requeued", 0), result.get("reclaimed", 0)))
+    return result
+
+
 def _tick_loop(stop_event, *, home, base_env, interval, on_tick):
     """The tick thread body: wake every `interval` seconds and run_tick() for the
-    registered owners. A tick that raises is reported to stderr and swallowed (a single
-    bad schedule must not kill the clock); the loop continues. Stops promptly when
+    registered owners, plus a periodic resume pass every _RESUME_EVERY_TICKS wakes
+    (audit §3a). A tick that raises is reported to stderr and swallowed (a single bad
+    schedule must not kill the clock); the loop continues. Stops promptly when
     `stop_event` is set — stop_event.wait(interval) returns True the instant a shutdown
     is signalled, so the thread does not block a clean process exit for up to a minute."""
+    tick_count = 0
     while not stop_event.wait(interval):
+        tick_count += 1
         try:
             fired = run_tick(home=home, base_env=base_env)
         except Exception as exc:  # noqa: BLE001 — the clock must survive a bad tick.
             _stderr("cp_boot: tick error: %s" % _exc_line(exc))
             continue
+        # PERIODIC RESUME — re-drive orphaned /jobs work off the warm tick, not only at boot.
+        # Isolated from the schedule tick so a resume fault never stops the clock.
+        try:
+            _maybe_resume(tick_count, home=home, base_env=base_env)
+        except Exception as exc:  # noqa: BLE001 — a resume fault must not kill the clock.
+            _stderr("cp_boot: resume pass error: %s" % _exc_line(exc))
         if on_tick is not None and fired:
             try:
                 on_tick(fired)

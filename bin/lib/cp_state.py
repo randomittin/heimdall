@@ -97,6 +97,25 @@ BACKEND_FIRESTORE = "firestore"
 # "control-plane" path segment is named — stores pass only their own sub-path.
 CONTROL_PLANE_DIR = "control-plane"
 
+# The optimistic-concurrency VERSION field carried INSIDE a keyed record for the
+# compare-and-swap put_record_if path (the cross-instance atomic-claim seam behind the
+# team-queue). A record with no rev is version 0; a successful CAS write persists the
+# caller-supplied bumped rev. A LOCAL flock only serialises within one host — under
+# max-instances>1 two hosts race, and this rev check is what makes the losing writer
+# see False + re-read instead of clobbering the winner's claim (double-dispatch).
+REV_FIELD = "rev"
+
+
+def _rev_of(record):
+    """The integer rev carried by a keyed record (REV_FIELD), or 0 when the record is
+    absent / carries no (or a malformed) rev — the version compare-and-swap keys on."""
+    if not isinstance(record, dict):
+        return 0
+    try:
+        return int(record.get(REV_FIELD, 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
 
 class BackendUnavailable(RuntimeError):
     """Raised when a selected backend cannot be initialized (e.g. HEIMDALL_STATE_BACKEND=
@@ -143,6 +162,18 @@ class StateBackend(abc.ABC):
     def get_record(self, rel):
         """Read ONE keyed JSON record from `rel` (written by put_record), or None if the
         path is absent or the content is not a JSON object. Read-only; tolerant."""
+
+    @abc.abstractmethod
+    def put_record_if(self, rel, record, expected_rev):
+        """ATOMIC compare-and-swap keyed write: persist `record` to `rel` ONLY IF the
+        currently-stored record's REV_FIELD equals `expected_rev` (an absent record is
+        version 0). Returns True on a committed write, False on a rev-conflict (a
+        concurrent writer already advanced the version) or an IO failure. The caller
+        sets record[REV_FIELD] to the bumped version BEFORE calling and, on False,
+        re-reads + re-runs its mutation — the cross-instance optimistic-concurrency
+        (CAS) discipline that makes a queued->in_flight claim safe under max-instances>1.
+        A local flock only serialises within ONE host; this atomic rev check is what
+        stops two Cloud Run instances both claiming the same task (double-dispatch)."""
 
     @abc.abstractmethod
     def list_names(self, rel_dir, *, suffix=""):
@@ -260,6 +291,18 @@ class LocalBackend(StateBackend):
         except (OSError, ValueError):
             return None
         return obj if isinstance(obj, dict) else None
+
+    def put_record_if(self, rel, record, expected_rev):
+        """Compare-and-swap keyed write (the optimistic-concurrency seam): write `record`
+        ONLY IF the currently-stored record's rev equals `expected_rev`. On a single host
+        this is a correct CAS because the team-queue holds a per-partition flock across the
+        whole read-mutate-write, so the get_record + put_record below run under mutual
+        exclusion (no other same-host writer interleaves); the rev compare is the durable
+        cross-check (and the guard when a caller does NOT hold the flock). Returns True on
+        the committed write, False on a rev-conflict or an IO failure."""
+        if _rev_of(self.get_record(rel)) != expected_rev:
+            return False
+        return self.put_record(rel, record)
 
     def list_names(self, rel_dir, *, suffix=""):
         """Sorted names directly under a store dir, filtered by suffix. Absent -> []."""

@@ -117,6 +117,27 @@ _REDACTION = "[REDACTED]"
 _MAX_ATTEMPTS_ENV = "HEIMDALL_RR_TASK_MAX_ATTEMPTS"
 _MAX_ATTEMPTS_DEFAULT = 5
 
+# ── CROSS-INSTANCE ATOMIC CLAIM (the double-dispatch fix, audit §3b) ────────────────
+#
+# WHY THIS EXISTS (the live latent break, max-instances=5). The per-partition lock is a
+# LOCAL flock (_PartitionLock) — it serialises mutators WITHIN one host, but Cloud Run runs
+# up to 5 instances on SEPARATE filesystems, so two instances' flocks are independent. The
+# queued->in_flight claim was a get_record -> put_record (read-modify-write) with NO cross-
+# instance atomicity: two gated instances could pick() the SAME task -> double-dispatch (2×
+# Claude spend + duplicate PRs). The mitigation was "live runs 1 instance" — a mask, not a fix.
+#
+# THE FIX (optimistic concurrency / compare-and-swap). The partition record carries a `rev`
+# (int). Every mutator runs READ rev -> MUTATE -> CONDITIONAL WRITE via the StateBackend's
+# put_record_if(rel, record, expected_rev): the write commits ONLY IF the stored rev still
+# equals the rev we read. On the firestore backend that check is a Firestore transaction
+# (atomic across instances); on the local backend it is the flock + rev cross-check (correct
+# on a single host). On a CONFLICT (a concurrent instance advanced the rev between our read
+# and write) put_record_if returns False -> we RE-READ the now-current record and re-run the
+# mutation, bounded by _CAS_MAX_ATTEMPTS. So the LOSER of a claim race sees the winner's
+# committed state (the task already gone), and picks the NEXT task (or None) — never the same
+# one. The local flock is KEPT as an additional intra-process/intra-host guard.
+_CAS_MAX_ATTEMPTS = 5
+
 
 # ── small helpers ──────────────────────────────────────────────────────────────
 
@@ -306,6 +327,7 @@ def _empty_store(team_id):
     return {
         "schema_version": _SCHEMA_VERSION,
         "team_id": team_id,
+        "rev": 0,
         "queued": {},
         "in_flight": {},
         "done": {},
@@ -328,14 +350,40 @@ def _load(backend, team_id):
         if not isinstance(rec.get(bucket), dict):
             rec[bucket] = {}
     rec.setdefault("schema_version", _SCHEMA_VERSION)
+    # MIGRATE forward the optimistic-concurrency version: a record written before the CAS
+    # design lacks `rev`; treat its absence as version 0, so the first CAS write stamps rev=1.
+    rec.setdefault("rev", 0)
     rec["team_id"] = team_id
     return rec
 
 
-def _save(backend, team_id, store):
-    """Atomically write a team's partition record (put_record — tmp+os.replace, sorted keys).
-    Returns True on a durable write, False on IO failure."""
-    return backend.put_record(_queue_rel(team_id), store)
+def _cas(backend, team_id, mutate, *, home=None):
+    """READ -> MUTATE -> CONDITIONAL-WRITE with bounded retry — the cross-instance atomic
+    claim (audit §3b). Loads the partition record, hands it to `mutate(store)`, and persists
+    via the backend's compare-and-swap put_record_if keyed on the record's `rev`. On a rev
+    CONFLICT (a concurrent instance committed between our read and write) it RE-READS and
+    re-runs `mutate` against the now-current record, bounded by _CAS_MAX_ATTEMPTS.
+
+    `mutate(store)` returns (result, needs_write):
+      • needs_write=False -> a pure read / no-op decision (dedup hit, empty queue, unknown id):
+        return (result, ok=True) immediately, no write attempted (no contention).
+      • needs_write=True  -> the store was modified; stamp rev+1 and CAS-write it. On success
+        return (result, True); on conflict re-read + retry.
+    Returns (result, ok): ok=False means the attempts were exhausted / the write kept failing
+    (the caller maps that to an io_error), which is the SAME degrade the old single put_record
+    had on an IO failure — never a silent success. The loser of a claim race simply re-reads
+    and, on the next mutate, selects a DIFFERENT (or no) task — the double-claim is impossible."""
+    for _ in range(_CAS_MAX_ATTEMPTS):
+        store = _load(backend, team_id)
+        expected_rev = issue_queue._to_int(store.get("rev", 0))
+        result, needs_write = mutate(store)
+        if not needs_write:
+            return result, True
+        store["rev"] = expected_rev + 1
+        if backend.put_record_if(_queue_rel(team_id), store, expected_rev):
+            return result, True
+        # CONFLICT (or IO failure): a concurrent instance advanced the rev. Re-read + retry.
+    return None, False
 
 
 # ── THE PUBLIC API (every op scoped to the caller's team_id partition) ─────────────
@@ -373,24 +421,24 @@ def enqueue(team_id, task, *, home=None):
         "attempts": 0,
     }
     backend = _backend(home)
-    with _PartitionLock(team_id, home):
-        store = _load(backend, team_id)
+
+    def _mutate(store):
         # RE-OPEN: a fresh enqueue of a dead task's text revives it (attempts reset to 0).
         if tid in store["dead"]:
             store["dead"].pop(tid, None)
             store["queued"][tid] = item
-            ok = _save(backend, team_id, store)
-            if not ok:
-                return {"ok": False, "reason": "io_error", "id": tid, "team_id": team_id}
             return {"ok": True, "id": tid, "added": True, "reopened": True,
-                    "team_id": team_id}
+                    "team_id": team_id}, True
         if tid in store["queued"] or tid in store["in_flight"] or tid in store["done"]:
-            return {"ok": True, "id": tid, "added": False, "team_id": team_id}
+            return {"ok": True, "id": tid, "added": False, "team_id": team_id}, False
         store["queued"][tid] = item
-        ok = _save(backend, team_id, store)
-        if not ok:
-            return {"ok": False, "reason": "io_error", "id": tid, "team_id": team_id}
-        return {"ok": True, "id": tid, "added": True, "team_id": team_id}
+        return {"ok": True, "id": tid, "added": True, "team_id": team_id}, True
+
+    with _PartitionLock(team_id, home):
+        result, ok = _cas(backend, team_id, _mutate, home=home)
+    if not ok:
+        return {"ok": False, "reason": "io_error", "id": tid, "team_id": team_id}
+    return result
 
 
 def pick(team_id, *, home=None, cfg=None):
@@ -406,17 +454,22 @@ def pick(team_id, *, home=None, cfg=None):
     unreachable here."""
     team_id = _require_team(team_id)
     backend = _backend(home)
-    with _PartitionLock(team_id, home):
-        store = _load(backend, team_id)
+
+    def _mutate(store):
         queued = builtins.list(store["queued"].values())
         if not queued:
-            return None
+            return None, False
         chosen = issue_queue.pick_order(queued, cfg or {})[0]
         cid = chosen["id"]
         del store["queued"][cid]
         store["in_flight"][cid] = {"since": _now_iso(), "item": chosen}
-        _save(backend, team_id, store)
-        return chosen
+        return chosen, True
+
+    with _PartitionLock(team_id, home):
+        result, _ok = _cas(backend, team_id, _mutate, home=home)
+    # result is the claimed item, or None on an empty queue / exhausted CAS race (the loser
+    # that could not win a claim within the bound legitimately returns None — nothing claimed).
+    return result
 
 
 def complete(team_id, id, verdict, *, home=None):
@@ -431,22 +484,25 @@ def complete(team_id, id, verdict, *, home=None):
     if not id:
         return {"ok": False, "reason": "no_id", "team_id": team_id}
     backend = _backend(home)
-    with _PartitionLock(team_id, home):
-        store = _load(backend, team_id)
+    clean_verdict = telemetry._scrub(verdict) if verdict is not None else None
+
+    def _mutate(store):
         rec = store["in_flight"].pop(id, None)
         item = rec.get("item") if isinstance(rec, dict) else None
         if item is None:
             item = store["queued"].pop(id, None)
         if item is None and id not in store["done"]:
-            return {"ok": False, "reason": "unknown_id", "id": id, "team_id": team_id}
+            return {"ok": False, "reason": "unknown_id", "id": id, "team_id": team_id}, False
         if item is None:
             item = store["done"].get(id, {}).get("item")
-        clean_verdict = telemetry._scrub(verdict) if verdict is not None else None
         store["done"][id] = {"verdict": clean_verdict, "at": _now_iso(), "item": item}
-        ok = _save(backend, team_id, store)
-        if not ok:
-            return {"ok": False, "reason": "io_error", "id": id, "team_id": team_id}
-        return {"ok": True, "id": id, "verdict": clean_verdict, "team_id": team_id}
+        return {"ok": True, "id": id, "verdict": clean_verdict, "team_id": team_id}, True
+
+    with _PartitionLock(team_id, home):
+        result, ok = _cas(backend, team_id, _mutate, home=home)
+    if not ok:
+        return {"ok": False, "reason": "io_error", "id": id, "team_id": team_id}
+    return result
 
 
 def retry(team_id, id, reason=None, *, max_attempts=None, home=None):
@@ -473,14 +529,16 @@ def retry(team_id, id, reason=None, *, max_attempts=None, home=None):
     cap = _max_attempts(max_attempts)
     clean_error = telemetry._scrub(reason) if reason is not None else None
     backend = _backend(home)
-    with _PartitionLock(team_id, home):
-        store = _load(backend, team_id)
+
+    def _mutate(store):
         rec = store["in_flight"].pop(id, None)
         item = rec.get("item") if isinstance(rec, dict) else None
         if item is None:
             item = store["queued"].pop(id, None)
         if not isinstance(item, dict):
-            return {"ok": False, "reason": "unknown_id", "id": id, "team_id": team_id}
+            return {"ok": False, "reason": "unknown_id", "id": id, "team_id": team_id}, False
+        # attempts is read from the FRESHLY-loaded item each CAS pass (a re-read after a
+        # conflict re-derives it from the persisted store), so a retried CAS never double-counts.
         attempts = issue_queue._to_int(item.get("attempts", 0)) + 1
         item["attempts"] = attempts
         item["last_error"] = clean_error
@@ -492,11 +550,14 @@ def retry(team_id, id, reason=None, *, max_attempts=None, home=None):
             item["retry_at"] = _now_iso()
             store["queued"][id] = item
             state = "queued"
-        ok = _save(backend, team_id, store)
-        if not ok:
-            return {"ok": False, "reason": "io_error", "id": id, "team_id": team_id}
         return {"ok": True, "id": id, "state": state, "attempts": attempts,
-                "error": clean_error, "team_id": team_id}
+                "error": clean_error, "team_id": team_id}, True
+
+    with _PartitionLock(team_id, home):
+        result, ok = _cas(backend, team_id, _mutate, home=home)
+    if not ok:
+        return {"ok": False, "reason": "io_error", "id": id, "team_id": team_id}
+    return result
 
 
 def requeue(team_id, id, *, home=None):
@@ -513,19 +574,22 @@ def requeue(team_id, id, *, home=None):
     if not id:
         return {"ok": False, "reason": "no_id", "team_id": team_id}
     backend = _backend(home)
-    with _PartitionLock(team_id, home):
-        store = _load(backend, team_id)
+
+    def _mutate(store):
         rec = store["in_flight"].pop(id, None)
         item = rec.get("item") if isinstance(rec, dict) else None
         if item is None:
             if id in store["queued"]:
-                return {"ok": True, "id": id, "state": "queued", "team_id": team_id}
-            return {"ok": False, "reason": "unknown_id", "id": id, "team_id": team_id}
+                return {"ok": True, "id": id, "state": "queued", "team_id": team_id}, False
+            return {"ok": False, "reason": "unknown_id", "id": id, "team_id": team_id}, False
         store["queued"][id] = item
-        ok = _save(backend, team_id, store)
-        if not ok:
-            return {"ok": False, "reason": "io_error", "id": id, "team_id": team_id}
-        return {"ok": True, "id": id, "state": "queued", "team_id": team_id}
+        return {"ok": True, "id": id, "state": "queued", "team_id": team_id}, True
+
+    with _PartitionLock(team_id, home):
+        result, ok = _cas(backend, team_id, _mutate, home=home)
+    if not ok:
+        return {"ok": False, "reason": "io_error", "id": id, "team_id": team_id}
+    return result
 
 
 def list(team_id, *, home=None, cfg=None):  # noqa: A001 — the public API name is `list`.

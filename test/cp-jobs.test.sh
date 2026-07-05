@@ -318,6 +318,186 @@ print(J.current_state('$ENQ_JOB', os.environ['HEIMDALL_HOME']))
 ")"
 [ "$RESTART_FINAL" = "done" ] && ok "P a SEPARATE process (restart) replays the log + drives the job to done" || bad "P restart replay did not complete the job (got '$RESTART_FINAL')"
 
+# ──────────────────────────────────────────────────────────────────────────────
+# X. RUNNING-ORPHAN RECLAIM + PERIODIC RESUME (audit §3a). resume_orphans now also
+#    reclaims a job left `running` when its container died (past a lease), bounded to a
+#    re-drive-once-then-fail-terminal policy; and the tick runs the pass on a cadence, not
+#    only at boot. Hermetic: an isolated home, a fake lease clock (now=), an injected runner.
+# ──────────────────────────────────────────────────────────────────────────────
+echo "X. running-orphan reclaim + periodic resume (§3a)"
+X_OUT="$("$PY" - <<'PYEOF' 2>"$WORK/x.err"
+import datetime, json, os, sys
+sys.path.insert(0, os.environ["LIB"])
+import cp_jobstore as J
+import cp_worker as W
+import cp_boot as B
+
+now = datetime.datetime.now(datetime.timezone.utc)
+past_lease = now + datetime.timedelta(hours=3)                # > the 2h default running lease
+
+# A dead-container re-drive: leaves the job `running` (simulates a re-orphan), so the bounded
+# reclaim must fail it terminal on the SECOND pass. Reads the job in ITS OWN home (threaded
+# through by resume_orphans_pass), so each sub-case can use an isolated store.
+def reorphan_runner(job_id, **kw):
+    return J.read_job(job_id, kw.get("home"))
+
+# A successful re-drive: this instance takes over and completes the job (in its own home).
+def completing_runner(job_id, *, resume_running=False, **kw):
+    h = kw.get("home")
+    if resume_running and J.current_state(job_id, h) == J.STATE_RUNNING:
+        J.set_result(job_id, {"status": "reclaimed"}, home=h)
+        J.transition(job_id, J.STATE_DONE, home=h)
+    return J.read_job(job_id, h)
+
+# Each sub-case gets an ISOLATED store: the fake past_lease clock of one case must never make a
+# a still-running job from an earlier sub-case look orphaned (shared home cross-contaminates counts).
+h1 = os.path.join(os.environ["HEIMDALL_HOME"], "reclaim-within")
+h2 = os.path.join(os.environ["HEIMDALL_HOME"], "reclaim-bounded")
+h3 = os.path.join(os.environ["HEIMDALL_HOME"], "reclaim-good")
+
+# ── (1) WITHIN LEASE — a fresh running job is NOT reclaimed (age < lease). ──
+fresh = J.create_job("run-task-X", {"task_id": "fresh"}, home=h1)
+J.transition(fresh, "running", home=h1)
+p_fresh = W.resume_orphans_pass(home=h1, runner=reorphan_runner, now=now)
+within_lease_skipped = (p_fresh["reclaimed"] == 0 and J.current_state(fresh, h1) == "running")
+
+# ── (2) BOUNDED RECLAIM — a running orphan past lease is reclaimed ONCE then failed terminal. ──
+orphan = J.create_job("run-task-X", {"task_id": "orphan"}, home=h2)
+J.transition(orphan, "running", home=h2)
+# pass 1: re-drive (the runner re-orphans it) -> still running, one reclaim marker recorded.
+pass1 = W.resume_orphans_pass(home=h2, runner=reorphan_runner, now=past_lease)
+state1 = J.current_state(orphan, h2)
+marks1 = W._reclaim_count(orphan, h2)
+# pass 2: bound exhausted -> failed terminal (running -> cancelled, noted).
+pass2 = W.resume_orphans_pass(home=h2, runner=reorphan_runner, now=past_lease)
+state2 = J.current_state(orphan, h2)
+
+# ── (3) SUCCESSFUL RECLAIM — a running orphan re-driven to done (the happy reclaim). ──
+good = J.create_job("run-task-X", {"task_id": "good"}, home=h3)
+J.transition(good, "running", home=h3)
+pass_good = W.resume_orphans_pass(home=h3, runner=completing_runner, now=past_lease)
+state_good = J.current_state(good, h3)
+
+# ── (4) PERIODIC CADENCE — _maybe_resume fires ONLY every Nth (5th) tick. ──
+chome = os.path.join(os.environ["HEIMDALL_HOME"], "cadence")
+J.create_job("sync-queue", {"queue": "issue"}, home=chome)   # a queued job to requeue
+fired = [B._maybe_resume(n, home=chome) for n in range(1, 6)]
+cadence_ok = (all(f is None for f in fired[:4]) and fired[4] is not None)
+# the resume that DID fire re-drove the queued job (requeued>=1) — the tick really works.
+cadence_requeued = (fired[4] or {}).get("requeued", 0) >= 1
+
+print(json.dumps({
+    "within_lease_skipped": within_lease_skipped,
+    "pass1_reclaimed": pass1["reclaimed"] == 1,
+    "state1_still_running": state1 == "running",
+    "one_reclaim_mark": marks1 == 1,
+    "pass2_failed_terminal": (pass2["reclaimed"] == 1 and state2 == "cancelled"),
+    "good_reclaimed_done": (pass_good["reclaimed"] == 1 and state_good == "done"),
+    "cadence_fires_on_5th": cadence_ok,
+    "cadence_requeued": cadence_requeued,
+}))
+PYEOF
+)"
+if [ -s "$WORK/x.err" ]; then cat "$WORK/x.err" >&2; fi
+jx(){ printf '%s' "$X_OUT" | "$PY" -c "import json,sys;print(json.load(sys.stdin).get('$1'))" 2>/dev/null; }
+[ "$(jx within_lease_skipped)" = "True" ] && ok "X1 a running job WITHIN its lease is NOT reclaimed (no false reclaim of a live job)" || bad "X1 within-lease job wrongly reclaimed (X_OUT=$X_OUT)"
+[ "$(jx pass1_reclaimed)" = "True" ] && [ "$(jx state1_still_running)" = "True" ] && [ "$(jx one_reclaim_mark)" = "True" ] \
+  && ok "X2 a running orphan past lease is RECLAIMED (re-driven once; one durable reclaim marker recorded)" || bad "X2 reclaim did not re-drive once (X_OUT=$X_OUT)"
+[ "$(jx pass2_failed_terminal)" = "True" ] \
+  && ok "X3 a STILL-orphaned running job (re-drive exhausted) is FAILED TERMINAL (running -> cancelled) — bounded, never re-driven forever" || bad "X3 exhausted reclaim not failed terminal (X_OUT=$X_OUT)"
+[ "$(jx good_reclaimed_done)" = "True" ] \
+  && ok "X4 a running orphan the re-drive COMPLETES is reclaimed to done (the happy reclaim path)" || bad "X4 successful reclaim did not reach done (X_OUT=$X_OUT)"
+[ "$(jx cadence_fires_on_5th)" = "True" ] && [ "$(jx cadence_requeued)" = "True" ] \
+  && ok "X5 the periodic resume fires ONLY on the Nth (5th) tick and re-drives orphaned work (audit §3a fix (a))" || bad "X5 periodic resume cadence wrong (X_OUT=$X_OUT)"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Y. BUG #15 — RUNNER-HONORING queued resume + GRACE (proven live 2026-07-05 20:24).
+#    resume_orphans drove QUEUED jobs via run_job IN-PROCESS regardless of the runner. On the
+#    gated service (a REMOTE cloudrun-job runner) a resume pass then STOLE a freshly-queued job
+#    18s after dispatch and ran it in-process with STALE code, while the real Cloud Run Job
+#    execution ran the SAME job — a double-run. THE FIX: a REMOTE runner RE-DISPATCHES a queued
+#    orphan via the runner (never run_job in-process); a queued job younger than the grace window
+#    is SKIPPED (its dispatch is still booting); an IN-PROCESS runner is unchanged (run_job).
+# ──────────────────────────────────────────────────────────────────────────────
+echo "Y. bug #15 — runner-honoring queued resume + grace"
+Y_OUT="$("$PY" - <<'PYEOF' 2>"$WORK/y.err"
+import datetime, json, os, sys
+sys.path.insert(0, os.environ["LIB"])
+import cp_jobstore as J
+import cp_worker as W
+import cp_jobrunner as R
+
+base = os.environ["HEIMDALL_HOME"]
+now = datetime.datetime.now(datetime.timezone.utc)
+old = now + datetime.timedelta(minutes=10)   # > the 5min queued grace -> a genuine stuck orphan
+
+class Rec:
+    """A fake JobRunner: records every dispatch() so the test can prove the DISPATCH path ran
+    (or did not). name pins whether resume treats it as REMOTE (cloudrun-job) or in-process."""
+    def __init__(self, name):
+        self.name = name
+        self.calls = []
+    def dispatch(self, job_id, **kw):
+        self.calls.append(job_id)
+        return {"dispatched": True, "runner": self.name}
+
+ran = []   # records ANY in-process run_job-style invocation — must stay empty on the remote path.
+def recording_run(job_id, **kw):
+    ran.append(job_id)
+    h = kw.get("home")
+    J.transition(job_id, J.STATE_RUNNING, home=h)
+    J.set_result(job_id, {"status": "in-proc"}, home=h)
+    J.transition(job_id, J.STATE_DONE, home=h)
+    return J.read_job(job_id, home=h)
+
+# (1) REMOTE + OLD queued -> RE-DISPATCH via the runner; run_job NOT invoked; job stays queued
+#     (the real out-of-process execution moves it, not this host).
+h1 = os.path.join(base, "bug15-remote-old")
+rem1 = Rec(R.RUNNER_CLOUDRUN)
+j1 = J.create_job("sync-queue", {"queue": "issue"}, home=h1)
+W.resume_orphans_pass(home=h1, runner=recording_run, job_runner=rem1, now=old)
+remote_old_dispatched = (rem1.calls == [j1])
+remote_old_no_inproc = (j1 not in ran)
+remote_old_still_queued = (J.current_state(j1, h1) == "queued")
+
+# (2) REMOTE + YOUNG queued -> SKIPPED by grace; no dispatch, no run_job, stays queued
+#     (its dispatcher just created an execution — the container is booting).
+h2 = os.path.join(base, "bug15-remote-young")
+rem2 = Rec(R.RUNNER_CLOUDRUN)
+j2 = J.create_job("sync-queue", {"queue": "issue"}, home=h2)
+W.resume_orphans_pass(home=h2, runner=recording_run, job_runner=rem2, now=now)
+young_skipped = (rem2.calls == [] and j2 not in ran and J.current_state(j2, h2) == "queued")
+
+# (3) IN-PROCESS runner (thread) + OLD queued -> run_job IN-PROCESS; dispatch NOT called; done.
+#     The in-process resume path is UNCHANGED for thread/subprocess runners.
+h3 = os.path.join(base, "bug15-inproc")
+thr = Rec(R.RUNNER_THREAD)
+j3 = J.create_job("sync-queue", {"queue": "issue"}, home=h3)
+W.resume_orphans_pass(home=h3, runner=recording_run, job_runner=thr, now=old)
+inproc_ran = (j3 in ran)
+inproc_no_dispatch = (thr.calls == [])
+inproc_done = (J.current_state(j3, h3) == "done")
+
+print(json.dumps({
+  "remote_old_dispatched": remote_old_dispatched,
+  "remote_old_no_inproc": remote_old_no_inproc,
+  "remote_old_still_queued": remote_old_still_queued,
+  "young_skipped": young_skipped,
+  "inproc_ran": inproc_ran,
+  "inproc_no_dispatch": inproc_no_dispatch,
+  "inproc_done": inproc_done,
+}))
+PYEOF
+)"
+if [ -s "$WORK/y.err" ]; then cat "$WORK/y.err" >&2; fi
+jy(){ printf '%s' "$Y_OUT" | "$PY" -c "import json,sys;print(json.load(sys.stdin).get('$1'))" 2>/dev/null; }
+[ "$(jy remote_old_dispatched)" = "True" ] && [ "$(jy remote_old_no_inproc)" = "True" ] && [ "$(jy remote_old_still_queued)" = "True" ] \
+  && ok "Y1 REMOTE runner: an OLD queued orphan is RE-DISPATCHED via the runner, run_job NOT invoked in-process (bug #15 — no double-run)" || bad "Y1 remote re-dispatch wrong (Y_OUT=$Y_OUT)"
+[ "$(jy young_skipped)" = "True" ] \
+  && ok "Y2 REMOTE runner: a YOUNG queued job (< grace) is SKIPPED — its dispatch is still booting (grace guard)" || bad "Y2 young queued not skipped (Y_OUT=$Y_OUT)"
+[ "$(jy inproc_ran)" = "True" ] && [ "$(jy inproc_no_dispatch)" = "True" ] && [ "$(jy inproc_done)" = "True" ] \
+  && ok "Y3 IN-PROCESS runner (thread): queued orphan re-driven via run_job in-process, no dispatch — unchanged" || bad "Y3 in-process resume changed (Y_OUT=$Y_OUT)"
+
 echo
 printf "cp-jobs: %d passed, %d failed\n" "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
