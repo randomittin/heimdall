@@ -241,14 +241,22 @@ AUTH_ENV_ORDER = (AUTH_ENV_OAUTH, AUTH_ENV_API_KEY)
 # maintainer child ALSO needs a bounded set of NON-secret config roots + the PR bot token
 # to do its real work: HOME (git/gh/claude read per-user config), PYTHONPATH (the loop's
 # sibling-lib imports), and HEIMDALL_PR_BOT_TOKEN (the scoped B1 token issue_pr.py opens
-# heimdall/* PRs with — the maintainer OPENS PRs, never pushes main / merges). This is a
-# DELIBERATE, bounded widening for THIS handler's child ONLY; it does NOT touch
-# ISOLATED_ENV_ALLOW, so every other handler stays maximally scrubbed. The PKI key / audit
-# creds are NEVER in this set — a breached maintainer child cannot read control-plane state.
+# heimdall/* PRs with — the maintainer OPENS PRs, never pushes main / merges). It ALSO
+# needs the NON-secret HEADLESS-FIX toggles so the loop's fix slot actually drives
+# `claude -p` to write edits (bug #20 — without them the child ran but produced an EMPTY
+# diff): HEIMDALL_FIX_WITH_CLAUDE (the enable flag the deployed maintainer sets),
+# HEIMDALL_CLAUDE_BIN (an optional binary override), and HEIMDALL_FIX_TIMEOUT (the per-fix
+# wall-clock cap). None is a secret. This is a DELIBERATE, bounded widening for THIS
+# handler's child ONLY; it does NOT touch ISOLATED_ENV_ALLOW, so every other handler stays
+# maximally scrubbed. The PKI key / audit creds are NEVER in this set — a breached
+# maintainer child cannot read control-plane state.
 MAINTAINER_ENV_PASSTHROUGH = (
     "HOME",
     "PYTHONPATH",
     "HEIMDALL_PR_BOT_TOKEN",
+    "HEIMDALL_FIX_WITH_CLAUDE",
+    "HEIMDALL_CLAUDE_BIN",
+    "HEIMDALL_FIX_TIMEOUT",
 )
 
 # Env var overriding the maintain-loop binary path (tests point it at a hermetic mock,

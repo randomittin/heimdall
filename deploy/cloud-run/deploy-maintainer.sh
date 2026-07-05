@@ -147,6 +147,9 @@ arch_a() {
     ( umask 177; {
         printf 'export HEIMDALL_JOB_RUNNER=subprocess\n'
         printf 'export HEIMDALL_MAINTAINER_RUNNER=hybrid\n'
+        # DRIVE REAL FIXES: the loop's fix slot invokes `claude -p` to write edits only
+        # when this is set (bug #20 — without it the cycle runs but produces an EMPTY diff).
+        printf 'export HEIMDALL_FIX_WITH_CLAUDE=1\n'
         printf 'export CLAUDE_CODE_OAUTH_TOKEN=%q\n' "$OAUTH_TOKEN"
         if [ "$GH_APP" = 1 ]; then
           printf 'export HEIMDALL_GH_APP_ID=%q\n' "$GH_APP_ID"
