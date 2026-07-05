@@ -15,7 +15,7 @@ set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLUGIN_DIR="$(cd "$DIR/../../.." && pwd)"
-SCRIPT="$PLUGIN_DIR/bin/generate-changelog"
+SCRIPT="${GENERATE_CHANGELOG:-$PLUGIN_DIR/bin/generate-changelog}"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 

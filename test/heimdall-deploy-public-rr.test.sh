@@ -150,7 +150,7 @@ if printf '%s' "$OUT" | grep -qF "serviceAccount:${OVR}" \
    && ! printf '%s' "$OUT" | grep -qF "serviceAccount:<RESOLVED-RUNTIME-SA>"; then
   ok "grants bind the --runtime-sa override verbatim (no auto-detect sentinel)"
 else bad "--runtime-sa override not used for the grant members"; fi
-printf '%s' "$OUT" | grep -qF "spec.template.spec.serviceAccountName" \
+printf '%s' "$OUT" | grep -qE "describe heimdall-control-plane.*serviceAccountName" \
   && bad "--runtime-sa given but the plan still runs the auto-detect describe" \
   || ok "--runtime-sa short-circuits the gated-service describe"
 

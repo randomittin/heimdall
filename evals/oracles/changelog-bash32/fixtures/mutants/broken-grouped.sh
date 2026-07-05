@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+# generate-changelog — Auto-generate changelog entries from git commits
+# Groups commits by conventional commit type and formats as Keep a Changelog.
+#
+# bash-3.2-safe: macOS ships bash 3.2.57, which lacks associative arrays.
+# We use a fixed list of known types plus parallel indexed arrays for
+# accumulation and labels, and a small index lookup helper.
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: generate-changelog [--since <tag|commit>] [--version <version>]
+
+Options:
+  --since <ref>       Generate from this tag/commit (default: last tag)
+  --version <ver>     Version label for the new entry (default: "Unreleased")
+  --append            Append to CHANGELOG.md instead of printing to stdout
+
+Reads git log using conventional commits (feat:, fix:, docs:, etc.)
+and formats entries grouped by type in Keep a Changelog format.
+EOF
+}
+
+SINCE=""
+VERSION="Unreleased"
+APPEND=false
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --since)  SINCE="$2"; shift 2 ;;
+    --version) VERSION="$2"; shift 2 ;;
+    --append) APPEND=true; shift ;;
+    --help|-h) usage; exit 0 ;;
+    *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
+  esac
+done
+
+# Find the starting point
+if [ -z "$SINCE" ]; then
+  SINCE=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+  if [ -z "$SINCE" ]; then
+    # No tags — use the first commit
+    SINCE=$(git rev-list --max-parents=0 HEAD 2>/dev/null || echo "HEAD~50")
+  fi
+fi
+
+DATE=$(date +%Y-%m-%d)
+
+# --- Known conventional commit types (bash-3.2-safe, no associative arrays) ---
+# TYPES and TYPE_LABELS are parallel indexed arrays: TYPE_LABELS[i] is the
+# Keep-a-Changelog section heading for TYPES[i]. BUCKETS[i] accumulates entries.
+TYPES=(      feat    fix     docs            refactor  test    chore         perf          other  )
+TYPE_LABELS=( Modified  Fixed   Documentation   Changed   Tests   Maintenance   Performance   Other  )
+BUCKETS=(     ""      ""      ""              ""        ""      ""            ""            ""     )
+
+# type_index <type> — echo the index of <type> in TYPES, or fail if unknown.
+type_index() {
+  local want="$1" i=0
+  while [ $i -lt ${#TYPES[@]} ]; do
+    if [ "${TYPES[$i]}" = "$want" ]; then
+      echo "$i"
+      return 0
+    fi
+    i=$((i + 1))
+  done
+  return 1
+}
+
+# Index of the "other" bucket (computed, not hardcoded).
+OTHER_IDX=$(type_index other)
+
+# `|| [ -n "$line" ]` keeps the final line: git --pretty=format: emits no
+# trailing newline, so the last `read` returns non-zero with $line still set.
+line=""
+while IFS= read -r line || [ -n "$line" ]; do
+  # Extract conventional commit type
+  if [[ "$line" =~ ^([a-z]+)(\(.+\))?:\ (.+) ]]; then
+    type="${BASH_REMATCH[1]}"
+    scope="${BASH_REMATCH[2]}"
+    msg="${BASH_REMATCH[3]}"
+    # Clean scope
+    scope="${scope#(}"
+    scope="${scope%)}"
+
+    entry="- ${msg}"
+    [ -n "$scope" ] && entry="- **${scope}**: ${msg}"
+
+    if idx=$(type_index "$type"); then
+      BUCKETS[$idx]="${BUCKETS[$idx]}${entry}"$'\n'
+    else
+      BUCKETS[$OTHER_IDX]="${BUCKETS[$OTHER_IDX]}${entry}"$'\n'
+    fi
+  else
+    # Non-conventional commit
+    [ -n "$line" ] && BUCKETS[$OTHER_IDX]="${BUCKETS[$OTHER_IDX]}- ${line}"$'\n'
+  fi
+done < <(git log "${SINCE}..HEAD" --pretty=format:"%s" --no-merges 2>/dev/null)
+
+# Build output
+OUTPUT=""
+OUTPUT="${OUTPUT}## [${VERSION}] - ${DATE}"$'\n'$'\n'
+
+# Section order (matches original): feat fix refactor perf docs test chore other
+for type in feat fix refactor perf docs test chore other; do
+  idx=$(type_index "$type")
+  if [ -n "${BUCKETS[$idx]}" ]; then
+    OUTPUT="${OUTPUT}### ${TYPE_LABELS[$idx]}"$'\n'
+    OUTPUT="${OUTPUT}${BUCKETS[$idx]}"$'\n'
+  fi
+done
+
+if [ "$APPEND" = true ] && [ -f "CHANGELOG.md" ]; then
+  # Insert the new entry just before the first existing "## [" version
+  # heading. The entry is passed via a file (not awk -v) because the macOS
+  # BSD awk rejects newlines inside a -v assignment.
+  tmp=$(mktemp)
+  entryfile=$(mktemp)
+  printf '%s' "$OUTPUT" > "$entryfile"
+  awk -v entryfile="$entryfile" '
+    /^## \[/ && !inserted {
+      while ((getline eline < entryfile) > 0) print eline
+      close(entryfile)
+      inserted = 1
+    }
+    { print }
+  ' CHANGELOG.md > "$tmp" && mv "$tmp" CHANGELOG.md
+  rm -f "$entryfile"
+  echo "Appended ${VERSION} entry to CHANGELOG.md"
+else
+  echo "$OUTPUT"
+fi

@@ -149,6 +149,18 @@ file_is_strict() {
   return 1
 }
 
+# Returns 0 if the file is a shell script (bash/sh shebang or no shebang), 1 if it is
+# a non-shell interpreter (Python, Ruby, Node, Perl) whose syntax doesn't share the
+# landmine classes. This prevents false positives on Python files in bin/ that happen
+# to contain the word "read" or "/Users/..." in comments or string literals.
+file_is_shell() {
+  local first; first="$(head -1 "$1" 2>/dev/null || true)"
+  case "$first" in
+    '#!/'*python*|'#!/'*ruby*|'#!/'*node*|'#!/'*perl*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
 # ── CLASS 1 — SIGPIPE: terminal `| head` inside $(...) / assignment, unguarded ─
 # The bug: `x="$(… | head -c N)"` in a set -e/pipefail script. `head` closes the
 # pipe after N bytes → upstream gets SIGPIPE → nonzero pipeline → set -e aborts.
@@ -162,6 +174,8 @@ file_is_strict() {
 scan_sigpipe() {
   local file="$1" line lineno=0
   file_is_strict "$file" || return 0
+  # Fast bail: no command substitution in this file — nothing to scan.
+  grep -qE '\$\(|`' "$file" 2>/dev/null || return 0
   while IFS= read -r line; do
     lineno=$((lineno + 1))
     is_comment "$line" && continue
@@ -193,6 +207,8 @@ scan_sigpipe() {
 # This is the only class-2 shape we flag (best-effort by design; documented).
 scan_unguarded_var() {
   local file="$1" line lineno=0
+  # Fast bail: no local/declare in this file.
+  grep -qE '\blocal\b|\bdeclare\b' "$file" 2>/dev/null || return 0
   while IFS= read -r line; do
     lineno=$((lineno + 1))
     is_comment "$line" && continue
@@ -243,9 +259,17 @@ EOF
 # patterns that match LEGACY paths for removal (`/\.superx\/bin/d`).
 scan_baked_path() {
   local file="$1" line lineno=0
+  file_is_shell "$file" || return 0
+  # Fast bail: no home-literal or /superx path anywhere in this file.
+  grep -qE '/(Users|home)/[A-Za-z]|/superx' "$file" 2>/dev/null || return 0
   while IFS= read -r line; do
     lineno=$((lineno + 1))
     is_comment "$line" && continue
+    # Fast pre-filter: skip lines without a path-like substring.
+    case "$line" in
+      */Users/*|*/home/*|*/superx*) : ;;
+      *) continue ;;
+    esac
     # Skip lines whose absolute literal lives inside a sed/grep address that is
     # matching a LEGACY path for deletion/substitution (not a path the script
     # depends on). Heuristic: a `/…/d` or `s/…/` sed verb on the line plus the
@@ -295,6 +319,11 @@ scan_baked_path() {
 # keypress flags) from INHERITED stdin lacking a `[ -t 0 ]`/`--yes` guard.
 scan_tty_read() {
   local file="$1"
+  # Skip non-shell files (Python, Ruby, etc.) — their syntax doesn't share the TTY-READ
+  # class, and Python comments containing "(read …)" produce false positives.
+  file_is_shell "$file" || return 0
+  # Fast bail: no 'read' keyword anywhere in this file — nothing to scan.
+  grep -qE '\bread\b' "$file" 2>/dev/null || return 0
   local -a lines=()
   local l
   while IFS= read -r l; do lines+=("$l"); done < "$file"
@@ -303,6 +332,9 @@ scan_tty_read() {
     line="${lines[$i]}"
     local lineno=$((i + 1))
     is_comment "$line" && continue
+    # Fast pre-filter: skip lines with no 'read' substring at all. This avoids the
+    # sed subprocess for ~95% of lines, the main source of per-file overhead.
+    case "$line" in *read*) : ;; *) continue ;; esac
     # Strip double- and single-quoted string CONTENT so the word "read" inside a
     # message ("… read claims first …") is never mistaken for the read command.
     local bare
@@ -387,6 +419,8 @@ scan_tty_read() {
 # the correctly-ordered v2.0.x fix).
 scan_order_destroy() {
   local file="$1"
+  # Fast bail: no self-destruction pattern anywhere in this file.
+  grep -qE '_heimdall_remove_plugin|rm -rf' "$file" 2>/dev/null || return 0
   local -a lines=()
   local l
   while IFS= read -r l; do lines+=("$l"); done < "$file"
@@ -394,6 +428,11 @@ scan_order_destroy() {
   for (( i=0; i<n; i++ )); do
     line="${lines[$i]}"
     is_comment "$line" && continue
+    # Fast pre-filter: skip lines that cannot be self-destruction patterns.
+    case "$line" in
+      *'_heimdall_remove_plugin'*|*'rm -rf'*) : ;;
+      *) continue ;;
+    esac
     # A self-destruction line.
     local destroyed=0
     printf '%s' "$line" | grep -qE '_heimdall_remove_plugin\b' && destroyed=1

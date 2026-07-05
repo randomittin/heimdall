@@ -1,0 +1,9 @@
+{
+  "mutants": [
+    {
+      "name": "broken-grouped",
+      "file": "broken-grouped.sh",
+      "description": "maps feat: commits to 'Modified' instead of 'Added'; the Added section never appears — run.test.sh check [4] fails on '### Added' and '- **api**: add login endpoint'"
+    }
+  ]
+}

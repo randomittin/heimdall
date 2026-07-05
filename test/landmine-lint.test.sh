@@ -196,13 +196,20 @@ if [ "$c4_count" = "3" ]; then ok "exactly 3 class-4 findings (the 3 unguarded p
 # B. CLEAN-TREE — zero false positives on the real shipped scripts.
 # ─────────────────────────────────────────────────────────────────────────────
 echo "B. CLEAN-TREE (no false positives on the real current tree):"
+_B_START=$(date +%s)
 TREE_OUT="$("$LINT" --root "$REPO" 2>&1)"
 TREE_RC=$?
+_B_ELAPSED=$(( $(date +%s) - _B_START ))
 if [ "$TREE_RC" -eq 0 ]; then
   ok "real tree is clean (exit 0): ${TREE_OUT##*$'\n'}"
 else
   bad "real tree flagged a landmine (exit $TREE_RC) — false positive(s):"
   printf '%s\n' "$TREE_OUT" | sed 's/^/      /'
+fi
+if [ "$_B_ELAPSED" -le 60 ]; then
+  ok "real-tree scan within 60s budget (${_B_ELAPSED}s)"
+else
+  bad "real-tree scan exceeded 60s budget (${_B_ELAPSED}s) — add case-check pre-filters or file_is_shell guards to linter"
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
