@@ -301,6 +301,12 @@ def build_maintainer_argv(params, *, loop_bin=None):
             "--repo", params["repo"], "--max", str(params["max"])]
     if params.get("budget_tokens") is not None:
         argv += ["--budget-tokens", str(params["budget_tokens"])]
+    # explicit=True is the drain's AUTHORIZATION that this cycle came from a signed rr task;
+    # the flag makes the loop run WITHOUT a local heimdall-state.json enable flag (absent in
+    # the ephemeral job container). A LITERAL flag element — no untyped data enters the argv
+    # (the allowlist already proved `explicit` is a strict bool, never a string payload).
+    if params.get("explicit"):
+        argv += ["--explicit"]
     return argv
 
 
@@ -351,6 +357,7 @@ def run_maintainer_cycle(params, ctx):
             "action": "run-maintainer-cycle",
             "repo": params["repo"], "max": params["max"],
             "budget_tokens": params.get("budget_tokens"),
+            "explicit": bool(params.get("explicit")),
             "argv": argv, "auth_source": auth_source,
             "isolated": True, "status": "timeout",
         }
@@ -369,6 +376,7 @@ def run_maintainer_cycle(params, ctx):
         "action": "run-maintainer-cycle",
         "repo": params["repo"], "max": params["max"],
         "budget_tokens": params.get("budget_tokens"),
+        "explicit": bool(params.get("explicit")),  # the drain's rr-task authorization (safe metadata).
         "argv": argv,                 # SAFE: the token is env-only, never an argv element.
         "auth_source": auth_source,   # the auth var NAME only — never its value.
         "exit_code": proc.returncode,

@@ -307,6 +307,53 @@ else
   bad "an approved issue was still parked (parked=$(jget "$OUT2" '.tally.parked'))"
 fi
 
+echo "── (10) EXPLICIT rr-task authorization — runs with NO local heimdall-state.json ─"
+# The deployed-shape gap fix: an EXPLICIT rr task (the gated drain passes --explicit) IS the
+# authorization, so the loop runs even though NO heimdall-state.json exists (the ephemeral
+# Cloud Run Job container shape). NOTE: enable_state is deliberately NOT called here, and the
+# run_loop helper points HEIMDALL_STATE_FILE at a path that does NOT exist -> _read_state {}.
+R11="$(new_repo explicit_on)"; seed "$R11" 111       # queued issue, but NO state file at all
+[ ! -f "$R11/heimdall-state.json" ] || bad "precondition: R11 unexpectedly has a state file"
+OUT="$(run_loop "$R11" "$METER_SMALL" --explicit --evidence "true")"
+if [ "$(jget "$OUT" '.stop')" != "disabled" ] && [ "$(jget "$OUT" '.cycles')" -ge 1 ]; then
+  ok "explicit -> runs with NO local state file (stop=$(jget "$OUT" '.stop'), cycles=$(jget "$OUT" '.cycles') — the no-op is removed)"
+else
+  bad "explicit did NOT run without state (stop=$(jget "$OUT" '.stop') cycles=$(jget "$OUT" '.cycles'))"
+fi
+
+# FALSIFIER — the SAFETY GATE HOLDS: the SAME repo shape with NO --explicit + NO state file
+# stays OFF (unattended never auto-runs on an unconfigured repo). This is what proves the
+# explicit path is a scoped authorization, not a blanket always-on.
+R12="$(new_repo explicit_off)"; seed "$R12" 112
+[ ! -f "$R12/heimdall-state.json" ] || bad "precondition: R12 unexpectedly has a state file"
+OUT="$(run_loop "$R12" "$METER_SMALL" --evidence "true")"
+if [ "$(jget "$OUT" '.stop')" = "disabled" ] && [ "$(jget "$OUT" '.cycles')" = "0" ]; then
+  ok "FALSIFIER: no --explicit + no state file -> stop=disabled, 0 cycles (the unattended gate holds)"
+else
+  bad "the unattended safety gate did NOT hold (stop=$(jget "$OUT" '.stop') cycles=$(jget "$OUT" '.cycles'))"
+fi
+# and the falsifier truly did nothing — the queued issue is untouched.
+QST12="$(HEIMDALL_HOME="$R12/.heimdall" "$QCMD" status --repo "$R12")"
+if [ "$(jget "$QST12" '.queued')" = "1" ]; then
+  ok "FALSIFIER: the unauthorized run touched NOTHING (queue still has its issue)"
+else
+  bad "the unauthorized run mutated the queue (queued=$(jget "$QST12" '.queued'))"
+fi
+
+# OPERATOR ENV OVERRIDE — HEIMDALL_MAINTAINER_ENABLED=1 authorizes a run with NO state file.
+R13="$(new_repo env_enabled)"; seed "$R13" 113
+[ ! -f "$R13/heimdall-state.json" ] || bad "precondition: R13 unexpectedly has a state file"
+OUT="$(env HEIMDALL_HOME="$R13/.heimdall" \
+           HEIMDALL_STATE_FILE="$R13/heimdall-state.json" \
+           HEIMDALL_TOKENS_BIN="$METER_SMALL" \
+           HEIMDALL_MAINTAINER_ENABLED=1 \
+           "$CMD" run --repo "$R13" --evidence "true" 2>/dev/null)"
+if [ "$(jget "$OUT" '.stop')" != "disabled" ] && [ "$(jget "$OUT" '.cycles')" -ge 1 ]; then
+  ok "HEIMDALL_MAINTAINER_ENABLED=1 -> runs with NO state file (documented operator override)"
+else
+  bad "env override did NOT authorize a run (stop=$(jget "$OUT" '.stop') cycles=$(jget "$OUT" '.cycles'))"
+fi
+
 echo
 echo "════════════════════════════════════════════════════════════════════════════"
 printf "maintain-loop: \033[32m%d passed\033[0m, " "$PASS"
@@ -315,4 +362,4 @@ if [ "$FAIL" -gt 0 ]; then
   exit 1
 fi
 printf "%d failed\n" "$FAIL"
-echo "ALL GREEN — budget-cap can't-burn-tokens · stop-guards · checkpoint · heartbeat · resume · disabled · approval-park"
+echo "ALL GREEN — budget-cap can't-burn-tokens · stop-guards · checkpoint · heartbeat · resume · disabled · approval-park · explicit-rr-authz · env-override"

@@ -791,7 +791,17 @@ def drain_team_queue(team_id, *, home=None, base_env=None, now=None, policy_name
             cp_team_queue.requeue(team_id, tid, home=home)
             break
         seen.add(tid)
-        params = {"repo": repo, "max": 1, "budget_tokens": budget}
+        # The dispatch params are built SERVER-SIDE from the drain's OWN trusted inputs (the
+        # team's covered repo, a fixed max, the env budget) — NEVER copied from the task item
+        # (`task`), so a task's TEXT can never inject a param (the injection-resistance
+        # property; the queue already dropped any non-text key at enqueue). `explicit=True` is
+        # the deployed-shape AUTHORIZATION: this cycle originates from an EXPLICIT rr task the
+        # user signed + submitted, which the gated drain is now dispatching — that submission
+        # IS the authorization, so the maintainer runs WITHOUT a local heimdall-state.json
+        # enable flag (absent in the ephemeral job container). Scheduled/unattended cycles
+        # (cp_scheduler) do NOT set this, so they keep the OFF-by-default local-enable gate —
+        # the loop never auto-runs on an unconfigured repo.
+        params = {"repo": repo, "max": 1, "budget_tokens": budget, "explicit": True}
         try:
             outcome = dispatch_maintainer_cycle(
                 team_id, params, home=home, base_env=base_env, now=now,
