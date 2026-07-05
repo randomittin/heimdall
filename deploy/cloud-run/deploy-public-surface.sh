@@ -355,7 +355,8 @@ fi
 # across scale-to-zero), and enroll writes the bootstrapped pubkey to the key registry.
 run gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
   --member="serviceAccount:${PUBLIC_SA}" \
-  --role="roles/datastore.user"
+  --role="roles/datastore.user" \
+  --condition=None
 
 # Secret access — granted at the SECRET RESOURCE level (NOT project-wide), so the public
 # SA can read ONLY the secret(s) it needs and no other secret in the project. The enroll

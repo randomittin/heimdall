@@ -467,6 +467,7 @@ ensure_public_sa
 wait_sa_propagate
 retry 5 run gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
   --member="serviceAccount:${PUBLIC_SA}" --role="roles/datastore.user" \
+  --condition=None \
   || die "STEP 4: datastore.user grant failed after retries."
 retry 5 run gcloud secrets add-iam-policy-binding "${ENROLL_SECRET}" --project="${PROJECT_ID}" \
   --member="serviceAccount:${PUBLIC_SA}" --role="roles/secretmanager.secretAccessor" \

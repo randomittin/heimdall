@@ -240,8 +240,8 @@ arch_b() {
   # IAM: a least-priv role that can run the job (idempotent)
   show "gcloud iam roles create heimdallJobRunner --project=$PROJECT --permissions=run.jobs.run  (|| exists)"
   [ "$DRY" = 1 ] || gcloud iam roles create heimdallJobRunner --project="$PROJECT" --permissions=run.jobs.run >/dev/null 2>&1 || true
-  show "gcloud projects add-iam-policy-binding $PROJECT --member=serviceAccount:${RUNTIME_SA} --role=projects/$PROJECT/roles/heimdallJobRunner"
-  [ "$DRY" = 1 ] || gcloud projects add-iam-policy-binding "$PROJECT" --member="serviceAccount:${RUNTIME_SA}" --role="projects/$PROJECT/roles/heimdallJobRunner" >/dev/null
+  show "gcloud projects add-iam-policy-binding $PROJECT --member=serviceAccount:${RUNTIME_SA} --role=projects/$PROJECT/roles/heimdallJobRunner --condition=None"
+  [ "$DRY" = 1 ] || gcloud projects add-iam-policy-binding "$PROJECT" --member="serviceAccount:${RUNTIME_SA}" --role="projects/$PROJECT/roles/heimdallJobRunner" --condition=None >/dev/null
   say "cloud job '$JOB' deployed. Hybrid tick fires it when your box is down."
   if [ -z "$SCHEDULE" ]; then
     warn "schedule registration (per-minute tick fires run-maintainer-cycle): pass --schedule \"<cron>\" to register it now (heimdall-control-plane schedule-maintainer), or see MAINTAINER-RUNBOOK.md §6."
