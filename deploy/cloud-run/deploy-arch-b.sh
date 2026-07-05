@@ -111,6 +111,20 @@ if [ -n "$_yaml_proj" ] && [ "$_yaml_proj" != "$PROJECT" ]; then
   warn "this script pins the IMAGE path to $PROJECT; also update serviceAccountName + GOOGLE_CLOUD_PROJECT in $YAML to $PROJECT before a real deploy (RUNBOOK §3.2)."
 fi
 
+# ── a2. deployed-shape preflight (WARN-ONLY — never blocks) ───────────────────
+# Static scan of bin/lib/*.py for the workstation-assumption smells the 14-bug
+# cloud-maintainer bring-up saga proved dangerous (slug-onto-CWD paths, unguarded
+# local-state reads, captured-but-ignored subprocess stderr, reserved Cloud Run env
+# names in override dicts). Needs NO creds/network and NEVER blocks the deploy — a
+# BOUNDED experiment (promotion to blocking is `--strict`, once it earns it).
+DSHAPE_CHECK="$ROOT/bin/heimdall-deployed-shape-check"
+if command -v python3 >/dev/null 2>&1 && [ -f "$DSHAPE_CHECK" ]; then
+  say "a2. deployed-shape preflight (WARN-only — findings never block)"
+  python3 "$DSHAPE_CHECK" --root "$ROOT" || true
+else
+  warn "a2. deployed-shape preflight skipped (python3 or $DSHAPE_CHECK absent)"
+fi
+
 # ── b. ensure the Artifact Registry docker repo exists (idempotent) ──────────
 say "b. ensure Artifact Registry repo '${AR_REPO}' in ${REGION} (create || already exists)"
 if [ "$DRY" = 1 ]; then

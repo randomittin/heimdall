@@ -1,0 +1,334 @@
+#!/usr/bin/env python3
+# heimdall-deployed-shape-check — a STATIC preflight for the workstation-assumption
+# smells the 14-bug cloud-maintainer bring-up saga proved dangerous. It reads bin/lib/*.py
+# with the stdlib `ast` module (no third-party deps, no network, no execution of the target
+# code) and emits WARNINGS at file:line for the four failure shapes that recurred:
+#
+#   (a) slug-shaped path build   — os.path.abspath/join over an owner/name SLUG argument.
+#         The saga's bug 13: the planning dir was built from a repo slug joined onto the
+#         CWD, which in a Cloud Run job is READ-ONLY (no clone happened) -> the maintainer
+#         could not write its own planning state. A slug is not a writable checkout.
+#   (b) unguarded state-file read — open()/os.path.exists() on a HEIMDALL-state file with
+#         NO env override and NO fresh-home fallback in the same function. The saga's bugs
+#         10 (.maintainer.enabled gate absent in an ephemeral container) and 12 (budget
+#         meter fail-closed on a fresh $HOME): local state that simply is not there in a
+#         cold cloud container needs an env override + a defined fresh-home semantic.
+#   (c) captured-but-ignored stderr — subprocess.run(..., capture_output=True) whose
+#         .stderr is never referenced afterward (and check= is not True). The saga's bug 6:
+#         a task subprocess failed, its stderr was captured, and nobody surfaced it ->
+#         silent task consumption with no retry and no diagnosable trail. Every subprocess
+#         failure must surface scrubbed stderr.
+#   (d) reserved env name in an override dict — a Cloud Run RESERVED name (PORT, K_SERVICE,
+#         K_REVISION, K_CONFIGURATION, any K_*) written as a key into an env dict. The
+#         saga's bug 9: reserved names in the per-execution env override made Cloud Run
+#         reject the RunJob request. Reserved names must be stripped from any outbound env.
+#
+# ALLOWLIST. A site is intentional when its line — or anywhere in its enclosing function —
+# carries the marker comment `# deployed-shape-ok: <reason>`. That is the documented escape
+# hatch: it records WHY the smell is safe here (an env override exists, the slug is already
+# a cloned workspace, the stderr is deliberately discarded, the reserved name is stripped).
+#
+# OUTPUT / EXIT. Warn-only by default (exit 0 even with findings) so it can sit in a deploy
+# script without ever blocking — a BOUNDED experiment (promotion to blocking is `--strict`,
+# once it has proven itself). `--json` emits structured findings for tests/automation.
+#
+# Usage:
+#   heimdall-deployed-shape-check [PATH ...]        # default: <root>/bin/lib/*.py
+#     [--root DIR]     repo root (default: the dir two levels up from this script)
+#     [--json]         emit {"findings":[...],"count":N} instead of human warnings
+#     [--quiet]        suppress the per-finding lines (footer/JSON only)
+#     [--strict]       exit 1 when findings exist (the promotion-to-blocking path)
+#   -h | --help
+#
+# Exit: 0 ok (warn-only) · 1 findings-and---strict · 2 usage/runtime.
+
+import argparse
+import ast
+import glob
+import json
+import os
+import re
+import sys
+
+MARKER = "deployed-shape-ok"   # inline allowlist: "# deployed-shape-ok: <reason>"
+
+# (a) a name that denotes an owner/name SLUG (not a bare directory path). Deliberately
+# EXCLUDES bare "repo"/"repos" (those are usually real dir paths, e.g. os.path.join(repo,
+# ".planning")) — the bug-13 smell is specifically a SLUG used as a writable path segment.
+SLUG_RE = re.compile(r'(?i)(slug|full_?name|owner_repo|repo_full|repo_name|nwo)')
+
+# (b) a filename fragment that denotes local HEIMDALL/maintainer state that a cold cloud
+# container will simply not have unless it was provisioned.
+STATE_HINT_RE = re.compile(
+    r'(\.maintainer|\.planning|\.enabled|\.heimdall|heimdall[-_]state|budget|usage[-_.]|'
+    r'settings\.json|checkpoint)', re.I)
+
+# (d) Cloud Run reserved env names (PORT + the K_* family the platform injects itself).
+RESERVED_ENV_RE = re.compile(r'^(PORT|K_[A-Z0-9_]+)$')
+
+PATH_BUILDERS = {"os.path.abspath", "os.path.join", "abspath", "join"}
+FILE_READERS = {"open", "os.path.exists", "os.path.isfile", "os.path.isdir",
+                "os.path.lexists", "exists", "isfile"}
+
+
+def _die(msg, code=2):
+    sys.stderr.write("error: %s\n" % msg)
+    raise SystemExit(code)
+
+
+def _dotted(fn):
+    """Dotted name for a Call's func node: os.path.join -> 'os.path.join'."""
+    parts = []
+    node = fn
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name):
+        parts.append(node.id)
+    return ".".join(reversed(parts))
+
+
+def _kw(node, name):
+    for k in node.keywords:
+        if k.arg == name:
+            return k.value
+    return None
+
+
+def _is_true(v):
+    return isinstance(v, ast.Constant) and v.value is True
+
+
+def _is_pipe(v):
+    # subprocess.PIPE (Attribute) or a bare PIPE Name.
+    if isinstance(v, ast.Attribute):
+        return v.attr == "PIPE"
+    return isinstance(v, ast.Name) and v.id == "PIPE"
+
+
+def _const_str(v):
+    if isinstance(v, ast.Constant) and isinstance(v.value, str):
+        return v.value
+    # f-string: concatenate its constant fragments so a hint in the literal part still hits.
+    if isinstance(v, ast.JoinedStr):
+        buf = []
+        for part in v.values:
+            if isinstance(part, ast.Constant) and isinstance(part.value, str):
+                buf.append(part.value)
+        return "".join(buf) if buf else None
+    return None
+
+
+def _name_ish(v):
+    """The identifier a Name/Attribute arg denotes (for the slug heuristic)."""
+    if isinstance(v, ast.Name):
+        return v.id
+    if isinstance(v, ast.Attribute):
+        return v.attr
+    return None
+
+
+class _Scanner(ast.NodeVisitor):
+    def __init__(self, path, src):
+        self.path = path
+        self.lines = src.splitlines()
+        self.findings = []
+        # enclosing-function spans, for marker + env-fallback lookups.
+        self.funcs = []  # (start, end, text)
+
+    # ---- enclosing-function helpers -------------------------------------------------
+    def _index_funcs(self, tree):
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                start = node.lineno
+                end = getattr(node, "end_lineno", start)
+                text = "\n".join(self.lines[start - 1:end])
+                self.funcs.append((start, end, text))
+
+    def _enc_text(self, lineno):
+        """Innermost enclosing function's source text (smallest span wins)."""
+        best = None
+        for start, end, text in self.funcs:
+            if start <= lineno <= end:
+                if best is None or (end - start) < (best[1] - best[0]):
+                    best = (start, end, text)
+        return best[2] if best else ""
+
+    def _marked(self, lineno):
+        line = self.lines[lineno - 1] if 0 < lineno <= len(self.lines) else ""
+        if MARKER in line:
+            return True
+        return MARKER in self._enc_text(lineno)
+
+    def _has_env_fallback(self, lineno):
+        return re.search(r'environ|getenv', self._enc_text(lineno)) is not None
+
+    def _add(self, lineno, rule, msg):
+        if self._marked(lineno):
+            return
+        self.findings.append({"file": self.path, "line": lineno,
+                              "rule": rule, "message": msg})
+
+    # ---- detectors ------------------------------------------------------------------
+    def visit_Call(self, node):
+        name = _dotted(node.func)
+
+        # (a) slug-shaped path build
+        if name in PATH_BUILDERS:
+            for arg in node.args:
+                ident = _name_ish(arg)
+                if ident and SLUG_RE.search(ident):
+                    self._add(node.lineno, "slug-path",
+                              "%s() builds a path from slug-shaped arg %r — a cloud job's "
+                              "CWD is read-only; clone into a writable workspace, don't join "
+                              "a slug onto CWD (bug 13)" % (name, ident))
+                    break
+
+        # (b) unguarded state-file read
+        if name in FILE_READERS and node.args:
+            hint = _const_str(node.args[0])
+            if hint and STATE_HINT_RE.search(hint):
+                if not self._has_env_fallback(node.lineno):
+                    self._add(node.lineno, "state-read",
+                              "%s(%r) reads local HEIMDALL state with no env override / "
+                              "fresh-home fallback in this function — a cold cloud container "
+                              "has no such file (bugs 10/12); add an env override or mark "
+                              "'# %s: <reason>'" % (name, hint, MARKER))
+
+        # (c) captured-but-ignored subprocess stderr
+        if name in ("subprocess.run", "run") and _has_captured_stderr(node):
+            if not _is_true(_kw(node, "check")):
+                self._flag_ignored_stderr(node)
+
+        self.generic_visit(node)
+
+    def _flag_ignored_stderr(self, call):
+        # find the assignment target this call binds to (X = subprocess.run(...)); a bare
+        # expression-statement call discards EVERYTHING -> definitely silent.
+        target = getattr(call, "_assign_target", None)
+        if target is None:
+            self._add(call.lineno, "silent-stderr",
+                      "subprocess.run(capture_output) result is discarded — a failing task's "
+                      "stderr is captured and dropped (silent consumption, bug 6); bind it and "
+                      "surface scrubbed stderr on nonzero exit")
+            return
+        # is <target>.stderr referenced anywhere in the enclosing function?
+        enc = self._enc_text(call.lineno)
+        if re.search(r'\b%s\s*\.\s*stderr\b' % re.escape(target), enc):
+            return
+        self._add(call.lineno, "silent-stderr",
+                  "subprocess.run captured into %r but %s.stderr is never referenced — a "
+                  "failing subprocess is silently consumed (bug 6); surface scrubbed stderr "
+                  "on nonzero exit" % (target, target))
+
+    def visit_Assign(self, node):
+        # tag a subprocess.run call with its single-Name assignment target for (c).
+        if (isinstance(node.value, ast.Call)
+                and _dotted(node.value.func) in ("subprocess.run", "run")
+                and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)):
+            node.value._assign_target = node.targets[0].id
+
+        # (d) reserved env name written via subscript assignment: env["PORT"] = ...
+        for tgt in node.targets:
+            if isinstance(tgt, ast.Subscript):
+                key = _const_str(tgt.slice if not isinstance(tgt.slice, ast.Index)
+                                 else tgt.slice.value)
+                if key and RESERVED_ENV_RE.match(key):
+                    self._add(tgt.lineno, "reserved-env",
+                              "reserved Cloud Run env name %r written into an env dict — the "
+                              "platform injects/reserves it; a RunJob override that sets it is "
+                              "rejected (bug 9); strip reserved names before dispatch" % key)
+        self.generic_visit(node)
+
+    def visit_Dict(self, node):
+        # (d) reserved env name as a dict-literal key: {"PORT": ...}
+        for k in node.keys:
+            key = _const_str(k) if k is not None else None
+            if key and RESERVED_ENV_RE.match(key):
+                self._add(k.lineno, "reserved-env",
+                          "reserved Cloud Run env name %r in an env dict literal — Cloud Run "
+                          "reserves it; a RunJob override that sets it is rejected (bug 9); "
+                          "strip reserved names before dispatch" % key)
+        self.generic_visit(node)
+
+
+def _has_captured_stderr(call):
+    if _is_true(_kw(call, "capture_output")):
+        return True
+    return _is_pipe(_kw(call, "stderr"))
+
+
+def scan_file(path):
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            src = fh.read()
+    except OSError as e:
+        return [], "read-error: %s (%s)" % (path, e)
+    try:
+        tree = ast.parse(src, filename=path)
+    except SyntaxError as e:
+        return [], "syntax-error: %s:%s (%s)" % (path, e.lineno, e.msg)
+    sc = _Scanner(path, src)
+    sc._index_funcs(tree)
+    sc.visit(tree)
+    sc.findings.sort(key=lambda f: (f["line"], f["rule"]))
+    return sc.findings, None
+
+
+def _targets(args):
+    if args.paths:
+        out = []
+        for p in args.paths:
+            if os.path.isdir(p):
+                out.extend(sorted(glob.glob(os.path.join(p, "**", "*.py"), recursive=True)))
+            else:
+                out.append(p)
+        return out
+    return sorted(glob.glob(os.path.join(args.root, "bin", "lib", "*.py")))
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(
+        prog="heimdall-deployed-shape-check",
+        description="Static preflight for workstation-assumption smells (the 14-bug "
+                    "cloud-maintainer saga's recurring shapes). Warn-only by default.")
+    here = os.path.dirname(os.path.abspath(__file__))
+    ap.add_argument("paths", nargs="*", help="files/dirs to scan (default: <root>/bin/lib/*.py)")
+    ap.add_argument("--root", default=os.path.dirname(here), help="repo root")
+    ap.add_argument("--json", action="store_true", help="emit structured findings")
+    ap.add_argument("--quiet", action="store_true", help="suppress per-finding lines")
+    ap.add_argument("--strict", action="store_true", help="exit 1 when findings exist")
+    args = ap.parse_args(argv)
+
+    targets = _targets(args)
+    findings = []
+    notes = []
+    for path in targets:
+        f, note = scan_file(path)
+        findings.extend(f)
+        if note:
+            notes.append(note)
+
+    if args.json:
+        print(json.dumps({"findings": findings, "count": len(findings),
+                          "scanned": len(targets), "notes": notes}, sort_keys=True))
+    else:
+        if not args.quiet:
+            for f in findings:
+                sys.stderr.write("\033[33mWARN\033[0m %s:%d [%s] %s\n"
+                                 % (f["file"], f["line"], f["rule"], f["message"]))
+            for n in notes:
+                sys.stderr.write("\033[90mnote\033[0m %s\n" % n)
+        sys.stderr.write("deployed-shape-check: %d finding(s) across %d file(s)\n"
+                         % (len(findings), len(targets)))
+
+    if args.strict and findings:
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main(sys.argv[1:]))
+    except BrokenPipeError:
+        raise SystemExit(0)
