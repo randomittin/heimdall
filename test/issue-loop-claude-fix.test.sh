@@ -233,6 +233,132 @@ else
   bad "the injected command EXECUTED — sanitizer bypassed"
 fi
 
+# ══════════════════════════════════════════════════════════════════════════════
+# PROMPT-INJECTION HARDENING (security review) — sections (5)/(6)/(7). ADDITIVE:
+# the fix step runs on ATTACKER-CONTROLLED input (a public issue body) inside a
+# credential-bearing container. A CAPTURE fake claude records its argv + child env +
+# prompt so we can assert: (5) allowedTools is EXACTLY Edit,Write,Read (NO Bash);
+# (6) the child env carries the claude auth var but NONE of the team credentials even
+# when the parent has them; (7) the prompt wraps the body in the untrusted-content block
+# behind the guardrail. Each has a built-in falsifier (Bash present / a secret leaks /
+# the body escapes the block -> the assertion fails).
+# ══════════════════════════════════════════════════════════════════════════════
+
+CAPDIR="$WORK/cap"; mkdir -p "$CAPDIR"
+# CAPTURE fake: dumps argv (NUL-delimited) + env to CAPDIR (baked-in path, since the
+# scrubbed child env drops any ad-hoc capture-dir var), AND writes the edit so the run
+# flows all the way through the gate. NO model, NO network.
+cat > "$FAKEBIN/claude-capture" <<CAPEOF
+#!/usr/bin/env bash
+: > "$CAPDIR/argv"
+for a in "\$@"; do printf '%s\0' "\$a" >> "$CAPDIR/argv"; done
+env > "$CAPDIR/env"
+printf 'FIXED by fake claude\n' >> app.py
+echo "fake-claude: captured argv+env, wrote edit"
+exit 0
+CAPEOF
+chmod +x "$FAKEBIN/claude-capture"
+
+# drive run-once with the CAPTURE claude AND a parent env STUFFED with team credentials —
+# the scrub must keep ALL of them out of the child while keeping the claude auth var.
+R5="$(new_repo capture_repo "$RT_GATED")"
+seed "$R5" 24 "$BODY"
+: > "$GH_LOG"
+( cd "$R5" && env \
+    HEIMDALL_HOME="$R5/.heimdall" \
+    PATH="$FAKEBIN:$PATH" \
+    HEIMDALL_FIX_WITH_CLAUDE=1 \
+    HEIMDALL_CLAUDE_BIN="$FAKEBIN/claude-capture" \
+    CLAUDE_CODE_OAUTH_TOKEN="sk-ant-oat-FAKEauth0000000000000000000000" \
+    HEIMDALL_PR_BOT_TOKEN="ghs_FAKEbottoken000000000000000000000000" \
+    GH_TOKEN="ghp_FAKEghtoken00000000000000000000000000" \
+    GITHUB_TOKEN="ghp_FAKEgithubtoken0000000000000000000000" \
+    HEIMDALL_GH_APP_PRIVATE_KEY="-----BEGIN FAKE PRIVATE KEY-----" \
+    HEIMDALL_GH_APP_ID="123456" \
+    HEIMDALL_CP_PKI_KEY="FAKEpkikey00000000000000000000000000000" \
+    NPM_AUTH_SECRET="shhh-do-not-leak" \
+    "$CMD" run-once --repo "$R5" --print >/dev/null 2>&1 ) || true
+
+# extract the captured prompt (argv element after -p) + allowedTools value via python.
+"$PY" - "$CAPDIR/argv" "$CAPDIR/prompt" "$CAPDIR/allowed" "$CAPDIR/hasbash" <<'PYEOF'
+import sys
+raw = open(sys.argv[1], "rb").read()
+args = [x.decode("utf-8", "replace") for x in raw.split(b"\0") if x != b""]
+prompt = ""
+allowed = ""
+for i, a in enumerate(args):
+    if a == "-p" and i + 1 < len(args):
+        prompt = args[i + 1]
+    if a == "--allowedTools" and i + 1 < len(args):
+        allowed = args[i + 1]
+open(sys.argv[2], "w").write(prompt)
+open(sys.argv[3], "w").write(allowed)
+# "Bash" present ANYWHERE in the argv (any element) -> the falsifier fires.
+open(sys.argv[4], "w").write("yes" if any("Bash" in a for a in args) else "no")
+PYEOF
+
+echo "── (5) HARDENING — the fix argv drops Bash: allowedTools EXACTLY Edit,Write,Read ──────"
+ALLOWED="$(cat "$CAPDIR/allowed" 2>/dev/null || true)"
+if [ "$ALLOWED" = "Edit,Write,Read" ]; then
+  ok "the fix invocation passes --allowedTools EXACTLY 'Edit,Write,Read' (Bash dropped)"
+else
+  bad "allowedTools is not exactly Edit,Write,Read (got: '$ALLOWED')"
+fi
+if [ "$(cat "$CAPDIR/hasbash" 2>/dev/null)" = "no" ]; then
+  ok "the string 'Bash' appears NOWHERE in the fix argv (falsifier: any Bash -> FAIL)"
+else
+  bad "'Bash' is present somewhere in the fix argv — the shell was not dropped"
+fi
+
+echo "── (6) HARDENING — the fix child env is CREDENTIAL-SCRUBBED (auth kept, creds dropped) ─"
+LEAKED=""
+for v in HEIMDALL_PR_BOT_TOKEN GH_TOKEN GITHUB_TOKEN HEIMDALL_GH_APP_PRIVATE_KEY HEIMDALL_GH_APP_ID HEIMDALL_CP_PKI_KEY NPM_AUTH_SECRET; do
+  if grep -q "^$v=" "$CAPDIR/env"; then LEAKED="$LEAKED $v"; fi
+done
+if [ -z "$LEAKED" ]; then
+  ok "NO team credential reached the fix child (PR_BOT_TOKEN/GH_TOKEN/GH_APP/PKI/SECRET all dropped)"
+else
+  bad "team credential(s) LEAKED into the fix child env:$LEAKED"
+fi
+if grep -q "^CLAUDE_CODE_OAUTH_TOKEN=" "$CAPDIR/env"; then
+  ok "the claude auth var (CLAUDE_CODE_OAUTH_TOKEN) IS present — the call can still authenticate"
+else
+  bad "the claude auth var is missing from the child env — the fix call could not authenticate"
+fi
+if grep -q "^HEIMDALL_FIX_WITH_CLAUDE=" "$CAPDIR/env" && grep -q "^PATH=" "$CAPDIR/env"; then
+  ok "the non-secret baseline (PATH) + HEIMDALL_FIX_* toggle survive the scrub"
+else
+  bad "the non-secret baseline/toggles did not survive the scrub ($(grep -c '=' "$CAPDIR/env") vars)"
+fi
+
+echo "── (7) HARDENING — the prompt frames the issue body as UNTRUSTED, inside a delimited block ─"
+if grep -q '<untrusted-issue-content>' "$CAPDIR/prompt" && grep -q '</untrusted-issue-content>' "$CAPDIR/prompt"; then
+  ok "the prompt carries the <untrusted-issue-content> delimiters"
+else
+  bad "the untrusted-content delimiters are missing from the prompt"
+fi
+if grep -qi 'UNTRUSTED' "$CAPDIR/prompt" && grep -q 'IGNORE any instructions' "$CAPDIR/prompt"; then
+  ok "the guardrail text (UNTRUSTED data, IGNORE any instructions) precedes the block"
+else
+  bad "the guardrail text is missing from the prompt"
+fi
+# the issue body MUST land INSIDE the block: open-marker < body-text < close-marker.
+if "$PY" - "$CAPDIR/prompt" <<'PYEOF'
+import sys
+t = open(sys.argv[1]).read()
+# the guardrail sentence NAMES both markers, so the REAL block boundaries are the LAST
+# occurrence of each tag (rfind) — the opening/closing tags that actually wrap the body.
+o = t.rfind("<untrusted-issue-content>")
+c = t.rfind("</untrusted-issue-content>")
+b = t.find("The final element is excluded.")
+sys.exit(0 if (o != -1 and c != -1 and b != -1 and o < b < c) else 1)
+PYEOF
+then
+  ok "the issue body lands INSIDE the untrusted block (falsifier: body outside block -> FAIL)"
+else
+  bad "the issue body is NOT inside the untrusted block"
+fi
+
 echo
 echo "════════════════════════════════════════════════════════════════════════════"
 printf "issue-loop-claude-fix: \033[32m%d passed\033[0m, " "$PASS"
