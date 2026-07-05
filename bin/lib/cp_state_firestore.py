@@ -102,12 +102,69 @@ _FIELD_KIND = "kind"     # "ndjson" | "record" — what a node doc represents.
 _KIND_NDJSON = "ndjson"
 _KIND_RECORD = "record"
 
+# ── Firestore TTL (data-lifecycle: bound the ephemeral doc families' growth) ───────────
+#
+# A Firestore TTL policy expires a doc when a NAMED FIELD holds a Timestamp in the past. The
+# field MUST be of Firestore Timestamp type — a plain number (the record's own float `ts`) is
+# IGNORED by TTL, and a nested field is not what a single flat-collection policy targets. So an
+# eligible ephemeral doc carries a dedicated TOP-LEVEL `ttl_at` Timestamp; the operator enables
+# ONE collection-group TTL policy on `ttl_at` (deploy/cloud-run/setup-ops-hardening.sh).
+_FIELD_TTL_AT = "ttl_at"
+
+# The control-plane store ROOTS whose docs are safe to auto-expire (ephemeral BY DESIGN):
+#   • "nonce"     — a seen-nonce is dead weight once its freshness window elapses (cp_nonce:
+#                   a record older than the window is already treated as absent).
+#   • "ratelimit" — a fixed-window counter bucket is never read again once the window rolls
+#                   over (cp_ratelimit: a stale bucket self-expires logically).
+# EVERY other root (jobs, approvals, presence, audit, teamq, …) is durable-forever and MUST NOT
+# carry a ttl_at field, so the SINGLE collection-group TTL policy on `ttl_at` expires ONLY these
+# two doc families and never touches a job log or an approval record. `heimdall_cp` being one
+# flat collection is exactly why the discriminator is the field's PRESENCE, not the collection.
+_TTL_ELIGIBLE_ROOTS = frozenset(("nonce", "ratelimit"))
+
+# The default TTL horizon (seconds from write) for an eligible doc. 24h is >> the presence
+# freshness window (300s, cp_nonce.DEFAULT_WINDOW_SECONDS) and the enroll/presence rate windows
+# (≤3600s), so a doc is only ever expired long after it is dead weight. Overridable per deploy.
+# Firestore reaps expired docs within ~24–72h of the ttl_at instant (best-effort) — this is a
+# retention FLOOR, not an exact delete time.
+_TTL_HORIZON_ENV = "HEIMDALL_FIRESTORE_TTL_HORIZON_SECONDS"
+_TTL_HORIZON_DEFAULT = 86400
+
 
 def _encode_rel(rel):
     """Encode a store-relative path into a flat Firestore doc id (slashes → _SEP).
     Normalizes os.sep to "/" first so the mapping is identical on every platform."""
     norm = rel.replace(os.sep, "/").strip("/")
     return norm.replace("/", _SEP)
+
+
+def _ttl_root(rel):
+    """The FIRST path segment (the store root) of a store-relative path, normalized across
+    platforms: 'nonce/presence/a/b.json' → 'nonce'. Empty rel → ''. Used to decide TTL
+    eligibility by doc family without re-deriving the flat encoding."""
+    norm = rel.replace(os.sep, "/").strip("/")
+    return norm.split("/", 1)[0] if norm else ""
+
+
+def _ttl_at_for(rel):
+    """A timezone-aware UTC datetime `_TTL_HORIZON` seconds in the FUTURE iff `rel` is a
+    TTL-eligible ephemeral doc (nonce/ratelimit), else None. The real google.cloud.firestore
+    client serializes a datetime to a Firestore Timestamp — the type a TTL policy requires; the
+    record's own float `ts` is a plain number a TTL policy IGNORES, which is exactly why a
+    dedicated top-level `ttl_at` Timestamp is written instead of reusing `rec.ts`. Horizon is
+    HEIMDALL_FIRESTORE_TTL_HORIZON_SECONDS (default 86400s / 24h); a non-int / non-positive
+    override falls back to the default so a misconfig never disables the field."""
+    if _ttl_root(rel) not in _TTL_ELIGIBLE_ROOTS:
+        return None
+    import datetime
+    raw = os.environ.get(_TTL_HORIZON_ENV)
+    try:
+        horizon = int(raw) if raw is not None else _TTL_HORIZON_DEFAULT
+    except (TypeError, ValueError):
+        horizon = _TTL_HORIZON_DEFAULT
+    if horizon <= 0:
+        horizon = _TTL_HORIZON_DEFAULT
+    return datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=horizon)
 
 
 def _dir_prefix(rel_dir):
@@ -236,11 +293,32 @@ class FirestoreBackend(cp_state.StateBackend):
         """ATOMICALLY write ONE keyed JSON record to the rel's node doc (a single-doc
         Firestore set is atomic — no reader ever sees a torn write, the same guarantee
         LocalBackend gets from mktemp+os.replace). Returns True on a committed write,
-        False on any backend error."""
+        False on any backend error.
+
+        DATA-LIFECYCLE: a TTL-ELIGIBLE ephemeral rel (nonce/ratelimit — see _TTL_ELIGIBLE_ROOTS)
+        additionally gets a TOP-LEVEL `ttl_at` Timestamp so the collection-group TTL policy can
+        reap it; every OTHER rel is written WITHOUT it (durable-forever). ttl_at is best-effort
+        METADATA, never a durability requirement: if the backend cannot store a Timestamp (a
+        JSON test fake whose serializer rejects a datetime), the write is RETRIED without ttl_at
+        so the record still persists exactly as before — the TTL is simply absent on that
+        backend (only the real Firestore has TTL anyway)."""
+        doc = {_FIELD_KIND: _KIND_RECORD, _FIELD_REC: record}
+        ttl_at = _ttl_at_for(rel)
         try:
-            self._node(rel).set({_FIELD_KIND: _KIND_RECORD, _FIELD_REC: record})
+            if ttl_at is not None:
+                self._node(rel).set(dict(doc, **{_FIELD_TTL_AT: ttl_at}))
+            else:
+                self._node(rel).set(doc)
             return True
         except Exception:  # noqa: BLE001 — IO failure → False (the LocalBackend contract).
+            # A backend/serializer that cannot store a Timestamp must still persist the record:
+            # retry WITHOUT the best-effort ttl_at (never sacrifice durability for TTL metadata).
+            if ttl_at is not None:
+                try:
+                    self._node(rel).set(doc)
+                    return True
+                except Exception:  # noqa: BLE001 — the record write genuinely failed → False.
+                    return False
             return False
 
     def get_record(self, rel):
