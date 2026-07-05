@@ -329,6 +329,119 @@ echo "== G. maintainer OPENS PRs via the bot token; never pushes/merges =="
 [ "$(jget G1_child_has_bot_token)" = "true" ] && ok "G1 HEIMDALL_PR_BOT_TOKEN passed through to the child (the loop's PR runner uses it)" || bad "G1 bot token did not reach the child"
 if grep -qE 'never pushes main|no-push/no-merge|OPENS PRs' "$LIB/cp_handlers.py"; then ok "G2 source states the no-push/no-merge constraint (a human gates merge)"; else bad "G2 source is missing the no-push/no-merge constraint statement"; fi
 
+echo "== H. a FAILED cycle NAMES its cause: result.error_tail (scrubbed) + summary on nonzero exit =="
+# THE SILENT-FAILURE FIX: a child exiting 1 must (1) surface its stderr as a bounded,
+# token-scrubbed result.error_tail, (2) still attach a parsed stdout JSON summary even on a
+# nonzero exit, and (3) print the cause to the job's own stderr so `gcloud logging read`
+# shows it. Two shapes: H1 = exit 1 WITH JSON on stdout + a token-bearing stderr; H2 = the
+# LIVE silent shape (exit 1, EMPTY stdout, a traceback on stderr -> summary null but named).
+FAILMOCK="$WORK/mock-fail-loop"
+cat > "$FAILMOCK" <<'EOF'
+#!/usr/bin/env bash
+# a parsed summary must attach EVEN on a nonzero exit (stop=budget printed to stdout)...
+echo '{"cycles":0,"stop":"budget","tally":{"fixed":0,"flagged":0,"parked":0,"pr":0},"budget":{"cap_tokens":600000,"used":null,"over":true}}'
+# ...and the REAL cause on stderr, carrying token-ish secrets that MUST be scrubbed.
+echo "fatal: gh auth failed with token ghs_ABCDEF0123456789ABCDEF01 and key sk-ant-SECRETKEY99AABB" >&2
+echo "-----BEGIN RSA PRIVATE KEY----- MIIkey-material-here" >&2
+echo "RuntimeError: the maintainer child exploded during the fix gate" >&2
+exit 1
+EOF
+chmod +x "$FAILMOCK"
+SILENTMOCK="$WORK/mock-silent-loop"
+cat > "$SILENTMOCK" <<'EOF'
+#!/usr/bin/env bash
+# the LIVE silent-failure shape: NOTHING on stdout (no JSON), a traceback on stderr, exit 1.
+echo "Traceback (most recent call last):" >&2
+echo "  File \"maintain_loop.py\", line 831, in run" >&2
+echo "RuntimeError: could not read .planning under an ephemeral home" >&2
+exit 1
+EOF
+chmod +x "$SILENTMOCK"
+
+HOUT="$WORK/harness_h.json"
+LIB="$LIB" WORK="$WORK" FAILMOCK="$FAILMOCK" SILENTMOCK="$SILENTMOCK" \
+  "$PY" - >"$HOUT" 2>"$WORK/harness_h.err" <<'PYEOF'
+import json, os, sys
+sys.path.insert(0, os.environ["LIB"])
+import cp_allowlist as A
+import cp_handlers as H
+WORK = os.environ["WORK"]
+REPO = "randomittin/heimdall"
+
+
+def make_ctx(cid, env):
+    scratch = os.path.join(WORK, "scratch", cid)
+    os.makedirs(scratch, exist_ok=True)
+    return H.IsolatedContext(scratch, "jobtok-" + cid, base_env=env)
+
+
+out = {}
+# H1 — exit 1 WITH a JSON summary on stdout + a token-bearing stderr.
+os.environ["HEIMDALL_MAINTAIN_LOOP_BIN"] = os.environ["FAILMOCK"]
+ctx = make_ctx("h1", {"CLAUDE_CODE_OAUTH_TOKEN": "x", "PATH": os.environ.get("PATH", "")})
+r1 = H.run_maintainer_cycle(
+    A.validate("run-maintainer-cycle", {"repo": REPO, "max": 1})["params"], ctx)
+out["h1_status"] = r1.get("status")
+out["h1_exit"] = r1.get("exit_code")
+out["h1_summary_stop"] = (r1.get("summary") or {}).get("stop")
+out["h1_error_tail"] = r1.get("error_tail")
+out["h1_result_json"] = json.dumps(r1)
+
+# H2 — the LIVE silent shape: exit 1, EMPTY stdout (no JSON), a traceback on stderr.
+os.environ["HEIMDALL_MAINTAIN_LOOP_BIN"] = os.environ["SILENTMOCK"]
+ctx = make_ctx("h2", {"CLAUDE_CODE_OAUTH_TOKEN": "x", "PATH": os.environ.get("PATH", "")})
+r2 = H.run_maintainer_cycle(
+    A.validate("run-maintainer-cycle", {"repo": REPO, "max": 1})["params"], ctx)
+out["h2_status"] = r2.get("status")
+out["h2_summary"] = r2.get("summary")
+out["h2_error_tail"] = r2.get("error_tail")
+
+print(json.dumps(out, indent=2, sort_keys=True))
+PYEOF
+
+hget() { "$PY" -c 'import json,sys; d=json.load(open(sys.argv[1])); v=d.get(sys.argv[2]); print(json.dumps(v) if not isinstance(v,str) else v)' "$HOUT" "$1"; }
+
+if [ ! -s "$HOUT" ]; then echo "FATAL: H harness produced no output" >&2; cat "$WORK/harness_h.err" >&2; exit 2; fi
+
+# H1 — status/exit reflect the child failure; the summary STILL attaches on nonzero exit.
+{ [ "$(hget h1_status)" = "failed" ] && [ "$(hget h1_exit)" = "1" ]; } \
+  && ok "H1 nonzero child -> status=failed, exit_code=1" \
+  || bad "H1 status/exit wrong (status=$(hget h1_status) exit=$(hget h1_exit))"
+[ "$(hget h1_summary_stop)" = "budget" ] \
+  && ok "H1 parsed stdout JSON summary ATTACHED even on nonzero exit (stop=budget)" \
+  || bad "H1 summary NOT attached on nonzero exit (summary_stop=$(hget h1_summary_stop))"
+# H1 — error_tail NAMES the cause...
+H1TAIL="$(hget h1_error_tail)"
+if printf '%s' "$H1TAIL" | grep -q 'RuntimeError: the maintainer child exploded'; then
+  ok "H1 error_tail NAMES the cause: '$H1TAIL'"
+else
+  bad "H1 error_tail did not name the cause: '$H1TAIL'"
+fi
+# H1 — ...and token-ish secrets are SCRUBBED from error_tail AND the whole result (falsifier).
+H1JSON="$(hget h1_result_json)"
+if printf '%s' "$H1JSON" | grep -qE 'ghs_ABCDEF|sk-ant-SECRETKEY|BEGIN RSA PRIVATE KEY|MIIkey-material'; then
+  bad "H1 FALSIFIER: a token-ish secret LEAKED into the result: $H1JSON"
+else
+  ok "H1 FALSIFIER: ghs_/sk-ant-/PEM secrets SCRUBBED from error_tail + the whole result"
+fi
+# H1 — the cause is ALSO printed to the handler's own stderr (so gcloud logging shows it).
+if grep -q 'RuntimeError: the maintainer child exploded' "$WORK/harness_h.err"; then
+  ok "H1 the cause is printed to the job's stderr (visible to gcloud logging read)"
+else
+  bad "H1 the cause was NOT printed to stderr (silent in the logs)"
+fi
+
+# H2 — the LIVE silent shape: empty stdout -> summary null, but the traceback is NAMED.
+[ "$(hget h2_summary)" = "null" ] \
+  && ok "H2 empty stdout -> summary:null (the parse honestly finds no JSON)" \
+  || bad "H2 summary was not null (summary=$(hget h2_summary))"
+H2TAIL="$(hget h2_error_tail)"
+if printf '%s' "$H2TAIL" | grep -q 'RuntimeError: could not read .planning'; then
+  ok "H2 the silent traceback is now NAMED in error_tail: '$H2TAIL'"
+else
+  bad "H2 silent failure still swallowed (error_tail='$H2TAIL')"
+fi
+
 echo
 echo "cp-maintainer: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1

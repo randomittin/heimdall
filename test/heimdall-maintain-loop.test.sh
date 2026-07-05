@@ -354,6 +354,79 @@ else
   bad "env override did NOT authorize a run (stop=$(jget "$OUT" '.stop') cycles=$(jget "$OUT" '.cycles'))"
 fi
 
+echo "── (11) FRESH-HOME BUDGET — an empty meter at START is used=0, NOT fail-closed ─"
+# DEPLOYED-SHAPE: the ephemeral Cloud Run Job container starts with a FRESH HEIMDALL_HOME
+# (/app/state, always empty), so heimdall-tokens truthfully reports ZERO accumulated usage
+# — a well-formed record with total_tokens==0 + a benign "no session dir" marker. The OLD
+# fail-closed rule wrongly treated that as an unreadable meter and STOPPED(budget) at cycle 0,
+# so the cloud maintainer could NEVER execute a cycle. Now: budget NOT over at start, a real
+# cycle runs (mirrors the deployed --max 1 job). The falsifier below proves fail-closed is
+# still enforced once usage has been recorded.
+mk_fresh_meter() {
+  # emits the exact fresh/no-data record heimdall-tokens returns for an empty home.
+  local dest="$1"
+  cat > "$dest" <<'METER'
+#!/usr/bin/env bash
+echo '{"total_tokens": 0, "turns": 0, "total_cost_usd": null, "error": "no session dir for cwd slug under ~/.claude/projects"}'
+METER
+  chmod +x "$dest"
+}
+METER_FRESH="$WORK/meter_fresh"; mk_fresh_meter "$METER_FRESH"
+R14="$(new_repo fresh_home)"; seed "$R14" 141        # NO state file -> use --explicit authz
+[ ! -f "$R14/heimdall-state.json" ] || bad "precondition: R14 unexpectedly has a state file"
+OUT="$(run_loop "$R14" "$METER_FRESH" --explicit --max 1 --evidence "true")"
+if [ "$(jget "$OUT" '.stop')" != "budget" ] && [ "$(jget "$OUT" '.cycles')" -ge 1 ]; then
+  ok "fresh-home meter -> budget NOT over at start, a cycle RAN (stop=$(jget "$OUT" '.stop') cycles=$(jget "$OUT" '.cycles'))"
+else
+  bad "fresh-home still fail-closed at cycle 0 (stop=$(jget "$OUT" '.stop') cycles=$(jget "$OUT" '.cycles'))"
+fi
+# the checkpoint's budget block must carry the fresh reading (used=0, meter=fresh, not over).
+FRESH_BUDGET="$("$PY" -c 'import sys,os;sys.path.insert(0,os.path.join(sys.argv[1],"..","..","bin","lib"));import maintain_loop as m;import json;print(json.dumps(m.budget_state(sys.argv[1],600000,usage_recorded=False)))' "$R14" 2>/dev/null || true)"
+if printf '%s' "$FRESH_BUDGET" | jq -e '.over==false and .used==0 and .meter=="fresh"' >/dev/null 2>&1; then
+  ok "budget_state(fresh, usage_recorded=False) -> over:false used:0 meter:fresh (deployed-shape truth)"
+else
+  bad "fresh budget snapshot wrong: $FRESH_BUDGET"
+fi
+
+echo "── (12) FALSIFIER — a meter that goes UNREADABLE after usage still fail-closes ─"
+# The fix must NOT disable fail-closed entirely. Once ANY usage is recorded this run, a
+# meter that becomes UNREADABLE fail-closes (STOP budget) rather than running blind — the
+# honesty rule for a genuinely broken meter is preserved.
+# A stateful meter: 1st read = a real under-cap usage (records usage), 2nd+ = a DEGRADED
+# record with no numeric total (unreadable). The loop must run exactly ONE cycle then STOP.
+mk_stateful_meter() {
+  local dest="$1" counter="$2"
+  cat > "$dest" <<METER
+#!/usr/bin/env bash
+n=\$(cat "$counter" 2>/dev/null || echo 0)
+echo \$((n+1)) > "$counter"
+if [ "\$n" = "0" ]; then
+  echo '{"total_tokens": 100, "total_cost_usd": 0.0}'
+else
+  echo '{"error": "meter backend unavailable", "total_cost_usd": null}'
+fi
+METER
+  chmod +x "$dest"
+}
+CNT="$WORK/meter_state_counter"
+METER_STATE="$WORK/meter_stateful"; mk_stateful_meter "$METER_STATE" "$CNT"
+R15="$(new_repo fresh_falsify)"; seed "$R15" 151; seed "$R15" 152; seed "$R15" 153
+OUT="$(run_loop "$R15" "$METER_STATE" --explicit --evidence "true" --max-failures 9)"
+if [ "$(jget "$OUT" '.stop')" = "budget" ] && [ "$(jget "$OUT" '.cycles')" = "1" ]; then
+  ok "FALSIFIER: meter unreadable AFTER usage recorded -> STOP(budget) after 1 cycle (never blind)"
+else
+  bad "fail-closed-after-usage broke (stop=$(jget "$OUT" '.stop') cycles=$(jget "$OUT" '.cycles'))"
+fi
+# and the direct guard: an unreadable meter WITH usage recorded is over; a MISSING binary is
+# unreadable at start too (so the old fail-safe test (2) still holds — never blind on a truly
+# broken meter, only on a truthful fresh zero do we run).
+FALSE_BUDGET="$("$PY" -c 'import sys,os;sys.path.insert(0,os.path.join(sys.argv[1],"..","..","bin","lib"));import maintain_loop as m;import json;print(json.dumps(m.budget_state(sys.argv[1],600000,usage_recorded=True)))' "$R14" 2>/dev/null || true)"
+if printf '%s' "$FALSE_BUDGET" | jq -e '.over==true and .meter=="unavailable"' >/dev/null 2>&1; then
+  ok "budget_state(empty, usage_recorded=True) -> over:true meter:unavailable (fail-closed after usage)"
+else
+  bad "fail-closed-after-usage snapshot wrong: $FALSE_BUDGET"
+fi
+
 echo
 echo "════════════════════════════════════════════════════════════════════════════"
 printf "maintain-loop: \033[32m%d passed\033[0m, " "$PASS"
@@ -362,4 +435,4 @@ if [ "$FAIL" -gt 0 ]; then
   exit 1
 fi
 printf "%d failed\n" "$FAIL"
-echo "ALL GREEN — budget-cap can't-burn-tokens · stop-guards · checkpoint · heartbeat · resume · disabled · approval-park · explicit-rr-authz · env-override"
+echo "ALL GREEN — budget-cap can't-burn-tokens · stop-guards · checkpoint · heartbeat · resume · disabled · approval-park · explicit-rr-authz · env-override · fresh-home-budget · fail-closed-after-usage"
