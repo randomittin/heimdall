@@ -444,6 +444,340 @@ jj(){ printf '%s' "$J_OUT" | "$PY" -c "import json,sys;print(json.load(sys.stdin
 [ "$(jj done_not_reopened)" = "True" ] \
   && ok "I5 a successfully-dispatched (done) task is NOT re-opened by a duplicate enqueue (idempotency preserved)" || bad "I5 a done task was wrongly re-opened (J_OUT=$J_OUT)"
 
+# ──────────────────────────────────────────────────────────────────────────────
+# K. CROSS-INSTANCE ATOMIC CLAIM (the double-dispatch fix, audit §3b). The queued->
+#    in_flight claim is a compare-and-swap on the partition record's `rev` via the
+#    StateBackend's put_record_if. Under max-instances>1 the local flock gives NO cross-
+#    instance mutual exclusion, so two instances could pick() the SAME task. The CAS makes
+#    the LOSER of a claim race see the winner's committed rev and re-read (claim the next /
+#    nothing) instead of double-claiming.
+#    FALSIFIER: without the rev check, a STALE-rev write would succeed and BOTH instances
+#    would win the same task (double-dispatch / a lost task).
+# ──────────────────────────────────────────────────────────────────────────────
+echo
+echo "K. cross-instance atomic claim (compare-and-swap on rev, LocalBackend)"
+K_OUT="$("$PY" - <<'PYEOF' 2>"$WORK/k.err"
+import json, os, sys
+sys.path.insert(0, os.environ["LIB"])
+import cp_team_queue as Q
+import cp_state
+
+b = cp_state.get_backend()
+
+# --- K1: the RAW backend CAS — put_record_if honors expected_rev. ---
+rel1 = Q._queue_rel("cccccccccccccccccccccccccccccccc")
+first   = b.put_record_if(rel1, {"rev": 1, "mark": "first"},   0)  # absent==0 -> commit
+stale   = b.put_record_if(rel1, {"rev": 2, "mark": "stale"},   0)  # stored rev now 1 -> REFUSE
+correct = b.put_record_if(rel1, {"rev": 2, "mark": "correct"}, 1)  # matches -> commit
+after1  = b.get_record(rel1)
+
+# --- K2: two "instances" both read the SAME rev and both try to claim the SAME task.
+#         Exactly ONE CAS commits; the loser re-reads and claims the OTHER task. ---
+T2 = "22220000222200002222000022220000"
+Q.enqueue(T2, "race task one")
+Q.enqueue(T2, "race task two")
+rel2 = Q._queue_rel(T2)
+sA = b.get_record(rel2); revA = cp_state._rev_of(sA)
+sB = b.get_record(rel2); revB = cp_state._rev_of(sB)          # STALE read at the same rev
+victim = sorted(sA["queued"].keys())[0]
+# instance A claims `victim`.
+itemA = sA["queued"].pop(victim); sA["in_flight"][victim] = {"since": "A", "item": itemA}
+sA["rev"] = revA + 1
+okA = b.put_record_if(rel2, sA, revA)                         # True (rev matched)
+# instance B tries the SAME claim at the now-STALE revB -> MUST be refused (no double-claim).
+itemB = sB["queued"].pop(victim); sB["in_flight"][victim] = {"since": "B", "item": itemB}
+sB["rev"] = revB + 1
+okB = b.put_record_if(rel2, sB, revB)                         # False (A advanced the rev)
+# B, having lost, RE-READS and claims the OTHER task.
+sB2 = b.get_record(rel2); revB2 = cp_state._rev_of(sB2)
+other = sorted(sB2["queued"].keys())[0] if sB2["queued"] else None
+recovered = False
+if other is not None:
+    itemO = sB2["queued"].pop(other); sB2["in_flight"][other] = {"since": "B", "item": itemO}
+    sB2["rev"] = revB2 + 1
+    recovered = b.put_record_if(rel2, sB2, revB2)
+final2 = b.get_record(rel2)
+inflight2 = sorted(final2["in_flight"].keys())
+
+# --- K3: Q.pick RECOVERS from an injected conflict — the loser re-reads and claims the
+#         next task (the whole point: no double-claim, no lost task). A one-shot wrapper
+#         forces the first put_record_if to lose to a competing instance. ---
+T3 = "33330000333300003333000033330000"
+Q.enqueue(T3, "pick task alpha")
+Q.enqueue(T3, "pick task beta")
+
+class ConflictOnce:
+    """Wraps a real backend; the FIRST put_record_if loses a race: before returning False it
+    commits a COMPETING claim (as if another instance won), so the caller's _cas MUST re-read
+    and claim a different task."""
+    def __init__(self, inner):
+        self._inner = inner
+        self._fired = False
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+    def put_record_if(self, rel, record, expected_rev):
+        if not self._fired:
+            self._fired = True
+            cur = self._inner.get_record(rel); rev = cp_state._rev_of(cur)
+            keys = sorted(cur.get("queued", {}).keys())
+            if keys:
+                v = keys[0]; it = cur["queued"].pop(v)
+                cur["in_flight"][v] = {"since": "competitor", "item": it}; cur["rev"] = rev + 1
+                self._inner.put_record(rel, cur)   # competing commit advances the rev
+            return False                            # our write loses the race
+        return self._inner.put_record_if(rel, record, expected_rev)
+
+wrapped = ConflictOnce(cp_state.get_backend())
+orig = Q._backend
+Q._backend = lambda home=None: wrapped
+try:
+    picked3 = Q.pick(T3)          # first CAS conflicts -> _cas re-reads -> claims the OTHER task
+finally:
+    Q._backend = orig
+final3 = cp_state.get_backend().get_record(Q._queue_rel(T3))
+inflight3 = sorted(final3["in_flight"].keys())
+
+print(json.dumps({
+    "k1_first_commit": first is True,
+    "k1_stale_refused": stale is False,
+    "k1_correct_commit": correct is True,
+    "k1_correct_won": (after1 or {}).get("mark") == "correct",
+    "k2_A_won": okA is True,
+    "k2_B_refused_stale": okB is False,
+    "k2_B_recovered": recovered is True,
+    "k2_two_distinct_claims": (len(inflight2) == 2 and not final2["queued"]),
+    "k3_pick_recovered": picked3 is not None,
+    "k3_two_distinct_claims": (len(inflight3) == 2 and not final3["queued"]),
+}))
+PYEOF
+)"
+if [ -s "$WORK/k.err" ]; then cat "$WORK/k.err" >&2; fi
+jk(){ printf '%s' "$K_OUT" | "$PY" -c "import json,sys;print(json.load(sys.stdin).get('$1'))" 2>/dev/null; }
+[ "$(jk k1_first_commit)" = "True" ] && [ "$(jk k1_stale_refused)" = "True" ] \
+  && [ "$(jk k1_correct_commit)" = "True" ] && [ "$(jk k1_correct_won)" = "True" ] \
+  && ok "K1 put_record_if is a real CAS — a STALE-rev write is REFUSED, the matching-rev write commits (the falsifier: without the rev check the stale write would win)" || bad "K1 CAS did not enforce rev (K_OUT=$K_OUT)"
+[ "$(jk k2_A_won)" = "True" ] && [ "$(jk k2_B_refused_stale)" = "True" ] \
+  && [ "$(jk k2_B_recovered)" = "True" ] && [ "$(jk k2_two_distinct_claims)" = "True" ] \
+  && ok "K2 two instances claiming the SAME task at the SAME rev -> exactly ONE wins; the loser re-reads and claims the next (2 distinct claims, no double-claim)" || bad "K2 double-claim NOT prevented (K_OUT=$K_OUT)"
+[ "$(jk k3_pick_recovered)" = "True" ] && [ "$(jk k3_two_distinct_claims)" = "True" ] \
+  && ok "K3 Q.pick RECOVERS from a claim-race conflict — it re-reads and claims the next task (loser never returns the same item; 2 distinct claims)" || bad "K3 pick did not recover from a conflict (K_OUT=$K_OUT)"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# L. THE rev SURVIVES THE FIRESTORE ENCODE PATH — the CAS must work on the REAL deployed
+#    backend, not just local. A faithful in-process fake google.cloud.firestore (the same
+#    shape cp-flow-firestore uses, with transaction()/transactional support) backs the
+#    FirestoreBackend; the CAS uses a Firestore TRANSACTION there. Proves: (1) put_record_if
+#    honors rev on the firestore encode path, (2) the full enqueue->pick->retry->complete
+#    round-trip works under firestore (rev round-trips through _FIELD_REC).
+# ──────────────────────────────────────────────────────────────────────────────
+echo
+echo "L. rev survives the firestore-fake backend (CAS on the real encode path)"
+FAKEPKG="$WORK/fakepy"
+mkdir -p "$FAKEPKG"
+cat >"$FAKEPKG/_fake_firestore_impl.py" <<'PYEOF'
+# Faithful in-process FAKE of the slice of google.cloud.firestore the FirestoreBackend uses
+# (incl. transaction()/transactional for the CAS). Persists to HEIMDALL_FAKE_FS_STORE.
+import json
+import os
+
+_STORE_ENV = "HEIMDALL_FAKE_FS_STORE"
+
+
+def _store_path():
+    p = os.environ.get(_STORE_ENV)
+    if not p:
+        raise RuntimeError("fake firestore needs %s set" % _STORE_ENV)
+    return p
+
+
+def _load():
+    try:
+        with open(_store_path(), "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
+def _save(data):
+    tmp = _store_path() + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(data, fh)
+    os.replace(tmp, _store_path())
+
+
+class Client:
+    def __init__(self, project=None, database=None):
+        self.project = project
+
+    def collection(self, name):
+        return CollectionRef(name)
+
+    def transaction(self):
+        return _Transaction()
+
+
+class CollectionRef:
+    def __init__(self, path):
+        self._path = path
+
+    def document(self, doc_id):
+        return DocRef(self._path, doc_id)
+
+    def order_by(self, field):
+        return _Query(self._path, order_field=field)
+
+    def stream(self):
+        return _Query(self._path).stream()
+
+
+class _Query:
+    def __init__(self, coll_path, order_field=None):
+        self._coll_path = coll_path
+        self._order_field = order_field
+
+    def order_by(self, field):
+        return _Query(self._coll_path, order_field=field)
+
+    def stream(self):
+        data = _load()
+        coll = data.get("collections", {}).get(self._coll_path, {})
+        items = [_Snapshot(self._coll_path, k, v.get("fields")) for k, v in coll.items()]
+        if self._order_field:
+            items.sort(key=lambda s: (s.to_dict() or {}).get(self._order_field))
+        else:
+            items.sort(key=lambda s: s.id)
+        return iter(items)
+
+
+class DocRef:
+    def __init__(self, coll_path, doc_id):
+        self._coll_path = coll_path
+        self._doc_id = doc_id
+
+    @property
+    def id(self):
+        return self._doc_id
+
+    def collection(self, name):
+        return CollectionRef("%s/%s/%s" % (self._coll_path, self._doc_id, name))
+
+    def get(self, transaction=None):
+        data = _load()
+        doc = data.get("collections", {}).get(self._coll_path, {}).get(self._doc_id)
+        return _Snapshot(self._coll_path, self._doc_id, doc.get("fields") if doc else None)
+
+    def set(self, fields, merge=False):
+        data = _load()
+        coll = data.setdefault("collections", {}).setdefault(self._coll_path, {})
+        doc = coll.setdefault(self._doc_id, {"fields": {}})
+        if merge:
+            cur = dict(doc.get("fields") or {}); cur.update(fields); doc["fields"] = cur
+        else:
+            doc["fields"] = dict(fields)
+        _save(data)
+
+
+class _Snapshot:
+    def __init__(self, coll_path, doc_id, fields):
+        self._coll_path = coll_path
+        self._doc_id = doc_id
+        self._fields = fields
+
+    @property
+    def id(self):
+        return self._doc_id
+
+    @property
+    def exists(self):
+        return self._fields is not None
+
+    def to_dict(self):
+        return dict(self._fields) if self._fields is not None else None
+
+
+class _Transaction:
+    def set(self, ref, fields, merge=False):
+        ref.set(fields, merge=merge)
+
+    def get(self, ref):
+        return ref.get()
+
+
+def transactional(func):
+    def _wrapped(transaction, *args, **kwargs):
+        return func(transaction, *args, **kwargs)
+    return _wrapped
+PYEOF
+cat >"$FAKEPKG/sitecustomize.py" <<'PYEOF'
+import importlib
+import sys
+import _fake_firestore_impl as _impl
+for _name in ("google", "google.cloud"):
+    if _name not in sys.modules:
+        try:
+            importlib.import_module(_name)
+        except Exception:  # noqa: BLE001
+            import types
+            _pkg = types.ModuleType(_name); _pkg.__path__ = []; sys.modules[_name] = _pkg
+sys.modules["google.cloud.firestore"] = _impl
+setattr(sys.modules["google.cloud"], "firestore", _impl)
+PYEOF
+: >"$WORK/fake_fs.json"
+L_OUT="$(HEIMDALL_STATE_BACKEND="firestore" \
+         HEIMDALL_FIRESTORE_ROOT="teamq_cas_gate" \
+         HEIMDALL_FIRESTORE_PROJECT="cp-team-queue-cas-test" \
+         HEIMDALL_FAKE_FS_STORE="$WORK/fake_fs.json" \
+         PYTHONPATH="$FAKEPKG${PYTHONPATH:+:$PYTHONPATH}" \
+         "$PY" - <<'PYEOF' 2>"$WORK/l.err"
+import json, os, sys
+sys.path.insert(0, os.environ["LIB"])
+import cp_team_queue as Q
+import cp_state
+
+b = cp_state.get_backend()
+assert type(b).__name__ == "FirestoreBackend", "expected FirestoreBackend, got %r" % type(b)
+
+# --- L1: put_record_if honors rev on the FIRESTORE encode path (a Firestore transaction). ---
+rel = Q._queue_rel("ffff1111ffff1111ffff1111ffff1111")
+c_first   = b.put_record_if(rel, {"rev": 1, "mark": "first"},   0)  # absent==0 -> commit
+c_stale   = b.put_record_if(rel, {"rev": 2, "mark": "stale"},   0)  # rev now 1 -> REFUSE
+c_correct = b.put_record_if(rel, {"rev": 2, "mark": "correct"}, 1)  # matches -> commit
+enc_after = b.get_record(rel)
+
+# --- L2: the full CAS-driven round-trip works under firestore (rev round-trips). ---
+T = "ffff2222ffff2222ffff2222ffff2222"
+e  = Q.enqueue(T, "firestore round-trip task")
+p1 = Q.pick(T)
+r1 = Q.retry(T, p1["id"], "transient", max_attempts=3)   # attempts=1 -> back to queued
+p2 = Q.pick(T)
+comp = Q.complete(T, p2["id"], "dispatched:cloud")
+after = Q.pick(T)                                        # nothing left
+stored = b.get_record(Q._queue_rel(T))
+
+print(json.dumps({
+    "is_firestore": True,
+    "l1_first_commit": c_first is True,
+    "l1_stale_refused": c_stale is False,
+    "l1_correct_commit": c_correct is True,
+    "l1_correct_won": (enc_after or {}).get("mark") == "correct",
+    "l2_enq": bool(e.get("ok") and e.get("added")),
+    "l2_retry_requeued": (r1.get("ok") is True and r1.get("state") == "queued"),
+    "l2_repicked": bool(p2 and p2["id"] == e["id"]),
+    "l2_complete": (comp.get("ok") is True),
+    "l2_drained": after is None,
+    "l2_rev_advanced": cp_state._rev_of(stored) >= 1,
+}))
+PYEOF
+)"
+if [ -s "$WORK/l.err" ]; then cat "$WORK/l.err" >&2; fi
+jl(){ printf '%s' "$L_OUT" | "$PY" -c "import json,sys;print(json.load(sys.stdin).get('$1'))" 2>/dev/null; }
+[ "$(jl l1_first_commit)" = "True" ] && [ "$(jl l1_stale_refused)" = "True" ] \
+  && [ "$(jl l1_correct_commit)" = "True" ] && [ "$(jl l1_correct_won)" = "True" ] \
+  && ok "L1 put_record_if enforces rev on the FIRESTORE encode path (a Firestore transaction) — a stale-rev write is REFUSED" || bad "L1 firestore CAS did not enforce rev (L_OUT=$L_OUT)"
+[ "$(jl l2_enq)" = "True" ] && [ "$(jl l2_retry_requeued)" = "True" ] && [ "$(jl l2_repicked)" = "True" ] \
+  && [ "$(jl l2_complete)" = "True" ] && [ "$(jl l2_drained)" = "True" ] && [ "$(jl l2_rev_advanced)" = "True" ] \
+  && ok "L2 the full enqueue->pick->retry->complete round-trip works under firestore; rev round-trips through the record (survives local+firestore backends)" || bad "L2 firestore round-trip / rev survival failed (L_OUT=$L_OUT)"
+
 echo
 echo "============================================================"
 printf "cp-team-queue: %d passed, %d failed\n" "$PASS" "$FAIL"

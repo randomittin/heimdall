@@ -333,6 +333,25 @@ class FirestoreBackend(cp_state.StateBackend):
         except Exception:  # noqa: BLE001 — absent/unreadable → None (tolerant).
             return None
 
+    def put_record_if(self, rel, record, expected_rev):
+        """ATOMIC compare-and-swap keyed write (the cross-instance atomic-claim seam):
+        inside a Firestore TRANSACTION, read the node doc's current record rev and write
+        `record` ONLY IF it equals `expected_rev` (an absent doc is version 0). Firestore
+        serialises the transaction against every concurrent writer, so of two Cloud Run
+        instances both reading rev R and racing to claim a task, EXACTLY ONE commits — the
+        other's transaction sees the advanced rev and returns False, so it re-reads and
+        picks the next task instead of double-claiming. Returns True on the committed
+        write, False on a rev-conflict or any backend error. This reuses the SAME db-level
+        transaction the ndjson append (`_append_in_transaction`) already relies on."""
+        try:
+            db = self._db()
+            node = self._node(rel)
+            transaction = db.transaction()
+            return bool(_put_record_if_in_transaction(
+                transaction, node, record, expected_rev))
+        except Exception:  # noqa: BLE001 — conflict/IO failure → False (the CAS contract).
+            return False
+
     # ── enumeration / presence (list_names / exists) ──────────────────────────────
 
     def list_names(self, rel_dir, *, suffix=""):
@@ -422,6 +441,29 @@ class FirestoreBackend(cp_state.StateBackend):
             "external store, not an on-disk tree. path() is a LocalBackend-only "
             "operation (the StateBackend contract permits refusing it here)." % rel
         )
+
+
+def _put_record_if_in_transaction(transaction, node, record, expected_rev):
+    """Atomically: read the node doc's current record rev and, ONLY IF it equals
+    `expected_rev` (absent doc == rev 0), overwrite the doc with `record` as the kind=record
+    payload; return True. On a rev mismatch, write nothing and return False. Decorated as a
+    Firestore transaction so two instances racing on the same partition serialise — the CAS
+    that closes cross-instance double-dispatch. Module-level (not a method) so the
+    @firestore.transactional decorator wraps a plain function as the library requires."""
+    from google.cloud import firestore  # lazy — same dep boundary as _build_client.
+
+    @firestore.transactional
+    def _txn(txn):
+        snap = node.get(transaction=txn)
+        cur_rev = 0
+        if snap.exists:
+            cur_rev = cp_state._rev_of((snap.to_dict() or {}).get(_FIELD_REC))
+        if cur_rev != expected_rev:
+            return False
+        txn.set(node, {_FIELD_KIND: _KIND_RECORD, _FIELD_REC: record})
+        return True
+
+    return _txn(transaction)
 
 
 def _append_in_transaction(transaction, node, lines, record):

@@ -52,6 +52,7 @@
 
 from __future__ import annotations
 
+import datetime
 import os
 import sys
 import threading
@@ -105,6 +106,160 @@ _PAUSE_POLL_SECONDS = 0.05
 # worker forever. On timeout the worker returns control (the job stays paused on disk,
 # resumable later by re-running the worker) rather than blocking indefinitely.
 _PAUSE_MAX_SECONDS = 30.0
+
+
+# ── running-orphan reclaim tuning (audit §3a — a dead-container job is reclaimed) ──
+#
+# A job left `running` when its job-container dies (Cloud Run Job execution killed, the
+# in-process daemon starved) is NEVER advanced again on its own — no worker holds it. Left
+# alone it sits `running` forever, invisible. resume_orphans reclaims it on a LEASE: a job
+# whose running stint began more than _RUNNING_LEASE_SECONDS ago is presumed dead.
+#
+# The lease default is 2× the ~1h max task time = 2h — long enough that a legitimately long
+# job (which also streams progress ticks) is never falsely reclaimed, short enough that a dead
+# container is picked up on the next resume pass. Overridable via env for ops + tests.
+_RUNNING_LEASE_ENV = "HEIMDALL_JOB_RUNNING_LEASE_SECONDS"
+_RUNNING_LEASE_DEFAULT = 7200  # 2h = 2 × the 1h per-task ceiling.
+
+# Bounded re-drive: an orphaned running job is RE-DRIVEN once (this instance takes over and
+# runs its handler to completion); if it is STILL a running orphan on a later pass (the re-
+# drive faulted / re-orphaned), it is FAILED TERMINAL (running -> cancelled with a note)
+# rather than re-driven forever — the never-loop-a-deterministically-failing-job discipline.
+_RECLAIM_MAX = 1
+# The durable marker (a job-log detail) counted to bound re-drives across passes/instances.
+_RECLAIM_MARKER = "running_orphan_reclaim"
+# The note stamped when the bound is exhausted and the orphan is failed terminal.
+_RECLAIM_FAILED_DETAIL = "running_orphan_lease_failed"
+
+
+# ── QUEUED-orphan grace window (BUG #15 — the double-run guard) ────────────────────
+#
+# THE LIVE INCIDENT (2026-07-05 20:24, forensically proven). resume_orphans re-drove a
+# QUEUED job via run_job IN-PROCESS regardless of HEIMDALL_JOB_RUNNER. On the gated service
+# (a REMOTE runner) that meant: the dispatcher created a real Cloud Run Job execution for a
+# freshly-queued job, and ~18s later a resume pass on the (OLDER-image) gated SERVICE stole
+# that same still-queued job and ran it IN-PROCESS with STALE code (the 876-line traceback),
+# while the correct new-image Cloud Run Job execution arrived to find the job already done —
+# a DOUBLE-RUN off ONE dispatch.
+#
+# THE GRACE HALF OF THE FIX: a queued job younger than this window is presumed to have a
+# dispatch still in flight (its Cloud Run Job container is booting), so the REMOTE resume path
+# SKIPS it rather than re-dispatching — re-dispatching a booting job re-creates the very race.
+# The default 5min comfortably exceeds Cloud Run Job cold-start; overridable for ops + tests.
+_QUEUED_GRACE_ENV = "HEIMDALL_JOB_QUEUED_GRACE_SECONDS"
+_QUEUED_GRACE_DEFAULT = 300  # 5 min — longer than a Cloud Run Job cold start.
+
+
+def _stderr(msg):
+    """One LOUD diagnostic line to stderr (Cloud Run captures it into the service logs).
+    Best-effort: a logging failure is swallowed so it can NEVER break the caller. Mirrors
+    cp_boot._stderr — the loud-log discipline (no silent skip / no silent swallow)."""
+    try:
+        sys.stderr.write("%s\n" % msg)
+        sys.stderr.flush()
+    except Exception:  # noqa: BLE001 — diagnostic only; a write error must not break a resume.
+        return
+
+
+def _running_lease_seconds():
+    """The running-orphan lease in seconds (HEIMDALL_JOB_RUNNING_LEASE_SECONDS, else the 2h
+    default). A malformed / non-positive env value falls back to the default (never crashes
+    a resume pass)."""
+    raw = os.environ.get(_RUNNING_LEASE_ENV)
+    try:
+        val = int(raw) if raw else 0
+    except (TypeError, ValueError):
+        val = 0
+    return val if val > 0 else _RUNNING_LEASE_DEFAULT
+
+
+def _parse_iso(ts):
+    """Parse an ISO-8601 timestamp string to an aware UTC datetime, or None if unparseable.
+    A naive ts (no tzinfo) is treated as UTC (the store writes second-precision UTC)."""
+    try:
+        dt = datetime.datetime.fromisoformat(ts)
+    except (ValueError, TypeError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return dt
+
+
+def _running_since(job_id, home):
+    """The ISO ts of the LATEST state=running event in a job's log (when the current running
+    stint began) — the lease anchor. None if the job never entered running. Read via the
+    jobstore's tolerant line scan (no store edit — the raw event rows carry the per-event ts)."""
+    since = None
+    for rec in jobstore._read_lines(job_id, home):
+        if rec.get("ev") == jobstore.EV_STATE and rec.get("state") == jobstore.STATE_RUNNING:
+            since = rec.get("ts", since)
+    return since
+
+
+def _reclaim_count(job_id, home):
+    """How many reclaim attempts a job's log already records (the durable _RECLAIM_MARKER
+    lines) — the bound that stops an orphan being re-driven forever across passes/instances."""
+    n = 0
+    for rec in jobstore._read_lines(job_id, home):
+        if rec.get("detail") == _RECLAIM_MARKER:
+            n += 1
+    return n
+
+
+def _mark_reclaim(job_id, home):
+    """Durably record ONE reclaim attempt (a progress line carrying the _RECLAIM_MARKER
+    detail) BEFORE re-driving, so the bound survives a crash mid-reclaim and is shared
+    across instances (the count is folded from the log, not held in memory)."""
+    jobstore.append_event(job_id, ev=jobstore.EV_PROGRESS, progress="reclaim",
+                          detail=_RECLAIM_MARKER, home=home)
+
+
+def _state_since(job_id, state, home):
+    """The ISO ts of the LATEST EV_STATE event for `state` in a job's log (when the job most
+    recently ENTERED that state), or None. Generalizes _running_since so the QUEUED-orphan grace
+    can anchor on when the job was queued (i.e. when its dispatch was handed off)."""
+    since = None
+    for rec in jobstore._read_lines(job_id, home):
+        if rec.get("ev") == jobstore.EV_STATE and rec.get("state") == state:
+            since = rec.get("ts", since)
+    return since
+
+
+def _queued_grace_seconds():
+    """The QUEUED-orphan grace window in seconds (HEIMDALL_JOB_QUEUED_GRACE_SECONDS, else the
+    5min default). A malformed / non-positive value falls back to the default — never crashes a
+    resume pass (mirrors _running_lease_seconds)."""
+    raw = os.environ.get(_QUEUED_GRACE_ENV)
+    try:
+        val = int(raw) if raw else 0
+    except (TypeError, ValueError):
+        val = 0
+    return val if val > 0 else _QUEUED_GRACE_DEFAULT
+
+
+def _is_remote_runner(job_runner):
+    """True if the configured job runner executes jobs OUT OF PROCESS on a separate medium that a
+    fresh dispatch re-drives (cloudrun-job). BUG #15: for such a runner a queued orphan must be
+    RE-DISPATCHED via the runner — NEVER run_job in-process here, or the (possibly stale-image)
+    resume host runs the SAME job the real Cloud Run Job execution is running (the proven double-
+    run). thread/subprocess run in THIS process, so their resume stays in-process (unchanged)."""
+    import cp_jobrunner
+    return getattr(job_runner, "name", None) == cp_jobrunner.RUNNER_CLOUDRUN
+
+
+def _resolve_job_runner(home):
+    """The JobRunner the deployment's HEIMDALL_JOB_RUNNER selects (cp_jobrunner.get_job_runner) —
+    resolved ONCE per resume pass so a queued-orphan re-drive honors the SAME runner the live
+    dispatch uses (incl. the K_SERVICE AUTO -> cloudrun-job rule inside Cloud Run). Construction is
+    cheap (no GCP import until dispatch). A selection failure (an unknown runner name) falls back
+    to None -> the in-process path, logged loudly rather than crashing the pass."""
+    import cp_jobrunner
+    try:
+        return cp_jobrunner.get_job_runner(home=home)
+    except Exception as exc:  # noqa: BLE001 — never crash a resume pass on runner selection.
+        _stderr("cp_worker: resume runner-resolve failed %s -> in-process fallback"
+                % type(exc).__name__)
+        return None
 
 
 # ── the durable pause/resume/cancel flags (ANY client, via the jobstore log) ───
@@ -187,7 +342,7 @@ def _checkpoint(job_id, home):
 
 
 def run_job(job_id, *, actor_haid=None, home=None, base_env=None,
-            checkpoints=4):
+            checkpoints=4, resume_running=False):
     """Run ONE server-hosted job to completion — the heart of THE FLIGHT FIX.
 
     The job is identified by its durable cp_jobstore record (created by the /jobs start
@@ -223,18 +378,27 @@ def run_job(job_id, *, actor_haid=None, home=None, base_env=None,
     state = folded.get("state")
     if state in jobstore.TERMINAL_STATES:
         return folded  # already finished/cancelled — idempotent no-op.
-    if state == jobstore.STATE_RUNNING:
-        # a sibling worker is already on it; do not double-run.
+    if state == jobstore.STATE_RUNNING and not resume_running:
+        # a sibling worker is already on it; do not double-run. (resume_orphans passes
+        # resume_running=True to RECLAIM a job whose worker died — see §3a reclaim.)
         return folded
 
     action_type = folded.get("action_type")
     raw_params = folded.get("params") or {}
 
-    # 1. queued -> running (durable + audited). Any client may now disconnect.
-    jobstore.transition(job_id, jobstore.STATE_RUNNING, home=home)
-    cp_audit.write("job_state", actor_haid=actor_haid, job_id=job_id,
-                   action_type=action_type, outcome="ok", detail="running",
-                   home=home)
+    # 1. queued -> running (durable + audited). Any client may now disconnect. When RECLAIMING
+    #    an orphan that is ALREADY running (resume_running, its old worker gone), there is no
+    #    queued->running edge to take — this instance simply takes over the existing running
+    #    stint and drives it to done; the audit row records the takeover.
+    if state == jobstore.STATE_QUEUED:
+        jobstore.transition(job_id, jobstore.STATE_RUNNING, home=home)
+        cp_audit.write("job_state", actor_haid=actor_haid, job_id=job_id,
+                       action_type=action_type, outcome="ok", detail="running",
+                       home=home)
+    else:
+        cp_audit.write("job_state", actor_haid=actor_haid, job_id=job_id,
+                       action_type=action_type, outcome="ok",
+                       detail="running-reclaimed", home=home)
 
     # 2. THE ALLOWLIST GATE — only an allowlisted action runs. No arbitrary command.
     try:
@@ -353,28 +517,163 @@ def assert_isolated_cannot_read_control_plane(job_id, *, home=None, base_env=Non
 # ── restart replay: re-attach to jobs left mid-flight (the durability driver) ──
 
 
-def resume_orphans(*, actor_haid=None, home=None, base_env=None, checkpoints=4):
-    """After a server RESTART, re-fold every job in the store and drive any job left
-    `queued` (or interrupted before running) back to completion (§4 L94 replay-on-boot).
-    A job that was `running` when the process died is re-folded from disk; this driver
-    re-runs the queued ones so the flight fix survives a full process restart, not just
-    a client disconnect. Returns the list of (job_id, final_state) it advanced.
+def resume_orphans(*, actor_haid=None, home=None, base_env=None, checkpoints=4,
+                   runner=None, job_runner=None, grace_seconds=None, now=None):
+    """Re-drive orphaned jobs — the replay driver (§4 L94), now ALSO the running-orphan
+    reclaimer (audit §3a) and the runner-honoring queued re-drive (BUG #15). Returns the list
+    of (job_id, final_state) it advanced (the stable return the boot hook + cp-jobs restart test
+    bind to). See resume_orphans_pass for the counted variant the periodic tick logs."""
+    return resume_orphans_pass(
+        actor_haid=actor_haid, home=home, base_env=base_env,
+        checkpoints=checkpoints, runner=runner, job_runner=job_runner,
+        grace_seconds=grace_seconds, now=now)["advanced"]
 
-    A `paused`/terminal job is left as-is (a human/owner controls those). This is the
-    boot hook the server calls to make durable jobs self-healing across restarts."""
+
+def resume_orphans_pass(*, actor_haid=None, home=None, base_env=None, checkpoints=4,
+                        runner=None, job_runner=None, grace_seconds=None, now=None):
+    """ONE resume pass over the whole job store, returning
+    {"advanced": [(job_id, final_state), ...], "requeued": int, "reclaimed": int}.
+
+    Two orphan classes are re-driven — every decision LOGGED loudly (no silent skip, audit
+    §5). The pass is idempotent, so the periodic tick (cp_boot) can run it on a cadence, not
+    only at boot (audit §3a fix (a)):
+
+      QUEUED orphan (a dispatch that never durably started work — the cloudrun-job kick
+        failed, or a boot after enqueue): RE-DRIVEN honoring the configured runner (BUG #15).
+        When the runner is REMOTE (cloudrun-job) the orphan is RE-DISPATCHED via that runner —
+        never run_job in-process (a stale-image resume host must not run the SAME job the real
+        Cloud Run Job execution runs), and a queued job younger than `grace` is SKIPPED (its
+        dispatch is still booting). For an IN-PROCESS runner (thread/subprocess) it is re-driven
+        in-process via `runner` (default run_job), unchanged. Counts toward `requeued`.
+
+      RUNNING orphan (a job-container died mid-run — audit §3a fix (b)): a job whose running
+        stint began more than the lease (_running_lease_seconds) ago is presumed dead. It is
+        RECLAIMED with a bound (_RECLAIM_MAX): the first time this instance takes over and
+        re-drives it (runner with resume_running=True); if it is STILL a running orphan on a
+        later pass (the re-drive faulted / re-orphaned), it is FAILED TERMINAL (running ->
+        cancelled, detail=_RECLAIM_FAILED_DETAIL) rather than re-driven forever. Counts
+        toward `reclaimed`. A running job WITHIN its lease is left running (logged as skipped).
+
+    A `paused`/terminal job is left as-is (owner-controlled) — logged as a skip. `runner` is
+    an injectable worker entry (default run_job) for deterministic tests; `now` pins the
+    lease clock (default utcnow)."""
+    run = runner or run_job
+    when = now if now is not None else datetime.datetime.now(datetime.timezone.utc)
+    lease = _running_lease_seconds()
+    grace = grace_seconds if grace_seconds is not None else _queued_grace_seconds()
+    # BUG #15: resolve the deployment's runner ONCE; a REMOTE runner (cloudrun-job) re-DISPATCHES
+    # queued orphans instead of running them in-process. An injected job_runner wins (tests).
+    jr = job_runner if job_runner is not None else _resolve_job_runner(home)
+    remote = _is_remote_runner(jr)
     advanced = []
+    requeued = 0
+    reclaimed = 0
     for jid in jobstore.list_job_ids(home):
         folded = jobstore.fold_state(jid, home)
         if folded is None:
             continue
-        if folded.get("state") == jobstore.STATE_QUEUED:
+        state = folded.get("state")
+
+        if state == jobstore.STATE_QUEUED:
+            if remote:
+                # BUG #15 — the runner runs jobs OUT OF PROCESS (cloudrun-job): RE-DISPATCH via
+                # the runner, NEVER run_job in-process. GRACE: a queued job younger than the window
+                # has a dispatch still in flight (its Cloud Run Job container is booting); resuming
+                # it now re-creates the proven double-run, so SKIP it this pass.
+                age = None
+                since = _state_since(jid, jobstore.STATE_QUEUED, home)
+                if since is not None:
+                    dt = _parse_iso(since)
+                    if dt is not None:
+                        age = (when - dt).total_seconds()
+                if age is not None and age < grace:
+                    _stderr("cp_worker: resume queued job=%s age=%.0f grace=%d "
+                            "resumed-via=skipped-young (dispatch in flight — container booting)"
+                            % (jid, age, grace))
+                    continue
+                dispatched = jr.dispatch(jid, actor_haid=actor_haid, home=home,
+                                         base_env=base_env)
+                ok = (bool(dispatched.get("dispatched"))
+                      if isinstance(dispatched, dict) else bool(dispatched))
+                fstate = jobstore.current_state(jid, home)
+                advanced.append((jid, fstate))
+                requeued += 1
+                _stderr("cp_worker: resume queued job=%s age=%s resumed-via=%s dispatched=%s -> %s"
+                        % (jid, ("%.0f" % age) if age is not None else "unknown",
+                           getattr(jr, "name", "?"), ok, fstate))
+                continue
+            # IN-PROCESS runner modes (thread/subprocess): re-drive in THIS process — unchanged.
             try:
-                final = run_job(jid, actor_haid=actor_haid, home=home,
-                                base_env=base_env, checkpoints=checkpoints)
-                advanced.append((jid, final.get("state") if final else None))
-            except (ActionRefused, IsolationRefused, jobstore.IllegalTransition):
-                advanced.append((jid, jobstore.current_state(jid, home)))
-    return advanced
+                final = run(jid, actor_haid=actor_haid, home=home,
+                            base_env=base_env, checkpoints=checkpoints)
+                fstate = final.get("state") if final else None
+                advanced.append((jid, fstate))
+                _stderr("cp_worker: resume queued job=%s resumed-via=in-process -> %s"
+                        % (jid, fstate))
+            except (ActionRefused, IsolationRefused, jobstore.IllegalTransition) as exc:
+                fstate = jobstore.current_state(jid, home)
+                advanced.append((jid, fstate))
+                _stderr("cp_worker: resume queued job=%s resumed-via=in-process REFUSED %s -> %s"
+                        % (jid, type(exc).__name__, fstate))
+            requeued += 1
+            continue
+
+        if state == jobstore.STATE_RUNNING:
+            age = None
+            since = _running_since(jid, home)
+            if since is not None:
+                dt = _parse_iso(since)
+                if dt is not None:
+                    age = (when - dt).total_seconds()
+            if age is None or age < lease:
+                _stderr("cp_worker: resume skip running job=%s age=%s lease=%d "
+                        "(within lease — a live worker may hold it)"
+                        % (jid, ("%.0f" % age) if age is not None else "unknown", lease))
+                continue
+            rc = _reclaim_count(jid, home)
+            if rc < _RECLAIM_MAX:
+                # RE-DRIVE once: record the durable bound marker FIRST, then take over the
+                # running stint and drive it to done (resume_running=True). A fault leaves it
+                # running (audited by run_job) so the NEXT pass fails it terminal.
+                _mark_reclaim(jid, home)
+                try:
+                    final = run(jid, actor_haid=actor_haid, home=home,
+                                base_env=base_env, checkpoints=checkpoints,
+                                resume_running=True)
+                    fstate = final.get("state") if final else None
+                except (ActionRefused, IsolationRefused, jobstore.IllegalTransition) as exc:
+                    fstate = jobstore.current_state(jid, home)
+                    _stderr("cp_worker: reclaim re-drive job=%s REFUSED %s"
+                            % (jid, type(exc).__name__))
+                except Exception as exc:  # noqa: BLE001 — handler fault audited in run_job;
+                    # leave the job running so the next pass fails it terminal.
+                    fstate = jobstore.current_state(jid, home)
+                    _stderr("cp_worker: reclaim re-drive job=%s FAULT %s"
+                            % (jid, type(exc).__name__))
+                advanced.append((jid, fstate))
+                reclaimed += 1
+                _stderr("cp_worker: resume reclaim running job=%s attempt=%d age=%.0f "
+                        "lease=%d -> %s" % (jid, rc + 1, age, lease, fstate))
+            else:
+                # BOUND EXHAUSTED — fail terminal (running -> cancelled, noted + audited).
+                fstate = jobstore.STATE_CANCELLED
+                try:
+                    jobstore.transition(jid, jobstore.STATE_CANCELLED,
+                                        detail=_RECLAIM_FAILED_DETAIL, home=home)
+                except jobstore.IllegalTransition:
+                    fstate = jobstore.current_state(jid, home)
+                cp_audit.write("job_state", actor_haid=actor_haid, job_id=jid,
+                               action_type=folded.get("action_type"), outcome="error",
+                               detail=_RECLAIM_FAILED_DETAIL, home=home)
+                advanced.append((jid, fstate))
+                reclaimed += 1
+                _stderr("cp_worker: resume FAIL running job=%s reclaim_exhausted "
+                        "age=%.0f lease=%d -> %s" % (jid, age, lease, fstate))
+            continue
+
+        # paused / any other non-orphan state: owner-controlled — never silently skipped.
+        _stderr("cp_worker: resume skip job=%s state=%s (owner-controlled)" % (jid, state))
+    return {"advanced": advanced, "requeued": requeued, "reclaimed": reclaimed}
 
 
 # ── the /jobs endpoint route handlers (register via cp_server.register_route) ──
@@ -468,10 +767,19 @@ def _detach_run(runner, job_id, *, actor_haid=None, home=None, base_env=None):
     def _target():
         try:
             runner(job_id, actor_haid=actor_haid, home=home, base_env=base_env)
-        except (ActionRefused, IsolationRefused, jobstore.IllegalTransition):
-            return  # already audited + durably recorded by run_job; no socket to raise on.
-        except Exception:  # noqa: BLE001 — a handler fault is audited in run_job; the
-            return         # job state reflects it. Don't crash the daemon thread.
+        except (ActionRefused, IsolationRefused, jobstore.IllegalTransition) as exc:
+            # already audited + durably recorded by run_job; no socket to raise on. LOUD
+            # (audit obs #5): a swallowed thread exit must still say WHY — TYPE ONLY (never
+            # str(exc)/base_env, which could carry a token), the maintainer-runner discipline.
+            _stderr("cp_worker: job=%s detached-run refusal %s (audited by run_job)"
+                    % (job_id, type(exc).__name__))
+            return
+        except Exception as exc:  # noqa: BLE001 — a handler fault is audited in run_job; the
+            # job state reflects it. Don't crash the daemon thread — but say WHY (type only), so
+            # a fault that raced BEFORE run_job's own audit write is not fully invisible.
+            _stderr("cp_worker: job=%s detached-run FAULT %s (state in the durable log)"
+                    % (job_id, type(exc).__name__))
+            return
 
     t = threading.Thread(
         target=_target, name="cp-job-%s" % job_id, daemon=True)
