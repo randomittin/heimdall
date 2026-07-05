@@ -778,6 +778,147 @@ jl(){ printf '%s' "$L_OUT" | "$PY" -c "import json,sys;print(json.load(sys.stdin
   && [ "$(jl l2_complete)" = "True" ] && [ "$(jl l2_drained)" = "True" ] && [ "$(jl l2_rev_advanced)" = "True" ] \
   && ok "L2 the full enqueue->pick->retry->complete round-trip works under firestore; rev round-trips through the record (survives local+firestore backends)" || bad "L2 firestore round-trip / rev survival failed (L_OUT=$L_OUT)"
 
+# ──────────────────────────────────────────────────────────────────────────────
+# M. THE LEGACY (pre-CAS, REV-LESS) RECORD IS CLAIMABLE + a CAS EXHAUSTION IS LOUD (bug #19).
+#    LIVE INCIDENT: the drain picked NOTHING from a partition whose Firestore doc VERIFIABLY
+#    held a queued task, every cycle, with NO log — because the doc was written by the OLD
+#    (pre-CAS) code and has NO `rev` field (rev=None when read). M1: a REAL pre-CAS record
+#    shape (rec.{queued,in_flight,done,dead,team_id} with NO rev) MUST be claimed (missing-rev
+#    folds to rev 0, the CAS commits, rev is STAMPED going forward). M2/M3: a PERMANENT CAS
+#    conflict must return None CLEANLY *and* emit a LOUD stderr line — silent pick failure is
+#    exactly how bug #19 hid.
+# ──────────────────────────────────────────────────────────────────────────────
+echo
+echo "M. LEGACY (pre-CAS, rev-less) record parity + LOUD CAS-exhaustion (bug #19, LocalBackend)"
+M_OUT="$("$PY" - <<'PYEOF' 2>"$WORK/m.err"
+import json, os, sys
+sys.path.insert(0, os.environ["LIB"])
+import cp_team_queue as Q
+import cp_state
+
+b = cp_state.get_backend()
+
+# --- M1: a REAL pre-CAS record (the live doc shape, NO rev field) is CLAIMED by pick. A reader
+#         that folded missing-rev != 0 would compute expected_rev != the stored rev the CAS
+#         reads -> the compare-and-swap could NEVER commit -> pick silently claims NOTHING. ---
+TEAM = "6ca551f293a788a72825fc2de95859cc"
+rel = Q._queue_rel(TEAM)
+TID = "task:9feee8260915c39b115427b8d3df3858"
+legacy = {
+    "schema_version": "1.0.0",
+    "team_id": TEAM,
+    # NOTE: NO "rev" key — the byte-for-byte shape a pre-CAS writer left in the store.
+    "queued": {TID: {"id": TID, "team_id": TEAM, "text": "legacy queued task",
+                     "priority_signal": {"severity": None, "age_seconds": 0,
+                                         "source_priority": 0},
+                     "created_at": "2026-06-01T00:00:00+00:00", "attempts": 0}},
+    "in_flight": {}, "done": {}, "dead": {},
+}
+assert "rev" not in legacy, "fixture must have NO rev field (the pre-CAS shape)"
+b.put_record(rel, legacy)                          # write the rev-less record directly
+rev_read = (b.get_record(rel) or {}).get("rev")    # rev=None when read (the absent key)
+claimed = Q.pick(TEAM)                              # MUST claim the legacy task
+after = b.get_record(rel)
+
+# --- M2/M3: a PERMANENT CAS conflict (put_record_if ALWAYS refuses) MUST NOT be silent. pick()
+#            returns None cleanly AND emits a LOUD stderr line so an exhausted claim loop is
+#            never invisible again (the exact silence bug #19 hid behind). ---
+CT = "abcdef00abcdef00abcdef00abcdef00"
+Q.enqueue(CT, "task that can never be claimed")
+
+class AlwaysConflict:
+    """Wraps a real backend; put_record_if ALWAYS returns False (a permanent, terminal CAS
+    conflict) so _cas exhausts every attempt — the forced falsifier for the loud line."""
+    def __init__(self, inner): self._inner = inner
+    def __getattr__(self, name): return getattr(self._inner, name)
+    def put_record_if(self, rel, record, expected_rev): return False
+
+wrapped = AlwaysConflict(cp_state.get_backend())
+orig = Q._backend
+Q._backend = lambda home=None: wrapped
+try:
+    picked_conflict = Q.pick(CT)                    # exhausts the CAS -> None, but LOUD
+finally:
+    Q._backend = orig
+
+print(json.dumps({
+    "m1_rev_read_none": rev_read is None,
+    "m1_claimed": bool(claimed and claimed["id"] == TID),
+    "m1_moved_to_inflight": (TID in (after or {}).get("in_flight", {})
+                             and TID not in (after or {}).get("queued", {})),
+    "m1_rev_stamped": cp_state._rev_of(after) >= 1,
+    "m2_pick_none": picked_conflict is None,
+}))
+PYEOF
+)"
+if [ -s "$WORK/m.err" ]; then cat "$WORK/m.err" >&2; fi
+jm(){ printf '%s' "$M_OUT" | "$PY" -c "import json,sys;print(json.load(sys.stdin).get('$1'))" 2>/dev/null; }
+[ "$(jm m1_rev_read_none)" = "True" ] && [ "$(jm m1_claimed)" = "True" ] \
+  && [ "$(jm m1_moved_to_inflight)" = "True" ] && [ "$(jm m1_rev_stamped)" = "True" ] \
+  && ok "M1 a REAL pre-CAS rev-less record is CLAIMED by pick (missing-rev == rev 0; the CAS commits and STAMPS rev going forward)" || bad "M1 legacy record not claimed (M_OUT=$M_OUT)"
+[ "$(jm m2_pick_none)" = "True" ] \
+  && ok "M2 a permanent CAS conflict makes pick return None CLEANLY (the loser claims nothing)" || bad "M2 pick did not return None on permanent conflict (M_OUT=$M_OUT)"
+grep -qE "pick CAS conflict/exhausted team=[0-9a-f]{8} attempts=[0-9]+" "$WORK/m.err" \
+  && ok "M3 a permanent CAS exhaustion is LOUD — pick emits 'cp_team_queue: pick CAS conflict/exhausted team=<id8> attempts=N' (silent pick failure is exactly how bug #19 hid)" || bad "M3 no loud CAS-exhaustion line (m.err=$(cat "$WORK/m.err"))"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# N. THE LEGACY REV-LESS RECORD IS CLAIMED UNDER THE FIRESTORE TRANSACTIONAL CAS (bug #19,
+#    the DEPLOYED shape). The live break was firestore-only: the record read back with rev=None
+#    from _FIELD_REC and the transactional put_record_if must still treat it as rev 0 and commit
+#    the claim (parity with LocalBackend). Reuses the section-L in-process fake (transaction()/
+#    transactional), so the Firestore TRANSACTION path is exercised end-to-end.
+# ──────────────────────────────────────────────────────────────────────────────
+echo
+echo "N. LEGACY rev-less record CLAIMED under the FIRESTORE-fake transactional CAS (bug #19, deployed shape)"
+: >"$WORK/fake_fs_n.json"
+N_OUT="$(HEIMDALL_STATE_BACKEND="firestore" \
+         HEIMDALL_FIRESTORE_ROOT="teamq_legacy_gate" \
+         HEIMDALL_FIRESTORE_PROJECT="cp-team-queue-legacy-test" \
+         HEIMDALL_FAKE_FS_STORE="$WORK/fake_fs_n.json" \
+         PYTHONPATH="$FAKEPKG${PYTHONPATH:+:$PYTHONPATH}" \
+         "$PY" - <<'PYEOF' 2>"$WORK/n.err"
+import json, os, sys
+sys.path.insert(0, os.environ["LIB"])
+import cp_team_queue as Q
+import cp_state
+
+b = cp_state.get_backend()
+assert type(b).__name__ == "FirestoreBackend", "expected FirestoreBackend, got %r" % type(b)
+
+# The live doc that drained NOTHING: a pre-CAS rev-less record with a queued task, written
+# straight through the FirestoreBackend put_record (so it lives under _FIELD_REC with NO rev).
+TEAM = "6ca551f293a788a72825fc2de95859cc"
+rel = Q._queue_rel(TEAM)
+TID = "task:9feee8260915c39b115427b8d3df3858"
+legacy = {
+    "schema_version": "1.0.0", "team_id": TEAM,
+    "queued": {TID: {"id": TID, "team_id": TEAM, "text": "legacy queued task",
+                     "priority_signal": {"severity": None, "age_seconds": 0,
+                                         "source_priority": 0},
+                     "created_at": "2026-06-01T00:00:00+00:00", "attempts": 0}},
+    "in_flight": {}, "done": {}, "dead": {},
+}
+b.put_record(rel, legacy)                          # rev-less, on the firestore encode path
+rev_read = (b.get_record(rel) or {}).get("rev")    # None (absent key), read through _FIELD_REC
+claimed = Q.pick(TEAM)                              # MUST claim via the Firestore TRANSACTION CAS
+after = b.get_record(rel)
+
+print(json.dumps({
+    "is_firestore": True,
+    "n_rev_read_none": rev_read is None,
+    "n_claimed": bool(claimed and claimed["id"] == TID),
+    "n_moved_to_inflight": (TID in (after or {}).get("in_flight", {})
+                            and TID not in (after or {}).get("queued", {})),
+    "n_rev_stamped": cp_state._rev_of(after) >= 1,
+}))
+PYEOF
+)"
+if [ -s "$WORK/n.err" ]; then cat "$WORK/n.err" >&2; fi
+jn(){ printf '%s' "$N_OUT" | "$PY" -c "import json,sys;print(json.load(sys.stdin).get('$1'))" 2>/dev/null; }
+[ "$(jn n_rev_read_none)" = "True" ] && [ "$(jn n_claimed)" = "True" ] \
+  && [ "$(jn n_moved_to_inflight)" = "True" ] && [ "$(jn n_rev_stamped)" = "True" ] \
+  && ok "N a REAL pre-CAS rev-less record is CLAIMED under the FIRESTORE transactional CAS (missing-rev==0 on the deployed encode path; rev STAMPED going forward) — the exact live silent-drain shape" || bad "N legacy record not claimed under firestore (N_OUT=$N_OUT)"
+
 echo
 echo "============================================================"
 printf "cp-team-queue: %d passed, %d failed\n" "$PASS" "$FAIL"
