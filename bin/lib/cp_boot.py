@@ -57,6 +57,24 @@ import cp_worker
 # so a per-minute tick fires every schedule on the minute it becomes due, no finer.
 TICK_INTERVAL_SECONDS = 60.0
 
+# ── THE TICK WATCHDOG (bug #17: one blocked sub-step must never silence the clock) ──────────
+#
+# WHY (live prod hang, revision heimdall-control-plane-00050). run_tick() drains each team's
+# queue, which reads Firestore. When a backend read wedged (an unbounded collection scan with no
+# timeout — since fixed in cp_state_firestore), the tick thread BLOCKED inside run_tick FOREVER:
+# no "drain cycle" line, no "tick error" (an exception would have printed one), just SILENCE for
+# 8+ minutes while a queued task sat undrained. The loud-tick contract was defeated because a
+# BLOCK is not an exception. THE WATCHDOG closes that gap structurally: run_tick runs in a worker
+# thread the loop WAITS ON for a bounded budget. If the step overruns, the loop ABANDONS THE WAIT
+# (never the durable work — the worker keeps finishing in the background), emits a LOUD
+# "drain step timeout" line, and continues to the next wake — so ONE slow/blocked step can no
+# longer silence the loop. An OVERLAP GUARD refuses to start a second run_tick while a prior one
+# is still finishing, so schedules/drains are never double-fired.
+_TICK_STEP_TIMEOUT_ENV = "HEIMDALL_CP_TICK_STEP_TIMEOUT_SECONDS"
+# 55s < the 60s cadence: a normal wake (drain + dispatch) finishes well under this, while a truly
+# wedged step is detected within one cadence. Overridable per deploy / injectable per test.
+_TICK_STEP_TIMEOUT_DEFAULT = 55.0
+
 # PERIODIC RESUME (audit §3a fix (a)). resume_orphans runs at boot, but with min-instances=1
 # the gated instance stays warm for days, so a boot-only replay almost never re-runs — a job
 # stuck `queued` (a failed cloudrun-job dispatch) or `running` (a dead job-container) sits
@@ -216,41 +234,116 @@ def _maybe_resume(tick_count, *, home=None, base_env=None, every=_RESUME_EVERY_T
     return result
 
 
-def _tick_loop(stop_event, *, home, base_env, interval, on_tick):
-    """The tick thread body: wake every `interval` seconds and run_tick() for the
-    registered owners, plus a periodic resume pass every _RESUME_EVERY_TICKS wakes
-    (audit §3a). A tick that raises is reported to stderr and swallowed (a single bad
-    schedule must not kill the clock); the loop continues. Stops promptly when
-    `stop_event` is set — stop_event.wait(interval) returns True the instant a shutdown
-    is signalled, so the thread does not block a clean process exit for up to a minute."""
+def _step_timeout(explicit=None):
+    """The tick-step watchdog budget in seconds: an explicit positive `explicit` wins (tests),
+    else HEIMDALL_CP_TICK_STEP_TIMEOUT_SECONDS, else _TICK_STEP_TIMEOUT_DEFAULT (55s). A malformed
+    / non-positive override falls back to the default so a misconfig never DISABLES the watchdog."""
+    if isinstance(explicit, (int, float)) and explicit > 0:
+        return float(explicit)
+    raw = os.environ.get(_TICK_STEP_TIMEOUT_ENV)
+    try:
+        val = float(raw) if raw not in (None, "") else _TICK_STEP_TIMEOUT_DEFAULT
+    except (TypeError, ValueError):
+        return _TICK_STEP_TIMEOUT_DEFAULT
+    return val if val > 0 else _TICK_STEP_TIMEOUT_DEFAULT
+
+
+class _StepWorker:
+    """Runs one tick sub-step (run_tick) in a daemon thread so the loop can BOUND how long it
+    waits on it (bug #17 watchdog). A step that overruns the budget is ABANDONED by the WAITER,
+    not killed — the worker keeps finishing in the background (its durable side effects still
+    land), and the loop refuses to start a NEW run of the step until this one finishes (the
+    overlap guard, so schedules/drains are never double-fired). Captures the result AND any
+    exception so the loop can log a `tick error` exactly as the synchronous path did."""
+
+    __slots__ = ("label", "_fn", "result", "exc", "done", "_thread")
+
+    def __init__(self, label, fn):
+        self.label = label
+        self._fn = fn
+        self.result = None
+        self.exc = None
+        self.done = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="cp-tick-step", daemon=True)
+
+    def _run(self):
+        try:
+            self.result = self._fn()
+        except BaseException as exc:  # noqa: BLE001 — capture EVERYTHING so the loop reports it.
+            self.exc = exc
+        finally:
+            self.done.set()
+
+    def start(self):
+        self._thread.start()
+
+    def wait(self, timeout):
+        """True iff the step finished within `timeout` seconds; False if it overran (abandon)."""
+        return self.done.wait(timeout)
+
+    @property
+    def alive(self):
+        return self._thread.is_alive()
+
+
+def _tick_loop(stop_event, *, home, base_env, interval, on_tick, step_timeout=None):
+    """The tick thread body: wake every `interval` seconds and run_tick() for the registered
+    owners, plus a periodic resume pass every _RESUME_EVERY_TICKS wakes (audit §3a). Stops
+    promptly when `stop_event` is set.
+
+    WATCHDOG (bug #17): each wake emits a LOUD "tick wake #N" line FIRST (liveness is now visible
+    every cadence, so a wedged step can never produce total silence), then runs run_tick in a
+    worker thread the loop waits on for `step_timeout` (default 55s). If run_tick overruns, the
+    loop emits "drain step timeout" and continues — it does NOT start a second run_tick until the
+    prior worker finishes (overlap guard), so one blocked/slow step neither silences the clock nor
+    double-fires work. A run_tick that RAISES is reported as "tick error" exactly as before. The
+    periodic resume runs on cadence regardless of run_tick's fate (its backend calls are timed)."""
     tick_count = 0
+    budget = _step_timeout(step_timeout)
+    inflight = None  # a _StepWorker whose run_tick has not finished yet (the overlap guard).
     while not stop_event.wait(interval):
         tick_count += 1
-        try:
-            fired = run_tick(home=home, base_env=base_env)
-        except Exception as exc:  # noqa: BLE001 — the clock must survive a bad tick.
-            _stderr("cp_boot: tick error: %s" % _exc_line(exc))
-            continue
+        _stderr("cp_boot: tick wake #%d" % tick_count)  # LOUD liveness — silence now impossible.
+        # OVERLAP GUARD: never start a second run_tick while a prior one is still finishing.
+        if inflight is not None and inflight.alive:
+            _stderr("cp_boot: drain step still running: %s (prior wake not finished — skipping "
+                    "this wake's run_tick, loop continues)" % inflight.label)
+        else:
+            inflight = _StepWorker(
+                "run_tick", lambda: run_tick(home=home, base_env=base_env))
+            inflight.start()
+            if inflight.wait(budget):
+                # Settled within budget: report an exception as `tick error`, else fan out on_tick.
+                if inflight.exc is not None:
+                    _stderr("cp_boot: tick error: %s" % _exc_line(inflight.exc))
+                elif on_tick is not None and inflight.result:
+                    try:
+                        on_tick(inflight.result)
+                    except Exception as exc:  # noqa: BLE001 — observer fault never stops clock.
+                        _stderr("cp_boot: on_tick error: %s" % _exc_line(exc))
+                inflight = None  # settled — the next wake may start a fresh run_tick.
+            else:
+                # WATCHDOG FIRES: abandon the WAIT (not the worker); stay loud, keep the loop
+                # turning. The worker finishes in the background; the overlap guard blocks a
+                # duplicate run_tick until it does.
+                _stderr("cp_boot: drain step timeout: %s exceeded %.0fs — abandoning wait, loop "
+                        "continues (worker finishing in background)" % (inflight.label, budget))
         # PERIODIC RESUME — re-drive orphaned /jobs work off the warm tick, not only at boot.
-        # Isolated from the schedule tick so a resume fault never stops the clock.
+        # Runs on cadence regardless of run_tick's fate; a resume fault must not kill the clock.
         try:
             _maybe_resume(tick_count, home=home, base_env=base_env)
         except Exception as exc:  # noqa: BLE001 — a resume fault must not kill the clock.
             _stderr("cp_boot: resume pass error: %s" % _exc_line(exc))
-        if on_tick is not None and fired:
-            try:
-                on_tick(fired)
-            except Exception as exc:  # noqa: BLE001 — observer fault never stops clock.
-                _stderr("cp_boot: on_tick error: %s" % _exc_line(exc))
 
 
 def start_tick_thread(*, home=None, base_env=None,
-                      interval=TICK_INTERVAL_SECONDS, on_tick=None):
+                      interval=TICK_INTERVAL_SECONDS, on_tick=None, step_timeout=None):
     """Start the per-minute scheduler tick daemon (at most one per process). Returns
     (thread, stop_event) on a fresh start, or (None, None) if a tick thread already
     runs in this process (the singleton guard — a double-boot does not spawn two
     clocks). The thread is a daemon so it never blocks interpreter shutdown; pass the
-    returned stop_event to stop it cleanly."""
+    returned stop_event to stop it cleanly. `step_timeout` overrides the watchdog budget
+    (default env/_TICK_STEP_TIMEOUT_DEFAULT) — injectable for deterministic tests."""
     global _TICK_STARTED
     with _TICK_LOCK:
         if _TICK_STARTED:
@@ -259,7 +352,7 @@ def start_tick_thread(*, home=None, base_env=None,
         thread = threading.Thread(
             target=_tick_loop,
             kwargs={"stop_event": stop_event, "home": home, "base_env": base_env,
-                    "interval": interval, "on_tick": on_tick},
+                    "interval": interval, "on_tick": on_tick, "step_timeout": step_timeout},
             name="cp-scheduler-tick",
             daemon=True,
         )
