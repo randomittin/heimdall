@@ -56,16 +56,66 @@ PY
 
 # 6. --cloud preflight needs NO docker (image built + pinned upstream by arch-b; this script
 #    only does jobs-replace + IAM + secret mint). Non-dry cloud run with fake claude/gh/gcloud
-#    on PATH but docker ABSENT must PASS preflight and reach token collection — never die on
-#    "missing 'docker'". Falsifiable: reintroducing `need docker` makes preflight die instead.
+#    on PATH but docker ABSENT must PASS preflight — never die on "missing 'docker'".
+#    AND, against the CURRENT MULTI-TENANT manifest (no cred secretKeyRefs), it must SKIP the
+#    token prompts entirely: no `claude setup-token` (which prints a live ~1-year token!), no
+#    OAuth/PAT prompt — just the multi-tenant skip note. (It then dies at the un-pinned digest
+#    sentinel gate, ORTHOGONAL to the secret flow: the committed manifest pins the real digest
+#    only at deploy time via deploy-arch-b.sh.) Falsifiable two ways: reintroducing
+#    `need docker` re-adds the docker die; re-baking a cred secretKeyRef re-arms the prompts.
 FAKEBIN="$(mktemp -d)"
 for t in claude gh gcloud; do printf '#!/usr/bin/env bash\nexit 0\n' > "$FAKEBIN/$t"; chmod +x "$FAKEBIN/$t"; done
 # docker is deliberately absent from FAKEBIN — it must NOT be required by cloud preflight.
 OUT5="$(PATH="$FAKEBIN:/usr/bin:/bin" bash "$S" --cloud --repo acme/widgets </dev/null 2>&1)"; rc5=$?
 printf '%s' "$OUT5" | grep -q "missing 'docker'" && bad "cloud preflight still requires docker" || ok "cloud preflight requires NO docker"
-# reaching the OAuth mint prompt proves preflight passed (collect_secrets runs only after it).
-printf '%s' "$OUT5" | grep -q 'CLAUDE_CODE_OAUTH_TOKEN' && ok "cloud run passed preflight -> reached token collection (no docker gate)" || bad "cloud run did not reach token collection (blocked before secrets)"
+printf '%s' "$OUT5" | grep -q 'Paste the CLAUDE_CODE_OAUTH_TOKEN' && bad "multi-tenant cloud STILL prompts for a token (setup-token leak hazard)" || ok "multi-tenant cloud prompts for NO token"
+printf '%s' "$OUT5" | grep -q 'mint a ~1-year subscription token' && bad "multi-tenant cloud STILL runs claude setup-token (prints a live token)" || ok "multi-tenant cloud does NOT run claude setup-token"
+printf '%s' "$OUT5" | grep -q 'legacy secret mint skipped' && ok "multi-tenant cloud prints the skip note (passed preflight, reached arch_b)" || bad "no multi-tenant skip note (did not reach arch_b past preflight)"
 rm -rf "$FAKEBIN"
+
+# 7. FALSIFIER — a manifest that DOES mount the legacy cred secretKeyRefs (single-tenant path)
+#    STILL prompts for the tokens. Build a temp manifest carrying heimdall-cc-oauth-token /
+#    heimdall-pr-bot-token secretKeyRefs; a non-dry --cloud run against it must reach the OAuth
+#    mint prompt (auto-detect keeps the legacy path intact when the mounts ARE present).
+LEGYAML="$(mktemp)"; cp "$YAML" "$LEGYAML"
+cat >> "$LEGYAML" <<'YML'
+                - name: CLAUDE_CODE_OAUTH_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: heimdall-cc-oauth-token
+                      key: latest
+                - name: HEIMDALL_PR_BOT_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: heimdall-pr-bot-token
+                      key: latest
+YML
+FB7="$(mktemp -d)"
+for t in claude gh gcloud; do printf '#!/usr/bin/env bash\nexit 0\n' > "$FB7/$t"; chmod +x "$FB7/$t"; done
+OUT7="$(PATH="$FB7:/usr/bin:/bin" HEIMDALL_MAINTAINER_JOB_YAML="$LEGYAML" bash "$S" --cloud --repo acme/widgets </dev/null 2>&1)"
+printf '%s' "$OUT7" | grep -q 'Paste the CLAUDE_CODE_OAUTH_TOKEN' && ok "legacy-mount manifest STILL prompts for tokens (single-tenant path preserved)" || bad "legacy-mount manifest did NOT prompt (auto-detect over-skipped)"
+rm -rf "$FB7"
+
+# 8. CLEAN ARGV — the mksecret + iam-role helpers must invoke gcloud with a CLEAN argv; the
+#    "(|| exists)" annotation is DISPLAY-ONLY and must NEVER reach the executed command (the
+#    live break was `gcloud ... (|| exists): command not found`). Run non-dry --cloud against a
+#    legacy manifest (real-looking digest so the full arch_b path runs) with a LOGGING fake
+#    gcloud; assert the recorded argv is verbatim-clean and carries NO annotation token.
+LEGYAML2="$(mktemp)"; sed 's/@sha256:REPLACE_WITH_DIGEST/@sha256:'"$(printf 'a%.0s' {1..64})"'/' "$LEGYAML" > "$LEGYAML2"
+FB8="$(mktemp -d)"; ARGLOG="$(mktemp)"; : > "$ARGLOG"
+for t in claude gh; do printf '#!/usr/bin/env bash\nexit 0\n' > "$FB8/$t"; chmod +x "$FB8/$t"; done
+cat > "$FB8/gcloud" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$ARGLOG"
+exit 0
+EOF
+chmod +x "$FB8/gcloud"
+printf 'oauthval\nbotval\n' | PATH="$FB8:/usr/bin:/bin" HEIMDALL_MAINTAINER_JOB_YAML="$LEGYAML2" bash "$S" --cloud --repo acme/widgets >/dev/null 2>&1; rc8=$?
+[ "$rc8" = 0 ] && ok "legacy full cloud path completes exit 0 (clean argv, no command-not-found)" || bad "legacy full cloud path rc=$rc8 (mksecret/iam broke)"
+grep -qE '^secrets create heimdall-cc-oauth-token --replication-policy=automatic --project=heimdall-cp-prod$' "$ARGLOG" && ok "mksecret runs gcloud with CLEAN argv (secret create logged verbatim)" || bad "mksecret create argv missing/garbled"
+grep -qE '^iam roles create heimdallJobRunner --project=heimdall-cp-prod --permissions=run\.jobs\.run$' "$ARGLOG" && ok "iam-role create runs gcloud with CLEAN argv (no annotation)" || bad "iam-role create argv missing/garbled"
+grep -qE '\(\|\||exists\)' "$ARGLOG" && bad "annotation '(|| exists)' LEAKED into executed gcloud argv" || ok "no '(|| exists)' annotation in any executed gcloud argv"
+rm -rf "$FB8" "$ARGLOG" "$LEGYAML" "$LEGYAML2"
 
 echo "──────────"; echo "deploy-maintainer: $P passed, $F failed"
 [ "$F" = 0 ] || exit 1
