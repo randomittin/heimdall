@@ -171,6 +171,19 @@ grep -q "google-cloud-firestore" "${REPO_ROOT}/Dockerfile" 2>/dev/null \
   || { warn "  Dockerfile missing google-cloud-firestore pin"; GUARD_OK=0; }
 [ "$GUARD_OK" = 1 ] || die "STEP 2: current-main source guards absent — refusing to rebuild a stale image."
 
+# deployed-shape preflight (WARN-ONLY — never blocks the go-live). Static scan of
+# bin/lib/*.py for the workstation-assumption smells the 14-bug cloud-maintainer
+# bring-up saga proved dangerous (slug-onto-CWD paths, unguarded local-state reads,
+# captured-but-ignored subprocess stderr, reserved Cloud Run env names in override
+# dicts). Needs no creds; a bounded experiment (promotion to blocking is `--strict`).
+DSHAPE_CHECK="${REPO_ROOT}/bin/heimdall-deployed-shape-check"
+if command -v python3 >/dev/null 2>&1 && [ -f "${DSHAPE_CHECK}" ]; then
+  note "deployed-shape preflight (WARN-only — findings never block):"
+  python3 "${DSHAPE_CHECK}" --root "${REPO_ROOT}" || true
+else
+  warn "deployed-shape preflight skipped (python3 or ${DSHAPE_CHECK} absent)"
+fi
+
 # Detect-and-skip: compare the gated service's live image to the current-main HEAD.
 # We compare the deployed image's commit-tag (or just report) against HEAD; if the
 # operator has already deployed current main, we skip the spend-incurring rebuild.
