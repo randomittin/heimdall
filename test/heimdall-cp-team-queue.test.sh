@@ -280,14 +280,14 @@ big = "x" * 10000
 eb = Q.enqueue(T, big)
 pb = Q.pick(T)
 # Secret-shaped: a GitHub PAT + an assigned-credential shape -> redacted, not stored.
-secret = "deploy with token=AbCdEf0123456789AbCdEf01 and key ghp_" + ("a" * 36)
+secret = "deploy with token=ASSIGNED_CRED_SENTINEL_notreal and key ghp_" + ("a" * 36)
 es = Q.enqueue(T, secret)
 ps = Q.pick(T)
 stored = ps["text"] if ps else ""
 print(json.dumps({
     "trimmed": len(pb["text"]) <= Q._TASK_MAX_CHARS and len(pb["text"]) < 10000,
     "no_ghp": "ghp_" not in stored,
-    "no_assigned": "token=AbCdEf0123456789AbCdEf01" not in stored,
+    "no_assigned": "token=ASSIGNED_CRED_SENTINEL_notreal" not in stored,
     "redaction_present": Q._REDACTION in stored,
 }))
 PYEOF
