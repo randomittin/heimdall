@@ -1,15 +1,46 @@
 # Heimdall 🛡️
 
-**Verification gates for AI coding agents** — catches what the model misses, proves it did.
+**A cloud bot that fixes your GitHub issues and opens a proven PR. You review, you merge.**
+
+Every PR ships the runnable evidence that the fix passes. The bot opens it on a `heimdall/*` branch **as a scoped GitHub App** — never as you, never on `main`, and it never self-merges. A human always gates the merge.
 
 [![Claude Code](https://img.shields.io/badge/Claude%20Code-plugin-e056a0?style=flat-square)](https://code.claude.com)
 [![License: MIT](https://img.shields.io/badge/License-MIT-9b59b6?style=flat-square)](LICENSE)
-[![Version](https://img.shields.io/badge/version-2.0.5-00d4ff?style=flat-square)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-2.0.12-00d4ff?style=flat-square)](CHANGELOG.md)
+
+---
+
+## Get a bot PR on your repo
+
+Once you've installed the Heimdall Maintainer GitHub App on your repo and run `claude setup-token`, it's three commands:
+
+```bash
+rr setup --mode control-plane --endpoint <public-url> --enroll-token <token>
+rr connect                                    # registers your App install + captures your Claude cred
+rr "fix the flaky test in payments and open a PR"
+```
+
+**What happens:** `rr` signs your task with your own Ed25519 key and enqueues it. A gated worker clones your repo with **your team's** Claude subscription and **your** GitHub App installation, runs the issue-resolution loop until the fix passes the gates, and opens a `heimdall/*` PR on your repo. You review it. You merge it.
+
+**Enrollment is token-gated today — no self-serve yet, and we won't pretend otherwise.** The enroll token and the service URL are handed out by hand: **ask for an enroll token** at [runheimdall.dev](https://runheimdall.dev). Full onboarding steps: [`deploy/cloud-run/PUBLIC-RR-RUNBOOK.md`](deploy/cloud-run/PUBLIC-RR-RUNBOOK.md).
+
+### Why it's safe to point at your repo
+
+- **Tenant isolation is a falsifiable oracle, not a promise.** Every cross-tenant attack — IDOR by repo slug, cred read across teams, queue drain, installation-id swap, signed-request replay — has a named invariant and a red-line mutant test. Drop any gate and [`test/heimdall-cp-authz-gate.test.sh`](test/heimdall-cp-authz-gate.test.sh) goes red; the keystone suite passes **only** when every mutant is caught. Full invariant + attack matrix: [`docs/specs/2026-07-03-rr-isolation-invariants.md`](docs/specs/2026-07-03-rr-isolation-invariants.md).
+- **BYOC — no shared keys.** You pay your own Claude tokens; your credential lands in **your own** per-team Secret Manager secret and is injected env-only into your job — never logged, never echoed, never readable by another tenant.
+- **Least-privilege bot.** The App holds exactly Contents + Issues + Pull requests — **no** Administration, **no** Actions/Workflows, **no** merge capability. It can open a PR; it cannot touch branch protection or push to `main`.
+- **Honest bring-up.** This loop was hardened over a live multi-tenant bring-up that shook out a run of production-only failures — Google's GFE rejecting GET-with-a-body, cold-start identity drift, jobs starving under scale-to-zero — each now documented as fixed in [`deploy/cloud-run/README.md`](deploy/cloud-run/README.md) and the runbook.
+
+---
+
+## Under the hood — the verification orchestrator
+
+The bot is powered by Heimdall's local engine: a Claude Code plugin that turns one prompt into finished, **proven** work. Every plan wires an external, falsifiable oracle so the implementation can never grade its own homework, and the merge stays blocked until the work is proven correct. Install it to run the same gates on your own machine.
 
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/randomittin/heimdall/v2.0.5/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/randomittin/heimdall/v2.0.12/install.sh | bash
 ```
 
 No sudo. No telemetry. Idempotent — re-run to upgrade. Reversible:
@@ -21,7 +52,7 @@ hmd uninstall    # removes everything; nothing else was touched
 **Prefer to inspect first?**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/randomittin/heimdall/v2.0.5/install.sh -o install.sh
+curl -fsSL https://raw.githubusercontent.com/randomittin/heimdall/v2.0.12/install.sh -o install.sh
 less install.sh  # function-wrapped, no eval, no base64 — what you read is what runs
 bash install.sh
 ```
