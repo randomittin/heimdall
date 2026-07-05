@@ -406,7 +406,8 @@ else
 fi
 run gcloud projects add-iam-policy-binding "$PROJECT" \
   --member="serviceAccount:${RUNTIME_SA}" \
-  --role="projects/${PROJECT}/roles/${TEAM_SECRET_CREATOR_ROLE}"
+  --role="projects/${PROJECT}/roles/${TEAM_SECRET_CREATOR_ROLE}" \
+  --condition=None
 
 # 4c. Conditional secretmanager.admin on the per-team PREFIX ONLY (add-version / access / get /
 #     delete on heimdall-tc-* — and NOTHING else). delete is why we use admin here, not just
