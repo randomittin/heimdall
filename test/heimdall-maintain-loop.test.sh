@@ -427,6 +427,164 @@ else
   bad "fail-closed-after-usage snapshot wrong: $FALSE_BUDGET"
 fi
 
+# ── fake gh/claude on PATH (hermetic: NO network, NO real GitHub, NO real model) ─
+# A fake `gh` records its argv + whether GH_TOKEN rode the env, and fabricates a REAL
+# throwaway git checkout on `gh repo clone` — so the cloud-shape clone path is exercised
+# end-to-end without a network. `git` stays REAL (only gh/claude are faked), so the loop's
+# own git/comprehend/attest run for real against the fabricated checkout.
+FAKEBIN="$WORK/fakebin"; mkdir -p "$FAKEBIN"
+GH_ARGV_LOG="$WORK/gh_argv.log"; : > "$GH_ARGV_LOG"
+GH_ENV_LOG="$WORK/gh_env.log"; : > "$GH_ENV_LOG"
+cat > "$FAKEBIN/gh" <<GHEOF
+#!/usr/bin/env bash
+# fake gh — record argv + GH_TOKEN-in-env, fabricate a checkout on \`repo clone\`.
+printf '%s\n' "\$*" >> "$GH_ARGV_LOG"
+[ -n "\${GH_TOKEN:-}" ] && printf 'GH_TOKEN_PRESENT\n' >> "$GH_ENV_LOG"
+if [ "\${1:-}" = "repo" ] && [ "\${2:-}" = "clone" ]; then
+  slug="\$3"; dest="\$4"
+  mkdir -p "\$dest"
+  git init -q "\$dest"
+  git -C "\$dest" config user.email t@t
+  git -C "\$dest" config user.name t
+  git -C "\$dest" config commit.gpgsign false
+  git -C "\$dest" remote add origin "https://github.com/\$slug.git"
+  printf 'x\n' > "\$dest/app.py"
+  git -C "\$dest" add -A
+  git -C "\$dest" commit -qm init
+fi
+exit 0
+GHEOF
+chmod +x "$FAKEBIN/gh"
+cat > "$FAKEBIN/claude" <<'CLAUDEEOF'
+#!/usr/bin/env bash
+exit 0
+CLAUDEEOF
+chmod +x "$FAKEBIN/claude"
+BOT_TOKEN="ghs_FAKEcloneTOKEN0000000000000000000000"
+
+echo "── (13) CLOUD-SHAPE WORKSPACE — a bare owner/name SLUG is CLONED into the workdir ─"
+# The deployed shape: a FRESH HEIMDALL_HOME, a read-only CWD (mimics /app in the Cloud Run
+# Job, where only /app/state=HEIMDALL_HOME is writable), NO state file, and --repo as a bare
+# SLUG. The loop must clone into ${HEIMDALL_HOME}/work/<owner>__<name> (NOT a CWD-relative
+# join — the PermissionError bug), auth riding the bot token in the ENV (never argv).
+CLOUD_HOME="$WORK/cloud_home"; mkdir -p "$CLOUD_HOME"
+RO_CWD="$WORK/ro_cwd"; mkdir -p "$RO_CWD"
+SLUG="randomittin/heimdall-maintainer-test"
+WORKDIR="$CLOUD_HOME/work/randomittin__heimdall-maintainer-test"
+: > "$GH_ARGV_LOG"; : > "$GH_ENV_LOG"
+RAW="$("$PY" -c 'import json,sys;print(json.dumps({"repo":"acme/widget","number":131,"title":"fix","body":"broken","labels":[{"name":"bug"}],"created_at":"2020-06-01T00:00:00Z"}))')"
+HEIMDALL_HOME="$CLOUD_HOME" "$QCMD" ingest --source github --raw "$RAW" --repo "$SLUG" >/dev/null
+chmod 555 "$RO_CWD"
+OUT="$(cd "$RO_CWD" && env HEIMDALL_HOME="$CLOUD_HOME" \
+      HEIMDALL_TOKENS_BIN="$METER_SMALL" \
+      HEIMDALL_PR_BOT_TOKEN="$BOT_TOKEN" \
+      PATH="$FAKEBIN:$PATH" \
+      "$CMD" run --repo "$SLUG" --explicit --max 1 --evidence "true" 2>/dev/null)"
+chmod 755 "$RO_CWD"
+if [ -d "$WORKDIR/.git" ]; then
+  ok "the bare slug was CLONED into \${HEIMDALL_HOME}/work/<owner>__<name> (writable root)"
+else
+  bad "no workdir cloned at $WORKDIR"
+fi
+if [ -f "$WORKDIR/.planning/CHECKPOINT.md" ]; then
+  ok "the planning/checkpoint dir lands UNDER the workdir (not a bare-slug CWD join)"
+else
+  bad "no checkpoint under the workdir (planning_dir did not derive from the workdir)"
+fi
+if grep -q "repo clone $SLUG" "$GH_ARGV_LOG" && ! grep -q "$BOT_TOKEN" "$GH_ARGV_LOG"; then
+  ok "clone argv is TOKEN-FREE (falsifier: a token in argv would fail this grep)"
+else
+  bad "clone argv missing or leaked the token: $(cat "$GH_ARGV_LOG")"
+fi
+if grep -q 'GH_TOKEN_PRESENT' "$GH_ENV_LOG"; then
+  ok "the bot token rode the ENV (GH_TOKEN) into the cloner — never argv/logs"
+else
+  bad "clone auth did NOT ride the env (GH_TOKEN absent)"
+fi
+if [ "$(jget "$OUT" '.stop')" != "workspace-error" ] && [ "$(jget "$OUT" '.cycles')" -ge 1 ] \
+   && [ "$(jget "$OUT" '.tally.fixed')" -ge 1 ]; then
+  ok "the cycle PROCEEDED against the clone (cycles=$(jget "$OUT" '.cycles') fixed=$(jget "$OUT" '.tally.fixed'))"
+else
+  bad "the cycle did not proceed (stop=$(jget "$OUT" '.stop') cycles=$(jget "$OUT" '.cycles'))"
+fi
+if [ ! -e "$RO_CWD/randomittin" ]; then
+  ok "NOTHING was written CWD-relative (the /app read-only PermissionError can't recur)"
+else
+  bad "a bare-slug dir was created under the CWD (the original bug)"
+fi
+
+echo "── (14) WORKSTATION-SHAPE — CWD is a checkout matching the SLUG -> NO clone ──"
+# Byte-identical local behavior: when the CWD is ALREADY a checkout of the target slug (its
+# git remote matches), the loop uses it unchanged — NO clone, planning at the checkout's own
+# .planning. HEIMDALL_MAINTAIN_WORKDIR points at a dir that must stay UNUSED (the falsifier).
+WS_REPO="$(new_repo ws_slug)"
+git -C "$WS_REPO" remote add origin "https://github.com/acme/ws-widget.git"
+enable_state "$WS_REPO" true 600000
+seed "$WS_REPO" 141
+UNUSED_ROOT="$WORK/should_not_be_used"
+: > "$GH_ARGV_LOG"
+OUT="$(cd "$WS_REPO" && env HEIMDALL_HOME="$WS_REPO/.heimdall" \
+      HEIMDALL_STATE_FILE="$WS_REPO/heimdall-state.json" \
+      HEIMDALL_TOKENS_BIN="$METER_SMALL" \
+      HEIMDALL_MAINTAIN_WORKDIR="$UNUSED_ROOT" \
+      PATH="$FAKEBIN:$PATH" \
+      "$CMD" run --repo "acme/ws-widget" --max 1 --evidence "true" 2>/dev/null)"
+if ! grep -q "repo clone" "$GH_ARGV_LOG"; then
+  ok "workstation: the CWD checkout was reused — NO clone attempted (byte-identical local)"
+else
+  bad "workstation still cloned despite a matching CWD checkout: $(cat "$GH_ARGV_LOG")"
+fi
+if [ -f "$WS_REPO/.planning/CHECKPOINT.md" ] && [ ! -d "$UNUSED_ROOT" ]; then
+  ok "workstation: planning at the CHECKOUT's .planning; the workdir root stays UNUSED"
+else
+  bad "workstation planning misplaced (checkpoint=$( [ -f "$WS_REPO/.planning/CHECKPOINT.md" ] && echo yes || echo no ) unused_root=$( [ -d "$UNUSED_ROOT" ] && echo created || echo absent ))"
+fi
+if [ "$(jget "$OUT" '.cycles')" -ge 1 ]; then
+  ok "workstation: the cycle ran against the local checkout (cycles=$(jget "$OUT" '.cycles'))"
+else
+  bad "workstation cycle did not run (cycles=$(jget "$OUT" '.cycles'))"
+fi
+
+echo "── (15) SLUG TRAVERSAL — owner/../../etc is REFUSED (no clone, no join) ──────"
+TRAV_HOME="$WORK/trav_home"; mkdir -p "$TRAV_HOME"
+TRAV_CWD="$WORK/trav_cwd"; mkdir -p "$TRAV_CWD"
+: > "$GH_ARGV_LOG"
+OUT="$(cd "$TRAV_CWD" && env HEIMDALL_HOME="$TRAV_HOME" \
+      HEIMDALL_TOKENS_BIN="$METER_SMALL" \
+      HEIMDALL_PR_BOT_TOKEN="$BOT_TOKEN" \
+      PATH="$FAKEBIN:$PATH" \
+      "$CMD" run --repo "owner/../../etc" --explicit --max 1 --evidence "true" 2>/dev/null)"
+if [ "$(jget "$OUT" '.stop')" = "workspace-error" ] && [ "$(jget "$OUT" '.cycles')" = "0" ]; then
+  ok "traversal slug -> stop=workspace-error, 0 cycles (refused BEFORE any filesystem join)"
+else
+  bad "traversal not refused (stop=$(jget "$OUT" '.stop') cycles=$(jget "$OUT" '.cycles'))"
+fi
+if ! grep -q "clone" "$GH_ARGV_LOG"; then
+  ok "traversal: NO clone attempted (nothing joined, nothing executed)"
+else
+  bad "traversal still attempted a clone: $(cat "$GH_ARGV_LOG")"
+fi
+# direct guard: the segment validator refuses traversal shapes yet accepts a real slug.
+PY_TRAV="$("$PY" -c '
+import maintain_loop as m
+refused = True
+for b in ["owner/..","../x/y","a/b/c","owner/na me","o/..","owner/../../etc"]:
+    try:
+        m._parse_repo_slug(b); refused = False; break
+    except m.WorkspaceError:
+        continue
+good = False
+try:
+    good = m._parse_repo_slug("acme/widget") == ("acme", "widget")
+except Exception:
+    good = False
+print("OK" if (refused and good) else "BAD")')"
+if [ "$PY_TRAV" = "OK" ]; then
+  ok "the slug validator refuses every traversal shape yet accepts a real owner/name"
+else
+  bad "the slug validator is wrong (result=$PY_TRAV)"
+fi
+
 echo
 echo "════════════════════════════════════════════════════════════════════════════"
 printf "maintain-loop: \033[32m%d passed\033[0m, " "$PASS"
@@ -435,4 +593,4 @@ if [ "$FAIL" -gt 0 ]; then
   exit 1
 fi
 printf "%d failed\n" "$FAIL"
-echo "ALL GREEN — budget-cap can't-burn-tokens · stop-guards · checkpoint · heartbeat · resume · disabled · approval-park · explicit-rr-authz · env-override · fresh-home-budget · fail-closed-after-usage"
+echo "ALL GREEN — budget-cap can't-burn-tokens · stop-guards · checkpoint · heartbeat · resume · disabled · approval-park · explicit-rr-authz · env-override · fresh-home-budget · fail-closed-after-usage · cloud-clone-workspace · workstation-parity · slug-traversal-refused"
