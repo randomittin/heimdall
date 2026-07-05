@@ -39,6 +39,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -775,6 +776,261 @@ def _persist_autopilot(repo, cycle, stop, heartbeat):
         return  # persistence is advisory; the checkpoint file remains authoritative
 
 
+# ── WORKSPACE RESOLUTION (deployed-shape: the cloud job has NO checkout) ───────
+#
+# The maintainer loop was DESIGNED to run INSIDE an existing local checkout: `--repo`
+# was a DIRECTORY and every repo-relative op (the .planning checkpoint dir, the orient/
+# attest cwd, git) ran against it. The ephemeral Cloud Run Job has NO checkout — the
+# gated drain dispatches `--repo owner/name` (a SLUG). Treating that slug as a relative
+# path made os.makedirs(<cwd>/owner/...) explode (PermissionError: /app is read-only for
+# the heimdall user; only /app/state=HEIMDALL_HOME is writable) — the 9th prod-only break.
+#
+# resolve_workspace() closes the gap WITHOUT changing local behavior:
+#   • an existing local DIRECTORY arg      -> os.path.abspath(it), unchanged (workstation);
+#   • an owner/name SLUG already checked out as the CWD (remote matches) -> the CWD,
+#     unchanged (workstation parity even when invoked by slug);
+#   • else (the cloud/fresh shape)         -> a per-repo WORKDIR under the writable
+#     workspace root: cloned shallow when absent, refreshed (fetch+reset) when present.
+#
+# Clone auth rides the SCOPED PR-bot token exactly the way issue_pr does — the token is
+# injected into the child ENV (GH_TOKEN for `gh`, HEIMDALL_GIT_ASKPASS_TOKEN for the
+# plain-git fallback's askpass), NEVER on argv and NEVER inside a logged URL. The
+# workspace root is HEIMDALL_MAINTAIN_WORKDIR (env) or ${HEIMDALL_HOME}/work; the per-repo
+# dir is <root>/<owner>__<name> with each slug segment validated as a safe, traversal-free
+# path segment (the same discipline cp_ghinstall applies to a team_id / repo slug). A bad
+# or traversing slug is refused (WorkspaceError), never joined.
+
+HEIMDALL_MAINTAIN_WORKDIR_ENV = "HEIMDALL_MAINTAIN_WORKDIR"
+
+STOP_WORKSPACE = "workspace-error"   # the workspace could not be resolved / cloned.
+
+# One slug segment: starts alnum, then alnum/._- only. Rejects "", ".", "..", any "/" or
+# "\", and every shell metachar/whitespace — so a segment can never traverse or escape the
+# workspace root when it is filesystem-joined.
+_SLUG_SEGMENT_RX = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+
+# GitHub token / PEM shapes redacted from any git/gh error BEFORE it is surfaced (belt-and-
+# suspenders — the token rides the env, but a misconfigured remote could echo a URL).
+_GIT_TOKENISH_RX = re.compile(
+    r"(gh[oprsu]_[A-Za-z0-9]{6,}|github_pat_[A-Za-z0-9_]{6,}"
+    r"|x-access-token:[^@\s]+|-----BEGIN[^\n]*)")
+
+
+class WorkspaceError(Exception):
+    """A repo workspace could not be resolved, cloned, or refreshed. The message is
+    ALWAYS token-scrubbed (a git/gh URL or stderr can carry a credential) and names a git
+    error, never a Python traceback."""
+
+
+def _scrub_git_error(text):
+    """Make a git/gh error LOG-SAFE: redact any token-ish run, collapse whitespace to one
+    line, hard-cap it. Returns '' for empty. Idempotent."""
+    if not text:
+        return ""
+    scrubbed = _GIT_TOKENISH_RX.sub("<redacted>", str(text))
+    return " ".join(scrubbed.split())[:300]
+
+
+def _safe_slug_segment(seg):
+    """Return `seg` iff it is a safe, traversal-free path segment; else raise
+    WorkspaceError. The guard that stops owner/.. and shell metachars from ever reaching a
+    filesystem join."""
+    if not isinstance(seg, str) or not _SLUG_SEGMENT_RX.fullmatch(seg):
+        raise WorkspaceError("unsafe repo path segment %r" % seg)
+    return seg
+
+
+def _parse_repo_slug(arg):
+    """Parse an `owner/name` slug into (owner, name) SAFE segments, or raise
+    WorkspaceError. Exactly one '/'; each side a safe segment — so a deep path
+    (owner/../../etc) or a traversing segment (owner/..) is refused, never joined."""
+    if not isinstance(arg, str) or arg.count("/") != 1:
+        raise WorkspaceError("repo %r is not an owner/name slug" % arg)
+    owner, name = arg.split("/", 1)
+    return _safe_slug_segment(owner), _safe_slug_segment(name)
+
+
+def _maintain_workdir_root():
+    """The writable workspace root the per-repo workdir lives under:
+    HEIMDALL_MAINTAIN_WORKDIR if set, else ${HEIMDALL_HOME:-~/.heimdall}/work."""
+    root = os.environ.get(HEIMDALL_MAINTAIN_WORKDIR_ENV)
+    if root:
+        return os.path.abspath(root)
+    home = os.environ.get("HEIMDALL_HOME") or os.path.join(
+        os.path.expanduser("~"), ".heimdall")
+    return os.path.join(os.path.abspath(home), "work")
+
+
+def _is_git_checkout(path):
+    """True iff `path` is inside a git working tree. A missing path / non-repo reads False
+    (never raises)."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", path, "rev-parse", "--is-inside-work-tree"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+        )
+    except OSError:
+        return False
+    return proc.returncode == 0 and (proc.stdout or "").strip() == "true"
+
+
+def _remote_owner_name(path):
+    """The `owner/name` of the git remote origin at `path`, or None. Normalizes the https
+    / ssh / git@ URL forms down to the trailing owner/name (host + .git suffix stripped)."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", path, "config", "--get", "remote.origin.url"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+        )
+    except OSError:
+        return None
+    url = (proc.stdout or "").strip()
+    if not url:
+        return None
+    slug = re.sub(r"^[a-z]+\+?[a-z]*://", "", url)   # scheme://
+    slug = re.sub(r"^[^@/]+@", "", slug)             # user@ (ssh / x-access-token)
+    slug = re.sub(r"^[^/:]+[:/]", "", slug, count=1)  # host[:/]
+    slug = re.sub(r"\.git$", "", slug).rstrip("/")
+    segs = [s for s in slug.split("/") if s]
+    if len(segs) < 2:
+        return None
+    return "%s/%s" % (segs[-2], segs[-1])
+
+
+# The GIT_ASKPASS helper for the plain-git clone fallback. It reads the token from the env
+# ONLY (HEIMDALL_GIT_ASKPASS_TOKEN) — it never contains the token, so it is safe on disk;
+# the username is the fixed x-access-token GitHub expects for an installation/PAT token.
+_ASKPASS_BODY = (
+    "#!/bin/sh\n"
+    "# Heimdall git askpass: emit the bot token for the password prompt and the fixed\n"
+    "# username for the username prompt. The token rides HEIMDALL_GIT_ASKPASS_TOKEN in\n"
+    "# the env ONLY — never on argv, never written into any git config or URL.\n"
+    'case "$1" in\n'
+    "  Username*|username*) printf 'x-access-token\\n' ;;\n"
+    "  *) printf '%s\\n' \"${HEIMDALL_GIT_ASKPASS_TOKEN:-}\" ;;\n"
+    "esac\n"
+)
+
+
+def _ensure_askpass_helper():
+    """Write (once) the tiny GIT_ASKPASS helper under the workspace root and return its
+    path, or None on an IO failure. The helper reads the token from the env — it never
+    contains the token."""
+    root = _maintain_workdir_root()
+    try:
+        os.makedirs(root, exist_ok=True)
+        path = os.path.join(root, ".git-askpass.sh")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(_ASKPASS_BODY)
+        os.chmod(path, 0o700)
+    except OSError:
+        return None
+    return path
+
+
+def _bot_clone_env(with_askpass=False):
+    """The child env for a git/gh clone/fetch that authenticates as the SCOPED PR bot —
+    the SAME token-via-env discipline issue_pr._bot_env uses. The bot token
+    (HEIMDALL_PR_BOT_TOKEN) is injected as GH_TOKEN (`gh` reads it) and, for the plain-git
+    fallback, exposed to the GIT_ASKPASS helper via HEIMDALL_GIT_ASKPASS_TOKEN. The RAW
+    HEIMDALL_PR_BOT_TOKEN and any inherited personal GITHUB_TOKEN are SCRUBBED so only the
+    scoped bot identity is ever used and the child can never echo the raw token. The token
+    rides the ENV only — never argv, never a logged URL. GIT_TERMINAL_PROMPT=0 makes a
+    missing credential fail LOUD instead of hanging on an interactive prompt."""
+    env = dict(os.environ)
+    token = env.pop("HEIMDALL_PR_BOT_TOKEN", None)
+    env.pop("GITHUB_TOKEN", None)
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    if token:
+        env["GH_TOKEN"] = token
+        if with_askpass:
+            helper = _ensure_askpass_helper()
+            if helper:
+                env["GIT_ASKPASS"] = helper
+                env["HEIMDALL_GIT_ASKPASS_TOKEN"] = token
+    return env
+
+
+def _clone_repo(owner, name, workdir):
+    """Shallow-clone owner/name into `workdir` as the scoped PR bot. Prefers `gh repo
+    clone` (the exact mechanism issue_pr rides for `gh`, token via GH_TOKEN in the child
+    env), falling back to `git clone` with the token supplied through the GIT_ASKPASS
+    helper (username x-access-token in the URL — NOT the token). On any failure raises a
+    WorkspaceError naming the SCRUBBED git error (never a traceback, never the token)."""
+    slug = "%s/%s" % (owner, name)
+    if shutil.which("gh"):
+        argv = ["gh", "repo", "clone", slug, workdir, "--", "--depth", "1"]
+        env = _bot_clone_env(with_askpass=False)
+    else:
+        argv = ["git", "clone", "--depth", "1",
+                "https://x-access-token@github.com/%s.git" % slug, workdir]
+        env = _bot_clone_env(with_askpass=True)
+    try:
+        proc = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              text=True, env=env)
+    except OSError as exc:
+        raise WorkspaceError(
+            "could not run the cloner for %s: %s" % (slug, _scrub_git_error(str(exc))))
+    if proc.returncode != 0:
+        note = _scrub_git_error(proc.stderr) or ("cloner exited %d" % proc.returncode)
+        raise WorkspaceError("clone of %s failed: %s" % (slug, note))
+    if not _is_git_checkout(workdir):
+        raise WorkspaceError(
+            "clone of %s produced no working tree at %s" % (slug, workdir))
+
+
+def _refresh_workdir(workdir):
+    """Refresh an existing workdir to the remote's latest (shallow fetch + hard reset to
+    FETCH_HEAD) as the scoped PR bot. LOUD: a fetch/reset failure raises a WorkspaceError
+    with the SCRUBBED git error, so a stale/broken tree is never silently fixed against."""
+    env = _bot_clone_env(with_askpass=True)
+    steps = (
+        ["git", "-C", workdir, "fetch", "--depth", "1", "origin"],
+        ["git", "-C", workdir, "reset", "--hard", "FETCH_HEAD"],
+    )
+    for argv in steps:
+        try:
+            proc = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                  text=True, env=env)
+        except OSError as exc:
+            raise WorkspaceError(
+                "could not refresh %s: %s" % (workdir, _scrub_git_error(str(exc))))
+        if proc.returncode != 0:
+            note = _scrub_git_error(proc.stderr) or ("git exited %d" % proc.returncode)
+            raise WorkspaceError("refresh of %s failed: %s" % (workdir, note))
+
+
+def resolve_workspace(repo_arg, *, allow_clone=True):
+    """Resolve the `--repo` arg to a real working tree (see the section dossier above).
+
+      • an existing local DIRECTORY  -> os.path.abspath(it), unchanged (workstation).
+      • an owner/name SLUG already checked out as the CWD (remote matches) -> the CWD,
+        unchanged (workstation parity even when invoked by slug).
+      • else (cloud/fresh) -> <root>/<owner>__<name>: cloned when absent, refreshed when
+        present. With allow_clone False (a read-only plan) the computed workdir path is
+        returned WITHOUT cloning.
+
+    Raises WorkspaceError on a traversing / ill-formed slug or a clone/refresh failure."""
+    if os.path.isdir(repo_arg):
+        return os.path.abspath(repo_arg)
+    owner, name = _parse_repo_slug(repo_arg)   # refuses traversal before any join
+    cwd = os.getcwd()
+    if _is_git_checkout(cwd):
+        remote = _remote_owner_name(cwd)
+        if remote and remote.lower() == ("%s/%s" % (owner, name)).lower():
+            return cwd   # workstation parity: the CWD already is this repo's checkout
+    workdir = os.path.join(_maintain_workdir_root(), "%s__%s" % (owner, name))
+    if _is_git_checkout(workdir):
+        if allow_clone:
+            _refresh_workdir(workdir)
+        return workdir
+    if not allow_clone:
+        return workdir   # read-only preview: compute the path, clone NOTHING
+    os.makedirs(_maintain_workdir_root(), exist_ok=True)
+    _clone_repo(owner, name, workdir)
+    return workdir
+
+
 # ── the AUTOPILOT run loop (drives issue_loop.run_once cycle-by-cycle) ─────────
 
 
@@ -815,10 +1071,67 @@ def run(repo, base="HEAD", evidence_cmds=None, cfg=None, max_cycles=0,
 
     Returns a summary dict {cycles, stop, tally, last, budget, results}. Every
     transition is durably appended to .planning/CHECKPOINT.md."""
-    repo = os.path.abspath(repo)
+    raw_repo = repo
+    # ── AUTHORIZATION FIRST — read state from the existing local tree (workstation) or a
+    #    tolerant-empty read for a bare slug (the cloud shape, always --explicit). Gating
+    #    BEFORE the workspace step means an UNAUTHORIZED run NEVER clones. THREE independent
+    #    authorizations (the deployed-shape design):
+    #      • explicit=True — the cycle originates from an EXPLICIT rr task the user signed +
+    #        submitted, which the gated drain dispatched. That submission IS the
+    #        authorization, so the loop runs WITHOUT a local heimdall-state.json enable flag
+    #        (which never exists in the ephemeral Cloud Run Job container).
+    #      • env_enabled() — HEIMDALL_MAINTAINER_ENABLED, a documented operator ENV override.
+    #      • is_enabled(state) — the LOCAL-workstation enable flag (OFF by default): the
+    #        UNATTENDED / scheduled path keeps this safety gate, so the loop NEVER auto-runs
+    #        on an unconfigured repo (the safety property is preserved).
+    gate_repo = os.path.abspath(raw_repo) if os.path.isdir(raw_repo) else raw_repo
+    state = _read_state(gate_repo)
+    cap = resolve_cap(state, cap_override)
+    tally = {"fixed": 0, "flagged": 0, "parked": 0, "pr": 0}
+    last = None
+    budget = {"cap_tokens": cap, "used": None, "cost_usd_est": None, "over": None}
+    results = []
+    if not (explicit or env_enabled() or is_enabled(state)):
+        return {
+            "cycles": 0,
+            "stop": STOP_DISABLED,
+            "tally": tally,
+            "last": None,
+            "budget": budget,
+            "results": [],
+            "note": ("maintainer is not enabled (.maintainer.enabled != true, no --explicit "
+                     "rr-task authorization, no HEIMDALL_MAINTAINER_ENABLED)"),
+        }
+
+    # ── WORKSPACE (deployed-shape): resolve `--repo` to a REAL working tree. In the cloud
+    #    the arg is a bare owner/name SLUG and there is NO checkout — clone it into the
+    #    writable workspace root (bot-token auth rides the child ENV, never argv). On the
+    #    workstation an existing checkout is used unchanged (byte-identical). Ensure the bot
+    #    token is present for clone auth first (the per-cycle mint refreshes it each cycle).
+    #    A clone/traversal failure FAILS LOUD — a scrubbed, named git error in the summary +
+    #    a stderr line (the deployed error_tail), never a Python traceback.
+    apply_pr_bot_token()
+    try:
+        repo = resolve_workspace(raw_repo)
+    except WorkspaceError as exc:
+        note = "workspace unavailable: %s" % _scrub_git_error(str(exc))
+        sys.stderr.write("maintain-loop: %s\n" % note)
+        return {
+            "cycles": 0,
+            "stop": STOP_WORKSPACE,
+            "tally": tally,
+            "last": None,
+            "budget": budget,
+            "results": [],
+            "note": note,
+        }
+
+    # everything repo-relative below now runs against the RESOLVED working tree (the local
+    # checkout on the workstation, the cloned workdir in the cloud).
     state = _read_state(repo)
     planning_dir = _planning_dir(repo, planning_dir)
     cap = resolve_cap(state, cap_override)
+    budget = {"cap_tokens": cap, "used": None, "cost_usd_est": None, "over": None}
     if max_failures is None:
         max_failures = DEFAULT_MAX_FAILURES
 
@@ -831,10 +1144,6 @@ def run(repo, base="HEAD", evidence_cmds=None, cfg=None, max_cycles=0,
     if context_block is not None:
         fix_runner = make_context_fix_runner(context_block, inner=fix_runner)
 
-    tally = {"fixed": 0, "flagged": 0, "parked": 0, "pr": 0}
-    last = None
-    budget = {"cap_tokens": cap, "used": None, "cost_usd_est": None, "over": None}
-    results = []
     cycle = 0
     fail_streak = 0
     stop = None
@@ -843,29 +1152,6 @@ def run(repo, base="HEAD", evidence_cmds=None, cfg=None, max_cycles=0,
     # recorded this run — a completed cycle burned tokens, or the meter reported real usage —
     # a subsequent unavailable read FAIL-CLOSES (never run blind). See budget_state().
     usage_recorded = False
-
-    # ── AUTHORIZATION — the maintainer must be authorized before the loop runs. THREE
-    #    independent authorizations (the deployed-shape design):
-    #      • explicit=True — the cycle originates from an EXPLICIT rr task the user signed +
-    #        submitted, which the gated drain dispatched. That submission IS the
-    #        authorization, so the loop runs WITHOUT a local heimdall-state.json enable flag
-    #        (which never exists in the ephemeral Cloud Run Job container — THE deployed-shape
-    #        gap this fixes: the enable flag was a local-workstation concept).
-    #      • env_enabled() — HEIMDALL_MAINTAINER_ENABLED, a documented operator ENV override.
-    #      • is_enabled(state) — the LOCAL-workstation enable flag (OFF by default): the
-    #        UNATTENDED / scheduled path keeps this safety gate, so the loop NEVER auto-runs
-    #        on an unconfigured repo (the safety property is preserved).
-    if not (explicit or env_enabled() or is_enabled(state)):
-        return {
-            "cycles": 0,
-            "stop": STOP_DISABLED,
-            "tally": tally,
-            "last": None,
-            "budget": budget,
-            "results": [],
-            "note": ("maintainer is not enabled (.maintainer.enabled != true, no --explicit "
-                     "rr-task authorization, no HEIMDALL_MAINTAINER_ENABLED)"),
-        }
 
     def emit(next_action, stop_reason):
         """Append one checkpoint block reflecting the current position."""
@@ -1007,7 +1293,13 @@ def plan(repo, base="HEAD", cfg=None, cap_override=None, context_file=None,
     auto-detected shipped capsule), the plan surfaces a `context` block showing the
     read-only briefing that WOULD be prepended to each fix prompt. When no capsule is
     present the output is byte-identical to before (no `context` key)."""
-    repo = os.path.abspath(repo)
+    # Read-only: resolve an existing local checkout unchanged, or (for a bare slug) the
+    # computed workdir path WITHOUT cloning (the plan mutates nothing). A traversing/ill-
+    # formed slug falls back to a plain abspath — plan only READS, it never joins-and-makes.
+    try:
+        repo = resolve_workspace(repo, allow_clone=False)
+    except WorkspaceError:
+        repo = os.path.abspath(repo)
     state = _read_state(repo)
     cap = resolve_cap(state, cap_override)
     budget = budget_state(repo, cap)
@@ -1112,6 +1404,10 @@ def _cli(argv):
                         "sets this for an explicit rr task; unattended runs omit it)")
     args = p.parse_args(argv)
 
+    # `repo` (abspath) backs the LOCAL read-only subcommands (heartbeat/resume-hint/status)
+    # + the checkpoint pdir. `run`/`plan` instead receive the RAW `--repo` arg so
+    # resolve_workspace can distinguish a local checkout PATH from a bare owner/name SLUG
+    # (the cloud shape) — abspath'ing a slug is exactly the bug this fix removes.
     repo = os.path.abspath(args.repo)
     cfg = _load_cfg(args.config)
     pdir = _planning_dir(repo, args.planning_dir)
@@ -1120,13 +1416,13 @@ def _cli(argv):
         # --dry-run makes `run` a read-only preview (incl. the context that WOULD be
         # prepended): print the plan, execute/mutate nothing.
         if args.dry_run:
-            out = plan(repo, base=args.base, cfg=cfg,
+            out = plan(args.repo, base=args.base, cfg=cfg,
                        cap_override=args.budget_tokens, context_file=args.context,
                        context_max_bytes=args.context_max_bytes)
             print(json.dumps(out, indent=2, sort_keys=True))
             return 0
         summary = run(
-            repo, base=args.base, evidence_cmds=args.evidence, cfg=cfg,
+            args.repo, base=args.base, evidence_cmds=args.evidence, cfg=cfg,
             max_cycles=args.max, cap_override=args.budget_tokens,
             max_failures=args.max_failures, planning_dir=args.planning_dir,
             context_file=args.context, context_max_bytes=args.context_max_bytes,
@@ -1147,7 +1443,7 @@ def _cli(argv):
         return 0
 
     if args.subcommand == "plan":
-        out = plan(repo, base=args.base, cfg=cfg, cap_override=args.budget_tokens,
+        out = plan(args.repo, base=args.base, cfg=cfg, cap_override=args.budget_tokens,
                    context_file=args.context,
                    context_max_bytes=args.context_max_bytes)
         print(json.dumps(out, indent=2, sort_keys=True))
