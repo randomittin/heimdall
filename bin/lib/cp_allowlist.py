@@ -130,6 +130,18 @@ class Int:
         return value
 
 
+class Bool:
+    """A STRICT boolean scalar. ONLY Python True/False pass — an int (even 0/1), a string
+    ("true"/"1"/"yes"), or any other type is REFUSED. Strictness is load-bearing: this type
+    backs the `explicit` maintainer-authorization flag, so a truthy-but-untyped value can
+    never coerce its way into authorizing a cycle. Carries no string payload at all."""
+
+    def validate(self, name, value):
+        if not isinstance(value, bool):
+            raise RefusedDispatch("bad_param", "%s must be a boolean" % name)
+        return value
+
+
 class Opt:
     """Marks a DECLARED param as OPTIONAL: absent from the request -> skipped (NOT a
     missing_param refusal); present -> validated by the inner bounded type. Optionality
@@ -277,6 +289,18 @@ _ALLOWLIST = {
             "repo": Str(maxlen=128, pattern=REPO_SLUG_RE),
             "max": Int(lo=1, hi=100),
             "budget_tokens": Opt(Int(lo=1, hi=100_000_000)),
+            # explicit: an OPTIONAL strict-boolean AUTHORIZATION flag. Set ONLY by the gated,
+            # server-side drain (cp_maintainer_runner.drain_team_queue) when a cycle
+            # originates from an EXPLICIT rr task a user signed + submitted — that submission
+            # IS the authorization, so the maintainer runs WITHOUT a local heimdall-state.json
+            # enable flag (which never exists in the ephemeral Cloud Run Job container). It is
+            # NEVER settable from the rr-task TEXT / request body: the public surface only
+            # ENQUEUES task text (a closed-schema, scrubbed DATA record — extra keys dropped),
+            # and the drain builds these params FROM SCRATCH, never copying a task field.
+            # Bool() is strict (True/False only), so a truthy-but-untyped value can't coerce
+            # it on. The extra-key wall still refuses any UNKNOWN param, so this widening does
+            # not open a smuggle channel — it names one more typed, bounded, closed-set scalar.
+            "explicit": Opt(Bool()),
         },
         requires_gate=False,
         isolated=True,

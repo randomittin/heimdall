@@ -331,8 +331,29 @@ def _maintainer(state):
 
 def is_enabled(state):
     """True ONLY when maintainer.enabled is explicitly True. A missing key is OFF —
-    the loop never auto-runs on an unconfigured repo."""
+    the loop never auto-runs on an unconfigured repo. This is the LOCAL-workstation gate
+    for UNATTENDED / scheduled cycles (kept OFF by default); an EXPLICIT rr-task dispatch
+    authorizes independently via the run() `explicit` arg, and an operator via env_enabled()."""
     return _maintainer(state).get("enabled") is True
+
+
+# The operator ENV override: authorizes cycles to run WITHOUT a local heimdall-state.json
+# enable flag. Documented belt-and-suspenders to the per-dispatch `explicit` authorization.
+MAINTAINER_ENABLED_ENV = "HEIMDALL_MAINTAINER_ENABLED"
+_ENABLED_TRUTHY = {"1", "true", "yes", "on"}
+
+
+def env_enabled():
+    """Operator ENV override: HEIMDALL_MAINTAINER_ENABLED set truthy (1/true/yes/on)
+    authorizes cycles to run WITHOUT a local heimdall-state.json enable flag. This is the
+    documented, GLOBAL always-on an operator opts a box into deliberately — the belt-and-
+    suspenders to the PRIMARY per-dispatch `explicit` authorization (which the gated drain
+    sets per rr task). Unset / "" / "0" / "false" -> off (the loop keeps the OFF-by-default
+    local-enable gate for unattended cycles — it never auto-runs on an unconfigured repo)."""
+    raw = os.environ.get(MAINTAINER_ENABLED_ENV)
+    if not raw:
+        return False
+    return raw.strip().lower() in _ENABLED_TRUTHY
 
 
 def resolve_cap(state, override=None):
@@ -728,12 +749,20 @@ def _verdict(state_name):
 
 def run(repo, base="HEAD", evidence_cmds=None, cfg=None, max_cycles=0,
         cap_override=None, max_failures=None, planning_dir=None, fix_runner=None,
-        context_file=None, context_max_bytes=DEFAULT_CONTEXT_MAX_BYTES):
+        context_file=None, context_max_bytes=DEFAULT_CONTEXT_MAX_BYTES,
+        explicit=False):
     """Drive the autopilot loop over the honest engine (issue_loop.run_once).
 
     One CYCLE = one budget-gated, approval-gated, backpressured issue_loop.run_once.
     The loop STOPS on the first run-away guard that trips (budget / empty-queue /
     repeated-failure) or pauses when --max is reached (stop=null -> re-armable).
+
+    explicit: the DEPLOYED-SHAPE AUTHORIZATION. When True, the cycle originates from an
+    EXPLICIT rr task a user signed + submitted (the gated drain sets it) — that submission
+    IS the authorization, so the loop runs WITHOUT a local heimdall-state.json enable flag
+    (which never exists in the ephemeral Cloud Run Job container). When False (unattended /
+    scheduled cycles), the loop keeps the OFF-by-default local-enable gate (is_enabled) — it
+    NEVER auto-runs on an unconfigured repo (the safety property is preserved).
 
     context_file: the rr LOCAL-SESSION-CONTEXT capsule to PREPEND to each fix cycle's
     prompt (a read-only briefing). When None, the shipped capsule is auto-detected
@@ -766,8 +795,18 @@ def run(repo, base="HEAD", evidence_cmds=None, cfg=None, max_cycles=0,
     fail_streak = 0
     stop = None
 
-    # ── the maintainer must be ENABLED — the loop NEVER auto-runs when off ────
-    if not is_enabled(state):
+    # ── AUTHORIZATION — the maintainer must be authorized before the loop runs. THREE
+    #    independent authorizations (the deployed-shape design):
+    #      • explicit=True — the cycle originates from an EXPLICIT rr task the user signed +
+    #        submitted, which the gated drain dispatched. That submission IS the
+    #        authorization, so the loop runs WITHOUT a local heimdall-state.json enable flag
+    #        (which never exists in the ephemeral Cloud Run Job container — THE deployed-shape
+    #        gap this fixes: the enable flag was a local-workstation concept).
+    #      • env_enabled() — HEIMDALL_MAINTAINER_ENABLED, a documented operator ENV override.
+    #      • is_enabled(state) — the LOCAL-workstation enable flag (OFF by default): the
+    #        UNATTENDED / scheduled path keeps this safety gate, so the loop NEVER auto-runs
+    #        on an unconfigured repo (the safety property is preserved).
+    if not (explicit or env_enabled() or is_enabled(state)):
         return {
             "cycles": 0,
             "stop": STOP_DISABLED,
@@ -775,7 +814,8 @@ def run(repo, base="HEAD", evidence_cmds=None, cfg=None, max_cycles=0,
             "last": None,
             "budget": budget,
             "results": [],
-            "note": "maintainer is not enabled (.maintainer.enabled != true)",
+            "note": ("maintainer is not enabled (.maintainer.enabled != true, no --explicit "
+                     "rr-task authorization, no HEIMDALL_MAINTAINER_ENABLED)"),
         }
 
     def emit(next_action, stop_reason):
@@ -1006,6 +1046,12 @@ def _cli(argv):
                         % DEFAULT_CONTEXT_MAX_BYTES)
     p.add_argument("--dry-run", dest="dry_run", action="store_true",
                    help="on run: print the plan (incl. context) and execute nothing")
+    # AUTHORIZATION: the gated drain passes --explicit for a cycle from a signed rr task, so
+    # the loop runs WITHOUT a local heimdall-state.json enable flag (absent in the ephemeral
+    # job container). Unattended/scheduled runs OMIT it and keep the OFF-by-default gate.
+    p.add_argument("--explicit", dest="explicit", action="store_true",
+                   help="authorize this cycle WITHOUT a local enable flag (the gated drain "
+                        "sets this for an explicit rr task; unattended runs omit it)")
     args = p.parse_args(argv)
 
     repo = os.path.abspath(args.repo)
@@ -1026,6 +1072,7 @@ def _cli(argv):
             max_cycles=args.max, cap_override=args.budget_tokens,
             max_failures=args.max_failures, planning_dir=args.planning_dir,
             context_file=args.context, context_max_bytes=args.context_max_bytes,
+            explicit=args.explicit,
         )
         print(json.dumps(summary, indent=2, sort_keys=True))
         t = summary.get("tally") or {}
