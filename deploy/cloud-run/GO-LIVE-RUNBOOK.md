@@ -586,6 +586,58 @@ The gated `heimdall-control-plane`, its `heimdall-cp-run` SA, `cp-pki-key`, and 
 
 ---
 
+## 10. Ops hardening — alerting + Firestore lifecycle (post-go-live)
+
+Closes prod-readiness-audit-2026-07-06 **§3d (no alerting — a dead task pages nobody)**
+and **§4 (no TTL, PITR disabled, no backup — a bad write is unrecoverable)**. One
+idempotent operator does the whole thing:
+
+```bash
+# REVIEW the plan (zero mutating gcloud, no auth/spend — prints every command):
+bash deploy/cloud-run/setup-ops-hardening.sh --dry-run
+
+# APPLY (under your own authenticated gcloud shell; safe to re-run — each step guards first):
+bash deploy/cloud-run/setup-ops-hardening.sh
+```
+
+**What it provisions (all idempotent — an existing resource is reused/updated, never duplicated):**
+
+| # | Resource | What it catches / does |
+| --- | --- | --- |
+| §3 | log-based metric `heimdall_task_dead` | a task hit the dead-letter bucket — matches the maintainer line `… -> dead(attempts=N)` and the `cp_boot` drain line `… dead=N` (N≥1; `dead=0` never fires) |
+| §3 | log-based metric `heimdall_tick_error` | `cp_boot: tick error` / `drain…ERROR` / `REFUSED reason=` — a silent clock or a refused dispatch |
+| §3 | alert policy ×3 | one per metric **+** one on maintainer-**job** failures (`run.googleapis.com/job/completed_execution_count`, `result="failed"`), each **threshold > 0 over a 5-min window** |
+| §3 | email notification channel | `rj@superpe.co`, created-if-absent, wired into every policy |
+| §5 | Firestore **TTL** on `ttl_at` @ `heimdall_cp` | auto-expires the ephemeral doc families only |
+| §5 | Firestore **PITR** | `databases update --enable-pitr` (7-day recovery window) |
+| §5 | Firestore **daily backup** | `backups schedules create --recurrence=daily --retention=7d` |
+
+**The TTL field-shape (the honest limitation, and why it is safe).** `heimdall_cp` is a
+**single flat collection** — jobs, approvals, presence, audit, nonce and ratelimit docs all
+live in it. A Firestore TTL policy expires a doc only when a **named field holds a Timestamp
+in the past**, so the discriminator is the field's **presence**, not the collection. The
+existing per-record `ts` is a nested **float** (a plain number Firestore TTL ignores), so
+`cp_state_firestore.put_record` now writes a dedicated **top-level `ttl_at` Timestamp** — but
+**only** for the two ephemeral, safe-to-expire roots (`_TTL_ELIGIBLE_ROOTS = {nonce,
+ratelimit}`; a seen-nonce is dead weight past its freshness window, a rate bucket past its
+window). **Durable docs (jobs / approvals / audit / teamq) never get `ttl_at`, so the one TTL
+policy never touches them.** Horizon is 24h by default
+(`HEIMDALL_FIRESTORE_TTL_HORIZON_SECONDS`), well past every window; Firestore reaps within
+~24–72h of `ttl_at` (best-effort). Writing `ttl_at` is best-effort metadata — if a backend
+cannot store a Timestamp the write retries without it and the record still persists
+(durability is never traded for TTL). The **jobs `done` bucket / unbounded `/jobs` log growth**
+(§4) is **NOT** covered here — those docs are retained by design (dedup depends on the queue
+`done` bucket) and pruning them needs a code-level cleanup job, out of scope for this operator.
+
+> **Verify (post-apply):** `gcloud logging metrics list --project=heimdall-cp-prod` shows both
+> metrics; `gcloud alpha monitoring policies list --project=heimdall-cp-prod` shows all three;
+> `gcloud firestore fields ttls list --project=heimdall-cp-prod` shows `ttl_at`;
+> `gcloud firestore databases describe --database='(default)' --format='value(pointInTimeRecoveryEnablement)'`
+> is `POINT_IN_TIME_RECOVERY_ENABLED`; `gcloud firestore backups schedules list --database='(default)'`
+> shows a daily schedule. The plan shape is gated by `test/heimdall-ops-hardening.test.sh`.
+
+---
+
 ## Go-live checklist (every box before token distribution)
 
 - [ ] Gated service live on a current-`main` immutable image (README §3–§4).
@@ -599,3 +651,4 @@ The gated `heimdall-control-plane`, its `heimdall-cp-run` SA, `cp-pki-key`, and 
 - [ ] **LIVE:** `POST /dispatch` on public → **404** (Step 7.1).
 - [ ] **LIVE:** unauthenticated `POST /dispatch` on gated → **401/403** at the edge (Step 7.2).
 - [ ] Enroll token + public URL distributed out-of-band (Step 8).
+- [ ] **OPS:** `setup-ops-hardening.sh` applied — 2 log-based metrics + 3 alert policies + email channel, Firestore TTL(`ttl_at`) + PITR + daily 7d backup all live (Step 10).
