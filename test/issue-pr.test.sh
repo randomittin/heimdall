@@ -274,6 +274,31 @@ else
   bad "PR body does not embed the SI-2 record"
 fi
 
+# ── (1b) the viral-loop FOOTER: self-serve CTA + link, honest constraint, NO token ─
+# The bot PR is the ONE surface a drive-by reviewer sees; the footer must turn it into
+# a funnel entrance — a branded line, a self-serve landing link, and the honest human
+# gate — and it must NEVER leak a token (it is STATIC branded text).
+if printf '%s' "$BODY" | grep -qF 'https://runheimdall.dev'; then
+  ok "PR body footer carries the self-serve onboarding link (runheimdall.dev)"
+else
+  bad "PR body footer missing the runheimdall.dev onboarding link — the viral CTA"
+fi
+if printf '%s' "$BODY" | grep -qiF 'want this bot on your repos'; then
+  ok "PR body footer carries the 'want this bot on your repos?' self-serve CTA"
+else
+  bad "PR body footer missing the self-serve CTA line"
+fi
+if printf '%s' "$BODY" | grep -qiE 'never merges|a human reviews and merges'; then
+  ok "PR body footer states the honest constraint (opens the PR, never merges)"
+else
+  bad "PR body footer missing the never-merges constraint line"
+fi
+if printf '%s' "$BODY" | grep -qiE 'ghp_|github_pat_|sk-ant-|enroll[_-]?token|oauth[_-]?token|X-Heimdall-Enroll'; then
+  bad "PR body leaked a token-shaped secret (the footer must be static branded text)"
+else
+  ok "PR body carries NO token-shaped secret (footer is static branded text only)"
+fi
+
 echo "── (2) open_pr OPENS + STOPS — marks PR_OPEN, never merges/closes/posts ───────"
 if printf '%s' "$OPEN_OUT" | jq -e '.merged == false and .source_closed == false and .resolution_posted == false' >/dev/null 2>&1; then
   ok "open_pr result asserts: not merged, source not closed, resolution not posted"

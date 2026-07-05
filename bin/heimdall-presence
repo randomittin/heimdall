@@ -396,7 +396,22 @@ def _bootstrap_seed():
         "pubkey": pub_b64,
         "handle": os.environ.get("PRES_HANDLE") or None,
     }).encode("utf-8")
-    if not 200 <= _enroll(body, token) < 300:
+    status = _enroll(body, token)
+    if not 200 <= status < 300:
+        # LOUD on a REFUSED *CONFIGURED* enroll, mute otherwise. A 4xx means a reachable
+        # server ACTIVELY REFUSED this enroll — but that is only a CREDENTIAL error worth
+        # surfacing when the dev actually configured a token (a wrong/expired/revoked
+        # enroll_token). A wrong token must NOT look like success, so name it ONCE on
+        # stderr (the throttle stamp keeps it to one line per window). Everything else
+        # stays MUTE: a tokenless zero-config beat merely probing the shipped DEFAULT
+        # endpoint (no token, no expressed intent) gets a 4xx as a matter of course —
+        # that is the beat's silent-no-op contract, not a credential error — and a
+        # transport failure (status 0 == offline/DNS/TLS) or a 5xx (transient server
+        # fault) are never credential errors either.
+        if token and 400 <= status < 500:
+            sys.stderr.write(
+                "heimdall enroll refused (%d): check the enroll token / endpoint\n"
+                % status)
         return ""   # enroll refused/offline -> no seed (the stamp throttles the retry).
     # Persist the seed 0600 (created restrictively; never world/group-readable).
     try:

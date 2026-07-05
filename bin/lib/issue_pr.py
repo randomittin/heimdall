@@ -71,6 +71,12 @@ import issue_queue  # piece (b); sibling on sys.path
 # the queue machine-state this piece marks on a gate-PASS issue (dossier §4/§6).
 PR_OPEN = "PR_OPEN"
 
+# The self-serve landing surface for the PR-body footer (the viral-loop entrance).
+# The CP maintainer opens PRs through build_pr_body, so this footer is the ONE
+# surface a drive-by reviewer sees — it turns every bot PR into a funnel entrance.
+# The canonical Heimdall domain (README + share card); NOT a secret, NEVER a token.
+HEIMDALL_LANDING_URL = "https://runheimdall.dev"
+
 
 class HumanGateError(Exception):
     """Raised when a caller tries to drive a state transition the human-approval
@@ -213,6 +219,23 @@ def _render_risk(record):
     return "\n".join(lines)
 
 
+def _render_footer():
+    """The branded self-serve footer (the viral-loop CTA) — the ONE surface a
+    drive-by PR reviewer sees. Three lines, no emoji, engineer-credible: what
+    Heimdall is, the self-serve CTA + landing link, and the honest human-gate
+    constraint (opens the PR, never merges). STATIC branded text — it carries NO
+    token/secret, EVER. Pure function — no IO."""
+    return "\n".join([
+        "---",
+        "",
+        "**Heimdall** opens proven-fix PRs from your issue queue — every PR ships "
+        "the runnable evidence that the fix passes.",
+        "Want this bot on your repos? → %s" % HEIMDALL_LANDING_URL,
+        "Heimdall opens the PR and stops — it never merges; a human reviews and "
+        "merges.",
+    ])
+
+
 def build_pr_body(issue, record):
     """Build the full PR body markdown from the issue + the SI-2 record. The body
     carries EVERY SI-2 field a human needs to approve a PROVEN fix: what it
@@ -248,6 +271,8 @@ def build_pr_body(issue, record):
         "```json",
         json.dumps(record, indent=2, sort_keys=True),
         "```",
+        "",
+        _render_footer(),
     ]
     return "\n".join(sections)
 

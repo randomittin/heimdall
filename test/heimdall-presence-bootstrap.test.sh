@@ -357,6 +357,35 @@ EOF
   else
     bad "T2 the throttle did not hold (count $FAIL_N1->$FAIL_N2, stamp mtime $MT1->$MT2)"
   fi
+
+  # ── R. REFUSED ENROLL IS LOUD: a wrong/expired token (a 4xx from a REACHABLE server)
+  #    prints ONE stderr line naming the refusal AND still exits 0. A wrong token must
+  #    NOT look like success. (Offline / no-config stays MUTE — proven in F; a 5xx stays
+  #    mute — proven in T; this proves the deliberate REFUSAL is surfaced.)
+  echo
+  echo "R. a REFUSED enroll (wrong token -> 401) prints ONE loud stderr line + exits 0"
+  REF_LOG="$WORK/refused.log"; : > "$REF_LOG"
+  URL_REF="$(launch_mock "$REF_LOG" "right-token-xyz" "")"   # server requires 'right-token-xyz'
+  HOME_REF="$WORK/home_ref"; mkdir -p "$HOME_REF/.heimdall"
+  cat > "$HOME_REF/.heimdall/cp-endpoint.json" <<EOF
+{"url":"$URL_REF","enroll_token":"wrong-token-abc"}
+EOF
+  run_in "$HOME_REF" beat 2>"$WORK/refused_beat.err"; REF_EX="$?"
+  REF_SEED="$(ls "$HOME_REF/.heimdall/pki/"*.seed 2>/dev/null | head -1 || true)"
+  if [ "$REF_EX" = "0" ] && grep -qi "enroll refused (401)" "$WORK/refused_beat.err"; then
+    ok "R1 a 401-refused enroll printed a loud 'enroll refused (401)' line AND exited 0"
+  else
+    bad "R1 refused enroll was not loud (exit=$REF_EX); stderr:"; sed 's/^/    /' "$WORK/refused_beat.err" >&2
+  fi
+  if [ -z "$REF_SEED" ]; then
+    ok "R2 a refused enroll persisted NO seed (a wrong token does NOT look like success)"
+  else
+    bad "R2 a refused enroll WRONGLY persisted a seed ($REF_SEED)"
+  fi
+  REF_LINES="$(grep -c 'enroll refused' "$WORK/refused_beat.err" 2>/dev/null || echo 0)"
+  [ "$REF_LINES" = "1" ] \
+    && ok "R3 the refusal is named EXACTLY once (one line, not a per-render spew — throttle holds)" \
+    || bad "R3 expected exactly one 'enroll refused' line, got $REF_LINES"
 else
   echo "A-E SKIPPED: no Ed25519 backend (cryptography/pynacl) — bootstrap keygen unavailable here."
 fi

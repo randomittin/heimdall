@@ -225,6 +225,111 @@ else
   bad "--mode control-plane did not override the vm config: $cp_over"
 fi
 
+# ── (10) rr status <task-id> in CONTROL-PLANE mode — the actionable per-task read ─
+# CP mode has no VM/SSH log to tail; the CP queue is not publicly readable, so `rr
+# status` prints the ACTIONABLE fallback: the task id, the gh command that shows the
+# PR the drain opens, the drain-cycle explanation, and the `rr connect` stranded-team
+# fix. It must NEVER print the VM ssh log path (that is the VM-mode surface).
+st_out="$("$RR" status task-abc123 --mode control-plane --repo acme/widget --dry-run 2>&1 | strip_ansi)"
+echo "$st_out" | grep -q "task id: task-abc123" \
+  && ok "10.1 rr status <id> (cp) echoes the task id" \
+  || bad "10.1 status cp missing the task id: $st_out"
+echo "$st_out" | grep -q "gh pr list --repo acme/widget" \
+  && ok "10.2 rr status (cp) prints the gh pr list watch command for the repo" \
+  || bad "10.2 status cp missing the gh pr list watch command: $st_out"
+echo "$st_out" | grep -qi "drain cycle" \
+  && ok "10.3 rr status (cp) explains the drain cycle (where/why the PR appears)" \
+  || bad "10.3 status cp missing the drain-cycle explanation: $st_out"
+echo "$st_out" | grep -q "rr connect" \
+  && ok "10.4 rr status (cp) names \`rr connect\` as the stranded-team fix" \
+  || bad "10.4 status cp missing the rr connect hint: $st_out"
+if echo "$st_out" | grep -q "gcloud compute ssh"; then
+  bad "10.5 status cp leaked the VM ssh log path (VM surface bled into cp mode)"
+else
+  ok "10.5 rr status (cp) never prints the VM ssh log path"
+fi
+
+# ── (11) SAME-TEXT DEDUP NOTICE — a round-trip over a mock CP (crypto-gated) ──────
+# The server reports `added:false` for an idempotent no-op (the identical scrubbed
+# text is already queued/in-flight/done). dispatch_cp must SAY SO — a stranger re-
+# running the same task (seeing no PR yet) must not mistake a dedup for a fresh
+# submit. A fresh enqueue (added:true) must print NO such notice.
+LIB_DIR="$ROOT/bin/lib"
+CRYPTO="$("$PY" -c "import sys;sys.path.insert(0,'$LIB_DIR');import cp_auth;print('1' if cp_auth.crypto_available() else '0')" 2>/dev/null || echo 0)"
+: > "$WORK/rrmock.pids"   # collect mock pids in a FILE (subshell-safe: a var set
+RRPORT_SEQ=0             # inside the $(...) launch would never reach the parent)
+launch_rrtask_mock() {   # $1 = "true"|"false" the server's `added`; echoes the base URL.
+  RRPORT_SEQ=$((RRPORT_SEQ+1)); local pf="$WORK/rrport.$RRPORT_SEQ.txt"; : >"$pf"
+  MOCK_ADDED="$1" "$PY" - "$pf" >/dev/null 2>>"$WORK/rrmock.err" <<'PYEOF' &
+import json, os, sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+added = os.environ["MOCK_ADDED"] == "true"
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        self.rfile.read(n)
+        body = json.dumps({"enqueued": True, "id": "task-xyz",
+                           "added": added, "team_id": "team-x"}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+srv = HTTPServer(("127.0.0.1", 0), H)
+with open(sys.argv[1], "w") as fh:
+    fh.write(str(srv.server_address[1]))
+srv.serve_forever()
+PYEOF
+  local pid=$!; echo "$pid" >> "$WORK/rrmock.pids"; local p=""
+  for _ in $(seq 1 50); do
+    p="$(sed -n '1p' "$pf" 2>/dev/null || true)"; [ -n "$p" ] && break
+    kill -0 "$pid" >/dev/null 2>&1 || break
+    "$PY" -c "import time;time.sleep(0.1)"
+  done
+  [ -n "$p" ] || { echo "FATAL: rr-task mock never bound a port" >&2; return 1; }
+  printf 'http://127.0.0.1:%s\n' "$p"
+}
+
+if [ "$CRYPTO" = 1 ]; then
+  # plant a REAL 0600 signing seed for HMD_HAID so cp_client_py can sign (the mock does
+  # not verify the signature — it only proves the client parses `added` + surfaces it).
+  SLUG="$(printf '%s' "$HMD_HAID" | tr '/:' '__')"
+  mkdir -p "$HOME/.heimdall/pki"
+  SEED_DEST="$HOME/.heimdall/pki/$SLUG.seed" "$PY" - <<PYEOF
+import os, sys
+sys.path.insert(0, "$LIB_DIR")
+import cp_auth
+priv, _ = cp_auth.generate_keypair()
+p = os.environ["SEED_DEST"]
+fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+os.write(fd, priv.encode("ascii")); os.close(fd)
+PYEOF
+
+  URL_D="$(launch_rrtask_mock false)"
+  dd_out="$(RR_NO_CONTEXT=1 HEIMDALL_CP_URL="$URL_D" "$RR" "dup task text" \
+            --mode control-plane --repo acme/widget 2>&1 | strip_ansi)"
+  echo "$dd_out" | grep -qi "identical task already processed" \
+    && ok "11.1 a dedup no-op (added:false) prints the 'already processed — reword' notice" \
+    || bad "11.1 dedup notice missing on added:false: $dd_out"
+
+  URL_F="$(launch_rrtask_mock true)"
+  fr_out="$(RR_NO_CONTEXT=1 HEIMDALL_CP_URL="$URL_F" "$RR" "fresh task text" \
+            --mode control-plane --repo acme/widget 2>&1 | strip_ansi)"
+  if echo "$fr_out" | grep -qi "identical task already processed"; then
+    bad "11.2 a fresh enqueue (added:true) WRONGLY printed the dedup notice: $fr_out"
+  else
+    ok "11.2 a fresh enqueue (added:true) prints NO dedup notice"
+  fi
+  echo "$fr_out" | grep -qi "ENQUEUED to the control plane" \
+    && ok "11.3 a fresh enqueue still reports success (id + server-derived team)" \
+    || bad "11.3 fresh enqueue missing the success line: $fr_out"
+
+  while read -r p; do kill "$p" >/dev/null 2>&1 || true; wait "$p" 2>/dev/null || true; done < "$WORK/rrmock.pids"
+else
+  echo "  SKIP (11) dedup-notice round-trip — no crypto backend (cryptography|pynacl)"
+fi
+
 echo
 echo "════════════════════════════════════════════════════════════════════════════"
 printf "rr-cp: \033[32m%d passed\033[0m, " "$PASS"
