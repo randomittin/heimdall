@@ -37,7 +37,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 LOOP="$ROOT/bin/heimdall-maintain-loop"
 CP_CLI="$ROOT/bin/heimdall-control-plane"
-YAML="$HERE/heimdall-maintainer-job.yaml"
+YAML="${HEIMDALL_MAINTAINER_JOB_YAML:-$HERE/heimdall-maintainer-job.yaml}"
 ENVFILE="$HOME/.heimdall/maintainer.env"
 GH_APP_KEY_STORE="$HOME/.heimdall/gh-app-private-key.pem"
 
@@ -64,6 +64,12 @@ warn() { printf '\033[33m! %s\033[0m\n' "$*" >&2; }
 die()  { printf '\033[31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
 # run: in --dry-run print the command (no secrets are ever in argv), else execute.
 run()  { if [ "$DRY" = 1 ]; then printf '  \033[90m$ %s\033[0m\n' "$*"; else "$@"; fi; }
+# show: print a PLAN/ANNOTATION line in --dry-run only; a no-op otherwise. Human-readable
+# annotations like "(|| exists)" belong HERE, never inside an argv handed to `run` — feeding
+# an annotated string to `run` in LIVE mode executed the whole string as ONE command name
+# (`gcloud secrets create ... (|| exists): command not found`, the mksecret break). The real
+# gcloud runs as a separate, clean-argv statement in the non-dry branch below.
+show() { [ "$DRY" = 1 ] && printf '  \033[90m$ %s\033[0m\n' "$*"; return 0; }
 
 [ -n "$REPO" ] || die "missing --repo <owner/repo>"
 printf '%s' "$REPO" | grep -qE '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$' \
@@ -100,6 +106,12 @@ fi
 OAUTH_TOKEN=""; BOT_TOKEN=""
 collect_secrets() {
   [ "$DRY" = 1 ] && { warn "dry-run: skipping token prompts"; return 0; }
+  if [ "$PROMPT_TOKENS" != 1 ]; then
+    # multi-tenant + cloud-only: the shared base Job mounts NO per-team creds (injected at
+    # dispatch), so no token is requested and `claude setup-token` is NEVER invoked here.
+    say "multi-tenant: per-team creds injected at dispatch — legacy secret mint skipped"
+    return 0
+  fi
   say "mint a ~1-year subscription token (a browser will open — only you can consent)"
   claude setup-token || die "claude setup-token failed"
   printf 'Paste the CLAUDE_CODE_OAUTH_TOKEN (sk-ant-oat-...): '; read -rs OAUTH_TOKEN; echo
@@ -178,7 +190,7 @@ arch_a() {
 # ── Arch B: Cloud Run Job ────────────────────────────────────────────────────
 mksecret() { # $1 secret name  $2 token-var-name (value via stdin, never argv)
   local name="$1" var="$2"
-  run "gcloud secrets create $name --replication-policy=automatic --project=$PROJECT  (|| exists)"
+  show "gcloud secrets create $name --replication-policy=automatic --project=$PROJECT  (|| exists)"
   [ "$DRY" = 1 ] && { run "printf '%s' \$$var | gcloud secrets versions add $name --data-file=- --project=$PROJECT"; return 0; }
   gcloud secrets create "$name" --replication-policy=automatic --project="$PROJECT" 2>/dev/null || true
   printf '%s' "${!var}" | gcloud secrets versions add "$name" --data-file=- --project="$PROJECT" >/dev/null
@@ -188,7 +200,7 @@ mksecret() { # $1 secret name  $2 token-var-name (value via stdin, never argv)
 }
 mksecret_file() { # $1 secret name  $2 file path (streamed via --data-file, never argv)
   local name="$1" file="$2"
-  run "gcloud secrets create $name --replication-policy=automatic --project=$PROJECT  (|| exists)"
+  show "gcloud secrets create $name --replication-policy=automatic --project=$PROJECT  (|| exists)"
   [ "$DRY" = 1 ] && { run "gcloud secrets versions add $name --data-file=<App key.pem> --project=$PROJECT"; return 0; }
   gcloud secrets create "$name" --replication-policy=automatic --project="$PROJECT" 2>/dev/null || true
   gcloud secrets versions add "$name" --data-file="$file" --project="$PROJECT" >/dev/null
@@ -198,7 +210,15 @@ mksecret_file() { # $1 secret name  $2 file path (streamed via --data-file, neve
 }
 arch_b() {
   say "Arch B — Cloud Run Job (project=$PROJECT region=$REGION)"
-  mksecret heimdall-cc-oauth-token OAUTH_TOKEN
+  if [ "$MINT_LEGACY" = 1 ]; then
+    mksecret heimdall-cc-oauth-token OAUTH_TOKEN
+    # the static PAT secret is the fallback — created in dry-run (shape) or when a PAT was entered.
+    if [ "$DRY" = 1 ] || [ -n "$BOT_TOKEN" ]; then
+      mksecret heimdall-pr-bot-token   BOT_TOKEN
+    fi
+  else
+    say "multi-tenant: per-team creds injected at dispatch — legacy secret mint skipped"
+  fi
   if [ "$GH_APP" = 1 ]; then
     # RECOMMENDED bot identity — the App private key as a secret; App id + installation id
     # as (non-secret) Job env. The Job mints a fresh 1h installation token per cycle.
@@ -206,10 +226,6 @@ arch_b() {
     say "GitHub App PR-bot (recommended): wire the maintainer Job with —"
     printf '  \033[90m--set-secrets="HEIMDALL_GH_APP_PRIVATE_KEY=%s:latest"\033[0m\n' "$GH_APP_KEY_SECRET"
     printf '  \033[90m--set-env-vars="HEIMDALL_GH_APP_ID=%s,HEIMDALL_GH_APP_INSTALLATION_ID=%s"\033[0m\n' "$GH_APP_ID" "$GH_APP_INSTALL_ID"
-  fi
-  # the static PAT secret is the fallback — created in dry-run (shape) or when a PAT was entered.
-  if [ "$DRY" = 1 ] || [ -n "$BOT_TOKEN" ]; then
-    mksecret heimdall-pr-bot-token   BOT_TOKEN
   fi
   # image toolchain gate: the base long-job image lacks git/gh/claude — refuse a broken deploy
   say "verify the maintainer image carries git + gh + claude"
@@ -219,10 +235,13 @@ arch_b() {
   else
     run "check $YAML image digest is a real @sha256 (not REPLACE_WITH_DIGEST) — else STOP, build the maintainer image first"
   fi
-  run "gcloud run jobs replace $YAML --region=$REGION --project=$PROJECT"
+  show "gcloud run jobs replace $YAML --region=$REGION --project=$PROJECT"
+  [ "$DRY" = 1 ] || gcloud run jobs replace "$YAML" --region="$REGION" --project="$PROJECT"
   # IAM: a least-priv role that can run the job (idempotent)
-  run "gcloud iam roles create heimdallJobRunner --project=$PROJECT --permissions=run.jobs.run  (|| exists)"
-  run "gcloud projects add-iam-policy-binding $PROJECT --member=serviceAccount:${RUNTIME_SA} --role=projects/$PROJECT/roles/heimdallJobRunner"
+  show "gcloud iam roles create heimdallJobRunner --project=$PROJECT --permissions=run.jobs.run  (|| exists)"
+  [ "$DRY" = 1 ] || gcloud iam roles create heimdallJobRunner --project="$PROJECT" --permissions=run.jobs.run >/dev/null 2>&1 || true
+  show "gcloud projects add-iam-policy-binding $PROJECT --member=serviceAccount:${RUNTIME_SA} --role=projects/$PROJECT/roles/heimdallJobRunner"
+  [ "$DRY" = 1 ] || gcloud projects add-iam-policy-binding "$PROJECT" --member="serviceAccount:${RUNTIME_SA}" --role="projects/$PROJECT/roles/heimdallJobRunner" >/dev/null
   say "cloud job '$JOB' deployed. Hybrid tick fires it when your box is down."
   if [ -z "$SCHEDULE" ]; then
     warn "schedule registration (per-minute tick fires run-maintainer-cycle): pass --schedule \"<cron>\" to register it now (heimdall-control-plane schedule-maintainer), or see MAINTAINER-RUNBOOK.md §6."
@@ -251,6 +270,30 @@ register_schedule() {
   fi
   run "$CP_CLI" schedule-maintainer --repo "$REPO" --cron "$SCHEDULE" --max "$MAXN"
 }
+
+# ── legacy single-tenant secret auto-detect ──────────────────────────────────
+# The base Job manifest either MOUNTS the single-tenant secrets (heimdall-cc-oauth-token /
+# heimdall-pr-bot-token via secretKeyRef) — the LEGACY path where the operator mints them —
+# or it does NOT (MULTI-TENANT: the dispatcher injects per-team creds per execution). We only
+# prompt for + mint those legacy secrets when the manifest actually references them. This
+# stops a multi-tenant --cloud deploy from running `claude setup-token` (which prints a live
+# ~1-year token to the terminal) and prompting for creds that the shared Job never mounts.
+LEGACY_MANIFEST=0
+if [ -f "$YAML" ] && grep -qE 'heimdall-cc-oauth-token|heimdall-pr-bot-token' "$YAML"; then
+  LEGACY_MANIFEST=1
+fi
+# arch_b mints the legacy secrets only when the cloud manifest actually mounts them.
+MINT_LEGACY=0
+case "$MODE" in cloud|hybrid) [ "$LEGACY_MANIFEST" = 1 ] && MINT_LEGACY=1 ;; esac
+# collect_secrets prompts when a consumer needs the tokens at deploy time: the Arch-A local
+# runner (local/hybrid) always needs the OAuth token; a GitHub App identity (--gh-app) is an
+# explicit opt-in; and arch_b needs them only when it will mint the legacy cloud secrets. A
+# cloud-only deploy against a multi-tenant manifest needs NO token — nothing is minted here.
+PROMPT_TOKENS=0
+case "$MODE" in
+  local|hybrid) PROMPT_TOKENS=1 ;;
+  cloud) { [ "$MINT_LEGACY" = 1 ] || [ "$GH_APP" = 1 ]; } && PROMPT_TOKENS=1 ;;
+esac
 
 case "$MODE" in
   local)  collect_secrets; arch_a ;;
