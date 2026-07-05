@@ -184,6 +184,44 @@ def _storage_identity_env():
     return pairs
 
 
+# ── CLOUD RUN RESERVED ENV NAMES (the InvalidArgument 400 fix) ─────────────────────
+#
+# THE LIVE INCIDENT (2026-07-05T05:39:44Z, gated service logs). The gated drain builds base_env
+# by overlaying the per-team env onto the SERVICE's baseline env — which, INSIDE a Cloud Run
+# container, includes the PLATFORM's reserved runtime vars (PORT, K_SERVICE, K_REVISION,
+# K_CONFIGURATION, CLOUD_RUN_TIMEOUT_SECONDS — "automatically set by the system"). Cloud Run
+# REFUSES a RunJobRequest whose container env override names ANY reserved var, so run_job 400'd:
+#     InvalidArgument: 400 run_job_request.overrides.container_overrides[0].env: The following
+#     reserved env names were provided: PORT, K_REVISION, CLOUD_RUN_TIMEOUT_SECONDS, K_SERVICE,
+#     K_CONFIGURATION. These values are automatically set by the system.
+# => EVERY dispatch 400'd, dispatch returned dispatched:False, and the durable CP job row stayed
+# `queued` and re-drove into the SAME 400 forever (resume/retry never escapes it).
+#
+# THE FIX. _container_env_pairs FILTERS OUT the reserved names before building the override, so
+# the override never names a var the platform sets itself. The filter is:
+#   • EXACT match: PORT, CLOUD_RUN_TIMEOUT_SECONDS
+#   • PREFIX match: any name starting with "K_" (K_SERVICE / K_REVISION / K_CONFIGURATION and any
+#     FUTURE platform K_ var — the prefix rule is robust to Cloud Run adding more).
+# We deliberately DO NOT over-filter: everything the job legitimately needs (HEIMDALL_*,
+# CLAUDE_CODE_OAUTH_TOKEN, ANTHROPIC_API_KEY, HEIMDALL_PR_BOT_TOKEN, GOOGLE_CLOUD_PROJECT,
+# HEIMDALL_STATE_BACKEND, ...) survives — the strict requirement is only the reserved set. The
+# Cloud Run Job execution INHERITS these platform vars from the system regardless, so dropping
+# them from the override loses nothing; it only stops the 400.
+_RESERVED_ENV_EXACT = frozenset({"PORT", "CLOUD_RUN_TIMEOUT_SECONDS"})
+_RESERVED_ENV_PREFIXES = ("K_",)
+
+
+def _is_reserved_env_name(name):
+    """True if `name` is a Cloud Run reserved runtime env var the platform sets itself — an override
+    naming one 400s the RunJobRequest (the live incident). Reserved == exact {PORT,
+    CLOUD_RUN_TIMEOUT_SECONDS} OR any name with a reserved prefix (K_* — K_SERVICE/K_REVISION/
+    K_CONFIGURATION and any future platform K_ var). Used to strip these from the container env
+    override; the execution still inherits them from the system, so nothing is lost."""
+    if name in _RESERVED_ENV_EXACT:
+        return True
+    return any(name.startswith(pfx) for pfx in _RESERVED_ENV_PREFIXES)
+
+
 def _container_env_pairs(base_env=None):
     """The (name, value) env pairs to apply as a Cloud Run Job execution's PER-EXECUTION container
     env override. This is the MULTI-TENANT credential seam: the gated per-team drain assembles THAT
@@ -196,7 +234,14 @@ def _container_env_pairs(base_env=None):
     WIN their final value. Values are coerced to str; a None value is dropped (never injected blank).
     An empty/None base_env reduces to exactly _storage_identity_env() — the single-tenant behavior is
     byte-unchanged. Built FRESH per call from the caller's base_env, so two teams dispatched through
-    the same runner get two DISTINCT env sets — no cross-tenant leak."""
+    the same runner get two DISTINCT env sets — no cross-tenant leak.
+
+    FINALLY we STRIP the Cloud Run RESERVED env names (_is_reserved_env_name: exact {PORT,
+    CLOUD_RUN_TIMEOUT_SECONDS} + prefix K_) — on the gated image base_env is overlaid onto the
+    service's Cloud-Run baseline env, which carries those platform-set vars, and an override naming
+    ANY of them 400s run_job (InvalidArgument, the 2026-07-05 live incident) so the job re-drives
+    queued forever. The execution inherits the platform vars from the system regardless, so this
+    loses nothing the job needs (the strict requirement); it only stops the 400."""
     merged = {}
     if base_env:
         for name, value in base_env.items():
@@ -206,7 +251,10 @@ def _container_env_pairs(base_env=None):
     # storage-identity OVERRIDES (the write/read-doc fix) — applied last so it wins its own keys.
     for name, value in _storage_identity_env():
         merged[name] = value
-    return list(merged.items())
+    # RESERVED-NAME FILTER (the InvalidArgument 400 fix) — drop any Cloud Run reserved var the
+    # baseline env pulled into base_env, so the override never names a platform-set var (which 400s).
+    return [(name, value) for name, value in merged.items()
+            if not _is_reserved_env_name(name)]
 
 
 class JobRunnerError(RuntimeError):

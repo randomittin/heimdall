@@ -686,6 +686,78 @@ if _accepts_base_env:
     print("PASS D19: base_env=None -> only the storage-identity pin, no team-cred keys "
           "(single-tenant path unchanged)" if d19 else
           "FAIL D19: base_env=None changed the override shape: %r" % env_none)
+
+# ── build 5: CLOUD RUN RESERVED ENV NAMES ARE FILTERED (the InvalidArgument 400 fix) ────────
+#    THE LIVE INCIDENT (2026-07-05T05:39:44Z, gated service logs): dispatch built base_env by
+#    overlaying the per-team env onto the SERVICE's baseline env — which on Cloud Run includes the
+#    platform's RESERVED runtime vars (PORT, K_SERVICE, K_REVISION, K_CONFIGURATION,
+#    CLOUD_RUN_TIMEOUT_SECONDS). run_job then 400'd:
+#      InvalidArgument: 400 run_job_request.overrides.container_overrides[0].env: The following
+#      reserved env names were provided: PORT, K_REVISION, CLOUD_RUN_TIMEOUT_SECONDS, K_SERVICE,
+#      K_CONFIGURATION. These values are automatically set by the system.
+#    => every dispatch 400s, the durable CP job row stays queued and re-drives into the same 400
+#    forever. THE FIX: _container_env_pairs FILTERS OUT the reserved names (exact {PORT,
+#    CLOUD_RUN_TIMEOUT_SECONDS} + prefix K_) at the RunJobRequest boundary, so the override never
+#    names a reserved var — WITHOUT over-filtering anything the job legitimately needs.
+#    (storage-identity from build 3 is still set on os.environ: backend=firestore /
+#    project=svc-fs-project / root=svc_root_coll / gcp=svc-gcp-project.)
+RESERVED_BASE_ENV = {
+    # the exact reserved names the live 400 named — must ALL be filtered out of the override.
+    "PORT": "8080",
+    "K_SERVICE": "heimdall-gated",
+    "K_REVISION": "heimdall-gated-00042-abc",
+    "K_CONFIGURATION": "heimdall-gated",
+    "CLOUD_RUN_TIMEOUT_SECONDS": "3600",
+    # a future/unknown K_ platform var — the K_ prefix rule must catch it too (robustness).
+    "K_SOMETHING_NEW": "whatever",
+    # the job's LEGITIMATE env — MUST survive the filter (no over-filtering).
+    "HEIMDALL_X": "job-needs-this",
+    "CLAUDE_CODE_OAUTH_TOKEN": "team_oauth_SECRET_survives",
+    "HEIMDALL_PR_BOT_TOKEN": "ghs_team_minted_survives",
+    "ANTHROPIC_API_KEY": "team_apikey_survives",
+}
+RESERVED_NAMES = ("PORT", "K_SERVICE", "K_REVISION", "K_CONFIGURATION",
+                  "CLOUD_RUN_TIMEOUT_SECONDS", "K_SOMETHING_NEW")
+
+req_res = cp_jobrunner.CloudRunJobRunner().build_request(TEST_JOB_ID, base_env=RESERVED_BASE_ENV)
+env_res = override_env(req_res)
+
+# D20 (THE FIX) — NONE of the Cloud Run reserved names appear in the container env override.
+#      Without the filter, run_job 400s (the live incident) and the job re-drives forever.
+leaked = [n for n in RESERVED_NAMES if n in env_res]
+d20 = (not leaked)
+print("PASS D20: NO reserved env name (PORT/K_SERVICE/K_REVISION/K_CONFIGURATION/"
+      "CLOUD_RUN_TIMEOUT_SECONDS/K_*) survives the override — run_job no longer 400s" if d20 else
+      "FAIL D20: reserved env names LEAKED into the override %r — run_job would 400 "
+      "(InvalidArgument reserved env names) and the job re-drives forever" % leaked)
+
+# D21 (FALSIFIER, no over-filter) — the job's LEGITIMATE env survives: team cred + minted token +
+#      HEIMDALL_X + ANTHROPIC_API_KEY are all still carried, so the filter did not strip what the
+#      execution needs. Without this, a too-broad filter would break the multi-tenant path.
+d21 = (env_res.get("HEIMDALL_X") == "job-needs-this"
+       and env_res.get("CLAUDE_CODE_OAUTH_TOKEN") == "team_oauth_SECRET_survives"
+       and env_res.get("HEIMDALL_PR_BOT_TOKEN") == "ghs_team_minted_survives"
+       and env_res.get("ANTHROPIC_API_KEY") == "team_apikey_survives")
+print("PASS D21 (no over-filter): the team cred + minted token + HEIMDALL_X + ANTHROPIC_API_KEY "
+      "all SURVIVE the reserved-name filter — nothing the job needs was stripped" if d21 else
+      "FAIL D21 (over-filter): the filter stripped a legitimate var: %r" % env_res)
+
+# D22 — the storage-identity pin STILL rides alongside (GOOGLE_CLOUD_PROJECT is NOT a reserved
+#       name and must survive — the write/read-doc fix is intact). GOOGLE_CLOUD_PROJECT was set to
+#       svc-gcp-project by build 3 and comes via the storage-identity overlay.
+d22 = (env_res.get("HEIMDALL_STATE_BACKEND") == "firestore"
+       and env_res.get("GOOGLE_CLOUD_PROJECT") == "svc-gcp-project"
+       and env_res.get("HEIMDALL_FIRESTORE_ROOT") == "svc_root_coll")
+print("PASS D22: storage-identity (backend/root/GOOGLE_CLOUD_PROJECT) survives the reserved filter "
+      "— GOOGLE_CLOUD_PROJECT is NOT reserved and the doc-path fix is intact" if d22 else
+      "FAIL D22: the reserved filter also stripped storage-identity: %r" % env_res)
+
+# D23 — the args override is UNCHANGED (run-job,<id> still carried) with the reserved filter active.
+args_res = override_args(req_res)
+d23 = (args_res == ["run-job", TEST_JOB_ID])
+print("PASS D23: args override still == ['run-job', '%s'] with the reserved-name filter active"
+      % TEST_JOB_ID if d23 else
+      "FAIL D23: args override changed to %r when the reserved filter was added" % (args_res,))
 PYEOF
 
 # Run the request-shape assertions and map PASS/FAIL/SKIP lines to the test's counters.
