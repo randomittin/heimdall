@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -310,6 +311,48 @@ def build_maintainer_argv(params, *, loop_bin=None):
     return argv
 
 
+# Token-ish patterns scrubbed from any child error text before it is surfaced (result +
+# logs). Covers GitHub tokens (ghs_/ghp_/gho_/github_pat_), Anthropic keys (sk-ant-), and
+# PEM private-key headers (the whole -----BEGIN ...  line). A failed cycle must NAME its
+# cause WITHOUT ever echoing a credential that leaked into the child's stderr.
+_SECRET_SCRUB = re.compile(
+    r"(?:ghs_|ghp_|gho_|github_pat_|sk-ant-)[A-Za-z0-9_-]+"
+    r"|-----BEGIN[^\n]*"
+)
+
+# The error tail is bounded so a runaway child cannot flood the durable result / logs.
+_ERROR_TAIL_MAX = 400
+
+
+def _scrub_secrets(text):
+    """Redact token-ish substrings (GitHub / Anthropic / PEM) from `text`. Never returns a
+    credential — the surfaced cause is safe to persist and log."""
+    return _SECRET_SCRUB.sub("[REDACTED]", text)
+
+
+def _error_tail(proc, summary):
+    """Build a bounded, token-scrubbed cause line from a FAILED child: its stderr (the
+    proximate error), plus the tail of stdout when that stdout was NOT parseable JSON (the
+    live silent-failure shape — a traceback on stdout instead of a summary). Returns None
+    when there is genuinely nothing to report. Truncated to the LAST _ERROR_TAIL_MAX chars
+    (the proximate cause sits at the end of a traceback), '…'-prefixed when clipped."""
+    parts = []
+    err = (proc.stderr or "").strip()
+    if err:
+        parts.append(err)
+    if summary is None:
+        out = (proc.stdout or "").strip()
+        if out:
+            parts.append("stdout: " + out)
+    tail = "\n".join(parts).strip()
+    if not tail:
+        return None
+    tail = _scrub_secrets(tail)
+    if len(tail) > _ERROR_TAIL_MAX:
+        tail = "…" + tail[-_ERROR_TAIL_MAX:]
+    return tail
+
+
 def run_maintainer_cycle(params, ctx):
     """Handle the `run-maintainer-cycle` action: drive the durable maintainer autopilot
     loop (bin/heimdall-maintain-loop) for `max` bounded cycles against `repo`, honoring an
@@ -325,8 +368,11 @@ def run_maintainer_cycle(params, ctx):
 
     Returns the loop's structured result (its JSON summary: cycles, stop, tally incl. PRs
     opened, budget) plus the SAFE dispatch metadata (the argv — token-free — the selected
-    auth var NAME, and the exit code). Token-free by construction: only the auth var NAME
-    (not its value) is ever surfaced."""
+    auth var NAME, and the exit code). The parsed stdout summary attaches EVEN on a nonzero
+    exit. On a FAILED cycle a bounded, token-SCRUBBED `error_tail` (the child's stderr + any
+    non-JSON stdout tail) NAMES the cause in the durable result AND is printed to the job's
+    stderr for `gcloud logging read`. Token-free by construction: only the auth var NAME
+    (not its value) is ever surfaced, and error text is scrubbed of token-ish patterns."""
     argv = build_maintainer_argv(params)
     src = ctx.source_env()
 
@@ -386,6 +432,20 @@ def run_maintainer_cycle(params, ctx):
     }
     if parse_error:
         result["parse_error"] = parse_error
+
+    # A FAILED cycle (nonzero exit, or a child that printed no parseable summary) must NAME
+    # its cause — the silent-failure pattern (exit_code:1, summary:null, NO error text) is
+    # what made a broken cloud cycle undiagnosable. Surface the child's scrubbed stderr (+
+    # non-JSON stdout tail) in BOTH the durable result (result.error_tail) AND the job's own
+    # stderr, so `gcloud logging read` shows the cause. Token-ish patterns are scrubbed first.
+    if proc.returncode != 0 or summary is None:
+        tail = _error_tail(proc, summary)
+        if tail:
+            result["error_tail"] = tail
+            sys.stderr.write(
+                "run-maintainer-cycle FAILED (repo=%s exit=%s): %s\n"
+                % (params["repo"], proc.returncode, tail)
+            )
     return result
 
 

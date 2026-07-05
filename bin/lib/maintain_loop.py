@@ -372,12 +372,23 @@ def resolve_cap(state, override=None):
 
 def measure_tokens(repo):
     """Read the REAL session token usage from bin/heimdall-tokens (the authoritative
-    meter). Returns (used_tokens, cost_usd, ok).
+    meter). Returns (used_tokens, cost_usd, status).
 
-    ok is False whenever the meter is UNAVAILABLE for ANY reason — the binary is
-    missing, the call fails, the output is unparseable, or the record carries an
-    `error` (a degraded read). An ok=False read is treated by the caller as
-    NEAR-CAP -> STOP: the loop NEVER runs blind on tokens (the honesty rule)."""
+    status is one of:
+      • "ok"         — a TRUSTWORTHY reading: a well-formed record with a numeric
+                       total_tokens and no degrading error. used_tokens is exact.
+      • "empty"      — the meter RAN CLEANLY and truthfully reports ZERO accumulated
+                       usage: a FRESH / no-data HEIMDALL_HOME. heimdall-tokens emits a
+                       well-formed record with total_tokens==0 (and turns==0) plus a
+                       benign "no session dir" marker because this home has no transcript
+                       history YET. This is a DEPLOYED-SHAPE truth (the ephemeral Cloud
+                       Run Job container starts at /app/state, always empty), NOT a broken
+                       meter. used_tokens is 0.
+      • "unreadable" — the meter is GENUINELY unavailable: the binary is missing, the call
+                       errors, the output is unparseable, the record is degraded (an error
+                       with no exact-zero usage), or total_tokens is non-numeric. The caller
+                       treats this as NEAR-CAP -> STOP once ANY usage has been recorded this
+                       run (never run blind on tokens — the honesty rule)."""
     meter = _tokens_bin()
     cwd = os.environ.get("HEIMDALL_TOKENS_CWD") or repo
     try:
@@ -388,41 +399,74 @@ def measure_tokens(repo):
             text=True,
         )
     except OSError:
-        return (None, None, False)  # binary missing / not executable -> near-cap
+        return (None, None, "unreadable")  # binary missing / not executable
     if proc.returncode != 0:
-        return (None, None, False)  # a usage error (bad flags) -> near-cap
+        return (None, None, "unreadable")  # a usage error (bad flags)
     try:
         rec = json.loads(proc.stdout)
     except (ValueError, TypeError):
-        return (None, None, False)
-    if not isinstance(rec, dict) or rec.get("error"):
-        return (None, None, False)  # degraded record -> treat as unreadable
+        return (None, None, "unreadable")
+    if not isinstance(rec, dict):
+        return (None, None, "unreadable")
     used = rec.get("total_tokens")
     if not isinstance(used, (int, float)):
-        return (None, None, False)
+        return (None, None, "unreadable")  # no numeric usage -> can't measure
     cost = rec.get("total_cost_usd")
     cost = cost if isinstance(cost, (int, float)) else None
-    return (int(used), cost, True)
+    if rec.get("error"):
+        # A record that carries an error BUT still reports an EXACT zero usage with no
+        # turns is the FRESH / no-data shape ("no session dir for cwd slug ...") — a
+        # TRUTHFUL zero, distinct from a corrupt/degraded read. Any other error (or a
+        # nonzero token count alongside an error) is degraded -> unreadable.
+        turns = rec.get("turns")
+        if used == 0 and (turns == 0 or turns is None):
+            return (0, cost, "empty")
+        return (None, None, "unreadable")
+    return (int(used), cost, "ok")
 
 
-def budget_state(repo, cap):
-    """The budget snapshot for a cycle: {cap_tokens, used, cost_usd_est, over}.
-    over is True when used >= cap OR the meter is unreadable (fail-safe STOP)."""
-    used, cost, ok = measure_tokens(repo)
-    if not ok:
+def budget_state(repo, cap, usage_recorded=True):
+    """The budget snapshot for a cycle: {cap_tokens, used, cost_usd_est, over, meter}.
+    over is True when used >= cap OR the meter can't be trusted to prove we're under it.
+
+    DEPLOYED-SHAPE rationale: the fail-CLOSED rule ("an unreadable meter -> STOP, never run
+    blind") was written for a PERSISTENT workstation, where an unreadable meter means the
+    meter broke mid-HISTORY. The ephemeral Cloud Run Job container instead starts with a
+    FRESH HEIMDALL_HOME (/app/state, always empty), so at loop START the meter truthfully
+    reports ZERO accumulated usage ("empty"). Treating that as a broken meter STOPPED the
+    loop before any cycle — the cloud maintainer could NEVER execute. So:
+      • "ok"     -> normal: over = used >= cap.
+      • "empty" AND no usage recorded yet this run -> used=0, NOT over: start metering from
+        zero and enforce the cap as usage accrues per cycle (the fresh-home case). The
+        ephemeral job's own per-cycle accounting makes later reads real usage.
+      • "unreadable", OR an "empty"/unavailable read AFTER usage was already recorded this
+        run -> FAIL-CLOSED (over=True): the meter genuinely broke / vanished mid-run and we
+        must never run blind. usage_recorded defaults True so read-only callers (plan /
+        status) keep the conservative fail-closed reading unchanged."""
+    used, cost, status = measure_tokens(repo)
+    if status == "ok":
         return {
             "cap_tokens": cap,
-            "used": None,
-            "cost_usd_est": None,
-            "over": True,
-            "meter": "unavailable",
+            "used": used,
+            "cost_usd_est": cost,
+            "over": used >= cap,
+            "meter": "ok",
         }
+    if status == "empty" and not usage_recorded:
+        return {
+            "cap_tokens": cap,
+            "used": 0,
+            "cost_usd_est": cost,
+            "over": False,
+            "meter": "fresh",
+        }
+    # "unreadable", or an unavailable/empty read AFTER usage was recorded -> fail-closed.
     return {
         "cap_tokens": cap,
-        "used": used,
-        "cost_usd_est": cost,
-        "over": used >= cap,
-        "meter": "ok",
+        "used": None,
+        "cost_usd_est": None,
+        "over": True,
+        "meter": "unavailable",
     }
 
 
@@ -794,6 +838,11 @@ def run(repo, base="HEAD", evidence_cmds=None, cfg=None, max_cycles=0,
     cycle = 0
     fail_streak = 0
     stop = None
+    # DEPLOYED-SHAPE: a fresh ephemeral home (Cloud Run Job) has NO recorded usage at loop
+    # START, so a fresh/empty meter reads as used=0 (not fail-closed). Once ANY usage is
+    # recorded this run — a completed cycle burned tokens, or the meter reported real usage —
+    # a subsequent unavailable read FAIL-CLOSES (never run blind). See budget_state().
+    usage_recorded = False
 
     # ── AUTHORIZATION — the maintainer must be authorized before the loop runs. THREE
     #    independent authorizations (the deployed-shape design):
@@ -828,13 +877,19 @@ def run(repo, base="HEAD", evidence_cmds=None, cfg=None, max_cycles=0,
 
     while True:
         # ── BUDGET gate (before ANY work — the can't-burn-tokens guarantee) ───
-        budget = budget_state(repo, cap)
+        budget = budget_state(repo, cap, usage_recorded=usage_recorded)
         if budget["over"]:
             stop = STOP_BUDGET
             reason = ("budget cap %d reached (used %s)"
                       % (cap, budget.get("used")))
             emit("stopped: " + reason, stop)
             break
+        # a readable meter reporting REAL usage means usage IS on record now -> a later
+        # unavailable read must fail-close (never run blind on a meter that broke mid-run).
+        if (budget.get("meter") == "ok"
+                and isinstance(budget.get("used"), (int, float))
+                and budget["used"] > 0):
+            usage_recorded = True
 
         # ── peek the queue (read-only) — empty pickable set -> STOP ───────────
         queued = _peek_queued(repo, cfg)
@@ -883,6 +938,9 @@ def run(repo, base="HEAD", evidence_cmds=None, cfg=None, max_cycles=0,
             break
 
         cycle += 1
+        # a completed cycle burned tokens -> usage is recorded from here on (a subsequent
+        # unavailable meter read now fail-closes instead of re-reading as a fresh zero).
+        usage_recorded = True
         pr = None
         if st == issue_loop.PR_OPEN:
             tally["fixed"] += 1
