@@ -218,7 +218,25 @@ class RateLimiter:
             # store is tolerant (put_record -> False on error) and we never lock out a dev.
             self._backend.put_record(rel, {_FIELD_COUNT: count + 1})
             return (True, 0)
-        except Exception:  # noqa: BLE001 — FAIL-OPEN: a transient backend error never refuses.
+        except Exception as exc:  # noqa: BLE001 — FAIL-OPEN: a backend error never refuses.
+            # DECISION (F6, 2026-07-06 audit): we deliberately fail OPEN, not closed. The tradeoff
+            # is availability > abuse-cap: locking out a legit dev on a transient store hiccup is
+            # worse than a temporarily-unenforced cap, because the abuse gate is NOT the auth gate
+            # (the PKI chokepoint + the enroll token are the real security boundaries, unaffected by
+            # a store outage) and the deployment-wide enroll-budget ceiling is the backstop that
+            # still bounds registry growth in the worst case. But the fail-open must be OBSERVABLE:
+            # emit ONE loud stderr line so an outage window in which the caps are NOT enforced is
+            # visible in the logs. Token-free by construction — we log only the caller-controlled
+            # `scope` + the exception TYPE, never the raw key (which may be an IP / bootstrap-token
+            # value / haid). Guarded so a logging error can NEVER defeat the fail-open return.
+            try:
+                sys.stderr.write(
+                    "cp_ratelimit: FAIL-OPEN abuse-cap on backend error (scope=%s type=%s) — "
+                    "rate cap not enforced this call; enroll-budget ceiling is the backstop\n"
+                    % (_scope_slug(scope), type(exc).__name__))
+                sys.stderr.flush()
+            except Exception:  # noqa: BLE001 — diagnostic only; must not defeat the fail-open return.
+                return (True, 0)
             return (True, 0)
 
     def enroll_budget_ok(self, now=None, *, max_new, window):

@@ -255,11 +255,13 @@ def _log(msg):
 # A token-ish shape scrubber for a diagnostic detail before it reaches a LOG line. The
 # GhInstallError detail is ALREADY token-free by the minter contract (the minter prints ONLY
 # the token to stdout; the note is trimmed stderr) — this is belt-and-suspenders: even if a
-# future minter regression leaked a GitHub token / PEM header into stderr, it never reaches
-# the Cloud Run log. Matches GitHub token prefixes (ghs_/ghp_/gho_/ghu_/ghr_ + fine-grained
-# github_pat_) and a PEM BEGIN header.
+# future minter regression leaked a GitHub token / Anthropic key / PEM header into stderr, it
+# never reaches the Cloud Run log. Matches GitHub token prefixes (ghs_/ghp_/gho_/ghu_/ghr_ +
+# fine-grained github_pat_), Anthropic keys (sk-ant- — parity with the sibling
+# cp_handlers._SECRET_SCRUB, F5 of the 2026-07-06 audit), and a PEM BEGIN header.
 _TOKENISH_RX = re.compile(
-    r"(gh[oprsu]_[A-Za-z0-9]{6,}|github_pat_[A-Za-z0-9_]{6,}|-----BEGIN[^\n]*)")
+    r"(gh[oprsu]_[A-Za-z0-9]{6,}|github_pat_[A-Za-z0-9_]{6,}"
+    r"|sk-ant-[A-Za-z0-9_-]+|-----BEGIN[^\n]*)")
 
 # The hard cap on a logged detail (~200 chars keeps ONE scannable log line).
 _DETAIL_MAX_CHARS = 200
