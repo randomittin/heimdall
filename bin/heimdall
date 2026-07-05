@@ -42,6 +42,14 @@ SETUP_MARKER_LEGACY="$PLUGIN_DIR/.setup-done"
 _write_setup_marker() {
   mkdir -p "$HEIMDALL_HOME_DIR" 2>/dev/null || true
   touch "$SETUP_MARKER" 2>/dev/null || true
+  # Also drop a best-effort marker at the legacy install-dir location. This is a
+  # NON-authoritative convenience copy: idempotency + cold/warm detection key off
+  # $SETUP_MARKER in the user home (above), NEVER off this one. On a root-owned /
+  # read-only install tree the write silently no-ops (the live-VM bug can't recur —
+  # setup state no longer DEPENDS on a writable install dir). It only keeps a
+  # consumer that still probes the pre-migration path in sync with a completed
+  # install; a failure here never aborts or re-triggers setup.
+  touch "$SETUP_MARKER_LEGACY" 2>/dev/null || true
 }
 
 # MIGRATE a pre-existing legacy marker to the user home so an ALREADY-set-up
@@ -613,19 +621,7 @@ first_run_setup() {
     echo "  + claude-mem (persistent memory across sessions)"
     local _cm_t0; _cm_t0="$(_tele_now_ms)"
     _tele_install_step companion:claude-mem started
-    # PRECONDITION GATE (headless-safe, the live-VM fix): claude-mem's `install` is
-    # an INTERACTIVE multi-prompt wizard (email → IDE → runtime → provider → model)
-    # that ALSO needs `bun` on PATH to finish. On a headless box (no TTY) or one
-    # without bun it CANNOT complete non-interactively — force-feeding `yes` only
-    # makes the wizard spam every prompt and then abort `bun-missing-after-install`.
-    # So we ATTEMPT it ONLY when BOTH a real TTY (stdin+stdout) AND bun are present;
-    # otherwise SKIP cleanly WITHOUT launching the installer at all. The graceful-
-    # skip contract is preserved: never fatal, one-line re-enable note.
-    if ! { [ -t 0 ] && [ -t 1 ]; } || ! command -v bun &>/dev/null; then
-      echo "  claude-mem is an optional companion — skipped (re-enable: 'npx claude-mem install')"
-      _tele_install_step companion:claude-mem failed "$_cm_t0" \
-        precondition-unmet "no interactive TTY or bun absent; claude-mem wizard needs both"
-    elif ! command -v npx &>/dev/null; then
+    if ! command -v npx &>/dev/null; then
       # No npx → cannot install. This is not an error to halt on: skip gracefully.
       echo "  claude-mem is an optional companion — skipping (Heimdall works without it)"
       echo "    (npm/npx not found; install Node.js then run 'npx claude-mem install' to enable it)"
@@ -633,16 +629,23 @@ first_run_setup() {
         npx-absent "npx not on PATH"
     else
       local _cm_rc=0
-      # A real TTY + bun are present → the interactive wizard can run to completion
-      # with the user answering its prompts. `npx --yes` auto-confirms npx's OWN
-      # package-fetch prompt only; the exit code stays that of npx. A nonzero exit
-      # is NON-FATAL — graceful skip with the exact manual re-enable step.
-      npx --yes claude-mem install || _cm_rc=$?
+      # HEADLESS-SAFE ATTEMPT (the live-VM fix, done right): run the installer with
+      # stdin from /dev/null so a wizard prompt can NEVER hang the launcher — on a
+      # headless box (no TTY / no bun) the wizard reads EOF and aborts FAST, which
+      # surfaces as a nonzero exit → the graceful-skip path below. `</dev/null` (NOT
+      # the old `< <(yes)`) means one clean EOF: no prompt-spam, no pipefail SIGPIPE.
+      # `npx --yes` auto-confirms npx's OWN package-fetch prompt; the exit code stays
+      # that of npx, so the npm-exec outcome is captured at npm-exec granularity
+      # (dossier §3 piece d: "is claude-mem's npm-exec the dominant failure point?" —
+      # a pre-emptive skip would emit no npm-exec datum at all). A nonzero exit is
+      # NON-FATAL; a real TTY + bun let the wizard run to completion → succeeded.
+      npx --yes claude-mem install </dev/null || _cm_rc=$?
       if [ "$_cm_rc" -eq 0 ]; then
         _tele_install_step companion:claude-mem succeeded "$_cm_t0"
       else
-        # Declined or failed → graceful skip with the pinned message + the exact
-        # manual step, never a cryptic error or a hang.
+        # Declined or failed (incl. no-TTY / bun-absent fast-abort) → graceful skip
+        # with the pinned message + the exact manual step, never a cryptic error or a
+        # hang.
         echo "  claude-mem is an optional companion — skipping (Heimdall works without it)"
         echo "    (re-enable anytime: 'npx claude-mem install')"
         _tele_install_step companion:claude-mem failed "$_cm_t0" \
