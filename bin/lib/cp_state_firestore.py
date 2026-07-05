@@ -180,6 +180,77 @@ def _dir_prefix(rel_dir):
     return (norm.replace("/", _SEP) + _SEP) if norm else ""
 
 
+# ── bounded reads (the hang fix, bug #17): every enumeration/read is PREFIX-SCOPED + TIMED-OUT ─
+#
+# WHY (live prod hang, revision heimdall-control-plane-00050). list_names/exists streamed the
+# ENTIRE `heimdall_cp` root collection with NO prefix pushdown, NO page bound, and NO timeout
+# (git history: `self._root().stream()` since the module's first commit). On a LARGE collection
+# (300+ docs, growing with the TTL/nonce/ratelimit/audit families the ops hardening added) the
+# gated per-minute tick's drain — known_team_ids -> list_names("teamq") — re-streamed EVERY doc
+# EVERY tick. With no timeout a stalled / oversized stream BLOCKED the tick thread FOREVER: the
+# observed silence (no "drain cycle", no "tick error") because the thread was wedged inside the
+# stream, not raising. THE FIX: (1) push a document-id RANGE filter to Firestore so ONLY the
+# "<rel_dir>__*" docs are scanned (a bounded subset, not the whole collection); (2) put a WALL-
+# CLOCK TIMEOUT on every stream/get so a stalled read RAISES DeadlineExceeded (caught by the
+# tolerant callers -> []/None) instead of blocking the clock; (3) cap the client-side page count.
+_QUERY_TIMEOUT_ENV = "HEIMDALL_FIRESTORE_QUERY_TIMEOUT_SECONDS"
+_QUERY_TIMEOUT_DEFAULT = 20.0
+_QUERY_PAGE_SIZE_ENV = "HEIMDALL_FIRESTORE_QUERY_PAGE_SIZE"
+_QUERY_PAGE_SIZE_DEFAULT = 2000
+# The high code point appended to a prefix to form the INCLUSIVE upper bound of the doc-id range
+# [prefix, prefix+""] — the canonical Firestore prefix-scan sentinel ("" is a very
+# high BMP code point, so every id that STARTS WITH `prefix` sorts at or below prefix+"").
+_PREFIX_HIGH_SENTINEL = ""
+
+
+def _query_timeout():
+    """The per-operation wall-clock timeout (seconds) for a Firestore stream/get —
+    HEIMDALL_FIRESTORE_QUERY_TIMEOUT_SECONDS, default 20. A malformed / non-positive override
+    falls back to the default so a misconfig never DISABLES the timeout (the anti-hang guard)."""
+    raw = os.environ.get(_QUERY_TIMEOUT_ENV)
+    try:
+        val = float(raw) if raw not in (None, "") else _QUERY_TIMEOUT_DEFAULT
+    except (TypeError, ValueError):
+        return _QUERY_TIMEOUT_DEFAULT
+    return val if val > 0 else _QUERY_TIMEOUT_DEFAULT
+
+
+def _query_page_size():
+    """The client-side cap on docs scanned per enumeration (a second bound behind the doc-id
+    range) — HEIMDALL_FIRESTORE_QUERY_PAGE_SIZE, default 2000. Malformed / non-positive -> default."""
+    raw = os.environ.get(_QUERY_PAGE_SIZE_ENV)
+    try:
+        val = int(raw) if raw not in (None, "") else _QUERY_PAGE_SIZE_DEFAULT
+    except (TypeError, ValueError):
+        return _QUERY_PAGE_SIZE_DEFAULT
+    return val if val > 0 else _QUERY_PAGE_SIZE_DEFAULT
+
+
+def _stream(query, *, timeout):
+    """Stream a query/collection with a wall-clock `timeout` when the client supports it (the real
+    google client accepts stream(timeout=)); transparently fall back to a plain stream() for a
+    test double whose stream() takes no kwargs. The timeout is what turns a stalled network read
+    into a raised DeadlineExceeded (caught by the tolerant callers) instead of an unbounded block."""
+    try:
+        return query.stream(timeout=timeout)
+    except TypeError:
+        return query.stream()
+
+
+def _doc_get(ref, *, timeout, transaction=None):
+    """Read ONE document with a wall-clock `timeout` when supported, falling back for a test double
+    whose get() takes no timeout kwarg. `transaction` threads a Firestore transaction through
+    unchanged (the CAS/append read path)."""
+    try:
+        if transaction is not None:
+            return ref.get(transaction=transaction, timeout=timeout)
+        return ref.get(timeout=timeout)
+    except TypeError:
+        if transaction is not None:
+            return ref.get(transaction=transaction)
+        return ref.get()
+
+
 class FirestoreBackend(cp_state.StateBackend):
     """The durable StateBackend: the 7 control-plane store operations, persisted in
     Google Cloud Firestore (external to ${HEIMDALL_HOME}). Construct with no args to use
@@ -253,6 +324,28 @@ class FirestoreBackend(cp_state.StateBackend):
         """The node document reference for a store-relative path."""
         return self._root().document(_encode_rel(rel))
 
+    def _prefix_query(self, prefix):
+        """A root-collection query BOUNDED to the docs whose id starts with `prefix` (the bug #17
+        hang fix): a Firestore document-id RANGE filter [prefix, prefix+HIGH] pushed to the server
+        so ONLY the "<rel_dir>__*" family is scanned, never the whole collection. When the client
+        lacks the range API (an older/limited test double whose module exposes no FieldFilter /
+        FieldPath), it DEGRADES to the full collection ref — still safe because every caller streams
+        it under a wall-clock timeout, so a broad scan can slow but never HANG. An empty prefix
+        (whole-collection enumeration, e.g. list_names of the store root) also returns the full
+        ref (timed-out at the call site)."""
+        col = self._root()
+        if not prefix:
+            return col
+        try:
+            from google.cloud import firestore  # lazy — same dep boundary as _build_client.
+            docid = firestore.FieldPath.document_id()
+            return (col
+                    .where(filter=firestore.FieldFilter(docid, ">=", prefix))
+                    .where(filter=firestore.FieldFilter(
+                        docid, "<=", prefix + _PREFIX_HIGH_SENTINEL)))
+        except Exception:  # noqa: BLE001 — a client without the range API degrades to the full
+            return col     # collection (still TIMED-OUT at the call site, so it cannot hang).
+
     # ── append-only NDJSON (append_line / read_lines) ─────────────────────────────
 
     def append_line(self, rel, record, *, fsync=False):
@@ -283,7 +376,7 @@ class FirestoreBackend(cp_state.StateBackend):
         out = []
         try:
             lines = self._node(rel).collection(_LINES_SUBCOLLECTION)
-            for snap in lines.order_by(_FIELD_SEQ).stream():
+            for snap in _stream(lines.order_by(_FIELD_SEQ), timeout=_query_timeout()):
                 data = snap.to_dict() or {}
                 rec = data.get(_FIELD_REC)
                 if isinstance(rec, dict):
@@ -330,7 +423,7 @@ class FirestoreBackend(cp_state.StateBackend):
         """Read ONE keyed JSON record from the rel's node doc, or None if the doc is
         absent or its `rec` field is not a JSON object. Read-only; tolerant."""
         try:
-            snap = self._node(rel).get()
+            snap = _doc_get(self._node(rel), timeout=_query_timeout())
             if not snap.exists:
                 return None
             rec = (snap.to_dict() or {}).get(_FIELD_REC)
@@ -388,8 +481,17 @@ class FirestoreBackend(cp_state.StateBackend):
         firestore encoding header documents the "no __ in a segment" assumption."""
         prefix = _dir_prefix(rel_dir)
         names = set()
+        page_cap = _query_page_size()
         try:
-            for snap in self._root().stream():
+            scanned = 0
+            # BOUNDED: only the "<rel_dir>__*" doc-id family is streamed (a Firestore document-id
+            # range pushdown), under a wall-clock timeout, capped at page_cap docs — so a large
+            # `heimdall_cp` collection can never wedge the tick here (bug #17). The startswith
+            # guard below is belt-and-suspenders for the degraded full-collection fallback path.
+            for snap in _stream(self._prefix_query(prefix), timeout=_query_timeout()):
+                scanned += 1
+                if scanned > page_cap:
+                    break
                 doc_id = snap.id
                 if not doc_id.startswith(prefix):
                     continue
@@ -421,12 +523,13 @@ class FirestoreBackend(cp_state.StateBackend):
         `rel` as a dir prefix (so exists("jobs") is True once a job log exists, matching
         LocalBackend.exists on a store dir)."""
         try:
-            if self._node(rel).get().exists:
+            if _doc_get(self._node(rel), timeout=_query_timeout()).exists:
                 return True
             prefix = _dir_prefix(rel)
             if not prefix:
                 return False
-            for snap in self._root().stream():
+            # BOUNDED prefix scan + timeout (bug #17): stop at the FIRST doc under the prefix.
+            for snap in _stream(self._prefix_query(prefix), timeout=_query_timeout()):
                 if snap.id.startswith(prefix):
                     return True
             return False
@@ -459,7 +562,10 @@ def _put_record_if_in_transaction(transaction, node, record, expected_rev):
 
     @firestore.transactional
     def _txn(txn):
-        snap = node.get(transaction=txn)
+        # TIMED read inside the transaction (bug #17): a stalled transactional get raises rather
+        # than blocking the caller (which, for the team-queue CAS, holds the local flock across
+        # this network round-trip — a wedge here would freeze the whole partition's tick).
+        snap = _doc_get(node, timeout=_query_timeout(), transaction=txn)
         cur_rev = 0
         if snap.exists:
             cur_rev = cp_state._rev_of((snap.to_dict() or {}).get(_FIELD_REC))
@@ -481,7 +587,7 @@ def _append_in_transaction(transaction, node, lines, record):
 
     @firestore.transactional
     def _txn(txn):
-        snap = node.get(transaction=txn)
+        snap = _doc_get(node, timeout=_query_timeout(), transaction=txn)  # TIMED (bug #17)
         if snap.exists:
             cur = (snap.to_dict() or {}).get(_FIELD_SEQ)
             next_seq = (cur + 1) if isinstance(cur, int) else 0
