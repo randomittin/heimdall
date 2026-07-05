@@ -513,7 +513,7 @@ def run_once(repo, base="HEAD", evidence_cmds=None, cfg=None,
 
         return _gate_and_finish(
             q, issue, orient_result, fix_result, record, loop_run_id,
-            evidence_cmds=resolved_evidence,
+            evidence_cmds=resolved_evidence, repo=repo,
         )
     except Exception as exc:  # noqa: BLE001 — no path silently drops an issue
         # honest ERRORED transition: flag out-of-scope, never leave it claimed
@@ -538,7 +538,7 @@ def run_once(repo, base="HEAD", evidence_cmds=None, cfg=None,
 
 
 def _gate_and_finish(q, issue, orient_result, fix_result, record,
-                     loop_run_id=None, evidence_cmds=None):
+                     loop_run_id=None, evidence_cmds=None, repo=None):
     """THE CARDINAL RULE wiring, made STRUCTURAL (dossier §5):
 
       verdict = read_verdict(record)          # record.evidence.all_passed ONLY
@@ -576,9 +576,13 @@ def _gate_and_finish(q, issue, orient_result, fix_result, record,
         open_pr = _soft_import_open_pr()
         if open_pr is not None:
             # the pr layer (piece d) is present — hand it the issue + the SAME
-            # SI-2 record. The layer asserts all_passed internally too (defence
-            # in depth); we only ever call it on a verified PASS.
-            open_pr(issue, record)
+            # SI-2 record + the WORKSPACE repo (bug #21: open_pr commits+pushes the
+            # heimdall/* branch from this working tree BEFORE `gh pr create`, so the PR
+            # references a branch that actually reached the remote). The layer asserts
+            # all_passed internally too (defence in depth); we only call it on a PASS.
+            # A branch push failure raises out of open_pr -> the run_once except flags
+            # the issue (no PR against a branch the remote never saw).
+            open_pr(issue, record, repo=repo)
             pr_opened = True
         # else: SOFT-IMPORT miss — mark pr_ready and STOP. Do NOT fabricate a PR.
         q.set_state(issue_id, PR_OPEN, pr="pr-ready:" + issue_id)

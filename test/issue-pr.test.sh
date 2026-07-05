@@ -451,6 +451,188 @@ fi
 unset MOCK_PR_MERGED
 
 echo
+echo "── (6) BUG #21 — open_pr COMMITS + PUSHES the heimdall/* branch BEFORE gh pr create ──"
+# The defect: open_pr built `gh pr create --head heimdall/issue/<id>` while NOTHING ever
+# created/committed/pushed that branch — a live PASS would open a PR against a ref the
+# remote never saw (empty/failing PR). The fix commits the working-tree edit onto the
+# heimdall/* branch (bot identity) and PUSHES it to origin (scoped bot token via env),
+# THEN opens the PR. HERMETIC: a LOCAL BARE repo as origin (no network, no live GitHub);
+# the mock gh runner records `gh pr create` (no real gh). We assert the branch LANDS in
+# the bare remote carrying the edit commit, the committer is the bot, the push rode NO
+# token on argv/refs, and gh pr create fired AFTER the push.
+FAKETOKEN="ghs_FAKEbottoken000000000000000000000000"
+
+# a clone with a real (local, bare) origin + an UNCOMMITTED working-tree fix edit.
+PUSH_REPO="$WORK/pushrepo"; PUSH_BARE="$WORK/pushrepo.git"
+git init --bare -q "$PUSH_BARE"
+mkdir -p "$PUSH_REPO"
+git -C "$PUSH_REPO" init -q
+git -C "$PUSH_REPO" config user.email t@t
+git -C "$PUSH_REPO" config user.name t
+git -C "$PUSH_REPO" config commit.gpgsign false
+git -C "$PUSH_REPO" remote add origin "$PUSH_BARE"
+printf 'module init\n' > "$PUSH_REPO/app.py"
+git -C "$PUSH_REPO" add -A
+git -C "$PUSH_REPO" commit -qm init
+FIX_MARK="THE-REAL-FIX-LINE-$$"
+printf '%s\n' "$FIX_MARK" >> "$PUSH_REPO/app.py"   # the uncommitted fix the loop produced
+
+# a driver that calls open_pr with the recording mock gh runner + a bot token set, so the
+# COMMIT+PUSH path fires (the token rides the env; the mock avoids a live gh). Catches a
+# PushError (branch push failed) and exits 1 with the scrubbed message — mirrors the CLI.
+open_pr_push_driver() {
+  # $1 = repo path. Prints the open_pr result JSON on success; exit 1 on PushError.
+  RECORD="$PASS_RECORD" ISSUE_JSON="$ISSUE_JSON" REPO="$1" \
+  HEIMDALL_PR_BOT_TOKEN="$FAKETOKEN" "$PY" - <<'PYEOF'
+import json, os, sys
+import issue_pr
+import mock_gh
+issue = json.loads(os.environ["ISSUE_JSON"])
+record = json.loads(os.environ["RECORD"])
+try:
+    result = issue_pr.open_pr(issue, record, repo=os.environ["REPO"], base="main",
+                              gh_runner=mock_gh.runner)
+except issue_pr.PushError as exc:
+    sys.stderr.write("PushError: %s\n" % exc)
+    sys.exit(1)
+print(json.dumps(result))
+PYEOF
+}
+
+: > "$GH_SENTINEL"
+PUSH_OUT="$(open_pr_push_driver "$PUSH_REPO")"
+PUSH_BRANCH="heimdall/issue/github-acme-widget-7"
+
+# (6a) the branch was created IN THE BARE REMOTE and carries the fix commit.
+if git -C "$PUSH_BARE" rev-parse --verify "refs/heads/$PUSH_BRANCH" >/dev/null 2>&1; then
+  ok "the heimdall/* branch was PUSHED to origin (it EXISTS in the bare remote)"
+else
+  bad "the branch never reached origin — the PR would reference a non-existent ref (bug #21)"
+fi
+if git -C "$PUSH_BARE" show "$PUSH_BRANCH:app.py" 2>/dev/null | grep -qF "$FIX_MARK"; then
+  ok "the pushed branch CARRIES the working-tree fix edit (not empty)"
+else
+  bad "the pushed branch is missing the fix edit — the PR would be empty"
+fi
+
+# (6b) the commit was authored + committed by the BOT identity (never a real person).
+CN="$(git -C "$PUSH_BARE" log -1 --format='%cn' "$PUSH_BRANCH" 2>/dev/null || true)"
+AN="$(git -C "$PUSH_BARE" log -1 --format='%an' "$PUSH_BRANCH" 2>/dev/null || true)"
+CE="$(git -C "$PUSH_BARE" log -1 --format='%ce' "$PUSH_BRANCH" 2>/dev/null || true)"
+if [ "$CN" = "heimdall-maintainer[bot]" ] && [ "$AN" = "heimdall-maintainer[bot]" ]; then
+  ok "the fix commit committer + author are the BOT identity (heimdall-maintainer[bot])"
+else
+  bad "the fix commit is NOT the bot identity (committer=$CN author=$AN)"
+fi
+if printf '%s' "$CE" | grep -qF 'noreply'; then
+  ok "the bot commit email is a noreply address (a [bot] handle, never a real person)"
+else
+  bad "the bot commit email is not a noreply address ($CE)"
+fi
+
+# (6c) gh pr create FIRED (after the push) — the mock recorded a create-command whose
+# --head is exactly the pushed heimdall/* branch.
+if [ -s "$GH_SENTINEL" ] && jq -e '. | index("create")' < "$GH_SENTINEL" >/dev/null 2>&1; then
+  ok "gh pr create FIRED after the push (the mock recorded a create-command)"
+else
+  bad "gh pr create did NOT fire after the push"
+fi
+if grep -qF "$PUSH_BRANCH" "$GH_SENTINEL"; then
+  ok "the gh pr create --head references the pushed heimdall/* branch"
+else
+  bad "the gh pr create --head does not reference the pushed branch"
+fi
+
+# (6d) FALSIFIER — token-free: the scoped bot token rides the ENV only, NEVER argv / a
+# logged URL / a stored ref. It must appear NOWHERE in the result, the recorded gh
+# command, nor the bare remote (config/reflog/packed-refs). If code ever put it on argv or
+# in a URL-with-token push, this REDS.
+LEAK="$(
+  { printf '%s\n' "$PUSH_OUT"; cat "$GH_SENTINEL";
+    grep -rIsF "$FAKETOKEN" "$PUSH_BARE" 2>/dev/null || true; } | grep -F "$FAKETOKEN" || true
+)"
+if [ -z "$LEAK" ]; then
+  ok "TOKEN-FREE: the bot token appears in NO argv / result / remote (it rode the env only)"
+else
+  bad "TOKEN LEAK: the scoped bot token surfaced on an argv/URL/ref — creds discipline broken"
+fi
+
+# (6e) the push targets the bot's heimdall/* namespace ONLY — main is NEVER pushed.
+case "$PUSH_BRANCH" in
+  heimdall/*) ok "the pushed branch is under the bot's heimdall/* namespace (never main)" ;;
+  *) bad "the pushed branch escaped heimdall/* — SAFETY BROKEN" ;;
+esac
+if git -C "$PUSH_BARE" rev-parse --verify refs/heads/main >/dev/null 2>&1 \
+   || git -C "$PUSH_BARE" rev-parse --verify refs/heads/master >/dev/null 2>&1; then
+  bad "main/master exists in the bare remote — open_pr pushed a default branch (NEVER allowed)"
+else
+  ok "no main/master was pushed to origin — open_pr pushes ONLY the heimdall/* branch"
+fi
+
+echo "  ‣ FALSIFIER — a PUSH FAILURE opens NO PR (loud, scrubbed) ────────────────────"
+# origin points at a path that is NOT a git repo -> the push FAILS. open_pr must raise a
+# PushError BEFORE any gh pr create — a PR is never opened against a branch the remote
+# never saw. The error is loud and token-scrubbed.
+FAIL_REPO="$WORK/failpush"
+mkdir -p "$FAIL_REPO" "$WORK/not-a-repo"
+git -C "$FAIL_REPO" init -q
+git -C "$FAIL_REPO" config user.email t@t
+git -C "$FAIL_REPO" config user.name t
+git -C "$FAIL_REPO" config commit.gpgsign false
+git -C "$FAIL_REPO" remote add origin "$WORK/not-a-repo"   # not a repo -> push fails
+printf 'module init\n' > "$FAIL_REPO/app.py"
+git -C "$FAIL_REPO" add -A
+git -C "$FAIL_REPO" commit -qm init
+printf 'edit\n' >> "$FAIL_REPO/app.py"
+: > "$GH_SENTINEL"
+if open_pr_push_driver "$FAIL_REPO" >/dev/null 2>"$WORK/pusherr.err"; then
+  bad "open_pr opened a PR despite a push failure — bug #21 regressed (dangling PR)"
+else
+  RC=$?
+  if [ "$RC" = "1" ] && [ ! -s "$GH_SENTINEL" ]; then
+    ok "a push failure -> exit 1 and NO gh pr create (no PR against an unpushed branch)"
+  else
+    bad "a push failure did not cleanly refuse (rc=$RC, gh recorded: $(cat "$GH_SENTINEL"))"
+  fi
+fi
+if grep -qiE 'push|branch' "$WORK/pusherr.err"; then
+  ok "the push failure is LOUD (the error names the push/branch failure)"
+else
+  bad "the push failure was not surfaced loudly"
+fi
+if grep -qF "$FAKETOKEN" "$WORK/pusherr.err"; then
+  bad "the push-failure error LEAKED the bot token — scrub discipline broken"
+else
+  ok "the push-failure error is token-scrubbed (no credential in the surfaced message)"
+fi
+
+echo "  ‣ IDEMPOTENCY — gh_bot_runner treats an existing PR ('already exists') as success ──"
+# A re-run re-pushes the branch and re-runs `gh pr create`; gh EXITS NON-ZERO when an open
+# PR already exists for the head. That is SUCCESS for us — detect it, recover the existing
+# PR url, return ok=true (never a spurious failure). Fake gh: exit 1 + the "already exists"
+# message carrying the existing PR url.
+IDEMPBIN="$WORK/idempbin"; mkdir -p "$IDEMPBIN"
+cat > "$IDEMPBIN/gh" <<'GHEOF'
+#!/usr/bin/env bash
+echo "a pull request for branch \"heimdall/issue/x\" into branch \"main\" already exists:" >&2
+echo "https://github.com/acme/widget/pull/42" >&2
+exit 1
+GHEOF
+chmod +x "$IDEMPBIN/gh"
+IDEMP_OUT="$(PATH="$IDEMPBIN:$PATH" HEIMDALL_PR_BOT_TOKEN="$FAKETOKEN" "$PY" - <<'PYEOF'
+import json
+import issue_pr
+r = issue_pr.gh_bot_runner(["gh", "pr", "create", "--head", "heimdall/issue/x"])
+print(json.dumps(r))
+PYEOF
+)"
+if printf '%s' "$IDEMP_OUT" | jq -e '.ok == true and .already_exists == true and (.url | test("/pull/42"))' >/dev/null 2>&1; then
+  ok "an 'already exists' PR is treated as SUCCESS with the existing url recovered (idempotent re-run)"
+else
+  bad "gh_bot_runner did not tolerate an existing PR ($IDEMP_OUT)"
+fi
+
+echo
 echo "── grep: structural proofs of the human gate in the source ───────────────────"
 if grep -qE 'def open_pr\(' "$LIB" && grep -qE 'def on_merged\(' "$LIB"; then
   ok "module exposes open_pr (open+stop) and on_merged (human writeback) — and only these"
