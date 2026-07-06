@@ -451,12 +451,18 @@ if [ "\${1:-}" = "issue" ] && [ "\${2:-}" = "list" ]; then
 fi
 if [ "\${1:-}" = "repo" ] && [ "\${2:-}" = "clone" ]; then
   slug="\$3"; dest="\$4"
+  # HERMETIC ORIGIN: a LOCAL BARE repo stands in for GitHub as \`origin\` so bug #21's
+  # real \`git push\` of the heimdall/* branch (open_pr commits+pushes BEFORE gh pr create)
+  # lands with NO network — mirrors issue-pr.test.sh §6. A github.com URL here makes
+  # open_pr's push hit the real network and fail auth (never hermetic, never green).
+  bare="\${dest}.origin.git"
+  git init -q --bare "\$bare"
   mkdir -p "\$dest"
   git init -q "\$dest"
   git -C "\$dest" config user.email t@t
   git -C "\$dest" config user.name t
   git -C "\$dest" config commit.gpgsign false
-  git -C "\$dest" remote add origin "https://github.com/\$slug.git"
+  git -C "\$dest" remote add origin "\$bare"
   printf 'x\n' > "\$dest/app.py"
   git -C "\$dest" add -A
   git -C "\$dest" commit -qm init
