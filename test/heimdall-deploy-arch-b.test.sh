@@ -114,6 +114,8 @@ dgrep 'google-cloud-firestore==2.16.1'                         "pins google-clou
 dgrep 'cryptography==42.0.8'                                    "pins cryptography (Ed25519 backend)"
 dgrep 'COPY bin/ /app/bin/'                                    "copies the heimdall bins onto the image"
 dgrep 'claude --version'                                       "build-time toolchain gate (claude --version)"
+dgrep 'pip install .*pytest|pytest==[0-9]'                     "installs the base test toolchain (pytest) — SI-2 gate runs a repo's tests (bug #24)"
+dgrep 'import pytest|pytest --version'                         "build-time gate proves pytest is present"
 
 echo
 echo "deploy-arch-b: $PASS passed, $FAIL failed"

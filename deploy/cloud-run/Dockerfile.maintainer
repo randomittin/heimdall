@@ -110,6 +110,19 @@ RUN pip install --no-cache-dir \
 # (firestore) or returning {dispatched: False} on every dispatch (run_v2) at runtime.
 RUN python -c "import google.cloud.firestore, google.cloud.run_v2, cryptography; print('deps OK')"
 
+# ── Base test toolchain (pytest) — the SI-2 gate must be able to RUN a repo's tests ──
+# bug #24 (deployed-shape): the maintainer clones a repo and the SI-2 gate runs that repo's
+# acceptance commands (e.g. ./run_tests.sh, which typically shells `pytest`). A dev's box has
+# pytest installed; the ephemeral maintainer starts from a clean image, so WITHOUT pytest the
+# gate ran even a CORRECT fix's tests with ok=False + an empty tail (pytest: command not found)
+# -> GATE_FAILED, no PR (job-c6e420a8 run-11). pytest is the ONE ubiquitous Python test runner,
+# so it ships in the image as the base toolchain; the clone's OWN deps are bootstrapped per-job
+# by bin/lib/issue_bootstrap.py (pip install -r requirements.txt / -e .). Pinned for a
+# reproducible build; the import guard fails the build if it is missing.
+RUN pip install --no-cache-dir "pytest==8.2.2" \
+    && python -c "import pytest; print('pytest OK', pytest.__version__)" \
+    && pytest --version
+
 # ── Non-root runtime user (Cloud Run best practice; least privilege) ─────────
 # Identical to the repo-root Dockerfile; --home-dir /app so tools resolve $HOME under the
 # app root (we point HOME/CLAUDE_CONFIG_DIR at the writable state dir below).

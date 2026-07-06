@@ -449,6 +449,76 @@ def _commit_message(issue):
     )
 
 
+# ── clean commit scope (bug #24): the fix commit is ONLY the source change ────
+#   The fix/attest run leaves SESSION + TEST artifacts in the clone — __pycache__/, a
+#   .pytest_cache/, a .claude/ scratch, a stray venv, *.egg-info from an editable install,
+#   the .heimdall/ runtime home. A blanket `git add -A` stages ALL of them, so the pushed
+#   heimdall/* branch would carry junk beyond the real edit (run-11 attested files_changed=1
+#   via `git diff` but the COMMIT was "6 files"). We write these ignore patterns into the
+#   clone's LOCAL exclude (.git/info/exclude) BEFORE `git add -A` — LOCAL to this clone (never
+#   the repo's committed .gitignore, so the maintained repo's tree is untouched) and affecting
+#   only UNTRACKED files, so the pushed diff is EXACTLY the fix. A marker line makes it idempotent.
+_COMMIT_EXCLUDE_PATTERNS = (
+    "__pycache__/",
+    "*.pyc",
+    ".pytest_cache/",
+    ".claude/",
+    ".venv/",
+    "venv/",
+    "node_modules/",
+    "*.egg-info/",
+    ".heimdall/",
+)
+_COMMIT_EXCLUDE_MARKER = "# heimdall-maintainer: scoped fix-commit exclude (bug #24)"
+
+
+def _resolve_git_info_dir(repo):
+    """The clone's `.git/info` directory (where the LOCAL exclude lives). For a normal
+    clone this is <repo>/.git/info; for a worktree/submodule (.git is a FILE pointing at
+    the real gitdir) we resolve it via `git rev-parse --git-dir`. Returns the info-dir
+    path, or None when it cannot be resolved."""
+    gitdir = os.path.join(repo, ".git")
+    if os.path.isdir(gitdir):
+        return os.path.join(gitdir, "info")
+    # a worktree/submodule points .git at a file -> ask git for the real gitdir.
+    r = _git(repo, ["rev-parse", "--git-dir"])
+    if r.returncode == 0 and (r.stdout or "").strip():
+        gd = r.stdout.strip()
+        if not os.path.isabs(gd):
+            gd = os.path.join(repo, gd)
+        return os.path.join(gd, "info")
+    return None
+
+
+def _write_scoped_exclude(repo):
+    """Append Heimdall's junk-ignore patterns to the clone's LOCAL exclude
+    (.git/info/exclude) so `git add -A` never stages session/test artifacts. LOCAL to this
+    clone only (never the committed .gitignore); IDEMPOTENT (a marker line prevents a
+    re-run from re-appending); BEST-EFFORT (an IO failure returns quietly — the commit still
+    proceeds). Returns True when the patterns are present after the call, else False."""
+    try:
+        info_dir = _resolve_git_info_dir(repo)
+        if not info_dir:
+            return False
+        os.makedirs(info_dir, exist_ok=True)
+        exclude_path = os.path.join(info_dir, "exclude")
+        existing = ""
+        if os.path.isfile(exclude_path):
+            with open(exclude_path, "r", encoding="utf-8") as fh:
+                existing = fh.read()
+        if _COMMIT_EXCLUDE_MARKER in existing:
+            return True  # already applied — idempotent, do not duplicate.
+        with open(exclude_path, "a", encoding="utf-8") as fh:
+            if existing and not existing.endswith("\n"):
+                fh.write("\n")
+            fh.write(_COMMIT_EXCLUDE_MARKER + "\n")
+            for pat in _COMMIT_EXCLUDE_PATTERNS:
+                fh.write(pat + "\n")
+        return True
+    except OSError:
+        return False
+
+
 def _commit_and_push_branch(issue, branch, repo, base, token):
     """Create/reset the heimdall/* branch at HEAD, stage + commit the working-tree fix as
     the BOT identity, and push the branch to origin (scoped bot token via env). This is the
@@ -483,6 +553,14 @@ def _commit_and_push_branch(issue, branch, repo, base, token):
             % (branch, repo, _scrub_git_error(r.stderr) or "git checkout -B failed"))
 
     # ── 2) stage ALL working-tree edits (scope: this clone only) ──────────────────────
+    # bug #24: before staging, write a SCOPED local exclude so the fix commit carries ONLY
+    # the real source change — never the session/test artifacts (__pycache__, .pytest_cache,
+    # .claude, venvs, egg-info, .heimdall) the fix/attest run leaves in the clone. Without
+    # this `git add -A` would stage that junk (run-11 pushed "6 files (5 added, 1 modified)"
+    # when the real fix was 1 file). The attestation already counts the clean set via
+    # `git diff` — this aligns the COMMIT to that same set. Best-effort (an IO failure is
+    # non-fatal); the exclude only affects UNTRACKED files in THIS clone.
+    _write_scoped_exclude(repo)
     r = _git(repo, ["add", "-A"])
     if r.returncode != 0:
         raise PushError(
