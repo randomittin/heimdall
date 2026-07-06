@@ -63,6 +63,21 @@ echo "fake-claude: made no changes"
 exit 0
 NOOPEOF
 chmod +x "$FAKEBIN/claude-noop"
+# bug #25: a fake coder that applies ONLY the correct sum_range fix (inclusive of the final
+# element) to tinymath/core.py in the workspace, leaving the co-resident average bug alone.
+cat > "$FAKEBIN/claude-fix-sumrange" <<'SREOF'
+#!/usr/bin/env bash
+python3 - <<'PYEOF'
+import io
+p = "tinymath/core.py"
+s = io.open(p).read()
+s = s.replace("return sum(range(a, b))", "return sum(range(a, b + 1))")
+io.open(p, "w").write(s)
+PYEOF
+echo "fake-claude: applied inclusive sum_range fix (co-resident bugs left untouched)"
+exit 0
+SREOF
+chmod +x "$FAKEBIN/claude-fix-sumrange"
 
 # ── FAKE gh (records the PR-create argv; NO live GitHub). ──────────────────────
 GH_LOG="$WORK/gh.log"; : > "$GH_LOG"
@@ -110,6 +125,64 @@ grep -q FIXED app.py
 # acceptance that ALWAYS fails (the evidence-fails falsifier).
 RT_RED='#!/usr/bin/env bash
 exit 1
+'
+
+# bug #25: a REAL tinymath clone — a fixable gating node (test_sum_range) PLUS a co-resident
+# ALWAYS-FAILING sibling (test_average, an unrelated planted bug). run_tests.sh runs the WHOLE
+# suite (so it is RED regardless of the sum_range fix). The origin bare mirrors new_repo so the
+# PR path can push hermetically.
+new_tinymath_repo() {
+  local name="$1"
+  local repo="$WORK/$name"
+  local bare="$WORK/$name.git"
+  git init --bare -q "$bare"
+  mkdir -p "$repo/tinymath" "$repo/tests"
+  git -C "$repo" init -q
+  git -C "$repo" config user.email t@t
+  git -C "$repo" config user.name t
+  git -C "$repo" config commit.gpgsign false
+  git -C "$repo" remote add origin "$bare"
+  cat > "$repo/tinymath/__init__.py" <<'PYEOF'
+from .core import sum_range, average
+PYEOF
+  cat > "$repo/tinymath/core.py" <<'PYEOF'
+def sum_range(a, b):
+    return sum(range(a, b))
+
+def average(xs):
+    return sum(xs) / (len(xs) - 1)
+PYEOF
+  cat > "$repo/tests/test_sum_range.py" <<'PYEOF'
+import unittest
+from tinymath.core import sum_range
+
+class SumRangeTest(unittest.TestCase):
+    def test_inclusive_of_the_final_element(self):
+        self.assertEqual(sum_range(1, 5), 15)
+PYEOF
+  cat > "$repo/tests/test_average.py" <<'PYEOF'
+import unittest
+from tinymath.core import average
+
+class AverageTest(unittest.TestCase):
+    def test_mean(self):
+        self.assertEqual(average([2, 4, 6]), 4)
+PYEOF
+  cat > "$repo/run_tests.sh" <<'PYEOF'
+#!/usr/bin/env bash
+exec python3 -m pytest -q
+PYEOF
+  chmod +x "$repo/run_tests.sh"
+  git -C "$repo" add -A
+  git -C "$repo" commit -qm init
+  printf '%s' "$repo"
+}
+
+# the bug #25 body: names the PRECISE gating node on a "Gating test:" line (run-12 shape).
+NODE_BODY='sum_range excludes the final element.
+
+Acceptance (must go green): ./run_tests.sh
+Gating test (red today): tests/test_sum_range.py::SumRangeTest::test_inclusive_of_the_final_element
 '
 
 seed() {
@@ -389,6 +462,48 @@ then
   ok "the issue body lands INSIDE the untrusted block (falsifier: body outside block -> FAIL)"
 else
   bad "the issue body is NOT inside the untrusted block"
+fi
+
+echo "── (8) bug #25 — co-resident bugs: the NAMED node gates, the whole suite is DEMOTED ──"
+# The run-12 failure: a CORRECT sum_range fix was refused because ./run_tests.sh ran the
+# WHOLE suite (3 planted bugs) -> whole-suite red -> GATE_FAILED. With the node-precedence
+# fix the issue's OWN gating test is the isolated proof: it passes -> the gate passes on
+# merit -> PR_OPEN, even though the whole suite stays red on the unrelated sibling bugs.
+R8="$(new_tinymath_repo coresident_repo)"
+if ! ( cd "$R8" && ./run_tests.sh ) >/dev/null 2>&1; then
+  ok "precondition: the whole suite ./run_tests.sh is RED (a co-resident sibling bug fails)"
+else
+  bad "the whole suite was unexpectedly green — the co-resident bug precondition is missing"
+fi
+seed "$R8" 25 "$NODE_BODY"
+: > "$GH_LOG"
+OUT="$(run_once "$R8" "$FAKEBIN/claude-fix-sumrange")" || true
+if ( cd "$R8" && python3 -m pytest "tests/test_sum_range.py::SumRangeTest::test_inclusive_of_the_final_element" -q ) >/dev/null 2>&1; then
+  ok "the fake coder applied the CORRECT sum_range fix (the gating node now PASSES in isolation)"
+else
+  bad "the sum_range fix did not land — the gating node is still red"
+fi
+# the co-resident sibling is STILL red (the whole suite would fail the gate — the falsifier).
+if ! ( cd "$R8" && ./run_tests.sh ) >/dev/null 2>&1; then
+  ok "the co-resident sibling stays RED after the fix (the whole suite would still fail the gate)"
+else
+  bad "the whole suite went green — the co-resident isolation is not being exercised"
+fi
+NODE_CMD='python3 -m pytest tests/test_sum_range.py::SumRangeTest::test_inclusive_of_the_final_element -q'
+if printf '%s' "$OUT" | jq -e --arg n "$NODE_CMD" '.evidence_cmds | index($n) != null' >/dev/null 2>&1; then
+  ok "the gate ran the PRECISE named node as evidence (per-issue isolated proof)"
+else
+  bad "the named node was not the evidence ($(printf '%s' "$OUT" | jq -c '.evidence_cmds'))"
+fi
+if printf '%s' "$OUT" | jq -e '[.evidence_cmds[] | select(. == "./run_tests.sh")] | length == 0' >/dev/null 2>&1; then
+  ok "the whole-suite ./run_tests.sh is DEMOTED (never a gating command when a node is named)"
+else
+  bad "the whole suite was still a gating command — co-resident bugs could fail the gate"
+fi
+if printf '%s' "$OUT" | jq -e '.gate.all_passed == true and .state == "PR_OPEN" and .pr_opened == true' >/dev/null 2>&1; then
+  ok "bug #25: the correct single-issue fix PASSES the gate + reaches PR_OPEN despite a RED whole suite"
+else
+  bad "the correct fix did NOT reach PR_OPEN ($(printf '%s' "$OUT" | jq -c '.state,.gate.all_passed,.attestation.evidence'))"
 fi
 
 echo
