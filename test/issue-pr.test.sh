@@ -633,6 +633,79 @@ else
 fi
 
 echo
+echo "── (7) BUG #24 — CLEAN COMMIT SCOPE: the push carries ONLY the fix, never junk ──"
+# The defect: `git add -A` staged the fix AND the session/test artifacts the fix/attest run
+# leaves in the clone (__pycache__/, .pytest_cache/, .claude/, egg-info, .heimdall/), so the
+# pushed heimdall/* branch carried junk beyond the 1-file fix (run-11: "6 files" for a 1-file
+# edit). _commit_and_push_branch now writes a SCOPED local exclude before staging, so the
+# pushed diff is EXACTLY the source change. HERMETIC: a LOCAL BARE origin; we assert the fix
+# file LANDS in the remote branch and every junk path is ABSENT (git -C bare ls-tree).
+SCOPE_REPO="$WORK/scoperepo"; SCOPE_BARE="$WORK/scoperepo.git"
+git init --bare -q "$SCOPE_BARE"
+mkdir -p "$SCOPE_REPO"
+git -C "$SCOPE_REPO" init -q
+git -C "$SCOPE_REPO" config user.email t@t
+git -C "$SCOPE_REPO" config user.name t
+git -C "$SCOPE_REPO" config commit.gpgsign false
+git -C "$SCOPE_REPO" remote add origin "$SCOPE_BARE"
+mkdir -p "$SCOPE_REPO/tinymath"
+printf 'def sum_range(a, b):\n    return sum(range(a, b))\n' > "$SCOPE_REPO/tinymath/core.py"
+git -C "$SCOPE_REPO" add -A
+git -C "$SCOPE_REPO" commit -qm init
+# the REAL source fix (the only thing that should land on the branch).
+SCOPE_FIX="THE-REAL-FIX-$$"
+printf 'def sum_range(a, b):\n    return sum(range(a, b + 1))  # %s\n' "$SCOPE_FIX" > "$SCOPE_REPO/tinymath/core.py"
+# the STRAY session/test artifacts the fix/attest run leaves behind (untracked junk).
+mkdir -p "$SCOPE_REPO/tinymath/__pycache__" "$SCOPE_REPO/.pytest_cache" \
+         "$SCOPE_REPO/.claude" "$SCOPE_REPO/tinymath.egg-info"
+printf 'JUNK\n' > "$SCOPE_REPO/tinymath/__pycache__/core.cpython-312.pyc"
+printf 'JUNK\n' > "$SCOPE_REPO/.pytest_cache/CACHEDIR.TAG"
+printf 'JUNK\n' > "$SCOPE_REPO/.claude/scratch.json"
+printf 'JUNK\n' > "$SCOPE_REPO/tinymath.egg-info/PKG-INFO"
+
+: > "$GH_SENTINEL"
+SCOPE_OUT="$(open_pr_push_driver "$SCOPE_REPO")"
+SCOPE_BRANCH="heimdall/issue/github-acme-widget-7"
+
+# (7a) the REAL fix file landed on the pushed branch, carrying the fix.
+if git -C "$SCOPE_BARE" show "$SCOPE_BRANCH:tinymath/core.py" 2>/dev/null | grep -qF "$SCOPE_FIX"; then
+  ok "the pushed branch CARRIES the real source fix (tinymath/core.py)"
+else
+  bad "the pushed branch is missing the real fix — clean-scope dropped the source change"
+fi
+
+# (7b) EVERY junk path is ABSENT from the pushed tree (the whole point of bug #24).
+SCOPE_TREE="$(git -C "$SCOPE_BARE" ls-tree -r --name-only "$SCOPE_BRANCH" 2>/dev/null || true)"
+JUNK_HIT=0
+for junk in "__pycache__" ".pytest_cache" ".claude/" ".egg-info" ".heimdall"; do
+  if printf '%s\n' "$SCOPE_TREE" | grep -qF "$junk"; then
+    bad "JUNK LEAKED into the pushed branch: a path matching '$junk' was committed"
+    JUNK_HIT=1
+  fi
+done
+if [ "$JUNK_HIT" -eq 0 ]; then
+  ok "NO junk in the pushed tree (__pycache__/.pytest_cache/.claude/.egg-info/.heimdall all absent)"
+fi
+# (7c) the committed tree is EXACTLY the one source file changed (files_changed=1 alignment).
+SCOPE_DIFF_N="$(git -C "$SCOPE_BARE" diff --name-only "$SCOPE_BRANCH~1" "$SCOPE_BRANCH" 2>/dev/null | grep -c . || true)"
+if [ "$SCOPE_DIFF_N" = "1" ]; then
+  ok "the fix commit changed EXACTLY 1 file (aligned with the attestation's files_changed=1)"
+else
+  bad "the fix commit changed $SCOPE_DIFF_N files (expected exactly 1 — the source fix)"
+fi
+# (7d) the scoped exclude is LOCAL to the clone (never a committed .gitignore in the tree).
+if printf '%s\n' "$SCOPE_TREE" | grep -qxF ".gitignore"; then
+  bad "a .gitignore was committed — the exclude must be LOCAL (.git/info/exclude), not the tree"
+else
+  ok "the scope exclude is local to the clone (.git/info/exclude) — the repo tree is untouched"
+fi
+if grep -qF "heimdall-maintainer: scoped fix-commit exclude" "$SCOPE_REPO/.git/info/exclude" 2>/dev/null; then
+  ok "the clone's LOCAL exclude (.git/info/exclude) carries the scoped junk patterns"
+else
+  bad "the local .git/info/exclude was not written with the scoped patterns"
+fi
+
+echo
 echo "── grep: structural proofs of the human gate in the source ───────────────────"
 if grep -qE 'def open_pr\(' "$LIB" && grep -qE 'def on_merged\(' "$LIB"; then
   ok "module exposes open_pr (open+stop) and on_merged (human writeback) — and only these"

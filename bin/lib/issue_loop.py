@@ -67,6 +67,21 @@ except Exception:  # noqa: BLE001 — absent/broken discovery must never break t
     issue_evidence = None
 
 
+# ── dependency-bootstrap seam (soft-import, like issue_evidence above) ─────────
+# issue_bootstrap.bootstrap_dependencies installs the CLONE's own declared deps
+# (requirements.txt -> pip install -r; pyproject/setup.py -> pip install -e .) into the
+# ephemeral maintainer container BEFORE the SI-2 gate runs the evidence commands. bug #24:
+# a dev's ./run_tests.sh assumes pytest + the repo's deps are already present; the
+# ephemeral maintainer starts clean, so the gate ran the CORRECT fix's tests with ok=False
+# + an empty tail (deps missing) -> GATE_FAILED, no PR. Best-effort + tolerant: a pip
+# failure is recorded, never fatal (the evidence run is the real check). A soft-import miss
+# (partial checkout) degrades to no bootstrap — byte-identical to before.
+try:
+    import issue_bootstrap  # sibling on sys.path
+except Exception:  # noqa: BLE001 — absent/broken bootstrap must never break the loop
+    issue_bootstrap = None
+
+
 # ── telemetry seam: the loop is CONSUMER #1 of the ONE event surface (dossier §2) ─
 # Soft-import the general telemetry surface, mirroring how the PR layer is soft-
 # imported below: if bin/lib/telemetry.py is ABSENT (a partial checkout) the loop
@@ -614,6 +629,27 @@ def run_once(repo, base="HEAD", evidence_cmds=None, cfg=None,
                     evidence_cmds, issue, repo)
             except Exception:  # noqa: BLE001 — discovery never breaks the loop
                 resolved_evidence = list(evidence_cmds or [])
+
+        # ── dependency bootstrap: install the CLONE's deps BEFORE the gate runs ─
+        # bug #24 (deployed-shape): a dev's ./run_tests.sh assumes pytest + the repo's
+        # deps are already present, but the ephemeral maintainer starts from a clean
+        # image — so the gate ran the CORRECT fix's tests with ok=False + an empty tail
+        # (ModuleNotFound) -> GATE_FAILED, no PR. bootstrap_dependencies pip-installs the
+        # clone's requirements.txt / pyproject deps into the ephemeral container. It is
+        # BEST-EFFORT + TOLERANT (a pip failure is recorded, never fatal — the evidence
+        # run is the real check) and a no-op when the clone declares no deps or the module
+        # is absent. Only fires when there IS evidence to prove (no deps to bootstrap for
+        # an empty gate). The diagnostic is attached to fix_result so a silent dep miss is
+        # visible in the run output, not an inscrutable empty tail.
+        bootstrap_result = None
+        if issue_bootstrap is not None and resolved_evidence:
+            try:
+                bootstrap_result = issue_bootstrap.bootstrap_dependencies(repo)
+            except Exception as bexc:  # noqa: BLE001 — bootstrap never breaks the loop
+                bootstrap_result = {"attempted": False,
+                                    "reason": "bootstrap-error:" + type(bexc).__name__}
+        if isinstance(fix_result, dict) and bootstrap_result is not None:
+            fix_result["dep_bootstrap"] = bootstrap_result
 
         # ── attest (REUSE SI-2) + GATE ────────────────────────────────────────
         record = attest(repo, base, resolved_evidence,
