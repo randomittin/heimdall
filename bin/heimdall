@@ -1073,6 +1073,41 @@ case "${1:-}" in
     printf "  ${D}Reinstall anytime: curl -fsSL https://runheimdall.dev/install | bash${R}\n\n"
     exit 0
     ;;
+  team)
+    # Pass-through to heimdall-team (new/join/share/show and bare dispatch).
+    # Bin dir resolved via $PLUGIN_DIR — same as demo/rr above, never hardcoded.
+    shift
+    TEAM_BIN="$PLUGIN_DIR/bin/heimdall-team"
+    if [ ! -x "$TEAM_BIN" ]; then
+      echo "  Error: heimdall-team not found at $TEAM_BIN" >&2
+      echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+      exit 1
+    fi
+    exec "$TEAM_BIN" "$@"
+    ;;
+  invite)
+    # Pass-through to heimdall-invite (teammate join-link generator).
+    shift
+    INVITE_BIN="$PLUGIN_DIR/bin/heimdall-invite"
+    if [ ! -x "$INVITE_BIN" ]; then
+      echo "  Error: heimdall-invite not found at $INVITE_BIN" >&2
+      echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+      exit 1
+    fi
+    exec "$INVITE_BIN" "$@"
+    ;;
+  presence)
+    # Pass-through to heimdall-presence (off/on/on --global/on --no-files/
+    # status/roster/beat/retire). All args/flags forwarded verbatim.
+    shift
+    PRESENCE_BIN="$PLUGIN_DIR/bin/heimdall-presence"
+    if [ ! -x "$PRESENCE_BIN" ]; then
+      echo "  Error: heimdall-presence not found at $PRESENCE_BIN" >&2
+      echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+      exit 1
+    fi
+    exec "$PRESENCE_BIN" "$@"
+    ;;
 esac
 
 # ── Command handlers ──
@@ -1476,6 +1511,9 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   echo "  heimdall --reinstall      Nuke and re-clone from GitHub (fixes zombie states)"
   echo "  heimdall --uninstall      Remove heimdall completely (add --yes for non-interactive)"
   echo "  heimdall --help           Show this help"
+  echo "  heimdall team             Manage team presence (new/join/share/show)"
+  echo "  heimdall invite           Generate a teammate join link"
+  echo "  heimdall presence         Control presence (off/on/status/roster)"
   echo ""
   echo "heimdall launches Claude Code with:"
   echo "  --dangerously-skip-permissions    full autonomy"
