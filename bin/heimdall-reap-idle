@@ -1,0 +1,304 @@
+#!/usr/bin/env bash
+# heimdall-reap-idle — the IDLE-AGENT AUTO-REAPER.
+#
+# Long orchestration sessions accumulate three kinds of leftovers that clutter the
+# session and leak disk:
+#   1. stale git worktrees under .claude/worktrees/agent-* (and .worktrees/*) that
+#      were merged into main or abandoned;
+#   2. orphaned background poll-loops an agent spawned to watch a deploy
+#      (bash `for i in $(seq …)` loops hitting `gcloud run jobs executions` / `gh pr`);
+#   3. agent-pool leases whose worktree/process no longer exists.
+#
+# This tool reaps them — but the ONE invariant it never breaks is: NEVER destroy
+# unmerged work. It classifies from GIT itself (merge-base --is-ancestor), never
+# from an agent's self-report that it is "done" (the R2/R7 convention: a truncated
+# agent cannot be trusted to say its branch is safe to delete — git can).
+#
+# ── Worktree classification (per worktree in scope) ──────────────────────────
+#   SCOPE   path (relative to repo root) matches .claude/worktrees/agent-* OR
+#           .worktrees/*  — everything else (the operator's own live worktrees,
+#           the main worktree, this reaper's own worktree) is OUT OF SCOPE and
+#           NEVER touched.
+#   REAP    the worktree tip (branch head, or detached HEAD) is an ANCESTOR of
+#           main => merged/clean/no divergence => `git worktree remove --force`
+#           (+ `git branch -D` if it is on a branch other than main).
+#   KEEP    the tip is NOT an ancestor of main => it carries commits not on main
+#           => unmerged work => KEEP and report by name. Never destroyed.
+#   SKIP    locked worktree whose recorded agent pid is still ALIVE => an agent is
+#           actively working there => leave it alone regardless of merge state.
+#   PRUNE   worktree whose directory has vanished (git marks it prunable) =>
+#           `git worktree prune` clears the dangling admin entry.
+#
+# ── Idle background pollers ──────────────────────────────────────────────────
+#   The tool cannot kill another agent's harness process. It scopes to a NARROW
+#   watcher shape only — a poll LOOP (`for … seq` / `while`) hitting a deploy
+#   watcher (`gcloud run jobs executions` / `gh pr list|view|checks|status`) — and
+#   REPORTS the PID plus a ready-to-run kill command. `--kill` kills ONLY those
+#   watcher-matched PIDs that share THIS process's group (a child of this shell);
+#   nothing outside that narrow pattern is ever killed.
+#
+# ── agent-pool reconciliation (only with --apply) ────────────────────────────
+#   Releases the lease named for each reaped worktree, then runs `agent-pool
+#   health-check` to drop leases whose pid is dead. Best-effort; never fatal.
+#
+# Default is DRY-RUN (safe): it prints every per-worktree decision and mutates
+# NOTHING. Pass --apply to actually reap. Idempotent: a second --apply is a no-op.
+#
+# Usage:
+#   heimdall-reap-idle [--apply] [--kill] [--repo <path>] [--main <ref>] [--quiet]
+#
+#   --apply        actually remove merged/clean worktrees + branches, prune, and
+#                  reconcile agent-pool leases. Without it: report only.
+#   --kill         additionally kill watcher pollers that are children of this
+#                  shell (same process group). Without it: report pollers only.
+#   --repo <path>  operate on this repo (default: the repo containing cwd).
+#   --main <ref>   the integration ref merges land on (default: auto — main,
+#                  else master, else the primary worktree's branch).
+#   --quiet        suppress the per-worktree decision lines; print only the summary.
+#
+# Exit 0 on success (keeping unmerged work is success, not failure). Exit 2 on a
+# usage/repo error.
+set -uo pipefail
+
+APPLY=0
+KILL=0
+QUIET=0
+REPO=""
+MAIN_REF=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --apply)  APPLY=1 ;;
+    --kill)   KILL=1 ;;
+    --quiet)  QUIET=1 ;;
+    --repo)   REPO="${2:-}"; shift ;;
+    --repo=*) REPO="${1#--repo=}" ;;
+    --main)   MAIN_REF="${2:-}"; shift ;;
+    --main=*) MAIN_REF="${1#--main=}" ;;
+    -h|--help)
+      sed -n '2,60p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0 ;;
+    *) echo "heimdall-reap-idle: unknown argument: $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+command -v git >/dev/null 2>&1 || { echo "heimdall-reap-idle: git not found" >&2; exit 2; }
+
+# Resolve the repo root. The PRIMARY worktree is always the first entry of
+# `git worktree list` and is where .claude/worktrees/ lives, so scope is relative
+# to it — this keeps the reaper correct even when invoked from INSIDE a linked
+# agent worktree (where show-toplevel would wrongly point at the child).
+if [ -z "$REPO" ]; then
+  REPO="$(git worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10); exit}')"
+  [ -n "$REPO" ] || REPO="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+fi
+[ -n "$REPO" ] || { echo "heimdall-reap-idle: not inside a git repo (pass --repo)" >&2; exit 2; }
+REPO="$(cd "$REPO" 2>/dev/null && pwd -P)" || { echo "heimdall-reap-idle: bad --repo path" >&2; exit 2; }
+git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1 || { echo "heimdall-reap-idle: $REPO is not a git repo" >&2; exit 2; }
+
+# The reaper must never reap the worktree it is itself running from.
+SELF_WT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+[ -n "$SELF_WT" ] && SELF_WT="$(cd "$SELF_WT" 2>/dev/null && pwd -P || echo "$SELF_WT")"
+
+# Resolve the integration ref merges land on.
+resolve_main() {
+  local r
+  for r in main master; do
+    if git -C "$REPO" rev-parse --verify -q "refs/heads/$r" >/dev/null 2>&1; then
+      echo "$r"; return 0
+    fi
+  done
+  # fall back to the primary worktree's current branch
+  git -C "$REPO" rev-parse --abbrev-ref HEAD 2>/dev/null
+}
+[ -n "$MAIN_REF" ] || MAIN_REF="$(resolve_main)"
+MAIN_SHA="$(git -C "$REPO" rev-parse --verify -q "$MAIN_REF" 2>/dev/null || true)"
+[ -n "$MAIN_SHA" ] || { echo "heimdall-reap-idle: cannot resolve main ref '$MAIN_REF' in $REPO" >&2; exit 2; }
+
+AGENTPOOL="${HEIMDALL_REAP_AGENTPOOL:-$(cd "$(dirname "$0")" && pwd)/agent-pool}"
+PS_CMD="${HEIMDALL_REAP_PS_CMD:-}"
+
+# ── output helpers ───────────────────────────────────────────────────────────
+say()  { [ "$QUIET" = 1 ] || printf '%s\n' "$*"; }
+line() { # decision tag + path + reason
+  local tag="$1" path="$2" reason="$3"
+  say "$(printf '[%-5s] %s — %s' "$tag" "$path" "$reason")"
+}
+
+REAPED=0        # worktrees actually removed (--apply)
+REAP_CAND=0     # worktrees classified reapable (dry-run or apply)
+KEPT=0
+KEPT_NAMES=""
+PRUNED=0
+
+# ── enumerate + classify worktrees ───────────────────────────────────────────
+reap_worktrees() {
+  local wt_path="" wt_head="" wt_branch="" wt_detached=0 wt_locked="" wt_prunable=0
+  local line
+
+  flush_record() {
+    [ -n "$wt_path" ] || return 0
+
+    local abspath rel
+    abspath="$wt_path"
+    rel="${abspath#$REPO/}"
+
+    # The primary/main worktree and this reaper's own worktree are never targets.
+    if [ "$abspath" = "$REPO" ] || [ "$abspath" = "$SELF_WT" ]; then
+      return 0
+    fi
+
+    # SCOPE: only agent worktrees + .worktrees/*. Anything outside the repo tree
+    # or anywhere else is the operator's business — never touched.
+    case "$rel" in
+      .claude/worktrees/agent-*|.worktrees/*) : ;;
+      *) return 0 ;;  # out of scope, silent
+    esac
+
+    # A vanished directory: let git prune the dangling admin entry.
+    if [ "$wt_prunable" = 1 ] || [ ! -d "$abspath" ]; then
+      line "PRUNE" "$rel" "worktree directory is gone (dangling git entry)"
+      if [ "$APPLY" = 1 ]; then
+        git -C "$REPO" worktree prune >/dev/null 2>&1 || true
+        PRUNED=$((PRUNED+1))
+      fi
+      return 0
+    fi
+
+    # A locked worktree whose recorded agent pid is still alive => active. Skip.
+    if [ -n "$wt_locked" ]; then
+      local lpid=""
+      lpid="$(printf '%s' "$wt_locked" | grep -oE 'pid [0-9]+' | grep -oE '[0-9]+' | head -1)"
+      if [ -n "$lpid" ] && kill -0 "$lpid" 2>/dev/null; then
+        line "SKIP" "$rel" "locked, agent pid $lpid still alive (active)"
+        return 0
+      fi
+    fi
+
+    # The tip commit: branch head, or the detached HEAD.
+    local tip="$wt_head"
+    [ -n "$tip" ] || tip="$(git -C "$REPO" rev-parse --verify -q "HEAD" 2>/dev/null)"
+
+    # Core rule: tip is an ANCESTOR of main => merged/clean => reap.
+    if git -C "$REPO" merge-base --is-ancestor "$tip" "$MAIN_SHA" 2>/dev/null; then
+      local why="merged into $MAIN_REF"
+      [ "$tip" = "$MAIN_SHA" ] && why="at $MAIN_REF head (no divergence)"
+      line "REAP" "$rel" "$why"
+      REAP_CAND=$((REAP_CAND+1))
+      if [ "$APPLY" = 1 ]; then
+        # A stale lock (dead/absent pid) still blocks removal — clear it first.
+        [ -n "$wt_locked" ] && git -C "$REPO" worktree unlock "$abspath" >/dev/null 2>&1 || true
+        if git -C "$REPO" worktree remove --force "$abspath" >/dev/null 2>&1; then
+          REAPED=$((REAPED+1))
+          # Delete the now-orphan branch (proven merged; safe). Never main.
+          if [ "$wt_detached" = 0 ] && [ -n "$wt_branch" ] && [ "$wt_branch" != "$MAIN_REF" ]; then
+            git -C "$REPO" branch -D "$wt_branch" >/dev/null 2>&1 || true
+          fi
+          # Release the matching agent-pool lease (best effort).
+          if [ -x "$AGENTPOOL" ] || [ "$AGENTPOOL" = "/usr/bin/true" ]; then
+            "$AGENTPOOL" release "$(basename "$abspath")" >/dev/null 2>&1 || true
+          fi
+        else
+          line "KEEP" "$rel" "reap FAILED (git worktree remove errored) — left intact"
+        fi
+      fi
+      return 0
+    fi
+
+    # Otherwise it has commits not on main => unmerged work => KEEP, always.
+    local ahead
+    ahead="$(git -C "$REPO" rev-list --count "$MAIN_SHA..$tip" 2>/dev/null || echo '?')"
+    local name="${wt_branch:-detached@${tip:0:8}}"
+    line "KEEP" "$rel" "$ahead commit(s) not on $MAIN_REF (unmerged: $name)"
+    KEPT=$((KEPT+1))
+    KEPT_NAMES="${KEPT_NAMES:+$KEPT_NAMES, }$rel"
+    return 0
+  }
+
+  while IFS= read -r line; do
+    case "$line" in
+      "worktree "*)
+        flush_record
+        wt_path="${line#worktree }"; wt_head=""; wt_branch=""
+        wt_detached=0; wt_locked=""; wt_prunable=0 ;;
+      "HEAD "*)      wt_head="${line#HEAD }" ;;
+      "branch "*)    wt_branch="${line#branch refs/heads/}" ;;
+      "detached")    wt_detached=1 ;;
+      "locked "*)    wt_locked="${line#locked }" ;;
+      "locked")      wt_locked="(no reason)" ;;
+      "prunable "*)  wt_prunable=1 ;;
+      "")            flush_record; wt_path="" ;;
+    esac
+  done < <(git -C "$REPO" worktree list --porcelain 2>/dev/null)
+  flush_record
+}
+
+# ── idle background pollers ──────────────────────────────────────────────────
+# Narrow watcher shape: a poll LOOP hitting a deploy watcher. Nothing else.
+WATCH_TOOL_RE='gcloud +run +jobs +executions|gh +pr +(list|view|checks|status)'
+WATCH_LOOP_RE='for +[A-Za-z_]+ +in|while +(true|\[|\()|seq +[0-9]'
+POLLERS_FOUND=0
+
+reap_pollers() {
+  local mypgid ps_out
+  mypgid="$( (ps -o pgid= -p $$ 2>/dev/null || echo 0) | tr -d ' ' )"
+
+  if [ -n "$PS_CMD" ]; then
+    ps_out="$("$PS_CMD" 2>/dev/null)"
+  else
+    ps_out="$(ps -eo pid=,pgid=,command= 2>/dev/null || ps -eo pid=,pgid=,comm= 2>/dev/null)"
+  fi
+
+  [ -n "$ps_out" ] || return 0
+
+  local pid pgid cmd
+  while IFS= read -r ln; do
+    [ -n "$ln" ] || continue
+    pid="$(printf '%s' "$ln" | awk '{print $1}')"
+    pgid="$(printf '%s' "$ln" | awk '{print $2}')"
+    cmd="$(printf '%s' "$ln" | sed -E 's/^ *[0-9]+ +[0-9]+ +//')"
+    case "$pid" in ''|*[!0-9]*) continue ;; esac
+    [ "$pid" = "$$" ] && continue  # never flag ourselves
+
+    printf '%s' "$cmd" | grep -qE "$WATCH_TOOL_RE" || continue
+    printf '%s' "$cmd" | grep -qE "$WATCH_LOOP_RE" || continue
+
+    POLLERS_FOUND=$((POLLERS_FOUND+1))
+    local safe=0
+    [ -n "$mypgid" ] && [ "$mypgid" != "0" ] && [ "$pgid" = "$mypgid" ] && safe=1
+
+    if [ "$KILL" = 1 ] && [ "$safe" = 1 ]; then
+      if kill "$pid" 2>/dev/null; then
+        say "[KILL ] poller pid $pid (child of this shell) — killed: ${cmd:0:70}"
+      else
+        say "[POLLER] pid $pid — kill failed, run: kill $pid   (${cmd:0:60})"
+      fi
+    else
+      local note="report-only (rerun with --kill to terminate)"
+      [ "$safe" = 0 ] && note="not a child of this shell — kill it yourself"
+      say "[POLLER] watcher pid $pid — $note: kill $pid   (${cmd:0:60})"
+    fi
+  done <<< "$ps_out"
+}
+
+# ── run ──────────────────────────────────────────────────────────────────────
+say "heimdall-reap-idle: repo=$REPO main=$MAIN_REF@${MAIN_SHA:0:8} mode=$([ "$APPLY" = 1 ] && echo APPLY || echo DRY-RUN)"
+say "─────────────────────────────────────────────────────────────────────────"
+reap_worktrees
+reap_pollers
+
+if [ "$APPLY" = 1 ] && { [ -x "$AGENTPOOL" ] || [ "$AGENTPOOL" = "/usr/bin/true" ]; }; then
+  "$AGENTPOOL" health-check >/dev/null 2>&1 || true
+fi
+
+say "─────────────────────────────────────────────────────────────────────────"
+if [ "$APPLY" = 1 ]; then
+  printf 'SUMMARY: reaped %d worktree(s), %d kept-unmerged%s, %d pruned, %d poller(s) found\n' \
+    "$REAPED" "$KEPT" "$([ -n "$KEPT_NAMES" ] && echo " ($KEPT_NAMES)")" "$PRUNED" "$POLLERS_FOUND"
+else
+  printf 'SUMMARY (dry-run): would reap %d, %d kept-unmerged%s, %d poller(s) found — rerun with --apply to reap\n' \
+    "$REAP_CAND" "$KEPT" "$([ -n "$KEPT_NAMES" ] && echo " ($KEPT_NAMES)")" "$POLLERS_FOUND"
+fi
+
+exit 0

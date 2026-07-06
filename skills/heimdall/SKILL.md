@@ -13,6 +13,20 @@ You are operating with **Heimdall** capabilities. This skill provides autonomous
 - **Skill detection**: Use `detect-skills` to inventory installed skills
 - **Conflict logging**: Use `conflict-log` to track and resolve skill conflicts
 - **Authenticity checks**: Use `authenticity-check` to validate external packages
+- **Idle-agent reaper**: Use `heimdall-reap-idle` to reclaim stale agent worktrees + orphaned pollers
+
+## Session Hygiene — Idle-Agent Reaper
+
+Long orchestration sessions leak disk: finished subagents leave behind git worktrees under `.claude/worktrees/agent-*` (and `.worktrees/*`), plus orphaned background poll-loops that were watching a deploy. `bin/heimdall-reap-idle` reclaims them safely:
+
+- **Classifies from git, never from an agent's word.** A worktree is reaped only when its tip is an ancestor of `main` (`git merge-base --is-ancestor` → merged/clean). Any worktree carrying commits **not** on `main` is KEPT and reported by name — unmerged work is never destroyed (R2/R7: inspect from git, don't trust a truncated agent).
+- **Scope-locked.** Only agent worktrees + `.worktrees/*` are ever candidates; the main worktree, the current worktree, locked worktrees with a live agent pid, and any worktree outside the repo tree are never touched.
+- **Default-safe.** Runs as a `--dry-run` by default (mutates nothing, prints every decision). Reap for real with `--apply`. Idempotent.
+- **Pollers.** Reports orphaned `gcloud run jobs executions` / `gh pr` watcher loops with a ready-to-run kill command; `--kill` terminates only those in this shell's process group.
+
+Reap now: `bin/heimdall-reap-idle --apply`
+
+**Wired automatically:** SessionStart prints a one-line hint when merged worktrees are reapable; SessionEnd runs `heimdall-reap-idle --apply` (merged-only cleanup, never unmerged). In the **maintain cycle**, run `bin/heimdall-reap-idle --apply` at the top of each sweep so accumulated merged worktrees from prior fix/seek waves are reclaimed before new agents spawn.
 
 ## PARALLELISM IS MANDATORY — enforced at every level
 
