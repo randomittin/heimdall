@@ -1,0 +1,193 @@
+#!/usr/bin/env bash
+# heimdall-statusline-register — self-bootstrap the watchman HUD for EVERY teammate.
+#
+# THE RJ-ONLY BUG THIS FIXES. Claude Code reads `statusLine` ONLY from the user's
+# ~/.claude/settings.json (and project/enterprise settings) — NEVER from a plugin's
+# own settings.json (see the plugin docs; a plugin's bare settings.json is ignored).
+# So the working registration lived solely in ONE dev's personal settings, hardcoded
+# to that dev's absolute checkout path — it never shipped to teammates, and the path
+# broke on any other machine/username. The curl install.sh wires it for curl users
+# (ensure_statusline_registered), but a MARKETPLACE install (`claude plugins install`
+# / `/plugin install`) never runs install.sh — so those teammates still got a blank
+# enter-box. This bin closes that gap: the SessionStart hook (plugin-shipped, so it
+# reaches every install) calls it, and it self-bootstraps the HUD into the user's
+# settings at a DYNAMICALLY-RESOLVED absolute path — never a hardcoded /Users/<rj>.
+#
+# WHY AN ABSOLUTE PATH (not ${CLAUDE_PLUGIN_ROOT}). A user-level statusLine command is
+# evaluated by Claude Code with NO CLAUDE_PLUGIN_ROOT set (that var is injected only
+# for plugin-DECLARED commands). An unresolved ${CLAUDE_PLUGIN_ROOT} there expands to
+# empty → the command silently renders nothing. So we resolve the plugin root NOW —
+# from $CLAUDE_PLUGIN_ROOT if the plugin injected it (available inside the SessionStart
+# hook), else from this bin's OWN location — and BAKE that absolute path in. Portable
+# because it is each machine's own resolved path, never one dev's home.
+#
+# SUBCOMMANDS (the SessionStart hook depends on `register` — keep the interface stable):
+#   heimdall-statusline-register [register]   idempotently wire statusLine +
+#         subagentStatusLine into ~/.claude/settings.json. Prints ONE state word,
+#         ALWAYS exits 0. Never clobbers a user's own custom statusLine.
+#   heimdall-statusline-register status       read-only: print what it would do.
+#
+# STATE WORDS (printed on stdout; the installer/hook surface them):
+#   registered  — wrote/refreshed our statusLine
+#   current     — already canonical; nothing written
+#   kept-custom — the user has a non-heimdall statusLine; left untouched
+#   skipped     — python3 unavailable, no resolvable root, or the write failed
+#
+# SAFETY CONTRACT (mirrors bin/heimdall-cc-selfheal):
+#   * NEVER clobbers a user's OWN statusLine — writes only when the key is absent or
+#     already points at a heimdall statusline script (refreshing a stale path).
+#   * Atomic, key-preserving edit (tmp + os.replace) — every other settings key survives.
+#   * Missing python3 / unresolvable root / write failure = clean no-op, exit 0.
+#   * Opt out: HEIMDALL_NO_STATUSLINE_REGISTER=1 or ${HOME}/.heimdall/no-statusline-register.
+#   * Honors $CLAUDE_CONFIG_DIR (Claude Code's config override) → $HOME/.claude.
+#   * set -uo pipefail, never set -x, never echoes a secret.
+#
+# OVERRIDES / TEST SEAMS:
+#   --root <dir>                 force the plugin root (else CLAUDE_PLUGIN_ROOT, else self).
+#   CLAUDE_CONFIG_DIR            settings dir (default $HOME/.claude).
+#   HEIMDALL_STATUSLINE_SETTINGS explicit settings.json path (overrides CLAUDE_CONFIG_DIR).
+set -uo pipefail
+
+SUB="register"
+FORCE_ROOT=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    register|status) SUB="$1" ;;
+    --root) shift; FORCE_ROOT="${1:-}" ;;
+    --root=*) FORCE_ROOT="${1#--root=}" ;;
+    *) : ;;   # tolerate unknown args — never break the SessionStart hook
+  esac
+  shift
+done
+
+opted_out() {
+  [ "${HEIMDALL_NO_STATUSLINE_REGISTER:-0}" = "1" ] && return 0
+  [ -f "${HOME:-/nonexistent}/.heimdall/no-statusline-register" ] && return 0
+  return 1
+}
+
+# Resolve the plugin root to an ABSOLUTE path, dynamically, with NO hardcoded home:
+#   1) --root <dir> (explicit, e.g. install.sh passing its install dir)
+#   2) $CLAUDE_PLUGIN_ROOT — but ONLY if it actually contains our statusline script
+#      (the plugin injects it inside hooks; guard against a stale/foreign value)
+#   3) this bin's own location: <root>/bin/heimdall-statusline-register → <root>
+resolve_root() {
+  local r
+  if [ -n "$FORCE_ROOT" ]; then printf '%s' "$FORCE_ROOT"; return 0; fi
+  if [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -x "${CLAUDE_PLUGIN_ROOT}/hooks/statusline.sh" ]; then
+    printf '%s' "$CLAUDE_PLUGIN_ROOT"; return 0
+  fi
+  # cd-based resolution (portable; no readlink -f dependency). $0 here is a full path
+  # in both call sites (install.sh passes it; the hook invokes "$PLUGIN/bin/…").
+  local bindir
+  bindir="$(cd "$(dirname "$0")" 2>/dev/null && pwd)" || return 1
+  r="$(cd "$bindir/.." 2>/dev/null && pwd)" || return 1
+  printf '%s' "$r"
+}
+
+opted_out && { printf 'skipped'; exit 0; }
+command -v python3 >/dev/null 2>&1 || { printf 'skipped'; exit 0; }
+
+ROOT="$(resolve_root)"
+if [ -z "$ROOT" ] || [ ! -x "$ROOT/hooks/statusline.sh" ]; then
+  # No resolvable, valid plugin root → registering an unrenderable line is pointless.
+  printf 'skipped'; exit 0
+fi
+
+CFG="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+SETTINGS="${HEIMDALL_STATUSLINE_SETTINGS:-$CFG/settings.json}"
+
+if [ "$SUB" = status ]; then
+  HMD_SL_PLUGIN="$ROOT" HMD_SL_SETTINGS="$SETTINGS" HMD_SL_MODE=status python3 - <<'PY' 2>/dev/null || printf 'skipped'
+import json, os
+plugin = os.environ["HMD_SL_PLUGIN"]; path = os.environ["HMD_SL_SETTINGS"]
+def cmd(rel):
+    p = plugin + "/" + rel
+    return "bash -c '[ -x \"%s\" ] && exec bash \"%s\"; exit 0'" % (p, p)
+WANT = {"statusLine": ("hooks/statusline.sh", cmd("hooks/statusline.sh")),
+        "subagentStatusLine": ("hmd-subagent-statusline.sh", cmd("sentinels/hmd-subagent-statusline.sh"))}
+try:
+    data = json.load(open(path))
+    if not isinstance(data, dict): data = {}
+except Exception:
+    data = {}
+sl = data.get("statusLine")
+if isinstance(sl, dict) and "hooks/statusline.sh" not in (sl.get("command") or "") and sl.get("command"):
+    print("kept-custom"); raise SystemExit
+need = False
+for key,(marker,val) in WANT.items():
+    cur = data.get(key)
+    if cur is None or (isinstance(cur, dict) and marker in (cur.get("command") or "")):
+        if (cur or {}).get("command") != val: need = True
+print("would-register" if need else "current")
+PY
+  echo
+  exit 0
+fi
+
+# ── register: idempotent, atomic, custom-preserving merge (identical command form to
+# install.sh's ensure_statusline_registered so both propagation paths converge). ──
+HMD_SL_PLUGIN="$ROOT" HMD_SL_SETTINGS="$SETTINGS" python3 - <<'PY' 2>/dev/null || { printf 'skipped'; exit 0; }
+import json, os, sys, tempfile
+
+plugin = os.environ["HMD_SL_PLUGIN"]
+path   = os.environ["HMD_SL_SETTINGS"]
+
+def cmd(rel):
+    p = plugin + "/" + rel
+    # The proven working form: absolute path, [ -x ] guard, exit 0. Byte-identical to
+    # install.sh so a machine wired by either path holds the same registration.
+    return "bash -c '[ -x \"%s\" ] && exec bash \"%s\"; exit 0'" % (p, p)
+
+WANT = {
+    "statusLine":         {"marker": "hooks/statusline.sh",
+                           "value": {"type": "command", "command": cmd("hooks/statusline.sh")}},
+    "subagentStatusLine": {"marker": "hmd-subagent-statusline.sh",
+                           "value": {"type": "command", "command": cmd("sentinels/hmd-subagent-statusline.sh")}},
+}
+
+try:
+    with open(path) as fh:
+        data = json.load(fh)
+    if not isinstance(data, dict):
+        data = {}
+except Exception:
+    data = {}
+
+wrote = custom = False
+for key, spec in WANT.items():
+    cur = data.get(key)
+    ours = cur is None or (isinstance(cur, dict) and spec["marker"] in (cur.get("command") or ""))
+    if not ours:
+        custom = True
+        continue
+    if cur != spec["value"]:
+        data[key] = spec["value"]
+        wrote = True
+
+if wrote:
+    d = os.path.dirname(path) or "."
+    try:
+        os.makedirs(d, exist_ok=True)
+    except Exception:
+        print("skipped"); sys.exit(0)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".settings.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            json.dump(data, fh, indent=2)
+            fh.write("\n")
+        os.replace(tmp, path)
+    except Exception:
+        try: os.unlink(tmp)
+        except OSError: pass
+        print("skipped"); sys.exit(0)
+
+sl = data.get("statusLine")
+if isinstance(sl, dict) and WANT["statusLine"]["marker"] in (sl.get("command") or ""):
+    print("registered" if wrote else "current")
+elif custom:
+    print("kept-custom")
+else:
+    print("skipped")
+PY
+exit 0
