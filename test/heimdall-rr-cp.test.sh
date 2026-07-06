@@ -330,6 +330,56 @@ else
   echo "  SKIP (11) dedup-notice round-trip — no crypto backend (cryptography|pynacl)"
 fi
 
+# ── (12) BUG #23 — the CLIENT sanitizes/extracts the Claude token BEFORE signing/posting ──────────
+#    `claude setup-token` prints a DECORATED interactive UI (ANSI + banner), so
+#    `export CLAUDE_CODE_OAUTH_TOKEN="$(claude setup-token)"` captures the whole dump, not the token.
+#    `rr connect` runs it through the SHIPPED claude_cred oracle (the same shape grammar the server
+#    enforces): extract the ONE sk-ant-oat…/sk-ant-api… token, or REFUSE. This proves both the oracle
+#    contract the client relies on AND that bin/rr is wired to call it + refuse (grep-falsifiable).
+echo "(12) BUG #23 client token sanitize/extract — decorated setup-token dump -> the clean token, or refuse"
+C12_OUT="$WORK/c12.out"
+"$PY" - >"$C12_OUT" 2>/dev/null <<PYEOF
+import json, os, secrets, sys
+sys.path.insert(0, "$ROOT/bin/lib")
+import claude_cred as C
+ESC = "\x1b"
+tok = "sk-ant-oat01-" + secrets.token_urlsafe(70)
+# (a) the ~2199-char decorated \`claude setup-token\` dump: ANSI + banner + the token buried.
+spinner = "".join(ESC + "[2K" + ESC + "[1G" + f for f in ["-", "\\\\", "|", "/"] * 60)
+banner = (ESC + "]0;claude\x07" + ESC + "[1mWelcome to Claude Code" + ESC + "[0m\r\n"
+          "Your OAuth token:\r\n" + ESC + "[32m" + tok + ESC + "[0m\r\n"
+          "Visit https://console.anthropic.com/oauth/authorize?x=1 to continue\r\n")
+blob = spinner + banner + (ESC + "[2K") * 200
+out = {
+    "blob_big": len(blob) >= 2199,
+    "a_decorated_extracts_clean": C.extract_claude_token(blob) == tok,
+    "b_clean_unchanged": C.extract_claude_token(tok) == tok,
+    "c_junk_none": C.extract_claude_token("no token here\x1b[0m just words") is None,
+    "d_two_tokens_none": C.extract_claude_token(
+        tok + " " + "sk-ant-api03-" + secrets.token_urlsafe(70)) is None,
+    "d_same_twice_ok": C.extract_claude_token(tok + "\n" + tok) == tok,
+}
+sys.stdout.write(json.dumps(out))
+PYEOF
+c12() { "$PY" -c "import json;print(json.load(open('$C12_OUT')).get('$1'))" 2>/dev/null; }
+[ "$(c12 blob_big)" = "True" ] || bad "12.0 fixture broken: the reconstructed dump is < 2199 chars"
+[ "$(c12 a_decorated_extracts_clean)" = "True" ] \
+  && ok "12.1 the 2199-char decorated dump -> the CLEAN buried sk-ant-oat token (a)" || bad "12.1 decorated dump did not extract clean (see $C12_OUT)"
+[ "$(c12 b_clean_unchanged)" = "True" ] \
+  && ok "12.2 a clean token is returned UNCHANGED (b)" || bad "12.2 clean token altered"
+[ "$(c12 c_junk_none)" = "True" ] \
+  && ok "12.3 junk with no token -> None (client refuses) (c)" || bad "12.3 junk not rejected"
+[ "$(c12 d_two_tokens_none)" = "True" ] && [ "$(c12 d_same_twice_ok)" = "True" ] \
+  && ok "12.4 two DISTINCT tokens -> None (ambiguous, refuse); the same token twice -> that token (d)" || bad "12.4 ambiguity handling wrong"
+# bin/rr WIRING (grep-falsifiable): do_connect extracts via cp_extract_token_py and REFUSES on empty.
+if grep -q 'cp_extract_token_py' "$RR" \
+   && grep -q 'the token looks wrong — paste ONLY the sk-ant-oat' "$RR" \
+   && grep -q 'claude_cred.extract_claude_token' "$RR"; then
+  ok "12.5 bin/rr connect is WIRED to sanitize+extract the cred (cp_extract_token_py) and REFUSE a non-clean value"
+else
+  bad "12.5 bin/rr connect is missing the sanitize/extract/refuse wiring"
+fi
+
 echo
 echo "════════════════════════════════════════════════════════════════════════════"
 printf "rr-cp: \033[32m%d passed\033[0m, " "$PASS"

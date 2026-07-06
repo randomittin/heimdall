@@ -691,6 +691,23 @@ do_connect() {
   fi
   [ -n "$cred_secret" ] || die "no credential provided — set CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_API_KEY or paste when prompted"
 
+  # BUG #23 — SANITIZE + VALIDATE the Claude cred at the CLIENT boundary before it is ever
+  # signed/posted. `claude setup-token` prints a DECORATED interactive UI (ANSI escape
+  # sequences + a "Welcome to Claude Code" / "Your OAuth token:" banner + the authorize URL),
+  # so `export CLAUDE_CODE_OAUTH_TOKEN="$(claude setup-token)"` captures the whole ~2199-char
+  # decorated dump, NOT the clean token. Stored as-is, `claude` gets `Bearer <ansi junk>` ->
+  # "Header has invalid value" -> interactive fallback -> GATE_FAILED, 0 files. Strip ANSI/
+  # control, collapse whitespace, EXTRACT the one sk-ant-oat…/sk-ant-api… token by shape.
+  # Zero / junk / two distinct tokens -> REFUSE (never post a non-clean value). The secret
+  # crosses to python via the ENV ONLY (never argv/log); nothing of the token is printed.
+  local clean_secret
+  clean_secret="$(RR_RAW_SECRET="$cred_secret" cp_extract_token_py)"
+  if [ -z "$clean_secret" ]; then
+    unset cred_secret
+    die "the token looks wrong — paste ONLY the sk-ant-oat… value from \`claude setup-token\` (the token itself, not the whole decorated output)"
+  fi
+  cred_secret="$clean_secret"; unset clean_secret   # use the CLEAN extracted single token.
+
   say "signing + posting the tenant credential to the control plane ($CP_URL/team/cred)…"
   local resp kind a b
   resp="$(CP_REG_PATH=/team/cred CP_REG_KIND="$cred_kind" CP_CRED_SECRET="$cred_secret" cp_register_py)"
@@ -749,6 +766,22 @@ do_connect() {
 # seed read / network (the dry-run plan uses this). Emits one tab-record: `OK\t<a>\t<team_id>` on 2xx
 # (a = kind for cred, installation_id for install), `HTTP\t<code>\t<err>` on an HTTP refusal, or
 # `ERR\t<reason>` on no-seed/transport.
+# cp_extract_token_py — SANITIZE + EXTRACT the clean Claude token from RR_RAW_SECRET (bug #23).
+# Reuses the SHIPPED claude_cred oracle (the SAME shape grammar the server enforces). The raw
+# value crosses via the ENV ONLY (never argv). Prints the ONE clean sk-ant-oat…/sk-ant-api…
+# token on success, or NOTHING (empty) when zero / junk / ambiguous — so the caller refuses.
+# Nothing of the token is otherwise emitted (no log/echo/repr).
+cp_extract_token_py() {
+  LIB="$LIB" "$PY" - <<'PYEOF'
+import os, sys
+sys.path.insert(0, os.environ["LIB"])
+import claude_cred
+tok = claude_cred.extract_claude_token(os.environ.get("RR_RAW_SECRET") or "")
+if tok:
+    sys.stdout.write(tok)
+PYEOF
+}
+
 cp_register_py() {
   LIB="$LIB" CP_URL="$CP_URL" CP_HAID="$CP_HAID" CP_SEED_FILE="$CP_SEED_FILE" \
   "$PY" - <<'PYEOF'
