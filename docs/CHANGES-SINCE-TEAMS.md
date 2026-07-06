@@ -5,19 +5,19 @@ team features through the current head. Grouped by theme, not chronology.
 
 ## Header — method, anchor, honesty
 
-- **Head at time of writing:** `bb8d061` (`refs/heads/main`).
-- **Pushed frontier:** `origin/main` = `6202149` (release v2.0.12). Everything
-  below `6202149..bb8d061` is **unpushed** — the checkpoint counts it at **~85
-  commits ahead**; RJ pushes.
-- **Sourcing note (honest):** this environment has no `git` CLI and no `rg`
-  (ripgrep) — `git show --stat` could not be run. Every SHA cited here is read
-  directly from git's own on-disk record, `.git/logs/HEAD` (the 299-entry HEAD
-  reflog spanning 2026-06-23 → 2026-07-06), cross-checked against the tracked
-  planning ledger `.planning/experiments.jsonl` and `.planning/CHECKPOINT.md`.
-  SHAs are quoted in their 7-char short form as they appear in the reflog. A
-  handful of bug-fix SHAs (`cca7381`, `fa23a7d`, `00b0b3f`, `9c5aca5`) live
-  inside squashed worktree merges and are cited from the experiments ledger's
-  `refs` field rather than the top-level reflog.
+- **Head at time of writing:** `b0616d5` (`refs/heads/main` = `origin/main`).
+- **Pushed frontier:** `origin/main` = `b0616d5` (released v2.0.13). Everything
+  is **pushed and released** — no unpushed commits. The prior draft (anchor
+  `bb8d061`) had ~85 unpushed commits; this update covers `bb8d061..b0616d5`
+  (the final arc, §h–§m).
+- **Sourcing note (corrected):** the prior draft was written without `git` CLI
+  access — SHAs were sourced from `.git/logs/HEAD` reflog and
+  `.planning/experiments.jsonl`. That constraint no longer applies: `git` IS
+  available. Every SHA cited in the new sections (§h–§m) was sourced directly
+  from `git log --oneline bb8d061..b0616d5` and verified with `git cat-file -e`.
+  Earlier-section SHAs remain as sourced and are correct. A handful of bug-fix
+  SHAs (`cca7381`, `fa23a7d`, `00b0b3f`, `9c5aca5`) still live inside squashed
+  worktree merges and are cited from the experiments ledger.
 - **Anchor choice:** `28d7c4f` — `docs(team): team-mode design dossier — STEP-0
   inventory (2 naming traps caught), P1 activity-record schema + P2 gate-surface
   + P3 collision`. This is the first commit that names and specifies team
@@ -102,14 +102,15 @@ and threat-model docs added in `bbe2c97` are the canonical W1–W5 spec.
 
 ---
 
-## (c) The cloud maintainer pipeline — rr, dispatch, Cloud Run Jobs, the 15-bug ladder
+## (c) The cloud maintainer pipeline — rr, dispatch, Cloud Run Jobs, the 29-bug ladder
 
 This is the flagship: `bin/rr` submits a repo/issue to the public surface, which
 dispatches an isolated **Cloud Run Job** (`heimdall-maintainer-job`) that clones
 the target, runs the maintainer, and opens a PR. Bringing it up in production
-exposed a **15-bug ladder** — almost every bug was a *deployed-shape* break that
-works locally and fails only in the real container/GFE/IAM environment. Bugs
-1–14 are fixed and merged; bug 15 is the sole open blocker.
+exposed a **29-bug ladder** — almost every bug was a *deployed-shape* break
+invisible locally, surfacing only in the real container/GFE/IAM environment.
+Bugs 1–15 are covered here; bugs 16–29 (the final arc to the first autonomous PR)
+appear in §(h). All 29 are fixed and closed.
 
 rr / dispatch / job plumbing:
 
@@ -120,7 +121,7 @@ rr / dispatch / job plumbing:
 - `548576b` merge feat/deploy-public-rr — public rr surface deploy
 - (`cp-job-runner-cloudrun`, `cp-job-runner-runbook`, `cp-job-hardening`, `cp-dispatch-loud-log`, `cp-getjobs-readpath`/`query-param` merged through the job read-path train)
 
-The 15-bug bring-up ladder (cause → fix; ledger = `.planning/experiments.jsonl`, `.planning/CHECKPOINT.md`):
+The 29-bug bring-up ladder — bugs 1–15 (cause → fix; ledger = `.planning/experiments.jsonl`, `.planning/CHECKPOINT.md`):
 
 1. **missing-sm-dep** — `/team/cred` 503: `google-cloud-secret-manager` in the local venv, absent in the CP image → add it + build-time import guard. `96cfc19`, `1460ec0`
 2. **cred-forward-least-priv** — public SA can't write Secret Manager under prod least-privilege → forward public→gated `/team/cred` over authenticated s2s + `run.invoker`; keep read/dispatch forbidden. `cca7381`, `fa23a7d`
@@ -155,7 +156,7 @@ maintainer autopilot round out the reliability surface.
 - `508f247` merge billing-kill-switch — spend circuit-breaker
 - `d6254d6` merge(maintain-loop): durable in-session maintainer autopilot (`--receipt` + `--heartbeat`)
 - `31f49ae` wip(cp-hybrid): `cp_maintainer_runner` — heartbeat/select/failover/park + scheduler routing + `runner-beat` verb
-- `bb8d061` merge worktree-agent-a478d283 — CAS pick + periodic resume + running-lease (MUST cover bug 15's runner-honoring resume) — **current HEAD**
+- `bb8d061` merge worktree-agent-a478d283 — CAS pick + periodic resume + running-lease (runner-honoring resume = bug 15; fix landed in `a0edb19`)
 - `9795c37` merge worktree-agent-a7ab547f — ops-hardening script: alerting / TTL / PITR (applied via gcloud post-merge)
 
 ---
@@ -176,7 +177,7 @@ discipline keeps secrets out of surfaced subprocess output.
 - `06684be` fix(presence): sever server PKI var from the dev path + honest leak-test
 - `da85ffc` chore(secret-scan): allowlist the confirmed-fake enroll fixture by fingerprint
 - scrub/`error_tail` discipline: bug 6 fix surfaces only *scrubbed* subprocess stderr; secrets never in argv/logs/chat
-- **F1 (token rotation):** OPEN — RJ rotates `sk-ant-oat01-…` once the run-8 PR lands; leaked token is NOT in the repo (audit-verified).
+- **F1 (token rotation):** CLOSED — `sk-ant-oat01-…` revoked; fresh credential in SM v4, old versions disabled. See §k.
 
 ---
 
@@ -189,7 +190,7 @@ viral loop's #1 starter — the **PR-footer CTA** — ships in `issue_pr.py` alo
 `rr status`, loud enroll, and a dedup notice. A teams growth strategy doc maps the
 Slack playbook to `hmd` with wave-gated phases and a Cursor-for-teams revenue
 model. A self-improve/autoresearch corpus plus a **deployed-shape preflight**
-(warn-only in the deploy scripts) encodes the 15-bug lessons so future bring-ups
+(warn-only in the deploy scripts) encodes the 29-bug lessons so future bring-ups
 catch them earlier.
 
 - `b4b84fc` docs(readme): install-first repo front door — pin v2.0.5, honest GENERALIZES (0.50/8 repos → /proof), capability table
@@ -228,7 +229,138 @@ version-bump/tag/Release close the loop so shipped bumps actually reach clients.
 - `7d9e020` fix(go-live): mount `HEIMDALL_GH_APP_ID` + `HEIMDALL_GH_APP_PRIVATE_KEY` on the gated service (mint_failed fix)
 - `af8ec47` feat(github-app): add `Actions:read` to the App perm set (Workflows:write stays per-team opt-in)
 - Auto-update / ship: `b7b9707` + `2896a45` (SessionStart auto-update), `d3d2367` (auto version-bump + tag + Release), `c1a4bee` (self-heal native auto-update)
-- Releases in-window: `81826b5` v2.0.6 · `bdd76f8` v2.0.7 · `c9b4cb3` v2.0.8 · `fba3d7f` v2.0.9 · `1835f75` v2.0.10 · `1c42efd` v2.0.11 · `6202149` v2.0.12 (the aborted `v2.1.0`/`v3.0.0`/`v9.9.9` autobump-test tags were reset, never on main)
+- Releases in-window: `81826b5` v2.0.6 · `bdd76f8` v2.0.7 · `c9b4cb3` v2.0.8 · `fba3d7f` v2.0.9 · `1835f75` v2.0.10 · `1c42efd` v2.0.11 · `6202149` v2.0.12 · `b0616d5` v2.0.13 (the aborted `v2.1.0`/`v3.0.0`/`v9.9.9` autobump-test tags were reset, never on main)
+
+---
+
+## (h) The final arc — bugs #16–#29 and the first autonomous PR
+
+**The headline:** after 29 deployed-shape bugs fixed, the cloud maintainer ran
+end-to-end and opened **PR #5 on `randomittin/heimdall-maintainer-test`** —
+correct `sum_range` off-by-one fix, authored under bot identity, clean diff
+scope. Proven on real Cloud Run + Firestore. No hand-holding.
+
+Bugs 16–29 (cause → fix):
+
+16. **F2-condition-ripple** — `--condition=None` missing on unconditional project
+    IAM bindings; the F2 SA-narrowing broke them silently. `052d5a6`, `15f3f2c`
+17. **tick-blocked-unbounded-scan** — unbounded `list_names` Firestore scan
+    blocked the tick thread; bounded reads + prefix pushdown + page-cap + 55-sec
+    watchdog per step. `9305e35`, `484fba9`
+18. **W4-env-dropped-on-redeploy** — `RR_TENANT_AUTHZ` + `TEAM_CRED_STORE`
+    silently dropped by a destructive `set-env-vars` on a direct go-live run,
+    disabling the drain. `181d9b2`
+19. **rev-none-cas-exhaustion** — legacy rev-less Firestore records were
+    unclaimable; CAS exhaustion conflated with empty queue (silent drop). Loud
+    CAS exhaustion + `_rev_of` rev-None parity. `e063b05`, `361a15e`
+20. **fix-cycle-never-invoked-claude** — the fix cycle emitted log lines but
+    never actually called `claude`; added headless flags, loud `fix_attempt`
+    telemetry, `HEIMDALL_FIX_WITH_CLAUDE` gate. `19a99f9`, `bf455fe`
+21. **pr-no-diff** — `gh pr create` ran before `git commit`+`push`, so the
+    opened PR carried no diff. Fix: commit fix onto `heimdall/issue/<id>` (bot
+    identity), push via token-in-env (`force-with-lease`, never main), THEN
+    create PR. `848ef19`, `96f1b8e`
+22. **claude-config-dir-lost-in-chain** — `CLAUDE_CONFIG_DIR` dropped through
+    the handler→fix-child env chain; `claude` headless could not locate its
+    credential. Path threaded through both links. `f8dfb2e`, `c0e2dc7`
+23. **corrupt-credential-ingestion** — the setup-token was stored as a decorated
+    blob (full `claude setup-token …` invocation string), not the raw key;
+    ingestion never stripped the decoration → every fix attempt authed with
+    garbage. Shared `claude_cred` oracle added at client (`rr connect`) and
+    server (`/team/cred`). `4416623`, `5554034`
+24. **pytest-not-in-image-and-dirty-scope** — container lacked `pytest` and the
+    target repo's dependencies; pushed branch included `__pycache__`/venv.
+    Bootstrap deps before evidence run; strip non-source files from the pushed
+    branch. `5facaa6`, `0fb43dc`
+25. **whole-suite-as-gate** — evidence ran the entire test suite, not the
+    issue-specific named test; non-deterministic cross-issue failures. Gate on
+    the issue's named gating-test node (injection-safe extraction); whole-suite
+    demoted to advisory. `9cc8c4d`, `17fa2a2`
+26. **app-jwt-fallback-in-gh** — `gh pr create` fell back to App-JWT (not
+    installation token) when `GH_CONFIG_DIR` was unset; PR created under App
+    identity instead of bot. Fix: single cleaned installation token + isolated
+    `GH_CONFIG_DIR`, no fallback. `51d16d2`, `34ef3e0`
+27. **test-not-reconciled-to-bug21** — `heimdall-issue-pr-bot` test used the
+    pre-bug-21 contract; post-push semantics broke it. Updated: hermetic bare
+    origin + bot-identity branch assertion. `da36a70`, `6cef006`
+28. **KEYSTONE — phantom-PR_OPEN** — `open_pr`'s return value was discarded; a
+    `gh pr create` failure silently faked `PR_OPEN`. Every run since bug #21 had
+    been reporting success while failing. New honest `PR_FAILED` state (branch
+    pushed, PR not created): flagged, loud, re-runnable; `pr` node propagated to
+    the job row. See §(m) for the meta-lesson. `3672b8a`, `1b10c2f`
+29. **gh-pr-create-no-git-repo** — `gh pr create` ran with the agent's CWD (no
+    `.git`), not the clone root; `not a git repository` error on run 15. Fix:
+    `--repo <slug>` + `cwd=<clone>`. `a28b12e`, `28dc8dd`
+
+**Result:** `10a036d` — `heimdall: checkpoint — FIRST AUTONOMOUS PR (#5) landed;
+bugs 1-29 closed, maintainer proven end-to-end`.
+
+---
+
+## (i) Prompt-injection hardening of the fix-step
+
+The fix-step runs `claude` (headless) against untrusted issue content. Two
+hardening commits landed before the final run arc:
+
+- `cf3c7b5` / `63ee326` fix(security): **Bash dropped from coder tools** in the
+  fix-child invocation; untrusted issue content reframed as
+  `<untrusted-content>`; child env scrubbed of all credentials not needed for
+  the fix cycle (only `CLAUDE_CONFIG_DIR` + a scoped `GH_TOKEN` pass through).
+  A malicious issue body cannot escape the diff surface via shell execution.
+
+---
+
+## (j) Idle-agent auto-reaper
+
+Stale worktrees and orphaned pollers leaked disk + poll cycles across sessions.
+A new `bin/heimdall-reap-idle` script reaps them automatically:
+
+- `a714e74` / `17ea17a` feat(reap): **merged worktrees reaped on SessionEnd**;
+  **unmerged worktrees always kept** (no data loss). Orphaned pollers (background
+  `hmd team` processes without a live session) swept. SessionEnd hook runs
+  `--apply` immediately; SessionStart hook prints a hint if stale worktrees
+  remain. Falsifier-tested: a worktree with unmerged commits survives reap.
+
+---
+
+## (k) Release hygiene — gitleaks unblock, token rotation, v2.0.13
+
+Several hygiene items closed the window before v2.0.13 ship:
+
+- **Gitleaks history unblock** — `5502677` broke the token-shaped sentinel in
+  the team-queue test fixture (a benign literal mis-authored before the
+  fixture-secret convention). `ea1315c` completed the unblock: broke all live
+  fixture tokens per convention + added `.gitleaksignore` fingerprints for
+  confirmed-benign history entries, unblocking the `ship.sh` gitleaks gate.
+- **Token rotation (F1 CLOSED)** — the `sk-ant-oat01-…` key that appeared in
+  history was revoked; a fresh credential stored in Secret Manager (SM v4), old
+  versions disabled. F1 from the security audit (§e) is now CLOSED.
+- **Stray bot-branch cleanup** — orphaned `heimdall/issue/*` branches left by
+  failed pre-#28 runs cleaned from `randomittin/heimdall-maintainer-test`.
+- **v2.0.13** — `b0616d5` chore(release): v2.0.13 — the final arc pushed,
+  tagged, and released.
+
+---
+
+## (m) Meta-lesson — the deployed-shape / silent-failure class
+
+The last ~14 bugs (#16–#29) all share a pattern: **silent success masking real
+failure**, each invisible until the prior loud-guard forced the noise outward.
+The progression is not coincidence — it is the shape of layered silent-failure
+systems revealing themselves one guard at a time.
+
+**Bug #28 is the architectural keystone.** By discarding `open_pr`'s return
+value, the loop had been reporting `PR_OPEN` for every run since bug #21 — even
+when `gh pr create` failed. No test caught it because none asserted the loop's
+returned state. Fixing it turned every subsequent run's phantom success into an
+honest quoted error, and bugs #29 through the first autonomous PR fell quickly
+after.
+
+The recurring pattern that exposed each new layer: **surface the real error,
+named and scrubbed, never a silently caught exception**. Applied at: tick
+exhaustion (#19), fix-cycle invocation (#20), PR create result (#28), `gh` CWD
+(#29). The `error_tail` discipline from bug #6 is the same lesson, twelve bugs
+earlier.
 
 ---
 
@@ -236,47 +368,41 @@ version-bump/tag/Release close the loop so shipped bumps actually reach clients.
 
 - **Tenant:** team `6ca551f2`, install `144263218`, repo
   `randomittin/heimdall-maintainer-test` (4 maintainer issues seeded).
-- **Services/images:** gated dispatch service image `1498119` — **STALE vs
-  main**, needs a rebuild; JOB image `b0ffc7d5` = `66c3ee0` — **correct**
-  (byte-verified). Background tick healthy at 1/min.
-- **Proven end-to-end:** signed HTTP surface (401/422 cardinals), presence +
-  enroll + `roster-public`, per-execution isolated dispatch, Cloud Run Job
-  clone→maintainer→PR path — all 14 fixed bugs verified in prod or by test.
-- **Blocked:** task `abec8dac` consumed by the bug-15 in-process steal.
-  **NO PR YET.**
-- **Head:** `bb8d061` (main); `origin/main` at `6202149` (v2.0.12).
+- **Services/images:** both gated and public images rebuilt and released as
+  v2.0.13. Background tick healthy at 1/min.
+- **Proven end-to-end:** PR #5 opened autonomously on
+  `randomittin/heimdall-maintainer-test` — correct `sum_range` off-by-one fix,
+  bot identity, clean diff scope, real Cloud Run + Firestore. All 29 bugs
+  closed.
+- **Head:** `b0616d5` (main = origin/main, PUSHED, released v2.0.13).
 
 ## Outstanding items
 
-- **Bug 15 (resume_orphans in-process steal)** — the one open ladder bug; fix
-  must land in the CAS/resume agent (runner-honoring resume + young-job grace).
-- **F1 — token rotation** — RJ rotates `sk-ant-oat01-…` after the PR lands.
-- **Run-8 PR — pending** — resume sequence: merge remaining agents → full gate →
-  rebuild BOTH images (`deploy-public-rr.sh` + `deploy-arch-b.sh`) → apply
-  ops-hardening + F2 IAM → `bin/rr` fresh submit → run 8 → PR on
-  `randomittin/heimdall-maintainer-test`.
-- **~85 unpushed commits** (`6202149..bb8d061`) — RJ pushes.
-- **Gated service image rebuild** — `1498119` is behind main.
-- **Spend-cap fix** — per-team/day cap in `cp_maintainer_runner`, next after the
-  F2 agent frees the file.
+- **F1 token rotation** — CLOSED: `sk-ant-oat01-…` revoked; SM v4 active, old
+  versions disabled (see §k).
+- **Gitleaks gate** — CLOSED: `ea1315c` unblocks `ship.sh` (see §k).
+- **Site repo** — hero/proof/team/growth pages live in the separate site repo
+  (`4c3362e`); independent of this tree.
+- **Spend-cap tuning** — per-team/day caps shipped (`13f3ce6`); further parameter
+  tuning deferred to post-v2.0.13.
 
 ## Test-coverage stats (as sourced; honest)
 
-A full `pytest` suite count is not derivable from the git/planning record
-without running the suite, and the git CLI is unavailable in this environment —
-so rather than invent a number, here are the concrete, ledger-traceable gate and
-oracle figures:
+`git` is now available in this environment; a fresh `pytest` run gives exact
+counts. The following are concrete, ledger-traceable figures from the bug-fix
+arc:
 
-- **Bug ladder:** 15 found; **14 verified** (`verified-in-prod` or
-  `verified-by-test` per `.planning/experiments.jsonl`), 1 open.
+- **Bug ladder:** 29 found; **29 verified** (all `verified-in-prod` or
+  `verified-by-test` per `.planning/experiments.jsonl`). No open bugs.
 - **cp-wired §10 assembly gate** (`56d2eea`): full signed-HTTP flow gate;
   falsifiable — commenting `boot()` drops it 34 → 24/10.
 - **cp-getjobs read-path** (`2c5d24a` train): 10/10, with query-mismatch
   falsifiers → 401 either direction.
 - **cp-public-surface boundary falsifier** (`31c92c2`): gated routes must 404 on
   the public service.
+- **maintain-loop** (`19113ab`): 41/41 with cp-maintainer 27/0 + cp-job-execution 41/0.
+- **idle-agent reaper falsifier** (`17ea17a`): unmerged worktree survives reap.
 - **README GENERALIZES claim** (`b4b84fc`): honest 0.50/8 repos → `/proof`.
-- **Audits** (`docs/analysis/`): security = CONDITIONAL GO, prod-readiness top-5
-  logged, viral-readiness names the PR-footer CTA as the #1 loop-starter.
-</content>
-</invoke>
+- **Audits** (`docs/analysis/`): security = CONDITIONAL GO → F1 CLOSED, F2
+  applied; prod-readiness top-5 all closed; viral-readiness PR-footer CTA
+  shipped.
