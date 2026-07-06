@@ -875,6 +875,131 @@ else
 fi
 
 echo
+echo "── (9) BUG #29 — gh pr create gets --repo <slug> + runs with cwd=<workspace clone> ──"
+# The defect: the branch PUSH ran with cwd=<clone> (git -C clone) and SUCCEEDED, but the
+# `gh pr create` arm shelled out to `git` to resolve the repo/remote from a cwd that was NOT
+# the clone -> "fatal: not a git repository" -> exit 1, the PR never opened (prod run-15: push
+# ok, pr.error="failed to run git: fatal: not a git repository"). The fix makes gh INDEPENDENT
+# of cwd git-introspection two ways: (1) build_gh_create_command passes --repo <slug> (gh then
+# talks to the API by slug, no local .git needed) AND (2) gh_bot_runner runs gh with
+# cwd=<workspace clone> (so any residual git introspection finds the real repo). Belt + braces.
+
+# (9a) build_gh_create_command carries --repo <owner/name>, sanitized from issue.source_ref.
+BGCC_OUT="$(ISSUE_JSON="$ISSUE_JSON" "$PY" - <<'PYEOF'
+import json, os
+import issue_pr
+issue = json.loads(os.environ["ISSUE_JSON"])
+print(json.dumps(issue_pr.build_gh_create_command(issue, "fix: x", "/tmp/body.md", base="main")))
+PYEOF
+)"
+if printf '%s' "$BGCC_OUT" | jq -e 'index("--repo") as $i | $i != null and .[$i+1] == "acme/widget"' >/dev/null 2>&1; then
+  ok "build_gh_create_command passes --repo acme/widget (gh resolves the repo by slug, not cwd .git)"
+else
+  bad "build_gh_create_command did NOT pass --repo <owner/name> — bug #29 (gh falls back to cwd git introspection): $BGCC_OUT"
+fi
+
+# a fake gh that RECORDS its argv + $PWD, then MIMICS real gh's repo resolution:
+#   • with --repo <slug>: hit the API by slug — NO local .git needed (exit 0 + url).
+#   • without --repo: introspect the cwd's git repo (git rev-parse) — exactly the prod path;
+#     a non-git cwd -> the run-15 "fatal: not a git repository" failure (exit 1).
+REPOGH="$WORK/repoghbin"; mkdir -p "$REPOGH"
+GH29_PWD="$WORK/gh29_pwd.txt";   export GH29_PWD
+GH29_ARGV="$WORK/gh29_argv.txt"; export GH29_ARGV
+cat > "$REPOGH/gh" <<'GHEOF'
+#!/usr/bin/env bash
+printf '%s\n' "$PWD" > "$GH29_PWD"
+: > "$GH29_ARGV"; for a in "$@"; do printf '%s\n' "$a" >> "$GH29_ARGV"; done
+slug=""; prev=""
+for a in "$@"; do [ "$prev" = "--repo" ] && slug="$a"; prev="$a"; done
+if [ -n "$slug" ]; then
+  echo "https://github.com/$slug/pull/29"; exit 0          # API by slug — no cwd .git needed
+fi
+if git rev-parse --git-dir >/dev/null 2>&1; then
+  echo "https://github.com/acme/widget/pull/29"; exit 0    # resolved from the cwd's git repo
+fi
+echo "failed to run git: fatal: not a git repository (or any of the parent directories): .git" >&2
+exit 1
+GHEOF
+chmod +x "$REPOGH/gh"
+
+# (9b) END-TO-END: open_pr pushes the branch (cwd=clone) THEN runs gh — assert the fake gh
+# was invoked with cwd == the workspace clone AND its argv carried --repo acme/widget.
+CWD_REPO="$WORK/cwdrepo"; CWD_BARE="$WORK/cwdrepo.git"
+git init --bare -q "$CWD_BARE"
+mkdir -p "$CWD_REPO"
+git -C "$CWD_REPO" init -q
+git -C "$CWD_REPO" config user.email t@t
+git -C "$CWD_REPO" config user.name t
+git -C "$CWD_REPO" config commit.gpgsign false
+git -C "$CWD_REPO" remote add origin "$CWD_BARE"
+printf 'module init\n' > "$CWD_REPO/app.py"
+git -C "$CWD_REPO" add -A
+git -C "$CWD_REPO" commit -qm init
+printf 'the real fix\n' >> "$CWD_REPO/app.py"
+rm -f "$GH29_PWD" "$GH29_ARGV"
+E2E_OUT="$(PATH="$REPOGH:$PATH" RECORD="$PASS_RECORD" ISSUE_JSON="$ISSUE_JSON" \
+  REPO="$CWD_REPO" HEIMDALL_PR_BOT_TOKEN="$FAKETOKEN" "$PY" - <<'PYEOF'
+import json, os
+import issue_pr
+issue = json.loads(os.environ["ISSUE_JSON"])
+record = json.loads(os.environ["RECORD"])
+print(json.dumps(issue_pr.open_pr(issue, record, repo=os.environ["REPO"], base="main")))
+PYEOF
+)"
+CWD_REPO_REAL="$(cd "$CWD_REPO" && pwd -P)"
+GH_SAW_PWD="$(cat "$GH29_PWD" 2>/dev/null || true)"
+GH_SAW_PWD_REAL="$(cd "$GH_SAW_PWD" 2>/dev/null && pwd -P || printf '%s' "$GH_SAW_PWD")"
+if [ -n "$GH_SAW_PWD_REAL" ] && [ "$GH_SAW_PWD_REAL" = "$CWD_REPO_REAL" ]; then
+  ok "gh pr create ran with cwd == the workspace clone ($CWD_REPO_REAL) — git introspection finds .git"
+else
+  bad "gh ran in the WRONG cwd (saw '$GH_SAW_PWD_REAL', want '$CWD_REPO_REAL') — bug #29 (gh can't find .git)"
+fi
+if grep -qxF -- "--repo" "$GH29_ARGV" 2>/dev/null && grep -qxF "acme/widget" "$GH29_ARGV" 2>/dev/null; then
+  ok "the live gh pr create argv carried --repo acme/widget (repo resolved by slug)"
+else
+  bad "the live gh pr create argv did NOT carry --repo <slug> (cat $GH29_ARGV)"
+fi
+if printf '%s' "$E2E_OUT" | jq -e '.pr_opened == true and (.pr.url | test("/pull/29"))' >/dev/null 2>&1; then
+  ok "open_pr OPENED the PR end-to-end (pr_opened=true, url recovered) — the run-15 create failure is fixed"
+else
+  bad "open_pr did not open the PR end-to-end ($E2E_OUT)"
+fi
+
+echo "  ‣ FALSIFIER — WITHOUT --repo in a non-git cwd gh FAILS (the exact run-15 break); WITH --repo it SUCCEEDS ──"
+# Isolates the two independent robustness legs against a NON-GIT cwd:
+#   • pre-fix shape (NO --repo) + non-git cwd -> gh introspects git, finds no .git -> the
+#     run-15 "fatal: not a git repository" failure (ok=false). This is what regressed prod.
+#   • fixed shape (--repo <slug>) + the SAME non-git cwd -> gh hits the API by slug, succeeds
+#     (ok=true) — proof --repo makes the create INDEPENDENT of cwd git introspection.
+NONGIT="$WORK/nongit-tmp"; mkdir -p "$NONGIT"
+FALS_OUT="$(PATH="$REPOGH:$PATH" HEIMDALL_PR_BOT_TOKEN="$FAKETOKEN" NONGIT="$NONGIT" "$PY" - <<'PYEOF'
+import json, os
+import issue_pr
+nongit = os.environ["NONGIT"]
+no_repo   = ["gh", "pr", "create", "--head", "heimdall/issue/x", "--base", "main"]
+with_repo = ["gh", "pr", "create", "--repo", "acme/widget", "--head", "heimdall/issue/x", "--base", "main"]
+pre = issue_pr.gh_bot_runner(no_repo, cwd=nongit)     # pre-fix shape in a non-git cwd
+fix = issue_pr.gh_bot_runner(with_repo, cwd=nongit)   # fixed shape, same non-git cwd
+print(json.dumps({"pre": pre, "fix": fix}))
+PYEOF
+)"
+if printf '%s' "$FALS_OUT" | jq -e '.pre.ok == false and .pre.exit == 1' >/dev/null 2>&1; then
+  ok "FALSIFIER: pre-fix (no --repo) in a non-git cwd FAILS exactly like run-15 (ok=false, exit 1)"
+else
+  bad "the falsifier did not reproduce the run-15 failure — the test can't catch bug #29 ($FALS_OUT)"
+fi
+if printf '%s' "$FALS_OUT" | jq -e '.pre.error | test("not a git repository")' >/dev/null 2>&1; then
+  ok "the pre-fix failure NAMES the run-15 cause ('not a git repository') — captured, not silent"
+else
+  bad "the pre-fix failure did not name the 'not a git repository' cause ($FALS_OUT)"
+fi
+if printf '%s' "$FALS_OUT" | jq -e '.fix.ok == true and (.fix.url | test("/pull/29"))' >/dev/null 2>&1; then
+  ok "WITH --repo the SAME non-git cwd SUCCEEDS (ok=true) — --repo makes gh cwd-independent (bug #29 fixed)"
+else
+  bad "--repo did not make the create succeed from a non-git cwd ($FALS_OUT)"
+fi
+
+echo
 echo "── grep: structural proofs of the human gate in the source ───────────────────"
 if grep -qE 'def open_pr\(' "$LIB" && grep -qE 'def on_merged\(' "$LIB"; then
   ok "module exposes open_pr (open+stop) and on_merged (human writeback) — and only these"

@@ -56,6 +56,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import re
@@ -103,6 +104,12 @@ _GIT_TOKENISH_RX = re.compile(
 # A PR url (…/pull/<n>) parsed out of `gh pr create` output — used to recover the
 # EXISTING PR's url when gh reports the branch already has an open PR (idempotency).
 _PR_URL_RX = re.compile(r"https://\S+?/pull/\d+")
+
+# A well-formed GitHub repo slug (owner/name). bug #29: `gh pr create --repo <slug>` lets
+# `gh` resolve the target repo via the API BY SLUG — so it never has to shell out to `git`
+# to introspect a cwd that may not be the workspace clone (the run-15 "fatal: not a git
+# repository" break). We only ever pass a sanitized owner/name through onto the argv.
+_REPO_SLUG_RX = re.compile(r"^[\w.-]+/[\w.-]+$")
 
 
 class HumanGateError(Exception):
@@ -333,18 +340,44 @@ def _branch_name(issue):
     return "heimdall/issue/%s" % safe
 
 
+def _repo_slug(issue):
+    """The originating GitHub repo slug (owner/name) for this issue, read from the
+    normalized issue's links.source_ref.repo (issue_queue sets this for a github source).
+    SANITIZED against _REPO_SLUG_RX (owner/name of word/./- chars only) so nothing but a
+    well-formed slug ever reaches the `gh` argv. Returns the slug, or None when it is
+    absent/malformed (a non-github source, or a slug we would not trust on the argv)."""
+    ref = (issue.get("links") or {}).get("source_ref") or {}
+    slug = ref.get("repo")
+    if isinstance(slug, str):
+        slug = slug.strip()
+        if _REPO_SLUG_RX.match(slug):
+            return slug
+    return None
+
+
 def build_gh_create_command(issue, title, body_file, base="main"):
     """Build the `gh pr create` command shape (a list of argv tokens). This is the
     ARTIFACT the agent produces; the agent NEVER executes it — RJ's creds run it at
     runtime (dossier §6.3). body comes from a file so the (large) SI-2 body never
-    has to be shell-quoted inline."""
-    return [
-        "gh", "pr", "create",
+    has to be shell-quoted inline.
+
+    bug #29: when the issue carries a well-formed repo slug we pass `--repo <owner/name>`
+    so `gh` resolves the target repo BY SLUG via the API. Without it, `gh pr create`
+    shells out to `git` to introspect the cwd's repo/remote — and in prod (run-15) that
+    cwd was NOT the workspace clone, so `git` reported "fatal: not a git repository" and
+    the create failed (exit 1) even though the branch push had succeeded. --repo makes the
+    create INDEPENDENT of any cwd git-introspection."""
+    cmd = ["gh", "pr", "create"]
+    slug = _repo_slug(issue)
+    if slug:
+        cmd += ["--repo", slug]
+    cmd += [
         "--base", base,
         "--head", _branch_name(issue),
         "--title", title,
         "--body-file", body_file,
     ]
+    return cmd
 
 
 # ── commit + push the fix onto the heimdall/* branch (bug #21: a PR needs a branch) ──
@@ -696,8 +729,12 @@ def open_pr(issue, record, repo=None, base="main", gh_runner=None):
     # open the PR via the runner (mock in tests; the scoped bot-token `gh` at runtime).
     # Default = gh_bot_runner: opens the PR under the bot identity against the branch the
     # push above landed, or (no bot token) records the create-command shape only.
+    # bug #29: run the create with cwd=<workspace clone> (the SAME dir the push committed in)
+    # so any residual `git` introspection `gh` does resolves the REAL repo — belt-and-braces
+    # with the --repo slug on the argv. A legacy runner that only accepts argv is called
+    # argv-only (backward-compatible); the default gh_bot_runner accepts and uses the cwd.
     runner = gh_runner or gh_bot_runner
-    gh_result = runner(create_command)
+    gh_result = _call_gh_runner(runner, create_command, _resolve_repo(repo))
 
     # mark the issue PR_OPEN in the queue store. We do NOT mark it resolved and we
     # do NOT close the source — autonomy ends here (dossier §6 human gate).
@@ -784,7 +821,24 @@ def _default_gh_runner(create_command):
     }
 
 
-def gh_bot_runner(argv):
+def _call_gh_runner(runner, argv, cwd):
+    """Invoke a gh runner, passing cwd=<workspace clone> ONLY when the runner accepts it
+    (bug #29: the default gh_bot_runner does, so `gh` resolves the repo from INSIDE the
+    clone; a legacy/test runner that takes only argv is called argv-only, unchanged). We
+    inspect the runner's signature rather than hard-passing cwd so any injected runner —
+    regardless of arity — keeps working."""
+    try:
+        params = inspect.signature(runner).parameters
+        accepts_cwd = "cwd" in params or any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+    except (TypeError, ValueError):
+        accepts_cwd = False
+    if accepts_cwd:
+        return runner(argv, cwd=cwd)
+    return runner(argv)
+
+
+def gh_bot_runner(argv, cwd=None):
     """The PR-ONLY SCOPED BOT-TOKEN runner — the SOLE production PR-open path (the
     agent NEVER pushes with RJ's personal creds). It authenticates `gh` as a bot
     identity read from env HEIMDALL_PR_BOT_TOKEN: a GitHub App installation token /
@@ -803,6 +857,10 @@ def gh_bot_runner(argv):
     GH_TOKEN (an empty token makes `gh` fall back to a stale gh-config App-JWT login ->
     the bug #26 "JWT could not be decoded" 401). The token is read+cleaned via the
     SINGLE source (_bot_token), so this create arm and the push arm can never diverge.
+
+    cwd (bug #29): the workspace clone to run `gh` FROM, so any `git` introspection `gh`
+    does resolves the real .git (the run-15 break was `gh` shelling to git in a cwd that
+    was NOT the clone). open_pr threads the clone here; a direct call (cwd=None) is unchanged.
     Returns { ok, pushed, url, exit, error, command, identity }; `error` is the
     token/JWT-SCRUBBED stderr tail on failure (so a failed create NAMES its cause);
     `command` is the shlex-joined argv WITHOUT the token (the token lives only in the
@@ -822,6 +880,11 @@ def gh_bot_runner(argv):
             stderr=subprocess.PIPE,
             text=True,
             env=_bot_env(token, cfg_dir),
+            # bug #29: run `gh` from INSIDE the workspace clone so any `git` introspection
+            # it does (repo/remote resolution, --head detection) finds the real .git —
+            # the run-15 break was `gh` shelling to git in a cwd that was NOT the clone.
+            # cwd=None (a direct call with no cwd) keeps the process's own cwd, unchanged.
+            cwd=cwd,
         )
     finally:
         shutil.rmtree(cfg_dir, ignore_errors=True)
