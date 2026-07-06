@@ -17,26 +17,40 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 BIN_DIR = os.path.normpath(os.path.join(HERE, "..", "bin"))  # heimdall-identity / heimdall-presence live here
 spec = importlib.util.spec_from_file_location("hmd_sigil", os.path.join(HERE, "hmd_sigil.py"))
 SIG = importlib.util.module_from_spec(spec); spec.loader.exec_module(SIG)
+_tcspec = importlib.util.spec_from_file_location("hmd_termcaps", os.path.join(HERE, "hmd_termcaps.py"))
+TC = importlib.util.module_from_spec(_tcspec); _tcspec.loader.exec_module(TC)
 
-# ── color mode ───────────────────────────────────────────────────────────────
+# ── terminal capability tier ─────────────────────────────────────────────────
 # CC's statusLine is non-TTY but truecolor, so we can't lean on isatty alone.
-# hooks/statusline.sh already resolves the terminal's color capability and passes
-# --color / --no-color; we honor that first, then the NO_COLOR standard, then a
-# truecolor/256color env, then isatty. When color is OFF every palette code is the
-# empty string, so every f-string collapses to clean plain text — no ANSI garbage
-# in CI/pipes (mirrors hmd-gate-anim.sh's non-TTY collapse). The sigil pixels and
-# per-agent glyphs (which emit ANSI regardless) are guarded separately below.
-def _use_color():
-    a = sys.argv
-    if "--no-color" in a or "--plain" in a: return False
-    if os.environ.get("NO_COLOR") is not None: return False
-    if "--color" in a: return True
-    if (os.environ.get("COLORTERM") or "") in ("truecolor", "24bit"): return True
-    if "256color" in (os.environ.get("TERM") or ""): return True
-    try: return sys.stdout.isatty()
-    except Exception: return False
-USE_COLOR = _use_color()
+# hmd_termcaps.detect() resolves a graded tier from $COLORTERM/$TERM/$TERM_PROGRAM/
+# $TMUX (+ the --no-color/--plain flag hooks/statusline.sh passes, + the
+# HEIMDALL_STATUSLINE_MODE override): color ∈ {truecolor,256,16,mono}, unicode ∈
+# {full,basic,ascii}. The line is BUILT in 24-bit truecolor + full unicode exactly
+# as before; CAPS.emit() downgrades the finished bytes in one pass at write time
+# (truecolor+full = byte-identical NO-OP). USE_COLOR gates the palette (empty codes
+# → clean plain text) so the sigil/glyphs that emit ANSI regardless collapse too.
+CAPS = TC.detect(sys.argv)
+USE_COLOR = CAPS.use_color()
 def _c(s): return s if USE_COLOR else ""
+def _write(s):
+    # single choke point: every render path emits through the tier downgrade.
+    sys.stdout.write(CAPS.emit(s))
+
+# a branded ASCII sigil for no-unicode terminals (dumb/CI): 4 rows × 8 cols so the
+# 8-wide square-sigil anchor + 2-space gutter (ANCHOR=10) alignment is preserved.
+ASCII_SIGIL = ["  ____  ", " |o  o| ", " |____| ", "  hmd   "]
+def _sigil_rows(seed, eye):
+    """The left anchor per tier: half-block watchman when unicode=full + color on
+    (color downgraded by emit); a branded ASCII sigil for no-unicode terms; a blank
+    8-wide anchor for mono+unicode (preserves the legacy no-color blank behavior)."""
+    if CAPS.unicode == TC.ASCII:
+        return list(ASCII_SIGIL)
+    if CAPS.color == TC.MONO:
+        return ["        "] * 4
+    if CAPS.unicode == TC.FULL:
+        try: return SIG.render(seed, eye_override=eye, pad="")
+        except Exception: return list(ASCII_SIGIL)
+    return list(ASCII_SIGIL)   # basic unicode + color → safe ASCII sigil
 
 # palette (empty in no-color mode → f-strings render as plain text)
 CY=_c("\033[38;2;34;211;238m"); GR=_c("\033[38;2;34;197;94m"); RD=_c("\033[38;2;239;68;68m")
@@ -45,7 +59,9 @@ TEAL=_c("\033[38;2;45;212;191m")  # #2dd4bf — brand wordmark + eye bracket (mo
 BOLD=_c("\033[1m"); X=_c("\033[0m")
 SEP=f"{FAINT} │ {X}"
 ANSI = re.compile(r"\033\[[0-9;]*m")
-def vis(s): return len(ANSI.sub("", s))
+# visible width is tier-aware: emoji (e.g. ⚡) are double-width when unicode=full,
+# but width-1 once downgraded to ASCII — so the right-pin math tracks the real cells.
+def vis(s): return CAPS.width(s)
 
 def read_json():
     try: return json.load(sys.stdin)
@@ -399,7 +415,7 @@ def main():
     if "--widget" in sys.argv:
         eyes = {"pass":"^ ^","deny":"O O","scanning":". .","watching":"• •"}[verdict]
         cnt = f" {passed}/{total}" if passed is not None else ""
-        sys.stdout.write(f"{CY}▐{X}{vcol}{eyes}{X}{CY}▌{X} {vcol}{vglyph} {vword}{cnt}{X}")
+        _write(f"{CY}▐{X}{vcol}{eyes}{X}{CY}▌{X} {vcol}{vglyph} {vword}{cnt}{X}")
         return
 
     # keep THIS dev present on teammates' walls AND warm the roster cache in ONE fork: a
@@ -408,9 +424,9 @@ def main():
     _spawn_presence(cwd, handle, verdict)
 
     # ── sigil anchor (squint animates; eyes stay visible in every frame) ──
-    # In no-color mode the sprite's ANSI half-blocks would be garbage, so collapse
-    # the anchor to blank columns (keeps the 8-wide alignment, emits no escapes).
-    sig = SIG.render(seed, eye_override=eye, pad="") if USE_COLOR else ["        "] * 4
+    # Per terminal tier: half-block watchman on unicode=full, a branded ASCII sigil
+    # on no-unicode terms (dumb/CI), a blank 8-wide anchor in mono (legacy no-color).
+    sig = _sigil_rows(seed, eye)
     SW = 8
     ANCHOR = SW + 2  # sigil(8 cols) + 2-space gutter, prefixed on EVERY row
 
@@ -524,7 +540,7 @@ def main():
         out.append(f"{_sig(sig,1,CY)}  " + line(l2, r2))
         for i, seg in enumerate(swarm):
             out.append(f"{_sig(sig, 2+i, CY)}  " + seg)
-        sys.stdout.write("\n".join(out) + "\n")
+        _write("\n".join(out) + "\n")
         return
 
     out = []
@@ -542,7 +558,7 @@ def main():
         if vis(tease) > max(0, cols - ANCHOR - RMARGIN): tease = ""
         out.append(f"{_sig(sig,2,CY)}  " + tease)
         out.append(f"{_sig(sig,3,CY)}  ")
-    sys.stdout.write("\n".join(out) + "\n")
+    _write("\n".join(out) + "\n")
 
 def _sig(rows, i, fallback):
     return rows[i] if i < len(rows) else "        "   # 8-space blank = square sigil width
