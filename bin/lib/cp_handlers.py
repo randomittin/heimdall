@@ -246,7 +246,13 @@ AUTH_ENV_ORDER = (AUTH_ENV_OAUTH, AUTH_ENV_API_KEY)
 # `claude -p` to write edits (bug #20 — without them the child ran but produced an EMPTY
 # diff): HEIMDALL_FIX_WITH_CLAUDE (the enable flag the deployed maintainer sets),
 # HEIMDALL_CLAUDE_BIN (an optional binary override), and HEIMDALL_FIX_TIMEOUT (the per-fix
-# wall-clock cap). None is a secret. This is a DELIBERATE, bounded widening for THIS
+# wall-clock cap). It ALSO needs CLAUDE_CONFIG_DIR (bug #22 — the FINAL auth link): the
+# deployed image sets it (/app/state/.claude) as the writable dir where the operator's
+# provisioned claude credential lives; without it here the maintain-loop child — and the
+# headless fix child nested under it — cannot locate that credential and `claude -p` falls
+# back to the interactive OAuth LOGIN PROMPT (job-2e58dabf run 9: exit 1, 0 files changed,
+# output_tail = "Browser didn't open? Use the url below to sign in"). It is a PATH, NOT a
+# secret. None of these is a secret. This is a DELIBERATE, bounded widening for THIS
 # handler's child ONLY; it does NOT touch ISOLATED_ENV_ALLOW, so every other handler stays
 # maximally scrubbed. The PKI key / audit creds are NEVER in this set — a breached
 # maintainer child cannot read control-plane state.
@@ -257,6 +263,7 @@ MAINTAINER_ENV_PASSTHROUGH = (
     "HEIMDALL_FIX_WITH_CLAUDE",
     "HEIMDALL_CLAUDE_BIN",
     "HEIMDALL_FIX_TIMEOUT",
+    "CLAUDE_CONFIG_DIR",
 )
 
 # Env var overriding the maintain-loop binary path (tests point it at a hermetic mock,
