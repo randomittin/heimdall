@@ -292,6 +292,7 @@ seed "$R5" 24 "$BODY"
     HEIMDALL_FIX_WITH_CLAUDE=1 \
     HEIMDALL_CLAUDE_BIN="$FAKEBIN/claude-capture" \
     CLAUDE_CODE_OAUTH_TOKEN="sk-ant-oat-FAKEauth0000000000000000000000" \
+    CLAUDE_CONFIG_DIR="$R5/.claude-cfg" \
     HEIMDALL_PR_BOT_TOKEN="ghs_FAKEbottoken000000000000000000000000" \
     GH_TOKEN="ghp_FAKEghtoken00000000000000000000000000" \
     GITHUB_TOKEN="ghp_FAKEgithubtoken0000000000000000000000" \
@@ -346,6 +347,15 @@ if grep -q "^CLAUDE_CODE_OAUTH_TOKEN=" "$CAPDIR/env"; then
   ok "the claude auth var (CLAUDE_CODE_OAUTH_TOKEN) IS present — the call can still authenticate"
 else
   bad "the claude auth var is missing from the child env — the fix call could not authenticate"
+fi
+# bug #22: CLAUDE_CONFIG_DIR must ALSO survive into the fix child. The deployed image sets
+# it (/app/state/.claude) so the claude CLI locates the provisioned credential; dropping it
+# made the headless fix fall back to an interactive OAuth LOGIN PROMPT (job-2e58dabf run 9,
+# the FINAL auth link). It is NON-secret (a path), so it rides the allowlist explicitly.
+if grep -q "^CLAUDE_CONFIG_DIR=" "$CAPDIR/env"; then
+  ok "bug #22: CLAUDE_CONFIG_DIR survives into the fix child (claude finds its provisioned credential — no login prompt)"
+else
+  bad "bug #22: CLAUDE_CONFIG_DIR was DROPPED — the headless claude falls back to the interactive OAuth login prompt"
 fi
 if grep -q "^HEIMDALL_FIX_WITH_CLAUDE=" "$CAPDIR/env" && grep -q "^PATH=" "$CAPDIR/env"; then
   ok "the non-secret baseline (PATH) + HEIMDALL_FIX_* toggle survive the scrub"

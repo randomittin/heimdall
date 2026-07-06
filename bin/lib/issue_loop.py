@@ -285,8 +285,15 @@ _FIX_TAIL_MAX = 800
 # (issue_pr._bot_env / the GitHub-App mint), so nothing downstream is starved.
 
 # the non-secret runtime baseline the child inherits (mirrors cp_handlers.ISOLATED_ENV_ALLOW,
-# + HOME which the claude CLI needs for ~/.claude config + auth cache).
-_FIX_ENV_BASELINE = ("PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TZ")
+# + HOME which the claude CLI needs for ~/.claude config + auth cache). CLAUDE_CONFIG_DIR
+# (bug #22 — the FINAL auth link) is the deployed image's writable config dir
+# (/app/state/.claude) where the operator's provisioned claude credential lives; the headless
+# `claude -p` needs it to LOCATE that credential — dropping it made the fix child fall back to
+# the interactive OAuth LOGIN PROMPT (job-2e58dabf run 9). It is a PATH, not a secret. It is
+# kept explicitly (rather than relying on HOME→~/.claude equivalence) to remove ambiguity for
+# the claude 2.1.x headless resolver. Every actual credential OTHER than the ONE claude auth
+# var (below) is still dropped.
+_FIX_ENV_BASELINE = ("PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "CLAUDE_CONFIG_DIR")
 
 # the two LLM-auth vars in PREFERENCE order (OAuth subscription first, metered key second) —
 # the ONLY credential-shaped vars allowed through (the call cannot authenticate without one).

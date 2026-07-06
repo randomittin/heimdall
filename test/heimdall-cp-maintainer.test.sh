@@ -94,6 +94,7 @@ printf '%s\n' "\$0" "\$@" > "$WORK/loop.argv"
   [ -n "\${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && echo "CLAUDE_CODE_OAUTH_TOKEN=\$CLAUDE_CODE_OAUTH_TOKEN"
   [ -n "\${ANTHROPIC_API_KEY:-}" ]       && echo "ANTHROPIC_API_KEY=\$ANTHROPIC_API_KEY"
   [ -n "\${HEIMDALL_PR_BOT_TOKEN:-}" ]   && echo "HEIMDALL_PR_BOT_TOKEN=\$HEIMDALL_PR_BOT_TOKEN"
+  [ -n "\${CLAUDE_CONFIG_DIR:-}" ]       && echo "CLAUDE_CONFIG_DIR=\$CLAUDE_CONFIG_DIR"
 } > "$WORK/loop.childenv"
 # the SELECTED auth var NAME (oauth priority) for the E-path assertions.
 if   [ -n "\${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then echo CLAUDE_CODE_OAUTH_TOKEN > "$WORK/loop.authname"
@@ -223,6 +224,7 @@ out["E3_apikey_fallback"] = (
 # Run once with OAuth + the bot token in the base env; capture the FULL recorded surface.
 ctx = make_ctx("f1", {"CLAUDE_CODE_OAUTH_TOKEN": OAUTH,
                       "HEIMDALL_PR_BOT_TOKEN": BOT,
+                      "CLAUDE_CONFIG_DIR": "/app/state/.claude",
                       "PATH": os.environ.get("PATH", "")})
 res_f = H.run_maintainer_cycle(
     A.validate("run-maintainer-cycle", {"repo": REPO, "max": 1})["params"], ctx)
@@ -230,6 +232,11 @@ res_f = H.run_maintainer_cycle(
 # shape only, per §9) — the audit ndjson is a recorded surface the token must NOT touch.
 os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = OAUTH
 os.environ["HEIMDALL_PR_BOT_TOKEN"] = BOT
+# bug #22: the deployed job container carries CLAUDE_CONFIG_DIR (/app/state/.claude) in its
+# process env; cp_server.dispatch builds the IsolatedContext from os.environ, so set it here
+# to exercise the REAL dispatch chain (this is the last mock invocation, so loop.childenv
+# reflects the dispatch child's env — the production path, not just a hand-built ctx).
+os.environ["CLAUDE_CONFIG_DIR"] = "/app/state/.claude"
 disp = S.dispatch(actor, "run-maintainer-cycle", {"repo": REPO, "max": 1})
 out["F_dispatch_status"] = disp.status
 out["F_result_json"] = json.dumps(res_f)          # the handler result (a recorded surface)
@@ -240,6 +247,10 @@ with open(os.path.join(WORK, "loop.childenv")) as fh:
     childenv = fh.read()
 out["F1_child_has_oauth"] = (OAUTH in childenv)
 out["G1_child_has_bot_token"] = (BOT in childenv)
+# bug #22: the deployed image sets CLAUDE_CONFIG_DIR (/app/state/.claude) so the headless
+# claude CLI in the fix step finds its provisioned credential. It MUST pass through the
+# maintainer child env (else the fix step falls back to the interactive OAuth login prompt).
+out["G3_child_has_config_dir"] = ("CLAUDE_CONFIG_DIR=/app/state/.claude" in childenv)
 
 
 # ── D. SCHEDULER fires run-maintainer-cycle (same cron as run-suite) ────────────
@@ -271,6 +282,8 @@ if [ ! -s "$HARNESS_OUT" ]; then
   echo "----- harness.err -----" >&2; cat "$WORK/harness.err" >&2
   exit 2
 fi
+
+echo "DEBUG_CHILDENV_BEGIN"; "$PY" -c 'import json,sys;print(json.load(open(sys.argv[1])).get("DEBUG_childenv"))' "$HARNESS_OUT"; echo "DEBUG_CHILDENV_END"
 
 jget() { "$PY" -c 'import json,sys; d=json.load(open(sys.argv[1])); v=d.get(sys.argv[2]); print(json.dumps(v) if not isinstance(v,str) else v)' "$HARNESS_OUT" "$1"; }
 
@@ -327,6 +340,7 @@ if grep -qF "$OAUTH_TOKEN" "$WORK/loop.argv" 2>/dev/null; then bad "F2b token fo
 
 echo "== G. maintainer OPENS PRs via the bot token; never pushes/merges =="
 [ "$(jget G1_child_has_bot_token)" = "true" ] && ok "G1 HEIMDALL_PR_BOT_TOKEN passed through to the child (the loop's PR runner uses it)" || bad "G1 bot token did not reach the child"
+[ "$(jget G3_child_has_config_dir)" = "true" ] && ok "G3 bug #22: CLAUDE_CONFIG_DIR passed through to the child (the headless fix's claude finds its provisioned credential — no login prompt)" || bad "G3 bug #22: CLAUDE_CONFIG_DIR did NOT reach the child — the fix step's claude falls back to the interactive OAuth login"
 if grep -qE 'never pushes main|no-push/no-merge|OPENS PRs' "$LIB/cp_handlers.py"; then ok "G2 source states the no-push/no-merge constraint (a human gates merge)"; else bad "G2 source is missing the no-push/no-merge constraint statement"; fi
 
 echo "== H. a FAILED cycle NAMES its cause: result.error_tail (scrubbed) + summary on nonzero exit =="
