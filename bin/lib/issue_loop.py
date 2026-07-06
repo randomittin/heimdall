@@ -116,6 +116,9 @@ ORIENTED = "ORIENTED"
 FIXED = "FIXED"
 ATTESTED = "ATTESTED"
 PR_OPEN = "PR_OPEN"        # terminal-for-loop (dossier §6 human gate begins here)
+PR_FAILED = "PR_FAILED"    # bug #28: gate PASSED + branch PUSHED, but `gh pr create`
+                           # FAILED — NO real PR exists. Honest, RE-RUNNABLE terminal
+                           # (-> flagged{pr-create-failed}); NEVER fabricated as PR_OPEN.
 GATE_FAILED = "GATE_FAILED"  # terminal; -> flagged{gate-failed}; NOT resolved
 ERRORED = "ERRORED"        # honest failure; -> flagged{out-of-scope} or released
 
@@ -678,6 +681,7 @@ def run_once(repo, base="HEAD", evidence_cmds=None, cfg=None,
             "error": str(exc),
             "pr_ready": False,
             "pr_opened": False,
+            "pr": None,
         }
 
 
@@ -716,33 +720,74 @@ def _gate_and_finish(q, issue, orient_result, fix_result, record,
         _emit_telemetry("issue_state", run_id=loop_run_id, phase="waves",
                         outcome=ATTESTED, gate="oracle",
                         extra={"issue_id": issue_id})
-        pr_opened = False
+
         open_pr = _soft_import_open_pr()
-        if open_pr is not None:
-            # the pr layer (piece d) is present — hand it the issue + the SAME
-            # SI-2 record + the WORKSPACE repo (bug #21: open_pr commits+pushes the
-            # heimdall/* branch from this working tree BEFORE `gh pr create`, so the PR
-            # references a branch that actually reached the remote). The layer asserts
-            # all_passed internally too (defence in depth); we only call it on a PASS.
-            # A branch push failure raises out of open_pr -> the run_once except flags
-            # the issue (no PR against a branch the remote never saw).
-            open_pr(issue, record, repo=repo)
-            pr_opened = True
-        # else: SOFT-IMPORT miss — mark pr_ready and STOP. Do NOT fabricate a PR.
-        q.set_state(issue_id, PR_OPEN, pr="pr-ready:" + issue_id)
+        if open_pr is None:
+            # SOFT-IMPORT miss (a partial checkout has no pr layer) — mark pr_ready
+            # and STOP. Do NOT fabricate a PR (there is no layer to open one).
+            q.set_state(issue_id, PR_OPEN, pr="pr-ready:" + issue_id)
+            _emit_telemetry("issue_state", run_id=loop_run_id, phase="waves",
+                            outcome=PR_OPEN, extra={"issue_id": issue_id})
+            return _finish_pass(issue, orient_result, fix_result, record, gate,
+                                evidence_cmds, state=PR_OPEN, pr_ready=True,
+                                pr_opened=False, pr_node=None)
+
+        # ── bug #28 (THE KEYSTONE): HONOR open_pr's return — never hard-code success ─
+        # The pr layer (piece d) is present. It COMMITS+PUSHES the heimdall/* branch from
+        # this working tree BEFORE `gh pr create` (bug #21), then returns a dict carrying
+        # the LOUD `pr` node {opened,url,exit,error,branch,pushed} + top-level pr_opened.
+        # A branch PUSH failure RAISES PushError out of open_pr -> the run_once except
+        # flags the issue (no PR against a branch the remote never saw — bug #21 intact).
+        # A `gh pr create` failure does NOT raise: it returns pr_opened=False + ok=False
+        # + a scrubbed pr.error. The loop MUST honor that instead of faking PR_OPEN (the
+        # exact defect: the branch pushed, gh create 401'd, the loop marked PR_OPEN with
+        # NO real PR). We read the verdict from the RETURN, never a hard-coded True.
+        pr_res = open_pr(issue, record, repo=repo) or {}
+        pr_opened = bool(pr_res.get("pr_opened"))
+        pr_node = pr_res.get("pr")  # the loud {opened,url,exit,error,branch,pushed}
+        node = pr_node if isinstance(pr_node, dict) else {}
+
+        if pr_opened:
+            # a REAL PR was opened (gh create succeeded, a url exists) -> PR_OPEN.
+            pr_ref = (pr_res.get("url") or node.get("url") or pr_res.get("pr")
+                      or ("pr-open:" + issue_id))
+            q.set_state(issue_id, PR_OPEN, pr=pr_ref)
+            _emit_telemetry("issue_state", run_id=loop_run_id, phase="waves",
+                            outcome=PR_OPEN, extra={"issue_id": issue_id})
+            return _finish_pass(issue, orient_result, fix_result, record, gate,
+                                evidence_cmds, state=PR_OPEN, pr_ready=True,
+                                pr_opened=True, pr_node=pr_node)
+
+        # a CREATE FAILURE: the branch pushed but `gh pr create` FAILED (ok is False, or
+        # a loud pr.error names the gh exit). This is the bug #28 fault — NEVER fabricate
+        # PR_OPEN for it. Mark the honest, RE-RUNNABLE PR_FAILED and FLAG it so the issue
+        # stays actionable and the job row NAMES the real gh exit/error (the pr node rides
+        # into the result below), instead of a PR silently vanishing.
+        create_failed = (pr_res.get("ok") is False) or bool(node.get("error"))
+        if create_failed:
+            q.set_state(issue_id, PR_FAILED)
+            _emit_telemetry("issue_state", run_id=loop_run_id, phase="waves",
+                            outcome=PR_FAILED, gate="oracle",
+                            extra={"issue_id": issue_id})
+            q.flag(issue_id, "pr-create-failed",
+                   evidence_ref=node.get("error") or gate["evidence_ref"])
+            return _finish_pass(issue, orient_result, fix_result, record, gate,
+                                evidence_cmds, state=PR_FAILED, pr_ready=False,
+                                pr_opened=False, pr_node=pr_node)
+
+        # RECORD-ONLY artifact mode: with NO scoped bot token, open_pr honestly builds the
+        # PR artifact and pushes NOTHING (the agent never pushes with personal creds) — it
+        # returns ok=True, no error, pr_opened=False. This is NOT a failure and NOT a real
+        # PR: mark pr_ready + STOP, and report pr_opened=False HONESTLY (never a fabricated
+        # real-PR claim). In the deployed maintainer the bot token is always present, so a
+        # PASS here yields either pr_opened=True or the PR_FAILED branch above.
+        q.set_state(issue_id, PR_OPEN,
+                    pr=pr_res.get("url") or ("pr-ready:" + issue_id))
         _emit_telemetry("issue_state", run_id=loop_run_id, phase="waves",
                         outcome=PR_OPEN, extra={"issue_id": issue_id})
-        return {
-            "state": PR_OPEN,
-            "issue": issue,
-            "orient": orient_result,
-            "fix": fix_result,
-            "attestation": record,
-            "gate": gate,
-            "evidence_cmds": list(evidence_cmds or []),
-            "pr_ready": True,
-            "pr_opened": pr_opened,
-        }
+        return _finish_pass(issue, orient_result, fix_result, record, gate,
+                            evidence_cmds, state=PR_OPEN, pr_ready=True,
+                            pr_opened=False, pr_node=pr_node)
 
     # ── FAIL path — GATE_FAILED -> flagged honestly; NO PR is ever opened ─────
     q.set_state(issue_id, GATE_FAILED)
@@ -760,6 +805,28 @@ def _gate_and_finish(q, issue, orient_result, fix_result, record,
         "evidence_cmds": list(evidence_cmds or []),
         "pr_ready": False,
         "pr_opened": False,
+        "pr": None,
+    }
+
+
+def _finish_pass(issue, orient_result, fix_result, record, gate, evidence_cmds,
+                 state, pr_ready, pr_opened, pr_node):
+    """Build run_once's result dict for a gate-PASS outcome (bug #28). ALWAYS carries the
+    LOUD `pr` node (open_pr's {opened,url,exit,error,branch,pushed}, or None on a soft-
+    import miss) + the top-level pr_opened, so the job row NAMES the gh exit/error — the
+    exact signal whose absence made a failed create invisible. `state` is PR_OPEN (real PR
+    or record-only/soft-miss artifact) or PR_FAILED (branch pushed, gh create failed)."""
+    return {
+        "state": state,
+        "issue": issue,
+        "orient": orient_result,
+        "fix": fix_result,
+        "attestation": record,
+        "gate": gate,
+        "evidence_cmds": list(evidence_cmds or []),
+        "pr_ready": pr_ready,
+        "pr_opened": pr_opened,
+        "pr": pr_node,
     }
 
 

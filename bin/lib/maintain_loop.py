@@ -1142,6 +1142,11 @@ def _verdict(state_name):
     """Map an issue_loop result state to a compact heartbeat verdict."""
     if state_name == issue_loop.PR_OPEN:
         return "PASS"
+    if state_name == issue_loop.PR_FAILED:
+        # bug #28: gate PASSED + branch PUSHED, but `gh pr create` FAILED (no real PR).
+        # A distinct, honest verdict so the heartbeat NAMES the create failure instead
+        # of a silent PASS — the issue is flagged{pr-create-failed} + re-runnable.
+        return "PR-FAIL"
     if state_name == issue_loop.GATE_FAILED:
         return "FAIL"
     if state_name == issue_loop.ERRORED:

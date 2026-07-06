@@ -506,6 +506,116 @@ else
   bad "the correct fix did NOT reach PR_OPEN ($(printf '%s' "$OUT" | jq -c '.state,.gate.all_passed,.attestation.evidence'))"
 fi
 
+echo "── (9) bug #28 (KEYSTONE) e2e — gh create FAILS but push OK -> PR_FAILED, NOT a faked PR_OPEN ─"
+# THE bug #28 falsifier over the REAL open_pr + REAL gh_bot_runner: the branch PUSHES to
+# the (local, bare) origin (push OK), then a FAILING fake `gh pr create` (exit 1, a JWT
+# 401 on stderr — the exact run-14 shape) makes open_pr return pr_opened False + a scrubbed
+# pr.error. Pre-fix the loop DISCARDED that return and hard-coded PR_OPEN + pr_opened True
+# (the silent fake: branch pushed, gh 401'd, row said PR_OPEN with NO real PR). Post-fix
+# the loop HONORS the return -> PR_FAILED, flagged{pr-create-failed}, re-runnable, and the
+# job row NAMES the gh error. A FAILING gh on PATH (shadows the success gh) drives it.
+FAILBIN="$WORK/failbin"; mkdir -p "$FAILBIN"
+GHFAIL_LOG="$WORK/ghfail.log"; : > "$GHFAIL_LOG"
+cat > "$FAILBIN/gh" <<GHEOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$GHFAIL_LOG"
+if [ "\${1:-}" = "pr" ] && [ "\${2:-}" = "create" ]; then
+  # emit a JWT-shaped token in stderr to prove the loud pr.error is SCRUBBED (never leaks it).
+  echo "failed to create pull request: HTTP 401: A JSON web token could not be decoded (eyJhbGciOiJ.abcdef123.ghijkl456)" >&2
+  exit 1
+fi
+exit 0
+GHEOF
+chmod +x "$FAILBIN/gh"
+
+R9="$(new_repo ghfail_repo "$RT_GATED")"
+seed "$R9" 28 "$BODY"
+OUT="$( cd "$R9" && env \
+    HEIMDALL_HOME="$R9/.heimdall" \
+    PATH="$FAILBIN:$FAKEBIN:$PATH" \
+    HEIMDALL_FIX_WITH_CLAUDE=1 \
+    HEIMDALL_CLAUDE_BIN="$FAKEBIN/claude-fix" \
+    HEIMDALL_PR_BOT_TOKEN="ghs_FAKEbottoken000000000000000000000000" \
+    "$CMD" run-once --repo "$R9" --print 2>/dev/null )" || true
+
+if printf '%s' "$OUT" | jq -e '.gate.all_passed == true' >/dev/null 2>&1; then
+  ok "(9) precondition: the gate PASSED on merit (the fix is proven; only the PR-create step fails)"
+else
+  bad "(9) the gate did not pass — cannot isolate the create failure ($(printf '%s' "$OUT" | jq -c '.gate'))"
+fi
+if grep -q 'pr create' "$GHFAIL_LOG"; then
+  ok "(9) the REAL PR path INVOKED \`gh pr create\` (which then failed) — the create step ran"
+else
+  bad "(9) \`gh pr create\` was never attempted: $(cat "$GHFAIL_LOG")"
+fi
+# THE falsifier: state must NOT be PR_OPEN (pre-fix it wrongly was), and pr_opened False.
+if printf '%s' "$OUT" | jq -e '.state != "PR_OPEN" and .state == "PR_FAILED" and .pr_ready == false and .pr_opened == false' >/dev/null 2>&1; then
+  ok "(9) gh create FAILS -> state PR_FAILED, NOT PR_OPEN, pr_opened False (bug #28: NO fabricated success)"
+else
+  bad "(9) a failed create was faked as PR_OPEN ($(printf '%s' "$OUT" | jq -c '.state,.pr_opened'))"
+fi
+# the branch PUSHED (push OK) even though the create failed — this is the exact split.
+BARE9="$WORK/ghfail_repo.git"
+BRANCH9="heimdall/issue/github-acme-widget-28"
+if git -C "$BARE9" rev-parse --verify "refs/heads/$BRANCH9" >/dev/null 2>&1; then
+  ok "(9) the fix branch PUSHED to origin (push OK) even though \`gh pr create\` failed — the split bug #28 names"
+else
+  bad "(9) the branch never reached origin — this would be a bug #21 push failure, not the bug #28 create split"
+fi
+# the loud pr.error NAMES the gh failure AND is scrubbed (no raw JWT/token ever surfaces).
+if printf '%s' "$OUT" | jq -e '.pr.error != null and (.pr.error | test("eyJ|ghs_|ghp_") | not)' >/dev/null 2>&1; then
+  ok "(9) result.pr.error is present + SCRUBBED — the job row NAMES the gh 401 without leaking the JWT/token"
+else
+  bad "(9) pr.error missing or unscrubbed ($(printf '%s' "$OUT" | jq -c '.pr.error'))"
+fi
+# the issue is flagged honestly + re-runnable (tally pr=0), never silently resolved.
+FLAG9_REASON="$("$PY" -c 'import json,sys; d=json.load(open(sys.argv[1])); print((d.get("flagged",{}).get("github:acme/widget#28",{}) or {}).get("reason",""))' "$R9/.heimdall/issues/queue.json" 2>/dev/null || true)"
+if "$QCMD" status --repo "$R9" | jq -e '.flagged >= 1 and .resolved == 0' >/dev/null 2>&1 && [ "$FLAG9_REASON" = "pr-create-failed" ]; then
+  ok "(9) the issue is flagged{pr-create-failed} + re-runnable (out of resolved; tally pr=0)"
+else
+  bad "(9) the failed-create issue was not honestly flagged (reason='$FLAG9_REASON')"
+fi
+
+echo "── (10) bug #21 UNCHANGED — a PUSH failure raises PushError -> flagged, NO gh pr create ─"
+# Regression guard: a branch PUSH failure (broken origin) must STILL raise PushError out of
+# open_pr -> the run_once except flags the issue, and NO \`gh pr create\` is attempted (no PR
+# against a branch the remote never saw). bug #28 changed the gh-create arm ONLY; the push
+# arm (bug #21) is untouched.
+R10="$(new_repo pushfail_repo "$RT_GATED")"
+git -C "$R10" remote set-url origin "file://$WORK/does-not-exist-$$.git"
+seed "$R10" 29 "$BODY"
+PUSHFAIL_LOG="$WORK/pushfail-gh.log"; : > "$PUSHFAIL_LOG"
+PFBIN="$WORK/pfbin"; mkdir -p "$PFBIN"
+cat > "$PFBIN/gh" <<GHEOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$PUSHFAIL_LOG"
+if [ "\${1:-}" = "pr" ] && [ "\${2:-}" = "create" ]; then echo "https://github.com/acme/widget/pull/99"; fi
+exit 0
+GHEOF
+chmod +x "$PFBIN/gh"
+OUT="$( cd "$R10" && env \
+    HEIMDALL_HOME="$R10/.heimdall" \
+    PATH="$PFBIN:$FAKEBIN:$PATH" \
+    HEIMDALL_FIX_WITH_CLAUDE=1 \
+    HEIMDALL_CLAUDE_BIN="$FAKEBIN/claude-fix" \
+    HEIMDALL_PR_BOT_TOKEN="ghs_FAKEbottoken000000000000000000000000" \
+    "$CMD" run-once --repo "$R10" --print 2>/dev/null )" || true
+if printf '%s' "$OUT" | jq -e '.state == "ERRORED" and .pr_opened == false and .pr_ready == false' >/dev/null 2>&1; then
+  ok "(10) a push failure -> ERRORED (PushError raised), pr_opened False (bug #21 intact)"
+else
+  bad "(10) a push failure was not surfaced as ERRORED ($(printf '%s' "$OUT" | jq -c '.state,.pr_opened'))"
+fi
+if ! grep -q 'pr create' "$PUSHFAIL_LOG"; then
+  ok "(10) NO \`gh pr create\` on a push failure (no PR against an unpushed branch — bug #21)"
+else
+  bad "(10) \`gh pr create\` ran despite a push failure — bug #21 VIOLATED"
+fi
+if "$QCMD" status --repo "$R10" | jq -e '.flagged >= 1 and .resolved == 0' >/dev/null 2>&1; then
+  ok "(10) the push-failed issue is flagged (out of the resolved path)"
+else
+  bad "(10) the push-failed issue was not flagged"
+fi
+
 echo
 echo "════════════════════════════════════════════════════════════════════════════"
 printf "issue-loop-claude-fix: \033[32m%d passed\033[0m, " "$PASS"
