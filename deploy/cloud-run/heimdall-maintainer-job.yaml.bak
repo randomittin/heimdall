@@ -56,7 +56,7 @@ spec:
           containers:
               # DIGEST-PINNED image carrying git + gh + the claude CLI on top of the
               # control-plane image. Replace with the resolved @sha256 digest.
-            - image: us-central1-docker.pkg.dev/heimdall-cp-prod/heimdall/heimdall-maintainer@sha256:8ac2e8a0048c3f9ecdc139511016589d81727479eb2bf69d2d7d9c4240fb6077
+            - image: us-central1-docker.pkg.dev/heimdall-cp-prod/heimdall/heimdall-maintainer@sha256:b1aa78d2958dd51549717e188a89c2f43c70ad1318b20f83bbf07051e10f069d
               # the run-to-completion entrypoint; each execution overrides args -> run-job,<JOB_ID>.
               command:
                 - heimdall-control-plane
