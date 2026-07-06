@@ -164,7 +164,27 @@ fi
 
 echo "── (5) CHECKPOINT — the header block is valid + machine-readable ─────────────"
 R5="$(new_repo checkpoint)"; enable_state "$R5" true 600000; seed "$R5" 5
-run_loop "$R5" "$METER_SMALL" --evidence "true" >/dev/null
+# bug #28: exercise a REAL PR-open cycle (the production path). With a scoped bot token +
+# a bare origin + a fake `gh pr create`, open_pr PUSHES the branch and OPENS a PR, so the
+# loop HONORS pr_opened=True -> tally pr=1. (Without a token open_pr is record-only and
+# pr_opened is honestly False — no real PR to count.) This keeps section (6)'s "1 PR"
+# heartbeat assertion a genuine production observable, not the old hard-coded fake.
+R5BARE="$WORK/checkpoint.origin.git"; git init --bare -q "$R5BARE"
+git -C "$R5" config commit.gpgsign false
+git -C "$R5" remote add origin "$R5BARE"
+PRBIN="$WORK/prbin"; mkdir -p "$PRBIN"
+cat > "$PRBIN/gh" <<'GHEOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = "pr" ] && [ "${2:-}" = "create" ]; then echo "https://github.com/acme/widget/pull/5"; fi
+exit 0
+GHEOF
+chmod +x "$PRBIN/gh"
+env HEIMDALL_HOME="$R5/.heimdall" \
+    HEIMDALL_STATE_FILE="$R5/heimdall-state.json" \
+    HEIMDALL_TOKENS_BIN="$METER_SMALL" \
+    HEIMDALL_PR_BOT_TOKEN="ghs_FAKEbottoken000000000000000000000000" \
+    PATH="$PRBIN:$PATH" \
+    "$CMD" run --repo "$R5" --evidence "true" >/dev/null 2>&1
 CKPT="$R5/.planning/CHECKPOINT.md"
 if [ -f "$CKPT" ] && grep -q '<!-- heimdall-autopilot' "$CKPT"; then
   ok "CHECKPOINT.md exists and carries an autopilot header block"

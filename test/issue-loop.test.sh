@@ -169,16 +169,17 @@ if printf '%s' "$OUT" | jq -e '.gate.all_passed == true' >/dev/null 2>&1; then
 else
   bad "PASS: gate verdict not sourced from evidence.all_passed"
 fi
-# The REAL pr layer (piece d) is now on PYTHONPATH (the wrapper prepends bin/lib),
-# so the loop drives the REAL open_pr — STRONGER than the old mock double: we assert
-# the REAL observable the real layer leaves behind. open_pr() firing means (a) the
-# loop reports pr_opened==true (the real layer was invoked, not a soft-import miss),
-# and (b) the real layer persisted the issue into the queue's in_flight bucket with
-# machine-state PR_OPEN AND wrote the real PR body file carrying the SI-2 record.
-if printf '%s' "$OUT" | jq -e '.pr_opened == true' >/dev/null 2>&1; then
-  ok "PASS: the REAL open_pr fired (pr_opened==true, real pr layer invoked)"
+# The REAL pr layer (piece d) is on PYTHONPATH (the wrapper prepends bin/lib), so the
+# loop drives the REAL open_pr. This run sets NO bot token, so open_pr is in RECORD-ONLY
+# mode: it builds the artifact and pushes NOTHING (the agent never pushes with personal
+# creds). bug #28: the loop HONORS open_pr's return, so pr_opened is HONESTLY false here
+# (no real PR was opened) and the loud `pr` node is propagated with opened=false AND NO
+# error (record-only is a success, not a create failure). That the REAL layer fired is
+# proven by the loud pr node + the in_flight PR_OPEN state + the real PR body file below.
+if printf '%s' "$OUT" | jq -e '.pr_opened == false and .pr.opened == false and .pr.error == null' >/dev/null 2>&1; then
+  ok "PASS: the REAL open_pr fired in record-only mode — pr_opened HONESTLY false (bug #28: return honored, no fabricated PR), loud pr node carries no error"
 else
-  bad "PASS: open_pr did NOT fire on a gate-pass (PR layer not invoked)"
+  bad "PASS: record-only open_pr did not report the honest pr node ($(printf '%s' "$OUT" | jq -c '.pr_opened,.pr'))"
 fi
 PASS_ID="$(printf '%s' "$OUT" | jq -r '.issue.id')"
 if "$ROOT/bin/heimdall-issue-loop" status --repo "$REPO" \
@@ -270,6 +271,117 @@ if [ ! -e "$FAIL_BODY" ] && \
   ok "REAL pr layer: no PR body written + issue NOT in PR_OPEN on a gate-FAIL"
 else
   bad "REAL pr layer: a real PR artifact leaked on a gate-FAIL"
+fi
+
+echo "── (6) bug #28 (KEYSTONE) — the loop HONORS open_pr's return; a FAILED gh create is NOT a fabricated PR_OPEN ─"
+# THE bug #28 falsifier: pre-fix the loop DISCARDED open_pr's return and hard-coded
+# pr_opened=True + PR_OPEN, so a `gh pr create` failure (branch pushed, gh 401'd) was
+# silently faked as success. We drive _gate_and_finish DIRECTLY with a fake open_pr for
+# each outcome (opened / gh-create-failed / record-only / soft-import-miss) — hermetic,
+# no gh/network — and assert the loop reads the VERDICT FROM THE RETURN, never a hard True.
+DRV="$WORK/honor.py"
+cat > "$DRV" <<'PYEOF'
+import json, sys
+import issue_loop, issue_queue
+
+repo, scenario, iid = sys.argv[1], sys.argv[2], sys.argv[3]
+record = {"schema": "si-2.1", "task": "t",
+          "evidence": {"checks": [{"cmd": "true", "exit": 0, "ok": True}],
+                       "ran": 1, "all_passed": True}}
+issue = {"id": iid, "title": "t", "source": "github", "links": {}}
+
+q = issue_queue.IssueQueue(repo=repo)
+q.data["in_flight"][iid] = {"since": "2020", "state": "ATTESTED", "pr": None}
+q.data["flagged"].pop(iid, None); q.data["resolved"].pop(iid, None)
+q.save()
+
+BRANCH = "heimdall/issue/x"
+def _opened(iss, rec, repo=None):
+    url = "https://github.com/acme/widget/pull/7"
+    return {"ok": True, "pr_opened": True, "url": url,
+            "pr": {"opened": True, "url": url, "exit": 0, "error": None,
+                   "branch": BRANCH, "pushed": {"pushed": True}}}
+def _ghfail(iss, rec, repo=None):
+    # branch PUSHED (pushed True), but `gh pr create` FAILED: ok False, no url, a
+    # SCRUBBED pr.error naming the gh exit (the JWT 401 the token/JWT scrubber redacts).
+    return {"ok": False, "pr_opened": False,
+            "pr": {"opened": False, "url": None, "exit": 1,
+                   "error": "HTTP 401: A JSON web token could not be decoded <redacted>",
+                   "branch": BRANCH, "pushed": {"pushed": True, "branch": BRANCH}}}
+def _recordonly(iss, rec, repo=None):
+    # no bot token: artifact built, NOTHING pushed. ok True, no error, pr_opened False.
+    return {"ok": True, "pr_opened": False,
+            "pr": {"opened": False, "url": None, "exit": None, "error": None,
+                   "branch": BRANCH, "pushed": None}}
+
+fakes = {"opened": _opened, "ghfail": _ghfail, "recordonly": _recordonly}
+if scenario == "softmiss":
+    issue_loop._soft_import_open_pr = lambda: None
+else:
+    issue_loop._soft_import_open_pr = lambda: fakes[scenario]
+
+res = issue_loop._gate_and_finish(q, issue, {"capsule_attached": False},
+                                  {"briefed": True}, record, repo=repo)
+print(json.dumps(res, default=str))
+PYEOF
+
+honor_run() { PYTHONPATH="$ROOT/bin/lib:${PYTHONPATH:-}" "$PY" "$DRV" "$REPO" "$1" "$2"; }
+qflag_reason() { "$PY" -c 'import json,sys; d=json.load(open(sys.argv[1])); print((d.get("flagged",{}).get(sys.argv[2],{}) or {}).get("reason",""))' "$HEIMDALL_HOME/issues/queue.json" "$1"; }
+
+# (6a) gh create SUCCEEDS -> real PR opened -> PR_OPEN, pr_opened True, result.pr.opened True.
+OUT="$(honor_run opened 'github:acme/widget#901')"
+if printf '%s' "$OUT" | jq -e '.state == "PR_OPEN" and .pr_ready == true and .pr_opened == true and .pr.opened == true' >/dev/null 2>&1; then
+  ok "(6a) gh create SUCCEEDS -> PR_OPEN, pr_opened True, result.pr.opened True (tally pr=1)"
+else
+  bad "(6a) a successful create did NOT reach PR_OPEN ($(printf '%s' "$OUT" | jq -c '.state,.pr_opened,.pr'))"
+fi
+if "$ROOT/bin/heimdall-issue-loop" status --repo "$REPO" | jq -e '.in_flight_states["github:acme/widget#901"] == "PR_OPEN"' >/dev/null 2>&1; then
+  ok "(6a) the issue is in_flight PR_OPEN (not flagged)"
+else
+  bad "(6a) the opened issue is not in_flight PR_OPEN"
+fi
+
+# (6b) THE bug #28 falsifier: gh create FAILS but push OK -> NOT PR_OPEN, pr_opened False,
+#      result.pr.error present + scrubbed, issue flagged/re-runnable, tally pr=0. Pre-fix
+#      this WRONGLY showed PR_OPEN + pr_opened True (the silent fake).
+OUT="$(honor_run ghfail 'github:acme/widget#902')"
+if printf '%s' "$OUT" | jq -e '.state != "PR_OPEN" and .state == "PR_FAILED" and .pr_ready == false and .pr_opened == false' >/dev/null 2>&1; then
+  ok "(6b) gh create FAILS (push OK) -> state PR_FAILED, NOT PR_OPEN, pr_opened False (no fabricated success)"
+else
+  bad "(6b) a failed create was fabricated as success ($(printf '%s' "$OUT" | jq -c '.state,.pr_opened'))"
+fi
+if printf '%s' "$OUT" | jq -e '.pr.error != null and (.pr.error | test("eyJ|ghs_|ghp_") | not)' >/dev/null 2>&1; then
+  ok "(6b) result.pr.error is present AND scrubbed (the job row NAMES the gh failure without leaking the token/JWT)"
+else
+  bad "(6b) pr.error missing or unscrubbed ($(printf '%s' "$OUT" | jq -c '.pr.error'))"
+fi
+if "$ROOT/bin/heimdall-issue-queue" status --repo "$REPO" | jq -e '.flagged >= 1 and .resolved == 0' >/dev/null 2>&1 \
+   && [ "$(qflag_reason 'github:acme/widget#902')" = "pr-create-failed" ]; then
+  ok "(6b) the issue is flagged{pr-create-failed} + re-runnable (out of resolved; tally pr=0)"
+else
+  bad "(6b) a failed-create issue was not honestly flagged (reason='$(qflag_reason 'github:acme/widget#902')')"
+fi
+if "$ROOT/bin/heimdall-issue-loop" status --repo "$REPO" | jq -e '(.in_flight_states["github:acme/widget#902"] // "absent") != "PR_OPEN"' >/dev/null 2>&1; then
+  ok "(6b) the failed-create issue is NOT left in_flight PR_OPEN (no silent fake persisted)"
+else
+  bad "(6b) the failed-create issue was persisted as PR_OPEN — bug #28 NOT fixed"
+fi
+
+# (6c) record-only (no bot token): artifact built, nothing pushed -> PR_OPEN + pr_ready,
+#      but pr_opened HONESTLY False (not a failure, not a fabricated real-PR claim).
+OUT="$(honor_run recordonly 'github:acme/widget#903')"
+if printf '%s' "$OUT" | jq -e '.state == "PR_OPEN" and .pr_ready == true and .pr_opened == false and .pr.error == null' >/dev/null 2>&1; then
+  ok "(6c) record-only -> PR_OPEN + pr_ready, pr_opened HONESTLY False, no error (artifact built, not flagged)"
+else
+  bad "(6c) record-only mode mis-handled ($(printf '%s' "$OUT" | jq -c '.state,.pr_opened,.pr'))"
+fi
+
+# (6d) SOFT-IMPORT miss (no pr layer): pr_ready + STOP, no fabricated PR, pr node null.
+OUT="$(honor_run softmiss 'github:acme/widget#904')"
+if printf '%s' "$OUT" | jq -e '.state == "PR_OPEN" and .pr_ready == true and .pr_opened == false and .pr == null' >/dev/null 2>&1; then
+  ok "(6d) soft-import miss -> pr_ready + STOP (pr_opened False, pr null; no fabricated PR)"
+else
+  bad "(6d) soft-import miss mis-handled ($(printf '%s' "$OUT" | jq -c '.state,.pr_opened,.pr'))"
 fi
 
 echo
