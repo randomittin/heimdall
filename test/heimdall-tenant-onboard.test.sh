@@ -545,11 +545,14 @@ _orig = TC.put_team_cred
 def _boom(*a, **k):
     raise RuntimeError("simulated SM failure")
 TC.put_team_cred = _boom
+# A SHAPE-VALID secret (bug #23 gate passes) so the flow REACHES the boomed store — the point of
+# this test is the store-fault -> structured 502 path, not the shape gate (covered by test 10).
+STORE_SECRET = "sk-ant-oat01-" + secrets.token_urlsafe(40)
 try:
     st, body = PS.register_team_cred(A.Identity(Hd),
-        {"body": json.dumps({"kind": "oauth_token", "secret": "sekret_value_y"}).encode("utf-8")}, home=H)
+        {"body": json.dumps({"kind": "oauth_token", "secret": STORE_SECRET}).encode("utf-8")}, home=H)
     out["store_fault_structured"] = (st == 502 and body.get("error") == "store_error"
-                                     and "sekret_value_y" not in json.dumps(body))
+                                     and STORE_SECRET not in json.dumps(body))
 except Exception as exc:  # noqa: BLE001 — a RAISED exception here IS the bare-503 bug.
     out["store_fault_structured"] = False
     out["store_fault_exc"] = type(exc).__name__
@@ -569,6 +572,98 @@ j9() { "$PY" -c "import json;print(json.load(open('$D9_OUT')).get('$1'))" 2>/dev
 [ "$(j9 store_fault_structured)" = "True" ] \
   && ok "9.3 a DIRECT store fault in register_team_cred returns a STRUCTURED 502 {store_error} (not a raised crash / bare 503, no secret)" \
   || bad "9.3 a store fault was not surfaced as a structured error (exc=$(j9 store_fault_exc), see $D9_OUT)"
+
+# ── (10) BUG #23 — the SERVER SHAPE GATE: register_team_cred REFUSES a decorated/oversized/control-char
+#    secret at the boundary (structured 422 bad_secret_shape, NOT stored), yet passes a CLEAN token.
+#    FALSIFIABLE: with the shape gate disabled (is_valid_claude_secret -> always True) the SAME junk
+#    secret sails through to the store and IS stored -> the gate is what does the work. ──────────────
+echo "(10) BUG #23 server shape gate — the corrupt-cred (2199-char setup-token dump) is REFUSED, not stored [FALSIFIABLE]"
+D10_OUT="$EXT/d10.out"; D10_ERR="$EXT/d10.err"
+"$PY" - >"$D10_OUT" 2>"$D10_ERR" <<'PYEOF'
+import json, os, secrets, sys
+sys.path.insert(0, os.environ["LIB"])
+import cp_auth as A
+import cp_publicsurface as PS
+import cp_team_creds as TC
+import claude_cred
+
+os.environ["HEIMDALL_PUBLIC_SURFACE"] = "0"; os.environ["HEIMDALL_TEAM_CRED_STORE"] = "local"
+H = os.environ["HEIMDALL_HOME"]
+out = {}
+
+def _fresh_team():
+    hd = "haid:shape." + secrets.token_hex(4); _priv, pub = A.generate_keypair()
+    tid = A.derive_team_id(secrets.token_urlsafe(16)); A.register_key(hd, pub, team_id=tid)
+    return hd, tid
+
+def _post(hd, secret, kind="oauth_token"):
+    return PS.register_team_cred(A.Identity(hd),
+        {"body": json.dumps({"kind": kind, "secret": secret}).encode("utf-8")}, home=H)
+
+# reconstruct the corrupt 2199-char `claude setup-token` dump: ANSI + banner + the token buried.
+ESC = "\x1b"; real = "sk-ant-oat01-" + secrets.token_urlsafe(70)
+spinner = "".join(ESC + "[2K" + ESC + "[1G" + f for f in ["⠋","⠙","⠹","⠸"] * 40)
+banner = (ESC + "]0;claude\x07" + ESC + "[1mWelcome to Claude Code" + ESC + "[0m\r\n"
+          "Your OAuth token:\r\n" + ESC + "[32m" + real + ESC + "[0m\r\n"
+          "Visit https://console.anthropic.com/oauth/authorize?x=1 to continue\r\n")
+blob = spinner + banner + (ESC + "[2K") * 200
+out["blob_is_big"] = (len(blob) >= 2199)
+
+# (a) the decorated blob -> 422 bad_secret_shape, NOT stored.
+hd, tid = _fresh_team()
+st, body = _post(hd, blob)
+out["blob_422"] = (st == 422 and body.get("error") == "bad_secret_shape")
+out["blob_not_stored"] = (TC.get_team_cred(tid, home=H) is None)
+out["blob_no_secret_in_body"] = (real not in json.dumps(body) and "\x1b" not in json.dumps(body))
+
+# (b) a control-char secret (valid token with an embedded ESC) -> 422, NOT stored.
+hd2, tid2 = _fresh_team()
+ctrl = "sk-ant-oat01-" + ESC + "[31m" + secrets.token_urlsafe(40)
+st2, body2 = _post(hd2, ctrl)
+out["ctrl_422"] = (st2 == 422 and body2.get("error") == "bad_secret_shape")
+out["ctrl_not_stored"] = (TC.get_team_cred(tid2, home=H) is None)
+
+# (c) an OVERSIZED secret (>200 chars) -> 422, NOT stored.
+hd3, tid3 = _fresh_team()
+st3, _ = _post(hd3, "sk-ant-oat01-" + "A" * 300)
+out["big_422"] = (st3 == 422)
+out["big_not_stored"] = (TC.get_team_cred(tid3, home=H) is None)
+
+# (d) a CLEAN token STILL passes -> 200 stored, env carries EXACTLY it (the gate is not a blanket deny).
+hd4, tid4 = _fresh_team()
+clean = "sk-ant-oat01-" + secrets.token_urlsafe(40)
+st4, body4 = _post(hd4, clean)
+out["clean_200"] = (st4 == 200 and body4.get("stored") is True)
+out["clean_stored"] = (TC.env_for_team(tid4, home=H).get("CLAUDE_CODE_OAUTH_TOKEN") == clean)
+
+# (e) FALSIFIER — disable the shape gate (is_valid -> always True) and the SAME control-char secret
+#     now sails through and IS STORED. Proves the gate (not some other check) blocks the junk.
+hd5, tid5 = _fresh_team()
+_orig = claude_cred.is_valid_claude_secret
+claude_cred.is_valid_claude_secret = lambda secret, kind: True
+try:
+    st5, _ = _post(hd5, ctrl)
+    out["falsifier_stores_without_gate"] = (st5 == 200 and TC.get_team_cred(tid5, home=H) is not None)
+finally:
+    claude_cred.is_valid_claude_secret = _orig
+
+sys.stdout.write(json.dumps(out))
+PYEOF
+j10() { "$PY" -c "import json;print(json.load(open('$D10_OUT')).get('$1'))" 2>/dev/null; }
+[ "$(j10 blob_is_big)" = "True" ] || bad "10.0 fixture broken: the reconstructed setup-token dump is < 2199 chars"
+[ "$(j10 blob_422)" = "True" ] && [ "$(j10 blob_not_stored)" = "True" ] && [ "$(j10 blob_no_secret_in_body)" = "True" ] \
+  && ok "10.1 the 2199-char decorated \`claude setup-token\` dump -> 422 bad_secret_shape, NOT stored, no secret/ANSI echoed" \
+  || bad "10.1 the corrupt decorated blob was not refused/kept-out-of-store (see $D10_OUT)"
+[ "$(j10 ctrl_422)" = "True" ] && [ "$(j10 ctrl_not_stored)" = "True" ] \
+  && ok "10.2 a control-char secret -> 422, NOT stored" || bad "10.2 control-char secret not refused (see $D10_OUT)"
+[ "$(j10 big_422)" = "True" ] && [ "$(j10 big_not_stored)" = "True" ] \
+  && ok "10.3 an oversized (>200-char) secret -> 422, NOT stored" || bad "10.3 oversized secret not refused (see $D10_OUT)"
+[ "$(j10 clean_200)" = "True" ] && [ "$(j10 clean_stored)" = "True" ] \
+  && ok "10.4 a CLEAN sk-ant-oat token STILL passes -> 200 stored, env carries exactly it (not a blanket deny)" \
+  || bad "10.4 a clean token was wrongly refused (see $D10_OUT)"
+[ "$(j10 falsifier_stores_without_gate)" = "True" ] \
+  && ok "10.5 FALSIFIER: with the shape gate disabled the SAME control-char secret IS stored -> the gate does the work" \
+  || bad "10.5 the falsifier did not demonstrate the gate is load-bearing (see $D10_OUT)"
 
 echo
 echo "============================================================"

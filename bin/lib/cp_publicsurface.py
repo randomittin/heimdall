@@ -61,6 +61,9 @@ import cp_team_queue  # the ENQUEUE-ONLY sink for the public /rr-task route (INV
                      # a bounded, scrubbed row to the CALLER'S OWN team partition and STOPS; the
                      # gated worker (cp_maintainer_runner) is the only side that dispatches.
 import cp_team_creds  # the PER-TEAM MODEL-CREDENTIAL store (BYO-credential onboarding — POST /team/cred).
+import claude_cred   # the shared SANITIZE+VALIDATE oracle for the Claude BYO cred (bug #23). The server
+                     # REFUSES a decorated/oversized/control-char secret at the boundary (structured 4xx,
+                     # no store) even though the client already sanitizes — defense-in-depth.
                      # THE INV-6 REASONING (write-forward ≠ "holding a cred"): the signed handler
                      # WRITE-FORWARDS the caller's OWN cred into EXACTLY the caller's server-derived
                      # team_id partition (Secret Manager in cloud) and STOPS. It NEVER reads a cred back
@@ -708,6 +711,16 @@ def register_team_cred(identity, request, *, home=None, now=None):
         return (422, {"error": "bad_kind", "team_id": team_id})
     if not isinstance(secret, str) or not secret:
         return (422, {"error": "missing_secret", "team_id": team_id})
+    # BUG #23 — SHAPE GATE (defense-in-depth, runs on BOTH the public and gated surface, BEFORE any
+    # forward or store). The corrupt-cred incident began with a secret that was the whole ~2199-char
+    # `claude setup-token` decorated dump (ANSI escapes + banner) rather than the clean token, so the
+    # store held junk and every maintainer run failed `claude` auth. We REFUSE, right here, any secret
+    # that carries a control char, exceeds 200 chars, or does not match the sk-ant-oat (oauth_token) /
+    # sk-ant-api (api_key) grammar — a STRUCTURED 422, never stored, never the secret in the body/log.
+    # The value only TRANSITS this check (INV-4); nothing of it is echoed. FALSIFIER: drop this gate and
+    # a control-char/oversized secret sails through to put_team_cred and IS stored (test 10 goes red).
+    if not claude_cred.is_valid_claude_secret(secret, kind):
+        return (422, {"error": "bad_secret_shape", "team_id": team_id})
     # LEAST-PRIVILEGE WRITE PLACEMENT (the /team/cred 503 fix). On the internet-facing PUBLIC surface
     # with the Secret-Manager cred store, the public SA (heimdall-cp-public-run@) is DELIBERATELY
     # least-privilege and holds NO secretmanager.admin/create — so a DIRECT put_team_cred here (which
