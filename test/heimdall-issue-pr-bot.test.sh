@@ -7,11 +7,12 @@
 # MOCK bot token (NO live network, NO real PR, NO real creds):
 #
 #   (1) BOT-TOKEN PATH — with HEIMDALL_PR_BOT_TOKEN set, open_pr's default runner
-#       (gh_bot_runner) invokes `gh pr create` from a `heimdall/*` HEAD branch with
-#       --base main, WITHOUT touching main (main's HEAD sha is unchanged; no local
-#       branch is created). The scoped token reaches `gh` via the GH_TOKEN child
-#       env (functional proof: the mock gh confirms the exact token), and any
-#       inherited personal GITHUB_TOKEN is SCRUBBED from the child.
+#       (gh_bot_runner) commits the fix onto a `heimdall/issue/<id>` branch (bot
+#       committer identity), pushes it to the bare-repo origin BEFORE `gh pr create`,
+#       then invokes `gh pr create` with --base main, WITHOUT touching main (main's
+#       HEAD sha is unchanged; no main push, no merge). The scoped token reaches `gh`
+#       via the GH_TOKEN child env (functional proof: the mock gh confirms the exact
+#       token), and any inherited personal GITHUB_TOKEN is SCRUBBED from the child.
 #
 #   (2) TOKEN ABSENT -> RECORD-ONLY — with no HEIMDALL_PR_BOT_TOKEN, open_pr builds
 #       the artifact but pushes NOTHING (gh is NEVER invoked; pushed=false). The
@@ -68,6 +69,20 @@ printf 'module init\n' > "$REPO/app.py"
 git -C "$REPO" add -A
 git -C "$REPO" commit -qm "init"
 git -C "$REPO" branch -M main 2>/dev/null || true
+
+# ── LOCAL BARE origin — hermetic pushable remote for open_pr's git push (bug-21) ─
+# After bug-21, open_pr commits the fix onto a heimdall/* branch and PUSHES it to
+# origin BEFORE gh pr create. Without a real remote the push raises PushError
+# ('origin' does not appear to be a git repository). A local bare repo is the
+# hermetic equivalent used in test/issue-pr.test.sh §6 — no network, no auth.
+BARE="$WORK/repo.git"
+git init --bare -q "$BARE"
+git -C "$REPO" remote add origin "$BARE"
+# an uncommitted fix edit so _commit_and_push_branch has real staged content to
+# commit (mirrors the FIX_MARK pattern in test/issue-pr.test.sh §6; the bot-identity
+# commit can then be verified in the bare remote after the push).
+FIX_MARK="THE-REAL-FIX-$$"
+printf '%s\n' "$FIX_MARK" >> "$REPO/app.py"
 
 export HEIMDALL_HOME="$REPO/.heimdall"
 
@@ -157,7 +172,7 @@ PYEOF
 
 # open_pr via the DEFAULT runner (gh_bot_runner) — the real bot-token path.
 open_pr_default() {
-  # $1 = record JSON. Prints the open_pr result JSON (or exits 1 on HumanGateError).
+  # $1 = record JSON. Prints the open_pr result JSON (or exits 1 on error).
   RECORD="$1" ISSUE_JSON="$ISSUE_JSON" REPO="$REPO" "$PY" - <<'PYEOF'
 import json, os, sys
 import issue_pr
@@ -167,6 +182,9 @@ try:
     result = issue_pr.open_pr(issue, record, repo=os.environ["REPO"], base="main")
 except issue_pr.HumanGateError as exc:
     sys.stderr.write("HumanGateError: %s\n" % exc)
+    sys.exit(1)
+except issue_pr.PushError as exc:
+    sys.stderr.write("PushError: %s\n" % exc)
     sys.exit(1)
 print(json.dumps(result))
 PYEOF
@@ -215,7 +233,8 @@ if grep -qE 'pr create' "$GH_ARGV_LOG" && grep -qE -- '--head heimdall/' "$GH_AR
 else
   bad "gh argv missing create/--head heimdall/*/--base main (got: $(cat "$GH_ARGV_LOG"))"
 fi
-# NO push to main: main HEAD unchanged, no local branch created, no 'gh pr merge'.
+# NO push to main: main HEAD unchanged, no 'gh pr merge'. The heimdall/* branch IS
+# committed + pushed to origin (bug-21 contract: gh pr create references a pushed ref).
 MAIN_AFTER="$(git -C "$REPO" rev-parse main)"
 if [ "$MAIN_BEFORE" = "$MAIN_AFTER" ]; then
   ok "main HEAD unchanged — the bot-token path never pushed/touched main"
@@ -227,10 +246,17 @@ if ! grep -qE -- '--head main|pr merge| merge ' "$GH_ARGV_LOG"; then
 else
   bad "gh argv contained a main-push or a merge verb (scope violated)"
 fi
-if [ ! -e "$REPO/.git/refs/heads/heimdall" ] && ! git -C "$REPO" branch --list 'heimdall/*' | grep -q .; then
-  ok "no local heimdall/* branch was created by open_pr (artifact only; gh owns the push)"
+PUSH_BRANCH="heimdall/issue/github-acme-widget-7"
+if git -C "$BARE" rev-parse --verify "refs/heads/$PUSH_BRANCH" >/dev/null 2>&1; then
+  ok "open_pr committed + pushed the heimdall/* branch to origin (bug-21 contract)"
 else
-  ok "note: heimdall/* branch present (harmless in mock)"
+  bad "open_pr did NOT push the heimdall/* branch to origin (bug #21 regressed)"
+fi
+CN="$(git -C "$BARE" log -1 --format='%cn' "$PUSH_BRANCH" 2>/dev/null || true)"
+if [ "$CN" = "heimdall-maintainer[bot]" ]; then
+  ok "the fix commit is under the bot identity (committer=heimdall-maintainer[bot])"
+else
+  bad "the fix commit is NOT the bot identity (committer=${CN:-<none>})"
 fi
 # functional proof the scoped token reached gh via env; personal creds scrubbed.
 if grep -q 'token-match' "$GH_TOKEN_SEEN"; then
