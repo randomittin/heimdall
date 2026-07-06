@@ -706,6 +706,175 @@ else
 fi
 
 echo
+echo "── (8) BUG #26 — SINGLE CLEANED TOKEN + gh ENV ISOLATION + LOUD scrubbed pr ─────"
+# Root cause: the maintainer git PUSH (installation token as basic-auth password) SUCCEEDED,
+# but `gh pr create` (GH_TOKEN bearer) got an EMPTY/whitespace-corrupted token and silently
+# fell back to the container's stored gh-config App-JWT login -> GitHub 401 "A JSON web token
+# could not be decoded". Push + create read the token via DIFFERENT paths, so they diverged.
+# The fix: ONE cleaned token source (_bot_token: .strip() + reject blank) feeds BOTH arms; the
+# gh create/comment child runs GH_TOKEN=<cleaned>, NO personal GITHUB_TOKEN, XDG_CONFIG_HOME
+# popped, and GH_CONFIG_DIR=a FRESH EMPTY dir so `gh` can never read a stale hosts.yml login;
+# and a failed create is LOUD (result.pr carries a token/JWT-SCRUBBED stderr tail + pr_opened
+# False) instead of vanishing silently.
+
+# (8a) the gh create child sees the EXACT cleaned token — whitespace/newline STRIPPED, non-empty,
+#      GH_CONFIG_DIR a fresh EMPTY dir, XDG_CONFIG_HOME dropped, and NO personal GITHUB_TOKEN.
+CLEAN_TOKEN="ghs_CLEANbottoken1234567890123456789012"
+RAW_TOKEN="  ${CLEAN_TOKEN}  "$'\n'   # surrounded by spaces AND a real trailing newline (direct
+                                      # assignment, so the newline is NOT stripped by $() )
+GH_ENV_SENTINEL="$WORK/gh_env.txt"; export GH_ENV_SENTINEL
+ENVBIN="$WORK/envbin"; mkdir -p "$ENVBIN"
+cat > "$ENVBIN/gh" <<'GHEOF'
+#!/usr/bin/env bash
+{
+  printf 'GH_TOKEN=[%s]\n' "${GH_TOKEN-<UNSET>}"
+  printf 'GH_CONFIG_DIR=[%s]\n' "${GH_CONFIG_DIR-<UNSET>}"
+  printf 'GITHUB_TOKEN=[%s]\n' "${GITHUB_TOKEN-<UNSET>}"
+  printf 'XDG_CONFIG_HOME=[%s]\n' "${XDG_CONFIG_HOME-<UNSET>}"
+  if [ -n "${GH_CONFIG_DIR:-}" ] && [ -d "${GH_CONFIG_DIR}" ]; then
+    printf 'CFG_ENTRIES=%s\n' "$(ls -A "$GH_CONFIG_DIR" | wc -l | tr -d ' ')"
+    printf 'CFG_ISDIR=1\n'
+  else
+    printf 'CFG_ENTRIES=NA\nCFG_ISDIR=0\n'
+  fi
+} > "$GH_ENV_SENTINEL"
+echo "https://github.com/acme/widget/pull/99"
+exit 0
+GHEOF
+chmod +x "$ENVBIN/gh"
+
+ENV_OUT="$(PATH="$ENVBIN:$PATH" HEIMDALL_PR_BOT_TOKEN="$RAW_TOKEN" \
+  GITHUB_TOKEN="ghp_PERSONALmustNOTleak00000000000000000" \
+  XDG_CONFIG_HOME="$WORK/xdg-should-be-dropped" "$PY" - <<'PYEOF'
+import json
+import issue_pr
+r = issue_pr.gh_bot_runner(["gh", "pr", "create", "--head", "heimdall/issue/x"])
+print(json.dumps(r))
+PYEOF
+)"
+
+if grep -qxF "GH_TOKEN=[$CLEAN_TOKEN]" "$GH_ENV_SENTINEL"; then
+  ok "gh child GH_TOKEN == the EXACT cleaned token (leading/trailing whitespace + newline STRIPPED)"
+else
+  bad "gh child GH_TOKEN was not the cleaned token (got: $(grep '^GH_TOKEN=' "$GH_ENV_SENTINEL" | head -1))"
+fi
+if grep -qxF "GH_TOKEN=[]" "$GH_ENV_SENTINEL"; then
+  bad "gh child GH_TOKEN is EMPTY — gh would fall back to the stale App-JWT login (the #26 401)"
+else
+  ok "gh child GH_TOKEN is NON-EMPTY (no empty-token fallback to a stale gh-config login)"
+fi
+if grep -qxF "GITHUB_TOKEN=[<UNSET>]" "$GH_ENV_SENTINEL"; then
+  ok "the personal GITHUB_TOKEN is POPPED from the gh child env (only the scoped bot token remains)"
+else
+  bad "a personal GITHUB_TOKEN leaked into the gh child env ($(grep '^GITHUB_TOKEN=' "$GH_ENV_SENTINEL"))"
+fi
+if grep -qxF "XDG_CONFIG_HOME=[<UNSET>]" "$GH_ENV_SENTINEL"; then
+  ok "XDG_CONFIG_HOME is POPPED so nothing shadows the isolated GH_CONFIG_DIR"
+else
+  bad "XDG_CONFIG_HOME was not dropped — it could shadow the isolated GH_CONFIG_DIR"
+fi
+if grep -qxF "CFG_ISDIR=1" "$GH_ENV_SENTINEL" && grep -qxF "CFG_ENTRIES=0" "$GH_ENV_SENTINEL"; then
+  ok "GH_CONFIG_DIR is a FRESH EMPTY dir (no inherited hosts.yml -> no stale App-JWT login)"
+else
+  bad "GH_CONFIG_DIR was not a fresh empty dir ($(grep -E '^CFG_' "$GH_ENV_SENTINEL" | tr '\n' ' '))"
+fi
+if grep -qE '^GH_CONFIG_DIR=\[.*heimdall-gh-cfg' "$GH_ENV_SENTINEL"; then
+  ok "GH_CONFIG_DIR points at an ephemeral heimdall-gh-cfg dir (not the user's real gh config)"
+else
+  bad "GH_CONFIG_DIR was not the ephemeral heimdall-gh-cfg dir ($(grep '^GH_CONFIG_DIR=' "$GH_ENV_SENTINEL"))"
+fi
+CFG_PATH="$(sed -n 's/^GH_CONFIG_DIR=\[\(.*\)\]$/\1/p' "$GH_ENV_SENTINEL")"
+if [ -n "$CFG_PATH" ] && [ ! -e "$CFG_PATH" ]; then
+  ok "the ephemeral gh config dir is REMOVED after the create (no leak on disk)"
+else
+  bad "the ephemeral gh config dir was not cleaned up (still at: $CFG_PATH)"
+fi
+
+echo "  ‣ FALSIFIER — the RAW token carried a trailing newline; an UNSTRIPPED port would RED 8a ──"
+# The raw HEIMDALL_PR_BOT_TOKEN had a trailing newline. A trailing newline is tolerated by the
+# git-askpass PUSH helper but sent VERBATIM by `gh` as the bearer -> a malformed token -> the
+# #26 "JWT could not be decoded" 401. Prove the raw HAD the newline: a non-stripping port would
+# have written `GH_TOKEN=[...token<newline>]` (the `]` on the next line), reding the exact-match in 8a.
+if [ "$(printf '%s' "$RAW_TOKEN" | wc -l | tr -d ' ')" -ge 1 ]; then
+  ok "FALSIFIER setup: the RAW HEIMDALL_PR_BOT_TOKEN carried a trailing newline (the #26 corruption)"
+else
+  bad "FALSIFIER setup broken: the raw token had no trailing newline to strip"
+fi
+
+echo "  ‣ (8b) a FAILED gh create is LOUD — result.pr.error captured + JWT/token-SCRUBBED ──"
+# The #26 forensics gap: a failed `gh pr create` (empty/stale-JWT GH_TOKEN -> 401) left NO trace,
+# the PR silently vanished. Now open_pr records result.pr {opened,url,exit,error,branch,pushed}
+# (+ top-level pr_opened) with the gh stderr tail captured and TOKEN/JWT-SCRUBBED (the eyJ… App
+# JWT that caused the 401 is redacted). A real (local bare) origin so the PUSH arm succeeds; the
+# FAILING fake gh only fails the CREATE, so we exercise the loud-create path end to end.
+FAILGH_BIN="$WORK/failghbin"; mkdir -p "$FAILGH_BIN"
+JWT_LEAK="eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiIxMjM0NSJ9.SsWlLXtokenSIGpayloadABCDEF"
+TOK_LEAK="ghs_SECRETfailtoken0000000000000000000000"
+cat > "$FAILGH_BIN/gh" <<GHEOF
+#!/usr/bin/env bash
+echo "Creating pull request for heimdall/issue/x into main..."
+echo "GraphQL: HTTP 401 A JSON web token could not be decoded (token $JWT_LEAK, bot $TOK_LEAK)" >&2
+exit 1
+GHEOF
+chmod +x "$FAILGH_BIN/gh"
+
+LOUD_REPO="$WORK/loudrepo"; LOUD_BARE="$WORK/loudrepo.git"
+git init --bare -q "$LOUD_BARE"
+mkdir -p "$LOUD_REPO"
+git -C "$LOUD_REPO" init -q
+git -C "$LOUD_REPO" config user.email t@t
+git -C "$LOUD_REPO" config user.name t
+git -C "$LOUD_REPO" config commit.gpgsign false
+git -C "$LOUD_REPO" remote add origin "$LOUD_BARE"
+printf 'module init\n' > "$LOUD_REPO/app.py"
+git -C "$LOUD_REPO" add -A
+git -C "$LOUD_REPO" commit -qm init
+printf 'the real fix\n' >> "$LOUD_REPO/app.py"
+
+LOUD_OUT="$(PATH="$FAILGH_BIN:$PATH" RECORD="$PASS_RECORD" ISSUE_JSON="$ISSUE_JSON" \
+  REPO="$LOUD_REPO" HEIMDALL_PR_BOT_TOKEN="$CLEAN_TOKEN" "$PY" - <<'PYEOF'
+import json, os
+import issue_pr
+issue = json.loads(os.environ["ISSUE_JSON"])
+record = json.loads(os.environ["RECORD"])
+result = issue_pr.open_pr(issue, record, repo=os.environ["REPO"], base="main")
+print(json.dumps(result))
+PYEOF
+)"
+
+if printf '%s' "$LOUD_OUT" | jq -e '.pr_opened == false' >/dev/null 2>&1; then
+  ok "a failed gh create -> pr_opened=false (the PR did NOT silently succeed)"
+else
+  bad "pr_opened not false on a failed create ($LOUD_OUT)"
+fi
+if printf '%s' "$LOUD_OUT" | jq -e '.pr.opened == false and .pr.exit == 1 and (.pr.error != null) and .pr.branch == "heimdall/issue/github-acme-widget-7"' >/dev/null 2>&1; then
+  ok "result.pr is LOUD: opened=false, exit=1, branch set, error captured (the failure is NAMED)"
+else
+  bad "result.pr did not capture the loud failure ($LOUD_OUT)"
+fi
+if printf '%s' "$LOUD_OUT" | jq -e '.pr.pushed.pushed == true' >/dev/null 2>&1; then
+  ok "result.pr.pushed shows the branch PUSHED (push arm succeeded; only the create failed)"
+else
+  bad "result.pr.pushed did not record the successful push ($LOUD_OUT)"
+fi
+PR_ERR="$(printf '%s' "$LOUD_OUT" | jq -r '.pr.error')"
+if printf '%s' "$PR_ERR" | grep -qiE 'could not be decoded|401'; then
+  ok "the captured pr.error NAMES the cause (the 401 / JWT-decode failure)"
+else
+  bad "pr.error did not name the failure cause (got: $PR_ERR)"
+fi
+if printf '%s' "$PR_ERR" | grep -qF "$JWT_LEAK"; then
+  bad "pr.error LEAKED the App JWT (eyJ…) — the #26 credential surfaced in a persisted result"
+else
+  ok "pr.error SCRUBBED the App JWT (eyJ… redacted — the #26 credential never surfaces)"
+fi
+if printf '%s' "$PR_ERR" | grep -qF "$TOK_LEAK"; then
+  bad "pr.error LEAKED the ghs_ bot token"
+else
+  ok "pr.error SCRUBBED the ghs_ bot token (no credential in the persisted, human-read pr result)"
+fi
+
+echo
 echo "── grep: structural proofs of the human gate in the source ───────────────────"
 if grep -qE 'def open_pr\(' "$LIB" && grep -qE 'def on_merged\(' "$LIB"; then
   ok "module exposes open_pr (open+stop) and on_merged (human writeback) — and only these"

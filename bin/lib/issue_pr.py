@@ -60,8 +60,10 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
+import tempfile
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
@@ -87,11 +89,15 @@ HEIMDALL_LANDING_URL = "https://runheimdall.dev"
 PR_BOT_COMMITTER_NAME = "heimdall-maintainer[bot]"
 PR_BOT_COMMITTER_EMAIL = "heimdall-maintainer[bot]@users.noreply.github.com"
 
-# GitHub token / PEM shapes redacted from any git/gh error BEFORE it is surfaced. The
-# token rides the child ENV (never argv/URL), but a misconfigured remote could echo a
-# credential-bearing URL — belt-and-suspenders, mirroring maintain_loop._GIT_TOKENISH_RX.
+# GitHub token / PEM / App-JWT shapes redacted from any git/gh error BEFORE it is
+# surfaced. The token rides the child ENV (never argv/URL), but a misconfigured remote
+# could echo a credential-bearing URL — belt-and-suspenders, mirroring
+# maintain_loop._GIT_TOKENISH_RX. The eyJ… alternative catches the App JWT / installation
+# token whose "A JSON web token could not be decoded" 401 IS the bug #26 failure we record:
+# the failure is NAMED in the loud pr result WITHOUT ever carrying the JWT that caused it.
 _GIT_TOKENISH_RX = re.compile(
     r"(gh[oprsu]_[A-Za-z0-9]{6,}|github_pat_[A-Za-z0-9_]{6,}"
+    r"|eyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}"
     r"|x-access-token:[^@\s]+|-----BEGIN[^\n]*)")
 
 # A PR url (…/pull/<n>) parsed out of `gh pr create` output — used to recover the
@@ -678,7 +684,11 @@ def open_pr(issue, record, repo=None, base="main", gh_runner=None):
     # a branch the remote never saw) and the loop flags the issue. With NO bot token we are
     # in record-only mode (gh_bot_runner also degrades to record-only): we build the
     # artifact + push NOTHING — the agent never pushes with RJ's personal creds.
-    token = os.environ.get("HEIMDALL_PR_BOT_TOKEN")
+    # bug #26: read the CLEANED token from the SINGLE source (_bot_token) so the push
+    # arm here and the gh-create arm (gh_bot_runner) can NEVER diverge — the observed
+    # asymmetry was the push succeeding on a good token while `gh pr create` got an
+    # empty/stale one. A trailing-newline/blank token is stripped/rejected at the source.
+    token = _bot_token()
     push_result = None
     if token:
         push_result = _commit_and_push_branch(issue, branch, repo, base, token)
@@ -694,6 +704,25 @@ def open_pr(issue, record, repo=None, base="main", gh_runner=None):
     pr_ref = (gh_result or {}).get("url") or (gh_result or {}).get("pr") or branch
     _record_pr_open_state(q, issue_id, pr_ref)
 
+    # ── LOUD PR STEP (bug #26 forensics) ──────────────────────────────────────
+    # Record the create outcome — opened?, url, exit code, and a token/JWT-SCRUBBED
+    # stderr tail — into result.pr (+ top-level pr_opened) so the NEXT run NAMES the
+    # cause in the job row instead of the PR silently vanishing. This is why #26 needed
+    # forensics: the failed `gh pr create` (empty/stale-JWT GH_TOKEN -> 401 "A JSON web
+    # token could not be decoded") left NO trace. Never again — a failed create is now
+    # loud, not silent. The stderr tail is scrubbed via _scrub_git_error (which the
+    # eyJ… JWT alternative in _GIT_TOKENISH_RX now also redacts).
+    gh = gh_result or {}
+    pr_opened = bool(gh.get("ok", False)) and gh.get("url") is not None
+    pr = {
+        "opened": pr_opened,
+        "url": gh.get("url"),
+        "exit": gh.get("exit"),
+        "error": _scrub_git_error(gh.get("error")) if gh.get("error") else None,
+        "branch": branch,
+        "pushed": push_result,
+    }
+
     return {
         "ok": bool((gh_result or {}).get("ok", True)),
         "issue_id": issue_id,
@@ -704,12 +733,41 @@ def open_pr(issue, record, repo=None, base="main", gh_runner=None):
         "create_command": create_command,
         "push": push_result,
         "gh": gh_result,
+        # loud, persisted, human-read record of the create step (scrubbed).
+        "pr": pr,
+        "pr_opened": pr_opened,
         "all_passed": True,
         # explicit, auditable proof of the human gate: open_pr opened + stopped.
         "merged": False,
         "source_closed": False,
         "resolution_posted": False,
     }
+
+
+def _bot_token():
+    """Read the scoped PR-bot token from HEIMDALL_PR_BOT_TOKEN and CLEAN it at the
+    boundary (bug #26 corruption class): strip surrounding whitespace/newlines — a
+    trailing newline is tolerated by the git-askpass PUSH helper but sent VERBATIM by
+    `gh` as the bearer, yielding a malformed token -> "A JSON web token could not be
+    decoded" — and reject an empty / whitespace-only value (an empty GH_TOKEN makes
+    `gh` fall back to a stale gh-config App-JWT login -> the same 401). Returns the
+    cleaned NON-EMPTY token, or None when absent/blank. This is the SOLE token source:
+    BOTH the push arm (_commit_and_push_branch/_bot_push_env) AND the gh-create arm
+    (gh_bot_runner) read it, so they can NEVER diverge — the #26 asymmetry was exactly
+    the push succeeding on a good token while `gh pr create` got an empty/stale one."""
+    raw = os.environ.get("HEIMDALL_PR_BOT_TOKEN")
+    if raw is None:
+        return None
+    token = raw.strip()
+    return token or None
+
+
+def _ephemeral_gh_config_dir():
+    """A FRESH, EMPTY dir for the child `gh`'s GH_CONFIG_DIR so the create/comment
+    subprocess starts from a clean config — no inherited hosts.yml, no stale App-JWT
+    login. With an empty config dir, GH_TOKEN is the sole credential `gh` can use (the
+    #26 fallback-to-stale-login path is removed by construction). Caller cleans it up."""
+    return tempfile.mkdtemp(prefix="heimdall-gh-cfg-")
 
 
 def _default_gh_runner(create_command):
@@ -740,21 +798,33 @@ def gh_bot_runner(argv):
     (which is recorded/ps-visible) and NEVER printed/logged. Any inherited personal
     GITHUB_TOKEN is scrubbed so ONLY the scoped bot identity is ever used.
 
-    When HEIMDALL_PR_BOT_TOKEN is ABSENT we fall back to the record-only default —
-    we NEVER push with personal creds. Returns { ok, pushed, url, exit, command,
-    identity }; `command` is the shlex-joined argv WITHOUT the token (the token
-    lives only in the child env)."""
-    token = os.environ.get("HEIMDALL_PR_BOT_TOKEN")
+    When HEIMDALL_PR_BOT_TOKEN is ABSENT (or blank) we fall back to the record-only
+    default — we NEVER push with personal creds AND we never hand `gh` an empty/stale
+    GH_TOKEN (an empty token makes `gh` fall back to a stale gh-config App-JWT login ->
+    the bug #26 "JWT could not be decoded" 401). The token is read+cleaned via the
+    SINGLE source (_bot_token), so this create arm and the push arm can never diverge.
+    Returns { ok, pushed, url, exit, error, command, identity }; `error` is the
+    token/JWT-SCRUBBED stderr tail on failure (so a failed create NAMES its cause);
+    `command` is the shlex-joined argv WITHOUT the token (the token lives only in the
+    child env)."""
+    token = _bot_token()
     if not token:
-        # no scoped bot identity available -> NEVER fall through to personal creds.
+        # no scoped bot identity available -> NEVER fall through to personal creds
+        # and NEVER run `gh` with an empty/stale token (the #26 401 failure mode).
         return _default_gh_runner(argv)
-    proc = subprocess.run(
-        argv,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        env=_bot_env(token),
-    )
+    # a FRESH, EMPTY gh config dir per invocation so `gh` can NEVER read a stale
+    # hosts.yml App-JWT login on the container — GH_TOKEN is then the sole credential.
+    cfg_dir = _ephemeral_gh_config_dir()
+    try:
+        proc = subprocess.run(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=_bot_env(token, cfg_dir),
+        )
+    finally:
+        shutil.rmtree(cfg_dir, ignore_errors=True)
     out = (proc.stdout or "").strip().splitlines()
     # IDEMPOTENCY: a re-run on the same issue re-pushes the branch and re-runs `gh pr
     # create`; gh EXITS NON-ZERO when an open PR already exists for the head branch. That
@@ -769,30 +839,41 @@ def gh_bot_runner(argv):
             "already_exists": True,
             "url": existing.group(0) if existing else (out[-1] if out else None),
             "exit": proc.returncode,
+            "error": None,
             "command": " ".join(shlex.quote(t) for t in argv),
             "identity": "heimdall-pr-bot",
         }
+    ok = proc.returncode == 0
     return {
-        "ok": proc.returncode == 0,
-        "pushed": proc.returncode == 0,
-        "url": out[-1] if out else None,
+        "ok": ok,
+        "pushed": ok,
+        "url": out[-1] if (out and ok) else None,
         "exit": proc.returncode,
+        # SCRUBBED stderr tail so a failure (e.g. the #26 "JWT could not be decoded" 401)
+        # is NAMED in the result WITHOUT ever carrying the token/JWT that caused it.
+        "error": None if ok else _scrub_git_error(proc.stderr),
         # NB: the token is NOT here — it travelled via GH_TOKEN in the child env only.
         "command": " ".join(shlex.quote(t) for t in argv),
         "identity": "heimdall-pr-bot",
     }
 
 
-def _bot_env(token):
-    """Build the child-process env for the scoped bot identity: inject the token as
-    GH_TOKEN (so `gh` authenticates as the bot), and SCRUB any inherited personal
-    GITHUB_TOKEN plus the raw HEIMDALL_PR_BOT_TOKEN so the personal creds can never
-    be what pushes and the child can never echo the raw token. The token lives in
-    the ENV only, never on argv — so it is never logged/recorded."""
+def _bot_env(token, cfg_dir):
+    """Build the child-process env for the scoped bot identity's `gh pr create`: inject
+    the (already-cleaned) token as GH_TOKEN (so `gh` authenticates as the bot), SCRUB any
+    inherited personal GITHUB_TOKEN plus the raw HEIMDALL_PR_BOT_TOKEN (personal creds can
+    never be what opens the PR; the child can never echo the raw token), and ISOLATE `gh`
+    to the FRESH EMPTY GH_CONFIG_DIR so it can NEVER fall back to a stale App-JWT hosts.yml
+    login (the bug #26 "JWT could not be decoded" 401). GH_TOKEN takes precedence over
+    stored creds AND the empty config dir removes the fallback entirely — defence in depth.
+    XDG_CONFIG_HOME is popped so nothing shadows the isolated GH_CONFIG_DIR. The token lives
+    in the ENV only, never on argv — so it is never logged/recorded."""
     env = dict(os.environ)
     env.pop("GITHUB_TOKEN", None)
     env.pop("HEIMDALL_PR_BOT_TOKEN", None)
+    env.pop("XDG_CONFIG_HOME", None)  # so nothing shadows the isolated GH_CONFIG_DIR
     env["GH_TOKEN"] = token
+    env["GH_CONFIG_DIR"] = cfg_dir
     return env
 
 
