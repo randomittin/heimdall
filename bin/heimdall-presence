@@ -56,7 +56,7 @@ PY="$(command -v python3 || command -v python || true)"
 
 # ── parse argv (subcommand + option-style overrides) ───────────────────────────
 SUB="${1:-}"; shift || true
-HAID=""; PROJECT=""; URL=""; HANDLE=""; VERDICT=""; FILE=""; JSON=""
+HAID=""; PROJECT=""; URL=""; HANDLE=""; VERDICT=""; FILE=""; JSON=""; GLOBAL=""; NOFILES=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --haid)    HAID="${2:?--haid needs a value}"; shift 2 ;;
@@ -66,6 +66,8 @@ while [ "$#" -gt 0 ]; do
     --verdict) VERDICT="${2:?--verdict needs a value}"; shift 2 ;;
     --file)    FILE="${2:?--file needs a value}"; shift 2 ;;
     --json)    JSON="1"; shift ;;
+    --global)  GLOBAL="1"; shift ;;   # off/on: machine-wide kill switch (~/.heimdall/presence-off)
+    --no-files) NOFILES="1"; shift ;; # on: stay present but withhold file/activity detail
     *) echo "heimdall-presence: unexpected argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -100,6 +102,49 @@ PYEOF
   CFG_URL="$(printf '%s\n' "$CFG_OUT" | sed -n '1p')"
   CFG_TOKEN="$(printf '%s\n' "$CFG_OUT" | sed -n '2p')"
 fi
+
+# ── PRESENCE OPT-OUT (consent surface) — per-repo + global toggles ───────────────
+# State (local, cheap, readable — no server round-trip to CHECK it):
+#   • per-repo: <repo>/.heimdall/presence.json -> {"enabled": false} silences THIS repo;
+#     {"files": false} keeps the dev present but withholds file detail. (gitignored by
+#     `.heimdall/*` — one dev's choice must NEVER commit into a teammate's repo.)
+#   • global:  ~/.heimdall/presence-off (EXISTENCE = off), mirroring the no-autoupdate stamp.
+# EFFECTIVE = NOT global-off AND NOT repo-off. Default (no files) = ON — existing users
+# unchanged. OFF = invisible (no beats), NOT blind (roster/status still work).
+GLOBAL_OFF_FILE="$HMD_DIR/presence-off"
+_pres_state_dir() {
+  if [ -n "${HEIMDALL_PRESENCE_DIR:-}" ]; then printf '%s' "$HEIMDALL_PRESENCE_DIR"; return; fi
+  local top; top="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+  if [ -n "$top" ]; then printf '%s/.heimdall' "$top"; else printf '%s/.heimdall' "$PWD"; fi
+}
+PRES_STATE_DIR="$(_pres_state_dir)"
+PRES_STATE_FILE="$PRES_STATE_DIR/presence.json"
+
+# Effective-state probes are PURE BASH ($(<file) is a builtin — no python, no subprocess),
+# so a `beat` no-op is a stat-only fast path a cron/hook can't leak around the toggle.
+_global_pres_off() { [ -f "$GLOBAL_OFF_FILE" ]; }
+_repo_pres_off() {
+  [ -f "$PRES_STATE_FILE" ] || return 1
+  local c; c="$(<"$PRES_STATE_FILE")" 2>/dev/null || return 1
+  [[ "$c" =~ \"enabled\"[[:space:]]*:[[:space:]]*false ]]
+}
+_pres_off() { _global_pres_off || _repo_pres_off; }
+_repo_nofiles() {   # the --no-files sub-toggle: present, but file detail withheld.
+  [ -f "$PRES_STATE_FILE" ] || return 1
+  local c; c="$(<"$PRES_STATE_FILE")" 2>/dev/null || return 1
+  [[ "$c" =~ \"files\"[[:space:]]*:[[:space:]]*false ]]
+}
+_write_pres_state() {   # atomic write of presence.json (gitignored; non-secret).
+  mkdir -p "$PRES_STATE_DIR" 2>/dev/null || true
+  local tmp="$PRES_STATE_FILE.tmp.$$"
+  printf '%s\n' "$1" > "$tmp" 2>/dev/null && mv -f "$tmp" "$PRES_STATE_FILE" 2>/dev/null
+}
+
+# OFF = ZERO beats. A `beat` (from the statusline fork, a cron, or a hook) is a stat-only
+# no-op when effectively off — no python, no network, no seed bootstrap. This is defense in
+# depth: the statusline also skips the beat when off, but the toggle is enforced HERE too so
+# nothing can leak a beat around it. Retire/roster/status/on/off still run when off.
+if [ "$SUB" = "beat" ] && _pres_off; then beat_noop; fi
 
 # Normalize a git remote URL to a STABLE project id: host+path, with scheme/userinfo/port
 # stripped, an scp-style "host:path" colon -> "/", a trailing .git dropped, lowercased. All
@@ -483,6 +528,18 @@ def main():
         # A beat is fire-and-forget: success or not, never surface an error to the caller
         # (the statusline must not break on a flaky beat). Exit 0 always.
         return 0
+    if VERB == "retire":
+        # The opt-out prompt-disappearance path: POST /presence-retire so the server writes a
+        # retirement tombstone and drops this dev from teammates' rosters on the NEXT read (no
+        # 45s TTL wait). Signed with the dev's OWN seed (retire yourself only). Fire-and-forget
+        # — if the seed/URL is offline the retire is a no-op and the TTL expiry is the fallback.
+        body = json.dumps({
+            "project": os.environ.get("PRES_PROJECT") or "",
+            "nonce": secrets.token_hex(16),
+            "ts": int(time.time()),
+        }).encode()
+        request("POST", "/presence-retire", body, seed)
+        return 0
     if VERB == "roster":
         project = os.environ.get("PRES_PROJECT") or ""
         path = "/roster?" + urllib.parse.urlencode({"project": project})
@@ -505,25 +562,95 @@ if __name__ == "__main__":
 PYEOF
 }
 
+# Best-effort ONE final signed retire beat (opt-out prompt-disappearance). Only attempts when
+# the wire is resolvable (URL+HAID+PROJECT+signer present); otherwise the TTL expiry is the
+# graceful fallback. Never fatal — an offline `off` still writes the local toggle.
+_try_retire() {
+  [ -n "$PY" ] || return 0
+  [ -f "$LIB/cp_auth.py" ] || return 0
+  [ -n "$URL" ] && [ -n "$HAID" ] && [ -n "$PROJECT" ] || return 0
+  run_client retire >/dev/null 2>&1 || true
+}
+
 case "$SUB" in
-  beat)   run_client beat ;;
-  roster) run_client roster ;;
+  beat)
+    # Effectively-on here (the OFF guard above already no-op'd an off beat). Honor the
+    # --no-files sub-toggle: withhold the file field so the beat body sends file:null.
+    _repo_nofiles && FILE=""
+    run_client beat ;;
+  roster) run_client roster ;;   # OFF = invisible, NOT blind: an opted-out dev still SEES the wall.
+  retire) run_client retire ;;   # emit ONE signed retire beat (used by `off`; exposed for tooling).
+  off)
+    if [ -n "$GLOBAL" ]; then
+      mkdir -p "$HMD_DIR" 2>/dev/null || true
+      : > "$GLOBAL_OFF_FILE" 2>/dev/null || true
+      printf 'presence: OFF globally (machine-wide kill switch) — %s\n' "$GLOBAL_OFF_FILE"
+    else
+      _write_pres_state '{"enabled": false}'
+      printf 'presence: OFF for this repo — %s\n' "$PRES_STATE_FILE"
+    fi
+    # Retire NOW so you drop from teammates' walls promptly (no 45s TTL wait).
+    _try_retire
+    printf 'you can still SEE the team; the team can no longer see you. (hmd presence on to return)\n'
+    ;;
+  on)
+    if [ -n "$GLOBAL" ]; then
+      rm -f "$GLOBAL_OFF_FILE" 2>/dev/null || true
+      printf 'presence: ON globally — %s removed\n' "$GLOBAL_OFF_FILE"
+    fi
+    if [ -n "$NOFILES" ]; then
+      _write_pres_state '{"enabled": true, "files": false}'
+      printf 'presence: ON for this repo, file detail WITHHELD (--no-files) — handle+verdict only\n'
+    elif [ -z "$GLOBAL" ]; then
+      _write_pres_state '{"enabled": true}'
+      printf 'presence: ON for this repo — %s\n' "$PRES_STATE_FILE"
+    fi
+    ;;
+  status)
+    _global_pres_off && G="off" || G="on"
+    _repo_pres_off   && R="off" || R="on"
+    _repo_nofiles    && FILES="withheld (--no-files)" || FILES="shown"
+    if _pres_off; then
+      EFF="OFF"
+      if _global_pres_off; then WHY="global kill switch is on"; else WHY="this repo is opted out"; fi
+    else
+      EFF="ON"; WHY="broadcasting handle + verdict$([ "$FILES" = shown ] && printf ' + current file')"
+    fi
+    printf 'presence status\n'
+    printf '  repo:      %-4s (%s)\n' "$R" "$PRES_STATE_FILE"
+    printf '  global:    %-4s (%s)\n' "$G" "$GLOBAL_OFF_FILE"
+    printf '  effective: %s — %s\n' "$EFF" "$WHY"
+    printf '  files:     %s\n' "$FILES"
+    printf '  note: OFF = invisible, not blind — you can still SEE the team; the team cannot see you.\n'
+    ;;
   ""|-h|--help|help)
     cat <<'USAGE'
-heimdall-presence — server-synced team presence
+heimdall-presence — server-synced team presence (with consent opt-out)
 
   heimdall-presence beat              send a heartbeat for this repo's project + identity
   heimdall-presence roster [--json]   print the online team for this repo's project
+  heimdall-presence off               stop broadcasting from THIS repo (+ retire now)
+  heimdall-presence on  [--no-files]  re-enable this repo (--no-files: withhold file detail)
+  heimdall-presence off --global      machine-wide kill switch (~/.heimdall/presence-off)
+  heimdall-presence on  --global      lift the machine-wide kill switch
+  heimdall-presence status            print repo/global/effective state + what is broadcast
+  heimdall-presence retire            emit one signed retire beat (drop off walls now)
+
+CONSENT: OFF = zero beats (a stat-only no-op — a cron/hook can't leak around it) AND a retire
+beat so you vanish from teammates' walls promptly, not after the TTL. OFF is invisible, NOT
+blind: `roster` still shows the team. Broadcast is ONLY handle + verdict + current filename —
+never file contents, never code. --no-files keeps you present but sends file:null.
 
 ZERO-CONFIG: with ${HOME}/.heimdall/cp-endpoint.json shipped, the first beat/roster
 auto-resolves the url, auto-generates+enrolls+persists a 0600 signing key, derives a
 stable project id from the git remote, and reads the handle from heimdall-identity — the
 dev exports NOTHING. Overrides still win:
-  Overrides: --haid --project --url --handle --verdict --file
+  Overrides: --haid --project --url --handle --verdict --file --global --no-files
   Env: HMD_HAID HMD_PROJECT HMD_HANDLE HMD_VERDICT HMD_FILE HMD_ENROLL_THROTTLE
+       HEIMDALL_PRESENCE_DIR (per-repo state dir override)
        HEIMDALL_CP_URL|BASE_URL  HMD_PRESENCE_SEED (dev key override; server's HEIMDALL_CP_PKI_KEY is NOT read)
 Offline/unconfigured degrades cleanly (empty roster, no-op beat, exit 0).
 USAGE
     ;;
-  *) echo "heimdall-presence: unknown subcommand '$SUB' (try: beat | roster)" >&2; exit 2 ;;
+  *) echo "heimdall-presence: unknown subcommand '$SUB' (try: beat | roster | on | off | status | retire)" >&2; exit 2 ;;
 esac

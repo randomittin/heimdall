@@ -226,6 +226,36 @@ def record_presence(haid, *, project, team_id, handle=None, verdict=None, file=N
             "team_id": team_id}
 
 
+def record_retire(haid, *, project, team_id, home=None, ts=None):
+    """RETIRE one dev's presence: atomically OVERWRITE their (project, team_id, haid) record
+    with a RETIREMENT TOMBSTONE {haid, project, retired: True, ts} via put_record (last-write-
+    wins). This is the "prompt disappearance, not TTL-wait" path: the tombstone makes roster()
+    DROP the dev on the very NEXT read — no 45s online-window wait — so a `hmd presence off`
+    vanishes the dev from teammates' walls promptly. A later normal beat (record_presence,
+    retired absent) overwrites the tombstone and the dev reappears (re-opt-in).
+
+    The record KEY is the SERVER-VERIFIED haid (a dev can only retire ITSELF, never a
+    teammate); team_id is the (project, team) partition, resolved from the caller's binding at
+    the route, NEVER a body field. DATA only — a tombstone runs nothing. Returns
+    {ok, haid, project, team_id, retired} on a stored write, {ok: False, reason} on IO
+    failure. Routed THROUGH the StateBackend (put_record) — Firestore-durable on Cloud Run,
+    byte-identical on local; NEVER backend.path()."""
+    if not haid:
+        return {"ok": False, "reason": "no_haid"}
+    record = {
+        "haid": haid,
+        "project": _clean(project),
+        "retired": True,
+        # epoch seconds — a fresh tombstone; is_online() keeps it "recent" so the
+        # retired guard (not the TTL) is what removes the dev on the next read.
+        "ts": float(ts) if isinstance(ts, (int, float)) else time.time(),
+    }
+    if not _backend(home).put_record(_record_rel(project, team_id, haid), record):
+        return {"ok": False, "reason": "io_error"}
+    return {"ok": True, "haid": haid, "project": record.get("project"),
+            "team_id": team_id, "retired": True}
+
+
 def is_online(record, *, now=None, ttl=None):
     """True iff a presence record's heartbeat is within the online TTL (now - ts <= ttl).
     A record with no/garbled ts is OFFLINE (never falsely online). `now`/`ttl` are
@@ -268,6 +298,16 @@ def roster(project, team_id, *, home=None, now=None, ttl=None):
         rel = os.path.join(team_dir, name)
         record = backend.get_record(rel)
         if not is_online(record, now=when, ttl=window):
+            continue
+        # RETIREMENT (opt-out) is honored HERE, at the READ AUTHORITY — the server
+        # drops a retired dev from EVERY roster read (the signed /roster AND the
+        # team-secret /roster-team), so opt-out is REAL (server-side), not cosmetic
+        # client-hiding. A dev who ran `hmd presence off` posted a retire tombstone
+        # ({retired: true}); it disappears them on the NEXT read, no 45s TTL wait. A
+        # later normal beat overwrites the tombstone (retired absent) and they
+        # reappear (re-opt-in). THE FALSIFIER: drop this guard and a retired dev
+        # reappears on the roster -> test/heimdall-presence-optout.test.sh goes RED.
+        if isinstance(record, dict) and record.get("retired"):
             continue
         view = dict(record)
         view["online"] = True
@@ -375,6 +415,34 @@ def roster_route(identity, request, *, home=None):
     return cp_server.Response(
         200, {"project": project, "team_id": team_id,
               "roster": roster(project, team_id, home=home)})
+
+
+def retire_route(identity, request, *, home=None):
+    """POST /presence-retire — RETIRE the caller's presence (the opt-out prompt-disappearance
+    path). The server ran the §3 auth chokepoint BEFORE this, so `identity` is a VERIFIED
+    cp_auth.Identity; the tombstone is keyed by identity.haid (the VERIFIED HAID) — a dev can
+    only retire ITSELF, never a teammate. team_id is resolved from the VERIFIED caller's
+    registry binding (cp_auth.registered_team), NEVER a body field, so the retirement lands in
+    the caller's OWN team partition.
+
+    Body (JSON): {project} — the project to retire from (the client sends its repo's project).
+    Writes a retirement tombstone so the dev drops from teammates' rosters on the next read
+    (no TTL wait). 200 with the retire summary on a write, 422 when no project is supplied,
+    500 on an IO failure. DATA ONLY — dispatches nothing, runs no handler."""
+    haid = identity.haid if isinstance(identity, cp_auth.Identity) else identity
+    payload = _parse_body(request)
+    project = payload.get("project")
+    if not project:
+        return cp_server.Response(
+            422, {"retired": False, "reason": "no_project"})
+    team_id = cp_auth.registered_team(haid, home=home)
+    result = record_retire(haid, project=project, team_id=team_id, home=home)
+    if not result.get("ok"):
+        return cp_server.Response(
+            500, {"retired": False, "reason": result.get("reason", "io_error")})
+    return cp_server.Response(
+        200, {"retired": True, "haid": haid, "project": result.get("project"),
+              "team_id": team_id})
 
 
 # ── the TEAM-PRIVATE browser read (GET /roster-team — the static dashboard's read) ──
@@ -492,6 +560,12 @@ def register(*, home=None):
     keys.append(cp_server.register_route(
         "GET", "/roster",
         lambda identity, request: roster_route(identity, request, home=home)))
+    # POST /presence-retire — the opt-out prompt-disappearance path: a signed member retires
+    # its OWN presence (a tombstone keyed by the verified haid), dropping off teammates' walls
+    # on the next read. Authenticated seam (only a signed member can retire itself).
+    keys.append(cp_server.register_route(
+        "POST", "/presence-retire",
+        lambda identity, request: retire_route(identity, request, home=home)))
     # The TEAM-PRIVATE browser read + its CORS preflight (pre-auth; public-surface-only,
     # self-gated inside the handlers; secret-header authorized; per-IP rate-limited; READ-ONLY).
     keys.append(cp_server.register_public_route(

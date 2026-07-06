@@ -81,7 +81,26 @@ def _quiet_rm(path):
 def _roster_cache_path(cwd): return os.path.join(cwd, ".heimdall", ".roster-cache.json")
 def _beat_stamp_path(cwd): return os.path.join(cwd, ".heimdall", ".beat-stamp")
 
-def _spawn_presence(cwd, handle, verdict):
+def _presence_state(cwd):
+    """Effective presence opt-out — read from the SAME durable state bin/heimdall-presence
+    writes: the global ~/.heimdall/presence-off stamp (existence = off) + the per-repo
+    <cwd>/.heimdall/presence.json ({"enabled": false} = off, {"files": false} = file detail
+    withheld). Returns (present, files_shown). Default (no files) = present — existing users
+    unchanged. Pure stat/JSON reads, never raises (the statusline must never break)."""
+    present, files_shown = True, True
+    gp = os.path.join(os.path.expanduser("~"), ".heimdall", "presence-off")
+    try:
+        if os.path.exists(gp): present = False
+    except Exception: present = present   # any stat fault → leave the default (present)
+    try:
+        with open(os.path.join(cwd, ".heimdall", "presence.json")) as f: st = json.load(f)
+        if isinstance(st, dict):
+            if st.get("enabled") is False: present = False
+            if st.get("files") is False: files_shown = False
+    except Exception: files_shown = files_shown   # absent/unreadable → default (present, shown)
+    return present, files_shown
+
+def _spawn_presence(cwd, handle, verdict, present=True):
     """ONE coordinated, fire-and-forget presence fork per render. Cheap STAT-ONLY throttle
     gates decide what is due — the beat stamp (~20s, under the server's ~45s TTL) and the
     roster cache (~4s) + refresher lock (~8s) — BEFORE anything is spawned, so a throttled
@@ -97,6 +116,10 @@ def _spawn_presence(cwd, handle, verdict):
     # stat-only "is it due?" gates — NO process is spawned just to decide.
     try: beat_due = not (os.path.exists(stamp) and now - os.path.getmtime(stamp) < 20)
     except Exception: beat_due = False
+    # OFF = ZERO beats: an opted-out dev writes NO .beat-stamp and forks NO beat (invisible to
+    # teammates). The roster refresh below is untouched — OFF is invisible, NOT blind. FALSIFIER:
+    # drop this line and an off render writes the stamp + forks a beat → the optout test goes RED.
+    if not present: beat_due = False
     try:
         fresh  = os.path.exists(cache) and now - os.path.getmtime(cache) < 4
         locked = os.path.exists(lock)  and now - os.path.getmtime(lock)  < 8
@@ -402,10 +425,16 @@ def main():
         sys.stdout.write(f"{CY}▐{X}{vcol}{eyes}{X}{CY}▌{X} {vcol}{vglyph} {vword}{cnt}{X}")
         return
 
+    # presence opt-out (consent surface): when the dev ran `hmd presence off` (repo or global)
+    # they are INVISIBLE — no beat is forked (present=False gates it), but the roster still
+    # refreshes so they can SEE the team (off = invisible, not blind). The statusline shows a
+    # clear off-hint below so the dev is never silently invisible.
+    present, files_shown = _presence_state(cwd)
+
     # keep THIS dev present on teammates' walls AND warm the roster cache in ONE fork: a
     # throttled, detached beat + roster refresh (the roster read alone never announced us).
     # Stat-only throttle gates → ZERO forks when both are throttled. Never blocks the render.
-    _spawn_presence(cwd, handle, verdict)
+    _spawn_presence(cwd, handle, verdict, present)
 
     # ── sigil anchor (squint animates; eyes stay visible in every frame) ──
     # In no-color mode the sprite's ANSI half-blocks would be garbage, so collapse
@@ -485,7 +514,11 @@ def main():
         header = f"{FAINT}── watch ──{X}"
         you_state = {"pass": "✓", "deny": "✗", "scanning": "◦"}.get(verdict, "⚡")
         you_word  = {"pass": "proven", "deny": "blocked", "scanning": "scanning"}.get(verdict, "working")
-        you_seg = f"{sig_glyph(seed)} {BOLD}you{X} {DIM}{you_state} {you_word}{X}"  # your watchman closes the wall
+        if present:
+            you_seg = f"{sig_glyph(seed)} {BOLD}you{X} {DIM}{you_state} {you_word}{X}"  # your watchman closes the wall
+        else:
+            # OPTED OUT: the dev sees the team but the team can't see them — say so plainly.
+            you_seg = f"{sig_glyph(seed)} {BOLD}you{X} {DIM}◦ presence off{X}"
 
         JOIN = 2                                   # the "  " between wall segments
         budget = max(0, cols - (SW + 2) - RMARGIN) # usable row width: COLUMNS − sigil anchor − gutter
@@ -538,7 +571,12 @@ def main():
         # SOLO TEASE: the wall is empty (no roster, no team files). Fill the dead row
         # with a faint invite — sells the team feature, drives the growth loop. Single
         # row, width-safe (<= COLUMNS − sigil anchor − gutter): dropped if it can't fit.
-        tease = f"{FAINT}── watch ── invite your team · hmd invite{X}"
+        # When OPTED OUT the invite would be a lie (no one can see the dev) — show the
+        # invisible-state hint instead so the dev knows they're off, not just alone.
+        if present:
+            tease = f"{FAINT}── watch ── invite your team · hmd invite{X}"
+        else:
+            tease = f"{FAINT}── watch ── presence off · hmd presence on{X}"
         if vis(tease) > max(0, cols - ANCHOR - RMARGIN): tease = ""
         out.append(f"{_sig(sig,2,CY)}  " + tease)
         out.append(f"{_sig(sig,3,CY)}  ")
