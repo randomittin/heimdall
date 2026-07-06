@@ -1,1 +1,25 @@
 2e36d3c92edd244c47edc01108d0b5f4c8f4b37c:test/heimdall-presence-bootstrap.test.sh:generic-api-key:59
+# ── Benign TEST-FIXTURE history fingerprints (gitleaks .gitleaksignore) ──────────
+# These are per-secret fingerprints (commit:file:rule:line) — NOT a path allowlist.
+# The convention (docs/analysis/gitleaks-history-triage-2026-07-06.md +
+# docs/superpowers/specs/heimdall-fixture-secret-convention.md) forbids blanket
+# path-allowlisting a fixture file (it would blind the gate to a real secret checked
+# in beside it). A fingerprint is narrow: it ignores ONLY this exact benign value at
+# this exact historical commit, so the gate still catches anything new.
+#
+# The CURRENT-tree literals were broken to obviously-fake, gitleaks-inert forms in
+# the same change (so future commits stay clean); these fingerprints cover only the
+# copies frozen in HISTORY commits, which a tree-fix can't reach.
+#
+# Heavier alternative (RJ may still choose it later): rewrite the literals out of
+# history with `git filter-repo --replace-text`, then delete these lines. See the
+# "Step 2 — scrub history" section of docs/analysis/gitleaks-history-triage-2026-07-06.md.
+
+# benign test fixture — a fake personal GITHUB_TOKEN proving it is POPPED from the gh child env (bug #26 test)
+51d16d23619d71bc889a212e6fdeeb80c4af3a55:test/issue-pr.test.sh:github-pat:747
+# benign test fixture — a fake App JWT the failing gh emits, proving pr.error SCRUBS it (bug #26 test)
+51d16d23619d71bc889a212e6fdeeb80c4af3a55:test/issue-pr.test.sh:jwt:811
+# benign test fixture — a fake secret-shaped enqueue input proving it is REDACTED, not stored (team-queue scrub test)
+e7fe6de738ce03e1fe306c04d8524b37cfe8163e:test/heimdall-cp-team-queue.test.sh:generic-api-key:283
+# benign test fixture — the same fake redaction-assertion string (team-queue scrub test)
+e7fe6de738ce03e1fe306c04d8524b37cfe8163e:test/heimdall-cp-team-queue.test.sh:generic-api-key:290

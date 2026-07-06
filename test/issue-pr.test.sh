@@ -744,7 +744,7 @@ GHEOF
 chmod +x "$ENVBIN/gh"
 
 ENV_OUT="$(PATH="$ENVBIN:$PATH" HEIMDALL_PR_BOT_TOKEN="$RAW_TOKEN" \
-  GITHUB_TOKEN="ghp_PERSONALmustNOTleak00000000000000000" \
+  GITHUB_TOKEN="ghp_PERSONAL-must-NOT-leak-OBVIOUSLY-FAKE" \
   XDG_CONFIG_HOME="$WORK/xdg-should-be-dropped" "$PY" - <<'PYEOF'
 import json
 import issue_pr
@@ -808,7 +808,7 @@ echo "  ‣ (8b) a FAILED gh create is LOUD — result.pr.error captured + JWT/t
 # JWT that caused the 401 is redacted). A real (local bare) origin so the PUSH arm succeeds; the
 # FAILING fake gh only fails the CREATE, so we exercise the loud-create path end to end.
 FAILGH_BIN="$WORK/failghbin"; mkdir -p "$FAILGH_BIN"
-JWT_LEAK="eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiIxMjM0NSJ9.SsWlLXtokenSIGpayloadABCDEF"
+JWT_LEAK="eyJHEADERfake.PAYLOADfake.SIGNATUREfake"
 TOK_LEAK="ghs_SECRETfailtoken0000000000000000000000"
 cat > "$FAILGH_BIN/gh" <<GHEOF
 #!/usr/bin/env bash
