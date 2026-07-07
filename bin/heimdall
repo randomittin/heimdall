@@ -1108,6 +1108,21 @@ case "${1:-}" in
     fi
     exec "$PRESENCE_BIN" "$@"
     ;;
+  watch)
+    # Pass-through to heimdall-watch-tui (the `hmd watch` TUI dashboard, spec C).
+    # DISTINCT bin from bin/heimdall-watch (the H-3 sentinel watch-mode tool),
+    # mirroring the heimdall-drain anti-clobber convention. The dashboard is a
+    # renderer over local caches — zero additional server calls. Degrades to a
+    # static wall+feed dump (+ pip install textual hint) when Textual is absent.
+    shift
+    WATCH_BIN="$PLUGIN_DIR/bin/heimdall-watch-tui"
+    if [ ! -x "$WATCH_BIN" ]; then
+      echo "  Error: heimdall-watch-tui not found at $WATCH_BIN" >&2
+      echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+      exit 1
+    fi
+    exec "$WATCH_BIN" "$@"
+    ;;
 esac
 
 # ── Command handlers ──
