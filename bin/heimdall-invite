@@ -224,4 +224,11 @@ if [ -n "$WANT_QR" ] && command -v qrencode >/dev/null 2>&1; then
   printf '%s' "$JOIN" | qrencode -t ANSIUTF8 2>/dev/null || true
 fi
 
+# ── Δ6 funnel: record the `invite_sent` growth-loop stage (client-side, consent-
+#    gated, fire-and-forget). Emitted ONLY on the success path (an invite was
+#    actually generated), never on the no-team degrade above. Zero-content: the
+#    engine carries only the coded stage + a HASHED team key — never the secret.
+FUNNEL_BIN="$BIN_DIR/heimdall-funnel"
+[ -x "$FUNNEL_BIN" ] && ( "$FUNNEL_BIN" emit invite_sent --context cli >/dev/null 2>&1 & ) || true
+
 exit 0

@@ -1124,6 +1124,11 @@ case "${1:-}" in
       echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
       exit 1
     fi
+    # Δ6 funnel: record the `join` growth-loop stage (client-side, consent-gated,
+    # fire-and-forget — never blocks or prints; the engine no-ops when off). Emitted
+    # BEFORE the exec so the join hand-off still replaces this process.
+    FUNNEL_BIN="$PLUGIN_DIR/bin/heimdall-funnel"
+    [ -x "$FUNNEL_BIN" ] && ( "$FUNNEL_BIN" emit join --context cli >/dev/null 2>&1 & ) || true
     exec "$JOIN_BIN" join "$@"
     ;;
   connect)
@@ -1190,6 +1195,47 @@ case "${1:-}" in
       exit 1
     fi
     exec "$VERDICT_BIN" "$@"
+    ;;
+  badge)
+    # Pass-through to heimdall-badge: the viral README badge — "🛡 heimdall: N proven
+    # merges" with a runheimdall.dev backlink (markdown snippet / offline-safe SVG /
+    # JSON). Number sourced from the repo's local verdict/beats store. All args
+    # forwarded verbatim (--markdown/--svg/--json/--count).
+    shift
+    BADGE_BIN="$PLUGIN_DIR/bin/heimdall-badge"
+    if [ ! -x "$BADGE_BIN" ]; then
+      echo "  Error: heimdall-badge not found at $BADGE_BIN" >&2
+      echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+      exit 1
+    fi
+    exec "$BADGE_BIN" "$@"
+    ;;
+  clip)
+    # Pass-through to heimdall-clip: export a gate/wall MOMENT as a shareable card
+    # (sigil + runheimdall.dev tag) from the local verdict/receipt store. All args
+    # forwarded verbatim (--last/--wall/--json/--svg).
+    shift
+    CLIP_BIN="$PLUGIN_DIR/bin/heimdall-clip"
+    if [ ! -x "$CLIP_BIN" ]; then
+      echo "  Error: heimdall-clip not found at $CLIP_BIN" >&2
+      echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+      exit 1
+    fi
+    exec "$CLIP_BIN" "$@"
+    ;;
+  funnel)
+    # Pass-through to heimdall-funnel: the Δ6 launch-funnel local view + the internal
+    # emit the growth-loop surfaces call (install/init/invite_sent/join/badge_added).
+    # Client-side into the shared telemetry spool, consent-gated + zero-content — no
+    # CP route. All args forwarded verbatim (counts/status/purge/emit).
+    shift
+    FUNNEL_BIN="$PLUGIN_DIR/bin/heimdall-funnel"
+    if [ ! -x "$FUNNEL_BIN" ]; then
+      echo "  Error: heimdall-funnel not found at $FUNNEL_BIN" >&2
+      echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+      exit 1
+    fi
+    exec "$FUNNEL_BIN" "$@"
     ;;
 esac
 

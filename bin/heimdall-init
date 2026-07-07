@@ -165,7 +165,7 @@ git -C "$REPO" config core.hooksPath "$HOOKS_REL"
 
 # ── keep the transient local state out of the repo's own git noise ─────────────
 GI="$REPO/.gitignore"
-for pat in ".heimdall/verdict.json" ".heimdall/receipts/"; do
+for pat in ".heimdall/verdict.json" ".heimdall/receipts/" ".heimdall/audit.json"; do
   if [ -f "$GI" ] && grep -qxF "$pat" "$GI" 2>/dev/null; then continue; fi
   printf '%s\n' "$pat" >> "$GI" 2>/dev/null || true
 done
@@ -184,5 +184,23 @@ if [ "$PRIOR_ABS" != "$REPO/.git/hooks" ] || { [ -x "$PRIOR_ABS/pre-commit" ] ||
 fi
 printf "  ${D}gates run on every commit; deny blocks it.${R}\n"
 printf "  ${D}escape once:${R} ${B}HMD_SKIP=1 git commit …${R} ${D}(logged, never silent)${R}\n"
-printf "  ${D}last verdict:${R} ${C}hmd verdict${R}\n\n"
+printf "  ${D}last verdict:${R} ${C}hmd verdict${R}\n"
+
+# ── Δ2 audit-on-init: a fast, fully-offline repo audit → A NUMBER WORTH POSTING,
+#    printed here and STORED to <repo>/.heimdall/audit.json for `hmd badge`/`hmd
+#    clip`. Runs on FIRST init only (no audit.json yet). NON-BLOCKING by contract:
+#    the whole block is guarded + `|| true`, so a scan/python hiccup never changes
+#    init's exit status (still 0). ────────────────────────────────────────────────
+AUDIT_LIB="$PLUGIN_BIN/lib/repo_audit.py"
+if [ ! -f "$REPO/.heimdall/audit.json" ] && command -v python3 >/dev/null 2>&1 && [ -f "$AUDIT_LIB" ]; then
+  AUDIT_LINE="$(python3 "$AUDIT_LIB" run --repo "$REPO" --store "$REPO/.heimdall/audit.json" 2>/dev/null || true)"
+  [ -n "$AUDIT_LINE" ] && printf "  ${C}%s${R}\n" "$AUDIT_LINE"
+fi
+
+# ── Δ6 funnel: record the `init` growth-loop stage (client-side, consent-gated,
+#    fire-and-forget — never blocks or prints; the engine no-ops when off). ────────
+FUNNEL_BIN="$PLUGIN_BIN/heimdall-funnel"
+[ -x "$FUNNEL_BIN" ] && ( "$FUNNEL_BIN" emit init --context hook >/dev/null 2>&1 & ) || true
+
+printf '\n'
 exit 0
