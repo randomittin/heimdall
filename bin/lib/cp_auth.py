@@ -508,26 +508,69 @@ def default_team_id():
     return None
 
 
-def register_key(haid, public_b64, *, owner=False, team_id=None, project=None, home=None):
+def register_key(haid, public_b64, *, owner=False, team_id=None, project=None,
+                 enrolled_at=None, home=None):
     """Bind an Ed25519 public key to a HAID (the `register` step, §3). Upserts the
-    {haid -> {pubkey, owner, team_id?, project?}} entry. Returns True on a stored write. The
-    instance generated the keypair and sends ONLY public_b64 — the private seed never leaves
-    the instance. `owner=True` flags a distinguished gate-override identity (§7).
+    {haid -> {pubkey, owner, team_id?, project?, enrolled_at?}} entry. Returns True on a stored
+    write. The instance generated the keypair and sends ONLY public_b64 — the private seed never
+    leaves the instance. `owner=True` flags a distinguished gate-override identity (§7).
 
     `team_id`/`project` are ADDITIVE (multi-tenant teams): when supplied they are stored as
     the member's team partition handle + active repo; when None they are omitted (a binding
     with no team_id reads as default_team_id() — additive, non-destructive, no migration). The
-    raw team_secret is NEVER passed here — only its derived, non-secret team_id."""
+    raw team_secret is NEVER passed here — only its derived, non-secret team_id.
+
+    `enrolled_at` (epoch seconds) is the ADDITIVE first-registration stamp the registry-hygiene
+    job (cost-governance §3) uses to bound never-beat identities: it is written when an explicit
+    value is passed, else the EXISTING binding's enrolled_at is PRESERVED across a team-switch
+    re-stamp (so the original enroll time is never lost), else omitted (a legacy binding with no
+    stamp is grandfathered — hygiene never evicts on the ABSENCE of an activity signal)."""
     if not haid or not public_b64:
         return False
     reg = _load_keys(home)
+    prior = reg["keys"].get(haid) if isinstance(reg["keys"].get(haid), dict) else {}
     entry = {"pubkey": public_b64, "owner": bool(owner)}
     if team_id is not None:
         entry["team_id"] = team_id
     if project is not None:
         entry["project"] = project
+    if isinstance(enrolled_at, (int, float)) and not isinstance(enrolled_at, bool):
+        entry["enrolled_at"] = int(enrolled_at)
+    elif isinstance(prior.get("enrolled_at"), (int, float)):
+        entry["enrolled_at"] = int(prior["enrolled_at"])
     reg["keys"][haid] = entry
     return _store_keys(reg, home)
+
+
+def remove_keys(haids, *, home=None):
+    """Evict a set of HAID bindings from the registry (the registry-hygiene job, cost-governance
+    §3: monthly TTL-eviction of identities with zero beats in 60 days). Rewrites the registry
+    record ONCE, dropping every haid in `haids` that is NOT an owner (an owner is the server /
+    gate-override identity and is NEVER evicted, even if named). Returns the SORTED list of haids
+    actually removed ([] when none matched / all were owners / the write failed). Firestore-safe
+    (get_record + put_record only, never backend.path()). Reversible only by re-enroll — the
+    caller (hygiene) audits every eviction."""
+    wanted = {h for h in (haids or []) if h}
+    if not wanted:
+        return []
+    reg = _load_keys(home)
+    keys = reg.get("keys")
+    if not isinstance(keys, dict):
+        return []
+    removed = []
+    for haid in list(keys.keys()):
+        if haid not in wanted:
+            continue
+        entry = keys.get(haid)
+        if isinstance(entry, dict) and entry.get("owner"):
+            continue  # never evict an owner identity.
+        del keys[haid]
+        removed.append(haid)
+    if not removed:
+        return []
+    if not _store_keys(reg, home):
+        return []
+    return sorted(removed)
 
 
 def registered_pubkey(haid, home=None):

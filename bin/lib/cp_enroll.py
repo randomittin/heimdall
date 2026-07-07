@@ -320,6 +320,18 @@ def enroll(haid, pubkey, *, provided_token, team_secret=None, handle=None,
             return {"ok": False, "reason": "registry_write_failed"}
         return {"ok": True, "haid": haid, "team_id": team_id}
 
+    # 6.4. ANOMALY FREEZE (cost-governance §3) — a team persistently flagged as a write-flooder
+    #      (>50× the median daily write volume for FREEZE_DAYS consecutive days) has its ENROLLMENT
+    #      FROZEN: no NEW member may join it. This is a NET-NEW gate ONLY — the idempotent/conflict/
+    #      own-key-switch paths already returned above, so EXISTING members keep working (at the
+    #      coalesced max backoff). Reversible (cp_anomaly.unfreeze / clear_mark) + audited. Lazy
+    #      import (cp_anomaly pulls cp_config/cp_notify; no cycle back to cp_enroll, but keep the
+    #      load-time surface minimal). Fail-open by construction: is_frozen returns False on any
+    #      store hiccup, so a legit team is never frozen out by a transient backend error.
+    import cp_anomaly  # lazy — the abuse throttle; a frozen team refuses only NET-NEW enrolls.
+    if cp_anomaly.is_frozen(team_id, home=home):
+        return {"ok": False, "reason": "team_frozen"}
+
     # 6.5. CAPS — a NET-NEW haid only (idempotent/conflict/switch already returned above).
     #      PER-TEAM first (bounds how much one secret can bloat its team), then the GLOBAL
     #      registry ceiling (bounds total growth regardless of rate / key-IP rotation).
@@ -330,9 +342,13 @@ def enroll(haid, pubkey, *, provided_token, team_secret=None, handle=None,
 
     # 7. Register the NEW binding. Enrolled devs are NOT owners (owner is the server identity,
     #    cp_auth.ensure_server_identity); a self-enroll — token OR open — never grants
-    #    gate-override authority (owner=False is re-asserted here, unconditionally).
+    #    gate-override authority (owner=False is re-asserted here, unconditionally). Stamp
+    #    enrolled_at (epoch) so the registry-hygiene job (cost-governance §3) can bound a
+    #    NEVER-beating identity: an enrolled key that never produces a beat is still evicted once
+    #    its enrolled_at ages past the idle window (bounded registry growth forever).
+    import time as _time  # stdlib — the enroll timestamp for the hygiene idle window.
     if not cp_auth.register_key(haid, pubkey, owner=False, team_id=team_id,
-                                project=project, home=home):
+                                project=project, enrolled_at=int(_time.time()), home=home):
         return {"ok": False, "reason": "registry_write_failed"}
     return {"ok": True, "haid": haid, "team_id": team_id}
 
@@ -351,6 +367,7 @@ _STATUS_BY_REASON = {
     "haid_pubkey_conflict": 409,
     "team_secret_weak": 422,
     "team_required": 422,
+    "team_frozen": 429,
     "team_full": 429,
     "enroll_registry_full": 429,
     "registry_write_failed": 500,

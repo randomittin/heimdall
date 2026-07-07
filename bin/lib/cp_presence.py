@@ -460,6 +460,14 @@ def beat_route(identity, request, *, home=None):
                 "cp_presence: beat NOT stored haid=%s project=%s team=%s reason=%s\n"
                 % (haid, project, team_id, reason))
         return cp_server.Response(500, {"recorded": False, "reason": reason})
+    # ABUSE THROTTLE (cost-governance §3) — count this beat against the team's daily write volume
+    # and, on a sampled cadence, coalesce a >50×-median write-flooder to the interval-ladder max
+    # (cp_anomaly). FLAG-GATED (HEIMDALL_ANOMALY_TRACK): inert on the gated/single-tenant path (no
+    # per-beat write added). Best-effort — the throttle never fails an accepted beat (observe_beat
+    # swallows its own faults), so a store hiccup in the counter cannot turn a good beat into a 500.
+    import cp_anomaly  # lazy — the write-flood throttle; mirrors cp_boot's lazy tenant-runner import.
+    if cp_anomaly.tracking_enabled():
+        cp_anomaly.observe_beat(team_id, home=home)
     return cp_server.Response(
         200, {"recorded": True, "haid": haid, "project": result.get("project"),
               "team_id": team_id})

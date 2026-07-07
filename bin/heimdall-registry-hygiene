@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# heimdall-registry-hygiene — THE MONTHLY REGISTRY TTL-EVICTION JOB (cost-governance §3).
+#
+# Reclaim dead identities so the haid->pubkey registry stays bounded FOREVER: evict every binding
+# with ZERO beats in the idle window (default 60 days), derived from the presence store (zero per-
+# beat cost). Owners are never evicted; a binding with no activity signal at all is grandfathered
+# (kept). Reversible by re-enroll, audited on every applied run. Heimdall never pays for inference
+# (BYO everywhere); this governs one of the two things the $10k/mo budget buys — Firestore storage.
+#
+# USAGE:
+#   heimdall-registry-hygiene [--apply] [--max-idle-days N] [--home DIR] [--json]
+#
+#   --apply           actually remove the stale bindings. DEFAULT is a DRY RUN (compute + print the
+#                     plan, touch nothing) — run dry first, then --apply.
+#   --max-idle-days N the idle window in days (default 60, or HEIMDALL_REGISTRY_MAX_IDLE_DAYS).
+#   --home DIR        the control-plane state home (defaults to the runtime HEIMDALL_HOME).
+#   --json            emit the full plan/result as JSON (default: a human summary).
+#
+# Exit 0 on a completed run (dry or applied).
+
+set -uo pipefail
+
+SELF="$0"
+if command -v readlink >/dev/null 2>&1; then
+  SELF="$(readlink -f "$0" 2>/dev/null || readlink "$0" 2>/dev/null || echo "$0")"
+fi
+BIN_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+LIB_DIR="$BIN_DIR/lib"
+
+usage() { sed -n '2,20p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+PY="$(command -v python3 || command -v python || true)"
+if [ -z "$PY" ]; then
+  echo "error: python3 not found (required for registry hygiene)" >&2
+  exit 2
+fi
+
+APPLY=""; MAX_IDLE=""; HOME_DIR=""; JSON=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --apply)          APPLY="1"; shift ;;
+    --max-idle-days)  MAX_IDLE="${2:?--max-idle-days needs a value}"; shift 2 ;;
+    --home)           HOME_DIR="${2:?--home needs a dir}"; shift 2 ;;
+    --json)           JSON="1"; shift ;;
+    -h|--help)        usage; exit 0 ;;
+    --*)              echo "error: unknown option: $1" >&2; usage >&2; exit 2 ;;
+    *)                echo "error: unexpected argument: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+LIB_DIR="$LIB_DIR" APPLY="$APPLY" MAX_IDLE="$MAX_IDLE" HOME_DIR="$HOME_DIR" JSON="$JSON" \
+  "$PY" - <<'PYEOF'
+import json
+import os
+import sys
+
+sys.path.insert(0, os.environ["LIB_DIR"])
+import cp_registry_hygiene
+
+max_idle = None
+raw = os.environ.get("MAX_IDLE")
+if raw:
+    try:
+        max_idle = int(raw)
+    except (TypeError, ValueError):
+        sys.stderr.write("heimdall-registry-hygiene: ignoring malformed --max-idle-days=%r\n" % raw)
+
+home = os.environ.get("HOME_DIR") or None
+result = cp_registry_hygiene.evict_stale(
+    max_idle=max_idle, home=home, apply=bool(os.environ.get("APPLY")))
+
+if os.environ.get("JSON"):
+    print(json.dumps(result, indent=2, sort_keys=True))
+else:
+    mode = "APPLIED" if result["applied"] else "DRY RUN"
+    print("registry hygiene (%s):" % mode)
+    print("  window          : %d days" % result["max_idle_days"])
+    print("  scanned         : %d bindings" % result["scanned"])
+    print("  to evict        : %d" % len(result["evict"]))
+    print("  evicted         : %d" % len(result["evicted"]))
+    print("  kept active     : %d" % len(result["keep_active"]))
+    print("  kept owner      : %d" % len(result["keep_owner"]))
+    print("  kept grandfathd : %d" % len(result["keep_grandfathered"]))
+    if not result["applied"] and result["evict"]:
+        print("  (dry run — re-run with --apply to remove the %d idle bindings)"
+              % len(result["evict"]))
+PYEOF

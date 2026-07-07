@@ -43,6 +43,7 @@ if _HERE not in sys.path:
 
 import cp_approval
 import cp_auth
+import cp_config
 import cp_dashboard
 import cp_diag
 import cp_enroll
@@ -410,6 +411,12 @@ def boot(server=cp_server, *, home=None, base_env=None, start_tick=True,
     # the PRE-AUTH public seam (the caller has no key to sign with yet) and gated by the
     # server-side HEIMDALL_ENROLL_TOKEN secret — fail-closed when that secret is unset.
     routes["enroll"] = list(cp_enroll.register(home=home))
+    # Server-driven adaptive intervals (cost-governance §2): GET /config serves the current
+    # spend-pace interval ladder to every client (statusline/watch/ext/hooks), UNSIGNED because
+    # a browser cannot PKI-sign. Pre-auth public seam; the client clamps every interval to
+    # [15s,300s] so a spoofed/broken config can never DoS it. (GET,/config) is also in
+    # cp_publicsurface.PUBLIC_ROUTES so the public surface serves it, not a flat 404.
+    routes["config"] = list(cp_config.register(home=home))
     # The unauthenticated Cloud Run health probes (§A). Registered into the seam for
     # status/CLI visibility (registered_routes() reflects /healthz + /readyz); the LIVE
     # serving of these two bypasses the seam and runs pre-auth in cp_server. Idempotent.
