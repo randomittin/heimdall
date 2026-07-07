@@ -1,0 +1,617 @@
+#!/usr/bin/env bash
+# heimdall-connect — `hmd connect`: the ONE lazy, idempotent, secret-safe command
+# that registers this team's Claude credential (and, when given, its GitHub App
+# install) with the control plane. It ABSORBS the multi-step `rr setup/connect`
+# token-plumbing into a single guided capture (spec: heimdall-team-ux-zeroconfig,
+# Part 2). It REUSES rr's signing/endpoint helpers verbatim in spirit — the same
+# per-dev Ed25519 seed heimdall-presence bootstraps (0600), the same shipped
+# cp_auth signer over urllib, the same claude_cred shape oracle — so the two
+# clients agree on exactly one token grammar and one wire.
+#
+# LAZY + IDEMPOTENT (Part 2.1): nothing asks for a cred upfront; presence/wall/gates
+# NEVER call connect. A cred is captured only when GENUINELY needed (a sleep/remote
+# job with none) or when connect is run EXPLICITLY. Re-run while already connected →
+# a no-op status, no prompt. The sleep/remote-job path surfaces the need (never a
+# silent fail) via `hmd connect --request`: it prints the one-liner + exits 2.
+#
+# CAPTURE — TWO modes, IDENTICAL hard invariants (Part 2.2):
+#   (default)  env auto-detect FIRST ($CLAUDE_CODE_OAUTH_TOKEN else $ANTHROPIC_API_KEY);
+#              present + valid shape → used SILENTLY, no prompt. Else a hidden no-echo
+#              `read -rs` prompt in-terminal (nothing ever touches disk).
+#   --inbox    the watch-armed pickup: a fresh 0600 file in a tmpfs-like dir (Linux
+#              /dev/shm if present, else $TMPDIR). Print ONE instruction (paste the
+#              token into <path> from any tab). WATCH/poll, bounded by TIMEOUT (~120s).
+#              On first write: read, shape-validate (claude_cred.extract_claude_token),
+#              forward SIGNED write-only to /team/cred, then SHRED (shred -u, else
+#              overwrite+unlink). Timeout / abort / SIGINT → the trap SHREDS + removes
+#              the inbox (zero residue), a message, nonzero exit.
+#   --tab      (macOS) open a fresh Terminal tab running the hidden-prompt capture, so
+#              the secret never touches the working terminal's scrollback.
+#
+# HARD INVARIANTS (falsifier-tested in test/heimdall-connect.test.sh):
+#   • never echoed        — `read -rs`; the inbox's CONTENT is never printed (only its path).
+#   • never in argv       — the secret crosses bash→python via the ENV ONLY (`ps` shows nothing).
+#   • no plaintext at rest — the inbox is shredded on every exit path; no temp copy is made;
+#                            an env-sourced token is never written to disk.
+#   • watcher times out    — no content within TIMEOUT → shred + remove + message + nonzero.
+#   • abort/SIGINT safe    — the EXIT/INT/TERM trap shreds + unlinks the inbox.
+#   • NO CLIPBOARD         — pbpaste/xclip/wl-paste and any clipboard poll are BANNED (a
+#                            clipboard is world-readable to other processes). Not used here.
+#   • write-forward-only   — the server side stays write-forward-never-read-back (there is no
+#                            cred READ route); connect records only a LOCAL, value-free marker
+#                            (kind + timestamp) so `--status` and idempotency work offline.
+#
+# FLAGS:
+#   hmd connect                     capture (env-autodetect → hidden prompt) + forward.
+#   hmd connect --inbox             watch-armed 0600 file pickup (then shred).
+#   hmd connect --tab               macOS: capture in a fresh terminal tab.
+#   hmd connect --status            registered / not, kinds, install — NEVER values.
+#   hmd connect --request           lazy need-check: connected → exit 0; else one-liner + exit 2.
+#   hmd connect --force             re-capture even if already connected (rotated token).
+#   hmd connect --gh-app-installation-id <id> [--repo owner/name]
+#                                   also register the GitHub App install (POST /team/install).
+#   hmd connect --api-key           force the api_key cred kind (default = oauth_token).
+#   hmd connect --endpoint <url>    override the CP public-surface URL (baked default otherwise).
+#   hmd connect --dry-run           print the signed-POST plan (secret REDACTED), send nothing.
+#   hmd connect -h | --help
+#
+# Exit status: 0 ok · 2 usage error / cred-needed (--request) · 1 fail-closed (no cred,
+#              timeout, not enrolled, transport/HTTP refusal).
+set -euo pipefail
+
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+BINDIR="$(dirname "$SELF")"
+LIB="$BINDIR/lib"                                   # the shipped cp_auth signer + claude_cred oracle live here.
+CP_ENDPOINT_JSON="$HOME/.heimdall/cp-endpoint.json" # the CP {url, enroll_token} — SAME file heimdall-presence/rr read.
+CONNECT_STATE="${HEIMDALL_CONNECT_STATE:-$HOME/.heimdall/connect-state.json}"  # LOCAL value-free marker (kind+ts only).
+# Shipped DEFAULT public-surface URL (lowest precedence — config/flag/env override it).
+# The CP URL is NOT a secret (a public Cloud Run endpoint), so it is baked in — the SAME
+# default heimdall-presence + rr ship, so a dev needs ZERO url config.
+DEFAULT_CP_URL="https://heimdall-cp-public-203927696193.us-central1.run.app"
+# The watcher's bound. ~120s by default; test-only override via HEIMDALL_CONNECT_TIMEOUT.
+TIMEOUT="${HEIMDALL_CONNECT_TIMEOUT:-120}"
+printf '%s' "$TIMEOUT" | grep -qE '^[0-9]+$' || TIMEOUT=120
+
+PY="$(command -v python3 || command -v python || true)"
+
+# ── house-style helpers (mirrors bin/rr) ───────────────────────────────────────
+say()  { printf '\033[36m▸ %s\033[0m\n' "$*"; }
+warn() { printf '\033[33m! %s\033[0m\n' "$*" >&2; }
+die()  { printf '\033[31m✗ %s\033[0m\n' "$*" >&2; exit "${2:-1}"; }
+plan() { printf '  \033[90m$ %s\033[0m\n' "$*"; }
+
+usage() { sed -n '2,60p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+valid_repo() { printf '%s' "$1" | grep -qE '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'; }
+
+# ── arg parse ──────────────────────────────────────────────────────────────────
+MODE="default"            # default | inbox | tab | status | request
+CONNECT_INSTALL_ID=""
+REPO_OVERRIDE=""
+ENDPOINT_OVERRIDE=""
+FORCE_API_KEY=0
+FORCE=0
+DRY=0
+
+while [ $# -gt 0 ]; do case "$1" in
+  --inbox)     MODE="inbox";   shift ;;
+  --tab)       MODE="tab";     shift ;;
+  --status)    MODE="status";  shift ;;
+  --request)   MODE="request"; shift ;;
+  request|status) MODE="$1";   shift ;;   # bare subcommand form (hmd connect status / request).
+  --force|--reconnect) FORCE=1; shift ;;
+  --gh-app-installation-id) CONNECT_INSTALL_ID="${2:?--gh-app-installation-id needs a numeric id}"; shift 2 ;;
+  --repo)      REPO_OVERRIDE="${2:?--repo needs owner/repo}"; shift 2 ;;
+  --endpoint)  ENDPOINT_OVERRIDE="${2:?--endpoint needs a url}"; shift 2 ;;
+  --api-key)   FORCE_API_KEY=1; shift ;;
+  --dry-run)   DRY=1;           shift ;;
+  -h|--help)   usage; exit 0 ;;
+  --)          shift; break ;;
+  -*)          die "unknown flag: $1 (see: hmd connect --help)" 2 ;;
+  *)           die "unexpected argument: $1 (see: hmd connect --help)" 2 ;;
+esac; done
+
+if [ -n "$CONNECT_INSTALL_ID" ]; then
+  printf '%s' "$CONNECT_INSTALL_ID" | grep -qE '^[0-9]+$' \
+    || die "--gh-app-installation-id must be a positive integer (got: $CONNECT_INSTALL_ID)" 2
+fi
+[ -z "$REPO_OVERRIDE" ] || valid_repo "$REPO_OVERRIDE" || die "--repo must be owner/name (got: $REPO_OVERRIDE)" 2
+
+# the cred kind: api_key iff forced OR only ANTHROPIC_API_KEY is set (no oauth token).
+CRED_KIND="oauth_token"
+if [ "$FORCE_API_KEY" = 1 ]; then
+  CRED_KIND="api_key"
+elif [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+  CRED_KIND="api_key"
+fi
+
+# ── CP wire resolution (mirrors bin/rr resolve_cp_wire) ────────────────────────
+# URL precedence: --endpoint > $HEIMDALL_CP_URL/$BASE_URL > cp-endpoint.json .url > default.
+# identity from $HMD_HAID > heimdall-identity current > heimdall-haid current. The per-
+# (machine,haid) 0600 seed path is the SAME slug/layout heimdall-presence persists.
+CP_URL=""; CP_HAID=""; CP_SEED_FILE=""
+resolve_cp_wire() {
+  local cfg_url=""
+  if [ -n "$PY" ] && [ -f "$CP_ENDPOINT_JSON" ]; then
+    cfg_url="$("$PY" - "$CP_ENDPOINT_JSON" 2>/dev/null <<'PYEOF' || true
+import json, sys
+try:
+    print((json.load(open(sys.argv[1])).get("url") or ""))
+except Exception:
+    print("")
+PYEOF
+)"
+  fi
+  CP_URL="$ENDPOINT_OVERRIDE"
+  [ -n "$CP_URL" ] || CP_URL="${HEIMDALL_CP_URL:-${BASE_URL:-}}"
+  [ -n "$CP_URL" ] || CP_URL="$cfg_url"
+  [ -n "$CP_URL" ] || CP_URL="$DEFAULT_CP_URL"
+
+  CP_HAID="${HMD_HAID:-}"
+  if [ -z "$CP_HAID" ] && [ -x "$BINDIR/heimdall-identity" ]; then
+    CP_HAID="$("$BINDIR/heimdall-identity" current 2>/dev/null || true)"
+  fi
+  if [ -z "$CP_HAID" ] && [ -x "$BINDIR/heimdall-haid" ]; then
+    CP_HAID="$("$BINDIR/heimdall-haid" current 2>/dev/null || true)"
+  fi
+
+  if [ -n "${HOME:-}" ] && [ -n "$CP_HAID" ]; then
+    local slug; slug="$(printf '%s' "$CP_HAID" | tr '/:' '__')"
+    CP_SEED_FILE="$HOME/.heimdall/pki/$slug.seed"
+  fi
+}
+
+# ensure_enrolled — reuse heimdall-presence's bootstrap (keygen → /enroll → 0600 seed)
+# when no signing key exists yet. Best-effort + idempotent, exactly as rr does.
+ensure_enrolled() {
+  [ -n "$CP_HAID" ] || die "no Heimdall identity resolved — enroll first: run \`heimdall-presence beat\` (or set \$HMD_HAID)"
+  if [ -z "$CP_SEED_FILE" ] || [ ! -f "$CP_SEED_FILE" ]; then
+    if [ -x "$BINDIR/heimdall-presence" ]; then
+      say "enrolling this device with the control plane (first use)…"
+      "$BINDIR/heimdall-presence" beat >/dev/null 2>&1 || true
+    fi
+  fi
+  [ -n "$CP_SEED_FILE" ] && [ -f "$CP_SEED_FILE" ] \
+    || die "not enrolled — no signing key at ${CP_SEED_FILE:-<haid-derived>}. Enroll first: run \`heimdall-presence beat\` (needs a reachable CP + the enroll token)"
+}
+
+# ── the LOCAL, value-free connect marker (kind + ts — NEVER a secret value) ─────
+# The server side is write-forward-never-read-back (there is NO cred read route), so
+# "am I connected?" is answered from a LOCAL 0600 marker recording only the KIND and a
+# timestamp. This powers `--status` + idempotency WITHOUT ever storing/reading a value.
+marker_get_cred_kind() {
+  [ -n "$PY" ] && [ -f "$CONNECT_STATE" ] || { printf ''; return 0; }
+  "$PY" - "$CONNECT_STATE" <<'PYEOF' 2>/dev/null || printf ''
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    print(((d.get("cred") or {}).get("kind")) or "")
+except Exception:
+    print("")
+PYEOF
+}
+
+marker_write_cred() {
+  local kind="$1"
+  [ -n "$PY" ] || return 0
+  mkdir -p "$(dirname "$CONNECT_STATE")" 2>/dev/null || true
+  MK_KIND="$kind" MK_DEST="$CONNECT_STATE" "$PY" - <<'PYEOF' || true
+import json, os, time
+dest = os.environ["MK_DEST"]
+try:
+    d = json.load(open(dest))
+    if not isinstance(d, dict): d = {}
+except Exception:
+    d = {}
+d["cred"] = {"kind": os.environ["MK_KIND"], "ts": int(time.time())}   # NO secret value — kind + ts only.
+with open(dest, "w") as f:
+    json.dump(d, f, indent=2, sort_keys=True); f.write("\n")
+PYEOF
+  chmod 600 "$CONNECT_STATE" 2>/dev/null || true
+}
+
+marker_write_install() {
+  local iid="$1" repo="$2"
+  [ -n "$PY" ] || return 0
+  mkdir -p "$(dirname "$CONNECT_STATE")" 2>/dev/null || true
+  MK_IID="$iid" MK_REPO="$repo" MK_DEST="$CONNECT_STATE" "$PY" - <<'PYEOF' || true
+import json, os, time
+dest = os.environ["MK_DEST"]
+try:
+    d = json.load(open(dest))
+    if not isinstance(d, dict): d = {}
+except Exception:
+    d = {}
+d["install"] = {"installation_id": os.environ["MK_IID"], "repo": os.environ["MK_REPO"], "ts": int(time.time())}
+with open(dest, "w") as f:
+    json.dump(d, f, indent=2, sort_keys=True); f.write("\n")
+PYEOF
+  chmod 600 "$CONNECT_STATE" 2>/dev/null || true
+}
+
+# ── the SHIPPED claude_cred oracle over the ENV (never argv) ────────────────────
+# SANITIZE + EXTRACT the ONE clean sk-ant-oat…/sk-ant-api… token from RR_RAW_SECRET
+# (bug #23 — `claude setup-token` prints a DECORATED blob). Prints the clean token, or
+# NOTHING when zero / junk / ambiguous. Nothing of the token is otherwise emitted.
+extract_token_py() {
+  LIB="$LIB" "$PY" - <<'PYEOF'
+import os, sys
+sys.path.insert(0, os.environ["LIB"])
+import claude_cred
+tok = claude_cred.extract_claude_token(os.environ.get("RR_RAW_SECRET") or "")
+if tok:
+    sys.stdout.write(tok)
+PYEOF
+}
+
+# ── the SIGNED write-only onboarding client (mirrors bin/rr cp_register_py) ─────
+# REUSES the shipped cp_auth Ed25519 signer over urllib. Inputs cross via the ENV ONLY
+# (CP_URL/CP_HAID/CP_SEED_FILE/CP_REG_PATH + per-route fields) — NEVER argv. /team/cred
+# body is {kind, secret, nonce, ts} (secret from CP_CRED_SECRET, env-only); /team/install
+# body is {installation_id, repos, nonce, ts}. RR_CP_DUMP_BODY → print the body (secret
+# REDACTED) and stop BEFORE any seed read / network. Emits one tab-record:
+# `OK\t<a>\t<team_id>` (a = kind|installation_id), `HTTP\t<code>\t<err>`, or `ERR\t<reason>`.
+register_py() {
+  LIB="$LIB" CP_URL="$CP_URL" CP_HAID="$CP_HAID" CP_SEED_FILE="$CP_SEED_FILE" \
+  "$PY" - <<'PYEOF'
+import json, os, secrets, sys, time
+import urllib.error, urllib.request
+
+path = os.environ.get("CP_REG_PATH") or ""
+nonce = secrets.token_hex(16); ts = int(time.time())
+
+if path == "/team/cred":
+    kind = os.environ.get("CP_REG_KIND") or "oauth_token"
+    if os.environ.get("RR_CP_DUMP_BODY"):
+        sys.stdout.write(json.dumps({"kind": kind, "secret": "<redacted>",
+                                     "nonce": nonce, "ts": ts})); sys.exit(0)
+    body_obj = {"kind": kind, "secret": os.environ.get("CP_CRED_SECRET") or "",
+                "nonce": nonce, "ts": ts}
+elif path == "/team/install":
+    repo = os.environ.get("CP_INSTALL_REPO") or ""
+    body_obj = {"installation_id": os.environ.get("CP_INSTALL_ID") or "",
+                "repos": [repo] if repo else [], "nonce": nonce, "ts": ts}
+    if os.environ.get("RR_CP_DUMP_BODY"):
+        sys.stdout.write(json.dumps(body_obj)); sys.exit(0)
+else:
+    sys.stdout.write("ERR\tbad_path"); sys.exit(0)
+
+body = json.dumps(body_obj).encode("utf-8")
+
+# Read the persisted 0600 seed HERE (in-process) so the seed bytes never touch bash/argv —
+# only the seed-file PATH crossed from the shell.
+try:
+    with open(os.environ["CP_SEED_FILE"], "r", encoding="utf-8") as fh:
+        seed = fh.read().strip()
+except OSError:
+    sys.stdout.write("ERR\tno_seed"); sys.exit(0)
+if not seed:
+    sys.stdout.write("ERR\tno_seed"); sys.exit(0)
+
+sys.path.insert(0, os.environ["LIB"])
+import cp_auth as K  # the SHIPPED Ed25519 signer — never re-implemented.
+
+BASE = os.environ["CP_URL"].rstrip("/")
+req = urllib.request.Request(BASE + path, data=body, method="POST")
+req.add_header("Content-Type", "application/json")
+req.add_header("X-Heimdall-HAID", os.environ["CP_HAID"])
+req.add_header("X-Heimdall-Signature", K.sign(seed, K.canonical_message("POST", path, body)))
+try:
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        raw = resp.read()
+        d = json.loads(raw) if raw else {}
+        a = (d.get("kind") if path == "/team/cred" else d.get("installation_id")) or ""
+        sys.stdout.write("OK\t%s\t%s" % (a, d.get("team_id") or ""))
+except urllib.error.HTTPError as exc:
+    raw = exc.read()
+    try:
+        d = json.loads(raw) if raw else {}
+    except Exception:
+        d = {}
+    sys.stdout.write("HTTP\t%d\t%s" % (exc.code, d.get("error") or ""))
+except Exception:  # noqa: BLE001 — any transport/TLS/DNS fault is a connect failure.
+    sys.stdout.write("ERR\tconnect")
+PYEOF
+}
+
+# forward_cred SECRET — extract → validate → SIGN + POST write-only to /team/cred → marker.
+# SECRET crosses in via the ENV (CP_CRED_SECRET) ONLY; nothing of it is echoed/logged. On a
+# shape failure it returns 3 (so the caller can retry a prompt) without posting anything.
+forward_cred() {
+  local raw="$1" clean
+  clean="$(RR_RAW_SECRET="$raw" extract_token_py)"
+  if [ -z "$clean" ]; then
+    warn "that doesn't look like a Claude token — paste ONLY the sk-ant-oat…/sk-ant-api… value"
+    return 3
+  fi
+  say "signing + posting the credential to the control plane ($CP_URL/team/cred)…"
+  local resp kind a b
+  resp="$(CP_REG_PATH=/team/cred CP_REG_KIND="$CRED_KIND" CP_CRED_SECRET="$clean" register_py)"
+  unset clean
+  IFS=$'\t' read -r kind a b <<<"$resp"
+  case "$kind" in
+    OK)  marker_write_cred "$CRED_KIND"
+         say "credential STORED for your team (kind: ${a:-$CRED_KIND}, team: ${b:-server-derived}, INV-1) — never echoed/logged"
+         return 0 ;;
+    HTTP)
+      case "$a" in
+        401) die "signature REJECTED (401) — this device's key isn't recognized. Re-enroll: heimdall-presence beat" ;;
+        403) die "no team (403) — this device isn't bound to a team. Enroll first: heimdall-presence beat" ;;
+        422) die "credential refused (422): ${b:-bad kind/secret}" ;;
+        429) die "rate limited (429) — too many registrations too fast; retry shortly" ;;
+        *)   die "control-plane refused the credential (HTTP $a): ${b:-}" ;;
+      esac ;;
+    ERR)
+      case "$a" in
+        no_seed) die "not enrolled — no usable signing key. Enroll first: heimdall-presence beat" ;;
+        connect) die "could not reach the control plane at $CP_URL (offline / DNS / TLS)" ;;
+        *)       die "control-plane client error (${a:-unknown})" ;;
+      esac ;;
+    *) die "control-plane client returned an unexpected result: $resp" ;;
+  esac
+}
+
+# forward_install — SIGN + POST the (NON-secret) GitHub App installation to /team/install.
+forward_install() {
+  local repo="$1"
+  [ -n "$repo" ] || die "an installation needs a repo — pass --repo owner/name" 2
+  say "registering your GitHub App installation ($CP_URL/team/install)…"
+  local resp kind a b
+  resp="$(CP_REG_PATH=/team/install CP_INSTALL_ID="$CONNECT_INSTALL_ID" CP_INSTALL_REPO="$repo" register_py)"
+  IFS=$'\t' read -r kind a b <<<"$resp"
+  case "$kind" in
+    OK)  marker_write_install "${a:-$CONNECT_INSTALL_ID}" "$repo"
+         say "installation STORED (installation_id: ${a:-$CONNECT_INSTALL_ID}, repo: $repo, team: ${b:-server-derived})" ;;
+    HTTP)
+      case "$a" in
+        401) die "signature REJECTED (401) on /team/install — re-enroll: heimdall-presence beat" ;;
+        403) die "no team (403) on /team/install — enroll first: heimdall-presence beat" ;;
+        422) die "installation refused (422): ${b:-bad installation_id/repo}" ;;
+        429) die "rate limited (429) on /team/install — retry shortly" ;;
+        *)   die "control-plane refused the installation (HTTP $a): ${b:-}" ;;
+      esac ;;
+    ERR) die "control-plane client error on /team/install (${a:-unknown})" ;;
+    *)   die "control-plane client returned an unexpected result: $resp" ;;
+  esac
+}
+
+# ── SHRED — overwrite + unlink (no plaintext at rest). shred(1) if present, else zero-fill. ──
+shred_file() {
+  local f="$1"
+  [ -n "$f" ] && [ -e "$f" ] || return 0
+  if command -v shred >/dev/null 2>&1; then
+    shred -u -z -n 3 "$f" 2>/dev/null && return 0
+  fi
+  # macOS / no-shred: overwrite the bytes in place, then unlink.
+  local sz
+  sz="$(wc -c <"$f" 2>/dev/null | tr -d ' ')" || sz=0
+  case "$sz" in ''|*[!0-9]*) sz=0 ;; esac
+  if [ "$sz" -gt 0 ]; then
+    dd if=/dev/zero of="$f" bs="$sz" count=1 conv=notrunc >/dev/null 2>&1 || true
+  fi
+  rm -f "$f" 2>/dev/null || true
+}
+
+# ── STATUS — registered / not, kinds, install; NEVER values (Part 2.1) ─────────
+do_status() {
+  resolve_cp_wire
+  [ -n "$PY" ] && [ -f "$CONNECT_STATE" ] || { say "not connected — run \`hmd connect\` to register your Claude credential (30s)"; return 0; }
+  local out
+  out="$("$PY" - "$CONNECT_STATE" <<'PYEOF' 2>/dev/null || true
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    d = {}
+cred = d.get("cred") or {}
+inst = d.get("install") or {}
+if cred.get("kind"):
+    print("cred\t%s" % cred.get("kind"))          # KIND only — never a value.
+if inst.get("installation_id"):
+    print("install\t%s\t%s" % (inst.get("installation_id"), inst.get("repo") or ""))
+PYEOF
+)"
+  if [ -z "$out" ]; then
+    say "not connected — run \`hmd connect\` to register your Claude credential (30s)"
+    return 0
+  fi
+  say "connected (endpoint: $CP_URL) — kinds registered (values are NEVER shown):"
+  local tag a b
+  while IFS=$'\t' read -r tag a b; do
+    case "$tag" in
+      cred)    printf '    Claude credential: %s ✓\n' "$a" ;;
+      install) printf '    GitHub App install: %s (repo: %s) ✓\n' "$a" "${b:-—}" ;;
+    esac
+  done <<<"$out"
+}
+
+# ── REQUEST — the lazy need-check the sleep/remote-job path calls (Part 2.1) ────
+# Connected → exit 0 (nothing needed, no prompt). Else → the ONE-LINER + exit 2, so the
+# need is SURFACED (never a silent fail) and a human runs `hmd connect`.
+do_request() {
+  resolve_cp_wire
+  if [ -n "$(marker_get_cred_kind)" ]; then
+    say "connected — a Claude credential is registered; remote jobs can run."
+    exit 0
+  fi
+  printf 'Remote jobs need a Claude credential — run `hmd connect` (30s)\n'
+  exit 2
+}
+
+# ── DEFAULT capture — env auto-detect FIRST, else a hidden no-echo prompt ───────
+do_default() {
+  resolve_cp_wire
+
+  # Idempotent no-op: already connected (a local marker records a registered cred). Re-run
+  # while connected → status, NO prompt (unless --force / a new install to add).
+  if [ "$FORCE" != 1 ] && [ -z "$CONNECT_INSTALL_ID" ] && [ -n "$(marker_get_cred_kind)" ]; then
+    say "already connected (Claude credential registered: $(marker_get_cred_kind)) — nothing to do."
+    say "re-capture a rotated token with: hmd connect --force"
+    return 0
+  fi
+
+  if [ "$DRY" = 1 ]; then do_dry; return 0; fi
+
+  ensure_enrolled
+
+  # (a) env auto-detect FIRST — a present, VALID-SHAPE token is used SILENTLY (no prompt).
+  local raw="" src=""
+  if [ "$CRED_KIND" = oauth_token ] && [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+    raw="$CLAUDE_CODE_OAUTH_TOKEN"; src="CLAUDE_CODE_OAUTH_TOKEN"
+  elif [ "$CRED_KIND" = api_key ] && [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+    raw="$ANTHROPIC_API_KEY"; src="ANTHROPIC_API_KEY"
+  fi
+  if [ -n "$raw" ]; then
+    if [ -n "$(RR_RAW_SECRET="$raw" extract_token_py)" ]; then
+      say "using \$$src from the environment ($CRED_KIND) — no prompt needed"
+      forward_cred "$raw" || die "the \$$src value is not a valid Claude token — unset it or fix it, then re-run"
+      after_cred
+      return 0
+    fi
+    warn "\$$src is set but not a valid Claude token shape — falling back to a hidden prompt"
+  fi
+
+  # (b) hidden no-echo prompt (`read -rs`); up to 3 shape attempts, then a docs link.
+  local label="Claude OAuth token (run: claude setup-token)"
+  [ "$CRED_KIND" = api_key ] && label="Anthropic API key"
+  local attempt rc
+  for attempt in 1 2 3; do
+    printf '%s' "Paste your $label (input hidden, not echoed): " >&2
+    raw=""; read -rs raw || true; printf '\n' >&2
+    if [ -z "$raw" ]; then warn "nothing entered (attempt $attempt/3)"; continue; fi
+    set +e; forward_cred "$raw"; rc=$?; set -e
+    unset raw
+    if [ "$rc" = 0 ]; then after_cred; return 0; fi
+    [ "$rc" = 3 ] || exit "$rc"   # a real HTTP/transport error already died inside forward_cred.
+  done
+  die "3 invalid tokens — get a fresh one with \`claude setup-token\` (docs: https://runheimdall.dev/connect)"
+}
+
+# after_cred — the optional GitHub App install step + the closing hint.
+after_cred() {
+  if [ -n "$CONNECT_INSTALL_ID" ]; then
+    forward_install "${REPO_OVERRIDE:-}"
+    say "connected — your team now has a Claude cred + GitHub App install."
+  else
+    say "connected. Add --gh-app-installation-id <id> --repo owner/name to also bind your repo for remote PRs."
+  fi
+}
+
+# do_dry — print the signed-POST plan with the secret REDACTED; send nothing, read no seed.
+do_dry() {
+  local cred_body
+  cred_body="$(CP_REG_PATH=/team/cred CP_REG_KIND="$CRED_KIND" RR_CP_DUMP_BODY=1 register_py)"
+  say "would SIGN + POST the credential to the write-only onboarding route (never read back):"
+  plan "ensure enrolled: $BINDIR/heimdall-presence beat   # bootstraps the 0600 Ed25519 key + /enroll if absent"
+  plan "POST $CP_URL/team/cred   body=$cred_body   # SIGNED; secret REDACTED + sent via env, NEVER argv/log; team_id server-derived (INV-1)"
+  if [ -n "$CONNECT_INSTALL_ID" ]; then
+    local install_body
+    install_body="$(CP_REG_PATH=/team/install CP_INSTALL_ID="$CONNECT_INSTALL_ID" CP_INSTALL_REPO="${REPO_OVERRIDE:-}" RR_CP_DUMP_BODY=1 register_py)"
+    plan "POST $CP_URL/team/install   body=$install_body   # SIGNED; team_id server-derived (INV-1)"
+  else
+    warn "no --gh-app-installation-id given — /team/install would be skipped (add it to bind your repo)."
+  fi
+  say "INV-1: team_id is derived SERVER-SIDE from the signed binding — the client sends NO team_id."
+  warn "dry-run: nothing sent, no secret read."
+}
+
+# ── INBOX — the watch-armed 0600 file pickup (then SHRED) ──────────────────────
+INBOX=""
+inbox_cleanup() { [ -n "$INBOX" ] && shred_file "$INBOX"; INBOX=""; }
+trap 'inbox_cleanup' EXIT
+trap 'inbox_cleanup; exit 130' INT
+trap 'inbox_cleanup; exit 143' TERM
+
+do_inbox() {
+  resolve_cp_wire
+
+  if [ "$FORCE" != 1 ] && [ -z "$CONNECT_INSTALL_ID" ] && [ -n "$(marker_get_cred_kind)" ]; then
+    say "already connected (Claude credential registered: $(marker_get_cred_kind)) — nothing to do."
+    say "re-capture a rotated token with: hmd connect --inbox --force"
+    return 0
+  fi
+
+  if [ "$DRY" = 1 ]; then do_dry; return 0; fi
+
+  ensure_enrolled
+
+  # arm a fresh 0600 inbox in a tmpfs-like dir (Linux /dev/shm if present + writable, else $TMPDIR).
+  local dir
+  if [ -n "${HEIMDALL_CONNECT_INBOX_DIR:-}" ]; then dir="$HEIMDALL_CONNECT_INBOX_DIR"
+  elif [ -d /dev/shm ] && [ -w /dev/shm ]; then dir="/dev/shm"
+  else dir="${TMPDIR:-/tmp}"; fi
+  dir="${dir%/}"; mkdir -p "$dir" 2>/dev/null || true
+  INBOX="$(mktemp "$dir/heimdall-connect.XXXXXXXX")" || die "could not create a secure inbox in $dir"
+  chmod 600 "$INBOX" 2>/dev/null || true
+
+  say "inbox armed (0600, auto-shredded): $INBOX"
+  say "paste your $([ "$CRED_KIND" = api_key ] && echo 'Anthropic API key' || echo 'Claude OAuth token') into that file FROM ANY TAB, then save. e.g.:"
+  plan "printf %s '<sk-ant-…>' > $INBOX"
+  warn "waiting up to ${TIMEOUT}s — the token is captured with NO echo, then the file is shredded…"
+
+  # WATCH/poll, bounded by TIMEOUT. The inbox CONTENT is never printed.
+  local start now poll content=""
+  start="$(date +%s)"
+  poll="${HEIMDALL_CONNECT_POLL:-0.3}"
+  while :; do
+    if [ -s "$INBOX" ]; then
+      content="$(cat "$INBOX" 2>/dev/null || true)"
+      [ -n "$content" ] && break
+    fi
+    now="$(date +%s)"
+    if [ $((now - start)) -ge "$TIMEOUT" ]; then
+      inbox_cleanup
+      die "no token pasted within ${TIMEOUT}s — inbox shredded, nothing captured. Re-run: hmd connect --inbox"
+    fi
+    sleep "$poll"
+  done
+
+  # captured — SHRED immediately (the token now lives ONLY in this process's memory),
+  # then validate + forward. Shredding BEFORE the network call guarantees no plaintext
+  # survives even if the forward then fails.
+  inbox_cleanup
+  local rc
+  set +e; forward_cred "$content"; rc=$?; set -e
+  unset content
+  if [ "$rc" != 0 ]; then
+    [ "$rc" = 3 ] && die "the pasted value wasn't a valid Claude token — nothing stored (inbox already shredded). Re-run: hmd connect --inbox"
+    exit "$rc"
+  fi
+  after_cred
+}
+
+# ── TAB — macOS: run the hidden-prompt capture in a FRESH terminal tab ─────────
+# So the secret never touches the working terminal's scrollback. The new tab runs THIS
+# same bin (default mode) as a fresh login shell — it does the full capture + forward.
+do_tab() {
+  case "$(uname -s)" in
+    Darwin) ;;
+    *) die "--tab is macOS-only — use \`hmd connect --inbox\` (watch-armed) or the default hidden prompt" 2 ;;
+  esac
+  local cmd="$SELF"
+  [ "$FORCE_API_KEY" = 1 ] && cmd="$cmd --api-key"
+  [ "$FORCE" = 1 ] && cmd="$cmd --force"
+  [ -n "$CONNECT_INSTALL_ID" ] && cmd="$cmd --gh-app-installation-id $CONNECT_INSTALL_ID"
+  [ -n "$REPO_OVERRIDE" ] && cmd="$cmd --repo $REPO_OVERRIDE"
+  local osa="tell application \"Terminal\" to do script \"$cmd\""
+  if [ "$DRY" = 1 ] || [ "${HEIMDALL_CONNECT_TAB_DRYRUN:-0}" = 1 ]; then
+    say "would open a fresh Terminal tab running the hidden-prompt capture (secret stays off this scrollback):"
+    plan "osascript -e '$osa'"
+    return 0
+  fi
+  command -v osascript >/dev/null 2>&1 || die "osascript not found — use \`hmd connect --inbox\` instead"
+  say "opening a fresh Terminal tab for the capture — paste the token THERE (nothing lands on this scrollback)."
+  osascript -e "$osa" >/dev/null 2>&1 || die "could not open a Terminal tab — use \`hmd connect --inbox\` instead"
+  say "capture running in the new tab. This tab is done."
+}
+
+# ── dispatch ───────────────────────────────────────────────────────────────────
+case "$MODE" in
+  status)  do_status ;;
+  request) do_request ;;
+  inbox)   do_inbox ;;
+  tab)     do_tab ;;
+  default) do_default ;;
+  *)       die "internal: unknown mode $MODE" 2 ;;
+esac
+exit 0
