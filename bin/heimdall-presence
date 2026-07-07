@@ -223,30 +223,34 @@ if [ -z "$URL" ] || [ -z "$HAID" ] || [ -z "$PROJECT" ]; then
   esac
 fi
 
-# ── per-repo TEAM secret (multi-tenant presence) — RULING 1b AUTO-SOLO ──────────
-# The team secret lives PER-REPO in <repo>/.heimdall/team.json (0600, gitignored),
-# NOT the global cp-endpoint.json (a dev may be on different teams in different
-# repos). It is sent ONCE in the X-Heimdall-Team-Secret header at /enroll; signed
-# beats/reads thereafter carry NO secret (membership is server-side — the signed
-# GET /roster returns the caller's team). If team.json is ABSENT we AUTO-MINT one
-# SILENTLY (same shape as `heimdall-team new`) so a dev is ZERO-CONFIG and starts
-# in their OWN solo team (sees only themselves until they share/invite). The secret
-# crosses bash->python via the ENVIRONMENT only — NEVER argv (argv shows in `ps`).
+# ── per-repo TEAM secret (multi-tenant presence) — ONE CANONICAL FILE ───────────
+# The team secret lives PER-REPO in <repo>/.heimdall/team.json — the SINGLE canonical
+# file every reader (this client, heimdall-team, heimdall-invite) resolves from, NOT
+# the global cp-endpoint.json (a dev may be on different teams in different repos).
+# In a PRIVATE repo team.json is TRACKED/committed (so a teammate who clones the repo
+# ALREADY HAS it -> auto-joins with zero commands); in a PUBLIC repo it is gitignored
+# (grown via `hmd invite`). It is sent ONCE in the X-Heimdall-Team-Secret header at
+# /enroll; signed beats/reads thereafter carry NO secret (membership is server-side —
+# the signed GET /roster returns the caller's team). If team.json is ABSENT we
+# AUTO-MINT one SILENTLY so a dev is ZERO-CONFIG and starts in their OWN solo team
+# (sees only themselves until they invite). A legacy team.shared.json (the old
+# two-file model's committed secret) is STILL READ for back-compat. The secret crosses
+# bash->python via the ENVIRONMENT only — NEVER argv (argv shows in `ps`).
 TEAM_DIR="${HEIMDALL_TEAM_DIR:-}"
 if [ -z "$TEAM_DIR" ]; then
   TEAM_TOP="$(git rev-parse --show-toplevel 2>/dev/null || true)"
   if [ -n "$TEAM_TOP" ]; then TEAM_DIR="$TEAM_TOP/.heimdall"; else TEAM_DIR="$PWD/.heimdall"; fi
 fi
 TEAM_FILE="$TEAM_DIR/team.json"
-SHARED_FILE="$TEAM_DIR/team.shared.json"
+SHARED_FILE="$TEAM_DIR/team.shared.json"   # LEGACY committed secret (read-only back-compat)
 TEAM_SECRET=""
-# Resolve the team secret with SHARED > PERSONAL > SOLO precedence, else AUTO-MINT a
-# personal solo team 0600 (silent, non-fatal). The TRACKED team.shared.json (committed
-# only in a verified-private repo by `heimdall-team share`/`auto`) WINS so a teammate
-# who clones/pulls the repo AUTO-JOINS the repo's team; otherwise the dev's personal
-# team.json is used; otherwise a fresh solo team is minted. All IO is python-side (no jq
-# dependency); any failure leaves TEAM_SECRET empty (enroll then omits the header —
-# graceful, never a traceback).
+# Resolve the team secret — precedence IDENTICAL to heimdall-team `_resolve` so both
+# readers agree byte-for-byte: an EXPLICIT team.json (source new|join|rotate — a
+# deliberate mint/join, incl. the committed private-repo team) wins; else the legacy
+# committed team.shared.json (a teammate who cloned an OLD repo auto-joins); else an
+# auto-solo/legacy team.json; else AUTO-MINT a fresh solo team 0600. All IO is
+# python-side (no jq dependency); any failure leaves TEAM_SECRET empty (enroll then
+# omits the header — graceful, never a traceback).
 TEAM_SECRET="$(HMD_TEAM_DIR_R="$TEAM_DIR" HMD_TEAM_FILE_R="$TEAM_FILE" HMD_TEAM_SHARED_R="$SHARED_FILE" "$PY" - 2>/dev/null <<'PYEOF' || true
 import json, os, secrets, sys, time
 team_dir = os.environ["HMD_TEAM_DIR_R"]
@@ -254,23 +258,29 @@ path = os.environ["HMD_TEAM_FILE_R"]
 shared = os.environ["HMD_TEAM_SHARED_R"]
 
 def _read(p):
+    """(secret, source) from a team file, ("","") if absent/unreadable."""
     try:
-        s = json.load(open(p)).get("team_secret")
-        return s if isinstance(s, str) and s else ""
+        d = json.load(open(p))
+        s = d.get("team_secret")
     except Exception:
-        return ""
+        return "", ""
+    if isinstance(s, str) and s:
+        src = d.get("source")
+        return s, (src if isinstance(src, str) else "")
+    return "", ""
 
-# 1) SHARED (committed team) wins — a teammate who cloned the repo auto-joins its team.
-s = _read(shared)
-if s:
-    sys.stdout.write(s)
-    sys.exit(0)
-# 2) PERSONAL team.json.
-s = _read(path)
-if s:
-    sys.stdout.write(s)
-    sys.exit(0)
-# 3) AUTO-SOLO mint: write team.json 0600 with a fresh 43-char base64url secret.
+ps, psrc = _read(path)
+ss, _ss = _read(shared)
+# 1) a DELIBERATE team.json (new|join|rotate) wins — incl. the committed private team.
+if ps and psrc in ("new", "join", "rotate"):
+    sys.stdout.write(ps); sys.exit(0)
+# 2) the LEGACY committed team.shared.json (back-compat auto-join).
+if ss:
+    sys.stdout.write(ss); sys.exit(0)
+# 3) an auto-solo / legacy team.json.
+if ps:
+    sys.stdout.write(ps); sys.exit(0)
+# 4) AUTO-SOLO mint: write team.json 0600 with a fresh 43-char base64url secret.
 try:
     os.makedirs(team_dir, mode=0o700, exist_ok=True)
     sec = secrets.token_urlsafe(32)

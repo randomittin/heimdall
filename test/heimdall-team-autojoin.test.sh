@@ -124,22 +124,22 @@ echo "heimdall-team — github-collaborator AUTO-JOIN (share + precedence)"
 echo "============================================================"
 echo
 
-# ── (a) SHARE on a PRIVATE repo writes + commits team.shared.json ────────────
+# ── (a) SHARE on a PRIVATE repo writes + commits team.json (the ONE tracked file)
 R1="$WORK/private"; init_repo "$R1" "https://github.com/fakeorg/fakerepo.git"
 TD1="$R1/.heimdall"
 HEIMDALL_TEAM_DIR="$TD1" "$CLI" join "$FAKE_PERSONAL" >/dev/null 2>&1   # seed a fake team
-SH1="$TD1/team.shared.json"
+TJ1="$TD1/team.json"
 A_OUT="$( cd "$R1" && PATH="$MOCKBIN:$PATH" MOCK_GH_MODE=private \
           HEIMDALL_TEAM_DIR="$TD1" "$CLI" share 2>"$WORK/a.err"; echo "RC=$?" )"
 A_RC="${A_OUT##*RC=}"
-A_SHARED_SECRET="$(secret_of "$SH1")"
-A_TRACKED="$(git -C "$R1" ls-files -- .heimdall/team.shared.json 2>/dev/null)"
-A_COMMITTED="$(git -C "$R1" log --oneline 2>/dev/null | grep -c "share team secret" || true)"
-if [ "$A_RC" -eq 0 ] && [ -f "$SH1" ] && [ "$A_SHARED_SECRET" = "$FAKE_PERSONAL" ] \
+A_SECRET="$(secret_of "$TJ1")"
+A_TRACKED="$(git -C "$R1" ls-files -- .heimdall/team.json 2>/dev/null)"
+A_COMMITTED="$(git -C "$R1" log --oneline 2>/dev/null | grep -c "team.json" || true)"
+if [ "$A_RC" -eq 0 ] && [ -f "$TJ1" ] && [ "$A_SECRET" = "$FAKE_PERSONAL" ] \
    && [ -n "$A_TRACKED" ] && [ "$A_COMMITTED" -ge 1 ]; then
-  ok "(a) share on a PRIVATE repo wrote + git-tracked + committed team.shared.json carrying the secret"
+  ok "(a) share on a PRIVATE repo wrote + git-tracked + committed team.json carrying the secret"
 else
-  bad "(a) share/private failed (rc=$A_RC file=$([ -f "$SH1" ]&&echo y||echo n) tracked='$A_TRACKED' committed=$A_COMMITTED secret_match=$([ "$A_SHARED_SECRET" = "$FAKE_PERSONAL" ]&&echo y||echo n))"; cat "$WORK/a.err" >&2
+  bad "(a) share/private failed (rc=$A_RC file=$([ -f "$TJ1" ]&&echo y||echo n) tracked='$A_TRACKED' committed=$A_COMMITTED secret_match=$([ "$A_SECRET" = "$FAKE_PERSONAL" ]&&echo y||echo n))"; cat "$WORK/a.err" >&2
 fi
 
 # ── (b) SHARE on a PUBLIC repo HARD-REFUSES, commits nothing ─────────────────
@@ -183,12 +183,13 @@ TD4="$R4/.heimdall"
 HEIMDALL_TEAM_DIR="$TD4" "$CLI" join "$FAKE_PERSONAL" >/dev/null 2>&1
 D_OUT="$( cd "$R4" && PATH="$MINBIN" HEIMDALL_TEAM_DIR="$TD4" "$CLI" share 2>"$WORK/d.err"; echo "RC=$?" )"
 D_RC="${D_OUT##*RC=}"
-# The gh-absent branch is identified by its UNIQUE "not installed" message (the slug
-# refusal also contains "github", so a loose grep would pass for the wrong reason).
-if [ "$D_RC" -ne 0 ] && [ ! -f "$TD4/team.shared.json" ] && grep -qi "not installed" "$WORK/d.err"; then
-  ok "(d) gh ABSENT -> refused (exit $D_RC), no team.shared.json, message says gh not installed"
+# gh + curl both ABSENT -> visibility is INDETERMINATE -> fail-SAFE refusal (never
+# commit a secret you can't PROVE is private). team.json must NOT be tracked/committed.
+D_TRACKED="$(git -C "$R4" ls-files -- .heimdall/team.json 2>/dev/null)"
+if [ "$D_RC" -ne 0 ] && [ -z "$D_TRACKED" ] && grep -qiE "prove|private|refus" "$WORK/d.err"; then
+  ok "(d) privacy UNPROVABLE (gh+curl absent) -> refused (exit $D_RC), team.json NOT committed"
 else
-  bad "(d) gh-absent should refuse via the gh-not-installed path (rc=$D_RC file=$([ -f "$TD4/team.shared.json" ]&&echo y||echo n))"; cat "$WORK/d.err" >&2
+  bad "(d) unprovable-privacy should refuse + commit nothing (rc=$D_RC tracked='$D_TRACKED')"; cat "$WORK/d.err" >&2
 fi
 
 # ── (e) AUTO-JOIN: shared.json + NO personal -> resolve the SHARED secret ─────
@@ -238,22 +239,22 @@ else
   bad "(f2) explicit join should beat shared (got source=$(json_field "$F2_JSON" source) tid=$(json_field "$F2_JSON" team_id))"
 fi
 
-# ── (g) ROTATE mints a NEW secret + overwrites both files + re-commits ───────
+# ── (g) ROTATE mints a NEW secret + re-writes + re-commits team.json ─────────
 R8="$WORK/rotate"; init_repo "$R8" "https://github.com/fakeorg/rotaterepo.git"
 TD8="$R8/.heimdall"
 HEIMDALL_TEAM_DIR="$TD8" "$CLI" join "$FAKE_PERSONAL" >/dev/null 2>&1
 ( cd "$R8" && PATH="$MOCKBIN:$PATH" MOCK_GH_MODE=private HEIMDALL_TEAM_DIR="$TD8" "$CLI" share ) >/dev/null 2>"$WORK/g1.err"
-G_SHARED_BEFORE="$(secret_of "$TD8/team.shared.json")"
+G_BEFORE="$(secret_of "$TD8/team.json")"
 ( cd "$R8" && PATH="$MOCKBIN:$PATH" MOCK_GH_MODE=private HEIMDALL_TEAM_DIR="$TD8" "$CLI" share --rotate ) >/dev/null 2>"$WORK/g2.err"
 G_RC=$?
-G_SHARED_AFTER="$(secret_of "$TD8/team.shared.json")"
-G_PERSONAL_AFTER="$(secret_of "$TD8/team.json")"
-G_ROTATE_COMMIT="$(git -C "$R8" log --oneline 2>/dev/null | grep -c "rotate the team secret" || true)"
-if [ "$G_RC" -eq 0 ] && [ -n "$G_SHARED_AFTER" ] && [ "$G_SHARED_AFTER" != "$G_SHARED_BEFORE" ] \
-   && [ "$G_PERSONAL_AFTER" = "$G_SHARED_AFTER" ] && [ "$G_ROTATE_COMMIT" -ge 1 ]; then
-  ok "(g) share --rotate minted a NEW secret, overwrote BOTH team.shared.json + team.json, and re-committed"
+G_AFTER="$(secret_of "$TD8/team.json")"
+G_TRACKED="$(git -C "$R8" ls-files -- .heimdall/team.json 2>/dev/null)"
+G_ROTATE_COMMIT="$(git -C "$R8" log --oneline 2>/dev/null | grep -c "rotate" || true)"
+if [ "$G_RC" -eq 0 ] && [ -n "$G_AFTER" ] && [ "$G_AFTER" != "$G_BEFORE" ] \
+   && [ -n "$G_TRACKED" ] && [ "$G_ROTATE_COMMIT" -ge 1 ]; then
+  ok "(g) share --rotate minted a NEW secret, re-wrote + re-committed the tracked team.json"
 else
-  bad "(g) rotate wrong (rc=$G_RC changed=$([ "$G_SHARED_AFTER" != "$G_SHARED_BEFORE" ]&&echo y||echo n) personal==shared=$([ "$G_PERSONAL_AFTER" = "$G_SHARED_AFTER" ]&&echo y||echo n) commit=$G_ROTATE_COMMIT)"; cat "$WORK/g2.err" >&2
+  bad "(g) rotate wrong (rc=$G_RC changed=$([ "$G_AFTER" != "$G_BEFORE" ]&&echo y||echo n) tracked='$G_TRACKED' commit=$G_ROTATE_COMMIT)"; cat "$WORK/g2.err" >&2
 fi
 
 echo

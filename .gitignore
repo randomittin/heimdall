@@ -135,3 +135,13 @@ evals/oracles/*/report.json
 evals/benchmark/results.jsonl
 # Git worktrees (heimdall isolation)
 .worktrees/
+
+# heimdall team secret — gitignored on a PUBLIC/unverified repo: a bearer
+# secret must never be committed to a world-readable repo. Grow the team
+# out-of-band with `hmd invite`.
+.heimdall/team.json
+
+# heimdall team secret — gitignored on a PUBLIC/unverified repo: a bearer
+# secret must never be committed to a world-readable repo. Grow the team
+# out-of-band with `hmd invite`.
+.heimdall/team.json
