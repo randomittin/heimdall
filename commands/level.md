@@ -1,45 +1,38 @@
 ---
 name: level
-description: Set Heimdall autonomy level (1=Guided, 2=Checkpoint, 3=Full Auto). Use with a number, +/- to cycle, or no argument to show current level.
+description: Deprecated alias for /hmd:autonomy. Sets Heimdall autonomy (1=Guided, 2=Checkpoint, 3=Full Auto). Still works; prints a one-line rename notice.
 argument-hint: <1|2|3|+|->
 disable-model-invocation: true
 ---
 
-# Set Autonomy Level
+# Set Autonomy (deprecated alias of /hmd:autonomy)
 
-Set the Heimdall autonomy level.
-
-## Valid levels:
-- **1 (Guided)**: Ask for approval on every action
-- **2 (Checkpoint)**: Run autonomously, pause at major milestones
-- **3 (Full Auto)**: Run until complete, only stop if blocked
+`/hmd:level` was renamed to `/hmd:autonomy`. This alias still works for one release so muscle memory doesn't break; it will be removed a couple of releases later.
 
 ## Instructions:
 
-1. Parse `$ARGUMENTS`:
-   - If **empty or missing**: Show current level from `heimdall-state get '.project.autonomy_level'` and the level descriptions. Done.
-   - If **`+`**: Read current level, increment by 1 (wrap 3→1). Use the result as the new level.
-   - If **`-`**: Read current level, decrement by 1 (wrap 1→3). Use the result as the new level.
-   - If **1, 2, or 3**: Use directly as the new level.
+1. **First, print exactly this one-line notice:**
+   `'/hmd:level' is now '/hmd:autonomy' — same behavior. Please switch.`
+
+2. Then behave identically to `/hmd:autonomy $ARGUMENTS`. Parse `$ARGUMENTS`:
+   - If **empty or missing**: Show current setting from `heimdall-state get '.project.autonomy_level'` and the descriptions below. Done.
+   - If **`+`**: Read current setting, increment by 1 (wrap 3→1). Use the result as the new setting.
+   - If **`-`**: Read current setting, decrement by 1 (wrap 1→3). Use the result as the new setting.
+   - If **1, 2, or 3**: Use directly as the new setting.
    - If **anything else**: Show valid options and ask the user to choose.
 
-2. Update the state file:
+3. Update the state file (the on-disk key stays `.project.autonomy_level` — do not rename it):
 ```bash
 heimdall-state set '.project.autonomy_level' '<new_level>'
 ```
 
-3. Confirm with a compact status line:
+4. Confirm with a compact status line:
    - `◀ 1 Guided` / `◀ 2 Checkpoint ▶` / `3 Full Auto ▶`
-   - Show the active level highlighted, with arrows indicating cycle direction
+   - Show the active setting highlighted, with arrows indicating cycle direction
 
-4. If changing from a lower to higher level, add: "More autonomous now. `/hmd:level -` to step back."
+## Valid settings:
+- **1 (Guided)**: Asks before every action.
+- **2 (Checkpoint)**: Runs on its own, pauses at major milestones.
+- **3 (Full Auto)**: Runs until complete; only stops if blocked.
 
-5. If changing from a higher to lower level, add: "More checkpoints now. `/hmd:level +` to step up."
-
-## Quick cycling
-
-Since Claude Code keybindings only support built-in actions (no custom action registration), the fastest way to cycle is:
-- `/hmd:level +` — next level (1→2→3→1)
-- `/hmd:level -` — previous level (3→2→1→3)
-
-This is the Heimdall equivalent of the effort slider. Users can type `/s` + tab-complete to `/hmd:level` and then `+` or `-`.
+Going forward, use `/hmd:autonomy` (and `/hmd:autonomy +` / `-` to cycle).

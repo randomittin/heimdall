@@ -48,7 +48,7 @@ TIMELINES: NEVER estimate work in weeks or months. AI agents run in parallel —
 
 ## Available Commands
 
-- `/hmd:level <1|2|3>` — Set autonomy level
+- `/hmd:autonomy <1|2|3>` — Set autonomy (Guided/Checkpoint/Full Auto); `/hmd:level` is a deprecated alias
 - `/hmd:status` — Show current project state
 - `/hmd:maintain` — Toggle maintainer mode
 - `/hmd:reflect` — Force conflict reflection pass

@@ -790,15 +790,15 @@ Read current level: `heimdall-state get '.project.autonomy_level'`
 ### Quick Cycling
 
 The fastest way to change levels mid-task:
-- `/hmd:level +` — cycle up (1→2→3→1)
-- `/hmd:level -` — cycle down (3→2→1→3)
-- `/hmd:level 2` — set directly
+- `/hmd:autonomy +` — cycle up (1→2→3→1)
+- `/hmd:autonomy -` — cycle down (3→2→1→3)
+- `/hmd:autonomy 2` — set directly
 
-Claude Code doesn't support custom keybindings for non-built-in actions, so the slash command with `+`/`-` is the arrow-key equivalent. Tab-completion makes this fast: `/s` → tab → `level +`.
+Claude Code doesn't support custom keybindings for non-built-in actions, so the slash command with `+`/`-` is the arrow-key equivalent. Tab-completion makes this fast: `/a` → tab → `autonomy +`. (`/hmd:level` still works as a deprecated alias.)
 
 ### Adaptive Suggestions
-- If user approves everything without changes at Level 1 for 5+ actions → suggest: "You've approved everything so far. Want to bump to Level 2? (`/hmd:level +`)"
-- If user keeps rejecting/modifying at Level 3 → suggest: "I notice you're making frequent adjustments. Want to step down to Level 2? (`/hmd:level -`)"
+- If user approves everything without changes at Level 1 for 5+ actions → suggest: "You've approved everything so far. Want to bump to Level 2? (`/hmd:autonomy +`)"
+- If user keeps rejecting/modifying at Level 3 → suggest: "I notice you're making frequent adjustments. Want to step down to Level 2? (`/hmd:autonomy -`)"
 
 ### Governance Modes (Hive-Mind)
 

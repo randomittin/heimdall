@@ -167,7 +167,7 @@ Notes. They are why the heimdall tree is ~5x the v1.1.0 tree.)
 
 | Class | Item | Superx behavior (at v1.1.0) | Status | Heimdall now | Notes |
 |---|---|---|---|---|---|
-| Slash | `/superx:level <1/2/3/+/->` | set/cycle autonomy level | renamed (`/superx:level` to `/hmd:level`) | `commands/level.md` | namespace = plugin name (heimdall/hmd) |
+| Slash | `/superx:level <1/2/3/+/->` | set/cycle autonomy level | renamed (`/superx:level` → `/hmd:autonomy`; `/hmd:level` kept as deprecated alias) | `commands/autonomy.md` (+ alias `commands/level.md`) | namespace = plugin name (heimdall/hmd) |
 | Slash | `/superx:status` | show state + gates | renamed to `/hmd:status` | `commands/status.md` | — |
 | Slash | `/superx:maintain [on/off/status]` | maintainer mode | renamed to `/hmd:maintain` | `commands/maintain.md` | — |
 | Slash | `/superx:maintain-check [--dry-run]` | one maintenance cycle | renamed to `/hmd:maintain-check` | `commands/maintain-check.md` | — |
@@ -208,7 +208,7 @@ Notes. They are why the heimdall tree is ~5x the v1.1.0 tree.)
 | Behavior | Model routing haiku/sonnet/opus | MODEL ROUTING preamble | kept | kept (preamble `bin/heimdall:1105`) | — |
 | Behavior | Continuation: never exit w/ tasks remaining | preamble CONTINUATION | improved (adds `/hmd:save` cadence) | `bin/heimdall:1112` | — |
 | Behavior | Acceptance criteria as runnable gates | blocking, 2 fix attempts then BLOCKED | kept | kept | — |
-| Behavior | Autonomy levels 1/2/3 (Guided/Checkpoint/Full Auto) | `/superx:level` | renamed (`/hmd:level`) | `commands/level.md` | — |
+| Behavior | Autonomy levels 1/2/3 (Guided/Checkpoint/Full Auto) | `/superx:level` | renamed (`/hmd:autonomy`; `/hmd:level` deprecated alias) | `commands/autonomy.md` (+ alias `commands/level.md`) | on-disk key `.project.autonomy_level` unchanged — no reset on upgrade |
 | Behavior | Maintainer mode (triage/fix/test/batch release) | severity x confidence matrix | kept | kept | `commands/maintain*.md` |
 | Behavior | Token budgets, warn at 80% | budget cmds | improved (statusline bar) | kept + visualized | — |
 | Behavior | Companion plugins auto-install (caveman, superpowers, claude-mem) | first_run_setup | kept | kept (`first_run_setup` in `bin/heimdall:172`) | superx-marketplace add renamed to heimdall-marketplace (bin/heimdall:195-197) |

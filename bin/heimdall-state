@@ -242,7 +242,7 @@ cmd_status() {
   echo "=== heimdall status ==="
   echo "Project: $(jq -r '.project.name // "(unnamed)"' "$STATE_FILE")"
   echo "Phase:   $(jq -r '.project.phase' "$STATE_FILE")"
-  echo "Level:   $(jq -r '.project.autonomy_level' "$STATE_FILE") (1=Guided, 2=Checkpoint, 3=Full Auto)"
+  echo "Autonomy: $(jq -r '.project.autonomy_level' "$STATE_FILE") (1=Guided, 2=Checkpoint, 3=Full Auto)"
   echo ""
   echo "Quality Gates:"
   echo "  Tests passing:      $(jq -r '.quality_gates.tests_passing' "$STATE_FILE")"

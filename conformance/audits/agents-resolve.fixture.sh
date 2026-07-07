@@ -45,7 +45,9 @@ for role in architect coder database-architect design docs-writer incident-respo
 done
 
 # 5. Renamed slash commands resolve under /hmd:<name> (frontmatter name present, no superx: prefix).
-for cmd in level status maintain maintain-check reflect; do
+# `autonomy` is the canonical command (renamed from `level`); `level` is kept as a
+# deprecated alias so both must resolve.
+for cmd in autonomy level status maintain maintain-check reflect; do
   nm="$(awk -F': *' '/^name:/{print $2; exit}' "commands/${cmd}.md" 2>/dev/null)"
   [ -n "$nm" ] && ok "command '$cmd' resolves as /hmd:$nm" || bad "command '$cmd' has no name: frontmatter"
 done
