@@ -57,6 +57,12 @@ PY="$(command -v python3 || command -v python || true)"
 # ── parse argv (subcommand + option-style overrides) ───────────────────────────
 SUB="${1:-}"; shift || true
 HAID=""; PROJECT=""; URL=""; HANDLE=""; VERDICT=""; FILE=""; JSON=""; GLOBAL=""; NOFILES=""
+# STRICT surfaces a DROPPED/refused beat LOUDLY (nonzero exit) instead of the fire-and-forget
+# exit-0 the statusline relies on. Default is the silent-safe path; --strict / HMD_PRESENCE_STRICT=1
+# opts in (used by tooling + the BUG2 regression test to prove a failed beat no longer fakes
+# success). Either way a dropped beat is NAMED on stderr (below) so a human running it manually
+# — the exact way the invisible-beat bug surfaced — sees the failure instead of nothing.
+STRICT="${HMD_PRESENCE_STRICT:-}"
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --haid)    HAID="${2:?--haid needs a value}"; shift 2 ;;
@@ -68,6 +74,7 @@ while [ "$#" -gt 0 ]; do
     --json)    JSON="1"; shift ;;
     --global)  GLOBAL="1"; shift ;;   # off/on: machine-wide kill switch (~/.heimdall/presence-off)
     --no-files) NOFILES="1"; shift ;; # on: stay present but withhold file/activity detail
+    --strict)  STRICT="1"; shift ;;   # beat: surface a dropped/refused beat with a nonzero exit
     *) echo "heimdall-presence: unexpected argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -302,6 +309,7 @@ run_client() {
   PRES_ENROLL_STAMP="$ENROLL_STAMP" PRES_THROTTLE="${HMD_ENROLL_THROTTLE:-180}" \
   PRES_PROJECT="$PROJECT" PRES_HANDLE="$HANDLE" PRES_VERDICT="$VERDICT" \
   PRES_FILE="$FILE" PRES_VERB="$1" PRES_JSON="$JSON" PRES_TEAM_SECRET="$TEAM_SECRET" \
+  PRES_STRICT="$STRICT" \
   "$PY" - <<'PYEOF'
 import contextlib
 import json
@@ -335,6 +343,14 @@ def request(method, path, body, seed, *, timeout=10):
     if data is not None:
         req.add_header("Content-Type", "application/json")
     req.add_header("X-Heimdall-Signature", K.sign(seed, K.canonical_message(method, path, body)))
+    # The per-repo TEAM SECRET rides the header on EVERY presence call (beat / retire / roster),
+    # not just enroll — the server hashes it (derive_team_id) to the SAME partition the browser
+    # /roster-team read derives, so a signed beat lands EXACTLY where its team.json secret reads it
+    # back (the BUG2 write<->read round-trip). The signature covers only method+path+body, so this
+    # header never perturbs it; the secret is sent over TLS, never argv, never logged.
+    team_secret = os.environ.get("PRES_TEAM_SECRET") or ""
+    if team_secret:
+        req.add_header("X-Heimdall-Team-Secret", team_secret)
     token = os.environ.get("ID_TOKEN") or ""   # optional Cloud Run IAM bearer.
     if token:
         req.add_header("Authorization", "Bearer " + token)
@@ -524,9 +540,18 @@ def main():
             "nonce": secrets.token_hex(16),
             "ts": int(time.time()),
         }).encode()
-        request("POST", "/presence", body, seed)
-        # A beat is fire-and-forget: success or not, never surface an error to the caller
-        # (the statusline must not break on a flaky beat). Exit 0 always.
+        status, _ = request("POST", "/presence", body, seed)
+        # LOUD on a DROPPED/REFUSED beat — the exit-0-no-output that MASKED the invisible-beat bug
+        # is gone. A beat that never lands (transport drop -> status 0, or a non-2xx server refusal)
+        # is NAMED on stderr so a human running `heimdall-presence beat` sees the failure instead of
+        # nothing. stdout stays CLEAN (the statusline reads stdout); the default exit stays 0 so the
+        # statusline never breaks on a flaky beat. STRICT (--strict / HMD_PRESENCE_STRICT=1) makes it
+        # exit NONZERO so tooling/tests can assert the failure surfaces.
+        if not (200 <= status < 300):
+            strict = bool(os.environ.get("PRES_STRICT"))
+            reason = "unreachable (transport drop)" if status == 0 else ("HTTP %d" % status)
+            sys.stderr.write("heimdall presence: beat NOT delivered — %s\n" % reason)
+            return 1 if strict else 0
         return 0
     if VERB == "retire":
         # The opt-out prompt-disappearance path: POST /presence-retire so the server writes a

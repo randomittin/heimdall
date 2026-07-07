@@ -366,6 +366,37 @@ def _query_project(request, payload):
     return None
 
 
+def _partition_team(haid, request, *, home=None):
+    """The (project, team) PARTITION handle a signed beat / retire / self-roster writes or reads
+    under. PREFER the PRESENTED team_secret — the SAME capability the browser /roster-team read
+    hashes to its partition (cp_auth.derive_team_id) — so a member's signed beat lands in EXACTLY
+    the partition its team.json secret reads back: the write<->read round-trip closes on ONE
+    derived partition (the BUG2 "viral-loop gate" fix). WITHOUT this, the WRITE partition came from
+    the ENROLL-TIME binding (cp_auth.registered_team) while the READ partition (/roster-team) comes
+    from the PRESENTED secret — for a LEGACY binding (no team_id -> default/None) or a STALE binding
+    (enrolled under an older secret) those DIFFER, so a valid beat lands in a black-hole partition
+    the roster read never enumerates and the beater is invisible to its own team.
+
+    The secret rides the X-Heimdall-Team-Secret HEADER (cp_server lifts it into
+    request["team_secret"]); it is hashed ONE-WAY and never stored / echoed. FALL BACK to the
+    enroll-time registry binding ONLY when NO secret is presented — back-compat: an older client
+    that sends no secret still scopes to its bound team (and a legacy no-team_id binding still reads
+    as the default team).
+
+    ISOLATION is preserved (rr-multitenant-isolation / cp-team-isolation): the presented secret is a
+    bearer team capability — holding it IS membership, the IDENTICAL trust the /roster-team read
+    already grants — and the record stays keyed by the SERVER-VERIFIED haid, so a caller can only
+    ever write ITS OWN presence, into a team whose secret it holds. A different secret hashes to a
+    different partition, so a beat can never cross-write another team; team_id (the hash) presented
+    AS a secret is inert (derive of it is a wrong partition)."""
+    secret = request.get("team_secret") if isinstance(request, dict) else None
+    if secret:
+        tid = cp_auth.derive_team_id(secret)
+        if tid:
+            return tid
+    return cp_auth.registered_team(haid, home=home)
+
+
 def beat_route(identity, request, *, home=None):
     """POST /presence — RECORD a dev's heartbeat (§presence). The server ran the §3 auth
     chokepoint BEFORE this, so `identity` is a VERIFIED cp_auth.Identity — an unsigned /
@@ -382,9 +413,14 @@ def beat_route(identity, request, *, home=None):
     if not project:
         return cp_server.Response(
             422, {"recorded": False, "reason": "no_project"})
-    # team_id from the VERIFIED identity's registry binding (NEVER the body) — a member can
-    # only beat into THEIR team. A binding with no team_id reads as the default team (§migration).
-    team_id = cp_auth.registered_team(haid, home=home)
+    # team_id from the PRESENTED team secret (the X-Heimdall-Team-Secret header, hashed one-way)
+    # when supplied — so the beat WRITES into EXACTLY the partition /roster-team READS from that
+    # same secret (the BUG2 round-trip); else the VERIFIED identity's registry binding (NEVER a
+    # body field). A binding with no team_id reads as the default team (§migration). See
+    # _partition_team for the isolation argument (the secret is a bearer capability; the record
+    # stays keyed by the verified haid, so a member can only write ITS OWN presence into a team
+    # whose secret it holds).
+    team_id = _partition_team(haid, request, home=home)
     result = record_presence(
         haid, project=project, team_id=team_id, handle=payload.get("handle"),
         verdict=payload.get("verdict"), file=payload.get("file"), home=home)
@@ -411,7 +447,9 @@ def roster_route(identity, request, *, home=None):
     if not project:
         return cp_server.Response(
             422, {"reason": "no_project", "roster": []})
-    team_id = cp_auth.registered_team(haid, home=home)
+    # Same partition resolution as the beat: PREFER the presented team secret (so the caller's own
+    # `roster` read is scoped to the SAME partition its beats wrote), else the registry binding.
+    team_id = _partition_team(haid, request, home=home)
     return cp_server.Response(
         200, {"project": project, "team_id": team_id,
               "roster": roster(project, team_id, home=home)})
@@ -435,7 +473,9 @@ def retire_route(identity, request, *, home=None):
     if not project:
         return cp_server.Response(
             422, {"retired": False, "reason": "no_project"})
-    team_id = cp_auth.registered_team(haid, home=home)
+    # Retire into the SAME partition the beat wrote: PREFER the presented team secret, else the
+    # registry binding — so a `presence off` tombstones exactly where the dev is visible.
+    team_id = _partition_team(haid, request, home=home)
     result = record_retire(haid, project=project, team_id=team_id, home=home)
     if not result.get("ok"):
         return cp_server.Response(
