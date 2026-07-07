@@ -63,6 +63,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sys
@@ -134,18 +135,42 @@ def _backend(home=None):
 
 
 def _slug(value):
-    """A filesystem-safe, bounded path slug for a project name / HAID. Keeps
-    [A-Za-z0-9._-] and maps every other char (the HAID `:` / a repo `/`) to `_`, so the
-    segment is filesystem-safe, path-traversal-proof, AND free of the "__" separator the
-    Firestore flat encoding reserves (a single odd char becomes a single "_"). Returns
-    'unknown' for an empty/None value (an unattributed record still stores, never escapes
-    its segment). Mirrors cp_ingest._slug exactly."""
+    """A filesystem-safe, bounded path slug for a project name / HAID. Keeps [A-Za-z0-9.-]
+    and maps every RUN of other chars (the HAID `:` / a repo `/`, incl. a literal `_`) to a
+    SINGLE `_`, so the segment is filesystem-safe, path-traversal-proof, AND — critically for
+    the Firestore flat encoding — can NEVER contain the "__" separator FirestoreBackend
+    reserves. Returns 'unknown' for an empty/None value (an unattributed record still stores,
+    never escapes its segment).
+
+    THE COLLAPSE IS LOAD-BEARING (firestore-only viral-gate bug). FirestoreBackend flattens a
+    rel `presence/<p>/<t>/<h>.json` to ONE doc id, "/"→"__", and list_names(<p>/<t>, ".json")
+    recovers the immediate child by splitting the remainder on the FIRST "__" — a leaf when
+    there is no interior "__", a SUBDIRECTORY otherwise. If a HAID with adjacent odd chars
+    (e.g. a "://" / "//" run) mapped each char to a lone "_" INDIVIDUALLY, the leaf basename
+    would contain "__"; list_names then read that leaf as a subdirectory and DROPPED it under
+    the ".json" suffix filter, so a valid beat's record was invisible to its own roster-team on
+    Firestore (while os.listdir on the LOCAL backend returned it verbatim — the deployed-shape
+    gap the hermetic BUG2 test missed). Collapsing every replacement run to a single "_" honors
+    the no-"__" invariant the flat encoding depends on, so the WRITE doc id and the READ
+    list_names prefix stay byte-identical AND unambiguous on Firestore. A record that already
+    round-trips (single-"_" slug) is UNCHANGED — the collapse is identity on it. See
+    test/cp-presence-firestore.test.sh. NB: cp_ingest._slug carries the same per-char mapping
+    and the same latent firestore risk for a "__"-bearing instance slug; this fix is scoped to
+    the presence viral-gate and does NOT touch cp_ingest."""
     raw = str(value or "").strip()
     if not raw:
         return "unknown"
     out = []
+    prev_us = False
     for ch in raw[:_SLUG_MAX]:
-        out.append(ch if (ch.isalnum() or ch in "._-") else "_")
+        if ch.isalnum() or ch in ".-":
+            out.append(ch)
+            prev_us = False
+        elif not prev_us:
+            # Every other char — including a literal "_" — maps to a SINGLE "_", and a RUN of
+            # such chars collapses to one "_" (prev_us), so no "__" can ever appear in a segment.
+            out.append("_")
+            prev_us = True
     slug = "".join(out).strip("._-")
     return slug or "unknown"
 
@@ -425,8 +450,16 @@ def beat_route(identity, request, *, home=None):
         haid, project=project, team_id=team_id, handle=payload.get("handle"),
         verdict=payload.get("verdict"), file=payload.get("file"), home=home)
     if not result.get("ok"):
-        return cp_server.Response(
-            500, {"recorded": False, "reason": result.get("reason", "io_error")})
+        # LOUD on a DROPPED write (the firestore-only silent-drop class). A backend write that
+        # fails must NEVER look like a silent 200: it surfaces as a 500 to the client AND is
+        # NAMED on the server log here, so an operator sees "beat NOT stored" instead of an empty
+        # roster with no trace. Best-effort log (suppressed) never masks the honest 500.
+        reason = result.get("reason", "io_error")
+        with contextlib.suppress(Exception):
+            sys.stderr.write(
+                "cp_presence: beat NOT stored haid=%s project=%s team=%s reason=%s\n"
+                % (haid, project, team_id, reason))
+        return cp_server.Response(500, {"recorded": False, "reason": reason})
     return cp_server.Response(
         200, {"recorded": True, "haid": haid, "project": result.get("project"),
               "team_id": team_id})
