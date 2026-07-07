@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# heimdall-cost-report — THE DAILY COST JOB + brake chain (cost-governance §1/§4).
+#
+# Turn yesterday's spend into the spend-pace, back off the interval ladder, alert the owner at
+# 50/75/90%, and report the dead-man's-brake (billing kill-switch) status — the four §4 links, run
+# as one daily CP scheduled job. Heimdall never pays for inference (BYO everywhere); this governs
+# the ONLY spend the $10k/mo budget buys — Firestore ops + Cloud Run request handling.
+#
+# USAGE:
+#   heimdall-cost-report [--daily-usd N] [--reads N] [--writes N] [--requests N] [--dau N]
+#                        [--home DIR] [--no-set-ladder] [--no-notify] [--json]
+#
+#   --daily-usd N     yesterday's ACTUAL infra $ (from the BigQuery billing export — RJ enables it
+#                     once). When given it is authoritative. When omitted the job MODELS a $/day
+#                     from the op counts below (the path until the export is live).
+#   --reads/--writes/--requests N   yesterday's Firestore reads+writes + Cloud Run requests, used
+#                     to MODEL the $/day when --daily-usd is not given (cp_cost_model list rates).
+#   --dau N           yesterday's active devs — for the $/DAU line.
+#   --home DIR        the control-plane state home (defaults to the runtime HEIMDALL_HOME).
+#   --no-set-ladder   compute + report only; do NOT write the ladder tier (a dry run).
+#   --no-notify       do NOT page owners / post the daily summary (a dry run).
+#   --json            emit the full run result as JSON (default: a human summary).
+#
+# The %-of-budget it computes is the SPEND-PACE the adaptive-interval ladder (GET /config) serves;
+# the ladder self-heals the burn with barely-perceptible wall latency. Exit 0 on a completed run.
+
+set -uo pipefail
+
+SELF="$0"
+if command -v readlink >/dev/null 2>&1; then
+  SELF="$(readlink -f "$0" 2>/dev/null || readlink "$0" 2>/dev/null || echo "$0")"
+fi
+BIN_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+LIB_DIR="$BIN_DIR/lib"
+
+usage() { sed -n '2,32p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+PY="$(command -v python3 || command -v python || true)"
+if [ -z "$PY" ]; then
+  echo "error: python3 not found (required for the cost report)" >&2
+  exit 2
+fi
+
+DAILY_USD=""; READS=""; WRITES=""; REQUESTS=""; DAU=""; HOME_DIR=""
+SET_LADDER="1"; NOTIFY="1"; JSON=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --daily-usd)     DAILY_USD="${2:?--daily-usd needs a value}"; shift 2 ;;
+    --reads)         READS="${2:?--reads needs a value}"; shift 2 ;;
+    --writes)        WRITES="${2:?--writes needs a value}"; shift 2 ;;
+    --requests)      REQUESTS="${2:?--requests needs a value}"; shift 2 ;;
+    --dau)           DAU="${2:?--dau needs a value}"; shift 2 ;;
+    --home)          HOME_DIR="${2:?--home needs a dir}"; shift 2 ;;
+    --no-set-ladder) SET_LADDER=""; shift ;;
+    --no-notify)     NOTIFY=""; shift ;;
+    --json)          JSON="1"; shift ;;
+    -h|--help)       usage; exit 0 ;;
+    --*)             echo "error: unknown option: $1" >&2; usage >&2; exit 2 ;;
+    *)               echo "error: unexpected argument: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+LIB_DIR="$LIB_DIR" DAILY_USD="$DAILY_USD" READS="$READS" WRITES="$WRITES" \
+REQUESTS="$REQUESTS" DAU="$DAU" HOME_DIR="$HOME_DIR" SET_LADDER="$SET_LADDER" \
+NOTIFY="$NOTIFY" JSON="$JSON" "$PY" - <<'PYEOF'
+import json
+import os
+import sys
+
+sys.path.insert(0, os.environ["LIB_DIR"])
+import cp_costjob
+
+
+def _num(name, cast):
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return None
+    try:
+        return cast(raw)
+    except (TypeError, ValueError):
+        sys.stderr.write("heimdall-cost-report: ignoring malformed %s=%r\n" % (name, raw))
+        return None
+
+
+home = os.environ.get("HOME_DIR") or None
+result = cp_costjob.run_daily(
+    daily_usd=_num("DAILY_USD", float),
+    reads=_num("READS", int),
+    writes=_num("WRITES", int),
+    requests=_num("REQUESTS", int),
+    dau=_num("DAU", int),
+    home=home,
+    set_ladder=bool(os.environ.get("SET_LADDER")),
+    notify_owner=bool(os.environ.get("NOTIFY")),
+)
+
+if os.environ.get("JSON"):
+    print(json.dumps(result, indent=2, sort_keys=True))
+else:
+    rpt = result["report"]
+    print("cost report (%s):" % result["source"])
+    print("  $/day            : $%.4f" % rpt["daily_usd"])
+    if rpt["per_dau_usd"] is not None:
+        print("  $/DAU            : $%.6f" % rpt["per_dau_usd"])
+    print("  projected month  : $%.2f" % rpt["projected_month_usd"])
+    print("  %% of budget      : %.1f%% (of $%.0f)" % (result["spend_pace_pct"],
+                                                       rpt["budget_usd"]))
+    print("  ladder tier      : %d%s (was %d)" % (
+        result["new_tier"],
+        (" [%s]" % result["ladder_reason"]) if result["ladder_reason"] else "",
+        result["prev_tier"]))
+    if result["alert_fired"]:
+        print("  OWNER ALERT      : fired -> %d owner(s)" % result["owners_alerted"])
+    if result["kill_switch_armed"]:
+        print("  KILL SWITCH      : ARMED (hard cap reached — verify the GCP budget object)")
+PYEOF

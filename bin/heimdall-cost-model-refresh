@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# heimdall-cost-model-refresh — THE WEEKLY UNIT-COST MODEL re-validation (cost-governance §1).
+#
+# The living-doc job: recompute the launch-cost-model.md virality table from the CURRENT
+# configurable GCP rates + cadence, print it, and emit the modeled spend-pace the daily cost job
+# consumes. Run WEEKLY so the model is re-validated against reality and the doc's constants are
+# corrected when a rate moves. A doc drifts; a script does not — this is the script.
+#
+# USAGE:
+#   heimdall-cost-model-refresh [--concurrent "100 1000 10000"] [--active-hours H]
+#                               [--beat S] [--refresh S] [--roster R] [--json]
+#
+#   --concurrent LIST  space-separated concurrent-session counts to model (default "100 1000 10000").
+#   --active-hours H   active hours/day per session (default 8; use 24 for the sustained worst case).
+#   --beat S           beat interval seconds to model (default 20 — the tier-0 default).
+#   --refresh S        roster refresh interval seconds (default 15).
+#   --roster R         roster size (docs read per refresh, default 5).
+#   --json             emit the modeled rows as JSON (default: a human table).
+#
+# It computes NOTHING durable (no ladder write, no spend) — it is the what-if that keeps the model
+# honest. The DAILY job (heimdall-cost-report) is the one that sets the ladder from ACTUAL spend.
+
+set -uo pipefail
+
+SELF="$0"
+if command -v readlink >/dev/null 2>&1; then
+  SELF="$(readlink -f "$0" 2>/dev/null || readlink "$0" 2>/dev/null || echo "$0")"
+fi
+BIN_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+LIB_DIR="$BIN_DIR/lib"
+
+usage() { sed -n '2,22p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+PY="$(command -v python3 || command -v python || true)"
+if [ -z "$PY" ]; then
+  echo "error: python3 not found (required for the cost model)" >&2
+  exit 2
+fi
+
+CONCURRENT="100 1000 10000"; ACTIVE_HOURS="8"; BEAT="20"; REFRESH="15"; ROSTER="5"; JSON=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --concurrent)   CONCURRENT="${2:?--concurrent needs a value}"; shift 2 ;;
+    --active-hours) ACTIVE_HOURS="${2:?--active-hours needs a value}"; shift 2 ;;
+    --beat)         BEAT="${2:?--beat needs a value}"; shift 2 ;;
+    --refresh)      REFRESH="${2:?--refresh needs a value}"; shift 2 ;;
+    --roster)       ROSTER="${2:?--roster needs a value}"; shift 2 ;;
+    --json)         JSON="1"; shift ;;
+    -h|--help)      usage; exit 0 ;;
+    --*)            echo "error: unknown option: $1" >&2; usage >&2; exit 2 ;;
+    *)              echo "error: unexpected argument: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+LIB_DIR="$LIB_DIR" CONCURRENT="$CONCURRENT" ACTIVE_HOURS="$ACTIVE_HOURS" BEAT="$BEAT" \
+REFRESH="$REFRESH" ROSTER="$ROSTER" JSON="$JSON" "$PY" - <<'PYEOF'
+import json
+import os
+import sys
+
+sys.path.insert(0, os.environ["LIB_DIR"])
+import cp_cost_model
+
+
+def _f(name, default):
+    try:
+        return float(os.environ.get(name) or default)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+concurrents = []
+for tok in (os.environ.get("CONCURRENT") or "").split():
+    try:
+        concurrents.append(int(float(tok)))
+    except (TypeError, ValueError):
+        sys.stderr.write("heimdall-cost-model-refresh: ignoring bad concurrent=%r\n" % tok)
+
+active_hours = _f("ACTIVE_HOURS", 8)
+beat = _f("BEAT", 20)
+refresh = _f("REFRESH", 15)
+roster = int(_f("ROSTER", 5))
+
+rows = [cp_cost_model.model_from_concurrency(
+            c, active_hours=active_hours, beat_interval_s=beat,
+            refresh_interval_s=refresh, roster_size=roster)
+        for c in concurrents]
+
+if os.environ.get("JSON"):
+    print(json.dumps({
+        "budget_usd": cp_cost_model.monthly_budget_usd(),
+        "fixed_floor_usd": cp_cost_model.fixed_floor_usd(),
+        "assumptions": {"active_hours": active_hours, "beat_interval_s": beat,
+                        "refresh_interval_s": refresh, "roster_size": roster},
+        "rows": rows,
+    }, indent=2, sort_keys=True))
+else:
+    print("unit-cost model (weekly re-validation) — beat %.0fs / refresh %.0fs / roster %d / "
+          "%.0fh active-day / $%.0f budget"
+          % (beat, refresh, roster, active_hours, cp_cost_model.monthly_budget_usd()))
+    print("  %-10s %-14s %-16s %-10s" % ("concurrent", "$/day", "projected/mo", "%budget"))
+    for r in rows:
+        print("  %-10d $%-13.2f $%-15.2f %.1f%%"
+              % (r["concurrent"], r["daily_usd"], r["projected_month_usd"], r["pct_of_budget"]))
+    print("fixed floor (gated always-on instance): $%.2f/mo" % cp_cost_model.fixed_floor_usd())
+PYEOF
