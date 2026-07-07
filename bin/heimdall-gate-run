@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+# heimdall-gate-run — the HEADLESS gate entrypoint for the universal git core (Layer 0).
+#
+# WHAT IT IS. The single command a plain git hook runs to execute the SAME gate
+# suite the Claude Code plugin runs at commit/push time — but from a bare git-hook
+# process with NO plugin runtime, NO MCP, NO Claude Code in the loop. It reuses the
+# real gate runners (bin/falsify per applicable oracle domain, bin/corpus for the
+# regression corpus) exactly as hooks/hooks.json's PreToolUse `git push` gate does,
+# and reduces them to one verdict: pass | deny.
+#
+# CONTRACT.
+#   - DENY  = a real gate went red -> nonzero exit + a BIFRÖST verdict block on stderr.
+#   - PASS  = every applicable gate green (or none configured) -> exit 0, quiet.
+#   Either way it PERSISTS the repo's last verdict to <repo>/.heimdall/verdict.json
+#   so `hmd verdict` can print it and the post-commit beat can carry it.
+#
+# Usage:
+#   heimdall-gate-run [--phase pre-commit|pre-push] [--json]
+#   -h, --help
+#
+# Exit: 0 = pass; 1 = deny (a gate is red); 2 = usage error.
+set -uo pipefail
+
+# Resolve through symlinks so a hook invoking us by an embedded/symlinked path still
+# finds our sibling gate runners (falsify/corpus) under the plugin bin dir.
+SELF="$0"
+while [ -h "$SELF" ]; do
+  _d="$(cd "$(dirname "$SELF")" && pwd)"
+  SELF="$(readlink "$SELF")"
+  case "$SELF" in /*) ;; *) SELF="$_d/$SELF" ;; esac
+done
+BIN_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+PLUGIN_DIR="$(cd "$BIN_DIR/.." && pwd)"
+
+usage() { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; }
+
+PHASE="pre-commit"; JSON=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --phase) PHASE="${2:?--phase needs a value}"; shift 2 ;;
+    --json)  JSON=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "heimdall-gate-run: unexpected argument: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+case "$PHASE" in pre-commit|pre-push) ;; *) echo "heimdall-gate-run: --phase must be pre-commit|pre-push" >&2; exit 2 ;; esac
+
+REPO="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+FALSIFY="$PLUGIN_DIR/bin/falsify"
+CORPUS="$PLUGIN_DIR/bin/corpus"
+
+DENY=0
+FAIL_GATE=""
+REASONS=""            # newline-joined human reasons
+GATE_OUT=""           # captured runner stderr to relay on deny
+
+add_reason() { REASONS="${REASONS}${REASONS:+$'\n'}$1"; }
+
+# ── 1. Oracle falsifiability gates over the REPO's own oracle domains ─────────
+#    Identical to the plugin push gate: for each domain with mutant fixtures,
+#    `falsify <domain> --assert-score 1.0` must hold (the gate can still go red).
+#    A non-falsifiable gate (score < 1.0) DENIES — a green suite over a dead gate
+#    must not ship.
+if [ -x "$FALSIFY" ] && [ -d "$REPO/evals/oracles" ]; then
+  for D in "$REPO/evals/oracles"/*/; do
+    [ -d "$D/fixtures/mutants" ] || continue
+    DOM="$(basename "$D")"
+    if ! OUT="$(HEIMDALL_ORACLES_DIR="$REPO/evals/oracles" "$FALSIFY" "$DOM" --assert-score 1.0 2>&1)"; then
+      DENY=1; FAIL_GATE="falsify:$DOM"
+      add_reason "oracle gate '$DOM' is not falsifiable (bin/falsify score < 1.0)"
+      GATE_OUT="$OUT"
+      break
+    fi
+  done
+fi
+
+# ── 2. Corpus regression gate ─────────────────────────────────────────────────
+#    A case the gates once caught must still be caught (CI-inversion guard).
+if [ "$DENY" = 0 ] && [ -x "$CORPUS" ] && [ -f "$REPO/evals/corpus/INDEX.json" ]; then
+  if ! OUT="$( cd "$REPO" && CORPUS_DIR="$REPO/evals/corpus" ORACLES_DIR="$REPO/evals/oracles" "$CORPUS" run 2>&1 )"; then
+    DENY=1; FAIL_GATE="corpus"
+    add_reason "corpus regression — a case the gates once caught is no longer caught"
+    GATE_OUT="$OUT"
+  fi
+fi
+
+# ── persist the verdict (the source of truth for `hmd verdict` + the beat) ─────
+VERDICT="pass"; [ "$DENY" = 1 ] && VERDICT="deny"
+TS="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)"
+TOP_FILE="$(git diff --cached --name-only 2>/dev/null | sed '/^$/d' | head -1)"
+VDIR="$REPO/.heimdall"
+VFILE="$VDIR/verdict.json"
+mkdir -p "$VDIR" 2>/dev/null || true
+if command -v jq >/dev/null 2>&1; then
+  jq -cn --arg v "$VERDICT" --arg ph "$PHASE" --arg ts "$TS" \
+         --arg gate "$FAIL_GATE" --arg file "$TOP_FILE" --arg reasons "$REASONS" \
+    '{verdict:$v, phase:$ph, ts:$ts, gate:($gate // ""), file:$file,
+      reasons: ($reasons | if . == "" then [] else split("\n") end)}' \
+    > "$VFILE" 2>/dev/null || true
+else
+  # jq-less fallback: a minimal, valid one-line object.
+  printf '{"verdict":"%s","phase":"%s","ts":"%s","gate":"%s","file":"%s"}\n' \
+    "$VERDICT" "$PHASE" "$TS" "$FAIL_GATE" "$TOP_FILE" > "$VFILE" 2>/dev/null || true
+fi
+
+# ── PASS ──────────────────────────────────────────────────────────────────────
+if [ "$DENY" = 0 ]; then
+  exit 0
+fi
+
+# ── DENY: the BIFRÖST verdict block on stderr (visible, never silent) ─────────
+{
+  printf '\n'
+  printf '\033[1;31m🛑 BIFRÖST — Heimdall DENIED the %s\033[0m\n' "$PHASE"
+  printf '   gate: %s\n' "$FAIL_GATE"
+  while IFS= read -r _r; do [ -n "$_r" ] && printf '   • %s\n' "$_r"; done <<EOF
+$REASONS
+EOF
+  if [ -n "$GATE_OUT" ]; then
+    printf '   ── gate output ──\n'
+    printf '%s\n' "$GATE_OUT" | sed 's/^/   /'
+  fi
+  printf '   nothing ships unproven. harden the gate until it is falsifiable again.\n'
+  printf '   escape (logged, never silent): \033[1mHMD_SKIP=1 git commit …\033[0m\n\n'
+} >&2
+exit 1

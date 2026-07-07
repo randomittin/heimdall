@@ -1166,6 +1166,31 @@ case "${1:-}" in
     fi
     exec "$TELEMETRY_CORPUS_BIN" "$@"
     ;;
+  init)
+    # Pass-through to heimdall-init (the universal git core, Layer 0): installs the
+    # git hooks (core.hooksPath=.heimdall/hooks, chaining any prior hooks) so gates
+    # fire on commit/push with git alone in the loop — no Claude Code required.
+    shift
+    INIT_BIN="$PLUGIN_DIR/bin/heimdall-init"
+    if [ ! -x "$INIT_BIN" ]; then
+      echo "  Error: heimdall-init not found at $INIT_BIN" >&2
+      echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+      exit 1
+    fi
+    exec "$INIT_BIN" "$@"
+    ;;
+  verdict)
+    # Pass-through to heimdall-verdict: print the repo's last gate result (the CLI
+    # answer to "what did the watchman say"), usable from any terminal/editor.
+    shift
+    VERDICT_BIN="$PLUGIN_DIR/bin/heimdall-verdict"
+    if [ ! -x "$VERDICT_BIN" ]; then
+      echo "  Error: heimdall-verdict not found at $VERDICT_BIN" >&2
+      echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+      exit 1
+    fi
+    exec "$VERDICT_BIN" "$@"
+    ;;
 esac
 
 # ── Command handlers ──
