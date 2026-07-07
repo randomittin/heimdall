@@ -1062,6 +1062,227 @@ def _hook_block():
     ])
 
 
+# ── the CORPUS INGEST / TRANSPORT contract (premerge-corpus-spec §4/§5.2) ─────
+#
+# WHAT THIS ADDS on top of the LOCAL emit engine above (item #4). The emit path spools a
+# zero-content pmr_v1 LOCALLY (project -> guard -> scan -> spool); THIS section carries that spool
+# to the control plane and lands it in the ISOLATED corpus store, plus the server-side no-secret /
+# on-schema boundary an ingest re-runs. It is ADDITIVE — every function above is byte-for-byte
+# unchanged (item #4's telemetry gate stays green); these are the NEW symbols cp_corpus /
+# cp_corpus_aggregate / cp_corpus_synth / corpus_client bind to.
+
+# THE CORPUS STORE NAMESPACE (the store-isolation seam — cp_state.get_backend(namespace=)). The
+# corpus lands under ${HEIMDALL_HOME}/heimdall_corpus/ (local) / the "heimdall_corpus" root
+# collection (firestore) — a DISJOINT keyspace from control-plane presence/ops/team data.
+# Overridable via HEIMDALL_CORPUS_NAMESPACE so a test can pin a unique root and still prove the
+# cross-namespace isolation against the control-plane store on the SAME backend.
+CORPUS_NAMESPACE_ENV = "HEIMDALL_CORPUS_NAMESPACE"
+DEFAULT_CORPUS_NAMESPACE = "heimdall_corpus"
+
+# The two consent tiers' store partitions WITHIN the corpus namespace. T0 = zero-content metadata
+# (default ON); T1 = deny-context hunks (opt-in per repo). Kept separate so the rule-synthesis job
+# reads ONLY t1/ and a T1 partition can carry its own retention.
+T0_PARTITION = "t0"
+T1_PARTITION = "t1"
+
+# K-ANONYMITY floor: an aggregate bucket backed by fewer than this many DISTINCT team_id_hash is
+# SUPPRESSED (never served). The hard privacy gate on every published/queryable rollup (§2).
+K_ANONYMITY_MIN = 20
+
+# The CLOSED set of keys a canonical corpus PMR record carries after rebuild — a reader (the
+# aggregate) trusts ONLY these, and an ingested record is reduced to exactly this shape so a
+# smuggled off-schema key (a source line hidden under an unknown field) is never stored.
+CORPUS_PMR_TOP_KEYS = frozenset({
+    "schema", "pmr_id", "team_id_hash", "repo_class_hash", "ts", "tz_bucket",
+    "agent", "change", "verify", "human", "env",
+})
+
+
+def corpus_namespace():
+    """The corpus store namespace (HEIMDALL_CORPUS_NAMESPACE, default 'heimdall_corpus') — the
+    disjoint keyspace the corpus lands in (cp_state.get_backend(namespace=this)). A test pins a
+    unique value to prove isolation against the control-plane store on the same backend."""
+    raw = os.environ.get(CORPUS_NAMESPACE_ENV)
+    return raw.strip() if raw and raw.strip() else DEFAULT_CORPUS_NAMESPACE
+
+
+def corpus_send_enabled(home=None):
+    """True iff the corpus SEND is permitted — the SAME master consent that gates local emit
+    (enabled()): telemetry OFF (HEIMDALL_TELEMETRY=off or persisted enabled=false) => no network
+    byte leaves. There is no separate corpus opt-out; the one telemetry switch governs both."""
+    return enabled(home)
+
+
+def any_hunks_enabled(home=None):
+    """True iff ANY repo class has opted into T1 hunk capture (the home-level gate the flusher
+    checks before it sends the T1 spool). Per-repo opt-in is set by set_hunks(); this is the
+    'is T1 on at all' rollup a batch flush keys on."""
+    hunks = load_consent(home).get("hunks", {})
+    return any(bool(v) for v in hunks.values()) if isinstance(hunks, dict) else False
+
+
+# ── the SECRET-SCAN BELT (§2 — the go/no-go every T1 payload + every flush re-runs) ──
+
+
+def scan_for_secrets(payload):
+    """Scan a payload (dict/list/str) for secret shapes, returning the LIST of finding labels
+    (empty == clean). A thin projection of secret_scan_payload (the item-#4 vocabulary — telemetry
+    high-signal patterns + gitleaks when present); this is the shape cp_corpus (the T1 boundary)
+    and corpus_client (the before-send belt) consume. THE FALSIFIER: plant an AWS AKIA key in a
+    payload -> a non-empty list -> the ingest drops it / the send refuses it (heimdall-corpus-
+    ingest)."""
+    _clean, findings = secret_scan_payload(payload)
+    return findings
+
+
+def is_secret_free(payload):
+    """True iff scan_for_secrets found nothing — the go/no-go the send path checks."""
+    return not scan_for_secrets(payload)
+
+
+# ── the SERVER-SIDE closed-schema rebuild (§2 no-secret / on-schema boundary) ──
+
+
+def _first(d, *keys):
+    """The first present, non-None value among `keys` in dict `d` (else None). Lets rebuild read
+    BOTH the item-#4 NESTED client shape (ids.team_id_hash / when.ts / agent.haid_class.tool) AND
+    an already-flat corpus shape, normalizing either to the flat canonical record below."""
+    if not isinstance(d, dict):
+        return None
+    for k in keys:
+        if k in d and d[k] is not None:
+            return d[k]
+    return None
+
+
+def rebuild_pmr(line):
+    """Re-run the closed-schema, zero-content-guarded rebuild on ONE pushed/stored PMR SERVER-SIDE
+    (the no-secret / on-schema boundary, mirroring cp_ingest._rebuild_event). Accepts the item-#4
+    client pmr_v1 (NESTED: ids / when / agent.haid_class) OR an already-flat corpus record, and
+    emits the CANONICAL FLAT corpus record — every free field bounded via _tag / coerced via
+    _int/_num, every unknown wire key DROPPED (never read), then the whole record re-checked by
+    assert_zero_content. A client cannot inject an off-schema / secret / content-bearing PMR: the
+    server rebuilds it from the pinned keys. Returns the clean record, or None when the line is not
+    a dict / not a pmr_v1 / fails the zero-content guard. `team_id_hash` is carried from the line
+    but the caller (cp_corpus) OVERWRITES it with the server-derived handle (INV-1)."""
+    if not isinstance(line, dict):
+        return None
+    if line.get("schema") not in (None, SCHEMA_PMR):
+        return None
+    ids = line.get("ids") if isinstance(line.get("ids"), dict) else {}
+    when = line.get("when") if isinstance(line.get("when"), dict) else {}
+    agent_in = line.get("agent") if isinstance(line.get("agent"), dict) else {}
+    haid_class = (agent_in.get("haid_class")
+                  if isinstance(agent_in.get("haid_class"), dict) else {})
+    change_in = line.get("change") if isinstance(line.get("change"), dict) else {}
+    verify_in = line.get("verify") if isinstance(line.get("verify"), dict) else {}
+    falsify_in = (verify_in.get("falsify")
+                  if isinstance(verify_in.get("falsify"), dict) else {})
+    reuse_in = verify_in.get("reuse") if isinstance(verify_in.get("reuse"), dict) else {}
+    human_in = line.get("human") if isinstance(line.get("human"), dict) else {}
+    env_in = line.get("env") if isinstance(line.get("env"), dict) else {}
+
+    rec = {
+        "schema": SCHEMA_PMR,
+        "pmr_id": _tag(_first(ids, "pmr_id") or line.get("pmr_id")),
+        "team_id_hash": _tag(_first(ids, "team_id_hash") or line.get("team_id_hash")),
+        "repo_class_hash": _tag(_first(ids, "repo_class_hash") or line.get("repo_class_hash")),
+        "ts": _num(_first(when, "ts") if when else line.get("ts"), 0),
+        "tz_bucket": _tag(_first(when, "tz_bucket") if when else line.get("tz_bucket")),
+        "agent": {
+            "tool": _tag(_first(haid_class, "tool") or agent_in.get("tool") or "unknown"),
+            "model_family": _tag(_first(haid_class, "model_family")
+                                 or agent_in.get("model_family") or "unknown"),
+            "version": _tag(_first(haid_class, "version")
+                            or agent_in.get("version") or "unknown"),
+        },
+        "change": {
+            "files_touched": _int(change_in.get("files_touched", 0)),
+            "loc_added": _int(change_in.get("loc_added", 0)),
+            "loc_deleted": _int(change_in.get("loc_deleted", 0)),
+            "hunks": _int(change_in.get("hunks", 0)),
+            "langs": _tag_list(change_in.get("langs")),
+            "complexity_delta": _int(change_in.get("complexity_delta", 0)),
+            "dep_graph_touch": bool(change_in.get("dep_graph_touch", False)),
+            "test_files_touched": _int(change_in.get("test_files_touched", 0)),
+        },
+        "verify": {
+            "gates_run": _tag_list(verify_in.get("gates_run")),
+            "verdict": _tag(verify_in.get("verdict")),
+            "deny_reasons": _tag_list(verify_in.get("deny_reasons")),
+            "retry_count": _int(verify_in.get("retry_count", 0)),
+            "time_to_green_s": _num(verify_in.get("time_to_green_s", 0)),
+            "falsify": {
+                "mutants_run": _int(falsify_in.get("mutants_run", 0)),
+                "survived": _int(falsify_in.get("survived", 0)),
+            },
+            "reuse": {
+                "dup_candidates": _int(reuse_in.get("dup_candidates", 0)),
+                "reused": bool(reuse_in.get("reused", False)),
+            },
+            "bloat_budget_delta": _num(verify_in.get("bloat_budget_delta", 0)),
+        },
+        "human": {
+            "merged": bool(human_in.get("merged", False)),
+            "overridden": bool(human_in.get("overridden", False)),
+            "override_latency_s": _num(human_in.get("override_latency_s", 0)),
+        },
+        "env": {
+            "os_class": _tag(env_in.get("os_class") or "unknown"),
+            "ci": bool(env_in.get("ci", False)),
+            "hmd_version": _tag(env_in.get("hmd_version") or "unknown"),
+        },
+    }
+    ok, _violations = assert_zero_content(rec)
+    if not ok:
+        return None
+    return rec
+
+
+# ── the CLIENT-SIDE spool helpers the flusher drains (§5.2 — the outbox) ──────
+
+
+def clear_spool(home=None):
+    """Empty the LOCAL T0 send-queue (spool_dir) — called by the flusher AFTER a 200 ack
+    (at-least-once). Returns the count removed. A no-op on an absent spool."""
+    return _empty_dir(spool_dir(home))
+
+
+def hunk_spool_dir(home=None):
+    """<pmr_dir>/hunks — the T1 deny-context OUTBOX (opt-in). Separate from the T0 spool so the
+    T1-off gate can leave it untouched. A hunk record is a dict; the flusher secret-scans EACH
+    before send (the belt) and the server re-scans at ingest (cp_corpus)."""
+    return os.path.join(pmr_dir(home), "hunks")
+
+
+def hunk_spool_records(home=None):
+    """Read every queued T1 hunk record from the hunk outbox (read-only). Tolerant: a bad file is
+    skipped, an absent outbox yields []. The opt-in T1 payloads the flusher drains when hunks are
+    enabled."""
+    return _read_dir_records(hunk_spool_dir(home))
+
+
+def spool_hunk(record, home=None):
+    """Queue ONE T1 deny-context hunk into the outbox (opt-in capture). Atomic keyed write, same
+    discipline as the T0 spool. A `pmr_id` / `hunk_id` (else a content hash) names the file.
+    Returns the path. Stored as-is; the secret-scan belt runs at flush + the server re-scans at
+    ingest, so a secret can never leave even if one is queued."""
+    d = hunk_spool_dir(home)
+    os.makedirs(d, exist_ok=True)
+    name = str(record.get("pmr_id") or record.get("hunk_id")
+               or hashlib.sha256(
+                   json.dumps(record, sort_keys=True).encode("utf-8")).hexdigest()[:24])
+    path = os.path.join(d, name + ".json")
+    _atomic_write_json(path, record)
+    return path
+
+
+def clear_hunk_spool(home=None):
+    """Empty the T1 hunk outbox — called AFTER a 200 ack when hunks were sent. Returns the count
+    removed. A no-op on an absent outbox."""
+    return _empty_dir(hunk_spool_dir(home))
+
+
 # ── CLI core (driven by bin/heimdall-telemetry-corpus + `hmd telemetry`) ──────
 
 
