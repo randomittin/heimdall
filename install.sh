@@ -19,10 +19,11 @@
 #   HEIMDALL_NO_COLOR   set to force plain mode (NO_COLOR also honored)
 #   HEIMDALL_NO_INTRO   reserved for first-run demo; ignored here
 #   HEIMDALL_FORCE_HMD  install the `hmd` entry point even if a collider exists
-#   HEIMDALL_CP_URL     team control-plane URL → cp-endpoint.json (else TTY prompt)
-#   HEIMDALL_ENROLL_TOKEN  one-time enroll token (SECRET) → 0600 cp-endpoint.json;
-#                          never echoed, never tracked. Set once; presence is then
-#                          automatic. No gcloud/Secret-Manager — supplied by the env.
+#   HEIMDALL_CP_URL     team control-plane URL → cp-endpoint.json (optional; a public
+#                       default is baked in, so first-run enrollment is automatic)
+#   HEIMDALL_ENROLL_TOKEN  OPERATOR-ONLY bootstrap token for a token-gated (re-gated)
+#                          deployment → 0600 cp-endpoint.json; never echoed/tracked.
+#                          Unneeded on the open-bounded public CP — see OPERATORS.md.
 #   HEIMDALL_FORCE      rewrite cp-endpoint.json even if values are unchanged
 #
 set -euo pipefail
@@ -888,13 +889,14 @@ main() {
   esac
 
   # Step: configure the control-plane endpoint so SERVER-SYNCED TEAM PRESENCE
-  # auto-resolves for THIS dev with zero manual exports. The url + enroll token come
-  # from the install env (HEIMDALL_CP_URL + HEIMDALL_ENROLL_TOKEN — preferred for a
-  # scripted/team install) or, ONLY on a real interactive TTY, a one-time prompt; a
-  # non-interactive run with no env (curl|bash, whose stdin is the script pipe — or
-  # CI) skips cleanly with guidance and NEVER hangs. The token is a SECRET: read
-  # without echo, written 0600 into $HOME/.heimdall (gitignored, out of any repo),
-  # never printed. OPTIONAL/graceful — a skip or failure never aborts the install.
+  # auto-resolves for THIS dev with zero manual exports. The url comes from the
+  # install env (HEIMDALL_CP_URL) or, ONLY on a real interactive TTY, a one-time
+  # prompt; a non-interactive run with no env (curl|bash, whose stdin is the script
+  # pipe — or CI) skips cleanly with guidance and NEVER hangs. Enrollment is
+  # automatic (open-bounded) — there is NO token to paste. An OPERATOR re-gating a
+  # private deployment may still pre-seed HEIMDALL_ENROLL_TOKEN via the env (a SECRET:
+  # read without echo, written 0600, never printed — see OPERATORS.md). OPTIONAL/
+  # graceful — a skip or failure never aborts the install.
   local CP_URL="${HEIMDALL_CP_URL:-}"
   local CP_TOK="${HEIMDALL_ENROLL_TOKEN:-}"
   local CP_FORCE=""
@@ -902,15 +904,13 @@ main() {
   step_begin "Configuring control-plane endpoint"
   # Prompt ONLY on an interactive TTY, and only when the env did not supply a value
   # and no config exists yet. Under curl|bash / CI, [ -t 0 ] is false → no read, no
-  # hang. The token read is silent (-s) so it never lands in the terminal scrollback.
+  # hang. NO token prompt: enrollment is open-bounded (tokenless) — the url is all a
+  # dev ever supplies, and even that has a baked default. An operator re-gating a
+  # private deployment passes HEIMDALL_ENROLL_TOKEN via the env (see OPERATORS.md),
+  # which leaves CP_TOK non-empty and skips this interactive block entirely.
   if [ -z "$CP_URL" ] && [ -z "$CP_TOK" ] && [ ! -f "$PLUGIN_DIR/cp-endpoint.json" ] && [ -t 0 ]; then
-    printf '\n   %sTeam control-plane URL%s (blank to skip presence setup): ' "$C_WHITE" "$C_RESET"
+    printf '\n   %sTeam control-plane URL%s (blank for the default public CP): ' "$C_WHITE" "$C_RESET"
     IFS= read -r CP_URL || CP_URL=""
-    if [ -n "$CP_URL" ]; then
-      printf '   %sTeam enroll token%s (hidden): ' "$C_WHITE" "$C_RESET"
-      IFS= read -rs CP_TOK || CP_TOK=""
-      printf '\n'
-    fi
   fi
   local CP_STATE; CP_STATE="$(ensure_cp_endpoint "$PLUGIN_DIR" "$CP_URL" "$CP_TOK" "$CP_FORCE")"
   case "$CP_STATE" in
@@ -926,7 +926,7 @@ main() {
       printf '   %s⚠ no control-plane endpoint set — team presence stays offline.%s\n' \
         "$C_GOLD" "$C_RESET"
       printf '   %s  configure it any time (no re-install needed):%s\n' "$C_DIM" "$C_RESET"
-      printf '   %s    HEIMDALL_CP_URL=<url> HEIMDALL_ENROLL_TOKEN=<token> bash install.sh%s\n' \
+      printf '   %s    HEIMDALL_CP_URL=<url> bash install.sh%s\n' \
         "$C_DIM" "$C_RESET"
       printf '   %s  (writes %s/cp-endpoint.json, 0600; enrollment is automatic thereafter)%s\n' \
         "$C_DIM" "$CP_SHORT" "$C_RESET"

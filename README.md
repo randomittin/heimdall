@@ -12,17 +12,16 @@ Every PR ships the runnable evidence that the fix passes. The bot opens it on a 
 
 ## Get a bot PR on your repo
 
-Once you've installed the Heimdall Maintainer GitHub App on your repo and run `claude setup-token`, it's three commands:
+Once you've installed the Heimdall Maintainer GitHub App on your repo and run `claude setup-token`, it's two commands:
 
 ```bash
-rr setup --mode control-plane --endpoint <public-url> --enroll-token <token>
 rr connect                                    # registers your App install + captures your Claude cred
 rr "fix the flaky test in payments and open a PR"
 ```
 
 **What happens:** `rr` signs your task with your own Ed25519 key and enqueues it. A gated worker clones your repo with **your team's** Claude subscription and **your** GitHub App installation, runs the issue-resolution loop until the fix passes the gates, and opens a `heimdall/*` PR on your repo. You review it. You merge it.
 
-**Enrollment is token-gated today — no self-serve yet, and we won't pretend otherwise.** The enroll token and the service URL are handed out by hand: **ask for an enroll token** at [runheimdall.dev](https://runheimdall.dev). Full onboarding steps: [`deploy/cloud-run/PUBLIC-RR-RUNBOOK.md`](deploy/cloud-run/PUBLIC-RR-RUNBOOK.md).
+**Nothing to paste — no token, no URL.** The public control plane is baked in and enrollment is automatic: your first signed call registers this device on first use. Just `rr connect` and go. (Running your own deployment, or need to re-gate enrollment behind a bootstrap token? That's an operator concern — see [`OPERATORS.md`](OPERATORS.md).)
 
 ### Why it's safe to point at your repo
 
