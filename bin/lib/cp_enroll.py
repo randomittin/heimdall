@@ -342,9 +342,13 @@ def enroll(haid, pubkey, *, provided_token, team_secret=None, handle=None,
 
     # 7. Register the NEW binding. Enrolled devs are NOT owners (owner is the server identity,
     #    cp_auth.ensure_server_identity); a self-enroll — token OR open — never grants
-    #    gate-override authority (owner=False is re-asserted here, unconditionally).
+    #    gate-override authority (owner=False is re-asserted here, unconditionally). Stamp
+    #    enrolled_at (epoch) so the registry-hygiene job (cost-governance §3) can bound a
+    #    NEVER-beating identity: an enrolled key that never produces a beat is still evicted once
+    #    its enrolled_at ages past the idle window (bounded registry growth forever).
+    import time as _time  # stdlib — the enroll timestamp for the hygiene idle window.
     if not cp_auth.register_key(haid, pubkey, owner=False, team_id=team_id,
-                                project=project, home=home):
+                                project=project, enrolled_at=int(_time.time()), home=home):
         return {"ok": False, "reason": "registry_write_failed"}
     return {"ok": True, "haid": haid, "team_id": team_id}
 
