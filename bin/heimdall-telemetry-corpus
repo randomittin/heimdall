@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# heimdall-telemetry-corpus — the Pre-Merge Corpus (PMR) T0 control + emit CLI.
+# The thin bash front over bin/lib/pmr_corpus.py, routed by `hmd telemetry` (the
+# `telemetry)` case in bin/heimdall). Mirrors bin/heimdall-telemetry / heimdall-redum:
+# a bash wrapper that hands the whole argv to the python engine's CLI core.
+#
+#   hmd telemetry status              read-only: tier, what's collected, spool size
+#   hmd telemetry on | off            flip consent (off is FULLY honored — zero emit)
+#   hmd telemetry hunks on|off        T1 per-repo opt-in FLAG only (no T1 payload)
+#   hmd telemetry purge [--team-id ID] local spool purge + queued corpus deletion
+#
+# Internal (called by the gate pipeline + the post-commit hook, not by users):
+#   hmd telemetry emit [--job @f|JSON]   project+guard+scan+queue ONE pmr_v1
+#   hmd telemetry observe [--sha SHA]    post-commit outcome-observer seed
+#   hmd telemetry scan                   local outcome job (revert/hotfix/survived)
+#   hmd telemetry install-hook           install the chained post-commit hook
+#
+# ZERO-CONTENT + SECRET-SCAN-BEFORE-SEND are enforced in the engine: a payload
+# carrying a real path / source line / secret is BLOCKED + ALARMED, never queued.
+# NOTHING sends anywhere in step 1 — the spool IS the local send-queue.
+#
+# Exit status:
+#   0  status / on / off / hunks / purge / emit / observe / scan / install-hook.
+#   2  usage error (unknown subcommand / python absent / engine missing).
+
+set -uo pipefail
+
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+BINDIR="$(dirname "$SELF")"
+PMR_LIB="$BINDIR/lib/pmr_corpus.py"
+
+usage() { sed -n '2,30p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+PY="$(command -v python3 || command -v python || true)"
+if [ -z "$PY" ]; then
+  case "${1:-}" in
+    emit|observe|scan) echo '{"emitted": false, "reason": "python absent"}'; exit 0 ;;
+    *) echo "error: python3 not found (required for hmd telemetry)" >&2; exit 2 ;;
+  esac
+fi
+
+[ -f "$PMR_LIB" ] || {
+  case "${1:-}" in
+    emit|observe|scan) echo '{"emitted": false, "reason": "pmr engine absent"}'; exit 0 ;;
+    *) echo "error: pmr corpus engine not found: $PMR_LIB" >&2; exit 2 ;;
+  esac
+}
+
+[ $# -ge 1 ] || { usage >&2; exit 2; }
+
+case "$1" in
+  -h|--help) usage; exit 0 ;;
+esac
+
+# Hand the whole argv straight to the engine's CLI core (the lib owns the grammar).
+exec "$PY" "$PMR_LIB" "$@"
