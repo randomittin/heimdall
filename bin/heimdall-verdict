@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# heimdall-verdict — print the repo's last gate result (universal git core, Layer 0).
+#
+# The CLI answer to "what did the watchman say" — usable from ANY terminal or editor
+# task runner, with no Claude Code and no plugin runtime. It reads the verdict that
+# bin/heimdall-gate-run persisted at the last gated commit/push:
+#   <repo>/.heimdall/verdict.json  { verdict, phase, ts, gate, file, reasons[] }
+#
+# Usage:
+#   heimdall-verdict            human-readable last verdict
+#   heimdall-verdict --json     the raw verdict.json (or {} if none yet)
+#   heimdall-verdict --field K  print a single field's value (verdict|phase|ts|gate|file)
+#   -h, --help
+#
+# Exit: 0 always (absence of a verdict is not an error — it just means no gated
+# commit has run yet). Machine callers use --field and treat empty as "unknown".
+set -uo pipefail
+
+usage() { sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; }
+
+MODE="human"; FIELD=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --json)  MODE="json"; shift ;;
+    --field) MODE="field"; FIELD="${2:?--field needs a key}"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "heimdall-verdict: unexpected argument: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+REPO="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+VFILE="$REPO/.heimdall/verdict.json"
+HAVE_JQ=0; command -v jq >/dev/null 2>&1 && HAVE_JQ=1
+
+# read a single scalar field from the verdict file (jq when present, sed fallback).
+read_field() {
+  local key="$1"
+  [ -f "$VFILE" ] || { echo ""; return 0; }
+  if [ "$HAVE_JQ" = 1 ]; then
+    jq -r --arg k "$key" '.[$k] // empty | if type=="array" then join("; ") else tostring end' "$VFILE" 2>/dev/null || echo ""
+  else
+    sed -n "s/.*\"$key\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$VFILE" 2>/dev/null | head -1
+  fi
+}
+
+case "$MODE" in
+  field)
+    read_field "$FIELD"
+    ;;
+  json)
+    if [ -f "$VFILE" ]; then cat "$VFILE"; else printf '{}\n'; fi
+    ;;
+  human)
+    if [ ! -f "$VFILE" ]; then
+      printf 'verdict: none yet — no gated commit has run in this repo.\n'
+      printf '         run `hmd init` to install the hooks, then commit.\n'
+      exit 0
+    fi
+    V="$(read_field verdict)"; PH="$(read_field phase)"; TS="$(read_field ts)"
+    G="$(read_field gate)"; F="$(read_field file)"; RS="$(read_field reasons)"
+    case "$V" in
+      pass) printf '\033[1;32m✓ PASS\033[0m' ;;
+      deny) printf '\033[1;31m🛑 DENY\033[0m' ;;
+      *)    printf '? %s' "${V:-unknown}" ;;
+    esac
+    printf '  \033[2m(%s, %s)\033[0m\n' "${PH:-?}" "${TS:-?}"
+    [ -n "$F" ] && printf '   file: %s\n' "$F"
+    if [ "$V" = "deny" ]; then
+      [ -n "$G" ]  && printf '   gate: %s\n' "$G"
+      [ -n "$RS" ] && printf '   why:  %s\n' "$RS"
+    fi
+    ;;
+esac
+exit 0
