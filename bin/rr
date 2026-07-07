@@ -23,10 +23,11 @@
 # SUBCOMMANDS:
 #   rr setup --vm <name> --zone <z> --project <p> [--repo <default>] [--mode vm]
 #         Write ~/.heimdall/remote.json (the VM cloud target). No secret is ever stored.
-#   rr setup --mode control-plane [--endpoint <url>] [--enroll-token <t>] [--repo <default>]
+#   rr setup --mode control-plane [--endpoint <url>] [--repo <default>]
 #         Write ~/.heimdall/remote.json {mode:control-plane}; with --endpoint, also
-#         update the shared ~/.heimdall/cp-endpoint.json {url, enroll_token?}. The
-#         enroll token is the ONLY secret and lives 0600 in cp-endpoint.json — never argv'd back.
+#         update the shared ~/.heimdall/cp-endpoint.json {url}. Enrollment is
+#         automatic (open-bounded) — there is no token to configure. (Operators
+#         re-gating a private deployment behind a bootstrap token: see OPERATORS.md.)
 #   rr "<task>" [--repo <owner/repo>] [--max N] [--dry-run]
 #         File the maintainer issue (idempotent) + dispatch to the cloud executor.
 #   rr "<task>" --mode control-plane [--repo <owner/repo>] [--dry-run]
@@ -48,7 +49,7 @@
 #
 # FLAGS: --repo <owner/repo> · --max <N> (default 3) · --mode vm|control-plane ·
 #        --vm/--zone/--project (vm setup or per-call override) · --endpoint <url> ·
-#        --enroll-token <t> (control-plane setup) · --gh-app-installation-id <id> (connect) ·
+#        --gh-app-installation-id <id> (connect) ·
 #        --api-key (connect: force the api_key cred kind) · --dry-run · --local · -h/--help.
 #        --dry-run everywhere PRINTS the plan (gh+ssh, or the signed POST /rr-task
 #        / /team/cred / /team/install body) and executes nothing (no creds/network needed).
@@ -73,7 +74,7 @@ LIB="$BINDIR/lib"                                   # the shipped cp_auth Ed2551
 CP_ENDPOINT_JSON="$HOME/.heimdall/cp-endpoint.json" # the CP {url, enroll_token} — SAME file heimdall-presence reads.
 # Shipped DEFAULT public-surface URL (lowest precedence — the config/flag/env override it).
 # The CP URL is NOT a secret (a public Cloud Run endpoint), so it is baked in — same default
-# heimdall-presence ships, so a dev needs ZERO url config; only the enroll TOKEN is distributed.
+# heimdall-presence ships, so a dev needs ZERO url config and enrollment is automatic (open-bounded).
 DEFAULT_CP_URL="https://heimdall-cp-public-203927696193.us-central1.run.app"
 
 PY="$(command -v python3 || command -v python || true)"
