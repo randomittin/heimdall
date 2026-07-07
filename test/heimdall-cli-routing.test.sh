@@ -93,10 +93,11 @@ claude_reached()  { grep -q "launch:task" "$TRACE_FILE" 2>/dev/null; }
 
 reset() { : > "$STUB_OUT"; : > "$TRACE_FILE"; }
 
-# Ensure stubs are in place for all three bins under test.
+# Ensure stubs are in place for all bins under test.
 make_stub heimdall-team
 make_stub heimdall-invite
 make_stub heimdall-presence
+make_stub heimdall-connect
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 1. `hmd team new --force` → execs heimdall-team, args forwarded, no fall-through
@@ -226,6 +227,45 @@ else
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
+# 7b. `hmd join <secret>` → execs heimdall-team with `join` PREPENDED, no fall-through
+#     (the third user-facing command; the secret rides argv as the documented entry).
+# ══════════════════════════════════════════════════════════════════════════════
+reset
+run_hmd join "abc123secretsecretsecretsecretsecret"
+
+if stub_called "heimdall-team" && args_contain "join abc123secretsecretsecretsecretsecret"; then
+  ok "join routes to heimdall-team with 'join' prepended + secret forwarded"
+else
+  bad "join routes to heimdall-team with 'join' prepended + secret forwarded"
+  cat "$STUB_OUT" >&2
+fi
+
+if ! claude_reached; then
+  ok "join does NOT fall through to Claude"
+else
+  bad "join MUST NOT reach the Claude fall-through"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 7c. `hmd connect --status` → execs heimdall-connect, args forwarded, no fall-through
+# ══════════════════════════════════════════════════════════════════════════════
+reset
+run_hmd connect --status
+
+if stub_called "heimdall-connect" && args_contain "--status"; then
+  ok "connect routes to heimdall-connect (--status forwarded)"
+else
+  bad "connect routes to heimdall-connect (--status forwarded)"
+  cat "$STUB_OUT" >&2
+fi
+
+if ! claude_reached; then
+  ok "connect does NOT fall through to Claude"
+else
+  bad "connect MUST NOT reach the Claude fall-through"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 8. FALSIFIER — unknown command falls through to Claude launch path
 #    A routed name must NOT reach fall-through; an unknown one MUST.
 # ══════════════════════════════════════════════════════════════════════════════
@@ -239,8 +279,8 @@ else
   cat "$TRACE_FILE" >&2
 fi
 
-if ! stub_called "heimdall-team" && ! stub_called "heimdall-invite" && ! stub_called "heimdall-presence"; then
-  ok "unknown command does NOT route to team/invite/presence stubs (falsifier)"
+if ! stub_called "heimdall-team" && ! stub_called "heimdall-invite" && ! stub_called "heimdall-presence" && ! stub_called "heimdall-connect"; then
+  ok "unknown command does NOT route to team/invite/presence/connect stubs (falsifier)"
 else
   bad "unknown command must NOT be intercepted by any routing stub"
   cat "$STUB_OUT" >&2
