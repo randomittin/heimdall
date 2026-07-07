@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# heimdall-sigil — the `hmd sigil` front door for the deterministic watchman.
+#
+# Thin router to the SHARED sigil core (sentinels/hmd_sigil.py). Every sigil
+# surface — statusline, banner, this CLI, the TUI — renders through that one core,
+# so a render fix lands everywhere at once (the twin-file duplication that let the
+# sigil morph on one surface silently is gone).
+#
+#   hmd sigil --test                 terminal calibration card (detected caps):
+#                                    sigil at 3 sizes + aspect-square + checkerboard.
+#                                    Screenshot this if your sigil looks morphed.
+#   hmd sigil --seed <id> --size M   render a specific identity's sigil
+#   hmd sigil --seed <id> --tier 256 force a capability tier (truecolor|256|16|mono|ascii)
+#
+# The core auto-detects the terminal tier (COLORTERM/TERM/TERM_PROGRAM/$TMUX, plus
+# the HEIMDALL_STATUSLINE_MODE override), so the calibration shows EXACTLY what this
+# terminal will render — never raw truecolor blind on a 256/tmux/16-color terminal.
+set -euo pipefail
+
+self="$0"
+if command -v readlink >/dev/null 2>&1; then
+  self="$(readlink -f "$0" 2>/dev/null || readlink "$0" 2>/dev/null || echo "$0")"
+fi
+BIN_DIR="$(cd "$(dirname "$self")" && pwd)"
+SIGIL_PY="$BIN_DIR/../sentinels/hmd_sigil.py"
+
+if [ ! -f "$SIGIL_PY" ]; then
+  echo "  Error: sigil core not found at $SIGIL_PY" >&2
+  echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+  exit 1
+fi
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "  Error: python3 is required to render the sigil" >&2
+  exit 1
+fi
+
+# Default (no args) → the calibration card, the 2-second "is my terminal ok?" check.
+if [ "$#" -eq 0 ]; then set -- --test; fi
+
+exec python3 "$SIGIL_PY" "$@"
