@@ -107,6 +107,44 @@ _SCOPE_SLUG_MAX = 64
 # keeping the path short. The raw key is NEVER stored — only this hash.
 _KEY_HASH_HEX = 32
 
+# The SANE DEFAULT window (seconds) a cap falls back to when its window is MISSING / None / not a
+# positive number. THE PARTIAL-CONFIG INCIDENT (2026-07-07): a cap LIMIT env was set WITHOUT its
+# _WINDOW partner, so the window reached allow() as None. A None/str window must NEVER make the
+# cap TypeError OPEN (an unenforced abuse gate) nor silently degrade to the 1s divide-by-zero
+# backstop (a wrongly-tight ~1s window). It resolves to THIS conservative minute-window instead —
+# a limit set without a window still BOUNDS at a sensible rate. 60s mirrors the per-IP / per-token
+# / rr-dispatch defaults every caller (_int_env / _xxx_window) already uses.
+_DEFAULT_WINDOW = 60
+
+
+def _coerce_int(value):
+    """Coerce a config value to an int, or None when it cannot be one. Accepts a real int/float
+    (a bool is REJECTED — True/False is never a meaningful limit/window) and a numeric STRING
+    (an un-coerced env value handed straight in, e.g. "100"); anything else -> None. This is the
+    guard that makes a limit/window ROBUST AT THE LIMITER boundary regardless of how the caller
+    parsed the env: a numeric string ENFORCES (coerced) instead of fail-closed-refusing every
+    call, and a non-numeric value degrades to the documented safe default rather than TypeError-ing
+    the cap open. No exception ever escapes (a bad value is a None, never a raise)."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_window(window):
+    """The EFFECTIVE window (a positive int) for a cap: coerce str->int, and fall back to the
+    SANE DEFAULT (_DEFAULT_WINDOW) when the window is None / missing / non-numeric / non-positive.
+    So a limit set WITHOUT its _WINDOW partner (window=None) never TypeErrors the cap open and
+    never degrades to the ~1s divide-safety clamp — it bounds at a sensible minute window."""
+    win = _coerce_int(window)
+    if win is None or win <= 0:
+        return _DEFAULT_WINDOW
+    return win
+
 
 def _scope_slug(scope):
     """A filesystem-safe, bounded slug for the SCOPE path segment. Keeps [A-Za-z0-9._-] and
@@ -195,14 +233,25 @@ class RateLimiter:
         lock out a legit dev on a transient store hiccup. This is bounded (an absent counter
         reads as 0 = allow; a failed increment still allows); the registry-growth ceiling
         (enroll_budget_ok) is the backstop on the worst case. A non-positive `limit` refuses
-        immediately (a zero quota is a hard closed gate, by intent)."""
+        immediately (a zero quota is a hard closed gate, by intent).
+
+        PARTIAL-CONFIG SAFE (the 2026-07-07 incident). `limit` and `window` are COERCED at the
+        boundary (_coerce_int / _coerce_window) BEFORE any arithmetic, so a cap set as an env
+        LIMIT without its _WINDOW partner (window=None), or an un-coerced numeric STRING handed
+        straight in ("100"), can NEVER TypeError the cap open nor fail-closed-refuse every call:
+        a missing/bad window resolves to the sane _DEFAULT_WINDOW, and a numeric-string limit
+        enforces (coerced). Only a genuinely non-numeric / non-positive limit is the hard-closed
+        gate (by intent)."""
         when = now if now is not None else _now()
-        if not isinstance(limit, (int, float)) or limit <= 0:
-            # A zero/negative quota is an explicit hard-closed gate (e.g. a kill switch). It is
-            # NOT a backend error, so it does NOT fail open — refuse with a full-window retry.
-            return (False, _retry_after(when, window))
+        win = _coerce_window(window)          # None/str/bad -> sane default; never TypeErrors below.
+        lim = _coerce_int(limit)              # numeric string coerces; non-numeric -> None (closed).
+        if lim is None or lim <= 0:
+            # A zero/negative/uncoercible quota is an explicit hard-closed gate (e.g. a kill
+            # switch, or a genuinely malformed limit). It is NOT a backend error, so it does NOT
+            # fail open — refuse with a full-window retry (computed on the coerced window).
+            return (False, _retry_after(when, win))
         try:
-            bucket = _bucket(when, window)
+            bucket = _bucket(when, win)
             rel = self._bucket_rel(scope, key, bucket)
             record = self._backend.get_record(rel)
             count = 0
@@ -210,10 +259,10 @@ class RateLimiter:
                 raw = record.get(_FIELD_COUNT)
                 if isinstance(raw, int) and raw >= 0:
                     count = raw
-            if count >= limit:
+            if count >= lim:
                 # Quota exhausted for this window — refuse WITHOUT incrementing (a refused
                 # request does not consume more budget) and report when the window refreshes.
-                return (False, _retry_after(when, window))
+                return (False, _retry_after(when, win))
             # Within quota: consume one unit. A failed write fails OPEN (still allow) — the
             # store is tolerant (put_record -> False on error) and we never lock out a dev.
             self._backend.put_record(rel, {_FIELD_COUNT: count + 1})
