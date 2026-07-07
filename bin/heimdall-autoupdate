@@ -26,6 +26,11 @@
 #                                  A read-only inspection — never applies.
 #
 # SAFETY CONTRACT.
+#   * SIGNATURE-GATED apply: the downloaded install.sh is APPLIED only after its detached
+#     minisign signature verifies against the IN-REPO public key (release/heimdall-signing.pub)
+#     via bin/lib/heimdall-verify.sh. Missing verifier, missing/invalid/mismatched signature,
+#     or a download failure ⇒ REFUSE + stay on current (fail-closed, loud). An unsigned or
+#     tampered release can never reach `bash`. See SIGNING.md for the trust model + key rotation.
 #   * NEVER blocks SessionStart: short network timeouts (~5s), the apply is detached.
 #   * Offline / API-fail / parse-fail = SILENT no-op, exit 0. Offline is normal, not an error.
 #   * Never partially applies (install.sh is the atomic unit); never downgrades; never
@@ -37,8 +42,14 @@
 #   HEIMDALL_NO_AUTOUPDATE=1        opt out (also: ${HOME}/.heimdall/no-autoupdate file).
 #   HEIMDALL_UPDATE_INTERVAL=86400  throttle window in seconds (default 24h).
 #   HEIMDALL_LATEST_OVERRIDE=X.Y.Z  TEST seam: inject the "latest" version, skip the network.
-#   HEIMDALL_AUTOUPDATE_DRYRUN=1    TEST seam: resolve + decide, but DON'T detach the installer
-#                                   (logs "would-apply" instead). Never used in production.
+#   HEIMDALL_AUTOUPDATE_DRYRUN=1    TEST seam: resolve + decide, but DON'T fetch/verify/detach
+#                                   (logs "would-apply"). Decide-only. Never used in production.
+#   HEIMDALL_SIGNING_PUBKEY=PATH    override the trust-root public key (default in-repo
+#                                   release/heimdall-signing.pub). Rotation / test seam.
+#   HEIMDALL_INSTALL_ARTIFACT=PATH  TEST seam: verify a LOCAL install.sh (skip the download).
+#   HEIMDALL_INSTALL_SIG=PATH       TEST seam: the LOCAL detached signature to verify against.
+#   HEIMDALL_VERIFY_ONLY=1          TEST seam: fetch/verify + decide, print "verified <v>",
+#                                   but do NOT execute the installer.
 #   HEIMDALL_HOME                   state home (stamp + log + opt-out file). Default ~/.heimdall.
 
 set -uo pipefail
@@ -214,30 +225,94 @@ opted_out() {
   return 1
 }
 
-# ── apply (the atomic, detached, NEXT-session upgrade) ──────────────────────────
-# Re-run the LATEST tag's idempotent installer DETACHED so it never blocks SessionStart.
-# install.sh updates the on-disk plugin for the NEXT session; the current process is
-# untouched. The DRYRUN seam stops short of detaching (for the test) and logs would-apply.
+# A loud, user-facing refusal (stderr) so a blocked upgrade is never silent. SessionStart
+# surfaces this line; the same fact is also written to the secret-free autoupdate.log.
+_refuse_msg() {
+  local latest="$1" reason="$2"
+  printf 'heimdall: refusing auto-update to v%s — %s.\n' "$latest" "$reason" >&2
+  printf 'heimdall: staying on the current, verified version (see SIGNING.md).\n' >&2
+}
+
+# ── apply (the atomic, detached, NEXT-session upgrade — SIGNATURE-GATED) ─────────
+# Re-run the LATEST tag's idempotent installer DETACHED so it never blocks SessionStart —
+# but ONLY after its install.sh signature verifies against the IN-REPO public key. This is
+# the security boundary: a compromised release channel that swaps install.sh, or a release
+# with no signature at all, is REFUSED and the client stays on its current, trusted version.
+#
+# Trust root = the LOCAL, already-installed release/heimdall-signing.pub (never a key fetched
+# beside the artifact — that would let an attacker ship their own key). Fail-closed: missing
+# verifier lib, missing/invalid/mismatched signature, or a download failure all REFUSE.
+#
+# The DRYRUN seam (decide-only, never used in production) stops short of BOTH verify and
+# detach and logs would-apply — it exists purely so the offline autoupdate test can read the
+# semver/opt-out/throttle DECISION without a network fetch or a real key.
 apply_update() {
   local latest="$1"
   local ref="v${latest}"
   local url="${INSTALL_RAW_BASE}/${ref}/install.sh"
+  local sig_url="https://github.com/${REPO_SLUG}/releases/download/${ref}/install.sh.minisig"
+  local pubkey="${HEIMDALL_SIGNING_PUBKEY:-$PLUGIN_DIR/release/heimdall-signing.pub}"
 
-  if [ "${HEIMDALL_AUTOUPDATE_DRYRUN:-0}" = "1" ]; then
+  # Decide-only seam: no fetch, no verify, no exec (the autoupdate decision test).
+  if [ "${HEIMDALL_AUTOUPDATE_DRYRUN:-0}" = "1" ] && [ "${HEIMDALL_VERIFY_ONLY:-0}" != "1" ]; then
     log_line "would-apply $latest via $url (dryrun)"
     return 0
   fi
 
-  command -v curl >/dev/null 2>&1 || { log_line "apply-skip $latest no-curl"; return 0; }
+  # Load the verifier library. It is the trust boundary — if it is absent we CANNOT verify,
+  # so we refuse rather than apply unverified code.
+  local verlib="$SELF_DIR/lib/heimdall-verify.sh"
+  if [ ! -f "$verlib" ]; then
+    log_line "refuse $latest verify-lib-missing ($verlib) — staying on current"
+    _refuse_msg "$latest" "the signature-verification library is missing"
+    return 0
+  fi
+  # shellcheck source=/dev/null
+  . "$verlib" || { log_line "refuse $latest verify-lib-unloadable — staying on current"; _refuse_msg "$latest" "the signature verifier could not load"; return 0; }
 
-  log_line "apply $latest (background, next session) via $ref"
-  # Detached + fully backgrounded: the installer's stdout/stderr go to the log, it runs
-  # in its own session (setsid when available) so it survives this process exiting and
-  # never holds SessionStart open. NO auth header — the install.sh fetch is public.
+  # Acquire the artifact + its detached signature. TEST seam: caller supplies local paths
+  # (HEIMDALL_INSTALL_ARTIFACT / HEIMDALL_INSTALL_SIG) → no network.
+  local artifact="${HEIMDALL_INSTALL_ARTIFACT:-}" sig="${HEIMDALL_INSTALL_SIG:-}" workdir=""
+  if [ -z "$artifact" ]; then
+    command -v curl >/dev/null 2>&1 || { log_line "apply-skip $latest no-curl"; return 0; }
+    workdir="$(mktemp -d "${TMPDIR:-/tmp}/heimdall-apply.XXXXXX" 2>/dev/null)" \
+      || { log_line "apply-skip $latest no-tmp"; return 0; }
+    artifact="$workdir/install.sh"; sig="$workdir/install.sh.minisig"
+    if ! curl -fsSL --max-time 30 "$url" -o "$artifact" 2>/dev/null; then
+      rm -rf "$workdir"; log_line "refuse $latest download-failed ($url) — staying on current"
+      _refuse_msg "$latest" "the release artifact could not be downloaded"; return 0
+    fi
+    # A missing signature asset is NOT a download error — it just fails verification below
+    # (fail-closed: an unsigned release is refused, never applied).
+    curl -fsSL --max-time 15 "$sig_url" -o "$sig" 2>/dev/null || true
+  fi
+
+  heimdall_verify_release "$artifact" "$sig" "$pubkey"
+  local vrc=$?
+  if [ "$vrc" -ne 0 ]; then
+    local reason; reason="$(heimdall_verify_reason "$vrc")"
+    log_line "refuse $latest signature rc=$vrc ($reason) — staying on current"
+    _refuse_msg "$latest" "$reason"
+    [ -n "$workdir" ] && rm -rf "$workdir"
+    return 0
+  fi
+  log_line "verified $latest signature ok (pubkey $pubkey)"
+
+  # Verify-only seam: prove the decision without executing anything (the signing test).
+  if [ "${HEIMDALL_VERIFY_ONLY:-0}" = "1" ]; then
+    printf 'verified %s\n' "$latest"
+    [ -n "$workdir" ] && rm -rf "$workdir"
+    return 0
+  fi
+
+  log_line "apply $latest (background, next session) verified via $ref"
+  # Execute the EXACT bytes we verified (verify-then-run-same-file — no TOCTOU re-fetch).
+  # Detached + fully backgrounded via setsid so it survives this process exiting and never
+  # holds SessionStart open; the workdir is removed after the installer finishes.
   if command -v setsid >/dev/null 2>&1; then
-    setsid bash -c "curl -fsSL '$url' | bash >>'$LOG_FILE' 2>&1" >/dev/null 2>&1 &
+    setsid bash -c "bash '$artifact' >>'$LOG_FILE' 2>&1; rm -rf '$workdir' 2>/dev/null" >/dev/null 2>&1 &
   else
-    ( curl -fsSL "$url" | bash >>"$LOG_FILE" 2>&1 ) >/dev/null 2>&1 &
+    ( bash "$artifact" >>"$LOG_FILE" 2>&1; rm -rf "$workdir" 2>/dev/null ) >/dev/null 2>&1 &
   fi
   disown 2>/dev/null || true
 }
