@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# heimdall-funnel — the Δ6 LAUNCH FUNNEL control + emit CLI. The thin bash front
+# over bin/lib/funnel.py, routed by `hmd funnel` (the `funnel)` case in bin/heimdall).
+# Mirrors bin/heimdall-telemetry-corpus: a wrapper that hands the whole argv to the
+# python engine's CLI core.
+#
+#   hmd funnel                       the local funnel view (per-stage counts)
+#   hmd funnel counts [--json]       same, JSON with --json
+#   hmd funnel status [--json]       alias of counts
+#   hmd funnel purge                 clear the local funnel spool
+#
+# Internal (called by the growth-loop surfaces, not by users):
+#   hmd funnel emit <stage>          record install|init|invite_sent|join|badge_added
+#                                    [--team-id ID] [--context TOK]
+#
+# The privacy line is the corpus #4 line, REUSED verbatim by the engine: OFF fully
+# honored (off => zero emit), ZERO-CONTENT (a planted path/source line is BLOCKED +
+# ALARMED, never written), SECRET-SCAN-before-send. NOTHING sends anywhere — the
+# ndjson spool under ~/.heimdall/telemetry/funnel/ IS the local record. No CP route.
+#
+# Exit status:
+#   0  view / counts / status / purge / emit (emit never gates its caller).
+#   2  usage error (unknown subcommand / python absent / engine missing).
+
+set -uo pipefail
+
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+BINDIR="$(dirname "$SELF")"
+FUNNEL_LIB="$BINDIR/lib/funnel.py"
+
+usage() { sed -n '2,26p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+PY="$(command -v python3 || command -v python || true)"
+if [ -z "$PY" ]; then
+  case "${1:-}" in
+    emit) echo '{"emitted": false, "reason": "python absent"}'; exit 0 ;;
+    *) echo "error: python3 not found (required for hmd funnel)" >&2; exit 2 ;;
+  esac
+fi
+
+[ -f "$FUNNEL_LIB" ] || {
+  case "${1:-}" in
+    emit) echo '{"emitted": false, "reason": "funnel engine absent"}'; exit 0 ;;
+    *) echo "error: funnel engine not found: $FUNNEL_LIB" >&2; exit 2 ;;
+  esac
+}
+
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+esac
+
+# Default (no args) → the local funnel view.
+[ $# -ge 1 ] || set -- counts
+
+# Resolve a coded hmd version for the engine's env class (git tag → manifest → v).
+# Single token, never a path/secret — the engine's zero-content guard still checks.
+if [ -z "${HEIMDALL_HMD_VERSION:-}" ]; then
+  _mf="$BINDIR/../.claude-plugin/plugin.json"
+  if command -v git >/dev/null 2>&1 && git -C "$BINDIR" rev-parse --git-dir >/dev/null 2>&1; then
+    _v="$(git -C "$BINDIR" describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null || true)"
+  fi
+  if [ -z "${_v:-}" ] && [ -f "$_mf" ]; then
+    _v="v$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$_mf" 2>/dev/null | head -1)"
+  fi
+  [ -n "${_v:-}" ] && export HEIMDALL_HMD_VERSION="$_v"
+fi
+
+exec "$PY" "$FUNNEL_LIB" "$@"

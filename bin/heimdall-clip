@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+# heimdall-clip — export a GATE / WALL moment as a shareable card. The screenshot-
+# ready artifact behind the viral loop: a clean, sigil-stamped card carrying the
+# runheimdall.dev tag that a user drops into a PR, a chat, or a tweet.
+#
+#   hmd clip --last     the last gate verdict as a card (PASS / DENY moment)
+#   hmd clip --wall     the proven-merge wall (roster + how many the watchman proved)
+#   hmd clip --json     the same moment as structured JSON
+#   hmd clip --svg      an SVG card (redirect to a file); pairs with --last / --wall
+#
+# It reads ONLY the local verdict/receipt store the universal git core writes:
+#   <repo>/.heimdall/verdict.json          (last gate result — hmd verdict's source)
+#   <repo>/.heimdall/receipts/beats.log    (per-commit pass/deny beats — the wall)
+# No network, no model call. Every card carries the sigil (🛡) + the runheimdall.dev
+# tag by construction, so the backlink travels with every share.
+#
+# Usage:
+#   hmd clip [--last|--wall] [--svg|--json]
+#   -h | --help
+#
+# Exit: 0 always (an unwritten verdict store is not an error — it renders an
+# "initialise me" card rather than failing).
+set -uo pipefail
+
+TAG="runheimdall.dev"
+SIGIL="🛡"
+WORDMARK="HEIMDALL"
+
+usage() { sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; }
+
+KIND="last"; OUT="card"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --last)  KIND="last"; shift ;;
+    --wall)  KIND="wall"; shift ;;
+    --json)  OUT="json"; shift ;;
+    --svg)   OUT="svg"; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "heimdall-clip: unexpected argument: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+REPO="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+VFILE="$REPO/.heimdall/verdict.json"
+BEATS="$REPO/.heimdall/receipts/beats.log"
+
+# read a single scalar field from verdict.json (jq when present, sed fallback) —
+# same reader shape as bin/heimdall-verdict, kept dependency-free.
+HAVE_JQ=0; command -v jq >/dev/null 2>&1 && HAVE_JQ=1
+read_field() {
+  local key="$1"
+  [ -f "$VFILE" ] || { printf ''; return 0; }
+  if [ "$HAVE_JQ" = 1 ]; then
+    jq -r --arg k "$key" '.[$k] // empty | if type=="array" then join("; ") else tostring end' "$VFILE" 2>/dev/null || printf ''
+  else
+    sed -n "s/.*\"$key\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$VFILE" 2>/dev/null | head -1
+  fi
+}
+
+# proven-merge count from the beats spool (a `pass` verdict per gated commit).
+proven_count() {
+  local n=0
+  [ -f "$BEATS" ] && n="$(awk -F'\t' '$2=="pass"{c++} END{print c+0}' "$BEATS" 2>/dev/null || echo 0)"
+  printf '%s' "${n:-0}"
+}
+
+V="$(read_field verdict)"; PH="$(read_field phase)"; TS="$(read_field ts)"
+G="$(read_field gate)"; F="$(read_field file)"; RS="$(read_field reasons)"
+COUNT="$(proven_count)"
+
+# verdict glyph + word (falls back to an initialise prompt when no verdict yet).
+verdict_line() {
+  case "$V" in
+    pass) printf '✓ PASS' ;;
+    deny) printf '🛑 DENY' ;;
+    *)    printf 'watchman ready' ;;
+  esac
+}
+
+# ── ANSI card (default) ───────────────────────────────────────────────────────
+COLOR=0; [ -t 1 ] && COLOR=1
+c_dim=""; c_cyan=""; c_grn=""; c_red=""; c_rst=""
+if [ "$COLOR" = 1 ]; then
+  c_dim='\033[2m'; c_cyan='\033[38;2;0;212;255m'
+  c_grn='\033[1;32m'; c_red='\033[1;31m'; c_rst='\033[0m'
+fi
+
+card_last() {
+  printf '\n'
+  printf "  ${c_cyan}%s  %s${c_rst}\n" "$SIGIL" "$WORDMARK"
+  local vl; vl="$(verdict_line)"
+  case "$V" in
+    pass) printf "  ${c_grn}%s${c_rst}  ${c_dim}%s · %s${c_rst}\n" "$vl" "${PH:-gate}" "${TS:-now}" ;;
+    deny) printf "  ${c_red}%s${c_rst}  ${c_dim}%s · %s${c_rst}\n" "$vl" "${PH:-gate}" "${TS:-now}"
+          [ -n "$G" ]  && printf "  ${c_dim}gate:${c_rst} %s\n" "$G"
+          [ -n "$RS" ] && printf "  ${c_dim}why:${c_rst}  %s\n" "$RS" ;;
+    *)    printf "  ${c_dim}%s — run `hmd init` then commit to prove one.${c_rst}\n" "$vl" ;;
+  esac
+  [ -n "$F" ] && printf "  ${c_dim}file:${c_rst} %s\n" "$F"
+  printf "  ${c_cyan}%s${c_rst}\n\n" "$TAG"
+}
+
+card_wall() {
+  printf '\n'
+  printf "  ${c_cyan}%s  %s — proven wall${c_rst}\n" "$SIGIL" "$WORDMARK"
+  printf "  ${c_grn}%s${c_rst} ${c_dim}merges proven by the watchman${c_rst}\n" "$COUNT"
+  local vl; vl="$(verdict_line)"
+  printf "  ${c_dim}last:${c_rst} %s ${c_dim}(%s)${c_rst}\n" "$vl" "${PH:-gate}"
+  # Best-effort team roster (offline => silent skip; never blocks the card).
+  local PRES="$(cd "$(dirname "$0")" && pwd)/heimdall-presence"
+  if [ -x "$PRES" ]; then
+    local roster; roster="$("$PRES" roster 2>/dev/null | head -6 || true)"
+    if [ -n "$roster" ]; then
+      printf '%s\n' "$roster" | while IFS= read -r rl; do
+        [ -n "$rl" ] && printf "  ${c_dim}%s${c_rst}\n" "$rl"
+      done
+    fi
+  fi
+  printf "  ${c_cyan}%s${c_rst}\n\n" "$TAG"
+}
+
+# ── SVG card ──────────────────────────────────────────────────────────────────
+svg_card() {
+  local title body
+  if [ "$KIND" = "wall" ]; then
+    title="$SIGIL $WORDMARK — proven wall"
+    body="$COUNT merges proven by the watchman"
+  else
+    title="$SIGIL $WORDMARK"
+    body="$(verdict_line)  ·  ${PH:-gate}"
+  fi
+  cat <<SVG
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="440" height="140" role="img" aria-label="$title">
+  <!-- Heimdall share card. Tag: $TAG -->
+  <title>$title</title>
+  <a xlink:href="https://$TAG" target="_blank" rel="noopener">
+    <rect width="440" height="140" rx="10" fill="#0d1117"/>
+    <rect x="0" y="0" width="440" height="140" rx="10" fill="none" stroke="#0d98ba" stroke-width="2"/>
+    <text x="24" y="46" font-family="Verdana,DejaVu Sans,sans-serif" font-size="22" fill="#e6edf3">$title</text>
+    <text x="24" y="86" font-family="Verdana,DejaVu Sans,sans-serif" font-size="18" fill="#7ee787">$body</text>
+    <text x="24" y="120" font-family="Verdana,DejaVu Sans,sans-serif" font-size="14" fill="#00d4ff">$TAG</text>
+  </a>
+</svg>
+SVG
+}
+
+# ── JSON ──────────────────────────────────────────────────────────────────────
+json_card() {
+  printf '{"schema":"clip_v1","kind":"%s","sigil":"%s","tag":"%s","verdict":"%s","phase":"%s","ts":"%s","file":"%s","gate":"%s","proven_count":%s}\n' \
+    "$KIND" "$SIGIL" "$TAG" "${V:-}" "${PH:-}" "${TS:-}" "${F:-}" "${G:-}" "${COUNT:-0}"
+}
+
+case "$OUT" in
+  json) json_card ;;
+  svg)  svg_card ;;
+  card) [ "$KIND" = "wall" ] && card_wall || card_last ;;
+esac
+exit 0

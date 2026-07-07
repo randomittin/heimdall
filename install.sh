@@ -1079,6 +1079,13 @@ main() {
   esac
   printf '   %sdone in %ss%s\n' "$C_DIM" "$ELAPSED" "$C_RESET"
   blank
+
+  # ── Δ6 funnel: record the `install` growth-loop stage — the very top of the
+  #    funnel. Client-side into the shared telemetry spool, consent-gated + zero-
+  #    content (no CP route, no model call). Fire-and-forget: never blocks or fails
+  #    the install, and the engine no-ops when consent is off.
+  local FUNNEL_BIN="$PLUGIN_DIR/bin/heimdall-funnel"
+  [ -x "$FUNNEL_BIN" ] && ( "$FUNNEL_BIN" emit install --context installer >/dev/null 2>&1 & ) || true
 }
 
 main "$@"
