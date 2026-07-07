@@ -163,7 +163,7 @@ note "would pin a stale boundary, so the gated image must come from current main
 # and the build-time import guard must be in the source about to be built.
 note "current-main source guards (must be present before a rebuild is meaningful):"
 GUARD_OK=1
-grep -q "return cp_state_firestore.FirestoreBackend()" "${REPO_ROOT}/bin/lib/cp_state.py" 2>/dev/null \
+grep -qE "return cp_state_firestore\.FirestoreBackend\(" "${REPO_ROOT}/bin/lib/cp_state.py" 2>/dev/null \
   && note "  ok  cp_state.py firestore branch returns FirestoreBackend()" \
   || { warn "  cp_state.py firestore branch missing FirestoreBackend() return"; GUARD_OK=0; }
 grep -q "google-cloud-firestore" "${REPO_ROOT}/Dockerfile" 2>/dev/null \
