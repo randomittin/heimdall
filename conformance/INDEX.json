@@ -243,7 +243,7 @@
       "rationale": "these artifacts are WRITTEN by a live orchestrator/planner run (model-gated) or at install time. No deterministic, model-free producer to drive in a fixture. detected-stack.json is the one such artifact with a model-free producer (stack-pack), and IS fixtured."
     },
     {
-      "row": "Slash commands /hmd:level/status/maintain/maintain-check/reflect (renamed) + net-new save/autocommit/bench/debloat/demo/designmatch/report-bug",
+      "row": "Slash commands /hmd:autonomy (was /hmd:level, kept as deprecated alias)/status/maintain/maintain-check/reflect (renamed) + net-new save/autocommit/bench/debloat/demo/designmatch/report-bug",
       "class": "slash",
       "observable": false,
       "rationale": "slash commands are markdown specs the model executes; behavior is model-gated. Their namespace resolution (frontmatter name -> /hmd:<name>) IS asserted statically by audits/agents-resolve."

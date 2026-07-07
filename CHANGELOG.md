@@ -5,6 +5,14 @@ All notable changes to superx will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- **`/level` renamed to `/autonomy`** — the command that controls how much the agent does before asking is now `/hmd:autonomy` (with `/hmd:autonomy +` / `-` to cycle and `/hmd:autonomy <1|2|3>` to set). "Autonomy" names what it actually controls. Levels, semantics, and the on-disk config key (`.project.autonomy_level`) are unchanged — no existing user's saved setting resets on upgrade.
+
+### Deprecated
+- **`/hmd:level`** is kept as a deprecated alias for one release. It still works and prints a one-line "'/hmd:level' is now '/hmd:autonomy'" notice. It will be removed a couple of releases later.
+
 ## [1.1.0] - 2026-04-19
 
 superx can now run **10 agents in parallel** instead of 3 — background agents bypass Claude Code's per-turn limit, so a 10-task wave all runs simultaneously.
