@@ -405,6 +405,74 @@ PYEOF
   && ok "G cp_ratelimit.py NEVER calls backend.path() (every op is get/put — firestore-safe)" \
   || bad "G cp_ratelimit.py has $PATH_CALLS real .path() call(s) — FirestoreBackend.path() RAISES on a serving path"
 
+# ──────────────────────────────────────────────────────────────────────────────
+# H. PARTIAL-CONFIG SAFETY — a LIMIT set WITHOUT its WINDOW partner (the prod incident: a cap
+#    env was set but the *_WINDOW var was NOT). The limiter MUST default the window safely and
+#    ENFORCE the cap — never TypeError the cap OPEN, never fail-closed-refuse a numeric-string
+#    limit. Three falsifiable proofs: (H1) window=None enforces AND the refusal's retry_after
+#    reflects the SANE DEFAULT window (not a 1s degrade); (H2) a numeric-STRING limit/window
+#    coerces and enforces (the FIRST call PASSES — pre-fix a str limit fail-closed-refused the
+#    first call); (H3) enroll_budget_ok with a missing window still enforces (no TypeError).
+# ──────────────────────────────────────────────────────────────────────────────
+echo
+echo "H. partial-config safety (a LIMIT with a MISSING/str WINDOW enforces, never TypeErrors open)"
+PART_OUT="$(env HEIMDALL_STATE_BACKEND=local HEIMDALL_HOME="$LOCAL_HOME" LOCAL_HOME="$LOCAL_HOME" \
+  "$PY" - <<'PYEOF' 2>"$EXT/part.err"
+import json, os, sys
+sys.path.insert(0, os.environ["LIB"])
+import cp_ratelimit as R
+home = os.environ["LOCAL_HOME"]
+out = {}
+
+# H1. A LIMIT set WITHOUT its WINDOW — window resolves to None. The cap must STILL enforce
+#     (first `limit` pass, (limit+1)th refused) with NO exception, and the retry_after must
+#     reflect the SANE DEFAULT window (>= 2s), proving it is not the old 1s divide-safety clamp.
+rl = R.RateLimiter(home=home)
+seq = [rl.allow("rr_dispatch", "team-none-window", now=1000.0, limit=3, window=None)
+       for _ in range(4)]
+out["H1_first3_ok"] = [s[0] for s in seq[:3]]      # expect [True, True, True]
+out["H1_4th_ok"] = seq[3][0]                        # expect False (enforced, not opened)
+out["H1_4th_retry_after"] = seq[3][1]               # expect >= 2 (the sane default window)
+
+# H2. A numeric-STRING limit AND window (an un-coerced env value handed straight in). The
+#     limiter must COERCE str->int and ENFORCE — the FIRST call must PASS (pre-fix a str limit
+#     hit `not isinstance(limit,(int,float))` and fail-CLOSED-refused every call, incl. the 1st).
+rl2 = R.RateLimiter(home=home)
+seq2 = [rl2.allow("rr_dispatch", "team-str-cfg", now=2000.0, limit="3", window="10")
+        for _ in range(4)]
+out["H2_first_ok"] = seq2[0][0]                     # expect True (str limit coerced, not refused)
+out["H2_first3_ok"] = [s[0] for s in seq2[:3]]      # expect [True, True, True]
+out["H2_4th_ok"] = seq2[3][0]                        # expect False (coerced cap still enforces)
+
+# H3. enroll_budget_ok with a MISSING window (None) still enforces its ceiling (no TypeError).
+budget = [rl2.enroll_budget_ok(now=3000.0, max_new=2, window=None) for _ in range(3)]
+out["H3_budget"] = budget                           # expect [True, True, False]
+
+print(json.dumps(out))
+PYEOF
+)"
+if [ -s "$EXT/part.err" ]; then
+  bad "H partial-config raised on stderr (a TypeError leaked — the cap opened): $(cat "$EXT/part.err")"
+fi
+pget() { printf '%s' "$PART_OUT" | "$PY" -c "import json,sys;print(json.load(sys.stdin)$1)" 2>/dev/null; }
+
+[ "$(pget "['H1_first3_ok']")" = "[True, True, True]" ] && [ "$(pget "['H1_4th_ok']")" = "False" ] \
+  && ok "H1 a LIMIT with a MISSING window ENFORCES (first 3 pass, 4th refused) — no TypeError, cap not opened" \
+  || bad "H1 a missing-window cap did not enforce (out=$PART_OUT)"
+H1RA="$(pget "['H1_4th_retry_after']")"
+{ [ -n "$H1RA" ] && [ "$H1RA" -ge 2 ] 2>/dev/null; } \
+  && ok "H1 the refusal's retry_after reflects the SANE DEFAULT window (got ${H1RA}s, not the 1s divide-safety degrade)" \
+  || bad "H1 retry_after did not reflect a sane default window (got '$H1RA' — a missing window degraded to ~1s)"
+[ "$(pget "['H2_first_ok']")" = "True" ] \
+  && ok "H2 FALSIFIABLE: a numeric-STRING limit COERCES and the FIRST call PASSES (pre-fix a str limit fail-closed-refused every call)" \
+  || bad "H2 a numeric-string limit did not coerce — the first call was refused (fail-closed) (out=$PART_OUT)"
+[ "$(pget "['H2_first3_ok']")" = "[True, True, True]" ] && [ "$(pget "['H2_4th_ok']")" = "False" ] \
+  && ok "H2 a str limit/window coerces AND still enforces the cap (first 3 pass, 4th refused)" \
+  || bad "H2 a str-config cap did not enforce correctly (out=$PART_OUT)"
+[ "$(pget "['H3_budget']")" = "[True, True, False]" ] \
+  && ok "H3 enroll_budget_ok with a MISSING window still enforces its ceiling (no TypeError)" \
+  || bad "H3 the enroll-budget ceiling broke under a missing window (out=$PART_OUT)"
+
 echo
 echo "============================================================"
 printf "cp-ratelimit (%s): %d passed, %d failed\n" "$MODE" "$PASS" "$FAIL"
