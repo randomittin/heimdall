@@ -22,6 +22,7 @@ static wall+feed dump when Textual is absent.
 """
 
 import os
+import re
 import sys
 import json
 import time
@@ -187,20 +188,52 @@ def read_feed(root, limit=200):
     return events[:limit]
 
 
-def read_receipt(event):
+def _confined_realpath(candidate, base):
+    """Return the resolved candidate ONLY if it lies within `base` (an allowlisted
+    directory), else None. This is the path-traversal gate for INSPECTOR reads: a
+    feed item's receipt_path is UNTRUSTED, so an absolute escape (/etc/passwd), a
+    `..` traversal (../../etc/passwd), or a symlink pointing outside the base must
+    NOT be opened. We realpath both sides (which collapses `..` AND resolves
+    symlinks) and require the candidate to sit strictly under base + os.sep. A
+    relative candidate is resolved against base; an absolute candidate that still
+    lands inside base (e.g. the beat cadence writes absolute receipt paths under
+    .heimdall/) is allowed — containment, not the abs/rel distinction, is the gate."""
+    if not candidate or not isinstance(candidate, str):
+        return None
+    base_real = os.path.realpath(base)
+    if os.path.isabs(candidate):
+        cand = candidate
+    else:
+        cand = os.path.join(base_real, candidate)
+    cand_real = os.path.realpath(cand)
+    if cand_real == base_real:
+        return None  # the base dir itself is not a receipt file
+    if cand_real.startswith(base_real + os.sep):
+        return cand_real
+    return None
+
+
+def read_receipt(event, root=None):
     """The INSPECTOR target for a feed item: the local report.json it points at.
     Falls back to an inline receipt or the event's own fields. Local read only;
-    scoped to a Heimdall artifact (a report), never a general file browser."""
+    scoped to a Heimdall artifact (a report) under <root>/.heimdall — NEVER a
+    general file browser. The receipt_path comes from an UNTRUSTED feed item, so
+    it is confined to the .heimdall base (_confined_realpath): a crafted absolute
+    path, `..` traversal, or symlink escape is refused before any open()."""
     if not event:
         return {}
+    if root is None:
+        root = resolve_root(os.environ)
+    base = _heimdall_dir(root)
     rp = event.get("receipt_path")
-    if rp and os.path.exists(rp):
+    safe = _confined_realpath(rp, base) if rp else None
+    if safe and os.path.exists(safe):
         try:
-            with open(rp, "r") as f:
+            with open(safe, "r") as f:
                 return json.load(f)
         except Exception:
             return {"ref": event.get("ref"), "verdict": event.get("verdict"),
-                    "reason_text": "receipt unreadable: %s" % rp}
+                    "reason_text": "receipt unreadable: %s" % safe}
     if isinstance(event.get("receipt"), dict):
         return event["receipt"]
     return {
@@ -212,22 +245,48 @@ def read_receipt(event):
 
 
 # ── shell-out table (renderer over existing plumbing) ────────────────────────
+# A ref/id is a data-derived value (from the feed/roster) that becomes a CLI
+# POSITIONAL. It must match the strict charset the system actually issues — hex
+# gate refs (a3f1b2), haid handles (haid:rj-a3f9), dotted/slashed paths — so a
+# crafted value can never smuggle a shell metachar or whitespace into an argv slot.
+_REF_RE = re.compile(r"^[A-Za-z0-9._:/-]+$")
+
+
+def _safe_ref(ref):
+    """Allowlist a data-derived ref before it reaches a CLI. Returns the trimmed
+    ref if it matches the issued-id charset, else None (reject). Note a value like
+    `--foo` passes the charset (hyphens are legal in refs) but is still rendered as
+    a POSITIONAL after a `--` terminator by build_shell_argv, so it can never be
+    read as a flag; values with spaces / `;` / `$` / backticks are rejected here."""
+    if not isinstance(ref, str):
+        return None
+    ref = ref.strip()
+    if not ref or not _REF_RE.match(ref):
+        return None
+    return ref
+
+
 def build_shell_argv(action, hmd_bin, event=None):
-    """Build the argv that SHELLS the existing CLI for an owner action. The TUI
+    """Build the argv that SHELLS the existing CLI for an owner action. ALWAYS an
+    argv LIST (the caller runs it with shell=False — never a shell string). The TUI
     never reimplements the logic — it execs `hmd <cmd> ...`. Returns [] for an
-    unknown action so the caller can no-op cleanly."""
-    ref = (event or {}).get("ref", "") if event else ""
-    table = {
-        "clip":     [hmd_bin, "clip", ref],
-        "invite":   [hmd_bin, "invite"],
-        "presence": [hmd_bin, "presence"],
-        "approve":  [hmd_bin, "approve", ref],
-        "deny":     [hmd_bin, "deny", ref],
-    }
-    argv = table.get(action)
-    if not argv:
-        return []
-    return [a for a in argv if a != ""]
+    unknown action, or for a ref-consuming action whose data-derived ref fails the
+    allowlist, so the caller can no-op cleanly.
+
+    Ref-consuming actions (clip/approve/deny) place the validated ref as a POSITIONAL
+    after a literal `--` option terminator: this guarantees a ref beginning with `-`
+    (e.g. `--foo`, `-rf`) is parsed as an operand, never a flag (argument injection)."""
+    raw = (event or {}).get("ref", "") if event else ""
+    if action in ("clip", "approve", "deny"):
+        ref = _safe_ref(raw)
+        if ref is None:
+            return []
+        return [hmd_bin, action, "--", ref]
+    if action == "invite":
+        return [hmd_bin, "invite"]
+    if action == "presence":
+        return [hmd_bin, "presence"]
+    return []
 
 
 # ── render core bridge (consume hmd_sigil + hmd_termcaps; never re-implement) ─

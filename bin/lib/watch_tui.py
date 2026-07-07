@@ -144,7 +144,7 @@ class WatchApp(App):
         if ev is None:
             insp.update("INSPECTOR\n  (select a feed item, then Enter)")
             return
-        receipt = wd.read_receipt(ev)
+        receipt = wd.read_receipt(ev, self._root)
         insp.update("\n".join(wd.render_inspector(receipt, self._caps)))
 
     def _paint_status(self):
