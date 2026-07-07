@@ -196,12 +196,14 @@ else
 fi
 
 # ── (2) INSPECTOR renders the fixture DENY receipt ──────────────────────────
-INSP="$(NO_COLOR=1 HEIMDALL_STATUSLINE_MODE=mono "$PY" - "$DATA" "$ROOT/sentinels" "$REPO/.heimdall/report-a3f1.json" <<'PY' 2>&1
+INSP="$(NO_COLOR=1 HEIMDALL_STATUSLINE_MODE=mono "$PY" - "$DATA" "$ROOT/sentinels" "$REPO/.heimdall/report-a3f1.json" "$REPO" <<'PY' 2>&1
 import importlib.util, sys
 spec = importlib.util.spec_from_file_location("watch_data", sys.argv[1])
 wd = importlib.util.module_from_spec(spec); spec.loader.exec_module(wd)
 caps = wd.load_caps(sys.argv[2])
-rec = wd.read_receipt({"receipt_path": sys.argv[3], "ref": "a3f1"})
+# read_receipt is confined to <root>/.heimdall — pass the fixture repo root so the
+# (absolute, in-base) fixture receipt resolves inside the allowlisted base.
+rec = wd.read_receipt({"receipt_path": sys.argv[3], "ref": "a3f1"}, sys.argv[4])
 print("\n".join(wd.render_inspector(rec, caps)))
 PY
 )"
@@ -312,6 +314,114 @@ HELP_OUT="$("$ROOT/bin/hmd" watch --help 2>&1 || true)"
 printf '%s' "$HELP_OUT" | grep -qi 'TUI dashboard' \
   && ok "(11) 'hmd watch' routes to heimdall-watch-tui" \
   || bad "(11) 'hmd watch' did not route to the TUI launcher"
+
+# ── SECURITY (each check is a falsifier: pre-fix RED, post-fix GREEN) ─────────
+# Two vulns found in a security review of the merged TUI:
+#   SEC-1 ARGUMENT-INJECTION — a data-derived ref (feed/roster) reaching a CLI as
+#         an ARG could be read as a FLAG (--foo/-rf) or carry a shell metachar.
+#   SEC-2 PATH-TRAVERSAL — a feed item's receipt_path reaching the INSPECTOR could
+#         escape .heimdall via an absolute path / `..` / a symlink and read /etc/passwd.
+printf "\n  ── SECURITY ──\n"
+
+# ── SEC-1 argument-injection: a hostile ref is NEVER a flag / NEVER a shell string ─
+SARG="$("$PY" - "$DATA" <<'PY' 2>&1
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("watch_data", sys.argv[1])
+wd = importlib.util.module_from_spec(spec); spec.loader.exec_module(wd)
+bad_refs = ["--malicious", "-rf", "--output=/etc/cron.d/x", "; rm -rf /",
+            "$(touch pwned)", "`id`", "a b c", "x;y", "\n--flag", "--"]
+ok = True
+for r in bad_refs:
+    for act in ["approve", "deny", "clip"]:
+        argv = wd.build_shell_argv(act, "hmd", {"ref": r})
+        if not isinstance(argv, list):
+            ok = False; print("UNSAFE %s %r: not a list -> %r" % (act, r, argv)); continue
+        if not argv:
+            continue  # rejected by the allowlist — a safe no-op (value never reaches CLI)
+        if "--" not in argv:
+            ok = False; print("UNSAFE %s %r: no -- terminator -> %r" % (act, r, argv)); continue
+        term = argv.index("--")
+        if r in argv[:term]:
+            ok = False; print("UNSAFE %s %r: value BEFORE -- (flag position) -> %r" % (act, r, argv)); continue
+print("ARGV", "ALLSAFE" if ok else "HASUNSAFE")
+PY
+)"
+printf '%s' "$SARG" | grep -q 'ARGV ALLSAFE' \
+  && ok "(SEC-1) argv-injection: hostile ref never a flag/shell string (rejected, or positional after --)" \
+  || { bad "(SEC-1) argv-injection: a data-derived ref reached the CLI as a flag/metachar"; printf '%s\n' "$SARG" | sed 's/^/      /'; }
+
+# executor must pass the argv LIST with shell=False — never build a shell string
+if grep -q 'shell=True' "$APP"; then
+  bad "(SEC-1) executor uses shell=True (shell-string / metachar risk)"
+else
+  ok "(SEC-1) executor never uses shell=True (argv list, shell=False)"
+fi
+grep -qE 'subprocess\.run\(argv' "$APP" \
+  && ok "(SEC-1) executor passes the argv LIST to subprocess (never a joined string)" \
+  || bad "(SEC-1) executor does not pass the argv list to subprocess"
+
+# legit refs still work (allowlist accepts real ids; positional after --)
+LEGITARG="$("$PY" - "$DATA" <<'PY' 2>&1
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("watch_data", sys.argv[1])
+wd = importlib.util.module_from_spec(spec); spec.loader.exec_module(wd)
+for act in ["approve", "deny", "clip"]:
+    print("LEGIT %s -> %s" % (act, " ".join(wd.build_shell_argv(act, "hmd", {"ref": "a3f1"}))))
+print("LEGITHAID -> %s" % " ".join(wd.build_shell_argv("approve", "hmd", {"ref": "haid:rj-a3f9"})))
+PY
+)"
+printf '%s' "$LEGITARG" | grep -qE 'LEGIT approve -> hmd approve -- a3f1' \
+  && ok "(SEC-1c) legit ref still shells (positional after --)" \
+  || { bad "(SEC-1c) legit ref no longer shells"; printf '%s\n' "$LEGITARG" | sed 's/^/      /'; }
+printf '%s' "$LEGITARG" | grep -qE 'LEGITHAID -> hmd approve -- haid:rj-a3f9' \
+  && ok "(SEC-1c) legit haid ref accepted by the allowlist" \
+  || { bad "(SEC-1c) legit haid ref rejected by the allowlist"; printf '%s\n' "$LEGITARG" | sed 's/^/      /'; }
+
+# ── SEC-2 path-traversal: INSPECTOR reads are confined to <root>/.heimdall ────
+# A valid-JSON secret OUTSIDE the base (would be read+leaked pre-fix), plus a
+# symlink inside .heimdall that escapes the base (realpath resolves it out).
+printf '%s' '{"reason_text":"TOPSECRET_LEAK","ref":"pwned"}' > "$WORK/secret.json"
+ln -sf "$WORK/secret.json" "$REPO/.heimdall/escape.json"
+
+STRAV="$(NO_COLOR=1 "$PY" - "$DATA" "$REPO" "$WORK/secret.json" "$REPO/.heimdall/escape.json" "$REPO/.heimdall/report-a3f1.json" <<'PY' 2>&1
+import importlib.util, sys, json
+spec = importlib.util.spec_from_file_location("watch_data", sys.argv[1])
+wd = importlib.util.module_from_spec(spec); spec.loader.exec_module(wd)
+root, abs_outside, symlink_escape, legit = sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
+def leaks(ref):
+    blob = json.dumps(wd.read_receipt({"receipt_path": ref, "ref": "x", "summary": "s"}, root))
+    return ("TOPSECRET_LEAK" in blob) or ("root:x:0:0" in blob) or ("root:*:0:0" in blob)
+cases = [
+    ("abs_outside_base", abs_outside),
+    ("rel_traversal", "../../secret.json"),
+    ("etc_passwd_abs", "/etc/passwd"),
+    ("etc_passwd_rel", "../../../../../../etc/passwd"),
+    ("symlink_escape", symlink_escape),
+]
+allrefused = True
+for name, ref in cases:
+    if leaks(ref):
+        allrefused = False; print("LEAK %s via %r" % (name, ref))
+    else:
+        print("REFUSED %s" % name)
+print("TRAVERSAL", "ALLREFUSED" if allrefused else "LEAKED")
+# legit in-base receipt (absolute path under .heimdall) still readable
+legit_blob = json.dumps(wd.read_receipt({"receipt_path": legit, "ref": "a3f1"}, root))
+print("LEGIT_OK" if "api_contract_break" in legit_blob else "LEGIT_FAIL")
+# legit in-base receipt (relative to the base) also readable
+rel_blob = json.dumps(wd.read_receipt({"receipt_path": "report-a3f1.json", "ref": "a3f1"}, root))
+print("LEGITREL_OK" if "api_contract_break" in rel_blob else "LEGITREL_FAIL")
+PY
+)"
+printf '%s' "$STRAV" | grep -q 'TRAVERSAL ALLREFUSED' \
+  && ok "(SEC-2) path-traversal: receipt reads confined to .heimdall (abs / .. / symlink escapes REFUSED)" \
+  || { bad "(SEC-2) path-traversal: a crafted receipt_path escaped .heimdall"; printf '%s\n' "$STRAV" | sed 's/^/      /'; }
+printf '%s' "$STRAV" | grep -q 'LEGIT_OK' \
+  && ok "(SEC-2c) legit in-base receipt (absolute) still readable" \
+  || { bad "(SEC-2c) legit in-base receipt broke"; printf '%s\n' "$STRAV" | sed 's/^/      /'; }
+printf '%s' "$STRAV" | grep -q 'LEGITREL_OK' \
+  && ok "(SEC-2c) legit in-base receipt (relative) still readable" \
+  || bad "(SEC-2c) legit relative in-base receipt broke"
 
 # ── summary ─────────────────────────────────────────────────────────────────
 printf "\n  Results: %d passed, %d failed\n" "$PASS" "$FAIL"
