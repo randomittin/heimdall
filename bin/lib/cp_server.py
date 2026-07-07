@@ -483,6 +483,15 @@ def _build_handler_class(home, enforce_revocation):
                 if refusal is not None:
                     self._send(Response(*refusal))
                     return
+            # PUBLIC-SURFACE /corpus flood shed (pre-auth, cheap): drop an over-limit IP's signed
+            # corpus-flush attempt BEFORE spending crypto on signature verify. Inert on the gated
+            # surface (the per-team cap + replay-nonce run post-auth, below).
+            if (cp_publicsurface.public_surface_enabled()
+                    and (method, route_path) == ("POST", "/corpus")):
+                refusal = cp_publicsurface.check_corpus_pre_auth(request, home=home)
+                if refusal is not None:
+                    self._send(Response(*refusal))
+                    return
             # PUBLIC-SURFACE /team/cred + /team/install flood shed (pre-auth, cheap): drop an
             # over-limit IP's signed registration BEFORE spending crypto on signature verify. The
             # bucket scope names the route so the two register windows stay distinct. Inert on the
@@ -507,6 +516,17 @@ def _build_handler_class(home, enforce_revocation):
             if (cp_publicsurface.public_surface_enabled()
                     and (method, route_path) == ("POST", "/presence")):
                 refusal = cp_publicsurface.check_presence_post_auth(
+                    identity, request, home=home)
+                if refusal is not None:
+                    self._send(Response(*refusal))
+                    return
+            # PUBLIC-SURFACE post-auth /corpus gates (need the VERIFIED haid): per-team rate cap +
+            # replay-nonce over the signed corpus-flush body. Inert on the gated surface. The actual
+            # ingest handler is the registered POST /corpus route (cp_corpus), reached via the seam
+            # below once these gates pass — so the corpus route stays a normal authenticated route.
+            if (cp_publicsurface.public_surface_enabled()
+                    and (method, route_path) == ("POST", "/corpus")):
+                refusal = cp_publicsurface.check_corpus_post_auth(
                     identity, request, home=home)
                 if refusal is not None:
                     self._send(Response(*refusal))

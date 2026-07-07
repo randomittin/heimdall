@@ -149,6 +149,7 @@ PUBLIC_ROUTES = frozenset({
     ("POST", "/enroll"),
     ("POST", "/presence"),
     ("POST", "/rr-task"),
+    ("POST", "/corpus"),
     ("POST", "/team/cred"),
     ("POST", "/team/install"),
     ("GET", "/roster"),
@@ -262,6 +263,17 @@ def _rr_task_ip_window():    return _int_env("HEIMDALL_RR_TASK_IP_WINDOW", 60)
 def _rr_task_team_limit():   return _int_env("HEIMDALL_RR_TASK_TEAM_LIMIT", 30)
 def _rr_task_team_window():  return _int_env("HEIMDALL_RR_TASK_TEAM_WINDOW", 60)
 def _rr_task_nonce_window(): return _int_env("HEIMDALL_RR_TASK_NONCE_WINDOW", 300)
+
+# /corpus — the SIGNED pre-merge CORPUS ingest (premerge-corpus-spec §5.2). Per-IP (pre-verify
+# blunt flood shed) AND per-TEAM (post-verify, keyed on the caller's server-derived team_id_hash)
+# fixed-window caps bound a single tenant's flush rate, plus a replay-nonce over the signed body.
+# A flush is a periodic batch (many PMRs per POST), so the per-team cap is generous but bounded;
+# all env-tunable, conservative defaults sized for a periodic spool drain, not a flood.
+def _corpus_ip_limit():     return _int_env("HEIMDALL_CORPUS_IP_LIMIT", 60)
+def _corpus_ip_window():    return _int_env("HEIMDALL_CORPUS_IP_WINDOW", 60)
+def _corpus_team_limit():   return _int_env("HEIMDALL_CORPUS_TEAM_LIMIT", 30)
+def _corpus_team_window():  return _int_env("HEIMDALL_CORPUS_TEAM_WINDOW", 60)
+def _corpus_nonce_window(): return _int_env("HEIMDALL_CORPUS_NONCE_WINDOW", 300)
 
 # /team/cred + /team/install — the SIGNED, team-scoped REGISTRATION writes (INV-6/8, the last-mile
 # onboarding). Registration is a rare, near-one-shot act (a tenant sets its cred/install once, then
@@ -601,6 +613,60 @@ def check_rr_task_post_auth(identity, request, *, home=None, now=None):
     ts = payload.get("ts")
     accepted, reason = cp_nonce.accept(
         "rr-task", str(haid), nonce, ts, now=now, window=_rr_task_nonce_window())
+    if not accepted:
+        return (401, {"error": "replay_" + reason})
+    return None
+
+
+# ── the SIGNED /corpus ingest gates (premerge-corpus-spec §5.2 — the corpus intake) ──────────
+#
+# THE CORPUS INTAKE. POST /corpus is a SIGNED public write (like /rr-task): the §3 chokepoint
+# verifies the Ed25519 signature BEFORE the post-auth gate runs (unsigned/forged is a 401), the
+# caller's team_id_hash is derived SERVER-SIDE from the verified binding (INV-1), and cp_corpus
+# writes the PMR batch to the caller's OWN partition in the ISOLATED corpus namespace. These gates
+# only add abuse-resistance (flood + replay) — the isolation + no-secret discipline lives in
+# cp_corpus (server-derived partition) + pmr_corpus (rebuild + secret-scan).
+
+
+def check_corpus_pre_auth(request, *, home=None, now=None):
+    """PUBLIC-SURFACE per-IP flood gate for POST /corpus, applied BEFORE the §3 signature verify
+    so a blunt flood is shed CHEAPLY (no crypto spent on an over-limit IP). Returns None to
+    proceed to auth, or (429, body) to refuse. The per-team cap + replay-nonce run AFTER identity
+    is known (check_corpus_post_auth)."""
+    limiter = cp_ratelimit.RateLimiter(home=home)
+    ip = client_ip(request)
+    ok, retry = limiter.allow(
+        "corpus_ip", ip, now=now, limit=_corpus_ip_limit(), window=_corpus_ip_window())
+    if not ok:
+        return (429, _rate_limited_body("corpus_ip", retry))
+    return None
+
+
+def check_corpus_post_auth(identity, request, *, home=None, now=None):
+    """PUBLIC-SURFACE gates for POST /corpus that need the VERIFIED identity (run AFTER the §3
+    chokepoint, so `identity.haid` is proven and the body is signature-covered):
+      1. per-TEAM rate-limit — keyed on the caller's SERVER-DERIVED team_id (cp_auth.registered_
+         team), so a single tenant cannot flood the corpus intake even rotating members/IPs.
+      2. replay-nonce — the signed body carries {nonce, ts}; cp_nonce.accept decides freshness +
+         first-use. A stale ts or a replayed nonce -> 401 (the captured signed bytes cannot be
+         resent). The nonce scope 'corpus' namespaces it, so a corpus nonce can never be replayed
+         as a presence/rr-task beat.
+    Returns None to let the ingest run, or (429, body) / (401, body) to refuse."""
+    haid = getattr(identity, "haid", None) or identity
+    team_id = cp_auth.registered_team(str(haid), home=home)
+    team_key = team_id if team_id else ("haid:" + str(haid))
+    limiter = cp_ratelimit.RateLimiter(home=home)
+    ok, retry = limiter.allow(
+        "corpus_team", team_key, now=now,
+        limit=_corpus_team_limit(), window=_corpus_team_window())
+    if not ok:
+        return (429, _rate_limited_body("corpus_team", retry))
+
+    payload = _body_dict(request)
+    nonce = payload.get("nonce")
+    ts = payload.get("ts")
+    accepted, reason = cp_nonce.accept(
+        "corpus", str(haid), nonce, ts, now=now, window=_corpus_nonce_window())
     if not accepted:
         return (401, {"error": "replay_" + reason})
     return None

@@ -44,6 +44,7 @@ if _HERE not in sys.path:
 import cp_approval
 import cp_auth
 import cp_config
+import cp_corpus
 import cp_dashboard
 import cp_diag
 import cp_enroll
@@ -397,6 +398,11 @@ def boot(server=cp_server, *, home=None, base_env=None, start_tick=True,
     #    write to the home the server serves; the home-free pieces (schedules/notify)
     #    resolve home per-call from the runtime environment.
     routes["ingest"] = [cp_ingest.register(home=home)]
+    # Pre-merge corpus ingest (§5.2): the SIGNED POST /corpus lands a client's spooled PMR T0
+    # batch (+ opt-in T1 hunks) in the ISOLATED heimdall_corpus/ namespace (never the control-
+    # plane store), keyed by the SERVER-DERIVED team_id_hash (INV-1). DATA only — no dispatch,
+    # no cred, no model call (BYO-inference). The route is in cp_publicsurface.PUBLIC_ROUTES.
+    routes["corpus"] = [cp_corpus.register(home=home)]
     routes["dashboard"] = [cp_dashboard.register(home=home)]
     routes["schedules"] = list(cp_scheduler.register_routes())
     routes["jobs"] = list(cp_worker.register_job_routes(home=home, base_env=base_env))

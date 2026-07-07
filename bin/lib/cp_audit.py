@@ -66,6 +66,10 @@ AUDIT_EVENTS = (
     "approval",          # an approval decision landed (approved/rejected) (§7).
     "override",          # an owner forced a gate (§7) — authority exercised, audited.
     "ingest",            # a telemetry batch was ingested (§5).
+    "corpus_ingest",     # a pre-merge corpus batch (PMR T0 + T1 hunks) was ingested (§5.2). The
+                         # row is COUNTS-ONLY (received/stored/blocked) — never a PMR value or a
+                         # hunk byte; it is OPS metadata about the ingest, so it lives in the
+                         # control-plane audit log, never in the isolated corpus namespace.
     "auth_fail",         # an auth verification failed (unsigned/bad-sig/revoked) (§3).
 )
 
