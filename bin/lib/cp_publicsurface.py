@@ -137,6 +137,14 @@ import cp_credforward  # LEAST-PRIVILEGE cred WRITE-FORWARD (POST /team/cred). O
 #       records the map keyed by that team and STOPS — it mints/holds NO token. Fail-closed: no team
 #       -> 403; a bad installation_id / repo slug -> 422.
 # All OTHER entries are READ-ONLY: there is deliberately no other unauthenticated write.
+# PLUS the PUBLIC, UNSIGNED, CACHED interval-tuning read (cost-governance §2):
+#   GET /config — the server-driven adaptive-interval ladder (cp_config). Non-sensitive tuning
+#       data (beat/refresh intervals + ttl + backoff_reason), served UNSIGNED because a browser
+#       statusline / a raw hook cannot PKI-sign. A spoofed/broken config cannot DoS a client:
+#       every client CLAMPS each interval it reads to [15s, 300s] (cp_config.clamp_interval,
+#       mirrored in bin/heimdall-presence). Kept in the allowlist so the public surface SERVES it
+#       instead of a flat 404. Read-only, no body, no secret (cp-team-isolation stays green — a
+#       cohort key is the caller's own team_id and the response leaks no other team's state).
 PUBLIC_ROUTES = frozenset({
     ("POST", "/enroll"),
     ("POST", "/presence"),
@@ -147,6 +155,7 @@ PUBLIC_ROUTES = frozenset({
     ("GET", "/roster-team"),
     ("OPTIONS", "/roster-team"),
     ("GET", "/roster-public"),
+    ("GET", "/config"),
     ("GET", "/healthz"),
     ("GET", "/readyz"),
 })
