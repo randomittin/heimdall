@@ -925,6 +925,21 @@ case "${1:-}" in
     fi
     exec "$RR_BIN" "$@"
     ;;
+  sigil)
+    # `hmd sigil` — render the deterministic watchman sigil / calibration card.
+    # Delegates to the sibling bin/heimdall-sigil, which routes through the SHARED
+    # render core (sentinels/hmd_sigil.py). `hmd sigil --test` prints the terminal
+    # calibration card (sigil at 3 sizes + aspect-square + checkerboard) so a
+    # teammate can verify — or screenshot — how the sigil renders on their terminal.
+    shift
+    SIGIL_BIN="$PLUGIN_DIR/bin/heimdall-sigil"
+    if [ ! -x "$SIGIL_BIN" ]; then
+      echo "  Error: sigil renderer not found at $SIGIL_BIN" >&2
+      echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+      exit 1
+    fi
+    exec "$SIGIL_BIN" "$@"
+    ;;
   guard)
     # `hmd guard install` — wire the NATIVE git pre-push hook into the git repo
     # at the current directory. The hook runs on EVERY push (human or agent),
