@@ -97,6 +97,20 @@ BACKEND_FIRESTORE = "firestore"
 # "control-plane" path segment is named — stores pass only their own sub-path.
 CONTROL_PLANE_DIR = "control-plane"
 
+# ── THE NAMESPACE SEAM (store ISOLATION — the corpus asset lands in its OWN namespace) ──
+#
+# Every control-plane store shares ONE namespace: ${HEIMDALL_HOME}/control-plane/ (local)
+# / the "heimdall_cp" root collection (firestore). The PRE-MERGE CORPUS (the acquisition-
+# value data asset — heimdall-premerge-corpus-spec §3 L49) is a SEPARATE data class with its
+# OWN retention policy that MUST NEVER mix with presence/ops/team data. So a caller may pass
+# an explicit `namespace` to get_backend: it overrides BOTH backends' store root at once —
+# the local sub-dir AND the firestore root collection — so the corpus store addresses a
+# DISJOINT keyspace on every backend. namespace=None (every existing caller) preserves each
+# backend's own default (control-plane / heimdall_cp), so existing stores are byte-for-byte
+# unchanged. THE ISOLATION FALSIFIER: a corpus read (namespace="heimdall_corpus") can never
+# resolve a presence/team/ops rel, and vice-versa, because the two live under different roots
+# on the SAME backend — proven cross-namespace in test/heimdall-corpus-ingest.test.sh.
+
 # The optimistic-concurrency VERSION field carried INSIDE a keyed record for the
 # compare-and-swap put_record_if path (the cross-instance atomic-claim seam behind the
 # team-queue). A record with no rev is version 0; a successful CAS write persists the
@@ -210,13 +224,18 @@ class LocalBackend(StateBackend):
     indent=2 atomic put shape, the flush/fsync discipline, the store read order, and the
     sorted enumeration. A migrated store on this backend writes identical files."""
 
-    def __init__(self, home=None):
+    def __init__(self, home=None, subroot=None):
         self._home = home
+        # The store sub-root under the home. Defaults to CONTROL_PLANE_DIR so every existing
+        # caller is byte-for-byte unchanged; an explicit `subroot` (the corpus namespace) roots
+        # this backend at a DISJOINT dir (${HOME}/<subroot>/) — the store-isolation seam.
+        self._subroot = subroot or CONTROL_PLANE_DIR
 
-    # the store root: ${home or HEIMDALL_HOME}/control-plane/ (resolved live).
+    # the store root: ${home or HEIMDALL_HOME}/<subroot>/ (resolved live; subroot defaults to
+    # control-plane/, the historical path).
     def _root(self):
         base = self._home if self._home else issue_queue.heimdall_home()
-        return os.path.join(base, CONTROL_PLANE_DIR)
+        return os.path.join(base, self._subroot)
 
     def path(self, rel):
         """Absolute filesystem path under control-plane/ for a store-relative path."""
@@ -323,7 +342,7 @@ class LocalBackend(StateBackend):
 # ── the factory: select the backend impl from the environment ──────────────────
 
 
-def get_backend(home=None, backend=None):
+def get_backend(home=None, backend=None, *, namespace=None):
     """Return the StateBackend impl selected by HEIMDALL_STATE_BACKEND (default
     "local"), or the explicit `backend` name when passed. `home` pins the store root
     (threaded through from the store's `home=` arg).
@@ -336,19 +355,28 @@ def get_backend(home=None, backend=None):
                      ephemeral home reads the same state back. Imported LAZILY so a
                      local user never loads the firestore dep.
 
+    `namespace` (the store-ISOLATION seam) overrides the store ROOT on BOTH backends at
+    once — the local sub-dir (${HOME}/<namespace>/) AND the firestore root collection — so
+    a caller (the pre-merge CORPUS) can land its data in a DISJOINT keyspace that never
+    mixes with the shared control-plane store. namespace=None (every existing caller)
+    preserves each backend's own default (control-plane / the env-or-"heimdall_cp" root),
+    so existing stores are byte-for-byte unchanged.
+
     An unknown backend name raises ValueError (fail closed — never guess a backend)."""
     name = (backend if backend is not None
             else os.environ.get(BACKEND_ENV) or BACKEND_LOCAL).strip().lower()
     if name == BACKEND_LOCAL:
-        return LocalBackend(home=home)
+        return LocalBackend(home=home, subroot=namespace)
     if name == BACKEND_FIRESTORE:
         # Lazy import: the firestore adapter (and its google-cloud-firestore dep) is
         # pulled in ONLY when the firestore backend is actually selected, so the default
         # local path never requires the dep. The home arg is intentionally not used for
         # storage by FirestoreBackend (persistence is keyed to the Firestore project,
-        # not the home) — it is accepted for factory-signature parity only.
+        # not the home) — it is accepted for factory-signature parity only. `namespace`
+        # becomes the root COLLECTION (overriding the env-or-default heimdall_cp), the
+        # firestore half of the store-isolation seam.
         import cp_state_firestore
-        return cp_state_firestore.FirestoreBackend()
+        return cp_state_firestore.FirestoreBackend(root=namespace)
     raise ValueError(
         "unknown %s=%r (expected 'local' or 'firestore')" % (BACKEND_ENV, name)
     )
