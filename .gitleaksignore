@@ -23,3 +23,5 @@
 e7fe6de738ce03e1fe306c04d8524b37cfe8163e:test/heimdall-cp-team-queue.test.sh:generic-api-key:283
 # benign test fixture — the same fake redaction-assertion string (team-queue scrub test)
 e7fe6de738ce03e1fe306c04d8524b37cfe8163e:test/heimdall-cp-team-queue.test.sh:generic-api-key:290
+# benign test fixture — a planted GitHub PAT the corpus secret-scan falsifier MUST detect (proves secret-scan-before-send BLOCKS it → 'secret-detected-blocked' + PMR-ALARM). Must stay gitleaks-matchable by design; allowlisted like the bug-26 fixtures.
+f2c0b8f4349c5f99921b9d079b20751605041713:test/heimdall-telemetry.test.sh:github-pat:186
