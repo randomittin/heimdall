@@ -93,6 +93,75 @@ write_version() {  # $1=new version — rewrite plugin.json's version field in p
   mv "$tmp" "$PLUGIN_MANIFEST"
 }
 
+# ── Release signing (minisign) ───────────────────────────────────────────────
+# After a Release is published, sign the artifact clients auto-update from (install.sh) and
+# upload the DETACHED signature (install.sh.minisig) as a Release asset. bin/heimdall-autoupdate
+# verifies that signature against the in-repo public key (release/heimdall-signing.pub) BEFORE
+# it ever runs the downloaded install.sh — so an unsigned/tampered release is refused.
+#
+# RJ holds the SECRET key OUTSIDE the repo (default: ~/.heimdall/signing/heimdall-signing.key,
+# override with HEIMDALL_SIGNING_KEY). If minisign is not installed OR the secret key is absent,
+# we WARN and release UNSIGNED — we do NOT hard-block RJ. (Clients that verify will then REFUSE
+# that release until it is signed; that is the point.) See SIGNING.md for key generation + rotation.
+DEFAULT_SIGNING_KEY="$HOME/.heimdall/signing/heimdall-signing.key"
+
+sign_release_artifact() {  # $1 = tag (vX.Y.Z). Best-effort: WARN + return 0 when it cannot sign.
+  local tag="$1"
+  local artifact="${SHIP_ARTIFACT:-${REPO_ROOT:-$PWD}/install.sh}"
+  # Resolve the key at CALL time so `HEIMDALL_SIGNING_KEY=... ship.sh` and the sourced test seam
+  # both take effect (a source-time global would freeze the default before the env is set).
+  local seckey="${HEIMDALL_SIGNING_KEY:-$DEFAULT_SIGNING_KEY}"
+
+  if [ ! -f "$artifact" ]; then
+    warn "signing: artifact not found ($artifact) — releasing $tag UNSIGNED."
+    return 0
+  fi
+  if ! command -v minisign >/dev/null 2>&1; then
+    warn "signing: minisign not installed — releasing $tag UNSIGNED. Clients that verify will REFUSE it."
+    warn "  install:  brew install minisign   (or see SIGNING.md), then re-sign:"
+    warn "  re-sign:  minisign -Sm '$artifact' -x install.sh.minisig && gh release upload $tag install.sh.minisig --clobber"
+    return 0
+  fi
+  if [ ! -f "$seckey" ]; then
+    warn "signing: no signing key at $seckey — releasing $tag UNSIGNED (RJ holds the key)."
+    warn "  generate once (see SIGNING.md): minisign -G -W -f -s '$seckey' -p '${REPO_ROOT:-.}/release/heimdall-signing.pub'"
+    return 0
+  fi
+
+  local sigdir sig
+  sigdir="$(mktemp -d "${TMPDIR:-/tmp}/heimdall-sign.XXXXXX")" || { warn "signing: mktemp failed — releasing $tag UNSIGNED."; return 0; }
+  sig="$sigdir/install.sh.minisig"   # basename becomes the Release asset name
+  if ! minisign -S -s "$seckey" -m "$artifact" -x "$sig" \
+        -c "heimdall $tag install.sh" \
+        -t "heimdall release $tag — signed $(date -u +%Y-%m-%dT%H:%M:%SZ)" >/dev/null 2>&1; then
+    warn "signing: minisign -S failed (bad/locked key?) — releasing $tag UNSIGNED."
+    rm -rf "$sigdir"; return 0
+  fi
+  ok "signed install.sh → install.sh.minisig ($tag)"
+
+  if command -v gh >/dev/null 2>&1; then
+    if gh release upload "$tag" "$sig" --clobber >/dev/null 2>&1; then
+      ok "uploaded install.sh.minisig to Release $tag — auto-update can now VERIFY this release"
+    else
+      warn "signing: gh release upload failed — the sig was NOT attached to $tag. Attach it with:"
+      warn "  gh release upload $tag '$sig' --clobber"
+      return 0
+    fi
+  else
+    warn "signing: gh CLI absent — sig created at $sig but NOT uploaded. Attach it with:"
+    warn "  gh release upload $tag '$sig' --clobber"
+    return 0
+  fi
+  rm -rf "$sigdir"
+}
+
+# Test/introspection seam: `SHIP_SOURCE_ONLY=1 . release/ship.sh` defines the functions above
+# (read_version, sign_release_artifact, …) WITHOUT running the release flow. Executed normally
+# the variable is unset and we fall through to the real pipeline below.
+if [ "${SHIP_SOURCE_ONLY:-0}" = "1" ]; then
+  return 0 2>/dev/null || exit 0
+fi
+
 # ── Args (multi-flag: parse every argument, not just $1) ─────────────────────
 CHECK_ONLY=0; BUMP_KIND="patch"; EXPLICIT_VERSION=""; DO_BUMP=1; PRINT_NEXT=0
 while [ "$#" -gt 0 ]; do
@@ -241,6 +310,9 @@ if [ -n "$TAG" ]; then
     gh release create "$TAG" --generate-notes --title "$TAG" \
       || die "gh release create $TAG failed — tag is pushed; run: gh release create $TAG --generate-notes --title $TAG"
     ok "published GitHub Release $TAG — auto-update's releases/latest now advances"
+    # Sign install.sh + attach install.sh.minisig so clients can VERIFY this release before
+    # applying it. Best-effort: WARNS + releases UNSIGNED if no minisign/key (never blocks RJ).
+    sign_release_artifact "$TAG"
   else
     warn "gh CLI absent or unauthenticated — tag $TAG is pushed but the GitHub RELEASE was NOT published."
     warn "auto-update reads releases/latest, so it will LAG until you run:"

@@ -129,3 +129,31 @@ Defaults referenced above: project `heimdall-cp-prod`, region `us-central1`,
 service `heimdall-cp-public`, enroll secret `cp-enroll-token`. Override via the
 `PROJECT_ID` / `REGION` / `PUBLIC_SERVICE` / `ENROLL_SECRET` env vars the deploy
 scripts read.
+
+---
+
+## Release signing — the auto-update trust root (operator-only)
+
+Clients auto-update by re-running a Release's `install.sh`. That is code-execution to the whole
+fleet, so releases are **signed** (minisign) and `bin/heimdall-autoupdate` **verifies the
+signature against the in-repo public key `release/heimdall-signing.pub` before applying** — an
+unsigned/tampered/wrong-key release is refused and the client stays put. Full trust model, key
+generation, and rotation live in **`SIGNING.md`**; this is the operator quick-reference.
+
+- **Trust anchor (in repo):** `release/heimdall-signing.pub`. It must be committed and must ship
+  in the **same release that first carries the verifying updater**, or auto-update fails closed
+  (refuses everything — code `3`, "no trust root"). See the *Launch ordering* section of `SIGNING.md`.
+- **Secret key (never in repo):** RJ holds it at `~/.heimdall/signing/heimdall-signing.key`
+  (`chmod 600`). One-time generation command is in `SIGNING.md`.
+- **`ship.sh` posture:** after publishing a Release it signs `install.sh` and uploads
+  `install.sh.minisig`. Missing minisign **or** key ⇒ **WARN + release UNSIGNED** (never a hard
+  block); it prints the exact re-sign command.
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `HEIMDALL_SIGNING_KEY` | `~/.heimdall/signing/heimdall-signing.key` | Secret key `ship.sh` signs with. |
+| `HEIMDALL_SIGNING_PUBKEY` | in-repo `release/heimdall-signing.pub` | Trust-root override the updater verifies against (rotation / test seam). |
+
+Incident lever: a bad-but-signed release is handled exactly like the posture memo
+(`docs/analysis/launch-autoupdate-posture.md`) — un-publish the Release + delete the tag, or
+fix-forward. A **leaked signing key** additionally requires key rotation (`SIGNING.md`).
