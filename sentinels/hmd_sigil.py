@@ -273,6 +273,14 @@ def glyph(seed, eye_override=None):
     col = eye_override or hue
     return color(col, 'fg') + '◉' + '\033[0m'
 
+def glyph_color(seed):
+    """The DOMINANT sigil color (body hue) for a seed — the deterministic identity
+    tint the statusline wall paints a teammate's glyph with (spec B §4: teammate
+    glyphs tinted by glyph_color(), state shown by solid/dim/red-frame, NOT by
+    recoloring). Same seed -> same hue, forever, on every surface."""
+    _, hue, _ = grid_for(seed)
+    return hue
+
 
 def _sq(rgb, n, caps):
     """An n×n aspect-square block: n cols × n/2 half-block rows, each cell the same

@@ -48,9 +48,75 @@ def _sigil_rows(seed, eye):
     if CAPS.color == TC.MONO:
         return ["        "] * 4
     if CAPS.unicode == TC.FULL:
-        try: return SIG.render(seed, eye_override=eye, pad="")
+        try: return cached_sigil(seed, "M", CAPS, eye)   # shared core, cached (§1/§5)
         except Exception: return list(ASCII_SIGIL)
     return list(ASCII_SIGIL)   # basic unicode + color → safe ASCII sigil
+
+def _sigil_rows_s(seed, eye):
+    """The COMPACT anchor: sigil S (4 cols × 2 rows) through the same shared/cached
+    core as the full-mode M anchor, with the identical per-tier fallbacks (ASCII
+    mini-anchor on no-unicode, blank on mono, safe ASCII on basic)."""
+    if CAPS.unicode == TC.ASCII:
+        return list(ASCII_SIGIL_S)
+    if CAPS.color == TC.MONO:
+        return ["    ", "    "]
+    if CAPS.unicode == TC.FULL:
+        try: return cached_sigil(seed, "S", CAPS, eye)
+        except Exception: return list(ASCII_SIGIL_S)
+    return list(ASCII_SIGIL_S)
+
+def _wall_state(v):
+    """Teammate verdict → the compact wall's three visual states (spec B §4):
+    deny → red-frame, watching/idle → dim, everything live → solid."""
+    nv = _norm_verdict(v)
+    if nv == "deny": return "deny"
+    if nv == "watching": return "idle"
+    return "active"
+
+def wall_state_glyph(seed, state):
+    """One teammate cell for the compact wall: a ◉ tinted by the teammate's DOMINANT
+    sigil color (glyph_color — identity, NOT verdict), with state carried by the
+    frame/intensity: active = solid hue, idle = dimmed hue, deny = red ▕ ▏ frame
+    around the hue glyph. In no-color mode the glyph collapses to a bare ◉ (emit
+    strips the tint)."""
+    try: hue = SIG.glyph_color(seed)
+    except Exception: hue = (90, 100, 114)
+    if not USE_COLOR:
+        return "▕◉▏" if state == "deny" else "◉"
+    if state == "deny":
+        return f"{RD}▕{X}{sgr(hue)}◉{X}{RD}▏{X}"
+    if state == "idle":
+        dim = tuple(max(0, c * 45 // 100) for c in hue)
+        return f"{sgr(dim)}◉{X}"
+    return f"{sgr(hue)}◉{X}"
+
+def compact_wall(cwd, seed, my_verdict, present, cols, anch):
+    """A row of teammate GLYPHS for the compact HUD: your glyph first, then live
+    teammates (most-recent first) tinted by glyph_color, capped to the row budget
+    with a `+k` overflow tag (spec B §4). Width-safe: stops before the gutter, never
+    slicing a glyph."""
+    budget = max(0, cols - anch - 6)   # usable width: cols − S anchor − right gutter
+    you_state = ("deny" if my_verdict == "deny"
+                 else "idle" if my_verdict == "watching" else "active")
+    if present:
+        parts = [wall_state_glyph(seed, you_state)]
+    else:
+        parts = [f"{FAINT}◦{X}"]        # you are invisible (presence off) — a faint dot
+    used = vis(parts[0]); JOIN = 1
+    team = sorted(team_presence(cwd), key=lambda m: m.get("ts", 0), reverse=True)
+    shown = 0
+    for m in team:
+        g = wall_state_glyph(m.get("name", "?"), _wall_state(m.get("verdict", "working")))
+        if used + JOIN + vis(g) > budget: break
+        parts.append(g); used += JOIN + vis(g); shown += 1
+    extra = len(team) - shown
+    if extra > 0:
+        tag = f"{DIM}+{extra}{X}"
+        while shown > 0 and used + JOIN + vis(tag) > budget:
+            dropped = parts.pop(); shown -= 1; extra += 1
+            used -= JOIN + vis(dropped); tag = f"{DIM}+{extra}{X}"
+        parts.append(tag)
+    return " ".join(parts)
 
 # palette (empty in no-color mode → f-strings render as plain text)
 CY=_c("\033[38;2;34;211;238m"); GR=_c("\033[38;2;34;197;94m"); RD=_c("\033[38;2;239;68;68m")
@@ -62,6 +128,126 @@ ANSI = re.compile(r"\033\[[0-9;]*m")
 # visible width is tier-aware: emoji (e.g. ⚡) are double-width when unicode=full,
 # but width-1 once downgraded to ASCII — so the right-pin math tracks the real cells.
 def vis(s): return CAPS.width(s)
+
+def sgr(rgb):
+    """A 24-bit fg SGR for an arbitrary rgb, gated by USE_COLOR (empty → plain text)
+    and downgraded to the detected tier at write time by CAPS.emit (like the fixed
+    palette above). Used for per-identity glyph tints (glyph_color)."""
+    return _c("\033[38;2;%d;%d;%dm" % (rgb[0], rgb[1], rgb[2]))
+
+# ── DENSITY (spec B §2) ────────────────────────────────────────────────────────
+# Auto-select by terminal width. NEVER truncate mid-glyph: each mode renders a
+# self-contained block whose rows are padded (finalize) to a uniform width, so a
+# line is either fully present or absent — never sliced through a half-block/emoji.
+#   full    (≥120): sigil M + name + verdict + team wall (the rich ambient HUD)
+#   compact (80–119): sigil S + verdict + wall GLYPHS (tinted, +k overflow)
+#   minimal (<80):    a single glyph + the verdict word
+def density(cols):
+    if cols >= 120: return "full"
+    if cols >= 80:  return "compact"
+    return "minimal"
+
+# ── VERDICT SEMANTICS (spec B §3) ──────────────────────────────────────────────
+# PASS / DENY / RUNNING / IDLE — each a FIXED glyph + color, identical across every
+# capability tier (the bytes are built once in truecolor and CAPS.emit maps the color
+# to the tier deterministically, so the glyph never changes and the hue maps 1:1).
+# DENY PULSES via a TWO-FRAME alternation on the refresh tick (SGR blink is BANNED):
+# frame A = bold bright red, frame B = a dimmer red — SAME glyph+word+width, so the
+# pulse never shifts columns (width invariant holds across both frames).
+VERDICT_CANON = {
+    "PASS":    ((34, 197, 94),  "✓", "PASS"),
+    "DENY":    ((239, 68, 68),  "✗", "DENY"),
+    "RUNNING": ((245, 158, 11), "⟳", "RUNNING"),
+    "IDLE":    ((34, 211, 238), "◦", "IDLE"),
+}
+CANON_OF = {
+    "pass": "PASS", "proven": "PASS", "green": "PASS", "done": "PASS", "ok": "PASS",
+    "deny": "DENY", "blocked": "DENY", "fail": "DENY", "failed": "DENY", "closed": "DENY",
+    "scanning": "RUNNING", "scan": "RUNNING", "running": "RUNNING", "working": "RUNNING",
+    "active": "RUNNING", "busy": "RUNNING",
+    "watching": "IDLE", "idle": "IDLE",
+}
+def canon_verdict(v):
+    return CANON_OF.get((v or "").strip().lower(), "IDLE")
+
+def _deny_dim(rgb, tick):
+    """Frame B of the DENY pulse: a dimmer red on odd ticks (frame A = full red on
+    even). Two-frame, deterministic on the tick — no SGR blink."""
+    if tick % 2 == 1:
+        return tuple(max(0, c * 6 // 10) for c in rgb)
+    return rgb
+
+def verdict_seg(canon, tick):
+    """The fixed glyph + word for a verdict, pulsing on DENY. Same width every frame."""
+    rgb, g, w = VERDICT_CANON[canon]
+    if canon == "DENY": rgb = _deny_dim(rgb, tick)
+    return f"{sgr(rgb)}{BOLD}{g} {w}{X}"
+
+def verdict_word(canon, tick):
+    """Just the colored word (minimal mode), pulsing on DENY."""
+    rgb, _g, w = VERDICT_CANON[canon]
+    if canon == "DENY": rgb = _deny_dim(rgb, tick)
+    return f"{sgr(rgb)}{BOLD}{w}{X}"
+
+# ── SIGIL CACHE (spec B §5) ────────────────────────────────────────────────────
+# Precompute the sigil to a cached string per (haid, size, caps[, eye]). The cache
+# key embeds the capability tier so a CAPS CHANGE — and only a caps change (plus the
+# small fixed set of animation eye-colors) — invalidates it; a verdict/context/token
+# change never rebuilds the sigil. An in-process memo makes repeat lookups within one
+# render free; a durable on-disk layer under ~/.heimdall/.sigil-cache carries the
+# precompute across the per-refresh process spawns, keeping render well under 50ms.
+# Bytes are stored in native truecolor (tier-independent); the single tier downgrade
+# happens later in finalize(), so the same cache serves every surface consistently.
+_SIG_MEMO = {}
+def _sigil_cache_dir():
+    return os.path.join(os.path.expanduser("~"), ".heimdall", ".sigil-cache")
+
+def cached_sigil(seed, size, caps, eye):
+    eyt = tuple(eye or SIG.EYE)
+    ekey = "%02x%02x%02x" % (eyt[0], eyt[1], eyt[2])
+    ckey = "%s-%s" % (caps.color, caps.unicode)
+    memo_k = (seed, size, ckey, ekey)
+    m = _SIG_MEMO.get(memo_k)
+    if m is not None: return list(m)
+    lines = None
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "-", seed or "you")[:48]
+    path = os.path.join(_sigil_cache_dir(), "%s__%s__%s__%s.sig" % (safe, size, ckey, ekey))
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.read().split("\n")
+    except Exception:
+        lines = None
+    if lines is None:
+        try:
+            lines = SIG.sigil_render(seed, size, SIG.tier_caps(), eye_override=eye)
+        except Exception:
+            lines = None
+        if lines is not None:
+            try:
+                os.makedirs(_sigil_cache_dir(), exist_ok=True)
+                tmp = path + ".%d.tmp" % os.getpid()
+                with open(tmp, "w", encoding="utf-8") as f: f.write("\n".join(lines))
+                os.replace(tmp, path)
+            except Exception:
+                lines = lines   # cache write is best-effort; a miss just recomputes
+    if lines is None:
+        lines = list(ASCII_SIGIL) if size == "M" else ["    ", "    "]
+    _SIG_MEMO[memo_k] = list(lines)
+    return list(lines)
+
+# a 4-wide × 2-row branded ASCII anchor for the compact mode's no-unicode fallback.
+ASCII_SIGIL_S = [" __ ", "|oo|"]
+
+def finalize(lines):
+    """Emit every row to the detected tier (the single downgrade pass) then pad each
+    to the uniform MAX visible width so ALL rows are wcwidth-equal — the width
+    invariant the density goldens assert (spec Tests 2–3). Pad is trailing spaces
+    only, so a shorter wall/tease row aligns flush under the header block and no line
+    is ever sliced mid-glyph."""
+    em = [CAPS.emit(ln) for ln in lines]
+    ws = [CAPS.width(ln) for ln in em]
+    W = max(ws) if ws else 0
+    return "\n".join(ln + " " * (W - w) for ln, w in zip(em, ws))
 
 def read_json():
     try: return json.load(sys.stdin)
@@ -452,6 +638,33 @@ def main():
     # Stat-only throttle gates → ZERO forks when both are throttled. Never blocks the render.
     _spawn_presence(cwd, handle, verdict, present)
 
+    # ── DENSITY SELECTION (spec B §2) ─────────────────────────────────────────
+    # The canonical verdict (PASS/DENY/RUNNING/IDLE) drives the compact + minimal
+    # blocks. IDLE = solo + no gate verdict (matches the full-HUD idle dedup below).
+    dmode = density(cols)
+    idle = (verdict == "watching" and passed is None)
+    canon = "IDLE" if idle else canon_verdict(verdict)
+
+    if dmode == "minimal":
+        # minimal (<80): the watchman glyph + the verdict word. One cell + one whole
+        # word, padded to width — structurally impossible to slice mid-glyph.
+        vrgb = VERDICT_CANON[canon][0]
+        row = f"{sig_glyph(seed, vrgb)} {verdict_word(canon, t)}"
+        sys.stdout.write(finalize([row]) + "\n")
+        return
+
+    if dmode == "compact":
+        # compact (80–119): sigil S (4 cols × 2 rows) + verdict, then a wall of
+        # teammate glyphs (tinted by glyph_color, +k overflow) on the second row.
+        sigS = _sigil_rows_s(seed, eye)
+        ANCH_S = 4 + 2
+        head = f"{BOLD}{handle}{X}  {verdict_seg(canon, t)}"
+        wall = compact_wall(cwd, seed, verdict, present, cols, ANCH_S)
+        r0 = f"{_sig(sigS, 0, CY)}  {head}"
+        r1 = f"{_sig(sigS, 1, CY)}  {wall}"
+        sys.stdout.write(finalize([r0, r1]) + "\n")
+        return
+
     # ── sigil anchor (squint animates; eyes stay visible in every frame) ──
     # Per terminal tier: half-block watchman on unicode=full, a branded ASCII sigil
     # on no-unicode terms (dumb/CI), a blank 8-wide anchor in mono (legacy no-color).
@@ -573,7 +786,7 @@ def main():
         out.append(f"{_sig(sig,1,CY)}  " + line(l2, r2))
         for i, seg in enumerate(swarm):
             out.append(f"{_sig(sig, 2+i, CY)}  " + seg)
-        _write("\n".join(out) + "\n")
+        sys.stdout.write(finalize(out) + "\n")   # single tier downgrade + width invariant
         return
 
     out = []
@@ -596,7 +809,7 @@ def main():
         if vis(tease) > max(0, cols - ANCHOR - RMARGIN): tease = ""
         out.append(f"{_sig(sig,2,CY)}  " + tease)
         out.append(f"{_sig(sig,3,CY)}  ")
-    _write("\n".join(out) + "\n")
+    sys.stdout.write(finalize(out) + "\n")   # single tier downgrade + width invariant
 
 def _sig(rows, i, fallback):
     return rows[i] if i < len(rows) else "        "   # 8-space blank = square sigil width
