@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+# heimdall-badge — the VIRAL BADGE: a shields.io-style badge a user pastes into
+# their README that says how many merges Heimdall has PROVEN in this repo, and
+# BACKLINKS to runheimdall.dev (the growth mechanic).
+#
+#   🛡 heimdall: N proven merges          (when the repo has gated, passing commits)
+#   🛡 heimdall: watchman active          (freshly initialised, no proven merge yet)
+#
+# THE NUMBER is local + honest: it counts the `pass` verdicts the universal git core
+# (hmd init) recorded in <repo>/.heimdall/receipts/beats.log — every gated commit
+# that the watchman passed. A repo with no beats yet falls back to the audit number
+# (hmd init's Δ2 audit.json) to still say something true ("watchman active").
+#
+# OFFLINE-SAFE: the SVG is generated locally (no shields.io round-trip), so `--svg`
+# always yields a committable badge even with no network. The default markdown
+# points its <img> at the runheimdall.dev badge endpoint (the viral image host) and
+# links to runheimdall.dev — BOTH surfaces carry the backlink.
+#
+# Usage:
+#   hmd badge                 the README markdown snippet (default)
+#   hmd badge --markdown      same, explicit
+#   hmd badge --svg           the offline-safe static SVG (redirect to a file)
+#   hmd badge --json          { count, label, message, backlink, markdown }
+#   hmd badge --count         just the proven-merge number
+#   -h | --help
+#
+# Exit: 0 always (a repo with no verdict store is not an error — it just reads 0).
+set -uo pipefail
+
+BACKLINK="https://runheimdall.dev"
+LABEL="🛡 heimdall"
+
+usage() { sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'; }
+
+MODE="markdown"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --markdown|--md) MODE="markdown"; shift ;;
+    --svg)           MODE="svg"; shift ;;
+    --json)          MODE="json"; shift ;;
+    --count)         MODE="count"; shift ;;
+    -h|--help)       usage; exit 0 ;;
+    *) echo "heimdall-badge: unexpected argument: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+# ── resolve this script's dir (relocatable) + the repo under audit ────────────
+SELF="$0"
+if command -v readlink >/dev/null 2>&1; then
+  SELF="$(readlink -f "$0" 2>/dev/null || readlink "$0" 2>/dev/null || echo "$0")"
+fi
+BIN_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+
+REPO="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+BEATS="$REPO/.heimdall/receipts/beats.log"
+AUDIT="$REPO/.heimdall/audit.json"
+
+# ── the proven-merge number ───────────────────────────────────────────────────
+# beats.log lines are:  <iso-ts>\t<verdict>\t<topfile>.  A proven merge = a `pass`.
+COUNT=0
+if [ -f "$BEATS" ]; then
+  COUNT="$(awk -F'\t' '$2=="pass"{n++} END{print n+0}' "$BEATS" 2>/dev/null || echo 0)"
+fi
+[ -n "$COUNT" ] || COUNT=0
+
+# The headline message. Proven merges when we have them; else the honest fallback.
+if [ "$COUNT" -gt 0 ] 2>/dev/null; then
+  MESSAGE="$COUNT proven merges"
+else
+  MESSAGE="watchman active"
+fi
+
+# A stable, README-safe slug for the badge-endpoint URL (repo basename only — the
+# user's own repo name; never a secret). Non-alnum collapses to '-'.
+SLUG="$(basename "$REPO" 2>/dev/null | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '-' | sed 's/-\{1,\}/-/g; s/^-//; s/-$//')"
+[ -n "$SLUG" ] || SLUG="repo"
+ENDPOINT="$BACKLINK/badge/$SLUG.svg"
+
+# ── the offline-safe static SVG (shields.io-style, generated locally) ─────────
+# Rough monospace-ish width estimate: ~7px/char + side padding. A static badge does
+# not need pixel-perfect kerning — it renders cleanly in every README.
+svg() {
+  local left="$LABEL" right="$MESSAGE"
+  local lw rw tw
+  lw=$(( ${#left} * 7 + 16 ))
+  rw=$(( ${#right} * 7 + 16 ))
+  tw=$(( lw + rw ))
+  local lx=$(( lw * 10 / 2 ))
+  local rx=$(( (lw + rw / 2) * 10 ))
+  cat <<SVG
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="$tw" height="20" role="img" aria-label="$left: $right">
+  <!-- Heimdall proven-merge badge. Backlink: $BACKLINK -->
+  <title>$left: $right</title>
+  <a xlink:href="$BACKLINK" target="_blank" rel="noopener">
+    <linearGradient id="s" x2="0" y2="100%">
+      <stop offset="0" stop-color="#bbb" stop-opacity=".1"/>
+      <stop offset="1" stop-opacity=".1"/>
+    </linearGradient>
+    <clipPath id="r"><rect width="$tw" height="20" rx="3" fill="#fff"/></clipPath>
+    <g clip-path="url(#r)">
+      <rect width="$lw" height="20" fill="#555"/>
+      <rect x="$lw" width="$rw" height="20" fill="#0d98ba"/>
+      <rect width="$tw" height="20" fill="url(#s)"/>
+    </g>
+    <g fill="#fff" text-anchor="middle" font-family="Verdana,Geneva,DejaVu Sans,sans-serif" font-size="110" transform="scale(.1)">
+      <text x="$lx" y="140" fill="#010101" fill-opacity=".3">$left</text>
+      <text x="$lx" y="130">$left</text>
+      <text x="$rx" y="140" fill="#010101" fill-opacity=".3">$right</text>
+      <text x="$rx" y="130">$right</text>
+    </g>
+  </a>
+</svg>
+SVG
+}
+
+markdown() {
+  # BOTH the image endpoint and the link carry the runheimdall.dev backlink.
+  printf '[![%s: %s](%s)](%s)\n' "$LABEL" "$MESSAGE" "$ENDPOINT" "$BACKLINK"
+}
+
+# ── Δ6 funnel: badge_added (client-side, consent-gated, fire-and-forget) ──────
+# Never blocks or prints; the engine no-ops when consent is off.
+FUNNEL_BIN="$BIN_DIR/heimdall-funnel"
+[ -x "$FUNNEL_BIN" ] && ( "$FUNNEL_BIN" emit badge_added --context cli >/dev/null 2>&1 & ) || true
+
+case "$MODE" in
+  count)    printf '%s\n' "$COUNT" ;;
+  svg)      svg ;;
+  markdown) markdown ;;
+  json)
+    # Emit the markdown INSIDE the JSON too (escaped) so a machine caller gets the
+    # paste-ready snippet + the backlink in one shot.
+    MD="$(markdown)"
+    MD_ESC="$(printf '%s' "$MD" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+    printf '{"schema":"badge_v1","count":%s,"label":"%s","message":"%s","backlink":"%s","endpoint":"%s","markdown":"%s"}\n' \
+      "$COUNT" "$LABEL" "$MESSAGE" "$BACKLINK" "$ENDPOINT" "$MD_ESC"
+    ;;
+esac
+exit 0
