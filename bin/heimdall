@@ -1137,6 +1137,20 @@ case "${1:-}" in
     fi
     exec "$PRESENCE_BIN" "$@"
     ;;
+  telemetry)
+    # `hmd telemetry` — Pre-Merge Corpus (PMR) T0 consent + control surface
+    # (status/on/off/hunks on|off/purge) + the internal emit/observe/scan/install-hook
+    # the gate pipeline and post-commit hook call. Own namespace, client-side only —
+    # the corpus clock starts AT launch. All args/flags forwarded verbatim.
+    shift
+    TELEMETRY_CORPUS_BIN="$PLUGIN_DIR/bin/heimdall-telemetry-corpus"
+    if [ ! -x "$TELEMETRY_CORPUS_BIN" ]; then
+      echo "  Error: heimdall-telemetry-corpus not found at $TELEMETRY_CORPUS_BIN" >&2
+      echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+      exit 1
+    fi
+    exec "$TELEMETRY_CORPUS_BIN" "$@"
+    ;;
 esac
 
 # ── Command handlers ──

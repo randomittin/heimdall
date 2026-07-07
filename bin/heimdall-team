@@ -291,13 +291,24 @@ commit_team() { # $1 = commit message
 # `rotate`, not by silently un-committing an exposed secret.
 ensure_team_gitignored() {
   local root; root="$(git rev-parse --show-toplevel 2>/dev/null || true)"; [ -n "$root" ] || return 0
+  # An ACTIVE ignore rule already covers the (untracked) secret -> nothing to do.
   git -C "$root" check-ignore -q "$TEAM_FILE" 2>/dev/null && return 0
+  # IDEMPOTENCY GUARD: `git check-ignore` reports a TRACKED file as NOT ignored
+  # (tracking overrides .gitignore), so on a private->public flip where team.json
+  # was previously committed, the check above MISSES and — without this guard — the
+  # same block would be re-appended on EVERY run (unbounded .gitignore growth). Skip
+  # when the literal pattern line is already present so the block lands at most once,
+  # regardless of the file's tracking state.
+  local gi="$root/.gitignore"
+  if [ -f "$gi" ] && grep -qxF '.heimdall/team.json' "$gi" 2>/dev/null; then
+    return 0
+  fi
   {
     printf '\n# heimdall team secret — gitignored on a PUBLIC/unverified repo: a bearer\n'
     printf '# secret must never be committed to a world-readable repo. Grow the team\n'
     printf '# out-of-band with `hmd invite`.\n'
     printf '.heimdall/team.json\n'
-  } >> "$root/.gitignore" 2>/dev/null || true
+  } >> "$gi" 2>/dev/null || true
 }
 
 log_auto() { # best-effort, secret-free
