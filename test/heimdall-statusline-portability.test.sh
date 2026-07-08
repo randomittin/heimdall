@@ -144,6 +144,38 @@ RRC=$?
 [ -n "$ROUT" ] && ok "statusline.sh renders a line with no state" \
               || bad "statusline.sh rendered blank with no state"
 
+# ── 9) BELT-AND-SUSPENDERS: the FIRST register (statusLine key absent → now written)
+#       emits a ONE-TIME stderr activation note ("visible next session"); a second,
+#       idempotent register must NOT re-emit it. The note is stderr-only so it never
+#       pollutes the state-word contract on stdout. ──
+HOMEDIR3="$WORK/home-note"; mkdir -p "$HOMEDIR3/.claude"
+NERR1="$(env -i HOME="$HOMEDIR3" PATH="/usr/bin:/bin:/usr/local/bin" \
+  "$DST/bin/heimdall-statusline-register" register 2>&1 >/dev/null)"
+case "$NERR1" in *"statusline activated"*) ok "first register emits one-time stderr activation note" ;;
+  *) bad "first register did NOT emit stderr activation note (got: '$NERR1')" ;; esac
+# stdout must still be JUST the state word (note lives on stderr, not stdout)
+NOUT1="$(env -i HOME="$WORK/home-note2" PATH="/usr/bin:/bin:/usr/local/bin" \
+  "$DST/bin/heimdall-statusline-register" register 2>/dev/null)"
+[ "$NOUT1" = registered ] && ok "stdout state word uncontaminated by the note (=registered)" \
+                          || bad "stdout state word contaminated: '$NOUT1'"
+NERR2="$(env -i HOME="$HOMEDIR3" PATH="/usr/bin:/bin:/usr/local/bin" \
+  "$DST/bin/heimdall-statusline-register" register 2>&1 >/dev/null)"
+case "$NERR2" in *"statusline activated"*) bad "second (idempotent) register wrongly re-emitted the note (got: '$NERR2')" ;;
+  *) ok "second (idempotent) register emits NO note" ;; esac
+
+# ── 10) the SessionStart hook runs the statusline register SYNCHRONOUSLY (not
+#       backgrounded/detached). CC snapshots the settings.json statusLine key AT
+#       session start; an async write lands AFTER the snapshot → teammate's FIRST
+#       session shows a blank HUD. Synchronous register = key present before snapshot. ──
+HJ="$REPO_ROOT/hooks/hooks.json"
+jq . "$HJ" >/dev/null 2>&1 && ok "hooks.json is valid JSON" || bad "hooks.json is NOT valid JSON"
+SS="$(jq -r '.hooks.SessionStart[]?.hooks[]?.command // empty' "$HJ" 2>/dev/null)"
+case "$SS" in
+  *'("$SLREG" register'*'&)'*) bad "SessionStart still backgrounds SLREG register (async write lands after CC snapshot → blank first session)" ;;
+  *'"$SLREG" register'*)       ok "SessionStart runs SLREG register synchronously (no backgrounding &)" ;;
+  *)                           bad "SessionStart no longer invokes SLREG register" ;;
+esac
+
 echo
 if [ "$FAILS" = 0 ]; then echo "PASS — statusline portable + propagates to any teammate"; exit 0
 else echo "FAIL — $FAILS assertion(s) failed"; exit 1; fi
