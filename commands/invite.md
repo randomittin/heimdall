@@ -57,7 +57,10 @@ open-bounded (tokenless) — nothing for a user to pass or see.
   enrollment is an operator-only concern (see `OPERATORS.md`), never a user surface.
 - **Don't fabricate a join.** If no team is configured, relay the CLI's setup
   guidance — never hand-craft a one-liner with a guessed URL or secret.
-- Files nothing and calls no network — it only reads local config and prints.
+- Files nothing. It reads local config and makes one lightweight, read-only origin
+  check (`git ls-remote` + a raw-URL HTTP probe) to guarantee the pinned ref
+  actually resolves — if it does NOT, the CLI REFUSES to print a broken join,
+  prints a loud error, and exits non-zero (the owner must push/tag/publish first).
 
 ## Examples
 

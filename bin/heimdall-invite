@@ -6,8 +6,14 @@
 # one-liner that drops a teammate straight onto THIS repo's team — the canonical
 # curl|bash installer with this team's control-plane URL + TEAM SECRET inlined:
 #
-#   curl -fsSL https://raw.githubusercontent.com/<repo>/<ref>/install.sh \
-#     | HEIMDALL_CP_URL='<url>' HEIMDALL_TEAM_SECRET='<secret>' bash
+#   ( set -o pipefail; f="$(mktemp …)" \
+#     && curl -fsSL --proto '=https' https://raw.githubusercontent.com/<repo>/<ref>/install.sh -o "$f" \
+#     && HEIMDALL_CP_URL='<url>' HEIMDALL_TEAM_SECRET='<secret>' bash "$f"; r=$?; rm -f "$f"; exit $r )
+#
+# The installer is fetched to a temp file THEN run (never `curl … | bash`): a 404
+# makes curl exit non-zero and bash never runs — a broken/unpublished ref fails
+# LOUDLY instead of piping an empty body into a silent no-op. The secret rides ONLY
+# the env of the bash invocation; the downloaded file carries NO secret.
 #
 # The teammate pastes that ONE line; install.sh consumes HEIMDALL_TEAM_SECRET into
 # their <repo>/.heimdall/team.json (0600) + HEIMDALL_CP_URL into their global
@@ -21,10 +27,13 @@
 # different teams in different repos). The control-plane URL is GLOBAL + NOT secret:
 # it resolves from the dev's ~/.heimdall/cp-endpoint.json `url`, else the shipped
 # public default (so a dev who only ran `heimdall-team new` can still invite). The
-# install repo/ref mirror the canonical README one-liner: repo from plugin.json,
-# ref from the installed clone's release tag (else the manifest version, else
-# `main`); HEIMDALL_REF overrides. HEIMDALL_TEAM_DIR overrides the team.json dir
-# (tests / non-git trees).
+# install repo comes from plugin.json. The ref is resolved to the HIGHEST tag
+# actually PUBLISHED on origin (git ls-remote — never the local VERSION or a
+# local-only tag that hasn't been pushed), else origin's `main` when offline;
+# HEIMDALL_REF pins explicitly but is still verified against origin. Before
+# printing, the resulting raw URL is probed (HTTP) and, if it does NOT resolve,
+# heimdall-invite REFUSES loudly (exit 3) rather than hand a teammate a silent-404
+# join. HEIMDALL_TEAM_DIR overrides the team.json dir (tests / non-git trees).
 #
 # SECURITY — the team secret IS a secret. It is this team's bearer capability,
 # deliberately shared with a teammate, so heimdall-invite PRINTS it to the terminal
@@ -43,8 +52,9 @@
 #   heimdall-invite --qr       also render a QR of the join (needs `qrencode`)
 #   -h | --help                this help
 #
-# Exit: 0 always on the happy + degrade paths (offline/unconfigured is normal); 2
-# on a bad flag.
+# Exit: 0 on the happy + degrade paths (offline/unconfigured is normal); 2 on a bad
+# flag; 3 when the resolved install ref does NOT resolve on origin (refuses to
+# print a silent-404 join — the owner must push/tag/publish first).
 set -uo pipefail
 
 # ── resolve this script's own dir (RELOCATABLE — symlink-followed, no baked path).
@@ -173,45 +183,114 @@ PYEOF
   esac
 }
 
-resolve_ref() {
-  # HEIMDALL_REF wins (a dev can pin); else the installed clone's nearest release
-  # tag (normalized to vX.Y.Z), else the manifest version (v-prefixed), else main.
-  if [ -n "${HEIMDALL_REF:-}" ]; then printf '%s' "$HEIMDALL_REF"; return 0; fi
-  local ver=""
-  if git -C "$PLUGIN_ROOT" rev-parse --git-dir >/dev/null 2>&1; then
-    ver="$(git -C "$PLUGIN_ROOT" describe --tags --abbrev=0 2>/dev/null || true)"
+# ── published-ref resolution. The join MUST pin a ref that actually EXISTS on
+# origin — else the teammate's `curl` 404s and they silently never install. We
+# resolve to the highest tag PUBLISHED on origin (git ls-remote), NOT the local
+# VERSION / a local-only tag (which may be bumped in prep but unpushed); offline /
+# no-tags we fall back to origin's canonical `main`. HEIMDALL_REF still lets a dev
+# pin, but the pin is verified against origin below. Test seams (network-free):
+# HEIMDALL_INVITE_PUBLISHED_TAGS / HEIMDALL_INVITE_PUBLISHED_BRANCHES stand in for
+# the ls-remote listings; HEIMDALL_INVITE_ASSUME_HTTP stands in for the raw-URL
+# HTTP probe; HEIMDALL_INVITE_REMOTE overrides the remote name (default origin). ─
+REMOTE="${HEIMDALL_INVITE_REMOTE:-origin}"
+
+published_tags() {
+  if [ -n "${HEIMDALL_INVITE_PUBLISHED_TAGS:-}" ]; then
+    printf '%s\n' $HEIMDALL_INVITE_PUBLISHED_TAGS
+    return 0
   fi
-  if [ -z "$ver" ] && [ -f "$MANIFEST" ]; then
-    if command -v jq >/dev/null 2>&1; then
-      ver="$(jq -r '.version // ""' "$MANIFEST" 2>/dev/null || true)"
-    elif [ -n "$PY" ]; then
-      ver="$(HMD_INV_CFG="$MANIFEST" "$PY" - <<'PYEOF' 2>/dev/null
-import json, os, sys
-try:
-    d = json.load(open(os.environ["HMD_INV_CFG"]))
-    sys.stdout.write(str(d.get("version") or ""))
-except Exception:
-    sys.stdout.write("")
-PYEOF
-)"
-    fi
+  git -C "$PLUGIN_ROOT" ls-remote --tags "$REMOTE" 2>/dev/null \
+    | sed 's#.*refs/tags/##' | grep -vE '\^\{\}$'
+}
+
+highest_published_tag() {
+  published_tags | grep -E '^v?[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1
+}
+
+ref_on_origin() {   # 0 iff $1 is a PUBLISHED tag OR a branch that exists on origin
+  local ref="$1"
+  published_tags | grep -qxF "$ref" && return 0
+  if [ -n "${HEIMDALL_INVITE_PUBLISHED_BRANCHES:-}" ]; then
+    printf '%s\n' $HEIMDALL_INVITE_PUBLISHED_BRANCHES | grep -qxF "$ref" && return 0
+    return 1
   fi
-  # Normalize a bare X.Y.Z to vX.Y.Z; keep an existing v-prefix; empty -> main.
-  case "$ver" in
-    "")                       printf 'main' ;;
-    v[0-9]*)                  printf '%s' "$ver" ;;
-    [0-9]*.[0-9]*.[0-9]*)     printf 'v%s' "$ver" ;;
-    *)                        printf '%s' "$ver" ;;
+  git -C "$PLUGIN_ROOT" ls-remote --heads "$REMOTE" "$ref" 2>/dev/null | grep -q . && return 0
+  return 1
+}
+
+# Resolve REF + whether it is CONFIRMED to exist on origin.
+REF=""; CONFIRMED=0
+if [ -n "${HEIMDALL_REF:-}" ]; then
+  REF="$HEIMDALL_REF"                         # an explicit pin — still verified below.
+  if ref_on_origin "$REF"; then CONFIRMED=1; else CONFIRMED=0; fi
+else
+  REF="$(highest_published_tag)"
+  if [ -n "$REF" ]; then
+    CONFIRMED=1                               # came straight from origin's tag list.
+  else
+    REF="main"; CONFIRMED=1                   # offline / no tags -> origin's canonical branch.
+  fi
+fi
+
+REPO_SLUG="$(resolve_repo_slug)"
+INSTALL_URL="https://raw.githubusercontent.com/$REPO_SLUG/$REF/install.sh"
+
+# ── verify the join actually resolves before we hand it to a teammate. Primary
+# gate: the ref must exist on origin. Defense in depth: the raw URL must return
+# HTTP 200 (a real non-200 like 404 blocks; a transport error offline does not
+# falsely block, since origin-confirmation already vouched for the ref). ─────────
+LAST_HTTP=""
+verify_install_url() {
+  local url="$1" code
+  if [ -n "${HEIMDALL_INVITE_ASSUME_HTTP:-}" ]; then
+    code="$HEIMDALL_INVITE_ASSUME_HTTP"
+  elif command -v curl >/dev/null 2>&1; then
+    code="$(curl -sS --proto '=https' -o /dev/null -w '%{http_code}' --max-time 12 "$url" 2>/dev/null || printf '000')"
+  else
+    code="200"                                # no probe available; origin-confirmation gated REF.
+  fi
+  LAST_HTTP="$code"
+  case "$code" in
+    200|000) return 0 ;;                      # resolves, or a transport error we won't block on.
+    *)       return 1 ;;                      # a real HTTP status (e.g. 404) -> broken -> block.
   esac
 }
 
-REPO_SLUG="$(resolve_repo_slug)"
-REF="$(resolve_ref)"
-INSTALL_URL="https://raw.githubusercontent.com/$REPO_SLUG/$REF/install.sh"
+refuse() {
+  # $1 = short reason. Loud, to STDERR, non-zero exit — never a silent broken join.
+  cat >&2 <<MSG
+heimdall-invite: REFUSING to print a join — the install URL does not resolve on origin.
+
+    $INSTALL_URL
+    ref: $REF  ($1)
+
+A teammate pasting a join pinned to an unpublished ref would SILENTLY fail to
+install (curl 404 -> nothing runs) and never join your team. Fix the ref first:
+
+  • Push your release + tag so the ref exists on origin:
+        git push "$REMOTE" HEAD --follow-tags
+  • Or invite against an already-published ref (a tag or branch on origin):
+        HEIMDALL_REF=<published-tag-or-main> heimdall-invite
+
+Then re-run heimdall-invite.
+MSG
+  exit 3
+}
+
+[ "$CONFIRMED" -eq 1 ] || refuse "ref not found on origin '$REMOTE'"
+verify_install_url "$INSTALL_URL" || refuse "raw URL returned HTTP $LAST_HTTP"
 
 # ── build the join one-liner. The URL is team-specific but NOT secret; the SECRET
-# IS — both are inlined ONLY into this string, written ONLY to stdout below. ──────
-JOIN="curl -fsSL $INSTALL_URL | HEIMDALL_CP_URL='$URL' HEIMDALL_TEAM_SECRET='$SECRET' bash"
+# IS — both are inlined ONLY into this string, written ONLY to stdout below. The
+# installer is downloaded to a mktemp file then run (`bash "$f"`), so a fetch
+# failure (404) yields a non-zero curl and NO bash run — never the old `| bash`
+# that swallowed an empty 404 body into a silent no-op. The secret rides ONLY the
+# env of the bash invocation; the downloaded file (install.sh) carries NO secret.
+# The subshell keeps the trailing `exit` from closing a teammate's interactive
+# shell. Every runtime $var (f, ?, r, TMPDIR) is left literal for the teammate's
+# shell; only the URL + CP url + secret are interpolated (printf %s). ────────────
+JOIN_FMT='( set -o pipefail; f="$(mktemp "${TMPDIR:-/tmp}/heimdall-install.XXXXXXXX")" && curl -fsSL --proto '\''=https'\'' %s -o "$f" && HEIMDALL_CP_URL='\''%s'\'' HEIMDALL_TEAM_SECRET='\''%s'\'' bash "$f"; r=$?; rm -f "$f"; exit $r )'
+JOIN="$(printf "$JOIN_FMT" "$INSTALL_URL" "$URL" "$SECRET")"
 printf 'Share this ONE command with a teammate to put them on your team:\n\n'
 printf '\xe2\x9a\xa0 contains your team secret — share only with teammates\n\n'
 printf '%s\n' "$JOIN"
