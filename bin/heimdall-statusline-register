@@ -127,7 +127,9 @@ fi
 
 # ── register: idempotent, atomic, custom-preserving merge (identical command form to
 # install.sh's ensure_statusline_registered so both propagation paths converge). ──
-HMD_SL_PLUGIN="$ROOT" HMD_SL_SETTINGS="$SETTINGS" python3 - <<'PY' 2>/dev/null || { printf 'skipped'; exit 0; }
+# Capture the state word so the caller (SessionStart hook, synchronous) can surface a
+# ONE-TIME activation note — stdout stays the pure state-word contract, note goes stderr.
+STATE="$(HMD_SL_PLUGIN="$ROOT" HMD_SL_SETTINGS="$SETTINGS" python3 - <<'PY' 2>/dev/null
 import json, os, sys, tempfile
 
 plugin = os.environ["HMD_SL_PLUGIN"]
@@ -190,4 +192,14 @@ elif custom:
 else:
     print("skipped")
 PY
+)" || STATE="skipped"
+# Any empty capture (python vanished/failed silently) degrades to a clean no-op word.
+[ -z "$STATE" ] && STATE="skipped"
+printf '%s\n' "$STATE"
+# Belt-and-suspenders: ONLY when this run newly wrote/refreshed the key ("registered")
+# do we surface a one-time note. Idempotent re-runs return "current" → silent. The note
+# is stderr so the stdout state-word contract stays untouched for install.sh/callers.
+if [ "$STATE" = registered ]; then
+  printf '[heimdall] statusline activated — visible next session\n' >&2
+fi
 exit 0
