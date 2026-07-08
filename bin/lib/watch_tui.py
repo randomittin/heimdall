@@ -17,6 +17,7 @@ it when Textual is present; otherwise it falls back to watch_data.static_dump().
 import os
 import importlib.util
 import subprocess
+import threading
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -41,6 +42,13 @@ def _resolve_hmd_bin():
 # Refresh cadence for the local caches. This is a LOCAL FILE re-read, NOT a network
 # poll — the beat/roster cadence that populates the caches runs independently.
 _REFRESH_SECONDS = 2.0
+
+# Presence-beat cadence while the wall is open: opening the wall marks you present, and a
+# beat every _BEAT_SECONDS keeps you TTL-live (comfortably inside the ~45s presence TTL)
+# without hammering the CP at the 2s render tick. When watch closes and the TTL lapses you
+# go offline naturally. The beat is a best-effort SHELL-OUT to the existing heimdall-presence
+# path (never the render loop's job) — see watch_data.build_beat_argv.
+_BEAT_SECONDS = 20.0
 
 
 class WatchApp(App):
@@ -98,8 +106,30 @@ class WatchApp(App):
         yield Footer()
 
     def on_mount(self):
+        # Opening the wall marks you present: beat on open, then on a TTL-live interval
+        # while the dashboard stays open. The render loop (refresh_data) stays LOCAL-only.
+        self._emit_beat()
         self.refresh_data()
         self.set_interval(_REFRESH_SECONDS, self.refresh_data)
+        self.set_interval(_BEAT_SECONDS, self._emit_beat)
+
+    # ── presence beat (best-effort, non-blocking) ─────────────────────────────
+    def _emit_beat(self):
+        """Shell the existing `heimdall-presence beat` so watching == being present. Runs on
+        a daemon thread with a short timeout so a slow/failed beat NEVER blocks or crashes the
+        TUI — the wall renders regardless. Reuses heimdall-presence (enroll/sign/HAID + team
+        secret header): an idempotent upsert keyed by HAID, so beating alongside a live
+        session adds no duplicate roster row. Runs from `self._root` so the beat's project +
+        team.json match the repo being watched."""
+        argv = wd.build_beat_argv(wd.resolve_presence_bin(os.environ))
+
+        def _run():
+            import contextlib
+            with contextlib.suppress(Exception):
+                subprocess.run(argv, cwd=self._root, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=5)
+
+        threading.Thread(target=_run, daemon=True).start()
 
     # ── data (local reads only) ──────────────────────────────────────────────
     def refresh_data(self):
