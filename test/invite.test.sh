@@ -1,20 +1,36 @@
 #!/usr/bin/env bash
 # test/invite.test.sh — acceptance test for the team-join viral loop
 # (bin/heimdall-invite). Proves, against the REAL CLI with a temp $HOME + a per-
-# repo team.json (via HEIMDALL_TEAM_DIR), with NO network call:
+# repo team.json (via HEIMDALL_TEAM_DIR), with NO real network call (origin
+# listing + the raw-URL HTTP probe are injected via test seams:
+# HEIMDALL_INVITE_PUBLISHED_TAGS / HEIMDALL_INVITE_PUBLISHED_BRANCHES /
+# HEIMDALL_INVITE_ASSUME_HTTP):
 #
 #   (a) SYNTAX — `bash -n` parses the script clean.
 #   (b) FULL JOIN — a repo team.json {team_secret} + a global cp-endpoint {url}
 #       prints the ONE-command join inlining BOTH the url and the TEAM SECRET into
-#       the canonical curl|bash installer (HEIMDALL_CP_URL + HEIMDALL_TEAM_SECRET),
-#       plus the "contains your team secret" caveat. Exit 0.
+#       the download-then-run installer form (curl -o <mktemp> && … bash <file>),
+#       pinned to the HIGHEST PUBLISHED tag on origin, plus the "contains your team
+#       secret" caveat. Exit 0.
 #   (c) URL-DEFAULT JOIN — a team.json secret but NO cp-endpoint url falls back to
 #       the shipped public default url (still HEIMDALL_TEAM_SECRET). Exit 0.
 #   (d) CLEAN DEGRADE — no team.json at all -> a helpful "run heimdall-team new"
-#       message, exit 0, NO traceback / NO `curl …| … bash` join emitted.
+#       message, exit 0, NO traceback / NO curl…bash join emitted.
 #   (e) NO-SECRET-TO-FILE — after the FULL-join case, the secret literal appears
 #       NOWHERE on disk under the temp dirs except, of course, the input team.json
 #       the dev already owns. The CLI writes the secret to STDOUT only.
+#   (f) FALSIFIER — REFUSE UNRESOLVABLE REF — when the pinned ref (HEIMDALL_REF)
+#       is NOT a published tag/branch on origin, the CLI must NOT print a join; it
+#       must print a loud error and exit non-zero (so a teammate never gets a
+#       silent-404 install one-liner).
+#   (g) FALSIFIER — EMITTED REF IS PUBLISHED — with no pin, the emitted install
+#       URL pins the HIGHEST tag that actually exists on origin (never the local
+#       VERSION / local-only tag).
+#   (h) FALSIFIER — NON-SWALLOWING ONE-LINER — the emitted join downloads the
+#       installer to a temp file and runs `bash <file>` (curl 404 -> no bash run ->
+#       loud non-zero), NOT the old `curl … | bash` shape that swallows a 404 into
+#       an empty pipe. The secret rides ONLY the env of the bash invocation — the
+#       curl download (what lands in the /tmp installer file) carries NO secret.
 #
 # A deliberately FAKE secret is used so the test output and the repo carry no real
 # credential (secret-scan stays clean).
@@ -32,6 +48,14 @@ CLI="$ROOT/bin/heimdall-invite"
 FAKE_URL="https://cp.example-team.test"
 FAKE_SECRET="FAKE-INVITE-SECRET-0000000000-not-a-real-token"
 DEFAULT_CP_URL="https://heimdall-cp-public-eqfrs7sfuq-uc.a.run.app"
+
+# Test seams — stand in for `git ls-remote` (published refs on origin) + the raw
+# URL HTTP probe, so the whole suite runs WITHOUT touching the network.
+PUB_TAGS="v2.0.9 v2.0.18 v2.0.10"     # highest published = v2.0.18
+PUB_HIGH="v2.0.18"
+export HEIMDALL_INVITE_PUBLISHED_TAGS="$PUB_TAGS"
+export HEIMDALL_INVITE_PUBLISHED_BRANCHES="main"
+export HEIMDALL_INVITE_ASSUME_HTTP="200"
 
 PASS=0
 FAIL=0
@@ -62,13 +86,15 @@ write_cp_url "$H1" "$FAKE_URL"; write_team "$TD1" "$FAKE_SECRET"
 OUT1="$(HOME="$H1" HEIMDALL_TEAM_DIR="$TD1" "$CLI"; echo "RC=$?")"
 RC1="${OUT1##*RC=}"; BODY1="${OUT1%RC=*}"
 if [ "$RC1" -eq 0 ] \
-   && printf '%s' "$BODY1" | grep -qF "curl -fsSL https://raw.githubusercontent.com/" \
+   && printf '%s' "$BODY1" | grep -qF "curl -fsSL --proto '=https' https://raw.githubusercontent.com/" \
+   && printf '%s' "$BODY1" | grep -qF "/$PUB_HIGH/install.sh" \
+   && printf '%s' "$BODY1" | grep -qF "set -o pipefail" \
+   && printf '%s' "$BODY1" | grep -qF 'bash "$f"' \
    && printf '%s' "$BODY1" | grep -qF "HEIMDALL_CP_URL='$FAKE_URL'" \
    && printf '%s' "$BODY1" | grep -qF "HEIMDALL_TEAM_SECRET='$FAKE_SECRET'" \
-   && printf '%s' "$BODY1" | grep -qF "install.sh | HEIMDALL_CP_URL=" \
-   && printf '%s' "$BODY1" | grep -qE " bash *$" \
+   && ! printf '%s' "$BODY1" | grep -qF "install.sh | HEIMDALL_CP_URL=" \
    && printf '%s' "$BODY1" | grep -q "contains your team secret"; then
-  ok "(b) team secret + url -> one-command join inlines both + prints the secret caveat (exit 0)"
+  ok "(b) team secret + url -> download-then-run join, pinned to the highest published tag, inlines both + caveat (exit 0)"
 else
   bad "(b) full-join output wrong (rc=$RC1):
 $BODY1"
@@ -96,7 +122,7 @@ RC3="${OUT3##*RC=}"; BODY3="${OUT3%RC=*}"
 if [ "$RC3" -eq 0 ] \
    && printf '%s' "$BODY3" | grep -q "no team is configured for this repo" \
    && ! printf '%s' "$BODY3" | grep -q "Traceback" \
-   && ! printf '%s' "$BODY3" | grep -qE "curl -fsSL https://raw\.githubusercontent\.com/[^ ]+ \| HEIMDALL_CP_URL="; then
+   && ! printf '%s' "$BODY3" | grep -qE "raw\.githubusercontent\.com/[^ ]+/install\.sh"; then
   ok "(d) no team.json -> helpful setup message, exit 0, no traceback, no fabricated join"
 else
   bad "(d) degrade output wrong (rc=$RC3):
@@ -118,8 +144,67 @@ else
 $HITS"
 fi
 
+# ── (f) FALSIFIER — refuse to emit a join pinned to an UNRESOLVABLE ref ──────────
+# HEIMDALL_REF pins a ref that is NOT among the published tags/branches on origin.
+# The CLI MUST refuse: loud error, non-zero exit, and NO curl…bash join emitted.
+H5="$(mk_dir)"; TD5="$(mk_dir)/.heimdall"
+write_cp_url "$H5" "$FAKE_URL"; write_team "$TD5" "$FAKE_SECRET"
+OUT5="$(HOME="$H5" HEIMDALL_TEAM_DIR="$TD5" HEIMDALL_REF="v99.99.99" \
+        HEIMDALL_INVITE_ASSUME_HTTP="404" "$CLI" 2>&1; echo "RC=$?")"
+RC5="${OUT5##*RC=}"; BODY5="${OUT5%RC=*}"
+if [ "$RC5" -ne 0 ] \
+   && ! printf '%s' "$BODY5" | grep -qE "raw\.githubusercontent\.com/[^ ]+/v99\.99\.99/install\.sh -o" \
+   && printf '%s' "$BODY5" | grep -qiE "does not resolve|REFUSING|not (published|resolve)"; then
+  ok "(f) unpublished pinned ref -> loud refusal, non-zero exit, NO join emitted"
+else
+  bad "(f) FALSIFIER: CLI emitted a join for an unresolvable ref (rc=$RC5):
+$BODY5"
+fi
+
+# ── (g) FALSIFIER — the emitted ref is the HIGHEST PUBLISHED tag on origin ───────
+# No pin: the emitted install URL must pin v2.0.18 (highest published), never a
+# local-only tag / the manifest VERSION.
+H6="$(mk_dir)"; TD6="$(mk_dir)/.heimdall"
+write_cp_url "$H6" "$FAKE_URL"; write_team "$TD6" "$FAKE_SECRET"
+OUT6="$(HOME="$H6" HEIMDALL_TEAM_DIR="$TD6" "$CLI"; echo "RC=$?")"
+RC6="${OUT6##*RC=}"; BODY6="${OUT6%RC=*}"
+EMITTED_REF="$(printf '%s' "$BODY6" | grep -oE 'raw\.githubusercontent\.com/[^ ]+/install\.sh' \
+                | head -1 | sed -E 's#.*/([^/]+)/install\.sh#\1#')"
+if [ "$RC6" -eq 0 ] && [ "$EMITTED_REF" = "$PUB_HIGH" ]; then
+  ok "(g) no pin -> emitted ref is the highest PUBLISHED tag ($EMITTED_REF), not a local-only ref"
+else
+  bad "(g) FALSIFIER: emitted ref is '$EMITTED_REF', expected '$PUB_HIGH' (rc=$RC6):
+$BODY6"
+fi
+
+# ── (h) FALSIFIER — non-swallowing one-liner; secret not in the downloaded file ──
+# The join must download the installer to a temp file then `bash <file>` (a 404
+# gives a non-zero curl and NO bash run), and the secret must ride ONLY the env of
+# the bash invocation — the curl download portion (what the /tmp installer file
+# receives) must NOT contain the secret.
+H7="$(mk_dir)"; TD7="$(mk_dir)/.heimdall"
+write_cp_url "$H7" "$FAKE_URL"; write_team "$TD7" "$FAKE_SECRET"
+OUT7="$(HOME="$H7" HEIMDALL_TEAM_DIR="$TD7" "$CLI"; echo "RC=$?")"
+RC7="${OUT7##*RC=}"; BODY7="${OUT7%RC=*}"
+# The join line is the last printed line carrying the raw installer URL.
+JOINLINE="$(printf '%s' "$BODY7" | grep -F 'raw.githubusercontent.com' | tail -1)"
+CURL_PART="${JOINLINE%%&& HEIMDALL_CP_URL=*}"   # everything up to the download's success
+if [ "$RC7" -eq 0 ] \
+   && printf '%s' "$JOINLINE" | grep -qF -e '-o "$f"' \
+   && printf '%s' "$JOINLINE" | grep -qF 'bash "$f"' \
+   && printf '%s' "$JOINLINE" | grep -qF "HEIMDALL_TEAM_SECRET='$FAKE_SECRET' bash" \
+   && printf '%s' "$CURL_PART" | grep -qF -e '-o "$f"' \
+   && ! printf '%s' "$CURL_PART" | grep -qF "$FAKE_SECRET"; then
+  ok "(h) non-swallowing join: downloads to a file then bash <file>; secret only in the bash env, not the download"
+else
+  bad "(h) FALSIFIER: one-liner shape wrong or secret in the download portion (rc=$RC7):
+JOIN: $JOINLINE
+CURL_PART: $CURL_PART"
+fi
+
 # ── cleanup ────────────────────────────────────────────────────────────────────
-rm -rf "$H1" "$H2" "$H3" "$H4" "$TD1" "$TD2" "$TD3" "$TD4" 2>/dev/null || true
+rm -rf "$H1" "$H2" "$H3" "$H4" "$H5" "$H6" "$H7" \
+       "$TD1" "$TD2" "$TD3" "$TD4" "$TD5" "$TD6" "$TD7" 2>/dev/null || true
 
 echo
 echo "  invite tests: $PASS passed, $FAIL failed"
