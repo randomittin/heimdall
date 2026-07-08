@@ -1276,15 +1276,10 @@ if [[ "${1:-}" == "--update" ]]; then
   printf "${R}\n"
   printf "  ${V}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${R}\n\n"
 
+  # DEV-CHECKOUT GUARD: a contributor's editable clone (local commits or uncommitted
+  # edits) must never be clobbered by an auto-update. If this is a dev checkout, print the
+  # correct MANUAL step instead of guessing — never touch a contributor's working tree.
   if [ -d "$PLUGIN_DIR/.git" ]; then
-    local_hash=$(git -C "$PLUGIN_DIR" rev-parse HEAD 2>/dev/null)
-    local_short="${local_hash:0:7}"
-
-    # DEV-CHECKOUT GUARD: the auto-update below does `git reset --hard origin/main`,
-    # which is safe for the canonical clean ~/.heimdall clone but would DESTROY a
-    # dev/editable checkout that has local commits or uncommitted edits. If this
-    # install can't be safely auto-updated, print the correct MANUAL step instead
-    # of guessing — never silently clobber a contributor's working tree.
     dirty_tree=0
     [ -n "$(git -C "$PLUGIN_DIR" status --porcelain 2>/dev/null)" ] && dirty_tree=1
     ahead_count=$(git -C "$PLUGIN_DIR" rev-list origin/main..HEAD --count 2>/dev/null || echo 0)
@@ -1300,86 +1295,25 @@ if [[ "${1:-}" == "--update" ]]; then
       printf "    ${C}hmd --reinstall${R}\n\n"
       exit 0
     fi
-
-    # Animated fetch
-    printf "  ${D}[1/2]${R} ${B}Sync${R}\n"
-    git -C "$PLUGIN_DIR" fetch origin main --force 2>/dev/null &
-    spin $! "Fetching from origin..."
-    git -C "$PLUGIN_DIR" fetch origin --force 2>/dev/null
-
-    # Compare
-    remote_hash=$(git -C "$PLUGIN_DIR" rev-parse origin/main 2>/dev/null)
-    remote_short="${remote_hash:0:7}"
-
-    if [ "$local_hash" != "$remote_hash" ]; then
-      # Update available — apply it
-      printf "\n  ${D}[2/2]${R} ${B}Apply${R}\n"
-      git -C "$PLUGIN_DIR" reset --hard origin/main >/dev/null 2>&1 &
-      spin $! "Applying ${local_short} → ${remote_short}..."
-
-      new_hash=$(git -C "$PLUGIN_DIR" rev-parse HEAD 2>/dev/null)
-      base=$(git -C "$PLUGIN_DIR" merge-base "$local_hash" "$new_hash" 2>/dev/null || echo "$local_hash")
-      echo "$base" > "$PLUGIN_DIR/.last-update-from"
-      changed=$(git -C "$PLUGIN_DIR" diff --name-only "$base".."$new_hash" 2>/dev/null | wc -l | tr -d ' ')
-
-      printf "\n  ${V}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${R}\n"
-      printf "  ${G}${B}✔ Updated${R}  ${D}%s files changed${R}\n" "$changed"
-      printf "  ${V}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${R}\n\n"
-
-      git -C "$PLUGIN_DIR" log --oneline "$base".."$new_hash" 2>/dev/null | head -12 | while IFS= read -r line; do
-        msg="${line#* }"
-        case "$msg" in
-          feat:*|feat\(*) printf "  ${G}▸ NEW ${R} %s\n" "${msg#feat: }" ;;
-          fix:*|fix\(*)   printf "  ${C}▸ FIX ${R} %s\n" "${msg#fix: }" ;;
-          docs:*)          printf "  ${D}▸ DOC ${R} %s\n" "${msg#docs: }" ;;
-          release:*)       printf "  ${W}▸ REL ${R} %s\n" "${msg#release: }" ;;
-          *)               printf "  ${D}▸     ${R} %s\n" "$msg" ;;
-        esac
-        sleep 0.04
-      done
-
-      printf "\n"
-      git -C "$PLUGIN_DIR" diff --stat "$base".."$new_hash" 2>/dev/null | tail -1 | while IFS= read -r line; do
-        printf "   ${D}%s${R}\n" "$line"
-      done
-      printf "\n"
-
-    else
-      # No changes available
-      printf "\n  ${V}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${R}\n"
-      printf "  ${G}✔ Already on latest${R}  ${D}(%s)${R}\n" "$local_short"
-      printf "  ${V}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${R}\n"
-
-      if [ ! -f "$PLUGIN_DIR/.last-update-from" ]; then
-        mk=$(git -C "$PLUGIN_DIR" log --oneline -10 2>/dev/null | tail -1 | cut -d' ' -f1)
-        [ -n "$mk" ] && echo "$mk" > "$PLUGIN_DIR/.last-update-from"
-      fi
-
-      if [ -f "$PLUGIN_DIR/.last-update-from" ]; then
-        last_from=$(cat "$PLUGIN_DIR/.last-update-from")
-        count=$(git -C "$PLUGIN_DIR" log --oneline "$last_from"..HEAD 2>/dev/null | wc -l | tr -d ' ')
-        if [ "${count:-0}" -gt 0 ]; then
-          printf "\n  ${D}%s changes since install:${R}\n\n" "$count"
-          git -C "$PLUGIN_DIR" log --oneline "$last_from"..HEAD 2>/dev/null | head -12 | while IFS= read -r line; do
-            msg="${line#* }"
-            case "$msg" in
-              feat:*|feat\(*) printf "  ${G}▸ NEW ${R} %s\n" "${msg#feat: }" ;;
-              fix:*|fix\(*)   printf "  ${C}▸ FIX ${R} %s\n" "${msg#fix: }" ;;
-              docs:*)          printf "  ${D}▸ DOC ${R} %s\n" "${msg#docs: }" ;;
-              release:*)       printf "  ${W}▸ REL ${R} %s\n" "${msg#release: }" ;;
-              *)               printf "  ${D}▸     ${R} %s\n" "$msg" ;;
-            esac
-            sleep 0.03
-          done
-        fi
-      fi
-      printf "\n"
-    fi
-  else
-    printf "  ${W}No git repo found. Reinstalling...${R}\n"
-    exec bash -c 'cd "$HOME" && curl -fsSL https://raw.githubusercontent.com/randomittin/heimdall/main/install.sh | bash'
   fi
-  exit 0
+
+  # SIGNED UPDATE (the teammate / released-install path). Delegate to the verifying updater:
+  # it resolves installed vs latest, fetches the release, VERIFIES its minisign signature
+  # against the in-repo trust root (release/heimdall-signing.pub), and applies ONLY on a
+  # clean verify — refusing a tampered/unsigned release LOUDLY (fail-closed). This replaces
+  # the old unsigned `git reset --hard origin/main`, which tracked the branch tip and skipped
+  # verification entirely. The updater pins the resolved version so the EXACT release installs.
+  AUTOUP="$PLUGIN_DIR/bin/heimdall-autoupdate"
+  if [ -x "$AUTOUP" ]; then
+    printf "  ${D}[1/1]${R} ${B}Verify & apply signed release${R}\n\n"
+    "$AUTOUP" update
+    exit $?
+  fi
+
+  # Fallback: the updater binary is missing (a broken/partial install). Re-run the canonical
+  # installer, which itself fails closed on a bad fetch. Never silently no-op.
+  printf "  ${W}Signed updater not found — reinstalling from the canonical installer…${R}\n"
+  exec bash -c 'cd "$HOME" && curl -fsSL https://raw.githubusercontent.com/randomittin/heimdall/main/install.sh | bash'
 fi
 
 # --reinstall: nuke and rebuild ~/.heimdall from scratch (fixes zombie states)

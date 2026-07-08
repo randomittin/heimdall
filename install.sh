@@ -572,10 +572,12 @@ sigil_handle() {
 
 main() {
   # ── Configuration ────────────────────────────────────────────────────────
-  # Pinned ref. No release tag exists yet, so this defaults to `main`; the
-  # README one-liner resolves runheimdall.dev/install to a pinned tag, and the
-  # release script templates that tag in here. HEIMDALL_REF overrides for dev.
-  local DEFAULT_REF="v2.0.5"
+  # Pinned ref = the CURRENT released tag. release/ship.sh rewrites this on every
+  # release (see bump_default_ref) so a fresh `curl|bash` install and hmd --update's
+  # reinstall fallback fetch THIS release, never a stale default. bin/heimdall-autoupdate
+  # ALSO pins HEIMDALL_REF to the version it verified, so an auto-update installs the
+  # exact resolved release regardless of this default. HEIMDALL_REF overrides for dev.
+  local DEFAULT_REF="v2.0.19"
   local REF="${HEIMDALL_REF:-$DEFAULT_REF}"
   local REPO="${HEIMDALL_REPO:-https://github.com/randomittin/heimdall.git}"
 
