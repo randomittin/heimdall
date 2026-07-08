@@ -64,8 +64,12 @@ docs/superpowers/plans/
 /*.seed
 # Belt-and-suspenders for a dev who creates them under an in-repo .heimdall/ (already
 # covered by `.heimdall/*`, named here so an un-ignore exception can never leak them).
-# team.json is the per-repo TEAM SECRET install.sh writes for the team-invite path
-# (HEIMDALL_TEAM_SECRET) — a bearer capability; it must never be committed.
+# team.json is the per-repo TEAM SECRET — a bearer capability. RECONCILIATION (settled
+# model): it stays GITIGNORED by default (this line) so a stray `git add .` can NEVER
+# stage the secret; the DELIBERATE private-repo path in bin/heimdall-team FORCE-ADDS it
+# (`git add -f`, --no-verify) ONLY after PROVING the repo private (read access == the
+# team boundary → clone == join). Once tracked, gitignore no longer applies to it. A
+# PUBLIC / privacy-unverifiable repo keeps it ignored and grows the team via `hmd invite`.
 .heimdall/cp-endpoint.json
 .heimdall/pki/
 .heimdall/identity.json
@@ -135,13 +139,3 @@ evals/oracles/*/report.json
 evals/benchmark/results.jsonl
 # Git worktrees (heimdall isolation)
 .worktrees/
-
-# heimdall team secret — gitignored on a PUBLIC/unverified repo: a bearer
-# secret must never be committed to a world-readable repo. Grow the team
-# out-of-band with `hmd invite`.
-.heimdall/team.json
-
-# heimdall team secret — gitignored on a PUBLIC/unverified repo: a bearer
-# secret must never be committed to a world-readable repo. Grow the team
-# out-of-band with `hmd invite`.
-.heimdall/team.json
