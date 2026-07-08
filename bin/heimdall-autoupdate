@@ -22,6 +22,12 @@
 #   heimdall-autoupdate check      throttled, background, safe. Resolve installed vs latest;
 #                                  if newer, background-apply; else no-op. ALWAYS exit 0 fast.
 #   heimdall-autoupdate --force    ignore the throttle; check now (still background-applies).
+#   heimdall-autoupdate update     MANUAL foreground update (the `hmd --update` path): resolve
+#                                  installed vs latest, verify the signed release, and apply it
+#                                  NOW in the foreground. Ignores throttle + auto-update opt-out
+#                                  (the user explicitly asked). Loud + fail-closed + non-zero on
+#                                  any refusal. Pins HEIMDALL_REF so the EXACT verified version
+#                                  installs (never install.sh's stale DEFAULT_REF).
 #   heimdall-autoupdate status     print installed + latest + whether an update is pending.
 #                                  A read-only inspection — never applies.
 #
@@ -265,22 +271,22 @@ apply_update() {
   if [ ! -f "$verlib" ]; then
     log_line "refuse $latest verify-lib-missing ($verlib) — staying on current"
     _refuse_msg "$latest" "the signature-verification library is missing"
-    return 0
+    return 1
   fi
   # shellcheck source=/dev/null
-  . "$verlib" || { log_line "refuse $latest verify-lib-unloadable — staying on current"; _refuse_msg "$latest" "the signature verifier could not load"; return 0; }
+  . "$verlib" || { log_line "refuse $latest verify-lib-unloadable — staying on current"; _refuse_msg "$latest" "the signature verifier could not load"; return 1; }
 
   # Acquire the artifact + its detached signature. TEST seam: caller supplies local paths
   # (HEIMDALL_INSTALL_ARTIFACT / HEIMDALL_INSTALL_SIG) → no network.
   local artifact="${HEIMDALL_INSTALL_ARTIFACT:-}" sig="${HEIMDALL_INSTALL_SIG:-}" workdir=""
   if [ -z "$artifact" ]; then
-    command -v curl >/dev/null 2>&1 || { log_line "apply-skip $latest no-curl"; return 0; }
+    command -v curl >/dev/null 2>&1 || { log_line "apply-skip $latest no-curl"; _refuse_msg "$latest" "curl is required to download the release but is not installed"; return 1; }
     workdir="$(mktemp -d "${TMPDIR:-/tmp}/heimdall-apply.XXXXXX" 2>/dev/null)" \
-      || { log_line "apply-skip $latest no-tmp"; return 0; }
+      || { log_line "apply-skip $latest no-tmp"; _refuse_msg "$latest" "a temporary working directory could not be created"; return 1; }
     artifact="$workdir/install.sh"; sig="$workdir/install.sh.minisig"
     if ! curl -fsSL --max-time 30 "$url" -o "$artifact" 2>/dev/null; then
       rm -rf "$workdir"; log_line "refuse $latest download-failed ($url) — staying on current"
-      _refuse_msg "$latest" "the release artifact could not be downloaded"; return 0
+      _refuse_msg "$latest" "the release artifact could not be downloaded"; return 1
     fi
     # A missing signature asset is NOT a download error — it just fails verification below
     # (fail-closed: an unsigned release is refused, never applied).
@@ -294,7 +300,7 @@ apply_update() {
     log_line "refuse $latest signature rc=$vrc ($reason) — staying on current"
     _refuse_msg "$latest" "$reason"
     [ -n "$workdir" ] && rm -rf "$workdir"
-    return 0
+    return 1
   fi
   log_line "verified $latest signature ok (pubkey $pubkey)"
 
@@ -305,16 +311,33 @@ apply_update() {
     return 0
   fi
 
+  # Install the EXACT version we just resolved + verified — PIN HEIMDALL_REF=$ref so the
+  # installer fetches THIS release, never its own baked DEFAULT_REF. Without this pin a stale
+  # DEFAULT_REF (historically v2.0.5) silently DOWNGRADED every auto-update and re-triggered it
+  # forever. The verified version is authoritative; install.sh's default is irrelevant here.
+
+  # Foreground manual apply (the `hmd --update` / `heimdall-autoupdate update` path): run the
+  # verified installer SYNCHRONOUSLY, streaming its output, and return its real exit code so the
+  # caller can report success/failure LOUDLY. Never detached — the user is watching.
+  if [ "${HEIMDALL_APPLY_FOREGROUND:-0}" = "1" ]; then
+    log_line "apply $latest (foreground manual) verified via $ref"
+    HEIMDALL_REF="$ref" bash "$artifact"
+    local irc=$?
+    [ -n "$workdir" ] && rm -rf "$workdir"
+    return "$irc"
+  fi
+
   log_line "apply $latest (background, next session) verified via $ref"
   # Execute the EXACT bytes we verified (verify-then-run-same-file — no TOCTOU re-fetch).
   # Detached + fully backgrounded via setsid so it survives this process exiting and never
   # holds SessionStart open; the workdir is removed after the installer finishes.
   if command -v setsid >/dev/null 2>&1; then
-    setsid bash -c "bash '$artifact' >>'$LOG_FILE' 2>&1; rm -rf '$workdir' 2>/dev/null" >/dev/null 2>&1 &
+    setsid env HEIMDALL_REF="$ref" bash -c "bash '$artifact' >>'$LOG_FILE' 2>&1; rm -rf '$workdir' 2>/dev/null" >/dev/null 2>&1 &
   else
-    ( bash "$artifact" >>"$LOG_FILE" 2>&1; rm -rf "$workdir" 2>/dev/null ) >/dev/null 2>&1 &
+    ( HEIMDALL_REF="$ref" bash "$artifact" >>"$LOG_FILE" 2>&1; rm -rf "$workdir" 2>/dev/null ) >/dev/null 2>&1 &
   fi
   disown 2>/dev/null || true
+  return 0
 }
 
 # ── core: resolve installed vs latest, decide, maybe apply ──────────────────────
@@ -371,11 +394,53 @@ cmd_status() {
   exit 0
 }
 
+# ── update (MANUAL, foreground, LOUD, fail-closed) ───────────────────────────────
+# The `hmd --update` path delegates here. Unlike the background `check`, this is an
+# EXPLICIT user request: it ignores the throttle AND the auto-update opt-out (the user
+# asked), resolves installed vs latest, and — iff newer — fetches, VERIFIES the release
+# signature against the in-repo trust root, and applies it in the FOREGROUND so the user
+# sees the result. Every failure is loud (stderr + non-zero exit); a tampered/unsigned
+# release is REFUSED exactly like the background path (apply_update is the shared gate).
+cmd_update() {
+  local installed latest
+  installed="$(installed_version)"
+  latest="$(latest_version)"
+
+  if [ -z "$latest" ]; then
+    printf 'heimdall: could not determine the latest version (offline or GitHub unreachable).\n' >&2
+    printf 'heimdall: staying on the current version — try again when you have a connection.\n' >&2
+    exit 1
+  fi
+  if [ -z "$installed" ]; then
+    printf 'heimdall: could not determine the installed version — cannot compare safely.\n' >&2
+    exit 1
+  fi
+
+  if [ "$(semver_is_newer "$installed" "$latest")" != "newer" ]; then
+    printf 'heimdall: already on the latest version (v%s).\n' "$installed"
+    log_line "manual-update current (installed=$installed latest=$latest)"
+    exit 0
+  fi
+
+  printf 'heimdall: updating v%s → v%s (verifying release signature)…\n' "$installed" "$latest"
+  HEIMDALL_APPLY_FOREGROUND=1 apply_update "$latest"
+  local rc=$?
+  if [ "$rc" -eq 0 ]; then
+    printf 'heimdall: ✔ updated to v%s — the new version is active on your next `hmd` launch.\n' "$latest"
+    exit 0
+  fi
+  # apply_update already printed a loud, specific refusal reason to stderr.
+  printf 'heimdall: ✗ update to v%s did NOT complete — you are still on v%s (see above / %s).\n' \
+    "$latest" "$installed" "$LOG_FILE" >&2
+  exit 1
+}
+
 # ── dispatch ─────────────────────────────────────────────────────────────────────
 SUB="${1:-check}"
 case "$SUB" in
   check)        run_check ;;
   --force|force) run_check force ;;
+  update)       cmd_update ;;
   status)       cmd_status ;;
   -h|--help|help)
     cat <<'USAGE'
@@ -383,6 +448,7 @@ heimdall-autoupdate — hmd keeps itself current, safely, in the background
 
   heimdall-autoupdate check      throttled background check; background-applies if newer (default)
   heimdall-autoupdate --force    ignore the throttle and check now (still background-applies)
+  heimdall-autoupdate update     MANUAL foreground update: verify the signed release + apply now
   heimdall-autoupdate status     print installed + latest + whether an update is pending
 
 Auto-update is ON by default. Opt out: HEIMDALL_NO_AUTOUPDATE=1 or a file at

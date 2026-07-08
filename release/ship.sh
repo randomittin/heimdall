@@ -155,6 +155,21 @@ sign_release_artifact() {  # $1 = tag (vX.Y.Z). Best-effort: WARN + return 0 whe
   rm -rf "$sigdir"
 }
 
+# bump_default_ref — pin install.sh's `local DEFAULT_REF="vX.Y.Z"` to $1 (a vX.Y.Z tag) and
+# `git add` it. Idempotent; a no-op (returns 0) if the file or the line is absent so a repo
+# layout change never hard-blocks a release. This is what keeps fresh installs off a stale ref.
+bump_default_ref() {
+  local tag="$1"
+  local file="${SHIP_INSTALL_SH:-${REPO_ROOT:-$PWD}/install.sh}"
+  printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' || { warn "bump_default_ref: '$tag' is not a vX.Y.Z tag — skipping"; return 0; }
+  [ -f "$file" ] || { warn "bump_default_ref: $file not found — skipping"; return 0; }
+  grep -Eq 'local DEFAULT_REF="v[0-9]+\.[0-9]+\.[0-9]+"' "$file" || { warn "bump_default_ref: no DEFAULT_REF line in $file — skipping"; return 0; }
+  sed -E -i.bak "s/(local DEFAULT_REF=\")v[0-9]+\.[0-9]+\.[0-9]+(\")/\1${tag}\2/" "$file" \
+    && rm -f "$file.bak"
+  git add "$file" 2>/dev/null || true
+  ok "pinned install.sh DEFAULT_REF → $tag"
+}
+
 # Test/introspection seam: `SHIP_SOURCE_ONLY=1 . release/ship.sh` defines the functions above
 # (read_version, sign_release_artifact, …) WITHOUT running the release flow. Executed normally
 # the variable is unset and we fall through to the real pipeline below.
@@ -224,6 +239,10 @@ if [ "$CHECK_ONLY" -eq 0 ] && [ "$DO_BUMP" -eq 1 ]; then
   fi
   write_version "$NEW_VERSION"
   git add "$PLUGIN_MANIFEST"
+  # Pin install.sh's DEFAULT_REF to THIS tag so a fresh `curl|bash` install and hmd --update's
+  # reinstall fallback fetch this release, not a stale default (the historical v2.0.5 downgrade
+  # bug). Folded into the release commit so main + the tag always carry a current default.
+  bump_default_ref "$TAG"
   git commit --no-verify -q -m "chore(release): $TAG" || die "bump commit failed"
   ok "bumped $CUR_VERSION → $NEW_VERSION (commit $(git rev-parse --short HEAD))"
 elif [ "$DO_BUMP" -eq 0 ]; then
