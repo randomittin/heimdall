@@ -142,20 +142,45 @@ SH
   chmod +x "$FAKEBIN/$c"
 done
 
+# ── beat stub: opening the wall beats (open == present). The REAL heimdall-presence
+# would speak HTTPS to the CP — a NETWORK call the zero-server-load render invariant (1)
+# forbids on the read path. So inject a HERMETIC stub (pure bash — NO socket) that RECORDS
+# the dispatched beat to a log. (1) then proves BOTH that the render path makes zero DIRECT
+# network calls AND that watch dispatched exactly one beat through the reused presence bin.
+export BEATLOG="$WORK/beat.log"; : > "$BEATLOG"
+BEAT_STUB="$FAKEBIN/heimdall-presence"
+cat > "$BEAT_STUB" <<SH
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$BEATLOG"
+exit 0
+SH
+chmod +x "$BEAT_STUB"
+
 run_watch_once() {
   PYTHONPATH="$TRIP${PYTHONPATH:+:$PYTHONPATH}" PATH="$FAKEBIN:$PATH" \
     NO_COLOR=1 HEIMDALL_STATUSLINE_MODE=mono \
     HEIMDALL_WATCH_ROOT="$REPO" HEIMDALL_HOME="$HEIMDALL_HOME" \
+    HEIMDALL_PRESENCE_BIN="$BEAT_STUB" \
     "$BIN" --once 2>&1
 }
 
 # ── (1) ZERO ADDITIONAL SERVER CALLS ────────────────────────────────────────
-: > "$TRIPWIRE_LOG"
+: > "$TRIPWIRE_LOG"; : > "$BEATLOG"
 DUMP="$(run_watch_once)"; wrc=$?
 if [ -s "$TRIPWIRE_LOG" ]; then
   bad "(1) watch session made a network call:"; sed 's/^/      /' "$TRIPWIRE_LOG"
 else
-  ok "(1) watch session made ZERO network calls (tripwire log empty)"
+  ok "(1) watch RENDER path made ZERO direct network calls (tripwire log empty)"
+fi
+
+# ── (1c) OPEN == PRESENT — watch dispatched a beat through the reused presence bin ──
+# The render path stays local (above); the presence beat is a SEPARATE best-effort
+# shell-out to heimdall-presence (here the hermetic stub). A single `hmd watch --once`
+# must self-include on the roster, so it MUST dispatch exactly one `beat`.
+if grep -qw 'beat' "$BEATLOG"; then
+  ok "(1c) opening the wall dispatched a presence beat (open == present, via heimdall-presence beat)"
+else
+  bad "(1c) watch --once did NOT beat — a watcher with no live session stays invisible"; sed 's/^/      /' "$BEATLOG"
 fi
 
 # ── (1b) negative control — the tripwire DOES catch a real connection ────────

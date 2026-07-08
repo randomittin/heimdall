@@ -289,6 +289,37 @@ def build_shell_argv(action, hmd_bin, event=None):
     return []
 
 
+# ── presence beat (open the wall == you're on the wall) ───────────────────────
+# Opening the wall marks you present: watch emits a lightweight heartbeat through the
+# EXISTING beat path so simply watching keeps you TTL-live (when watch closes and the
+# TTL lapses you go offline naturally). Like the owner actions, watch NEVER speaks the
+# presence protocol itself — it BUILDS the argv here (pure) and the action layer
+# (watch_entry one-shot / watch_tui interval) RUNS it best-effort. The beat REUSES
+# heimdall-presence: its enroll/sign/HAID resolution + X-Heimdall-Team-Secret header,
+# so the heartbeat lands in exactly the partition the watcher's own team.json reads
+# back (idempotent upsert keyed by HAID — no duplicate roster rows).
+def resolve_presence_bin(env=None):
+    """The sibling `heimdall-presence` CLI — the ONE beat path watch reuses. Override
+    with HEIMDALL_PRESENCE_BIN (testability / a packaged path); else bin/heimdall-presence
+    next to this lib dir; else the bare name resolved on PATH."""
+    env = os.environ if env is None else env
+    override = env.get("HEIMDALL_PRESENCE_BIN")
+    if override:
+        return override
+    here = os.path.dirname(os.path.abspath(__file__))
+    cand = os.path.normpath(os.path.join(here, "..", "heimdall-presence"))
+    if os.path.exists(cand):
+        return cand
+    return "heimdall-presence"
+
+
+def build_beat_argv(presence_bin):
+    """The argv that SHELLS the existing presence beat (heimdall-presence beat). ALWAYS a
+    LIST (the caller runs it with shell=False). The beat is best-effort: the caller times
+    it out and swallows errors so the wall still renders on a network hiccup."""
+    return [presence_bin, "beat"]
+
+
 # ── render core bridge (consume hmd_sigil + hmd_termcaps; never re-implement) ─
 def _sentinels_dir(explicit=None):
     if explicit:
