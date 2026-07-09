@@ -305,6 +305,44 @@ _ALLOWLIST = {
         requires_gate=False,
         isolated=True,
     ),
+    # aggregate-issues: the DAILY k-anon fold of the ANONYMIZED ISSUE store (Wave 3,
+    # issue-collection). Rolls the isolated heimdall_corpus/issues/ partitions into the
+    # published k-anon aggregate (cp_issue_aggregate.run_daily_aggregate) — a DATA-ONLY
+    # job that reads + writes ONLY the corpus namespace, dispatches nothing, spawns no
+    # process, makes no model call. THE SECURITY SPINE HOLDS BY CONSTRUCTION: the ONE
+    # optional param is a bounded Int k-anon override (never a free string / cmd / prompt),
+    # and validate_params refuses any extra key, so a breach cannot smuggle a command
+    # through this action. isolated=True (§2 low-priv env); requires_gate=False (a bounded,
+    # reversible aggregate that only ever SUPPRESSES below the k-anon floor — never opens a
+    # PR, never touches control-plane state). A cron fires it once a day via cp_scheduler,
+    # which re-validates through THIS gate at both create- and fire-time.
+    "aggregate-issues": ActionSpec(
+        handler="cp_handlers.aggregate_issues",
+        # k_min: an OPTIONAL bounded distinct-team k-anon override (mirrors the CLI --k-min).
+        # Absent -> the handler uses issue_corpus.ISSUE_K_ANONYMITY_MIN (=10). A bounded Int
+        # only — it can carry no shell/command payload. Raising it only SUPPRESSES more
+        # buckets (fail-safe toward MORE privacy); it can never surface a sub-threshold cell.
+        params={"k_min": Opt(Int(lo=1, hi=1000))},
+        requires_gate=False,
+        isolated=True,
+    ),
+    # synth-issues: the DAILY SHADOW-synthesis of candidate GitHub issues from the k-anon
+    # aggregate (Wave 3, issue-collection). Clusters k-anon-cleared signature buckets into
+    # SHADOW proposals (cp_issue_synth.run_synthesis) a maintainer promotes by hand — it
+    # enforces nothing, auto-opens NOTHING, dispatches nothing, makes no model call. SAME
+    # blast-radius wall as aggregate-issues: the ONE optional param is a bounded Int support
+    # floor (never a free string / cmd / prompt), extra keys refused. isolated=True;
+    # requires_gate=False (SHADOW-only — every proposal is pending_review/enforced=False, so
+    # the human gate is downstream at promotion, not here). Cron-fired via cp_scheduler.
+    "synth-issues": ActionSpec(
+        handler="cp_handlers.synth_issues",
+        # min_teams: an OPTIONAL bounded distinct-team SUPPORT floor a signature cluster must
+        # clear before it becomes a candidate (mirrors the CLI --min-teams). Absent -> the
+        # handler uses the imported k-anon floor. A bounded Int only; no free-string payload.
+        params={"min_teams": Opt(Int(lo=1, hi=1000))},
+        requires_gate=False,
+        isolated=True,
+    ),
 }
 
 # Freeze the registry: a read-only proxy so no runtime code can add an action_type.
