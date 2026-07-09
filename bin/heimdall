@@ -23,6 +23,16 @@ fi
 PLUGIN_DIR="$(cd "$(dirname "$SELF")/.." && pwd)"
 WORK_DIR="$(pwd)"
 
+# Arrow-key selection menu helper (bin/lib/select.sh) — powers every interactive
+# prompt (the persona pick, the uninstall/reinstall confirms) with ↑/↓ + Enter
+# selection, j/k aliases, clean Ctrl-C abort (always restores the terminal), and
+# a hang-proof non-TTY fallback. Sourced best-effort: a missing lib degrades to
+# the guarded typed-read fallbacks at each call site, never a crash.
+if [ -f "$PLUGIN_DIR/bin/lib/select.sh" ]; then
+  # shellcheck disable=SC1091
+  . "$PLUGIN_DIR/bin/lib/select.sh" 2>/dev/null || true
+fi
+
 # ── First-run completion marker (USER-writable, NEVER the install dir) ──
 #
 # The marker MUST live in a user-writable path, NOT $PLUGIN_DIR. Live GCE failure:
@@ -243,7 +253,7 @@ f1_persona_check() {
     # unset so the next interactive run asks once; product code defaults to the
     # guided (non-coder) surface until then (persona_store.is_coder() → False).
     if [ -t 0 ] && [ -t 1 ] && [ "${HEIMDALL_NO_INTRO:-0}" != "1" ] && [ "${F1_ASSUME_YES:-0}" != "1" ]; then
-      local P D R reply choice
+      local P D R choice
       P='\033[38;2;224;86;160m'; D='\033[2m'; R='\033[0m'
       # Re-check stdin is STILL an interactive TTY immediately before the read.
       # The outer guard can pass while stdin is redirected away from the terminal
@@ -261,18 +271,24 @@ f1_persona_check() {
         # and it can be changed later.
         printf "\n  ${P}One-time question${R} — how should Heimdall explain its work to you?\n"
         printf "    ${D}This only changes the wording of explanations, not what Heimdall can do.${R}\n"
-        printf "    ${D}1) coder      — technical and terse: shows code, commands, file paths${R}\n"
-        printf "    ${D}2) non-coder  — plain language: explains what it's doing in everyday terms${R}\n"
-        reply=""
-        # -t timeout is belt-and-suspenders for a wedged INTERACTIVE terminal (a
-        # human walks away mid-prompt); the [ -t 0 ] re-check above is the real
-        # non-TTY guard. No answer within the window → defer (leave unset).
-        read -rt 60 -p "  choose [1/2] (default 1 = coder): " reply 2>/dev/null || reply=""
-        case "$reply" in
-          2|non-coder|nc) choice="non-coder" ;;
-          *)              choice="coder" ;;
-        esac
-        if "$persona_bin" set "$choice" >/dev/null 2>&1; then
+        # Arrow-key selection (↑/↓ + Enter; j/k aliases; Ctrl-C cancels and
+        # restores the terminal). hmd_select renders the highlighted choice and
+        # returns the picked index in HMD_SELECT_INDEX. It reads keys ONLY on a
+        # real TTY (already guaranteed by the [ -t 0 ]/[ -t 1 ] guards above) and
+        # can never hang on a non-TTY stream. If the helper is unavailable (a
+        # partial install), DEFER — leave the persona unset for the next run
+        # rather than reintroduce a typed-number read that could stall.
+        choice=""
+        if command -v hmd_select >/dev/null 2>&1; then
+          hmd_select 0 "" \
+            "coder      — technical and terse: shows code, commands, file paths" \
+            "non-coder  — plain language: explains what it's doing in everyday terms"
+          case "$HMD_SELECT_INDEX" in
+            1) choice="non-coder" ;;
+            *) choice="coder" ;;
+          esac
+        fi
+        if [ -n "$choice" ] && "$persona_bin" set "$choice" >/dev/null 2>&1; then
           F1_PERSONA="$choice"
           printf "  ${P}▸ Talking to you as: %s${R} ${D}(remembered — asked once; change anytime)${R}\n\n" "$choice"
         fi
@@ -1040,7 +1056,14 @@ case "${1:-}" in
     _uyes=0; for _a in "$@"; do { [ "$_a" = "--yes" ] || [ "$_a" = "-y" ]; } && _uyes=1; done
     if [ "$_uyes" -ne 1 ]; then
       if [ -t 0 ]; then
-        read -p "  Remove heimdall from ~/.heimdall and PATH? [y/N] " _confirm
+        # Arrow-key confirm (↑/↓ + Enter, default No). Falls back to a guarded
+        # typed [y/N] read only if the select helper is unavailable.
+        _confirm=n
+        if command -v hmd_confirm >/dev/null 2>&1; then
+          hmd_confirm "  Remove heimdall from ~/.heimdall and PATH?" && _confirm=y
+        else
+          read -p "  Remove heimdall from ~/.heimdall and PATH? [y/N] " _confirm
+        fi
         if [[ "${_confirm:-n}" != [yY]* ]]; then
           printf "\n  ${D}Cancelled — nothing removed.${R}\n\n"
           exit 0
@@ -1332,7 +1355,13 @@ if [[ "${1:-}" == "--reinstall" || "${1:-}" == "--fix" ]]; then
   for _a in "$@"; do { [ "$_a" = "--yes" ] || [ "$_a" = "-y" ]; } && _ri_yes=1; done
   if [ "$_ri_yes" -ne 1 ]; then
     if [ -t 0 ]; then
-      read -p "  Proceed? [y/N] " confirm
+      # Arrow-key confirm (↑/↓ + Enter, default No); guarded typed fallback.
+      confirm=n
+      if command -v hmd_confirm >/dev/null 2>&1; then
+        hmd_confirm "  Proceed with reinstall (wipes ~/.heimdall)?" && confirm=y
+      else
+        read -p "  Proceed? [y/N] " confirm
+      fi
       if [[ "${confirm:-n}" != [yY]* ]]; then
         echo "  Cancelled."
         exit 0
@@ -1390,7 +1419,14 @@ if [[ "${1:-}" == "--uninstall" ]]; then
 
   # Interactive confirm only on a TTY without --yes; --yes/non-TTY skips it.
   if [ "$ASSUME_YES" -ne 1 ]; then
-    read -p "  Remove heimdall from ~/.heimdall and PATH? [y/N] " confirm
+    # Arrow-key confirm (↑/↓ + Enter, default No). Reachable only on a TTY (the
+    # non-TTY-without-yes case already exited 2 above). Guarded typed fallback.
+    confirm=n
+    if command -v hmd_confirm >/dev/null 2>&1; then
+      hmd_confirm "  Remove heimdall from ~/.heimdall and PATH?" && confirm=y
+    else
+      read -p "  Remove heimdall from ~/.heimdall and PATH? [y/N] " confirm
+    fi
     if [[ "${confirm:-n}" != [yY]* ]]; then
       printf "\n  ${P}${B}(ᵔᴥᵔ)${R}  ${D}phew! welcome back.${R}\n\n"
       exit 0
@@ -1421,7 +1457,13 @@ if [[ "${1:-}" == "--uninstall" ]]; then
   # Uninstall companion plugins — interactive only (TTY without --yes). In
   # --yes/non-TTY mode skip silently to honor the zero-stdin contract.
   if [ "$ASSUME_YES" -ne 1 ]; then
-    read -p "  Also uninstall companion plugins (caveman, claude-mem)? [y/N] " plugins
+    # Arrow-key confirm (↑/↓ + Enter, default No); guarded typed fallback.
+    plugins=n
+    if command -v hmd_confirm >/dev/null 2>&1; then
+      hmd_confirm "  Also uninstall companion plugins (caveman, claude-mem)?" && plugins=y
+    else
+      read -p "  Also uninstall companion plugins (caveman, claude-mem)? [y/N] " plugins
+    fi
     if [[ "${plugins:-n}" == [yY]* ]]; then
       claude plugins uninstall caveman 2>/dev/null && printf "  ${D}×${R} caveman removed\n" || true
       claude plugins uninstall superpowers 2>/dev/null && printf "  ${D}×${R} superpowers removed\n" || true
