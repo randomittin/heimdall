@@ -48,6 +48,10 @@
 #   HEIMDALL_NO_AUTOUPDATE=1        opt out (also: ${HOME}/.heimdall/no-autoupdate file).
 #   HEIMDALL_UPDATE_INTERVAL=86400  throttle window in seconds (default 24h).
 #   HEIMDALL_LATEST_OVERRIDE=X.Y.Z  TEST seam: inject the "latest" version, skip the network.
+#   HEIMDALL_INSTALLED_OVERRIDE=X.Y.Z  TEST seam: inject the "installed" version (skip git/manifest
+#                                   resolution). Lets a test simulate a much-older install
+#                                   (e.g. v2.0.5) climbing to the current release. Never used
+#                                   in production — real installs resolve from the git tag.
 #   HEIMDALL_AUTOUPDATE_DRYRUN=1    TEST seam: resolve + decide, but DON'T fetch/verify/detach
 #                                   (logs "would-apply"). Decide-only. Never used in production.
 #   HEIMDALL_SIGNING_PUBKEY=PATH    override the trust-root public key (default in-repo
@@ -103,6 +107,11 @@ norm_semver() {
 # or '' if nothing resolves. Falls back to THIS repo's manifest when the plugin dir has
 # no resolvable tag (e.g. a tarball install).
 installed_version() {
+  # TEST seam: an injected installed version short-circuits git/manifest resolution so a
+  # test can simulate an arbitrary old install (v2.0.5) climbing. Normalised → bare X.Y.Z.
+  local inj; inj="$(norm_semver "${HEIMDALL_INSTALLED_OVERRIDE:-}")"
+  if [ -n "$inj" ]; then printf '%s' "$inj"; return 0; fi
+
   local ver=""
   if git -C "$PLUGIN_DIR" rev-parse --git-dir >/dev/null 2>&1; then
     ver="$(git -C "$PLUGIN_DIR" describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null || true)"
@@ -223,6 +232,31 @@ touch_stamp() {
   : > "$STAMP" 2>/dev/null || true
 }
 
+# ── update-check cache (the SIGNAL the statusline + launcher notice consume) ─────
+# The launcher's own cache writer (bin/heimdall check_for_update) is gated on an
+# interactive TTY, so a headless SessionStart never refreshes it — the exact reason
+# akshat/Madhavan had NO visible "you're behind" signal. This background `check` DOES
+# run headless, so it publishes the same cache: a stale install SURFACES regardless of
+# whether the user ever launches interactive `hmd`. We WRITE it; the statusline READS it.
+#
+# Schema + leading-v match bin/heimdall's _update_refresh_cache EXACTLY so a single
+# consumer parses either writer's output:
+#   {"checked_epoch":N,"installed":"vX.Y.Z","latest":"vA.B.C"}
+# Atomic (temp + mv, so a concurrent reader never sees half a file). Best-effort:
+# a write failure never fails the check (fail-open — the cache is advisory, not a gate).
+write_update_cache() {
+  local installed="$1" latest="$2"
+  [ -n "$installed" ] && [ -n "$latest" ] || return 0
+  mkdir -p "$HMD_HOME" 2>/dev/null || return 0
+  local now; now="$(date +%s 2>/dev/null || echo 0)"
+  local cache="$HMD_HOME/update-check.json"
+  local tmp="${cache}.tmp.$$"
+  # installed/latest are bare X.Y.Z here → prefix v to match the launcher's schema.
+  printf '{"checked_epoch":%s,"installed":"v%s","latest":"v%s"}\n' \
+    "$now" "$installed" "$latest" > "$tmp" 2>/dev/null \
+    && mv -f "$tmp" "$cache" 2>/dev/null || rm -f "$tmp" 2>/dev/null || true
+}
+
 # ── opt-out ────────────────────────────────────────────────────────────────────
 # Honored FIRST, before any work. Env switch OR the opt-out file → clean no-op.
 opted_out() {
@@ -254,7 +288,9 @@ _refuse_msg() {
 # semver/opt-out/throttle DECISION without a network fetch or a real key.
 apply_update() {
   local latest="$1"
+  local from="${2:-}"                    # installed version (for the visible from→to log line)
   local ref="v${latest}"
+  local span; span="v${from:-?} -> v${latest}"
   local url="${INSTALL_RAW_BASE}/${ref}/install.sh"
   local sig_url="https://github.com/${REPO_SLUG}/releases/download/${ref}/install.sh.minisig"
   local pubkey="${HEIMDALL_SIGNING_PUBKEY:-$PLUGIN_DIR/release/heimdall-signing.pub}"
@@ -320,14 +356,14 @@ apply_update() {
   # verified installer SYNCHRONOUSLY, streaming its output, and return its real exit code so the
   # caller can report success/failure LOUDLY. Never detached — the user is watching.
   if [ "${HEIMDALL_APPLY_FOREGROUND:-0}" = "1" ]; then
-    log_line "apply $latest (foreground manual) verified via $ref"
+    log_line "auto-update: applying $span (foreground manual) — verified $ref"
     HEIMDALL_REF="$ref" bash "$artifact"
     local irc=$?
     [ -n "$workdir" ] && rm -rf "$workdir"
     return "$irc"
   fi
 
-  log_line "apply $latest (background, next session) verified via $ref"
+  log_line "auto-update: applying $span (background; active on your next hmd launch) — verified $ref"
   # Execute the EXACT bytes we verified (verify-then-run-same-file — no TOCTOU re-fetch).
   # Detached + fully backgrounded via setsid so it survives this process exiting and never
   # holds SessionStart open; the workdir is removed after the installer finishes.
@@ -364,8 +400,13 @@ run_check() {
     exit 0
   fi
 
+  # Publish the fresh installed/latest to the cache the statusline + launcher notice read —
+  # BEFORE the apply decision, so a stale install SURFACES even when we don't/can't apply
+  # (opt-in-signature refusal, no-curl, dryrun). This is the always-on visible-signal write.
+  write_update_cache "$installed" "$latest"
+
   if [ "$(semver_is_newer "$installed" "$latest")" = "newer" ]; then
-    apply_update "$latest"
+    apply_update "$latest" "$installed"
   else
     log_line "check current (installed=$installed latest=$latest)"
   fi
@@ -423,7 +464,7 @@ cmd_update() {
   fi
 
   printf 'heimdall: updating v%s → v%s (verifying release signature)…\n' "$installed" "$latest"
-  HEIMDALL_APPLY_FOREGROUND=1 apply_update "$latest"
+  HEIMDALL_APPLY_FOREGROUND=1 apply_update "$latest" "$installed"
   local rc=$?
   if [ "$rc" -eq 0 ]; then
     printf 'heimdall: ✔ updated to v%s — the new version is active on your next `hmd` launch.\n' "$latest"
