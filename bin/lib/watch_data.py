@@ -469,8 +469,43 @@ def status_bar(team_n, ent, caps=None):
     return _emit(caps, line)
 
 
-# ── the Textual-absent one-shot dump (wall + feed + status) ──────────────────
-def static_dump(root, caps=None, sig=None, textual_present=True, env=None):
+# ── textual install hint (interpreter-aware + PEP-668-aware) ─────────────────
+# The rich Textual TUI is an OPTIONAL enhancement, never a hard dependency. When it is
+# absent we must tell the user how to install it INTO THE EXACT interpreter hmd's watch
+# runs under (the one that does `import textual`) — NOT into an isolated pipx/brew venv
+# hmd can't import from (the live footgun: `pipx install textual` succeeds but hmd's
+# python3 still can't `import textual`). sys.executable IS that interpreter. On a PEP-668
+# externally-managed python (modern macOS / Homebrew / Debian) a plain `pip install`
+# errors, so we surface the `--break-system-packages` escape. Pure string-building; the
+# only I/O is a stat() for the EXTERNALLY-MANAGED marker.
+def _externally_managed():
+    """True if THIS interpreter is PEP-668 externally-managed (an EXTERNALLY-MANAGED
+    marker in its stdlib dir). Best-effort: any error => assume not managed."""
+    import sysconfig
+    try:
+        stdlib = sysconfig.get_path("stdlib")
+    except Exception:
+        stdlib = None
+    return bool(stdlib and os.path.exists(os.path.join(stdlib, "EXTERNALLY-MANAGED")))
+
+
+def textual_install_hint(env=None):
+    """The EXACT command to install textual into hmd-watch's OWN interpreter. Targets
+    sys.executable (the python that does `import textual` here), PEP-668-aware. Returns a
+    single shell-ready string. NEVER suggests `pipx install textual` (isolated venv →
+    hmd's python can't import it)."""
+    import shlex
+    py = shlex.quote(sys.executable or "python3")
+    if _externally_managed():
+        return "%s -m pip install --user --break-system-packages textual" % py
+    return "%s -m pip install --user textual" % py
+
+
+# ── wall+feed+status BODY (shared by the static dump and the live auto-refresh loop) ──
+def render_dump(root, caps=None, sig=None, env=None):
+    """The wall+feed+status body as a list of lines. Shared by the one-shot static dump
+    (static_dump) and the no-textual auto-refresh live loop (watch_entry). Local reads
+    only — NO network, NO textual dependency."""
     env = os.environ if env is None else env
     members, payload = read_roster(root)
     ent = resolve_entitlement(payload, env)
@@ -481,10 +516,18 @@ def static_dump(root, caps=None, sig=None, textual_present=True, env=None):
     out.extend(render_feed(events, caps))
     out.append("")
     out.append(status_bar(len(members), ent, caps))
+    return out
+
+
+# ── the Textual-absent one-shot dump (wall + feed + status) ──────────────────
+def static_dump(root, caps=None, sig=None, textual_present=True, env=None):
+    env = os.environ if env is None else env
+    out = render_dump(root, caps, sig, env)
     if not textual_present:
         out.append("")
         out.append("textual not installed — showing a static one-shot wall+feed.")
-        out.append("For the full interactive dashboard: pip install textual")
+        out.append("For the rich interactive dashboard, install textual into hmd's own python:")
+        out.append("  " + textual_install_hint(env))
     return "\n".join(out)
 
 
