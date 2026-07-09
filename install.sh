@@ -127,8 +127,33 @@ gate_count() {
 # launcher on PATH for the simple task path; subcommands that shell out to a
 # sibling (e.g. `hmd demo`) need the symlink, so we never reach the copy in
 # practice. One symlink attempt, then copy — no silent broken-launcher install.
+# Source-checkout guard (populated in main() once $REPO is known). link_entry
+# REFUSES to write any link whose destination dir sits inside one of these roots,
+# so a checkout-local run — or a curl|bash launched from inside a clone — can
+# NEVER mutate a tracked file (e.g. the repo's own bin/hmd, when that bin/ is on
+# PATH and gets picked up as the EXISTING_HMD "stale shadow" to overwrite).
+# Newline-delimited; EMPTY ⇒ no guard, which is the normal curl|bash stranger
+# install (it has no on-disk source tree to protect — zero false positives).
+SOURCE_GUARD_ROOTS=""
+
 link_entry() {
   local src="$1" dst="$2"
+  # Refuse to write into the installer's OWN source checkout. dst may not exist
+  # yet, so resolve its PARENT dir (real path) and refuse if it falls under a
+  # guarded root. Returning 1 lets the EXISTING_HMD caller fall through to its
+  # "left in place, remove it yourself" warning — never a silent clobber.
+  if [ -n "${SOURCE_GUARD_ROOTS:-}" ]; then
+    local _dp _root
+    _dp="$(cd "$(dirname -- "$dst")" 2>/dev/null && pwd -P || true)"
+    if [ -n "$_dp" ]; then
+      while IFS= read -r _root; do
+        [ -n "$_root" ] || continue
+        case "$_dp/" in "$_root/"*) return 1 ;; esac
+      done <<EOF
+$SOURCE_GUARD_ROOTS
+EOF
+    fi
+  fi
   rm -f "$dst" 2>/dev/null || true
   # Absolute symlink: `readlink -f "$dst"` follows it to the real launcher in the
   # plugin tree, so the launcher's PLUGIN_DIR resolves to ~/.heimdall and every
@@ -628,6 +653,28 @@ main() {
   local DEFAULT_REF="v2.0.21"
   local REF="${HEIMDALL_REF:-$DEFAULT_REF}"
   local REPO="${HEIMDALL_REPO:-https://github.com/randomittin/heimdall.git}"
+
+  # ── Source-checkout guard roots (see SOURCE_GUARD_ROOTS above link_entry) ────
+  # A stranger install (curl|bash) has NO local source tree — both branches below
+  # no-op and the guard stays empty. A checkout-local or dev/test run pins the
+  # tree(s) the installer must never write into, so it cannot clobber a tracked
+  # file (the repo's own bin/hmd) if that bin/ happens to be on PATH.
+  SOURCE_GUARD_ROOTS=""
+  # (a) The installer's own on-disk dir — only when it is a real file on disk
+  #     (a piped curl|bash has no BASH_SOURCE path, so this is skipped).
+  local _gsrc="${BASH_SOURCE[0]:-}" _gr=""
+  if [ -n "$_gsrc" ] && [ -f "$_gsrc" ]; then
+    _gr="$(cd "$(dirname -- "$_gsrc")" 2>/dev/null && pwd -P || true)"
+    [ -n "$_gr" ] && SOURCE_GUARD_ROOTS="${SOURCE_GUARD_ROOTS}${_gr}
+"
+  fi
+  # (b) A LOCAL HEIMDALL_REPO checkout (tests/dev point REPO at a path; the
+  #     default is an https:// clone URL, which is not a dir → skipped).
+  if [ -d "$REPO" ]; then
+    _gr="$(cd "$REPO" 2>/dev/null && pwd -P || true)"
+    [ -n "$_gr" ] && SOURCE_GUARD_ROOTS="${SOURCE_GUARD_ROOTS}${_gr}
+"
+  fi
 
   # Install layout. Plugin (all components) lives in its own dir; the two entry
   # points are SYMLINKED into a bin dir on PATH (symlink so the launcher's

@@ -31,6 +31,17 @@ SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$SELF_DIR/.." && pwd)"
 REF="$(git -C "$REPO" rev-parse HEAD)"
 
+# ── Hermeticity guard ────────────────────────────────────────────────────────
+# This suite runs the REAL install.sh, which resolves an existing `hmd` via
+# `command -v hmd`. If the dev's inherited PATH carries <repo>/bin, the installer
+# would treat the repo's OWN tracked bin/hmd as a stale shadow and OVERWRITE it in
+# place — mutating a tracked file (the dev-env-breaking bug). Two defenses:
+#   1) run install.sh under a CONTROLLED PATH (SYS) — python3/git + system dirs
+#      only, never the inherited PATH — so `command -v hmd` finds nothing to touch;
+#   2) a tripwire that RESTORES + fails loudly if any tracked bin/ file changed.
+SYS="$(dirname "$(command -v python3)"):$(dirname "$(command -v git)"):/usr/bin:/bin"
+BIN_GUARD_BEFORE="$(git -C "$REPO" status --porcelain -- bin/ 2>/dev/null)"
+
 # An obviously-fake secret (>= 32 chars so it passes the weak-secret gate) so the
 # "no leak" grep is meaningful — it must appear in NO tracked file, only in the
 # throwaway repo store under test. NOT a real token (secret-scan stays clean).
@@ -55,7 +66,18 @@ EOF
 chmod +x "$FAKE_DIR/claude"
 
 TMP_ROOT="$(mktemp -d)"
-trap 'rm -rf "$FAKE_DIR" "$TMP_ROOT"' EXIT
+# Cleanup + tripwire: a hermetic install test must NEVER mutate a tracked file.
+# If bin/ changed on ANY exit path, restore it and shout (belt to the explicit
+# assertion in the body, which owns the exit code).
+cleanup() {
+  local after; after="$(git -C "$REPO" status --porcelain -- bin/ 2>/dev/null)"
+  if [ "$after" != "$BIN_GUARD_BEFORE" ]; then
+    printf '\n\033[31mFATAL\033[0m test mutated tracked bin/ — restoring:\n%s\n' "$after" >&2
+    git -C "$REPO" checkout -- bin/ 2>/dev/null || true
+  fi
+  rm -rf "$FAKE_DIR" "$TMP_ROOT"
+}
+trap cleanup EXIT
 
 # Owner perm bits of a path, portable across macOS (stat -f) and Linux (stat -c).
 mode_of() { stat -f '%Lp' "$1" 2>/dev/null || stat -c '%a' "$1" 2>/dev/null; }
@@ -80,7 +102,7 @@ run_install() { # $1=workdir(repo)  $2=HOME  $3=TEAM_SECRET (may be empty)
         HOME="$2" TERM="dumb" HEIMDALL_NO_COLOR=1 \
         HEIMDALL_REPO="$REPO" HEIMDALL_REF="$REF" \
         HEIMDALL_TEAM_SECRET="$3" \
-        PATH="$FAKE_DIR:$PATH" \
+        PATH="$FAKE_DIR:$SYS" \
         bash "$REPO/install.sh" </dev/null 2>&1 )
 }
 
@@ -195,6 +217,14 @@ if grep -qF "$TEAM_SECRET" "$TMP_ROOT/env.out" "$TMP_ROOT/env2.out" "$TMP_ROOT/s
   bad "install printed the team secret to its output (logging a secret)"
 else
   ok "install never echoes the team secret to stdout/stderr"
+fi
+
+# ── (7) HERMETIC — the install runs left the repo's tracked bin/ pristine ───────
+BIN_GUARD_AFTER="$(git -C "$REPO" status --porcelain -- bin/ 2>/dev/null)"
+if [ "$BIN_GUARD_AFTER" = "$BIN_GUARD_BEFORE" ]; then
+  ok "hermetic: install runs never mutated the repo's tracked bin/ (no clobber)"
+else
+  bad "install run MUTATED tracked bin/ (non-hermetic): $BIN_GUARD_AFTER"
 fi
 
 # ── Tally ──────────────────────────────────────────────────────────────────────
