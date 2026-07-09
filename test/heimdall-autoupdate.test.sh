@@ -214,6 +214,53 @@ rc=$?
   || bad "E2 unknown subcommand should be non-zero (rc=$rc)"
 rm -rf "$H"
 
+# ── F. UPDATE-CHECK CACHE: the background check WRITES the signal the statusline reads ─
+# The launcher's own cache writer (bin/heimdall) is gated on an interactive TTY; the
+# SessionStart background check is the ONLY updater that runs headless. It MUST publish
+# $HMD_HOME/update-check.json {checked_epoch,installed,latest} so a stale install SURFACES
+# (akshat/Madhavan had NO visible signal). Schema + v-prefix match the launcher's writer.
+# Simulate a much-older install so the assertion is exact, not relative.
+H="$(mk_home)"
+HEIMDALL_HOME="$H" HEIMDALL_INSTALLED_OVERRIDE="2.0.5" HEIMDALL_LATEST_OVERRIDE="2.0.20" \
+  HEIMDALL_AUTOUPDATE_DRYRUN=1 "$BIN" check >/dev/null 2>&1
+CACHE="$H/update-check.json"
+if [ -f "$CACHE" ] \
+   && grep -q '"installed":"v2.0.5"' "$CACHE" 2>/dev/null \
+   && grep -q '"latest":"v2.0.20"' "$CACHE" 2>/dev/null \
+   && grep -Eq '"checked_epoch":[0-9]+' "$CACHE" 2>/dev/null; then
+  ok "F background check publishes update-check.json (installed=v2.0.5 latest=v2.0.20) for the statusline"
+else
+  bad "F check did not publish the update-check cache (cache='$(cat "$CACHE" 2>/dev/null)')"
+fi
+rm -rf "$H"
+
+# F2: status is READ-ONLY — it must NOT write the cache (only check/--force publish).
+H="$(mk_home)"
+HEIMDALL_HOME="$H" HEIMDALL_INSTALLED_OVERRIDE="2.0.5" HEIMDALL_LATEST_OVERRIDE="2.0.20" \
+  "$BIN" status >/dev/null 2>&1
+if [ ! -f "$H/update-check.json" ]; then
+  ok "F2 status stays read-only (no cache write)"
+else
+  bad "F2 status wrote the cache (should be read-only)"
+fi
+rm -rf "$H"
+
+# ── G. DAILY-WINDOW GUARANTEE: with the REAL default interval, a >1-day-old stamp re-checks ─
+# Proves users cannot silently exceed ~1 day stale. Uses the DEFAULT interval (no override):
+# a stamp aged ~25h must let the check run (would-apply the climb). A just-touched stamp
+# throttling is already proven by B1; this pins the *default window* is daily, not a test value.
+H="$(mk_home)"; mkdir -p "$H"; : > "$H/.last-update-check"
+touch -t "$(date -v-25H +%Y%m%d%H%M 2>/dev/null || date -d '25 hours ago' +%Y%m%d%H%M 2>/dev/null || echo 202001010000)" \
+  "$H/.last-update-check" 2>/dev/null || touch -t 202001010000 "$H/.last-update-check" 2>/dev/null || true
+HEIMDALL_HOME="$H" HEIMDALL_INSTALLED_OVERRIDE="2.0.5" HEIMDALL_LATEST_OVERRIDE="2.0.20" \
+  HEIMDALL_AUTOUPDATE_DRYRUN=1 "$BIN" check >/dev/null 2>&1
+if grep -q 'would-apply' "$H/autoupdate.log" 2>/dev/null; then
+  ok "G daily-window: a >24h-old stamp re-checks under the DEFAULT interval (no silent >1-day staleness)"
+else
+  bad "G default-interval stamp aged 25h should re-check (log='$(last_log "$H")')"
+fi
+rm -rf "$H"
+
 # ── tally ──────────────────────────────────────────────────────────────────────
 echo ""
 echo "── heimdall-autoupdate: $PASS passed, $FAIL failed ──"

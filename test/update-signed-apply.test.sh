@@ -182,6 +182,39 @@ else
 fi
 rm -rf "$H"
 
+# ── G. THE MARQUEE FALSIFIER: a MUCH-older install climbs to the current release ──
+# installed=v2.0.5 (akshat) + latest=v2.0.20 signed → foreground apply pins
+# HEIMDALL_REF=v2.0.20 and the stub RUNS. Proves v2.0.20's updater reliably climbs
+# from an ARBITRARY old version (the exact akshat/Madhavan bootstrap-then-climb case),
+# not merely installed+1. RED without the HEIMDALL_INSTALLED_OVERRIDE seam or a broken pin.
+H="$(mktemp -d)"; REC="$H/ref.rec"; : > "$REC"
+HEIMDALL_HOME="$H" HMD_TEST_RECORD="$REC" \
+  HEIMDALL_INSTALLED_OVERRIDE="2.0.5" HEIMDALL_LATEST_OVERRIDE="2.0.20" \
+  HEIMDALL_INSTALL_ARTIFACT="$ARTIFACT" HEIMDALL_INSTALL_SIG="$SIG" \
+  HEIMDALL_SIGNING_PUBKEY="$PUB" "$UPDATER" update >/dev/null 2>&1
+rc=$?
+if [ "$rc" -eq 0 ] && [ "$(cat "$REC" 2>/dev/null)" = "v2.0.20" ]; then
+  ok "G climb v2.0.5 → v2.0.20: signed apply pins HEIMDALL_REF=v2.0.20 (exact release installs, not DEFAULT_REF)"
+else
+  bad "G old-install climb failed (rc=$rc rec='$(cat "$REC" 2>/dev/null)' expected 'v2.0.20')"
+fi
+rm -rf "$H"
+
+# ── H. same big jump, TAMPERED release → REFUSE fail-closed, stub NEVER runs ──────
+H="$(mktemp -d)"; REC="$H/ref.rec"; : > "$REC"
+ERR="$(HEIMDALL_HOME="$H" HMD_TEST_RECORD="$REC" \
+  HEIMDALL_INSTALLED_OVERRIDE="2.0.5" HEIMDALL_LATEST_OVERRIDE="2.0.20" \
+  HEIMDALL_INSTALL_ARTIFACT="$TAMPERED" HEIMDALL_INSTALL_SIG="$SIG" \
+  HEIMDALL_SIGNING_PUBKEY="$PUB" "$UPDATER" update 2>&1 >/dev/null)"
+rc=$?
+if [ "$rc" -ne 0 ] && [ -z "$(cat "$REC" 2>/dev/null)" ] \
+   && printf '%s' "$ERR" | grep -qi 'refus'; then
+  ok "H climb v2.0.5 → v2.0.20 TAMPERED → REFUSES fail-closed (exit $rc, stub NOT run)"
+else
+  bad "H tampered big-jump should refuse loudly + nonzero + no exec (rc=$rc rec='$(cat "$REC" 2>/dev/null)' err='$ERR')"
+fi
+rm -rf "$H"
+
 echo ""
 echo "── update-signed-apply: $PASS passed, $FAIL failed ──"
 [ "$FAIL" -eq 0 ] || exit 1
