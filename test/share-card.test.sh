@@ -32,6 +32,17 @@ INSTALL="$REPO/install.sh"
 PUBLIC_URL="https://runheimdall.dev"
 TAGLINE="nothing ships unproven"
 
+# ── Hermeticity guard ────────────────────────────────────────────────────────
+# This suite runs the REAL install.sh, which resolves an existing `hmd` via
+# `command -v hmd`. If the dev's inherited PATH carries <repo>/bin, the installer
+# would treat the repo's OWN tracked bin/hmd as a stale shadow and OVERWRITE it in
+# place — mutating a tracked file (the dev-env-breaking bug). Two defenses:
+#   1) run install.sh under a CONTROLLED PATH (SYS) — python3/git + system dirs
+#      only, never the inherited PATH — so `command -v hmd` finds nothing to touch;
+#   2) a tripwire that RESTORES + fails loudly if any tracked bin/ file changed.
+SYS="$(dirname "$(command -v python3)"):$(dirname "$(command -v git)"):/usr/bin:/bin"
+BIN_GUARD_BEFORE="$(git -C "$REPO" status --porcelain -- bin/ 2>/dev/null)"
+
 PASS=0; FAIL=0
 ok()  { printf '  \033[32mPASS\033[0m %s\n' "$1"; PASS=$((PASS+1)); }
 bad() { printf '  \033[31mFAIL\033[0m %s\n' "$1"; FAIL=$((FAIL+1)); }
@@ -50,7 +61,18 @@ case "${1:-}" in
 esac
 EOF
 chmod +x "$FAKE_DIR/claude"
-trap 'rm -rf "$TMP_ROOT" "$FAKE_DIR"' EXIT
+# Cleanup + tripwire: a hermetic install test must NEVER mutate a tracked file.
+# If bin/ changed on ANY exit path, restore it and shout (belt to the explicit
+# assertion in the body, which owns the exit code).
+cleanup() {
+  local after; after="$(git -C "$REPO" status --porcelain -- bin/ 2>/dev/null)"
+  if [ "$after" != "$BIN_GUARD_BEFORE" ]; then
+    printf '\n\033[31mFATAL\033[0m test mutated tracked bin/ — restoring:\n%s\n' "$after" >&2
+    git -C "$REPO" checkout -- bin/ 2>/dev/null || true
+  fi
+  rm -rf "$TMP_ROOT" "$FAKE_DIR"
+}
+trap cleanup EXIT
 
 # Count ESC (0x1b) bytes in a file — the ANSI detector for the paste-clean check.
 esc_count() { LC_ALL=C tr -cd '\033' < "$1" | wc -c | tr -d ' '; }
@@ -204,7 +226,7 @@ ICARD="$TMP_ROOT/install-tty.out"
 IRC="$(pty_run "$ICARD" 90 -- env -u NO_COLOR -u HEIMDALL_NO_COLOR \
         -u CLAUDE_CONFIG_DIR -u HEIMDALL_HOME \
         HOME="$INST_HOME_I" TERM="xterm-256color" \
-        HEIMDALL_REPO="$REPO" HEIMDALL_REF="$REF" PATH="$FAKE_DIR:$PATH" \
+        HEIMDALL_REPO="$REPO" HEIMDALL_REF="$REF" PATH="$FAKE_DIR:$SYS" \
         bash "$INSTALL")"
 IRC="$(printf '%s' "$IRC" | tail -1)"
 
@@ -235,7 +257,7 @@ fi
 NCARD="$TMP_ROOT/install-pipe.out"
 env -u CLAUDE_CONFIG_DIR -u HEIMDALL_HOME \
     HOME="$INST_HOME_N" TERM="dumb" HEIMDALL_NO_COLOR=1 \
-    HEIMDALL_REPO="$REPO" HEIMDALL_REF="$REF" PATH="$FAKE_DIR:$PATH" \
+    HEIMDALL_REPO="$REPO" HEIMDALL_REF="$REF" PATH="$FAKE_DIR:$SYS" \
     bash "$INSTALL" </dev/null > "$NCARD" 2>&1; NRC=$?
 [ "$NRC" -eq 0 ] && ok "non-interactive install exits 0" \
                  || bad "non-interactive install exit $NRC (want 0)"
@@ -247,6 +269,14 @@ fi
 NEC="$(esc_count "$NCARD")"
 [ "$NEC" = "0" ] && ok "non-interactive install output is ANSI-free (clean logs)" \
                  || bad "non-interactive install leaked $NEC ANSI bytes"
+
+# ── HERMETIC — the install runs left the repo's tracked bin/ pristine ───────────
+BIN_GUARD_AFTER="$(git -C "$REPO" status --porcelain -- bin/ 2>/dev/null)"
+if [ "$BIN_GUARD_AFTER" = "$BIN_GUARD_BEFORE" ]; then
+  ok "hermetic: install runs never mutated the repo's tracked bin/ (no clobber)"
+else
+  bad "install run MUTATED tracked bin/ (non-hermetic): $BIN_GUARD_AFTER"
+fi
 
 # ── Tally ─────────────────────────────────────────────────────────────────────
 echo "--------------------------------------------------------------------"
