@@ -142,6 +142,54 @@ link_entry() {
   chmod +x "$dst"
 }
 
+# Classify an existing `hmd` found on PATH as OURS (a heimdall/superx-owned binary,
+# safe to overwrite — leaving a stale one behind is the very bug that strands
+# teammates on an old version) or FOREIGN (a genuinely third-party tool, e.g. the
+# PyPI `hmd-cli-app` — NEVER clobber it without an explicit force flag: data loss).
+# OURS is signalled by ANY of:
+#   - the binary, or its symlink target, lives under a heimdall/superx tree
+#     ($HOME/.heimdall or $HOME/.superx — where our own and the legacy superx-era
+#     installs put it);
+#   - the file body carries a heimdall/superx marker (our launcher mentions
+#     "heimdall" hundreds of times; the legacy superx launcher carries "superx").
+# Prints exactly one word: "ours" or "foreign".
+hmd_ownership() {
+  local hmd_path="$1" real
+  real="$(readlink -f "$hmd_path" 2>/dev/null || readlink "$hmd_path" 2>/dev/null || printf '%s' "$hmd_path")"
+  case "$real" in
+    *"/.heimdall/"*|*"/.superx/"*) printf 'ours'; return 0 ;;
+  esac
+  case "$hmd_path" in
+    *"/.heimdall/"*|*"/.superx/"*) printf 'ours'; return 0 ;;
+  esac
+  # Body marker — only read a regular, readable file (skip dirs/sockets/broken links).
+  if [ -f "$real" ] && [ -r "$real" ] \
+     && LC_ALL=C grep -qiE 'heimdall|superx' "$real" 2>/dev/null; then
+    printf 'ours'; return 0
+  fi
+  printf 'foreign'
+}
+
+# Best-effort version of an existing (stale) `hmd`, for a human-readable
+# "(was <ver>)" note when we replace it. NEVER runs the stale binary (a broken
+# launcher could hang or drop into an interactive path) — resolves the plugin tree
+# behind the symlink and reads its version the same way resolved_version() does.
+# Prints a bare X.Y.Z, or "unknown" when the tree can't be resolved.
+hmd_probe_version() {
+  local hmd_path="$1" real dir v=""
+  real="$(readlink -f "$hmd_path" 2>/dev/null || readlink "$hmd_path" 2>/dev/null || printf '%s' "$hmd_path")"
+  # The launcher lives at <tree>/bin/heimdall → the tree root is two levels up.
+  dir="$(cd "$(dirname "$real")/.." 2>/dev/null && pwd || true)"
+  if [ -n "$dir" ]; then
+    v="$(resolved_version "$dir" 2>/dev/null || true)"
+  fi
+  if [ -n "$v" ] && [ "$v" != "?" ]; then
+    printf '%s' "$v"
+  else
+    printf 'unknown'
+  fi
+}
+
 # Pick the shell profile the user's interactive shell will actually source, so a
 # PATH export takes effect on the next shell. Order mirrors what login/interactive
 # shells read: zsh → ~/.zshrc, bash → ~/.bashrc (Linux) / ~/.bash_profile (login),
@@ -718,15 +766,26 @@ main() {
   step_ok "Prerequisites (git, Claude Code $CLAUDE_VER)"
 
   # ── hmd collision preflight (A0.7) ────────────────────────────────────────
-  # `hmd` is canonical, but a real collider exists (PyPI hmd-cli-app). If `hmd`
-  # already resolves to something OTHER than our own bin dir, install `heimdall`
-  # only — unless HEIMDALL_FORCE_HMD=1.
+  # `hmd` is canonical, but a real collider exists (PyPI hmd-cli-app). When an
+  # `hmd` already resolves to something OTHER than our own bin dir we must decide:
+  #   - OURS (a heimdall/superx-owned binary, incl. the legacy ~/.superx/bin/hmd):
+  #     OVERWRITE it by default. Leaving a stale, PATH-shadowing hmd behind is the
+  #     bug that silently strands teammates on an old version despite reinstalling.
+  #   - FOREIGN (a genuine third-party tool): PRESERVE it — install `heimdall` only
+  #     — unless HEIMDALL_FORCE_HMD=1 explicitly authorizes taking the name.
   local INSTALL_HMD=1
   local EXISTING_HMD=""
+  local HMD_OWNED=""   # "ours" | "foreign" | "" (none, or already at our target)
   if command -v hmd >/dev/null 2>&1; then
     EXISTING_HMD=$(command -v hmd)
-    if [ "$EXISTING_HMD" != "$BIN_DIR/hmd" ] && [ -z "${HEIMDALL_FORCE_HMD:-}" ]; then
-      INSTALL_HMD=0
+    if [ "$EXISTING_HMD" != "$BIN_DIR/hmd" ]; then
+      HMD_OWNED="$(hmd_ownership "$EXISTING_HMD")"
+      # Only a FOREIGN hmd blocks the `hmd` link (unless forced). Our own stale hmd
+      # is always installed over — the fix below also overwrites it in place if it
+      # shadows the canonical link from an earlier PATH dir.
+      if [ "$HMD_OWNED" = "foreign" ] && [ -z "${HEIMDALL_FORCE_HMD:-}" ]; then
+        INSTALL_HMD=0
+      fi
     fi
   fi
 
@@ -857,16 +916,54 @@ main() {
   fi
   # heimdall: always.
   link_entry "$SRC" "$BIN_DIR/heimdall"
-  # hmd: canonical, unless a real collider blocked it.
+  # hmd: canonical, unless a genuinely FOREIGN collider blocked it.
   if [ "$INSTALL_HMD" -eq 1 ]; then
     link_entry "$SRC" "$BIN_DIR/hmd"
+    # If an existing hmd resolves from a DIFFERENT PATH dir than our canonical
+    # $BIN_DIR/hmd (e.g. ~/.superx/bin earlier on PATH than ~/.local/bin), the link
+    # above is MASKED — the stale binary keeps answering `hmd`. That is exactly the
+    # bug. Fix it at the shadowing path itself.
+    if [ -n "$EXISTING_HMD" ] && [ "$EXISTING_HMD" != "$BIN_DIR/hmd" ]; then
+      if [ "$HMD_OWNED" = "ours" ]; then
+        # OURS → overwrite in place so PATH resolves to the new launcher regardless
+        # of dir order. Safe: it is our own stale binary. If the dir is read-only
+        # (e.g. a root-owned sudo install), link_entry fails → warn LOUDLY with the
+        # exact removal command rather than silently leaving the shadow.
+        local OLDVER; OLDVER="$(hmd_probe_version "$EXISTING_HMD")"
+        if link_entry "$SRC" "$EXISTING_HMD" 2>/dev/null; then
+          blank
+          printf '   %sreplacing stale heimdall hmd at %s (was %s)%s\n' \
+            "$C_GOLD" "$EXISTING_HMD" "$OLDVER" "$C_RESET"
+          blank
+        else
+          blank
+          printf '   %s⚠ a stale heimdall hmd at %s (was %s) SHADOWS the new install%s\n' \
+            "$C_GOLD" "$EXISTING_HMD" "$OLDVER" "$C_RESET"
+          printf '   %s  and could not be overwritten — remove it so `hmd` picks up the new version:%s\n' \
+            "$C_DIM" "$C_RESET"
+          printf '       %srm -f %s%s\n' "$C_CYAN" "$EXISTING_HMD" "$C_RESET"
+          blank
+        fi
+      else
+        # FOREIGN but forced (HEIMDALL_FORCE_HMD=1): we installed our canonical hmd
+        # but must NOT clobber the third-party binary (data-loss risk). It may still
+        # shadow us from an earlier PATH dir — say so, with the exact removal command.
+        blank
+        printf '   %s⚠ a foreign hmd at %s may SHADOW the new install%s\n' \
+          "$C_GOLD" "$EXISTING_HMD" "$C_RESET"
+        printf '   %s  it was left untouched — to use heimdall'\''s hmd, remove it:%s\n' \
+          "$C_DIM" "$C_RESET"
+        printf '       %srm -f %s%s\n' "$C_CYAN" "$EXISTING_HMD" "$C_RESET"
+        blank
+      fi
+    fi
     _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" link succeeded "$LNK_T0"
     step_ok "Linking entry points (hmd, heimdall)"
   else
     _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" link succeeded "$LNK_T0"
     step_ok "Linking entry point (heimdall)"
     blank
-    printf '   %s⚠ hmd already exists at %s — installed `heimdall` only.%s\n' \
+    printf '   %s⚠ hmd already exists at %s and looks like a different tool — installed `heimdall` only.%s\n' \
       "$C_GOLD" "$EXISTING_HMD" "$C_RESET"
     printf '   %s  override with: HEIMDALL_FORCE_HMD=1 curl … | bash%s\n' \
       "$C_DIM" "$C_RESET"
