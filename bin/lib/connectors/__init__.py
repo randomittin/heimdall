@@ -152,4 +152,4 @@ def active(cfg: dict) -> List[Connector]:
 # The launch set is declared in ONE place: the trailing import side-effect. Each
 # module calls register(...) at import. A 4th source adds its module here + a
 # register() call — zero edits to the logic above, zero edits to pieces (b)/(c)/(d).
-from . import github, slack, email  # noqa: E402,F401
+from . import github, slack, email, corpus  # noqa: E402,F401

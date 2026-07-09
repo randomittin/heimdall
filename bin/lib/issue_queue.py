@@ -42,6 +42,11 @@ _KIND_BY_SOURCE = {
     "github": "issue",
     "slack": "chat",
     "email": "email",
+    # corpus = the anonymized-issue-corpus SHADOW-proposal source (cp_issue_synth).
+    # A "proposal" is a pending_review candidate a maintainer promotes — NEVER an
+    # auto-opened issue. The corpus connector (connectors/corpus.py) reads these;
+    # normalize maps them to the ONE internal schema below (source=corpus).
+    "corpus": "proposal",
 }
 
 # severity rank (dossier §3) — a fixed map; the ONLY interpretation of severity for
@@ -313,6 +318,38 @@ def normalize(source, raw_item, cfg=None, now=None):
         }
         url = raw_item.get("permalink")
 
+    elif src == "corpus":
+        # A cp_issue_synth SHADOW proposal (native shape shadow_issue_v1). It is
+        # ZERO-CONTENT by construction — a coded pattern (error_class, signature
+        # HASH, hmd_version, os_class, command) + distinct-team support counts +
+        # sample issue_ids. NO free text, NO path, NO url (SHADOW — never filed).
+        pattern = raw_item.get("pattern") if isinstance(raw_item.get("pattern"), dict) else {}
+        support = raw_item.get("support") if isinstance(raw_item.get("support"), dict) else {}
+        proposal_id = raw_item.get("proposal_id") or ""
+        native_id = proposal_id
+        error_class = pattern.get("error_class") or "unknown"
+        command = pattern.get("command") or "unknown"
+        signature_hash = pattern.get("signature_hash") or "unknown"
+        teams = support.get("teams")
+        issue_count = support.get("issues")
+        # Title + body are built from CODED tokens only (never the candidate's raw
+        # anything — it is already a coded shadow string). No content can leak.
+        title = "[shadow] %s @ %s - %s teams, %s issues (sig %s)" % (
+            error_class, command, teams, issue_count, str(signature_hash)[:12]
+        )
+        body = raw_item.get("candidate") or title
+        severity = None  # a shadow proposal carries no severity — never guessed
+        created_at = _epoch_to_iso(raw_item.get("created_ts"))
+        source_ref = {
+            "proposal_id": proposal_id,
+            "schema_version": raw_item.get("schema_version"),
+            "status": raw_item.get("status"),
+            "pattern": dict(pattern),
+            "support": dict(support),
+            "sample_issue_ids": list(raw_item.get("sample_issue_ids") or []),
+        }
+        url = None  # SHADOW — a proposal is never filed anywhere, so it has no url
+
     elif src == "email":
         headers = raw_item.get("headers") or {}
         message_id = raw_item.get("message_id") or headers.get("Message-ID") or ""
@@ -352,6 +389,21 @@ def _slack_ts_to_iso(ts):
     to ISO-8601 UTC; an unparseable ts -> now."""
     try:
         epoch = float(str(ts).split(".")[0])
+    except (TypeError, ValueError):
+        return _now_iso()
+    return (
+        datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+    )
+
+
+def _epoch_to_iso(value):
+    """A cp_issue_synth proposal's created_ts is epoch seconds (float, time.time()).
+    Convert to a second-precision ISO-8601 UTC string; a missing/unparseable ts ->
+    now (the schema's created_at is always a valid ISO string)."""
+    try:
+        epoch = float(value)
     except (TypeError, ValueError):
         return _now_iso()
     return (

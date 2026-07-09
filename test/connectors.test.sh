@@ -104,7 +104,7 @@ need = ["register", "get", "available", "active", "is_registered", "ConnectorCon
 missing = [n for n in need if not hasattr(c, n)]
 assert not missing, "seam missing symbols: %s" % missing
 avail = c.available()
-assert avail == ["email", "github", "slack"], "launch set wrong: %r" % avail
+assert avail == ["corpus", "email", "github", "slack"], "launch set wrong: %r" % avail
 # get() fails loud on a typo, listing available — never silently defaults.
 try:
     c.get("nope")
