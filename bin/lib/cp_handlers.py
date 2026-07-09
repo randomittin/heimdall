@@ -464,6 +464,76 @@ def run_maintainer_cycle(params, ctx):
     return result
 
 
+# ── issue-collection cron handlers: the k-anon fold + shadow-synth (DATA-only) ──
+#
+# These two handlers are the ONLY dispatch targets for the scheduled issue-collection
+# actions (aggregate-issues / synth-issues). Unlike run-maintainer-cycle they spawn NO
+# subprocess and make NO model call: they run the shipped, source-reviewed
+# cp_issue_aggregate / cp_issue_synth folds IN-PROCESS over the ISOLATED corpus namespace
+# (heimdall_corpus/issues/ — a keyspace DISJOINT from the control-plane store). The §2
+# isolation they honor is logical: they touch ONLY the corpus namespace, never the PKI
+# key / audit log / server secrets, and they resolve the store from the AMBIENT runtime
+# environment (home=None -> HEIMDALL_HOME / the configured durable backend), NOT the job
+# scratch dir — the aggregate/synth MUST read the durable issue store, not the empty
+# per-job scratch. The params are the VALIDATED, bounded k-anon scalars from the allowlist
+# (an optional Int only — no free string, no command). They return the fold's structured,
+# counts-only summary the job runner records.
+
+
+def aggregate_issues(params, ctx):  # noqa: ARG001 — ctx is the §2 seam; this DATA job needs none of it.
+    """Handle the `aggregate-issues` action: run the daily k-anon issue aggregate over the
+    ISOLATED corpus namespace. params carries the VALIDATED optional `k_min` (a bounded Int
+    distinct-team override, or absent -> the module default ISSUE_K_ANONYMITY_MIN). Reads +
+    writes ONLY the corpus namespace (cp_issue_aggregate.run_daily_aggregate, home=None ->
+    the ambient runtime store); dispatches nothing, spawns no process, makes no model call.
+
+    `ctx` is the §2 IsolatedContext seam (present for every handler) but intentionally
+    unused here: this job's store is the DURABLE corpus namespace, never the empty per-job
+    scratch dir, so binding it to ctx.scratch would read an empty store. Returns a bounded,
+    counts-only summary (published/suppressed bucket counts, team + security-exclusion
+    tallies) — never a signature byte or a raw metric of a sub-threshold cell."""
+    import cp_issue_aggregate  # lazy — keep the base handler import graph minimal (mirrors §4).
+    k_min = params.get("k_min")
+    agg = cp_issue_aggregate.run_daily_aggregate(k_min=k_min) or {}
+    return {
+        "action": "aggregate-issues",
+        "isolated": True,
+        "status": "done",
+        "utc_day": agg.get("utc_day"),
+        "k_min": agg.get("k_min"),
+        "total_issues": agg.get("total_issues"),
+        "total_teams": agg.get("total_teams"),
+        "excluded_security": agg.get("excluded_security"),
+        "published_buckets": agg.get("published_buckets"),
+        "suppressed_buckets": agg.get("suppressed_buckets"),
+    }
+
+
+def synth_issues(params, ctx):  # noqa: ARG001 — ctx is the §2 seam; this DATA job needs none of it.
+    """Handle the `synth-issues` action: run the daily SHADOW synthesis of candidate issues
+    from the k-anon-cleared issue store. params carries the VALIDATED optional `min_teams` (a
+    bounded Int distinct-team support floor, or absent -> the imported k-anon floor). Reads
+    the ISOLATED corpus namespace + APPENDS the shadow proposal review queue
+    (cp_issue_synth.run_synthesis, home=None -> the ambient runtime store). SHADOW-ONLY: it
+    writes pending_review/enforced=False proposals, enforces nothing, auto-opens nothing,
+    dispatches nothing, makes no model call.
+
+    `ctx` is the §2 seam (unused — same rationale as aggregate_issues: the durable corpus
+    store, not scratch). Returns the synthesis summary (issues read, proposals generated,
+    the support floor used) — counts only, no proposal text."""
+    import cp_issue_synth  # lazy — keep the base handler import graph minimal (mirrors §4).
+    min_teams = params.get("min_teams")
+    summary = cp_issue_synth.run_synthesis(min_teams=min_teams) or {}
+    return {
+        "action": "synth-issues",
+        "isolated": True,
+        "status": "done",
+        "issues_read": summary.get("issues_read"),
+        "proposals": summary.get("proposals"),
+        "min_teams": summary.get("min_teams"),
+    }
+
+
 # ── the registered handler map + resolver (named, never code-from-the-wire) ────
 #
 # The server resolves an ActionSpec.handler ("cp_handlers.run_task") to a callable
@@ -475,6 +545,8 @@ HANDLERS = {
     "cp_handlers.sync_queue": sync_queue,
     "cp_handlers.run_suite": run_suite,
     "cp_handlers.run_maintainer_cycle": run_maintainer_cycle,
+    "cp_handlers.aggregate_issues": aggregate_issues,
+    "cp_handlers.synth_issues": synth_issues,
 }
 
 
