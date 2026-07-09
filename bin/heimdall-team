@@ -42,7 +42,12 @@
 # team.json.
 #
 # THE USER-FACING SURFACE — three commands, total (everything else is internal):
-#   hmd team           status: solo/shared? owner? private-tracked or invite-mode?
+#   hmd team           SMART DEFAULT: no team -> mint (private commits, public gitignores +
+#                      invites); a PROVEN-private repo whose team.json is UNTRACKED (minted
+#                      before the committed-path feature, or while visibility was momentarily
+#                      indeterminate — gitignored + never committed) -> PROMOTE it to the
+#                      committed/tracked path so clones auto-join (the MIGRATION); else SHOW
+#                      status. Public/unverifiable NEVER commits here (the leak guard).
 #   hmd invite         the one join line to hand a teammate (public repos).
 #   hmd join <secret>  teammate-side manual join (the invite one-liner wraps it).
 #
@@ -558,6 +563,75 @@ PYEOF
   exit 0
 }
 
+# ── `hmd team new` — mint a fresh team (private -> commit; public -> gitignore+invite) ─
+cmd_new() { # $1 = force(1|"")
+  local FORCE="${1:-}"
+  if [ -f "$TEAM_FILE" ] && [ -z "$FORCE" ]; then
+    cat >&2 <<EOF
+heimdall-team: a team is already configured for this repo:
+    $TEAM_FILE
+Refusing to overwrite it (that would orphan you from the current team).
+Re-mint anyway with:   heimdall-team new --force
+Or inspect it with:    hmd team
+EOF
+    return 2
+  fi
+  local SECRET IDENT OH OHNAME TID
+  SECRET="$(mint_secret)"
+  [ -n "$SECRET" ] || { echo "heimdall-team: failed to mint a secret" >&2; return 2; }
+  IDENT="$(current_identity)"; OH="${IDENT%%$'\t'*}"; OHNAME="${IDENT#*$'\t'}"
+  HMD_TEAM_OWNER_HAID="$OH" HMD_TEAM_OWNER_HANDLE="$OHNAME" write_team "$SECRET" "new"
+  TID="$(team_id_of "$SECRET")"
+  printf 'Minted a new team for this repo (team_id %s).\n' "$TID"
+  printf 'Stored 0600 in %s\n' "$TEAM_FILE"
+  # In a PROVEN-private repo, commit it (tracked -> collaborators auto-join).
+  if [ "$(detect_visibility)" = "private" ]; then
+    if commit_team "chore(team): commit team.json — private repo, read access is the team boundary"; then
+      printf 'Committed (tracked) — collaborators AUTO-JOIN on clone/pull.\n\n'
+    fi
+  else
+    ensure_team_gitignored
+    printf '\n'
+    printf '\xe2\x9a\xa0 the line below contains your TEAM SECRET — share only with teammates\n'
+    printf '  (public repo: distribute out-of-band; never commit a bearer secret)\n\n'
+    if [ -x "$INVITE_CLI" ]; then
+      "$INVITE_CLI" || true
+    fi
+  fi
+  return 0
+}
+
+# ── `hmd team` (bare) — SMART DEFAULT dispatch (the zero-thought surface) ───────────
+# Resolves what the repo needs and does it, so a dev never has to know the internal verbs:
+#   • NO team yet             -> MINT one (cmd_new): a PROVEN-private repo COMMITS it
+#                                (clone == join); a public/unverifiable repo gitignores it
+#                                + prints the invite line (never commit a bearer secret).
+#   • team present, PROVEN    -> PROMOTE it to the committed/tracked path. THE MIGRATION:
+#     private, but UNTRACKED     a repo minted BEFORE the committed-path feature, or minted
+#                                while visibility was momentarily INDETERMINATE (no
+#                                authenticated gh) — so its team.json was gitignored + never
+#                                committed (the EXACT state that leaves a private repo's
+#                                clones NOT auto-joining: they mint their own solo team and
+#                                need a manual `hmd team join`). Force-add + commit it so
+#                                clones/pulls carry it and first-session presence auto-joins.
+#                                Idempotent: an already-tracked team is left untouched.
+#   • otherwise               -> just SHOW status. A PUBLIC / privacy-unverifiable repo NEVER
+#                                commits here (do_share hard-refuses regardless) — the cardinal
+#                                leak guard: a bearer secret must never land in a public tree.
+cmd_dispatch() {
+  local SECRET
+  SECRET="$(_resolve secret)"
+  if [ -z "$SECRET" ]; then
+    cmd_new ""
+    exit $?
+  fi
+  if ! team_is_tracked && [ "$(detect_visibility)" = "private" ]; then
+    if do_share ""; then exit 0; fi
+    # do_share failed (no commit identity / IO) -> fall through to status (never fatal).
+  fi
+  cmd_status "$@"
+}
+
 # ── argv ────────────────────────────────────────────────────────────────────────
 SUB="${1:-}"; shift 2>/dev/null || true
 
@@ -565,7 +639,10 @@ case "$SUB" in
   -h|--help|help)
     usage; exit 0 ;;
 
-  ""|show|dispatch|status)
+  ""|dispatch)
+    cmd_dispatch "$@"; exit $? ;;
+
+  show|status)
     cmd_status "$@"; exit $? ;;
 
   auto)
@@ -579,38 +656,7 @@ case "$SUB" in
         *) echo "heimdall-team new: unexpected argument: $1" >&2; exit 2 ;;
       esac
     done
-    if [ -f "$TEAM_FILE" ] && [ -z "$FORCE" ]; then
-      cat >&2 <<EOF
-heimdall-team: a team is already configured for this repo:
-    $TEAM_FILE
-Refusing to overwrite it (that would orphan you from the current team).
-Re-mint anyway with:   heimdall-team new --force
-Or inspect it with:    hmd team
-EOF
-      exit 2
-    fi
-    SECRET="$(mint_secret)"
-    [ -n "$SECRET" ] || { echo "heimdall-team: failed to mint a secret" >&2; exit 2; }
-    IDENT="$(current_identity)"; OH="${IDENT%%$'\t'*}"; OHNAME="${IDENT#*$'\t'}"
-    HMD_TEAM_OWNER_HAID="$OH" HMD_TEAM_OWNER_HANDLE="$OHNAME" write_team "$SECRET" "new"
-    TID="$(team_id_of "$SECRET")"
-    printf 'Minted a new team for this repo (team_id %s).\n' "$TID"
-    printf 'Stored 0600 in %s\n' "$TEAM_FILE"
-    # In a PROVEN-private repo, commit it (tracked -> collaborators auto-join).
-    if [ "$(detect_visibility)" = "private" ]; then
-      if commit_team "chore(team): commit team.json — private repo, read access is the team boundary"; then
-        printf 'Committed (tracked) — collaborators AUTO-JOIN on clone/pull.\n\n'
-      fi
-    else
-      ensure_team_gitignored
-      printf '\n'
-      printf '\xe2\x9a\xa0 the line below contains your TEAM SECRET — share only with teammates\n'
-      printf '  (public repo: distribute out-of-band; never commit a bearer secret)\n\n'
-      if [ -x "$INVITE_CLI" ]; then
-        "$INVITE_CLI" || true
-      fi
-    fi
-    exit 0 ;;
+    cmd_new "$FORCE"; exit $? ;;
 
   join)
     SECRET="${1:-}"
