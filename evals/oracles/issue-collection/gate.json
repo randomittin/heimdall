@@ -1,0 +1,7 @@
+{
+  "id": "issue-collection",
+  "name": "Anonymized issue-collection k-anon differential gate",
+  "trigger": "per-wave",
+  "severity": "hard",
+  "golden_input": "fixtures/golden/differential.json"
+}

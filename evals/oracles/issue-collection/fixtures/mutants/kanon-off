@@ -1,0 +1,136 @@
+{
+  "fixture": "mutant",
+  "mutant": "kanon-off",
+  "domain": "issue-collection",
+  "kind": "mutant",
+  "invariant_violated": [
+    "INV-B"
+  ],
+  "defect": "A signature bucket seen by only 4 distinct teams (< ISSUE_K_ANONYMITY_MIN=10) is SERVED with real rates instead of SUPPRESSED. Breaks the k-anon floor.",
+  "reject_contract": "served/suppressed partition diverges: reference suppresses the 4-team bucket, the corrupted (buggy) impl serves it.",
+  "stream": [
+    {
+      "schema": "issue_v1",
+      "consent_version": 1,
+      "ids": {
+        "issue_id": "iss-sigBBB-t00-20",
+        "team_id_hash": "t00",
+        "repo_class_hash": "rc0"
+      },
+      "when": {
+        "ts": 0,
+        "tz_bucket": "utc+0000"
+      },
+      "signal": {
+        "error_class": "lint",
+        "signature_hash": "sigBBB",
+        "gate": "lint",
+        "phase": "implement",
+        "command": "test",
+        "severity": "low"
+      },
+      "env": {
+        "os_class": "linux",
+        "ci": false,
+        "hmd_version": "2.0.18"
+      },
+      "security_sensitive": false
+    },
+    {
+      "schema": "issue_v1",
+      "consent_version": 1,
+      "ids": {
+        "issue_id": "iss-sigBBB-t01-21",
+        "team_id_hash": "t01",
+        "repo_class_hash": "rc0"
+      },
+      "when": {
+        "ts": 0,
+        "tz_bucket": "utc+0000"
+      },
+      "signal": {
+        "error_class": "lint",
+        "signature_hash": "sigBBB",
+        "gate": "lint",
+        "phase": "implement",
+        "command": "test",
+        "severity": "low"
+      },
+      "env": {
+        "os_class": "linux",
+        "ci": false,
+        "hmd_version": "2.0.18"
+      },
+      "security_sensitive": false
+    },
+    {
+      "schema": "issue_v1",
+      "consent_version": 1,
+      "ids": {
+        "issue_id": "iss-sigBBB-t02-22",
+        "team_id_hash": "t02",
+        "repo_class_hash": "rc0"
+      },
+      "when": {
+        "ts": 0,
+        "tz_bucket": "utc+0000"
+      },
+      "signal": {
+        "error_class": "lint",
+        "signature_hash": "sigBBB",
+        "gate": "lint",
+        "phase": "implement",
+        "command": "test",
+        "severity": "low"
+      },
+      "env": {
+        "os_class": "linux",
+        "ci": false,
+        "hmd_version": "2.0.18"
+      },
+      "security_sensitive": false
+    },
+    {
+      "schema": "issue_v1",
+      "consent_version": 1,
+      "ids": {
+        "issue_id": "iss-sigBBB-t03-23",
+        "team_id_hash": "t03",
+        "repo_class_hash": "rc0"
+      },
+      "when": {
+        "ts": 0,
+        "tz_bucket": "utc+0000"
+      },
+      "signal": {
+        "error_class": "lint",
+        "signature_hash": "sigBBB",
+        "gate": "lint",
+        "phase": "implement",
+        "command": "test",
+        "severity": "low"
+      },
+      "env": {
+        "os_class": "linux",
+        "ci": false,
+        "hmd_version": "2.0.18"
+      },
+      "security_sensitive": false
+    }
+  ],
+  "corrupted": {
+    "served": [
+      [
+        "lint",
+        "sigBBB",
+        "2.0.18",
+        "linux",
+        "test",
+        4,
+        4
+      ]
+    ],
+    "suppressed": [],
+    "excluded_security": 0
+  }
+}

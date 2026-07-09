@@ -1,0 +1,531 @@
+{
+  "fixture": "golden",
+  "domain": "issue-collection",
+  "kind": "differential",
+  "what": "CORRECT issue_v1 stream. The gate feeds it to BOTH the impl (cp_issue_aggregate.compute_issue_aggregates) AND the independent reference (reference/aggregate_ref.aggregate), normalizes each to the served/suppressed/excluded_security partition, and diffs. They MUST be identical. If the gate rejects this golden it is over-strict (false-RED) and is itself broken.",
+  "invariants_exercised": [
+    "INV-B",
+    "INV-F"
+  ],
+  "expected_partition": {
+    "served": 1,
+    "suppressed": 1,
+    "excluded_security": 2,
+    "note": "sigAAA 12 distinct teams / 13 rows -> SERVED; sigBBB 4 teams -> SUPPRESSED (k<10); 2 auth records -> EXCLUDED (INV-F, any k)."
+  },
+  "stream": [
+    {
+      "schema": "issue_v1",
+      "consent_version": 1,
+      "ids": {
+        "issue_id": "iss-sigAAA-t00-1",
+        "team_id_hash": "t00",
+        "repo_class_hash": "rc0"
+      },
+      "when": {
+        "ts": 0,
+        "tz_bucket": "utc+0000"
+      },
+      "signal": {
+        "error_class": "lint",
+        "signature_hash": "sigAAA",
+        "gate": "lint",
+        "phase": "implement",
+        "command": "test",
+        "severity": "low"
+      },
+      "env": {
+        "os_class": "linux",
+        "ci": false,
+        "hmd_version": "2.0.18"
+      },
+      "security_sensitive": false
+    },
+    {
+      "schema": "issue_v1",
+      "consent_version": 1,
+      "ids": {
+        "issue_id": "iss-sigAAA-t01-2",
+        "team_id_hash": "t01",
+        "repo_class_hash": "rc0"
+      },
+      "when": {
+        "ts": 0,
+        "tz_bucket": "utc+0000"
+      },
+      "signal": {
+        "error_class": "lint",
+        "signature_hash": "sigAAA",
+        "gate": "lint",
+        "phase": "implement",
+        "command": "test",
+        "severity": "low"
+      },
+      "env": {
+        "os_class": "linux",
+        "ci": false,
+        "hmd_version": "2.0.18"
+      },
+      "security_sensitive": false
+    },
+    {
+      "schema": "issue_v1",
+      "consent_version": 1,
+      "ids": {
+        "issue_id": "iss-sigAAA-t02-3",
+        "team_id_hash": "t02",
+        "repo_class_hash": "rc0"
+      },
+      "when": {
+        "ts": 0,
+        "tz_bucket": "utc+0000"
+      },
+      "signal": {
+        "error_class": "lint",
+        "signature_hash": "sigAAA",
+        "gate": "lint",
+        "phase": "implement",
+        "command": "test",
+        "severity": "low"
+      },
+      "env": {
+        "os_class": "linux",
+        "ci": false,
+        "hmd_version": "2.0.18"
+      },
+      "security_sensitive": false
+    },
+    {
+      "schema": "issue_v1",
+      "consent_version": 1,
+      "ids": {
+        "issue_id": "iss-sigAAA-t03-4",
+        "team_id_hash": "t03",
+        "repo_class_hash": "rc0"
+      },
+      "when": {
+        "ts": 0,
+        "tz_bucket": "utc+0000"
+      },
+      "signal": {
+        "error_class": "lint",
+        "signature_hash": "sigAAA",
+        "gate": "lint",
+        "phase": "implement",
+        "command": "test",
+        "severity": "low"
+      },
+      "env": {
+        "os_class": "linux",
+        "ci": false,
+        "hmd_version": "2.0.18"
+      },
+      "security_sensitive": false
+    },
+    {
+      "schema": "issue_v1",
+      "consent_version": 1,
+      "ids": {
+        "issue_id": "iss-sigAAA-t04-5",
+        "team_id_hash": "t04",
+        "repo_class_hash": "rc0"
+      },
+      "when": {
+        "ts": 0,
+        "tz_bucket": "utc+0000"
+      },
+      "signal": {
+        "error_class": "lint",
+        "signature_hash": "sigAAA",
+        "gate": "lint",
+        "phase": "implement",
+        "command": "test",
+        "severity": "low"
+      },
+      "env": {
+        "os_class": "linux",
+        "ci": false,
+        "hmd_version": "2.0.18"
+      },
+      "security_sensitive": false
+    },
+    {
+      "schema": "issue_v1",
+      "consent_version": 1,
+      "ids": {
+        "issue_id": "iss-sigAAA-t05-6",
+        "team_id_hash": "t05",
+        "repo_class_hash": "rc0"
+      },
+      "when": {
+        "ts": 0,
+        "tz_bucket": "utc+0000"
+      },
+      "signal": {
+        "error_class": "lint",
+        "signature_hash": "sigAAA",
+        "gate": "lint",
+        "phase": "implement",
+        "command": "test",
+        "severity": "low"
+      },
+      "env": {
+        "os_class": "linux",
+        "ci": false,
+        "hmd_version": "2.0.18"
+      },
+      "security_sensitive": false
+    },
+    {
+      "schema": "issue_v1",
+      "consent_version": 1,
+      "ids": {
+        "issue_id": "iss-sigAAA-t06-7",
+        "team_id_hash": "t06",
+        "repo_class_hash": "rc0"
+      },
+      "when": {
+        "ts": 0,
+        "tz_bucket": "utc+0000"
+      },
+      "signal": {
+        "error_class": "lint",
+        "signature_hash": "sigAAA",
+        "gate": "lint",
+        "phase": "implement",
+        "command": "test",
+        "severity": "low"
+      },
+      "env": {
+        "os_class": "linux",
+        "ci": false,
+        "hmd_version": "2.0.18"
+      },
+      "security_sensitive": false
+    },
+    {
+      "schema": "issue_v1",
+      "consent_version": 1,
+      "ids": {
+        "issue_id": "iss-sigAAA-t07-8",
+        "team_id_hash": "t07",
+        "repo_class_hash": "rc0"
+      },
+      "when": {
+        "ts": 0,
+        "tz_bucket": "utc+0000"
+      },
+      "signal": {
+        "error_class": "lint",
+        "signature_hash": "sigAAA",
+        "gate": "lint",
+        "phase": "implement",
+        "command": "test",
+        "severity": "low"
+      },
+      "env": {
+        "os_class": "linux",
+        "ci": false,
+        "hmd_version": "2.0.18"
+      },
+      "security_sensitive": false
+    },
+    {
+      "schema": "issue_v1",
+      "consent_version": 1,
+      "ids": {
+        "issue_id": "iss-sigAAA-t08-9",
+        "team_id_hash": "t08",
+        "repo_class_hash": "rc0"
+      },
+      "when": {
+        "ts": 0,
+        "tz_bucket": "utc+0000"
+      },
+      "signal": {
+        "error_class": "lint",
+        "signature_hash": "sigAAA",
+        "gate": "lint",
+        "phase": "implement",
+        "command": "test",
+        "severity": "low"
+      },
+      "env": {
+        "os_class": "linux",
+        "ci": false,
+        "hmd_version": "2.0.18"
+      },
+      "security_sensitive": false
+    },
+    {
+      "schema": "issue_v1",
+      "consent_version": 1,
+      "ids": {
+        "issue_id": "iss-sigAAA-t09-10",
+        "team_id_hash": "t09",
+        "repo_class_hash": "rc0"
+      },
+      "when": {
+        "ts": 0,
+        "tz_bucket": "utc+0000"
+      },
+      "signal": {
+        "error_class": "lint",
+        "signature_hash": "sigAAA",
+        "gate": "lint",
+        "phase": "implement",
+        "command": "test",
+        "severity": "low"
+      },
+      "env": {
+        "os_class": "linux",
+        "ci": false,
+        "hmd_version": "2.0.18"
+      },
+      "security_sensitive": false
+    },
+    {
+      "schema": "issue_v1",
+      "consent_version": 1,
+      "ids": {
+        "issue_id": "iss-sigAAA-t10-11",
+        "team_id_hash": "t10",
+        "repo_class_hash": "rc0"
+      },
+      "when": {
+        "ts": 0,
+        "tz_bucket": "utc+0000"
+      },
+      "signal": {
+        "error_class": "lint",
+        "signature_hash": "sigAAA",
+        "gate": "lint",
+        "phase": "implement",
+        "command": "test",
+        "severity": "low"
+      },
+      "env": {
+        "os_class": "linux",
+        "ci": false,
+        "hmd_version": "2.0.18"
+      },
+      "security_sensitive": false
+    },
+    {
+      "schema": "issue_v1",
+      "consent_version": 1,
+      "ids": {
+        "issue_id": "iss-sigAAA-t11-12",
+        "team_id_hash": "t11",
+        "repo_class_hash": "rc0"
+      },
+      "when": {
+        "ts": 0,
+        "tz_bucket": "utc+0000"
+      },
+      "signal": {
+        "error_class": "lint",
+        "signature_hash": "sigAAA",
+        "gate": "lint",
+        "phase": "implement",
+        "command": "test",
+        "severity": "low"
+      },
+      "env": {
+        "os_class": "linux",
+        "ci": false,
+        "hmd_version": "2.0.18"
+      },
+      "security_sensitive": false
+    },
+    {
+      "schema": "issue_v1",
+      "consent_version": 1,
+      "ids": {
+        "issue_id": "iss-sigAAA-t00-13",
+        "team_id_hash": "t00",
+        "repo_class_hash": "rc0"
+      },
+      "when": {
+        "ts": 0,
+        "tz_bucket": "utc+0000"
+      },
+      "signal": {
+        "error_class": "lint",
+        "signature_hash": "sigAAA",
+        "gate": "lint",
+        "phase": "implement",
+        "command": "test",
+        "severity": "low"
+      },
+      "env": {
+        "os_class": "linux",
+        "ci": false,
+        "hmd_version": "2.0.18"
+      },
+      "security_sensitive": false
+    },
+    {
+      "schema": "issue_v1",
+      "consent_version": 1,
+      "ids": {
+        "issue_id": "iss-sigBBB-t00-14",
+        "team_id_hash": "t00",
+        "repo_class_hash": "rc0"
+      },
+      "when": {
+        "ts": 0,
+        "tz_bucket": "utc+0000"
+      },
+      "signal": {
+        "error_class": "lint",
+        "signature_hash": "sigBBB",
+        "gate": "lint",
+        "phase": "implement",
+        "command": "test",
+        "severity": "low"
+      },
+      "env": {
+        "os_class": "linux",
+        "ci": false,
+        "hmd_version": "2.0.18"
+      },
+      "security_sensitive": false
+    },
+    {
+      "schema": "issue_v1",
+      "consent_version": 1,
+      "ids": {
+        "issue_id": "iss-sigBBB-t01-15",
+        "team_id_hash": "t01",
+        "repo_class_hash": "rc0"
+      },
+      "when": {
+        "ts": 0,
+        "tz_bucket": "utc+0000"
+      },
+      "signal": {
+        "error_class": "lint",
+        "signature_hash": "sigBBB",
+        "gate": "lint",
+        "phase": "implement",
+        "command": "test",
+        "severity": "low"
+      },
+      "env": {
+        "os_class": "linux",
+        "ci": false,
+        "hmd_version": "2.0.18"
+      },
+      "security_sensitive": false
+    },
+    {
+      "schema": "issue_v1",
+      "consent_version": 1,
+      "ids": {
+        "issue_id": "iss-sigBBB-t02-16",
+        "team_id_hash": "t02",
+        "repo_class_hash": "rc0"
+      },
+      "when": {
+        "ts": 0,
+        "tz_bucket": "utc+0000"
+      },
+      "signal": {
+        "error_class": "lint",
+        "signature_hash": "sigBBB",
+        "gate": "lint",
+        "phase": "implement",
+        "command": "test",
+        "severity": "low"
+      },
+      "env": {
+        "os_class": "linux",
+        "ci": false,
+        "hmd_version": "2.0.18"
+      },
+      "security_sensitive": false
+    },
+    {
+      "schema": "issue_v1",
+      "consent_version": 1,
+      "ids": {
+        "issue_id": "iss-sigBBB-t03-17",
+        "team_id_hash": "t03",
+        "repo_class_hash": "rc0"
+      },
+      "when": {
+        "ts": 0,
+        "tz_bucket": "utc+0000"
+      },
+      "signal": {
+        "error_class": "lint",
+        "signature_hash": "sigBBB",
+        "gate": "lint",
+        "phase": "implement",
+        "command": "test",
+        "severity": "low"
+      },
+      "env": {
+        "os_class": "linux",
+        "ci": false,
+        "hmd_version": "2.0.18"
+      },
+      "security_sensitive": false
+    },
+    {
+      "schema": "issue_v1",
+      "consent_version": 1,
+      "ids": {
+        "issue_id": "iss-sigCCC-t00-18",
+        "team_id_hash": "t00",
+        "repo_class_hash": "rc0"
+      },
+      "when": {
+        "ts": 0,
+        "tz_bucket": "utc+0000"
+      },
+      "signal": {
+        "error_class": "auth",
+        "signature_hash": "sigCCC",
+        "gate": "lint",
+        "phase": "implement",
+        "command": "test",
+        "severity": "low"
+      },
+      "env": {
+        "os_class": "linux",
+        "ci": false,
+        "hmd_version": "2.0.18"
+      },
+      "security_sensitive": true
+    },
+    {
+      "schema": "issue_v1",
+      "consent_version": 1,
+      "ids": {
+        "issue_id": "iss-sigDDD-t01-19",
+        "team_id_hash": "t01",
+        "repo_class_hash": "rc0"
+      },
+      "when": {
+        "ts": 0,
+        "tz_bucket": "utc+0000"
+      },
+      "signal": {
+        "error_class": "auth",
+        "signature_hash": "sigDDD",
+        "gate": "lint",
+        "phase": "implement",
+        "command": "test",
+        "severity": "low"
+      },
+      "env": {
+        "os_class": "linux",
+        "ci": false,
+        "hmd_version": "2.0.18"
+      },
+      "security_sensitive": true
+    }
+  ]
+}

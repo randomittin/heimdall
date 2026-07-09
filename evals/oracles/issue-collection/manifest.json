@@ -1,0 +1,44 @@
+{
+  "domain": "issue-collection",
+  "gate_type": "differential",
+  "title": "Anonymized issue-collection k-anon differential oracle",
+  "description": "Proves the implementation's k-anon issue aggregate (bin/lib/cp_issue_aggregate.py) matches an INDEPENDENTLY-authored reference aggregator (reference/aggregate_ref.py) over identical seeded issue_v1 streams. Both sides are normalized to a common comparable partition — the served bucket set + the suppressed bucket set + the security-exclusion count — and diffed. The impl author (Waves 1-3) and the reference author (Wave 2d) are disjoint; this gate harness (Wave 4) is authored by neither, wiring the diff so oracle independence holds by construction.",
+  "invariants": {
+    "source": "INVARIANTS.md",
+    "load_bearing": {
+      "INV-B": "a signature bucket is SERVED only at >= ISSUE_K_ANONYMITY_MIN (=10) DISTINCT team_id_hash; sub-threshold buckets are SUPPRESSED (teams-only marker, never metrics). Distinct-team count, never row count.",
+      "INV-F": "a security_sensitive record NEVER enters the public aggregate, at any team count; it is excluded and counted opaquely.",
+      "INV-G": "the partition counts DISTINCT teams and never emits a per-team row (tenant isolation preserved in the output shape)."
+    }
+  },
+  "artifacts": {
+    "gate": "gate.sh",
+    "run": "run.sh",
+    "descriptor": "gate.json",
+    "diff_truth": "differential.py",
+    "reference": "reference/aggregate_ref.py",
+    "golden": "fixtures/golden/differential.json",
+    "mutants": "fixtures/mutants/",
+    "belt": "../../../test/heimdall-issue-collection.test.sh"
+  },
+  "reference": {
+    "independent": true,
+    "kind": "separate-agent",
+    "dir": "reference",
+    "no_impl_import": "reference/aggregate_ref.py imports nothing from bin/lib/* — every constant and computation is reproduced from INVARIANTS.md alone (enforced by grep acceptance)."
+  },
+  "normalization": {
+    "why": "impl and reference legitimately use different envelopes (issue_aggregate_v1 dimensions map vs issue_aggregate_ref_v1 served/suppressed lists), so the raw envelopes are NOT byte-diffed. Both are projected to the same partition before diffing (reference/README §'Aggregate output wrapper shape').",
+    "partition": {
+      "served": "[error_class, signature_hash, hmd_version, os_class, command_or_phase, teams, rows]",
+      "suppressed": "[error_class, signature_hash, hmd_version, os_class, command_or_phase, teams]",
+      "excluded_security": "int"
+    }
+  },
+  "gate_command": "evals/oracles/issue-collection/gate.sh --differential --seeds 200",
+  "falsifiability": {
+    "harness": "bin/falsify issue-collection --assert-score 1.0",
+    "requires": "golden GREEN + every mutant KILLED (score 1.0)",
+    "mutants": ["kanon-off", "security-lane-leak", "cross-tenant-merge", "wrong-bucket-key"]
+  }
+}

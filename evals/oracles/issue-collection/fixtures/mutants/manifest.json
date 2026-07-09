@@ -1,0 +1,44 @@
+{
+  "domain": "issue-collection",
+  "fixture_kind": "mutants",
+  "purpose": "Each mutant is a minimal self-contained fixture (a seeded issue_v1 `stream` + the `corrupted` served/suppressed/excluded_security partition a BUGGY impl would emit, breaking ONE privacy invariant). `bin/falsify issue-collection` runs the gate against golden (expect PASS — the merged impl equals the independent reference) then every mutant (expect REJECT — the gate recomputes the CORRECT partition from the stream via the independent reference and diffs it against `corrupted`). Falsifiability score = mutants rejected / total, conditioned on golden passing; a P0 gate requires 1.0. A mutant that SURVIVES (gate stays green) proves the normalization is blind to that defect class and is a false-green — it BLOCKS the build.",
+  "golden": "../golden/differential.json",
+  "mutants": [
+    {
+      "name": "kanon-off",
+      "file": "kanon-off",
+      "defect": "a signature bucket seen by only 4 distinct teams (< ISSUE_K_ANONYMITY_MIN=10) is SERVED with real rates instead of SUPPRESSED — the k-anon floor is off",
+      "invariant_violated": ["INV-B"],
+      "must_turn_red_gate": "differential",
+      "reject_contract": "served/suppressed partition diverges: the reference suppresses the 4-team bucket; the corrupted impl serves it (served index 0: reference [] vs corrupted [4-team bucket])",
+      "blind_to": ["INV-F"]
+    },
+    {
+      "name": "security-lane-leak",
+      "file": "security-lane-leak",
+      "defect": "a security-sensitive bucket (error_class=auth, security_sensitive=true) enters the PUBLIC served aggregate instead of being excluded to the private lane — the absolute security exclusion (INV-F, any k) is broken",
+      "invariant_violated": ["INV-F"],
+      "must_turn_red_gate": "differential",
+      "reject_contract": "served set diverges (the corrupted impl serves the auth bucket) AND excluded_security drops from 12 to 0",
+      "blind_to": ["INV-B (k-anon numeric)"]
+    },
+    {
+      "name": "cross-tenant-merge",
+      "file": "cross-tenant-merge",
+      "defect": "distinct-team count conflated with ROW count: a bucket with 10 distinct teams but 20 rows reports teams=20; a single team spamming issues would then clear k-anon as if it were a real cohort — a cross-tenant merge defeating the distinct-team guarantee",
+      "invariant_violated": ["INV-B", "INV-G"],
+      "must_turn_red_gate": "differential",
+      "reject_contract": "served bucket diverges at the teams field: reference 10 (distinct) vs corrupted 20 (rows)",
+      "blind_to": ["INV-F"]
+    },
+    {
+      "name": "wrong-bucket-key",
+      "file": "wrong-bucket-key",
+      "defect": "the bucket key drops signature_hash, so two DISTINCT error signatures collapse into ONE bucket — the published partition hides which signatures exist and inflates a single bucket's counts",
+      "invariant_violated": ["INV-B"],
+      "must_turn_red_gate": "differential",
+      "reject_contract": "served set diverges: reference has 2 distinct-signature buckets, the corrupted impl has 1 merged bucket with an empty signature_hash (served count 2 vs 1)",
+      "blind_to": ["INV-F"]
+    }
+  ]
+}

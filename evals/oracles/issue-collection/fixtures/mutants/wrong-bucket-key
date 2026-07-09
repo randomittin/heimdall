@@ -1,0 +1,622 @@
+{
+  "fixture": "mutant",
+  "mutant": "wrong-bucket-key",
+  "domain": "issue-collection",
+  "kind": "mutant",
+  "invariant_violated": [
+    "INV-B"
+  ],
+  "defect": "The bucket key drops signature_hash, so two DISTINCT error signatures collapse into ONE bucket. The published partition then hides which signatures exist and inflates a single bucket's counts.",
+  "reject_contract": "served set diverges: reference has 2 distinct-signature buckets, the corrupted impl has 1 merged bucket with an empty signature_hash.",
+  "stream": [
+    {
+      "schema": "issue_v1",
+      "consent_version": 1,
+      "ids": {
+        "issue_id": "iss-sig1-t00-67",
+        "team_id_hash": "t00",
+        "repo_class_hash": "rc0"
+      },
+      "when": {
+        "ts": 0,
+        "tz_bucket": "utc+0000"
+      },
+      "signal": {
+        "error_class": "lint",
+        "signature_hash": "sig1",
+        "gate": "lint",
+        "phase": "implement",
+        "command": "test",
+        "severity": "low"
+      },
+      "env": {
+        "os_class": "linux",
+        "ci": false,
+        "hmd_version": "2.0.18"
+      },
+      "security_sensitive": false
+    },
+    {
+      "schema": "issue_v1",
+      "consent_version": 1,
+      "ids": {
+        "issue_id": "iss-sig1-t01-68",
+        "team_id_hash": "t01",
+        "repo_class_hash": "rc0"
+      },
+      "when": {
+        "ts": 0,
+        "tz_bucket": "utc+0000"
+      },
+      "signal": {
+        "error_class": "lint",
+        "signature_hash": "sig1",
+        "gate": "lint",
+        "phase": "implement",
+        "command": "test",
+        "severity": "low"
+      },
+      "env": {
+        "os_class": "linux",
+        "ci": false,
+        "hmd_version": "2.0.18"
+      },
+      "security_sensitive": false
+    },
+    {
+      "schema": "issue_v1",
+      "consent_version": 1,
+      "ids": {
+        "issue_id": "iss-sig1-t02-69",
+        "team_id_hash": "t02",
+        "repo_class_hash": "rc0"
+      },
+      "when": {
+        "ts": 0,
+        "tz_bucket": "utc+0000"
+      },
+      "signal": {
+        "error_class": "lint",
+        "signature_hash": "sig1",
+        "gate": "lint",
+        "phase": "implement",
+        "command": "test",
+        "severity": "low"
+      },
+      "env": {
+        "os_class": "linux",
+        "ci": false,
+        "hmd_version": "2.0.18"
+      },
+      "security_sensitive": false
+    },
+    {
+      "schema": "issue_v1",
+      "consent_version": 1,
+      "ids": {
+        "issue_id": "iss-sig1-t03-70",
+        "team_id_hash": "t03",
+        "repo_class_hash": "rc0"
+      },
+      "when": {
+        "ts": 0,
+        "tz_bucket": "utc+0000"
+      },
+      "signal": {
+        "error_class": "lint",
+        "signature_hash": "sig1",
+        "gate": "lint",
+        "phase": "implement",
+        "command": "test",
+        "severity": "low"
+      },
+      "env": {
+        "os_class": "linux",
+        "ci": false,
+        "hmd_version": "2.0.18"
+      },
+      "security_sensitive": false
+    },
+    {
+      "schema": "issue_v1",
+      "consent_version": 1,
+      "ids": {
+        "issue_id": "iss-sig1-t04-71",
+        "team_id_hash": "t04",
+        "repo_class_hash": "rc0"
+      },
+      "when": {
+        "ts": 0,
+        "tz_bucket": "utc+0000"
+      },
+      "signal": {
+        "error_class": "lint",
+        "signature_hash": "sig1",
+        "gate": "lint",
+        "phase": "implement",
+        "command": "test",
+        "severity": "low"
+      },
+      "env": {
+        "os_class": "linux",
+        "ci": false,
+        "hmd_version": "2.0.18"
+      },
+      "security_sensitive": false
+    },
+    {
+      "schema": "issue_v1",
+      "consent_version": 1,
+      "ids": {
+        "issue_id": "iss-sig1-t05-72",
+        "team_id_hash": "t05",
+        "repo_class_hash": "rc0"
+      },
+      "when": {
+        "ts": 0,
+        "tz_bucket": "utc+0000"
+      },
+      "signal": {
+        "error_class": "lint",
+        "signature_hash": "sig1",
+        "gate": "lint",
+        "phase": "implement",
+        "command": "test",
+        "severity": "low"
+      },
+      "env": {
+        "os_class": "linux",
+        "ci": false,
+        "hmd_version": "2.0.18"
+      },
+      "security_sensitive": false
+    },
+    {
+      "schema": "issue_v1",
+      "consent_version": 1,
+      "ids": {
+        "issue_id": "iss-sig1-t06-73",
+        "team_id_hash": "t06",
+        "repo_class_hash": "rc0"
+      },
+      "when": {
+        "ts": 0,
+        "tz_bucket": "utc+0000"
+      },
+      "signal": {
+        "error_class": "lint",
+        "signature_hash": "sig1",
+        "gate": "lint",
+        "phase": "implement",
+        "command": "test",
+        "severity": "low"
+      },
+      "env": {
+        "os_class": "linux",
+        "ci": false,
+        "hmd_version": "2.0.18"
+      },
+      "security_sensitive": false
+    },
+    {
+      "schema": "issue_v1",
+      "consent_version": 1,
+      "ids": {
+        "issue_id": "iss-sig1-t07-74",
+        "team_id_hash": "t07",
+        "repo_class_hash": "rc0"
+      },
+      "when": {
+        "ts": 0,
+        "tz_bucket": "utc+0000"
+      },
+      "signal": {
+        "error_class": "lint",
+        "signature_hash": "sig1",
+        "gate": "lint",
+        "phase": "implement",
+        "command": "test",
+        "severity": "low"
+      },
+      "env": {
+        "os_class": "linux",
+        "ci": false,
+        "hmd_version": "2.0.18"
+      },
+      "security_sensitive": false
+    },
+    {
+      "schema": "issue_v1",
+      "consent_version": 1,
+      "ids": {
+        "issue_id": "iss-sig1-t08-75",
+        "team_id_hash": "t08",
+        "repo_class_hash": "rc0"
+      },
+      "when": {
+        "ts": 0,
+        "tz_bucket": "utc+0000"
+      },
+      "signal": {
+        "error_class": "lint",
+        "signature_hash": "sig1",
+        "gate": "lint",
+        "phase": "implement",
+        "command": "test",
+        "severity": "low"
+      },
+      "env": {
+        "os_class": "linux",
+        "ci": false,
+        "hmd_version": "2.0.18"
+      },
+      "security_sensitive": false
+    },
+    {
+      "schema": "issue_v1",
+      "consent_version": 1,
+      "ids": {
+        "issue_id": "iss-sig1-t09-76",
+        "team_id_hash": "t09",
+        "repo_class_hash": "rc0"
+      },
+      "when": {
+        "ts": 0,
+        "tz_bucket": "utc+0000"
+      },
+      "signal": {
+        "error_class": "lint",
+        "signature_hash": "sig1",
+        "gate": "lint",
+        "phase": "implement",
+        "command": "test",
+        "severity": "low"
+      },
+      "env": {
+        "os_class": "linux",
+        "ci": false,
+        "hmd_version": "2.0.18"
+      },
+      "security_sensitive": false
+    },
+    {
+      "schema": "issue_v1",
+      "consent_version": 1,
+      "ids": {
+        "issue_id": "iss-sig1-t10-77",
+        "team_id_hash": "t10",
+        "repo_class_hash": "rc0"
+      },
+      "when": {
+        "ts": 0,
+        "tz_bucket": "utc+0000"
+      },
+      "signal": {
+        "error_class": "lint",
+        "signature_hash": "sig1",
+        "gate": "lint",
+        "phase": "implement",
+        "command": "test",
+        "severity": "low"
+      },
+      "env": {
+        "os_class": "linux",
+        "ci": false,
+        "hmd_version": "2.0.18"
+      },
+      "security_sensitive": false
+    },
+    {
+      "schema": "issue_v1",
+      "consent_version": 1,
+      "ids": {
+        "issue_id": "iss-sig2-t00-78",
+        "team_id_hash": "t00",
+        "repo_class_hash": "rc0"
+      },
+      "when": {
+        "ts": 0,
+        "tz_bucket": "utc+0000"
+      },
+      "signal": {
+        "error_class": "lint",
+        "signature_hash": "sig2",
+        "gate": "lint",
+        "phase": "implement",
+        "command": "test",
+        "severity": "low"
+      },
+      "env": {
+        "os_class": "linux",
+        "ci": false,
+        "hmd_version": "2.0.18"
+      },
+      "security_sensitive": false
+    },
+    {
+      "schema": "issue_v1",
+      "consent_version": 1,
+      "ids": {
+        "issue_id": "iss-sig2-t01-79",
+        "team_id_hash": "t01",
+        "repo_class_hash": "rc0"
+      },
+      "when": {
+        "ts": 0,
+        "tz_bucket": "utc+0000"
+      },
+      "signal": {
+        "error_class": "lint",
+        "signature_hash": "sig2",
+        "gate": "lint",
+        "phase": "implement",
+        "command": "test",
+        "severity": "low"
+      },
+      "env": {
+        "os_class": "linux",
+        "ci": false,
+        "hmd_version": "2.0.18"
+      },
+      "security_sensitive": false
+    },
+    {
+      "schema": "issue_v1",
+      "consent_version": 1,
+      "ids": {
+        "issue_id": "iss-sig2-t02-80",
+        "team_id_hash": "t02",
+        "repo_class_hash": "rc0"
+      },
+      "when": {
+        "ts": 0,
+        "tz_bucket": "utc+0000"
+      },
+      "signal": {
+        "error_class": "lint",
+        "signature_hash": "sig2",
+        "gate": "lint",
+        "phase": "implement",
+        "command": "test",
+        "severity": "low"
+      },
+      "env": {
+        "os_class": "linux",
+        "ci": false,
+        "hmd_version": "2.0.18"
+      },
+      "security_sensitive": false
+    },
+    {
+      "schema": "issue_v1",
+      "consent_version": 1,
+      "ids": {
+        "issue_id": "iss-sig2-t03-81",
+        "team_id_hash": "t03",
+        "repo_class_hash": "rc0"
+      },
+      "when": {
+        "ts": 0,
+        "tz_bucket": "utc+0000"
+      },
+      "signal": {
+        "error_class": "lint",
+        "signature_hash": "sig2",
+        "gate": "lint",
+        "phase": "implement",
+        "command": "test",
+        "severity": "low"
+      },
+      "env": {
+        "os_class": "linux",
+        "ci": false,
+        "hmd_version": "2.0.18"
+      },
+      "security_sensitive": false
+    },
+    {
+      "schema": "issue_v1",
+      "consent_version": 1,
+      "ids": {
+        "issue_id": "iss-sig2-t04-82",
+        "team_id_hash": "t04",
+        "repo_class_hash": "rc0"
+      },
+      "when": {
+        "ts": 0,
+        "tz_bucket": "utc+0000"
+      },
+      "signal": {
+        "error_class": "lint",
+        "signature_hash": "sig2",
+        "gate": "lint",
+        "phase": "implement",
+        "command": "test",
+        "severity": "low"
+      },
+      "env": {
+        "os_class": "linux",
+        "ci": false,
+        "hmd_version": "2.0.18"
+      },
+      "security_sensitive": false
+    },
+    {
+      "schema": "issue_v1",
+      "consent_version": 1,
+      "ids": {
+        "issue_id": "iss-sig2-t05-83",
+        "team_id_hash": "t05",
+        "repo_class_hash": "rc0"
+      },
+      "when": {
+        "ts": 0,
+        "tz_bucket": "utc+0000"
+      },
+      "signal": {
+        "error_class": "lint",
+        "signature_hash": "sig2",
+        "gate": "lint",
+        "phase": "implement",
+        "command": "test",
+        "severity": "low"
+      },
+      "env": {
+        "os_class": "linux",
+        "ci": false,
+        "hmd_version": "2.0.18"
+      },
+      "security_sensitive": false
+    },
+    {
+      "schema": "issue_v1",
+      "consent_version": 1,
+      "ids": {
+        "issue_id": "iss-sig2-t06-84",
+        "team_id_hash": "t06",
+        "repo_class_hash": "rc0"
+      },
+      "when": {
+        "ts": 0,
+        "tz_bucket": "utc+0000"
+      },
+      "signal": {
+        "error_class": "lint",
+        "signature_hash": "sig2",
+        "gate": "lint",
+        "phase": "implement",
+        "command": "test",
+        "severity": "low"
+      },
+      "env": {
+        "os_class": "linux",
+        "ci": false,
+        "hmd_version": "2.0.18"
+      },
+      "security_sensitive": false
+    },
+    {
+      "schema": "issue_v1",
+      "consent_version": 1,
+      "ids": {
+        "issue_id": "iss-sig2-t07-85",
+        "team_id_hash": "t07",
+        "repo_class_hash": "rc0"
+      },
+      "when": {
+        "ts": 0,
+        "tz_bucket": "utc+0000"
+      },
+      "signal": {
+        "error_class": "lint",
+        "signature_hash": "sig2",
+        "gate": "lint",
+        "phase": "implement",
+        "command": "test",
+        "severity": "low"
+      },
+      "env": {
+        "os_class": "linux",
+        "ci": false,
+        "hmd_version": "2.0.18"
+      },
+      "security_sensitive": false
+    },
+    {
+      "schema": "issue_v1",
+      "consent_version": 1,
+      "ids": {
+        "issue_id": "iss-sig2-t08-86",
+        "team_id_hash": "t08",
+        "repo_class_hash": "rc0"
+      },
+      "when": {
+        "ts": 0,
+        "tz_bucket": "utc+0000"
+      },
+      "signal": {
+        "error_class": "lint",
+        "signature_hash": "sig2",
+        "gate": "lint",
+        "phase": "implement",
+        "command": "test",
+        "severity": "low"
+      },
+      "env": {
+        "os_class": "linux",
+        "ci": false,
+        "hmd_version": "2.0.18"
+      },
+      "security_sensitive": false
+    },
+    {
+      "schema": "issue_v1",
+      "consent_version": 1,
+      "ids": {
+        "issue_id": "iss-sig2-t09-87",
+        "team_id_hash": "t09",
+        "repo_class_hash": "rc0"
+      },
+      "when": {
+        "ts": 0,
+        "tz_bucket": "utc+0000"
+      },
+      "signal": {
+        "error_class": "lint",
+        "signature_hash": "sig2",
+        "gate": "lint",
+        "phase": "implement",
+        "command": "test",
+        "severity": "low"
+      },
+      "env": {
+        "os_class": "linux",
+        "ci": false,
+        "hmd_version": "2.0.18"
+      },
+      "security_sensitive": false
+    },
+    {
+      "schema": "issue_v1",
+      "consent_version": 1,
+      "ids": {
+        "issue_id": "iss-sig2-t10-88",
+        "team_id_hash": "t10",
+        "repo_class_hash": "rc0"
+      },
+      "when": {
+        "ts": 0,
+        "tz_bucket": "utc+0000"
+      },
+      "signal": {
+        "error_class": "lint",
+        "signature_hash": "sig2",
+        "gate": "lint",
+        "phase": "implement",
+        "command": "test",
+        "severity": "low"
+      },
+      "env": {
+        "os_class": "linux",
+        "ci": false,
+        "hmd_version": "2.0.18"
+      },
+      "security_sensitive": false
+    }
+  ],
+  "corrupted": {
+    "served": [
+      [
+        "lint",
+        "",
+        "2.0.18",
+        "linux",
+        "test",
+        11,
+        22
+      ]
+    ],
+    "suppressed": [],
+    "excluded_security": 0
+  }
+}

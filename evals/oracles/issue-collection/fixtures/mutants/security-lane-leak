@@ -1,0 +1,658 @@
+{
+  "fixture": "mutant",
+  "mutant": "security-lane-leak",
+  "domain": "issue-collection",
+  "kind": "mutant",
+  "invariant_violated": [
+    "INV-F"
+  ],
+  "defect": "A security-sensitive bucket (error_class=auth, security_sensitive=true) is included in the PUBLIC served aggregate instead of being excluded to the private lane. Breaks the absolute security exclusion (any k).",
+  "reject_contract": "served set diverges (the corrupted impl serves the auth bucket) AND excluded_security drops from 12 to 0.",
+  "stream": [
+    {
+      "schema": "issue_v1",
+      "consent_version": 1,
+      "ids": {
+        "issue_id": "iss-sigOK-t00-24",
+        "team_id_hash": "t00",
+        "repo_class_hash": "rc0"
+      },
+      "when": {
+        "ts": 0,
+        "tz_bucket": "utc+0000"
+      },
+      "signal": {
+        "error_class": "lint",
+        "signature_hash": "sigOK",
+        "gate": "lint",
+        "phase": "implement",
+        "command": "test",
+        "severity": "low"
+      },
+      "env": {
+        "os_class": "linux",
+        "ci": false,
+        "hmd_version": "2.0.18"
+      },
+      "security_sensitive": false
+    },
+    {
+      "schema": "issue_v1",
+      "consent_version": 1,
+      "ids": {
+        "issue_id": "iss-sigOK-t01-25",
+        "team_id_hash": "t01",
+        "repo_class_hash": "rc0"
+      },
+      "when": {
+        "ts": 0,
+        "tz_bucket": "utc+0000"
+      },
+      "signal": {
+        "error_class": "lint",
+        "signature_hash": "sigOK",
+        "gate": "lint",
+        "phase": "implement",
+        "command": "test",
+        "severity": "low"
+      },
+      "env": {
+        "os_class": "linux",
+        "ci": false,
+        "hmd_version": "2.0.18"
+      },
+      "security_sensitive": false
+    },
+    {
+      "schema": "issue_v1",
+      "consent_version": 1,
+      "ids": {
+        "issue_id": "iss-sigOK-t02-26",
+        "team_id_hash": "t02",
+        "repo_class_hash": "rc0"
+      },
+      "when": {
+        "ts": 0,
+        "tz_bucket": "utc+0000"
+      },
+      "signal": {
+        "error_class": "lint",
+        "signature_hash": "sigOK",
+        "gate": "lint",
+        "phase": "implement",
+        "command": "test",
+        "severity": "low"
+      },
+      "env": {
+        "os_class": "linux",
+        "ci": false,
+        "hmd_version": "2.0.18"
+      },
+      "security_sensitive": false
+    },
+    {
+      "schema": "issue_v1",
+      "consent_version": 1,
+      "ids": {
+        "issue_id": "iss-sigOK-t03-27",
+        "team_id_hash": "t03",
+        "repo_class_hash": "rc0"
+      },
+      "when": {
+        "ts": 0,
+        "tz_bucket": "utc+0000"
+      },
+      "signal": {
+        "error_class": "lint",
+        "signature_hash": "sigOK",
+        "gate": "lint",
+        "phase": "implement",
+        "command": "test",
+        "severity": "low"
+      },
+      "env": {
+        "os_class": "linux",
+        "ci": false,
+        "hmd_version": "2.0.18"
+      },
+      "security_sensitive": false
+    },
+    {
+      "schema": "issue_v1",
+      "consent_version": 1,
+      "ids": {
+        "issue_id": "iss-sigOK-t04-28",
+        "team_id_hash": "t04",
+        "repo_class_hash": "rc0"
+      },
+      "when": {
+        "ts": 0,
+        "tz_bucket": "utc+0000"
+      },
+      "signal": {
+        "error_class": "lint",
+        "signature_hash": "sigOK",
+        "gate": "lint",
+        "phase": "implement",
+        "command": "test",
+        "severity": "low"
+      },
+      "env": {
+        "os_class": "linux",
+        "ci": false,
+        "hmd_version": "2.0.18"
+      },
+      "security_sensitive": false
+    },
+    {
+      "schema": "issue_v1",
+      "consent_version": 1,
+      "ids": {
+        "issue_id": "iss-sigOK-t05-29",
+        "team_id_hash": "t05",
+        "repo_class_hash": "rc0"
+      },
+      "when": {
+        "ts": 0,
+        "tz_bucket": "utc+0000"
+      },
+      "signal": {
+        "error_class": "lint",
+        "signature_hash": "sigOK",
+        "gate": "lint",
+        "phase": "implement",
+        "command": "test",
+        "severity": "low"
+      },
+      "env": {
+        "os_class": "linux",
+        "ci": false,
+        "hmd_version": "2.0.18"
+      },
+      "security_sensitive": false
+    },
+    {
+      "schema": "issue_v1",
+      "consent_version": 1,
+      "ids": {
+        "issue_id": "iss-sigOK-t06-30",
+        "team_id_hash": "t06",
+        "repo_class_hash": "rc0"
+      },
+      "when": {
+        "ts": 0,
+        "tz_bucket": "utc+0000"
+      },
+      "signal": {
+        "error_class": "lint",
+        "signature_hash": "sigOK",
+        "gate": "lint",
+        "phase": "implement",
+        "command": "test",
+        "severity": "low"
+      },
+      "env": {
+        "os_class": "linux",
+        "ci": false,
+        "hmd_version": "2.0.18"
+      },
+      "security_sensitive": false
+    },
+    {
+      "schema": "issue_v1",
+      "consent_version": 1,
+      "ids": {
+        "issue_id": "iss-sigOK-t07-31",
+        "team_id_hash": "t07",
+        "repo_class_hash": "rc0"
+      },
+      "when": {
+        "ts": 0,
+        "tz_bucket": "utc+0000"
+      },
+      "signal": {
+        "error_class": "lint",
+        "signature_hash": "sigOK",
+        "gate": "lint",
+        "phase": "implement",
+        "command": "test",
+        "severity": "low"
+      },
+      "env": {
+        "os_class": "linux",
+        "ci": false,
+        "hmd_version": "2.0.18"
+      },
+      "security_sensitive": false
+    },
+    {
+      "schema": "issue_v1",
+      "consent_version": 1,
+      "ids": {
+        "issue_id": "iss-sigOK-t08-32",
+        "team_id_hash": "t08",
+        "repo_class_hash": "rc0"
+      },
+      "when": {
+        "ts": 0,
+        "tz_bucket": "utc+0000"
+      },
+      "signal": {
+        "error_class": "lint",
+        "signature_hash": "sigOK",
+        "gate": "lint",
+        "phase": "implement",
+        "command": "test",
+        "severity": "low"
+      },
+      "env": {
+        "os_class": "linux",
+        "ci": false,
+        "hmd_version": "2.0.18"
+      },
+      "security_sensitive": false
+    },
+    {
+      "schema": "issue_v1",
+      "consent_version": 1,
+      "ids": {
+        "issue_id": "iss-sigOK-t09-33",
+        "team_id_hash": "t09",
+        "repo_class_hash": "rc0"
+      },
+      "when": {
+        "ts": 0,
+        "tz_bucket": "utc+0000"
+      },
+      "signal": {
+        "error_class": "lint",
+        "signature_hash": "sigOK",
+        "gate": "lint",
+        "phase": "implement",
+        "command": "test",
+        "severity": "low"
+      },
+      "env": {
+        "os_class": "linux",
+        "ci": false,
+        "hmd_version": "2.0.18"
+      },
+      "security_sensitive": false
+    },
+    {
+      "schema": "issue_v1",
+      "consent_version": 1,
+      "ids": {
+        "issue_id": "iss-sigOK-t10-34",
+        "team_id_hash": "t10",
+        "repo_class_hash": "rc0"
+      },
+      "when": {
+        "ts": 0,
+        "tz_bucket": "utc+0000"
+      },
+      "signal": {
+        "error_class": "lint",
+        "signature_hash": "sigOK",
+        "gate": "lint",
+        "phase": "implement",
+        "command": "test",
+        "severity": "low"
+      },
+      "env": {
+        "os_class": "linux",
+        "ci": false,
+        "hmd_version": "2.0.18"
+      },
+      "security_sensitive": false
+    },
+    {
+      "schema": "issue_v1",
+      "consent_version": 1,
+      "ids": {
+        "issue_id": "iss-sigSEC-t00-35",
+        "team_id_hash": "t00",
+        "repo_class_hash": "rc0"
+      },
+      "when": {
+        "ts": 0,
+        "tz_bucket": "utc+0000"
+      },
+      "signal": {
+        "error_class": "auth",
+        "signature_hash": "sigSEC",
+        "gate": "lint",
+        "phase": "implement",
+        "command": "test",
+        "severity": "low"
+      },
+      "env": {
+        "os_class": "linux",
+        "ci": false,
+        "hmd_version": "2.0.18"
+      },
+      "security_sensitive": true
+    },
+    {
+      "schema": "issue_v1",
+      "consent_version": 1,
+      "ids": {
+        "issue_id": "iss-sigSEC-t01-36",
+        "team_id_hash": "t01",
+        "repo_class_hash": "rc0"
+      },
+      "when": {
+        "ts": 0,
+        "tz_bucket": "utc+0000"
+      },
+      "signal": {
+        "error_class": "auth",
+        "signature_hash": "sigSEC",
+        "gate": "lint",
+        "phase": "implement",
+        "command": "test",
+        "severity": "low"
+      },
+      "env": {
+        "os_class": "linux",
+        "ci": false,
+        "hmd_version": "2.0.18"
+      },
+      "security_sensitive": true
+    },
+    {
+      "schema": "issue_v1",
+      "consent_version": 1,
+      "ids": {
+        "issue_id": "iss-sigSEC-t02-37",
+        "team_id_hash": "t02",
+        "repo_class_hash": "rc0"
+      },
+      "when": {
+        "ts": 0,
+        "tz_bucket": "utc+0000"
+      },
+      "signal": {
+        "error_class": "auth",
+        "signature_hash": "sigSEC",
+        "gate": "lint",
+        "phase": "implement",
+        "command": "test",
+        "severity": "low"
+      },
+      "env": {
+        "os_class": "linux",
+        "ci": false,
+        "hmd_version": "2.0.18"
+      },
+      "security_sensitive": true
+    },
+    {
+      "schema": "issue_v1",
+      "consent_version": 1,
+      "ids": {
+        "issue_id": "iss-sigSEC-t03-38",
+        "team_id_hash": "t03",
+        "repo_class_hash": "rc0"
+      },
+      "when": {
+        "ts": 0,
+        "tz_bucket": "utc+0000"
+      },
+      "signal": {
+        "error_class": "auth",
+        "signature_hash": "sigSEC",
+        "gate": "lint",
+        "phase": "implement",
+        "command": "test",
+        "severity": "low"
+      },
+      "env": {
+        "os_class": "linux",
+        "ci": false,
+        "hmd_version": "2.0.18"
+      },
+      "security_sensitive": true
+    },
+    {
+      "schema": "issue_v1",
+      "consent_version": 1,
+      "ids": {
+        "issue_id": "iss-sigSEC-t04-39",
+        "team_id_hash": "t04",
+        "repo_class_hash": "rc0"
+      },
+      "when": {
+        "ts": 0,
+        "tz_bucket": "utc+0000"
+      },
+      "signal": {
+        "error_class": "auth",
+        "signature_hash": "sigSEC",
+        "gate": "lint",
+        "phase": "implement",
+        "command": "test",
+        "severity": "low"
+      },
+      "env": {
+        "os_class": "linux",
+        "ci": false,
+        "hmd_version": "2.0.18"
+      },
+      "security_sensitive": true
+    },
+    {
+      "schema": "issue_v1",
+      "consent_version": 1,
+      "ids": {
+        "issue_id": "iss-sigSEC-t05-40",
+        "team_id_hash": "t05",
+        "repo_class_hash": "rc0"
+      },
+      "when": {
+        "ts": 0,
+        "tz_bucket": "utc+0000"
+      },
+      "signal": {
+        "error_class": "auth",
+        "signature_hash": "sigSEC",
+        "gate": "lint",
+        "phase": "implement",
+        "command": "test",
+        "severity": "low"
+      },
+      "env": {
+        "os_class": "linux",
+        "ci": false,
+        "hmd_version": "2.0.18"
+      },
+      "security_sensitive": true
+    },
+    {
+      "schema": "issue_v1",
+      "consent_version": 1,
+      "ids": {
+        "issue_id": "iss-sigSEC-t06-41",
+        "team_id_hash": "t06",
+        "repo_class_hash": "rc0"
+      },
+      "when": {
+        "ts": 0,
+        "tz_bucket": "utc+0000"
+      },
+      "signal": {
+        "error_class": "auth",
+        "signature_hash": "sigSEC",
+        "gate": "lint",
+        "phase": "implement",
+        "command": "test",
+        "severity": "low"
+      },
+      "env": {
+        "os_class": "linux",
+        "ci": false,
+        "hmd_version": "2.0.18"
+      },
+      "security_sensitive": true
+    },
+    {
+      "schema": "issue_v1",
+      "consent_version": 1,
+      "ids": {
+        "issue_id": "iss-sigSEC-t07-42",
+        "team_id_hash": "t07",
+        "repo_class_hash": "rc0"
+      },
+      "when": {
+        "ts": 0,
+        "tz_bucket": "utc+0000"
+      },
+      "signal": {
+        "error_class": "auth",
+        "signature_hash": "sigSEC",
+        "gate": "lint",
+        "phase": "implement",
+        "command": "test",
+        "severity": "low"
+      },
+      "env": {
+        "os_class": "linux",
+        "ci": false,
+        "hmd_version": "2.0.18"
+      },
+      "security_sensitive": true
+    },
+    {
+      "schema": "issue_v1",
+      "consent_version": 1,
+      "ids": {
+        "issue_id": "iss-sigSEC-t08-43",
+        "team_id_hash": "t08",
+        "repo_class_hash": "rc0"
+      },
+      "when": {
+        "ts": 0,
+        "tz_bucket": "utc+0000"
+      },
+      "signal": {
+        "error_class": "auth",
+        "signature_hash": "sigSEC",
+        "gate": "lint",
+        "phase": "implement",
+        "command": "test",
+        "severity": "low"
+      },
+      "env": {
+        "os_class": "linux",
+        "ci": false,
+        "hmd_version": "2.0.18"
+      },
+      "security_sensitive": true
+    },
+    {
+      "schema": "issue_v1",
+      "consent_version": 1,
+      "ids": {
+        "issue_id": "iss-sigSEC-t09-44",
+        "team_id_hash": "t09",
+        "repo_class_hash": "rc0"
+      },
+      "when": {
+        "ts": 0,
+        "tz_bucket": "utc+0000"
+      },
+      "signal": {
+        "error_class": "auth",
+        "signature_hash": "sigSEC",
+        "gate": "lint",
+        "phase": "implement",
+        "command": "test",
+        "severity": "low"
+      },
+      "env": {
+        "os_class": "linux",
+        "ci": false,
+        "hmd_version": "2.0.18"
+      },
+      "security_sensitive": true
+    },
+    {
+      "schema": "issue_v1",
+      "consent_version": 1,
+      "ids": {
+        "issue_id": "iss-sigSEC-t10-45",
+        "team_id_hash": "t10",
+        "repo_class_hash": "rc0"
+      },
+      "when": {
+        "ts": 0,
+        "tz_bucket": "utc+0000"
+      },
+      "signal": {
+        "error_class": "auth",
+        "signature_hash": "sigSEC",
+        "gate": "lint",
+        "phase": "implement",
+        "command": "test",
+        "severity": "low"
+      },
+      "env": {
+        "os_class": "linux",
+        "ci": false,
+        "hmd_version": "2.0.18"
+      },
+      "security_sensitive": true
+    },
+    {
+      "schema": "issue_v1",
+      "consent_version": 1,
+      "ids": {
+        "issue_id": "iss-sigSEC-t11-46",
+        "team_id_hash": "t11",
+        "repo_class_hash": "rc0"
+      },
+      "when": {
+        "ts": 0,
+        "tz_bucket": "utc+0000"
+      },
+      "signal": {
+        "error_class": "auth",
+        "signature_hash": "sigSEC",
+        "gate": "lint",
+        "phase": "implement",
+        "command": "test",
+        "severity": "low"
+      },
+      "env": {
+        "os_class": "linux",
+        "ci": false,
+        "hmd_version": "2.0.18"
+      },
+      "security_sensitive": true
+    }
+  ],
+  "corrupted": {
+    "served": [
+      [
+        "auth",
+        "sigSEC",
+        "2.0.18",
+        "linux",
+        "test",
+        12,
+        12
+      ],
+      [
+        "lint",
+        "sigOK",
+        "2.0.18",
+        "linux",
+        "test",
+        11,
+        11
+      ]
+    ],
+    "suppressed": [],
+    "excluded_security": 0
+  }
+}

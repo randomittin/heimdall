@@ -8,6 +8,38 @@
     "example"
   ],
   "oracles": {
+    "issue-collection": {
+      "gate_type": "differential",
+      "description": "Anonymized issue-collection k-anon aggregate oracle. Feeds an identical seeded issue_v1 stream through the implementation aggregate (bin/lib/cp_issue_aggregate.py) and an independently-authored reference aggregator, normalizes both to a common comparable partition (served bucket set + suppressed bucket set + security-exclusion count — NOT the raw envelopes, which differ by design), and asserts they are identical across all seeds. Catches whole-output k-anon/bucketing/security-exclusion bugs a per-bucket property check passes.",
+      "domain_signals": [
+        "issue_v1",
+        "k-anonymity",
+        "anonymized issue",
+        "issue aggregate",
+        "signature bucket",
+        "issue-collection"
+      ],
+      "assets": [
+        {
+          "name": "reference-aggregator",
+          "kind": "separate-agent",
+          "purpose": "Independently authored, spec-only recomputation of the k-anon issue aggregate over a seeded synthetic issue stream. Imports nothing from bin/lib/* (every constant and computation reproduced from INVARIANTS.md), so it shares no code path with the implementation under test.",
+          "dir": "evals/oracles/issue-collection/reference"
+        },
+        {
+          "name": "seeded-issue-stream",
+          "kind": "in-repo-dataset",
+          "purpose": "Deterministic seeded issue_v1 stream generator (reference/aggregate_ref.generate_stream). Same seed => byte-identical stream driving the differential comparison; the distribution is skewed so some signature buckets clear the k>=10 distinct-team floor and some do not, and a slice is security-sensitive (exercising INV-F exclusion).",
+          "dir": "evals/oracles/issue-collection/reference"
+        }
+      ],
+      "gate_command": "evals/oracles/issue-collection/gate.sh --differential --seeds 200",
+      "reference": {
+        "independent": true,
+        "kind": "separate-agent",
+        "dir": "evals/oracles/issue-collection/reference"
+      }
+    },
     "emulator-gb": {
       "gate_type": "trace-diff",
       "description": "Game Boy (DMG / LR35902 CPU) emulator oracle. Verifies an implementation by diffing its per-instruction execution trace against a known-correct reference trace, then asserting the standard Blargg ROM serial-output pass markers.",
