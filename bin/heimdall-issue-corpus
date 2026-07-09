@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# heimdall-issue-corpus — the Anonymized Issue Collection LOCAL emit + control CLI.
+# The thin bash front over bin/lib/issue_corpus.py, a sibling of
+# bin/heimdall-telemetry-corpus (which fronts pmr_corpus.py). Hands the whole argv
+# to the python engine's CLI core (the lib owns the grammar).
+#
+#   hmd issue emit [--event @f|JSON]  project+classify+guard+scan+spool ONE issue_v1
+#   hmd issue status                  read-only: consent, k-anon floor, outbox size
+#   hmd issue purge [--team-id ID]    local outbox purge + queued deletion
+#   hmd issue flush --dry-run         build+scan the signed batch, send NOTHING
+#
+# ZERO-CONTENT + SECRET-SCAN-BEFORE-SEND + CONSENT-OFF are enforced in the engine
+# (reused from pmr_corpus): a payload carrying a path / source line / secret is
+# BLOCKED + ALARMED, never spooled; consent OFF is a pure no-op. A security-
+# sensitive signal is routed to the PRIVATE .planning/security-signals/ lane and is
+# NEVER sent. NOTHING sends anywhere in this build — the outbox IS the local queue.
+#
+# Exit status:
+#   0  emit / status / purge / flush --dry-run.
+#   2  usage error (unknown subcommand / python absent / engine missing / bare flush).
+
+set -uo pipefail
+
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+BINDIR="$(dirname "$SELF")"
+ISSUE_LIB="$BINDIR/lib/issue_corpus.py"
+
+usage() { sed -n '2,20p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+PY="$(command -v python3 || command -v python || true)"
+if [ -z "$PY" ]; then
+  case "${1:-}" in
+    emit) echo '{"emitted": false, "reason": "python absent"}'; exit 0 ;;
+    *) echo "error: python3 not found (required for hmd issue)" >&2; exit 2 ;;
+  esac
+fi
+
+[ -f "$ISSUE_LIB" ] || {
+  case "${1:-}" in
+    emit) echo '{"emitted": false, "reason": "issue engine absent"}'; exit 0 ;;
+    *) echo "error: issue corpus engine not found: $ISSUE_LIB" >&2; exit 2 ;;
+  esac
+}
+
+[ $# -ge 1 ] || { usage >&2; exit 2; }
+
+case "$1" in
+  -h|--help) usage; exit 0 ;;
+esac
+
+# Hand the whole argv straight to the engine's CLI core (the lib owns the grammar).
+exec "$PY" "$ISSUE_LIB" "$@"
