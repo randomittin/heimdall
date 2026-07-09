@@ -259,6 +259,36 @@ def gate_state(cwd):
         with open(p) as f: return json.load(f)
     except Exception: return {}
 
+def _parse_semver(v):
+    """Parse a vX.Y.Z (optional leading v) into a comparable (int,int,int) tuple,
+    or None when it does NOT cleanly match — mirrors bin/heimdall's _update_semver_cmp
+    parser so a malformed/empty version can never yield a false 'behind'."""
+    m = re.match(r"^v?(\d+)\.(\d+)\.(\d+)$", (v or "").strip())
+    return tuple(int(x) for x in m.groups()) if m else None
+
+def update_notice():
+    """A compact 'update available' HUD notice, read PURELY from the update-check
+    cache that bin/heimdall's daily BACKGROUND probe writes — NO network and NO
+    subprocess on this render path (the statusline must stay fast + off-box). The
+    cache lives at ${HEIMDALL_HOME:-~/.heimdall}/update-check.json and holds
+    {checked_epoch, installed, latest} (the exact schema the probe writes). Returns
+    the notice iff the cached installed version is STRICTLY older than the cached
+    latest; returns '' (silent) on a current/ahead install, a missing/corrupt/
+    unparseable cache, or ANY fault — a fail-safe that never breaks the line and
+    never cries a false 'behind'."""
+    home = os.environ.get("HEIMDALL_HOME") or os.path.join(os.path.expanduser("~"), ".heimdall")
+    try:
+        with open(os.path.join(home, "update-check.json")) as f:
+            d = json.load(f)
+        installed = _parse_semver(d.get("installed"))
+        latest_raw = (d.get("latest") or "").strip()
+        latest = _parse_semver(latest_raw)
+    except Exception:
+        return ""
+    if not installed or not latest or installed >= latest:
+        return ""
+    return f"{AM}⬆ {latest_raw} available{X} {FAINT}·{X} {DIM}hmd --update{X}"
+
 def identity(cwd, fallback):
     """Sigil SEED + display HANDLE from bin/heimdall-identity (RJ's call: identity is a
     file each dev controls, not a derived HAID). One `--json` call resolves both. Any
@@ -645,24 +675,37 @@ def main():
     idle = (verdict == "watching" and passed is None)
     canon = "IDLE" if idle else canon_verdict(verdict)
 
+    # "update available" notice (spec: dev learns of a newer release AMBIENTLY). A
+    # pure LOCAL cache read (update_notice makes zero network calls) → '' when the
+    # install is current/ahead or the cache is absent/corrupt (silent fail-safe). We
+    # width-guard it so a very narrow terminal never wraps the line.
+    upd = update_notice()
+    if upd and vis(upd) > max(0, cols - RMARGIN):
+        upd = ""
+
     if dmode == "minimal":
         # minimal (<80): the watchman glyph + the verdict word. One cell + one whole
-        # word, padded to width — structurally impossible to slice mid-glyph.
+        # word, padded to width — structurally impossible to slice mid-glyph. An
+        # available update rides one extra padded row below (added only when present,
+        # so a current install renders byte-identically to before).
         vrgb = VERDICT_CANON[canon][0]
         row = f"{sig_glyph(seed, vrgb)} {verdict_word(canon, t)}"
-        sys.stdout.write(finalize([row]) + "\n")
+        rows = [row] + ([upd] if upd else [])
+        sys.stdout.write(finalize(rows) + "\n")
         return
 
     if dmode == "compact":
         # compact (80–119): sigil S (4 cols × 2 rows) + verdict, then a wall of
         # teammate glyphs (tinted by glyph_color, +k overflow) on the second row.
+        # An available update appends one extra row (only when present).
         sigS = _sigil_rows_s(seed, eye)
         ANCH_S = 4 + 2
         head = f"{BOLD}{handle}{X}  {verdict_seg(canon, t)}"
         wall = compact_wall(cwd, seed, verdict, present, cols, ANCH_S)
         r0 = f"{_sig(sigS, 0, CY)}  {head}"
         r1 = f"{_sig(sigS, 1, CY)}  {wall}"
-        sys.stdout.write(finalize([r0, r1]) + "\n")
+        rows = [r0, r1] + ([f"{'':6}{upd}"] if upd else [])
+        sys.stdout.write(finalize(rows) + "\n")
         return
 
     # ── sigil anchor (squint animates; eyes stay visible in every frame) ──
@@ -786,6 +829,8 @@ def main():
         out.append(f"{_sig(sig,1,CY)}  " + line(l2, r2))
         for i, seg in enumerate(swarm):
             out.append(f"{_sig(sig, 2+i, CY)}  " + seg)
+        if upd:
+            out.append(f"{_sig(sig, 2+len(swarm), CY)}  " + upd)
         sys.stdout.write(finalize(out) + "\n")   # single tier downgrade + width invariant
         return
 
@@ -795,7 +840,7 @@ def main():
     if wall_segs:
         wall = "  ".join(wall_segs)
         out.append(f"{_sig(sig,2,CY)}  " + wall)
-        out.append(f"{_sig(sig,3,CY)}  ")
+        out.append(f"{_sig(sig,3,CY)}  " + upd)   # blank tail row → carries the update notice when one is available
     else:
         # SOLO TEASE: the wall is empty (no roster, no team files). Fill the dead row
         # with a faint invite — sells the team feature, drives the growth loop. Single
@@ -808,7 +853,7 @@ def main():
             tease = f"{FAINT}── watch ── presence off · hmd presence on{X}"
         if vis(tease) > max(0, cols - ANCHOR - RMARGIN): tease = ""
         out.append(f"{_sig(sig,2,CY)}  " + tease)
-        out.append(f"{_sig(sig,3,CY)}  ")
+        out.append(f"{_sig(sig,3,CY)}  " + upd)   # blank tail row → carries the update notice when one is available
     sys.stdout.write(finalize(out) + "\n")   # single tier downgrade + width invariant
 
 def _sig(rows, i, fallback):
