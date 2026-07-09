@@ -36,7 +36,9 @@ from __future__ import annotations
 import json
 import os
 import re
+import secrets
 import sys
+import time
 import uuid
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -571,23 +573,49 @@ def purge(team_id=None, home=None):
             "deletion_request": req_path}
 
 
+def build_flush_body(records):
+    """Build the SIGNED /issues wire body a flush POSTs: {schema, consent_version, issues:[...],
+    nonce, ts}. THE CLIENT-BODY COUPLING WITH THE SERVER REPLAY GATE (F-1): the CP's POST /issues
+    post-auth gate (cp_publicsurface.check_issues_post_auth) runs cp_nonce.accept over the {nonce,
+    ts} it reads from THIS body, and cp_nonce treats a missing/None ts as STALE -> the gate 401s any
+    signed flush that lacks them. So the flush body MUST carry a FRESH per-flush nonce + a current ts
+    that ride INSIDE the signed body (unforgeable, only replayable — exactly what the gate catches),
+    mirroring bin/rr's signed /rr-task body and the /corpus flush client. Present now even though
+    Wave-1 ships no live transport, so the body builder and the gate stay consistent when transport
+    lands. `issues` carries the FULL scrubbed records (the server's _parse_batch reads body['issues']),
+    NOT just ids. PURE — no IO; the caller signs the json.dumps of this dict."""
+    return {
+        "schema": "issue_batch_v1",
+        "consent_version": CONSENT_VERSION,
+        "issues": list(records or []),
+        # nonce: opaque per-flush client material (secrets, like bin/rr:~569). ts: current epoch
+        # seconds — the freshness the server's stale-check bounds the replay window against.
+        "nonce": secrets.token_hex(16),
+        "ts": int(time.time()),
+    }
+
+
 def flush_dry_run(home=None):
     """Build the signed batch that a flush WOULD send — and send NOTHING (there is
     no transport in Wave 1). Re-guards + re-scans each queued record (the send belt)
     and reports which would ship vs be held. A record failing the belt is DROPPED
-    from the batch (never sent), matching the fail-closed send discipline."""
+    from the batch (never sent), matching the fail-closed send discipline. The built body
+    carries the fresh {nonce, ts} the server's replay-nonce gate requires (build_flush_body)."""
     records = outbox_records(home)
-    ship, held = [], []
+    ship_recs, held = [], []
     for rec in records:
         ok, violations = pmr_corpus.assert_zero_content(rec)
         clean, findings = pmr_corpus.secret_scan_payload(rec)
         if ok and clean and not rec.get("security_sensitive"):
-            ship.append(rec.get("ids", {}).get("issue_id"))
+            ship_recs.append(rec)
         else:
             reason = ("zero-content" if not ok else
                       "secret" if not clean else "security-sensitive")
             held.append({"issue_id": rec.get("ids", {}).get("issue_id"),
                          "reason": reason})
+    # The ACTUAL signed wire body (with the fresh {nonce, ts} the replay gate proves live+first-use).
+    body = build_flush_body(ship_recs)
+    ship = [r.get("ids", {}).get("issue_id") for r in ship_recs]
     return {
         "dry_run": True,
         "sent": 0,
@@ -597,6 +625,11 @@ def flush_dry_run(home=None):
             "consent_version": CONSENT_VERSION,
             "count": len(ship),
             "issue_ids": ship,
+            # the replay-gate coupling: the signed body's fresh nonce + ts (F-1). A live flush
+            # regenerates these per POST via build_flush_body; surfaced here so the dry-run
+            # preview and the gate stay consistent.
+            "nonce": body["nonce"],
+            "ts": body["ts"],
         },
         "would_ship": len(ship),
         "held": held,

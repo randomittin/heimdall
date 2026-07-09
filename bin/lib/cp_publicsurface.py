@@ -296,6 +296,19 @@ def _corpus_team_limit():   return _int_env("HEIMDALL_CORPUS_TEAM_LIMIT", 30)
 def _corpus_team_window():  return _int_env("HEIMDALL_CORPUS_TEAM_WINDOW", 60)
 def _corpus_nonce_window(): return _int_env("HEIMDALL_CORPUS_NONCE_WINDOW", 300)
 
+# /issues — the SIGNED anonymized-issue-corpus flush (anonymized-issue-collection §W3, the ADDITIVE
+# SIBLING of /corpus). Per-IP (pre-verify blunt flood shed, F-3 crypto-DoS) AND per-TEAM (post-verify,
+# keyed on the caller's server-derived team_id_hash, F-2 storage/aggregate skew) fixed-window caps
+# bound a single tenant's flush rate, plus a replay-nonce over the signed body (F-1 — a captured
+# signed batch must NOT replay-append and corrupt the INV-B k-anon aggregate). A flush is a periodic
+# batch (many issue_v1 per POST), so the per-team cap is generous but bounded. MIRRORS /corpus's
+# defaults + shape EXACTLY; all env-tunable, conservative defaults sized for a periodic spool drain.
+def _issues_ip_limit():     return _int_env("HEIMDALL_ISSUES_IP_LIMIT", 60)
+def _issues_ip_window():    return _int_env("HEIMDALL_ISSUES_IP_WINDOW", 60)
+def _issues_team_limit():   return _int_env("HEIMDALL_ISSUES_TEAM_LIMIT", 30)
+def _issues_team_window():  return _int_env("HEIMDALL_ISSUES_TEAM_WINDOW", 60)
+def _issues_nonce_window(): return _int_env("HEIMDALL_ISSUES_NONCE_WINDOW", 300)
+
 # /team/cred + /team/install — the SIGNED, team-scoped REGISTRATION writes (INV-6/8, the last-mile
 # onboarding). Registration is a rare, near-one-shot act (a tenant sets its cred/install once, then
 # rotates occasionally), so the caps are TIGHTER than /rr-task: a per-IP (pre-verify blunt flood
@@ -688,6 +701,71 @@ def check_corpus_post_auth(identity, request, *, home=None, now=None):
     ts = payload.get("ts")
     accepted, reason = cp_nonce.accept(
         "corpus", str(haid), nonce, ts, now=now, window=_corpus_nonce_window())
+    if not accepted:
+        return (401, {"error": "replay_" + reason})
+    return None
+
+
+# ── the SIGNED /issues ingest gates (anonymized-issue-collection §W3 — the issue-corpus intake) ──
+#
+# THE ISSUE INTAKE — the ADDITIVE SIBLING of /corpus, at ABUSE-GATE PARITY with it. POST /issues is a
+# SIGNED public write: the §3 chokepoint verifies the Ed25519 signature BEFORE the post-auth gate runs
+# (an unsigned/forged/unknown/revoked push is a 401, INV-E fail-closed), the caller's team_id_hash is
+# derived SERVER-SIDE from the verified binding (cp_auth.registered_team, INV-C), and cp_issue_ingest
+# appends the scrubbed issue_v1 batch to the caller's OWN partition in the ISOLATED corpus namespace.
+# These gates add the ABUSE half (flood + replay) the AUTH half (Section 1) lacked:
+#   • F-3 (pre-auth, per-IP) — shed a blunt flood CHEAPLY, before any crypto is spent on an over-limit
+#     IP (an internet-facing --allow-unauthenticated surface must not pay a full Ed25519 verify per
+#     flood packet).
+#   • F-2 (post-auth, per-team) — bound one tenant's flush rate so a leaked-key churn cannot inflate
+#     storage OR skew the published k-anon aggregate (cp_issue_aggregate) via a per-signature flood.
+#   • F-1 (post-auth, replay-nonce) — a CAPTURED signed batch is byte-replayable; ingest_issues has no
+#     idempotency, so an unbounded replay re-appends every record and CORRUPTS the INV-B aggregate. The
+#     nonce scope 'issues' namespaces it, so an issues nonce can never be replayed as a presence/
+#     corpus/rr-task beat (and vice-versa). Mirrors check_corpus_pre_auth + check_corpus_post_auth.
+
+
+def check_issues_pre_auth(request, *, home=None, now=None):
+    """PUBLIC-SURFACE per-IP flood gate for POST /issues, applied BEFORE the §3 signature verify so a
+    blunt flood is shed CHEAPLY (no crypto spent on an over-limit IP — F-3). Returns None to proceed to
+    auth, or (429, body) to refuse. The per-team cap + replay-nonce run AFTER identity is known
+    (check_issues_post_auth). Mirrors check_corpus_pre_auth exactly (scope 'issues_ip')."""
+    limiter = cp_ratelimit.RateLimiter(home=home)
+    ip = client_ip(request)
+    ok, retry = limiter.allow(
+        "issues_ip", ip, now=now, limit=_issues_ip_limit(), window=_issues_ip_window())
+    if not ok:
+        return (429, _rate_limited_body("issues_ip", retry))
+    return None
+
+
+def check_issues_post_auth(identity, request, *, home=None, now=None):
+    """PUBLIC-SURFACE gates for POST /issues that need the VERIFIED identity (run AFTER the §3
+    chokepoint, so `identity.haid` is proven and the body is signature-covered):
+      1. per-TEAM rate-limit (F-2) — keyed on the caller's SERVER-DERIVED team_id (cp_auth.registered_
+         team), so a single tenant cannot flood the issue intake even rotating members/IPs; over-limit
+         -> 429. Bounds both storage growth AND the k-anon aggregate's per-signature counts.
+      2. replay-nonce (F-1) — the signed body carries {nonce, ts}; cp_nonce.accept decides freshness +
+         first-use. A stale ts or a replayed nonce -> 401 (the captured signed bytes cannot be resent,
+         so a batch can never replay-append and corrupt the INV-B aggregate). The nonce scope 'issues'
+         namespaces it, so an issues nonce can never be replayed as a corpus/presence/rr-task beat.
+    Returns None to let the ingest run, or (429, body) / (401, body) to refuse. Mirrors
+    check_corpus_post_auth exactly (scope 'issues_team' + nonce scope 'issues')."""
+    haid = getattr(identity, "haid", None) or identity
+    team_id = cp_auth.registered_team(str(haid), home=home)
+    team_key = team_id if team_id else ("haid:" + str(haid))
+    limiter = cp_ratelimit.RateLimiter(home=home)
+    ok, retry = limiter.allow(
+        "issues_team", team_key, now=now,
+        limit=_issues_team_limit(), window=_issues_team_window())
+    if not ok:
+        return (429, _rate_limited_body("issues_team", retry))
+
+    payload = _body_dict(request)
+    nonce = payload.get("nonce")
+    ts = payload.get("ts")
+    accepted, reason = cp_nonce.accept(
+        "issues", str(haid), nonce, ts, now=now, window=_issues_nonce_window())
     if not accepted:
         return (401, {"error": "replay_" + reason})
     return None
