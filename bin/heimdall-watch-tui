@@ -12,13 +12,18 @@
 # shell the existing CLI. See bin/lib/watch_data.py + bin/lib/watch_tui.py.
 #
 # Modes:
-#   hmd watch            full dashboard (Textual). Degrades to a static wall+feed
-#                        dump + a `pip install textual` hint if Textual is absent.
+#   hmd watch            full dashboard (Textual) when textual is importable. When textual
+#                        is ABSENT, a no-textual auto-refresh LIVE wall (ANSI reprint every
+#                        ~2s + self-beating) — a live wall with ZERO extra deps. Piped/CI
+#                        (non-TTY) degrades to a single static dump (never an infinite loop).
 #   hmd watch --pane     slim tmux-split wall-only view.
 #   hmd watch --once     one-shot static wall+feed dump (no interactive loop; CI/pipes).
+#   hmd watch --install-tui  install textual into hmd's OWN python (PEP-668-aware) for the
+#                        rich TUI — targets the exact interpreter hmd watch runs under, NOT
+#                        an isolated pipx/brew venv hmd can't import from.
 #   hmd watch -h|--help  this help.
 #
-# Textual is NOT a hard dependency of hmd — its absence degrades, never blocks.
+# Textual is NOT a hard dependency of hmd — its absence degrades to a live wall, never blocks.
 set -euo pipefail
 
 SELF="$0"
