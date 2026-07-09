@@ -49,6 +49,7 @@ import cp_dashboard
 import cp_diag
 import cp_enroll
 import cp_ingest
+import cp_issue_ingest
 import cp_notify
 import cp_presence
 import cp_scheduler
@@ -403,6 +404,13 @@ def boot(server=cp_server, *, home=None, base_env=None, start_tick=True,
     # plane store), keyed by the SERVER-DERIVED team_id_hash (INV-1). DATA only — no dispatch,
     # no cred, no model call (BYO-inference). The route is in cp_publicsurface.PUBLIC_ROUTES.
     routes["corpus"] = [cp_corpus.register(home=home)]
+    # Anonymized issue ingest (issue-collection, Wave 3 wire-boot): the SIGNED POST /issues lands
+    # a client's spooled zero-content issue_v1 batch in the SAME ISOLATED heimdall_corpus/ namespace
+    # as /corpus but a DISJOINT issues/ partition (never the control-plane store), keyed by the
+    # SERVER-DERIVED team_id_hash (INV-C). DATA only — no dispatch, no handler, no model call. An
+    # unsigned push 401s at the auth chokepoint; no team resolves -> 403 fail-closed. Sibling of the
+    # corpus route above; the wire-public-surface task adds POST /issues to cp_publicsurface.
+    routes["issues"] = [cp_issue_ingest.register(home=home)]
     routes["dashboard"] = [cp_dashboard.register(home=home)]
     routes["schedules"] = list(cp_scheduler.register_routes())
     routes["jobs"] = list(cp_worker.register_job_routes(home=home, base_env=base_env))
