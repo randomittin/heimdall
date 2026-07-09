@@ -1,0 +1,204 @@
+{
+  "plan": "docs/superpowers/plans/2026-07-09-anonymized-issue-collection.md",
+  "oracle": {
+    "domain": "issue-collection",
+    "gate_type": "differential",
+    "gate_command": "evals/oracles/issue-collection/gate.sh --differential --seeds 200",
+    "independent": true,
+    "reference_author": "wave-2 issue-reference (separate agent, disjoint files)",
+    "note": "no pre-existing registry domain matched; added in wave 4 and flagged for reviewer"
+  },
+  "waves": [
+    {
+      "id": 0,
+      "tasks": [
+        {
+          "id": "issue-ledger",
+          "agent": "hmd:docs-writer",
+          "model": "sonnet",
+          "effort": "default",
+          "scope": "evals/oracles/issue-collection/INVARIANTS.md, evals/oracles/issue-collection/COVERAGE.md",
+          "skills": [],
+          "acceptance": [
+            "test -f evals/oracles/issue-collection/INVARIANTS.md",
+            "test -f evals/oracles/issue-collection/COVERAGE.md",
+            "grep -qi server-derived evals/oracles/issue-collection/INVARIANTS.md",
+            "grep -qi expected-red evals/oracles/issue-collection/COVERAGE.md"
+          ],
+          "prompt": "Read bin/lib/pmr_corpus.py, bin/lib/cp_corpus.py, evals/oracles/rr-multitenant-isolation/README.md, test/heimdall-corpus-ingest.test.sh. Write evals/oracles/issue-collection/INVARIANTS.md stating as checkable statements: (INV-A) issue_v1 leaves are coded/hashed/bounded only (no path, no source, no free text); (INV-B) k-anon >= 20 distinct teams per published bucket; (INV-C) team_id_hash is server-derived at ingest, never a body field; (INV-D) consent OFF => emit no-op + send gate False; (INV-E) unsigned ingest => 401 fail-closed; (INV-F) security-sensitive signal => private .planning/ lane, excluded from public aggregate + synth; (INV-G) issue store namespace disjoint from control-plane keyspace. Write evals/oracles/issue-collection/COVERAGE.md as the coverage matrix (subsystems in-scope/descoped, oracle row affected, expected green/expected-red) from PLAN section 3. Real content only, no TODO."
+        }
+      ]
+    },
+    {
+      "id": 1,
+      "tasks": [
+        {
+          "id": "issue-emit-lib",
+          "agent": "hmd:coder",
+          "model": "opus",
+          "effort": "high",
+          "scope": "bin/lib/issue_corpus.py, bin/heimdall-issue-corpus",
+          "skills": [],
+          "acceptance": [
+            "grep -q SCHEMA_ISSUE bin/lib/issue_corpus.py",
+            "grep -q 'import pmr_corpus' bin/lib/issue_corpus.py",
+            "grep -q classify_security_sensitive bin/lib/issue_corpus.py",
+            "HEIMDALL_TELEMETRY=off python3 bin/lib/issue_corpus.py emit --event '{\"error_class\":\"lint\"}' | grep -q '\"emitted\": false'",
+            "python3 bin/lib/issue_corpus.py emit --event '{\"error_class\":\"x\",\"message\":\"a/b.py:1 x()\"}' | grep -qi blocked",
+            "test -x bin/heimdall-issue-corpus"
+          ],
+          "prompt": "Read evals/oracles/issue-collection/INVARIANTS.md, bin/lib/pmr_corpus.py (REUSE target - import, never edit), bin/lib/telemetry.py, bin/heimdall-telemetry-corpus. Create bin/lib/issue_corpus.py: a sibling of pmr_corpus that IMPORTS pmr_corpus for enabled/assert_zero_content/secret_scan_payload/team_id_hash/repo_class_hash/corpus_home/_alarm (do NOT re-derive, do NOT edit pmr_corpus.py - the #4/#10 gates must stay green). Define SCHEMA_ISSUE='issue_v1'. project(event) builds a record with ONLY coded/hashed/bounded fields: ids{issue_id,team_id_hash,repo_class_hash}, when{ts,tz_bucket}, signal{error_class,signature_hash,gate,phase,command,severity}, env{os_class,ci,hmd_version}, security_sensitive:bool. classify_security_sensitive(event): True iff secret_scan finds anything in the raw event OR error_class in _SECURITY_CLASSES={auth,crypto,secret,injection,deanon,isolation,incident} OR explicit incident marker. emit_issue(event,home): consent-off no-op; project; if security_sensitive write to .planning/security-signals/<id>.json (private, NOT the send outbox); else assert_zero_content (BLOCK+ALARM), secret_scan (BLOCK+ALARM), spool to issue outbox. rebuild_issue(line): closed-schema server rebuild mirroring pmr_corpus.rebuild_pmr (bound via _tag, coerce ints, DROP unknown keys, re-run zero-content, return clean or None). Thin CLI bin/heimdall-issue-corpus with emit/status/purge/flush --dry-run. Never raise into caller. Production-ready, no stubs."
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "tasks": [
+        {
+          "id": "issue-ingest",
+          "agent": "hmd:coder",
+          "model": "opus",
+          "effort": "high",
+          "scope": "bin/lib/cp_issue_ingest.py",
+          "skills": [],
+          "acceptance": [
+            "grep -q 'def register' bin/lib/cp_issue_ingest.py",
+            "grep -q '/issues' bin/lib/cp_issue_ingest.py",
+            "grep -q cp_auth.registered_team bin/lib/cp_issue_ingest.py",
+            "grep -q rebuild_issue bin/lib/cp_issue_ingest.py",
+            "python3 -c \"import sys;sys.path.insert(0,'bin/lib');import cp_issue_ingest\"",
+            "grep -q 403 bin/lib/cp_issue_ingest.py"
+          ],
+          "prompt": "Read evals/oracles/issue-collection/INVARIANTS.md, bin/lib/cp_corpus.py (the sibling to mirror), bin/lib/cp_auth.py, bin/lib/cp_state.py, bin/lib/cp_audit.py, bin/lib/issue_corpus.py. Create bin/lib/cp_issue_ingest.py mirroring cp_corpus.py: ingest_issues boundary + issues_route + register wiring POST /issues. Store rel issues/<team_hash>/issues.ndjson inside pmr_corpus.corpus_namespace() (isolated keyspace). INV-1: team_id_hash = cp_auth.registered_team(haid); no team -> 403 fail-closed. Re-run issue_corpus.rebuild_issue per record; re-scan secret at boundary; drop any security_sensitive record at the boundary (fail-closed). Data-only: no action_type, no handler, no process, no model call. One cp_audit.write('issue_ingest',...) counts-only row. Do NOT register in cp_boot (that is a separate wave-3 task). Do NOT edit cp_corpus.py. Production-ready."
+        },
+        {
+          "id": "issue-aggregate",
+          "agent": "hmd:coder",
+          "model": "opus",
+          "effort": "high",
+          "scope": "bin/lib/cp_issue_aggregate.py",
+          "skills": [],
+          "acceptance": [
+            "grep -q K_ANONYMITY_MIN bin/lib/cp_issue_aggregate.py",
+            "grep -q suppressed bin/lib/cp_issue_aggregate.py",
+            "grep -qi security_sensitive bin/lib/cp_issue_aggregate.py",
+            "python3 -c \"import sys;sys.path.insert(0,'bin/lib');import cp_issue_aggregate\""
+          ],
+          "prompt": "Read evals/oracles/issue-collection/INVARIANTS.md, bin/lib/cp_corpus_aggregate.py (the mirror), bin/lib/pmr_corpus.py (K_ANONYMITY_MIN), bin/lib/cp_issue_ingest.py read path. Create bin/lib/cp_issue_aggregate.py mirroring cp_corpus_aggregate: _new_bucket/_fold/_publish_bucket/run_daily_aggregate. Bucket key = (error_class,signature_hash,hmd_version,os_class,command|phase). Per-bucket k-anon >= pmr_corpus.K_ANONYMITY_MIN distinct team_id_hash else emit {suppressed:true,reason:'k_anonymity',teams:n} (never the metrics). EXCLUDE every security_sensitive:true record from the public aggregate. Write to the isolated corpus namespace under issue-aggregates/. Surface a suppressed_bucket_count metric. No model call. CLI run [--home]. Do NOT edit cp_corpus_aggregate.py. Production-ready."
+        },
+        {
+          "id": "issue-synth",
+          "agent": "hmd:coder",
+          "model": "opus",
+          "effort": "high",
+          "scope": "bin/lib/cp_issue_synth.py",
+          "skills": [],
+          "acceptance": [
+            "grep -q pending_review bin/lib/cp_issue_synth.py",
+            "grep -qi support bin/lib/cp_issue_synth.py",
+            "grep -qi security_sensitive bin/lib/cp_issue_synth.py",
+            "python3 -c \"import sys;sys.path.insert(0,'bin/lib');import cp_issue_synth\""
+          ],
+          "prompt": "Read evals/oracles/issue-collection/INVARIANTS.md, bin/lib/cp_corpus_synth.py (the mirror). Create bin/lib/cp_issue_synth.py mirroring synthesize_proposals: cluster k-anon-cleared issue buckets into candidate GitHub-issue records; emit a candidate only when distinct-team support >= floor (default pmr_corpus.K_ANONYMITY_MIN). EVERY candidate is SHADOW: status='pending_review', enforced=False (a human promotes). Candidate carries only coded pattern + support counts + sample issue_ids - NO message text. NEVER include a security_sensitive bucket. Pure (no IO in the clustering fn, no model call). Do NOT edit cp_corpus_synth.py. Production-ready."
+        },
+        {
+          "id": "issue-reference",
+          "agent": "hmd:coder",
+          "model": "opus",
+          "effort": "high",
+          "scope": "evals/oracles/issue-collection/reference/aggregate_ref.py, evals/oracles/issue-collection/reference/README.md",
+          "skills": [],
+          "acceptance": [
+            "test -f evals/oracles/issue-collection/reference/aggregate_ref.py",
+            "! grep -q cp_issue_aggregate evals/oracles/issue-collection/reference/aggregate_ref.py",
+            "python3 evals/oracles/issue-collection/reference/aggregate_ref.py --help"
+          ],
+          "prompt": "INDEPENDENCE TASK for the differential oracle. Read ONLY evals/oracles/issue-collection/INVARIANTS.md. Do NOT read or import bin/lib/cp_issue_aggregate.py or any bin/lib/* module - you must share no code path with the implementation. Study evals/oracles/exchange-lob/reference for the naive-independent-reference style. Create evals/oracles/issue-collection/reference/aggregate_ref.py: a from-scratch, spec-only recomputation of the k-anon issue aggregate over a seeded synthetic issue stream (bucket by error_class/signature/version/os/command-phase, suppress buckets under 20 distinct teams, exclude security_sensitive). Correctness over speed. Plus a README.md explaining the independence contract. Production-ready, no impl imports."
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "tasks": [
+        {
+          "id": "wire-boot",
+          "agent": "hmd:coder",
+          "model": "opus",
+          "effort": "high",
+          "scope": "bin/lib/cp_boot.py",
+          "skills": [],
+          "acceptance": [
+            "grep -q 'import cp_issue_ingest' bin/lib/cp_boot.py",
+            "grep -q 'routes\\[\"issues\"\\]' bin/lib/cp_boot.py",
+            "python3 -c \"import sys;sys.path.insert(0,'bin/lib');import cp_boot\""
+          ],
+          "prompt": "Read bin/lib/cp_boot.py lines 44-56 (imports) and 400-429 (route registrations) and bin/lib/cp_issue_ingest.py. Edit ONLY bin/lib/cp_boot.py: add 'import cp_issue_ingest' with the other cp_ imports and add routes[\"issues\"] = [cp_issue_ingest.register(home=home)] alongside the corpus registration, following the exact pattern of cp_corpus. Change nothing else. Verify cp_boot imports clean."
+        },
+        {
+          "id": "wire-allowlist",
+          "agent": "hmd:coder",
+          "model": "opus",
+          "effort": "high",
+          "scope": "bin/lib/cp_allowlist.py, bin/lib/cp_handlers.py",
+          "skills": [],
+          "acceptance": [
+            "grep -q '\"aggregate-issues\"' bin/lib/cp_allowlist.py",
+            "grep -q '\"synth-issues\"' bin/lib/cp_allowlist.py",
+            "python3 -c \"import sys;sys.path.insert(0,'bin/lib');import cp_allowlist as a;assert a.is_allowed('aggregate-issues') and a.is_allowed('synth-issues')\"",
+            "python3 -c \"import sys;sys.path.insert(0,'bin/lib');import cp_allowlist as a;assert not a.is_allowed('arbitrary-cmd')\""
+          ],
+          "prompt": "Read bin/lib/cp_allowlist.py lines 254-312 (ActionSpec registry, esp. run-maintainer-cycle) and bin/lib/cp_scheduler.py and bin/lib/cp_handlers.py. Edit bin/lib/cp_allowlist.py: add two ActionSpecs 'aggregate-issues' and 'synth-issues' with requires_gate=False, isolated=True, typed+bounded params only (no free string; extra-key wall as in run-maintainer-cycle). Edit bin/lib/cp_handlers.py: add the two handlers dispatching to cp_issue_aggregate.run_daily_aggregate and cp_issue_synth. No arbitrary command must be dispatchable. Production-ready."
+        },
+        {
+          "id": "wire-queue-source",
+          "agent": "hmd:coder",
+          "model": "opus",
+          "effort": "high",
+          "scope": "bin/lib/issue_queue.py, bin/lib/connectors/corpus.py",
+          "skills": [],
+          "acceptance": [
+            "grep -q corpus bin/lib/issue_queue.py",
+            "test -f bin/lib/connectors/corpus.py",
+            "python3 -c \"import sys;sys.path.insert(0,'bin/lib');import issue_queue as q;assert 'corpus' in q._KIND_BY_SOURCE\""
+          ],
+          "prompt": "Read bin/lib/issue_queue.py lines 103-128 (normalize + _identity + _KIND_BY_SOURCE), bin/heimdall-issue-loop, and an existing connector under bin/lib/connectors/. Edit bin/lib/issue_queue.py: add a 'corpus' entry to _KIND_BY_SOURCE and a normalize adapter mapping a synth candidate to the one internal issue schema (additive - the existing 3 launch sources untouched). Create bin/lib/connectors/corpus.py reading synth candidates as native items, matching the connector interface. The existing seeker/fixer heimdall-issue-loop must drain source=corpus unchanged. Production-ready."
+        },
+        {
+          "id": "wire-public-surface",
+          "agent": "hmd:coder",
+          "model": "opus",
+          "effort": "high",
+          "scope": "bin/lib/cp_publicsurface.py",
+          "skills": [],
+          "acceptance": [
+            "grep -q '/issues' bin/lib/cp_publicsurface.py",
+            "python3 -c \"import sys;sys.path.insert(0,'bin/lib');import cp_publicsurface\"",
+            "bash deploy/cloud-run/check-public-surface.sh >/dev/null 2>&1"
+          ],
+          "prompt": "Read bin/lib/cp_publicsurface.py (PUBLIC_ROUTES) and deploy/cloud-run/check-public-surface.sh. Edit ONLY bin/lib/cp_publicsurface.py: add POST /issues to PUBLIC_ROUTES so it is served signed+gated on the public surface exactly like /corpus. Verify the public-surface check still passes. Change nothing else."
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "tasks": [
+        {
+          "id": "issue-oracle-gate",
+          "agent": "hmd:verifier",
+          "model": "opus",
+          "effort": "max",
+          "scope": "evals/oracles/issue-collection/{gate.sh,run.sh,manifest.json,fixtures/}, test/heimdall-issue-collection.test.sh, evals/oracles/registry.json",
+          "skills": [],
+          "acceptance": [
+            "bin/oracle-select issue-collection | grep -q gate.sh",
+            "jq -e '.oracles[\"issue-collection\"].gate_type==\"differential\"' evals/oracles/registry.json",
+            "jq -e '.oracles[\"issue-collection\"].reference.independent==true' evals/oracles/registry.json",
+            "bin/falsify issue-collection --assert-score 1.0",
+            "bash test/heimdall-issue-collection.test.sh"
+          ],
+          "prompt": "INDEPENDENT correctness gate (you are NOT a wave-1/2/3 impl author). Read evals/oracles/issue-collection/INVARIANTS.md, test/heimdall-corpus-ingest.test.sh (the belt to mirror), bin/falsify, evals/oracles/registry.json, evals/oracles/REPORT-CONTRACT.md, evals/oracles/issue-collection/reference/aggregate_ref.py. Create the gate harness: run.sh (writes typed report.json status+first_divergence per REPORT-CONTRACT), gate.sh --differential --seeds 200 (diff impl cp_issue_aggregate output vs reference/aggregate_ref.py over seeded streams), manifest.json, fixtures/golden/ + fixtures/mutants/. Mutants MUST include kanon-off, cross-tenant-read, leaked-content, and security-signal-in-public-aggregate. Create test/heimdall-issue-collection.test.sh mirroring the corpus belt with sections: anonymization, secret-scan, consent-off, k-anon, isolation (rr keystone 1.0), signed-ingest fail-closed, security-routing, differential. Add the issue-collection domain to evals/oracles/registry.json (gate_type differential, reference.independent=true, gate_command as above, domain_signals). bin/falsify issue-collection --assert-score 1.0 MUST pass (golden green + every mutant killed). Production-ready, real fixtures, no stubs."
+        }
+      ]
+    }
+  ]
+}
