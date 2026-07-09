@@ -9,6 +9,24 @@
 # SUBCOMMANDS
 #   heimdall-presence beat            send a heartbeat for THIS repo's project + identity.
 #   heimdall-presence roster [--json] print the ONLINE team for THIS repo's project.
+#   heimdall-presence keeper-start    spawn ONE detached background beat-keeper that beats
+#                                     every ~20s (under the ~45s server TTL) until the session
+#                                     ends — so a LIVE-BUT-IDLE session stays on the wall even
+#                                     when nothing re-renders the statusline. Idempotent (never
+#                                     a second keeper for the same session/repo); consent-gated
+#                                     (OFF -> no keeper); silent-safe (failures never fatal).
+#   heimdall-presence keeper-stop     kill THIS session's keeper + reap its pidfile (no leak).
+#
+# DURABLE PRESENCE (why the keeper exists). A single SessionStart beat AGES OUT past the ~45s
+# TTL on an idle-but-live session, and the statusline beat only fires when Claude Code REDRAWS
+# — so a session that stops rendering silently vanishes from the wall. The keeper is a detached
+# loop that re-beats on a timer (independent of renders) until keeper-stop reaps it at
+# SessionEnd. It REUSES `beat` (and its consent gate) for every heartbeat — never re-implements
+# beating. DEV-CHECKOUT: when heimdall is a dev checkout (on PATH, NOT a registered plugin) the
+# plugin's SessionStart hook does not fire, so wire these two subcommands into your OWN
+# ~/.claude/settings.json SessionStart/SessionEnd hooks (see USAGE below) — or run install.sh,
+# which registers the plugin whose hooks call them for you. The runtime home + this bin are
+# resolved DYNAMICALLY (never a hardcoded path), so the same wiring works on any machine.
 #
 # ZERO-CONFIG. A dev's FIRST beat/roster auto-resolves everything — the dev exports
 # NOTHING. The CP url comes from a shipped local config, the signing key is auto-generated
@@ -47,6 +65,7 @@
 set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SELF="$SELF_DIR/heimdall-presence"   # this bin, resolved dynamically (the keeper re-invokes it for `beat`).
 REPO="$(cd "$SELF_DIR/.." && pwd)"
 LIB="$REPO/bin/lib"
 HAID_CLI="$SELF_DIR/heimdall-haid"
@@ -57,6 +76,10 @@ PY="$(command -v python3 || command -v python || true)"
 # ── parse argv (subcommand + option-style overrides) ───────────────────────────
 SUB="${1:-}"; shift || true
 HAID=""; PROJECT=""; URL=""; HANDLE=""; VERDICT=""; FILE=""; JSON=""; GLOBAL=""; NOFILES=""
+# Keeper-scoped overrides. SESSION keys the per-session pidfile so the SessionEnd stop reaps
+# EXACTLY the keeper this session's SessionStart spawned (never a teammate's live session).
+# It may legitimately be EMPTY (a hook passing an absent session_id) — so it is NOT `:?`-guarded.
+SESSION=""; INTERVAL=""; KEEPER_PIDFILE=""
 # STRICT surfaces a DROPPED/refused beat LOUDLY (nonzero exit) instead of the fire-and-forget
 # exit-0 the statusline relies on. Default is the silent-safe path; --strict / HMD_PRESENCE_STRICT=1
 # opts in (used by tooling + the BUG2 regression test to prove a failed beat no longer fakes
@@ -75,6 +98,9 @@ while [ "$#" -gt 0 ]; do
     --global)  GLOBAL="1"; shift ;;   # off/on: machine-wide kill switch (~/.heimdall/presence-off)
     --no-files) NOFILES="1"; shift ;; # on: stay present but withhold file/activity detail
     --strict)  STRICT="1"; shift ;;   # beat: surface a dropped/refused beat with a nonzero exit
+    --session)  SESSION="${2-}"; shift 2 ;;   # keeper: per-session pidfile key (may be empty)
+    --interval) INTERVAL="${2-}"; shift 2 ;;  # keeper: beat period in seconds (default 20)
+    --pidfile)  KEEPER_PIDFILE="${2-}"; shift 2 ;;  # keeper: explicit pidfile (test seam)
     *) echo "heimdall-presence: unexpected argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -607,12 +633,142 @@ _try_retire() {
   run_client retire >/dev/null 2>&1 || true
 }
 
+# ── DURABLE PRESENCE KEEPER ──────────────────────────────────────────────────────
+# A detached loop that re-beats on a timer so a LIVE-BUT-IDLE session (no statusline
+# renders, no manual beats) stays on the wall instead of ageing out past the ~45s TTL.
+# It REUSES `beat` for every heartbeat (its consent gate no-ops an off beat too) — it
+# NEVER re-implements beating. The keeper is keyed per (project, session): its pid lives
+# in ONE file under the runtime home so keeper-stop reaps exactly the loop this session
+# started, and a stale-pid guard + a wallclock backstop mean a crashed session never
+# orphans a loop forever. Everything is best-effort + silent-safe: a keeper fault (offline,
+# CP down, no place to persist) never breaks the session.
+
+# runtime keeper dir (under the runtime home; overridable for tests — never hardcoded).
+_keeper_dir() { printf '%s' "${HEIMDALL_KEEPER_DIR:-$HMD_DIR/presence-keeper}"; }
+# session key: --session > $HMD_SESSION_ID > $CLAUDE_SESSION_ID > "default" (repo-scoped).
+_keeper_session() {
+  local s="$SESSION"
+  [ -n "$s" ] || s="${HMD_SESSION_ID:-}"
+  [ -n "$s" ] || s="${CLAUDE_SESSION_ID:-}"
+  [ -n "$s" ] || s="default"
+  printf '%s' "$s"
+}
+# the per-(project,session) pidfile. Slugs '/:@ ' so a remote-derived project id + a session
+# id never break the filename.
+_keeper_pidfile() {
+  [ -n "$KEEPER_PIDFILE" ] && { printf '%s' "$KEEPER_PIDFILE"; return; }
+  local proj sess
+  proj="$(printf '%s' "${PROJECT:-repo}" | tr '/:@ ' '____')"
+  sess="$(printf '%s' "$(_keeper_session)" | tr '/:@ ' '____')"
+  printf '%s/%s__%s.pid' "$(_keeper_dir)" "$proj" "$sess"
+}
+# is a LIVE keeper recorded in $1? (pidfile present, numeric pid, process alive).
+_keeper_alive() {
+  local pf="$1" pid
+  [ -f "$pf" ] || return 1
+  pid="$(cat "$pf" 2>/dev/null || true)"
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  kill -0 "$pid" 2>/dev/null
+}
+
+# The loop itself. Claims the pidfile with its OWN pid, then beats every INTERVAL until it is
+# killed, its pidfile stops naming it (soft-stop / a newer keeper won the file), it hits the
+# cycle cap (a test seam), or it exceeds the wallclock backstop (orphan guard). Reaps its own
+# pidfile on exit. TERM/INT are trapped so keeper-stop kills it PROMPTLY (the in-flight sleep
+# is interrupted + reaped, so no zombie sleep is left behind).
+_keeper_loop() {
+  local pidfile="$1" interval="$2"
+  local beat_bin="${HMD_KEEPER_BEAT_BIN:-$SELF}"      # test seam: inject a recording beat stub.
+  local max_cycles="${HMD_KEEPER_MAX_CYCLES:-0}"      # 0 = unbounded (a positive N = test seam).
+  local max_seconds="${HMD_KEEPER_MAX_SECONDS:-86400}" # 24h orphan backstop (0 = unbounded).
+  local start_ts now cycles=0 swait=""
+  start_ts="$(date +%s 2>/dev/null || echo 0)"
+  mkdir -p "$(dirname "$pidfile")" 2>/dev/null || true
+  # claim ownership atomically (last writer wins; the loser sees the mismatch + exits below).
+  printf '%s\n' "$$" > "$pidfile.tmp.$$" 2>/dev/null && mv -f "$pidfile.tmp.$$" "$pidfile" 2>/dev/null
+  # shellcheck disable=SC2064 — expand $pidfile/$swait/$$ at trap-fire time, not define time.
+  trap 'rm -f "$pidfile.tmp.$$" 2>/dev/null; [ -n "$swait" ] && kill "$swait" 2>/dev/null; [ "$(cat "$pidfile" 2>/dev/null)" = "$$" ] && rm -f "$pidfile" 2>/dev/null; exit 0' TERM INT
+  while :; do
+    "$beat_bin" beat >/dev/null 2>&1 || true          # REUSE beat (its consent gate applies).
+    cycles=$((cycles + 1))
+    [ "$max_cycles" != "0" ] && [ "$cycles" -ge "$max_cycles" ] && break
+    # soft-stop / stale-pid guard: if the pidfile no longer names us, a stop (rm) or a newer
+    # keeper claimed it -> exit so there is ever only ONE live keeper per session.
+    [ "$(cat "$pidfile" 2>/dev/null || true)" = "$$" ] || break
+    now="$(date +%s 2>/dev/null || echo 0)"           # wallclock backstop against an orphan.
+    [ "$max_seconds" != "0" ] && [ "$((now - start_ts))" -ge "$max_seconds" ] && break
+    sleep "$interval" & swait=$!; wait "$swait" 2>/dev/null; swait=""
+  done
+  [ "$(cat "$pidfile" 2>/dev/null || true)" = "$$" ] && rm -f "$pidfile" 2>/dev/null || true
+  return 0
+}
+
+# keeper-start: consent-gated, idempotent, detached spawn of ONE keeper for this session.
+_keeper_start() {
+  # CONSENT OFF -> NO keeper. Mirror `off`: a best-effort retire so we are not on the wall,
+  # then return. (The loop's beats would no-op anyway, but not spawning it is the honest
+  # "consent off -> no keeper" contract and wastes no process.)
+  if _pres_off; then _try_retire; printf 'presence keeper: not started (presence is OFF)\n'; return 0; fi
+  local pidfile interval i=0
+  pidfile="$(_keeper_pidfile)"
+  interval="${INTERVAL:-${HMD_KEEPER_INTERVAL:-20}}"
+  mkdir -p "$(_keeper_dir)" 2>/dev/null || true
+  if _keeper_alive "$pidfile"; then
+    printf 'presence keeper: already running (pid %s) — not spawning a second\n' "$(cat "$pidfile" 2>/dev/null)"
+    return 0
+  fi
+  rm -f "$pidfile" 2>/dev/null || true               # reap a stale pidfile (dead pid).
+  # Detach: RE-EXEC this bin as a fresh `keeper-loop` process (NOT a subshell of us) so the loop
+  # runs as its OWN top-level shell — `$$` inside is then its real pid (a subshell's $$ is the
+  # PARENT's, and $BASHPID is bash-4-only, absent on macOS's stock bash 3.2). nohup + disown +
+  # </dev/null detach it from this hook/shell so it survives the session; the loop self-claims
+  # the pidfile with its own $$.
+  nohup "$SELF" keeper-loop --pidfile "$pidfile" --interval "$interval" </dev/null >/dev/null 2>&1 &
+  disown 2>/dev/null || true
+  # Briefly wait for the loop to claim the pidfile so an immediate double-start sees it (closes
+  # the idempotency race). Best-effort — the keeper is armed regardless of this confirmation.
+  while [ "$i" -lt 40 ]; do _keeper_alive "$pidfile" && break; i=$((i + 1)); sleep 0.05 2>/dev/null || sleep 1; done
+  if _keeper_alive "$pidfile"; then
+    printf 'presence keeper: started (pid %s, beats every %ss)\n' "$(cat "$pidfile" 2>/dev/null)" "$interval"
+  else
+    printf 'presence keeper: could not confirm start (best-effort — presence still beats on render)\n'
+  fi
+  return 0
+}
+
+# keeper-stop: kill THIS session's keeper + reap its pidfile. Idempotent (a missing/stale/dead
+# keeper is a clean no-op). Sends TERM, escalates to KILL if it lingers, then removes the file.
+_keeper_stop() {
+  local pidfile pid i=0
+  pidfile="$(_keeper_pidfile)"
+  [ -f "$pidfile" ] || { printf 'presence keeper: not running\n'; return 0; }
+  pid="$(cat "$pidfile" 2>/dev/null || true)"
+  case "$pid" in
+    ''|*[!0-9]*) rm -f "$pidfile" 2>/dev/null || true; printf 'presence keeper: stale pidfile cleared\n'; return 0 ;;
+  esac
+  if kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null || true
+    while [ "$i" -lt 20 ] && kill -0 "$pid" 2>/dev/null; do i=$((i + 1)); sleep 0.05 2>/dev/null || sleep 1; done
+    kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
+    printf 'presence keeper: stopped (pid %s)\n' "$pid"
+  else
+    printf 'presence keeper: already gone (pid %s)\n' "$pid"
+  fi
+  rm -f "$pidfile" 2>/dev/null || true
+  return 0
+}
+
 case "$SUB" in
   beat)
     # Effectively-on here (the OFF guard above already no-op'd an off beat). Honor the
     # --no-files sub-toggle: withhold the file field so the beat body sends file:null.
     _repo_nofiles && FILE=""
     run_client beat ;;
+  keeper-start) _keeper_start ;;
+  keeper-stop)  _keeper_stop ;;
+  keeper-loop)  # INTERNAL: run one keeper loop in-process. Used by keeper-start's detached
+                # spawn and by the falsifier test to drive N deterministic cycles.
+    _keeper_loop "$(_keeper_pidfile)" "${INTERVAL:-${HMD_KEEPER_INTERVAL:-20}}" ;;
   roster) run_client roster ;;   # OFF = invisible, NOT blind: an opted-out dev still SEES the wall.
   retire) run_client retire ;;   # emit ONE signed retire beat (used by `off`; exposed for tooling).
   off)
@@ -670,6 +826,30 @@ heimdall-presence — server-synced team presence (with consent opt-out)
   heimdall-presence on  --global      lift the machine-wide kill switch
   heimdall-presence status            print repo/global/effective state + what is broadcast
   heimdall-presence retire            emit one signed retire beat (drop off walls now)
+  heimdall-presence keeper-start [--session ID] [--interval S]
+                                      spawn ONE detached background beat-keeper (default 20s,
+                                      under the ~45s TTL) so a LIVE-BUT-IDLE session stays on
+                                      the wall. Idempotent + consent-gated + silent-safe.
+  heimdall-presence keeper-stop  [--session ID]
+                                      kill this session's keeper + reap its pidfile (no leak)
+
+KEEPER (durable presence): a single SessionStart beat ages out past the TTL and the statusline
+beat only fires on a REDRAW — so a live-but-idle session vanishes from the wall. keeper-start
+runs a detached loop that re-beats on a timer (reusing `beat` + its consent gate) until
+keeper-stop reaps it at SessionEnd. The pid lives in ONE file under the runtime home
+(~/.heimdall/presence-keeper/<project>__<session>.pid, or $HEIMDALL_KEEPER_DIR); a stale-pid
+guard + a 24h wallclock backstop mean a crashed session never orphans a loop. OFF -> no keeper.
+
+DEV-CHECKOUT (heimdall on PATH but NOT a registered plugin -> the plugin's SessionStart hook
+never fires): wire the two subcommands into your OWN ~/.claude/settings.json so the keeper still
+starts/stops with your session (paths resolve dynamically — no hardcoding):
+  "hooks": {
+    "SessionStart": [{"hooks": [{"type": "command",
+      "command": "SID=$(jq -r '.session_id // empty'); heimdall-presence keeper-start --session \"$SID\" >/dev/null 2>&1 &"}]}],
+    "SessionEnd":   [{"hooks": [{"type": "command",
+      "command": "SID=$(jq -r '.session_id // empty'); heimdall-presence keeper-stop  --session \"$SID\" >/dev/null 2>&1 || true"}]}]
+  }
+Or just run install.sh, which registers the plugin whose shipped hooks call them for you.
 
 CONSENT: OFF = zero beats (a stat-only no-op — a cron/hook can't leak around it) AND a retire
 beat so you vanish from teammates' walls promptly, not after the TTL. OFF is invisible, NOT
@@ -687,5 +867,5 @@ dev exports NOTHING. Overrides still win:
 Offline/unconfigured degrades cleanly (empty roster, no-op beat, exit 0).
 USAGE
     ;;
-  *) echo "heimdall-presence: unknown subcommand '$SUB' (try: beat | roster | on | off | status | retire)" >&2; exit 2 ;;
+  *) echo "heimdall-presence: unknown subcommand '$SUB' (try: beat | roster | on | off | status | retire | keeper-start | keeper-stop)" >&2; exit 2 ;;
 esac
