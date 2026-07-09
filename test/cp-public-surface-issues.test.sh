@@ -299,6 +299,130 @@ else
     || bad "INV-G: the issue store + control-plane share a root — issue=$CROOT cp=$CPROOT"
 fi
 
+# ── SECTION 2b — ABUSE-GATE PARITY with /corpus (F-1/F-2/F-3: replay + per-team + per-IP) ──
+#
+# WHY THIS EXISTS. /issues was allowlisted + auth-gated (Section 1) but had NO abuse half: no
+# pre-auth per-IP flood shed (F-3 crypto-DoS), no post-auth per-team cap (F-2 aggregate/storage
+# skew), no replay-nonce (F-1 — a captured signed batch replays indefinitely, re-appends every
+# record, inflates one tenant's per-signature counts and CORRUPTS the INV-B k-anon aggregate).
+# This section drives the SAME gate seam the server wires (cp_publicsurface.check_issues_*),
+# mirroring the /corpus + /rr-task gate proofs (heimdall-cp-authz-gate.test.sh:213-316). Each
+# assertion is RED-without-fix (the gate functions do not exist) and GREEN-with.
+echo
+echo "── SECTION 2b — abuse gates: /issues at parity with /corpus (429 flood shed + 401 replay)"
+
+GATE_DRIVER="$ROOT_T/gate_driver.py"
+cat >"$GATE_DRIVER" <<'PYEOF'
+import json
+import os
+import sys
+
+sys.path.insert(0, os.environ["LIB"])
+import cp_auth
+import cp_publicsurface as PS
+import cp_server as CS
+
+HOME = os.environ["HEIMDALL_HOME"]
+os.environ["HEIMDALL_PUBLIC_SURFACE"] = "1"
+now = 1_000_000
+out = {}
+
+# RED-WITHOUT-FIX: if the /issues abuse gates were never added, the accessors below are absent —
+# print an all-False result so each assertion below goes RED (rather than crashing opaquely).
+if not (hasattr(PS, "check_issues_pre_auth") and hasattr(PS, "check_issues_post_auth")):
+    print(json.dumps({"gates_missing": True}))
+    sys.exit(0)
+
+
+def team(secret, haid):
+    """Register a team key so the per-team cap keys on a REAL server-derived team_id_hash."""
+    priv, pub = cp_auth.generate_keypair()
+    cp_auth.register_key(haid, pub, team_id=cp_auth.derive_team_id(secret), home=HOME)
+    return cp_auth.Identity(haid)
+
+
+id_team = team("issues-team-secret-xxxxxxxxxxxxxxxxxxxx", "haid:iss-team")
+id_rep = team("issues-rep-secret-xxxxxxxxxxxxxxxxxxxx", "haid:iss-rep")
+id_sib = team("issues-sib-secret-xxxxxxxxxxxxxxxxxxxx", "haid:iss-sib")
+
+# ── F-3 per-IP crypto-DoS shed: the pre-auth per-IP flood trips 429 BEFORE any crypto is spent.
+os.environ["HEIMDALL_ISSUES_IP_LIMIT"] = "3"
+os.environ["HEIMDALL_ISSUES_IP_WINDOW"] = "60"
+ip_req = {"peer_ip": "9.9.9.9", "body": json.dumps({"issues": []})}
+out["ip_flood_429"] = 0
+for _ in range(12):
+    r = PS.check_issues_pre_auth(ip_req, home=HOME, now=now)
+    if isinstance(r, tuple) and r[0] == 429:
+        out["ip_flood_429"] = 1
+        out["ip_scope"] = r[1].get("scope")
+        break
+
+# ── F-2 per-team cap: the post-auth per-team flood trips 429. Fresh nonce each call so the RATE
+#    check (which runs first) is what trips — never the replay check.
+os.environ["HEIMDALL_ISSUES_TEAM_LIMIT"] = "3"
+os.environ["HEIMDALL_ISSUES_TEAM_WINDOW"] = "60"
+out["team_flood_429"] = 0
+for i in range(12):
+    body = json.dumps({"issues": [], "nonce": "n-team-%02d" % i, "ts": now})
+    r = PS.check_issues_post_auth(id_team, {"body": body, "peer_ip": "8.8.8.8"}, home=HOME, now=now)
+    if isinstance(r, tuple) and r[0] == 429:
+        out["team_flood_429"] = 1
+        out["team_scope"] = r[1].get("scope")
+        break
+
+# ── F-1 replay-nonce: the SAME signed (nonce, ts) twice -> first ok, second 401 replay_. Team cap
+#    raised high so the RATE check cannot trip first (this proves the REPLAY gate, not the cap).
+os.environ["HEIMDALL_ISSUES_TEAM_LIMIT"] = "30"
+rep_body = json.dumps({"issues": [], "nonce": "issues-replayZ", "ts": now})
+g1 = PS.check_issues_post_auth(id_rep, {"body": rep_body, "peer_ip": "7.7.7.7"}, home=HOME, now=now)
+g2 = PS.check_issues_post_auth(id_rep, {"body": rep_body, "peer_ip": "7.7.7.7"}, home=HOME, now=now)
+out["nonce_first_ok"] = (g1 is None)
+out["nonce_replay_401"] = (isinstance(g2, tuple) and g2[0] == 401
+                           and str(g2[1].get("error", "")).startswith("replay_"))
+
+# structural: /issues is in the allowlist AND SIGNED-ONLY (goes through §3, not a pre-auth route),
+# exactly like /corpus.
+out["issues_public"] = (PS.is_public_route("POST", "/issues") is True
+                        and ("POST", "/issues") in PS.PUBLIC_ROUTES)
+out["issues_signed_only"] = (CS._public_route("POST", "/issues") is None)
+
+# sibling intact: the /corpus post-auth gate still passes (we did not break /corpus).
+cg = PS.check_corpus_post_auth(
+    id_sib, {"body": json.dumps({"nonce": "corpus-z", "ts": now}), "peer_ip": "4.4.4.4"},
+    home=HOME, now=now)
+out["corpus_sibling_ok"] = (cg is None)
+
+print(json.dumps(out))
+PYEOF
+
+GOUT="$("$PY" "$GATE_DRIVER" 2>"$ROOT_T/gate.err")"
+if [ -z "$GOUT" ]; then
+  bad "S2b gate driver produced no output (see stderr)"; cat "$ROOT_T/gate.err" >&2
+else
+  echo "  gate driver: $GOUT"
+  gj() { printf '%s' "$GOUT" | "$PY" -c "import json,sys;print(json.load(sys.stdin)$1)" 2>/dev/null; }
+
+  [ "$(gj "['ip_flood_429']")" = "1" ] && [ "$(gj "['ip_scope']")" = "issues_ip" ] \
+    && ok "F-3: pre-auth per-IP flood sheds 429 (issues_ip) BEFORE crypto — at parity with /corpus" \
+    || bad "F-3: no per-IP 429 flood shed on /issues (crypto-DoS surface open) — out=$GOUT"
+
+  [ "$(gj "['team_flood_429']")" = "1" ] && [ "$(gj "['team_scope']")" = "issues_team" ] \
+    && ok "F-2: post-auth per-team cap trips 429 (issues_team) — bounds one tenant's flush + aggregate skew" \
+    || bad "F-2: no per-team 429 cap on /issues (storage/aggregate skew open) — out=$GOUT"
+
+  [ "$(gj "['nonce_first_ok']")" = "True" ] && [ "$(gj "['nonce_replay_401']")" = "True" ] \
+    && ok "F-1: a replayed signed /issues batch (same nonce) -> 401 replay_ — defeats k-anon aggregate corruption" \
+    || bad "F-1: the replay-nonce gate did not refuse a replayed /issues batch — out=$GOUT"
+
+  [ "$(gj "['issues_public']")" = "True" ] && [ "$(gj "['issues_signed_only']")" = "True" ] \
+    && ok "/issues is in the public allowlist AND SIGNED-ONLY (rides §3 like /corpus)" \
+    || bad "/issues route wiring is wrong — out=$GOUT"
+
+  [ "$(gj "['corpus_sibling_ok']")" = "True" ] \
+    && ok "sibling intact: the /corpus post-auth gate still passes (the sibling is not broken)" \
+    || bad "the /corpus sibling gate regressed — out=$GOUT"
+fi
+
 # ── SECTION 3 — FIRESTORE-MODE round-trip (deployed-shape: LocalBackend-green != Firestore-green) ──
 echo
 echo "── SECTION 3 — firestore-mode ingest -> aggregate + isolation (the deployed-shape guard)"
@@ -586,6 +710,41 @@ try:
 except cp_state.BackendUnavailable:
     out["fs_path_raises"] = True
 
+# ── ABUSE-GATE PARITY UNDER FIRESTORE (the audit noted S3 never asserted 429/replay). The 429 +
+#    replay gates must hold under the REAL FirestoreBackend too: the rate counters + the nonce
+#    seen-set are durable THROUGH cp_state, so they catch a flood/replay fleet-wide. Drive the
+#    SAME gate seam the server wires. Guarded so a missing gate reads False (RED-without-fix)
+#    rather than crashing the whole firestore section.
+import cp_publicsurface as PS
+os.environ["HEIMDALL_PUBLIC_SURFACE"] = "1"
+NOWG = 2_000_000
+out["fs_ip_flood_429"] = 0
+out["fs_nonce_first_ok"] = False
+out["fs_nonce_replay_401"] = False
+if hasattr(PS, "check_issues_pre_auth") and hasattr(PS, "check_issues_post_auth"):
+    # F-3 per-IP flood shed under firestore.
+    os.environ["HEIMDALL_ISSUES_IP_LIMIT"] = "3"
+    os.environ["HEIMDALL_ISSUES_IP_WINDOW"] = "60"
+    for _ in range(12):
+        r = PS.check_issues_pre_auth(
+            {"peer_ip": "5.5.5.5", "body": json.dumps({"issues": []})}, home=HOME, now=NOWG)
+        if isinstance(r, tuple) and r[0] == 429:
+            out["fs_ip_flood_429"] = 1
+            break
+    # F-1 replay-nonce under firestore (durable seen-set). Team cap high so the RATE check does
+    # not trip first — this proves the replay gate holds under the firestore-backed seen-set.
+    priv, pub = cp_auth.generate_keypair()
+    cp_auth.register_key("haid:fsrep", pub,
+                         team_id=cp_auth.derive_team_id("fs-rep-secret-xxxxxxxxxxxxxxxxxxxx"),
+                         home=HOME)
+    id_rep = cp_auth.Identity("haid:fsrep")
+    os.environ["HEIMDALL_ISSUES_TEAM_LIMIT"] = "30"
+    rb = json.dumps({"issues": [], "nonce": "fs-issues-replay", "ts": NOWG})
+    fg1 = PS.check_issues_post_auth(id_rep, {"body": rb, "peer_ip": "6.6.6.6"}, home=HOME, now=NOWG)
+    fg2 = PS.check_issues_post_auth(id_rep, {"body": rb, "peer_ip": "6.6.6.6"}, home=HOME, now=NOWG)
+    out["fs_nonce_first_ok"] = (fg1 is None)
+    out["fs_nonce_replay_401"] = (isinstance(fg2, tuple) and fg2[0] == 401)
+
 print(json.dumps(out))
 PYEOF
 
@@ -624,6 +783,14 @@ else
   [ "$(fj "['fs_path_raises']")" = "True" ] \
     && ok "S3f path() raises under firestore, yet ingest+aggregate succeeded => the issue code never calls path()" \
     || bad "S3f path() did not raise under firestore (the deployed-shape guard is inert) — fs=$FSOUT"
+
+  [ "$(fj "['fs_ip_flood_429']")" = "1" ] \
+    && ok "S3g the /issues per-IP flood gate sheds 429 UNDER FIRESTORE (the abuse gate holds in the deployed shape)" \
+    || bad "S3g the /issues per-IP flood gate did not trip under firestore — fs=$FSOUT"
+
+  [ "$(fj "['fs_nonce_first_ok']")" = "True" ] && [ "$(fj "['fs_nonce_replay_401']")" = "True" ] \
+    && ok "S3h a replayed signed /issues batch -> 401 UNDER FIRESTORE (replay caught fleet-wide via the durable seen-set)" \
+    || bad "S3h the /issues replay-nonce gate did not hold under firestore — fs=$FSOUT"
 fi
 
 echo
