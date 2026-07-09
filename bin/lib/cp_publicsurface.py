@@ -137,6 +137,26 @@ import cp_credforward  # LEAST-PRIVILEGE cred WRITE-FORWARD (POST /team/cred). O
 #       records the map keyed by that team and STOPS — it mints/holds NO token. Fail-closed: no team
 #       -> 403; a bad installation_id / repo slug -> 422.
 # All OTHER entries are READ-ONLY: there is deliberately no other unauthenticated write.
+# PLUS the SIGNED ANONYMIZED-ISSUE intake (anonymized-issue-collection §W3 — the ADDITIVE SIBLING
+# of /corpus). POST /issues is a SIGNED public write, served signed+gated on the public surface
+# EXACTLY like /corpus:
+#   POST /issues — a SIGNED, team-scoped issue-corpus flush. It is NOT a pre-auth public route, so
+#       it goes through the §3 auth chokepoint (a signature is REQUIRED — an unsigned/forged/
+#       unknown/revoked push is a 401 BEFORE the handler runs, INV-E fail-closed), and the caller's
+#       team_id_hash is derived SERVER-SIDE from the verified binding (cp_auth.registered_team,
+#       INV-C — a body team_id is IGNORED). cp_issue_ingest.issues_route re-runs the closed-schema
+#       zero-content rebuild + secret-scan, DROPS any security_sensitive record at the boundary
+#       (INV-F — it belongs to the private .planning/ lane, never the public partition), and appends
+#       the scrubbed issue_v1 batch to the caller's OWN partition in the ISOLATED corpus namespace
+#       (issues/<team_hash>/issues.ndjson, disjoint from the control-plane keyspace, INV-G). It
+#       holds NO credential, resolves NO action_type, runs NO handler, and makes NO model call —
+#       DATA-only, like /corpus. No team resolves -> 403 fail-closed. The k-anon aggregate this
+#       intake feeds (cp_issue_aggregate) serves a signature bucket ONLY at >= 10 distinct teams
+#       (INV-B) and EXCLUDES every security-sensitive record (INV-F); that gate lives in the
+#       aggregate, not here — this route is the write side of that same contract. The handler is
+#       registered by the boot seam (cp_issue_ingest.register via cp_boot), reached through the
+#       normal registered-route dispatch once this allowlist entry lets the public boundary SERVE
+#       it instead of a flat 404. Rides the shared §3 chokepoint for auth exactly like /corpus.
 # PLUS the PUBLIC, UNSIGNED, CACHED interval-tuning read (cost-governance §2):
 #   GET /config — the server-driven adaptive-interval ladder (cp_config). Non-sensitive tuning
 #       data (beat/refresh intervals + ttl + backoff_reason), served UNSIGNED because a browser
@@ -150,6 +170,7 @@ PUBLIC_ROUTES = frozenset({
     ("POST", "/presence"),
     ("POST", "/rr-task"),
     ("POST", "/corpus"),
+    ("POST", "/issues"),
     ("POST", "/team/cred"),
     ("POST", "/team/install"),
     ("GET", "/roster"),
