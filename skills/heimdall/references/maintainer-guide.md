@@ -127,6 +127,15 @@ routing — falsifiability over vibes. Details: `skills/self-improve/SKILL.md`,
 `docs/analysis/autoresearch-distilled.md`. Invoked automatically by `/hmd:maintain-check` on the Nth
 cycle, or on demand via `/hmd:self-improve`.
 
+### Overnight: `/dream`
+
+For an off-hours pass, `/dream` (`commands/dream.md`, `bin/heimdall-dream`) runs this self-improve
+loop **and** a maintainer sweep together, then leaves a **morning report** at
+`.planning/dream/YYYY-MM-DD.md` — suggested changes, issues raised with proposed fixes, and kept
+(measured) improvements. It is **shadow-first**: risky routing changes are surfaced for review, not
+auto-applied; only the keep-gate's measured, reversible wins persist. It never pushes or merges.
+Schedule it with `/schedule "/dream --overnight" --cron "0 3 * * *"` (or `/routine`).
+
 ## Communication
 
 Maintainer mode communicates progress naturally:

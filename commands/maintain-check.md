@@ -131,6 +131,9 @@ pass-rate delta over its baseline; otherwise the override is rolled back. See
 `skills/self-improve/SKILL.md` and `docs/analysis/autoresearch-distilled.md`. This is a deliberate
 step-back BETWEEN fix batches — never mid-fix.
 
+For an OVERNIGHT pass that runs this loop **plus** a maintainer sweep and leaves a morning report
+(`.planning/dream/YYYY-MM-DD.md`), use `/dream` (`commands/dream.md`) — shadow-first, never pushes.
+
 ## Resume / Re-arm
 
 The engine writes a durable checkpoint every transition, so a brand-new session can

@@ -1,0 +1,395 @@
+#!/usr/bin/env python3
+# heimdall-dream — the OVERNIGHT autoresearch + maintainer sweep that surfaces a
+# MORNING REPORT (a "dream journal"). RJ's mental model: "/sleep" — but there is no
+# /sleep command; /dream is the canonical overnight wrapper. On-demand or scheduled.
+#
+# WHAT IT DOES (shadow-first — surface, don't auto-apply risky changes overnight):
+#   1. autoresearch/self-improve loop (bin/heimdall-self-improve) — FORM hypotheses
+#      from real metrics + queue evidence, and TEST them via the keep-or-rollback
+#      gate: EVALUATE every open experiment (KEEP only a measured delta over baseline,
+#      else ROLL BACK). Optionally START one bounded, reversible experiment.
+#   2. maintainer sweep (seeker) — RAISE issues found from the evidence (recurring
+#      dead-reason clusters + the live issue queue) WITH proposed FIXES, as candidates.
+#   3. COLLECT improvements — the self-improve KEEPS (measured, validated wins).
+#   4. WRITE a morning report to .planning/dream/YYYY-MM-DD.md with three sections:
+#        (1) suggested changes   (2) issues raised & their fixes   (3) improvements kept.
+#
+# INVARIANTS (do not weaken):
+#   • shadow-first — routing suggestions are SURFACED for review, not auto-applied.
+#     Only the self-improve keep-gate (safe, measured, reversible) may persist a change.
+#   • agent-never-pushes — this bin runs NO `git push`, NO `gh pr`, NO merge. Ever.
+#     It writes a local report; a human reviews and applies in the morning.
+#   • real, not fabricated — every line of the report is sourced from actual
+#     self-improve output + real queue state. With NO evidence it says so honestly.
+#
+# The self-improve keep-gate is REUSED verbatim by shelling out to the sibling
+# bin/heimdall-self-improve — this bin adds NO new keep/rollback logic of its own.
+#
+# Usage:
+#   heimdall-dream run   [--repo DIR] [--date YYYY-MM-DD] [--min-samples N]
+#                        [--min-delta F] [--out FILE] [--mode overnight|on-demand]
+#                        [--start-experiment] [--json]
+#   heimdall-dream where [--repo DIR] [--date YYYY-MM-DD]   # print the report path
+#   -h | --help
+#
+# Exit status: 0 ok (incl. an honest empty report) · 2 usage · 3 runtime.
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+
+BIN_DIR = os.path.dirname(os.path.realpath(__file__))
+SELF_IMPROVE = os.path.join(BIN_DIR, "heimdall-self-improve")
+ISSUE_LOOP = os.path.join(BIN_DIR, "heimdall-issue-loop")
+
+
+def _now():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _today():
+    return time.strftime("%Y-%m-%d", time.gmtime())
+
+
+def _die(msg, code=3):
+    sys.stderr.write("error: %s\n" % msg)
+    raise SystemExit(code)
+
+
+def _report_path(repo, date, out):
+    if out:
+        return out
+    return os.path.join(repo, ".planning", "dream", "%s.md" % date)
+
+
+# ── reuse: shell out to the sibling self-improve bin (the keep-gate is REUSED, not
+#    reimplemented). Returns parsed JSON stdout; None on a non-zero exit. ──────────
+
+def _si(repo, *args):
+    if not os.path.exists(SELF_IMPROVE):
+        _die("sibling bin not found: %s" % SELF_IMPROVE)
+    cmd = [sys.executable, SELF_IMPROVE, "--repo", repo] + list(args)
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        return {"_error": proc.stderr.strip() or proc.stdout.strip(),
+                "_rc": proc.returncode}
+    out = proc.stdout.strip()
+    if not out:
+        return {}
+    try:
+        return json.loads(out)
+    except (ValueError, TypeError):
+        return {"_raw": out}
+
+
+def _issue_queue(repo):
+    """Best-effort read of the live issue queue (the seeker's downstream). Absent
+    bin/queue -> zeros (graceful — the sweep still runs on metric/queue evidence)."""
+    if not os.path.exists(ISSUE_LOOP):
+        return None
+    proc = subprocess.run([sys.executable, ISSUE_LOOP, "status", "--repo", repo],
+                          capture_output=True, text=True)
+    if proc.returncode != 0:
+        return None
+    try:
+        return json.loads(proc.stdout.strip() or "{}")
+    except (ValueError, TypeError):
+        return None
+
+
+# ── the overnight run ─────────────────────────────────────────────────────────
+
+def cmd_run(args):
+    repo = args.repo
+    date = args.date or _today()
+    ms = str(args.min_samples)
+
+    # 1. COLLECT the comparable scalar + FORM hypotheses (real self-improve output).
+    collect = _si(repo, "collect")
+    hypos = _si(repo, "hypotheses", "--min-samples", ms)
+    status = _si(repo, "status")
+
+    total_records = int(collect.get("total_task_records", 0) or 0)
+    hyp_list = hypos.get("hypotheses", []) if isinstance(hypos, dict) else []
+    routing_hyps = [h for h in hyp_list if h.get("kind") == "routing"]
+    precheck_hyps = [h for h in hyp_list if h.get("kind") == "precheck"]
+
+    # 2. TEST via the keep-gate — EVALUATE every open experiment (KEEP measured wins,
+    #    else ROLL BACK). This is the self-improve falsifier, reused verbatim.
+    open_exps = status.get("open_experiments", []) if isinstance(status, dict) else []
+    evaluated = []
+    for exp_id in open_exps:
+        res = _si(repo, "experiment", "evaluate", "--id", exp_id)
+        if isinstance(res, dict) and res.get("decision"):
+            evaluated.append(res)
+    kept = [e for e in evaluated if e.get("decision") == "keep"]
+    discarded = [e for e in evaluated if e.get("decision") != "keep"]
+
+    # 2b. Optionally START one bounded, reversible experiment (safe per the keep-gate:
+    #     unvalidated, snapshotted, auto-rolled-back next cycle if it does not win).
+    started = None
+    if args.start_experiment and routing_hyps:
+        # do not start on a subject that already carries an override (an open
+        # experiment or a validated win) — one bounded experiment per subject.
+        active = status.get("overrides_active", {}) if isinstance(status, dict) else {}
+        cand = next((h for h in routing_hyps
+                     if h.get("testable")
+                     and h.get("proposal", {}).get("task_type") not in active), None)
+        if cand:
+            started = _si(repo, "experiment", "start", "--hypothesis", cand["id"],
+                          "--min-samples", ms, "--min-delta", str(args.min_delta))
+            if isinstance(started, dict) and started.get("started"):
+                started["hypothesis"] = cand
+            else:
+                started = None
+
+    # 3. maintainer SWEEP — the seeker's issues: recurring dead-reason clusters (from
+    #    real queue-stats, surfaced by self-improve as precheck hypotheses) + the live
+    #    issue queue state.
+    queue = _issue_queue(repo)
+
+    # re-read the post-evaluate status so validated wins reflect this run's KEEPs.
+    status = _si(repo, "status")
+    validated = status.get("validated_overrides", {}) if isinstance(status, dict) else {}
+
+    honest_empty = (total_records == 0 and not routing_hyps and not precheck_hyps
+                    and not kept and not validated
+                    and not (queue and (queue.get("queued") or queue.get("flagged"))))
+
+    report = _render(date, repo, args.mode, total_records, routing_hyps,
+                     precheck_hyps, queue, kept, discarded, validated, started,
+                     args.min_delta, honest_empty)
+
+    path = _report_path(repo, date, args.out)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(report)
+
+    summary = {
+        "date": date,
+        "report_path": path,
+        "mode": args.mode,
+        "honest_empty": honest_empty,
+        "pushed": False,  # agent-never-pushes: this bin performs NO push/merge.
+        "counts": {
+            "suggested_changes": len(routing_hyps) + (1 if started else 0),
+            "issues_raised": len(precheck_hyps)
+                             + (1 if queue and (queue.get("queued") or queue.get("flagged")) else 0),
+            "improvements_kept": len(kept),
+            "experiments_discarded": len(discarded),
+            "validated_overrides": len(validated),
+        },
+    }
+    if args.json:
+        print(json.dumps(summary, indent=2, sort_keys=True))
+    else:
+        print("dream: wrote %s (%s) — %d suggested, %d issues, %d kept%s"
+              % (path, "nothing to suggest" if honest_empty else "signal found",
+                 summary["counts"]["suggested_changes"],
+                 summary["counts"]["issues_raised"],
+                 summary["counts"]["improvements_kept"],
+                 "" if not args.start_experiment else " · 1 experiment started"
+                 if started else ""))
+    return 0
+
+
+# ── the morning report (markdown) — every line sourced from real output ─────────
+
+def _render(date, repo, mode, total_records, routing_hyps, precheck_hyps, queue,
+            kept, discarded, validated, started, min_delta, honest_empty):
+    L = []
+    L.append("# Dream Journal — %s" % date)
+    L.append("")
+    L.append("Overnight autoresearch + maintainer sweep. **Shadow-first**: routing "
+             "suggestions are surfaced for review, not auto-applied. Only the "
+             "self-improve keep-gate (safe, measured, reversible) persists a change. "
+             "No changes were pushed or merged.")
+    L.append("")
+    L.append("- generated: `%s`" % _now())
+    L.append("- repo: `%s`" % repo)
+    L.append("- mode: `%s`" % mode)
+    L.append("- task-outcome records seen: **%d**" % total_records)
+    L.append("")
+
+    if honest_empty:
+        L.append("> **Nothing to suggest — no evidence yet.** `.planning/metrics.jsonl` "
+                 "carries no `task` outcome records (and the queue is clear), so there "
+                 "is no measurable signal to form a hypothesis from. Dream ran honestly "
+                 "and is not fabricating suggestions. Once maintainer cycles record task "
+                 "outcomes, re-run `/dream`.")
+        L.append("")
+        L.append("## 1. Suggested changes")
+        L.append("")
+        L.append("_None — no measured signal._")
+        L.append("")
+        L.append("## 2. Issues raised & proposed fixes")
+        L.append("")
+        L.append("_None — no dead-reason clusters and an empty issue queue._")
+        L.append("")
+        L.append("## 3. Improvements kept")
+        L.append("")
+        L.append("_None — no experiments to evaluate._")
+        L.append("")
+        L.append("---")
+        L.append("")
+        L.append("_No changes pushed. The agent never pushes or merges — a human reviews "
+                 "and applies. Schedule overnight with_ `/schedule \"/dream\" --cron "
+                 "\"0 3 * * *\"`.")
+        L.append("")
+        return "\n".join(L)
+
+    # ── 1. suggested changes ────────────────────────────────────────────────────
+    L.append("## 1. Suggested changes")
+    L.append("")
+    L.append("Routing/planning hypotheses formed from the measured baseline. These are "
+             "**suggestions** — apply after review with "
+             "`heimdall-self-improve experiment start --hypothesis <id>`.")
+    L.append("")
+    if routing_hyps:
+        for h in routing_hyps:
+            b = h.get("baseline", {}) or {}
+            prop = h.get("proposal", {}) or {}
+            L.append("- **`%s`** — %s `%s` → `%s`"
+                     % (h["id"], h.get("subject", "?"),
+                        prop.get("from_model", "?"), prop.get("to_model", "?")))
+            L.append("  - observation: %s" % h.get("observation", ""))
+            L.append("  - rationale: %s" % h.get("rationale", ""))
+            L.append("  - baseline: pass_rate **%.2f** over **%d** samples (avg_retries %.2f)"
+                     % (float(b.get("pass_rate", 0) or 0), int(b.get("samples", 0) or 0),
+                        float(b.get("avg_retries", 0) or 0)))
+            L.append("  - expected: %s" % h.get("expected", ""))
+    else:
+        L.append("_None — no routing hypothesis met the min-samples gate._")
+    if started:
+        h = started.get("hypothesis", {})
+        L.append("")
+        L.append("**Experiment started this run (bounded · reversible · unvalidated):** "
+                 "`%s` — routing `%s` → `%s`. The next matching tasks run the variant; "
+                 "the keep-gate validates it on the next `/dream` (KEEP on a measured "
+                 "delta ≥ %.2f, else auto-rollback)."
+                 % (started.get("started"), h.get("subject", "?"),
+                    started.get("variant_model", "?"), min_delta))
+    L.append("")
+
+    # ── 2. issues raised & proposed fixes ────────────────────────────────────────
+    L.append("## 2. Issues raised & proposed fixes")
+    L.append("")
+    L.append("Candidates from the maintainer sweep — recurring failure clusters and the "
+             "live issue queue. Raised as candidates for a human; not auto-filed.")
+    L.append("")
+    any_issue = False
+    for h in precheck_hyps:
+        any_issue = True
+        b = h.get("baseline", {}) or {}
+        L.append("- **issue** (`%s`): %s" % (h["id"], h.get("observation", "")))
+        L.append("  - proposed fix: %s" % h.get("rationale", ""))
+        L.append("  - evidence: reason=`%s` count=**%s**"
+                 % (b.get("reason", "?"), b.get("count", "?")))
+        L.append("  - action: add a pre-check or a `.planning/skills/*.md` pattern; if it "
+                 "belongs in the codebase, file a repo issue via `heimdall-feedback`.")
+    if queue and (queue.get("queued") or queue.get("flagged")):
+        any_issue = True
+        L.append("- **issue queue**: %d queued · %d flagged · %d in-flight · %d resolved"
+                 % (int(queue.get("queued", 0) or 0), int(queue.get("flagged", 0) or 0),
+                    int(queue.get("in_flight", 0) or 0), int(queue.get("resolved", 0) or 0)))
+        if queue.get("flagged"):
+            L.append("  - proposed fix: **flagged** issues failed the gate — a human should "
+                     "triage; the fixer opens a PR only via `heimdall-issue-pr open` "
+                     "(never by pushing).")
+        if queue.get("queued"):
+            L.append("  - proposed fix: **queued** issues are pickable — the fixer will "
+                     "orient → fix → GATE → attest → PR-ready on the next maintainer cycle.")
+    if not any_issue:
+        L.append("_None — no dead-reason clusters and no queued/flagged issues._")
+    L.append("")
+
+    # ── 3. improvements kept ─────────────────────────────────────────────────────
+    L.append("## 3. Improvements kept")
+    L.append("")
+    L.append("Measured wins from the self-improve keep-gate — an override persists ONLY "
+             "with a measured pass-rate delta over its baseline (else it was rolled back).")
+    L.append("")
+    if kept:
+        for e in kept:
+            r = e.get("result", {}) or {}
+            L.append("- **KEPT** `%s` — delta **%+.4f** (variant %.2f vs baseline %.2f) "
+                     "over **%d** samples → override *validated*."
+                     % (e.get("id", "?"), float(r.get("delta_pass_rate", 0) or 0),
+                        float(r.get("variant_pass_rate", 0) or 0),
+                        float(r.get("baseline_pass_rate", 0) or 0),
+                        int(r.get("samples", 0) or 0)))
+            L.append("  - verdict: %s" % r.get("reason", ""))
+    if validated:
+        for subj, ov in sorted(validated.items()):
+            if isinstance(ov, dict):
+                L.append("- active validated override: `%s` → `%s` (%s)"
+                         % (subj, ov.get("model", "?"), ov.get("reason", "")))
+    if not kept and not validated:
+        L.append("_None kept this run._")
+    if discarded:
+        L.append("")
+        L.append("**Rolled back (not an improvement — transparency):**")
+        for e in discarded:
+            r = e.get("result", {}) or {}
+            L.append("- `%s` DISCARDED — %s" % (e.get("id", "?"), r.get("reason", "")))
+    L.append("")
+    L.append("---")
+    L.append("")
+    L.append("_No changes pushed. The agent never pushes or merges — a human reviews and "
+             "applies suggestions. Re-run on demand with_ `/dream` _or schedule overnight "
+             "with_ `/schedule \"/dream\" --cron \"0 3 * * *\"`.")
+    L.append("")
+    return "\n".join(L)
+
+
+def cmd_where(args):
+    print(_report_path(args.repo, args.date or _today(), args.out))
+    return 0
+
+
+def build_parser():
+    ap = argparse.ArgumentParser(
+        prog="heimdall-dream",
+        description="Overnight autoresearch + maintainer sweep -> a morning report "
+                    "(dream journal). Shadow-first; agent-never-pushes.")
+    ap.add_argument("--repo", default=".", help="repo root (default: cwd)")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    r = sub.add_parser("run", help="run the overnight loop and write the morning report")
+    r.add_argument("--date", default=None, help="report date (default: today UTC)")
+    r.add_argument("--min-samples", type=int, default=3)
+    r.add_argument("--min-delta", type=float, default=0.10)
+    r.add_argument("--out", default=None, help="override report path")
+    r.add_argument("--mode", default="on-demand", choices=["overnight", "on-demand"])
+    r.add_argument("--overnight", dest="mode", action="store_const", const="overnight",
+                   help="alias for --mode overnight (used when a schedule fires /dream)")
+    r.add_argument("--start-experiment", action="store_true",
+                   help="also START one bounded, reversible experiment (default: surface only)")
+    r.add_argument("--json", action="store_true", help="print the machine summary")
+    r.set_defaults(fn=cmd_run)
+
+    w = sub.add_parser("where", help="print the report path for a date")
+    w.add_argument("--date", default=None)
+    w.add_argument("--out", default=None)
+    w.set_defaults(fn=cmd_where)
+
+    return ap
+
+
+def main(argv):
+    ap = build_parser()
+    args = ap.parse_args(argv)
+    args.repo = os.path.abspath(args.repo)
+    if not os.path.isdir(args.repo):
+        _die("repo not a directory: %s" % args.repo, 2)
+    return args.fn(args)
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main(sys.argv[1:]))
+    except BrokenPipeError:
+        raise SystemExit(0)

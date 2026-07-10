@@ -22,6 +22,9 @@ parts (aggregation, hypothesis generation, override apply/rollback, experiment l
   completed cycles (default 10 — matching the "after every 10 completed tasks" cadence in
   `agents/heimdall.md` → *Pattern Learning (SONA-inspired)*). One experiment per invocation.
 - **On demand:** the user runs `/hmd:self-improve` or asks Heimdall to improve/tune itself.
+- **Overnight (`/dream`):** the `/dream` command wraps this loop for an off-hours run and
+  leaves a morning report (`.planning/dream/YYYY-MM-DD.md`) — see `commands/dream.md`. It
+  reuses this exact keep-gate (surface-first; only measured, reversible wins persist).
 
 Do NOT run it mid-fix. It is a deliberate *step back* between batches of work, exactly like
 autoresearch's overnight step-back between training runs.
