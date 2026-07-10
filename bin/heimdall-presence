@@ -154,8 +154,12 @@ except Exception:
 PYEOF
 }
 
-[ -n "$PY" ] || { [ "$SUB" = "roster" ] && emit_empty_roster || beat_noop; }
-[ -f "$LIB/cp_auth.py" ] || { [ "$SUB" = "roster" ] && emit_empty_roster || beat_noop; }
+# The activity verbs bump/read a LOCAL mtime stamp (bash + stat only, no python, no wire), so
+# they must NOT be swallowed by the no-python / no-crypto degrade the wire verbs need.
+if [ "$SUB" != "activity" ] && [ "$SUB" != "activity-ts" ]; then
+  [ -n "$PY" ] || { [ "$SUB" = "roster" ] && emit_empty_roster || beat_noop; }
+  [ -f "$LIB/cp_auth.py" ] || { [ "$SUB" = "roster" ] && emit_empty_roster || beat_noop; }
+fi
 
 # ── local config (${HOME}/.heimdall/cp-endpoint.json) — the shipped CP endpoint ──
 # Zero-config: the install ships {url, enroll_token} here so a dev exports NOTHING. Parsed
@@ -212,6 +216,39 @@ _write_pres_state() {   # atomic write of presence.json (gitignored; non-secret)
   mkdir -p "$PRES_STATE_DIR" 2>/dev/null || true
   local tmp="$PRES_STATE_FILE.tmp.$$"
   printf '%s\n' "$1" > "$tmp" 2>/dev/null && mv -f "$tmp" "$PRES_STATE_FILE" 2>/dev/null
+}
+
+# ── ACTIVITY STAMP (the wall-state ACTIVE/IDLE signal) ─────────────────────────────
+# A local mtime stamp under the per-repo state dir marks the LAST time this dev did REAL WORK
+# (an edit, or an active gate verdict). `beat` sends its mtime as the body's `activity_ts`, so
+# the server DERIVES ACTIVE (activity fresh) vs IDLE (activity stale/absent) — an idle beater
+# stays on the wall, demoted not dropped. It is CLIENT-OWNED and LOCAL: a pure mtime, no network,
+# no secret, scoped to THIS repo/dev. TWO bump paths (the plan's "edit hook + verdict"):
+#   • the edit hook (PostToolUse) shells `heimdall-presence activity` after a write, and
+#   • an ACTIVE-verdict beat (working/pass/deny/scanning, NOT watching/idle) bumps it inline.
+# A bare keeper/daemon beat (no verdict) does NOT bump — it only READS the stamp forward, so a
+# dev who stopped working decays ACTIVE -> IDLE across the activity window, then OFFLINE when the
+# beats stop. HMD_ACTIVITY_STAMP overrides the path (tests); HMD_ACTIVITY_TS overrides the value.
+_activity_stamp_path() { printf '%s' "${HMD_ACTIVITY_STAMP:-$PRES_STATE_DIR/.activity-stamp}"; }
+_bump_activity_stamp() {
+  local st; st="$(_activity_stamp_path)"
+  mkdir -p "$(dirname "$st")" 2>/dev/null || true
+  : > "$st" 2>/dev/null || true
+}
+# epoch-seconds mtime of $1 (macOS `stat -f %m` / GNU `stat -c %Y`); empty if absent.
+_stamp_mtime() { [ -f "$1" ] || return 0; stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || true; }
+# The activity_ts the NEXT beat will send: HMD_ACTIVITY_TS override > now (bumping the stamp)
+# when this beat carries an ACTIVE verdict > the existing stamp mtime (carried forward by a bare
+# keeper/daemon beat) > empty (no known activity -> the server derives IDLE). Printed by the
+# `activity-ts` verb (a debug/test seam) and consumed inline by the `beat` case.
+_resolve_activity_ts() {
+  if [ -n "${HMD_ACTIVITY_TS:-}" ]; then printf '%s' "$HMD_ACTIVITY_TS"; return; fi
+  case "$VERDICT" in
+    ""|watching|idle|IDLE|Watching|WATCHING) : ;;   # empty / idle sentinel -> not an active signal
+    *) _bump_activity_stamp ;;                        # real work this beat -> bump the stamp to now
+  esac
+  local mt; mt="$(_stamp_mtime "$(_activity_stamp_path)")"
+  [ -n "$mt" ] && printf '%s' "$mt"
 }
 
 # OFF = ZERO beats. A `beat` (from the statusline fork, a cron, or a hook) is a stat-only
@@ -393,6 +430,7 @@ run_client() {
   PRES_ENROLL_STAMP="$ENROLL_STAMP" PRES_THROTTLE="${HMD_ENROLL_THROTTLE:-180}" \
   PRES_PROJECT="$PROJECT" PRES_HANDLE="$HANDLE" PRES_VERDICT="$VERDICT" \
   PRES_FILE="$FILE" PRES_VERB="$1" PRES_JSON="$JSON" PRES_TEAM_SECRET="$TEAM_SECRET" \
+  PRES_ACTIVITY_TS="${ACTIVITY_TS:-}" \
   PRES_STRICT="$STRICT" PRES_INTERACTIVE="$INTERACTIVE" \
   PRES_CRYPTO_WARN_STAMP="$CRYPTO_WARN_STAMP" \
   "$PY" - <<'PYEOF'
@@ -663,11 +701,20 @@ def main():
         # replay-nonce gate can prove this is a LIVE, first-use beat — a captured beat cannot
         # be replayed (the nonce is single-use within the freshness window). Unforgeable
         # because signed; only replayable, which the gate catches.
+        # activity_ts (OPTIONAL): epoch seconds of last real work, from the client activity
+        # stamp. The server derives ACTIVE (fresh) vs IDLE (stale/absent) from it. A bare
+        # keeper/daemon beat carries the stamp's older mtime (or null) -> the dev reads IDLE.
+        _act_raw = os.environ.get("PRES_ACTIVITY_TS") or ""
+        try:
+            activity_ts = float(_act_raw) if _act_raw else None
+        except ValueError:
+            activity_ts = None
         body = json.dumps({
             "project": os.environ.get("PRES_PROJECT") or "",
             "handle": os.environ.get("PRES_HANDLE") or None,
             "verdict": os.environ.get("PRES_VERDICT") or None,
             "file": os.environ.get("PRES_FILE") or None,
+            "activity_ts": activity_ts,
             "nonce": secrets.token_hex(16),
             "ts": int(time.time()),
         }).encode()
@@ -870,7 +917,18 @@ case "$SUB" in
     # Effectively-on here (the OFF guard above already no-op'd an off beat). Honor the
     # --no-files sub-toggle: withhold the file field so the beat body sends file:null.
     _repo_nofiles && FILE=""
+    # Resolve the wall-state activity signal: an ACTIVE-verdict beat bumps the stamp to now, a
+    # bare keeper/daemon beat carries the stamp mtime forward, absent -> null (server -> IDLE).
+    ACTIVITY_TS="$(_resolve_activity_ts)"
     run_client beat ;;
+  activity)
+    # BUMP the activity stamp to now — the edit hook's entry point ("real work happened").
+    # Local, consent-independent (a pure mtime, no beat, no network); the NEXT beat reads it.
+    _bump_activity_stamp ;;
+  activity-ts)
+    # Print the activity_ts the next beat WOULD send (HMD_ACTIVITY_TS > active-verdict-now >
+    # stamp mtime > empty). A debug + test seam; honors HMD_VERDICT exactly as `beat` does.
+    _resolve_activity_ts; printf '\n' ;;
   keeper-start) _keeper_start ;;
   keeper-stop)  _keeper_stop ;;
   keeper-loop)  # INTERNAL: run one keeper loop in-process. Used by keeper-start's detached
@@ -1001,5 +1059,5 @@ dev exports NOTHING. Overrides still win:
 Offline/unconfigured degrades cleanly (empty roster, no-op beat, exit 0).
 USAGE
     ;;
-  *) echo "heimdall-presence: unknown subcommand '$SUB' (try: beat | roster | on | off | status | retire | doctor | keeper-start | keeper-stop)" >&2; exit 2 ;;
+  *) echo "heimdall-presence: unknown subcommand '$SUB' (try: beat | roster | on | off | status | retire | activity | doctor | keeper-start | keeper-stop)" >&2; exit 2 ;;
 esac

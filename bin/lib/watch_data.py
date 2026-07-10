@@ -64,6 +64,12 @@ VERDICT_SYM = {
     "PASS": "✓", "DENY": "✗", "RUNNING": "▶", "IDLE": "·",
 }
 
+# Wall STATE -> badge. The server derives a per-dev "active"/"idle" state on every roster view
+# (cp_presence.roster); the wall renders them DISTINCTLY so a glance separates "working now"
+# (● active) from "here but idle" (○ idle). This is the presence badge — orthogonal to the
+# verdict glyph (a teammate can be idle with a PASS verdict, or active while RUNNING).
+STATE_SYM = {"active": "●", "idle": "○"}
+
 
 # ── path resolution (all local) ──────────────────────────────────────────────
 def resolve_root(env=None):
@@ -356,9 +362,24 @@ def _seed_of(member):
     return member.get("haid") or member.get("handle") or "?"
 
 
+def member_state(member):
+    """The wall state ("active"/"idle") for a roster row. The server-derived `state` field
+    wins; a LEGACY row without it (an old roster cache / an old server) falls back to a
+    verdict-based guess — the idle/watching sentinels read idle, everything else active — so
+    the wall still renders distinctly against an old cache (backward-compatible)."""
+    s = str(member.get("state") or "").strip().lower()
+    if s in STATE_SYM:
+        return s
+    v = str(member.get("verdict") or "").strip().lower()
+    return "idle" if v in ("watching", "idle") else "active"
+
+
 # ── panes ─────────────────────────────────────────────────────────────────────
 def render_wall(members, caps=None, sig=None):
-    """WALL pane: one line per teammate — sigil glyph + handle + verdict."""
+    """WALL pane: one line per teammate — presence badge + sigil glyph + handle + verdict.
+    The presence badge (● active / ○ idle) renders the server-derived wall state distinctly so
+    a glance separates who is working now from who is here but idle (offline devs are already
+    absent from the roster)."""
     lines = ["WALL"]
     if not members:
         lines.append("  (no teammates online)")
@@ -367,11 +388,12 @@ def render_wall(members, caps=None, sig=None):
         handle = m.get("handle") or m.get("haid") or "?"
         verdict = (m.get("verdict") or "-")
         sym = VERDICT_SYM.get(verdict.upper(), "·")
+        badge = STATE_SYM.get(member_state(m), "●")
         try:
             glyph = sig.glyph(_seed_of(m)) if sig is not None else "◉"
         except Exception:
             glyph = "◉"
-        line = "%s %-8s %s %s" % (glyph, handle[:8], sym, verdict)
+        line = "%s %s %-8s %s %s" % (badge, glyph, handle[:8], sym, verdict)
         lines.append(_emit(caps, line))
     return lines
 
