@@ -1,0 +1,20 @@
+{
+  "kind": "mutant",
+  "name": "content-leak",
+  "defect": "the team lens surfaces a teammate's free-form active_goal PROSE in a candidate field instead of the scrubbed roster handle — dev00's human slot carries 'advance module 7 toward green' (RT-LEAK). A candidate must carry ONLY scrubbed roster fields; the whole-partition diff catches the un-scrubbed value.",
+  "invariant_violated": ["RT-LEAK"],
+  "stream": [
+    {"haid": "haid:dev00.box", "human": "dev00", "branch": "feat/dev00", "phase": "wave-1/build", "progress_pct": 40, "surface": "mod00/file.ts#sym00", "claim_active": true,  "has_checkpoint": true,  "active_goal": "advance module 7 toward green", "team": "mine"},
+    {"haid": "haid:dev01.box", "human": "dev01", "branch": "feat/dev01", "phase": "wave-2/build", "progress_pct": 55, "surface": "mod01/file.ts#sym01", "claim_active": false, "has_checkpoint": true,  "active_goal": "finish the pdf renderer",        "team": "mine"},
+    {"haid": "haid:dev02.box", "human": "dev02", "branch": "feat/dev02", "phase": "wave-3/done",  "progress_pct": 100,"surface": "mod02/file.ts#sym02", "claim_active": false, "has_checkpoint": true,  "active_goal": "done shipping the widget",       "team": "mine"},
+    {"haid": "haid:dev03.box", "human": "dev03", "branch": "feat/dev03", "phase": "wave-1/build", "progress_pct": 30, "surface": "mod03/secret.ts#sym03","claim_active": true,  "has_checkpoint": true,  "active_goal": "other team private work",         "team": "other"},
+    {"haid": "haid:dev04.box", "human": "dev04", "branch": "feat/dev04", "phase": "wave-1/build", "progress_pct": 20, "surface": "mod04/file.ts#sym04", "claim_active": false, "has_checkpoint": false, "active_goal": "abandoned, no checkpoint",        "team": "mine"}
+  ],
+  "corrupted": {
+    "candidates": [
+      ["mod00/file.ts#sym00", "haid:dev00.box", "advance module 7 toward green", "teammate-in-flight", false],
+      ["mod01/file.ts#sym01", "haid:dev01.box", "dev01", "adoptable-dropped", true],
+      ["mod02/file.ts#sym02", "haid:dev02.box", "dev02", "completed", false]
+    ]
+  }
+}

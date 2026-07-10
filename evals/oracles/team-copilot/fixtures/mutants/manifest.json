@@ -1,0 +1,43 @@
+{
+  "domain": "team-copilot",
+  "fixture_kind": "mutants",
+  "purpose": "The REDUM TEAM-LENS arm of the unified team-copilot differential. Each mutant is a self-contained fixture (a teammate work-state `stream` + the `corrupted` team-candidate partition a BUGGY lens would emit, breaking ONE invariant). bin/falsify team-copilot runs the gate against golden (expect PASS — the REAL redum team lens equals the independent reference) then every mutant (expect REJECT — the gate recomputes the CORRECT partition from the stream via the independent reference and diffs it against `corrupted`). Score = mutants rejected / total, conditioned on golden passing; a P0 gate requires 1.0.",
+  "golden": "../golden/differential.json",
+  "mutants": [
+    {
+      "name": "cross-team-read",
+      "file": "cross-team-read",
+      "defect": "a DIFFERENT team's surface leaks into the roster — team isolation broken",
+      "invariant_violated": ["RT-ISO"],
+      "must_turn_red_gate": "differential"
+    },
+    {
+      "name": "content-leak",
+      "file": "content-leak",
+      "defect": "a teammate's active_goal prose leaks into a candidate field instead of the scrubbed handle",
+      "invariant_violated": ["RT-LEAK"],
+      "must_turn_red_gate": "differential"
+    },
+    {
+      "name": "stale-claim-not-reaped",
+      "file": "stale-claim-not-reaped",
+      "defect": "a reaped teammate (checkpoint survives, claim dropped) is shown as in-flight instead of adoptable — recovery broken",
+      "invariant_violated": ["RT-CLASS"],
+      "must_turn_red_gate": "differential"
+    },
+    {
+      "name": "inflight-misclass",
+      "file": "inflight-misclass",
+      "defect": "a teammate actively building is shown as adoptable-dropped — prevention broken",
+      "invariant_violated": ["RT-CLASS"],
+      "must_turn_red_gate": "differential"
+    },
+    {
+      "name": "dropped-teammate",
+      "file": "dropped-teammate",
+      "defect": "a whole teammate row is dropped from the roster — recoverable work silently vanishes",
+      "invariant_violated": ["RT-DROP"],
+      "must_turn_red_gate": "differential"
+    }
+  ]
+}
