@@ -1,0 +1,7 @@
+{
+  "kind": "differential",
+  "seeds": [1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 100, 144, 200, 233, 377],
+  "records": 12,
+  "what": "CORRECT seeded teammate work-state streams. The gate folds each through the REAL redum team lens (over a real on-disk ledger) AND the independent reference (reference.fold), normalizes to the team-candidate roster [surface, haid, human, class, adoptable], and diffs. They MUST be identical on every seed. Each stream exercises all three classes (teammate-in-flight / adoptable-dropped / completed), a cross-team slice that MUST be excluded (RT-ISO), and ghost records that MUST be skipped. A false-RED here means the gate rejects its own golden and is itself broken.",
+  "invariants_exercised": ["RT-ISO", "RT-CLASS", "RT-DROP", "RT-LEAK", "RT-GHOST"]
+}

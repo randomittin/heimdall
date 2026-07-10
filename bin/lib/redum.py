@@ -29,6 +29,8 @@
 
 from __future__ import annotations
 
+import datetime
+import json
 import os
 import re
 import sys
@@ -39,6 +41,20 @@ if _HERE not in sys.path:
 
 import dedup  # noqa: E402 — sibling import after sys.path setup
 import reuse_analyzer as reuse  # noqa: E402
+
+# The TEAM read-model. Redum's team lens (below) does NOT rebuild "what are my teammates
+# working on" — it REUSES the shared-checkpoints engine, the ONE read model the checkpoint
+# store already folds. checkpoint_share owns the git-native ledger resolution
+# (planning_dir/claims_dir/checkpoints_dir — HEIMDALL_PLANNING_DIR or <git-root>/.planning),
+# the per-HAID slug, the scrubbed checkpoint reads, the completed-work test, and the
+# surface-overlap engine. A DIFFERENT team's ledger lives in a DIFFERENT planning dir and is
+# never read — team isolation is the store boundary, inherited verbatim (keystone stays 1.0).
+# Guarded so the SOLO path (team lens off) never gains a new failure mode if the module is
+# absent; the lens degrades to empty rather than raising.
+try:
+    import checkpoint_share as _cp  # noqa: E402 — the shared team read-model
+except Exception:  # noqa: BLE001 — absence must never break the solo redum path
+    _cp = None
 
 # the gate policy floor below which a low-reuse change is flagged. Mirrors the
 # SI-2 risk floor (attestation.REUSE_RISK_FLOOR = 0.30) so Redum's gate and SI-2's
@@ -70,7 +86,8 @@ _INTENT_HINTS = [
 # ── PLAN-TIME FACTORING ───────────────────────────────────────────────────────
 
 
-def factor_for_task(task, repo_files, want_kinds=None, max_per_concept=4):
+def factor_for_task(task, repo_files, want_kinds=None, max_per_concept=4,
+                    team_lens=False, my_haid=None, repo_root=None, now=None):
     """PHASE 1. Given a task description + the current repo files, return the
     reuse candidates the agent SHOULD reuse — so it reuses by design.
 
@@ -79,18 +96,32 @@ def factor_for_task(task, repo_files, want_kinds=None, max_per_concept=4):
     want_kinds: optional kind filter (e.g. only ["rn-selector","mmkv-key"]).
     max_per_concept: cap candidates surfaced per detected concept (anti-over-
                      factoring: factor what is genuinely shared, not everything).
+    team_lens: when True (and my_haid given), ALSO fold in OTHER teammates' live
+               work — their ACTIVE claims + SHARED checkpoints — as reuse/overlap
+               candidates, so "don't reinvent existing CODE" extends to "don't
+               reinvent OR redo what a teammate is BUILDING right now". OFF by
+               default → the returned dict is byte-identical to the solo path (no
+               team keys), so no solo/feature-off behavior changes.
+    my_haid / repo_root / now: team-lens inputs (this HAID's id — excluded from its
+               own reuse advice; the planning-dir root; an epoch/ISO clock for TTL).
 
-    Returns {
+    Returns (solo) {
       "task": task,
       "candidates": [ {name, kind, file, score, reason, concept}, ... ],
       "concepts": [detected concept tags],
       "advice": one-line human guidance,
     }
+    With team_lens ON the dict ALSO carries:
+      "team_candidates": [ {surface, haid, human, branch, source, class, phase,
+                            progress_pct, adoptable, reason}, ... ],
+      "team_advice": one-line team guidance.
 
     The candidates are REAL repo units (indexed via the shared dedup core). A
     concept hint only surfaces a symbol that ACTUALLY EXISTS in the repo — Redum
     never invents a target. This is the anti-luck mechanism: the planner/agent is
-    handed the names to call."""
+    handed the names to call. Team candidates are REAL teammate surfaces already
+    public in the git ledger (claim globs + checkpoint surfaces) — read-only, never
+    written, never blocking."""
     index = dedup.index_repo_units(repo_files)
     by_name = {}
     for u in index:
@@ -158,12 +189,19 @@ def factor_for_task(task, repo_files, want_kinds=None, max_per_concept=4):
 
     candidates.sort(key=lambda c: (-c["score"], c["name"]))
     advice = _factor_advice(candidates)
-    return {
+    result = {
         "task": task,
         "candidates": candidates,
         "concepts": sorted(set(concepts)),
         "advice": advice,
     }
+    # TEAM LENS (opt-in): fold OTHER teammates' in-flight work into the reuse
+    # surfacing. OFF by default so the solo path is byte-identical (no new keys).
+    if team_lens:
+        lens = team_lens_candidates(task, my_haid, repo_root=repo_root, now=now)
+        result["team_candidates"] = lens["team_candidates"]
+        result["team_advice"] = lens["team_advice"]
+    return result
 
 
 def _near_repo_unit(name, index):
@@ -186,11 +224,267 @@ def _factor_advice(candidates):
     return ("reuse existing machinery instead of reimplementing: %s" % names)
 
 
+# ── TEAM READ-MODEL (the code∪work BRIDGE) ─────────────────────────────────────
+#
+# ONE read model — "what are my teammates working on" — powers BOTH:
+#   • duplicate-effort PREVENTION: a surface under a teammate's ACTIVE claim is a
+#     'teammate-in-flight' reuse candidate — coordinate/reuse, do NOT reinvent.
+#   • dropped-work RECOVERY: a surface in a teammate's SHARED checkpoint whose claim
+#     has DROPPED (TTL-reaped / no active claim) and is not complete is an
+#     'adoptable-dropped' candidate — adopt/resume, do NOT redo. This ties the
+#     reap→adopt path of the shared-checkpoints handoff into redum's surfacing.
+#   • a COMPLETED checkpoint surface is 'completed' — reuse the finished work.
+#
+# The read is TEAM-ISOLATION-SAFE by construction: it resolves the ONE planning dir
+# (HEIMDALL_PLANNING_DIR or <git-root>/.planning) via checkpoint_share and reads only
+# that team's ledger. A different team's ledger is a different dir → never read
+# (rr-multitenant-isolation keystone unaffected). It NEVER emits a teammate's free-form
+# prose (active_goal/task_ref) — only already-public surfaces + scrubbed roster fields
+# (haid/human/branch/phase/progress_pct) — so the team lens has ZERO new leak surface.
+
+
+def _parse_iso_epoch(value):
+    """Parse an ISO8601 UTC timestamp (…Z or +00:00) to epoch seconds, or None. Mirrors
+    heimdall-claim's timestamp shape (date -u +%FT%TZ). Tolerant — a bad value → None."""
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    iso = s.replace("Z", "+00:00")
+    try:
+        dt = datetime.datetime.fromisoformat(iso)
+    except ValueError:
+        try:
+            dt = datetime.datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=datetime.timezone.utc)
+        except ValueError:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return dt.timestamp()
+
+
+def _now_epoch(now):
+    """Resolve the comparison clock. now: None → wall-clock UTC now; int/float → epoch
+    as-is; str → parsed from ISO. Injectable so TTL tests are hermetic."""
+    if now is None:
+        return datetime.datetime.now(datetime.timezone.utc).timestamp()
+    if isinstance(now, (int, float)):
+        return float(now)
+    parsed = _parse_iso_epoch(now)
+    return parsed if parsed is not None else \
+        datetime.datetime.now(datetime.timezone.utc).timestamp()
+
+
+def _claim_is_active(rec, now_epoch):
+    """A claim is ACTIVE while now < heartbeat + ttl_minutes (heimdall-claim's rule). A
+    claim with an unparseable heartbeat is treated as EXPIRED (fail-safe: we do not surface
+    stale work as live)."""
+    hb = _parse_iso_epoch(rec.get("heartbeat") or rec.get("claimed_at"))
+    if hb is None:
+        return False
+    try:
+        ttl_min = float(rec.get("ttl_minutes", 90))
+    except (TypeError, ValueError):
+        ttl_min = 90.0
+    return now_epoch < (hb + ttl_min * 60.0)
+
+
+def _read_active_claims(my_haid, repo_root=None, now=None):
+    """Read OTHER HAIDs' ACTIVE claims from the team ledger, keyed by HAID. Read-only,
+    tolerant (a bad file is skipped). Team-isolation-safe: reads ONLY the resolved
+    .planning/ledger/claims dir — a different team's ledger is never touched."""
+    out = {}
+    if _cp is None:
+        return out
+    now_epoch = _now_epoch(now)
+    try:
+        d = _cp.claims_dir(repo_root)
+        names = sorted(n for n in os.listdir(d) if n.endswith(".json"))
+    except OSError:
+        return out
+    for n in names:
+        try:
+            with open(os.path.join(d, n), "r", encoding="utf-8") as fh:
+                rec = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(rec, dict):
+            continue
+        haid = rec.get("haid")
+        if not haid or haid == my_haid:
+            continue
+        if _claim_is_active(rec, now_epoch):
+            out[haid] = rec
+    return out
+
+
+def _task_tokens(task):
+    """Distinctive alnum tokens (len ≥ 3) in the task text, lowercased — the vocabulary a
+    teammate surface must intersect to be RELEVANT to this task."""
+    return {t.lower() for t in re.findall(r"[A-Za-z0-9_]+", task or "") if len(t) >= 3}
+
+
+def _surface_relevant(surface, tokens):
+    """A teammate's claimed surface is RELEVANT to the task when the task names its symbol
+    or a distinctive path segment. Matches on the '#symbol' part and on each path segment /
+    file-stem (glob wildcards stripped). A too-short/globby segment (len < 3) never matches
+    on its own, so a broad 'src/**' claim does not spam every task."""
+    s = str(surface)
+    parts = set()
+    file_part, _, sym = s.partition("#")
+    if sym:
+        parts.add(sym.lower())
+    for seg in re.split(r"[/.]", file_part):
+        seg = seg.replace("*", "").strip()
+        if len(seg) >= 3:
+            parts.add(seg.lower())
+    return bool(parts & tokens)
+
+
+def _cp_completed(rec):
+    """Whether a checkpoint marks completed work — reuse checkpoint_share's rule when
+    available, else a local mirror (progress 100 / a done-ish phase)."""
+    if _cp is not None:
+        return _cp._is_completed(rec)  # noqa: SLF001 — intentional reuse of the shared rule
+    try:
+        pct = int(rec.get("progress_pct", 0))
+    except (TypeError, ValueError):
+        pct = 0
+    if pct >= 100:
+        return True
+    return bool(re.search(r"\b(done|complete|completed|merged|shipped|landed)\b",
+                          str(rec.get("phase") or "").lower()))
+
+
+def team_lens_candidates(task, my_haid, repo_root=None, now=None):
+    """Build the TEAM read-model: OTHER teammates' in-flight surfaces, folded from ACTIVE
+    claims (live work) ∪ SHARED checkpoints (redundant, handoff-ready), matched to the task
+    as reuse/overlap candidates. The code∪work bridge (see section header).
+
+    Returns {"team_candidates": [...sorted...], "team_advice": str}. Read-only, never blocks,
+    never emits teammate prose. A missing read-model (no checkpoint_share / empty ledger) →
+    empty candidates (graceful)."""
+    tokens = _task_tokens(task)
+    active = _read_active_claims(my_haid, repo_root=repo_root, now=now)
+    checkpoints = {}
+    if _cp is not None:
+        try:
+            checkpoints = _cp.all_checkpoints(repo_root) or {}
+        except Exception:  # noqa: BLE001 — a bad store never breaks planning
+            checkpoints = {}
+
+    # the union of OTHER HAIDs that have live claims and/or shared checkpoints.
+    haids = set(active) | {h for h in checkpoints if h and h != my_haid}
+    out = []
+    for haid in sorted(haids):
+        if haid == my_haid:
+            continue
+        claim = active.get(haid)
+        ckpt = checkpoints.get(haid)
+        has_active = claim is not None
+        completed = bool(ckpt) and _cp_completed(ckpt)
+
+        human = None
+        branch = None
+        phase = None
+        pct = None
+        if ckpt:
+            human = ckpt.get("human")
+            branch = ckpt.get("branch")
+            phase = ckpt.get("phase")
+            pct = ckpt.get("progress_pct")
+        if claim and not human:
+            human = claim.get("human")
+
+        # union of the surfaces this teammate is on: their live claim + their checkpoint.
+        surfaces = set()
+        if claim:
+            surfaces |= {str(s) for s in (claim.get("claimed_surfaces") or [])}
+        if ckpt:
+            surfaces |= {str(s) for s in (ckpt.get("claimed_surfaces") or [])}
+
+        for surface in sorted(surfaces):
+            if not _surface_relevant(surface, tokens):
+                continue
+            in_claim = bool(claim) and surface in \
+                {str(s) for s in (claim.get("claimed_surfaces") or [])}
+            in_ckpt = bool(ckpt) and surface in \
+                {str(s) for s in (ckpt.get("claimed_surfaces") or [])}
+
+            if completed:
+                cls = "completed"
+                reason = ("%s already COMPLETED %s (checkpoint %s%%) — reuse the finished "
+                          "work, do not rewrite" % (human or haid, surface, pct))
+            elif has_active:
+                cls = "teammate-in-flight"
+                reason = ("%s is BUILDING %s right now (active claim%s) — coordinate/reuse, "
+                          "do NOT reinvent" % (human or haid, surface,
+                                               " + checkpoint" if in_ckpt else ""))
+            elif in_ckpt:
+                # a checkpoint surface with NO active claim = dropped/reaped work that
+                # SURVIVED in the redundant store → adoptable (the recovery half).
+                cls = "adoptable-dropped"
+                reason = ("%s's claim on %s DROPPED but their checkpoint survives (phase=%s, "
+                          "%s%%) — adopt/resume, do NOT redo" % (human or haid, surface,
+                                                                 phase, pct))
+            else:
+                # an EXPIRED claim with no surviving checkpoint: the work is gone, nothing
+                # to reuse or adopt — do not surface a ghost.
+                continue
+
+            # _cp is guaranteed non-None here: a None read-model yields no active claims and
+            # no checkpoints, so `haids` is empty and this loop never runs.
+            out.append({
+                "surface": surface,
+                "haid": haid,
+                "human": human or _cp.haid_human(haid),
+                "branch": branch,
+                "source": ("claim+checkpoint" if in_claim and in_ckpt
+                           else "claim" if in_claim else "checkpoint"),
+                "class": cls,
+                "phase": phase,
+                "progress_pct": pct,
+                "adoptable": cls == "adoptable-dropped",
+                "reason": reason,
+            })
+
+    out.sort(key=lambda c: (_CLASS_ORDER.get(c["class"], 9), c["haid"], c["surface"]))
+    return {"team_candidates": out, "team_advice": _team_advice(out)}
+
+
+# in-flight (coordinate NOW) ranks above adoptable (recover) above completed (reuse done).
+_CLASS_ORDER = {"teammate-in-flight": 0, "adoptable-dropped": 1, "completed": 2}
+
+
+def _team_advice(team_candidates):
+    if not team_candidates:
+        return ("no teammate is working on this surface right now — no coordination needed "
+                "(the team lens found no active claims or checkpoints to reuse/adopt)")
+    inflight = [c for c in team_candidates if c["class"] == "teammate-in-flight"]
+    adoptable = [c for c in team_candidates if c["class"] == "adoptable-dropped"]
+    parts = []
+    if inflight:
+        who = ", ".join(sorted({"%s:%s" % (c["human"], c["surface"]) for c in inflight}))
+        parts.append("a teammate is BUILDING this now — coordinate/reuse, do NOT reinvent: "
+                     + who)
+    if adoptable:
+        who = ", ".join(sorted({"%s:%s" % (c["human"], c["surface"]) for c in adoptable}))
+        parts.append("dropped teammate work SURVIVES — adopt/resume, do NOT redo: " + who)
+    if not parts:
+        who = ", ".join(sorted({c["surface"] for c in team_candidates}))
+        parts.append("teammate already completed this — reuse the finished work: " + who)
+    return " | ".join(parts)
+
+
 # ── COMMIT-TIME GATE ──────────────────────────────────────────────────────────
 
 
 def gate_attestation(attestation, repo_files=None, changed_files=None,
-                     floor=DEFAULT_REUSE_FLOOR, policy="flag"):
+                     floor=DEFAULT_REUSE_FLOOR, policy="flag",
+                     team_lens=False, my_haid=None, repo_root=None, now=None,
+                     changed_surfaces=None):
     """PHASE 2. Read SI-2's `reuse` field from an attestation record and decide the
     residual-redundancy verdict. Redum does NOT re-measure reuse — it ACTS on the
     metric SI-2 already emitted.
@@ -204,15 +498,29 @@ def gate_attestation(attestation, repo_files=None, changed_files=None,
                  fires on SI-2's suspected_duplicates (the metric stands alone).
     floor: reuse_pct below which a change is flagged (default 0.30, = SI-2 floor).
     policy: "flag" (default; warn, exit non-blocking) or "block" (the gate fails).
+    team_lens: when True (and my_haid given), ALSO emit an INFORMATIONAL team signal
+               when the change touches a surface a teammate holds an ACTIVE claim on.
+               This is WARN-ONLY — a teammate's parallel work is a P3 collision, NOT a
+               same-thing-MADE redum duplicate — so it NEVER escalates the verdict and
+               NEVER blocks (surfacing > blocking, per team-mode law). The LOCAL
+               same-repo residual-duplicate gate below is UNCHANGED: it still hard-blocks
+               (verdict "block" under policy=block). OFF by default → byte-identical to
+               the solo path (no team_signals key).
+    my_haid / repo_root / now: team-lens inputs (this HAID; the planning-dir root; the
+               TTL clock). changed_surfaces: optional explicit list of surfaces the change
+               touches; when omitted it is derived from changed_files' paths.
 
-    Returns {
+    Returns (solo) {
       "verdict": "ok" | "flag" | "block",
       "reuse_pct": float|None,
       "suspected_duplicates": [...],        # echoed from SI-2 (not recomputed)
       "residual": [ {new_unit, duplicates, existing, reason}, ... ],
       "flags": [ {level, code, detail}, ... ],
       "summary": one-line human verdict,
-    }"""
+    }
+    With team_lens ON the dict ALSO carries "team_signals": [ {level:"warn", code:
+    "team-residual-duplicate", haid, human, surface, overlaps, detail}, ... ] and the same
+    entries appear as WARN-level flags — never HIGH, so the verdict is untouched."""
     reuse_field = _reuse_field(attestation)
     pct = reuse_field.get("reuse_pct")
     suspected = reuse_field.get("suspected_duplicates") or []
@@ -265,14 +573,17 @@ def gate_attestation(attestation, repo_files=None, changed_files=None,
                       "reinvents existing repo code" % (pct, floor),
         })
 
-    # verdict: any high flag → flag (or block under block policy); else ok.
+    # verdict: any high flag → flag (or block under block policy); else ok. Computed over
+    # the LOCAL flags ONLY — the team lens (below) NEVER contributes a high flag, so it can
+    # never change this verdict. This is the WARN-vs-BLOCK boundary: local same-repo
+    # duplication hard-blocks; a teammate's parallel work only warns.
     has_high = any(f["level"] == "high" for f in flags)
     if not has_high:
         verdict = "ok"
     else:
         verdict = "block" if policy == "block" else "flag"
 
-    return {
+    result = {
         "verdict": verdict,
         "reuse_pct": pct,
         "suspected_duplicates": suspected,
@@ -280,6 +591,16 @@ def gate_attestation(attestation, repo_files=None, changed_files=None,
         "flags": flags,
         "summary": _gate_summary(verdict, pct, residual, floor),
     }
+
+    # TEAM LENS (opt-in, WARN-ONLY): a teammate's active claim overlapping this change is a
+    # coordination signal, never a hard duplicate. Emitted AFTER the verdict is fixed so it
+    # provably cannot block. OFF by default → no team_signals key (solo path byte-identical).
+    if team_lens:
+        signals = _team_gate_signals(my_haid, changed_files, changed_surfaces,
+                                     repo_root=repo_root, now=now)
+        result["team_signals"] = signals
+        flags.extend(signals)  # visible in the flags list, but WARN so verdict is untouched
+    return result
 
 
 def _reuse_field(attestation):
@@ -368,3 +689,53 @@ def _gate_summary(verdict, pct, residual, floor):
     return ("redum gate: %s — reuse=%s, %d residual duplicate%s "
             "(floor=%.0f%%)" % (verdict.upper(), pct_s, n,
                                 "" if n == 1 else "s", floor * 100))
+
+
+def _change_surfaces(changed_files, changed_surfaces):
+    """The surfaces this change touches. Explicit `changed_surfaces` wins; else derive them
+    from the changed-file PATHS (a file-level surface is enough to detect a teammate overlap
+    via the shared file-prefix overlap engine)."""
+    if changed_surfaces:
+        return [str(s) for s in changed_surfaces]
+    if not changed_files:
+        return []
+    return sorted({str(p) for p in changed_files})
+
+
+def _team_gate_signals(my_haid, changed_files, changed_surfaces, repo_root=None, now=None):
+    """WARN-ONLY team residual signals: for each surface this change touches, if a DIFFERENT
+    teammate holds an ACTIVE claim over an overlapping surface, emit a warn signal naming the
+    teammate. Reuses checkpoint_share's surface-overlap engine (the SAME rule the claim ledger
+    uses) — never a new collision rule. Read-only, team-isolation-safe, and by construction
+    level 'warn' so it can never block a commit."""
+    signals = []
+    if _cp is None:
+        return signals
+    surfaces = _change_surfaces(changed_files, changed_surfaces)
+    if not surfaces:
+        return signals
+    active = _read_active_claims(my_haid, repo_root=repo_root, now=now)
+    seen = set()
+    for haid, claim in sorted(active.items()):
+        held = [str(s) for s in (claim.get("claimed_surfaces") or [])]
+        for req in surfaces:
+            for h in held:
+                if not _cp._surfaces_overlap(req, h):  # noqa: SLF001 — intentional reuse
+                    continue
+                key = (haid, req, h)
+                if key in seen:
+                    continue
+                seen.add(key)
+                human = claim.get("human") or _cp.haid_human(haid)
+                signals.append({
+                    "level": "warn",
+                    "code": "team-residual-duplicate",
+                    "haid": haid,
+                    "human": human,
+                    "surface": req,
+                    "overlaps": h,
+                    "detail": ("%s holds an ACTIVE claim on %s overlapping this change's %s — "
+                               "coordinate/reuse, do NOT reinvent (WARN only, not a block)"
+                               % (human, h, req)),
+                })
+    return signals
