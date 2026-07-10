@@ -93,7 +93,7 @@ rm -rf "$P"
 
 # ─────────────────────────────────────────────────────────────────────────────
 echo "D. WIRED — the ACTUAL SessionEnd hook command auto-writes CHECKPOINT.md:"
-CMD="$(jq -r '.hooks.SessionEnd[0].hooks[0].command' "$HOOKS" 2>/dev/null)"
+CMD="$(jq -r '[.hooks.SessionEnd[].hooks[].command | select(test("heimdall-checkpoint"))][0]' "$HOOKS" 2>/dev/null)"
 [ -n "$CMD" ] && [ "$CMD" != "null" ] && ok "extracted SessionEnd hook command from hooks.json" || bad "could not read SessionEnd command"
 P="$(make_project)"
 ( cd "$P" && CLAUDE_PLUGIN_ROOT="$REPO" PATH="$REPO/bin:$PATH" bash -c "$CMD" ) >/dev/null 2>&1
