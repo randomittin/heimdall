@@ -1,0 +1,502 @@
+#!/usr/bin/env bash
+# heimdall-doctor-install — the MANDATORY post-install VALIDATION GATE.
+#
+# WHY THIS EXISTS. A fresh install used to hand the dev straight into an interactive
+# Claude Code session while parts were SILENTLY broken — crypto backend missing,
+# presence dead, statusline blank, claude-mem misconfigured. Hours were lost chasing
+# breakages a first-run check should have caught. This harness exercises EVERY part
+# of the install AFTER it lands (and after claude-mem setup), reports a per-check
+# ✓/⚠/✗ with an actionable fix on every failure, and — critically — gates the
+# "ready" hand-off: install.sh withholds the go-ahead and NEVER drops into an
+# interactive session while a critical check is red.
+#
+# EXIT CODE is the gate: 0 = all systems go (no ✗); 1 = at least one ✗ (NOT READY).
+# A ⚠ (degraded — e.g. control-plane offline, python absent) is NON-gating: it is
+# reported loudly but does not fail the gate, so an offline/CI install still passes.
+#
+# CHECKS (each real + runnable, ordered by how badly a failure silently bites):
+#   1. crypto      Ed25519 backend importable in the EXACT interpreter presence uses.
+#   2. presence    a real beat lands and the caller appears in their own roster.
+#   3. statusline  the watchman HUD is registered in the user's Claude settings.
+#   4. gates       hooks.json parses and every enforced gate is wired (N/N).
+#   5. claude-mem  the memory plugin is registered + enabled per hmd's expectations.
+#   6. hooks       SessionStart/SessionEnd keeper + statusline entries present + valid.
+#   7. path        hmd/heimdall on PATH resolves to THIS install (no stale shadow).
+#   8. runtime     (--cc-verify only) the FIRST cc/claude run — HEADLESS, in the
+#                  BACKGROUND, BOUNDED — completes so SessionStart wiring fires.
+#
+# USAGE:
+#   heimdall-doctor-install [--cc-verify] [--plugin-dir DIR] [--timeout SECS]
+#                           [--quiet] [--json]
+#
+# OVERRIDES / TEST SEAMS:
+#   HMD_DOCTOR_PLUGIN_DIR   plugin tree to validate (default: parent of this bin's dir).
+#   CLAUDE_CONFIG_DIR       Claude settings dir (default: $HOME/.claude).
+#   HMD_DOCTOR_CC_TIMEOUT   bound (secs) for the headless first-run (default: 45).
+#   HEIMDALL_SKIP_CC_VERIFY  set → skip the runtime check even under --cc-verify.
+#   HMD_DOCTOR_CLAUDE       override the `claude` binary the runtime check invokes.
+#
+# SAFETY: read-mostly. The only writes are a presence beat (into $HOME/.heimdall)
+# and the bounded headless cc run — never a repo file. set -uo pipefail; no set -x;
+# never echoes a secret. Missing python3/jq degrades to ⚠, never a crash.
+set -uo pipefail
+
+SELF="$0"
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# ── Args ──────────────────────────────────────────────────────────────────────
+CC_VERIFY=0 QUIET=0 JSON=0
+PLUGIN_DIR="${HMD_DOCTOR_PLUGIN_DIR:-}"
+CC_TIMEOUT="${HMD_DOCTOR_CC_TIMEOUT:-45}"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --cc-verify) CC_VERIFY=1 ;;
+    --plugin-dir) PLUGIN_DIR="${2:?--plugin-dir needs a value}"; shift ;;
+    --timeout)    CC_TIMEOUT="${2:?--timeout needs a value}"; shift ;;
+    --quiet)      QUIET=1 ;;
+    --json)       JSON=1 ;;
+    -h|--help)    sed -n '2,40p' "$SELF" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "heimdall-doctor-install: unknown arg: $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+# Default plugin dir: the tree this bin lives in (…/heimdall/bin/… → …/heimdall).
+[ -n "$PLUGIN_DIR" ] || PLUGIN_DIR="$(cd "$SELF_DIR/.." && pwd)"
+
+CFG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+SETTINGS="$CFG_DIR/settings.json"
+HOOKS_JSON="$PLUGIN_DIR/hooks/hooks.json"
+BIN_DIR="$PLUGIN_DIR/bin"
+PY="$(command -v python3 || command -v python || true)"
+
+# ── Colors (TTY only) ───────────────────────────────────────────────────────
+if [ -t 1 ] && [ "${TERM:-dumb}" != "dumb" ] && [ -z "${NO_COLOR:-}" ] && [ -z "${HEIMDALL_NO_COLOR:-}" ]; then
+  C_RESET=$'\033[0m'; C_GREEN=$'\033[32m'; C_RED=$'\033[31m'; C_GOLD=$'\033[33m'
+  C_DIM=$'\033[2m'; C_BOLD=$'\033[1m'; C_CYAN=$'\033[36m'
+else
+  C_RESET=""; C_GREEN=""; C_RED=""; C_GOLD=""; C_DIM=""; C_BOLD=""; C_CYAN=""
+fi
+
+# ── Result accumulation ───────────────────────────────────────────────────────
+NP=0 NW=0 NF=0                # counts: pass / warn / fail
+RESULT_LINES=()               # for the --json report
+# record NAME STATUS(pass|warn|fail) MESSAGE [FIX]
+record() {
+  local name="$1" status="$2" msg="$3" fix="${4:-}"
+  local glyph color
+  case "$status" in
+    pass) glyph="✓"; color="$C_GREEN"; NP=$((NP+1)) ;;
+    warn) glyph="⚠"; color="$C_GOLD";  NW=$((NW+1)) ;;
+    fail) glyph="✗"; color="$C_RED";   NF=$((NF+1)) ;;
+  esac
+  if [ "$QUIET" -eq 0 ] && [ "$JSON" -eq 0 ]; then
+    printf '   %s%s%s %s%-11s%s %s\n' "$color" "$glyph" "$C_RESET" "$C_BOLD" "$name" "$C_RESET" "$msg"
+    if [ "$status" != "pass" ] && [ -n "$fix" ]; then
+      printf '        %sfix:%s %s\n' "$C_DIM" "$C_RESET" "$fix"
+    fi
+  fi
+  # JSON row (values are scrubbed of quotes/newlines — never a secret here anyway).
+  local jm jf jn
+  jn="$(printf '%s' "$name"   | tr -d '"\n')"
+  jm="$(printf '%s' "$msg"    | tr -d '"\n')"
+  jf="$(printf '%s' "$fix"    | tr -d '"\n')"
+  RESULT_LINES+=("{\"check\":\"$jn\",\"status\":\"$status\",\"message\":\"$jm\",\"fix\":\"$jf\"}")
+}
+
+# Bounded background run (portable — this host has no `timeout`). Mirrors the
+# run_capped pattern used across the install test suites. Returns the child's exit
+# code, or 124 if it had to be killed at the deadline.
+run_capped() { # $1=secs  $2=outfile  rest=cmd…
+  local secs="$1" out="$2"; shift 2
+  "$@" >"$out" 2>&1 &
+  local pid=$! i=0
+  while kill -0 "$pid" 2>/dev/null; do
+    sleep 1; i=$((i+1))
+    if [ "$i" -ge "$secs" ]; then
+      kill -9 "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; return 124
+    fi
+  done
+  wait "$pid"; return $?
+}
+
+# Resolve a plugin tree's version the same way install.sh/bin/heimdall do: nearest
+# git tag (normalised to X.Y.Z), else the plugin manifest version, else "?".
+resolved_version() {
+  local dir="$1" ver=""
+  if git -C "$dir" rev-parse --git-dir >/dev/null 2>&1; then
+    ver="$(git -C "$dir" describe --tags --abbrev=0 2>/dev/null || true)"
+    [ -n "$ver" ] && ver="$(printf '%s' "$ver" | sed -E 's/^v?([0-9]+\.[0-9]+\.[0-9]+).*/\1/')"
+  fi
+  if [ -z "$ver" ] && [ -f "$dir/.claude-plugin/plugin.json" ] && command -v jq >/dev/null 2>&1; then
+    ver="$(jq -r '.version // empty' "$dir/.claude-plugin/plugin.json" 2>/dev/null || true)"
+  fi
+  [ -n "$ver" ] && printf '%s' "$ver" || printf '?'
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CHECK 1 — Ed25519 crypto backend importable in the EXACT presence interpreter.
+# Mirrors cp_auth.py's backend order (cryptography.hazmat…ed25519, then nacl.signing)
+# so this agrees byte-for-byte with what a beat will decide. THIS is the invisible-
+# teammate outage: a missing backend → unsigned beats dropped → SILENTLY invisible.
+# ══════════════════════════════════════════════════════════════════════════════
+check_crypto() {
+  local fix
+  fix="${PY:-python3} -m pip install --user cryptography  (add --break-system-packages on an externally-managed python)"
+  if [ -z "$PY" ]; then
+    record "crypto" fail "no python interpreter on PATH — presence cannot sign beats" \
+      "install python3, then: python3 -m pip install --user cryptography"
+    return
+  fi
+  if "$PY" - <<'PY' >/dev/null 2>&1
+import sys
+try:
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey  # noqa: F401
+except Exception:
+    try:
+        import nacl.signing  # noqa: F401
+    except Exception:
+        sys.exit(1)
+sys.exit(0)
+PY
+  then
+    record "crypto" pass "Ed25519 backend importable ($PY)"
+  else
+    record "crypto" fail "Ed25519 backend NOT importable in $PY — beats will be unsigned + teammates never see you" "$fix"
+  fi
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CHECK 2 — presence roundtrip: a real beat lands and the caller shows in their own
+# roster. Reuses the presence doctor if it landed; else a bounded beat+roster
+# roundtrip. Distinguishes the local-fatal cases (crypto/interpreter → ✗) from the
+# environmental ones (control-plane offline / no team yet / 409 → ⚠, non-gating).
+# ══════════════════════════════════════════════════════════════════════════════
+check_presence() {
+  local pres="$BIN_DIR/heimdall-presence"
+  local doctor="$BIN_DIR/heimdall-presence-doctor"
+  if [ ! -x "$pres" ]; then
+    record "presence" fail "heimdall-presence missing at $pres — the install is incomplete" \
+      "re-run the installer to restore the plugin tree"
+    return
+  fi
+  # A missing crypto backend makes presence structurally impossible — surface it as
+  # the same fatal signal here (defence in depth with check 1).
+  if [ -z "$PY" ] || ! "$PY" - <<'PY' >/dev/null 2>&1
+try:
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey  # noqa: F401
+except Exception:
+    import nacl.signing  # noqa: F401
+PY
+  then
+    record "presence" fail "presence cannot sign beats — Ed25519 backend missing (you would be invisible)" \
+      "${PY:-python3} -m pip install --user cryptography"
+    return
+  fi
+  local tmp; tmp="$(mktemp 2>/dev/null || echo /tmp/hmd-doctor-pres.$$)"
+  local rc
+  # Prefer the dedicated doctor if the doctor agent has landed it.
+  if [ -x "$doctor" ]; then
+    run_capped 15 "$tmp" "$doctor"; rc=$?
+    if [ "$rc" -eq 0 ]; then
+      record "presence" pass "presence doctor: enroll+beat healthy, you appear in your roster"
+    elif [ "$rc" -eq 124 ]; then
+      record "presence" warn "presence doctor timed out (control-plane slow/offline) — non-fatal" \
+        "check network/HEIMDALL_CP_URL; run: heimdall-presence status"
+    else
+      record "presence" fail "presence doctor reported a breakage (see: heimdall-presence-doctor)" \
+        "run: heimdall-presence-doctor   # prints the exact enroll/beat failure"
+    fi
+    rm -f "$tmp" 2>/dev/null || true
+    return
+  fi
+  # No doctor: beat + roster roundtrip. A beat is fire-and-forget (never fails hard);
+  # then read the caller's OWN roster and look for their HAID.
+  local haid; haid="$("$BIN_DIR/heimdall-haid" current 2>/dev/null || "$BIN_DIR/heimdall-identity" 2>/dev/null || true)"
+  run_capped 12 "$tmp" "$pres" beat; rc=$?
+  local beat_out; beat_out="$(cat "$tmp" 2>/dev/null || true)"
+  local roster; run_capped 12 "$tmp" "$pres" roster --json; roster="$(cat "$tmp" 2>/dev/null || true)"
+  rm -f "$tmp" 2>/dev/null || true
+  if [ -n "$haid" ] && printf '%s' "$roster" | grep -qF "$haid"; then
+    record "presence" pass "beat landed — you appear in your own roster ($haid)"
+  elif printf '%s' "$beat_out" | grep -qiE '409|conflict'; then
+    record "presence" warn "presence beat hit a 409 (identity already enrolled elsewhere) — non-fatal" \
+      "run: heimdall-presence status   # confirms signing backend + enrollment"
+  else
+    # Beat sent but roster round-trip unverified — almost always an offline/no-team
+    # control plane, not a local break (crypto is already proven above). Non-gating.
+    record "presence" warn "beat sent but roster round-trip unverified (control-plane offline or no team yet)" \
+      "check network/HEIMDALL_CP_URL; run: heimdall-presence status"
+  fi
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CHECK 3 — statusline registered in the USER's Claude settings.json + renders.
+# Claude Code reads statusLine ONLY from the user settings (never a plugin's own), so
+# a missing entry is the "blank enter-box" bug. Absent → ✗; a user's own custom line
+# → ⚠ (kept, non-gating); ours pointing at an executable render script → ✓.
+# ══════════════════════════════════════════════════════════════════════════════
+check_statusline() {
+  local fix="run: $BIN_DIR/heimdall-statusline-register register"
+  if [ ! -f "$SETTINGS" ]; then
+    record "statusline" fail "no statusLine in $SETTINGS — the watchman HUD is unregistered (blank enter-box)" "$fix"
+    return
+  fi
+  local cmd=""
+  if command -v jq >/dev/null 2>&1; then
+    cmd="$(jq -r '.statusLine.command // ""' "$SETTINGS" 2>/dev/null || true)"
+  elif [ -n "$PY" ]; then
+    cmd="$(HMD_S="$SETTINGS" "$PY" -c 'import json,os;d=json.load(open(os.environ["HMD_S"]));print((d.get("statusLine") or {}).get("command",""))' 2>/dev/null || true)"
+  fi
+  if [ -z "$cmd" ]; then
+    record "statusline" fail "no statusLine registered in $SETTINGS (blank enter-box for this dev)" "$fix"
+    return
+  fi
+  case "$cmd" in
+    *statusline.sh*)
+      # Ours. Confirm the referenced render script is present + executable.
+      local script; script="$(printf '%s' "$cmd" | grep -oE '/[^" ]*statusline\.sh' | head -1)"
+      if [ -n "$script" ] && [ -x "$script" ]; then
+        record "statusline" pass "watchman HUD registered → $script"
+      else
+        record "statusline" fail "statusLine points at a missing/non-executable render script: $script" \
+          "$fix   # re-resolves the absolute render path for this machine"
+      fi
+      ;;
+    *)
+      record "statusline" warn "a custom (non-heimdall) statusLine is set — left untouched" \
+        "to use the watchman HUD instead: $BIN_DIR/heimdall-statusline-register register"
+      ;;
+  esac
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CHECK 4 — gates wired: hooks.json parses and every enforced gate command is present.
+# N is the RUNTIME count (never hardcoded — a fixed number is a stale-doc bug the
+# first time a gate is added/removed), matching install.sh's gate_count exactly.
+# ══════════════════════════════════════════════════════════════════════════════
+check_gates() {
+  if [ ! -f "$HOOKS_JSON" ]; then
+    record "gates" fail "hooks.json missing at $HOOKS_JSON — no gates are wired" \
+      "re-run the installer to restore the plugin tree"
+    return
+  fi
+  if ! command -v jq >/dev/null 2>&1; then
+    record "gates" warn "jq not installed — cannot count wired gates" "install jq to enable gate verification"
+    return
+  fi
+  if ! jq -e . "$HOOKS_JSON" >/dev/null 2>&1; then
+    record "gates" fail "hooks.json is not valid JSON — the gate wiring is corrupt" \
+      "restore hooks/hooks.json from a clean checkout, then re-run the installer"
+    return
+  fi
+  local n; n="$(jq '[.. | objects | select(has("command"))] | length' "$HOOKS_JSON" 2>/dev/null || echo 0)"
+  if [ -n "$n" ] && [ "$n" -gt 0 ] 2>/dev/null; then
+    record "gates" pass "$n/$n gate hooks wired + hooks.json valid"
+  else
+    record "gates" fail "hooks.json parses but wires ZERO gate commands" \
+      "restore hooks/hooks.json from a clean checkout"
+  fi
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CHECK 5 — claude-mem configured + operational, PER HMD's expectations.
+# hmd drives claude-mem through the Claude Code PLUGIN (claude-mem@thedotmack from
+# the thedotmack marketplace) — that is what provides the /mem-search skill and the
+# SessionStart memory-injection hooks hmd relies on. Tiers:
+#   PASS  — plugin enabled in settings OR listed by `claude plugins list`.
+#   FAIL  — evidence of a setup ATTEMPT (marketplace known or a plugin cache) but the
+#           plugin is NOT enabled → genuinely MISCONFIGURED (the falsifier target).
+#   WARN  — no trace at all → simply not set up (offline/CI/stub) — non-gating, since
+#           claude-mem is an optional companion Heimdall works without.
+# ══════════════════════════════════════════════════════════════════════════════
+check_claude_mem() {
+  local mkt_repo="thedotmack/claude-mem" mkt_name="thedotmack" plugin_id="claude-mem@thedotmack"
+  local fix="claude plugins marketplace add $mkt_repo && claude plugins install $plugin_id"
+  local enabled="" mkt_known="" cache="" listed=""
+
+  if command -v jq >/dev/null 2>&1 && [ -f "$SETTINGS" ]; then
+    enabled="$(jq -r --arg k "$plugin_id" '.enabledPlugins[$k] // empty' "$SETTINGS" 2>/dev/null || true)"
+    mkt_known="$(jq -r --arg m "$mkt_name" 'if (.extraKnownMarketplaces // {}) | has($m) then "y" else "" end' "$SETTINGS" 2>/dev/null || true)"
+  fi
+  # Marketplace registry (written by `claude plugins marketplace add`).
+  if [ -z "$mkt_known" ] && command -v jq >/dev/null 2>&1 && [ -f "$CFG_DIR/plugins/known_marketplaces.json" ]; then
+    mkt_known="$(jq -r --arg m "$mkt_name" 'if has($m) then "y" else "" end' "$CFG_DIR/plugins/known_marketplaces.json" 2>/dev/null || true)"
+  fi
+  # Installed plugin cache (thedotmack/claude-mem/<ver>).
+  if [ -d "$CFG_DIR/plugins/cache/$mkt_name/claude-mem" ]; then cache="y"; fi
+  # Live listing (bounded — `claude plugins list` can be slow/offline).
+  if command -v "${HMD_DOCTOR_CLAUDE:-claude}" >/dev/null 2>&1; then
+    local tmp; tmp="$(mktemp 2>/dev/null || echo /tmp/hmd-doctor-cm.$$)"
+    run_capped 15 "$tmp" "${HMD_DOCTOR_CLAUDE:-claude}" plugins list || true
+    grep -qi 'claude-mem' "$tmp" 2>/dev/null && listed="y"
+    rm -f "$tmp" 2>/dev/null || true
+  fi
+
+  if [ "$enabled" = "true" ] || [ -n "$listed" ]; then
+    record "claude-mem" pass "plugin $plugin_id registered + enabled (mem-search + memory hooks live)"
+  elif [ -n "$mkt_known" ] || [ -n "$cache" ]; then
+    record "claude-mem" fail "claude-mem MISCONFIGURED — marketplace/cache present but plugin not enabled" "$fix"
+  else
+    record "claude-mem" warn "claude-mem not set up (optional companion) — memory across sessions is off" "$fix"
+  fi
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CHECK 6 — the SessionStart/SessionEnd hooks hmd's runtime depends on are present
+# AND the file is valid JSON: the keeper beat (SessionStart keeper-start / SessionEnd
+# keeper-stop) and the statusline self-register (SessionStart). Missing any → ✗.
+# ══════════════════════════════════════════════════════════════════════════════
+check_hooks() {
+  if [ ! -f "$HOOKS_JSON" ]; then
+    record "hooks" fail "hooks.json missing at $HOOKS_JSON" "re-run the installer to restore the plugin tree"
+    return
+  fi
+  if ! command -v jq >/dev/null 2>&1; then
+    record "hooks" warn "jq not installed — cannot validate hook wiring" "install jq"
+    return
+  fi
+  if ! jq -e . "$HOOKS_JSON" >/dev/null 2>&1; then
+    record "hooks" fail "hooks.json is not valid JSON" "restore hooks/hooks.json from a clean checkout"
+    return
+  fi
+  local ss se
+  ss="$(jq -r '[.hooks.SessionStart[]?.hooks[]?.command] | join("\n")' "$HOOKS_JSON" 2>/dev/null || true)"
+  se="$(jq -r '[.hooks.SessionEnd[]?.hooks[]?.command]   | join("\n")' "$HOOKS_JSON" 2>/dev/null || true)"
+  local missing=""
+  printf '%s' "$ss" | grep -q 'keeper-start'          || missing="$missing SessionStart:keeper-start"
+  printf '%s' "$ss" | grep -q 'statusline-register'   || missing="$missing SessionStart:statusline-register"
+  printf '%s' "$se" | grep -q 'keeper-stop'           || missing="$missing SessionEnd:keeper-stop"
+  if [ -z "$missing" ]; then
+    record "hooks" pass "SessionStart (keeper-start + statusline-register) + SessionEnd (keeper-stop) wired"
+  else
+    record "hooks" fail "hooks.json is missing required entries:$missing" \
+      "restore hooks/hooks.json from a clean checkout, then re-run the installer"
+  fi
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CHECK 7 — hmd/heimdall on PATH resolves to THIS install (no stale shadow). The
+# shadow bug: `hmd` answers from an older tree earlier on PATH → the dev runs a stale
+# version despite reinstalling. Not-on-PATH yet → ⚠ (profile just needs sourcing).
+# ══════════════════════════════════════════════════════════════════════════════
+check_path() {
+  local want_ver; want_ver="$(resolved_version "$PLUGIN_DIR")"
+  local hmd; hmd="$(command -v hmd 2>/dev/null || command -v heimdall 2>/dev/null || true)"
+  if [ -z "$hmd" ]; then
+    record "path" warn "hmd/heimdall not on PATH yet — reopen your terminal or source your profile" \
+      "export PATH=\"\$HOME/.local/bin:\$PATH\""
+    return
+  fi
+  local real tree got_ver
+  real="$(readlink -f "$hmd" 2>/dev/null || readlink "$hmd" 2>/dev/null || printf '%s' "$hmd")"
+  tree="$(cd "$(dirname "$real")/.." 2>/dev/null && pwd || true)"
+  got_ver="$(resolved_version "$tree" 2>/dev/null || echo '?')"
+  if [ "$got_ver" != "?" ] && [ "$want_ver" != "?" ] && [ "$got_ver" != "$want_ver" ]; then
+    record "path" fail "STALE SHADOW: $hmd → v$got_ver but this install is v$want_ver" \
+      "remove the shadow: rm -f $hmd   (or fix PATH order so \$HOME/.local/bin wins)"
+  else
+    record "path" pass "$hmd → v$got_ver (matches this install)"
+  fi
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CHECK 8 — the FIRST cc/claude run, HEADLESS + BACKGROUND + BOUNDED. RJ's directive:
+# the installer must NOT drop into an interactive session before verification — the
+# first invocation is a headless probe (claude -p, stdin /dev/null, no TTY) whose ONLY
+# job is to fire the SessionStart wiring (keeper beat, statusline register, mem hook).
+# Bounded by a hard deadline (kill at CC_TIMEOUT); its result gates the ready message.
+#   PASS — completed cleanly within the bound (wiring had its chance to fire).
+#   FAIL — claude ran but EXITED NONZERO (a real runtime/startup error worth blocking).
+#   WARN — killed at the deadline (bounded, non-fatal) / claude absent / skipped.
+# ══════════════════════════════════════════════════════════════════════════════
+check_runtime() {
+  [ "$CC_VERIFY" -eq 1 ] || return 0
+  local claude="${HMD_DOCTOR_CLAUDE:-claude}"
+  if [ -n "${HEIMDALL_SKIP_CC_VERIFY:-}" ]; then
+    record "runtime" warn "first-run verify skipped (HEIMDALL_SKIP_CC_VERIFY set)" \
+      "unset HEIMDALL_SKIP_CC_VERIFY to exercise the headless first run"
+    return
+  fi
+  if ! command -v "$claude" >/dev/null 2>&1; then
+    record "runtime" warn "claude not installed — skipped the headless first-run verify" \
+      "install Claude Code, then: hmd doctor-install --cc-verify"
+    return
+  fi
+  # Snapshot statusline registration so we can note whether the run's SessionStart
+  # wiring took effect (best-effort signal — not the gate).
+  local before_sl=0
+  if command -v jq >/dev/null 2>&1 && [ -f "$SETTINGS" ]; then
+    jq -e '.statusLine.command // "" | test("statusline.sh")' "$SETTINGS" >/dev/null 2>&1 && before_sl=1
+  fi
+  local tmp; tmp="$(mktemp 2>/dev/null || echo /tmp/hmd-doctor-cc.$$)"
+  local rc t0 t1
+  t0="$(date +%s 2>/dev/null || echo 0)"
+  # HEADLESS: -p (print/non-interactive), stdin from /dev/null (no prompt can hang),
+  # bounded by run_capped (kill at the deadline). NEVER an interactive session.
+  run_capped "$CC_TIMEOUT" "$tmp" "$claude" -p "reply OK — heimdall install verification probe" </dev/null
+  rc=$?
+  t1="$(date +%s 2>/dev/null || echo 0)"
+  local secs=$(( t1 - t0 ))
+  local after_sl=0
+  if command -v jq >/dev/null 2>&1 && [ -f "$SETTINGS" ]; then
+    jq -e '.statusLine.command // "" | test("statusline.sh")' "$SETTINGS" >/dev/null 2>&1 && after_sl=1
+  fi
+  local wiring=""
+  [ "$before_sl" -eq 0 ] && [ "$after_sl" -eq 1 ] && wiring=" (SessionStart wiring fired: statusline registered)"
+  # Persist the probe result for install.sh / telemetry (best-effort, into $HOME).
+  mkdir -p "$PLUGIN_DIR/.heimdall" 2>/dev/null || true
+  printf '{"rc":%s,"seconds":%s,"timeout":%s,"statusline_after":%s}\n' \
+    "$rc" "$secs" "$CC_TIMEOUT" "$after_sl" > "$PLUGIN_DIR/.heimdall/cc-verify.json" 2>/dev/null || true
+  rm -f "$tmp" 2>/dev/null || true
+  if [ "$rc" -eq 124 ]; then
+    record "runtime" warn "headless first-run hit the ${CC_TIMEOUT}s bound and was killed — non-fatal$wiring" \
+      "the first session was slow; try it interactively when ready: hmd"
+  elif [ "$rc" -eq 0 ]; then
+    record "runtime" pass "headless first-run completed in ${secs}s — SessionStart wiring exercised$wiring"
+  else
+    record "runtime" fail "headless first-run exited $rc — Claude Code could not start cleanly" \
+      "reproduce: claude -p hi   # then fix the reported startup/hook error"
+  fi
+}
+
+# ── Run all checks ─────────────────────────────────────────────────────────────
+if [ "$QUIET" -eq 0 ] && [ "$JSON" -eq 0 ]; then
+  printf '\n   %s%sHeimdall install validation%s  %s(%s)%s\n\n' \
+    "$C_BOLD" "$C_CYAN" "$C_RESET" "$C_DIM" "v$(resolved_version "$PLUGIN_DIR")" "$C_RESET"
+fi
+
+check_crypto
+check_presence
+check_statusline
+check_gates
+check_claude_mem
+check_hooks
+check_path
+check_runtime
+
+# ── Summary + gate ─────────────────────────────────────────────────────────────
+if [ "$JSON" -eq 1 ]; then
+  printf '{"pass":%s,"warn":%s,"fail":%s,"ready":%s,"checks":[%s]}\n' \
+    "$NP" "$NW" "$NF" "$([ "$NF" -eq 0 ] && echo true || echo false)" \
+    "$(IFS=,; echo "${RESULT_LINES[*]}")"
+  [ "$NF" -eq 0 ]
+  exit $?
+fi
+
+if [ "$QUIET" -eq 0 ]; then
+  printf '\n'
+  if [ "$NF" -eq 0 ]; then
+    printf '   %s%s✓ all systems go%s — %s%d ok%s' "$C_BOLD" "$C_GREEN" "$C_RESET" "$C_GREEN" "$NP" "$C_RESET"
+    [ "$NW" -gt 0 ] && printf ', %s%d degraded%s' "$C_GOLD" "$NW" "$C_RESET"
+    printf '\n\n'
+  else
+    printf '   %s%s⛔ NOT READY%s — %s%d check(s) failed%s' "$C_BOLD" "$C_RED" "$C_RESET" "$C_RED" "$NF" "$C_RESET"
+    [ "$NW" -gt 0 ] && printf ', %s%d degraded%s' "$C_GOLD" "$NW" "$C_RESET"
+    printf ', %s%d ok%s\n' "$C_GREEN" "$NP" "$C_RESET"
+    printf '   %sfix the ✗ item(s) above, then re-verify:%s %sheimdall-doctor-install%s\n\n' \
+      "$C_DIM" "$C_RESET" "$C_CYAN" "$C_RESET"
+  fi
+fi
+
+# EXIT CODE IS THE GATE: any ✗ → non-zero → install.sh withholds "ready".
+[ "$NF" -eq 0 ]
