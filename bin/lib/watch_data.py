@@ -375,6 +375,39 @@ def member_state(member):
 
 
 # ── panes ─────────────────────────────────────────────────────────────────────
+def resolve_seed(root, env=None):
+    """The VIEWER's own sigil seed for the wall HERO — best-effort + LOCAL only:
+    HMD_HAID env first, else the seed/handle in <root>/.heimdall/identity.json, else
+    None (skip the hero). Never raises — a broken identity file must not sink the wall."""
+    env = os.environ if env is None else env
+    s = (env.get("HMD_HAID") or "").strip()
+    if s:
+        return s
+    try:
+        with open(os.path.join(_heimdall_dir(root), "identity.json")) as f:
+            rec = json.load(f)
+        if isinstance(rec, dict):
+            s = (rec.get("seed") or rec.get("handle") or "").strip()
+            return s or None
+    except Exception:
+        return None
+    return None
+
+
+def render_hero(seed, caps=None, sig=None):
+    """The wall HERO: the viewer's own watchman as the DETAILED 16×16 sprite (the
+    richer banner/share tier) — `hmd watch` HAS the vertical space, so it shows the
+    full shaded character, not just a glyph. Returns [] when the seed or the detailed
+    renderer is unavailable (the wall still renders — the hero is purely additive)."""
+    if not seed or sig is None or not hasattr(sig, "render_detailed"):
+        return []
+    try:
+        art = sig.render_detailed(seed, caps=caps, pad="  ")
+    except Exception:
+        return []
+    return ["YOU"] + list(art)
+
+
 def render_wall(members, caps=None, sig=None):
     """WALL pane: one line per teammate — presence badge + sigil glyph + handle + verdict.
     The presence badge (● active / ○ idle) renders the server-derived wall state distinctly so
@@ -533,6 +566,10 @@ def render_dump(root, caps=None, sig=None, env=None):
     ent = resolve_entitlement(payload, env)
     events = read_feed(root)
     out = []
+    hero = render_hero(resolve_seed(root, env), caps, sig)
+    if hero:
+        out.extend(hero)
+        out.append("")
     out.extend(render_wall(members, caps, sig))
     out.append("")
     out.extend(render_feed(events, caps))

@@ -26,8 +26,14 @@ _spec.loader.exec_module(_mod)
 sigil_render = _mod.sigil_render
 render = _mod.render
 render_large = _mod.render_large
+render_detailed = _mod.render_detailed
 glyph = _mod.glyph
 grid_for = _mod.grid_for
+detailed_grid_for = _mod.detailed_grid_for
+detailed_family_for = _mod.detailed_family_for
+detailed_name_for = _mod.detailed_name_for
+DETAILED_SPRITES = _mod.DETAILED_SPRITES
+BASE_FAMILIES = _mod.BASE_FAMILIES
 cell_color = _mod.cell_color
 color = _mod.color
 tier_caps = _mod.tier_caps

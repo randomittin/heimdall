@@ -40,8 +40,17 @@ spec = importlib.util.spec_from_file_location("s", os.path.join(os.environ["HMD_
 m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 e = os.environ.get("HMD_EYE", "")
 eye = tuple(int(x) for x in e.split(";")) if e else None
-fn = m.render_large if os.environ.get("HMD_SIZE") == "large" else m.render
-print("\n".join(fn(sys.argv[1], eye_override=eye, pad="  ")))
+sz = os.environ.get("HMD_SIZE")
+# The share card / README avatar (a TTY / screen-recording surface with room to
+# spare) renders the DETAILED 16×16 sprite — RJ's hand-authored animal with real
+# character detail + tonal shading, richer than the compact statusline face. The
+# wake animation stays on the compact face (it re-draws in place; the eyes blink
+# through eye_override). Everything routes through the ONE shared render core.
+if sz == "detailed":
+    print("\n".join(m.render_detailed(sys.argv[1], pad="  ")))
+else:
+    fn = m.render_large if sz == "large" else m.render
+    print("\n".join(fn(sys.argv[1], eye_override=eye, pad="  ")))
 PY
 }
 
@@ -96,7 +105,7 @@ hmd_wake() {
 hmd_share() {
   if is_tty; then
     printf '\n'
-    face "$OPEN" large
+    face "$OPEN" detailed
     printf '\n'
     printf '  %b\n' "${CY}${B}@${HANDLE}${X}   ${DIM}your watchman${X}"
     printf '  %b\n' "$TAGLINE"
