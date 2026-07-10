@@ -1354,7 +1354,9 @@ main() {
   if [ -x "$DOC_BIN" ]; then
     local VAL_T0; VAL_T0="$(_tele_now_ms)"
     _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" validate started
-    if HMD_DOCTOR_PLUGIN_DIR="$PLUGIN_DIR" "$DOC_BIN" --cc-verify --plugin-dir "$PLUGIN_DIR"; then
+    # Bound the headless first-run (default 30s; HEIMDALL_CC_VERIFY_TIMEOUT overrides).
+    if HMD_DOCTOR_PLUGIN_DIR="$PLUGIN_DIR" "$DOC_BIN" --cc-verify \
+         --plugin-dir "$PLUGIN_DIR" --timeout "${HEIMDALL_CC_VERIFY_TIMEOUT:-30}"; then
       VALIDATED=1
       _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" validate succeeded "$VAL_T0"
     else
@@ -1362,6 +1364,12 @@ main() {
       _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" validate failed "$VAL_T0" \
         validation-gate-failed "post-install validation found a broken part"
     fi
+    # HEAL: the headless first-run boots real Claude Code, which rewrites the user's
+    # ~/.claude/settings.json on startup and can DROP the statusLine we registered
+    # earlier. Re-assert it now (idempotent, never clobbers a user's own line) so a
+    # first-run write can NEVER leave the watchman HUD unregistered — for the dev AND
+    # for the validation the dev will re-run. Silent + non-fatal.
+    ensure_statusline_registered "$PLUGIN_DIR" >/dev/null 2>&1 || true
   fi
 
   # ── 5b. Claim your watchman (the identity hook) ───────────────────────────
