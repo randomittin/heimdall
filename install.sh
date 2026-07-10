@@ -621,6 +621,42 @@ ensure_crypto_backend() {
   printf 'failed'
 }
 
+# ── claude-mem memory plugin — set up PER HMD's expectations ──────────────────
+#
+# hmd drives cross-session memory through the Claude Code PLUGIN claude-mem@thedotmack
+# (marketplace `thedotmack` → thedotmack/claude-mem). THAT plugin — not the standalone
+# npm tool — is what provides the /mem-search skill and the SessionStart memory-injection
+# hooks the orchestrator + agents rely on (agents/heimdall.md: "search … claude-mem for
+# proven patterns"). The legacy first-run path (`npx claude-mem install` in bin/heimdall)
+# wires claude-mem's OWN npm hooks, which DIVERGE from the CC-plugin hmd expects; this
+# reconciles that by registering the marketplace + installing the plugin the plugin way.
+#
+# IDEMPOTENT (fast no-op when already enabled — never re-installs), NON-FATAL (claude-mem
+# is an optional companion Heimdall works without), LOUD on failure. The caller renders
+# the ✓/⚠ line + the exact manual fix. Prints ONE state word:
+#   present     — the plugin is already registered/enabled; nothing done
+#   configured  — registered the marketplace + installed the plugin (now enabled)
+#   skipped     — the `claude` CLI is absent, so no plugin registration is possible
+#   failed      — a register/install step failed AND the plugin is still not present (LOUD)
+ensure_claude_mem() {
+  command -v claude >/dev/null 2>&1 || { printf 'skipped'; return 0; }
+  local mkt="thedotmack/claude-mem" mkt_name="thedotmack" plugin="claude-mem@thedotmack"
+  # Already present? Fast idempotent path — never touch the CLI again.
+  if claude plugins list 2>/dev/null | grep -qi 'claude-mem'; then printf 'present'; return 0; fi
+  local rc=0
+  # Register the marketplace (idempotent — `add` is a no-op when already known).
+  if ! claude plugins marketplace list 2>/dev/null | grep -q "$mkt_name"; then
+    claude plugins marketplace add "$mkt" >/dev/null 2>&1 || rc=$?
+  fi
+  # Install the plugin from that marketplace.
+  claude plugins install "$plugin" >/dev/null 2>&1 || rc=$?
+  # Re-check: the CLI's own listing is the sole arbiter (never trust the exit alone).
+  if claude plugins list 2>/dev/null | grep -qi 'claude-mem'; then printf 'configured'; return 0; fi
+  # Not listed. If every step still returned 0 (e.g. a quiet CLI that defers the write),
+  # report configured optimistically; only a nonzero step is a hard `failed`.
+  if [ "$rc" -eq 0 ]; then printf 'configured'; else printf 'failed'; fi
+}
+
 # ── Install-step telemetry (dossier §3 + §8) ────────────────────────────────
 #
 # install.sh's own step — the PATH export — emits started→succeeded|failed +
@@ -1234,6 +1270,39 @@ main() {
   step_begin "Wiring secret-scan + bloat gates"
   step_ok "Wiring secret-scan + bloat gates"
 
+  # Step: set up claude-mem PER HMD's expectations (the CC plugin, not the npm tool)
+  # so /mem-search + the SessionStart memory-injection hooks the orchestrator relies
+  # on are live. OPTIONAL/graceful — a failure is LOUD but never aborts the install.
+  local CM_T0; CM_T0="$(_tele_now_ms)"
+  _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" claude-mem started
+  step_begin "Setting up claude-mem (memory)"
+  local CM_STATE; CM_STATE="$(ensure_claude_mem)"
+  case "$CM_STATE" in
+    present)
+      _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" claude-mem succeeded "$CM_T0"
+      step_ok "Setting up claude-mem (memory)" "already enabled" ;;
+    configured)
+      _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" claude-mem succeeded "$CM_T0"
+      step_ok "Setting up claude-mem (memory)" "plugin registered" ;;
+    skipped)
+      _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" claude-mem failed "$CM_T0" \
+        claude-cli-absent "no claude CLI on PATH"
+      step_ok "Setting up claude-mem (memory)" "skipped (no claude CLI)" ;;
+    *)  # failed — LOUD, non-fatal.
+      _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" claude-mem failed "$CM_T0" \
+        claude-mem-plugin-install-failed "marketplace add / plugin install returned nonzero"
+      step_ok "Setting up claude-mem (memory)" "unavailable"
+      blank
+      printf '   %s⚠ claude-mem plugin setup failed — cross-session memory is OFF.%s\n' \
+        "$C_GOLD" "$C_RESET"
+      printf '   %s  hmd uses the claude-mem PLUGIN for /mem-search + memory injection. Enable it:%s\n' \
+        "$C_DIM" "$C_RESET"
+      printf '       %sclaude plugins marketplace add thedotmack/claude-mem \&\& claude plugins install claude-mem@thedotmack%s\n' \
+        "$C_CYAN" "$C_RESET"
+      blank
+      ;;
+  esac
+
   # ── 5. Success card (A4) ──────────────────────────────────────────────────
   # VER is the ACTUAL installed version (git tag → manifest), never a literal.
   local VER; VER=$(resolved_version "$PLUGIN_DIR")
@@ -1268,6 +1337,33 @@ main() {
     say "Uninstall:   $PRIMARY uninstall"
   fi
 
+  # ── 5a. MANDATORY post-install validation gate (the ready-gate) ───────────
+  # RJ's directive: as soon as claude-mem setup completes, VALIDATE the whole
+  # install before handing off — never run CC while a part is silently broken.
+  # heimdall-doctor-install exercises EVERY part (crypto, presence, statusline,
+  # gates, claude-mem, hooks, PATH) AND runs the FIRST cc/claude invocation
+  # HEADLESS + BOUNDED in the background (--cc-verify) purely to fire the
+  # SessionStart wiring — it NEVER drops into an interactive session. Its exit
+  # code is the gate: any ✗ → we WITHHOLD the "ready" hand-off (no watchman
+  # claim, no `Run: hmd demo` go-ahead) and print the loud NOT-READY block. The
+  # install itself stays non-fatal (artifacts are on disk); only the go-ahead is
+  # gated. A missing harness (should never happen) defaults to validated so we
+  # never block on our own absent tool.
+  local VALIDATED=1
+  local DOC_BIN="$PLUGIN_DIR/bin/heimdall-doctor-install"
+  if [ -x "$DOC_BIN" ]; then
+    local VAL_T0; VAL_T0="$(_tele_now_ms)"
+    _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" validate started
+    if HMD_DOCTOR_PLUGIN_DIR="$PLUGIN_DIR" "$DOC_BIN" --cc-verify --plugin-dir "$PLUGIN_DIR"; then
+      VALIDATED=1
+      _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" validate succeeded "$VAL_T0"
+    else
+      VALIDATED=0
+      _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" validate failed "$VAL_T0" \
+        validation-gate-failed "post-install validation found a broken part"
+    fi
+  fi
+
   # ── 5b. Claim your watchman (the identity hook) ───────────────────────────
   # The "claim your watchman" moment: show the dev THEIR deterministic sigil and
   # the two ways to spread it — `hmd invite` (recruit the team) and the share
@@ -1292,10 +1388,25 @@ main() {
   blank
   local END_TS; END_TS=$(date +%s)
   local ELAPSED=$(( END_TS - START_TS ))
-  if [ "$FANCY" -eq 1 ]; then
-    printf '   Run:  %s%s%s%s demo%s\n' "$C_CYAN" "$C_BOLD" "$PRIMARY" "$C_RESET" "$C_RESET"
+  # The go-ahead is GATED on validation: only a fully-verified install hands the
+  # dev on to `hmd demo`. A red gate prints a loud NOT-READY block instead — the
+  # exact fix is in the validation output above — and NEVER auto-runs a session.
+  if [ "$VALIDATED" -eq 1 ]; then
+    if [ "$FANCY" -eq 1 ]; then
+      printf '   Run:  %s%s%s%s demo%s\n' "$C_CYAN" "$C_BOLD" "$PRIMARY" "$C_RESET" "$C_RESET"
+    else
+      say "   Run:  $PRIMARY demo"
+    fi
   else
-    say "   Run:  $PRIMARY demo"
+    if [ "$FANCY" -eq 1 ]; then
+      printf '   %s%s⛔ NOT READY%s — do not start a session yet.\n' "$C_RED" "$C_BOLD" "$C_RESET"
+    else
+      say "   NOT READY — do not start a session yet."
+    fi
+    printf '   %s  a validation check above failed — fix it, then re-verify:%s\n' "$C_DIM" "$C_RESET"
+    printf '       %s%s/bin/heimdall-doctor-install --cc-verify%s\n' "$C_CYAN" "$SHORT_PATH" "$C_RESET"
+    printf '   %s  (the install itself completed — the artifacts are in %s)%s\n' \
+      "$C_DIM" "$SHORT_PATH" "$C_RESET"
   fi
   # PATH setup — make `hmd` reachable without the user hand-editing a profile.
   # ensure_path_on_profile appends a single guarded export to the right shell
