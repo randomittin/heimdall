@@ -105,6 +105,15 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
+# INTERACTIVE gates the LOUD, actionable crypto-missing warning (below) to a HUMAN who ran
+# `heimdall-presence beat` at a terminal. The statusline/keeper fork beats with stderr
+# redirected to /dev/null (NOT a tty), so `[ -t 2 ]` is False there → they stay SILENT
+# (no spam, exit 0 — the strict silent-safe contract the statusline relies on). An explicit
+# HMD_PRESENCE_INTERACTIVE=1 forces it on for tooling/tests that cannot allocate a pty. This
+# is the interactive-vs-render distinction the crypto-gap warning hooks onto.
+INTERACTIVE=""
+if [ -n "${HMD_PRESENCE_INTERACTIVE:-}" ] || [ -t 2 ]; then INTERACTIVE="1"; fi
+
 # `roster --json` with nothing configured must STILL emit a clean empty roster — define
 # the offline emitters up front so every degrade path is one call (no traceback, exit 0).
 emit_empty_roster() {
@@ -112,6 +121,26 @@ emit_empty_roster() {
   exit 0
 }
 beat_noop() { exit 0; }   # an unconfigured/failed beat is a silent no-op (offline is fine).
+
+# Probe the Ed25519 signing backend for `status` — the natural place a dev checks WHY presence
+# is not working. Prints "ok:<backend>" (cp_auth.crypto_available() True), "missing" (degraded
+# mode — no seed can mint, the dev is invisible), or "unknown" (cannot probe). Read-only; never
+# raises. Distinct from the OFF/consent state — a dev can be ON yet invisible due to this gap.
+_signing_probe() {
+  { [ -n "$PY" ] && [ -f "$LIB/cp_auth.py" ]; } || { printf 'unknown'; return; }
+  LIB="$LIB" "$PY" - <<'PYEOF' 2>/dev/null
+import os, sys
+sys.path.insert(0, os.environ["LIB"])
+try:
+    import cp_auth as K
+    if K.crypto_available():
+        sys.stdout.write("ok:" + (K.backend_name() or "ed25519"))
+    else:
+        sys.stdout.write("missing")
+except Exception:
+    sys.stdout.write("unknown")
+PYEOF
+}
 
 [ -n "$PY" ] || { [ "$SUB" = "roster" ] && emit_empty_roster || beat_noop; }
 [ -f "$LIB/cp_auth.py" ] || { [ "$SUB" = "roster" ] && emit_empty_roster || beat_noop; }
@@ -237,12 +266,16 @@ fi
 # Per-(machine,repo) seed + enroll-throttle paths, keyed by haid (slugged so ':' and '/'
 # never break the filename). The seed material lives ONLY in this 0600 file + the signing
 # process — the bash side handles the PATH, never the seed bytes.
-PKI_DIR=""; SEED_FILE=""; ENROLL_STAMP=""
+PKI_DIR=""; SEED_FILE=""; ENROLL_STAMP=""; CRYPTO_WARN_STAMP=""
 if [ -n "${HOME:-}" ] && [ -n "$HAID" ]; then
   PKI_DIR="$HMD_DIR/pki"
   HAID_SLUG="$(printf '%s' "$HAID" | tr '/:' '__')"
   SEED_FILE="$PKI_DIR/$HAID_SLUG.seed"
   ENROLL_STAMP="$PKI_DIR/$HAID_SLUG.enroll-attempt"
+  # A DEDICATED once-per-window mtime stamp for the crypto-missing warning — separate from
+  # the enroll-attempt stamp (which crypto-missing never reaches, since keygen fails first)
+  # so the loud warning throttles to ONE line per window without perturbing enroll backoff.
+  CRYPTO_WARN_STAMP="$PKI_DIR/$HAID_SLUG.crypto-warn"
 fi
 
 # OFFLINE / UNCONFIGURED -> clean degrade. We need a URL, an identity, and a project; the
@@ -345,7 +378,8 @@ run_client() {
   PRES_ENROLL_STAMP="$ENROLL_STAMP" PRES_THROTTLE="${HMD_ENROLL_THROTTLE:-180}" \
   PRES_PROJECT="$PROJECT" PRES_HANDLE="$HANDLE" PRES_VERDICT="$VERDICT" \
   PRES_FILE="$FILE" PRES_VERB="$1" PRES_JSON="$JSON" PRES_TEAM_SECRET="$TEAM_SECRET" \
-  PRES_STRICT="$STRICT" \
+  PRES_STRICT="$STRICT" PRES_INTERACTIVE="$INTERACTIVE" \
+  PRES_CRYPTO_WARN_STAMP="$CRYPTO_WARN_STAMP" \
   "$PY" - <<'PYEOF'
 import contextlib
 import json
@@ -452,6 +486,42 @@ def _persisted_seed():
         return ""
 
 
+def _warn_crypto_missing():
+    """Emit ONE actionable stderr line when the Ed25519 signing backend is missing — the
+    PERSISTENT, actionable misconfig that silently made a dev INVISIBLE (keygen raises
+    AuthError('crypto_unavailable'), the seed is never minted, every beat is dropped
+    unsigned, and nothing surfaced why — the bug that cost hours). The line names the ACTUAL
+    interpreter (sys.executable) + the exact pip fix so the human can act immediately.
+
+    GATED to PRES_INTERACTIVE (a human at a terminal, or an explicit opt-in) — the statusline
+    /keeper render fork runs it with PRES_INTERACTIVE unset, so it stays SILENT + exit 0 (the
+    strict silent-safe contract; the statusline must never spam or traceback). THROTTLED by an
+    mtime stamp (PRES_CRYPTO_WARN_STAMP, same window as the enroll throttle) so an interactive
+    beat loop prints it ONCE per window, not every beat. stdout is NEVER touched (the statusline
+    reads stdout)."""
+    if not os.environ.get("PRES_INTERACTIVE"):
+        return
+    stamp = os.environ.get("PRES_CRYPTO_WARN_STAMP") or ""
+    throttle = float(os.environ.get("PRES_THROTTLE") or "180")
+    now = time.time()
+    # Back off if we warned recently — one loud line per window, never a per-beat spew.
+    if stamp and os.path.exists(stamp):
+        recent = False
+        with contextlib.suppress(OSError):
+            recent = (now - os.path.getmtime(stamp)) < throttle
+        if recent:
+            return
+    if stamp:
+        with contextlib.suppress(OSError):
+            os.makedirs(os.path.dirname(stamp), mode=0o700, exist_ok=True)
+            with open(stamp, "w", encoding="utf-8") as fh:
+                fh.write("%f" % now)
+    py = sys.executable or "python3"
+    sys.stderr.write(
+        "heimdall presence: signing backend missing (Ed25519) — you are INVISIBLE to your "
+        "team. fix: %s -m pip install --user cryptography\n" % py)
+
+
 def _bootstrap_seed():
     """Auto-enroll once: keygen (cp_auth) -> POST /enroll -> persist the seed 0600 -> return
     it. Throttled by an mtime stamp so a FAILING enroll does NOT hammer the server every
@@ -462,6 +532,16 @@ def _bootstrap_seed():
     and a place to persist the seed. The enroll token is sent ONLY IF configured, so an OPEN
     server (HEIMDALL_ENROLL_OPEN=1) auto-enrolls a dev with ZERO config; a token-mode server
     still works because a configured token is still sent."""
+    # CRYPTO-MISSING is a DISTINCT failure from transient offline/DNS/TLS: the Ed25519 backend
+    # is absent (cp_auth.crypto_available() is False), so keygen can NEVER succeed and NO seed
+    # will EVER mint — a PERSISTENT, actionable misconfig, not a network blip. Surface it LOUD
+    # (interactive beat only, throttled) instead of the silent '' that hid the invisible-beat
+    # bug; the statusline/keeper render fork stays muted (PRES_INTERACTIVE unset). Checked FIRST,
+    # before the enroll throttle/network, because it is settled without any request.
+    if not K.crypto_available():
+        if VERB == "beat":
+            _warn_crypto_missing()
+        return ""
     token = os.environ.get("PRES_ENROLL_TOKEN") or ""
     seed_file = os.environ.get("PRES_SEED_FILE") or ""
     if not BASE or not seed_file:
@@ -807,11 +887,19 @@ case "$SUB" in
     else
       EFF="ON"; WHY="broadcasting handle + verdict$([ "$FILES" = shown ] && printf ' + current file')"
     fi
+    SIGN="$(_signing_probe)"
     printf 'presence status\n'
     printf '  repo:      %-4s (%s)\n' "$R" "$PRES_STATE_FILE"
     printf '  global:    %-4s (%s)\n' "$G" "$GLOBAL_OFF_FILE"
     printf '  effective: %s — %s\n' "$EFF" "$WHY"
     printf '  files:     %s\n' "$FILES"
+    # The signing-backend line REVEALS the crypto gap: presence can be effective:ON yet
+    # SILENTLY DISABLED when the Ed25519 backend is missing (no seed → every beat dropped).
+    case "$SIGN" in
+      ok:*)    printf '  signing:   Ed25519 backend OK (%s)\n' "${SIGN#ok:}" ;;
+      missing) printf '  signing:   MISSING — presence disabled, run %s -m pip install --user cryptography\n' "${PY:-python3}" ;;
+      *)       printf '  signing:   unknown (could not probe the Ed25519 backend)\n' ;;
+    esac
     printf '  note: OFF = invisible, not blind — you can still SEE the team; the team cannot see you.\n'
     ;;
   ""|-h|--help|help)
