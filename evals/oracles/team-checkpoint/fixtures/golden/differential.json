@@ -1,0 +1,11 @@
+{
+  "kind": "differential",
+  "seed": 1,
+  "records": 24,
+  "what": "CORRECT seeded per-HAID checkpoint stream. The gate folds it through the impl (checkpoint_share.fold_stream) AND the independent reference (reference.fold), normalizes to served/excluded_security, and diffs. They MUST be identical. Exercises INV-C (a security slice excluded) + INV-D (a consent-off slice skipped) + INV-G (the served roster). A false-RED here means the gate rejects its own golden and is itself broken.",
+  "invariants_exercised": [
+    "INV-C",
+    "INV-D",
+    "INV-G"
+  ]
+}

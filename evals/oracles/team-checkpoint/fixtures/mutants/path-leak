@@ -1,0 +1,69 @@
+{
+  "kind": "mutant",
+  "name": "path-leak",
+  "defect": "an absolute machine path (/Users/...) in the goal is SHIPPED RAW instead of redacted to [path-redacted] \u2014 a free-form path/body leaks (INV-A)",
+  "invariant_violated": [
+    "INV-A"
+  ],
+  "stream": [
+    {
+      "haid": "haid:a.box",
+      "human": "alice",
+      "branch": "feat/alice",
+      "head_sha": "abc1234",
+      "phase": "wave-2/build",
+      "progress_pct": 40,
+      "active_goal": "advance the widget module",
+      "claimed_surfaces": [
+        "src/alice.py"
+      ],
+      "task_ref": "task-alice",
+      "updated_at": "2026-07-10T00:00:00Z",
+      "resumable": true
+    },
+    {
+      "haid": "haid:e.box",
+      "human": "erin",
+      "branch": "feat/erin",
+      "head_sha": "abc1234",
+      "phase": "wave-2/build",
+      "progress_pct": 40,
+      "active_goal": "editing /Users/erin/secret/creds.py locally",
+      "claimed_surfaces": [
+        "src/erin.py"
+      ],
+      "task_ref": "task-erin",
+      "updated_at": "2026-07-10T00:00:00Z",
+      "resumable": true
+    }
+  ],
+  "corrupted": {
+    "served": [
+      [
+        "haid:a.box",
+        "alice",
+        "feat/alice",
+        "abc1234",
+        "wave-2/build",
+        40,
+        "advance the widget module",
+        "task-alice",
+        "[\"src/alice.py\"]",
+        true
+      ],
+      [
+        "haid:e.box",
+        "erin",
+        "feat/erin",
+        "abc1234",
+        "wave-2/build",
+        40,
+        "editing /Users/erin/secret/creds.py locally",
+        "task-erin",
+        "[\"src/erin.py\"]",
+        true
+      ]
+    ],
+    "excluded_security": 0
+  }
+}

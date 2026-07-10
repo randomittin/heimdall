@@ -1,0 +1,70 @@
+{
+  "kind": "mutant",
+  "name": "consent-off-served",
+  "defect": "a record whose owner set presence consent OFF (share_consent=false) is SERVED instead of skipped \u2014 consent-off shares nothing is broken (INV-D)",
+  "invariant_violated": [
+    "INV-D"
+  ],
+  "stream": [
+    {
+      "haid": "haid:a.box",
+      "human": "alice",
+      "branch": "feat/alice",
+      "head_sha": "abc1234",
+      "phase": "wave-2/build",
+      "progress_pct": 40,
+      "active_goal": "advance the widget module",
+      "claimed_surfaces": [
+        "src/alice.py"
+      ],
+      "task_ref": "task-alice",
+      "updated_at": "2026-07-10T00:00:00Z",
+      "resumable": true
+    },
+    {
+      "haid": "haid:d.box",
+      "human": "dave",
+      "branch": "feat/dave",
+      "head_sha": "abc1234",
+      "phase": "wave-2/build",
+      "progress_pct": 40,
+      "active_goal": "advance the widget module",
+      "claimed_surfaces": [
+        "src/dave.py"
+      ],
+      "task_ref": "task-dave",
+      "updated_at": "2026-07-10T00:00:00Z",
+      "resumable": true,
+      "share_consent": false
+    }
+  ],
+  "corrupted": {
+    "served": [
+      [
+        "haid:a.box",
+        "alice",
+        "feat/alice",
+        "abc1234",
+        "wave-2/build",
+        40,
+        "advance the widget module",
+        "task-alice",
+        "[\"src/alice.py\"]",
+        true
+      ],
+      [
+        "haid:d.box",
+        "dave",
+        "feat/dave",
+        "abc1234",
+        "wave-2/build",
+        40,
+        "advance the widget module",
+        "task-dave",
+        "[\"src/dave.py\"]",
+        true
+      ]
+    ],
+    "excluded_security": 0
+  }
+}

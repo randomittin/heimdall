@@ -1,0 +1,8 @@
+{
+  "id": "team-checkpoint",
+  "name": "Shared team-checkpoint roster differential gate",
+  "trigger": "per-wave",
+  "severity": "hard",
+  "gate_type": "differential",
+  "golden_input": "fixtures/golden/differential.json"
+}
