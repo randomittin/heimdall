@@ -29,6 +29,7 @@
 
 from __future__ import annotations
 
+import ast
 import datetime
 import json
 import os
@@ -739,3 +740,419 @@ def _team_gate_signals(my_haid, changed_files, changed_surfaces, repo_root=None,
                                % (human, h, req)),
                 })
     return signals
+
+
+# ── CROSS-PROJECT SYMBOL REUSE (ponytail rung-2: "already exists? reuse it") ────
+#
+# The mechanical embodiment of the lazy-ladder's rung 2. The team lens above asks
+# "is a TEAMMATE building this?"; this asks the code-only question one rung earlier:
+# "does this SAME symbol already exist SOMEWHERE ELSE in the project?" — and routes
+# the author to the canonical definition instead of a parallel copy.
+#
+# It builds a PROJECT-WIDE SYMBOL INDEX (functions, classes/types, dataclasses/
+# TypedDicts/structs, module-level constants — Python via the real ast; shell
+# functions heuristically) keyed by name + signature/shape + defining module, then
+# classifies each PROPOSED new symbol against it:
+#
+#   EXACT-DUP-ONLY BLOCK (exit-3, mirrors redum's hard local-dup gate):
+#     • a new FUNCTION with the SAME name AND SAME signature as a project function
+#       in a DIFFERENT module.
+#     • a new TYPE with the SAME name AND identical field SHAPE as a project type
+#       in a DIFFERENT module.
+#     These are unambiguous re-declarations of one canonical symbol → hard block.
+#
+#   ADVISE / WARN (surface the canonical import, never block — false-positive risk
+#   from shadowing / generics / legitimate parallel domains):
+#     • a type whose FIELDS match an existing type but under a DIFFERENT name
+#       (structural equivalence).
+#     • a function sharing a name but with a DIFFERENT signature (likely the same
+#       capability under drift), or a near-duplicate name.
+#     • a re-defined module-level constant/object.
+#
+# It REUSES redum's existing analysis substrate rather than rebuilding it: the
+# dedup name normalizer (dedup.normalize) and the SHARED ignore set (reuse.is_test_
+# path) that already scopes reuse to production code. Test fixtures, vendored, and
+# generated trees are neither indexed as canonical nor checked as proposals. An
+# explicit opt-out marker on a symbol (a deliberate, justified local copy) is
+# honored — that symbol is allowed unconditionally.
+#
+# This is the code∪code half of rung-2; the team lens above is the code∪work half.
+
+# an author's explicit "this local copy is deliberate" marker (comment or decorator
+# above/inside the symbol). Honors the ponytail carve-out: a justified copy is not a
+# violation. Matches `redum: allow-duplicate`, `redum-allow-duplicate`,
+# `redum: allow-local-copy`, `@redum_allow_duplicate`, etc.
+_OPTOUT_RX = re.compile(
+    r"redum[\s:_\-]*allow[\s_\-]*(?:duplicate|local[\s_\-]*copy)", re.I)
+
+# vendored / generated trees: NOT the project's own canonical reuse surface.
+_VENDOR_RX = re.compile(
+    r"(^|/)(node_modules|bower_components|vendor|vendored|third[_-]?party|external|"
+    r"\.venv|venv|site-packages|dist|build|out|target|generated|__generated__|\.gen)(/|$)")
+_GENERATED_FILE_RX = re.compile(
+    r"(\.generated\.[A-Za-z0-9]+$|_generated\.[A-Za-z0-9]+$|_pb2\.py$|\.pb\.go$|"
+    r"\.g\.dart$|\.min\.js$|\.bundle\.js$)")
+
+# symbol families the reuse decision groups by (a function never dedups a type).
+_FN_FAMILY = frozenset({"function", "shell-function", "method"})
+_TYPE_FAMILY = frozenset({"type", "class", "interface", "enum", "component"})
+_CONST_FAMILY = frozenset({"const"})
+
+# the new symbol-reuse hard block exits 3 (distinct from the SI-2 residual gate's
+# exit-1), so a CI/hook can tell a cross-project re-declaration from a low-reuse flag.
+SYMBOL_REUSE_BLOCK_EXIT = 3
+
+
+def _is_ignored_symbol_path(path):
+    """A path whose symbols are NOT the project's canonical reuse surface: test /
+    spec / fixture files (via reuse.is_test_path — the SHARED ignore set redum
+    already scopes reuse with), plus vendored and generated trees. Symbols here are
+    neither indexed as canonical nor checked as proposals."""
+    norm = str(path).replace("\\", "/")
+    if reuse.is_test_path(norm):
+        return True
+    if _VENDOR_RX.search(norm):
+        return True
+    return bool(_GENERATED_FILE_RX.search(norm))
+
+
+class SymbolRecord:
+    """One declared symbol in the project index: name + shape + defining module.
+
+      name      — the canonical identifier a caller would reuse.
+      kind      — function | shell-function | method | type | const | (raw dedup kind).
+      module    — the file the symbol is defined in.
+      sig       — for a function: the ordered parameter list (or [] for a shell fn).
+                  None when the language yields no signature (never exact-blocks).
+      fields    — for a type: the declared field/attribute names. None otherwise.
+      value     — for a const: the source repr of its value. None otherwise.
+      optout    — True when the author marked this a deliberate local copy.
+    """
+
+    __slots__ = ("name", "kind", "module", "sig", "fields", "value",
+                 "line", "end_line", "optout")
+
+    def __init__(self, name, kind, module, sig=None, fields=None, value=None,
+                 line=None, end_line=None, optout=False):
+        self.name = name
+        self.kind = kind
+        self.module = module
+        self.sig = sig
+        self.fields = fields
+        self.value = value
+        self.line = line
+        self.end_line = end_line
+        self.optout = optout
+
+    @property
+    def family(self):
+        if self.kind in _FN_FAMILY:
+            return "function"
+        if self.kind in _TYPE_FAMILY:
+            return "type"
+        if self.kind in _CONST_FAMILY:
+            return "const"
+        return "other"
+
+    def shape(self):
+        """A stable canonical shape string for exact-match comparison within a family:
+        a function's parameter list, a type's sorted field set, a const's value repr."""
+        fam = self.family
+        if fam == "function":
+            return "(" + ",".join(self.sig or []) + ")"
+        if fam == "type":
+            return "{" + ",".join(sorted(self.fields or [])) + "}"
+        if fam == "const":
+            return "=" + (self.value if self.value is not None else "?")
+        return ""
+
+    def to_dict(self):
+        d = {"name": self.name, "kind": self.kind, "module": self.module,
+             "family": self.family, "shape": self.shape()}
+        if self.optout:
+            d["optout"] = True
+        return d
+
+
+def _optout_near(lines, node_line, node_end):
+    """True when the opt-out marker appears in/just-above a symbol's source span (its
+    decorators, a leading comment, or its body)."""
+    lo = max(0, (node_line or 1) - 3)
+    hi = min(len(lines), (node_end or node_line or 1))
+    window = "\n".join(lines[lo:hi])
+    return bool(_OPTOUT_RX.search(window))
+
+
+def _py_symbol_records(src, path):
+    """Extract module-level Python symbols (real ast): functions (with signatures),
+    classes/dataclasses/TypedDicts (with field shapes), module-level constants."""
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return []
+    lines = src.splitlines()
+    out = []
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            a = node.args
+            params = [p.arg for p in list(a.posonlyargs) + list(a.args)]
+            params += [p.arg for p in a.kwonlyargs]
+            if a.vararg:
+                params.append("*" + a.vararg.arg)
+            if a.kwarg:
+                params.append("**" + a.kwarg.arg)
+            out.append(SymbolRecord(
+                node.name, "function", path, sig=params, line=node.lineno,
+                end_line=getattr(node, "end_lineno", node.lineno),
+                optout=_optout_near(lines, node.lineno,
+                                    getattr(node, "end_lineno", node.lineno))))
+        elif isinstance(node, ast.ClassDef):
+            fields = []
+            for stmt in node.body:
+                if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+                    fields.append(stmt.target.id)
+                elif isinstance(stmt, ast.Assign):
+                    for t in stmt.targets:
+                        if isinstance(t, ast.Name):
+                            fields.append(t.id)
+            out.append(SymbolRecord(
+                node.name, "type", path, fields=fields, line=node.lineno,
+                end_line=getattr(node, "end_lineno", node.lineno),
+                optout=_optout_near(lines, node.lineno,
+                                    getattr(node, "end_lineno", node.lineno))))
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            value = None
+            if getattr(node, "value", None) is not None:
+                try:
+                    value = ast.unparse(node.value)
+                except Exception:  # noqa: BLE001 — unparse is best-effort metadata
+                    value = None
+            for t in targets:
+                if isinstance(t, ast.Name):
+                    out.append(SymbolRecord(
+                        t.id, "const", path, value=value, line=node.lineno,
+                        end_line=getattr(node, "end_lineno", node.lineno),
+                        optout=_optout_near(lines, node.lineno,
+                                            getattr(node, "end_lineno", node.lineno))))
+    return out
+
+
+_SH_FUNC_RX = re.compile(
+    r"(?m)^\s*(?:function\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*\(\)\s*\{"
+    r"|^\s*function\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{")
+
+
+def _sh_symbol_records(src, path):
+    """Heuristic shell-function extraction: `name() {` and `function name {`. Shell
+    carries no signature, so shell functions can exact-block only another shell
+    function of the SAME name (sig=[] → shape "()")."""
+    out = []
+    lines = src.splitlines()
+    for m in _SH_FUNC_RX.finditer(src):
+        name = m.group(1) or m.group(2)
+        ln = src.count("\n", 0, m.start()) + 1
+        out.append(SymbolRecord(name, "shell-function", path, sig=[], line=ln,
+                                optout=_optout_near(lines, ln, ln)))
+    return out
+
+
+def _symbol_records_for(path, src):
+    """All indexable symbol records in one file, or [] when the path is ignored
+    (test/fixture/vendored/generated). Python + shell natively; other languages fall
+    back to the dedup name+kind units (no signature → advise-only, never exact-block)."""
+    if _is_ignored_symbol_path(path):
+        return []
+    lang = reuse.detect_language(path)
+    if lang == "py":
+        return _py_symbol_records(src, path)
+    if lang in ("sh", "sh_maybe"):
+        return _sh_symbol_records(src, path)
+    recs = []
+    for u in dedup.index_repo_units({path: src}):
+        if u.kind in _TYPE_FAMILY:
+            kind = "type"
+        elif u.kind in _CONST_FAMILY:
+            kind = "const"
+        elif u.kind in _FN_FAMILY:
+            kind = "function"
+        else:
+            continue  # rn-slice / rn-selector / mmkv-key are the SI-2 gate's job.
+        # no signature/fields available cross-language → advise-only shape.
+        recs.append(SymbolRecord(u.name, kind, path))
+    return recs
+
+
+def build_symbol_index(repo_files):
+    """Build the PROJECT-WIDE symbol index over {path: source}. Skips ignored paths
+    (test/fixture/vendored/generated). Returns list[SymbolRecord]."""
+    index = []
+    for path, src in (repo_files or {}).items():
+        index.extend(_symbol_records_for(path, src))
+    return index
+
+
+def _import_hint(sym):
+    """A copy-pasteable pointer to the canonical symbol's import site."""
+    mod = str(sym.module)
+    lang = reuse.detect_language(mod)
+    if lang == "py":
+        dotted = re.sub(r"\.py$", "", mod).replace("/", ".").strip(".")
+        return "from %s import %s" % (dotted, sym.name)
+    if lang in ("sh", "sh_maybe"):
+        return "source %s  # then call %s()" % (mod, sym.name)
+    return "reuse %s from %s" % (sym.name, mod)
+
+
+def _pick_canonical(cands, proposed):
+    """Deterministically choose the canonical to route to: the smallest (module, name)
+    among candidates in a DIFFERENT module than the proposal (a symbol never dedups
+    against itself)."""
+    xs = sorted((c for c in cands if c.module != proposed.module),
+                key=lambda c: (str(c.module), str(c.name)))
+    return xs[0] if xs else None
+
+
+def _reason_for(proposed, canonical, klass):
+    verb = {"exact-function": "re-declares the existing function",
+            "exact-type": "re-declares the existing type",
+            "structural-type": "has the same fields as the existing type",
+            "same-name-function": "shares a name with the existing function",
+            "same-name-type": "shares a name with the existing type",
+            "const-redef": "re-defines the existing constant"}.get(klass, "duplicates")
+    return ("proposed %s %r %s %r in %s — reuse the canonical, do not re-declare it"
+            % (proposed.family, proposed.name, verb, canonical.name, canonical.module))
+
+
+def _finding(proposed, canonical, level, klass):
+    return {
+        "proposed": proposed.name,
+        "proposed_module": proposed.module,
+        "kind": proposed.kind,
+        "family": proposed.family,
+        "level": level,          # "block" | "warn"
+        "class": klass,
+        "canonical": {"name": canonical.name, "module": canonical.module,
+                      "kind": canonical.kind, "shape": canonical.shape()},
+        "import_hint": _import_hint(canonical),
+        "reason": _reason_for(proposed, canonical, klass),
+    }
+
+
+def _classify_symbol(proposed, by_norm, type_by_fields):
+    """Classify ONE proposed symbol against the canonical index. Returns a finding
+    dict (level block|warn) or None when the symbol is unique/allowed (→ ok).
+    Precedence: opt-out > exact-block > structural/near/const advise > unique."""
+    if proposed.optout:
+        return None  # a deliberate, justified local copy — allowed unconditionally.
+    nn = dedup.normalize(proposed.name)
+    same_name = by_norm.get(nn, [])
+
+    if proposed.family == "function":
+        # EXACT: same normalized name + identical signature, different module. Both
+        # sides must carry a real signature (cross-language name-only units never block).
+        exact = _pick_canonical(
+            [c for c in same_name if c.family == "function"
+             and c.sig is not None and proposed.sig is not None
+             and c.shape() == proposed.shape()], proposed)
+        if exact is not None:
+            return _finding(proposed, exact, "block", "exact-function")
+        near = _pick_canonical([c for c in same_name if c.family == "function"], proposed)
+        if near is not None:
+            return _finding(proposed, near, "warn", "same-name-function")
+        return None
+
+    if proposed.family == "type":
+        exact = _pick_canonical(
+            [c for c in same_name if c.family == "type"
+             and c.fields and proposed.fields and c.shape() == proposed.shape()], proposed)
+        if exact is not None:
+            return _finding(proposed, exact, "block", "exact-type")
+        # structural: identical field SHAPE under a DIFFERENT name.
+        if proposed.fields:
+            struct = _pick_canonical(
+                [c for c in type_by_fields.get(proposed.shape(), []) if c.family == "type"],
+                proposed)
+            if struct is not None:
+                return _finding(proposed, struct, "warn", "structural-type")
+        same_type = _pick_canonical([c for c in same_name if c.family == "type"], proposed)
+        if same_type is not None:
+            return _finding(proposed, same_type, "warn", "same-name-type")
+        return None
+
+    if proposed.family == "const":
+        c = _pick_canonical([c for c in same_name if c.family == "const"], proposed)
+        if c is not None:
+            return _finding(proposed, c, "warn", "const-redef")
+        return None
+
+    return None
+
+
+def detect_symbol_reuse(proposed_files, repo_files, index=None):
+    """Classify each PROPOSED new symbol against the PROJECT-WIDE canonical index.
+
+    proposed_files: {path: source} of the NEW code being added.
+    repo_files:     {path: source} of the EXISTING project (the canonical surface).
+    index:          an optional pre-built index (build_symbol_index) to reuse.
+
+    Returns {
+      "verdict": "block" | "advise" | "ok",
+      "blocked": [finding, ...],   # exact function/type duplication — HARD (exit-3)
+      "advised": [finding, ...],   # structural/near/const — WARN, surface canonical
+      "ok":      [{name, module}], # unique or opt-out-allowed
+      "findings":[...all block+warn...],
+      "summary": one-line human verdict,
+    }
+    Advise-default, exact-dup-only-block. Opt-out-marked and ignored-path symbols
+    are never flagged."""
+    if index is None:
+        index = build_symbol_index(repo_files)
+    by_norm = {}
+    type_by_fields = {}
+    for u in index:
+        by_norm.setdefault(dedup.normalize(u.name), []).append(u)
+        if u.family == "type" and u.fields:
+            type_by_fields.setdefault(u.shape(), []).append(u)
+
+    findings = []
+    ok_rows = []
+    for path, src in (proposed_files or {}).items():
+        for proposed in _symbol_records_for(path, src):
+            f = _classify_symbol(proposed, by_norm, type_by_fields)
+            if f is None:
+                ok_rows.append({"name": proposed.name, "module": proposed.module})
+            else:
+                findings.append(f)
+
+    blocked = [f for f in findings if f["level"] == "block"]
+    advised = [f for f in findings if f["level"] == "warn"]
+    verdict = "block" if blocked else ("advise" if advised else "ok")
+    ok_rows.sort(key=lambda r: (r["module"], r["name"]))
+    return {
+        "verdict": verdict,
+        "blocked": blocked,
+        "advised": advised,
+        "ok": ok_rows,
+        "findings": findings,
+        "summary": _symbol_reuse_summary(verdict, blocked, advised),
+    }
+
+
+def _symbol_reuse_summary(verdict, blocked, advised):
+    if verdict == "block":
+        names = ", ".join(sorted({b["proposed"] for b in blocked}))
+        return ("redum symbol-reuse: BLOCK — %d exact duplicate symbol(s) already exist "
+                "project-wide (%s); reuse the canonical, do not re-declare"
+                % (len(blocked), names))
+    if verdict == "advise":
+        names = ", ".join(sorted({a["proposed"] for a in advised}))
+        return ("redum symbol-reuse: ADVISE — %d symbol(s) resemble existing project code "
+                "(%s); consider reusing the canonical" % (len(advised), names))
+    return "redum symbol-reuse: OK — no cross-project symbol duplication detected"
+
+
+def symbol_reuse_exit_code(result):
+    """The gate exit code for a detect_symbol_reuse result: exit-3 on a hard block
+    (exact function/type re-declaration), else 0 (advise is WARN-only, never blocks)."""
+    return SYMBOL_REUSE_BLOCK_EXIT if result.get("verdict") == "block" else 0
