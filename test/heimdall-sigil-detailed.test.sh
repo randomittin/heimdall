@@ -129,10 +129,66 @@ emit("render: every line is the 16-cell square width", widths == {16}, "widths=%
 flat = "\n".join(tc)
 emit("render: value 2 emits a full white eye (255;255;255 fg+bg)",
      "38;2;255;255;255" in flat and "48;2;255;255;255" in flat)
-emit("render: value 5 emits the near-black outline (12;14;20)", "38;2;12;14;20" in flat or "48;2;12;14;20" in flat)
+emit("render: value 5 (silhouette edge) emits the drawn outline (48;52;64)", "38;2;48;52;64" in flat or "48;2;48;52;64" in flat)
 a = "\n".join(m.sigil_render("determinism", "D", m.tier_caps()))
 b = "\n".join(m.sigil_render("determinism", "D", m.tier_caps()))
 emit("render: deterministic (same seed → byte-identical)", a == b)
+
+# ── 6) ANTI-SPECKLE — no scattered black dots in the body fill (RJ's #1 reject) ──
+# The 2-px-per-cell `▀` pack turns a near-black INTERIOR pixel sitting over a body
+# pixel into a half-black cell = a black speckle dot. Assert that no cell INTERIOR to
+# the silhouette renders a near-black half (max channel < 40). This is RED on the old
+# render (interior value-5 marks were the ink color 12,14,20) and GREEN after the fix
+# (interior 5 is recolored to the soft shadow tone; only bg-bordering edge 5 stays dark).
+CELL = re.compile(r"\033\[38;2;(\d+);(\d+);(\d+)m(?:\033\[48;2;(\d+);(\d+);(\d+)m)?([^\033])")
+def _interior(g, r, c, N=16):
+    if g[r][c] == ".": return False
+    for dr, dc in ((-1,0),(1,0),(0,-1),(0,1)):
+        rr, cc = r+dr, c+dc
+        if not (0 <= rr < N and 0 <= cc < N) or g[rr][cc] == ".": return False
+    return True
+def _interior_black_halves(name):
+    g = D[name]["grid"]; lines = m.sigil_render(name, "D", m.tier_caps()); bad = 0
+    for ti, line in enumerate(lines):
+        for ci, mm in enumerate(CELL.finditer(line)):
+            fr,fg,fb,br,bg,bb,_ = mm.groups()
+            if _interior(g, ti*2, ci) and max(int(fr),int(fg),int(fb)) < 40: bad += 1
+            if br and _interior(g, ti*2+1, ci) and max(int(br),int(bg),int(bb)) < 40: bad += 1
+    return bad
+speckle = {n: _interior_black_halves(n) for n in ("fox","lisa","pearl","dragon","penguin","cat","cat-joy")}
+emit("anti-speckle: NO near-black cell inside the body fill on any sampled sprite",
+     all(v == 0 for v in speckle.values()), "counts=%s" % speckle)
+
+# per-variant hue: an emotion variant renders ITS OWN authored hue, not a default/base.
+def _has_hue(name, hexstr, emotion=None, seed=None):
+    r,gc,b = int(hexstr[1:3],16), int(hexstr[3:5],16), int(hexstr[5:7],16)
+    flat = "\n".join(m.render_detailed(seed or name, emotion=emotion))
+    return ("38;2;%d;%d;%d" % (r,gc,b)) in flat
+emit("hue: fox renders its authored ORANGE #e0783c (not the compact green)",
+     _has_hue("fox", "#e0783c"))
+emit("hue: fox-rage renders its authored RED #b0503c",
+     _has_hue("fox", "#b0503c", emotion="rage"))
+emit("hue: fox-neutral renders its authored GREY #d7dde3",
+     _has_hue("fox", "#d7dde3", emotion="neutral"))
+emit("hue: fox base vs fox-rage differ (per-variant hue applied, not identical)",
+     "\n".join(m.render_detailed("fox")) != "\n".join(m.render_detailed("fox", emotion="rage")))
+
+# clean eyes: a 2×2 eye-pair renders as SOLID white cells (fg==bg==255), never a
+# half-white/half-body split (the BUG-3 checker), even when it straddles the pack.
+def _eye_split(name):
+    solid = split = 0
+    for line in m.sigil_render(name, "D", m.tier_caps()):
+        for mm in CELL.finditer(line):
+            fr,fg,fb,br,bg,bb,_ = mm.groups()
+            wt = (fr,fg,fb) == ("255","255","255"); wb = (br,bg,bb) == ("255","255","255")
+            if wt or wb: (solid, split) = (solid+1, split) if (wt and wb) else (solid, split+1)
+    return solid, split
+eye_ok = True; eye_detail = []
+for n in ("rabbit","dog","cat-shock","lisa","dragon","fox"):
+    s, sp = _eye_split(n); eye_detail.append("%s=%d/%d" % (n, s, sp))
+    if sp != 0 or s == 0: eye_ok = False
+emit("eyes: 2×2 eye-pairs render as SOLID white cells, no half-white checker",
+     eye_ok, "solid/split: %s" % " ".join(eye_detail))
 
 # ── 5) COMPACT UNTOUCHED — the detailed literals never touched the value grid ──
 # rebuild rj's finished 8×8 independently and confirm grid_for still equals it.

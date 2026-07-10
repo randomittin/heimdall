@@ -170,17 +170,29 @@ SIZES = {'S': 4, 'M': 8, 'L': 16}
 #
 # VALUE→COLOR at the 'D' tier (this IS the shading — highlight/shadow placement is
 # hand-authored, the bg is a subtle top-left-lit diagonal gradient):
-#   1 → hue            2 → full white eye        5 → near-black carved outline
+#   1 → hue            2 → full white eye        5 → carved outline (SILHOUETTE edge)
 #   3 → hue lightened  4 → hue darkened          6 → accent6 hex   7 → accent7 hex
 #   . → bg hex rendered as a subtle top-left-lit diagonal gradient (terminal-safe)
 # 3 and 4 are DERIVED from the hue (the shading ramp); 6/7 are the authored accents.
-WHITE   = (255, 255, 255)   # value 2 — a full, bright white eye
+#
+# ANTI-SPECKLE (the load-bearing fix): value 5 is the INK LINE, but the artist also
+# uses lone/short interior 5s for muzzle/mouth/nose marks. On the 2-px-per-cell `▀`
+# pack a near-black interior 5 sitting over a body pixel renders as a half-black cell
+# = a scattered BLACK DOT peppering the fill (RJ's #1 reject). So value 5 is split by
+# POSITION at render time: a 5 that borders the bg ('.') is the true silhouette
+# OUTLINE and keeps the ink color; a 5 with NO bg neighbor is an INTERIOR feature mark
+# and is recolored to the soft SHADOW tone (value-4 color) — the mark survives (so
+# emotion variants still differ) but never reads as a near-black speck. See
+# `_render_detailed`. The eyes get a parallel de-speckle: a 2×2 eye block is grown to
+# fill its text cell so a pixel-row-straddled eye reads as a solid white square, never
+# a half-split checker (BUG 3).
+WHITE   = (255, 255, 255)   # value 2 — a full, bright white eye (no pupil)
 BLACK   = (0, 0, 0)
-OUTLINE = (12, 14, 20)      # value 5 — near-black carved outline (the ink line)
-HL_LIFT = 0.34              # value 3 highlight = hue lifted this far toward white
-SH_DROP = 0.42              # value 4 shadow    = hue dropped this far toward black
-BG_LIGHT = 0.30             # '.' top-left lit   (subtle diagonal gradient of bg hex)
-BG_DARK  = 0.34             # '.' bottom-right shaded
+OUTLINE = (48, 52, 64)      # value 5 (SILHOUETTE edge) — a drawn dark edge, not a black void
+HL_LIFT = 0.24              # value 3 highlight = hue lifted this far toward white
+SH_DROP = 0.30              # value 4 shadow    = hue dropped this far toward black (keeps hue saturated)
+BG_LIGHT = 0.15             # '.' top-left lit   (subtle diagonal gradient of bg hex, half strength)
+BG_DARK  = 0.17             # '.' bottom-right shaded (half strength)
 
 
 def _clamp8(x):
@@ -380,13 +392,32 @@ def detailed_family_for(haid):
     return BASE_FAMILIES[int.from_bytes(h[:8], 'big') % len(BASE_FAMILIES)]
 
 def detailed_name_for(haid, emotion=None):
-    """The sprite NAME to render: the HAID's base family by default; with an emotion, the
-    '<family>-<emotion>' variant IF it exists, else a graceful fall back to the base."""
-    fam = detailed_family_for(haid)
+    """The sprite NAME to render.
+
+    DIRECT ADDRESSING (fixes the 'fox renders green' bug): when `haid` is itself a
+    known sprite name — a base family ('fox') or a full variant ('fox-rage') — that
+    EXACT sprite is previewed, so its OWN authored hue/bg/accents are used (the gallery,
+    `--seed fox --emotion rage`, per-variant eyeballing). Previously every name was run
+    through the family HASH, so 'fox' hashed onto an unrelated family (e.g. green
+    'lanky') and its non-existent emotion variants all fell back to that one green base.
+
+    A real arbitrary HAID (not a sprite name) still maps through the deterministic
+    family hash. An `emotion` selects the '<family>-<emotion>' variant when it exists,
+    else a graceful fall back to the base family (never crashes / never blank)."""
+    if haid in BASE_FAMILIES:
+        fam = haid
+    elif haid in DETAILED_SPRITES:                 # a full variant name, e.g. 'fox-rage'
+        base = haid.split('-', 1)[0]
+        fam = base if base in BASE_FAMILIES else haid
+    else:
+        fam = detailed_family_for(haid)
     if emotion:
         cand = "%s-%s" % (fam, emotion)
         if cand in DETAILED_SPRITES:
             return cand
+        return fam if fam in DETAILED_SPRITES else haid
+    if haid in DETAILED_SPRITES:                    # honor a full variant name passed directly
+        return haid
     return fam
 
 def _detailed_palette(sprite, eye_override=None):
@@ -412,6 +443,34 @@ def _bg_px(bg, r, c, N):
     if t <= 0.5:
         return _mix(bg, WHITE, (0.5 - t) * BG_LIGHT)
     return _mix(bg, BLACK, (t - 0.5) * BG_DARK)
+
+
+def _borders_bg(grid, r, c, N):
+    """True if (r,c) touches a background ('.') pixel in its 8-neighbourhood (or the
+    grid border) — i.e. it sits on the SILHOUETTE edge. Used to tell a true OUTLINE
+    ink pixel (value 5 bordering the bg) from an INTERIOR value-5 feature mark that
+    must NOT render near-black (else it reads as a scattered black speckle dot)."""
+    for dr in (-1, 0, 1):
+        for dc in (-1, 0, 1):
+            if dr == 0 and dc == 0:
+                continue
+            rr, cc = r + dr, c + dc
+            if not (0 <= rr < N and 0 <= cc < N) or grid[rr][cc] == '.':
+                return True
+    return False
+
+def _eye_block_pixels(grid, N):
+    """Every (r,c) that is a value-2 eye pixel belonging to a 2×2 block of '2' (the
+    watchman 'double eye-pair'). ONLY these are grown to fill their text cell, so a
+    2×2 eye that straddles the fixed pixel-row pairing renders as a solid white square
+    instead of a half-split checker (BUG 3). A stray lone '2' glint is left as authored."""
+    eyes = set()
+    for r in range(N - 1):
+        for c in range(N - 1):
+            if (grid[r][c] == '2' and grid[r][c + 1] == '2'
+                    and grid[r + 1][c] == '2' and grid[r + 1][c + 1] == '2'):
+                eyes |= {(r, c), (r, c + 1), (r + 1, c), (r + 1, c + 1)}
+    return eyes
 
 
 _DETAILED_MEMO = {}
@@ -540,16 +599,29 @@ def _render_detailed(haid, caps, eye_override=None, pad='', xscale=1, emotion=No
     the width invariant every emitted line = 16 cells holds. Detailed-tier ONLY: the
     compact 8×8 path never reaches here, so it stays byte-identical to branch `sigil`."""
     _name, grid, pal, bg, N = detailed_grid_for(haid, emotion, eye_override)
+    eyes = _eye_block_pixels(grid, N)      # 2×2 eye pixels to grow to solid cells (BUG 3)
+    eye_rgb = eye_override or WHITE
+    interior_mark = pal['4']               # soft shadow tone for INTERIOR value-5 marks
     def px(r, c):
         ch = grid[r][c]
-        return _bg_px(bg, r, c, N) if ch == '.' else pal[ch]
+        if ch == '.':
+            return _bg_px(bg, r, c, N)
+        if ch == '5' and not _borders_bg(grid, r, c, N):
+            # ANTI-SPECKLE: an interior 5 is a muzzle/mouth/nose mark, not the ink line
+            # — render it as the soft shadow tone so it never reads as a near-black dot.
+            return interior_mark
+        return pal[ch]
     lines = []
     for tr in range(0, N, 2):   # two pixel-rows per text-row (N=16 is even)
         line = pad
         for c in range(N):
-            top = px(tr, c)
-            bot = px(tr + 1, c) if tr + 1 < N else OFF
-            line += _cell(top, bot) * xscale
+            if (tr, c) in eyes or (tr + 1, c) in eyes:
+                cell = _cell(eye_rgb, eye_rgb)   # grow the 2×2 eye to a solid white cell
+            else:
+                top = px(tr, c)
+                bot = px(tr + 1, c) if tr + 1 < N else OFF
+                cell = _cell(top, bot)
+            line += cell * xscale
         lines.append(line)
     return caps.emit("\n".join(lines)).split("\n")
 
