@@ -8,6 +8,40 @@
     "example"
   ],
   "oracles": {
+    "team-copilot": {
+      "gate_type": "differential",
+      "description": "Unified team co-piloting oracle (REDUM TEAM-LENS arm). Folds an identical seeded teammate work-state stream through the REAL redum team lens (bin/lib/redum.factor_for_task with team_lens=True, driven over a real on-disk claim+checkpoint ledger) and an independently-authored reference fold, normalizes both to a common comparable partition (the team-candidate roster [surface, haid, human, class, adoptable] \u2014 NOT the raw records), and asserts they are identical across all seeds. Catches whole-aggregate co-piloting bugs a per-record property check passes: a cross-team read (RT-ISO), a reaped-vs-in-flight misclassification (RT-CLASS, the code\u222awork bridge: don't-reinvent live work / don't-redo dropped work), a dropped teammate row (RT-DROP), or a teammate's goal prose leaking into a surfaced candidate (RT-LEAK). The team residual signal at the commit gate is WARN-only (never blocks); the local same-repo redum duplicate gate is unchanged (still hard-blocks).",
+      "domain_signals": [
+        "team-copilot",
+        "redum team lens",
+        "teammate-in-flight",
+        "adoptable-dropped",
+        "code union work bridge",
+        "team_checkpoint_v1",
+        "claimed_surfaces",
+        "factor_for_task"
+      ],
+      "assets": [
+        {
+          "name": "reference-fold",
+          "kind": "separate-agent",
+          "purpose": "Independently authored, spec-only recomputation of the team-candidate roster over a seeded teammate work-state stream. Imports nothing from bin/lib/* (every rule reproduced from INVARIANTS.md), so it shares no code path with the implementation under test (bin/lib/redum.py team lens).",
+          "dir": "evals/oracles/team-copilot"
+        },
+        {
+          "name": "seeded-workstate-stream",
+          "kind": "in-repo-dataset",
+          "purpose": "Deterministic seeded teammate work-state stream generator (reference.generate_stream). Same seed => byte-identical stream; the distribution exercises all three classes (in-flight / adoptable-dropped / completed) plus a cross-team slice that must be excluded (RT-ISO).",
+          "dir": "evals/oracles/team-copilot"
+        }
+      ],
+      "gate_command": "evals/oracles/team-copilot/gate.sh --differential --seeds 200",
+      "reference": {
+        "independent": true,
+        "kind": "separate-agent",
+        "dir": "evals/oracles/team-copilot"
+      }
+    },
     "team-checkpoint": {
       "gate_type": "differential",
       "description": "Shared team-checkpoint roster oracle (TEAM MODE P4). Folds an identical seeded per-HAID checkpoint stream through the implementation (bin/lib/checkpoint_share.fold_stream) and an independently-authored reference fold, normalizes both to a common comparable partition (served roster set keyed by HAID + security-exclusion count \u2014 NOT the raw records), and asserts they are identical across all seeds. Catches whole-aggregate privacy/roster bugs a per-record property check passes: a security-lane leak (INV-C), a secret leak (INV-B), a consent-off leak (INV-D), an absolute-path leak (INV-A), or a dropped/duplicated/misattributed teammate (INV-G).",
@@ -158,40 +192,6 @@
         "independent": true
       }
     },
-    "team-copilot": {
-      "gate_type": "differential",
-      "description": "Unified team co-piloting oracle (REDUM TEAM-LENS arm). Folds an identical seeded teammate work-state stream through the REAL redum team lens (bin/lib/redum.factor_for_task with team_lens=True, driven over a real on-disk claim+checkpoint ledger) and an independently-authored reference fold, normalizes both to a common comparable partition (the team-candidate roster [surface, haid, human, class, adoptable] \u2014 NOT the raw records), and asserts they are identical across all seeds. Catches whole-aggregate co-piloting bugs a per-record property check passes: a cross-team read (RT-ISO), a reaped-vs-in-flight misclassification (RT-CLASS, the code\u222awork bridge: don't-reinvent live work / don't-redo dropped work), a dropped teammate row (RT-DROP), or a teammate's goal prose leaking into a surfaced candidate (RT-LEAK). The team residual signal at the commit gate is WARN-only (never blocks); the local same-repo redum duplicate gate is unchanged (still hard-blocks).",
-      "domain_signals": [
-        "team-copilot",
-        "redum team lens",
-        "teammate-in-flight",
-        "adoptable-dropped",
-        "code union work bridge",
-        "team_checkpoint_v1",
-        "claimed_surfaces",
-        "factor_for_task"
-      ],
-      "assets": [
-        {
-          "name": "reference-fold",
-          "kind": "separate-agent",
-          "purpose": "Independently authored, spec-only recomputation of the team-candidate roster over a seeded teammate work-state stream. Imports nothing from bin/lib/* (every rule reproduced from INVARIANTS.md), so it shares no code path with the implementation under test (bin/lib/redum.py team lens).",
-          "dir": "evals/oracles/team-copilot"
-        },
-        {
-          "name": "seeded-workstate-stream",
-          "kind": "in-repo-dataset",
-          "purpose": "Deterministic seeded teammate work-state stream generator (reference.generate_stream). Same seed => byte-identical stream; the distribution exercises all three classes (in-flight / adoptable-dropped / completed) plus a cross-team slice that must be excluded (RT-ISO).",
-          "dir": "evals/oracles/team-copilot"
-        }
-      ],
-      "gate_command": "evals/oracles/team-copilot/gate.sh --differential --seeds 200",
-      "reference": {
-        "independent": true,
-        "kind": "separate-agent",
-        "dir": "evals/oracles/team-copilot"
-      }
-    },
     "symbol-reuse": {
       "gate_type": "differential",
       "description": "Cross-project symbol-reuse oracle (ponytail rung-2: 'already exists? reuse it'). Folds an identical seeded stream of symbol declarations through the implementation detector (bin/lib/redum.detect_symbol_reuse, via synthesized source) and an independently-authored reference fold, normalizes both to a common comparable partition (the blocked/advised/ok classification \u2014 NOT the raw findings), and asserts they are identical across all seeds. Catches whole-partition classification bugs a per-symbol property check passes: a missed exact function/type re-declaration (SR-C/SR-D), a false-flagged unique symbol (SR-H), an ignored opt-out marker (SR-B), or a cross-file duplicate missed by a file-local index (the project-wide guarantee).",
@@ -224,6 +224,40 @@
           "purpose": "Deterministic seeded symbol-declaration stream generator (reference.generate_stream). Same seed => byte-identical stream; the distribution cycles eight class templates so every seed exercises blocked (exact fn/type), advised (structural/same-name/const), ok (unique + opt-out), and dropped (ignored path)."
         }
       ]
+    },
+    "triage-coord": {
+      "gate_type": "differential",
+      "description": "Team issue-triage co-piloting oracle. Folds an identical seeded multi-HAID issue-pick stream (variable-latency interleaved) through the REAL triage claim path (bin/lib/issue_claim.simulate_claim_stream over a real on-disk HAID-shared claim ledger) and an independently-authored reference fold, normalizes both to the served-claim sequence, and asserts identical across all seeds. Catches whole-sequence triage bugs a per-record check passes: a double-pick race (two teammates claim one issue), a cross-team read, a stale claim not reaped. Routing is suggest-only; the claim gate is HAID-attributed so two teammates never triage/fix the same issue.",
+      "domain_signals": [
+        "triage-coord",
+        "issue triage",
+        "issue-claim",
+        "double-pick",
+        "suggest-only routing",
+        "reap-adopt",
+        "issue_claim",
+        "issue_queue"
+      ],
+      "assets": [
+        {
+          "name": "reference-fold",
+          "kind": "separate-agent",
+          "purpose": "Independently authored spec-only recomputation of the served-claim sequence; imports nothing from bin/lib/*.",
+          "dir": "evals/oracles/triage-coord"
+        },
+        {
+          "name": "seeded-pick-stream",
+          "kind": "in-repo-dataset",
+          "purpose": "Deterministic seeded interleaved multi-HAID issue-pick stream; exercises double-pick, cross-team, stale-reap.",
+          "dir": "evals/oracles/triage-coord"
+        }
+      ],
+      "gate_command": "evals/oracles/triage-coord/gate.sh --differential --seeds 200",
+      "reference": {
+        "independent": true,
+        "kind": "separate-agent",
+        "dir": "evals/oracles/triage-coord"
+      }
     }
   }
 }

@@ -1,0 +1,16 @@
+{
+  "kind": "mutant",
+  "name": "double-pick-race",
+  "defect": "two teammates both granted the SAME (team,issue) over a variable-latency interleave — the whole-sequence race a per-event property check misses (one-owner-per-issue-per-team)",
+  "invariant_violated": ["one-owner-per-issue-per-team"],
+  "stream": [
+    {"t": 0, "seq": 0, "team": "team-alpha", "haid": "haid:a1.box", "issue": "github:o/r#1", "ttl": 5, "action": "pick"},
+    {"t": 1, "seq": 1, "team": "team-alpha", "haid": "haid:a2.box", "issue": "github:o/r#1", "ttl": 5, "action": "pick"}
+  ],
+  "corrupted": {
+    "served": [
+      [0, 0, "team-alpha", "github:o/r#1", "haid:a1.box"],
+      [1, 1, "team-alpha", "github:o/r#1", "haid:a2.box"]
+    ]
+  }
+}
