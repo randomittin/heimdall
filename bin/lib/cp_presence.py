@@ -91,6 +91,20 @@ import telemetry   # REUSE _scrub — no-secret-by-construction (bounded + secre
 PRESENCE_TTL_ENV = "HEIMDALL_PRESENCE_TTL_SECONDS"
 DEFAULT_TTL_SECONDS = 45.0
 
+# ── the ACTIVITY window (a heartbeat with activity fresher than this is "active") ──
+#
+# THE WALL-STATE MODEL (additive, no privacy shift). A beat carries an optional client-owned
+# `activity_ts` (epoch seconds — bumped by the edit hook + an active verdict). The server
+# derives a per-dev wall state from TWO clocks: the online TTL (above) decides membership
+# (OFFLINE = ts older than the TTL, DROPPED), and this ACTIVITY window decides ACTIVE vs IDLE
+# WITHIN the online set — ACTIVE when activity_ts is within the window, IDLE when it is stale
+# or ABSENT (beating — a keeper/daemon heartbeat — but not actively working). The window is
+# deliberately LONGER than the TTL: a dev who edited within the window still reads ACTIVE even
+# across a couple of keeper beats, then decays to IDLE, and only OFFLINE once the beats stop.
+# Overridable via env so a deploy / a test can tune it.
+PRESENCE_ACTIVITY_TTL_ENV = "HEIMDALL_PRESENCE_ACTIVITY_TTL_SECONDS"
+DEFAULT_ACTIVITY_TTL_SECONDS = 120.0
+
 # A conservative slug bound for a project / HAID used as a path segment (mirrors
 # cp_ingest._SLUG_MAX). Keeps the store human-greppable + filesystem-safe + bounded, and
 # (critically for the Firestore flat encoding) produces only single "_" runs from a
@@ -109,6 +123,21 @@ def ttl_seconds():
     except (TypeError, ValueError):
         return DEFAULT_TTL_SECONDS
     return val if val > 0 else DEFAULT_TTL_SECONDS
+
+
+def activity_ttl_seconds():
+    """The ACTIVE-window in seconds (HEIMDALL_PRESENCE_ACTIVITY_TTL_SECONDS, default 120).
+    A dev whose activity_ts is within this window of `now` derives ACTIVE; older/absent =>
+    IDLE (see derive_state). A malformed env value falls back to the default (never crashes
+    a read), and a non-positive value falls back too (the window must be a real duration)."""
+    raw = os.environ.get(PRESENCE_ACTIVITY_TTL_ENV)
+    if not raw:
+        return DEFAULT_ACTIVITY_TTL_SECONDS
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_ACTIVITY_TTL_SECONDS
+    return val if val > 0 else DEFAULT_ACTIVITY_TTL_SECONDS
 
 
 # ── store layout (a keyed record per (project, verified-haid) — StateBackend rel) ──
@@ -204,15 +233,34 @@ def _clean(value):
     return telemetry._scrub(str(value))
 
 
-def build_record(haid, *, project, handle=None, verdict=None, file=None, ts=None):
+def _coerce_ts(value):
+    """Coerce a client-supplied epoch-seconds value to a float, or None if it is not a
+    finite number. Used for the OPTIONAL activity_ts field (a bad/absent value simply
+    means 'no known activity' => the dev derives IDLE, never a crash)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    val = float(value)
+    # Reject NaN / inf (they would poison the window comparison).
+    if val != val or val in (float("inf"), float("-inf")):
+        return None
+    return val
+
+
+def build_record(haid, *, project, handle=None, verdict=None, file=None, ts=None,
+                 activity_ts=None):
     """Assemble ONE DATA-ONLY, secret-scrubbed presence record. Pure — no IO. `haid` is
     the VERIFIED identity (the partition key); project/handle/verdict/file are scrubbed
     DATA. `ts` is epoch seconds (defaults to now) — the freshness used by the TTL.
 
     The schema is CLOSED — only these keys exist:
-      {haid, handle, project, verdict, file, ts}
-    There is NO action_type/cmd/handler field: a presence record is rendered status, it
-    cannot be made to run anything (the §2 control/data-plane line)."""
+      {haid, handle, project, verdict, file, ts, activity_ts}
+    `activity_ts` is the ADDITIVE, OPTIONAL wall-state field (epoch seconds — the last time
+    the client did real work, bumped by the edit hook + an active verdict). It is DATA, not a
+    capability: a client can only ever set its OWN record's activity_ts (the record is keyed
+    by the verified haid), so it can at most (de)promote ITSELF between active and idle. A
+    non-numeric/absent value stores None => the dev derives IDLE (beating but no known
+    activity). There is NO action_type/cmd/handler field: a presence record is rendered
+    status, it cannot be made to run anything (the §2 control/data-plane line)."""
     return {
         "haid": haid,
         "handle": _clean(handle),
@@ -220,12 +268,15 @@ def build_record(haid, *, project, handle=None, verdict=None, file=None, ts=None
         "verdict": _clean(verdict),
         "file": _clean(file),
         # epoch seconds — the freshness the TTL filters on. A bad ts coerces to now.
-        "ts": float(ts) if isinstance(ts, (int, float)) else time.time(),
+        "ts": float(ts) if isinstance(ts, (int, float)) and not isinstance(ts, bool)
+        else time.time(),
+        # epoch seconds of last real activity (OPTIONAL). None => no known activity => IDLE.
+        "activity_ts": _coerce_ts(activity_ts),
     }
 
 
 def record_presence(haid, *, project, team_id, handle=None, verdict=None, file=None,
-                    home=None, ts=None):
+                    home=None, ts=None, activity_ts=None):
     """STORE one dev's heartbeat: build the scrubbed record and atomically upsert it under
     (project, team_id, haid) via put_record (last-write-wins — a fresher beat overwrites the
     dev's prior record). The partition KEY is (project, team_id) and the record KEY is `haid`
@@ -244,7 +295,7 @@ def record_presence(haid, *, project, team_id, handle=None, verdict=None, file=N
     if not haid:
         return {"ok": False, "reason": "no_haid"}
     record = build_record(haid, project=project, handle=handle, verdict=verdict,
-                          file=file, ts=ts)
+                          file=file, ts=ts, activity_ts=activity_ts)
     if not _backend(home).put_record(_record_rel(project, team_id, haid), record):
         return {"ok": False, "reason": "io_error"}
     return {"ok": True, "haid": haid, "project": record.get("project"),
@@ -295,7 +346,32 @@ def is_online(record, *, now=None, ttl=None):
     return (when - ts) <= window
 
 
-def roster(project, team_id, *, home=None, now=None, ttl=None):
+def derive_state(record, *, now=None, activity_ttl=None):
+    """The wall state of an ONLINE presence record: "active" or "idle".
+
+    A record is ACTIVE iff its `activity_ts` (the last real work — an edit/verdict) is within
+    the activity window of `now`; otherwise IDLE. An ABSENT / non-numeric / stale activity_ts
+    => IDLE (beating but no known recent activity — a keeper/daemon heartbeat, or an old client
+    that predates the field). A FUTURE activity_ts beyond the window (a client clock ahead) also
+    reads IDLE rather than falsely-active — a small forward skew (up to the window) is tolerated.
+
+    THIS DOES NOT DECIDE MEMBERSHIP. OFFLINE (ts older than the online TTL) is handled by
+    is_online/roster, which DROP the record before this is ever consulted — so an idle beater
+    STAYS on the wall (demoted to idle), it does not disappear. `now`/`activity_ttl` are
+    injectable for deterministic tests (the clock decides, not the data)."""
+    if not isinstance(record, dict):
+        return "idle"
+    activity_ts = record.get("activity_ts")
+    if not isinstance(activity_ts, (int, float)) or isinstance(activity_ts, bool):
+        return "idle"
+    when = now if now is not None else time.time()
+    window = activity_ttl if activity_ttl is not None else activity_ttl_seconds()
+    delta = when - activity_ts
+    # Within the window looking back (recent work) OR a small forward clock skew => ACTIVE.
+    return "active" if -window <= delta <= window else "idle"
+
+
+def roster(project, team_id, *, home=None, now=None, ttl=None, activity_ttl=None):
     """The ONLINE devs for a (project, team): the fold of the latest heartbeat per dev,
     filtered to those within the TTL, sorted by haid for a stable view. Read-only; an absent
     partition yields [] (honest empty — a nonexistent team and an idle team are
@@ -317,6 +393,7 @@ def roster(project, team_id, *, home=None, now=None, ttl=None):
     backend = _backend(home)
     when = now if now is not None else time.time()
     window = ttl if ttl is not None else ttl_seconds()
+    act_window = activity_ttl if activity_ttl is not None else activity_ttl_seconds()
     out = []
     team_dir = _team_rel(project, team_id)
     for name in backend.list_names(team_dir, suffix=_RECORD_SUFFIX):
@@ -337,6 +414,10 @@ def roster(project, team_id, *, home=None, now=None, ttl=None):
         view = dict(record)
         view["online"] = True
         view["age_seconds"] = round(when - record["ts"], 1)
+        # The DERIVED wall state (ADDITIVE — the record on disk is unchanged). ACTIVE when the
+        # dev's activity_ts is fresh, IDLE when it is stale/absent. OFFLINE never reaches here
+        # (is_online dropped it above), so an idle beater stays on the wall, demoted not dropped.
+        view["state"] = derive_state(record, now=when, activity_ttl=act_window)
         out.append(view)
     out.sort(key=lambda r: str(r.get("haid") or ""))
     return out
@@ -446,9 +527,14 @@ def beat_route(identity, request, *, home=None):
     # stays keyed by the verified haid, so a member can only write ITS OWN presence into a team
     # whose secret it holds).
     team_id = _partition_team(haid, request, home=home)
+    # activity_ts is OPTIONAL client-owned DATA (the last real work the client did — bumped by
+    # the edit hook + an active verdict). It scopes ONLY this caller's own record (keyed by the
+    # verified haid), so it can at most (de)promote the caller between active/idle; a non-numeric
+    # value coerces to None (=> IDLE). No secret risk — it is a number, not a free string.
     result = record_presence(
         haid, project=project, team_id=team_id, handle=payload.get("handle"),
-        verdict=payload.get("verdict"), file=payload.get("file"), home=home)
+        verdict=payload.get("verdict"), file=payload.get("file"),
+        activity_ts=payload.get("activity_ts"), home=home)
     if not result.get("ok"):
         # LOUD on a DROPPED write (the firestore-only silent-drop class). A backend write that
         # fails must NEVER look like a silent 200: it surfaces as a 500 to the client AND is
@@ -566,6 +652,10 @@ def _team_view(record):
         "verdict": record.get("verdict"),
         "file": record.get("file"),
         "age_seconds": record.get("age_seconds"),
+        # The DERIVED wall state (ADDITIVE — the browser renders ● active vs ○ idle). Present on
+        # every roster view (roster() sets it); a legacy view without it reads None -> the client
+        # falls back to a verdict-based guess, so this is backward-compatible for old readers.
+        "state": record.get("state"),
     }
 
 
