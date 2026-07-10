@@ -172,6 +172,34 @@ def _ttl_at_for(rel):
     return datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=horizon)
 
 
+# The Firestore document-id field-path sentinel for a doc-id range/order query. This is the
+# EXACT string google.cloud.firestore_v1.field_path.FieldPath.document_id() returns, used as a
+# LITERAL on purpose: the prod-empty-roster bug was reading it as `firestore.FieldPath`, which is
+# NOT exported at the top-level google.cloud.firestore namespace in the pinned client
+# (google-cloud-firestore==2.16.1 exposes only `firestore.FieldFilter`) — that AttributeError was
+# swallowed and every enumeration silently degraded to a whole-collection scan. Using the literal
+# needs NO import of FieldPath (whose location varies by client version) AND avoids importing the
+# real firestore_v1 as a side effect (which would drag in requests and emit an import-time warning
+# to stderr even under the in-process test fake), so the doc-id pushdown is built identically on
+# every client version. FieldFilter(_DOCUMENT_ID_FIELD, op, value) is the client's canonical
+# document-id filter — "__name__" is the reserved sentinel it special-cases.
+_DOCUMENT_ID_FIELD = "__name__"
+
+
+def _warn_read_failure(op, rel, exc):
+    """Emit ONE stderr line when a bounded enumeration/exists read RAISES (a DeadlineExceeded from
+    a slow scan, a FAILED_PRECONDITION from a missing index, a transport error) and the caller is
+    about to degrade to []/False. Makes an empty roster caused by a backend read error TRACEABLE
+    (never a silent empty). Best-effort: a logging failure must not turn into a read failure."""
+    try:
+        sys.stderr.write(
+            "cp_state_firestore: WARNING %s(%r) read FAILED (%s: %s) — degrading to empty. An "
+            "empty roster here is a BACKEND READ ERROR, not an idle team.\n"
+            % (op, rel, type(exc).__name__, exc))
+    except Exception:  # noqa: BLE001 — best-effort log, never mask the read.
+        return
+
+
 def _dir_prefix(rel_dir):
     """The encoded doc-id prefix every node directly under `rel_dir` shares. A node
     "jobs/job-abc.ndjson" under rel_dir "jobs" encodes to "jobs__job-abc.ndjson", so
@@ -328,23 +356,57 @@ class FirestoreBackend(cp_state.StateBackend):
         """A root-collection query BOUNDED to the docs whose id starts with `prefix` (the bug #17
         hang fix): a Firestore document-id RANGE filter [prefix, prefix+HIGH] pushed to the server
         so ONLY the "<rel_dir>__*" family is scanned, never the whole collection. When the client
-        lacks the range API (an older/limited test double whose module exposes no FieldFilter /
-        FieldPath), it DEGRADES to the full collection ref — still safe because every caller streams
-        it under a wall-clock timeout, so a broad scan can slow but never HANG. An empty prefix
-        (whole-collection enumeration, e.g. list_names of the store root) also returns the full
-        ref (timed-out at the call site)."""
+        lacks the range API (an older/limited test double whose module exposes no FieldFilter),
+        it DEGRADES to the full collection ref — still safe because every caller streams it under
+        a wall-clock timeout, so a broad scan can slow but never HANG. An empty prefix (whole-
+        collection enumeration, e.g. list_names of the store root) also returns the full ref
+        (timed-out at the call site).
+
+        THE PROD-EMPTY-ROSTER BUG (two faults, both fixed here). The bounded read builds a
+        document-id RANGE filter. It failed on the pinned client (google-cloud-firestore==2.16.1)
+        for TWO reasons, and EITHER one silently degrades the read to a whole-collection scan:
+
+          1. THE FIELD-PATH SENTINEL. The prior code read it as `firestore.FieldPath.document_id()`.
+             FieldPath is NOT exported at the top-level google.cloud.firestore namespace in the
+             pinned client (only FieldFilter is), so `firestore.FieldPath` raised AttributeError,
+             which the `except` below SWALLOWED — degrading EVERY list_names/exists to a FULL scan.
+             The doc-id sentinel is the literal "__name__" (_DOCUMENT_ID_FIELD), used directly so
+             no client-version FieldPath-location quirk can disable the pushdown again.
+
+          2. THE COMPARISON VALUE MUST BE A DOCUMENT REFERENCE, NOT A STRING. A "__name__"
+             FieldFilter whose value is a plain STRING serializes to a `string_value`, but Firestore
+             compares __name__ against a `reference_value` (a document PATH) — a string_value bound
+             never matches / is rejected, so the range does NOT bound and the read still returns
+             empty (or scans everything). Passing col.document(<id>) DocumentReferences makes the
+             client serialize `reference_value: projects/.../documents/<root>/<id>`, the shape that
+             actually pushes the doc-id range down to the server.
+
+        On the ever-growing heimdall_cp collection the degraded full scan crossed the 20s query
+        timeout and every roster read silently returned [] (an empty roster despite a landed beat)
+        while a raw call HUNG. Both faults are closed here; a client genuinely lacking FieldFilter
+        (an in-process test fake) still degrades to the full ref (safe under the call-site timeout),
+        and a real read error is surfaced LOUDLY by _warn_read_failure, never a silent empty."""
         col = self._root()
         if not prefix:
             return col
         try:
             from google.cloud import firestore  # lazy — same dep boundary as _build_client.
-            docid = firestore.FieldPath.document_id()
+            # DocumentReference bounds (NOT strings) so the client serializes reference_value —
+            # the only shape Firestore honors for a __name__ range. The [prefix, prefix+HIGH]
+            # window captures exactly the "<rel_dir>__*" family (HIGH = a very high BMP code point
+            # that sorts above every real doc-id char).
+            lo = col.document(prefix)
+            hi = col.document(prefix + _PREFIX_HIGH_SENTINEL)
             return (col
-                    .where(filter=firestore.FieldFilter(docid, ">=", prefix))
-                    .where(filter=firestore.FieldFilter(
-                        docid, "<=", prefix + _PREFIX_HIGH_SENTINEL)))
-        except Exception:  # noqa: BLE001 — a client without the range API degrades to the full
-            return col     # collection (still TIMED-OUT at the call site, so it cannot hang).
+                    .where(filter=firestore.FieldFilter(_DOCUMENT_ID_FIELD, ">=", lo))
+                    .where(filter=firestore.FieldFilter(_DOCUMENT_ID_FIELD, "<=", hi)))
+        except Exception:  # noqa: BLE001 — a client whose module lacks the filter API (an in-
+            # process test fake) degrades to the full collection: safe because every caller streams
+            # under a wall-clock timeout, so a broad scan slows but cannot hang. On the PINNED prod
+            # client FieldFilter DOES exist, so this branch is never taken there — and if a future
+            # client ever drops it, the resulting full-scan timeout is surfaced LOUDLY by
+            # _warn_read_failure at the list_names/exists layer (never a silent empty roster).
+            return col
 
     # ── append-only NDJSON (append_line / read_lines) ─────────────────────────────
 
@@ -514,7 +576,13 @@ class FirestoreBackend(cp_state.StateBackend):
                 if suffix and not rest.endswith(suffix):
                     continue
                 names.add(rest)
-        except Exception:  # noqa: BLE001 — absent/unreadable collection → [] (tolerant).
+        except Exception as exc:  # noqa: BLE001 — unreadable collection → [] (tolerant).
+            # LOUD, not silent: an EMPTY enumeration from a backend read ERROR (a
+            # DeadlineExceeded from a slow/unbounded scan, a FAILED_PRECONDITION from a missing
+            # index) is exactly the prod-empty-roster class. Absent collections do NOT raise
+            # (a streamed empty range just yields nothing), so reaching here means a real error —
+            # name it so an operator sees "read failed" instead of an unexplained empty roster.
+            _warn_read_failure("list_names", rel_dir, exc)
             return []
         return sorted(names)
 
@@ -533,7 +601,9 @@ class FirestoreBackend(cp_state.StateBackend):
                 if snap.id.startswith(prefix):
                     return True
             return False
-        except Exception:  # noqa: BLE001 — unreadable → False (tolerant).
+        except Exception as exc:  # noqa: BLE001 — unreadable → False (tolerant).
+            # LOUD (see list_names): a read ERROR here is not the same as "no such node"; name it.
+            _warn_read_failure("exists", rel, exc)
             return False
 
     # ── path: refused (no local file for a Firestore-backed rel) ──────────────────
