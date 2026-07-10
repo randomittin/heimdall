@@ -75,6 +75,18 @@ PY="$(command -v python3 || command -v python || true)"
 
 # ── parse argv (subcommand + option-style overrides) ───────────────────────────
 SUB="${1:-}"; shift || true
+
+# `doctor` delegates to the self-healing autoenroll helper (bin/heimdall-presence-doctor)
+# with all remaining args (its OWN flags: --bg, --status, --once). Intercepted BEFORE this
+# bin's strict option parser (which would reject --bg/--status) — exec so the doctor owns
+# stdout/stderr/exit. The helper resolves the SAME interpreter/identity/project/wire this
+# bin does and REUSES `beat`/`roster`/`status` for its remediation + verify.
+if [ "$SUB" = "doctor" ]; then
+  DOCTOR_BIN="$SELF_DIR/heimdall-presence-doctor"
+  if [ -x "$DOCTOR_BIN" ]; then exec "$DOCTOR_BIN" "$@"; fi
+  echo "heimdall-presence: doctor helper not found or not executable ($DOCTOR_BIN)" >&2
+  exit 2
+fi
 HAID=""; PROJECT=""; URL=""; HANDLE=""; VERDICT=""; FILE=""; JSON=""; GLOBAL=""; NOFILES=""
 # Keeper-scoped overrides. SESSION keys the per-session pidfile so the SessionEnd stop reaps
 # EXACTLY the keeper this session's SessionStart spawned (never a teammate's live session).
@@ -266,12 +278,15 @@ fi
 # Per-(machine,repo) seed + enroll-throttle paths, keyed by haid (slugged so ':' and '/'
 # never break the filename). The seed material lives ONLY in this 0600 file + the signing
 # process — the bash side handles the PATH, never the seed bytes.
-PKI_DIR=""; SEED_FILE=""; ENROLL_STAMP=""; CRYPTO_WARN_STAMP=""
+PKI_DIR=""; SEED_FILE=""; ENROLL_STAMP=""; CRYPTO_WARN_STAMP=""; DOCTOR_DIAG=""
 if [ -n "${HOME:-}" ] && [ -n "$HAID" ]; then
   PKI_DIR="$HMD_DIR/pki"
   HAID_SLUG="$(printf '%s' "$HAID" | tr '/:' '__')"
   SEED_FILE="$PKI_DIR/$HAID_SLUG.seed"
   ENROLL_STAMP="$PKI_DIR/$HAID_SLUG.enroll-attempt"
+  # The self-heal doctor's persisted last-diagnosis (heimdall-presence-doctor writes it; the
+  # status subcommand below surfaces it so a dev sees WHY presence is/isn't healthy).
+  DOCTOR_DIAG="$PKI_DIR/$HAID_SLUG.doctor-diagnosis"
   # A DEDICATED once-per-window mtime stamp for the crypto-missing warning — separate from
   # the enroll-attempt stamp (which crypto-missing never reaches, since keygen fails first)
   # so the loud warning throttles to ONE line per window without perturbing enroll backoff.
@@ -813,6 +828,18 @@ _keeper_start() {
   else
     printf 'presence keeper: could not confirm start (best-effort — presence still beats on render)\n'
   fi
+  # SELF-HEALING AUTOENROLL: launch the background presence-doctor (detached, idempotent,
+  # consent-gated) alongside the keeper — it diagnoses+remediates+verifies (crypto backend,
+  # interpreter, stale throttle, enroll, roster) until presence is HEALTHY, then quiesces.
+  # REUSES this already-SessionStart-wired keeper-start path (no new hooks.json edit). The
+  # doctor is its OWN detached process (nohup+disown) so it outlives + runs independent of the
+  # keeper loop. SKIPPED under the keeper's beat-injection test seam (HMD_KEEPER_BEAT_BIN) and
+  # an explicit HMD_DOCTOR_DISABLE, so hermetic tests never trigger the doctor's real network.
+  DOCTOR_BIN="$SELF_DIR/heimdall-presence-doctor"
+  if [ -x "$DOCTOR_BIN" ] && [ -z "${HMD_KEEPER_BEAT_BIN:-}" ] && [ -z "${HMD_DOCTOR_DISABLE:-}" ]; then
+    nohup "$DOCTOR_BIN" --bg </dev/null >/dev/null 2>&1 &
+    disown 2>/dev/null || true
+  fi
   return 0
 }
 
@@ -900,6 +927,22 @@ case "$SUB" in
       missing) printf '  signing:   MISSING — presence disabled, run %s -m pip install --user cryptography\n' "${PY:-python3}" ;;
       *)       printf '  signing:   unknown (could not probe the Ed25519 backend)\n' ;;
     esac
+    # The self-heal doctor's LAST DIAGNOSIS (if it has run) — surfaces WHY presence is/isn't
+    # healthy in the natural place a dev checks. `heimdall-presence doctor` heals it in the bg.
+    if [ -n "$DOCTOR_DIAG" ] && [ -f "$DOCTOR_DIAG" ] && [ -n "$PY" ]; then
+      DIAG_LINE="$("$PY" - "$DOCTOR_DIAG" 2>/dev/null <<'PYEOF' || true
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    st = d.get("state") or "?"
+    msg = d.get("reason") or ""
+    sys.stdout.write("%s%s" % (st, (" — %s" % msg) if msg else ""))
+except Exception:
+    sys.stdout.write("")
+PYEOF
+)"
+      [ -n "$DIAG_LINE" ] && printf '  doctor:    %s\n' "$DIAG_LINE"
+    fi
     printf '  note: OFF = invisible, not blind — you can still SEE the team; the team cannot see you.\n'
     ;;
   ""|-h|--help|help)
@@ -920,6 +963,9 @@ heimdall-presence — server-synced team presence (with consent opt-out)
                                       the wall. Idempotent + consent-gated + silent-safe.
   heimdall-presence keeper-stop  [--session ID]
                                       kill this session's keeper + reap its pidfile (no leak)
+  heimdall-presence doctor            SELF-HEAL: diagnose+remediate+verify autoenroll once
+  heimdall-presence doctor --bg       detached background self-heal loop (keeper-start runs it)
+  heimdall-presence doctor --status   print the self-heal doctor's last diagnosis
 
 KEEPER (durable presence): a single SessionStart beat ages out past the TTL and the statusline
 beat only fires on a REDRAW — so a live-but-idle session vanishes from the wall. keeper-start
@@ -955,5 +1001,5 @@ dev exports NOTHING. Overrides still win:
 Offline/unconfigured degrades cleanly (empty roster, no-op beat, exit 0).
 USAGE
     ;;
-  *) echo "heimdall-presence: unknown subcommand '$SUB' (try: beat | roster | on | off | status | retire | keeper-start | keeper-stop)" >&2; exit 2 ;;
+  *) echo "heimdall-presence: unknown subcommand '$SUB' (try: beat | roster | on | off | status | retire | doctor | keeper-start | keeper-stop)" >&2; exit 2 ;;
 esac
