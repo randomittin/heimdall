@@ -184,11 +184,18 @@ def _eye_split(name):
             if wt or wb: (solid, split) = (solid+1, split) if (wt and wb) else (solid, split+1)
     return solid, split
 eye_ok = True; eye_detail = []
-for n in ("rabbit","dog","cat-shock","lisa","dragon","fox"):
+for n in ("rabbit","dog","cat-shock","mouse","dragon","fox"):
     s, sp = _eye_split(n); eye_detail.append("%s=%d/%d" % (n, s, sp))
     if sp != 0 or s == 0: eye_ok = False
 emit("eyes: 2×2 eye-pairs render as SOLID white cells, no half-white checker",
      eye_ok, "solid/split: %s" % " ".join(eye_detail))
+
+# lisa is a PORTRAIT (transcribed from RJ's reference): her eyes are the DARK brown
+# accent7 (#3a2b20 → 58;43;32), NOT the creatures' full-white value-2 eye — so a
+# lisa render must carry the dark-brown ink and NEVER the 255;255;255 white eye.
+lisa_flat = "\n".join(m.sigil_render("lisa", "D", m.tier_caps()))
+emit("lisa: portrait renders DARK eyes (accent7 58;43;32), not a white eye-pair",
+     ("38;2;58;43;32" in lisa_flat) and ("38;2;255;255;255" not in lisa_flat))
 
 # ── 5) COMPACT UNTOUCHED — the detailed literals never touched the value grid ──
 # rebuild rj's finished 8×8 independently and confirm grid_for still equals it.
