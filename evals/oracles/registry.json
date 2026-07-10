@@ -191,6 +191,39 @@
         "kind": "separate-agent",
         "dir": "evals/oracles/team-copilot"
       }
+    },
+    "symbol-reuse": {
+      "gate_type": "differential",
+      "description": "Cross-project symbol-reuse oracle (ponytail rung-2: 'already exists? reuse it'). Folds an identical seeded stream of symbol declarations through the implementation detector (bin/lib/redum.detect_symbol_reuse, via synthesized source) and an independently-authored reference fold, normalizes both to a common comparable partition (the blocked/advised/ok classification \u2014 NOT the raw findings), and asserts they are identical across all seeds. Catches whole-partition classification bugs a per-symbol property check passes: a missed exact function/type re-declaration (SR-C/SR-D), a false-flagged unique symbol (SR-H), an ignored opt-out marker (SR-B), or a cross-file duplicate missed by a file-local index (the project-wide guarantee).",
+      "domain_signals": [
+        "symbol_reuse_v1",
+        "cross-project reuse",
+        "symbol reuse",
+        "duplicate symbol",
+        "re-declared symbol",
+        "canonical symbol",
+        "symbol-reuse"
+      ],
+      "gate_command": "evals/oracles/symbol-reuse/gate.sh --differential --seeds 200",
+      "reference": {
+        "dir": "evals/oracles/symbol-reuse",
+        "independent": true,
+        "kind": "separate-agent"
+      },
+      "assets": [
+        {
+          "dir": "evals/oracles/symbol-reuse",
+          "kind": "separate-agent",
+          "name": "reference-fold",
+          "purpose": "Independently authored, spec-only recomputation of the symbol-reuse classification over a seeded synthetic symbol-declaration stream. Imports nothing from bin/lib/* (every rule reproduced from INVARIANTS.md), so it shares no code path with the implementation under test."
+        },
+        {
+          "dir": "evals/oracles/symbol-reuse",
+          "kind": "in-repo-dataset",
+          "name": "seeded-symbol-stream",
+          "purpose": "Deterministic seeded symbol-declaration stream generator (reference.generate_stream). Same seed => byte-identical stream; the distribution cycles eight class templates so every seed exercises blocked (exact fn/type), advised (structural/same-name/const), ok (unique + opt-out), and dropped (ignored path)."
+        }
+      ]
     }
   }
 }

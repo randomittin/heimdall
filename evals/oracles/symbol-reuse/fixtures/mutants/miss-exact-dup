@@ -1,0 +1,39 @@
+{
+  "kind": "mutant",
+  "name": "miss-exact-dup",
+  "defect": "an exact type duplication (same name + same fields, different module) that MUST hard-block is instead let through as ok \u2014 a missed cross-project re-declaration (SR-D)",
+  "invariant_violated": [
+    "SR-D"
+  ],
+  "stream": {
+    "canonical": [
+      {
+        "module": "app/models.py",
+        "name": "Invoice",
+        "kind": "type",
+        "fields": [
+          "id",
+          "total"
+        ]
+      }
+    ],
+    "proposed": [
+      {
+        "module": "billing/new.py",
+        "name": "Invoice",
+        "kind": "type",
+        "fields": [
+          "id",
+          "total"
+        ]
+      }
+    ]
+  },
+  "corrupted": {
+    "blocked": [],
+    "advised": [],
+    "ok": [
+      "Invoice@billing/new.py"
+    ]
+  }
+}

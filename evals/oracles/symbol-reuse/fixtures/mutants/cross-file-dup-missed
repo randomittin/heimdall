@@ -1,0 +1,39 @@
+{
+  "kind": "mutant",
+  "name": "cross-file-dup-missed",
+  "defect": "an exact function duplication whose canonical lives in a DIFFERENT file is missed and served as ok \u2014 the whole point of a PROJECT-WIDE index is catching cross-file re-declaration (SR-C)",
+  "invariant_violated": [
+    "SR-C"
+  ],
+  "stream": {
+    "canonical": [
+      {
+        "module": "svc/handler.py",
+        "name": "handle_request",
+        "kind": "function",
+        "params": [
+          "req",
+          "ctx"
+        ]
+      }
+    ],
+    "proposed": [
+      {
+        "module": "svc2/handler.py",
+        "name": "handle_request",
+        "kind": "function",
+        "params": [
+          "req",
+          "ctx"
+        ]
+      }
+    ]
+  },
+  "corrupted": {
+    "blocked": [],
+    "advised": [],
+    "ok": [
+      "handle_request@svc2/handler.py"
+    ]
+  }
+}

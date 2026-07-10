@@ -1,0 +1,44 @@
+{
+  "domain": "symbol-reuse",
+  "fixture_kind": "mutants",
+  "purpose": "Each mutant is a self-contained fixture (a symbol-declaration `stream` + the `corrupted` blocked/advised/ok partition a BUGGY detector would emit, breaking ONE invariant). bin/falsify symbol-reuse runs the gate against golden (expect PASS — the impl classification equals the independent reference) then every mutant (expect REJECT — the gate recomputes the CORRECT partition from the stream via the independent reference and diffs it against `corrupted`). Score = mutants rejected / total, conditioned on golden passing; a P0 gate requires 1.0.",
+  "golden": "../golden/differential.json",
+  "mutants": [
+    {
+      "name": "miss-exact-dup",
+      "file": "miss-exact-dup",
+      "defect": "an exact type duplication (same name + same fields, different module) that MUST hard-block is served as ok — a missed cross-project re-declaration",
+      "invariant_violated": [
+        "SR-D"
+      ],
+      "must_turn_red_gate": "differential"
+    },
+    {
+      "name": "false-flag-unique",
+      "file": "false-flag-unique",
+      "defect": "a genuinely unique new symbol is wrongly flagged as a duplicate (false positive)",
+      "invariant_violated": [
+        "SR-H"
+      ],
+      "must_turn_red_gate": "differential"
+    },
+    {
+      "name": "ignore-optout-broken",
+      "file": "ignore-optout-broken",
+      "defect": "an opt-out-marked deliberate local copy is wrongly hard-blocked instead of allowed",
+      "invariant_violated": [
+        "SR-B"
+      ],
+      "must_turn_red_gate": "differential"
+    },
+    {
+      "name": "cross-file-dup-missed",
+      "file": "cross-file-dup-missed",
+      "defect": "an exact function duplication whose canonical lives in a DIFFERENT file is missed and served as ok",
+      "invariant_violated": [
+        "SR-C"
+      ],
+      "must_turn_red_gate": "differential"
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "kind": "differential",
+  "seed": 1,
+  "records": 24,
+  "what": "CORRECT seeded symbol-declaration stream. The gate synthesizes real source from it, folds it through the impl (redum.detect_symbol_reuse) AND the independent reference (reference.fold), normalizes to blocked/advised/ok, and diffs. They MUST be identical. Exercises every class: exact-function + exact-type (SR-C/SR-D block), structural-type + same-name-function + const-redef (SR-E..SR-G advise), unique (SR-H ok), opt-out-allowed (SR-B ok), and ignored-path (SR-A dropped). A false-RED here means the gate rejects its own golden and is itself broken.",
+  "invariants_exercised": [
+    "SR-A",
+    "SR-B",
+    "SR-C",
+    "SR-D",
+    "SR-E",
+    "SR-F",
+    "SR-G",
+    "SR-H"
+  ]
+}

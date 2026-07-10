@@ -1,0 +1,43 @@
+{
+  "kind": "mutant",
+  "name": "false-flag-unique",
+  "defect": "a genuinely unique new symbol is wrongly flagged as a duplicate (false positive) \u2014 the detector must NOT flag a symbol with no canonical match (SR-H)",
+  "invariant_violated": [
+    "SR-H"
+  ],
+  "stream": {
+    "canonical": [
+      {
+        "module": "app/util.py",
+        "name": "clamp",
+        "kind": "function",
+        "params": [
+          "x",
+          "lo",
+          "hi"
+        ]
+      }
+    ],
+    "proposed": [
+      {
+        "module": "feat/report.py",
+        "name": "summarize_ledger",
+        "kind": "function",
+        "params": [
+          "rows"
+        ]
+      }
+    ]
+  },
+  "corrupted": {
+    "blocked": [
+      [
+        "summarize_ledger@feat/report.py",
+        "exact-function",
+        "clamp@app/util.py"
+      ]
+    ],
+    "advised": [],
+    "ok": []
+  }
+}
