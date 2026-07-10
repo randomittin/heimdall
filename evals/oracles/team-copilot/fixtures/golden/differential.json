@@ -1,0 +1,15 @@
+{
+  "kind": "differential",
+  "seeds": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+            17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
+            31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44,
+            45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58,
+            59, 60, 61, 62, 63, 64],
+  "records": 30,
+  "what": "CORRECT seeded, variable-latency, interleaved multi-HAID pick stream. The gate folds it through the impl (issue_claim.simulate_claim_stream) AND the independent reference (reference.fold), normalizes to the served-claim partition, and diffs. They MUST be identical over every seed. Exercises one-owner-per-issue-per-team (a race that only one teammate wins), team isolation (the SAME issue id served in BOTH teams), and TTL-reap→re-pick (a dropped claim's issue re-granted after its window). A false-RED here means the gate rejects its own golden and is itself broken.",
+  "invariants_exercised": [
+    "one-owner-per-issue-per-team",
+    "team-isolation",
+    "ttl-reap-re-pick"
+  ]
+}

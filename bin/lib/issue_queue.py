@@ -30,6 +30,24 @@ import datetime
 import json
 import os
 import re
+import sys
+
+# ── team-mode siblings (TRACK A: claim-gated pick + presence routing) ──────────
+# OPTIONAL + guarded: issue_queue is imported by ~10 modules and the solo/CLI path must
+# never hard-depend on team mode. A missing sibling degrades to solo behaviour (no claim
+# gate, no routing) — byte-identical to today. bin/lib is put on sys.path so the sibling
+# import resolves the same way every CP job resolves its peers.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+try:
+    import issue_claim as _issue_claim  # HAID-attributed git-shared claim (reuses heimdall-claim)
+except Exception:  # pragma: no cover - exercised only on a broken install
+    _issue_claim = None
+try:
+    import cp_presence as _cp_presence  # is_online / roster — the ONLINE decision for routing
+except Exception:  # pragma: no cover
+    _cp_presence = None
 
 # ── schema constants ──────────────────────────────────────────────────────────
 
@@ -475,6 +493,131 @@ def pick_order(issues, cfg=None):
     )
 
 
+# ── presence × expertise ROUTING (SUGGEST-ONLY — never auto-assign) ────────────
+#
+# The coordination-logic addition (TRACK A step 2): pick_order weights by severity/age/source;
+# this is an ORTHOGONAL routing pass that SUGGESTS who should pick an issue up, by the ONLINE
+# roster × each teammate's recently-touched files. It NEVER re-scores severity, NEVER claims,
+# and NEVER assigns — a human/maintainer confirms the pick (RJ decision: suggest-only, surface
+# > auto, per the team-mode law). route_suggestions is a PURE function with ZERO side effects.
+
+_PATH_TOKEN = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_./-]*[A-Za-z0-9_]")
+
+
+def _surface_file(s):
+    return str(s).split("#", 1)[0]
+
+
+def _glob_prefix(g):
+    """Directory prefix of a surface glob (mirrors heimdall-claim's glob_prefix): src/a/** →
+    src/a, src/a/*.ts → src/a, a literal path → itself. Empty means a repo-root glob."""
+    if g.endswith("/**"):
+        return g[:-3]
+    if g == "**":
+        return ""
+    if "*" in g:
+        return g.rsplit("/", 1)[0] if "/" in g else ""
+    return g
+
+
+def _file_overlap(a, b):
+    """Whether two file surfaces overlap by literal equality or directory-prefix nesting —
+    the SAME relation heimdall-claim's files_overlap uses (reproduced here for the pure
+    routing score, over the file parts only)."""
+    fa, fb = _surface_file(a), _surface_file(b)
+    if fa == fb:
+        return True
+    pa, pb = _glob_prefix(fa), _glob_prefix(fb)
+    if pa == "" or pb == "":
+        return True
+    if fb == pa or fb.startswith(pa + "/"):
+        return True
+    if fa == pb or fa.startswith(pb + "/"):
+        return True
+    if pb == pa or pb.startswith(pa + "/") or pa.startswith(pb + "/"):
+        return True
+    return False
+
+
+def _issue_files(issue):
+    """The files an issue implicates, best-effort: explicit source_ref path hints + any
+    path-like token in the title/body. The expertise signal routing scores against — never a
+    guess at code, just the surfaces the issue text names."""
+    files = set()
+    ref = (issue.get("links") or {}).get("source_ref") or {}
+    for key in ("path", "file", "files"):
+        v = ref.get(key)
+        if isinstance(v, str):
+            files.add(v)
+        elif isinstance(v, list):
+            files.update(str(x) for x in v if isinstance(x, str))
+    text = "%s\n%s" % (issue.get("title") or "", issue.get("body") or "")
+    files.update(_PATH_TOKEN.findall(text))
+    return {f for f in files if f}
+
+
+def _is_online(rec, now=None, ttl=None):
+    """ONLINE decision for one teammate record — reuses cp_presence.is_online (the single
+    authority: now - ts <= ttl) when the sibling is importable, else an identical local fold.
+    A record with no/garbled `ts` is OFFLINE (never falsely online)."""
+    if _cp_presence is not None:
+        return _cp_presence.is_online(rec, now=now, ttl=ttl)
+    ts = rec.get("ts") if isinstance(rec, dict) else None
+    if not isinstance(ts, (int, float)):
+        return False
+    import time as _time
+
+    when = now if now is not None else _time.time()
+    window = ttl if ttl is not None else 45.0
+    return (when - ts) <= window
+
+
+def route_suggestions(issue, teammates, now=None, ttl=None):
+    """SUGGEST-ONLY presence × expertise routing. Returns a ranked list of candidate owners
+    for `issue` — NEVER claims, assigns, or mutates anything (a human confirms the pick).
+
+      [{"haid", "human", "score", "reasons": [...], "online": True}, ...]
+
+    ranked by how well each ONLINE teammate's recently-touched files overlap the issue's
+    implicated files. Rules (INVARIANTS): OFFLINE teammates are NEVER suggested (is_online
+    decides membership); a teammate with ZERO file overlap is not a confident owner and is
+    omitted (an issue with no matching online owner therefore yields [] and STAYS queued —
+    a documented expected state, not a bug). `teammates` is a list of roster records
+    {haid, human, files_touched:[...], ts (epoch)}; `now`/`ttl` are injected into the online
+    decision for determinism."""
+    issue_files = _issue_files(issue)
+    out = []
+    for rec in teammates or []:
+        if not isinstance(rec, dict):
+            continue
+        if not _is_online(rec, now=now, ttl=ttl):
+            continue  # OFFLINE → never suggested (no auto-assign to an absent teammate)
+        touched = [str(s) for s in (rec.get("files_touched") or [])]
+        matched = []
+        for f in sorted(issue_files):
+            for s in touched:
+                if _file_overlap(f, s):
+                    matched.append((f, s))
+                    break
+        if not matched:
+            continue  # no expertise signal → not a confident owner
+        out.append(
+            {
+                "haid": rec.get("haid"),
+                "human": rec.get("human"),
+                "score": len(matched),
+                "reasons": [
+                    "touched %s (overlaps issue file %s)" % (s, f) for f, s in matched
+                ],
+                "online": True,
+                # EXPLICIT: a suggestion, not an assignment. The maintainer confirms.
+                "assigned": False,
+            }
+        )
+    out.sort(key=lambda r: (-r["score"], str(r.get("haid") or "")))
+    return out
+
+
 # ── the queue store (atomic JSON, bucketed) ───────────────────────────────────
 
 
@@ -501,6 +644,7 @@ class IssueQueue:
 
     def __init__(self, path=None, repo=None):
         self.path = path or queue_path(repo)
+        self.repo = repo
         self.data = self._load()
 
     # -- persistence -----------------------------------------------------------
@@ -583,11 +727,51 @@ class IssueQueue:
         in_flight BEFORE returning it (claim-before-work — the no-double-work
         guard, dossier §3). A second pick() on the same store returns the NEXT
         issue, never the one already claimed. Returns the claimed issue dict, or
-        None when nothing is pickable. Persists the claim immediately."""
+        None when nothing is pickable. Persists the claim immediately.
+
+        TEAM MODE (opt-in, TRACK A): when claim-gating is active, the machine-local
+        in_flight guard is EXTENDED across teammates. The pick reaps TTL-expired
+        teammate claims (freeing a dropped teammate's issue → handoff), then walks
+        priority order SKIPPING any issue a DIFFERENT teammate holds an ACTIVE
+        git-shared claim on, and CLAIMS the first free issue (HAID-attributed, via
+        heimdall-claim) before returning it. Two teammates can never triage/fix the
+        same issue. The solo/off default path below is byte-identical to today."""
         queued = self._queued()
         if not queued:
             return None
-        chosen = pick_order(queued, cfg)[0]
+        ordered = pick_order(queued, cfg)
+
+        if not self._claim_gate_active():
+            return self._claim_local(ordered[0], now)
+
+        _issue_claim.reap(repo=self.repo)
+        for cand in ordered:
+            # Gate on the synthetic per-issue surface `issue:<slug>` (issue_claim.issue_surface):
+            # check it against every OTHER HAID's active git-shared claim, then claim it before
+            # returning — the machine-local in_flight guard, now promoted cross-teammate.
+            clear, _holder = _issue_claim.check(cand["id"], repo=self.repo)
+            if not clear:
+                continue  # a teammate holds an active claim — cross-teammate no-double-work
+            if not _issue_claim.claim(
+                cand["id"], "issue-triage:" + cand["id"], repo=self.repo
+            ):
+                continue  # lost the claim race (teammate won between check and claim) — next
+            return self._claim_local(cand, now)
+        return None  # every queued issue is actively claimed by a teammate
+
+    def _claim_gate_active(self):
+        """True when team claim-gating should wrap this pick: opt-in (HEIMDALL_TEAM on-ish),
+        the sibling importable, and the heimdall-claim primitive present. Any False → the solo
+        pick below runs, byte-identical to today (no claim shell, no claim file)."""
+        return bool(
+            _issue_claim is not None
+            and _issue_claim.team_claim_enabled()
+            and _issue_claim.available()
+        )
+
+    def _claim_local(self, chosen, now):
+        """Move `chosen` into the machine-local in_flight bucket + persist (the original
+        claim-before-work guard, unchanged). Returns the chosen issue."""
         since = (
             now.replace(microsecond=0).isoformat() if now is not None else _now_iso()
         )
@@ -716,6 +900,8 @@ def _cli(argv):
     p.add_argument("--id")
     p.add_argument("--now")
     p.add_argument("--repo")
+    p.add_argument("--teammates")
+    p.add_argument("--ttl")
     args = p.parse_args(argv)
 
     sub = args.subcommand
@@ -768,6 +954,31 @@ def _cli(argv):
             return 2
         released = q.release(args.id)
         print(json.dumps({"released": released, "id": args.id}, indent=2))
+        return 0
+
+    if sub == "route":
+        # SUGGEST-ONLY routing: print the ranked candidate owners for an issue. Reads only;
+        # NEVER claims/assigns/mutates the queue (a human confirms the pick). --teammates is a
+        # roster JSON (@file or inline) of {haid, human, files_touched, ts}; --now/--ttl pin
+        # the ONLINE decision for a deterministic suggestion.
+        if not args.id:
+            print("error: route needs --id <issue-id>")
+            return 2
+        issue = q.data["issues"].get(args.id)
+        if issue is None:
+            print("error: unknown issue id: %s" % args.id)
+            return 2
+        teammates = _read_json_arg(args.teammates) if args.teammates else []
+        route_now = float(args.now) if args.now else None
+        route_ttl = float(args.ttl) if args.ttl else None
+        suggestions = route_suggestions(issue, teammates, now=route_now, ttl=route_ttl)
+        print(
+            json.dumps(
+                {"id": args.id, "assigned": False, "suggestions": suggestions},
+                indent=2,
+                sort_keys=True,
+            )
+        )
         return 0
 
     print("error: unknown subcommand: %s" % sub)

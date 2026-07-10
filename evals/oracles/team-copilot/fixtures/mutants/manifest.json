@@ -1,0 +1,29 @@
+{
+  "domain": "team-copilot",
+  "fixture_kind": "mutants",
+  "purpose": "Each mutant is a self-contained fixture (a pick `stream` + the `corrupted` served-claim partition a BUGGY impl would emit, breaking ONE invariant). bin/falsify team-copilot runs the gate against golden (expect PASS — the impl fold equals the independent reference) then every mutant (expect REJECT — the gate recomputes the CORRECT partition from the stream via the independent reference and diffs it against `corrupted`). Score = mutants rejected / total, conditioned on golden passing; a P0 gate requires 1.0.",
+  "golden": "../golden/differential.json",
+  "mutants": [
+    {
+      "name": "double-pick-race",
+      "file": "double-pick-race",
+      "defect": "two teammates both granted the SAME (team,issue) — the whole-sequence race a per-event 'each grant is valid' check misses (one-owner-per-issue-per-team)",
+      "invariant_violated": ["one-owner-per-issue-per-team"],
+      "must_turn_red_gate": "differential"
+    },
+    {
+      "name": "cross-team-read",
+      "file": "cross-team-read",
+      "defect": "a pick in team-beta is DENIED because team-alpha holds the same issue id — a cross-team read that leaks one team's claims into another's arbitration (team-isolation / rr-multitenant-isolation)",
+      "invariant_violated": ["team-isolation"],
+      "must_turn_red_gate": "differential"
+    },
+    {
+      "name": "stale-claim-not-reaped",
+      "file": "stale-claim-not-reaped",
+      "defect": "a dropped teammate's TTL-expired claim is never reaped, so a later pick of the same issue is DENIED forever — the issue is wedged, never adoptable (ttl-reap-re-pick / handoff)",
+      "invariant_violated": ["ttl-reap-re-pick"],
+      "must_turn_red_gate": "differential"
+    }
+  ]
+}

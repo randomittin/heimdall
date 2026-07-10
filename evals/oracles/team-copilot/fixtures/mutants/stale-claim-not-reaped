@@ -1,0 +1,15 @@
+{
+  "kind": "mutant",
+  "name": "stale-claim-not-reaped",
+  "defect": "a dropped teammate's TTL-expired claim is never reaped, so a later pick of the same issue is DENIED forever — the issue is wedged, never adoptable (ttl-reap-re-pick / handoff)",
+  "invariant_violated": ["ttl-reap-re-pick"],
+  "stream": [
+    {"t": 0, "seq": 0, "team": "team-alpha", "haid": "haid:a1.box", "issue": "github:o/r#1", "ttl": 4, "action": "pick"},
+    {"t": 10, "seq": 1, "team": "team-alpha", "haid": "haid:a2.box", "issue": "github:o/r#1", "ttl": 4, "action": "pick"}
+  ],
+  "corrupted": {
+    "served": [
+      [0, 0, "team-alpha", "github:o/r#1", "haid:a1.box"]
+    ]
+  }
+}

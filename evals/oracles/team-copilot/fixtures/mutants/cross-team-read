@@ -1,0 +1,15 @@
+{
+  "kind": "mutant",
+  "name": "cross-team-read",
+  "defect": "a pick in team-beta is DENIED because team-alpha holds the same issue id — a cross-team read leaking one team's claims into another's arbitration (team-isolation)",
+  "invariant_violated": ["team-isolation"],
+  "stream": [
+    {"t": 0, "seq": 0, "team": "team-alpha", "haid": "haid:a1.box", "issue": "github:o/r#1", "ttl": 5, "action": "pick"},
+    {"t": 1, "seq": 1, "team": "team-beta", "haid": "haid:b1.box", "issue": "github:o/r#1", "ttl": 5, "action": "pick"}
+  ],
+  "corrupted": {
+    "served": [
+      [0, 0, "team-alpha", "github:o/r#1", "haid:a1.box"]
+    ]
+  }
+}

@@ -8,6 +8,39 @@
     "example"
   ],
   "oracles": {
+    "team-copilot": {
+      "gate_type": "differential",
+      "description": "Team co-piloting triage claim-arbitration oracle (TEAM MODE, TRACK A). Folds an identical seeded, variable-latency, interleaved multi-HAID pick stream through the implementation (bin/lib/issue_claim.simulate_claim_stream) and an independently-authored reference fold, normalizes both to a common comparable partition (the served-claim sequence, keyed by [t, seq, team, issue, haid] — NOT the raw events), and asserts they are identical across all seeds. Catches whole-sequence race/isolation/TTL bugs a per-event property check passes: a double-pick race (two teammates both granted one issue), a cross-team read (one team's claim blocking another team's pick), or a stale claim never reaped (a dropped teammate's issue wedged, never adoptable). Property checks (one-owner-per-issue, no-cross-team-read, reap-frees) accompany but never replace the whole-sequence differential.",
+      "domain_signals": [
+        "team-copilot",
+        "team triage",
+        "issue claim",
+        "claim-gated pick",
+        "no-double-work",
+        "presence routing",
+        "reap handoff"
+      ],
+      "assets": [
+        {
+          "name": "reference-fold",
+          "kind": "separate-agent",
+          "purpose": "Independently authored, spec-only recomputation of the served-claim sequence over a seeded interleaved pick stream. Imports nothing from bin/lib/* (every rule reproduced from INVARIANTS.md), so it shares no code path with the implementation under test.",
+          "dir": "evals/oracles/team-copilot"
+        },
+        {
+          "name": "seeded-pick-stream",
+          "kind": "in-repo-dataset",
+          "purpose": "Deterministic seeded, VARIABLE-LATENCY interleaved multi-HAID pick stream generator (reference.generate_stream). Same seed => byte-identical stream; two teams share the same issue ids (exercising isolation) and TTLs are short (exercising reap→re-pick). NOT a fixed-yield arrival-ordered sweep — the jittered interleave is where the double-pick race hides.",
+          "dir": "evals/oracles/team-copilot"
+        }
+      ],
+      "gate_command": "evals/oracles/team-copilot/gate.sh --differential --seeds 200",
+      "reference": {
+        "independent": true,
+        "kind": "separate-agent",
+        "dir": "evals/oracles/team-copilot"
+      }
+    },
     "team-checkpoint": {
       "gate_type": "differential",
       "description": "Shared team-checkpoint roster oracle (TEAM MODE P4). Folds an identical seeded per-HAID checkpoint stream through the implementation (bin/lib/checkpoint_share.fold_stream) and an independently-authored reference fold, normalizes both to a common comparable partition (served roster set keyed by HAID + security-exclusion count — NOT the raw records), and asserts they are identical across all seeds. Catches whole-aggregate privacy/roster bugs a per-record property check passes: a security-lane leak (INV-C), a secret leak (INV-B), a consent-off leak (INV-D), an absolute-path leak (INV-A), or a dropped/duplicated/misattributed teammate (INV-G).",
