@@ -33,12 +33,13 @@ BEFORE any downsample (OFF -> DIM filled block) so box-filtering never fringes.
 Two ways a grid is born — a HYBRID that always yields a clean, legible face:
   - CURATED   : 4 hand-authored mockup identities (rj/nadia/arjun/priya) ship
                 their exact grids + hue, so those seeds match the design 1:1.
-  - GENERATED : every other seed (real HAIDs are arbitrary) is built on a fixed
-                guardian-sprite TEMPLATE — domed helm / framed visor / armed torso
-                / two legs. The fixed cells carve the SAME little sentinel for every
-                seed; the hash only flips a few TEXTURE cells that EXTEND the build
-                (crest, pauldrons, arms, hip flare, stance), mirrored about the 3.5
-                axis. No free bit placement -> a recognizable creature, never a blob.
+  - GENERATED : every other seed (real HAIDs are arbitrary) maps DETERMINISTICALLY
+                onto the ported superx SPRITE CAST — a set of hand-authored animal
+                characters (owl / fox / cat / rabbit / panda / bear / dog / monk),
+                each with its own unmistakable ear-and-body silhouette + hue. The
+                hash picks ONE animal (sha256(seed)[0] % 8); the same seed always
+                gets the same character. Distinct HAIDs -> distinct recognizable
+                animals, never the one muddy guardian blob for everyone.
 
 Both paths then get the universal watchman finish: a full-dark carved VISOR BAND
 (grid rows 2+3, edge to edge) holding two FULL-CELL white square EYES (cols 2 & 5,
@@ -85,31 +86,59 @@ CURATED_HUES = {
     'priya': (244, 114, 182),   # pink
 }
 
-# generated seeds draw their hue from the SAME 4-color identity palette — the
-# terminal never shows an off-brand body color the mockup never uses.
-GEN_HUES = [(45, 212, 191), (245, 158, 11), (167, 139, 250), (244, 114, 182)]
-
-# guardian-sprite TEMPLATE — half-grid (cols 0..3; mirror about the 3.5 axis to cols
-# 7..4 — even width, no center column), 8 rows.
-# codes: '1' body (always lit)   '.' off (always dark)   '~' texture (hash decides).
-# The fixed '1'/'.' cells carve a recognizable little SENTINEL/INVADER silhouette —
-# domed helm, framed visor, an armed torso, two legs — so EVERY seed is the same
-# creature, never a random blob. Each '~' only ever EXTENDS an adjacent solid run
-# (a wider crest, broad pauldrons, arms out, a hip flare, a wider stance) so a texture
-# bit varies the guardian's build/livery per seed WITHOUT ever leaving an isolated
-# dot. 5 texture cells -> 32 silhouettes x 4 identity hues = 128 distinct sprites.
-# rows 2/3 here only reserve the visor's negative space — the universal finish carves
-# the full dark band and punches the real full-cell eyes at cols 2 & 5.
-TEMPLATE = [
-    ".~11",  # row0 crown    — domed helm cap; ~col1 = crest / wider crown
-    ".111",  # row1 helm      — full helm dome (cols 1..6)
-    "....",  # row2 visor top — all dark; eyes punched at cols 2 & 5
-    "....",  # row3 visor bot — all dark; eyes punched at cols 2 & 5
-    "~111",  # row4 shoulders — chest plate; ~col0 = pauldrons / arms out (6 -> 8 wide)
-    ".~1.",  # row5 torso     — body core with an extending arm (~col1), never dotty
-    "..~1",  # row6 hips      — lower torso; ~col2 = belt / hip flare (narrow -> wide)
-    ".1~.",  # row7 legs      — two legs; ~col2 = wider planted stance (narrow -> wide)
-]
+# ── SUPERX SPRITE CAST (ported) — the generated path is a recognizable ANIMAL, not
+#    a blob. The superx dashboard shipped a cast of full-body pixel characters (one
+#    per agent role) that READ as characters because each had an unmistakable
+#    SILHOUETTE. That cast is ported here to the statusline's 8x8 half-block grid:
+#    the distinguishing cues that survive at 4-row terminal scale — EAR shape (top
+#    text-row) + BODY silhouette (bottom two text-rows) — are hand-authored per
+#    animal; the middle band (rows 2,3) is reserved for the universal watchman finish
+#    (carved dark + full-cell eyes at cols 2 & 5), so every animal still reads as a
+#    face. Values: 0=off (DIM silhouette block), 1=body hue, 2=eye. Every row is
+#    vertically symmetric (mirror about the 3.5 axis) — the render/width invariant.
+#    A HAID is mapped DETERMINISTICALLY onto one animal (sha256(seed)[0] % 8), so
+#    each dev gets a STABLE, recognizable character forever — 8 animals × distinct
+#    per-character hues, never the one muddy guardian for everyone.
+ANIMALS = {
+    # owl — architect: ear tufts at the outer corners, round tapered body, talons.
+    'owl':    ["10000001", "11111111", "01111110", "01111110",
+               "01111110", "01111110", "00111100", "01000010"],
+    # fox — coder: pointed ears (wide at the base), a slim body, legs + shoes.
+    'fox':    ["01000010", "11100111", "01111110", "01111110",
+               "00111100", "00111100", "01100110", "11000011"],
+    # cat — design: two-pronged pointed ears, slim body.
+    'cat':    ["10100101", "01111110", "01111110", "01111110",
+               "01111110", "00111100", "00111100", "01100110"],
+    # rabbit — test-runner: tall thin centered ears merging into the crown.
+    'rabbit': ["00100100", "00111100", "01111110", "01111110",
+               "01111110", "01111110", "00111100", "01100110"],
+    # panda — lint-quality: small round mid-ears, a wide belly.
+    'panda':  ["01100110", "11111111", "01111110", "01111110",
+               "11111111", "01111110", "01111110", "01100110"],
+    # bear — reviewer: round ears at the extreme corners, a wide head + body.
+    'bear':   ["11000011", "11111111", "01111110", "01111110",
+               "01111110", "01111110", "01111110", "01100110"],
+    # dog — docs-writer: floppy ears hang down the sides (cols 0,7 lit at row 4).
+    'dog':    ["01111110", "11111111", "01111110", "01111110",
+               "11111111", "01111110", "01111110", "01100110"],
+    # monk — superx mascot: bald narrow crown (no ears), robe flares wide at the base.
+    'monk':   ["00111100", "01111110", "01111110", "01111110",
+               "01111110", "01111110", "11111111", "11111111"],
+}
+# fixed order → deterministic index from the HAID hash (bash-3.2 test parity too).
+ANIMAL_ORDER = ['owl', 'fox', 'cat', 'rabbit', 'panda', 'bear', 'dog', 'monk']
+# per-character hue — a well-separated categorical palette echoing the superx role
+# colors, so two devs on different animals are also different COLORS (max distinction).
+ANIMAL_HUES = {
+    'owl':    (52, 152, 219),    # blue
+    'fox':    (46, 204, 113),    # green
+    'cat':    (224, 86, 160),    # magenta
+    'rabbit': (241, 196, 15),    # yellow
+    'panda':  (200, 205, 210),   # light slate (patches read against the dark band)
+    'bear':   (231, 76, 60),     # red
+    'dog':    (26, 188, 156),    # teal
+    'monk':   (230, 126, 34),    # orange
+}
 
 EYE = (240, 248, 255)   # bright eye glint (aliceblue)
 DIM = (19, 21, 29)       # OFF pixel — a DIM FILLED cell (#13151d) -> solid silhouette
@@ -138,31 +167,23 @@ def _apply_watchman(g):
         g[3][col] = 2               # bottom half of the eye cell
     return g
 
+def animal_for(seed):
+    """The deterministic animal a HAID maps onto: sha256(seed)[0] % 8, indexed into
+    the fixed ANIMAL_ORDER. Same seed -> same animal, forever, on every surface."""
+    idx = hashlib.sha256(seed.encode()).digest()[0] % len(ANIMAL_ORDER)
+    return ANIMAL_ORDER[idx]
+
 def grid_for(seed, eye_override=None):
-    """8x8 vertically-symmetric watchman. Curated for the 4 mockup seeds,
-    template-generated (clean, framed eyes) for everything else."""
+    """8x8 vertically-symmetric watchman. Curated for the 4 mockup seeds; every other
+    HAID maps deterministically onto a ported superx ANIMAL sprite (recognizable
+    character, never a blob). Both paths get the universal watchman finish."""
     if seed in CURATED_GRIDS:
         g = [[int(ch) for ch in row] for row in CURATED_GRIDS[seed]]
         hue = CURATED_HUES[seed]
     else:
-        h = hashlib.sha256(seed.encode()).digest()
-        g = [[0] * W for _ in range(H)]
-        half = W // 2  # cols 0..3, then mirror to 7..4 (even width, no center col)
-        bit = 0
-        for r in range(H):
-            for c in range(half):
-                code = TEMPLATE[r][c]
-                if code == '1':
-                    v = 1
-                elif code == '~':
-                    byte = h[(bit // 8) % len(h)]
-                    v = (byte >> (bit % 8)) & 1   # texture bit, low density per template
-                    bit += 1
-                else:
-                    v = 0
-                g[r][c] = v
-                g[r][W - 1 - c] = v               # mirror about the 3.5 axis
-        hue = GEN_HUES[h[0] % len(GEN_HUES)]
+        name = animal_for(seed)
+        g = [[int(ch) for ch in row] for row in ANIMALS[name]]
+        hue = ANIMAL_HUES[name]
     _apply_watchman(g)
     eye = eye_override or EYE
     return g, hue, eye
