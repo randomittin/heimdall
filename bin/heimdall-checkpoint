@@ -1,0 +1,234 @@
+#!/usr/bin/env bash
+# heimdall-checkpoint — mechanical, LLM-free auto-save of forward session state.
+#
+# WHY THIS EXISTS
+#   Heimdall is meant to auto-save session state to .planning/ so a fresh run
+#   resumes with context. The RICH save is /hmd:save (commands/save.md) — but that
+#   is an LLM PROMPT, so it only runs when a human types /hmd:save. Nothing wrote
+#   the .planning state files on its own: the SessionEnd hook only did a git COMMIT
+#   ("session-end checkpoint"), and .planning/ is gitignored, so forward state was
+#   never persisted automatically. Result: RJ had to run /hmd:save by hand.
+#
+#   This script is the MECHANICAL fallback that the SessionEnd hook invokes so
+#   auto-checkpointing fires on its own. It does NOT reimplement the LLM handoff —
+#   it captures the machine-derivable forward state (git HEAD, recent commits,
+#   dirty files, active goal, phase) into an .planning/CHECKPOINT.md block that a
+#   resuming session (and bin/heimdall-context-capsule) already knows how to read.
+#   A subsequent /hmd:save enriches the same file; this guarantees SOMETHING is
+#   always there.
+#
+# CONTRACT
+#   - Best-effort / non-fatal: every step tolerates missing git/jq/state. Exit 0.
+#   - Idempotent: the auto block is delimited by markers and REPLACED in place, so
+#     re-runs update (mtime advances) rather than appending forever.
+#   - Non-destructive: a manual (marker-less) CHECKPOINT.md is preserved; the auto
+#     block is inserted around it.
+#   - .planning/ is gitignored — we write to disk only, never `git add`.
+#
+# USAGE
+#   heimdall-checkpoint write [project_dir]   # write/update .planning/CHECKPOINT.md
+#   heimdall-checkpoint help
+#
+# DEV-CHECKOUT COVERAGE
+#   This is invoked from the EXISTING SessionEnd command in hooks/hooks.json (it is
+#   an additive prefix to that one command, not a new hook entry). Plugin installs
+#   load hooks.json directly; dev-checkouts get it because install.sh reads
+#   hooks/hooks.json and mirrors every command into ~/.claude/settings.json. So no
+#   NEW wiring is needed — a dev-checkout only re-runs install.sh (or reloads the
+#   plugin) to pick up the updated SessionEnd command. If you hand-wire settings.json
+#   instead, the SessionEnd entry must include this prefix (before the autocommit
+#   early-exit, so state saves even when autocommit is off):
+#     "SessionEnd": [{ "hooks": [{ "type": "command", "command":
+#        "PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel)}\"; CKPT=\"$PLUGIN/bin/heimdall-checkpoint\"; if [ -x \"$CKPT\" ] && { [ -d .planning ] || [ -f heimdall-state.json ]; }; then \"$CKPT\" write . >/dev/null 2>&1 || true; fi; ..." }] }]
+
+set -uo pipefail
+
+BEGIN_MARK="<!-- heimdall-auto-checkpoint:begin -->"
+END_MARK="<!-- heimdall-auto-checkpoint:end -->"
+
+_timestamp() { date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "unknown"; }
+
+# Build the machine-readable auto-checkpoint block (stdout). Pure, no side effects.
+_build_block() {
+  local project_dir="$1" ts="$2"
+  local branch head_sha commits changed goal phase
+
+  if git -C "$project_dir" rev-parse --git-dir >/dev/null 2>&1; then
+    branch=$(git -C "$project_dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
+    head_sha=$(git -C "$project_dir" rev-parse --short HEAD 2>/dev/null || echo "none")
+    commits=$(git -C "$project_dir" log --oneline -10 2>/dev/null || true)
+    changed=$(git -C "$project_dir" status --porcelain 2>/dev/null | head -40 || true)
+  else
+    branch="n/a"; head_sha="n/a"; commits=""; changed=""
+  fi
+
+  # Active goal (best-effort; heimdall-state may be absent or uninitialised).
+  goal="none"
+  if command -v heimdall-state >/dev/null 2>&1; then
+    goal=$( (cd "$project_dir" && heimdall-state goal-get 2>/dev/null) || echo "none" )
+  fi
+  [ -z "$goal" ] && goal="none"
+
+  # Phase from STATE.md frontmatter if present.
+  phase="unknown"
+  if [ -f "$project_dir/.planning/STATE.md" ]; then
+    phase=$(awk '/^---$/{c++; next} c==1 && /^phase:/{gsub(/^phase:[[:space:]]*"?/,""); gsub(/"$/,""); print; exit}' \
+      "$project_dir/.planning/STATE.md" 2>/dev/null || echo "unknown")
+    [ -z "$phase" ] && phase="unknown"
+  fi
+
+  local dirty_count
+  dirty_count=$(printf '%s\n' "$changed" | grep -c . 2>/dev/null || echo 0)
+
+  printf '%s\n' "$BEGIN_MARK"
+  printf '## Auto-checkpoint — %s\n\n' "$ts"
+  printf '> Written automatically at session end (mechanical, no LLM). Run `/hmd:save`\n'
+  printf '> for a richer human/LLM-authored handoff — it enriches this same file.\n\n'
+  printf '- **Branch:** %s\n' "$branch"
+  printf '- **HEAD:** %s\n' "$head_sha"
+  printf '- **Phase:** %s\n' "$phase"
+  printf '- **Active goal:** %s\n' "$goal"
+  printf '- **Uncommitted files:** %s\n\n' "$dirty_count"
+
+  printf '### Recent commits\n'
+  if [ -n "$commits" ]; then
+    printf '%s\n' "$commits" | sed 's/^/- /'
+  else
+    printf -- '- (no git history)\n'
+  fi
+  printf '\n'
+
+  if [ -n "$changed" ]; then
+    printf '### Uncommitted changes (git status --porcelain)\n'
+    printf '```\n%s\n```\n\n' "$changed"
+  fi
+
+  printf '### Resume\n'
+  printf 'Read this file, then `heimdall` to resume. If a goal is set above, restore it with `/goal <condition>`.\n'
+  printf '%s\n' "$END_MARK"
+}
+
+# Splice the fresh block into CHECKPOINT.md.
+#   - no file        -> header + block
+#   - has markers    -> replace between begin/end (update in place)
+#   - marker-less    -> prepend block, preserve existing (manual save protected)
+_write_checkpoint() {
+  local ckpt="$1" block="$2"
+  local tmp
+  tmp=$(mktemp) || return 1
+
+  # Line numbers of an existing auto block, if any. Both markers must be present
+  # and ordered for an in-place replace; otherwise we treat the file as manual.
+  local bstart="" bend="" total
+  if [ -f "$ckpt" ]; then
+    bstart=$(grep -nF "$BEGIN_MARK" "$ckpt" 2>/dev/null | head -1 | cut -d: -f1)
+    bend=$(grep -nF "$END_MARK" "$ckpt" 2>/dev/null | head -1 | cut -d: -f1)
+  fi
+
+  if [ ! -f "$ckpt" ]; then
+    {
+      printf '# Checkpoint\n\n'
+      printf '%s\n' "$block"
+    } > "$tmp"
+  elif [ -n "$bstart" ] && [ -n "$bend" ] && [ "$bend" -ge "$bstart" ]; then
+    # Replace the existing auto block in place (sed line-slice — no multi-line
+    # awk -v, which breaks on BSD awk). Keep surrounding content verbatim.
+    total=$(wc -l < "$ckpt" | tr -d ' ')
+    {
+      [ "$bstart" -gt 1 ] && sed -n "1,$((bstart - 1))p" "$ckpt"
+      printf '%s\n' "$block"
+      [ "$bend" -lt "$total" ] && sed -n "$((bend + 1)),\$p" "$ckpt"
+    } > "$tmp"
+  else
+    # Manual/LLM-authored checkpoint (no clean auto block) — do NOT clobber.
+    # Prepend the auto block, preserve the existing content below.
+    {
+      printf '%s\n\n' "$block"
+      cat "$ckpt"
+    } > "$tmp"
+  fi
+
+  mv "$tmp" "$ckpt" 2>/dev/null || { rm -f "$tmp"; return 1; }
+}
+
+# Persist goal + phase + last-checkpoint timestamp into .planning/settings.json.
+# Best-effort: needs jq; a "none" goal is not written as a fake condition.
+_update_settings() {
+  local settings="$1" goal="$2" phase="$3" ts="$4"
+  command -v jq >/dev/null 2>&1 || return 0
+
+  local base tmp
+  if [ -f "$settings" ]; then
+    base=$(cat "$settings" 2>/dev/null)
+    # Guard against a corrupt/non-JSON file — fall back to {} rather than error.
+    echo "$base" | jq -e . >/dev/null 2>&1 || base='{}'
+  else
+    base='{}'
+  fi
+
+  tmp=$(mktemp) || return 0
+  if [ "$goal" = "none" ] || [ -z "$goal" ]; then
+    printf '%s' "$base" | jq --arg p "$phase" --arg ts "$ts" \
+      '.phase = $p | .auto_checkpoint_at = $ts' > "$tmp" 2>/dev/null \
+      && mv "$tmp" "$settings" 2>/dev/null || rm -f "$tmp"
+  else
+    printf '%s' "$base" | jq --arg g "$goal" --arg p "$phase" --arg ts "$ts" \
+      '.goal = ((.goal // {}) + {condition: $g}) | .phase = $p | .auto_checkpoint_at = $ts' > "$tmp" 2>/dev/null \
+      && mv "$tmp" "$settings" 2>/dev/null || rm -f "$tmp"
+  fi
+}
+
+cmd_write() {
+  local project_dir="${1:-$PWD}"
+  # Resolve; a bad path is non-fatal (we simply do nothing).
+  project_dir=$(cd "$project_dir" 2>/dev/null && pwd) || return 0
+  local planning="$project_dir/.planning"
+
+  mkdir -p "$planning" 2>/dev/null || return 0
+
+  local ts block
+  ts=$(_timestamp)
+  block=$(_build_block "$project_dir" "$ts") || return 0
+
+  _write_checkpoint "$planning/CHECKPOINT.md" "$block" || return 0
+
+  # Derive goal/phase once more for settings (cheap; keeps settings authoritative).
+  local goal phase
+  goal="none"
+  if command -v heimdall-state >/dev/null 2>&1; then
+    goal=$( (cd "$project_dir" && heimdall-state goal-get 2>/dev/null) || echo "none" )
+  fi
+  [ -z "$goal" ] && goal="none"
+  phase="unknown"
+  if [ -f "$planning/STATE.md" ]; then
+    phase=$(awk '/^---$/{c++; next} c==1 && /^phase:/{gsub(/^phase:[[:space:]]*"?/,""); gsub(/"$/,""); print; exit}' \
+      "$planning/STATE.md" 2>/dev/null || echo "unknown")
+    [ -z "$phase" ] && phase="unknown"
+  fi
+  _update_settings "$planning/settings.json" "$goal" "$phase" "$ts"
+
+  echo "[heimdall-checkpoint] auto-saved $planning/CHECKPOINT.md" >&2
+  return 0
+}
+
+case "${1:-help}" in
+  write) cmd_write "${2:-}" ;;
+  help|--help|-h)
+    cat <<'USAGE'
+heimdall-checkpoint — mechanical auto-save of forward session state to .planning/
+
+Usage:
+  heimdall-checkpoint write [project_dir]   Write/update .planning/CHECKPOINT.md
+                                            (+ STATE.md phase & settings.json goal)
+                                            from git + heimdall-state. Non-fatal,
+                                            idempotent, never clobbers a manual save.
+
+Invoked automatically by the SessionEnd hook. The rich, human-authored handoff is
+/hmd:save (commands/save.md); this is the always-on mechanical safety net.
+USAGE
+    ;;
+  *)
+    echo "Unknown command: ${1}. Try: heimdall-checkpoint help" >&2
+    exit 1
+    ;;
+esac
