@@ -558,6 +558,69 @@ PY
   printf 'skipped'
 }
 
+# ── Ed25519 PKI crypto backend (the fix for the invisible-teammate outage) ────
+#
+# THE BUG (root cause of a multi-hour teammate-presence outage): a fresh curl|bash
+# install had NO working presence because the python interpreter hmd invokes for
+# heimdall-presence carried NEITHER `cryptography` NOR `pynacl`. The chain:
+#   heimdall-presence beat → cp_auth.generate_keypair() raises
+#   AuthError('crypto_unavailable') (cp_auth.py:143 — backend None when neither lib
+#   imports) → the beat swallows it → no enroll → no signing seed → unsigned beats
+#   dropped → the teammate is INVISIBLE on the wall, SILENTLY.
+# Two real teammates (akshat, madhavan) lost hours to this.
+#
+# _crypto_importable — true iff the given interpreter can load an Ed25519 backend.
+# Mirrors cp_auth.py's backend order EXACTLY (cryptography.hazmat…ed25519 first, then
+# nacl.signing) so this check agrees byte-for-byte with what crypto_available() will
+# decide at beat time. Quiet: all output discarded — only the exit code matters.
+_crypto_importable() {
+  local py="$1"
+  "$py" - <<'PY' >/dev/null 2>&1
+import sys
+try:
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey  # noqa: F401
+except Exception:
+    try:
+        import nacl.signing  # noqa: F401
+    except Exception:
+        sys.exit(1)
+sys.exit(0)
+PY
+}
+
+# ensure_crypto_backend — GUARANTEE the presence interpreter can do Ed25519, or shout.
+# Targets the EXACT interpreter heimdall-presence runs (bin/heimdall-presence:74,
+# PY="$(command -v python3 || command -v python)") — NOT pipx (an isolated venv hmd
+# can't import from), NOT a different python. Behaviour:
+#   - IDEMPOTENT  — if a backend already imports, it's a silent no-op (nothing runs);
+#   - PEP-668-AWARE — installs `cryptography` with `pip install --user`, falling back
+#     to `--user --break-system-packages` for an externally-managed interpreter
+#     (Homebrew / Debian / macOS system python) that refuses the plain --user write;
+#   - NON-FATAL  — a failure NEVER aborts the install (the caller prints a loud
+#     warning and continues);
+#   - VERIFYING  — after any install attempt it RE-CHECKS the import, so the state it
+#     returns reflects what the beat will actually see, not what pip claimed.
+# Prints ONE state word (the caller renders the ✓/⚠ line + the manual-fix guidance):
+#   present    — a backend already imported; nothing installed (idempotent no-op)
+#   installed  — cryptography was installed and the backend now imports
+#   failed     — a backend is still not importable after the install attempt (LOUD)
+#   nopy       — no python interpreter on PATH at all (presence needs one — LOUD)
+ensure_crypto_backend() {
+  local py; py="$(command -v python3 || command -v python || true)"
+  if [ -z "$py" ]; then printf 'nopy'; return 0; fi
+  # Already importable → silent idempotent no-op (do NOT touch pip).
+  if _crypto_importable "$py"; then printf 'present'; return 0; fi
+  # Not importable → install `cryptography` into THAT interpreter's user site.
+  # First a plain --user install; PEP-668 externally-managed interpreters refuse it,
+  # so retry with --break-system-packages. Both are quiet + best-effort — pip's exit
+  # is NOT trusted; the re-check below is the sole arbiter of success.
+  "$py" -m pip install --user --quiet cryptography >/dev/null 2>&1 \
+    || "$py" -m pip install --user --break-system-packages --quiet cryptography >/dev/null 2>&1 \
+    || true
+  if _crypto_importable "$py"; then printf 'installed'; return 0; fi
+  printf 'failed'
+}
+
 # ── Install-step telemetry (dossier §3 + §8) ────────────────────────────────
 #
 # install.sh's own step — the PATH export — emits started→succeeded|failed +
@@ -1101,6 +1164,61 @@ main() {
     absent)     step_ok "Joining team" "solo (no invite)" ;;
     weak)       step_ok "Joining team" "skipped (secret too short)" ;;
     *)          step_ok "Joining team" "skipped" ;;
+  esac
+
+  # Step: ensure the Ed25519 PKI crypto backend for the presence interpreter.
+  # THE FIX for the invisible-teammate outage (see ensure_crypto_backend above):
+  # a fresh install must end with the interpreter heimdall-presence uses able to
+  # sign beats, or SHOUT — never silently leave presence broken. Idempotent (silent
+  # ✓ when the backend already imports), PEP-668-aware, NON-FATAL. The re-checked
+  # ✓/⚠ line is the signal that would have saved akshat + madhavan hours.
+  local CR_T0; CR_T0="$(_tele_now_ms)"
+  _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" crypto started
+  step_begin "Ensuring PKI crypto backend (Ed25519)"
+  # Resolve the SAME interpreter for the manual-fix message (matches the presence
+  # bin + ensure_crypto_backend); fall back to a literal `python3` label if none.
+  local PRES_PY; PRES_PY="$(command -v python3 || command -v python || true)"
+  local CRYPTO_STATE; CRYPTO_STATE="$(ensure_crypto_backend)"
+  case "$CRYPTO_STATE" in
+    present)
+      _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" crypto succeeded "$CR_T0"
+      step_ok "Ensuring PKI crypto backend (Ed25519)" "present" ;;
+    installed)
+      _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" crypto succeeded "$CR_T0"
+      step_ok "Ensuring PKI crypto backend (Ed25519)" "installed cryptography" ;;
+    nopy)
+      _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" crypto failed "$CR_T0" \
+        crypto-backend-unavailable "no python interpreter on PATH"
+      step_ok "Ensuring PKI crypto backend (Ed25519)" "no python found"
+      blank
+      printf '   %s⚠ no python interpreter found — TEAM PRESENCE WILL NOT WORK.%s\n' \
+        "$C_GOLD" "$C_RESET"
+      printf '   %s  heimdall-presence signs its beats with an Ed25519 backend; without%s\n' \
+        "$C_DIM" "$C_RESET"
+      printf '   %s  python3 your beats stay unsigned and teammates never see you online.%s\n' \
+        "$C_DIM" "$C_RESET"
+      printf '   %s  install python3, then run:%s\n' "$C_DIM" "$C_RESET"
+      printf '       %spython3 -m pip install --user cryptography%s\n' "$C_CYAN" "$C_RESET"
+      blank
+      ;;
+    *)  # failed — the backend is still missing; NEVER silent, ALWAYS the loud fix.
+      _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" crypto failed "$CR_T0" \
+        crypto-backend-unavailable "cryptography/pynacl not importable after install attempt"
+      step_ok "Ensuring PKI crypto backend (Ed25519)" "UNAVAILABLE"
+      blank
+      printf '   %s⚠ Ed25519 crypto backend MISSING — TEAM PRESENCE WILL BE SILENTLY BROKEN.%s\n' \
+        "$C_GOLD" "$C_RESET"
+      printf '   %s  heimdall-presence cannot sign its beats, so teammates will NOT see you%s\n' \
+        "$C_DIM" "$C_RESET"
+      printf '   %s  online — the exact outage that cost real teammates hours. Fix it (installs%s\n' \
+        "$C_DIM" "$C_RESET"
+      printf '   %s  into the SAME interpreter hmd uses for presence):%s\n' "$C_DIM" "$C_RESET"
+      printf '       %s%s -m pip install --user cryptography%s\n' \
+        "$C_CYAN" "${PRES_PY:-python3}" "$C_RESET"
+      printf '   %s  (on an externally-managed python add --break-system-packages)%s\n' \
+        "$C_DIM" "$C_RESET"
+      blank
+      ;;
   esac
 
   # Step: verify gates — N is the RUNTIME gate count, never hardcoded.
