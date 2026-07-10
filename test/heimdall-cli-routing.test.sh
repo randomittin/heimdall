@@ -266,6 +266,58 @@ else
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
+# 7d. `hmd beat` → execs heimdall-presence with `beat` PREPENDED, no fall-through.
+#     Shortcut so a teammate never types the raw ~/.heimdall/bin/heimdall-presence path.
+# ══════════════════════════════════════════════════════════════════════════════
+reset
+run_hmd beat
+
+if stub_called "heimdall-presence" && args_contain "beat"; then
+  ok "beat routes to heimdall-presence with 'beat' prepended"
+else
+  bad "beat routes to heimdall-presence with 'beat' prepended"
+  cat "$STUB_OUT" >&2
+fi
+
+if ! claude_reached; then
+  ok "beat does NOT fall through to Claude"
+else
+  bad "beat MUST NOT reach the Claude fall-through"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 7e. `hmd beat --strict` — flags forwarded verbatim after the prepended verb.
+# ══════════════════════════════════════════════════════════════════════════════
+reset
+run_hmd beat --strict
+
+if stub_called "heimdall-presence" && args_contain "beat --strict"; then
+  ok "beat forwards flags verbatim (beat --strict)"
+else
+  bad "beat forwards flags verbatim (beat --strict)"
+  cat "$STUB_OUT" >&2
+fi
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 7f. `hmd roster` → execs heimdall-presence with `roster` PREPENDED, no fall-through.
+# ══════════════════════════════════════════════════════════════════════════════
+reset
+run_hmd roster
+
+if stub_called "heimdall-presence" && args_contain "roster"; then
+  ok "roster routes to heimdall-presence with 'roster' prepended"
+else
+  bad "roster routes to heimdall-presence with 'roster' prepended"
+  cat "$STUB_OUT" >&2
+fi
+
+if ! claude_reached; then
+  ok "roster does NOT fall through to Claude"
+else
+  bad "roster MUST NOT reach the Claude fall-through"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 8. FALSIFIER — unknown command falls through to Claude launch path
 #    A routed name must NOT reach fall-through; an unknown one MUST.
 # ══════════════════════════════════════════════════════════════════════════════

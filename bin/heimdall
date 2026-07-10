@@ -1180,6 +1180,24 @@ case "${1:-}" in
     fi
     exec "$PRESENCE_BIN" "$@"
     ;;
+  beat|roster)
+    # First-class shortcuts for the two presence verbs teammates reach for most:
+    # `hmd beat` (send a heartbeat) and `hmd roster` (see the team wall). Both delegate
+    # to heimdall-presence with the verb PREPENDED, so a teammate never needs the raw
+    # ~/.heimdall/bin/heimdall-presence path (only `hmd`/`heimdall` are linked onto PATH
+    # at install — the raw bin is not). PRESENCE_BIN resolves via $PLUGIN_DIR exactly
+    # like the presence)/team)/watch) cases above, so it works for a plugin-install AND
+    # a dev-checkout. Any remaining flags (e.g. `hmd beat --strict`) forward verbatim.
+    PRESENCE_VERB="$1"
+    shift
+    PRESENCE_BIN="$PLUGIN_DIR/bin/heimdall-presence"
+    if [ ! -x "$PRESENCE_BIN" ]; then
+      echo "  Error: heimdall-presence not found at $PRESENCE_BIN" >&2
+      echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+      exit 1
+    fi
+    exec "$PRESENCE_BIN" "$PRESENCE_VERB" "$@"
+    ;;
   telemetry)
     # `hmd telemetry` — Pre-Merge Corpus (PMR) T0 consent + control surface
     # (status/on/off/hunks on|off/purge) + the internal emit/observe/scan/install-hook
