@@ -1,0 +1,401 @@
+#!/usr/bin/env bash
+# heimdall-checkpoint-share — the Shared Team Checkpoints (TEAM MODE P4) CLI.
+#
+# A thin bash front-end over bin/lib/checkpoint_share.py. It publishes THIS instance's
+# resumable snapshot into the git-committed per-HAID store (.planning/ledger/checkpoints/
+# {slug}.json), reads/rosters teammates' snapshots, REFUSES to rewrite/redo a surface a
+# teammate already holds or completed (the no-rewrite guarantee), and RESUMES a dropped
+# teammate's work (the redundancy handoff). git IS the coordination substrate (TM-1): a
+# `git pull` already carries every teammate's checkpoint, so redundancy is free.
+#
+# CONSENT (INV-D): publishing reuses the PRESENCE consent gate verbatim — a per-repo
+# <repo>/.heimdall/presence.json {"enabled": false} (or the global ~/.heimdall/presence-off
+# marker) makes publish a hard ZERO-WRITE no-op (exit 0). Reads/roster/precheck/resume are
+# always available (off = invisible, not blind), mirroring heimdall-presence.
+#
+# The privacy boundary (allowlist -> path-strip -> _scrub -> zero-content -> security-class ->
+# secret-scan fail-closed) lives ENTIRELY in the engine; this CLI only gathers inputs and
+# renders output. See evals/oracles/team-checkpoint/INVARIANTS.md.
+#
+# Usage:
+#   heimdall-checkpoint-share publish [--repo DIR] [--progress N]
+#         Gather git + heimdall-state + THIS haid's ledger claim, then publish the scrubbed
+#         shared checkpoint. Consent OFF -> zero-write no-op. Security-sensitive -> the local
+#         lane, never the shared store. A secret -> abort, nothing written.
+#   heimdall-checkpoint-share read <haid> [--repo DIR] [--json]
+#         Print a teammate's shared checkpoint.
+#   heimdall-checkpoint-share roster [--repo DIR] [--json]
+#         Fold all checkpoints -> a table (human · phase · progress% · surfaces · freshness).
+#   heimdall-checkpoint-share precheck <surface>... [--repo DIR]
+#         The NO-REWRITE / NO-REDO guard. Refuse (exit 3) if any surface overlaps a DIFFERENT
+#         teammate's ACTIVE claim (via heimdall-claim check) OR their COMPLETED checkpoint
+#         (progress 100 / done phase). Names the holder. Run this BEFORE starting work.
+#   heimdall-checkpoint-share resume <haid> [--repo DIR] [--apply] [--force]
+#         The REDUNDANCY HANDOFF. Read a dropped teammate's last checkpoint; verify their claim
+#         is TTL-expired (refuse to stomp a LIVE teammate unless --force); reap the expired
+#         claim; print the adopted goal/phase/HEAD plan. With --apply: re-claim the freed
+#         surfaces under THIS haid, adopt the goal, and note the handoff in decisions.md.
+#   heimdall-checkpoint-share help
+#
+# Exit: 0 ok / no collision; 2 usage/IO error; 3 collision (precheck) or live-teammate (resume).
+set -uo pipefail
+
+SELF="$0"
+if command -v readlink >/dev/null 2>&1; then
+  SELF="$(readlink -f "$0" 2>/dev/null || readlink "$0" 2>/dev/null || echo "$0")"
+fi
+BIN_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+LIB_DIR="$BIN_DIR/lib"
+HAID_BIN="$BIN_DIR/heimdall-haid"
+CLAIM_BIN="$BIN_DIR/heimdall-claim"
+CKPT_BIN="$BIN_DIR/heimdall-checkpoint"
+
+PY="$(command -v python3 || command -v python || true)"
+[ -n "$PY" ] || { echo "error: python3 is required" >&2; exit 2; }
+[ -f "$LIB_DIR/checkpoint_share.py" ] || { echo "error: engine missing: $LIB_DIR/checkpoint_share.py" >&2; exit 2; }
+
+usage() { sed -n '2,53p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+current_haid() {
+  if [ -x "$HAID_BIN" ]; then "$HAID_BIN" current 2>/dev/null || echo "haid:local"; else echo "haid:local"; fi
+}
+
+# ── publish: gather inputs, hand to the engine (consent/scrub/route all inside) ──
+cmd_publish() {
+  local repo="$PWD" progress=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repo) repo="${2:?--repo needs a value}"; shift 2 ;;
+      --progress) progress="${2:?--progress needs a value}"; shift 2 ;;
+      *) echo "error: unknown flag: $1" >&2; exit 2 ;;
+    esac
+  done
+  repo="$(cd "$repo" 2>/dev/null && pwd)" || { echo "error: bad --repo" >&2; exit 2; }
+
+  local haid branch head_sha phase goal
+  haid="$(current_haid)"
+  branch="$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
+  head_sha="$(git -C "$repo" rev-parse --short HEAD 2>/dev/null || echo none)"
+  phase="unknown"
+  if [ -f "$repo/.planning/STATE.md" ]; then
+    phase=$(awk '/^---$/{c++; next} c==1 && /^phase:/{gsub(/^phase:[[:space:]]*"?/,""); gsub(/"$/,""); print; exit}' \
+      "$repo/.planning/STATE.md" 2>/dev/null || echo unknown)
+    [ -z "$phase" ] && phase="unknown"
+  fi
+  goal="none"
+  if command -v heimdall-state >/dev/null 2>&1; then
+    goal=$( (cd "$repo" && heimdall-state goal-get 2>/dev/null) || echo none )
+  elif [ -x "$BIN_DIR/heimdall-state" ]; then
+    goal=$( (cd "$repo" && "$BIN_DIR/heimdall-state" goal-get 2>/dev/null) || echo none )
+  fi
+  [ -z "$goal" ] && goal="none"
+
+  CS_REPO="$repo" CS_LIB="$LIB_DIR" CS_HAID="$haid" CS_BRANCH="$branch" \
+  CS_HEAD="$head_sha" CS_PHASE="$phase" CS_GOAL="$goal" CS_PROGRESS="$progress" \
+  "$PY" - <<'PYEOF'
+import json, os, re, sys
+sys.path.insert(0, os.environ["CS_LIB"])
+import checkpoint_share as cs
+
+repo = os.environ["CS_REPO"]; haid = os.environ["CS_HAID"]
+goal = os.environ.get("CS_GOAL", "none")
+goal = None if goal in ("", "none") else goal
+
+surfaces, task = [], None
+claim = os.path.join(cs.claims_dir(repo), cs.haid_slug(haid) + ".json")
+try:
+    with open(claim, "r", encoding="utf-8") as fh:
+        cj = json.load(fh)
+    if isinstance(cj, dict):
+        surfaces = [s for s in (cj.get("claimed_surfaces") or []) if isinstance(s, str)]
+        task = cj.get("task_ref")
+except (OSError, ValueError):
+    surfaces, task = [], None
+
+prog = os.environ.get("CS_PROGRESS", "")
+if prog.strip():
+    try:
+        progress = int(prog)
+    except ValueError:
+        progress = 0
+else:
+    done = total = 0
+    for name in ("STATE.md", "CHECKPOINT.md"):
+        try:
+            with open(os.path.join(repo, ".planning", name), "r", encoding="utf-8") as fh:
+                text = fh.read()
+        except OSError:
+            continue
+        done += len(re.findall(r"^\s*[-*]\s*\[[xX]\]", text, re.M))
+        total += len(re.findall(r"^\s*[-*]\s*\[[ xX]\]", text, re.M))
+    progress = int(round(100 * done / total)) if total else 0
+
+res = cs.publish({
+    "haid": haid,
+    "branch": os.environ.get("CS_BRANCH", "unknown"),
+    "head_sha": os.environ.get("CS_HEAD", "none"),
+    "phase": os.environ.get("CS_PHASE", "unknown"),
+    "progress_pct": progress,
+    "active_goal": goal,
+    "claimed_surfaces": surfaces,
+    "task_ref": task,
+}, repo_root=repo)
+print(json.dumps(res, sort_keys=True))
+sys.exit(0)
+PYEOF
+}
+
+# ── read: print one teammate's shared checkpoint ──
+cmd_read() {
+  local repo="$PWD" as_json="" haid=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repo) repo="${2:?--repo needs a value}"; shift 2 ;;
+      --json) as_json=1; shift ;;
+      -*) echo "error: unknown flag: $1" >&2; exit 2 ;;
+      *) haid="$1"; shift ;;
+    esac
+  done
+  [ -n "$haid" ] || { echo "error: read needs a <haid>" >&2; exit 2; }
+  repo="$(cd "$repo" 2>/dev/null && pwd)" || { echo "error: bad --repo" >&2; exit 2; }
+  CS_REPO="$repo" CS_LIB="$LIB_DIR" CS_HAID="$haid" CS_JSON="$as_json" "$PY" - <<'PYEOF'
+import json, os, sys
+sys.path.insert(0, os.environ["CS_LIB"])
+import checkpoint_share as cs
+rec = cs.read_checkpoint(os.environ["CS_HAID"], repo_root=os.environ["CS_REPO"])
+if rec is None:
+    print("no shared checkpoint for %s" % os.environ["CS_HAID"])
+    sys.exit(0)
+if os.environ.get("CS_JSON"):
+    print(json.dumps(rec, sort_keys=True, indent=2))
+else:
+    for k in cs.SHARED_FIELDS:
+        if k in rec:
+            v = rec[k]
+            if isinstance(v, list):
+                v = ", ".join(str(x) for x in v)
+            print("%-16s %s" % (k + ":", v))
+sys.exit(0)
+PYEOF
+}
+
+# ── roster: fold all checkpoints into a table (who is on what, how far, how fresh) ──
+cmd_roster() {
+  local repo="$PWD" as_json=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repo) repo="${2:?--repo needs a value}"; shift 2 ;;
+      --json) as_json=1; shift ;;
+      *) echo "error: unknown flag: $1" >&2; exit 2 ;;
+    esac
+  done
+  repo="$(cd "$repo" 2>/dev/null && pwd)" || { echo "error: bad --repo" >&2; exit 2; }
+  CS_REPO="$repo" CS_LIB="$LIB_DIR" CS_JSON="$as_json" "$PY" - <<'PYEOF'
+import datetime, json, os, sys
+sys.path.insert(0, os.environ["CS_LIB"])
+import checkpoint_share as cs
+
+recs = cs.all_checkpoints(repo_root=os.environ["CS_REPO"])
+if os.environ.get("CS_JSON"):
+    print(json.dumps(cs.roster_from_files(repo_root=os.environ["CS_REPO"]),
+                     sort_keys=True, indent=2))
+    sys.exit(0)
+
+def freshness(ts):
+    try:
+        t = datetime.datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        secs = (datetime.datetime.now(datetime.timezone.utc) - t).total_seconds()
+    except (ValueError, TypeError):
+        return "?"
+    if secs < 90:
+        return "now"
+    if secs < 3600:
+        return "%dm" % (secs // 60)
+    if secs < 86400:
+        return "%dh" % (secs // 3600)
+    return "%dd" % (secs // 86400)
+
+if not recs:
+    print("(no shared checkpoints — nobody has published yet)")
+    sys.exit(0)
+print("%-22s %-16s %5s  %-8s  %s" % ("HUMAN", "PHASE", "PROG", "FRESH", "SURFACES"))
+for haid in sorted(recs):
+    r = recs[haid]
+    surfaces = ", ".join(r.get("claimed_surfaces") or []) or "-"
+    print("%-22s %-16s %4s%%  %-8s  %s" % (
+        (r.get("human") or haid)[:22],
+        (r.get("phase") or "?")[:16],
+        r.get("progress_pct", 0),
+        freshness(r.get("updated_at")),
+        surfaces[:60],
+    ))
+sys.exit(0)
+PYEOF
+}
+
+# ── precheck: the NO-REWRITE / NO-REDO guard (active claim + completed checkpoint) ──
+cmd_precheck() {
+  local repo="$PWD"; local surfaces=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repo) repo="${2:?--repo needs a value}"; shift 2 ;;
+      --) shift; while [ $# -gt 0 ]; do surfaces+=("$1"); shift; done ;;
+      -*) echo "error: unknown flag: $1" >&2; exit 2 ;;
+      *) surfaces+=("$1"); shift ;;
+    esac
+  done
+  [ "${#surfaces[@]}" -ge 1 ] || { echo "error: precheck needs at least one <surface>" >&2; exit 2; }
+  repo="$(cd "$repo" 2>/dev/null && pwd)" || { echo "error: bad --repo" >&2; exit 2; }
+
+  local haid; haid="$(current_haid)"
+  local collision=0
+
+  # HALF 1 — ACTIVE claims (R1 no-stomp), delegated to heimdall-claim check.
+  if [ -x "$CLAIM_BIN" ]; then
+    if ! ( cd "$repo" && HEIMDALL_PLANNING_DIR="${HEIMDALL_PLANNING_DIR:-$repo/.planning}" \
+           "$CLAIM_BIN" check -- "${surfaces[@]}" ) >/dev/null 2>"$repo/.ckpt-precheck.err"; then
+      collision=1
+      echo "NO-REWRITE: a requested surface overlaps a teammate's ACTIVE claim:" >&2
+      sed 's/^/  /' "$repo/.ckpt-precheck.err" >&2 2>/dev/null || true
+    fi
+    rm -f "$repo/.ckpt-precheck.err" 2>/dev/null || true
+  fi
+
+  # HALF 2 — COMPLETED checkpoints (no-redo across shared state), via the engine.
+  local comp
+  comp="$(CS_REPO="$repo" CS_LIB="$LIB_DIR" CS_HAID="$haid" CS_SURF="$(printf '%s\n' "${surfaces[@]}")" "$PY" - <<'PYEOF'
+import json, os, sys
+sys.path.insert(0, os.environ["CS_LIB"])
+import checkpoint_share as cs
+surfaces = [s for s in os.environ["CS_SURF"].splitlines() if s.strip()]
+ok, collisions = cs.precheck_surfaces(surfaces, os.environ["CS_HAID"], repo_root=os.environ["CS_REPO"])
+print(json.dumps({"ok": ok, "collisions": collisions}, sort_keys=True))
+PYEOF
+)"
+  if [ "$(printf '%s' "$comp" | "$PY" -c 'import json,sys;print(json.load(sys.stdin)["ok"])' 2>/dev/null)" = "False" ]; then
+    collision=1
+    echo "NO-REDO: a requested surface was already COMPLETED by a teammate (per their checkpoint):" >&2
+    printf '%s' "$comp" | "$PY" -c '
+import json, sys
+for c in json.load(sys.stdin)["collisions"]:
+    print("  %r overlaps %r held by %s (%s, phase %s, %s%%)" % (
+        c["requested"], c["overlaps"], c["holder"], c.get("human"),
+        c.get("phase"), c.get("progress_pct")))' 2>/dev/null >&2 || true
+  fi
+
+  if [ "$collision" -eq 1 ]; then
+    echo "resolve by sequencing behind the holder or picking a different surface; do NOT force." >&2
+    exit 3
+  fi
+  echo "clear: no requested surface overlaps a teammate's active claim or completed checkpoint"
+  exit 0
+}
+
+# ── resume: the REDUNDANCY HANDOFF of a dropped teammate's work ──
+cmd_resume() {
+  local repo="$PWD" apply="" force="" haid=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repo) repo="${2:?--repo needs a value}"; shift 2 ;;
+      --apply) apply=1; shift ;;
+      --force) force=1; shift ;;
+      -*) echo "error: unknown flag: $1" >&2; exit 2 ;;
+      *) haid="$1"; shift ;;
+    esac
+  done
+  [ -n "$haid" ] || { echo "error: resume needs a <haid> (the dropped teammate)" >&2; exit 2; }
+  repo="$(cd "$repo" 2>/dev/null && pwd)" || { echo "error: bad --repo" >&2; exit 2; }
+  export HEIMDALL_PLANNING_DIR="${HEIMDALL_PLANNING_DIR:-$repo/.planning}"
+
+  # 1. read the dropped teammate's last shared checkpoint.
+  local rec
+  rec="$(CS_REPO="$repo" CS_LIB="$LIB_DIR" CS_HAID="$haid" "$PY" - <<'PYEOF'
+import json, os, sys
+sys.path.insert(0, os.environ["CS_LIB"])
+import checkpoint_share as cs
+rec = cs.read_checkpoint(os.environ["CS_HAID"], repo_root=os.environ["CS_REPO"])
+print(json.dumps(rec) if rec else "")
+PYEOF
+)"
+  [ -n "$rec" ] || { echo "error: no shared checkpoint for $haid — nothing to resume" >&2; exit 2; }
+
+  # 2. is the dropped teammate still ALIVE? An ACTIVE claim => refuse to stomp (unless --force).
+  local still_active=0
+  if [ -x "$CLAIM_BIN" ]; then
+    if ( cd "$repo" && "$CLAIM_BIN" list --json 2>/dev/null ) \
+         | "$PY" -c "import json,sys; d=json.load(sys.stdin); sys.exit(0 if any(c.get('haid')=='$haid' for c in d) else 1)"; then
+      still_active=1
+    fi
+  fi
+  if [ "$still_active" -eq 1 ] && [ -z "$force" ]; then
+    echo "REFUSING: $haid still holds an ACTIVE claim (alive). Do not stomp a live teammate." >&2
+    echo "If they are genuinely gone, re-run with --force." >&2
+    exit 3
+  fi
+
+  local me task goal phase head branch surfaces
+  me="$(current_haid)"
+  task="$(printf '%s' "$rec" | "$PY" -c 'import json,sys;print(json.load(sys.stdin).get("task_ref") or "unknown")')"
+  goal="$(printf '%s' "$rec" | "$PY" -c 'import json,sys;print(json.load(sys.stdin).get("active_goal") or "")')"
+  phase="$(printf '%s' "$rec" | "$PY" -c 'import json,sys;print(json.load(sys.stdin).get("phase") or "unknown")')"
+  head="$(printf '%s' "$rec" | "$PY" -c 'import json,sys;print(json.load(sys.stdin).get("head_sha") or "none")')"
+  branch="$(printf '%s' "$rec" | "$PY" -c 'import json,sys;print(json.load(sys.stdin).get("branch") or "unknown")')"
+  surfaces="$(printf '%s' "$rec" | "$PY" -c 'import json,sys;print("\n".join(json.load(sys.stdin).get("claimed_surfaces") or []))')"
+
+  echo "HANDOFF PLAN — resume $haid's work as $me"
+  echo "  task:     $task"
+  echo "  goal:     ${goal:-<none>}"
+  echo "  phase:    $phase"
+  echo "  at:       $branch @ $head"
+  echo "  surfaces:"; printf '%s' "$surfaces" | sed 's/^/    - /'
+
+  # 3. reap the dropped teammate's TTL-expired claim (frees the surfaces).
+  if [ -x "$CLAIM_BIN" ]; then
+    ( cd "$repo" && "$CLAIM_BIN" reap ) 2>/dev/null | sed 's/^/  reap: /' || true
+  fi
+
+  if [ -z "$apply" ]; then
+    echo ""
+    echo "(plan only — re-run with --apply to re-claim the surfaces under $me, adopt the goal,"
+    echo " and record the handoff in decisions.md)"
+    exit 0
+  fi
+
+  # 4. APPLY: re-claim the freed surfaces under THIS haid, adopt the goal, note decisions.md.
+  local claimed=0
+  if [ -x "$CLAIM_BIN" ] && [ -n "$surfaces" ]; then
+    local surf_args=(); while IFS= read -r s; do [ -n "$s" ] && surf_args+=("$s"); done <<< "$surfaces"
+    if [ "${#surf_args[@]}" -ge 1 ]; then
+      ( cd "$repo" && "$CLAIM_BIN" claim --task "resumed:$task" -- "${surf_args[@]}" ) \
+        >/dev/null 2>&1 && claimed=1 || true
+    fi
+  fi
+  if [ -n "$goal" ] && [ "$goal" != "[dropped]" ]; then
+    if command -v heimdall-state >/dev/null 2>&1; then
+      ( cd "$repo" && heimdall-state goal-set "$goal" ) >/dev/null 2>&1 || true
+    elif [ -x "$BIN_DIR/heimdall-state" ]; then
+      ( cd "$repo" && "$BIN_DIR/heimdall-state" goal-set "$goal" ) >/dev/null 2>&1 || true
+    fi
+  fi
+  local dec="$HEIMDALL_PLANNING_DIR/ledger/decisions.md"
+  mkdir -p "$(dirname "$dec")" 2>/dev/null || true
+  {
+    printf '\n## %s — redundancy handoff (%s -> %s)\n\n' "$(date -u +%FT%TZ)" "$haid" "$me"
+    printf 'Resumed \`%s\` (task \`%s\`) from checkpoint at \`%s\` on \`%s\`. Surfaces re-claimed under \`%s\`: %s.\n' \
+      "$haid" "$task" "$head" "$branch" "$me" "$(printf '%s' "$surfaces" | tr '\n' ' ')"
+  } >> "$dec" 2>/dev/null || true
+
+  echo ""
+  echo "APPLIED: surfaces re-claimed=$([ "$claimed" -eq 1 ] && echo yes || echo no); goal adopted; handoff noted in decisions.md"
+  exit 0
+}
+
+case "${1:-help}" in
+  publish)  shift; cmd_publish "$@" ;;
+  read)     shift; cmd_read "$@" ;;
+  roster)   shift; cmd_roster "$@" ;;
+  precheck) shift; cmd_precheck "$@" ;;
+  resume)   shift; cmd_resume "$@" ;;
+  help|-h|--help) usage; exit 0 ;;
+  *) echo "error: unknown subcommand: ${1}. Try: heimdall-checkpoint-share help" >&2; exit 2 ;;
+esac

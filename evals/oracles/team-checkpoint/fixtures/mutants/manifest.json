@@ -1,0 +1,53 @@
+{
+  "domain": "team-checkpoint",
+  "fixture_kind": "mutants",
+  "purpose": "Each mutant is a self-contained fixture (a checkpoint `stream` + the `corrupted` served/excluded_security partition a BUGGY impl would emit, breaking ONE invariant). bin/falsify team-checkpoint runs the gate against golden (expect PASS \u2014 the impl fold equals the independent reference) then every mutant (expect REJECT \u2014 the gate recomputes the CORRECT partition from the stream via the independent reference and diffs it against `corrupted`). Score = mutants rejected / total, conditioned on golden passing; a P0 gate requires 1.0.",
+  "golden": "../golden/differential.json",
+  "mutants": [
+    {
+      "name": "security-lane-leak",
+      "file": "security-lane-leak",
+      "defect": "a phase=incident record enters the public served roster; excluded_security drops to 0",
+      "invariant_violated": [
+        "INV-C"
+      ],
+      "must_turn_red_gate": "differential"
+    },
+    {
+      "name": "no-secret-leak",
+      "file": "no-secret-leak",
+      "defect": "a ghp_ PAT-in-goal record is served instead of dropped by secret-scan",
+      "invariant_violated": [
+        "INV-B"
+      ],
+      "must_turn_red_gate": "differential"
+    },
+    {
+      "name": "consent-off-served",
+      "file": "consent-off-served",
+      "defect": "a share_consent=false record is served instead of skipped",
+      "invariant_violated": [
+        "INV-D"
+      ],
+      "must_turn_red_gate": "differential"
+    },
+    {
+      "name": "path-leak",
+      "file": "path-leak",
+      "defect": "an absolute /Users/ path in the goal is shipped raw instead of redacted",
+      "invariant_violated": [
+        "INV-A"
+      ],
+      "must_turn_red_gate": "differential"
+    },
+    {
+      "name": "dropped-teammate",
+      "file": "dropped-teammate",
+      "defect": "a whole teammate row is dropped from the served roster",
+      "invariant_violated": [
+        "INV-G"
+      ],
+      "must_turn_red_gate": "differential"
+    }
+  ]
+}

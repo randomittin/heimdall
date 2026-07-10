@@ -135,6 +135,19 @@ evals/oracles/*/report.json
 # gitleaks still scans these paths; the summary carries no code/secret (the
 # publisher scrubs every field through the telemetry _scrub discipline).
 !.planning/ledger/verdicts/
+# TEAM MODE P4 — the shared-checkpoint store is git-backed shared state, same pattern as the
+# activity/verdicts/collisions stores above (TM-1: git IS the coordination substrate). P4
+# (bin/heimdall-checkpoint-share / bin/lib/checkpoint_share.py) publishes each instance's
+# RESUMABLE snapshot — the SHARED allowlist only (haid/human/branch/head_sha/phase/progress/
+# scrubbed goal/claimed surfaces/task/updated_at) — into one per-HAID file
+# (.planning/ledger/checkpoints/{slug}.json) so a sibling checkout reads "who is on what, how
+# far" AND can resume a dropped teammate's work. One writer per file -> conflict-free merges
+# (INV-E). The chain down to ledger/ is already re-included above; un-ignore the checkpoints
+# dir + its records. gitleaks still scans these paths; the record is scrubbed secret-free by
+# construction (checkpoint_share path-strips + telemetry _scrub + secret-scans fail-closed
+# before write). The SECURITY-SIGNALS lane (.planning/security-signals/) is DELIBERATELY NOT
+# re-included anywhere — a security incident stays local, enforced by this absence (INV-C).
+!.planning/ledger/checkpoints/
 .claude/
 evals/benchmark/results.jsonl
 # Git worktrees (heimdall isolation)

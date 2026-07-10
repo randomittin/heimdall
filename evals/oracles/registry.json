@@ -8,6 +8,38 @@
     "example"
   ],
   "oracles": {
+    "team-checkpoint": {
+      "gate_type": "differential",
+      "description": "Shared team-checkpoint roster oracle (TEAM MODE P4). Folds an identical seeded per-HAID checkpoint stream through the implementation (bin/lib/checkpoint_share.fold_stream) and an independently-authored reference fold, normalizes both to a common comparable partition (served roster set keyed by HAID + security-exclusion count — NOT the raw records), and asserts they are identical across all seeds. Catches whole-aggregate privacy/roster bugs a per-record property check passes: a security-lane leak (INV-C), a secret leak (INV-B), a consent-off leak (INV-D), an absolute-path leak (INV-A), or a dropped/duplicated/misattributed teammate (INV-G).",
+      "domain_signals": [
+        "team_checkpoint_v1",
+        "shared checkpoint",
+        "checkpoint roster",
+        "team checkpoint",
+        "resumable snapshot",
+        "team-checkpoint"
+      ],
+      "assets": [
+        {
+          "name": "reference-fold",
+          "kind": "separate-agent",
+          "purpose": "Independently authored, spec-only recomputation of the checkpoint roster fold over a seeded synthetic checkpoint stream. Imports nothing from bin/lib/* (every constant and rule reproduced from INVARIANTS.md), so it shares no code path with the implementation under test.",
+          "dir": "evals/oracles/team-checkpoint"
+        },
+        {
+          "name": "seeded-checkpoint-stream",
+          "kind": "in-repo-dataset",
+          "purpose": "Deterministic seeded per-HAID checkpoint stream generator (reference.generate_stream). Same seed => byte-identical stream; the distribution is skewed so a slice is security-sensitive (INV-C exclusion) and a slice is consent-off (INV-D skip), the rest served.",
+          "dir": "evals/oracles/team-checkpoint"
+        }
+      ],
+      "gate_command": "evals/oracles/team-checkpoint/gate.sh --differential --seeds 200",
+      "reference": {
+        "independent": true,
+        "kind": "separate-agent",
+        "dir": "evals/oracles/team-checkpoint"
+      }
+    },
     "issue-collection": {
       "gate_type": "differential",
       "description": "Anonymized issue-collection k-anon aggregate oracle. Feeds an identical seeded issue_v1 stream through the implementation aggregate (bin/lib/cp_issue_aggregate.py) and an independently-authored reference aggregator, normalizes both to a common comparable partition (served bucket set + suppressed bucket set + security-exclusion count — NOT the raw envelopes, which differ by design), and asserts they are identical across all seeds. Catches whole-output k-anon/bucketing/security-exclusion bugs a per-bucket property check passes.",

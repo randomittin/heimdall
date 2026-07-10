@@ -178,6 +178,83 @@ _update_settings() {
   fi
 }
 
+# Publish the SHAREABLE team checkpoint (TEAM MODE P4) — best-effort, non-fatal, consent-gated.
+# This is the mechanical companion to the local CHECKPOINT.md write: it projects the machine-
+# derivable forward state into the ALLOWLISTED, scrubbed, secret-scanned per-HAID record at
+# .planning/ledger/checkpoints/{slug}.json (git-committed shared state) so a teammate can resume
+# this session's work if this machine drops. All routing (consent OFF -> no-op; security-
+# sensitive -> local lane; secret -> abort) lives in bin/lib/checkpoint_share.py; this only
+# GATHERS the inputs (git + heimdall-state + the ledger claim) and hands them to publish().
+_publish_shared() {
+  local project_dir="$1" phase="$2" goal="$3"
+  local self bindir lib py haid branch head_sha
+  self="$0"
+  command -v readlink >/dev/null 2>&1 && self="$(readlink -f "$0" 2>/dev/null || readlink "$0" 2>/dev/null || echo "$0")"
+  bindir="$(cd "$(dirname "$self")" && pwd)"
+  lib="$bindir/lib"
+  [ -f "$lib/checkpoint_share.py" ] || return 0
+  py="$(command -v python3 || command -v python || true)"
+  [ -n "$py" ] || return 0
+
+  branch="$(git -C "$project_dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
+  head_sha="$(git -C "$project_dir" rev-parse --short HEAD 2>/dev/null || echo none)"
+  haid=""
+  [ -x "$bindir/heimdall-haid" ] && haid="$("$bindir/heimdall-haid" current 2>/dev/null || true)"
+  [ -n "$haid" ] || haid="haid:local"
+
+  CS_PROJECT="$project_dir" CS_LIB="$lib" CS_HAID="$haid" CS_BRANCH="$branch" \
+  CS_HEAD="$head_sha" CS_PHASE="$phase" CS_GOAL="$goal" \
+  "$py" - <<'PYEOF' >/dev/null 2>&1 || true
+import json, os, re, sys
+sys.path.insert(0, os.environ["CS_LIB"])
+import checkpoint_share as cs
+
+project = os.environ["CS_PROJECT"]
+haid = os.environ["CS_HAID"]
+goal = os.environ.get("CS_GOAL", "none")
+if goal in ("", "none"):
+    goal = None
+
+# claimed_surfaces + task_ref: mirror THIS haid's ledger claim (already-public globs), never
+# re-derived. Reuse the same slug rule the claim store uses.
+surfaces, task = [], None
+claim = os.path.join(cs.claims_dir(project), cs.haid_slug(haid) + ".json")
+try:
+    with open(claim, "r", encoding="utf-8") as fh:
+        cj = json.load(fh)
+    if isinstance(cj, dict):
+        surfaces = [s for s in (cj.get("claimed_surfaces") or []) if isinstance(s, str)]
+        task = cj.get("task_ref")
+except (OSError, ValueError):
+    surfaces, task = [], None
+
+# progress: coarse, derived from completed vs total task checkboxes in the planning state.
+done = total = 0
+for name in ("STATE.md", "CHECKPOINT.md"):
+    p = os.path.join(project, ".planning", name)
+    try:
+        with open(p, "r", encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError:
+        continue
+    done += len(re.findall(r"^\s*[-*]\s*\[[xX]\]", text, re.M))
+    total += len(re.findall(r"^\s*[-*]\s*\[[ xX]\]", text, re.M))
+progress = int(round(100 * done / total)) if total else 0
+
+cs.publish({
+    "haid": haid,
+    "branch": os.environ.get("CS_BRANCH", "unknown"),
+    "head_sha": os.environ.get("CS_HEAD", "none"),
+    "phase": os.environ.get("CS_PHASE", "unknown"),
+    "progress_pct": progress,
+    "active_goal": goal,
+    "claimed_surfaces": surfaces,
+    "task_ref": task,
+}, repo_root=project)
+PYEOF
+  return 0
+}
+
 cmd_write() {
   local project_dir="${1:-$PWD}"
   # Resolve; a bad path is non-fatal (we simply do nothing).
@@ -206,6 +283,9 @@ cmd_write() {
     [ -z "$phase" ] && phase="unknown"
   fi
   _update_settings "$planning/settings.json" "$goal" "$phase" "$ts"
+
+  # Publish the shareable team checkpoint (P4) — consent-gated + non-fatal, inside publish().
+  _publish_shared "$project_dir" "$phase" "$goal"
 
   echo "[heimdall-checkpoint] auto-saved $planning/CHECKPOINT.md" >&2
   return 0

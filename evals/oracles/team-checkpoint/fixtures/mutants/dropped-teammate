@@ -1,0 +1,72 @@
+{
+  "kind": "mutant",
+  "name": "dropped-teammate",
+  "defect": "a whole teammate's row is DROPPED from the served roster \u2014 a whole-aggregate misattribution a per-record property check would miss (INV-G)",
+  "invariant_violated": [
+    "INV-G"
+  ],
+  "stream": [
+    {
+      "haid": "haid:a.box",
+      "human": "alice",
+      "branch": "feat/alice",
+      "head_sha": "abc1234",
+      "phase": "wave-2/build",
+      "progress_pct": 40,
+      "active_goal": "advance the widget module",
+      "claimed_surfaces": [
+        "src/alice.py"
+      ],
+      "task_ref": "task-alice",
+      "updated_at": "2026-07-10T00:00:00Z",
+      "resumable": true
+    },
+    {
+      "haid": "haid:b.box",
+      "human": "bob",
+      "branch": "feat/bob",
+      "head_sha": "abc1234",
+      "phase": "incident",
+      "progress_pct": 40,
+      "active_goal": "advance the widget module",
+      "claimed_surfaces": [
+        "src/bob.py"
+      ],
+      "task_ref": "task-bob",
+      "updated_at": "2026-07-10T00:00:00Z",
+      "resumable": true
+    },
+    {
+      "haid": "haid:f.box",
+      "human": "fran",
+      "branch": "feat/fran",
+      "head_sha": "abc1234",
+      "phase": "wave-2/build",
+      "progress_pct": 40,
+      "active_goal": "advance the widget module",
+      "claimed_surfaces": [
+        "src/fran.py"
+      ],
+      "task_ref": "task-fran",
+      "updated_at": "2026-07-10T00:00:00Z",
+      "resumable": true
+    }
+  ],
+  "corrupted": {
+    "served": [
+      [
+        "haid:a.box",
+        "alice",
+        "feat/alice",
+        "abc1234",
+        "wave-2/build",
+        40,
+        "advance the widget module",
+        "task-alice",
+        "[\"src/alice.py\"]",
+        true
+      ]
+    ],
+    "excluded_security": 1
+  }
+}
