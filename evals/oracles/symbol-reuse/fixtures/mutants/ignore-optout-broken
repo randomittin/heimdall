@@ -1,0 +1,42 @@
+{
+  "kind": "mutant",
+  "name": "ignore-optout-broken",
+  "defect": "an opt-out-marked deliberate local copy is wrongly hard-blocked \u2014 the detector must honor the opt-out marker and allow it (SR-B)",
+  "invariant_violated": [
+    "SR-B"
+  ],
+  "stream": {
+    "canonical": [
+      {
+        "module": "core/auth.py",
+        "name": "verify_token",
+        "kind": "function",
+        "params": [
+          "tok"
+        ]
+      }
+    ],
+    "proposed": [
+      {
+        "module": "edge/auth.py",
+        "name": "verify_token",
+        "kind": "function",
+        "params": [
+          "tok"
+        ],
+        "optout": true
+      }
+    ]
+  },
+  "corrupted": {
+    "blocked": [
+      [
+        "verify_token@edge/auth.py",
+        "exact-function",
+        "verify_token@core/auth.py"
+      ]
+    ],
+    "advised": [],
+    "ok": []
+  }
+}
