@@ -74,6 +74,25 @@ for row in g:
 PY
 }
 
+# avatar_png — render the DETAILED sigil as a CRISP PNG (option C): the true-fidelity
+# avatar for the surfaces that can display an image. The terminal card keeps its
+# half-block face; THIS writes a clean upscaled pixel-art PNG (matching RJ's gallery)
+# to a deterministic cache path and echoes it. Reuses the SAME value→color palette as
+# the terminal sigil (sentinels/hmd_sigil.py) via sentinels/hmd_sigil_png.py, so the
+# terminal and the image agree hue-for-hue. The PRESENCE WALL consumes the same
+# convention: <cache>/sigil/<seed>.png. Public material only (deterministic art from
+# the seed — no secret). Non-fatal: a missing python3 / renderer just skips the line.
+PNG_PY="$HERE/hmd_sigil_png.py"
+avatar_png() {
+  command -v python3 >/dev/null 2>&1 || return 1
+  [ -f "$PNG_PY" ] || return 1
+  local dir="${HOME:-/tmp}/.heimdall/sigil"
+  local safe; safe="$(printf '%s' "$SEED" | tr -c 'A-Za-z0-9_-' '_')"
+  local out="$dir/$safe.png"
+  python3 "$PNG_PY" --seed "$SEED" --scale 24 --out "$out" >/dev/null 2>&1 || return 1
+  printf '%s' "$out"
+}
+
 is_tty() { [ -t 1 ]; }
 up() { printf '\033[%dA' "$(( N + 1 ))"; }   # cursor up over face + caption
 
@@ -110,6 +129,10 @@ hmd_share() {
     printf '  %b\n' "${CY}${B}@${HANDLE}${X}   ${DIM}your watchman${X}"
     printf '  %b\n' "$TAGLINE"
     printf '  %b\n' "${DIM}join${X}  ${CY}${PUBLIC_URL}${X}"
+    # the crisp PNG avatar for image surfaces (share, presence wall) — deterministic
+    # cache path; skipped silently if the renderer/python3 is unavailable.
+    _png="$(avatar_png)" && [ -n "$_png" ] \
+      && printf '  %b\n' "${DIM}avatar${X}  ${CY}${_png}${X}"
     printf '\n'
     printf '  %b\n' "${DIM}my Heimdall watchman — ${PUBLIC_URL}${X}"
     printf '\n'

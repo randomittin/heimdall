@@ -956,6 +956,22 @@ case "${1:-}" in
     fi
     exec "$SIGIL_BIN" "$@"
     ;;
+  sigil-png)
+    # `hmd sigil-png` — CRISP PNG render of the watchman sigil, for the image
+    # surfaces (share-card avatar, presence wall). Delegates to bin/heimdall-sigil-png,
+    # which routes through sentinels/hmd_sigil_png.py — reusing the SAME value→color
+    # palette as the terminal sigil, so both surfaces agree hue-for-hue. Pure stdlib
+    # (PNG via zlib/struct); deterministic (same sprite → byte-identical PNG).
+    #   hmd sigil-png --seed <id|sprite> --out avatar.png [--scale N] [--emotion e]
+    shift
+    PNG_BIN="$PLUGIN_DIR/bin/heimdall-sigil-png"
+    if [ ! -x "$PNG_BIN" ]; then
+      echo "  Error: sigil PNG renderer not found at $PNG_BIN" >&2
+      echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+      exit 1
+    fi
+    exec "$PNG_BIN" "$@"
+    ;;
   guard)
     # `hmd guard install` — wire the NATIVE git pre-push hook into the git repo
     # at the current directory. The hook runs on EVERY push (human or agent),
