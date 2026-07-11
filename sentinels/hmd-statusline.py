@@ -202,10 +202,26 @@ _SIG_MEMO = {}
 def _sigil_cache_dir():
     return os.path.join(os.path.expanduser("~"), ".heimdall", ".sigil-cache")
 
+def _sigil_version():
+    """A short CONTENT hash of hmd_sigil.py's source, folded into the cache key. Any
+    change to the sigil code (grids, palette, render logic, the border frame) mints a
+    fresh key → the stale on-disk sigil is never served again, with NO manual cache
+    clear (the "sigil never updated" bug). Falls back to '0' when the source can't be
+    read — the key then degrades to the old tier/eye/seed behavior, never crashing."""
+    try:
+        src = getattr(SIG, "__file__", None) or os.path.join(HERE, "hmd_sigil.py")
+        with open(src, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()[:12]
+    except Exception:
+        return "0"
+_SIG_VERSION = _sigil_version()
+
 def cached_sigil(seed, size, caps, eye):
     eyt = tuple(eye or SIG.EYE)
     ekey = "%02x%02x%02x" % (eyt[0], eyt[1], eyt[2])
-    ckey = "%s-%s" % (caps.color, caps.unicode)
+    # the version hash is part of the key/filename → a code change invalidates the
+    # cache automatically; only a tier/eye/seed/version match hits the stored sigil.
+    ckey = "%s-%s-%s" % (caps.color, caps.unicode, _SIG_VERSION)
     memo_k = (seed, size, ckey, ekey)
     m = _SIG_MEMO.get(memo_k)
     if m is not None: return list(m)
