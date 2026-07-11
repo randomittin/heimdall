@@ -51,8 +51,8 @@ PY
 
 echo "== 1) LOAD: 29 heroes, each 8×8, tokens ⊆ palette, distinct render, exit 0 =="
 run_py '
-ok("pool has 29 heroes") if len(S.HERO_SIGILS)==29 else bad("pool has %d (want 29)"%len(S.HERO_SIGILS))
-expect={"batsy","green-lantern","venom","hulk","thanos","black-panther","deadpool","spiderman","ironman","cyborg","joker","flash","superman","cyclops","human-torch","lex-luthor","doctor-strange","martian-manhunter","green-goblin","cloak","mr-fantastic","beast","antman","loki","nick-fury","black-bolt","red-skull","magneto","silver-surfer"}
+ok("pool has 29 heroes") if len(S.HERO_SIGILS)==30 else bad("pool has %d (want 30)"%len(S.HERO_SIGILS))
+expect={"batsy","green-lantern","venom","hulk","thanos","black-panther","deadpool","spiderman","ironman","cyborg","joker","flash","superman","cyclops","human-torch","lex-luthor","doctor-strange","martian-manhunter","green-goblin","cloak","mr-fantastic","beast","antman","loki","nick-fury","black-bolt","red-skull","magneto","silver-surfer","vision"}
 ok("exact expected roster") if set(S.HERO_SIGILS)==expect else bad("roster mismatch: %s"%(set(S.HERO_SIGILS)^expect))
 TOK={".":"bg","1":"hue","2":"eye","3":"highlight","4":"shadow","5":"outline","6":"accent6","7":"accent7"}
 shape=cover=True
@@ -78,7 +78,7 @@ for name in S.HERO_ORDER:
             if l and len(STRIP.sub("",l))!=8: allw=False
     rends[name]="\n".join(S.sigil_render(name,"M",S.tier_caps()))
 ok("every hero renders width-8, exit 0, on truecolor/256/16") if (allw and alltier) else bad("width/tier render fault")
-ok("all 29 hero renders are distinct") if len(set(rends.values()))==29 else bad("hero renders collide: %d unique"%len(set(rends.values())))
+ok("all 30 hero renders are distinct") if len(set(rends.values()))==30 else bad("hero renders collide: %d unique"%len(set(rends.values())))
 '
 
 echo "== 2) AUTO: hero_for deterministic + roughly uniform; real HAID renders its hero =="
@@ -86,7 +86,7 @@ run_py '
 det=all(S.hero_for("haid:u%d.m-%04x"%(i,i))==S.hero_for("haid:u%d.m-%04x"%(i,i)) for i in range(200))
 ok("hero_for deterministic (same HAID -> same hero)") if det else bad("hero_for not deterministic")
 c=collections.Counter(S.hero_for("haid:u%d.m-%04x"%(i,i)) for i in range(500))
-ok("roughly uniform: %d/29 heroes hit over 500 HAIDs"%len(c)) if len(c)>=26 else bad("poor spread: %d/29"%len(c))
+ok("roughly uniform: %d/30 heroes hit over 500 HAIDs"%len(c)) if len(c)>=27 else bad("poor spread: %d/30"%len(c))
 lo,hi=min(c.values()),max(c.values())
 ok("no bucket degenerate (min=%d max=%d over 500, ideal ~17)"%(lo,hi)) if (lo>=5 and hi<=40) else bad("bucket skew min=%d max=%d"%(lo,hi))
 h="haid:dev.box-ab12"; hero=S.hero_for(h)
