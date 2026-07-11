@@ -519,6 +519,13 @@ HERO_SIGILS = {
         "outline": "#0e0c0d", "accent6": "#6d6f73", "accent7": "#6a573d",
         "bg": "#383e3f",
     },
+    "pig": {
+        "name": "pig",
+        "grid": ["11111111", "11111111", "11111111", "5..11..5",
+                 "5..11..5", "11322311", "11111111", "11111111"],
+        "hue": "#f9a8a1", "eye": "#eec8ca", "highlight": "#f28282",
+        "outline": "#000000", "bg": "#ffffff",
+    },
 }
 
 # fixed SORTED name order → the deterministic index a HAID hashes onto (hero_for). A
