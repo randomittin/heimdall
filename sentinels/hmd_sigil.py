@@ -53,7 +53,7 @@ silhouette / bounding box instead of fraying into transparent space.
   python3 hmd_sigil.py --seed arjun   --size M --tier 256   # tiered render
   python3 hmd_sigil.py --seed arjun   --glyph               # single wall cell
 """
-import hashlib, sys, os, argparse, importlib.util
+import hashlib, sys, os, re, argparse, importlib.util
 from collections import Counter
 
 # ── shared capability module (single source of the tier LUTs) ──────────────────
@@ -86,39 +86,175 @@ CURATED_HUES = {
     'priya': (244, 114, 182),   # pink
 }
 
-# ── CUSTOM (PINNED) SIGILS — hand-authored complete faces pinned to ONE identity.
-#    Keyed by the EXACT sigil seed the statusline resolves (a full HAID) or a handle.
-#    Unlike the curated 0/1/2 grids (which get the universal watchman finish), a
-#    custom sigil is a COMPLETE authored face: it carries its OWN full palette and is
-#    rendered RAW — the animal-cast watchman band + forced eyes are BYPASSED (the face
-#    already has its own eyes in the grid). ADDITIVE: only the pinned seed is affected;
-#    every other seed resolves through the unchanged curated→animal path.
+# ── HERO SIGILS — hand-authored COMPLETE hero faces (RJ-authored 8×8, transcribed
+#    VERBATIM from .planning/ref/custom-sigil-spec.md). Each carries its OWN full palette
+#    and renders RAW: the animal-cast watchman band + forced eyes are BYPASSED (the face
+#    already has its own eyes in the grid). A hero may use ANY SUBSET of the alphabet, so
+#    a spec only carries the palette keys its grid actually references — the render
+#    tolerates missing keys (hulk/superman have no accent7; black-panther no accent6/7;
+#    joker no eye; ironman adds highlight; cyborg uses all eight).
 #
-#    grid alphabet (8×8):  . = bg   1 = hue   2 = eye   5 = outline
-#                          6 = accent6   7 = accent7
-#    Each value maps to a hex in the spec; the compact render (S/M/L) honors the FULL
-#    palette and the one-pass tier downgrade (truecolor→256→16→mono) applies as usual.
-CUSTOM_SIGILS = {
-    # batsy — RJ's hand-authored bat-cowl homage (RJ's own pixels), pinned to RJ's HAID.
-    #   navy cowl (1) · white eyes (2) · near-black outline (5) · skin jaw (6) · blue accents (7)
-    "haid:rj.rishabhs-macbook-air-46d5": {
+#    grid alphabet (8×8):  . = bg       1 = hue      2 = eye       3 = highlight
+#                          4 = shadow   5 = outline  6 = accent6   7 = accent7
+#    Each token maps to a hex; the compact render (S/M/L) honors the FULL palette and the
+#    one-pass tier downgrade (truecolor→256→16→mono) applies as usual.
+#
+#    Two roles:
+#      • POOL   — HERO_SIGILS (keyed by hero NAME) is the AUTO-ASSIGN pool: every REAL
+#                 HAID with no explicit choice maps DETERMINISTICALLY onto one hero
+#                 (hero_for), so a dev gets a recognizable hero free — never the blob.
+#      • PINNED — CUSTOM_SIGILS maps an EXACT seed (a full HAID / handle) to a hero;
+#                 batsy stays pinned to RJ's own HAID (the sigil-custom contract).
+#    ADDITIVE: curated (rj/nadia/arjun/priya) + the animal cast are UNCHANGED; only a
+#    pinned seed, an explicit hero name, or a REAL HAID resolves to a hero.
+HERO_SIGILS = {
+    # batsy — RJ's bat-cowl homage: navy cowl(1)·white eyes(2)·near-black outline(5)·skin jaw(6)·blue accents(7)
+    "batsy": {
         "name": "batsy",
-        "grid": ["1......1",
-                 "11777171",
-                 "15117711",
-                 "15511151",
-                 "12255221",
-                 "15555551",
-                 "16622661",
-                 ".166661."],
-        "hue":     "#181c39",   # 1 — navy cowl (body)
-        "eye":     "#faf3e8",   # 2 — warm white eyes
-        "outline": "#040204",   # 5 — near-black outline
-        "accent6": "#f7c7a7",   # 6 — skin jaw
-        "accent7": "#299af7",   # 7 — blue ear-tips / accents
-        "bg":      "#141d25",   # . — backdrop (solid, so the silhouette has a clean box)
+        "grid": ["1......1", "11777171", "15117711", "15511151",
+                 "12255221", "15555551", "16622661", ".166661."],
+        "hue": "#181c39", "eye": "#faf3e8", "outline": "#040204",
+        "accent6": "#f7c7a7", "accent7": "#299af7", "bg": "#141d25",
+    },
+    "green-lantern": {
+        "name": "green-lantern",
+        "grid": [".111111.", "11111111", "16116661", "77766777",
+                 "52577525", "55777755", "66622666", ".666666."],
+        "hue": "#9a3b27", "eye": "#f9ede6", "outline": "#010200",
+        "accent6": "#fcc39a", "accent7": "#06783b", "bg": "#392520",
+    },
+    "venom": {
+        "name": "venom",
+        "grid": [".111111.", "25555552", "21555512", "22511522",
+                 "22211222", "56611665", "51122115", ".517715."],
+        "hue": "#010002", "eye": "#faede7", "outline": "#151938",
+        "accent6": "#b7b5b7", "accent7": "#f95c96", "bg": "#0e1515",
+    },
+    "hulk": {
+        "name": "hulk",
+        "grid": [".111111.", "11111111", "15151151", "51165115",
+                 "52666625", "56622665", "56611665", ".566665."],
+        "hue": "#010100", "eye": "#fdfdf7", "outline": "#08783b",
+        "accent6": "#26e948", "bg": "#0e1515",
+    },
+    "thanos": {
+        "name": "thanos",
+        "grid": [".117711.", "75766757", "77666677", "65555556",
+                 "62555526", "65111156", "61222216", ".111111."],
+        "hue": "#6c6389", "eye": "#fef6fa", "outline": "#020002",
+        "accent6": "#fa9627", "accent7": "#fbfa38", "bg": "#2c313b",
+    },
+    "black-panther": {
+        "name": "black-panther",
+        "grid": [".1....1.", "15155151", "11511511", "15555511",
+                 "12555521", "11111111", "11111111", ".111111."],
+        "hue": "#000001", "eye": "#fcfafa", "outline": "#141a38", "bg": "#0e1515",
+    },
+    "deadpool": {
+        "name": "deadpool",
+        "grid": [".566665.", "75556257", "11555511", "11155111",
+                 "12111121", "11111111", "11755711", ".755555."],
+        "hue": "#020001", "eye": "#fbe8e9", "outline": "#fa063a",
+        "accent6": "#fb5a95", "accent7": "#b82545", "bg": "#0e1515",
+    },
+    "spiderman": {
+        "name": "spiderman",
+        "grid": [".7777777", "11111111", "15611651", "62566526",
+                 "62255226", "62255226", "15566551", ".1111116"],
+        "hue": "#fb0745", "eye": "#fdebe6", "outline": "#030101",
+        "accent6": "#67153a", "accent7": "#fc5c94", "bg": "#541728",
+    },
+    "ironman": {
+        "name": "ironman",
+        "grid": [".111111.", "11511511", "16755231", "16672631",
+                 "53366335", "56677735", "66755736", ".677276."],
+        "hue": "#fa0745", "eye": "#fcf867", "highlight": "#feeae7",
+        "outline": "#681537", "accent6": "#fa9717", "accent7": "#fbfa37",
+        "bg": "#541728",
+    },
+    "cyborg": {
+        "name": "cyborg",
+        "grid": [".55522.2", "5533262.", "5311666.", "51116556",
+                 "15115446", "11117776", "11122476", ".111776."],
+        "hue": "#fdc29a", "eye": "#fdf5e8", "highlight": "#4a4339",
+        "shadow": "#fcfc39", "outline": "#020101", "accent6": "#2599fc",
+        "accent7": "#963928", "bg": "#554b40",
+    },
+    "joker": {
+        "name": "joker",
+        "grid": [".676676.", "67677676", "71166117", "16111161",
+                 "15611651", "11111111", "13555531", ".133331."],
+        "hue": "#fbf5e8", "highlight": "#fe0444", "outline": "#020100",
+        "accent6": "#077739", "accent7": "#28e849", "bg": "#545956",
+    },
+    "flash": {
+        "name": "flash",
+        "grid": [".111111.", "11111111", "71111117", "76511567",
+                 "16611661", "11166111", "16622661", ".166661."],
+        "hue": "#fb063b", "eye": "#feebd6", "outline": "#772c36",
+        "accent6": "#fbc49a", "accent7": "#fff939", "bg": "#541725",
+    },
+    "superman": {
+        "name": "superman",
+        "grid": [".555555.", "55555555", "55151155", "51115115",
+                 "16111161", "11111111", "11122111", ".111111."],
+        "hue": "#fdc39a", "eye": "#ffecd8", "outline": "#020101",
+        "accent6": "#79d4fb", "bg": "#554b40",
+    },
+    "cyclops": {
+        "name": "cyclops",
+        "grid": ["77777777", "71111117", "15555551", "22222222",
+                 "23333332", "51111115", "13666631", ".666666."],
+        "hue": "#051746", "eye": "#fef845", "highlight": "#fd0944",
+        "outline": "#010102", "accent6": "#fbc39b", "accent7": "#2499f7",
+        "bg": "#0f1b28",
     },
 }
+
+# fixed SORTED name order → the deterministic index a HAID hashes onto (hero_for). A
+# stable sort means every surface (and the bash test parity) agrees on the mapping.
+HERO_ORDER = sorted(HERO_SIGILS)
+
+# PINNED customs — an EXACT seed → a hero face. batsy stays pinned to RJ's own HAID so
+# the heimdall-sigil-custom contract (RJ's HAID → batsy, rendered RAW) is byte-identical.
+CUSTOM_SIGILS = {
+    "haid:rj.rishabhs-macbook-air-46d5": HERO_SIGILS["batsy"],
+}
+
+# A REAL HAID is the canonical `haid:human.machine-hash4[/role]` shape (mirrors
+# bin/heimdall-haid `valid_haid`). Only a real HAID auto-assigns a hero — short demo /
+# handle seeds (rj, you, teammate-xyz, haid:alice) stay on the curated/animal path, so
+# every existing golden is untouched.
+_HAID_RE = re.compile(r'^haid:[a-z0-9-]+\.[a-z0-9-]+-[0-9a-f]{4}(/[a-z0-9][a-z0-9-]*)?$')
+
+def _is_haid(seed):
+    return bool(_HAID_RE.match(seed or ""))
+
+def hero_for(haid):
+    """The hero a HAID deterministically auto-assigns to: sha256(haid) mod 14 indexed
+    into the SORTED hero-name pool. Same HAID → same hero forever; roughly uniform
+    across distinct HAIDs. This is the default sigil for any real HAID with no override."""
+    idx = int(hashlib.sha256(haid.encode()).hexdigest(), 16) % len(HERO_ORDER)
+    return HERO_ORDER[idx]
+
+def _resolve_custom_spec(seed):
+    """The hero spec a seed resolves to, or None (→ the unchanged curated/animal path):
+        1. an EXPLICIT pin in CUSTOM_SIGILS (batsy → RJ's HAID) — always wins;
+        2. an EXPLICIT hero NAME (the CLI/override seed, e.g. 'venom');
+        3. a REAL HAID → its deterministic auto-assigned hero (hero_for)."""
+    if seed in CUSTOM_SIGILS:
+        return CUSTOM_SIGILS[seed]
+    if seed in HERO_SIGILS:
+        return HERO_SIGILS[seed]
+    if _is_haid(seed):
+        return HERO_SIGILS[hero_for(seed)]
+    return None
+
+# token → palette-key map for a hero spec. The palette is built for ONLY the keys a
+# hero carries, so a spec that omits (say) accent7 renders fine — the render never
+# references a token its grid does not use (asserted by the 14-hero load test).
+_TOKEN_KEY = {'.': 'bg', '1': 'hue', '2': 'eye', '3': 'highlight',
+              '4': 'shadow', '5': 'outline', '6': 'accent6', '7': 'accent7'}
 
 # ── SUPERX SPRITE CAST (ported) — the generated path is a recognizable ANIMAL, not
 #    a blob. The superx dashboard shipped a cast of full-body pixel characters (one
@@ -551,24 +687,18 @@ def animal_for(seed):
     return ANIMAL_ORDER[idx]
 
 def custom_for(seed, eye_override=None):
-    """(token_grid, palette) for a PINNED custom sigil, or None when the seed is not
-    pinned. The token grid is the raw authored 8×8 (chars '.','1','2','5','6','7');
-    the palette maps each token → RGB from the spec. NO watchman finish — a custom
-    sigil is a complete authored face and renders its OWN pixels exactly. eye_override
-    is ignored: the face carries its own authored eye color (2), so it renders
-    identically in every animation frame (renders its own pixels exactly)."""
-    spec = CUSTOM_SIGILS.get(seed)
+    """(token_grid, palette) for a hero sigil (pinned / hero-name / auto-assigned HAID),
+    or None when the seed takes the curated/animal path. The token grid is the raw
+    authored 8×8 (chars from the alphabet '.','1'..'7'); the palette maps each token →
+    RGB, built for ONLY the palette keys the hero carries (missing keys tolerated). NO
+    watchman finish — a hero is a complete authored face and renders its OWN pixels
+    exactly. eye_override is ignored: the face carries its own authored eye color (2),
+    so it renders identically in every animation frame."""
+    spec = _resolve_custom_spec(seed)
     if not spec:
         return None
     grid = [list(row) for row in spec["grid"]]
-    pal = {
-        '.': _hex_rgb(spec["bg"]),
-        '1': _hex_rgb(spec["hue"]),
-        '2': _hex_rgb(spec["eye"]),
-        '5': _hex_rgb(spec["outline"]),
-        '6': _hex_rgb(spec["accent6"]),
-        '7': _hex_rgb(spec["accent7"]),
-    }
+    pal = {tok: _hex_rgb(spec[key]) for tok, key in _TOKEN_KEY.items() if key in spec}
     return grid, pal
 
 def _custom_size_grid(seed, size, eye_override=None):
@@ -593,21 +723,24 @@ def _custom_size_grid(seed, size, eye_override=None):
     return tg, pal
 
 def grid_for(seed, eye_override=None):
-    """8x8 vertically-symmetric watchman. A PINNED custom sigil (CUSTOM_SIGILS) resolves
-    FIRST — its authored face renders RAW (no watchman finish). Otherwise: curated for
-    the 4 mockup seeds; every other HAID maps deterministically onto a ported superx
-    ANIMAL sprite. The curated + animal paths get the universal watchman finish."""
-    if seed in CUSTOM_SIGILS:
-        # Custom resolves first. grid_for returns the int projection used by glyph /
-        # glyph_color / --debug (bg→0, hue→1, eye→2, accents/outline collapse to body);
-        # the compact FACE render honors the FULL palette via _custom_size_grid in
-        # sigil_render (this int grid is never used to paint the pinned face). No
-        # _apply_watchman — the custom face keeps its own pixels/eyes.
-        spec = CUSTOM_SIGILS[seed]
-        tok2v = {'.': 0, '1': 1, '2': 2, '5': 1, '6': 1, '7': 1}
+    """8x8 vertically-symmetric watchman. A HERO sigil resolves FIRST — an explicit pin
+    (batsy → RJ's HAID), an explicit hero name, or a REAL HAID's auto-assigned hero — and
+    renders RAW (no watchman finish). Otherwise: curated for the 4 mockup seeds; every
+    other seed maps deterministically onto a ported superx ANIMAL sprite. The curated +
+    animal paths get the universal watchman finish."""
+    spec = _resolve_custom_spec(seed)
+    if spec is not None:
+        # Hero resolves first. grid_for returns the int projection used by glyph /
+        # glyph_color / --debug (bg→0, hue→1, eye→2, highlight/shadow/accents/outline
+        # collapse to body); the compact FACE render honors the FULL palette via
+        # _custom_size_grid in sigil_render (this int grid never paints the hero face).
+        # No _apply_watchman — the hero face keeps its own pixels/eyes. A hero without
+        # an authored eye (e.g. joker) falls back to the shared EYE for this projection
+        # only (never used to paint the face).
+        tok2v = {'.': 0, '1': 1, '2': 2, '3': 1, '4': 1, '5': 1, '6': 1, '7': 1}
         g = [[tok2v[ch] for ch in row] for row in spec["grid"]]
         hue = _hex_rgb(spec["hue"])
-        eye = eye_override or _hex_rgb(spec["eye"])
+        eye = eye_override or (_hex_rgb(spec["eye"]) if "eye" in spec else EYE)
         return g, hue, eye
     if seed in CURATED_GRIDS:
         g = [[int(ch) for ch in row] for row in CURATED_GRIDS[seed]]
@@ -868,7 +1001,25 @@ def _cli_main(argv=None):
                          "falls back to the base family when the variant is absent")
     ap.add_argument('--glyph', action='store_true')
     ap.add_argument('--debug', action='store_true')  # print ·/#/@ grid
+    ap.add_argument('--hero-for', dest='hero_for', default=None, metavar='HAID',
+                    help="print the hero a HAID auto-assigns to (deterministic pool pick)")
+    ap.add_argument('--list-heroes', action='store_true',
+                    help="print the hero auto-assign pool (one name per line, sorted)")
+    ap.add_argument('--resolve', default=None, metavar='SEED',
+                    help="print the hero NAME a seed resolves to (pin/name/auto), else empty")
     a = ap.parse_args(argv)
+    if a.list_heroes:
+        print('\n'.join(HERO_ORDER))
+        return 0
+    if a.hero_for:
+        print(hero_for(a.hero_for))
+        return 0
+    if a.resolve:
+        # The hero NAME a seed actually renders as (explicit pin > hero name > real HAID
+        # auto-assign), or empty for a curated/animal seed. What `hmd sigil` reports.
+        spec = _resolve_custom_spec(a.resolve)
+        print(spec["name"] if spec else "")
+        return 0
     if a.test:
         # calibration uses the DETECTED tier unless one is forced with --tier.
         cc = None
