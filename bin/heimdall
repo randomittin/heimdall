@@ -770,16 +770,106 @@ type_text() {
   done
 }
 
+# ── Loader color tier ─────────────────────────────────────────────────────────
+# Resolve the shader-spinner's render tier, mirroring hmd_termcaps precedence but
+# in pure bash (spin() is a hot foreground loop; no python per frame). Tiers:
+#   truecolor | 256 | 16 : animated braille bar with a sweeping color band
+#   mono                  : animated PLAIN braille, no color codes (no-color TTY)
+#   none                  : no animation at all — used for a non-TTY stdout so we
+#                           never spew \r frames into a pipe/file ("no garbage")
+# Overrides (demo/test): HEIMDALL_SPIN_TIER forces a tier and bypasses the TTY
+# check so frames can be captured headlessly; HEIMDALL_STATUSLINE_MODE is honored
+# for consistency with the statusline.
+_spin_tier() {
+  local mode="${HEIMDALL_SPIN_TIER:-${HEIMDALL_STATUSLINE_MODE:-}}"
+  case "$mode" in
+    truecolor|256|16|mono|none) printf '%s' "$mode"; return;;
+    ascii) printf 'mono'; return;;
+  esac
+  # non-TTY stdout → never animate (piped \r frames are garbage bytes)
+  [ -t 1 ] || { printf 'none'; return; }
+  # explicit no-color / dumb terminal → plain braille (animated, zero color codes)
+  if [ -n "${NO_COLOR:-}" ] || [ "${TERM:-dumb}" = "dumb" ]; then
+    printf 'mono'; return
+  fi
+  # tmux/screen: 24-bit SGR is unreliable → cap at 256
+  case "${TERM:-}" in screen*|tmux*) printf '256'; return;; esac
+  [ -n "${TMUX:-}" ] && { printf '256'; return; }
+  # an explicit truecolor advertisement is the strongest positive signal
+  case "${COLORTERM:-}" in truecolor|24bit) printf 'truecolor'; return;; esac
+  # Apple Terminal has no 24-bit path → 256
+  [ "${TERM_PROGRAM:-}" = "Apple_Terminal" ] && { printf '256'; return; }
+  case "${TERM:-}" in *256color*) printf '256'; return;; esac
+  printf '16'   # any other real TERM → 16-color
+}
+
+# ── Shader-style spinner ───────────────────────────────────────────────────────
+# Same contract as before: `spin <pid> <msg>` animates until <pid> exits, then
+# prints "  ✔ <msg>". Instead of one glyph, it renders a short braille BAR whose
+# glyph advances through the spin frames (the shimmer) while a bright color band
+# sweeps left→right across it (the shader sweep). Degrades truecolor→256→16→mono;
+# non-TTY skips animation entirely. Cursor is hidden during the sweep and always
+# restored, and the line is cleared (\033[K) on stop.
 spin() {
   local pid=$1 msg="$2"
   local frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+  local tier; tier="$(_spin_tier)"
+
+  # non-TTY / disabled: wait quietly, emit the result line only (no \r, no ANSI).
+  if [ "$tier" = "none" ]; then
+    while kill -0 "$pid" 2>/dev/null; do sleep 0.08; done
+    printf "  ✔ %s\n" "$msg"
+    return
+  fi
+
+  local R=$'\033[0m'
+  local W=10 span=14                 # bar cells; band travel incl. off-screen gap
+  # truecolor endpoints: dim slate (off-band) → bright cyan-white (band center)
+  local br0=70 bg0=70 bb0=110 br1=130 bg1=240 bb1=255
+  local c256=(60 61 67 74 81 159)    # xterm-256 ramp, index by level 0..5
+  local c16=($'\033[34m' $'\033[34m' $'\033[36m' $'\033[36m' $'\033[1;36m' $'\033[1;37m')
+  local chk=""                       # per-tier green for the ✔ (never truecolor on 256/16)
+  case "$tier" in
+    truecolor) chk=$'\033[38;2;78;204;163m';;
+    256)       chk=$'\033[38;5;78m';;
+    16)        chk=$'\033[32m';;
+  esac
+
+  printf '\033[?25l'                  # hide cursor for a clean sweep
   local i=0
   while kill -0 "$pid" 2>/dev/null; do
-    printf "\r  ${frames[$((i % 10))]} %s" "$msg"
+    local glyph="${frames[$((i % 10))]}"
+    local center=$(( i % span )) bar="" cell d lvl
+    for (( cell=0; cell<W; cell++ )); do
+      d=$(( cell - center )); [ $d -lt 0 ] && d=$(( -d ))
+      case $d in 0) lvl=5;; 1) lvl=4;; 2) lvl=2;; 3) lvl=1;; *) lvl=0;; esac
+      case "$tier" in
+        truecolor)
+          local rr=$(( br0 + (br1-br0)*lvl/5 ))
+          local gg=$(( bg0 + (bg1-bg0)*lvl/5 ))
+          local bb=$(( bb0 + (bb1-bb0)*lvl/5 ))
+          bar+=$'\033[38;2;'"$rr;$gg;$bb"'m'"$glyph" ;;
+        256) bar+=$'\033[38;5;'"${c256[$lvl]}"'m'"$glyph" ;;
+        16)  bar+="${c16[$lvl]}$glyph" ;;
+        mono) bar+="$glyph" ;;
+      esac
+    done
+    if [ "$tier" = "mono" ]; then
+      printf "\r  %s %s\033[K" "$bar" "$msg"
+    else
+      printf "\r  %s%s %s\033[K" "$bar" "$R" "$msg"
+    fi
     sleep 0.08
-    i=$((i + 1))
+    i=$(( i + 1 ))
   done
-  printf "\r  ✔ %s\n" "$msg"
+
+  # stop: rewrite line as the result, clear trailing sweep chars, restore cursor.
+  if [ "$tier" = "mono" ]; then
+    printf "\r  ✔ %s\033[K\n" "$msg"
+  else
+    printf "\r  %s✔%s %s\033[K\n" "$chk" "$R" "$msg"
+  fi
+  printf '\033[?25h'
 }
 
 # ── Dynamic version (NEVER baked) ──
