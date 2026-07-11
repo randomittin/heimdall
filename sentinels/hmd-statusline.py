@@ -373,7 +373,32 @@ def identity(cwd, fallback):
             handle = (rec.get("handle") or "").strip() or None
     except Exception:
         seed = handle = None   # any fault → drop to the env fallback below
-    return (seed or fallback), (handle or seed or fallback)
+    resolved = seed or fallback
+    return _sigil_override_seed(resolved), (handle or resolved)
+
+def _sigil_override_seed(seed):
+    """The dev's OWN sigil seed, honoring a hero OVERRIDE if one is set AND unlocked.
+    `hmd sigil set <hero>` persists the choice to <home>/sigil-choice (only writable once
+    the dev has run hmd ≥3 times — the ~/.heimdall/.run-count gate). When set + unlocked,
+    the override hero NAME (itself a resolvable sigil seed) WINS over the seed's
+    auto-assigned hero — the resolution order the render core then honors. Guarded: an
+    absent/invalid choice, a locked count, or any read fault → the seed is returned
+    UNCHANGED, so every statusline golden (which runs with no choice file) is a byte-exact
+    no-op. Only the current dev's own seed is affected; teammate seeds are never touched."""
+    home = os.environ.get("HEIMDALL_HOME") or os.path.join(os.path.expanduser("~"), ".heimdall")
+    try:
+        with open(os.path.join(home, "sigil-choice")) as f:
+            choice = f.read().strip()
+    except Exception:
+        return seed
+    if not choice or choice not in SIG.HERO_SIGILS:
+        return seed
+    try:
+        with open(os.path.join(home, ".run-count")) as f:
+            runs = int(f.read().strip() or "0")
+    except Exception:
+        runs = 0
+    return choice if runs >= 3 else seed
 
 def _quiet_rm(path):
     try: os.remove(path)

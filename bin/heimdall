@@ -890,6 +890,28 @@ print_banner() {
 
 ENTRY_NAME="$(basename "$0")"   # hmd or heimdall — for self-referential help
 
+# ── run-count (unlock gamification for `hmd sigil`) ──────────────────────────
+# No existing per-invocation dev counter exists (.planning/metrics.jsonl is per-REPO
+# task-outcome records, not per-dev hmd runs), so a tiny counter file owns it. Bumped
+# ONCE per hmd invocation; HEIMDALL_RUN_COUNTED makes it idempotent within one process
+# tree (nested self-calls don't double-count). Never fails the caller.
+HEIMDALL_RUN_COUNT_FILE="$HEIMDALL_HOME_DIR/.run-count"
+hmd_run_count() {                     # echo the current count (0 when absent/garbage)
+  local n=0
+  [ -f "$HEIMDALL_RUN_COUNT_FILE" ] && n="$(cat "$HEIMDALL_RUN_COUNT_FILE" 2>/dev/null || echo 0)"
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  printf '%s' "$n"
+}
+hmd_bump_run_count() {
+  [ -n "${HEIMDALL_RUN_COUNTED:-}" ] && return 0
+  export HEIMDALL_RUN_COUNTED=1
+  mkdir -p "$HEIMDALL_HOME_DIR" 2>/dev/null || return 0
+  local n; n="$(hmd_run_count)"; n=$((n + 1))
+  printf '%s\n' "$n" > "$HEIMDALL_RUN_COUNT_FILE" 2>/dev/null || true
+  return 0
+}
+hmd_bump_run_count || true
+
 case "${1:-}" in
   version|--version|-v|-V)
     # Resolve via the SAME dynamic resolver the banner + install card use, so all
@@ -949,12 +971,66 @@ case "${1:-}" in
     # teammate can verify — or screenshot — how the sigil renders on their terminal.
     shift
     SIGIL_BIN="$PLUGIN_DIR/bin/heimdall-sigil"
-    if [ ! -x "$SIGIL_BIN" ]; then
-      echo "  Error: sigil renderer not found at $SIGIL_BIN" >&2
-      echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
-      exit 1
-    fi
-    exec "$SIGIL_BIN" "$@"
+    SIGIL_PY="$PLUGIN_DIR/sentinels/hmd_sigil.py"
+    HAID_BIN="$PLUGIN_DIR/bin/heimdall-haid"
+    SIGIL_CHOICE_FILE="$HEIMDALL_HOME_DIR/sigil-choice"
+    case "${1:-}" in
+      ''|status|show)
+        # `hmd sigil` — the dev's CURRENT hero + whether change is unlocked (≥3 runs).
+        # Effective hero = an unlocked override, else the seed's auto-assigned hero
+        # (real HAID → hero_for) as the render core resolves it. Unlock is earned
+        # customization: change your sigil only after you've run hmd 3+ times.
+        _haid="$("$HAID_BIN" current 2>/dev/null || true)"
+        [ -n "$_haid" ] || _haid="${HEIMDALL_HAID:-haid:local}"
+        _auto="$(python3 "$SIGIL_PY" --resolve "$_haid" 2>/dev/null || true)"
+        [ -n "$_auto" ] || _auto="$(python3 "$SIGIL_PY" --hero-for "$_haid" 2>/dev/null || true)"
+        _runs="$(hmd_run_count)"
+        _override=""; [ -f "$SIGIL_CHOICE_FILE" ] && _override="$(cat "$SIGIL_CHOICE_FILE" 2>/dev/null || true)"
+        if [ -n "$_override" ] && [ "$_runs" -ge 3 ]; then _current="$_override"; else _current="$_auto"; fi
+        printf "  sigil: %s\n" "${_current:-<none>}"
+        printf "  haid:  %s\n" "$_haid"
+        if [ "$_runs" -ge 3 ]; then
+          printf "  change unlocked (%s runs) — pick any: hmd sigil set <name>\n" "$_runs"
+          printf "  heroes: %s\n" "$(python3 "$SIGIL_PY" --list-heroes 2>/dev/null | tr '\n' ' ')"
+        else
+          printf "  change locked — unlocks after 3 hmd runs (you have %s)\n" "$_runs"
+        fi
+        exit 0
+        ;;
+      set)
+        # `hmd sigil set <name>` — persist a hero override, gated on the unlock.
+        shift
+        _name="${1:-}"
+        _runs="$(hmd_run_count)"
+        if [ -z "$_name" ]; then
+          echo "  usage: hmd sigil set <name>" >&2
+          echo "  heroes: $(python3 "$SIGIL_PY" --list-heroes 2>/dev/null | tr '\n' ' ')" >&2
+          exit 2
+        fi
+        if [ "$_runs" -lt 3 ]; then
+          echo "  sigil change unlocks after 3 hmd runs (you have $_runs)" >&2
+          exit 1
+        fi
+        if ! python3 "$SIGIL_PY" --list-heroes 2>/dev/null | grep -qx -- "$_name"; then
+          echo "  unknown hero: $_name" >&2
+          echo "  pick one of: $(python3 "$SIGIL_PY" --list-heroes 2>/dev/null | tr '\n' ' ')" >&2
+          exit 2
+        fi
+        mkdir -p "$HEIMDALL_HOME_DIR" 2>/dev/null || true
+        printf '%s\n' "$_name" > "$SIGIL_CHOICE_FILE"
+        printf "  sigil set to %s (unlocked, %s runs)\n" "$_name" "$_runs"
+        exit 0
+        ;;
+      *)
+        # --test / --seed / --tier / --glyph / … → the shared render core (unchanged).
+        if [ ! -x "$SIGIL_BIN" ]; then
+          echo "  Error: sigil renderer not found at $SIGIL_BIN" >&2
+          echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+          exit 1
+        fi
+        exec "$SIGIL_BIN" "$@"
+        ;;
+    esac
     ;;
   sigil-png)
     # `hmd sigil-png` — CRISP PNG render of the watchman sigil, for the image
