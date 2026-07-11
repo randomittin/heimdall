@@ -142,6 +142,11 @@ ANIMAL_HUES = {
 
 EYE = (240, 248, 255)   # bright eye glint (aliceblue)
 DIM = (19, 21, 29)       # OFF pixel — a DIM FILLED cell (#13151d) -> solid silhouette
+BORDER = (10, 11, 15)    # value 3 — a near-black 1px FRAME (darker than DIM) that rings the
+                         # block to contain edge speckle/bleed and crisp the silhouette. (No
+                         # single-digit 5/6 channel: the density suite's SGR-blink guard treats
+                         # a standalone `5`/`6` param as banned blink, so the frame color avoids
+                         # colliding with a truecolor `38;2;R;G;B` triplet.)
 OFF = None               # legacy transparent sentinel (kept for color()/glyph back-compat)
 
 W, H = 8, 8
@@ -538,8 +543,25 @@ def color(rgb, layer):  # layer: 'fg' or 'bg'
     return f'\033[{code};2;{rgb[0]};{rgb[1]};{rgb[2]}m'
 
 def cell_color(v, hue, eye):
-    # 0 -> DIM filled block (silhouette), 1 -> body hue, 2 -> eye glint
-    return {0: DIM, 1: hue, 2: eye}[v]
+    # 0 -> DIM filled block (silhouette), 1 -> body hue, 2 -> eye glint, 3 -> border frame
+    return {0: DIM, 1: hue, 2: eye, 3: BORDER}[v]
+
+def _apply_border(vg):
+    """Ring the value grid with a near-black 1px FRAME (value 3), IN-FOOTPRINT (no
+    growth): every PERIMETER cell that is OFF/DIM (value 0) becomes the frame, while a
+    lit body/eye pixel that reaches the edge (an ear tip, a shoulder) is preserved so
+    the silhouette survives. The frame contains the DIM edge-speckle bleed and crisps
+    the block's bounding box. Mutates + returns the grid. N>=2 assumed (S=4, M=8, L=16)."""
+    N = len(vg)
+    if N < 2:
+        return vg
+    for c in range(N):
+        if vg[0][c] == 0:      vg[0][c] = 3
+        if vg[N - 1][c] == 0:  vg[N - 1][c] = 3
+    for r in range(N):
+        if vg[r][0] == 0:      vg[r][0] = 3
+        if vg[r][N - 1] == 0:  vg[r][N - 1] = 3
+    return vg
 
 def _cell(top, bot):
     """One text cell from a top/bot pixel pair. OFF (None) stays transparent;
@@ -632,7 +654,7 @@ def _render_detailed(haid, caps, eye_override=None, pad='', xscale=1, emotion=No
     return caps.emit("\n".join(lines)).split("\n")
 
 
-def sigil_render(haid, size='M', caps=None, eye_override=None, pad='', xscale=1, emotion=None):
+def sigil_render(haid, size='M', caps=None, eye_override=None, pad='', xscale=1, emotion=None, border=False):
     """THE shared watchman renderer — every surface goes through here.
 
     Builds the value grid at `size`, emits PURE `▀` half-block cells in 24-bit
@@ -645,11 +667,14 @@ def sigil_render(haid, size='M', caps=None, eye_override=None, pad='', xscale=1,
     size 'D' is the DETAILED tier (RJ's 16×16 hand-authored sprites + shading, with
     an optional `emotion` variant); S/M/L are the flat compact/animal grids and are
     byte-untouched by the detailed path. xscale doubles each cell horizontally (the
-    legacy `large` share form)."""
+    legacy `large` share form). `border` rings the S/M/L grid with an in-footprint
+    near-black 1px frame (FIX 4) — default off, so the CLI/banner path is unchanged."""
     caps = caps or _NATIVE
     if size == 'D':
         return _render_detailed(haid, caps, eye_override, pad, xscale, emotion)
     vg, hue, eye = _size_grid(haid, size, eye_override)
+    if border:
+        vg = _apply_border(vg)   # in-footprint near-black 1px frame (FIX 4)
     N = len(vg)
     lines = []
     for tr in range(0, N, 2):   # two pixel-rows per text-row (N is always even)

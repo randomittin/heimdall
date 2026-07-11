@@ -216,12 +216,13 @@ def _sigil_version():
         return "0"
 _SIG_VERSION = _sigil_version()
 
-def cached_sigil(seed, size, caps, eye):
+def cached_sigil(seed, size, caps, eye, border=True):
     eyt = tuple(eye or SIG.EYE)
     ekey = "%02x%02x%02x" % (eyt[0], eyt[1], eyt[2])
-    # the version hash is part of the key/filename → a code change invalidates the
-    # cache automatically; only a tier/eye/seed/version match hits the stored sigil.
-    ckey = "%s-%s-%s" % (caps.color, caps.unicode, _SIG_VERSION)
+    # the version hash + border flag are part of the key/filename → a code change (or
+    # a border toggle) invalidates the cache automatically; only a tier/eye/seed/
+    # version/border match hits the stored sigil.
+    ckey = "%s-%s-%s%s" % (caps.color, caps.unicode, _SIG_VERSION, "b" if border else "")
     memo_k = (seed, size, ckey, ekey)
     m = _SIG_MEMO.get(memo_k)
     if m is not None: return list(m)
@@ -235,7 +236,7 @@ def cached_sigil(seed, size, caps, eye):
         lines = None
     if lines is None:
         try:
-            lines = SIG.sigil_render(seed, size, SIG.tier_caps(), eye_override=eye)
+            lines = SIG.sigil_render(seed, size, SIG.tier_caps(), eye_override=eye, border=border)
         except Exception:
             lines = None
         if lines is not None:
