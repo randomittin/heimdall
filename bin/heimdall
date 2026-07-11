@@ -918,6 +918,37 @@ heimdall_version() {
   printf '%s' "$ver"
 }
 
+# ── Banner version (plugin.json is the SINGLE SOURCE OF TRUTH) ──
+#
+# The startup BANNER must always match the SHIPPED release. The manifest
+# (.claude-plugin/plugin.json) ships bundled WITH the release code, so it is the
+# authoritative answer to "what code is this". A git tag, by contrast, can be
+# STALE or MISSING in an INSTALLED plugin clone — a shallow/behind checkout whose
+# nearest reachable tag lags the manifest. That is exactly how the banner drifted
+# to a stale v2.0.18 while the shipped manifest already read 2.1.0 (heimdall_version
+# resolves the git tag FIRST, so a behind-checkout tag shadowed the truth).
+#
+# So the BANNER reads the manifest FIRST and only falls back to the git-tag
+# resolver when the manifest is unreadable (a tarball with no manifest) — never a
+# hardcoded string. NOTE: `hmd version` deliberately keeps the OPPOSITE order (git
+# tag = canonical release identity) via heimdall_version(); this resolver is
+# banner-scoped on purpose, so the two do not conflict.
+banner_version() {
+  local ver="" raw="" manifest="$PLUGIN_DIR/.claude-plugin/plugin.json"
+  if [ -f "$manifest" ]; then
+    if command -v jq >/dev/null 2>&1; then
+      raw="$(jq -r '.version // empty' "$manifest" 2>/dev/null || true)"
+    else
+      raw="$(grep -oE '"version"[[:space:]]*:[[:space:]]*"[^"]+"' "$manifest" 2>/dev/null | head -1 | sed -E 's/.*"([^"]+)".*/\1/')"
+    fi
+    [ -n "$raw" ] && ver="v${raw#v}"
+  fi
+  # Manifest unreadable → defer to the git-tag resolver so the banner still shows
+  # something truthful rather than nothing.
+  [ -z "$ver" ] && ver="$(heimdall_version)"
+  printf '%s' "$ver"
+}
+
 print_banner() {
   local C V G D R
   R='\033[0m'
@@ -950,8 +981,10 @@ print_banner() {
     # Renderer absent (partial/broken install) → minimal text, never blank.
     printf "  H E I M D A L L\n  Nothing ships unproven.\n"
   fi
-  # Dynamic version line — resolved at runtime (git tag → manifest), never baked.
-  local _ver; _ver="$(heimdall_version)"
+  # Dynamic version line — resolved at runtime from the shipped manifest
+  # (.claude-plugin/plugin.json) FIRST so the banner can never drift from the
+  # shipped release; git-tag only as a manifest-unreadable fallback. Never baked.
+  local _ver; _ver="$(banner_version)"
   [ -n "$_ver" ] && printf "  ${D}%s${R}\n" "$_ver"
   sleep 0.1
   printf "  ${V}╭─────────────────────────────────────╮${R}\n"; sleep 0.05
