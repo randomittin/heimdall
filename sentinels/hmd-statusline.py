@@ -932,12 +932,24 @@ def main():
     swarm = swarm_block(cwd)
     if swarm:
         out = []
-        out.append(f"{_sig(sig,0,CY)}  " + line(l1, r1))
-        out.append(f"{_sig(sig,1,CY)}  " + line(l2, r2))
+        # VERTICALLY CENTER the 4-row sigil among the N content rows. A swarm/team-
+        # wall layout has N>4 rows, so the perfect 8×8 sigil (8 cols × 4 half-block
+        # rows) can't fill them — it sits in the MIDDLE: ⌊(N−4)/2⌋ blank 8-space
+        # prefixes above, the sigil's 4 rows contiguous, the rest blank below. Only
+        # the vertical POSITION shifts; the sigil is never distorted. N≤4 → off 0 →
+        # top-anchored (byte-identical to before). `off` guards negative indices so
+        # a blank-above row is a true 8-space prefix, not a wrapped sig[-1].
+        N = 2 + len(swarm) + (1 if upd else 0)
+        off = (N - 4) // 2 if N > 4 else 0
+        def sigc(c):  # sigil prefix for content row c, centered by `off`
+            idx = c - off
+            return sig[idx] if 0 <= idx < len(sig) else "        "
+        out.append(f"{sigc(0)}  " + line(l1, r1))
+        out.append(f"{sigc(1)}  " + line(l2, r2))
         for i, seg in enumerate(swarm):
-            out.append(f"{_sig(sig, 2+i, CY)}  " + seg)
+            out.append(f"{sigc(2+i)}  " + seg)
         if upd:
-            out.append(f"{_sig(sig, 2+len(swarm), CY)}  " + upd)
+            out.append(f"{sigc(2+len(swarm))}  " + upd)
         sys.stdout.write(finalize(out, MAXW) + "\n")   # single tier downgrade + width invariant + no-wrap clamp
         return
 
