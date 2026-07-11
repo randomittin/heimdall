@@ -295,6 +295,65 @@ def read_json():
     try: return json.load(sys.stdin)
     except Exception: return {}
 
+def _cols_from_tty():
+    """Read the REAL width of the CONTROLLING terminal via /dev/tty. Claude Code captures
+    the statusline's stdout (so stdout is NOT a tty — `tput cols` / an ioctl on stdout
+    would fail or lie), but /dev/tty may still be the actual terminal and report its true
+    winsize. Two probes, in order:
+      1. `tput cols </dev/tty` — ncurses reads the tty's window size (needs $TERM; returns
+         '' when setupterm fails, which we skip).
+      2. `stty size </dev/tty`  — prints "rows cols" straight from the tty's TIOCGWINSZ,
+         with no $TERM dependency.
+    Returns a positive int, or None when there is no controlling terminal or both probes
+    fail. Never raises — the statusline must never break on width detection."""
+    try:
+        tty = open("/dev/tty")
+    except Exception:
+        return None                               # no controlling terminal → caller defaults
+    try:
+        probes = (
+            (["tput", "cols"], lambda o: o.strip()),
+            (["stty", "size"], lambda o: (o.split()[1] if len(o.split()) >= 2 else "")),
+        )
+        for cmd, pick in probes:
+            try:
+                r = subprocess.run(cmd, stdin=tty, stdout=subprocess.PIPE,
+                                   stderr=subprocess.DEVNULL, timeout=0.5)
+                c = int(pick(r.stdout.decode("utf-8", "replace")))
+                if c > 0:
+                    return c
+            except Exception:
+                continue                          # this probe failed → try the next
+    finally:
+        try: tty.close()
+        except Exception: pass
+    return None
+
+def resolve_cols():
+    """Resolve the terminal width WITHOUT ever over-assuming — we must NEVER render wider
+    than the real terminal, or an over-wide row soft-wraps into a thin duplicate strip on
+    a narrow terminal (RJ's ~95-col bug). Order:
+      1. $COLUMNS if set + numeric + >0 — Claude Code exports it (v2.1.153+); an explicit
+         width always wins and keeps every golden (which pins COLUMNS) byte-identical.
+      2. The controlling terminal's real width via /dev/tty (_cols_from_tty) — used when
+         COLUMNS is absent (older CC / other invocations) so we still fit the real screen.
+      3. A CONSERVATIVE 80-col default when the width is genuinely unknown — UNDER-render
+         (compact) rather than OVER-render and wrap. A slightly narrow statusline beats a
+         wrapping one.
+    Returns an int >= 1."""
+    env = os.environ.get("COLUMNS")
+    if env is not None:
+        try:
+            c = int(env.strip())
+            if c > 0:
+                return c
+        except Exception:
+            pass                                  # non-numeric COLUMNS → fall through
+    c = _cols_from_tty()
+    if c and c > 0:
+        return c
+    return 80                                     # conservative floor: under-render, never wrap
+
 def gate_state(cwd):
     p = os.environ.get("HEIMDALL_STATE", os.path.join(cwd, ".heimdall", "statusline.json"))
     try:
@@ -717,8 +776,10 @@ def main():
     if verdict not in VERDICT: verdict = "watching"
     eye_rgb, vcol, vglyph, vword = VERDICT[verdict]
     passed, total = st.get("passed"), st.get("total")
-    cols = int(os.environ.get("COLUMNS") or 120)   # CC exports COLUMNS (v2.1.153+); 80 is the ANSI floor, 120 our default
-    if cols < 1: cols = 120
+    # Resolve the REAL width: explicit $COLUMNS → the controlling terminal via /dev/tty →
+    # a conservative 80. Never blindly assume 120, or a narrow terminal (no $COLUMNS
+    # exported) soft-wraps the over-wide full-mode rows into a thin duplicate strip.
+    cols = resolve_cols()
     RMARGIN = 6  # right safety gutter: clears Claude Code's scrollbar + edge padding so the verdict never clips off-screen
     # every finalized row is clamped to this width so none can wrap: it matches the
     # width a line()-built row already targets (cols − RMARGIN, ANCHOR included), so
