@@ -314,6 +314,33 @@ def update_notice():
         return ""
     return f"{AM}⬆ {latest_raw} available{X} {FAINT}·{X} {DIM}hmd --update{X}"
 
+def usage_limit_seg(data, now):
+    """The session-relevant 5-HOUR usage-limit indicator, pinned at the rightmost end
+    of the top row. Reads rate_limits.five_hour.{used_percentage,resets_at} from CC's
+    stdin JSON — present ONLY for Pro/Max accounts and ABSENT until the first API
+    response, so a missing/malformed field returns '' (render NOTHING, never a fake %).
+    Renders `⧗ NN%` color-graded green→amber→red as it approaches 100, plus a compact
+    resets-in countdown (`·2h` / `·45m`) when resets_at is a future epoch. HMD_NOW
+    drives the clock for deterministic conformance (same override the eye animation uses)."""
+    rl = data.get("rate_limits")
+    if not isinstance(rl, dict):
+        return ""
+    fh = rl.get("five_hour")
+    if not isinstance(fh, dict):
+        return ""
+    up = fh.get("used_percentage")
+    if not isinstance(up, (int, float)) or isinstance(up, bool):
+        return ""                                   # absent/malformed → NO fabrication
+    pct = max(0, min(100, int(round(up))))
+    col = RD if pct >= 90 else AM if pct >= 70 else GR   # green→amber→red toward the cap
+    seg = f"{col}⧗ {pct}%{X}"
+    ra = fh.get("resets_at")
+    if isinstance(ra, (int, float)) and not isinstance(ra, bool) and ra > now:
+        rem = int(ra - now)
+        cd = f"{rem // 3600}h" if rem >= 3600 else f"{max(1, rem // 60)}m"
+        seg += f" {FAINT}·{X}{DIM}{cd}{X}"           # compact "resets in" countdown
+    return seg
+
 def identity(cwd, fallback):
     """Sigil SEED + display HANDLE from bin/heimdall-identity (RJ's call: identity is a
     file each dev controls, not a derived HAID). One `--json` call resolves both. Any
@@ -785,6 +812,13 @@ def main():
         bifrost = (f"{GR}bifröst open{X}" if verdict=="pass" else
                    f"{RD}bifröst closed{X}" if verdict=="deny" else f"{DIM}watching{X}")
         r2 = f"{bifrost}{claim_seg}"
+
+    # 5-hour usage-limit indicator, pinned at the rightmost end of the top row (after
+    # the verdict). Absent unless CC's stdin JSON carries rate_limits (Pro/Max, post
+    # first API response) → never fabricated. Rides r1, which line() right-pins.
+    usage_seg = usage_limit_seg(data, t)
+    if usage_seg:
+        r1 = f"{r1}  {usage_seg}" if r1 else usage_seg
 
     # left info rows
     l1 = f"{eyes_inline} {TEAL}{BOLD}HEIMDALL{X}{SEP}{DIM}{handle}{X}{SEP}{DIM}{model}{X}"
