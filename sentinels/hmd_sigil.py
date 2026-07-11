@@ -318,6 +318,14 @@ HERO_SIGILS = {
         "hue": "#409ae6", "eye": "#ffefea", "accent6": "#afb4b6",
         "accent7": "#ecff5a", "bg": "#204055",
     },
+    "vision": {
+        "name": "vision",
+        "grid": [".774447.", "71774717", "15177151", "16633661",
+                 "11266211", "15566551", "15633651", ".566665."],
+        "hue": "#000000", "eye": "#e1dd66", "highlight": "#ff63a4",
+        "shadow": "#2fe05d", "outline": "#7e0c42", "accent6": "#f80840",
+        "accent7": "#077936", "bg": "#0e1515",
+    },
 }
 
 # fixed SORTED name order → the deterministic index a HAID hashes onto (hero_for). A
