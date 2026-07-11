@@ -86,6 +86,40 @@ CURATED_HUES = {
     'priya': (244, 114, 182),   # pink
 }
 
+# ── CUSTOM (PINNED) SIGILS — hand-authored complete faces pinned to ONE identity.
+#    Keyed by the EXACT sigil seed the statusline resolves (a full HAID) or a handle.
+#    Unlike the curated 0/1/2 grids (which get the universal watchman finish), a
+#    custom sigil is a COMPLETE authored face: it carries its OWN full palette and is
+#    rendered RAW — the animal-cast watchman band + forced eyes are BYPASSED (the face
+#    already has its own eyes in the grid). ADDITIVE: only the pinned seed is affected;
+#    every other seed resolves through the unchanged curated→animal path.
+#
+#    grid alphabet (8×8):  . = bg   1 = hue   2 = eye   5 = outline
+#                          6 = accent6   7 = accent7
+#    Each value maps to a hex in the spec; the compact render (S/M/L) honors the FULL
+#    palette and the one-pass tier downgrade (truecolor→256→16→mono) applies as usual.
+CUSTOM_SIGILS = {
+    # batsy — RJ's hand-authored bat-cowl homage (RJ's own pixels), pinned to RJ's HAID.
+    #   navy cowl (1) · white eyes (2) · near-black outline (5) · skin jaw (6) · blue accents (7)
+    "haid:rj.rishabhs-macbook-air-46d5": {
+        "name": "batsy",
+        "grid": ["1......1",
+                 "11777171",
+                 "15117711",
+                 "15511151",
+                 "12255221",
+                 "15555551",
+                 "16622661",
+                 ".166661."],
+        "hue":     "#181c39",   # 1 — navy cowl (body)
+        "eye":     "#faf3e8",   # 2 — warm white eyes
+        "outline": "#040204",   # 5 — near-black outline
+        "accent6": "#f7c7a7",   # 6 — skin jaw
+        "accent7": "#299af7",   # 7 — blue ear-tips / accents
+        "bg":      "#141d25",   # . — backdrop (solid, so the silhouette has a clean box)
+    },
+}
+
 # ── SUPERX SPRITE CAST (ported) — the generated path is a recognizable ANIMAL, not
 #    a blob. The superx dashboard shipped a cast of full-body pixel characters (one
 #    per agent role) that READ as characters because each had an unmistakable
@@ -516,10 +550,65 @@ def animal_for(seed):
     idx = hashlib.sha256(seed.encode()).digest()[0] % len(ANIMAL_ORDER)
     return ANIMAL_ORDER[idx]
 
+def custom_for(seed, eye_override=None):
+    """(token_grid, palette) for a PINNED custom sigil, or None when the seed is not
+    pinned. The token grid is the raw authored 8×8 (chars '.','1','2','5','6','7');
+    the palette maps each token → RGB from the spec. NO watchman finish — a custom
+    sigil is a complete authored face and renders its OWN pixels exactly. eye_override
+    is ignored: the face carries its own authored eye color (2), so it renders
+    identically in every animation frame (renders its own pixels exactly)."""
+    spec = CUSTOM_SIGILS.get(seed)
+    if not spec:
+        return None
+    grid = [list(row) for row in spec["grid"]]
+    pal = {
+        '.': _hex_rgb(spec["bg"]),
+        '1': _hex_rgb(spec["hue"]),
+        '2': _hex_rgb(spec["eye"]),
+        '5': _hex_rgb(spec["outline"]),
+        '6': _hex_rgb(spec["accent6"]),
+        '7': _hex_rgb(spec["accent7"]),
+    }
+    return grid, pal
+
+def _custom_size_grid(seed, size, eye_override=None):
+    """The token grid + palette for a pinned custom sigil at the target size, or None.
+    M is the native authored 8×8; L is a nearest 2× upsample (crisp doubling); S is an
+    8→4 box-majority downsample on the TOKENS (mirrors _size_grid), so shrinking never
+    fringes the silhouette. The palette is unchanged across sizes."""
+    got = custom_for(seed, eye_override)
+    if got is None:
+        return None
+    g, pal = got
+    N = SIZES[size]
+    if N == W:                                             # M — native 8×8, raw
+        tg = g
+    elif N == 2 * W:                                       # L — nearest 2× upsample
+        tg = [[g[r // 2][c // 2] for c in range(N)] for r in range(N)]
+    else:                                                  # S — 8→4 box-majority
+        step = W // N
+        tg = [[_majority([g[step * R + dr][step * C + dc]
+                          for dr in range(step) for dc in range(step)])
+               for C in range(N)] for R in range(N)]
+    return tg, pal
+
 def grid_for(seed, eye_override=None):
-    """8x8 vertically-symmetric watchman. Curated for the 4 mockup seeds; every other
-    HAID maps deterministically onto a ported superx ANIMAL sprite (recognizable
-    character, never a blob). Both paths get the universal watchman finish."""
+    """8x8 vertically-symmetric watchman. A PINNED custom sigil (CUSTOM_SIGILS) resolves
+    FIRST — its authored face renders RAW (no watchman finish). Otherwise: curated for
+    the 4 mockup seeds; every other HAID maps deterministically onto a ported superx
+    ANIMAL sprite. The curated + animal paths get the universal watchman finish."""
+    if seed in CUSTOM_SIGILS:
+        # Custom resolves first. grid_for returns the int projection used by glyph /
+        # glyph_color / --debug (bg→0, hue→1, eye→2, accents/outline collapse to body);
+        # the compact FACE render honors the FULL palette via _custom_size_grid in
+        # sigil_render (this int grid is never used to paint the pinned face). No
+        # _apply_watchman — the custom face keeps its own pixels/eyes.
+        spec = CUSTOM_SIGILS[seed]
+        tok2v = {'.': 0, '1': 1, '2': 2, '5': 1, '6': 1, '7': 1}
+        g = [[tok2v[ch] for ch in row] for row in spec["grid"]]
+        hue = _hex_rgb(spec["hue"])
+        eye = eye_override or _hex_rgb(spec["eye"])
+        return g, hue, eye
     if seed in CURATED_GRIDS:
         g = [[int(ch) for ch in row] for row in CURATED_GRIDS[seed]]
         hue = CURATED_HUES[seed]
@@ -649,6 +738,24 @@ def sigil_render(haid, size='M', caps=None, eye_override=None, pad='', xscale=1,
     caps = caps or _NATIVE
     if size == 'D':
         return _render_detailed(haid, caps, eye_override, pad, xscale, emotion)
+    # PINNED custom sigil (S/M/L): render the authored token grid RAW through the FULL
+    # palette (.=bg 1=hue 2=eye 5=outline 6=accent6 7=accent7) — bypassing the animal
+    # watchman band/eyes — then downgrade the whole block to `caps` in the same one pass
+    # (truecolor NO-OP · 256 LUT · 16 · mono) as every other tier. Never reached for a
+    # non-pinned seed, so all other seeds stay byte-identical.
+    custom = _custom_size_grid(haid, size, eye_override) if size in ('S', 'M', 'L') else None
+    if custom is not None:
+        tg, pal = custom
+        N = len(tg)
+        lines = []
+        for tr in range(0, N, 2):
+            line = pad
+            for c in range(N):
+                top = pal[tg[tr][c]]
+                bot = pal[tg[tr + 1][c]] if tr + 1 < N else OFF
+                line += _cell(top, bot) * xscale
+            lines.append(line)
+        return caps.emit("\n".join(lines)).split("\n")
     vg, hue, eye = _size_grid(haid, size, eye_override)
     N = len(vg)
     lines = []
