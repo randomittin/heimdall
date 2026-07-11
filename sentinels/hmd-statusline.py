@@ -238,13 +238,38 @@ def cached_sigil(seed, size, caps, eye):
 # a 4-wide × 2-row branded ASCII anchor for the compact mode's no-unicode fallback.
 ASCII_SIGIL_S = [" __ ", "|oo|"]
 
-def finalize(lines):
-    """Emit every row to the detected tier (the single downgrade pass) then pad each
-    to the uniform MAX visible width so ALL rows are wcwidth-equal — the width
-    invariant the density goldens assert (spec Tests 2–3). Pad is trailing spaces
-    only, so a shorter wall/tease row aligns flush under the header block and no line
-    is ever sliced mid-glyph."""
-    em = [CAPS.emit(ln) for ln in lines]
+def _clamp_row(s, maxw):
+    """Truncate one already-emitted row to `maxw` VISIBLE cells without slicing an
+    ANSI escape or a wide glyph in half. ANSI codes carry zero width and are copied
+    verbatim; a visible glyph is dropped whole once it would cross the budget. A
+    reset is appended iff the row carried color AND was actually clipped, so a
+    truncated row never bleeds its last SGR into the terminal. maxw<=0 → empty."""
+    if maxw is None:
+        return s
+    if maxw <= 0:
+        return ""
+    out = []; w = 0; pos = 0; n = len(s); had_ansi = False; clipped = False
+    while pos < n:
+        m = ANSI.match(s, pos)
+        if m:
+            out.append(m.group(0)); had_ansi = True; pos = m.end(); continue
+        ch = s[pos]; cw = CAPS.width(ch)
+        if w + cw > maxw:
+            clipped = True; break
+        out.append(ch); w += cw; pos += 1
+    r = "".join(out)
+    if clipped and had_ansi:
+        r += "\033[0m"   # close any dangling SGR so the clip never bleeds color
+    return r
+
+def finalize(lines, clamp=None):
+    """Emit every row to the detected tier (the single downgrade pass), CLAMP each to
+    the available terminal width so no row can overflow COLUMNS and wrap onto a 2nd
+    visual line (the double-header / 8.5-row-sigil bleed), then pad each to the
+    uniform MAX visible width so ALL rows are wcwidth-equal — the width invariant the
+    density goldens assert (spec Tests 2–3). Pad is trailing spaces only; clamp drops
+    whole glyphs only — so a line is never sliced mid-glyph and never wraps."""
+    em = [_clamp_row(CAPS.emit(ln), clamp) for ln in lines]
     ws = [CAPS.width(ln) for ln in em]
     W = max(ws) if ws else 0
     return "\n".join(ln + " " * (W - w) for ln, w in zip(em, ws))
@@ -623,8 +648,14 @@ def main():
     if verdict not in VERDICT: verdict = "watching"
     eye_rgb, vcol, vglyph, vword = VERDICT[verdict]
     passed, total = st.get("passed"), st.get("total")
-    cols = int(os.environ.get("COLUMNS") or 120)
+    cols = int(os.environ.get("COLUMNS") or 120)   # CC exports COLUMNS (v2.1.153+); 80 is the ANSI floor, 120 our default
+    if cols < 1: cols = 120
     RMARGIN = 6  # right safety gutter: clears Claude Code's scrollbar + edge padding so the verdict never clips off-screen
+    # every finalized row is clamped to this width so none can wrap: it matches the
+    # width a line()-built row already targets (cols − RMARGIN, ANCHOR included), so
+    # the well-formed HUD rows are untouched and only an overflowing wall/swarm/tease/
+    # update row (the double-header bleed) is trimmed back inside the terminal.
+    MAXW = max(1, cols - RMARGIN)
 
     # ── eye animation: the watchman's eyes are the signature, so they animate —
     # but NEVER off the verdict (a verdict-colored eye washes into a same-hue body
@@ -691,7 +722,7 @@ def main():
         vrgb = VERDICT_CANON[canon][0]
         row = f"{sig_glyph(seed, vrgb)} {verdict_word(canon, t)}"
         rows = [row] + ([upd] if upd else [])
-        sys.stdout.write(finalize(rows) + "\n")
+        sys.stdout.write(finalize(rows, MAXW) + "\n")
         return
 
     if dmode == "compact":
@@ -705,7 +736,7 @@ def main():
         r0 = f"{_sig(sigS, 0, CY)}  {head}"
         r1 = f"{_sig(sigS, 1, CY)}  {wall}"
         rows = [r0, r1] + ([f"{'':6}{upd}"] if upd else [])
-        sys.stdout.write(finalize(rows) + "\n")
+        sys.stdout.write(finalize(rows, MAXW) + "\n")
         return
 
     # ── sigil anchor (squint animates; eyes stay visible in every frame) ──
@@ -831,7 +862,7 @@ def main():
             out.append(f"{_sig(sig, 2+i, CY)}  " + seg)
         if upd:
             out.append(f"{_sig(sig, 2+len(swarm), CY)}  " + upd)
-        sys.stdout.write(finalize(out) + "\n")   # single tier downgrade + width invariant
+        sys.stdout.write(finalize(out, MAXW) + "\n")   # single tier downgrade + width invariant + no-wrap clamp
         return
 
     out = []
@@ -854,7 +885,7 @@ def main():
         if vis(tease) > max(0, cols - ANCHOR - RMARGIN): tease = ""
         out.append(f"{_sig(sig,2,CY)}  " + tease)
         out.append(f"{_sig(sig,3,CY)}  " + upd)   # blank tail row → carries the update notice when one is available
-    sys.stdout.write(finalize(out) + "\n")   # single tier downgrade + width invariant
+    sys.stdout.write(finalize(out, MAXW) + "\n")   # single tier downgrade + width invariant + no-wrap clamp
 
 def _sig(rows, i, fallback):
     return rows[i] if i < len(rows) else "        "   # 8-space blank = square sigil width
