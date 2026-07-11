@@ -202,10 +202,27 @@ _SIG_MEMO = {}
 def _sigil_cache_dir():
     return os.path.join(os.path.expanduser("~"), ".heimdall", ".sigil-cache")
 
-def cached_sigil(seed, size, caps, eye):
+def _sigil_version():
+    """A short CONTENT hash of hmd_sigil.py's source, folded into the cache key. Any
+    change to the sigil code (grids, palette, render logic, the border frame) mints a
+    fresh key → the stale on-disk sigil is never served again, with NO manual cache
+    clear (the "sigil never updated" bug). Falls back to '0' when the source can't be
+    read — the key then degrades to the old tier/eye/seed behavior, never crashing."""
+    try:
+        src = getattr(SIG, "__file__", None) or os.path.join(HERE, "hmd_sigil.py")
+        with open(src, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()[:12]
+    except Exception:
+        return "0"
+_SIG_VERSION = _sigil_version()
+
+def cached_sigil(seed, size, caps, eye, border=True):
     eyt = tuple(eye or SIG.EYE)
     ekey = "%02x%02x%02x" % (eyt[0], eyt[1], eyt[2])
-    ckey = "%s-%s" % (caps.color, caps.unicode)
+    # the version hash + border flag are part of the key/filename → a code change (or
+    # a border toggle) invalidates the cache automatically; only a tier/eye/seed/
+    # version/border match hits the stored sigil.
+    ckey = "%s-%s-%s%s" % (caps.color, caps.unicode, _SIG_VERSION, "b" if border else "")
     memo_k = (seed, size, ckey, ekey)
     m = _SIG_MEMO.get(memo_k)
     if m is not None: return list(m)
@@ -219,7 +236,7 @@ def cached_sigil(seed, size, caps, eye):
         lines = None
     if lines is None:
         try:
-            lines = SIG.sigil_render(seed, size, SIG.tier_caps(), eye_override=eye)
+            lines = SIG.sigil_render(seed, size, SIG.tier_caps(), eye_override=eye, border=border)
         except Exception:
             lines = None
         if lines is not None:
@@ -238,13 +255,38 @@ def cached_sigil(seed, size, caps, eye):
 # a 4-wide × 2-row branded ASCII anchor for the compact mode's no-unicode fallback.
 ASCII_SIGIL_S = [" __ ", "|oo|"]
 
-def finalize(lines):
-    """Emit every row to the detected tier (the single downgrade pass) then pad each
-    to the uniform MAX visible width so ALL rows are wcwidth-equal — the width
-    invariant the density goldens assert (spec Tests 2–3). Pad is trailing spaces
-    only, so a shorter wall/tease row aligns flush under the header block and no line
-    is ever sliced mid-glyph."""
-    em = [CAPS.emit(ln) for ln in lines]
+def _clamp_row(s, maxw):
+    """Truncate one already-emitted row to `maxw` VISIBLE cells without slicing an
+    ANSI escape or a wide glyph in half. ANSI codes carry zero width and are copied
+    verbatim; a visible glyph is dropped whole once it would cross the budget. A
+    reset is appended iff the row carried color AND was actually clipped, so a
+    truncated row never bleeds its last SGR into the terminal. maxw<=0 → empty."""
+    if maxw is None:
+        return s
+    if maxw <= 0:
+        return ""
+    out = []; w = 0; pos = 0; n = len(s); had_ansi = False; clipped = False
+    while pos < n:
+        m = ANSI.match(s, pos)
+        if m:
+            out.append(m.group(0)); had_ansi = True; pos = m.end(); continue
+        ch = s[pos]; cw = CAPS.width(ch)
+        if w + cw > maxw:
+            clipped = True; break
+        out.append(ch); w += cw; pos += 1
+    r = "".join(out)
+    if clipped and had_ansi:
+        r += "\033[0m"   # close any dangling SGR so the clip never bleeds color
+    return r
+
+def finalize(lines, clamp=None):
+    """Emit every row to the detected tier (the single downgrade pass), CLAMP each to
+    the available terminal width so no row can overflow COLUMNS and wrap onto a 2nd
+    visual line (the double-header / 8.5-row-sigil bleed), then pad each to the
+    uniform MAX visible width so ALL rows are wcwidth-equal — the width invariant the
+    density goldens assert (spec Tests 2–3). Pad is trailing spaces only; clamp drops
+    whole glyphs only — so a line is never sliced mid-glyph and never wraps."""
+    em = [_clamp_row(CAPS.emit(ln), clamp) for ln in lines]
     ws = [CAPS.width(ln) for ln in em]
     W = max(ws) if ws else 0
     return "\n".join(ln + " " * (W - w) for ln, w in zip(em, ws))
@@ -288,6 +330,33 @@ def update_notice():
     if not installed or not latest or installed >= latest:
         return ""
     return f"{AM}⬆ {latest_raw} available{X} {FAINT}·{X} {DIM}hmd --update{X}"
+
+def usage_limit_seg(data, now):
+    """The session-relevant 5-HOUR usage-limit indicator, pinned at the rightmost end
+    of the top row. Reads rate_limits.five_hour.{used_percentage,resets_at} from CC's
+    stdin JSON — present ONLY for Pro/Max accounts and ABSENT until the first API
+    response, so a missing/malformed field returns '' (render NOTHING, never a fake %).
+    Renders `⧗ NN%` color-graded green→amber→red as it approaches 100, plus a compact
+    resets-in countdown (`·2h` / `·45m`) when resets_at is a future epoch. HMD_NOW
+    drives the clock for deterministic conformance (same override the eye animation uses)."""
+    rl = data.get("rate_limits")
+    if not isinstance(rl, dict):
+        return ""
+    fh = rl.get("five_hour")
+    if not isinstance(fh, dict):
+        return ""
+    up = fh.get("used_percentage")
+    if not isinstance(up, (int, float)) or isinstance(up, bool):
+        return ""                                   # absent/malformed → NO fabrication
+    pct = max(0, min(100, int(round(up))))
+    col = RD if pct >= 90 else AM if pct >= 70 else GR   # green→amber→red toward the cap
+    seg = f"{col}⧗ {pct}%{X}"
+    ra = fh.get("resets_at")
+    if isinstance(ra, (int, float)) and not isinstance(ra, bool) and ra > now:
+        rem = int(ra - now)
+        cd = f"{rem // 3600}h" if rem >= 3600 else f"{max(1, rem // 60)}m"
+        seg += f" {FAINT}·{X}{DIM}{cd}{X}"           # compact "resets in" countdown
+    return seg
 
 def identity(cwd, fallback):
     """Sigil SEED + display HANDLE from bin/heimdall-identity (RJ's call: identity is a
@@ -623,8 +692,14 @@ def main():
     if verdict not in VERDICT: verdict = "watching"
     eye_rgb, vcol, vglyph, vword = VERDICT[verdict]
     passed, total = st.get("passed"), st.get("total")
-    cols = int(os.environ.get("COLUMNS") or 120)
+    cols = int(os.environ.get("COLUMNS") or 120)   # CC exports COLUMNS (v2.1.153+); 80 is the ANSI floor, 120 our default
+    if cols < 1: cols = 120
     RMARGIN = 6  # right safety gutter: clears Claude Code's scrollbar + edge padding so the verdict never clips off-screen
+    # every finalized row is clamped to this width so none can wrap: it matches the
+    # width a line()-built row already targets (cols − RMARGIN, ANCHOR included), so
+    # the well-formed HUD rows are untouched and only an overflowing wall/swarm/tease/
+    # update row (the double-header bleed) is trimmed back inside the terminal.
+    MAXW = max(1, cols - RMARGIN)
 
     # ── eye animation: the watchman's eyes are the signature, so they animate —
     # but NEVER off the verdict (a verdict-colored eye washes into a same-hue body
@@ -691,7 +766,7 @@ def main():
         vrgb = VERDICT_CANON[canon][0]
         row = f"{sig_glyph(seed, vrgb)} {verdict_word(canon, t)}"
         rows = [row] + ([upd] if upd else [])
-        sys.stdout.write(finalize(rows) + "\n")
+        sys.stdout.write(finalize(rows, MAXW) + "\n")
         return
 
     if dmode == "compact":
@@ -705,7 +780,7 @@ def main():
         r0 = f"{_sig(sigS, 0, CY)}  {head}"
         r1 = f"{_sig(sigS, 1, CY)}  {wall}"
         rows = [r0, r1] + ([f"{'':6}{upd}"] if upd else [])
-        sys.stdout.write(finalize(rows) + "\n")
+        sys.stdout.write(finalize(rows, MAXW) + "\n")
         return
 
     # ── sigil anchor (squint animates; eyes stay visible in every frame) ──
@@ -754,6 +829,13 @@ def main():
         bifrost = (f"{GR}bifröst open{X}" if verdict=="pass" else
                    f"{RD}bifröst closed{X}" if verdict=="deny" else f"{DIM}watching{X}")
         r2 = f"{bifrost}{claim_seg}"
+
+    # 5-hour usage-limit indicator, pinned at the rightmost end of the top row (after
+    # the verdict). Absent unless CC's stdin JSON carries rate_limits (Pro/Max, post
+    # first API response) → never fabricated. Rides r1, which line() right-pins.
+    usage_seg = usage_limit_seg(data, t)
+    if usage_seg:
+        r1 = f"{r1}  {usage_seg}" if r1 else usage_seg
 
     # left info rows
     l1 = f"{eyes_inline} {TEAL}{BOLD}HEIMDALL{X}{SEP}{DIM}{handle}{X}{SEP}{DIM}{model}{X}"
@@ -831,7 +913,7 @@ def main():
             out.append(f"{_sig(sig, 2+i, CY)}  " + seg)
         if upd:
             out.append(f"{_sig(sig, 2+len(swarm), CY)}  " + upd)
-        sys.stdout.write(finalize(out) + "\n")   # single tier downgrade + width invariant
+        sys.stdout.write(finalize(out, MAXW) + "\n")   # single tier downgrade + width invariant + no-wrap clamp
         return
 
     out = []
@@ -854,7 +936,7 @@ def main():
         if vis(tease) > max(0, cols - ANCHOR - RMARGIN): tease = ""
         out.append(f"{_sig(sig,2,CY)}  " + tease)
         out.append(f"{_sig(sig,3,CY)}  " + upd)   # blank tail row → carries the update notice when one is available
-    sys.stdout.write(finalize(out) + "\n")   # single tier downgrade + width invariant
+    sys.stdout.write(finalize(out, MAXW) + "\n")   # single tier downgrade + width invariant + no-wrap clamp
 
 def _sig(rows, i, fallback):
     return rows[i] if i < len(rows) else "        "   # 8-space blank = square sigil width
