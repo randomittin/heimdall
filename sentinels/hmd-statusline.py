@@ -204,7 +204,7 @@ def _sigil_cache_dir():
 
 def _sigil_version():
     """A short CONTENT hash of hmd_sigil.py's source, folded into the cache key. Any
-    change to the sigil code (grids, palette, render logic, the border frame) mints a
+    change to the sigil code (grids, palette, render logic) mints a
     fresh key → the stale on-disk sigil is never served again, with NO manual cache
     clear (the "sigil never updated" bug). Falls back to '0' when the source can't be
     read — the key then degrades to the old tier/eye/seed behavior, never crashing."""
@@ -216,13 +216,12 @@ def _sigil_version():
         return "0"
 _SIG_VERSION = _sigil_version()
 
-def cached_sigil(seed, size, caps, eye, border=True):
+def cached_sigil(seed, size, caps, eye):
     eyt = tuple(eye or SIG.EYE)
     ekey = "%02x%02x%02x" % (eyt[0], eyt[1], eyt[2])
-    # the version hash + border flag are part of the key/filename → a code change (or
-    # a border toggle) invalidates the cache automatically; only a tier/eye/seed/
-    # version/border match hits the stored sigil.
-    ckey = "%s-%s-%s%s" % (caps.color, caps.unicode, _SIG_VERSION, "b" if border else "")
+    # the version hash is part of the key/filename → a code change invalidates the
+    # cache automatically; only a tier/eye/seed/version match hits the stored sigil.
+    ckey = "%s-%s-%s" % (caps.color, caps.unicode, _SIG_VERSION)
     memo_k = (seed, size, ckey, ekey)
     m = _SIG_MEMO.get(memo_k)
     if m is not None: return list(m)
@@ -236,7 +235,7 @@ def cached_sigil(seed, size, caps, eye, border=True):
         lines = None
     if lines is None:
         try:
-            lines = SIG.sigil_render(seed, size, SIG.tier_caps(), eye_override=eye, border=border)
+            lines = SIG.sigil_render(seed, size, SIG.tier_caps(), eye_override=eye)
         except Exception:
             lines = None
         if lines is not None:
