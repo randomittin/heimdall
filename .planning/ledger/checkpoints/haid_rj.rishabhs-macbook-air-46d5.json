@@ -1,0 +1,21 @@
+{
+  "active_goal": "[dropped]",
+  "branch": "main",
+  "claimed_surfaces": [
+    "app/api/connects/**",
+    "app/api/conversations/**",
+    "app/api/deals/**",
+    "app/api/jobs/**",
+    "app/api/proposals/**",
+    "app/api/reviews/**"
+  ],
+  "haid": "haid:rj.rishabhs-macbook-air-46d5",
+  "head_sha": "8dd1160",
+  "human": "rj",
+  "phase": "unknown",
+  "progress_pct": 45,
+  "resumable": true,
+  "schema": "team_checkpoint_v1",
+  "task_ref": "read-endpoints-and-jobs (Wave 2) (via heimdall-ledger-mcp:haid:rj.rishabhs-macbook-air-46d5/claude-code)",
+  "updated_at": "2026-07-11T12:53:56Z"
+}
