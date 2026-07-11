@@ -6,7 +6,7 @@
 #      FULL palette (.=bg 1=hue 2=eye 5=outline 6=accent6 7=accent7). All six authored
 #      colors appear; the shape matches the authored grid.
 #   2. RAW (no watchman): the pinned face BYPASSES the animal watchman finish — it keeps
-#      its OWN eyes (authored eye color #faf3e8), NOT the forced aliceblue band eyes.
+#      its OWN eyes (authored eye color #fffcf6), NOT the forced aliceblue band eyes.
 #   3. EYE color honored: a value-2 cell paints the authored eye hex.
 #   4. ADDITIVE / unpinned unchanged: a NON-pinned seed renders BYTE-IDENTICALLY to the
 #      unchanged curated→animal path (watchman finish intact) — only the pin is affected.
@@ -25,11 +25,13 @@ command -v python3 >/dev/null 2>&1 || { echo "SKIP: python3 unavailable"; exit 0
 
 # ── 1. PINNED → batsy full palette (all six authored colors present in the M render) ──
 M="$(python3 "$SIG" --seed "$HAID" --size M --tier truecolor)"
-for hex in "20;29;37" "24;28;57" "250;243;232" "4;2;4" "247;199;167" "41;154;247"; do
-  if printf '%s' "$M" | grep -q "38;2;$hex"; then ok "batsy palette present: 38;2;$hex"
-  else bad "batsy palette MISSING: 38;2;$hex"; fi
+# layer-agnostic: the ▄ lower-half glyph carries the BOTTOM pixel as fg (38;2) and the
+# TOP pixel as bg (48;2), so an authored color may land on EITHER layer — match both.
+for hex in "19;28;35" "20;24;52" "255;252;246" "0;0;0" "248;207;177" "47;150;255"; do
+  if printf '%s' "$M" | grep -qE "[34]8;2;$hex"; then ok "batsy palette present: $hex"
+  else bad "batsy palette MISSING: $hex"; fi
 done
-ncol=$(printf '%s' "$M" | grep -oE '38;2;[0-9]+;[0-9]+;[0-9]+' | sort -u | wc -l | tr -d ' ')
+ncol=$(printf '%s' "$M" | grep -oE '[34]8;2;[0-9]+;[0-9]+;[0-9]+' | sed -E 's/^[0-9]+;2;//' | sort -u | wc -l | tr -d ' ')
 [ "$ncol" = "6" ] && ok "batsy renders its full palette (6 distinct colors, not a flat body)" \
                    || bad "batsy distinct colors = $ncol (expected 6)"
 
@@ -40,14 +42,15 @@ EXP=$'#······#\n########\n########\n########\n#@@##@@#\n########\n###@@###
                     || { bad "batsy shape mismatch"; printf '  got:\n%s\n' "$DBG"; }
 
 # ── 2 + 3. RAW render: authored eyes (#faf3e8), NOT the forced watchman aliceblue band ──
-printf '%s' "$M" | grep -q "38;2;250;243;232" \
-  && ok "batsy eye uses the AUTHORED eye color #faf3e8 (value 2 honored)" \
-  || bad "batsy authored eye color #faf3e8 absent"
+printf '%s' "$M" | grep -qE "[34]8;2;255;252;246" \
+  && ok "batsy eye uses the AUTHORED eye color #fffcf6 (value 2 honored)" \
+  || bad "batsy authored eye color #fffcf6 absent"
 printf '%s' "$M" | grep -q "240;248;255" \
   && bad "batsy leaked the watchman forced-eye aliceblue (240;248;255) — finish NOT bypassed" \
   || ok "batsy bypasses the watchman forced-eyes (no aliceblue band)"
 # value-2 over value-5: grid row4='12255221' / row5='15555551' → a top=eye,bot=outline cell.
-printf '%s' "$M" | grep -q "38;2;250;243;232m"$'\033'"\[48;2;4;2;4m" \
+# With the ▄ lower-half glyph the bottom pixel (outline) is fg (38;2) and the top (eye) is bg (48;2).
+printf '%s' "$M" | grep -q "38;2;0;0;0m"$'\033'"\[48;2;255;252;246m▄" \
   && ok "batsy eye(2) composites over outline(5) exactly as authored" \
   || bad "batsy eye-over-outline cell not found (raw palette not honored)"
 

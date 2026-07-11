@@ -113,8 +113,8 @@ HERO_SIGILS = {
         "name": "batsy",
         "grid": ["1......1", "11777171", "15117711", "15511151",
                  "12255221", "15555551", "16622661", ".166661."],
-        "hue": "#181c39", "eye": "#faf3e8", "outline": "#040204",
-        "accent6": "#f7c7a7", "accent7": "#299af7", "bg": "#141d25",
+        "hue": "#141834", "eye": "#fffcf6", "outline": "#000000",
+        "accent6": "#f8cfb1", "accent7": "#2f96ff", "bg": "#131c23",
     },
     "green-lantern": {
         "name": "green-lantern",
@@ -904,16 +904,21 @@ def _apply_border(vg):
 
 def _cell(top, bot):
     """One text cell from a top/bot pixel pair. OFF (None) stays transparent;
-    everything else is a filled half-block so the face has a solid bounding box.
-    The sigil block is PURE `▀` (fg=top px, bg=bottom px) so every emitted cell has
-    identical wcwidth 1 — the width-invariant the conformance goldens assert."""
+    everything else is a filled block so the face has a solid bounding box.
+    The sigil block is PURE `▄` — the LOWER-half glyph (fg = BOTTOM px, bg = TOP px).
+    Displayed pixels are IDENTICAL to the old `▀` upper-half form (upper half = top px,
+    lower half = bot px); only the glyph and the fg/bg assignment swap. `▄` is used so
+    any half-block-font overshoot spills DOWN into the next row instead of bleeding above
+    the top edge (the top-edge doubling `▀` caused in RJ's terminal font). A LONE single
+    pixel renders as a FULL block `█` — a solid cell with no half ambiguity. Every emitted
+    cell has wcwidth 1 — the width-invariant the conformance goldens assert."""
     if top is None and bot is None:
         return ' '
     if bot is None:
-        return color(top, 'fg') + '▀' + '\033[0m'
+        return color(top, 'fg') + '█' + '\033[0m'
     if top is None:
-        return color(bot, 'fg') + '▄' + '\033[0m'
-    return color(top, 'fg') + color(bot, 'bg') + '▀' + '\033[0m'
+        return color(bot, 'fg') + '█' + '\033[0m'
+    return color(bot, 'fg') + color(top, 'bg') + '▄' + '\033[0m'
 
 
 # ── tier plumbing ──────────────────────────────────────────────────────────────
