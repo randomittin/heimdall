@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# heimdall-sigil-heroes.test.sh — the 38-hero custom pool + HAID auto-assign + the
+# heimdall-sigil-heroes.test.sh — the 57-hero custom pool + HAID auto-assign + the
 # unlock-after-3-runs CLI (`hmd sigil` / `hmd sigil set`).
 #
 # CONTRACT:
-#   1. LOAD    — 38 heroes, each a pixel-exact 8×8 grid whose every token has a palette
+#   1. LOAD    — 57 heroes, each a pixel-exact 8×8 grid whose every token has a palette
 #                key (missing keys tolerated: no accent7 on hulk/superman, no accent6/7
 #                on black-panther, no eye on joker/kaonashi, +highlight on ironman, all 8
-#                on cyborg). Each renders at width 8, exit 0, on every tier; all distinct.
+#                on gambit). Each renders at width 8, exit 0, on every tier; all distinct.
 #   2. AUTO    — hero_for(haid) is deterministic (same HAID → same hero) and roughly
-#                uniform (sha256 mod 38 over the sorted pool); a REAL HAID renders its
+#                uniform (sha256 mod 57 over the sorted pool); a REAL HAID renders its
 #                auto-assigned hero as its sigil.
 #   3. ADDITIVE— short/toy seeds (rj, you, teammate-xyz, haid:alice) DO NOT auto-assign
 #                — they stay on the curated/animal path. batsy's pin wins; a hero NAME
@@ -49,10 +49,10 @@ PY
   fail=$((fail + $(echo "$line" | awk '{print $3}')))
 }
 
-echo "== 1) LOAD: 38 heroes, each 8×8, tokens ⊆ palette, distinct render, exit 0 =="
+echo "== 1) LOAD: 57 heroes, each 8×8, tokens ⊆ palette, distinct render, exit 0 =="
 run_py '
-ok("pool has 38 heroes") if len(S.HERO_SIGILS)==38 else bad("pool has %d (want 38)"%len(S.HERO_SIGILS))
-expect={"batsy","green-lantern","venom","hulk","thanos","black-panther","deadpool","spiderman","ironman","cyborg","joker","flash","superman","cyclops","human-torch","lex-luthor","doctor-strange","martian-manhunter","green-goblin","cloak","mr-fantastic","beast","antman","loki","nick-fury","black-bolt","red-skull","magneto","silver-surfer","vision","batgirl","robin","daredevil","doom","captain-america","thing","kaonashi","thor"}
+ok("pool has 57 heroes") if len(S.HERO_SIGILS)==57 else bad("pool has %d (want 57)"%len(S.HERO_SIGILS))
+expect={"batsy","green-lantern","venom","hulk","thanos","black-panther","deadpool","spiderman","ironman","cyborg","joker","flash","superman","cyclops","human-torch","lex-luthor","doctor-strange","martian-manhunter","green-goblin","cloak","mr-fantastic","beast","antman","loki","nick-fury","black-bolt","red-skull","magneto","silver-surfer","vision","batgirl","robin","daredevil","doom","captain-america","thing","kaonashi","thor","mystique","harley-quinn","scarlett-witch","gambit","war-machine","plastic-man","hellboy","peacemaker","rhino","doctor-fate","rogue","steve","sheep","creeper","chicken","skeleton","enderman","zombie","wolf"}
 ok("exact expected roster") if set(S.HERO_SIGILS)==expect else bad("roster mismatch: %s"%(set(S.HERO_SIGILS)^expect))
 TOK={".":"bg","1":"hue","2":"eye","3":"highlight","4":"shadow","5":"outline","6":"accent6","7":"accent7"}
 shape=cover=True
@@ -69,7 +69,8 @@ ok("black-panther has no accent6/accent7 (tolerated)") if not ({"accent6","accen
 ok("joker has no eye (tolerated)") if "eye" not in S.HERO_SIGILS["joker"] else bad("joker has eye")
 ok("kaonashi has no eye (tolerated)") if "eye" not in S.HERO_SIGILS["kaonashi"] else bad("kaonashi has eye")
 ok("ironman adds highlight") if "highlight" in S.HERO_SIGILS["ironman"] else bad("ironman missing highlight")
-ok("cyborg uses all 8 palette keys") if all(k in S.HERO_SIGILS["cyborg"] for k in ("bg","hue","eye","highlight","shadow","outline","accent6","accent7")) else bad("cyborg not full palette")
+ok("gambit uses all 8 palette keys") if all(k in S.HERO_SIGILS["gambit"] for k in ("bg","hue","eye","highlight","shadow","outline","accent6","accent7")) else bad("gambit not full palette")
+ok("cyborg revised palette (hue/outline/accent6/accent7/bg, no eye)") if (S.HERO_SIGILS["cyborg"]["hue"]=="#000000" and S.HERO_SIGILS["cyborg"]["outline"]=="#fc073d" and S.HERO_SIGILS["cyborg"]["accent6"]=="#9a3c25" and S.HERO_SIGILS["cyborg"]["accent7"]=="#4c433c" and S.HERO_SIGILS["cyborg"]["bg"]=="#0e1515" and "eye" not in S.HERO_SIGILS["cyborg"]) else bad("cyborg not on revised palette")
 STRIP=re.compile(r"\033\[[0-9;]*m"); allw=alltier=True; rends={}
 for name in S.HERO_ORDER:
     for tier in ("truecolor","256","16"):
@@ -79,7 +80,7 @@ for name in S.HERO_ORDER:
             if l and len(STRIP.sub("",l))!=8: allw=False
     rends[name]="\n".join(S.sigil_render(name,"M",S.tier_caps()))
 ok("every hero renders width-8, exit 0, on truecolor/256/16") if (allw and alltier) else bad("width/tier render fault")
-ok("all 38 hero renders are distinct") if len(set(rends.values()))==38 else bad("hero renders collide: %d unique"%len(set(rends.values())))
+ok("all 57 hero renders are distinct") if len(set(rends.values()))==57 else bad("hero renders collide: %d unique"%len(set(rends.values())))
 '
 
 echo "== 2) AUTO: hero_for deterministic + roughly uniform; real HAID renders its hero =="
@@ -87,9 +88,9 @@ run_py '
 det=all(S.hero_for("haid:u%d.m-%04x"%(i,i))==S.hero_for("haid:u%d.m-%04x"%(i,i)) for i in range(200))
 ok("hero_for deterministic (same HAID -> same hero)") if det else bad("hero_for not deterministic")
 c=collections.Counter(S.hero_for("haid:u%d.m-%04x"%(i,i)) for i in range(500))
-ok("roughly uniform: %d/38 heroes hit over 500 HAIDs"%len(c)) if len(c)>=35 else bad("poor spread: %d/38"%len(c))
+ok("roughly uniform: %d/57 heroes hit over 500 HAIDs"%len(c)) if len(c)>=52 else bad("poor spread: %d/57"%len(c))
 lo,hi=min(c.values()),max(c.values())
-ok("no bucket degenerate (min=%d max=%d over 500, ideal ~13)"%(lo,hi)) if (lo>=3 and hi<=30) else bad("bucket skew min=%d max=%d"%(lo,hi))
+ok("no bucket degenerate (min=%d max=%d over 500, ideal ~9)"%(lo,hi)) if (lo>=1 and hi<=25) else bad("bucket skew min=%d max=%d"%(lo,hi))
 h="haid:dev.box-ab12"; hero=S.hero_for(h)
 ok("a REAL HAID renders its auto-assigned hero (hue matches %s)"%hero) if S.grid_for(h)[1]==S._hex_rgb(S.HERO_SIGILS[hero]["hue"]) else bad("real HAID did not render its auto hero")
 '

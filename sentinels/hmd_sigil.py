@@ -174,11 +174,10 @@ HERO_SIGILS = {
     },
     "cyborg": {
         "name": "cyborg",
-        "grid": [".55522.2", "5533262.", "5311666.", "51116556",
-                 "15115446", "11117776", "11122476", ".111776."],
-        "hue": "#fdc29a", "eye": "#fdf5e8", "highlight": "#4a4339",
-        "shadow": "#fcfc39", "outline": "#020101", "accent6": "#2599fc",
-        "accent7": "#963928", "bg": "#554b40",
+        "grid": [".111111.", "11111111", "16611661", "17666661",
+                 "65766616", "17666661", "16111161", "16161161"],
+        "hue": "#000000", "outline": "#fc073d", "accent6": "#9a3c25",
+        "accent7": "#4c433c", "bg": "#0e1515",
     },
     "joker": {
         "name": "joker",
@@ -384,6 +383,142 @@ HERO_SIGILS = {
         "hue": "#f9be9b", "eye": "#fbefe2", "highlight": "#71c2e5",
         "accent6": "#c1c2c3", "accent7": "#fffc30", "bg": "#534a40",
     },
+    "mystique": {
+        "name": "mystique",
+        "grid": [".111117.", "11722117", "13755117", "13366317",
+                 "15266251", "15666651", "15611651", "13566531"],
+        "hue": "#fc073d", "eye": "#fffd35", "highlight": "#6a1040",
+        "outline": "#0e193f", "accent6": "#239bfc", "accent7": "#fc5d98",
+        "bg": "#541726",
+    },
+    "harley-quinn": {
+        "name": "harley-quinn",
+        "grid": ["25....12", "..5511..", ".555111.", "52222221",
+                 "51111111", "51611611", ".222222.", "..2222.."],
+        "hue": "#000000", "eye": "#ffefe3", "outline": "#fc073d",
+        "accent6": "#239bfc", "bg": "#0e1515",
+    },
+    "scarlett-witch": {
+        "name": "scarlett-witch",
+        "grid": ["1.5555.1", "11555511", "11151111", "16252261",
+                 "15622651", "16666661", "51611615", "51666615"],
+        "hue": "#fc073d", "eye": "#ffefe3", "outline": "#9a3c25",
+        "accent6": "#fec29b", "bg": "#541726",
+    },
+    "gambit": {
+        "name": "gambit",
+        "grid": [".666666.", "6666336.", "55577556", "54155145",
+                 "52111125", "51111115", "51111115", ".711117."],
+        "hue": "#fec29b", "eye": "#ffefe3", "highlight": "#6a1040",
+        "shadow": "#9a3c25", "outline": "#0e193f", "accent6": "#fc073d",
+        "accent7": "#239bfc", "bg": "#554b40",
+    },
+    "war-machine": {
+        "name": "war-machine",
+        "grid": [".712217.", "71162117", "62162126", "62166126",
+                 "15566551", "71666617", "71111117", "61777716"],
+        "hue": "#0e193f", "eye": "#ffefe3", "outline": "#fc073d",
+        "accent6": "#b6b7bc", "accent7": "#239bfc", "bg": "#121c27",
+    },
+    "plastic-man": {
+        "name": "plastic-man",
+        "grid": [".555555.", "55555555", "51111115", "66666666",
+                 "66611666", "11111111", "11122111", ".111111."],
+        "hue": "#fec29b", "eye": "#ffefe3", "outline": "#000000",
+        "accent6": "#fc073d", "bg": "#554b40",
+    },
+    "hellboy": {
+        "name": "hellboy",
+        "grid": [".71..71.", ".117711.", "56611665", "51111115",
+                 "52611625", "56111165", "51155115", "55555555"],
+        "hue": "#fc073d", "eye": "#fffd35", "outline": "#000000",
+        "accent6": "#6a1040", "accent7": "#fc5d98", "bg": "#541726",
+    },
+    "peacemaker": {
+        "name": "peacemaker",
+        "grid": [".111111.", "11111111", "11111111", "17111171",
+                 "12711721", "11111111", "16666661", ".666666."],
+        "hue": "#ffefe3", "eye": "#fffd35", "accent6": "#fec29b",
+        "accent7": "#b6b7bc", "bg": "#555854",
+    },
+    "rhino": {
+        "name": "rhino",
+        "grid": ["...12...", ".111211.", "11622611", "16666661",
+                 "16577561", "16777761", "11722711", "11111111"],
+        "hue": "#b6b7bc", "eye": "#ffefe3", "outline": "#000000",
+        "accent6": "#4c433c", "accent7": "#fec29b", "bg": "#41484a",
+    },
+    "doctor-fate": {
+        "name": "doctor-fate",
+        "grid": ["...11...", ".111211.", "11112116", "66122166",
+                 "62112126", "67112176", "61112116", ".111111."],
+        "hue": "#fffd35", "eye": "#ffefe3", "accent6": "#fd9321",
+        "accent7": "#b6b7bc", "bg": "#555c24",
+    },
+    "rogue": {
+        "name": "rogue",
+        "grid": [".222226.", "26622226", "65565252", "61161216",
+                 "65111156", "61111116", "61177116", "6.1111.6"],
+        "hue": "#fec29b", "eye": "#ffefe3", "outline": "#000000",
+        "accent6": "#9a3c25", "accent7": "#fc073d", "bg": "#554b40",
+    },
+    "steve": {
+        "name": "steve",
+        "grid": ["55555555", "55555555", "51111115", "11111111",
+                 "12611621", "11155111", "11511511", "11555511"],
+        "hue": "#deb3a0", "eye": "#fefefc", "outline": "#623517",
+        "accent6": "#3a4aa0", "bg": "#4c4742",
+    },
+    "sheep": {
+        "name": "sheep",
+        "grid": ["11111111", "11111111", "16666661", "15166151",
+                 "16666661", "11666611", "11677611", "11111111"],
+        "hue": "#ffffff", "outline": "#08080a", "accent6": "#e0b5a4",
+        "accent7": "#f076ab", "bg": "#555c5c",
+    },
+    "creeper": {
+        "name": "creeper",
+        "grid": ["1.111111", "11117111", "16611661", "16571561",
+                 "11155.77", "71655611", "17555511", "11511571"],
+        "hue": "#6bbe47", "outline": "#000000", "accent6": "#1d1d1f",
+        "accent7": "#96c934", "bg": "#839f7d",
+    },
+    "chicken": {
+        "name": "chicken",
+        "grid": ["11111111", "11111111", "15111151", "11111111",
+                 "11222211", "11777711", "11166111", "11166111"],
+        "hue": "#ffffff", "eye": "#fdd840", "outline": "#070709",
+        "accent6": "#d61f26", "accent7": "#cead29", "bg": "#555c5c",
+    },
+    "skeleton": {
+        "name": "skeleton",
+        "grid": ["11111111", "11111111", "11111111", "11111111",
+                 "16611661", "11122111", "16666661", "11111111"],
+        "hue": "#f1f1f3", "eye": "#c8c5c6", "accent6": "#7e8180",
+        "bg": "#515859",
+    },
+    "enderman": {
+        "name": "enderman",
+        "grid": ["15111151", "15511551", "51555515", "11555515",
+                 "76255267", "51155115", "15511551", "51111115"],
+        "hue": "#000000", "eye": "#fbbed5", "outline": "#1c1c1c",
+        "accent6": "#994ea0", "accent7": "#b670b3", "bg": "#0e1515",
+    },
+    "zombie": {
+        "name": "zombie",
+        "grid": ["11117171", "71211717", "12177171", "71271711",
+                 "15511557", "71155112", "11571511", "21517512"],
+        "hue": "#10a04b", "eye": "#005521", "outline": "#152a18",
+        "accent7": "#1b7e41", "bg": "#508065",
+    },
+    "wolf": {
+        "name": "wolf",
+        "grid": ["11166111", "66666666", "11111111", "13311331",
+                 "63577536", "67155376", "77111177", "61444416"],
+        "hue": "#979495", "highlight": "#bfbdbe", "shadow": "#313035",
+        "outline": "#0e0c0d", "accent6": "#6d6f73", "accent7": "#6a573d",
+        "bg": "#383e3f",
+    },
 }
 
 # fixed SORTED name order → the deterministic index a HAID hashes onto (hero_for). A
@@ -406,7 +541,7 @@ def _is_haid(seed):
     return bool(_HAID_RE.match(seed or ""))
 
 def hero_for(haid):
-    """The hero a HAID deterministically auto-assigns to: sha256(haid) mod 38 indexed
+    """The hero a HAID deterministically auto-assigns to: sha256(haid) mod 57 indexed
     into the SORTED hero-name pool. Same HAID → same hero forever; roughly uniform
     across distinct HAIDs. This is the default sigil for any real HAID with no override."""
     idx = int(hashlib.sha256(haid.encode()).hexdigest(), 16) % len(HERO_ORDER)
@@ -427,7 +562,7 @@ def _resolve_custom_spec(seed):
 
 # token → palette-key map for a hero spec. The palette is built for ONLY the keys a
 # hero carries, so a spec that omits (say) accent7 renders fine — the render never
-# references a token its grid does not use (asserted by the 38-hero load test).
+# references a token its grid does not use (asserted by the 57-hero load test).
 _TOKEN_KEY = {'.': 'bg', '1': 'hue', '2': 'eye', '3': 'highlight',
               '4': 'shadow', '5': 'outline', '6': 'accent6', '7': 'accent7'}
 
