@@ -228,8 +228,8 @@ HERO_SIGILS = {
         "name": "doctor-strange",
         "grid": ["65555556", "55555555", "22151122", "21115112",
                  "15111151", "11155111", "11577511", "61511516"],
-        "hue": "#fcc49a", "eye": "#fcfcfa", "outline": "#020000",
-        "accent6": "#e71644", "accent7": "#97371b", "bg": "#544c40",
+        "hue": "#ffc3a1", "eye": "#fffdff", "outline": "#000000",
+        "accent6": "#d5133f", "accent7": "#9e2b3e", "bg": "#554b42",
     },
     "martian-manhunter": {
         "name": "martian-manhunter",
@@ -326,6 +326,64 @@ HERO_SIGILS = {
         "shadow": "#2fe05d", "outline": "#7e0c42", "accent6": "#f80840",
         "accent7": "#077936", "bg": "#0e1515",
     },
+    "batgirl": {
+        "name": "batgirl",
+        "grid": ["56....65", "55666655", "51555515", "12111121",
+                 "12311321", "11111111", "12277221", "..2222.."],
+        "hue": "#1f143e", "eye": "#ffcbb2", "highlight": "#5bd043",
+        "outline": "#656182", "accent6": "#f161a1", "accent7": "#cb587d",
+        "bg": "#161a26",
+    },
+    "robin": {
+        "name": "robin",
+        "grid": [".555555.", "55555565", "55226665", "11111111",
+                 "12211221", "11166111", "66622666", ".666666."],
+        "hue": "#000000", "eye": "#fff2e8", "outline": "#9c3a27",
+        "accent6": "#f7bf94", "bg": "#0e1515",
+    },
+    "daredevil": {
+        "name": "daredevil",
+        "grid": ["61....1.", "11111111", "11666611", "16555561",
+                 "12655621", "16611111", "17722771", ".777777."],
+        "hue": "#ff0340", "eye": "#ffedfe", "outline": "#101433",
+        "accent6": "#671539", "accent7": "#ffc39c", "bg": "#551627",
+    },
+    "doom": {
+        "name": "doom",
+        "grid": [".111111.", "11333311", "13557111", "15662651",
+                 "17726771", "15622651", "15677651", ".111111."],
+        "hue": "#147743", "eye": "#fff3f7", "highlight": "#32e761",
+        "outline": "#000000", "accent6": "#c0bec1", "accent7": "#504238",
+        "bg": "#133628",
+    },
+    "captain-america": {
+        "name": "captain-america",
+        "grid": [".666666.", "26622662", "21211212", "11261211",
+                 "17166171", "11677611", "11722711", ".777777."],
+        "hue": "#02174a", "eye": "#fffff5", "accent6": "#3395f4",
+        "accent7": "#ffc292", "bg": "#0e1b2a",
+    },
+    "thing": {
+        "name": "thing",
+        "grid": ["..1111..", ".112261.", "61111161", "65511556",
+                 "62711726", "67111176", "61177116", "11155111"],
+        "hue": "#993a28", "eye": "#fff2ec", "outline": "#63142d",
+        "accent6": "#e99752", "accent7": "#ffc5a9", "bg": "#392520",
+    },
+    "kaonashi": {
+        "name": "kaonashi",
+        "grid": [".111111.", "11111111", "15511551", "11111111",
+                 "15511551", "61111116", "11511511", ".115511."],
+        "hue": "#fff1e5", "outline": "#000000", "accent6": "#e76990",
+        "bg": "#555855",
+    },
+    "thor": {
+        "name": "thor",
+        "grid": ["22....22", ".266662.", "22666622", "61177116",
+                 "63111136", "61111116", "76122167", "76111167"],
+        "hue": "#f9be9b", "eye": "#fbefe2", "highlight": "#71c2e5",
+        "accent6": "#c1c2c3", "accent7": "#fffc30", "bg": "#534a40",
+    },
 }
 
 # fixed SORTED name order → the deterministic index a HAID hashes onto (hero_for). A
@@ -348,7 +406,7 @@ def _is_haid(seed):
     return bool(_HAID_RE.match(seed or ""))
 
 def hero_for(haid):
-    """The hero a HAID deterministically auto-assigns to: sha256(haid) mod 14 indexed
+    """The hero a HAID deterministically auto-assigns to: sha256(haid) mod 38 indexed
     into the SORTED hero-name pool. Same HAID → same hero forever; roughly uniform
     across distinct HAIDs. This is the default sigil for any real HAID with no override."""
     idx = int(hashlib.sha256(haid.encode()).hexdigest(), 16) % len(HERO_ORDER)
@@ -369,7 +427,7 @@ def _resolve_custom_spec(seed):
 
 # token → palette-key map for a hero spec. The palette is built for ONLY the keys a
 # hero carries, so a spec that omits (say) accent7 renders fine — the render never
-# references a token its grid does not use (asserted by the 14-hero load test).
+# references a token its grid does not use (asserted by the 38-hero load test).
 _TOKEN_KEY = {'.': 'bg', '1': 'hue', '2': 'eye', '3': 'highlight',
               '4': 'shadow', '5': 'outline', '6': 'accent6', '7': 'accent7'}
 

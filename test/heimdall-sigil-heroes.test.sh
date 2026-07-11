@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# heimdall-sigil-heroes.test.sh — the 29-hero custom pool + HAID auto-assign + the
+# heimdall-sigil-heroes.test.sh — the 38-hero custom pool + HAID auto-assign + the
 # unlock-after-3-runs CLI (`hmd sigil` / `hmd sigil set`).
 #
 # CONTRACT:
-#   1. LOAD    — 29 heroes, each a pixel-exact 8×8 grid whose every token has a palette
+#   1. LOAD    — 38 heroes, each a pixel-exact 8×8 grid whose every token has a palette
 #                key (missing keys tolerated: no accent7 on hulk/superman, no accent6/7
-#                on black-panther, no eye on joker, +highlight on ironman, all 8 on
-#                cyborg). Each renders at width 8, exit 0, on every tier; all distinct.
+#                on black-panther, no eye on joker/kaonashi, +highlight on ironman, all 8
+#                on cyborg). Each renders at width 8, exit 0, on every tier; all distinct.
 #   2. AUTO    — hero_for(haid) is deterministic (same HAID → same hero) and roughly
-#                uniform (sha256 mod 29 over the sorted pool); a REAL HAID renders its
+#                uniform (sha256 mod 38 over the sorted pool); a REAL HAID renders its
 #                auto-assigned hero as its sigil.
 #   3. ADDITIVE— short/toy seeds (rj, you, teammate-xyz, haid:alice) DO NOT auto-assign
 #                — they stay on the curated/animal path. batsy's pin wins; a hero NAME
@@ -49,10 +49,10 @@ PY
   fail=$((fail + $(echo "$line" | awk '{print $3}')))
 }
 
-echo "== 1) LOAD: 29 heroes, each 8×8, tokens ⊆ palette, distinct render, exit 0 =="
+echo "== 1) LOAD: 38 heroes, each 8×8, tokens ⊆ palette, distinct render, exit 0 =="
 run_py '
-ok("pool has 29 heroes") if len(S.HERO_SIGILS)==30 else bad("pool has %d (want 30)"%len(S.HERO_SIGILS))
-expect={"batsy","green-lantern","venom","hulk","thanos","black-panther","deadpool","spiderman","ironman","cyborg","joker","flash","superman","cyclops","human-torch","lex-luthor","doctor-strange","martian-manhunter","green-goblin","cloak","mr-fantastic","beast","antman","loki","nick-fury","black-bolt","red-skull","magneto","silver-surfer","vision"}
+ok("pool has 38 heroes") if len(S.HERO_SIGILS)==38 else bad("pool has %d (want 38)"%len(S.HERO_SIGILS))
+expect={"batsy","green-lantern","venom","hulk","thanos","black-panther","deadpool","spiderman","ironman","cyborg","joker","flash","superman","cyclops","human-torch","lex-luthor","doctor-strange","martian-manhunter","green-goblin","cloak","mr-fantastic","beast","antman","loki","nick-fury","black-bolt","red-skull","magneto","silver-surfer","vision","batgirl","robin","daredevil","doom","captain-america","thing","kaonashi","thor"}
 ok("exact expected roster") if set(S.HERO_SIGILS)==expect else bad("roster mismatch: %s"%(set(S.HERO_SIGILS)^expect))
 TOK={".":"bg","1":"hue","2":"eye","3":"highlight","4":"shadow","5":"outline","6":"accent6","7":"accent7"}
 shape=cover=True
@@ -67,6 +67,7 @@ ok("every grid token has a palette key (missing keys tolerated)") if cover else 
 ok("hulk has no accent7 (tolerated)") if "accent7" not in S.HERO_SIGILS["hulk"] else bad("hulk has accent7")
 ok("black-panther has no accent6/accent7 (tolerated)") if not ({"accent6","accent7"}&set(S.HERO_SIGILS["black-panther"])) else bad("black-panther has an accent")
 ok("joker has no eye (tolerated)") if "eye" not in S.HERO_SIGILS["joker"] else bad("joker has eye")
+ok("kaonashi has no eye (tolerated)") if "eye" not in S.HERO_SIGILS["kaonashi"] else bad("kaonashi has eye")
 ok("ironman adds highlight") if "highlight" in S.HERO_SIGILS["ironman"] else bad("ironman missing highlight")
 ok("cyborg uses all 8 palette keys") if all(k in S.HERO_SIGILS["cyborg"] for k in ("bg","hue","eye","highlight","shadow","outline","accent6","accent7")) else bad("cyborg not full palette")
 STRIP=re.compile(r"\033\[[0-9;]*m"); allw=alltier=True; rends={}
@@ -78,7 +79,7 @@ for name in S.HERO_ORDER:
             if l and len(STRIP.sub("",l))!=8: allw=False
     rends[name]="\n".join(S.sigil_render(name,"M",S.tier_caps()))
 ok("every hero renders width-8, exit 0, on truecolor/256/16") if (allw and alltier) else bad("width/tier render fault")
-ok("all 30 hero renders are distinct") if len(set(rends.values()))==30 else bad("hero renders collide: %d unique"%len(set(rends.values())))
+ok("all 38 hero renders are distinct") if len(set(rends.values()))==38 else bad("hero renders collide: %d unique"%len(set(rends.values())))
 '
 
 echo "== 2) AUTO: hero_for deterministic + roughly uniform; real HAID renders its hero =="
@@ -86,9 +87,9 @@ run_py '
 det=all(S.hero_for("haid:u%d.m-%04x"%(i,i))==S.hero_for("haid:u%d.m-%04x"%(i,i)) for i in range(200))
 ok("hero_for deterministic (same HAID -> same hero)") if det else bad("hero_for not deterministic")
 c=collections.Counter(S.hero_for("haid:u%d.m-%04x"%(i,i)) for i in range(500))
-ok("roughly uniform: %d/30 heroes hit over 500 HAIDs"%len(c)) if len(c)>=27 else bad("poor spread: %d/30"%len(c))
+ok("roughly uniform: %d/38 heroes hit over 500 HAIDs"%len(c)) if len(c)>=35 else bad("poor spread: %d/38"%len(c))
 lo,hi=min(c.values()),max(c.values())
-ok("no bucket degenerate (min=%d max=%d over 500, ideal ~17)"%(lo,hi)) if (lo>=5 and hi<=40) else bad("bucket skew min=%d max=%d"%(lo,hi))
+ok("no bucket degenerate (min=%d max=%d over 500, ideal ~13)"%(lo,hi)) if (lo>=3 and hi<=30) else bad("bucket skew min=%d max=%d"%(lo,hi))
 h="haid:dev.box-ab12"; hero=S.hero_for(h)
 ok("a REAL HAID renders its auto-assigned hero (hue matches %s)"%hero) if S.grid_for(h)[1]==S._hex_rgb(S.HERO_SIGILS[hero]["hue"]) else bad("real HAID did not render its auto hero")
 '
@@ -120,7 +121,7 @@ if [ -x "$HMD" ]; then
   OUT="$(HEIMDALL_HOME="$H" "$HMD" sigil set batman 2>&1)"; RC=$?
   { [ "$RC" -ne 0 ] && printf '%s' "$OUT" | grep -q "unknown hero"; } \
     && ok "set REJECTS an unknown name (exit $RC)" || bad "unknown name not rejected (exit $RC): $OUT"
-  printf '%s' "$OUT" | grep -q "spiderman" && ok "rejection lists the 14 heroes" || bad "rejection did not list heroes"
+  printf '%s' "$OUT" | grep -q "spiderman" && ok "rejection lists the hero pool" || bad "rejection did not list heroes"
   [ "$(cat "$H/sigil-choice" 2>/dev/null)" = "venom" ] && ok "unknown-name reject left the valid choice intact" || bad "choice clobbered by bad set"
 
   OUT="$(HEIMDALL_HOME="$H" "$HMD" sigil 2>&1)"
