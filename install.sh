@@ -657,6 +657,51 @@ ensure_claude_mem() {
   if [ "$rc" -eq 0 ]; then printf 'configured'; else printf 'failed'; fi
 }
 
+# ── Nightly /dream auto-schedule (the overnight maintainer sweep, hands-free) ──
+#
+# `/dream` (bin/heimdall-dream) is the overnight autoresearch + maintainer sweep that
+# leaves a morning report. On-demand it is a manual `/dream`; this wires the installer
+# to register it as a launchd LaunchAgent (com.heimdall.dream) so it fires nightly at
+# 03:00 WITHOUT a live session and survives logout/reboot — zero user action.
+#
+# The schedule helper (bin/heimdall-dream-schedule) is already idempotent (fixed plist
+# path, unload-before-load) and carries the OFF switch (`heimdall-dream-schedule
+# uninstall`), so we just CALL it. We point --repo at the INSTALLED checkout ($PLUGIN_DIR)
+# so the plist's dream bin ($PLUGIN_DIR/bin/heimdall-dream) is the STABLE installed path:
+# when hmd auto-updates that tree in place, the nightly job automatically runs the NEW
+# code — the schedule is never pinned to a version-frozen copy. heimdall-autoupdate
+# additionally re-asserts this schedule post-update (idempotent) to heal a plist-format/
+# path change.
+#
+# GATING (matches the crypto/statusline optional steps — graceful, never aborts install):
+#   - OPT-OUT: HEIMDALL_NO_DREAM_SCHEDULE=1 → skip by request (a CI/headless dev declines).
+#   - macOS-ONLY: launchd is the platform scheduler; a non-Darwin box or a missing
+#     launchctl → skip cleanly (the cron/cloud routine in commands/dream.md covers those).
+#   - NON-FATAL: a missing helper/dream bin or a launchctl load failure → skip, never fail.
+# Prints ONE state word (the caller renders the ✓ line + the disable hint):
+#   scheduled    — the nightly LaunchAgent was (re)installed + loaded (idempotent)
+#   optout       — HEIMDALL_NO_DREAM_SCHEDULE=1 → skipped by request
+#   unsupported  — not macOS, or launchctl absent → skipped (use the cron/cloud routine)
+#   skipped      — schedule helper / dream bin missing, or launchctl load failed (non-fatal)
+ensure_dream_schedule() {
+  local plugin_dir="$1"
+  # Opt-out FIRST — a declining dev/CI never touches launchd at all.
+  [ "${HEIMDALL_NO_DREAM_SCHEDULE:-0}" = "1" ] && { printf 'optout'; return 0; }
+  # macOS + launchctl only (the schedule helper targets launchd; anything else is a
+  # clean skip, exactly as the helper's own is_macos guard would report).
+  [ "$(uname -s 2>/dev/null)" = "Darwin" ] || { printf 'unsupported'; return 0; }
+  command -v launchctl >/dev/null 2>&1 || { printf 'unsupported'; return 0; }
+  local sched="$plugin_dir/bin/heimdall-dream-schedule"
+  [ -x "$sched" ] || { printf 'skipped'; return 0; }
+  # Idempotent register + load, pointed at the installed checkout. Quiet + best-effort:
+  # a load failure (rc from the helper) degrades to 'skipped', never aborts the install.
+  if "$sched" install --repo "$plugin_dir" >/dev/null 2>&1; then
+    printf 'scheduled'
+  else
+    printf 'skipped'
+  fi
+}
+
 # ── Install-step telemetry (dossier §3 + §8) ────────────────────────────────
 #
 # install.sh's own step — the PATH export — emits started→succeeded|failed +
@@ -743,6 +788,12 @@ sigil_handle() {
 }
 
 main() {
+  # TEST SEAM: let the acceptance harness `source` this installer purely to unit-test
+  # the pure helpers (ensure_dream_schedule gating, etc.) WITHOUT running a real network
+  # install. Unset in EVERY production path — a curl|bash stranger install never sets it,
+  # so the trailing `main "$@"` contract is byte-for-byte unchanged. Return at once when set.
+  [ -n "${HEIMDALL_INSTALL_SOURCE_ONLY:-}" ] && return 0
+
   # ── Configuration ────────────────────────────────────────────────────────
   # Pinned ref = the CURRENT released tag. release/ship.sh rewrites this on every
   # release (see bump_default_ref) so a fresh `curl|bash` install and hmd --update's
@@ -1301,6 +1352,38 @@ main() {
         "$C_CYAN" "$C_RESET"
       blank
       ;;
+  esac
+
+  # Step: schedule the nightly /dream overnight sweep as a launchd LaunchAgent so the
+  # maintainer sweep + morning report happen hands-free at 03:00 — surviving logout/
+  # reboot, no live session needed. macOS-only (launchd), OPT-OUT via
+  # HEIMDALL_NO_DREAM_SCHEDULE=1, and OPTIONAL/graceful (dossier §8): a non-Darwin box,
+  # a missing launchctl, or a load failure NEVER aborts the install. --repo points at
+  # the INSTALLED checkout ($PLUGIN_DIR) so the plist's dream bin is the stable installed
+  # path — auto-updates that refresh that tree keep the nightly job on the CURRENT code.
+  local DS_T0; DS_T0="$(_tele_now_ms)"
+  _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" dream-schedule started
+  step_begin "Scheduling nightly /dream (03:00)"
+  local DS_STATE; DS_STATE="$(ensure_dream_schedule "$PLUGIN_DIR")"
+  case "$DS_STATE" in
+    scheduled)
+      _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" dream-schedule succeeded "$DS_T0"
+      step_ok "Scheduling nightly /dream (03:00)" "enabled"
+      blank
+      printf '   %s▸ nightly /dream scheduled (03:00) — disable: heimdall-dream-schedule uninstall%s\n' \
+        "$C_DIM" "$C_RESET"
+      blank
+      ;;
+    optout)
+      _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" dream-schedule succeeded "$DS_T0"
+      step_ok "Scheduling nightly /dream (03:00)" "skipped (opted out)" ;;
+    unsupported)
+      _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" dream-schedule succeeded "$DS_T0"
+      step_ok "Scheduling nightly /dream (03:00)" "skipped (macOS only)" ;;
+    *)  # skipped — helper/dream bin missing or launchctl load failed. Non-fatal.
+      _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" dream-schedule failed "$DS_T0" \
+        dream-schedule-unavailable "schedule helper missing or launchctl load failed"
+      step_ok "Scheduling nightly /dream (03:00)" "skipped" ;;
   esac
 
   # ── 5. Success card (A4) ──────────────────────────────────────────────────

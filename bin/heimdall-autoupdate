@@ -273,6 +273,31 @@ _refuse_msg() {
   printf 'heimdall: staying on the current, verified version (see SIGNING.md).\n' >&2
 }
 
+# ── re-assert the nightly /dream schedule after an update (self-heal) ────────────
+# An upgrade can change the LaunchAgent plist FORMAT or the installed bin path; a
+# stale/malformed plist would silently stop the nightly /dream. After the verified
+# install.sh applies (which itself re-registers the schedule via its own install step),
+# we RE-RUN the schedule installer here too — idempotent defense-in-depth so a
+# plist-format/path change is healed and the nightly job keeps firing the CURRENT code.
+#
+# Gated EXACTLY like install.sh's schedule step (macOS + launchctl, honoring
+# HEIMDALL_NO_DREAM_SCHEDULE) and BEST-EFFORT: it never changes the update's exit code.
+# --repo + the schedule helper both resolve from $PLUGIN_DIR — the freshly-applied,
+# stable installed tree — so the plist points at the always-current dream bin.
+reassert_dream_schedule() {
+  [ "${HEIMDALL_NO_DREAM_SCHEDULE:-0}" = "1" ] && return 0
+  [ "$(uname -s 2>/dev/null)" = "Darwin" ] || return 0
+  command -v launchctl >/dev/null 2>&1 || return 0
+  local sched="$PLUGIN_DIR/bin/heimdall-dream-schedule"
+  [ -x "$sched" ] || return 0
+  if "$sched" install --repo "$PLUGIN_DIR" >/dev/null 2>&1; then
+    log_line "dream-schedule re-asserted post-update (repo $PLUGIN_DIR)"
+  else
+    log_line "dream-schedule re-assert failed post-update — non-fatal"
+  fi
+  return 0
+}
+
 # ── apply (the atomic, detached, NEXT-session upgrade — SIGNATURE-GATED) ─────────
 # Re-run the LATEST tag's idempotent installer DETACHED so it never blocks SessionStart —
 # but ONLY after its install.sh signature verifies against the IN-REPO public key. This is
@@ -359,11 +384,18 @@ apply_update() {
     log_line "auto-update: applying $span (foreground manual) — verified $ref"
     HEIMDALL_REF="$ref" bash "$artifact"
     local irc=$?
+    # Post-apply: heal the nightly /dream LaunchAgent against a plist-format/path change.
+    # Best-effort — never alters the install's exit code (irc).
+    reassert_dream_schedule
     [ -n "$workdir" ] && rm -rf "$workdir"
     return "$irc"
   fi
 
   log_line "auto-update: applying $span (background; active on your next hmd launch) — verified $ref"
+  # NB: the nightly /dream schedule is re-asserted for the BACKGROUND path by the applied
+  # install.sh's OWN schedule step (it re-runs ensure_dream_schedule during this detached
+  # install), so the plist self-heals to the current code without a fragile inline duplicate
+  # here. The foreground `update` path calls reassert_dream_schedule directly (above).
   # Execute the EXACT bytes we verified (verify-then-run-same-file — no TOCTOU re-fetch).
   # Detached + fully backgrounded via setsid so it survives this process exiting and never
   # holds SessionStart open; the workdir is removed after the installer finishes.
@@ -477,6 +509,14 @@ cmd_update() {
 }
 
 # ── dispatch ─────────────────────────────────────────────────────────────────────
+# TEST SEAM: let the acceptance harness `source` this updater to unit-test the pure
+# helpers (reassert_dream_schedule, etc.) WITHOUT triggering the default `check` (which
+# would hit the network). Unset in every production path — the SessionStart hook + `hmd
+# --update` invoke this as a script, never sourced with this var — so behaviour is unchanged.
+if [ -n "${HEIMDALL_AUTOUPDATE_SOURCE_ONLY:-}" ]; then
+  return 0 2>/dev/null || exit 0
+fi
+
 SUB="${1:-check}"
 case "$SUB" in
   check)        run_check ;;
