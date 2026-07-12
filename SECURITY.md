@@ -7,15 +7,20 @@ our own history.**
 ## Reporting a vulnerability
 
 Please report security issues **privately**, not in a public issue or pull
-request.
+request. Two private channels, use whichever you prefer:
 
-- Open a **GitHub Security Advisory** on this repository
-  (Security → Advisories → *Report a vulnerability*). This keeps the report
-  confidential until a fix is ready and gives us a private channel to coordinate.
+- **Email `security@runheimdall.dev`.** This reaches the maintainer directly.
+  Encrypt if you like, or just send enough for us to reproduce.
+- **A GitHub Security Advisory** on this repository, if private vulnerability
+  reporting is enabled (Security → Advisories → *Report a vulnerability*). This
+  keeps the report confidential until a fix is ready and gives us a private
+  channel to coordinate. If you do not see the option, use the email above — the
+  GitHub private-reporting toggle lives under the repo owner's Settings →
+  Security and may not be enabled yet.
 
 What to expect:
 
-- **Acknowledgement target: within 48 hours.** We confirm receipt and let you
+- **Acknowledgement target: within 72 hours.** We confirm receipt and let you
   know whether we can reproduce it.
 - We work a fix and a coordinated disclosure timeline with you. We credit
   reporters who want credit; we honor requests to stay anonymous.
@@ -24,13 +29,25 @@ What to expect:
 
 Please give us a reasonable window to ship a fix before any public disclosure.
 
+## Safe harbor for good-faith research
+
+We will not pursue, support, or threaten legal action against anyone who reports
+a vulnerability in good faith through the private channels above — nor will we
+retaliate in any other way. "Good faith" means: you make a reasonable effort to
+avoid privacy violations, data loss, and service disruption; you only interact
+with accounts and data you own or have explicit permission to test; and you give
+us a reasonable window to remediate before public disclosure. If you are unsure
+whether an action is authorized, ask us first at `security@runheimdall.dev`.
+
 ## Supported scope
 
 | In scope                                                        | Out of scope                                              |
 |-----------------------------------------------------------------|-----------------------------------------------------------|
-| The Heimdall harness, gates, sentinels, and hooks in this repo. | Vulnerabilities in Claude Code or the Anthropic platform — report those to their respective projects. |
-| The latest released version on the default branch.              | Issues that require a user to run `--dangerously-skip-permissions` in a throwaway sandbox (that flag is documented as autonomy with no safety classifier in the loop). |
-| Bypasses of a quality or safety gate that let unproven code through. | Third-party dependencies — we will help upstream the report. |
+| **The plugin:** the Heimdall harness, gates, sentinels, and hooks in this repo. | Vulnerabilities in Claude Code or the Anthropic platform — report those to their respective projects. |
+| **The control plane:** the hosted presence/enrollment/dispatch service (multi-tenant team presence, enroll tokens, PKI, job dispatch). | Issues that require a user to run `--dangerously-skip-permissions` in a throwaway sandbox (that flag is documented as autonomy with no safety classifier in the loop). |
+| **The site:** the public marketing/docs site and its install path. | Third-party dependencies — we will help upstream the report. |
+| The latest released version on the default branch.              | Automated scanner output with no demonstrated impact, and best-practice suggestions that are not an exploitable weakness. |
+| Bypasses of a quality or safety gate that let unproven code through; tenant-isolation breaks in the control plane; supply-chain integrity of the install path. |                                                           |
 
 Only the latest released version receives security fixes. There are no separately
 maintained release branches.
