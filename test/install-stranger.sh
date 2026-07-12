@@ -71,8 +71,15 @@ ok()   { printf '  \033[32mPASS\033[0m %s\n' "$1"; PASS=$((PASS+1)); }
 bad()  { printf '  \033[31mFAIL\033[0m %s\n' "$1"; FAIL=$((FAIL+1)); }
 
 run_install() {  # $1=HOME
+  # HEIMDALL_NO_DREAM_SCHEDULE=1: the installer now auto-registers a launchd
+  # LaunchAgent (com.heimdall.dream). launchctl load targets the REAL user GUI
+  # session domain — NOT isolated by the throwaway $HOME — so an unguarded run would
+  # stomp the tester's own live nightly agent with one pointed at this temp checkout
+  # (then leave it dangling on cleanup). Opt out so the smoke stays side-effect-free;
+  # the schedule wiring itself is proven hermetically in test/dream-install-wire.test.sh.
   env -i HOME="$1" TERM="dumb" PATH="$STRANGER_PATH" \
     HEIMDALL_REPO="$REPO" HEIMDALL_REF="$REF" HEIMDALL_NO_COLOR=1 \
+    HEIMDALL_NO_DREAM_SCHEDULE=1 \
     bash "$REPO/install.sh" 2>&1
 }
 in_stranger() { # $1=HOME, rest=cmd — run a command as the stranger would
@@ -384,6 +391,7 @@ fi
 TMPH_G="$(mktemp -d)"
 GRACE_CARD="$(env -i HOME="$TMPH_G" TERM="dumb" PATH="$STRANGER_PATH" \
   HEIMDALL_REPO="$REPO" HEIMDALL_REF="$REF" HEIMDALL_NO_COLOR=1 \
+  HEIMDALL_NO_DREAM_SCHEDULE=1 \
   HEIMDALL_FORCE_FAIL_OPTIONAL=1 bash "$REPO/install.sh" 2>&1)"
 GRACE_RC=$?
 GLNK="$TMPH_G/.local/bin/hmd"; [ -e "$GLNK" ] || GLNK="$TMPH_G/.local/bin/heimdall"
@@ -407,6 +415,7 @@ fi
 # variant going GREEN here would itself be the regression. (We assert the abort.)
 HARD_CARD="$(env -i HOME="$TMPH_G" TERM="dumb" PATH="$STRANGER_PATH" \
   HEIMDALL_REPO="$REPO" HEIMDALL_REF="$REF" HEIMDALL_NO_COLOR=1 \
+  HEIMDALL_NO_DREAM_SCHEDULE=1 \
   HEIMDALL_FORCE_FAIL_OPTIONAL=1 HEIMDALL_HARD_FAIL_OPTIONAL=1 bash "$REPO/install.sh" 2>&1)"
 HARD_RC=$?
 if [ "$HARD_RC" -ne 0 ] \
