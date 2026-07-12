@@ -1,4 +1,3 @@
-2e36d3c92edd244c47edc01108d0b5f4c8f4b37c:test/heimdall-presence-bootstrap.test.sh:generic-api-key:59
 # ── Benign TEST-FIXTURE history fingerprints (gitleaks .gitleaksignore) ──────────
 # These are per-secret fingerprints (commit:file:rule:line) — NOT a path allowlist.
 # The convention (docs/analysis/gitleaks-history-triage-2026-07-06.md +
@@ -15,6 +14,8 @@
 # history with `git filter-repo --replace-text`, then delete these lines. See the
 # "Step 2 — scrub history" section of docs/analysis/gitleaks-history-triage-2026-07-06.md.
 
+# benign test fixture — a fake enroll token ("enroll-secret-abc123") the presence-bootstrap test feeds its LOCALHOST mock control plane; never a real credential (presence-bootstrap enroll test)
+2e36d3c92edd244c47edc01108d0b5f4c8f4b37c:test/heimdall-presence-bootstrap.test.sh:generic-api-key:59
 # benign test fixture — a fake personal GITHUB_TOKEN proving it is POPPED from the gh child env (bug #26 test)
 51d16d23619d71bc889a212e6fdeeb80c4af3a55:test/issue-pr.test.sh:github-pat:747
 # benign test fixture — a fake App JWT the failing gh emits, proving pr.error SCRUBS it (bug #26 test)

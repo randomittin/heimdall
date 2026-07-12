@@ -105,11 +105,20 @@ fi
 # consistency guard: the yaml's serviceAccountName + GOOGLE_CLOUD_PROJECT reference a
 # project; if --project differs, the image-pin (below) keeps the image path in sync but
 # those two fields are OUT of this script's pin scope — warn the operator to align them.
-_yaml_proj="$(grep -oE 'heimdall-cp-runtime@[A-Za-z0-9-]+\.iam' "$YAML" | head -1 | sed -E 's/^heimdall-cp-runtime@([A-Za-z0-9-]+)\.iam$/\1/')"
-if [ -n "$_yaml_proj" ] && [ "$_yaml_proj" != "$PROJECT" ]; then
-  warn "the manifest's serviceAccountName/GOOGLE_CLOUD_PROJECT reference '$_yaml_proj', but --project=$PROJECT."
-  warn "this script pins the IMAGE path to $PROJECT; also update serviceAccountName + GOOGLE_CLOUD_PROJECT in $YAML to $PROJECT before a real deploy (RUNBOOK §3.2)."
-fi
+# The public manifest ships with a <runtime-sa>@<project> PLACEHOLDER, so also warn if it
+# is left unfilled (an angle-bracket placeholder in the serviceAccountName).
+_yaml_sa="$(grep -oE 'serviceAccountName:[[:space:]]*[^[:space:]]+' "$YAML" | head -1 | sed -E 's/^serviceAccountName:[[:space:]]*//')"
+case "$_yaml_sa" in
+  ''|*'<'*'>'*)
+    warn "the manifest's serviceAccountName is an unfilled placeholder ('${_yaml_sa:-<none>}')."
+    warn "before a real deploy, set serviceAccountName + GOOGLE_CLOUD_PROJECT in $YAML to your runtime SA in project $PROJECT (RUNBOOK §3.2)." ;;
+  *)
+    _yaml_proj="$(printf '%s' "$_yaml_sa" | sed -E 's/^[^@]+@([A-Za-z0-9-]+)\.iam.*$/\1/')"
+    if [ -n "$_yaml_proj" ] && [ "$_yaml_proj" != "$PROJECT" ]; then
+      warn "the manifest's serviceAccountName/GOOGLE_CLOUD_PROJECT reference '$_yaml_proj', but --project=$PROJECT."
+      warn "this script pins the IMAGE path to $PROJECT; also update serviceAccountName + GOOGLE_CLOUD_PROJECT in $YAML to $PROJECT before a real deploy (RUNBOOK §3.2)."
+    fi ;;
+esac
 
 # ── a2. deployed-shape preflight (WARN-ONLY — never blocks) ───────────────────
 # Static scan of bin/lib/*.py for the workstation-assumption smells the 14-bug
