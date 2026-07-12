@@ -1,0 +1,223 @@
+#!/usr/bin/env bash
+# heimdall-dream-schedule — run /dream AUTOMATICALLY in the background, nightly.
+#
+# WHY THIS EXISTS
+#   `/dream` (bin/heimdall-dream) is the overnight autoresearch + maintainer sweep that
+#   leaves a MORNING REPORT. On-demand it is a manual `/dream`. This helper makes it
+#   AUTO-BACKGROUND: it registers the overnight run with the platform-native scheduler
+#   so it fires every night at 03:00 WITHOUT a live session and SURVIVES logout/reboot.
+#
+#   On macOS the platform scheduler is launchd — we do NOT invent a scheduler. We
+#   register a per-user LaunchAgent `com.heimdall.dream` (no root: it lives in
+#   ~/Library/LaunchAgents). launchd is restart-durable by construction: a
+#   StartCalendarInterval fires at the next matching wall-clock minute, and if the box
+#   was asleep/off at 03:00 launchd runs it at the next wake. The scheduled command is
+#   the EXACT shadow-first, non-pushing overnight run:
+#
+#       heimdall-dream --repo <REPO> run --overnight
+#
+#   heimdall-dream already honors shadow-first + agent-never-pushes; this helper just
+#   invokes it on a timer. stdout/stderr are appended to ~/.heimdall/logs/dream.log.
+#
+# COMMANDS
+#   install   [--repo DIR] [--hour H] [--minute M]   register + load the nightly agent
+#   uninstall [--repo DIR]                            unload + remove the agent (OFF switch)
+#   status    [--repo DIR] [--json]                   is it installed / loaded? show cmd
+#   run-now   [--repo DIR] [--json]                   fire the SAME overnight run once, now
+#   -h | --help
+#
+# GUARANTEES
+#   - IDEMPOTENT: the plist path is fixed (one file per label), so re-install overwrites
+#     in place and unload-before-load means never two loaded copies — install twice ==
+#     exactly ONE registered job.
+#   - OFF SWITCH: `uninstall` unloads and removes the plist; a second uninstall is a
+#     clean no-op. Nothing is left behind.
+#   - SHADOW-FIRST / NEVER-PUSHES: inherited from heimdall-dream — this helper adds no
+#     push/merge and passes no flag that would.
+#
+# TEST/PORTABILITY SEAMS (env overrides; all default to the real macOS values):
+#   HEIMDALL_LAUNCH_AGENTS_DIR   plist dir      (default: $HOME/Library/LaunchAgents)
+#   HEIMDALL_DREAM_LOG           log file       (default: $HOME/.heimdall/logs/dream.log)
+#   LAUNCHCTL                    launchctl bin  (default: launchctl)
+#   These let the acceptance suite prove install/idempotent/status/uninstall with a
+#   shimmed launchctl and a tmp dir — no root, no real agent loaded.
+#
+# Exit status: 0 ok · 2 usage / unsupported platform · 3 runtime.
+
+set -euo pipefail
+
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+BINDIR="$(dirname "$SELF")"
+DREAM="$BINDIR/heimdall-dream"
+
+LABEL="com.heimdall.dream"
+LA_DIR="${HEIMDALL_LAUNCH_AGENTS_DIR:-$HOME/Library/LaunchAgents}"
+LOG="${HEIMDALL_DREAM_LOG:-$HOME/.heimdall/logs/dream.log}"
+LAUNCHCTL="${LAUNCHCTL:-launchctl}"
+PLIST="$LA_DIR/$LABEL.plist"
+
+usage() { sed -n '2,40p' "$SELF" | sed 's/^# \{0,1\}//'; }
+die()   { echo "error: $*" >&2; exit 3; }
+
+# ── arg parse (shared across subcommands) ────────────────────────────────────────
+REPO=""
+HOUR=3
+MINUTE=0
+JSON=0
+parse_args() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repo)   REPO="${2:-}"; shift 2 ;;
+      --hour)   HOUR="${2:-}"; shift 2 ;;
+      --minute) MINUTE="${2:-}"; shift 2 ;;
+      --json)   JSON=1; shift ;;
+      *) die "unknown argument: $1" ;;
+    esac
+  done
+  if [ -z "$REPO" ]; then
+    REPO="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+  fi
+  # absolutize the repo path so the plist is location-independent.
+  REPO="$(cd "$REPO" 2>/dev/null && pwd)" || die "repo not a directory: $REPO"
+  case "$HOUR"   in ''|*[!0-9]*) die "bad --hour: $HOUR" ;; esac
+  case "$MINUTE" in ''|*[!0-9]*) die "bad --minute: $MINUTE" ;; esac
+}
+
+# XML-escape a path for embedding in the plist (paths may hold & < > ' ").
+xml_escape() {
+  local s="$1"
+  s="${s//&/&amp;}"; s="${s//</&lt;}"; s="${s//>/&gt;}"
+  s="${s//\"/&quot;}"; s="${s//\'/&apos;}"
+  printf '%s' "$s"
+}
+
+is_macos() { [ "$(uname -s)" = "Darwin" ]; }
+
+# ── emit the plist (the single source of the scheduled argv) ─────────────────────
+write_plist() {
+  mkdir -p "$LA_DIR" "$(dirname "$LOG")"
+  local e_dream e_repo e_log
+  e_dream="$(xml_escape "$DREAM")"
+  e_repo="$(xml_escape "$REPO")"
+  e_log="$(xml_escape "$LOG")"
+  cat > "$PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>$LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$e_dream</string>
+    <string>--repo</string>
+    <string>$e_repo</string>
+    <string>run</string>
+    <string>--overnight</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>$HOUR</integer>
+    <key>Minute</key>
+    <integer>$MINUTE</integer>
+  </dict>
+  <key>RunAtLoad</key>
+  <false/>
+  <key>WorkingDirectory</key>
+  <string>$e_repo</string>
+  <key>StandardOutPath</key>
+  <string>$e_log</string>
+  <key>StandardErrorPath</key>
+  <string>$e_log</string>
+</dict>
+</plist>
+PLIST
+}
+
+# ── launchctl helpers (unload-before-load == idempotent; tolerant of "not loaded") ─
+unload_agent() {
+  "$LAUNCHCTL" unload -w "$PLIST" >/dev/null 2>&1 || true
+}
+load_agent() {
+  "$LAUNCHCTL" load -w "$PLIST" >/dev/null 2>&1 \
+    || die "launchctl failed to load $PLIST"
+}
+is_loaded() {
+  "$LAUNCHCTL" list "$LABEL" >/dev/null 2>&1
+}
+
+# ── subcommands ──────────────────────────────────────────────────────────────────
+cmd_install() {
+  is_macos || die "unsupported platform: launchd scheduling is macOS-only (found $(uname -s)). \
+Use the cron/cloud routine documented in commands/dream.md instead."
+  [ -x "$DREAM" ] || die "heimdall-dream not executable at $DREAM"
+  write_plist
+  unload_agent   # drop any prior copy so a re-install never yields two loaded jobs
+  load_agent
+  local cron="$MINUTE $HOUR * * *"
+  if [ "$JSON" = 1 ]; then
+    printf '{"installed":true,"loaded":%s,"label":"%s","plist":"%s","cron":"%s","command":"%s --repo %s run --overnight","log":"%s"}\n' \
+      "$(is_loaded && echo true || echo false)" "$LABEL" "$PLIST" "$cron" "$DREAM" "$REPO" "$LOG"
+  else
+    echo "installed $LABEL — nightly at $(printf '%02d:%02d' "$HOUR" "$MINUTE") (cron '$cron')"
+    echo "  command: $DREAM --repo $REPO run --overnight"
+    echo "  plist:   $PLIST"
+    echo "  log:     $LOG"
+    echo "  loaded:  $(is_loaded && echo yes || echo no)"
+    echo "  disable: heimdall-dream-schedule uninstall"
+  fi
+}
+
+cmd_uninstall() {
+  # off switch — tolerate a non-macOS box and an already-absent agent (idempotent).
+  unload_agent
+  rm -f "$PLIST"
+  if [ "$JSON" = 1 ]; then
+    printf '{"installed":false,"loaded":false,"label":"%s","plist":"%s"}\n' "$LABEL" "$PLIST"
+  else
+    echo "uninstalled $LABEL (plist removed, agent unloaded)"
+  fi
+}
+
+cmd_status() {
+  local installed loaded
+  [ -f "$PLIST" ] && installed=true || installed=false
+  if is_loaded; then loaded=true; else loaded=false; fi
+  if [ "$JSON" = 1 ]; then
+    printf '{"installed":%s,"loaded":%s,"label":"%s","plist":"%s","command":"%s --repo %s run --overnight","log":"%s"}\n' \
+      "$installed" "$loaded" "$LABEL" "$PLIST" "$DREAM" "$REPO" "$LOG"
+  else
+    if [ "$installed" = true ] && [ "$loaded" = true ]; then
+      echo "$LABEL: registered (installed + loaded)"
+    elif [ "$installed" = true ]; then
+      echo "$LABEL: installed but NOT loaded"
+    else
+      echo "$LABEL: not installed"
+    fi
+    echo "  plist:   $PLIST"
+    echo "  command: $DREAM --repo $REPO run --overnight"
+    echo "  log:     $LOG"
+  fi
+}
+
+# run-now — fire the SAME overnight run the schedule would, once, now (parity check &
+# a way to prove the wiring without waiting for 03:00). Delegates to heimdall-dream.
+cmd_run_now() {
+  [ -x "$DREAM" ] || die "heimdall-dream not executable at $DREAM"
+  local extra=()
+  [ "$JSON" = 1 ] && extra+=(--json)
+  exec "$DREAM" --repo "$REPO" run --overnight "${extra[@]}"
+}
+
+# ── dispatch ───────────────────────────────────────────────────────────────────
+[ $# -ge 1 ] || { usage >&2; exit 2; }
+CMD="$1"; shift
+case "$CMD" in
+  -h|--help) usage; exit 0 ;;
+  install)   parse_args "$@"; cmd_install ;;
+  uninstall) parse_args "$@"; cmd_uninstall ;;
+  status)    parse_args "$@"; cmd_status ;;
+  run-now)   parse_args "$@"; cmd_run_now ;;
+  *) echo "error: unknown command: $CMD" >&2; usage >&2; exit 2 ;;
+esac

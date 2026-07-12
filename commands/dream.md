@@ -95,11 +95,42 @@ cloud routine), `/routine`, or `/loop`:
 /routine "run /dream --overnight" --every 24h
 ```
 
+### Auto-background on THIS box (macOS launchd — no live session needed)
+
+`/schedule` and `/routine` are cloud routines. To run `/dream` automatically in the
+background on the local machine — nightly, with NO session open, surviving logout and
+reboot — use the platform-native scheduler (launchd) via `bin/heimdall-dream-schedule`.
+It registers a per-user LaunchAgent `com.heimdall.dream` (lives in
+`~/Library/LaunchAgents` — **no root**) that fires the exact shadow-first, non-pushing
+overnight run and appends output to `~/.heimdall/logs/dream.log`:
+
+```bash
+# register the nightly 03:00 background run (idempotent — re-running never duplicates):
+heimdall-dream-schedule install --repo .
+
+# is it registered? (add --json for a machine summary)
+heimdall-dream-schedule status --repo .
+
+# fire the SAME overnight command once, now (proves the wiring without waiting for 03:00):
+heimdall-dream-schedule run-now --repo .
+
+# OFF SWITCH — unload + remove the agent (idempotent; a second run is a clean no-op):
+heimdall-dream-schedule uninstall --repo .
+```
+
+launchd is restart-durable by construction: the `StartCalendarInterval` fires at the
+next matching wall-clock minute, and if the box was asleep/off at 03:00 it runs at the
+next wake. Change the time with `--hour H --minute M`. The scheduled job inherits
+`/dream`'s invariants — **shadow-first, agent-never-pushes** — this helper only invokes
+it on a timer; it adds no push/merge. macOS-only (it errors clearly elsewhere and points
+you back to the cron/cloud routine above).
+
 On-demand `/dream` works any time — it runs the loop now and writes that day's report.
 
 ## Reference
 
 - Orchestrator: `bin/heimdall-dream` (stdlib python3; `-h` for usage).
+- Auto-background scheduler: `bin/heimdall-dream-schedule` (macOS launchd; `install|status|run-now|uninstall`). Acceptance: `test/heimdall-dream-schedule.test.sh` (hermetic; shimmed launchctl, no root).
 - Reused gate: `bin/heimdall-self-improve` + `skills/self-improve/SKILL.md`.
 - Maintainer sweep: `commands/maintain.md`, `skills/heimdall/references/maintainer-guide.md`.
 - Acceptance: `test/heimdall-dream.test.sh` (hermetic; proves the three sections, the
