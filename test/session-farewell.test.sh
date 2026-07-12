@@ -127,6 +127,35 @@ fi
   || bad "no .unlock-shown marker written"
 rm -rf "$U_HOME" 2>/dev/null || true
 
+# ── 8. FIX 3: SHARE CTA — real artifact path, never fabricated ──
+# With a FRESH reel artifact present, the close points at it; with none, it stays silent.
+A_DIR="$(mktemp -d 2>/dev/null || echo /tmp/farewell-share-$$)"
+mkdir -p "$A_DIR/.planning/reels" 2>/dev/null || true
+: > "$A_DIR/.planning/reels/run-share.txt"
+OUT_SHARE="$( cd "$A_DIR" && CLAUDE_PLUGIN_ROOT="$REPO" bash "$FAREWELL" </dev/null 2>&1 )"
+printf '%s' "$OUT_SHARE" | grep -q 'your run card' \
+  && printf '%s' "$OUT_SHARE" | grep -q '.planning/reels/run-share.txt' \
+  && ok "share CTA points at the REAL fresh run-card artifact" \
+  || bad "share CTA missing or wrong path for a fresh artifact"
+# Stale artifact (mtime well outside the freshness window) => NOT surfaced.
+touch -t 202001010000.00 "$A_DIR/.planning/reels/run-share.txt" 2>/dev/null || true
+OUT_STALE="$( cd "$A_DIR" && CLAUDE_PLUGIN_ROOT="$REPO" bash "$FAREWELL" </dev/null 2>&1 )"
+if printf '%s' "$OUT_STALE" | grep -q 'your run card'; then
+  bad "share CTA surfaced a stale artifact (outside freshness window)"
+else
+  ok "share CTA drops stale artifacts (freshness-gated)"
+fi
+rm -rf "$A_DIR" 2>/dev/null || true
+# No reels dir at all => print NOTHING (never a fabricated path).
+N_DIR="$(mktemp -d 2>/dev/null || echo /tmp/farewell-noshare-$$)"
+OUT_NOART="$( cd "$N_DIR" && CLAUDE_PLUGIN_ROOT="$REPO" bash "$FAREWELL" </dev/null 2>&1 )"
+if printf '%s' "$OUT_NOART" | grep -q 'your run card'; then
+  bad "share CTA fabricated a run-card path with no artifact present"
+else
+  ok "share CTA silent when no artifact exists (no fabricated path)"
+fi
+rm -rf "$N_DIR" 2>/dev/null || true
+
 echo ""
 echo "session-farewell.test.sh: $PASS passed, $FAIL failed."
 [ "$FAIL" -eq 0 ] || exit 1

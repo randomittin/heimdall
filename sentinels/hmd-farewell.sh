@@ -96,6 +96,34 @@ if [ -f "$UNLOCK_PENDING" ] && [ ! -f "$UNLOCK_SHOWN" ]; then
   rm -f "$UNLOCK_PENDING" 2>/dev/null || true
 fi
 
+# ── FIX 3: share CTA — surface the REAL run-card artifact path ────────────────
+# The SessionEnd hook backgrounds the reel/summary render into .planning/reels/ but
+# never tells the dev where the shareable artifact landed. Point at the NEWEST reel
+# artifact IF one is freshly written for THIS run (mtime within the freshness window),
+# preferring a rendered visual over the text endframe. Never fabricated: if nothing
+# fresh exists (the background render has not landed yet / is undetermined) we print
+# NOTHING. Freshness window overridable for tests via HEIMDALL_FAREWELL_ARTIFACT_MAX_AGE.
+share_line=""
+REEL_DIR=".planning/reels"
+if [ -d "$REEL_DIR" ]; then
+  _now="$(date +%s 2>/dev/null || echo 0)"
+  _maxage="${HEIMDALL_FAREWELL_ARTIFACT_MAX_AGE:-120}"
+  case "$_maxage" in ''|*[!0-9]*) _maxage=120 ;; esac
+  _best=""; _best_mt=0
+  for _f in "$REEL_DIR"/*.gif "$REEL_DIR"/*.mp4 "$REEL_DIR"/*.png "$REEL_DIR"/*.txt; do
+    [ -f "$_f" ] || continue
+    _mt="$(stat -f %m "$_f" 2>/dev/null || stat -c %Y "$_f" 2>/dev/null || echo 0)"
+    case "$_mt" in ''|*[!0-9]*) _mt=0 ;; esac
+    [ "$_mt" -gt "$_best_mt" ] && { _best_mt="$_mt"; _best="$_f"; }
+  done
+  if [ -n "$_best" ] && [ "$_now" -gt 0 ]; then
+    _age=$(( _now - _best_mt ))
+    if [ "$_age" -ge 0 ] && [ "$_age" -le "$_maxage" ]; then
+      share_line="${DIM}your run card → ${X}${CY}${_best#./}${X}"
+    fi
+  fi
+fi
+
 # ── the resting watchman frame (TTY + not suppressed + renderer present) ──
 FACE_BIN="$PLUGIN_DIR/bin/heimdall-face"
 if is_tty && [ "${HEIMDALL_NO_INTRO:-0}" != "1" ] && [ -x "$FACE_BIN" ]; then
@@ -110,5 +138,6 @@ fi
 printf '  %b\n' "${CY}${B}▸${X} ${DIM}the watchman sleeps.${X}"
 [ -n "$receipt" ]     && printf '  %b\n' "$receipt"
 [ -n "$unlock_line" ] && printf '  %b\n' "$unlock_line"
+[ -n "$share_line" ]  && printf '  %b\n' "$share_line"
 printf '  %b\n' "${CY}${B}HEIMDALL${X} ${DIM}· what shipped, shipped proven.${X}"
 printf '\n'
