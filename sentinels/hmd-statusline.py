@@ -11,7 +11,7 @@ Ships via plugin settings.json:
 Modes:
   --widget   emit only the watchman+verdict segment (ccstatusline coexistence)
 """
-import sys, os, json, time, re, hashlib, importlib.util, subprocess, shlex
+import sys, os, json, time, re, hashlib, importlib.util, subprocess, shlex, contextlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BIN_DIR = os.path.normpath(os.path.join(HERE, "..", "bin"))  # heimdall-identity / heimdall-presence live here
@@ -206,12 +206,31 @@ def _sigil_version():
     """A short CONTENT hash of hmd_sigil.py's source, folded into the cache key. Any
     change to the sigil code (grids, palette, render logic) mints a
     fresh key → the stale on-disk sigil is never served again, with NO manual cache
-    clear (the "sigil never updated" bug). Falls back to '0' when the source can't be
-    read — the key then degrades to the old tier/eye/seed behavior, never crashing."""
+    clear (the "sigil never updated" bug). CC forks a fresh python per render, so to
+    avoid re-hashing the whole source on every spawn we memoize (mtime → hash) in a tiny
+    sidecar (.srcver): an unchanged mtime reuses the stored hash and SKIPS the re-read;
+    only a real edit (which bumps mtime) re-reads + re-hashes → a fresh key that still
+    busts the sigil cache. Falls back to '0' when the source can't be read — the key
+    then degrades to the old tier/eye/seed behavior, never crashing."""
     try:
         src = getattr(SIG, "__file__", None) or os.path.join(HERE, "hmd_sigil.py")
+        mtime = os.path.getmtime(src)
+        vpath = os.path.join(_sigil_cache_dir(), ".srcver")
+        cached = None
+        with contextlib.suppress(Exception):
+            with open(vpath, "r", encoding="utf-8") as f:
+                cached_mtime, cached_hash = f.read().split(None, 1)
+            if float(cached_mtime) == mtime:
+                cached = cached_hash.strip()
+        if cached is not None:
+            return cached
         with open(src, "rb") as f:
-            return hashlib.sha256(f.read()).hexdigest()[:12]
+            h = hashlib.sha256(f.read()).hexdigest()[:12]
+        with contextlib.suppress(Exception):
+            os.makedirs(_sigil_cache_dir(), exist_ok=True)
+            with open(vpath, "w", encoding="utf-8") as f:
+                f.write("%r %s" % (mtime, h))
+        return h
     except Exception:
         return "0"
 _SIG_VERSION = _sigil_version()

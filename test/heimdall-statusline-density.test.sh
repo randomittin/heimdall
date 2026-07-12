@@ -20,8 +20,11 @@
 #      with NO SGR blink (params 5/6 BANNED) — asserted across both frames.
 #   4. TIER FIDELITY: truecolor → 38;2;; 256 → 38;5; and NO 38;2;; 16 → neither
 #      (the morph guard, same contract as the sigil core).
-#   5. <50ms RENDER BENCHMARK: the in-process render (warm sigil cache) median is
-#      reported and asserted under the 50ms budget.
+#   5. RENDER BENCHMARK: the in-process render (warm sigil cache) median is reported and
+#      asserted under the 50ms budget; a COLD-cache render sample (on-disk sigil cache +
+#      in-process memo wiped → a forced recompute) is also asserted under an 80ms budget,
+#      so a cold-path regression the warm median (served from cache) would never see is
+#      still caught.
 #
 # HERMETIC: a throwaway $HOME + workspace per render; a FIXED file-controlled identity
 # (seed=rj, handle=rj) and a FRESH roster cache (3 teammates: active/idle/deny) so the
@@ -151,9 +154,9 @@ grep -qF '38;2;' <<<"$C256" && bad "256 → leaked raw 38;2; (morph)"   || ok "2
 grep -qF '38;2;' <<<"$C16"  && bad "16 → leaked raw 38;2;"            || ok "16 → no 38;2;"
 grep -qF '38;5;' <<<"$C16"  && bad "16 → leaked 256 38;5;"           || ok "16 → no 38;5; (ANSI-16 only)"
 
-echo "== 5) <50ms render benchmark (in-process, warm sigil cache) =="
+echo "== 5) render benchmark: warm median <50ms + a cold-cache sample <80ms =="
 BENCH="$(python3 - "$SL" <<'PY'
-import os,sys,io,time,importlib.util,tempfile,statistics,contextlib
+import os,sys,io,time,importlib.util,tempfile,statistics,contextlib,shutil
 SL=sys.argv[1]
 ws=tempfile.mkdtemp(); home=tempfile.mkdtemp()
 os.makedirs(ws+"/.heimdall",exist_ok=True)
@@ -170,19 +173,30 @@ def one():
   sys.stdin=io.StringIO(j)
   with contextlib.redirect_stdout(io.StringIO()):
     m.main()
-one()  # warm the sigil cache (disk + memo)
+one()  # warm the interpreter + sigil cache (disk + memo)
+# COLD sample: wipe the on-disk sigil cache + the in-process memo so this ONE render is
+# FORCED to recompute the sigil (recompute + disk write) — a cold-path regression the
+# warm median (served from cache) would never see. The interpreter is already warm, so
+# this isolates the cache-recompute cost, not first-call import overhead.
+shutil.rmtree(m._sigil_cache_dir(), ignore_errors=True); m._SIG_MEMO.clear()
+sys.stdin=io.StringIO(j); t0=time.perf_counter()
+with contextlib.redirect_stdout(io.StringIO()): m.main()
+cold=(time.perf_counter()-t0)*1000
+one()  # re-warm the cache for the warm-median run
 ts=[]
 for _ in range(60):
   sys.stdin=io.StringIO(j); t0=time.perf_counter()
   with contextlib.redirect_stdout(io.StringIO()): m.main()
   ts.append((time.perf_counter()-t0)*1000)
-print("%.3f %.3f"%(statistics.median(ts),max(ts)))
+print("%.3f %.3f %.3f"%(cold,statistics.median(ts),max(ts)))
 PY
 )"
-MED="${BENCH%% *}"; MX="${BENCH##* }"
-echo "  render median=${MED}ms max=${MX}ms (budget 50ms)"
+COLD="${BENCH%% *}"; REST="${BENCH#* }"; MED="${REST%% *}"; MX="${REST##* }"
+echo "  render warm median=${MED}ms max=${MX}ms (budget 50ms) | cold-cache=${COLD}ms (budget 80ms)"
 python3 -c "import sys;sys.exit(0 if float('$MED')<50.0 else 1)" \
-  && ok "median render < 50ms (${MED}ms)" || bad "median render ${MED}ms exceeds 50ms budget"
+  && ok "warm median render < 50ms (${MED}ms)" || bad "warm median render ${MED}ms exceeds 50ms budget"
+python3 -c "import sys;sys.exit(0 if float('$COLD')<80.0 else 1)" \
+  && ok "cold-cache render < 80ms (${COLD}ms)" || bad "cold-cache render ${COLD}ms exceeds 80ms budget"
 
 echo
 echo "$pass passed, $fail failed"
