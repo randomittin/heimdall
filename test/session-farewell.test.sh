@@ -50,11 +50,25 @@ printf '%s' "$OUT" | grep -qi 'shipped proven' && ok "carries the 'shipped prove
 printf '%s' "$OUT" | grep -q 'HEIMDALL' && ok "carries the HEIMDALL wordmark" || bad "missing HEIMDALL wordmark"
 
 # ── 3. REAL STATS, NEVER FAKED ──
-# No ledger => NO fabricated count anywhere in the receipt.
-if printf '%s' "$OUT" | grep -qE '[0-9]+ (file|agent)'; then
-  bad "farewell invented a stat with an empty session ledger"
+# COLD-LEDGER ISOLATION (fixes a cold/warm flake): edit-tracker AND
+# parallelism-tracker both key their state by $TMPDIR + $CLAUDE_SESSION_ID, so the
+# AMBIENT session in which this suite runs can legitimately carry real edits/agents.
+# A truthful stat from a warm tracker is NOT a fabrication — asserting "zero digits"
+# against $OUT therefore raced (green on a cold ledger, red once the ambient trackers
+# had seeded any agent/edit). Run the "no ledger" close in a PRISTINE sandbox (its own
+# TMPDIR/HEIMDALL_HOME/HOME + a fresh session id) so the ledger is provably empty; then
+# every stat is >=0 and DROPPED, so no number is fabricated into the receipt (mirrors
+# the farewell's own zero-stats drop). Reproduce the old red with a warm ambient run.
+COLD_TMP="$(mktemp -d 2>/dev/null || echo /tmp/farewell-cold-$$)"
+mkdir -p "$COLD_TMP/tmp" "$COLD_TMP/hmd" "$COLD_TMP/home" 2>/dev/null || true
+OUT_COLD="$(TMPDIR="$COLD_TMP/tmp" HEIMDALL_HOME="$COLD_TMP/hmd" HOME="$COLD_TMP/home" \
+  CLAUDE_SESSION_ID="farewell-cold-$$" CLAUDE_PLUGIN_ROOT="$REPO" \
+  bash "$FAREWELL" </dev/null 2>&1)"
+rm -rf "$COLD_TMP" 2>/dev/null || true
+if printf '%s' "$OUT_COLD" | grep -qE '[0-9]+ (file|agent)'; then
+  bad "farewell invented a stat with a cold (empty) session ledger"
 else
-  ok "no ledger -> no fabricated stat (tagline-only close)"
+  ok "cold ledger -> no fabricated stat (>=0 stats dropped, tagline-only close)"
 fi
 # Seed a REAL edit ledger (3 files) and confirm it is reported truthfully.
 ET="$REPO/bin/edit-tracker"
