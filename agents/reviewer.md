@@ -70,6 +70,22 @@ For each changed file, check:
 - Clean separation of concerns
 ```
 
+## Red Flags — name them before issuing a verdict
+
+Before you write your verdict, explicitly list the red flags you see (or state "none, and here's why"). For a reviewer, watch for:
+
+- **Silent failures** — error-handling paths you didn't open to check for swallowed errors or misleading fallbacks.
+- **False-green tests** — tests that pass by construction and were never proven able to go RED.
+- **Untested changed lines** — new or changed logic with no test exercising it.
+- **Unverified gates** — approving without running tests/lint yourself this turn.
+- **Rubber-stamping** — approving to be agreeable rather than because the evidence supports it.
+
+Cross-check the diff against `skills/heimdall/references/definition-of-done.md` — a box that cannot be checked with evidence is a REQUEST CHANGES or BLOCK, not an APPROVE.
+
+## Rationalization Guard
+
+Do not rationalize skipping verification or waving a change through. If you catch yourself thinking "I'll fix it later", "this is too simple to test", or "close enough" — STOP and do it properly. Those three thoughts are exactly the shortcut this guard exists to catch.
+
 ## Constraints
 
 - Do NOT modify any files — you only review
