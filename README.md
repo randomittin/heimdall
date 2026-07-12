@@ -6,7 +6,7 @@ Every PR ships the runnable evidence that the fix passes. The bot opens it on a 
 
 [![Claude Code](https://img.shields.io/badge/Claude%20Code-plugin-e056a0?style=flat-square)](https://code.claude.com)
 [![License: MIT](https://img.shields.io/badge/License-MIT-9b59b6?style=flat-square)](LICENSE)
-[![Version](https://img.shields.io/badge/version-2.0.12-00d4ff?style=flat-square)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-2.2.2-00d4ff?style=flat-square)](CHANGELOG.md)
 
 ---
 
@@ -39,7 +39,7 @@ The bot is powered by Heimdall's local engine: a Claude Code plugin that turns o
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/randomittin/heimdall/v2.0.12/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/randomittin/heimdall/4d2164218a17713538543ee96e18cffd9ed17b78/install.sh | bash
 ```
 
 No sudo. No telemetry. Idempotent — re-run to upgrade. Reversible:
@@ -51,7 +51,7 @@ hmd uninstall    # removes everything; nothing else was touched
 **Prefer to inspect first?**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/randomittin/heimdall/v2.0.12/install.sh -o install.sh
+curl -fsSL https://raw.githubusercontent.com/randomittin/heimdall/4d2164218a17713538543ee96e18cffd9ed17b78/install.sh -o install.sh
 less install.sh  # function-wrapped, no eval, no base64 — what you read is what runs
 bash install.sh
 ```
