@@ -50,11 +50,25 @@ printf '%s' "$OUT" | grep -qi 'shipped proven' && ok "carries the 'shipped prove
 printf '%s' "$OUT" | grep -q 'HEIMDALL' && ok "carries the HEIMDALL wordmark" || bad "missing HEIMDALL wordmark"
 
 # ── 3. REAL STATS, NEVER FAKED ──
-# No ledger => NO fabricated count anywhere in the receipt.
-if printf '%s' "$OUT" | grep -qE '[0-9]+ (file|agent)'; then
-  bad "farewell invented a stat with an empty session ledger"
+# COLD-LEDGER ISOLATION (fixes a cold/warm flake): edit-tracker AND
+# parallelism-tracker both key their state by $TMPDIR + $CLAUDE_SESSION_ID, so the
+# AMBIENT session in which this suite runs can legitimately carry real edits/agents.
+# A truthful stat from a warm tracker is NOT a fabrication — asserting "zero digits"
+# against $OUT therefore raced (green on a cold ledger, red once the ambient trackers
+# had seeded any agent/edit). Run the "no ledger" close in a PRISTINE sandbox (its own
+# TMPDIR/HEIMDALL_HOME/HOME + a fresh session id) so the ledger is provably empty; then
+# every stat is >=0 and DROPPED, so no number is fabricated into the receipt (mirrors
+# the farewell's own zero-stats drop). Reproduce the old red with a warm ambient run.
+COLD_TMP="$(mktemp -d 2>/dev/null || echo /tmp/farewell-cold-$$)"
+mkdir -p "$COLD_TMP/tmp" "$COLD_TMP/hmd" "$COLD_TMP/home" 2>/dev/null || true
+OUT_COLD="$(TMPDIR="$COLD_TMP/tmp" HEIMDALL_HOME="$COLD_TMP/hmd" HOME="$COLD_TMP/home" \
+  CLAUDE_SESSION_ID="farewell-cold-$$" CLAUDE_PLUGIN_ROOT="$REPO" \
+  bash "$FAREWELL" </dev/null 2>&1)"
+rm -rf "$COLD_TMP" 2>/dev/null || true
+if printf '%s' "$OUT_COLD" | grep -qE '[0-9]+ (file|agent)'; then
+  bad "farewell invented a stat with a cold (empty) session ledger"
 else
-  ok "no ledger -> no fabricated stat (tagline-only close)"
+  ok "cold ledger -> no fabricated stat (>=0 stats dropped, tagline-only close)"
 fi
 # Seed a REAL edit ledger (3 files) and confirm it is reported truthfully.
 ET="$REPO/bin/edit-tracker"
@@ -91,6 +105,56 @@ if grep -q 'hmd-farewell' "$HOOKS"; then
 else
   bad "SessionEnd hook does NOT invoke hmd-farewell.sh"
 fi
+
+# ── 7. FIX 1: ONE-SHOT SIGIL-UNLOCK REVEAL ──
+# bin/heimdall arms $HEIMDALL_HOME/.unlock-pending on the 3-run crossing; the NEXT
+# close reveals it ONCE and drops .unlock-shown so it never repeats.
+U_HOME="$(mktemp -d 2>/dev/null || echo /tmp/farewell-unlock-$$)"
+mkdir -p "$U_HOME" 2>/dev/null || true
+: > "$U_HOME/.unlock-pending"
+U1="$(HEIMDALL_HOME="$U_HOME" CLAUDE_PLUGIN_ROOT="$REPO" bash "$FAREWELL" </dev/null 2>&1)"
+U2="$(HEIMDALL_HOME="$U_HOME" CLAUDE_PLUGIN_ROOT="$REPO" bash "$FAREWELL" </dev/null 2>&1)"
+printf '%s' "$U1" | grep -qi 'sigil customization unlocked' \
+  && ok "unlock reveal fires once when armed" \
+  || bad "unlock reveal did not fire on the armed close"
+if printf '%s' "$U2" | grep -qi 'sigil customization unlocked'; then
+  bad "unlock reveal repeated (must be one-shot)"
+else
+  ok "unlock reveal is one-shot (silent on the next close)"
+fi
+[ -f "$U_HOME/.unlock-shown" ] \
+  && ok "unlock reveal drops a .unlock-shown marker" \
+  || bad "no .unlock-shown marker written"
+rm -rf "$U_HOME" 2>/dev/null || true
+
+# ── 8. FIX 3: SHARE CTA — real artifact path, never fabricated ──
+# With a FRESH reel artifact present, the close points at it; with none, it stays silent.
+A_DIR="$(mktemp -d 2>/dev/null || echo /tmp/farewell-share-$$)"
+mkdir -p "$A_DIR/.planning/reels" 2>/dev/null || true
+: > "$A_DIR/.planning/reels/run-share.txt"
+OUT_SHARE="$( cd "$A_DIR" && CLAUDE_PLUGIN_ROOT="$REPO" bash "$FAREWELL" </dev/null 2>&1 )"
+printf '%s' "$OUT_SHARE" | grep -q 'your run card' \
+  && printf '%s' "$OUT_SHARE" | grep -q '.planning/reels/run-share.txt' \
+  && ok "share CTA points at the REAL fresh run-card artifact" \
+  || bad "share CTA missing or wrong path for a fresh artifact"
+# Stale artifact (mtime well outside the freshness window) => NOT surfaced.
+touch -t 202001010000.00 "$A_DIR/.planning/reels/run-share.txt" 2>/dev/null || true
+OUT_STALE="$( cd "$A_DIR" && CLAUDE_PLUGIN_ROOT="$REPO" bash "$FAREWELL" </dev/null 2>&1 )"
+if printf '%s' "$OUT_STALE" | grep -q 'your run card'; then
+  bad "share CTA surfaced a stale artifact (outside freshness window)"
+else
+  ok "share CTA drops stale artifacts (freshness-gated)"
+fi
+rm -rf "$A_DIR" 2>/dev/null || true
+# No reels dir at all => print NOTHING (never a fabricated path).
+N_DIR="$(mktemp -d 2>/dev/null || echo /tmp/farewell-noshare-$$)"
+OUT_NOART="$( cd "$N_DIR" && CLAUDE_PLUGIN_ROOT="$REPO" bash "$FAREWELL" </dev/null 2>&1 )"
+if printf '%s' "$OUT_NOART" | grep -q 'your run card'; then
+  bad "share CTA fabricated a run-card path with no artifact present"
+else
+  ok "share CTA silent when no artifact exists (no fabricated path)"
+fi
+rm -rf "$N_DIR" 2>/dev/null || true
 
 echo ""
 echo "session-farewell.test.sh: $PASS passed, $FAIL failed."
