@@ -1019,6 +1019,12 @@ ENTRY_NAME="$(basename "$0")"   # hmd or heimdall — for self-referential help
 # ONCE per hmd invocation; HEIMDALL_RUN_COUNTED makes it idempotent within one process
 # tree (nested self-calls don't double-count). Never fails the caller.
 HEIMDALL_RUN_COUNT_FILE="$HEIMDALL_HOME_DIR/.run-count"
+# One-shot sigil-unlock reveal (FIX 1): the ≥3-run `hmd sigil` customization unlock
+# is otherwise SILENT. `.unlock-pending` is armed on the first crossing into unlocked
+# territory; the next session-close farewell prints the celebration ONCE and drops a
+# `.unlock-shown` marker so it is never re-armed or repeated.
+HEIMDALL_UNLOCK_PENDING_FILE="$HEIMDALL_HOME_DIR/.unlock-pending"
+HEIMDALL_UNLOCK_SHOWN_FILE="$HEIMDALL_HOME_DIR/.unlock-shown"
 hmd_run_count() {                     # echo the current count (0 when absent/garbage)
   local n=0
   [ -f "$HEIMDALL_RUN_COUNT_FILE" ] && n="$(cat "$HEIMDALL_RUN_COUNT_FILE" 2>/dev/null || echo 0)"
@@ -1029,8 +1035,13 @@ hmd_bump_run_count() {
   [ -n "${HEIMDALL_RUN_COUNTED:-}" ] && return 0
   export HEIMDALL_RUN_COUNTED=1
   mkdir -p "$HEIMDALL_HOME_DIR" 2>/dev/null || return 0
-  local n; n="$(hmd_run_count)"; n=$((n + 1))
+  local prev n; prev="$(hmd_run_count)"; n=$((prev + 1))
   printf '%s\n' "$n" > "$HEIMDALL_RUN_COUNT_FILE" 2>/dev/null || true
+  # First crossing into the unlocked band (prev<3 -> n>=3): arm the one-shot reveal.
+  # Guarded on the shown-marker so a manually-edited or re-crossed counter never re-arms.
+  if [ "$prev" -lt 3 ] && [ "$n" -ge 3 ] && [ ! -f "$HEIMDALL_UNLOCK_SHOWN_FILE" ]; then
+    : > "$HEIMDALL_UNLOCK_PENDING_FILE" 2>/dev/null || true
+  fi
   return 0
 }
 hmd_bump_run_count || true

@@ -81,6 +81,21 @@ if [ "${#parts[@]}" -gt 0 ]; then
   done
 fi
 
+# ── FIX 1: one-shot sigil-unlock reveal ──────────────────────────────────────
+# When `hmd` crosses 3 runs it silently unlocks `hmd sigil set <hero>`. bin/heimdall
+# arms $HMD_HOME/.unlock-pending on that crossing; here we reveal it ONCE, then drop
+# a .unlock-shown marker so it never repeats. Text-only (paste-clean); never fatal.
+HMD_HOME="${HEIMDALL_HOME:-$HOME/.heimdall}"
+UNLOCK_PENDING="$HMD_HOME/.unlock-pending"
+UNLOCK_SHOWN="$HMD_HOME/.unlock-shown"
+unlock_line=""
+if [ -f "$UNLOCK_PENDING" ] && [ ! -f "$UNLOCK_SHOWN" ]; then
+  unlock_line="${GR}${B}🔓 sigil customization unlocked${X}${DIM} — ${X}${B}hmd sigil set <hero>${X}"
+  mkdir -p "$HMD_HOME" 2>/dev/null || true
+  : > "$UNLOCK_SHOWN" 2>/dev/null || true      # mark shown — one-shot, never repeats
+  rm -f "$UNLOCK_PENDING" 2>/dev/null || true
+fi
+
 # ── the resting watchman frame (TTY + not suppressed + renderer present) ──
 FACE_BIN="$PLUGIN_DIR/bin/heimdall-face"
 if is_tty && [ "${HEIMDALL_NO_INTRO:-0}" != "1" ] && [ -x "$FACE_BIN" ]; then
@@ -93,6 +108,7 @@ fi
 
 # ── the close: title -> receipt (if any) -> tagline ──
 printf '  %b\n' "${CY}${B}▸${X} ${DIM}the watchman sleeps.${X}"
-[ -n "$receipt" ] && printf '  %b\n' "$receipt"
+[ -n "$receipt" ]     && printf '  %b\n' "$receipt"
+[ -n "$unlock_line" ] && printf '  %b\n' "$unlock_line"
 printf '  %b\n' "${CY}${B}HEIMDALL${X} ${DIM}· what shipped, shipped proven.${X}"
 printf '\n'

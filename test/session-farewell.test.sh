@@ -92,6 +92,27 @@ else
   bad "SessionEnd hook does NOT invoke hmd-farewell.sh"
 fi
 
+# ── 7. FIX 1: ONE-SHOT SIGIL-UNLOCK REVEAL ──
+# bin/heimdall arms $HEIMDALL_HOME/.unlock-pending on the 3-run crossing; the NEXT
+# close reveals it ONCE and drops .unlock-shown so it never repeats.
+U_HOME="$(mktemp -d 2>/dev/null || echo /tmp/farewell-unlock-$$)"
+mkdir -p "$U_HOME" 2>/dev/null || true
+: > "$U_HOME/.unlock-pending"
+U1="$(HEIMDALL_HOME="$U_HOME" CLAUDE_PLUGIN_ROOT="$REPO" bash "$FAREWELL" </dev/null 2>&1)"
+U2="$(HEIMDALL_HOME="$U_HOME" CLAUDE_PLUGIN_ROOT="$REPO" bash "$FAREWELL" </dev/null 2>&1)"
+printf '%s' "$U1" | grep -qi 'sigil customization unlocked' \
+  && ok "unlock reveal fires once when armed" \
+  || bad "unlock reveal did not fire on the armed close"
+if printf '%s' "$U2" | grep -qi 'sigil customization unlocked'; then
+  bad "unlock reveal repeated (must be one-shot)"
+else
+  ok "unlock reveal is one-shot (silent on the next close)"
+fi
+[ -f "$U_HOME/.unlock-shown" ] \
+  && ok "unlock reveal drops a .unlock-shown marker" \
+  || bad "no .unlock-shown marker written"
+rm -rf "$U_HOME" 2>/dev/null || true
+
 echo ""
 echo "session-farewell.test.sh: $PASS passed, $FAIL failed."
 [ "$FAIL" -eq 0 ] || exit 1
