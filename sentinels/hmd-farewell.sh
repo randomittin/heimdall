@@ -124,6 +124,37 @@ if [ -d "$REEL_DIR" ]; then
   fi
 fi
 
+# ── FIX 5: solo-run invite (growth beat) — mirrors the statusline solo tease ──
+# When the run was SOLO (no teammates on the wall) the screenshot moment is the ideal
+# recruit beat. Solo-detect via the SAME signals the statusline uses: the per-repo
+# roster cache (online teammates) + the local team heartbeat files. Skip entirely when
+# presence is opted-out (an invite would be a lie — no one can see the dev). Never fatal.
+invite_line=""
+_top="$(git rev-parse --show-toplevel 2>/dev/null || true)"; [ -n "$_top" ] || _top="$PWD"
+HMD_REPO_DIR="$_top/.heimdall"
+_optout=""
+[ -f "$HMD_HOME/presence-off" ] && _optout=1          # global kill switch
+if [ -z "$_optout" ] && [ -f "$HMD_REPO_DIR/presence.json" ]; then
+  grep -qE '"enabled"[[:space:]]*:[[:space:]]*false' "$HMD_REPO_DIR/presence.json" 2>/dev/null && _optout=1
+fi
+if [ -z "$_optout" ]; then
+  _has_team=""
+  _roster="$HMD_REPO_DIR/.roster-cache.json"
+  if [ -f "$_roster" ]; then
+    if command -v jq >/dev/null 2>&1; then
+      _n="$(jq 'if type=="array" then length else 0 end' "$_roster" 2>/dev/null || echo 0)"
+      case "$_n" in ''|*[!0-9]*) _n=0 ;; esac
+      [ "$_n" -gt 0 ] && _has_team=1
+    elif grep -qE '"(haid|handle)"' "$_roster" 2>/dev/null; then
+      _has_team=1
+    fi
+  fi
+  if [ -z "$_has_team" ] && [ -d "$HMD_REPO_DIR/team" ]; then
+    for _tf in "$HMD_REPO_DIR/team"/*.json; do [ -f "$_tf" ] && { _has_team=1; break; }; done
+  fi
+  [ -z "$_has_team" ] && invite_line="${DIM}flying solo — invite your team · ${X}${B}hmd invite${X}"
+fi
+
 # ── the resting watchman frame (TTY + not suppressed + renderer present) ──
 FACE_BIN="$PLUGIN_DIR/bin/heimdall-face"
 if is_tty && [ "${HEIMDALL_NO_INTRO:-0}" != "1" ] && [ -x "$FACE_BIN" ]; then
@@ -139,5 +170,6 @@ printf '  %b\n' "${CY}${B}▸${X} ${DIM}the watchman sleeps.${X}"
 [ -n "$receipt" ]     && printf '  %b\n' "$receipt"
 [ -n "$unlock_line" ] && printf '  %b\n' "$unlock_line"
 [ -n "$share_line" ]  && printf '  %b\n' "$share_line"
+[ -n "$invite_line" ] && printf '  %b\n' "$invite_line"
 printf '  %b\n' "${CY}${B}HEIMDALL${X} ${DIM}· what shipped, shipped proven.${X}"
 printf '\n'
