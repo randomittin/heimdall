@@ -7,19 +7,32 @@
 # touches that hook. This NATIVE git hook runs on EVERY push regardless of
 # initiator, giving the two paths identical coverage.
 #
-# It does NOT reimplement the checks — it delegates to bin/heimdall-selfscan,
-# the single source of truth that runs gitleaks over the full history AND the
-# author/committer identity allowlist. Both this hook and the CC PreToolUse gate
-# call that one script; there is no duplicated logic.
+# It runs TWO layers, both delegating to shared single-source-of-truth scripts —
+# no check logic is reimplemented here:
 #
-# Installed by `hmd guard install`, which wires it via core.hooksPath set to the
-# RELATIVE path `.heimdall/git-hooks` (so a bare `.git/hooks` clobber cannot
-# silently disable it, AND a repo move/rename keeps it wired — git resolves
-# core.hooksPath relative to the working tree root).
+#   LAYER 1 — IDENTITY, on the PUSH RANGE (bin/heimdall-check-identities).
+#     The earliest, most precise catch: every author+committer email of the exact
+#     commits being pushed must be allowlisted. This is the direct root-cause fix
+#     for the v2.2.0 R9 trip (3 commits with committer rj@superpe.co leaked from
+#     scratchpad worktrees and were caught only AFTER the push). Catching it here,
+#     pre-push, means the bad identity never leaves the box. This layer honors the
+#     documented emergency escape hatch HEIMDALL_SKIP_ID_GUARD=1.
 #
-# RELOCATABLE: this hook bakes NO absolute path. It resolves heimdall-selfscan at
+#   LAYER 2 — FULL-HISTORY, on ALL refs (bin/heimdall-selfscan).
+#     gitleaks secret scan + author/committer allowlist over --all + strict-mode
+#     landmine lint. This is the authoritative belt-and-suspenders gate and has NO
+#     escape hatch — so even if layer 1 is bypassed, a non-allowlisted identity or
+#     a secret still cannot reach a Release.
+#
+# SCOPING: this hook is wired via a RELATIVE core.hooksPath, so it can fire in any
+# repo that inherits the config. Layer 1 runs ONLY when this repo actually carries
+# bin/heimdall-check-identities at its top (i.e. it IS a heimdall checkout);
+# otherwise it stands down. Layer 2 (selfscan) self-scopes the same way. A foreign
+# repo is therefore never policed by heimdall's allowlist.
+#
+# RELOCATABLE: this hook bakes NO absolute path. It resolves its delegates at
 # RUNTIME from the repo top (`git rev-parse --show-toplevel`), falling back to a
-# PATH lookup. Moving or renaming the repo therefore keeps the gate working.
+# PATH lookup. Moving or renaming the repo keeps the gate working.
 #
 # git invokes pre-push as:  pre-push <remote-name> <remote-url>   (refs on stdin)
 # A nonzero exit aborts the push. The success line printed by selfscan
@@ -28,16 +41,32 @@
 
 set -euo pipefail
 
+# Capture the ref updates git streams on stdin BEFORE anything else consumes it,
+# so layer 1 can scope the identity check to exactly the commits being pushed.
+STDIN_REFS="$(cat)"
+
+REPO_TOP="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+
+# ── LAYER 1 — identity allowlist on the push range ───────────────────────────
+# Only when this repo carries the shared helper at its top (a heimdall checkout).
+# Stand down silently in a foreign repo (the helper won't be present there).
+if [ -n "$REPO_TOP" ] && [ -x "$REPO_TOP/bin/heimdall-check-identities" ]; then
+  printf '%s\n' "$STDIN_REFS" | "$REPO_TOP/bin/heimdall-check-identities" --pre-push
+elif command -v heimdall-check-identities >/dev/null 2>&1; then
+  # Only a heimdall checkout's helper should police this repo; a PATH-only helper
+  # (installed globally) must not apply heimdall's allowlist to a foreign repo.
+  if [ -n "$REPO_TOP" ] && [ -x "$REPO_TOP/bin/heimdall-selfscan" ]; then
+    printf '%s\n' "$STDIN_REFS" | heimdall-check-identities --pre-push
+  fi
+fi
+
+# ── LAYER 2 — full-history secret + identity + landmine gate (no escape) ─────
 resolve_selfscan() {
-  # 1. In-repo scanner, resolved at runtime from the repo top. This is the
-  #    normal case and is RELOCATABLE — moving/renaming the repo moves the
-  #    scanner with it, and we never reference a baked absolute path.
   local top
   if top="$(git rev-parse --show-toplevel 2>/dev/null)" \
      && [ -x "$top/bin/heimdall-selfscan" ]; then
     printf '%s' "$top/bin/heimdall-selfscan"; return 0
   fi
-  # 2. On PATH (brew / ~/.local/bin installs).
   if command -v heimdall-selfscan >/dev/null 2>&1; then
     command -v heimdall-selfscan; return 0
   fi

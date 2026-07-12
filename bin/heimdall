@@ -1216,40 +1216,93 @@ case "${1:-}" in
       exit 1
     fi
 
-    # Wire via core.hooksPath into a heimdall-managed dir, NOT .git/hooks — so a
-    # later `.git/hooks` clobber (or a fresh clone re-init) cannot silently
-    # disable the gate, and we never trample a user's existing hooks.
-    #
-    # RELOCATABLE: the value STORED in git config is the RELATIVE path
-    # `.heimdall/git-hooks`. git resolves core.hooksPath relative to the working
-    # tree root, so `mv`-ing or renaming the repo keeps the hook wired — an
-    # absolute path would dangle the instant the repo moves. The hook body itself
-    # resolves heimdall-selfscan at RUNTIME via `git rev-parse --show-toplevel`
-    # (no baked absolute path), so the delegate target moves with the repo too.
-    rel_hooks_dir=".heimdall/git-hooks"
-    hooks_dir="$repo_root/$rel_hooks_dir"
-    mkdir -p "$hooks_dir"
-    dst_hook="$hooks_dir/pre-push"
+    # Read whatever core.hooksPath is CURRENTLY set to (local scope). We must
+    # never clobber a real custom hooksPath — only git's default (.git/hooks) or a
+    # heimdall-managed value is safe to (re)wire.
+    current_hp="$(git -C "$repo_root" config --local --get core.hooksPath 2>/dev/null || true)"
 
-    # Copy the hook verbatim — NO path is baked. The hook resolves the scanner at
-    # runtime from the repo top, so it survives a repo move/rename.
-    cp "$src_hook" "$dst_hook"
-    chmod +x "$dst_hook"
+    # Is the current hooksPath just git's DEFAULT (unset, the relative `.git/hooks`,
+    # or the absolute path git resolves that to — worktrees report it absolute) or
+    # an already-heimdall-managed value? Those are safe to (re)wire; a genuine
+    # custom dir is NOT and must be preserved. `git rev-parse --git-path hooks`
+    # yields the exact default path in this checkout so the absolute form matches.
+    default_hp="$(git -C "$repo_root" rev-parse --git-path hooks 2>/dev/null || true)"
+    hp_safe_to_rewire=0
+    case "$current_hp" in
+      ""|".git/hooks"|"hooks/git"|".heimdall/git-hooks") hp_safe_to_rewire=1 ;;
+    esac
+    if [ -n "$default_hp" ] && [ "$current_hp" = "$default_hp" ]; then hp_safe_to_rewire=1; fi
 
-    # RELATIVE on purpose (see above). Run from $repo_root so a stale absolute
-    # value from a prior install is overwritten with the relocatable one.
-    git -C "$repo_root" config core.hooksPath "$rel_hooks_dir"
-
+    # Is $repo_root a heimdall CHECKOUT? Then the guard hook + scanner are already
+    # version-controlled at hooks/git/pre-push + bin/heimdall-selfscan, so we wire
+    # core.hooksPath straight at the TRACKED dir — no copy. A fresh clone that runs
+    # `hmd guard install` is then guarded by files git already carries, and a
+    # `.git` re-init can be re-wired by re-running this. For a NON-heimdall repo we
+    # keep copying the hook into a heimdall-managed dir (the hook self-scopes and
+    # stands down there anyway).
     apply_heimdall_theme 2>/dev/null || true
-    G='\033[32m'; D='\033[2m'; B='\033[1m'; R='\033[0m'
+    G='\033[32m'; D='\033[2m'; B='\033[1m'; R='\033[0m'; Y='\033[33m'
+
+    if [ -f "$repo_root/hooks/git/pre-push" ] && [ -x "$repo_root/bin/heimdall-selfscan" ]; then
+      # ── heimdall checkout: wire the TRACKED hooks dir (relative, relocatable) ──
+      rel_hooks_dir="hooks/git"
+      dst_hook="$repo_root/$rel_hooks_dir/pre-push"
+      if [ "$hp_safe_to_rewire" -eq 1 ]; then
+          # Unset, git's default, or an already-heimdall-managed value — safe.
+          git -C "$repo_root" config core.hooksPath "$rel_hooks_dir"
+      else
+          # A real custom hooksPath — DO NOT clobber it. Chain instead: preserve
+          # any pre-existing pre-push as pre-push.local and drop a wrapper that
+          # runs it first, then execs the tracked heimdall guard.
+          custom_dir="$current_hp"
+          case "$custom_dir" in /*) : ;; *) custom_dir="$repo_root/$custom_dir" ;; esac
+          mkdir -p "$custom_dir"
+          if [ -e "$custom_dir/pre-push" ] && ! grep -q "heimdall-guard-chain" "$custom_dir/pre-push" 2>/dev/null; then
+            mv "$custom_dir/pre-push" "$custom_dir/pre-push.local"
+          fi
+          {
+            echo "#!/usr/bin/env bash"
+            echo "# heimdall-guard-chain: preserve the repo's existing pre-push, then run"
+            echo "# heimdall's tracked guard. Installed because a custom core.hooksPath was"
+            echo "# set — we did NOT clobber it."
+            echo "set -euo pipefail"
+            echo "REFS=\"\$(cat)\""
+            echo "here=\"\$(cd \"\$(dirname \"\${BASH_SOURCE[0]}\")\" && pwd)\""
+            echo "if [ -x \"\$here/pre-push.local\" ]; then printf '%s\\n' \"\$REFS\" | \"\$here/pre-push.local\" \"\$@\"; fi"
+            echo "top=\"\$(git rev-parse --show-toplevel)\""
+            echo "printf '%s\\n' \"\$REFS\" | exec \"\$top/hooks/git/pre-push\" \"\$@\""
+          } > "$custom_dir/pre-push"
+          chmod +x "$custom_dir/pre-push"
+          dst_hook="$custom_dir/pre-push"
+          rel_hooks_dir="$current_hp"
+          printf "\n  ${Y}!${R} preserved your custom core.hooksPath (%s) — chained the guard in\n" "$current_hp"
+      fi
+    else
+      # ── non-heimdall repo: copy the self-scoping hook into a managed dir ──
+      rel_hooks_dir=".heimdall/git-hooks"
+      hooks_dir="$repo_root/$rel_hooks_dir"
+      mkdir -p "$hooks_dir"
+      dst_hook="$hooks_dir/pre-push"
+      cp "$src_hook" "$dst_hook"
+      chmod +x "$dst_hook"
+      if [ "$hp_safe_to_rewire" -eq 1 ]; then
+          git -C "$repo_root" config core.hooksPath "$rel_hooks_dir"
+      else
+          printf "\n  ${Y}!${R} left your custom core.hooksPath (%s) untouched — copied the guard to %s\n" "$current_hp" "$rel_hooks_dir"
+      fi
+    fi
+
     printf "\n  ${B}Heimdall push guard installed${R}\n\n"
     printf "  ${G}✓${R} hook        %s\n" "$dst_hook"
-    printf "  ${G}✓${R} delegates   %s ${D}(resolved at push time)${R}\n" "$repo_root/bin/heimdall-selfscan"
+    printf "  ${G}✓${R} identity    %s ${D}(push-range author+committer allowlist)${R}\n" "$repo_root/bin/heimdall-check-identities"
+    printf "  ${G}✓${R} delegates   %s ${D}(full-history secret + identity + landmine)${R}\n" "$repo_root/bin/heimdall-selfscan"
     printf "  ${G}✓${R} core.hooksPath = %s ${D}(relative → survives a repo move)${R}\n" "$rel_hooks_dir"
     printf "\n"
-    printf "  ${D}Runs on EVERY push (human or agent): gitleaks full-history secret scan${R}\n"
-    printf "  ${D}+ author/committer identity allowlist. A blocked push prints the reason;${R}\n"
-    printf "  ${D}a clean push prints: guard: gitleaks=0 · identities=N/N allowlisted${R}\n\n"
+    printf "  ${D}Runs on EVERY push (human or agent): a push-range identity allowlist${R}\n"
+    printf "  ${D}(root-cause fix for the v2.2.0 R9 trip) + a full-history gitleaks secret${R}\n"
+    printf "  ${D}scan + identity allowlist + landmine lint. A blocked push prints the reason;${R}\n"
+    printf "  ${D}a clean push prints: guard: gitleaks=0 · identities=N/N allowlisted${R}\n"
+    printf "  ${D}Emergency identity bypass (verify first): HEIMDALL_SKIP_ID_GUARD=1 git push${R}\n\n"
     exit 0
     ;;
   uninstall)
