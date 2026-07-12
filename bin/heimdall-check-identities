@@ -1,0 +1,187 @@
+#!/usr/bin/env bash
+# heimdall-check-identities — the SINGLE source of truth for the author/committer
+# email allowlist check over a set of commits.
+#
+# Why this exists: v2.2.0's release TRIPPED R9 (the fresh-clone verify in
+# release/ship.sh) because 3 commits carried the committer email rj@superpe.co,
+# leaked from agent commits made in scratchpad worktrees. R9 caught it only AFTER
+# the push. This helper is the reusable primitive that lets the check run at the
+# EARLIEST safe point (the native git pre-push hook, before anything leaves the
+# box) AND stay the ONE implementation ship.sh's R9 also calls — so the allowlist
+# logic lives in exactly one place.
+#
+# What it does: for every commit in the requested scope, both the AUTHOR (%ae)
+# and the COMMITTER (%ce) email must be on the allowlist. Any commit with an
+# off-allowlist author OR committer is printed (short sha, role, email, subject)
+# and the tool exits nonzero. A clean scope exits 0.
+#
+# Scope selection:
+#   heimdall-check-identities                 # default: --all (every ref)
+#   heimdall-check-identities --all           # full history, all refs + tags
+#   heimdall-check-identities <range>...      # any git rev-list spec(s):
+#                                             #   A..B, HEAD~3..HEAD, a ref, etc.
+#   heimdall-check-identities --pre-push      # parse git pre-push stdin lines
+#                                             #   (<lref> <lsha> <rref> <rsha>)
+#                                             #   and check exactly the pushed
+#                                             #   commits.
+#
+# Escape hatch (documented, for emergencies): setting HEIMDALL_SKIP_ID_GUARD=1
+# bypasses the check entirely — the tool prints a loud notice to stderr and exits
+# 0. Use it only to unblock an emergency push you have manually verified; the
+# authoritative full-history gate (release/ship.sh R9 + bin/heimdall-selfscan)
+# still runs and has NO bypass, so a bad identity cannot silently reach a Release.
+#
+# Exit codes:
+#   0  every author+committer email in scope is allowlisted (or nothing in scope,
+#      or the escape hatch was used)
+#   1  at least one off-allowlist author/committer identity was found
+#   2  not in a git repository / a git command failed hard
+#
+# The allowlist MIRRORS release/ship.sh's ALLOWED_IDENTITIES and
+# bin/heimdall-selfscan's ALLOWED_IDENTITIES. All three must agree; it is kept
+# short and hard-coded on purpose — a configurable allowlist would itself be an
+# escape hatch.
+
+set -euo pipefail
+
+ALLOWED_IDENTITIES="rj@runheimdall.dev
+noreply@anthropic.com"
+
+# ── escape hatch (checked first, before any git work) ────────────────────────
+if [ "${HEIMDALL_SKIP_ID_GUARD:-}" = "1" ]; then
+  echo "heimdall-check-identities: HEIMDALL_SKIP_ID_GUARD=1 set — BYPASSING the" >&2
+  echo "author/committer identity allowlist. Emergency use only; the fresh-clone" >&2
+  echo "R9 gate still enforces this at release time." >&2
+  exit 0
+fi
+
+# ── must be in a git repo ────────────────────────────────────────────────────
+if ! git rev-parse --git-dir >/dev/null 2>&1; then
+  echo "heimdall-check-identities: not inside a git repository." >&2
+  exit 2
+fi
+
+# ── resolve the commit set to check ──────────────────────────────────────────
+# COMMITS holds a newline-separated list of full SHAs. We collect it differently
+# per mode, then dedupe once.
+COMMITS=""
+
+collect_pre_push_stdin() {
+  # git invokes a pre-push hook with the ref updates on stdin, one per line:
+  #   <local ref> <local sha> <remote ref> <remote sha>
+  # A zero local sha => a ref DELETION (nothing to push, skip). A zero remote
+  # sha => a NEW ref: check every commit reachable from local that is not already
+  # on a remote-tracking ref (falls back to the full reachable set if no remote
+  # refs are known — over-checking is safe). Otherwise check <remote>..<local>.
+  local zero="0000000000000000000000000000000000000000"
+  local lref lsha rref rsha revs
+  while read -r lref lsha rref rsha; do
+    [ -n "${lsha:-}" ] || continue
+    if [ "$lsha" = "$zero" ]; then
+      continue
+    fi
+    if [ "$rsha" = "$zero" ]; then
+      revs="$(git rev-list "$lsha" --not --remotes 2>/dev/null || git rev-list "$lsha")"
+    else
+      revs="$(git rev-list "$rsha..$lsha" 2>/dev/null || true)"
+    fi
+    if [ -n "$revs" ]; then
+      COMMITS="${COMMITS:+$COMMITS
+}$revs"
+    fi
+  done
+}
+
+MODE="all"
+declare -a RANGES=()
+if [ "$#" -eq 0 ]; then
+  MODE="all"
+else
+  case "$1" in
+    --all)      MODE="all" ;;
+    --pre-push) MODE="prepush" ;;
+    -h|--help)
+      # Print the usage block from the header comment.
+      sed -n '2,45p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0
+      ;;
+    *)          MODE="ranges"; RANGES=("$@") ;;
+  esac
+fi
+
+case "$MODE" in
+  all)
+    COMMITS="$(git rev-list --all 2>/dev/null || true)"
+    ;;
+  ranges)
+    COMMITS="$(git rev-list "${RANGES[@]}" 2>/dev/null || true)"
+    ;;
+  prepush)
+    collect_pre_push_stdin
+    ;;
+esac
+
+# Dedupe (a commit reachable from several refs/ranges is checked once).
+if [ -n "$COMMITS" ]; then
+  COMMITS="$(printf '%s\n' "$COMMITS" | sort -u)"
+fi
+
+# Nothing in scope => nothing to enforce.
+if [ -z "$COMMITS" ]; then
+  echo "heimdall-check-identities: no commits in scope — nothing to check." >&2
+  exit 0
+fi
+
+# ── check each commit's author + committer email against the allowlist ───────
+is_allowed() { # is_allowed <email>
+  printf '%s\n' "$ALLOWED_IDENTITIES" | grep -Fxq -- "$1"
+}
+
+total=0
+offenders=""
+while IFS= read -r sha; do
+  [ -n "$sha" ] || continue
+  total=$((total + 1))
+  # One git call per commit: author-email, committer-email, subject, NUL-joined
+  # so an email/subject containing spaces cannot split the fields.
+  line="$(git show -s --format='%ae%x1f%ce%x1f%s' "$sha")"
+  ae="${line%%$'\x1f'*}"
+  rest="${line#*$'\x1f'}"
+  ce="${rest%%$'\x1f'*}"
+  subj="${rest#*$'\x1f'}"
+  short="${sha:0:7}"
+  if ! is_allowed "$ae"; then
+    offenders="${offenders:+$offenders
+}${short}  author     ${ae}  ${subj}"
+  fi
+  if ! is_allowed "$ce"; then
+    offenders="${offenders:+$offenders
+}${short}  committer  ${ce}  ${subj}"
+  fi
+done <<EOF
+$COMMITS
+EOF
+
+if [ -n "$offenders" ]; then
+  {
+    echo "BLOCKED: non-allowlisted author/committer identity in the commits being checked."
+    echo "Every commit's author AND committer email must be one of:"
+    printf '%s\n' "$ALLOWED_IDENTITIES" | sed 's/^/  - /'
+    echo "Offending commits:"
+    printf '%s\n' "$offenders" | sed 's/^/  ✗ /'
+    echo ""
+    echo "Fix by rewriting the offending commits' identity, then re-push, e.g.:"
+    echo "  git rebase -i <base>          # 'edit' each offender, then:"
+    echo "  git commit --amend --reset-author --author='RJ <rj@runheimdall.dev>'"
+    echo "  git rebase --continue"
+    echo "or rewrite in bulk:"
+    echo "  git filter-repo --email-callback \\"
+    echo "    'return b\"rj@runheimdall.dev\" if email not in (b\"rj@runheimdall.dev\", b\"noreply@anthropic.com\") else email'"
+    echo ""
+    echo "Emergency bypass (verify manually first): HEIMDALL_SKIP_ID_GUARD=1 git push ..."
+  } >&2
+  exit 1
+fi
+
+echo "guard: identities=${total}/${total} allowlisted" >&2
+exit 0

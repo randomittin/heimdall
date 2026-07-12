@@ -33,7 +33,10 @@ set -euo pipefail
 
 # ── Config (edit if the repo's facts change) ─────────────────────────────────
 BRANCH="main"
-ALLOWED_IDENTITIES=("rj@runheimdall.dev" "noreply@anthropic.com")
+# The author/committer identity allowlist is NOT duplicated here — R9 (b) below
+# delegates to bin/heimdall-check-identities, the single source of truth shared
+# with the native pre-push hook, so the release gate and pre-push gate can never
+# drift apart. (See release/ship.sh R9 step 3(b).)
 
 # ── Output helpers (TTY-gated: plain when piped, no ANSI garbage in logs) ─────
 if [ -t 1 ]; then
@@ -294,19 +297,18 @@ R9_GL_RC=0
 [ "$R9_GL_RC" -eq 0 ] || die "R9: gitleaks found leaks in the pushed history (exit $R9_GL_RC)"
 ok "R9 gitleaks: clean"
 
-# (b) identity allowlist — every author+committer email must be allowed
-IDENTITIES="$( ( cd "$CLONE_DIR" && git log --all --format='%ae%n%ce' ) | sort -u | sed '/^$/d' )"
-BAD=""
-while IFS= read -r email; do
-  [ -z "$email" ] && continue
-  allowed=0
-  for a in "${ALLOWED_IDENTITIES[@]}"; do
-    if [ "$email" = "$a" ]; then allowed=1; break; fi
-  done
-  [ "$allowed" -eq 0 ] && BAD="$BAD $email"
-done <<< "$IDENTITIES"
-[ -z "$BAD" ] || die "R9: non-allowlisted identity in history:$BAD"
-ok "R9 identities: $(printf '%s' "$IDENTITIES" | tr '\n' ' ')"
+# (b) identity allowlist — every author+committer email must be allowed. This
+# delegates to bin/heimdall-check-identities, the SINGLE source of truth for the
+# allowlist check (the SAME script the native pre-push hook runs), so the release
+# gate and the pre-push gate can never disagree. It scans --all over the FRESH
+# clone. The escape hatch is intentionally NOT honored here: a release verify runs
+# with HEIMDALL_SKIP_ID_GUARD unset so R9 is unbypassable.
+IDCHECK="$REPO_ROOT/bin/heimdall-check-identities"
+[ -x "$IDCHECK" ] || die "R9: bin/heimdall-check-identities missing/not executable at $IDCHECK"
+if ! ( cd "$CLONE_DIR" && HEIMDALL_SKIP_ID_GUARD= "$IDCHECK" --all ); then
+  die "R9: non-allowlisted author/committer identity in pushed history (see above)"
+fi
+ok "R9 identities: all author+committer emails allowlisted"
 
 # (c) HEAD match
 CLONE_HEAD="$( cd "$CLONE_DIR" && git rev-parse HEAD )"
