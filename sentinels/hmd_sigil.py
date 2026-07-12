@@ -548,8 +548,8 @@ def _is_haid(seed):
     return bool(_HAID_RE.match(seed or ""))
 
 def hero_for(haid):
-    """The hero a HAID deterministically auto-assigns to: sha256(haid) mod 57 indexed
-    into the SORTED hero-name pool. Same HAID → same hero forever; roughly uniform
+    """The hero a HAID deterministically auto-assigns to: sha256(haid) mod len(HERO_ORDER)
+    indexed into the SORTED hero-name pool. Same HAID → same hero forever; roughly uniform
     across distinct HAIDs. This is the default sigil for any real HAID with no override."""
     idx = int(hashlib.sha256(haid.encode()).hexdigest(), 16) % len(HERO_ORDER)
     return HERO_ORDER[idx]
