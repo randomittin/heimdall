@@ -173,6 +173,52 @@ bump_default_ref() {
   ok "pinned install.sh DEFAULT_REF → $tag"
 }
 
+# write_version_file — mirror the manifest version into the repo-root VERSION file (a
+# single-source plain-text version other tooling/CI reads WITHOUT a JSON parser) and
+# `git add` it. Folded into the release commit so VERSION, plugin.json, and the README
+# badge never drift — test/version-unified.test.sh gates exactly this. Idempotent.
+write_version_file() {
+  local new="$1"
+  local file="${SHIP_VERSION_FILE:-${REPO_ROOT:-$PWD}/VERSION}"
+  printf '%s\n' "$new" > "$file" || { warn "write_version_file: could not write $file — skipping"; return 0; }
+  git add "$file" 2>/dev/null || true
+  ok "wrote VERSION → $new"
+}
+
+# bump_readme_badge — keep README's version badge in lock-step with the manifest so
+# test/version-unified.test.sh stays green across releases (a bumped manifest with a stale
+# badge is precisely the drift that gate catches). Rewrites `badge/version-X.Y.Z-` → $1 and
+# `git add`s it. Idempotent; a no-op (returns 0) if the file or the badge line is absent.
+bump_readme_badge() {
+  local new="$1"
+  local file="${SHIP_README:-${REPO_ROOT:-$PWD}/README.md}"
+  [ -f "$file" ] || { warn "bump_readme_badge: $file not found — skipping"; return 0; }
+  grep -Eq 'badge/version-[0-9]+\.[0-9]+\.[0-9]+-' "$file" || { warn "bump_readme_badge: no version badge in $file — skipping"; return 0; }
+  sed -E -i.bak "s#(badge/version-)[0-9]+\.[0-9]+\.[0-9]+(-)#\1${new}\2#g" "$file" \
+    && rm -f "$file.bak"
+  git add "$file" 2>/dev/null || true
+  ok "updated README version badge → $new"
+}
+
+# bump_readme_sha — SHA-pin README's install one-liner(s) to $1 (a 40-hex commit SHA) and
+# `git add` it. Tags are FORCE-MOVABLE; a full commit SHA is immutable, so a fresh
+# `curl|bash` fetches EXACTLY the reviewed bytes (supply-chain hardening). Rewrites EVERY
+# raw.githubusercontent .../install.sh ref (the one-liner AND the inspect-first fetch),
+# matching whatever ref is currently pinned (tag OR a prior SHA) → idempotent. No-op
+# (returns 0) if the file or a matching URL is absent so a layout change never blocks release.
+bump_readme_sha() {
+  local sha="$1"
+  local file="${SHIP_README:-${REPO_ROOT:-$PWD}/README.md}"
+  printf '%s' "$sha" | grep -Eq '^[0-9a-f]{40}$' || { warn "bump_readme_sha: '$sha' is not a 40-hex SHA — skipping"; return 0; }
+  [ -f "$file" ] || { warn "bump_readme_sha: $file not found — skipping"; return 0; }
+  grep -Eq 'raw\.githubusercontent\.com/randomittin/heimdall/[^/]+/install\.sh' "$file" \
+    || { warn "bump_readme_sha: no install URL in $file — skipping"; return 0; }
+  sed -E -i.bak "s#(raw\.githubusercontent\.com/randomittin/heimdall/)[^/]+(/install\.sh)#\1${sha}\2#g" "$file" \
+    && rm -f "$file.bak"
+  git add "$file" 2>/dev/null || true
+  ok "SHA-pinned README install URL → ${sha:0:12}…"
+}
+
 # Test/introspection seam: `SHIP_SOURCE_ONLY=1 . release/ship.sh` defines the functions above
 # (read_version, sign_release_artifact, …) WITHOUT running the release flow. Executed normally
 # the variable is unset and we fall through to the real pipeline below.
@@ -246,6 +292,15 @@ if [ "$CHECK_ONLY" -eq 0 ] && [ "$DO_BUMP" -eq 1 ]; then
   # reinstall fallback fetch this release, not a stale default (the historical v2.0.5 downgrade
   # bug). Folded into the release commit so main + the tag always carry a current default.
   bump_default_ref "$TAG"
+  # Single-source the version: mirror it into VERSION and re-sync the README badge so the
+  # release commit carries plugin.json == VERSION == README badge (test/version-unified.test.sh).
+  write_version_file "$NEW_VERSION"
+  bump_readme_badge "$NEW_VERSION"
+  # SHA-pin README's install one-liner to the CURRENT verified HEAD (tags are force-movable; a
+  # full commit SHA is immutable). That is the last R9-verified commit — the release commit has
+  # no SHA until AFTER this commit is made (chicken-and-egg), and pinning fresh installs to
+  # already-verified history is the safer supply-chain choice. Folded into the release commit.
+  bump_readme_sha "$(git rev-parse HEAD)"
   git commit --no-verify -q -m "chore(release): $TAG" || die "bump commit failed"
   ok "bumped $CUR_VERSION → $NEW_VERSION (commit $(git rev-parse --short HEAD))"
 elif [ "$DO_BUMP" -eq 0 ]; then
@@ -328,6 +383,8 @@ if [ -n "$TAG" ]; then
   git push origin "$TAG" || die "pushing tag $TAG failed"
   ok "tagged + pushed $TAG"
   if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+    # Real GH Release, never a silent no-op: create w/ auto-generated notes → sign install.sh →
+    # upload install.sh.minisig (die on release-create failure; gh-absent path WARNs loudly below).
     gh release create "$TAG" --generate-notes --title "$TAG" \
       || die "gh release create $TAG failed — tag is pushed; run: gh release create $TAG --generate-notes --title $TAG"
     ok "published GitHub Release $TAG — auto-update's releases/latest now advances"
