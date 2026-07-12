@@ -52,7 +52,10 @@ spec:
           # the runtime SA MUST hold roles/datastore.user + secretmanager.secretAccessor
           # on the mounted secrets (RUNBOOK §3.1). It does NOT need run.jobs.run — that is
           # the DISPATCHER's permission, not the executor's.
-          serviceAccountName: heimdall-cp-runtime@heimdall-cp-prod.iam.gserviceaccount.com
+          # PLACEHOLDER — fill <runtime-sa> + <project> with your project's runtime SA
+          # before `gcloud run jobs replace` (RUNBOOK §3.2). deploy-arch-b.sh warns if this
+          # is left unfilled; the SA name deploy-maintainer.sh derives is heimdall-cp-runtime.
+          serviceAccountName: <runtime-sa>@<project>.iam.gserviceaccount.com
           containers:
               # DIGEST-PINNED image carrying git + gh + the claude CLI on top of the
               # control-plane image. Replace with the resolved @sha256 digest.
