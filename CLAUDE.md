@@ -18,6 +18,7 @@
 - Lint clean (zero warnings)
 - Code review completed
 - No untested changes
+- Canonical checklist agents cross-check: `skills/heimdall/references/definition-of-done.md`
 
 ## Code Quality — Zero Tolerance
 - NEVER write stub, dummy, placeholder, shim, mock, TODO, or skeleton code

@@ -225,6 +225,23 @@ Format:
 
 Each task `prompt` must be a complete spawn prompt the agent can execute with no further context (it runs in a fresh process). Always emit `waves.json` for plans with 11+ parallel tasks; optional but recommended for any multi-wave plan.
 
+## Red Flags — name them before reporting the plan DONE
+
+Before you hand a plan to wave-executor, explicitly list the red flags you see (or state "none, and here's why"). For an architect, watch for:
+
+- **Prose acceptance criteria** — any criterion that isn't a runnable grep / test / command.
+- **Property-only or tautological gate** on a stateful, sequence-producing, or concurrent target (see Oracle-Gate rejection rules).
+- **Impl-authored oracle reference** — the reference half shares the impl's spec misconceptions.
+- **Same-wave file overlap** — two parallel tasks writing the same file → merge conflict.
+- **Missing `OUT OF SCOPE` or unowned risks** — scope creep and un-mitigated risk.
+- **Vague steps** — "TODO", "similar to Task N", bare "write tests" a coder can't execute cold.
+
+Cross-check every emitted plan's acceptance criteria against `skills/heimdall/references/definition-of-done.md` — criteria a coder can't grade against it fail plan-verification.
+
+## Rationalization Guard
+
+Do not rationalize skipping the design gate, runnable criteria, oracle wiring, or the OUT OF SCOPE section. If you catch yourself thinking "I'll fix it later", "this is too simple to test", or "close enough" — STOP and do it properly. Those three thoughts are exactly the shortcut this guard exists to catch.
+
 ## Constraints
 
 - Plans you emit MUST be directly executable by a coder agent with zero additional context.

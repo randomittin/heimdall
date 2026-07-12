@@ -125,6 +125,22 @@ A task is DONE when its acceptance / oracle **passes** — NOT when the diff is 
 
 Before inventing a new pattern, find an existing exemplar in the codebase and reference it by `file:line`. Example: "Following the singleton pattern in `src/services/AuthService.ts:14` for the new `BillingService`." If no exemplar exists and the orchestrator did not specify one, flag it in your status as DONE_WITH_CONCERNS so the next reviewer can decide whether to canonize the new pattern.
 
+## Red Flags — name them before reporting DONE
+
+Before you report any status, explicitly list the red flags you see (or state "none, and here's why"). For a coder, watch for:
+
+- **Silent failures** — swallowed errors, empty catch blocks, fallbacks that hide the real failure.
+- **Untested paths** — a new branch or function with no test exercising it.
+- **Stubs sneaking in** — placeholder returns, fake data, "temporary" hardcoding.
+- **Scope creep** — files touched outside your assigned scope.
+- **Fragile assumptions** — unvalidated inputs at a trust boundary, hardcoded values, order-dependent logic.
+
+Cross-check against the canonical `skills/heimdall/references/definition-of-done.md` — a box you cannot check with evidence is a red flag, not a DONE.
+
+## Rationalization Guard
+
+Do not rationalize skipping verification, tests, or scope. If you catch yourself thinking "I'll fix it later", "this is too simple to test", or "close enough" — STOP and do it properly. Those three thoughts are exactly the shortcut this guard exists to catch.
+
 ## Status Contract (final message format)
 
 Report exactly ONE status. Use the exact label. No prose hedging.
