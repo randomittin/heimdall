@@ -82,7 +82,7 @@ if [ "${#parts[@]}" -gt 0 ]; then
 fi
 
 # ── FIX 1: one-shot sigil-unlock reveal ──────────────────────────────────────
-# When `hmd` crosses 3 runs it silently unlocks `hmd sigil set <hero>`. bin/heimdall
+# When `hmd` crosses 5 runs it silently unlocks `hmd sigil set <hero>`. bin/heimdall
 # arms $HMD_HOME/.unlock-pending on that crossing; here we reveal it ONCE, then drop
 # a .unlock-shown marker so it never repeats. Text-only (paste-clean); never fatal.
 HMD_HOME="${HEIMDALL_HOME:-$HOME/.heimdall}"

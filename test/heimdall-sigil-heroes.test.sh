@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # heimdall-sigil-heroes.test.sh — the 57-hero custom pool + HAID auto-assign + the
-# unlock-after-3-runs CLI (`hmd sigil` / `hmd sigil set`).
+# unlock-after-5-runs CLI (`hmd sigil` / `hmd sigil set`).
 #
 # CONTRACT:
 #   1. LOAD    — 57 heroes, each a pixel-exact 8×8 grid whose every token has a palette
@@ -13,7 +13,7 @@
 #   3. ADDITIVE— short/toy seeds (rj, you, teammate-xyz, haid:alice) DO NOT auto-assign
 #                — they stay on the curated/animal path. batsy's pin wins; a hero NAME
 #                resolves to that hero.
-#   4. UNLOCK  — `hmd sigil set` refuses before 3 hmd runs, rejects an unknown name, and
+#   4. UNLOCK  — `hmd sigil set` refuses before 5 hmd runs, rejects an unknown name, and
 #                persists a valid override once unlocked; `hmd sigil` reports current +
 #                lock state.
 set -u
@@ -106,17 +106,22 @@ ok("explicit hero name resolves to that hero") if S._resolve_custom_spec("venom"
 
 echo "== 4) UNLOCK CLI: hmd sigil / hmd sigil set gate =="
 if [ -x "$HMD" ]; then
+  # Pin the run-count so the gate reads the .run-count file value EXACTLY. Inside a
+  # live hmd session HEIMDALL_RUN_COUNTED is already exported (bump is once-per-tree),
+  # so forcing it here makes the boundary deterministic regardless of the runner env:
+  # the file value IS the effective run-count. Threshold is 5.
+  export HEIMDALL_RUN_COUNTED=1
   H="$(mktemp -d)"
-  printf '0\n' > "$H/.run-count"                     # bumps to 1 (<3) → locked
+  printf '4\n' > "$H/.run-count"                     # run-count 4 (<5) → locked
   OUT="$(HEIMDALL_HOME="$H" "$HMD" sigil set venom 2>&1)"; RC=$?
-  { [ "$RC" -ne 0 ] && printf '%s' "$OUT" | grep -qi "unlocks after 3"; } \
-    && ok "set REFUSED before 3 runs (exit $RC)" || bad "set not refused before 3 (exit $RC): $OUT"
+  { [ "$RC" -ne 0 ] && printf '%s' "$OUT" | grep -qi "unlocks after 5"; } \
+    && ok "set REFUSED at run-count 4 (exit $RC)" || bad "set not refused at 4 (exit $RC): $OUT"
   [ ! -f "$H/sigil-choice" ] && ok "no override persisted while locked" || bad "override persisted while locked"
 
-  printf '5\n' > "$H/.run-count"                     # bumps to 6 (≥3) → unlocked
+  printf '5\n' > "$H/.run-count"                     # run-count 5 (≥5) → unlocked
   OUT="$(HEIMDALL_HOME="$H" "$HMD" sigil set venom 2>&1)"; RC=$?
   { [ "$RC" -eq 0 ] && [ "$(cat "$H/sigil-choice" 2>/dev/null)" = "venom" ]; } \
-    && ok "set SUCCEEDS after 3 runs, persists 'venom'" || bad "set failed after unlock (exit $RC): $OUT"
+    && ok "set SUCCEEDS at run-count 5, persists 'venom'" || bad "set failed after unlock (exit $RC): $OUT"
 
   printf '9\n' > "$H/.run-count"
   OUT="$(HEIMDALL_HOME="$H" "$HMD" sigil set batman 2>&1)"; RC=$?
