@@ -1294,43 +1294,6 @@ def sigil_accent_color(seed):
     return best if best is not None else glyph_color(seed)
 
 
-def sigil_silhouette(seed, size, color=None, caps=None):
-    """Render `seed`'s sigil at `size` ('S'/'M'/'L') as a SINGLE-HUE silhouette: every
-    ON pixel → `color`, every OFF pixel → the DIM block. Same shape as the full render,
-    one flat hue — for the statusline team-cluster S marks (4 cols × 2 text rows) where a
-    full multi-tone palette reads as mud (exactly why micro() recolors). `color` is a
-    '#rrggbb' hex or an (r,g,b) tuple; None keeps the seed's own hue (glyph_color).
-
-    The sigil_render() output path is BYTE-UNTOUCHED (goldens unmoved) — this is a
-    parallel single-hue projection over the SAME size grid (_custom_size_grid for heroes,
-    _size_grid for curated/animal), packed via the shared `_cell`. Returns a list of
-    text-row strings (size 'S' → 2 rows of 4 cells)."""
-    caps = caps or TC.detect()
-    if color is None:
-        over = glyph_color(seed)
-    elif isinstance(color, str):
-        over = _hex_rgb(color)
-    else:
-        over = tuple(color)
-    got = _custom_size_grid(seed, size)              # hero: authored token grid
-    if got is not None:
-        grid, _pal = got
-        on = lambda cell: cell != '.'
-    else:
-        grid, _hue, _eye = _size_grid(seed, size)    # curated / animal: value grid
-        on = lambda cell: cell != 0
-    N = len(grid)
-    lines = []
-    for tr in range(0, N, 2):
-        line = ""
-        for c in range(N):
-            top = over if on(grid[tr][c]) else DIM
-            bot = (over if on(grid[tr + 1][c]) else DIM) if tr + 1 < N else OFF
-            line += _cell(top, bot)
-        lines.append(line)
-    return caps.emit("\n".join(lines)).split("\n")
-
-
 # ── TEAM-MINI — a high-quality 4×4 (2 text-row) teammate silhouette ──────────────
 # The statusline team cluster gives each teammate a 4×4px mark (4 cols × 2 text rows): the
 # TOP text-row rides Row1, the BOTTOM rides Row2, the NAME sits under it on Row3. The
@@ -1348,7 +1311,7 @@ def sigil_silhouette(seed, size, color=None, caps=None):
 # to a cowl+ears silhouette with an eye band, hulk to a solid brow + eye band, ironman to
 # faceplate slits — recognizable, in the teammate's identity hue.
 #
-# DEDICATED PATH: sigil_render()/sigil_silhouette() are byte-UNTOUCHED (the S goldens and
+# DEDICATED PATH: sigil_render() is byte-UNTOUCHED (the S goldens and
 # heimdall-sigil-render stay byte-stable); team_mini is a parallel projection over the SAME
 # resolved 8×8 grid (custom_for for heroes, grid_for for curated/animal), packed via _cell.
 TEAM_MINI_W, TEAM_MINI_H = 4, 4   # 4×4 px → 4 cols × 2 `▄` text-rows
@@ -1356,7 +1319,7 @@ TEAM_MINI_W, TEAM_MINI_H = 4, 4   # 4×4 px → 4 cols × 2 `▄` text-rows
 def _team_mini_class_grid(seed):
     """The seed's 8×8 grid as an OFF/ON/EYE class per pixel. A hero classes its authored
     TOKEN grid ('.' → off, '2' → eye, else on); every other seed classes the composited
-    VALUE grid (0 → off, 2 → eye, else on) — mirroring how micro/sigil_silhouette resolve
+    VALUE grid (0 → off, 2 → eye, else on) — mirroring how micro resolves
     the grid, so team_mini never diverges from the seed's canonical silhouette."""
     got = custom_for(seed)
     if got is not None:
@@ -1477,35 +1440,80 @@ def micro(seed_or_hero, color=None, caps=None):
     return caps.emit(line)
 
 
-# ── TOP-HALF — the top 2 `▄` text-rows of the FULL 8×8 hero, in NATURAL colors ────
-# The statusline team rail shows each teammate as the recognizable TOP HALF of their
-# actual hero face (ears / brow / eyes) — NOT a single-hue recoloured block (micro's mud
-# at 4×2px). This is the top 4 pixel-rows = the top 2 text-rows of the size-'M' render, in
-# the hero's OWN authored palette, so akshat's hero-top and kai's hero-top look DIFFERENT
-# (distinct silhouettes AND distinct colors). 8 cols × 2 text-rows per teammate.
-def top_half(seed_or_hero, caps=None):
-    """The TOP HALF (top 4 pixel-rows = top 2 `▄` text-rows) of the seed's full 8×8 hero
-    sigil, rendered in the hero's OWN natural palette — NOT recoloured to a single hue.
+# ── EYE-STRIP — the EYE band of the FULL 8×8 hero (pixel rows 3–6), NATURAL colors ─
+# The statusline team rail shows each teammate as the recognizable EYE STRIP of their
+# actual hero face — the brow + EYES + upper cheek — NOT a single-hue recoloured block
+# (micro's mud at 4×2px) and NOT the top-of-head crop the old top_half() showed (pixel
+# rows 0–3 = hair/ears/cowl only → the eyes were BELOW the crop, invisible: the bug).
+#
+# The default crop is pixel ROWS 3–6 (4 px = 2 `▄` text-rows), 8 cells wide, in the hero's
+# OWN authored palette. But hero grids are hand-authored and the eye row varies per hero,
+# so the crop AUTO-CENTERS on the eyes (Spec v2 §4): find the grid row carrying the most
+# eye pixels (token '2' for a hero; value 2 for a curated/animal seed) and, when that eye
+# row falls OUTSIDE the default [3,6] window, shift the 4-px window so the eye row sits in
+# it (top = eye_row − 1, clamped to the grid 0–7 so it never runs off the edge). That
+# guarantees the eyes are inside the returned strip for EVERY hero. A face with no eye
+# pixel at all (e.g. joker) keeps the default rows 3–6 (there is nothing to center on).
+#
+# DEDICATED PATH: sigil_render()/the goldens are byte-UNTOUCHED — eye_strip is a parallel
+# crop over the SAME resolved 8×8 grid (custom_for for heroes, grid_for for curated/animal),
+# packed via the shared `_cell` (`▄`: fg = BOTTOM px, bg = TOP px). 8 cols × 2 text-rows.
+def _eye_strip_top(eye_count, default=3, win=4):
+    """The top grid-row of the 4-px eye-strip crop window, auto-centered on the eyes.
+    `eye_count[r]` = number of eye pixels in grid row r. Default window is rows
+    [default, default+win-1] (= 3–6). If the row with the most eyes is INSIDE that window
+    (or there are no eyes at all) the default is kept; otherwise the window shifts so the
+    eye row is one below its top (top = eye_row − 1), clamped to [0, W − win] so the crop
+    stays wholly on the grid."""
+    if max(eye_count) <= 0:
+        return default
+    # eye row = most eye pixels; ties break toward the row nearest the grid center (3.5)
+    eye_row = max(range(len(eye_count)), key=lambda r: (eye_count[r], -abs(r - 3.5)))
+    if default <= eye_row <= default + win - 1:
+        return default
+    return max(0, min(eye_row - 1, W - win))
 
-    This is exactly `sigil_render(seed_or_hero, 'M', caps)[:2]`: the SAME shared render
-    core every surface uses, so the M goldens / heimdall-sigil-render / heroes stay
-    byte-untouched (this only slices the first two of the four returned rows). Each row is
-    8 cells wide. `seed_or_hero` is any seed the sigil core resolves (hero NAME, real HAID →
-    its auto-assigned hero, pinned HAID, or a toy seed → its animal). Returns a list of
-    EXACTLY 2 text-row strings; degrades to two blank 8-cell rows on any fault (never
-    raises — the statusline must never error)."""
+def eye_strip(seed_or_hero, caps=None):
+    """The EYE STRIP of the seed's full 8×8 hero sigil — 2 `▄` text-rows (4 pixel-rows),
+    8 cells wide, in the hero's OWN natural palette, cropped so the EYES are visible.
+
+    Replaces top_half() (which cropped pixel rows 0–3 = the top of the head, leaving the
+    eyes below the crop). The crop is pixel rows 3–6 by default, auto-centered on the eye
+    row when a hero's eyes fall outside that window (see the section header + _eye_strip_top).
+
+    `seed_or_hero` is any seed the sigil core resolves (hero NAME, real HAID → its
+    auto-assigned hero, pinned HAID, or a toy seed → its animal). Returns a list of EXACTLY
+    2 text-row strings, tier-downgraded through `caps` in one pass (truecolor NO-OP · 256
+    LUT · 16 · mono); degrades to two blank 8-cell rows on any fault (never raises — the
+    statusline must never error)."""
     caps = caps or TC.detect()
     blank = caps.emit(" " * W)
     try:
-        rows = sigil_render(seed_or_hero, 'M', caps)
+        got = custom_for(seed_or_hero)
+        if got is not None:                              # hero: authored token grid + palette
+            grid, pal = got
+            pxfn = lambda r, c: pal.get(grid[r][c], pal['.'])
+            eye_count = [sum(1 for c in range(W) if grid[r][c] == '2') for r in range(W)]
+        else:                                            # curated / animal: value grid
+            grid, hue, eye = grid_for(seed_or_hero)
+            pxfn = lambda r, c: cell_color(grid[r][c], hue, eye)
+            eye_count = [sum(1 for c in range(W) if grid[r][c] == 2) for r in range(W)]
     except Exception:
         return [blank, blank]
-    if not rows:
-        return [blank, blank]
-    rows = list(rows[:2])
-    while len(rows) < 2:
-        rows.append(blank)
-    return rows
+    top = _eye_strip_top(eye_count)                      # 4-px window top row, eye-centered
+    lines = []
+    for tr in (top, top + 2):                            # two text-rows: (top,top+1),(top+2,top+3)
+        line = ""
+        for c in range(W):
+            line += _cell(pxfn(tr, c), pxfn(tr + 1, c))  # ▄: bg = TOP px, fg = BOTTOM px
+        lines.append(line)
+    return caps.emit("\n".join(lines)).split("\n")
+
+# BACK-COMPAT ALIAS — top_half is the old teammate-render entry point still called by
+# sentinels/hmd-statusline.py (:743) + test/heimdall-statusline-fullbleed.test.sh. It now
+# resolves to eye_strip so the statusline immediately shows EYES (same signature, same
+# 2-row × 8-cell shape). The caller migration to eye_strip is the integration agent's job.
+top_half = eye_strip
 
 
 def _sq(rgb, n, caps):

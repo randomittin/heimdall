@@ -1,41 +1,46 @@
 #!/usr/bin/env python3
 """
-hmd_gauge.py — the Row2 full-bleed context gauge for the Heimdall statusline.
+hmd_gauge.py — Spec v2 gauges for the Heimdall statusline.
 
-A single text row spanning EXACTLY `width` visible cells: a run of
-background-colored space cells forming a horizontal bar, with two fg labels
-spliced INSIDE the bar (col 2 and right-aligned). The filled region carries a
-24-bit background RAMP dark->bright; the empty track is a dim alternating
-stripe. Two label strings sit over the bar preserving each cell's background:
+Two renderers live here, both leaf-standalone (import only hmd_termcaps + stdlib):
 
-  left  (over the fill, white bold) : `CTX <pct>% · ↓<tokens>`
-  right (over the track, faint)     : `7d <pct>% · $<cost> · <dur>`
+1. render_gauge  — Row 2 "context gauge" (Spec v2 §2). ONE text row of EXACTLY
+   `width` visible cells: a run of background-coloured space cells forming a
+   horizontal bar with two fg labels spliced INSIDE it.
+
+     • Blue shader: the FILLED region carries a per-cell 24-bit background ramp
+       #1E2F73 → #4264FF → #5AD7E6 (deep indigo → brand blue → cyan), interpolated
+       per filled cell. At used ≥70% the TIP cell(s) remap to gold #FFCB57; at
+       ≥90% the tip remaps to red #FF6B6B — tip-only, the rest of the fill keeps
+       its identity ramp (never an all-gold / all-red bar).
+     • Track (unfilled): alternating #181B24 / #14161E cells.
+     • Inside-left label (over the fill, white bold): `CTX <pct>% · ↓<tokens>`
+       (tokens humanized 708000→708k, 1200000→1.2M).
+     • Inside-right label (over the track end, faint): `$<cost>` (`$%.2f`). If the
+       fill overruns into the right-label cells, that label's fg flips to dark ink
+       #0B0C10 for contrast against the bright fill.
+     • Width degrade: bar <32c drops `↓tokens`; <26c drops `$cost`.
+
+2. render_micro_gauge — Row 4 "limit micro-gauge" (Spec v2 §2). A small labelled
+   rate-limit bar: `<label> <bar> <pct>%` + optional `·<N>h` reset (faint). The
+   bar is EXACTLY `width` cells (12c full / 8c mid). The fill ramps from its own
+   `hue` (5h cyan #5AD7E6, 7d gold #FFCB57 — passed in) and follows the SAME tip
+   rule as the main gauge: gold ≥70 → red ≥90. `micro_text(label, pct, reset_h)`
+   is the plain-text (narrow-tier) form; `pct=None` yields the bare label only
+   (never a fabricated `0%`).
 
 Build-once / downgrade-once
 ---------------------------
-Like hmd-statusline.py, the row is BUILT in 24-bit truecolor + full unicode and
-then handed to `caps.emit()`, which rewrites every standalone `48;2`/`38;2` SGR
-to the detected tier (256 / 16) or strips it (mono) in a single pass. Because
-`caps.emit`'s rewriter matches ONLY standalone `\\033[(38|48);2;r;g;bm`
-sequences, each colour is emitted as its own escape (never combined into one
-multi-parameter SGR) so the tier downgrade always fires. On a mono / no-colour
-tier the coloured cell path is skipped entirely in favour of a plain ASCII
-proportional bar `[####----]` — never a stripped run of blank spaces.
+Each colour is emitted as its OWN standalone `\\033[48;2;r;g;bm` / `\\033[38;2;…m`
+escape (never combined into one multi-parameter SGR) so hmd_termcaps.Caps.emit()
+— whose rewriter matches ONLY standalone true-colour SGRs — always downgrades
+truecolor → 256 (`48;5;N`) → 16 (nearest bright) → mono (stripped). On a mono /
+no-colour tier the main gauge degrades to a plain ASCII proportional bar
+`[####----]` and the micro-gauge to its plain `micro_text` form.
 
-ANSI budget
------------
-The ramp is QUANTIZED: a new ramp colour is chosen only every
-`ceil(width/40)` cells, capping distinct ramp SGRs at ~40 per row regardless of
-width. A background SGR is emitted only when the cell background actually
-changes from the previous cell, and foreground SGRs only bracket the label
-glyphs — so a full-width row stays well under the escape-byte budget.
-
-Standalone, exit-safe: imports only hmd_termcaps (for the tier downgrade) and
-the stdlib. No import into hmd-statusline.py — no cycle. `render_gauge` never
-raises for any input; it degrades to the ASCII bar on any unexpected state.
+Neither renderer ever raises for any input; both degrade defensively.
 """
 import os
-import math
 import contextlib
 import importlib.util
 
@@ -47,13 +52,13 @@ _tcspec = importlib.util.spec_from_file_location(
 TC = importlib.util.module_from_spec(_tcspec)
 _tcspec.loader.exec_module(TC)
 
-# ── ramp anchors (24-bit RGB) ────────────────────────────────────────────────
+# ── blue-shader ramp anchors (24-bit RGB) ────────────────────────────────────
 # The base ramp fills the WHOLE bar: #1E2F73 -> #4264FF -> #5AD7E6 (deep indigo ->
-# brand blue -> cyan) by default, or dark->accent->bright derived from base_hue (the
-# user's OWN sigil VIVID accent, sigil_accent_color) so the bar reads in the sigil's
-# identity hue. The danger warning does NOT remap the whole ramp — it tints ONLY the
-# last ~TIP_CELLS filled cells (the tip) toward gold (>=70) / red (>=90) as a per-cell
-# blend, so e.g. batsy at 81% is MOSTLY BLUE with a small gold tip (not an all-gold bar).
+# brand blue -> cyan) by default, or dark->hue->bright derived from a supplied base
+# hue (the user's OWN sigil accent) so the bar reads in that identity hue. The gold
+# (>=70) / red (>=90) danger warning does NOT remap the whole ramp — it remaps ONLY
+# the last TIP_CELLS filled cells (the tip), so e.g. 81% is MOSTLY BLUE with a small
+# gold tip (never an all-gold bar).
 DARK = (0x1E, 0x2F, 0x73)   # #1E2F73
 BLUE = (0x42, 0x64, 0xFF)   # #4264FF
 CYAN = (0x5A, 0xD7, 0xE6)   # #5AD7E6
@@ -66,18 +71,24 @@ _TRACK_BGS = (TRACK_A, TRACK_B)
 
 # label foregrounds
 FG_WHITE = (0xFF, 0xFF, 0xFF)   # left label, bold
-FG_FAINT = (0x9A, 0xA4, 0xB2)   # right label, faint gray (#9AA4B2)
+FG_FAINT = (0x9A, 0xA4, 0xB2)   # right label / micro readout, faint gray (#9AA4B2)
+FG_INK = (0x0B, 0x0C, 0x10)     # right label over fill — dark ink for contrast
+FG_TRACK = (0x3A, 0x3F, 0x49)   # micro-gauge empty ░ cells — ghost gray (#3A3F49)
 
 # thresholds
 GOLD_AT = 70
 RED_AT = 90
-TIP_CELLS = 3          # danger tints ONLY the last ~3 filled cells (the bar tip)
+TIP_CELLS = 2          # danger remaps ONLY the last TIP_CELLS filled cells (the tip)
 
-# splice geometry / tier gates
-_LEFT_COL = 2          # left label begins at cell index 2
-_RIGHT_PAD = 2         # right label ends `_RIGHT_PAD` cells before the edge
-_MIN_LABELS = 40       # width < this  -> bar only, no labels
-_MIN_RIGHT = 60        # width < this  -> drop the right label
+# main-gauge splice geometry / width-degrade gates
+_LEFT_COL = 1          # left label begins at cell index 1
+_RIGHT_PAD = 1         # right label ends `_RIGHT_PAD` cells before the edge
+_DROP_TOKENS = 32      # bar width < this -> drop `↓tokens` from the left label
+_DROP_COST = 26        # bar width < this -> drop the `$cost` right label
+
+# micro-gauge glyphs
+_FILL_GLYPH = "▓"
+_TRACK_GLYPH = "░"
 
 _MIDDOT = "·"     # ·  (downgrades to '.' on ascii tier)
 _ARROW = "↓"      # ↓  (downgrades to 'v' on basic/ascii tier)
@@ -141,10 +152,9 @@ def _lerp(a, b, t):
 
 def ramp_anchors(base_hue):
     """The three ramp endpoints (dark, mid, bright). base_hue None → the literal
-    #1E2F73 → #4264FF → #5AD7E6 default (byte-identical to the pre-hue ramp). A given
-    base_hue (the user's OWN sigil dominant RGB) derives the ramp from THAT hue: a deep
-    variant (hue toward black) → the hue itself → a bright variant (hue toward white),
-    all by RGB lerp. The gold (>=70) / red (>=90) danger tips stay hue-independent."""
+    #1E2F73 → #4264FF → #5AD7E6 blue shader. A given base_hue (an RGB triple)
+    derives the ramp from THAT hue: a deep variant (toward black) → the hue → a
+    bright variant (toward white). The gold/red danger tips stay hue-independent."""
     if base_hue is None:
         return DARK, BLUE, CYAN
     h = (int(base_hue[0]), int(base_hue[1]), int(base_hue[2]))
@@ -155,9 +165,8 @@ def ramp_anchors(base_hue):
 
 def base_ramp_color(t, base_hue=None):
     """Fill colour at fraction t in [0,1] on the BASE ramp: a 3-stop dark->mid->bright
-    gradient derived from base_hue (default indigo->blue->cyan). NO danger remap — the
-    whole bar carries this ramp; the gold/red danger warning is applied per-cell at the
-    TIP only (see _build_cells), so the sigil's identity hue is never hidden."""
+    gradient (default indigo->blue->cyan). NO danger remap — the whole bar carries
+    this ramp; the gold/red tip warning is applied per-cell at the TIP only."""
     dark, mid, bright = ramp_anchors(base_hue)
     if t <= 0.5:
         return _lerp(dark, mid, t / 0.5)
@@ -165,8 +174,8 @@ def base_ramp_color(t, base_hue=None):
 
 
 def danger_color(pct):
-    """The tip danger tint for a usage percentage: gold at >=70, red at >=90, else None
-    (no danger — the bar stays its base ramp). Hue-independent (a danger signal)."""
+    """The tip danger tint for a usage percentage: gold at >=70, red at >=90, else
+    None (no danger — the bar stays its base ramp). Hue-independent (a signal)."""
     if pct >= RED_AT:
         return RED
     if pct >= GOLD_AT:
@@ -175,9 +184,8 @@ def danger_color(pct):
 
 
 def ramp_color(t, pct, base_hue=None):
-    """Back-compat shim: the base ramp colour at t (the danger tint is now applied at the
-    tip only, in _build_cells, not by remapping the whole ramp). Retained so any external
-    caller keeps working; the gauge itself builds cells via base_ramp_color + danger."""
+    """Back-compat shim: the base ramp colour at t (the danger tint is applied at the
+    tip only, in _build_cells). Retained so any external caller keeps working."""
     return base_ramp_color(t, base_hue)
 
 
@@ -219,6 +227,20 @@ def _splice(cells, start, text, fg, bold):
             cells[j][3] = bold
 
 
+def _splice_right(cells, start, text, fill):
+    """Splice the right label with a PER-CELL fg: FG_INK (dark ink) for any cell
+    that sits over the fill (j < fill), else FG_FAINT. This is the fill-overrun
+    contrast flip from Spec v2 §2 — the bright shader would swallow a faint label,
+    so the overlapped glyphs go dark-on-bright while the rest stay faint-on-track."""
+    n = len(cells)
+    for i, ch in enumerate(text):
+        j = start + i
+        if 0 <= j < n:
+            cells[j][1] = ch
+            cells[j][2] = FG_INK if j < fill else FG_FAINT
+            cells[j][3] = False
+
+
 def _serialize(cells):
     """Cell array -> ANSI string. A background SGR fires only when the bg
     changes; fg/bold SGRs only bracket label glyphs. Trailing reset."""
@@ -241,63 +263,42 @@ def _serialize(cells):
 
 def _build_cells(width, pct, base_hue=None):
     """A `width`-long cell array: [bg_rgb, char, fg_rgb_or_None, bold_bool].
-    Filled cells carry the quantized BASE ramp (dark->accent->bright, tinted from
-    base_hue); the tip cell is forced to the ramp endpoint. The danger warning tints ONLY
-    the last `TIP_CELLS` filled cells toward gold (pct>=70) / red (pct>=90) as a per-cell
-    blend that is strongest (full danger) at the very tip and fades to the base ramp
-    inward — so the bar stays the sigil's identity hue with a small danger tip, never an
-    all-gold/all-red bar. Empty cells carry the alternating track stripe."""
+    Filled cells carry the per-cell BASE ramp (dark->mid->bright, from base_hue).
+    The danger warning REMAPS the last `TIP_CELLS` filled cells to gold (pct>=70) /
+    red (pct>=90) — tip-only, so the bar stays its identity hue with a small danger
+    tip, never an all-gold/all-red bar. Empty cells carry the alternating track."""
     fill = _fill_count(width, pct)
-    step = max(1, math.ceil(width / 40.0))
     denom = max(1, fill - 1)
     danger = danger_color(pct)
     cells = []
     for i in range(width):
         if i < fill:
-            # quantize to `step`-cell blocks; force the tip to the endpoint.
-            qi = fill - 1 if i == fill - 1 else (i // step) * step
-            bg = base_ramp_color(qi / denom, base_hue)
-            if danger is not None:
-                dist = (fill - 1) - i               # 0 at the very tip
-                if dist < TIP_CELLS:
-                    # blend 1.0 at the tip → 1/TIP_CELLS one cell before the fade edge.
-                    blend = (TIP_CELLS - dist) / float(TIP_CELLS)
-                    bg = _lerp(bg, danger, blend)
+            bg = base_ramp_color(i / denom, base_hue)   # per-cell interpolation
+            if danger is not None and (fill - 1 - i) < TIP_CELLS:
+                bg = danger                             # tip-only remap
         else:
             bg = _TRACK_BGS[i % 2]
         cells.append([bg, " ", None, False])
     return cells
 
 
-def render_gauge(width, used_pct, tokens, five_hour_pct, seven_day_pct, cost_usd,
-                 duration_ms, caps, ctx_pct=None, base_hue=None, labels=True):
-    """Render the Row2 context gauge as ONE row of EXACTLY `width` visible cells.
+def render_gauge(width, used_pct, tokens, cost_usd, caps, base_hue=None, labels=True):
+    """Render the Row 2 context gauge as ONE row of EXACTLY `width` visible cells.
 
-    width         : total visible cell count of the row
-    used_pct      : context-window used percentage — drives the FILL (None -> 0 fill)
-                    and the left `CTX <pct>%` label
-    tokens        : input token count (humanized in the left label)
-    five_hour_pct : rate_limits.five_hour.used_percentage — the 5-hour SESSION limit,
-                    shown in the right readout as `5h <n>%` (omitted if None)
-    seven_day_pct : rate_limits.seven_day.used_percentage (omitted if None)
-    cost_usd      : session cost (right label, `$%.2f`)
-    duration_ms   : session duration (right label, `1h04m`/`12m30s`)
-    caps          : hmd_termcaps.Caps — drives the tier downgrade at emit time
-    ctx_pct       : context % echoed in the RIGHT readout as `ctx <n>%` (None omits it;
-                    the caller passes it only at the widest tier where the readout
-                    shows). The right readout reads `ctx <n>% · 5h <n>% · 7d <n>% ·
-                    $<cost> · <dur>`, each part OMITTED when its source is absent
-                    (never a fabricated `0%`).
-    base_hue      : the user's OWN sigil dominant RGB (hmd_sigil.glyph_color(seed)). The
-                    dark->hue->bright fill ramp is derived from it; None → the default
-                    indigo->blue->cyan. Gold/red danger tips (>=70/>=90) stay hue-independent.
-    labels        : when False the bar is rendered CLEAN — the fill/track bg ramp only,
-                    with NO CTX/token/dual-limit text spliced over it (the statusline's
-                    Row2 gauge; the metrics render on their own row). Default True keeps
-                    the labelled bar for any external caller.
+    width     : bar width (the statusline clamps 24–40c; this fn honours what it
+                is given and always emits exactly that many visible cells).
+    used_pct  : context-window used percentage — drives the FILL (None -> 0 fill)
+                and the left `CTX <pct>%` label.
+    tokens    : input token count (humanized in the left label as `↓<tokens>`).
+    cost_usd  : session cost (right label, `$%.2f`; None omits it).
+    caps      : hmd_termcaps.Caps — drives the tier downgrade at emit time.
+    base_hue  : optional RGB triple for the fill ramp (the user's OWN sigil accent);
+                None -> the default blue shader #1E2F73→#4264FF→#5AD7E6. Gold/red
+                danger tips (>=70/>=90) stay hue-independent.
+    labels    : when False the bar renders CLEAN (fill/track ramp only, no text).
 
-    Returns a tier-appropriate string: truecolor bg ramp downgraded to 256/16,
-    or a plain ASCII proportional bar on a mono tier. Never raises.
+    Returns a tier-appropriate string: truecolor bg ramp downgraded to 256/16, or a
+    plain ASCII proportional bar on a mono tier. Never raises.
     """
     try:
         try:
@@ -316,41 +317,29 @@ def render_gauge(width, used_pct, tokens, five_hour_pct, seven_day_pct, cost_usd
             return _ascii_bar(width, pct)
 
         cells = _build_cells(width, pct, base_hue)
+        fill = _fill_count(width, pct)
 
-        # ── labels (suppressed entirely when labels=False, or on the narrowest tier) ──
-        if labels and width >= _MIN_LABELS:
-            # left label over the fill, white bold
+        if labels:
+            # ── inside-left label over the fill, white bold ──
             left = "CTX %d%%" % _pct_int(pct)
-            tok = humanize_tokens(tokens)
-            if tok:
-                left += " %s %s%s" % (_MIDDOT, _ARROW, tok)
+            if width >= _DROP_TOKENS:
+                tok = humanize_tokens(tokens)
+                if tok:
+                    left += " %s %s%s" % (_MIDDOT, _ARROW, tok)
             left = left[:max(0, width - _LEFT_COL)]
             left_end = _LEFT_COL + len(left)
             _splice(cells, _LEFT_COL, left, FG_WHITE, True)
 
-            # right label over the track end, faint — dropped when too narrow. A dual
-            # limits readout: context % AND the 5-hour session limit %, then 7d/cost/dur.
-            if width >= _MIN_RIGHT:
-                right_parts = []
-                if ctx_pct is not None:
-                    right_parts.append("ctx %d%%" % _pct_int(ctx_pct))
-                if five_hour_pct is not None:
-                    right_parts.append("5h %d%%" % _pct_int(five_hour_pct))
-                if seven_day_pct is not None:
-                    right_parts.append("7d %d%%" % _pct_int(seven_day_pct))
-                if cost_usd is not None:
-                    with contextlib.suppress(TypeError, ValueError):
-                        right_parts.append("$%.2f" % float(cost_usd))
-                dur = humanize_duration(duration_ms)
-                if dur:
-                    right_parts.append(dur)
-                right = (" %s " % _MIDDOT).join(right_parts)
+            # ── inside-right label over the track end, faint (fg flips over fill) ──
+            if width >= _DROP_COST and cost_usd is not None:
+                right = ""
+                with contextlib.suppress(TypeError, ValueError):
+                    right = "$%.2f" % float(cost_usd)
                 if right:
                     start = width - len(right) - _RIGHT_PAD
-                    # never overlap the left label; drop the right label if it
-                    # would collide on a cramped bar.
+                    # never overlap the left label; drop it if it would collide.
                     if start >= left_end:
-                        _splice(cells, start, right, FG_FAINT, False)
+                        _splice_right(cells, start, right, fill)
 
         row = _serialize(cells)
         # single tier-downgrade pass (truecolor+full = byte-identical no-op).
@@ -363,11 +352,107 @@ def render_gauge(width, used_pct, tokens, five_hour_pct, seven_day_pct, cost_usd
             return ""
 
 
+# ── Row 4 limit micro-gauge ───────────────────────────────────────────────────
+def micro_text(label, pct=None, reset_h=None):
+    """Plain-text (narrow-tier) form of a limit micro-gauge:
+
+        micro_text("5h", 28, 3)     -> "5h 28% ·3h"
+        micro_text("7d", 41)        -> "7d 41%"
+        micro_text("5h")            -> "5h"          (pct=None -> label only)
+
+    `pct=None` yields the bare label — never a fabricated `0%` (Spec v2 §2). A
+    reset (hours) is appended as ` ·<N>h` when supplied."""
+    label = str(label)
+    if pct is None:
+        return label
+    s = "%s %d%%" % (label, _pct_int(pct))
+    if reset_h is not None:
+        with contextlib.suppress(TypeError, ValueError):
+            s += " %s%dh" % (_MIDDOT, int(reset_h))
+    return s
+
+
+def render_micro_gauge(width, hue, pct, caps, label, reset_h=None):
+    """Render a Row 4 rate-limit micro-gauge: `<label> <bar> <pct>%` + optional
+    `·<N>h` reset, where the bar is EXACTLY `width` visible cells of `▓` (fill) /
+    `░` (track).
+
+    width    : bar cell count (12c full / 8c mid).
+    hue      : fill RGB — 5h cyan #5AD7E6, 7d gold #FFCB57 (caller-supplied). The
+               fill ramps dark(hue)->hue->bright(hue) and, per the SAME rule as the
+               main gauge, remaps its tip to gold (>=70) / red (>=90).
+    pct      : used percentage. None -> bare label only (never a fabricated `0%`).
+    caps     : hmd_termcaps.Caps — tier downgrade at emit time.
+    label    : leading tag (`5h` / `7d`).
+    reset_h  : optional reset hours -> ` ·<N>h` faint suffix.
+
+    On a mono / no-colour tier (or width<=0) returns the plain `micro_text` form.
+    Never raises.
+    """
+    try:
+        try:
+            width = int(width)
+        except (TypeError, ValueError):
+            width = 0
+
+        # pct absent -> bare label only (never a fabricated 0%).
+        if pct is None:
+            s = micro_text(label, None, reset_h)
+            return caps.emit(s) if caps is not None else s
+
+        p = float(pct)
+        if p < 0.0:
+            p = 0.0
+
+        # mono / no-colour / degenerate width -> plain text.
+        if caps is None or not caps.use_color() or width <= 0:
+            return micro_text(label, pct, reset_h)
+
+        fill = _fill_count(width, p)
+        denom = max(1, fill - 1)
+        danger = danger_color(p)
+
+        out = [_fg(FG_FAINT), str(label), " "]
+        prev_fg = FG_FAINT
+        for i in range(width):
+            if i < fill:
+                col = base_ramp_color(i / denom, hue)
+                if danger is not None and (fill - 1 - i) < TIP_CELLS:
+                    col = danger
+                glyph = _FILL_GLYPH
+            else:
+                col = FG_TRACK
+                glyph = _TRACK_GLYPH
+            if col != prev_fg:
+                out.append(_fg(col))
+                prev_fg = col
+            out.append(glyph)
+
+        tail = " %d%%" % _pct_int(p)
+        if reset_h is not None:
+            with contextlib.suppress(TypeError, ValueError):
+                tail += " %s%dh" % (_MIDDOT, int(reset_h))
+        if prev_fg != FG_FAINT:
+            out.append(_fg(FG_FAINT))
+        out.append(tail)
+        out.append("\033[0m")
+        return caps.emit("".join(out))
+    except Exception:
+        with contextlib.suppress(Exception):
+            return micro_text(label, pct, reset_h)
+        return ""
+
+
 if __name__ == "__main__":
     import sys
     caps = TC.detect(sys.argv)
-    w = 80
+    w = 40
     for a in sys.argv[1:]:
         if a.isdigit():
             w = int(a)
-    print(render_gauge(w, 42, 708000, 55, 12, 0.87, 3_840_000, caps, ctx_pct=42))
+    print(render_gauge(w, 71, 708000, 4.12, caps))
+    print(render_gauge(w, 81, 708000, 4.12, caps))
+    print(render_gauge(w, 93, 708000, 4.12, caps))
+    print(render_micro_gauge(12, CYAN, 28, caps, "5h", reset_h=3), "  ",
+          render_micro_gauge(12, GOLD, 41, caps, "7d"))
+    print(micro_text("5h", 28, 3), "|", micro_text("7d", 41), "|", micro_text("5h"))
