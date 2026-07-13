@@ -253,6 +253,73 @@ def compose_with_sigil(sigil_rows, content_rows, cols, gutter=2, unicode_tier=FU
     return out
 
 
+# ── team-first zone allocation (Spec v2 §2 — THE anti-truncation rule) ──────────
+# Spec v2 §6 team-zone geometry: each teammate is a fixed 15-cell column (an 8-cell
+# eye-strip + a 1-cell gap + a 6-cell name/state label) and adjacent members are
+# separated by a 2-cell gap. @full 3 members = 3×15 + 2×2 = 49c.
+TEAM_MEMBER_W = 15        # per-member column width (8c strip + 1c gap + 6c label)
+TEAM_MEMBER_GAP = 2       # blank cells between adjacent member columns
+TEAM_STRIP_W = 8          # the eye-strip is 8 cells (rides the RIGHT of the column)
+ROWS_GAP = 2              # blank cells between the rows-zone and the team zone
+GAUGE_MIN_W = 24          # Spec v2 §2 — the Row2 gauge never shrinks below this
+GAUGE_MAX_W = 40          # Spec v2 §2 — the Row2 gauge never grows beyond this
+
+
+def team_zone_alloc(cols, n_members, overflow=0, sigil_w=8, sigil_gap=1,
+                    member_w=TEAM_MEMBER_W, member_gap=TEAM_MEMBER_GAP,
+                    rows_gap=ROWS_GAP, gauge_min=GAUGE_MIN_W):
+    """Spec v2 §2 zone allocation — the ORDER SWAP that fixes the truncation bug.
+
+    The team zone is reserved FIRST from the RIGHT edge (before the gauge is sized),
+    so a teammate eye-strip can NEVER be truncated. The rows zone (identity / gauge /
+    gates / micro-gauges) takes whatever is left, and the gauge is the only flexible
+    element in it (clamped 24–40c by the caller). Team members are packed greedily and
+    CAPPED so the gauge keeps at least `gauge_min` cells; the first member that would
+    breach that floor — and every one after it — folds into the `+N` overflow tag.
+
+    Geometry: `sigil_w + sigil_gap` fixed on the left (9c), then the rows zone, then a
+    `rows_gap`, then the team zone flush to the right edge. Exactly:
+        sigil_w + sigil_gap + rows_zone_w + rows_gap + team_w == cols   (team present)
+        sigil_w + sigil_gap + rows_zone_w                     == cols   (solo)
+
+    Returns (rows_zone_w, team_w, shown_n, overflow_out, rows_gap_used):
+      rows_zone_w   — cells for the identity/gauge/gates/micro content (>= 0)
+      team_w        — cells reserved for the team zone (0 when solo / no room)
+      shown_n       — teammates that actually fit (the rest → overflow_out)
+      overflow_out  — the final `+N` count (dropped members + the input overflow)
+      rows_gap_used — the gap between the two zones (0 when there is no team zone)
+    """
+    cols = max(0, int(cols))
+    inner = max(0, cols - sigil_w - sigil_gap)          # everything right of the sigil (= cols-9)
+    if n_members <= 0 or inner <= 0:
+        return inner, 0, 0, max(0, int(overflow)), 0
+
+    team_budget = inner - gauge_min - rows_gap          # widest the team zone may take
+    if team_budget < member_w:
+        return inner, 0, 0, int(overflow) + n_members, 0   # not even one member fits → solo
+
+    shown = 0
+    used = 0
+    of = int(overflow)
+    for i in range(n_members):
+        piece = member_w + (member_gap if shown else 0)
+        rest = of + (n_members - i - 1)                 # members that would remain unshown
+        tag_w = len(" +%d" % rest) if rest > 0 else 0   # reserve room for the eventual +N tag
+        if used + piece + tag_w <= team_budget:
+            shown += 1
+            used += piece
+        else:
+            of = of + (n_members - i)                   # drop this + all remaining → +N
+            break
+    if shown == 0:
+        return inner, 0, 0, of, 0
+
+    tag = (" +%d" % of) if of > 0 else ""               # ASCII → len == visible width
+    team_w = used + len(tag)
+    rows_zone_w = inner - team_w - rows_gap
+    return rows_zone_w, team_w, shown, of, rows_gap
+
+
 # ── width tiers ────────────────────────────────────────────────────────────────
 def width_tier(cols):
     """Classify a column count into a layout tier so the assembler can drop segments:
