@@ -707,29 +707,6 @@ def gate_cells(gates, colored=True):
         out.append(f"{col}{glyph}{X}" if colored else glyph)
     return (f"{FAINT}·{X}".join(out) if colored else "·".join(out))
 
-def perm_mode(data):
-    """The permission-mode indicator. CC does NOT pass permission mode on statusLine
-    stdin today (descoped) — probe the stdin fields, then a bounded transcript tail,
-    then OMIT (never fabricated). Returns '' when no signal exists."""
-    for k in ("permission_mode", "permissionMode", "permission"):
-        v = data.get(k)
-        if isinstance(v, str) and v.strip():
-            return v.strip()
-    tp = data.get("transcript_path") or data.get("transcriptPath")
-    if isinstance(tp, str) and tp:
-        try:
-            with open(tp, "rb") as f:
-                f.seek(0, os.SEEK_END)
-                size = f.tell()
-                f.seek(max(0, size - 4096))
-                tail = f.read().decode("utf-8", "replace")
-            m = re.findall(r'"permission[_A-Za-z]*"\s*:\s*"([A-Za-z]+)"', tail)
-            if m:
-                return m[-1]
-        except Exception:
-            return ""
-    return ""
-
 def subagent_ghost(agents):
     """A faint right-rail ghost naming the busiest live subagent (the most recently
     started) + the active count. '' when no subagent is live."""
@@ -863,13 +840,12 @@ def main():
                                base_hue=sig_hue, labels=False)
     row2 = LAYOUT.left_right(gauge, t_bot, gw) if rail_w > 0 else gauge
 
-    # Row3 — gate verdict + daemon (left) / teammate NAMES (right rail).
+    # Row3 — gate verdict + daemon (left) / teammate NAMES (right rail). No permission
+    # segment: CC renders the bypass footer natively and does NOT expose permission mode to
+    # statusLine, so a duplicate here was always broken.
     left3 = gate_cells(gates, colored=True)
     if tier != "narrow":
         left3 += f"{SEP}{daemon_seg(ledger)}"
-        pm = perm_mode(data)
-        if pm:
-            left3 += f"{SEP}{DIM}{pm}{X}"
     if tier == "narrow":
         row3 = LAYOUT.pad_or_truncate(left3, gw)
     else:
