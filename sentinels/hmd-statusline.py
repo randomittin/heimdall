@@ -610,6 +610,14 @@ def _team_hue(seed, sigil):
 TEAM_CELL_W = 4
 TEAM_GAP = 2   # cells between the gauge (Row2) and the team sigil-bottoms rail
 
+# GAUGE WIDTH CAP (RJ: the central bar was taking too much width, leaving less for other
+# items). The Row2 gauge no longer runs edge-to-edge: it is capped to GAUGE_MAX_FRAC of the
+# content width (right of the sigil), so it RESERVES a clear right-side zone for the
+# teammate cluster + breathing room, and — even when solo — leaves a right margin instead
+# of filling the whole line. GAUGE_MIN keeps a legible bar on cramped terminals.
+GAUGE_MAX_FRAC = 0.66   # gauge spans at most ~2/3 of the content width; the rest is reserved
+GAUGE_MIN = 24          # ...but never shrink the bar below this (cramped-width floor)
+
 
 def _team_members(cwd, ledger):
     """Up to 3 teammates + a `+N` overflow, from the ledger team[] (status.json mirror)
@@ -837,18 +845,25 @@ def main():
     # the TEAM CLUSTER owns the right rail across rows 1–3: each teammate's S-size sigil
     # TOP on Row1, BOTTOM on Row2, and the NAME on Row3 (RJ: '2x2 not 4x4' + stacked).
     # Shown at full/mid; dropped at narrow (the right rail collapses like the old rail).
+    # GAUGE CAP + RESERVED TEAMMATE ZONE (RJ: the central bar took too much width). The
+    # gauge spans at most GAUGE_MAX_FRAC of the content width, so a dedicated right-side
+    # zone is always reserved for the team cluster (+ breathing room), and a solo render
+    # leaves a right margin instead of running edge-to-edge.
+    gauge_cap = min(gw, max(GAUGE_MIN, int(gw * GAUGE_MAX_FRAC)))
     if tier in ("full", "mid"):
-        # the team rail may claim up to the content width MINUS a minimum gauge span, so a
-        # wide cluster shrinks the gauge rather than overflowing the line. Short names at
-        # normal widths fit whole with room to spare; the budget only bites on a pathological
-        # cluster, where whole teammates drop into +N (never a mid-token slice).
-        min_gauge = max(12, gw // 3)
-        rail_avail = max(0, gw - TEAM_GAP - min_gauge)
+        # the team rail owns the right side: everything the capped gauge + its breathing
+        # gutter do not claim. Short names at normal widths fit whole with room to spare;
+        # the budget only bites on a pathological cluster, where whole teammates drop into
+        # +N (never a mid-token slice).
+        rail_avail = max(0, gw - gauge_cap - TEAM_GAP)
         t_top, t_bot, t_names, rail_w = team_rail(cwd, ledger, rail_avail)
     else:
         t_top, t_bot, t_names, rail_w = "", "", "", 0
     team_gap = TEAM_GAP if rail_w > 0 else 0
-    gauge_span = max(0, gw - rail_w - team_gap)   # the gauge yields room to the team rail
+    # gauge = content − teammate_zone − breathing gutter, then hard-capped to the max
+    # fraction. It STOPS before the teammate zone (never runs under/over the teammates) and,
+    # when solo, still yields a right margin rather than filling the whole line.
+    gauge_span = max(0, min(gauge_cap, gw - rail_w - team_gap))
 
     # Row1 — identity (left) + teammate sigil-TOPS (right rail).
     left1 = f"{TEAL}{BOLD}⛭ HEIMDALL{X}{SEP}{DIM}{handle}·{model}{X}{SEP}{AM}{repo_str}{X}"
