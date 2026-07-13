@@ -7,18 +7,20 @@ THIS document, not from impl-authored goldens. If the impl and this ledger
 disagree, this ledger is the correctness authority — the impl is wrong until
 the ledger is proven wrong on its own math.
 
-**Subject under test (SUT):** the 3-row statusline render
+**Subject under test (SUT):** the 4-row statusline render
 (`sentinels/hmd-statusline.py` + siblings `hmd_gauge.py`, `hmd_layout.py`,
 `hmd_ledger.py`), driven by CC statusLine stdin JSON and
 `.heimdall/{status,statusline}.json` ledger state.
 
-**Layout (4 rows: the hero sigil is a perfect 8×8 = 4 half-block rows, so its 3 content
-rows lay out to the RIGHT of sigil rows 1–3, and sigil row 4 sits beside a BLANK content
-row padded to COLUMNS — the full untrimmed sigil shows):**
-- **Row1** — identity / team / rate-limit (right-pinned).
-- **Row2** — full-bleed usage gauge (per-cell `48;2` bg ramp, inside labels).
-- **Row3** — gate verdict / permission-mode (descoped) / live subagent count.
-- **Row4** — BLANK content (space-padded to COLUMNS) beside the sigil's bottom row.
+**Layout (4 rows: the hero sigil is a perfect 8×8 = 4 half-block rows, so the four content
+rows lay out to the RIGHT of sigil rows 1–4 — the full untrimmed sigil shows):**
+- **Row1** — identity / model / repo (left) + team sigil-TOPS (right rail).
+- **Row2** — the CLEAN usage gauge (per-cell `48;2` bg ramp, NO inside labels), CAPPED to
+  reserve a right-side teammate zone (sigil-BOTTOMS); it is NOT full-bleed of the content span.
+- **Row3** — gate verdict / live subagent count (left) + teammate NAMES (right rail).
+  Permission-mode is DESCOPED (CC renders the bypass footer natively; no statusLine signal).
+- **Row4** — the metrics line: left `CTX <pct>% · ↓<tokens>`, right `ctx% · 5h% · 7d% · $cost
+  · <reset>` (the numbers moved OFF the Row2 gauge onto their own row), gated by width tier.
 
 **Measurement conventions used throughout:**
 - `COLUMNS` = the terminal width the SUT resolves (`resolve_cols`, 80-col
@@ -52,15 +54,21 @@ check is proven non-tautological).
 - **Known-bad RED:** disable `full_bleed_pad` (return the row unpadded) → some
   row `vis != COLUMNS` → RED. Off-by-one the pad (`cols-1`) → RED.
 
-### GAUGE-FILL — Row2 filled width equals rounded percentage
-- **Assertion:** Row2 filled-cell count `== round(used_percentage/100 × COLUMNS)`.
-- **Measure:** feed `context_window.used_percentage = p`; count the leading run
-  of "filled" cells in Row2 (cells carrying a ramp `48;2` bg vs the dim empty
-  track). Assert `count == round(p/100 × COLUMNS)` for
-  `p ∈ {0, 1, 50, 69, 70, 89, 90, 100}` at each `COLUMNS`. Standard round-half-up
-  per the spec `round()`, NOT floor.
-- **Known-bad RED:** replace `round()` with `int()`/floor → fractional cases
-  diverge (e.g. `p=1, COLUMNS=80` → round 1 vs floor 0) → RED.
+### GAUGE-FILL — Row2 filled width equals rounded percentage of the CAPPED span
+- **Assertion:** Row2 filled-cell count `== round(used_percentage/100 × gauge_span)`, where
+  `gauge_span` is the CAPPED allotment (NOT `COLUMNS`, NOT the full content span `gw`): the
+  gauge reserves a right-side teammate zone. Solo (no team) `gauge_span = min(gw, max(24,
+  int(gw × 0.66)))` with `gw = COLUMNS − 10`.
+- **Measure:** (a) re-derive `gauge_span` from the SUT's OWN render — the count of Row2 cells
+  carrying an active `48;2` bg minus the 8 sigil-anchor cells — and assert it equals the capped
+  formula AND `gw − gauge_span > 0` (a reserved right zone). (b) feed
+  `context_window.used_percentage = p`; count the leading run of filled (ramp `48;2`) cells vs
+  the dim empty track and assert `count == round(p/100 × gauge_span)` for
+  `p ∈ {0, 1, 50, 69, 70, 89, 90, 100}` at each `COLUMNS`. Round-half-up per the spec `round()`,
+  NOT floor.
+- **Known-bad RED:** replace `round()` with `int()`/floor → fractional cases diverge (e.g.
+  `p=1, gauge_span=72` → round 1 vs floor 0) → RED. Remove the cap (gauge full-bleed = `gw`) →
+  the SUT's real-render span `≠` the capped formula and `gw − gauge_span = 0` → RED.
 
 ### GAUGE-RAMP — base ramp fills the whole bar + TIP-ONLY danger + empty track
 - **Assertion:** the BASE ramp `#1E2F73 → #4264FF → #5AD7E6` (default) — or
@@ -82,27 +90,29 @@ check is proven non-tautological).
   → RED. Remap the WHOLE ramp on danger (the old behavior) → `pct=70` first cell is blue,
   not dark → RED. Drop the empty-track fill → trailing cells go bare → RED.
 
-### GAUGE-LABELS — inside labels gated by width
-- **Assertion:** at `COLUMNS ≥ 60` both inside labels render (left
-  `CTX <pct>% · ↓<tokens>`, right `<7d>% · $<cost> · <dur>`); at `COLUMNS < 60`
-  the RIGHT label is dropped; at `COLUMNS < 40` the gauge is bar-only (NO labels).
-- **Measure:** feed a fixed stdin with known tokens/cost/dur; on Row2,
-  `strip()` and assert: `w≥60` → contains `CTX` AND the right cluster (`$`);
-  `40 ≤ w < 60` → contains `CTX`, does NOT contain the right `$` cluster;
-  `w < 40` → contains neither label token (pure bar). Check
-  `w ∈ {40, 59, 60, 120}`.
-- **Known-bad RED:** always-draw both labels → right label present at `w=45` →
-  RED. Never-draw labels → `CTX` missing at `w=120` → RED.
+### GAUGE-LABELS — the gauge is CLEAN; the metric labels live on Row4, gated by width
+- **Assertion:** the Row2 gauge carries NO text at ANY tier (a clean `48;2` bg bar — the
+  numbers moved OFF it). The metric labels live on **Row4**: left `CTX <pct>% · ↓<tokens>` and
+  right `ctx% · 5h% · 7d% · $<cost> · <reset>`. The right cluster shows at `full` only; at
+  `mid`/`narrow` Row4 is the LEFT `CTX`/tokens only. `tiny` (<40) has no Row4 (one line).
+- **Measure:** feed a fixed stdin with known tokens/cost/dur. On Row2 `strip()` and assert it
+  contains neither `CTX` nor `$` (clean bar) at `w ∈ {48, 80, 120}`. On Row4 `strip()`:
+  `full`(120) → contains `CTX` AND the right `$` cluster; `mid`(80) & `narrow`(48) → contains
+  `CTX`, does NOT contain the right `$` cluster.
+- **Known-bad RED:** always-draw the right cluster → `$` present on Row4 at `w=80` → RED.
+  Splice a label onto the gauge → `CTX`/`$` appears on Row2 → RED. Never-draw `CTX` at `w=120`
+  → RED.
 
 ### NULL-SAFE — absent/null fields render NOTHING, never a fabricated zero
 - **Assertion:** (a) `used_percentage` null/absent → gauge treats it as `0`
   (empty bar), NOT a crash; (b) `rate_limits` absent → the limit segment(s) are
-  OMITTED entirely (no `0%`, no `⧗`, no placeholder); (c) `workspace.repo`
-  absent → Row1 shows the `current_dir` basename with NO branch/`:worktree`
+  OMITTED entirely (the Row4 `5h`/`7d` readouts vanish — no `0%`, no placeholder);
+  (c) `workspace.repo` absent → Row1 shows the `current_dir` basename with NO branch/`:worktree`
   suffix. No field is ever fabricated from a missing source.
 - **Measure:** three canned inputs. (a) stdin with `context_window` lacking
   `used_percentage` → SUT exits 0, Row2 fill `== 0`. (b) stdin with no
-  `rate_limits` key → `! grep -q '⧗'` and no `%`-bearing limit token on Row1.
+  `rate_limits` key → Row4 contains neither a `5h` nor a `7d` token (the limit readouts moved
+  OFF Row1 onto the Row4 metrics rail; no fabricated `0%`).
   (c) stdin with `workspace.current_dir` set but no `repo` → Row1 contains
   `basename(current_dir)` and does NOT contain a branch glyph/`:` worktree join.
 - **Known-bad RED:** default a missing `rate_limits` to `0%` → the `0%` token
@@ -110,16 +120,16 @@ check is proven non-tautological).
 
 ### WIDTH-TIERS — four tiers select content density
 - **Assertion:** `width_tier(COLUMNS)` = `full` (≥100) · `mid` (60–99) ·
-  `bar` (40–59) · `single` (<40), and the render obeys:
-  - `full` — all 3 rows, all segments.
-  - `mid` — drop team member names (count only) AND the gauge RIGHT label.
-  - `bar` — drop Row1 right rail (rate-limit) AND all gauge labels (bar-only).
-  - `single` — ONE line, exactly `HMD <pct>% <gates>`.
+  `narrow` (40–59) · `tiny` (<40), and the render obeys:
+  - `full` — all four rows, all segments (incl. the Row4 right `$` cluster + the team rail).
+  - `mid` — team sigil rail kept; Row4 drops to the LEFT `CTX`/tokens only (no right `$`).
+  - `narrow` — drop the Row1/Row3 team rail; Row4 = LEFT `CTX`/tokens only (no right `$`).
+  - `tiny` — ONE line, exactly `HMD <pct>% <gates>`.
 - **Measure:** for representative widths `{120, 80, 48, 30}` assert the row
   count (`wc -l`) is `4, 4, 4, 1` respectively (the multi-row tiers emit the full
   untrimmed 8×8 sigil = 4 rows); and per-tier content greps:
-  `mid`(80) → Row2 has `CTX` but not the right `$` cluster; `bar`(48) → Row1 has
-  no rate-limit token and Row2 has no `CTX`; `single`(30) → single line matching
+  `mid`(80) → Row4 has `CTX` but not the right `$` cluster; `narrow`(48) → Row4 still has
+  `CTX` (left-only) and no right `$`; `tiny`(30) → single line matching
   `^HMD [0-9]+% ` (and still `vis == COLUMNS`, see ROW-EXACT).
 - **Known-bad RED:** shift a boundary (e.g. `≥90` for full) → `w=95` renders the
   full rail → RED. Emit 3 rows at `w=30` → `wc -l != 1` → RED.
@@ -171,10 +181,10 @@ check is proven non-tautological).
 - **Assertion:** the user's OWN hero sigil — the current 58-hero `▄` 8×8 render
   (`hmd_sigil.py`) — REMAINS the left anchor of the statusline. It is NOT retired
   and NOT replaced by the `▟█▙` brand glyph. TEAMMATES render as the compressed
-  1-row micro mark. The 3-row content lays out to the RIGHT of the sigil; Row2's
-  gauge fills the remaining width to the right of the sigil (its full-bleed span
-  is `COLUMNS − sigil_width`, and ROW-EXACT/GAUGE-FILL are computed against that
-  post-anchor span so the anchor + gauge together still fill the line exactly).
+  1-row micro mark. The content lays out to the RIGHT of the sigil; Row2's
+  gauge fills its CAPPED allotment to the right of the sigil (it reserves a right-side
+  teammate zone — it is NOT full-bleed of `COLUMNS − sigil_width`; see GAUGE-FILL), and
+  ROW-EXACT proves the anchor + gauge + reserved zone together fill the line exactly).
 - **Rationale:** RJ override of spec §8, which proposed retiring the 4-row hero
   block in favor of `▟█▙`. The hero sigil is the user's identity mark and stays;
   only teammates compress to the micro mark. The `hmd_sigil.py` 58-hero system
@@ -184,8 +194,8 @@ check is proven non-tautological).
   left anchor (the `▄`/8×8 render, NOT a lone `▟█▙`); the sigil goldens diff
   clean: `git diff --quiet conformance/statusline/goldens/sigil/`. (b) a teammate
   entry renders the 1-row micro mark, not the full hero block. (c) Row2's ramped
-  span begins after the sigil anchor, and `vis(Row2) == COLUMNS` still holds
-  (anchor + gauge together fill the line).
+  span begins after the sigil anchor and is CAPPED (a right teammate zone reserved), and
+  `vis(Row2) == COLUMNS` still holds (anchor + capped gauge + zone + pad fill the line).
 - **Known-bad RED:** replace the self anchor with `▟█▙` → the hero sigil block is
   absent from the SELF render → RED. Any modification to `hmd_sigil.py` that
   dirties the sigil goldens → `git diff --quiet …/sigil/` fails → RED.
@@ -199,8 +209,8 @@ overrides are called out so a reviewer sees what is/ isn't enforced.
 
 | Spec § | Topic | Invariant IDs | Notes |
 |---|---|---|---|
-| §2 | Row1 identity / team / rate-limit | ROW-EXACT · NULL-SAFE · WIDTH-TIERS · SIGIL-KEEP | team names drop at `mid`; rate-limit rail drops at `bar`; sigil is the left anchor. |
-| §3 | Row2 full-bleed gauge (fill / ramp / tips / labels / budget) | GAUGE-FILL · GAUGE-RAMP · GAUGE-LABELS · ANSI-BUDGET · ROW-EXACT | the gauge's full-bleed span is `COLUMNS − sigil_width` per SIGIL-KEEP. |
+| §2 | Row1 identity / team / rate-limit | ROW-EXACT · NULL-SAFE · WIDTH-TIERS · SIGIL-KEEP | team names drop at `narrow`; the rate-limit readout moved to the Row4 metrics rail; sigil is the left anchor. |
+| §3 | Row2 gauge (fill / ramp / tips / budget) + Row4 metric labels | GAUGE-FILL · GAUGE-RAMP · GAUGE-LABELS · ANSI-BUDGET · ROW-EXACT | the gauge is CAPPED (reserves a right teammate zone, NOT full-bleed); metric labels moved OFF the bar onto Row4. |
 | §4 | Row3 gate verdict / permission-mode / subagent count | ROW-EXACT · FALLBACK · WIDTH-TIERS | permission-mode is DESCOPED (no CC stdin signal) — expected-red / omitted, not covered by a green invariant. |
 | §5 | Width tiers (≥100 / 60–99 / 40–59 / <40) | WIDTH-TIERS · ROW-EXACT · GAUGE-LABELS | tier boundaries + the `<40` single-line `HMD <pct>% <gates>`. |
 | §6 | Null / absent-field handling | NULL-SAFE · FALLBACK · EXIT | never fabricate a `0%`/`$0`; degrade, don't crash. |
