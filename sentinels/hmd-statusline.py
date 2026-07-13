@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """
-hmd-statusline.py — Heimdall watchman statusline v1 "Full-bleed Gauge" (3-row).
+hmd-statusline.py — Heimdall watchman statusline v1 "Full-bleed Gauge".
 
-The user's OWN hero sigil (hmd_sigil size 'M', the ▄ 8×8 render) anchors the LEFT;
-three content rows lay out to its right, EXACTLY $COLUMNS visible cells each:
+The user's OWN hero sigil (hmd_sigil size 'M', the ▄ 8×8 render) anchors the LEFT as a
+perfect 8×8 = 4 half-block rows; three content rows lay out to its right, EXACTLY
+$COLUMNS visible cells each, and the sigil's 4th row sits beside a BLANK content row so
+the full untrimmed sigil shows (a 4-row statusline):
 
   Row1  ⛭ HEIMDALL │ <user>·<model> │ <repo>:<branch>   ·· team · daemon · rate-limit
   Row2  <full-bleed context gauge, per-cell 48;2 bg ramp, inside labels>
   Row3  <gate cells ✓/◌/✗ · perm-mode>                    ·· busiest subagent (ghost)
+  Row4  <blank content — the sigil's bottom row, padded to COLUMNS>
 
 Assembled through the sibling pure modules:
   hmd_gauge   — the Row2 full-bleed gauge (render_gauge)
@@ -144,8 +147,11 @@ def cached_sigil(seed, size, caps, eye):
 def _sigil_rows(seed, eye):
     """The left anchor per tier: the 58-hero half-block watchman (size 'M') on
     unicode=full + color; a branded ASCII sigil on no-unicode terms; a blank 8-wide
-    anchor in mono. The 3-row layout uses the TOP 3 of the sigil's rows (SIGIL-KEEP:
-    the multi-cell hero block stays the anchor; hmd_sigil.py is byte-untouched)."""
+    anchor in mono. The hero block is a perfect 8×8 = 4 half-block text-rows and is
+    returned UNTRIMMED (SIGIL-KEEP: the multi-cell hero block stays the anchor;
+    hmd_sigil.py is byte-untouched). The layout emits max(sigil_height, content_height)
+    rows, so the full 4-row sigil shows: content rows 1–3 beside sigil rows 1–3, and
+    sigil row 4 sits beside a BLANK content row padded to COLUMNS."""
     if CAPS.unicode == TC.ASCII:
         rows = list(ASCII_SIGIL)
     elif CAPS.color == TC.MONO:
@@ -157,7 +163,7 @@ def _sigil_rows(seed, eye):
             rows = list(ASCII_SIGIL)
     else:
         rows = list(ASCII_SIGIL)
-    return rows[:3]
+    return rows
 
 # ── stdin ────────────────────────────────────────────────────────────────────
 def read_stdin():
@@ -215,6 +221,43 @@ def resolve_cols():
     if c and c > 0:
         return c
     return 80   # conservative floor: under-render, never wrap
+
+# ── git branch (cached, NO subprocess) ────────────────────────────────────────
+def _git_branch(cwd):
+    """The current git branch for `cwd`, read STRAIGHT from `.git/HEAD` — no
+    subprocess, no network. Walks up parents until a `.git` (dir OR the worktree
+    `gitdir:` file) is found, then parses `ref: refs/heads/<branch>` (a detached HEAD
+    → the short sha). Returns None outside any git repo (→ no branch suffix). Total:
+    any fault degrades to None, never raises."""
+    try:
+        d = os.path.abspath(cwd)
+    except Exception:
+        return None
+    for _ in range(64):
+        gitpath = os.path.join(d, ".git")
+        head = None
+        try:
+            if os.path.isdir(gitpath):
+                head = os.path.join(gitpath, "HEAD")
+            elif os.path.isfile(gitpath):
+                # a linked worktree: `.git` is a file `gitdir: <path-to-gitdir>`.
+                with open(gitpath, "r", encoding="utf-8") as f:
+                    line = f.read().strip()
+                if line.startswith("gitdir:"):
+                    head = os.path.join(line.split(":", 1)[1].strip(), "HEAD")
+            if head and os.path.isfile(head):
+                with open(head, "r", encoding="utf-8") as f:
+                    ref = f.read().strip()
+                if ref.startswith("ref: refs/heads/"):
+                    return ref[len("ref: refs/heads/"):].strip() or None
+                return ref[:7] if ref else None   # detached HEAD → short sha
+        except Exception:
+            return None
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    return None
 
 # ── legacy single-verdict state (for --widget + eye animation) ────────────────
 def gate_state(cwd):
@@ -462,6 +505,20 @@ def seven_day_pct(data):
         return None
     return v
 
+def five_hour_pct(data):
+    """rate_limits.five_hour.used_percentage → float, or None (absent → gauge omits the
+    `5h <n>%` readout — never a fabricated 0%)."""
+    rl = data.get("rate_limits")
+    if not isinstance(rl, dict):
+        return None
+    fh = rl.get("five_hour")
+    if not isinstance(fh, dict):
+        return None
+    v = fh.get("used_percentage")
+    if not isinstance(v, (int, float)) or isinstance(v, bool):
+        return None
+    return v
+
 def _hexcolor(seed, sigil):
     """A '#rrggbb' for a teammate's micro mark: the entry's own sigil hex if it carries
     one, else the deterministic identity hue glyph_color(seed)."""
@@ -612,11 +669,16 @@ def main():
     pct = 0.0 if not isinstance(up, (int, float)) or isinstance(up, bool) else float(up)
     session_id = data.get("session_id") or ""
 
-    # repo:branch — repo absent → the current_dir basename with NO branch/:worktree join.
+    # repo:branch — CC's statusLine stdin rarely carries a branch, so fall back to the
+    # cached .git/HEAD read (no subprocess) so Row1 shows `heimdall:main`, not bare
+    # `heimdall`. repo absent → the current_dir basename with NO branch/:worktree join
+    # (dir-basename no-branch outside git).
     repo_obj = ws.get("repo") or {}
     repo_name = repo_obj.get("name")
     branch = ws.get("git_worktree") or repo_obj.get("branch")
     if repo_name:
+        if not branch:
+            branch = _git_branch(cwd)
         repo_str = str(repo_name) + (":" + str(branch) if branch else "")
     else:
         repo_str = os.path.basename(str(cwd).rstrip("/")) or str(cwd)
@@ -677,16 +739,18 @@ def main():
         if upd: rparts.append(upd)
         row1 = LAYOUT.left_right(left1, "  ".join(rparts), gw)
 
-    # Row2 — the full-bleed context gauge (labels gated by tier)
+    # Row2 — the full-bleed context gauge (labels gated by tier). At full tier the RIGHT
+    # readout carries DUAL limits: context % AND the 5-hour session limit % (+7d/cost/dur).
     tin = cw.get("total_input_tokens")
     if tier == "full":
-        gauge = GAUGE.render_gauge(gw, pct, tin, seven_day_pct(data),
+        gauge = GAUGE.render_gauge(gw, pct, tin, five_hour_pct(data), seven_day_pct(data),
                                    (data.get("cost") or {}).get("total_cost_usd"),
-                                   (data.get("cost") or {}).get("total_duration_ms"), CAPS)
+                                   (data.get("cost") or {}).get("total_duration_ms"), CAPS,
+                                   ctx_pct=pct)
     elif tier == "mid":     # drop the gauge RIGHT label (nulled → render_gauge omits it)
-        gauge = GAUGE.render_gauge(gw, pct, tin, None, None, None, CAPS)
+        gauge = GAUGE.render_gauge(gw, pct, tin, None, None, None, None, CAPS)
     else:                   # narrow → bar-only
-        gauge = GAUGE.render_gauge(gw, pct, None, None, None, None, CAPS)
+        gauge = GAUGE.render_gauge(gw, pct, None, None, None, None, None, CAPS)
 
     # Row3 — gate verdict / permission-mode / busiest subagent (ghost)
     left3 = gate_cells(gates, colored=True)

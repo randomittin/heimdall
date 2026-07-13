@@ -119,9 +119,9 @@ for tr in $TIERS; do for cl in $COLORS; do
   else bad "ROW-EXACT BROKEN: ${tr} × ${cl} widths [$ws] != [$want]"; fi
 done; done
 
-echo "== 3) ROW-COUNT: full/mid/narrow → 3 rows, tiny → 1 =="
+echo "== 3) ROW-COUNT: full/mid/narrow → 4 rows (untrimmed 8×8 sigil), tiny → 1 =="
 for tr in $TIERS; do
-  want=3; [ "$tr" = tiny ] && want=1
+  want=4; [ "$tr" = tiny ] && want=1
   g="$GOLD/${SEED}_${tr}_truecolor.txt"
   [ -f "$g" ] || { bad "row-count: golden missing ${tr}"; continue; }
   n="$(rowcount < "$g")"

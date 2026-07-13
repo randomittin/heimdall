@@ -1,4 +1,4 @@
-# INVARIANTS — HMD Statusline v1 "Full-bleed Gauge" (3-row)
+# INVARIANTS — HMD Statusline v1 "Full-bleed Gauge" (4-row: 8×8 sigil anchor)
 
 **Artifact type:** independent correctness reference (invariant ledger).
 **Authored:** Wave-0, SEPARATELY from the implementation. The falsifier
@@ -12,10 +12,13 @@ the ledger is proven wrong on its own math.
 `hmd_ledger.py`), driven by CC statusLine stdin JSON and
 `.heimdall/{status,statusline}.json` ledger state.
 
-**Layout (fixed 3 rows, laid out to the RIGHT of the sigil anchor):**
+**Layout (4 rows: the hero sigil is a perfect 8×8 = 4 half-block rows, so its 3 content
+rows lay out to the RIGHT of sigil rows 1–3, and sigil row 4 sits beside a BLANK content
+row padded to COLUMNS — the full untrimmed sigil shows):**
 - **Row1** — identity / team / rate-limit (right-pinned).
 - **Row2** — full-bleed usage gauge (per-cell `48;2` bg ramp, inside labels).
 - **Row3** — gate verdict / permission-mode (descoped) / live subagent count.
+- **Row4** — BLANK content (space-padded to COLUMNS) beside the sigil's bottom row.
 
 **Measurement conventions used throughout:**
 - `COLUMNS` = the terminal width the SUT resolves (`resolve_cols`, 80-col
@@ -38,7 +41,9 @@ check is proven non-tautological).
 
 ### ROW-EXACT — every row is exactly COLUMNS printable cells
 - **Assertion:** for each emitted row `r`, `vis(r) == COLUMNS`, verified at
-  `COLUMNS ∈ {40, 80, 120, 200}` and across all multi-row tiers.
+  `COLUMNS ∈ {40, 80, 120, 200}` and across all multi-row tiers. The multi-row tiers
+  emit 4 rows (the untrimmed 8×8 sigil anchor); the 4th (blank content) row is
+  space-padded to COLUMNS and obeys `vis == COLUMNS` like every other row.
 - **Measure:** pipe a canned stdin through the SUT under
   `COLUMNS=<w> python3 sentinels/hmd-statusline.py --color`; for every output
   line assert `len(strip(line)) == <w>` (wide-glyph-adjusted). Run for
@@ -105,7 +110,8 @@ check is proven non-tautological).
   - `bar` — drop Row1 right rail (rate-limit) AND all gauge labels (bar-only).
   - `single` — ONE line, exactly `HMD <pct>% <gates>`.
 - **Measure:** for representative widths `{120, 80, 48, 30}` assert the row
-  count (`wc -l`) is `3, 3, 3, 1` respectively; and per-tier content greps:
+  count (`wc -l`) is `4, 4, 4, 1` respectively (the multi-row tiers emit the full
+  untrimmed 8×8 sigil = 4 rows); and per-tier content greps:
   `mid`(80) → Row2 has `CTX` but not the right `$` cluster; `bar`(48) → Row1 has
   no rate-limit token and Row2 has no `CTX`; `single`(30) → single line matching
   `^HMD [0-9]+% ` (and still `vis == COLUMNS`, see ROW-EXACT).

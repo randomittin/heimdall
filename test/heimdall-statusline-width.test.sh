@@ -1,22 +1,25 @@
 #!/usr/bin/env bash
 #
 # heimdall-statusline-width.test.sh — STATUSLINE ROW-WIDTH / NO-WRAP CONFORMANCE (v1
-# full-bleed 3-row).
+# full-bleed).
 #
 # The v1 layout lays three content rows to the RIGHT of the hero-sigil anchor, EACH
 # padded/truncated to EXACTLY $COLUMNS visible cells (hmd_layout.pad_or_truncate /
-# compose_with_sigil). An over-long segment (a long model name, a deep team file) can
-# never widen a row past COLUMNS — it is truncated whole-glyph, never wrapped. The
-# tiny tier (<40) collapses to ONE line.
+# compose_with_sigil). The hero sigil is a perfect 8×8 = 4 half-block rows, so the
+# render is 4 rows: content rows 1–3 beside sigil rows 1–3, and the sigil's 4th row
+# beside a BLANK (space-padded) content row. An over-long segment (a long model name,
+# a deep team file) can never widen a row past COLUMNS — it is truncated whole-glyph,
+# never wrapped. The tiny tier (<40) collapses to ONE line.
 #
 # THIS SUITE LOCKS (driving the REAL statusline on an overflow-inducing fixture):
 #   1. EXACTLY ONE `HEIMDALL` wordmark line at every multi-row tier (no wrap duplicate);
 #      the tiny tier carries `HMD` (0 `HEIMDALL`), still one line.
-#   2. The row count is EXACTLY 3 (full/mid/narrow) or 1 (tiny) — never a bleed.
+#   2. The row count is EXACTLY 4 (full/mid/narrow — the untrimmed 8×8 sigil) or 1
+#      (tiny) — never a bleed.
 #   3. EVERY rendered row is EXACTLY COLUMNS visible cells (== , not merely <=): the
 #      full-bleed layout fills the line precisely, so a wrap (width>COLUMNS) OR a short
 #      row (width<COLUMNS) both fail.
-# FALSIFIER: off-by-one the pad (cols-1) and assertion 3 goes RED; drop the 3-row
+# FALSIFIER: off-by-one the pad (cols-1) and assertion 3 goes RED; drop the 4-row
 # compose and the row count / header-count assertions go RED.
 set -u
 
@@ -87,13 +90,13 @@ EOF
 }
 
 echo "== full mode (COLUMNS=120) — overflow-inducing long model =="
-check 120 full 3 1
+check 120 full 4 1
 
 echo "== mid mode (COLUMNS=80) =="
-check 80 mid 3 1
+check 80 mid 4 1
 
-echo "== narrow mode (COLUMNS=48) — right rail dropped, still 3 exact rows =="
-check 48 narrow 3 1
+echo "== narrow mode (COLUMNS=48) — right rail dropped, still 4 exact rows =="
+check 48 narrow 4 1
 
 echo "== tiny mode (COLUMNS=30) — single line, HMD not HEIMDALL =="
 check 30 tiny 1 0
