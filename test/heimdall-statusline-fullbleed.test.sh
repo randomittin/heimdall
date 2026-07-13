@@ -203,7 +203,7 @@ def inv_gauge_fill():
     for w in (80, 120, 200):
         span = span_of(w)
         for p in (0, 1, 50, 69, 70, 89, 90, 100):
-            row = G.render_gauge(span, p, 128000, 12, 0.87, 3840000, CAPS)
+            row = G.render_gauge(span, p, 128000, 12, 0.87, 3840000, None, CAPS)
             got = fill_count(row)
             exp = max(0, min(span, round(p / 100.0 * span)))
             if got == exp:
@@ -225,7 +225,7 @@ def _classify(rgb):
 def inv_gauge_ramp():
     span = span_of(120)
     for p, want_tip, want_first in ((50, "ramp", G.DARK), (70, "gold", G.BLUE), (90, "red", G.GOLD)):
-        row = G.render_gauge(span, p, None, None, None, None, CAPS)
+        row = G.render_gauge(span, p, None, None, None, None, None, CAPS)
         seq = bg_sequence(row)
         fills = [c for c in seq if c is not None and c not in TRACK]
         tracks = [c for c in seq if c in TRACK]
@@ -296,7 +296,7 @@ def inv_ansi_budget():
     for w in (120, 200):
         span = span_of(w)
         step = max(1, math.ceil(span / 40.0))
-        row = G.render_gauge(span, 50, None, None, None, None, CAPS)
+        row = G.render_gauge(span, 50, None, None, None, None, None, CAPS)
         seq = [c for c in bg_sequence(row) if c is not None]
         fills = [c for c in seq if c not in TRACK]
         distinct_ramp = len(set(fills))
@@ -428,7 +428,7 @@ def prove_red():
     for w in (80, 120, 200):
         span = span_of(w)
         for p in (1, 50, 69, 70, 89, 90):
-            row = m2.GAUGE.render_gauge(span, p, None, None, None, None, CAPS)
+            row = m2.GAUGE.render_gauge(span, p, None, None, None, None, None, CAPS)
             got = fill_count(row); exp = max(0, min(span, round(p / 100.0 * span)))
             if got != exp:
                 diverged = True

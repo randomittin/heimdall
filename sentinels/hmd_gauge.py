@@ -135,16 +135,32 @@ def _lerp(a, b, t):
             round(a[2] + (b[2] - a[2]) * t))
 
 
-def ramp_color(t, pct):
+def ramp_anchors(base_hue):
+    """The three ramp endpoints (dark, mid, bright). base_hue None → the literal
+    #1E2F73 → #4264FF → #5AD7E6 default (byte-identical to the pre-hue ramp). A given
+    base_hue (the user's OWN sigil dominant RGB) derives the ramp from THAT hue: a deep
+    variant (hue toward black) → the hue itself → a bright variant (hue toward white),
+    all by RGB lerp. The gold (>=70) / red (>=90) danger tips stay hue-independent."""
+    if base_hue is None:
+        return DARK, BLUE, CYAN
+    h = (int(base_hue[0]), int(base_hue[1]), int(base_hue[2]))
+    dark = _lerp((0, 0, 0), h, 0.45)              # deep variant of the hue
+    bright = _lerp(h, (255, 255, 255), 0.42)      # bright variant of the hue
+    return dark, h, bright
+
+
+def ramp_color(t, pct, base_hue=None):
     """Fill colour at fraction t in [0,1]. The endpoints REMAP by pct: gold tip
-    at >=70, red tip at >=90 — else the 3-stop indigo->blue->cyan gradient."""
+    at >=70, red tip at >=90 (both hue-independent danger signals) — else a 3-stop
+    dark->hue->bright gradient derived from base_hue (default indigo->blue->cyan)."""
     if pct >= RED_AT:
         return _lerp(GOLD, RED, t)
+    dark, mid, bright = ramp_anchors(base_hue)
     if pct >= GOLD_AT:
-        return _lerp(BLUE, GOLD, t)
+        return _lerp(mid, GOLD, t)
     if t <= 0.5:
-        return _lerp(DARK, BLUE, t / 0.5)
-    return _lerp(BLUE, CYAN, (t - 0.5) / 0.5)
+        return _lerp(dark, mid, t / 0.5)
+    return _lerp(mid, bright, (t - 0.5) / 0.5)
 
 
 # ── SGR helpers (each colour a STANDALONE escape so caps.emit can rewrite it) ──
@@ -205,10 +221,10 @@ def _serialize(cells):
     return "".join(out)
 
 
-def _build_cells(width, pct):
+def _build_cells(width, pct, base_hue=None):
     """A `width`-long cell array: [bg_rgb, char, fg_rgb_or_None, bold_bool].
-    Filled cells carry the quantized ramp; the tip cell is forced to the ramp
-    endpoint; empty cells carry the alternating track stripe."""
+    Filled cells carry the quantized ramp (tinted from base_hue); the tip cell is
+    forced to the ramp endpoint; empty cells carry the alternating track stripe."""
     fill = _fill_count(width, pct)
     step = max(1, math.ceil(width / 40.0))
     denom = max(1, fill - 1)
@@ -217,7 +233,7 @@ def _build_cells(width, pct):
         if i < fill:
             # quantize to `step`-cell blocks; force the tip to the endpoint.
             qi = fill - 1 if i == fill - 1 else (i // step) * step
-            bg = ramp_color(qi / denom, pct)
+            bg = ramp_color(qi / denom, pct, base_hue)
         else:
             bg = _TRACK_BGS[i % 2]
         cells.append([bg, " ", None, False])
@@ -225,7 +241,7 @@ def _build_cells(width, pct):
 
 
 def render_gauge(width, used_pct, tokens, five_hour_pct, seven_day_pct, cost_usd,
-                 duration_ms, caps, ctx_pct=None):
+                 duration_ms, caps, ctx_pct=None, base_hue=None):
     """Render the Row2 context gauge as ONE row of EXACTLY `width` visible cells.
 
     width         : total visible cell count of the row
@@ -243,6 +259,9 @@ def render_gauge(width, used_pct, tokens, five_hour_pct, seven_day_pct, cost_usd
                     shows). The right readout reads `ctx <n>% · 5h <n>% · 7d <n>% ·
                     $<cost> · <dur>`, each part OMITTED when its source is absent
                     (never a fabricated `0%`).
+    base_hue      : the user's OWN sigil dominant RGB (hmd_sigil.glyph_color(seed)). The
+                    dark->hue->bright fill ramp is derived from it; None → the default
+                    indigo->blue->cyan. Gold/red danger tips (>=70/>=90) stay hue-independent.
 
     Returns a tier-appropriate string: truecolor bg ramp downgraded to 256/16,
     or a plain ASCII proportional bar on a mono tier. Never raises.
@@ -263,7 +282,7 @@ def render_gauge(width, used_pct, tokens, five_hour_pct, seven_day_pct, cost_usd
         if caps is None or not caps.use_color():
             return _ascii_bar(width, pct)
 
-        cells = _build_cells(width, pct)
+        cells = _build_cells(width, pct, base_hue)
 
         # ── labels (skipped entirely on the narrowest tier) ──
         if width >= _MIN_LABELS:
