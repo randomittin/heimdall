@@ -7,10 +7,10 @@ perfect 8×8 = 4 half-block rows; three content rows lay out to its right, EXACT
 $COLUMNS visible cells each, and the sigil's 4th row sits beside a BLANK content row so
 the full untrimmed sigil shows (a 4-row statusline):
 
-  Row1  ⛭ HEIMDALL │ <user>·<model> │ <repo>:<branch>   ·· team · daemon · rate-limit
-  Row2  <full-bleed context gauge, per-cell 48;2 bg ramp, inside labels>
-  Row3  <gate cells ✓/◌/✗ · perm-mode>                    ·· busiest subagent (ghost)
-  Row4  <blank content — the sigil's bottom row, padded to COLUMNS>
+  Row1  ⛭ HEIMDALL │ <user>·<model> │ <repo>:<branch>   ·· teammate sigil-TOPS
+  Row2  <full-bleed CLEAN context gauge, per-cell 48;2 bg ramp, NO labels> ·· sigil-BOTTOMS
+  Row3  <gate cells ✓/◌/✗ · daemon>                       ·· teammate NAMES
+  Row4  <metrics: CTX <pct>% · ↓<tok>    ctx% · 5h% · 7d% · $cost · <reset>>
 
 Assembled through the sibling pure modules:
   hmd_gauge   — the Row2 full-bleed gauge (render_gauge)
@@ -473,6 +473,26 @@ def active_swarm_agents():
 # resets_at (e.g. a far-future epoch) and its countdown is OMITTED, never printed.
 FIVE_HOUR_S = 5 * 3600
 
+def reset_countdown(data, now):
+    """The BARE sanitized 5-hour reset countdown — 'Nh' (>=1h) or 'Nm' (<1h) — from
+    rate_limits.five_hour.resets_at, or '' when absent/insane. SANITY (guards the
+    2282244h far-future overflow): emitted ONLY when `0 < (resets_at − now) ≤ 5h`; a
+    resets_at that is absent, ≤ now, or yields > 5h → '' (an implausible hour count is
+    never printed). Single source of the reset math for both the Row4 readout and the
+    legacy rate_limit_parts segment."""
+    rl = data.get("rate_limits")
+    if not isinstance(rl, dict):
+        return ""
+    fh = rl.get("five_hour")
+    if not isinstance(fh, dict):
+        return ""
+    ra = fh.get("resets_at")
+    if isinstance(ra, (int, float)) and not isinstance(ra, bool) and ra > now:
+        rem = int(ra - now)
+        if 0 < rem <= FIVE_HOUR_S:   # sane: a 5-hour-limit reset is always ≤ 5h
+            return f"{rem // 3600}h" if rem >= 3600 else f"{max(1, rem // 60)}m"
+    return ""
+
 def rate_limit_parts(data, now):
     """(pct_seg, reset_seg) for the 5-hour usage limit. Reads
     rate_limits.five_hour.{used_percentage,resets_at} (Pro/Max, present only after the
@@ -495,13 +515,8 @@ def rate_limit_parts(data, now):
     pct = max(0, min(100, int(round(up))))
     col = RD if pct >= 90 else AM if pct >= 70 else GR
     pct_seg = f"{col}𝘅 {pct}%{X}"
-    reset_seg = ""
-    ra = fh.get("resets_at")
-    if isinstance(ra, (int, float)) and not isinstance(ra, bool) and ra > now:
-        rem = int(ra - now)
-        if 0 < rem <= FIVE_HOUR_S:   # sane: a 5-hour-limit reset is always ≤ 5h
-            cd = f"{rem // 3600}h" if rem >= 3600 else f"{max(1, rem // 60)}m"
-            reset_seg = f"{FAINT}·{X}{DIM}{cd}{X}"
+    cd = reset_countdown(data, now)
+    reset_seg = f"{FAINT}·{X}{DIM}{cd}{X}" if cd else ""
     return pct_seg, reset_seg
 
 def rate_limit_seg(data, now):
@@ -535,6 +550,40 @@ def five_hour_pct(data):
     if not isinstance(v, (int, float)) or isinstance(v, bool):
         return None
     return v
+
+def metrics_segments(data, pct, tokens, now):
+    """The Row4 metrics line as (left, right) for LAYOUT.left_right over the content width.
+    Moved OFF the Row2 gauge (now a clean unlabelled bar) so the numbers read as plain text
+    on their own row.
+
+      left  = `CTX <pct>% · ↓<tokens>`   — context used % + humanized input tokens
+      right = `ctx <n>% · 5h <n>% · 7d <n>% · $<cost> · <reset>`
+
+    Every RIGHT part is OMITTED when its source is absent (never a fabricated 0%): 5h/7d
+    only when their rate_limits are present, $ only when cost is present, <reset> only when
+    the sanitized 5-hour countdown is sane. tokens is dropped from LEFT when absent."""
+    pi = max(0, min(999, int(round(pct)))) if isinstance(pct, (int, float)) and not isinstance(pct, bool) else 0
+    left = f"{BOLD}{CY}CTX {pi}%{X}"
+    tok = GAUGE.humanize_tokens(tokens)
+    if tok:
+        left += f" {FAINT}·{X} {DIM}↓{tok}{X}"
+    parts = [f"{DIM}ctx {pi}%{X}"]
+    fh = five_hour_pct(data)
+    if fh is not None:
+        parts.append(f"{DIM}5h {max(0, min(999, int(round(fh))))}%{X}")
+    sd = seven_day_pct(data)
+    if sd is not None:
+        parts.append(f"{DIM}7d {max(0, min(999, int(round(sd))))}%{X}")
+    cost_obj = data.get("cost")
+    cost = cost_obj.get("total_cost_usd") if isinstance(cost_obj, dict) else None
+    if isinstance(cost, (int, float)) and not isinstance(cost, bool):
+        parts.append(f"{DIM}${cost:.2f}{X}")
+    rc = reset_countdown(data, now)
+    if rc:
+        parts.append(f"{DIM}{rc}{X}")
+    right = f" {FAINT}·{X} ".join(parts)
+    return left, right
+
 
 def _team_hue(seed, sigil):
     """A '#rrggbb' recolor hue for a teammate's cluster sigil: the entry's OWN sigil hex
@@ -805,19 +854,13 @@ def main():
     except Exception:
         sig_hue = None
 
-    # Row2 — the context gauge over `gauge_span`, with the teammate sigil-BOTTOMS on the
-    # right rail (the gauge is full-bleed of the span it is left when the team rail is
-    # present; solo → full remaining width, byte-identical to the pre-team layout).
+    # Row2 — the CLEAN full-bleed context gauge (per-cell bg ramp ONLY; NO text spliced
+    # over it — every metric moved to Row4), with the teammate sigil-BOTTOMS on the right
+    # rail. The gauge is full-bleed of the span it is left when the team rail is present;
+    # solo → the full remaining width. labels=False → an unlabelled bar at every tier.
     tin = cw.get("total_input_tokens")
-    if tier == "full":
-        gauge = GAUGE.render_gauge(gauge_span, pct, tin, five_hour_pct(data), seven_day_pct(data),
-                                   (data.get("cost") or {}).get("total_cost_usd"),
-                                   (data.get("cost") or {}).get("total_duration_ms"), CAPS,
-                                   ctx_pct=pct, base_hue=sig_hue)
-    elif tier == "mid":     # drop the gauge RIGHT label (nulled → render_gauge omits it)
-        gauge = GAUGE.render_gauge(gauge_span, pct, tin, None, None, None, None, CAPS, base_hue=sig_hue)
-    else:                   # narrow → bar-only
-        gauge = GAUGE.render_gauge(gauge_span, pct, None, None, None, None, None, CAPS, base_hue=sig_hue)
+    gauge = GAUGE.render_gauge(gauge_span, pct, None, None, None, None, None, CAPS,
+                               base_hue=sig_hue, labels=False)
     row2 = LAYOUT.left_right(gauge, t_bot, gw) if rail_w > 0 else gauge
 
     # Row3 — gate verdict + daemon (left) / teammate NAMES (right rail).
@@ -832,10 +875,17 @@ def main():
     else:
         row3 = LAYOUT.left_right(left3, t_names, gw)
 
-    # Row4 — (metrics land here in the next step) blank content beside the sigil's 4th row.
-    row4 = ""
+    # Row4 — the metrics line (moved OFF the Row2 gauge) beside the sigil's blank 4th row:
+    # CTX/tokens (left) + the dual-limit readout ctx/5h/7d/$cost/reset (right), spanning
+    # the full content width. full → both halves; mid/narrow → the left CTX/tokens only.
+    m_left, m_right = metrics_segments(data, pct, tin, t)
+    row4 = LAYOUT.left_right(m_left, m_right, gw) if tier == "full" else LAYOUT.pad_or_truncate(m_left, gw)
 
     lines = LAYOUT.compose_with_sigil(sigrows, [row1, row2, row3, row4], cols, GUTTER)
+    # hard COLUMNS clamp: every assembled line is forced to EXACTLY `cols` visible cells
+    # (compose_with_sigil already does this per-row; this is the belt-and-suspenders guard
+    # that no assembled row can ever exceed the terminal width → no soft-wrap).
+    lines = [LAYOUT.pad_or_truncate(l, cols) for l in lines]
     _write("\n".join(lines) + "\n")
 
 
