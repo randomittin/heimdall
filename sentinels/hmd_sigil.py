@@ -1255,6 +1255,82 @@ def glyph_color(seed):
     return hue
 
 
+def sigil_accent_color(seed):
+    """The VIVID identity color of a seed's sigil — the palette swatch with the highest
+    HSV saturation×value that is NEITHER near-black NOR near-white. This is the colour a
+    human NAMES the hero by (batsy→blue #2f96ff, hulk→green, spiderman→red, joker→green),
+    as opposed to glyph_color()'s DOMINANT body hue (often a near-black cowl/body that
+    reads as "black"). The statusline gauge ramp samples THIS so the bar reads in the
+    sigil's recognizable identity hue, not its dark body.
+
+    For a HERO: scan its authored palette keys (hue/eye/accent6/accent7) and pick
+    argmax(saturation×value) among the swatches that are neither near-black (v<0.22 — the
+    dark body/outline) nor near-white (v>0.90 & s<0.20 — the eye glint). A non-hero seed
+    (curated / animal) carries no such palette → its identity hue glyph_color(seed).
+    Deterministic: same seed → same accent, forever."""
+    import colorsys
+    spec = _resolve_custom_spec(seed)
+    if spec is None:
+        return glyph_color(seed)
+    best = None
+    best_score = -1.0
+    for key in ("hue", "eye", "accent6", "accent7"):
+        hexv = spec.get(key)
+        if not isinstance(hexv, str):
+            continue
+        try:
+            r, g, b = _hex_rgb(hexv)
+        except Exception:
+            continue
+        _h, s, v = colorsys.rgb_to_hsv(r / 255.0, g / 255.0, b / 255.0)
+        if v < 0.22:                        # near-black — the dark cowl/body/outline
+            continue
+        if v > 0.90 and s < 0.20:           # near-white — the eye glint
+            continue
+        score = s * v
+        if score > best_score:
+            best_score = score
+            best = (r, g, b)
+    return best if best is not None else glyph_color(seed)
+
+
+def sigil_silhouette(seed, size, color=None, caps=None):
+    """Render `seed`'s sigil at `size` ('S'/'M'/'L') as a SINGLE-HUE silhouette: every
+    ON pixel → `color`, every OFF pixel → the DIM block. Same shape as the full render,
+    one flat hue — for the statusline team-cluster S marks (4 cols × 2 text rows) where a
+    full multi-tone palette reads as mud (exactly why micro() recolors). `color` is a
+    '#rrggbb' hex or an (r,g,b) tuple; None keeps the seed's own hue (glyph_color).
+
+    The sigil_render() output path is BYTE-UNTOUCHED (goldens unmoved) — this is a
+    parallel single-hue projection over the SAME size grid (_custom_size_grid for heroes,
+    _size_grid for curated/animal), packed via the shared `_cell`. Returns a list of
+    text-row strings (size 'S' → 2 rows of 4 cells)."""
+    caps = caps or TC.detect()
+    if color is None:
+        over = glyph_color(seed)
+    elif isinstance(color, str):
+        over = _hex_rgb(color)
+    else:
+        over = tuple(color)
+    got = _custom_size_grid(seed, size)              # hero: authored token grid
+    if got is not None:
+        grid, _pal = got
+        on = lambda cell: cell != '.'
+    else:
+        grid, _hue, _eye = _size_grid(seed, size)    # curated / animal: value grid
+        on = lambda cell: cell != 0
+    N = len(grid)
+    lines = []
+    for tr in range(0, N, 2):
+        line = ""
+        for c in range(N):
+            top = over if on(grid[tr][c]) else DIM
+            bot = (over if on(grid[tr + 1][c]) else DIM) if tr + 1 < N else OFF
+            line += _cell(top, bot)
+        lines.append(line)
+    return caps.emit("\n".join(lines)).split("\n")
+
+
 # ── MICRO / CHIP render — a SINGLE text-row team-cluster mark ────────────────────
 # The statusline Row-1 team cluster (`team <mark> <mark> name·name`) gives each
 # teammate ONE text-row of height. This derives a tiny recognizable mark from the

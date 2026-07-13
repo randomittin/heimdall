@@ -48,9 +48,12 @@ TC = importlib.util.module_from_spec(_tcspec)
 _tcspec.loader.exec_module(TC)
 
 # ── ramp anchors (24-bit RGB) ────────────────────────────────────────────────
-# normal fill:  #1E2F73 -> #4264FF -> #5AD7E6   (deep indigo -> brand blue -> cyan)
-# pct >= 70:    #4264FF -> #FFCB57              (brand blue -> gold tip)
-# pct >= 90:    #FFCB57 -> #FF6B6B              (gold -> red tip)
+# The base ramp fills the WHOLE bar: #1E2F73 -> #4264FF -> #5AD7E6 (deep indigo ->
+# brand blue -> cyan) by default, or dark->accent->bright derived from base_hue (the
+# user's OWN sigil VIVID accent, sigil_accent_color) so the bar reads in the sigil's
+# identity hue. The danger warning does NOT remap the whole ramp — it tints ONLY the
+# last ~TIP_CELLS filled cells (the tip) toward gold (>=70) / red (>=90) as a per-cell
+# blend, so e.g. batsy at 81% is MOSTLY BLUE with a small gold tip (not an all-gold bar).
 DARK = (0x1E, 0x2F, 0x73)   # #1E2F73
 BLUE = (0x42, 0x64, 0xFF)   # #4264FF
 CYAN = (0x5A, 0xD7, 0xE6)   # #5AD7E6
@@ -68,6 +71,7 @@ FG_FAINT = (0x9A, 0xA4, 0xB2)   # right label, faint gray (#9AA4B2)
 # thresholds
 GOLD_AT = 70
 RED_AT = 90
+TIP_CELLS = 3          # danger tints ONLY the last ~3 filled cells (the bar tip)
 
 # splice geometry / tier gates
 _LEFT_COL = 2          # left label begins at cell index 2
@@ -149,18 +153,32 @@ def ramp_anchors(base_hue):
     return dark, h, bright
 
 
-def ramp_color(t, pct, base_hue=None):
-    """Fill colour at fraction t in [0,1]. The endpoints REMAP by pct: gold tip
-    at >=70, red tip at >=90 (both hue-independent danger signals) — else a 3-stop
-    dark->hue->bright gradient derived from base_hue (default indigo->blue->cyan)."""
-    if pct >= RED_AT:
-        return _lerp(GOLD, RED, t)
+def base_ramp_color(t, base_hue=None):
+    """Fill colour at fraction t in [0,1] on the BASE ramp: a 3-stop dark->mid->bright
+    gradient derived from base_hue (default indigo->blue->cyan). NO danger remap — the
+    whole bar carries this ramp; the gold/red danger warning is applied per-cell at the
+    TIP only (see _build_cells), so the sigil's identity hue is never hidden."""
     dark, mid, bright = ramp_anchors(base_hue)
-    if pct >= GOLD_AT:
-        return _lerp(mid, GOLD, t)
     if t <= 0.5:
         return _lerp(dark, mid, t / 0.5)
     return _lerp(mid, bright, (t - 0.5) / 0.5)
+
+
+def danger_color(pct):
+    """The tip danger tint for a usage percentage: gold at >=70, red at >=90, else None
+    (no danger — the bar stays its base ramp). Hue-independent (a danger signal)."""
+    if pct >= RED_AT:
+        return RED
+    if pct >= GOLD_AT:
+        return GOLD
+    return None
+
+
+def ramp_color(t, pct, base_hue=None):
+    """Back-compat shim: the base ramp colour at t (the danger tint is now applied at the
+    tip only, in _build_cells, not by remapping the whole ramp). Retained so any external
+    caller keeps working; the gauge itself builds cells via base_ramp_color + danger."""
+    return base_ramp_color(t, base_hue)
 
 
 # ── SGR helpers (each colour a STANDALONE escape so caps.emit can rewrite it) ──
@@ -223,17 +241,28 @@ def _serialize(cells):
 
 def _build_cells(width, pct, base_hue=None):
     """A `width`-long cell array: [bg_rgb, char, fg_rgb_or_None, bold_bool].
-    Filled cells carry the quantized ramp (tinted from base_hue); the tip cell is
-    forced to the ramp endpoint; empty cells carry the alternating track stripe."""
+    Filled cells carry the quantized BASE ramp (dark->accent->bright, tinted from
+    base_hue); the tip cell is forced to the ramp endpoint. The danger warning tints ONLY
+    the last `TIP_CELLS` filled cells toward gold (pct>=70) / red (pct>=90) as a per-cell
+    blend that is strongest (full danger) at the very tip and fades to the base ramp
+    inward — so the bar stays the sigil's identity hue with a small danger tip, never an
+    all-gold/all-red bar. Empty cells carry the alternating track stripe."""
     fill = _fill_count(width, pct)
     step = max(1, math.ceil(width / 40.0))
     denom = max(1, fill - 1)
+    danger = danger_color(pct)
     cells = []
     for i in range(width):
         if i < fill:
             # quantize to `step`-cell blocks; force the tip to the endpoint.
             qi = fill - 1 if i == fill - 1 else (i // step) * step
-            bg = ramp_color(qi / denom, pct, base_hue)
+            bg = base_ramp_color(qi / denom, base_hue)
+            if danger is not None:
+                dist = (fill - 1) - i               # 0 at the very tip
+                if dist < TIP_CELLS:
+                    # blend 1.0 at the tip → 1/TIP_CELLS one cell before the fade edge.
+                    blend = (TIP_CELLS - dist) / float(TIP_CELLS)
+                    bg = _lerp(bg, danger, blend)
         else:
             bg = _TRACK_BGS[i % 2]
         cells.append([bg, " ", None, False])

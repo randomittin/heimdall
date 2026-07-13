@@ -804,10 +804,12 @@ def main():
         rail = row1_rail(gw, left1, cwd, ledger, tier, data, t)
         row1 = LAYOUT.left_right(left1, rail, gw)
 
-    # the fill ramp is tinted from the user's OWN sigil hue (glyph_color(seed)); the
-    # gold/red danger tips stay hue-independent. base_hue None → the default blue ramp.
+    # the fill ramp is tinted from the user's OWN sigil VIVID accent (sigil_accent_color:
+    # batsy→blue, hulk→green, spiderman→red — NOT the dark body hue glyph_color returns);
+    # the gold/red danger tint stays hue-independent and tip-only. base_hue None →
+    # the default blue ramp.
     try:
-        sig_hue = SIG.glyph_color(seed)
+        sig_hue = SIG.sigil_accent_color(seed)
     except Exception:
         sig_hue = None
 
