@@ -224,14 +224,16 @@ def _classify(rgb):
 
 def inv_gauge_ramp():
     span = span_of(120)
-    for p, want_tip, want_first in ((50, "ramp", G.DARK), (70, "gold", G.BLUE), (90, "red", G.GOLD)):
+    # the BASE ramp fills the whole bar (danger is tip-only now), so the FIRST filled cell
+    # is the dark ramp start #1E2F73 for EVERY pct band — pct=70/90 no longer start blue.
+    for p, want_tip, want_first in ((50, "ramp", G.DARK), (70, "gold", G.DARK), (90, "red", G.DARK)):
         row = G.render_gauge(span, p, None, None, None, None, None, CAPS)
         seq = bg_sequence(row)
         fills = [c for c in seq if c is not None and c not in TRACK]
         tracks = [c for c in seq if c in TRACK]
         if not fills:
             bad("GAUGE-RAMP: pct=%d no filled cells" % p); continue
-        # (a) first filled cell ~ the ramp start endpoint for this pct band
+        # (a) first filled cell ~ the base-ramp start endpoint (same for every pct band)
         first_ok = fills[0] == want_first
         # (b) tip class
         tip_cls = _classify(fills[-1])

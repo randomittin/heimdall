@@ -62,19 +62,25 @@ check is proven non-tautological).
 - **Known-bad RED:** replace `round()` with `int()`/floor → fractional cases
   diverge (e.g. `p=1, COLUMNS=80` → round 1 vs floor 0) → RED.
 
-### GAUGE-RAMP — ramp anchors + tip remap + empty track
-- **Assertion:** filled cells lerp the ramp `#1E2F73 → #4264FF → #5AD7E6`;
-  the tip cell remaps to gold (`#F5A623`-class) when `pct ≥ 70` and to red when
-  `pct ≥ 90`; the unfilled remainder renders a dim empty-track stripe (present,
-  never blank/space-collapsed).
-- **Measure:** parse Row2 `48;2;R;G;B` codes. (a) first filled cell ≈ `#1E2F73`
-  and the last non-tip filled cell trends toward `#5AD7E6` (monotone-ish lerp,
-  within quantization). (b) tip cell bg is gold-class iff `70 ≤ pct < 90`,
-  red-class iff `pct ≥ 90`, ramp-blue otherwise. (c) at `pct < 100` at least one
-  trailing cell carries the dim empty-track bg (distinct from ramp + from
-  terminal default). Check `pct ∈ {50, 70, 90}`.
-- **Known-bad RED:** swap the 70/90 thresholds → gold appears at `pct=90`
-  instead of red → RED. Drop the empty-track fill → trailing cells go bare → RED.
+### GAUGE-RAMP — base ramp fills the whole bar + TIP-ONLY danger + empty track
+- **Assertion:** the BASE ramp `#1E2F73 → #4264FF → #5AD7E6` (default) — or
+  `dark → accent → bright` derived from the user's OWN sigil VIVID accent
+  (`sigil_accent_color`) — fills the WHOLE filled region, so the FIRST filled cell is the
+  dark ramp start (`#1E2F73` for the default) for EVERY pct band. The gold/red danger
+  does NOT remap the whole ramp: it tints ONLY the last `TIP_CELLS` (~3) filled cells
+  toward gold (`pct ≥ 70`) / red (`pct ≥ 90`) as a per-cell blend that is FULL danger at
+  the very tip and fades to the base ramp inward — so the bar reads mostly in its identity
+  hue with a small danger tip (e.g. batsy at 81% = mostly BLUE, small GOLD tip). The
+  unfilled remainder renders a dim empty-track stripe (present, never blank/space-collapsed).
+- **Measure:** parse Row2 `48;2;R;G;B` codes. (a) first filled cell ≈ `#1E2F73` (the base
+  ramp start) for ALL of `pct ∈ {50, 70, 90}` — the whole-ramp remap is GONE, so `pct=70`
+  no longer starts at blue. (b) tip cell bg is gold-class iff `70 ≤ pct < 90`, red-class
+  iff `pct ≥ 90`, ramp-bright otherwise (at the very tip the blend is 1.0 → exactly
+  gold/red). (c) at `pct < 100` at least one trailing cell carries the dim empty-track bg
+  (distinct from ramp + from terminal default). Check `pct ∈ {50, 70, 90}`.
+- **Known-bad RED:** swap the 70/90 thresholds → gold appears at `pct=90` instead of red
+  → RED. Remap the WHOLE ramp on danger (the old behavior) → `pct=70` first cell is blue,
+  not dark → RED. Drop the empty-track fill → trailing cells go bare → RED.
 
 ### GAUGE-LABELS — inside labels gated by width
 - **Assertion:** at `COLUMNS ≥ 60` both inside labels render (left
