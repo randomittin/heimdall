@@ -536,51 +536,82 @@ def five_hour_pct(data):
         return None
     return v
 
-def _hexcolor(seed, sigil):
-    """A '#rrggbb' for a teammate's micro mark: the entry's own sigil hex if it carries
-    one, else the deterministic identity hue glyph_color(seed)."""
+def _team_hue(seed, sigil):
+    """A '#rrggbb' recolor hue for a teammate's cluster sigil: the entry's OWN sigil hex
+    if it carries a valid one, else the seed's VIVID sigil accent (sigil_accent_color — the
+    colour a human names the hero by: batsy→blue, hulk→green), else the deterministic dim
+    identity hue. A single-hue S silhouette reads best in the vivid accent, not the dark
+    body hue glyph_color returns."""
     if isinstance(sigil, str) and re.match(r"^#[0-9A-Fa-f]{6}$", sigil):
         return sigil
     try:
-        r, g, b = SIG.glyph_color(seed)
+        r, g, b = SIG.sigil_accent_color(seed)
     except Exception:
-        r, g, b = (90, 100, 114)
+        try:
+            r, g, b = SIG.glyph_color(seed)
+        except Exception:
+            r, g, b = (90, 100, 114)
     return "#%02x%02x%02x" % (r, g, b)
 
-def team_cluster(cwd, ledger, tier):
-    """Row-1 team cluster: up to 3 recolored micro marks + a `+N` overflow, hidden when
-    solo. Primary source is the ledger team[] (status.json mirror); falls back to the
-    live roster cache (team_presence) so the cluster renders today. At `mid` tier the
-    member names are dropped (count/marks only)."""
+
+# team-cluster geometry: each teammate's S-size sigil is 4 cols × 2 text rows; the name
+# below is padded/truncated to the same 4-cell column so tops, bottoms and names stack.
+TEAM_CELL_W = 4
+TEAM_GAP = 2   # cells between the gauge (Row2) and the team sigil-bottoms rail
+
+
+def _team_members(cwd, ledger):
+    """Up to 3 teammates + a `+N` overflow, from the ledger team[] (status.json mirror)
+    else the live roster cache (team_presence). Each member carries its OWN haid so the
+    cluster resolves per-teammate. Returns (members[<=3], overflow)."""
     members = list(ledger.get("team") or [])
     overflow = int(ledger.get("team_overflow") or 0)
     if not members:
         tp = team_presence(cwd)
         members = [{"user": m.get("name") or "?", "haid": m.get("haid"),
-                    "sigil": "", "state": m.get("verdict") or ""}
-                   for m in tp[:3]]
+                    "sigil": "", "state": m.get("verdict") or ""} for m in tp[:3]]
         overflow = max(0, len(tp) - 3)
+    return members[:3], overflow
+
+
+def team_rail(cwd, ledger):
+    """The RIGHT-rail team cluster as STACKED S-size sigils (RJ: '2x2 not 4x4' + stacked).
+    Each teammate's 4×4px sigil (S = 4 cols × 2 TEXT ROWS) sits with its TOP half on Row1
+    and BOTTOM half on Row2 of the right rail, the teammate NAME under it on Row3. Up to 3
+    teammates (space-gapped) + a `+N` overflow on Row1; HIDDEN entirely when solo.
+
+    Each sigil is seeded on the teammate's OWN haid (pin/hero_for-aware → THEIR hero) and
+    recoloured to their hue (sigil_silhouette single-hue projection — the multi-tone S grid
+    reads as mud at 8px, so one flat identity hue). Returns (top, bot, names, rail_w): the
+    three right-rail row strings, each LEFT-aligned to the SAME rail_w so the halves stack
+    (tops above bottoms) and names sit under each column. Solo → ('', '', '', 0)."""
+    members, overflow = _team_members(cwd, ledger)
     if not members:
-        return ""
-    marks = []
-    for m in members[:3]:
-        # seed on the teammate's OWN HAID (pin/hero_for-aware) so each teammate resolves
-        # to THEIR own sigil hero — not batsy-for-everyone. Fall back to the handle only
-        # when no haid is carried (older roster rows).
+        return "", "", "", 0
+    tops, bots, nams = [], [], []
+    for m in members:
         seed = m.get("haid") or m.get("user") or m.get("sigil") or "?"
-        color = _hexcolor(seed, m.get("sigil")) if USE_COLOR else None
+        hue = _team_hue(seed, m.get("sigil")) if USE_COLOR else None
         try:
-            marks.append(SIG.micro(seed, color, CAPS))
+            srows = SIG.sigil_silhouette(seed, "S", hue, CAPS)
         except Exception:
-            marks.append(f"{DIM}▄{X}")
-    cluster = f"{DIM}team{X} " + "".join(marks)
+            srows = [" " * TEAM_CELL_W, " " * TEAM_CELL_W]
+        tops.append(srows[0] if len(srows) > 0 else " " * TEAM_CELL_W)
+        bots.append(srows[1] if len(srows) > 1 else " " * TEAM_CELL_W)
+        nm = LAYOUT.pad_or_truncate(str(m.get("user") or ""), TEAM_CELL_W)
+        nams.append(f"{DIM}{nm}{X}")
+    top = " ".join(tops)
+    bot = " ".join(bots)
+    names = " ".join(nams)
     if overflow > 0:
-        cluster += f" {DIM}+{overflow}{X}"
-    if tier == "full":
-        names = "·".join(str(m.get("user")) for m in members[:3] if m.get("user"))
-        if names:
-            cluster += f" {DIM}{names}{X}"
-    return cluster
+        top += f" {DIM}+{overflow}{X}"
+    rail_w = max(vis(top), vis(bot), vis(names))
+    # LEFT-align each rail row within rail_w so the sigil columns stack vertically; the
+    # whole rail_w block is then RIGHT-pinned in the content row by left_right().
+    top = LAYOUT.pad_or_truncate(top, rail_w)
+    bot = LAYOUT.pad_or_truncate(bot, rail_w)
+    names = LAYOUT.pad_or_truncate(names, rail_w)
+    return top, bot, names, rail_w
 
 def daemon_seg(ledger):
     return f"{GR}◆{X}" if ledger.get("daemon") == "up" else f"{FAINT}◇{X}"
@@ -611,57 +642,6 @@ def update_notice():
     return f"{AM}⬆ {latest_raw} available{X} {FAINT}·{X} {DIM}hmd --update{X}"
 
 
-def row1_rail(gw, left1, cwd, ledger, tier, data, now):
-    """Assemble the Row-1 right rail within a WIDTH BUDGET, dropping WHOLE segments by
-    priority tier — NEVER slicing mid-token. The budget reserves `left1` whole (plus a
-    2-cell gap) so the following left_right() never has to truncate either side and no
-    right-rail token is ever hard-cut. Keep-priority when space is tight:
-        limits(5h %) > daemon > team(names → marks → hidden) > reset > update-notice.
-    Each segment is included only if the WHOLE rail still fits; otherwise it is dropped
-    (team first degrades names→marks). Returns the assembled rail string (may be '')."""
-    budget = max(0, gw - vis(left1) - 2)   # reserve left1 whole + a 2-cell min gap
-    if budget <= 0:
-        return ""
-    five, reset = rate_limit_parts(data, now)
-    daemon = daemon_seg(ledger)
-    team_rich = team_cluster(cwd, ledger, tier)     # names at 'full', marks at 'mid'
-    team_lean = team_cluster(cwd, ledger, "mid")    # marks only (degraded variant)
-    upd = update_notice()
-
-    chosen = {}
-    def rail_str():
-        parts = []
-        if "team" in chosen:   parts.append(chosen["team"])
-        if "daemon" in chosen: parts.append(chosen["daemon"])
-        lim = chosen.get("five", "")
-        if lim and "reset" in chosen:
-            lim += chosen["reset"]
-        if lim: parts.append(lim)
-        if "upd" in chosen:    parts.append(chosen["upd"])
-        return "  ".join(parts)
-    def fits():
-        return vis(rail_str()) <= budget
-    def take(key, text):
-        if not text:
-            return
-        chosen[key] = text
-        if not fits():
-            del chosen[key]
-
-    take("five", five)                              # 1 · limits (5-hour %)
-    take("daemon", daemon)                          # 2 · daemon liveness
-    if team_rich:                                   # 3 · team (rich → lean → hidden)
-        chosen["team"] = team_rich
-        if not fits():
-            del chosen["team"]
-            if team_lean and team_lean != team_rich:
-                chosen["team"] = team_lean
-                if not fits():
-                    del chosen["team"]
-    if "five" in chosen:
-        take("reset", reset)                        # 4 · reset countdown
-    take("upd", upd)                                # 5 · update notice
-    return rail_str()
 
 
 # ── Row-3 segments ─────────────────────────────────────────────────────────────
@@ -795,18 +775,26 @@ def main():
         _write(LAYOUT.pad_or_truncate(line, cols) + "\n")
         return
 
-    # ── the 3-row layout, laid out to the RIGHT of the hero sigil anchor ──
-    sigrows = _sigil_rows(seed, eye)                      # 8-wide × 3 rows
+    # ── the 4-row layout, laid out to the RIGHT of the hero sigil anchor ──
+    sigrows = _sigil_rows(seed, eye)                      # 8-wide × 4 rows
     gw = LAYOUT.remaining_width(sigrows, cols, GUTTER)    # gauge / content span
 
-    # Row1 — identity / team / rate-limit. The right rail is assembled within a width
-    # BUDGET (row1_rail): whole segments drop by priority — never a mid-token hard-cut.
+    # the TEAM CLUSTER owns the right rail across rows 1–3: each teammate's S-size sigil
+    # TOP on Row1, BOTTOM on Row2, and the NAME on Row3 (RJ: '2x2 not 4x4' + stacked).
+    # Shown at full/mid; dropped at narrow (the right rail collapses like the old rail).
+    if tier in ("full", "mid"):
+        t_top, t_bot, t_names, rail_w = team_rail(cwd, ledger)
+    else:
+        t_top, t_bot, t_names, rail_w = "", "", "", 0
+    team_gap = TEAM_GAP if rail_w > 0 else 0
+    gauge_span = max(0, gw - rail_w - team_gap)   # the gauge yields room to the team rail
+
+    # Row1 — identity (left) + teammate sigil-TOPS (right rail).
     left1 = f"{TEAL}{BOLD}⛭ HEIMDALL{X}{SEP}{DIM}{handle}·{model}{X}{SEP}{AM}{repo_str}{X}"
     if tier == "narrow":
         row1 = LAYOUT.pad_or_truncate(left1, gw)          # drop the right rail
     else:
-        rail = row1_rail(gw, left1, cwd, ledger, tier, data, t)
-        row1 = LAYOUT.left_right(left1, rail, gw)
+        row1 = LAYOUT.left_right(left1, t_top, gw)
 
     # the fill ramp is tinted from the user's OWN sigil VIVID accent (sigil_accent_color:
     # batsy→blue, hulk→green, spiderman→red — NOT the dark body hue glyph_color returns);
@@ -817,32 +805,37 @@ def main():
     except Exception:
         sig_hue = None
 
-    # Row2 — the full-bleed context gauge (labels gated by tier). At full tier the RIGHT
-    # readout carries DUAL limits: context % AND the 5-hour session limit % (+7d/cost/dur).
+    # Row2 — the context gauge over `gauge_span`, with the teammate sigil-BOTTOMS on the
+    # right rail (the gauge is full-bleed of the span it is left when the team rail is
+    # present; solo → full remaining width, byte-identical to the pre-team layout).
     tin = cw.get("total_input_tokens")
     if tier == "full":
-        gauge = GAUGE.render_gauge(gw, pct, tin, five_hour_pct(data), seven_day_pct(data),
+        gauge = GAUGE.render_gauge(gauge_span, pct, tin, five_hour_pct(data), seven_day_pct(data),
                                    (data.get("cost") or {}).get("total_cost_usd"),
                                    (data.get("cost") or {}).get("total_duration_ms"), CAPS,
                                    ctx_pct=pct, base_hue=sig_hue)
     elif tier == "mid":     # drop the gauge RIGHT label (nulled → render_gauge omits it)
-        gauge = GAUGE.render_gauge(gw, pct, tin, None, None, None, None, CAPS, base_hue=sig_hue)
+        gauge = GAUGE.render_gauge(gauge_span, pct, tin, None, None, None, None, CAPS, base_hue=sig_hue)
     else:                   # narrow → bar-only
-        gauge = GAUGE.render_gauge(gw, pct, None, None, None, None, None, CAPS, base_hue=sig_hue)
+        gauge = GAUGE.render_gauge(gauge_span, pct, None, None, None, None, None, CAPS, base_hue=sig_hue)
+    row2 = LAYOUT.left_right(gauge, t_bot, gw) if rail_w > 0 else gauge
 
-    # Row3 — gate verdict / permission-mode / busiest subagent (ghost)
+    # Row3 — gate verdict + daemon (left) / teammate NAMES (right rail).
     left3 = gate_cells(gates, colored=True)
     if tier != "narrow":
+        left3 += f"{SEP}{daemon_seg(ledger)}"
         pm = perm_mode(data)
         if pm:
             left3 += f"{SEP}{DIM}{pm}{X}"
     if tier == "narrow":
         row3 = LAYOUT.pad_or_truncate(left3, gw)
     else:
-        agents, _mx = active_swarm_agents()
-        row3 = LAYOUT.left_right(left3, subagent_ghost(agents), gw)
+        row3 = LAYOUT.left_right(left3, t_names, gw)
 
-    lines = LAYOUT.compose_with_sigil(sigrows, [row1, gauge, row3], cols, GUTTER)
+    # Row4 — (metrics land here in the next step) blank content beside the sigil's 4th row.
+    row4 = ""
+
+    lines = LAYOUT.compose_with_sigil(sigrows, [row1, row2, row3, row4], cols, GUTTER)
     _write("\n".join(lines) + "\n")
 
 
