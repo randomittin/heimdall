@@ -270,7 +270,7 @@ def _build_cells(width, pct, base_hue=None):
 
 
 def render_gauge(width, used_pct, tokens, five_hour_pct, seven_day_pct, cost_usd,
-                 duration_ms, caps, ctx_pct=None, base_hue=None):
+                 duration_ms, caps, ctx_pct=None, base_hue=None, labels=True):
     """Render the Row2 context gauge as ONE row of EXACTLY `width` visible cells.
 
     width         : total visible cell count of the row
@@ -291,6 +291,10 @@ def render_gauge(width, used_pct, tokens, five_hour_pct, seven_day_pct, cost_usd
     base_hue      : the user's OWN sigil dominant RGB (hmd_sigil.glyph_color(seed)). The
                     dark->hue->bright fill ramp is derived from it; None → the default
                     indigo->blue->cyan. Gold/red danger tips (>=70/>=90) stay hue-independent.
+    labels        : when False the bar is rendered CLEAN — the fill/track bg ramp only,
+                    with NO CTX/token/dual-limit text spliced over it (the statusline's
+                    Row2 gauge; the metrics render on their own row). Default True keeps
+                    the labelled bar for any external caller.
 
     Returns a tier-appropriate string: truecolor bg ramp downgraded to 256/16,
     or a plain ASCII proportional bar on a mono tier. Never raises.
@@ -313,8 +317,8 @@ def render_gauge(width, used_pct, tokens, five_hour_pct, seven_day_pct, cost_usd
 
         cells = _build_cells(width, pct, base_hue)
 
-        # ── labels (skipped entirely on the narrowest tier) ──
-        if width >= _MIN_LABELS:
+        # ── labels (suppressed entirely when labels=False, or on the narrowest tier) ──
+        if labels and width >= _MIN_LABELS:
             # left label over the fill, white bold
             left = "CTX %d%%" % _pct_int(pct)
             tok = humanize_tokens(tokens)
