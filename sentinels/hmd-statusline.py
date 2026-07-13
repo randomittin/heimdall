@@ -183,8 +183,14 @@ def read_stdin():
 
 # ── width detection (REUSE: 80-col conservative floor — RJ's ~95-col wrap bug) ──
 def _cols_from_tty():
-    """Read the REAL width of the CONTROLLING terminal via /dev/tty (CC captures stdout,
-    so it is not a tty). tput cols → stty size, in order. None when no tty / both fail."""
+    """Read the REAL width of the CONTROLLING terminal via /dev/tty. This is the FALLBACK
+    ONLY — it runs when $COLUMNS is absent/invalid (resolve_cols probes COLUMNS first).
+
+    Under Claude Code's statusLine the script's stdout is CAPTURED (a pipe, not a tty) and
+    there is typically NO controlling terminal, so /dev/tty cannot be opened and this returns
+    None → resolve_cols then honours $COLUMNS (which CC sets) or the conservative floor. It is
+    the PLAIN-TERMINAL path (dev runs the script by hand with COLUMNS unset) where this probe
+    resolves the true width. tput cols → stty size, in order. None when no tty / both fail."""
     try:
         tty = open("/dev/tty")
     except Exception:
@@ -209,14 +215,29 @@ def _cols_from_tty():
     return None
 
 def resolve_cols():
-    """Width WITHOUT over-assuming (never render wider than the real terminal, or an
-    over-wide row soft-wraps into a thin duplicate strip). $COLUMNS → /dev/tty → 80."""
+    """The width the whole layout is clamped to. Resolution order is LOAD-BEARING:
+
+        1. $COLUMNS  (CC's statusLine contract, v2.1.153+ — ALWAYS FIRST)
+        2. /dev/tty  (plain-terminal fallback when COLUMNS is unset)
+        3. 80        (conservative floor — under-render, never wrap)
+
+    WHY $COLUMNS MUST WIN (the RJ live-statusline bug): Claude Code runs this script for its
+    statusLine with $COLUMNS set to the statusLine region's REAL width, but it CAPTURES stdout
+    (a pipe) and gives the process no controlling terminal — so a /dev/tty width probe there
+    FAILS, or (worse) resolves the FULL outer terminal, which is WIDER than CC's region. If the
+    tty probe were consulted before COLUMNS, the render would use that wrong (too-wide) width
+    and every row would overflow CC's narrower region → CC truncates them mid-token (the
+    `7d 12% $…01.…` clip RJ saw). Honouring $COLUMNS FIRST makes the render match CC's region
+    exactly; the tty probe is reached ONLY when COLUMNS is genuinely absent (a plain terminal).
+
+    Combined with the per-row hard clamp in main() (every emitted row is forced to EXACTLY the
+    returned width), nothing the SUT emits can ever exceed CC's statusLine width."""
     env = os.environ.get("COLUMNS")
     if env is not None:
         with contextlib.suppress(Exception):
             c = int(env.strip())
             if c > 0:
-                return c
+                return c   # $COLUMNS wins — the tty probe below is NOT consulted.
     c = _cols_from_tty()
     if c and c > 0:
         return c
@@ -925,9 +946,11 @@ def main():
     row4 = ""
 
     lines = LAYOUT.compose_with_sigil(sigrows, [row1, row2, row3, row4], cols, GUTTER)
-    # hard COLUMNS clamp: every assembled line is forced to EXACTLY `cols` visible cells
-    # (compose_with_sigil already does this per-row; this is the belt-and-suspenders guard
-    # that no assembled row can ever exceed the terminal width → no soft-wrap).
+    # HARD COLUMNS CLAMP (the CC live-statusline safety net): every assembled line is forced to
+    # EXACTLY `cols` (= resolve_cols(), which honours CC's $COLUMNS first) visible cells.
+    # compose_with_sigil already does this per-row; this belt-and-suspenders pass guarantees NO
+    # assembled row can ever exceed CC's statusLine width, so CC never truncates a row mid-token
+    # (the `…` clip) and no over-wide row soft-wraps into a thin duplicate strip.
     lines = [LAYOUT.pad_or_truncate(l, cols) for l in lines]
     _write("\n".join(lines) + "\n")
 
