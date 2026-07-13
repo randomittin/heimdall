@@ -314,20 +314,23 @@ def _identity_cache_path(session_id):
     tmp = os.environ.get("HMD_STATUSLINE_TMP") or "/tmp"
     return os.path.join(tmp, "hmd-statusline-identity-" + slug)
 
-def _identity_cache_get(session_id):
-    """The cached (seed, handle) when the cache file is < IDENTITY_TTL old, else None. A
-    hit proves NO heimdall-identity fork happened this render. Never raises."""
+def _identity_cache_read(session_id):
+    """The cached (seed, handle) tuple, plus whether it is still FRESH (< IDENTITY_TTL old):
+    returns (value_or_None, is_fresh). A FRESH value serves the WARM no-fork render (a hit
+    proves NO heimdall-identity fork happened this tick). A STALE value is kept as the
+    last-known-good identity, reused when a re-fork FAILS — so a transient fork
+    timeout/error never regresses the MAIN sigil to the $USER fallback (the batsy-pin miss
+    that rendered the `rj`→dog animal). Never raises."""
     p = _identity_cache_path(session_id)
     try:
-        if time.time() - os.path.getmtime(p) > IDENTITY_TTL:
-            return None
+        fresh = (time.time() - os.path.getmtime(p)) <= IDENTITY_TTL
         with open(p, encoding="utf-8") as f:
             d = json.load(f)
         if isinstance(d, dict) and isinstance(d.get("seed"), str) and isinstance(d.get("handle"), str):
-            return d["seed"], d["handle"]
+            return (d["seed"], d["handle"]), fresh
     except Exception:
-        return None
-    return None
+        return None, False
+    return None, False
 
 def _identity_cache_put(session_id, seed, handle):
     """Atomically persist the resolved (seed, handle) for the session (tmp + os.replace).
@@ -345,12 +348,22 @@ def _identity_cache_put(session_id, seed, handle):
 
 def identity(cwd, fallback, session_id=""):
     """The resolved (sigil seed, display handle), served through the per-session 5s cache
-    so a WARM refresh never forks heimdall-identity. On a cache MISS the canonical bin is
-    forked ONCE (bash+jq), the result is applied through the sigil override + cached, and
-    returned; on a HIT the cached pair is returned with NO fork. Byte-identical to the
-    uncached path (same resolved pair → same render)."""
-    cached = _identity_cache_get(session_id)
-    if cached is not None:
+    so a WARM refresh never forks heimdall-identity. On a FRESH hit the cached pair is
+    returned with NO fork. On a MISS (cold or >TTL) the canonical bin is forked ONCE
+    (bash+jq); a GENUINE resolution is applied through the sigil override, cached, and
+    returned (byte-identical to the uncached path).
+
+    A fork that TIMES OUT / errors / returns empty must NEVER poison the cache with the
+    $USER fallback: that bare handle is not a real HAID, so it MISSES the batsy
+    CUSTOM_SIGILS pin and the MAIN sigil regresses to the `rj`→dog TEAL animal — and the
+    5s cache would then FREEZE that wrong seed, flipping the sigil for a full 5s while the
+    team-self sigil (which reads the real HAID from the ledger) stays batsy. So a failed
+    re-fork instead REUSES the last-known-good identity (the stale cache entry, any age),
+    keeping the MAIN sigil the SAME pinned hero the team renders. Only a cold session that
+    has NEVER resolved falls back to $USER — and that is left UNCACHED so the next
+    (recovered) fork wins immediately (self-heals, no 5s freeze)."""
+    cached, fresh = _identity_cache_read(session_id)
+    if cached is not None and fresh:
         return cached
     seed = handle = None
     bin_path = os.path.join(BIN_DIR, "heimdall-identity")
@@ -363,10 +376,13 @@ def identity(cwd, fallback, session_id=""):
             handle = (rec.get("handle") or "").strip() or None
     except Exception:
         seed = handle = None
-    resolved = seed or fallback
-    out = (_sigil_override_seed(resolved), (handle or resolved))
-    _identity_cache_put(session_id, out[0], out[1])
-    return out
+    if seed:
+        out = (_sigil_override_seed(seed), (handle or seed))
+        _identity_cache_put(session_id, out[0], out[1])
+        return out
+    if cached is not None:
+        return cached   # fork failed → reuse last-known-good (== team-self), never $USER
+    return _sigil_override_seed(fallback), fallback   # cold + broken fork → transient, UNCACHED
 
 def _sigil_override_seed(seed):
     """Honor `hmd sigil set <hero>` (unlocked after >=3 runs); else the seed unchanged."""
