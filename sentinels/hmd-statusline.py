@@ -606,6 +606,60 @@ def update_notice():
         return ""
     return f"{AM}⬆ {latest_raw} available{X} {FAINT}·{X} {DIM}hmd --update{X}"
 
+
+def row1_rail(gw, left1, cwd, ledger, tier, data, now):
+    """Assemble the Row-1 right rail within a WIDTH BUDGET, dropping WHOLE segments by
+    priority tier — NEVER slicing mid-token. The budget reserves `left1` whole (plus a
+    2-cell gap) so the following left_right() never has to truncate either side and no
+    right-rail token is ever hard-cut. Keep-priority when space is tight:
+        limits(5h %) > daemon > team(names → marks → hidden) > reset > update-notice.
+    Each segment is included only if the WHOLE rail still fits; otherwise it is dropped
+    (team first degrades names→marks). Returns the assembled rail string (may be '')."""
+    budget = max(0, gw - vis(left1) - 2)   # reserve left1 whole + a 2-cell min gap
+    if budget <= 0:
+        return ""
+    five, reset = rate_limit_parts(data, now)
+    daemon = daemon_seg(ledger)
+    team_rich = team_cluster(cwd, ledger, tier)     # names at 'full', marks at 'mid'
+    team_lean = team_cluster(cwd, ledger, "mid")    # marks only (degraded variant)
+    upd = update_notice()
+
+    chosen = {}
+    def rail_str():
+        parts = []
+        if "team" in chosen:   parts.append(chosen["team"])
+        if "daemon" in chosen: parts.append(chosen["daemon"])
+        lim = chosen.get("five", "")
+        if lim and "reset" in chosen:
+            lim += chosen["reset"]
+        if lim: parts.append(lim)
+        if "upd" in chosen:    parts.append(chosen["upd"])
+        return "  ".join(parts)
+    def fits():
+        return vis(rail_str()) <= budget
+    def take(key, text):
+        if not text:
+            return
+        chosen[key] = text
+        if not fits():
+            del chosen[key]
+
+    take("five", five)                              # 1 · limits (5-hour %)
+    take("daemon", daemon)                          # 2 · daemon liveness
+    if team_rich:                                   # 3 · team (rich → lean → hidden)
+        chosen["team"] = team_rich
+        if not fits():
+            del chosen["team"]
+            if team_lean and team_lean != team_rich:
+                chosen["team"] = team_lean
+                if not fits():
+                    del chosen["team"]
+    if "five" in chosen:
+        take("reset", reset)                        # 4 · reset countdown
+    take("upd", upd)                                # 5 · update notice
+    return rail_str()
+
+
 # ── Row-3 segments ─────────────────────────────────────────────────────────────
 _GATE_GLYPH = {"pass": ("✓", GR), "running": ("◌", AM), "deny": ("✗", RD)}
 
@@ -741,20 +795,21 @@ def main():
     sigrows = _sigil_rows(seed, eye)                      # 8-wide × 3 rows
     gw = LAYOUT.remaining_width(sigrows, cols, GUTTER)    # gauge / content span
 
-    # Row1 — identity / team / rate-limit
+    # Row1 — identity / team / rate-limit. The right rail is assembled within a width
+    # BUDGET (row1_rail): whole segments drop by priority — never a mid-token hard-cut.
     left1 = f"{TEAL}{BOLD}⛭ HEIMDALL{X}{SEP}{DIM}{handle}·{model}{X}{SEP}{AM}{repo_str}{X}"
     if tier == "narrow":
         row1 = LAYOUT.pad_or_truncate(left1, gw)          # drop the right rail
     else:
-        rparts = []
-        cluster = team_cluster(cwd, ledger, tier)
-        if cluster: rparts.append(cluster)
-        rparts.append(daemon_seg(ledger))
-        rl = rate_limit_seg(data, t)
-        if rl: rparts.append(rl)
-        upd = update_notice()   # ambient 'update available' — folded into Row1 spare width
-        if upd: rparts.append(upd)
-        row1 = LAYOUT.left_right(left1, "  ".join(rparts), gw)
+        rail = row1_rail(gw, left1, cwd, ledger, tier, data, t)
+        row1 = LAYOUT.left_right(left1, rail, gw)
+
+    # the fill ramp is tinted from the user's OWN sigil hue (glyph_color(seed)); the
+    # gold/red danger tips stay hue-independent. base_hue None → the default blue ramp.
+    try:
+        sig_hue = SIG.glyph_color(seed)
+    except Exception:
+        sig_hue = None
 
     # Row2 — the full-bleed context gauge (labels gated by tier). At full tier the RIGHT
     # readout carries DUAL limits: context % AND the 5-hour session limit % (+7d/cost/dur).
@@ -763,11 +818,11 @@ def main():
         gauge = GAUGE.render_gauge(gw, pct, tin, five_hour_pct(data), seven_day_pct(data),
                                    (data.get("cost") or {}).get("total_cost_usd"),
                                    (data.get("cost") or {}).get("total_duration_ms"), CAPS,
-                                   ctx_pct=pct)
+                                   ctx_pct=pct, base_hue=sig_hue)
     elif tier == "mid":     # drop the gauge RIGHT label (nulled → render_gauge omits it)
-        gauge = GAUGE.render_gauge(gw, pct, tin, None, None, None, None, CAPS)
+        gauge = GAUGE.render_gauge(gw, pct, tin, None, None, None, None, CAPS, base_hue=sig_hue)
     else:                   # narrow → bar-only
-        gauge = GAUGE.render_gauge(gw, pct, None, None, None, None, None, CAPS)
+        gauge = GAUGE.render_gauge(gw, pct, None, None, None, None, None, CAPS, base_hue=sig_hue)
 
     # Row3 — gate verdict / permission-mode / busiest subagent (ghost)
     left3 = gate_cells(gates, colored=True)

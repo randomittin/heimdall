@@ -436,7 +436,8 @@ def prove_red():
 
     # 3) null-safe RED: fabricate a 0% limit when rate_limits absent → a limit token appears.
     m3 = load(SL, "sl_mut3")
-    m3.rate_limit_seg = lambda data, now: "%s𝘅 0%%%s" % (m3.GR, m3.X)
+    # the Row-1 rail feeds from rate_limit_parts; fabricate a 0% pct segment there.
+    m3.rate_limit_parts = lambda data, now: ("%s𝘅 0%%%s" % (m3.GR, m3.X), "")
     c = tempfile.mkdtemp()
     d = canned(c, 120, rl=False)
     os.makedirs(os.path.join(c, ".heimdall"), exist_ok=True)
