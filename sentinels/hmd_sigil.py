@@ -1255,6 +1255,74 @@ def glyph_color(seed):
     return hue
 
 
+# ── MICRO / CHIP render — a SINGLE text-row team-cluster mark ────────────────────
+# The statusline Row-1 team cluster (`team <mark> <mark> name·name`) gives each
+# teammate ONE text-row of height. This derives a tiny recognizable mark from the
+# SAME 8×8 hero/animal grid every other size renders through — nothing new is
+# hand-authored. The 8×8 is box-majority downsampled (the exact filter S uses, only
+# to a 4×2 target) then packed into ONE `▄` text-row: 4 cells wide, each cell = a
+# top/bot pixel pair (top px → bg, bot px → fg — the `_cell` ▄ convention), so one
+# text-row encodes the 2 downsampled pixel-rows as a compressed silhouette.
+MICRO_W, MICRO_H = 4, 2   # 4 px wide × 2 px tall → one `▄` text-row of 4 cells
+
+def _micro_cells(seed):
+    """Box-majority downsample the seed's 8×8 grid to MICRO_H×MICRO_W, returning
+    (rows, is_on, base): `rows` is MICRO_H lists of MICRO_W items; `is_on(item)` is
+    True for a silhouette (non-bg) pixel; `base(item)` is the item's OWN hero color.
+    A hero (pin / hero-name / real-HAID auto-assign) downsamples its authored TOKEN
+    grid over its full palette (mirrors _custom_size_grid's S path); every other seed
+    downsamples the composited VALUE grid over its hue/eye (mirrors _size_grid's S
+    path). Each MICRO cell box is (W//MICRO_W)=2 wide × (H//MICRO_H)=4 tall = 8 source
+    px, majority-filtered (_majority — ties break toward the higher token/value so the
+    silhouette survives the shrink, exactly as S does)."""
+    sx, sy = W // MICRO_W, H // MICRO_H
+    def down(grid):
+        return [[_majority([grid[sy * R + dr][sx * C + dc]
+                            for dr in range(sy) for dc in range(sx)])
+                 for C in range(MICRO_W)] for R in range(MICRO_H)]
+    got = custom_for(seed)
+    if got is not None:                        # hero: authored token grid + full palette
+        grid, pal = got
+        rows = down(grid)
+        return rows, (lambda tok: tok != '.'), (lambda tok: pal.get(tok, pal['.']))
+    g, hue, eye = grid_for(seed)               # curated/animal: value grid (0 off,1 body,2 eye)
+    rows = down(g)
+    return rows, (lambda v: v != 0), (lambda v: cell_color(v, hue, eye))
+
+def micro(seed_or_hero, color=None, caps=None):
+    """A ONE-text-row compressed sigil mark (4 cells) for the statusline team cluster.
+
+    Derived — never hand-authored: the seed's 8×8 hero/animal grid is box-majority
+    downsampled to 4×2 px and packed into a single `▄` text-row via the shared `_cell`.
+    `seed_or_hero` is any seed the sigil core resolves — an explicit hero NAME, a real
+    HAID (→ its auto-assigned hero), a pinned HAID, or a toy seed (→ its animal); an
+    unknown seed never crashes, it resolves deterministically like every other surface.
+
+    RECOLOR CHOICE — at 4×2 px (8 pixels) a full multi-tone palette reads as mud, so a
+    supplied `color` (a '#rrggbb' hex, e.g. a teammate's status.json team[].sigil) paints
+    the compressed SILHOUETTE in that ONE hue: every on-pixel → the member's color, every
+    off-pixel → the DIM silhouette block. The shape (which pixels are on) is preserved, so
+    the mark still reads as the hero, now unmistakably in the member's color. With no
+    `color`, the mark keeps the hero's OWN palette colors (its native look, shrunk).
+
+    Terminal-safe: emitted truecolor is downgraded through `caps` in one pass (truecolor
+    NO-OP · 256 LUT · 16 · mono strips color → a plain `▄`/`.` glyph, no SGR). `caps`
+    defaults to the detected terminal. Returns ONE string (no trailing newline)."""
+    caps = caps or TC.detect()
+    rows, is_on, base = _micro_cells(seed_or_hero)
+    over = _hex_rgb(color) if color else None
+    line = ""
+    for C in range(MICRO_W):
+        top_item, bot_item = rows[0][C], rows[1][C]
+        if over is not None:
+            top = over if is_on(top_item) else DIM
+            bot = over if is_on(bot_item) else DIM
+        else:
+            top, bot = base(top_item), base(bot_item)
+        line += _cell(top, bot)
+    return caps.emit(line)
+
+
 def _sq(rgb, n, caps):
     """An n×n aspect-square block: n cols × n/2 half-block rows, each cell the same
     solid color (fg=bg). If the terminal's cell aspect is the assumed ~1:2, this
@@ -1322,6 +1390,10 @@ def _cli_main(argv=None):
                     help="detailed tier only: an emotion variant (e.g. rage, joy); "
                          "falls back to the base family when the variant is absent")
     ap.add_argument('--glyph', action='store_true')
+    ap.add_argument('--micro', action='store_true',
+                    help="print the 1-text-row compressed team-cluster mark (4 cells)")
+    ap.add_argument('--color', default=None, metavar='#RRGGBB',
+                    help="--micro only: recolor the mark to this hex (a teammate's sigil hue)")
     ap.add_argument('--debug', action='store_true')  # print ·/#/@ grid
     ap.add_argument('--hero-for', dest='hero_for', default=None, metavar='HAID',
                     help="print the hero a HAID auto-assigns to (deterministic pool pick)")
@@ -1354,6 +1426,14 @@ def _cli_main(argv=None):
         ap.error("--seed is required (or use --test for the calibration card)")
     if a.glyph:
         print(glyph(a.seed)); return 0
+    if a.micro:
+        # 1-text-row team-cluster mark. Honor an explicit --tier (goldens/scripts),
+        # else auto-detect the terminal (morph-safe — never truecolor blind).
+        if a.tier == 'ascii':   mc = tier_caps(TC.MONO, TC.ASCII)
+        elif a.tier == 'mono':  mc = tier_caps(TC.MONO, TC.FULL)
+        elif a.tier in ('256', '16', 'truecolor'): mc = tier_caps(a.tier, TC.FULL)
+        else:                   mc = TC.detect()
+        print(micro(a.seed, color=a.color, caps=mc)); return 0
     if a.debug:
         g, _, _ = grid_for(a.seed)
         for row in g:
