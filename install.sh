@@ -311,9 +311,10 @@ def cmd(rel):
 
 WANT = {
     "statusLine":         {"marker": "hooks/statusline.sh",
-                           "value": {"type": "command", "command": cmd("hooks/statusline.sh")}},
-    "subagentStatusLine": {"marker": "hmd-subagent-statusline.sh",
-                           "value": {"type": "command", "command": cmd("sentinels/hmd-subagent-statusline.sh")}},
+                           "value": {"type": "command", "command": cmd("hooks/statusline.sh"),
+                                     "refreshInterval": 2}},
+    "subagentStatusLine": {"marker": "subagent-statusline.sh",
+                           "value": {"type": "command", "command": cmd("hooks/subagent-statusline.sh")}},
 }
 
 try:

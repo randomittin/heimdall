@@ -246,7 +246,7 @@ except Exception:
 sl = (d.get("statusLine") or {}).get("command", "")
 sa = (d.get("subagentStatusLine") or {}).get("command", "")
 ok_sl = (plugin + "/hooks/statusline.sh") in sl
-ok_sa = (plugin + "/sentinels/hmd-subagent-statusline.sh") in sa
+ok_sa = (plugin + "/hooks/subagent-statusline.sh") in sa
 # Absolute installed path, NOT an unresolved ${CLAUDE_PLUGIN_ROOT} (which renders
 # nothing in a user-level statusLine) — the distinction the fix turns on.
 no_unresolved = "CLAUDE_PLUGIN_ROOT" not in sl and "CLAUDE_PLUGIN_ROOT" not in sa

@@ -105,7 +105,7 @@ def cmd(rel):
     p = plugin + "/" + rel
     return "bash -c '[ -x \"%s\" ] && exec bash \"%s\"; exit 0'" % (p, p)
 WANT = {"statusLine": ("hooks/statusline.sh", cmd("hooks/statusline.sh")),
-        "subagentStatusLine": ("hmd-subagent-statusline.sh", cmd("sentinels/hmd-subagent-statusline.sh"))}
+        "subagentStatusLine": ("subagent-statusline.sh", cmd("hooks/subagent-statusline.sh"))}
 try:
     data = json.load(open(path))
     if not isinstance(data, dict): data = {}
@@ -143,9 +143,10 @@ def cmd(rel):
 
 WANT = {
     "statusLine":         {"marker": "hooks/statusline.sh",
-                           "value": {"type": "command", "command": cmd("hooks/statusline.sh")}},
-    "subagentStatusLine": {"marker": "hmd-subagent-statusline.sh",
-                           "value": {"type": "command", "command": cmd("sentinels/hmd-subagent-statusline.sh")}},
+                           "value": {"type": "command", "command": cmd("hooks/statusline.sh"),
+                                     "refreshInterval": 2}},
+    "subagentStatusLine": {"marker": "subagent-statusline.sh",
+                           "value": {"type": "command", "command": cmd("hooks/subagent-statusline.sh")}},
 }
 
 try:
