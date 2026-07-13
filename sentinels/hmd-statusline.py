@@ -603,8 +603,10 @@ def _team_hue(seed, sigil):
     return "#%02x%02x%02x" % (r, g, b)
 
 
-# team-cluster geometry: each teammate's S-size sigil is 4 cols × 2 text rows; the name
-# below is padded/truncated to the same 4-cell column so tops, bottoms and names stack.
+# team-cluster geometry: each teammate's S-size sigil is 4 cols × 2 text rows; each column
+# widens to max(4, name width) so the sigil halves stack ABOVE the WHOLE name (never a
+# `aks…` mid-token slice). The cluster is budgeted to a spare width and drops whole
+# teammates (→ +N) before it would overflow.
 TEAM_CELL_W = 4
 TEAM_GAP = 2   # cells between the gauge (Row2) and the team sigil-bottoms rail
 
@@ -623,21 +625,48 @@ def _team_members(cwd, ledger):
     return members[:3], overflow
 
 
-def team_rail(cwd, ledger):
+def _team_assemble(cells, overflow, name_cap=None):
+    """Build (top, bot, names, rail_w) from `cells` [(top_half, bot_half, name), ...]. Each
+    column widens to max(TEAM_CELL_W, name width) so the two sigil halves stack ABOVE the
+    WHOLE name. `name_cap` (last-resort only) clamps an over-long name with `…`. All three
+    rows are LEFT-aligned to a common rail_w; the `+N` overflow tag rides the top row."""
+    tcol, bcol, ncol = [], [], []
+    for top_s, bot_s, name in cells:
+        if name_cap is not None and vis(name) > name_cap:
+            name = LAYOUT.pad_or_truncate(name, name_cap)
+        col_w = max(TEAM_CELL_W, vis(name))
+        tcol.append(LAYOUT.pad_or_truncate(top_s, col_w))
+        bcol.append(LAYOUT.pad_or_truncate(bot_s, col_w))
+        ncol.append(f"{DIM}{LAYOUT.pad_or_truncate(name, col_w)}{X}")
+    top = " ".join(tcol); bot = " ".join(bcol); names = " ".join(ncol)
+    if overflow > 0:
+        top += f" {DIM}+{overflow}{X}"
+    rail_w = max(vis(top), vis(bot), vis(names))
+    return (LAYOUT.pad_or_truncate(top, rail_w),
+            LAYOUT.pad_or_truncate(bot, rail_w),
+            LAYOUT.pad_or_truncate(names, rail_w), rail_w)
+
+
+def team_rail(cwd, ledger, avail):
     """The RIGHT-rail team cluster as STACKED S-size sigils (RJ: '2x2 not 4x4' + stacked).
     Each teammate's 4×4px sigil (S = 4 cols × 2 TEXT ROWS) sits with its TOP half on Row1
     and BOTTOM half on Row2 of the right rail, the teammate NAME under it on Row3. Up to 3
     teammates (space-gapped) + a `+N` overflow on Row1; HIDDEN entirely when solo.
 
+    Names show IN FULL — each column widens to max(4, name width) so short names (`kai`) and
+    longer ones (`akshay`) both render whole, never sliced to `aks…`. `avail` is the max rail
+    width the content row can spare; when the full cluster would exceed it, trailing WHOLE
+    teammates are dropped into `+N` (never a mid-token slice), and only a lone still-too-wide
+    name is abbreviated with `…` as the absolute last resort.
+
     Each sigil is seeded on the teammate's OWN haid (pin/hero_for-aware → THEIR hero) and
     recoloured to their hue (sigil_silhouette single-hue projection — the multi-tone S grid
-    reads as mud at 8px, so one flat identity hue). Returns (top, bot, names, rail_w): the
-    three right-rail row strings, each LEFT-aligned to the SAME rail_w so the halves stack
-    (tops above bottoms) and names sit under each column. Solo → ('', '', '', 0)."""
+    reads as mud at 8px, so one flat identity hue). Returns (top, bot, names, rail_w) each
+    LEFT-aligned to the SAME rail_w; solo / no room → ('', '', '', 0)."""
     members, overflow = _team_members(cwd, ledger)
-    if not members:
+    if not members or avail is None or avail < TEAM_CELL_W:
         return "", "", "", 0
-    tops, bots, nams = [], [], []
+    cells = []
     for m in members:
         seed = m.get("haid") or m.get("user") or m.get("sigil") or "?"
         hue = _team_hue(seed, m.get("sigil")) if USE_COLOR else None
@@ -645,21 +674,21 @@ def team_rail(cwd, ledger):
             srows = SIG.sigil_silhouette(seed, "S", hue, CAPS)
         except Exception:
             srows = [" " * TEAM_CELL_W, " " * TEAM_CELL_W]
-        tops.append(srows[0] if len(srows) > 0 else " " * TEAM_CELL_W)
-        bots.append(srows[1] if len(srows) > 1 else " " * TEAM_CELL_W)
-        nm = LAYOUT.pad_or_truncate(str(m.get("user") or ""), TEAM_CELL_W)
-        nams.append(f"{DIM}{nm}{X}")
-    top = " ".join(tops)
-    bot = " ".join(bots)
-    names = " ".join(nams)
-    if overflow > 0:
-        top += f" {DIM}+{overflow}{X}"
-    rail_w = max(vis(top), vis(bot), vis(names))
-    # LEFT-align each rail row within rail_w so the sigil columns stack vertically; the
-    # whole rail_w block is then RIGHT-pinned in the content row by left_right().
-    top = LAYOUT.pad_or_truncate(top, rail_w)
-    bot = LAYOUT.pad_or_truncate(bot, rail_w)
-    names = LAYOUT.pad_or_truncate(names, rail_w)
+        top = srows[0] if len(srows) > 0 else " " * TEAM_CELL_W
+        bot = srows[1] if len(srows) > 1 else " " * TEAM_CELL_W
+        cells.append((top, bot, str(m.get("user") or "")))
+    of = overflow
+    cs = list(cells)
+    top, bot, names, rail_w = _team_assemble(cs, of)
+    # BUDGET: drop trailing WHOLE teammates (→ +N) until the cluster fits `avail`.
+    while rail_w > avail and len(cs) > 1:
+        cs = cs[:-1]; of += 1
+        top, bot, names, rail_w = _team_assemble(cs, of)
+    # LAST RESORT: a lone teammate whose name alone overruns `avail` → clamp that ONE name
+    # column with `…` (only now — every whole-member drop is exhausted).
+    if rail_w > avail:
+        tag = vis(" +%d" % of) if of > 0 else 0
+        top, bot, names, rail_w = _team_assemble(cs, of, name_cap=max(TEAM_CELL_W, avail - tag))
     return top, bot, names, rail_w
 
 def daemon_seg(ledger):
@@ -809,7 +838,13 @@ def main():
     # TOP on Row1, BOTTOM on Row2, and the NAME on Row3 (RJ: '2x2 not 4x4' + stacked).
     # Shown at full/mid; dropped at narrow (the right rail collapses like the old rail).
     if tier in ("full", "mid"):
-        t_top, t_bot, t_names, rail_w = team_rail(cwd, ledger)
+        # the team rail may claim up to the content width MINUS a minimum gauge span, so a
+        # wide cluster shrinks the gauge rather than overflowing the line. Short names at
+        # normal widths fit whole with room to spare; the budget only bites on a pathological
+        # cluster, where whole teammates drop into +N (never a mid-token slice).
+        min_gauge = max(12, gw // 3)
+        rail_avail = max(0, gw - TEAM_GAP - min_gauge)
+        t_top, t_bot, t_names, rail_w = team_rail(cwd, ledger, rail_avail)
     else:
         t_top, t_bot, t_names, rail_w = "", "", "", 0
     team_gap = TEAM_GAP if rail_w > 0 else 0
