@@ -222,6 +222,43 @@ def resolve_cols():
         return c
     return 80   # conservative floor: under-render, never wrap
 
+# ── git branch (cached, NO subprocess) ────────────────────────────────────────
+def _git_branch(cwd):
+    """The current git branch for `cwd`, read STRAIGHT from `.git/HEAD` — no
+    subprocess, no network. Walks up parents until a `.git` (dir OR the worktree
+    `gitdir:` file) is found, then parses `ref: refs/heads/<branch>` (a detached HEAD
+    → the short sha). Returns None outside any git repo (→ no branch suffix). Total:
+    any fault degrades to None, never raises."""
+    try:
+        d = os.path.abspath(cwd)
+    except Exception:
+        return None
+    for _ in range(64):
+        gitpath = os.path.join(d, ".git")
+        head = None
+        try:
+            if os.path.isdir(gitpath):
+                head = os.path.join(gitpath, "HEAD")
+            elif os.path.isfile(gitpath):
+                # a linked worktree: `.git` is a file `gitdir: <path-to-gitdir>`.
+                with open(gitpath, "r", encoding="utf-8") as f:
+                    line = f.read().strip()
+                if line.startswith("gitdir:"):
+                    head = os.path.join(line.split(":", 1)[1].strip(), "HEAD")
+            if head and os.path.isfile(head):
+                with open(head, "r", encoding="utf-8") as f:
+                    ref = f.read().strip()
+                if ref.startswith("ref: refs/heads/"):
+                    return ref[len("ref: refs/heads/"):].strip() or None
+                return ref[:7] if ref else None   # detached HEAD → short sha
+        except Exception:
+            return None
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    return None
+
 # ── legacy single-verdict state (for --widget + eye animation) ────────────────
 def gate_state(cwd):
     p = os.environ.get("HEIMDALL_STATE", os.path.join(cwd, ".heimdall", "statusline.json"))
@@ -618,11 +655,16 @@ def main():
     pct = 0.0 if not isinstance(up, (int, float)) or isinstance(up, bool) else float(up)
     session_id = data.get("session_id") or ""
 
-    # repo:branch — repo absent → the current_dir basename with NO branch/:worktree join.
+    # repo:branch — CC's statusLine stdin rarely carries a branch, so fall back to the
+    # cached .git/HEAD read (no subprocess) so Row1 shows `heimdall:main`, not bare
+    # `heimdall`. repo absent → the current_dir basename with NO branch/:worktree join
+    # (dir-basename no-branch outside git).
     repo_obj = ws.get("repo") or {}
     repo_name = repo_obj.get("name")
     branch = ws.get("git_worktree") or repo_obj.get("branch")
     if repo_name:
+        if not branch:
+            branch = _git_branch(cwd)
         repo_str = str(repo_name) + (":" + str(branch) if branch else "")
     else:
         repo_str = os.path.basename(str(cwd).rstrip("/")) or str(cwd)
