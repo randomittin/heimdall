@@ -692,6 +692,43 @@ def gate_cells(gates, colored=True):
         out.append(f"{col}{glyph}{X}" if colored else glyph)
     return (f"{FAINT}·{X}".join(out) if colored else "·".join(out))
 
+# Row3 gate-label detail levels (richest → sparsest): 0 = `<mark> <id> <detail>`,
+# 1 = `<mark> <id>`, 2 = `<mark>` only. The mark (verdict glyph) is ALWAYS kept; the
+# detail is dropped first, then the id, when the row is width-constrained.
+_GATE_LVL_FULL, _GATE_LVL_ID, _GATE_LVL_MARK = 0, 1, 2
+
+def _gate_seg(g, level, colored):
+    """One gate rendered at `level`: mark (verdict-coloured) + optional id (dim) + optional
+    detail (faint). The mark is always present; the id/detail are gated by `level`."""
+    glyph, col = _GATE_GLYPH.get(g.get("state"), ("◌", DIM))
+    mark = f"{col}{glyph}{X}" if colored else glyph
+    gid = str(g.get("id") or "")
+    if level >= _GATE_LVL_MARK or not gid:
+        return mark
+    idpart = f" {DIM}{gid}{X}" if colored else " " + gid
+    detail = str(g.get("detail") or "")
+    if level >= _GATE_LVL_ID or not detail:
+        return mark + idpart
+    detpart = f" {FAINT}{detail}{X}" if colored else " " + detail
+    return mark + idpart + detpart
+
+def gate_labels(gates, avail, colored=True):
+    """Row3 gate labels — `<mark> <id> <detail> · …` (e.g. `✓ secrets · ✓ tests 41/41 ·
+    ✓ designmatch .91`). Mark ✓ pass / ◌ running / ✗ deny; id + detail from the ledger
+    gates[]. BUDGET: render at the RICHEST detail level whose visible width fits `avail`,
+    dropping the detail first (level 1) then the id (level 2 → marks only) GLOBALLY when
+    width-constrained — the verdict mark is never dropped. Empty gates → `◌ offline` (no
+    ledger). The caller still pad_or_truncate()s to the exact span as a last resort."""
+    if not gates:
+        return f"{DIM}◌ offline{X}" if colored else "offline"
+    sep = f"{FAINT} · {X}" if colored else " · "
+    seg = ""
+    for level in (_GATE_LVL_FULL, _GATE_LVL_ID, _GATE_LVL_MARK):
+        seg = sep.join(_gate_seg(g, level, colored) for g in gates)
+        if avail is None or vis(seg) <= avail:
+            return seg
+    return seg   # marks-only still over budget → caller clips
+
 def subagent_ghost(agents):
     """A faint right-rail ghost naming the busiest live subagent (the most recently
     started) + the active count. '' when no subagent is live."""
@@ -837,10 +874,12 @@ def main():
                                base_hue=sig_hue, labels=True)
     row2 = gauge
 
-    # ── Row3 — the gate cells `✓ <id> <detail> · …` (left); the right rail is EMPTY ──
-    # (the mockup's subagent line CANNOT come from the main statusline — CC passes no subagent
-    # data here; it renders via subagentStatusLine separately). The daemon moved to Row1.
-    row3 = LAYOUT.pad_or_truncate(gate_cells(gates, colored=True), gw)
+    # ── Row3 — the gate labels `✓ <id> <detail> · …` (left); the right rail is EMPTY ──
+    # e.g. `✓ secrets · ✓ tests 41/41 · ✓ designmatch .91`. gate_labels budgets to gw,
+    # dropping <detail> then <id> (never the verdict mark) when width-constrained; empty
+    # gates → `◌ offline`. (The mockup's subagent line CANNOT come from the main statusline —
+    # CC passes no subagent data here; it renders via subagentStatusLine separately.)
+    row3 = LAYOUT.pad_or_truncate(gate_labels(gates, gw, colored=True), gw)
 
     # ── Row4 — blank content beside the sigil's 4th (bottom) row (every metric is placed on
     # Rows 1–2: CTX/tokens on the gauge fill, 7d/$ on the gauge track end, 5h/reset on Row1) ──
