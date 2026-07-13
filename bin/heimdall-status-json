@@ -240,6 +240,10 @@ def read_team(roster_raw, now):
         state = r.get("state") if isinstance(r.get("state"), str) else None
         team.append({
             "user": str(user),
+            # the teammate's OWN HAID — so the statusline resolves THEIR sigil hero
+            # (hero_for/pin), not a fixed hero recolored for everyone. honest-null when
+            # the roster row carries no haid.
+            "haid": str(haid) if isinstance(haid, str) and haid else None,
             "sigil": sigil_hex(seed),
             "branch": None,  # honest-null — presence does not broadcast a branch (see doc)
             "state": state,

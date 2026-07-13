@@ -239,6 +239,9 @@ def filter_team(team, now=None, self_ids=None, cap=TEAM_CAP, ttl=TEAM_TTL):
             continue
         live.append({
             "user": str(user) if user is not None else "",
+            # preserve the teammate's OWN HAID so the statusline can render THEIR sigil
+            # hero (hero_for/pin), not one hardcoded hero recolored for the whole team.
+            "haid": str(haid) if haid is not None else "",
             "sigil": str(sigil) if sigil is not None else "",
             "branch": str(e.get("branch") or ""),
             "state": _norm_state(e.get("state")),

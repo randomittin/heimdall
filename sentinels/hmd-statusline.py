@@ -556,14 +556,18 @@ def team_cluster(cwd, ledger, tier):
     overflow = int(ledger.get("team_overflow") or 0)
     if not members:
         tp = team_presence(cwd)
-        members = [{"user": m.get("name") or "?", "sigil": "", "state": m.get("verdict") or ""}
+        members = [{"user": m.get("name") or "?", "haid": m.get("haid"),
+                    "sigil": "", "state": m.get("verdict") or ""}
                    for m in tp[:3]]
         overflow = max(0, len(tp) - 3)
     if not members:
         return ""
     marks = []
     for m in members[:3]:
-        seed = m.get("user") or m.get("sigil") or "?"
+        # seed on the teammate's OWN HAID (pin/hero_for-aware) so each teammate resolves
+        # to THEIR own sigil hero — not batsy-for-everyone. Fall back to the handle only
+        # when no haid is carried (older roster rows).
+        seed = m.get("haid") or m.get("user") or m.get("sigil") or "?"
         color = _hexcolor(seed, m.get("sigil")) if USE_COLOR else None
         try:
             marks.append(SIG.micro(seed, color, CAPS))
