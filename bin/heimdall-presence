@@ -833,6 +833,20 @@ _keeper_loop() {
   while :; do
     "$beat_bin" beat >/dev/null 2>&1 || true          # REUSE beat (its consent gate applies).
     cycles=$((cycles + 1))
+    # THROTTLED RESOURCE GC: every N beats fire a cheap, backgrounded `heimdall-gc run
+    # --quick` so a LONG-LIVED session keeps freeing temp files + stale pidfiles
+    # "constantly" (not just at session end). CHEAP (quick = temp + orphan pidfiles,
+    # skips the git worktree pass) + THROTTLED (default every 30 beats ≈ 10min at the
+    # 20s interval) + backgrounded + best-effort. SKIPPED under the beat-injection test
+    # seam (HMD_KEEPER_BEAT_BIN) so hermetic keeper tests never shell out to gc.
+    if [ -z "${HMD_KEEPER_BEAT_BIN:-}" ]; then
+      local gc_every="${HMD_GC_KEEPER_BEATS:-30}"
+      case "$gc_every" in ''|*[!0-9]*) gc_every=0 ;; esac
+      if [ "$gc_every" -gt 0 ] && [ "$((cycles % gc_every))" -eq 0 ]; then
+        local gc_bin="$SELF_DIR/heimdall-gc"
+        [ -x "$gc_bin" ] && ( "$gc_bin" run --quick --quiet >/dev/null 2>&1 & ) || true
+      fi
+    fi
     [ "$max_cycles" != "0" ] && [ "$cycles" -ge "$max_cycles" ] && break
     # soft-stop / stale-pid guard: if the pidfile no longer names us, a stop (rm) or a newer
     # keeper claimed it -> exit so there is ever only ONE live keeper per session.
