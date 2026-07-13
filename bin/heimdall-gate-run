@@ -53,8 +53,22 @@ DENY=0
 FAIL_GATE=""
 REASONS=""            # newline-joined human reasons
 GATE_OUT=""           # captured runner stderr to relay on deny
+GATES_NDJSON=""       # per-gate results (one compact JSON object per line) — the statusline feed
+HAVE_JQ=0; command -v jq >/dev/null 2>&1 && HAVE_JQ=1
 
 add_reason() { REASONS="${REASONS}${REASONS:+$'\n'}$1"; }
+
+# Record ONE gate's result for the statusline's status.json feed (Spec v1 §6): {id,state,detail}.
+# state ∈ pass|deny (a synchronous run never records "running"); detail is a short honest string
+# (e.g. the falsifiability score "6/6"). Requires jq for safe JSON encoding — without jq the
+# array is simply omitted (the jq-less verdict write emits gates:[]), never fabricated.
+add_gate() {  # id state detail
+  [ "$HAVE_JQ" = 1 ] || return 0
+  local entry
+  entry="$(jq -cn --arg id "$1" --arg st "$2" --arg dt "$3" '{id:$id, state:$st, detail:$dt}')"
+  GATES_NDJSON="${GATES_NDJSON}${entry}
+"
+}
 
 # ── 1. Oracle falsifiability gates over the REPO's own oracle domains ─────────
 #    Identical to the plugin push gate: for each domain with mutant fixtures,
@@ -65,22 +79,33 @@ if [ -x "$FALSIFY" ] && [ -d "$REPO/evals/oracles" ]; then
   for D in "$REPO/evals/oracles"/*/; do
     [ -d "$D/fixtures/mutants" ] || continue
     DOM="$(basename "$D")"
-    if ! OUT="$(HEIMDALL_ORACLES_DIR="$REPO/evals/oracles" "$FALSIFY" "$DOM" --assert-score 1.0 2>&1)"; then
+    OUT="$(HEIMDALL_ORACLES_DIR="$REPO/evals/oracles" "$FALSIFY" "$DOM" --assert-score 1.0 2>&1)"; rc=$?
+    # honest detail: the falsifiability score line "SCORE: k/t = ..." emitted by bin/falsify.
+    SCORE="$(printf '%s' "$OUT" | sed -n 's/.*SCORE:[[:space:]]*\([0-9][0-9]*\/[0-9][0-9]*\).*/\1/p' | head -1)"
+    if [ "$rc" -ne 0 ]; then
       DENY=1; FAIL_GATE="falsify:$DOM"
       add_reason "oracle gate '$DOM' is not falsifiable (bin/falsify score < 1.0)"
       GATE_OUT="$OUT"
-      break
+      add_gate "falsify:$DOM" "deny" "${SCORE:-}"
+      break                       # fast-deny (unchanged): later gates did NOT run, so are NOT recorded.
     fi
+    add_gate "falsify:$DOM" "pass" "${SCORE:-}"
   done
 fi
 
 # ── 2. Corpus regression gate ─────────────────────────────────────────────────
 #    A case the gates once caught must still be caught (CI-inversion guard).
 if [ "$DENY" = 0 ] && [ -x "$CORPUS" ] && [ -f "$REPO/evals/corpus/INDEX.json" ]; then
-  if ! OUT="$( cd "$REPO" && CORPUS_DIR="$REPO/evals/corpus" ORACLES_DIR="$REPO/evals/oracles" "$CORPUS" run 2>&1 )"; then
+  OUT="$( cd "$REPO" && CORPUS_DIR="$REPO/evals/corpus" ORACLES_DIR="$REPO/evals/oracles" "$CORPUS" run 2>&1 )"; rc=$?
+  # honest detail: the corpus pass count "N/M" if the runner prints one, else empty.
+  CCOUNT="$(printf '%s' "$OUT" | sed -n 's/.*\([0-9][0-9]*\/[0-9][0-9]*\).*/\1/p' | tail -1)"
+  if [ "$rc" -ne 0 ]; then
     DENY=1; FAIL_GATE="corpus"
     add_reason "corpus regression — a case the gates once caught is no longer caught"
     GATE_OUT="$OUT"
+    add_gate "corpus" "deny" "${CCOUNT:-}"
+  else
+    add_gate "corpus" "pass" "${CCOUNT:-}"
   fi
 fi
 
@@ -91,15 +116,19 @@ TOP_FILE="$(git diff --cached --name-only 2>/dev/null | sed '/^$/d' | head -1)"
 VDIR="$REPO/.heimdall"
 VFILE="$VDIR/verdict.json"
 mkdir -p "$VDIR" 2>/dev/null || true
-if command -v jq >/dev/null 2>&1; then
+if [ "$HAVE_JQ" = 1 ]; then
+  # `gates` is the ADDITIVE per-gate array the statusline reads (bin/heimdall-status-json);
+  # empty-input jq -s yields [] (honest empty when no oracle/corpus gate ran).
+  GATES_ARR="$(printf '%s' "$GATES_NDJSON" | jq -sc '.' 2>/dev/null || echo '[]')"
   jq -cn --arg v "$VERDICT" --arg ph "$PHASE" --arg ts "$TS" \
          --arg gate "$FAIL_GATE" --arg file "$TOP_FILE" --arg reasons "$REASONS" \
+         --argjson gates "$GATES_ARR" \
     '{verdict:$v, phase:$ph, ts:$ts, gate:($gate // ""), file:$file,
-      reasons: ($reasons | if . == "" then [] else split("\n") end)}' \
+      reasons: ($reasons | if . == "" then [] else split("\n") end), gates:$gates}' \
     > "$VFILE" 2>/dev/null || true
 else
-  # jq-less fallback: a minimal, valid one-line object.
-  printf '{"verdict":"%s","phase":"%s","ts":"%s","gate":"%s","file":"%s"}\n' \
+  # jq-less fallback: a minimal, valid one-line object. gates:[] (structured recording needs jq).
+  printf '{"verdict":"%s","phase":"%s","ts":"%s","gate":"%s","file":"%s","gates":[]}\n' \
     "$VERDICT" "$PHASE" "$TS" "$FAIL_GATE" "$TOP_FILE" > "$VFILE" 2>/dev/null || true
 fi
 

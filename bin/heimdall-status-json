@@ -1,0 +1,289 @@
+#!/usr/bin/env bash
+# heimdall-status-json — the LEDGER STATUS PRODUCER for the HMD statusline (Spec v1 §6).
+#
+# WHAT IT IS. The statusline reads ONE JSON file per refresh — ~/.heimdall/ledger/status.json
+# — and never shells out to a dozen probes on the hot path. THIS bin is the single writer of
+# that file. It folds four REAL, already-existing sources into the schema the statusline reads
+# and writes the result ATOMICALLY (temp + rename), so a mid-refresh read never sees a partial
+# file. It is cheap and bounded — the statusline caches the read for ~5s; this only has to be
+# fast enough to keep that cache warm on the presence beat.
+#
+# THE CONTRACT (Spec v1 §6). One object, four keys:
+#   {
+#     "daemon": "watching" | "down",
+#     "gates":  [ {"id": "<gate>", "state": "pass"|"running"|"deny", "detail": "<str>"}, ... ],
+#     "verdict":{ "state": "pass"|"deny"|"pending", "label": "<GENERALIZES|BLOCKED|PENDING>" },
+#     "team":   [ {"user":"<h>","sigil":"#RRGGBB","branch":<str|null>,"state":"<st>","ts":<epoch>}, ... ]
+#   }
+#   - gates[].state: pass/running/deny -> the statusline renders the check/spinner/cross glyphs.
+#   - team[] entries carry a heartbeat ts, the teammate's sigil hue (deterministic identity
+#     color), a branch (null until presence broadcasts one — see below), and a wall state.
+#     The STATUSLINE filters team[] to ts < 5min old + excludes self; this writer emits the
+#     full online roster projection (the presence roster already TTL-drops offline devs).
+#
+# THE REAL SOURCES (never fabricated — an empty source yields an honestly-empty field):
+#   • daemon  <- the presence KEEPER liveness. A live keeper pidfile under $HEIMDALL_KEEPER_DIR
+#               (the same dir bin/heimdall-presence's keeper claims) => "watching"; none alive
+#               => "down". Liveness is a real kill-0 probe, never assumed.
+#   • gates   <- the LAST gate-run's recorded per-gate results: <repo>/.heimdall/verdict.json
+#               `.gates` (an array of {id,state,detail} that bin/heimdall-gate-run now persists
+#               alongside the overall verdict). Absent (old file / no gated run yet) => [].
+#   • verdict <- the overall verdict from that same verdict.json `.verdict` (pass|deny), mapped
+#               to {state,label}. No verdict.json => {"pending","PENDING"} (no gated run yet).
+#   • team    <- the presence ROSTER (bin/heimdall-presence roster --json) — the online devs on
+#               this project's team. Each row {haid,handle,verdict,file,age_seconds,state} maps
+#               to {user,sigil,branch,state,ts}. sigil = the sigil core's glyph_color(haid) as
+#               #RRGGBB (sentinels/hmd_sigil.py — the SAME hue every sigil surface paints).
+#
+# THE FALLBACK CONTRACT. This writer's job is to NEVER write garbage; the statusline owns the
+# absence case. If status.json is missing or stale, or daemon reads "down", the statusline shows
+# the down/offline state — that is the statusline's concern. Here: every source is read
+# defensively, so the assembled object is ALWAYS schema-valid (empty arrays, "down", "pending"
+# for empty/broken sources), and the write is atomic. A source we cannot parse degrades to its
+# empty value; the writer never emits a partial file and never invents a gate or a teammate.
+#
+# CADENCE / WIRING. Refreshed on the presence keeper's beat (bin/heimdall-presence's keeper loop
+# calls us each cycle), so status.json stays warm while the session is live. Gates refresh
+# whenever a gate run records a new verdict.json (commit/push via bin/heimdall-gate-run). See
+# skills/heimdall/references/statusline-ledger.md for the full contract.
+#
+# Usage:
+#   heimdall-status-json [--out <path>] [--print]
+#   -h, --help
+# Env seams (also used by the wiring + tests):
+#   HMD_STATUS_OUT            output path (default $HEIMDALL_HOME/ledger/status.json)
+#   HEIMDALL_HOME             runtime home (default ~/.heimdall)
+#   HEIMDALL_KEEPER_DIR       keeper pidfile dir (default $HEIMDALL_HOME/presence-keeper)
+#   HMD_STATUS_VERDICT_FILE   verdict.json path (default <repo>/.heimdall/verdict.json)
+#   HMD_STATUS_ROSTER_JSON    inject roster JSON directly (else run `heimdall-presence roster`)
+#   HMD_STATUS_NOW            inject "now" epoch seconds (deterministic ts reconstruction)
+#
+# Exit: 0 = a valid status.json was written; 2 = usage error. Never nonzero for an empty source.
+set -uo pipefail
+
+# ── path resolution (resolve symlinks so we find our sibling bins + the sigil core) ──
+SELF="$0"
+if command -v readlink >/dev/null 2>&1; then
+  SELF="$(readlink -f "$0" 2>/dev/null || readlink "$0" 2>/dev/null || echo "$0")"
+fi
+BIN_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+PLUGIN_DIR="$(cd "$BIN_DIR/.." && pwd)"
+SIGIL_CORE_DIR="$PLUGIN_DIR/sentinels"
+PRESENCE_BIN="$BIN_DIR/heimdall-presence"
+
+usage() { sed -n '2,60p' "$0" | sed 's/^# \{0,1\}//'; }
+
+OUT_OVERRIDE=""; PRINT=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --out)   OUT_OVERRIDE="${2:?--out needs a path}"; shift 2 ;;
+    --print) PRINT=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "heimdall-status-json: unexpected argument: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+HMD_HOME="${HEIMDALL_HOME:-$HOME/.heimdall}"
+OUT="${OUT_OVERRIDE:-${HMD_STATUS_OUT:-$HMD_HOME/ledger/status.json}}"
+KEEPER_DIR="${HEIMDALL_KEEPER_DIR:-$HMD_HOME/presence-keeper}"
+REPO="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+VERDICT_FILE="${HMD_STATUS_VERDICT_FILE:-$REPO/.heimdall/verdict.json}"
+NOW="${HMD_STATUS_NOW:-$(date +%s 2>/dev/null || echo 0)}"
+
+# ── daemon liveness (pure bash — a real kill-0 probe over the keeper pidfiles) ──
+# "watching" iff ANY pidfile in the keeper dir names a live process; else "down".
+# Mirrors bin/heimdall-presence's own _keeper_alive check (numeric pid + kill -0).
+daemon_state() {
+  local pf pid
+  [ -d "$KEEPER_DIR" ] || { printf 'down'; return; }
+  for pf in "$KEEPER_DIR"/*.pid; do
+    [ -f "$pf" ] || continue
+    pid="$(cat "$pf" 2>/dev/null || true)"
+    case "$pid" in ''|*[!0-9]*) continue ;; esac
+    if kill -0 "$pid" 2>/dev/null; then printf 'watching'; return; fi
+  done
+  printf 'down'
+}
+DAEMON="$(daemon_state)"
+
+# ── roster JSON (injected seam, else the REAL presence roster — best-effort) ───
+# `roster --json` degrades to a clean empty roster ([]) when presence is unconfigured/offline,
+# so this never blocks the write. A total failure -> "[]" (honest empty team).
+if [ -n "${HMD_STATUS_ROSTER_JSON+x}" ]; then
+  ROSTER_JSON="$HMD_STATUS_ROSTER_JSON"
+elif [ -x "$PRESENCE_BIN" ]; then
+  ROSTER_JSON="$("$PRESENCE_BIN" roster --json 2>/dev/null || true)"
+else
+  ROSTER_JSON="[]"
+fi
+[ -n "$ROSTER_JSON" ] || ROSTER_JSON="[]"
+
+# ── assemble + atomic-write (python: import the sigil core for the identity hue) ──
+PY="$(command -v python3 || command -v python || true)"
+if [ -z "$PY" ]; then
+  # No python -> we cannot derive sigil hues. Still honor the never-write-garbage contract:
+  # emit a schema-valid file with an empty team (honest — the hue source is unavailable).
+  mkdir -p "$(dirname "$OUT")" 2>/dev/null || true
+  tmp="$OUT.tmp.$$"
+  printf '{"daemon":"%s","gates":[],"verdict":{"state":"pending","label":"PENDING"},"team":[]}\n' \
+    "$DAEMON" > "$tmp" 2>/dev/null && mv -f "$tmp" "$OUT" 2>/dev/null
+  [ "$PRINT" = 1 ] && cat "$OUT" 2>/dev/null
+  exit 0
+fi
+
+HMD_SIGIL_DIR="$SIGIL_CORE_DIR" \
+HMD_DAEMON="$DAEMON" \
+HMD_VERDICT_FILE="$VERDICT_FILE" \
+HMD_ROSTER_JSON="$ROSTER_JSON" \
+HMD_OUT="$OUT" \
+HMD_NOW="$NOW" \
+HMD_PRINT="$PRINT" \
+"$PY" - <<'PYEOF'
+import json, os, sys, contextlib
+
+SIGIL_DIR = os.environ.get("HMD_SIGIL_DIR", "")
+if SIGIL_DIR:
+    sys.path.insert(0, SIGIL_DIR)
+
+# glyph_color is the deterministic identity hue every sigil surface paints. Import defensively:
+# if the core is unavailable, sigils degrade to null (honest — never a fabricated color).
+try:
+    import hmd_sigil  # noqa: E402
+
+    def sigil_hex(seed):
+        try:
+            r, g, b = hmd_sigil.glyph_color(seed)
+            return "#%02X%02X%02X" % (int(r), int(g), int(b))
+        except Exception:
+            return None
+except Exception:
+    def sigil_hex(seed):
+        return None
+
+
+def read_verdict(path):
+    """Fold the recorded gate-run verdict.json into (gates[], verdict{}). Every field is read
+    defensively — a missing file / bad JSON / missing key degrades to the honest-empty value
+    ([] gates, pending verdict). NEVER fabricates a gate."""
+    gates, verdict = [], {"state": "pending", "label": "PENDING"}
+    if not path or not os.path.isfile(path):
+        return gates, verdict
+    try:
+        with open(path, "r") as fh:
+            doc = json.load(fh)
+    except Exception:
+        return gates, verdict
+    if not isinstance(doc, dict):
+        return gates, verdict
+
+    raw_gates = doc.get("gates")
+    if isinstance(raw_gates, list):
+        for g in raw_gates:
+            if not isinstance(g, dict):
+                continue
+            gid = g.get("id")
+            state = g.get("state")
+            if not gid or state not in ("pass", "running", "deny"):
+                continue  # skip malformed entries — never invent one
+            detail = g.get("detail")
+            gates.append({
+                "id": str(gid),
+                "state": state,
+                "detail": "" if detail is None else str(detail),
+            })
+
+    v = doc.get("verdict")
+    if v == "pass":
+        verdict = {"state": "pass", "label": "GENERALIZES"}
+    elif v == "deny":
+        verdict = {"state": "deny", "label": "BLOCKED"}
+    # anything else (absent/unknown) stays the pending default.
+    return gates, verdict
+
+
+def _haid_human(haid):
+    if not isinstance(haid, str):
+        return None
+    # haid:<human>.<rand> -> <human> (mirror bin/heimdall-gate-surface's haid_human).
+    body = haid[5:] if haid.startswith("haid:") else haid
+    return body.split(".", 1)[0] or None
+
+
+def read_team(roster_raw, now):
+    """Project the presence roster onto the team[] schema. A row that cannot be parsed is
+    dropped (never fabricated). branch is honest-null: presence broadcasts the file being
+    edited, NOT a git branch, so no teammate branch is available cross-dev today."""
+    team = []
+    try:
+        rows = json.loads(roster_raw)
+    except Exception:
+        return team
+    if not isinstance(rows, list):
+        return team
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        haid = r.get("haid")
+        handle = r.get("handle")
+        user = handle or _haid_human(haid) or "?"
+        seed = haid or handle or user
+        # ts: prefer an explicit epoch; else reconstruct the heartbeat time from age_seconds
+        # (the roster drops absolute ts and carries age instead).
+        ts = None
+        raw_ts = r.get("ts")
+        if isinstance(raw_ts, (int, float)) and not isinstance(raw_ts, bool):
+            ts = int(raw_ts)
+        else:
+            age = r.get("age_seconds")
+            if isinstance(age, (int, float)) and not isinstance(age, bool):
+                ts = int(now - age)
+        state = r.get("state") if isinstance(r.get("state"), str) else None
+        team.append({
+            "user": str(user),
+            "sigil": sigil_hex(seed),
+            "branch": None,  # honest-null — presence does not broadcast a branch (see doc)
+            "state": state,
+            "ts": ts,
+        })
+    return team
+
+
+def atomic_write(path, text):
+    """temp + rename — a mid-read never sees a partial file. The temp lives in the SAME dir as
+    the target so the rename is a same-filesystem atomic mv; it is cleaned up on any failure."""
+    d = os.path.dirname(path) or "."
+    with contextlib.suppress(Exception):
+        os.makedirs(d, exist_ok=True)
+    tmp = "%s.tmp.%d" % (path, os.getpid())
+    try:
+        with open(tmp, "w") as fh:
+            fh.write(text)
+        os.replace(tmp, path)  # atomic on POSIX
+    finally:
+        if os.path.exists(tmp):
+            with contextlib.suppress(Exception):
+                os.remove(tmp)
+
+
+def main():
+    try:
+        now = float(os.environ.get("HMD_NOW", "0") or 0)
+    except Exception:
+        now = 0.0
+    gates, verdict = read_verdict(os.environ.get("HMD_VERDICT_FILE", ""))
+    team = read_team(os.environ.get("HMD_ROSTER_JSON", "[]"), now)
+    status = {
+        "daemon": os.environ.get("HMD_DAEMON", "down") or "down",
+        "gates": gates,
+        "verdict": verdict,
+        "team": team,
+    }
+    text = json.dumps(status, sort_keys=True) + "\n"
+    atomic_write(os.environ["HMD_OUT"], text)
+    if os.environ.get("HMD_PRINT") == "1":
+        sys.stdout.write(text)
+    return 0
+
+
+sys.exit(main())
+PYEOF
