@@ -1,18 +1,22 @@
 #!/usr/bin/env bash
 #
 # heimdall-statusline-fullbleed.test.sh — the ORACLE GATE for the v1 4-row statusline
-# (capped gauge + reserved teammate zone). This suite is the INDEPENDENT correctness authority: every assertion is
-# derived from conformance/statusline/INVARIANTS.md (authored SEPARATELY from the impl),
-# NOT from impl-authored goldens. It drives the REAL SUT
+# (FULL-BLEED gauge, CTX-on-bar, inline team on Row1, gate labels on Row3). This suite is the
+# INDEPENDENT correctness authority: every assertion is derived from
+# conformance/statusline/INVARIANTS.md (authored SEPARATELY from the impl), NOT from
+# impl-authored goldens. It drives the REAL SUT
 # (sentinels/hmd-statusline.py + hmd_gauge.py + hmd_layout.py + hmd_ledger.py).
 #
-# The 11 invariants (INVARIANTS.md), each with its named known-bad RED:
+# The 12 invariants (INVARIANTS.md), each with its named known-bad RED:
 #   ROW-EXACT     every emitted row == COLUMNS visible cells (@40/80/120/200).
-#   GAUGE-FILL    Row2 filled cells == round(pct/100 * gauge_span), gauge_span = the CAPPED
-#                 allotted width (a right teammate zone is RESERVED, NOT full-bleed).
+#   GAUGE-FILL    Row2 filled cells == round(pct/100 * gw), where gw is the FULL-BLEED content
+#                 span (COLUMNS-10); the gauge spans the whole content column (no reserved zone).
 #   GAUGE-RAMP    ramp #1E2F73→#4264FF→#5AD7E6; gold tip @>=70, red tip @>=90; dim track.
-#   GAUGE-LABELS  the Row2 gauge is CLEAN (no labels at ANY tier); the metric labels live on
-#                 Row4, gated by tier: full = left CTX + right $ cluster, mid/narrow = CTX only.
+#   GAUGE-LABELS  the metric labels live ON the Row2 bar (CTX + ↓tokens on the fill; 7d% + $cost
+#                 on the track end), gated by width: CTX at gw>=40, the 7d/$ readout at gw>=60.
+#                 Row4 carries NO metric labels (it is the blank content row under the sigil).
+#   GATE-LABELS   Row3 renders each ledger gate as `<mark> <id> <detail>` · joined
+#                 (`✓ secrets · ✓ tests 41/41 · ✓ designmatch .91`); empty ledger → `◌ offline`.
 #   NULL-SAFE     absent rate_limits/cost/tokens/repo render NOTHING (never a fake 0%).
 #   WIDTH-TIERS   full/mid/narrow/tiny → 4/4/4/1 rows; tiny == `HMD <pct>% <gates>`.
 #   ANSI-BUDGET   the ramp is QUANTIZED (no per-cell recolor); track = a 2-colour stripe.
@@ -21,17 +25,14 @@
 #   EXIT          every input → exit 0 AND empty stderr.
 #   SIGIL-KEEP    the hero ▄ 8×8 render stays the LEFT anchor; sigil goldens diff clean.
 #
-# SPAN CONVENTION (SIGIL-KEEP + GAUGE CAP): the content column is the span RIGHT of the sigil
-# anchor — gw = COLUMNS - anchor(8 sigil + 2 gutter) = COLUMNS-10. The Row2 gauge is NO LONGER
-# full-bleed of gw: it is CAPPED so a right-side teammate zone is always reserved. Solo (as the
-# canned inputs are — no team), the cap is the whole allotment:
-#   gauge_cap  = min(gw, max(GAUGE_MIN(24), int(gw * GAUGE_MAX_FRAC(0.66))))
-#   gauge_span = min(gauge_cap, gw)      # solo: rail_w=0, team_gap=0
-# GAUGE-FILL / GAUGE-RAMP / ANSI-BUDGET are computed against gauge_span (the CAPPED allotment),
-# exactly as the statusline calls render_gauge(gauge_span, ...). GAUGE-FILL also proves the cap
-# is REAL: it re-derives gauge_span from the SUT's own render (bg-cell count − sigil 8) and
-# asserts gw - gauge_span > 0 (a reserved right zone), so a regression to full-bleed flips RED.
-# ROW-EXACT then proves anchor + gauge + reserved zone together fill the line to COLUMNS.
+# SPAN CONVENTION (SIGIL-KEEP + FULL-BLEED gauge): the content column is the span RIGHT of the
+# sigil anchor — gw = COLUMNS - anchor(8 sigil + 2 gutter) = COLUMNS-10. The Row2 gauge is
+# FULL-BLEED of gw (the statusline calls render_gauge(gw, ..., labels=True)); there is NO cap and
+# NO reserved teammate zone — the team is INLINE on Row1 now, not stacked beside the gauge.
+# GAUGE-FILL / GAUGE-RAMP / ANSI-BUDGET are computed against gw, exactly as the statusline calls
+# render_gauge(gw, ...). GAUGE-FILL also proves the full-bleed is REAL: it re-derives the span
+# from the SUT's own render (bg-cell count − sigil 8) and asserts it equals gw (a cap regression
+# → span < gw → RED). ROW-EXACT then proves anchor + full-bleed gauge fill the line to COLUMNS.
 #
 # ANSI-BUDGET RECONCILIATION (documented deviation): INVARIANTS.md states the literal
 # bound "distinct 48;2 <= ceil(COLUMNS/40)+2". The SHIPPED hmd_gauge.py (a frozen
@@ -46,12 +47,13 @@
 # RED (step=1 → a fresh ramp colour every filled cell).
 #
 # MODES:
-#   (no args)        run all 11 invariants.
-#   --only <name>    run one (row-exact|gauge-fill|gauge-ramp|gauge-labels|null-safe|
-#                    width-tiers|ansi-budget|fallback|perf|exit|sigil-keep).
+#   (no args)        run all 12 invariants.
+#   --only <name>    run one (row-exact|gauge-fill|gauge-ramp|gauge-labels|gate-labels|
+#                    null-safe|width-tiers|ansi-budget|fallback|perf|exit|sigil-keep).
 #   --prove-red      MUTATION harness: monkeypatch the named known-bad into the SUT and
 #                    prove the corresponding property FLIPS RED (a green-only suite that
-#                    cannot go red is worthless). Proves row-width, gauge-fill, null-safe.
+#                    cannot go red is worthless). Proves row-width, gauge-fill, null-safe,
+#                    gate-labels.
 set -u
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -115,14 +117,11 @@ TRACK = {G.TRACK_A, G.TRACK_B}
 def span_of(cols):
     return L.remaining_width(["x" * 8], cols, 2)   # == cols-10 for cols>10 (the CONTENT span gw)
 
-# Row2 gauge is CAPPED (a right teammate zone is reserved) — NOT full-bleed of the content.
-# Mirror the SUT's solo-path geometry (the canned inputs carry no team → rail_w=0, team_gap=0).
-GAUGE_MAX_FRAC = 0.66
-GAUGE_MIN = 24
+# Row2 gauge is FULL-BLEED of the content span gw — the statusline calls render_gauge(gw, ...).
+# There is NO cap and NO reserved teammate zone (the team is INLINE on Row1 now), so the gauge
+# span IS gw. GAUGE-FILL / GAUGE-RAMP / ANSI-BUDGET are computed against this full-bleed span.
 def gauge_span_of(cols):
-    gw = span_of(cols)
-    cap = min(gw, max(GAUGE_MIN, int(gw * GAUGE_MAX_FRAC)))
-    return max(0, min(cap, gw))
+    return span_of(cols)
 
 def bg_cell_count(row):
     """Count visible cells carrying an ACTIVE 48;2 bg (reset-aware). In a real Row2 this is
@@ -239,26 +238,22 @@ def inv_row_exact():
 def inv_gauge_fill():
     for w in (80, 120, 200):
         gw = span_of(w)
-        span = gauge_span_of(w)
-        # (a) the cap RESERVES a right teammate zone — the gauge is NOT full-bleed of gw.
-        (ok if gw - span > 0 else bad)(
-            "GAUGE-FILL: COLUMNS=%d gauge_span=%d < content=%d (right zone reserved %d)"
-            % (w, span, gw, gw - span))
-        # (b) the SUT's REAL Row2 gauge occupies exactly gauge_span cells (bg-cells − sigil 8),
-        #     tying the CAPPED geometry to the shipped render (a full-bleed regression → RED).
+        # (a) the gauge is FULL-BLEED of the content span — the SUT's REAL Row2 gauge occupies
+        #     exactly gw cells (bg-cells − sigil 8). A cap regression (span < gw) flips this RED.
         c = tempfile.mkdtemp(); out, _, _ = render(w, canned(c, w)); shutil.rmtree(c, True)
         measured = bg_cell_count(rows(out)[1]) - 8
-        (ok if measured == span else bad)(
-            "GAUGE-FILL: COLUMNS=%d real Row2 gauge span=%d == capped %d" % (w, measured, span))
-        # (c) fill == round(pct/100 × gauge_span) across the pct bands (round-half-up, NOT floor).
+        (ok if measured == gw else bad)(
+            "GAUGE-FILL: COLUMNS=%d real Row2 gauge span=%d == full-bleed content %d"
+            % (w, measured, gw))
+        # (b) fill == round(pct/100 × gw) across the pct bands (round-half-up, NOT floor).
         for p in (0, 1, 50, 69, 70, 89, 90, 100):
-            row = G.render_gauge(span, p, 128000, 12, 0.87, 3840000, None, CAPS)
+            row = G.render_gauge(gw, p, 128000, 12, 0.87, 3840000, None, CAPS)
             got = fill_count(row)
-            exp = max(0, min(span, round(p / 100.0 * span)))
+            exp = max(0, min(gw, round(p / 100.0 * gw)))
             if got == exp:
-                ok("GAUGE-FILL: span=%d pct=%d fill=%d==round" % (span, p, got))
+                ok("GAUGE-FILL: span=%d pct=%d fill=%d==round" % (gw, p, got))
             else:
-                bad("GAUGE-FILL: span=%d pct=%d fill=%d != round=%d" % (span, p, got, exp))
+                bad("GAUGE-FILL: span=%d pct=%d fill=%d != round=%d" % (gw, p, got, exp))
 
 def _classify(rgb):
     if rgb in TRACK:
@@ -306,23 +301,55 @@ def _row4_plain(out):
     return strip(rs[3]) if len(rs) > 3 else ""
 
 def inv_gauge_labels():
-    # The Row2 gauge is CLEAN at EVERY tier (labels moved OFF the bar); the metric labels live
-    # on Row4, gated by tier: full → left CTX + right $ cluster ; mid/narrow → CTX only.
+    # The metric labels live ON the Row2 bar now (CTX + ↓tokens on the fill; 7d% + $cost on the
+    # track end), gated by width: CTX at gw>=40, the right 7d/$ readout at gw>=60. Row4 carries
+    # NO metric labels (it is the blank content row beside the sigil's 4th half-block row).
     def r2r4(w):
         c = tempfile.mkdtemp(); out, _, _ = render(w, canned(c, w)); shutil.rmtree(c, True)
         return _row2_plain(out), _row4_plain(out)
-    # full(120): gauge clean; Row4 = CTX AND right $ cluster.
+    # full(120): gw=110 → Row2 has CTX AND the right $ readout; Row4 has neither.
     r2, r4 = r2r4(120)
-    (ok if ("CTX" not in r2 and "$" not in r2) else bad)("GAUGE-LABELS: full → Row2 gauge clean (no CTX/$ on the bar)")
-    (ok if ("CTX" in r4 and "$" in r4) else bad)("GAUGE-LABELS: full → Row4 has CTX AND right $ cluster")
-    # mid(80): gauge clean; Row4 = CTX, right $ cluster dropped.
+    (ok if ("CTX" in r2 and "$" in r2) else bad)("GAUGE-LABELS: full → Row2 has CTX AND right $ readout on the bar")
+    (ok if ("CTX" not in r4 and "$" not in r4) else bad)("GAUGE-LABELS: full → Row4 carries no metric labels")
+    # mid(80): gw=70>=60 → Row2 keeps CTX AND the $ readout.
     r2, r4 = r2r4(80)
-    (ok if ("CTX" not in r2 and "$" not in r2) else bad)("GAUGE-LABELS: mid → Row2 gauge clean")
-    (ok if ("CTX" in r4 and "$" not in r4) else bad)("GAUGE-LABELS: mid → Row4 CTX present, right $ dropped")
-    # narrow(48): gauge clean; Row4 = left CTX only (no right $).
-    r2, r4 = r2r4(48)
-    (ok if ("CTX" not in r2 and "$" not in r2) else bad)("GAUGE-LABELS: narrow → Row2 gauge clean")
-    (ok if ("CTX" in r4 and "$" not in r4) else bad)("GAUGE-LABELS: narrow → Row4 CTX only (no right $)")
+    (ok if ("CTX" in r2 and "$" in r2) else bad)("GAUGE-LABELS: mid(80) → Row2 has CTX AND $ (gw>=60)")
+    (ok if ("CTX" not in r4 and "$" not in r4) else bad)("GAUGE-LABELS: mid(80) → Row4 carries no metric labels")
+    # a width where CTX shows but the right $ readout is GATED OFF (40<=gw<60): cols=64 → gw=54.
+    r2, _ = r2r4(64)
+    (ok if ("CTX" in r2 and "$" not in r2) else bad)("GAUGE-LABELS: gw=54 → Row2 CTX only, right $ dropped")
+    # narrow bar (gw<40): cols=48 → gw=38 → the bar is CLEAN (no CTX label fits under gw<40).
+    r2, _ = r2r4(48)
+    (ok if ("CTX" not in r2) else bad)("GAUGE-LABELS: gw=38 → Row2 bar clean (no CTX under gw<40)")
+
+def inv_gate_labels():
+    # Row3 renders each ledger gate as `<mark> <id> <detail>` · joined. Drive a status.json
+    # ledger (HEIMDALL_HOME/ledger/status.json, i.e. HOME/.heimdall/ledger) with three known
+    # gates and assert Row3 carries the id + detail for each, marked ✓.
+    home = tempfile.mkdtemp()
+    os.makedirs(os.path.join(home, ".heimdall", "ledger"), exist_ok=True)
+    status = {"daemon": True, "gates": [
+        {"id": "secrets", "state": "pass", "detail": ""},
+        {"id": "tests", "state": "pass", "detail": "41/41"},
+        {"id": "designmatch", "state": "pass", "detail": ".91"}]}
+    with open(os.path.join(home, ".heimdall", "ledger", "status.json"), "w") as f:
+        json.dump(status, f)
+    c = tempfile.mkdtemp()
+    out, rc, _ = render(120, canned(c, 120), home=home)
+    shutil.rmtree(c, True); shutil.rmtree(home, True)
+    r3 = strip(rows(out)[2])
+    for tok in ("✓ secrets", "✓ tests 41/41", "✓ designmatch .91"):
+        (ok if tok in r3 else bad)("GATE-LABELS: Row3 carries `%s`" % tok)
+    # empty ledger gates (present but []) → the neutral `◌ offline` marker (no fabricated pass).
+    home2 = tempfile.mkdtemp()
+    os.makedirs(os.path.join(home2, ".heimdall", "ledger"), exist_ok=True)
+    with open(os.path.join(home2, ".heimdall", "ledger", "status.json"), "w") as f:
+        json.dump({"daemon": False, "gates": []}, f)
+    c2 = tempfile.mkdtemp()
+    out2, _, _ = render(120, canned(c2, 120), home=home2)
+    shutil.rmtree(c2, True); shutil.rmtree(home2, True)
+    r3b = strip(rows(out2)[2])
+    (ok if "offline" in r3b else bad)("GATE-LABELS: empty ledger gates → `◌ offline`")
 
 def inv_null_safe():
     # (a) used_percentage absent → fill 0, exit 0
@@ -331,11 +358,12 @@ def inv_null_safe():
     out, rc, err = render(120, d); shutil.rmtree(c, True)
     span = span_of(120)
     (ok if rc == 0 else bad)("NULL-SAFE: absent used_percentage → exit 0")
-    # (b) rate_limits absent → no 5h/7d limit token on Row4 (the metrics moved OFF Row1;
-    #     the limits now live in the Row4 metrics rail, never a fabricated 0%).
+    # (b) rate_limits absent → NO 5h token on Row1 (the tail) AND NO 7d token on Row2 (the gauge
+    #     readout) — the limits render from LIVE sources only, never a fabricated 0%.
     c = tempfile.mkdtemp(); out, rc, err = render(120, canned(c, 120, rl=False)); shutil.rmtree(c, True)
-    r4 = _row4_plain(out)
-    (ok if ("5h" not in r4 and "7d" not in r4) else bad)("NULL-SAFE: rate_limits absent → no 5h/7d limit token on Row4")
+    r1 = strip(rows(out)[0]); r2 = _row2_plain(out)
+    (ok if "5h" not in r1 else bad)("NULL-SAFE: rate_limits absent → no 5h token on Row1 tail")
+    (ok if "7d" not in r2 else bad)("NULL-SAFE: rate_limits absent → no 7d token on Row2 gauge")
     # (c) workspace.repo absent → basename, no ':' worktree join in the repo segment
     c = tempfile.mkdtemp()
     d = canned(c, 120, repo=False); out, rc, err = render(120, d); shutil.rmtree(c, True)
@@ -463,9 +491,9 @@ def inv_sigil_keep():
 
 REG = {
     "row-exact": inv_row_exact, "gauge-fill": inv_gauge_fill, "gauge-ramp": inv_gauge_ramp,
-    "gauge-labels": inv_gauge_labels, "null-safe": inv_null_safe, "width-tiers": inv_width_tiers,
-    "ansi-budget": inv_ansi_budget, "fallback": inv_fallback, "perf": inv_perf,
-    "exit": inv_exit, "sigil-keep": inv_sigil_keep,
+    "gauge-labels": inv_gauge_labels, "gate-labels": inv_gate_labels, "null-safe": inv_null_safe,
+    "width-tiers": inv_width_tiers, "ansi-budget": inv_ansi_budget, "fallback": inv_fallback,
+    "perf": inv_perf, "exit": inv_exit, "sigil-keep": inv_sigil_keep,
 }
 
 # ════════════════════════ PROVE-RED (mutation) ════════════════════════
@@ -497,11 +525,18 @@ def prove_red():
                 diverged = True
     (ok if diverged else bad)("prove-red gauge-fill: floor→round mismatch on a fractional case (RED)")
 
-    # 3) null-safe RED: fabricate a 0% limit when rate_limits absent → a limit token appears.
+    # 3) null-safe RED: remove the None-guard in rate_limit_parts (the INVARIANTS.md known-bad
+    #    "default a missing rate_limits to 0%") → a fabricated `5h 0%` appears on the Row1 tail
+    #    even though rate_limits is ABSENT. rate_limit_seg → main's Row1 tail reads this fn.
     m3 = load(SL, "sl_mut3")
-    # the Row4 metrics rail feeds its 5h readout from five_hour_pct(); fabricate a 0% when the
-    # source is absent (exactly the INVARIANTS.md known-bad: "default a missing rate_limits to 0%").
-    m3.five_hour_pct = lambda data: 0.0
+    def _rlp_guard_removed(data, now):
+        rl = data.get("rate_limits") or {}
+        fh = rl.get("five_hour") or {}
+        up = fh.get("used_percentage")
+        up = 0 if up is None else up          # THE BUG: fabricate 0% when the source is absent
+        pct = max(0, min(100, int(round(up))))
+        return ("5h %d%%" % pct, "")
+    m3.rate_limit_parts = _rlp_guard_removed
     c = tempfile.mkdtemp()
     d = canned(c, 120, rl=False)
     os.makedirs(os.path.join(c, ".heimdall"), exist_ok=True)
@@ -515,9 +550,38 @@ def prove_red():
         m3.main()
     finally:
         sys.stdout = old
-    r4 = strip(rows(buf.getvalue())[3])
+    r1 = strip(rows(buf.getvalue())[0])
     shutil.rmtree(c, True)
-    (ok if "5h 0%" in r4 else bad)("prove-red null-safe: fabricated 5h 0%% appears on Row4 when rate_limits absent (RED)")
+    (ok if "5h 0%" in r1 else bad)("prove-red null-safe: fabricated 5h 0%% appears on Row1 when rate_limits absent (RED)")
+
+    # 4) gate-labels RED: force _gate_seg to marks-only (drop id+detail regardless of level) →
+    #    Row3 loses the gate ids, so the mockup label `secrets` disappears from the render.
+    m4 = load(SL, "sl_mut4")
+    def _seg_marks_only(g, level, colored):
+        glyph, col = m4._GATE_GLYPH.get(g.get("state"), ("◌", m4.DIM))
+        return (col + glyph + m4.X) if colored else glyph
+    m4._gate_seg = _seg_marks_only          # gate_labels → _gate_seg (module global) reads this
+    home = tempfile.mkdtemp()
+    os.makedirs(os.path.join(home, ".heimdall", "ledger"), exist_ok=True)
+    st = {"daemon": True, "gates": [{"id": "secrets", "state": "pass", "detail": ""},
+                                    {"id": "tests", "state": "pass", "detail": "41/41"}]}
+    open(os.path.join(home, ".heimdall", "ledger", "status.json"), "w").write(json.dumps(st))
+    c = tempfile.mkdtemp()
+    d = canned(c, 120)
+    os.makedirs(os.path.join(c, ".heimdall"), exist_ok=True)
+    open(os.path.join(c, ".heimdall", "identity.json"), "w").write('{"handle":"rj","seed":"rj"}\n')
+    os.environ.update({"HOME": home, "HEIMDALL_IDENTITY_DIR": os.path.join(c, ".heimdall"),
+                       "HMD_HAID": "rj", "HMD_NOW": "1000", "COLUMNS": "120",
+                       "HMD_STATUSLINE_TMP": tempfile.mkdtemp(), "HEIMDALL_STATUSLINE_MODE": "truecolor",
+                       "HEIMDALL_CP_URL": "http://127.0.0.1:1"})
+    sys.stdin = io.StringIO(json.dumps(d)); buf = io.StringIO(); old = sys.stdout; sys.stdout = buf
+    try:
+        m4.main()
+    finally:
+        sys.stdout = old
+    r3 = strip(rows(buf.getvalue())[2])
+    shutil.rmtree(c, True); shutil.rmtree(home, True)
+    (ok if "secrets" not in r3 else bad)("prove-red gate-labels: _gate_seg marks-only → Row3 loses `secrets` (RED)")
 
 # ════════════════════════ dispatch ════════════════════════
 if MODE == "prove-red":
@@ -529,8 +593,9 @@ elif MODE.startswith("only:"):
     print("== --only %s ==" % name)
     REG[name]()
 else:
-    for name in ("row-exact", "gauge-fill", "gauge-ramp", "gauge-labels", "null-safe",
-                 "width-tiers", "ansi-budget", "fallback", "perf", "exit", "sigil-keep"):
+    for name in ("row-exact", "gauge-fill", "gauge-ramp", "gauge-labels", "gate-labels",
+                 "null-safe", "width-tiers", "ansi-budget", "fallback", "perf", "exit",
+                 "sigil-keep"):
         print("== %s ==" % name)
         REG[name]()
 
