@@ -297,7 +297,61 @@ VERDICT = {  # verdict -> (eye color rgb, ansi col, glyph, word)
 }
 
 # ── identity (FILE-controlled seed + handle; env fallback) ────────────────────
-def identity(cwd, fallback):
+# Resolving identity forks the canonical `heimdall-identity` bin (bash + jq, ~tens of
+# ms) — and profiling the render shows this fork is the DOMINANT per-render cost (the
+# sigil renders are already sub-millisecond + disk-cached). But identity is SESSION-
+# STABLE (the seed/handle do not change while a session runs), so the resolved
+# (seed, handle) is served through a per-session 5s cache (mirroring hmd_ledger's
+# read_status TTL): the fork happens at most ONCE per 5s and a WARM refresh does ZERO
+# subprocess forks for identity. The cache stores the FINAL resolved pair, so the render
+# is byte-identical to the uncached fork — the cache only elides the re-resolution.
+IDENTITY_TTL = 5.0   # seconds — session-stable; mirror hmd_ledger.CACHE_TTL
+
+def _identity_cache_path(session_id):
+    """`<tmp>/hmd-statusline-identity-<slug>` — session-keyed (never pid-keyed), the same
+    HMD_STATUSLINE_TMP dir + slugging convention the ledger cache uses."""
+    slug = re.sub(r"[^A-Za-z0-9._-]", "-", str(session_id or "").strip()) or "default"
+    tmp = os.environ.get("HMD_STATUSLINE_TMP") or "/tmp"
+    return os.path.join(tmp, "hmd-statusline-identity-" + slug)
+
+def _identity_cache_get(session_id):
+    """The cached (seed, handle) when the cache file is < IDENTITY_TTL old, else None. A
+    hit proves NO heimdall-identity fork happened this render. Never raises."""
+    p = _identity_cache_path(session_id)
+    try:
+        if time.time() - os.path.getmtime(p) > IDENTITY_TTL:
+            return None
+        with open(p, encoding="utf-8") as f:
+            d = json.load(f)
+        if isinstance(d, dict) and isinstance(d.get("seed"), str) and isinstance(d.get("handle"), str):
+            return d["seed"], d["handle"]
+    except Exception:
+        return None
+    return None
+
+def _identity_cache_put(session_id, seed, handle):
+    """Atomically persist the resolved (seed, handle) for the session (tmp + os.replace).
+    Best-effort: a write failure just means the next render re-resolves. Never raises."""
+    p = _identity_cache_path(session_id)
+    tmp = p + ".%d.tmp" % os.getpid()
+    try:
+        os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"seed": seed, "handle": handle}, f)
+        os.replace(tmp, p)
+    except Exception:
+        with contextlib.suppress(Exception):
+            os.remove(tmp)
+
+def identity(cwd, fallback, session_id=""):
+    """The resolved (sigil seed, display handle), served through the per-session 5s cache
+    so a WARM refresh never forks heimdall-identity. On a cache MISS the canonical bin is
+    forked ONCE (bash+jq), the result is applied through the sigil override + cached, and
+    returned; on a HIT the cached pair is returned with NO fork. Byte-identical to the
+    uncached path (same resolved pair → same render)."""
+    cached = _identity_cache_get(session_id)
+    if cached is not None:
+        return cached
     seed = handle = None
     bin_path = os.path.join(BIN_DIR, "heimdall-identity")
     try:
@@ -310,7 +364,9 @@ def identity(cwd, fallback):
     except Exception:
         seed = handle = None
     resolved = seed or fallback
-    return _sigil_override_seed(resolved), (handle or resolved)
+    out = (_sigil_override_seed(resolved), (handle or resolved))
+    _identity_cache_put(session_id, out[0], out[1])
+    return out
 
 def _sigil_override_seed(seed):
     """Honor `hmd sigil set <hero>` (unlocked after >=3 runs); else the seed unchanged."""
@@ -826,7 +882,7 @@ def main():
         repo_str = os.path.basename(str(cwd).rstrip("/")) or str(cwd)
 
     fallback = os.environ.get("HMD_HAID") or os.environ.get("USER") or "you"
-    seed, handle = identity(cwd, fallback)
+    seed, handle = identity(cwd, fallback, session_id)
 
     # legacy verdict for the eye + --widget only.
     st = gate_state(cwd)
