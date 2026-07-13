@@ -7,7 +7,7 @@ perfect 8×8 = 4 half-block rows; three content rows lay out to its right, EXACT
 $COLUMNS visible cells each, and the sigil's 4th row sits beside a BLANK content row so
 the full untrimmed sigil shows (a 4-row statusline):
 
-  Row1  ⛭ HEIMDALL │ <user>·<model> │ <repo>:<branch>   team <µsigil> <name>… │ ◆ 𝘅<5h>%·<reset>
+  Row1  ⛭ HEIMDALL │ <user>·<model> │ <repo>:<branch>   team <µsigil> <name>… │ ◆ 5h <pct>%·<reset>
   Row2  <full-bleed context gauge: CTX <pct>%·↓<tok> ON the fill (white bold), 7d<pct>%·$<cost> ON the track end (faint)>
   Row3  <gate cells ✓ <id> <detail> · …>                (right rail empty — subagents render via subagentStatusLine)
   Row4  <blank content — carries the sigil's 4th (bottom) row>
@@ -496,7 +496,7 @@ def reset_countdown(data, now):
 def rate_limit_parts(data, now):
     """(pct_seg, reset_seg) for the 5-hour usage limit. Reads
     rate_limits.five_hour.{used_percentage,resets_at} (Pro/Max, present only after the
-    first API response). pct_seg is the coloured `𝘅 NN%`; reset_seg is `·<Nh|Nm>`.
+    first API response). pct_seg is the coloured `5h NN%`; reset_seg is `·<Nh|Nm>`.
     Either is '' when its source is absent/malformed (never a fabricated value).
 
     RESET SANITY (guards the 2282244h overflow): the countdown is emitted ONLY when
@@ -514,13 +514,16 @@ def rate_limit_parts(data, now):
         return "", ""
     pct = max(0, min(100, int(round(up))))
     col = RD if pct >= 90 else AM if pct >= 70 else GR
-    pct_seg = f"{col}𝘅 {pct}%{X}"
+    # plain ASCII `5h` label (NOT an astral math glyph) so vis_width == the terminal's
+    # rendered width on every font/terminal — the right rail can never be mis-budgeted
+    # past COLUMNS by an astral-glyph width disagreement.
+    pct_seg = f"{col}5h {pct}%{X}"
     cd = reset_countdown(data, now)
     reset_seg = f"{FAINT}·{X}{DIM}{cd}{X}" if cd else ""
     return pct_seg, reset_seg
 
 def rate_limit_seg(data, now):
-    """The combined 5-hour indicator `𝘅 NN%·<reset>` (pct + sanitized countdown)."""
+    """The combined 5-hour indicator `5h NN%·<reset>` (pct + sanitized countdown)."""
     pct_seg, reset_seg = rate_limit_parts(data, now)
     return pct_seg + reset_seg if pct_seg else ""
 
@@ -692,6 +695,43 @@ def gate_cells(gates, colored=True):
         out.append(f"{col}{glyph}{X}" if colored else glyph)
     return (f"{FAINT}·{X}".join(out) if colored else "·".join(out))
 
+# Row3 gate-label detail levels (richest → sparsest): 0 = `<mark> <id> <detail>`,
+# 1 = `<mark> <id>`, 2 = `<mark>` only. The mark (verdict glyph) is ALWAYS kept; the
+# detail is dropped first, then the id, when the row is width-constrained.
+_GATE_LVL_FULL, _GATE_LVL_ID, _GATE_LVL_MARK = 0, 1, 2
+
+def _gate_seg(g, level, colored):
+    """One gate rendered at `level`: mark (verdict-coloured) + optional id (dim) + optional
+    detail (faint). The mark is always present; the id/detail are gated by `level`."""
+    glyph, col = _GATE_GLYPH.get(g.get("state"), ("◌", DIM))
+    mark = f"{col}{glyph}{X}" if colored else glyph
+    gid = str(g.get("id") or "")
+    if level >= _GATE_LVL_MARK or not gid:
+        return mark
+    idpart = f" {DIM}{gid}{X}" if colored else " " + gid
+    detail = str(g.get("detail") or "")
+    if level >= _GATE_LVL_ID or not detail:
+        return mark + idpart
+    detpart = f" {FAINT}{detail}{X}" if colored else " " + detail
+    return mark + idpart + detpart
+
+def gate_labels(gates, avail, colored=True):
+    """Row3 gate labels — `<mark> <id> <detail> · …` (e.g. `✓ secrets · ✓ tests 41/41 ·
+    ✓ designmatch .91`). Mark ✓ pass / ◌ running / ✗ deny; id + detail from the ledger
+    gates[]. BUDGET: render at the RICHEST detail level whose visible width fits `avail`,
+    dropping the detail first (level 1) then the id (level 2 → marks only) GLOBALLY when
+    width-constrained — the verdict mark is never dropped. Empty gates → `◌ offline` (no
+    ledger). The caller still pad_or_truncate()s to the exact span as a last resort."""
+    if not gates:
+        return f"{DIM}◌ offline{X}" if colored else "offline"
+    sep = f"{FAINT} · {X}" if colored else " · "
+    seg = ""
+    for level in (_GATE_LVL_FULL, _GATE_LVL_ID, _GATE_LVL_MARK):
+        seg = sep.join(_gate_seg(g, level, colored) for g in gates)
+        if avail is None or vis(seg) <= avail:
+            return seg
+    return seg   # marks-only still over budget → caller clips
+
 def subagent_ghost(agents):
     """A faint right-rail ghost naming the busiest live subagent (the most recently
     started) + the active count. '' when no subagent is live."""
@@ -807,7 +847,7 @@ def main():
 
     # ── Row1 — identity (left) + the INLINE team + the daemon/5h/reset tail (right rail) ──
     # The teammates are laid out INLINE on Row1 (micro mark + whole handle), then a `│`, then
-    # the daemon glyph + the 5-hour usage (`𝘅 NN%`) + the sanitized reset countdown. The team
+    # the daemon glyph + the 5-hour usage (`5h NN%`) + the sanitized reset countdown. The team
     # group HIDES when solo; the tail (daemon + 5h + reset) still shows. At narrow the whole
     # right rail drops. The team rail is BUDGETED so the right side never mid-token clips and
     # the ⛭ HEIMDALL wordmark is always preserved (ROW1_MIN_LEFT reserved for the identity).
@@ -816,12 +856,16 @@ def main():
         row1 = LAYOUT.pad_or_truncate(left1, gw)          # drop the right rail
     else:
         tail = daemon_seg(ledger)
-        rls = rate_limit_seg(data, t)                     # `𝘅 NN%·<reset>` (or '' when absent)
+        rls = rate_limit_seg(data, t)                     # `5h NN%·<reset>` (or '' when absent)
         if rls:
             tail += " " + rls
-        # the INLINE team rides between the identity and the tail: `team … │ ◆ 𝘅 NN%·<reset>`.
-        # budgeted to what remains after the tail + its separator (dropped at narrow).
-        team_avail = max(0, gw - vis(tail) - vis(SEP))
+        # the INLINE team rides between the identity and the tail: `team … │ ◆ 5h NN%·<reset>`.
+        # BUDGET (no right-edge clip): the team gets ONLY what remains after the WHOLE identity
+        # (left1) + the tail + their separator — so vis(left1)+vis(right1) <= gw always holds and
+        # left_right never has to truncate the identity to make room for teammates. The team
+        # itself drops whole members (→ +N) rather than mid-token slice (team_inline). The tail
+        # (daemon + 5h + reset) is small + high-priority and is always kept at full/mid.
+        team_avail = max(0, gw - vis(left1) - vis(SEP) - vis(tail))
         team_seg = team_inline(cwd, ledger, team_avail) if tier in ("full", "mid") else ""
         right1 = (team_seg + SEP + tail) if team_seg else tail
         row1 = LAYOUT.left_right(left1, right1, gw)
@@ -837,10 +881,12 @@ def main():
                                base_hue=sig_hue, labels=True)
     row2 = gauge
 
-    # ── Row3 — the gate cells `✓ <id> <detail> · …` (left); the right rail is EMPTY ──
-    # (the mockup's subagent line CANNOT come from the main statusline — CC passes no subagent
-    # data here; it renders via subagentStatusLine separately). The daemon moved to Row1.
-    row3 = LAYOUT.pad_or_truncate(gate_cells(gates, colored=True), gw)
+    # ── Row3 — the gate labels `✓ <id> <detail> · …` (left); the right rail is EMPTY ──
+    # e.g. `✓ secrets · ✓ tests 41/41 · ✓ designmatch .91`. gate_labels budgets to gw,
+    # dropping <detail> then <id> (never the verdict mark) when width-constrained; empty
+    # gates → `◌ offline`. (The mockup's subagent line CANNOT come from the main statusline —
+    # CC passes no subagent data here; it renders via subagentStatusLine separately.)
+    row3 = LAYOUT.pad_or_truncate(gate_labels(gates, gw, colored=True), gw)
 
     # ── Row4 — blank content beside the sigil's 4th (bottom) row (every metric is placed on
     # Rows 1–2: CTX/tokens on the gauge fill, 7d/$ on the gauge track end, 5h/reset on Row1) ──
