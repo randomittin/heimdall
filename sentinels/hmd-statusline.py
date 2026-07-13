@@ -469,28 +469,45 @@ def active_swarm_agents():
     return out, mx
 
 # ── Row-1 right-rail segments ─────────────────────────────────────────────────
-def rate_limit_seg(data, now):
-    """The 5-hour usage-limit indicator: `𝘅 NN% ·<reset>`. Reads
+# the 5-hour usage limit ALWAYS resets within 5 hours; anything larger is a garbage
+# resets_at (e.g. a far-future epoch) and its countdown is OMITTED, never printed.
+FIVE_HOUR_S = 5 * 3600
+
+def rate_limit_parts(data, now):
+    """(pct_seg, reset_seg) for the 5-hour usage limit. Reads
     rate_limits.five_hour.{used_percentage,resets_at} (Pro/Max, present only after the
-    first API response). Absent/malformed → '' (render NOTHING, never a fabricated %)."""
+    first API response). pct_seg is the coloured `𝘅 NN%`; reset_seg is `·<Nh|Nm>`.
+    Either is '' when its source is absent/malformed (never a fabricated value).
+
+    RESET SANITY (guards the 2282244h overflow): the countdown is emitted ONLY when
+    `0 < (resets_at − now) ≤ 5h`. A resets_at that is absent, ≤ now, or yields > 5h
+    (a far-future epoch mis-read as a delta) → reset_seg '' — an implausible hour count
+    is never printed."""
     rl = data.get("rate_limits")
     if not isinstance(rl, dict):
-        return ""
+        return "", ""
     fh = rl.get("five_hour")
     if not isinstance(fh, dict):
-        return ""
+        return "", ""
     up = fh.get("used_percentage")
     if not isinstance(up, (int, float)) or isinstance(up, bool):
-        return ""
+        return "", ""
     pct = max(0, min(100, int(round(up))))
     col = RD if pct >= 90 else AM if pct >= 70 else GR
-    seg = f"{col}𝘅 {pct}%{X}"
+    pct_seg = f"{col}𝘅 {pct}%{X}"
+    reset_seg = ""
     ra = fh.get("resets_at")
     if isinstance(ra, (int, float)) and not isinstance(ra, bool) and ra > now:
         rem = int(ra - now)
-        cd = f"{rem // 3600}h" if rem >= 3600 else f"{max(1, rem // 60)}m"
-        seg += f"{FAINT}·{X}{DIM}{cd}{X}"
-    return seg
+        if 0 < rem <= FIVE_HOUR_S:   # sane: a 5-hour-limit reset is always ≤ 5h
+            cd = f"{rem // 3600}h" if rem >= 3600 else f"{max(1, rem // 60)}m"
+            reset_seg = f"{FAINT}·{X}{DIM}{cd}{X}"
+    return pct_seg, reset_seg
+
+def rate_limit_seg(data, now):
+    """The combined 5-hour indicator `𝘅 NN%·<reset>` (pct + sanitized countdown)."""
+    pct_seg, reset_seg = rate_limit_parts(data, now)
+    return pct_seg + reset_seg if pct_seg else ""
 
 def seven_day_pct(data):
     """rate_limits.seven_day.used_percentage → float, or None (absent → gauge omits it)."""
