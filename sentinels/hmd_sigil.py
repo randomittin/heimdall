@@ -1477,6 +1477,37 @@ def micro(seed_or_hero, color=None, caps=None):
     return caps.emit(line)
 
 
+# ── TOP-HALF — the top 2 `▄` text-rows of the FULL 8×8 hero, in NATURAL colors ────
+# The statusline team rail shows each teammate as the recognizable TOP HALF of their
+# actual hero face (ears / brow / eyes) — NOT a single-hue recoloured block (micro's mud
+# at 4×2px). This is the top 4 pixel-rows = the top 2 text-rows of the size-'M' render, in
+# the hero's OWN authored palette, so akshat's hero-top and kai's hero-top look DIFFERENT
+# (distinct silhouettes AND distinct colors). 8 cols × 2 text-rows per teammate.
+def top_half(seed_or_hero, caps=None):
+    """The TOP HALF (top 4 pixel-rows = top 2 `▄` text-rows) of the seed's full 8×8 hero
+    sigil, rendered in the hero's OWN natural palette — NOT recoloured to a single hue.
+
+    This is exactly `sigil_render(seed_or_hero, 'M', caps)[:2]`: the SAME shared render
+    core every surface uses, so the M goldens / heimdall-sigil-render / heroes stay
+    byte-untouched (this only slices the first two of the four returned rows). Each row is
+    8 cells wide. `seed_or_hero` is any seed the sigil core resolves (hero NAME, real HAID →
+    its auto-assigned hero, pinned HAID, or a toy seed → its animal). Returns a list of
+    EXACTLY 2 text-row strings; degrades to two blank 8-cell rows on any fault (never
+    raises — the statusline must never error)."""
+    caps = caps or TC.detect()
+    blank = caps.emit(" " * W)
+    try:
+        rows = sigil_render(seed_or_hero, 'M', caps)
+    except Exception:
+        return [blank, blank]
+    if not rows:
+        return [blank, blank]
+    rows = list(rows[:2])
+    while len(rows) < 2:
+        rows.append(blank)
+    return rows
+
+
 def _sq(rgb, n, caps):
     """An n×n aspect-square block: n cols × n/2 half-block rows, each cell the same
     solid color (fg=bg). If the terminal's cell aspect is the assumed ~1:2, this
