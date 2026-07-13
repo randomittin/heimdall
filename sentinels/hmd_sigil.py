@@ -1331,6 +1331,84 @@ def sigil_silhouette(seed, size, color=None, caps=None):
     return caps.emit("\n".join(lines)).split("\n")
 
 
+# ── TEAM-MINI — a high-quality 4×4 (2 text-row) teammate silhouette ──────────────
+# The statusline team cluster gives each teammate a 4×4px mark (4 cols × 2 text rows): the
+# TOP text-row rides Row1, the BOTTOM rides Row2, the NAME sits under it on Row3. The
+# generic S-size 8→4 BOX-MAJORITY downsample (tie → higher token) makes almost EVERY box
+# "on", so a hero collapses to a solid recoloured BLOCK — RJ: "a beige blob, not a
+# recognizable hero". team_mini is a FEATURE-PRESERVING reduction instead: each 8×8 pixel
+# is classed OFF (bg) / ON (body) / EYE, and each 2×2 box collapses by a rule that KEEPS the
+# silhouette gaps + eyes rather than averaging them into mud —
+#   • any eye pixel in the box → EYE  (eyes are 1–2px and define the face; they survive)
+#   • else ON iff on-pixels STRICTLY outnumber off  (a tie → OFF, so the bg silhouette —
+#     batsy's cowl ears, spiderman's lenses, ironman's faceplate slits — is CARVED, not
+#     flooded to a solid block)
+# The mark is recoloured to the teammate hue: ON → the hue, EYE → a bright tint of the hue
+# (so eye POSITIONS pop against the body), OFF → the DIM silhouette block. So batsy reduces
+# to a cowl+ears silhouette with an eye band, hulk to a solid brow + eye band, ironman to
+# faceplate slits — recognizable, in the teammate's identity hue.
+#
+# DEDICATED PATH: sigil_render()/sigil_silhouette() are byte-UNTOUCHED (the S goldens and
+# heimdall-sigil-render stay byte-stable); team_mini is a parallel projection over the SAME
+# resolved 8×8 grid (custom_for for heroes, grid_for for curated/animal), packed via _cell.
+TEAM_MINI_W, TEAM_MINI_H = 4, 4   # 4×4 px → 4 cols × 2 `▄` text-rows
+
+def _team_mini_class_grid(seed):
+    """The seed's 8×8 grid as an OFF/ON/EYE class per pixel. A hero classes its authored
+    TOKEN grid ('.' → off, '2' → eye, else on); every other seed classes the composited
+    VALUE grid (0 → off, 2 → eye, else on) — mirroring how micro/sigil_silhouette resolve
+    the grid, so team_mini never diverges from the seed's canonical silhouette."""
+    got = custom_for(seed)
+    if got is not None:
+        grid, _pal = got
+        return [[('eye' if grid[r][c] == '2' else 'off' if grid[r][c] == '.' else 'on')
+                 for c in range(W)] for r in range(W)]
+    g, _hue, _eye = grid_for(seed)
+    return [[('eye' if g[r][c] == 2 else 'off' if g[r][c] == 0 else 'on')
+             for c in range(W)] for r in range(W)]
+
+def _team_mini_reduce(box):
+    """Collapse a 2×2 class box to one OFF/ON/EYE pixel, feature-preserving: an eye survives
+    (any eye → EYE); else ON only when on-pixels STRICTLY outnumber off (a tie → OFF), so the
+    bg silhouette is carved rather than flooded to a solid block (the box-majority mud)."""
+    if box.count('eye'):
+        return 'eye'
+    return 'on' if box.count('on') > box.count('off') else 'off'
+
+def team_mini(seed, color=None, caps=None):
+    """A high-quality 4×4 (2 text-row) teammate mark: a FEATURE-PRESERVING reduction of the
+    seed's 8×8 hero/animal grid (see the section header), recoloured to `color` — the
+    teammate hue. ON → the hue, EYE → a bright tint of the hue (eye-pop), OFF → the DIM
+    silhouette block. `color` is a '#rrggbb' hex or an (r,g,b) tuple; None keeps the seed's
+    own dominant hue (glyph_color). Returns a list of 2 text-row strings (4 cells each),
+    tier-downgraded through `caps` in one pass (truecolor NO-OP · 256 LUT · 16 · mono). Any
+    seed the sigil core resolves works (hero name / real HAID / pin / toy seed); never raises
+    for a resolvable seed."""
+    caps = caps or TC.detect()
+    if color is None:
+        hue = glyph_color(seed)
+    elif isinstance(color, str):
+        hue = _hex_rgb(color)
+    else:
+        hue = tuple(color)
+    eye_col = _mix(hue, WHITE, 0.6)   # a bright tint of the identity hue so eye positions pop
+    px = {'off': DIM, 'on': hue, 'eye': eye_col}
+    cl = _team_mini_class_grid(seed)
+    sx = sy = W // TEAM_MINI_W        # 2×2 source box per output pixel
+    red = [[_team_mini_reduce([cl[sy * R + dr][sx * C + dc]
+                               for dr in range(sy) for dc in range(sx)])
+            for C in range(TEAM_MINI_W)] for R in range(TEAM_MINI_W)]
+    lines = []
+    for tr in range(0, TEAM_MINI_W, 2):
+        line = ""
+        for c in range(TEAM_MINI_W):
+            top = px[red[tr][c]]
+            bot = px[red[tr + 1][c]] if tr + 1 < TEAM_MINI_W else OFF
+            line += _cell(top, bot)
+        lines.append(line)
+    return caps.emit("\n".join(lines)).split("\n")
+
+
 # ── MICRO / CHIP render — a SINGLE text-row team-cluster mark ────────────────────
 # The statusline Row-1 team cluster (`team <mark> <mark> name·name`) gives each
 # teammate ONE text-row of height. This derives a tiny recognizable mark from the
