@@ -1019,7 +1019,7 @@ ENTRY_NAME="$(basename "$0")"   # hmd or heimdall — for self-referential help
 # ONCE per hmd invocation; HEIMDALL_RUN_COUNTED makes it idempotent within one process
 # tree (nested self-calls don't double-count). Never fails the caller.
 HEIMDALL_RUN_COUNT_FILE="$HEIMDALL_HOME_DIR/.run-count"
-# One-shot sigil-unlock reveal (FIX 1): the ≥3-run `hmd sigil` customization unlock
+# One-shot sigil-unlock reveal (FIX 1): the ≥5-run `hmd sigil` customization unlock
 # is otherwise SILENT. `.unlock-pending` is armed on the first crossing into unlocked
 # territory; the next session-close farewell prints the celebration ONCE and drops a
 # `.unlock-shown` marker so it is never re-armed or repeated.
@@ -1037,9 +1037,9 @@ hmd_bump_run_count() {
   mkdir -p "$HEIMDALL_HOME_DIR" 2>/dev/null || return 0
   local prev n; prev="$(hmd_run_count)"; n=$((prev + 1))
   printf '%s\n' "$n" > "$HEIMDALL_RUN_COUNT_FILE" 2>/dev/null || true
-  # First crossing into the unlocked band (prev<3 -> n>=3): arm the one-shot reveal.
+  # First crossing into the unlocked band (prev<5 -> n>=5): arm the one-shot reveal.
   # Guarded on the shown-marker so a manually-edited or re-crossed counter never re-arms.
-  if [ "$prev" -lt 3 ] && [ "$n" -ge 3 ] && [ ! -f "$HEIMDALL_UNLOCK_SHOWN_FILE" ]; then
+  if [ "$prev" -lt 5 ] && [ "$n" -ge 5 ] && [ ! -f "$HEIMDALL_UNLOCK_SHOWN_FILE" ]; then
     : > "$HEIMDALL_UNLOCK_PENDING_FILE" 2>/dev/null || true
   fi
   return 0
@@ -1110,24 +1110,24 @@ case "${1:-}" in
     SIGIL_CHOICE_FILE="$HEIMDALL_HOME_DIR/sigil-choice"
     case "${1:-}" in
       ''|status|show)
-        # `hmd sigil` — the dev's CURRENT hero + whether change is unlocked (≥3 runs).
+        # `hmd sigil` — the dev's CURRENT hero + whether change is unlocked (≥5 runs).
         # Effective hero = an unlocked override, else the seed's auto-assigned hero
         # (real HAID → hero_for) as the render core resolves it. Unlock is earned
-        # customization: change your sigil only after you've run hmd 3+ times.
+        # customization: change your sigil only after you've run hmd 5+ times.
         _haid="$("$HAID_BIN" current 2>/dev/null || true)"
         [ -n "$_haid" ] || _haid="${HEIMDALL_HAID:-haid:local}"
         _auto="$(python3 "$SIGIL_PY" --resolve "$_haid" 2>/dev/null || true)"
         [ -n "$_auto" ] || _auto="$(python3 "$SIGIL_PY" --hero-for "$_haid" 2>/dev/null || true)"
         _runs="$(hmd_run_count)"
         _override=""; [ -f "$SIGIL_CHOICE_FILE" ] && _override="$(cat "$SIGIL_CHOICE_FILE" 2>/dev/null || true)"
-        if [ -n "$_override" ] && [ "$_runs" -ge 3 ]; then _current="$_override"; else _current="$_auto"; fi
+        if [ -n "$_override" ] && [ "$_runs" -ge 5 ]; then _current="$_override"; else _current="$_auto"; fi
         printf "  sigil: %s\n" "${_current:-<none>}"
         printf "  haid:  %s\n" "$_haid"
-        if [ "$_runs" -ge 3 ]; then
+        if [ "$_runs" -ge 5 ]; then
           printf "  change unlocked (%s runs) — pick any: hmd sigil set <name>\n" "$_runs"
           printf "  heroes: %s\n" "$(python3 "$SIGIL_PY" --list-heroes 2>/dev/null | tr '\n' ' ')"
         else
-          printf "  change locked — unlocks after 3 hmd runs (you have %s)\n" "$_runs"
+          printf "  change locked — unlocks after 5 hmd runs (you have %s)\n" "$_runs"
         fi
         exit 0
         ;;
@@ -1141,8 +1141,8 @@ case "${1:-}" in
           echo "  heroes: $(python3 "$SIGIL_PY" --list-heroes 2>/dev/null | tr '\n' ' ')" >&2
           exit 2
         fi
-        if [ "$_runs" -lt 3 ]; then
-          echo "  sigil change unlocks after 3 hmd runs (you have $_runs)" >&2
+        if [ "$_runs" -lt 5 ]; then
+          echo "  sigil change unlocks after 5 hmd runs (you have $_runs)" >&2
           exit 1
         fi
         if ! python3 "$SIGIL_PY" --list-heroes 2>/dev/null | grep -qx -- "$_name"; then

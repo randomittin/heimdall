@@ -107,7 +107,7 @@ else
 fi
 
 # ── 7. FIX 1: ONE-SHOT SIGIL-UNLOCK REVEAL ──
-# bin/heimdall arms $HEIMDALL_HOME/.unlock-pending on the 3-run crossing; the NEXT
+# bin/heimdall arms $HEIMDALL_HOME/.unlock-pending on the 5-run crossing; the NEXT
 # close reveals it ONCE and drops .unlock-shown so it never repeats.
 U_HOME="$(mktemp -d 2>/dev/null || echo /tmp/farewell-unlock-$$)"
 mkdir -p "$U_HOME" 2>/dev/null || true
