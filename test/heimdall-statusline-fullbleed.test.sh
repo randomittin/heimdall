@@ -111,6 +111,7 @@ SENT = os.path.join(ROOT, "sentinels")
 G = load(os.path.join(SENT, "hmd_gauge.py"), "hmd_gauge_fb")
 L = load(os.path.join(SENT, "hmd_layout.py"), "hmd_layout_fb")
 TC = load(os.path.join(SENT, "hmd_termcaps.py"), "hmd_termcaps_fb")
+SIG = load(os.path.join(SENT, "hmd_sigil.py"), "hmd_sigil_fb")   # top_half distinctness (TEAM-SIGIL)
 CAPS = TC.detect(["--color"])
 TRACK = {G.TRACK_A, G.TRACK_B}
 
@@ -142,6 +143,54 @@ def bg_cell_count(row):
             n += 1
         i += 1
     return n
+
+# ── TEAM-SIGIL parsing helpers (the top-half team rail) ──
+# three teammates with distinct REAL HAIDs → distinct auto-assigned heroes (hero_for).
+TEAM3 = [{"handle": "akshat", "haid": "haid:akshat.mbp-1a2b", "verdict": "working", "age_seconds": 1},
+         {"handle": "kai",    "haid": "haid:kai.mbp-9z8y",    "verdict": "watching", "age_seconds": 1},
+         {"handle": "mira",   "haid": "haid:mira.mbp-3c4d",   "verdict": "deny",     "age_seconds": 1}]
+
+def distinct_bg(row):
+    """The set of distinct active `48;2` bg colours on a row (reset-aware). On Row1 (which has
+    NO gauge) every bg comes from the team sigil-TOPS, so a NATURAL hero top yields >=2 colours
+    and a single-hue 'mud' block yields exactly 1."""
+    cur = None; seen = set(); i = 0
+    while i < len(row):
+        m = ANSI.match(row, i)
+        if m:
+            mm = re.match(r"\x1b\[48;2;(\d+);(\d+);(\d+)m", m.group(0))
+            if mm:
+                cur = tuple(int(x) for x in mm.groups())
+            elif m.group(0) == "\x1b[0m":
+                cur = None
+            i = m.end(); continue
+        if cur is not None:
+            seen.add(cur)
+        i += 1
+    return seen
+
+def leading_bg_after_anchor(row):
+    """The contiguous run of bg cells on Row2 AFTER the 8 sigil-anchor cells + the gutter — i.e.
+    the gauge width (fill+track). SOLO → the full content span gw (the gauge is full-bleed); with
+    a team → gauge_w < gw (the gauge is CAPPED and a 2-cell gap then the sigil-BOTTOMS follow)."""
+    cur = None; i = 0; cells = 0; run = 0; started = False
+    while i < len(row):
+        m = ANSI.match(row, i)
+        if m:
+            g = m.group(0); mm = re.match(r"\x1b\[48;2;(\d+);(\d+);(\d+)m", g)
+            if mm:
+                cur = tuple(int(x) for x in mm.groups())
+            elif g == "\x1b[0m":
+                cur = None
+            i = m.end(); continue
+        if cells < 8:                       # the sigil anchor
+            cells += 1; i += 1; continue
+        if cur is None:                     # the gutter (pre-gauge) or the post-gauge gap
+            if started:
+                break                       # end of the contiguous gauge run
+            i += 1; continue
+        run += 1; started = True; i += 1
+    return run
 
 # ── hermetic render of the REAL statusline ──
 def render(cols, data, home=None, tmp=None, now=1000, extra_env=None):
