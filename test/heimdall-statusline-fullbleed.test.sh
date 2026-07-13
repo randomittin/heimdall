@@ -226,6 +226,68 @@ def inv_fallback():
         cond = "⛭ HEIMDALL" in strip(out) and rc == 0 and not err
         (ok if cond else bad)("FALLBACK: %s stdin → ⛭ HEIMDALL, exit %d, err=%r" % (label, rc, err[:40]))
 
+def inv_perf():
+    # Spec v2 §5 caching + §10 acceptance — the WARM render is <50ms, a COLD render <80ms.
+    # MEASURED IN-PROCESS (import the module + call main()), NOT subprocess wall: a subprocess
+    # render folds in ~30-60ms of python interpreter startup + module import that the live
+    # statusLine (a warm long-lived cache dir on disk) never pays per tick, so wall time would
+    # measure the WRONG thing. The identity 5s-cache (hmd-statusline._identity_cache_*) makes a
+    # warm tick fork ZERO subprocesses for identity — asserted explicitly below.
+    import io, time, statistics, contextlib
+    m = load(SL, "sl_perf")
+    home = team_home(); c = tempfile.mkdtemp()
+    os.makedirs(os.path.join(c, ".heimdall"), exist_ok=True)
+    open(os.path.join(c, ".heimdall", "identity.json"), "w").write('{"handle":"rj","seed":"rj"}\n')
+    tmp = tempfile.mkdtemp()
+    os.environ.update({"HOME": home, "HEIMDALL_HOME": os.path.join(home, ".heimdall"),
+                       "HEIMDALL_IDENTITY_DIR": os.path.join(c, ".heimdall"), "HMD_HAID": "rj",
+                       "HMD_NOW": "1752410000", "COLUMNS": "120", "LANG": "en_US.UTF-8",
+                       "HMD_STATUSLINE_TMP": tmp, "HEIMDALL_STATUSLINE_MODE": "truecolor",
+                       "HEIMDALL_CP_URL": "http://127.0.0.1:1"})
+    j = json.dumps(canned(c, 120))
+    def one():
+        sys.stdin = io.StringIO(j)
+        with contextlib.redirect_stdout(io.StringIO()):
+            m.main()
+    one()   # prime: interpreter + sigil (disk + memo) + ledger + identity 5s caches
+
+    # ZERO identity forks on a warm tick: count heimdall-identity execs across a primed render.
+    forks = {"n": 0}
+    real_run = m.subprocess.run
+    def counting_run(cmd, *a, **k):
+        with contextlib.suppress(Exception):
+            p = cmd[0] if isinstance(cmd, (list, tuple)) else cmd
+            if isinstance(p, str) and os.path.basename(p) == "heimdall-identity":
+                forks["n"] += 1
+        return real_run(cmd, *a, **k)
+    m.subprocess.run = counting_run
+    one()
+    m.subprocess.run = real_run
+    (ok if forks["n"] == 0 else bad)(
+        "PERF: warm render forks ZERO heimdall-identity (5s identity cache HIT, not %d)" % forks["n"])
+
+    # COLD sample: wipe the on-disk sigil cache + in-process memo + the ledger tmp so this ONE
+    # render is forced to recompute the sigil + re-read the ledger (the cold-path regression the
+    # warm median, served from cache, never sees).
+    shutil.rmtree(m._sigil_cache_dir(), ignore_errors=True); m._SIG_MEMO.clear()
+    shutil.rmtree(tmp, ignore_errors=True); os.makedirs(tmp, exist_ok=True)
+    sys.stdin = io.StringIO(j); t0 = time.perf_counter()
+    with contextlib.redirect_stdout(io.StringIO()): m.main()
+    cold = (time.perf_counter() - t0) * 1000.0
+    one()   # re-warm the caches for the warm-median run
+
+    ts = []
+    for _ in range(10):   # warm in-process median over 10 iterations (Spec v2 §10)
+        sys.stdin = io.StringIO(j); t0 = time.perf_counter()
+        with contextlib.redirect_stdout(io.StringIO()): m.main()
+        ts.append((time.perf_counter() - t0) * 1000.0)
+    med = statistics.median(ts); mx = max(ts)
+    shutil.rmtree(home, ignore_errors=True); shutil.rmtree(c, ignore_errors=True)
+    shutil.rmtree(tmp, ignore_errors=True)
+    print("  PERF: warm median=%.3fms max=%.3fms (budget 50) | cold=%.3fms (budget 80)" % (med, mx, cold))
+    (ok if med < 50.0 else bad)("PERF: warm in-process median %.3fms < 50ms (10 iters, primed)" % med)
+    (ok if cold < 80.0 else bad)("PERF: cold-cache render %.3fms < 80ms (sigil + ledger caches wiped)" % cold)
+
 # ════════════════════════ PROVE-RED (mutation) ════════════════════════
 def _seed_cwd(c):
     os.makedirs(os.path.join(c, ".heimdall"), exist_ok=True)
@@ -284,7 +346,8 @@ if MODE == "prove-red":
     prove_red()
 else:
     for name, fn in (("row-exact", inv_row_exact), ("team-uncut", inv_team_uncut),
-                     ("ledger-gone", inv_ledger_gone), ("fallback", inv_fallback)):
+                     ("ledger-gone", inv_ledger_gone), ("fallback", inv_fallback),
+                     ("perf", inv_perf)):
         print("== %s ==" % name)
         fn()
 

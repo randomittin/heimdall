@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 #
-# heimdall-statusline-density.test.sh — DENSITY CONFORMANCE for the v1 full-bleed 3-row
-# statusline. The statusline auto-selects a WIDTH TIER from the terminal width and lays
-# the content out to the RIGHT of the hero sigil anchor, EXACTLY $COLUMNS visible cells
-# per emitted row (hmd_layout.width_tier + compose_with_sigil):
-#   full   (>=100 cols): all three rows, all segments (team names + gauge right label).
-#   mid    (60–99):      drop team member names + the gauge right label.
-#   narrow (40–59):      drop the Row1 right rail + all gauge labels (bar-only).
+# heimdall-statusline-density.test.sh — DENSITY CONFORMANCE for the v2 full-bleed 4-row
+# composite statusline. The statusline auto-selects a WIDTH TIER from the terminal width
+# and lays the 4 content rows out to the RIGHT of the 8×8 hero sigil anchor, EXACTLY
+# $COLUMNS visible cells per emitted row (hmd_layout.width_tier + compose_with_sigil):
+#   full   (>=100 cols): 4 rows, everything — 3 team members, 40c gauge, gate details, 12c micro-bars.
+#   mid    (60–99):      4 rows — 2 team members + `+N` (states drop), 32c gauge, gate details drop, 8c micro.
+#   narrow (40–59):      4 rows — team → inline `● ● ●` dots on the Row1 rail; gauge bar-only; micro → text.
 #   tiny   (<40):        ONE line — `HMD <pct>% <gates>`.
+#
+# Row1 identity drops WHOLE segments per tier (git counts → model → handle → repo:branch),
+# never a mid-token `…` (Spec v2 §2) — the goldens lock that whole-segment behaviour.
 #
 # THIS SUITE LOCKS:
 #   1. GOLDENS byte-exact: 4 width tiers × 3 capability tiers (truecolor/256/16),

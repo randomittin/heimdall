@@ -970,6 +970,49 @@ def subagent_ghost(agents):
     plural = "s" if n != 1 else ""
     return f"{FAINT}⋯ {n} agent{plural} · {role}{X}"
 
+# ── Row1 identity — WHOLE-SEGMENT drop (Spec v2 §2/§7: text drops per tier, NEVER
+# mid-token) ─────────────────────────────────────────────────────────────────────
+def row1_left(handle, model, repo_seg, cseg, avail):
+    """The Row1 identity left run — `⛭ HEIMDALL │ rj · Opus 4.8 │ heimdall:branch +2 ~1`
+    — reduced to fit `avail` cells by dropping WHOLE segments, never slicing a token with
+    an ellipsis (the `rj · Opus …` / `heimdall:statu…` mid-word clip from the 80c render).
+
+    Drop order, least → most important: git counts → model name → handle → repo:branch.
+    The `⛭ HEIMDALL` brand is the anchor and is NEVER dropped (if even it overruns a
+    pathologically narrow rows zone, the caller's exact-width clamp handles it — but at
+    every tier ≥ narrow the brand fits). Dependencies fall out of the order: the model
+    never renders without its handle, git counts never render without their repo.
+
+    `avail` None → no width pressure, the full run is returned."""
+    brand = f"{BLUE}{BOLD}⛭ HEIMDALL{X}"
+
+    def build(handle_on, model_on, repo_on, counts_on):
+        s = brand
+        if handle_on:
+            idt = f"{handle} · {model}" if model_on else str(handle)
+            s += f"{SEP}{DIM}{idt}{X}"
+        if repo_on:
+            s += f"{SEP}{repo_seg}" + (cseg if counts_on else "")
+        return s
+
+    # richest → sparsest whole-segment combos (H=handle M=model R=repo:branch C=counts).
+    # repo:branch outranks the model name; when the repo string won't fit at all it is
+    # dropped as a UNIT and the handle (± model) is kept — never a sliced `heimdall:statu…`.
+    combos = (
+        (True,  True,  True,  True),    # rj · Opus 4.8 │ heimdall:branch +2 ~1
+        (True,  True,  True,  False),   # rj · Opus 4.8 │ heimdall:branch
+        (True,  False, True,  False),   # rj │ heimdall:branch          (drop model)
+        (True,  True,  False, False),   # rj · Opus 4.8                 (repo won't fit → drop as a unit)
+        (True,  False, False, False),   # rj                            (handle only)
+        (False, False, False, False),   # ⛭ HEIMDALL                    (brand anchor only)
+    )
+    for h, m, r, c in combos:
+        s = build(h, m, r, c)
+        if avail is None or vis(s) <= avail:
+            return s
+    return brand
+
+
 # ── the render ──────────────────────────────────────────────────────────────
 def _eye(verdict, t):
     """The watchman's eye color for THIS tick — always a LIGHT color (never dark), a
@@ -1121,13 +1164,16 @@ def main():
         if counts[1]:
             cparts.append(f"{GOLDC}~{counts[1]}{X}")
         cseg = " " + " ".join(cparts)
-    left1 = (f"{BLUE}{BOLD}⛭ HEIMDALL{X}{SEP}{DIM}{handle} · {model}{X}"
-             f"{SEP}{repo_seg}{cseg}")
     right1 = daemon_rail(verdict)
     if tier == "narrow":
         dots = team_dots(roster)                         # §7 narrow: inline `● ● ●`
         if dots:
             right1 += "  " + dots
+    # WHOLE-SEGMENT drop: fit the identity run into the span left of the right rail so a
+    # tier-narrowed Row1 drops `· Opus 4.8` / `heimdall:branch` as whole units — never a
+    # mid-token `…` (Spec v2 §2). Reserve 1c so the two runs never abut with no gap.
+    avail1 = max(0, rows_zone_w - vis(right1) - 1)
+    left1 = row1_left(handle, model, repo_seg, cseg, avail1)
     row1_zone = LAYOUT.left_right(left1, right1, rows_zone_w)
 
     # ── Row2 — the context gauge (CTX%·↓tokens on the fill, $cost on the track end) ──
