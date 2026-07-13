@@ -505,6 +505,20 @@ def seven_day_pct(data):
         return None
     return v
 
+def five_hour_pct(data):
+    """rate_limits.five_hour.used_percentage → float, or None (absent → gauge omits the
+    `5h <n>%` readout — never a fabricated 0%)."""
+    rl = data.get("rate_limits")
+    if not isinstance(rl, dict):
+        return None
+    fh = rl.get("five_hour")
+    if not isinstance(fh, dict):
+        return None
+    v = fh.get("used_percentage")
+    if not isinstance(v, (int, float)) or isinstance(v, bool):
+        return None
+    return v
+
 def _hexcolor(seed, sigil):
     """A '#rrggbb' for a teammate's micro mark: the entry's own sigil hex if it carries
     one, else the deterministic identity hue glyph_color(seed)."""
@@ -725,16 +739,18 @@ def main():
         if upd: rparts.append(upd)
         row1 = LAYOUT.left_right(left1, "  ".join(rparts), gw)
 
-    # Row2 — the full-bleed context gauge (labels gated by tier)
+    # Row2 — the full-bleed context gauge (labels gated by tier). At full tier the RIGHT
+    # readout carries DUAL limits: context % AND the 5-hour session limit % (+7d/cost/dur).
     tin = cw.get("total_input_tokens")
     if tier == "full":
-        gauge = GAUGE.render_gauge(gw, pct, tin, seven_day_pct(data),
+        gauge = GAUGE.render_gauge(gw, pct, tin, five_hour_pct(data), seven_day_pct(data),
                                    (data.get("cost") or {}).get("total_cost_usd"),
-                                   (data.get("cost") or {}).get("total_duration_ms"), CAPS)
+                                   (data.get("cost") or {}).get("total_duration_ms"), CAPS,
+                                   ctx_pct=pct)
     elif tier == "mid":     # drop the gauge RIGHT label (nulled → render_gauge omits it)
-        gauge = GAUGE.render_gauge(gw, pct, tin, None, None, None, CAPS)
+        gauge = GAUGE.render_gauge(gw, pct, tin, None, None, None, None, CAPS)
     else:                   # narrow → bar-only
-        gauge = GAUGE.render_gauge(gw, pct, None, None, None, None, CAPS)
+        gauge = GAUGE.render_gauge(gw, pct, None, None, None, None, None, CAPS)
 
     # Row3 — gate verdict / permission-mode / busiest subagent (ghost)
     left3 = gate_cells(gates, colored=True)

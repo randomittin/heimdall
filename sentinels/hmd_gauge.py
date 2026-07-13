@@ -224,17 +224,25 @@ def _build_cells(width, pct):
     return cells
 
 
-def render_gauge(width, used_pct, tokens, seven_day_pct, cost_usd,
-                 duration_ms, caps):
+def render_gauge(width, used_pct, tokens, five_hour_pct, seven_day_pct, cost_usd,
+                 duration_ms, caps, ctx_pct=None):
     """Render the Row2 context gauge as ONE row of EXACTLY `width` visible cells.
 
     width         : total visible cell count of the row
-    used_pct      : context-window used percentage (None -> 0 fill)
+    used_pct      : context-window used percentage — drives the FILL (None -> 0 fill)
+                    and the left `CTX <pct>%` label
     tokens        : input token count (humanized in the left label)
+    five_hour_pct : rate_limits.five_hour.used_percentage — the 5-hour SESSION limit,
+                    shown in the right readout as `5h <n>%` (omitted if None)
     seven_day_pct : rate_limits.seven_day.used_percentage (omitted if None)
     cost_usd      : session cost (right label, `$%.2f`)
     duration_ms   : session duration (right label, `1h04m`/`12m30s`)
     caps          : hmd_termcaps.Caps — drives the tier downgrade at emit time
+    ctx_pct       : context % echoed in the RIGHT readout as `ctx <n>%` (None omits it;
+                    the caller passes it only at the widest tier where the readout
+                    shows). The right readout reads `ctx <n>% · 5h <n>% · 7d <n>% ·
+                    $<cost> · <dur>`, each part OMITTED when its source is absent
+                    (never a fabricated `0%`).
 
     Returns a tier-appropriate string: truecolor bg ramp downgraded to 256/16,
     or a plain ASCII proportional bar on a mono tier. Never raises.
@@ -268,9 +276,14 @@ def render_gauge(width, used_pct, tokens, seven_day_pct, cost_usd,
             left_end = _LEFT_COL + len(left)
             _splice(cells, _LEFT_COL, left, FG_WHITE, True)
 
-            # right label over the track end, faint — dropped when too narrow
+            # right label over the track end, faint — dropped when too narrow. A dual
+            # limits readout: context % AND the 5-hour session limit %, then 7d/cost/dur.
             if width >= _MIN_RIGHT:
                 right_parts = []
+                if ctx_pct is not None:
+                    right_parts.append("ctx %d%%" % _pct_int(ctx_pct))
+                if five_hour_pct is not None:
+                    right_parts.append("5h %d%%" % _pct_int(five_hour_pct))
                 if seven_day_pct is not None:
                     right_parts.append("7d %d%%" % _pct_int(seven_day_pct))
                 if cost_usd is not None:
@@ -305,4 +318,4 @@ if __name__ == "__main__":
     for a in sys.argv[1:]:
         if a.isdigit():
             w = int(a)
-    print(render_gauge(w, 42, 708000, 12, 0.87, 3_840_000, caps))
+    print(render_gauge(w, 42, 708000, 55, 12, 0.87, 3_840_000, caps, ctx_pct=42))
