@@ -819,7 +819,12 @@ def main():
         rls = rate_limit_seg(data, t)                     # `𝘅 NN%·<reset>` (or '' when absent)
         if rls:
             tail += " " + rls
-        row1 = LAYOUT.left_right(left1, tail, gw)
+        # the INLINE team rides between the identity and the tail: `team … │ ◆ 𝘅 NN%·<reset>`.
+        # budgeted to what remains after the tail + its separator (dropped at narrow).
+        team_avail = max(0, gw - vis(tail) - vis(SEP))
+        team_seg = team_inline(cwd, ledger, team_avail) if tier in ("full", "mid") else ""
+        right1 = (team_seg + SEP + tail) if team_seg else tail
+        row1 = LAYOUT.left_right(left1, right1, gw)
 
     # ── Row2 — the full-bleed context gauge WITH the metric labels ON the bar ──
     # left  (over the fill, white bold) : CTX <pct>% · ↓<tokens>
