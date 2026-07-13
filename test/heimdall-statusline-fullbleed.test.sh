@@ -282,7 +282,7 @@ def inv_null_safe():
     (ok if (":" + "statusline") not in r0 else bad)("NULL-SAFE: repo absent → no branch/:worktree join")
 
 def inv_width_tiers():
-    for w, want in ((120, 3), (80, 3), (48, 3), (30, 1)):
+    for w, want in ((120, 4), (80, 4), (48, 4), (30, 1)):
         c = tempfile.mkdtemp(); out, rc, err = render(w, canned(c, w)); shutil.rmtree(c, True)
         rc_rows = len(rows(out))
         (ok if rc_rows == want else bad)("WIDTH-TIERS: COLUMNS=%d → %d rows (want %d)" % (w, rc_rows, want))
@@ -387,10 +387,11 @@ def inv_sigil_keep():
     # (a) SELF render: the left anchor is the multi-cell hero ▄ block, NOT a lone ▟█▙.
     c = tempfile.mkdtemp(); out, _, _ = render(120, canned(c, 120)); shutil.rmtree(c, True)
     rs = rows(out)
-    anchors = [strip(r)[:8] for r in rs[:3]]
+    # the hero sigil is a perfect 8×8 = 4 half-block rows, untrimmed → anchors all 4 rows.
+    anchors = [strip(r)[:8] for r in rs[:4]]
     has_block = all("▄" in a for a in anchors)
     no_brand_glyph = not any(g in out for g in ("▟", "█", "▙"))
-    (ok if has_block else bad)("SIGIL-KEEP: hero ▄ block anchors the 3 rows (left 8 cells)")
+    (ok if has_block else bad)("SIGIL-KEEP: hero ▄ block anchors all 4 rows (left 8 cells)")
     (ok if no_brand_glyph else bad)("SIGIL-KEEP: no ▟█▙ brand glyph (hero kept, not replaced)")
     # (b) the sigil goldens diff clean (hmd_sigil.py byte-untouched by this work).
     r = subprocess.run(["git", "diff", "--quiet", "conformance/statusline/goldens/sigil/"],

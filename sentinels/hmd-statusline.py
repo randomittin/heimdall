@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """
-hmd-statusline.py — Heimdall watchman statusline v1 "Full-bleed Gauge" (3-row).
+hmd-statusline.py — Heimdall watchman statusline v1 "Full-bleed Gauge".
 
-The user's OWN hero sigil (hmd_sigil size 'M', the ▄ 8×8 render) anchors the LEFT;
-three content rows lay out to its right, EXACTLY $COLUMNS visible cells each:
+The user's OWN hero sigil (hmd_sigil size 'M', the ▄ 8×8 render) anchors the LEFT as a
+perfect 8×8 = 4 half-block rows; three content rows lay out to its right, EXACTLY
+$COLUMNS visible cells each, and the sigil's 4th row sits beside a BLANK content row so
+the full untrimmed sigil shows (a 4-row statusline):
 
   Row1  ⛭ HEIMDALL │ <user>·<model> │ <repo>:<branch>   ·· team · daemon · rate-limit
   Row2  <full-bleed context gauge, per-cell 48;2 bg ramp, inside labels>
   Row3  <gate cells ✓/◌/✗ · perm-mode>                    ·· busiest subagent (ghost)
+  Row4  <blank content — the sigil's bottom row, padded to COLUMNS>
 
 Assembled through the sibling pure modules:
   hmd_gauge   — the Row2 full-bleed gauge (render_gauge)
@@ -144,8 +147,11 @@ def cached_sigil(seed, size, caps, eye):
 def _sigil_rows(seed, eye):
     """The left anchor per tier: the 58-hero half-block watchman (size 'M') on
     unicode=full + color; a branded ASCII sigil on no-unicode terms; a blank 8-wide
-    anchor in mono. The 3-row layout uses the TOP 3 of the sigil's rows (SIGIL-KEEP:
-    the multi-cell hero block stays the anchor; hmd_sigil.py is byte-untouched)."""
+    anchor in mono. The hero block is a perfect 8×8 = 4 half-block text-rows and is
+    returned UNTRIMMED (SIGIL-KEEP: the multi-cell hero block stays the anchor;
+    hmd_sigil.py is byte-untouched). The layout emits max(sigil_height, content_height)
+    rows, so the full 4-row sigil shows: content rows 1–3 beside sigil rows 1–3, and
+    sigil row 4 sits beside a BLANK content row padded to COLUMNS."""
     if CAPS.unicode == TC.ASCII:
         rows = list(ASCII_SIGIL)
     elif CAPS.color == TC.MONO:
@@ -157,7 +163,7 @@ def _sigil_rows(seed, eye):
             rows = list(ASCII_SIGIL)
     else:
         rows = list(ASCII_SIGIL)
-    return rows[:3]
+    return rows
 
 # ── stdin ────────────────────────────────────────────────────────────────────
 def read_stdin():
