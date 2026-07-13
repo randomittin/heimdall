@@ -1,0 +1,338 @@
+#!/usr/bin/env bash
+# heimdall-gc — the RESOURCE-HYGIENE auto garbage collector.
+#
+# hmd spawns background loops (presence keepers, dream runs) and writes transient
+# temp/cache files (statusline ledgers under /tmp, the sigil + vis caches, rotating
+# logs) as it works. Over a long-lived session — or across many sessions where one
+# crashed before its SessionEnd cleanup ran — these leak processes and disk. This
+# collector CONSTANTLY frees that back, on a schedule (SessionStart --quick, a
+# throttled keeper beat, SessionEnd full run), reaping ONLY hmd's OWN orphaned
+# artifacts and NEVER a live session's, a secret, or unmerged work.
+#
+# THE THREE CATEGORIES (each independently safe, idempotent, non-fatal):
+#
+#   1. WORKTREES  — merged/abandoned agent worktrees under .claude/worktrees/agent-*
+#      are reaped by DELEGATING to bin/heimdall-reap-idle --apply (its git-derived
+#      merge-base classification is the single source of truth; this tool NEVER
+#      re-implements it). Unmerged work is ALWAYS kept. Then `git worktree prune`
+#      clears any dangling admin entries.
+#
+#   2. PROCESSES  — orphaned presence-keeper pidfiles under $HEIMDALL_KEEPER_DIR.
+#      A pidfile whose pid is DEAD (the session crashed before keeper-stop ran) is
+#      reaped (the file — the process is already gone). A pid that is ALIVE but is
+#      demonstrably NOT a heimdall process (the pid was recycled by an unrelated
+#      program) has its STALE pidfile reaped, and the foreign process is NEVER
+#      touched. A pid that is ALIVE and is (or might be) a genuine keeper is KEPT
+#      untouched — removing a live keeper's pidfile would soft-stop it, and killing
+#      it could silence a LIVE session's presence. SAFETY FIRST: when unsure, keep.
+#      Truly-orphaned live keepers self-expire at their own 24h wallclock backstop,
+#      after which their pidfile is a DEAD one this tool then reaps.
+#
+#   3. TEMP FILES — TTL + ownership checked:
+#        • $TMPDIR + /tmp  hmd-*        (statusline ledgers etc.) older than the temp
+#          TTL. A temp keyed by a LIVE session id (a live keeper names it) is KEPT
+#          regardless of age — never reap a live session's artifact.
+#        • ~/.heimdall/.sigil-cache/*.sig + vis-cache/*  older than the cache TTL
+#          (both are content-addressed + self-healing — safe to purge; the .srcver
+#          self-heal sidecar is preserved).
+#        • ~/.heimdall/logs/*  — an oversize log is ROTATED in place (truncated to its
+#          last lines, kept); an old + small log is deleted. Recent logs are kept.
+#      NEVER deleted (defense-in-depth name/path guard, on TOP of only ever scanning
+#      the transient dirs): team.json, *.seed, pki/, signing/, sigil-choice, .run-count,
+#      identity, persona.json, the ledger's active status.json, .srcver.
+#
+#   run  = worktrees + processes + temp, each wrapped so a failure in one step never
+#          aborts the others (or the caller); prints a one-line receipt of what it
+#          freed. --quick = temp + processes only (skips the git worktree pass) for a
+#          fast SessionStart / keeper-beat sweep.
+#
+# All destructive ops are `|| true` guarded — this tool is best-effort and NEVER
+# fatal. --dry-run reports every decision but mutates nothing.
+#
+# Usage:
+#   heimdall-gc [run|worktrees|procs|temp] [--quick] [--dry-run] [--quiet]
+#               [--repo <path>] [--home <dir>]
+#
+# Test/override seams (env):
+#   HEIMDALL_HOME           runtime home root (default ~/.heimdall)
+#   HEIMDALL_KEEPER_DIR     keeper pidfile dir (default <home>/presence-keeper)
+#   HMD_GC_TMP_ROOTS        space-separated temp roots to sweep (default "/tmp $TMPDIR")
+#   HMD_GC_TEMP_TTL_MIN     temp-file TTL in minutes   (default 60)
+#   HMD_GC_CACHE_TTL_HOURS  sigil/vis cache TTL in hours(default 24)
+#   HMD_GC_LOG_MAX_BYTES    log rotate threshold bytes (default 1048576)
+#   HMD_GC_LOG_TAIL_LINES   lines kept when rotating    (default 200)
+#   HMD_GC_LOG_TTL_HOURS    old-log delete TTL in hours (default 168)
+#   HMD_GC_LIVE_PIDS        space-separated "alive" pids (test seam; replaces kill -0)
+#   HMD_GC_PROC_CMD         path to a `cmd <pid>`-echoing stub (test seam; replaces ps)
+#   HMD_GC_BREAK            name of a step to force-fail (test seam for non-fatal proof)
+#
+# Exit: always 0 for `run` (best-effort). 2 on a usage error.
+set -uo pipefail
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ── argv ────────────────────────────────────────────────────────────────────────
+SUB=""; QUICK=0; DRYRUN=0; QUIET=0; REPO=""; HOME_OVERRIDE=""
+usage() { sed -n '2,66p' "$0" | sed 's/^# \{0,1\}//'; }
+while [ $# -gt 0 ]; do
+  case "$1" in
+    run|worktrees|procs|processes|temp|temp-files) SUB="$1" ;;
+    --quick)          QUICK=1 ;;
+    --dry-run|-n)     DRYRUN=1 ;;
+    --quiet|-q)       QUIET=1 ;;
+    --repo)           REPO="${2:-}"; shift ;;
+    --repo=*)         REPO="${1#--repo=}" ;;
+    --home)           HOME_OVERRIDE="${2:-}"; shift ;;
+    --home=*)         HOME_OVERRIDE="${1#--home=}" ;;
+    -h|--help)        usage; exit 0 ;;
+    *) echo "heimdall-gc: unknown argument: $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+[ -n "$SUB" ] || SUB="run"
+case "$SUB" in processes) SUB="procs" ;; temp-files) SUB="temp" ;; esac
+
+# ── resolved paths ───────────────────────────────────────────────────────────────
+HMD_HOME="${HOME_OVERRIDE:-${HEIMDALL_HOME:-${HOME:-}/.heimdall}}"
+KEEPER_DIR="${HEIMDALL_KEEPER_DIR:-$HMD_HOME/presence-keeper}"
+SIGIL_CACHE="$HMD_HOME/.sigil-cache"
+VIS_CACHE="$HMD_HOME/vis-cache"
+LOGS_DIR="$HMD_HOME/logs"
+
+if [ -n "${HMD_GC_TMP_ROOTS:-}" ]; then
+  TMP_ROOTS="$HMD_GC_TMP_ROOTS"
+else
+  TMP_ROOTS="/tmp"
+  if [ -n "${TMPDIR:-}" ] && [ "${TMPDIR%/}" != "/tmp" ]; then TMP_ROOTS="$TMP_ROOTS ${TMPDIR%/}"; fi
+fi
+
+TEMP_TTL_MIN="${HMD_GC_TEMP_TTL_MIN:-60}"
+CACHE_TTL_HOURS="${HMD_GC_CACHE_TTL_HOURS:-24}"
+LOG_MAX_BYTES="${HMD_GC_LOG_MAX_BYTES:-1048576}"
+LOG_TAIL_LINES="${HMD_GC_LOG_TAIL_LINES:-200}"
+LOG_TTL_HOURS="${HMD_GC_LOG_TTL_HOURS:-168}"
+
+# ── counters ─────────────────────────────────────────────────────────────────────
+WT_REAPED=0
+PROC_REAPED=0
+PROC_KEPT_LIVE=0
+TEMP_REAPED=0
+TEMP_BYTES=0
+LOGS_ROTATED=0
+
+# ── helpers ──────────────────────────────────────────────────────────────────────
+_report() { [ "$QUIET" = 1 ] && return 0; printf '[gc:%s] %s\n' "$1" "$2" >&2; }
+
+_fsize() { stat -f%z "$1" 2>/dev/null || stat -c%s "$1" 2>/dev/null || echo 0; }
+
+# liveness: the test seam HMD_GC_LIVE_PIDS (set, possibly empty) replaces kill -0.
+_pid_alive() {
+  if [ -n "${HMD_GC_LIVE_PIDS+x}" ]; then
+    case " ${HMD_GC_LIVE_PIDS} " in *" $1 "*) return 0 ;; *) return 1 ;; esac
+  fi
+  kill -0 "$1" 2>/dev/null
+}
+
+# the command line of a pid (for foreign-vs-keeper discrimination). Test seam: a stub.
+_proc_cmd() {
+  if [ -n "${HMD_GC_PROC_CMD:-}" ]; then "$HMD_GC_PROC_CMD" "$1" 2>/dev/null; return; fi
+  ps -o command= -p "$1" 2>/dev/null || ps -o comm= -p "$1" 2>/dev/null || true
+}
+
+# NEVER-DELETE guard: secrets, identity, active state, self-heal sidecars — on TOP of
+# only ever scanning the transient dirs, so a protected file can never fall through.
+_is_protected() {
+  case "$(basename "$1")" in
+    team.json|team.shared.json|*.seed|sigil-choice|.run-count|identity|persona.json| \
+    cp-endpoint.json|remote.json|status.json|.srcver) return 0 ;;
+  esac
+  case "$1" in
+    */pki/*|*/signing/*|*/ledger/*|*/gh-app/*) return 0 ;;
+  esac
+  return 1
+}
+
+# reap one file, accumulating count + bytes (dry-run: report only).
+_reap_file() {
+  local f="$1" sz
+  sz="$(_fsize "$f")"; case "$sz" in ''|*[!0-9]*) sz=0 ;; esac
+  _report "temp" "reap ${f} (${sz}B)"
+  if [ "$DRYRUN" != 1 ]; then rm -f "$f" 2>/dev/null || return 0; fi
+  TEMP_REAPED=$((TEMP_REAPED + 1)); TEMP_BYTES=$((TEMP_BYTES + sz))
+}
+
+# ── 1. WORKTREES (delegate to reap-idle; never re-implement its logic) ───────────
+gc_worktrees() {
+  [ "${HMD_GC_BREAK:-}" = worktrees ] && { _report "wt" "forced break (test seam)"; return 1; }
+  [ "$QUICK" = 1 ] && return 0
+  command -v git >/dev/null 2>&1 || return 0
+  local repo="$REPO"
+  [ -n "$repo" ] || repo="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+  [ -n "$repo" ] || return 0
+  git -C "$repo" rev-parse --git-dir >/dev/null 2>&1 || return 0
+  local reap="$SELF_DIR/heimdall-reap-idle" out n
+  if [ -x "$reap" ]; then
+    # Delegate ONLY the worktree reaping. Suppress reap-idle's O(processes) poller
+    # scan (a no-op ps seam) — gc reaps orphaned processes itself (keeper pidfiles),
+    # and reap-idle's poller pass only REPORTS (it kills nothing without --kill +
+    # same-pgid, which a detached gc can't satisfy anyway). This keeps the worktree
+    # step ~1s instead of ~30s on a busy machine.
+    if [ "$DRYRUN" = 1 ]; then
+      out="$(HEIMDALL_REAP_PS_CMD=true "$reap" --repo "$repo" --quiet 2>/dev/null || true)"
+      n="$(printf '%s' "$out" | sed -n 's/.*would reap \([0-9][0-9]*\).*/\1/p' | head -1)"
+    else
+      out="$(HEIMDALL_REAP_PS_CMD=true "$reap" --repo "$repo" --apply --quiet 2>/dev/null || true)"
+      n="$(printf '%s' "$out" | sed -n 's/.*reaped \([0-9][0-9]*\) worktree.*/\1/p' | head -1)"
+    fi
+    case "$n" in ''|*[!0-9]*) n=0 ;; esac
+    WT_REAPED=$((WT_REAPED + n))
+    [ "$n" -gt 0 ] && _report "wt" "reaped $n merged agent worktree(s) via heimdall-reap-idle"
+  fi
+  [ "$DRYRUN" = 1 ] || git -C "$repo" worktree prune >/dev/null 2>&1 || true
+  return 0
+}
+
+# ── 2. PROCESSES (orphaned keeper pidfiles — SAFE subset only) ───────────────────
+gc_procs() {
+  [ "${HMD_GC_BREAK:-}" = procs ] && { _report "proc" "forced break (test seam)"; return 1; }
+  [ -d "$KEEPER_DIR" ] || return 0
+  local pf pid cmd
+  for pf in "$KEEPER_DIR"/*.pid; do
+    [ -e "$pf" ] || continue
+    pid="$(cat "$pf" 2>/dev/null | tr -d '[:space:]')"
+    case "$pid" in
+      ''|*[!0-9]*)
+        _report "proc" "reap corrupt pidfile (non-numeric): ${pf##*/}"
+        [ "$DRYRUN" = 1 ] || rm -f "$pf" 2>/dev/null || true
+        PROC_REAPED=$((PROC_REAPED + 1)); continue ;;
+    esac
+    if _pid_alive "$pid"; then
+      cmd="$(_proc_cmd "$pid")"
+      if [ -n "$cmd" ] && ! printf '%s' "$cmd" | grep -qi 'heimdall'; then
+        # alive, but demonstrably NOT a heimdall process -> the pid was recycled.
+        # Reap the STALE pidfile only; the foreign process is NEVER touched.
+        _report "proc" "reap stale pidfile (pid $pid recycled by a foreign proc): ${pf##*/}"
+        [ "$DRYRUN" = 1 ] || rm -f "$pf" 2>/dev/null || true
+        PROC_REAPED=$((PROC_REAPED + 1))
+      else
+        # alive heimdall keeper, OR an unidentifiable pid -> assume a LIVE keeper and
+        # KEEP it untouched (removing the pidfile would soft-stop a live session's keeper).
+        PROC_KEPT_LIVE=$((PROC_KEPT_LIVE + 1))
+        _report "proc" "keep LIVE keeper pid $pid (${pf##*/})"
+      fi
+    else
+      # dead pid -> the session ended/crashed before keeper-stop reaped it. Safe.
+      _report "proc" "reap dead keeper pidfile (pid $pid not alive): ${pf##*/}"
+      [ "$DRYRUN" = 1 ] || rm -f "$pf" 2>/dev/null || true
+      PROC_REAPED=$((PROC_REAPED + 1))
+    fi
+  done
+  return 0
+}
+
+# LIVE session ids: the session key of every keeper pidfile that names an ALIVE pid.
+# A temp file whose name carries a live session id is NEVER reaped, regardless of age.
+_live_session_ids() {
+  local pf pid b
+  [ -d "$KEEPER_DIR" ] || return 0
+  for pf in "$KEEPER_DIR"/*.pid; do
+    [ -e "$pf" ] || continue
+    pid="$(cat "$pf" 2>/dev/null | tr -d '[:space:]')"
+    case "$pid" in ''|*[!0-9]*) continue ;; esac
+    _pid_alive "$pid" || continue
+    b="${pf##*/}"; b="${b%.pid}"          # <project>__<session>
+    printf '%s\n' "${b##*__}"
+  done
+}
+
+# ── 3. TEMP FILES (TTL + live-session + protected guards) ────────────────────────
+gc_temp() {
+  [ "${HMD_GC_BREAK:-}" = temp ] && { _report "temp" "forced break (test seam)"; return 1; }
+  local live_sids f root sid keep
+  live_sids="$(_live_session_ids)"
+
+  # 3a. temp roots: hmd-* past the temp TTL, skipping live-session-keyed + protected.
+  for root in $TMP_ROOTS; do
+    [ -d "$root" ] || continue
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      _is_protected "$f" && continue
+      keep=0
+      if [ -n "$live_sids" ]; then
+        while IFS= read -r sid; do
+          [ -n "$sid" ] || continue
+          case "$f" in *"$sid"*) keep=1; break ;; esac
+        done <<< "$live_sids"
+      fi
+      [ "$keep" = 1 ] && { _report "temp" "keep live-session temp: ${f##*/}"; continue; }
+      _reap_file "$f"
+      # trailing slash forces find to DESCEND a symlinked root (macOS /tmp -> /private/tmp),
+      # which `find /tmp -maxdepth 1` would otherwise refuse to enter — the statusline temps live there.
+    done < <(find "${root%/}/" -maxdepth 1 -type f -name 'hmd-*' -mmin +"$TEMP_TTL_MIN" 2>/dev/null)
+  done
+
+  # 3b. sigil + vis caches: entries past the cache TTL (self-healing; safe to purge).
+  local cache_min=$((CACHE_TTL_HOURS * 60)) cdir
+  for cdir in "$SIGIL_CACHE" "$VIS_CACHE"; do
+    [ -d "$cdir" ] || continue
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      _is_protected "$f" && continue
+      _reap_file "$f"
+    done < <(find "${cdir%/}/" -maxdepth 1 -type f -mmin +"$cache_min" 2>/dev/null)
+  done
+
+  # 3c. logs: rotate oversize (keep), delete old + small.
+  gc_logs
+  return 0
+}
+
+gc_logs() {
+  [ -d "$LOGS_DIR" ] || return 0
+  local log sz tmp log_ttl_min=$((LOG_TTL_HOURS * 60))
+  for log in "$LOGS_DIR"/*; do
+    [ -f "$log" ] || continue
+    _is_protected "$log" && continue
+    sz="$(_fsize "$log")"; case "$sz" in ''|*[!0-9]*) sz=0 ;; esac
+    if [ "$sz" -gt "$LOG_MAX_BYTES" ]; then
+      if [ "$DRYRUN" != 1 ]; then
+        tmp="$log.gc.$$"
+        if tail -n "$LOG_TAIL_LINES" "$log" > "$tmp" 2>/dev/null; then
+          mv -f "$tmp" "$log" 2>/dev/null || rm -f "$tmp" 2>/dev/null || true
+        else
+          rm -f "$tmp" 2>/dev/null || true
+        fi
+      fi
+      LOGS_ROTATED=$((LOGS_ROTATED + 1))
+      _report "temp" "rotate oversize log ${log##*/} (${sz}B -> tail ${LOG_TAIL_LINES})"
+      continue
+    fi
+    # old + small -> delete entirely.
+    if [ -n "$(find "$log" -maxdepth 0 -type f -mmin +"$log_ttl_min" 2>/dev/null)" ]; then
+      _reap_file "$log"
+    fi
+  done
+  return 0
+}
+
+# ── receipt ──────────────────────────────────────────────────────────────────────
+print_receipt() {
+  [ "$QUIET" = 1 ] && return 0
+  local kb=$(((TEMP_BYTES + 512) / 1024))
+  printf 'heimdall-gc%s: freed %d worktree(s), %d orphan pidfile(s) (kept %d live keeper(s)), %d temp file(s) ~%dKB, %d log(s) rotated\n' \
+    "$([ "$DRYRUN" = 1 ] && printf ' (dry-run)')" \
+    "$WT_REAPED" "$PROC_REAPED" "$PROC_KEPT_LIVE" "$TEMP_REAPED" "$kb" "$LOGS_ROTATED"
+}
+
+# ── dispatch (each step non-fatal: `|| true` keeps run going) ────────────────────
+case "$SUB" in
+  worktrees) gc_worktrees || true; print_receipt ;;
+  procs)     gc_procs || true;     print_receipt ;;
+  temp)      gc_temp || true;      print_receipt ;;
+  run)
+    gc_worktrees || true
+    gc_procs || true
+    gc_temp || true
+    print_receipt ;;
+esac
+exit 0
