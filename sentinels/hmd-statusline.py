@@ -1,12 +1,31 @@
 #!/usr/bin/env python3
 """
-hmd-statusline.py — Heimdall watchman statusline v2 for Claude Code.
-Full-width. Personal sigil anchors the left; gate verdict pins the right; the
-team watch wall fills the bottom row when teammates are live. Reads CC JSON on
-stdin. Zero context cost. Falls back gracefully with no state and no team.
+hmd-statusline.py — Heimdall watchman statusline v1 "Full-bleed Gauge" (3-row).
 
-Ships via plugin settings.json:
-  "statusLine": {"type":"command","command":"python3 ${CLAUDE_PLUGIN_ROOT}/sentinels/hmd-statusline.py","refreshInterval":3}
+The user's OWN hero sigil (hmd_sigil size 'M', the ▄ 8×8 render) anchors the LEFT;
+three content rows lay out to its right, EXACTLY $COLUMNS visible cells each:
+
+  Row1  ⛭ HEIMDALL │ <user>·<model> │ <repo>:<branch>   ·· team · daemon · rate-limit
+  Row2  <full-bleed context gauge, per-cell 48;2 bg ramp, inside labels>
+  Row3  <gate cells ✓/◌/✗ · perm-mode>                    ·· busiest subagent (ghost)
+
+Assembled through the sibling pure modules:
+  hmd_gauge   — the Row2 full-bleed gauge (render_gauge)
+  hmd_layout  — exact-width row assembly (compose_with_sigil / remaining_width /
+                pad_or_truncate / left_right / width_tier)
+  hmd_ledger  — the coordination ledger reader (read_status → daemon/gates/verdict/team)
+
+Width tiers (hmd_layout.width_tier):
+  full   (>=100): all three rows, all segments.
+  mid    (60-99): drop team member names (count only) + the gauge right label.
+  narrow (40-59): drop Row1 right rail + all gauge labels (bar-only).
+  tiny   (<40):   ONE line — `HMD <pct>% <gates>`.
+
+Reads Claude Code's statusLine JSON on stdin. Null-safe throughout; always exits 0,
+NEVER writes stderr. Empty/malformed stdin → the `⛭ HEIMDALL` fallback line, exit 0.
+
+Ships via hooks/statusline.sh → python3 ${CLAUDE_PLUGIN_ROOT}/sentinels/hmd-statusline.py
+(refreshInterval:2, wired by bin/heimdall-statusline-register / install.sh).
 
 Modes:
   --widget   emit only the watchman+verdict segment (ccstatusline coexistence)
@@ -14,21 +33,28 @@ Modes:
 import sys, os, json, time, re, hashlib, importlib.util, subprocess, shlex, contextlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-BIN_DIR = os.path.normpath(os.path.join(HERE, "..", "bin"))  # heimdall-identity / heimdall-presence live here
-spec = importlib.util.spec_from_file_location("hmd_sigil", os.path.join(HERE, "hmd_sigil.py"))
-SIG = importlib.util.module_from_spec(spec); spec.loader.exec_module(SIG)
-_tcspec = importlib.util.spec_from_file_location("hmd_termcaps", os.path.join(HERE, "hmd_termcaps.py"))
-TC = importlib.util.module_from_spec(_tcspec); _tcspec.loader.exec_module(TC)
+BIN_DIR = os.path.normpath(os.path.join(HERE, "..", "bin"))  # heimdall-identity / heimdall-presence
+
+
+def _load(name):
+    spec = importlib.util.spec_from_file_location(name, os.path.join(HERE, name + ".py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+# sibling modules — imported by path so this file stays runnable from any cwd.
+SIG = _load("hmd_sigil")
+TC = _load("hmd_termcaps")
+GAUGE = _load("hmd_gauge")        # import hmd_gauge — the Row2 full-bleed gauge
+LAYOUT = _load("hmd_layout")      # import hmd_layout — exact-width row assembly
+LEDGER = _load("hmd_ledger")      # import hmd_ledger — the ledger reader (read_status)
 
 # ── terminal capability tier ─────────────────────────────────────────────────
-# CC's statusLine is non-TTY but truecolor, so we can't lean on isatty alone.
-# hmd_termcaps.detect() resolves a graded tier from $COLORTERM/$TERM/$TERM_PROGRAM/
-# $TMUX (+ the --no-color/--plain flag hooks/statusline.sh passes, + the
-# HEIMDALL_STATUSLINE_MODE override): color ∈ {truecolor,256,16,mono}, unicode ∈
-# {full,basic,ascii}. The line is BUILT in 24-bit truecolor + full unicode exactly
-# as before; CAPS.emit() downgrades the finished bytes in one pass at write time
-# (truecolor+full = byte-identical NO-OP). USE_COLOR gates the palette (empty codes
-# → clean plain text) so the sigil/glyphs that emit ANSI regardless collapse too.
+# CC's statusLine is non-TTY but truecolor. hmd_termcaps.detect() grades a tier from
+# $COLORTERM/$TERM/$TERM_PROGRAM/$TMUX (+ --no-color/--plain + HEIMDALL_STATUSLINE_MODE).
+# The line is BUILT in 24-bit truecolor + full unicode; CAPS.emit() downgrades the
+# finished bytes in ONE pass at write time (truecolor+full = byte-identical NO-OP).
 CAPS = TC.detect(sys.argv)
 USE_COLOR = CAPS.use_color()
 def _c(s): return s if USE_COLOR else ""
@@ -36,182 +62,35 @@ def _write(s):
     # single choke point: every render path emits through the tier downgrade.
     sys.stdout.write(CAPS.emit(s))
 
-# a branded ASCII sigil for no-unicode terminals (dumb/CI): 4 rows × 8 cols so the
-# 8-wide square-sigil anchor + 2-space gutter (ANCHOR=10) alignment is preserved.
-ASCII_SIGIL = ["  ____  ", " |o  o| ", " |____| ", "  hmd   "]
-def _sigil_rows(seed, eye):
-    """The left anchor per tier: half-block watchman when unicode=full + color on
-    (color downgraded by emit); a branded ASCII sigil for no-unicode terms; a blank
-    8-wide anchor for mono+unicode (preserves the legacy no-color blank behavior)."""
-    if CAPS.unicode == TC.ASCII:
-        return list(ASCII_SIGIL)
-    if CAPS.color == TC.MONO:
-        return ["        "] * 4
-    if CAPS.unicode == TC.FULL:
-        try: return cached_sigil(seed, "M", CAPS, eye)   # shared core, cached (§1/§5)
-        except Exception: return list(ASCII_SIGIL)
-    return list(ASCII_SIGIL)   # basic unicode + color → safe ASCII sigil
-
-def _sigil_rows_s(seed, eye):
-    """The COMPACT anchor: sigil S (4 cols × 2 rows) through the same shared/cached
-    core as the full-mode M anchor, with the identical per-tier fallbacks (ASCII
-    mini-anchor on no-unicode, blank on mono, safe ASCII on basic)."""
-    if CAPS.unicode == TC.ASCII:
-        return list(ASCII_SIGIL_S)
-    if CAPS.color == TC.MONO:
-        return ["    ", "    "]
-    if CAPS.unicode == TC.FULL:
-        try: return cached_sigil(seed, "S", CAPS, eye)
-        except Exception: return list(ASCII_SIGIL_S)
-    return list(ASCII_SIGIL_S)
-
-def _wall_state(v):
-    """Teammate verdict → the compact wall's three visual states (spec B §4):
-    deny → red-frame, watching/idle → dim, everything live → solid."""
-    nv = _norm_verdict(v)
-    if nv == "deny": return "deny"
-    if nv == "watching": return "idle"
-    return "active"
-
-def wall_state_glyph(seed, state):
-    """One teammate cell for the compact wall: a ◉ tinted by the teammate's DOMINANT
-    sigil color (glyph_color — identity, NOT verdict), with state carried by the
-    frame/intensity: active = solid hue, idle = dimmed hue, deny = red ▕ ▏ frame
-    around the hue glyph. In no-color mode the glyph collapses to a bare ◉ (emit
-    strips the tint)."""
-    try: hue = SIG.glyph_color(seed)
-    except Exception: hue = (90, 100, 114)
-    if not USE_COLOR:
-        return "▕◉▏" if state == "deny" else "◉"
-    if state == "deny":
-        return f"{RD}▕{X}{sgr(hue)}◉{X}{RD}▏{X}"
-    if state == "idle":
-        dim = tuple(max(0, c * 45 // 100) for c in hue)
-        return f"{sgr(dim)}◉{X}"
-    return f"{sgr(hue)}◉{X}"
-
-def compact_wall(cwd, seed, my_verdict, present, cols, anch):
-    """A row of teammate GLYPHS for the compact HUD: your glyph first, then live
-    teammates (most-recent first) tinted by glyph_color, capped to the row budget
-    with a `+k` overflow tag (spec B §4). Width-safe: stops before the gutter, never
-    slicing a glyph."""
-    budget = max(0, cols - anch - 6)   # usable width: cols − S anchor − right gutter
-    you_state = ("deny" if my_verdict == "deny"
-                 else "idle" if my_verdict == "watching" else "active")
-    if present:
-        parts = [wall_state_glyph(seed, you_state)]
-    else:
-        parts = [f"{FAINT}◦{X}"]        # you are invisible (presence off) — a faint dot
-    used = vis(parts[0]); JOIN = 1
-    team = sorted(team_presence(cwd), key=lambda m: m.get("ts", 0), reverse=True)
-    shown = 0
-    for m in team:
-        g = wall_state_glyph(m.get("name", "?"), _wall_state(m.get("verdict", "working")))
-        if used + JOIN + vis(g) > budget: break
-        parts.append(g); used += JOIN + vis(g); shown += 1
-    extra = len(team) - shown
-    if extra > 0:
-        tag = f"{DIM}+{extra}{X}"
-        while shown > 0 and used + JOIN + vis(tag) > budget:
-            dropped = parts.pop(); shown -= 1; extra += 1
-            used -= JOIN + vis(dropped); tag = f"{DIM}+{extra}{X}"
-        parts.append(tag)
-    return " ".join(parts)
-
 # palette (empty in no-color mode → f-strings render as plain text)
 CY=_c("\033[38;2;34;211;238m"); GR=_c("\033[38;2;34;197;94m"); RD=_c("\033[38;2;239;68;68m")
 AM=_c("\033[38;2;245;158;11m"); DIM=_c("\033[38;2;90;100;114m"); FAINT=_c("\033[38;2;58;65;77m")
-TEAL=_c("\033[38;2;45;212;191m")  # #2dd4bf — brand wordmark + eye bracket (mockup §3 teal)
+TEAL=_c("\033[38;2;45;212;191m")  # brand wordmark teal
 BOLD=_c("\033[1m"); X=_c("\033[0m")
 SEP=f"{FAINT} │ {X}"
 ANSI = re.compile(r"\033\[[0-9;]*m")
-# visible width is tier-aware: emoji (e.g. ⚡) are double-width when unicode=full,
-# but width-1 once downgraded to ASCII — so the right-pin math tracks the real cells.
 def vis(s): return CAPS.width(s)
 
 def sgr(rgb):
-    """A 24-bit fg SGR for an arbitrary rgb, gated by USE_COLOR (empty → plain text)
-    and downgraded to the detected tier at write time by CAPS.emit (like the fixed
-    palette above). Used for per-identity glyph tints (glyph_color)."""
+    """A 24-bit fg SGR for an arbitrary rgb, gated by USE_COLOR + downgraded by CAPS.emit."""
     return _c("\033[38;2;%d;%d;%dm" % (rgb[0], rgb[1], rgb[2]))
 
-# ── DENSITY (spec B §2) ────────────────────────────────────────────────────────
-# Auto-select by terminal width. NEVER truncate mid-glyph: each mode renders a
-# self-contained block whose rows are padded (finalize) to a uniform width, so a
-# line is either fully present or absent — never sliced through a half-block/emoji.
-#   full    (≥120): sigil M + name + verdict + team wall (the rich ambient HUD)
-#   compact (80–119): sigil S + verdict + wall GLYPHS (tinted, +k overflow)
-#   minimal (<80):    a single glyph + the verdict word
-def density(cols):
-    if cols >= 120: return "full"
-    if cols >= 80:  return "compact"
-    return "minimal"
+# a branded ASCII sigil for no-unicode terminals (dumb/CI): 8-wide × 3 rows so the
+# anchor alignment survives AND the `hmd` wordmark still reads within the 3-row height.
+ASCII_SIGIL = [" ______ ", "|o    o|", "|_hmd__|"]
 
-# ── VERDICT SEMANTICS (spec B §3) ──────────────────────────────────────────────
-# PASS / DENY / RUNNING / IDLE — each a FIXED glyph + color, identical across every
-# capability tier (the bytes are built once in truecolor and CAPS.emit maps the color
-# to the tier deterministically, so the glyph never changes and the hue maps 1:1).
-# DENY PULSES via a TWO-FRAME alternation on the refresh tick (SGR blink is BANNED):
-# frame A = bold bright red, frame B = a dimmer red — SAME glyph+word+width, so the
-# pulse never shifts columns (width invariant holds across both frames).
-VERDICT_CANON = {
-    "PASS":    ((34, 197, 94),  "✓", "PASS"),
-    "DENY":    ((239, 68, 68),  "✗", "DENY"),
-    "RUNNING": ((245, 158, 11), "⟳", "RUNNING"),
-    "IDLE":    ((34, 211, 238), "◦", "IDLE"),
-}
-CANON_OF = {
-    "pass": "PASS", "proven": "PASS", "green": "PASS", "done": "PASS", "ok": "PASS",
-    "deny": "DENY", "blocked": "DENY", "fail": "DENY", "failed": "DENY", "closed": "DENY",
-    "scanning": "RUNNING", "scan": "RUNNING", "running": "RUNNING", "working": "RUNNING",
-    "active": "RUNNING", "busy": "RUNNING",
-    "watching": "IDLE", "idle": "IDLE",
-}
-def canon_verdict(v):
-    return CANON_OF.get((v or "").strip().lower(), "IDLE")
+GUTTER = 2   # spaces between the sigil anchor and the content column.
 
-def _deny_dim(rgb, tick):
-    """Frame B of the DENY pulse: a dimmer red on odd ticks (frame A = full red on
-    even). Two-frame, deterministic on the tick — no SGR blink."""
-    if tick % 2 == 1:
-        return tuple(max(0, c * 6 // 10) for c in rgb)
-    return rgb
-
-def verdict_seg(canon, tick):
-    """The fixed glyph + word for a verdict, pulsing on DENY. Same width every frame."""
-    rgb, g, w = VERDICT_CANON[canon]
-    if canon == "DENY": rgb = _deny_dim(rgb, tick)
-    return f"{sgr(rgb)}{BOLD}{g} {w}{X}"
-
-def verdict_word(canon, tick):
-    """Just the colored word (minimal mode), pulsing on DENY."""
-    rgb, _g, w = VERDICT_CANON[canon]
-    if canon == "DENY": rgb = _deny_dim(rgb, tick)
-    return f"{sgr(rgb)}{BOLD}{w}{X}"
-
-# ── SIGIL CACHE (spec B §5) ────────────────────────────────────────────────────
-# Precompute the sigil to a cached string per (haid, size, caps[, eye]). The cache
-# key embeds the capability tier so a CAPS CHANGE — and only a caps change (plus the
-# small fixed set of animation eye-colors) — invalidates it; a verdict/context/token
-# change never rebuilds the sigil. An in-process memo makes repeat lookups within one
-# render free; a durable on-disk layer under ~/.heimdall/.sigil-cache carries the
-# precompute across the per-refresh process spawns, keeping render well under 50ms.
-# Bytes are stored in native truecolor (tier-independent); the single tier downgrade
-# happens later in finalize(), so the same cache serves every surface consistently.
+# ── SIGIL CACHE ────────────────────────────────────────────────────────────────
+# Precompute the sigil to a cached string per (haid, size, caps[, eye]). A content
+# hash of hmd_sigil.py is folded into the key so a code change mints a fresh key.
 _SIG_MEMO = {}
 def _sigil_cache_dir():
     return os.path.join(os.path.expanduser("~"), ".heimdall", ".sigil-cache")
 
 def _sigil_version():
-    """A short CONTENT hash of hmd_sigil.py's source, folded into the cache key. Any
-    change to the sigil code (grids, palette, render logic) mints a
-    fresh key → the stale on-disk sigil is never served again, with NO manual cache
-    clear (the "sigil never updated" bug). CC forks a fresh python per render, so to
-    avoid re-hashing the whole source on every spawn we memoize (mtime → hash) in a tiny
-    sidecar (.srcver): an unchanged mtime reuses the stored hash and SKIPS the re-read;
-    only a real edit (which bumps mtime) re-reads + re-hashes → a fresh key that still
-    busts the sigil cache. Falls back to '0' when the source can't be read — the key
-    then degrades to the old tier/eye/seed behavior, never crashing."""
+    """Short CONTENT hash of hmd_sigil.py folded into the cache key (mtime-memoized in a
+    .srcver sidecar so a fresh spawn skips re-hashing an unchanged source)."""
     try:
         src = getattr(SIG, "__file__", None) or os.path.join(HERE, "hmd_sigil.py")
         mtime = os.path.getmtime(src)
@@ -238,8 +117,6 @@ _SIG_VERSION = _sigil_version()
 def cached_sigil(seed, size, caps, eye):
     eyt = tuple(eye or SIG.EYE)
     ekey = "%02x%02x%02x" % (eyt[0], eyt[1], eyt[2])
-    # the version hash is part of the key/filename → a code change invalidates the
-    # cache automatically; only a tier/eye/seed/version match hits the stored sigil.
     ckey = "%s-%s-%s" % (caps.color, caps.unicode, _SIG_VERSION)
     memo_k = (seed, size, ckey, ekey)
     m = _SIG_MEMO.get(memo_k)
@@ -247,87 +124,65 @@ def cached_sigil(seed, size, caps, eye):
     lines = None
     safe = re.sub(r"[^A-Za-z0-9_.-]+", "-", seed or "you")[:48]
     path = os.path.join(_sigil_cache_dir(), "%s__%s__%s__%s.sig" % (safe, size, ckey, ekey))
-    try:
+    with contextlib.suppress(Exception):
         with open(path, "r", encoding="utf-8") as f:
             lines = f.read().split("\n")
-    except Exception:
-        lines = None
     if lines is None:
-        try:
+        with contextlib.suppress(Exception):
             lines = SIG.sigil_render(seed, size, SIG.tier_caps(), eye_override=eye)
-        except Exception:
-            lines = None
         if lines is not None:
-            try:
+            with contextlib.suppress(Exception):
                 os.makedirs(_sigil_cache_dir(), exist_ok=True)
                 tmp = path + ".%d.tmp" % os.getpid()
                 with open(tmp, "w", encoding="utf-8") as f: f.write("\n".join(lines))
                 os.replace(tmp, path)
-            except Exception:
-                lines = lines   # cache write is best-effort; a miss just recomputes
     if lines is None:
-        lines = list(ASCII_SIGIL) if size == "M" else ["    ", "    "]
+        lines = list(ASCII_SIGIL)
     _SIG_MEMO[memo_k] = list(lines)
     return list(lines)
 
-# a 4-wide × 2-row branded ASCII anchor for the compact mode's no-unicode fallback.
-ASCII_SIGIL_S = [" __ ", "|oo|"]
+def _sigil_rows(seed, eye):
+    """The left anchor per tier: the 58-hero half-block watchman (size 'M') on
+    unicode=full + color; a branded ASCII sigil on no-unicode terms; a blank 8-wide
+    anchor in mono. The 3-row layout uses the TOP 3 of the sigil's rows (SIGIL-KEEP:
+    the multi-cell hero block stays the anchor; hmd_sigil.py is byte-untouched)."""
+    if CAPS.unicode == TC.ASCII:
+        rows = list(ASCII_SIGIL)
+    elif CAPS.color == TC.MONO:
+        rows = ["        "] * 4
+    elif CAPS.unicode == TC.FULL:
+        try:
+            rows = cached_sigil(seed, "M", CAPS, eye)
+        except Exception:
+            rows = list(ASCII_SIGIL)
+    else:
+        rows = list(ASCII_SIGIL)
+    return rows[:3]
 
-def _clamp_row(s, maxw):
-    """Truncate one already-emitted row to `maxw` VISIBLE cells without slicing an
-    ANSI escape or a wide glyph in half. ANSI codes carry zero width and are copied
-    verbatim; a visible glyph is dropped whole once it would cross the budget. A
-    reset is appended iff the row carried color AND was actually clipped, so a
-    truncated row never bleeds its last SGR into the terminal. maxw<=0 → empty."""
-    if maxw is None:
-        return s
-    if maxw <= 0:
-        return ""
-    out = []; w = 0; pos = 0; n = len(s); had_ansi = False; clipped = False
-    while pos < n:
-        m = ANSI.match(s, pos)
-        if m:
-            out.append(m.group(0)); had_ansi = True; pos = m.end(); continue
-        ch = s[pos]; cw = CAPS.width(ch)
-        if w + cw > maxw:
-            clipped = True; break
-        out.append(ch); w += cw; pos += 1
-    r = "".join(out)
-    if clipped and had_ansi:
-        r += "\033[0m"   # close any dangling SGR so the clip never bleeds color
-    return r
+# ── stdin ────────────────────────────────────────────────────────────────────
+def read_stdin():
+    """Return (data|None). None means empty OR malformed stdin (→ the ⛭ HEIMDALL
+    fallback). A valid but empty `{}` returns {} (→ the full null-safe render)."""
+    try:
+        raw = sys.stdin.read()
+    except Exception:
+        return None
+    if not raw or not raw.strip():
+        return None
+    try:
+        d = json.loads(raw)
+    except Exception:
+        return None
+    return d if isinstance(d, dict) else None
 
-def finalize(lines, clamp=None):
-    """Emit every row to the detected tier (the single downgrade pass), CLAMP each to
-    the available terminal width so no row can overflow COLUMNS and wrap onto a 2nd
-    visual line (the double-header / 8.5-row-sigil bleed), then pad each to the
-    uniform MAX visible width so ALL rows are wcwidth-equal — the width invariant the
-    density goldens assert (spec Tests 2–3). Pad is trailing spaces only; clamp drops
-    whole glyphs only — so a line is never sliced mid-glyph and never wraps."""
-    em = [_clamp_row(CAPS.emit(ln), clamp) for ln in lines]
-    ws = [CAPS.width(ln) for ln in em]
-    W = max(ws) if ws else 0
-    return "\n".join(ln + " " * (W - w) for ln, w in zip(em, ws))
-
-def read_json():
-    try: return json.load(sys.stdin)
-    except Exception: return {}
-
+# ── width detection (REUSE: 80-col conservative floor — RJ's ~95-col wrap bug) ──
 def _cols_from_tty():
-    """Read the REAL width of the CONTROLLING terminal via /dev/tty. Claude Code captures
-    the statusline's stdout (so stdout is NOT a tty — `tput cols` / an ioctl on stdout
-    would fail or lie), but /dev/tty may still be the actual terminal and report its true
-    winsize. Two probes, in order:
-      1. `tput cols </dev/tty` — ncurses reads the tty's window size (needs $TERM; returns
-         '' when setupterm fails, which we skip).
-      2. `stty size </dev/tty`  — prints "rows cols" straight from the tty's TIOCGWINSZ,
-         with no $TERM dependency.
-    Returns a positive int, or None when there is no controlling terminal or both probes
-    fail. Never raises — the statusline must never break on width detection."""
+    """Read the REAL width of the CONTROLLING terminal via /dev/tty (CC captures stdout,
+    so it is not a tty). tput cols → stty size, in order. None when no tty / both fail."""
     try:
         tty = open("/dev/tty")
     except Exception:
-        return None                               # no controlling terminal → caller defaults
+        return None
     try:
         probes = (
             (["tput", "cols"], lambda o: o.strip()),
@@ -341,104 +196,44 @@ def _cols_from_tty():
                 if c > 0:
                     return c
             except Exception:
-                continue                          # this probe failed → try the next
+                continue
     finally:
-        try: tty.close()
-        except Exception: pass
+        with contextlib.suppress(Exception):
+            tty.close()
     return None
 
 def resolve_cols():
-    """Resolve the terminal width WITHOUT ever over-assuming — we must NEVER render wider
-    than the real terminal, or an over-wide row soft-wraps into a thin duplicate strip on
-    a narrow terminal (RJ's ~95-col bug). Order:
-      1. $COLUMNS if set + numeric + >0 — Claude Code exports it (v2.1.153+); an explicit
-         width always wins and keeps every golden (which pins COLUMNS) byte-identical.
-      2. The controlling terminal's real width via /dev/tty (_cols_from_tty) — used when
-         COLUMNS is absent (older CC / other invocations) so we still fit the real screen.
-      3. A CONSERVATIVE 80-col default when the width is genuinely unknown — UNDER-render
-         (compact) rather than OVER-render and wrap. A slightly narrow statusline beats a
-         wrapping one.
-    Returns an int >= 1."""
+    """Width WITHOUT over-assuming (never render wider than the real terminal, or an
+    over-wide row soft-wraps into a thin duplicate strip). $COLUMNS → /dev/tty → 80."""
     env = os.environ.get("COLUMNS")
     if env is not None:
-        try:
+        with contextlib.suppress(Exception):
             c = int(env.strip())
             if c > 0:
                 return c
-        except Exception:
-            pass                                  # non-numeric COLUMNS → fall through
     c = _cols_from_tty()
     if c and c > 0:
         return c
-    return 80                                     # conservative floor: under-render, never wrap
+    return 80   # conservative floor: under-render, never wrap
 
+# ── legacy single-verdict state (for --widget + eye animation) ────────────────
 def gate_state(cwd):
     p = os.environ.get("HEIMDALL_STATE", os.path.join(cwd, ".heimdall", "statusline.json"))
     try:
-        with open(p) as f: return json.load(f)
-    except Exception: return {}
-
-def _parse_semver(v):
-    """Parse a vX.Y.Z (optional leading v) into a comparable (int,int,int) tuple,
-    or None when it does NOT cleanly match — mirrors bin/heimdall's _update_semver_cmp
-    parser so a malformed/empty version can never yield a false 'behind'."""
-    m = re.match(r"^v?(\d+)\.(\d+)\.(\d+)$", (v or "").strip())
-    return tuple(int(x) for x in m.groups()) if m else None
-
-def update_notice():
-    """A compact 'update available' HUD notice, read PURELY from the update-check
-    cache that bin/heimdall's daily BACKGROUND probe writes — NO network and NO
-    subprocess on this render path (the statusline must stay fast + off-box). The
-    cache lives at ${HEIMDALL_HOME:-~/.heimdall}/update-check.json and holds
-    {checked_epoch, installed, latest} (the exact schema the probe writes). Returns
-    the notice iff the cached installed version is STRICTLY older than the cached
-    latest; returns '' (silent) on a current/ahead install, a missing/corrupt/
-    unparseable cache, or ANY fault — a fail-safe that never breaks the line and
-    never cries a false 'behind'."""
-    home = os.environ.get("HEIMDALL_HOME") or os.path.join(os.path.expanduser("~"), ".heimdall")
-    try:
-        with open(os.path.join(home, "update-check.json")) as f:
-            d = json.load(f)
-        installed = _parse_semver(d.get("installed"))
-        latest_raw = (d.get("latest") or "").strip()
-        latest = _parse_semver(latest_raw)
+        with open(p) as f:
+            return json.load(f)
     except Exception:
-        return ""
-    if not installed or not latest or installed >= latest:
-        return ""
-    return f"{AM}⬆ {latest_raw} available{X} {FAINT}·{X} {DIM}hmd --update{X}"
+        return {}
 
-def usage_limit_seg(data, now):
-    """The session-relevant 5-HOUR usage-limit indicator, pinned at the rightmost end
-    of the top row. Reads rate_limits.five_hour.{used_percentage,resets_at} from CC's
-    stdin JSON — present ONLY for Pro/Max accounts and ABSENT until the first API
-    response, so a missing/malformed field returns '' (render NOTHING, never a fake %).
-    Renders `⧗ NN%` color-graded green→amber→red as it approaches 100, plus a compact
-    resets-in countdown (`·2h` / `·45m`) when resets_at is a future epoch. HMD_NOW
-    drives the clock for deterministic conformance (same override the eye animation uses)."""
-    rl = data.get("rate_limits")
-    if not isinstance(rl, dict):
-        return ""
-    fh = rl.get("five_hour")
-    if not isinstance(fh, dict):
-        return ""
-    up = fh.get("used_percentage")
-    if not isinstance(up, (int, float)) or isinstance(up, bool):
-        return ""                                   # absent/malformed → NO fabrication
-    pct = max(0, min(100, int(round(up))))
-    col = RD if pct >= 90 else AM if pct >= 70 else GR   # green→amber→red toward the cap
-    seg = f"{col}⧗ {pct}%{X}"
-    ra = fh.get("resets_at")
-    if isinstance(ra, (int, float)) and not isinstance(ra, bool) and ra > now:
-        rem = int(ra - now)
-        cd = f"{rem // 3600}h" if rem >= 3600 else f"{max(1, rem // 60)}m"
-        seg += f" {FAINT}·{X}{DIM}{cd}{X}"           # compact "resets in" countdown
-    return seg
+VERDICT = {  # verdict -> (eye color rgb, ansi col, glyph, word)
+ "pass":     ((34,197,94),  GR, "✓", "GATE"),
+ "deny":     ((239,68,68),  RD, "✗", "BIFRÖST CLOSED"),
+ "scanning": ((245,158,11), AM, "◦", "scanning"),
+ "watching": ((34,211,238), CY, "◦", "watching"),
+}
 
+# ── identity (FILE-controlled seed + handle; env fallback) ────────────────────
 def identity(cwd, fallback):
-    """Sigil SEED + display HANDLE from bin/heimdall-identity (RJ's call: identity is a
-    file each dev controls, not a derived HAID). One `--json` call resolves both. Any
-    absence/error/timeout falls back to the OLD HMD_HAID/USER seed so the line never breaks."""
     seed = handle = None
     bin_path = os.path.join(BIN_DIR, "heimdall-identity")
     try:
@@ -449,19 +244,12 @@ def identity(cwd, fallback):
             seed = (rec.get("seed") or "").strip() or None
             handle = (rec.get("handle") or "").strip() or None
     except Exception:
-        seed = handle = None   # any fault → drop to the env fallback below
+        seed = handle = None
     resolved = seed or fallback
     return _sigil_override_seed(resolved), (handle or resolved)
 
 def _sigil_override_seed(seed):
-    """The dev's OWN sigil seed, honoring a hero OVERRIDE if one is set AND unlocked.
-    `hmd sigil set <hero>` persists the choice to <home>/sigil-choice (only writable once
-    the dev has run hmd ≥3 times — the ~/.heimdall/.run-count gate). When set + unlocked,
-    the override hero NAME (itself a resolvable sigil seed) WINS over the seed's
-    auto-assigned hero — the resolution order the render core then honors. Guarded: an
-    absent/invalid choice, a locked count, or any read fault → the seed is returned
-    UNCHANGED, so every statusline golden (which runs with no choice file) is a byte-exact
-    no-op. Only the current dev's own seed is affected; teammate seeds are never touched."""
+    """Honor `hmd sigil set <hero>` (unlocked after >=3 runs); else the seed unchanged."""
     home = os.environ.get("HEIMDALL_HOME") or os.path.join(os.path.expanduser("~"), ".heimdall")
     try:
         with open(os.path.join(home, "sigil-choice")) as f:
@@ -477,51 +265,42 @@ def _sigil_override_seed(seed):
         runs = 0
     return choice if runs >= 3 else seed
 
+# ── presence (opt-out + one coordinated fire-and-forget beat/roster fork) ─────
 def _quiet_rm(path):
-    try: os.remove(path)
-    except OSError: return
+    with contextlib.suppress(OSError):
+        os.remove(path)
 
 def _roster_cache_path(cwd): return os.path.join(cwd, ".heimdall", ".roster-cache.json")
 def _beat_stamp_path(cwd): return os.path.join(cwd, ".heimdall", ".beat-stamp")
 
 def _presence_state(cwd):
-    """Effective presence opt-out — read from the SAME durable state bin/heimdall-presence
-    writes: the global ~/.heimdall/presence-off stamp (existence = off) + the per-repo
-    <cwd>/.heimdall/presence.json ({"enabled": false} = off, {"files": false} = file detail
-    withheld). Returns (present, files_shown). Default (no files) = present — existing users
-    unchanged. Pure stat/JSON reads, never raises (the statusline must never break)."""
     present, files_shown = True, True
     gp = os.path.join(os.path.expanduser("~"), ".heimdall", "presence-off")
+    with contextlib.suppress(Exception):
+        if os.path.exists(gp):
+            present = False
     try:
-        if os.path.exists(gp): present = False
-    except Exception: present = present   # any stat fault → leave the default (present)
-    try:
-        with open(os.path.join(cwd, ".heimdall", "presence.json")) as f: st = json.load(f)
+        with open(os.path.join(cwd, ".heimdall", "presence.json")) as f:
+            st = json.load(f)
         if isinstance(st, dict):
             if st.get("enabled") is False: present = False
             if st.get("files") is False: files_shown = False
-    except Exception: files_shown = files_shown   # absent/unreadable → default (present, shown)
+    except Exception:
+        files_shown = files_shown   # absent/unreadable → default (present, shown)
     return present, files_shown
 
 def _spawn_presence(cwd, handle, verdict, present=True):
-    """ONE coordinated, fire-and-forget presence fork per render. Cheap STAT-ONLY throttle
-    gates decide what is due — the beat stamp (~20s, under the server's ~45s TTL) and the
-    roster cache (~4s) + refresher lock (~8s) — BEFORE anything is spawned, so a throttled
-    (cold/offline) render is a pure stat → return with ZERO subprocesses. When BOTH a beat
-    and a roster refresh come due they ride ONE /bin/sh child (one fork, not two); when only
-    one is due only that runs. Throttle stamps are written BEFORE the fork so a crash still
-    backs off (one attempt per window). Detached, non-blocking, never raises — the statusline
-    must never hang or break on presence; heimdall-presence is itself a no-op when offline."""
+    """ONE coordinated, throttled, fire-and-forget presence fork per render (beat +
+    roster refresh ride one child). Stat-only 'is it due?' gates → ZERO forks when
+    throttled. Detached, never blocks, never raises."""
     bin_path = os.path.join(BIN_DIR, "heimdall-presence")
     if not os.access(bin_path, os.X_OK): return
     now = time.time()
     cache = _roster_cache_path(cwd); lock = cache + ".lock"; stamp = _beat_stamp_path(cwd)
-    # stat-only "is it due?" gates — NO process is spawned just to decide.
-    try: beat_due = not (os.path.exists(stamp) and now - os.path.getmtime(stamp) < 20)
-    except Exception: beat_due = False
-    # OFF = ZERO beats: an opted-out dev writes NO .beat-stamp and forks NO beat (invisible to
-    # teammates). The roster refresh below is untouched — OFF is invisible, NOT blind. FALSIFIER:
-    # drop this line and an off render writes the stamp + forks a beat → the optout test goes RED.
+    try:
+        beat_due = not (os.path.exists(stamp) and now - os.path.getmtime(stamp) < 20)
+    except Exception:
+        beat_due = False
     if not present: beat_due = False
     try:
         fresh  = os.path.exists(cache) and now - os.path.getmtime(cache) < 4
@@ -530,23 +309,27 @@ def _spawn_presence(cwd, handle, verdict, present=True):
     except Exception:
         roster_due = False
     if not beat_due and not roster_due:
-        return   # everything throttled → the fast no-op path: zero forks.
+        return
     try:
         os.makedirs(os.path.join(cwd, ".heimdall"), exist_ok=True)
     except Exception:
         return
     pieces = []; env = dict(os.environ)
     if beat_due:
-        try: open(stamp, "w").close()   # claim the beat window BEFORE the fork → one per 20s
-        except Exception: beat_due = False
+        try:
+            open(stamp, "w").close()
+        except Exception:
+            beat_due = False
     if beat_due:
         pv = {"pass": "pass", "deny": "deny", "scanning": "working",
               "watching": "watching"}.get(verdict, "working")
         env["HMD_HANDLE"] = handle or ""; env["HMD_VERDICT"] = pv
         pieces.append("%s beat >/dev/null 2>&1" % shlex.quote(bin_path))
     if roster_due:
-        try: open(lock, "w").close()    # claim the refresher lock BEFORE the fork
-        except Exception: roster_due = False
+        try:
+            open(lock, "w").close()
+        except Exception:
+            roster_due = False
     if roster_due:
         tmp = cache + ".%d.tmp" % os.getpid()
         pieces.append("%s roster --json > %s 2>/dev/null && mv -f %s %s; rm -f %s" %
@@ -558,17 +341,14 @@ def _spawn_presence(cwd, handle, verdict, present=True):
                          start_new_session=True, stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
     except Exception:
-        if roster_due: _quiet_rm(lock)   # spawn failed → drop the lock so the next render retries
+        if roster_due: _quiet_rm(lock)
 
 def roster_presence(cwd):
-    """SERVER-synced ONLINE team (devs on OTHER machines, within the server TTL), served
-    INSTANTLY from a short-TTL cache. The background refresh that keeps the cache warm is
-    driven by _spawn_presence (coordinated with the beat into ONE fork); here we only READ.
-    An empty/missing cache returns [] so team_presence falls back to local files. Never
-    blocks, never raises."""
+    """SERVER-synced ONLINE team, served instantly from the short-TTL roster cache."""
     cache = _roster_cache_path(cwd); rows = None
     try:
-        with open(cache) as f: rows = json.load(f)
+        with open(cache) as f:
+            rows = json.load(f)
     except Exception:
         rows = None
     if not isinstance(rows, list): return []
@@ -583,69 +363,46 @@ def roster_presence(cwd):
             "verdict": r.get("verdict") or "working",
             "file": r.get("file") or "",
             "ts": ts,
-            "online": True,   # the roster is who is actually ONLINE now
+            "online": True,
         })
     return out
 
 def team_presence(cwd, ttl=30):
-    """Prefer the SERVER roster (online team across machines), else the local
-    .heimdall/team/*.json heartbeat files (OFFLINE fallback) when the control plane is
-    unreachable/unconfigured — the watch wall always renders, empty never means a hang."""
+    """Prefer the SERVER roster, else local .heimdall/team/*.json heartbeats."""
     roster = roster_presence(cwd)
     if roster: return roster
     d = os.path.join(cwd, ".heimdall", "team"); out = []
-    try: names = os.listdir(d)
-    except Exception: return out
+    try:
+        names = os.listdir(d)
+    except Exception:
+        return out
     now = time.time()
     for n in names:
         if not n.endswith(".json"): continue
         try:
-            with open(os.path.join(d, n)) as f: t = json.load(f)
-        except Exception: continue
-        if now - t.get("ts", 0) > ttl: continue   # gone stale → agent left
+            with open(os.path.join(d, n)) as f:
+                t = json.load(f)
+        except Exception:
+            continue
+        if now - t.get("ts", 0) > ttl: continue
         out.append(t)
     out.sort(key=lambda t: t.get("name", ""))
     return out
 
-VERDICT = {  # verdict -> (eye color rgb, ansi col, glyph, word)
- "pass":     ((34,197,94),  GR, "✓", "GATE"),
- "deny":     ((239,68,68),  RD, "✗", "BIFRÖST CLOSED"),
- "scanning": ((245,158,11), AM, "◦", "scanning"),
- "watching": ((34,211,238), CY, "◦", "watching"),
-}
-
-def sig_glyph(seed, rgb=None):
-    """One identity cell — the watchman ◉ from hmd_sigil, verdict-tinted. In
-    no-color mode SIG.glyph would still emit ANSI, so return a bare ◉ instead."""
-    if not USE_COLOR: return "◉"
-    try: return SIG.glyph(seed, eye_override=rgb)
-    except Exception: return f"{DIM}◉{X}"
-
-# ── the parallel-agent SWARM: the REAL live-agent set, never fabricated ────────
-# Roster   = bin/agent-pool (active agents: id, role/type, pid) under ~/.heimdall.
-# Surface  = the claim ledger (.planning/ledger/claims/*.json — an agent's current
-#            claimed file) with bin/shared-memory (ns swarm-file) as fallback.
-# Verdict  = bin/shared-memory (ns swarm-gate) — each agent's live gate verdict —
-#            falling back to "working" for a live-but-unreported agent.
-# All reads are plain file / SQLite reads (no subprocess, no network) so the
-# statusline stays a few milliseconds on every render.
-
+# ── live subagent set (agent-pool: the REAL live-agent roster, never fabricated) ─
 def _home(): return os.path.expanduser("~")
 
 def _agent_pool_file():
-    """Mirror agent-pool._resolve_pool_file: ~/.heimdall, adopting a pre-existing
-    legacy ~/.superx pool. HOME-relative, so tests isolate by redirecting HOME."""
     new = os.path.join(_home(), ".heimdall", "agent-pool.json")
     legacy = os.path.join(_home(), ".superx", "agent-pool.json")
     if not os.path.exists(new) and os.path.exists(legacy): return legacy
     return new
 
 def active_swarm_agents():
-    """The live roster from agent-pool: only status=='active' agents, and only
-    those whose PID is still alive (a dead-but-unreaped entry is NOT a real agent
-    — never render a ghost tile). Returns ([{id, role, started_at}], max_agents)."""
+    """Live roster from agent-pool: status=='active' agents whose PID is still alive."""
     try:
-        with open(_agent_pool_file()) as f: pool = json.load(f)
+        with open(_agent_pool_file()) as f:
+            pool = json.load(f)
     except Exception:
         return [], 0
     if not isinstance(pool, dict): return [], 0
@@ -657,405 +414,305 @@ def active_swarm_agents():
         if not isinstance(info, dict) or info.get("status") != "active": continue
         pid = info.get("pid")
         if isinstance(pid, int):
-            try: os.kill(pid, 0)
-            except ProcessLookupError: continue      # dead → not a real live agent
-            except Exception: pass                    # PermissionError etc. → alive
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                continue
+            except Exception:
+                pass_alive = True   # PermissionError etc. → the pid is alive
         out.append({"id": aid, "role": (info.get("type") or "agent"),
                     "started_at": info.get("started_at") or ""})
     out.sort(key=lambda a: (a["started_at"], a["id"]))
     return out, mx
 
-def _slug(s):  # match heimdall-haid's slug: alnum runs → '-', lowercased, trimmed
-    return re.sub(r"[^A-Za-z0-9]+", "-", s or "").strip("-").lower()
+# ── Row-1 right-rail segments ─────────────────────────────────────────────────
+def rate_limit_seg(data, now):
+    """The 5-hour usage-limit indicator: `𝘅 NN% ·<reset>`. Reads
+    rate_limits.five_hour.{used_percentage,resets_at} (Pro/Max, present only after the
+    first API response). Absent/malformed → '' (render NOTHING, never a fabricated %)."""
+    rl = data.get("rate_limits")
+    if not isinstance(rl, dict):
+        return ""
+    fh = rl.get("five_hour")
+    if not isinstance(fh, dict):
+        return ""
+    up = fh.get("used_percentage")
+    if not isinstance(up, (int, float)) or isinstance(up, bool):
+        return ""
+    pct = max(0, min(100, int(round(up))))
+    col = RD if pct >= 90 else AM if pct >= 70 else GR
+    seg = f"{col}𝘅 {pct}%{X}"
+    ra = fh.get("resets_at")
+    if isinstance(ra, (int, float)) and not isinstance(ra, bool) and ra > now:
+        rem = int(ra - now)
+        cd = f"{rem // 3600}h" if rem >= 3600 else f"{max(1, rem // 60)}m"
+        seg += f"{FAINT}·{X}{DIM}{cd}{X}"
+    return seg
 
-def _iso_epoch(s):
-    try:
-        from datetime import datetime
-        return datetime.fromisoformat((s or "").strip().replace("Z", "+00:00")).timestamp()
-    except Exception:
+def seven_day_pct(data):
+    """rate_limits.seven_day.used_percentage → float, or None (absent → gauge omits it)."""
+    rl = data.get("rate_limits")
+    if not isinstance(rl, dict):
         return None
+    sd = rl.get("seven_day")
+    if not isinstance(sd, dict):
+        return None
+    v = sd.get("used_percentage")
+    if not isinstance(v, (int, float)) or isinstance(v, bool):
+        return None
+    return v
 
-def swarm_claims(cwd):
-    """Current claimed surface per haid, from the coordination ledger. Honors
-    HEIMDALL_PLANNING_DIR (tests + non-default checkouts), else <cwd>/.planning.
-    TTL-expired claims are skipped so a stale surface never renders."""
-    base = os.environ.get("HEIMDALL_PLANNING_DIR") or os.path.join(cwd, ".planning")
-    d = os.path.join(base, "ledger", "claims")
-    out = {}
-    try: names = os.listdir(d)
-    except Exception: return out
-    now = time.time()
-    for n in names:
-        if not n.endswith(".json"): continue
-        try:
-            with open(os.path.join(d, n)) as f: c = json.load(f)
-        except Exception: continue
-        if not isinstance(c, dict): continue
-        hb = c.get("heartbeat") or c.get("claimed_at")
-        ttl = c.get("ttl_minutes") or 90
-        e = _iso_epoch(hb) if hb else None
-        if e and now > e + ttl * 60: continue          # expired → not active
-        surfs = [s for s in (c.get("claimed_surfaces") or []) if isinstance(s, str)]
-        rec = {"task": c.get("task_ref") or "", "surface": surfs[0] if surfs else ""}
-        haid = c.get("haid") or ""
-        if haid: out[haid] = rec; out[_slug(haid)] = rec
-    return out
-
-def swarm_shared(ns):
-    """A namespace snapshot from bin/shared-memory's SQLite (read-only, expiry
-    honored). Empty/missing DB → {}. Never blocks (0.5s busy timeout)."""
-    dbp = (os.environ.get("HEIMDALL_MEMORY_DB") or os.environ.get("SUPERX_MEMORY_DB")
-           or os.path.join(_home(), ".heimdall", "shared-memory.db"))
-    if not os.path.exists(dbp):
-        legacy = os.path.join(_home(), ".superx", "shared-memory.db")
-        if os.path.exists(legacy): dbp = legacy
-        else: return {}
-    out = {}
+def _hexcolor(seed, sigil):
+    """A '#rrggbb' for a teammate's micro mark: the entry's own sigil hex if it carries
+    one, else the deterministic identity hue glyph_color(seed)."""
+    if isinstance(sigil, str) and re.match(r"^#[0-9A-Fa-f]{6}$", sigil):
+        return sigil
     try:
-        import sqlite3
-        conn = sqlite3.connect("file:%s?mode=ro" % dbp, uri=True, timeout=0.5)
-        now = time.time()
-        for k, v, exp in conn.execute(
-                "SELECT key, value, expires_at FROM memory WHERE namespace=?", (ns,)):
-            if exp is not None and exp < now: continue
-            out[k] = v
-        conn.close()
+        r, g, b = SIG.glyph_color(seed)
     except Exception:
-        return {}
-    return out
+        r, g, b = (90, 100, 114)
+    return "#%02x%02x%02x" % (r, g, b)
 
-_VERDICT_ALIAS = {
-    "pass":"pass","proven":"pass","green":"pass","done":"pass","ok":"pass",
-    "deny":"deny","blocked":"deny","fail":"deny","failed":"deny","closed":"deny",
-    "working":"working","active":"working","running":"working","busy":"working",
-    "scan":"scanning","scanning":"scanning",
-    "watching":"watching","idle":"watching",
-}
-def _norm_verdict(v): return _VERDICT_ALIAS.get((v or "").strip().lower(), "working")
+def team_cluster(cwd, ledger, tier):
+    """Row-1 team cluster: up to 3 recolored micro marks + a `+N` overflow, hidden when
+    solo. Primary source is the ledger team[] (status.json mirror); falls back to the
+    live roster cache (team_presence) so the cluster renders today. At `mid` tier the
+    member names are dropped (count/marks only)."""
+    members = list(ledger.get("team") or [])
+    overflow = int(ledger.get("team_overflow") or 0)
+    if not members:
+        tp = team_presence(cwd)
+        members = [{"user": m.get("name") or "?", "sigil": "", "state": m.get("verdict") or ""}
+                   for m in tp[:3]]
+        overflow = max(0, len(tp) - 3)
+    if not members:
+        return ""
+    marks = []
+    for m in members[:3]:
+        seed = m.get("user") or m.get("sigil") or "?"
+        color = _hexcolor(seed, m.get("sigil")) if USE_COLOR else None
+        try:
+            marks.append(SIG.micro(seed, color, CAPS))
+        except Exception:
+            marks.append(f"{DIM}▄{X}")
+    cluster = f"{DIM}team{X} " + "".join(marks)
+    if overflow > 0:
+        cluster += f" {DIM}+{overflow}{X}"
+    if tier == "full":
+        names = "·".join(str(m.get("user")) for m in members[:3] if m.get("user"))
+        if names:
+            cluster += f" {DIM}{names}{X}"
+    return cluster
 
-def _swarm_v(v):  # normalized verdict -> (eye rgb, ansi col, glyph, word)
-    return {
-        "pass":     ((34,197,94),  GR, "✓", "proven"),
-        "deny":     ((239,68,68),  RD, "✗", "BIFRÖST"),
-        "working":  ((245,158,11), AM, "⟳", "working"),
-        "scanning": ((245,158,11), AM, "◦", "scanning"),
-        "watching": ((34,211,238), CY, "◦", "watching"),
-    }[v]
+def daemon_seg(ledger):
+    return f"{GR}◆{X}" if ledger.get("daemon") == "up" else f"{FAINT}◇{X}"
 
-def swarm_block(cwd):
-    """Build the SWARM block rows (header + one aligned row per live agent), or
-    None when 1-or-fewer agents are active (→ the normal HUD is untouched). Each
-    row is spectacle + receipt: mini-sigil · role · gate glyph · current file."""
-    agents, mx = active_swarm_agents()
-    if len(agents) < 2: return None
-    gate = swarm_shared("swarm-gate"); files = swarm_shared("swarm-file")
-    claims = swarm_claims(cwd)
-    def _lookup(m, aid): return m.get(aid) or m.get(_slug(aid))
-    entries = []
-    for a in agents:
-        aid = a["id"]
-        v = _norm_verdict(_lookup(gate, aid) or "working")
-        cl = _lookup(claims, aid) or {}
-        surface = (cl.get("surface") or cl.get("task")
-                   or _lookup(files, aid) or "")
-        entries.append((a, v, surface))
-    role_w = min(13, max(len(a["role"]) for a, _, _ in entries))
-    word_w = max(len(_swarm_v(v)[3]) for _, v, _ in entries)
-    rows = []
-    for a, v, surface in entries:
-        rgb, col, glyph, word = _swarm_v(v)
-        g = sig_glyph(a["id"], rgb)
-        role = a["role"][:role_w].ljust(role_w)
-        verdict = f"{col}{BOLD}{glyph} {word.ljust(word_w)}{X}"
-        surf = f" {FAINT}·{X} {DIM}{surface}{X}" if surface else ""
-        if v == "deny":  # the screenshot moment — bracket it red so the block reads
-            rows.append(f"{RD}▕{X}{g} {DIM}{role}{X} {verdict}{surf}{RD}▏{X}")
-        else:
-            rows.append(f"{g} {DIM}{role}{X} {verdict}{surf}")
+def _parse_semver(v):
+    """Parse vX.Y.Z (optional leading v) into a comparable (int,int,int), or None when
+    it does NOT cleanly match — a malformed/empty version can never yield a false 'behind'."""
+    m = re.match(r"^v?(\d+)\.(\d+)\.(\d+)$", (v or "").strip())
+    return tuple(int(x) for x in m.groups()) if m else None
+
+def update_notice():
+    """A compact 'update available' HUD notice, read PURELY from the update-check cache
+    bin/heimdall's daily BACKGROUND probe writes — NO network, NO subprocess on the render
+    path. Cache: ${HEIMDALL_HOME:-~/.heimdall}/update-check.json {checked_epoch,installed,
+    latest}. Returns the notice iff installed is STRICTLY older than latest; else '' (silent
+    on a current/ahead install, a missing/corrupt/unparseable cache, or ANY fault)."""
+    home = os.environ.get("HEIMDALL_HOME") or os.path.join(os.path.expanduser("~"), ".heimdall")
+    try:
+        with open(os.path.join(home, "update-check.json")) as f:
+            d = json.load(f)
+        installed = _parse_semver(d.get("installed"))
+        latest_raw = (d.get("latest") or "").strip()
+        latest = _parse_semver(latest_raw)
+    except Exception:
+        return ""
+    if not installed or not latest or installed >= latest:
+        return ""
+    return f"{AM}⬆ {latest_raw} available{X} {FAINT}·{X} {DIM}hmd --update{X}"
+
+# ── Row-3 segments ─────────────────────────────────────────────────────────────
+_GATE_GLYPH = {"pass": ("✓", GR), "running": ("◌", AM), "deny": ("✗", RD)}
+
+def gate_cells(gates, colored=True):
+    """Gate verdict cells (✓ pass / ◌ running / ✗ deny) `·`-joined. Empty → the neutral
+    offline marker. `colored=False` yields plain glyphs (tiny-tier single line)."""
+    if not gates:
+        return f"{DIM}◌ offline{X}" if colored else "offline"
+    out = []
+    for g in gates:
+        glyph, col = _GATE_GLYPH.get(g.get("state"), ("◌", DIM))
+        out.append(f"{col}{glyph}{X}" if colored else glyph)
+    return (f"{FAINT}·{X}".join(out) if colored else "·".join(out))
+
+def perm_mode(data):
+    """The permission-mode indicator. CC does NOT pass permission mode on statusLine
+    stdin today (descoped) — probe the stdin fields, then a bounded transcript tail,
+    then OMIT (never fabricated). Returns '' when no signal exists."""
+    for k in ("permission_mode", "permissionMode", "permission"):
+        v = data.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    tp = data.get("transcript_path") or data.get("transcriptPath")
+    if isinstance(tp, str) and tp:
+        try:
+            with open(tp, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                f.seek(max(0, size - 4096))
+                tail = f.read().decode("utf-8", "replace")
+            m = re.findall(r'"permission[_A-Za-z]*"\s*:\s*"([A-Za-z]+)"', tail)
+            if m:
+                return m[-1]
+        except Exception:
+            return ""
+    return ""
+
+def subagent_ghost(agents):
+    """A faint right-rail ghost naming the busiest live subagent (the most recently
+    started) + the active count. '' when no subagent is live."""
+    if not agents:
+        return ""
+    busiest = agents[-1]
+    role = str(busiest.get("role") or "agent")[:16]
     n = len(agents)
-    cap = f"/{mx}" if mx else ""
-    header = f"{FAINT}── swarm {n}{cap} active ──{X}"
-    return [header] + rows
+    plural = "s" if n != 1 else ""
+    return f"{FAINT}⋯ {n} agent{plural} · {role}{X}"
+
+# ── the render ──────────────────────────────────────────────────────────────
+def _eye(verdict, t):
+    """The watchman's eye color for THIS tick — always a LIGHT color (never dark), a
+    12-tick blink/look/glint cycle; scanning pulses faster. Deterministic on HMD_NOW."""
+    GLINT = (240, 248, 255); LOOK = (255, 255, 255)
+    BLINK = (120, 128, 145); SQUINT = (150, 160, 175)
+    phase = t % 12
+    if phase == 0:          eye = BLINK
+    elif phase in (4, 8):   eye = LOOK
+    else:                   eye = GLINT
+    if verdict == "scanning":
+        eye = LOOK if (t % 2 == 0) else SQUINT
+    return eye
+
+def _fallback(cols):
+    _write(LAYOUT.pad_or_truncate(f"{TEAL}{BOLD}⛭ HEIMDALL{X}", cols) + "\n")
 
 def main():
-    data = read_json()
-    cwd = (data.get("workspace") or {}).get("current_dir") or data.get("cwd") or os.getcwd()
-    model = (data.get("model") or {}).get("display_name", "Claude")
+    data = read_stdin()
+    cols = resolve_cols()
+    if data is None:
+        _fallback(cols)
+        return
+
+    ws = data.get("workspace") or {}
+    cwd = ws.get("current_dir") or data.get("cwd") or os.getcwd()
+    model = (data.get("model") or {}).get("display_name") or "Claude"
     cw = data.get("context_window") or {}
-    pct = int(cw.get("used_percentage") or 0)
-    repo = ((data.get("workspace") or {}).get("repo") or {}).get("name") or os.path.basename(cwd)
-    # identity is FILE-controlled (bin/heimdall-identity): seed feeds the sigil, handle
-    # shows on the wall. Falls back to the old HMD_HAID/USER resolution if the bin errors.
+    up = cw.get("used_percentage")
+    pct = 0.0 if not isinstance(up, (int, float)) or isinstance(up, bool) else float(up)
+    session_id = data.get("session_id") or ""
+
+    # repo:branch — repo absent → the current_dir basename with NO branch/:worktree join.
+    repo_obj = ws.get("repo") or {}
+    repo_name = repo_obj.get("name")
+    branch = ws.get("git_worktree") or repo_obj.get("branch")
+    if repo_name:
+        repo_str = str(repo_name) + (":" + str(branch) if branch else "")
+    else:
+        repo_str = os.path.basename(str(cwd).rstrip("/")) or str(cwd)
+
     fallback = os.environ.get("HMD_HAID") or os.environ.get("USER") or "you"
     seed, handle = identity(cwd, fallback)
 
+    # legacy verdict for the eye + --widget only.
     st = gate_state(cwd)
     verdict = st.get("verdict", "watching")
     if verdict not in VERDICT: verdict = "watching"
-    eye_rgb, vcol, vglyph, vword = VERDICT[verdict]
     passed, total = st.get("passed"), st.get("total")
-    # Resolve the REAL width: explicit $COLUMNS → the controlling terminal via /dev/tty →
-    # a conservative 80. Never blindly assume 120, or a narrow terminal (no $COLUMNS
-    # exported) soft-wraps the over-wide full-mode rows into a thin duplicate strip.
-    cols = resolve_cols()
-    RMARGIN = 6  # right safety gutter: clears Claude Code's scrollbar + edge padding so the verdict never clips off-screen
-    # every finalized row is clamped to this width so none can wrap: it matches the
-    # width a line()-built row already targets (cols − RMARGIN, ANCHOR included), so
-    # the well-formed HUD rows are untouched and only an overflowing wall/swarm/tease/
-    # update row (the double-header bleed) is trimmed back inside the terminal.
-    MAXW = max(1, cols - RMARGIN)
 
-    # ── eye animation: the watchman's eyes are the signature, so they animate —
-    # but NEVER off the verdict (a verdict-colored eye washes into a same-hue body
-    # and erases the face; the verdict reads from the right block + bar + bifröst
-    # text). And NEVER fully dark: a still can land on ANY frame, so every phase is
-    # a LIGHT color and the eyes stay visible in EVERY frame (the eyeless-capture
-    # lesson holds). A cheap, deterministic 12-tick cycle (~36s at the 3s refresh)
-    # keeps the watchman alive in a screen recording, richer than a lone squint:
-    #   • BLINK  — one tick the eyes dim to a near-closed muted slate (still visible)
-    #   • LOOK   — a couple of ticks a brighter glint passes across the eyes (a scan)
-    #   • GLINT  — the steady bright white watch the rest of the time
-    # Scanning verdict overrides with a faster look-pulse so the watchman reads as
-    # actively scanning. HMD_NOW overrides the clock for deterministic conformance.
-    # (The red deny-flash / pass-sparkle live in hmd-gate-anim.sh, not here.)
     t = int(os.environ.get("HMD_NOW") or time.time())
-    GLINT  = (240, 248, 255)   # steady bright white watch-glint (the default eye)
-    LOOK   = (255, 255, 255)   # pure-white pulse — a light passing across the eyes
-    BLINK  = (120, 128, 145)   # a blink: eyes nearly closed, dimmed but STILL VISIBLE
-    SQUINT = (150, 160, 175)   # alert squint — muted white, never dark
-    phase = t % 12
-    if phase == 0:          eye = BLINK       # ~1 frame in 12: a quick blink
-    elif phase in (4, 8):   eye = LOOK        # periodic bright look/scan pulse
-    else:                   eye = GLINT       # steady bright watch
-    if verdict == "scanning":                 # actively scanning -> faster look-pulse
-        eye = LOOK if (t % 2 == 0) else SQUINT
+    eye = _eye(verdict, t)
 
     if "--widget" in sys.argv:
+        eye_rgb, vcol, vglyph, vword = VERDICT[verdict]
         eyes = {"pass":"^ ^","deny":"O O","scanning":". .","watching":"• •"}[verdict]
         cnt = f" {passed}/{total}" if passed is not None else ""
         _write(f"{CY}▐{X}{vcol}{eyes}{X}{CY}▌{X} {vcol}{vglyph} {vword}{cnt}{X}")
         return
 
-    # presence opt-out (consent surface): when the dev ran `hmd presence off` (repo or global)
-    # they are INVISIBLE — no beat is forked (present=False gates it), but the roster still
-    # refreshes so they can SEE the team (off = invisible, not blind). The statusline shows a
-    # clear off-hint below so the dev is never silently invisible.
-    present, files_shown = _presence_state(cwd)
-
-    # keep THIS dev present on teammates' walls AND warm the roster cache in ONE fork: a
-    # throttled, detached beat + roster refresh (the roster read alone never announced us).
-    # Stat-only throttle gates → ZERO forks when both are throttled. Never blocks the render.
+    # keep THIS dev present on teammates' walls + warm the roster cache in ONE fork.
+    present, _files_shown = _presence_state(cwd)
     _spawn_presence(cwd, handle, verdict, present)
 
-    # ── DENSITY SELECTION (spec B §2) ─────────────────────────────────────────
-    # The canonical verdict (PASS/DENY/RUNNING/IDLE) drives the compact + minimal
-    # blocks. IDLE = solo + no gate verdict (matches the full-HUD idle dedup below).
-    dmode = density(cols)
-    idle = (verdict == "watching" and passed is None)
-    canon = "IDLE" if idle else canon_verdict(verdict)
+    # point the ledger's LEGACY fallback at THIS project's statusline.json (the stdin
+    # cwd, not the process cwd) so Row3 reflects the real gate verdict — matching the
+    # old gate_state(cwd) lookup. An explicit HEIMDALL_STATE (tests) always wins.
+    os.environ.setdefault("HEIMDALL_STATE", os.path.join(cwd, ".heimdall", "statusline.json"))
+    ledger = LEDGER.read_status(session_id)
+    gates = ledger.get("gates") or []
+    tier = LAYOUT.width_tier(cols)
 
-    # "update available" notice (spec: dev learns of a newer release AMBIENTLY). A
-    # pure LOCAL cache read (update_notice makes zero network calls) → '' when the
-    # install is current/ahead or the cache is absent/corrupt (silent fail-safe). We
-    # width-guard it so a very narrow terminal never wraps the line.
-    upd = update_notice()
-    if upd and vis(upd) > max(0, cols - RMARGIN):
-        upd = ""
-
-    if dmode == "minimal":
-        # minimal (<80): the watchman glyph + the verdict word. One cell + one whole
-        # word, padded to width — structurally impossible to slice mid-glyph. An
-        # available update rides one extra padded row below (added only when present,
-        # so a current install renders byte-identically to before).
-        vrgb = VERDICT_CANON[canon][0]
-        row = f"{sig_glyph(seed, vrgb)} {verdict_word(canon, t)}"
-        rows = [row] + ([upd] if upd else [])
-        sys.stdout.write(finalize(rows, MAXW) + "\n")
+    # ── tiny (<40): ONE line — `HMD <pct>% <gates>` ──
+    if tier == "tiny":
+        line = "HMD %d%% %s" % (int(round(pct)), gate_cells(gates, colored=False))
+        _write(LAYOUT.pad_or_truncate(line, cols) + "\n")
         return
 
-    if dmode == "compact":
-        # compact (80–119): sigil S (4 cols × 2 rows) + verdict, then a wall of
-        # teammate glyphs (tinted by glyph_color, +k overflow) on the second row.
-        # An available update appends one extra row (only when present).
-        sigS = _sigil_rows_s(seed, eye)
-        ANCH_S = 4 + 2
-        head = f"{BOLD}{handle}{X}  {verdict_seg(canon, t)}"
-        wall = compact_wall(cwd, seed, verdict, present, cols, ANCH_S)
-        r0 = f"{_sig(sigS, 0, CY)}  {head}"
-        r1 = f"{_sig(sigS, 1, CY)}  {wall}"
-        rows = [r0, r1] + ([f"{'':6}{upd}"] if upd else [])
-        sys.stdout.write(finalize(rows, MAXW) + "\n")
-        return
+    # ── the 3-row layout, laid out to the RIGHT of the hero sigil anchor ──
+    sigrows = _sigil_rows(seed, eye)                      # 8-wide × 3 rows
+    gw = LAYOUT.remaining_width(sigrows, cols, GUTTER)    # gauge / content span
 
-    # ── sigil anchor (squint animates; eyes stay visible in every frame) ──
-    # Per terminal tier: half-block watchman on unicode=full, a branded ASCII sigil
-    # on no-unicode terms (dumb/CI), a blank 8-wide anchor in mono (legacy no-color).
-    sig = _sigil_rows(seed, eye)
-    SW = 8
-    ANCHOR = SW + 2  # sigil(8 cols) + 2-space gutter, prefixed on EVERY row
+    # Row1 — identity / team / rate-limit
+    left1 = f"{TEAL}{BOLD}⛭ HEIMDALL{X}{SEP}{DIM}{handle}·{model}{X}{SEP}{AM}{repo_str}{X}"
+    if tier == "narrow":
+        row1 = LAYOUT.pad_or_truncate(left1, gw)          # drop the right rail
+    else:
+        rparts = []
+        cluster = team_cluster(cwd, ledger, tier)
+        if cluster: rparts.append(cluster)
+        rparts.append(daemon_seg(ledger))
+        rl = rate_limit_seg(data, t)
+        if rl: rparts.append(rl)
+        upd = update_notice()   # ambient 'update available' — folded into Row1 spare width
+        if upd: rparts.append(upd)
+        row1 = LAYOUT.left_right(left1, "  ".join(rparts), gw)
 
-    # context bar
-    bcol = RD if pct >= 90 else AM if pct >= 70 else GR
-    fill = min(10, round(pct / 10))  # 38% -> 4 cells (mockup §3), not floor(3)
-    bar = f"{bcol}{'▓'*fill}{FAINT}{'░'*(10-fill)}{X} {bcol}{pct}%{X}"
-
-    # token gauge (honest: absolute input tokens from CC, else derived from %×size)
-    def human(n):
-        if not n: return None
-        return f"{n//1000}k" if n >= 1000 else str(n)
+    # Row2 — the full-bleed context gauge (labels gated by tier)
     tin = cw.get("total_input_tokens")
-    size = cw.get("context_window_size")
-    if not tin and pct and size: tin = int(size * pct / 100)
-    toks = human(tin)
-    tok_seg = f"{SEP}{DIM}↓{toks}{X}" if toks else ""
+    if tier == "full":
+        gauge = GAUGE.render_gauge(gw, pct, tin, seven_day_pct(data),
+                                   (data.get("cost") or {}).get("total_cost_usd"),
+                                   (data.get("cost") or {}).get("total_duration_ms"), CAPS)
+    elif tier == "mid":     # drop the gauge RIGHT label (nulled → render_gauge omits it)
+        gauge = GAUGE.render_gauge(gw, pct, tin, None, None, None, CAPS)
+    else:                   # narrow → bar-only
+        gauge = GAUGE.render_gauge(gw, pct, None, None, None, None, CAPS)
 
-    # ledger claim count (live coordination signal — count claim files, no subprocess)
-    def ledger_claims(p):
-        d = os.path.join(p, ".planning", "ledger", "claims")
-        try: return sum(1 for n in os.listdir(d) if n.endswith(".json"))
-        except Exception: return 0
-    claims = ledger_claims(cwd)
-    claim_txt = f"{DIM}ledger {claims} claim{'s' if claims != 1 else ''}{X}" if claims else ""
-    claim_seg = f" {FAINT}·{X} {claim_txt}" if claim_txt else ""  # with leading separator, appended after bifröst
-
-    # inline eye bracket `▐ ● ● ▌` — brand teal, NOT verdict-colored (§3 row0; a
-    # verdict hue washes the eyes into the body). Verdict reads from the right block.
-    eyes_inline = f"{TEAL}▐ ● ● ▌{X}"
-
-    # right-aligned verdict block. IDLE (verdict==watching, no gate verdict) showed
-    # "watching" TWICE — r1 glyph-word AND r2 bifröst-else. Dedup: idle shows it ONCE.
-    idle = (verdict == "watching" and passed is None)
-    if idle:
-        r1 = f"{DIM}◦ watching{X}"          # single calm idle marker, top-right
-        r2 = claim_txt                       # ledger claim if any, else EMPTY — never a 2nd "watching"
+    # Row3 — gate verdict / permission-mode / busiest subagent (ghost)
+    left3 = gate_cells(gates, colored=True)
+    if tier != "narrow":
+        pm = perm_mode(data)
+        if pm:
+            left3 += f"{SEP}{DIM}{pm}{X}"
+    if tier == "narrow":
+        row3 = LAYOUT.pad_or_truncate(left3, gw)
     else:
-        r1 = f"{vcol}{BOLD}{vglyph} {vword}{X}" + (f" {vcol}{passed}/{total}{X}" if passed is not None else "")
-        bifrost = (f"{GR}bifröst open{X}" if verdict=="pass" else
-                   f"{RD}bifröst closed{X}" if verdict=="deny" else f"{DIM}watching{X}")
-        r2 = f"{bifrost}{claim_seg}"
+        agents, _mx = active_swarm_agents()
+        row3 = LAYOUT.left_right(left3, subagent_ghost(agents), gw)
 
-    # 5-hour usage-limit indicator, pinned at the rightmost end of the top row (after
-    # the verdict). Absent unless CC's stdin JSON carries rate_limits (Pro/Max, post
-    # first API response) → never fabricated. Rides r1, which line() right-pins.
-    usage_seg = usage_limit_seg(data, t)
-    if usage_seg:
-        r1 = f"{r1}  {usage_seg}" if r1 else usage_seg
+    lines = LAYOUT.compose_with_sigil(sigrows, [row1, gauge, row3], cols, GUTTER)
+    _write("\n".join(lines) + "\n")
 
-    # left info rows
-    l1 = f"{eyes_inline} {TEAL}{BOLD}HEIMDALL{X}{SEP}{DIM}{handle}{X}{SEP}{DIM}{model}{X}"
-    l2 = f"{bar}{SEP}{AM}{repo}:main{X}{tok_seg}"
-
-    # team wall (only when teammates present). WIDTH-AWARE capacity: fit as many of the
-    # most-recently-active teammates as the row width allows (COLUMNS minus the sigil
-    # anchor + right gutter), then "+N more" for the overflow — no clip past the gutter.
-    team = team_presence(cwd)
-    wall_segs = []
-    if team:
-        team = sorted(team, key=lambda t: t.get("ts", 0), reverse=True)
-
-        def member_seg(m):  # the per-teammate render — formula unchanged, + an online pip
-            v = m.get("verdict", "working")
-            col = {"pass":GR,"done":GR,"deny":RD,"working":AM,"watching":CY}.get(v, CY)
-            ergb = {"pass":(34,197,94),"done":(34,197,94),"deny":(239,68,68),"working":(245,158,11)}.get(v)
-            g = sig_glyph(m.get("name","?"), ergb)
-            state = ({"pass":"✓","done":"✓","deny":"✗","working":"⚡"}.get(v,"◦"))
-            f = m.get("file","")
-            # online status: a server-roster teammate is live NOW (green ●); a local
-            # file-fallback heartbeat shows a faint ◦.
-            pip = f"{GR}●{X}" if m.get("online") else f"{FAINT}◦{X}"
-            label = f"{m.get('name','?')} {col}{state}{(' '+f) if f else ''}{X}"
-            seg = f"{pip} {g} {label}"
-            if v == "deny":  # the moment — make it pop
-                seg = f"{RD}▕{X}{pip} {g} {RD}{BOLD}{m.get('name','?')} ✗ BIFRÖST{(' '+f) if f else ''}{X}{RD}▏{X}"
-            return seg
-
-        header = f"{FAINT}── watch ──{X}"
-        you_state = {"pass": "✓", "deny": "✗", "scanning": "◦"}.get(verdict, "⚡")
-        you_word  = {"pass": "proven", "deny": "blocked", "scanning": "scanning"}.get(verdict, "working")
-        if present:
-            you_seg = f"{sig_glyph(seed)} {BOLD}you{X} {DIM}{you_state} {you_word}{X}"  # your watchman closes the wall
-        else:
-            # OPTED OUT: the dev sees the team but the team can't see them — say so plainly.
-            you_seg = f"{sig_glyph(seed)} {BOLD}you{X} {DIM}◦ presence off{X}"
-
-        JOIN = 2                                   # the "  " between wall segments
-        budget = max(0, cols - (SW + 2) - RMARGIN) # usable row width: COLUMNS − sigil anchor − gutter
-        used = vis(header) + JOIN + vis(you_seg)   # header + the you-closer are always shown
-        chosen = []
-        for m in team:
-            seg = member_seg(m)
-            if chosen and used + JOIN + vis(seg) > budget: break
-            chosen.append((m, seg)); used += JOIN + vis(seg)
-        extra = len(team) - len(chosen)
-        while extra > 0 and chosen and used + JOIN + vis(f"{DIM}+{extra} more{X}") > budget:
-            m, seg = chosen.pop(); used -= JOIN + vis(seg); extra += 1   # make room for the "+N more" tag
-
-        wall_segs.append(header)
-        for m, seg in sorted(chosen, key=lambda ms: ms[0].get("name", "")):
-            wall_segs.append(seg)
-        if extra > 0:
-            wall_segs.append(f"{DIM}+{extra} more{X}")
-        wall_segs.append(you_seg)
-
-    def line(left, right):
-        # account for the sigil anchor prefixed on every row AND a right safety
-        # gutter, so the right block pins inside the usable width — Claude Code
-        # reserves the far-right edge (scrollbar + padding) and clips anything
-        # rendered at exactly COLUMNS.
-        gap = cols - ANCHOR - RMARGIN - vis(left) - vis(right)
-        return left + (" " * max(1, gap)) + right
-
-    # ── SWARM MODE: >1 agent live → the top two rows (brand + gate) stay, and the
-    # bottom rows become the live agent roster (spectacle + per-agent receipt).
-    # 1-or-fewer agents → fall through to the unchanged team-wall / solo behavior.
-    swarm = swarm_block(cwd)
-    if swarm:
-        out = []
-        # VERTICALLY CENTER the 4-row sigil among the N content rows. A swarm/team-
-        # wall layout has N>4 rows, so the perfect 8×8 sigil (8 cols × 4 half-block
-        # rows) can't fill them — it sits in the MIDDLE: ⌊(N−4)/2⌋ blank 8-space
-        # prefixes above, the sigil's 4 rows contiguous, the rest blank below. Only
-        # the vertical POSITION shifts; the sigil is never distorted. N≤4 → off 0 →
-        # top-anchored (byte-identical to before). `off` guards negative indices so
-        # a blank-above row is a true 8-space prefix, not a wrapped sig[-1].
-        N = 2 + len(swarm) + (1 if upd else 0)
-        off = (N - 4) // 2 if N > 4 else 0
-        def sigc(c):  # sigil prefix for content row c, centered by `off`
-            idx = c - off
-            return sig[idx] if 0 <= idx < len(sig) else "        "
-        out.append(f"{sigc(0)}  " + line(l1, r1))
-        out.append(f"{sigc(1)}  " + line(l2, r2))
-        for i, seg in enumerate(swarm):
-            out.append(f"{sigc(2+i)}  " + seg)
-        if upd:
-            out.append(f"{sigc(2+len(swarm))}  " + upd)
-        sys.stdout.write(finalize(out, MAXW) + "\n")   # single tier downgrade + width invariant + no-wrap clamp
-        return
-
-    out = []
-    out.append(f"{_sig(sig,0,CY)}  " + line(l1, r1))
-    out.append(f"{_sig(sig,1,CY)}  " + line(l2, r2))
-    if wall_segs:
-        wall = "  ".join(wall_segs)
-        out.append(f"{_sig(sig,2,CY)}  " + wall)
-        out.append(f"{_sig(sig,3,CY)}  " + upd)   # blank tail row → carries the update notice when one is available
-    else:
-        # SOLO TEASE: the wall is empty (no roster, no team files). Fill the dead row
-        # with a faint invite — sells the team feature, drives the growth loop. Single
-        # row, width-safe (<= COLUMNS − sigil anchor − gutter): dropped if it can't fit.
-        # When OPTED OUT the invite would be a lie (no one can see the dev) — show the
-        # invisible-state hint instead so the dev knows they're off, not just alone.
-        if present:
-            tease = f"{FAINT}── watch ── invite your team · hmd invite{X}"
-        else:
-            tease = f"{FAINT}── watch ── presence off · hmd presence on{X}"
-        if vis(tease) > max(0, cols - ANCHOR - RMARGIN): tease = ""
-        out.append(f"{_sig(sig,2,CY)}  " + tease)
-        out.append(f"{_sig(sig,3,CY)}  " + upd)   # blank tail row → carries the update notice when one is available
-    sys.stdout.write(finalize(out, MAXW) + "\n")   # single tier downgrade + width invariant + no-wrap clamp
-
-def _sig(rows, i, fallback):
-    return rows[i] if i < len(rows) else "        "   # 8-space blank = square sigil width
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        # the statusline must NEVER error, NEVER write stderr: any fault → the branded
+        # floor, exit 0. (Bare width probe so even resolve_cols faults degrade cleanly.)
+        try:
+            _fallback(resolve_cols())
+        except Exception:
+            with contextlib.suppress(Exception):
+                sys.stdout.write("⛭ HEIMDALL\n")
+        sys.exit(0)

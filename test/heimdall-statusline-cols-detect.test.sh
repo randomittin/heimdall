@@ -16,12 +16,13 @@
 #
 # THIS SUITE LOCKS (driving the REAL statusline inside a sized pseudo-terminal):
 #   1. RJ's case: a 95-col terminal with COLUMNS UNSET → the width is DETECTED (95),
-#      density is compact (no HEIMDALL wordmark), and NO row exceeds 95 (no wrap).
-#      FALSIFIER: the old blind-120 default emits full-mode 114-cell rows → >95 → RED.
+#      and NO row exceeds 95 (no wrap). At the detected 95 the v1 layout is the `mid`
+#      tier — the three rows render (HEIMDALL wordmark present), each fitting 95.
+#      FALSIFIER: the old blind-120 default emits 120-cell rows → >95 → RED.
 #   2. COLUMNS=95 explicit → NO row exceeds 95.
-#   3. COLUMNS=120 explicit → full mode (HEIMDALL present), NO row exceeds 120.
-#   4. COLUMNS UNSET + NO controlling /dev/tty → the CONSERVATIVE 80 default, compact,
-#      NO row exceeds 80 (under-render, never over-render).
+#   3. COLUMNS=120 explicit → full tier (HEIMDALL present), NO row exceeds 120.
+#   4. COLUMNS UNSET + NO controlling /dev/tty → the CONSERVATIVE 80 default (the `mid`
+#      tier), NO row exceeds 80 (under-render, never over-render).
 set -u
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -125,8 +126,8 @@ $(run_case 95 "" | metrics)
 EOF
 [ "$MX" -le 95 ] && ok "95-col unset: max row $MX <= 95 (real width detected, no wrap)" \
                  || bad "95-col unset: a row is $MX cells > 95 (blind-120 default → wraps)"
-[ "$HC" = 0 ] && ok "95-col unset: compact density (no HEIMDALL wordmark) — fits 95" \
-             || bad "95-col unset: full mode rendered ($HC HEIMDALL) — over-wide for 95"
+[ "$HC" = 1 ] && ok "95-col unset: mid tier (HEIMDALL wordmark present) — fits 95" \
+             || bad "95-col unset: HEIMDALL count $HC (expected 1 at the detected 95)"
 
 echo "== 2) COLUMNS=95 explicit — no row exceeds 95 =="
 MX="$(run_case 95 95 | metrics | head -1)"
@@ -148,8 +149,8 @@ $(run_case 0 "" --no-tty | metrics)
 EOF
 [ "$MX" -le 80 ] && ok "no-tty unset: max row $MX <= 80 (conservative default, under-render)" \
                  || bad "no-tty unset: a row is $MX cells > 80 (over-render)"
-[ "$HC" = 0 ] && ok "no-tty unset: compact density at the conservative 80 default" \
-             || bad "no-tty unset: full mode rendered ($HC HEIMDALL) at unknown width"
+[ "$HC" = 1 ] && ok "no-tty unset: mid tier (HEIMDALL present) at the conservative 80 default" \
+             || bad "no-tty unset: HEIMDALL count $HC (expected 1 at the conservative 80)"
 
 echo
 echo "$pass passed, $fail failed"
