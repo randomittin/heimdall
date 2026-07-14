@@ -257,6 +257,12 @@ command -v gitleaks >/dev/null 2>&1 || die "gitleaks not found — install it fi
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || die "not inside a git repository"
 cd "$REPO_ROOT"
 
+# Self-heal a STALE .git/index.lock left by an INTERRUPTED prior run (the recurring
+# "Unable to create '.git/index.lock': File exists" at ship time — an aborted release or a
+# racing autocommit that died mid-write). heimdall-git-guard clears ONLY an ownerless lock
+# (waits out any LIVE git op, never removes a lock a running op holds). Best-effort.
+[ -x "$REPO_ROOT/bin/heimdall-git-guard" ] && "$REPO_ROOT/bin/heimdall-git-guard" "$REPO_ROOT" || true
+
 CUR_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
 if [ "$CUR_BRANCH" != "$BRANCH" ]; then
   warn "on branch '$CUR_BRANCH', not '$BRANCH' — will operate on '$CUR_BRANCH'"

@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# heimdall-git-guard — clear a PROVEN-STALE .git/index.lock before a git write.
+#
+# WHY: git writes (commit/add/merge) create `.git/index.lock`, do the op, then remove it. A
+# git process KILLED mid-op (an interrupted release, a SIGKILLed autocommit, two writers
+# racing the same index) leaves a 0-byte lock behind, and every subsequent git write then
+# dies with "Unable to create '.git/index.lock': File exists." This guard removes ONLY a lock
+# that no live git process owns — self-healing the interrupted-writer case — and NEVER touches
+# a lock a running git op legitimately holds.
+#
+# SAFETY: conservative by construction. While ANY `git` process is alive it WAITS (never
+# clears), giving a legitimate in-flight op time to finish and release the lock itself. It only
+# removes the lock after observing, across two checks, that the lock persists AND no git
+# process is running — the signature of a dead writer, not a live one. Best-effort: always
+# exits 0 so it can never itself block the caller.
+#
+# USAGE:  heimdall-git-guard [repo-dir]   # default: the enclosing git worktree, else $PWD
+set -u
+
+repo="${1:-}"
+if [ -z "$repo" ]; then
+  repo="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+fi
+lock="$repo/.git/index.lock"
+
+# Is a git process alive (i.e. might legitimately own the lock)? Overridable via
+# HMD_GIT_GUARD_PGREP for testing the conservative wait/preserve path deterministically
+# (a copied `git`-named binary can't be spawned on a code-signed OS). Default: real pgrep.
+_git_alive() {
+  if [ -n "${HMD_GIT_GUARD_PGREP:-}" ]; then eval "$HMD_GIT_GUARD_PGREP"; else pgrep -x git >/dev/null 2>&1; fi
+}
+
+# fast path: no lock → nothing to do.
+[ -f "$lock" ] || exit 0
+
+# Up to ~3s: wait out any live git op; clear the lock only once it is proven ownerless.
+i=0
+while [ "$i" -lt 6 ]; do
+  i=$((i + 1))
+  [ -f "$lock" ] || exit 0                       # someone finished + released → done
+  if _git_alive; then                             # a git op is alive → do NOT touch; wait
+    sleep 0.5
+    continue
+  fi
+  # no git process seen — confirm the lock still persists one tick later (avoid a TOCTOU where
+  # a legit op releases between our check and now), and that no git proc appeared meanwhile.
+  sleep 0.3
+  [ -f "$lock" ] || exit 0
+  if _git_alive; then
+    continue
+  fi
+  rm -f "$lock" 2>/dev/null && \
+    printf 'heimdall-git-guard: cleared stale index.lock (no git process owns it)\n' >&2
+  exit 0
+done
+exit 0
