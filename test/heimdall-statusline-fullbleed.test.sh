@@ -73,6 +73,9 @@ def load(path, name):
     return m
 SENT = os.path.join(ROOT, "sentinels")
 L = load(os.path.join(SENT, "hmd_layout.py"), "hmd_layout_fb")
+# the 2nd-column gutter the SUT (hmd-statusline.py) reserves + renders between the content
+# column and the left-packed team column (kept in sync with hmd-statusline.TEAM_COL_GAP).
+SL_TEAM_COL_GAP = 4
 
 def bg_cells(row):
     """Per-visible-cell 'has an active 48;2 bg?' list (reset-aware)."""
@@ -175,9 +178,13 @@ def inv_row_exact():
                     % (w, label, widths, len(rs), rc, err[:60]))
 
 def inv_team_uncut():
-    # Spec v2 §8.2 — 3 teammates @120: NO `…` in the team-zone span, and the last 8 cells of
-    # rows 1–2 are SIGIL cells (active bg). team_w is derived from the SUT's own allocator.
-    rows_zone_w, team_w, shown, of, gap = L.team_zone_alloc(120, 3, 0)
+    # Spec v2 §8.2 (LEFT-PACK, RJ): 3 teammates @120 render as a COMPACT 2ND COLUMN hugging the
+    # content (a TEAM_COL_GAP gutter), NOT flush to the right edge — a flush-right team at a wide
+    # terminal overshoots CC's narrower live statusLine region and clips. The anti-truncation
+    # contract is therefore: NO `…` ANYWHERE in the render (left-pack + trailing blanks ⇒ nothing
+    # rides the far edge), and rows 1–2 carry the teammate eye-strips as contiguous 8-cell SIGIL
+    # runs. team_w is derived from the SUT's own allocator (with the SAME TEAM_COL_GAP gutter).
+    rows_zone_w, team_w, shown, of, gap = L.team_zone_alloc(120, 3, 0, rows_gap=SL_TEAM_COL_GAP)
     home = team_home()
     c = tempfile.mkdtemp()
     out, rc, err = render(120, canned(c, 120), home=home)
@@ -185,16 +192,17 @@ def inv_team_uncut():
     rs = rows(out)
     (ok if (shown == 3 and team_w == 49) else bad)(
         "TEAM-UNCUT: allocator packs 3 members @120 → team_w=%d shown=%d (want 49/3)" % (team_w, shown))
-    # (a) no ellipsis anywhere inside the team-zone span (the last team_w visible cells)
-    span_clean = True
-    for r in rs:
-        span = strip(r)[-team_w:]
-        if "…" in span:
-            span_clean = False
-    (ok if span_clean else bad)("TEAM-UNCUT: no `…` inside the team-zone span (cols T..119) on any row")
-    # (b) the last 8 cells of rows 1–2 are sigil cells (active 48;2 bg), not text
-    r12_ok = len(rs) >= 2 and last8_are_sigil(rs[0]) and last8_are_sigil(rs[1])
-    (ok if r12_ok else bad)("TEAM-UNCUT: last 8 cells of rows 1–2 are sigil bg-cells (eye-strips ride the edge)")
+    # (a) NO ellipsis anywhere — the left-pack guarantees no row ever needs a mid-token clip.
+    clean = all("…" not in strip(r) for r in rs)
+    (ok if clean else bad)("TEAM-UNCUT: no `…` anywhere (left-pack ⇒ nothing rides the far edge)")
+    # (b) rows 1–2 carry the main sigil (8c) PLUS every teammate eye-strip (8c each) as sigil
+    # bg-cells: total active-bg cells on each of rows 1–2 >= 8·(1 + shown).
+    want_bg = 8 * (1 + shown)
+    r12_ok = (len(rs) >= 2 and sum(bg_cells(rs[0])) >= want_bg
+              and sum(bg_cells(rs[1])) >= want_bg)
+    (ok if r12_ok else bad)(
+        "TEAM-UNCUT: rows 1–2 carry main+%d teammate eye-strips as sigil cells (>=%d bg cells)"
+        % (shown, want_bg))
     # (c) the eyes are VISIBLE — a teammate's authored eye color appears on rows 1–2.
     SIG = load(os.path.join(SENT, "hmd_sigil.py"), "hmd_sigil_fb")
     er, eg, eb = SIG._hex_rgb(SIG.HERO_SIGILS[SIG.hero_for("haid:akshat.mbp-1a2b")]["eye"])

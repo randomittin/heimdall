@@ -686,6 +686,10 @@ TEAM_SIG_W = 8         # a hero top-half is 8 cells wide (the full 8×8 render w
 TEAM_SIG_GAP = 1       # one blank cell between adjacent teammate sigils
 TEAM_ROW2_GAP = 2      # blank cells between the Row2 gauge and the reserved sigil zone
 GAUGE_MIN_W = 24       # the Row2 gauge keeps at least this many cells when a team zone is set
+TEAM_COL_GAP = 4       # 2nd-column gutter: blank cells between the content column and the team
+                       # column. The team is packed LEFT (hugs the content) — NOT flush to the
+                       # right edge — so a wide terminal never rides the team past CC's narrower
+                       # live statusLine region (RJ's right-side truncation). See main().
 
 
 def _team_members(cwd, ledger):
@@ -1126,27 +1130,31 @@ def main():
         team_states = False                              # §7 mid: states drop (name only)
 
     inner = cols - 9                                     # everything right of the 9c sigil zone
+    # team_zone_alloc sizes the team zone + caps members so the gauge keeps its floor; we take
+    # its rows-zone width as the CONTENT BUDGET (build the rows at their richest that fits).
+    # The team is then placed as a COMPACT 2ND COLUMN hugging the content (a TEAM_COL_GAP
+    # gutter), NOT flush to the right edge: a flush-right team at a wide terminal sits out at
+    # $COLUMNS, which overshoots CC's narrower live statusLine region and gets clipped (RJ's
+    # right-side truncation). Left-packing keeps the whole render only as wide as its content +
+    # team, so nothing ever rides the far edge; the per-row hard clamp pads the tail with blanks.
     if tier in ("full", "mid") and members:
-        rows_zone_w, team_w, shown_n, of, team_gap = LAYOUT.team_zone_alloc(
-            cols, len(members), overflow)
+        # reserve the SAME TEAM_COL_GAP gutter the compose step renders, so content_budget is
+        # the exact col1 ceiling — col1_w + gap + team_w <= inner, never a hard-clamp `…` clip.
+        content_budget, team_w, shown_n, of, _alloc_gap = LAYOUT.team_zone_alloc(
+            cols, len(members), overflow, rows_gap=TEAM_COL_GAP)
         members = members[:shown_n]
+        team_gap = TEAM_COL_GAP
     else:
-        rows_zone_w, team_w, of, team_gap = inner, 0, overflow, 0
+        content_budget, team_w, of, team_gap = inner, 0, overflow, 0
 
     # the gauge is the ONLY flexible element in the rows zone: 40c full / 32c mid, min 24.
     gauge_max = LAYOUT.GAUGE_MAX_W if tier == "full" else 32
-    gauge_w = max(0, min(gauge_max, rows_zone_w))
+    gauge_w = max(0, min(gauge_max, content_budget))
 
     if team_w > 0:
         t1, t2, t3, t4 = team_columns(members, team_w, of, t, states=team_states)
     else:
         t1 = t2 = t3 = t4 = ""
-
-    def compose(zone, col):
-        """rows-zone content (padded to rows_zone_w) + the 2c gap + the team column, summing
-        to EXACTLY `inner` cells. Solo → just the padded rows-zone content."""
-        z = LAYOUT.pad_or_truncate(zone, rows_zone_w)
-        return z if team_w <= 0 else z + " " * team_gap + col
 
     # ── Row1 — identity (left) + the watchman rail (right) ──
     # `⛭ HEIMDALL` (blue) │ `rj · Opus 4.8` (dim) │ `heimdall:branch` (ink·faint) +staged
@@ -1172,9 +1180,8 @@ def main():
     # WHOLE-SEGMENT drop: fit the identity run into the span left of the right rail so a
     # tier-narrowed Row1 drops `· Opus 4.8` / `heimdall:branch` as whole units — never a
     # mid-token `…` (Spec v2 §2). Reserve 1c so the two runs never abut with no gap.
-    avail1 = max(0, rows_zone_w - vis(right1) - 1)
+    avail1 = max(0, content_budget - vis(right1) - 1)
     left1 = row1_left(handle, model, repo_seg, cseg, avail1)
-    row1_zone = LAYOUT.left_right(left1, right1, rows_zone_w)
 
     # ── Row2 — the context gauge (CTX%·↓tokens on the fill, $cost on the track end) ──
     # narrow → bar-only (labels off). render_gauge splices the labels inside the bar's cell
@@ -1183,11 +1190,32 @@ def main():
                                labels=(tier != "narrow"))
 
     # ── Row3 — the gate labels `✓ <id> <detail> · …` (ledger missing → `– gates offline`) ──
-    row3_zone = gate_labels(gates, rows_zone_w, colored=True)
+    row3_zone = gate_labels(gates, content_budget, colored=True)
 
     # ── Row4 — the 5h + 7d limit micro-gauges (session stats when rate_limits is absent) ──
     bar_w = 12 if tier == "full" else (8 if tier == "mid" else 0)
-    row4_zone = micro_row(data, t, bar_w, session_id, dur_ms, avail=rows_zone_w)
+    row4_zone = micro_row(data, t, bar_w, session_id, dur_ms, avail=content_budget)
+
+    # ── COMPACT column-1: shrink the content column to the NATURAL width of its widest row so
+    # the team column HUGS the content (a TEAM_COL_GAP gutter) instead of the far edge. col1_w
+    # is >= every row's natural width (no new truncation) and <= the content budget. Solo
+    # (team_w==0) keeps the full inner width so the watchman rail stays right-anchored. ──
+    if team_w > 0:
+        nat1 = vis(left1) + (1 + vis(right1) if right1 else 0)
+        col1_w = min(content_budget,
+                     max(nat1, gauge_w, vis(row3_zone), vis(row4_zone)))
+        col1_w = max(1, col1_w)
+    else:
+        col1_w = content_budget
+
+    row1_zone = LAYOUT.left_right(left1, right1, col1_w)
+
+    def compose(zone, col):
+        """content column (padded to col1_w) + the TEAM_COL_GAP gutter + the team column. Solo
+        → just the padded content column. Sum <= inner; the caller's exact-width clamp pads the
+        trailing blanks so the team never rides the far edge (the anti-truncation left-pack)."""
+        z = LAYOUT.pad_or_truncate(zone, col1_w)
+        return z if team_w <= 0 else z + " " * team_gap + col
 
     row1 = compose(row1_zone, t1)
     row2 = compose(gauge, t2)
