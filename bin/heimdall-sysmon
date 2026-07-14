@@ -1,0 +1,222 @@
+#!/usr/bin/env bash
+# heimdall-sysmon — READ-ONLY system-health advisor: does this machine need a DISK or
+# MEMORY cleanup, and is HEIMDALL ITSELF the thing hogging it?
+#
+# WHY THIS EXISTS: a long Heimdall session leaks background python — the presence keeper's
+# presence-doctor spawns `mock_cp.py` (a mock control-plane) children that get orphaned to
+# launchd (ppid 1) and never reaped. One session accumulated ~692 of them, pinning all RAM
+# and thrashing swap 17G/17G. heimdall-gc reaps orphaned keeper PIDFILES, but NOT these
+# launchd-reparented children (no pidfile tracks them) — so they slip the collector. This
+# advisor is the check that CATCHES them: it counts heimdall's own orphaned python, grades
+# disk + memory pressure, and SUGGESTS the fix (never auto-acts unless asked with --reap).
+#
+# It NEVER touches a foreign process. The one mutating mode (--reap-hmd-orphans) kills ONLY
+# procs whose cmdline carries heimdall's OWN signature (mock_cp.py / presence-doctor / a
+# heimdall-tagged python) AND are orphaned to launchd — the exact leak, nothing else.
+#
+# macOS-correct throughout (learned the hard way — see the mac-deep-clean skill):
+#   • `df -h /` LIES (/ is the sealed read-only snapshot) → true free = diskutil Container
+#     Free Space on /System/Volumes/Data.
+#   • `ps aux` RSS undercounts (shared/compressed pages) → memory pressure read from
+#     vm.swapusage + vm_stat, whose counters end in `.` and must be de-dotted before math.
+#   • `timeout` does not exist → no external timeouts here; every probe is a bounded builtin.
+#   • never prompts for sudo; wired-RAM / swap recovery is PRINTED as a manual reboot step.
+#
+# USAGE
+#   heimdall-sysmon                 human report + a SUGGESTION block; exit = worst severity
+#   heimdall-sysmon --json          machine-readable {disk,memory,procs,severity,suggestions}
+#   heimdall-sysmon --quiet         print ONLY when action is advised (WARN/CRIT); silent when OK
+#   heimdall-sysmon --reap-hmd-orphans   kill heimdall's OWN orphaned python leak + its spawner
+#   heimdall-sysmon --filter-orphans     read `pid ppid command…` lines on stdin, print the pids
+#                                        the reaper WOULD target (the scoping oracle — testable)
+#
+# EXIT: 0 = healthy · 1 = WARN (cleanup advisable) · 2 = CRITICAL (act now / a live leak).
+set -u
+
+# ── thresholds (env-overridable) ────────────────────────────────────────────────
+DISK_WARN_PCT="${HMD_SYSMON_DISK_WARN_PCT:-85}"    # Data volume % USED at/above which → WARN
+DISK_CRIT_PCT="${HMD_SYSMON_DISK_CRIT_PCT:-93}"    # … CRITICAL
+SWAP_WARN_PCT="${HMD_SYSMON_SWAP_WARN_PCT:-40}"    # swap % of total in use → WARN
+SWAP_CRIT_PCT="${HMD_SYSMON_SWAP_CRIT_PCT:-70}"    # … CRITICAL (thrashing)
+WIRED_WARN_PCT="${HMD_SYSMON_WIRED_WARN_PCT:-55}"  # wired RAM % of total → WARN (reboot-only fix)
+ORPHAN_WARN="${HMD_SYSMON_ORPHAN_WARN:-20}"        # heimdall orphaned-python count → WARN
+ORPHAN_CRIT="${HMD_SYSMON_ORPHAN_CRIT:-80}"        # … CRITICAL (a live runaway leak)
+RUNAWAY_ANY="${HMD_SYSMON_RUNAWAY_ANY:-120}"       # ANY single interpreter proc count → runaway
+
+# the SINGLE source of truth for "is this a heimdall-owned python orphan?" — an awk boolean
+# reused by BOTH the counter and the reaper so detection and killing can never diverge. A row
+# is `pid ppid command…`; matched iff ppid==1 (orphaned to launchd) AND the command carries a
+# heimdall signature. A foreign python (ppid!=1, or no heimdall marker) is NEVER matched.
+HMD_ORPHAN_AWK='
+  $2==1 {
+    cmd=""; for (i=3;i<=NF;i++) cmd=cmd" "$i
+    if (cmd ~ /mock_cp\.py/) { print $1; next }
+    if (cmd ~ /presence-doctor/) { print $1; next }
+    if ((cmd ~ /[Pp]ython/) && (cmd ~ /heimdall|\.heimdall|hmd-/)) { print $1; next }
+  }'
+
+MODE="report"; JSON=0; QUIET=0
+for a in "$@"; do
+  case "$a" in
+    --json) JSON=1 ;;
+    --quiet|-q) QUIET=1 ;;
+    --reap-hmd-orphans|--reap) MODE="reap" ;;
+    --filter-orphans) MODE="filter" ;;
+    -h|--help) grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  esac
+done
+
+# ── the scoping oracle: emit the pids the reaper would target, from stdin ps rows ──
+if [ "$MODE" = "filter" ]; then
+  awk "$HMD_ORPHAN_AWK"
+  exit 0
+fi
+
+# ── helpers ──────────────────────────────────────────────────────────────────────
+_bytes_human() { # bytes → human Gi
+  awk -v b="${1:-0}" 'BEGIN{printf (b>=1073741824)?"%.1fGi":"%.0fMi", (b>=1073741824)?b/1073741824:b/1048576}'
+}
+
+# ── DISK: true free on the Data volume (df / lies) ────────────────────────────────
+disk_status="ok"; disk_used_pct=0; disk_free_b=0; disk_total_b=0
+_probe_disk() {
+  local info free tot
+  info="$(diskutil info /System/Volumes/Data 2>/dev/null)"
+  free="$(printf '%s\n' "$info" | awk -F'[()]' '/Container Free Space/{print $2}' | awk '{print $1}')"
+  tot="$(printf '%s\n' "$info" | awk -F'[()]' '/Container Total Space/{print $2}' | awk '{print $1}')"
+  if [ -z "$free" ] || [ -z "$tot" ]; then
+    # fallback: df -k on the Data volume (1K blocks)
+    local dk; dk="$(df -k /System/Volumes/Data 2>/dev/null | awk 'NR==2{print $2" "$4}')"
+    tot="$(( $(echo "$dk" | awk '{print $1}') * 1024 ))"
+    free="$(( $(echo "$dk" | awk '{print $2}') * 1024 ))"
+  fi
+  disk_free_b="${free:-0}"; disk_total_b="${tot:-0}"
+  if [ "${disk_total_b:-0}" -gt 0 ] 2>/dev/null; then
+    disk_used_pct="$(awk -v f="$disk_free_b" -v t="$disk_total_b" 'BEGIN{printf "%d",(t-f)*100/t}')"
+  fi
+  if   [ "$disk_used_pct" -ge "$DISK_CRIT_PCT" ] 2>/dev/null; then disk_status="crit"
+  elif [ "$disk_used_pct" -ge "$DISK_WARN_PCT" ] 2>/dev/null; then disk_status="warn"
+  fi
+}
+_probe_disk
+
+# ── MEMORY: swap + wired via vm.swapusage / vm_stat (de-dot the counters) ─────────
+mem_status="ok"; swap_used_pct=0; swap_used_g=0; swap_total_g=0; wired_pct=0; free_pct=0
+_probe_mem() {
+  local su memsize ps
+  su="$(sysctl -n vm.swapusage 2>/dev/null)"     # total = NN.NNM  used = NN.NNM  free = …
+  swap_total_g="$(printf '%s' "$su" | awk '{for(i=1;i<=NF;i++)if($i=="total"){gsub(/M/,"",$(i+2));printf "%.1f",$(i+2)/1024}}')"
+  swap_used_g="$(printf '%s' "$su" | awk '{for(i=1;i<=NF;i++)if($i=="used"){gsub(/M/,"",$(i+2));printf "%.1f",$(i+2)/1024}}')"
+  [ -n "$swap_total_g" ] || swap_total_g=0
+  [ -n "$swap_used_g" ] || swap_used_g=0
+  swap_used_pct="$(awk -v u="$swap_used_g" -v t="$swap_total_g" 'BEGIN{printf "%d", (t>0)?u*100/t:0}')"
+  memsize="$(sysctl -n hw.memsize 2>/dev/null)"; [ -n "$memsize" ] || memsize=0
+  # vm_stat: strip trailing dots, compute wired/free as % of RAM
+  local vm; vm="$(vm_stat 2>/dev/null | sed 's/\.//g')"
+  ps="$(printf '%s\n' "$vm" | awk '/page size of/{print $8}')"; [ -n "$ps" ] || ps=16384
+  local wired free
+  wired="$(printf '%s\n' "$vm" | awk '/Pages wired down/{print $4}')"
+  free="$(printf '%s\n' "$vm" | awk '/Pages free/{print $3}')"
+  [ -n "$wired" ] || wired=0; [ -n "$free" ] || free=0
+  if [ "$memsize" -gt 0 ] 2>/dev/null; then
+    wired_pct="$(awk -v w="$wired" -v p="$ps" -v m="$memsize" 'BEGIN{printf "%d", w*p*100/m}')"
+    free_pct="$(awk -v f="$free" -v p="$ps" -v m="$memsize" 'BEGIN{printf "%d", f*p*100/m}')"
+  fi
+  if   [ "$swap_used_pct" -ge "$SWAP_CRIT_PCT" ] 2>/dev/null; then mem_status="crit"
+  elif [ "$swap_used_pct" -ge "$SWAP_WARN_PCT" ] 2>/dev/null; then mem_status="warn"
+  fi
+  [ "$wired_pct" -ge "$WIRED_WARN_PCT" ] 2>/dev/null && [ "$mem_status" = "ok" ] && mem_status="warn"
+}
+_probe_mem
+
+# ── PROCS: heimdall's own orphaned-python leak + any generic runaway ──────────────
+proc_status="ok"; orphan_hmd=0; py_total=0; runaway_name=""; runaway_n=0
+_probe_procs() {
+  local rows
+  rows="$(ps -axo pid=,ppid=,command= 2>/dev/null)"
+  orphan_hmd="$(printf '%s\n' "$rows" | awk "$HMD_ORPHAN_AWK" | grep -c . )"
+  py_total="$(pgrep -x python3 2>/dev/null | grep -c . )"
+  local p n
+  for p in python3 node bun ruby java deno; do
+    n="$(pgrep -x "$p" 2>/dev/null | grep -c . )"
+    if [ "$n" -gt "$runaway_n" ]; then runaway_n="$n"; runaway_name="$p"; fi
+  done
+  if   [ "$orphan_hmd" -ge "$ORPHAN_CRIT" ] 2>/dev/null; then proc_status="crit"
+  elif [ "$orphan_hmd" -ge "$ORPHAN_WARN" ] 2>/dev/null; then proc_status="warn"
+  fi
+  if [ "$runaway_n" -ge "$RUNAWAY_ANY" ] 2>/dev/null; then proc_status="crit"; fi
+}
+_probe_procs
+
+# ── overall severity ──────────────────────────────────────────────────────────────
+_rank() { case "$1" in crit) echo 2;; warn) echo 1;; *) echo 0;; esac; }
+sev=0
+for s in "$disk_status" "$mem_status" "$proc_status"; do r="$(_rank "$s")"; [ "$r" -gt "$sev" ] && sev="$r"; done
+sev_word="ok"; [ "$sev" = 1 ] && sev_word="warn"; [ "$sev" = 2 ] && sev_word="crit"
+
+# ── REAP: kill ONLY heimdall's own orphaned python + its spawner, then re-measure ──
+if [ "$MODE" = "reap" ]; then
+  before="$orphan_hmd"
+  pids="$(ps -axo pid=,ppid=,command= 2>/dev/null | awk "$HMD_ORPHAN_AWK")"
+  killed=0
+  if [ -n "$pids" ]; then
+    printf '%s\n' "$pids" | xargs -r kill -9 2>/dev/null
+    killed="$(printf '%s\n' "$pids" | grep -c . )"
+  fi
+  # kill the SPAWNER so the leak does not respawn (heimdall's OWN presence keeper loops only)
+  spawn_before="$(pgrep -f 'heimdall-presence.*(keeper|roster|beat)' 2>/dev/null | grep -c . )"
+  pkill -9 -f 'heimdall-presence.*(keeper|roster|beat)' 2>/dev/null || true
+  sleep 1
+  after="$(ps -axo pid=,ppid=,command= 2>/dev/null | awk "$HMD_ORPHAN_AWK" | grep -c . )"
+  echo "heimdall-sysmon --reap: killed $killed orphaned heimdall python (mock_cp.py / presence-doctor),"
+  echo "  stopped $spawn_before presence spawner daemon(s). orphaned-python now: $after (was $before)."
+  [ "$after" -gt 0 ] && echo "  note: $after respawned/immortal — re-run, or reboot if wired RAM is the residue."
+  exit 0
+fi
+
+# ── JSON ──────────────────────────────────────────────────────────────────────────
+if [ "$JSON" = 1 ]; then
+  printf '{'
+  printf '"severity":"%s",' "$sev_word"
+  printf '"disk":{"status":"%s","used_pct":%s,"free_bytes":%s,"total_bytes":%s},' \
+    "$disk_status" "${disk_used_pct:-0}" "${disk_free_b:-0}" "${disk_total_b:-0}"
+  printf '"memory":{"status":"%s","swap_used_pct":%s,"swap_used_g":%s,"swap_total_g":%s,"wired_pct":%s,"free_pct":%s},' \
+    "$mem_status" "${swap_used_pct:-0}" "${swap_used_g:-0}" "${swap_total_g:-0}" "${wired_pct:-0}" "${free_pct:-0}"
+  printf '"procs":{"status":"%s","hmd_orphans":%s,"python3_total":%s,"runaway":"%s","runaway_n":%s}' \
+    "$proc_status" "${orphan_hmd:-0}" "${py_total:-0}" "${runaway_name:-}" "${runaway_n:-0}"
+  printf '}\n'
+  exit "$sev"
+fi
+
+# ── human report (--quiet: only when action advised) ───────────────────────────────
+if [ "$QUIET" = 1 ] && [ "$sev" = 0 ]; then exit 0; fi
+
+_line() { printf '  %-8s %-5s %s\n' "$1" "$2" "$3"; }
+echo "heimdall-sysmon — system health: $(printf '%s' "$sev_word" | tr '[:lower:]' '[:upper:]')"
+_line "disk"   "$disk_status" "Data $(_bytes_human "$disk_free_b") free · ${disk_used_pct}% used"
+_line "memory" "$mem_status"  "swap ${swap_used_g}G/${swap_total_g}G (${swap_used_pct}%) · free ${free_pct}% · wired ${wired_pct}%"
+if [ "$orphan_hmd" -gt 0 ] || [ "$runaway_n" -ge "$RUNAWAY_ANY" ] 2>/dev/null; then
+  _line "procs" "$proc_status" "${orphan_hmd} orphaned heimdall python (mock_cp.py/presence-doctor) · python3 total ${py_total} · peak ${runaway_name}×${runaway_n}"
+else
+  _line "procs" "$proc_status" "no heimdall python leak · python3 ${py_total}"
+fi
+
+# ── SUGGESTIONS ─────────────────────────────────────────────────────────────────────
+if [ "$sev" = 0 ]; then
+  echo "suggestion: none — healthy."
+  exit 0
+fi
+echo "suggestion:"
+if [ "$proc_status" != "ok" ]; then
+  echo "  • heimdall is leaking python — reap its OWN orphans (foreign procs untouched):"
+  echo "      heimdall-sysmon --reap-hmd-orphans"
+fi
+if [ "$mem_status" != "ok" ]; then
+  echo "  • memory pressure: after the reap, wired RAM + swap only fully clear on reboot:"
+  echo "      sudo reboot"
+fi
+if [ "$disk_status" != "ok" ]; then
+  echo "  • disk is ${disk_used_pct}% full — run the deep clean: invoke the 'mac-deep-clean' skill"
+  echo "    (tiered, read-only investigation first; deletes only caches / dead repos / SDK bloat)."
+fi
+exit "$sev"
