@@ -311,9 +311,10 @@ def cmd(rel):
 
 WANT = {
     "statusLine":         {"marker": "hooks/statusline.sh",
-                           "value": {"type": "command", "command": cmd("hooks/statusline.sh")}},
-    "subagentStatusLine": {"marker": "hmd-subagent-statusline.sh",
-                           "value": {"type": "command", "command": cmd("sentinels/hmd-subagent-statusline.sh")}},
+                           "value": {"type": "command", "command": cmd("hooks/statusline.sh"),
+                                     "refreshInterval": 2}},
+    "subagentStatusLine": {"marker": "subagent-statusline.sh",
+                           "value": {"type": "command", "command": cmd("hooks/subagent-statusline.sh")}},
 }
 
 try:
@@ -800,7 +801,7 @@ main() {
   # reinstall fallback fetch THIS release, never a stale default. bin/heimdall-autoupdate
   # ALSO pins HEIMDALL_REF to the version it verified, so an auto-update installs the
   # exact resolved release regardless of this default. HEIMDALL_REF overrides for dev.
-  local DEFAULT_REF="v2.2.2"
+  local DEFAULT_REF="v2.2.3"
   local REF="${HEIMDALL_REF:-$DEFAULT_REF}"
   local REPO="${HEIMDALL_REPO:-https://github.com/randomittin/heimdall.git}"
 

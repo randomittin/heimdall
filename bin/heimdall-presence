@@ -832,6 +832,15 @@ _keeper_loop() {
   trap 'rm -f "$pidfile.tmp.$$" 2>/dev/null; [ -n "$swait" ] && kill "$swait" 2>/dev/null; [ "$(cat "$pidfile" 2>/dev/null)" = "$$" ] && rm -f "$pidfile" 2>/dev/null; exit 0' TERM INT
   while :; do
     "$beat_bin" beat >/dev/null 2>&1 || true          # REUSE beat (its consent gate applies).
+    # Refresh the statusline's ledger status.json on the SAME beat cadence (HMD Statusline
+    # Spec v1 §6) so the file the statusline reads stays warm while the session is live. This
+    # is where the daemon "watching" liveness comes from — the keeper's own pidfile. Best-effort
+    # + silent: a status-write fault NEVER perturbs the heartbeat. Skipped under the beat-injection
+    # test seam so the keeper falsifier stays hermetic (no real status-source reads / no ~/.heimdall
+    # writes in tests).
+    if [ -z "${HMD_KEEPER_BEAT_BIN:-}" ] && [ -x "$SELF_DIR/heimdall-status-json" ]; then
+      "$SELF_DIR/heimdall-status-json" >/dev/null 2>&1 || true
+    fi
     cycles=$((cycles + 1))
     # THROTTLED RESOURCE GC: every N beats fire a cheap, backgrounded `heimdall-gc run
     # --quick` so a LONG-LIVED session keeps freeing temp files + stale pidfiles

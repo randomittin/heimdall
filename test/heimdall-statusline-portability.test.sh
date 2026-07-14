@@ -86,7 +86,7 @@ SA="$(sl_cmd "$SETTINGS" subagentStatusLine)"
 #       path), resolved dynamically — not a foreign path ──
 case "$SL" in *"$DST/hooks/statusline.sh"*) ok "statusLine points at teammate checkout ($DST)" ;;
   *) bad "statusLine does NOT point at teammate checkout: $SL" ;; esac
-case "$SA" in *"$DST/sentinels/hmd-subagent-statusline.sh"*) ok "subagentStatusLine points at teammate checkout" ;;
+case "$SA" in *"$DST/hooks/subagent-statusline.sh"*) ok "subagentStatusLine points at teammate checkout" ;;
   *) bad "subagentStatusLine does NOT point at teammate checkout: $SA" ;; esac
 
 # ── 4) PORTABILITY / FALSIFIER: no /Users/rj, no unresolved ${CLAUDE_PLUGIN_ROOT}
