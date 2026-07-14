@@ -396,7 +396,8 @@ def identity(cwd, fallback, session_id=""):
     return _sigil_override_seed(fallback), fallback   # cold + broken fork → transient, UNCACHED
 
 def _sigil_override_seed(seed):
-    """Honor `hmd sigil set <hero>` (unlocked after >=3 runs); else the seed unchanged."""
+    """Honor `hmd sigil set <hero>` (unlocked after >=5 runs — matches the heimdall-sigil CLI
+    threshold); else the seed unchanged."""
     home = os.environ.get("HEIMDALL_HOME") or os.path.join(os.path.expanduser("~"), ".heimdall")
     try:
         with open(os.path.join(home, "sigil-choice")) as f:
@@ -410,7 +411,7 @@ def _sigil_override_seed(seed):
             runs = int(f.read().strip() or "0")
     except Exception:
         runs = 0
-    return choice if runs >= 3 else seed
+    return choice if runs >= 5 else seed
 
 # ── presence (opt-out + one coordinated fire-and-forget beat/roster fork) ─────
 def _quiet_rm(path):
