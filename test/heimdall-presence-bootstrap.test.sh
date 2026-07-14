@@ -52,7 +52,7 @@ cleanup() {
   done
   rm -rf "$WORK"
 }
-trap cleanup EXIT
+trap cleanup INT TERM EXIT
 
 HOME_T="$WORK/home"; mkdir -p "$HOME_T"
 MOCK_LOG="$WORK/mock.log"; : > "$MOCK_LOG"
@@ -131,6 +131,20 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._send(404, {"error": "no_route"})
 
+
+# self-terminating watchdog — a leaked mock CP must NEVER outlive its test. A bash EXIT trap
+# does NOT run on SIGKILL (the agent/API hard-kills that orphaned ~692 of these to launchd), so
+# guard IN-PROCESS: exit hard once orphaned (reparented to launchd, ppid 1), or the original
+# parent is gone, or a 120s backstop elapses. Root-cause fix for the mock_cp.py python leak.
+import threading as _th, time as _t
+_PPID0 = os.getppid()
+def _watchdog():
+    start = _t.time()
+    while True:
+        _t.sleep(1.0)
+        if os.getppid() != _PPID0 or os.getppid() == 1 or (_t.time() - start) > 120:
+            os._exit(0)
+_th.Thread(target=_watchdog, daemon=True).start()
 
 srv = HTTPServer(("127.0.0.1", 0), Handler)
 sys.stdout.write("%d\n" % srv.server_address[1])
