@@ -14,10 +14,13 @@
 #        (b) every author+committer email is on the identity allowlist
 #        (c) origin HEAD matches local HEAD
 #   5. TAG + GitHub RELEASE (only AFTER R9 passes — release only verified-clean
-#      history): git tag vX.Y.Z, push the tag, gh release create --generate-notes.
+#      history): git tag vX.Y.Z, push the tag, publish a Release whose notes are
+#      DERIVED from this repo's conventional commits (bin/generate-changelog), and
+#      attach the minisign signature of install.sh.
 #
 # Stops at the first failure. Nothing is pushed if the local scan finds leaks.
-# Exit 0 = everything green.
+# Exit 0 = everything green — INCLUDING that the Release is live on GitHub. A run that
+# cannot publish fails non-zero; it never prints a green banner over an unpublished release.
 #
 # Usage:
 #   release/ship.sh            full: patch-bump -> scan -> push -> R9 -> tag+release
@@ -27,6 +30,8 @@
 #   release/ship.sh --no-bump  ship without bumping (no new version/tag/release)
 #   release/ship.sh --print-next   print the next version per the bump flag, exit (no mutation)
 #   release/ship.sh --check    local scan + pending-commit preview, do NOT push/bump
+#   release/ship.sh --dry-run  print the exact `gh release` command + notes, publish NOTHING
+#   release/ship.sh --release-only  publish the manifest's current version (orphan recovery)
 #   release/ship.sh -h         this help
 
 set -euo pipefail
@@ -60,9 +65,14 @@ ship.sh — bump, scan, push, verify, and release in one step.
   release/ship.sh --no-bump    ship without a version bump (no tag/release)
   release/ship.sh --print-next print the next version (no mutation), exit
   release/ship.sh --check      local secret scan + show pending commits, do NOT push/bump
+  release/ship.sh --dry-run    print the EXACT gh release command + notes, publish NOTHING
+  release/ship.sh --release-only  publish the version already in the manifest (recover a
+                               ship that died between the bump commit and the tag)
   release/ship.sh -h           this help
 
 Stops at the first failure. Nothing is pushed if the local scan finds leaks.
+A run that CANNOT publish a release fails loudly in preflight — it never bumps,
+warns, and exits 0 (that silent skip is what stranded v2.2.3/v2.0.17/v2.0.13).
 USAGE
 }
 
@@ -94,6 +104,116 @@ write_version() {  # $1=new version — rewrite plugin.json's version field in p
   grep -Eq "\"version\"[[:space:]]*:[[:space:]]*\"${new}\"" "$tmp" \
     || { rm -f "$tmp"; die "version rewrite did not take (manifest format unexpected)"; }
   mv "$tmp" "$PLUGIN_MANIFEST"
+}
+
+# ── Release notes + publication ──────────────────────────────────────────────
+# WHY THIS IS NOT `--generate-notes`: every published Release carried an 83-byte
+# GitHub-boilerplate body ("Full Changelog: <compare-link>") — technically a release, but it
+# told a reader nothing about what shipped. Notes are now derived from the repo's OWN
+# conventional-commit history via bin/generate-changelog, which is the same generator
+# CHANGELOG.md uses, so the Release body and the changelog can never tell different stories.
+
+# prev_release_tag — the tag the notes range starts from: the newest vX.Y.Z tag that is an
+# ANCESTOR of HEAD and is not $1 itself. Prints nothing when there is no prior tag (the
+# caller then falls back to the full history), which is the correct first-release behaviour.
+prev_release_tag() {
+  local exclude="$1"
+  git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname --merged HEAD 2>/dev/null \
+    | grep -Fxv "$exclude" | head -1
+}
+
+# build_release_notes <tag> <outfile> — write the Release body for <tag> to <outfile>.
+# Source of truth, in order:
+#   1. CHANGELOG.md — if it carries a section for THIS exact version, that hand-curated
+#      prose wins (a human wrote something better than a commit list).
+#   2. bin/generate-changelog — conventional commits since the previous tag.
+# Hard-fails rather than publishing an empty body: a Release with no notes is the boilerplate
+# no-op this function exists to end.
+build_release_notes() {
+  local tag="$1" out="$2" version="${1#v}" prev notes_body=""
+
+  # (1) A curated CHANGELOG.md section for this exact version, if one exists.
+  if [ -f "$REPO_ROOT/CHANGELOG.md" ]; then
+    notes_body="$(awk -v v="$version" '
+      $0 ~ "^## \\[" v "\\]" { grab = 1; next }
+      grab && /^## / { exit }
+      grab { print }
+    ' "$REPO_ROOT/CHANGELOG.md" 2>/dev/null || true)"
+    # Strip to nothing if the section held only blank lines.
+    printf '%s' "$notes_body" | grep -q '[^[:space:]]' || notes_body=""
+  fi
+
+  # (2) Otherwise derive from conventional commits since the previous tag.
+  if [ -z "$notes_body" ]; then
+    prev="$(prev_release_tag "$tag")"
+    local gen="$REPO_ROOT/bin/generate-changelog"
+    if [ -x "$gen" ]; then
+      if [ -n "$prev" ]; then
+        notes_body="$("$gen" --since "$prev" --version "$version" 2>/dev/null || true)"
+      else
+        notes_body="$("$gen" --version "$version" 2>/dev/null || true)"
+      fi
+      # generate-changelog emits its own "## [version] - date" heading; drop it so the
+      # Release title is not duplicated inside the body.
+      notes_body="$(printf '%s\n' "$notes_body" | sed '1{/^## \[/d;}')"
+    fi
+  fi
+
+  # (3) Last resort: a plain commit list. Still real content, never boilerplate.
+  if ! printf '%s' "$notes_body" | grep -q '[^[:space:]]'; then
+    prev="$(prev_release_tag "$tag")"
+    if [ -n "$prev" ]; then
+      notes_body="$(git log --no-merges --pretty=format:'- %s' "${prev}..HEAD" 2>/dev/null || true)"
+    else
+      notes_body="$(git log --no-merges --pretty=format:'- %s' HEAD 2>/dev/null || true)"
+    fi
+  fi
+
+  printf '%s' "$notes_body" | grep -q '[^[:space:]]' \
+    || die "release notes for $tag came out EMPTY — refusing to publish a boilerplate Release"
+
+  prev="$(prev_release_tag "$tag")"
+  {
+    printf '%s\n' "$notes_body"
+    printf '\n'
+    if [ -n "$prev" ]; then
+      printf '**Full changelog**: https://github.com/randomittin/heimdall/compare/%s...%s\n' "$prev" "$tag"
+    fi
+    printf '\nInstall/upgrade:\n\n```bash\ncurl -fsSL https://raw.githubusercontent.com/randomittin/heimdall/%s/install.sh | bash\n```\n' "$tag"
+    printf '\n`install.sh.minisig` is the detached minisign signature of this release'\''s `install.sh`; `bin/heimdall-autoupdate` verifies it against `release/heimdall-signing.pub` before applying.\n'
+  } > "$out" || die "could not write release notes to $out"
+}
+
+# publish_release <tag> <notes-file> — create the GitHub Release, or UPDATE it if it already
+# exists. IDEMPOTENT by design: a re-run after a partial ship must converge, not error out
+# ambiguously. Every gh invocation is exit-checked and dies loudly — no `|| true`, no
+# `2>/dev/null` swallowing the reason. gh's stderr is captured and REPRINTED on failure so
+# the operator sees what GitHub actually said.
+publish_release() {
+  local tag="$1" notes="$2" out rc
+
+  # NOTE: `if out="$(cmd)"` — not `out="$(cmd)"; rc=$?`. Under this script's `set -e`, a
+  # failing command-substitution in a bare assignment aborts the shell BEFORE the next line,
+  # so the recovery `die` message would never print (a loud failure turned silent). An if-
+  # condition is exempt from set -e and still captures stdout+stderr into $out.
+  if gh release view "$tag" >/dev/null 2>&1; then
+    warn "Release $tag already exists — updating its notes + title in place (idempotent re-run)"
+    if ! out="$(gh release edit "$tag" --notes-file "$notes" --title "$tag" 2>&1)"; then
+      rc=$?; printf '%s\n' "$out" >&2
+      die "gh release edit $tag failed (exit $rc) — see gh output above"
+    fi
+    ok "updated GitHub Release $tag"
+  else
+    if ! out="$(gh release create "$tag" --notes-file "$notes" --title "$tag" 2>&1)"; then
+      rc=$?; printf '%s\n' "$out" >&2
+      die "gh release create $tag failed (exit $rc) — the tag is pushed; re-run release/ship.sh --release-only after fixing the cause"
+    fi
+    ok "published GitHub Release $tag — auto-update's releases/latest now advances"
+  fi
+
+  # A Release that GitHub did not actually record is a silent no-op. Read it back.
+  gh release view "$tag" >/dev/null 2>&1 \
+    || die "post-publish readback failed: GitHub does not report a Release at $tag"
 }
 
 # ── Release signing (minisign) ───────────────────────────────────────────────
@@ -142,19 +262,25 @@ sign_release_artifact() {  # $1 = tag (vX.Y.Z). Best-effort: WARN + return 0 whe
   fi
   ok "signed install.sh → install.sh.minisig ($tag)"
 
-  if command -v gh >/dev/null 2>&1; then
-    if gh release upload "$tag" "$sig" --clobber >/dev/null 2>&1; then
-      ok "uploaded install.sh.minisig to Release $tag — auto-update can now VERIFY this release"
-    else
-      warn "signing: gh release upload failed — the sig was NOT attached to $tag. Attach it with:"
-      warn "  gh release upload $tag '$sig' --clobber"
-      return 0
-    fi
-  else
-    warn "signing: gh CLI absent — sig created at $sig but NOT uploaded. Attach it with:"
-    warn "  gh release upload $tag '$sig' --clobber"
-    return 0
+  # Past THIS point the artifact IS signed, so a failure to attach is NOT a soft condition:
+  # the Release would ship with no signature and every verifying client would REFUSE it.
+  # We hold the key, we produced the sig — dropping it silently is the failure mode this
+  # whole signing model exists to prevent. Loud failure > quiet skip.
+  local out rc
+  # if-condition capture (set -e safe — see publish_release for why bare `out=$(...)` aborts).
+  if ! out="$(gh release upload "$tag" "$sig" --clobber 2>&1)"; then
+    rc=$?; printf '%s\n' "$out" >&2
+    rm -rf "$sigdir"
+    die "gh release upload failed (exit $rc) — $tag is published but UNSIGNED; verifying clients will REFUSE it. Attach it with: minisign -Sm install.sh -x install.sh.minisig && gh release upload $tag install.sh.minisig --clobber"
   fi
+  ok "uploaded install.sh.minisig to Release $tag — auto-update can now VERIFY this release"
+
+  # Read the asset back: an upload that reports success but leaves no asset is the silent
+  # no-op class this ship is being fixed for.
+  gh release view "$tag" --json assets --jq '.assets[].name' 2>/dev/null | grep -Fxq 'install.sh.minisig' \
+    || { rm -rf "$sigdir"; die "post-upload readback failed: Release $tag carries no install.sh.minisig asset"; }
+  ok "verified install.sh.minisig is attached to $tag"
+
   rm -rf "$sigdir"
 }
 
@@ -173,31 +299,42 @@ bump_default_ref() {
   ok "pinned install.sh DEFAULT_REF → $tag"
 }
 
-# write_version_file — mirror the manifest version into the repo-root VERSION file (a
-# single-source plain-text version other tooling/CI reads WITHOUT a JSON parser) and
-# `git add` it. Folded into the release commit so VERSION, plugin.json, and the README
-# badge never drift — test/version-unified.test.sh gates exactly this. Idempotent.
-write_version_file() {
+# render_version_surfaces — RENDER (not hand-patch) the manifest-derived version surfaces:
+# the repo-root VERSION mirror and README's generated HEIMDALL:VERSION region. Delegates to
+# bin/heimdall-render-version, the single renderer, so ship.sh and the drift gate can never
+# disagree about what a surface should say. HARD-fails: a release commit carrying a stale
+# README/VERSION is precisely the drift test/version-drift.test.sh exists to catch, so
+# discovering it at ship time and warning would just push a known-red commit.
+render_version_surfaces() {
   local new="$1"
-  local file="${SHIP_VERSION_FILE:-${REPO_ROOT:-$PWD}/VERSION}"
-  printf '%s\n' "$new" > "$file" || { warn "write_version_file: could not write $file — skipping"; return 0; }
-  git add "$file" 2>/dev/null || true
-  ok "wrote VERSION → $new"
+  local renderer="${SHIP_RENDERER:-${REPO_ROOT:-$PWD}/bin/heimdall-render-version}"
+  [ -x "$renderer" ] || die "render_version_surfaces: $renderer missing/not executable — cannot render version surfaces for $new"
+  "$renderer" || die "render_version_surfaces: rendering failed for $new"
+  git add "${REPO_ROOT:-$PWD}/VERSION" "${REPO_ROOT:-$PWD}/README.md" 2>/dev/null || true
+  ok "rendered version surfaces (VERSION, README region) → $new"
 }
 
-# bump_readme_badge — keep README's version badge in lock-step with the manifest so
-# test/version-unified.test.sh stays green across releases (a bumped manifest with a stale
-# badge is precisely the drift that gate catches). Rewrites `badge/version-X.Y.Z-` → $1 and
-# `git add`s it. Idempotent; a no-op (returns 0) if the file or the badge line is absent.
-bump_readme_badge() {
-  local new="$1"
-  local file="${SHIP_README:-${REPO_ROOT:-$PWD}/README.md}"
-  [ -f "$file" ] || { warn "bump_readme_badge: $file not found — skipping"; return 0; }
-  grep -Eq 'badge/version-[0-9]+\.[0-9]+\.[0-9]+-' "$file" || { warn "bump_readme_badge: no version badge in $file — skipping"; return 0; }
-  sed -E -i.bak "s#(badge/version-)[0-9]+\.[0-9]+\.[0-9]+(-)#\1${new}\2#g" "$file" \
-    && rm -f "$file.bak"
-  git add "$file" 2>/dev/null || true
-  ok "updated README version badge → $new"
+# sync_release_artifacts — re-point the TAG-derived artifacts at $1 via release/sync-release.sh:
+# the npx wrapper (packages/runheimdall/package.json version/tag/url/sha256), and the vanity
+# 302 targets (vercel.json, _redirects). That script also ASSERTS the wrapper's baked sha256
+# equals the digest of the install.sh this tag will serve, so `npx runheimdall` and
+# runheimdall.dev/install provably resolve to byte-identical bytes.
+#
+# This call is why the wrapper stopped drifting: sync-release.sh existed but NOTHING invoked
+# it, so the wrapper sat at v2.0.5 while the plugin shipped 2.2.6 — `npx runheimdall`
+# installed a months-stale Heimdall and no gate was red. HARD-fails for the same reason
+# render_version_surfaces does.
+sync_release_artifacts() {
+  local tag="$1"
+  local sync="${SHIP_SYNC_RELEASE:-${REPO_ROOT:-$PWD}/release/sync-release.sh}"
+  [ -x "$sync" ] || [ -f "$sync" ] || die "sync_release_artifacts: $sync not found — cannot sync release artifacts for $tag"
+  bash "$sync" "$tag" || die "sync_release_artifacts: release/sync-release.sh $tag failed — artifacts would drift from the tag"
+  git add "${REPO_ROOT:-$PWD}/packages/runheimdall/package.json" \
+          "${REPO_ROOT:-$PWD}/vercel.json" \
+          "${REPO_ROOT:-$PWD}/_redirects" \
+          "${REPO_ROOT:-$PWD}/install.sh" \
+          "$PLUGIN_MANIFEST" 2>/dev/null || true
+  ok "synced release artifacts (npx wrapper, vanity 302) → $tag"
 }
 
 # bump_readme_sha — SHA-pin README's install one-liner(s) to $1 (a 40-hex commit SHA) and
@@ -228,6 +365,7 @@ fi
 
 # ── Args (multi-flag: parse every argument, not just $1) ─────────────────────
 CHECK_ONLY=0; BUMP_KIND="patch"; EXPLICIT_VERSION=""; DO_BUMP=1; PRINT_NEXT=0
+DRY_RUN=0; RELEASE_ONLY=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --check|--check-only) CHECK_ONLY=1 ;;
@@ -235,6 +373,8 @@ while [ "$#" -gt 0 ]; do
     --major) BUMP_KIND="major" ;;
     --no-bump) DO_BUMP=0 ;;
     --print-next) PRINT_NEXT=1 ;;
+    --dry-run) DRY_RUN=1 ;;
+    --release-only) RELEASE_ONLY=1; DO_BUMP=0 ;;
     --version) BUMP_KIND="explicit"; EXPLICIT_VERSION="${2:-}"; shift
                printf '%s' "$EXPLICIT_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' \
                  || die "--version needs X.Y.Z (got '${EXPLICIT_VERSION:-}')" ;;
@@ -277,6 +417,115 @@ printf '%sorigin: %s%s\n' "$D" "$REMOTE_URL" "$R"
 # Refresh the remote ref so the pending-commit preview is accurate (non-fatal).
 git fetch origin "$BRANCH" --quiet 2>/dev/null || true
 
+# ── Release preflight — check the RELEASE prerequisites BEFORE mutating anything ──
+# ROOT CAUSE (the orphaned-version defect): the version bump was committed in step 0, but the
+# tag + Release only happened at the very end, AFTER the push and the three R9 gates. Any
+# failure in between left the bump commit in history with NO tag and NO Release — and the next
+# ship read the bumped manifest, computed the NEXT version, and skipped the orphan FOREVER.
+# That is exactly how v2.2.3 (f6c5f10), v2.0.17 and v2.0.13 became versions that exist in
+# plugin.json history and are installable, but have no tag and no GitHub Release.
+# Separately, the release step was gated behind `if command -v gh && gh auth status`, whose
+# else-branch merely WARNed — so a gh-absent/unauthenticated run printed the green
+# "✓ Shipped & verified" banner and EXITED 0 having published nothing.
+#
+# Both are fixed the same way: the things a release REQUIRES are proven up front, and a
+# release-capable run that cannot release is a HARD failure, never a warn-and-exit-0.
+preflight_release_prereqs() {
+  command -v gh >/dev/null 2>&1 \
+    || die "gh CLI not found — a release cannot be published. Install it (brew install gh) or re-run with --no-bump to ship without a release."
+  gh auth status >/dev/null 2>&1 \
+    || die "gh is not authenticated — a release cannot be published. Run 'gh auth login', or re-run with --no-bump to ship without a release."
+  [ -x "$REPO_ROOT/bin/generate-changelog" ] \
+    || die "bin/generate-changelog missing/not executable — release notes cannot be derived."
+  ok "release prereqs: gh present + authenticated, notes generator present"
+}
+
+# reconcile_orphan_release — the recovery path the old flow never had. If the CURRENT manifest
+# version has no tag and no Release, a prior ship died between the bump commit and the tag.
+# Bumping past it would orphan it permanently (the v2.2.3 defect). Refuse, and name the fix.
+reconcile_orphan_release() {
+  local cur_tag="v$1"
+  git rev-parse -q --verify "refs/tags/$cur_tag" >/dev/null 2>&1 && return 0
+  git ls-remote --exit-code --tags origin "refs/tags/$cur_tag" >/dev/null 2>&1 && return 0
+  # No tag anywhere for the version currently in the manifest. Was it ever released?
+  if git log --oneline -1 --grep="chore(release): $cur_tag" >/dev/null 2>&1 \
+     && [ -n "$(git log --oneline --grep="chore(release): $cur_tag" 2>/dev/null)" ]; then
+    die "orphaned release detected: the manifest is at $1 and a 'chore(release): $cur_tag' commit exists, but $cur_tag has NO tag and NO GitHub Release — a prior ship died between the bump and the tag. Bumping past it would strand $1 forever. Finish it first:  release/ship.sh --release-only"
+  fi
+  return 0
+}
+
+# ── --dry-run: prove the release WITHOUT publishing ──────────────────────────
+# Prints the EXACT gh invocation that would run and the EXACT notes body that would be
+# posted, then exits 0 having mutated nothing (no bump, no commit, no tag, no push, no gh
+# write). This is how the release path is proven without ever creating a real Release —
+# test/ship-release.test.sh asserts against this output.
+if [ "$DRY_RUN" -eq 1 ]; then
+  step "Dry run — nothing will be bumped, committed, tagged, pushed, or published"
+  if [ "$RELEASE_ONLY" -eq 1 ]; then
+    DRY_VERSION="$(read_version)"
+  else
+    DRY_VERSION="$(compute_next "$(read_version)" "$BUMP_KIND" "$EXPLICIT_VERSION")"
+  fi
+  DRY_TAG="v$DRY_VERSION"
+  TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/heimdall-dry.XXXXXX")" || die "mktemp failed"
+  trap 'rm -rf "$TMP_DIR" 2>/dev/null || true' EXIT
+  DRY_NOTES="$TMP_DIR/notes.md"
+  build_release_notes "$DRY_TAG" "$DRY_NOTES"
+
+  DRY_PREV="$(prev_release_tag "$DRY_TAG")"
+  printf '  current version : %s\n' "$(read_version)"
+  printf '  release version : %s (tag %s)\n' "$DRY_VERSION" "$DRY_TAG"
+  printf '  notes range     : %s..HEAD\n' "${DRY_PREV:-<first release: full history>}"
+  printf '  gh authed       : %s\n' "$(gh auth status >/dev/null 2>&1 && echo yes || echo 'NO — a real run would HARD-FAIL in preflight')"
+  if gh release view "$DRY_TAG" >/dev/null 2>&1; then
+    printf '  existing release: YES — a real run would UPDATE it (idempotent)\n'
+    DRY_VERB="edit"
+  else
+    printf '  existing release: no — a real run would CREATE it\n'
+    DRY_VERB="create"
+  fi
+
+  step "Exact command that would run"
+  printf '  gh release %s %s --notes-file %s --title %s\n' "$DRY_VERB" "$DRY_TAG" "$DRY_NOTES" "$DRY_TAG"
+  printf '  gh release upload %s install.sh.minisig --clobber\n' "$DRY_TAG"
+
+  step "Exact release notes that would be posted"
+  sed 's/^/  | /' "$DRY_NOTES"
+
+  printf '\n%s%sDry run complete%s — nothing was published. Re-run without --dry-run to release.\n' "$G" "$B" "$R"
+  exit 0
+fi
+
+# ── --release-only: finish an ORPHANED version (the v2.2.3 recovery path) ────
+# Releases the version ALREADY in the manifest: tag it, publish real notes, sign, attach.
+# This is the path that did not exist when v2.2.3/v2.0.17/v2.0.13 were stranded — the only
+# way to recover was to bump past them, which is what made the hole permanent.
+if [ "$RELEASE_ONLY" -eq 1 ]; then
+  step "Release-only — publishing the version already in the manifest"
+  preflight_release_prereqs
+  RO_VERSION="$(read_version)"
+  TAG="v$RO_VERSION"
+  TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/heimdall-ro.XXXXXX")" || die "mktemp failed"
+  trap 'rm -rf "$TMP_DIR" 2>/dev/null || true' EXIT
+
+  if ! git rev-parse -q --verify "refs/tags/$TAG" >/dev/null 2>&1; then
+    git tag "$TAG" || die "git tag $TAG failed"
+    ok "tagged $TAG"
+  else
+    ok "tag $TAG already exists locally"
+  fi
+  git push origin "$TAG" 2>/dev/null || warn "tag $TAG already on origin (or push skipped) — continuing"
+
+  RO_NOTES="$TMP_DIR/notes.md"
+  build_release_notes "$TAG" "$RO_NOTES"
+  publish_release "$TAG" "$RO_NOTES"
+  sign_release_artifact "$TAG"
+  printf '\n%s%s✓ Released %s%s — https://github.com/randomittin/heimdall/releases/tag/%s\n' \
+    "$G" "$B" "$TAG" "$R" "$TAG"
+  exit 0
+fi
+
 # ── 0. Version bump (skipped on --check / --no-bump) ─────────────────────────
 # Runs BEFORE the scan/push so the bump commit ships and is R9-verified. The TAG +
 # GitHub Release come AFTER R9 (only verified-clean history is released). This is
@@ -284,7 +533,11 @@ git fetch origin "$BRANCH" --quiet 2>/dev/null || true
 NEW_VERSION=""; TAG=""
 if [ "$CHECK_ONLY" -eq 0 ] && [ "$DO_BUMP" -eq 1 ]; then
   step "Version bump"
+  # Prove we CAN release before we mutate a single file. A bump we cannot follow through
+  # with is what strands a version (see preflight_release_prereqs above).
+  preflight_release_prereqs
   CUR_VERSION="$(read_version)"
+  reconcile_orphan_release "$CUR_VERSION"
   NEW_VERSION="$(compute_next "$CUR_VERSION" "$BUMP_KIND" "$EXPLICIT_VERSION")"
   TAG="v$NEW_VERSION"
   [ "$NEW_VERSION" = "$CUR_VERSION" ] && die "next version equals current ($CUR_VERSION) — nothing to bump"
@@ -292,16 +545,27 @@ if [ "$CHECK_ONLY" -eq 0 ] && [ "$DO_BUMP" -eq 1 ]; then
      || git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
     die "tag $TAG already exists (local or origin) — refusing to re-release $NEW_VERSION"
   fi
+  # A non-fast-forward push is what killed the v2.2.3 ship: main had diverged from origin,
+  # the push at step 2 was rejected, and the bump commit was already made. Catch the
+  # divergence BEFORE the bump so the operator merges first and no orphan is created.
+  if git rev-parse -q --verify "origin/$BRANCH" >/dev/null 2>&1; then
+    if ! git merge-base --is-ancestor "origin/$BRANCH" HEAD 2>/dev/null; then
+      die "origin/$BRANCH has commits HEAD does not contain — the release push would be REJECTED and the bump commit would be stranded (this is the v2.2.3 defect). Merge/rebase origin/$BRANCH first, then re-run."
+    fi
+  fi
   write_version "$NEW_VERSION"
   git add "$PLUGIN_MANIFEST"
   # Pin install.sh's DEFAULT_REF to THIS tag so a fresh `curl|bash` install and hmd --update's
   # reinstall fallback fetch this release, not a stale default (the historical v2.0.5 downgrade
   # bug). Folded into the release commit so main + the tag always carry a current default.
   bump_default_ref "$TAG"
-  # Single-source the version: mirror it into VERSION and re-sync the README badge so the
-  # release commit carries plugin.json == VERSION == README badge (test/version-unified.test.sh).
-  write_version_file "$NEW_VERSION"
-  bump_readme_badge "$NEW_VERSION"
+  # Single-source the version: RENDER every version surface from the manifest rather than
+  # hand-patching each one. bin/heimdall-render-version owns VERSION + the README generated
+  # region; release/sync-release.sh owns the tag-derived artifacts (the npx wrapper's
+  # version/tag/url/sha256 and the vanity 302 targets). Both are idempotent and both are
+  # gated by test/version-drift.test.sh, so the release commit cannot carry a stale surface.
+  render_version_surfaces "$NEW_VERSION"
+  sync_release_artifacts "$TAG"
   # SHA-pin README's install one-liner to the CURRENT verified HEAD (tags are force-movable; a
   # full commit SHA is immutable). That is the last R9-verified commit — the release commit has
   # no SHA until AFTER this commit is made (chicken-and-egg), and pinning fresh installs to
@@ -388,18 +652,20 @@ if [ -n "$TAG" ]; then
   git tag "$TAG" || die "git tag $TAG failed"
   git push origin "$TAG" || die "pushing tag $TAG failed"
   ok "tagged + pushed $TAG"
-  if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
-    # Real GH Release, never a silent no-op: create w/ auto-generated notes → sign install.sh →
-    # upload install.sh.minisig (die on release-create failure; gh-absent path WARNs loudly below).
-    gh release create "$TAG" --generate-notes --title "$TAG" \
-      || die "gh release create $TAG failed — tag is pushed; run: gh release create $TAG --generate-notes --title $TAG"
-    ok "published GitHub Release $TAG — auto-update's releases/latest now advances"
-    # Sign install.sh + attach install.sh.minisig so clients can VERIFY this release before
-    # applying it. Best-effort: WARNS + releases UNSIGNED if no minisign/key (never blocks RJ).
-    sign_release_artifact "$TAG"
-  else
-    warn "gh CLI absent or unauthenticated — tag $TAG is pushed but the GitHub RELEASE was NOT published."
-    warn "auto-update reads releases/latest, so it will LAG until you run:"
-    warn "  gh release create $TAG --generate-notes --title $TAG"
-  fi
+
+  # gh presence/auth was PROVEN in preflight before anything was mutated, so there is no
+  # warn-and-exit-0 branch here any more: reaching this point and failing to publish is a
+  # hard, non-zero failure. Real notes → create-or-update → sign → attach, each exit-checked.
+  NOTES_FILE="$TMP_DIR/release-notes-$TAG.md"
+  build_release_notes "$TAG" "$NOTES_FILE"
+  ok "built release notes for $TAG ($(wc -l < "$NOTES_FILE" | tr -d ' ') lines, from conventional commits)"
+  publish_release "$TAG" "$NOTES_FILE"
+
+  # Sign install.sh + attach install.sh.minisig so clients can VERIFY this release before
+  # applying it. Key-absent is a documented WARN (RJ holds the key offline); a failure to
+  # attach a sig we DID produce is a hard failure — see sign_release_artifact.
+  sign_release_artifact "$TAG"
+
+  printf '\n%s%s✓ Released %s%s — https://github.com/randomittin/heimdall/releases/tag/%s\n' \
+    "$G" "$B" "$TAG" "$R" "$TAG"
 fi
