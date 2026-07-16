@@ -17,27 +17,38 @@
 #      history): git tag vX.Y.Z, push the tag, publish a Release whose notes are
 #      DERIVED from this repo's conventional commits (bin/generate-changelog), and
 #      attach the minisign signature of install.sh.
+#   6. NPM PUBLISH — publish the npx wrapper (packages/runheimdall) to the registry, so
+#      `npx runheimdall` resolves to the version this ship just cut. Publishing used to live
+#      OUTSIDE this script as a human step, and the human forgot: npm sat at 2.0.5 while the
+#      plugin shipped 2.2.6. Same disease as the orphaned Releases, same cure.
 #
 # Stops at the first failure. Nothing is pushed if the local scan finds leaks.
-# Exit 0 = everything green — INCLUDING that the Release is live on GitHub. A run that
-# cannot publish fails non-zero; it never prints a green banner over an unpublished release.
+# Exit 0 = everything green — INCLUDING that the Release is live on GitHub and the wrapper is
+# live on npm. A run that cannot publish fails non-zero; it never prints a green banner over an
+# unpublished release.
 #
 # Usage:
-#   release/ship.sh            full: patch-bump -> scan -> push -> R9 -> tag+release
+#   release/ship.sh            full: patch-bump -> scan -> push -> R9 -> tag+release -> npm
 #   release/ship.sh --minor    bump the minor version instead of patch
 #   release/ship.sh --major    bump the major version
 #   release/ship.sh --version X.Y.Z   set an explicit version
 #   release/ship.sh --no-bump  ship without bumping (no new version/tag/release)
 #   release/ship.sh --print-next   print the next version per the bump flag, exit (no mutation)
 #   release/ship.sh --check    local scan + pending-commit preview, do NOT push/bump
-#   release/ship.sh --dry-run  print the exact `gh release` command + notes, publish NOTHING
+#   release/ship.sh --dry-run  print the exact `gh release` + `npm publish` commands, publish NOTHING
 #   release/ship.sh --release-only  publish the manifest's current version (orphan recovery)
+#   release/ship.sh --npm-only publish the manifest's current version to npm ONLY (npm drift recovery)
+#   release/ship.sh --no-npm   ship without publishing to npm
 #   release/ship.sh -h         this help
 
 set -euo pipefail
 
 # ── Config (edit if the repo's facts change) ─────────────────────────────────
 BRANCH="main"
+# The npx wrapper published to npm. Its package.json version is NOT a second source of truth:
+# release/sync-release.sh re-points it FROM the plugin manifest on every release sync, and
+# publish_npm refuses to publish if the two ever disagree.
+NPM_PKG_DIR="packages/runheimdall"
 # The author/committer identity allowlist is NOT duplicated here — R9 (b) below
 # delegates to bin/heimdall-check-identities, the single source of truth shared
 # with the native pre-push hook, so the release gate and pre-push gate can never
@@ -58,21 +69,26 @@ usage() {
   cat <<'USAGE'
 ship.sh — bump, scan, push, verify, and release in one step.
 
-  release/ship.sh              patch-bump -> scan -> push -> R9 verify -> tag + GitHub release
+  release/ship.sh              patch-bump -> scan -> push -> R9 verify -> tag + release -> npm
   release/ship.sh --minor      bump minor instead of patch
   release/ship.sh --major      bump major
   release/ship.sh --version X.Y.Z   set an explicit version
   release/ship.sh --no-bump    ship without a version bump (no tag/release)
   release/ship.sh --print-next print the next version (no mutation), exit
   release/ship.sh --check      local secret scan + show pending commits, do NOT push/bump
-  release/ship.sh --dry-run    print the EXACT gh release command + notes, publish NOTHING
+  release/ship.sh --dry-run    print the EXACT gh release + npm publish commands, publish NOTHING
   release/ship.sh --release-only  publish the version already in the manifest (recover a
                                ship that died between the bump commit and the tag)
+  release/ship.sh --npm-only   publish the version already in the manifest to npm ONLY —
+                               no bump, no tag, no push (recover npm drift, e.g. npm stuck
+                               at 2.0.5 while the manifest ships 2.2.6)
+  release/ship.sh --no-npm     ship without publishing to npm
   release/ship.sh -h           this help
 
 Stops at the first failure. Nothing is pushed if the local scan finds leaks.
-A run that CANNOT publish a release fails loudly in preflight — it never bumps,
-warns, and exits 0 (that silent skip is what stranded v2.2.3/v2.0.17/v2.0.13).
+A run that CANNOT publish a release or publish to npm fails loudly in preflight — it
+never bumps, warns, and exits 0 (that silent skip is what stranded v2.2.3/v2.0.17/v2.0.13
+as unreleased tags, and what let npm drift 20 patch versions behind the repo).
 USAGE
 }
 
@@ -356,16 +372,152 @@ bump_readme_sha() {
   ok "SHA-pinned README install URL → ${sha:0:12}…"
 }
 
+# ── npm publication (the npx wrapper) ────────────────────────────────────────
+# ROOT CAUSE (the npm-drift defect): `npm view runheimdall version` said 2.0.5 while the repo
+# shipped 2.2.6 — twenty patch releases of drift — because `npm publish` lived OUTSIDE this
+# script as a human step, and a human step that is not on the critical path is a step that gets
+# forgotten. That is the SAME disease that stranded v2.2.3/v2.0.17/v2.0.13 as orphaned
+# Releases: the version bump was committed in one place and the artifact published (or, in
+# practice, not) somewhere else. It gets the SAME cure as publish_release:
+#   * prove the prerequisites BEFORE any mutation      (preflight_npm_prereqs)
+#   * publish inside the ship stage, never beside it   (publish_npm, called from the flow)
+#   * exit-check every call, reprint the registry's own words, never `|| true`
+#   * be idempotent so a re-run converges               (already-published -> loud skip)
+#   * give the operator a recovery flag for drift that already exists   (--npm-only)
+
+npm_pkg_dir() { printf '%s' "${SHIP_NPM_DIR:-${REPO_ROOT:-$PWD}/$NPM_PKG_DIR}"; }
+
+npm_pkg_field() {  # $1=field — read a top-level string field out of the wrapper's package.json
+  local field="$1" file v
+  file="$(npm_pkg_dir)/package.json"
+  [ -f "$file" ] || die "npm: $file not found — cannot resolve .$field"
+  v="$(jq -r --arg f "$field" '.[$f] // empty' "$file" 2>/dev/null)" \
+    || die "npm: could not parse $file (invalid JSON?)"
+  [ -n "$v" ] || die "npm: $file has no .$field"
+  printf '%s' "$v"
+}
+
+# npm_version_published <pkg> <version> — 0 when that EXACT version is already on the registry.
+# `npm view pkg@ver version` prints the version on a hit and exits non-zero (E404) on a miss:
+# the registry's own answer to "is this published?". --prefer-online defeats npm's local
+# metadata cache, which would otherwise let a stale cache claim a live version is missing.
+npm_version_published() {
+  local pkg="$1" version="$2" out
+  out="$(npm view --prefer-online "${pkg}@${version}" version 2>/dev/null)" || return 1
+  [ "$out" = "$version" ]
+}
+
+# preflight_npm_prereqs — prove we CAN publish to npm BEFORE the bump mutates a single file.
+# Mirrors preflight_release_prereqs, and for the identical reason: a bump we cannot follow
+# through with is what strands a version. Every failure here is a HARD, non-zero die. There is
+# deliberately NO warn-and-continue branch — a warn-and-exit-0 is exactly what let ship.sh
+# print "✓ Shipped & verified" having published nothing. npm's stderr is REPRINTED, never
+# swallowed by 2>/dev/null, so the operator sees what the registry actually said.
+preflight_npm_prereqs() {
+  local dir pkg who out rc
+  command -v npm >/dev/null 2>&1 \
+    || die "npm not found — the npx wrapper cannot be published. Install Node/npm, or re-run with --no-npm to ship without publishing to npm."
+  command -v jq >/dev/null 2>&1 \
+    || die "jq not found — cannot read $NPM_PKG_DIR/package.json. Install it (brew install jq), or re-run with --no-npm."
+  dir="$(npm_pkg_dir)"
+  [ -f "$dir/package.json" ] || die "npm: $dir/package.json not found — there is nothing to publish."
+  pkg="$(npm_pkg_field name)"
+
+  # if-condition capture (set -e safe — see publish_release for why bare `out=$(...)` aborts).
+  if ! who="$(npm whoami 2>&1)"; then
+    rc=$?; printf '%s\n' "$who" >&2
+    die "npm is not authenticated (npm whoami exit $rc) — '$pkg' cannot be published. Run 'npm login', or re-run with --no-npm to ship without publishing to npm."
+  fi
+  ok "npm prereqs: authenticated as $who"
+
+  # Publish RIGHTS on the package. Only checkable when the package already exists — a package
+  # that is not on the registry yet is a first publish, which any authenticated user may do.
+  if npm view --prefer-online "$pkg" version >/dev/null 2>&1; then
+    if ! out="$(npm owner ls "$pkg" 2>&1)"; then
+      rc=$?; printf '%s\n' "$out" >&2
+      die "npm: could not read the owners of '$pkg' (npm owner ls exit $rc) — publish rights cannot be proven. See npm's output above."
+    fi
+    if ! printf '%s\n' "$out" | grep -Fq "$who"; then
+      printf '%s\n' "$out" >&2
+      die "npm: '$who' is NOT an owner of '$pkg' — the publish would be REJECTED *after* the version bump commit was already made. Owners are listed above. Get publish rights, or re-run with --no-npm."
+    fi
+    ok "npm prereqs: '$who' has publish rights on '$pkg'"
+  else
+    warn "npm: '$pkg' is not on the registry yet — this would be its FIRST publish"
+  fi
+}
+
+# npm_positioning_notice — SURFACE this, do not solve it. package.json's .description and
+# .keywords are what npmjs.com renders as the package's page subtitle and its search result;
+# they are still pre-launch text because the canonical §3 positioning line is RJ's call and its
+# spec (heimdall-seo-geo-spec.md) does not exist in this repo. npm versions are IMMUTABLE, so
+# publishing before that decision lands means publishing the wrong words and then burning a
+# whole version number to fix them. Say so loudly at the npm stage; decide it nowhere near here.
+# Tracked in .planning/A3-PENDING-POSITIONING.md.
+npm_positioning_notice() {
+  local pending="${REPO_ROOT:-$PWD}/.planning/A3-PENDING-POSITIONING.md"
+  [ -f "$pending" ] || return 0
+  warn "npm positioning is PENDING RJ's canonical §3 decision:"
+  warn "  .description / .keywords in $NPM_PKG_DIR/package.json are still pre-launch text."
+  warn "  npm versions are IMMUTABLE — publishing now means publishing AGAIN to fix the words."
+  warn "  Decide first (candidates A/B/C): .planning/A3-PENDING-POSITIONING.md"
+}
+
+# publish_npm <version> — publish the npx wrapper at <version> to the registry.
+# IDEMPOTENT by design, exactly like publish_release: a re-run after a partial ship must
+# converge, not error out ambiguously. We ask the registry FIRST rather than letting a
+# duplicate publish fail, because npm's own duplicate error (E403 "cannot publish over
+# previously published version") is indistinguishable at a glance from a real permissions
+# failure — so we say plainly which case this is.
+publish_npm() {
+  local version="$1" dir pkg pkg_version out rc tries
+  dir="$(npm_pkg_dir)"
+  pkg="$(npm_pkg_field name)"
+
+  # The manifest is the SOLE source of version truth; the wrapper's package.json is a rendered
+  # surface that release/sync-release.sh re-points from it. If they disagree, the sync did not
+  # run and publishing would put a mislabelled tarball on an immutable registry.
+  pkg_version="$(npm_pkg_field version)"
+  [ "$pkg_version" = "$version" ] \
+    || die "npm: $NPM_PKG_DIR/package.json is at $pkg_version but this ship is publishing $version — release/sync-release.sh did not re-point the wrapper. Refusing to publish a mismatched version."
+
+  if npm_version_published "$pkg" "$version"; then
+    warn "npm: ${pkg}@${version} is ALREADY published — skipping the publish (idempotent re-run)"
+    ok "npm: ${pkg}@${version} is live on the registry"
+    return 0
+  fi
+
+  npm_positioning_notice
+
+  # if-condition capture (set -e safe — see publish_release for why bare `out=$(...)` aborts).
+  if ! out="$(cd "$dir" && npm publish --access public 2>&1)"; then
+    rc=$?; printf '%s\n' "$out" >&2
+    die "npm publish failed (exit $rc) for ${pkg}@${version} — see npm's output above. The version bump is already committed and the Release is published; recover with:  release/ship.sh --npm-only"
+  fi
+  ok "published ${pkg}@${version} to npm — 'npx runheimdall' now resolves to $version"
+
+  # A publish npm reported OK but the registry did not record is a silent no-op — the exact
+  # class this stage exists to end. Read it back, allowing for registry propagation.
+  tries=0
+  until npm_version_published "$pkg" "$version"; do
+    tries=$((tries+1))
+    [ "$tries" -ge 5 ] \
+      && die "npm post-publish readback failed after $tries attempts: the registry does not report ${pkg}@${version}. Recover with:  release/ship.sh --npm-only"
+    sleep 2
+  done
+  ok "verified ${pkg}@${version} is live on the registry"
+}
+
 # Test/introspection seam: `SHIP_SOURCE_ONLY=1 . release/ship.sh` defines the functions above
-# (read_version, sign_release_artifact, …) WITHOUT running the release flow. Executed normally
-# the variable is unset and we fall through to the real pipeline below.
+# (read_version, sign_release_artifact, publish_npm, …) WITHOUT running the release flow.
+# Executed normally the variable is unset and we fall through to the real pipeline below.
 if [ "${SHIP_SOURCE_ONLY:-0}" = "1" ]; then
   return 0 2>/dev/null || exit 0
 fi
 
 # ── Args (multi-flag: parse every argument, not just $1) ─────────────────────
 CHECK_ONLY=0; BUMP_KIND="patch"; EXPLICIT_VERSION=""; DO_BUMP=1; PRINT_NEXT=0
-DRY_RUN=0; RELEASE_ONLY=0
+DRY_RUN=0; RELEASE_ONLY=0; NPM_ONLY=0; DO_NPM=1
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --check|--check-only) CHECK_ONLY=1 ;;
@@ -375,6 +527,8 @@ while [ "$#" -gt 0 ]; do
     --print-next) PRINT_NEXT=1 ;;
     --dry-run) DRY_RUN=1 ;;
     --release-only) RELEASE_ONLY=1; DO_BUMP=0 ;;
+    --npm-only) NPM_ONLY=1; DO_BUMP=0 ;;
+    --no-npm) DO_NPM=0 ;;
     --version) BUMP_KIND="explicit"; EXPLICIT_VERSION="${2:-}"; shift
                printf '%s' "$EXPLICIT_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' \
                  || die "--version needs X.Y.Z (got '${EXPLICIT_VERSION:-}')" ;;
@@ -456,13 +610,14 @@ reconcile_orphan_release() {
 }
 
 # ── --dry-run: prove the release WITHOUT publishing ──────────────────────────
-# Prints the EXACT gh invocation that would run and the EXACT notes body that would be
-# posted, then exits 0 having mutated nothing (no bump, no commit, no tag, no push, no gh
-# write). This is how the release path is proven without ever creating a real Release —
-# test/ship-release.test.sh asserts against this output.
+# Prints the EXACT gh and npm invocations that would run and the EXACT notes body that would
+# be posted, then exits 0 having mutated nothing (no bump, no commit, no tag, no push, no gh
+# write, no npm publish). This is how both publish paths are proven without ever creating a
+# real Release or putting a real tarball on an immutable registry —
+# test/ship-release.test.sh and test/ship-npm.test.sh assert against this output.
 if [ "$DRY_RUN" -eq 1 ]; then
   step "Dry run — nothing will be bumped, committed, tagged, pushed, or published"
-  if [ "$RELEASE_ONLY" -eq 1 ]; then
+  if [ "$RELEASE_ONLY" -eq 1 ] || [ "$NPM_ONLY" -eq 1 ]; then
     DRY_VERSION="$(read_version)"
   else
     DRY_VERSION="$(compute_next "$(read_version)" "$BUMP_KIND" "$EXPLICIT_VERSION")"
@@ -470,28 +625,75 @@ if [ "$DRY_RUN" -eq 1 ]; then
   DRY_TAG="v$DRY_VERSION"
   TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/heimdall-dry.XXXXXX")" || die "mktemp failed"
   trap 'rm -rf "$TMP_DIR" 2>/dev/null || true' EXIT
-  DRY_NOTES="$TMP_DIR/notes.md"
-  build_release_notes "$DRY_TAG" "$DRY_NOTES"
 
-  DRY_PREV="$(prev_release_tag "$DRY_TAG")"
-  printf '  current version : %s\n' "$(read_version)"
-  printf '  release version : %s (tag %s)\n' "$DRY_VERSION" "$DRY_TAG"
-  printf '  notes range     : %s..HEAD\n' "${DRY_PREV:-<first release: full history>}"
-  printf '  gh authed       : %s\n' "$(gh auth status >/dev/null 2>&1 && echo yes || echo 'NO — a real run would HARD-FAIL in preflight')"
-  if gh release view "$DRY_TAG" >/dev/null 2>&1; then
-    printf '  existing release: YES — a real run would UPDATE it (idempotent)\n'
-    DRY_VERB="edit"
-  else
-    printf '  existing release: no — a real run would CREATE it\n'
-    DRY_VERB="create"
+  if [ "$NPM_ONLY" -eq 0 ]; then
+    DRY_NOTES="$TMP_DIR/notes.md"
+    build_release_notes "$DRY_TAG" "$DRY_NOTES"
+
+    DRY_PREV="$(prev_release_tag "$DRY_TAG")"
+    printf '  current version : %s\n' "$(read_version)"
+    printf '  release version : %s (tag %s)\n' "$DRY_VERSION" "$DRY_TAG"
+    printf '  notes range     : %s..HEAD\n' "${DRY_PREV:-<first release: full history>}"
+    printf '  gh authed       : %s\n' "$(gh auth status >/dev/null 2>&1 && echo yes || echo 'NO — a real run would HARD-FAIL in preflight')"
+    if gh release view "$DRY_TAG" >/dev/null 2>&1; then
+      printf '  existing release: YES — a real run would UPDATE it (idempotent)\n'
+      DRY_VERB="edit"
+    else
+      printf '  existing release: no — a real run would CREATE it\n'
+      DRY_VERB="create"
+    fi
+
+    step "Exact command that would run"
+    printf '  gh release %s %s --notes-file %s --title %s\n' "$DRY_VERB" "$DRY_TAG" "$DRY_NOTES" "$DRY_TAG"
+    printf '  gh release upload %s install.sh.minisig --clobber\n' "$DRY_TAG"
+
+    step "Exact release notes that would be posted"
+    sed 's/^/  | /' "$DRY_NOTES"
   fi
 
-  step "Exact command that would run"
-  printf '  gh release %s %s --notes-file %s --title %s\n' "$DRY_VERB" "$DRY_TAG" "$DRY_NOTES" "$DRY_TAG"
-  printf '  gh release upload %s install.sh.minisig --clobber\n' "$DRY_TAG"
+  # ── npm stage (dry) ────────────────────────────────────────────────────────
+  if [ "$DO_NPM" -eq 1 ]; then
+    step "npm publish (dry)"
+    if ! command -v npm >/dev/null 2>&1; then
+      warn "npm not found — a real run would HARD-FAIL in preflight (or use --no-npm)"
+    elif ! command -v jq >/dev/null 2>&1; then
+      warn "jq not found — a real run would HARD-FAIL in preflight (or use --no-npm)"
+    else
+      DRY_NPM_DIR="$(npm_pkg_dir)"
+      DRY_NPM_PKG="$(npm_pkg_field name)"
+      DRY_NPM_PKGVER="$(npm_pkg_field version)"
+      printf '  package         : %s\n' "$DRY_NPM_PKG"
+      printf '  package dir     : %s\n' "$DRY_NPM_DIR"
+      printf '  publish version : %s\n' "$DRY_VERSION"
+      printf '  package.json ver: %s' "$DRY_NPM_PKGVER"
+      if [ "$DRY_NPM_PKGVER" = "$DRY_VERSION" ]; then
+        printf '  (matches)\n'
+      else
+        printf '  (release/sync-release.sh re-points this to %s during the bump)\n' "$DRY_VERSION"
+      fi
+      printf '  npm authed      : %s\n' "$(npm whoami 2>/dev/null || echo 'NO — a real run would HARD-FAIL in preflight')"
+      printf '  registry now at : %s\n' "$(npm view --prefer-online "$DRY_NPM_PKG" version 2>/dev/null || echo '<unreachable or unpublished>')"
+      if npm_version_published "$DRY_NPM_PKG" "$DRY_VERSION"; then
+        printf '  already on npm  : YES — a real run would SKIP the publish (idempotent)\n'
+      else
+        printf '  already on npm  : no — a real run would PUBLISH it\n'
+      fi
 
-  step "Exact release notes that would be posted"
-  sed 's/^/  | /' "$DRY_NOTES"
+      printf '  files allowlist :\n'
+      jq -r '.files[]? // empty' "$DRY_NPM_DIR/package.json" | while IFS= read -r f; do
+        if [ -e "$DRY_NPM_DIR/$f" ]; then
+          printf '    - %s (present)\n' "$f"
+        else
+          printf '    - %s (MISSING — the tarball would not carry it)\n' "$f"
+        fi
+      done
+
+      step "Exact npm command that would run"
+      printf '  cd %s && npm publish --access public\n' "$DRY_NPM_DIR"
+
+      npm_positioning_notice
+    fi
+  fi
 
   printf '\n%s%sDry run complete%s — nothing was published. Re-run without --dry-run to release.\n' "$G" "$B" "$R"
   exit 0
@@ -526,6 +728,22 @@ if [ "$RELEASE_ONLY" -eq 1 ]; then
   exit 0
 fi
 
+# ── --npm-only: reconcile npm to the manifest's CURRENT version (npm-drift recovery) ──
+# The npm analogue of --release-only, with the same semantics: publish the version ALREADY in
+# the manifest, cut NO new version, tag nothing, push nothing, touch no file. This is the path
+# that did not exist while `npm view runheimdall version` reported 2.0.5 and the repo shipped
+# 2.2.6 — the only way to "fix" npm was to cut a fresh release, which is precisely what let the
+# gap grow to twenty patch versions instead of closing it.
+if [ "$NPM_ONLY" -eq 1 ]; then
+  step "npm-only — publishing the version already in the manifest to npm"
+  preflight_npm_prereqs
+  NPM_ONLY_VERSION="$(read_version)"
+  publish_npm "$NPM_ONLY_VERSION"
+  printf '\n%s%s✓ npm reconciled to %s%s — https://www.npmjs.com/package/%s\n' \
+    "$G" "$B" "$NPM_ONLY_VERSION" "$R" "$(npm_pkg_field name)"
+  exit 0
+fi
+
 # ── 0. Version bump (skipped on --check / --no-bump) ─────────────────────────
 # Runs BEFORE the scan/push so the bump commit ships and is R9-verified. The TAG +
 # GitHub Release come AFTER R9 (only verified-clean history is released). This is
@@ -534,8 +752,15 @@ NEW_VERSION=""; TAG=""
 if [ "$CHECK_ONLY" -eq 0 ] && [ "$DO_BUMP" -eq 1 ]; then
   step "Version bump"
   # Prove we CAN release before we mutate a single file. A bump we cannot follow through
-  # with is what strands a version (see preflight_release_prereqs above).
+  # with is what strands a version (see preflight_release_prereqs above). npm is proven here
+  # for the same reason and at the same moment: an unauthenticated npm discovered at the END
+  # of a ship leaves a bumped, tagged, released version that `npx runheimdall` cannot install.
   preflight_release_prereqs
+  if [ "$DO_NPM" -eq 1 ]; then
+    preflight_npm_prereqs
+  else
+    warn "--no-npm: this ship will NOT publish the npx wrapper to npm"
+  fi
   CUR_VERSION="$(read_version)"
   reconcile_orphan_release "$CUR_VERSION"
   NEW_VERSION="$(compute_next "$CUR_VERSION" "$BUMP_KIND" "$EXPLICIT_VERSION")"
@@ -668,4 +893,21 @@ if [ -n "$TAG" ]; then
 
   printf '\n%s%s✓ Released %s%s — https://github.com/randomittin/heimdall/releases/tag/%s\n' \
     "$G" "$B" "$TAG" "$R" "$TAG"
+
+  # ── 6. npm publish (the npx wrapper) ───────────────────────────────────────
+  # ORDERING — this is LAST, after the tag is pushed and the Release is live, on purpose. The
+  # wrapper's package.json bakes in installScriptUrl = raw.../<TAG>/install.sh and that tag's
+  # sha256; publishing to npm BEFORE the tag exists on origin would put a package on the
+  # registry whose install URL 404s. npm publishes are effectively IRREVERSIBLE (unpublish is
+  # blocked after 72h and a version number can never be reused), whereas a missing Release can
+  # be published after the fact with --release-only. So the recoverable step goes first and the
+  # unrecoverable one goes last. npm's presence, auth, and publish rights were already PROVEN
+  # in preflight before anything was mutated, so reaching this point and failing to publish is
+  # a hard, non-zero failure with a named recovery path — never a warn-and-exit-0.
+  if [ "$DO_NPM" -eq 1 ]; then
+    step "npm publish ($(npm_pkg_field name)@$NEW_VERSION)"
+    publish_npm "$NEW_VERSION"
+    printf '\n%s%s✓ Published %s@%s%s — https://www.npmjs.com/package/%s\n' \
+      "$G" "$B" "$(npm_pkg_field name)" "$NEW_VERSION" "$R" "$(npm_pkg_field name)"
+  fi
 fi
