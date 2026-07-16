@@ -1,16 +1,20 @@
 #!/usr/bin/env bash
 #
-# sync-release.sh — sync the three Heimdall release artifacts to one tag.
+# sync-release.sh — sync the Heimdall release artifacts to one tag.
 #
 #   release/sync-release.sh <TAG> [--dry]
 #
-# One tag in, three artifacts re-pointed so they resolve to byte-identical
-# install.sh bytes:
+# One tag in, four artifacts re-pointed/re-rendered so they resolve to
+# byte-identical install.sh bytes (and a byte-identical README):
 #
 #   1. Redirect:  vercel.json + _redirects  -> raw .../<TAG>/install.sh  (302)
 #   2. npx wrap:  packages/runheimdall/package.json  ->  version, pinned URL,
 #                 tag, and the sha256 of THIS tag's install.sh
 #   3. Docs/ref:  README.md raw-URL tags + install.sh DEFAULT_REF
+#   4. npm docs:  packages/runheimdall/README.md  <-  root README.md
+#                 (byte-identical copy, taken AFTER step 3's URL templating,
+#                 so npmjs.com never serves a stale README — see
+#                 test/npm-readme-drift.test.sh)
 #
 # install-ux v2 guarantee: the redirect and the npx wrapper MUST resolve to
 # byte-identical scripts. This script ASSERTS that itself — it computes the
@@ -35,6 +39,7 @@ REDIRECTS="$ROOT/_redirects"
 README="$ROOT/README.md"
 INSTALL="$ROOT/install.sh"
 PKG="$ROOT/packages/runheimdall/package.json"
+PKG_README="$ROOT/packages/runheimdall/README.md"
 MANIFEST="$ROOT/.claude-plugin/plugin.json"
 
 REPO_PATH="randomittin/heimdall"
@@ -151,7 +156,15 @@ T="$(mktemp)"
 sed -E "s|(${RAW_BASE//\//\\/}/)v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?(/install\.sh)|\1${TAG}\3|g" "$README" > "$T"
 write_file "$README" "$T"
 
-# 5. npx wrapper package.json: version, tag, url, sha256
+# 5. npm README mirror — byte-identical copy of the just-templated root README, so
+# `npm view runheimdall readme` / npmjs.com/package/runheimdall never serves a stale
+# doc. This is a copy, not a hand-maintained second file: test/npm-readme-drift.test.sh
+# gates that the two never diverge outside this render step.
+T="$(mktemp)"
+cp "$README" "$T"
+write_file "$PKG_README" "$T"
+
+# 6. npx wrapper package.json: version, tag, url, sha256
 T="$(mktemp)"
 jq --arg v "$VERSION" --arg tag "$TAG" --arg url "$INSTALL_URL" --arg sha "$NEW_SHA" \
    '.version = $v
@@ -161,7 +174,7 @@ jq --arg v "$VERSION" --arg tag "$TAG" --arg url "$INSTALL_URL" --arg sha "$NEW_
    "$PKG" > "$T"
 write_file "$PKG" "$T"
 
-# 6. plugin manifest .version — bump to the release version so the manifest stays
+# 7. plugin manifest .version — bump to the release version so the manifest stays
 # consistent with the tag. The launcher's heimdall_version() resolves the tag
 # FIRST and only falls back to this field when git is unavailable, so this is a
 # fallback value, not the source of truth — but a stale fallback is a latent lie
