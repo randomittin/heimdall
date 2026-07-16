@@ -23,8 +23,13 @@ safe to publish, and I flagged them rather than quietly working around them:
    branch `truth-pass`), and a telemetry surface (`hmd telemetry`, `bin/heimdall-telemetry-corpus`,
    the "Pre-Merge Corpus" T0 tier, **on by default**). `IDENTITY.md` is stale relative to the
    current code and should not be quoted verbatim in public copy.
-2. **`README.md:45`** (current `main`) still reads *"No sudo. No telemetry."* — also a bare,
-   unscoped claim that the code no longer supports as written. The site (`heimdall-site`,
+2. **`README.md`** *(FIXED — no longer applies)*. This finding was written against the
+   pre-merge tree, where README read *"No sudo. No telemetry."* — a bare, unscoped claim the
+   code did not support as written. That line was **removed** when the install one-liner was
+   SHA-pinned to `v2.2.6` (merged in `a4-security`); README now reads *"No sudo. Idempotent."*
+   and carries no bare telemetry claim. **`IDENTITY.md:31` is the only surface still carrying
+   it**, and it awaits RJ's decision because it is constitution-level text. The site
+   (`heimdall-site`,
    commit `7618ec7`) already fixed this exact problem for `runheimdall.dev` by replacing the
    bare claim with four **scoped** claims (gates run locally / presence is opt-out-able and
    documented / telemetry is specified+killable / auto-update is checked+disableable), each
