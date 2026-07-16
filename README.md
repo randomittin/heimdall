@@ -87,6 +87,8 @@ for machines with no `minisign` binary, and the fail-closed behavior of the auto
 
 **Prerequisites:** Claude Code 1.0+ · Git · `jq` (`brew install jq`)
 
+**Also on npm:** [`npx runheimdall`](https://www.npmjs.com/package/runheimdall) — same pinned tag, same sha256 check, zero clone required.
+
 ---
 
 ## First run
