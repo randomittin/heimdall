@@ -39,22 +39,49 @@ The bot is powered by Heimdall's local engine: a Claude Code plugin that turns o
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/randomittin/heimdall/9b8a01da690fc64ecb059268866c3fec3d534018/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/randomittin/heimdall/v2.2.6/install.sh -o heimdall-install.sh \
+  && echo "fafe31e30b481882a43ab93aaab742b1e90b0d4bde31498aa8f58f3f23585b33  heimdall-install.sh" | shasum -a 256 -c - \
+  && bash heimdall-install.sh
 ```
 
-No sudo. No telemetry. Idempotent — re-run to upgrade. Reversible:
+Pinned to the `v2.2.6` tag **and** checked against the sha256 of that tag's `install.sh`. The `&&`
+chain is load-bearing: if the bytes do not match the digest, `shasum -c` prints `FAILED` and
+**nothing runs** — so a tag moved under you, a CDN cache poisoning, or a truncated download stops
+the install instead of executing. On a Linux box without `shasum`, `sha256sum -c -` takes the same
+digest. Re-derive it yourself any time:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/randomittin/heimdall/v2.2.6/install.sh | shasum -a 256
+# fafe31e30b481882a43ab93aaab742b1e90b0d4bde31498aa8f58f3f23585b33
+```
+
+No sudo. Idempotent — re-run to upgrade. Reversible:
 
 ```bash
 hmd uninstall    # removes everything; nothing else was touched
 ```
 
-**Prefer to inspect first?**
+**Prefer to inspect first?** Same download, same check — just read it before you run it:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/randomittin/heimdall/9b8a01da690fc64ecb059268866c3fec3d534018/install.sh -o install.sh
-less install.sh  # function-wrapped, no eval, no base64 — what you read is what runs
-bash install.sh
+curl -fsSL https://raw.githubusercontent.com/randomittin/heimdall/v2.2.6/install.sh -o heimdall-install.sh
+echo "fafe31e30b481882a43ab93aaab742b1e90b0d4bde31498aa8f58f3f23585b33  heimdall-install.sh" | shasum -a 256 -c -
+less heimdall-install.sh  # function-wrapped, no eval, no base64 — what you read is what runs
+bash heimdall-install.sh
 ```
+
+**Signature (stronger than the digest).** A digest you copy from this README only proves the bytes
+match what this README says; a signature proves they came from the maintainer's key. Every release
+signs `install.sh` with minisign and publishes `install.sh.minisig` as a release asset:
+
+```bash
+curl -fsSL -O https://github.com/randomittin/heimdall/releases/download/v2.2.6/install.sh.minisig
+minisign -Vp release/heimdall-signing.pub -m heimdall-install.sh -x install.sh.minisig
+```
+
+The public key ships in this repo at `release/heimdall-signing.pub`, so that command assumes a
+clone. [`SIGNING.md`](SIGNING.md) has the full model — including the bundled pure-python verifier
+for machines with no `minisign` binary, and the fail-closed behavior of the auto-updater.
 
 **Prerequisites:** Claude Code 1.0+ · Git · `jq` (`brew install jq`)
 
