@@ -94,7 +94,19 @@ deploy/cloud-run/deploy-public-rr.sh \
   --gh-app-key-file ~/.heimdall/heimdall-maintainer.pem \
   --project heimdall-cp-prod \
   --region  us-central1 \
-  --endpoint https://<your-public-service-url>      # optional; used only in the onboarding print
+  --endpoint https://<your-public-service-url>      # optional — omit on a first deploy; see below
+```
+
+`<your-public-service-url>` is **your own** Cloud Run URL for `heimdall-cp-public` — there is no
+default and no shared value to copy. On a **first** deploy the service does not exist yet, so the
+URL does not either: **omit `--endpoint` entirely.** The flag feeds only the onboarding print (the
+`rr setup` line handed to devs); leaving it out changes nothing that gets deployed. After the
+service is up, read the real URL back and re-run with it if you want the print to be copy-pasteable:
+
+```bash
+gcloud run services describe heimdall-cp-public --region=us-central1 \
+  --project=heimdall-cp-prod --format='value(status.url)'
+# → https://heimdall-cp-public-<hash>-uc.a.run.app   ← that is your --endpoint
 ```
 
 The sequence (each step guarded + idempotent — safe to re-run):

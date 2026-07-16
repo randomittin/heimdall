@@ -22,12 +22,44 @@ What to expect:
 
 - **Acknowledgement target: within 72 hours.** We confirm receipt and let you
   know whether we can reproduce it.
+- **Triage target: within 7 days** of acknowledgement — we tell you the severity
+  we assigned, whether we accept the report, and our intended fix window.
 - We work a fix and a coordinated disclosure timeline with you. We credit
   reporters who want credit; we honor requests to stay anonymous.
 - **No bug bounty.** Heimdall is an MIT-licensed open-source project with no
   paid disclosure program. We are grateful for responsible reports regardless.
 
-Please give us a reasonable window to ship a fix before any public disclosure.
+These are targets from a single maintainer, not a staffed rotation or a
+contractual SLA. If you have not heard back within the acknowledgement window,
+please assume the mail went astray and ping again rather than assume silence.
+
+## Disclosure policy
+
+We practice coordinated disclosure:
+
+- **90 days** from acknowledgement is the default window to ship a fix before
+  the report is made public. If we need longer, we tell you why and agree a new
+  date with you rather than let it lapse silently.
+- **A fix ships first, then the advisory.** We publish a GitHub Security
+  Advisory once a fixed release is available, crediting you unless you asked to
+  stay anonymous.
+- **Actively-exploited issues move faster** — we fix and disclose as quickly as
+  we can, and will not sit on a live exploit for 90 days.
+- If you plan to disclose publicly on your own timeline, please tell us the
+  date; we would rather ship a fix before it lands than be surprised by it.
+
+## Supported versions
+
+| Version | Supported |
+|---|---|
+| The latest released version (see [Releases](https://github.com/randomittin/heimdall/releases)) | Yes — security fixes land here |
+| Any earlier release | No |
+
+Heimdall ships from a single `main` line with no separately maintained release
+branches, so a security fix is delivered as a **new release**, not a backport.
+`hmd` is idempotent — re-running the installer upgrades in place. If you are
+pinned to an older tag, the remedy for a security issue is to move to the latest
+release.
 
 ## Safe harbor for good-faith research
 
@@ -49,8 +81,8 @@ whether an action is authorized, ask us first at `security@runheimdall.dev`.
 | The latest released version on the default branch.              | Automated scanner output with no demonstrated impact, and best-practice suggestions that are not an exploitable weakness. |
 | Bypasses of a quality or safety gate that let unproven code through; tenant-isolation breaks in the control plane; supply-chain integrity of the install path. |                                                           |
 
-Only the latest released version receives security fixes. There are no separately
-maintained release branches.
+For which releases receive fixes, see [Supported versions](#supported-versions)
+above.
 
 ## Secret hygiene
 
@@ -81,3 +113,26 @@ it points that policy at itself first.
 If you find a credential that did make it into the tree, please report it through
 the private channel above rather than opening a public issue, so it can be
 rotated before attention is drawn to it.
+
+The same scan runs in CI as a bypass-proof backstop:
+[`.github/workflows/public-repo-no-secrets.yml`](.github/workflows/public-repo-no-secrets.yml)
+runs a sha256-pinned `gitleaks` over the full history on every push and pull
+request, so a credential cannot land in the public repo even if a local gate was
+skipped.
+
+## Release integrity and verification
+
+The install path is part of the attack surface, so it is signed and verifiable —
+do not take our word that a downloaded `install.sh` is authentic, check it:
+
+- **Every release signs `install.sh`** with [minisign](https://jedisct1.github.io/minisign/)
+  (Ed25519) and publishes `install.sh.minisig` as a release asset. The public
+  key ships in the repo at `release/heimdall-signing.pub`.
+- **The one-liner in [`README.md`](README.md) is tag-pinned and sha256-checked** —
+  it refuses to execute if the downloaded bytes do not match the digest.
+- **The auto-updater is fail-closed:** with no signing public key present it
+  refuses to apply a release rather than trusting it.
+
+Full model — the verifier refusal codes, the bundled pure-python verifier for
+machines without the `minisign` binary, and the signing workflow — is in
+[`SIGNING.md`](SIGNING.md).
