@@ -95,3 +95,33 @@ Pick a positioning letter (A/B/C) and confirm/edit the keywords list, then eithe
 Either way, re-run `bash test/version-drift.test.sh` afterward (it does not check these two
 fields, but confirms the edit didn't accidentally touch the version-bearing fields on the same
 file) and `jq . packages/runheimdall/package.json` to confirm the JSON stays valid.
+
+## Ordering caveat — decide this BEFORE the next npm publish
+
+`release/ship.sh` now publishes `packages/runheimdall` to npm as a stage of the ship (branch
+`a3-npm-ship`), because publishing used to be a human step outside the script and the human
+forgot: `npm view runheimdall version` reported **2.0.5** while the repo shipped **2.2.6**.
+
+That makes this pending decision time-sensitive, and the ordering is the whole point:
+
+- **`.description` and `.keywords` are what npmjs.com renders** as the package page's subtitle
+  and its `npm search` result. They are the first words anyone reads about Heimdall on npm.
+- **npm versions are immutable.** `npm unpublish` is blocked after 72 hours and a version
+  number can never be reused. There is no "edit the description later" — the published tarball
+  carries the metadata it was published with.
+- Therefore **publishing before this decision lands means publishing twice**: once with the
+  pre-launch text, and again (burning a whole version number) to correct the words.
+
+`release/ship.sh` states this at the npm stage rather than deciding it — `npm_positioning_notice()`
+prints a loud warning naming this file on every `npm publish` path (`--dry-run`, `--npm-only`,
+and a full ship). It is a **notice, not a block**: it does not gate the publish, because whether
+the words are final is RJ's call, not a script's. Confirm it by running:
+
+```bash
+release/ship.sh --npm-only --dry-run     # publishes nothing; prints the notice + the exact command
+```
+
+**Recommended order:** pick the letter → apply `.description`/`.keywords` → commit → then run
+the npm reconcile (`release/ship.sh --npm-only`) so npm's very first correct-version publish
+also carries the correct words. If the reconcile has to happen first for other reasons, that is
+a deliberate choice to publish the positioning text twice — make it knowingly.
