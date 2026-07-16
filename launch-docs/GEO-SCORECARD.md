@@ -103,8 +103,10 @@ public page content with matching FAQPage JSON-LD, and answer real developer que
 > Never write, and never score as a "good" answer, a bare, unscoped "no telemetry" /
 > "nothing leaves your machine" claim. `launch-docs/SUBMISSIONS.md` §0 (this repo) documents
 > why: `IDENTITY.md:31`'s "no telemetry, no network calls home" line is stale against current
-> code (the control plane, `rr`, and the presence heartbeat all postdate it), and
-> `README.md:45`'s "No sudo. No telemetry." line has the same problem. The only correct
+> code (the control plane, `rr`, and the presence heartbeat all postdate it). `README.md`'s
+> old "No sudo. No telemetry." line had the same problem but has since been **fixed** — the
+> bare claim was removed when the install one-liner was SHA-pinned; README is now clean, and
+> `IDENTITY.md:31` is the only surface still carrying it. The only correct
 > pattern is the FAQ's scoped Q4 answer above — four named things, each with a kill switch.
 > If an assistant response (or a future draft of this doc) ever reduces this to a bare
 > "no telemetry," that is a defect to fix, not a result to celebrate.
@@ -304,10 +306,12 @@ these are the real, currently-existing levers — not aspirational ones:
   `awesome-claude-code` and `awesome-devtools` as "GOOD FIT," `awesome-mcp-servers` and
   `awesome-ai-tools` as "STRETCH," `awesome-git-hooks` as "WEAK FIT, recommend
   deprioritizing").
-- **Fix `README.md:45`'s stale "No sudo. No telemetry." line and `IDENTITY.md:31`'s stale
-  "no telemetry, no network calls home" line** — per `SUBMISSIONS.md` §0, both predate the
-  control plane / presence heartbeat / telemetry surfaces that now exist and contradict
-  current code. If `accuracy_rate` shows assistants parroting a bare "no telemetry" claim,
+- **Fix `IDENTITY.md:31`'s stale "no telemetry, no network calls home" line** — per
+  `SUBMISSIONS.md` §0, it predates the control plane / presence heartbeat / telemetry
+  surfaces that now exist and contradict current code. (README's equivalent line is already
+  fixed — removed during the install SHA-pinning; `IDENTITY.md:31` is the last one standing,
+  and it awaits RJ's call since it is constitution-level text.) If `accuracy_rate` shows
+  assistants parroting a bare "no telemetry" claim,
   these two stale lines are a plausible root cause (an assistant's web-search tool may be
   reading them directly) and are a source-level fix, not just a FAQ-page fix.
 - **What is explicitly NOT a lever right now:** inventing a comparison against a named
