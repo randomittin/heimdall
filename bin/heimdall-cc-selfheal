@@ -14,10 +14,28 @@
 # durable repair is removing the npm conflict + the config flag — after that Claude
 # Code's OWN updater works again; our `claude update` is a best-effort re-stage/verify.
 #
+# DETECTION IS READ-ONLY — AND WHY THAT MATTERS. This tool used to PROBE health by
+# running `claude update` and treating a non-zero exit as "unhealthy". That probe is a
+# mutating INSTALL, not a query: it made hmd spawn an updater that competes with the
+# auto-update poll every live session already runs (~30 min) for Claude's per-version
+# install lock. A losing racer throws, and Claude renders exactly the banner this tool
+# exists to remove: "✘ Auto-update failed · Run claude doctor". On a machine with no npm
+# conflict the probe was also pointless — repair() had nothing to fix and just re-ran
+# `claude update` ("self-heal: nothing to repair" in the log, twice a window).
+# Health is now read from Claude's OWN recorded outcome, ~/.claude/.last-update-result.json
+# ({outcome,status,version_from,version_to,error_code}), which is authoritative and free.
+# `claude update` is now issued ONLY after we actually repaired something — never as a probe.
+#
 # SUBCOMMANDS (the SessionStart hook depends on `check` — keep the interface stable):
 #   heimdall-cc-selfheal check    throttled, background, safe. Detect → repair → log.
 #                                 ALWAYS exit 0 fast; the repair runs DETACHED.
 #   heimdall-cc-selfheal status   read-only: print healthy/unhealthy + what it would do.
+#   heimdall-cc-selfheal pin-notice
+#                                 read-only, fast, ONE line: warn when THIS session is
+#                                 pinned to an older binary than the newest installed.
+#                                 A running process cannot be hot-swapped onto a new
+#                                 binary, so the only honest remedy is "restart" — we say
+#                                 so once at SessionStart rather than nagging every render.
 #   heimdall-cc-selfheal --force  ignore the throttle; run now.
 #
 # SAFETY CONTRACT.
@@ -35,6 +53,11 @@
 #   HEIMDALL_HOME                   state home (stamp + log + opt-out). Default ~/.heimdall.
 #   HEIMDALL_CLAUDE_CONFIG          path to claude.json (default ~/.claude.json). TEST seam.
 #   HEIMDALL_SELFHEAL_DRYRUN=1      TEST seam: detect + log "would-repair", apply NOTHING.
+#   HEIMDALL_CC_UPDATE_RESULT       path to Claude's own last-update-result.json
+#                                   (default ~/.claude/.last-update-result.json). TEST seam.
+#   HEIMDALL_CC_VERSIONS            claude versions dir. TEST seam.
+#   HEIMDALL_CC_PIN_PID             pid to resolve the running version from. TEST seam.
+#   HEIMDALL_CC_LSOF                `lsof -p <pid>`-style stub. TEST seam.
 
 set -uo pipefail
 
@@ -45,6 +68,8 @@ LOG_FILE="$HMD_HOME/cc-selfheal.log"
 CLAUDE_JSON="${HEIMDALL_CLAUDE_CONFIG:-$HOME/.claude.json}"
 INTERVAL="${HEIMDALL_SELFHEAL_INTERVAL:-86400}"
 NPM_CONFLICT="@anthropic-ai/claude-code"
+UPDATE_RESULT="${HEIMDALL_CC_UPDATE_RESULT:-$HOME/.claude/.last-update-result.json}"
+CC_VERSIONS="${HEIMDALL_CC_VERSIONS:-$HOME/.local/share/claude/versions}"
 
 log() {  # one-line, secret-free, best-effort
   mkdir -p "$HMD_HOME" 2>/dev/null || return 0
@@ -89,11 +114,30 @@ try: sys.exit(0 if json.load(open(sys.argv[1])).get('autoUpdates') is False else
 except Exception: sys.exit(1)" "$CLAUDE_JSON" 2>/dev/null
 }
 
-# does the native updater itself fail? (cheap-ish; only called inside the throttled,
-# detached repair path — `claude update` is non-interactive and exits 0 when healthy)
+# Did the native updater's LAST REAL attempt fail? READ-ONLY: Claude records every
+# attempt's outcome itself, so we read that instead of provoking a fresh install.
+# Absent/unreadable/unparseable file -> NOT failing (we never invent a fault).
 updater_failing() {
-  command -v claude >/dev/null 2>&1 || return 1
-  ! claude update >/dev/null 2>&1
+  [ -r "$UPDATE_RESULT" ] && command -v python3 >/dev/null 2>&1 || return 1
+  python3 -c "import json,sys
+try: d=json.load(open(sys.argv[1]))
+except Exception: sys.exit(1)
+if not isinstance(d,dict): sys.exit(1)
+sys.exit(0 if (d.get('outcome')=='failed' or (d.get('status') or '').endswith('_failed')) else 1)" \
+    "$UPDATE_RESULT" 2>/dev/null
+}
+
+# one-line human summary of that recorded outcome (read-only; never a secret).
+update_result_detail() {
+  [ -r "$UPDATE_RESULT" ] && command -v python3 >/dev/null 2>&1 || return 1
+  python3 -c "import json,sys
+try: d=json.load(open(sys.argv[1]))
+except Exception: sys.exit(1)
+if not isinstance(d,dict): sys.exit(1)
+print('%s (%s->%s%s)' % (d.get('status') or d.get('outcome') or '?',
+      d.get('version_from') or '?', d.get('version_to') or '?',
+      ', error_code=%s' % d['error_code'] if d.get('error_code') else ''))" \
+    "$UPDATE_RESULT" 2>/dev/null
 }
 
 # unhealthy iff (on a native install) the npm conflict exists OR the updater fails.
@@ -144,11 +188,14 @@ repair() {
   if autoupdates_false; then
     set_autoupdates_true && { log "repaired: set autoUpdates=true in claude.json"; did=1; } || log "WARN: could not set autoUpdates"
   fi
-  # best-effort re-stage/verify (native updater stages NEXT launch; never hot-swaps)
-  if command -v claude >/dev/null 2>&1; then
-    if claude update >/dev/null 2>&1; then log "verified: claude update -> ok"; else log "NOTE: claude update still non-zero after repair (will retry next window)"; fi
+  # Re-stage ONLY if we genuinely repaired something. Issuing `claude update` when there
+  # was nothing to fix is not a no-op: it races the auto-update poll of every live
+  # session for the install lock and can itself CAUSE the "Auto-update failed" banner.
+  # With the conflict gone, Claude's own updater is the one that should drive the install.
+  if [ "$did" = 1 ] && command -v claude >/dev/null 2>&1; then
+    if claude update >/dev/null 2>&1; then log "verified: claude update -> ok"; else log "NOTE: claude update non-zero after repair (Claude's own updater will retry)"; fi
   fi
-  [ "$did" = 1 ] && log "self-heal complete" || log "self-heal: nothing to repair"
+  [ "$did" = 1 ] && log "self-heal complete" || log "self-heal: nothing to repair (no mutation attempted)"
 }
 
 throttled() {  # true if checked within the window (skip)
@@ -160,11 +207,60 @@ throttled() {  # true if checked within the window (skip)
 
 cmd_status() {  # read-only
   if ! is_native; then echo "cc-selfheal: not a native Claude Code install — skipped"; return 0; fi
-  local issues=""
+  local issues="" detail
   npm_conflict_present && issues="${issues} npm-conflict($NPM_CONFLICT)"
-  command -v claude >/dev/null 2>&1 && updater_failing && issues="${issues} updater-failing"
+  if updater_failing; then
+    detail="$(update_result_detail 2>/dev/null || true)"
+    issues="${issues} last-update-failed${detail:+[$detail]}"
+  fi
   autoupdates_false && issues="${issues} autoUpdates:false"
   if [ -n "$issues" ]; then echo "cc-selfheal: UNHEALTHY —$issues (would repair)"; else echo "cc-selfheal: healthy"; fi
+  cmd_pin_notice || true
+}
+
+# ── the pin notice ───────────────────────────────────────────────────────────────
+# A live process executes its binary for its whole life; hmd can NEVER hot-swap it onto
+# a newer one, and killing a session to force adoption is off the table. So the honest
+# fix is to TELL the user, once, at SessionStart. Resolution is by lsof, because argv is
+# not sufficient: a pinned session's argv is just "claude" with no version in it.
+_lsof_p() {
+  if [ -n "${HEIMDALL_CC_LSOF:-}" ]; then "$HEIMDALL_CC_LSOF" "$1" 2>/dev/null; return 0; fi
+  lsof -p "$1" 2>/dev/null || true
+}
+
+# nearest ancestor pid whose command is claude (the session hosting this hook).
+_claude_ancestor() {
+  if [ -n "${HEIMDALL_CC_PIN_PID:-}" ]; then printf '%s\n' "$HEIMDALL_CC_PIN_PID"; return 0; fi
+  local pid="$PPID" n=0 comm
+  while [ -n "$pid" ] && [ "$pid" != 0 ] && [ "$pid" != 1 ] && [ "$n" -lt 12 ]; do
+    comm="$(ps -o comm= -p "$pid" 2>/dev/null || true)"
+    case "${comm##*/}" in claude) printf '%s\n' "$pid"; return 0 ;; esac
+    pid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ' || true)"
+    n=$((n + 1))
+  done
+  return 1
+}
+
+# the versions/<v> binary a pid actually has open.
+_running_version() {
+  _lsof_p "$1" | tr ' ' '\n' | grep -F "$CC_VERSIONS/" | head -1 | sed "s|^.*$CC_VERSIONS/||;s|/.*$||"
+}
+
+_newest_installed() { ls "$CC_VERSIONS" 2>/dev/null | sort -V | tail -1; }
+
+cmd_pin_notice() {
+  opted_out && return 0
+  is_native || return 0
+  [ -d "$CC_VERSIONS" ] || return 0
+  local pid running newest
+  pid="$(_claude_ancestor || true)";        [ -n "$pid" ] || return 0
+  running="$(_running_version "$pid" || true)"; [ -n "$running" ] || return 0
+  newest="$(_newest_installed || true)";    [ -n "$newest" ] || return 0
+  [ "$running" = "$newest" ] && return 0
+  # only ever report BEHIND — a session ahead of the newest on-disk build is not a fault.
+  [ "$(printf '%s\n%s\n' "$running" "$newest" | sort -V | head -1)" = "$running" ] || return 0
+  printf '[heimdall] claude %s is pinned by this session; %s is installed — restart to adopt it (auto-update cannot swap a running binary).\n' \
+    "$running" "$newest"
 }
 
 cmd_check() {  # throttled + DETACHED; never blocks the session
@@ -183,6 +279,7 @@ case "${1:-check}" in
   check)        shift 2>/dev/null || true; cmd_check "${1:-}" ;;
   --force)      cmd_check --force ;;
   status)       cmd_status ;;
-  -h|--help)    sed -n '2,42p' "$0" | sed 's/^# \{0,1\}//' ;;
-  *)            echo "heimdall-cc-selfheal: unknown arg '${1}' (check|status|--force)" >&2; exit 2 ;;
+  pin-notice)   cmd_pin_notice ;;
+  -h|--help)    sed -n '2,60p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *)            echo "heimdall-cc-selfheal: unknown arg '${1}' (check|status|pin-notice|--force)" >&2; exit 2 ;;
 esac
