@@ -89,6 +89,20 @@ for machines with no `minisign` binary, and the fail-closed behavior of the auto
 
 **Also on npm:** [`npx runheimdall`](https://www.npmjs.com/package/runheimdall) — same pinned tag, same sha256 check, zero clone required.
 
+### Your code stays yours
+
+Gates run 100% locally. Your code never leaves your machine.
+
+Team presence is a feature you can see and switch off: it sends {handle, verdict, current filename} — never code, never file contents — to your team's endpoint. hmd presence off makes you invisible; hmd presence on --no-files hides filenames.
+
+Telemetry is specified, minimal, and yours to kill: DATA.md documents every field. hmd telemetry off. hmd telemetry purge deletes the local spool — nothing is transmitted in this release.
+
+Auto-update checks GitHub Releases for new signed versions. HEIMDALL_NO_AUTOUPDATE=1 (or ~/.heimdall/no-autoupdate) disables it.
+
+`rr` is the one thing that sends on purpose, and only when you run it: your BYO Claude credential (write-only), your GitHub App installation id, and the literal task text you typed — because that text is the job. It never uploads your working tree; the worker clones your repo from GitHub.
+
+Full data contract and every field collected: [DATA.md](DATA.md).
+
 ---
 
 ## First run
