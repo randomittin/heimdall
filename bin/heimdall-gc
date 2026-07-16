@@ -9,7 +9,7 @@
 # throttled keeper beat, SessionEnd full run), reaping ONLY hmd's OWN orphaned
 # artifacts and NEVER a live session's, a secret, or unmerged work.
 #
-# THE THREE CATEGORIES (each independently safe, idempotent, non-fatal):
+# THE FOUR CATEGORIES (each independently safe, idempotent, non-fatal):
 #
 #   1. WORKTREES  — merged/abandoned agent worktrees under .claude/worktrees/agent-*
 #      are reaped by DELEGATING to bin/heimdall-reap-idle --apply (its git-derived
@@ -41,6 +41,21 @@
 #      the transient dirs): team.json, *.seed, pki/, signing/, sigil-choice, .run-count,
 #      identity, persona.json, the ledger's active status.json, .srcver.
 #
+#   4. CLAUDE VERSIONS — retired ~/.local/share/claude/versions/<v> binaries (~230MB
+#      EACH). Claude Code's NATIVE installer keeps its own 2 newest UNPROTECTED
+#      versions, where "protected" = the symlink target, its own execPath, and any
+#      version whose <v>.lock is held by a live pid. A long-lived session PINS its
+#      version via that lock, which REMOVES it from the unprotected list — letting an
+#      older, genuinely-dead version hide inside the keep-2 window and linger for days.
+#      This step reclaims exactly those, and ONLY on a proof of non-use:
+#        KEEP if it is the symlink target · KEEP if any live pid has the binary open
+#        (lsof — argv is NOT sufficient: a pinned session's argv says only "claude",
+#        and a version can be executed with NO lock at all) · KEEP if its lock is held
+#        by a live pid · KEEP the newest HMD_GC_CC_KEEP unreferenced ones as headroom.
+#      FAIL-SAFE: no lsof, no versions dir, not a native install, or ANY doubt -> KEEP
+#      EVERYTHING. A live process is NEVER signalled and its lock is NEVER removed;
+#      Claude's own lock protocol is read, never written and never bypassed.
+#
 #   run  = worktrees + processes + temp, each wrapped so a failure in one step never
 #          aborts the others (or the caller); prints a one-line receipt of what it
 #          freed. --quick = temp + processes only (skips the git worktree pass) for a
@@ -50,7 +65,7 @@
 # fatal. --dry-run reports every decision but mutates nothing.
 #
 # Usage:
-#   heimdall-gc [run|worktrees|procs|temp] [--quick] [--dry-run] [--quiet]
+#   heimdall-gc [run|worktrees|procs|temp|ccversions] [--quick] [--dry-run] [--quiet]
 #               [--repo <path>] [--home <dir>]
 #
 # Test/override seams (env):
@@ -62,6 +77,11 @@
 #   HMD_GC_LOG_MAX_BYTES    log rotate threshold bytes (default 1048576)
 #   HMD_GC_LOG_TAIL_LINES   lines kept when rotating    (default 200)
 #   HMD_GC_LOG_TTL_HOURS    old-log delete TTL in hours (default 168)
+#   HMD_GC_CC_VERSIONS      claude versions dir (default ~/.local/share/claude/versions)
+#   HMD_GC_CC_BIN           claude launcher symlink (default ~/.local/bin/claude)
+#   HMD_GC_CC_LOCKS         claude lock dir (default ~/.local/state/claude/locks)
+#   HMD_GC_CC_KEEP          unreferenced versions kept as headroom (default 2)
+#   HMD_GC_CC_LSOF          path to an `lsof -t <file>`-style stub (test seam)
 #   HMD_GC_LIVE_PIDS        space-separated "alive" pids (test seam; replaces kill -0)
 #   HMD_GC_PROC_CMD         path to a `cmd <pid>`-echoing stub (test seam; replaces ps)
 #   HMD_GC_BREAK            name of a step to force-fail (test seam for non-fatal proof)
@@ -73,10 +93,10 @@ SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ── argv ────────────────────────────────────────────────────────────────────────
 SUB=""; QUICK=0; DRYRUN=0; QUIET=0; REPO=""; HOME_OVERRIDE=""
-usage() { sed -n '2,66p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,88p' "$0" | sed 's/^# \{0,1\}//'; }
 while [ $# -gt 0 ]; do
   case "$1" in
-    run|worktrees|procs|processes|temp|temp-files) SUB="$1" ;;
+    run|worktrees|procs|processes|temp|temp-files|ccversions|cc-versions) SUB="$1" ;;
     --quick)          QUICK=1 ;;
     --dry-run|-n)     DRYRUN=1 ;;
     --quiet|-q)       QUIET=1 ;;
@@ -90,7 +110,7 @@ while [ $# -gt 0 ]; do
   shift
 done
 [ -n "$SUB" ] || SUB="run"
-case "$SUB" in processes) SUB="procs" ;; temp-files) SUB="temp" ;; esac
+case "$SUB" in processes) SUB="procs" ;; temp-files) SUB="temp" ;; cc-versions) SUB="ccversions" ;; esac
 
 # ── resolved paths ───────────────────────────────────────────────────────────────
 HMD_HOME="${HOME_OVERRIDE:-${HEIMDALL_HOME:-${HOME:-}/.heimdall}}"
@@ -106,6 +126,11 @@ else
   if [ -n "${TMPDIR:-}" ] && [ "${TMPDIR%/}" != "/tmp" ]; then TMP_ROOTS="$TMP_ROOTS ${TMPDIR%/}"; fi
 fi
 
+CC_VERSIONS_DIR="${HMD_GC_CC_VERSIONS:-${HOME:-}/.local/share/claude/versions}"
+CC_BIN="${HMD_GC_CC_BIN:-${HOME:-}/.local/bin/claude}"
+CC_LOCKS_DIR="${HMD_GC_CC_LOCKS:-${HOME:-}/.local/state/claude/locks}"
+CC_KEEP="${HMD_GC_CC_KEEP:-2}"
+
 TEMP_TTL_MIN="${HMD_GC_TEMP_TTL_MIN:-60}"
 CACHE_TTL_HOURS="${HMD_GC_CACHE_TTL_HOURS:-24}"
 LOG_MAX_BYTES="${HMD_GC_LOG_MAX_BYTES:-1048576}"
@@ -119,6 +144,9 @@ PROC_KEPT_LIVE=0
 TEMP_REAPED=0
 TEMP_BYTES=0
 LOGS_ROTATED=0
+CCV_REAPED=0
+CCV_BYTES=0
+CCV_KEPT=0
 
 # ── helpers ──────────────────────────────────────────────────────────────────────
 _report() { [ "$QUIET" = 1 ] && return 0; printf '[gc:%s] %s\n' "$1" "$2" >&2; }
@@ -315,24 +343,124 @@ gc_logs() {
   return 0
 }
 
+# ── 4. CLAUDE VERSIONS (reap ONLY on a proof of non-use; any doubt -> keep) ──────
+
+_mtime() { stat -f%m "$1" 2>/dev/null || stat -c%Y "$1" 2>/dev/null || echo 0; }
+_nlink() { stat -f%l "$1" 2>/dev/null || stat -c%h "$1" 2>/dev/null || echo 2; }
+
+# resolve a symlink chain portably (macOS readlink has no -f).
+_cc_resolve() {
+  local p="$1" t n=0
+  while [ -L "$p" ] && [ "$n" -lt 10 ]; do
+    t="$(readlink "$p" 2>/dev/null)" || return 1
+    case "$t" in /*) p="$t" ;; *) p="$(dirname "$p")/$t" ;; esac
+    n=$((n + 1))
+  done
+  [ -e "$p" ] || return 1
+  printf '%s\n' "$p"
+}
+
+# pids holding a version binary open. lsof is the ONLY sound oracle here: a pinned
+# session's argv is just "claude" (no version path), and a version can be executed
+# with no lock at all — argv/lock scanning would miss both. Test seam: a stub.
+_cc_refs() {
+  if [ -n "${HMD_GC_CC_LSOF:-}" ]; then "$HMD_GC_CC_LSOF" "$1" 2>/dev/null; return 0; fi
+  lsof -t -- "$1" 2>/dev/null || true
+}
+
+# pid recorded in Claude's own <version>.lock. READ-ONLY — we never write or remove a
+# lock; Claude already treats a dead-pid lock as stale and reuses it itself.
+_cc_lock_pid() {
+  local lk="$CC_LOCKS_DIR/$1.lock"
+  [ -r "$lk" ] || return 1
+  sed -n 's/.*"pid"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$lk" 2>/dev/null | head -1
+}
+
+_cc_keep() { CCV_KEPT=$((CCV_KEPT + 1)); _report "ccv" "keep $1 ($2)"; }
+
+_cc_reap() {
+  local f="$1" sz
+  sz="$(_fsize "$f")"; case "$sz" in ''|*[!0-9]*) sz=0 ;; esac
+  _report "ccv" "reap ${f##*/} (${sz}B, retired + unreferenced)"
+  if [ "$DRYRUN" != 1 ]; then rm -f "$f" 2>/dev/null || return 0; fi
+  CCV_REAPED=$((CCV_REAPED + 1)); CCV_BYTES=$((CCV_BYTES + sz))
+}
+
+gc_ccversions() {
+  [ "${HMD_GC_BREAK:-}" = ccversions ] && { _report "ccv" "forced break (test seam)"; return 1; }
+  [ "$QUICK" = 1 ] && return 0
+  [ -d "$CC_VERSIONS_DIR" ] || return 0
+  # FAIL-SAFE: with no reference oracle we cannot PROVE a version is unused -> keep all.
+  if [ -z "${HMD_GC_CC_LSOF:-}" ] && ! command -v lsof >/dev/null 2>&1; then
+    _report "ccv" "no lsof — cannot prove non-use; keeping every version"
+    return 0
+  fi
+  # NATIVE installs only: the launcher must resolve INTO the versions dir.
+  local target
+  target="$(_cc_resolve "$CC_BIN" || true)"
+  case "$target" in
+    "$CC_VERSIONS_DIR"/*) ;;
+    *) _report "ccv" "launcher does not resolve into ${CC_VERSIONS_DIR} — not a native install; skipping"
+       return 0 ;;
+  esac
+
+  local v name refs p held lpid unref=""
+  for v in "$CC_VERSIONS_DIR"/*; do
+    [ -f "$v" ] || continue
+    name="${v##*/}"
+    if [ "$v" = "$target" ]; then _cc_keep "$name" "current symlink target"; continue; fi
+    # a version linked elsewhere (e.g. ClaudeCode.app) frees nothing when unlinked and
+    # unlinking may break that other holder -> never ours to reap.
+    if [ "$(_nlink "$v")" -gt 1 ] 2>/dev/null; then
+      _cc_keep "$name" "hardlinked elsewhere — unlinking frees nothing"; continue
+    fi
+    held=0
+    for p in $(_cc_refs "$v"); do
+      case "$p" in ''|*[!0-9]*) continue ;; esac
+      if _pid_alive "$p"; then held=1; break; fi
+    done
+    if [ "$held" = 1 ]; then _cc_keep "$name" "executed by live pid $p"; continue; fi
+    lpid="$(_cc_lock_pid "$name" || true)"
+    if [ -n "$lpid" ] && _pid_alive "$lpid"; then
+      _cc_keep "$name" "lock held by live pid $lpid"; continue
+    fi
+    unref="$unref $name"
+  done
+
+  # Of the provably-unreferenced, keep the newest CC_KEEP as rollback headroom.
+  local ordered i=0
+  ordered="$(for name in $unref; do printf '%s %s\n' "$(_mtime "$CC_VERSIONS_DIR/$name")" "$name"; done \
+             | sort -rn | awk '{print $2}')"
+  for name in $ordered; do
+    i=$((i + 1))
+    if [ "$i" -le "$CC_KEEP" ]; then _cc_keep "$name" "unreferenced, newest-$CC_KEEP headroom"; continue; fi
+    _cc_reap "$CC_VERSIONS_DIR/$name"
+  done
+  return 0
+}
+
 # ── receipt ──────────────────────────────────────────────────────────────────────
 print_receipt() {
   [ "$QUIET" = 1 ] && return 0
   local kb=$(((TEMP_BYTES + 512) / 1024))
-  printf 'heimdall-gc%s: freed %d worktree(s), %d orphan pidfile(s) (kept %d live keeper(s)), %d temp file(s) ~%dKB, %d log(s) rotated\n' \
+  local ccmb=$(((CCV_BYTES + 524288) / 1048576))
+  printf 'heimdall-gc%s: freed %d worktree(s), %d orphan pidfile(s) (kept %d live keeper(s)), %d temp file(s) ~%dKB, %d log(s) rotated, %d retired claude version(s) ~%dMB (kept %d in use)\n' \
     "$([ "$DRYRUN" = 1 ] && printf ' (dry-run)')" \
-    "$WT_REAPED" "$PROC_REAPED" "$PROC_KEPT_LIVE" "$TEMP_REAPED" "$kb" "$LOGS_ROTATED"
+    "$WT_REAPED" "$PROC_REAPED" "$PROC_KEPT_LIVE" "$TEMP_REAPED" "$kb" "$LOGS_ROTATED" \
+    "$CCV_REAPED" "$ccmb" "$CCV_KEPT"
 }
 
 # ── dispatch (each step non-fatal: `|| true` keeps run going) ────────────────────
 case "$SUB" in
-  worktrees) gc_worktrees || true; print_receipt ;;
-  procs)     gc_procs || true;     print_receipt ;;
-  temp)      gc_temp || true;      print_receipt ;;
+  worktrees)  gc_worktrees || true;   print_receipt ;;
+  procs)      gc_procs || true;       print_receipt ;;
+  temp)       gc_temp || true;        print_receipt ;;
+  ccversions) gc_ccversions || true;  print_receipt ;;
   run)
     gc_worktrees || true
     gc_procs || true
     gc_temp || true
+    gc_ccversions || true
     print_receipt ;;
 esac
 exit 0

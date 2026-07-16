@@ -3,7 +3,7 @@
     "heimdall-ledger": {
       "command": "python3",
       "args": [
-        "${CLAUDE_PLUGIN_ROOT}/bin/heimdall-ledger-mcp"
+        "${CLAUDE_PLUGIN_ROOT:-.}/bin/heimdall-ledger-mcp"
       ],
       "env": {}
     }
