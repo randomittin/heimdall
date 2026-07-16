@@ -116,6 +116,14 @@ def render(cols, data, home=None, tmp=None, now=1752410000, blob=None, legacy=Tr
         "HMD_NOW": str(now), "HEIMDALL_CP_URL": "http://127.0.0.1:1", "COLUMNS": str(cols),
         "HMD_STATUSLINE_TMP": (tmp or tempfile.mkdtemp()),
         "HEIMDALL_STATUSLINE_MODE": "truecolor",
+        # This suite pins the RENDERER contract (rows full-bleed the layout width; tier
+        # boundaries at 40/60/100) at a GIVEN width — so it takes COLUMNS AS the layout width
+        # and holds back none of CC's region spacing. Deriving the layout width from CC's
+        # $COLUMNS (which is the FULL TERMINAL width, 4 cells wider than CC's paint region)
+        # is a SEPARATE contract, owned by heimdall-statusline-cc-region-reserve.test.sh.
+        # Without this pin the reserve would silently shift the tier under test (COLUMNS=40
+        # → layout 36 → tiny, not narrow), testing a different tier than the label claims.
+        "HMD_STATUSLINE_RESERVE": "0",
     }
     if not legacy:
         # a TRUE ledger-absent render — no status.json AND no legacy statusline.json to map.
