@@ -8,10 +8,14 @@
 #   - function-wrapped (last line is `main "$@"`) — a dropped curl|bash never
 #     executes a half-downloaded script
 #   - no stdin reads, no interactive prompts (stdin IS the script under a pipe)
-#   - no sudo, no telemetry, no eval/base64/obfuscation
+#   - no sudo, no eval/base64/obfuscation
 #   - pinned to a release ref (HEIMDALL_REF) — what you read is what runs
 #   - idempotent: re-run upgrades cleanly, never errors "already exists"
 #   - reversible: `hmd uninstall` removes everything, touches nothing else
+#   - Gates run 100% locally. Your code never leaves your machine.
+#   - the ONLY thing this installer emits is LOCAL, on-machine step telemetry you
+#     fully control (never a network phone-home) — every field is in DATA.md, and
+#     it is off-by-default-capable (HEIMDALL_TELEMETRY=off / hmd telemetry off)
 #
 # Env overrides (all HEIMDALL_*, never HMD_*):
 #   HEIMDALL_REF        git ref to install (default: the pinned release below)
@@ -709,9 +713,9 @@ ensure_dream_schedule() {
 # duration_ms + an error CLASS (never a secret value) through the substrate's bash
 # wrapper, which is cloned into $PLUGIN_DIR/bin by the fetch step BEFORE this fires.
 # Fire-and-forget: the wrapper always exits 0, and every call is `|| true`-guarded,
-# so telemetry can NEVER fail or block the install (the comment in this file's
-# header — "no telemetry" — refers to NETWORK/remote telemetry; this is local-only,
-# off-by-default-capable, on-machine data the user fully controls). A disabled or
+# so telemetry can NEVER fail or block the install (this install-step telemetry is
+# LOCAL-only, off-by-default-capable, on-machine data the user fully controls — see
+# DATA.md; it is never a network phone-home). A disabled or
 # absent telemetry world (HEIMDALL_TELEMETRY=off / no wrapper) is a perfect no-op,
 # so the stranger-test install path is byte-for-byte identical.
 
@@ -1407,8 +1411,10 @@ main() {
     printf '   %s│%s  Next:        %s%-34s%s%s│%s\n' "$C_DIM" "$C_RESET" "$C_CYAN" "$PRIMARY demo" "$C_RESET" "$C_DIM" "$C_RESET"
     printf '   %s│%s  In Claude:   /hmd:verify  /hmd:save  …          %s│%s\n' "$C_DIM" "$C_RESET" "$C_DIM" "$C_RESET"
     printf '   %s│%s  Docs:        runheimdall.dev                    %s│%s\n' "$C_DIM" "$C_RESET" "$C_DIM" "$C_RESET"
+    printf '   %s│%s  Data:        %-34s%s│%s\n' "$C_DIM" "$C_RESET" "DATA.md — telemetry contract" "$C_DIM" "$C_RESET"
     printf '   %s│%s  Uninstall:   %-34s%s│%s\n' "$C_DIM" "$C_RESET" "$PRIMARY uninstall" "$C_DIM" "$C_RESET"
     printf '   %s└───────────────────────────────────────────────┘%s\n' "$C_DIM" "$C_RESET"
+    printf '   %s# gates local · presence opt-out · telemetry documented & killable · the watchman does not sleep%s\n' "$C_DIM" "$C_RESET"
   else
     say "Heimdall v$VER installed"
     say "gates live · secret-scan armed · $N/$N"
@@ -1418,7 +1424,9 @@ main() {
     say "Next:        $PRIMARY demo"
     say "In Claude:   /hmd:verify  /hmd:save"
     say "Docs:        runheimdall.dev"
+    say "Data:        DATA.md — telemetry contract"
     say "Uninstall:   $PRIMARY uninstall"
+    say "# gates local · presence opt-out · telemetry documented & killable · the watchman does not sleep"
   fi
 
   # ── 5a. MANDATORY post-install validation gate (the ready-gate) ───────────
@@ -1556,3 +1564,5 @@ main() {
 }
 
 main "$@"
+
+# gates local · presence opt-out · telemetry documented & killable · the watchman does not sleep

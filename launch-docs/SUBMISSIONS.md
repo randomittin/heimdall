@@ -33,17 +33,20 @@ safe to publish, and I flagged them rather than quietly working around them:
    commit `7618ec7`) already fixed this exact problem for `runheimdall.dev` by replacing the
    bare claim with four **scoped** claims (gates run locally / presence is opt-out-able and
    documented / telemetry is specified+killable / auto-update is checked+disableable), each
-   traceable to `DATA.md`. `DATA.md` itself is real and thorough (commit `da7816b`, "docs:
-   DATA.md data contract") but **lives on branch `truth-pass`, not on `main`** — so the site's
-   own `DATA.md` link (`github.com/randomittin/heimdall/blob/main/DATA.md`) currently 404s.
+   traceable to `DATA.md`. `DATA.md` is now **on `main`**, reconciled against current code on
+   branch `truthpass-reconcile` — so the site's own `DATA.md` link
+   (`github.com/randomittin/heimdall/blob/main/DATA.md`) resolves. The reconciled contract
+   documents **five** surfaces (the three from `da7816b` plus the auto-update version check and
+   `rr`), matching the site FAQ's enumeration, and the README carries the same scoped set as
+   S1–S6 under §"Your code stays yours", gated verbatim by `test/truth-pass-claims.test.sh`.
 
 **What I did about it:** every claim below uses the site's already-fixed, scoped phrasing
 (never a bare "no telemetry"), and I did not use `IDENTITY.md`'s "no telemetry, no network
-calls home" line anywhere. I'm surfacing this so RJ can decide: (a) merge `truth-pass` →
-`main` before any submission goes out (so `DATA.md` actually resolves), and (b) correct
-`README.md:45` and `IDENTITY.md:31` to match current reality. Until `DATA.md` is on `main`,
-any listing copy that links to it should be held with the rest of item 3, or the link
-swapped to the `truth-pass` branch ref.
+calls home" line anywhere. I'm surfacing this so RJ can decide: (a) **done** — the reconciled
+`truth-pass` content is on `main` via `truthpass-reconcile`, so `DATA.md` actually resolves,
+and (b) correct `IDENTITY.md:31` to match current reality (`README.md`'s bare claim is already
+gone). With `DATA.md` on `main`, listing copy may link to it directly at
+`github.com/randomittin/heimdall/blob/main/DATA.md` — no branch ref needed.
 
 ---
 
@@ -307,9 +310,9 @@ artifact — flagged so RJ knows which numbers to double check before they go ou
 | BYOC — credential lands in your own per-team Secret Manager secret, never logged/echoed/readable by another tenant | `README.md:29` | Yes (doc claim; not independently re-audited by me beyond reading the doc) |
 | App holds exactly Contents + Issues + Pull requests, no Administration/Actions/merge capability | `README.md:30` | Yes (doc claim) |
 | No sudo, idempotent install, reversible via `hmd uninstall` | `README.md:45-49` | Yes |
-| "No telemetry" (README's current bare phrasing) | `README.md:45` | **Contradicted by current code** — see §0. Not reused in any draft above. |
-| "No telemetry, no network calls home" (constitution-level) | `IDENTITY.md:31` | **Stale, contradicted by `bin/heimdall-presence`, `bin/heimdall-telemetry-corpus`, `rr`/control-plane surfaces.** Not reused in any draft above. |
-| Gates run 100% locally; code never leaves the machine (scoped claim, as used in drafts above) | `heimdall-site` commit `7618ec7` (index.html); `DATA.md` §"Local gates" row, branch `truth-pass`, commit `da7816b` | Partially — `DATA.md` is real but **not yet merged to `main`**; flagged in §0 |
+| "No telemetry" (README's former bare phrasing) | *(removed)* | **Resolved.** The bare claim is gone from `README.md`; the scoped claim set now lives under README §"Your code stays yours", gated by `test/truth-pass-claims.test.sh`. |
+| "No telemetry, no network calls home" (constitution-level) | `IDENTITY.md:31` | **Stale, contradicted by `bin/heimdall-presence:304` (default control plane), `bin/heimdall-autoupdate:76` (GitHub Releases GET), and `bin/rr:568` (task text).** Not reused in any draft above. **Still open — reserved for RJ.** |
+| Gates run 100% locally; code never leaves the machine (scoped claim, as used in drafts above) | `heimdall-site` commit `7618ec7` (index.html); `DATA.md` §"Local gates" row | Yes — `DATA.md` is the merged data contract; the claim is gated verbatim as S1 by `test/truth-pass-claims.test.sh` |
 | Falsifiability score 1.0 — `exchange-lob` 6/6 mutants caught, `emulator-gb` 3/3 | `evals/flagship/STATUS.md:21-26` | Yes |
 | Corpus 13/13 caught (100%) at v0.1 | `evals/corpus/CORPUS-STATUS.md:10` | Yes |
 | Oracle gate types ranked differential > trace-diff > verdict > property > example | `evals/oracles/README.md:15-19` (`registry.json`) | Yes |
