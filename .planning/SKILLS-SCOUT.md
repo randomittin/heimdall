@@ -1,15 +1,16 @@
 # Skills Scout — Newly-Released Official Anthropic Skills → Heimdall Incorporation
 
 **Branch:** `skills-scout-report2`  ·  **Base sha:** `7ea54ea`  ·  **Author:** scout agent
-**Status:** SKELETON committed from LOCAL evidence (network enrichment attempted after).
+**Status:** ENRICHED — skeleton committed from LOCAL evidence, then web-verified against official Anthropic sources (network was reachable).
 **Truth-pass:** every capability below is cited to a LOCAL file path or an official Anthropic URL. Nothing from memory. Anything not established from evidence is marked **UNVERIFIED / cannot establish** and NOT guessed.
 
 ---
 
 ## 0. TL;DR — the honest headline
 
-- **"ghost"** and **"focus"** as *official Anthropic skill/plugin names*: **NOT FOUND in any local evidence.** Searched the installed plugins manifest, the 37 first-party Anthropic plugins in `claude-plugins-official`, and the full 400KB+ `plugin-catalog-cache.json`. Zero `ghost*` matches; every `focus` match is the plain English word ("Focuses on recently modified code", "Forge-focused", "focused commands") — not a product. **Cannot establish what RJ means by "ghost"/"focus" from local evidence — needs RJ confirmation** (see §5).
-- What IS genuinely new and official (Anthropic-authored, sitting in the marketplace **uninstalled**) and maps cleanly onto Heimdall: **code-simplifier**, **code-modernization**, **hookify**, **session-report**, **receipts**, **project-artifact**, **claude-code-setup** (automation recommender). These are real (cited to local marketplace.json + SKILL.md) and rank-ordered in §2–§3.
+- **"focus" IS REAL and CONFIRMED.** It is **Claude Code "focus mode"**, toggled by the **`/focus`** slash command — a *transcript display mode*, not a plugin/skill. Introduced in **Claude Code 2.1.110** (official `anthropics/claude-code` CHANGELOG). It is already available in RJ's installed **2.1.212**. Focus mode collapses in-turn activity so the user sees **only Claude's final message**; subagents/background work fold into an activity summary. See §6 for exact cited lines and the Heimdall wiring in §3 (#3).
+- **"ghost" — CANNOT ESTABLISH. It is not an Anthropic capability by any evidence I have.** No `ghost` skill/plugin in the installed manifest, the 37 first-party Anthropic plugins, the 400KB+ catalog cache, OR the official `anthropics/skills` repo. In the official Claude Code CHANGELOG the only `ghost` hits are **"Ghostty"** (a third-party terminal emulator) and bug fixes for **"ghost frames/characters"** (rendering artifacts) — neither is a feature. **Needs RJ confirmation** (§5).
+- What ELSE is genuinely new and official and maps cleanly onto Heimdall: from the marketplace (Anthropic-authored, **uninstalled**) — **code-simplifier**, **hookify**, code-modernization; from the official **`anthropics/skills`** repo — **webapp-testing** (HIGH fit → verifier), **doc-coauthoring** (→ docs-writer). All cited (local marketplace.json/SKILL.md + GitHub). Rank-ordered in §2–§3.
 
 ---
 
@@ -45,8 +46,11 @@ All authorship = **Anthropic** per `marketplace.json` `author.name` (verified lo
 | **receipts** | "Personal Claude Code impact report… mines `~/.claude/projects` locally, cross-references git history, writes markdown+HTML." (`SKILL.md`) | NO | Overlaps Heimdall claim-ledger / attest surfaces (`bin/heimdall-attest`, `.planning/ledger`). Likely **REDUNDANT**. | skip | confirmed (local) |
 | **project-artifact** | "Generate and publish a living project status page — overview & success criteria, workstream sequence, next steps." (`marketplace.json`) | NO | Maps to `.planning/` state files + STATE.md/CHECKPOINT.md. Overlaps `hmd:save`. | LOW | confirmed (local) |
 | **claude-code-setup** | "Analyze codebases and recommend tailored Claude Code automations (hooks, skills, MCP, subagents)." (`marketplace.json`) | **YES** (installed) | Already available; `skills/…/claude-automation-recommender/SKILL.md`. | n/a | confirmed (local) |
+| **webapp-testing** (skills repo) | "Toolkit for interacting with and testing local web applications using Playwright… verifying frontend functionality, debugging UI behavior, capturing browser screenshots, and viewing browser logs." (`anthropics/skills` SKILL.md) | NO | **Verification-first bullseye.** Wire into `agents/verifier.md` / `hmd:test-runner` to *drive the real app*, not just run unit tests — matches the built-in `/verify` and `/run` skills' intent. | **HIGH** | confirmed (web) |
+| **doc-coauthoring** (skills repo) | "Structured workflow for co-authoring documentation… Context Gathering, Refinement & Structure, Reader Testing." (`anthropics/skills` SKILL.md) | NO | Maps to `agents/docs-writer.md`. | MED | confirmed (web) |
+| **`/focus` — focus mode** (CC feature) | Transcript display mode; `/focus` toggles it. "Claude now writes more self-contained summaries since it knows you only see its final message." (CC CHANGELOG 2.1.101/2.1.110/2.1.198) | **Built-in** (2.1.110+; RJ on 2.1.212) | Not installable — it's a display mode. Heimdall adaptation in §3 (#3): make agent *final messages* self-contained given users may run in focus mode. | **MED-HIGH** | confirmed (web) |
 
-> Install command (do NOT run): `claude plugins install <name>@claude-plugins-official`. NOTHING installed by this scout.
+> Install command (do NOT run): `claude plugins install <name>@claude-plugins-official` (marketplace plugins) or add the `anthropics/skills` repo. NOTHING installed by this scout. `/focus` is built-in — nothing to install.
 
 ---
 
@@ -62,7 +66,13 @@ All authorship = **Anthropic** per `marketplace.json` `author.name` (verified lo
 - **Wiring surface:** `hooks/hooks.json`, `hooks/git/`.
 - **Conflict check:** generated hooks must respect R1–R9 (`.planning/conventions.md`) and never add telemetry/publish.
 
-### #3 — TBD pending "ghost"/"focus" establishment OR code-modernization for legacy tasks.
+### #3 — focus mode (`/focus`) → make agent final messages self-contained (MED-HIGH fit)
+- **Why it fits:** focus mode is CONFIRMED shipped and available to RJ (2.1.212). When a user runs Heimdall in focus mode they see **only the final message** of each turn — all the wave/agent activity is folded away. This directly rewards Heimdall's existing "lead with the outcome, self-contained summary" discipline. CHANGELOG 2.1.101: *"Claude now writes more self-contained summaries since it knows you only see its final message."*
+- **Wiring surface:** the orchestrator/agent final-report convention (`agents/heimdall.md`, `agents/*.md` final-message guidance) + `hooks/statusline.sh` / `hooks/subagent-statusline.sh` (which already surface sub-agent activity that focus mode collapses). Ensure each wave's terminal message stands alone (what shipped, what's verified) without relying on the collapsed transcript.
+- **Conflict check:** none — this is display-side and tightens an existing convention. No install, no telemetry, no publish. Stays truth-pass.
+
+### Bonus #4 — webapp-testing → verifier drives the real app (HIGH fit, see §2)
+- **Wiring surface:** `agents/verifier.md` + `evals/oracles/*` — replace/augment "tests pass" with "app behavior observed via Playwright". Aligns with the built-in `/verify` skill and Heimdall's falsifiable-oracle north star. Redundancy check vs existing `hmd:designmatch` (already Playwright-based) needed before adopting.
 
 ---
 
@@ -74,20 +84,45 @@ All authorship = **Anthropic** per `marketplace.json` `author.name` (verified lo
 
 ## 5. COULD NOT ESTABLISH — needs RJ confirmation (LOUD)
 
-**"ghost"** and **"focus"** — I could not find any official Anthropic skill/plugin/feature by these names in local evidence, and I must not invent them.
+**"focus" — RESOLVED** (see §0/§6): it is Claude Code **focus mode / `/focus`**, confirmed and cited. No longer open.
 
-To resolve, I need ONE of:
-1. The exact surface where RJ saw them (a URL, a changelog line, a `/command`, a plugin name, a screenshot).
-2. Confirmation they are Claude Code *features* (not plugins) — e.g. a codename — so I can search official docs/changelog for the real name.
-3. Permission to treat them as paraphrases and the rough capability RJ associates with each.
+**"ghost" — STILL CANNOT ESTABLISH.** No Anthropic skill/plugin/feature named "ghost" exists in ANY source I checked:
+- installed plugins manifest — no match
+- 37 first-party Anthropic marketplace plugins — no match
+- 406KB `plugin-catalog-cache.json` (full third-party catalog) — no match
+- official `anthropics/skills` repo (17 skills) — no match
+- official Claude Code CHANGELOG — only **"Ghostty"** (third-party terminal emulator) and **"ghost frames"/"ghost characters"** (rendering-bug fixes). Neither is a capability.
 
-Candidate interpretations I refuse to assert without evidence (listed only to speed RJ's confirmation, NOT as findings):
-- "ghost" → possibly "ghost text"/inline-suggestion or a background/hidden-agent feature — **UNVERIFIED.**
-- "focus" → possibly a plan/focus mode or file-scoping feature — **UNVERIFIED.**
+To resolve I need ONE of, from RJ:
+1. The exact surface where RJ saw "ghost" (URL, changelog line, a `/command`, plugin name, screenshot).
+2. Confirmation it's a codename/paraphrase + the rough capability RJ associates with it, so I can search official docs/changelog for the real name.
+3. Whether "ghost" might be **"Ghostty"** (terminal) or a non-Anthropic tool RJ conflated.
+
+I refuse to assert any "ghost" capability without this — a confident fabrication here is exactly the failure this task guards against.
 
 ---
 
-## 6. Web enrichment status
-_Attempted after this skeleton was committed. Results appended below if network was reachable; otherwise marked UNREACHABLE._
+## 6. Web enrichment status — REACHABLE, verified against official Anthropic sources
 
-<!-- WEB-ENRICHMENT-MARKER -->
+Sources fetched (official only): `anthropics/claude-code` CHANGELOG.md, `anthropics/skills` GitHub repo (contents API + raw SKILL.md).
+
+### focus mode / `/focus` — CONFIRMED (Claude Code CHANGELOG, official)
+Exact cited lines from `raw.githubusercontent.com/anthropics/claude-code/main/CHANGELOG.md`:
+- **2.1.110:** "Changed `Ctrl+O` to toggle between normal and verbose transcript only; **focus view is now toggled separately with the new `/focus` command**." → this is when `/focus` shipped.
+- **2.1.101:** "Improved focus mode: **Claude now writes more self-contained summaries since it knows you only see its final message.**"
+- **2.1.198:** "Improved focus mode: **subagents launched in a turn now appear in its activity summary**, and completed background notifications fold into a single count."
+- **2.1.208-era (line 530):** ongoing focus-mode refinements — still actively maintained.
+- RJ's installed CC = **2.1.212** → focus mode + `/focus` are present.
+
+**What focus mode IS (cited):** a transcript *display* mode. When on, the user sees only Claude's final message per turn; intermediate tool calls / subagent activity collapse into an activity summary. It is NOT a plugin or skill — nothing to install.
+
+**Heimdall relevance:** rewards self-contained final messages (already a Heimdall convention) and clean sub-agent activity summaries (Heimdall's statusline hooks). Wiring in §3 (#3).
+
+### ghost — searched, NOT FOUND (see §5). Only "Ghostty" (terminal) + "ghost frames/characters" (bug fixes) in CHANGELOG.
+
+### official `anthropics/skills` repo (17 skills, contents API)
+Full list: algorithmic-art, brand-guidelines, canvas-design, claude-api, **doc-coauthoring**, docx, frontend-design, internal-comms, mcp-builder, pdf, pptx, skill-creator, slack-gif-creator, theme-factory, **web-artifacts-builder**, **webapp-testing**, xlsx.
+- Heimdall-relevant new ones pulled into §2: **webapp-testing** (verifier), **doc-coauthoring** (docs-writer). Others are design/office-doc skills (lower fit; overlap `ui-ux-pro-max`, `hmd:designmatch`).
+
+### Network resilience note
+Skeleton (commit `562f2a8`) was committed from local evidence BEFORE any fetch, per the anti-ENOTFOUND mandate. All web calls used `curl -m 12`; a failure would have left the committed skeleton intact.
