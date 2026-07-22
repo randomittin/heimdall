@@ -1,0 +1,347 @@
+#!/usr/bin/env bash
+# heimdall-cleanup — the UNIFIED system-health CORE: one entrypoint for BOTH axes of
+# machine health Heimdall is responsible for — MEMORY (RAM/swap pressure + hmd's OWN
+# orphaned-python leak) and DISK (hmd's OWN reclaimable garbage: merged worktrees, temp,
+# logs, retired claude versions). It ORCHESTRATES the two existing, tested reapers — it
+# NEVER re-implements their logic:
+#
+#   • bin/heimdall-sysmon  — the MEMORY + hmd-orphan authority. Its `--filter-orphans`
+#     matcher is the SINGLE source of truth for "is this a heimdall-owned python orphan?"
+#     (ppid==1 AND a heimdall signature — a foreign python is NEVER matched). We route ALL
+#     orphan scoping through it, and delegate the actual kill to its `--reap-hmd-orphans`
+#     (which also stops the spawner so the leak can't respawn). Scope can never diverge.
+#   • bin/heimdall-gc      — the DISK authority. Reaps ONLY hmd's own artifacts, each on a
+#     proof of non-use (lsof-guarded retired versions, merged-only worktrees, TTL'd temp).
+#     We drive it in --dry-run for `report` (mutates NOTHING) and full for `--apply`.
+#
+# WHY A NEW ENTRYPOINT (and not "promote sysmon"): sysmon is the memory/proc advisor; gc is
+# the disk collector. Neither covers BOTH axes, and folding gc's disk domain into sysmon (or
+# vice-versa) would DUPLICATE a tested reaper — the exact thing the conventions forbid. A
+# thin orchestrator over the two authorities is the smallest possible "one core capability"
+# surface: it adds unification + a safe auto path, and zero new reaping logic.
+#
+# THE READ-ONLY CONTRACT (the cc-selfheal lesson: a "status" that secretly mutated CAUSED the
+# error it existed to prevent). `report` (the DEFAULT) is PROVABLY read-only: it calls only
+# `sysmon` (no mutating flag), `gc run --dry-run`, and read-only probes (df, ps, /proc). It
+# can NOT reach the reap path — dispatch routes report and apply through disjoint functions.
+#
+# SUBCOMMANDS
+#   heimdall-cleanup                 report (DEFAULT): read-only unified memory+disk health +
+#                                    reclaimable-now total. Exit = worst severity (0/1/2).
+#   heimdall-cleanup report          same, explicit.
+#   heimdall-cleanup --json          machine-readable {severity,memory,disk,procs,reclaim}.
+#   heimdall-cleanup --apply | reap  reap hmd's OWN garbage: orphaned hmd python (any present)
+#                                    + gc disk. Prints reclaimed MB + freed resident RAM.
+#   heimdall-cleanup --deep          SUGGEST-only handoff to the mac-deep-clean skill for the
+#                                    heavier, confirm-gated disk cleanup. Reaps NOTHING itself.
+#   heimdall-cleanup --auto          the HOOK path (SessionStart/End). Runs gc (hmd disk) always;
+#                                    reaps orphaned hmd python ONLY on a genuine runaway
+#                                    (count >= ORPHAN_CRIT) so a live session's keeper is never
+#                                    killed; SUGGESTS (one line) at/above ORPHAN_WARN. Honors the
+#                                    opt-out. Non-spammy: silent unless it acted or there's pressure.
+#   --quiet   suppress the human report (used by --auto).  --repo <path>  passthrough to gc.
+#   --quick   passthrough to gc (temp+procs only; skips the slower worktree+version pass) —
+#             used by the SessionStart hook so startup stays fast; SessionEnd runs the full sweep.
+#
+# OPT-OUT (mirrors heimdall-autoupdate): HEIMDALL_NO_CLEANUP=1 or ~/.heimdall/no-cleanup.
+# Honored in the --auto/hook path so a normal run can fully disable the automatic cleanup.
+#
+# CROSS-PLATFORM HONESTY. sysmon's swap/wired grading is macOS-shaped (vm_stat / vm.swapusage).
+# On Linux we do NOT stub it: memory pressure is read for real from /proc/meminfo, and the
+# hmd-orphan scope still routes through sysmon's matcher (ppid==1 is orphaned-to-init there
+# too). gc is portable (find/stat -c fallback). On an unknown OS memory grading is DECLARED
+# unsupported (not faked) and only the disk/orphan axes run.
+#
+# EXIT: 0 healthy · 1 WARN (cleanup advisable) · 2 CRITICAL (act now / a live leak). --apply
+# and --deep exit 0 on success.
+set -uo pipefail
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SYSMON="${HMD_CLEANUP_SYSMON:-$SELF_DIR/heimdall-sysmon}"
+GC="${HMD_CLEANUP_GC:-$SELF_DIR/heimdall-gc}"
+
+OS="$(uname -s 2>/dev/null || echo unknown)"
+
+# thresholds (shared with sysmon so the two never disagree on "is this a leak")
+ORPHAN_WARN="${HMD_SYSMON_ORPHAN_WARN:-20}"    # >= → SUGGEST a reap
+ORPHAN_CRIT="${HMD_SYSMON_ORPHAN_CRIT:-80}"    # >= → a runaway; --auto reaps unasked
+SWAP_WARN_PCT="${HMD_SYSMON_SWAP_WARN_PCT:-40}"
+MEM_AVAIL_WARN_PCT="${HMD_CLEANUP_MEM_AVAIL_WARN_PCT:-15}"   # linux: MemAvailable% below → warn
+
+# opt-out (env OR marker file), matching heimdall-autoupdate's idiom.
+HMD_HOME="${HEIMDALL_HOME:-${HOME:-}/.heimdall}"
+NO_CLEANUP_FILE="$HMD_HOME/no-cleanup"
+opted_out() {
+  [ "${HEIMDALL_NO_CLEANUP:-0}" = "1" ] && return 0
+  [ -f "$NO_CLEANUP_FILE" ] && return 0
+  return 1
+}
+
+# ── test seams (never set in production) ─────────────────────────────────────────
+#   HMD_CLEANUP_PS_ROWS   file of `pid ppid command…` rows, used instead of live ps for
+#                         orphan scoping (lets a test plant a foreign proc + assert exclusion).
+#   HMD_CLEANUP_KILL_CMD  a `cmd <pid>…`-recording stub used instead of sysmon --reap-hmd-orphans
+#                         so a test proves the reap SCOPE without signalling any real process.
+PS_ROWS_FILE="${HMD_CLEANUP_PS_ROWS:-}"
+KILL_CMD="${HMD_CLEANUP_KILL_CMD:-}"
+
+# ── argv ─────────────────────────────────────────────────────────────────────────
+MODE="report"; JSON=0; QUIET=0; AUTO=0; QUICK=0; REPO=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    report)          MODE="report" ;;
+    reap|--apply|apply) MODE="apply" ;;
+    --deep|deep)     MODE="deep" ;;
+    --auto)          MODE="apply"; AUTO=1; QUIET=1 ;;
+    --quick)         QUICK=1 ;;
+    --json)          JSON=1 ;;
+    --quiet|-q)      QUIET=1 ;;
+    --repo)          REPO="${2:-}"; shift ;;
+    --repo=*)        REPO="${1#--repo=}" ;;
+    -h|--help)       grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "heimdall-cleanup: unknown argument: $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+# ── shared probes (read-only) ────────────────────────────────────────────────────
+
+# raw `pid ppid command…` rows — from the test seam, or live ps (both BSD + Linux forms).
+_ps_rows() {
+  if [ -n "$PS_ROWS_FILE" ]; then cat "$PS_ROWS_FILE" 2>/dev/null; return 0; fi
+  ps -axo pid=,ppid=,command= 2>/dev/null || ps -eo pid=,ppid=,command= 2>/dev/null || true
+}
+
+# the reap SCOPE — delegated entirely to sysmon's matcher (single source of truth).
+_orphan_pids() { _ps_rows | "$SYSMON" --filter-orphans 2>/dev/null || true; }
+
+# resident RAM (MB) held by a set of pids — the REAL memory a reap frees back (wired/swap
+# need a reboot; we never claim otherwise). 0 for synthetic test pids that don't exist.
+_rss_mb() {
+  [ "$#" -gt 0 ] || { echo 0; return 0; }
+  local list kb
+  list="$(printf '%s,' "$@")"; list="${list%,}"
+  kb="$(ps -o rss= -p "$list" 2>/dev/null | awk '{s+=$1} END{printf "%d", s+0}')"
+  echo $(( (kb + 512) / 1024 ))
+}
+
+# gc receipt (stdout) for disk accounting. dry -> --dry-run (mutates nothing).
+_gc_run() {
+  local extra=""
+  [ -n "$REPO" ] && extra="--repo $REPO"
+  [ "$QUICK" = 1 ] && extra="$extra --quick"
+  if [ "$1" = "dry" ]; then
+    "$GC" run --dry-run $extra 2>/dev/null || true
+  else
+    "$GC" run $extra 2>/dev/null || true
+  fi
+}
+_gc_kb() { sed -n 's/.*temp file(s) ~\([0-9]*\)KB.*/\1/p' | head -1; }
+_gc_mb() { sed -n 's/.*claude version(s) ~\([0-9]*\)MB.*/\1/p' | head -1; }
+_gc_wt() { sed -n 's/.*freed \([0-9]*\) worktree(s).*/\1/p' | head -1; }
+_gc_tempn() { sed -n 's/.*, \([0-9]*\) temp file(s).*/\1/p' | head -1; }
+_gc_ccn() { sed -n 's/.*, \([0-9]*\) retired claude version(s).*/\1/p' | head -1; }
+_num() { case "$1" in ''|*[!0-9]*) echo 0 ;; *) echo "$1" ;; esac; }
+
+# ── memory pressure: macOS via sysmon, Linux via /proc/meminfo (REAL, not stubbed) ──
+mem_status="ok"; mem_desc="unsupported on $OS"; wired_pct=0; swap_pct=0; avail_pct=0
+_probe_memory() {
+  if [ "$OS" = "Darwin" ] && [ -x "$SYSMON" ]; then
+    local js
+    js="$("$SYSMON" --json 2>/dev/null || true)"
+    mem_status="$(printf '%s' "$js" | sed -n 's/.*"memory":{"status":"\([a-z]*\)".*/\1/p')"
+    swap_pct="$(_num "$(printf '%s' "$js" | sed -n 's/.*"swap_used_pct":\([0-9]*\).*/\1/p')")"
+    wired_pct="$(_num "$(printf '%s' "$js" | sed -n 's/.*"wired_pct":\([0-9]*\).*/\1/p')")"
+    [ -n "$mem_status" ] || mem_status="ok"
+    mem_desc="swap ${swap_pct}% · wired ${wired_pct}%"
+    return 0
+  fi
+  if [ -r /proc/meminfo ]; then
+    local total avail stot sfree
+    total="$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null)"
+    avail="$(awk '/^MemAvailable:/{print $2}' /proc/meminfo 2>/dev/null)"
+    stot="$(awk '/^SwapTotal:/{print $2}' /proc/meminfo 2>/dev/null)"
+    sfree="$(awk '/^SwapFree:/{print $2}' /proc/meminfo 2>/dev/null)"
+    total="$(_num "$total")"; avail="$(_num "$avail")"; stot="$(_num "$stot")"; sfree="$(_num "$sfree")"
+    if [ "$total" -gt 0 ]; then avail_pct=$(( avail * 100 / total )); fi
+    if [ "$stot" -gt 0 ]; then swap_pct=$(( (stot - sfree) * 100 / stot )); fi
+    mem_desc="avail ${avail_pct}% · swap ${swap_pct}%"
+    mem_status="ok"
+    [ "$swap_pct" -ge "$SWAP_WARN_PCT" ] && mem_status="warn"
+    [ "$avail_pct" -le "$MEM_AVAIL_WARN_PCT" ] && [ "$total" -gt 0 ] && mem_status="warn"
+    return 0
+  fi
+  # unknown OS: declare unsupported honestly; never fabricate a memory grade.
+  mem_status="ok"; mem_desc="memory grading unsupported on $OS (no vm_stat, no /proc/meminfo)"
+}
+
+# ── disk pressure: reuse sysmon's whole-volume read on macOS; df elsewhere ─────────
+disk_status="ok"; disk_desc=""
+_probe_disk() {
+  if [ "$OS" = "Darwin" ] && [ -x "$SYSMON" ]; then
+    local js used free
+    js="$("$SYSMON" --json 2>/dev/null || true)"
+    disk_status="$(printf '%s' "$js" | sed -n 's/.*"disk":{"status":"\([a-z]*\)".*/\1/p')"
+    used="$(_num "$(printf '%s' "$js" | sed -n 's/.*"used_pct":\([0-9]*\).*/\1/p')")"
+    [ -n "$disk_status" ] || disk_status="ok"
+    disk_desc="${used}% used (Data volume)"
+    return 0
+  fi
+  local line used
+  line="$(df -Pk / 2>/dev/null | awk 'NR==2{print $5}' | tr -d '%')"
+  used="$(_num "$line")"
+  disk_desc="${used}% used (/)"
+  disk_status="ok"
+  [ "$used" -ge 85 ] && disk_status="warn"
+  [ "$used" -ge 93 ] && disk_status="crit"
+}
+
+_rank() { case "$1" in crit) echo 2 ;; warn) echo 1 ;; *) echo 0 ;; esac; }
+
+# ── REPORT (read-only) ────────────────────────────────────────────────────────────
+do_report() {
+  _probe_memory
+  _probe_disk
+  local pids orphans rss
+  pids="$(_orphan_pids)"
+  orphans="$(printf '%s\n' "$pids" | grep -c . || true)"; orphans="$(_num "$orphans")"
+  # shellcheck disable=SC2086
+  rss="$([ "$orphans" -gt 0 ] && _rss_mb $pids || echo 0)"
+
+  local proc_status="ok"
+  [ "$orphans" -ge "$ORPHAN_WARN" ] && proc_status="warn"
+  [ "$orphans" -ge "$ORPHAN_CRIT" ] && proc_status="crit"
+
+  local receipt kb mb wt tempn ccn reclaim_mb
+  receipt="$(_gc_run dry)"
+  kb="$(_num "$(printf '%s' "$receipt" | _gc_kb)")"
+  mb="$(_num "$(printf '%s' "$receipt" | _gc_mb)")"
+  wt="$(_num "$(printf '%s' "$receipt" | _gc_wt)")"
+  tempn="$(_num "$(printf '%s' "$receipt" | _gc_tempn)")"
+  ccn="$(_num "$(printf '%s' "$receipt" | _gc_ccn)")"
+  reclaim_mb=$(( (kb + 1023) / 1024 + mb ))
+
+  local sev=0 r
+  for s in "$mem_status" "$disk_status" "$proc_status"; do r="$(_rank "$s")"; [ "$r" -gt "$sev" ] && sev="$r"; done
+  local sev_word="ok"; [ "$sev" = 1 ] && sev_word="warn"; [ "$sev" = 2 ] && sev_word="crit"
+
+  if [ "$JSON" = 1 ]; then
+    printf '{'
+    printf '"severity":"%s",' "$sev_word"
+    printf '"memory":{"status":"%s","swap_pct":%s,"wired_pct":%s,"avail_pct":%s},' \
+      "$mem_status" "$swap_pct" "$wired_pct" "$avail_pct"
+    printf '"disk":{"status":"%s"},' "$disk_status"
+    printf '"procs":{"status":"%s","hmd_orphans":%s,"resident_mb":%s},' "$proc_status" "$orphans" "$rss"
+    printf '"reclaim":{"disk_mb":%s,"temp_files":%s,"temp_kb":%s,"cc_versions":%s,"cc_mb":%s,"worktrees":%s}' \
+      "$reclaim_mb" "$tempn" "$kb" "$ccn" "$mb" "$wt"
+    printf '}\n'
+    return "$sev"
+  fi
+
+  if [ "$QUIET" = 1 ] && [ "$sev" = 0 ] && [ "$reclaim_mb" = 0 ] && [ "$orphans" = 0 ]; then
+    return 0
+  fi
+
+  local _l="  %-8s %-5s %s\n"
+  printf 'heimdall-cleanup — system health: %s\n' "$(printf '%s' "$sev_word" | tr '[:lower:]' '[:upper:]')"
+  printf "$_l" "memory" "$mem_status" "$mem_desc"
+  if [ "$orphans" -gt 0 ]; then
+    printf "$_l" "procs" "$proc_status" "${orphans} orphaned heimdall python (~${rss}MB resident, reap-safe)"
+  else
+    printf "$_l" "procs" "$proc_status" "no heimdall python leak"
+  fi
+  printf "$_l" "disk" "$disk_status" "$disk_desc"
+  printf "$_l" "reclaim" "-" "hmd-owned: ${tempn} temp ~${kb}KB · ${ccn} retired claude version(s) ~${mb}MB · ${wt} merged worktree(s) → ~${reclaim_mb}MB reclaimable now"
+
+  if [ "$sev" = 0 ] && [ "$reclaim_mb" = 0 ] && [ "$orphans" = 0 ]; then
+    printf 'suggestion: none — healthy.\n'
+    return 0
+  fi
+  printf 'suggestion:\n'
+  if [ "$orphans" -ge "$ORPHAN_WARN" ] || [ "$reclaim_mb" -gt 0 ]; then
+    printf '  • reap heimdall'\''s OWN garbage (foreign procs + user files untouched):\n'
+    printf '      heimdall-cleanup --apply\n'
+  fi
+  if [ "$mem_status" != "ok" ]; then
+    printf '  • memory pressure: after the reap, wired RAM + swap only fully clear on reboot.\n'
+  fi
+  if [ "$disk_status" != "ok" ]; then
+    printf '  • disk is under pressure — heavier cleanup (caches / dead repos / SDK bloat):\n'
+    printf '      heimdall-cleanup --deep\n'
+  fi
+  return "$sev"
+}
+
+# ── APPLY (reap hmd's OWN garbage only) ───────────────────────────────────────────
+do_apply() {
+  if [ "$AUTO" = 1 ] && opted_out; then return 0; fi
+
+  local pids orphans rss threshold reaped=0
+  pids="$(_orphan_pids)"
+  orphans="$(printf '%s\n' "$pids" | grep -c . || true)"; orphans="$(_num "$orphans")"
+  # manual --apply reaps ANY present hmd orphan; --auto reaps ONLY a genuine runaway
+  # (>= ORPHAN_CRIT) so a normal session's live presence keeper is never killed.
+  threshold=1; [ "$AUTO" = 1 ] && threshold="$ORPHAN_CRIT"
+
+  # shellcheck disable=SC2086
+  rss="$([ "$orphans" -gt 0 ] && _rss_mb $pids || echo 0)"
+
+  if [ "$orphans" -ge "$threshold" ] && [ "$orphans" -gt 0 ]; then
+    if [ -n "$KILL_CMD" ]; then
+      # controlled/test path: signal EXACTLY the scoped pids, nothing else.
+      # shellcheck disable=SC2086
+      $KILL_CMD $pids 2>/dev/null || true
+      reaped="$orphans"
+    else
+      # production: delegate to sysmon's reaper (re-derives the same scope + stops the spawner).
+      "$SYSMON" --reap-hmd-orphans >/dev/null 2>&1 || true
+      reaped="$orphans"
+    fi
+  fi
+
+  # disk: full gc (hmd's own worktrees/temp/logs/retired versions — each proof-gated).
+  local receipt kb mb reclaim_mb
+  receipt="$(_gc_run wet)"
+  kb="$(_num "$(printf '%s' "$receipt" | _gc_kb)")"
+  mb="$(_num "$(printf '%s' "$receipt" | _gc_mb)")"
+  reclaim_mb=$(( (kb + 1023) / 1024 + mb ))
+
+  if [ "$QUIET" = 1 ]; then
+    # --auto: speak ONLY when something happened or a leak is being suggested.
+    if [ "$reaped" -gt 0 ] || [ "$reclaim_mb" -gt 0 ]; then
+      printf 'heimdall-cleanup: reaped %d orphaned hmd python (~%dMB resident), reclaimed ~%dMB disk.\n' \
+        "$reaped" "$rss" "$reclaim_mb"
+    elif [ "$AUTO" = 1 ] && [ "$orphans" -ge "$ORPHAN_WARN" ]; then
+      printf 'heimdall-cleanup: %d orphaned hmd python detected — run `heimdall-cleanup --apply` to reap (foreign procs untouched).\n' "$orphans"
+    fi
+    return 0
+  fi
+
+  printf 'heimdall-cleanup --apply: reaped %d orphaned heimdall python (~%dMB resident freed; wired RAM/swap clear on reboot), reclaimed ~%dMB disk.\n' \
+    "$reaped" "$rss" "$reclaim_mb"
+  return 0
+}
+
+# ── DEEP (suggest-only handoff — reaps NOTHING) ───────────────────────────────────
+do_deep() {
+  cat <<'EOF'
+heimdall-cleanup --deep — heavier disk cleanup is CONFIRM-GATED, not automatic.
+
+This step reclaims user-facing disk beyond heimdall's own footprint (SDK/simulator
+bloat, dead repos, large caches). It is handed to the tiered mac-deep-clean skill,
+which investigates READ-ONLY first and deletes only after you confirm each tier.
+
+  → invoke the 'mac-deep-clean' skill (macOS) for the guided, confirm-gated sweep.
+
+heimdall-cleanup itself never auto-deletes anything outside heimdall's own garbage.
+For that safe subset run:  heimdall-cleanup --apply
+EOF
+  return 0
+}
+
+# ── dispatch (report and apply are DISJOINT — report can never reach a reap) ──────
+case "$MODE" in
+  report) do_report ;;
+  apply)  do_apply ;;
+  deep)   do_deep ;;
+esac
