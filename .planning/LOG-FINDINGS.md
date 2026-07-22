@@ -68,18 +68,19 @@
 - **Observation:** Two comments in the same file disagree about when the team secret is transmitted.
 - **Evidence:**
   - `bin/heimdall-presence:350` (docstring): *"It is sent ONCE in the X-Heimdall-Team-Secret header at /enroll; signed beats/reads thereafter carry NO secret."*
+  - `bin/heimdall-presence:508` (the `/enroll` docstring): **a second** stale copy — *"it is sent ONCE here at enroll; signed beats/reads thereafter carry NO secret."*
   - `bin/heimdall-presence:471` (inside `def request()`, the **shared** helper for every call — `:456`): *"The per-repo TEAM SECRET rides the header on EVERY presence call (beat / retire / roster), not just enroll."*
   - Code confirms `:471` is the truth: `request()` at `:475-476` adds `X-Heimdall-Team-Secret` whenever `PRES_TEAM_SECRET` is set, for **any** method/path — beats included.
-- **Root cause:** `:350` is stale text describing an earlier one-shot-enroll design; the code moved to per-call secret (the "BUG2 write↔read round-trip") but the docstring wasn't updated. It's a security-relevant claim (implies beats are secret-free when they are not).
-- **Fix:** Correct `:350` to "sent on EVERY presence call (enroll/beat/retire/roster) in the X-Heimdall-Team-Secret header," matching `:471` and the code.
+- **Root cause:** `:350` and `:508` are stale text describing an earlier one-shot-enroll design; the code moved to per-call secret (the "BUG2 write↔read round-trip") but the two docstrings weren't updated. It's a security-relevant claim (implies beats are secret-free when they are not) — and it appears **twice**, so a reader is doubly misled.
+- **Fix:** Correct **both** `:350` and `:508` to "sent on EVERY presence call (enroll/beat/retire/roster) in the X-Heimdall-Team-Secret header," matching `:471` and the code.
 - **Falsify:** Read `:475-476` — header is added unconditionally on `PRES_TEAM_SECRET`, not gated on `path == "/enroll"`. Already confirmed.
 
 ### F5 — Coordination `protocol.log` is empty (0 bytes) — coordination telemetry produces nothing  · CONFIRMED
 
 - **Observation / Evidence:** `wc -l .planning/protocol.log` → **0**. The task named it the primary source for retries/timeouts/R1-collisions/reaped-claims/stalled-agents. None of that has ever been logged here.
-- **Root cause hypothesis (needs a code trace to confirm — SUSPECTED):** either the coordination ledger writes elsewhere (MCP `heimdall-ledger`), or the protocol-log writer is unwired like F1/F2. This session's ledger is over MCP, so local `protocol.log` may simply be the wrong/legacy sink.
-- **Fix:** Confirm the intended sink; if `protocol.log` is dead, remove references to it (docs/task expectations) or wire the writer. Do **not** treat "empty" as "healthy."
-- **Falsify:** `grep -rn "protocol.log" bin lib` — if there is a writer, drive a coordination event and confirm a line lands; if there is no writer, the file is vestigial.
+- **Root cause (now confirmed):** The writer **exists and works** — `bin/lib/protocol.sh:66` does `printf '%s\t%s\t%s\t%s\n' ... >> "$PROTOCOL_LOG"`. The file is empty because the **local** coordination-audit path (`proto_log`/`proto_audit`) was never invoked in this repo; coordination this session runs over the MCP `heimdall-ledger`, not the local bash protocol. So `protocol.log` is a live-but-unexercised sink, not a dead one — the task's premise that it holds retries/collisions/reaps is simply not met here because no local coordination sequence ran.
+- **Fix:** Either route real coordination through `protocol.sh` so the audit log populates (making these events mineable), or scope docs to say the audit log only fills on local (non-MCP) coordination. Don't treat empty as healthy, and don't treat it as broken.
+- **Falsify:** Run a local coordination op that calls `proto_log`; confirm a tab-delimited line lands in `.planning/protocol.log`. It will — the appender is real.
 
 ### F6 — "Agents confidently write claims from partial reads" IS a recurring, evidenced class  · CONFIRMED (pattern)
 
@@ -102,6 +103,14 @@
 - **Fix:** Either surface parallelism ratio in the self-improve report (it's the only populated signal today), or accept it's advisory-only and stop implying it feeds routing. Pairs with F1: once `task` records exist, low-parallelism sessions can be correlated with outcomes.
 - **Falsify:** `heimdall-self-improve` output references parallelism ratio, or a doc explicitly scopes it as advisory. Today neither is true.
 
+### F8 — `.gitignore` ignores all of `.planning/`, contradicting CLAUDE.md's "git-committed" rule  · CONFIRMED
+
+- **Observation:** Committing this very report required `git add -f` — `.planning/LOG-FINDINGS.md` is gitignored.
+- **Evidence:** `git check-ignore -v` → `.gitignore:116:.planning/*`. CLAUDE.md (all three copies) states: *"Planning state lives in `.planning/` (human-readable, git-committed)."* The ignore rule makes that false for anything not explicitly force-added or re-included.
+- **Root cause:** A broad `.planning/*` ignore (added to keep transient state out of git) directly conflicts with the documented convention that planning state IS committed. Whichever is intended, the two disagree.
+- **Fix:** Decide the policy and make it consistent — either narrow the ignore to the transient files (`.planning/*.lock`, caches) and un-ignore human-readable planning docs, or amend CLAUDE.md to say planning state is local-only. Today a `git add` of a planning doc silently no-ops, which is a foot-gun (a prior agent could believe it committed planning state when it did not).
+- **Falsify:** `git check-ignore .planning/LOG-FINDINGS.md` returns the path (ignored) while CLAUDE.md claims it is committed — already confirmed, the two contradict.
+
 ---
 
 ## Quick wins (≤1hr) vs structural
@@ -111,7 +120,8 @@
 | F3a | SKILL.md:47 wrong `collect` arg order | ~10 min | quick |
 | F4 | presence:350 stale "sent ONCE" comment | ~10 min | quick |
 | F3b | claude-mem install: skip not fail on no-TTY | ~30 min | quick |
-| F5 | protocol.log dead-sink confirm/remove | ~30 min | quick (after trace) |
+| F5 | protocol.log unexercised sink — route coord or scope docs | ~30 min | quick |
+| F8 | `.gitignore` `.planning/*` vs CLAUDE.md "git-committed" | ~10 min | quick |
 | F1 | wire `metric:"task"` emitter at the gate | structural | structural |
 | F2 | wire run-lifecycle telemetry into real run | structural | structural |
 | F6 | claim-provenance / SKILL-command smoke gate | structural | structural |
@@ -126,8 +136,8 @@
 
 ## CONFIRMED vs SUSPECTED
 
-- **CONFIRMED (evidence in hand):** F1 (collect run + writer census), F2 (event histogram + caller census), F3a (command errored), F3b (15 failed events enumerated), F4 (two comments + code at :475), F5 (0-byte file), F6 (git-log chain + F3a/F4 fresh), F7 (computed ratios).
-- **SUSPECTED (needs a run/trace):** F5 root cause (is protocol.log a dead sink or wrong sink? — needs `grep` for its writer). Whether wiring F1/F2 at heimdall:2673 is the *correct* single hook vs. per-agent verifier — needs a read of the verifier return path.
+- **CONFIRMED (evidence in hand):** F1 (collect run + writer census), F2 (event histogram + caller census), F3a (command errored), F3b (15 failed events enumerated), F4 (three comments — :350/:508 stale, :471 true — + code at :475), F5 (0-byte file + real appender at protocol.sh:66), F6 (git-log chain + F3a/F4 fresh), F7 (computed ratios), F8 (`git check-ignore` + CLAUDE.md text).
+- **SUSPECTED (needs a run/trace):** Whether wiring F1/F2 at heimdall:2673 is the *correct* single hook vs. per-agent verifier return path — needs a read of the verifier gate to pick the exact emit site.
 
 ---
 *No invented log data. Every claim above traces to a real file:line or a command run this session.*
