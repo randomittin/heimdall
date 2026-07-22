@@ -21,9 +21,10 @@
 # surface: it adds unification + a safe auto path, and zero new reaping logic.
 #
 # THE READ-ONLY CONTRACT (the cc-selfheal lesson: a "status" that secretly mutated CAUSED the
-# error it existed to prevent). `report` (the DEFAULT) is PROVABLY read-only: it calls only
-# `sysmon` (no mutating flag), `gc run --dry-run`, and read-only probes (df, ps, /proc). It
-# can NOT reach the reap path — dispatch routes report and apply through disjoint functions.
+# error it existed to prevent). `report` (the DEFAULT) and `--advise` are PROVABLY read-only:
+# they call only `sysmon` (no mutating flag), `gc run --dry-run`, and read-only probes (df, ps,
+# /proc). Neither can reach the reap path — dispatch routes report/advise and apply through
+# disjoint functions.
 #
 # SUBCOMMANDS
 #   heimdall-cleanup                 report (DEFAULT): read-only unified memory+disk health +
@@ -32,6 +33,12 @@
 #   heimdall-cleanup --json          machine-readable {severity,memory,disk,procs,reclaim}.
 #   heimdall-cleanup --apply | reap  reap hmd's OWN garbage: orphaned hmd python (any present)
 #                                    + gc disk. Prints reclaimed MB + freed resident RAM.
+#   heimdall-cleanup --advise        READ-ONLY memory-pressure advisory for the SessionStart
+#                                    hook: when swap/wired are genuinely HIGH (>= REBOOT_*_PCT)
+#                                    it prints an HONEST reboot recommendation — and when the
+#                                    pressure is NOT heimdall (no hmd python leak) it SAYS SO and
+#                                    points at a restart, so the user is never left thinking hmd
+#                                    is the hog. Silent on a healthy machine. Honors the opt-out.
 #   heimdall-cleanup --deep          SUGGEST-only handoff to the mac-deep-clean skill for the
 #                                    heavier, confirm-gated disk cleanup. Reaps NOTHING itself.
 #   heimdall-cleanup --auto          the HOOK path (SessionStart/End). Runs gc (hmd disk) always;
@@ -60,13 +67,19 @@ SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SYSMON="${HMD_CLEANUP_SYSMON:-$SELF_DIR/heimdall-sysmon}"
 GC="${HMD_CLEANUP_GC:-$SELF_DIR/heimdall-gc}"
 
-OS="$(uname -s 2>/dev/null || echo unknown)"
+OS="${HMD_CLEANUP_OS:-$(uname -s 2>/dev/null || echo unknown)}"
 
 # thresholds (shared with sysmon so the two never disagree on "is this a leak")
 ORPHAN_WARN="${HMD_SYSMON_ORPHAN_WARN:-20}"    # >= → SUGGEST a reap
 ORPHAN_CRIT="${HMD_SYSMON_ORPHAN_CRIT:-80}"    # >= → a runaway; --auto reaps unasked
 SWAP_WARN_PCT="${HMD_SYSMON_SWAP_WARN_PCT:-40}"
 MEM_AVAIL_WARN_PCT="${HMD_CLEANUP_MEM_AVAIL_WARN_PCT:-15}"   # linux: MemAvailable% below → warn
+# reboot-advisory thresholds: at/above these, the pressure is kernel-wired RAM + swap that
+# heimdall CANNOT free — only a reboot clears it. Set genuinely-high (above the WARN grades)
+# so a healthy machine is never nagged. When crossed AND hmd is clean, the report says so
+# honestly and points at a reboot instead of letting the user think hmd is the hog.
+REBOOT_SWAP_PCT="${HMD_CLEANUP_REBOOT_SWAP_PCT:-80}"    # swap % of total in use → reboot-worthy
+REBOOT_WIRED_PCT="${HMD_CLEANUP_REBOOT_WIRED_PCT:-80}"  # wired RAM % of total → reboot-worthy
 
 # opt-out (env OR marker file), matching heimdall-autoupdate's idiom.
 HMD_HOME="${HEIMDALL_HOME:-${HOME:-}/.heimdall}"
@@ -82,6 +95,8 @@ opted_out() {
 #                         orphan scoping (lets a test plant a foreign proc + assert exclusion).
 #   HMD_CLEANUP_KILL_CMD  a `cmd <pid>…`-recording stub used instead of sysmon --reap-hmd-orphans
 #                         so a test proves the reap SCOPE without signalling any real process.
+#   HMD_CLEANUP_OS        override for `uname -s`, so a test can pin the memory-probe path
+#                         (Darwin→sysmon) deterministically on any CI host.
 PS_ROWS_FILE="${HMD_CLEANUP_PS_ROWS:-}"
 KILL_CMD="${HMD_CLEANUP_KILL_CMD:-}"
 
@@ -91,6 +106,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     report)          MODE="report" ;;
     reap|--apply|apply) MODE="apply" ;;
+    --advise|advise) MODE="advise" ;;
     --deep|deep)     MODE="deep" ;;
     --auto)          MODE="apply"; AUTO=1; QUIET=1 ;;
     --quick)         QUICK=1 ;;
@@ -145,6 +161,7 @@ _num() { case "$1" in ''|*[!0-9]*) echo 0 ;; *) echo "$1" ;; esac; }
 
 # ── memory pressure: macOS via sysmon, Linux via /proc/meminfo (REAL, not stubbed) ──
 mem_status="ok"; mem_desc="unsupported on $OS"; wired_pct=0; swap_pct=0; avail_pct=0
+swap_used_g=0; swap_total_g=0
 _probe_memory() {
   if [ "$OS" = "Darwin" ] && [ -x "$SYSMON" ]; then
     local js
@@ -152,8 +169,10 @@ _probe_memory() {
     mem_status="$(printf '%s' "$js" | sed -n 's/.*"memory":{"status":"\([a-z]*\)".*/\1/p')"
     swap_pct="$(_num "$(printf '%s' "$js" | sed -n 's/.*"swap_used_pct":\([0-9]*\).*/\1/p')")"
     wired_pct="$(_num "$(printf '%s' "$js" | sed -n 's/.*"wired_pct":\([0-9]*\).*/\1/p')")"
+    swap_used_g="$(printf '%s' "$js" | sed -n 's/.*"swap_used_g":\([0-9.]*\).*/\1/p')"; [ -n "$swap_used_g" ] || swap_used_g=0
+    swap_total_g="$(printf '%s' "$js" | sed -n 's/.*"swap_total_g":\([0-9.]*\).*/\1/p')"; [ -n "$swap_total_g" ] || swap_total_g=0
     [ -n "$mem_status" ] || mem_status="ok"
-    mem_desc="swap ${swap_pct}% · wired ${wired_pct}%"
+    mem_desc="swap ${swap_used_g}G/${swap_total_g}G (${swap_pct}%) · wired ${wired_pct}%"
     return 0
   fi
   if [ -r /proc/meminfo ]; then
@@ -197,6 +216,41 @@ _probe_disk() {
 }
 
 _rank() { case "$1" in crit) echo 2 ;; warn) echo 1 ;; *) echo 0 ;; esac; }
+
+# ── reboot advisory (HONEST attribution) ──────────────────────────────────────────
+# genuinely-HIGH memory pressure = swap OR wired at/above the reboot thresholds. This is
+# kernel-wired RAM + swap that heimdall did not cause and CANNOT free — only a reboot clears
+# it. Reads the real vm_stat/vm.swapusage figures (via sysmon) that _probe_memory already set.
+_reboot_worthy() {
+  [ "$swap_pct" -ge "$REBOOT_SWAP_PCT" ] 2>/dev/null && return 0
+  [ "$wired_pct" -ge "$REBOOT_WIRED_PCT" ] 2>/dev/null && return 0
+  return 1
+}
+
+# print the reboot recommendation. Attribution is the whole point: when hmd is CLEAN (no python
+# leak) SAY SO and point at a reboot; when hmd IS holding RAM (orphan leak) recommend --apply
+# FIRST, then reboot for the residual wired/swap. Every number is a real reading.
+#   $1 orphans   $2 resident-MB held by those orphans   $3 hmd-reclaimable disk MB
+_reboot_advisory() {
+  local orphans="$1" rss="$2" reclaim_mb="$3"
+  if [ "$orphans" -gt 0 ]; then
+    printf '  • memory pressure is HIGH (swap %sG/%sG = %s%%, wired %s%%). Part of it IS heimdall —\n' \
+      "$swap_used_g" "$swap_total_g" "$swap_pct" "$wired_pct"
+    printf '    %s orphaned hmd python holding ~%sMB resident. Reap heimdall'\''s OWN leak FIRST:\n' "$orphans" "$rss"
+    printf '        heimdall-cleanup --apply\n'
+    printf '    The remainder is kernel-wired RAM + swap, which clear ONLY on reboot — after the reap,\n'
+    printf '    a restart clears the residue. Heimdall reaps only its own footprint and cannot free\n'
+    printf '    kernel-wired memory.\n'
+    printf '      → run --apply, then save your work and reboot\n'
+  else
+    printf '  • memory pressure is HIGH (swap %sG/%sG = %s%%, wired %s%%) — and this is NOT heimdall:\n' \
+      "$swap_used_g" "$swap_total_g" "$swap_pct" "$wired_pct"
+    printf '    no hmd python leak, ~%sMB of hmd-owned garbage total. Wired RAM and swap are\n' "$reclaim_mb"
+    printf '    kernel/driver-locked and clear ONLY on reboot — a restart is the fix. Heimdall reaps\n'
+    printf '    only its own footprint; it cannot free kernel-wired memory.\n'
+    printf '      → save your work, then reboot\n'
+  fi
+}
 
 # ── REPORT (read-only) ────────────────────────────────────────────────────────────
 do_report() {
@@ -262,8 +316,10 @@ do_report() {
     printf '  • reap heimdall'\''s OWN garbage (foreign procs + user files untouched):\n'
     printf '      heimdall-cleanup --apply\n'
   fi
-  if [ "$mem_status" != "ok" ]; then
-    printf '  • memory pressure: after the reap, wired RAM + swap only fully clear on reboot.\n'
+  if _reboot_worthy; then
+    _reboot_advisory "$orphans" "$rss" "$reclaim_mb"
+  elif [ "$mem_status" != "ok" ]; then
+    printf '  • memory pressure: after any reap, wired RAM + swap only fully clear on reboot.\n'
   fi
   if [ "$disk_status" != "ok" ]; then
     printf '  • disk is under pressure — heavier cleanup (caches / dead repos / SDK bloat):\n'
@@ -322,6 +378,31 @@ do_apply() {
   return 0
 }
 
+# ── ADVISE (read-only reboot advisory for the SessionStart hook) ──────────────────
+# Speaks ONLY when memory pressure is genuinely HIGH (reboot-worthy). Honors the opt-out.
+# Mutates NOTHING — sysmon read-only, orphan scope, gc --dry-run. Never reaps.
+do_advise() {
+  if opted_out; then return 0; fi
+  _probe_memory
+  _reboot_worthy || return 0   # non-spammy: silent on a healthy / merely-warn machine
+
+  local pids orphans rss
+  pids="$(_orphan_pids)"
+  orphans="$(printf '%s\n' "$pids" | grep -c . || true)"; orphans="$(_num "$orphans")"
+  # shellcheck disable=SC2086
+  rss="$([ "$orphans" -gt 0 ] && _rss_mb $pids || echo 0)"
+
+  local receipt kb mb reclaim_mb
+  receipt="$(_gc_run dry)"
+  kb="$(_num "$(printf '%s' "$receipt" | _gc_kb)")"
+  mb="$(_num "$(printf '%s' "$receipt" | _gc_mb)")"
+  reclaim_mb=$(( (kb + 1023) / 1024 + mb ))
+
+  printf '[heimdall] system-health advisory:\n'
+  _reboot_advisory "$orphans" "$rss" "$reclaim_mb"
+  return 0
+}
+
 # ── DEEP (suggest-only handoff — reaps NOTHING) ───────────────────────────────────
 do_deep() {
   cat <<'EOF'
@@ -339,9 +420,10 @@ EOF
   return 0
 }
 
-# ── dispatch (report and apply are DISJOINT — report can never reach a reap) ──────
+# ── dispatch (report/advise and apply are DISJOINT — a read-only mode never reaches a reap) ──
 case "$MODE" in
   report) do_report ;;
   apply)  do_apply ;;
+  advise) do_advise ;;
   deep)   do_deep ;;
 esac
