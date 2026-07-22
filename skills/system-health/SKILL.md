@@ -22,12 +22,32 @@ launchd-reparented *children* (nothing tracks them) — so they slip the collect
 real cleanup session was just purging these do-nothing python procs.** This advisor is the
 check that catches them early.
 
-## Run it
+## Run it — the unified core (both axes at once)
+
+`bin/heimdall-cleanup` is the ONE entrypoint that covers BOTH axes — MEMORY (RAM/swap +
+hmd's orphan leak) and DISK (hmd's own reclaimable garbage). It ORCHESTRATES the two
+reapers below; it never re-implements them. Reach for it first:
 
 ```bash
-heimdall-sysmon            # human report + a SUGGESTION block; exit 0 ok / 1 warn / 2 critical
+heimdall-cleanup           # report (DEFAULT, read-only): unified health + reclaimable-now MB
+heimdall-cleanup --json    # {severity, memory, disk, procs, reclaim} for programmatic use
+heimdall-cleanup --apply   # reap hmd's OWN garbage only (orphaned hmd python + gc disk)
+heimdall-cleanup --deep    # SUGGEST-only handoff to mac-deep-clean (confirm-gated, nothing auto)
+```
+
+`report` is provably read-only (sysmon with no mutating flag + `gc run --dry-run` + read-only
+probes) — the cc-selfheal lesson: a "status" that secretly mutates causes the error it exists
+to prevent. It is wired into SessionStart/End via `--auto` (runs gc always; reaps orphaned hmd
+python ONLY on a genuine runaway so a live keeper is never killed). Opt out with
+`HEIMDALL_NO_CLEANUP=1` or `~/.heimdall/no-cleanup`.
+
+### The underlying reapers (the core delegates to these — use directly for a single axis)
+
+```bash
+heimdall-sysmon            # MEMORY axis: human report + a SUGGESTION block; exit 0 ok / 1 warn / 2 critical
 heimdall-sysmon --quiet    # print ONLY when action is advised (ideal at session start)
 heimdall-sysmon --json     # {severity, disk, memory, procs, ...} for programmatic use
+heimdall-gc run            # DISK axis: reap merged worktrees / temp / logs / retired claude versions
 ```
 
 Three graded sections:

@@ -40,6 +40,8 @@
 #                                    killed; SUGGESTS (one line) at/above ORPHAN_WARN. Honors the
 #                                    opt-out. Non-spammy: silent unless it acted or there's pressure.
 #   --quiet   suppress the human report (used by --auto).  --repo <path>  passthrough to gc.
+#   --quick   passthrough to gc (temp+procs only; skips the slower worktree+version pass) —
+#             used by the SessionStart hook so startup stays fast; SessionEnd runs the full sweep.
 #
 # OPT-OUT (mirrors heimdall-autoupdate): HEIMDALL_NO_CLEANUP=1 or ~/.heimdall/no-cleanup.
 # Honored in the --auto/hook path so a normal run can fully disable the automatic cleanup.
@@ -84,13 +86,14 @@ PS_ROWS_FILE="${HMD_CLEANUP_PS_ROWS:-}"
 KILL_CMD="${HMD_CLEANUP_KILL_CMD:-}"
 
 # ── argv ─────────────────────────────────────────────────────────────────────────
-MODE="report"; JSON=0; QUIET=0; AUTO=0; REPO=""
+MODE="report"; JSON=0; QUIET=0; AUTO=0; QUICK=0; REPO=""
 while [ $# -gt 0 ]; do
   case "$1" in
     report)          MODE="report" ;;
     reap|--apply|apply) MODE="apply" ;;
     --deep|deep)     MODE="deep" ;;
     --auto)          MODE="apply"; AUTO=1; QUIET=1 ;;
+    --quick)         QUICK=1 ;;
     --json)          JSON=1 ;;
     --quiet|-q)      QUIET=1 ;;
     --repo)          REPO="${2:-}"; shift ;;
@@ -126,6 +129,7 @@ _rss_mb() {
 _gc_run() {
   local extra=""
   [ -n "$REPO" ] && extra="--repo $REPO"
+  [ "$QUICK" = 1 ] && extra="$extra --quick"
   if [ "$1" = "dry" ]; then
     "$GC" run --dry-run $extra 2>/dev/null || true
   else
