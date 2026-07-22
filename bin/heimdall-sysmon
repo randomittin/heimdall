@@ -29,6 +29,10 @@
 #   heimdall-sysmon --reap-hmd-orphans   kill heimdall's OWN orphaned python leak + its spawner
 #   heimdall-sysmon --filter-orphans     read `pid ppid command…` lines on stdin, print the pids
 #                                        the reaper WOULD target (the scoping oracle — testable)
+#   heimdall-sysmon --filter-idle-agents read `pid ppid pgid tty %cpu etime command…` rows on stdin,
+#                                        print the pids of FINISHED background heimdall AGENT
+#                                        subprocesses safe to reap (the idle-agent scoping oracle —
+#                                        the second single-source matcher, testable the same way).
 #
 # EXIT: 0 = healthy · 1 = WARN (cleanup advisable) · 2 = CRITICAL (act now / a live leak).
 set -u
@@ -55,6 +59,58 @@ HMD_ORPHAN_AWK='
     if ((cmd ~ /[Pp]ython/) && (cmd ~ /heimdall|\.heimdall|hmd-/)) { print $1; next }
   }'
 
+# the SECOND single source of truth — "is this a FINISHED heimdall AGENT subprocess safe to
+# reap?" — the exact analogue of HMD_ORPHAN_AWK but for `claude --agent` background procs, not
+# python. cc-update's whole lesson is NEVER signal a live claude, so this matcher is deliberately
+# conservative: a row is `pid ppid pgid tty %cpu etime command…` and is a reap target iff ALL hold:
+#   1. it is a heimdall agent subprocess: the command is `claude` AND carries `--agent` AND a
+#      heimdall marker (--agent heimdall / --plugin-dir …/heimdall / a heimdall-preamble file). A
+#      foreign `claude --agent x` with no heimdall marker is NEVER matched.
+#   2. it is DETACHED — no controlling terminal (tty is ?? / ? / -). RJ's FOREGROUND interactive
+#      session ALWAYS owns a real tty (ttysNNN); a spawned background agent's stdio is piped and it
+#      owns none. This single rule excludes every foreground/typed-in session, the one thing we must
+#      never kill — proven by the fixture that plants a ttys-attached agent and asserts it survives.
+#   3. it is NOT in the caller's own process tree: neither its pid nor its pgid is in
+#      SELF_EXCLUDE (the reaper injects its own ancestry pids + pgid + sid), so the live session
+#      that INVOKED the reaper can never be in its own reap set.
+#   4. it is CPU-IDLE — %cpu <= CPU_EPS (default 0.0: any measurable activity keeps it). A live
+#      working agent burns CPU; a finished one sits at 0.
+#   5. it is AGED past a GENEROUS floor: an ORPHAN (ppid==1 — its spawner already exited, the same
+#      abandoned-to-launchd signal HMD_ORPHAN_AWK uses) needs AGE_MIN; a still-parented-but-detached
+#      agent needs the far larger EXTREME_AGE (a multi-day straggler) before it is ever a target.
+# Thresholds arrive via -v from the caller (env-overridable) so the oracle stays a pure function.
+HMD_IDLE_AGENT_AWK='
+  function to_secs(e,   d,a,n,h,m,s,p) {
+    d=0
+    if (e ~ /-/) { split(e,p,"-"); d=p[1]+0; e=p[2] }
+    n=split(e,a,":")
+    if      (n==3) { h=a[1]+0; m=a[2]+0; s=a[3]+0 }
+    else if (n==2) { h=0;      m=a[1]+0; s=a[2]+0 }
+    else           { h=0;      m=0;      s=a[1]+0 }
+    return d*86400 + h*3600 + m*60 + s
+  }
+  {
+    pid=$1; ppid=$2+0; pgid=$3; tty=$4; cpu=$5+0; etime=$6
+    cmd=""; for (i=7;i<=NF;i++) cmd=cmd" "$i
+    # 1. heimdall agent subprocess
+    if (cmd !~ /claude/)   next
+    if (cmd !~ /--agent/)  next
+    if (cmd !~ /heimdall/) next
+    # 2. detached — no real controlling terminal (?? / ? / -). A device name (ttysNNN, s000,
+    #    console, anything with a digit or letters) means an attached session → NEVER a target.
+    if (tty !~ /^[?-]+$/) next
+    # 3. never the caller'"'"'s own tree
+    if (index(SELF, " " pid " ")  > 0) next
+    if (index(SELF, " " pgid " ") > 0) next
+    # 4. cpu-idle
+    if (cpu > CPU_EPS) next
+    # 5. aged past a generous floor (orphan: AGE_MIN; still-parented straggler: EXTREME_AGE)
+    secs = to_secs(etime)
+    if (ppid==1) { if (secs < AGE_MIN)     next }
+    else         { if (secs < EXTREME_AGE) next }
+    print pid
+  }'
+
 MODE="report"; JSON=0; QUIET=0
 for a in "$@"; do
   case "$a" in
@@ -62,6 +118,7 @@ for a in "$@"; do
     --quiet|-q) QUIET=1 ;;
     --reap-hmd-orphans|--reap) MODE="reap" ;;
     --filter-orphans) MODE="filter" ;;
+    --filter-idle-agents) MODE="filter-agents" ;;
     -h|--help) grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
   esac
 done
@@ -69,6 +126,19 @@ done
 # ── the scoping oracle: emit the pids the reaper would target, from stdin ps rows ──
 if [ "$MODE" = "filter" ]; then
   awk "$HMD_ORPHAN_AWK"
+  exit 0
+fi
+
+# ── the idle-AGENT scoping oracle: emit finished-background-agent pids safe to reap ──
+# SELF is the caller'"'"'s own ancestry (pids + pgid + sid), space-padded so `index(SELF," p ")`
+# is an exact whole-token test. Thresholds are env-overridable; defaults are conservative.
+if [ "$MODE" = "filter-agents" ]; then
+  IDLE_SELF=" ${HMD_IDLE_SELF_EXCLUDE:-} "
+  IDLE_AGE_MIN="${HMD_IDLE_AGE_MIN_SEC:-1800}"        # orphan (ppid==1) detached idle agent: >= 30 min
+  IDLE_EXTREME="${HMD_IDLE_EXTREME_AGE_SEC:-259200}"  # non-orphan detached idle straggler: >= 3 days
+  IDLE_CPU_EPS="${HMD_IDLE_CPU_EPS:-0}"               # %cpu at/below which a proc counts as idle
+  awk -v SELF="$IDLE_SELF" -v AGE_MIN="$IDLE_AGE_MIN" -v EXTREME_AGE="$IDLE_EXTREME" \
+      -v CPU_EPS="$IDLE_CPU_EPS" "$HMD_IDLE_AGENT_AWK"
   exit 0
 fi
 
