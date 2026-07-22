@@ -37,6 +37,22 @@
 #   watcher-matched PIDs that share THIS process's group (a child of this shell);
 #   nothing outside that narrow pattern is ever killed.
 #
+# ── Idle AGENT processes (the multi-day RAM leak) ────────────────────────────
+#   A finished `claude --agent heimdall` background subprocess stays RESIDENT for
+#   days after its task completes, pinning RAM. This axis reaps ONLY the ones that
+#   are PROVABLY finished background agents — never a live one, never RJ's foreground
+#   session. Scoping is delegated ENTIRELY to `heimdall-sysmon --filter-idle-agents`
+#   (the single source of truth, the exact analogue of its orphaned-python matcher):
+#   a proc is a target iff it is a heimdall `claude --agent` proc AND is DETACHED
+#   (no controlling tty — so every foreground/typed-in session is excluded) AND is
+#   NOT in THIS reaper's own process tree (we inject our full ancestry + pgid + sid
+#   so the session that INVOKED us can never be reaped) AND is CPU-idle AND aged past
+#   a generous floor (an orphan ≥30 min; a still-parented straggler ≥3 days). Report
+#   is default; --apply reaps GRACEFULLY: SIGTERM first, then — only for a proc that
+#   STAYED in the safe-to-reap set across a grace window and is still alive — SIGKILL.
+#   Freed resident RAM (RSS) is printed. --agents-only runs JUST this axis;
+#   --agents-json prints {idle_agents,resident_mb} read-only (for heimdall-cleanup).
+#
 # ── agent-pool reconciliation (only with --apply) ────────────────────────────
 #   Releases the lease named for each reaped worktree, then runs `agent-pool
 #   health-check` to drop leases whose pid is dead. Best-effort; never fatal.
@@ -65,59 +81,96 @@ KILL=0
 QUIET=0
 REPO=""
 MAIN_REF=""
+AGENTS_ONLY=0   # run ONLY the idle-agent-process axis (skip worktrees + pollers)
+AGENTS_JSON=0   # print {idle_agents,resident_mb} read-only and exit (for heimdall-cleanup)
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --apply)  APPLY=1 ;;
     --kill)   KILL=1 ;;
     --quiet)  QUIET=1 ;;
+    --agents-only) AGENTS_ONLY=1 ;;
+    --agents-json) AGENTS_JSON=1 ;;
     --repo)   REPO="${2:-}"; shift ;;
     --repo=*) REPO="${1#--repo=}" ;;
     --main)   MAIN_REF="${2:-}"; shift ;;
     --main=*) MAIN_REF="${1#--main=}" ;;
     -h|--help)
-      sed -n '2,60p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,72p' "$0" | sed 's/^# \{0,1\}//'
       exit 0 ;;
     *) echo "heimdall-reap-idle: unknown argument: $1" >&2; exit 2 ;;
   esac
   shift
 done
 
-command -v git >/dev/null 2>&1 || { echo "heimdall-reap-idle: git not found" >&2; exit 2; }
+# The worktree/poller axes need a git repo; the idle-AGENT axis is process-only and
+# repo-independent, so --agents-only / --agents-json skip repo resolution entirely
+# (heimdall-cleanup drives the agent axis with a non-git path).
+SELF_WT=""; MAIN_SHA=""
+if [ "$AGENTS_ONLY" = 0 ] && [ "$AGENTS_JSON" = 0 ]; then
+  command -v git >/dev/null 2>&1 || { echo "heimdall-reap-idle: git not found" >&2; exit 2; }
 
-# Resolve the repo root. The PRIMARY worktree is always the first entry of
-# `git worktree list` and is where .claude/worktrees/ lives, so scope is relative
-# to it — this keeps the reaper correct even when invoked from INSIDE a linked
-# agent worktree (where show-toplevel would wrongly point at the child).
-if [ -z "$REPO" ]; then
-  REPO="$(git worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10); exit}')"
-  [ -n "$REPO" ] || REPO="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+  # Resolve the repo root. The PRIMARY worktree is always the first entry of
+  # `git worktree list` and is where .claude/worktrees/ lives, so scope is relative
+  # to it — this keeps the reaper correct even when invoked from INSIDE a linked
+  # agent worktree (where show-toplevel would wrongly point at the child).
+  if [ -z "$REPO" ]; then
+    REPO="$(git worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10); exit}')"
+    [ -n "$REPO" ] || REPO="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+  fi
+  [ -n "$REPO" ] || { echo "heimdall-reap-idle: not inside a git repo (pass --repo)" >&2; exit 2; }
+  REPO="$(cd "$REPO" 2>/dev/null && pwd -P)" || { echo "heimdall-reap-idle: bad --repo path" >&2; exit 2; }
+  git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1 || { echo "heimdall-reap-idle: $REPO is not a git repo" >&2; exit 2; }
+
+  # The reaper must never reap the worktree it is itself running from.
+  SELF_WT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+  [ -n "$SELF_WT" ] && SELF_WT="$(cd "$SELF_WT" 2>/dev/null && pwd -P || echo "$SELF_WT")"
+
+  # Resolve the integration ref merges land on.
+  resolve_main() {
+    local r
+    for r in main master; do
+      if git -C "$REPO" rev-parse --verify -q "refs/heads/$r" >/dev/null 2>&1; then
+        echo "$r"; return 0
+      fi
+    done
+    # fall back to the primary worktree's current branch
+    git -C "$REPO" rev-parse --abbrev-ref HEAD 2>/dev/null
+  }
+  [ -n "$MAIN_REF" ] || MAIN_REF="$(resolve_main)"
+  MAIN_SHA="$(git -C "$REPO" rev-parse --verify -q "$MAIN_REF" 2>/dev/null || true)"
+  [ -n "$MAIN_SHA" ] || { echo "heimdall-reap-idle: cannot resolve main ref '$MAIN_REF' in $REPO" >&2; exit 2; }
 fi
-[ -n "$REPO" ] || { echo "heimdall-reap-idle: not inside a git repo (pass --repo)" >&2; exit 2; }
-REPO="$(cd "$REPO" 2>/dev/null && pwd -P)" || { echo "heimdall-reap-idle: bad --repo path" >&2; exit 2; }
-git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1 || { echo "heimdall-reap-idle: $REPO is not a git repo" >&2; exit 2; }
-
-# The reaper must never reap the worktree it is itself running from.
-SELF_WT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
-[ -n "$SELF_WT" ] && SELF_WT="$(cd "$SELF_WT" 2>/dev/null && pwd -P || echo "$SELF_WT")"
-
-# Resolve the integration ref merges land on.
-resolve_main() {
-  local r
-  for r in main master; do
-    if git -C "$REPO" rev-parse --verify -q "refs/heads/$r" >/dev/null 2>&1; then
-      echo "$r"; return 0
-    fi
-  done
-  # fall back to the primary worktree's current branch
-  git -C "$REPO" rev-parse --abbrev-ref HEAD 2>/dev/null
-}
-[ -n "$MAIN_REF" ] || MAIN_REF="$(resolve_main)"
-MAIN_SHA="$(git -C "$REPO" rev-parse --verify -q "$MAIN_REF" 2>/dev/null || true)"
-[ -n "$MAIN_SHA" ] || { echo "heimdall-reap-idle: cannot resolve main ref '$MAIN_REF' in $REPO" >&2; exit 2; }
 
 AGENTPOOL="${HEIMDALL_REAP_AGENTPOOL:-$(cd "$(dirname "$0")" && pwd)/agent-pool}"
 PS_CMD="${HEIMDALL_REAP_PS_CMD:-}"
+
+# ── idle-AGENT axis: seams + thresholds (never set in production) ─────────────────
+#   HEIMDALL_REAP_SYSMON        the scoping oracle (default: sibling heimdall-sysmon). A test
+#                               points it at a BROKEN stub to prove the checks can go red.
+#   HEIMDALL_REAP_AGENT_PS_CMD  emits `pid ppid pgid tty %cpu etime command…` rows instead of live
+#                               ps (lets a test plant foreground/live/foreign/self fixtures).
+#   HEIMDALL_REAP_KILL_CMD      a `cmd -SIG pid`-recording stub used instead of real `kill`, so a
+#                               test proves the reap SCOPE + the TERM→KILL escalation WITHOUT
+#                               signalling any real process. A `-0` liveness probe is NOT recorded.
+#   HEIMDALL_REAP_RSS_CMD       maps a pid list → total RSS kb (default: real `ps -o rss=`).
+#   HEIMDALL_REAP_SELF_EXCLUDE  extra pids/pgids to NEVER reap (merged with computed ancestry).
+#   HEIMDALL_REAP_GRACE_SEC     seconds between SIGTERM and SIGKILL (default 8; tests set 0).
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+SYSMON="${HEIMDALL_REAP_SYSMON:-$SELF_DIR/heimdall-sysmon}"
+AGENT_PS_CMD="${HEIMDALL_REAP_AGENT_PS_CMD:-}"
+KILL_CMD="${HEIMDALL_REAP_KILL_CMD:-}"
+RSS_CMD="${HEIMDALL_REAP_RSS_CMD:-}"
+GRACE_SEC="${HEIMDALL_REAP_GRACE_SEC:-8}"
+
+# opt-out (env OR marker file), matching heimdall-cleanup/heimdall-autoupdate. Honored on the
+# idle-agent REAP path so a dev can fully disable process-reaping.
+HMD_HOME="${HEIMDALL_HOME:-${HOME:-}/.heimdall}"
+opted_out() {
+  [ "${HEIMDALL_NO_CLEANUP:-0}" = "1" ] && return 0
+  [ -f "$HMD_HOME/no-cleanup" ] && return 0
+  return 1
+}
 
 # ── output helpers ───────────────────────────────────────────────────────────
 say()  { [ "$QUIET" = 1 ] || printf '%s\n' "$*"; }
@@ -131,6 +184,102 @@ REAP_CAND=0     # worktrees classified reapable (dry-run or apply)
 KEPT=0
 KEPT_NAMES=""
 PRUNED=0
+AGENT_CAND=0    # idle agent processes classified reapable
+AGENT_REAPED=0  # idle agent processes actually signalled/reaped (--apply)
+AGENT_RSS_MB=0  # resident RAM (MB) the reap frees back
+
+# ── idle-AGENT axis ──────────────────────────────────────────────────────────
+# rich process rows `pid ppid pgid tty %cpu etime command…` — from the seam or live ps.
+_agent_ps_rows() {
+  if [ -n "$AGENT_PS_CMD" ]; then "$AGENT_PS_CMD" 2>/dev/null; return 0; fi
+  ps -axo pid=,ppid=,pgid=,tty=,%cpu=,etime=,command= 2>/dev/null \
+    || ps -eo pid=,ppid=,pgid=,tty=,%cpu=,etime=,command= 2>/dev/null || true
+}
+
+# THIS reaper's own exclusion set: every ancestor pid up the tree (so the session that
+# invoked us is never a target — the pid-71532 catastrophe), plus our own pgid + sid.
+# Merged with any operator-supplied HEIMDALL_REAP_SELF_EXCLUDE.
+_self_exclude() {
+  local p="$$" acc="" guard=0
+  while [ -n "$p" ] && [ "$p" != "0" ] && [ "$guard" -lt 64 ]; do
+    acc="$acc $p"
+    p="$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')"
+    guard=$((guard+1))
+  done
+  local pgid sid
+  pgid="$( (ps -o pgid= -p $$ 2>/dev/null || echo '') | tr -d ' ' )"
+  sid="$( (ps -o sess= -p $$ 2>/dev/null || echo '') | tr -d ' ' )"
+  printf '%s %s %s %s' "$acc" "$pgid" "$sid" "${HEIMDALL_REAP_SELF_EXCLUDE:-}"
+}
+
+# total RSS (MB) held by a pid list — the REAL RAM a reap frees back (0 for synthetic
+# test pids that don't exist). Uses the seam if set, else real ps.
+_agent_rss_mb() {
+  [ "$#" -gt 0 ] || { echo 0; return 0; }
+  local kb list
+  if [ -n "$RSS_CMD" ]; then
+    kb="$("$RSS_CMD" "$@" 2>/dev/null | awk '{s+=$1} END{printf "%d", s+0}')"
+  else
+    list="$(printf '%s,' "$@")"; list="${list%,}"
+    kb="$(ps -o rss= -p "$list" 2>/dev/null | awk '{s+=$1} END{printf "%d", s+0}')"
+  fi
+  echo $(( (kb + 512) / 1024 ))
+}
+
+# the scope: pipe rich rows through sysmon's idle-agent oracle with our self-exclusion set.
+_idle_agent_pids() {
+  local self
+  self="$(_self_exclude)"
+  _agent_ps_rows | HMD_IDLE_SELF_EXCLUDE="$self" "$SYSMON" --filter-idle-agents 2>/dev/null || true
+}
+
+# signal a pid: through the recording stub if set (never a real process in tests), else real kill.
+# The stub records the SIGNAL it was asked to send; a `-0` liveness probe is passed but NOT counted.
+_sig() { # $1 = -TERM|-KILL|-0   $2 = pid
+  if [ -n "$KILL_CMD" ]; then "$KILL_CMD" "$1" "$2" 2>/dev/null; return $?; fi
+  kill "$1" "$2" 2>/dev/null
+}
+_alive() { _sig -0 "$1"; }
+
+reap_idle_agents() {
+  local pids pid
+  pids="$(_idle_agent_pids)"
+  [ -n "$pids" ] || return 0
+
+  # measure freed RSS across the candidate set BEFORE we signal anything.
+  # shellcheck disable=SC2086
+  AGENT_RSS_MB="$(_agent_rss_mb $pids)"
+
+  for pid in $pids; do
+    AGENT_CAND=$((AGENT_CAND+1))
+    line "AGENT" "pid $pid" "finished background heimdall agent (detached, cpu-idle, aged) — reapable"
+  done
+
+  [ "$APPLY" = 1 ] || return 0
+  if opted_out; then
+    line "AGENT" "opt-out" "HEIMDALL_NO_CLEANUP set / no-cleanup marker — process reaping disabled"
+    return 0
+  fi
+
+  # GRACEFUL reap: SIGTERM every candidate first.
+  for pid in $pids; do
+    _sig -TERM "$pid" && line "TERM " "pid $pid" "sent SIGTERM (graceful stop)"
+  done
+
+  # grace window, then escalate to SIGKILL ONLY for a pid that is STILL alive AND STILL in the
+  # safe-to-reap set (re-scoped from a fresh process table across the window). A proc that exited
+  # on SIGTERM, or that is no longer classified safe, is never SIGKILLed.
+  [ "${GRACE_SEC:-0}" -gt 0 ] 2>/dev/null && sleep "$GRACE_SEC"
+  local still
+  still="$(_idle_agent_pids | tr '\n' ' ')"
+  for pid in $pids; do
+    case " $still " in *" $pid "*) : ;; *) continue ;; esac   # dropped out of the safe set → leave it
+    if _alive "$pid"; then
+      _sig -KILL "$pid" && line "KILL " "pid $pid" "still resident after grace — sent SIGKILL"
+    fi
+    AGENT_REAPED=$((AGENT_REAPED+1))
+  done
+}
 
 # ── enumerate + classify worktrees ───────────────────────────────────────────
 reap_worktrees() {
@@ -283,10 +432,35 @@ reap_pollers() {
 }
 
 # ── run ──────────────────────────────────────────────────────────────────────
+
+# read-only machine-readable idle-agent scope (for heimdall-cleanup report). Mutates NOTHING.
+if [ "$AGENTS_JSON" = 1 ]; then
+  pids="$(_idle_agent_pids)"
+  n="$(printf '%s\n' "$pids" | grep -c . || true)"; case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  # shellcheck disable=SC2086
+  mb="$([ "$n" -gt 0 ] && _agent_rss_mb $pids || echo 0)"
+  printf '{"idle_agents":%s,"resident_mb":%s}\n' "$n" "$mb"
+  exit 0
+fi
+
+# agent-only axis (for heimdall-cleanup --apply): reap idle agents, print a one-line receipt.
+if [ "$AGENTS_ONLY" = 1 ]; then
+  reap_idle_agents
+  if [ "$APPLY" = 1 ]; then
+    printf 'heimdall-reap-idle: reaped %d idle agent process(es) (~%dMB resident freed).\n' \
+      "$AGENT_REAPED" "$AGENT_RSS_MB"
+  else
+    printf 'heimdall-reap-idle (dry-run): %d idle agent process(es) reapable (~%dMB resident) — rerun with --apply.\n' \
+      "$AGENT_CAND" "$AGENT_RSS_MB"
+  fi
+  exit 0
+fi
+
 say "heimdall-reap-idle: repo=$REPO main=$MAIN_REF@${MAIN_SHA:0:8} mode=$([ "$APPLY" = 1 ] && echo APPLY || echo DRY-RUN)"
 say "─────────────────────────────────────────────────────────────────────────"
 reap_worktrees
 reap_pollers
+reap_idle_agents
 
 if [ "$APPLY" = 1 ] && { [ -x "$AGENTPOOL" ] || [ "$AGENTPOOL" = "/usr/bin/true" ]; }; then
   "$AGENTPOOL" health-check >/dev/null 2>&1 || true
@@ -294,11 +468,11 @@ fi
 
 say "─────────────────────────────────────────────────────────────────────────"
 if [ "$APPLY" = 1 ]; then
-  printf 'SUMMARY: reaped %d worktree(s), %d kept-unmerged%s, %d pruned, %d poller(s) found\n' \
-    "$REAPED" "$KEPT" "$([ -n "$KEPT_NAMES" ] && echo " ($KEPT_NAMES)")" "$PRUNED" "$POLLERS_FOUND"
+  printf 'SUMMARY: reaped %d worktree(s), %d kept-unmerged%s, %d pruned, %d poller(s) found, %d idle agent(s) reaped (~%dMB)\n' \
+    "$REAPED" "$KEPT" "$([ -n "$KEPT_NAMES" ] && echo " ($KEPT_NAMES)")" "$PRUNED" "$POLLERS_FOUND" "$AGENT_REAPED" "$AGENT_RSS_MB"
 else
-  printf 'SUMMARY (dry-run): would reap %d, %d kept-unmerged%s, %d poller(s) found — rerun with --apply to reap\n' \
-    "$REAP_CAND" "$KEPT" "$([ -n "$KEPT_NAMES" ] && echo " ($KEPT_NAMES)")" "$POLLERS_FOUND"
+  printf 'SUMMARY (dry-run): would reap %d, %d kept-unmerged%s, %d poller(s) found, %d idle agent(s) reapable (~%dMB) — rerun with --apply to reap\n' \
+    "$REAP_CAND" "$KEPT" "$([ -n "$KEPT_NAMES" ] && echo " ($KEPT_NAMES)")" "$POLLERS_FOUND" "$AGENT_CAND" "$AGENT_RSS_MB"
 fi
 
 exit 0
