@@ -470,7 +470,7 @@ npm_positioning_notice() {
 # previously published version") is indistinguishable at a glance from a real permissions
 # failure — so we say plainly which case this is.
 publish_npm() {
-  local version="$1" dir pkg pkg_version out rc tries
+  local version="$1" dir pkg pkg_version rc tries
   dir="$(npm_pkg_dir)"
   pkg="$(npm_pkg_field name)"
 
@@ -489,9 +489,24 @@ publish_npm() {
 
   npm_positioning_notice
 
-  # if-condition capture (set -e safe — see publish_release for why bare `out=$(...)` aborts).
-  if ! out="$(cd "$dir" && npm publish --access public 2>&1)"; then
-    rc=$?; printf '%s\n' "$out" >&2
+  # PUBLISH ON THE REAL TTY — deliberately NOT wrapped in $(...) capture (nor piped/tee'd).
+  # WHY: RJ's npm 2FA is a passkey/WebAuthn (Apple Keychain). It produces NO typed TOTP code,
+  # so npm's ONLY viable second factor here is its browser/web flow: npm prints
+  # "Authenticate your account at: https://www.npmjs.com/auth/cli/<uuid>" and opens the browser
+  # for the passkey. That interactive web auth runs ONLY when npm's stdout is a real TTY. The
+  # moment `npm publish` is captured in a command-substitution (or piped through `tee`), npm
+  # sees a non-TTY stdout, abandons web auth, and falls back to DEMANDING a typed `--otp` —
+  # which for a passkey can never be satisfied → `npm error code EOTP`, a hard dead-end. The
+  # broken scripted path did exactly this: `out="$(cd "$dir" && npm publish … 2>&1)"`. The
+  # working manual path was a bare `npm publish --access public` on the terminal. So the publish
+  # now INHERITS ship.sh's stdio (the operator's terminal) and we capture only its exit code;
+  # npm's own output streams straight to the terminal, so the operator sees the auth URL live
+  # and, on failure, the reason. `--auth-type=web` pins the browser flow explicitly instead of
+  # trusting npm's version default. CI/automation publishes with an npm AUTOMATION TOKEN, which
+  # bypasses 2FA entirely (no prompt, no TTY needed), so this identical line is correct headless.
+  rc=0
+  ( cd "$dir" && npm publish --access public --auth-type=web ) || rc=$?
+  if [ "$rc" -ne 0 ]; then
     die "npm publish failed (exit $rc) for ${pkg}@${version} — see npm's output above. The version bump is already committed and the Release is published; recover with:  release/ship.sh --npm-only"
   fi
   ok "published ${pkg}@${version} to npm — 'npx runheimdall' now resolves to $version"
@@ -689,7 +704,9 @@ if [ "$DRY_RUN" -eq 1 ]; then
       done
 
       step "Exact npm command that would run"
-      printf '  cd %s && npm publish --access public\n' "$DRY_NPM_DIR"
+      # Runs attached to the terminal (no $(...) capture) so npm's browser/web 2FA works for a
+      # passkey/WebAuthn account; --auth-type=web pins that flow. See publish_npm for the full why.
+      printf '  cd %s && npm publish --access public --auth-type=web\n' "$DRY_NPM_DIR"
 
       npm_positioning_notice
     fi

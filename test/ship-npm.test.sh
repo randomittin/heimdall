@@ -289,6 +289,26 @@ else
   bad "publish_npm did not read the published version back"; sed 's/^/    /' "$C6" >&2
 fi
 
+# ── Case 7: the real publish runs on the TTY, NOT wrapped in command-substitution ──
+# ROOT-CAUSE GUARD for the EOTP dead-end. RJ's npm 2FA is a passkey/WebAuthn — it emits no
+# typed OTP, so npm must use its browser/web auth, which only runs when `npm publish` is
+# attached to a real TTY. Wrapping the publish in $(...) (or piping/tee'ing it) hands npm a
+# non-TTY stdout → npm abandons web auth → demands a typed --otp → `npm error code EOTP`, a
+# dead-end for a passkey. This case goes red if that regression ever returns.
+# Strip full-line comments first: ship.sh's own comment ILLUSTRATES the broken $(...) form on
+# purpose (so a reader sees what not to do), and only executable lines can actually regress.
+if grep -vE '^[[:space:]]*#' "$SHIP" | grep -Eq '\$\([^)]*npm publish'; then
+  bad "regression: 'npm publish' is wrapped in command-substitution \$(...) — kills TTY web auth (EOTP for passkey 2FA)"
+  grep -vE '^[[:space:]]*#' "$SHIP" | grep -nE '\$\([^)]*npm publish' | sed 's/^/    /' >&2
+else
+  ok "'npm publish' is NOT captured in \$(...) — it runs on the terminal, so npm web/passkey auth works"
+fi
+if grep -Fq '( cd "$dir" && npm publish --access public --auth-type=web )' "$SHIP"; then
+  ok "the real publish runs directly (inherits ship.sh's TTY) with --auth-type=web pinned"
+else
+  bad "could not find the direct, TTY-attached 'npm publish --access public --auth-type=web' invocation"
+fi
+
 echo ""
 echo "ship-npm.test.sh: $PASS passed, $FAIL failed."
 [ "$FAIL" -eq 0 ] || exit 1
