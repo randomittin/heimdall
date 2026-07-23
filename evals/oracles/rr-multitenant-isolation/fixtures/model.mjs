@@ -178,6 +178,99 @@ export function godEnumeratePartitions(gates, req) {
   return Object.keys(TEAMS); // GOLDEN: server-enumerated registry only.
 }
 
+// ─────────────────────────────────────────────────────────────────────────────────────
+// INV-LOGIN — the dashboard team-login session (Option B: local hmd + HAID + gh
+// device-flow — docs/analysis/dashboard-login-design.md).
+//
+// A dashboard login session is minted after a local hmd signs a canonical assertion
+// binding {github-user ↔ HAID ↔ device_code} with the enrolled Ed25519 HAID key, riding
+// the EXISTING verify_identity chokepoint. The session is a team-READ capability scoped
+// to the caller's OWN teams — the team_ids are SERVER-DERIVED at mint via
+// registered_team(haid) and signed into the session; they are NEVER trusted from the
+// client. The session is short-TTL, and it ALWAYS mints Identity.owner=false: owner
+// authority stays rooted in owner-PKI + IAP and is never delegatable through a login
+// session (dashboard-login-design.md "God mode stays separate").
+//
+// Formally, for a login session minted for HAID H enrolled in registered_team(H):
+//   * a read is scoped to the session's server-derived teams ONLY — a body/query
+//     team_id is never honored (INV-LOGIN-1);
+//   * the session's team list is fixed server-side at mint from registered_team(H) and
+//     signed in — a client-tampered team list is never trusted (INV-LOGIN-2);
+//   * an expired/TTL-lapsed session is rejected (401) before any read (INV-LOGIN-3);
+//   * a mint request whose HAID signature fails verification issues NO session
+//     (INV-LOGIN-4);
+//   * a login session is ALWAYS Identity.owner=false; it never passes an owner/god gate
+//     (INV-LOGIN-5).
+// This model authors the ORACLE only; the real /dashboard/session mint + poll routes and
+// the `hmd dashboard login` CLI are implemented later and must PASS this gate.
+// ─────────────────────────────────────────────────────────────────────────────────────
+
+// The two enrolled login callers. Each HAID is enrolled in exactly ONE team via
+// registered_team(haid) — the same server-derived binding INV-1 uses. A login session
+// reads ONLY that team's roster.
+const HAID_A = { haid: "haid:alice", team_id: TEAM_A.team_id };
+const HAID_B = { haid: "haid:bob", team_id: TEAM_B.team_id };
+
+// registered_team(haid) — the server-derived team binding at mint. Mirrors
+// cp_auth.registered_team: derived from the verified enroll binding, never the client.
+function registeredTeam(haid) {
+  if (haid === HAID_A.haid) return HAID_A.team_id;
+  if (haid === HAID_B.haid) return HAID_B.team_id;
+  return null;
+}
+
+// A login session as minted by the CP: `teams` are the SERVER-DERIVED team_ids from
+// registeredTeam(haid) at mint time, signed into the token; `owner` is ALWAYS false for
+// a login session; `exp` is the short TTL; `haid` binds the session to the enrolled key.
+function mintLoginSession(haid, serverDerivedTeams, exp) {
+  return { haid, teams: serverDerivedTeams, owner: false, exp };
+}
+
+// ── INV-LOGIN-1: a read scopes to the session's SERVER-DERIVED teams, never a
+//    caller-supplied body/query team_id. Mirrors the /dashboard-data read gate:
+//    "returns roster/observe for ONLY the session's server-computed team_ids. Never
+//    trusts a client team_id." ──
+export function sessionReadTeams(gates, session, req) {
+  if (gates.sessionHonorsBodyTeam && req.body && req.body.team_id) {
+    return [req.body.team_id]; // MUTANT (INV-LOGIN-1 dropped): read trusts the wire team_id.
+  }
+  return session.teams; // GOLDEN: the session's server-derived teams only.
+}
+
+// ── INV-LOGIN-2: the session's team list is fixed SERVER-SIDE at mint from
+//    registeredTeam(haid) and signed into the token. A client-tampered team list (a team
+//    the HAID is not enrolled in, injected at mint) is never trusted. ──
+export function sessionMintTeams(gates, haid, req) {
+  if (gates.sessionTeamsFromClient && req.body && req.body.teams) {
+    return req.body.teams; // MUTANT (INV-LOGIN-2 dropped): teams taken from the client.
+  }
+  const t = registeredTeam(haid);
+  return t ? [t] : []; // GOLDEN: server-derived from the enroll binding at mint.
+}
+
+// ── INV-LOGIN-3: an expired/TTL-lapsed session is rejected (401) before any read. The
+//    short TTL is enforced; a lapsed `exp` is not honored. ──
+export function sessionIsLive(gates, session, now) {
+  if (gates.skipSessionExpiry) return true; // MUTANT (INV-LOGIN-3 dropped): TTL never checked.
+  return session.exp > now; // GOLDEN: reject once the short TTL has lapsed.
+}
+
+// ── INV-LOGIN-4: a mint request rides verify_identity — the HAID signature MUST verify
+//    or NO session is issued. Mirrors cp_auth.verify: a bad signature is rejected at the
+//    single chokepoint before any session is minted. ──
+export function mintVerifiesSignature(gates, assertion) {
+  if (gates.mintSkipsSigVerify) return true; // MUTANT (INV-LOGIN-4 dropped): mint skips sig verify.
+  return assertion.signature === "valid"; // GOLDEN: only a verified HAID signature mints.
+}
+
+// ── INV-LOGIN-5: a login session is ALWAYS Identity.owner=false; only owner-PKI + IAP
+//    grants owner. A login session must never pass an owner/god gate — owner authority is
+//    not delegatable through a dashboard session. ──
+export function loginSessionPassesOwnerGate(gates, session) {
+  if (gates.loginSessionGrantsOwner) return true; // MUTANT (INV-LOGIN-5 dropped): login mints owner.
+  return session.owner === true; // GOLDEN: a login session is never owner (always false).
+}
+
 // ── The fixed cross-tenant attack sequence. Each returns "DENY" (attack stopped) or
 //    "ALLOW" (attack SUCCEEDED — a tenant touched another's resource). The acceptance
 //    oracle demands DENY for every one; a mutant flips exactly its own gate's attack
@@ -270,6 +363,49 @@ export function evaluateAttack(gates, attackId) {
       // question is whether the aggregate trusts the caller-supplied team_id.
       const partitions = godEnumeratePartitions(gates, req);
       return partitions.includes(FORGED_TEAM_ID) ? "ALLOW" : "DENY";
+    }
+    case "L1-session-cross-team": {
+      // INV-LOGIN-1. A VALID login session minted for team A (server-derived from
+      // registeredTeam(haid:alice)) is presented to /dashboard-data with a body team_id=B
+      // to read team B's roster. The read MUST stay scoped to the session's server-derived
+      // teams; team B appearing in the read set (the read honoring the wire team_id) is the
+      // ALLOW.
+      const session = mintLoginSession(HAID_A.haid, [registeredTeam(HAID_A.haid)], 9999);
+      const req = { body: { team_id: TEAM_B.team_id } };
+      const readTeams = sessionReadTeams(gates, session, req);
+      return readTeams.includes(TEAM_B.team_id) ? "ALLOW" : "DENY";
+    }
+    case "L2-tampered-session-teamids": {
+      // INV-LOGIN-2. A mint request for haid:alice (enrolled in team A) carries a
+      // client-tampered `teams` list that adds team B. Teams are server-derived at mint
+      // from registeredTeam(haid) and signed in — the tampered team B must NOT enter the
+      // session. Team B appearing in the minted session (the mint trusting the client
+      // team list) is the ALLOW.
+      const req = { body: { teams: [TEAM_A.team_id, TEAM_B.team_id] } };
+      const teams = sessionMintTeams(gates, HAID_A.haid, req);
+      return teams.includes(TEAM_B.team_id) ? "ALLOW" : "DENY";
+    }
+    case "L3-expired-session": {
+      // INV-LOGIN-3. A session whose short TTL has lapsed (exp in the past) is presented
+      // for a read. It MUST be rejected (401) before any read. The lapsed session being
+      // treated as live (the read proceeding) is the ALLOW.
+      const NOW = 1000;
+      const expired = mintLoginSession(HAID_A.haid, [registeredTeam(HAID_A.haid)], NOW - 1);
+      return sessionIsLive(gates, expired, NOW) ? "ALLOW" : "DENY";
+    }
+    case "L4-bad-signature-mint": {
+      // INV-LOGIN-4. A mint request whose HAID signature fails verification. verify_identity
+      // MUST reject it and issue NO session. The mint proceeding on an invalid signature
+      // (a session issued) is the ALLOW.
+      const assertion = { haid: HAID_A.haid, device_code: "dev-123", signature: "forged" };
+      return mintVerifiesSignature(gates, assertion) ? "ALLOW" : "DENY";
+    }
+    case "L5-session-is-owner": {
+      // INV-LOGIN-5. A login session (always Identity.owner=false) is pointed at an
+      // owner/god route. It MUST NOT pass the owner gate — only owner-PKI + IAP grants
+      // owner. The login session passing the owner gate is the ALLOW.
+      const session = mintLoginSession(HAID_A.haid, [registeredTeam(HAID_A.haid)], 9999);
+      return loginSessionPassesOwnerGate(gates, session) ? "ALLOW" : "DENY";
     }
     default:
       throw new Error("unknown attack id: " + attackId);

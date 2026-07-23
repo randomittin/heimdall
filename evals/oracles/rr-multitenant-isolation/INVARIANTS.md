@@ -1,4 +1,4 @@
-# rr-multitenant-isolation — invariants (INV-GOD authored here)
+# rr-multitenant-isolation — invariants (INV-GOD + INV-LOGIN authored here)
 
 This oracle is the falsifiable gate the cross-tenant "god mode" monitoring aggregate
 (`GET /god/roster`) must pass **before any handler code is written**. The god aggregate
@@ -63,9 +63,77 @@ by the `accept-request-team-id` gate.
 
 ## Falsifiability
 
-- Golden (`fixtures/golden/candidate.mjs`, every gate STRONG) DENIES all 11 attacks →
-  `bin/falsify rr-multitenant-isolation --assert-score 1.0` passes (9/9 mutants killed).
-- Weakening the acceptance table (dropping any G* row) makes that row's mutant SURVIVE →
-  score < 1.0 → falsify exits nonzero. The gate is not green-by-construction.
+- Golden (`fixtures/golden/candidate.mjs`, every gate STRONG) DENIES all 16 attacks →
+  `bin/falsify rr-multitenant-isolation --assert-score 1.0` passes (14/14 mutants killed).
+- Weakening the acceptance table (dropping any G* or L* row) makes that row's mutant
+  SURVIVE → score < 1.0 → falsify exits nonzero. The gate is not green-by-construction.
 - The real `GET /god/roster` handler is implemented later (a separate agent) and MUST
   pass this gate — this oracle is authored independent of that implementation.
+
+---
+
+# INV-LOGIN — dashboard team-login session (authored here)
+
+This oracle is also the falsifiable gate the dashboard **team-login** flow must pass
+**before any login route is written**. Option B (`docs/analysis/dashboard-login-design.md`)
+mints a short-TTL SESSION after a local hmd signs a canonical assertion binding
+`{github-user ↔ HAID ↔ device_code}` with the enrolled Ed25519 HAID key, riding the
+EXISTING `verify_identity` chokepoint. The session is a team-READ capability scoped to the
+caller's OWN teams — never a cross-team capability, never owner. As with INV-GOD, the gate
+is authored independent of (and prior to) the implementation.
+
+## INV-LOGIN
+
+> A dashboard login session is a team-READ capability scoped to the caller's OWN teams
+> (server-derived via `registered_team(haid)` and signed in at mint); it is short-TTL,
+> minted only on a verified HAID signature, and is ALWAYS `Identity.owner=false`.
+
+Formally, for a login session minted for HAID `H` enrolled in `registered_team(H)`:
+
+1. A read scopes to the session's **server-derived** teams ONLY — a body/query `team_id`
+   is never honored (mirrors the `/dashboard-data` read: "returns roster/observe for ONLY
+   the session's server-computed team_ids. Never trusts a client team_id.").
+2. The session's team list is fixed **server-side at mint** from `registered_team(H)` and
+   signed into the token — a client-tampered team list is never trusted.
+3. An **expired / TTL-lapsed** session is rejected (401) before any read.
+4. A mint request whose **HAID signature fails** verification issues **NO** session
+   (`verify_identity` / `cp_auth.verify` is the single chokepoint).
+5. A login session is **ALWAYS `Identity.owner=false`**; only owner-PKI + IAP grants owner
+   (`dashboard-login-design.md` "God mode stays separate"). Owner authority is never
+   delegatable through a dashboard session.
+
+INV-LOGIN composes with the existing invariants: its server-derived team scope is the same
+`registered_team(haid)` binding INV-1 uses, and its owner-separation is the same owner gate
+INV-GOD hardens (a login session must fail `requireOwner` exactly as a non-owner key does).
+
+## The five attack rows (all expected DENY)
+
+Added to `fixtures/golden/acceptance.json` and modeled in `fixtures/model.mjs`, in fixed
+sequence order after the existing A*/enqueue/G* rows:
+
+| Row | Invariant | Attack | DENY means |
+|---|---|---|---|
+| `L1-session-cross-team` | INV-LOGIN-1 | a valid session for team A used with a body `team_id=B` to read team B's roster | the read stays scoped to the session's server-derived teams; team B is invisible |
+| `L2-tampered-session-teamids` | INV-LOGIN-2 | a mint whose client-tampered team list adds a team the HAID is not enrolled in | teams are server-derived at mint from `registered_team` and signed in; the tampered team never enters the session |
+| `L3-expired-session` | INV-LOGIN-3 | an expired / TTL-lapsed session presented for a read | the short TTL is enforced — the lapsed session is rejected (401) before any read |
+| `L4-bad-signature-mint` | INV-LOGIN-4 | a mint request whose HAID signature fails verification | `verify_identity` rejects it — no session is issued |
+| `L5-session-is-owner` | INV-LOGIN-5 | a login session pointed at an owner/god route | the session is always `owner=false` and never passes the owner gate |
+
+## Mutant → gate → RED (each new gate is load-bearing)
+
+Each mutant is `fixtures/model.mjs` with EXACTLY ONE INV-LOGIN gate dropped. Dropping it
+flips its attack from DENY to ALLOW, and `run.sh` reports that attack as `first_divergence`.
+`bin/falsify` catches it (KILLED); dropping the row from the acceptance table makes the
+mutant SURVIVE (score < 1.0) — proving the row is load-bearing.
+
+| Mutant | Gate dropped | Attack that then SUCCEEDS | Oracle goes RED at |
+|---|---|---|---|
+| `session-honors-body-team` | session read scopes to the session's server-derived teams | L1 — a team-A session reads team B by naming `team_id=B` | `L1-session-cross-team` |
+| `session-teams-from-client` | server-derived team list at mint (`registered_team`, signed in) | L2 — the mint injects a team the HAID is not enrolled in | `L2-tampered-session-teamids` |
+| `skip-session-expiry` | the short-TTL session expiry check | L3 — an expired session keeps reading rosters | `L3-expired-session` |
+| `mint-skips-sig-verify` | the HAID signature verification at mint (`verify_identity`) | L4 — a forged-signature mint is issued a session | `L4-bad-signature-mint` |
+| `login-session-grants-owner` | the always-`owner=false` rule for login sessions | L5 — a login session passes the owner/god gate | `L5-session-is-owner` |
+
+Unlike `accept-request-team-id` / `god-in-public-allowlist` (one dropped gate → two
+attacks), each INV-LOGIN mutant flips EXACTLY one attack (verified: `grade.mjs` reports a
+single `ALLOW` per mutant), so every L* row has its own dedicated mutant.

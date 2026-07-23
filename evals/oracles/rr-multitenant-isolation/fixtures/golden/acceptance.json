@@ -1,6 +1,6 @@
 {
   "feature": "rr-multitenant-isolation",
-  "note": "The fixed cross-tenant attack sequence. Every attack MUST be DENIED. This is the reference the differential-style denial oracle grades against — independent of the candidate model. Weakening this table (dropping an attack case) lets the mutant that only flips that case SURVIVE, which is exactly how test/heimdall-rr-isolation-oracle.test.sh proves the acceptance table is load-bearing (falsify score drops below 1.0). The G* rows encode INV-GOD: the owner-only cross-tenant god aggregate (GET /god/roster) is 404 on the public surface for all callers and all team secrets, is reachable on the gated control-plane service ONLY with owner PKI + valid signature + IAM, and never honors a caller-supplied team_id.",
+  "note": "The fixed cross-tenant attack sequence. Every attack MUST be DENIED. This is the reference the differential-style denial oracle grades against — independent of the candidate model. Weakening this table (dropping an attack case) lets the mutant that only flips that case SURVIVE, which is exactly how test/heimdall-rr-isolation-oracle.test.sh proves the acceptance table is load-bearing (falsify score drops below 1.0). The G* rows encode INV-GOD: the owner-only cross-tenant god aggregate (GET /god/roster) is 404 on the public surface for all callers and all team secrets, is reachable on the gated control-plane service ONLY with owner PKI + valid signature + IAM, and never honors a caller-supplied team_id. The L* rows encode INV-LOGIN: the dashboard team-login session (Option B, docs/analysis/dashboard-login-design.md) is a team-READ capability scoped to the caller's OWN teams — team_ids are server-derived at mint via registered_team(haid) and signed in, never client-supplied; sessions are short-TTL; a bad HAID signature mints nothing; and a login session is ALWAYS Identity.owner=false (never owner/god).",
   "cases": [
     {
       "n": "A1-idor-repo",
@@ -67,6 +67,36 @@
       "expected": "DENY",
       "invariant": "INV-1 (god aggregate)",
       "attack": "the god handler must ignore a caller-supplied body/query team_id, enumerating partitions server-side"
+    },
+    {
+      "n": "L1-session-cross-team",
+      "expected": "DENY",
+      "invariant": "INV-LOGIN-1",
+      "attack": "a valid login session for team A used with a body team_id=B to read team B's roster — the read must stay scoped to the session's server-derived teams (registered_team(haid)), never a caller-supplied team_id"
+    },
+    {
+      "n": "L2-tampered-session-teamids",
+      "expected": "DENY",
+      "invariant": "INV-LOGIN-2",
+      "attack": "a mint request whose client-tampered team list adds a team the HAID is not enrolled in — teams are server-derived at mint from registered_team and signed in, never trusted from the client"
+    },
+    {
+      "n": "L3-expired-session",
+      "expected": "DENY",
+      "invariant": "INV-LOGIN-3",
+      "attack": "an expired/TTL-lapsed login session presented for a read must be rejected (401) before any read"
+    },
+    {
+      "n": "L4-bad-signature-mint",
+      "expected": "DENY",
+      "invariant": "INV-LOGIN-4",
+      "attack": "a mint request whose HAID signature fails verification must issue no session (verify_identity rejects it)"
+    },
+    {
+      "n": "L5-session-is-owner",
+      "expected": "DENY",
+      "invariant": "INV-LOGIN-5",
+      "attack": "a login session (always Identity.owner=false) pointed at an owner/god route must not pass the owner gate — only owner-PKI + IAP grants owner"
     }
   ]
 }

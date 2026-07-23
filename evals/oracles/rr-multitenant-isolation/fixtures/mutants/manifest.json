@@ -1,7 +1,7 @@
 {
   "domain": "rr-multitenant-isolation",
   "fixture_kind": "mutants",
-  "purpose": "Each mutant is the SAME isolation candidate (fixtures/model.mjs) with EXACTLY ONE cross-tenant isolation gate removed — modeling a real attack from the W0 ledger §3 RED-line table (docs/specs/2026-07-03-rr-isolation-invariants.md) plus the INV-GOD owner-only god-aggregate gates. With the gate gone, the cross-tenant attack it stops SUCCEEDS (the candidate returns ALLOW where the fixed all-DENY acceptance oracle demands DENY), so run.sh goes RED and reports the attack that succeeded as first_divergence. `bin/falsify rr-multitenant-isolation` runs the golden (expect PASS — every attack DENIED) then every mutant (expect REJECT — the dropped gate's attack caught). Falsifiability score = mutants rejected / total, conditioned on golden passing; this P0 isolation gate requires 1.0. A surviving mutant would prove an isolation gate is NOT load-bearing and BLOCKS the build. This is the meta-proof the multi-tenant isolation is real, not tautological: drop any gate -> the oracle goes RED.",
+  "purpose": "Each mutant is the SAME isolation candidate (fixtures/model.mjs) with EXACTLY ONE cross-tenant isolation gate removed — modeling a real attack from the W0 ledger §3 RED-line table (docs/specs/2026-07-03-rr-isolation-invariants.md) plus the INV-GOD owner-only god-aggregate gates and the INV-LOGIN dashboard team-login session gates (docs/analysis/dashboard-login-design.md). With the gate gone, the cross-tenant attack it stops SUCCEEDS (the candidate returns ALLOW where the fixed all-DENY acceptance oracle demands DENY), so run.sh goes RED and reports the attack that succeeded as first_divergence. `bin/falsify rr-multitenant-isolation` runs the golden (expect PASS — every attack DENIED) then every mutant (expect REJECT — the dropped gate's attack caught). Falsifiability score = mutants rejected / total, conditioned on golden passing; this P0 isolation gate requires 1.0. A surviving mutant would prove an isolation gate is NOT load-bearing and BLOCKS the build. This is the meta-proof the multi-tenant isolation is real, not tautological: drop any gate -> the oracle goes RED.",
   "golden": "../golden/candidate.mjs",
   "acceptance_oracle": "../golden/acceptance.json",
   "candidate_contract": "An ES module exporting default function evaluate(attackId) -> 'DENY' | 'ALLOW' for each cross-tenant attack id in the acceptance oracle. run.sh imports the candidate and grades evaluate(attackId) against every case (all expected 'DENY'), reporting the FIRST attack that returned ALLOW as first_divergence {file, step, expected:'DENY', actual:'ALLOW'}.",
@@ -95,6 +95,56 @@
       "must_turn_red_gate": "cross-tenant-denial",
       "first_fail_case": "G4-god-cross-partition",
       "reject_contract": "attack G4-god-cross-partition: expected DENY, candidate returns ALLOW -> gate status=fail at step 'G4-god-cross-partition'"
+    },
+    {
+      "name": "session-honors-body-team",
+      "file": "session-honors-body-team.mjs",
+      "invariant": "INV-LOGIN-1",
+      "gate_dropped": "session-scoped read (dashboard-data read scopes to the session's server-derived teams); the read trusts a caller-supplied body/query team_id",
+      "attack_that_succeeds": "L1 — a valid login session for team A reads team B's roster by naming team_id=B on the read",
+      "must_turn_red_gate": "cross-tenant-denial",
+      "first_fail_case": "L1-session-cross-team",
+      "reject_contract": "attack L1-session-cross-team: expected DENY, candidate returns ALLOW -> gate status=fail at step 'L1-session-cross-team'"
+    },
+    {
+      "name": "session-teams-from-client",
+      "file": "session-teams-from-client.mjs",
+      "invariant": "INV-LOGIN-2",
+      "gate_dropped": "server-derived team list at mint (registered_team(haid), signed into the session); the mint trusts a client-supplied team list",
+      "attack_that_succeeds": "L2 — a mint request injects a team the HAID is not enrolled in into the session's teams",
+      "must_turn_red_gate": "cross-tenant-denial",
+      "first_fail_case": "L2-tampered-session-teamids",
+      "reject_contract": "attack L2-tampered-session-teamids: expected DENY, candidate returns ALLOW -> gate status=fail at step 'L2-tampered-session-teamids'"
+    },
+    {
+      "name": "skip-session-expiry",
+      "file": "skip-session-expiry.mjs",
+      "invariant": "INV-LOGIN-3",
+      "gate_dropped": "the short-TTL session expiry check; an expired/TTL-lapsed session is treated as live",
+      "attack_that_succeeds": "L3 — an expired login session keeps reading rosters instead of being rejected (401)",
+      "must_turn_red_gate": "cross-tenant-denial",
+      "first_fail_case": "L3-expired-session",
+      "reject_contract": "attack L3-expired-session: expected DENY, candidate returns ALLOW -> gate status=fail at step 'L3-expired-session'"
+    },
+    {
+      "name": "mint-skips-sig-verify",
+      "file": "mint-skips-sig-verify.mjs",
+      "invariant": "INV-LOGIN-4",
+      "gate_dropped": "the HAID signature verification at mint (verify_identity / cp_auth.verify); a forged-signature mint issues a session",
+      "attack_that_succeeds": "L4 — a mint request with a failing HAID signature is issued a session",
+      "must_turn_red_gate": "cross-tenant-denial",
+      "first_fail_case": "L4-bad-signature-mint",
+      "reject_contract": "attack L4-bad-signature-mint: expected DENY, candidate returns ALLOW -> gate status=fail at step 'L4-bad-signature-mint'"
+    },
+    {
+      "name": "login-session-grants-owner",
+      "file": "login-session-grants-owner.mjs",
+      "invariant": "INV-LOGIN-5",
+      "gate_dropped": "the always-Identity.owner=false rule for login sessions; a login session is allowed to pass the owner/god gate",
+      "attack_that_succeeds": "L5 — a login session passes an owner/god route instead of being denied (owner authority is not delegatable via a login session)",
+      "must_turn_red_gate": "cross-tenant-denial",
+      "first_fail_case": "L5-session-is-owner",
+      "reject_contract": "attack L5-session-is-owner: expected DENY, candidate returns ALLOW -> gate status=fail at step 'L5-session-is-owner'"
     }
   ]
 }

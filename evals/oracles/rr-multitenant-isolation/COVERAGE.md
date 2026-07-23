@@ -43,13 +43,27 @@ exactly ONE gate removed.
 | `god-in-public-allowlist` | INV-GOD | public-surface route allowlist (`PUBLIC_ROUTES`) | G1/G2 — `/god/roster` resolves on the PUBLIC surface for an anonymous caller AND a team secret | `G1-god-on-public` (also flips G2) |
 | `drop-require-owner` | INV-GOD | gated `/god/*` owner gate (`_require_owner`) | G3 — a signed non-owner key reaches the gated `/god/roster` | `G3-nonowner-god` |
 | `god-accepts-body-team-id` | INV-1 (god aggregate) | server-side partition enumeration in the aggregate | G4 — the god handler honors a forged caller-supplied `team_id` | `G4-god-cross-partition` |
+| `session-honors-body-team` | INV-LOGIN-1 | session read scopes to the session's server-derived teams | L1 — a team-A session reads team B's roster via a body `team_id=B` | `L1-session-cross-team` |
+| `session-teams-from-client` | INV-LOGIN-2 | server-derived team list at mint (`registered_team`, signed in) | L2 — a mint injects a team the HAID is not enrolled in | `L2-tampered-session-teamids` |
+| `skip-session-expiry` | INV-LOGIN-3 | the short-TTL session expiry check | L3 — an expired session keeps reading rosters | `L3-expired-session` |
+| `mint-skips-sig-verify` | INV-LOGIN-4 | HAID signature verification at mint (`verify_identity`) | L4 — a forged-signature mint is issued a session | `L4-bad-signature-mint` |
+| `login-session-grants-owner` | INV-LOGIN-5 | the always-`owner=false` rule for login sessions | L5 — a login session passes the owner/god gate | `L5-session-is-owner` |
 
 Every mutant drops exactly one gate and flips its own attack(s) to `ALLOW`; the golden
-denies all eleven attacks. Two dropped gates open two attacks each from a single flag —
+denies all sixteen attacks. Two dropped gates open two attacks each from a single flag —
 `accept-request-team-id` (A1-spoof + `enqueue-cross-partition`, INV-1) and
 `god-in-public-allowlist` (G1 + G2, INV-GOD) — with the manifest pinning the first attack
-in the fixed sequence as `first_fail_case`. Falsifiability score = 9/9 = 1.0, conditioned
-on golden passing.
+in the fixed sequence as `first_fail_case`; every INV-LOGIN mutant (`L1`–`L5`) flips
+exactly one attack. Falsifiability score = 14/14 = 1.0, conditioned on golden passing.
+
+The five `L*` rows encode INV-LOGIN — the dashboard team-login session
+(`docs/analysis/dashboard-login-design.md`, Option B: local hmd + HAID + gh device-flow;
+see `INVARIANTS.md`). A login session is a team-READ capability scoped to the caller's OWN
+teams (server-derived via `registered_team(haid)` and signed in at mint), short-TTL, minted
+only on a verified HAID signature, and ALWAYS `Identity.owner=false`. The model gates:
+`sessionReadTeams` (INV-LOGIN-1 server-scoped read), `sessionMintTeams` (INV-LOGIN-2
+server-derived team list), `sessionIsLive` (INV-LOGIN-3 TTL), `mintVerifiesSignature`
+(INV-LOGIN-4 sig-at-mint), `loginSessionPassesOwnerGate` (INV-LOGIN-5 never-owner).
 
 ## Falsifiability (the acceptance table is load-bearing)
 
@@ -57,4 +71,6 @@ on golden passing.
 weakening the acceptance oracle (dropping the `A1-idor-repo` attack case) makes
 `drop-team-covers-repo` SURVIVE — the score drops below 1.0 and `bin/falsify` exits
 nonzero. A gate that could not be made to survive would be tautological; this one can.
-Dropping any G* row makes the corresponding INV-GOD mutant survive the same way.
+Dropping any G* row makes the corresponding INV-GOD mutant survive the same way; dropping
+any L* row makes its INV-LOGIN mutant survive (verified: each drop → score 13/14 = 0.9286,
+`bin/falsify` exits nonzero).
