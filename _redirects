@@ -2,4 +2,4 @@
 # /install -> the pinned release tag's raw install.sh. 302 (temporary) so the
 # brand line stays put while the target tag moves each release. The trailing
 # "302" is required — Netlify defaults to 301, which would cache permanently.
-/install  https://raw.githubusercontent.com/randomittin/heimdall/v2.2.6/install.sh  302
+/install  https://raw.githubusercontent.com/randomittin/heimdall/v2.3.0/install.sh  302
