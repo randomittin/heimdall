@@ -447,16 +447,23 @@ preflight_npm_prereqs() {
   fi
 }
 
-# npm_positioning_notice — SURFACE this, do not solve it. package.json's .description and
-# .keywords are what npmjs.com renders as the package's page subtitle and its search result;
-# they are still pre-launch text because the canonical §3 positioning line is RJ's call and its
-# spec (heimdall-seo-geo-spec.md) does not exist in this repo. npm versions are IMMUTABLE, so
-# publishing before that decision lands means publishing the wrong words and then burning a
-# whole version number to fix them. Say so loudly at the npm stage; decide it nowhere near here.
-# Tracked in .planning/A3-PENDING-POSITIONING.md.
+# npm_positioning_notice — SURFACE an UNDECIDED §3 positioning, stay SILENT once it is decided.
+# package.json's .description and .keywords are what npmjs.com renders as the package's page
+# subtitle and search result, and npm versions are IMMUTABLE — publishing pre-launch placeholder
+# words means burning a whole version number later to fix them. So while §3 is undecided we warn
+# loudly at the npm stage. §3 is DECIDED once .description carries the canonical launch tagline
+# "Nothing ships unproven." (candidate A — 12-term keyword list, committed 0185059). The tagline
+# in the SHIPPED words is the robust signal: it is exactly what a real ship publishes, so it can
+# never drift out of sync with a separate marker file. Decided → silent (no more crying wolf on
+# every ship); undecided → still loud. Decision history: .planning/A3-PENDING-POSITIONING.md.
+NPM_POSITIONING_TAGLINE="Nothing ships unproven."
 npm_positioning_notice() {
-  local pending="${REPO_ROOT:-$PWD}/.planning/A3-PENDING-POSITIONING.md"
-  [ -f "$pending" ] || return 0
+  local dir desc
+  dir="$(npm_pkg_dir)"
+  desc="$(jq -r '.description // empty' "$dir/package.json" 2>/dev/null || true)"
+  case "$desc" in
+    *"$NPM_POSITIONING_TAGLINE"*) return 0 ;;   # §3 decided — publish the right words, say nothing
+  esac
   warn "npm positioning is PENDING RJ's canonical §3 decision:"
   warn "  .description / .keywords in $NPM_PKG_DIR/package.json are still pre-launch text."
   warn "  npm versions are IMMUTABLE — publishing now means publishing AGAIN to fix the words."
@@ -511,14 +518,26 @@ publish_npm() {
   fi
   ok "published ${pkg}@${version} to npm — 'npx runheimdall' now resolves to $version"
 
-  # A publish npm reported OK but the registry did not record is a silent no-op — the exact
-  # class this stage exists to end. Read it back, allowing for registry propagation.
+  # Post-publish readback — CONFIRM the write is visible on a read replica. This is NOT the
+  # gate that catches a failed publish: a real publish failure already died above (npm publish
+  # returned non-zero). By the time we reach here npm printed `+ ${pkg}@${version}`, so the
+  # publish SUCCEEDED. npm's registry read replicas lag a write by 30s–several minutes, so a
+  # miss here is PROPAGATION LAG, not a lost publish. Therefore we poll patiently and, on
+  # timeout, WARN and exit SUCCESS — a slow read replica must never report a succeeded ship as
+  # failed (the false-negative that failed the real v2.3.1 ship: `+ runheimdall@2.3.1` printed,
+  # yet 5 fast attempts × 2s could not outrun the replica lag and the ship was declared dead).
+  # Defaults (~13 tries × 14s ≈ 3 min total budget) are overridable for tests via env.
+  local rb_max="${SHIP_READBACK_MAX_TRIES:-13}" rb_delay="${SHIP_READBACK_DELAY:-14}"
   tries=0
   until npm_version_published "$pkg" "$version"; do
     tries=$((tries+1))
-    [ "$tries" -ge 5 ] \
-      && die "npm post-publish readback failed after $tries attempts: the registry does not report ${pkg}@${version}. Recover with:  release/ship.sh --npm-only"
-    sleep 2
+    if [ "$tries" -ge "$rb_max" ]; then
+      warn "npm post-publish readback still lagging after $tries attempts — this read replica has not yet propagated ${pkg}@${version}."
+      warn "  This is NOT a failed publish: npm printed '+ ${pkg}@${version}' above, so the publish SUCCEEDED. npm read replicas lag a write by 30s–a few minutes."
+      warn "  Verify propagation shortly with:  npm view ${pkg} version   (expect ${version})"
+      return 0
+    fi
+    sleep "$rb_delay"
   done
   ok "verified ${pkg}@${version} is live on the registry"
 }

@@ -1,4 +1,10 @@
-# A3 — pending: package.json `description` / `keywords` await RJ's canonical §3
+# A3 — RESOLVED: package.json `description` / `keywords` §3 positioning
+
+> **DECIDED: candidate A, committed 0185059** — `packages/runheimdall/package.json` `.description`
+> now ends with the canonical tagline "Nothing ships unproven." and carries the 12-term keyword
+> list. `release/ship.sh` `npm_positioning_notice()` keys on that tagline: with §3 decided the
+> PENDING warning is now SILENT, and it only re-fires if a future package.json drops the tagline
+> (a genuinely-undecided state). The candidates and history below are retained for the record.
 
 ## Why this file exists
 

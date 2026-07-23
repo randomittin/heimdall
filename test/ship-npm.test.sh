@@ -42,7 +42,10 @@ echo "ship-npm harness  ship=$SHIP"
 echo "--------------------------------------------------------------------"
 
 # ── An npm stub whose behaviour is driven by env vars, first on PATH ─────────
-# NPM_STUB_MODE:  publish-ok | publish-fail | already-published | not-authed | not-owner
+# NPM_STUB_MODE:  publish-ok | publish-ok-lag | publish-fail | already-published | not-authed | not-owner
+#   publish-ok-lag: the publish SUCCEEDS (prints `+ pkg@ver`) but the version is NEVER recorded
+#   as visible — `npm view pkg@ver` keeps returning E404. Simulates npm's read-replica
+#   propagation lag: a genuinely-published version a read replica has not yet caught up to.
 # NPM_STUB_STATE: dir; a $NPM_STUB_STATE/published-<version> marker == "that version is live".
 # NPM_STUB_USER:  the identity `npm whoami` reports (default: rj).
 BIN_STUB="$WORK/stubbin"
@@ -91,7 +94,9 @@ case "$sub" in
       echo "npm ERR! 403 Forbidden - PUT https://registry.npmjs.org/runheimdall (simulated)" >&2
       exit 1; }
     ver="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' ./package.json | head -1)"
-    mkdir -p "$state"; : > "$state/published-$ver"
+    # publish-ok-lag: publish succeeds but the write is NOT made visible to `npm view` — the
+    # read replica lags. Every other ok mode records the marker so readback sees it immediately.
+    [ "$mode" = "publish-ok-lag" ] || { mkdir -p "$state"; : > "$state/published-$ver"; }
     echo "+ runheimdall@$ver"; exit 0 ;;
   *) exit 0 ;;
 esac
@@ -142,11 +147,14 @@ else
   bad "--dry-run actually invoked npm publish"; ls "$DRY_STATE" >&2
 fi
 
-# The pending-positioning notice must be loud at the npm stage (RJ publishes twice otherwise).
-if grep -q 'npm positioning is PENDING' "$DRY"; then
-  ok "--dry-run surfaces the pending §3 positioning decision"
+# §3 positioning is DECIDED (candidate A — "Nothing ships unproven." + 12 keywords, committed
+# 0185059). A decided §3 must NOT cry wolf on every ship, so the notice is now SILENT here.
+# (The notice is authoritatively unit-tested BOTH ways — decided-silent and undecided-loud — in
+# Case 9; this only guards that a decided ship does not re-surface the PENDING warning.)
+if ! grep -q 'npm positioning is PENDING' "$DRY"; then
+  ok "--dry-run does NOT cry wolf on the (decided) §3 positioning"
 else
-  bad "--dry-run did not surface the pending positioning notice"; sed 's/^/    /' "$DRY" >&2
+  bad "--dry-run still surfaced the PENDING §3 notice though §3 is decided"; sed 's/^/    /' "$DRY" >&2
 fi
 
 # ── Case 2: already published -> LOUD skip, exit 0 (idempotent re-run) ───────
@@ -307,6 +315,89 @@ if grep -Fq '( cd "$dir" && npm publish --access public --auth-type=web )' "$SHI
   ok "the real publish runs directly (inherits ship.sh's TTY) with --auth-type=web pinned"
 else
   bad "could not find the direct, TTY-attached 'npm publish --access public --auth-type=web' invocation"
+fi
+
+# ── Case 8: a LAGGING post-publish readback is NON-FATAL (publish already succeeded) ──
+# ROOT-CAUSE GUARD for the false-negative that failed the real v2.3.1 ship: npm returned
+# `+ runheimdall@2.3.1` (publish SUCCEEDED) but the post-publish readback polled a read replica
+# that had not yet propagated the write, and ship.sh DIED — reporting a succeeded ship as failed.
+# npm's read replicas lag a write by 30s–several minutes, so the readback must POLL patiently and,
+# on timeout, WARN and exit 0 — never die. A REAL publish failure is a separate path (Case 3,
+# still dies). SHIP_READBACK_MAX_TRIES/DELAY are overridden here so the loop times out instantly.
+FIX8="$WORK/pkglag"; mkdir -p "$FIX8"
+printf '{"name":"runheimdall","version":"2.2.6","files":["bin/runheimdall.js"]}\n' > "$FIX8/package.json"
+C8="$WORK/c8.out"
+(
+  cd "$REPO"
+  export NPM_STUB_STATE="$WORK/c8state" NPM_STUB_MODE="publish-ok-lag" SHIP_NPM_DIR="$FIX8"
+  export SHIP_READBACK_MAX_TRIES=2 SHIP_READBACK_DELAY=0
+  PATH="$BIN_STUB:$PATH"
+  # shellcheck disable=SC1090
+  SHIP_SOURCE_ONLY=1 . "$SHIP"
+  REPO_ROOT="$REPO"
+  publish_npm "2.2.6"
+) >"$C8" 2>&1
+c8_rc=$?
+if [ "$c8_rc" -eq 0 ]; then
+  ok "publish_npm treats a LAGGING readback as NON-FATAL (exit 0 — a succeeded publish is not failed by a slow replica)"
+else
+  bad "publish_npm DIED on a lagging readback (rc=$c8_rc) — false-negative regression"; sed 's/^/    /' "$C8" >&2
+fi
+if grep -q 'readback still lagging' "$C8" && grep -q 'npm view runheimdall version' "$C8"; then
+  ok "the lagging readback WARNS and names the manual verification (npm view runheimdall version)"
+else
+  bad "the lagging readback did not warn / name the manual verify"; sed 's/^/    /' "$C8" >&2
+fi
+# A lag is downstream of a REAL, successful publish — the '+ pkg@ver' publish must have run.
+if grep -q 'published runheimdall@2.2.6 to npm' "$C8"; then
+  ok "the publish itself still ran (the lag is a read-replica delay, not a no-op publish)"
+else
+  bad "publish did not run before the readback"; sed 's/^/    /' "$C8" >&2
+fi
+# The lag path must NOT falsely claim the registry-confirmed line — that is reserved for a real hit.
+if ! grep -q 'verified runheimdall@2.2.6 is live on the registry' "$C8"; then
+  ok "the lag path does NOT falsely claim registry-confirmed liveness (only a real hit prints that)"
+else
+  bad "the lag path printed the registry-confirmed line without an actual readback hit"; sed 's/^/    /' "$C8" >&2
+fi
+
+# ── Case 9: §3 positioning notice — SILENT when decided, LOUD when genuinely undecided ──
+# BUG: ship.sh kept crying "npm positioning is PENDING RJ's canonical §3 decision" on every ship
+# even though §3 is DECIDED (candidate A — description ends "Nothing ships unproven." + the
+# 12-term keyword list, committed 0185059). The notice now keys on the canonical tagline in
+# package.json .description: present → decided → SILENT; absent → undecided → still LOUD (npm
+# versions are immutable, so an undecided ship genuinely must warn). Both directions asserted.
+C9D="$WORK/c9d.out"
+(
+  cd "$REPO"
+  PATH="$BIN_STUB:$PATH"
+  # shellcheck disable=SC1090
+  SHIP_SOURCE_ONLY=1 . "$SHIP"
+  REPO_ROOT="$REPO"
+  npm_positioning_notice           # the REAL wrapper package.json — §3 is decided
+) >"$C9D" 2>&1
+if [ ! -s "$C9D" ] || ! grep -q 'PENDING' "$C9D"; then
+  ok "npm_positioning_notice is SILENT once §3 is decided (description carries \"Nothing ships unproven.\")"
+else
+  bad "npm_positioning_notice STILL warns PENDING though §3 is decided"; sed 's/^/    /' "$C9D" >&2
+fi
+# Genuinely undecided: a package.json whose .description lacks the canonical tagline.
+UND="$WORK/pkgundecided"; mkdir -p "$UND"
+printf '{"name":"runheimdall","version":"2.2.6","description":"pre-launch placeholder text","files":["bin/runheimdall.js"]}\n' > "$UND/package.json"
+C9U="$WORK/c9u.out"
+(
+  cd "$REPO"
+  export SHIP_NPM_DIR="$UND"
+  PATH="$BIN_STUB:$PATH"
+  # shellcheck disable=SC1090
+  SHIP_SOURCE_ONLY=1 . "$SHIP"
+  REPO_ROOT="$REPO"
+  npm_positioning_notice
+) >"$C9U" 2>&1
+if grep -q 'npm positioning is PENDING' "$C9U"; then
+  ok "npm_positioning_notice STILL warns when §3 is genuinely undecided (pre-launch description)"
+else
+  bad "npm_positioning_notice went silent on a genuinely undecided §3 — the warning was lost, not fixed"; sed 's/^/    /' "$C9U" >&2
 fi
 
 echo ""
