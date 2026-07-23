@@ -1254,7 +1254,20 @@ def main():
     row3 = compose(row3_zone, t3)
     row4 = compose(row4_zone, t4)
 
-    lines = LAYOUT.compose_with_sigil(sigrows, [row1, row2, row3, row4], cols, GUTTER)
+    # ── ambient "update available" notice (RJ's ask: a dev learns of a newer Heimdall
+    # release WITHOUT running any command). update_notice() is a PURE LOCAL read of the
+    # update-check cache bin/heimdall's daily background probe writes — zero network, zero
+    # subprocess on the render path — and returns '' on a current/ahead/missing/corrupt
+    # cache, so a current install renders byte-identically (the density goldens stay exact).
+    # It rides one extra row under the CONTENT column (blank sigil prefix via
+    # compose_with_sigil), shown only when it fits WHOLE in the content width so a narrow
+    # terminal never wraps the line nor clips the `hmd --update` command.
+    content_rows = [row1, row2, row3, row4]
+    note = update_notice()
+    if note and vis(note) <= LAYOUT.remaining_width(sigrows, cols, GUTTER):
+        content_rows.append(note)
+
+    lines = LAYOUT.compose_with_sigil(sigrows, content_rows, cols, GUTTER)
     # HARD COLUMNS CLAMP (the CC live-statusline safety net): every assembled line is forced
     # to EXACTLY `cols` visible cells so CC can never truncate a row mid-token (the `…` clip)
     # nor soft-wrap an over-wide row into a thin duplicate strip.
