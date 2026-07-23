@@ -53,6 +53,11 @@ HAID_CLI="$SELF_DIR/heimdall-haid"
 REPO="$(cd "$SELF_DIR/.." && pwd)"
 LIB="$REPO/bin/lib"
 
+# Canonical CP URL + opt-in consent gate — the SAME source-of-truth the client reads, so the
+# doctor honors the fail-safe DEFAULT OFF: it resolves the baked-in default (and thus enrolls /
+# phones home) ONLY when the dev has opted in. shellcheck source=lib/cp-consent.sh
+[ -f "$LIB/cp-consent.sh" ] && . "$LIB/cp-consent.sh"
+
 # ── the interpreter — THE SAME one heimdall-presence resolves (bin/heimdall-presence:74).
 # Every check + fix below runs under THIS python, so crypto is never installed into a
 # different interpreter than the one hmd actually beats with (the #1 subtle bug).
@@ -122,8 +127,12 @@ PYEOF
 fi
 URL="${HEIMDALL_CP_URL:-${BASE_URL:-}}"
 [ -n "$URL" ] || URL="$CFG_URL"
-DEFAULT_CP_URL="https://heimdall-cp-public-eqfrs7sfuq-uc.a.run.app"
-[ -n "$URL" ] || URL="$DEFAULT_CP_URL"
+DEFAULT_CP_URL="${HEIMDALL_DEFAULT_CP_URL:-}"   # canonical (sourced from lib/cp-consent.sh).
+# OPT-IN GATE (fail-safe): resolve the baked-in default ONLY when the dev opted in. Undecided/
+# declined => URL empty => the doctor's remediation is a clean no-op (no enroll, no phone-home).
+if [ -z "$URL" ] && [ "$(_cp_consent_decision 2>/dev/null)" = "connected" ]; then
+  URL="$(_cp_consent_url 2>/dev/null)"
+fi
 ENROLL_TOKEN="$CFG_TOKEN"
 
 # The per-repo TEAM secret — resolved with the SAME precedence + auto-solo mint the client

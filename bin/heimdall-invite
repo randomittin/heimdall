@@ -66,9 +66,13 @@ BIN_DIR="$(cd "$(dirname "$SELF")" 2>/dev/null && pwd)"
 PLUGIN_ROOT="${CLAUDE_PLUGIN_ROOT:-$(cd "$BIN_DIR/.." 2>/dev/null && pwd)}"
 MANIFEST="$PLUGIN_ROOT/.claude-plugin/plugin.json"
 
-# The shipped public-surface CP URL (NOT a secret) — the same default
-# bin/heimdall-presence bakes in, so a dev needs ZERO url config to invite.
-DEFAULT_CP_URL="https://heimdall-cp-public-eqfrs7sfuq-uc.a.run.app"
+# The shipped public-surface CP URL (NOT a secret) — sourced from the SINGLE source of truth
+# (lib/cp-consent.sh) that bin/heimdall-presence also reads, so the literal lives in ONE place
+# and a dev needs ZERO url config to invite. (Invite is an explicit "grow my team" action, so
+# it is NOT consent-gated — it always uses the canonical default to build the join one-liner.)
+# shellcheck source=lib/cp-consent.sh
+[ -f "$BIN_DIR/lib/cp-consent.sh" ] && . "$BIN_DIR/lib/cp-consent.sh"
+DEFAULT_CP_URL="${HEIMDALL_DEFAULT_CP_URL:-}"
 
 usage() { sed -n '2,46p' "$SELF" | sed 's/^# \{0,1\}//'; }
 

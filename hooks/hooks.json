@@ -101,6 +101,14 @@
             "command": "INPUT=$(cat); PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; HP=\"$PLUGIN/bin/heimdall-presence\"; if [ -x \"$HP\" ]; then SID=$(printf '%s' \"$INPUT\" | jq -r '.session_id // empty' 2>/dev/null || true); (\"$HP\" keeper-start --session \"$SID\" >/dev/null 2>&1 &) ; fi; exit 0"
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; HP=\"$PLUGIN/bin/heimdall-presence\"; [ -x \"$HP\" ] && \"$HP\" connect-prompt 2>/dev/null || true"
+          }
+        ]
       }
     ],
     "SessionEnd": [

@@ -47,11 +47,16 @@ WORK="$(mktemp -d -t "presence-crypto.$(printf 'X%.0s' 1 2 3 4 5 6)")"
 trap 'rm -rf "$WORK"' EXIT
 
 HOME_T="$WORK/home"; mkdir -p "$HOME_T/.heimdall"
+# OPT IN (the crypto-gap warning lives DOWNSTREAM of the control-plane opt-in gate — an
+# UNDECIDED dev is intentionally offline and never reaches the signing path). Persist a
+# CONNECTED decision pointed at an UNROUTABLE url so URL resolves non-empty (the beat reaches
+# the seed/crypto bootstrap — the exact path that hid the gap) while GUARANTEEING zero egress.
+printf '{"decision": "connected", "url": "http://127.0.0.1:9"}\n' > "$HOME_T/.heimdall/cp-consent.json"
 
-# A project repo with a git remote so URL/HAID/PROJECT resolve (the beat reaches the seed
-# bootstrap — the exact code path that hid the gap). No cp-endpoint.json: the shipped DEFAULT
-# CP url makes URL non-empty, and crypto-missing is settled BEFORE any network call, so no
-# egress ever happens.
+# A project repo with a git remote so HAID/PROJECT resolve (the beat reaches the seed
+# bootstrap — the exact code path that hid the gap). The per-home CONNECTED consent above
+# makes URL non-empty (the crypto path is downstream of the opt-in gate), and crypto-missing
+# is settled BEFORE any network call, so no egress ever happens.
 PROJ="$WORK/proj"; mkdir -p "$PROJ"
 git -C "$PROJ" init -q
 git -C "$PROJ" config user.email "dev@example.com"
@@ -154,6 +159,8 @@ echo
 if [ "$CRYPTO" = "1" ]; then
   echo "5. with the Ed25519 backend PRESENT: no warning, status reports OK"
   HOME_OK="$WORK/home_ok"; mkdir -p "$HOME_OK/.heimdall"
+  # opted-in home too (URL resolves non-empty via consent; unroutable => zero egress).
+  printf '{"decision": "connected", "url": "http://127.0.0.1:9"}\n' > "$HOME_OK/.heimdall/cp-consent.json"
   # interactive beat, backend present → the crypto-missing line must NOT appear.
   ( cd "$PROJ" && env -u HEIMDALL_CP_URL -u BASE_URL -u HEIMDALL_CP_PKI_KEY \
       HOME="$HOME_OK" HEIMDALL_TEAM_DIR="$HOME_OK/.heimdall" HMD_HAID="haid:cryptotest" \
