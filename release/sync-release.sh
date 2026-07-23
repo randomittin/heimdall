@@ -4,7 +4,7 @@
 #
 #   release/sync-release.sh <TAG> [--dry]
 #
-# One tag in, four artifacts re-pointed/re-rendered so they resolve to
+# One tag in, five artifacts re-pointed/re-rendered so they resolve to
 # byte-identical install.sh bytes (and a byte-identical README):
 #
 #   1. Redirect:  vercel.json + _redirects  -> raw .../<TAG>/install.sh  (302)
@@ -15,6 +15,12 @@
 #                 (byte-identical copy, taken AFTER step 3's URL templating,
 #                 so npmjs.com never serves a stale README — see
 #                 test/npm-readme-drift.test.sh)
+#   5. Netlify:   heimdall-site/netlify.toml  ->  /install 302 pinned to <TAG>
+#                 (the LIVE runheimdall.dev/install redirect, in the SEPARATE
+#                 randomittin/heimdall-site repo — bumped, committed, and pushed
+#                 in lockstep so the vanity URL never drifts to a stale tag; a
+#                 missing site checkout WARNs, never fails the release. See
+#                 release/HOSTING.md and test/ship-netlify.test.sh)
 #
 # install-ux v2 guarantee: the redirect and the npx wrapper MUST resolve to
 # byte-identical scripts. This script ASSERTS that itself — it computes the
@@ -222,6 +228,105 @@ assert_eq "vercel.json /install -> tag target"      "$INSTALL_URL" "$VERCEL_URL"
 assert_eq "_redirects /install -> tag target"       "$INSTALL_URL" "$REDIR_URL"
 
 echo "sync-release.sh: all artifacts resolve to ${INSTALL_URL} (sha256 ${NEW_SHA})"
+
+# ── 8. Netlify vanity redirect (runheimdall.dev/install) — SEPARATE site repo ──
+# runheimdall.dev is served by Netlify from randomittin/heimdall-site, NOT this
+# plugin repo. Its /install 302 lives in heimdall-site/netlify.toml and pins a
+# release tag in the `to` URL; that tag drifts to a stale release unless bumped
+# every ship. We bump it HERE, in lockstep, reusing THIS release's ${TAG} and the
+# already-computed ${NEW_SHA} (never recomputed — the site can't disagree with the
+# wrapper). The site checkout is OPTIONAL: a missing ../heimdall-site must NEVER
+# fail a plugin release, so absent -> WARN + the exact manual bump+push + continue.
+echo "sync-release.sh: syncing the Netlify vanity redirect (heimdall-site)"
+
+# Locate the site. An EXPLICIT HEIMDALL_SITE_DIR is authoritative — if it is set we
+# use it as-is and NEVER fall through to another candidate: silently retargeting the
+# real production site when the operator named a (mistyped) override would be a
+# dangerous surprise (a wrong override -> WARN below, not a push to a different site).
+# Only when the override is UNSET do we auto-discover: the sibling ../heimdall-site
+# of this plugin repo, then the known local checkout.
+SITE_DIR=""
+if [ -n "${HEIMDALL_SITE_DIR:-}" ]; then
+  SITE_DIR="$HEIMDALL_SITE_DIR"
+elif [ -d "$ROOT/../heimdall-site" ]; then
+  SITE_DIR="$(cd "$ROOT/../heimdall-site" && pwd)"
+elif [ -d "/Users/rj/Downloads/heimdall-site" ]; then
+  SITE_DIR="/Users/rj/Downloads/heimdall-site"
+fi
+SITE_TOML="${SITE_DIR:+$SITE_DIR/netlify.toml}"
+
+netlify_manual_hint() {
+  # A skipped auto-sync must never be a silent drift — print the exact by-hand fix.
+  cat >&2 <<HINT
+  ! runheimdall.dev/install was NOT auto-bumped. Do it by hand so it doesn't drift:
+      In randomittin/heimdall-site/netlify.toml, set the /install redirect to:
+        to = "${INSTALL_URL}"
+      and update the sha256 in the comment above it to:
+        ${NEW_SHA}
+      then, from the heimdall-site checkout:
+        git add netlify.toml
+        git commit -m "chore(netlify): pin /install -> ${TAG}"
+        git push origin main
+      Tip: set HEIMDALL_SITE_DIR=/path/to/heimdall-site to automate this next release.
+HINT
+}
+
+if [ -z "$SITE_DIR" ] || [ ! -f "$SITE_TOML" ]; then
+  echo "  ! heimdall-site checkout not found (set HEIMDALL_SITE_DIR, or place it at ../heimdall-site)" >&2
+  netlify_manual_hint
+else
+  echo "  site: $SITE_TOML"
+  # Rewrite, in one pass: the pinned tag in the /install `to` URL, the
+  # "Current release: vX.Y.Z" comment, and the "install.sh sha256 <hex>" comment
+  # — all to THIS release's tag + digest. Untouched lines pass through unchanged,
+  # so re-running the SAME tag is a byte no-op (idempotent).
+  T="$(mktemp)"
+  sed -E \
+    -e "s|(${RAW_BASE//\//\\/}/)v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?(/install\.sh)|\1${TAG}\3|g" \
+    -e "s|(Current release: )v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?|\1${TAG}|g" \
+    -e "s|(install\.sh sha256 )[0-9a-f]{64}|\1${NEW_SHA}|g" \
+    "$SITE_TOML" > "$T"
+
+  # ASSERT the rewrite produced the release tag BEFORE writing anything. Unlike the
+  # missing-dir case (a soft WARN), a present-but-unpinnable netlify.toml is a REAL
+  # drift bug (malformed toml / no /install redirect), so this dies — mirroring the
+  # byte-identical resolution gate the plugin artifacts pass above.
+  NETLIFY_TAG_NEW="$(sed -nE 's|.*'"${RAW_BASE//\//\\/}"'/(v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?)/install\.sh.*|\1|p' "$T" | head -1)"
+  assert_eq "netlify.toml /install -> tag target" "$TAG" "$NETLIFY_TAG_NEW"
+
+  # Apply (dry-aware): write_file mv's on a real run, discards + reports on --dry.
+  write_file "$SITE_TOML" "$T"
+
+  # Commit ONLY netlify.toml and push to trigger Netlify's auto-deploy. Real runs
+  # only. Idempotent: an unchanged file -> no commit. The commit is PATH-SCOPED to
+  # netlify.toml so we never bundle the site owner's OTHER staged work; a push
+  # failure (offline / no creds) WARNs with the manual command, it does NOT die.
+  if [ "$DRY" -eq 0 ]; then
+    if ! git -C "$SITE_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+      echo "  ! $SITE_DIR is not a git repo — bumped the file but cannot commit/push it" >&2
+      netlify_manual_hint
+    elif git -C "$SITE_DIR" diff --quiet HEAD -- netlify.toml 2>/dev/null; then
+      echo "  = netlify.toml already pinned to ${TAG} (no site commit needed)"
+    else
+      git -C "$SITE_DIR" add netlify.toml
+      if git -C "$SITE_DIR" commit -q -m "chore(netlify): pin /install -> ${TAG}" -- netlify.toml; then
+        echo "  ✓ committed heimdall-site netlify.toml -> ${TAG}"
+        PUSH_RC=0
+        git -C "$SITE_DIR" push origin main || PUSH_RC=$?
+        if [ "$PUSH_RC" -eq 0 ]; then
+          echo "  ✓ pushed heimdall-site (Netlify will auto-deploy /install -> ${TAG})"
+        else
+          echo "  ! git push origin main in $SITE_DIR failed (offline/no creds?) — the commit is local." >&2
+          echo "    push it manually to trigger the Netlify deploy:  git -C $SITE_DIR push origin main" >&2
+        fi
+      else
+        echo "  ! git commit in $SITE_DIR failed — netlify.toml bumped but not committed" >&2
+        netlify_manual_hint
+      fi
+    fi
+  fi
+fi
+
 if [ "$DRY" -eq 1 ]; then
   echo "sync-release.sh: dry run complete — nothing written, assertions passed."
 else
