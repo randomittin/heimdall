@@ -1,7 +1,7 @@
 {
   "name": "runheimdall",
   "version": "2.3.0",
-  "description": "Thin npx wrapper for the Heimdall installer — fetches the pinned-tag install.sh, verifies its sha256, and runs it. Byte-identical to runheimdall.dev/install.",
+  "description": "Thin npx wrapper for the Heimdall installer — fetches the pinned-tag install.sh, verifies its sha256, and runs it. Byte-identical to runheimdall.dev/install. Nothing ships unproven.",
   "bin": {
     "runheimdall": "bin/runheimdall.js"
   },
@@ -17,9 +17,17 @@
   },
   "keywords": [
     "heimdall",
-    "installer",
+    "claude-code",
+    "claude",
+    "ai-agent",
+    "code-review",
     "verification",
-    "claude-code"
+    "falsifiable",
+    "installer",
+    "cli",
+    "npx",
+    "sha256",
+    "self-hostable"
   ],
   "homepage": "https://runheimdall.dev",
   "repository": {
