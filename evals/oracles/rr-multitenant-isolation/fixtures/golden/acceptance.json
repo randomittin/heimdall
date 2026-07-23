@@ -1,6 +1,6 @@
 {
   "feature": "rr-multitenant-isolation",
-  "note": "The fixed cross-tenant attack sequence. Every attack MUST be DENIED. This is the reference the differential-style denial oracle grades against — independent of the candidate model. Weakening this table (dropping an attack case) lets the mutant that only flips that case SURVIVE, which is exactly how test/heimdall-rr-isolation-oracle.test.sh proves the acceptance table is load-bearing (falsify score drops below 1.0).",
+  "note": "The fixed cross-tenant attack sequence. Every attack MUST be DENIED. This is the reference the differential-style denial oracle grades against — independent of the candidate model. Weakening this table (dropping an attack case) lets the mutant that only flips that case SURVIVE, which is exactly how test/heimdall-rr-isolation-oracle.test.sh proves the acceptance table is load-bearing (falsify score drops below 1.0). The G* rows encode INV-GOD: the owner-only cross-tenant god aggregate (GET /god/roster) is 404 on the public surface for all callers and all team secrets, is reachable on the gated control-plane service ONLY with owner PKI + valid signature + IAM, and never honors a caller-supplied team_id.",
   "cases": [
     {
       "n": "A1-idor-repo",
@@ -43,6 +43,30 @@
       "expected": "DENY",
       "invariant": "INV-1",
       "attack": "team A enqueues a task into team B's partition"
+    },
+    {
+      "n": "G1-god-on-public",
+      "expected": "DENY",
+      "invariant": "INV-GOD",
+      "attack": "GET /god/roster on the PUBLIC surface must 404, never resolve the cross-tenant aggregate"
+    },
+    {
+      "n": "G2-team-secret-god",
+      "expected": "DENY",
+      "invariant": "INV-GOD",
+      "attack": "a valid team secret S (a public-surface bearer) used against /god/* must not reach the aggregate"
+    },
+    {
+      "n": "G3-nonowner-god",
+      "expected": "DENY",
+      "invariant": "INV-GOD",
+      "attack": "a validly SIGNED non-owner key against the gated /god/roster must 401 not_owner"
+    },
+    {
+      "n": "G4-god-cross-partition",
+      "expected": "DENY",
+      "invariant": "INV-1 (god aggregate)",
+      "attack": "the god handler must ignore a caller-supplied body/query team_id, enumerating partitions server-side"
     }
   ]
 }

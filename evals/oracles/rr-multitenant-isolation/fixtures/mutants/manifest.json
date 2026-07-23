@@ -1,7 +1,7 @@
 {
   "domain": "rr-multitenant-isolation",
   "fixture_kind": "mutants",
-  "purpose": "Each mutant is the SAME isolation candidate (fixtures/model.mjs) with EXACTLY ONE cross-tenant isolation gate removed — modeling a real attack from the W0 ledger §3 RED-line table (docs/specs/2026-07-03-rr-isolation-invariants.md). With the gate gone, the cross-tenant attack it stops SUCCEEDS (the candidate returns ALLOW where the fixed all-DENY acceptance oracle demands DENY), so run.sh goes RED and reports the attack that succeeded as first_divergence. `bin/falsify rr-multitenant-isolation` runs the golden (expect PASS — every attack DENIED) then every mutant (expect REJECT — the dropped gate's attack caught). Falsifiability score = mutants rejected / total, conditioned on golden passing; this P0 isolation gate requires 1.0. A surviving mutant would prove an isolation gate is NOT load-bearing and BLOCKS the build. This is the meta-proof the multi-tenant isolation is real, not tautological: drop any gate -> the oracle goes RED.",
+  "purpose": "Each mutant is the SAME isolation candidate (fixtures/model.mjs) with EXACTLY ONE cross-tenant isolation gate removed — modeling a real attack from the W0 ledger §3 RED-line table (docs/specs/2026-07-03-rr-isolation-invariants.md) plus the INV-GOD owner-only god-aggregate gates. With the gate gone, the cross-tenant attack it stops SUCCEEDS (the candidate returns ALLOW where the fixed all-DENY acceptance oracle demands DENY), so run.sh goes RED and reports the attack that succeeded as first_divergence. `bin/falsify rr-multitenant-isolation` runs the golden (expect PASS — every attack DENIED) then every mutant (expect REJECT — the dropped gate's attack caught). Falsifiability score = mutants rejected / total, conditioned on golden passing; this P0 isolation gate requires 1.0. A surviving mutant would prove an isolation gate is NOT load-bearing and BLOCKS the build. This is the meta-proof the multi-tenant isolation is real, not tautological: drop any gate -> the oracle goes RED.",
   "golden": "../golden/candidate.mjs",
   "acceptance_oracle": "../golden/acceptance.json",
   "candidate_contract": "An ES module exporting default function evaluate(attackId) -> 'DENY' | 'ALLOW' for each cross-tenant attack id in the acceptance oracle. run.sh imports the candidate and grades evaluate(attackId) against every case (all expected 'DENY'), reporting the FIRST attack that returned ALLOW as first_divergence {file, step, expected:'DENY', actual:'ALLOW'}.",
@@ -65,6 +65,36 @@
       "must_turn_red_gate": "cross-tenant-denial",
       "first_fail_case": "A10-public-dispatch",
       "reject_contract": "attack A10-public-dispatch: expected DENY, candidate returns ALLOW -> gate status=fail at step 'A10-public-dispatch'"
+    },
+    {
+      "name": "god-in-public-allowlist",
+      "file": "god-in-public-allowlist.mjs",
+      "invariant": "INV-GOD",
+      "gate_dropped": "the public-surface route allowlist (cp_publicsurface PUBLIC_ROUTES); adds /god/roster to the public surface",
+      "attack_that_succeeds": "G1/G2 — GET /god/roster resolves on the PUBLIC surface, so an anonymous caller AND a valid team secret S reach the owner-only cross-tenant aggregate",
+      "must_turn_red_gate": "cross-tenant-denial",
+      "first_fail_case": "G1-god-on-public",
+      "reject_contract": "attack G1-god-on-public: expected DENY, candidate returns ALLOW -> gate status=fail at step 'G1-god-on-public' (the same dropped gate also opens G2-team-secret-god; G1 is first in the fixed sequence)"
+    },
+    {
+      "name": "drop-require-owner",
+      "file": "drop-require-owner.mjs",
+      "invariant": "INV-GOD",
+      "gate_dropped": "the gated /god/* owner gate (_require_owner: identity.owner + valid signature); any signed key passes",
+      "attack_that_succeeds": "G3 — a validly SIGNED non-owner key reaches the gated /god/roster instead of getting 401 not_owner",
+      "must_turn_red_gate": "cross-tenant-denial",
+      "first_fail_case": "G3-nonowner-god",
+      "reject_contract": "attack G3-nonowner-god: expected DENY, candidate returns ALLOW -> gate status=fail at step 'G3-nonowner-god'"
+    },
+    {
+      "name": "god-accepts-body-team-id",
+      "file": "god-accepts-body-team-id.mjs",
+      "invariant": "INV-1 (god aggregate)",
+      "gate_dropped": "server-side partition enumeration inside the owner aggregate; the god handler trusts a caller-supplied body/query team_id",
+      "attack_that_succeeds": "G4 — the god aggregate honors a forged, non-registered caller-supplied team_id (INV-1 violation inside /god/*)",
+      "must_turn_red_gate": "cross-tenant-denial",
+      "first_fail_case": "G4-god-cross-partition",
+      "reject_contract": "attack G4-god-cross-partition: expected DENY, candidate returns ALLOW -> gate status=fail at step 'G4-god-cross-partition'"
     }
   ]
 }
