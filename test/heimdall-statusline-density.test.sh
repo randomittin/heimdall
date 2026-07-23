@@ -1,7 +1,15 @@
 #!/usr/bin/env bash
 #
 # heimdall-statusline-density.test.sh — DENSITY CONFORMANCE for the v2 full-bleed 4-row
-# composite statusline. The statusline auto-selects a WIDTH TIER from the terminal width
+# composite statusline.
+#
+# WIDTH SOURCE: this suite pins the RENDERER contract (tier density) at a GIVEN layout width,
+# so it renders with HMD_STATUSLINE_RESERVE=0 — COLUMNS IS the layout width here, and the
+# committed goldens are keyed to that. In production the layout width is $COLUMNS MINUS CC's
+# 4-cell statusLine region spacing; that derivation is owned by
+# heimdall-statusline-cc-region-reserve.test.sh.
+#
+# The statusline auto-selects a WIDTH TIER from the terminal width
 # and lays the 4 content rows out to the RIGHT of the 8×8 hero sigil anchor, EXACTLY
 # $COLUMNS visible cells per emitted row (hmd_layout.width_tier + compose_with_sigil):
 #   full   (>=100 cols): 4 rows, everything — 3 team members, 40c gauge, gate details, 12c micro-bars.
@@ -68,7 +76,7 @@ render_case() {
     | env -i PATH="$PATH" HOME="$HOMED" \
         HEIMDALL_IDENTITY_DIR="$WS/.heimdall" HMD_HAID="$SEED" HMD_NOW=7 \
         HEIMDALL_CP_URL="http://127.0.0.1:1" COLUMNS="$cols" LANG=en_US.UTF-8 \
-        HMD_STATUSLINE_TMP="$TMPD" \
+        HMD_STATUSLINE_TMP="$TMPD" HMD_STATUSLINE_RESERVE=0 \
         HEIMDALL_STATUSLINE_MODE="$color" python3 "$SL"
   rm -rf "$WS" "$HOMED" "$TMPD"
 }

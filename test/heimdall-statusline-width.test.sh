@@ -21,6 +21,12 @@
 #      row (width<COLUMNS) both fail.
 # FALSIFIER: off-by-one the pad (cols-1) and assertion 3 goes RED; drop the 4-row
 # compose and the row count / header-count assertions go RED.
+#
+# WIDTH SOURCE: this suite pins the RENDERER contract at a GIVEN layout width, so it renders
+# with HMD_STATUSLINE_RESERVE=0 — COLUMNS IS the layout width here. In production the layout
+# width is $COLUMNS MINUS CC's 4-cell statusLine region spacing (CC sets $COLUMNS to the FULL
+# TERMINAL width, then clips the right edge of anything wider). That derivation is a separate
+# contract, owned by heimdall-statusline-cc-region-reserve.test.sh.
 set -u
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -51,7 +57,7 @@ render_case() {
     | env -i PATH="$PATH" HOME="$HOMED" \
         HEIMDALL_IDENTITY_DIR="$WS/.heimdall" HMD_HAID="$SEED" HMD_NOW=7 \
         HEIMDALL_CP_URL="http://127.0.0.1:1" COLUMNS="$cols" LANG=en_US.UTF-8 \
-        HMD_STATUSLINE_TMP="$WS/tmp" \
+        HMD_STATUSLINE_TMP="$WS/tmp" HMD_STATUSLINE_RESERVE=0 \
         HEIMDALL_STATUSLINE_MODE=truecolor python3 "$SL"
   rm -rf "$WS" "$HOMED"
 }

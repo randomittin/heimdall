@@ -10,16 +10,22 @@
 # consulted before $COLUMNS, the render would use that too-wide width and every row would
 # overflow CC's narrower region → CC truncates it mid-token.
 #
+# NOTE (superseding correction): $COLUMNS is NOT CC's statusLine region width — it is the FULL
+# TERMINAL width. CC paints a region 4 cells narrower and hard-clips the right edge of anything
+# wider, so the layout width is $COLUMNS - 4. Measured against the real claude binary; the
+# measurement + the reserve contract live in heimdall-statusline-cc-region-reserve.test.sh.
+# This suite therefore asserts rows == $COLUMNS - RESERVE (still the COLUMNS-first property).
+#
 # THIS SUITE LOCKS (driving the REAL statusline inside a sized pseudo-terminal, with a 3-person
 # team so the right rail is fully exercised):
 #   1. $COLUMNS WINS over a DIFFERENT /dev/tty width — COLUMNS ∈ {100,120,160,200} while the
 #      pty reports a NARROWER width. resolve_cols MUST honour $COLUMNS first, so every row is
-#      EXACTLY $COLUMNS cells. FALSIFIER: a tty-first resolution would render the pty width →
-#      rows != $COLUMNS → RED.
+#      EXACTLY $COLUMNS - RESERVE cells. FALSIFIER: a tty-first resolution would render the pty
+#      width (COLUMNS-40, nowhere near COLUMNS-4) → RED.
 #   2. NO OVERFLOW / NO MID-TOKEN RIGHT-RAIL CLIP at any of those widths — the hard clamp holds
 #      and the right rail (gauge readout + team) either fits whole or drops whole segments (no
 #      stray `…` in the right half of a row).
-#   3. $COLUMNS set + NO controlling tty (the real CC v2.1.153+ context) → exact-width rows.
+#   3. $COLUMNS set + NO controlling tty (the real CC v2.1.153+ context) → exact region-width rows.
 #   4. $COLUMNS UNSET + NO tty (a degraded CC context) → the conservative 80 floor, no row > 80.
 set -u
 
@@ -49,6 +55,12 @@ def vis(s):
             continue
         n += 2 if _wide(o) else 1
     return n
+
+# CC sets $COLUMNS to the FULL TERMINAL width, but only paints a region 4 cells narrower and
+# hard-clips the right edge of anything wider (measured against claude v2.1.211 — see
+# heimdall-statusline-cc-region-reserve.test.sh). So the layout width CC actually gives us is
+# $COLUMNS - RESERVE, and THAT is what every row must equal.
+RESERVE = 4
 
 _p = 0; _f = 0
 def ok(m):
@@ -138,12 +150,13 @@ def heim(rs):
 print("== 1) $COLUMNS wins over a mismatched /dev/tty width ==")
 for w in (100, 120, 160, 200):
     ptw = max(20, w - 40)   # the pty is NARROWER — a tty-first resolution would render this.
+    want = w - RESERVE
     rs = rows(render_pty(ptw, w))
     widths = sorted(set(vis(r) for r in rs))
-    if widths == [w]:
-        ok("COLUMNS=%d (tty=%d) → every row == %d (COLUMNS honoured first, not the tty)" % (w, ptw, w))
+    if widths == [want]:
+        ok("COLUMNS=%d (tty=%d) → every row == %d (COLUMNS honoured first, not the tty; CC region reserve applied)" % (w, ptw, want))
     else:
-        bad("COLUMNS=%d (tty=%d) → row widths %s != [%d] (tty-first regression?)" % (w, ptw, widths, w))
+        bad("COLUMNS=%d (tty=%d) → row widths %s != [%d] (tty-first regression?)" % (w, ptw, widths, want))
     if not right_clip(rs, w):
         ok("COLUMNS=%d → no mid-token right-rail clip (right rail fits/drops whole)" % w)
     else:
@@ -151,15 +164,16 @@ for w in (100, 120, 160, 200):
     (ok if heim(rs) == 1 else bad)("COLUMNS=%d → HEIMDALL wordmark present (count %d)" % (w, heim(rs)))
 
 # 2) $COLUMNS set + NO controlling tty (the real CC v2.1.153+ context).
-print("== 2) $COLUMNS set + NO tty (real CC) → exact width, no overflow ==")
+print("== 2) $COLUMNS set + NO tty (real CC) → exact region width, no overflow ==")
 for w in (100, 120, 160, 200):
+    want = w - RESERVE
     rs = rows(render_pty(0, w, no_tty=True))
     widths = sorted(set(vis(r) for r in rs))
-    over = [x for x in widths if x > w]
-    if widths == [w] and not over and not right_clip(rs, w):
-        ok("COLUMNS=%d, no-tty → every row == %d, no overflow, no right clip" % (w, w))
+    over = [x for x in widths if x > want]
+    if widths == [want] and not over and not right_clip(rs, want):
+        ok("COLUMNS=%d, no-tty → every row == %d (CC's region), no overflow, no right clip" % (w, want))
     else:
-        bad("COLUMNS=%d, no-tty → widths %s (want [%d]), rightclip=%s" % (w, widths, w, right_clip(rs, w)))
+        bad("COLUMNS=%d, no-tty → widths %s (want [%d]), rightclip=%s" % (w, widths, want, right_clip(rs, want)))
 
 # 3) $COLUMNS UNSET + NO tty → the conservative 80 floor.
 print("== 3) $COLUMNS UNSET + NO tty (degraded CC) → conservative 80, no row > 80 ==")

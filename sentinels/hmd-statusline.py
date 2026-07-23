@@ -225,30 +225,61 @@ def _cols_from_tty():
             tty.close()
     return None
 
+# CC's statusLine region is NARROWER than $COLUMNS by this many cells (see resolve_cols).
+# MEASURED against the real `claude` binary (v2.1.211), not inferred: a probe statusLine
+# emitted a ruler of EXACTLY $COLUMNS cells inside pseudo-terminals of known width, and we
+# read back how many cells CC actually painted —
+#     pty/$COLUMNS:  80 → 76   95 → 91   120 → 116   160 → 156     (reserve == 4, CONSTANT)
+# Override via $HMD_STATUSLINE_RESERVE (CC's spacing is undocumented and may change between
+# CC versions; 0 disables the reserve and restores exact-$COLUMNS rows).
+CC_REGION_RESERVE = 4
+
+
+def _region_reserve():
+    """Cells to hold back from $COLUMNS for CC's statusLine spacing. $HMD_STATUSLINE_RESERVE
+    overrides the measured default; a negative/garbage value degrades to the default."""
+    env = os.environ.get("HMD_STATUSLINE_RESERVE")
+    if env is not None:
+        with contextlib.suppress(Exception):
+            r = int(env.strip())
+            if r >= 0:
+                return r
+    return CC_REGION_RESERVE
+
+
 def resolve_cols():
     """The width the whole layout is clamped to. Resolution order is LOAD-BEARING:
 
-        1. $COLUMNS  (CC's statusLine contract, v2.1.153+ — ALWAYS FIRST)
-        2. /dev/tty  (plain-terminal fallback when COLUMNS is unset)
-        3. 80        (conservative floor — under-render, never wrap)
+        1. $COLUMNS - CC_REGION_RESERVE  (CC's statusLine contract, v2.1.153+ — ALWAYS FIRST)
+        2. /dev/tty                      (plain-terminal fallback when COLUMNS is unset)
+        3. 80                            (conservative floor — under-render, never wrap)
 
     WHY $COLUMNS MUST WIN (the RJ live-statusline bug): Claude Code runs this script for its
-    statusLine with $COLUMNS set to the statusLine region's REAL width, but it CAPTURES stdout
-    (a pipe) and gives the process no controlling terminal — so a /dev/tty width probe there
-    FAILS, or (worse) resolves the FULL outer terminal, which is WIDER than CC's region. If the
-    tty probe were consulted before COLUMNS, the render would use that wrong (too-wide) width
-    and every row would overflow CC's narrower region → CC truncates them mid-token (the
-    `7d 12% $…01.…` clip RJ saw). Honouring $COLUMNS FIRST makes the render match CC's region
-    exactly; the tty probe is reached ONLY when COLUMNS is genuinely absent (a plain terminal).
+    statusLine with $COLUMNS set, but it CAPTURES stdout (a pipe) and gives the process no
+    controlling terminal — so a /dev/tty width probe there FAILS, or (worse) resolves the FULL
+    outer terminal. Honouring $COLUMNS FIRST is correct; the tty probe is reached ONLY when
+    COLUMNS is genuinely absent (a plain terminal).
+
+    WHY $COLUMNS IS NOT THE USABLE WIDTH (the RIGHT-EDGE truncation, RJ again). $COLUMNS is the
+    FULL TERMINAL width — NOT the width of the statusLine region CC paints into. CC reserves a
+    constant 4 cells of built-in spacing and HARD-CLIPS the right edge of anything wider (see
+    CC_REGION_RESERVE for the measurement). Resolving to $COLUMNS EXACTLY and then hard-clamping
+    every row to it (the previous behaviour) made every row EXACTLY 4 cells too wide, so CC ate
+    4 cells off the right of EVERY row — the truncation the clamp was meant to prevent. The
+    renderer must therefore target $COLUMNS - reserve, which is CC's real region.
+    (CC tells the SUBAGENT statusline its usable width directly, via the stdin `columns` field;
+    the main statusLine gets no such field, so the reserve must be applied here.)
 
     Combined with the per-row hard clamp in main() (every emitted row is forced to EXACTLY the
-    returned width), nothing the SUT emits can ever exceed CC's statusLine width."""
+    returned width), nothing the SUT emits can ever exceed CC's statusLine region."""
     env = os.environ.get("COLUMNS")
     if env is not None:
         with contextlib.suppress(Exception):
             c = int(env.strip())
             if c > 0:
-                return c   # $COLUMNS wins — the tty probe below is NOT consulted.
+                # $COLUMNS wins — the tty probe below is NOT consulted. Hold back CC's
+                # region spacing; floor at 1 so a pathologically narrow COLUMNS stays sane.
+                return max(1, c - _region_reserve())
     c = _cols_from_tty()
     if c and c > 0:
         return c
