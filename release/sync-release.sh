@@ -250,8 +250,8 @@ if [ -n "${HEIMDALL_SITE_DIR:-}" ]; then
   SITE_DIR="$HEIMDALL_SITE_DIR"
 elif [ -d "$ROOT/../heimdall-site" ]; then
   SITE_DIR="$(cd "$ROOT/../heimdall-site" && pwd)"
-elif [ -d "/Users/rj/Downloads/heimdall-site" ]; then
-  SITE_DIR="/Users/rj/Downloads/heimdall-site"
+elif [ -d "${HOME}/Downloads/heimdall-site" ]; then
+  SITE_DIR="${HOME}/Downloads/heimdall-site"
 fi
 SITE_TOML="${SITE_DIR:+$SITE_DIR/netlify.toml}"
 
