@@ -1,28 +1,36 @@
 #!/usr/bin/env bash
 # ship.sh — bump, scan, push, verify, and release in one step ("step 1", automated).
 #
-# Runs the full routine you've been doing by hand:
-#   0. VERSION BUMP — bump .claude-plugin/plugin.json (default: patch), commit it.
-#      This is what makes auto-update fire: bin/heimdall-autoupdate compares the
-#      installed plugin.json version to the GitHub releases/latest tag, so a ship
-#      MUST advance the version + publish a Release or no client rolls forward.
-#   1. preview the commits about to ship (origin/BRANCH..HEAD)
-#   2. local gitleaks scan over FULL history — stop & do NOT push if anything is found
-#   3. git push origin BRANCH  (the repo's own pre-push guard also fires here)
-#   4. R9 — independent verify from a FRESH clone of origin:
+# Runs the full routine you've been doing by hand. The version bump is the LAST mutating
+# step and happens ONLY after every pre-push guard is green, so a blocked guard can never
+# strand a "chore(release)" commit with no tag/release/npm (the dangling-bump defect):
+#   0. PRE-FLIGHT VALIDATION — no mutation, no commit. Resolve the next version (for
+#      messages only), prove the release prerequisites (gh/npm auth), then run every gate
+#      that can fail a release BEFORE bumping:
+#        - bash -n on the release scripts (a broken release script must never be committed)
+#        - gitleaks over FULL history (the same secret gate the pre-push hook runs)
+#        - heimdall-landmine-lint on the shell scripts (the same strict-mode gate)
+#      A failure here leaves ZERO new commits and a working tree `git checkout -- .` restores.
+#   1. VERSION BUMP — only now, guards green: bump .claude-plugin/plugin.json (default:
+#      patch) + render/sync the tag-derived artifacts + commit, all in one shot. This commit
+#      is what makes auto-update fire: bin/heimdall-autoupdate compares the installed
+#      plugin.json version to the GitHub releases/latest tag, so a ship MUST advance the
+#      version + publish a Release or no client rolls forward.
+#   2. git push origin BRANCH  (the repo's own pre-push guard re-runs here as a backstop —
+#      but it already passed in step 0, so it cannot strand the bump commit).
+#   3. R9 — independent verify from a FRESH clone of origin:
 #        (a) gitleaks clean on the pushed history
 #        (b) every author+committer email is on the identity allowlist
 #        (c) origin HEAD matches local HEAD
-#   5. TAG + GitHub RELEASE (only AFTER R9 passes — release only verified-clean
-#      history): git tag vX.Y.Z, push the tag, publish a Release whose notes are
-#      DERIVED from this repo's conventional commits (bin/generate-changelog), and
-#      attach the minisign signature of install.sh.
-#   6. NPM PUBLISH — publish the npx wrapper (packages/runheimdall) to the registry, so
+#   4. TAG + GitHub RELEASE (only AFTER R9 passes — release only verified-clean history):
+#      git tag vX.Y.Z, push the tag, publish a Release whose notes are DERIVED from this
+#      repo's conventional commits (bin/generate-changelog), attach the minisign signature.
+#   5. NPM PUBLISH — publish the npx wrapper (packages/runheimdall) to the registry, so
 #      `npx runheimdall` resolves to the version this ship just cut. Publishing used to live
 #      OUTSIDE this script as a human step, and the human forgot: npm sat at 2.0.5 while the
 #      plugin shipped 2.2.6. Same disease as the orphaned Releases, same cure.
 #
-# Stops at the first failure. Nothing is pushed if the local scan finds leaks.
+# Stops at the first failure. Nothing is bumped, committed, or pushed if a guard fails.
 # Exit 0 = everything green — INCLUDING that the Release is live on GitHub and the wrapper is
 # live on npm. A run that cannot publish fails non-zero; it never prints a green banner over an
 # unpublished release.
@@ -643,6 +651,47 @@ reconcile_orphan_release() {
   return 0
 }
 
+# preflight_push_guards — run the checks that can FAIL a release BEFORE any version bump.
+# THE FIX for the dangling-bump defect: these guards used to run AFTER the bump was committed
+# (the local gitleaks scan at "step 1", and the pre-push guard — gitleaks + landmine lint via
+# bin/heimdall-selfscan — at "step 2"). A blocked push (e.g. a landmine in a release script)
+# then left a committed "chore(release): vX.Y.Z" with no tag/release/npm, and the next ship
+# read the bumped manifest and skipped the orphan forever. Run pre-bump, a failure here leaves
+# ZERO new commits and a working tree `git checkout -- .` restores.
+#
+# These mirror the pre-push gate (bin/heimdall-selfscan runs the same gitleaks scan + the same
+# heimdall-landmine-lint), plus a bash -n syntax check on the release scripts — so anything the
+# push would reject is caught here, before the bump, not after it.
+preflight_push_guards() {
+  # (1) Syntax — a release script that does not parse must never be committed or pushed.
+  local s
+  for s in "$REPO_ROOT/release/ship.sh" "$REPO_ROOT/release/sync-release.sh"; do
+    [ -f "$s" ] || continue
+    bash -n "$s" || die "syntax error in $s (bash -n) — refusing to bump/push a broken release script"
+  done
+  ok "syntax: release scripts parse clean (bash -n)"
+
+  # (2) Secrets — gitleaks over FULL history (every ref). This is the SAME scan the pre-push
+  # gate runs; a leak anywhere in history blocks the release. Bare `gitleaks detect` auto-
+  # discovers the repo-root .gitleaks.toml allowlist, so this and the pre-push scan agree.
+  local gl_rc=0
+  gitleaks detect --log-opts=--all || gl_rc=$?
+  [ "$gl_rc" -eq 0 ] || die "gitleaks found leaks (exit $gl_rc) — NOT bumping/pushing. Scrub history, then retry."
+  ok "no leaks in local history"
+
+  # (3) Landmine lint — the strict-mode silent-failure class (terminal | head SIGPIPE, same-
+  # line local self-reference, baked machine paths, non-TTY read hangs, source-after-delete).
+  # This is the SAME gate the pre-push hook enforces (bin/heimdall-selfscan). An ABSENT linter
+  # is a hard block: the push would refuse it anyway, so refuse here — before the bump.
+  local lint="${SHIP_LANDMINE_LINT:-$REPO_ROOT/bin/heimdall-landmine-lint}"
+  if [ ! -x "$lint" ] && command -v heimdall-landmine-lint >/dev/null 2>&1; then
+    lint="$(command -v heimdall-landmine-lint)"
+  fi
+  [ -x "$lint" ] || die "heimdall-landmine-lint not found (looked at $lint) — the strict-mode landmine gate cannot run, and the pre-push hook would block the push anyway. Restore bin/heimdall-landmine-lint."
+  "$lint" || die "heimdall-landmine-lint found a strict-mode landmine — NOT bumping/pushing. Guard it (|| true / \${var:-default} / [ -t 0 ] / reorder), then retry."
+  ok "no strict-mode landmines in shell scripts"
+}
+
 # ── --dry-run: prove the release WITHOUT publishing ──────────────────────────
 # Prints the EXACT gh and npm invocations that would run and the EXACT notes body that would
 # be posted, then exits 0 having mutated nothing (no bump, no commit, no tag, no push, no gh
@@ -780,13 +829,18 @@ if [ "$NPM_ONLY" -eq 1 ]; then
   exit 0
 fi
 
-# ── 0. Version bump (skipped on --check / --no-bump) ─────────────────────────
-# Runs BEFORE the scan/push so the bump commit ships and is R9-verified. The TAG +
-# GitHub Release come AFTER R9 (only verified-clean history is released). This is
-# what advances releases/latest so bin/heimdall-autoupdate rolls clients forward.
-NEW_VERSION=""; TAG=""
+# ── 0. PRE-FLIGHT VALIDATION — resolve the version + run every guard, all BEFORE mutating ──
+# ROOT CAUSE (the dangling-bump defect RJ hit): the bump was committed in "step 0", but the
+# guards that can block a release — the local gitleaks scan and the pre-push guard (gitleaks +
+# heimdall-landmine-lint via bin/heimdall-selfscan) — ran AFTER that commit. A blocked push
+# (e.g. a landmine in a release script) left a committed "chore(release): vX.Y.Z" with no tag,
+# no Release, no npm, and the next ship read the bumped manifest and skipped the orphan forever.
+# The fix: the version bump is the LAST mutating step. We resolve the next version here for
+# messages ONLY (nothing is written), prove the release prerequisites, and run every guard —
+# so a failure leaves ZERO new commits and a working tree `git checkout -- .` restores.
+NEW_VERSION=""; TAG=""; CUR_VERSION=""
 if [ "$CHECK_ONLY" -eq 0 ] && [ "$DO_BUMP" -eq 1 ]; then
-  step "Version bump"
+  step "Release preflight — resolve version (nothing written yet)"
   # Prove we CAN release before we mutate a single file. A bump we cannot follow through
   # with is what strands a version (see preflight_release_prereqs above). npm is proven here
   # for the same reason and at the same moment: an unauthenticated npm discovered at the END
@@ -807,13 +861,52 @@ if [ "$CHECK_ONLY" -eq 0 ] && [ "$DO_BUMP" -eq 1 ]; then
     die "tag $TAG already exists (local or origin) — refusing to re-release $NEW_VERSION"
   fi
   # A non-fast-forward push is what killed the v2.2.3 ship: main had diverged from origin,
-  # the push at step 2 was rejected, and the bump commit was already made. Catch the
-  # divergence BEFORE the bump so the operator merges first and no orphan is created.
+  # the push was rejected, and the bump commit was already made. Catch the divergence in
+  # preflight — before the bump — so the operator merges first and no orphan is created.
   if git rev-parse -q --verify "origin/$BRANCH" >/dev/null 2>&1; then
     if ! git merge-base --is-ancestor "origin/$BRANCH" HEAD 2>/dev/null; then
       die "origin/$BRANCH has commits HEAD does not contain — the release push would be REJECTED and the bump commit would be stranded (this is the v2.2.3 defect). Merge/rebase origin/$BRANCH first, then re-run."
     fi
   fi
+  ok "release version resolved: $CUR_VERSION → $NEW_VERSION (tag $TAG) — NOT committed yet"
+elif [ "$DO_BUMP" -eq 0 ]; then
+  warn "--no-bump: shipping without a version bump (no tag/release)"
+fi
+
+# ── Preview what will ship (pre-bump; the bump, if any, adds one more commit) ─────────────
+step "Pending commits (origin/$BRANCH..HEAD)"
+PENDING="$(git log --oneline "origin/$BRANCH..HEAD" 2>/dev/null || true)"
+if [ -z "$PENDING" ]; then
+  if [ -n "$TAG" ]; then
+    warn "nothing pending yet — HEAD matches origin/$BRANCH (the $TAG bump commit will be the first)"
+  else
+    warn "nothing to push — HEAD matches origin/$BRANCH (verify will still run)"
+  fi
+else
+  printf '%s\n' "$PENDING" | sed 's/^/  /'
+fi
+
+# ── 1. Pre-push guards — run BEFORE the bump so a failed guard leaves ZERO new commits ────
+# syntax (bash -n) · secrets (gitleaks full history) · strict-mode landmine lint. These are
+# exactly the gates the git pre-push hook (bin/heimdall-selfscan) enforces, run here up front
+# so a blocked release aborts with nothing committed — the whole point of this ordering.
+step "Pre-push guards (syntax · secrets · landmine lint) — BEFORE any version bump"
+preflight_push_guards
+
+# --check stops here: local guards clean, nothing bumped or pushed.
+if [ "$CHECK_ONLY" -eq 1 ]; then
+  printf '\n%s%sCheck complete%s — guards clean (syntax, gitleaks, landmine). (--check: did not bump or push.)\n' "$G" "$B" "$R"
+  exit 0
+fi
+
+# ── 2. Version bump — the LAST mutating step, gated on ALL guards above being green ───────
+# TAG is non-empty only for a real bump run (CHECK_ONLY=0 && DO_BUMP=1). Everything the release
+# commit carries is rendered/synced into the WORKING TREE and then committed in one shot; if any
+# step here fails, the die aborts BEFORE `git commit`, so there is still no dangling bump, and
+# `git checkout -- .` discards any partial working-tree render. This is what advances
+# releases/latest so bin/heimdall-autoupdate rolls clients forward.
+if [ -n "$TAG" ]; then
+  step "Version bump ($TAG) — guards green, committing"
   write_version "$NEW_VERSION"
   git add "$PLUGIN_MANIFEST"
   # Pin install.sh's DEFAULT_REF to THIS tag so a fresh `curl|bash` install and hmd --update's
@@ -834,34 +927,14 @@ if [ "$CHECK_ONLY" -eq 0 ] && [ "$DO_BUMP" -eq 1 ]; then
   bump_readme_sha "$(git rev-parse HEAD)"
   git commit --no-verify -q -m "chore(release): $TAG" || die "bump commit failed"
   ok "bumped $CUR_VERSION → $NEW_VERSION (commit $(git rev-parse --short HEAD))"
-elif [ "$DO_BUMP" -eq 0 ]; then
-  warn "--no-bump: shipping without a version bump (no tag/release)"
 fi
 
-# ── Preview what will ship ───────────────────────────────────────────────────
-step "Pending commits (origin/$BRANCH..HEAD)"
-PENDING="$(git log --oneline "origin/$BRANCH..HEAD" 2>/dev/null || true)"
-if [ -z "$PENDING" ]; then
-  warn "nothing to push — HEAD matches origin/$BRANCH (verify will still run)"
-else
-  printf '%s\n' "$PENDING" | sed 's/^/  /'
-fi
-
-# ── 1. Local full-history secret scan ────────────────────────────────────────
-step "Local gitleaks scan (full history)"
-GL_RC=0
-gitleaks detect --log-opts=--all || GL_RC=$?
-[ "$GL_RC" -eq 0 ] || die "gitleaks found leaks (exit $GL_RC) — NOT pushing. Scrub history, then retry."
-ok "no leaks in local history"
-
-if [ "$CHECK_ONLY" -eq 1 ]; then
-  printf '\n%s%sCheck complete%s — local scan clean. (--check: did not push.)\n' "$G" "$B" "$R"
-  exit 0
-fi
-
-# ── 2. Push (repo's own pre-push guard fires here too) ───────────────────────
+# ── 3. Push (the repo's own pre-push guard re-runs here as a backstop) ────────────────────
 LOCAL_HEAD="$(git rev-parse HEAD)"
 step "Push to origin/$BRANCH"
+# Recompute the pending set now that the bump commit (if any) exists, so the push decision and
+# the R9 HEAD comparison see the commit actually being shipped.
+PENDING="$(git log --oneline "origin/$BRANCH..HEAD" 2>/dev/null || true)"
 if [ -z "$PENDING" ]; then
   warn "already up to date — skipping push, proceeding to verify"
 else
@@ -869,7 +942,7 @@ else
   ok "pushed"
 fi
 
-# ── 3. R9 — verify from a fresh clone ────────────────────────────────────────
+# ── 4. R9 — verify from a fresh clone ────────────────────────────────────────
 step "R9 verify (fresh clone of origin)"
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/heimdall-r9.XXXXXX")"
 cleanup() { rm -rf "$TMP_DIR" 2>/dev/null || true; }
