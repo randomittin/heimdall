@@ -97,6 +97,16 @@
       "reject_contract": "attack G4-god-cross-partition: expected DENY, candidate returns ALLOW -> gate status=fail at step 'G4-god-cross-partition'"
     },
     {
+      "name": "god-accepts-forged-iap",
+      "file": "god-accepts-forged-iap.mjs",
+      "invariant": "INV-GOD (IAP bridge)",
+      "gate_dropped": "the app-layer IAP JWT verification (cp_iap.iap_identity / verify_iap_jwt: ES256 signature + issuer + configured audience + owner email); the god web surface trusts any IAP assertion",
+      "attack_that_succeeds": "G5 — a forged/absent/wrong-email Google IAP JWT mints an owner-equivalent identity on the IAP-gated god web surface (the browser auth bridge)",
+      "must_turn_red_gate": "cross-tenant-denial",
+      "first_fail_case": "G5-god-forged-iap",
+      "reject_contract": "attack G5-god-forged-iap: expected DENY, candidate returns ALLOW -> gate status=fail at step 'G5-god-forged-iap'"
+    },
+    {
       "name": "session-honors-body-team",
       "file": "session-honors-body-team.mjs",
       "invariant": "INV-LOGIN-1",

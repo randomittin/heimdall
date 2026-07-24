@@ -20,6 +20,10 @@
 //   * godEnumeratePartitions<- the owner aggregate enumerates partitions SERVER-SIDE from
 //                              the team registry, never a caller-supplied team_id
 //                              (INV-1 holds even for the owner aggregate / G4 god-cross-partition)
+//   * iapGrantsOwner        <- the IAP-gated god WEB surface's owner bridge: cp_iap.iap_identity
+//                              accepts a Google IAP JWT as owner IFF the ES256 signature +
+//                              issuer + configured audience VERIFY and email == the owner email
+//                              (INV-GOD / G5 god-forged-iap — verify the assertion, never the edge)
 //
 // A `gates` object selects each gate's behavior. The golden wires EVERY flag falsy =>
 // every gate STRONG. A mutant sets EXACTLY ONE flag true => that gate is dropped, the
@@ -176,6 +180,25 @@ export function godEnumeratePartitions(gates, req) {
     return [req.body.team_id]; // MUTANT: trusts the caller-supplied team_id (INV-1 dropped).
   }
   return Object.keys(TEAMS); // GOLDEN: server-enumerated registry only.
+}
+
+// ── INV-GOD (IAP owner bridge): the IAP-gated god-serving WEB surface accepts a Google IAP
+//    JWT (X-Goog-IAP-JWT-Assertion) as an OWNER-EQUIVALENT identity IFF the app layer VERIFIES
+//    it — the ES256 signature against Google's published keys, iss == the IAP issuer, aud ==
+//    the configured backend audience — AND its email == the configured owner email. A browser
+//    can neither PKI-sign nor do GCP IAM, so this is the ONLY browser path to /god/*; it is a
+//    NEW owner-auth path ALONGSIDE the owner PKI, scoped to /god/* on the god surface only. The
+//    gate is the app-layer VERIFY, never the mere presence of an IAP header (trusting the edge
+//    is the foot-gun). Mirrors cp_iap.iap_identity + verify_iap_jwt. ──
+const GOD_OWNER_EMAIL = "rj@heimdall.example"; // the configured owner (env HEIMDALL_GOD_OWNER_EMAIL).
+const GOD_IAP_AUDIENCE = "/projects/123/global/backendServices/456"; // env HEIMDALL_GOD_IAP_AUDIENCE.
+export function iapGrantsOwner(gates, assertion) {
+  if (gates.godAcceptsForgedIap) return true; // MUTANT: skips the verify -> ANY assertion mints owner.
+  return !!assertion
+    && assertion.sig_valid === true                       // ES256 signature verified (not the edge).
+    && assertion.iss === "https://cloud.google.com/iap"   // the IAP issuer.
+    && assertion.aud === GOD_IAP_AUDIENCE                  // the configured backend audience.
+    && assertion.email === GOD_OWNER_EMAIL;               // GOLDEN: a VERIFIED IAP JWT for the owner.
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────
@@ -363,6 +386,21 @@ export function evaluateAttack(gates, attackId) {
       // question is whether the aggregate trusts the caller-supplied team_id.
       const partitions = godEnumeratePartitions(gates, req);
       return partitions.includes(FORGED_TEAM_ID) ? "ALLOW" : "DENY";
+    }
+    case "G5-god-forged-iap": {
+      // INV-GOD (IAP owner bridge). A browser hits the IAP-gated god surface with a FORGED IAP
+      // JWT (the ES256 signature does NOT verify). The app-layer verify (cp_iap.iap_identity)
+      // MUST reject it — owner is minted ONLY when the JWT's signature verifies AND its email ==
+      // the configured owner. The SAME gate rejects an absent JWT and a valid JWT for any other
+      // Google identity. Minting owner from a forged/absent/wrong-email JWT (trusting the IAP
+      // edge instead of verifying the assertion) is the ALLOW.
+      const forgedJwt = {
+        sig_valid: false,               // the signature does NOT verify (forged / tampered).
+        iss: "https://cloud.google.com/iap",
+        aud: GOD_IAP_AUDIENCE,
+        email: GOD_OWNER_EMAIL,
+      };
+      return iapGrantsOwner(gates, forgedJwt) ? "ALLOW" : "DENY";
     }
     case "L1-session-cross-team": {
       // INV-LOGIN-1. A VALID login session minted for team A (server-derived from

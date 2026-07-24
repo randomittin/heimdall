@@ -1,6 +1,6 @@
 {
   "feature": "rr-multitenant-isolation",
-  "note": "The fixed cross-tenant attack sequence. Every attack MUST be DENIED. This is the reference the differential-style denial oracle grades against — independent of the candidate model. Weakening this table (dropping an attack case) lets the mutant that only flips that case SURVIVE, which is exactly how test/heimdall-rr-isolation-oracle.test.sh proves the acceptance table is load-bearing (falsify score drops below 1.0). The G* rows encode INV-GOD: the owner-only cross-tenant god aggregate (GET /god/roster) is 404 on the public surface for all callers and all team secrets, is reachable on the gated control-plane service ONLY with owner PKI + valid signature + IAM, and never honors a caller-supplied team_id. The L* rows encode INV-LOGIN: the dashboard team-login session (Option B, docs/analysis/dashboard-login-design.md) is a team-READ capability scoped to the caller's OWN teams — team_ids are server-derived at mint via registered_team(haid) and signed in, never client-supplied; sessions are short-TTL; a bad HAID signature mints nothing; and a login session is ALWAYS Identity.owner=false (never owner/god).",
+  "note": "The fixed cross-tenant attack sequence. Every attack MUST be DENIED. This is the reference the differential-style denial oracle grades against — independent of the candidate model. Weakening this table (dropping an attack case) lets the mutant that only flips that case SURVIVE, which is exactly how test/heimdall-rr-isolation-oracle.test.sh proves the acceptance table is load-bearing (falsify score drops below 1.0). The G* rows encode INV-GOD: the owner-only cross-tenant god aggregate (GET /god/roster) is 404 on the public surface for all callers and all team secrets, is reachable on the gated control-plane service ONLY with owner PKI + valid signature + IAM, and never honors a caller-supplied team_id. G5 additionally covers the IAP-gated god WEB surface (the browser auth bridge, cp_iap): a Google IAP JWT mints an owner-equivalent identity ONLY when the app layer VERIFIES the ES256 signature + issuer + configured audience AND the email == the configured owner — a forged/absent/wrong-email JWT is 401 (verify the assertion, never trust the IAP edge). The L* rows encode INV-LOGIN: the dashboard team-login session (Option B, docs/analysis/dashboard-login-design.md) is a team-READ capability scoped to the caller's OWN teams — team_ids are server-derived at mint via registered_team(haid) and signed in, never client-supplied; sessions are short-TTL; a bad HAID signature mints nothing; and a login session is ALWAYS Identity.owner=false (never owner/god).",
   "cases": [
     {
       "n": "A1-idor-repo",
@@ -67,6 +67,12 @@
       "expected": "DENY",
       "invariant": "INV-1 (god aggregate)",
       "attack": "the god handler must ignore a caller-supplied body/query team_id, enumerating partitions server-side"
+    },
+    {
+      "n": "G5-god-forged-iap",
+      "expected": "DENY",
+      "invariant": "INV-GOD (IAP bridge)",
+      "attack": "a forged/absent/wrong-email Google IAP JWT against the IAP-gated god web surface must not mint an owner-equivalent identity — cp_iap must VERIFY the ES256 signature + issuer + configured audience AND require email == the configured owner, 401 otherwise (never trust the IAP edge)"
     },
     {
       "n": "L1-session-cross-team",

@@ -58,6 +58,11 @@ import cp_handlers
 import cp_publicsurface  # THE PUBLIC-SURFACE BOUNDARY (allowlist 404 + the enroll/presence
                          # abuse gates). One-way dependency: this module imports it; it never
                          # imports cp_server (the gates return (status, body) tuples we wrap).
+import cp_iap  # THE BROWSER→GOD AUTH BRIDGE. On the IAP-gated god-serving surface
+             # (god_surface_enabled(), env HEIMDALL_GOD_SURFACE=1) the /god/* routes accept a
+             # verified Google IAP JWT whose email == the configured owner as an OWNER-equivalent
+             # Identity (a browser can neither PKI-sign nor do GCP IAM). One-way dep like
+             # cp_publicsurface: this module imports it; it never imports cp_server.
 import issue_queue  # REUSE heimdall_home() for the per-job scratch root.
 
 # The control-plane version. The single source of truth for the server_version banner
@@ -435,6 +440,12 @@ def _build_handler_class(home, enforce_revocation):
                 "x_forwarded_for": self.headers.get("X-Forwarded-For"),
                 "peer_ip": (self.client_address[0]
                             if getattr(self, "client_address", None) else None),
+                # The Google IAP assertion header, forwarded by IAP on every request to the
+                # IAP-gated god-serving surface. The §3 chokepoint IGNORES it (verify_identity
+                # reads only haid/signature/method/path/body); it is consulted ONLY by the god
+                # surface branch (cp_iap.iap_identity) for /god/*, so lifting it is inert for
+                # every other route + surface. A normal signed / public request never sets it.
+                "iap_assertion": self.headers.get(cp_iap.IAP_JWT_HEADER),
             }
 
         def _handle(self, method):
@@ -445,6 +456,40 @@ def _build_handler_class(home, enforce_revocation):
             # SIGNATURE (authenticate, below) verifies over the FULL self.path-with-query
             # in `request["path"]` — the two concerns are split deliberately.
             route_path = request["route_path"]
+            # ── GOD-SURFACE BOUNDARY + IAP OWNER BRIDGE (§god-surface / INV-GOD) ── On the
+            # IAP-gated god-serving surface (HEIMDALL_GOD_SURFACE=1) the app serves ONLY the
+            # /god/* routes + the health probes; every other route is a FLAT 404 (the IAP
+            # origin's surface is minimized exactly like the public surface, so a browser that
+            # reached /dispatch here never even resolves it). For /god/* the identity is proven
+            # from the Google IAP JWT (X-Goog-IAP-JWT-Assertion) — cp_iap.iap_identity verifies
+            # the ES256 signature + issuer + the configured audience + expiry and mints an
+            # OWNER-equivalent Identity IFF the verified email == the configured owner email; a
+            # missing / invalid / wrong-email / unconfigured JWT → 401 + an audit auth_fail row.
+            # This path is honored ONLY here (god surface + /god/*): /god/* is NEVER in
+            # PUBLIC_ROUTES (G1/G2 — 404 on the public surface), and the IAP header is consulted
+            # for no other route (the owner grant confers nothing beyond /god/*). The gated IAM
+            # control-plane service (flag unset) is byte-for-byte unchanged — there /god/* rides
+            # the §3 Ed25519 owner + IAM path below, exactly as before.
+            if cp_iap.god_surface_enabled():
+                if cp_diag.is_health_path(method, route_path):
+                    self._send(cp_diag.handle(method, route_path, home=home))
+                    return
+                if not cp_iap.is_god_route(method, route_path):
+                    self._send(Response(404, {"error": "no_such_route"}))
+                    return
+                try:
+                    identity = cp_iap.iap_identity(request, home=home)
+                except cp_auth.AuthError as err:
+                    cp_audit.write("auth_fail", actor_haid=None, outcome="refused",
+                                   detail="iap_" + err.reason, home=home)
+                    self._send(Response(401, {"error": err.reason}))
+                    return
+                route = _route(method, route_path)
+                if route is None:
+                    self._send(Response(404, {"error": "no_such_route"}))
+                    return
+                self._send(route(identity, request))
+                return
             # ── PUBLIC-SURFACE BOUNDARY (§public-surface) ── On the --allow-unauthenticated
             # public service (HEIMDALL_PUBLIC_SURFACE=1) ONLY the public allowlist exists:
             # every gated route (dispatch/jobs/approval/owner/audit/scheduler/…) returns a
