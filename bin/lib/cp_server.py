@@ -411,6 +411,13 @@ def _build_handler_class(home, enforce_revocation):
                 # request never sets it; the §3 chokepoint ignores it, so lifting it is inert
                 # for every authenticated route.
                 "team_secret": self.headers.get("X-Heimdall-Team-Secret"),
+                # The Authorization header a Bearer-token caller carries — the dashboard-login
+                # SESSION read (GET /dashboard/rosters) presents its CP-signed session token as
+                # `Authorization: Bearer <token>` (cp_session._bearer_token reads it here). A
+                # browser cannot PKI-sign, so this is its credential channel. A normal signed
+                # request never sets it; the §3 chokepoint ignores it (verify_identity reads only
+                # haid/signature/method/path/body), so lifting it is inert for every gated route.
+                "authorization": self.headers.get("Authorization"),
                 # The rate-limit IP source for the PUBLIC surface (cp_publicsurface.client_ip
                 # owns the policy of choosing between them). x_forwarded_for is the raw header
                 # — on Cloud Run the GFE appends the caller, FIRST hop is the original client;
@@ -629,6 +636,30 @@ def _build_handler_class(home, enforce_revocation):
     return _CPHandler
 
 
+def register_extended_routes(home=None):
+    """Wire the two post-substrate route families that live in their OWN modules (§10 seam):
+      • cp_session — the dashboard-login SESSION routes (POST /dashboard/session/init +
+        /approve, GET /dashboard/session/status + /dashboard/rosters). Pre-auth PUBLIC seam
+        (a browser / local hmd cannot ride the §3 chokepoint); each route self-gates (the
+        assertion signature at approve, the CP-signed token at rosters). A team-READ
+        capability only — never dispatch, never owner, never cross-team (INV-LOGIN).
+      • cp_god — the OWNER-ONLY cross-tenant GOD routes (GET /god/roster + /god/logs).
+        AUTHENTICATED seam (register_route) so they ride the §3 chokepoint and the owner
+        gate; NEVER the public seam and NEVER cp_publicsurface.PUBLIC_ROUTES, so they 404 on
+        the public surface (INV-GOD G1/G2).
+
+    Lazy-imported (both modules import cp_server) to avoid an import cycle. Called from serve()
+    after cp_boot.boot so the deployed container exposes them; a caller/test may call it to
+    register against the live seam. Idempotent (register replaces a key). Returns
+    {"session": [...keys], "god": [...keys]}."""
+    import cp_session
+    import cp_god
+    return {
+        "session": cp_session.register(home=home),
+        "god": cp_god.register(home=home),
+    }
+
+
 def resolve_bind(*, host=None, port=None, env=None):
     """Resolve the (host, port) to bind, honoring the Cloud Run contract (§A1). An
     EXPLICIT value always wins; when one is not given it falls back to the environment
@@ -677,6 +708,12 @@ def serve(host=None, port=None, *, home=None, enforce_revocation=True):
     import cp_boot
 
     cp_boot.boot(home=home)
+
+    # Wire the SESSION (dashboard-login) + GOD (owner-only cross-tenant) route families —
+    # they live in their own modules and register through the same §10 seam. Done here (not
+    # in cp_boot) so the deployed serving container exposes them; the god routes stay off the
+    # public allowlist (404 on the public surface), the session routes ride the pre-auth seam.
+    register_extended_routes(home=home)
 
     handler_cls = _build_handler_class(home, enforce_revocation)
     httpd = HTTPServer((host, port), handler_cls)
