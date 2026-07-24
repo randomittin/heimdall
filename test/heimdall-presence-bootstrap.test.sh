@@ -134,15 +134,29 @@ class Handler(BaseHTTPRequestHandler):
 
 # self-terminating watchdog — a leaked mock CP must NEVER outlive its test. A bash EXIT trap
 # does NOT run on SIGKILL (the agent/API hard-kills that orphaned ~692 of these to launchd), so
-# guard IN-PROCESS: exit hard once orphaned (reparented to launchd, ppid 1), or the original
-# parent is gone, or a 120s backstop elapses. Root-cause fix for the mock_cp.py python leak.
+# guard IN-PROCESS on the TEST SCRIPT's liveness: the launcher exports MOCK_GUARD_PID=$$ (the
+# test script's pid, stable across the command-substitution subshell that backgrounds us), and
+# we exit hard once that process is gone — or a 120s backstop elapses. NOTE: we deliberately do
+# NOT key off getppid()/ppid==1. `URL="$(launch_mock)"` backgrounds us INSIDE a command-
+# substitution subshell, so the kernel reparents us to launchd (ppid 1) the instant that subshell
+# exits — WHILE the test is still running. A ppid-based guard would kill the mock ~1s after launch
+# and break every later step (the roster read, the doctor's enroll/beat). Watching the real
+# test-script pid kills a LEAKED mock (script gone) without killing a LIVE one (merely reparented).
 import threading as _th, time as _t
-_PPID0 = os.getppid()
+_GUARD = int(os.environ.get("MOCK_GUARD_PID") or "0")
 def _watchdog():
     start = _t.time()
     while True:
         _t.sleep(1.0)
-        if os.getppid() != _PPID0 or os.getppid() == 1 or (_t.time() - start) > 120:
+        guard_dead = False
+        if _GUARD:
+            try:
+                os.kill(_GUARD, 0)          # probe liveness only (no signal delivered)
+            except ProcessLookupError:
+                guard_dead = True            # the test script is gone -> we are a leak
+            except PermissionError:
+                guard_dead = False           # pid exists but not ours -> alive
+        if guard_dead or (_t.time() - start) > 120:
             os._exit(0)
 _th.Thread(target=_watchdog, daemon=True).start()
 
@@ -157,7 +171,7 @@ PYEOF
 PORT_SEQ=0
 launch_mock() {
   PORT_SEQ=$((PORT_SEQ+1)); local pf="$WORK/port.$PORT_SEQ.txt"; : >"$pf"
-  MOCK_LOG="$1" MOCK_TOKEN="$2" MOCK_ENROLL_FAIL="${3:-}" \
+  MOCK_LOG="$1" MOCK_TOKEN="$2" MOCK_ENROLL_FAIL="${3:-}" MOCK_GUARD_PID="$$" \
     "$PY" "$WORK/mock_cp.py" >"$pf" 2>>"$WORK/mock.err" &
   local pid=$!; MOCK_PIDS="$MOCK_PIDS $pid"; local p=""
   for _ in $(seq 1 50); do

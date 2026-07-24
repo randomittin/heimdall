@@ -22,9 +22,12 @@
 #   5. WIRE BEHAVIOR (real signed HTTP to a recording server) — a normal beat sends the file;
 #      `on --no-files` sends file:null with handle+verdict present; `off` POSTs a retire beat
 #      to /presence-retire; a subsequent `beat` while off sends NOTHING.
-#   6. STATUSLINE HINT (falsifiable) — an opted-out render shows "presence off" (not the
-#      invite tease) AND writes NO .beat-stamp; an ON render shows the invite AND writes the
-#      stamp (the beat-stamp falsifier).
+#   6. OPT-OUT VISIBILITY (falsifiable) — the v1 statusline is a FIXED 4-row layout (see
+#      heimdall-statusline-width.test.sh) with NO per-render tease row, so its opt-out proof is
+#      the .beat-stamp: an ON render ARMS a beat (stamp written), an OFF render writes NONE. The
+#      solo invite tease was RELOCATED to the session-end farewell (sentinels/hmd-farewell.sh) —
+#      a solo, presence-ON farewell shows "hmd invite"; an opted-out farewell SUPPRESSES it (an
+#      invite would be a lie when no one can see the dev).
 #   7. GITIGNORE — .heimdall/presence.json is gitignored (one dev's choice never commits into
 #      a teammate's repo), asserted against the real shipped .gitignore.
 #
@@ -298,43 +301,66 @@ fi
 kill "$WIRE_PID" >/dev/null 2>&1 || true; WIRE_PID=""
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 6. STATUSLINE HINT + the beat-stamp falsifier
+# 6. OPT-OUT VISIBILITY — the statusline .beat-stamp consent gate + the farewell invite tease
 # ══════════════════════════════════════════════════════════════════════════════
+# The v1 statusline (feat(statusline): rewrite to the v1 full-bleed 3-row layout) is a FIXED
+# 4-row render — heimdall-statusline-width.test.sh pins EXACTLY 4 non-empty rows — so a
+# per-render tease/off-hint row was RETIRED by design (it would break the row invariant). The
+# statusline's falsifiable opt-out proof is therefore the .beat-stamp: an ON render ARMS a beat
+# (stamp written), an OFF render writes NONE (the toggle short-circuits the fork). The solo
+# invite tease was RELOCATED to the session-end farewell (sentinels/hmd-farewell.sh, which even
+# comments "mirrors the statusline solo tease"); we prove the tease + its opt-out suppression
+# there — its real home now.
 echo
-echo "6. statusline shows the invisible hint when off (falsifiable vs. the invite tease)"
-HS="$TMP/homeS"; mkdir -p "$HS"
+echo "6. opt-out visibility: statusline .beat-stamp gate + the farewell invite tease (relocated)"
+HS="$TMP/homeS"; mkdir -p "$HS/.heimdall"
 render() {  # $1 = workspace dir
   env -i PATH="$PATH" HOME="$HS" HEIMDALL_CP_URL="http://127.0.0.1:1" COLUMNS=120 \
     LANG=en_US.UTF-8 "$PY" "$SL" <<EOF
 {"workspace":{"current_dir":"$1"}}
 EOF
 }
-# ON render (no presence.json): the invite tease shows; a beat-stamp IS written.
+FARE="$REPO/sentinels/hmd-farewell.sh"
+farewell() {  # $1 = a NON-git workspace dir -> the farewell resolves HMD_REPO_DIR to $1/.heimdall
+  ( cd "$1" && env -i PATH="$PATH" HOME="$HS" HEIMDALL_HOME="$HS/.heimdall" \
+      TERM=dumb NO_COLOR=1 HEIMDALL_NO_INTRO=1 bash "$FARE" 2>/dev/null )
+}
+
+# ON render (no presence.json): the beat is ARMED — a .beat-stamp IS written.
 RON_DIR="$TMP/slon"; mkdir -p "$RON_DIR/.heimdall"
-OUT_ON="$(render "$RON_DIR" 2>/dev/null)"
-if printf '%s' "$OUT_ON" | grep -q "hmd invite" && ! printf '%s' "$OUT_ON" | grep -q "presence off"; then
-  ok "6a ON render shows the invite tease, NOT the off-hint"
-else
-  bad "6a ON render wrong -- $(printf '%s' "$OUT_ON" | tail -n2)"
-fi
+render "$RON_DIR" >/dev/null 2>&1
 if [ -f "$RON_DIR/.heimdall/.beat-stamp" ]; then
-  ok "6b FALSIFIER: ON render WRITES .beat-stamp (the beat is armed when present)"
+  ok "6a FALSIFIER: ON render WRITES .beat-stamp (the beat is armed when present)"
 else
-  bad "6b ON render did not write .beat-stamp -- the beat-stamp falsifier is inert"
+  bad "6a ON render did not write .beat-stamp -- the beat-stamp falsifier is inert"
 fi
-# OFF render (presence.json {enabled:false}): the off-hint shows; NO beat-stamp is written.
+
+# OFF render (presence.json {enabled:false}): NO beat-stamp is written (zero beats).
 ROFF_DIR="$TMP/sloff"; mkdir -p "$ROFF_DIR/.heimdall"
 printf '{"enabled": false}\n' > "$ROFF_DIR/.heimdall/presence.json"
-OUT_OFF="$(render "$ROFF_DIR" 2>/dev/null)"
-if printf '%s' "$OUT_OFF" | grep -q "presence off" && ! printf '%s' "$OUT_OFF" | grep -q "hmd invite"; then
-  ok "6c OFF render shows the \"presence off\" hint (the dev can SEE they are invisible)"
-else
-  bad "6c OFF render missing the off-hint -- $(printf '%s' "$OUT_OFF" | tail -n2)"
-fi
+render "$ROFF_DIR" >/dev/null 2>&1
 if [ ! -f "$ROFF_DIR/.heimdall/.beat-stamp" ]; then
-  ok "6d OFF render writes NO .beat-stamp (zero beats; drop the guard -> stamp appears -> RED)"
+  ok "6b OFF render writes NO .beat-stamp (zero beats; drop the guard -> stamp appears -> RED)"
 else
-  bad "6d OFF render wrote a .beat-stamp -- the off dev still beats (RED)"
+  bad "6b OFF render wrote a .beat-stamp -- the off dev still beats (RED)"
+fi
+
+# The invite tease's REAL home (relocated off the statusline): a SOLO, presence-ON farewell
+# prints "invite your team · hmd invite" (the growth beat); an OPTED-OUT farewell SUPPRESSES it.
+FARE_ON="$TMP/fare_on"; mkdir -p "$FARE_ON/.heimdall"
+FOUT_ON="$(farewell "$FARE_ON")"
+if printf '%s' "$FOUT_ON" | grep -q "hmd invite"; then
+  ok "6c a solo, presence-ON farewell shows the invite tease (hmd invite) — the tease's real home"
+else
+  bad "6c solo-ON farewell missing the invite tease -- $(printf '%s' "$FOUT_ON" | tail -n2)"
+fi
+FARE_OFF="$TMP/fare_off"; mkdir -p "$FARE_OFF/.heimdall"
+printf '{"enabled": false}\n' > "$FARE_OFF/.heimdall/presence.json"
+FOUT_OFF="$(farewell "$FARE_OFF")"
+if ! printf '%s' "$FOUT_OFF" | grep -q "hmd invite"; then
+  ok "6d FALSIFIER: an OPTED-OUT farewell SUPPRESSES the invite (an invite would be a lie when invisible)"
+else
+  bad "6d opted-out farewell still showed the invite tease -- the dev is invisible, the invite lies"
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
