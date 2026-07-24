@@ -111,12 +111,40 @@ except Exception:
 print(hdrs.get(want, "") or "")
 PY
 }
+# flood METHOD URL N MODE [BODY] -> prints "<code> <scope>" of the FIRST 429 (shed) among N requests,
+# or "none 0" if none shed. MODE picks the X-Forwarded-For (client-IP) key cp_publicsurface rate-limits
+# on: "same" -> every request shares ONE IP bucket (proves a per-IP cap); "rotate" -> each request a
+# DISTINCT IP (per-IP never trips, isolates the deployment-wide budget); "none" -> no XFF (peer IP).
+flood(){ "$PY" - "$@" <<'PYF'
+import sys, json, urllib.request, urllib.error
+m, u, n, mode = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
+raw = sys.argv[5].encode() if len(sys.argv) > 5 and sys.argv[5] else b"{}"
+data = raw if m == "POST" else None
+for i in range(1, n + 1):
+    req = urllib.request.Request(u, data=data, method=m)
+    if mode == "same":
+        req.add_header("X-Forwarded-For", "203.0.113.7")
+    elif mode == "rotate":
+        req.add_header("X-Forwarded-For", "198.51.100.%d" % i)
+    try:
+        urllib.request.urlopen(req, timeout=5)
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
+            try: scope = json.loads(e.read() or b"{}").get("scope", "")
+            except Exception: scope = ""
+            print("429 %s" % (scope or "")); sys.exit(0)
+    except Exception:
+        print("0 transport"); sys.exit(0)
+print("none 0")
+PYF
+}
 waitup(){ for _ in $(seq 1 60); do [ "$(httpstat GET "$1/healthz")" = "200" ] && return 0; sleep 0.1; done; return 1; }
 
 # ── boot the PUBLIC surface (HEIMDALL_PUBLIC_SURFACE=1, enroll IP limit low for determinism) ──
 P1="$(freeport)"; U1="http://127.0.0.1:$P1"
 HEIMDALL_PUBLIC_SURFACE=1 HEIMDALL_CP_PKI_KEY="$PKI" HEIMDALL_ENROLL_TOKEN="$TOKEN" \
-  HEIMDALL_ENROLL_IP_LIMIT=3 HEIMDALL_HOME="$EXT/pub" \
+  HEIMDALL_ENROLL_IP_LIMIT=3 HEIMDALL_DASH_INIT_IP_LIMIT=3 HEIMDALL_DASH_READ_IP_LIMIT=3 \
+  HEIMDALL_DASH_INIT_BUDGET_MAX=20 HEIMDALL_HOME="$EXT/pub" \
   "$CLI" serve --host 127.0.0.1 --port "$P1" >/dev/null 2>&1 &
 SRV1=$!
 waitup "$U1" || { bad "public server did not come up"; echo "cp-public-surface: $PASS passed, $((FAIL+1)) failed"; exit 1; }
@@ -180,6 +208,36 @@ done
 [ "$hit429" = "1" ] && ok "enroll per-IP rate-limit trips 429 under flood (gate wired)" \
   || bad "no 429 under 25 rapid enrolls at limit=3 (rate-limit not wired?)"
 
+# ── DASHBOARD-LOGIN abuse caps (deploy-blocker: the 4 /dashboard/session/* routes went public with
+#    ZERO rate caps — a write-cost DoS on the $10k budget). Prove each cap is LOAD-BEARING: a flood
+#    trips the shed status (429) with the RIGHT scope, while a legitimately-paced login still 200s.
+#    IP caps set low via env (INIT/READ=3), budget=20; XFF spoofing keys the per-IP vs budget gate.
+c="$(httpstat POST "$U1/dashboard/session/init" '{}' 'X-Forwarded-For:192.0.2.50')"
+[ "$c" = "200" ] && ok "dash init legit-paced (single IP) -> 200 (a real login is never shed)" \
+  || bad "dash init legit -> $c (expected 200 — a legit login must not be capped)"
+
+r="$(flood POST "$U1/dashboard/session/init" 12 same '{}')"
+case "$r" in "429 dash_init_ip") ok "dash init per-IP flood -> 429 dash_init_ip (write-cost DoS shed)" ;;
+  *) bad "dash init per-IP flood -> '$r' (expected '429 dash_init_ip' — per-IP cap not wired?)" ;; esac
+
+# IP-rotating flood: each request a fresh IP (per-IP never trips), so ONLY the deployment-wide
+# device_code budget can shed it -> an attacker rotating IPs still cannot explode the session store.
+r="$(flood POST "$U1/dashboard/session/init" 60 rotate '{}')"
+case "$r" in "429 dash_init_budget") ok "dash init IP-rotating flood -> 429 dash_init_budget (budget bounds the fleet)" ;;
+  *) bad "dash init rotate flood -> '$r' (expected '429 dash_init_budget' — budget cap not wired?)" ;; esac
+
+# READ caps: approve/status/rosters each shed a same-IP flood past READ_IP_LIMIT=3 with their OWN
+# scope (the shed happens BEFORE the handler's verify/enumerate — a real pre-work flood shed).
+r="$(flood POST "$U1/dashboard/session/approve" 12 same '{}')"
+case "$r" in "429 dash_approve_ip") ok "dash approve per-IP flood -> 429 dash_approve_ip (sig-verify-flood shed)" ;;
+  *) bad "dash approve flood -> '$r' (expected '429 dash_approve_ip')" ;; esac
+r="$(flood GET "$U1/dashboard/session/status?device_code=dc-nope" 12 same)"
+case "$r" in "429 dash_status_ip") ok "dash status per-IP flood -> 429 dash_status_ip (poll-flood shed)" ;;
+  *) bad "dash status flood -> '$r' (expected '429 dash_status_ip')" ;; esac
+r="$(flood GET "$U1/dashboard/rosters" 12 same)"
+case "$r" in "429 dash_rosters_ip") ok "dash rosters per-IP flood -> 429 dash_rosters_ip (enumerate-flood shed)" ;;
+  *) bad "dash rosters flood -> '$r' (expected '429 dash_rosters_ip')" ;; esac
+
 # ── boot the GATED surface (flag OFF) — the control ──
 P2="$(freeport)"; U2="http://127.0.0.1:$P2"
 HEIMDALL_CP_PKI_KEY="$PKI" HEIMDALL_ENROLL_TOKEN="$TOKEN" HEIMDALL_HOME="$EXT/gated" \
@@ -191,6 +249,13 @@ c="$(httpstat POST "$U2/dispatch" '{}')"
 if [ "$c" = "401" ]; then ok "flag-off: /dispatch -> 401 (route exists, gated by auth; boundary is flag-gated, gated service unchanged)"
 elif [ "$c" = "404" ]; then bad "flag-off: /dispatch -> 404 (the boundary leaked into the GATED service — must be flag-gated)"
 else bad "flag-off: /dispatch -> $c (expected 401)"; fi
+
+# DASH caps are FLAG-GATED + LOAD-BEARING: on the gated surface (flag off) the SAME init flood is NOT
+# shed (the gates are inert) — remove the public boundary and the flood succeeds, proving the CAP (not
+# some other layer) is what sheds on the public surface. A 429 here would mean a cap leaked into gated.
+r="$(flood POST "$U2/dashboard/session/init" 12 same '{}')"
+case "$r" in "none 0") ok "flag-off: dash init flood NOT shed (gates inert on gated service; cap is load-bearing)" ;;
+  *) bad "flag-off: dash init flood -> '$r' (expected 'none 0' — a cap leaked into the GATED service!)" ;; esac
 
 echo "──────────────────────────────────────────"
 echo "cp-public-surface: $PASS passed, $FAIL failed"

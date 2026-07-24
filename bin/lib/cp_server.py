@@ -114,6 +114,15 @@ _ROUTES = {}
 # post-auth (identity, request) shape.
 _PUBLIC_ROUTES = {}
 
+# The pre-auth dashboard READ/verify routes that carry a per-IP flood shed on the public surface
+# (cp_publicsurface.check_dashboard_read_pre_auth), mapped to their INDEPENDENT rate-bucket scope.
+# init is NOT here — it is the highest-cost route and gets its own IP+budget gate (mirrors /enroll).
+_DASH_READ_SCOPE = {
+    ("POST", "/dashboard/session/approve"): "dash_approve",
+    ("GET", "/dashboard/session/status"): "dash_status",
+    ("GET", "/dashboard/rosters"): "dash_rosters",
+}
+
 
 def register_route(method, path, fn):
     """Register a route handler for (METHOD, path). `fn(identity, request) -> Response`
@@ -471,6 +480,28 @@ def _build_handler_class(home, enforce_revocation):
                     if refusal is not None:
                         self._send(Response(*refusal))
                         return
+                # PUBLIC-SURFACE dashboard-login abuse gates (pre-auth; the internet-facing
+                # device flow). init is the highest-cost route (a put_record per call mints a
+                # device_code — a write-cost DoS), so it gets a per-IP cap + a deployment-wide
+                # budget (mirrors /enroll). approve/status/rosters are cheap but verify/enumerate
+                # per call, so each gets a per-IP flood shed (mirrors /presence), bucketed by route
+                # scope. Inert on the gated surface. Runs BEFORE the handler so a shed request
+                # spends no signature verify / token verify / partition enumerate / put_record.
+                if cp_publicsurface.public_surface_enabled():
+                    if (method, route_path) == ("POST", "/dashboard/session/init"):
+                        refusal = cp_publicsurface.check_dashboard_init_pre_auth(
+                            request, home=home)
+                        if refusal is not None:
+                            self._send(Response(*refusal))
+                            return
+                    else:
+                        dash_scope = _DASH_READ_SCOPE.get((method, route_path))
+                        if dash_scope is not None:
+                            refusal = cp_publicsurface.check_dashboard_read_pre_auth(
+                                request, dash_scope, home=home)
+                            if refusal is not None:
+                                self._send(Response(*refusal))
+                                return
                 self._send(public(request))
                 return
             # PUBLIC-SURFACE presence flood shed (pre-auth, cheap): drop an over-limit IP's

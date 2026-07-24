@@ -357,6 +357,32 @@ def _team_write_team_limit():   return _int_env("HEIMDALL_TEAM_WRITE_TEAM_LIMIT"
 def _team_write_team_window():  return _int_env("HEIMDALL_TEAM_WRITE_TEAM_WINDOW", 60)
 def _team_write_nonce_window(): return _int_env("HEIMDALL_TEAM_WRITE_NONCE_WINDOW", 300)
 
+# /dashboard/session/init — the DASHBOARD-LOGIN device-flow start (cp_session.init_route). It is the
+# HIGHEST-cost dashboard route: EACH call does a Firestore put_record to mint a pending device_code, so
+# an unbounded flood is a WRITE-COST DoS on the deployment budget (the $10k finding). Two fixed-window
+# gates mirror check_enroll's IP+budget shape (there is NO token/team on this UNSIGNED route — a browser
+# opening a flow cannot sign): a per-IP cap + a DEPLOYMENT-WIDE budget on new device_codes, so an
+# attacker rotating IPs still cannot explode the session store. init is RARER than enroll (a dev opens
+# the dashboard occasionally, not once-per-machine-ever), so the defaults are CONSERVATIVE:
+#   • per-IP    5 / 60s   — a single IP mints at most 5 device_codes/minute (a real dashboard opens one).
+#   • budget   30 / 3600s — the whole deployment mints at most 30 new device_codes/hour across the fleet.
+# Both env-tunable (an explicit HEIMDALL_DASH_INIT_* always wins). Firestore-durable via cp_ratelimit.
+def _dash_init_ip_limit():      return _int_env("HEIMDALL_DASH_INIT_IP_LIMIT", 5)
+def _dash_init_ip_window():     return _int_env("HEIMDALL_DASH_INIT_IP_WINDOW", 60)
+def _dash_init_budget_max():    return _int_env("HEIMDALL_DASH_INIT_BUDGET_MAX", 30)
+def _dash_init_budget_window(): return _int_env("HEIMDALL_DASH_INIT_BUDGET_WINDOW", 3600)
+
+# /dashboard/session/{approve,status} + /dashboard/rosters — the pre-auth READ/verify dashboard routes.
+# Each is CHEAP per call but does amplifiable work an attacker could hammer (approve verifies a HAID
+# signature; status reads + one-time-releases a token; rosters verifies a CP token and ENUMERATES the
+# presence partitions), so a blunt per-IP flood is shed BEFORE that work — like /presence's pre-auth
+# shed. NO budget (these routes MINT nothing). The browser polls /status every ~5s (cp_session.POLL_
+# INTERVAL_SECONDS) and behind a corporate NAT many devs share one IP, so the per-IP cap is LOOSE
+# (mirrors /presence's 120/min) — a flood is shed, a legitimately-paced login never is. ONE knob-set,
+# DISTINCT buckets per route (the scope arg), so one route's legit polling never starves another.
+def _dash_read_ip_limit():  return _int_env("HEIMDALL_DASH_READ_IP_LIMIT", 120)
+def _dash_read_ip_window(): return _int_env("HEIMDALL_DASH_READ_IP_WINDOW", 60)
+
 
 # ── the public-surface predicates (what cp_server's router consults) ────────────────────
 
@@ -606,6 +632,69 @@ def check_roster_read(request, *, home=None, now=None):
         limit=_roster_read_limit(), window=_roster_read_window())
     if not ok:
         return (429, _rate_limited_body("roster_read", retry))
+    return None
+
+
+# ── the DASHBOARD-LOGIN SESSION abuse gates (pre-auth; the internet-facing device flow) ──────
+#
+# THE DASHBOARD-LOGIN THREAT. The four /dashboard/session/* + /dashboard/rosters routes ride the
+# PRE-AUTH public seam (a browser / a local hmd cannot PKI-sign the HTTP envelope), so — like
+# /enroll and /presence — the APP LAYER is their only abuse boundary on the --allow-unauthenticated
+# surface. Each self-gates for AUTHZ (the HAID assertion signature at approve, the CP-signed token at
+# rosters), but authz is not a RATE bound: without a cap a flood of unauthenticated init calls is a
+# WRITE-COST DoS (each init put_records a device_code — the $10k-budget finding), and a flood of
+# approve/status/rosters burns signature/token verifies + partition enumerations. These gates add the
+# missing RATE bound, mirroring the enroll (IP+budget) and presence (per-IP shed) patterns EXACTLY —
+# same cp_ratelimit substrate (Firestore-durable across instances), same (status, body) refusal shape.
+
+
+def check_dashboard_init_pre_auth(request, *, home=None, now=None):
+    """PUBLIC-SURFACE abuse gate for POST /dashboard/session/init (pre-auth — NO identity; a browser
+    opening a device flow cannot sign). init is the HIGHEST-cost dashboard route: EACH call does a
+    put_record to mint a pending device_code, so an unbounded flood is a WRITE-COST DoS on the
+    deployment budget. Two fixed-window checks mirror check_enroll's IP+budget shape (there is no
+    token/team on this unsigned route); the first to refuse returns a 429 (NOTHING is minted):
+      1. per-client-IP     — a single IP cannot hammer device-code minting.
+      2. dash_init_budget  — a DEPLOYMENT-WIDE ceiling on new device_codes/window (one global
+         counter), so an attacker rotating IPs cannot explode the session store no matter how many
+         IPs it uses (the enroll_budget analogue, via allow() over a single global key).
+    Returns None to let init run, or (429, body) to refuse. FAIL-OPEN on a backend hiccup (never
+    sheds a legitimately-paced login), exactly like the enroll/presence gates."""
+    limiter = cp_ratelimit.RateLimiter(home=home)
+    ip = client_ip(request)
+    ok, retry = limiter.allow(
+        "dash_init_ip", ip, now=now,
+        limit=_dash_init_ip_limit(), window=_dash_init_ip_window())
+    if not ok:
+        return (429, _rate_limited_body("dash_init_ip", retry))
+    # The DEPLOYMENT-WIDE budget on new device_codes — one global counter (scope+key fixed), the
+    # exact mechanic enroll_budget_ok uses, so IP-rotation cannot escape it.
+    ok, retry = limiter.allow(
+        "dash_init_budget", "global", now=now,
+        limit=_dash_init_budget_max(), window=_dash_init_budget_window())
+    if not ok:
+        return (429, _rate_limited_body("dash_init_budget", retry))
+    return None
+
+
+def check_dashboard_read_pre_auth(request, scope, *, home=None, now=None):
+    """PUBLIC-SURFACE per-IP flood gate for the pre-auth dashboard READ/verify routes — POST
+    /dashboard/session/approve, GET /dashboard/session/status, GET /dashboard/rosters — applied
+    BEFORE their self-gate work so a blunt flood is shed CHEAPLY. Each is cheap per call but does
+    amplifiable work an attacker could hammer (approve verifies a HAID signature; status reads +
+    one-time-releases a token; rosters verifies a CP token and ENUMERATES the presence partitions),
+    so one per-IP fixed-window cap is the whole gate (NO budget — these routes MINT nothing). `scope`
+    ("dash_approve"/"dash_status"/"dash_rosters") buckets the three routes INDEPENDENTLY, so one
+    route's legit polling never starves another (mirrors check_team_write_pre_auth's scope arg).
+    Returns None to let the route run, or (429, body) to refuse. FAIL-OPEN on a backend hiccup (never
+    sheds a legitimately-paced login), exactly like /presence's pre-auth shed."""
+    limiter = cp_ratelimit.RateLimiter(home=home)
+    ip = client_ip(request)
+    ok, retry = limiter.allow(
+        scope + "_ip", ip, now=now,
+        limit=_dash_read_ip_limit(), window=_dash_read_ip_window())
+    if not ok:
+        return (429, _rate_limited_body(scope + "_ip", retry))
     return None
 
 
