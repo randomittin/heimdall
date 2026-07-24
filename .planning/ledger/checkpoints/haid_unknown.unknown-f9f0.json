@@ -1,0 +1,14 @@
+{
+  "active_goal": "[dropped]",
+  "branch": "main",
+  "claimed_surfaces": [],
+  "haid": "haid:unknown.unknown-f9f0",
+  "head_sha": "530a68a",
+  "human": "unknown",
+  "phase": "unknown",
+  "progress_pct": 86,
+  "resumable": true,
+  "schema": "team_checkpoint_v1",
+  "task_ref": "[dropped]",
+  "updated_at": "2026-07-24T17:28:57Z"
+}
