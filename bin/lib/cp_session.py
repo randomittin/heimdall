@@ -103,6 +103,26 @@ _ASSERTION_DOMAIN = "heimdall-dashboard-login-v1"
 # dir or smuggle a path separator. Basename-guarded too (belt-and-suspenders).
 _DEVICE_CODE_RX = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 
+# ── CORS for the cross-origin static dashboard (runheimdall.dev -> the public CP) ──────────
+#
+# The static dashboard is served from a DIFFERENT origin than the control plane, so the browser
+# applies CORS to every session-route fetch. Access-Control-Allow-Origin:* lets that different
+# origin READ the response; `*` is safe here because the session capability rides an
+# Authorization: Bearer HEADER (GET /dashboard/rosters), NEVER a cookie or any ambient credential
+# — so there is nothing a malicious page could ride with the victim's session. Mirrors the
+# /roster-team CORS pattern (cp_presence._CORS_HEADERS). GET /dashboard/rosters carries the
+# Authorization header, a NON-simple request header, so the browser sends a CORS PREFLIGHT first;
+# _CORS_PREFLIGHT_HEADERS answers it (204) advertising Access-Control-Allow-Headers: Authorization
+# so the real GET may follow. (POST /dashboard/session/approve is called by the LOCAL hmd CLI, not
+# a browser, so CORS is moot for it — but attaching the allow-origin header to it is harmless.)
+_CORS_HEADERS = {"Access-Control-Allow-Origin": "*"}
+_CORS_PREFLIGHT_HEADERS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, OPTIONS",
+    "Access-Control-Allow-Headers": "Authorization",
+    "Access-Control-Max-Age": "86400",
+}
+
 
 def _ttl_seconds():
     """The session TTL (HEIMDALL_DASHBOARD_SESSION_TTL_SECONDS, default 3600). A malformed /
@@ -443,27 +463,58 @@ def rosters_route(request, *, home=None, now=None):
     return cp_server.Response(200, {"teams": out})
 
 
+def _with_cors(response):
+    """Attach the CORS allow-origin header to a Response IN PLACE and return it. Every
+    dashboard-session response — success AND error — must carry Access-Control-Allow-Origin so the
+    cross-origin runheimdall.dev dashboard can READ it: a 401/404/500 WITHOUT the header is opaque
+    to the browser JS and would break the login flow's error handling (the browser reports a bare
+    'network error', hiding the real status). `*` is safe (the session rides an Authorization
+    header, not a cookie — no ambient credential). Mirrors cp_presence._CORS_HEADERS on
+    /roster-team. Idempotent; tolerant of a non-Response (returns it unchanged)."""
+    headers = getattr(response, "headers", None)
+    if isinstance(headers, dict):
+        headers.update(_CORS_HEADERS)
+    return response
+
+
+def rosters_preflight(request):
+    """OPTIONS /dashboard/rosters — the CORS preflight for the Authorization-bearing browser read.
+    Returns 204 + the CORS headers (incl. Access-Control-Allow-Headers: Authorization) so a
+    different-origin dashboard may then issue GET /dashboard/rosters with the Bearer token. A
+    STATIC preflight — it exposes NO state and reads nothing; served on both the gated and public
+    surfaces exactly like the data routes (mirrors cp_presence.roster_team_preflight)."""
+    return cp_server.Response(204, None, headers=_CORS_PREFLIGHT_HEADERS)
+
+
 def register(*, home=None):
-    """Wire the four dashboard-login routes into cp_server's PRE-AUTH public seam (a browser
-    and a local hmd cannot PKI-sign the HTTP envelope, so they cannot ride the §3 chokepoint;
-    each route carries its OWN gate — the assertion signature at approve, the CP-signed token
-    at rosters). NOTE: these are pre-auth PUBLIC routes and are served on the GATED control-
-    plane service; to also serve them on the internet-facing --allow-unauthenticated public
+    """Wire the four dashboard-login routes (+ the rosters CORS preflight) into cp_server's
+    PRE-AUTH public seam (a browser and a local hmd cannot PKI-sign the HTTP envelope, so they
+    cannot ride the §3 chokepoint; each route carries its OWN gate — the assertion signature at
+    approve, the CP-signed token at rosters). Every response is CORS-wrapped (_with_cors) so the
+    cross-origin runheimdall.dev dashboard can read it; the Authorization-bearing GET /dashboard/
+    rosters also gets an OPTIONS preflight (rosters_preflight, advertising Access-Control-Allow-
+    Headers: Authorization). NOTE: these are pre-auth PUBLIC routes and are served on the GATED
+    control-plane service; to also serve them on the internet-facing --allow-unauthenticated public
     service, (POST,/dashboard/session/init), (POST,/dashboard/session/approve),
-    (GET,/dashboard/session/status), (GET,/dashboard/rosters) must be added to
-    cp_publicsurface.PUBLIC_ROUTES (owned by that module). The handlers close over the runtime
-    `home`. Returns the registered (method, path) keys; idempotent (re-registering replaces)."""
+    (GET,/dashboard/session/status), (GET,/dashboard/rosters), and (OPTIONS,/dashboard/rosters)
+    must be added to cp_publicsurface.PUBLIC_ROUTES (owned by that module). The handlers close over
+    the runtime `home`. Returns the registered (method, path) keys; idempotent (re-registering
+    replaces)."""
     keys = []
     keys.append(cp_server.register_public_route(
         "POST", "/dashboard/session/init",
-        lambda request: init_route(request, home=home)))
+        lambda request: _with_cors(init_route(request, home=home))))
     keys.append(cp_server.register_public_route(
         "POST", "/dashboard/session/approve",
-        lambda request: approve_route(request, home=home)))
+        lambda request: _with_cors(approve_route(request, home=home))))
     keys.append(cp_server.register_public_route(
         "GET", "/dashboard/session/status",
-        lambda request: status_route(request, home=home)))
+        lambda request: _with_cors(status_route(request, home=home))))
     keys.append(cp_server.register_public_route(
         "GET", "/dashboard/rosters",
-        lambda request: rosters_route(request, home=home)))
+        lambda request: _with_cors(rosters_route(request, home=home))))
+    # The CORS preflight for the Authorization-bearing GET /dashboard/rosters (204 + allow-headers).
+    keys.append(cp_server.register_public_route(
+        "OPTIONS", "/dashboard/rosters",
+        lambda request: rosters_preflight(request)))
     return keys

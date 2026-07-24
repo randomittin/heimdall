@@ -31,9 +31,43 @@ PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); printf "  \033[32mPASS\033[0m %s\n" "$1"; }
 bad() { FAIL=$((FAIL+1)); printf "  \033[31mFAIL\033[0m %s\n" "$1"; }
 
+# ── MECHANICAL ISOLATION GUARD (no crypto — always runs) ──────────────────────────────────
+# THE whole god/session isolation boundary reduces to ONE allowlist fact: the four dashboard-
+# login SESSION routes MUST be in PUBLIC_ROUTES (reachable on the internet surface) and the two
+# owner-only GOD routes MUST NOT be (they stay gated-only — a flat 404 on the public surface,
+# INV-GOD G1/G2). This asserts PUBLIC_ROUTES membership DIRECTLY so a future edit that leaks a
+# god route public — or drops/renames a session route — goes RED mechanically, without needing a
+# live server or a crypto backend. (The live-server half below re-proves it over a real socket.)
+GUARD_OUT="$("$PY" - "$LIB" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+import cp_publicsurface as p
+must_public = [("POST", "/dashboard/session/init"),
+               ("POST", "/dashboard/session/approve"),
+               ("GET",  "/dashboard/session/status"),
+               ("GET",  "/dashboard/rosters")]
+must_not_public = [("GET", "/god/roster"), ("GET", "/god/logs")]
+problems = []
+for m, path in must_public:
+    if not p.is_public_route(m, path):
+        problems.append("MISSING_PUBLIC %s %s" % (m, path))
+for m, path in must_not_public:
+    if p.is_public_route(m, path):
+        problems.append("GOD_LEAKED_PUBLIC %s %s" % (m, path))
+print("; ".join(problems))
+sys.exit(1 if problems else 0)
+PY
+)"
+if [ $? -eq 0 ]; then
+  ok "isolation guard: 4 session routes IN PUBLIC_ROUTES, /god/{roster,logs} NOT (boundary pinned)"
+else
+  bad "isolation guard: PUBLIC_ROUTES boundary broken -> ${GUARD_OUT:-unknown}"
+fi
+
 if ! "$PY" -c "import sys;sys.path.insert(0,'$LIB');import cp_auth;sys.exit(0 if cp_auth.crypto_available() else 1)"; then
   echo "  SKIP no crypto backend (cryptography|pynacl) — serve needs a server identity."
-  echo "cp-public-surface: 0 passed, 0 failed (SKIPPED — no crypto)"
+  echo "cp-public-surface: $PASS passed, $FAIL failed (server checks SKIPPED — no crypto)"
+  [ "$FAIL" = "0" ] || exit 1
   exit 0
 fi
 
@@ -61,6 +95,22 @@ except Exception:
     print(0)
 PY
 }
+# httphdr METHOD URL HEADER [REQ-HEADER "K:V"] -> prints the named RESPONSE header value ('' if absent)
+httphdr(){ "$PY" - "$@" <<'PY'
+import sys, urllib.request, urllib.error
+m, u, want = sys.argv[1], sys.argv[2], sys.argv[3]
+req = urllib.request.Request(u, method=m)
+if len(sys.argv) > 4 and sys.argv[4]:
+    k, v = sys.argv[4].split(":", 1); req.add_header(k, v)
+try:
+    r = urllib.request.urlopen(req, timeout=5); hdrs = r.headers
+except urllib.error.HTTPError as e:
+    hdrs = e.headers
+except Exception:
+    print(""); sys.exit(0)
+print(hdrs.get(want, "") or "")
+PY
+}
 waitup(){ for _ in $(seq 1 60); do [ "$(httpstat GET "$1/healthz")" = "200" ] && return 0; sleep 0.1; done; return 1; }
 
 # ── boot the PUBLIC surface (HEIMDALL_PUBLIC_SURFACE=1, enroll IP limit low for determinism) ──
@@ -78,6 +128,42 @@ for r in /dispatch /jobs /approvals; do
   if [ "$c" = "404" ]; then ok "gated $r -> 404 on public surface (boundary; never resolves/auths)"
   else bad "gated $r -> $c on public surface (expected 404 — the BOUNDARY is broken)"; fi
 done
+
+# GOD ROUTES stay gated-only — a FLAT 404 on the public surface (INV-GOD G1/G2). The live
+# re-proof of the mechanical guard above: even the owner's cross-tenant routes must be
+# indistinguishable from nonexistent on the internet surface (no 401 that would reveal them).
+for r in /god/roster /god/logs; do
+  c="$(httpstat GET "$U1$r")"
+  if [ "$c" = "404" ]; then ok "god $r -> 404 on public surface (never in PUBLIC_ROUTES — G1/G2)"
+  else bad "god $r -> $c on public surface (expected 404 — a GOD route LEAKED public!)"; fi
+done
+
+# DASHBOARD-SESSION routes ARE reachable on the public surface (they resolve past the boundary,
+# each self-gated). init mints a device_code (200); rosters with no token 401s (route resolves,
+# token-gated — NOT a boundary 404); the OPTIONS preflight answers 204.
+c="$(httpstat POST "$U1/dashboard/session/init" '{}')"
+[ "$c" = "200" ] && ok "/dashboard/session/init reachable -> 200 (mints device_code)" \
+  || bad "/dashboard/session/init -> $c on public surface (expected 200 — session route unreachable?)"
+c="$(httpstat GET "$U1/dashboard/rosters")"
+[ "$c" = "401" ] && ok "/dashboard/rosters reachable + no-token -> 401 (token-gated, not a 404 boundary)" \
+  || bad "/dashboard/rosters -> $c (expected 401 missing_token — route unreachable?)"
+c="$(httpstat OPTIONS "$U1/dashboard/rosters")"
+[ "$c" = "204" ] && ok "OPTIONS /dashboard/rosters preflight -> 204 (CORS preflight resolves)" \
+  || bad "OPTIONS /dashboard/rosters -> $c (expected 204 — preflight route missing?)"
+
+# CORS WIRED — the cross-origin runheimdall.dev dashboard must be able to READ these responses.
+h="$(httphdr GET "$U1/dashboard/session/status?device_code=dc-nope" "Access-Control-Allow-Origin")"
+[ "$h" = "*" ] && ok "/dashboard/session/status carries Access-Control-Allow-Origin:* (browser can read)" \
+  || bad "/dashboard/session/status ACAO='$h' (expected * — dashboard cannot read cross-origin)"
+h="$(httphdr GET "$U1/dashboard/rosters" "Access-Control-Allow-Origin")"
+[ "$h" = "*" ] && ok "/dashboard/rosters (401) carries Access-Control-Allow-Origin:* (error is readable too)" \
+  || bad "/dashboard/rosters ACAO='$h' (expected * — error opaque to browser)"
+h="$(httphdr OPTIONS "$U1/dashboard/rosters" "Access-Control-Allow-Headers")"
+case "$h" in *[Aa]uthorization*) ok "OPTIONS /dashboard/rosters advertises Access-Control-Allow-Headers: Authorization" ;;
+  *) bad "OPTIONS /dashboard/rosters allow-headers='$h' (expected Authorization — preflight would fail)" ;; esac
+h="$(httphdr GET "$U1/config" "Access-Control-Allow-Origin")"
+[ "$h" = "*" ] && ok "/config carries Access-Control-Allow-Origin:* (dashboard refresh-interval read works)" \
+  || bad "/config ACAO='$h' (expected * — cross-origin /config read blocked)"
 
 # PUBLIC routes reachable + token-gated.
 [ "$(httpstat GET "$U1/healthz")" = "200" ] && ok "/healthz reachable (200)" || bad "/healthz not 200"

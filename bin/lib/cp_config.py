@@ -411,7 +411,15 @@ def config_route(request, *, home=None):
     tolerant)."""
     cohort = _query_cohort(request)
     payload = config_payload(cohort, home=home)
-    headers = {"Cache-Control": "public, max-age=%d" % _cache_seconds()}
+    # Cache-Control collapses the statusline thundering-herd; Access-Control-Allow-Origin:* lets
+    # the cross-origin static dashboard (runheimdall.dev) READ this tuning data — `*` is safe here
+    # because /config is UNSIGNED, non-sensitive, read-only tuning with no cookie/ambient credential
+    # (mirrors the /roster-team + dashboard-session CORS pattern; a GET with no custom header is a
+    # CORS "simple" request, so no preflight is needed — just the allow-origin on the response).
+    headers = {
+        "Cache-Control": "public, max-age=%d" % _cache_seconds(),
+        "Access-Control-Allow-Origin": "*",
+    }
     return cp_server.Response(200, payload, headers=headers)
 
 

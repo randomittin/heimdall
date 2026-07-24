@@ -165,6 +165,32 @@ import cp_credforward  # LEAST-PRIVILEGE cred WRITE-FORWARD (POST /team/cred). O
 #       mirrored in bin/heimdall-presence). Kept in the allowlist so the public surface SERVES it
 #       instead of a flat 404. Read-only, no body, no secret (cp-team-isolation stays green — a
 #       cohort key is the caller's own team_id and the response leaks no other team's state).
+#       Served cross-origin (Access-Control-Allow-Origin:* on the response) so the static
+#       runheimdall.dev dashboard's refresh-interval read works from a different origin.
+# PLUS the DASHBOARD-LOGIN SESSION routes (Option B, cp_session — dashboard-login-design.md). The
+# static runheimdall.dev dashboard drives a self-hosted DEVICE FLOW: a browser cannot PKI-sign, so
+# these ride the PRE-AUTH public seam and each carries its OWN gate (the HAID assertion signature at
+# approve, the CP-signed session token at rosters). They are a TEAM-READ capability ONLY — never a
+# dispatch, never owner, never cross-team (INV-LOGIN L1-L5). The god routes stay OUT of this list
+# (INV-GOD G1/G2 — /god/* is a flat 404 on the public surface); these four are the ONLY dashboard
+# routes the internet-facing surface serves:
+#   POST /dashboard/session/init    — mint a pending device_code (a random slot id, NOT a
+#       capability); returns {device_code, interval, expires_in}. No auth (a browser opening a flow).
+#   POST /dashboard/session/approve — the LOCAL hmd completes the flow by signing the canonical
+#       {gh_user ↔ HAID ↔ device_code} assertion with the enrolled HAID key; the CP VERIFIES that
+#       signature (L4), SERVER-DERIVES the caller's teams (L2), and mints a short-TTL CP-signed
+#       token. A bad/forged signature -> 401 and NO session is minted. Called by the CLI, not the
+#       browser (so it needs no CORS response header).
+#   GET  /dashboard/session/status  — the browser polls (device_code in the ?query) until approved,
+#       then receives the CP-signed token ONCE (one-time release). A simple cross-origin GET.
+#   GET  /dashboard/rosters         — the browser reads ONLY its OWN teams' rosters with the
+#       CP-signed token in the Authorization: Bearer header (L1 — team scope from the TOKEN, never a
+#       body/query team_id). Authorization is a NON-simple request header, so the browser issues a
+#       CORS PREFLIGHT first; OPTIONS /dashboard/rosters answers it (204 + Access-Control-Allow-
+#       Headers: Authorization) so the real GET may then follow. Both the GET and the OPTIONS carry
+#       Access-Control-Allow-Origin:* (the token rides an Authorization header, NOT a cookie, so
+#       there is no ambient credential and `*` is safe). The OPTIONS entry is a CORS mechanism, not a
+#       new data route — it exposes no state (a static 204 preflight).
 PUBLIC_ROUTES = frozenset({
     ("POST", "/enroll"),
     ("POST", "/presence"),
@@ -178,6 +204,15 @@ PUBLIC_ROUTES = frozenset({
     ("OPTIONS", "/roster-team"),
     ("GET", "/roster-public"),
     ("GET", "/config"),
+    # The four dashboard-login SESSION routes (cp_session) — the ONLY dashboard routes on the
+    # public surface; /god/* stays OUT (INV-GOD G1/G2). See the block above.
+    ("POST", "/dashboard/session/init"),
+    ("POST", "/dashboard/session/approve"),
+    ("GET", "/dashboard/session/status"),
+    ("GET", "/dashboard/rosters"),
+    # The CORS preflight for the Authorization-bearing GET /dashboard/rosters (a static 204; no
+    # state) — required so the cross-origin browser's preflight succeeds instead of a flat 404.
+    ("OPTIONS", "/dashboard/rosters"),
     ("GET", "/healthz"),
     ("GET", "/readyz"),
 })
