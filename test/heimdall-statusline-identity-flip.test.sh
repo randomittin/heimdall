@@ -150,6 +150,24 @@ wseed, _ = sl.identity(ROOT, HANDLE, warm_sid)
 (ok if heroname(wseed) == "batsy" else bad)(
     "warm hit: still resolves batsy (got %r)" % heroname(wseed))
 
+# -- 5) CP opt-in / UNDECIDED state must NOT perturb the pinned seed -> batsy --
+# Commit 985f200 (auto-connect CP behind a one-time opt-in) leaves HEIMDALL_CP_URL EMPTY
+# whenever the consent is undecided (default-off). The sigil-seed path must be blind to
+# that: identity() forks heimdall-identity for the seed and NEVER reads CP consent, so the
+# MAIN hero must stay the pinned batsy no matter the CP URL state. This locks that the CP
+# opt-in can never flip the hero (the real flip was an IP-hostname HAID re-mint upstream in
+# heimdall-haid — see heimdall-haid-stable-machine.test.sh — not the CP gate).
+os.environ["HEIMDALL_CP_URL"] = ""            # undecided => empty URL (the 985f200 default-off)
+os.environ.pop("HMD_HAID", None)
+sl.BIN_DIR = HEALTHY
+cp_sid = "flip-cp-undecided"
+if os.path.exists(cache_path(cp_sid)): os.remove(cache_path(cp_sid))
+cseed, _ = sl.identity(ROOT, HANDLE, cp_sid)
+(ok if cseed == HAID else bad)(
+    "CP undecided (empty HEIMDALL_CP_URL): MAIN seed is still the pinned HAID (got %r)" % cseed)
+(ok if heroname(cseed) == "batsy" else bad)(
+    "CP undecided: MAIN hero stays batsy — the opt-in gate never flips it (got %r)" % heroname(cseed))
+
 sl.BIN_DIR = orig_bindir
 print("\n%d passed, %d failed" % (_p, _f))
 sys.exit(1 if _f else 0)

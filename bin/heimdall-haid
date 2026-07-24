@@ -6,7 +6,9 @@
 #
 #   haid:{human}.{machine}-{hash4}[/{spawn-role}]
 #     human   — git config user.email local-part, else $USER
-#     machine — `hostname -s`, slugified
+#     machine — the STABLE device name (scutil LocalHostName / hostnamectl --static),
+#               slugified; falls back to `hostname -s` but refuses a transient IP-fragment
+#               host so a network-assigned name never re-mints the HAID
 #     hash4   — short stable hash of human+machine+repo (deterministic per
 #               machine+repo, so the same checkout always derives the same HAID)
 #     /role   — optional spawn suffix; spawns INHERIT the parent identity so
@@ -113,10 +115,33 @@ derive_human() {
   slug "$user"
 }
 
-# machine = short hostname, slugified.
+# machine = the STABLE device name, slugified.
+#
+# `hostname -s` reflects the NETWORK-assigned name, which on many DHCP/mDNS networks is
+# the box's own IP (`hostname` => 192.168.27.8 => `hostname -s` => `192`). That is
+# TRANSIENT: it flips the machine slug (and, since hash4 folds machine in, the whole HAID)
+# every time the network changes — silently re-minting the HAID and dropping any
+# HAID-pinned sigil (RJ's batsy -> a hash hero). Ride the OS's stable device identity
+# instead (macOS: scutil LocalHostName; Linux: hostnamectl --static), fall back to
+# `hostname -s`, and REFUSE a purely-numeric/dotted host (an IP fragment is never a
+# device name). Devs whose hostname already equals their device name are unaffected —
+# scutil returns the same value `hostname -s` did, so the HAID is byte-identical.
 derive_machine() {
-  local host
-  host="$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo unknown)"
+  local host=""
+  if command -v scutil >/dev/null 2>&1; then
+    host="$(scutil --get LocalHostName 2>/dev/null || true)"
+  fi
+  if [ -z "$host" ] && command -v hostnamectl >/dev/null 2>&1; then
+    host="$(hostnamectl --static 2>/dev/null || true)"
+  fi
+  [ -n "$host" ] || host="$(hostname -s 2>/dev/null || hostname 2>/dev/null || true)"
+  # A short host of only digits/dots (an IP fragment like `192`) is a transient network
+  # name, never a stable device id — refuse it so the HAID never rides an IP.
+  case "$host" in
+    ''|*[!0-9.]*) : ;;   # empty (fallback below) or a real name (has a non digit/dot char)
+    *)            host="" ;;
+  esac
+  [ -n "$host" ] || host="unknown"
   slug "$host"
 }
 
