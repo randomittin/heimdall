@@ -1477,6 +1477,20 @@ case "${1:-}" in
     fi
     exec "$PRESENCE_BIN" "$PRESENCE_VERB" "$@"
     ;;
+  dashboard)
+    # `hmd dashboard login <device_code>` — the local side of the Option-B device-flow
+    # dashboard login (docs/analysis/dashboard-login-design.md). Signs a canonical assertion
+    # with the enrolled HAID key so the browser dashboard gets a short-TTL team-read session.
+    # Pass-through to heimdall-dashboard; all args/flags forwarded verbatim.
+    shift
+    DASHBOARD_BIN="$PLUGIN_DIR/bin/heimdall-dashboard"
+    if [ ! -x "$DASHBOARD_BIN" ]; then
+      echo "  Error: heimdall-dashboard not found at $DASHBOARD_BIN" >&2
+      echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+      exit 1
+    fi
+    exec "$DASHBOARD_BIN" "$@"
+    ;;
   telemetry)
     # `hmd telemetry` — Pre-Merge Corpus (PMR) T0 consent + control surface
     # (status/on/off/hunks on|off/purge) + the internal emit/observe/scan/install-hook

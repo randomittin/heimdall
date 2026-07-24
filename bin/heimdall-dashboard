@@ -1,0 +1,253 @@
+#!/usr/bin/env bash
+# heimdall-dashboard — the LOCAL side of the Option-B device-flow dashboard login.
+#
+# WHAT IT IS. The browser dashboard at runheimdall.dev cannot PKI-sign, so it shows a
+# device code + "Sign in with hmd". The user runs `hmd dashboard login <device_code>`
+# HERE; this bin proves membership by signing a canonical assertion with the machine's
+# ENROLLED Ed25519 HAID key (the SAME key the control plane already verifies for presence),
+# binding {gh_user ↔ HAID ↔ device_code ↔ nonce}. The CP verifies that signature, server-
+# derives the caller's teams, mints a short-TTL read session, and releases it to the polling
+# browser. NO secret ever enters the browser. Design: docs/analysis/dashboard-login-design.md.
+#
+#   hmd dashboard login <device_code>   approve a browser session for THIS machine's identity.
+#
+# The canonical assertion + the POST contract are the SINGLE SOURCE OF TRUTH in
+# bin/lib/cp_session.py (assertion_message / approve_route). This bin REUSES
+# cp_session.assertion_message so the signed bytes are byte-identical to what the CP
+# verifies — never a hand-copied string (drift there = a 401). Signing REUSES cp_auth.sign
+# (the shipped Ed25519 signer), never hand-rolled crypto.
+#
+# IDENTITY / SEED / URL / gh (resolved; flag > env > derive), mirroring heimdall-presence:
+#   HAID          : --haid > $HMD_HAID > `heimdall-identity current` > `heimdall-haid current`.
+#   signing seed  : the persisted 0600 seed at ${HOME}/.heimdall/pki/<haid-slug>.seed
+#                   (slug = haid with '/' and ':' -> '_', IDENTICAL to heimdall-presence's
+#                   keying). ABSENT => NOT ENROLLED => a clear error (never a fake sign). The
+#                   seed material stays in the python signer + the 0600 file ONLY — this bash
+#                   side handles the PATH, never the seed bytes; nothing is printed/logged/argv'd.
+#   gh identity   : `gh api user --jq .login` — the "gh" half of the haid+gh binding. gh
+#                   missing / unauthenticated => a clear error (never sign, never POST).
+#   server URL    : --url > $HEIMDALL_CP_URL > $BASE_URL > ${HOME}/.heimdall/cp-endpoint.json
+#                   `.url` > the shipped public default ($HEIMDALL_DEFAULT_CP_URL from
+#                   lib/cp-consent.sh). login is an EXPLICIT connect action, so the baked-in
+#                   public surface is an acceptable fallback (the URL is not a secret).
+#
+# CONSENT. Approving binds this machine's identity to a browser session that can READ your
+# teams' presence. The bin states exactly that in ONE line and requires confirmation
+# (--yes / -y to skip; a non-TTY without --yes refuses rather than hang — the same discipline
+# `hmd uninstall` uses). It is a TEAM-READ capability only — never owner, never dispatch.
+
+set -uo pipefail
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(cd "$SELF_DIR/.." && pwd)"
+LIB="$REPO/bin/lib"
+
+# Source the canonical public CP URL literal ($HEIMDALL_DEFAULT_CP_URL). Pure-bash, no
+# external tools (safe even on a stripped PATH). Absent lib => the default stays empty and
+# an unresolved URL surfaces as a clear error below.
+# shellcheck source=lib/cp-consent.sh
+[ -f "$LIB/cp-consent.sh" ] && . "$LIB/cp-consent.sh"
+
+HAID_CLI="$SELF_DIR/heimdall-haid"
+IDENTITY_CLI="$SELF_DIR/heimdall-identity"
+PY="$(command -v python3 || command -v python || true)"
+
+err() { printf 'heimdall dashboard: %s\n' "$1" >&2; }
+
+usage() {
+  cat >&2 <<'USAGE'
+usage: hmd dashboard login <device_code> [--haid HAID] [--url URL] [--yes]
+
+  Approve a browser dashboard session for this machine's Heimdall identity.
+  Get <device_code> from the "Sign in with hmd" panel in the browser dashboard.
+USAGE
+}
+
+SUB="${1:-}"; shift || true
+if [ "$SUB" != "login" ]; then
+  [ -n "$SUB" ] && err "unknown subcommand: $SUB"
+  usage
+  exit 2
+fi
+
+# ── parse `login <device_code>` + option overrides ─────────────────────────────
+DEVICE_CODE=""; HAID=""; URL=""; ASSUME_YES=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --haid) HAID="${2:?--haid needs a value}"; shift 2 ;;
+    --url)  URL="${2:?--url needs a value}"; shift 2 ;;
+    --yes|-y) ASSUME_YES="1"; shift ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; break ;;
+    -*) err "unexpected option: $1"; usage; exit 2 ;;
+    *)
+      if [ -z "$DEVICE_CODE" ]; then DEVICE_CODE="$1"; shift
+      else err "unexpected argument: $1"; usage; exit 2; fi
+      ;;
+  esac
+done
+
+[ -n "$PY" ] || { err "python3 is required but was not found on PATH"; exit 2; }
+[ -f "$LIB/cp_session.py" ] || { err "control-plane libs not found ($LIB/cp_session.py) — reinstall heimdall"; exit 2; }
+
+if [ -z "$DEVICE_CODE" ]; then
+  err "missing <device_code> (copy it from the browser dashboard's 'Sign in with hmd' panel)"
+  usage
+  exit 2
+fi
+
+# ── resolve HAID (flag > env > identity > haid CLI) ────────────────────────────
+[ -n "$HAID" ] || HAID="${HMD_HAID:-}"
+if [ -z "$HAID" ] && [ -x "$IDENTITY_CLI" ]; then HAID="$("$IDENTITY_CLI" current 2>/dev/null || true)"; fi
+if [ -z "$HAID" ] && [ -x "$HAID_CLI" ]; then HAID="$("$HAID_CLI" current 2>/dev/null || true)"; fi
+if [ -z "$HAID" ]; then
+  err "could not resolve a Heimdall identity (HAID) — run: hmd enroll  (or: heimdall-presence connect) first"
+  exit 3
+fi
+
+# ── resolve the enrolled signing seed file (must already exist = enrolled) ─────
+# Slug MUST match heimdall-presence: '/' and ':' -> '_'. Pure bash (no `tr`) so this works
+# even on a minimal PATH.
+HMD_DIR="${HOME:-}/.heimdall"
+HAID_SLUG="${HAID//\//_}"; HAID_SLUG="${HAID_SLUG//:/_}"
+SEED_FILE="$HMD_DIR/pki/$HAID_SLUG.seed"
+if [ -z "${HOME:-}" ] || [ ! -f "$SEED_FILE" ] || [ ! -s "$SEED_FILE" ]; then
+  err "not enrolled — no signing key for $HAID"
+  err "enroll this machine first:  hmd enroll   (or run any presence beat: hmd beat)"
+  exit 4
+fi
+
+# ── resolve the GitHub username via gh (the 'gh' half of the binding) ──────────
+if ! command -v gh >/dev/null 2>&1; then
+  err "GitHub CLI (gh) not installed — install gh, then run: gh auth login"
+  exit 5
+fi
+GH_USER="$(gh api user --jq .login 2>/dev/null || true)"
+if [ -z "$GH_USER" ]; then
+  err "gh is not authenticated — run: gh auth login   then retry"
+  exit 5
+fi
+
+# ── resolve the control-plane URL ──────────────────────────────────────────────
+[ -n "$URL" ] || URL="${HEIMDALL_CP_URL:-${BASE_URL:-}}"
+if [ -z "$URL" ] && [ -f "$HMD_DIR/cp-endpoint.json" ]; then
+  URL="$("$PY" - "$HMD_DIR/cp-endpoint.json" 2>/dev/null <<'PYEOF' || true
+import json, sys
+try:
+    sys.stdout.write((json.load(open(sys.argv[1])).get("url") or ""))
+except Exception:
+    sys.stdout.write("")
+PYEOF
+)"
+fi
+[ -n "$URL" ] || URL="${HEIMDALL_DEFAULT_CP_URL:-}"
+if [ -z "$URL" ]; then
+  err "no control plane configured — pass --url <cp-url> (or set \$HEIMDALL_CP_URL)"
+  exit 2
+fi
+
+# ── consent: state exactly what approving shares, then confirm ─────────────────
+printf 'Dashboard login binds this machine to a browser session.\n'
+printf '  identity : %s  (GitHub: %s)\n' "$HAID" "$GH_USER"
+printf '  grants   : a browser session at %s that can READ your teams'"'"' presence\n' "$URL"
+printf '  scope    : team-read only — never owner, never dispatch, short-lived.\n'
+if [ -z "$ASSUME_YES" ]; then
+  if [ -t 0 ]; then
+    printf 'Approve this login? [y/N] '
+    read -r _reply </dev/tty 2>/dev/null || _reply=""
+    case "${_reply:-n}" in
+      [yY]*) : ;;
+      *) printf 'Cancelled — nothing was sent.\n'; exit 0 ;;
+    esac
+  else
+    err "non-interactive: pass --yes to approve without a prompt (refusing to prompt)"
+    exit 2
+  fi
+fi
+
+# ── sign the canonical assertion + POST it (seed read in-process, never argv'd) ─
+DASH_LIB="$LIB" DASH_URL="$URL" DASH_HAID="$HAID" DASH_GH_USER="$GH_USER" \
+DASH_DEVICE_CODE="$DEVICE_CODE" DASH_SEED_FILE="$SEED_FILE" \
+"$PY" - <<'PYEOF'
+import contextlib
+import json
+import os
+import secrets
+import sys
+import urllib.error
+import urllib.request
+
+sys.path.insert(0, os.environ["DASH_LIB"])
+import cp_auth      # the SHIPPED Ed25519 signer — never re-implemented.
+import cp_session   # the SINGLE SOURCE OF TRUTH for the assertion + approve contract.
+
+URL = os.environ["DASH_URL"].rstrip("/")
+HAID = os.environ["DASH_HAID"]
+GH_USER = os.environ["DASH_GH_USER"]
+DEVICE_CODE = os.environ["DASH_DEVICE_CODE"]
+SEED_FILE = os.environ["DASH_SEED_FILE"]
+
+
+def fail(msg, code):
+    sys.stderr.write("heimdall dashboard: " + msg + "\n")
+    sys.exit(code)
+
+
+# Validate the device code with the CP's OWN rule so a bad paste fails clearly here
+# instead of as a 400 round-trip.
+if not cp_session._valid_device_code(DEVICE_CODE):
+    fail("invalid device code — copy it exactly from the browser dashboard", 3)
+
+# Read the enrolled seed IN-PROCESS; it never leaves this process (never printed/argv'd).
+try:
+    with open(SEED_FILE, "r", encoding="utf-8") as fh:
+        seed = fh.read().strip()
+except OSError:
+    seed = ""
+if not seed:
+    fail("not enrolled — the signing seed is missing/empty; run: hmd enroll", 4)
+
+# The canonical assertion the CP verifies (L4). REUSED from cp_session so the signed bytes
+# are byte-identical to approve_route's verify — a hand-copied string would risk a 401.
+nonce = secrets.token_hex(16)
+message = cp_session.assertion_message(HAID, GH_USER, DEVICE_CODE, nonce)
+try:
+    sig = cp_auth.sign(seed, message)
+except cp_auth.AuthError as exc:
+    fail("cannot sign the login assertion (Ed25519 backend: %s) — try: %s -m pip install --user cryptography"
+         % (getattr(exc, "reason", "unavailable"), sys.executable or "python3"), 5)
+
+body = json.dumps({
+    "haid": HAID,
+    "gh_user": GH_USER,
+    "device_code": DEVICE_CODE,
+    "nonce": nonce,
+    "sig": sig,
+}).encode("utf-8")
+
+req = urllib.request.Request(URL + "/dashboard/session/approve", data=body, method="POST")
+req.add_header("Content-Type", "application/json")
+try:
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        status = resp.status
+        resp.read()
+except urllib.error.HTTPError as exc:
+    status = exc.code
+    with contextlib.suppress(Exception):
+        exc.read()   # drain the error body; the status is what we act on.
+except Exception:  # noqa: BLE001 — any transport/TLS/DNS fault is a clean, named error.
+    fail("could not reach the control plane at %s (network error) — check your connection and retry"
+         % URL, 6)
+
+if 200 <= status < 300:
+    sys.stdout.write("✓ approved — return to your browser\n")
+    sys.exit(0)
+if status == 401:
+    fail("signature/enrollment rejected (401) — this machine's HAID may be revoked or "
+         "not enrolled for that team; re-enroll (hmd beat) and retry", 7)
+if status == 404:
+    fail("device code not recognized (404) — it may have expired; refresh the browser "
+         "dashboard for a new code", 8)
+fail("unexpected response from the control plane (HTTP %d)" % status, 9)
+PYEOF
+exit $?
