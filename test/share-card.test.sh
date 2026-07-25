@@ -222,11 +222,21 @@ INST_HOME_N="$TMP_ROOT/home-pipe";  mkdir -p "$INST_HOME_N"
 
 # (5a) INTERACTIVE (pty stdout, color on) — the success card SHOULD show the
 # watchman sigil + the invite/share pointers. pty_run prints the child rc.
+# Identity MUST be pinned (same HEIMDALL_IDENTITY_DIR/HMD_HAID hermeticity as
+# run_share() above) — without it, render_sigil() resolves the seed via
+# heimdall-haid, which is deterministic from machine+user, NOT from $HOME. On
+# a dev box whose real HAID happens to be a CUSTOM_SIGILS pin (e.g. RJ's own
+# machine -> the hand-authored "batsy" hero), that hero renders with ITS OWN
+# eye color instead of the generic watchman EYE — a real render, just not the
+# generic one this check asserts. Pinning $SEED (already non-HAID-shaped, so
+# it never collides with a CUSTOM_SIGILS/HERO_SIGILS pin) makes the assertion
+# machine-independent instead of failing only on the pinned dev's own box.
 ICARD="$TMP_ROOT/install-tty.out"
 IRC="$(pty_run "$ICARD" 90 -- env -u NO_COLOR -u HEIMDALL_NO_COLOR \
         -u CLAUDE_CONFIG_DIR -u HEIMDALL_HOME \
         HOME="$INST_HOME_I" TERM="xterm-256color" \
         HEIMDALL_REPO="$REPO" HEIMDALL_REF="$REF" PATH="$FAKE_DIR:$SYS" \
+        HEIMDALL_IDENTITY_DIR="$EMPTY_ID" HMD_HAID="$SEED" \
         bash "$INSTALL")"
 IRC="$(printf '%s' "$IRC" | tail -1)"
 
