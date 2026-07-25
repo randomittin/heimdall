@@ -92,7 +92,7 @@ else
   bad "(b1) new did not produce a 0600 43-char team.json (rc=$RC perm=$(perm_of "$TJ1") len=${#S1})"; cat "$WORK/new1.err" >&2
 fi
 if printf '%s' "$BODY" | grep -q "HEIMDALL_TEAM_SECRET=" \
-   && printf '%s' "$BODY" | grep -qF "curl -fsSL https://raw.githubusercontent.com/" \
+   && printf '%s' "$BODY" | grep -qF "curl -fsSL --proto '=https' https://raw.githubusercontent.com/" \
    && printf '%s' "$BODY" | grep -qi "team secret"; then
   ok "(b2) new printed the heimdall-invite join one-liner (HEIMDALL_TEAM_SECRET) + a secret caveat"
 else

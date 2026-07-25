@@ -637,9 +637,22 @@ first_run_setup() {
     echo "  + claude-mem (persistent memory across sessions)"
     local _cm_t0; _cm_t0="$(_tele_now_ms)"
     _tele_install_step companion:claude-mem started
-    if ! command -v npx &>/dev/null; then
+    # TTY+BUN GATE (LIVE-VM #2 fix): claude-mem's `npx claude-mem install` is an
+    # interactive multi-prompt wizard (email/IDE/runtime/provider/model) that ALSO
+    # requires `bun`. On a headless box force-feeding stdin still ran the wizard and
+    # aborted mid-way (`bun-missing-after-install`). So ATTEMPT the installer ONLY
+    # when BOTH a real TTY (stdin AND stdout) AND bun are present; otherwise SKIP
+    # cleanly WITHOUT ever launching it. This is the dominant first-run friction.
+    if ! { [ -t 0 ] && [ -t 1 ]; } || ! command -v bun &>/dev/null; then
+      # No interactive terminal and/or no bun → the wizard can't complete. Skip
+      # without invoking the installer (never hang, never a cryptic mid-wizard abort).
+      echo "  claude-mem is an optional companion — skipped (needs an interactive terminal + bun; Heimdall works without it)"
+      echo "    (re-enable anytime in a terminal with bun installed: 'npx claude-mem install')"
+      _tele_install_step companion:claude-mem skipped "$_cm_t0" \
+        no-tty-or-bun "tty=$([ -t 0 ] && [ -t 1 ] && echo 1 || echo 0) bun=$(command -v bun >/dev/null 2>&1 && echo 1 || echo 0)"
+    elif ! command -v npx &>/dev/null; then
       # No npx → cannot install. This is not an error to halt on: skip gracefully.
-      echo "  claude-mem is an optional companion — skipping (Heimdall works without it)"
+      echo "  claude-mem is an optional companion — skipped (Heimdall works without it)"
       echo "    (npm/npx not found; install Node.js then run 'npx claude-mem install' to enable it)"
       _tele_install_step companion:claude-mem failed "$_cm_t0" \
         npx-absent "npx not on PATH"
@@ -662,7 +675,7 @@ first_run_setup() {
         # Declined or failed (incl. no-TTY / bun-absent fast-abort) → graceful skip
         # with the pinned message + the exact manual step, never a cryptic error or a
         # hang.
-        echo "  claude-mem is an optional companion — skipping (Heimdall works without it)"
+        echo "  claude-mem is an optional companion — skipped (Heimdall works without it)"
         echo "    (re-enable anytime: 'npx claude-mem install')"
         _tele_install_step companion:claude-mem failed "$_cm_t0" \
           npm-exec-nonzero "npm exec exit $_cm_rc"

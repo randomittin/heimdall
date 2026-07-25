@@ -194,9 +194,20 @@ PY
   fi
   local tmp; tmp="$(mktemp 2>/dev/null || echo /tmp/hmd-doctor-pres.$$)"
   local rc
+  # SCOPE THE VALIDATION BEAT TO $HOME/.heimdall — never the dev's repo. This is a
+  # SYNTHETIC health-check beat; heimdall-presence resolves its team store from the
+  # invocation CWD (git-toplevel/.heimdall) and AUTO-MINTS a team.json when absent
+  # (bin/heimdall-presence). Run from inside a checkout (install.sh, `hmd`, this
+  # doctor) that mint lands in <repo>/.heimdall — polluting the dev's tree with a
+  # solo team.json they never asked for. Pin HEIMDALL_TEAM_DIR to the user's home
+  # store so the beat/enroll/roster roundtrip stays self-consistent (beat + roster
+  # read the SAME team) AND writes only to $HOME/.heimdall, honouring this file's
+  # SAFETY contract above. heimdall-presence + heimdall-presence-doctor both honour
+  # HEIMDALL_TEAM_DIR (bin/heimdall-presence:389, bin/heimdall-presence-doctor:142).
+  local home_team_dir="${HOME:-}/.heimdall"
   # Prefer the dedicated doctor if the doctor agent has landed it.
   if [ -x "$doctor" ]; then
-    run_capped 15 "$tmp" "$doctor"; rc=$?
+    run_capped 15 "$tmp" env HEIMDALL_TEAM_DIR="$home_team_dir" "$doctor"; rc=$?
     if [ "$rc" -eq 0 ]; then
       record "presence" pass "presence doctor: enroll+beat healthy, you appear in your roster"
     elif [ "$rc" -eq 124 ]; then
@@ -212,9 +223,9 @@ PY
   # No doctor: beat + roster roundtrip. A beat is fire-and-forget (never fails hard);
   # then read the caller's OWN roster and look for their HAID.
   local haid; haid="$("$BIN_DIR/heimdall-haid" current 2>/dev/null || "$BIN_DIR/heimdall-identity" 2>/dev/null || true)"
-  run_capped 12 "$tmp" "$pres" beat; rc=$?
+  run_capped 12 "$tmp" env HEIMDALL_TEAM_DIR="$home_team_dir" "$pres" beat; rc=$?
   local beat_out; beat_out="$(cat "$tmp" 2>/dev/null || true)"
-  local roster; run_capped 12 "$tmp" "$pres" roster --json; roster="$(cat "$tmp" 2>/dev/null || true)"
+  local roster; run_capped 12 "$tmp" env HEIMDALL_TEAM_DIR="$home_team_dir" "$pres" roster --json; roster="$(cat "$tmp" 2>/dev/null || true)"
   rm -f "$tmp" 2>/dev/null || true
   if [ -n "$haid" ] && printf '%s' "$roster" | grep -qF "$haid"; then
     record "presence" pass "beat landed — you appear in your own roster ($haid)"
