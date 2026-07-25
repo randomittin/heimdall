@@ -46,7 +46,7 @@ curl -fsSL https://raw.githubusercontent.com/randomittin/heimdall/679ecdebc0ed97
   && bash heimdall-install.sh
 ```
 
-Pinned to the `v2.2.6` tag **and** checked against the sha256 of that tag's `install.sh`. The `&&`
+Pinned to the `v2.3.2` tag **and** checked against the sha256 of that tag's `install.sh`. The `&&`
 chain is load-bearing: if the bytes do not match the digest, `shasum -c` prints `FAILED` and
 **nothing runs** — so a tag moved under you, a CDN cache poisoning, or a truncated download stops
 the install instead of executing. On a Linux box without `shasum`, `sha256sum -c -` takes the same
@@ -77,7 +77,7 @@ match what this README says; a signature proves they came from the maintainer's 
 signs `install.sh` with minisign and publishes `install.sh.minisig` as a release asset:
 
 ```bash
-curl -fsSL -O https://github.com/randomittin/heimdall/releases/download/v2.2.6/install.sh.minisig
+curl -fsSL -O https://github.com/randomittin/heimdall/releases/download/v2.3.2/install.sh.minisig
 minisign -Vp release/heimdall-signing.pub -m heimdall-install.sh -x install.sh.minisig
 ```
 
