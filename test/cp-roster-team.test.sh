@@ -313,7 +313,7 @@ A_STATUS="$(printf '%s' "$A_OUT" | "$PY" -c "import json,sys;print(json.load(sys
 A_CORS="$(printf '%s' "$A_OUT" | "$PY" -c "import json,sys;print(json.load(sys.stdin)['cors'])" 2>/dev/null)"
 A_HAS_DEV="$(printf '%s' "$A_OUT" | "$PY" -c "import json,os,sys;b=json.load(sys.stdin)['body'];print(any(r.get('haid')==os.environ['DEV_A'] for r in b.get('online',[])))" 2>/dev/null)"
 A_HAS_HAID="$(printf '%s' "$A_OUT" | "$PY" -c "import json,sys;b=json.load(sys.stdin)['body'];print(all('haid' in r for r in b.get('online',[])) and bool(b.get('online')))" 2>/dev/null)"
-A_KEYS_OK="$(printf '%s' "$A_OUT" | "$PY" -c "import json,sys;b=json.load(sys.stdin)['body'];print(all(set(r.keys())=={'haid','handle','verdict','file','age_seconds'} for r in b.get('online',[])))" 2>/dev/null)"
+A_KEYS_OK="$(printf '%s' "$A_OUT" | "$PY" -c "import json,sys;b=json.load(sys.stdin)['body'];print(all(set(r.keys())=={'haid','handle','verdict','file','age_seconds','state'} for r in b.get('online',[])))" 2>/dev/null)"
 A_NO_SECRETLIKE="$(printf '%s' "$A_OUT" | SECRET_LIKE="$SECRET_LIKE" "$PY" -c "import json,os,sys;t=json.load(sys.stdin)['body_text'];print(os.environ['SECRET_LIKE'] not in t)" 2>/dev/null)"
 A_NO_TEAMSECRET="$(printf '%s' "$A_OUT" | TEAM_SECRET="$TEAM_SECRET" "$PY" -c "import json,os,sys;t=json.load(sys.stdin)['body_text'];print(os.environ['TEAM_SECRET'] not in t)" 2>/dev/null)"
 if [ "$A_STATUS" = "200" ] && [ "$A_HAS_DEV" = "True" ]; then
@@ -325,7 +325,7 @@ fi
   && ok "A2 the MEMBER view INCLUDES haid (members see each other's identity — the deliberate difference)" \
   || bad "A2 the member view did not include haid (out=$A_OUT)"
 [ "$A_KEYS_OK" = "True" ] \
-  && ok "A3 each entry is exactly {haid,handle,verdict,file,age_seconds} (no pubkey/ts/secret)" \
+  && ok "A3 each entry is exactly {haid,handle,verdict,file,age_seconds,state} (derived wall-state; no pubkey/ts/secret)" \
   || bad "A3 an entry exposed unexpected keys (out=$A_OUT)"
 [ "$A_NO_SECRETLIKE" = "True" ] \
   && ok "A4 the secret-looking file value was scrubbed — NOT in the body" \

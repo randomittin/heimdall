@@ -74,13 +74,24 @@ class FieldFilter:
         self.value = value
 
 
+def _cmp_bound(value):
+    # A __name__ FieldFilter's comparison value is a DocumentReference (_DocRef), NOT a bare
+    # string: the SHIPPED bounded query passes col.document(<id>) on purpose — Firestore compares
+    # __name__ against a reference_value (a doc PATH), and a plain string_value never matches (the
+    # bug #17 / prod-empty-roster fault the code comment at cp_state_firestore.py documents). The
+    # real client/emulator range-compares __name__ by document id; mirror that by comparing on the
+    # ref's id, so this fake faithfully exercises the shipped reference-valued range pushdown.
+    return value.id if isinstance(value, _DocRef) else value
+
+
 def _match(doc_id, filters):
     for f in filters:
         if f.field != "__name__":
             return False
-        if f.op == ">=" and not (doc_id >= f.value):
+        bound = _cmp_bound(f.value)
+        if f.op == ">=" and not (doc_id >= bound):
             return False
-        if f.op == "<=" and not (doc_id <= f.value):
+        if f.op == "<=" and not (doc_id <= bound):
             return False
     return True
 

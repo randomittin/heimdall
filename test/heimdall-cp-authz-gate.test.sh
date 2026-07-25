@@ -89,6 +89,13 @@ import cp_maintainer_runner as MR, cp_publicsurface as PS, cp_jobstore as JS, cp
 H = os.environ["HEIMDALL_HOME"]
 now = 1_700_000_000.0
 os.environ["HEIMDALL_RR_TENANT_AUTHZ"] = "1"
+# This fixture asserts WIRING/ISOLATION (authz gate, per-team env, drain routing), NOT the INV-7
+# per-team DAILY spend ceiling (which has its own coverage). Team A accrues several dispatches
+# here (INV-11 allow + the falsifier + the drain's 3 tasks); the 2M/day default token budget would
+# STARVE the drain mid-sweep (correct prod behavior: DEFER + requeue at the cap) and make
+# drain_emptied_A fail for a reason unrelated to drain wiring. Lift the daily token budget so the
+# cap never pre-empts these wiring assertions — no assertion below depends on the daily cap.
+os.environ["HEIMDALL_TEAM_DAILY_TOKEN_BUDGET"] = "100000000"
 out = {}
 
 SA = "team-secret-A-aaaaaaaaaaaaaaaaaaaaaaaaaaaa"
