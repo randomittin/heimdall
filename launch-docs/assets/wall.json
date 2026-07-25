@@ -1,0 +1,1 @@
+{"schema":"clip_v1","kind":"wall","sigil":"🛡","tag":"runheimdall.dev","verdict":"pass","phase":"gate","ts":"2026-07-25T09:14:22Z","file":"src/auth/session.ts","gate":"oracle/falsify","proven_count":14}

@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="440" height="140" role="img" aria-label="🛡 HEIMDALL — proven wall">
+  <!-- Heimdall share card. Tag: runheimdall.dev -->
+  <title>🛡 HEIMDALL — proven wall</title>
+  <a xlink:href="https://runheimdall.dev" target="_blank" rel="noopener">
+    <rect width="440" height="140" rx="10" fill="#0d1117"/>
+    <rect x="0" y="0" width="440" height="140" rx="10" fill="none" stroke="#0d98ba" stroke-width="2"/>
+    <text x="24" y="46" font-family="Verdana,DejaVu Sans,sans-serif" font-size="22" fill="#e6edf3">🛡 HEIMDALL — proven wall</text>
+    <text x="24" y="86" font-family="Verdana,DejaVu Sans,sans-serif" font-size="18" fill="#7ee787">14 merges proven by the watchman</text>
+    <text x="24" y="120" font-family="Verdana,DejaVu Sans,sans-serif" font-size="14" fill="#00d4ff">runheimdall.dev</text>
+  </a>
+</svg>

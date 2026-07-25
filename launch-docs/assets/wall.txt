@@ -1,0 +1,37 @@
+HEIMDALL — team presence wall (text floor)
+===========================================
+The guaranteed plain-text fallback of the "install once, see your team's
+watchmen" wall asset. Two real renderers, run against a seeded fixture and
+the repo's own local gate history — no fabricated numbers, no mockups.
+
+── 1. sentinels/hmd-statusline.py — the live team wall ─────────────────────
+Rendered against a 6-watchman fixture (you + 5 teammates: arjun, kai, maya,
+nadia, priya — seeded as .heimdall/team/*.json heartbeats, the same fixture
+shape conformance/statusline/viral-statusline.fixture.sh uses). Only 3
+teammates + a "+N" overflow tag render at once by design (team_columns()
+caps at 3); ANSI stripped for portability.
+
+▄▄▄▄▄▄▄▄ ⛭ HEIMDALL │ rj · Claude │ acme-checkout ◦ watching           ▄▄▄▄▄▄▄▄         ▄▄▄▄▄▄▄▄         ▄▄▄▄▄▄▄▄
+▄▄▄▄▄▄▄▄  CTX 0%                                                       ▄▄▄▄▄▄▄▄         ▄▄▄▄▄▄▄▄         ▄▄▄▄▄▄▄▄
+▄▄▄▄▄▄▄▄ – gates offline                                               arjun            kai              maya     +2
+▄▄▄▄▄▄▄▄ session                                                       ◉ rev            ⚡ wrk           ◉ rev
+
+── 2. bin/heimdall-clip --wall — the proven-merge share card ───────────────
+Reads THIS repo's real .heimdall/verdict.json + .heimdall/receipts/beats.log
+(14 seeded pass beats + 1 deny, matching the exact <ts>\t<verdict>\t<file>
+format bin/heimdall-badge documents). The "presence" line is honestly empty
+here — that line is server/control-plane-backed (heimdall-presence roster)
+and this workspace has no live CP configured; it degrades cleanly by design
+rather than fabricating teammates (see sentinels/hmd-gate-anim.sh's own
+"never fabricate" precedent). Section 1 above is what a real dev sees for
+the team wall day to day (the local-heartbeat fallback).
+
+  🛡  HEIMDALL — proven wall
+  14 merges proven by the watchman
+  last: ✓ PASS (gate)
+  presence: no teammates online
+  runheimdall.dev
+
+See README.md in this directory for the exact regeneration commands and
+the one command to render a true animated wall.gif once asciinema+agg (or
+vhs) are installed.
