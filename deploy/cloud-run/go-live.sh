@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # go-live.sh — THE GUIDED OPERATOR for the two-service go-live (RUNBOOK steps 2–7).
 #
-# WHAT THIS IS. A sequencer RJ runs under his OWN already-authenticated gcloud
-# shell. It chains the canonical steps of GO-LIVE-RUNBOOK.md (gated rebuild →
+# WHAT THIS IS. A sequencer RJ runs INTERACTIVELY. It no longer REQUIRES a pre-authenticated
+# gcloud shell — STEP 0 (preflight_gcloud) VERIFIES a real access token (not just `auth list`)
+# and SELF-HEALS auth/project (interactive `gcloud auth login` + `gcloud config set project`)
+# before any step. It chains the canonical steps of GO-LIVE-RUNBOOK.md (gated rebuild →
 # secret existence → public least-privilege SA + no-dispatch proof → public deploy
 # → consistency gate → live boundary verify), PRINTS the exact gcloud command for
 # each step, RUNS it, and STOPS on the first failure. It does NOT replace the
@@ -139,10 +141,74 @@ resolve_gated_sa() {
   fi
 }
 
-command -v gcloud >/dev/null 2>&1 || die "gcloud not found — install the Cloud SDK and authenticate."
+# preflight_gcloud — STEP 0: VERIFY + SELF-HEAL gcloud auth and the active project BEFORE any
+# step, so a STALE credential is caught HERE, not mid-STEP-2 (where an Artifact Registry create
+# used to die with `Reauthentication failed. cannot prompt during non-interactive execution` — a
+# confusing LATE failure). This is an INTERACTIVE operator script, so a genuine token failure
+# legitimately prompts an in-browser `gcloud auth login`.
+#   1. gcloud present — else die with the install hint.
+#   2. Auth validity — probe a REAL token (`gcloud auth print-access-token`), NOT `auth list`
+#      (which reports a stale account as still ACTIVE). On failure -> interactive `gcloud auth
+#      login`, then RE-probe; still failing after login -> die loud with the exact remediation.
+#   3. Project — ensure the active project is ${PROJECT_ID} (heimdall-cp-prod by default; the whole
+#      script keys off this one PROJECT_ID constant/env). If it differs, `gcloud config set project`.
+# IDEMPOTENT + SAFE: on an already-authed shell with the right project this prints a couple of `ok`
+# lines and does NOTHING interactive (no spurious re-login) — it only prompts when the token is
+# genuinely invalid. plan/check mode is creds-optional: it PRINTS the intent and mutates nothing.
+preflight_gcloud() {
+  command -v gcloud >/dev/null 2>&1 \
+    || die "gcloud not found — install the Cloud SDK (https://cloud.google.com/sdk/docs/install), then re-run go-live."
+  if [ "$MODE" != "guided" ]; then
+    note "(plan) at guided run STEP 0 probes 'gcloud auth print-access-token'; a stale/absent token triggers an interactive 'gcloud auth login', then ensures the active project is ${PROJECT_ID}"
+    return 0
+  fi
+  # Network — resolve the Google API hosts STEP 2-7 depend on. A DNS/connectivity failure
+  # (flaky Wi-Fi, VPN, captive portal) otherwise surfaces as a confusing mid-STEP-2 gcloud
+  # crash ("Failed to resolve artifactregistry.googleapis.com"). Fail fast with the real cause.
+  local _unreach=""
+  local _h
+  for _h in artifactregistry.googleapis.com run.googleapis.com; do
+    python3 -c "import socket,sys; socket.gethostbyname(sys.argv[1])" "$_h" >/dev/null 2>&1 \
+      || host "$_h" >/dev/null 2>&1 \
+      || nslookup "$_h" >/dev/null 2>&1 \
+      || _unreach="${_unreach} ${_h}"
+  done
+  [ -n "${_unreach}" ] \
+    && die "STEP 0: cannot resolve Google API host(s):${_unreach} — a DNS/network problem on THIS machine (check Wi-Fi/VPN/captive-portal; try setting DNS to 8.8.8.8 or 1.1.1.1), then re-run go-live. Google is up if these resolve on another network."
+  note "  ok  Google API hosts resolve (network reachable)"
+  # Auth validity — the REAL fix: mint a token. `auth list` alone would green-light a stale cred.
+  if gcloud auth print-access-token >/dev/null 2>&1; then
+    note "  ok  gcloud credential valid (access token minted)"
+  else
+    warn "  gcloud has no valid access token (stale/absent/reauth-needed) — launching interactive login"
+    show "gcloud auth login"
+    gcloud auth login \
+      || die "STEP 0: 'gcloud auth login' failed — authenticate manually ('gcloud auth login'), then re-run go-live."
+    gcloud auth print-access-token >/dev/null 2>&1 \
+      || die "STEP 0: still no valid access token after 'gcloud auth login' — check the account/network, run 'gcloud auth login' manually, then re-run go-live."
+    note "  ok  gcloud credential valid after login"
+  fi
+  local acct
+  acct="$(gcloud auth list --filter=status:ACTIVE --format='value(account)' 2>/dev/null || true)"
+  [ -n "${acct}" ] && note "  active account: ${acct}"
+  # Project — the active gcloud project must be ${PROJECT_ID} (the constant the whole script uses).
+  local cur
+  cur="$(gcloud config get-value project 2>/dev/null || true)"
+  if [ "${cur}" = "${PROJECT_ID}" ]; then
+    note "  ok  active project already ${PROJECT_ID}"
+  else
+    warn "  active project is '${cur:-<unset>}' — setting it to ${PROJECT_ID}"
+    show "gcloud config set project ${PROJECT_ID}"
+    gcloud config set project "${PROJECT_ID}" >/dev/null 2>&1 \
+      || die "STEP 0: could not set the active project to ${PROJECT_ID} — set it manually ('gcloud config set project ${PROJECT_ID}'), then re-run go-live."
+    say "  set active project -> ${PROJECT_ID}"
+  fi
+}
 
 say "==> heimdall go-live (${MODE} mode) — RUNBOOK steps 2–7"
 note "project=${PROJECT_ID} region=${REGION}"
+step "STEP 0 — gcloud auth + project preflight (verify + self-heal before any step)"
+preflight_gcloud
 resolve_gated_sa
 note "gated=${GATED_SERVICE} (SA ${RUNTIME_SA})   public=${PUBLIC_SERVICE} (SA ${PUBLIC_SA})"
 if [ "$MODE" = "plan" ]; then
