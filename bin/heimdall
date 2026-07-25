@@ -1472,6 +1472,21 @@ case "${1:-}" in
     fi
     exec "$PRESENCE_BIN" "$@"
     ;;
+  context)
+    # Pass-through to heimdall-context-sync (sync/on/off/status). CONTEXT-SYNC: the
+    # rolling session state (worklog.json + context.md + cases/ + verdicts.ndjson)
+    # pushed to the hmd/context ORPHAN branch so any fresh machine / cloud job resumes
+    # instantly. Private repos ON by default; public repos OFF until opt-in. All
+    # args/flags forwarded verbatim. Bin resolved via $PLUGIN_DIR — never hardcoded.
+    shift
+    CONTEXT_BIN="$PLUGIN_DIR/bin/heimdall-context-sync"
+    if [ ! -x "$CONTEXT_BIN" ]; then
+      echo "  Error: heimdall-context-sync not found at $CONTEXT_BIN" >&2
+      echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+      exit 1
+    fi
+    exec "$CONTEXT_BIN" "$@"
+    ;;
   beat|roster)
     # First-class shortcuts for the two presence verbs teammates reach for most:
     # `hmd beat` (send a heartbeat) and `hmd roster` (see the team wall). Both delegate

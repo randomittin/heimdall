@@ -1,0 +1,500 @@
+#!/usr/bin/env bash
+# heimdall-context-sync — always-on CONTEXT-SYNC to the `hmd/context` orphan branch
+# (chat-ops P1). The rolling session state that lets ANY fresh machine / cloud job
+# RESUME instantly instead of rediscovering.
+#
+# WHAT IT SYNCS (an allowlist of known-safe, human-readable session state only):
+#   worklog.json    — the STRUCTURED worklog a cloud job reads FIRST (goal, summary,
+#                     last_state, open_cases, recent_commits, by, generated_ts).
+#   context.md      — a rolling human-readable session summary (checkpoint + state +
+#                     git-log + goal).
+#   cases/          — open case files (copied from <repo>/.heimdall/cases).
+#   verdicts.ndjson — recent gate history (from <repo>/.heimdall/verdicts.ndjson).
+# It NEVER reads env files, team.json, or any credential store.
+#
+# WHERE IT GOES — a dedicated `hmd/context` branch that is ORPHAN and NEVER MERGED:
+#   the payload is committed via git PLUMBING (a private index + commit-tree +
+#   update-ref) so the working tree, the user's index, and MAIN's history are ALL
+#   left untouched. main stays clean; the context branch is pushed to `origin`.
+#
+# SECRET-SCAN GATE (fail-closed — THE oracle): every payload is scanned for
+# credential SHAPES BEFORE the commit is created or pushed. A hit REFUSES the sync
+# (nothing is committed, nothing is pushed). Reuses the repo's secret tooling — an
+# env-seam scanner (HEIMDALL_SECRET_SCAN_BIN, tests/gitleaks-parity) and gitleaks
+# when present LAYER ON TOP of an always-on built-in secret-shape scan (the same
+# discipline bin/heimdall-feedback uses), so the gate holds even without gitleaks.
+#
+# FAIL-SAFE DEFAULT + TOGGLE (per-repo, persisted like presence.json):
+#   PRIVATE repo -> ON by default; PUBLIC (or unknown) repo -> OFF by default (a work
+#   narrative on a public branch is a leak class — the auto-join/presence direction).
+#   `context on` / `context off` persist {"enabled": …} in <repo>/.heimdall/context.json;
+#   `context status` prints the decision + effective state.
+#
+# Usage:
+#   heimdall-context-sync sync   [--repo DIR] [--remote NAME] [--throttle SECS] [--dry-run]
+#       Assemble + scan + commit the payload to hmd/context and push it. No-op (exit 0)
+#       when disabled for this repo. --throttle N no-ops if the last sync was < N seconds
+#       ago (the idle-checkpoint path). --dry-run assembles + scans + prints the plan,
+#       commits/pushes nothing.
+#   heimdall-context-sync on     [--repo DIR]   opt THIS repo IN  (persist enabled=true)
+#   heimdall-context-sync off    [--repo DIR]   opt THIS repo OUT (persist enabled=false)
+#   heimdall-context-sync status [--repo DIR]   print the toggle + effective state
+#   -h | --help                                 this help.
+#
+# Exit codes:
+#   0  synced / pushed, or a no-op (disabled / throttled / nothing to do), or help/status
+#   1  a SECRET was detected (fail-closed) — nothing committed or pushed
+#   2  usage error / missing dependency / not a git repo
+#   3  the push failed (remote unreachable / rejected) — the commit is on the local ref
+#
+# Env seams (tests / overrides; none carry secrets):
+#   HMD_CONTEXT_VISIBILITY     private|public|unknown — overrides gh visibility detection.
+#   HMD_CONTEXT_REMOTE         the push remote (default: origin; --remote wins).
+#   HEIMDALL_SECRET_SCAN_BIN   a scanner invoked as `<bin> <file>` (exit nonzero = finding).
+#   HEIMDALL_STATE_BIN         heimdall-state binary (default: sibling bin).
+#   HEIMDALL_STATE_FILE        heimdall-state file (default: <repo>/heimdall-state.json).
+
+set -euo pipefail
+
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+BINDIR="$(dirname "$SELF")"
+CONTEXT_BRANCH="hmd/context"
+
+usage() { sed -n '2,56p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+PY="$(command -v python3 || command -v python || true)"
+if [ -z "$PY" ]; then
+  echo "heimdall-context-sync: python3 not found (required to assemble the payload)" >&2
+  exit 2
+fi
+
+STATE_BIN="${HEIMDALL_STATE_BIN:-$BINDIR/heimdall-state}"
+IDENTITY_BIN="$BINDIR/heimdall-identity"
+
+# ── per-repo toggle state (gitignored, non-secret) — mirrors presence.json ──────
+_context_state_dir() { printf '%s/.heimdall' "$1"; }
+_context_state_file() { printf '%s/.heimdall/context.json' "$1"; }
+
+# The persisted decision: prints "enabled", "disabled", or "" (undecided/absent).
+_context_decision() {
+  local f c; f="$(_context_state_file "$1")"; [ -f "$f" ] || return 0
+  c="$(cat "$f" 2>/dev/null)" || return 0
+  case "$c" in
+    *'"enabled"'*[![:alnum:]]true* )  printf 'enabled' ;;
+    *'"enabled"'*[![:alnum:]]false* ) printf 'disabled' ;;
+  esac
+}
+
+# Repo visibility: env seam wins; else `gh repo view`; else "unknown".
+_context_visibility() {
+  if [ -n "${HMD_CONTEXT_VISIBILITY:-}" ]; then printf '%s' "$HMD_CONTEXT_VISIBILITY"; return; fi
+  if command -v gh >/dev/null 2>&1; then
+    local v
+    v="$(gh repo view --json isPrivate -q '.isPrivate' 2>/dev/null || true)"
+    case "$v" in
+      true)  printf 'private'; return ;;
+      false) printf 'public';  return ;;
+    esac
+  fi
+  printf 'unknown'
+}
+
+# EFFECTIVE enabled? explicit decision wins; else PRIVATE => on, PUBLIC/unknown => off.
+# Prints "<state>|<reason>" (state is "on" or "off") on stdout — the reason rides the
+# same line so callers get it WITHOUT a shared global (command-substitution runs in a
+# subshell, so a global assignment here would never reach the parent).
+_context_effective() {
+  local repo="$1" decision vis
+  decision="$(_context_decision "$repo")"
+  case "$decision" in
+    enabled)  printf 'on|explicit opt-in (context on)';  return ;;
+    disabled) printf 'off|explicit opt-out (context off)'; return ;;
+  esac
+  vis="$(_context_visibility)"
+  if [ "$vis" = "private" ]; then
+    printf 'on|default ON for a PRIVATE repo'
+  else
+    printf 'off|default OFF for a %s repo (opt in with '\''hmd context on'\'')' "$vis"
+  fi
+}
+
+_write_context_state() {  # atomic 0644 write of context.json ($1=repo, $2=json)
+  local dir file tmp; dir="$(_context_state_dir "$1")"; file="$(_context_state_file "$1")"
+  mkdir -p "$dir" 2>/dev/null || true
+  tmp="$file.tmp.$$"
+  if printf '%s\n' "$2" > "$tmp" 2>/dev/null; then
+    mv -f "$tmp" "$file" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+  else
+    rm -f "$tmp" 2>/dev/null; return 1
+  fi
+}
+
+# repo owner/repo ref from the git remote (best-effort; "local/session" fallback).
+_derive_repo_ref() {
+  local dir="$1" url slug
+  url="$(git -C "$dir" config --get remote.origin.url 2>/dev/null || true)"
+  slug="$(printf '%s' "$url" \
+    | sed -E -e 's#^[a-z]+\+?[a-z]*://##' -e 's#^git@##' \
+             -e 's#github\.com[:/]##' -e 's#\.git$##' -e 's#/$##')"
+  case "$slug" in
+    */*) printf '%s' "$slug" ;;
+    *)   printf 'local/session' ;;
+  esac
+}
+
+# ── assemble the payload into STAGE (worklog.json + context.md + cases/ + verdicts)
+assemble_payload() {
+  local repo="$1" repo_ref="$2" stage="$3"
+  local goal gitlog handle
+  goal="$(HEIMDALL_STATE_FILE="${HEIMDALL_STATE_FILE:-$repo/heimdall-state.json}" \
+          "$STATE_BIN" goal-get 2>/dev/null || echo "none")"
+  gitlog="$(git -C "$repo" log --oneline -20 2>/dev/null || echo "")"
+  handle="$("$IDENTITY_BIN" current 2>/dev/null || git -C "$repo" config user.name 2>/dev/null || echo "unknown")"
+  REPO_DIR="$repo" REPO_REF="$repo_ref" STAGE="$stage" \
+  GOAL_TXT="$goal" GITLOG_TXT="$gitlog" HANDLE_TXT="$handle" \
+  "$PY" - <<'PYEOF'
+import json, os, re, shutil, time
+
+repo   = os.environ["REPO_DIR"]
+ref    = os.environ["REPO_REF"]
+stage  = os.environ["STAGE"]
+goal   = (os.environ.get("GOAL_TXT") or "none").strip() or "none"
+gitlog = os.environ.get("GITLOG_TXT", "")
+handle = (os.environ.get("HANDLE_TXT") or "unknown").strip() or "unknown"
+
+planning = os.path.join(repo, ".planning")
+hmd      = os.path.join(repo, ".heimdall")
+
+
+def read_tail(path, max_lines):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return None
+    if len(lines) > max_lines:
+        lines = ["[...trimmed to the last %d lines...]" % max_lines] + lines[-max_lines:]
+    return "\n".join(lines)
+
+
+def first_heading(text):
+    if not text:
+        return ""
+    m = re.findall(r"^#{1,6}\s+(.*)$", text, re.M)
+    return m[0].strip() if m else ""
+
+
+checkpoint = read_tail(os.path.join(planning, "CHECKPOINT.md"), 150)
+state      = read_tail(os.path.join(planning, "STATE.md"), 120)
+commits    = [l for l in gitlog.splitlines() if l.strip()]
+
+# ── open cases: copy <repo>/.heimdall/cases -> STAGE/cases, record basenames ────
+open_cases = []
+src_cases = os.path.join(hmd, "cases")
+if os.path.isdir(src_cases):
+    dst_cases = os.path.join(stage, "cases")
+    for name in sorted(os.listdir(src_cases)):
+        sp = os.path.join(src_cases, name)
+        if os.path.isfile(sp):
+            os.makedirs(dst_cases, exist_ok=True)
+            shutil.copyfile(sp, os.path.join(dst_cases, name))
+            open_cases.append(os.path.splitext(name)[0])
+
+# ── verdicts.ndjson: copy the repo's gate history if present, else an empty file ─
+src_verdicts = os.path.join(hmd, "verdicts.ndjson")
+dst_verdicts = os.path.join(stage, "verdicts.ndjson")
+if os.path.isfile(src_verdicts):
+    shutil.copyfile(src_verdicts, dst_verdicts)
+else:
+    open(dst_verdicts, "w", encoding="utf-8").close()
+
+# ── the ROLLING SUMMARY (what was being attempted) ──────────────────────────────
+ck_head = first_heading(checkpoint)
+summary = ck_head or goal
+if ck_head and goal != "none":
+    summary = "%s (goal: %s)" % (ck_head, goal)
+
+# ── worklog.json — the STRUCTURED worklog a cloud job reads FIRST ────────────────
+worklog = {
+    "schema": "hmd-context/worklog@1",
+    "repo": ref,
+    "generated_ts": int(time.time()),
+    "by": handle,
+    "goal": goal,
+    "summary": summary,
+    "last_state": (state or "").strip(),
+    "open_cases": open_cases,
+    "recent_commits": commits[:20],
+}
+with open(os.path.join(stage, "worklog.json"), "w", encoding="utf-8") as fh:
+    json.dump(worklog, fh, indent=2, sort_keys=True)
+    fh.write("\n")
+
+# ── context.md — the rolling human-readable summary ─────────────────────────────
+sections = [
+    "# hmd/context — rolling session summary",
+    "> Read-only session state for a fresh machine / cloud job to RESUME from.",
+    "> Secret-scanned before every push. Orphan branch — never merged into main.",
+    "repo: %s" % ref,
+    "generated_ts: %d (%s UTC)" % (worklog["generated_ts"],
+                                   time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(worklog["generated_ts"]))),
+    "## What was being attempted\n%s" % summary,
+    "## Active goal\n%s" % goal,
+]
+if checkpoint is not None:
+    sections.append("## .planning/CHECKPOINT.md (where we left off)\n%s" % checkpoint)
+if state is not None:
+    sections.append("## .planning/STATE.md (current state)\n%s" % state)
+if open_cases:
+    sections.append("## open cases\n%s" % "\n".join("- %s" % c for c in open_cases))
+if commits:
+    sections.append("## git log --oneline -20\n%s" % "\n".join(commits[:20]))
+
+with open(os.path.join(stage, "context.md"), "w", encoding="utf-8") as fh:
+    fh.write("\n\n".join(sections) + "\n")
+PYEOF
+}
+
+# ── SECRET-SCAN GATE (fail-closed): scan every payload file BEFORE committing ────
+# Three layers, ALL fail-closed on a finding:
+#   1. an always-on built-in secret-SHAPE scan (python; the same discipline
+#      bin/heimdall-feedback uses) so the gate holds even without gitleaks — it
+#      catches sk-ant / GitHub / AWS / Slack / Google / JWT / private-key / inline
+#      secret-assignment shapes;
+#   2. an env-seam scanner (HEIMDALL_SECRET_SCAN_BIN, invoked as `<bin> <file>`) for
+#      tests / gitleaks-parity;
+#   3. gitleaks over each file on STDIN when it is installed.
+# Returns 0 (clean) or 1 (a finding — nothing must be committed or pushed).
+scan_stage() {
+  local stage="$1" f rc
+  # layer 1 — the always-on built-in shape scan over the whole payload.
+  if ! STAGE="$stage" "$PY" - <<'PYEOF'
+import os, re, sys
+
+stage = os.environ["STAGE"]
+PATTERNS = [
+    (r"sk-ant-[A-Za-z0-9_\-]{16,}",                 "Anthropic API key"),
+    (r"ghp_[A-Za-z0-9]{30,}",                       "GitHub personal access token"),
+    (r"gh[osru]_[A-Za-z0-9]{30,}",                  "GitHub token"),
+    (r"github_pat_[A-Za-z0-9_]{40,}",               "GitHub fine-grained PAT"),
+    (r"sk_live_[A-Za-z0-9]{16,}",                   "Stripe live key"),
+    (r"xox[baprs]-[A-Za-z0-9-]{10,}",               "Slack token"),
+    (r"AKIA[0-9A-Z]{16}",                           "AWS access key id"),
+    (r"AIza[0-9A-Za-z_\-]{35}",                     "Google API key"),
+    (r"-----BEGIN [A-Z ]*PRIVATE KEY-----",         "private key block"),
+    (r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}", "JWT"),
+    (r"(?i)\b(?:secret|password|passwd|api[_-]?key|access[_-]?token)\b\s*[:=]\s*\S{8,}",
+     "inline secret assignment"),
+]
+compiled = [(re.compile(p), what) for p, what in PATTERNS]
+for root, _dirs, files in os.walk(stage):
+    for name in files:
+        path = os.path.join(root, name)
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                blob = fh.read()
+        except OSError:
+            continue
+        for rx, what in compiled:
+            if rx.search(blob):
+                rel = os.path.relpath(path, stage)
+                sys.stderr.write("secret-scan: %s shape in %s\n" % (what, rel))
+                sys.exit(1)
+sys.exit(0)
+PYEOF
+  then
+    return 1
+  fi
+  # layers 2 & 3 — per-file external scanners (fail-closed on a finding).
+  while IFS= read -r f; do
+    [ -f "$f" ] || continue
+    if [ -n "${HEIMDALL_SECRET_SCAN_BIN:-}" ]; then
+      "$HEIMDALL_SECRET_SCAN_BIN" "$f" >/dev/null 2>&1; rc=$?
+      [ "$rc" -eq 0 ] || { echo "secret-scan: env-seam scanner flagged $f" >&2; return 1; }
+    fi
+    if command -v gitleaks >/dev/null 2>&1; then
+      gitleaks stdin --no-banner --redact < "$f" >/dev/null 2>&1 \
+        || { echo "secret-scan: gitleaks flagged $f" >&2; return 1; }
+    fi
+  done < <(find "$stage" -type f)
+  return 0
+}
+
+# ── commit the STAGE payload to the hmd/context orphan branch (plumbing only) ────
+# Uses a PRIVATE index (GIT_INDEX_FILE) + commit-tree + update-ref so the working
+# tree, the user's index, and MAIN's history are never touched. Echoes the commit sha.
+commit_orphan() {
+  local repo="$1" stage="$2" msg="$3"
+  local gitdir tmp_index tree parent commit an ae
+  gitdir="$(cd "$repo" && git rev-parse --absolute-git-dir)"
+  an="$(git -C "$repo" config user.name 2>/dev/null || echo heimdall)"
+  ae="$(git -C "$repo" config user.email 2>/dev/null || echo heimdall@localhost)"
+  tmp_index="$(mktemp)"; rm -f "$tmp_index"
+  (
+    cd "$stage" || exit 2
+    GIT_DIR="$gitdir" GIT_WORK_TREE="$stage" GIT_INDEX_FILE="$tmp_index" \
+      git add -f -A . || exit 2
+  ) || { rm -f "$tmp_index"; return 2; }
+  tree="$(GIT_DIR="$gitdir" GIT_INDEX_FILE="$tmp_index" git write-tree)" \
+    || { rm -f "$tmp_index"; return 2; }
+  parent="$(GIT_DIR="$gitdir" git rev-parse -q --verify "refs/heads/$CONTEXT_BRANCH" 2>/dev/null || true)"
+  if [ -n "$parent" ]; then
+    commit="$(printf '%s\n' "$msg" | GIT_DIR="$gitdir" \
+      GIT_AUTHOR_NAME="$an" GIT_AUTHOR_EMAIL="$ae" \
+      GIT_COMMITTER_NAME="$an" GIT_COMMITTER_EMAIL="$ae" \
+      git commit-tree "$tree" -p "$parent")"
+  else
+    commit="$(printf '%s\n' "$msg" | GIT_DIR="$gitdir" \
+      GIT_AUTHOR_NAME="$an" GIT_AUTHOR_EMAIL="$ae" \
+      GIT_COMMITTER_NAME="$an" GIT_COMMITTER_EMAIL="$ae" \
+      git commit-tree "$tree")"
+  fi
+  rm -f "$tmp_index"
+  [ -n "$commit" ] || return 2
+  GIT_DIR="$gitdir" git update-ref "refs/heads/$CONTEXT_BRANCH" "$commit" || return 2
+  printf '%s' "$commit"
+}
+
+# ── the sync verb ───────────────────────────────────────────────────────────────
+do_sync() {
+  local repo="$1" remote="$2" throttle="$3" dry="$4"
+  if ! git -C "$repo" rev-parse --git-dir >/dev/null 2>&1; then
+    echo "heimdall-context-sync: not a git repository: $repo" >&2
+    return 2
+  fi
+
+  # toggle gate: disabled => a clean no-op (nothing assembled, nothing pushed).
+  local res eff reason; res="$(_context_effective "$repo")"
+  eff="${res%%|*}"; reason="${res#*|}"
+  if [ "$eff" = "off" ]; then
+    echo "context-sync: OFF for this repo — $reason. Nothing synced."
+    return 0
+  fi
+
+  # idle-checkpoint throttle: no-op if the last sync was < throttle seconds ago.
+  local stamp; stamp="$(_context_state_dir "$repo")/.context-sync-stamp"
+  mkdir -p "$(_context_state_dir "$repo")" 2>/dev/null || true
+  if [ -n "$throttle" ] && [ "$throttle" -gt 0 ] 2>/dev/null && [ -f "$stamp" ]; then
+    local now mt; now="$(date +%s 2>/dev/null || echo 0)"
+    mt="$(stat -f %m "$stamp" 2>/dev/null || stat -c %Y "$stamp" 2>/dev/null || echo 0)"
+    if [ "$((now - mt))" -lt "$throttle" ]; then
+      echo "context-sync: throttled — last sync was $((now - mt))s ago (< ${throttle}s). Skipped."
+      return 0
+    fi
+  fi
+
+  local repo_ref stage msg
+  repo_ref="$(_derive_repo_ref "$repo")"
+  stage="$(mktemp -d)"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$stage'" RETURN
+
+  assemble_payload "$repo" "$repo_ref" "$stage" || {
+    echo "heimdall-context-sync: failed to assemble the payload" >&2; return 2; }
+
+  # THE ORACLE — secret-scan the payload BEFORE any commit or push (fail-closed).
+  if ! scan_stage "$stage"; then
+    echo "BLOCKED: heimdall-context-sync detected a credential SHAPE in the session state." >&2
+    echo "Fail-closed: NOTHING was committed or pushed. Scrub the secret from the source and retry." >&2
+    return 1
+  fi
+
+  msg="hmd context: sync $(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo now) — $repo_ref"
+
+  if [ "$dry" = "1" ]; then
+    echo "DRY-RUN context-sync plan:"
+    echo "  repo    : $repo_ref"
+    echo "  branch  : $CONTEXT_BRANCH (orphan; pushed to $remote; main untouched)"
+    echo "  payload : $(cd "$stage" && find . -type f | sed 's#^\./##' | sort | tr '\n' ' ')"
+    echo "  scan    : (not shown in dry-run plan)"
+    echo "  (nothing committed or pushed)"
+    return 0
+  fi
+
+  local sha
+  sha="$(commit_orphan "$repo" "$stage" "$msg")" || {
+    echo "heimdall-context-sync: failed to commit the context payload" >&2; return 2; }
+
+  # push the orphan branch to the remote (main is never involved).
+  if git -C "$repo" remote get-url "$remote" >/dev/null 2>&1; then
+    if git -C "$repo" push -q "$remote" "refs/heads/$CONTEXT_BRANCH:refs/heads/$CONTEXT_BRANCH" 2>/dev/null; then
+      echo "context-sync: pushed $CONTEXT_BRANCH ($sha) to $remote ($repo_ref)"
+      : > "$stamp" 2>/dev/null || true
+      return 0
+    fi
+    echo "heimdall-context-sync: push to $remote rejected/unreachable — commit is on local $CONTEXT_BRANCH ($sha)" >&2
+    : > "$stamp" 2>/dev/null || true
+    return 3
+  fi
+  echo "context-sync: no '$remote' remote — committed to local $CONTEXT_BRANCH ($sha) only"
+  : > "$stamp" 2>/dev/null || true
+  return 0
+}
+
+# ── argument parsing ────────────────────────────────────────────────────────────
+CMD="${1:-}"; shift || true
+case "$CMD" in
+  -h|--help|"") usage; [ -z "$CMD" ] && exit 2 || exit 0 ;;
+esac
+
+REPO="$PWD"
+REMOTE="${HMD_CONTEXT_REMOTE:-origin}"
+THROTTLE=""
+DRY=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --repo)     REPO="${2:?--repo needs a value}"; shift 2 ;;
+    --remote)   REMOTE="${2:?--remote needs a value}"; shift 2 ;;
+    --throttle) THROTTLE="${2:?--throttle needs a value}"; shift 2 ;;
+    --dry-run)  DRY=1; shift ;;
+    -h|--help)  usage; exit 0 ;;
+    *) echo "heimdall-context-sync: unknown argument: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+if [ ! -d "$REPO" ]; then
+  echo "heimdall-context-sync: not a directory: $REPO (--repo)" >&2
+  exit 2
+fi
+# resolve to the repo top-level when inside a work tree (so state paths are stable).
+TOP="$(git -C "$REPO" rev-parse --show-toplevel 2>/dev/null || true)"
+[ -n "$TOP" ] && REPO="$TOP" || REPO="$(cd "$REPO" && pwd)"
+
+case "$CMD" in
+  sync)
+    do_sync "$REPO" "$REMOTE" "$THROTTLE" "$DRY"
+    exit $?
+    ;;
+  on)
+    _write_context_state "$REPO" '{"enabled": true}'
+    printf 'context-sync: ON for this repo — %s\n' "$(_context_state_file "$REPO")"
+    printf 'session state will sync to the %s orphan branch (secret-scanned; main stays clean).\n' "$CONTEXT_BRANCH"
+    ;;
+  off)
+    _write_context_state "$REPO" '{"enabled": false}'
+    printf 'context-sync: OFF for this repo — %s\n' "$(_context_state_file "$REPO")"
+    printf 'no session state will be pushed. Re-enable with: hmd context on\n'
+    ;;
+  status)
+    DEC="$(_context_decision "$REPO")"; [ -n "$DEC" ] || DEC="undecided"
+    VIS="$(_context_visibility)"
+    RES="$(_context_effective "$REPO")"; EFF="${RES%%|*}"; EFF_REASON="${RES#*|}"
+    printf 'context-sync status\n'
+    printf '  repo:       %s\n' "$(_derive_repo_ref "$REPO")"
+    printf '  decision:   %-9s (%s)\n' "$DEC" "$(_context_state_file "$REPO")"
+    printf '  visibility: %s\n' "$VIS"
+    printf '  effective:  %s — %s\n' "$EFF" "$EFF_REASON"
+    printf '  branch:     %s (orphan; pushed to %s; never merged into main)\n' "$CONTEXT_BRANCH" "$REMOTE"
+    if LC="$(git -C "$REPO" rev-parse -q --verify "refs/heads/$CONTEXT_BRANCH" 2>/dev/null)"; then
+      printf '  local ref:  %s\n' "$LC"
+    else
+      printf '  local ref:  (none yet — no sync has run)\n'
+    fi
+    printf '  note: PRIVATE repos are ON by default; PUBLIC repos are OFF until you opt in.\n'
+    ;;
+  *)
+    echo "heimdall-context-sync: unknown subcommand '$CMD' (try: sync | on | off | status)" >&2
+    usage >&2
+    exit 2
+    ;;
+esac
