@@ -165,17 +165,19 @@ preflight_gcloud() {
   # Network — resolve the Google API hosts STEP 2-7 depend on. A DNS/connectivity failure
   # (flaky Wi-Fi, VPN, captive portal) otherwise surfaces as a confusing mid-STEP-2 gcloud
   # crash ("Failed to resolve artifactregistry.googleapis.com"). Fail fast with the real cause.
+  # A CONNECT test, not just DNS: oauth2 (token refresh) can fail on connection
+  # (Errno 61 refused) even when the host resolves — a bare DNS check misses that.
+  # A real HTTP status (even 404) means TLS connected = reachable; only a total
+  # connection failure (curl exit != 0 / code 000) counts as unreachable.
   local _unreach=""
-  local _h
-  for _h in artifactregistry.googleapis.com run.googleapis.com; do
-    python3 -c "import socket,sys; socket.gethostbyname(sys.argv[1])" "$_h" >/dev/null 2>&1 \
-      || host "$_h" >/dev/null 2>&1 \
-      || nslookup "$_h" >/dev/null 2>&1 \
-      || _unreach="${_unreach} ${_h}"
+  local _h _code
+  for _h in oauth2.googleapis.com artifactregistry.googleapis.com run.googleapis.com; do
+    _code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 "https://${_h}/" 2>/dev/null || echo 000)"
+    [ "${_code}" = "000" ] && _unreach="${_unreach} ${_h}"
   done
   [ -n "${_unreach}" ] \
-    && die "STEP 0: cannot resolve Google API host(s):${_unreach} — a DNS/network problem on THIS machine (check Wi-Fi/VPN/captive-portal; try setting DNS to 8.8.8.8 or 1.1.1.1), then re-run go-live. Google is up if these resolve on another network."
-  note "  ok  Google API hosts resolve (network reachable)"
+    && die "STEP 0: cannot reach Google API endpoint(s):${_unreach} — a network egress problem on THIS machine (flaky Wi-Fi, VPN, captive-portal, or a firewall blocking 443 to Google; oauth2 must be reachable to refresh the auth token). Fix the network (switch Wi-Fi / disconnect VPN / set DNS 8.8.8.8), confirm 'gcloud auth print-access-token' works, then re-run go-live. Google is up if these reach on another network."
+  note "  ok  Google API endpoints reachable (incl. oauth2 for token refresh)"
   # Auth validity — the REAL fix: mint a token. `auth list` alone would green-light a stale cred.
   if gcloud auth print-access-token >/dev/null 2>&1; then
     note "  ok  gcloud credential valid (access token minted)"
