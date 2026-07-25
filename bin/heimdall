@@ -1487,6 +1487,35 @@ case "${1:-}" in
     fi
     exec "$CONTEXT_BIN" "$@"
     ;;
+  chat)
+    # Pass-through to heimdall-chat (link/handle/serve/bindings/unlink). CHAT-OPS P2: the
+    # Telegram verb core — a chat message classifies to a bounded verb (status/investigate/
+    # report/link), resolves the {chat_id<->HAID<->team} binding server-side, and acts only
+    # for a bound member. All args/flags forwarded verbatim. Bin resolved via $PLUGIN_DIR —
+    # never hardcoded (mirrors the context)/presence) cases above).
+    shift
+    CHAT_BIN="$PLUGIN_DIR/bin/heimdall-chat"
+    if [ ! -x "$CHAT_BIN" ]; then
+      echo "  Error: heimdall-chat not found at $CHAT_BIN" >&2
+      echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+      exit 1
+    fi
+    exec "$CHAT_BIN" "$@"
+    ;;
+  link)
+    # Shorthand for `hmd chat link` — `hmd link telegram` mints the one-time 6-digit code a
+    # user DMs the bot to bind their chat to their Heimdall identity. Delegates to
+    # heimdall-chat with the `link` verb PREPENDED; any channel arg (default telegram)
+    # forwards verbatim. CHAT_BIN resolved via $PLUGIN_DIR exactly like the chat) case above.
+    shift
+    CHAT_BIN="$PLUGIN_DIR/bin/heimdall-chat"
+    if [ ! -x "$CHAT_BIN" ]; then
+      echo "  Error: heimdall-chat not found at $CHAT_BIN" >&2
+      echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+      exit 1
+    fi
+    exec "$CHAT_BIN" link "$@"
+    ;;
   beat|roster)
     # First-class shortcuts for the two presence verbs teammates reach for most:
     # `hmd beat` (send a heartbeat) and `hmd roster` (see the team wall). Both delegate

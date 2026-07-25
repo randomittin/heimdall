@@ -155,6 +155,16 @@
       "must_turn_red_gate": "cross-tenant-denial",
       "first_fail_case": "L5-session-is-owner",
       "reject_contract": "attack L5-session-is-owner: expected DENY, candidate returns ALLOW -> gate status=fail at step 'L5-session-is-owner'"
+    },
+    {
+      "name": "chat-trusts-bare-chatid",
+      "file": "chat-trusts-bare-chatid.mjs",
+      "invariant": "INV-CHAT",
+      "gate_dropped": "the server-derived chat team binding (chat_link.resolve of the persisted {chat_id<->HAID<->team}); the chat verb trusts a bare chat_id as an identity",
+      "attack_that_succeeds": "C1 — an unbound/forged chat_id is handed a team and its read verbs (status/investigate/report) return team data it was never bound to",
+      "must_turn_red_gate": "cross-tenant-denial",
+      "first_fail_case": "C1-unbound-chat",
+      "reject_contract": "attack C1-unbound-chat: expected DENY, candidate returns ALLOW -> gate status=fail at step 'C1-unbound-chat'"
     }
   ]
 }

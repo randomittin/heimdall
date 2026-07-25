@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# heimdall-chat — chat-ops P2 CLI launcher (Telegram verb core).
+#
+# A thin, dependency-free bash entrypoint that hands off to the Python implementation
+# (bin/lib/chat_cli.py). Kept as a shell launcher so `bash -n` validates it and the
+# landmine-lint gate scans it; ALL verb logic lives in the chat_*.py modules it drives.
+#
+# Subcommands (forwarded verbatim): link | handle | serve | bindings | unlink. See
+# `heimdall-chat` with no args for usage. The bot token is read from env
+# HEIMDALL_TELEGRAM_BOT_TOKEN ONLY — never a literal.
+set -euo pipefail
+
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+BINDIR="$(dirname "$SELF")"
+CLI_PY="$BINDIR/lib/chat_cli.py"
+
+PY="$(command -v python3 || command -v python || true)"
+if [ -z "$PY" ]; then
+  echo "heimdall-chat: python3 not found (required for chat-ops)" >&2
+  exit 2
+fi
+if [ ! -f "$CLI_PY" ]; then
+  echo "heimdall-chat: implementation missing at $CLI_PY" >&2
+  echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+  exit 2
+fi
+
+exec "$PY" "$CLI_PY" "$@"

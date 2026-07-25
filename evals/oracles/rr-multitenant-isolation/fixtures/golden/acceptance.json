@@ -103,6 +103,12 @@
       "expected": "DENY",
       "invariant": "INV-LOGIN-5",
       "attack": "a login session (always Identity.owner=false) pointed at an owner/god route must not pass the owner gate — only owner-PKI + IAP grants owner"
+    },
+    {
+      "n": "C1-unbound-chat",
+      "expected": "DENY",
+      "invariant": "INV-CHAT",
+      "attack": "an UNBOUND / forged chat_id (a bare chat handle) presented to a read verb (status/investigate/report) must resolve to NO team and get the link instruction — a bare chat_id is never trusted as an identity, and the team is server-derived from the persisted {chat_id<->HAID<->team} binding (chat_link.resolve), never from the chat_id itself"
     }
   ]
 }

@@ -294,6 +294,36 @@ export function loginSessionPassesOwnerGate(gates, session) {
   return session.owner === true; // GOLDEN: a login session is never owner (always false).
 }
 
+// ─────────────────────────────────────────────────────────────────────────────────────
+// INV-CHAT — the chat-ops identity binding (chat-ops P2 §2: a chat handle is never trusted
+// bare). A chat message's operative team is resolved SERVER-SIDE from the persisted
+// {chat_id <-> HAID <-> team} binding (bin/lib/chat_link.resolve), NEVER from the chat_id
+// itself. An UNBOUND / forged chat_id has no binding, so it resolves to NO team and gets the
+// link instruction — it returns NO team data. This is the direct chat-surface analogue of
+// INV-1 (server-derived team, never a wire value): the chat_id is a bare, attacker-suppliable
+// handle, exactly like a request team_id.
+//
+// This model authors the ORACLE only; the real chat_link.resolve + the status/investigate/
+// report verbs (bin/lib/chat_verbs.py) are implemented in P2 and must PASS this gate.
+// ─────────────────────────────────────────────────────────────────────────────────────
+
+// The persisted chat-binding registry: the ONLY bound chat handle maps to team A. Every other
+// chat_id (unbound / forged) has no binding. Mirrors chat_link's {chat_id -> team} store.
+const CHAT_BINDINGS = { "chat:alice": TEAM_A.team_id };
+
+// ── INV-CHAT: resolve a chat_id to its team from the persisted binding ONLY. An unbound /
+//    forged chat_id resolves to null (no team) — the verb then refuses with the link
+//    instruction and returns no data. Mirrors chat_link.resolve. ──
+export function chatResolveTeam(gates, chatId) {
+  if (gates.chatTrustsBareChatId) {
+    // MUTANT (INV-CHAT dropped): trusts a bare chat_id as an identity, handing an unbound /
+    // forged handle a team (here team A's partition) instead of refusing -> the forged chat
+    // reads team data it was never bound to.
+    return TEAM_A.team_id;
+  }
+  return CHAT_BINDINGS[chatId] || null; // GOLDEN: only a persisted binding resolves a team.
+}
+
 // ── The fixed cross-tenant attack sequence. Each returns "DENY" (attack stopped) or
 //    "ALLOW" (attack SUCCEEDED — a tenant touched another's resource). The acceptance
 //    oracle demands DENY for every one; a mutant flips exactly its own gate's attack
@@ -444,6 +474,15 @@ export function evaluateAttack(gates, attackId) {
       // owner. The login session passing the owner gate is the ALLOW.
       const session = mintLoginSession(HAID_A.haid, [registeredTeam(HAID_A.haid)], 9999);
       return loginSessionPassesOwnerGate(gates, session) ? "ALLOW" : "DENY";
+    }
+    case "C1-unbound-chat": {
+      // INV-CHAT. An UNBOUND (forged) chat_id hits a read verb (status/investigate/report).
+      // With no {chat_id<->HAID<->team} binding it MUST resolve to NO team and get the link
+      // instruction — never team data. Resolving a team (and thus returning data) for an
+      // unbound/forged chat_id is the ALLOW.
+      const UNBOUND_CHAT_ID = "chat:mallory"; // never bound; a bare, attacker-suppliable handle.
+      const team = chatResolveTeam(gates, UNBOUND_CHAT_ID);
+      return team ? "ALLOW" : "DENY";
     }
     default:
       throw new Error("unknown attack id: " + attackId);
