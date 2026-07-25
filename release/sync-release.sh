@@ -157,9 +157,23 @@ T="$(mktemp)"
 sed -E "s|^(/install[[:space:]]+).*|\1${INSTALL_URL}  302|" "$REDIRECTS" > "$T"
 write_file "$REDIRECTS" "$T"
 
-# 4. README raw-URL tags (any /heimdall/<oldtag>/install.sh -> /heimdall/<TAG>/install.sh)
+# 4. README version pins -> TAG. Three anchored rewrites, each keyed on surrounding text so
+#    only the intended spot moves (never a blind s/<oldver>/<newver>/g that would clobber a
+#    historical version reference):
+#      a) the raw-URL install tags   /heimdall/<oldtag>/install.sh -> /heimdall/<TAG>/install.sh
+#      b) the "Pinned to the `vX.Y.Z` tag" prose
+#      c) the releases/download/vX.Y.Z/install.sh.minisig asset URL
+#    (b) and (c) live OUTSIDE the raw-URL pattern and outside bin/heimdall-render-version's
+#    HEIMDALL:VERSION markers; keeping them here makes this sync self-consistent (the step-5
+#    copy to packages/runheimdall/README.md is then correct even if this script runs on its
+#    own), and bin/heimdall-render-version renders the SAME two spots from plugin.json so the
+#    ship.sh render-then-sync order can never disagree.
 T="$(mktemp)"
-sed -E "s|(${RAW_BASE//\//\\/}/)v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?(/install\.sh)|\1${TAG}\3|g" "$README" > "$T"
+sed -E \
+  -e "s|(${RAW_BASE//\//\\/}/)v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?(/install\.sh)|\1${TAG}\3|g" \
+  -e "s|(Pinned to the \`)v[0-9]+\.[0-9]+\.[0-9]+(\` tag)|\1${TAG}\2|g" \
+  -e "s|(releases/download/)v[0-9]+\.[0-9]+\.[0-9]+(/install\.sh\.minisig)|\1${TAG}\2|g" \
+  "$README" > "$T"
 write_file "$README" "$T"
 
 # 5. npm README mirror — byte-identical copy of the just-templated root README, so

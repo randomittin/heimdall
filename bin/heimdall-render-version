@@ -9,7 +9,14 @@
 # Rendered surfaces:
 #   1. VERSION                 — repo-root plain-text mirror (tooling/CI that has no JSON parser)
 #   2. README.md               — the generated region between the HEIMDALL:VERSION markers
-#                                (badge + version line). Nothing outside the markers is touched.
+#                                (badge + version line). Nothing else in the region is touched.
+#   2b. README.md version pins — two version-bearing spots that live OUTSIDE the markers, so the
+#                                generated region cannot reach them, yet the drift gate greps
+#                                EVERY X.Y.Z in the file: the `Pinned to the vX.Y.Z tag` prose
+#                                and the releases/download/vX.Y.Z/install.sh.minisig asset URL.
+#                                Rewritten in place with anchored regexes keyed on their
+#                                surrounding text — only those two spots move; every other line
+#                                (and any historical version reference) is passed through untouched.
 #
 # The remaining surfaces (packages/runheimdall/package.json, vercel.json, _redirects,
 # install.sh DEFAULT_REF) are tag-derived and rendered by release/sync-release.sh, which
@@ -115,9 +122,50 @@ render_readme() {
   printf '  rendered README version region -> %s\n' "$VERSION"
 }
 
+# ── 2b. README un-marked version pins (prose + minisig URL) ───────────────────
+# Two version-bearing spots live OUTSIDE the HEIMDALL:VERSION markers, so render_readme above
+# cannot reach them, yet test/version-drift + version-unified grep EVERY X.Y.Z in the file —
+# leave them and every version bump silently reintroduces version-drift red (they were last
+# hand-synced, which is exactly the manual step this renderer exists to remove):
+#   - the prose:  Pinned to the `vX.Y.Z` tag
+#   - the asset:  .../releases/download/vX.Y.Z/install.sh.minisig
+# Both are rewritten FROM plugin.json with anchored regexes keyed on their surrounding text —
+# NOT a blind s/<oldver>/<newver>/g — so ONLY these two spots move and any other version
+# reference is left untouched. The anchors are REQUIRED to exist: a README that lost either
+# line is a hard error, not a silent skip, mirroring the marker guard in render_readme.
+render_readme_pins() {
+  [ -f "$README" ] || die "README not found: $README"
+  grep -Eq 'Pinned to the `v[0-9]+\.[0-9]+\.[0-9]+` tag' "$README" \
+    || die "README is missing the 'Pinned to the \`vX.Y.Z\` tag' pin — cannot render it (anchor gone)"
+  grep -Eq 'releases/download/v[0-9]+\.[0-9]+\.[0-9]+/install\.sh\.minisig' "$README" \
+    || die "README is missing the releases/download/vX.Y.Z/install.sh.minisig pin — cannot render it (anchor gone)"
+
+  local tmp
+  tmp="$(mktemp "${TMPDIR:-/tmp}/hmd-readme-pins.XXXXXX")" || die "mktemp failed"
+  sed -E \
+    -e "s|(Pinned to the \`v)[0-9]+\.[0-9]+\.[0-9]+(\` tag)|\1${VERSION}\2|g" \
+    -e "s|(releases/download/v)[0-9]+\.[0-9]+\.[0-9]+(/install\.sh\.minisig)|\1${VERSION}\2|g" \
+    "$README" > "$tmp" || { rm -f "$tmp"; die "README pin render failed"; }
+
+  # Both spots must actually carry the manifest version now — a silent no-op or a rewrite that
+  # produced the wrong version would otherwise pass as "rendered".
+  grep -Fq "Pinned to the \`v${VERSION}\` tag" "$tmp" \
+    && grep -Fq "releases/download/v${VERSION}/install.sh.minisig" "$tmp" \
+    || { rm -f "$tmp"; die "pin render did not produce version ${VERSION} at both spots — refusing to write"; }
+
+  if cmp -s "$README" "$tmp"; then rm -f "$tmp"; return 0; fi
+  if [ "$MODE" = "check" ]; then
+    note_stale "README version pins (prose + minisig URL) do not match manifest '$VERSION'"
+    rm -f "$tmp"; return 0
+  fi
+  mv "$tmp" "$README" || { rm -f "$tmp"; die "could not write $README"; }
+  printf '  rendered README version pins -> %s\n' "$VERSION"
+}
+
 printf 'heimdall-render-version: manifest=%s mode=%s\n' "$VERSION" "$MODE"
 render_version_file
 render_readme
+render_readme_pins
 
 if [ "$MODE" = "check" ]; then
   [ "$STALE" -eq 0 ] || die "version surfaces are STALE — run bin/heimdall-render-version"
