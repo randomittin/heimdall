@@ -1548,6 +1548,25 @@ case "${1:-}" in
     fi
     exec "$DASHBOARD_BIN" "$@"
     ;;
+  god)
+    # `hmd god roster|logs` — OWNER-ONLY cross-tenant read (GOD MODE) from the terminal.
+    # Fetches the gated control-plane's GET /god/roster + GET /god/logs: the cross-team
+    # presence wall + activity aggregate every OTHER read scopes to one team. Two-gate auth:
+    # a GCP identity token for the Cloud Run --no-allow-unauthenticated edge + RJ's enrolled
+    # Ed25519 owner signature for the app-layer _require_owner. A signed NON-owner is refused
+    # 401 not_owner. The WEB god view (god.runheimdall.dev) is a SEPARATE IAP origin
+    # (docs/god-mode-iap-setup.md); THIS is the no-GCP-browser path (docs/god-mode-cli.md).
+    # Pass-through to heimdall-god; all args/flags forwarded verbatim. Bin resolved via
+    # $PLUGIN_DIR (never hardcoded), mirroring the dashboard) case above.
+    shift
+    GOD_BIN="$PLUGIN_DIR/bin/heimdall-god"
+    if [ ! -x "$GOD_BIN" ]; then
+      echo "  Error: heimdall-god not found at $GOD_BIN" >&2
+      echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+      exit 1
+    fi
+    exec "$GOD_BIN" "$@"
+    ;;
   telemetry)
     # `hmd telemetry` — Pre-Merge Corpus (PMR) T0 consent + control surface
     # (status/on/off/hunks on|off/purge) + the internal emit/observe/scan/install-hook

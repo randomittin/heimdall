@@ -1,0 +1,387 @@
+#!/usr/bin/env bash
+# heimdall-god — the OWNER-ONLY, no-GCP-browser CLI path to GOD MODE (cross-tenant read).
+#
+# WHAT IT IS. `hmd god` lets the fleet OWNER (RJ) watch EVERY team at once from a terminal:
+#   hmd god roster                      the cross-team PRESENCE wall (all teams online).
+#   hmd god logs [--kind K] [--limit N] the cross-team ACTIVITY aggregate (enroll/verdicts/
+#                                       runs/security), optionally one section, newest-N.
+#
+# It reads the OWNER-ONLY routes GET /god/roster + GET /god/logs on the GATED control-plane
+# service (heimdall-control-plane, deployed --no-allow-unauthenticated). Those routes are
+# gated TWICE and the CLI satisfies BOTH:
+#   (a) GCP IAM at the Cloud Run edge — the service is --no-allow-unauthenticated, so every
+#       request must carry a Google identity token. The CLI attaches
+#       `gcloud auth print-identity-token --audiences=<service-url>` as `Authorization:
+#       Bearer <token>` (RJ has gcloud). This is the SAME channel heimdall-presence uses for
+#       the gated service (Authorization: Bearer). It is inert at the app layer (the §3
+#       chokepoint ignores Authorization) — it only gets the request PAST the Cloud Run edge.
+#   (b) The APP-LAYER OWNER gate — cp_god's _require_owner refuses any non-owner Identity
+#       (401 not_owner). So the CLI signs the request with RJ's ENROLLED Ed25519 HAID key
+#       (the SAME key + seed heimdall-presence / heimdall-dashboard use), and the CP verifies
+#       that signature and checks owner:true in its key registry. RJ's HAID must be owner:true
+#       (grant it via HEIMDALL_CP_OWNER_HAIDS — see docs/god-mode-cli.md); a signed NON-owner
+#       gets 401 not_owner, which is the falsifier this path is built to honor.
+#
+# The signing REUSES cp_auth.sign over cp_auth.canonical_message(METHOD, PATH, "") — the SAME
+# canonical bytes the CP verifies for every signed read (byte-identical to heimdall-presence's
+# GFE-safe GET: EMPTY body, the query lives in the signed path). Never hand-rolled crypto.
+#
+# THE WEB GOD VIEW IS SEPARATE. god.runheimdall.dev is a DISTINCT IAP-gated origin (RJ's GCP,
+# docs/god-mode-iap-setup.md) that authenticates a BROWSER via Google IAP. THIS CLI is the
+# no-GCP-browser path: it needs only gcloud + the enrolled HAID key, no IAP LB. Same data,
+# two independent owner-auth paths (IAP JWT for the browser; Ed25519 + IAM token for the CLI).
+#
+# IDENTITY / SEED / URL / TOKEN (resolved; flag > env > derive), mirroring heimdall-dashboard:
+#   HAID          : --haid > $HMD_HAID > `heimdall-identity current` > `heimdall-haid current`.
+#   signing seed  : the persisted 0600 seed at ${HOME}/.heimdall/pki/<haid-slug>.seed
+#                   (slug = haid with '/' and ':' -> '_', IDENTICAL to heimdall-presence's
+#                   keying). ABSENT => NOT ENROLLED => a clear error (never a fake sign).
+#   service URL   : --url > $HEIMDALL_GOD_CP_URL > $HEIMDALL_CP_URL > gcloud describe of the
+#                   heimdall-control-plane service (region $HEIMDALL_GOD_CP_REGION, default
+#                   us-central1). This is the GATED service, NOT the public surface.
+#   IAM token     : $HEIMDALL_GOD_ID_TOKEN (explicit/testing) > `gcloud auth
+#                   print-identity-token --audiences=<URL>`. Omitted (with a stderr warning)
+#                   only if it cannot be resolved — a self-host gated service may not need it,
+#                   but a Cloud Run --no-allow-unauthenticated edge will 403 without it.
+
+set -uo pipefail
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(cd "$SELF_DIR/.." && pwd)"
+LIB="$REPO/bin/lib"
+
+HAID_CLI="$SELF_DIR/heimdall-haid"
+IDENTITY_CLI="$SELF_DIR/heimdall-identity"
+PY="$(command -v python3 || command -v python || true)"
+
+err() { printf 'heimdall god: %s\n' "$1" >&2; }
+
+usage() {
+  cat >&2 <<'USAGE'
+usage: hmd god <command> [options]
+
+commands:
+  roster                          the cross-team PRESENCE wall (all teams online).
+  logs [--kind K] [--limit N]     the cross-team ACTIVITY aggregate.
+                                  --kind: enroll | verdicts | runs | security (default: all)
+                                  --limit N: keep only the newest N rows per section.
+
+common options:
+  --haid HAID   sign as this HAID (default: your enrolled identity).
+  --url  URL    the gated control-plane service URL (default: gcloud-resolved).
+  --json        print the raw JSON response instead of the pretty wall.
+
+Owner-only. Your HAID must be owner:true in the control plane's key registry
+(grant via HEIMDALL_CP_OWNER_HAIDS — see docs/god-mode-cli.md). A signed non-owner
+is refused 401 not_owner.
+USAGE
+}
+
+SUB="${1:-}"; shift || true
+case "$SUB" in
+  roster|logs) : ;;
+  -h|--help|"") usage; [ -z "$SUB" ] && exit 2 || exit 0 ;;
+  *) err "unknown command: $SUB"; usage; exit 2 ;;
+esac
+
+# ── parse options ───────────────────────────────────────────────────────────────
+HAID=""; URL=""; KIND=""; LIMIT=""; AS_JSON=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --haid) HAID="${2:?--haid needs a value}"; shift 2 ;;
+    --url)  URL="${2:?--url needs a value}"; shift 2 ;;
+    --kind) KIND="${2:?--kind needs a value}"; shift 2 ;;
+    --limit) LIMIT="${2:?--limit needs a value}"; shift 2 ;;
+    --json) AS_JSON="1"; shift ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; break ;;
+    -*) err "unexpected option: $1"; usage; exit 2 ;;
+    *)  err "unexpected argument: $1"; usage; exit 2 ;;
+  esac
+done
+
+[ -n "$PY" ] || { err "python3 is required but was not found on PATH"; exit 2; }
+[ -f "$LIB/cp_auth.py" ] || { err "control-plane libs not found ($LIB/cp_auth.py) — reinstall heimdall"; exit 2; }
+
+if [ -n "$KIND" ] && [ "$SUB" != "logs" ]; then
+  err "--kind only applies to 'hmd god logs'"; exit 2
+fi
+case "${KIND:-}" in
+  ""|enroll|verdicts|runs|security) : ;;
+  *) err "invalid --kind '$KIND' (use: enroll | verdicts | runs | security)"; exit 2 ;;
+esac
+if [ -n "$LIMIT" ] && ! printf '%s' "$LIMIT" | grep -qE '^[0-9]+$'; then
+  err "--limit must be a non-negative integer (got '$LIMIT')"; exit 2
+fi
+
+# ── resolve HAID (flag > env > identity > haid CLI) ────────────────────────────
+[ -n "$HAID" ] || HAID="${HMD_HAID:-}"
+if [ -z "$HAID" ] && [ -x "$IDENTITY_CLI" ]; then HAID="$("$IDENTITY_CLI" current 2>/dev/null || true)"; fi
+if [ -z "$HAID" ] && [ -x "$HAID_CLI" ]; then HAID="$("$HAID_CLI" current 2>/dev/null || true)"; fi
+if [ -z "$HAID" ]; then
+  err "could not resolve a Heimdall identity (HAID) — run: hmd enroll  (or: hmd beat) first"
+  exit 3
+fi
+
+# ── resolve the enrolled signing seed file (must already exist = enrolled) ─────
+# Slug MUST match heimdall-presence: '/' and ':' -> '_'. Pure bash (no `tr`).
+HMD_DIR="${HOME:-}/.heimdall"
+HAID_SLUG="${HAID//\//_}"; HAID_SLUG="${HAID_SLUG//:/_}"
+SEED_FILE="$HMD_DIR/pki/$HAID_SLUG.seed"
+if [ -z "${HOME:-}" ] || [ ! -f "$SEED_FILE" ] || [ ! -s "$SEED_FILE" ]; then
+  err "not enrolled — no signing key for $HAID"
+  err "enroll this machine first:  hmd enroll   (or run any presence beat: hmd beat)"
+  exit 4
+fi
+
+# ── resolve the gated control-plane URL ────────────────────────────────────────
+REGION="${HEIMDALL_GOD_CP_REGION:-us-central1}"
+[ -n "$URL" ] || URL="${HEIMDALL_GOD_CP_URL:-${HEIMDALL_CP_URL:-}}"
+if [ -z "$URL" ]; then
+  if command -v gcloud >/dev/null 2>&1; then
+    URL="$(gcloud run services describe heimdall-control-plane --region="$REGION" \
+             --format='value(status.url)' 2>/dev/null || true)"
+  fi
+fi
+if [ -z "$URL" ]; then
+  err "no control-plane URL — pass --url <url>, set \$HEIMDALL_GOD_CP_URL, or authenticate gcloud"
+  err "(gcloud resolves it from: gcloud run services describe heimdall-control-plane --region=$REGION)"
+  exit 2
+fi
+
+# ── resolve the GCP IAM identity token (Cloud Run edge; audience = the service URL) ─
+ID_TOKEN="${HEIMDALL_GOD_ID_TOKEN:-}"
+if [ -z "$ID_TOKEN" ] && [ "${HEIMDALL_GOD_SKIP_ID_TOKEN:-}" != "1" ]; then
+  if command -v gcloud >/dev/null 2>&1; then
+    ID_TOKEN="$(gcloud auth print-identity-token --audiences="$URL" 2>/dev/null || true)"
+  fi
+  if [ -z "$ID_TOKEN" ]; then
+    err "could not obtain a GCP identity token (gcloud auth print-identity-token) — the"
+    err "--no-allow-unauthenticated Cloud Run edge will 403 without it. Run 'gcloud auth login'"
+    err "or set \$HEIMDALL_GOD_ID_TOKEN. Proceeding without it (a self-host gated service may allow)."
+  fi
+fi
+
+# ── sign the canonical GET assertion + fetch + pretty-print (seed read in-process) ─
+GOD_LIB="$LIB" GOD_URL="$URL" GOD_HAID="$HAID" GOD_SEED_FILE="$SEED_FILE" \
+GOD_ID_TOKEN="$ID_TOKEN" GOD_SUB="$SUB" GOD_KIND="$KIND" GOD_LIMIT="$LIMIT" \
+GOD_JSON="$AS_JSON" \
+"$PY" - <<'PYEOF'
+import json
+import os
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+sys.path.insert(0, os.environ["GOD_LIB"])
+import cp_auth  # the SHIPPED Ed25519 signer + canonical_message — never re-implemented.
+
+URL = os.environ["GOD_URL"].rstrip("/")
+HAID = os.environ["GOD_HAID"]
+SEED_FILE = os.environ["GOD_SEED_FILE"]
+ID_TOKEN = os.environ.get("GOD_ID_TOKEN") or ""
+SUB = os.environ["GOD_SUB"]
+KIND = os.environ.get("GOD_KIND") or ""
+LIMIT = os.environ.get("GOD_LIMIT") or ""
+AS_JSON = bool(os.environ.get("GOD_JSON"))
+
+
+def fail(msg, code):
+    sys.stderr.write("heimdall god: " + msg + "\n")
+    sys.exit(code)
+
+
+# Read the enrolled seed IN-PROCESS; it never leaves this process (never printed/argv'd).
+try:
+    with open(SEED_FILE, "r", encoding="utf-8") as fh:
+        seed = fh.read().strip()
+except OSError:
+    seed = ""
+if not seed:
+    fail("not enrolled — the signing seed is missing/empty; run: hmd enroll", 4)
+
+# The route path (with query) — signed IN FULL (cp_auth.canonical_message covers the query,
+# so the read is authenticated + tamper-evident). GFE-safe: EMPTY body on the GET.
+if SUB == "roster":
+    path = "/god/roster"
+else:
+    path = "/god/logs"
+
+method = "GET"
+try:
+    sig = cp_auth.sign(seed, cp_auth.canonical_message(method, path, b""))
+except cp_auth.AuthError as exc:
+    fail("cannot sign the god request (Ed25519 backend: %s) — try: %s -m pip install --user cryptography"
+         % (getattr(exc, "reason", "unavailable"), sys.executable or "python3"), 5)
+
+req = urllib.request.Request(URL + path, data=None, method=method)
+req.add_header("X-Heimdall-HAID", HAID)
+req.add_header("X-Heimdall-Signature", sig)
+if ID_TOKEN:
+    req.add_header("Authorization", "Bearer " + ID_TOKEN)
+
+try:
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        status = resp.status
+        raw = resp.read()
+except urllib.error.HTTPError as exc:
+    status = exc.code
+    try:
+        raw = exc.read()
+    except Exception:  # noqa: BLE001 — a body-less error is still a status we act on.
+        raw = b""
+except Exception:  # noqa: BLE001 — any transport/TLS/DNS fault is a clean, named error.
+    fail("could not reach the control plane at %s (network error) — check your connection/gcloud"
+         % URL, 6)
+
+try:
+    payload = json.loads(raw) if raw else {}
+except (ValueError, TypeError):
+    payload = {}
+
+if status == 401:
+    reason = (payload or {}).get("error") or "unauthorized"
+    if reason == "not_owner":
+        fail("refused (401 not_owner) — your HAID is NOT an owner.\n"
+             "  identity: %s\n"
+             "  Grant owner on the control plane, then retry:\n"
+             "    gcloud run services update heimdall-control-plane --region=us-central1 \\\n"
+             "      --update-env-vars=\"HEIMDALL_CP_OWNER_HAIDS=%s\"\n"
+             "  (see docs/god-mode-cli.md; a redeploy/go-live applies it.)" % (HAID, HAID), 7)
+    fail("signature/enrollment rejected (401 %s) — this HAID may be revoked or not enrolled; "
+         "re-enroll (hmd beat) and retry" % reason, 7)
+if status == 403:
+    fail("forbidden (403) at the Cloud Run edge — the GCP identity token was missing or not "
+         "authorized (roles/run.invoker). Run 'gcloud auth login' and ensure your account may "
+         "invoke heimdall-control-plane.", 8)
+if status == 404:
+    fail("not found (404) — /god%s is not served here. Is --url the GATED heimdall-control-plane "
+         "service (not the public surface)?" % (path[4:] if path.startswith("/god") else path), 9)
+if not (200 <= status < 300):
+    fail("unexpected response from the control plane (HTTP %d)" % status, 10)
+
+if AS_JSON:
+    sys.stdout.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    sys.exit(0)
+
+
+# ── pretty-printers ─────────────────────────────────────────────────────────────
+BOLD = "\033[1m"; DIM = "\033[2m"; GRN = "\033[32m"; RED = "\033[31m"; YEL = "\033[33m"; RST = "\033[0m"
+if not sys.stdout.isatty():
+    BOLD = DIM = GRN = RED = YEL = RST = ""
+
+
+def _age(secs):
+    try:
+        s = int(secs)
+    except (TypeError, ValueError):
+        return "?"
+    if s < 60:
+        return "%ds" % s
+    if s < 3600:
+        return "%dm" % (s // 60)
+    if s < 86400:
+        return "%dh" % (s // 3600)
+    return "%dd" % (s // 86400)
+
+
+def _verdict_color(v):
+    v = (v or "").upper()
+    if v == "PROVEN":
+        return GRN
+    if v in ("BLOCKED", "REFUSED"):
+        return RED
+    if v == "PENDING":
+        return YEL
+    return ""
+
+
+def print_roster(teams):
+    if not teams:
+        sys.stdout.write("%sno teams online%s\n" % (DIM, RST))
+        return
+    total = 0
+    sys.stdout.write("%sGOD ROSTER%s — cross-team presence wall (%d team%s)\n"
+                     % (BOLD, RST, len(teams), "" if len(teams) == 1 else "s"))
+    for t in sorted(teams, key=lambda x: (str(x.get("project") or ""), str(x.get("team_id") or ""))):
+        online = t.get("online") or []
+        total += len(online)
+        sys.stdout.write("\n%s%s%s  %steam %s%s  (%d online)\n"
+                         % (BOLD, t.get("project") or "(no project)", RST,
+                            DIM, str(t.get("team_id") or "?")[:12], RST, len(online)))
+        if not online:
+            sys.stdout.write("  %s· idle%s\n" % (DIM, RST))
+        for m in sorted(online, key=lambda x: str(x.get("haid") or "")):
+            vc = _verdict_color(m.get("verdict"))
+            state = m.get("state") or ""
+            dot = "%s●%s" % (GRN, RST) if state == "active" else "%s○%s" % (DIM, RST)
+            sys.stdout.write("  %s %-28s %s%-8s%s %s%s%s  %s%s%s\n"
+                             % (dot, (m.get("handle") or m.get("haid") or "?"),
+                                vc, (m.get("verdict") or "-"), RST,
+                                DIM, (m.get("file") or "-"), RST,
+                                DIM, _age(m.get("age_seconds")), RST))
+    sys.stdout.write("\n%s%d member%s online across %d team%s%s\n"
+                     % (DIM, total, "" if total == 1 else "s", len(teams),
+                        "" if len(teams) == 1 else "s", RST))
+
+
+def _tail(rows, limit):
+    if limit == "":
+        return rows
+    n = int(limit)
+    return rows[-n:] if n >= 0 else rows
+
+
+def print_enrollments(enrollments, limit):
+    sys.stdout.write("%sENROLLMENTS%s — cross-team membership (%d team%s)\n"
+                     % (BOLD, RST, len(enrollments), "" if len(enrollments) == 1 else "s"))
+    for e in enrollments:
+        members = _tail(e.get("members") or [], limit)
+        sys.stdout.write("  %steam %s%s  (%d member%s)\n"
+                         % (DIM, str(e.get("team_id") or "?")[:12], RST,
+                            e.get("count", len(members)), "" if e.get("count") == 1 else "s"))
+        for m in members:
+            own = " %s[owner]%s" % (YEL, RST) if m.get("owner") else ""
+            sys.stdout.write("    %-30s %s%s%s%s\n"
+                             % (m.get("haid") or "?", DIM, m.get("project") or "-", RST, own))
+
+
+def print_rows(title, rows, limit):
+    rows = _tail(rows or [], limit)
+    sys.stdout.write("%s%s%s (%d)\n" % (BOLD, title, RST, len(rows)))
+    if not rows:
+        sys.stdout.write("  %s· none%s\n" % (DIM, RST))
+    for r in rows:
+        parts = [str(r.get("ts") or "?"), (r.get("event") or "-"),
+                 (r.get("actor_haid") or "-")]
+        for k in ("action_type", "decision", "outcome"):
+            if r.get(k):
+                parts.append("%s=%s" % (k, r.get(k)))
+        if r.get("detail"):
+            parts.append(str(r.get("detail")))
+        sys.stdout.write("  " + "  ".join(parts) + "\n")
+
+
+if SUB == "roster":
+    print_roster(payload.get("teams") or [])
+else:
+    sections = {"enroll", "verdicts", "runs", "security"} if not KIND else {KIND}
+    first = True
+    if "enroll" in sections:
+        print_enrollments(payload.get("enrollments") or [], LIMIT); first = False
+    if "verdicts" in sections:
+        if not first:
+            sys.stdout.write("\n")
+        print_rows("GATE VERDICTS", payload.get("verdicts"), LIMIT); first = False
+    if "runs" in sections:
+        if not first:
+            sys.stdout.write("\n")
+        print_rows("RUN OUTCOMES", payload.get("runs"), LIMIT); first = False
+    if "security" in sections:
+        if not first:
+            sys.stdout.write("\n")
+        print_rows("SECURITY SIGNALS", payload.get("security"), LIMIT); first = False
+sys.exit(0)
+PYEOF
+exit $?

@@ -650,6 +650,94 @@ def owner_haids(home=None):
     )
 
 
+# ── OWNER GRANT (the boot-time, deploy-config owner promotion — §7 / god mode) ──
+#
+# THE GAP THIS CLOSES. `register_key` binds every ENROLLED dev owner=False
+# (cp_enroll re-asserts owner=False unconditionally: an enrolled teammate is never a
+# gate-override / god-mode identity). The ONLY owner a fresh deploy has is the server's
+# OWN self-identity (ensure_server_identity, HEIMDALL_CP_SERVER_HAID). So a HUMAN owner
+# — e.g. RJ, who wants `hmd god` cross-tenant read — has an enrolled HAID with a valid
+# signing key but owner=False, and `_require_owner` 401s him. There was no non-secret,
+# auditable way to make an enrolled HAID an owner.
+#
+# THE MECHANISM. The owner set is DEPLOY CONFIG, not an ambient wire op: env
+# HEIMDALL_CP_OWNER_HAIDS is a comma/space-separated list of HAIDs the operator declares
+# owners. At boot (cp_boot, right after ensure_server_identity) promote_owners() flips
+# owner=True on each listed HAID's EXISTING binding — preserving pubkey/team_id/project/
+# enrolled_at — so the promotion rebuilds deterministically on every cold-start (exactly
+# like the seeded server identity) and survives a Firestore-durable re-read.
+#
+# FAIL-SAFE / ORACLE-SAFE (INV-GOD G3 is untouched). Promotion is NEVER a wire input: it
+# is read ONLY from server env, so no caller can escalate itself. A HAID NOT in the
+# configured list is never promoted (a signed non-owner still 401s at _require_owner —
+# the G3 gate is unchanged). A listed HAID with NO existing binding is SKIPPED, not
+# fabricated: an owner needs a registered pubkey to sign, and we never invent one — the
+# human must enroll first (a normal presence beat), then the next boot promotes them.
+
+# The env var the deploy sets to declare human owners (comma/space-separated HAIDs).
+OWNER_HAIDS_ENV = "HEIMDALL_CP_OWNER_HAIDS"
+
+
+def configured_owner_haids(env=None):
+    """The operator-declared owner HAIDs parsed from HEIMDALL_CP_OWNER_HAIDS — a
+    comma/space/newline-separated list, de-duplicated, order-preserving. [] when unset or
+    empty. Pure (no store IO); read fresh from `env` (default os.environ) so a deploy can
+    change the owner set without a code change. This is DEPLOY CONFIG — never a wire input,
+    so it can never be an escalation channel."""
+    e = env if env is not None else os.environ
+    raw = e.get(OWNER_HAIDS_ENV) or ""
+    seen = set()
+    out = []
+    for tok in raw.replace(",", " ").split():
+        h = tok.strip()
+        if h and h not in seen:
+            seen.add(h)
+            out.append(h)
+    return out
+
+
+def promote_owners(home=None, *, haids=None, env=None):
+    """Flip owner=True on each configured owner HAID's EXISTING registry binding (the
+    boot-time owner grant). `haids` overrides the env list (tests / explicit wiring); else
+    the value of HEIMDALL_CP_OWNER_HAIDS (configured_owner_haids). Preserves pubkey +
+    team_id + project + enrolled_at (a re-register with owner=True, non-destructive). One
+    registry read + at most one write (only when something actually changed).
+
+    Returns a dict for the boot log (NO secret in it):
+      {"promoted": [...], "already": [...], "skipped_absent": [...]}
+      * promoted       — HAIDs whose binding was owner=False and is now owner=True.
+      * already        — HAIDs already owner=True (idempotent; no write needed for these).
+      * skipped_absent — listed HAIDs with NO binding (we never fabricate a pubkey; the
+                         human must enroll first, then a later boot promotes them).
+
+    Firestore-safe (get_record + put_record only, never backend.path()). Fail-safe: a HAID
+    not in the list is never touched, so a signed non-owner still 401s at _require_owner."""
+    wanted = list(haids) if haids is not None else configured_owner_haids(env=env)
+    result = {"promoted": [], "already": [], "skipped_absent": []}
+    if not wanted:
+        return result
+    reg = _load_keys(home)
+    keys = reg.get("keys")
+    if not isinstance(keys, dict):
+        keys = {}
+        reg["keys"] = keys
+    changed = False
+    for haid in wanted:
+        entry = keys.get(haid)
+        if not isinstance(entry, dict) or not entry.get("pubkey"):
+            result["skipped_absent"].append(haid)
+            continue
+        if entry.get("owner"):
+            result["already"].append(haid)
+            continue
+        entry["owner"] = True
+        result["promoted"].append(haid)
+        changed = True
+    if changed:
+        _store_keys(reg, home)
+    return result
+
+
 # ── revocation: REUSE heimdall-haid's agents.json status (§3, no new machinery) ─
 
 

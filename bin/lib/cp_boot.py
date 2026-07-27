@@ -97,13 +97,18 @@ class BootResult:
     """What boot() wired — for status/CLI/tests. Carries the registered route keys
     (per piece), the orphan jobs it re-drove, and whether the tick thread started."""
 
-    def __init__(self, routes, resumed, tick_started, server_identity=None):
+    def __init__(self, routes, resumed, tick_started, server_identity=None,
+                 promoted_owners=None):
         self.routes = routes              # {piece -> [(METHOD, path), ...]}
         self.resumed = resumed            # [(job_id, final_state), ...]
         self.tick_started = tick_started  # bool
         # The deterministic server signing identity established at boot (no private seed in
         # it — only the seeded/haid/public_key/registered status). None when not computed.
         self.server_identity = server_identity
+        # The boot-time owner grant outcome (cp_auth.promote_owners): which configured
+        # HAIDs were promoted / already owner / skipped-absent. No secret in it. None when
+        # HEIMDALL_CP_OWNER_HAIDS is unset (the default single-owner deploy).
+        self.promoted_owners = promoted_owners
 
     def to_dict(self):
         return {
@@ -116,6 +121,7 @@ class BootResult:
             ],
             "tick_started": self.tick_started,
             "server_identity": self.server_identity,
+            "promoted_owners": self.promoted_owners,
             "registered_routes": [
                 "%s %s" % (m, p) for (m, p) in cp_server.registered_routes()
             ],
@@ -392,6 +398,21 @@ def boot(server=cp_server, *, home=None, base_env=None, start_tick=True,
     #    a no-op and the dev `identity` mint path still owns registration.
     server_identity = cp_auth.ensure_server_identity(home=home)
 
+    # 0b. OWNER GRANT — promote each operator-declared HAID (HEIMDALL_CP_OWNER_HAIDS) to
+    #     owner=True on its EXISTING binding (cp_auth.promote_owners). This is the auditable,
+    #     non-secret way to make an ENROLLED human (e.g. RJ's `hmd god` HAID) a cross-tenant
+    #     owner: enroll binds owner=False, and this deploy-config promotion flips it on every
+    #     cold-start (deterministic, like the seeded server identity). Fail-safe: a HAID not in
+    #     the list is never touched (a signed non-owner still 401s at _require_owner — INV-GOD
+    #     G3 unchanged); a listed HAID with no binding is skipped (never fabricate a pubkey).
+    #     A no-op when the env is unset — the default single-owner deploy is byte-for-byte the
+    #     same. LOUD one-line log so a promotion is visible in the Cloud Run logs.
+    promoted_owners = cp_auth.promote_owners(home=home)
+    if promoted_owners.get("promoted") or promoted_owners.get("skipped_absent"):
+        _stderr("cp_boot: owner grant: promoted=%s already=%s skipped_absent=%s"
+                % (promoted_owners.get("promoted"), promoted_owners.get("already"),
+                   promoted_owners.get("skipped_absent")))
+
     routes = {}
 
     # 1. ASSEMBLE — every piece plugs its routes into the live seam. The home-aware
@@ -447,7 +468,8 @@ def boot(server=cp_server, *, home=None, base_env=None, start_tick=True,
         thread, _ = start_tick_thread(home=home, base_env=base_env)
         tick_started = thread is not None
 
-    return BootResult(routes, resumed, tick_started, server_identity=server_identity)
+    return BootResult(routes, resumed, tick_started, server_identity=server_identity,
+                      promoted_owners=promoted_owners)
 
 
 # Allow a quick local introspection: `python3 cp_boot.py` wires against the default
