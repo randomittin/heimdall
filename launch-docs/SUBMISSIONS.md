@@ -1,11 +1,12 @@
 # Heimdall — Submission Drafts (A6)
 
 > ## ⛔ NOTHING IN THIS FILE HAS BEEN SUBMITTED ANYWHERE.
-> Every item below is a **draft awaiting RJ's explicit approval**, item by item. No PR has
-> been opened on any external repo, no listing has been created, no form has been
-> submitted. This file was written on branch `a6-submissions` (a git worktree off `main`),
-> committed locally, and **not pushed**. RJ reviews the text, edits/approves per item, and
-> opens/submits from his own identity.
+> **Decisions locked by RJ, 2026-07-28.** Every item below now carries a final status
+> (APPROVED / DEFERRED / SKIP) at its section header, and approved copy is submission-ready.
+> This file is still awaiting RJ's submission from his own identity: no PR has been opened on
+> any external repo, no listing has been created, no form has been submitted, and no glama.ai
+> registration has been made. Written on branch `a6-submissions` (a git worktree off `main`),
+> committed locally, and **not pushed**.
 
 ---
 
@@ -50,23 +51,27 @@ gone). With `DATA.md` on `main`, listing copy may link to it directly at
 
 ---
 
-## 1. Positioning line — NO canonical §3 line exists to source
+## 1. Positioning line — STATUS: APPROVED (Candidate A, locked by RJ 2026-07-28)
 
 The task brief pointed at `heimdall-seo-geo-spec.md` §4 and a canonical "positioning line"
 from §3. **Neither exists in this repo** (`heimdall-seo-geo-spec.md` is not present; I did not
 invent a "§3" from a document I cannot find). Below are **candidates**, each derived verbatim
-or near-verbatim from repo truth, not invented. RJ picks one (or writes a new one) and every
-`{{POSITIONING_LINE}}` placeholder below gets swapped in one pass.
+or near-verbatim from repo truth, not invented. RJ reviewed all three and approved Candidate
+A; every positioning-line placeholder in this file is resolved to it below.
 
 | # | Candidate | Source | Note |
 |---|---|---|---|
-| A | **"Nothing ships unproven."** | `IDENTITY.md:18` (`tagline:` field, canonical YAML) | Shortest, already the repo's own designated tagline. Brand-voice fits the "Bifröst/watchman" slang system (`IDENTITY.md:22-25`). |
+| A | **"Nothing ships unproven."** — APPROVED | `IDENTITY.md:18` (`tagline:` field, canonical YAML) | Shortest, already the repo's own designated tagline. Brand-voice fits the "Bifröst/watchman" slang system (`IDENTITY.md:22-25`). **RJ's approved choice, 2026-07-28 — used in every tagline/positioning field below.** |
 | B | **"A cloud bot that fixes your GitHub issues and opens a proven PR. You review, you merge."** | `README.md:3` (bolded opening line) | Concrete and literal about what `rr` does; best for listing sites that want a plain-English one-liner (StackShare, LibHunt). |
 | C | **"Verification gates for AI-written code — every plan wires an external, falsifiable oracle so the merge stays blocked until the work is proven correct."** | Paraphrase of `README.md:37` ("Every plan wires an external, falsifiable oracle...") | Closest to a positioning statement (differentiates on verification vs. generation, per `evals/flagship/STATUS.md:38-42`'s explicit "VERIFICATION superiority... NOT generation superiority" framing). |
 
-**Default used inline below:** Candidate A (shortest, already-canonical tagline) — marked
-`{{POSITIONING_LINE}}` everywhere it appears so RJ can find/replace in one pass if a different
-candidate (or a real §3 line) is preferred.
+**RJ's decision (2026-07-28): Candidate A — "Nothing ships unproven." — approved for every
+tagline/positioning field in this file.** Candidates B and C above are kept for provenance
+only and are not used anywhere below. Every positioning-line placeholder in this file has
+been resolved to this text in this pass. (Product-copy split, confirmed intentional: the
+viral hook/H1 used elsewhere — "Your issues, fixed while you sleep" — is a separate line that
+does not appear in this submissions file; every listing here uses the verification-framed
+tagline instead.)
 
 ---
 
@@ -76,7 +81,7 @@ For each list I fetched the **real, current README** from GitHub (not memory) to
 exact entry format. Repo star counts were live-checked via the GitHub search API to confirm
 each is the highest-signal list under that name.
 
-### 2.1 `awesome-claude-code` — **GOOD FIT**
+### 2.1 `awesome-claude-code` — **GOOD FIT** — STATUS: APPROVED
 
 - **Repo:** https://github.com/hesreallyhim/awesome-claude-code (50.1k★, confirmed top hit for "awesome-claude-code")
 - **Section:** `## Multi-Agent Orchestration` (primary — wave-based parallel agents + the `heimdall` orchestrator agent is the closest match to this section's existing entries). Alternates worth considering: `## Security` (secret-scan + oracle gates) or `## Linting` (quality gates), but Multi-Agent Orchestration is the strongest single fit.
@@ -84,7 +89,7 @@ each is the highest-signal list under that name.
 - **Entry, in the list's exact current format** (bullet + description line, then a second line of `img.shields.io` badges — matches every entry I read in `Documentation, Knowledge & Learning` / `Providers, Runtime & Integration Infrastructure`):
 
 ```markdown
-- [Heimdall](https://github.com/randomittin/heimdall) by [randomittin](https://github.com/randomittin) - A Claude Code plugin that turns one prompt into finished work gated by falsifiable oracles: every implementation plan wires an external, independent correctness check (differential / trace-diff / verdict) the implementing agent never sees, and a PR only opens once a gate that is *proven able to fail* actually passes. {{POSITIONING_LINE}}  
+- [Heimdall](https://github.com/randomittin/heimdall) by [randomittin](https://github.com/randomittin) - A Claude Code plugin that gates every AI-generated change behind a falsifiable oracle, turning one prompt into finished, proven work: every implementation plan wires an external, independent correctness check (differential / trace-diff / verdict) the implementing agent never sees, and a PR only opens once a gate that is *proven able to fail* actually passes. Nothing ships unproven.  
 <img src="https://img.shields.io/github/created-at/randomittin/heimdall?style=flat-square&labelColor=2b2b2b&color=6b6b6b" alt="created">&nbsp;&nbsp;<img src="https://img.shields.io/github/last-commit/randomittin/heimdall?style=flat-square&labelColor=2b2b2b&color=6b6b6b" alt="last-commit">&nbsp;&nbsp;<img src="https://img.shields.io/github/license/randomittin/heimdall?style=flat-square&labelColor=2b2b2b&color=6b6b6b" alt="license">&nbsp;&nbsp;<img src="https://img.shields.io/github/stars/randomittin/heimdall?style=flat-square&labelColor=2b2b2b&color=6b6b6b" alt="stars">
 ```
 
@@ -103,7 +108,7 @@ each is the highest-signal list under that name.
   > per attack class (`test/heimdall-cp-authz-gate.test.sh`). Releases are minisign-signed and
   > verified before the self-updater applies them (`SIGNING.md`). MIT-licensed.
 
-### 2.2 `awesome-mcp-servers` — **STRETCH, honest caveat**
+### 2.2 `awesome-mcp-servers` — **STRETCH, honest caveat** — STATUS: APPROVED (narrow scope — option (b), `heimdall-ledger-mcp` only)
 
 - **Repo:** https://github.com/punkpeye/awesome-mcp-servers (90.8k★, confirmed top hit)
 - **Section:** `### 💻 Developer Tools`
@@ -116,11 +121,14 @@ each is the highest-signal list under that name.
   `bumpguard-mcp`, `docguard`). Submitting the whole Heimdall repo here would overstate what
   the MCP surface actually does. **Two options for RJ:** (a) skip this list entirely, or (b)
   submit `heimdall-ledger-mcp` specifically, scoped honestly as a coordination-ledger server,
-  not "Heimdall" the product. Draft below is option (b).
+  not "Heimdall" the product. **RJ's decision (2026-07-28): option (b) — approved.** Submit
+  `heimdall-ledger-mcp` narrowly, under this honest scope, now; revisit with a broader
+  submission once the full Layer-1 gates/verdict MCP server ships. Draft below is option (b).
 - **Format requirement I could not satisfy:** every current entry in this list carries a
   `glama.ai/mcp/servers/...` score badge, which requires the server to be registered on
-  glama.ai first (a step outside this repo). The draft below omits that badge; RJ (or
-  whoever opens the PR) should register on glama.ai first if that badge is wanted.
+  glama.ai first (a step outside this repo). The draft below omits that badge. **Action before
+  submitting: register on glama.ai FIRST for the badge** — do this before opening the PR, not
+  after.
 - **Entry draft, in the list's exact current bullet format:**
 
 ```markdown
@@ -130,7 +138,7 @@ each is the highest-signal list under that name.
 - **Claim check:** the tool list, delegation model, and handshake are all directly sourced
   from `PROTOCOL.md:219-306` ("MCP Interop Contract — `heimdall-ledger-mcp` — v1.0.0").
 
-### 2.3 `awesome-ai-tools` — **STRETCH**
+### 2.3 `awesome-ai-tools` — **STRETCH** — STATUS: DEFERRED
 
 - **Repo:** https://github.com/mahseema/awesome-ai-tools (5.7k★, confirmed top hit)
 - **Section:** `### Code` (nested under the "Code with AI" top-level section)
@@ -143,10 +151,10 @@ each is the highest-signal list under that name.
 - **Entry draft, matching the list's plain-bullet format** (`- [Name](url) - description.`):
 
 ```markdown
-- [Heimdall](https://github.com/randomittin/heimdall) - A verification-first plugin for Claude Code: every AI-generated change is gated by an external, falsifiable correctness oracle before a PR opens, instead of trusting the agent's own tests. {{POSITIONING_LINE}} MIT, self-hostable.
+- [Heimdall](https://github.com/randomittin/heimdall) - A verification-first plugin for Claude Code: every AI-generated change is gated by an external, falsifiable correctness oracle before a PR opens, instead of trusting the agent's own tests. Nothing ships unproven. MIT, self-hostable.
 ```
 
-### 2.4 `awesome-devtools` — **GOOD FIT**
+### 2.4 `awesome-devtools` — **GOOD FIT** — STATUS: APPROVED
 
 - **Repo:** https://github.com/devtoolsd/awesome-devtools (669★). I checked a second,
   higher-star candidate, `moimikey/awesome-devtools` (534★ — close, and actually the
@@ -163,7 +171,7 @@ each is the highest-signal list under that name.
 * [Heimdall](https://github.com/randomittin/heimdall) - Verification-gate plugin for Claude Code; wires every plan to a falsifiable external oracle so a merge stays blocked until the fix is proven, not just generated. MIT.
 ```
 
-### 2.5 `awesome-git-hooks` — **WEAK FIT, recommend deprioritizing**
+### 2.5 `awesome-git-hooks` — **WEAK FIT, recommend deprioritizing** — STATUS: SKIP
 
 - **Repo:** https://github.com/CompSciLauren/awesome-git-hooks (1.17k★, confirmed top hit)
 - **Fit assessment: honestly weak.** This list catalogs **individual, atomic, copy-paste hook
@@ -185,18 +193,17 @@ each is the highest-signal list under that name.
 
 ---
 
-## 3. Listing copy — AlternativeTo, OpenAlternative, LibHunt, StackShare, Product Hunt
+## 3. Listing copy — AlternativeTo, OpenAlternative, LibHunt, StackShare, Product Hunt — STATUS: APPROVED (all 5, locked by RJ 2026-07-28)
 
-Every field below traces to a specific repo line, cited inline. Positioning line uses
-`{{POSITIONING_LINE}}` (see §1).
+Every field below traces to a specific repo line, cited inline. Positioning line is "Nothing ships unproven." throughout (RJ's decision, §1).
 
-### 3.1 AlternativeTo
+### 3.1 AlternativeTo — STATUS: APPROVED
 
 | Field | Value | Source |
 |---|---|---|
 | Name | Heimdall | `IDENTITY.md:7` |
 | Website | https://runheimdall.dev | `IDENTITY.md:12` |
-| Tagline | {{POSITIONING_LINE}} | §1 |
+| Tagline | Nothing ships unproven. | §1 |
 | Description | "A Claude Code plugin that gates every AI-generated change behind an external, falsifiable correctness oracle — the implementing agent never sees the check that grades it. Ships a hosted mode (`rr`) that opens a scoped, human-reviewed PR on your own GitHub repo using your own Claude subscription and GitHub App install (BYOC — no shared keys). Two flagship verification gates are proven able to fail (falsifiability score 1.0 on `exchange-lob` and `emulator-gb`); a 13-case regression corpus catches 100% of its recorded failure cases at v0.1. MIT-licensed, self-hostable." | `README.md:1-37`, `evals/flagship/STATUS.md:21-26`, `evals/corpus/CORPUS-STATUS.md:10`, `LICENSE:1` |
 | Categories | Developer Tools, Code Review, AI Coding Assistants | inferred from feature set |
 | Platforms | macOS, Linux (bash 3.2 compatible per `PROTOCOL.md:59`); Windows not documented as supported | `PROTOCOL.md:59` — no Windows mention found anywhere in the docs read |
@@ -211,12 +218,12 @@ reads similarly to that category), but I found no in-repo comparison table or be
 against any named competitor, so I did not write a direct "alternative to X" claim. If RJ
 wants that framing, it needs a real comparison, not an assumption from me.
 
-### 3.2 OpenAlternative
+### 3.2 OpenAlternative — STATUS: APPROVED
 
 | Field | Value | Source |
 |---|---|---|
 | Name | Heimdall | `IDENTITY.md:7` |
-| Tagline | {{POSITIONING_LINE}} | §1 |
+| Tagline | Nothing ships unproven. | §1 |
 | Website | https://runheimdall.dev | `IDENTITY.md:12` |
 | GitHub | https://github.com/randomittin/heimdall | `IDENTITY.md:8` |
 | Category | Developer Tools / AI Coding | — |
@@ -224,33 +231,33 @@ wants that framing, it needs a real comparison, not an assumption from me.
 | "Alternative to" | Same caveat as §3.1 — no in-repo comparison basis for a specific proprietary product. If OpenAlternative's form requires a specific answer, the most defensible honest one is: "an open-source, self-hostable verification layer for AI coding agents, for teams wary of unverifiable AI-authored merges." | derived from `README.md` framing, not a direct product comparison |
 | Description | (same as AlternativeTo §3.1) | — |
 
-### 3.3 LibHunt
+### 3.3 LibHunt — STATUS: APPROVED
 
 | Field | Value | Source |
 |---|---|---|
 | Name | Heimdall | — |
-| Summary | {{POSITIONING_LINE}} | §1 |
+| Summary | Nothing ships unproven. | §1 |
 | Description | "Claude Code plugin + optional hosted bot. Verification gates run via falsifiable external oracles (`evals/oracles/registry.json`); quality gates block `git push` until tests pass, lint is clean, and no secret-scan finding is present (`PARITY.md:99-111`). Token-frugal multi-agent orchestration protocol included (`PROTOCOL.md`)." | as cited |
 | GitHub | https://github.com/randomittin/heimdall | — |
 | Language(s) | Shell (bash), Python, JavaScript/TypeScript — per `REUSE-METRIC.md:92-98`'s supported-stack table, which documents Heimdall's own analyzer's language coverage as a proxy for the repo's own primary languages | `REUSE-METRIC.md:92-98` |
 | Category | Developer Tools | — |
 
-### 3.4 StackShare
+### 3.4 StackShare — STATUS: APPROVED
 
 | Field | Value | Source |
 |---|---|---|
 | Tool name | Heimdall | — |
-| Tagline | {{POSITIONING_LINE}} | §1 |
+| Tagline | Nothing ships unproven. | §1 |
 | Category | Code Review / Utilities (StackShare has no exact "AI verification" category as of what I could infer; "Code Review" is the closest existing StackShare taxonomy bucket for a merge-gating tool) | inferred, flag for RJ to confirm against StackShare's live category list at submission time |
 | Description | "Verification layer for Claude Code: wires an independent, falsifiable oracle into every implementation plan so a PR only opens once a check *proven able to fail* actually passes. Ships `bin/falsify` (mutation-kill scoring) and `bin/corpus` (13-case regression replay, 100% catch-rate at v0.1)." | `README.md:37`, `evals/flagship/STATUS.md:21-26`, `evals/corpus/CORPUS-STATUS.md:10` |
 | Why we use it (pros, for a "stack" writeup) | "Falsifiability is measured, not asserted — every gate has a mutant-kill score before it's trusted (`evals/oracles/README.md:43-49`)." / "Signed auto-updates — releases are minisign-signed and verified before the self-updater applies anything (`SIGNING.md:9-14`)." | as cited |
 
-### 3.5 Product Hunt
+### 3.5 Product Hunt — STATUS: APPROVED
 
 | Field | Value | Source |
 |---|---|---|
 | Product name | Heimdall | — |
-| Tagline (≤60 chars) | `{{POSITIONING_LINE}}` — Candidate A ("Nothing ships unproven.") is 23 characters and fits comfortably; Candidate C is too long for PH's tagline field and would need trimming | §1 |
+| Tagline (≤60 chars) | Nothing ships unproven. (23 characters — fits PH's ≤60-char field comfortably; Candidate C would have needed trimming) | §1 |
 | Description | "Heimdall is a Claude Code plugin that gates AI-generated changes behind falsifiable, external correctness oracles — so 'the tests pass' actually means something. Two flagship gates are proven able to fail (falsifiability 1.0 on an order-book matcher and a Game Boy CPU emulator — see `evals/flagship/STATUS.md`), and a growing regression corpus makes sure a bug that was ever caught can't ship silently again. An optional hosted bot (`rr`) opens scoped, human-reviewed PRs on your own repo using your own Claude subscription and GitHub App install — you review, you merge, it never touches `main` directly and never self-merges (`README.md:5,30`)." | as cited |
 | Topics/tags | Developer Tools, AI, Open Source, Claude, DevOps | — |
 | First comment (maker comment) draft | "Hey — maker here. The idea behind Heimdall started from a simple annoyance: an AI agent's own tests are not evidence, because the same agent that wrote the code also wrote (and can rationalize) the tests. So Heimdall's gates are external — a mutation-tested oracle the implementing agent never sees (`evals/oracles/README.md`). We publish our own failures on purpose (`evals/flagship/STATUS.md` keeps the ❌ rows visible) because a verification system that hides its own misses can't be trusted with yours. Everything here is MIT-licensed and the install script is meant to be read before it's run (`less install.sh` before `bash install.sh` — no eval, no base64, per `README.md:51-57`). Happy to answer anything about the oracle design, the falsifiability scoring, or the hosted `rr` bot's tenant-isolation tests." | `evals/oracles/README.md`, `evals/flagship/STATUS.md:154-158`, `README.md:51-57` |
@@ -349,10 +356,11 @@ artifact — flagged so RJ knows which numbers to double check before they go ou
 
 ---
 
-## 7. What RJ needs to do before any item here can move
+## 7. What RJ needs to do before any item here can move — PARTIALLY DONE (2026-07-28)
 
-1. Pick (or write) the canonical positioning line (§1) and swap `{{POSITIONING_LINE}}`
-   everywhere it appears in this file.
+1. Pick (or write) the canonical positioning line (§1) and swap the positioning-line
+   placeholder everywhere it appears in this file. **[DONE 2026-07-28 — Candidate A
+   approved, all placeholders resolved.]**
 2. Decide on the `IDENTITY.md:31` / `README.md:45` "no telemetry" staleness (§0) — at minimum,
    don't let submission copy reuse the old bare phrasing (none of the drafts above do).
 3. Merge (or otherwise land) `DATA.md` onto `main` so the site's existing `DATA.md` link
@@ -362,7 +370,10 @@ artifact — flagged so RJ knows which numbers to double check before they go ou
    this file that isn't fully re-verifiable from committed repo contents).
 5. Decide whether to skip `awesome-git-hooks` (my recommendation, §2.5) and whether to pursue
    `awesome-mcp-servers` narrowly-scoped to `heimdall-ledger-mcp` only (§2.2) rather than the
-   whole product.
+   whole product. **[DONE 2026-07-28 — git-hooks: SKIP. mcp-servers: APPROVED, narrow
+   scope.]**
 6. Confirm what "Layer 1" means and whether it has shipped before lifting the hold on §4.
 7. Approve each section individually — this file intentionally has no single "approve all"
-   switch.
+   switch. **[Status 2026-07-28: §1 APPROVED · §2.1 APPROVED · §2.2 APPROVED (narrow scope) ·
+   §2.3 DEFERRED · §2.4 APPROVED · §2.5 SKIP · §3 APPROVED (all 5). §0 and §4 remain open —
+   not part of this decision round.]**
