@@ -23,6 +23,7 @@ The single map of Heimdall's knowledge tree. Every committed Markdown doc earns 
 | Doc | Purpose | Status |
 | --- | --- | --- |
 | [specs/INDEX.md](specs/INDEX.md) | **Sub-index** — canonical, current design specs (teams, tenancy, isolation). | Load-bearing |
+| [specs/README.md](specs/README.md) | **Sub-index** — chat-originated design specs (chatops, viral-launch plan, S-6 generalization, ship plan, website v2) + the Layer 0/Layer 1 resolution table. | Load-bearing |
 | [../PROTOCOL.md](../PROTOCOL.md) | Heimdall token-frugal protocol (v2.0.0). | Load-bearing |
 | [rr-control-plane-client.md](rr-control-plane-client.md) | `rr --mode control-plane` — the signed enqueue client. | Current |
 | [superpowers/specs/2026-04-06-superx-design.md](superpowers/specs/2026-04-06-superx-design.md) | superx superskill-manager design — referenced by the heimdall skill + agent. | Load-bearing |
