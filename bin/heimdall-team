@@ -41,20 +41,29 @@
 # an existing team.json is read as-is (no reset). New commits only ever land in
 # team.json.
 #
-# THE USER-FACING SURFACE — three commands, total (everything else is internal):
-#   hmd team           SMART DEFAULT: no team -> mint (private commits, public gitignores +
-#                      invites); a PROVEN-private repo whose team.json is UNTRACKED (minted
-#                      before the committed-path feature, or while visibility was momentarily
-#                      indeterminate — gitignored + never committed) -> PROMOTE it to the
-#                      committed/tracked path so clones auto-join (the MIGRATION); else SHOW
-#                      status. Public/unverifiable NEVER commits here (the leak guard).
-#   hmd invite         the one join line to hand a teammate (public repos).
-#   hmd join <secret>  teammate-side manual join (the invite one-liner wraps it).
+# THE USER-FACING SURFACE:
+#   hmd team           SMART DEFAULT. On a GitHub repo with an AUTHENTICATED gh, PREFERS the
+#                      AUTO (GitHub) path: form/join this repo's team from your GitHub access —
+#                      NOTHING to paste (WAVE-3 zero-touch). If AUTO can't run (no gh auth, no
+#                      CP url, severed) or is DENIED (not a collaborator) it falls back to the
+#                      BEARER-SECRET path: no team -> mint (private commits, public gitignores +
+#                      invites); a PROVEN-private repo whose team.json is UNTRACKED -> PROMOTE it
+#                      to the tracked path so clones auto-join (the MIGRATION); else SHOW status.
+#                      Public/unverifiable NEVER commits a secret here (the leak guard).
+#   hmd team auto      Explicitly run the AUTO (GitHub) path now (loud at a TTY). Same engine the
+#                      SessionStart hook runs quietly — forms/joins via GitHub, persists the
+#                      NON-secret team_id, no secret written.
+#   hmd invite         the one join line to hand a teammate. Since same-repo GitHub teammates now
+#                      AUTO-JOIN, invite is only needed for CROSS-REPO / NON-GitHub / air-gapped
+#                      joins (or a public repo the secret path grows out-of-band).
+#   hmd join <secret>  teammate-side manual join for the bearer-secret fallback (invite wraps it).
 #
 # Internal subcommands (not part of the surface; used by SessionStart + tooling):
-#   heimdall-team auto            SessionStart entry: ensure a team + auto-commit
-#                                 it in a verified-PRIVATE repo; gitignore it in a
-#                                 public one; warn on a private->public flip.
+#   heimdall-team auto            SessionStart entry: FIRST the AUTO (GitHub) path — form/join
+#                                 the team from GitHub access + persist the NON-secret team_id
+#                                 (quiet, throttled, idempotent); on success it stops. Else
+#                                 ensure a bearer-secret team + auto-commit it in a verified-
+#                                 PRIVATE repo; gitignore it in a public one; warn on a flip.
 #   heimdall-team new [--force]   mint a team_secret -> team.json (+ commit if the
 #                                 repo is private); print the invite one-liner.
 #   heimdall-team join <secret>   write team.json with a teammate's secret.
@@ -88,9 +97,17 @@ if command -v readlink >/dev/null 2>&1; then
   SELF="$(readlink -f "$0" 2>/dev/null || readlink "$0" 2>/dev/null || echo "$0")"
 fi
 BIN_DIR="$(cd "$(dirname "$SELF")" 2>/dev/null && pwd)"
+LIB_DIR="$BIN_DIR/lib"
 INVITE_CLI="$BIN_DIR/heimdall-invite"
 IDENTITY_CLI="$BIN_DIR/heimdall-identity"
 HAID_CLI="$BIN_DIR/heimdall-haid"
+
+# The control-plane URL + opt-out consent live in ONE place (lib/cp-consent.sh — the SAME
+# source heimdall-presence sources). We reuse it so the AUTO (GitHub) path resolves the exact
+# CP URL presence does and honors the SAME sever/opt-out gate (severed => ZERO egress). Absent
+# lib => the helpers stay undefined and the AUTO path DEFERS to the bearer-secret fallback.
+# shellcheck source=lib/cp-consent.sh
+[ -f "$LIB_DIR/cp-consent.sh" ] && . "$LIB_DIR/cp-consent.sh"
 
 PY="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)"
 [ -n "$PY" ] || { echo "heimdall-team: python3 is required" >&2; exit 2; }
@@ -426,15 +443,300 @@ EOF
   return 0
 }
 
+# ══ AUTO (GitHub) — ZERO-TOUCH team formation via CP POST /team/auto ══════════════
+# WAVE 3: a repo's team FORMS or JOINS automatically from the dev's GitHub ACCESS — no
+# bearer secret to paste. This is the DEFAULT for GitHub repos; the bearer-secret path
+# (new / join <secret> / invite) STAYS as the documented fallback for non-GitHub / air-
+# gapped teams. The two COEXIST in team.json: the AUTO path writes the NON-secret team_id
+# (+ an `auto` marker), never a secret, and preserves any secret the fallback wrote.
+
+# The CP url — flag/env override > shipped cp-endpoint.json > the consent DEFAULT (unless
+# SEVERED). Mirrors heimdall-presence's resolution exactly. Empty => the AUTO path defers.
+resolve_cp_url() {
+  local url="${HEIMDALL_CP_URL:-${BASE_URL:-}}"
+  if [ -z "$url" ] && [ -n "${HOME:-}" ] && [ -f "$HOME/.heimdall/cp-endpoint.json" ]; then
+    url="$(HMD_CFG="$HOME/.heimdall/cp-endpoint.json" "$PY" - <<'PYEOF'
+import json, os, sys
+try:
+    sys.stdout.write(json.load(open(os.environ["HMD_CFG"])).get("url") or "")
+except Exception:
+    sys.stdout.write("")
+PYEOF
+)"
+  fi
+  if [ -z "$url" ] && ! cp_severed; then
+    command -v _cp_consent_url >/dev/null 2>&1 && url="$(_cp_consent_url 2>/dev/null || true)"
+  fi
+  printf '%s' "$url"
+}
+
+# The dev has OPTED OUT of the control plane (persisted sever/decline). Reuses the SAME
+# consent gate presence uses — severed => zero egress. Missing lib => not severed (the
+# AUTO path then still needs a url + gh auth, both of which it verifies).
+cp_severed() {
+  command -v _cp_consent_decision >/dev/null 2>&1 || return 1
+  local d; d="$(_cp_consent_decision 2>/dev/null || true)"
+  [ "$d" = "severed" ] || [ "$d" = "declined" ]
+}
+
+# team.json already carries a GitHub-formed team_id? (idempotency — don't re-POST every
+# SessionStart once formed).
+team_has_auto_id() {
+  [ -f "$TEAM_FILE" ] || return 1
+  HMD_TEAM_FILE="$TEAM_FILE" "$PY" - <<'PYEOF'
+import json, os, sys
+try:
+    d = json.load(open(os.environ["HMD_TEAM_FILE"]))
+    sys.exit(0 if isinstance(d, dict) and d.get("team_id") else 1)
+except Exception:
+    sys.exit(1)
+PYEOF
+}
+
+# Read the GitHub-formed team (team_id<TAB>mode<TAB>project) out of team.json; tabs only if none.
+read_auto() {
+  [ -f "$TEAM_FILE" ] || { printf '\t\t'; return; }
+  HMD_TEAM_FILE="$TEAM_FILE" "$PY" - <<'PYEOF'
+import json, os, sys
+try:
+    d = json.load(open(os.environ["HMD_TEAM_FILE"]))
+    a = d.get("auto") or {}
+    sys.stdout.write((d.get("team_id") or "") + "\t" + (a.get("mode") or "") + "\t" + (a.get("project") or ""))
+except Exception:
+    sys.stdout.write("\t\t")
+PYEOF
+}
+
+# Persist the NON-secret team_id (+ auto marker) into team.json 0600, MERGING so any bearer
+# secret the fallback wrote is PRESERVED (the two coexist). Writes NO secret. `source` stays
+# whatever the secret path set — the auto marker lives under `auto.source == "auto-github"`.
+persist_team_id() { # $1=team_id  $2=mode  $3=project
+  mkdir -p "$TEAM_DIR" 2>/dev/null || { echo "heimdall-team: cannot create $TEAM_DIR" >&2; return 2; }
+  HMD_TID="$1" HMD_MODE="${2:-}" HMD_PROJ="${3:-}" HMD_TEAM_FILE="$TEAM_FILE" "$PY" - <<'PYEOF'
+import json, os, time
+path = os.environ["HMD_TEAM_FILE"]
+try:
+    rec = json.load(open(path))
+    if not isinstance(rec, dict):
+        rec = {}
+except Exception:
+    rec = {}
+rec["team_id"] = os.environ["HMD_TID"]
+rec.setdefault("created", int(time.time()))
+rec["auto"] = {
+    "source": "auto-github",
+    "mode": os.environ.get("HMD_MODE") or "",
+    "project": os.environ.get("HMD_PROJ") or "",
+    "joined": int(time.time()),
+}
+data = json.dumps(rec) + "\n"
+fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+try:
+    os.write(fd, data.encode("utf-8"))
+finally:
+    os.close(fd)
+os.chmod(path, 0o600)
+PYEOF
+}
+
+# THE AUTO PATH. Resolve gh_user (`gh api user`), gh_proof (`gh auth token` — TRANSIT-ONLY:
+# env -> python -> TLS, NEVER argv/logged/persisted), the repo slug + haid, then POST
+# {repo, gh_user, gh_proof, haid, sig?} to {CP}/team/auto. On {ok, team_id, mode} persist the
+# NON-secret team_id and print ONE honest line. RETURNS:
+#   0  formed/joined via GitHub (caller SKIPS the secret path — the GitHub team is authoritative)
+#   3  DEFER — no gh auth / no github remote / no CP url / SEVERED / offline / throttled:
+#      the caller falls through to the bearer-secret fallback (presence still works)
+#   4  DENIED — 403 non-collaborator/read-only, initiate_denied, or enroll_required (actionable
+#      message printed in loud mode); caller falls through to the fallback so the dev is never
+#      left teamless.
+# MODE: loud prints results (interactive `hmd team` / `hmd team auto` at a TTY); quiet stays
+# silent (SessionStart), is idempotent (skips once formed) and throttled. The gh token NEVER
+# touches argv, a log, an error string, or team.json.
+gh_auto() { # $1 = loud|quiet
+  local MODE="${1:-quiet}"
+  # opt-out / sever gate — no gh call, no network when the dev has said no.
+  [ "${HEIMDALL_NO_TEAM_AUTOSHARE:-0}" = "1" ] && return 3
+  [ -n "${HOME:-}" ] && [ -f "$HOME/.heimdall/no-team-autoshare" ] && return 3
+  cp_severed && return 3
+  # idempotent at SessionStart: already GitHub-formed -> nothing to do (no repeat POST).
+  [ "$MODE" = quiet ] && team_has_auto_id && return 0
+  # need a github remote slug.
+  local ORIGIN SLUG
+  ORIGIN="$(git remote get-url origin 2>/dev/null || true)"
+  SLUG="$(github_slug_of "$ORIGIN")"
+  [ -n "$SLUG" ] || return 3
+  # need an AUTHENTICATED gh — the PROOF. Absent/unauth -> DEFER (also the hermetic-test path).
+  command -v gh >/dev/null 2>&1 || return 3
+  local GH_PROOF GH_USER
+  GH_PROOF="$(gh auth token 2>/dev/null || true)"
+  [ -n "$GH_PROOF" ] || return 3
+  GH_USER="$(gh api user --jq .login 2>/dev/null || true)"
+  [ -n "$GH_USER" ] || return 3
+  # a CP url must resolve (flag/env/config/consent-default). None -> defer.
+  local URL; URL="$(resolve_cp_url)"
+  [ -n "$URL" ] || return 3
+  # SessionStart THROTTLE: a denied/failed repo must not POST every session.
+  if [ "$MODE" = quiet ]; then
+    local st="$HOME/.heimdall/.team-gh-auto-stamp" iv="${HEIMDALL_TEAM_GH_AUTO_THROTTLE:-86400}"
+    if [ -f "$st" ]; then
+      local now mt
+      now="$(date +%s 2>/dev/null || echo 0)"
+      mt="$(stat -f %m "$st" 2>/dev/null || stat -c %Y "$st" 2>/dev/null || echo 0)"
+      [ "$((now - mt))" -lt "$iv" ] && return 3
+    fi
+    mkdir -p "$HOME/.heimdall" 2>/dev/null && : > "$st" 2>/dev/null || true
+  fi
+  # identity + the OPTIONAL signing seed (sig rides only if this dev is already enrolled).
+  local IDENT HAID HAID_SLUG SEED_FILE=""
+  IDENT="$(current_identity)"; HAID="${IDENT%%$'\t'*}"
+  if [ -n "${HOME:-}" ] && [ -n "$HAID" ]; then
+    HAID_SLUG="$(printf '%s' "$HAID" | tr '/:' '__')"
+    SEED_FILE="$HOME/.heimdall/pki/$HAID_SLUG.seed"
+  fi
+  # POST — gh_proof crosses to python via ENV ONLY (never argv), rides the JSON body over TLS,
+  # and is NEVER echoed. python prints 6 secret-free lines: status, ok, team_id, mode, project, reason.
+  local RES
+  RES="$(HMD_URL="$URL" HMD_REPO="$SLUG" HMD_GH_USER="$GH_USER" HMD_GH_PROOF="$GH_PROOF" \
+         HMD_HAID="$HAID" HMD_SEED_FILE="$SEED_FILE" HMD_LIB="$LIB_DIR" "$PY" - <<'PYEOF'
+import json, os, sys
+import urllib.error
+import urllib.request
+
+url = os.environ["HMD_URL"].rstrip("/")
+# The base body the OPTIONAL signature covers (sig is appended AFTER, last key, so the server
+# strips it and re-serializes the remainder in the SAME order to verify).
+base = {
+    "repo": os.environ["HMD_REPO"],
+    "gh_user": os.environ["HMD_GH_USER"],
+    "gh_proof": os.environ["HMD_GH_PROOF"],
+    "haid": os.environ.get("HMD_HAID") or "",
+}
+body = json.dumps(base, separators=(",", ":")).encode("utf-8")
+seed_file = os.environ.get("HMD_SEED_FILE") or ""
+lib = os.environ.get("HMD_LIB") or ""
+if seed_file and os.path.exists(seed_file) and lib:
+    try:
+        sys.path.insert(0, lib)
+        import cp_auth as K
+        if K.crypto_available():
+            with open(seed_file, "r", encoding="utf-8") as fh:
+                seed = fh.read().strip()
+            if seed:
+                sig = K.sign(seed, K.canonical_message("POST", "/team/auto", body))
+                signed = dict(base)
+                signed["sig"] = sig
+                body = json.dumps(signed, separators=(",", ":")).encode("utf-8")
+    except Exception:
+        body = json.dumps(base, separators=(",", ":")).encode("utf-8")
+
+req = urllib.request.Request(url + "/team/auto", data=body, method="POST")
+req.add_header("Content-Type", "application/json")
+haid = os.environ.get("HMD_HAID") or ""
+if haid:
+    req.add_header("X-Heimdall-HAID", haid)
+status, out = 0, {}
+try:
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        raw = resp.read()
+        status = resp.status
+        out = json.loads(raw) if raw else {}
+except urllib.error.HTTPError as exc:
+    status = exc.code
+    try:
+        raw = exc.read()
+        out = json.loads(raw) if raw else {}
+    except Exception:
+        out = {}
+except Exception:
+    status, out = 0, {}
+
+
+def field(k):
+    v = out.get(k)
+    return "" if v is None else str(v)
+
+
+sys.stdout.write("\n".join([
+    str(status),
+    "1" if out.get("ok") else "0",
+    field("team_id"),
+    field("mode"),
+    field("project"),
+    field("reason") or field("error"),
+]) + "\n")
+PYEOF
+)"
+  local STATUS OKF TEAM_ID TMODE PROJECT REASON
+  STATUS="$(printf '%s\n' "$RES" | sed -n '1p')"
+  OKF="$(printf '%s\n'   "$RES" | sed -n '2p')"
+  TEAM_ID="$(printf '%s\n' "$RES" | sed -n '3p')"
+  TMODE="$(printf '%s\n'  "$RES" | sed -n '4p')"
+  PROJECT="$(printf '%s\n' "$RES" | sed -n '5p')"
+  REASON="$(printf '%s\n' "$RES" | sed -n '6p')"
+
+  if [ "$OKF" = "1" ] && [ -n "$TEAM_ID" ]; then
+    persist_team_id "$TEAM_ID" "$TMODE" "$PROJECT"
+    if [ "$MODE" = loud ]; then
+      case "$TMODE" in
+        initiated) printf 'Initiated the team for %s via GitHub — teammates with repo access auto-join (nothing to paste).\n' "$SLUG" ;;
+        joined)    printf "Joined %s's team via GitHub (team_id %s).\n" "$SLUG" "$TEAM_ID" ;;
+        *)         printf 'Formed the team for %s via GitHub (team_id %s).\n' "$SLUG" "$TEAM_ID" ;;
+      esac
+    fi
+    return 0
+  fi
+
+  # transport failure -> DEFER (offline is not a hard error; the secret path still works).
+  if [ "${STATUS:-0}" = "0" ]; then
+    [ "$MODE" = loud ] && printf "heimdall-team: couldn't reach the control plane to auto-form %s's team — falling back to the local team.\n" "$SLUG"
+    return 3
+  fi
+  # DENIED — actionable, never leaks the token or the reason verbatim beyond the known codes.
+  case "$REASON" in
+    *non*collaborator*|*read*only*|*read-only*|*forbidden*|*not*collaborator*)
+      if [ "$MODE" = loud ]; then
+        printf 'heimdall-team: GitHub says you lack write (collaborator) access to %s, so I cannot auto-join you to its team.\n' "$SLUG"
+        printf '  Ask a repo admin to add you, then rerun  hmd team  — or start your OWN team with:  hmd team new\n'
+      fi
+      return 4 ;;
+    initiate_denied)
+      if [ "$MODE" = loud ]; then
+        printf 'heimdall-team: the control plane declined to initiate a team for %s (initiate_denied).\n' "$SLUG"
+        printf '  Start one explicitly with:  hmd team new    (then grow it with:  hmd invite)\n'
+      fi
+      return 4 ;;
+    enroll_required)
+      if [ "$MODE" = loud ]; then
+        printf "heimdall-team: %s's team needs an explicit enroll first (enroll_required).\n" "$SLUG"
+        printf '  Run:  hmd team new    (or ask the owner to send you:  hmd invite)\n'
+      fi
+      return 4 ;;
+  esac
+  if [ "${STATUS:-0}" = "403" ]; then
+    if [ "$MODE" = loud ]; then
+      printf 'heimdall-team: GitHub access check failed for %s (HTTP 403) — I cannot auto-join you.\n' "$SLUG"
+      printf '  Ask for collaborator access, or start your own team with:  hmd team new\n'
+    fi
+    return 4
+  fi
+  # any other non-ok -> defer to the secret path (never leave the dev teamless).
+  [ "$MODE" = loud ] && printf 'heimdall-team: auto team formation for %s did not complete (status %s%s) — falling back to the local team.\n' "$SLUG" "${STATUS:-?}" "$([ -n "$REASON" ] && printf ', %s' "$REASON")"
+  return 3
+}
+
 # ── `hmd team auto` — the zero-COMMAND SessionStart entry ─────────────────────────
-# ALWAYS ensures a team.json so presence works with no command at all; then, when the
-# repo is VERIFIABLY PRIVATE, commits it (tracked -> collaborators auto-join); when
-# PUBLIC/indeterminate, gitignores it (never commit a secret). Warns on a flip. Never
-# pushes, never blocks, idempotent. Opt out: HEIMDALL_NO_TEAM_AUTOSHARE=1 or
-# ~/.heimdall/no-team-autoshare.
+# FIRST attempts the AUTO (GitHub) path — success => the GitHub team is authoritative and NO
+# bearer secret is written (skip the ensure below); DEFER/DENY => fall through so presence still
+# works zero-config. Then, when the repo is VERIFIABLY PRIVATE, commits team.json (tracked ->
+# collaborators auto-join); when PUBLIC/indeterminate, gitignores it (never commit a secret).
+# Warns on a flip. Never pushes, never blocks, idempotent. Opt out: HEIMDALL_NO_TEAM_AUTOSHARE=1
+# or ~/.heimdall/no-team-autoshare. loud at a TTY (a human ran `hmd team auto`), quiet otherwise.
 cmd_auto() {
   [ "${HEIMDALL_NO_TEAM_AUTOSHARE:-0}" = "1" ] && exit 0
   [ -f "$HOME/.heimdall/no-team-autoshare" ] && exit 0
+  local _amode=quiet
+  { [ -t 1 ] || [ -n "${HMD_TEAM_AUTO_LOUD:-}" ]; } && _amode=loud
+  if gh_auto "$_amode"; then exit 0; fi
   # capture heimdall-ACTIVE *before* our own solo mint (else we'd mark ourselves active).
   local active=0 m
   for m in "$TEAM_FILE" "$TEAM_DIR/identity.json" .planning/heimdall-state.json heimdall-state.json superx-state.json; do
@@ -492,21 +794,55 @@ cmd_status() { # $@ passed through (--json)
     esac
   done
   local INFO SOURCE CREATED SRCPATH SECRET TID VIS TRACKED MODE OWNER OH OHNAME
+  local AUTO AUTO_TID AUTO_MODE AUTO_PROJ
   INFO="$(_resolve info)"
   SOURCE="$(printf '%s' "$INFO" | sed -n '1p')"
   CREATED="$(printf '%s' "$INFO" | sed -n '2p')"
   SRCPATH="$(printf '%s' "$INFO" | sed -n '3p')"
   SECRET="$(_resolve secret)"
+  # The GitHub-formed (AUTO) team — a NON-secret team_id that COEXISTS with any bearer secret.
+  AUTO="$(read_auto)"
+  AUTO_TID="$(printf '%s' "$AUTO" | cut -f1)"
+  AUTO_MODE="$(printf '%s' "$AUTO" | cut -f2)"
+  AUTO_PROJ="$(printf '%s' "$AUTO" | cut -f3)"
 
   if [ -z "$SECRET" ]; then
+    # No bearer secret — but a GitHub-formed team_id means the repo IS on a team (the AUTO path).
+    if [ -n "$AUTO_TID" ]; then
+      if [ -n "$AS_JSON" ]; then
+        HMD_TEAM_TID="$AUTO_TID" HMD_TEAM_MODE="$AUTO_MODE" HMD_TEAM_PROJ="$AUTO_PROJ" \
+        HMD_TEAM_FILE="$TEAM_FILE" "$PY" - <<'PYEOF'
+import json, os
+print(json.dumps({
+    "configured": True,
+    "source": "auto-github",
+    "team_id": os.environ["HMD_TEAM_TID"],
+    "owner": None,
+    "mode": "auto-github (" + (os.environ.get("HMD_TEAM_MODE") or "formed") + ")",
+    "project": os.environ.get("HMD_TEAM_PROJ") or None,
+    "created": None,
+    "path": os.environ["HMD_TEAM_FILE"],
+}))
+PYEOF
+      else
+        printf 'configured: yes (via GitHub — no secret to manage)\n'
+        printf 'team_id:    %s\n' "$AUTO_TID"
+        printf 'mode:       auto-github (%s)\n' "${AUTO_MODE:-formed}"
+        [ -n "$AUTO_PROJ" ] && printf 'project:    %s\n' "$AUTO_PROJ"
+        printf 'grow:       teammates with GitHub access to this repo AUTO-JOIN (nothing to share).\n'
+        printf 'fallback:   for cross-repo / non-GitHub teammates use:  hmd invite\n'
+      fi
+      exit 0
+    fi
     if [ -n "$AS_JSON" ]; then
       printf '{"configured": false, "source": null, "team_id": null, "owner": null, "mode": "none", "created": null, "path": "%s"}\n' "$TEAM_FILE"
     else
       printf 'configured: no\n'
       printf 'No team is configured for this repo yet.\n'
-      printf 'One is auto-minted on your first heimdall session; then:\n'
-      printf '  private repo -> committed team.json, collaborators auto-join on clone.\n'
-      printf '  public repo  -> grow the team with:  hmd invite\n'
+      printf 'DEFAULT (GitHub repos): a team forms automatically from your GitHub access —\n'
+      printf '  run  hmd team  (or it happens on your next heimdall session). Nothing to paste.\n'
+      printf 'FALLBACK (non-GitHub / air-gapped): mint a bearer-secret team explicitly:\n'
+      printf '  hmd team new     then grow it with:  hmd invite\n'
     fi
     exit 0
   fi
@@ -551,11 +887,14 @@ PYEOF
     printf 'visibility: %s\n' "$VIS"
     [ -n "$CREATED" ] && printf 'created:    %s\n' "$CREATED"
     printf 'store:      %s\n' "$SRCPATH"
+    [ -n "$AUTO_TID" ] && printf 'github:     also GitHub-formed (team_id %s) — repo-access teammates auto-join.\n' "$AUTO_TID"
     if [ "$TRACKED" = "yes" ]; then
       printf 'grow:       collaborators AUTO-JOIN on clone/pull (nothing to share).\n'
     else
       printf 'grow:       hand a teammate:  hmd invite\n'
     fi
+    printf 'note:       GitHub repos form teams automatically (hmd team); this bearer-secret\n'
+    printf '            path is the FALLBACK for cross-repo / non-GitHub joins.\n'
     printf '(the team secret is never printed — see %s)\n' "$SRCPATH"
   fi
   # A flip (tracked + public) is the one loud, always-shown warning.
@@ -619,6 +958,14 @@ EOF
 #                                commits here (do_share hard-refuses regardless) — the cardinal
 #                                leak guard: a bearer secret must never land in a public tree.
 cmd_dispatch() {
+  # PREFER the AUTO (GitHub) path when gh is authenticated + a github remote exists: a repo's
+  # team forms/joins from GitHub access with nothing to paste (the WAVE-3 default). It DEFERS
+  # (rc 3) when gh is absent/unauthenticated, no CP url resolves, or the dev is severed, and
+  # DENIES (rc 4) for a non-collaborator — either way we fall through to the bearer-secret path,
+  # the documented fallback (mint / promote-if-private / show). loud: this is an interactive run.
+  local grc
+  gh_auto loud; grc=$?
+  [ "$grc" = 0 ] && exit 0
   local SECRET
   SECRET="$(_resolve secret)"
   if [ -z "$SECRET" ]; then
