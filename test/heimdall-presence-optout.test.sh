@@ -42,6 +42,10 @@ BIN="$REPO/bin/heimdall-presence"
 LIB="$REPO/bin/lib"
 SL="$REPO/sentinels/hmd-statusline.py"
 export LIB REPO
+# DEFAULT-ON egress guard: pin the baked-in CP default at a dead port so no un-pinned presence
+# call (e.g. `off`, which emits a retire beat) resolves the REAL production control plane under
+# an undecided consent. Explicit per-invocation HEIMDALL_CP_URL/--url pins still win.
+. "$REPO/test/lib/net-default-guard.sh"
 
 PY="$(command -v python3 || command -v python || true)"
 [ -n "$PY" ] || { echo "FATAL: python not found" >&2; exit 2; }

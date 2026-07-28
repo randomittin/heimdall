@@ -69,12 +69,13 @@ SELF="$SELF_DIR/heimdall-presence"   # this bin, resolved dynamically (the keepe
 REPO="$(cd "$SELF_DIR/.." && pwd)"
 LIB="$REPO/bin/lib"
 
-# ── control-plane URL + opt-in consent (SINGLE SOURCE OF TRUTH) ──────────────────
+# ── control-plane URL + opt-out consent (SINGLE SOURCE OF TRUTH) ──────────────────
 # Sourced: the canonical public CP URL literal ($HEIMDALL_DEFAULT_CP_URL) + the consent
 # store helpers (_cp_consent_decision / _cp_consent_url / _write_cp_consent). The gate
-# below resolves the baked-in default ONLY when the dev has explicitly opted in — so an
-# undecided/declined dev NEVER phones the control plane (fail-safe DEFAULT OFF). If the lib
-# is somehow absent, DEFAULT stays empty -> offline degrade (still fail-safe).
+# below resolves the baked-in default UNLESS the dev has explicitly opted OUT — so presence
+# is ON BY DEFAULT (undecided/connected phone the control plane; only a persisted DECLINE
+# withholds the URL, yielding zero egress). If the lib is somehow absent, DEFAULT stays empty
+# -> offline degrade (fail-safe toward silence).
 # shellcheck source=lib/cp-consent.sh
 [ -f "$LIB/cp-consent.sh" ] && . "$LIB/cp-consent.sh"
 HAID_CLI="$SELF_DIR/heimdall-haid"
@@ -324,15 +325,18 @@ fi
 [ -n "$URL" ] || URL="$CFG_URL"
 # Canonical public-surface URL (sourced from lib/cp-consent.sh — the ONE place the literal
 # lives). NOT a secret (a public --allow-unauthenticated Cloud Run endpoint). It is the
-# value `connect` persists and the value the OPT-IN gate resolves to when connected.
+# value `connect` persists and the value the opt-OUT gate resolves by DEFAULT (unless severed).
 DEFAULT_CP_URL="${HEIMDALL_DEFAULT_CP_URL:-}"
-# OPT-IN GATE (fail-safe DEFAULT OFF): the baked-in public CP is resolved ONLY when the dev
-# has EXPLICITLY opted in (persisted {"decision":"connected"} in ~/.heimdall/cp-consent.json).
-# Undecided OR declined => URL stays EMPTY => presence degrades to LOCAL/offline (empty roster,
-# no-op beat) below — nothing is ever sent to the control plane unasked. An explicit
-# --url / $HEIMDALL_CP_URL / $BASE_URL / cp-endpoint.json already won above (install-time or
-# power-user consent), so this gate only governs the ZERO-config default path.
-if [ -z "$URL" ] && [ "$(_cp_consent_decision 2>/dev/null)" = "connected" ]; then
+# OPT-OUT GATE (DEFAULT ON): the baked-in public CP is resolved for the ZERO-config default
+# path UNLESS the dev has EXPLICITLY opted out (persisted {"decision":"severed"} — or the legacy
+# {"decision":"declined"} from the old `disconnect` name — in ~/.heimdall/cp-consent.json).
+# Undecided => ON (auto-connect); connected => ON (stored/default url); SEVERED/declined => URL
+# stays EMPTY => presence degrades to LOCAL/offline (empty roster, no-op beat, NO enroll) below
+# => ZERO network egress. That empty-URL degrade (a few lines down) IS the privacy guarantee:
+# sever and NOTHING leaves this machine. An explicit --url / $HEIMDALL_CP_URL / $BASE_URL /
+# cp-endpoint.json already won above.
+_CP_DECISION="$(_cp_consent_decision 2>/dev/null)"
+if [ -z "$URL" ] && [ "$_CP_DECISION" != "severed" ] && [ "$_CP_DECISION" != "declined" ]; then
   URL="$(_cp_consent_url 2>/dev/null)"
 fi
 ENROLL_TOKEN="$CFG_TOKEN"   # the bootstrap enroll credential (config-only; never derived).
@@ -1005,7 +1009,7 @@ case "$SUB" in
     # OPT IN to the live control plane (the affirmative decision). Persist {connected, url}
     # so THIS and every future session auto-resolves the URL with zero re-prompt, then state
     # exactly what is shared (privacy) and send a first beat so the dev appears immediately.
-    # --url overrides the canonical default (a self-hosted CP). Reversible: `disconnect`.
+    # --url overrides the canonical default (a self-hosted CP). Reversible: `sever`.
     CU="${URL:-$DEFAULT_CP_URL}"
     if [ -z "$CU" ]; then
       echo "presence connect: no control-plane URL available (canonical default missing and no --url given)" >&2
@@ -1016,7 +1020,7 @@ case "$SUB" in
       printf '  url:     %s\n' "$CU"
       printf '  shared with your team (holders of this repo team secret): your HAID, online\n'
       printf '           status, and edit activity (current filename + verdict) — never file contents.\n'
-      printf '  future sessions auto-connect (no re-prompt). Reversible: hmd presence disconnect\n'
+      printf '  future sessions auto-connect (no re-prompt). Reversible: hmd presence sever\n'
       # Best-effort first beat — a fresh sub-invocation re-resolves the URL from the consent
       # we just wrote, so the dev shows up now (silent-safe; offline just no-ops).
       # HMD_CP_CONNECT_NO_BEAT skips it (hermetic tests assert persistence without a live beat).
@@ -1026,16 +1030,18 @@ case "$SUB" in
       exit 1
     fi
     ;;
-  disconnect)
-    # OPT OUT of the control plane (persisted DECLINE). Retire from teammates' walls NOW
-    # (best-effort — uses the URL still resolved from the prior consent), then persist the
-    # decline so presence stays LOCAL and is NEVER re-prompted. Re-enable with `connect`.
+  sever|disconnect)
+    # SEVER the Bifröst — the true-zero-egress opt-out (persisted {"decision":"severed"}). Retire
+    # from teammates' walls NOW (best-effort — uses the URL still resolved from the prior consent),
+    # then persist the sever so the CP URL stops resolving: NO beat, NO roster, NO enroll — nothing
+    # leaves this machine — and NEVER re-prompted. Re-enable with `connect`. `disconnect` is a
+    # hidden back-compat alias of `sever` (identical effect + persisted state).
     _try_retire
-    if _write_cp_consent '{"decision": "declined"}'; then
-      printf 'presence: DISCONNECTED from the control plane — local-only. No data leaves this machine.\n'
+    if _write_cp_consent '{"decision": "severed"}'; then
+      printf 'presence: SEVERED from the control plane — local-only. ZERO egress: no beat, no roster, no enroll leaves this machine.\n'
       printf '  you will not be prompted again. Re-enable anytime: hmd presence connect\n'
     else
-      echo "presence disconnect: could not persist the consent decision ($(_cp_consent_file))" >&2
+      echo "presence sever: could not persist the consent decision ($(_cp_consent_file))" >&2
       exit 1
     fi
     ;;
@@ -1052,41 +1058,44 @@ case "$SUB" in
       printf '  url:       (none — presence is LOCAL/offline; not contacting the control plane)\n'
     fi
     case "$D" in
-      connected) printf '  effect:    ON — presence beats to the control plane (your team can see you). Reversible: hmd presence disconnect\n' ;;
-      declined)  printf '  effect:    OFF — declined; no beats leave this machine. Re-enable: hmd presence connect\n' ;;
+      connected)      printf '  effect:    ON — presence beats to the control plane (your team can see you). Reversible: hmd presence sever\n' ;;
+      severed|declined) printf '  effect:    OFF — severed; ZERO egress, no beat/roster/enroll leaves this machine. Re-enable: hmd presence connect\n' ;;
       *)         if [ -n "$URL" ]; then
-                   printf '  effect:    ON via an explicit override ($HEIMDALL_CP_URL / --url / cp-endpoint.json).\n'
+                   printf '  effect:    ON — default on (undecided). Opt out: hmd presence sever (disables team/cloud)\n'
                  else
-                   printf '  effect:    OFF — undecided, default off (fail-safe). Enable: hmd presence connect\n'
+                   printf '  effect:    OFF — no control-plane URL resolves (severed or offline).\n'
                  fi ;;
     esac
     ;;
   connect-prompt)
-    # The ONE-TIME opt-in gate (wired into SessionStart). NEVER blocks a session.
-    #   • already decided (connected/declined)     -> respect it, exit silent (no re-prompt).
-    #   • an explicit URL override already resolves -> effectively connected, exit silent.
-    #   • UNDECIDED + a real TTY (or HMD_CP_PROMPT_FORCE) -> the [y/N] prompt; y -> connect,
-    #     anything else -> persist a DECLINE (never nag again).
-    #   • UNDECIDED + non-interactive -> DEFAULT OFF + a throttled one-line hint; persist
-    #     NOTHING so a later interactive session can still prompt.
+    # The ONE-TIME opt-OUT disclosure (wired into SessionStart). NEVER blocks a session.
+    # Presence is ON BY DEFAULT; this only DISCLOSES that and offers the opt-out.
+    #   • already decided (connected/severed/declined) -> respect it, exit silent (no re-prompt).
+    #   • an explicit URL override already resolves  -> honored as consent, exit silent.
+    #   • UNDECIDED + a real TTY (or HMD_CP_PROMPT_FORCE) -> [Y = keep on / n = disable]; n ->
+    #     sever (persist the opt-out), anything else -> connect (pin the opt-in).
+    #   • UNDECIDED + non-interactive -> stays ON (DEFAULT) + a throttled one-line opt-out
+    #     notice; persist NOTHING so a later interactive session can still pin a decision.
     D="$(_cp_consent_decision)"
     if [ -n "$D" ]; then exit 0; fi
-    if [ -n "$URL" ]; then exit 0; fi
+    # An EXPLICIT url override (env / cp-endpoint.json) is itself consent -> stay silent (never
+    # nag a power-user who already pointed presence somewhere). NOTE: with DEFAULT ON, $URL is
+    # now non-empty for UNDECIDED too (the baked-in CP resolves), so we test the OVERRIDE
+    # sources directly — testing $URL would wrongly swallow the first-run opt-out notice.
+    if [ -n "${HEIMDALL_CP_URL:-}" ] || [ -n "${BASE_URL:-}" ] || [ -n "$CFG_URL" ]; then exit 0; fi
     if { [ -t 0 ] && [ -t 1 ]; } || [ -n "${HMD_CP_PROMPT_FORCE:-}" ]; then
-      printf 'Point Heimdall presence at the live control plane?\n' >&2
-      printf 'Your HAID, online status, and edit activity (current filename + verdict) become visible\n' >&2
-      printf 'to your team (holders of this repo team secret) — never file contents.\n' >&2
-      printf '[y/N] ' >&2
+      printf 'Keep Heimdall presence ON? It shares your HAID, online status, and edit activity\n' >&2
+      printf '(current filename + verdict) with your team (holders of this repo team secret) —\n' >&2
+      printf 'never file contents.\n' >&2
+      printf '[Y = keep on / n = disable] ' >&2
       _ans=""; IFS= read -r _ans 2>/dev/null || _ans=""
       case "$_ans" in
-        y|Y|yes|YES|Yes) exec "$SELF" connect ;;
-        *) _write_cp_consent '{"decision": "declined"}'
-           printf 'presence: staying local-only. (hmd presence connect to enable later)\n' >&2 ;;
+        n|N|no|NO|No) exec "$SELF" sever ;;
+        *) exec "$SELF" connect ;;
       esac
-      exit 0
     fi
     if _cp_hint_throttled; then
-      printf '[heimdall] presence is local-only. Share your online status + edits with your team: hmd presence connect\n'
+      printf '[heimdall] presence is ON — your online status + edits (filename + verdict, never file contents) are shared with your team. hmd presence sever — disables team/cloud.\n'
     fi
     exit 0
     ;;
@@ -1164,7 +1173,8 @@ heimdall-presence — server-synced team presence (with consent opt-out)
   heimdall-presence connect [--url U] OPT IN to the live control plane: persist the decision +
                                       URL so every future session auto-connects (no re-prompt),
                                       state what is shared, and beat once so you appear now.
-  heimdall-presence disconnect        OPT OUT: retire now + persist a decline (never re-prompted).
+  heimdall-presence sever             OPT OUT (true zero egress): retire now + empty the CP URL so
+                                      NO beat/roster/enroll leaves this machine (never re-prompted).
                                       Presence stays LOCAL. Re-enable with connect.
   heimdall-presence cp-status         print the control-plane opt-in decision + resolved URL.
   heimdall-presence beat              send a heartbeat for this repo's project + identity
@@ -1203,16 +1213,16 @@ starts/stops with your session (paths resolve dynamically — no hardcoding):
   }
 Or just run install.sh, which registers the plugin whose shipped hooks call them for you.
 
-OPT-IN (fail-safe DEFAULT OFF): presence contacts the live control plane ONLY after you opt
-in. Until then — undecided or after `disconnect` — NO URL resolves, so every beat is a no-op
-and nothing leaves this machine. `connect` persists {connected, url} to ~/.heimdall/cp-consent.json
-(0600) so future sessions auto-connect with no re-prompt; `disconnect` persists a decline and
-you are never prompted again; `cp-status` shows the current decision + URL. On session start an
-UNDECIDED dev with a TTY is prompted ONCE (connect-prompt); a non-interactive session prints a
-single throttled hint and stays off. An explicit --url / $HEIMDALL_CP_URL / cp-endpoint.json
-still connects directly (install-time / power-user consent — the gate governs only the
-zero-config default). The consent decision is per-USER (~/.heimdall); the visibility toggles
-below (on/off/--no-files) are per-REPO and layer on top.
+OPT-OUT (DEFAULT ON): presence contacts the live control plane BY DEFAULT — an undecided or
+`connect`ed dev resolves the baked-in CP URL and beats. Opt out with `sever`: it persists the
+opt-out so NO URL resolves, every beat is a no-op, roster degrades to empty WITHOUT a wire
+call, and NOTHING leaves this machine (zero egress). `connect` pins the opt-in +{url} to
+~/.heimdall/cp-consent.json (0600); `cp-status` shows the current decision + URL. On session
+start an UNDECIDED dev sees the opt-out disclosure ONCE (connect-prompt): a TTY gets a
+[Y = keep on / n = disable] choice, a non-interactive session prints a single throttled one-line
+notice and stays ON. An explicit --url / $HEIMDALL_CP_URL / cp-endpoint.json is honored as-is.
+The consent decision is per-USER (~/.heimdall); the visibility toggles below (on/off/--no-files)
+are per-REPO and layer on top.
 
 CONSENT: OFF = zero beats (a stat-only no-op — a cron/hook can't leak around it) AND a retire
 beat so you vanish from teammates' walls promptly, not after the TTL. OFF is invisible, NOT
@@ -1230,5 +1240,5 @@ dev exports NOTHING. Overrides still win:
 Offline/unconfigured degrades cleanly (empty roster, no-op beat, exit 0).
 USAGE
     ;;
-  *) echo "heimdall-presence: unknown subcommand '$SUB' (try: connect | disconnect | cp-status | beat | roster | on | off | status | retire | activity | doctor | keeper-start | keeper-stop)" >&2; exit 2 ;;
+  *) echo "heimdall-presence: unknown subcommand '$SUB' (try: connect | sever | cp-status | beat | roster | on | off | status | retire | activity | doctor | keeper-start | keeper-stop)" >&2; exit 2 ;;
 esac

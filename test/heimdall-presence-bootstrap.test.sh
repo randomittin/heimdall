@@ -31,6 +31,9 @@ SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$SELF_DIR/.." && pwd)"
 BIN="$REPO/bin/heimdall-presence"
 LIB="$REPO/bin/lib"
+# DEFAULT-ON egress guard: pin the baked-in CP default at a dead port so no un-pinned presence
+# call in this suite resolves the REAL production control plane. Explicit per-invocation pins win.
+. "$REPO/test/lib/net-default-guard.sh"
 
 PY="$(command -v python3 || command -v python || true)"
 [ -n "$PY" ] || { echo "FATAL: python not found" >&2; exit 2; }
@@ -418,27 +421,32 @@ else
   echo "A-E SKIPPED: no Ed25519 backend (cryptography/pynacl) — bootstrap keygen unavailable here."
 fi
 
-# ── F. NO CONFIG -> clean empty roster + no-op beat + exit 0 + NO traceback ──
+# ── F. UNREACHABLE CP -> clean empty roster + no-op beat + exit 0 + NO traceback ──
+# DEFAULT ON: an undecided/no-config dev now resolves the baked-in CP, so "clean degrade" is
+# proven against an UNREACHABLE control plane. HEIMDALL_DEFAULT_CP_URL is pinned to a local
+# dead port so the baked-in default cannot phone the REAL production CP from this hermetic test.
 echo
-echo "F. NO config -> clean empty roster + no-op beat + exit 0 (no traceback)"
+echo "F. unreachable CP -> clean empty roster + no-op beat + exit 0 (no traceback)"
 HOME_BARE="$WORK/home_bare"; mkdir -p "$HOME_BARE"   # no cp-endpoint.json, no seed
 R_OUT="$( cd "$PROJ_REPO" \
   && env -u HEIMDALL_CP_URL -u BASE_URL -u HEIMDALL_CP_PKI_KEY -u PKI_SEED \
+       HEIMDALL_DEFAULT_CP_URL="http://127.0.0.1:1" \
        HOME="$HOME_BARE" HEIMDALL_TEAM_DIR="$HOME_BARE/.heimdall" \
        "$BIN" roster --json 2>"$WORK/bare_roster.err" )"; R_EX="$?"
 if [ "$R_OUT" = "[]" ] && [ "$R_EX" = "0" ] && [ ! -s "$WORK/bare_roster.err" ]; then
-  ok "F1 no-config roster --json -> [] , exit 0, EMPTY stderr (no traceback)"
+  ok "F1 unreachable-CP roster --json -> [] , exit 0, EMPTY stderr (no traceback)"
 else
-  bad "F1 no-config roster degraded badly (out='$R_OUT' exit=$R_EX)"; cat "$WORK/bare_roster.err" >&2
+  bad "F1 unreachable-CP roster degraded badly (out='$R_OUT' exit=$R_EX)"; cat "$WORK/bare_roster.err" >&2
 fi
 ( cd "$PROJ_REPO" \
   && env -u HEIMDALL_CP_URL -u BASE_URL -u HEIMDALL_CP_PKI_KEY -u PKI_SEED \
+       HEIMDALL_DEFAULT_CP_URL="http://127.0.0.1:1" \
        HOME="$HOME_BARE" HEIMDALL_TEAM_DIR="$HOME_BARE/.heimdall" \
        "$BIN" beat 2>"$WORK/bare_beat.err" ); BARE_BEAT_EX="$?"
 if [ "$BARE_BEAT_EX" = "0" ] && [ ! -s "$WORK/bare_beat.err" ]; then
-  ok "F2 no-config beat -> silent no-op, exit 0, EMPTY stderr"
+  ok "F2 unreachable-CP beat -> silent no-op, exit 0, EMPTY stderr"
 else
-  bad "F2 no-config beat degraded badly (exit=$BARE_BEAT_EX)"; cat "$WORK/bare_beat.err" >&2
+  bad "F2 unreachable-CP beat degraded badly (exit=$BARE_BEAT_EX)"; cat "$WORK/bare_beat.err" >&2
 fi
 
 echo

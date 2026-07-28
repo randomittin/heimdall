@@ -2,6 +2,7 @@
 
 Every wave reads identity from this file, never from memory.
 Signed-off: RJ, 2026-06-13 (gate foundation signed — GATE-REVIEW.md; domain screen complete).
+Default-on presence posture + scoped network claims confirmed: RJ, 2026-07-28 (opt-OUT via `hmd presence sever` = zero egress; heartbeat scope re-approved consciously).
 
 ```yaml
 name:      Heimdall
@@ -28,7 +29,13 @@ thesis:    README ¶1 verbatim = the moving-bar thesis (growth spec v4)
   users; the brand never uses it.
 
 ## Hard boundaries (constitution-level)
-- No telemetry, no network calls home, MIT, read the source.
+- Team presence + cloud features DO make network calls to the Heimdall control plane, ON BY
+  DEFAULT: a signed heartbeat carrying your HAID, online status, and edit activity (current
+  filename + verdict) — NEVER file contents, NEVER code, NEVER keystrokes — scoped to your team
+  (holders of your repo's team secret). That heartbeat is the ONLY thing sent home; no analytics,
+  no tracking, no third parties. Opt out completely with `hmd presence sever` → the
+  control-plane URL stops resolving → ZERO egress (no beat, no roster, no enroll), provable in
+  `bin/heimdall-presence`. MIT, read the source.
 - Publishing (npm, GitHub-publish, X, registrar) is ALWAYS human-gated; the agent never
   holds credentials.
 - Any public number traces to `heimdall bench` output or a commit sha; deltas measured on

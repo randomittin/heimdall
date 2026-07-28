@@ -29,6 +29,11 @@ INIT_BIN="$BIN/heimdall-init"
 GATE_BIN="$BIN/heimdall-gate-run"
 VERDICT_BIN="$BIN/heimdall-verdict"
 REAL_HEIMDALL="$BIN/heimdall"
+# DEFAULT-ON egress guard: `hmd init` generates a post-commit hook that shells the REAL
+# `heimdall-presence beat` (fire-and-forget). Under this test's fresh, undecided HOME the flip
+# would otherwise resolve the baked-in PROD control plane. Pin the default at a dead port so the
+# post-commit beat can never reach prod (it stays a local-spool + refused-connection no-op).
+. "$REPO/test/lib/net-default-guard.sh"
 
 for b in "$INIT_BIN" "$GATE_BIN" "$VERDICT_BIN" "$REAL_HEIMDALL"; do
   [ -x "$b" ] || { echo "FATAL: missing/!exec $b" >&2; exit 2; }

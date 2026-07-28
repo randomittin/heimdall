@@ -37,6 +37,9 @@ set -uo pipefail
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$SELF_DIR/.." && pwd)"
 BIN="$REPO/bin/heimdall-presence"
+# DEFAULT-ON egress guard: pin the baked-in CP default at a dead port so no un-pinned presence
+# call in this suite resolves the REAL production control plane. Explicit per-invocation pins win.
+. "$REPO/test/lib/net-default-guard.sh"
 DOCTOR="$REPO/bin/heimdall-presence-doctor"
 LIB="$REPO/bin/lib"
 
