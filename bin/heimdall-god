@@ -153,7 +153,11 @@ fi
 ID_TOKEN="${HEIMDALL_GOD_ID_TOKEN:-}"
 if [ -z "$ID_TOKEN" ] && [ "${HEIMDALL_GOD_SKIP_ID_TOKEN:-}" != "1" ]; then
   if command -v gcloud >/dev/null 2>&1; then
-    ID_TOKEN="$(gcloud auth print-identity-token --audiences="$URL" 2>/dev/null || true)"
+    # --audiences works for SERVICE-ACCOUNT creds; USER accounts reject it (ERROR) —
+    # fall back to the plain identity token, which Cloud Run accepts for an owner with
+    # roles/run.invoker (verified: plain token → gated /readyz 200).
+    ID_TOKEN="$(gcloud auth print-identity-token --audiences="$URL" 2>/dev/null \
+      || gcloud auth print-identity-token 2>/dev/null || true)"
   fi
   if [ -z "$ID_TOKEN" ]; then
     err "could not obtain a GCP identity token (gcloud auth print-identity-token) — the"
