@@ -525,6 +525,17 @@ def _build_handler_class(home, enforce_revocation):
                     if refusal is not None:
                         self._send(Response(*refusal))
                         return
+                # PUBLIC-SURFACE abuse gate for pre-auth /team/auto (per-IP + a deployment-wide
+                # budget): auto-team is high-cost (1-3 GitHub API round-trips + a registry write per
+                # call), so a flood is a GitHub-rate-limit burn + write-cost DoS. Mirrors /enroll's
+                # IP+budget shed; runs BEFORE the handler so a shed request spends no GitHub call /
+                # registry write. Inert on the gated surface.
+                if (cp_publicsurface.public_surface_enabled()
+                        and (method, route_path) == ("POST", "/team/auto")):
+                    refusal = cp_publicsurface.check_autoteam(request, home=home)
+                    if refusal is not None:
+                        self._send(Response(*refusal))
+                        return
                 # PUBLIC-SURFACE dashboard-login abuse gates (pre-auth; the internet-facing
                 # device flow). init is the highest-cost route (a put_record per call mints a
                 # device_code — a write-cost DoS), so it gets a per-IP cap + a deployment-wide

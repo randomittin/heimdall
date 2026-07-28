@@ -43,6 +43,7 @@ if _HERE not in sys.path:
 
 import cp_approval
 import cp_auth
+import cp_autoteam
 import cp_config
 import cp_corpus
 import cp_dashboard
@@ -446,6 +447,14 @@ def boot(server=cp_server, *, home=None, base_env=None, start_tick=True,
     # the PRE-AUTH public seam (the caller has no key to sign with yet) and gated by the
     # server-side HEIMDALL_ENROLL_TOKEN secret — fail-closed when that secret is unset.
     routes["enroll"] = list(cp_enroll.register(home=home))
+    # Zero-touch auto-team formation (design zero-touch-team-formation.md §3): the PRE-AUTH POST
+    # /team/auto composes the two Wave-1 primitives (cp_repoteam server-side repo->team registry +
+    # cp_ghverify server-side GitHub identity/access strata) into auto-initiate | auto-join. The
+    # GitHub strata ARE the auth (no signable envelope), the operative team_id is server-derived
+    # from the repo binding (INV-1, never a wire field), and no bearer secret transits or lands in
+    # git. Wired into the PRE-AUTH public seam like /enroll; (POST,/team/auto) is in cp_publicsurface.
+    # PUBLIC_ROUTES with its OWN abuse gate (check_autoteam — per-IP + deployment-wide budget).
+    routes["autoteam"] = list(cp_autoteam.register(home=home))
     # Server-driven adaptive intervals (cost-governance §2): GET /config serves the current
     # spend-pace interval ladder to every client (statusline/watch/ext/hooks), UNSIGNED because
     # a browser cannot PKI-sign. Pre-auth public seam; the client clamps every interval to

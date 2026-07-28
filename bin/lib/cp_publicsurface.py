@@ -199,6 +199,11 @@ PUBLIC_ROUTES = frozenset({
     ("POST", "/issues"),
     ("POST", "/team/cred"),
     ("POST", "/team/install"),
+    # The ZERO-TOUCH auto-initiate/auto-join route (cp_autoteam). Served PRE-AUTH like /enroll —
+    # the caller has no signable envelope and the server-side GitHub strata (identity + repo access)
+    # ARE the auth. No bearer secret transits; the operative team_id is server-derived (INV-1). It
+    # carries its OWN abuse gate here (check_autoteam — per-IP + a deployment-wide budget).
+    ("POST", "/team/auto"),
     ("GET", "/roster"),
     ("GET", "/roster-team"),
     ("OPTIONS", "/roster-team"),
@@ -382,6 +387,21 @@ def _dash_init_budget_window(): return _int_env("HEIMDALL_DASH_INIT_BUDGET_WINDO
 # DISTINCT buckets per route (the scope arg), so one route's legit polling never starves another.
 def _dash_read_ip_limit():  return _int_env("HEIMDALL_DASH_READ_IP_LIMIT", 120)
 def _dash_read_ip_window(): return _int_env("HEIMDALL_DASH_READ_IP_WINDOW", 60)
+
+# /team/auto — the ZERO-TOUCH auto-initiate/auto-join route (cp_autoteam). It is a HIGH-cost pre-auth
+# route: EACH call spends 1-3 GitHub API round-trips (GET /user + repo metadata + collaborator
+# permission) AND, on an initiate/join, a registry WRITE — so an unbounded flood is BOTH a GitHub-
+# rate-limit burn AND a write-cost DoS. Two fixed-window gates mirror check_enroll / check_dashboard_
+# init's IP+budget shape (there is NO signable envelope on this pre-auth route — the GitHub strata are
+# the auth): a per-IP cap + a DEPLOYMENT-WIDE budget on auto-team calls, so an attacker rotating IPs
+# still cannot explode the GitHub-API spend or the registry. Auto-team is a RARE first-run act, so the
+# defaults are CONSERVATIVE; both env-tunable (an explicit HEIMDALL_AUTOTEAM_* always wins):
+#   • per-IP    5 / 60s   — a single IP runs at most 5 auto-team calls/minute.
+#   • budget   60 / 3600s — the whole deployment runs at most 60 auto-team calls/hour across the fleet.
+def _autoteam_ip_limit():      return _int_env("HEIMDALL_AUTOTEAM_IP_LIMIT", 5)
+def _autoteam_ip_window():     return _int_env("HEIMDALL_AUTOTEAM_IP_WINDOW", 60)
+def _autoteam_budget_max():    return _int_env("HEIMDALL_AUTOTEAM_BUDGET_MAX", 60)
+def _autoteam_budget_window(): return _int_env("HEIMDALL_AUTOTEAM_BUDGET_WINDOW", 3600)
 
 
 # ── the public-surface predicates (what cp_server's router consults) ────────────────────
@@ -695,6 +715,33 @@ def check_dashboard_read_pre_auth(request, scope, *, home=None, now=None):
         limit=_dash_read_ip_limit(), window=_dash_read_ip_window())
     if not ok:
         return (429, _rate_limited_body(scope + "_ip", retry))
+    return None
+
+
+def check_autoteam(request, *, home=None, now=None):
+    """PUBLIC-SURFACE abuse gate for POST /team/auto (pre-auth — NO signable envelope; the GitHub
+    strata are the auth). Auto-team is HIGH-cost: each call spends GitHub API round-trips + (on an
+    initiate/join) a registry write, so an unbounded flood is a GitHub-rate + write-cost DoS. Two
+    fixed-window checks mirror check_enroll / check_dashboard_init_pre_auth's IP+budget shape; the
+    first to refuse returns a 429 (NOTHING is verified against GitHub, NOTHING is bound):
+      1. per-client-IP     — a single IP cannot hammer auto-team.
+      2. autoteam_budget   — a DEPLOYMENT-WIDE ceiling on auto-team calls/window (one global counter,
+         the exact mechanic enroll_budget/dash_init_budget use), so an attacker rotating IPs cannot
+         burn the GitHub-API budget or explode the registry no matter how many IPs it rotates through.
+    Returns None to let the handler run, or (429, body) to refuse. FAIL-OPEN on a backend hiccup
+    (never sheds a legit first-run), exactly like the enroll/dashboard gates."""
+    limiter = cp_ratelimit.RateLimiter(home=home)
+    ip = client_ip(request)
+    ok, retry = limiter.allow(
+        "autoteam_ip", ip, now=now,
+        limit=_autoteam_ip_limit(), window=_autoteam_ip_window())
+    if not ok:
+        return (429, _rate_limited_body("autoteam_ip", retry))
+    ok, retry = limiter.allow(
+        "autoteam_budget", "global", now=now,
+        limit=_autoteam_budget_max(), window=_autoteam_budget_window())
+    if not ok:
+        return (429, _rate_limited_body("autoteam_budget", retry))
     return None
 
 
