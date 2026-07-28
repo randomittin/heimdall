@@ -324,6 +324,99 @@ export function chatResolveTeam(gates, chatId) {
   return CHAT_BINDINGS[chatId] || null; // GOLDEN: only a persisted binding resolves a team.
 }
 
+// ─────────────────────────────────────────────────────────────────────────────────────
+// INV-AUTOTEAM — zero-touch team formation (auto-initiate + auto-join,
+// docs/analysis/zero-touch-team-formation.md). The membership proof moves from "holds
+// the team secret" to "has GitHub access to the repo," enforced SERVER-SIDE. A HAID is
+// bound to a repo's team_id via POST /team/auto IFF the server independently verifies:
+//   (A) the caller controls `gh_user` — the forwarded gh_proof's real GET /user login
+//       equals the claimed gh_user (Stratum A: identity re-derived, never trusted);
+//   (B) `gh_user` holds >= the repo's required permission on `repo` (Stratum B: a repo
+//       collaborator, at or above the visibility-dependent threshold);
+// where `repo -> team_id` is a SERVER-SIDE binding and the operative team_id is resolved
+// from `repo`, NEVER a wire field (INV-1 holds for auto-join too). First-runner
+// auto-INITIATE (no binding yet) additionally requires the caller to hold admin/push —
+// only someone who controls the repo may mint + bind repo->team.
+//
+// This model authors the ORACLE only; the real POST /team/auto handler
+// (cp_autoteam / cp_ghverify / cp_repoteam) is implemented later by a separate agent and
+// MUST pass this gate. Each gate below is dropped by EXACTLY ONE mutant, flipping EXACTLY
+// its own AT* attack DENY->ALLOW; the five gates are disjoint from every A*/G*/L*/C* gate
+// (no existing mutant flips an AT* row, and no AT* mutant flips an existing row).
+// ─────────────────────────────────────────────────────────────────────────────────────
+
+// GitHub permission levels, ranked. The auto-team thresholds compare against these:
+// private repo => read (any collaborator) suffices; PUBLIC repo => write/push required
+// (the actual committing team, not drive-by readers). Mirrors the levels
+// GET /repos/{repo}/collaborators/{gh_user}/permission returns.
+const PERMISSION_RANK = { none: 0, read: 1, write: 2, admin: 3 };
+
+// The server-side repo -> team_id binding registry (the new cp_repoteam source of truth).
+// alice/webapp is a PRIVATE repo bound to team A; carol/opensource is a PUBLIC repo bound
+// to team C. dave/fresh is deliberately ABSENT (unbound) — no team to resolve.
+const REPO_TEAM_BINDINGS = {
+  "alice/webapp": TEAM_A.team_id,
+  "carol/opensource": "cccc3333cccc3333cccc3333cccc3333",
+};
+
+// Repo visibility (GET /repos/{repo}.private). Drives the auto-join threshold: PUBLIC repos
+// demand write/push so the whole world's read access can't join the presence wall.
+const REPO_VISIBILITY = {
+  "alice/webapp": "private",
+  "carol/opensource": "public",
+  "dave/fresh": "public",
+};
+
+// The server-authoritative collaborator map (Stratum B: the install-token-scoped
+// GET /repos/{repo}/collaborators/{gh_user}/permission result). Only listed logins have
+// any access; a login absent from a repo's map has permission `none`.
+const REPO_COLLABORATORS = {
+  "alice/webapp": { alice: "admin" },
+};
+
+// ── INV-AUTOTEAM(B) — Stratum-B collaborator check: does `gh_user` have ANY qualifying
+//    access to `repo`? A caller with NO access (not a collaborator) can never auto-join.
+//    Mirrors the server-side permission lookup; the DENY is refuse + no binding written. ──
+export function autoteamHasRepoAccess(gates, repo, ghUser) {
+  if (gates.autoteamSkipsCollabCheck) return true; // MUTANT: skip Stratum-B => any caller "has access".
+  const perms = REPO_COLLABORATORS[repo] || {};
+  return Object.prototype.hasOwnProperty.call(perms, ghUser); // GOLDEN: only a real collaborator.
+}
+
+// ── INV-AUTOTEAM(A) — Stratum-A caller<->gh_user binding: the forwarded gh_proof's REAL
+//    login (server-derived via GET /user) MUST equal the claimed gh_user. A username claim
+//    is never trusted; a forger cannot name a victim collaborator's login. ──
+export function autoteamVerifyCaller(gates, ghProof, claimedGhUser) {
+  if (gates.autoteamTrustsClaimedGhUser) return true; // MUTANT: trust the claim, skip GET /user re-derive.
+  return !!ghProof && ghProof.token_login === claimedGhUser; // GOLDEN: real login must equal the claim.
+}
+
+// ── INV-1 (auto-join) — the operative team_id is resolved SERVER-SIDE from the repo->team
+//    binding, NEVER a caller-supplied wire team_id. A body/query team_id must be ignored. ──
+export function autoteamResolveTeam(gates, repo, req) {
+  if (gates.autoteamHonorsWireTeamId && req.body && req.body.team_id) {
+    return req.body.team_id; // MUTANT (INV-1 dropped): honors the wire team_id instead of the binding.
+  }
+  return REPO_TEAM_BINDINGS[repo] || null; // GOLDEN: server-derived from the repo->team binding only.
+}
+
+// ── INV-AUTOTEAM(§5) — the PUBLIC-repo write threshold. private => read suffices; PUBLIC =>
+//    write/push required, so a mere reader on a public repo is excluded (RJ's public-threshold
+//    policy — kept a clean single gate so the threshold is swappable). ──
+export function autoteamMeetsThreshold(gates, repo, permission) {
+  if (gates.autoteamPublicReadJoins) return true; // MUTANT: drop the public write-threshold => read joins.
+  const required = REPO_VISIBILITY[repo] === "public" ? "write" : "read"; // GOLDEN: public demands write/push.
+  return PERMISSION_RANK[permission] >= PERMISSION_RANK[required];
+}
+
+// ── INV-AUTOTEAM (initiate) — first-runner auto-INITIATE on an UNBOUND repo requires the
+//    caller to hold admin/push. Only someone who controls the repo may mint + bind
+//    repo->team; a read-only non-initiator can never invent a team. ──
+export function autoteamCanInitiate(gates, repo, permission) {
+  if (gates.autoteamAnyCallerInitiates) return true; // MUTANT: any caller initiates an unbound repo.
+  return PERMISSION_RANK[permission] >= PERMISSION_RANK["write"]; // GOLDEN: admin/push required to initiate.
+}
+
 // ── The fixed cross-tenant attack sequence. Each returns "DENY" (attack stopped) or
 //    "ALLOW" (attack SUCCEEDED — a tenant touched another's resource). The acceptance
 //    oracle demands DENY for every one; a mutant flips exactly its own gate's attack
@@ -483,6 +576,49 @@ export function evaluateAttack(gates, attackId) {
       const UNBOUND_CHAT_ID = "chat:mallory"; // never bound; a bare, attacker-suppliable handle.
       const team = chatResolveTeam(gates, UNBOUND_CHAT_ID);
       return team ? "ALLOW" : "DENY";
+    }
+    case "AT1-noncollaborator-autojoin": {
+      // INV-AUTOTEAM(B). Mallory has a real GitHub identity but is NOT a collaborator on the
+      // bound repo alice/webapp. She hits POST /team/auto to auto-join. The Stratum-B
+      // permission check MUST refuse — no binding written, the team stays invisible. Being
+      // granted access with no collaborator entry (the check skipped) is the ALLOW.
+      const req = { claimed_gh_user: "mallory", repo: "alice/webapp", gh_proof: { token_login: "mallory" } };
+      return autoteamHasRepoAccess(gates, req.repo, req.claimed_gh_user) ? "ALLOW" : "DENY";
+    }
+    case "AT2-forged-gh-identity": {
+      // INV-AUTOTEAM(A). The caller CLAIMS gh_user=alice (a real collaborator on alice/webapp)
+      // but the forwarded gh_proof's true GET /user login is mallory. Stratum A re-derives the
+      // login server-side and MUST refuse when it != the claim — a username claim is never
+      // trusted. Minting the binding on a claim whose token login disagrees is the ALLOW.
+      const req = { claimed_gh_user: "alice", gh_proof: { token_login: "mallory" } };
+      return autoteamVerifyCaller(gates, req.gh_proof, req.claimed_gh_user) ? "ALLOW" : "DENY";
+    }
+    case "AT3-autojoin-wire-team-id": {
+      // INV-1 (auto-join). A valid auto-join for the bound repo alice/webapp (-> team A)
+      // carries a body team_id=B. The operative team MUST be resolved SERVER-SIDE from the
+      // repo->team binding (team A), never the wire value. The wire team_id=B becoming the
+      // operative team (the server honoring it) is the ALLOW.
+      const req = { repo: "alice/webapp", body: { team_id: TEAM_B.team_id } };
+      const team = autoteamResolveTeam(gates, req.repo, req);
+      return team === TEAM_B.team_id ? "ALLOW" : "DENY";
+    }
+    case "AT4-public-read-only-autojoin": {
+      // INV-AUTOTEAM(§5). carol/opensource is a PUBLIC repo; the caller holds only READ. The
+      // public threshold is write/push (drive-by readers excluded), so a mere reader MUST be
+      // refused. A read-only caller clearing the public threshold (the threshold dropped) is
+      // the ALLOW.
+      const req = { repo: "carol/opensource", permission: "read" };
+      return autoteamMeetsThreshold(gates, req.repo, req.permission) ? "ALLOW" : "DENY";
+    }
+    case "AT5-unbound-repo-autojoin": {
+      // INV-AUTOTEAM (initiate). dave/fresh has NO repo->team binding, and the caller holds
+      // only READ (below admin/push). Auto-INITIATE requires admin/push — only someone who
+      // controls the repo may mint + bind a team. A non-initiator inventing a team on an
+      // unbound repo (any caller allowed to initiate) is the ALLOW.
+      const req = { repo: "dave/fresh", permission: "read" };
+      const bound = REPO_TEAM_BINDINGS[req.repo] != null;
+      const initiated = !bound && autoteamCanInitiate(gates, req.repo, req.permission);
+      return initiated ? "ALLOW" : "DENY";
     }
     default:
       throw new Error("unknown attack id: " + attackId);

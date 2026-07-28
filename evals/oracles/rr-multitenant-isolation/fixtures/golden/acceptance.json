@@ -109,6 +109,36 @@
       "expected": "DENY",
       "invariant": "INV-CHAT",
       "attack": "an UNBOUND / forged chat_id (a bare chat handle) presented to a read verb (status/investigate/report) must resolve to NO team and get the link instruction — a bare chat_id is never trusted as an identity, and the team is server-derived from the persisted {chat_id<->HAID<->team} binding (chat_link.resolve), never from the chat_id itself"
+    },
+    {
+      "n": "AT1-noncollaborator-autojoin",
+      "expected": "DENY",
+      "invariant": "INV-AUTOTEAM(B)",
+      "attack": "a user with a real GitHub identity but NO access to the bound repo hits POST /team/auto to auto-join — the Stratum-B collaborator/permission check (GET /repos/{repo}/collaborators/{gh_user}/permission) must refuse; no binding is written and the team stays invisible"
+    },
+    {
+      "n": "AT2-forged-gh-identity",
+      "expected": "DENY",
+      "invariant": "INV-AUTOTEAM(A)",
+      "attack": "the caller claims gh_user=a real collaborator but the forwarded gh_proof's true GET /user login differs — Stratum A re-derives the login server-side and must refuse (a username claim is never trusted); identity is verified, not asserted"
+    },
+    {
+      "n": "AT3-autojoin-wire-team-id",
+      "expected": "DENY",
+      "invariant": "INV-1 (auto-join)",
+      "attack": "an auto-join for a bound repo carries a body/query team_id != the repo->team binding — the server must resolve the operative team_id SERVER-SIDE from the repo binding (cp_repoteam), never honoring the wire team_id (INV-1 holds for auto-join)"
+    },
+    {
+      "n": "AT4-public-read-only-autojoin",
+      "expected": "DENY",
+      "invariant": "INV-AUTOTEAM(§5)",
+      "attack": "a caller with only READ on a PUBLIC repo tries to auto-join — the public-repo threshold is write/push (drive-by readers excluded, so the world can't join the presence wall); a mere reader is refused. This row encodes RJ's public-threshold policy as a single swappable gate"
+    },
+    {
+      "n": "AT5-unbound-repo-autojoin",
+      "expected": "DENY",
+      "invariant": "INV-AUTOTEAM (initiate)",
+      "attack": "no repo->team binding exists AND the caller lacks admin/push — auto-INITIATE requires admin/push (only someone who controls the repo may mint + bind repo->team), so a read-only non-initiator is refused; auto-join never invents a team"
     }
   ]
 }

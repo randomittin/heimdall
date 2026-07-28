@@ -137,3 +137,88 @@ mutant SURVIVE (score < 1.0) — proving the row is load-bearing.
 Unlike `accept-request-team-id` / `god-in-public-allowlist` (one dropped gate → two
 attacks), each INV-LOGIN mutant flips EXACTLY one attack (verified: `grade.mjs` reports a
 single `ALLOW` per mutant), so every L* row has its own dedicated mutant.
+
+---
+
+# INV-AUTOTEAM — zero-touch team formation (authored here)
+
+This oracle is also the falsifiable gate the **zero-touch team formation** flow
+(`docs/analysis/zero-touch-team-formation.md`) must pass **before any `POST /team/auto`
+handler is written**. The feature moves the membership proof from "holds the team secret"
+to "has GitHub access to the repo," enforced **SERVER-SIDE**: a teammate auto-JOINS a
+repo's team by proving GitHub repo access (no pasted secret), and a first-runner
+auto-INITIATES (admin/push → mint + bind repo→team). As with INV-GOD / INV-LOGIN, the gate
+is authored independent of (and prior to) the implementation (`cp_autoteam` / `cp_ghverify`
+/ `cp_repoteam`, authored by a separate impl agent in a later wave).
+
+## INV-AUTOTEAM
+
+> A HAID is bound to a repo's `team_id` via `POST /team/auto` **IFF** the server
+> independently verifies **(A)** the caller controls `gh_user` (the forwarded `gh_proof`'s
+> real `GET /user` login equals the claimed `gh_user`) **AND (B)** `gh_user` holds ≥ the
+> repo's required permission on `repo`, where `repo → team_id` is a server-side binding and
+> the operative `team_id` is server-resolved from `repo`, **never** a wire field (INV-1
+> holds for auto-join). First-runner auto-INITIATE (no binding yet) additionally requires
+> the caller to hold **admin/push** — only someone who controls the repo may mint + bind
+> `repo → team`.
+
+Formally, for a caller `C` claiming `{gh_user, repo}` with a forwarded token `gh_proof`:
+
+1. **Stratum A (identity).** The server re-derives the caller's login from `gh_proof` via
+   `GET /user` and requires it `== gh_user` — a username claim is never trusted.
+2. **Stratum B (permission).** The server reads
+   `GET /repos/{repo}/collaborators/{gh_user}/permission` and requires it ≥ the repo's
+   threshold: **private → read** (any collaborator); **PUBLIC → write/push** (the committing
+   team, not drive-by readers — RJ's public-threshold policy, §5 of the design).
+3. **INV-1 (auto-join).** The operative `team_id` is resolved from the server-side
+   `repo → team_id` binding (`cp_repoteam`), never a caller-supplied `team_id`.
+4. **Initiate.** When no `repo → team_id` binding exists, auto-INITIATE requires the caller
+   to hold **admin/push**; a read-only non-initiator can never invent a team.
+
+INV-AUTOTEAM composes with the existing invariants: its server-derived team scope is the
+same server-authored binding discipline INV-1 enforces (here `repo → team_id` rather than
+`registered_team(haid)`), and its server-side identity re-derivation mirrors the "verify the
+assertion, never the edge" principle INV-GOD's IAP bridge encodes.
+
+## The five attack rows (all expected DENY)
+
+Added to `fixtures/golden/acceptance.json` and modeled in `fixtures/model.mjs`, in fixed
+sequence order after the existing A*/enqueue/G*/L*/C* rows:
+
+| Row | Invariant | Attack | DENY means |
+|---|---|---|---|
+| `AT1-noncollaborator-autojoin` | INV-AUTOTEAM(B) | a user with NO access to the bound repo hits `/team/auto` | Stratum-B permission check refuses; no binding, team invisible |
+| `AT2-forged-gh-identity` | INV-AUTOTEAM(A) | caller claims `gh_user`=a real collaborator, but the `gh_proof`'s real `GET /user` login differs | Stratum A re-derives the login server-side; a username claim is never trusted |
+| `AT3-autojoin-wire-team-id` | INV-1 (auto-join) | auto-join carries a body/query `team_id` ≠ the `repo → team_id` binding | the server ignores the wire `team_id`, resolves team from `repo` server-side |
+| `AT4-public-read-only-autojoin` | INV-AUTOTEAM(§5) | PUBLIC repo, caller has only **read** (below the write threshold) | the public write-threshold refuses a mere reader — the world can't join the wall |
+| `AT5-unbound-repo-autojoin` | INV-AUTOTEAM (initiate) | no `repo → team_id` binding AND the caller lacks admin/push | only an admin/push holder may auto-initiate — a read-only non-initiator is refused |
+
+## Mutant → gate → RED (each new gate is load-bearing)
+
+Each mutant is `fixtures/model.mjs` with EXACTLY ONE INV-AUTOTEAM gate dropped. Dropping it
+flips its attack from DENY to ALLOW, and `run.sh` reports that attack as `first_divergence`.
+`bin/falsify` catches it (KILLED); dropping the row from the acceptance table makes the
+mutant SURVIVE (verified: score → 20/21 = 0.9524, `bin/falsify` exits nonzero) — proving the
+row is load-bearing.
+
+| Mutant | Gate dropped | Attack that then SUCCEEDS | Oracle goes RED at |
+|---|---|---|---|
+| `autoteam-skips-collab-check` | Stratum-B collaborator/permission check (`cp_ghverify`) | AT1 — a non-collaborator auto-joins the bound repo's team | `AT1-noncollaborator-autojoin` |
+| `autoteam-trusts-claimed-ghuser` | Stratum-A caller↔`gh_user` binding (`GET /user` re-derive) | AT2 — a forger names a real collaborator's login and is believed | `AT2-forged-gh-identity` |
+| `autoteam-honors-wire-teamid` | server-side `repo → team_id` resolution (`cp_repoteam`) | AT3 — the auto-join honors a caller-supplied `team_id` | `AT3-autojoin-wire-team-id` |
+| `autoteam-public-read-joins` | the PUBLIC-repo write/push threshold | AT4 — a read-only caller on a PUBLIC repo auto-joins | `AT4-public-read-only-autojoin` |
+| `autoteam-any-caller-initiates` | the admin/push requirement for auto-INITIATE | AT5 — a read-only non-initiator invents a team for an unbound repo | `AT5-unbound-repo-autojoin` |
+
+Each INV-AUTOTEAM mutant flips EXACTLY one attack (verified: `grade.mjs` reports a single
+`ALLOW` per mutant, and no existing A*/G*/L*/C* mutant flips any AT* row), so every AT* row
+has its own dedicated, disjoint gate.
+
+## Falsifiability
+
+- Golden (`fixtures/golden/candidate.mjs`, every gate STRONG) DENIES all 23 attacks →
+  `bin/falsify rr-multitenant-isolation --assert-score 1.0` passes (21/21 mutants killed).
+- Dropping any AT* row makes that row's mutant SURVIVE → score 20/21 = 0.9524 →
+  `bin/falsify` exits nonzero. The five auto-team gates are not green-by-construction.
+- The real `POST /team/auto` handler (`cp_autoteam` / `cp_ghverify` / `cp_repoteam`) is
+  implemented later by a separate agent and MUST pass this gate — this oracle is authored
+  independent of that implementation.

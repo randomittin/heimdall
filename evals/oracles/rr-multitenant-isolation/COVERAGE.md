@@ -48,6 +48,11 @@ exactly ONE gate removed.
 | `skip-session-expiry` | INV-LOGIN-3 | the short-TTL session expiry check | L3 — an expired session keeps reading rosters | `L3-expired-session` |
 | `mint-skips-sig-verify` | INV-LOGIN-4 | HAID signature verification at mint (`verify_identity`) | L4 — a forged-signature mint is issued a session | `L4-bad-signature-mint` |
 | `login-session-grants-owner` | INV-LOGIN-5 | the always-`owner=false` rule for login sessions | L5 — a login session passes the owner/god gate | `L5-session-is-owner` |
+| `autoteam-skips-collab-check` | INV-AUTOTEAM(B) | Stratum-B collaborator/permission check (`cp_ghverify`) | AT1 — a non-collaborator auto-joins the bound repo's team | `AT1-noncollaborator-autojoin` |
+| `autoteam-trusts-claimed-ghuser` | INV-AUTOTEAM(A) | Stratum-A caller↔`gh_user` binding (`GET /user` re-derive) | AT2 — a forger names a real collaborator's login and is believed | `AT2-forged-gh-identity` |
+| `autoteam-honors-wire-teamid` | INV-1 (auto-join) | server-side `repo → team_id` resolution (`cp_repoteam`) | AT3 — the auto-join honors a caller-supplied `team_id` | `AT3-autojoin-wire-team-id` |
+| `autoteam-public-read-joins` | INV-AUTOTEAM(§5) | the PUBLIC-repo write/push threshold | AT4 — a read-only caller on a PUBLIC repo auto-joins | `AT4-public-read-only-autojoin` |
+| `autoteam-any-caller-initiates` | INV-AUTOTEAM (initiate) | the admin/push requirement for auto-INITIATE | AT5 — a read-only non-initiator invents a team for an unbound repo | `AT5-unbound-repo-autojoin` |
 
 Every mutant drops exactly one gate and flips its own attack(s) to `ALLOW`; the golden
 denies all sixteen attacks. Two dropped gates open two attacks each from a single flag —
@@ -74,3 +79,27 @@ nonzero. A gate that could not be made to survive would be tautological; this on
 Dropping any G* row makes the corresponding INV-GOD mutant survive the same way; dropping
 any L* row makes its INV-LOGIN mutant survive (verified: each drop → score 13/14 = 0.9286,
 `bin/falsify` exits nonzero).
+
+## INV-AUTOTEAM — zero-touch team formation (the five AT rows)
+
+The five `AT*` rows encode INV-AUTOTEAM — zero-touch team formation
+(`docs/analysis/zero-touch-team-formation.md`; see `INVARIANTS.md`). Membership proof moves
+from "holds the team secret" to "has GitHub access to the repo," enforced SERVER-SIDE: a
+teammate auto-JOINS by proving GitHub repo access (Stratum A caller↔`gh_user` re-derive +
+Stratum B `gh_user`↔repo permission), the operative `team_id` is server-resolved from the
+`repo → team_id` binding (never a wire field), and a first-runner auto-INITIATES only with
+admin/push. The model gates are disjoint from every A*/G*/L*/C* gate:
+`autoteamHasRepoAccess` (AT1 Stratum-B collaborator check), `autoteamVerifyCaller` (AT2
+Stratum-A `GET /user` re-derive), `autoteamResolveTeam` (AT3 server-side `repo → team_id`
+resolution — INV-1 for auto-join), `autoteamMeetsThreshold` (AT4 public write-threshold —
+RJ's public-threshold policy as a single swappable gate), and `autoteamCanInitiate` (AT5
+admin/push required to initiate an unbound repo).
+
+With the AT rows added the oracle grades **23 attacks against 21 mutants**: falsifiability
+score = 21/21 = 1.0 (16 prior + 5 new, all mutants killed, golden passing). Each new mutant
+flips EXACTLY its own AT* row (verified: `grade.mjs` reports a single `ALLOW` per mutant),
+no existing mutant flips any AT* row, and no AT* mutant flips an existing attack. Dropping
+any AT* row makes its mutant SURVIVE (verified: each drop → score 20/21 = 0.9524,
+`bin/falsify` exits nonzero) — the five auto-team gates are load-bearing, not
+green-by-construction. The real `POST /team/auto` handler (`cp_autoteam` / `cp_ghverify` /
+`cp_repoteam`) is implemented later by a separate agent and MUST pass this gate.

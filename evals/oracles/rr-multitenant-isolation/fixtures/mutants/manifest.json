@@ -165,6 +165,56 @@
       "must_turn_red_gate": "cross-tenant-denial",
       "first_fail_case": "C1-unbound-chat",
       "reject_contract": "attack C1-unbound-chat: expected DENY, candidate returns ALLOW -> gate status=fail at step 'C1-unbound-chat'"
+    },
+    {
+      "name": "autoteam-skips-collab-check",
+      "file": "autoteam-skips-collab-check.mjs",
+      "invariant": "INV-AUTOTEAM(B)",
+      "gate_dropped": "the Stratum-B collaborator/permission check (cp_ghverify GET /repos/{repo}/collaborators/{gh_user}/permission); any caller is treated as having repo access",
+      "attack_that_succeeds": "AT1 — a user with NO access to the bound repo auto-joins its team",
+      "must_turn_red_gate": "cross-tenant-denial",
+      "first_fail_case": "AT1-noncollaborator-autojoin",
+      "reject_contract": "attack AT1-noncollaborator-autojoin: expected DENY, candidate returns ALLOW -> gate status=fail at step 'AT1-noncollaborator-autojoin'"
+    },
+    {
+      "name": "autoteam-trusts-claimed-ghuser",
+      "file": "autoteam-trusts-claimed-ghuser.mjs",
+      "invariant": "INV-AUTOTEAM(A)",
+      "gate_dropped": "the Stratum-A caller<->gh_user binding (cp_ghverify re-derive of the forwarded gh_proof via GET /user); the client-claimed gh_user is trusted unverified",
+      "attack_that_succeeds": "AT2 — a forger names a real collaborator's login and is believed (identity asserted, not verified)",
+      "must_turn_red_gate": "cross-tenant-denial",
+      "first_fail_case": "AT2-forged-gh-identity",
+      "reject_contract": "attack AT2-forged-gh-identity: expected DENY, candidate returns ALLOW -> gate status=fail at step 'AT2-forged-gh-identity'"
+    },
+    {
+      "name": "autoteam-honors-wire-teamid",
+      "file": "autoteam-honors-wire-teamid.mjs",
+      "invariant": "INV-1 (auto-join)",
+      "gate_dropped": "server-side repo->team resolution (cp_repoteam.resolve_team_for_repo); the auto-join handler honors a caller-supplied body/query team_id",
+      "attack_that_succeeds": "AT3 — an auto-join steers at a wire team_id != the repo->team binding (INV-1 violation inside auto-join)",
+      "must_turn_red_gate": "cross-tenant-denial",
+      "first_fail_case": "AT3-autojoin-wire-team-id",
+      "reject_contract": "attack AT3-autojoin-wire-team-id: expected DENY, candidate returns ALLOW -> gate status=fail at step 'AT3-autojoin-wire-team-id'"
+    },
+    {
+      "name": "autoteam-public-read-joins",
+      "file": "autoteam-public-read-joins.mjs",
+      "invariant": "INV-AUTOTEAM(§5)",
+      "gate_dropped": "the PUBLIC-repo write/push threshold; a mere reader on a public repo is allowed to auto-join (RJ's public-threshold policy)",
+      "attack_that_succeeds": "AT4 — a read-only caller on a PUBLIC repo auto-joins, putting the whole world on the presence wall",
+      "must_turn_red_gate": "cross-tenant-denial",
+      "first_fail_case": "AT4-public-read-only-autojoin",
+      "reject_contract": "attack AT4-public-read-only-autojoin: expected DENY, candidate returns ALLOW -> gate status=fail at step 'AT4-public-read-only-autojoin'"
+    },
+    {
+      "name": "autoteam-any-caller-initiates",
+      "file": "autoteam-any-caller-initiates.mjs",
+      "invariant": "INV-AUTOTEAM (initiate)",
+      "gate_dropped": "the admin/push requirement for auto-INITIATE on an unbound repo (cp_autoteam initiate gate); any caller can mint + bind a team",
+      "attack_that_succeeds": "AT5 — a read-only non-initiator invents a team for an unbound repo it does not control",
+      "must_turn_red_gate": "cross-tenant-denial",
+      "first_fail_case": "AT5-unbound-repo-autojoin",
+      "reject_contract": "attack AT5-unbound-repo-autojoin: expected DENY, candidate returns ALLOW -> gate status=fail at step 'AT5-unbound-repo-autojoin'"
     }
   ]
 }
