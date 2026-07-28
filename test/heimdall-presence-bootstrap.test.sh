@@ -34,6 +34,12 @@ LIB="$REPO/bin/lib"
 # DEFAULT-ON egress guard: pin the baked-in CP default at a dead port so no un-pinned presence
 # call in this suite resolves the REAL production control plane. Explicit per-invocation pins win.
 . "$REPO/test/lib/net-default-guard.sh"
+# This suite validates the SOLO-MINT + enroll bootstrap — the FALLBACK path taken on a non-GitHub
+# / air-gapped / gh-less first run. The repo below has a github.com remote, so on a machine with
+# `gh` authed the zero-touch auto-github path (POST /team/auto) would fire instead and make a real
+# `gh api user` call (non-hermetic). Disable it here so this suite stays hermetic and asserts the
+# solo path; the auto-github path has its OWN hermetic suite (heimdall-presence-autoteam).
+export HMD_AUTO_TEAM_DISABLE=1
 
 PY="$(command -v python3 || command -v python || true)"
 [ -n "$PY" ] || { echo "FATAL: python not found" >&2; exit 2; }

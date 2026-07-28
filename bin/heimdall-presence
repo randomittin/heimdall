@@ -385,11 +385,16 @@ fi
 # ALREADY HAS it -> auto-joins with zero commands); in a PUBLIC repo it is gitignored
 # (grown via `hmd invite`). It is sent ONCE in the X-Heimdall-Team-Secret header at
 # /enroll; signed beats/reads thereafter carry NO secret (membership is server-side —
-# the signed GET /roster returns the caller's team). If team.json is ABSENT we
-# AUTO-MINT one SILENTLY so a dev is ZERO-CONFIG and starts in their OWN solo team
-# (sees only themselves until they invite). A legacy team.shared.json (the old
-# two-file model's committed secret) is STILL READ for back-compat. The secret crosses
-# bash->python via the ENVIRONMENT only — NEVER argv (argv shows in `ps`).
+# the signed GET /roster returns the caller's team). If team.json is ABSENT the FIRST
+# RUN resolves the team at WIRE TIME (_resolve_team_for_wire, just before enroll/beat):
+# a GitHub repo + `gh` auto-forms the repo's shared team via POST /team/auto (zero-touch —
+# the first teammate INITIATES it, everyone else AUTO-JOINS, no invite/paste; the returned
+# team_id is persisted with NO bearer secret, source:"auto-github"); everything else
+# (no gh / no GitHub remote / air-gapped) falls back to a SILENT solo-mint so a dev is
+# still ZERO-CONFIG in their OWN solo team. A legacy team.shared.json (the old two-file
+# model's committed secret) is STILL READ for back-compat. The secret crosses bash->python
+# via the ENVIRONMENT only — NEVER argv (argv shows in `ps`). THIS block only READS an
+# existing binding; the mint/auto-github decision is deferred to the wire verb below.
 TEAM_DIR="${HEIMDALL_TEAM_DIR:-}"
 if [ -z "$TEAM_DIR" ]; then
   TEAM_TOP="$(git rev-parse --show-toplevel 2>/dev/null || true)"
@@ -398,16 +403,18 @@ fi
 TEAM_FILE="$TEAM_DIR/team.json"
 SHARED_FILE="$TEAM_DIR/team.shared.json"   # LEGACY committed secret (read-only back-compat)
 TEAM_SECRET=""
-# Resolve the team secret — precedence IDENTICAL to heimdall-team `_resolve` so both
-# readers agree byte-for-byte: an EXPLICIT team.json (source new|join|rotate — a
-# deliberate mint/join, incl. the committed private-repo team) wins; else the legacy
-# committed team.shared.json (a teammate who cloned an OLD repo auto-joins); else an
-# auto-solo/legacy team.json; else AUTO-MINT a fresh solo team 0600. All IO is
-# python-side (no jq dependency); any failure leaves TEAM_SECRET empty (enroll then
-# omits the header — graceful, never a traceback).
-TEAM_SECRET="$(HMD_TEAM_DIR_R="$TEAM_DIR" HMD_TEAM_FILE_R="$TEAM_FILE" HMD_TEAM_SHARED_R="$SHARED_FILE" "$PY" - 2>/dev/null <<'PYEOF' || true
-import json, os, secrets, sys, time
-team_dir = os.environ["HMD_TEAM_DIR_R"]
+# READ the team secret — precedence IDENTICAL to heimdall-team `_resolve` so both readers
+# agree byte-for-byte: an EXPLICIT team.json (source new|join|rotate — a deliberate mint/join,
+# incl. the committed private-repo team) wins; else the legacy committed team.shared.json (a
+# teammate who cloned an OLD repo auto-joins); else an auto-solo/legacy team.json. READ-ONLY:
+# a VIRGIN checkout (no binding yet) leaves TEAM_SECRET EMPTY here — the first-run mint (zero-
+# touch auto-github, else solo) happens at WIRE TIME in _resolve_team_for_wire, so an existing
+# binding short-circuits and a GitHub repo gets the auto-team path before any solo-mint. All IO
+# is python-side (no jq dependency); any failure leaves TEAM_SECRET empty (graceful, never a
+# traceback). An AUTO-GITHUB team.json carries a team_id + NO team_secret -> empty here (correct:
+# membership is server-side, no header rides).
+TEAM_SECRET="$(HMD_TEAM_FILE_R="$TEAM_FILE" HMD_TEAM_SHARED_R="$SHARED_FILE" "$PY" - 2>/dev/null <<'PYEOF' || true
+import json, os, sys
 path = os.environ["HMD_TEAM_FILE_R"]
 shared = os.environ["HMD_TEAM_SHARED_R"]
 
@@ -431,25 +438,12 @@ if ps and psrc in ("new", "join", "rotate"):
 # 2) the LEGACY committed team.shared.json (back-compat auto-join).
 if ss:
     sys.stdout.write(ss); sys.exit(0)
-# 3) an auto-solo / legacy team.json.
+# 3) an auto-solo / legacy team.json (a secret-bearing binding).
 if ps:
     sys.stdout.write(ps); sys.exit(0)
-# 4) AUTO-SOLO mint: write team.json 0600 with a fresh 43-char base64url secret.
-try:
-    os.makedirs(team_dir, mode=0o700, exist_ok=True)
-    sec = secrets.token_urlsafe(32)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    try:
-        os.write(fd, (json.dumps({"team_secret": sec, "created": int(time.time()), "source": "auto-solo"}) + "\n").encode("utf-8"))
-    finally:
-        os.close(fd)
-    os.chmod(path, 0o600)
-    sys.stdout.write(sec)
-except FileExistsError:
-    # a concurrent mint won the race -> read it back.
-    sys.stdout.write(_read(path))
-except Exception:
-    sys.stdout.write("")  # nowhere to persist / crypto fault -> stay header-less.
+# 4) FIRST RUN (no binding yet, or an auto-github team.json with no secret): stay EMPTY.
+#    _resolve_team_for_wire mints/auto-joins right before enroll/beat.
+sys.stdout.write("")
 PYEOF
 )"
 
@@ -469,6 +463,7 @@ run_client() {
   PRES_ACTIVITY_TS="${ACTIVITY_TS:-}" \
   PRES_STRICT="$STRICT" PRES_INTERACTIVE="$INTERACTIVE" \
   PRES_CRYPTO_WARN_STAMP="$CRYPTO_WARN_STAMP" \
+  PRES_GH_USER="${PRES_GH_USER:-}" PRES_GH_PROOF="${PRES_GH_PROOF:-}" PRES_REPO="${PRES_REPO:-}" \
   "$PY" - <<'PYEOF'
 import contextlib
 import json
@@ -732,6 +727,37 @@ def main():
         if VERB == "roster":
             render_roster([])
         return 0
+    if VERB == "team-auto":
+        # ZERO-TOUCH GITHUB TEAM FORMATION. resolve_seed() above already ENROLLED this HAID
+        # (REUSING the bootstrap enroll path) so the CP will not fail-close enroll_required.
+        # POST /team/auto with the single-use gh proof INSIDE the signed body (the signature
+        # covers method+path+body). On {ok, team_id, mode} print "<team_id>\t<mode>\t<project>"
+        # to stdout for the bash caller to persist as team.json (no secret). SECURITY: the gh
+        # proof lives ONLY in this request body — it is NEVER printed, logged, or written to
+        # stdout/stderr; any failure returns 1 (the caller degrades to solo-mint) and NEVER
+        # echoes the proof. A non-2xx / missing ok (enroll_required, rate-limit, no route,
+        # transport drop) -> 1.
+        gh_user = os.environ.get("PRES_GH_USER") or ""
+        gh_proof = os.environ.get("PRES_GH_PROOF") or ""
+        repo = os.environ.get("PRES_REPO") or ""
+        if not (gh_user and gh_proof and repo):
+            return 1
+        body = json.dumps({
+            "repo": repo,
+            "gh_user": gh_user,
+            "gh_proof": gh_proof,
+            "haid": HAID,
+        }).encode("utf-8")
+        status, resp = request("POST", "/team/auto", body, seed)
+        if not (200 <= status < 300) or not isinstance(resp, dict) or not resp.get("ok"):
+            return 1
+        team_id = resp.get("team_id") or ""
+        if not team_id:
+            return 1
+        mode = resp.get("mode") or ""
+        project = resp.get("project") or ""
+        sys.stdout.write("%s\t%s\t%s\n" % (team_id, mode, project))
+        return 0
     if VERB == "beat":
         # nonce + ts ride INSIDE the signed body (the signature covers it) so the server's
         # replay-nonce gate can prove this is a LIVE, first-use beat — a captured beat cannot
@@ -799,6 +825,136 @@ if __name__ == "__main__":
             sys.stdout.write("presence: no teammates online\n")
         sys.exit(0)
 PYEOF
+}
+
+# ── FIRST-RUN TEAM RESOLUTION (zero-touch team formation) ──────────────────────────
+# On the FIRST wire beat with NO team binding yet, resolve the repo's team ONCE:
+#   • a GitHub repo (origin on github.com) + `gh` installed & authed + presence ACTIVE (a URL
+#     resolves -> NOT severed) -> POST /team/auto: the FIRST teammate INITIATES the repo's
+#     shared team, EVERYONE else on the same repo AUTO-JOINS the SAME team — no invite, no
+#     paste. Persist the returned NON-SECRET team_id (source:"auto-github", NO bearer secret —
+#     the GitHub proof binds membership server-side; signed beats need no team header).
+#   • else (no gh / no GitHub remote / air-gapped / severed / HMD_AUTO_TEAM_DISABLE) -> SOLO-MINT
+#     (unchanged), so nothing regresses for non-GitHub / offline use.
+# Idempotent (an existing binding short-circuits) + best-effort (any failure -> solo/offline,
+# never a crash). Severed is enforced UPSTREAM too: a severed beat has an EMPTY URL and no-ops
+# at the offline-degrade gate BEFORE dispatch, so /team/auto is never reached (zero egress).
+
+# owner/repo of a github.com `origin` remote, else empty. GIT-ONLY (no network, no gh).
+_github_slug() {
+  local url norm
+  url="$(git config --get remote.origin.url 2>/dev/null || true)"
+  [ -n "$url" ] || return 0
+  norm="$(normalize_remote "$url")"   # scheme/userinfo/port/.git stripped, lowercased
+  case "$norm" in
+    github.com/*/*) printf '%s' "${norm#github.com/}" ;;   # -> owner/repo
+    *) return 0 ;;                                          # not github.com -> not a candidate
+  esac
+}
+
+# SOLO-MINT fallback (the ORIGINAL zero-config behavior): write a fresh 0600 solo team.json and
+# set TEAM_SECRET so the enroll/beat below carries it in the X-Heimdall-Team-Secret header. A dev
+# starts in their OWN solo team (sees only themselves until they invite). python-side IO (no jq);
+# any failure leaves TEAM_SECRET empty (header omitted — graceful).
+_solo_mint() {
+  TEAM_SECRET="$(HMD_TEAM_DIR_R="$TEAM_DIR" HMD_TEAM_FILE_R="$TEAM_FILE" "$PY" - 2>/dev/null <<'PYEOF' || true
+import json, os, secrets, sys, time
+team_dir = os.environ["HMD_TEAM_DIR_R"]
+path = os.environ["HMD_TEAM_FILE_R"]
+
+def _read(p):
+    try:
+        s = json.load(open(p)).get("team_secret")
+    except Exception:
+        return ""
+    return s if isinstance(s, str) else ""
+
+try:
+    os.makedirs(team_dir, mode=0o700, exist_ok=True)
+    sec = secrets.token_urlsafe(32)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        os.write(fd, (json.dumps({"team_secret": sec, "created": int(time.time()), "source": "auto-solo"}) + "\n").encode("utf-8"))
+    finally:
+        os.close(fd)
+    os.chmod(path, 0o600)
+    sys.stdout.write(sec)
+except FileExistsError:
+    sys.stdout.write(_read(path))   # a concurrent mint won the race -> read it back
+except Exception:
+    sys.stdout.write("")            # nowhere to persist -> stay header-less
+PYEOF
+)"
+}
+
+# The auto-github attempt. Resolves gh identity + a SINGLE-USE gh token (transit-only), then
+# drives the signed enroll + POST /team/auto in-process (REUSE run_client's seed/enroll/signer),
+# and persists the returned team_id as team.json (source:"auto-github", NO secret). Returns 0 on
+# a bound team (+ an honest one-liner to stderr, interactive only), nonzero on ANY miss (caller
+# falls back to solo-mint). gh TOKEN DISCIPLINE: fetched here, passed to run_client via the
+# ENVIRONMENT only (PRES_GH_PROOF — never argv, which shows in `ps`), scrubbed from the shell
+# immediately after the call, NEVER written to disk and NEVER echoed (even on error).
+_auto_team_call() {
+  local slug gh_user gh_proof
+  slug="$(_github_slug)"; [ -n "$slug" ] || return 1        # not a github.com repo
+  command -v gh >/dev/null 2>&1 || return 1                 # gh not installed
+  gh_user="$(gh api user --jq .login 2>/dev/null || true)"  # proves gh authed; empty -> bail
+  [ -n "$gh_user" ] || return 1
+  gh_proof="$(gh auth token 2>/dev/null || true)"           # single-use forward; transit-only
+  [ -n "$gh_proof" ] || return 1
+  local out
+  out="$(PRES_GH_USER="$gh_user" PRES_GH_PROOF="$gh_proof" PRES_REPO="$slug" run_client team-auto 2>/dev/null || true)"
+  gh_proof=""; unset gh_proof                                # scrub the proof from the shell ASAP
+  [ -n "$out" ] || return 1                                  # no {ok, team_id} -> miss
+  local team_id mode
+  team_id="$(printf '%s' "$out" | head -1 | cut -f1)"
+  mode="$(printf '%s' "$out" | head -1 | cut -f2)"
+  [ -n "$team_id" ] || return 1
+  # Persist the NON-SECRET team_id (0600; O_EXCL so a concurrent join never clobbers a binding).
+  HMD_TEAM_FILE_W="$TEAM_FILE" HMD_TEAM_DIR_W="$TEAM_DIR" HMD_TEAM_ID_W="$team_id" \
+    "$PY" - <<'PYEOF' 2>/dev/null || return 1
+import json, os, sys, time
+d = os.environ["HMD_TEAM_DIR_W"]
+p = os.environ["HMD_TEAM_FILE_W"]
+tid = os.environ["HMD_TEAM_ID_W"]
+try:
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        os.write(fd, (json.dumps({"team_id": tid, "source": "auto-github", "created": int(time.time())}) + "\n").encode("utf-8"))
+    finally:
+        os.close(fd)
+    os.chmod(p, 0o600)
+except FileExistsError:
+    pass          # a concurrent writer won -> the existing binding stands (idempotent)
+except Exception:
+    sys.exit(1)
+PYEOF
+  # Honest one-liner — stderr only (stdout is the statusline's), gated to a human at a terminal
+  # so the render fork never spams (same discipline as the crypto-missing warning).
+  if [ -n "$INTERACTIVE" ]; then
+    if [ "$mode" = "initiated" ]; then
+      printf 'heimdall: initiated the team for %s (via GitHub)\n' "$PROJECT" >&2
+    else
+      printf 'heimdall: joined your team for %s (via GitHub)\n' "$PROJECT" >&2
+    fi
+  fi
+  return 0
+}
+
+# Resolve the per-repo team for a WIRE beat, ONCE, before the signed enroll/beat. An existing
+# binding (a secret in team.json/shared read above, OR an auto-github team.json file) short-
+# circuits — idempotent, do nothing new. First run: try zero-touch auto-github, else solo-mint.
+# Auto-github is SKIPPED straight to solo when disabled (HMD_AUTO_TEAM_DISABLE), when presence is
+# severed/offline (empty URL -> no /team/auto egress), or with no signer/identity/project.
+_resolve_team_for_wire() {
+  [ -n "$PY" ] || return 0
+  [ -n "$TEAM_SECRET" ] && return 0        # an explicit/legacy/solo team is already resolved
+  [ -f "$TEAM_FILE" ] && return 0          # an auto-github team.json (no secret) already binds
+  if [ -z "${HMD_AUTO_TEAM_DISABLE:-}" ] && [ -n "$URL" ] && [ -n "$HAID" ] && [ -n "$PROJECT" ]; then
+    if _auto_team_call; then return 0; fi  # bound via GitHub -> TEAM_SECRET stays empty (no header)
+  fi
+  _solo_mint                               # fallback: the original solo-mint (sets TEAM_SECRET)
 }
 
 # Best-effort ONE final signed retire beat (opt-out prompt-disappearance). Only attempts when
@@ -986,6 +1142,10 @@ case "$SUB" in
     # Effectively-on here (the OFF guard above already no-op'd an off beat). Honor the
     # --no-files sub-toggle: withhold the file field so the beat body sends file:null.
     _repo_nofiles && FILE=""
+    # FIRST-RUN TEAM: with no binding yet, form the repo's team zero-touch (auto-github, else
+    # solo-mint) BEFORE the signed enroll/beat, so the enroll lands in the right team. Idempotent
+    # + best-effort; a severed beat never reaches here (it no-ops at the offline-degrade gate).
+    _resolve_team_for_wire
     # Resolve the wall-state activity signal: an ACTIVE-verdict beat bumps the stamp to now, a
     # bare keeper/daemon beat carries the stamp mtime forward, absent -> null (server -> IDLE).
     ACTIVITY_TS="$(_resolve_activity_ts)"

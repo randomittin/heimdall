@@ -40,6 +40,10 @@ BIN="$REPO/bin/heimdall-presence"
 # DEFAULT-ON egress guard: pin the baked-in CP default at a dead port so no un-pinned presence
 # call in this suite resolves the REAL production control plane. Explicit per-invocation pins win.
 . "$REPO/test/lib/net-default-guard.sh"
+# This suite validates the self-heal/enroll bootstrap on a repo with a github.com remote. Disable
+# the zero-touch auto-github path (POST /team/auto) so it stays hermetic (no real `gh api user`);
+# the auto-github path has its OWN hermetic suite (heimdall-presence-autoteam).
+export HMD_AUTO_TEAM_DISABLE=1
 DOCTOR="$REPO/bin/heimdall-presence-doctor"
 LIB="$REPO/bin/lib"
 

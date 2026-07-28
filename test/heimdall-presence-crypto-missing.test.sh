@@ -31,6 +31,10 @@ SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$SELF_DIR/.." && pwd)"
 BIN="$REPO/bin/heimdall-presence"
 LIB="$REPO/bin/lib"
+# This suite validates the crypto-missing degrade on a repo with a github.com remote. Disable the
+# zero-touch auto-github path (POST /team/auto) so it stays hermetic (no real `gh api user`); the
+# auto-github path has its OWN hermetic suite (heimdall-presence-autoteam).
+export HMD_AUTO_TEAM_DISABLE=1
 
 PY="$(command -v python3 || command -v python || true)"
 [ -n "$PY" ] || { echo "FATAL: python not found" >&2; exit 2; }
