@@ -3,7 +3,7 @@
   "redirects": [
     {
       "source": "/install",
-      "destination": "https://raw.githubusercontent.com/randomittin/heimdall/v2.3.3/install.sh",
+      "destination": "https://raw.githubusercontent.com/randomittin/heimdall/v2.3.4/install.sh",
       "permanent": false
     }
   ]
