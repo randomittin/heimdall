@@ -215,6 +215,16 @@
       "must_turn_red_gate": "cross-tenant-denial",
       "first_fail_case": "AT5-unbound-repo-autojoin",
       "reject_contract": "attack AT5-unbound-repo-autojoin: expected DENY, candidate returns ALLOW -> gate status=fail at step 'AT5-unbound-repo-autojoin'"
+    },
+    {
+      "name": "autoteam-skips-haid-possession",
+      "file": "autoteam-skips-haid-possession.mjs",
+      "invariant": "INV-AUTOTEAM (haid possession)",
+      "gate_dropped": "the HAID key-possession verification (cp_autoteam: the `sig` must verify under the claimed haid's registered Ed25519 pubkey); the handler binds the request's haid without proving key possession",
+      "attack_that_succeeds": "AT6 — an attacker with admin/push on a repo she controls, who merely KNOWS a victim's already-enrolled HAID, binds that victim's HAID into her team (griefing / cross-team visibility; residual vector §3c)",
+      "must_turn_red_gate": "cross-tenant-denial",
+      "first_fail_case": "AT6-haid-possession",
+      "reject_contract": "attack AT6-haid-possession: expected DENY, candidate returns ALLOW -> gate status=fail at step 'AT6-haid-possession'"
     }
   ]
 }

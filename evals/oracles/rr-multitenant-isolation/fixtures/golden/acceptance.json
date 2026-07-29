@@ -139,6 +139,12 @@
       "expected": "DENY",
       "invariant": "INV-AUTOTEAM (initiate)",
       "attack": "no repo->team binding exists AND the caller lacks admin/push — auto-INITIATE requires admin/push (only someone who controls the repo may mint + bind repo->team), so a read-only non-initiator is refused; auto-join never invents a team"
+    },
+    {
+      "n": "AT6-haid-possession",
+      "expected": "DENY",
+      "invariant": "INV-AUTOTEAM (haid possession)",
+      "attack": "an attacker with admin/push on a repo she controls, who has LEARNED a victim's already-enrolled HAID, hits POST /team/auto binding haid=victim but signs the possession assertion with HER OWN key, not the victim's registered Ed25519 key — the server must verify the possession signature against the REGISTERED pubkey of the claimed haid, so only the actual key-holder can bind their own haid; a missing/forged sig, or a sig that verifies under a different key, binds nothing (residual vector §3c: knowing a HAID must not let a repo admin bind it)"
     }
   ]
 }

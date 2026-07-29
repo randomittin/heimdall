@@ -53,6 +53,7 @@ exactly ONE gate removed.
 | `autoteam-honors-wire-teamid` | INV-1 (auto-join) | server-side `repo → team_id` resolution (`cp_repoteam`) | AT3 — the auto-join honors a caller-supplied `team_id` | `AT3-autojoin-wire-team-id` |
 | `autoteam-public-read-joins` | INV-AUTOTEAM(§5) | the PUBLIC-repo write/push threshold | AT4 — a read-only caller on a PUBLIC repo auto-joins | `AT4-public-read-only-autojoin` |
 | `autoteam-any-caller-initiates` | INV-AUTOTEAM (initiate) | the admin/push requirement for auto-INITIATE | AT5 — a read-only non-initiator invents a team for an unbound repo | `AT5-unbound-repo-autojoin` |
+| `autoteam-skips-haid-possession` | INV-AUTOTEAM (haid possession) | the HAID key-possession verification (`sig` must verify under the claimed haid's registered Ed25519 pubkey) | AT6 — a repo admin who KNOWS a victim's HAID binds it into her team without proving key possession | `AT6-haid-possession` |
 
 Every mutant drops exactly one gate and flips its own attack(s) to `ALLOW`; the golden
 denies all sixteen attacks. Two dropped gates open two attacks each from a single flag —
@@ -80,26 +81,29 @@ Dropping any G* row makes the corresponding INV-GOD mutant survive the same way;
 any L* row makes its INV-LOGIN mutant survive (verified: each drop → score 13/14 = 0.9286,
 `bin/falsify` exits nonzero).
 
-## INV-AUTOTEAM — zero-touch team formation (the five AT rows)
+## INV-AUTOTEAM — zero-touch team formation (the six AT rows)
 
-The five `AT*` rows encode INV-AUTOTEAM — zero-touch team formation
+The six `AT*` rows encode INV-AUTOTEAM — zero-touch team formation
 (`docs/analysis/zero-touch-team-formation.md`; see `INVARIANTS.md`). Membership proof moves
 from "holds the team secret" to "has GitHub access to the repo," enforced SERVER-SIDE: a
 teammate auto-JOINS by proving GitHub repo access (Stratum A caller↔`gh_user` re-derive +
 Stratum B `gh_user`↔repo permission), the operative `team_id` is server-resolved from the
 `repo → team_id` binding (never a wire field), and a first-runner auto-INITIATES only with
-admin/push. The model gates are disjoint from every A*/G*/L*/C* gate:
+admin/push, and the bound `haid` is proven by a key-possession `sig` that verifies under the
+claimed HAID's registered Ed25519 key. The model gates are disjoint from every A*/G*/L*/C* gate:
 `autoteamHasRepoAccess` (AT1 Stratum-B collaborator check), `autoteamVerifyCaller` (AT2
 Stratum-A `GET /user` re-derive), `autoteamResolveTeam` (AT3 server-side `repo → team_id`
 resolution — INV-1 for auto-join), `autoteamMeetsThreshold` (AT4 public write-threshold —
-RJ's public-threshold policy as a single swappable gate), and `autoteamCanInitiate` (AT5
-admin/push required to initiate an unbound repo).
+RJ's public-threshold policy as a single swappable gate), `autoteamCanInitiate` (AT5
+admin/push required to initiate an unbound repo), and `autoteamVerifiesHaidPossession` (AT6
+key-possession: the `sig` must verify under the claimed haid's registered pubkey — only the
+key-holder binds their own haid; closes the residual `sig`-not-enforced vector §3c).
 
-With the AT rows added the oracle grades **23 attacks against 21 mutants**: falsifiability
-score = 21/21 = 1.0 (16 prior + 5 new, all mutants killed, golden passing). Each new mutant
+With the AT rows added the oracle grades **24 attacks against 22 mutants**: falsifiability
+score = 22/22 = 1.0 (21 prior + 1 new AT6, all mutants killed, golden passing). Each new mutant
 flips EXACTLY its own AT* row (verified: `grade.mjs` reports a single `ALLOW` per mutant),
 no existing mutant flips any AT* row, and no AT* mutant flips an existing attack. Dropping
-any AT* row makes its mutant SURVIVE (verified: each drop → score 20/21 = 0.9524,
-`bin/falsify` exits nonzero) — the five auto-team gates are load-bearing, not
+any AT* row makes its mutant SURVIVE (verified: each drop → score 21/22 = 0.9545,
+`bin/falsify` exits nonzero) — the six auto-team gates are load-bearing, not
 green-by-construction. The real `POST /team/auto` handler (`cp_autoteam` / `cp_ghverify` /
 `cp_repoteam`) is implemented later by a separate agent and MUST pass this gate.

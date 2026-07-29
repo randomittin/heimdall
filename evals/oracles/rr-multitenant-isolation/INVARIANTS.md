@@ -160,9 +160,12 @@ is authored independent of (and prior to) the implementation (`cp_autoteam` / `c
 > the operative `team_id` is server-resolved from `repo`, **never** a wire field (INV-1
 > holds for auto-join). First-runner auto-INITIATE (no binding yet) additionally requires
 > the caller to hold **admin/push** — only someone who controls the repo may mint + bind
-> `repo → team`.
+> `repo → team`. The bound `haid` must itself be proven by a **key-possession** assertion
+> that verifies under that HAID's registered Ed25519 key — only the actual key-holder can
+> bind their OWN `haid`.
 
-Formally, for a caller `C` claiming `{gh_user, repo}` with a forwarded token `gh_proof`:
+Formally, for a caller `C` claiming `{gh_user, repo, haid}` with a forwarded token `gh_proof`
+and a possession assertion `sig`:
 
 1. **Stratum A (identity).** The server re-derives the caller's login from `gh_proof` via
    `GET /user` and requires it `== gh_user` — a username claim is never trusted.
@@ -174,13 +177,18 @@ Formally, for a caller `C` claiming `{gh_user, repo}` with a forwarded token `gh
    `repo → team_id` binding (`cp_repoteam`), never a caller-supplied `team_id`.
 4. **Initiate.** When no `repo → team_id` binding exists, auto-INITIATE requires the caller
    to hold **admin/push**; a read-only non-initiator can never invent a team.
+5. **HAID possession.** The bound `haid` must be proven by a canonical key-possession
+   `sig` that VERIFIES under the **registered pubkey of the claimed `haid`** — only the
+   actual key-holder can bind their own `haid`. A missing `sig`, a forged one, or a `sig`
+   that verifies under a **different** key binds nothing; knowing a victim's already-enrolled
+   HAID must not let a repo admin bind it (residual vector §3c — the `sig` is now ENFORCED).
 
 INV-AUTOTEAM composes with the existing invariants: its server-derived team scope is the
 same server-authored binding discipline INV-1 enforces (here `repo → team_id` rather than
 `registered_team(haid)`), and its server-side identity re-derivation mirrors the "verify the
 assertion, never the edge" principle INV-GOD's IAP bridge encodes.
 
-## The five attack rows (all expected DENY)
+## The six attack rows (all expected DENY)
 
 Added to `fixtures/golden/acceptance.json` and modeled in `fixtures/model.mjs`, in fixed
 sequence order after the existing A*/enqueue/G*/L*/C* rows:
@@ -192,6 +200,7 @@ sequence order after the existing A*/enqueue/G*/L*/C* rows:
 | `AT3-autojoin-wire-team-id` | INV-1 (auto-join) | auto-join carries a body/query `team_id` ≠ the `repo → team_id` binding | the server ignores the wire `team_id`, resolves team from `repo` server-side |
 | `AT4-public-read-only-autojoin` | INV-AUTOTEAM(§5) | PUBLIC repo, caller has only **read** (below the write threshold) | the public write-threshold refuses a mere reader — the world can't join the wall |
 | `AT5-unbound-repo-autojoin` | INV-AUTOTEAM (initiate) | no `repo → team_id` binding AND the caller lacks admin/push | only an admin/push holder may auto-initiate — a read-only non-initiator is refused |
+| `AT6-haid-possession` | INV-AUTOTEAM (haid possession) | an admin/push holder who KNOWS a victim's already-enrolled HAID binds `haid=V` but signs `sig` with her OWN key, not V's registered key | the possession `sig` must verify under the registered pubkey of the claimed `haid` — a missing/forged sig, or a sig under a different key, binds nothing (only the key-holder binds their own haid) |
 
 ## Mutant → gate → RED (each new gate is load-bearing)
 
@@ -208,6 +217,7 @@ row is load-bearing.
 | `autoteam-honors-wire-teamid` | server-side `repo → team_id` resolution (`cp_repoteam`) | AT3 — the auto-join honors a caller-supplied `team_id` | `AT3-autojoin-wire-team-id` |
 | `autoteam-public-read-joins` | the PUBLIC-repo write/push threshold | AT4 — a read-only caller on a PUBLIC repo auto-joins | `AT4-public-read-only-autojoin` |
 | `autoteam-any-caller-initiates` | the admin/push requirement for auto-INITIATE | AT5 — a read-only non-initiator invents a team for an unbound repo | `AT5-unbound-repo-autojoin` |
+| `autoteam-skips-haid-possession` | the HAID key-possession verification (`sig` must verify under the claimed haid's registered Ed25519 pubkey) | AT6 — a repo admin who KNOWS a victim's HAID binds it without proving key possession | `AT6-haid-possession` |
 
 Each INV-AUTOTEAM mutant flips EXACTLY one attack (verified: `grade.mjs` reports a single
 `ALLOW` per mutant, and no existing A*/G*/L*/C* mutant flips any AT* row), so every AT* row
@@ -215,10 +225,11 @@ has its own dedicated, disjoint gate.
 
 ## Falsifiability
 
-- Golden (`fixtures/golden/candidate.mjs`, every gate STRONG) DENIES all 23 attacks →
-  `bin/falsify rr-multitenant-isolation --assert-score 1.0` passes (21/21 mutants killed).
-- Dropping any AT* row makes that row's mutant SURVIVE → score 20/21 = 0.9524 →
-  `bin/falsify` exits nonzero. The five auto-team gates are not green-by-construction.
+- Golden (`fixtures/golden/candidate.mjs`, every gate STRONG) DENIES all 24 attacks →
+  `bin/falsify rr-multitenant-isolation --assert-score 1.0` passes (22/22 mutants killed).
+- Dropping any AT* row makes that row's mutant SURVIVE → score 21/22 = 0.9545 →
+  `bin/falsify` exits nonzero. The six auto-team gates are not green-by-construction.
 - The real `POST /team/auto` handler (`cp_autoteam` / `cp_ghverify` / `cp_repoteam`) is
   implemented later by a separate agent and MUST pass this gate — this oracle is authored
-  independent of that implementation.
+  independent of that implementation. AT6 in particular closes the residual `sig`-not-enforced
+  vector (§3c): the impl must ENFORCE the possession signature, not merely accept it.

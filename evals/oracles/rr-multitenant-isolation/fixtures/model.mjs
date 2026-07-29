@@ -374,6 +374,16 @@ const REPO_COLLABORATORS = {
   "alice/webapp": { alice: "admin" },
 };
 
+// The enrolled HAID -> registered Ed25519 pubkey registry (the same enroll binding the
+// rest of the control-plane verifies against — cp_auth's per-HAID public key). A HAID that
+// appears here is already enrolled with a known key; `haid:victim` is a victim whose HAID an
+// attacker with admin/push on some OTHER repo may LEARN but whose Ed25519 private key the
+// attacker does NOT hold. A possession assertion binds only if its signature verifies under
+// the claimed HAID's registered pubkey — the attacker's own key (`pk:mallory`) is not it.
+const HAID_ENROLLED_KEYS = {
+  "haid:victim": "pk:victim",
+};
+
 // ── INV-AUTOTEAM(B) — Stratum-B collaborator check: does `gh_user` have ANY qualifying
 //    access to `repo`? A caller with NO access (not a collaborator) can never auto-join.
 //    Mirrors the server-side permission lookup; the DENY is refuse + no binding written. ──
@@ -415,6 +425,23 @@ export function autoteamMeetsThreshold(gates, repo, permission) {
 export function autoteamCanInitiate(gates, repo, permission) {
   if (gates.autoteamAnyCallerInitiates) return true; // MUTANT: any caller initiates an unbound repo.
   return PERMISSION_RANK[permission] >= PERMISSION_RANK["write"]; // GOLDEN: admin/push required to initiate.
+}
+
+// ── INV-AUTOTEAM (haid possession) — a /team/auto request that binds `haid=V` must be SIGNED
+//    by V's enrolled Ed25519 key: a canonical key-POSSESSION assertion. The server verifies the
+//    possession signature against the REGISTERED pubkey of the claimed haid (HAID_ENROLLED_KEYS),
+//    so only the actual key-holder can bind their OWN haid. A missing signature, a forged one, or
+//    a signature that verifies under a DIFFERENT key (the attacker's) proves no possession and
+//    binds nothing — an admin/push holder on some repo who merely KNOWS a victim's HAID cannot
+//    bind that victim's haid into their team (residual vector §3c). Mirrors cp_autoteam's
+//    per-HAID possession check riding the enrolled-key verify chokepoint. ──
+export function autoteamVerifiesHaidPossession(gates, haid, possessionSig) {
+  if (gates.autoteamSkipsHaidPossession) return true; // MUTANT: skip possession => any caller binds any known HAID.
+  const registeredPubkey = HAID_ENROLLED_KEYS[haid];
+  if (!registeredPubkey) return false; // an unknown/unenrolled haid has no registered key to verify against.
+  // GOLDEN: the possession assertion's signature must verify under the claimed haid's REGISTERED
+  // pubkey — the attacker's own key does not verify, and a missing/forged sig verifies under nothing.
+  return !!possessionSig && possessionSig.verifies_under === registeredPubkey;
 }
 
 // ── The fixed cross-tenant attack sequence. Each returns "DENY" (attack stopped) or
@@ -619,6 +646,18 @@ export function evaluateAttack(gates, attackId) {
       const bound = REPO_TEAM_BINDINGS[req.repo] != null;
       const initiated = !bound && autoteamCanInitiate(gates, req.repo, req.permission);
       return initiated ? "ALLOW" : "DENY";
+    }
+    case "AT6-haid-possession": {
+      // INV-AUTOTEAM (haid possession). Mallory holds admin/push on a repo she controls and has
+      // LEARNED a victim's already-enrolled HAID (haid:victim). She hits POST /team/auto binding
+      // haid=victim to griefing-bind the victim into her team (cross-team visibility). The request
+      // carries a possession assertion, but it is signed by MALLORY's key (pk:mallory), NOT the
+      // victim's registered Ed25519 key (pk:victim). Only a request whose possession signature
+      // verifies under the REGISTERED pubkey of the claimed haid may bind that haid, so the
+      // signature-under-a-different-key (equally: a missing/forged sig) must be refused. Binding
+      // haid=victim without a signature that verifies under the victim's registered key is the ALLOW.
+      const req = { haid: "haid:victim", possessionSig: { verifies_under: "pk:mallory" } };
+      return autoteamVerifiesHaidPossession(gates, req.haid, req.possessionSig) ? "ALLOW" : "DENY";
     }
     default:
       throw new Error("unknown attack id: " + attackId);
