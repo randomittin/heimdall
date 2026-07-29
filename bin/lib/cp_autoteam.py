@@ -35,10 +35,22 @@
 # team_id) and FAIL-CLOSES when the HAID has no registered pubkey. So the caller MUST have
 # enrolled first (POST /enroll binds haid->pubkey) — this route carries no pubkey and therefore
 # cannot enroll. An unenrolled HAID gets a clear 403 "enroll_required": enroll, then re-call
-# /team/auto. The `sig` field is accepted (reserved for the design's key-possession hardening
-# follow-up, §3c) but is DELIBERATELY not the authorization basis in this wave — Strata A+B are,
-# exactly as the design states; wiring it needs a canonical assertion seam that lives in
-# cp_session (out of this wave's file scope), so it is not enforced here.
+# /team/auto.
+#
+# THE HAID KEY-POSSESSION GATE (AT6 — residual vector §3c, NOW ENFORCED). Strata A+B prove the
+# caller controls `gh_user` and holds repo access; they do NOT prove the caller holds the private
+# key of the `haid` being bound. Without that proof, an attacker with admin/push on a repo she
+# controls who merely LEARNS a victim's already-enrolled HAID could bind haid=victim into her team
+# (griefing / cross-team visibility). So every /team/auto that binds haid=V MUST carry a canonical
+# key-POSSESSION assertion SIGNED by V's registered Ed25519 key: `sig` over
+# possession_message(haid, repo_slug, gh_user, nonce, ts), verified with cp_auth.verify against the
+# REGISTERED pubkey of the claimed haid (the §3 chokepoint's verify — registered pubkey + revocation).
+# A missing/forged sig, or one that verifies under a DIFFERENT key, binds NOTHING (only the actual
+# key-holder binds their own haid). The signed nonce is spent single-use (cp_nonce) so a captured
+# assertion cannot be replayed for the same bind, and ts is signed so the freshness window is
+# tamper-evident. This gate runs BEFORE any GitHub API call — a forged possession is refused at the
+# cheapest point (no token spend). The two presence clients (bin/heimdall-presence, bin/heimdall-team)
+# build the BYTE-IDENTICAL possession_message and sign it with the enrolled HAID seed.
 #
 # THE SURFACE. Served PRE-AUTH via register_public_route (like /enroll — the caller may have no
 # signable envelope, and the GitHub strata ARE the auth). (POST, /team/auto) is in
@@ -73,8 +85,36 @@ import cp_repoteam   # the SERVER-SIDE repo->team registry (get/mint/bind) — t
 import cp_ghverify   # the two GitHub strata (verify_gh_identity / check_repo_access / can_initiate).
 import cp_audit      # every refusal + every accepted bind writes an audit row (§9).
 import cp_server     # REUSE register_public_route + Response — the pre-auth registration seam.
+import cp_auth       # AT6: registered_pubkey lookup + verify (Ed25519 over the registered pubkey).
+import cp_nonce      # AT6: the possession assertion's nonce is single-use within the freshness window.
+import cp_state      # AT6: the StateBackend for the nonce seen-set (home-pinned, firestore-safe).
 
-from cp_auth import AuthError  # the single failure type the gh strata raise (mapped to a status).
+from cp_auth import AuthError  # the single failure type the gh strata + the possession verify raise.
+
+
+# ── AT6 — the canonical HAID key-possession assertion (single source of truth; §3c) ────────────
+#
+# The domain-separated bytes the enrolled HAID key SIGNS and cp_autoteam VERIFIES for a /team/auto
+# bind. Mirrors cp_session.assertion_message discipline: a NUL-free domain tag + newline-joined
+# fixed fields, deterministic + unambiguous. The tag stops this signature aliasing ANY other signed
+# message in the system (the request envelope canonical_message, an enroll, a beat, a dashboard
+# login). Binds {haid, repo_slug, gh_user, nonce, ts} so a captured sig cannot be replayed for a
+# DIFFERENT bind (a different haid/repo/gh_user changes the bytes) nor outside its freshness window
+# (ts is signed). bin/heimdall-presence + bin/heimdall-team MUST build the BYTE-IDENTICAL message
+# over the SAME canonical repo_slug (cp_repoteam.repo_slug) or the bind 401s — this is the single
+# source of truth for producer + verifier.
+_POSSESSION_DOMAIN = "heimdall-team-auto-possession-v1"
+
+
+def possession_message(haid, repo_slug, gh_user, nonce, ts):
+    """The canonical possession-assertion bytes for a /team/auto bind (AT6). Domain-tagged +
+    newline-joined {haid, repo_slug, gh_user, nonce, ts}. Pure — no IO. The clients sign this over
+    the SAME canonical repo_slug; the server rebuilds it from the request and verifies the sig
+    against the claimed haid's registered Ed25519 pubkey."""
+    return ("\n".join([
+        _POSSESSION_DOMAIN, str(haid), str(repo_slug), str(gh_user),
+        str(nonce), str(ts),
+    ])).encode("utf-8")
 
 
 # The reason-code -> HTTP status map. A forged/unverifiable GitHub identity is 401 (AT2 — the
@@ -97,6 +137,16 @@ _STATUS_BY_REASON = {
     "gh_unreachable": 503,
     "enroll_required": 403,
     "bind_failed": 500,
+    # AT6 — key-possession refusals. A missing/malformed possession assertion, a forged/wrong-key
+    # signature, an unknown/degraded verify, or a replayed(nonce)/stale assertion is an auth failure
+    # (401); a revoked HAID is authenticated-enough but not authorized (403). None of these bind.
+    "possession_required": 401,
+    "possession_replay": 401,
+    "bad_signature": 401,
+    "unknown_haid": 401,
+    "malformed": 401,
+    "crypto_unavailable": 401,
+    "revoked": 403,
 }
 
 
@@ -112,7 +162,7 @@ def _refuse(haid, slug, reason, detail="", *, home=None):
     return (status, {"ok": False, "reason": reason})
 
 
-def auto_team(repo, gh_user, gh_proof, haid, *, home=None):
+def auto_team(repo, gh_user, gh_proof, haid, *, sig=None, nonce=None, ts=None, home=None):
     """THE testable auto-team core (auto-initiate | auto-join). Composes the two Wave-1
     primitives into one server-verified membership decision and returns a (status, body) tuple.
 
@@ -121,10 +171,18 @@ def auto_team(repo, gh_user, gh_proof, haid, *, home=None):
       gh_user  — the caller's CLAIMED GitHub login (trusted for NOTHING; re-derived at AT2).
       gh_proof — a single-use forwarded GitHub token (transit-only; spent once on GET /user).
       haid     — the caller's Heimdall id; MUST be enrolled (has a registered pubkey) already.
+      sig      — AT6: the base64 Ed25519 signature over possession_message(haid, slug, gh_user,
+                 nonce, ts), proving the caller HOLDS the private key of `haid`.
+      nonce/ts — AT6: the single-use nonce + freshness timestamp signed into the assertion (a
+                 captured sig cannot be replayed for the same bind).
 
     Flow (each step a hard, fail-closed gate — the AT rows in the module header):
       0. repo_slug the repo; unresolvable -> 422 bad_repo. Require gh_user/gh_proof/haid -> else
          422 missing_field.
+      0b. AT6 — KEY POSSESSION. The claimed haid must be enrolled (registered pubkey) else 403
+         enroll_required. `sig` (over possession_message) must verify under that REGISTERED pubkey
+         (cp_auth.verify) — a missing/forged/wrong-key sig -> 401, NO bind. The nonce is then spent
+         single-use (cp_nonce) -> a replayed/stale assertion is 401. Runs BEFORE any GitHub call.
       1. AT2 — verify_gh_identity(gh_proof, gh_user) -> verified_login (a forge -> 401). Every
          downstream check uses verified_login, NEVER the claimed gh_user.
       2. AT3/INV-1 — team = get_team_for_repo(slug): the team is ALWAYS server-derived from the
@@ -149,6 +207,39 @@ def auto_team(repo, gh_user, gh_proof, haid, *, home=None):
             and isinstance(haid, str) and haid.strip()):
         return _refuse(haid, slug, "missing_field",
                        "gh_user, gh_proof and haid are all required", home=home)
+
+    # 0b. AT6 — KEY POSSESSION (residual vector §3c). Prove the caller HOLDS the private key of the
+    #     `haid` it wants to bind, BEFORE any GitHub API cost. Only the actual key-holder binds their
+    #     own haid — an admin/push holder who merely KNOWS a victim's HAID cannot bind it.
+    if not cp_auth.registered_pubkey(haid, home=home):
+        # No registered key => the HAID never enrolled => it cannot prove possession. Surface the
+        # actionable enroll_required (enroll first, then re-call) rather than a bare unknown_haid.
+        return _refuse(haid, slug, "enroll_required",
+                       "the HAID must enroll (POST /enroll) before auto-join", home=home)
+    if not (isinstance(sig, str) and sig.strip()
+            and isinstance(nonce, str) and nonce.strip()):
+        return _refuse(haid, slug, "possession_required",
+                       "a key-possession sig + nonce are required to bind the haid", home=home)
+    try:
+        ts_val = float(ts)
+    except (TypeError, ValueError):
+        return _refuse(haid, slug, "possession_required",
+                       "a numeric possession ts is required to bind the haid", home=home)
+    # Verify the possession signature against the claimed haid's REGISTERED pubkey (registered pubkey
+    # + revocation). A missing/forged sig -> bad_signature; a sig under a DIFFERENT key -> bad_signature;
+    # a revoked haid -> revoked; a degraded backend -> crypto_unavailable. Every one binds NOTHING.
+    try:
+        cp_auth.verify(haid, possession_message(haid, slug, gh_user, nonce, ts), sig, home=home)
+    except AuthError as err:
+        return _refuse(haid, slug, err.reason, err.detail, home=home)
+    # Spend the nonce single-use within the freshness window: a REPLAY of the captured signed bytes
+    # (or a stale ts) is refused so a captured possession assertion cannot be re-bound.
+    fresh, why = cp_nonce.accept(
+        "team-auto-possession", haid, nonce, ts_val,
+        backend=cp_state.get_backend(home=home))
+    if not fresh:
+        return _refuse(haid, slug, "possession_replay",
+                       "the possession assertion is stale or already used (%s)" % why, home=home)
 
     # 1. AT2 — IDENTITY FIRST. Re-derive the caller's TRUE login server-side; a forged claim or an
     #    unverifiable token refuses BEFORE any repo/permission work. verified_login is authoritative.
@@ -198,7 +289,7 @@ def auto_team(repo, gh_user, gh_proof, haid, *, home=None):
 
 def _parse_body(request):
     """Extract the JSON body dict from a request. The wire body is a JSON object carrying
-    {repo, gh_user, gh_proof, haid, sig?}. Tolerant — a malformed/empty/non-object body yields
+    {repo, gh_user, gh_proof, haid, sig, nonce, ts}. Tolerant — a malformed/empty/non-object body yields
     {} (the core then refuses as bad_repo/missing_field), never a crash. Recognizes NOTHING
     executable (no action_type/handler key is honored — DATA only). A `team_id` field, if
     present, is IGNORED here and never read by the core (INV-1)."""
@@ -220,17 +311,20 @@ def _parse_body(request):
 
 def auto_team_route(request, *, home=None):
     """POST /team/auto — the PRE-AUTH auto-initiate/auto-join handler (served BEFORE the §3
-    chokepoint; the GitHub strata are the auth). `request` is the cp_server request dict; the
-    body is JSON {repo, gh_user, gh_proof, haid, sig?}. Runs the gated auto_team() core and maps
-    its (status, body) tuple to a Response. The body is ONLY {ok, team_id, mode, project} on
-    success / {ok:false, reason} on refusal — never the forwarded token, never a bearer secret.
-    DATA only — dispatches nothing."""
+    chokepoint; the GitHub strata + the AT6 possession sig are the auth). `request` is the
+    cp_server request dict; the body is JSON {repo, gh_user, gh_proof, haid, sig, nonce, ts}.
+    Runs the gated auto_team() core and maps its (status, body) tuple to a Response. The body is
+    ONLY {ok, team_id, mode, project} on success / {ok:false, reason} on refusal — never the
+    forwarded token, never a bearer secret. DATA only — dispatches nothing."""
     payload = _parse_body(request)
     status, body = auto_team(
         payload.get("repo"),
         payload.get("gh_user"),
         payload.get("gh_proof"),
         payload.get("haid"),
+        sig=payload.get("sig"),
+        nonce=payload.get("nonce"),
+        ts=payload.get("ts"),
         home=home,
     )
     return cp_server.Response(status, body)

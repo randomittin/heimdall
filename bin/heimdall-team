@@ -599,12 +599,12 @@ gh_auto() { # $1 = loud|quiet
   RES="$(HMD_URL="$URL" HMD_REPO="$SLUG" HMD_GH_USER="$GH_USER" HMD_GH_PROOF="$GH_PROOF" \
          HMD_HAID="$HAID" HMD_SEED_FILE="$SEED_FILE" HMD_LIB="$LIB_DIR" "$PY" - <<'PYEOF'
 import json, os, sys
+import secrets, time
 import urllib.error
 import urllib.request
 
 url = os.environ["HMD_URL"].rstrip("/")
-# The base body the OPTIONAL signature covers (sig is appended AFTER, last key, so the server
-# strips it and re-serializes the remainder in the SAME order to verify).
+# The base body the possession signature binds (sig/nonce/ts are appended AFTER).
 base = {
     "repo": os.environ["HMD_REPO"],
     "gh_user": os.environ["HMD_GH_USER"],
@@ -614,17 +614,34 @@ base = {
 body = json.dumps(base, separators=(",", ":")).encode("utf-8")
 seed_file = os.environ.get("HMD_SEED_FILE") or ""
 lib = os.environ.get("HMD_LIB") or ""
+# AT6 KEY POSSESSION: when this dev is already enrolled (a local 0600 seed exists), sign the
+# canonical possession assertion — cp_autoteam.possession_message(haid, slug, gh_user, nonce, ts) —
+# with the enrolled HAID seed so the server verifies key possession against the registered pubkey
+# (only the key-holder binds their own haid). Built BYTE-IDENTICAL to cp_autoteam.possession_message
+# over the SAME canonical slug (cp_repoteam.repo_slug). Seed material stays in-process (read from the
+# 0600 file, never argv/logged). A missing seed omits the sig -> the server refuses the bind and the
+# caller falls back to the bearer-secret path (a dev is never left teamless).
 if seed_file and os.path.exists(seed_file) and lib:
     try:
         sys.path.insert(0, lib)
         import cp_auth as K
+        import cp_repoteam as R
         if K.crypto_available():
             with open(seed_file, "r", encoding="utf-8") as fh:
                 seed = fh.read().strip()
             if seed:
-                sig = K.sign(seed, K.canonical_message("POST", "/team/auto", body))
+                slug = R.repo_slug(base["repo"]) or base["repo"]
+                nonce = secrets.token_hex(16)
+                ts = int(time.time())
+                possession = ("\n".join([
+                    "heimdall-team-auto-possession-v1", base["haid"], slug,
+                    base["gh_user"], nonce, str(ts),
+                ])).encode("utf-8")
+                sig = K.sign(seed, possession)
                 signed = dict(base)
                 signed["sig"] = sig
+                signed["nonce"] = nonce
+                signed["ts"] = ts
                 body = json.dumps(signed, separators=(",", ":")).encode("utf-8")
     except Exception:
         body = json.dumps(base, separators=(",", ":")).encode("utf-8")

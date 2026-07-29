@@ -742,11 +742,29 @@ def main():
         repo = os.environ.get("PRES_REPO") or ""
         if not (gh_user and gh_proof and repo):
             return 1
+        # AT6 KEY POSSESSION: prove this dev HOLDS the private key of HAID before the server binds it
+        # (only the key-holder binds their own haid — closes the "admin+known-victim-HAID" griefing
+        # vector). Sign the canonical possession assertion — cp_autoteam.possession_message(haid,
+        # slug, gh_user, nonce, ts) — with the enrolled seed (resolve_seed() above already ENROLLED
+        # this HAID, so the registered pubkey exists to verify against). Built BYTE-IDENTICAL to
+        # cp_autoteam.possession_message over the SAME canonical slug (cp_repoteam.repo_slug). The
+        # nonce is single-use + ts is signed, so a captured sig can't be replayed for a different bind.
+        import cp_repoteam as R  # the SAME slug canonicalizer the server verifies against.
+        slug = R.repo_slug(repo) or repo
+        nonce = secrets.token_hex(16)
+        ts = int(time.time())
+        possession = ("\n".join([
+            "heimdall-team-auto-possession-v1", HAID, slug, gh_user, nonce, str(ts),
+        ])).encode("utf-8")
+        sig = K.sign(seed, possession)
         body = json.dumps({
             "repo": repo,
             "gh_user": gh_user,
             "gh_proof": gh_proof,
             "haid": HAID,
+            "sig": sig,
+            "nonce": nonce,
+            "ts": ts,
         }).encode("utf-8")
         status, resp = request("POST", "/team/auto", body, seed)
         if not (200 <= status < 300) or not isinstance(resp, dict) or not resp.get("ok"):

@@ -32,6 +32,16 @@ done
 PY="$(command -v python3 || command -v python || true)"
 [ -n "$PY" ] || { echo "FATAL: python not found" >&2; exit 2; }
 
+# AT6 (key-possession) VERIFIES real Ed25519 signatures, so every bind path now needs a crypto
+# backend (cryptography/pynacl). Absent one, cp_auth.verify fail-closes crypto_unavailable and NO
+# bind can succeed — the whole hermetic driver is meaningless. Detect + SKIP cleanly (exit 0),
+# mirroring heimdall-presence-autoteam's CRYPTO gate.
+CRYPTO="$("$PY" -c "import sys;sys.path.insert(0,'$LIB');import cp_auth;print('1' if cp_auth.crypto_available() else '0')" 2>/dev/null || echo 0)"
+if [ "$CRYPTO" != "1" ]; then
+  echo "SKIP heimdall-cp-autoteam: no Ed25519 backend (cryptography/pynacl) — AT6 possession verify unavailable"
+  exit 0
+fi
+
 PASS=0
 FAIL=0
 ok()  { PASS=$((PASS+1)); printf "  \033[32mPASS\033[0m %s\n" "$1"; }
@@ -115,16 +125,38 @@ def fake_get(url, token, *, timeout=None):
 
 V._http_get_json = fake_get
 
-# ── enroll (register a pubkey for) the HAIDs the happy paths bind; a dummy pubkey is fine — the
-#    bind only needs registered_pubkey() to be truthy (the enroll-then-autojoin precondition). ──
+import secrets, time
+
+# ── enroll (register a REAL Ed25519 pubkey for) the HAIDs the happy paths bind. AT6 now VERIFIES a
+#    key-possession signature against this registered pubkey, so a dummy pubkey no longer suffices —
+#    each HAID gets a real keypair and we keep its private seed to sign the possession assertion. ──
+SEEDS = {}   # haid -> private_b64 (the enrolled signing seed the client would hold locally)
+
+def enroll_real(haid):
+    priv, pub = cp_auth.generate_keypair()
+    cp_auth.register_key(haid, pub, owner=False, project="proj")
+    SEEDS[haid] = priv
+
 for h in ("haid-alice", "haid-founder", "haid-dev2"):
-    cp_auth.register_key(h, "cHVia2V5LWJ5dGVz", owner=False, project="proj")
+    enroll_real(h)
+
+def possession(haid, repo, gh_user, nonce, ts):
+    """The client-side signing input: BYTE-IDENTICAL to cp_autoteam.possession_message over the
+    SAME canonical slug (cp_repoteam.repo_slug) the server verifies against."""
+    return A.possession_message(haid, R.repo_slug(repo), gh_user, nonce, ts)
 
 out = {}
 
-def call(repo, gh_user, gh_proof, haid):
-    """auto_team core -> {status, reason?, team_id?, mode?}."""
-    status, body = A.auto_team(repo, gh_user, gh_proof, haid)
+def call(repo, gh_user, gh_proof, haid, *, sign_as=None):
+    """auto_team core -> {status, reason?, team_id?, mode?}. Signs a FRESH, valid key-possession
+    assertion with `sign_as`'s (default `haid`'s) enrolled seed — the AT6 precondition every legit
+    bind now carries. A haid with no enrolled seed (e.g. haid-ghost) sends NO sig (the server
+    fail-closes enroll_required before it ever checks the sig)."""
+    nonce = secrets.token_hex(16)
+    ts = int(time.time())
+    seed = SEEDS.get(sign_as or haid)
+    sig = cp_auth.sign(seed, possession(haid, repo, gh_user, nonce, ts)) if seed else None
+    status, body = A.auto_team(repo, gh_user, gh_proof, haid, sig=sig, nonce=nonce, ts=ts)
     r = {"status": status}
     r.update({k: body.get(k) for k in ("reason", "team_id", "mode", "ok")})
     return r
@@ -164,10 +196,14 @@ out["at4_public_readonly"] = call("pub/site", "reader", "tok_reader", "haid-dev2
 out["at2_forged"] = call("alice/widgets", "alice", "tok_mallory", "haid-alice")
 
 # ── AT3: a WIRE team_id in the body is IGNORED — the team is server-resolved from the repo binding.
-#        Driven through the ROUTE (which parses the body) with an evil team_id; alice (read) joins. ──
+#        Driven through the ROUTE (which parses the body) with an evil team_id; alice (read) joins.
+#        Carries a VALID possession assertion so the route reaches the join (AT6 is not the subject). ──
+_n3 = secrets.token_hex(16); _t3 = int(time.time())
+_sig3 = cp_auth.sign(SEEDS["haid-alice"], possession("haid-alice", "alice/widgets", "alice", _n3, _t3))
 req = {"body": json.dumps({
     "repo": "alice/widgets", "gh_user": "alice", "gh_proof": "tok_alice",
-    "haid": "haid-alice", "team_id": "WIRE_EVIL_TEAM", "sig": "ignored-in-this-wave"})}
+    "haid": "haid-alice", "team_id": "WIRE_EVIL_TEAM",
+    "sig": _sig3, "nonce": _n3, "ts": _t3})}
 resp = A.auto_team_route(req)
 out["at3_route_status"] = resp.status
 out["at3_returned_team"] = resp.body.get("team_id")
@@ -185,6 +221,44 @@ shed = [P.check_autoteam(flood_req) for _ in range(3)]
 out["ratelimit_first_two_allow"] = (shed[0] is None and shed[1] is None)
 out["ratelimit_third_shed"] = (isinstance(shed[2], tuple) and shed[2][0] == 429
                                and shed[2][1].get("scope") == "autoteam_ip")
+
+# ── AT6 (haid KEY-POSSESSION, residual vector §3c). An attacker who KNOWS a victim's already-
+#    enrolled HAID must NOT be able to bind it: only the holder of the victim's registered Ed25519
+#    key may bind haid=victim. We drive the JOIN path of the now-bound founder/newrepo (a private
+#    repo where dev2 holds read) — possession is checked BEFORE the repo strata, so the sig is the
+#    deciding factor. victim holds a real enrolled key; mallory holds a DIFFERENT (unrelated) key. ──
+_vpriv, _vpub = cp_auth.generate_keypair()
+cp_auth.register_key("haid-victim", _vpub, owner=False, project="proj")  # victim's REGISTERED key.
+_mpriv, _mpub = cp_auth.generate_keypair()                              # attacker's key (NOT the victim's).
+AT6_REPO = "founder/newrepo"   # bound to Tnew (private); dev2 has read -> join-eligible.
+
+def at6_call(sig, nonce, ts):
+    status, body = A.auto_team(AT6_REPO, "dev2", "tok_dev2", "haid-victim",
+                               sig=sig, nonce=nonce, ts=ts)
+    r = {"status": status}
+    r.update({k: body.get(k) for k in ("reason", "team_id", "mode", "ok")})
+    return r
+
+# AT6a — a VALID own-key possession sig BINDS (mode joined, the server-derived team Tnew).
+_n6 = secrets.token_hex(16); _t6 = int(time.time())
+_sig6ok = cp_auth.sign(_vpriv, possession("haid-victim", AT6_REPO, "dev2", _n6, _t6))
+out["at6_valid"] = at6_call(_sig6ok, _n6, _t6)
+out["at6_valid_binds"] = (out["at6_valid"]["status"] == 200 and out["at6_valid"]["team_id"] == Tnew)
+
+# AT6b — a MISSING possession sig is DENIED (possession_required); nothing binds.
+out["at6_missing"] = at6_call(None, secrets.token_hex(16), int(time.time()))
+
+# AT6c — a sig under a DIFFERENT key (mallory's, over the victim's assertion) is DENIED
+#        (bad_signature): it does NOT verify under the victim's REGISTERED pubkey.
+_nw = secrets.token_hex(16); _tw = int(time.time())
+_sig6wrong = cp_auth.sign(_mpriv, possession("haid-victim", AT6_REPO, "dev2", _nw, _tw))
+out["at6_wrongkey"] = at6_call(_sig6wrong, _nw, _tw)
+
+# AT6d — a REPLAYED nonce is DENIED (possession_replay): the SAME accepted (sig, nonce, ts) resent.
+_nr = secrets.token_hex(16); _tr = int(time.time())
+_sig6r = cp_auth.sign(_vpriv, possession("haid-victim", AT6_REPO, "dev2", _nr, _tr))
+out["at6_replay_first"] = at6_call(_sig6r, _nr, _tr)    # first use: accepted + binds.
+out["at6_replay_second"] = at6_call(_sig6r, _nr, _tr)   # replay: same signed bytes -> denied.
 
 # ── transit-only proof: tokens WERE used (calls happened) but must NEVER persist anywhere. ──
 out["saw_forwarded_gh_token"] = ("tok_founder" in SEEN_TOKENS)
@@ -248,6 +322,27 @@ jk(){ printf '%s' "$R" | "$PY" -c "import json,sys;print(json.load(sys.stdin).ge
 [ "$(jk enroll_required status)" = "403" ] && [ "$(jk enroll_required reason)" = "enroll_required" ] \
   && ok "enroll-then-autojoin: an UNENROLLED HAID is refused enroll_required (enroll first, then re-call)" \
   || bad "enroll-required precondition broken (R=$R)"
+
+# ── AT6 key-possession: valid own-key sig BINDS ──
+[ "$(jk at6_valid status)" = "200" ] && [ "$(j at6_valid_binds)" = "True" ] \
+  && ok "AT6 a VALID own-key possession sig binds the haid (verifies under the registered pubkey)" \
+  || bad "AT6 valid own-key possession did not bind (R=$R)"
+
+# ── AT6 key-possession: MISSING sig denied ──
+[ "$(jk at6_missing status)" = "401" ] && [ "$(jk at6_missing reason)" = "possession_required" ] \
+  && ok "AT6 a MISSING possession sig is DENIED (401 possession_required) — no bind" \
+  || bad "AT6 a missing possession sig was not denied (R=$R)"
+
+# ── AT6 key-possession: sig under a DIFFERENT key denied ──
+[ "$(jk at6_wrongkey status)" = "401" ] && [ "$(jk at6_wrongkey reason)" = "bad_signature" ] \
+  && ok "AT6 a sig under a DIFFERENT key is DENIED (401 bad_signature) — only the key-holder binds their haid" \
+  || bad "AT6 a forged (different-key) possession sig was not denied (R=$R)"
+
+# ── AT6 key-possession: REPLAYED nonce denied ──
+[ "$(jk at6_replay_first status)" = "200" ] && [ "$(jk at6_replay_second status)" = "401" ] \
+  && [ "$(jk at6_replay_second reason)" = "possession_replay" ] \
+  && ok "AT6 a REPLAYED possession nonce is DENIED (401 possession_replay) — a captured sig cannot re-bind" \
+  || bad "AT6 a replayed possession nonce was not denied (R=$R)"
 
 # ── rate-limit shed ──
 [ "$(j ratelimit_first_two_allow)" = "True" ] && [ "$(j ratelimit_third_shed)" = "True" ] \
