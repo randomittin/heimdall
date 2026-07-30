@@ -389,6 +389,154 @@ else
   bad "empty local dry-run missing banner/hint (rc=$EMPTY_RC)"; cat "$EXT/empty.out"
 fi
 
+# ══ CROSS-REPO-SHARED TEAM COLLISION (the fail-closed guard) ════════════════════════════════════
+# THE BUG (from a real prod --dry-run): a single team_id can beat under MULTIPLE projects (a reused/
+# default/maintainer team). The presence-tree grouping then lands that SAME team_id in MULTIPLE
+# repo_slug groups — elected canonical in one, superseded in another. Re-pointing its members toward
+# ONE repo YANKS them out of the others (a HAID has exactly ONE registered_team). The tool MUST
+# fail-closed: never re-point a cross-repo team, never elect it as an absorbing canonical, report it.
+#
+# FIXTURE (its OWN HEIMDALL_HOME so it is independent of the split fixture above). Mirrors the prod
+# collision EXACTLY — a shared team that is elected canonical in one repo but SUPERSEDED in another
+# (the path that actually corrupts membership):
+#   * T_SHARED beats under TWO projects — sole team under owner/repo-a (would be its canonical), AND
+#     present under owner/repo-b ALONGSIDE an EXCLUSIVE team T_B that is EARLIER (T_B wins repo-b's
+#     election). WITHOUT the guard, repo-b elects T_B and re-points HS2 (a T_SHARED member) onto T_B
+#     — YANKING it out of T_SHARED where its teammate HS1 still lives. That is the corruption.
+#   * owner/repo-c is a GENUINE split with two EXCLUSIVE teams T_C1 (earliest→canonical) + T_C2 —
+#     the SAFE path that must still converge untouched.
+COL_HOME="$EXT/collision-home"; mkdir -p "$COL_HOME"
+export HEIMDALL_HOME="$COL_HOME"        # team_of/tree_digest read HEIMDALL_HOME at call time.
+
+T_SHARED="dddd3333dddd3333dddd3333dddd3333"
+T_B="9999bbbb9999bbbb9999bbbb9999bbbb"     # exclusive to repo-b, earlier → repo-b's canonical
+T_C1="eeee4444eeee4444eeee4444eeee4444"
+T_C2="ffff5555ffff5555ffff5555ffff5555"
+REPO_A="github.com/owner/repo-a"
+REPO_B="github.com/owner/repo-b"
+REPO_C="github.com/owner/repo-c"
+HS1="haid:sam.a-1a1a"    # T_SHARED under repo-a (canonical there)
+HS2="haid:sue.b-2b2b"    # T_SHARED under repo-b — the member a broken run would YANK onto T_B
+HB1="haid:ben.b-5b5b"    # T_B under repo-b (earliest in repo-b → its canonical)
+HC1="haid:cid.c-3c3c"    # T_C1 under repo-c (earliest → canonical)
+HC2="haid:cad.c-4c4c"    # T_C2 under repo-c (superseded → repointed to T_C1)
+export T_SHARED T_B T_C1 T_C2 REPO_A REPO_B REPO_C HS1 HS2 HB1 HC1 HC2
+
+"$PY" - <<'PY' || { echo "FATAL: collision seed failed" >&2; exit 2; }
+import os, sys
+sys.path.insert(0, os.environ["LIB"])
+import cp_auth, cp_presence, cp_state
+home = os.environ["HEIMDALL_HOME"]
+backend = cp_state.get_backend(home=home)
+PK = "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVowMTIzNDU2Nzg5"
+def reg(haid, team, enrolled):
+    assert cp_auth.register_key(haid, PK, team_id=team, enrolled_at=enrolled, home=home)
+def pres(project, team, haid):
+    rec = cp_presence.build_record(haid, project=project, handle="h")
+    assert backend.put_record(cp_presence._record_rel(project, team, haid), rec)
+reg(os.environ["HS1"], os.environ["T_SHARED"], 500)
+reg(os.environ["HB1"], os.environ["T_B"], 600)      # earliest in repo-b → repo-b's canonical
+reg(os.environ["HS2"], os.environ["T_SHARED"], 900) # later than T_B so T_B wins repo-b's election
+reg(os.environ["HC1"], os.environ["T_C1"], 700)
+reg(os.environ["HC2"], os.environ["T_C2"], 800)
+pres(os.environ["REPO_A"], os.environ["T_SHARED"], os.environ["HS1"])
+pres(os.environ["REPO_B"], os.environ["T_SHARED"], os.environ["HS2"])
+pres(os.environ["REPO_B"], os.environ["T_B"], os.environ["HB1"])
+pres(os.environ["REPO_C"], os.environ["T_C1"], os.environ["HC1"])
+pres(os.environ["REPO_C"], os.environ["T_C2"], os.environ["HC2"])
+print("collision-seeded")
+PY
+
+# DRY-RUN zero-write on the collision fixture: writes NOTHING and reports the cross-repo team.
+COL_BEFORE="$(tree_digest)"
+"$CONVERGE_CLI" --dry-run >"$EXT/col-dry.out" 2>&1
+COL_DRY_RC=$?
+COL_AFTER="$(tree_digest)"
+if [ "$COL_DRY_RC" -eq 0 ] && [ "$COL_BEFORE" = "$COL_AFTER" ]; then
+  ok "collision --dry-run wrote NOTHING (tree digest unchanged)"
+else
+  bad "collision --dry-run mutated state (rc=$COL_DRY_RC)"; cat "$EXT/col-dry.out"
+fi
+if grep -q "CROSS-REPO TEAMS (skipped" "$EXT/col-dry.out" && grep -q "$T_SHARED" "$EXT/col-dry.out"; then
+  ok "collision --dry-run reports T_SHARED under CROSS-REPO TEAMS (skipped)"
+else
+  bad "collision --dry-run did not report the cross-repo team"; cat "$EXT/col-dry.out"
+fi
+
+# EXECUTE the collision convergence (local store opt-in).
+"$CONVERGE_CLI" --allow-local >"$EXT/col-run1.out" 2>&1
+COL_RUN1_RC=$?
+[ "$COL_RUN1_RC" -eq 0 ] && ok "collision converge run exited 0" \
+  || { bad "collision converge run exited $COL_RUN1_RC"; cat "$EXT/col-run1.out"; }
+
+# FALSIFIABLE CORE: the shared team was NOT re-pointed under either repo (both HAIDs keep T_SHARED).
+if [ "$(team_of "$HS1")" = "$T_SHARED" ] && [ "$(team_of "$HS2")" = "$T_SHARED" ]; then
+  ok "cross-repo team NOT re-pointed (HS1+HS2 still T_SHARED after a real run)"
+else
+  bad "cross-repo team WAS re-pointed (HS1=$(team_of "$HS1") HS2=$(team_of "$HS2")) — membership corruption"
+fi
+
+# the shared team was NEVER elected as a repo->team canonical (no absorbing bind under repo-a/repo-b).
+BOUND_A="$("$PY" - <<'PY'
+import os, sys
+sys.path.insert(0, os.environ["LIB"])
+import cp_repoteam
+print(cp_repoteam.get_team_for_repo(os.environ["REPO_A"], home=os.environ["HEIMDALL_HOME"]) or "")
+PY
+)"
+BOUND_B="$("$PY" - <<'PY'
+import os, sys
+sys.path.insert(0, os.environ["LIB"])
+import cp_repoteam
+print(cp_repoteam.get_team_for_repo(os.environ["REPO_B"], home=os.environ["HEIMDALL_HOME"]) or "")
+PY
+)"
+# repo-a (T_SHARED its only/elected team) is SKIPPED → left UNBOUND; repo-b safely converges its
+# EXCLUSIVE canonical T_B (a cross-repo MEMBER in the group never blocks the exclusive election).
+if [ -z "$BOUND_A" ] && [ "$BOUND_B" = "$T_B" ]; then
+  ok "cross-repo team not elected (repo-a left UNBOUND, repo-b safely bound to exclusive T_B)"
+else
+  bad "wrong canonical binding (a='$BOUND_A' want empty; b='$BOUND_B' want $T_B)"
+fi
+
+# the CONFLICTS LEDGER records T_SHARED and BOTH repo_slugs it spans.
+CONFLICTS="$HEIMDALL_HOME/control-plane/migration/team-converge/_conflicts.json"
+if "$PY" - "$CONFLICTS" <<'PY'
+import json, os, sys
+d = json.load(open(sys.argv[1]))
+rows = {c["team_id"]: set(c["repo_slugs"]) for c in d["conflicts"]}
+t = os.environ["T_SHARED"]
+assert t in rows, ("T_SHARED absent from conflicts ledger", d)
+assert rows[t] == {"owner/repo-a", "owner/repo-b"}, rows[t]
+print("conflicts-ledger-ok")
+PY
+then
+  ok "conflicts ledger records T_SHARED spanning both repo_slugs"
+else
+  bad "conflicts ledger missing/incorrect ($CONFLICTS)"; cat "$CONFLICTS" 2>/dev/null
+fi
+
+# THE SAFE PATH IS UNAFFECTED: repo-c's two EXCLUSIVE teams still converge onto T_C1.
+if [ "$(team_of "$HC1")" = "$T_C1" ] && [ "$(team_of "$HC2")" = "$T_C1" ]; then
+  ok "genuinely-split repo-c converged its two EXCLUSIVE teams onto T_C1 (safe path intact)"
+else
+  bad "repo-c did not converge (HC1=$(team_of "$HC1") HC2=$(team_of "$HC2"))"
+fi
+
+# IDEMPOTENT: a second collision run is a byte-identical no-op (keys + conflicts + repo-c ledger).
+COL_KEYS="$HEIMDALL_HOME/control-plane/auth/keys.json"
+COL_LEDGER="$(ls "$HEIMDALL_HOME"/control-plane/migration/team-converge/*.json 2>/dev/null)"
+sha() { "$PY" -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$1"; }
+COL_K_BEFORE="$(sha "$COL_KEYS")"; COL_C_BEFORE="$(sha "$CONFLICTS")"
+"$CONVERGE_CLI" --allow-local >"$EXT/col-run2.out" 2>&1
+COL_RUN2_RC=$?
+COL_K_AFTER="$(sha "$COL_KEYS")"; COL_C_AFTER="$(sha "$CONFLICTS")"
+if [ "$COL_RUN2_RC" -eq 0 ] && [ "$COL_K_BEFORE" = "$COL_K_AFTER" ] && [ "$COL_C_BEFORE" = "$COL_C_AFTER" ]; then
+  ok "collision second run is a byte-identical no-op (keys.json + _conflicts.json unchanged)"
+else
+  bad "collision second run mutated state (rc=$COL_RUN2_RC keys:$COL_K_BEFORE/$COL_K_AFTER conflicts:$COL_C_BEFORE/$COL_C_AFTER)"
+fi
+
 echo
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1

@@ -42,6 +42,17 @@
 # PRESERVING pubkey/owner/project/enrolled_at and swapping ONLY team_id. It NEVER hard-deletes a
 # key/enrollment (the cp_auth registry-eviction path is never invoked) — losers only lose a member.
 #
+# FAIL-CLOSED ON CROSS-REPO-SHARED team_ids (the safety invariant). A single team_id can leave
+# beats under MULTIPLE projects (a reused/default/maintainer team). The presence-tree grouping then
+# lands that SAME team_id in MULTIPLE repo_slug groups — elected canonical in one, superseded in
+# another. Because a HAID has exactly ONE registered_team (cp_auth), re-pointing a shared team's
+# members toward one repo YANKS them out of the other repos that share it (order-dependent
+# membership corruption). A two-pass detection computes every team_id present in >1 group; those
+# CROSS-REPO teams are NEVER re-pointed and NEVER elected as an absorbing canonical — the group is
+# SKIPPED and the team is reported under "CROSS-REPO TEAMS (skipped — manual review)" and recorded
+# in migration/team-converge/_conflicts.json for human/repo-binding disambiguation. Only UNAMBIGUOUS
+# groups (all split team_ids exclusive to that one repo) converge, exactly as before.
+#
 # stdlib-only (argparse/json/os/sys/time) + the SHIPPED cp_state / cp_auth / cp_repoteam /
 # cp_presence substrate — no new dependency; honors HEIMDALL_HOME so a test pins a temp backend.
 
@@ -468,6 +479,21 @@ def converge(*, home=None, dry_run=False, allow_local=False, out=sys.stdout, err
     backend = cp_state.get_backend(home=home)
     groups, reg_keys = _scan(backend, home)
 
+    # ── PASS 2: CROSS-REPO-SHARED team detection (the fail-closed guard) ─────────────────────────
+    # A single team_id can leave presence beats under MULTIPLE projects — a reused/default/maintainer
+    # team whose members worked across several repos. The presence-tree grouping then lands that SAME
+    # team_id in MULTIPLE repo_slug groups (elected canonical in one, superseded in another). Because
+    # a HAID has exactly ONE registered_team (cp_auth), re-pointing such a shared team's members
+    # toward one repo YANKS them out of the OTHER repos that share it — order-dependent membership
+    # corruption. So: any team_id present in MORE THAN ONE group's presence tree is AMBIGUOUS — its
+    # home repo cannot be inferred — and must NEVER be re-pointed nor elected as an absorbing
+    # canonical. cross_repo maps such a team_id -> the sorted repo_slugs it spans.
+    _tid_to_slugs = {}
+    for slug, g in groups.items():
+        for tid in g["team_ids"]:
+            _tid_to_slugs.setdefault(tid, set()).add(slug)
+    cross_repo = {tid: sorted(slugs) for tid, slugs in _tid_to_slugs.items() if len(slugs) > 1}
+
     mode = "DRY-RUN (zero writes)" if dry_run else "EXECUTE"
     out.write("heimdall-team-converge [%s] — %d repo_slug group(s)\n" % (mode, len(groups)))
     if not groups and is_local:
@@ -475,24 +501,56 @@ def converge(*, home=None, dry_run=False, allow_local=False, out=sys.stdout, err
                   "HEIMDALL_STATE_BACKEND=firestore (this run did NOT read prod Firestore).\n")
 
     total_repointed = 0
+    skipped_groups = []
     for slug in sorted(groups):
         g = groups[slug]
 
-        # 1. ELECT canonical — the /team/auto binding if present, else earliest-enrolled_at.
+        # The cross-repo team_ids present in THIS group + the registry-present HAIDs that belong to
+        # them — those HAIDs are PROTECTED: never re-pointed (they live in the shared team that also
+        # serves other repos), so a converge here cannot yank them out of those repos.
+        cross_in_group = sorted(tid for tid in g["team_ids"] if tid in cross_repo)
+        protected = set()
+        for tid in cross_in_group:
+            protected |= g["team_members"].get(tid, set())
+
+        # 1. ELECT canonical — the /team/auto binding if present, else earliest-enrolled_at. READ
+        #    ONLY here: do NOT bind yet, so a group that elects a cross-repo team writes NOTHING.
         canonical = cp_repoteam.get_team_for_repo(slug, home=home)
-        if not canonical:
+        elected_locally = not canonical
+        if elected_locally:
             canonical = _elect_earliest(g["team_ids"], g["team_members"], reg_keys)
-            if canonical and not dry_run:
-                # CAS first-writer-wins: if a concurrent/prior bind exists we converge on IT.
-                canonical = cp_repoteam.bind_repo_team(slug, canonical, home=home)
         if not canonical:
             out.write("  %s -> (no electable team; %d skipped) — LEFT ALONE\n"
                       % (slug, len(g["skipped"])))
             continue
 
-        # 2. RE-POINT every registry-present member to canonical (idempotent skip when already there).
+        # FAIL-CLOSED: a cross-repo-shared team must NEVER be elected canonical — absorbing others
+        # into it would pull the OTHER repos' members in. Skip the whole group for manual review and
+        # write NOTHING (no bind_repo_team, no re-point, no ledger). Its conflict is reported below.
+        if canonical in cross_repo:
+            out.write("  %s -> SKIPPED (elected canonical %s spans %d repos: %s — manual review)\n"
+                      % (slug, canonical, len(cross_repo[canonical]), cross_repo[canonical]))
+            skipped_groups.append(slug)
+            continue
+
+        # Lock the election only now that canonical is confirmed repo-exclusive.
+        if elected_locally and not dry_run:
+            # CAS first-writer-wins: if a concurrent/prior bind exists we converge on IT.
+            canonical = cp_repoteam.bind_repo_team(slug, canonical, home=home)
+            # A concurrent bind could have landed a cross-repo team — re-check and fail closed
+            # BEFORE any member is moved (no re-point has happened yet).
+            if canonical in cross_repo:
+                out.write("  %s -> SKIPPED (CAS resolved to cross-repo %s: %s — manual review)\n"
+                          % (slug, canonical, cross_repo[canonical]))
+                skipped_groups.append(slug)
+                continue
+
+        # 2. RE-POINT every registry-present member to canonical (idempotent skip when already there),
+        #    EXCEPT protected members of a cross-repo-shared team — those are never touched.
         repointed = []
         for haid in sorted(g["haids"]):
+            if haid in protected:
+                continue  # member of a cross-repo-shared team — fail-closed, never re-point.
             if cp_auth.registered_team_field(haid, home=home) == canonical:
                 continue
             if not dry_run:
@@ -503,7 +561,9 @@ def converge(*, home=None, dry_run=False, allow_local=False, out=sys.stdout, err
             repointed.append(haid)
         total_repointed += len(repointed)
 
-        superseded = sorted(g["team_ids"] - {canonical})
+        # superseded = the group's OTHER team_ids that were absorbed — canonical AND every cross-repo
+        # team excluded (a shared team is never "superseded away"; it stays put for manual review).
+        superseded = sorted(g["team_ids"] - {canonical} - set(cross_repo))
 
         # 3. RECORD the superseded ledger — only when this run actually MOVED members, so a
         #    re-run over an already-converged repo writes NOTHING (true idempotent no-op).
@@ -514,15 +574,33 @@ def converge(*, home=None, dry_run=False, allow_local=False, out=sys.stdout, err
                  "repo_slug": slug,
                  "canonical_team_id": canonical,
                  "superseded_team_ids": superseded,
+                 "cross_repo_excluded": cross_in_group,
                  "haids_repointed": sorted(repointed),
                  "ts": int(time.time())})
 
         skipped_note = (", skipped=%d" % len(g["skipped"])) if g["skipped"] else ""
-        out.write("  %s -> %s  (+%d repointed, superseded=%s%s)\n"
-                  % (slug, canonical, len(repointed), superseded, skipped_note))
+        cross_note = (", cross_repo_excluded=%s" % cross_in_group) if cross_in_group else ""
+        out.write("  %s -> %s  (+%d repointed, superseded=%s%s%s)\n"
+                  % (slug, canonical, len(repointed), superseded, cross_note, skipped_note))
 
-    out.write("done: %d member(s) re-pointed%s.\n"
-              % (total_repointed, " (dry-run — nothing written)" if dry_run else ""))
+    # ── REPORT cross-repo-shared teams (skipped — manual review) + persist the conflicts ledger ──
+    # These need human/repo-binding disambiguation, not an automated guess. The ledger is written
+    # deterministically (sorted, no wall-clock ts) so a re-run is byte-idempotent.
+    if cross_repo:
+        out.write("\nCROSS-REPO TEAMS (skipped — manual review):\n")
+        for tid in sorted(cross_repo):
+            out.write("  %s spans %d repos: %s\n" % (tid, len(cross_repo[tid]), cross_repo[tid]))
+        if not dry_run:
+            backend.put_record(
+                os.path.join(_LEDGER_DIR, "_conflicts%s" % _RECORD_SUFFIX),
+                {"version": _LEDGER_VERSION,
+                 "conflicts": [{"team_id": tid, "repo_slugs": cross_repo[tid]}
+                               for tid in sorted(cross_repo)]})
+
+    out.write("done: %d member(s) re-pointed%s%s.\n"
+              % (total_repointed,
+                 (", %d group(s) skipped (cross-repo)" % len(skipped_groups)) if skipped_groups else "",
+                 " (dry-run — nothing written)" if dry_run else ""))
     return 0
 
 
