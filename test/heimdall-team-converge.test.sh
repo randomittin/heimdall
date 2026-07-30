@@ -198,6 +198,122 @@ else
   bad "firestore banner string builder wrong"
 fi
 
+# ── FIRESTORE PREFLIGHT: no-ADC → banner then FAST nonzero with the exact fix (no live GCP) ───────
+# The ADC probe + broken-transport detector are module-level seams, so a hermetic test forces the
+# firestore preflight path WITHOUT a live google-auth install or any network: monkeypatch the probe
+# to report MISSING ADC and assert converge() prints the banner then fails fast with the fix command.
+if "$PY" - <<'PY'
+import io, os, sys, importlib.util, importlib.machinery
+sys.path.insert(0, os.environ["LIB"])
+os.environ["HEIMDALL_STATE_BACKEND"] = "firestore"
+os.environ["GOOGLE_CLOUD_PROJECT"] = "prod-proj-xyz"
+loader = importlib.machinery.SourceFileLoader("converge_mod", os.environ["CONVERGE_CLI"])
+spec = importlib.util.spec_from_loader("converge_mod", loader)
+mod = importlib.util.module_from_spec(spec); loader.exec_module(mod)
+# Force the ADC-probe path without a live dep; simulate MISSING Application Default Credentials.
+mod._google_auth_available = lambda: True
+mod._detect_broken_transport = lambda: None
+mod._probe_adc = lambda timeout: ("no_adc", RuntimeError("Could not automatically determine credentials"))
+buf = io.StringIO()
+rc = mod.converge(home=None, dry_run=True, out=buf, err=buf)
+s = buf.getvalue()
+assert rc != 0, ("expected nonzero exit on missing ADC", rc, s)
+assert "backend: firestore" in s, ("banner must print BEFORE the fast fail", s)
+assert "application-default login" in s and "set-quota-project" in s, ("exact ADC fix missing", s)
+print("no-adc-ok")
+PY
+then
+  ok "firestore no-ADC: banner then fast nonzero exit with the exact ADC fix (no hang)"
+else
+  bad "firestore no-ADC preflight did not fast-fail with the fix"
+fi
+
+# ── FIRESTORE PREFLIGHT: a STALLED probe ABORTS within the timeout with the urllib3 diagnostic ────
+# Simulate the real incident (google-auth token refresh wedged in a broken urllib3): the probe
+# reports a stall AND the broken-transport detector names the versions. converge() must ABORT
+# nonzero with the urllib3 diagnostic + the clean-venv fix — NOT hang. (The watchdog itself is
+# exercised separately below with a real slow fn to prove it enforces the wall clock.)
+if "$PY" - <<'PY'
+import io, os, sys, importlib.util, importlib.machinery
+sys.path.insert(0, os.environ["LIB"])
+os.environ["HEIMDALL_STATE_BACKEND"] = "firestore"
+os.environ["GOOGLE_CLOUD_PROJECT"] = "prod-proj-xyz"
+loader = importlib.machinery.SourceFileLoader("converge_mod", os.environ["CONVERGE_CLI"])
+spec = importlib.util.spec_from_loader("converge_mod", loader)
+mod = importlib.util.module_from_spec(spec); loader.exec_module(mod)
+mod._google_auth_available = lambda: True
+mod._detect_broken_transport = lambda: ("2.6.3", "2.28.1")   # the RequestsDependencyWarning combo
+mod._urllib3_version = lambda: "2.6.3"
+mod._probe_adc = lambda timeout: ("stall", None)             # the token-refresh wedge
+buf = io.StringIO()
+rc = mod.converge(home=None, dry_run=True, out=buf, err=buf)
+s = buf.getvalue()
+assert rc != 0, ("a stall must ABORT nonzero, never hang", rc, s)
+assert "backend: firestore" in s, ("banner must print before the abort", s)
+assert "STALLED" in s and "urllib3" in s and "2.6.3" in s, ("stall diagnostic must name broken urllib3", s)
+assert "hmdconv" in s, ("clean-venv fix must be offered", s)
+assert "RequestsDependencyWarning" in s, ("up-front broken-transport WARNING must be printed", s)
+print("stall-ok")
+PY
+then
+  ok "firestore stall: aborts nonzero within timeout with the urllib3 diagnostic + venv fix (no hang)"
+else
+  bad "firestore stalled probe did not abort with the urllib3 diagnostic"
+fi
+
+# ── WATCHDOG: a genuinely slow fn is cut off at the wall clock (proves the hard timeout is real) ──
+# Feed _run_in_watchdog a fn that would sleep far past the timeout; it must return ("timeout", None)
+# in ~the timeout window, NOT block for the full sleep — the mechanism behind the stall abort.
+if "$PY" - <<'PY'
+import os, sys, time, importlib.util, importlib.machinery
+sys.path.insert(0, os.environ["LIB"])
+loader = importlib.machinery.SourceFileLoader("converge_mod", os.environ["CONVERGE_CLI"])
+spec = importlib.util.spec_from_loader("converge_mod", loader)
+mod = importlib.util.module_from_spec(spec); loader.exec_module(mod)
+t0 = time.time()
+status, payload = mod._run_in_watchdog(lambda: time.sleep(30), 0.5)   # would sleep 30s
+elapsed = time.time() - t0
+assert status == "timeout", ("a slow fn must time out", status)
+assert elapsed < 5, ("watchdog must return at the wall clock, not wait out the sleep", elapsed)
+# and a fast fn returns its result normally.
+status2, payload2 = mod._run_in_watchdog(lambda: 42, 5)
+assert status2 == "ok" and payload2 == 42, (status2, payload2)
+# and a raising fn is classified as an error carrying the exception.
+status3, payload3 = mod._run_in_watchdog(lambda: (_ for _ in ()).throw(ValueError("boom")), 5)
+assert status3 == "error" and isinstance(payload3, ValueError), (status3, payload3)
+print("watchdog-ok")
+PY
+then
+  ok "watchdog cuts off a slow probe at the wall clock (ok/error/timeout classified)"
+else
+  bad "watchdog did not enforce the hard timeout"
+fi
+
+# ── LOCAL SKIP: the firestore preflight NEVER runs on the LOCAL backend (hermetic path unchanged) ─
+# A booby-trapped _preflight_firestore that raises if called proves a LOCAL dry-run never touches it.
+if "$PY" - <<'PY'
+import io, os, sys, tempfile, importlib.util, importlib.machinery
+sys.path.insert(0, os.environ["LIB"])
+os.environ.pop("HEIMDALL_STATE_BACKEND", None)   # default → local
+loader = importlib.machinery.SourceFileLoader("converge_mod", os.environ["CONVERGE_CLI"])
+spec = importlib.util.spec_from_loader("converge_mod", loader)
+mod = importlib.util.module_from_spec(spec); loader.exec_module(mod)
+def _boom(*a, **k):
+    raise AssertionError("firestore preflight ran on the LOCAL backend")
+mod._preflight_firestore = _boom
+buf = io.StringIO()
+rc = mod.converge(home=tempfile.mkdtemp(prefix="hmd-skip-"), dry_run=True, out=buf, err=buf)
+s = buf.getvalue()
+assert rc == 0, ("local dry-run must exit 0", rc, s)
+assert "backend: LOCAL" in s, ("local banner expected", s)
+print("local-skip-ok")
+PY
+then
+  ok "LOCAL backend skips the firestore preflight entirely (hermetic path unchanged)"
+else
+  bad "firestore preflight leaked into the LOCAL path"
+fi
+
 # ── EXECUTE the migration (local store: --allow-local is the deliberate opt-in) ───────────────────
 "$CONVERGE_CLI" --allow-local >"$EXT/run1.out" 2>&1
 RUN1_RC=$?

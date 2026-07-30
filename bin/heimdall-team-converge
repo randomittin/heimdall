@@ -51,6 +51,7 @@ import argparse
 import json
 import os
 import sys
+import threading
 import time
 
 # Resolve bin/lib (the cp_* substrate) onto sys.path exactly as every other bin/ python tool.
@@ -116,6 +117,242 @@ def _backend_banner(home, backend=None):
         return name, "backend: LOCAL  home=%s" % home_path
     # An unknown backend: name it (get_backend will raise ValueError right after — fail closed).
     return name, "backend: %s (UNKNOWN — get_backend will refuse)" % name
+
+
+# ── FIRESTORE PREFLIGHT (fail-fast + self-heal — the "no more silent hang" fix) ─────────────────
+#
+# THE INCIDENT THIS HEALS. A real prod convergence printed the firestore banner then FROZE FOREVER
+# on the first query — no timeout, no diagnostic. TWO environment faults, neither surfaced: (1) ADC
+# was missing, so google-auth could not authenticate; (2) the pyenv Python shipped a broken urllib3
+# (2.6.x) whose RequestsDependencyWarning stalls google-auth's TOKEN REFRESH — an HTTP round-trip
+# over the requests/urllib3 transport that the FirestoreBackend's gRPC query timeout (bug #17) does
+# NOT bound. So the tool wedged inside token refresh with no wall clock. This preflight is modeled
+# on go-live.sh STEP-0 (verify a REAL token, self-heal, fail LOUD before the real work): it runs
+# ONLY for the firestore backend (the LOCAL path — and every hermetic test — skips it entirely) and
+# ALWAYS after the banner, so the resolved store is on screen even on a fast failure.
+_PROBE_TIMEOUT_ENV = "HEIMDALL_CONVERGE_PROBE_TIMEOUT_SECONDS"
+# 30s sits ABOVE the FirestoreBackend gRPC query timeout (20s default, cp_state_firestore
+# _QUERY_TIMEOUT_DEFAULT) so a legit slow-but-working query is never falsely aborted — only a TRUE
+# unbounded stall (the token-refresh wedge) crosses this wall clock.
+_PROBE_TIMEOUT_DEFAULT = 30.0
+
+# The clean-venv escape hatch printed in every broken-transport / stall message (a from-scratch env
+# with a compatible urllib3, run against the SAME firestore via HEIMDALL_STATE_BACKEND).
+_VENV_FIX = ("python3 -m venv /tmp/hmdconv && /tmp/hmdconv/bin/pip install google-cloud-firestore "
+             "&& HEIMDALL_STATE_BACKEND=firestore /tmp/hmdconv/bin/python bin/heimdall-team-converge")
+
+
+def _probe_timeout():
+    """The ADC-probe wall-clock timeout (seconds) — HEIMDALL_CONVERGE_PROBE_TIMEOUT_SECONDS, default
+    30. A malformed / non-positive override falls back to the default so a misconfig can never
+    DISABLE the anti-hang guard (the whole point of this preflight)."""
+    raw = os.environ.get(_PROBE_TIMEOUT_ENV)
+    try:
+        val = float(raw) if raw not in (None, "") else _PROBE_TIMEOUT_DEFAULT
+    except (TypeError, ValueError):
+        return _PROBE_TIMEOUT_DEFAULT
+    return val if val > 0 else _PROBE_TIMEOUT_DEFAULT
+
+
+def _urllib3_version():
+    """This interpreter's urllib3 version string, or None when urllib3 is absent — named in the
+    stall diagnostic so an operator sees the exact broken version they are running."""
+    try:
+        import urllib3
+        return getattr(urllib3, "__version__", None)
+    except Exception:  # noqa: BLE001 — absent/unimportable urllib3: nothing to name.
+        return None
+
+
+def _google_auth_available():
+    """True when google-auth is importable (the firestore dep is installed). Its OWN function so a
+    hermetic test can force the ADC-probe path without a live google-auth install, and so a missing
+    dep is deferred to get_backend's honest BackendUnavailable (which names exactly what to pip)."""
+    try:
+        import google.auth  # noqa: F401
+        return True
+    except Exception:  # noqa: BLE001 — dep absent.
+        return False
+
+
+def _detect_broken_transport():
+    """Return (urllib3_version, requests_version) when THIS interpreter's requests<->urllib3 pairing
+    is the incompatible combo that emits requests' RequestsDependencyWarning (the exact condition
+    that stalled google-auth's token refresh in the field), else None. Detection re-runs requests'
+    OWN import-time compatibility gate under a warnings recorder — faithful across requests versions
+    (no hardcoded version matrix) — and treats any RequestsDependencyWarning as the signature. The
+    recorder suppresses the stray stderr warning the import would otherwise emit."""
+    import warnings
+    import importlib
+    try:
+        import urllib3  # noqa: F401
+    except Exception:  # noqa: BLE001 — no urllib3: nothing to mismatch.
+        return None
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        mod = sys.modules.get("requests")
+        try:
+            if mod is None:
+                mod = importlib.import_module("requests")   # fresh import re-runs the compat gate.
+            else:
+                importlib.reload(mod)                        # already-imported: reload to re-run it.
+        except Exception:  # noqa: BLE001 — requests absent/unimportable: cannot classify → no signal.
+            return None
+        for w in caught:
+            if ("RequestsDependencyWarning" in type(w.message).__name__
+                    or "doesn't match a supported version" in str(w.message)):
+                return (getattr(sys.modules.get("urllib3"), "__version__", "?"),
+                        getattr(mod, "__version__", "?"))
+    return None
+
+
+def _run_in_watchdog(fn, timeout):
+    """Run fn() in a daemon thread and join for at most `timeout` seconds. Returns
+    ("ok", result) | ("error", exc) | ("timeout", None). A stalled fn leaves its daemon thread
+    wedged in the blocking call — harmless: a daemon thread dies with the process, and the ONLY
+    caller ABORTS (nonzero exit) on "timeout", so the process exits promptly instead of hanging."""
+    box = {}
+
+    def _run():
+        try:
+            box["result"] = fn()
+            box["status"] = "ok"
+        except BaseException as exc:  # noqa: BLE001 — capture ANY failure for the caller to classify.
+            box["exc"] = exc
+            box["status"] = "error"
+
+    t = threading.Thread(target=_run, name="hmd-converge-fs-probe", daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        return ("timeout", None)
+    if box.get("status") == "ok":
+        return ("ok", box.get("result"))
+    return ("error", box.get("exc"))
+
+
+def _is_missing_adc(exc):
+    """True when `exc` is google-auth's DefaultCredentialsError (ADC not configured), matched by
+    isinstance when google.auth is importable AND by type-name/message as a fallback so the
+    classification (and its hermetic test) needs no live google-auth import."""
+    try:
+        from google.auth.exceptions import DefaultCredentialsError as _dce
+    except Exception:  # noqa: BLE001 — google-auth absent: fall back to a name/message probe.
+        _dce = None
+    if _dce is not None and isinstance(exc, _dce):
+        return True
+    if type(exc).__name__ == "DefaultCredentialsError":
+        return True
+    msg = str(exc).lower()
+    return "default credentials" in msg or "could not automatically determine credentials" in msg
+
+
+def _probe_adc(timeout):
+    """Resolve Application Default Credentials AND mint a token under a hard wall-clock `timeout`,
+    returning a (status, payload):
+      ("ok", token)   — ADC resolved and a token minted (the store is authenticable/reachable).
+      ("no_adc", exc) — ADC is not configured (DefaultCredentialsError) — the operator must run
+                        `gcloud auth application-default login`.
+      ("stall", None) — the resolve/refresh HUNG past `timeout` — the broken-urllib3 signature
+                        (google-auth's token refresh wedged in a broken requests/urllib3 transport).
+      ("error", exc)  — any other auth/transport failure (surfaced; never a silent empty run).
+    The refresh is the EXACT operation the real incident stalled on (google-auth mints the token
+    over the requests/urllib3 transport), so this probe is a faithful, DATA-FREE reachability test:
+    it needs no Firestore documents, only working auth + egress to oauth2.googleapis.com."""
+    def _resolve_and_mint():
+        import google.auth
+        import google.auth.transport.requests as _gart
+        creds, _proj = google.auth.default()
+        creds.refresh(_gart.Request())
+        return getattr(creds, "token", True)
+
+    status, payload = _run_in_watchdog(_resolve_and_mint, timeout)
+    if status == "timeout":
+        return ("stall", None)
+    if status == "error":
+        return ("no_adc" if _is_missing_adc(payload) else "error", payload)
+    return ("ok", payload)
+
+
+def _preflight_firestore(home, *, out, err):
+    """FIRESTORE-ONLY fail-fast preflight (never runs for the LOCAL backend): catch the broken
+    environments that used to make a prod run HANG SILENTLY after the banner. Writes its findings
+    to `err`; returns 0 to proceed, or a nonzero exit code to ABORT before any enumeration.
+
+      1. ADC — Application Default Credentials must resolve AND mint a token. Missing ADC -> the
+         EXACT fix (gcloud auth application-default login + set-quota-project) and a nonzero exit.
+      2. broken transport (WARN-only) — an incompatible requests/urllib3 pairing (the urllib3 2.6.x
+         RequestsDependencyWarning that stalled google-auth in the field) is named up front with two
+         fixes, but the run CONTINUES (it MIGHT still work; the timeout below is the hard backstop).
+      3. connection timeout (the core fix) — the ADC token mint (the exact op the incident stalled
+         on) runs under a hard wall-clock timeout; a stall ABORTS with the urllib3 diagnostic instead
+         of hanging forever."""
+    project = (os.environ.get(cp_state_firestore.FIRESTORE_PROJECT_ENV)
+               or os.environ.get("GOOGLE_CLOUD_PROJECT")
+               or "<your-firestore-project>")
+
+    # 2. broken-transport WARNING (non-fatal) — surfaced BEFORE the probe so the likely cause is on
+    #    screen even if the probe then succeeds slowly.
+    broken = _detect_broken_transport()
+    if broken:
+        u3, rq = broken
+        err.write("=" * 72 + "\n")
+        err.write("WARNING: this Python env has an INCOMPATIBLE requests/urllib3 pairing "
+                  "(urllib3 %s, requests %s) — emits\n" % (u3, rq))
+        err.write("         RequestsDependencyWarning and can STALL google-auth's token refresh "
+                  "(the exact failure that\n")
+        err.write("         hung a prod convergence). Two fixes:\n")
+        err.write("           (a) run in a clean venv:\n")
+        err.write("               %s\n" % _VENV_FIX)
+        err.write("           (b) pin a compatible urllib3:  pip install 'urllib3<2'\n")
+        err.write("         Continuing — it MIGHT still work; the connection timeout below is the "
+                  "hard backstop.\n")
+        err.write("=" * 72 + "\n")
+
+    # google-auth present? If not, the firestore dep is not installed — get_backend's first touch
+    # raises a clear BackendUnavailable naming exactly what to install. Let THAT honest boundary
+    # fire rather than half-diagnosing here.
+    if not _google_auth_available():
+        err.write("preflight: google-auth not importable — skipping ADC probe; the firestore "
+                  "backend build will name the missing dependency.\n")
+        return 0
+
+    # 1 + 3. ADC resolve + token mint under a hard timeout (the core anti-hang guard).
+    timeout = _probe_timeout()
+    status, payload = _probe_adc(timeout)
+    if status == "no_adc":
+        err.write("=" * 72 + "\n")
+        err.write("FATAL: Application Default Credentials are NOT configured — the firestore backend "
+                  "cannot authenticate.\n")
+        err.write("       Fix (run BOTH, then re-run):\n")
+        err.write("         gcloud auth application-default login\n")
+        err.write("         gcloud auth application-default set-quota-project %s\n" % project)
+        err.write("=" * 72 + "\n")
+        return 3
+    if status == "stall":
+        u3 = _urllib3_version()
+        err.write("=" * 72 + "\n")
+        err.write("FATAL: Firestore auth/query STALLED after %.0fs%s — almost always a broken "
+                  "urllib3 in this\n"
+                  % (timeout, (" (saw urllib3 %s)" % u3) if u3 else ""))
+        err.write("       Python env: google-auth's token refresh wedged in a broken "
+                  "requests/urllib3 transport. Fix EITHER:\n")
+        err.write("         (a) run in a clean venv:\n")
+        err.write("             %s\n" % _VENV_FIX)
+        err.write("         (b) pin a compatible urllib3:  pip install 'urllib3<2'\n")
+        err.write("=" * 72 + "\n")
+        return 4
+    if status == "error":
+        err.write("=" * 72 + "\n")
+        err.write("FATAL: could not authenticate to Firestore (ADC token refresh failed): %s: %s\n"
+                  % (type(payload).__name__, payload))
+        err.write("       Verify ADC (gcloud auth application-default login), the quota project "
+                  "(%s), and network\n" % project)
+        err.write("       egress to oauth2.googleapis.com, then re-run.\n")
+        err.write("=" * 72 + "\n")
+        return 5
+    err.write("preflight: ok — ADC resolved and a token minted (firestore reachable).\n")
+    return 0
 
 
 def _project_repo_slug(project_dirname):
@@ -218,6 +455,15 @@ def converge(*, home=None, dry_run=False, allow_local=False, out=sys.stdout, err
         if not dry_run and not allow_local:
             err.write(_LOCAL_EXECUTE_GUARD + "\n")
             return 2
+
+    # FIRESTORE fail-fast preflight (never for LOCAL — the hermetic tests skip it entirely): ADC +
+    # broken-urllib3 checks + a hard-timeout token probe, so a broken env fails LOUD in seconds
+    # instead of hanging forever on the first enumeration. Runs for BOTH dry-run and execute (a
+    # dry-run still READS firestore, so it can stall too). A nonzero return ABORTS before any query.
+    if name == cp_state.BACKEND_FIRESTORE:
+        rc = _preflight_firestore(home, out=out, err=err)
+        if rc != 0:
+            return rc
 
     backend = cp_state.get_backend(home=home)
     groups, reg_keys = _scan(backend, home)
