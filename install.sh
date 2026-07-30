@@ -805,7 +805,7 @@ main() {
   # reinstall fallback fetch THIS release, never a stale default. bin/heimdall-autoupdate
   # ALSO pins HEIMDALL_REF to the version it verified, so an auto-update installs the
   # exact resolved release regardless of this default. HEIMDALL_REF overrides for dev.
-  local DEFAULT_REF="v2.3.6"
+  local DEFAULT_REF="v2.3.7"
   local REF="${HEIMDALL_REF:-$DEFAULT_REF}"
   local REPO="${HEIMDALL_REPO:-https://github.com/randomittin/heimdall.git}"
 
