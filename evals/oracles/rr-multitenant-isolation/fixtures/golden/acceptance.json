@@ -145,6 +145,12 @@
       "expected": "DENY",
       "invariant": "INV-AUTOTEAM (haid possession)",
       "attack": "an attacker with admin/push on a repo she controls, who has LEARNED a victim's already-enrolled HAID, hits POST /team/auto binding haid=victim but signs the possession assertion with HER OWN key, not the victim's registered Ed25519 key — the server must verify the possession signature against the REGISTERED pubkey of the claimed haid, so only the actual key-holder can bind their own haid; a missing/forged sig, or a sig that verifies under a different key, binds nothing (residual vector §3c: knowing a HAID must not let a repo admin bind it)"
+    },
+    {
+      "n": "AT7-same-repo-one-team",
+      "expected": "DENY",
+      "invariant": "INV-AUTOTEAM (repo convergence)",
+      "attack": "two+ distinct HAIDs (different machines, ANY of the 3 client resolution models) on the SAME repo_slug, online+github, resolve DIFFERENT team_ids — the client pre-empts the server /team/auto repo->team binding, so same-repo teammates land in different partitions and cannot see each other (public repos explode into per-machine solo teams). The client MUST converge every model on the server-derived repo->team id (INV-1 for repo membership)."
     }
   ]
 }

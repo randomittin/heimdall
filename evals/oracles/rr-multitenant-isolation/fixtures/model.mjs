@@ -444,6 +444,46 @@ export function autoteamVerifiesHaidPossession(gates, haid, possessionSig) {
   return !!possessionSig && possessionSig.verifies_under === registeredPubkey;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────────────
+// INV-AUTOTEAM (repo convergence) — one repo_slug ⇒ ONE team_id. The server repo->team
+// binding (cp_repoteam.repo_slug canonicalizes; bind_repo_team is first-writer-wins) is
+// the authority; the client resolver for a github repo that is online MUST converge on
+// it through ANY of the 3 client resolution models (a committed-secret team.json, the
+// /team/auto server binding, or an auto-solo mint). The SPLIT BUG (TEAM-SPLIT-BUG.md): a
+// committed secret or an auto-solo mint PRE-EMPTS /team/auto, so two HAIDs on the SAME
+// repo_slug derive DIFFERENT team_ids (sha256(secret) vs the server binding) and cannot
+// see each other — same-repo teammates land in different partitions (private repos), and
+// public repos explode into a per-machine solo team. Converging every model on the
+// server-derived repo->team id is INV-1 for repo membership.
+//
+// This model authors the ORACLE only; the real client resolver (bin/heimdall-presence
+// _resolve_team_for_wire + bin/heimdall-team _resolve) is fixed later (WAVE 2) and MUST
+// pass this gate. The gate below is dropped by EXACTLY ONE mutant, flipping EXACTLY its
+// own AT7 row DENY->ALLOW; it is disjoint from every A*/G*/L*/C*/AT1-6 gate (no existing
+// mutant flips AT7, and the AT7 mutant flips no existing row).
+// ─────────────────────────────────────────────────────────────────────────────────────
+
+// The server-side repo_slug -> team_id binding (cp_repoteam, first-writer-wins). One
+// entry: the rally repo the split bug was found on. This is the SINGLE authority every
+// client model must converge on.
+const SERVER_REPO_TEAM = { "randomittin/rally": "5eff00d5eff00d5eff00d5eff00d5eff" };
+function deriveTeamId(secret) { return "sha256:" + secret; }             // mirrors cp_auth.derive_team_id.
+function serverRepoTeam(slug) { return SERVER_REPO_TEAM[slug] || null; } // cp_repoteam.get/mint_team_for_repo.
+
+// ── INV-AUTOTEAM (repo convergence) — the client resolves the operative team_id for a
+//    github repo. GOLDEN (fixed): every resolution model returns the server repo->team
+//    binding, so all machines on one repo_slug converge. MUTANT (the CURRENT pre-fix
+//    client): a committed secret / auto-solo mint pre-empts /team/auto, deriving
+//    sha256(secret) instead — so the SAME repo_slug splits into different team_ids. ──
+export function clientResolveTeamId(gates, model, slug, ctx) {
+  if (gates.clientPreemptsServerBinding) {                 // MUTANT = the CURRENT (pre-fix) client.
+    if (model === "committed-secret") return deriveTeamId(ctx.committedSecret);
+    if (model === "auto-solo")        return deriveTeamId(ctx.soloSecret);
+    return serverRepoTeam(slug);                           // only the /team/auto path hits the server.
+  }
+  return serverRepoTeam(slug);                             // GOLDEN (fixed): the server binding is THE authority.
+}
+
 // ── The fixed cross-tenant attack sequence. Each returns "DENY" (attack stopped) or
 //    "ALLOW" (attack SUCCEEDED — a tenant touched another's resource). The acceptance
 //    oracle demands DENY for every one; a mutant flips exactly its own gate's attack
@@ -658,6 +698,21 @@ export function evaluateAttack(gates, attackId) {
       // haid=victim without a signature that verifies under the victim's registered key is the ALLOW.
       const req = { haid: "haid:victim", possessionSig: { verifies_under: "pk:mallory" } };
       return autoteamVerifiesHaidPossession(gates, req.haid, req.possessionSig) ? "ALLOW" : "DENY";
+    }
+    case "AT7-same-repo-one-team": {
+      // INV-AUTOTEAM (repo convergence). Three machines, three distinct HAIDs, the SAME
+      // repo_slug, all online+github, EACH entering through a DIFFERENT client resolution
+      // model (a committed-secret team.json, a fresh /team/auto, an auto-solo mint). They
+      // MUST resolve the SAME team_id — converge on the server repo->team binding. The
+      // client pre-empting that binding (a committed secret / auto-solo mint winning over
+      // /team/auto) so the models resolve DIFFERENT ids — same-repo teammates invisible to
+      // each other, public repos exploding into per-machine solo teams — is the ALLOW.
+      const slug = "randomittin/rally";
+      const t1 = clientResolveTeamId(gates, "committed-secret", slug, { committedSecret: "S-rally" });
+      const t2 = clientResolveTeamId(gates, "team-auto",        slug, {});
+      const t3 = clientResolveTeamId(gates, "auto-solo",        slug, { soloSecret: "S-solo" });
+      const converged = (t1 === t2) && (t2 === t3);
+      return converged ? "DENY" : "ALLOW";
     }
     default:
       throw new Error("unknown attack id: " + attackId);

@@ -225,6 +225,16 @@
       "must_turn_red_gate": "cross-tenant-denial",
       "first_fail_case": "AT6-haid-possession",
       "reject_contract": "attack AT6-haid-possession: expected DENY, candidate returns ALLOW -> gate status=fail at step 'AT6-haid-possession'"
+    },
+    {
+      "name": "client-preempts-server-binding",
+      "file": "client-preempts-server-binding.mjs",
+      "invariant": "INV-AUTOTEAM (repo convergence)",
+      "gate_dropped": "server repo->team convergence in the client resolver (bin/heimdall-presence _resolve_team_for_wire / bin/heimdall-team _resolve); a committed secret or an auto-solo mint pre-empts /team/auto, so one repo_slug derives multiple team_ids",
+      "attack_that_succeeds": "AT7 — two+ distinct HAIDs on the SAME repo_slug (different machines, different client resolution models) resolve DIFFERENT team_ids, so same-repo teammates cannot see each other and public repos explode into per-machine solo teams (TEAM-SPLIT-BUG.md)",
+      "must_turn_red_gate": "cross-tenant-denial",
+      "first_fail_case": "AT7-same-repo-one-team",
+      "reject_contract": "attack AT7-same-repo-one-team: expected DENY, candidate returns ALLOW -> gate status=fail at step 'AT7-same-repo-one-team'"
     }
   ]
 }
