@@ -9,6 +9,10 @@ if command -v readlink &>/dev/null; then
 fi
 PLUGIN_DIR="$(cd "$(dirname "$SELF")/.." && pwd)"
 
+# overload self-heal: retry+backoff around the `claude -p` decomposition spawn.
+# shellcheck source=lib/hmd-claude-retry.sh
+. "$PLUGIN_DIR/bin/lib/hmd-claude-retry.sh"
+
 usage() {
   cat <<'EOF'
 decompose — Break tasks into dependency-ordered parallel sub-tasks
@@ -71,5 +75,6 @@ ${CONTEXT:+\nCONTEXT:\n$CONTEXT}
 
 $FORMAT_INSTRUCTION"
 
-# Call Claude for decomposition
-claude -p "$PROMPT" --model claude-sonnet-4-6 2>/dev/null
+# Call Claude for decomposition (overload-resilient: retries transient 529/overload with
+# backoff, fails loudly on give-up instead of the old `2>/dev/null` silent-empty output).
+hmd_claude_retry -p "$PROMPT" --model claude-sonnet-4-6

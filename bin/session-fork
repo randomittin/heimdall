@@ -16,6 +16,11 @@ MAX_PARALLEL="${HEIMDALL_MAX_PARALLEL:-${SUPERX_MAX_PARALLEL:-10}}"
 SM="$PLUGIN_DIR/bin/shared-memory"
 AP="$PLUGIN_DIR/bin/agent-pool"
 
+# overload self-heal: retry+backoff around every `claude -p` spawn, loud clean failure
+# on exhaustion (never `|| true` an overload into fake output). See lib/hmd-claude-retry.sh.
+# shellcheck source=lib/hmd-claude-retry.sh
+. "$PLUGIN_DIR/bin/lib/hmd-claude-retry.sh"
+
 usage() {
   cat <<'EOF'
 session-fork — Spawn parallel Claude sessions for independent sub-tasks
@@ -62,16 +67,28 @@ Task: $prompt"
 
   (
     cd "$WORK_DIR"
-    local output
-    output=$(claude -p "$full_prompt" --model "$MODEL" --output-format text 2>&1) || true
-    echo "$output" > "$RESULTS_DIR/outputs/${task_id}.txt"
-    echo "done" > "$RESULTS_DIR/status/${task_id}"
+    local output rc=0 status_word
+    # Overload-resilient spawn: retries a transient 529/overload with backoff, fails fast
+    # on a real error, and returns a distinct non-zero exit on give-up. `|| rc=$?` captures
+    # the code without tripping `set -e` — the old `|| true` silently masked failures.
+    output=$(hmd_claude_retry -p "$full_prompt" --model "$MODEL" --output-format text) || rc=$?
+    if [ "$rc" -eq 0 ]; then
+      echo "$output" > "$RESULTS_DIR/outputs/${task_id}.txt"
+      status_word="done"
+    else
+      # NEVER silent garbage: an overloaded/failed spawn is marked FAILED so `status`
+      # and the orchestrator see a real failure, not fake output masquerading as a result.
+      { echo "$output"; echo "FORK FAILED (claude exit ${rc}) — task NOT completed"; } \
+        > "$RESULTS_DIR/outputs/${task_id}.txt"
+      status_word="failed"
+    fi
+    echo "$status_word" > "$RESULTS_DIR/status/${task_id}"
 
     if [ -x "$SM" ]; then
-      "$SM" set "task_${task_id}_status" "done" --ns forks --agent "$task_id" 2>/dev/null || true
+      "$SM" set "task_${task_id}_status" "$status_word" --ns forks --agent "$task_id" 2>/dev/null || true
       local summary
       summary=$(echo "$output" | tail -5 | head -3)
-      "$SM" publish "fork_results" "${task_id}: ${summary}" 2>/dev/null || true
+      "$SM" publish "fork_results" "${task_id} [${status_word}]: ${summary}" 2>/dev/null || true
     fi
 
     if [ -x "$AP" ]; then
@@ -210,8 +227,15 @@ cmd_status() {
     local p
     p=$(cat "$pidfile")
     if [ -f "$RESULTS_DIR/status/$tid" ]; then
-      done_count=$((done_count + 1))
-      echo "  done: $tid"
+      local sword
+      sword=$(cat "$RESULTS_DIR/status/$tid" 2>/dev/null)
+      if [ "$sword" = "failed" ]; then
+        failed=$((failed + 1))
+        echo "  failed: $tid (spawn failed — see outputs/${tid}.txt)"
+      else
+        done_count=$((done_count + 1))
+        echo "  done: $tid"
+      fi
     elif kill -0 "$p" 2>/dev/null; then
       running=$((running + 1))
       echo "  running: $tid (pid=$p)"
