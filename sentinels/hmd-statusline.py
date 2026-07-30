@@ -904,11 +904,11 @@ def _team_state_seg(m, now):
 
 
 def _team_branch_seg(branch):
-    """Row4 CROSS-BRANCH indicator (RJ: same-repo teammates on OTHER branches): `⎇<branch>`
-    in the faint branch hue, shown UNDER the teammate's name when their branch differs from
-    yours — so a teammate off on their own branch of the SAME repo reads at a glance. Terse
-    (no space after the glyph) to keep the most branch chars in the 8-cell strip; the caller
-    pad_or_truncate()s it to the strip width (a long branch clips with `…`)."""
+    """Row4 BRANCH indicator (RJ: every same-repo teammate surfaces their branch): `⎇<branch>`
+    in the faint branch hue, shown UNDER the teammate's name for ANY teammate with a recorded
+    branch — whether or not it matches yours — so who's on which branch of the SAME repo reads
+    at a glance. Terse (no space after the glyph) to keep the most branch chars in the 8-cell
+    strip; the caller pad_or_truncate()s it to the strip width (a long branch clips with `…`)."""
     b = str(branch or "").strip()
     return f"{BRANCHC}⎇{b}{X}"
 
@@ -917,10 +917,11 @@ def team_columns(members, team_w, overflow, now, states=True, self_branch=""):
     """Render `members` into the four team-zone row strings — each EXACTLY `team_w` visible
     cells. Rows 1–2: the 8-cell eye_strip (natural palette, eyes visible) riding the RIGHT
     of each 15c column. Row 3: the NAME (hero hue, ≤ strip width) under the strip, plus a
-    trailing `+N` overflow tag. Row 4: the teammate's BRANCH (`⎇<branch>`) when it differs
-    from `self_branch` — a same-repo teammate on another branch surfaces their branch on the
-    line UNDER their name; else the state segment (blank when `states` is False — the mid
-    tier). Members are joined by a 2-cell gap. Returns (r1, r2, r3, r4)."""
+    trailing `+N` overflow tag. Row 4: the teammate's BRANCH (`⎇<branch>`) whenever they have
+    a recorded branch — EVERY same-repo teammate surfaces their branch on the line UNDER their
+    name, not only cross-branch ones; a teammate with no branch falls back to the state segment
+    (blank when `states` is False — the mid tier). Members are joined by a 2-cell gap. Returns
+    (r1, r2, r3, r4). `self_branch` is retained for callers but no longer gates the branch line."""
     lp = " " * (LAYOUT.TEAM_MEMBER_W - LAYOUT.TEAM_STRIP_W)   # 7c left pad → strip on the right 8c
     gap = " " * LAYOUT.TEAM_MEMBER_GAP
     tops = []; bots = []; names = []; sts = []
@@ -940,11 +941,12 @@ def team_columns(members, team_w, overflow, now, states=True, self_branch=""):
         ncol = sgr(SIG._hex_rgb(hue)) if hue else DIM
         nm = LAYOUT.pad_or_truncate(str(m.get("user") or ""), LAYOUT.TEAM_STRIP_W)
         names.append(g + lp + f"{ncol}{nm}{X}")
-        # Row4: a teammate on a DIFFERENT branch of the SAME repo shows their branch UNDER
-        # their name (the cross-branch line); else the state segment. The branch line rides
-        # even in the mid tier (states=False) since it is NEW data absent from prior renders.
-        mb = str(m.get("branch") or "")
-        if self_branch and mb and mb != self_branch:
+        # Row4: EVERY same-repo teammate with a recorded branch shows it UNDER their name
+        # (the branch line) — matching OR differing from self_branch; a teammate with no
+        # branch falls back to the state segment. The branch line rides even in the mid tier
+        # (states=False) since it is NEW data absent from prior renders.
+        mb = str(m.get("branch") or "").strip()
+        if mb:
             r4seg = _team_branch_seg(mb)
         elif states:
             r4seg = _team_state_seg(m, now)

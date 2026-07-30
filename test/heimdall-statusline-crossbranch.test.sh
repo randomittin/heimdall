@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 #
-# heimdall-statusline-crossbranch.test.sh — CROSS-BRANCH TEAM VISIBILITY (RJ).
+# heimdall-statusline-crossbranch.test.sh — SAME-REPO TEAM BRANCH VISIBILITY (RJ).
 #
-# Same repo == same team surface: a teammate on a DIFFERENT git branch of the SAME repo is
-# STILL on your statusline roster (the roster is repo-scoped, never branch-scoped), and their
-# branch renders on the line UNDER their name (`⎇<branch>` in the faint branch hue) so you can
-# see, at a glance, who is off on another branch. A SAME-branch teammate is unchanged — their
-# Row4 stays the state segment (no branch line), so single-user / same-branch never regresses.
+# Same repo == same team surface: EVERY teammate on your statusline roster (the roster is
+# repo-scoped, never branch-scoped) surfaces their git branch on the line UNDER their name
+# (`⎇<branch>` in the faint branch hue) — whether or not it matches your own branch — so who
+# is on which branch of the SAME repo reads at a glance. A teammate with NO recorded branch
+# (outside any git repo) shows no branch line and falls back to the state segment, so that
+# path stays graceful and never crashes.
 #
 # It drives the REAL SUT (sentinels/hmd-statusline.py + the ledger reader) at 120 cols with a
 # status.json team[] of TWO teammates — `mira` on branch `wip` (differs from self `main`) and
@@ -15,12 +16,14 @@
 #   1. VISIBLE     both teammates render (mira AND kai) — the roster is not branch-filtered.
 #   2. BRANCH-LINE mira's branch (`⎇wip`) appears on Row4, the line directly UNDER her name
 #                  (Row3). (RED if the branch data is dropped or the line is missing.)
-#   3. SAME-BRANCH kai (== self branch) shows NO branch line (`⎇main` absent) — Row4 keeps the
-#                  state segment; same-branch rendering is not regressed.
-#   4. CONTROL     with BOTH teammates on `main` (all same-branch), NO `⎇` marker appears at all
-#                  — proving the branch line is CONDITIONED on a differing branch (falsifiable:
-#                  a bug that always/never draws it flips this or #2 RED).
-#   5. ROW-EXACT   every emitted row is EXACTLY 120 visible cells (the branch line respects the
+#   3. SAME-BRANCH kai (== self branch) NOW SHOWS its branch line (`⎇main` present) — every
+#                  same-repo teammate surfaces their branch, matching OR differing.
+#   4. CONTROL     with BOTH teammates on `main` (all same-branch), the `⎇` marker APPEARS for
+#                  EACH — proving the branch line is UNCONDITIONAL on branch match (falsifiable:
+#                  a bug that reverts to differ-only or never draws it flips this or #2 RED).
+#   5. NO-BRANCH   a teammate with an EMPTY/missing branch shows NO `⎇` line (the real negative:
+#                  a bug that always draws the marker flips this RED), and keeps the state seg.
+#   6. ROW-EXACT   every emitted row is EXACTLY 120 visible cells (the branch line respects the
 #                  team-zone width discipline), exit 0, empty stderr.
 set -u
 
@@ -117,17 +120,28 @@ branch_row = plain[3] if len(plain) > 3 else ""
 (ok if ("mira" in name_row and "⎇wip" in branch_row) else bad)(
     "BRANCH-LINE: `⎇wip` on Row4 directly under mira's name on Row3")
 
-# 3. SAME-BRANCH — kai (== self) shows NO branch line; `⎇main` never rendered.
-(ok if "⎇main" not in joined else bad)(
-    "SAME-BRANCH: kai (self branch) shows NO `⎇main` line (Row4 keeps the state)")
+# 3. SAME-BRANCH — kai (== self) NOW shows its branch line; `⎇main` IS rendered on Row4.
+(ok if "⎇main" in branch_row else bad)(
+    "SAME-BRANCH: kai (self branch) NOW shows `⎇main` line on Row4 (every teammate surfaces branch)")
 
-# 4. CONTROL — both teammates on `main` (all same-branch) → NO `⎇` marker anywhere.
+# 4. CONTROL — both teammates on `main` (all same-branch) → the `⎇` marker appears for EACH.
 rs2, rc2, err2 = render(120, "main",
                         [dict(MIRA, branch="main"), dict(KAI, branch="main")])
-(ok if all("⎇" not in strip(r) for r in rs2) else bad)(
-    "CONTROL: all teammates same-branch → NO `⎇` marker (branch line is differ-conditioned)")
+branch_row2 = strip(rs2[3]) if len(rs2) > 3 else ""
+(ok if branch_row2.count("⎇") == 2 else bad)(
+    "CONTROL: all teammates same-branch → `⎇` marker appears for EACH (unconditional, count=%d)"
+    % branch_row2.count("⎇"))
 
-# 5. ROW-EXACT — every row EXACTLY 120 cells, exit 0, empty stderr (both renders).
+# 5. NO-BRANCH (the real falsifiable negative) — a teammate with an EMPTY branch shows NO `⎇`
+#    line and keeps the state segment; a bug that ALWAYS draws the marker flips this RED.
+rs3, rc3, err3 = render(120, "main",
+                        [dict(MIRA, branch=""), dict(KAI, branch="main")])
+branch_row3 = strip(rs3[3]) if len(rs3) > 3 else ""
+(ok if branch_row3.count("⎇") == 1 and "⎇main" in branch_row3 else bad)(
+    "NO-BRANCH: empty-branch mira shows NO `⎇` line; only kai's `⎇main` (count=%d)"
+    % branch_row3.count("⎇"))
+
+# 6. ROW-EXACT — every row EXACTLY 120 cells, exit 0, empty stderr (all renders).
 widths = sorted(set(vis(r) for r in rs))
 (ok if widths == [120] and rc == 0 and not err else bad)(
     "ROW-EXACT: cross-branch render → every row == 120 (widths=%s rc=%d err=%r)"
@@ -135,6 +149,9 @@ widths = sorted(set(vis(r) for r in rs))
 widths2 = sorted(set(vis(r) for r in rs2))
 (ok if widths2 == [120] and rc2 == 0 and not err2 else bad)(
     "ROW-EXACT: control render → every row == 120 (widths=%s rc=%d)" % (widths2, rc2))
+widths3 = sorted(set(vis(r) for r in rs3))
+(ok if widths3 == [120] and rc3 == 0 and not err3 else bad)(
+    "ROW-EXACT: no-branch render → every row == 120 (widths=%s rc=%d)" % (widths3, rc3))
 
 print()
 print("%d passed, %d failed" % (_p, _f))
