@@ -47,7 +47,11 @@ Your AI agents can't grade their own homework. Heimdall gates every change behin
 | License | Open Source · MIT |
 | "Alternative to" | Leave blank / skip — no honest 1:1 substitute. If forced: "an open-source verification layer for AI coding agents." Do NOT claim "alternative to Copilot/Claude Code." |
 
-## 3.2 OpenAlternative
+## 3.2 OpenAlternative — ⛔ DEFERRED (2026-07-30)
+> Hard-gated: requires **≥10 stars** (repo has 5) AND "Real Application, not CLIs/scripts/AI wrappers"
+> (Heimdall's core is a plugin/CLI). Revisit after crossing 10 stars; frame the hosted `rr` product,
+> not the CLI. "Alternative to": CodeRabbit / Devin.
+
 
 | Field | Value |
 |---|---|
