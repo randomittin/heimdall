@@ -1,0 +1,224 @@
+#!/usr/bin/env python3
+# heimdall-team-converge — CONVERGE-FORWARD migration: collapse a repo split onto ONE team_id.
+#
+# THE BUG THIS HEALS (TEAM-SPLIT-BUG.md / TEAM-FIX-PLAN.md §4). One repo could end up with
+# MULTIPLE team_ids — a committed/legacy secret derives one, /team/auto derives another, an
+# auto-solo mint invents a third — so same-repo teammates land in different presence partitions
+# and cannot see each other. §1's resolver stops NEW splits; this tool heals the EXISTING ones:
+# it groups every enrolled machine by its canonical repo (repo_slug), elects ONE canonical team
+# per repo, and re-points every member's registry binding to it. Converge-FORWARD — it never
+# hard-deletes a key/enrollment; a losing team_id simply loses its last member and ages out of
+# presence via the read-time TTL. The move is auditable (a per-repo ledger) and idempotent.
+#
+# ⚠ TOUCHES DEPLOYED CP STATE. Against a real backend this re-stamps live registry bindings.
+# The OWNER (RJ) runs it against prod (Wave 4), always `--dry-run` first. This tool builds +
+# tests hermetically against a LOCAL temp backend only; it opens no network and mints no secret.
+#
+# THE GROUPING KEY IS THE DURABLE PRESENCE TREE (§4.1), NOT the key-registry `project` field.
+# The presence-client bootstrap enroll sends no `project`, so most registry bindings have
+# project=None — an unreliable grouping source. cp_presence instead writes one durable record per
+# (project, team_id, haid) at presence/<project>/<team_id>/<haid>.json (the ~45s TTL is a
+# READ-time freshness filter; the stored records PERSIST). We enumerate that tree exactly like
+# cp_god.aggregate_roster (bin/lib/cp_god.py:82): list_names(presence) -> project ->
+# list_names(presence/<project>) -> team_id -> list_names(.../<team_id>, ".json") -> haid.
+#
+# TWO SHAPE FACTS the naive pseudocode glosses (both verified against the shipped stores):
+#   * The presence PROJECT dir is cp_presence._slug'd — `github.com/owner/name` is stored as the
+#     single segment `github.com_owner_name` (every "/" and ":" collapses to "_"). repo_slug()
+#     needs the "/"-separated form, so we recover it by trying repo_slug on the raw name first,
+#     then on the "_"->"/" reversal, and take repo_slug's last-two-segments (host-agnostic).
+#   * The presence RECORD filename is cp_presence._slug(haid), NOT the raw HAID — a HAID carries a
+#     ":" (`haid:human.machine-hash4`) that slugs to "_". The registry is keyed by the RAW haid,
+#     so we bridge with a slug(raw_haid) -> raw_haid map built from the registry. A slugged
+#     presence haid with no registry counterpart is a HAID present in the tree but ABSENT from the
+#     key registry — it cannot be re-pointed (bind_haid_to_team fail-closes on no pubkey,
+#     cp_repoteam.py:340) — so it is recorded SKIPPED, never a crash.
+#
+# ELECTION + RE-POINT (§4.2). Per repo_slug: canonical = cp_repoteam.get_team_for_repo(slug) when
+# the /team/auto repo->team binding exists, else the team_id with the EARLIEST enrolled_at across
+# its members (grandfather a missing stamp to +inf; sorted tiebreak), then bind_repo_team (CAS,
+# first-writer-wins) locks it. Every member re-points via cp_repoteam.bind_haid_to_team — the SAME
+# accessor /team/auto uses (cp_autoteam.py:279): it re-registers through cp_auth.register_key,
+# PRESERVING pubkey/owner/project/enrolled_at and swapping ONLY team_id. It NEVER hard-deletes a
+# key/enrollment (the cp_auth registry-eviction path is never invoked) — losers only lose a member.
+#
+# stdlib-only (argparse/json/os/sys/time) + the SHIPPED cp_state / cp_auth / cp_repoteam /
+# cp_presence substrate — no new dependency; honors HEIMDALL_HOME so a test pins a temp backend.
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+
+# Resolve bin/lib (the cp_* substrate) onto sys.path exactly as every other bin/ python tool.
+_BIN = os.path.dirname(os.path.abspath(__file__))
+_LIB = os.path.join(_BIN, "lib")
+if _LIB not in sys.path:
+    sys.path.insert(0, _LIB)
+
+import cp_state      # the backend factory + firestore-safe list_names/get_record/put_record.
+import cp_auth       # _load_keys (raw-haid registry) + registered_team_field (current binding).
+import cp_repoteam   # repo_slug + get_team_for_repo + bind_repo_team (CAS) + bind_haid_to_team.
+import cp_presence   # _PRESENCE_REL + _slug (the SAME slug the presence store keys records by).
+
+_LEDGER_DIR = "migration/team-converge"
+_LEDGER_VERSION = "1.0.0"
+_RECORD_SUFFIX = ".json"
+
+
+def _project_repo_slug(project_dirname):
+    """Recover the canonical `owner/name` repo_slug from a PRESENCE PROJECT dir name, or None for a
+    truly-local (non-resolvable) project — the "leave it alone" signal.
+
+    The presence tree stores the project cp_presence._slug'd, so `github.com/owner/name` arrives as
+    the single segment `github.com_owner_name`. repo_slug() (host-agnostic, last-two-segments) needs
+    the "/"-separated form. Try the raw name first (in case an un-slugged project was ever stored),
+    then the "_"->"/" reversal. A bare local dir name (`code`, `mytool`) has one segment -> repo_slug
+    returns None on both -> the caller SKIPS it (truly-local: never re-pointed)."""
+    slug = cp_repoteam.repo_slug(project_dirname)
+    if slug:
+        return slug
+    return cp_repoteam.repo_slug(project_dirname.replace("_", "/"))
+
+
+def _enrolled_at(entry):
+    """The numeric enrolled_at stamp on a registry entry, or +inf when absent/non-numeric — a
+    legacy binding with no stamp is grandfathered to the LATEST possible time so it never wins the
+    earliest-created election over a stamped member."""
+    if isinstance(entry, dict):
+        v = entry.get("enrolled_at")
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            return float(v)
+    return float("inf")
+
+
+def _elect_earliest(team_ids, team_members, reg_keys):
+    """Elect the canonical team_id when no /team/auto binding exists: the team_id with the EARLIEST
+    enrolled_at across its members (min over members; a team with no registry-present member scores
+    +inf). Deterministic — team_ids are scanned sorted, so an exact-tie resolves to the smallest id."""
+    best_tid = None
+    best_at = None
+    for tid in sorted(team_ids):
+        members = team_members.get(tid) or set()
+        ats = [_enrolled_at(reg_keys.get(h)) for h in members]
+        tmin = min(ats) if ats else float("inf")
+        if best_at is None or tmin < best_at:
+            best_at, best_tid = tmin, tid
+    return best_tid
+
+
+def _scan(backend, home):
+    """Enumerate the durable presence tree and group every enrolled machine by its canonical
+    repo_slug. Returns a dict: slug -> {team_ids:set, haids:set(raw), team_members:{tid:set(raw)},
+    skipped:set(slugged-haid-with-no-registry)}. Truly-local (repo_slug None) projects are dropped.
+
+    The registry supplies the slug(raw_haid) -> raw_haid bridge: a presence record filename is the
+    SLUGGED haid, but the registry (and every re-point accessor) is keyed by the RAW haid. A slugged
+    presence haid with no registry counterpart is tracked as skipped (registry-missing)."""
+    reg_keys = cp_auth._load_keys(home)["keys"]
+    slug_to_raw = {}
+    for raw in reg_keys:
+        slug_to_raw[cp_presence._slug(raw)] = raw
+
+    groups = {}
+    for project in backend.list_names(cp_presence._PRESENCE_REL):
+        slug = _project_repo_slug(project)
+        if not slug:
+            continue  # truly-local tree — LEAVE ALONE (no owner/name to converge).
+        proj_rel = os.path.join(cp_presence._PRESENCE_REL, project)
+        g = groups.setdefault(
+            slug, {"team_ids": set(), "haids": set(), "team_members": {}, "skipped": set()})
+        for team_id in backend.list_names(proj_rel):
+            team_rel = os.path.join(proj_rel, team_id)
+            for rec in backend.list_names(team_rel, suffix=_RECORD_SUFFIX):
+                shaid = rec[: -len(_RECORD_SUFFIX)]
+                g["team_ids"].add(team_id)
+                raw = slug_to_raw.get(shaid)
+                if raw is None:
+                    g["skipped"].add(shaid)  # in the tree, absent from the registry — cannot re-point.
+                    continue
+                g["haids"].add(raw)
+                g["team_members"].setdefault(team_id, set()).add(raw)
+    return groups, reg_keys
+
+
+def converge(*, home=None, dry_run=False, out=sys.stdout):
+    """The migration. Scan -> per-slug elect canonical -> re-point every member -> ledger. In
+    --dry-run every write is suppressed (no bind_repo_team, no bind_haid_to_team, no ledger) and
+    only the plan is printed. Returns an exit code (0 = converged/planned, no crash on any skip)."""
+    backend = cp_state.get_backend(home=home)
+    groups, reg_keys = _scan(backend, home)
+
+    mode = "DRY-RUN (zero writes)" if dry_run else "EXECUTE"
+    out.write("heimdall-team-converge [%s] — %d repo_slug group(s)\n" % (mode, len(groups)))
+
+    total_repointed = 0
+    for slug in sorted(groups):
+        g = groups[slug]
+
+        # 1. ELECT canonical — the /team/auto binding if present, else earliest-enrolled_at.
+        canonical = cp_repoteam.get_team_for_repo(slug, home=home)
+        if not canonical:
+            canonical = _elect_earliest(g["team_ids"], g["team_members"], reg_keys)
+            if canonical and not dry_run:
+                # CAS first-writer-wins: if a concurrent/prior bind exists we converge on IT.
+                canonical = cp_repoteam.bind_repo_team(slug, canonical, home=home)
+        if not canonical:
+            out.write("  %s -> (no electable team; %d skipped) — LEFT ALONE\n"
+                      % (slug, len(g["skipped"])))
+            continue
+
+        # 2. RE-POINT every registry-present member to canonical (idempotent skip when already there).
+        repointed = []
+        for haid in sorted(g["haids"]):
+            if cp_auth.registered_team_field(haid, home=home) == canonical:
+                continue
+            if not dry_run:
+                if not cp_repoteam.bind_haid_to_team(haid, canonical, home=home):
+                    # fail-closed (no registered pubkey) — record skipped, never crash.
+                    g["skipped"].add(haid)
+                    continue
+            repointed.append(haid)
+        total_repointed += len(repointed)
+
+        superseded = sorted(g["team_ids"] - {canonical})
+
+        # 3. RECORD the superseded ledger — only when this run actually MOVED members, so a
+        #    re-run over an already-converged repo writes NOTHING (true idempotent no-op).
+        if repointed and not dry_run:
+            backend.put_record(
+                os.path.join(_LEDGER_DIR, "%s%s" % (cp_repoteam._key(slug), _RECORD_SUFFIX)),
+                {"version": _LEDGER_VERSION,
+                 "repo_slug": slug,
+                 "canonical_team_id": canonical,
+                 "superseded_team_ids": superseded,
+                 "haids_repointed": sorted(repointed),
+                 "ts": int(time.time())})
+
+        skipped_note = (", skipped=%d" % len(g["skipped"])) if g["skipped"] else ""
+        out.write("  %s -> %s  (+%d repointed, superseded=%s%s)\n"
+                  % (slug, canonical, len(repointed), superseded, skipped_note))
+
+    out.write("done: %d member(s) re-pointed%s.\n"
+              % (total_repointed, " (dry-run — nothing written)" if dry_run else ""))
+    return 0
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(
+        prog="heimdall-team-converge",
+        description="Converge every repo's split team_ids onto ONE canonical team (converge-forward).")
+    p.add_argument("--dry-run", action="store_true",
+                   help="compute + print the full per-slug plan with ZERO writes.")
+    p.add_argument("--home", default=None,
+                   help="control-plane HEIMDALL_HOME (default: the HEIMDALL_HOME env).")
+    args = p.parse_args(argv)
+    home = args.home if args.home is not None else os.environ.get("HEIMDALL_HOME")
+    return converge(home=home, dry_run=args.dry_run)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
