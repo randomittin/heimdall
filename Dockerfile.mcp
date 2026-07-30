@@ -1,0 +1,43 @@
+# Heimdall Coordination Ledger — MCP server image (for glama.ai indexing/hosting).
+#
+# THIS IS NOT THE CONTROL-PLANE IMAGE. The root `Dockerfile` builds the Cloud Run
+# control plane (heimdall-control-plane serve). This file builds the LOCAL stdio
+# MCP server `bin/heimdall-ledger-mcp` — a thin JSON-RPC 2.0 wrapper over the
+# coordination ledger that exposes 6 tools (read_claims, make_claim, release_claim,
+# read_capsules, append_decision, raise_conflict_pr). It is stdlib-only (zero pip
+# deps) and speaks MCP over stdin/stdout.
+#
+# glama.ai note: point the Admin-panel build at THIS Dockerfile (Dockerfile.mcp),
+# NOT the auto-inferred root Dockerfile — otherwise glama would launch the control
+# plane HTTP server and the MCP `initialize`/`tools/list` introspection (and the
+# quality score) would fail. Verified locally: initialize + tools/list complete a
+# clean handshake with all 6 tools and no real ledger context required.
+FROM python:3.12-slim
+
+# git: the ledger derives a stable HAID from git identity + repo path, and the
+# ledger tools shell out to sibling bin/ scripts (heimdall-claim, heimdall-haid).
+# A minimal inited repo lets those run inside the sandbox.
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y git \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# The MCP wrapper shells out to sibling CLIs under bin/ (+ bin/lib), so copy the
+# whole bin/ tree. Nothing else is needed — the server is pure Python stdlib.
+COPY bin/ /app/bin/
+
+# A minimal git repo + writable planning home so HAID derivation and any ledger
+# write path have somewhere to land inside the ephemeral sandbox.
+RUN git init -q \
+    && git -c user.email=ci@heimdall.local -c user.name=heimdall-ci commit --allow-empty -qm "glama-sandbox init" \
+    && mkdir -p /tmp/heimdall-planning
+
+ENV PATH="/app/bin:${PATH}" \
+    HEIMDALL_HOME="/tmp/heimdall-planning" \
+    HEIMDALL_PLANNING_DIR="/tmp/heimdall-planning" \
+    PYTHONDONTWRITEBYTECODE="1" \
+    PYTHONUNBUFFERED="1"
+
+# stdio MCP server: reads JSON-RPC on stdin, writes on stdout. No port.
+CMD ["python3", "/app/bin/heimdall-ledger-mcp"]
