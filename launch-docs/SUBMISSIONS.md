@@ -81,7 +81,14 @@ For each list I fetched the **real, current README** from GitHub (not memory) to
 exact entry format. Repo star counts were live-checked via the GitHub search API to confirm
 each is the highest-signal list under that name.
 
-### 2.1 `awesome-claude-code` — **GOOD FIT** — STATUS: SUBMITTED 2026-07-30 → https://github.com/hesreallyhim/awesome-claude-code/issues/2364 (awaiting maintainer review)
+### 2.1 `awesome-claude-code` — **GOOD FIT** — STATUS: SUBMITTED 2026-07-30 → https://github.com/hesreallyhim/awesome-claude-code/issues/2364 (validation bot: **Description max 500 chars** — used the trimmed 497-char form below; Category dropdown value = `Agent Orchestration`)
+
+**Form description (≤500 chars, validated):**
+
+```
+Your AI agents can't grade their own homework. Heimdall gates every change behind a falsifiable oracle the agent never sees — proven able to fail before it passes — so PRs open only on real proof. It runs parallel agents across a team's machines, teammates auto-join by GitHub access, and each dev's triage is shared automatically so tribal knowledge stops dying in one head. Checkpoints context across sessions; /dream fixes overnight; design-match scores UI vs canonical. Nothing ships unproven.
+```
+
 
 - **Repo:** https://github.com/hesreallyhim/awesome-claude-code (50.1k★, confirmed top hit for "awesome-claude-code")
 - **Section:** `## Multi-Agent Orchestration` (primary — wave-based parallel agents + the `heimdall` orchestrator agent is the closest match to this section's existing entries). Alternates worth considering: `## Security` (secret-scan + oracle gates) or `## Linting` (quality gates), but Multi-Agent Orchestration is the strongest single fit.
