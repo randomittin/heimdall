@@ -60,13 +60,62 @@ if _LIB not in sys.path:
     sys.path.insert(0, _LIB)
 
 import cp_state      # the backend factory + firestore-safe list_names/get_record/put_record.
+import cp_state_firestore  # the firestore coordinate env-var NAMES (root/database/project) — stdlib-safe import.
 import cp_auth       # _load_keys (raw-haid registry) + registered_team_field (current binding).
 import cp_repoteam   # repo_slug + get_team_for_repo + bind_repo_team (CAS) + bind_haid_to_team.
 import cp_presence   # _PRESENCE_REL + _slug (the SAME slug the presence store keys records by).
+import issue_queue   # heimdall_home() — the SAME local store-root resolution cp_state.LocalBackend uses.
 
 _LEDGER_DIR = "migration/team-converge"
 _LEDGER_VERSION = "1.0.0"
 _RECORD_SUFFIX = ".json"
+
+# The guard message a real EXECUTE against the LOCAL store prints before refusing (grep-anchored).
+_LOCAL_EXECUTE_GUARD = (
+    "REFUSING to EXECUTE against the LOCAL store — a real convergence would re-stamp the LOCAL "
+    "control-plane, not prod Firestore. Prod convergence needs HEIMDALL_STATE_BACKEND=firestore; "
+    "pass --allow-local ONLY when you deliberately mean the local store (e.g. hermetic tests)."
+)
+
+
+def _resolve_backend_name(backend=None):
+    """The RESOLVED backend name, computed EXACTLY as cp_state.get_backend does (explicit arg,
+    else HEIMDALL_STATE_BACKEND, else 'local'; stripped + lowercased). One source of truth so the
+    banner names the store the run will actually hit."""
+    return (backend if backend is not None
+            else os.environ.get(cp_state.BACKEND_ENV) or cp_state.BACKEND_LOCAL).strip().lower()
+
+
+def _backend_banner(home, backend=None):
+    """Return (name, banner) for the RESOLVED state backend and its coordinates, read from the
+    SAME env cp_state / cp_state_firestore resolve from — so the printed line is UNAMBIGUOUS about
+    which store this run reads/writes. Builds NO live client (pure string build; safe to unit-test
+    with HEIMDALL_STATE_BACKEND=firestore set and no network).
+
+      firestore -> `backend: firestore  project=<...>  root=<...>  database=<...>`
+                   project: HEIMDALL_FIRESTORE_PROJECT, else GOOGLE_CLOUD_PROJECT, else the
+                   gcloud/ADC default the client resolves at connect time (named honestly);
+                   root:    HEIMDALL_FIRESTORE_ROOT or the DEFAULT_ROOT ('heimdall_cp');
+                   database:HEIMDALL_FIRESTORE_DATABASE or '(default)'.
+      local     -> `backend: LOCAL  home=<resolved control-plane store root>`
+                   resolved the SAME way LocalBackend does: (home or issue_queue.heimdall_home())
+                   joined with cp_state.CONTROL_PLANE_DIR."""
+    name = _resolve_backend_name(backend)
+    if name == cp_state.BACKEND_FIRESTORE:
+        project = (os.environ.get(cp_state_firestore.FIRESTORE_PROJECT_ENV)
+                   or os.environ.get("GOOGLE_CLOUD_PROJECT")
+                   or "(gcloud/ADC default)")
+        root = (os.environ.get(cp_state_firestore.FIRESTORE_ROOT_ENV)
+                or cp_state_firestore.DEFAULT_ROOT)
+        database = os.environ.get(cp_state_firestore.FIRESTORE_DATABASE_ENV) or "(default)"
+        return name, ("backend: firestore  project=%s  root=%s  database=%s"
+                      % (project, root, database))
+    if name == cp_state.BACKEND_LOCAL:
+        base = home if home else issue_queue.heimdall_home()
+        home_path = os.path.join(base, cp_state.CONTROL_PLANE_DIR)
+        return name, "backend: LOCAL  home=%s" % home_path
+    # An unknown backend: name it (get_backend will raise ValueError right after — fail closed).
+    return name, "backend: %s (UNKNOWN — get_backend will refuse)" % name
 
 
 def _project_repo_slug(project_dirname):
@@ -145,15 +194,39 @@ def _scan(backend, home):
     return groups, reg_keys
 
 
-def converge(*, home=None, dry_run=False, out=sys.stdout):
+def converge(*, home=None, dry_run=False, allow_local=False, out=sys.stdout, err=sys.stderr):
     """The migration. Scan -> per-slug elect canonical -> re-point every member -> ledger. In
     --dry-run every write is suppressed (no bind_repo_team, no bind_haid_to_team, no ledger) and
-    only the plan is printed. Returns an exit code (0 = converged/planned, no crash on any skip)."""
+    only the plan is printed. Returns an exit code (0 = converged/planned, no crash on any skip;
+    nonzero = refused a real EXECUTE against the LOCAL store without --allow-local).
+
+    BACKEND TRANSPARENCY (never a silent wrong-store run). Before enumerating, the RESOLVED backend
+    + its coordinates are printed to stderr, read from the SAME env cp_state resolves from — so a
+    run can never quietly read the empty LOCAL store while looking like a clean prod pass. On LOCAL
+    a loud warning fires; a real EXECUTE against LOCAL is REFUSED unless --allow-local is explicit
+    (--dry-run is read-only and always allowed)."""
+    name, banner = _backend_banner(home)
+    err.write(banner + "\n")
+
+    is_local = (name == cp_state.BACKEND_LOCAL)
+    if is_local:
+        err.write("=" * 72 + "\n")
+        err.write("WARNING: this is the LOCAL control-plane store, NOT prod Firestore.\n")
+        err.write("         Prod convergence needs HEIMDALL_STATE_BACKEND=firestore (a 0-group "
+                  "result here is an EMPTY local store, not an already-converged prod).\n")
+        err.write("=" * 72 + "\n")
+        if not dry_run and not allow_local:
+            err.write(_LOCAL_EXECUTE_GUARD + "\n")
+            return 2
+
     backend = cp_state.get_backend(home=home)
     groups, reg_keys = _scan(backend, home)
 
     mode = "DRY-RUN (zero writes)" if dry_run else "EXECUTE"
     out.write("heimdall-team-converge [%s] — %d repo_slug group(s)\n" % (mode, len(groups)))
+    if not groups and is_local:
+        out.write("hint: 0 groups is EXPECTED for an empty LOCAL store — prod convergence needs "
+                  "HEIMDALL_STATE_BACKEND=firestore (this run did NOT read prod Firestore).\n")
 
     total_repointed = 0
     for slug in sorted(groups):
@@ -213,11 +286,14 @@ def main(argv=None):
         description="Converge every repo's split team_ids onto ONE canonical team (converge-forward).")
     p.add_argument("--dry-run", action="store_true",
                    help="compute + print the full per-slug plan with ZERO writes.")
+    p.add_argument("--allow-local", action="store_true",
+                   help="permit a real EXECUTE against the LOCAL store (else refused — prod needs "
+                        "HEIMDALL_STATE_BACKEND=firestore). --dry-run is read-only and never gated.")
     p.add_argument("--home", default=None,
                    help="control-plane HEIMDALL_HOME (default: the HEIMDALL_HOME env).")
     args = p.parse_args(argv)
     home = args.home if args.home is not None else os.environ.get("HEIMDALL_HOME")
-    return converge(home=home, dry_run=args.dry_run)
+    return converge(home=home, dry_run=args.dry_run, allow_local=args.allow_local)
 
 
 if __name__ == "__main__":

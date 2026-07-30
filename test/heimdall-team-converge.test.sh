@@ -27,7 +27,7 @@ SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$SELF_DIR/.." && pwd)"
 LIB="$REPO/bin/lib"
 CONVERGE_CLI="$REPO/bin/heimdall-team-converge"
-export LIB REPO
+export LIB REPO CONVERGE_CLI
 
 for f in cp_auth cp_presence cp_repoteam cp_state; do
   [ -f "$LIB/$f.py" ] || { echo "FATAL: $LIB/$f.py missing" >&2; exit 2; }
@@ -148,8 +148,58 @@ fi
   && ok "--dry-run left the split intact (haid3 still teamB)" \
   || bad "--dry-run re-pointed a HAID (must not write)"
 
-# ── EXECUTE the migration ────────────────────────────────────────────────────────────────────────
-"$CONVERGE_CLI" >"$EXT/run1.out" 2>&1
+# ── BACKEND TRANSPARENCY: banner prints the RESOLVED backend (LOCAL) + loud warning ──────────────
+if grep -q "backend: LOCAL" "$EXT/dryrun.out"; then
+  ok "banner prints resolved backend (backend: LOCAL) with home path"
+else
+  bad "banner did not print 'backend: LOCAL'"; cat "$EXT/dryrun.out"
+fi
+if grep -qi "NOT prod Firestore" "$EXT/dryrun.out"; then
+  ok "loud local-store warning printed (NOT prod Firestore)"
+else
+  bad "no loud local-store warning on the LOCAL backend"; cat "$EXT/dryrun.out"
+fi
+
+# ── LOCAL GUARD: a real EXECUTE against local WITHOUT --allow-local must REFUSE (nonzero) ─────────
+"$CONVERGE_CLI" >"$EXT/guard.out" 2>&1
+GUARD_RC=$?
+if [ "$GUARD_RC" -ne 0 ] && grep -q "REFUSING to EXECUTE against the LOCAL store" "$EXT/guard.out"; then
+  ok "execute against local WITHOUT --allow-local refused (rc=$GUARD_RC + guard message)"
+else
+  bad "local execute without --allow-local was NOT refused (rc=$GUARD_RC)"; cat "$EXT/guard.out"
+fi
+# the refusal must have written NOTHING (fixture still split).
+[ "$(team_of "$HAID3")" = "$TEAM_B" ] \
+  && ok "refused execute wrote NOTHING (haid3 still teamB)" \
+  || bad "refused execute mutated state (must exit before any write)"
+
+# ── FIRESTORE banner string (unit; no live firestore connection) ─────────────────────────────────
+if "$PY" - <<'PY'
+import os, sys, importlib.util, importlib.machinery
+sys.path.insert(0, os.environ["LIB"])
+os.environ["HEIMDALL_STATE_BACKEND"] = "firestore"
+os.environ["GOOGLE_CLOUD_PROJECT"] = "prod-proj-xyz"
+for k in ("HEIMDALL_FIRESTORE_PROJECT", "HEIMDALL_FIRESTORE_ROOT", "HEIMDALL_FIRESTORE_DATABASE"):
+    os.environ.pop(k, None)
+# The CLI is extensionless — load it via an explicit SourceFileLoader (no suffix-based loader).
+loader = importlib.machinery.SourceFileLoader("converge_mod", os.environ["CONVERGE_CLI"])
+spec = importlib.util.spec_from_loader("converge_mod", loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)                            # top-level import must NOT need the firestore dep
+name, banner = mod._backend_banner(None)          # pure string build — no client, no network
+assert name == "firestore", name
+for frag in ("backend: firestore", "project=prod-proj-xyz", "root=heimdall_cp", "database=(default)"):
+    assert frag in banner, (frag, banner)
+print("firestore-banner-ok")
+PY
+then
+  ok "firestore banner resolves project/root/database from env (no live connection)"
+else
+  bad "firestore banner string builder wrong"
+fi
+
+# ── EXECUTE the migration (local store: --allow-local is the deliberate opt-in) ───────────────────
+"$CONVERGE_CLI" --allow-local >"$EXT/run1.out" 2>&1
 RUN1_RC=$?
 [ "$RUN1_RC" -eq 0 ] && ok "converge run exited 0" || { bad "converge run exited $RUN1_RC"; cat "$EXT/run1.out"; }
 
@@ -200,7 +250,7 @@ KEYS="$HEIMDALL_HOME/control-plane/auth/keys.json"
 LEDGER="$(ls "$HEIMDALL_HOME"/control-plane/migration/team-converge/*.json 2>/dev/null | head -1)"
 KEYS_BEFORE="$("$PY" -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$KEYS")"
 LEDGER_BEFORE="$("$PY" -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$LEDGER")"
-"$CONVERGE_CLI" >"$EXT/run2.out" 2>&1
+"$CONVERGE_CLI" --allow-local >"$EXT/run2.out" 2>&1
 RUN2_RC=$?
 KEYS_AFTER="$("$PY" -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$KEYS")"
 LEDGER_AFTER="$("$PY" -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$LEDGER")"
@@ -208,6 +258,19 @@ if [ "$RUN2_RC" -eq 0 ] && [ "$KEYS_BEFORE" = "$KEYS_AFTER" ] && [ "$LEDGER_BEFO
   ok "second run is a byte-identical no-op (keys.json + ledger unchanged)"
 else
   bad "second run mutated state (rc=$RUN2_RC keys:$KEYS_BEFORE/$KEYS_AFTER ledger:$LEDGER_BEFORE/$LEDGER_AFTER)"
+fi
+
+# ── EMPTY LOCAL STORE: banner + warning + 0-groups hint, exit 0 (dry-run needs no flag) ──────────
+EMPTY_HOME="$EXT/empty-home"; mkdir -p "$EMPTY_HOME"
+HEIMDALL_HOME="$EMPTY_HOME" "$CONVERGE_CLI" --dry-run >"$EXT/empty.out" 2>&1
+EMPTY_RC=$?
+if [ "$EMPTY_RC" -eq 0 ] \
+   && grep -q "backend: LOCAL" "$EXT/empty.out" \
+   && grep -q "0 repo_slug group" "$EXT/empty.out" \
+   && grep -qi "empty LOCAL store" "$EXT/empty.out"; then
+  ok "empty local dry-run: banner + 0 groups + firestore hint, exit 0"
+else
+  bad "empty local dry-run missing banner/hint (rc=$EMPTY_RC)"; cat "$EXT/empty.out"
 fi
 
 echo
