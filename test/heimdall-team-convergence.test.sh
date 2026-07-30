@@ -1,148 +1,300 @@
 #!/usr/bin/env bash
-# heimdall-team-convergence.test.sh — WAVE-1 RED GATE for the team-split bug (TEAM-FIX-PLAN §5.5).
+# heimdall-team-convergence.test.sh — REAL-CODE convergence gate for the team-split bug
+# (TEAM-FIX-PLAN §5.5). RED on the pre-Wave-2 resolver, GREEN after it.
 #
-# THE BUG (documented here, RED now, GREEN after the Wave-2 resolver fix). Two developers on the
-# SAME github repo — the SAME canonical `repo_slug` — must land on the SAME operative team_id, or
-# they can never see each other's presence. On the SHIPPED code they DO NOT:
+# THE BUG. Two developers on the SAME github repo (the SAME canonical repo_slug) must land on the
+# SAME operative team_id, or they can never see each other's presence. They enter via DIFFERENT
+# client resolution models:
 #
-#   * MACHINE A (the committed-secret model). Enrolled from a repo whose <repo>/.heimdall/team.json
-#     carries a bearer `team_secret` (e.g. an old `hmd team new` / a pasted `join <secret>`). Its
-#     operative team_id is the CLIENT-derived handle of that secret:
-#         cp_auth.derive_team_id(team_secret)  ==  sha256("heimdall-team\0"+secret)[:32]
-#     (bin/heimdall-presence lifts the team.json secret into the wire header; the write/read
-#      partition is derive_team_id(secret) — the committed-secret world.)
+#   * MACHINE A — the COMMITTED-SECRET model. <repo>/.heimdall/team.json carries a bearer
+#     `team_secret` (an old `hmd team new` / a pasted `join <secret>` a teammate committed). On the
+#     SHIPPED (pre-fix) resolver, _resolve_team_for_wire RETURNS on the non-empty secret BEFORE ever
+#     calling /team/auto, so A lifts the secret into the X-Heimdall-Team-Secret header and the server
+#     binds A to derive_team_id(secret) == sha256("heimdall-team\0"+secret)[:32].
 #
-#   * MACHINE B (the /team/auto server model). Zero-touch enrolled via POST /team/auto, keyed on
-#     GitHub access. Its operative team_id is SERVER-derived for the repo_slug from a FRESH random
-#     secret the server mints and discards:
-#         cp_repoteam.mint_team_for_repo(repo_slug)  ->  derive_team_id(secrets.token_hex(32))
-#     The server NEVER sees Machine A's "S-rally" secret, so it never derives A's id.
+#   * MACHINE B — the /team/auto SERVER model. A fresh checkout, zero-touch: POST /team/auto binds
+#     the repo_slug to a server-derived team_id (first teammate INITIATES, everyone else JOINS).
 #
-# Same repo_slug, two operative team_ids → the team is SPLIT: A and B are invisible to each other.
-# This test asserts A_id == B_id, so it is RED against current code (prints the two divergent ids
-# + a "SPLIT:" line, exits nonzero). That RED is the correct, expected Wave-1 outcome.
+# Same repo_slug, two operative team_ids -> SPLIT: A and B are invisible to each other. This test
+# drives the ACTUAL bin/heimdall-presence resolver for both machines against a hermetic mock control
+# plane (localhost) + a shim `gh`, and asserts they CONVERGE on ONE server team_id and that A no
+# longer sends the secret header (which is exactly what re-split the repo).
 #
-# FALSIFIABLE IN REVERSE (why it goes GREEN after Wave 2). The resolver fix makes Machine A, for a
-# GITHUB repo, DROP its bearer secret and resolve the SAME server id — get_team_for_repo(repo_slug)
-# — that Machine B minted/bound. Both then read ONE server-derived partition for the slug, A_id
-# becomes get_team_for_repo(slug) == B_id, and this exact assertion flips to PASS. The convergence
-# target already exists on shipped code and is proven live below (C2: get==mint for the slug), so
-# the only thing failing today is that A still uses derive_team_id(secret) instead of that id.
+# FALSIFIABLE IN BOTH DIRECTIONS:
+#   * PRE-FIX  -> A short-circuits on its committed secret: team.json never gains a team_id, A's beat
+#                carries the team-secret header, A's operative id stays derive_team_id(secret) != B's
+#                server id. Assertions C1/C2 FAIL (RED).
+#   * POST-FIX -> A, being a github repo, PREFERS /team/auto: drops the header, adopts + persists the
+#                server team_id (secret preserved for the offline P4 fallback). A_id == B_id. GREEN.
 #
-# HERMETIC: two throwaway HOME/HEIMDALL_HOME backends (one per "machine"), a throwaway git repo for
-# the real repo_slug, all under a temp dir cleaned via trap. NO network, NO prod control plane, NO
-# live Cloud Run — Machine B drives the LOCAL cp_state backend. The RED failure is REAL: it comes
-# from invoking the actual cp_auth.derive_team_id + cp_repoteam.mint_team_for_repo/get_team_for_repo
-# shipped code, never a hardcoded `false`.
+# HERMETIC: two throwaway HOME/HEIMDALL_TEAM_DIR "machines" on one throwaway github-remote repo, an
+# in-process mock CP (stateful /team/auto so one repo -> one id), a PATH-shim `gh`. NO real network,
+# NO prod CP, NO GitHub API, NO spend. Cleaned via trap.
 #
-# Exit 0 = A and B converged (Wave 2 landed). Nonzero = the split is live (expected in Wave 1).
+# Exit 0 = A and B converged (Wave 2 landed). Nonzero = the split is live (expected pre-fix).
 
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
+BIN="$ROOT/bin/heimdall-presence"
 LIB="$ROOT/bin/lib"
 export LIB
+# DEFAULT-ON egress guard: pin the baked-in CP default at a dead port so no un-pinned presence call
+# can reach the real production CP.
+. "$ROOT/test/lib/net-default-guard.sh"
 
 PY="$(command -v python3 || command -v python || true)"
-if [ -z "$PY" ]; then echo "SKIP: python3 unavailable — cannot exercise real cp_auth/cp_repoteam" >&2; exit 0; fi
-for f in cp_auth cp_repoteam cp_state cp_allowlist; do
+[ -n "$PY" ] || { echo "SKIP: python3 unavailable" >&2; exit 0; }
+[ -x "$BIN" ] || { echo "FATAL: $BIN missing/!exec" >&2; exit 2; }
+for f in cp_auth cp_repoteam; do
   [ -f "$LIB/$f.py" ] || { echo "FATAL: $LIB/$f.py missing" >&2; exit 2; }
 done
+
+CRYPTO="$("$PY" -c "import sys;sys.path.insert(0,'$LIB');import cp_auth;print('1' if cp_auth.crypto_available() else '0')" 2>/dev/null || echo 0)"
+if [ "$CRYPTO" != "1" ]; then
+  echo "SKIP: no Ed25519 backend (cryptography/pynacl) — cannot exercise the signed enroll/beat resolver" >&2
+  exit 0
+fi
 
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); printf "  \033[32mPASS\033[0m %s\n" "$1"; }
 bad() { FAIL=$((FAIL+1)); printf "  \033[31mFAIL\033[0m %s\n" "$1"; }
 
-TMP="$(mktemp -d -t hmd-team-converge)"
-cleanup() { rm -rf "$TMP"; }
-trap cleanup EXIT
+WORK="$(mktemp -d -t hmd-team-convergence)"
+MOCK_PIDS=""
+cleanup() {
+  for p in $MOCK_PIDS; do kill "$p" >/dev/null 2>&1 || true; wait "$p" 2>/dev/null || true; done
+  rm -rf "$WORK"
+}
+trap cleanup INT TERM EXIT
 
-# ── the shared repo both "machines" are on: a real git repo → a real repo_slug ──────────────
-#    Machine A's team.json carries the committed bearer secret; the two machines share the SLUG,
-#    NOT the secret (the server never learns "S-rally").
-SECRET_A="S-rally-committed-team-secret-0000000000000"   # the bearer secret in A's team.json.
-REPO="$TMP/rally"; mkdir -p "$REPO"
-git -C "$REPO" init -q
-git -C "$REPO" remote add origin "https://github.com/randomittin/rally.git"
-REMOTE_URL="$(git -C "$REPO" config --get remote.origin.url)"
-[ -n "$REMOTE_URL" ] || { echo "FATAL: could not read the git remote url" >&2; exit 2; }
+GH_TOKEN="gho_faketoken_TRANSIT_ONLY_do_not_persist_conv"
+GH_LOGIN="octocat"
 
-# Two isolated backends — one operative HOME per machine (Machine B's server-side registry).
-A_HOME="$TMP/machine-a-home"; mkdir -p "$A_HOME"
-B_HOME="$TMP/machine-b-home"; mkdir -p "$B_HOME"
+# ── the mock control plane: /enroll, /team/auto (stateful: one repo -> one server team_id, first
+#    INITIATES the rest JOIN), /presence (LOGS whether the team-secret header rode). ──
+cat > "$WORK/mock_cp.py" <<'PYEOF'
+import hashlib, json, os, sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import urlsplit, parse_qs
 
-echo "============================================================"
-echo "TEAM CONVERGENCE — same repo_slug must map to ONE team_id"
-echo "  remote=$REMOTE_URL"
-echo "============================================================"
-echo
+LOG = os.environ["MOCK_LOG"]
+ENROLLED = set()
+TEAMS = {}   # repo_slug -> server team_id (first caller INITIATES, the rest JOIN the same id)
 
-# ── invoke the REAL shipped code: derive A's id from the secret, mint B's id from the slug ──
-RES="$(SECRET_A="$SECRET_A" REMOTE_URL="$REMOTE_URL" B_HOME="$B_HOME" "$PY" - <<'PYEOF' 2>"$TMP/py.err"
-import json, os, sys
-sys.path.insert(0, os.environ["LIB"])
-import cp_auth       # the committed-secret world: derive_team_id(secret).
-import cp_repoteam   # the /team/auto world: repo_slug + mint/get team_for_repo (LOCAL backend).
 
-remote = os.environ["REMOTE_URL"]
+def record(line):
+    with open(LOG, "a", encoding="utf-8") as fh:
+        fh.write(line + "\n")
 
-# The CANONICAL, NON-SECRET repo key — the real function, from the real git remote (no hardcode).
-slug = cp_repoteam.repo_slug(remote)
 
-# MACHINE A — the operative team_id an enrolled committed-secret client uses (client-derived).
-a_id = cp_auth.derive_team_id(os.environ["SECRET_A"])
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        return
 
-# MACHINE B — the operative team_id /team/auto binds for this repo_slug, SERVER-derived from a
-# fresh random secret. Its own isolated HOME backend (no network, no prod CP).
-b_home = os.environ["B_HOME"]
-b_id = cp_repoteam.mint_team_for_repo(slug, home=b_home)
-# The convergence TARGET already resolvable on shipped code: a second read returns the SAME bound
-# id (idempotent, no double-mint) — this is exactly the id the fixed resolver will make A adopt.
-b_id_reread = cp_repoteam.get_team_for_repo(slug, home=b_home)
+    def _body(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        return self.rfile.read(n) if n > 0 else b""
 
-json.dump({"slug": slug, "a_id": a_id, "b_id": b_id, "b_id_reread": b_id_reread}, sys.stdout)
+    def _send(self, code, obj):
+        p = json.dumps(obj).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(p)))
+        self.end_headers()
+        self.wfile.write(p)
+
+    def do_POST(self):
+        path = urlsplit(self.path).path
+        try:
+            d = json.loads(self._body() or b"{}")
+        except Exception:
+            d = {}
+        if path == "/enroll":
+            h = d.get("haid") or ""
+            if h:
+                ENROLLED.add(h)
+            record("enroll haid=%s" % h)
+            self._send(200, {"ok": True})
+            return
+        if path == "/team/auto":
+            repo = d.get("repo") or ""
+            haid = d.get("haid") or ""
+            record("teamauto repo=%s haid=%s" % (repo, haid))
+            if haid not in ENROLLED:
+                self._send(409, {"ok": False, "error": "enroll_required"})
+                return
+            tid = "srv_" + hashlib.sha1(repo.encode("utf-8")).hexdigest()[:24]
+            mode = "joined" if repo in TEAMS else "initiated"
+            TEAMS.setdefault(repo, tid)
+            self._send(200, {"ok": True, "team_id": TEAMS[repo], "mode": mode,
+                             "project": "github.com/" + repo})
+            return
+        if path == "/presence":
+            team = 1 if self.headers.get("X-Heimdall-Team-Secret") else 0
+            record("presence team_header=%d haid=%s" % (team, self.headers.get("X-Heimdall-HAID")))
+            self._send(200, {"ok": True})
+            return
+        self._send(404, {"error": "no_route"})
+
+    def do_GET(self):
+        s = urlsplit(self.path)
+        if s.path == "/roster":
+            q = parse_qs(s.query)
+            record("roster project=%s" % (q.get("project") or [""])[0])
+            self._send(200, {"roster": []})
+            return
+        self._send(404, {"error": "no_route"})
+
+
+import threading as _th, time as _t
+_GUARD = int(os.environ.get("MOCK_GUARD_PID") or "0")
+def _watchdog():
+    start = _t.time()
+    while True:
+        _t.sleep(1.0)
+        dead = False
+        if _GUARD:
+            try:
+                os.kill(_GUARD, 0)
+            except ProcessLookupError:
+                dead = True
+            except PermissionError:
+                dead = False
+        if dead or (_t.time() - start) > 120:
+            os._exit(0)
+_th.Thread(target=_watchdog, daemon=True).start()
+
+srv = HTTPServer(("127.0.0.1", 0), Handler)
+sys.stdout.write("%d\n" % srv.server_address[1])
+sys.stdout.flush()
+srv.serve_forever()
 PYEOF
-)"
-if [ -z "$RES" ]; then
-  echo "FATAL: the cp_auth/cp_repoteam invocation produced no output" >&2
-  cat "$TMP/py.err" >&2
-  exit 2
-fi
 
-get() { printf '%s' "$RES" | RES_KEY="$1" "$PY" -c 'import json,os,sys;sys.stdout.write(str(json.load(sys.stdin).get(os.environ["RES_KEY"]) or ""))'; }
-SLUG="$(get slug)"; A_ID="$(get a_id)"; B_ID="$(get b_id)"; B_ID2="$(get b_id_reread)"
+MOCK_LOG="$WORK/mock.log"; : > "$MOCK_LOG"
+PORT_FILE="$WORK/port.txt"; : > "$PORT_FILE"
+MOCK_LOG="$MOCK_LOG" MOCK_GUARD_PID="$$" "$PY" "$WORK/mock_cp.py" >"$PORT_FILE" 2>>"$WORK/mock.err" &
+MOCK_PIDS="$MOCK_PIDS $!"
+PORT=""
+for _ in $(seq 1 50); do
+  PORT="$(sed -n '1p' "$PORT_FILE" 2>/dev/null || true)"
+  [ -n "$PORT" ] && break
+  "$PY" -c "import time;time.sleep(0.1)"
+done
+[ -n "$PORT" ] || { echo "FATAL: mock CP never bound a port" >&2; cat "$WORK/mock.err" >&2; exit 2; }
+URL="http://127.0.0.1:$PORT"
 
-# ── sanity: the slug is the real canonical key, and both ids are real derived handles ───────
-if [ "$SLUG" = "randomittin/rally" ]; then
-  ok "slug: real repo_slug() canonicalized the git remote → $SLUG"
-else
-  bad "slug: repo_slug() gave '$SLUG' (expected randomittin/rally)"
-fi
-if [ -n "$A_ID" ] && [ -n "$B_ID" ]; then
-  ok "ids: both operative team_ids came from real shipped code (A via cp_auth.derive_team_id, B via cp_repoteam.mint_team_for_repo)"
-else
-  bad "ids: a team_id was empty (A='$A_ID' B='$B_ID') — real code did not resolve"
-fi
+# ── PATH-shim gh (authed). ──
+GHBIN="$WORK/ghbin"; mkdir -p "$GHBIN"
+cat > "$GHBIN/gh" <<EOF
+#!/usr/bin/env bash
+case "\$*" in
+  "api user"*)   printf '%s\n' "$GH_LOGIN" ;;
+  "auth token"*) printf '%s\n' "$GH_TOKEN" ;;
+  *) exit 1 ;;
+esac
+EOF
+chmod +x "$GHBIN/gh"
 
-# ── C2: the convergence TARGET is live — get_team_for_repo(slug) == mint (no double-mint) ───
-#    This proves the fix's destination already resolves on shipped code (falsifiable-in-reverse).
-if [ -n "$B_ID2" ] && [ "$B_ID2" = "$B_ID" ]; then
-  ok "target: get_team_for_repo(slug) == mint_team_for_repo(slug) — the server id A must adopt is stable ($B_ID)"
-else
-  bad "target: server id not stable (mint='$B_ID' reread='$B_ID2') — repoteam registry broken"
-fi
+# ── the SHARED github repo both machines are on (one canonical repo_slug). ──
+REPO="$WORK/rally"; mkdir -p "$REPO"
+git -C "$REPO" init -q
+git -C "$REPO" config user.email "dev@example.com"
+git -C "$REPO" config user.name "Dev"
+git -C "$REPO" remote add origin "https://github.com/randomittin/rally.git"
+SLUG_EXPECT="randomittin/rally"
 
-# ── THE CONVERGENCE ASSERTION — RED on shipped code, GREEN after the Wave-2 resolver fix ────
+# The REAL server canonicalizer — a sanity anchor that the slug the mock keys on is the same
+# repo_slug the shipped server derives (no hardcode-only assertion).
+SLUG_REAL="$(REMOTE="https://github.com/randomittin/rally.git" "$PY" -c 'import os,sys;sys.path.insert(0,os.environ["LIB"]);import cp_repoteam;sys.stdout.write(cp_repoteam.repo_slug(os.environ["REMOTE"]) or "")' 2>/dev/null || true)"
+
+write_endpoint() { mkdir -p "$1/.heimdall"; printf '{"url":"%s"}\n' "$2" > "$1/.heimdall/cp-endpoint.json"; }
+read_field() {
+  "$PY" - "$1" "$2" 2>/dev/null <<'PYEOF' || true
+import json, sys
+try:
+    sys.stdout.write(str(json.load(open(sys.argv[1])).get(sys.argv[2]) or ""))
+except Exception:
+    sys.stdout.write("")
+PYEOF
+}
+# clean-env runner (mirrors the presence-autoteam harness): zero manual CP exports; gh on PATH.
+run_at() {
+  local home="$1" ghbin="$2"; shift 2
+  ( cd "$REPO" \
+    && env -u HEIMDALL_CP_URL -u BASE_URL -u HEIMDALL_CP_PKI_KEY -u PKI_SEED \
+           -u HMD_PROJECT -u HMD_HAID -u HMD_HANDLE -u HMD_AUTO_TEAM_DISABLE \
+           PATH="$ghbin:$PATH" HOME="$home" HEIMDALL_TEAM_DIR="$home/.heimdall" \
+           HMD_PRESENCE_INTERACTIVE=1 "$BIN" "$@" )
+}
+
+echo "============================================================"
+echo "TEAM CONVERGENCE — same repo_slug must resolve to ONE team_id"
+echo "  remote=https://github.com/randomittin/rally.git  slug=$SLUG_EXPECT"
+echo "============================================================"
 echo
-if [ "$A_ID" = "$B_ID" ]; then
-  ok "CONVERGED: the committed-secret machine and the /team/auto machine share ONE team_id ($A_ID)"
+
+# sanity: the real server canonicalizer agrees on the slug the mock keys on.
+if [ "$SLUG_REAL" = "$SLUG_EXPECT" ]; then
+  ok "slug: cp_repoteam.repo_slug canonicalized the git remote -> $SLUG_REAL"
 else
-  bad "SPLIT: same repo_slug '$SLUG' resolves to TWO team_ids — A=$A_ID B=$B_ID"
-  printf "  \033[31mSPLIT: A=%s B=%s\033[0m\n" "$A_ID" "$B_ID"
-  echo   "  A (committed-secret / cp_auth.derive_team_id) and B (/team/auto / cp_repoteam.mint_team_for_repo)"
-  echo   "  are invisible to each other. Wave-2 fix: A drops its secret for a github repo and resolves"
-  echo   "  get_team_for_repo('$SLUG') == B ($B_ID) → this assertion flips GREEN."
+  bad "slug: repo_slug() gave '$SLUG_REAL' (expected $SLUG_EXPECT)"
+fi
+
+# ── MACHINE B — the /team/auto server model: a FRESH checkout INITIATES the repo's team. ──
+HOME_B="$WORK/home_b"; write_endpoint "$HOME_B" "$URL"
+run_at "$HOME_B" "$GHBIN" beat 2>"$WORK/b.err"; B_EX="$?"
+TJ_B="$HOME_B/.heimdall/team.json"
+B_TID="$(read_field "$TJ_B" team_id)"
+B_SRC="$(read_field "$TJ_B" source)"
+if [ "$B_EX" = "0" ] && [ -n "$B_TID" ] && [ "$B_SRC" = "auto-github" ]; then
+  ok "B: /team/auto model bound the server team_id ($B_TID, source auto-github, no secret)"
+else
+  bad "B: auto-github did not bind (exit=$B_EX tid='$B_TID' src='$B_SRC')"; cat "$WORK/b.err" >&2
+fi
+
+# ── MACHINE A — the COMMITTED-SECRET model: team.json pre-seeded with a bearer secret (as a
+#    teammate would commit it). The FIX makes A, being a github repo, prefer /team/auto. ──
+SECRET_A="S-rally-committed-team-secret-000000000000000"
+HOME_A="$WORK/home_a"; write_endpoint "$HOME_A" "$URL"
+mkdir -p "$HOME_A/.heimdall"
+printf '{"team_secret":"%s","created":7,"source":"new"}\n' "$SECRET_A" > "$HOME_A/.heimdall/team.json"
+: > "$MOCK_LOG"   # isolate A's beat so we can read A's own /presence header state
+run_at "$HOME_A" "$GHBIN" beat 2>"$WORK/a.err"; A_EX="$?"
+TJ_A="$HOME_A/.heimdall/team.json"
+A_TID="$(read_field "$TJ_A" team_id)"
+A_SEC="$(read_field "$TJ_A" team_secret)"
+# did A send the team-secret header on its /presence beat? (pre-fix: yes -> the re-split)
+A_TEAM_HEADER="$(grep -c '^presence team_header=1 ' "$MOCK_LOG" 2>/dev/null || true)"
+[ -n "$A_TEAM_HEADER" ] || A_TEAM_HEADER=0
+
+echo
+# ── C1: THE CONVERGENCE ASSERTION — A and B share ONE server team_id. ──
+if [ "$A_EX" = "0" ] && [ -n "$A_TID" ] && [ "$A_TID" = "$B_TID" ]; then
+  ok "C1 CONVERGED: the committed-secret machine adopted the SAME server team_id as /team/auto ($A_TID)"
+else
+  bad "C1 SPLIT: same repo_slug '$SLUG_EXPECT' -> A='$A_TID' B='$B_TID' (A must adopt the server id)"
+  printf "  \033[31mSPLIT: A_team_id=%s  B_team_id=%s\033[0m\n" "${A_TID:-<none>}" "$B_TID"
+  echo   "  A (committed-secret) short-circuited on its bearer secret instead of preferring /team/auto,"
+  echo   "  so it never adopted the server repo->team id and stays invisible to B. Wave-2 fix: A drops"
+  echo   "  the secret header for a github repo and persists get_team_for_repo('$SLUG_EXPECT') == B."
+  cat "$WORK/a.err" >&2
+fi
+
+# ── C2: A DROPPED the secret header — membership is the server binding, not sha256(secret). ──
+if [ "$A_TEAM_HEADER" -eq 0 ]; then
+  ok "C2 A's beat carried NO X-Heimdall-Team-Secret header (no re-bind to sha256(secret) -> no re-split)"
+else
+  bad "C2 A still sent the team-secret header ($A_TEAM_HEADER beat[s]) -> server re-binds to sha256(secret), the split"
+  sed 's/^/    /' "$MOCK_LOG" >&2
+fi
+
+# ── C3: the committed secret is PRESERVED (the P4 offline fallback survives the migration). ──
+if [ "$A_SEC" = "$SECRET_A" ]; then
+  ok "C3 A's committed team_secret is PRESERVED in team.json (offline P4 fallback intact after migration)"
+else
+  bad "C3 A's committed secret was lost (got '$A_SEC', expected the seeded bearer secret)"
 fi
 
 echo

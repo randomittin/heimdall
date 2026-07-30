@@ -333,6 +333,18 @@ if [ -z "$PROJECT" ]; then
   fi
 fi
 
+# DISPLAY LABEL (§3) — a human-readable name for the roster/statusline render. This does NOT change
+# PROJECT (the partition key — stable across clones, must stay the normalized remote). For a github
+# repo the label is the owner/name slug (drop the `github.com/` prefix) — never a bare working-tree
+# dir name like `code`/`Downloads` leaking from the basename fallback; for a non-github remote the
+# normalized PROJECT stands; for a truly-local tree the tree's basename is the best we have.
+if [ -z "${PROJECT_LABEL:-}" ]; then
+  case "$PROJECT" in
+    github.com/*/*) PROJECT_LABEL="${PROJECT#github.com/}" ;;   # -> owner/name
+    *)              PROJECT_LABEL="$PROJECT" ;;
+  esac
+fi
+
 [ -n "$URL" ] || URL="${HEIMDALL_CP_URL:-${BASE_URL:-}}"
 [ -n "$URL" ] || URL="$CFG_URL"
 # Canonical public-surface URL (sourced from lib/cp-consent.sh — the ONE place the literal
@@ -442,6 +454,20 @@ def _read(p):
         return s, (src if isinstance(src, str) else "")
     return "", ""
 
+def _team_id(p):
+    """The stored server team_id (github binding), else "" — absent/unreadable is "" too."""
+    try:
+        t = json.load(open(p)).get("team_id")
+    except Exception:
+        return ""
+    return t if isinstance(t, str) and t else ""
+
+# P1 — a GITHUB BINDING: team.json carries a server team_id (source:auto-github, OR a MIGRATED
+# committed file that ALSO kept its bearer secret for the offline fallback). Membership IS the
+# server repo->team binding, so send NO header even when a committed secret coexists — a secret
+# header would re-bind this HAID to sha256(secret) and re-SPLIT the repo (the team-split bug).
+if _team_id(path):
+    sys.stdout.write(""); sys.exit(0)
 ps, psrc = _read(path)
 ss, _ss = _read(shared)
 # 1) a DELIBERATE team.json (new|join|rotate) wins — incl. the committed private team.
@@ -470,7 +496,7 @@ run_client() {
   LIB="$LIB" PRES_URL="$URL" PRES_HAID="$HAID" PRES_SEED="$SEED" \
   PRES_SEED_FILE="$SEED_FILE" PRES_ENROLL_TOKEN="$ENROLL_TOKEN" \
   PRES_ENROLL_STAMP="$ENROLL_STAMP" PRES_THROTTLE="${HMD_ENROLL_THROTTLE:-180}" \
-  PRES_PROJECT="$PROJECT" PRES_HANDLE="$HANDLE" PRES_VERDICT="$VERDICT" \
+  PRES_PROJECT="$PROJECT" PRES_PROJECT_LABEL="${PROJECT_LABEL:-$PROJECT}" PRES_HANDLE="$HANDLE" PRES_VERDICT="$VERDICT" \
   PRES_FILE="$FILE" PRES_VERB="$1" PRES_JSON="$JSON" PRES_TEAM_SECRET="$TEAM_SECRET" \
   PRES_ACTIVITY_TS="${ACTIVITY_TS:-}" PRES_BRANCH="${BRANCH:-}" \
   PRES_STRICT="$STRICT" PRES_INTERACTIVE="$INTERACTIVE" \
@@ -721,6 +747,12 @@ def render_roster(rows):
     if not rows:
         sys.stdout.write("presence: no teammates online\n")
         return
+    # A one-line context header naming the repo by its human LABEL (owner/name for a github repo),
+    # not the raw partition key or a bare dir name. Only when there ARE teammates, so the ubiquitous
+    # empty-roster line is byte-identical.
+    label = os.environ.get("PRES_PROJECT_LABEL") or os.environ.get("PRES_PROJECT") or ""
+    if label:
+        sys.stdout.write("presence: %s\n" % label)
     for r in rows:
         who = r.get("handle") or r.get("haid") or "?"
         verdict = r.get("verdict") or "-"
@@ -891,6 +923,14 @@ _github_slug() {
 # starts in their OWN solo team (sees only themselves until they invite). python-side IO (no jq);
 # any failure leaves TEAM_SECRET empty (header omitted — graceful).
 _solo_mint() {
+  # §2 — NEVER auto-solo a GITHUB repo unless /team/auto was already ATTEMPTED-and-failed this
+  # session (_AUTO_TEAM_TRIED). Otherwise a github repo would fragment into per-machine solo teams
+  # instead of converging on the server repo->team binding (the public-repo explosion). A truly-
+  # local tree (no github remote) OR auto explicitly disabled still solo-mints (zero-config in your
+  # OWN team). Reached only as the P3-no-secret / P5 fallback from _resolve_team_for_wire.
+  if [ -n "$(_github_slug)" ] && [ -z "${HMD_AUTO_TEAM_DISABLE:-}" ] && [ -z "${_AUTO_TEAM_TRIED:-}" ]; then
+    return 0
+  fi
   TEAM_SECRET="$(HMD_TEAM_DIR_R="$TEAM_DIR" HMD_TEAM_FILE_R="$TEAM_FILE" "$PY" - 2>/dev/null <<'PYEOF' || true
 import json, os, secrets, sys, time
 team_dir = os.environ["HMD_TEAM_DIR_R"]
@@ -953,14 +993,27 @@ p = os.environ["HMD_TEAM_FILE_W"]
 tid = os.environ["HMD_TEAM_ID_W"]
 try:
     os.makedirs(d, mode=0o700, exist_ok=True)
-    fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    # MERGE (not O_EXCL-create): a FRESH repo (no file) -> {team_id, source:auto-github, NO secret};
+    # a repo whose team.json ALREADY carries a committed bearer secret -> that secret is PRESERVED
+    # (the P4 offline fallback) while we stamp the server team_id as the operative online id. This is
+    # the "committed-secret github repo migrates to /team/auto" reconciliation — the split-bug fix.
+    # Idempotent: re-stamping the same id rewrites identical content. Two concurrent writers land the
+    # SAME server-derived id (deterministic per repo_slug), so the TRUNC race is benign.
     try:
-        os.write(fd, (json.dumps({"team_id": tid, "source": "auto-github", "created": int(time.time())}) + "\n").encode("utf-8"))
+        rec = json.load(open(p))
+        if not isinstance(rec, dict):
+            rec = {}
+    except Exception:
+        rec = {}
+    rec["team_id"] = tid
+    rec.setdefault("source", "auto-github")   # only a first-run (secret-less) file gets auto-github
+    rec.setdefault("created", int(time.time()))
+    fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, (json.dumps(rec) + "\n").encode("utf-8"))
     finally:
         os.close(fd)
     os.chmod(p, 0o600)
-except FileExistsError:
-    pass          # a concurrent writer won -> the existing binding stands (idempotent)
 except Exception:
     sys.exit(1)
 PYEOF
@@ -981,14 +1034,42 @@ PYEOF
 # circuits — idempotent, do nothing new. First run: try zero-touch auto-github, else solo-mint.
 # Auto-github is SKIPPED straight to solo when disabled (HMD_AUTO_TEAM_DISABLE), when presence is
 # severed/offline (empty URL -> no /team/auto egress), or with no signer/identity/project.
+# team.json already carries a server team_id (P1)? Mirrors heimdall-team:team_has_auto_id — a
+# github binding short-circuits (idempotent, no /team/auto re-POST, no header).
+_team_file_has_id() {
+  [ -f "$TEAM_FILE" ] || return 1
+  HMD_TEAM_FILE_R="$TEAM_FILE" "$PY" - <<'PYEOF' 2>/dev/null
+import json, os, sys
+try:
+    d = json.load(open(os.environ["HMD_TEAM_FILE_R"]))
+    sys.exit(0 if isinstance(d, dict) and isinstance(d.get("team_id"), str) and d.get("team_id") else 1)
+except Exception:
+    sys.exit(1)
+PYEOF
+}
+
 _resolve_team_for_wire() {
   [ -n "$PY" ] || return 0
-  [ -n "$TEAM_SECRET" ] && return 0        # an explicit/legacy/solo team is already resolved
-  [ -f "$TEAM_FILE" ] && return 0          # an auto-github team.json (no secret) already binds
-  if [ -z "${HMD_AUTO_TEAM_DISABLE:-}" ] && [ -n "$URL" ] && [ -n "$HAID" ] && [ -n "$PROJECT" ]; then
-    if _auto_team_call; then return 0; fi  # bound via GitHub -> TEAM_SECRET stays empty (no header)
+  # P1 — team.json already carries a server team_id (auto-github, OR a MIGRATED committed file):
+  # the server repo->team binding IS membership. Drop any header + short-circuit (idempotent).
+  if _team_file_has_id; then TEAM_SECRET=""; return 0; fi
+  # P2 — a GITHUB repo, online (URL resolves -> not severed), auto not disabled: /team/auto is THE
+  # authority. Prefer it EVEN when a committed/legacy secret is present — THAT is the split-bug fix
+  # (the old code returned on a non-empty secret BEFORE ever calling /team/auto, so the secret
+  # header re-bound the HAID to sha256(secret) and split the repo). On success DROP the header +
+  # persist the server team_id (merged into team.json, secret preserved for offline).
+  local _slug; _slug="$(_github_slug)"
+  if [ -n "$_slug" ] && [ -z "${HMD_AUTO_TEAM_DISABLE:-}" ] && [ -n "$URL" ] && [ -n "$HAID" ] && [ -n "$PROJECT" ]; then
+    _AUTO_TEAM_TRIED=1
+    if _auto_team_call; then TEAM_SECRET=""; return 0; fi
   fi
-  _solo_mint                               # fallback: the original solo-mint (sets TEAM_SECRET)
+  # P3/P4 — /team/auto deferred/denied (no gh auth / non-collaborator / rate-limit) or offline: a
+  # committed/legacy/solo secret rides in the header (online fallback) / is retained locally
+  # (offline, self-heals to P2 on reconnect). Non-empty -> done.
+  [ -n "$TEAM_SECRET" ] && return 0
+  # P5 / P3-no-secret — no github remote (truly local), OR github+auto-tried-and-failed with no
+  # secret: solo-mint so a dev is never teamless (gated: never a fresh solo for an untried github repo).
+  _solo_mint
 }
 
 # Best-effort ONE final signed retire beat (opt-out prompt-disappearance). Only attempts when
