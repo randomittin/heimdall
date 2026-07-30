@@ -541,6 +541,9 @@ def roster_presence(cwd):
             "haid": r.get("haid"),
             "verdict": r.get("verdict") or "working",
             "file": r.get("file") or "",
+            # the teammate's OWN git branch (repo-relative), recorded at beat time. Absent on
+            # older roster records → "" (the render then shows no branch line, back-compat).
+            "branch": r.get("branch") or "",
             "ts": ts,
             "online": True,
         })
@@ -866,7 +869,8 @@ def _team_members(cwd, ledger):
     if not members:
         tp = team_presence(cwd)
         members = [{"user": m.get("name") or "?", "haid": m.get("haid"),
-                    "sigil": "", "state": m.get("verdict") or ""} for m in tp[:3]]
+                    "sigil": "", "branch": m.get("branch") or "",
+                    "state": m.get("verdict") or ""} for m in tp[:3]]
         overflow = max(0, len(tp) - 3)
     return members[:3], overflow
 
@@ -899,12 +903,24 @@ def _team_state_seg(m, now):
     return f"{FAINT}○{X}"
 
 
-def team_columns(members, team_w, overflow, now, states=True):
+def _team_branch_seg(branch):
+    """Row4 CROSS-BRANCH indicator (RJ: same-repo teammates on OTHER branches): `⎇<branch>`
+    in the faint branch hue, shown UNDER the teammate's name when their branch differs from
+    yours — so a teammate off on their own branch of the SAME repo reads at a glance. Terse
+    (no space after the glyph) to keep the most branch chars in the 8-cell strip; the caller
+    pad_or_truncate()s it to the strip width (a long branch clips with `…`)."""
+    b = str(branch or "").strip()
+    return f"{BRANCHC}⎇{b}{X}"
+
+
+def team_columns(members, team_w, overflow, now, states=True, self_branch=""):
     """Render `members` into the four team-zone row strings — each EXACTLY `team_w` visible
     cells. Rows 1–2: the 8-cell eye_strip (natural palette, eyes visible) riding the RIGHT
     of each 15c column. Row 3: the NAME (hero hue, ≤ strip width) under the strip, plus a
-    trailing `+N` overflow tag. Row 4: the state segment (blank when `states` is False — the
-    mid tier). Members are joined by a 2-cell gap. Returns (r1, r2, r3, r4)."""
+    trailing `+N` overflow tag. Row 4: the teammate's BRANCH (`⎇<branch>`) when it differs
+    from `self_branch` — a same-repo teammate on another branch surfaces their branch on the
+    line UNDER their name; else the state segment (blank when `states` is False — the mid
+    tier). Members are joined by a 2-cell gap. Returns (r1, r2, r3, r4)."""
     lp = " " * (LAYOUT.TEAM_MEMBER_W - LAYOUT.TEAM_STRIP_W)   # 7c left pad → strip on the right 8c
     gap = " " * LAYOUT.TEAM_MEMBER_GAP
     tops = []; bots = []; names = []; sts = []
@@ -924,9 +940,18 @@ def team_columns(members, team_w, overflow, now, states=True):
         ncol = sgr(SIG._hex_rgb(hue)) if hue else DIM
         nm = LAYOUT.pad_or_truncate(str(m.get("user") or ""), LAYOUT.TEAM_STRIP_W)
         names.append(g + lp + f"{ncol}{nm}{X}")
-        if states:
-            seg = LAYOUT.pad_or_truncate(_team_state_seg(m, now), LAYOUT.TEAM_STRIP_W)
-            sts.append(g + lp + seg)
+        # Row4: a teammate on a DIFFERENT branch of the SAME repo shows their branch UNDER
+        # their name (the cross-branch line); else the state segment. The branch line rides
+        # even in the mid tier (states=False) since it is NEW data absent from prior renders.
+        mb = str(m.get("branch") or "")
+        if self_branch and mb and mb != self_branch:
+            r4seg = _team_branch_seg(mb)
+        elif states:
+            r4seg = _team_state_seg(m, now)
+        else:
+            r4seg = None
+        if r4seg is not None:
+            sts.append(g + lp + LAYOUT.pad_or_truncate(r4seg, LAYOUT.TEAM_STRIP_W))
         else:
             sts.append(g + " " * (len(lp) + LAYOUT.TEAM_STRIP_W))
     tag_seg = f"{DIM} +%d{X}" % overflow if overflow > 0 else ""
@@ -1317,7 +1342,8 @@ def main():
     gauge_w = max(0, min(gauge_max, content_budget))
 
     if team_w > 0:
-        t1, t2, t3, t4 = team_columns(members, team_w, of, t, states=team_states)
+        t1, t2, t3, t4 = team_columns(members, team_w, of, t, states=team_states,
+                                      self_branch=branch or "")
     else:
         t1 = t2 = t3 = t4 = ""
 

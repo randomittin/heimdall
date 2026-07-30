@@ -277,6 +277,18 @@ _resolve_activity_ts() {
   [ -n "$mt" ] && printf '%s' "$mt"
 }
 
+# The repo-relative git BRANCH this beat rides (so teammates' statuslines can show a same-repo
+# dev who is off on ANOTHER branch, with their branch under their name). HMD_BRANCH overrides
+# (tests); else `git rev-parse --abbrev-ref HEAD`. A detached HEAD (bare "HEAD") degrades to the
+# short sha so the render still marks "off on a commit", never the literal word HEAD. Empty
+# outside any git repo (the render then shows no branch line). Pure git read, no network.
+_resolve_branch() {
+  if [ -n "${HMD_BRANCH:-}" ]; then printf '%s' "$HMD_BRANCH"; return; fi
+  local b; b="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+  if [ "$b" = "HEAD" ]; then b="$(git rev-parse --short HEAD 2>/dev/null || true)"; fi
+  [ -n "$b" ] && printf '%s' "$b"
+}
+
 # OFF = ZERO beats. A `beat` (from the statusline fork, a cron, or a hook) is a stat-only
 # no-op when effectively off — no python, no network, no seed bootstrap. This is defense in
 # depth: the statusline also skips the beat when off, but the toggle is enforced HERE too so
@@ -460,7 +472,7 @@ run_client() {
   PRES_ENROLL_STAMP="$ENROLL_STAMP" PRES_THROTTLE="${HMD_ENROLL_THROTTLE:-180}" \
   PRES_PROJECT="$PROJECT" PRES_HANDLE="$HANDLE" PRES_VERDICT="$VERDICT" \
   PRES_FILE="$FILE" PRES_VERB="$1" PRES_JSON="$JSON" PRES_TEAM_SECRET="$TEAM_SECRET" \
-  PRES_ACTIVITY_TS="${ACTIVITY_TS:-}" \
+  PRES_ACTIVITY_TS="${ACTIVITY_TS:-}" PRES_BRANCH="${BRANCH:-}" \
   PRES_STRICT="$STRICT" PRES_INTERACTIVE="$INTERACTIVE" \
   PRES_CRYPTO_WARN_STAMP="$CRYPTO_WARN_STAMP" \
   PRES_GH_USER="${PRES_GH_USER:-}" PRES_GH_PROOF="${PRES_GH_PROOF:-}" PRES_REPO="${PRES_REPO:-}" \
@@ -794,6 +806,10 @@ def main():
             "handle": os.environ.get("PRES_HANDLE") or None,
             "verdict": os.environ.get("PRES_VERDICT") or None,
             "file": os.environ.get("PRES_FILE") or None,
+            # the beating dev's repo-relative git branch (DATA — a teammate's statusline shows a
+            # same-repo dev on ANOTHER branch under their name). None outside a git repo / on an
+            # old client → the server stores None and the render shows no branch line (back-compat).
+            "branch": os.environ.get("PRES_BRANCH") or None,
             "activity_ts": activity_ts,
             "nonce": secrets.token_hex(16),
             "ts": int(time.time()),
@@ -1167,6 +1183,8 @@ case "$SUB" in
     # Resolve the wall-state activity signal: an ACTIVE-verdict beat bumps the stamp to now, a
     # bare keeper/daemon beat carries the stamp mtime forward, absent -> null (server -> IDLE).
     ACTIVITY_TS="$(_resolve_activity_ts)"
+    # the repo-relative branch this beat rides → teammates see a same-repo dev on another branch.
+    BRANCH="$(_resolve_branch)"
     run_client beat ;;
   activity)
     # BUMP the activity stamp to now — the edit hook's entry point ("real work happened").

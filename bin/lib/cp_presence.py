@@ -247,13 +247,16 @@ def _coerce_ts(value):
 
 
 def build_record(haid, *, project, handle=None, verdict=None, file=None, ts=None,
-                 activity_ts=None):
+                 activity_ts=None, branch=None):
     """Assemble ONE DATA-ONLY, secret-scrubbed presence record. Pure — no IO. `haid` is
-    the VERIFIED identity (the partition key); project/handle/verdict/file are scrubbed
+    the VERIFIED identity (the partition key); project/handle/verdict/file/branch are scrubbed
     DATA. `ts` is epoch seconds (defaults to now) — the freshness used by the TTL.
 
     The schema is CLOSED — only these keys exist:
-      {haid, handle, project, verdict, file, ts, activity_ts}
+      {haid, handle, project, verdict, file, branch, ts, activity_ts}
+    `branch` is the ADDITIVE, OPTIONAL repo-relative git branch the dev is on (scrubbed DATA —
+    a teammate's statusline shows a same-repo dev on ANOTHER branch under their name). Absent /
+    None on an old client → the field stores None and the render shows no branch line.
     `activity_ts` is the ADDITIVE, OPTIONAL wall-state field (epoch seconds — the last time
     the client did real work, bumped by the edit hook + an active verdict). It is DATA, not a
     capability: a client can only ever set its OWN record's activity_ts (the record is keyed
@@ -267,6 +270,9 @@ def build_record(haid, *, project, handle=None, verdict=None, file=None, ts=None
         "project": _clean(project),
         "verdict": _clean(verdict),
         "file": _clean(file),
+        # repo-relative git branch (OPTIONAL). None on an old client / outside a git repo => the
+        # teammate's render shows no branch line. Scrubbed like every other free-ish string field.
+        "branch": _clean(branch),
         # epoch seconds — the freshness the TTL filters on. A bad ts coerces to now.
         "ts": float(ts) if isinstance(ts, (int, float)) and not isinstance(ts, bool)
         else time.time(),
@@ -276,7 +282,7 @@ def build_record(haid, *, project, handle=None, verdict=None, file=None, ts=None
 
 
 def record_presence(haid, *, project, team_id, handle=None, verdict=None, file=None,
-                    home=None, ts=None, activity_ts=None):
+                    home=None, ts=None, activity_ts=None, branch=None):
     """STORE one dev's heartbeat: build the scrubbed record and atomically upsert it under
     (project, team_id, haid) via put_record (last-write-wins — a fresher beat overwrites the
     dev's prior record). The partition KEY is (project, team_id) and the record KEY is `haid`
@@ -295,7 +301,7 @@ def record_presence(haid, *, project, team_id, handle=None, verdict=None, file=N
     if not haid:
         return {"ok": False, "reason": "no_haid"}
     record = build_record(haid, project=project, handle=handle, verdict=verdict,
-                          file=file, ts=ts, activity_ts=activity_ts)
+                          file=file, ts=ts, activity_ts=activity_ts, branch=branch)
     if not _backend(home).put_record(_record_rel(project, team_id, haid), record):
         return {"ok": False, "reason": "io_error"}
     return {"ok": True, "haid": haid, "project": record.get("project"),
@@ -534,7 +540,7 @@ def beat_route(identity, request, *, home=None):
     result = record_presence(
         haid, project=project, team_id=team_id, handle=payload.get("handle"),
         verdict=payload.get("verdict"), file=payload.get("file"),
-        activity_ts=payload.get("activity_ts"), home=home)
+        activity_ts=payload.get("activity_ts"), branch=payload.get("branch"), home=home)
     if not result.get("ok"):
         # LOUD on a DROPPED write (the firestore-only silent-drop class). A backend write that
         # fails must NEVER look like a silent 200: it surfaces as a 500 to the client AND is
