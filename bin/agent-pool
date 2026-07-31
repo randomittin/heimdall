@@ -8,12 +8,18 @@ Usage:
   agent-pool init [--max <n>] [--min <n>]    Initialize pool (default max=10, min=1)
   agent-pool acquire <agent-id> <type>        Register an agent, exit 2 if at capacity
   agent-pool release <agent-id>               Mark agent as done
+  agent-pool beat <agent-id>                   Refresh agent heartbeat (last_active)
   agent-pool status                           Show pool state as JSON
   agent-pool should-scale                     Exit 0 if should scale up, 1 if not
   agent-pool active                           List active agents
   agent-pool wait                             Block until a slot is available
   agent-pool resize <max>                     Change max pool size
-  agent-pool health-check                     Remove dead agents (by PID check)
+  agent-pool health-check                     Reap dead (PID-gone) + stale-idle (hung) agents
+
+Environment:
+  HMD_AGENT_STALE_SECS   Stale-idle threshold in seconds (default 900). An active
+                         agent whose last_active is older than this is reaped by
+                         health-check EVEN IF its pid is still alive (hung fork).
 """
 import sys, os, json, time, fcntl, argparse
 from pathlib import Path
@@ -38,6 +44,16 @@ DEFAULTS = {
 
 def now_iso():
     return datetime.now(timezone.utc).isoformat()
+
+def stale_threshold_secs():
+    """Stale-idle reap threshold (seconds). Env-overridable; default 900."""
+    raw = os.environ.get("HMD_AGENT_STALE_SECS")
+    if raw is None or raw == "":
+        return 900
+    try:
+        return max(0, int(float(raw)))
+    except (ValueError, TypeError):
+        return 900
 
 def load_pool():
     if not POOL_FILE.exists():
@@ -93,9 +109,10 @@ def cmd_acquire(args):
     if len(act) >= pool["max_agents"]:
         print(f"At capacity ({pool['max_agents']}). Cannot acquire.", file=sys.stderr)
         sys.exit(2)
+    ts = now_iso()
     entry = {
         "type": args.type, "status": "active",
-        "started_at": now_iso(), "pid": args.pid,
+        "started_at": ts, "last_active": ts, "pid": args.pid,
     }
     pool["agents"][args.agent_id] = entry
     save_pool(pool)
@@ -117,6 +134,19 @@ def cmd_release(args):
         agent["duration_s"] = round((end - start).total_seconds(), 1)
     save_pool(pool)
     print(f"Released: {args.agent_id} (duration: {agent.get('duration_s', '?')}s)")
+
+@locked
+def cmd_beat(args):
+    pool = load_pool()
+    if not pool:
+        print("Pool not initialized.", file=sys.stderr); sys.exit(1)
+    agent = pool["agents"].get(args.agent_id)
+    if not agent:
+        print(f"Agent {args.agent_id} not found.", file=sys.stderr); sys.exit(1)
+    ts = now_iso()
+    agent["last_active"] = ts
+    save_pool(pool)
+    print(f"Beat: {args.agent_id} @ {ts}")
 
 @locked
 def cmd_status(_args):
@@ -191,24 +221,57 @@ def cmd_resize(args):
     save_pool(pool)
     print(f"Resized: {old} -> {args.max}")
 
+def _idle_secs(info, now):
+    """Seconds since the agent last proved liveness. Falls back to started_at
+    for back-compat entries that predate the last_active heartbeat field.
+    Returns None if no timestamp is available."""
+    stamp = info.get("last_active") or info.get("started_at")
+    if not stamp:
+        return None
+    try:
+        return (now - datetime.fromisoformat(stamp)).total_seconds()
+    except (ValueError, TypeError):
+        return None
+
 @locked
 def cmd_health_check(_args):
     pool = load_pool()
     if not pool:
         print("Pool not initialized.", file=sys.stderr); sys.exit(1)
-    reaped = []
+    threshold = stale_threshold_secs()
+    now = datetime.now(timezone.utc)
+    dead, stale = [], []
     for aid, info in list(pool["agents"].items()):
-        if info["status"] != "active" or not info.get("pid"):
+        if info["status"] != "active":
             continue
-        try:
-            os.kill(info["pid"], 0)
-        except (ProcessLookupError, PermissionError):
+        # 1) PID-dead: process gone → reap.
+        pid = info.get("pid")
+        if pid:
+            try:
+                os.kill(pid, 0)
+            except (ProcessLookupError, PermissionError):
+                info["status"] = "failed"
+                info["finished_at"] = now_iso()
+                dead.append(aid)
+                continue
+        # 2) Stale-idle: alive-but-hung. Reap when last heartbeat is older than
+        #    the threshold, EVEN IF the pid is still alive. A fresh beat (within
+        #    threshold) keeps the agent active regardless of pid.
+        idle = _idle_secs(info, now)
+        if idle is not None and idle > threshold:
             info["status"] = "failed"
             info["finished_at"] = now_iso()
-            reaped.append(aid)
+            info["reap_reason"] = f"stale-idle >{threshold}s (idle {round(idle)}s)"
+            stale.append(aid)
     save_pool(pool)
+    reaped = dead + stale
     if reaped:
-        print(f"Reaped {len(reaped)} dead agent(s): {', '.join(reaped)}")
+        parts = []
+        if dead:
+            parts.append(f"{len(dead)} dead pid: {', '.join(dead)}")
+        if stale:
+            parts.append(f"{len(stale)} stale-idle >{threshold}s: {', '.join(stale)}")
+        print(f"Reaped {len(reaped)} agent(s) [{'; '.join(parts)}]")
     else:
         print("All agents healthy.")
 
@@ -230,6 +293,10 @@ def main():
     sp = sub.add_parser("release")
     sp.add_argument("agent_id")
     sp.set_defaults(func=cmd_release)
+
+    sp = sub.add_parser("beat")
+    sp.add_argument("agent_id")
+    sp.set_defaults(func=cmd_beat)
 
     sp = sub.add_parser("status")
     sp.set_defaults(func=cmd_status)
