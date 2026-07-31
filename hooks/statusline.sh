@@ -37,6 +37,29 @@ fi
 BLOB=""
 [ -t 0 ] || BLOB="$(cat 2>/dev/null)"
 
+# ── LIVE harness-subagent count (reconciled: stale/failed/reaped EXCLUDED) ──────
+# Claude Code Agent-tool subagents (hmd:coder &c.) are owned by the harness and
+# never enter agent-pool, so a dead/hung one would keep inflating any raw count.
+# bin/heimdall-agents enumerates them from the harness task dir and returns ONLY
+# the live ones; we publish that as HMD_LIVE_SUBAGENTS so the HUD's agent segment
+# reflects the honest live count. This is heimdall's OWN view — it does NOT (cannot)
+# touch Claude Code's FleetView. Kept cheap + fail-safe: a fast stat-only read,
+# hard 1s ceiling, any error → 0. The bar must never block or error on this signal.
+HMD_LIVE_SUBAGENTS=0
+AGENTS_BIN=""
+if command -v heimdall-agents >/dev/null 2>&1; then AGENTS_BIN="heimdall-agents"
+elif [ -x "$HERE/../bin/heimdall-agents" ]; then AGENTS_BIN="$HERE/../bin/heimdall-agents"; fi
+if [ -n "$AGENTS_BIN" ]; then
+  # A hard time ceiling when a `timeout` (or macOS `gtimeout`) is available; else run
+  # bare — the count is already a stat-only read, so it stays sub-second regardless.
+  TO=""
+  command -v timeout  >/dev/null 2>&1 && TO="timeout 1"
+  [ -z "$TO" ] && command -v gtimeout >/dev/null 2>&1 && TO="gtimeout 1"
+  HMD_LIVE_SUBAGENTS="$(HMD_AGENT_CWD="$PWD" $TO "$AGENTS_BIN" count 2>/dev/null || true)"
+fi
+case "$HMD_LIVE_SUBAGENTS" in ''|*[!0-9]*) HMD_LIVE_SUBAGENTS=0 ;; esac
+export HMD_LIVE_SUBAGENTS
+
 # ── PRIMARY: the full-width watchman ──
 # Capture first; emit only on success (nonempty). Any failure falls through.
 if command -v python3 >/dev/null 2>&1 && [ -f "$WATCHMAN" ]; then

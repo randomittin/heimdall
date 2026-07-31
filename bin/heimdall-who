@@ -52,10 +52,38 @@ REGISTRY_FILE="$PLANNING_DIR/ledger/agents.json"
 ACTIVITY_BIN="$BIN_DIR/heimdall-activity"
 GATE_SURFACE_BIN="$BIN_DIR/heimdall-gate-surface"
 HAID_BIN="$BIN_DIR/heimdall-haid"
+AGENTS_BIN="$BIN_DIR/heimdall-agents"
 
 command -v jq >/dev/null 2>&1 || { echo "error: jq is required" >&2; exit 2; }
 
 usage() { sed -n '2,39p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+# ── HARNESS SUBAGENTS section (human view only) ───────────────────────────────
+# The HAID table above is heimdall's OWN agents (agent-pool / ledger). Claude Code
+# Agent-tool subagents (hmd:coder &c.) live in the HARNESS and never register here,
+# so a hung/failed one would otherwise be invisible. bin/heimdall-agents enumerates
+# them from the harness task dir + classifies by staleness/terminal marker; we fold
+# its REAL per-subagent state (live/stale/failed/done/reaped) into the roster so the
+# operator sees their true state, not "idle forever". Best-effort: absent tool or no
+# task dir → the section is silently omitted (never an error, never a fabricated row).
+subagents_section() {
+  [ -x "$AGENTS_BIN" ] || return 0
+  local rows
+  rows="$("$AGENTS_BIN" list --json 2>/dev/null || echo '[]')"
+  [ -n "$rows" ] || return 0
+  local n
+  n="$(printf '%s' "$rows" | jq 'length' 2>/dev/null || echo 0)"
+  [ "${n:-0}" -gt 0 ] 2>/dev/null || return 0
+  local live
+  live="$(printf '%s' "$rows" | jq '[.[]|select(.state=="live")]|length' 2>/dev/null || echo 0)"
+  echo
+  echo "HARNESS SUBAGENTS ($n tracked, $live live) — Agent-tool, not in the HAID registry"
+  printf '%s' "$rows" | jq -r '
+    sort_by(.id)[] |
+    "  " + .id + "\t" + .state + "\t" + "age:" + (.age_secs|tostring) + "s"
+  ' | column -t -s "$(printf '\t')" 2>/dev/null || printf '%s' "$rows" | jq -r '
+    sort_by(.id)[] | "  " + .id + "  " + .state + "  age:" + (.age_secs|tostring) + "s"'
+}
 
 # ── TEAM VIEW (P1 + P2) — JOIN agents × claims × activity × VERDICTS ──────────
 # Read-only. Delegates the activity read + overlap to bin/heimdall-activity and
@@ -171,6 +199,7 @@ if [ ! -f "$REGISTRY_FILE" ]; then
     printf '[]\n'
   else
     echo "(no registry at $REGISTRY_FILE — no agents have registered yet)"
+    subagents_section
   fi
   exit 0
 fi
@@ -218,6 +247,7 @@ fi
 COUNT="$(printf '%s' "$VIEW" | jq 'length')"
 if [ "$COUNT" -eq 0 ]; then
   echo "(no agents registered yet)"
+  subagents_section
   exit 0
 fi
 
@@ -247,3 +277,6 @@ if [ -n "$CURRENT_HAID" ]; then
     echo "note: this instance ($CURRENT_HAID) is not yet registered — run 'heimdall-haid register'"
   fi
 fi
+
+# Harness Agent-tool subagents (not in the HAID registry) — their REAL live state.
+subagents_section

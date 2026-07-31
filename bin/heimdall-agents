@@ -1,0 +1,250 @@
+#!/usr/bin/env bash
+# heimdall-agents — tracker + reaper for Claude Code Agent-tool SUBAGENTS.
+#
+# WHY THIS EXISTS ─────────────────────────────────────────────────────────────
+# Subagents spawned via Claude Code's Agent tool (e.g. hmd:coder, hmd:reviewer)
+# are owned by the Claude Code HARNESS. They NEVER enter heimdall's agent-pool or
+# HAID ledger, so when one dies, hangs, or fails, heimdall has ZERO visibility —
+# the harness still shows it in its FleetView and the swarm count keeps counting a
+# corpse. This tool gives heimdall its OWN honest view: it enumerates the harness's
+# per-subagent task-output files, classifies each by staleness + terminal marker,
+# serves a correct LIVE count for the statusline, and records a reaper decision in
+# heimdall's own registry so a dead/stale subagent stops inflating the count.
+#
+# HONEST BOUNDARY (do not overclaim) ──────────────────────────────────────────
+# The harness's task-output files are NOT ours — we NEVER delete them. `reap` only
+# writes to heimdall's own reaped-registry so heimdall's list/count exclude the
+# corpse thereafter. This tool CANNOT and DOES NOT remove an entry from Claude
+# Code's FleetView; that surface is owned by the harness. What we give heimdall is
+# real visibility + a stale/failed reaper + a correct live-agent count — nothing
+# more, nothing faked.
+#
+# THE DATA SOURCE ─────────────────────────────────────────────────────────────
+# The harness writes one file per spawned subagent under the session's task dir:
+#   <tmp>/claude-<uid>/<slugified-cwd>/<session-id>/tasks/<task-id>.output
+# Each `.output` is either a symlink to the subagent's live transcript jsonl or a
+# plain file; either way its (symlink-followed) mtime = the subagent's LAST
+# ACTIVITY. Presence = spawned. now-mtime = staleness. We fail CLOSED to "no
+# agents" if the dir can't be resolved — never crash, never fabricate.
+#
+# SUBCOMMANDS ─────────────────────────────────────────────────────────────────
+#   list [--json]   enumerate spawned subagents: id, age(s), state
+#                   states: live | stale | failed | done | reaped
+#   count           print the number of LIVE subagents (statusline consumes this)
+#   reap [--json]   record stale/terminal subagents in heimdall's reaped-registry
+#                   (idempotent); print what was reaped. Never touches harness files.
+#   -h | --help
+#
+# STATE MODEL ─────────────────────────────────────────────────────────────────
+#   reaped  — already recorded in the reaped-registry (excluded from live + count)
+#   failed  — a sibling <id>.status marks failure/error (terminal)
+#   done    — a sibling <id>.status marks completion (terminal)
+#   stale   — age >= HMD_AGENT_STALE_SECS (default 900) and not terminal
+#   live    — age < threshold, not terminal, not reaped   ← the ONLY counted state
+#
+# ENV ─────────────────────────────────────────────────────────────────────────
+#   HMD_AGENT_STALE_SECS   live/stale threshold in seconds (default 900) — the
+#                          SAME convention agent-pool health-check uses.
+#   HMD_AGENT_TASKDIR      override the task dir (skips discovery). Used by tests.
+#   HMD_AGENT_REAPED_FILE  override the reaped-registry path (default
+#                          ${HEIMDALL_HOME:-$HOME/.heimdall}/agents-reaped.json).
+#   HMD_AGENT_CWD          cwd whose slug is used for task-dir discovery (default PWD).
+#   HMD_NOW                override "now" epoch seconds (deterministic tests).
+#
+# Exit: 0 always for list/count/reap (fail-closed, degraded, never crashes);
+#       2 only on usage error.
+set -uo pipefail
+
+command -v jq >/dev/null 2>&1 || { echo "error: jq is required" >&2; exit 2; }
+
+# ── config ───────────────────────────────────────────────────────────────────
+STALE_SECS="${HMD_AGENT_STALE_SECS:-}"
+case "$STALE_SECS" in ''|*[!0-9]*) STALE_SECS=900 ;; esac
+NOW="${HMD_NOW:-}"
+case "$NOW" in ''|*[!0-9]*) NOW="$(date +%s)" ;; esac
+HMD_HOME="${HEIMDALL_HOME:-${HOME:-}/.heimdall}"
+REAPED_FILE="${HMD_AGENT_REAPED_FILE:-$HMD_HOME/agents-reaped.json}"
+
+# ── portable mtime (follow symlink → the transcript's real last-activity time) ─
+_mtime() { stat -L -f%m "$1" 2>/dev/null || stat -L -c%Y "$1" 2>/dev/null || echo 0; }
+
+now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+# ── task-dir discovery ────────────────────────────────────────────────────────
+# HMD_AGENT_TASKDIR wins outright (tests + explicit callers). Otherwise derive the
+# harness's task dir from the cwd slug: glob every plausible tmp root for
+# claude-*/<slug>/*/tasks and pick the NEWEST (the live session's dir is the one
+# still being written). Fail CLOSED to "" if nothing matches — callers treat "" as
+# zero agents. Never crashes on a missing root.
+_slug_for_cwd() {
+  # Claude projects slug: every non-alphanumeric char -> '-'. Mirrors
+  # heimdall-tokens _slug_for_cwd so we resolve the SAME dir the harness names.
+  local s="$1"
+  printf '%s' "${s//[^A-Za-z0-9]/-}"
+}
+
+resolve_taskdir() {
+  if [ -n "${HMD_AGENT_TASKDIR:-}" ]; then
+    printf '%s' "$HMD_AGENT_TASKDIR"
+    return 0
+  fi
+  local cwd slug root newest newest_mt mt d
+  cwd="${HMD_AGENT_CWD:-$PWD}"
+  slug="$(_slug_for_cwd "$cwd")"
+  newest=""; newest_mt=-1
+  # Candidate roots: $TMPDIR, and the canonical /private/tmp + /tmp claude roots.
+  for root in "${TMPDIR:-}" /private/tmp /tmp; do
+    [ -n "$root" ] || continue
+    for d in "${root%/}"/claude-*/"$slug"/*/tasks; do
+      [ -d "$d" ] || continue
+      mt="$(_mtime "$d")"
+      if [ "$mt" -gt "$newest_mt" ] 2>/dev/null; then
+        newest_mt="$mt"; newest="$d"
+      fi
+    done
+  done
+  printf '%s' "$newest"
+}
+
+# ── reaped-registry membership (loaded ONCE; no subprocess per file) ──────────
+# A space-padded id list so `case` can test membership without spawning grep.
+load_reaped() {
+  local ids=""
+  if [ -f "$REAPED_FILE" ]; then
+    ids="$(jq -r 'keys[]?' "$REAPED_FILE" 2>/dev/null | tr '\n' ' ')"
+  fi
+  printf ' %s ' "$ids"
+}
+
+# ── terminal marker: a sibling <id>.status whose content names the outcome ────
+# Cheap: only touched when the status file exists (rare). Absent → not terminal.
+_terminal_state() {
+  local sfile="$1" s=""
+  [ -f "$sfile" ] || return 0
+  s="$(tr '[:upper:]' '[:lower:]' < "$sfile" 2>/dev/null)"
+  case "$s" in
+    *fail*|*error*)        printf 'failed' ;;
+    *done*|*complete*)     printf 'done'   ;;
+  esac
+}
+
+# ── core enumeration: emits `id<TAB>age<TAB>state` per subagent, sorted by id ──
+# Shared by list/count/reap so classification lives in exactly one place.
+enumerate() {
+  local taskdir reaped f id mt age term state
+  taskdir="$(resolve_taskdir)"
+  [ -n "$taskdir" ] && [ -d "$taskdir" ] || return 0   # fail-closed: no agents
+  reaped="$(load_reaped)"
+  for f in "$taskdir"/*.output; do
+    [ -e "$f" ] || continue
+    id="${f##*/}"; id="${id%.output}"
+    mt="$(_mtime "$f")"
+    age=$(( NOW - mt ))
+    [ "$age" -lt 0 ] && age=0
+    state=""
+    case "$reaped" in *" $id "*) state="reaped" ;; esac
+    if [ -z "$state" ]; then
+      term="$(_terminal_state "$taskdir/$id.status")"
+      if [ -n "$term" ]; then
+        state="$term"
+      elif [ "$age" -ge "$STALE_SECS" ]; then
+        state="stale"
+      else
+        state="live"
+      fi
+    fi
+    printf '%s\t%s\t%s\n' "$id" "$age" "$state"
+  done | sort
+}
+
+# ── subcommands ───────────────────────────────────────────────────────────────
+cmd_list() {
+  local as_json="" rows
+  [ "${1:-}" = "--json" ] && as_json=1
+  rows="$(enumerate)"
+  if [ -n "$as_json" ]; then
+    if [ -z "$rows" ]; then echo '[]'; return 0; fi
+    printf '%s\n' "$rows" | jq -R -s '
+      split("\n") | map(select(length>0) | split("\t"))
+      | map({id: .[0], age_secs: (.[1]|tonumber), state: .[2]})'
+    return 0
+  fi
+  if [ -z "$rows" ]; then
+    echo "no tracked subagents"
+    return 0
+  fi
+  printf '%-20s %8s  %s\n' "SUBAGENT" "AGE(s)" "STATE"
+  printf '%s\n' "$rows" | while IFS=$'\t' read -r id age state; do
+    printf '%-20s %8s  %s\n' "$id" "$age" "$state"
+  done
+}
+
+cmd_count() {
+  # LIVE only — the statusline's authoritative live-subagent count. Stale, terminal
+  # (failed/done), and reaped subagents are all excluded, so a corpse never inflates.
+  local n
+  n="$(enumerate | awk -F'\t' '$3=="live"' | wc -l | tr -d ' ')"
+  printf '%s\n' "${n:-0}"
+}
+
+cmd_reap() {
+  local as_json="" rows reap_ids reason id age state now added
+  [ "${1:-}" = "--json" ] && as_json=1
+  rows="$(enumerate)"
+  # Ensure the registry exists as a JSON object so jq can merge into it.
+  mkdir -p "$(dirname "$REAPED_FILE")" 2>/dev/null || true
+  [ -f "$REAPED_FILE" ] || printf '{}\n' > "$REAPED_FILE" 2>/dev/null || true
+  now="$(now_iso)"
+  added=""   # newline list of "id reason" recorded THIS run (idempotency proof)
+  if [ -n "$rows" ]; then
+    while IFS=$'\t' read -r id age state; do
+      case "$state" in
+        stale)         reason="stale" ;;
+        failed)        reason="failed" ;;
+        done)          reason="done" ;;
+        *)             continue ;;   # live + already-reaped are never (re)recorded
+      esac
+      # Merge one record into the registry; jq is the single writer (atomic replace).
+      if tmp="$(mktemp "${REAPED_FILE}.XXXXXX" 2>/dev/null)"; then
+        if jq --arg id "$id" --arg at "$now" --arg r "$reason" \
+              '. + {($id): {reaped_at:$at, reason:$r}}' \
+              "$REAPED_FILE" > "$tmp" 2>/dev/null; then
+          mv "$tmp" "$REAPED_FILE" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+          added="$added$id $reason"$'\n'
+        else
+          rm -f "$tmp" 2>/dev/null
+        fi
+      fi
+    done <<< "$rows"
+  fi
+  if [ -n "$as_json" ]; then
+    if [ -z "$added" ]; then echo '[]'; return 0; fi
+    printf '%s' "$added" | jq -R -s '
+      split("\n") | map(select(length>0) | split(" "))
+      | map({task_id: .[0], reason: .[1]})'
+    return 0
+  fi
+  if [ -z "$added" ]; then
+    echo "reap: nothing to reap (idempotent no-op)"
+    return 0
+  fi
+  printf '%s' "$added" | while IFS=' ' read -r id reason; do
+    [ -n "$id" ] || continue
+    printf 'reaped %s (%s)\n' "$id" "$reason"
+  done
+}
+
+usage() { sed -n '2,55p' "$0" | sed 's/^# \{0,1\}//'; }
+
+main() {
+  local sub="${1:-}"
+  case "$sub" in
+    list)   shift; cmd_list "$@" ;;
+    count)  shift; cmd_count "$@" ;;
+    reap)   shift; cmd_reap "$@" ;;
+    -h|--help|help|'') usage ;;
+    *) echo "error: unknown subcommand: $sub" >&2; usage >&2; exit 2 ;;
+  esac
+}
+
+main "$@"
