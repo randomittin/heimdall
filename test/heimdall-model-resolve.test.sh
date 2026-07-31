@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+#
+# heimdall-model-resolve.test.sh — acceptance for tier-based model resolution.
+#
+# WHY: Opus 5 shipped but Heimdall kept spawning the pinned claude-opus-4-8 —
+# operational work ran on last-gen. The fix resolves models by TIER alias
+# (opus|sonnet|haiku), which Claude Code maps to the LATEST of that tier, with a
+# HEIMDALL_MODEL_<TIER> env override to PIN a full id for bench/eval repro.
+#
+# Guarantees proved:
+#   1. Default float — each tier prints its bare alias (latest-resolving form).
+#   2. Pin-override wins — HEIMDALL_MODEL_<TIER> prints that exact id instead.
+#   3. Unknown tier — nonzero exit + stderr message.
+#   4. Operational scripts float — NO hardcoded claude-(opus|sonnet|haiku)-N in
+#      session-fork, decompose, or the bin/heimdall lead-launch + routing sites.
+#
+# Usage:  test/heimdall-model-resolve.test.sh   (exit 0 = all guarantees hold)
+set -uo pipefail
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(cd "$SELF_DIR/.." && pwd)"
+RESOLVE="$REPO/bin/heimdall-model-resolve"
+
+PASS=0; FAIL=0
+ok()  { printf '  \033[32mPASS\033[0m %s\n' "$1"; PASS=$((PASS+1)); }
+bad() { printf '  \033[31mFAIL\033[0m %s\n' "$1"; FAIL=$((FAIL+1)); }
+
+echo "heimdall-model-resolve harness  repo=$REPO"
+echo "--------------------------------------------------------------------"
+
+[ -x "$RESOLVE" ] && ok "bin/heimdall-model-resolve is executable" \
+  || bad "bin/heimdall-model-resolve missing or not executable"
+
+# ── 1. DEFAULT FLOAT — bare alias per tier ──
+for tier in opus sonnet haiku; do
+  got="$(env -u HEIMDALL_MODEL_OPUS -u HEIMDALL_MODEL_SONNET -u HEIMDALL_MODEL_HAIKU \
+         "$RESOLVE" "$tier" 2>/dev/null)"
+  [ "$got" = "$tier" ] \
+    && ok "resolve $tier (no override) -> '$got' (bare alias = latest)" \
+    || bad "resolve $tier -> '$got', expected bare alias '$tier'"
+done
+
+# ── 2. PIN-OVERRIDE WINS ──
+got="$(HEIMDALL_MODEL_OPUS=claude-opus-9-9 "$RESOLVE" opus 2>/dev/null)"
+[ "$got" = "claude-opus-9-9" ] \
+  && ok "HEIMDALL_MODEL_OPUS pins opus -> '$got'" \
+  || bad "opus override -> '$got', expected claude-opus-9-9"
+got="$(HEIMDALL_MODEL_SONNET=claude-sonnet-9-9 "$RESOLVE" sonnet 2>/dev/null)"
+[ "$got" = "claude-sonnet-9-9" ] \
+  && ok "HEIMDALL_MODEL_SONNET pins sonnet -> '$got'" \
+  || bad "sonnet override -> '$got', expected claude-sonnet-9-9"
+got="$(HEIMDALL_MODEL_HAIKU=claude-haiku-9-9 "$RESOLVE" haiku 2>/dev/null)"
+[ "$got" = "claude-haiku-9-9" ] \
+  && ok "HEIMDALL_MODEL_HAIKU pins haiku -> '$got'" \
+  || bad "haiku override -> '$got', expected claude-haiku-9-9"
+
+# Override for one tier must NOT leak into another.
+got="$(HEIMDALL_MODEL_OPUS=claude-opus-9-9 "$RESOLVE" sonnet 2>/dev/null)"
+[ "$got" = "sonnet" ] \
+  && ok "opus override does not leak into sonnet -> '$got'" \
+  || bad "sonnet contaminated by opus override -> '$got', expected sonnet"
+
+# ── 3. UNKNOWN TIER — nonzero + stderr ──
+err="$("$RESOLVE" bogus 2>&1 >/dev/null)"; rc=$?
+[ "$rc" -ne 0 ] \
+  && ok "unknown tier exits nonzero (rc=$rc)" \
+  || bad "unknown tier exited 0 — should fail"
+printf '%s' "$err" | grep -qi 'unknown tier' \
+  && ok "unknown tier writes a message to stderr" \
+  || bad "unknown tier produced no stderr diagnostic"
+
+# ── 4. OPERATIONAL SCRIPTS FLOAT — no hardcoded pins remain ──
+for f in bin/session-fork bin/decompose; do
+  if grep -qE 'claude-(opus|sonnet|haiku)-[0-9]' "$REPO/$f"; then
+    bad "$f still contains a hardcoded pinned model id"
+  else
+    ok "$f has no hardcoded pinned model id (floats via resolver)"
+  fi
+done
+
+# bin/heimdall: lead-launch + routing sites must be resolver-driven. The bench
+# HELP-TEXT example id in bin/heimdall-bench is intentionally excluded (pinned).
+HITS="$(grep -nE 'claude-(opus|sonnet|haiku)-[0-9]' "$REPO/bin/heimdall" || true)"
+if [ -z "$HITS" ]; then
+  ok "bin/heimdall has no hardcoded pinned model id in operational sites"
+else
+  bad "bin/heimdall still pins a model id:"
+  printf '       %s\n' "$HITS"
+fi
+
+# Positive wiring check: the resolver is actually invoked in bin/heimdall.
+grep -q 'heimdall-model-resolve' "$REPO/bin/heimdall" \
+  && ok "bin/heimdall invokes heimdall-model-resolve" \
+  || bad "bin/heimdall never calls heimdall-model-resolve — not wired"
+
+echo ""
+echo "heimdall-model-resolve.test.sh: $PASS passed, $FAIL failed."
+[ "$FAIL" -eq 0 ] || exit 1
+exit 0

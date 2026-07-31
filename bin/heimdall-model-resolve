@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# heimdall-model-resolve — print the --model string for a Claude model TIER.
+#
+# WHY: operational spawns must float to the LATEST Claude of each tier. Claude
+# Code maps the bare tier ALIASES (opus/sonnet/haiku) to the newest model of
+# that tier, so passing the alias to `--model` always resolves to current-gen
+# — no stale pinned id (e.g. claude-opus-4-8) to rot when a new gen ships.
+#
+# Default:   print the bare ALIAS  → Claude Code resolves the latest of the tier.
+# Override:  set HEIMDALL_MODEL_<TIER> to a full id to PIN (bench/eval repro).
+#            e.g. HEIMDALL_MODEL_OPUS=claude-opus-5  → prints that exact id.
+#
+# Usage:  heimdall-model-resolve <opus|sonnet|haiku>
+# Exit:   0 + model string on stdout; nonzero + message on stderr for bad tier.
+set -euo pipefail
+
+tier="${1:-}"
+
+case "$tier" in
+  opus)   override="${HEIMDALL_MODEL_OPUS:-}" ;;
+  sonnet) override="${HEIMDALL_MODEL_SONNET:-}" ;;
+  haiku)  override="${HEIMDALL_MODEL_HAIKU:-}" ;;
+  *)
+    echo "heimdall-model-resolve: unknown tier '${tier}' (want: opus|sonnet|haiku)" >&2
+    exit 2
+    ;;
+esac
+
+# Pin-override wins (reproducibility); otherwise float to latest via the alias.
+if [ -n "$override" ]; then
+  printf '%s\n' "$override"
+else
+  printf '%s\n' "$tier"
+fi

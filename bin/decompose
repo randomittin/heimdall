@@ -77,4 +77,4 @@ $FORMAT_INSTRUCTION"
 
 # Call Claude for decomposition (overload-resilient: retries transient 529/overload with
 # backoff, fails loudly on give-up instead of the old `2>/dev/null` silent-empty output).
-hmd_claude_retry -p "$PROMPT" --model claude-sonnet-4-6
+hmd_claude_retry -p "$PROMPT" --model "$("$PLUGIN_DIR/bin/heimdall-model-resolve" sonnet)"
