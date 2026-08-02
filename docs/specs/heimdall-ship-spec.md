@@ -18,7 +18,7 @@
 - `.planning/` gitignored except graduated files (conventions.md, GATE-REVIEW.md — each future graduation is a deliberate force-add).
 - Scrub history check: no tokens/paths/personal data in tracked files (gitleaks one-shot over full history; it's already a gate going forward).
 - LICENSE (MIT), CONTRIBUTING.md (stack-pack + oracle-pack templates as the contribution doors, good-first-issue labels pre-created), SECURITY.md, CODE_OF_CONDUCT.md.
-- "What Heimdall will never do" README section: no telemetry, no network calls home, MIT, read the source.
+- "What Heimdall will never do" README section: retired 2026-07-28 — the absolute "no telemetry, no network calls home" claim went FALSE when team presence/cloud features flipped default-ON (`IDENTITY.md:5`, scoped paragraph `IDENTITY.md:32-38`). Ship the scoped S1–S6 claim set instead (enforced by `test/truth-pass-claims.test.sh`), with `DATA.md` as the receipt; MIT, read the source.
 - Install path: marketplace primary; `--auto` default; skip-permissions behind warned flag.
 - Acceptance: a stranger's 5-minute path works — clone → install → `heimdall demo` (S-5) without reading more than the README's first screen.
 
@@ -91,7 +91,7 @@ Rules: no superlatives, no "revolutionary," lowercase honesty; the number in the
 
 **Engagement rules for the week:** answer everything substantive <2h daytime IST; concede valid criticism in-thread and open an issue live (link it in the reply — nothing disarms HN like a filed issue mid-thread); never argue tone; the tautology/false-green skeptics are your best commenters — they're the audience that becomes contributors; ship at least one fix from comments within 48h and reply "fixed in <sha>".
 
-**The numbers you'll be asked for — have them ready:** token cost per flagship run; wall time; what happens without Anthropic access (answer: gates/corpus/bench are agent-agnostic, harness needs any CLI agent); why not just better prompts (answer: the R-1 incident — the prompt was fine, the reference was wrong, only external anchoring caught it); license/monetization (MIT, protocol open, maybe hosted team server later, no telemetry ever).
+**The numbers you'll be asked for — have them ready:** token cost per flagship run; wall time; what happens without Anthropic access (answer: gates/corpus/bench are agent-agnostic, harness needs any CLI agent); why not just better prompts (answer: the R-1 incident — the prompt was fine, the reference was wrong, only external anchoring caught it); license/monetization (MIT, protocol open, maybe hosted team server later — NOT "no telemetry ever": that absolute claim was retired 2026-07-28 when presence flipped default-ON; the accurate answer is the scoped S1–S6 claim set / `DATA.md`).
 
 **L2 (bloat, fast-follow ~Day 17) and L3 (teams, ~Day 30):** per master spec — L2 is X/Reddit-led with the before/after scorecard and the reply-guy command; L3 carries the R1-collision + R7-budget-death first-party incident write-ups as evidence. Cadence rule: a launch only fires when the previous one's issue queue is at zero-or-answered.
 

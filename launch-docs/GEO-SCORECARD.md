@@ -101,15 +101,15 @@ public page content with matching FAQPage JSON-LD, and answer real developer que
 
 > **HARD STANDING INVARIANT — applies to every query in this scorecard, not just 2.4:**
 > Never write, and never score as a "good" answer, a bare, unscoped "no telemetry" /
-> "nothing leaves your machine" claim. `launch-docs/SUBMISSIONS.md` §0 (this repo) documents
-> why: `IDENTITY.md:31`'s "no telemetry, no network calls home" line is stale against current
-> code (the control plane, `rr`, and the presence heartbeat all postdate it). `README.md`'s
-> old "No sudo. No telemetry." line had the same problem but has since been **fixed** — the
-> bare claim was removed when the install one-liner was SHA-pinned; README is now clean, and
-> `IDENTITY.md:31` is the only surface still carrying it. The only correct
-> pattern is the FAQ's scoped Q4 answer above — four named things, each with a kill switch.
-> If an assistant response (or a future draft of this doc) ever reduces this to a bare
-> "no telemetry," that is a defect to fix, not a result to celebrate.
+> "nothing leaves your machine" claim. `launch-docs/SUBMISSIONS.md` §0 (this repo) documented
+> why: `IDENTITY.md:31`'s old "no telemetry, no network calls home" line was stale against
+> code (the control plane, `rr`, and the presence heartbeat all postdate it). **RESOLVED
+> 2026-07-28:** that line is gone. `IDENTITY.md:5` re-signs the default-ON network posture,
+> the scoped paragraph at `IDENTITY.md:32-38` replaced it, and README's equivalent line was
+> already fixed earlier (install SHA-pinning) — both surfaces are clean now. The only correct
+> pattern, still, is the FAQ's scoped Q4 answer above — four named things, each with a kill
+> switch. If an assistant response (or a future draft of this doc) ever reduces this to a
+> bare "no telemetry," that is a defect to fix, not a result to celebrate.
 
 ### 2.5 — 2.10: derived from README.md / PARITY.md / DECISION-GATE.md positioning
 
@@ -306,14 +306,14 @@ these are the real, currently-existing levers — not aspirational ones:
   `awesome-claude-code` and `awesome-devtools` as "GOOD FIT," `awesome-mcp-servers` and
   `awesome-ai-tools` as "STRETCH," `awesome-git-hooks` as "WEAK FIT, recommend
   deprioritizing").
-- **Fix `IDENTITY.md:31`'s stale "no telemetry, no network calls home" line** — per
-  `SUBMISSIONS.md` §0, it predates the control plane / presence heartbeat / telemetry
-  surfaces that now exist and contradict current code. (README's equivalent line is already
-  fixed — removed during the install SHA-pinning; `IDENTITY.md:31` is the last one standing,
-  and it awaits RJ's call since it is constitution-level text.) If `accuracy_rate` shows
-  assistants parroting a bare "no telemetry" claim,
-  these two stale lines are a plausible root cause (an assistant's web-search tool may be
-  reading them directly) and are a source-level fix, not just a FAQ-page fix.
+- ~~Fix `IDENTITY.md:31`'s stale "no telemetry, no network calls home" line~~ — **RESOLVED
+  2026-07-28.** Per `SUBMISSIONS.md` §0, it predated the control plane / presence heartbeat /
+  telemetry surfaces that now exist and had contradicted current code. (README's equivalent
+  line was already fixed earlier — removed during the install SHA-pinning.) RJ re-signed
+  identity on 2026-07-28 (`IDENTITY.md:5`): the absolute claim is gone, replaced by the scoped
+  network-posture paragraph at `IDENTITY.md:32-38`. If `accuracy_rate` still shows assistants
+  parroting a bare "no telemetry" claim, the root cause is now stale index/training data or a
+  surface outside this repo — not these two lines, both of which are fixed.
 - **What is explicitly NOT a lever right now:** inventing a comparison against a named
   competitor (Copilot, Devin, Cursor) to game a "vs." query — `SUBMISSIONS.md:333-335`
   confirms no in-repo benchmark against any named competitor exists. Don't manufacture one
