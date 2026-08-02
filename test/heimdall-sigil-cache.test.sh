@@ -21,7 +21,14 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 SL="$ROOT/sentinels/hmd-statusline.py"
 
-command -v python3 >/dev/null 2>&1 || { echo "SKIP: python3 unavailable"; exit 0; }
+# A skip must never look like a pass: exit 0 with no roll-up line is exactly how a
+# vacuous gate hides. Report the skip LOUDLY and as a zero-assertion row.
+command -v python3 >/dev/null 2>&1 || {
+  echo "SKIP: python3 unavailable"
+  echo "RESULT: SKIPPED (0 assertions ran — this is NOT a pass)"
+  echo "heimdall-sigil-cache: 0 passed, 0 failed (SKIPPED — python3 unavailable)"
+  exit 0
+}
 [ -f "$SL" ] || { echo "FATAL: statusline missing at $SL"; exit 2; }
 
 SL="$SL" python3 - <<'PY'
@@ -43,7 +50,9 @@ home = tempfile.mkdtemp()
 os.environ["HOME"] = home
 
 fail = 0
-def ok(t):  print("  ok   " + t)
+passed = 0
+def ok(t):
+    global passed; passed += 1; print("  ok   " + t)
 def bad(t):
     global fail; fail += 1; print("  FAIL " + t)
 
@@ -58,7 +67,9 @@ if len(files) == 1 and VER in os.path.basename(files[0]):
     ok("first render wrote a cache file keyed by version %s" % VER)
 else:
     bad("expected one .sig keyed by the version hash, got %r" % [os.path.basename(f) for f in files])
-    print("%d failed" % (fail or 1)); sys.exit(1)
+    print("%d failed" % (fail or 1))
+    print("heimdall-sigil-cache: %d passed, %d failed" % (passed, fail))
+    sys.exit(1)
 CFILE = files[0]
 
 # corrupt the stored sigil with a recognizable sentinel.
@@ -94,5 +105,6 @@ else:
 
 print()
 print("%s" % ("all passed" if fail == 0 else ("%d failed" % fail)))
+print("heimdall-sigil-cache: %d passed, %d failed" % (passed, fail))
 sys.exit(1 if fail else 0)
 PY
