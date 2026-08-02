@@ -90,9 +90,19 @@ SITE="${HEIMDALL_LV_SITE:-https://runheimdall.dev}"
 
 # ── resolve the control-plane URL: explicit override > the dev's global endpoint file >
 # the shipped public default (the same precedence bin/heimdall-invite uses).
+#
+# The public-default literal is NOT duplicated here: bin/lib/cp-consent.sh is the single
+# source of truth for it ("lives HERE and NOWHERE ELSE in bin/"), so we source that lib in
+# a subshell and read $HEIMDALL_DEFAULT_CP_URL. Sourcing is side-effect-free (the lib is
+# variable + function definitions only) and keeps a CP-URL rotation a one-file change.
 resolve_cp() {
   if [ -n "${HEIMDALL_LV_CP:-}" ]; then printf '%s' "${HEIMDALL_LV_CP%/}"; return 0; fi
-  LV_CFG="${HOME:-}/.heimdall/cp-endpoint.json" "$PY" - <<'PYEOF'
+  local consent_lib="$ROOT/bin/lib/cp-consent.sh" default_cp=""
+  if [ -r "$consent_lib" ]; then
+    default_cp="$(. "$consent_lib"; printf '%s' "$HEIMDALL_DEFAULT_CP_URL")"
+  fi
+  [ -n "$default_cp" ] || { printf 'live-verify: cannot resolve the default control-plane URL (%s missing/unreadable) — pass $HEIMDALL_LV_CP\n' "$consent_lib" >&2; return 1; }
+  LV_CFG="${HOME:-}/.heimdall/cp-endpoint.json" LV_DEFAULT_CP="$default_cp" "$PY" - <<'PYEOF'
 import json, os, sys
 cfg = os.environ.get("LV_CFG", "")
 url = ""
@@ -101,10 +111,13 @@ try:
         url = json.load(open(cfg)).get("url") or ""
 except Exception:
     url = ""
-sys.stdout.write((url or "https://heimdall-cp-public-eqfrs7sfuq-uc.a.run.app").rstrip("/"))
+sys.stdout.write((url or os.environ["LV_DEFAULT_CP"]).rstrip("/"))
 PYEOF
 }
 CP="$(resolve_cp)"
+# Fail closed: this script has no `set -e`, so an unresolvable CP would otherwise fall
+# through as an empty base URL and produce meaningless "unreachable" verdicts.
+[ -n "$CP" ] || { printf 'live-verify: control-plane URL unresolved — aborting (set $HEIMDALL_LV_CP to override)\n' >&2; exit 2; }
 
 # ── project slug, derived exactly as docs/team-validation-runbook.md §4 derives it.
 resolve_project() {

@@ -101,24 +101,69 @@ cat > "$FAKEBIN/git" <<'SH'
 #!/usr/bin/env bash
 exit 0
 SH
-chmod +x "$FAKEBIN/claude" "$FAKEBIN/npx" "$FAKEBIN/node" "$FAKEBIN/git"
+cat > "$FAKEBIN/bun" <<'SH'
+#!/usr/bin/env bash
+# Present-but-inert `bun`. bin/heimdall gates the claude-mem installer on BOTH a real
+# TTY and bun being on PATH (the LIVE-VM #2 hang fix); without this stand-in the step
+# short-circuits to `skipped` and the NPX_RC knob below is never consulted at all.
+exit 0
+SH
+chmod +x "$FAKEBIN/claude" "$FAKEBIN/npx" "$FAKEBIN/node" "$FAKEBIN/git" "$FAKEBIN/bun"
 # Real python3 must resolve on the stripped PATH (telemetry + auth JSON checks).
 ln -s "$PY" "$FAKEBIN/python3"
 # NOTE: claude-mem is deliberately NOT created ⇒ `command -v claude-mem` fails ⇒
 # the claude-mem install block runs (the step under test).
+
+# ── A pty harness. bin/heimdall's claude-mem block is gated on `[ -t 0 ] && [ -t 1 ]`
+# (+ bun) so a headless box never launches claude-mem's interactive wizard. A plain
+# `cmd >/dev/null` run therefore has NO tty and always takes the graceful-skip branch,
+# which makes the sim-failure below unreachable. So drive the launcher under a REAL pty
+# (python3's pty.spawn — no `script(1)`, whose flags differ BSD vs util-linux).
+# stdin comes from /dev/null in the CALLER, so pty.spawn leaves the outer terminal's
+# termios untouched (no raw mode) while the CHILD still gets a genuine tty on fd 0+1.
+# A second fake-bin dir identical to FAKEBIN but WITHOUT bun, so the headless run below
+# exercises the gate's skip branch on both of its conditions (no tty AND no bun).
+NOBUNBIN="$WORK/fakebin-nobun"
+mkdir -p "$NOBUNBIN"
+for _fb in claude npx node git; do cp "$FAKEBIN/$_fb" "$NOBUNBIN/$_fb"; done
+chmod +x "$NOBUNBIN/claude" "$NOBUNBIN/npx" "$NOBUNBIN/node" "$NOBUNBIN/git"
+ln -s "$PY" "$NOBUNBIN/python3"
+
+PTY_RUNNER="$WORK/pty_run.py"
+cat > "$PTY_RUNNER" <<'PYEOF'
+import os, pty, sys
+status = pty.spawn(sys.argv[1:])
+if hasattr(os, "waitstatus_to_exitcode"):
+    sys.exit(os.waitstatus_to_exitcode(status))
+sys.exit(status >> 8 if status else 0)
+PYEOF
 
 # Drive bin/heimdall --setup in the sandbox. Args: $1=HEIMDALL_HOME (store dir),
 # plus inherited env (HEIMDALL_TELEMETRY / NPX_RC) governs telemetry + sim-failure.
 # ANTHROPIC_API_KEY short-circuits ensure_auth to its success path (no live login).
 # PATH = the fakebin FIRST (our claude/npx/node win) then the system coreutils dirs
 # (the launcher needs readlink/dirname/cd/pwd etc.); no real claude/npx is on it.
+# Runs under a pty (see PTY_RUNNER) so the claude-mem TTY gate opens and the npx
+# outcome — not the gate — decides the step. `</dev/null` keeps the outer terminal safe.
 # Returns the launcher's exit code; the caller captures it.
 run_setup() {
   local home="$1"
   PATH="$FAKEBIN:/usr/bin:/bin" HOME="$WORK/fakehome" \
     ANTHROPIC_API_KEY="sk-test-not-a-real-key" \
     HEIMDALL_HOME="$home" \
-    "$PLUG/bin/heimdall" --setup >/dev/null 2>&1
+    "$PY" "$PTY_RUNNER" "$PLUG/bin/heimdall" --setup </dev/null >/dev/null 2>&1
+}
+
+# The same launcher run HEADLESS — no pty AND no bun on PATH ($NOBUNBIN is FAKEBIN minus
+# the bun stand-in). This is the real-world CI/VM shape, and it pins the graceful-skip
+# branch of the claude-mem gate: the path that silently swallowed the sim-failure knob
+# and left section B vacuously green for 9 days.
+run_setup_headless() {
+  local home="$1"
+  PATH="$NOBUNBIN:/usr/bin:/bin" HOME="$WORK/fakehome" \
+    ANTHROPIC_API_KEY="sk-test-not-a-real-key" \
+    HEIMDALL_HOME="$home" \
+    "$PLUG/bin/heimdall" --setup </dev/null >/dev/null 2>&1
 }
 
 # A tiny python event-query helper: prints, for a (store, step, outcome) triple,
@@ -332,6 +377,46 @@ if [ "$(has_field "$STORE_E" path succeeded duration)" = "yes" ]; then
   ok "path succeeded event carries a numeric duration_ms"
 else
   bad "path succeeded event has no duration_ms"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# G. HEADLESS GATE — no tty + no bun ⇒ claude-mem is SKIPPED, never attempted.
+#    bin/heimdall refuses to launch claude-mem's interactive wizard without BOTH a
+#    real tty and bun (the LIVE-VM #2 hang fix). That branch is what sections A/B
+#    were silently taking before they were driven under a pty — it emitted a
+#    terminal `skipped` event that neither A nor B knew about, so B's sim-failure
+#    was unreachable and B's "no succeeded event" check was VACUOUSLY green.
+#    Pinned here so the gate can never again absorb the sim-failure unnoticed.
+# ─────────────────────────────────────────────────────────────────────────────
+echo "G. HEADLESS GATE (no tty + no bun ⇒ skipped, wizard never launched):"
+HOME_G="$WORK/home-g"
+NPX_RC=7 run_setup_headless "$HOME_G"; rc_g=$?
+STORE_G="$HOME_G/telemetry/events.ndjson"
+if [ "$rc_g" -eq 0 ]; then
+  ok "headless install exited 0 (the gate skips claude-mem, never hangs or fails the run)"
+else
+  bad "headless install exited $rc_g — the graceful-skip gate must never fail the install"
+fi
+g_skipped="$(count_events "$STORE_G" companion:claude-mem skipped)"
+if [ "$g_skipped" -ge 1 ]; then
+  ok "headless run emitted a terminal companion:claude-mem 'skipped' event (gate observable)"
+else
+  bad "no skipped companion:claude-mem event — the headless gate is not instrumented (started=$(count_events "$STORE_G" companion:claude-mem started))"
+fi
+if [ "$(has_field "$STORE_G" companion:claude-mem skipped errorclass)" = "yes" ]; then
+  ok "the skipped event carries an error CLASS (no-tty-or-bun — why it was skipped)"
+else
+  bad "the skipped event has no error class — the skip reason is unattributable"
+fi
+# The whole point of the gate: with no tty/bun the installer is NEVER invoked, so a
+# nonzero NPX_RC cannot appear as a failure. Proves the skip is pre-emptive, not a
+# swallowed npx error (and that sections A/B are genuinely reaching npx instead).
+g_failed="$(count_events "$STORE_G" companion:claude-mem failed)"
+g_succ="$(count_events "$STORE_G" companion:claude-mem succeeded)"
+if [ "$g_failed" -eq 0 ] && [ "$g_succ" -eq 0 ]; then
+  ok "headless run never invoked npx despite NPX_RC=7 (skip is pre-emptive, not a swallowed error)"
+else
+  bad "headless run produced failed=$g_failed succeeded=$g_succ — the wizard was launched behind the gate"
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
