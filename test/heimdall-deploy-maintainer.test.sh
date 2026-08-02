@@ -117,5 +117,132 @@ grep -qE '^iam roles create heimdallJobRunner --project=heimdall-cp-prod --permi
 grep -qE '\(\|\||exists\)' "$ARGLOG" && bad "annotation '(|| exists)' LEAKED into executed gcloud argv" || ok "no '(|| exists)' annotation in any executed gcloud argv"
 rm -rf "$FB8" "$ARGLOG" "$LEGYAML" "$LEGYAML2"
 
+# 9. MACHINE-SCOPED SANDBOX GUARD — the dormant twin of the launchd incident.
+#    `crontab` keys off the OS USER (getuid), NOT $HOME. A suite running under
+#    HOME=$(mktemp -d) therefore believes it is sandboxed while `crontab <file>` rewrites
+#    the DEVELOPER'S REAL crontab — the identical shape as the launchd bug that silently
+#    repointed the live nightly job at an ephemeral agent worktree. arch_a must REFUSE
+#    under a synthetic HOME, exit 4 (distinct from a failure), print the state word
+#    `sandboxed`, and touch NOTHING — not even `crontab -l`, whose failure is precisely
+#    how the destructive-read bug manifested.
+#
+#    HERMETIC: `crontab` is a RECORDING STUB and the PATH handed to the script under test
+#    is "$SBX_STUB:/usr/bin:/bin" — /usr/bin/crontab is shadowed by the stub, so the real
+#    crontab binary can never be invoked by any exercise below. Every invocation (READ and
+#    INSTALL alike) is appended to $SBX_LOG, so "zero invocations" is a positive assertion
+#    over a file rather than an absence of evidence.
+RROOT="$(cd "$(dirname "$S")/../.." && pwd)"
+SBX_STUB="$(mktemp -d)"; SBX_LOG="$SBX_STUB/crontab.invocations"; : > "$SBX_LOG"
+for t in claude gh gcloud; do printf '#!/usr/bin/env bash\nexit 0\n' > "$SBX_STUB/$t"; chmod +x "$SBX_STUB/$t"; done
+cat > "$SBX_STUB/crontab" <<EOF
+#!/usr/bin/env bash
+# RECORDING STUB — logs EVERY invocation, the READ included. Never touches a real crontab.
+if [ "\${1:-}" = "-l" ]; then
+  printf 'READ\n' >> "$SBX_LOG"
+  cat "$SBX_STUB/current.cron" 2>/dev/null
+  exit 0
+fi
+printf 'INSTALL %s\n' "\$1" >> "$SBX_LOG"
+cp "\$1" "$SBX_STUB/installed.cron"
+exit 0
+EOF
+chmod +x "$SBX_STUB/crontab"
+printf '0 3 * * * /usr/local/bin/backup-db.sh\n' > "$SBX_STUB/current.cron"
+
+# 9a. SYNTHETIC HOME → the real crontab is NEVER touched. This is the assertion that
+#     would have prevented the incident. --local drives arch_a with no gcloud needed.
+SBX_HOME="$(mktemp -d)"
+OUT9="$(printf 'oauthval\nbotval\n' | env -u HEIMDALL_REAL_HOME HOME="$SBX_HOME" \
+  PATH="$SBX_STUB:/usr/bin:/bin" bash "$S" --local --repo acme/widgets 2>&1)"; rc9=$?
+[ "$rc9" = 4 ] && ok "synthetic HOME: refused with the DISTINCT exit 4 (refusal, not failure)" \
+  || bad "synthetic HOME: rc=$rc9 (expected 4 — operator cannot tell refusal from breakage)"
+printf '%s' "$OUT9" | grep -q 'sandboxed' && ok "synthetic HOME: prints the state word 'sandboxed'" \
+  || bad "synthetic HOME: no 'sandboxed' state word in output"
+[ ! -s "$SBX_LOG" ] && ok "synthetic HOME: crontab invoked ZERO times — not even 'crontab -l'" \
+  || bad "synthetic HOME: THE REAL CRONTAB WAS REACHED — $(tr '\n' ';' < "$SBX_LOG")"
+[ ! -f "$SBX_STUB/installed.cron" ] && ok "synthetic HOME: no crontab content was written" \
+  || bad "synthetic HOME: DESTRUCTIVE — a crontab was installed anyway"
+[ ! -f "$SBX_HOME/.heimdall/maintainer.env" ] \
+  && ok "synthetic HOME: refusal was TOTAL AND EARLY (no env file, no smoke cycle)" \
+  || bad "synthetic HOME: side effects ran before the refusal (env file exists)"
+printf '%s' "$OUT9" | grep -q 'passwd home' && ok "synthetic HOME: states WHY (passwd-home mismatch)" \
+  || bad "synthetic HOME: refusal gives no diagnosable reason"
+
+# 9b. --hybrid reaches arch_a too — the default MODE, so the plain-run path is covered.
+: > "$SBX_LOG"; rm -f "$SBX_STUB/installed.cron"
+SBX_HOME2="$(mktemp -d)"
+OUT9H="$(printf 'oauthval\nbotval\n' | env -u HEIMDALL_REAL_HOME HOME="$SBX_HOME2" \
+  PATH="$SBX_STUB:/usr/bin:/bin" bash "$S" --hybrid --repo acme/widgets 2>&1)"; rc9h=$?
+[ "$rc9h" = 4 ] && ok "synthetic HOME (--hybrid, the DEFAULT mode): refused with exit 4" \
+  || bad "synthetic HOME (--hybrid): rc=$rc9h (expected 4)"
+[ ! -s "$SBX_LOG" ] && ok "synthetic HOME (--hybrid): crontab invoked ZERO times" \
+  || bad "synthetic HOME (--hybrid): real crontab reached — $(tr '\n' ';' < "$SBX_LOG")"
+
+# 9c. REAL OPERATOR → the cron entry STILL installs. That is the point of the guard: it
+#     must refuse a sandbox WITHOUT refusing the operator. Driven through a fake ROOT so
+#     the smoke `heimdall-maintain-loop` calls hit a stub instead of running a real
+#     maintainer cycle (which opens PRs). HEIMDALL_REAL_HOME is real-home.sh's documented
+#     test seam: it overrides ONLY the resolved passwd home, so the run self-identifies as
+#     the real user while `crontab` still resolves to the stub on PATH.
+FR="$(mktemp -d)"; mkdir -p "$FR/deploy/cloud-run" "$FR/bin/lib"
+cp "$S" "$FR/deploy/cloud-run/deploy-maintainer.sh"; chmod +x "$FR/deploy/cloud-run/deploy-maintainer.sh"
+cp "$RROOT/bin/lib/crontab-safe.sh" "$RROOT/bin/lib/real-home.sh" "$FR/bin/lib/"
+LOOPLOG="$FR/loop.log"
+cat > "$FR/bin/heimdall-maintain-loop" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$LOOPLOG"
+exit 0
+EOF
+chmod +x "$FR/bin/heimdall-maintain-loop"
+cmp -s "$S" "$FR/deploy/cloud-run/deploy-maintainer.sh" \
+  && ok "positive branch runs a BYTE-IDENTICAL copy of the shipped script (cannot drift)" \
+  || bad "positive-branch copy differs from the shipped script"
+: > "$SBX_LOG"; rm -f "$SBX_STUB/installed.cron"
+POS_HOME="$(mktemp -d)"
+OUT9P="$(printf 'oauthval\nbotval\n' | env HOME="$POS_HOME" HEIMDALL_REAL_HOME="$POS_HOME" \
+  PATH="$SBX_STUB:/usr/bin:/bin" bash "$FR/deploy/cloud-run/deploy-maintainer.sh" \
+  --local --repo acme/widgets 2>&1)"; rc9p=$?
+[ "$rc9p" = 0 ] && ok "real operator: deploy completes exit 0 (guard does NOT block a real install)" \
+  || bad "real operator: rc=$rc9p — the guard BLOCKED a legitimate install: $(printf '%s' "$OUT9P" | tail -3 | tr '\n' ' ')"
+grep -q '^INSTALL ' "$SBX_LOG" && ok "real operator: the crontab install DID run" \
+  || bad "real operator: no crontab install recorded — the deploy silently did nothing"
+grep -q 'heimdall-maintainer-beat' "$SBX_STUB/installed.cron" 2>/dev/null \
+  && ok "real operator: runner-beat entry written to the crontab" \
+  || bad "real operator: runner-beat entry MISSING from the installed crontab"
+grep -q 'heimdall-maintainer-cycle' "$SBX_STUB/installed.cron" 2>/dev/null \
+  && ok "real operator: cycle entry written to the crontab" \
+  || bad "real operator: cycle entry MISSING from the installed crontab"
+grep -q 'backup-db.sh' "$SBX_STUB/installed.cron" 2>/dev/null \
+  && ok "real operator: the unrelated job was PRESERVED (safe-replace still applies)" \
+  || bad "real operator: an unrelated crontab job was LOST"
+
+# 9d. The guard must not OVER-fire: --dry-run needs no creds, touches nothing, and must
+#     still print the cron plan under a synthetic HOME (an over-guard is churn that hides
+#     real ones). Falsifiable: gating dry-run too turns these three RED.
+: > "$SBX_LOG"
+DRY_HOME="$(mktemp -d)"
+OUT9D="$(env -u HEIMDALL_REAL_HOME HOME="$DRY_HOME" PATH="$SBX_STUB:/usr/bin:/bin" \
+  bash "$S" --dry-run --hybrid --repo acme/widgets </dev/null 2>&1)"; rc9d=$?
+[ "$rc9d" = 0 ] && ok "--dry-run under a synthetic HOME still exits 0 (guard does not over-fire)" \
+  || bad "--dry-run under a synthetic HOME rc=$rc9d (the guard over-fired)"
+printf '%s' "$OUT9D" | grep -q 'crontab: add (dedup on marker)' \
+  && ok "--dry-run still prints the cron plan under a synthetic HOME" \
+  || bad "--dry-run no longer prints the cron plan"
+[ ! -s "$SBX_LOG" ] && ok "--dry-run invoked crontab ZERO times" \
+  || bad "--dry-run invoked crontab: $(tr '\n' ';' < "$SBX_LOG")"
+
+# 9e. NO DRIFT — the guard must REUSE bin/lib/real-home.sh, never re-implement it. A second
+#     copy of the passwd lookup would drift from the launchd side, and a drifted guard is an
+#     unguarded one. Falsifiable: inlining a getpwuid/dscl lookup here turns the third RED.
+grep -q 'bin/lib/real-home.sh' "$S" && ok "sources the SHARED real-home lib (one definition)" \
+  || bad "does not source bin/lib/real-home.sh"
+grep -q 'heimdall_home_is_real' "$S" && ok "gates on the SHARED heimdall_home_is_real predicate" \
+  || bad "never calls heimdall_home_is_real"
+[ "$(grep -c 'getpwuid\|NFSHomeDirectory' "$S")" = 0 ] \
+  && ok "carries NO second copy of the passwd lookup (cannot drift from real-home.sh)" \
+  || bad "re-implements the passwd lookup locally — it WILL drift from real-home.sh"
+
+rm -rf "$SBX_STUB" "$SBX_HOME" "$SBX_HOME2" "$FR" "$POS_HOME" "$DRY_HOME"
+
 echo "──────────"; echo "deploy-maintainer: $P passed, $F failed"
 [ "$F" = 0 ] || exit 1
