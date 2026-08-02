@@ -243,6 +243,47 @@ is_loaded() {
   "$LAUNCHCTL" list "$LABEL" >/dev/null 2>&1
 }
 
+# ── Registered-command introspection (the SILENT-DEATH detector) ─────────────────
+#
+# WHY status HAS TO ANSWER THIS. launchd does not validate ProgramArguments[0] when a
+# job is loaded and does not complain at 03:00 when that program has vanished —
+# `launchctl list` keeps reporting the job either way. So `status` used to say
+# "registered (installed + loaded)" about a job that had not run in weeks. That is the
+# incident's lasting damage: not the bad write, but that NOTHING AFTERWARDS SAID SO. A
+# schedule whose failure mode is silence needs a liveness check, or it has no failure
+# mode at all — just an absence nobody attributes to anything.
+#
+# WHY THIS DETECTS AND DOES NOT REPAIR. Repair means CHOOSING a path to re-pin, and the
+# only path `status` could choose is the tree it happens to be running from — which is
+# exactly the hijack require_durable_pinned_paths exists to stop, re-introduced through
+# a read-only subcommand and triggered by nothing more than a stale plist. Repair
+# therefore stays where it already is and is already gated: `install` overwrites the
+# plist in place (fixed path + unload-before-load = idempotent) and heimdall-autoupdate
+# re-asserts it after every update, so the self-heal runs on the normal upgrade path —
+# and both now refuse an ephemeral tree. Detection here is inert by construction: it
+# writes nothing and issues no launchctl verb, so it cannot become a vector.
+#
+# plutil is the platform's OWN plist reader and ships with every macOS. Where it is
+# absent there is no launchd either, so printing nothing beats guessing from the XML —
+# a fabricated answer here would be worse than none.
+registered_command() {
+  local out
+  [ -f "$PLIST" ] || return 0
+  command -v plutil >/dev/null 2>&1 || return 0
+  out="$(plutil -extract ProgramArguments.0 raw -o - "$PLIST" 2>/dev/null)" || return 0
+  printf '%s' "$out"
+}
+
+# Minimal JSON string escaping for a value that comes from OUTSIDE this script (the
+# plist on disk) — a path holding a quote or backslash would otherwise emit JSON that
+# no consumer can parse.
+json_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  printf '%s' "$s"
+}
+
 # ── subcommands ──────────────────────────────────────────────────────────────────
 cmd_install() {
   # Explicit opt-out FIRST — a declining dev/CI never reaches launchd at all. Same
@@ -288,14 +329,23 @@ cmd_uninstall() {
 }
 
 cmd_status() {
-  local installed loaded
+  local installed loaded regcmd stale
   [ -f "$PLIST" ] && installed=true || installed=false
   if is_loaded; then loaded=true; else loaded=false; fi
+  # A job whose ProgramArguments[0] no longer exists is REGISTERED but DEAD: launchd
+  # will keep listing it and will keep never running it. Surface that as its own state.
+  regcmd="$(registered_command)"
+  stale=false
+  if [ "$installed" = true ] && [ -n "$regcmd" ] && [ ! -x "$regcmd" ]; then
+    stale=true
+  fi
   if [ "$JSON" = 1 ]; then
-    printf '{"installed":%s,"loaded":%s,"label":"%s","plist":"%s","command":"%s --repo %s run --overnight","log":"%s"}\n' \
-      "$installed" "$loaded" "$LABEL" "$PLIST" "$DREAM" "$REPO" "$LOG"
+    printf '{"installed":%s,"loaded":%s,"stale":%s,"label":"%s","plist":"%s","registered_command":"%s","command":"%s --repo %s run --overnight","log":"%s"}\n' \
+      "$installed" "$loaded" "$stale" "$LABEL" "$PLIST" "$(json_escape "$regcmd")" "$DREAM" "$REPO" "$LOG"
   else
-    if [ "$installed" = true ] && [ "$loaded" = true ]; then
+    if [ "$stale" = true ]; then
+      echo "$LABEL: registered but DEAD — its command no longer exists"
+    elif [ "$installed" = true ] && [ "$loaded" = true ]; then
       echo "$LABEL: registered (installed + loaded)"
     elif [ "$installed" = true ]; then
       echo "$LABEL: installed but NOT loaded"
@@ -305,6 +355,11 @@ cmd_status() {
     echo "  plist:   $PLIST"
     echo "  command: $DREAM --repo $REPO run --overnight"
     echo "  log:     $LOG"
+    if [ "$stale" = true ]; then
+      echo "  MISSING: the registered command is gone: $regcmd"
+      echo "           launchd still lists this job and will never run it. Re-register"
+      echo "           from your MAIN checkout: heimdall-dream-schedule install"
+    fi
   fi
 }
 

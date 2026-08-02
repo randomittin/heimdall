@@ -264,6 +264,44 @@ else
 fi
 "$CLI_CANON" uninstall --repo "$REPO" >/dev/null 2>&1 || true
 
+# ── (7) SILENT DEATH IS VISIBLE — status detects a plist pinned to a missing path ──
+#
+# The incident's lasting damage was not the bad write, it was that nothing afterwards
+# said so. launchd does not validate ProgramArguments[0] at load time and does not
+# complain at 03:00 when it has vanished — `launchctl list` keeps reporting the job — so
+# `status` cheerfully said "registered (installed + loaded)" about a job that had not run
+# in weeks. An operator whose nightly job died had no signal at all.
+: > "$CALLS"; rm -f "$PLIST"
+"$CLI_CANON" install --repo "$CANON" >/dev/null 2>&1
+# Simulate the reap: the tree the plist points at goes away, exactly as a worktree does.
+mv "$DREAM_CANON" "$DREAM_CANON.reaped"
+DTXT="$("$CLI_CANON" status --repo "$CANON")"
+DJSON="$("$CLI_CANON" status --repo "$CANON" --json)"
+if [ "$(echo "$DJSON" | jq -r '.stale')" = "true" ] \
+   && [ "$(echo "$DJSON" | jq -r '.registered_command')" = "$DREAM_CANON" ]; then
+  ok "(7) status --json flags a plist pinned to a missing command (stale=true + the path)"
+else
+  bad "(7) status --json did not flag the dead job: $DJSON"
+fi
+echo "$DTXT" | grep -qi 'dead\|stale\|no longer exists' \
+  && ok "(7) status says so in words — a dead nightly job is no longer silent" \
+  || bad "(7) status text hid the dead job: $(echo "$DTXT" | tr '\n' ' ' | cut -c1-160)"
+# Repair is `install`, which is guarded — status itself must stay inert (it is what an
+# operator runs while diagnosing, and a repairing status would re-pin from whatever tree
+# it happened to run in: the very hijack §6 closes).
+: > "$CALLS"
+"$CLI_CANON" status --repo "$CANON" >/dev/null 2>&1
+grep -Eq '^(load|unload|bootstrap|bootout)' "$CALLS" \
+  && bad "(7) status mutated launchd — a read-only subcommand must never repair" \
+  || ok "(7) status issues no launchctl load/unload — detection cannot become a hijack vector"
+mv "$DREAM_CANON.reaped" "$DREAM_CANON"
+# And the repair path itself: a re-install from the canonical tree heals the plist.
+"$CLI_CANON" install --repo "$CANON" >/dev/null 2>&1
+[ "$("$CLI_CANON" status --repo "$CANON" --json | jq -r '.stale')" = "false" ] \
+  && ok "(7) re-running install from the canonical tree heals the stale plist" \
+  || bad "(7) install did not heal the stale plist"
+"$CLI_CANON" uninstall --repo "$REPO" >/dev/null 2>&1 || true
+
 echo
 echo "-------------------------"
 printf "TOTAL: %d passed, %d failed\n" "$PASS" "$FAIL"
