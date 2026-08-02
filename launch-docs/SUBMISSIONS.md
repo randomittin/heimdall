@@ -81,7 +81,20 @@ For each list I fetched the **real, current README** from GitHub (not memory) to
 exact entry format. Repo star counts were live-checked via the GitHub search API to confirm
 each is the highest-signal list under that name.
 
-### 2.1 `awesome-claude-code` — **GOOD FIT** — STATUS: SUBMITTED 2026-07-30 → https://github.com/hesreallyhim/awesome-claude-code/issues/2364 (validation bot: **Description max 500 chars** — used the trimmed 497-char form below; Category dropdown value = `Agent Orchestration`)
+### 2.1 `awesome-claude-code` — **GOOD FIT** — STATUS: **REJECTED 2026-07-30** → https://github.com/hesreallyhim/awesome-claude-code/issues/2364 (CLOSED, label `validation-failed`)
+
+**What actually happened (factcheck 2026-08-03).** The submission was auto-rejected by the
+list's validation bot. The issue body was submitted carrying the **1122-char long form**, over
+the bot's hard **500-char cap** — bot comment: "❗ Description is too long (max 500
+characters)". The trimmed **497-char block below was drafted but never pasted into the form**.
+Issue #2364 is **CLOSED** with label `validation-failed`, and **Heimdall is NOT in the list**
+(`grep -i heimdall` against the live `awesome-claude-code/main/README.md` → no match). The
+prior "SUBMITTED … used the trimmed 497-char form" status recorded here was wrong on both
+counts — nothing was accepted, and the short form was never used.
+
+**ACTION — resubmit.** Open a fresh submission pasting the **497-char block below verbatim**
+into the Description field (it is already under the cap, unmodified), Category dropdown value =
+`Agent Orchestration`. Nothing else about the entry needs to change.
 
 **Form description (≤500 chars, validated):**
 
@@ -200,7 +213,11 @@ Your AI agents can't grade their own homework. Heimdall gates every change behin
 
 ---
 
-## 3. Listing copy — AlternativeTo, OpenAlternative, LibHunt, StackShare, Product Hunt — STATUS: APPROVED (all 5, locked by RJ 2026-07-28)
+## 3. Listing copy — AlternativeTo, OpenAlternative, LibHunt, StackShare, Product Hunt — copy APPROVED for all 5 (locked by RJ 2026-07-28) · **SUBMITTABLE NOW: 3.1, 3.3, 3.4, 3.5** · **3.2 DEFERRED on the ≥10★ gate**
+
+*Copy approval and submittability are separate things.* All five drafts below are approved
+text; only four can actually be submitted today. §3.2 (OpenAlternative) is blocked on an
+external star threshold, not on its copy — see that section.
 
 Every field below traces to a specific repo line, cited inline. Positioning line is "Nothing ships unproven." throughout (RJ's decision, §1).
 
@@ -225,7 +242,16 @@ reads similarly to that category), but I found no in-repo comparison table or be
 against any named competitor, so I did not write a direct "alternative to X" claim. If RJ
 wants that framing, it needs a real comparison, not an assumption from me.
 
-### 3.2 OpenAlternative — STATUS: APPROVED
+### 3.2 OpenAlternative — STATUS: **DEFERRED (2026-07-30, copy approved)**
+
+**Hard-gated — do not submit yet.** OpenAlternative requires **≥10 GitHub stars** to accept a
+listing; the repo has **5** (live-checked, `stargazerCount: 5`). It additionally applies a
+**"Real Application, not CLIs"** rule, which Heimdall-the-plugin does not satisfy on its face.
+Both gates are external and neither is copy-fixable, so the copy below is approved and ready
+while the *submission* is held. This matches `LISTING-PASTE-SHEET.md:50` (⛔ DEFERRED
+2026-07-30), which is the authoritative status — the earlier bare "APPROVED" here contradicted
+it. **Revisit once past 10★**, framing the hosted `rr` product (a cloud bot with a real hosted
+surface) rather than the CLI plugin, to clear the "Real Application" rule.
 
 | Field | Value | Source |
 |---|---|---|
@@ -332,7 +358,7 @@ artifact — flagged so RJ knows which numbers to double check before they go ou
 | Oracle gate types ranked differential > trace-diff > verdict > property > example | `evals/oracles/README.md:15-19` (`registry.json`) | Yes |
 | Releases minisign-signed; auto-updater verifies before applying, refuses unsigned/tampered/wrong-key | `SIGNING.md:9-14` | Yes |
 | Install script is function-wrapped, no eval, no base64 — readable before running | `README.md:51-57` | Yes (I read `install.sh` header structure indirectly via the README's own description; did not re-audit the full script byte-for-byte) |
-| "0.50 median reuse across 8 cold repos" | `README.md:77`, linking to external `https://runheimdall.dev/proof`; methodology (8 reuse-measured repos: 5 JS + 3 Python, 2 more working-output-only probes excluded from the median) documented in `docs/archive/docs/superpowers/specs/heimdall-S6-C3-proposal.md` | **Partially external** — the number itself lives on a linked page outside this repo; I could not find a committed results JSON/table reproducing it inside `main`. Methodology is real and traceable; the headline number is not independently re-verifiable from repo contents alone. **RJ should confirm the `/proof` page is live and accurate before this claim is used publicly.** |
+| "0.50 median reuse across 8 cold repos" | `README.md:77`, linking to external `https://runheimdall.dev/proof`; methodology (8 reuse-measured repos: 5 JS + 3 Python, 2 more working-output-only probes excluded from the median) documented in `docs/archive/docs/superpowers/specs/heimdall-S6-C3-proposal.md` | **Yes — verified in-repo 2026-08-03 (re-graded from "Partially external").** The full sorted per-repo table IS committed on `main` at `docs/archive/docs/superpowers/specs/heimdall-S6-C3-findings.md` (commit `ae88a55`): 8 reuse-measured sorted `0.2581, 0.375, 0.40, 0.50, 0.50, 0.56, 0.6552, 0.9524` → **recomputed median = exactly 0.50** (robust — both middle values are 0.50). The raw run JSONs are now committed too (`.planning/s6-sweep/20260620T050833Z-88787.json`, `…/20260621T164007Z-31435.json`), whose embedded `distribution.reuse_median` reads **0.5** in the full-10 run. The live `/proof` page was checked this pass: claim matches, and all **3 on-page evidence links return HTTP 200**. **Caveat on the companion number:** the "8/10 working output" cited alongside this is **ADJUDICATED, not raw** — the raw machine count in the full-10 run is **6/10** (`working_output_pass: 6`, `working_output_rate: 0.6`). Two repos were re-graded up: `jmespath.py` → PASS on assertion-exit-0 (its *baseline* errored only because the harness lacked the `hypothesis` test dep), and `cachecontrol` → PASS only on the hardened re-run (its original probe auto-discovered the shipped `FileCache` and crashed in pre-existing code). `cobra`/`anyhow` are **UNDETERMINED** (Go/Rust toolchains absent, then a probe-escaping bug) and are excluded rather than counted as failures. All four adjudication layers are documented in that findings file under **§THE FINDING**. Do not quote "8/10" publicly without the word *adjudicated*, or the raw 6/10 will read as a contradiction. |
 | `heimdall-ledger-mcp` — 6 tools, thin wrapper, delegates to `heimdall-claim`/`heimdall-haid` | `PROTOCOL.md:219-306` | Yes; binary existence confirmed (`bin/heimdall-ledger-mcp` present) |
 | MIT license | `LICENSE:1` | Yes |
 | Repo `github.com/randomittin/heimdall`, domain `runheimdall.dev` | `IDENTITY.md:8-12` | Yes |
@@ -384,3 +410,12 @@ artifact — flagged so RJ knows which numbers to double check before they go ou
    switch. **[Status 2026-07-28: §1 APPROVED · §2.1 APPROVED · §2.2 APPROVED (narrow scope) ·
    §2.3 DEFERRED · §2.4 APPROVED · §2.5 SKIP · §3 APPROVED (all 5). §0 and §4 remain open —
    not part of this decision round.]**
+
+**FACTCHECK PASS 2026-08-03** — three status lines corrected against live sources: §2.1
+`awesome-claude-code` re-graded SUBMITTED → **REJECTED** (issue #2364 CLOSED, `validation-failed`,
+1122 chars > 500 cap; Heimdall not in the list) · §3.2 OpenAlternative re-graded APPROVED →
+**DEFERRED** (≥10★ gate, repo has 5; now agrees with `LISTING-PASTE-SHEET.md:50`) · §5 "0.50
+median reuse" re-graded *Partially external* → **verified in-repo** (findings table at commit
+`ae88a55`, median recomputed = 0.50, `/proof` evidence links 3/3 HTTP 200), with the companion
+"8/10 working output" recorded as **adjudicated** (raw 6/10). Note the 2026-07-28 line above is
+kept as the historical decision record; where it conflicts with this pass, **this pass wins**.
