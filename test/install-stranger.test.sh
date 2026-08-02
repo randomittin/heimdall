@@ -1096,7 +1096,17 @@ if [ -x "$WT_EPHEM/bin/heimdall-dream-schedule" ] && [ -f "$WT_EPHEM/.git" ]; th
   # (the .git-file `gitdir:` shape) has to carry the refusal ALONE — proving the two
   # detectors are independently sufficient rather than one plus decoration.
   SB="$(new_probe_home)"
-  worktree_probe "$SB" "$WT_EPHEM/bin/heimdall-dream-schedule" "$WT_EPHEM" PATH="$SB/stub"; SCHED_RC=$?
+  # PATH must keep coreutils and drop ONLY git. An empty-ish PATH removes dirname/uname
+  # too, so the helper dies rc=127 BEFORE it can decide — that measures the harness, not
+  # the guard. Mirror the real system PATH minus git, so "no git" is the only variable.
+  mkdir -p "$SB/nogit"
+  for _b in /bin/* /usr/bin/*; do
+    [ "${_b##*/}" = "git" ] && continue
+    ln -sf "$_b" "$SB/nogit/${_b##*/}" 2>/dev/null || true
+  done
+  command -v git >/dev/null 2>&1 && PATH="$SB/nogit" command -v git >/dev/null 2>&1 \
+    && bad "probe setup: git still reachable on the no-git PATH — the assertion below is vacuous"
+  worktree_probe "$SB" "$WT_EPHEM/bin/heimdall-dream-schedule" "$WT_EPHEM" PATH="$SB/stub:$SB/nogit"; SCHED_RC=$?
   if [ ! -f "$SB/launchctl.calls" ] && [ "$SCHED_RC" -eq 5 ]; then
     ok "worktree refusal holds with NO git on PATH (the filesystem detector is sufficient alone)"
   else
