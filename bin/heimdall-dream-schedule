@@ -141,6 +141,54 @@ require_real_launchd_domain() {
   exit 4
 }
 
+# ── The ephemeral-checkout guard (the SECOND mechanism behind the same incident) ──
+#
+# WHAT THE PASSWD GUARD ABOVE CANNOT SEE. It proves the run owns this launchd domain.
+# It says nothing about whether the PATH being pinned survives the week. The run that
+# rewrote the developer's live com.heimdall.dream.plist had a genuine $HOME — real
+# user, real passwd home, real domain — and passed that guard cleanly. It registered
+#   <repo>/.claude/worktrees/agent-<id>/bin/heimdall-dream --repo <same worktree>
+# from an agent worktree. The worktree was later reaped, so the nightly job was left
+# pinned to a path that no longer exists. Nothing errors at 03:00; the job just never
+# runs again, and the only symptom is that dreams quietly stop arriving. A silent
+# permanent outage is strictly worse than a loud refusal, which is why this refuses.
+#
+# BOTH PINNED PATHS ARE CHECKED. $DREAM becomes ProgramArguments[0] and $REPO becomes
+# --repo AND WorkingDirectory. Either one landing in a disposable tree produces the
+# same silently-dead job, so both are gated; the incident corrupted both at once.
+#
+# THE PREDICATE IS STRUCTURAL (bin/lib/real-home.sh): "is this a LINKED git worktree",
+# asked of git itself and of the on-disk .git shape — not a substring match on
+# ".claude/worktrees", which would miss a worktree created anywhere else. An undefined
+# predicate (unreadable lib) refuses, matching the house rule above — though that case
+# already exits 4 there, since the same lib supplies both.
+#
+# ORDERING: this runs AFTER require_real_launchd_domain and BEFORE write_plist, so a
+# synthetic HOME still reports as 'sandboxed' (its wording is asserted elsewhere) and a
+# refusal here still leaves nothing behind. Exit 5 is distinct from sandboxed (4) and
+# from a genuine failure (3): an operator reading a log must be able to tell "refused
+# because synthetic HOME" from "refused because worktree checkout" from "broke".
+refuse_ephemeral() {
+  local what="$1" path="$2"
+  echo "not scheduled $PLIST (ephemeral checkout — refusing to pin a nightly job to a disposable tree)" >&2
+  echo "  $what is inside a linked git worktree: $path" >&2
+  echo "  A linked worktree exists to be reaped; a LaunchAgent pinned to one does not" >&2
+  echo "  fail loudly when that happens, it just silently stops running. Re-run this" >&2
+  echo "  from the main worktree (git worktree list | head -1). Nothing was written." >&2
+  exit 5
+}
+require_durable_pinned_paths() {
+  if ! type heimdall_path_is_ephemeral >/dev/null 2>&1; then
+    echo "not scheduled $PLIST (ephemeral checkout — cannot verify the tree is durable)" >&2
+    echo "  bin/lib/real-home.sh did not load, so the disposable-checkout predicate is" >&2
+    echo "  unavailable and this refuses rather than guess. Nothing was written." >&2
+    exit 5
+  fi
+  heimdall_path_is_ephemeral "$DREAM" && refuse_ephemeral "the dream command" "$DREAM"
+  heimdall_path_is_ephemeral "$REPO"  && refuse_ephemeral "the --repo target" "$REPO"
+  return 0
+}
+
 # ── emit the plist (the single source of the scheduled argv) ─────────────────────
 write_plist() {
   mkdir -p "$LA_DIR" "$(dirname "$LOG")"
@@ -195,6 +243,47 @@ is_loaded() {
   "$LAUNCHCTL" list "$LABEL" >/dev/null 2>&1
 }
 
+# ── Registered-command introspection (the SILENT-DEATH detector) ─────────────────
+#
+# WHY status HAS TO ANSWER THIS. launchd does not validate ProgramArguments[0] when a
+# job is loaded and does not complain at 03:00 when that program has vanished —
+# `launchctl list` keeps reporting the job either way. So `status` used to say
+# "registered (installed + loaded)" about a job that had not run in weeks. That is the
+# incident's lasting damage: not the bad write, but that NOTHING AFTERWARDS SAID SO. A
+# schedule whose failure mode is silence needs a liveness check, or it has no failure
+# mode at all — just an absence nobody attributes to anything.
+#
+# WHY THIS DETECTS AND DOES NOT REPAIR. Repair means CHOOSING a path to re-pin, and the
+# only path `status` could choose is the tree it happens to be running from — which is
+# exactly the hijack require_durable_pinned_paths exists to stop, re-introduced through
+# a read-only subcommand and triggered by nothing more than a stale plist. Repair
+# therefore stays where it already is and is already gated: `install` overwrites the
+# plist in place (fixed path + unload-before-load = idempotent) and heimdall-autoupdate
+# re-asserts it after every update, so the self-heal runs on the normal upgrade path —
+# and both now refuse an ephemeral tree. Detection here is inert by construction: it
+# writes nothing and issues no launchctl verb, so it cannot become a vector.
+#
+# plutil is the platform's OWN plist reader and ships with every macOS. Where it is
+# absent there is no launchd either, so printing nothing beats guessing from the XML —
+# a fabricated answer here would be worse than none.
+registered_command() {
+  local out
+  [ -f "$PLIST" ] || return 0
+  command -v plutil >/dev/null 2>&1 || return 0
+  out="$(plutil -extract ProgramArguments.0 raw -o - "$PLIST" 2>/dev/null)" || return 0
+  printf '%s' "$out"
+}
+
+# Minimal JSON string escaping for a value that comes from OUTSIDE this script (the
+# plist on disk) — a path holding a quote or backslash would otherwise emit JSON that
+# no consumer can parse.
+json_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  printf '%s' "$s"
+}
+
 # ── subcommands ──────────────────────────────────────────────────────────────────
 cmd_install() {
   # Explicit opt-out FIRST — a declining dev/CI never reaches launchd at all. Same
@@ -208,6 +297,8 @@ cmd_install() {
 Use the cron/cloud routine documented in commands/dream.md instead."
   # Fail-safe sandbox gate — before write_plist, so a refusal leaves NOTHING behind.
   require_real_launchd_domain
+  # Second gate: never pin the nightly job to a checkout that is built to be reaped.
+  require_durable_pinned_paths
   [ -x "$DREAM" ] || die "heimdall-dream not executable at $DREAM"
   write_plist
   unload_agent   # drop any prior copy so a re-install never yields two loaded jobs
@@ -238,14 +329,23 @@ cmd_uninstall() {
 }
 
 cmd_status() {
-  local installed loaded
+  local installed loaded regcmd stale
   [ -f "$PLIST" ] && installed=true || installed=false
   if is_loaded; then loaded=true; else loaded=false; fi
+  # A job whose ProgramArguments[0] no longer exists is REGISTERED but DEAD: launchd
+  # will keep listing it and will keep never running it. Surface that as its own state.
+  regcmd="$(registered_command)"
+  stale=false
+  if [ "$installed" = true ] && [ -n "$regcmd" ] && [ ! -x "$regcmd" ]; then
+    stale=true
+  fi
   if [ "$JSON" = 1 ]; then
-    printf '{"installed":%s,"loaded":%s,"label":"%s","plist":"%s","command":"%s --repo %s run --overnight","log":"%s"}\n' \
-      "$installed" "$loaded" "$LABEL" "$PLIST" "$DREAM" "$REPO" "$LOG"
+    printf '{"installed":%s,"loaded":%s,"stale":%s,"label":"%s","plist":"%s","registered_command":"%s","command":"%s --repo %s run --overnight","log":"%s"}\n' \
+      "$installed" "$loaded" "$stale" "$LABEL" "$PLIST" "$(json_escape "$regcmd")" "$DREAM" "$REPO" "$LOG"
   else
-    if [ "$installed" = true ] && [ "$loaded" = true ]; then
+    if [ "$stale" = true ]; then
+      echo "$LABEL: registered but DEAD — its command no longer exists"
+    elif [ "$installed" = true ] && [ "$loaded" = true ]; then
       echo "$LABEL: registered (installed + loaded)"
     elif [ "$installed" = true ]; then
       echo "$LABEL: installed but NOT loaded"
@@ -255,6 +355,11 @@ cmd_status() {
     echo "  plist:   $PLIST"
     echo "  command: $DREAM --repo $REPO run --overnight"
     echo "  log:     $LOG"
+    if [ "$stale" = true ]; then
+      echo "  MISSING: the registered command is gone: $regcmd"
+      echo "           launchd still lists this job and will never run it. Re-register"
+      echo "           from your MAIN checkout: heimdall-dream-schedule install"
+    fi
   fi
 }
 
