@@ -331,6 +331,12 @@ HEIMDALL_PUBLIC_SURFACE=1 "$CLI" serve --host 127.0.0.1 --port "$CP_PORT" --home
   >"$EXT/serve.out" 2>"$EXT/serve.err" &
 SERVER_PID=$!
 CP_URL="http://127.0.0.1:$CP_PORT"
+# READINESS POLL — /healthz is CORRECT here and must stay. CP_URL is unconditionally the
+# LOCAL subprocess booted two lines up (127.0.0.1 + an ephemeral port); no env can point it
+# at the deployed service. Locally the request reaches our app, so /healthz answers 200.
+# The "probe /readyz, never /healthz" rule applies ONLY to an EXTERNAL probe of the deployed
+# Cloud Run URL, where Google's edge 404s /healthz before it reaches the container (see
+# docs/team-validation-runbook.md §1.1). Do not "fix" this line to /readyz.
 UP=""
 for _ in $(seq 1 60); do
   [ "$(httpstat GET "$CP_URL/healthz")" = "200" ] && { UP="1"; break; }
