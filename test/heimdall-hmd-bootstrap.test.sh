@@ -26,7 +26,7 @@
 # THE PROOFS HERE (all hermetic — `claude`/`npx`/`bun` are recording PATH fakes;
 # claude-mem is absent so its branch runs; the launcher short-circuits at the
 # `launch:task` trace marker before any real `claude … -p`; every run is under a
-# 30s watchdog so a re-introduced blocking prompt fails as a HANG, not a wedge):
+# watchdog so a re-introduced blocking prompt fails as a HANG, not a wedge):
 #   1. FRESH first run — READ-ONLY install dir, unauthenticated, non-TTY — ONE
 #      invocation installs companions, writes the marker to the USER home (NOT the
 #      repo dir), and defers auth without aborting.
@@ -36,6 +36,13 @@
 #   5. claude-mem SKIPPED even when bun IS present but there is no TTY (the TTY is
 #      required, not just bun).
 #   6. claude-mem IS attempted when a real TTY (pty) AND bun are both present.
+#
+# HARNESS HERMETICITY — every scenario that must observe FIRST-RUN behaviour calls
+# cold_install_state first, and every "X was NOT invoked" proof is paired with a
+# POSITIVE CONTROL proving first-run setup actually ran in that same scenario. See
+# cold_install_state below for the cross-scenario leak this defends against; the
+# controls exist because a negative assertion is trivially satisfied by a launcher
+# that did nothing at all — which is exactly how proof 6 sat red unnoticed.
 #
 # Exit 0 = every proof holds. Nonzero = a proof failed (prints which).
 
@@ -116,13 +123,37 @@ PATH_BUN="$BUN_DIR:$FAKE_DIR:$SYS"
 
 trap 'chmod -R u+w "$TPLUG" 2>/dev/null || true; rm -rf "$TPLUG" "$FAKE_DIR" "$BUN_DIR" 2>/dev/null || true' EXIT
 
+# cold_install_state — return the INSTALL DIR to a genuine never-set-up state.
+#
+# WHY THIS EXISTS (the cross-scenario leak that silently red-lined proof 6): a
+# fresh $HEIMDALL_HOME is NOT sufficient to get first-run behaviour, because setup
+# state is ALSO reachable from the install dir. `_write_setup_marker`
+# (bin/heimdall:52) drops a convenience copy of the marker at the LEGACY path
+# $PLUGIN_DIR/.setup-done, and startup MIGRATES any existing legacy marker into a
+# fresh $HEIMDALL_HOME (bin/heimdall:70-72). So the moment ONE scenario completes
+# first-run setup against a WRITABLE $TPLUG, every later scenario is treated as
+# already-set-up: first_run_setup returns immediately (bin/heimdall:579) and the
+# companion/claude-mem code under test never executes — the run "passes" by doing
+# nothing. Scenario 1 dodged this only because $TPLUG was read-only at the time.
+# Any scenario asserting FIRST-RUN behaviour must call this first.
+cold_install_state() { rm -f "$TPLUG/.setup-done"; }
+
 # run_launcher MODE WORKDIR HEIMDALL_HOME STDOUT_CAPTURE PATH — drive the launcher's
 # first-run path UNAUTHENTICATED (no ANTHROPIC_API_KEY, a fresh empty HOME so
 # heimdall_is_authed is false). HEIMDALL_TRACE_ORDER short-circuits before the real
 # `claude … -p`. MODE=notty runs backgrounded with stdin </dev/null (an unguarded
 # prompt would hang); MODE=tty runs under `script`, which allocates a pty so the
-# launcher sees [ -t 0 ] && [ -t 1 ] TRUE. Both run under a 30s watchdog: prints
+# launcher sees [ -t 0 ] && [ -t 1 ] TRUE. Both run under a watchdog: prints
 # "HANG" and returns 124 if the launcher does not finish.
+#
+# WATCHDOG BUDGET: the hazard being guarded is an UNBOUNDED interactive read (a
+# re-introduced `Ok to proceed? (y)`-style prompt), which never returns at all —
+# so the bound only has to be comfortably above a slow-but-progressing run, and
+# generous is strictly safer than tight. 30s was too tight: a full first-run pass
+# measured 40s (non-TTY) / 31s (pty) on a dev box running other suites in
+# parallel, which surfaced as spurious "BLOCKED/hung" failures on scenarios that
+# had in fact completed. 120s is ~3x the measured worst case and still fails fast
+# and decisively on a genuine blocking prompt.
 run_launcher() {
   local mode="$1" wd="$2" hh="$3" out="$4" path="$5" trace; trace="$(mktemp)"
   local pid
@@ -150,7 +181,7 @@ RUN
   while kill -0 "$pid" 2>/dev/null; do
     sleep 0.2
     waited=$((waited + 1))
-    if [ "$waited" -ge 150 ]; then   # 150 * 0.2s = 30s
+    if [ "$waited" -ge 600 ]; then   # 600 * 0.2s = 120s (see WATCHDOG BUDGET above)
       kill -9 "$pid" 2>/dev/null || true
       rm -f "$trace" 2>/dev/null || true
       echo "HANG"
@@ -170,7 +201,7 @@ echo "--------------------------------------------------------------------"
 # ║    ONE invocation completes setup and writes the marker to the USER home.  ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 WD1="$(mktemp -d)"; HOME1="$(mktemp -d)"; HH1="$HOME1/.heimdall"
-rm -f "$TPLUG/.setup-done"                 # genuine cold first run (no legacy marker)
+cold_install_state                          # genuine cold first run (no legacy marker)
 chmod -R a-w "$TPLUG"                       # SIMULATE a root-owned / read-only install dir
 OUT1="$FAKE_DIR/run1.out"
 : > "$CALLS"
@@ -269,12 +300,13 @@ fi
 [ -f "$HH3/setup-done" ] \
   && ok "migration: user-home marker written from the legacy marker" \
   || bad "migration: user-home marker NOT written"
-rm -f "$TPLUG/.setup-done"
+cold_install_state
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║ 5. claude-mem SKIPPED with bun PRESENT but NO TTY (the TTY is required).   ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 WD4="$(mktemp -d)"; HOME4="$(mktemp -d)"; HH4="$HOME4/.heimdall"
+cold_install_state                           # scenario 4 set up an install — start cold again
 OUT4="$FAKE_DIR/run4.out"
 : > "$CALLS"
 HANG4="$(run_launcher notty "$WD4" "$HH4" "$OUT4" "$PATH_BUN")"; RC4=$?  # bun ON path, non-TTY
@@ -284,6 +316,12 @@ if [ "$RC4" -eq 124 ] || [ "$HANG4" = "HANG" ]; then
 else
   ok "bun-present non-TTY run completed (exit $RC4)"
 fi
+# POSITIVE CONTROL — the skip proof below is a NEGATIVE assertion, so it is
+# satisfied just as well by a launcher that short-circuited and did nothing. Prove
+# this run genuinely entered first-run setup before trusting the absence.
+grep -q 'claude plugins install caveman@caveman' "$CALLS" \
+  && ok "bun-present non-TTY run genuinely entered first-run setup (skip proof is not vacuous)" \
+  || bad "bun-present non-TTY run never entered first-run setup — skip proof would be VACUOUS (calls: $(tr '\n' ';' < "$CALLS"))"
 if grep -q 'claude-mem' "$CALLS"; then
   bad "claude-mem invoked with bun present but NO TTY (TTY must be required too)"
 else
@@ -297,6 +335,7 @@ if ! command -v script >/dev/null 2>&1; then
   note "TTY case skipped — 'script' (pty allocator) not on PATH"
 else
   WD5="$(mktemp -d)"; HOME5="$(mktemp -d)"; HH5="$HOME5/.heimdall"
+  cold_install_state                         # scenario 5 set up an install — start cold again
   OUT5="$FAKE_DIR/run5.out"
   : > "$CALLS"
   HANG5="$(run_launcher tty "$WD5" "$HH5" "$OUT5" "$PATH_BUN")"; RC5=$?  # bun + pty
@@ -306,6 +345,13 @@ else
   else
     ok "TTY+bun run completed without blocking (exit $RC5)"
   fi
+  # POSITIVE CONTROL — same reasoning as scenario 5, and this is the exact assertion
+  # that was silently red: a short-circuited launcher records NOTHING, so "no npx
+  # call" looked like a claude-mem regression when the run had simply never reached
+  # first-run setup at all. Fail loudly on that distinction instead of conflating it.
+  grep -q 'claude plugins install caveman@caveman' "$CALLS" \
+    && ok "TTY+bun run genuinely entered first-run setup (claude-mem proof is not vacuous)" \
+    || bad "TTY+bun run never entered first-run setup — claude-mem proof would be VACUOUS (calls: $(tr '\n' ';' < "$CALLS"))"
   if grep -q 'npx --yes claude-mem install' "$CALLS"; then
     ok "claude-mem ATTEMPTED (npx --yes claude-mem install) when TTY + bun both present"
   else
