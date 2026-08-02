@@ -68,6 +68,12 @@ if ! "$PY" -c "import google.cloud.firestore" >/dev/null 2>&1; then
   echo "       cannot be exercised. Install deploy/requirements-firestore.txt to run this gate."
   echo "       NB: the fake-backend firestore suites CANNOT catch this class — that blind spot"
   echo "       is why the prod-empty-roster regression shipped."
+  echo
+  echo "RESULT: SKIPPED (0 assertions ran — this is NOT a pass)"
+  # 0 passed / 0 failed makes the skip VISIBLE to test/run-all.sh as a zero-assertion row.
+  # A silent exit 0 here would be indistinguishable from a gate that actually proved the
+  # pushdown — which is exactly how a vacuous gate hides.
+  printf 'cp-presence-firestore-pushdown: 0 passed, 0 failed (SKIPPED — google-cloud-firestore absent)\n'
   exit 0
 fi
 
@@ -101,16 +107,22 @@ echo "  probe: $OUT"
 echo
 
 if [ "$RC" -ne 0 ]; then
-  echo "  FAIL the pushdown probe crashed (rc=$RC)"; echo; echo "RESULT: FAIL"; exit 1
+  echo "  FAIL the pushdown probe crashed (rc=$RC)"; echo; echo "RESULT: FAIL"
+  printf 'cp-presence-firestore-pushdown: 0 passed, 1 failed\n'
+  exit 1
 fi
 
 # GREEN iff the query is bounded (not the degraded CollectionReference) AND carries >=1 filter.
 if printf '%s' "$OUT" | grep -q "degraded=False" && printf '%s' "$OUT" | grep -qE "n_filters=[1-9]"; then
   echo "  PASS _prefix_query pushes the doc-id RANGE down (bounded Query, doc-id filters present)"
-  echo; echo "RESULT: PASS"; exit 0
+  echo; echo "RESULT: PASS"
+  printf 'cp-presence-firestore-pushdown: 1 passed, 0 failed\n'
+  exit 0
 else
   echo "  FAIL _prefix_query DEGRADED to a full-collection scan (bounded pushdown NOT built) —"
   echo "       the prod-empty-roster / 2-min-hang regression. firestore.FieldPath is absent in"
   echo "       the pinned client; resolve the doc-id path from firestore_v1.field_path instead."
-  echo; echo "RESULT: FAIL"; exit 1
+  echo; echo "RESULT: FAIL"
+  printf 'cp-presence-firestore-pushdown: 0 passed, 1 failed\n'
+  exit 1
 fi

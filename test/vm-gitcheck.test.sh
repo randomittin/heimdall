@@ -212,7 +212,11 @@ awk "BEGIN{exit !($H_WEIGHT > 0 && $H_WEIGHT != 0.99)}" && ok "weight=$H_WEIGHT 
 echo
 if [ "$FAIL" -eq 0 ]; then
   printf '\033[32mALL %d PROOFS PASSED\033[0m\n' "$PASS"
+  # Machine-readable roll-up for test/run-all.sh. Printed LAST on BOTH paths so an
+  # unparseable-but-green suite (indistinguishable from an empty one) is impossible.
+  printf 'vm-gitcheck: %d passed, %d failed\n' "$PASS" "$FAIL"
   exit 0
 fi
 printf '\033[31m%d/%d PROOFS FAILED\033[0m\n' "$FAIL" "$((PASS + FAIL))"
+printf 'vm-gitcheck: %d passed, %d failed\n' "$PASS" "$FAIL"
 exit 1

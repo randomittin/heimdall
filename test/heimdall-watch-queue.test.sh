@@ -229,4 +229,8 @@ fi
 # ── tally ──────────────────────────────────────────────────────────────────────
 echo ""
 echo "$PASS passed,$FAIL failed"
+# The line above lacks the space after the comma, so run-all.sh's
+# `[0-9]+ passed, [0-9]+ failed` regex never matched it and this suite reported
+# UNPARSED. Emit the canonical, prefixed roll-up the runner can actually read.
+echo "heimdall-watch-queue: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
