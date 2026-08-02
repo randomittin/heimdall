@@ -52,7 +52,7 @@ The bot is powered by Heimdall's local engine: a Claude Code plugin that turns o
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/randomittin/heimdall/168646ba9e3ded2b7f1297d0109ac4afc33439d2/install.sh -o heimdall-install.sh \
-  && echo "fafe31e30b481882a43ab93aaab742b1e90b0d4bde31498aa8f58f3f23585b33  heimdall-install.sh" | shasum -a 256 -c - \
+  && echo "28bbdcd333ad36380c6ac1f133b654dc2c719d6773710c224ef7c57c44d84580  heimdall-install.sh" | shasum -a 256 -c - \
   && bash heimdall-install.sh
 ```
 
@@ -64,7 +64,7 @@ digest. Re-derive it yourself any time:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/randomittin/heimdall/168646ba9e3ded2b7f1297d0109ac4afc33439d2/install.sh | shasum -a 256
-# fafe31e30b481882a43ab93aaab742b1e90b0d4bde31498aa8f58f3f23585b33
+# 28bbdcd333ad36380c6ac1f133b654dc2c719d6773710c224ef7c57c44d84580
 ```
 
 No sudo. Idempotent — re-run to upgrade. Reversible:
@@ -77,7 +77,7 @@ hmd uninstall    # removes everything; nothing else was touched
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/randomittin/heimdall/168646ba9e3ded2b7f1297d0109ac4afc33439d2/install.sh -o heimdall-install.sh
-echo "fafe31e30b481882a43ab93aaab742b1e90b0d4bde31498aa8f58f3f23585b33  heimdall-install.sh" | shasum -a 256 -c -
+echo "28bbdcd333ad36380c6ac1f133b654dc2c719d6773710c224ef7c57c44d84580  heimdall-install.sh" | shasum -a 256 -c -
 less heimdall-install.sh  # function-wrapped, no eval, no base64 — what you read is what runs
 bash heimdall-install.sh
 ```
