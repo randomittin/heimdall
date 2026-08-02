@@ -304,6 +304,16 @@ def record_presence(haid, *, project, team_id, handle=None, verdict=None, file=N
                           file=file, ts=ts, activity_ts=activity_ts, branch=branch)
     if not _backend(home).put_record(_record_rel(project, team_id, haid), record):
         return {"ok": False, "reason": "io_error"}
+    # THE ACTIVATION STAMP (server-side, DERIVED — no new client payload, no egress). `verdict`
+    # is ALREADY part of IDENTITY.md's sanctioned heartbeat payload, so writing down the FIRST
+    # one we ever saw from this HAID sends nothing new home; it only records a fact this beat
+    # already delivered. It lands on its OWN durable funnel doc and NOT on the record just
+    # written above, which is last-write-wins (the next beat overwrites it), replaced wholesale
+    # by a retirement tombstone, and the input cp_registry_hygiene reaps — a stamp stored there
+    # would evaporate. Write-once and failure-tolerant: a later verdict never moves the instant,
+    # and a store fault degrades to False rather than failing the heartbeat.
+    import cp_funnel  # lazy — the derived-fact stamp; never a transport, never a call home.
+    cp_funnel.stamp_first_verdict(haid, verdict=verdict, when=record.get("ts"), home=home)
     return {"ok": True, "haid": haid, "project": record.get("project"),
             "team_id": team_id}
 
