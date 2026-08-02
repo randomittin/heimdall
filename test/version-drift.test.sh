@@ -20,6 +20,7 @@
 #   5. _redirects  /install redirect target — release/sync-release.sh
 #   6. install.sh  DEFAULT_REF              — release/ship.sh bump_default_ref
 #   7. the marketing SITE (a SIBLING repo)  — hand-maintained; see below
+#   8. every PINNED INSTALL DIGEST (sha256) — DISCOVERED by shape, never listed; see below
 #
 # Surface 7 is the runheimdall.dev checkout, which is NOT a subdirectory of this repo. Its
 # version strings are hand-typed and nothing gated them, so they drifted three different ways
@@ -35,6 +36,27 @@
 # software's versions in prose (a pinned google-cloud-firestore==2.16.1, superx v1.1.0, the
 # v2.0.5 incident write-up), so this gate asserts the SPECIFIC version-bearing fields listed
 # above rather than sweeping every semver on the page.
+#
+# Surface 8 is a DIFFERENT defect class from 1-7: not a version that drifted, but a sha256
+# that no longer describes the bytes it is printed next to. The published install command is
+# an `&&` chain — curl → `shasum -a 256 -c -` → bash — so a wrong digest does not degrade the
+# install, it ABORTS it: `shasum -c` prints FAILED and nothing after the `&&` ever runs. That
+# shipped. README.md pinned fafe31e3… for an install.sh that really hashes to 28bbdcd…, so the
+# primary install path advertised on the repo's front page was dead while every check above
+# stayed green — and heimdall-site/netlify.toml carried the CORRECT digest at the same moment,
+# so the two published surfaces contradicted each other and nothing noticed.
+#
+# Digest surfaces are therefore DISCOVERED BY SHAPE — an exactly-64-char hex token within
+# DIGEST_WINDOW lines of a raw.githubusercontent install URL — and never from a hardcoded file
+# list. A hardcoded list is the mechanism of the original defect: README.md would have been on
+# it; netlify.toml and llms-full.txt would not. Two independent assertions run per discovery:
+#   (a) CROSS-SURFACE — every digest pinned against the same ref must be identical. Pure string
+#       comparison: no network, no git, catches the shipped defect on a plane.
+#   (b) DIGEST↔BYTES  — each digest must equal the real sha256 of install.sh at the ref its own
+#       URL fetches. Resolved OFFLINE from local git objects when the ref is in the checkout
+#       (works in CI, offline, and when GitHub is rate-limited); a bounded network fetch is the
+#       fallback ONLY for a ref this checkout does not have. An unreachable network yields a
+#       loud SKIP that earns no PASS — never a quiet green.
 #
 # R6: this gate ships with a corrupt-and-confirm proof — `--self-test` plants a drift in a
 # THROWAWAY copy of the repo, asserts the gate reports it, and restores nothing (the copy is
@@ -67,6 +89,51 @@ if [ "${1:-}" = "--self-test" ]; then
   set_version() {
     sed 's/"version"[[:space:]]*:[[:space:]]*"[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*"/"version": "'"$2"'"/' "$1" > "$1.mut" \
       && mv "$1.mut" "$1"
+  }
+
+  # ── Fixture for the digest mutants (surface 8) ─────────────────────────────
+  # A digest mutant only proves something if the fixture it perturbs was CORRECT first:
+  # mutating an already-drifted pin would "go red" with the mutation removed. TRUE_DIGEST is
+  # the real sha256 of install.sh at $SELF_TAG, resolved exactly the way the gate resolves it.
+  SELF_OWNER="$(bash "$SELF_DIR/version-drift.test.sh" --list-digests 2>/dev/null | awk -F'|' 'NF{print $3; exit}')"
+  TRUE_DIGEST=""
+  if git -C "$REPO" cat-file -e "$SELF_TAG:install.sh" 2>/dev/null; then
+    TRUE_DIGEST="$(git -C "$REPO" show "$SELF_TAG:install.sh" 2>/dev/null | shasum -a 256 | awk '{print $1}')"
+  elif [ -n "$SELF_OWNER" ]; then
+    SELF_FETCH="$(mktemp)"
+    curl -fsSL --max-time 15 -o "$SELF_FETCH" \
+      "https://raw.githubusercontent.com/$SELF_OWNER/heimdall/$SELF_TAG/install.sh" 2>/dev/null \
+      && TRUE_DIGEST="$(shasum -a 256 "$SELF_FETCH" | awk '{print $1}')"
+    rm -f "$SELF_FETCH"
+  fi
+  if [ -z "$TRUE_DIGEST" ] || [ -z "$SELF_OWNER" ]; then
+    echo "  ✗ SELF-TEST CANNOT RUN: $SELF_TAG:install.sh is not in this checkout and the network is unreachable — the digest mutants need the real bytes to mutate away from" >&2
+    exit 1
+  fi
+
+  # normalize_digests <root> — repoint every discovered repo-side install URL at $SELF_TAG
+  # and rewrite every pinned digest to that tag's true hash, yielding a fixture that is
+  # correct by construction. The file list comes from the gate's OWN --list-digests, so a
+  # newly added digest surface is normalised automatically instead of quietly falling out
+  # of this proof the day someone adds one.
+  normalize_digests() {
+    local root="$1" rel f
+    while IFS= read -r rel; do
+      [ -n "$rel" ] || continue
+      f="$root/$rel"
+      [ -f "$f" ] || continue
+      sed -e "s#\(raw\.githubusercontent\.com/[^/]*/heimdall/\)[^/]*\(/install\.sh\)#\1$SELF_TAG\2#g" \
+          -e "s#[0-9a-fA-F]\{64\}#$TRUE_DIGEST#g" "$f" > "$f.norm" && mv "$f.norm" "$f"
+    done <<NORM
+$(VERSION_DRIFT_REPO="$root" HEIMDALL_SITE_DIR="$NO_SITE" bash "$SELF_DIR/version-drift.test.sh" --list-digests 2>/dev/null | awk -F'|' 'NF&&$4=="repo"{print $5}' | sort -u)
+NORM
+  }
+
+  # A pristine throwaway repo that is green before anything is planted, so a red can only
+  # be attributable to the mutation planted after it.
+  fresh_copy() {
+    cp -R "$REPO/." "$TMP/" 2>/dev/null
+    normalize_digests "$TMP"
   }
 
   # assert_red <label> <expected-substring> — require BOTH a non-zero exit AND the
@@ -105,7 +172,7 @@ if [ "${1:-}" = "--self-test" ]; then
   echo "version-drift --self-test: asserting the gate goes RED on planted drift"
 
   # Mutant 1 — the SINGLE SOURCE itself moves. Every rendered surface must disagree.
-  cp -R "$REPO/." "$TMP/" 2>/dev/null
+  fresh_copy
   set_version "$TMP/.claude-plugin/plugin.json" 9.9.9
   assert_red "plugin.json .version=9.9.9" "VERSION drift"
 
@@ -113,14 +180,14 @@ if [ "${1:-}" = "--self-test" ]; then
   # 2.0.5 while the manifest was current, so `npx runheimdall` fetched a months-stale
   # installScriptUrl and installed a months-stale Heimdall with nothing red. This is
   # the regression that actually happened in production; it stays in the proof set.
-  cp -R "$REPO/." "$TMP/" 2>/dev/null
+  fresh_copy
   set_version "$TMP/packages/runheimdall/package.json" 2.0.5
   assert_red "runheimdall package.json .version=2.0.5" "runheimdall package.json drift"
 
   # Mutants 3+4 — the SITE block, both directions. A site surface that is never proven
   # able to go red is exactly how the site drifted to v2.0.16 unnoticed. proof.html (not
   # index.html) carries the planted tag so ONLY the meta assertion is in play.
-  cp -R "$REPO/." "$TMP/" 2>/dev/null
+  fresh_copy
   MUT_SITE="$SITE_TMP"
   printf '<meta name="heimdall-version" content="v0.0.1">\n' > "$SITE_TMP/proof.html"
   assert_red "site meta heimdall-version=v0.0.1" "site meta heimdall-version drift"
@@ -132,7 +199,147 @@ if [ "${1:-}" = "--self-test" ]; then
   MUT_SITE="$NO_SITE"
   assert_green "no site checkout (skipped, not failed)"
 
+  # ── Digest mutants (surface 8) ──────────────────────────────────────────────
+
+  # Mutant 6 — ONE character of a published digest is wrong. That is not a cosmetic typo:
+  # `shasum -c` prints FAILED, the `&&` chain stops, and the advertised install is dead.
+  fresh_copy
+  MUT_SITE="$NO_SITE"
+  # Remap only the first nibble through a fixed permutation — every hex char maps to a
+  # different one, so the result is always a well-formed digest that always differs.
+  BENT_DIGEST="$(printf '%s' "$TRUE_DIGEST" | cut -c1 | tr '0123456789abcdef' '1234567890badcfe')$(printf '%s' "$TRUE_DIGEST" | cut -c2-)"
+  sed "s#$TRUE_DIGEST#$BENT_DIGEST#g" "$TMP/README.md" > "$TMP/README.md.mut" \
+    && mv "$TMP/README.md.mut" "$TMP/README.md"
+  assert_red "README install digest bent by one character" "does NOT match the bytes it claims to describe"
+
+  # Mutant 7 — two WELL-FORMED surfaces pinning different digests for the same ref. This is
+  # the shipped defect's exact shape (README.md vs heimdall-site/netlify.toml), and it is
+  # caught with no network and no git: string comparison across discovered surfaces alone.
+  fresh_copy
+  MUT_SITE="$SITE_TMP"
+  OTHER_DIGEST="$(printf '%s' "$TRUE_DIGEST" | tr '0123456789abcdef' '1234567890badcfe')"
+  { printf '<meta name="heimdall-version" content="%s">\n' "$SELF_TAG"
+    printf 'curl -fsSL https://raw.githubusercontent.com/%s/heimdall/%s/install.sh -o heimdall-install.sh\n' "$SELF_OWNER" "$SELF_TAG"
+    printf 'echo "%s  heimdall-install.sh" | shasum -a 256 -c -\n' "$OTHER_DIGEST"
+  } > "$SITE_TMP/proof.html"
+  assert_red "two surfaces pinning different digests for $SELF_TAG" "DISAGREEMENT"
+
+  # Mutant 8 — THE DEFECT THAT SHIPPED, byte for byte. README.md pinned this digest while the
+  # install.sh it pointed at really hashed to something else, so the front-page install
+  # aborted at `shasum -c` and every version gate stayed green through it. Permanent.
+  fresh_copy
+  MUT_SITE="$NO_SITE"
+  SHIPPED_BAD_DIGEST="fafe31e30b481882a43ab93aaab742b1e90b0d4bde31498aa8f58f3f23585b33"
+  sed "s#$TRUE_DIGEST#$SHIPPED_BAD_DIGEST#g" "$TMP/README.md" > "$TMP/README.md.mut" \
+    && mv "$TMP/README.md.mut" "$TMP/README.md"
+  assert_red "the shipped defect: README pins $SHIPPED_BAD_DIGEST" "pinned $SHIPPED_BAD_DIGEST, actual"
+
+  # Mutant 9 — the anti-vacuous guard. Strip every pinned digest and the sweep must FAIL,
+  # not sail through green because it had nothing left to assert over.
+  fresh_copy
+  MUT_SITE="$NO_SITE"
+  while IFS= read -r void_rel; do
+    [ -n "$void_rel" ] || continue
+    sed "s#[0-9a-fA-F]\{64\}#DIGEST-REMOVED#g" "$TMP/$void_rel" > "$TMP/$void_rel.mut" \
+      && mv "$TMP/$void_rel.mut" "$TMP/$void_rel"
+  done <<VOID
+$(VERSION_DRIFT_REPO="$TMP" HEIMDALL_SITE_DIR="$NO_SITE" bash "$SELF_DIR/version-drift.test.sh" --list-digests 2>/dev/null | awk -F'|' 'NF&&$4=="repo"{print $5}' | sort -u)
+VOID
+  assert_red "every pinned digest removed" "VACUOUS"
+
   echo "version-drift --self-test: PASS"
+  exit 0
+fi
+
+# ── Pinned-install-digest discovery (surface 8) ───────────────────────────────
+# How close a 64-hex token has to sit to an install URL to be read as that URL's digest.
+# The published snippets put them 1 line apart; netlify.toml comments the digest 3 lines
+# above the redirect. 8 covers every real layout without reaching across unrelated prose.
+DIGEST_WINDOW=8
+DIGEST_RECORDS=""
+DIGEST_N=0
+
+# scan_one_file <scope> <relpath> <abspath>
+# Appends "ref|digest|owner|scope|relpath|line" for each 64-hex token near an install URL.
+scan_one_file() {
+  local scope="$1" rel="$2" f="$3"
+  local urls dl dline dtext dg ul uline urest uo ur best bestd uown d
+  # Both shapes must be present or this file cannot pin a digest to a URL.
+  grep -qE '[0-9a-fA-F]{64}' "$f" 2>/dev/null || return 0
+  grep -qE 'raw\.githubusercontent\.com/[^/]+/heimdall/[^/]+/install\.sh' "$f" 2>/dev/null || return 0
+
+  # "line|owner|ref" for every install URL in the file.
+  urls="$(grep -noE 'raw\.githubusercontent\.com/[^/]+/heimdall/[^/]+/install\.sh' "$f" 2>/dev/null \
+          | sed -n 's#^\([0-9][0-9]*\):raw\.githubusercontent\.com/\([^/]*\)/heimdall/\([^/]*\)/install\.sh$#\1|\2|\3#p')"
+  [ -n "$urls" ] || return 0
+
+  while IFS= read -r dl; do
+    [ -n "$dl" ] || continue
+    dline="${dl%%:*}"
+    dtext="${dl#*:}"
+    # Tokenise on non-hex so a 65+ hex run can never yield a bogus 64-char "digest",
+    # and so two digests on one line are both seen.
+    while IFS= read -r dg; do
+      [ -n "$dg" ] || continue
+      dg="$(printf '%s' "$dg" | tr 'ABCDEF' 'abcdef')"
+      best=""; bestd=-1; uown=""
+      while IFS= read -r ul; do
+        [ -n "$ul" ] || continue
+        uline="${ul%%|*}"; urest="${ul#*|}"; uo="${urest%%|*}"; ur="${urest#*|}"
+        d=$((dline - uline)); [ "$d" -lt 0 ] && d=$((0 - d))
+        if [ "$bestd" -lt 0 ] || [ "$d" -lt "$bestd" ]; then bestd="$d"; best="$ur"; uown="$uo"; fi
+      done <<INNER
+$urls
+INNER
+      [ "$bestd" -ge 0 ] && [ "$bestd" -le "$DIGEST_WINDOW" ] || continue
+      DIGEST_RECORDS="${DIGEST_RECORDS}${best}|${dg}|${uown}|${scope}|${rel}|${dline}
+"
+      DIGEST_N=$((DIGEST_N+1))
+    done <<TOKENS
+$(printf '%s\n' "$dtext" | tr -c '0-9a-fA-F' '\n' | grep -xE '[0-9a-fA-F]{64}')
+TOKENS
+  done <<LINES
+$(grep -nE '[0-9a-fA-F]{64}' "$f" 2>/dev/null)
+LINES
+}
+
+# discover_digests <scope> <root>
+# Dot-directories are pruned for the reason the site sweep already prunes them (.planning
+# archives incident write-ups pinned to dead tags — history, not drift). `test`/`tests` are
+# pruned because gate FIXTURES carry deliberately-wrong digests, including this file's own
+# historical-defect mutant; scanning them would gate the fixtures instead of the product.
+discover_digests() {
+  local scope="$1" root="$2" f rel
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    rel="${f#$root/}"
+    scan_one_file "$scope" "$rel" "$f"
+  done <<FILES
+$(find "$root" \
+    -type d \( -name '.?*' -o -name 'node_modules' -o -name 'test' -o -name 'tests' \) -prune -o \
+    -type f \( -name '*.md' -o -name '*.txt' -o -name '*.json' -o -name '*.toml' \
+            -o -name '*.html' -o -name '*.js' -o -name '*.sh' -o -name '*.yml' \
+            -o -name '*.yaml' \) -print 2>/dev/null | sort)
+FILES
+}
+
+# run_digest_discovery <site-dir>
+run_digest_discovery() {
+  local site="$1"
+  DIGEST_RECORDS=""; DIGEST_N=0
+  discover_digests repo "$REPO"
+  [ -d "$site" ] && discover_digests site "$(cd "$site" && pwd)"
+  return 0
+}
+
+digest_records() { printf '%s' "$DIGEST_RECORDS"; }
+
+# --list-digests: the discovery result, machine-readable. `--self-test` consumes this to
+# build its fixture, so a newly added digest surface is picked up by the proof automatically
+# instead of silently falling out of it.
+if [ "${1:-}" = "--list-digests" ]; then
+  run_digest_discovery "${HEIMDALL_SITE_DIR:-$REPO/../heimdall-site}"
+  digest_records
   exit 0
 fi
 
@@ -364,6 +571,75 @@ EOF
   # one — the same shape of false green that let the site drift in the first place.
   [ "$SITE_CHECKED" -eq 0 ] \
     && bad "site present at $HEIMDALL_SITE_DIR but ZERO version-bearing fields found — vacuous sweep, not a clean one"
+fi
+
+# ── 8. Pinned install digests — the sha256 must describe the bytes it sits next to ──
+run_digest_discovery "$HEIMDALL_SITE_DIR"
+
+DIGEST_COMPARED=0
+DIGEST_SKIPPED=0
+
+if [ "$DIGEST_N" -eq 0 ]; then
+  # Discovering nothing is the same false green that let the digest drift: a sweep that
+  # asserts over an empty set passes for free.
+  bad "ZERO pinned install digests discovered under $REPO — the digest sweep is VACUOUS, not clean (looked for a 64-hex token within $DIGEST_WINDOW lines of a raw.githubusercontent .../heimdall/<ref>/install.sh URL)"
+else
+  DIGEST_FILES="$(digest_records | awk -F'|' 'NF{print $4":"$5}' | sort -u | grep -c .)"
+  echo "  install digests: $DIGEST_N pin(s) discovered across $DIGEST_FILES file(s)"
+  digest_records | awk -F'|' 'NF{printf "    %s:%s:%s  %s…  ref=%s\n", $4, $5, $6, substr($2,1,12), $1}'
+
+  for dref in $(digest_records | awk -F'|' 'NF{print $1}' | sort -u); do
+    DREF_DIGESTS="$(digest_records | awk -F'|' -v r="$dref" 'NF&&$1==r{print $2}' | sort -u)"
+    DREF_COUNT="$(printf '%s\n' "$DREF_DIGESTS" | grep -c .)"
+
+    # (a) CROSS-SURFACE — offline, string-only. This alone catches the shipped defect:
+    # README said fafe31e3… while netlify.toml said 28bbdcd… for the same install.sh.
+    if [ "$DREF_COUNT" -gt 1 ]; then
+      bad "pinned install digest DISAGREEMENT for ref $dref — $DREF_COUNT different digests describe the SAME file; at most one can be right and every surface pinning the others aborts the install:"
+      digest_records | awk -F'|' -v r="$dref" 'NF&&$1==r{printf "         %s  at %s:%s:%s\n", $2, $4, $5, $6}' | sort -u
+    else
+      ok "pinned install digests agree across all surfaces for ref $dref ($DREF_DIGESTS)"
+    fi
+
+    # (b) DIGEST↔BYTES — local git objects first: offline, immune to rate limits, and the
+    # blob at a given ref is content-addressed, so it is byte-identical to what the URL serves.
+    DACTUAL=""; DSRC=""
+    if git -C "$REPO" cat-file -e "$dref:install.sh" 2>/dev/null; then
+      DACTUAL="$(git -C "$REPO" show "$dref:install.sh" 2>/dev/null | shasum -a 256 | awk '{print $1}')"
+      DSRC="local git $dref:install.sh, offline"
+    else
+      DOWNER="$(digest_records | awk -F'|' -v r="$dref" 'NF&&$1==r{print $3; exit}')"
+      DURL="https://raw.githubusercontent.com/$DOWNER/heimdall/$dref/install.sh"
+      DTMP="$(mktemp)"
+      # -o + exit status, never `curl | shasum`: a failed pipe would hash EMPTY input to a
+      # perfectly valid sha256 and quietly compare it, which is a green built out of nothing.
+      if curl -fsSL --max-time 15 -o "$DTMP" "$DURL" 2>/dev/null; then
+        DACTUAL="$(shasum -a 256 "$DTMP" | awk '{print $1}')"
+        DSRC="network fetch $DURL"
+      fi
+      rm -f "$DTMP"
+    fi
+
+    if [ -z "$DACTUAL" ]; then
+      printf '  \033[33mSKIP\033[0m %s\n' "digest↔bytes for ref $dref: not in this checkout AND unreachable over the network — NOT verified, and NOT counted as a pass"
+      DIGEST_SKIPPED=$((DIGEST_SKIPPED+1))
+      continue
+    fi
+
+    for ddig in $DREF_DIGESTS; do
+      DIGEST_COMPARED=$((DIGEST_COMPARED+1))
+      if [ "$ddig" = "$DACTUAL" ]; then
+        ok "pinned digest matches the real install.sh at $dref [$DSRC]"
+      else
+        bad "pinned install digest does NOT match the bytes it claims to describe at ref $dref: pinned $ddig, actual $DACTUAL [$DSRC] — the published \`shasum -a 256 -c -\` prints FAILED and the && chain aborts the install before it runs:"
+        digest_records | awk -F'|' -v r="$dref" -v d="$ddig" 'NF&&$1==r&&$2==d{printf "         pinned at %s:%s:%s\n", $4, $5, $6}'
+      fi
+    done
+  done
+
+  # An unreachable network must never be the reason this section looks clean.
+  [ "$DIGEST_COMPARED" -eq 0 ] \
+    && bad "$DIGEST_N pinned digest(s) discovered but NONE could be checked against real bytes ($DIGEST_SKIPPED ref(s) unresolvable offline and unreachable over the network) — an unverifiable digest sweep is not a green one"
 fi
 
 echo ""
