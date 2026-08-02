@@ -27,10 +27,15 @@ TRACKER="$PLUGIN_DIR/bin/edit-tracker"
 
 # Rebuild when missing OR stale: a binary older than its source may predate
 # `status`, which would make every run look NON-VERIFIED.
+# Progress/diagnostics go to STDERR, never stdout: `--json` promises a stdout
+# that is nothing but the payload. Prepending build chatter produced
+# `edit-tracker not built or stale. Building...{ "verdict": ... }`, which no
+# strict parser accepts — so a machine that happened to rebuild the tracker
+# silently lost its downstream stub gate.
 if [ ! -x "$TRACKER" ] || [ "$PLUGIN_DIR/bin/edit-tracker.c" -nt "$TRACKER" ]; then
-  echo "edit-tracker not built or stale. Building..."
+  echo "edit-tracker not built or stale. Building..." >&2
   clang -O2 -Wall -Wextra -o "$TRACKER" "$PLUGIN_DIR/bin/edit-tracker.c" 2>/dev/null || {
-    echo "Build failed. Run: clang -O2 -Wall -Wextra -o bin/edit-tracker bin/edit-tracker.c"
+    echo "Build failed. Run: clang -O2 -Wall -Wextra -o bin/edit-tracker bin/edit-tracker.c" >&2
     exit 1
   }
 fi
@@ -64,11 +69,10 @@ if [ "$ledger_present" -eq 0 ]; then
     echo "  \"files_edited\": null,"
     echo "  \"checks_passed\": 0,"
     echo "  \"checks_failed\": 0,"
-    # warnings=1 is load-bearing: downstream receipt gates (bin/summary-card)
-    # only redden on verdict=="FAIL" or warnings>0. Without it, a run that
-    # verified NOTHING would render as a green gate — the same false-green,
-    # one layer up.
-    echo "  \"warnings\": 1,"
+    # Zero warnings is the truth: nothing was checked, so nothing warned. The
+    # receipt gate keys on verdict=="NON_VERIFIED" directly, so this field no
+    # longer has to carry a tripwire value to keep downstream honest.
+    echo "  \"warnings\": 0,"
     echo "  \"paths\": []"
     echo "}"
     exit 2
@@ -93,6 +97,21 @@ fi
 
 paths=$("$TRACKER" paths 2>/dev/null || true)
 if [ -z "$paths" ]; then
+  # Ledger PRESENT + zero entries => the session genuinely made no edits: a real
+  # pass. Under --json that must still be a JSON payload — this is the most-hit
+  # --json path (every read-only / planning session), and prose here left the
+  # receipt's stub gate unparseable on most real runs.
+  if [ "$MODE" = "--json" ]; then
+    echo "{"
+    echo "  \"files_edited\": 0,"
+    echo "  \"checks_passed\": 0,"
+    echo "  \"checks_failed\": 0,"
+    echo "  \"warnings\": 0,"
+    echo "  \"verdict\": \"PASS\","
+    echo "  \"paths\": []"
+    echo "}"
+    exit 0
+  fi
   echo "[heimdall] verify-edits: No edits tracked this session (ledger present, 0 edits)."
   exit 0
 fi

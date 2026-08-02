@@ -178,12 +178,80 @@ OUT_MISS="$(HEIMDALL_RECEIPT_ORACLE_DIR="$EMPTY" HEIMDALL_RECEIPT_CORPUS_STATUS=
   HEIMDALL_RECEIPT_REUSE_DIR="$EMPTY" HEIMDALL_RECEIPT_PONYTAIL="$EMPTY/none.jsonl" \
   HEIMDALL_RECEIPT_HOLDOUT_JSON="$EMPTY/none.json" HEIMDALL_RECEIPT_WHO="rj.mbp" \
   "$CARD" --receipt "$EMPTY" 2>&1)" || rc=$?
-[ "$rc" -eq 0 ] && ok "missing every source → exit 0 (no crash)" \
-  || bad "receipt crashed on missing sources (rc=$rc)"
+# FAIL CLOSED: with every source missing, NO gate could be reached. That is the
+# textbook "we could not verify" run, so it exits 2 — the same verdict code a
+# NON_VERIFIED gate yields. It formerly exited 0, which told a scripted caller
+# "nothing held back" about a run where nothing was ever checked.
+# The contract this assertion really protects is "renders a VERDICT, never
+# crashes": pinning the exact code is strictly stronger than accepting any 0.
+[ "$rc" -eq 2 ] && ok "missing every source → exit 2 (fail closed, no crash)" \
+  || bad "missing-source receipt: want exit 2 (unverified), got rc=$rc"
 echo "$OUT_MISS" | grep -q "HEIMDALL RUN RECEIPT" && ok "box still drawn with all sources absent" \
   || bad "no box drawn on missing sources"
 echo "$OUT_MISS" | strip_ansi | grep -qE "n/a|—" && ok "absent rows degrade to n/a/dash (never faked)" \
   || bad "degraded rows not honest: $OUT_MISS"
+echo "$OUT_MISS" | strip_ansi | grep -q "nothing shipped unproven" \
+  && bad "zero gates ran yet the Bifrost opened — vacuous green" \
+  || ok "zero gates ran → Bifrost does NOT open"
+# ...and it says WHICH kind of closed: nothing ran at all is a distinct fact from
+# "one gate of several could not verify". That distinction is what the old
+# "— no gates ran" copy carried, and it is preserved — now as a CLOSED verdict.
+echo "$OUT_MISS" | strip_ansi | grep -q "no gate could verify" \
+  && ok "zero gates ran → copy says 'no gate could verify' (distinct wording kept)" \
+  || bad "lost the all-unverified wording: $(echo "$OUT_MISS" | strip_ansi | grep -i bif)"
+
+# ── 4b. THE FALSE-GREEN VECTOR: an UNPARSEABLE stub payload with every OTHER
+#       gate green. This is the case bin/verify-edits' --json build-chatter bug
+#       made reachable in production: falsify + corpus green, the stub payload
+#       merely unreadable, and the receipt shipped "✓ OPEN — nothing shipped
+#       unproven" for a run whose stub gate was never reached.
+#       "We could not reach the verifier" must NEVER render as OPEN.
+SGATE_JUNK="$WORK/sgate-unparseable.json"
+# byte-for-byte the shape the build-chatter bug produced: prose, then the payload.
+printf '%s' 'edit-tracker not built or stale. Building...{"verdict":"PASS","warnings":0}' > "$SGATE_JUNK"
+render_rc_junk=0
+OUT_JUNK="$(SGATE="$SGATE_JUNK" render "$HOLDOUT_EST")" || render_rc_junk=$?
+OUT_JUNK="$(printf '%s\n' "$OUT_JUNK" | strip_ansi)"
+echo "$OUT_JUNK" | grep -q "falsify 2/2=1.0" && ok "unparseable stub: other gates ARE green (vector is live)" \
+  || bad "fixture wrong — other gates not green, 4b proves nothing"
+echo "$OUT_JUNK" | grep -q "stub$GC" && bad "unparseable stub rendered the GREEN check" \
+  || ok "unparseable stub never renders the green check"
+echo "$OUT_JUNK" | grep -q "nothing shipped unproven" \
+  && bad "FALSE-GREEN: unparseable stub + green gates → Bifrost OPEN" \
+  || ok "unparseable stub + green gates → Bifrost is NOT OPEN"
+echo "$OUT_JUNK" | grep -qi "CLOSED" && ok "unparseable stub CLOSES the Bifrost" \
+  || bad "unparseable stub left the Bifrost open: $(echo "$OUT_JUNK" | grep -i bif)"
+echo "$OUT_JUNK" | grep -q "could not verify" \
+  && ok "unparseable stub reads as 'could not verify' (not a red gate)" \
+  || bad "unparseable stub mislabelled: $(echo "$OUT_JUNK" | grep -i bif)"
+echo "$OUT_JUNK" | grep -q "is red, held back" \
+  && bad "unparseable stub mislabelled as a RED gate (we never checked)" \
+  || ok "unparseable stub is NOT mislabelled as a failure"
+[ "$render_rc_junk" -eq 2 ] && ok "unparseable stub → exit 2 (could-not-verify code)" \
+  || bad "unparseable stub exit want 2, got $render_rc_junk"
+# The label still distinguishes the two unverified MODES: "stub?" = verify-edits
+# ran and reported NON_VERIFIED; "stub n/a" = we never got a verdict out of it.
+# Matched on the "stub n" prefix: the GATES row is width-capped at 40 cols, so a
+# full-width row renders the tail as "stub n…" — asserting the whole "n/a" here
+# would be testing the truncator, not the label.
+echo "$OUT_JUNK" | grep -qE "stub n" && ok "unparseable stub keeps the n/a label (mode stays legible)" \
+  || bad "lost the n/a label: $(echo "$OUT_JUNK" | grep -i gates)"
+echo "$OUT_JUNK" | grep -q "stub?" && bad "unparseable stub mislabelled 'stub?' (that means a NON_VERIFIED verdict)" \
+  || ok "unparseable stub not confused with a NON_VERIFIED verdict ('stub?')"
+
+# 4c. A COMPLETELY ABSENT stub payload behaves identically — "no payload at all"
+# and "payload we cannot read" are ONE fact: no verdict was obtained. The sole
+# --receipt caller is the SessionEnd hook (a real run); bin/heimdall-demo and
+# bin/heimdall-reel call the card WITHOUT --receipt, so no demo path renders a
+# Bifrost row and none can be turned CLOSED by this.
+render_rc_gone=0
+OUT_GONE="$(SGATE="$WORK/does-not-exist.json" render "$HOLDOUT_EST")" || render_rc_gone=$?
+OUT_GONE="$(printf '%s\n' "$OUT_GONE" | strip_ansi)"
+echo "$OUT_GONE" | grep -q "nothing shipped unproven" \
+  && bad "FALSE-GREEN: absent stub payload + green gates → Bifrost OPEN" \
+  || ok "absent stub payload + green gates → Bifrost is NOT OPEN"
+[ "$render_rc_gone" -eq 2 ] && ok "absent stub payload → exit 2 (same as unparseable)" \
+  || bad "absent stub payload exit want 2, got $render_rc_gone"
 
 # ── 5. Pipe/CI mode is ANSI-clean (no raw escape codes) ───────────────────────
 PIPED="$(render "$HOLDOUT_EST" | cat)"

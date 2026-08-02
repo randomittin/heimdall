@@ -498,14 +498,18 @@ print("%d %d"%(p,t))
   # stub — verify-edits --json. THREE verdicts, never two:
   #   NON_VERIFIED → the session edit ledger was absent, so nothing was checked.
   #                  Neither a pass nor a failure: "stub?" in warn colour, and it
-  #                  CLOSES the Bifröst. Keyed on the VERDICT alone — verify-edits
-  #                  also ships a warnings:1 value on that payload to trip the old
-  #                  `warnings>0` path, but this gate does not read it and stays
-  #                  correct if that value is ever dropped.
+  #                  CLOSES the Bifröst. Keyed on the VERDICT alone, so it stays
+  #                  correct no matter what the payload's `warnings` field says.
   #   FAIL, or warnings>0 → verification ran and found a real problem: "stub✗", red.
   #   anything else       → verification ran and the edits check out: "stub✓", green.
-  # "stub n/a" (dim) stays reserved for a DIFFERENT thing: no payload at all
-  # (verify-edits absent or its output unparseable).
+  # "stub n/a" (dim) marks a DIFFERENT unverified mode: no verdict was obtained at
+  # all — verify-edits absent, or its output unreadable. The label distinguishes
+  # the mode; the VERDICT is the same as NON_VERIFIED, because both mean the gate
+  # was never reached. Fail closed: "we could not run the verifier" must not
+  # render as proof. Absent and unparseable are ONE fact and are not split — the
+  # only --receipt caller is the SessionEnd hook (a real run); heimdall-demo and
+  # heimdall-reel invoke the card WITHOUT --receipt, so no demo renders a Bifröst
+  # row and none can be turned CLOSED by this.
   local sgate_json="" sg_src="${HEIMDALL_RECEIPT_STUB_JSON:-}"
   if [ -n "$sg_src" ]; then
     [ -f "$sg_src" ] && sgate_json="$(cat "$sg_src" 2>/dev/null)"
@@ -535,7 +539,8 @@ print("%s %s"%(d.get("warnings",-1), d.get("verdict","")))
       fi
     fi
   else
-    nf_seg_p="stub n/a"; nf_col="${rD}${nf_seg_p}${rR}"
+    # No verdict obtained → the gate did not run. Same standing as NON_VERIFIED.
+    nf_seg_p="stub n/a"; nf_col="${rD}${nf_seg_p}${rR}"; gates_unverified=1
   fi
   local gates_plain="${f_seg_p} · ${c_seg_p} · ${nf_seg_p}"
   local gates_col="${f_col}${rD} · ${rR}${c_col}${rD} · ${rR}${nf_col}"
@@ -544,19 +549,27 @@ print("%s %s"%(d.get("warnings",-1), d.get("verdict","")))
   # Precedence: RED beats UNVERIFIED beats OPEN. Both closed states hold the run
   # back, but the copy says WHICH — "is red" (we checked, it's broken) is a
   # different fact from "could not verify" (we never got to check).
-  local bi_plain bi_col
+  local bi_plain bi_col bi_why
   if [ "$gates_red" = 1 ]; then
     bi_plain="✗ CLOSED — a gate is red, held back"
     bi_col="${rRED}${rB}✗ CLOSED${rR}${rRED} — a gate is red, held back${rR}"
-  elif [ "$gates_unverified" = 1 ]; then
-    bi_plain="✗ CLOSED — a gate could not verify"
-    bi_col="${rW}${rB}✗ CLOSED${rR}${rW} — a gate could not verify${rR}"
-  elif [ "$gates_ran" = 1 ]; then
+  elif [ "$gates_unverified" = 1 ] || [ "$gates_ran" != 1 ]; then
+    # The `gates_ran != 1` half is an invariant guard on the OPEN branch below:
+    # a run in which not one gate ran is not "clean", it is unverified, and must
+    # never fall through to OPEN. No current input reaches it — the stub gate is
+    # unconditional and always sets gates_ran or gates_unverified — so it is
+    # defence in depth, not a covered behaviour. It is a branch CONDITION rather
+    # than a bare statement so the OPEN case is protected by construction.
+    gates_unverified=1
+    # Keep the distinction the old "no gates ran" copy carried: one gate of
+    # several being unreachable is a different fact from none running at all.
+    if [ "$gates_ran" = 1 ]; then bi_why="a gate could not verify"
+    else                          bi_why="no gate could verify"; fi
+    bi_plain="✗ CLOSED — ${bi_why}"
+    bi_col="${rW}${rB}✗ CLOSED${rR}${rW} — ${bi_why}${rR}"
+  else
     bi_plain="✓ OPEN — nothing shipped unproven"
     bi_col="${rG}${rB}✓ OPEN${rR}${rG} — nothing shipped unproven${rR}"
-  else
-    bi_plain="— no gates ran"
-    bi_col="${rD}${bi_plain}${rR}"
   fi
 
   # ══ ROW 5 · LEANER — LOC ladder delta (ponytail A/B) · reuse score ══

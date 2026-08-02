@@ -98,13 +98,78 @@ case "$jout" in
   *'"verdict": "PASS"'*) bad "ABSENT ledger: --json claims PASS" ;;
   *) ok "ABSENT ledger: --json never claims PASS" ;;
 esac
-# bin/summary-card reddens its stub gate on verdict=="FAIL" OR warnings>0.
-# NON_VERIFIED is deliberately not FAIL, so warnings must carry the signal or
-# the receipt renders a green gate for a run that verified nothing.
+# The REAL contract, not the old warnings>0 workaround. bin/summary-card now
+# branches on verdict=="NON_VERIFIED" BEFORE any warnings test, so the payload
+# no longer has to smuggle a magic warnings:1 tripwire to keep the receipt
+# honest. Asserting on `warnings` would re-encode that workaround; assert the
+# contract instead — the verdict drives it, end to end, for ANY warnings value.
 case "$jout" in
-  *'"warnings": 1'*) ok "ABSENT ledger: --json warnings>0 keeps receipt gates red" ;;
-  *) bad "ABSENT ledger: --json warnings would let a receipt show a green gate" ;;
+  *'"warnings": 0'*) ok "ABSENT ledger: --json carries no warnings tripwire (warnings 0)" ;;
+  *) bad "ABSENT ledger: --json still smuggles a warnings tripwire: $jout" ;;
 esac
+
+# End-to-end across the seam the tripwire used to bridge: feed the ledger-absent
+# payload to the receipt renderer with EVERY OTHER gate seeded green, so only the
+# stub gate can hold the run back. A green Bifröst here is the same false-green,
+# one layer up. Proven for warnings 0 AND warnings 1 — the card must be provably
+# independent of that field, in both directions.
+CARD_BIN="$REPO/bin/summary-card"
+CARD_WORK="$SANDBOX/card"
+mkdir -p "$CARD_WORK/oracles/o1" "$CARD_WORK/proj"
+echo '{"gate_id":"o1","status":"pass"}' > "$CARD_WORK/oracles/o1/report.json"
+printf '| 0.1 | 3 cases | 3/3 caught | 100%% |\n' > "$CARD_WORK/CORPUS-STATUS.md"
+NOPE="$CARD_WORK/absent.json"   # pins pool/holdout off the real emitters
+
+# card_receipt PAYLOAD_FILE -> sets CARD_OUT (ansi-stripped) + CARD_RC.
+# Must NOT be called in a command substitution: the card's exit status is the
+# assertion, and a subshell would strand it.
+CARD_OUT=""; CARD_RC=0
+card_receipt() {
+  local raw
+  CARD_RC=0
+  raw="$(HEIMDALL_RECEIPT_ORACLE_DIR="$CARD_WORK/oracles" \
+         HEIMDALL_RECEIPT_CORPUS_STATUS="$CARD_WORK/CORPUS-STATUS.md" \
+         HEIMDALL_RECEIPT_STUB_JSON="$1" \
+         HEIMDALL_RECEIPT_POOL_JSON="$NOPE" \
+         HEIMDALL_RECEIPT_HOLDOUT_JSON="$NOPE" \
+         HEIMDALL_RECEIPT_REUSE_DIR="$CARD_WORK/none" \
+         HEIMDALL_RECEIPT_PONYTAIL="$NOPE" \
+         HEIMDALL_RECEIPT_WHO="ledger.test" \
+         "$CARD_BIN" --receipt "$CARD_WORK/proj" 2>&1)" || CARD_RC=$?
+  CARD_OUT="$(printf '%s\n' "$raw" | sed -E $'s/\x1b\\[[0-9;]*m//g')"
+}
+
+if [ -x "$CARD_BIN" ]; then
+  # (a) the payload verify-edits ACTUALLY emits, byte for byte.
+  NV_PAYLOAD="$CARD_WORK/nv-real.json"
+  printf '%s\n' "$jout" > "$NV_PAYLOAD"
+  card_receipt "$NV_PAYLOAD"
+  case "$CARD_OUT" in
+    *"nothing shipped unproven"*)
+      bad "ABSENT ledger: receipt went OPEN on the real payload — false-green" ;;
+    *) ok "ABSENT ledger: real payload keeps the receipt non-green (not OPEN)" ;;
+  esac
+  case "$CARD_OUT" in
+    *"CLOSED"*) ok "ABSENT ledger: receipt Bifröst reads CLOSED" ;;
+    *) bad "ABSENT ledger: receipt did not close: $(printf '%s' "$CARD_OUT" | grep -i bif)" ;;
+  esac
+  [ "$CARD_RC" -eq 2 ] && ok "ABSENT ledger: receipt exits 2 (mirrors verify-edits)" \
+                       || bad "ABSENT ledger: receipt exit want 2, got $CARD_RC"
+
+  # (b) the SAME verdict with warnings forced BACK to 1 — the old tripwire value.
+  #     Must render identically: proves the card reads the verdict, not the field.
+  NV_W1="$CARD_WORK/nv-warn1.json"
+  printf '%s\n' '{"verdict":"NON_VERIFIED","reason":"edit-ledger-absent","files_edited":null,"checks_passed":0,"checks_failed":0,"warnings":1,"paths":[]}' > "$NV_W1"
+  card_receipt "$NV_W1"
+  case "$CARD_OUT" in
+    *"nothing shipped unproven"*) bad "warnings:1 NON_VERIFIED opened the Bifröst" ;;
+    *) ok "warnings:1 NON_VERIFIED also stays non-green (verdict drives it)" ;;
+  esac
+  [ "$CARD_RC" -eq 2 ] && ok "warnings:1 NON_VERIFIED also exits 2 (field-independent)" \
+                       || bad "warnings:1 NON_VERIFIED exit want 2, got $CARD_RC"
+else
+  bad "summary-card not executable at $CARD_BIN"
+fi
 
 # ── 2. STATE: LEDGER PRESENT, ZERO EDITS ──
 trk init >/dev/null 2>&1
@@ -195,6 +260,107 @@ out="$(env TMPDIR="$SANDBOX" CLAUDE_CODE_SESSION_ID="some-other-session" \
         "$TRACKER" status 2>&1)"; rc=$?
 [ "$rc" -eq 3 ] && ok "a different session id sees its own ledger as absent" \
                 || bad "session isolation broken: exit $rc ($out)"
+
+# ── 8. --json STDOUT IS ALWAYS VALID JSON — including the rebuild path ────────
+# verify-edits rebuilds a missing/stale edit-tracker before doing anything. That
+# build chatter used to go to STDOUT, so `--json` emitted
+#   edit-tracker not built or stale. Building...{ "verdict": ... }
+# — a payload no strict parser accepts. bin/summary-card happened to fail SAFE on
+# it (unparseable -> non-green), but that was luck: a machine that rebuilt the
+# tracker silently lost its stub gate. Progress/diagnostics belong on stderr.
+JSON_OK() { # stdin -> exit 0 iff stdin parses as JSON
+  python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null
+}
+if ! command -v python3 >/dev/null 2>&1; then
+  bad "python3 unavailable — cannot verify --json payload purity"
+else
+  # Force the rebuild path: make the source newer than the binary.
+  touch "$REPO/bin/edit-tracker.c"
+  [ "$REPO/bin/edit-tracker.c" -nt "$TRACKER" ] \
+    && ok "rebuild path armed (edit-tracker.c newer than the binary)" \
+    || bad "could not arm the rebuild path — the next assertions prove nothing"
+
+  # 8a. rebuild path + ABSENT ledger: the NON_VERIFIED payload must still parse.
+  rm -rf "$SANDBOX/heimdall-edits"
+  jbuild="$(vfy --json 2>/dev/null)"; jbrc=$?
+  printf '%s' "$jbuild" | JSON_OK \
+    && ok "rebuild path: --json stdout is valid JSON (absent ledger)" \
+    || bad "rebuild path: --json stdout is NOT valid JSON: [$jbuild]"
+  case "$jbuild" in
+    *"Building"*|*"not built or stale"*)
+      bad "rebuild path: build chatter leaked onto --json stdout: [$jbuild]" ;;
+    *) ok "rebuild path: no build chatter on --json stdout" ;;
+  esac
+  [ "$jbrc" -eq 2 ] && ok "rebuild path: absent ledger still exits 2" \
+                    || bad "rebuild path: expected exit 2, got $jbrc"
+
+  # 8b. rebuild path + PRESENT ledger with a real edit: the normal payload too.
+  touch "$REPO/bin/edit-tracker.c"
+  trk init >/dev/null 2>&1
+  trk log Write "$EDITED" >/dev/null 2>&1
+  jbuild2="$(vfy --json 2>/dev/null)"; jb2rc=$?
+  printf '%s' "$jbuild2" | JSON_OK \
+    && ok "rebuild path: --json stdout is valid JSON (present ledger, real edit)" \
+    || bad "rebuild path: --json stdout NOT valid JSON: [$jbuild2]"
+  [ "$jb2rc" -eq 0 ] && ok "rebuild path: present ledger + clean edit exits 0" \
+                     || bad "rebuild path: expected exit 0, got $jb2rc"
+
+  # 8c. the already-built (normal) path stays valid JSON — no regression.
+  jnorm="$(vfy --json 2>/dev/null)"; jnrc=$?
+  printf '%s' "$jnorm" | JSON_OK \
+    && ok "normal path: --json stdout is valid JSON (no rebuild)" \
+    || bad "normal path: --json stdout NOT valid JSON: [$jnorm]"
+  [ "$jnrc" -eq 0 ] && ok "normal path: exits 0" || bad "normal path: got $jnrc"
+
+  # 8d. the chatter is not merely deleted — it still reaches STDERR, so a human
+  #     rebuilding the tracker is still told. Silencing it would trade one bug
+  #     for a quieter one.
+  touch "$REPO/bin/edit-tracker.c"
+  errout="$(vfy --json 2>&1 >/dev/null)"
+  case "$errout" in
+    *"Building"*) ok "rebuild path: build chatter still reported on STDERR" ;;
+    *) bad "rebuild path: chatter vanished entirely (want stderr, got none): [$errout]" ;;
+  esac
+
+  # 8e. THE COMMON PATH: ledger PRESENT with ZERO edits — every read-only /
+  # planning session. This exit used to print the prose line
+  #   [heimdall] verify-edits: No edits tracked this session (ledger present, 0 edits).
+  # on STDOUT even under --json. It is by far the most-hit --json path, so the
+  # receipt's stub gate was unparseable on most real sessions.
+  trk clear >/dev/null 2>&1
+  jzero="$(vfy --json 2>/dev/null)"; jzrc=$?
+  printf '%s' "$jzero" | JSON_OK \
+    && ok "zero-edit session: --json stdout is valid JSON" \
+    || bad "zero-edit session: --json emitted non-JSON: [$jzero]"
+  [ "$jzrc" -eq 0 ] && ok "zero-edit session: --json exits 0 (a real pass)" \
+                    || bad "zero-edit session: expected exit 0, got $jzrc"
+  case "$jzero" in
+    *'"verdict": "PASS"'*) ok "zero-edit session: --json verdict PASS (tracked, nothing to check)" ;;
+    *) bad "zero-edit session: --json verdict wrong: [$jzero]" ;;
+  esac
+  case "$jzero" in
+    *'"files_edited": 0'*) ok "zero-edit session: --json reports files_edited 0" ;;
+    *) bad "zero-edit session: --json files_edited wrong: [$jzero]" ;;
+  esac
+
+  # 8f. ...and the DOWNSTREAM consequence, which is why 8e matters. summary-card
+  # now fails CLOSED on an unreadable stub payload. If this path emitted prose,
+  # every read-only session would render "✗ CLOSED — a gate could not verify" for
+  # a run that is genuinely fine — the false-RED that trains people to ignore the
+  # receipt. A legitimate zero-edit session MUST still open the Bifröst.
+  if [ -x "$CARD_BIN" ]; then
+    ZERO_PAYLOAD="$CARD_WORK/zero-edits.json"
+    printf '%s\n' "$jzero" > "$ZERO_PAYLOAD"
+    card_receipt "$ZERO_PAYLOAD"
+    case "$CARD_OUT" in
+      *"nothing shipped unproven"*)
+        ok "zero-edit session: receipt still OPENs (fail-closed did not eat a real pass)" ;;
+      *) bad "FALSE-RED: a clean read-only session closed the Bifröst: $(printf '%s' "$CARD_OUT" | grep -i bif)" ;;
+    esac
+    [ "$CARD_RC" -eq 0 ] && ok "zero-edit session: receipt exits 0" \
+                         || bad "zero-edit session: receipt exit want 0, got $CARD_RC"
+  fi
+fi
 
 echo "--------------------------------------------------------------------"
 echo "RESULT: $PASS passed, $FAIL failed"
