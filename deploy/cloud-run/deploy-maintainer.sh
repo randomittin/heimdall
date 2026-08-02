@@ -77,6 +77,13 @@ show() { [ "$DRY" = 1 ] && printf '  \033[90m$ %s\033[0m\n' "$*"; return 0; }
 # shellcheck source=../../bin/lib/crontab-safe.sh
 . "$ROOT/bin/lib/crontab-safe.sh"
 
+# the ONE real-user predicate, shared with bin/heimdall-dream-schedule + bin/heimdall so the
+# launchd and crontab directions of the SAME guard cannot drift apart. A second copy of this
+# logic would drift, and a drifted guard is an unguarded one — hence one lib, two call sites.
+[ -r "$ROOT/bin/lib/real-home.sh" ] || die "missing $ROOT/bin/lib/real-home.sh (needed to prove this is the real user's machine before touching its crontab)"
+# shellcheck source=../../bin/lib/real-home.sh
+. "$ROOT/bin/lib/real-home.sh"
+
 [ -n "$REPO" ] || die "missing --repo <owner/repo>"
 printf '%s' "$REPO" | grep -qE '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$' \
   || die "--repo must be <owner>/<name> (got: $REPO)"
@@ -140,9 +147,47 @@ collect_secrets() {
   fi
 }
 
+# ── The Arch-A sandbox guard (fail-safe, self-detecting) ─────────────────────
+#
+# WHY THE LOCAL RUNNER NEEDS THIS. `crontab` keys off the OS USER (getuid), NOT $HOME.
+# That is the IDENTICAL failure shape as the launchd incident that silently repointed the
+# developer's live nightly job at an ephemeral agent worktree: a harness that sets
+# HOME=$(mktemp -d) isolates the FILESYSTEM but not the crontab spool, so `crontab <file>`
+# still rewrites the REAL user's crontab and `crontab -l` still reads it. Arch A is by
+# definition "a runner on THIS box", so every side effect in arch_a is machine-scoped.
+#
+# IT DOES NOT TRUST THE CALLER. heimdall_home_is_real compares $HOME against the PASSWD
+# DATABASE, a source $HOME cannot influence, so a synthetic HOME self-identifies with ZERO
+# cooperation from whoever spawned the run. An env-var opt-out only works if every future
+# caller remembers it — one forgot, and that is exactly how the incident happened. This is
+# the floor underneath that, for the caller who forgets.
+#
+# REFUSAL IS TOTAL AND EARLY: it returns before the env file, before the smoke cycle, and
+# before ANY crontab call — not even `crontab -l`, whose failure is how the destructive
+# read bug manifested. Exit 4 is distinct from a real failure (die → 1) and prints the
+# state word `sandboxed`, mirroring heimdall-dream-schedule's exit 4 and the word install.sh
+# renders for it, so an operator (or a CI check) can tell REFUSAL from BREAKAGE.
+#
+# Fail safe at every unknown: if the predicate is somehow undefined, "don't know" answers NO.
+require_real_crontab_owner() {
+  # --dry-run executes nothing, so there is nothing to refuse.
+  if [ "$DRY" = 1 ]; then return 0; fi
+  if type heimdall_home_is_real >/dev/null 2>&1 && heimdall_home_is_real; then return 0; fi
+  printf '\033[33m! sandboxed — refusing to install the maintainer cron.\033[0m\n' >&2
+  printf '  $HOME (%s) is not this user'"'"'s passwd home (%s), so `crontab` would rewrite\n' \
+    "${HOME:-<unset>}" "$(heimdall_real_user_home)" >&2
+  printf '  the REAL user'"'"'s crontab — it keys off the OS user, which $HOME does not isolate.\n' >&2
+  printf '  Nothing was written: no crontab read, no crontab install, no env file.\n' >&2
+  printf '  Re-run as the real user, or use --dry-run to see the plan.\n' >&2
+  exit 4
+}
+
 # ── Arch A: local runner on this box ─────────────────────────────────────────
 arch_a() {
   say "Arch A — local runner on this machine"
+  # BEFORE any machine-scoped side effect. Placed inside arch_a (not at the dispatch) so a
+  # future caller of arch_a cannot route around it.
+  require_real_crontab_owner
   if [ "$DRY" != 1 ]; then
     mkdir -p "$(dirname "$ENVFILE")"
     if [ "$GH_APP" = 1 ]; then
