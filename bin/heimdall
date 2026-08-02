@@ -2214,9 +2214,37 @@ for s in reg.get('skills', []):
 
   echo ""
   printf "  \033[1mPlugin management (auto per-project):\033[0m\n"
-  "$PLUGIN_DIR/bin/skill-manager" status "$WORK_DIR" 2>/dev/null | while IFS= read -r line; do
-    printf "  %s\n" "$line"
-  done
+  # Plugin-management status is INFORMATIONAL — one block of `--skills` output,
+  # not a correctness requirement — so an unavailable skill-manager must degrade
+  # visibly, never abort the command.
+  #
+  # WHY THE GUARD: this script runs under `set -euo pipefail` and the helper was
+  # called as a bare PIPELINE HEAD. With bin/skill-manager missing or stripped of
+  # its +x bit (partial install, older layout), the pipeline inherited its 127,
+  # `set -e` fired, and `--skills` died HERE — every line below, including the
+  # whole "Commands:" help block, silently never printed. The `2>/dev/null`
+  # suppressed the message but NOT the exit status, so the user saw truncated
+  # output and no error at all. Same defect class as resolve_model() above; this
+  # matches the `[ -x "$SKILL_MGR" ]` guard both launch-path call sites use.
+  #
+  # Present-and-working behaviour is unchanged: the helper is still invoked with
+  # `status` and its lines are still indented verbatim. A helper that IS present
+  # but exits nonzero is reported rather than swallowed — degrading gracefully is
+  # for an ABSENT optional helper, not for hiding a real failure.
+  SKILLS_MGR_BIN="$PLUGIN_DIR/bin/skill-manager"
+  SKILLS_MGR_STATUS=""
+  if [ ! -x "$SKILLS_MGR_BIN" ]; then
+    printf "  (skill-manager unavailable at %s)\n" "$SKILLS_MGR_BIN"
+    printf "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash\n"
+  elif SKILLS_MGR_STATUS="$("$SKILLS_MGR_BIN" status "$WORK_DIR" 2>/dev/null)"; then
+    if [ -n "$SKILLS_MGR_STATUS" ]; then
+      printf '%s\n' "$SKILLS_MGR_STATUS" | while IFS= read -r line; do
+        printf "  %s\n" "$line"
+      done
+    fi
+  else
+    printf "  (skill-manager status exited nonzero — plugin state not shown)\n"
+  fi
 
   echo ""
   echo "  Commands:"

@@ -390,6 +390,125 @@ fi
 rm -f "$FAKE_BIN/heimdall-model-resolve"
 
 # ══════════════════════════════════════════════════════════════════════════════
+# 8c. THE WHOLE BUG CLASS, NOT JUST ONE INSTANCE — every launch-path helper must
+#     be survivable, both ABSENT and PRESENT-BUT-NOT-EXECUTABLE.
+#
+#     8b pins ONE helper (heimdall-model-resolve). The defect it pins is a CLASS:
+#     under `set -euo pipefail` an unguarded helper call kills the launcher. The
+#     shapes that are fatal (measured on bash 3.2.57, not assumed):
+#         X="$(helper)"        plain assignment          → FATAL
+#         helper | while read  pipeline head (pipefail)  → FATAL
+#         helper               bare simple command       → FATAL
+#     and the shapes that are NOT:
+#         local X="$(helper)"  (local's own status is 0) → survives
+#         cmd "$(helper)"      (outer status governs)    → survives
+#         helper || fallback / if helper / done < <(helper)
+#     NOTE `2>/dev/null` silences the MESSAGE, never the exit status — it makes a
+#     fatal call SILENT, not safe.
+#
+#     A lost +x bit is a distinct failure state from an absent file (chmod 000
+#     survives a `[ -f ]` test but not `[ -x ]`), so both are exercised here.
+# ══════════════════════════════════════════════════════════════════════════════
+LAUNCH_HELPERS="heimdall-model-resolve skill-manager heimdall-face heimdall-reuse-metric heimdall-persona heimdall-frontdoor heimdall-comprehend heimdall-telemetry heimdall-haid"
+
+for helper in $LAUNCH_HELPERS; do
+  # ABSENT
+  reset
+  rm -f "$FAKE_BIN/$helper"
+  run_hmd "unknown-task-absent-$helper"
+  if claude_reached; then
+    ok "launch survives ABSENT $helper"
+  else
+    bad "ABSENT $helper aborted the launcher before launch:task"
+    cat "$TRACE_FILE" >&2
+  fi
+
+  # PRESENT BUT NOT EXECUTABLE (lost +x bit — a partial/interrupted install)
+  reset
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$FAKE_BIN/$helper"
+  chmod 000 "$FAKE_BIN/$helper"
+  run_hmd "unknown-task-noexec-$helper"
+  if claude_reached; then
+    ok "launch survives NON-EXECUTABLE $helper (lost +x bit)"
+  else
+    bad "NON-EXECUTABLE $helper aborted the launcher before launch:task"
+    cat "$TRACE_FILE" >&2
+  fi
+  rm -f "$FAKE_BIN/$helper"
+done
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 8d. `hmd --skills` MUST NOT die on a missing bin/skill-manager.
+#
+#     Sibling of the 8b defect, found by sweeping the class. Line ~2217 called the
+#     helper as a PIPELINE HEAD:
+#         "$PLUGIN_DIR/bin/skill-manager" status "$WORK_DIR" 2>/dev/null | while …
+#     Under `pipefail` the pipeline inherits the helper's 127, `set -e` fires, and
+#     `--skills` dies part-way — the entire "Commands:" help block below it never
+#     prints. Worse than 8b: the `2>/dev/null` swallows the diagnostic, so the
+#     user sees truncated output and NO error at all.
+#
+#     Pinned from both sides, same as 8b:
+#       A. skill-manager ABSENT/non-exec → --skills still completes (rc 0) and
+#          still prints the trailing Commands block.
+#       B. skill-manager PRESENT         → it is still actually invoked with
+#          `status`, so a guard can never silently shadow the real helper.
+# ══════════════════════════════════════════════════════════════════════════════
+# run_skills — like run_hmd but keeps stdout so we can assert the tail printed.
+SKILLS_OUT="$(mktemp /tmp/test-hmd-skills-XXXXXX)"
+run_skills() {
+  PATH="$FAKE_BIN:$PATH" \
+  HEIMDALL_HOME="$FAKE_HOME" \
+  HEIMDALL_NO_INTRO=1 \
+  HEIMDALL_NO_UPDATE_CHECK=1 \
+  HMD_STUB_OUT="$STUB_OUT" \
+  bash "$FAKE_BIN/heimdall" --skills >"$SKILLS_OUT" 2>/dev/null
+}
+
+# A1. absent
+reset
+rm -f "$FAKE_BIN/skill-manager"
+if run_skills; then
+  ok "--skills exits 0 with skill-manager ABSENT"
+else
+  bad "--skills died (rc $?) with skill-manager ABSENT"
+fi
+if grep -q "Install from registry" "$SKILLS_OUT"; then
+  ok "--skills prints the trailing Commands block with skill-manager ABSENT"
+else
+  bad "--skills output truncated at the skill-manager pipeline (ABSENT)"
+  tail -4 "$SKILLS_OUT" >&2
+fi
+
+# A2. present but not executable
+reset
+printf '#!/usr/bin/env bash\nexit 0\n' > "$FAKE_BIN/skill-manager"
+chmod 000 "$FAKE_BIN/skill-manager"
+if run_skills; then
+  ok "--skills exits 0 with skill-manager NON-EXECUTABLE"
+else
+  bad "--skills died with a non-executable skill-manager"
+fi
+rm -f "$FAKE_BIN/skill-manager"
+
+# B. present → still genuinely invoked (falsifier: a guard must not shadow it)
+reset
+make_stub skill-manager
+if run_skills; then
+  ok "--skills exits 0 with skill-manager PRESENT"
+else
+  bad "--skills failed with skill-manager present"
+fi
+if stub_called "skill-manager" && args_contain "skill-manager ARGS: status"; then
+  ok "present skill-manager IS invoked with 'status' (guard does not shadow it)"
+else
+  bad "skill-manager present but never invoked with 'status'"
+  cat "$STUB_OUT" >&2
+fi
+rm -f "$FAKE_BIN/skill-manager"
+rm -f "$SKILLS_OUT"
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 9. Syntax check
 # ══════════════════════════════════════════════════════════════════════════════
 if bash -n "$REAL_BIN" 2>/dev/null; then
