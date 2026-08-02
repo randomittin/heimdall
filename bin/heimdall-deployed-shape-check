@@ -40,7 +40,10 @@
 #     [--strict]       exit 1 when findings exist (the promotion-to-blocking path)
 #   -h | --help
 #
-# Exit: 0 ok (warn-only) · 1 findings-and---strict · 2 usage/runtime.
+# Exit: 0 ok (warn-only) · 1 findings-and---strict · 2 usage/runtime, WHICH INCLUDES a
+# target set that resolved to zero files. A scan of nothing is not a clean scan: "0
+# findings across 0 files" is indistinguishable from a real pass, and --strict keys off
+# findings, so an empty target glob would otherwise exit 0 and certify an unexamined tree.
 
 import argparse
 import ast
@@ -301,6 +304,26 @@ def main(argv):
     args = ap.parse_args(argv)
 
     targets = _targets(args)
+
+    # ── ANTI-VACUOUS FLOOR ────────────────────────────────────────────────────
+    # Zero targets means the glob resolved to [] — invoked through a PATH symlink,
+    # pointed at the wrong --root, or handed paths that match no .py. "0 findings"
+    # over 0 files is indistinguishable from a real clean scan, and --strict is
+    # gated on findings, so an empty scan would exit 0 and certify nothing. That is
+    # a broken invocation (exit 2, the documented usage/runtime code), never a pass.
+    if not targets:
+        where = " ".join(args.paths) if args.paths \
+            else os.path.join(args.root, "bin", "lib", "*.py")
+        note = ("EXAMINED NOTHING: 0 files matched %s. A clean result over an empty "
+                "scan certifies nothing, so this is reported as a vacuous scan rather "
+                "than a pass. Point --root at the repo root or pass explicit paths."
+                % where)
+        if args.json:
+            print(json.dumps({"findings": [], "count": 0, "scanned": 0,
+                              "vacuous": True, "notes": [note]}, sort_keys=True))
+        sys.stderr.write("\033[31mVACUOUS\033[0m deployed-shape-check: %s\n" % note)
+        return 2
+
     findings = []
     notes = []
     for path in targets:
