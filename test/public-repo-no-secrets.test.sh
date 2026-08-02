@@ -143,8 +143,14 @@ fi
 cat >"$FIX/placeholder.json" <<'JSON'
 { "cp_url": "https://example.invalid", "enroll_token": "<your-enroll-token>", "team_secret": "<team-secret>" }
 JSON
+# The "leaked" value must be NON-<placeholder> (so secret_value_hits fires) but
+# must NOT be a gitleaks match: this detector keys off the JSON KEY NAME, not the
+# value's entropy, so a high-entropy literal buys the proof nothing and costs the
+# history a permanent generic-api-key finding. Convention case 1 (token-shaped
+# input -> obviously-fake, non-matching sentinel):
+# docs/superpowers/specs/heimdall-fixture-secret-convention.md
 cat >"$FIX/leaked.json" <<'JSON'
-{ "cp_url": "https://example.invalid", "enroll_token": "Zk3QpR7xLmN2vB8cT5wY1aH4dG6sJ0eU" }
+{ "cp_url": "https://example.invalid", "enroll_token": "REDACTED_SENTINEL_not_a_real_token" }
 JSON
 PH_N="$(count_lines "$(secret_value_hits "$FIX/placeholder.json")")"
 LK_N="$(count_lines "$(secret_value_hits "$FIX/leaked.json")")"

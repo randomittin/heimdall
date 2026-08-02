@@ -32,6 +32,28 @@ useDefault = true
 [allowlist]
 description = "Heimdall's own secret-detection fixtures — test material, not real credentials."
 
+# COMMIT-scoped allowlist — deliberately NOT a path entry.
+#
+# 1b9994c ("test(secrets): make public-repo-no-secrets non-vacuous") committed a
+# high-entropy 32-char literal as the `enroll_token` value in the C2 fixture of
+# test/public-repo-no-secrets.test.sh. It is NOT a credential: it is a throwaway
+# value written to a temp file to prove the secret-value detector fires on a
+# non-<placeholder>. That detector keys off the JSON KEY NAME (SECRET_KEY_RE),
+# never the value's entropy, so the literal bought the proof nothing.
+#
+# The tree is fixed FORWARD to the convention's case-1 sentinel, so no new commit
+# can reintroduce this. Git objects are immutable, so the one historical blob
+# still trips generic-api-key and must be named here or the gate stays red.
+#
+# Scoped to the SHA, not the file, on purpose: a path entry would blind the gate
+# to a genuine credential later checked in beside the fixture — the exact failure
+# docs/superpowers/specs/heimdall-fixture-secret-convention.md forbids. A commit
+# SHA is immutable, so this entry can never mask a FUTURE leak, in this file or
+# any other. test/public-repo-no-secrets.test.sh remains fully armed.
+commits = [
+  '''1b9994c25e794b75069dcc8a47dc1c6dc43c13a0''',
+]
+
 # Paths are matched against the file path of each finding. Each entry is a
 # SPECIFIC fixture-bearing file; widen this list only with a named justification.
 paths = [
