@@ -96,6 +96,7 @@ IAP_FW="allow-iap-ssh"                           # firewall rule name for IAP TC
 IAP_RANGE="35.235.240.0/20"                      # Google's fixed IAP source range
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$HERE/../.." && pwd)"
 
 usage() { sed -n '/^# Usage:/,/executes nothing/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
@@ -127,6 +128,12 @@ warn() { printf '\033[33m! %s\033[0m\n' "$*" >&2; }
 die()  { printf '\033[31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
 # run: in --dry-run print the command (NO secret is ever an argv here), else execute it.
 run()  { if [ "$DRY" = 1 ]; then printf '  \033[90m$ %s\033[0m\n' "$*"; else "$@"; fi; }
+
+# the ONE safe-crontab helper, shared with deploy/cloud-run/deploy-maintainer.sh. Here it only
+# EMITS the program (heimdall_crontab_script) — the VM runs it, so the VM needs nothing installed.
+[ -r "$ROOT/bin/lib/crontab-safe.sh" ] || die "missing $ROOT/bin/lib/crontab-safe.sh (needed to install the maintainer cron safely)"
+# shellcheck source=../../bin/lib/crontab-safe.sh
+. "$ROOT/bin/lib/crontab-safe.sh"
 
 # validate a repo slug (owner/name, no shell metacharacters) — the same gate the §1 allowlist uses.
 valid_repo() { printf '%s' "$1" | grep -qE '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'; }
@@ -558,10 +565,17 @@ phase_install_maintainer() {
   beatline="* * * * * . $envfile; $loop runner-beat --repo $REPO --runner-id \$(hostname) >/dev/null 2>&1 # heimdall-maintainer-beat"
   cycleline="$CRON . $envfile; $loop run --max $MAXN --repo $CLONE_PATH >/dev/null 2>&1 # heimdall-maintainer-cycle"
   # the remote side rewrites crontab, stripping any prior heimdall-maintainer- lines first (dedup),
-  # then appends the two fresh lines — so a re-run never stacks duplicates.
-  cron_cmd="tmp=\$(mktemp); crontab -l 2>/dev/null | grep -v 'heimdall-maintainer-' > \"\$tmp\" || true; printf '%s\n%s\n' '$beatline' '$cycleline' >> \"\$tmp\"; crontab \"\$tmp\"; rm -f \"\$tmp\""
-  run gcloud compute ssh "$VM" --zone "$ZONE" --project "$PROJECT" --tunnel-through-iap \
-      --command "$cron_cmd"
+  # then appends the two fresh lines — so a re-run never stacks duplicates. It ABORTS (touching
+  # nothing) if `crontab -l` fails for any reason other than "no crontab exists", and backs the
+  # VM's current crontab up to a timestamped file first — an empty read must never be installed.
+  cron_cmd="$(heimdall_crontab_script 'heimdall-maintainer-' "$beatline" "$cycleline")"
+  if [ "$DRY" = 1 ]; then
+    run "gcloud compute ssh $VM --zone $ZONE --project $PROJECT --tunnel-through-iap --command <safe-crontab-script>"
+  else
+    gcloud compute ssh "$VM" --zone "$ZONE" --project "$PROJECT" --tunnel-through-iap \
+        --command "$cron_cmd" \
+      || die "could not install the maintainer cron on $VM — its crontab was NOT modified (see the error above)."
+  fi
   if [ "$DRY" = 1 ]; then
     echo "      cron lines installed on the VM:"
     printf '        %s\n        %s\n' "$beatline" "$cycleline"
