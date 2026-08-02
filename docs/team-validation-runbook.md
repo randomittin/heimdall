@@ -17,9 +17,17 @@ f = os.path.expanduser('~/.heimdall/cp-endpoint.json')
 d = json.load(open(f)) if os.path.exists(f) else {}
 print((d.get('url') or 'https://heimdall-cp-public-eqfrs7sfuq-uc.a.run.app').rstrip('/'))
 ")"
-curl -s -o /dev/null -w "%{http_code}" "$CP_URL/healthz"
+curl -s -o /dev/null -w "%{http_code}" "$CP_URL/readyz"
 # expect: 200
 ```
+
+> Probe `/readyz`, **not** `/healthz`. Both are served by the same pre-auth handler
+> (`bin/lib/cp_diag.py`) and both are in the public allowlist, but Google's Cloud Run edge
+> intercepts an **external** `GET /healthz` and answers its own HTML 404 before the request
+> reaches the container — the 404 carries no `x-cloud-trace-context`, the `/readyz` 200 does.
+> `/readyz` is also the stronger probe: it proves the route seam booted and the state backend
+> initialised (`{"status":"ready","booted":true,…}`), where `/healthz` only proves the
+> interpreter is alive. `deploy/cloud-run/go-live.sh` §7.0 verifies the same way.
 
 **1.2 — `~/.heimdall/cp-endpoint.json` present**
 
