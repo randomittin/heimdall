@@ -39,16 +39,32 @@
 #   HEIMDALL_LAUNCH_AGENTS_DIR   plist dir      (default: $HOME/Library/LaunchAgents)
 #   HEIMDALL_DREAM_LOG           log file       (default: $HOME/.heimdall/logs/dream.log)
 #   LAUNCHCTL                    launchctl bin  (default: launchctl)
+#   HEIMDALL_REAL_HOME           passwd home    (default: resolved from getpwuid)
 #   These let the acceptance suite prove install/idempotent/status/uninstall with a
 #   shimmed launchctl and a tmp dir — no root, no real agent loaded.
 #
-# Exit status: 0 ok · 2 usage / unsupported platform · 3 runtime.
+# Exit status: 0 ok · 2 usage / unsupported platform · 3 runtime · 4 refused (see below).
 
 set -euo pipefail
 
 SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 BINDIR="$(dirname "$SELF")"
 DREAM="$BINDIR/heimdall-dream"
+
+# ── Shared real-user detection (bin/lib/real-home.sh) ────────────────────────────
+# This helper is THE choke point for LaunchAgent REGISTRATION: install.sh's
+# ensure_dream_schedule and heimdall-autoupdate's reassert_dream_schedule both
+# delegate here rather than calling launchctl themselves, so gating `install` gates
+# every caller — including one that has not been written yet. The predicate lives in
+# bin/lib/real-home.sh because bin/heimdall's uninstall side needs the SAME answer;
+# two copies of a guard drift, and a drifted guard is an unguarded one.
+# Sourced best-effort: an unreadable lib leaves heimdall_home_is_real undefined, and
+# require_real_launchd_domain treats "undefined" exactly like "not the real user" —
+# refuse. Fail safe at every unknown.
+if [ -r "$BINDIR/lib/real-home.sh" ]; then
+  # shellcheck disable=SC1091
+  . "$BINDIR/lib/real-home.sh" 2>/dev/null || true
+fi
 
 LABEL="com.heimdall.dream"
 LA_DIR="${HEIMDALL_LAUNCH_AGENTS_DIR:-$HOME/Library/LaunchAgents}"
@@ -92,6 +108,38 @@ xml_escape() {
 }
 
 is_macos() { [ "$(uname -s)" = "Darwin" ]; }
+
+# ── The install-side sandbox guard (fail-safe, self-detecting) ───────────────────
+#
+# WHY REGISTRATION NEEDS THIS. `launchctl load` does NOT resolve through $HOME — it
+# registers into the logged-in user's GUI session domain (gui/<uid>). A harness that
+# sets HOME=$(mktemp -d) isolates WHERE the plist file lands but NOT which launchd
+# hears about it, so an unguarded `install` under a throwaway HOME repoints the
+# DEVELOPER'S OWN live nightly job at the harness's temp checkout — a tree that is
+# then deleted, leaving the nightly job wired to a path that no longer exists. That
+# happened. This is the fix.
+#
+# IT DOES NOT TRUST THE CALLER. heimdall_home_is_real compares $HOME against the
+# PASSWD DATABASE, which $HOME cannot influence, so a synthetic HOME self-identifies
+# with zero cooperation from whoever spawned the run. HEIMDALL_NO_DREAM_SCHEDULE=1
+# stays the EXPLICIT opt-out (checked first, and honored here too so the helper's own
+# CLI obeys the same switch install.sh and heimdall-autoupdate obey); this passwd
+# comparison is the FLOOR underneath it, for every caller who forgets — the failure
+# mode a remember-the-env-var guard has by construction.
+#
+# REFUSAL IS TOTAL AND EARLY: it returns before write_plist, so neither launchd NOR
+# $LA_DIR is touched — no plist is created even in the sandbox. Exit 4 is distinct
+# from a real failure (3) so install.sh can report "sandboxed" rather than a scary
+# "load failed", while still being non-zero for anything that just checks success.
+require_real_launchd_domain() {
+  if type heimdall_home_is_real >/dev/null 2>&1 && heimdall_home_is_real; then
+    return 0
+  fi
+  echo "not scheduled $PLIST (synthetic HOME — refusing to touch the real launchd domain)" >&2
+  echo "  \$HOME is not this user's passwd home, so launchctl would reach the REAL" >&2
+  echo "  per-user launchd domain that \$HOME does not isolate. Nothing was written." >&2
+  exit 4
+}
 
 # ── emit the plist (the single source of the scheduled argv) ─────────────────────
 write_plist() {
@@ -149,8 +197,17 @@ is_loaded() {
 
 # ── subcommands ──────────────────────────────────────────────────────────────────
 cmd_install() {
+  # Explicit opt-out FIRST — a declining dev/CI never reaches launchd at all. Same
+  # variable install.sh + heimdall-autoupdate honor, checked here so the switch holds
+  # no matter which entry point is used.
+  if [ "${HEIMDALL_NO_DREAM_SCHEDULE:-0}" = "1" ]; then
+    echo "not scheduled $LABEL (HEIMDALL_NO_DREAM_SCHEDULE=1)" >&2
+    return 0
+  fi
   is_macos || die "unsupported platform: launchd scheduling is macOS-only (found $(uname -s)). \
 Use the cron/cloud routine documented in commands/dream.md instead."
+  # Fail-safe sandbox gate — before write_plist, so a refusal leaves NOTHING behind.
+  require_real_launchd_domain
   [ -x "$DREAM" ] || die "heimdall-dream not executable at $DREAM"
   write_plist
   unload_agent   # drop any prior copy so a re-install never yields two loaded jobs

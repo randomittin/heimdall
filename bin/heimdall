@@ -33,6 +33,16 @@ if [ -f "$PLUGIN_DIR/bin/lib/select.sh" ]; then
   . "$PLUGIN_DIR/bin/lib/select.sh" 2>/dev/null || true
 fi
 
+# Real-user detection (bin/lib/real-home.sh) — the fail-safe gate for the side effects
+# $HOME cannot isolate (launchctl targets the GUI session domain, not a $HOME path).
+# Shared with bin/heimdall-dream-schedule so the install and uninstall halves of the
+# guard cannot drift. Sourced best-effort: an unreadable lib leaves the predicates
+# undefined, which the _heimdall_* wrappers below read as "unsafe" → refuse.
+if [ -f "$PLUGIN_DIR/bin/lib/real-home.sh" ]; then
+  # shellcheck disable=SC1091
+  . "$PLUGIN_DIR/bin/lib/real-home.sh" 2>/dev/null || true
+fi
+
 # ── First-run completion marker (USER-writable, NEVER the install dir) ──
 #
 # The marker MUST live in a user-writable path, NOT $PLUGIN_DIR. Live GCE failure:
@@ -628,37 +638,21 @@ _heimdall_remove_path_export() {
 # real-user branch under a throwaway HOME with launchctl stubbed. Setting it can
 # never by itself reach a real domain: the launchd call still goes through
 # $LAUNCHCTL and the plist still comes from $HEIMDALL_LAUNCH_AGENTS_DIR.
+#
+# THE IMPLEMENTATION LIVES IN bin/lib/real-home.sh, shared with the INSTALL side
+# (bin/heimdall-dream-schedule, which registers + loads the very LaunchAgent this
+# file removes). Both directions of one guard must give the same answer; two copies
+# would drift, and a drifted guard is an unguarded one. These two wrappers keep the
+# existing call sites and, crucially, keep the FAIL-SAFE contract when the lib is
+# unreadable (a partial install): the resolver yields empty and the comparison is
+# false, so every caller reads "unsafe" and refuses.
 _heimdall_real_user_home() {
-  local h user
-  if [ -n "${HEIMDALL_REAL_HOME:-}" ]; then
-    printf '%s' "${HEIMDALL_REAL_HOME}"
-    return 0
-  fi
-  h=""
-  if command -v python3 >/dev/null 2>&1; then
-    h="$(python3 -c 'import pwd,os;print(pwd.getpwuid(os.getuid()).pw_dir)' 2>/dev/null || true)"
-  fi
-  if [ -z "$h" ] && command -v dscl >/dev/null 2>&1; then
-    user="$(id -un 2>/dev/null || true)"
-    if [ -n "$user" ]; then
-      h="$(dscl . -read "/Users/$user" NFSHomeDirectory 2>/dev/null | awk '{print $2}' || true)"
-    fi
-  fi
-  printf '%s' "$h"
+  type heimdall_real_user_home >/dev/null 2>&1 || { printf ''; return 0; }
+  heimdall_real_user_home
 }
-
-# TRUE when both arguments name the SAME directory. Compares physical paths so a
-# real user whose home is reached through a symlink is not misread as synthetic
-# (that misread would silently leave the nightly job installed — the exact bug
-# this guard exists to close).
 _heimdall_same_dir() {
-  local a="$1" b="$2"
-  [ -n "$a" ] && [ -n "$b" ] || return 1
-  [ "$a" = "$b" ] && return 0
-  [ -d "$a" ] && [ -d "$b" ] || return 1
-  a="$(cd "$a" 2>/dev/null && pwd -P)" || return 1
-  b="$(cd "$b" 2>/dev/null && pwd -P)" || return 1
-  [ "$a" = "$b" ]
+  type heimdall_same_dir >/dev/null 2>&1 || return 1
+  heimdall_same_dir "${1:-}" "${2:-}"
 }
 
 # ── Nightly-LaunchAgent removal (uninstall completeness) ──

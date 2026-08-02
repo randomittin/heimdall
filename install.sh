@@ -683,10 +683,19 @@ ensure_claude_mem() {
 #   - macOS-ONLY: launchd is the platform scheduler; a non-Darwin box or a missing
 #     launchctl → skip cleanly (the cron/cloud routine in commands/dream.md covers those).
 #   - NON-FATAL: a missing helper/dream bin or a launchctl load failure → skip, never fail.
+#   - SANDBOX FLOOR: the helper REFUSES (exit 4) when $HOME is not this user's passwd
+#     home. `launchctl` targets the logged-in user's GUI session domain (gui/<uid>) and
+#     does NOT resolve through $HOME, so a harness running a real install under a
+#     throwaway HOME would otherwise repoint the DEVELOPER'S live nightly job at its own
+#     temp checkout — a tree that is then deleted. That happened; this is the floor that
+#     stops it. It is SELF-DETECTING (passwd database, which $HOME cannot influence), so
+#     unlike HEIMDALL_NO_DREAM_SCHEDULE it does not depend on the caller remembering
+#     anything. The opt-out still works and still wins; this sits underneath it.
 # Prints ONE state word (the caller renders the ✓ line + the disable hint):
 #   scheduled    — the nightly LaunchAgent was (re)installed + loaded (idempotent)
 #   optout       — HEIMDALL_NO_DREAM_SCHEDULE=1 → skipped by request
 #   unsupported  — not macOS, or launchctl absent → skipped (use the cron/cloud routine)
+#   sandboxed    — synthetic $HOME → the helper refused to touch the real launchd domain
 #   skipped      — schedule helper / dream bin missing, or launchctl load failed (non-fatal)
 ensure_dream_schedule() {
   local plugin_dir="$1"
@@ -700,11 +709,16 @@ ensure_dream_schedule() {
   [ -x "$sched" ] || { printf 'skipped'; return 0; }
   # Idempotent register + load, pointed at the installed checkout. Quiet + best-effort:
   # a load failure (rc from the helper) degrades to 'skipped', never aborts the install.
-  if "$sched" install --repo "$plugin_dir" >/dev/null 2>&1; then
-    printf 'scheduled'
-  else
-    printf 'skipped'
-  fi
+  # The helper owns the sandbox refusal (it is the ONE place that calls launchctl, so
+  # gating it there covers this caller and heimdall-autoupdate's re-assert alike); we
+  # only have to render its distinct exit 4 honestly instead of as a scary "failed".
+  local rc=0
+  "$sched" install --repo "$plugin_dir" >/dev/null 2>&1 || rc=$?
+  case "$rc" in
+    0) printf 'scheduled' ;;
+    4) printf 'sandboxed' ;;
+    *) printf 'skipped' ;;
+  esac
 }
 
 # ── Install-step telemetry (dossier §3 + §8) ────────────────────────────────
@@ -1385,6 +1399,13 @@ main() {
     unsupported)
       _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" dream-schedule succeeded "$DS_T0"
       step_ok "Scheduling nightly /dream (03:00)" "skipped (macOS only)" ;;
+    sandboxed)
+      # NOT a failure: the helper proved this is not the real user's home and refused,
+      # so the real per-user launchd domain (which $HOME does not isolate) was never
+      # touched. Say so in the same words the uninstall side uses.
+      _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" dream-schedule succeeded "$DS_T0"
+      step_ok "Scheduling nightly /dream (03:00)" \
+        "skipped (synthetic HOME — refusing to touch the real launchd domain)" ;;
     *)  # skipped — helper/dream bin missing or launchctl load failed. Non-fatal.
       _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" dream-schedule failed "$DS_T0" \
         dream-schedule-unavailable "schedule helper missing or launchctl load failed"

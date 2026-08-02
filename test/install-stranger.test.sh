@@ -521,10 +521,26 @@ cp "$REAL_LAUNCHER" "$SAVED_LAUNCHER" 2>/dev/null && chmod +x "$SAVED_LAUNCHER" 
 # NOW because the uninstall below deletes that tree. It holds the launcher plus
 # heimdall-dream-schedule, so `hmd uninstall` resolves PLUGIN_DIR to this tree and
 # reaches the real LaunchAgent off-switch rather than its no-helper fallback.
-PROBE_TREE="$(mktemp -d)"; mkdir -p "$PROBE_TREE/bin"
+# bin/lib/real-home.sh comes too: it holds the SHARED passwd-based real-user
+# predicate that BOTH halves of the launchd guard resolve through (bin/heimdall on
+# uninstall, bin/heimdall-dream-schedule on install). Omitting it would make the
+# probe tree unrepresentative of a real install AND would silently push both halves
+# onto their fail-safe "cannot prove → refuse" branch, turning §7f/§8b green for the
+# wrong reason. Its presence is asserted below, so a failed copy FAILS LOUD.
+PROBE_TREE="$(mktemp -d)"; mkdir -p "$PROBE_TREE/bin/lib"
 cp "$RESOLVED_PLUGIN/bin/heimdall" "$PROBE_TREE/bin/heimdall" 2>/dev/null || true
 cp "$RESOLVED_PLUGIN/bin/heimdall-dream-schedule" "$PROBE_TREE/bin/heimdall-dream-schedule" 2>/dev/null || true
-chmod +x "$PROBE_TREE/bin/heimdall" "$PROBE_TREE/bin/heimdall-dream-schedule" 2>/dev/null || true
+cp "$RESOLVED_PLUGIN/bin/lib/real-home.sh" "$PROBE_TREE/bin/lib/real-home.sh" 2>/dev/null || true
+# heimdall-dream is the binary the schedule REGISTERS. §8 needs it present because
+# cmd_install refuses without an executable dream bin, and the plist it writes must
+# name this exact path. It is never executed here — only stat'd and embedded.
+cp "$RESOLVED_PLUGIN/bin/heimdall-dream" "$PROBE_TREE/bin/heimdall-dream" 2>/dev/null || true
+# install.sh too — §8d sources it (HEIMDALL_INSTALL_SOURCE_ONLY=1) to assert the state
+# word its ensure_dream_schedule returns. Copied HERE, from the INSTALLED tree, because
+# the uninstall below deletes $RESOLVED_PLUGIN before §8 runs.
+cp "$RESOLVED_PLUGIN/install.sh" "$PROBE_TREE/install.sh" 2>/dev/null || true
+chmod +x "$PROBE_TREE/bin/heimdall" "$PROBE_TREE/bin/heimdall-dream-schedule" \
+         "$PROBE_TREE/bin/heimdall-dream" 2>/dev/null || true
 
 # (7·0a) RESERVED-SUBCOMMAND NON-TTY CLASS — the launcher-preamble regression.
 # THE BUG (fixed in bin/heimdall, locked here): the F1 launch resolution-order
@@ -732,8 +748,10 @@ uninstall_probe() {
 }
 plant_plist() { printf '<plist>nightly</plist>\n' > "$1/LaunchAgents/com.heimdall.dream.plist"; }
 
-if [ ! -x "$PROBE_TREE/bin/heimdall" ] || [ ! -x "$PROBE_TREE/bin/heimdall-dream-schedule" ]; then
-  bad "uninstall-reversal probes unavailable — installed tree lacked heimdall/heimdall-dream-schedule"
+if [ ! -x "$PROBE_TREE/bin/heimdall" ] || [ ! -x "$PROBE_TREE/bin/heimdall-dream-schedule" ] \
+   || [ ! -f "$PROBE_TREE/bin/lib/real-home.sh" ] || [ ! -x "$PROBE_TREE/bin/heimdall-dream" ] \
+   || [ ! -f "$PROBE_TREE/install.sh" ]; then
+  bad "launchd-guard probes unavailable — installed tree lacked heimdall / heimdall-dream-schedule / heimdall-dream / bin/lib/real-home.sh / install.sh"
 else
 
 # (7f) REAL-USER UNINSTALL REMOVES THE NIGHTLY LAUNCHAGENT.
@@ -875,6 +893,152 @@ else
   bad "absent settings.json mishandled (rc=$ABS_RC, created=$([ -e "$SB/.claude/settings.json" ] && echo yes || echo no))"
 fi
 rm -rf "$SB"
+
+# ── (8a–8e) INSTALL DOES NOT REGISTER A LAUNCHAGENT FROM A SANDBOX ────────────
+#
+# THE INCIDENT THIS CLOSES (observed, not hypothetical). Agents running real installs
+# during testing overwrote the developer's REAL ~/Library/LaunchAgents/
+# com.heimdall.dream.plist and left it pointing at an ephemeral agent worktree — a
+# tree that is later reaped, so the nightly job was wired to a path that ceases to
+# exist. The cause: `launchctl` registers into the logged-in user's GUI session domain
+# (gui/<uid>) and does NOT resolve through $HOME. A throwaway HOME=$(mktemp -d)
+# isolates WHERE the plist file lands but NOT which launchd hears about it, so ANY
+# test performing a real install reaches the real scheduler.
+#
+# Uninstall got a passwd-based self-detecting guard (§7f/§7g). Install had only
+# HEIMDALL_NO_DREAM_SCHEDULE=1 — an opt-out every caller must REMEMBER. One forgot;
+# that is the whole incident. §8a is the assertion that would have caught it.
+#
+# ISOLATION — identical to §7f–§7k and equally incapable of touching anything real:
+#   1. HOME is a throwaway mktemp -d
+#   2. launchctl is STUBBED — $LAUNCHCTL points at the recorder AND the stub dir is
+#      FIRST on PATH, so even a bare `launchctl` lands on the recorder
+#   3. HEIMDALL_LAUNCH_AGENTS_DIR + HEIMDALL_DREAM_LOG redirect every write into it
+# On top of that, §8a snapshots the REAL plist and re-checks it afterwards, so a
+# regression that escaped all three layers still cannot pass silently.
+
+# The real nightly plist, if this developer has one. Read-only: hashed before §8 and
+# re-hashed after, never written. '' when absent (a CI box / a dev who opted out).
+REAL_LA_PLIST="$HOME/Library/LaunchAgents/com.heimdall.dream.plist"
+REAL_PLIST_BEFORE=""
+[ -f "$REAL_LA_PLIST" ] && REAL_PLIST_BEFORE="$(shasum -a 256 "$REAL_LA_PLIST" 2>/dev/null | awk '{print $1}')"
+
+# Drive the REAL `heimdall-dream-schedule install` from PROBE_TREE against a sandbox
+# HOME. $1=HOME, remaining args are extra NAME=VALUE env entries. Output → $SCHED_OUT.
+schedule_probe() {
+  local h="$1"; shift
+  local of rc; of="$(mktemp)"
+  env -i HOME="$h" TERM="dumb" PATH="$h/stub:/usr/bin:/bin" \
+    HEIMDALL_LAUNCH_AGENTS_DIR="$h/LaunchAgents" LAUNCHCTL="$h/stub/launchctl" \
+    HEIMDALL_DREAM_LOG="$h/dream.log" \
+    "$@" "$PROBE_TREE/bin/heimdall-dream-schedule" install --repo "$h" </dev/null >"$of" 2>&1
+  rc=$?
+  SCHED_OUT="$(cat "$of")"; rm -f "$of"
+  return "$rc"
+}
+
+# (8a) THE INCIDENT ASSERTION — a synthetic HOME must NOT reach launchd.
+SB="$(new_probe_home)"
+schedule_probe "$SB"; SCHED_RC=$?
+if [ ! -f "$SB/launchctl.calls" ]; then
+  ok "install under a synthetic HOME: launchctl was NEVER invoked (the incident assertion)"
+else
+  bad "INSTALL SANDBOX GUARD FAILED — launchctl was called under a throwaway HOME: $(tr '\n' ' ' < "$SB/launchctl.calls")"
+fi
+if [ ! -e "$SB/LaunchAgents/com.heimdall.dream.plist" ]; then
+  ok "install under a synthetic HOME: no plist was written at all (refusal precedes write_plist)"
+else
+  bad "INSTALL SANDBOX GUARD FAILED — a plist was written under a throwaway HOME"
+fi
+# The refusal must SAY so, in the same words the uninstall side uses.
+if printf '%s' "$SCHED_OUT" | grep -q 'synthetic HOME — refusing to touch the real launchd domain'; then
+  ok "install refusal prints the uninstall side's exact wording (rc=$SCHED_RC)"
+else
+  bad "install refusal wording missing (rc=$SCHED_RC, out: $(printf '%s' "$SCHED_OUT" | tr '\n' ' ' | cut -c1-200))"
+fi
+rm -rf "$SB"
+
+# (8b) REAL USER STILL GETS THE SCHEDULE. The guard is worthless if it also refuses
+# the interactive human it exists to protect. Driven through the HEIMDALL_REAL_HOME
+# seam (it overrides ONLY the resolved passwd home) while isolation layers 2 and 3
+# still stand between this and anything real.
+SB="$(new_probe_home)"
+schedule_probe "$SB" "HEIMDALL_REAL_HOME=$SB"; SCHED_RC=$?
+SB_PLIST="$SB/LaunchAgents/com.heimdall.dream.plist"
+if [ "$SCHED_RC" -eq 0 ] && [ -f "$SB_PLIST" ]; then
+  ok "real user: the nightly LaunchAgent IS installed (rc=0, plist written)"
+else
+  bad "real user: install did not complete (rc=$SCHED_RC, plist=$([ -f "$SB_PLIST" ] && echo yes || echo no), out: $(printf '%s' "$SCHED_OUT" | tr '\n' ' ' | cut -c1-200))"
+fi
+# The plist must name the dream bin of the tree it was installed from — the exact
+# field the incident corrupted (it held a reaped worktree path).
+if [ -f "$SB_PLIST" ] && grep -qF "<string>$PROBE_TREE/bin/heimdall-dream</string>" "$SB_PLIST"; then
+  ok "real user: plist ProgramArguments names the correct dream bin ($PROBE_TREE/bin/heimdall-dream)"
+else
+  bad "real user: plist does not name $PROBE_TREE/bin/heimdall-dream — got: $(grep -o '<string>[^<]*heimdall-dream</string>' "$SB_PLIST" 2>/dev/null | head -1)"
+fi
+if [ -f "$SB/launchctl.calls" ] && grep -q "load -w $SB_PLIST" "$SB/launchctl.calls"; then
+  ok "real user: launchctl load -w was invoked for the sandbox plist"
+else
+  bad "real user: launchctl load was NOT invoked (calls: $(tr '\n' ' ' < "$SB/launchctl.calls" 2>/dev/null))"
+fi
+rm -rf "$SB"
+
+# (8c) THE EXPLICIT OPT-OUT STILL WORKS. Self-detection is an additional floor, not a
+# replacement — a real user who declined must still be declined.
+SB="$(new_probe_home)"
+schedule_probe "$SB" "HEIMDALL_REAL_HOME=$SB" "HEIMDALL_NO_DREAM_SCHEDULE=1"; SCHED_RC=$?
+if [ "$SCHED_RC" -eq 0 ] && [ ! -e "$SB/LaunchAgents/com.heimdall.dream.plist" ] \
+   && [ ! -f "$SB/launchctl.calls" ]; then
+  ok "HEIMDALL_NO_DREAM_SCHEDULE=1 still opts out even for a real user (rc=0, no plist, no launchctl)"
+else
+  bad "opt-out regressed (rc=$SCHED_RC, plist=$([ -e "$SB/LaunchAgents/com.heimdall.dream.plist" ] && echo yes || echo no), calls=$(tr '\n' ' ' < "$SB/launchctl.calls" 2>/dev/null))"
+fi
+rm -rf "$SB"
+
+# (8d) THE INSTALLER REPORTS THE REFUSAL HONESTLY. install.sh's ensure_dream_schedule
+# maps the helper's distinct exit 4 to the state word 'sandboxed' — a silent 'skipped'
+# would hide from the next agent exactly why the schedule is missing. Sourced from the
+# INSTALLED install.sh (HEIMDALL_INSTALL_SOURCE_ONLY=1), the same seam
+# test/dream-install-wire.test.sh uses.
+INSTALLED_SH="$PROBE_TREE/install.sh"
+if [ -f "$INSTALLED_SH" ]; then
+  SB="$(new_probe_home)"
+  DS_STATE="$( set +e
+    export HOME="$SB" PATH="$SB/stub:/usr/bin:/bin" \
+           HEIMDALL_LAUNCH_AGENTS_DIR="$SB/LaunchAgents" LAUNCHCTL="$SB/stub/launchctl" \
+           HEIMDALL_DREAM_LOG="$SB/dream.log" HEIMDALL_INSTALL_SOURCE_ONLY=1
+    source "$INSTALLED_SH" >/dev/null 2>&1
+    ensure_dream_schedule "$PROBE_TREE" )"
+  if [ "$DS_STATE" = "sandboxed" ]; then
+    ok "install.sh reports state 'sandboxed' for a synthetic HOME (not a silent 'skipped')"
+  else
+    bad "install.sh state word for a synthetic HOME was '$DS_STATE' (expected 'sandboxed')"
+  fi
+  if [ ! -f "$SB/launchctl.calls" ] && [ ! -e "$SB/LaunchAgents/com.heimdall.dream.plist" ]; then
+    ok "install.sh's schedule step touched neither launchctl nor a plist under a synthetic HOME"
+  else
+    bad "install.sh's schedule step reached launchd under a synthetic HOME (calls=$(tr '\n' ' ' < "$SB/launchctl.calls" 2>/dev/null))"
+  fi
+  rm -rf "$SB"
+else
+  bad "install.sh not found in the installed tree at $INSTALLED_SH — cannot assert the state word"
+fi
+
+# (8e) THE REAL PLIST IS UNTOUCHED. The final backstop: whatever the probes above did,
+# the developer's own nightly job must be byte-for-byte what it was when §8 started.
+if [ -n "$REAL_PLIST_BEFORE" ]; then
+  REAL_PLIST_AFTER="$(shasum -a 256 "$REAL_LA_PLIST" 2>/dev/null | awk '{print $1}')"
+  if [ "$REAL_PLIST_AFTER" = "$REAL_PLIST_BEFORE" ]; then
+    ok "the REAL ~/Library/LaunchAgents/com.heimdall.dream.plist is byte-identical after §8"
+  else
+    bad "THE REAL NIGHTLY PLIST CHANGED during §8 (was ${REAL_PLIST_BEFORE:0:16}…, now ${REAL_PLIST_AFTER:0:16}…) — the incident recurred"
+  fi
+elif [ -e "$REAL_LA_PLIST" ]; then
+  bad "the REAL nightly plist appeared during §8 — a probe escaped its sandbox"
+else
+  ok "no real nightly plist on this host — §8 conjured none (nothing escaped the sandbox)"
+fi
 
 fi
 
