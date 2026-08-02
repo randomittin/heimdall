@@ -183,7 +183,17 @@ export HEIMDALL_CORPUS_HOME="$WORK/C"
 C_BEFORE="$(spool_count "$HEIMDALL_CORPUS_HOME")"
 # a GitHub PAT shape planted into agent.version (a single token — passes the
 # zero-content check, so ONLY the secret-scan layer can catch it).
-SEC_JOB='{"attestation":{"claims":{"file_count":0,"files":[]}},"ids":{"team_id":"t","repo":"r"},"agent":{"tool":"cursor","version":"ghp_012345678901234567890123456789012345"},"verify":{"verdict":"pass"}}'
+#
+# ASSEMBLED AT RUNTIME (fixture-secret-convention case 2: gate-proof token). The
+# scanner under test keys off ghp_[A-Za-z0-9]{36} (bin/lib/telemetry.py
+# _SECRET_PATTERNS), so the value MUST match that shape when (C1) runs — but it
+# must NOT exist as a contiguous literal in this file, or a working-tree gitleaks
+# scan flags the fixture itself. Each fragment below is individually inert; only
+# the concatenation is detector-shaped. Same pattern as test/selfscan.test.sh.
+_GP_PRE="ghp_"; _GP_A="0123456789012345678"; _GP_B="90123456789012345"
+PLANT_TOK="${_GP_PRE}${_GP_A}${_GP_B}"   # ghp_ + 36 chars, built here, never stored
+SEC_JOB_TMPL='{"attestation":{"claims":{"file_count":0,"files":[]}},"ids":{"team_id":"t","repo":"r"},"agent":{"tool":"cursor","version":"@PLANT_TOK@"},"verify":{"verdict":"pass"}}'
+SEC_JOB="${SEC_JOB_TMPL/@PLANT_TOK@/$PLANT_TOK}"
 C1="$(printf '%s' "$SEC_JOB" | "$CLI" emit 2>"$WORK/C1.err")"
 C_AFTER="$(spool_count "$HEIMDALL_CORPUS_HOME")"
 if printf '%s' "$C1" | grep -q 'secret-detected-blocked' \

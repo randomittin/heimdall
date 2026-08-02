@@ -65,7 +65,12 @@ trap cleanup INT TERM EXIT
 
 HOME_T="$WORK/home"; mkdir -p "$HOME_T"
 MOCK_LOG="$WORK/mock.log"; : > "$MOCK_LOG"
-TOKEN="enroll-secret-abc123"
+# A gitleaks-INERT sentinel (fixture-secret-convention case 1: token-shaped input).
+# The value is a pure pass-through — the client posts it, the mock records it, the
+# assertions below grep for it — so any non-empty opaque string proves exactly what
+# the old value proved. It is deliberately NOT detector-shaped: the previous literal
+# tripped gitleaks' generic-api-key rule in WORKING-TREE scans.
+TOKEN="enroll-sentinel-not-a-real-token"
 
 # ── the mock control plane (records what the client sent; real HTTP, localhost only) ──
 cat > "$WORK/mock_cp.py" <<'PYEOF'

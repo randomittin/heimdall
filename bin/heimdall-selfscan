@@ -5,9 +5,21 @@
 # native git pre-push hook installed by `hmd guard install` AND the Claude Code
 # PreToolUse pre-push gate in hooks/hooks.json):
 #
-#   1. SECRETS — gitleaks over the FULL history (`--log-opts=--all`, every ref
-#      incl. tags). A push can publish tags (`git push --force --tags`), so a
-#      secret on any ref must block. Zero findings required.
+#   1. SECRETS (HISTORY) — gitleaks over the FULL history (`--log-opts=--all`,
+#      every ref incl. tags). A push can publish tags (`git push --force --tags`),
+#      so a secret on any ref must block. Zero findings required.
+#   1b. SECRETS (WORKING TREE) — gitleaks `--no-git` over the PUSHABLE files as
+#      they are on disk: tracked files at their working-tree content, plus
+#      untracked-but-not-ignored ones. Disjoint from 1, not redundant: history
+#      covers secrets committed and later removed; tree covers what is on disk
+#      NOW. A .gitleaksignore entry is commit-scoped, so silencing a benign
+#      historical fixture also hides the still-live on-disk copy from the history
+#      walk — the tree pass is what sees it. Scoped to the pushable set on
+#      purpose: a raw filesystem walk also reads .gitignored paths (the
+#      developer's own .heimdall/team.json, stale agent worktrees), which no push
+#      can carry, and blocking on those would train everyone to disable the gate.
+#      Includes an anti-vacuous floor: a clean verdict over ~0 bytes is refused,
+#      because a gate that read nothing certifies nothing.
 #   2. IDENTITIES — the author AND committer email of every commit on every ref
 #      (`git log --all --format='%ae%n%ce'`) must be a subset of the allowlist
 #      {rj@runheimdall.dev, noreply@anthropic.com}. Any third identity is a hard
@@ -21,8 +33,10 @@
 # blocking pre-push gate, so a secret or an unknown identity cannot leave the
 # machine (see conventions.md R10).
 #
-# Scope: HEIMDALL's FULL git history (all refs, all commits) — not just the
-# staged diff (that is bin/secret-scan's job) and not just the push range.
+# Scope: HEIMDALL's FULL git history (all refs, all commits) PLUS the pushable
+# files as they stand on disk (tracked + untracked-not-ignored) — not just the
+# staged diff (that is bin/secret-scan's job) and not just the push range, and
+# never the .gitignored paths a push cannot carry.
 #
 # SCOPING — this gate polices HEIMDALL's repo, and ONLY heimdall's. It is wired
 # via core.hooksPath set to a RELATIVE path, so the native pre-push hook fires in
@@ -54,8 +68,11 @@
 #   The absence of that line on a push means the gate did not run.
 #
 # Exit codes:
-#   0  clean — no secret anywhere in history AND every identity allowlisted
-#   1  finding — a secret was detected in history, OR a non-allowlisted identity
+#   0  clean — no secret in history OR the working tree, every identity
+#      allowlisted, and the tree scan verifiably examined the tree
+#   1  finding — a secret was detected in history or in the pushable working-tree
+#      set, OR a non-allowlisted identity, OR the pushable set could not be
+#      materialised, OR the tree scan examined too little to certify
 #   2  gitleaks is absent (hard block; install message printed)
 #
 # Usage:
@@ -148,6 +165,158 @@ if [ "$SCAN_RC" -ne 0 ]; then
   exit 1
 fi
 
+# --- scan the WORKING TREE for secrets (--no-git) --------------------------
+# A SECOND secret check, NOT a replacement for the history walk above. The two
+# cover DISJOINT classes and neither subsumes the other:
+#
+#   history (--log-opts=--all) — every blob ever committed on any ref, including
+#     a secret that was committed and later deleted. It cannot see a credential
+#     that is on disk but not yet committed, and it re-reports a committed line
+#     only against the commit that INTRODUCED it.
+#   tree (--no-git) — the files as they exist on disk RIGHT NOW, staged or not.
+#     It cannot see anything already scrubbed from the worktree but still
+#     reachable in history.
+#
+# Why the gap was real: .gitleaksignore fingerprints are commit-scoped
+# (commit:file:rule:line). Silencing one benign historical fixture there ALSO
+# silences the still-live on-disk copy of that line from the history walk, since
+# the walk only ever attributes it to the introducing commit. Tree-mode
+# fingerprints are (file:rule:line) — a different namespace — so the on-disk copy
+# gets judged on its own terms. Before this step, a credential sitting in a
+# working-tree file could be wholly invisible to a gate that reported clean.
+#
+# SCOPE — exactly the files a push can carry, and nothing else.
+# `gitleaks --no-git` walks the FILESYSTEM, which is strictly wider than the
+# repo: it also reads untracked and .gitignored paths. Pointed at this repo that
+# is not a stricter gate, it is a BROKEN one — it reports findings that are
+# unpushable by construction (stale agent worktrees under .claude/, the
+# developer's own .heimdall/team.json bearer credential, ignored scratch docs).
+# A gate that blocks every push on a local credential the push cannot carry is
+# the wolf-crying failure mode: it gets disabled within a day, and the real blind
+# spot above reopens. So we scan the PUSHABLE SET instead:
+#
+#   git ls-files --cached            tracked files, read at their WORKING-TREE
+#                                    content — so uncommitted edits are covered.
+#   git ls-files --others            untracked but NOT ignored. Deliberately IN
+#             --exclude-standard     scope: a brand-new file becomes pushable the
+#                                    instant someone runs `git add .`, which is
+#                                    the common flow. A credential in a new file
+#                                    is exactly the class this pass exists for.
+#   (excluded)                       .gitignored paths. Unpushable without an
+#                                    explicit `git add -f`, which makes them
+#                                    tracked — and therefore back in scope
+#                                    automatically. No permanent blind spot.
+#
+# Why this and NOT a path allowlist in .gitleaks.toml: an allowlist is permanent
+# and blinds the gate to a GENUINE credential later added at that path. This
+# scope is derived from git's own notion of what a push carries, so it
+# self-corrects — the moment a path becomes pushable, it is scanned.
+#
+# Why not simply ask the walker to honor .gitignore: this repo force-adds tracked
+# files INSIDE ignored directories (docs/analysis/ is ignored, yet carries
+# tracked files). A gitignore-respecting walk would silently skip those; the
+# index does not. `git ls-files` is the only source of truth for "pushable".
+#
+# We materialise that set into a throwaway directory (preserving relative paths,
+# so the PATH-scoped allowlists in .gitleaks.toml keep matching) and scan it.
+# `-z` / `--null` keep paths with spaces or newlines intact. The filter drops
+# index entries with no file on disk — a tracked file deleted from the worktree
+# is an ordinary state, and tar would otherwise abort the whole gate on it.
+TREE_TMP="$(mktemp -d)"
+_selfscan_rm_treetmp() {
+  if [ -n "${TREE_TMP:-}" ] && [ -d "${TREE_TMP:-}" ]; then
+    rm -rf "$TREE_TMP" || :
+  fi
+}
+# Arm the cleanup BEFORE anything that can fail, so there is no window in which
+# the directory exists untracked. Covers EVERY exit path including interrupt: the
+# EXIT trap preserves the script's own status (it never calls exit itself), and
+# the signal traps re-exit with the conventional 128+signo so a Ctrl-C still
+# reads as a Ctrl-C to the caller.
+trap '_selfscan_rm_treetmp' EXIT
+trap '_selfscan_rm_treetmp; exit 130' INT
+trap '_selfscan_rm_treetmp; exit 143' TERM
+trap '_selfscan_rm_treetmp; exit 129' HUP
+
+# Canonicalize the same way HEIMDALL_TOP is resolved above, so the prefix we
+# strip from finding paths matches exactly what gitleaks reports. The fallback
+# keeps TREE_TMP non-empty on failure — an emptied TREE_TMP would slip past the
+# cleanup guard above and strand the directory.
+TREE_TMP="$(cd "$TREE_TMP" && pwd -P || printf '%s\n' "$TREE_TMP")"
+
+MAT_RC=0
+(
+  cd "$HEIMDALL_TOP" || exit 1
+  git ls-files -z --cached --others --exclude-standard \
+  | while IFS= read -r -d '' f; do
+      if [ -e "$f" ] || [ -L "$f" ]; then printf '%s\0' "$f"; fi
+    done \
+  | tar --null -T - -cf - \
+  | tar -xf - -C "$TREE_TMP"
+) || MAT_RC=$?
+
+if [ "$MAT_RC" -ne 0 ]; then
+  echo "BLOCKED: could not materialise Heimdall's pushable file set for the" >&2
+  echo "working-tree scan (rc=$MAT_RC). The gate cannot build the surface it is" >&2
+  echo "supposed to certify, so this push is refused rather than passed blind." >&2
+  exit 1
+fi
+
+TREE_OUT=""
+TREE_RC=0
+if [ -f "$GL_CONFIG" ]; then
+  TREE_OUT=$(gitleaks detect --source "$TREE_TMP" --config "$GL_CONFIG" --no-git --no-banner --no-color 2>&1) && TREE_RC=0 || TREE_RC=$?
+else
+  TREE_OUT=$(gitleaks detect --source "$TREE_TMP" --no-git --no-banner --no-color 2>&1) && TREE_RC=0 || TREE_RC=$?
+fi
+
+if [ "$TREE_RC" -ne 0 ]; then
+  echo "BLOCKED: gitleaks detected a secret in Heimdall's WORKING TREE." >&2
+  echo "This is the on-disk copy — the history scan above can be clean while a" >&2
+  echo "credential sits in a tracked file. Remove the value from the file (for a" >&2
+  echo "test fixture use the runtime-assembly / inert-sentinel convention in" >&2
+  echo "docs/superpowers/specs/heimdall-fixture-secret-convention.md). Do NOT add" >&2
+  echo "a fixture PATH to .gitleaks.toml — that blinds the gate to a real secret" >&2
+  echo "later checked in beside it." >&2
+  echo "Paths below are relative to the repo top ($HEIMDALL_TOP)." >&2
+  echo "------------------------------------------------------------" >&2
+  # Rewrite the scratch prefix back to repo-relative paths — a finding the reader
+  # cannot locate in their own checkout is a finding they cannot fix.
+  printf '%s\n' "$TREE_OUT" | sed "s|$TREE_TMP/||g" >&2
+  echo "------------------------------------------------------------" >&2
+  exit 1
+fi
+
+# ANTI-VACUOUS: a tree scan that examined nothing certifies nothing. gitleaks
+# reports the volume it actually read ("scanned ~N bytes"); we parse that and
+# refuse to accept a clean verdict over an empty scan. This is what catches the
+# failure mode where --source resolves somewhere wrong/empty and the gate
+# cheerfully reports 0 findings over 0 files.
+#
+# Scoping the scan to a materialised copy makes this floor MORE load-bearing, not
+# less: a silently-empty materialisation (tar producing nothing, an ls-files that
+# returned no paths) would otherwise hand gitleaks an empty directory and earn a
+# confident "no leaks found". MAT_RC catches a LOUD failure; this floor catches
+# the quiet one.
+#
+# The floor is a STRUCTURAL tripwire, not a size budget: heimdall's pushable set
+# scans ~11 MB, so 100 KB sits ~100x below actual. It can only fire when the scan
+# is pointed at the wrong place or the materialisation collapsed — never on
+# ordinary growth or pruning of the repo.
+TREE_MIN_BYTES=100000
+TREE_BYTES="$(printf '%s\n' "$TREE_OUT" | sed -n 's/.*scanned ~\([0-9][0-9]*\) bytes.*/\1/p' | tail -1)"
+if [ -z "$TREE_BYTES" ] || [ "$TREE_BYTES" -lt "$TREE_MIN_BYTES" ]; then
+  echo "BLOCKED: the working-tree secret scan examined too little to certify" >&2
+  echo "anything (bytes=${TREE_BYTES:-unparseable}, floor=${TREE_MIN_BYTES})." >&2
+  echo "A gate reporting clean over a surface it never read is a vacuous gate." >&2
+  echo "Check that gitleaks still reports 'scanned ~N bytes' and that the scan" >&2
+  echo "source resolves to the heimdall tree ($HEIMDALL_TOP)." >&2
+  echo "------------------------------------------------------------" >&2
+  printf '%s\n' "$TREE_OUT" >&2
+  echo "------------------------------------------------------------" >&2
+  exit 1
+fi
+
 # --- identity allowlist over the FULL history -----------------------------
 # Author AND committer email of every commit on every ref must be allowlisted.
 # `sort -u` collapses to the DISTINCT identities present; any one not in the
@@ -216,5 +385,9 @@ if [ "$LINT_RC" -ne 0 ]; then
 fi
 
 # --- success: emit the single detectable signal line ----------------------
-echo "guard: gitleaks=0 · identities=${allowed_count}/${total_count} allowlisted · landmines=0" >&2
+# The leading `guard: gitleaks=0 · identities=N/N allowlisted` substring is the
+# documented signal (bin/heimdall, hooks/git/pre-push) — extended, never reshaped.
+# The tree byte count is printed so the anti-vacuous measurement is visible on
+# every clean push: "0 findings" is only meaningful next to "over this much".
+echo "guard: gitleaks=0 · identities=${allowed_count}/${total_count} allowlisted · landmines=0 · tree=0/${TREE_BYTES:-n/a}B" >&2
 exit 0
