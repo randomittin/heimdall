@@ -140,6 +140,66 @@ is_comment() {
   esac
 }
 
+# ── PER-LINE MATCHING IS BASH-NATIVE, NOT `printf | grep` ─────────────────────
+# This linter is a BLOCKING pre-push gate: every push pays its full cost, and the
+# harness runs it four times (once directly, three times through the pre-push hook).
+# It used to match every hot line with `printf '%s' "$line" | grep -qE …`, i.e. two
+# fork+exec per test. Over the 38,665 in-scope lines that is ~15,000 processes, and
+# at macOS's ~1.5ms fork/exec that WAS the entire runtime: 26s wall-clock solo,
+# stretching to 83s when the test board oversubscribes the box under --jobs 6.
+#
+# `[[ $s =~ $re ]]` uses the SAME POSIX ERE engine (regcomp/regexec) that `grep -E`
+# does, on the same single line, with the same `^`/`$` anchoring — so the verdicts
+# are identical while the process count drops to zero. Every regex below is the
+# verbatim pattern its `grep -qE` used, hoisted to a constant so it is compiled
+# from a variable (bash 3.2 requires an UNQUOTED right-hand side for `=~`, and a
+# variable is the portable way to spell that).
+#
+# The `\b`-bearing patterns in scan_unguarded_var are deliberately LEFT on sed:
+# BSD sed's `\b` does not behave as a word boundary here (measured: `s/^.*\bdir=//`
+# leaves `local dir="$1" sub="$dir/.heimdall"` untouched), so rewriting them in a
+# true-word-boundary engine would silently CHANGE which class-2 lines are flagged.
+# A performance fix must not move a verdict; those stay exactly as they are.
+_RE_SIGPIPE_HEAD='\|[[:space:]]*head([[:space:]]+-[cn][[:space:]]*[0-9]+)?[[:space:]]*(\)|`|;|$)'
+_RE_SIGPIPE_GUARD='head[^|]*\|\|[[:space:]]*(true|:|echo)'
+_RE_NAME_ASSIGN='[A-Za-z_][A-Za-z0-9_]*='
+_RE_HOME_LITERAL='/(Users|home)/[A-Za-z][A-Za-z0-9._-]+'
+_RE_BARE_SUPERX='(^|[^A-Za-z0-9._/])/superx([/"'"'"' ]|$)'
+_RE_DQ_STRING='"[^"]*"'
+_RE_SQ_STRING="'[^']*'"
+_RE_READ_WORD='(^|[;&|({]|then|else|do)[[:space:]]*read([[:space:]]|$)'
+_RE_PROMPT_FLAG='(^|[[:space:]])-[A-Za-z]*p([[:space:]]|$)'
+_RE_KEYPRESS_FLAG='(^|[[:space:]])-[A-Za-z]*[sn][A-Za-z0-9]*([[:space:]]|$)'
+_RE_TTY_GUARD='\[\[?[[:space:]]+!?[[:space:]]*-t[[:space:]]+0[[:space:]]'
+_RE_YES_GATE='(ASSUME_YES|_uyes|--yes|-y)'
+_RE_TTY_TEST='(!?[[:space:]]*-t[[:space:]]+0)'
+# `\b` is spelled out here ON PURPOSE. macOS `grep -E` honours `\b` as a word
+# boundary, but bash's `=~` compiles through libc regcomp, which treats it as a
+# literal `b` — so a verbatim '_heimdall_remove_plugin\b' silently stops matching
+# and drops the whole class-5 finding. `([^A-Za-z0-9_]|$)` is the boundary the
+# preceding word char implies, and it restored the byte-identical finding set.
+_RE_REMOVE_PLUGIN='_heimdall_remove_plugin([^A-Za-z0-9_]|$)'
+_RE_RM_SELF='rm[[:space:]]+-rf[[:space:]]+"?\$(\{)?(0|PLUGIN_DIR|HEIMDALL_HOME)'
+_RE_RM_DOTHEIMDALL='rm[[:space:]]+-rf[[:space:]].*\$HOME/\.heimdall'
+_RE_SOURCE_VERB='(^|[;&]|then|do|else)[[:space:]]*(source|\.)[[:space:]]+'
+_RE_SOURCE_TARGET='\$(\{)?(PLUGIN_DIR|HEIMDALL_HOME|HOME)|\.heimdall|\$0'
+
+# Delete every match of $2 from $1, leftmost-first, without forking sed. Equivalent
+# to `s/RE//g` for the quote patterns used here: the prefix before a leftmost match
+# provably contains no quote character, so re-scanning from the start after each
+# removal cannot manufacture a match that a left-to-right sed pass would have missed.
+# The result lands in the global STRIPPED rather than on stdout — a `$(…)` capture
+# would fork a subshell per line and reintroduce exactly the cost being removed.
+STRIPPED=""
+strip_matches() {
+  local s="$1" re="$2" m
+  while [[ $s =~ $re ]]; do
+    m="${BASH_REMATCH[0]}"
+    s="${s%%"$m"*}${s#*"$m"}"
+  done
+  STRIPPED="$s"
+}
+
 # Does this file run under strict mode (set -e and/or pipefail)? Class 1 only
 # bites when the pipeline's nonzero status can abort the script.
 file_is_strict() {
@@ -184,13 +244,17 @@ scan_sigpipe() {
       *'$('*|*'`'*) : ;;
       *) continue ;;
     esac
+    # Cheap literal pre-filter: the class is defined by a terminal `head` stage, so
+    # a line without the substring `head` can never match the regex below. This is
+    # a strict subset test — it removes the regex call for ~97% of lines and cannot
+    # change a verdict.
+    case "$line" in *head*) : ;; *) continue ;; esac
     # Find a `head` that is the terminal stage of a pipe: `| head [...]` followed
     # only by optional close-paren/backtick/semicolon/whitespace to EOL.
     # head with a byte/line cap is the canonical early-closer.
-    if printf '%s' "$line" \
-         | grep -qE '\|[[:space:]]*head([[:space:]]+-[cn][[:space:]]*[0-9]+)?[[:space:]]*(\)|`|;|$)'; then
+    if [[ $line =~ $_RE_SIGPIPE_HEAD ]]; then
       # Guarded if a `|| true` / `|| :` / `|| echo` appears AFTER the head stage.
-      if printf '%s' "$line" | grep -qE 'head[^|]*\|\|[[:space:]]*(true|:|echo)'; then
+      if [[ $line =~ $_RE_SIGPIPE_GUARD ]]; then
         continue
       fi
       emit "$file" "$lineno" "1-SIGPIPE" "$line" \
@@ -216,6 +280,11 @@ scan_unguarded_var() {
       *local\ *|*declare\ *|*'	'local\ *) : ;;
       *) continue ;;
     esac
+    # Cheap literal pre-filter: the emit below requires a `$name` DEREFERENCE, so a
+    # declaration line with no `$` on it anywhere cannot produce a finding. Strict
+    # subset test — it cannot change a verdict, and it skips the sed/grep pipeline
+    # for the majority of `local` lines (plain `local i` / `local a b c` forms).
+    case "$line" in *'$'*) : ;; *) continue ;; esac
     # Pull the declaration body after the `local`/`declare` keyword, then TRUNCATE
     # at the first `;` — the `local` statement ends there. Bash expands only the
     # RHS of the local itself before the names exist; a `$name` deref in a LATER
@@ -225,8 +294,28 @@ scan_unguarded_var() {
     body="$(printf '%s' "$line" | sed -E 's/.*\b(local|declare)[[:space:]]+(-[A-Za-z]+[[:space:]]+)*//')"
     body="${body%%;*}"
     # Collect names assigned in the statement: tokens of the form  NAME=
-    local names
-    names="$(printf '%s' "$body" | grep -oE '[A-Za-z_][A-Za-z0-9_]*=' | sed 's/=$//' | sort -u || true)"
+    # Bash-native equivalent of `grep -oE '[A-Za-z_][A-Za-z0-9_]*=' | sed 's/=$//'`:
+    # `=~` yields the LEFTMOST match, and any earlier literal occurrence of that same
+    # token would itself have matched earlier — so cutting the scan cursor at the
+    # first literal occurrence lands exactly where grep -o's next scan would resume.
+    local names raw nm_tok ncount rest
+    raw=""; ncount=0; rest="$body"
+    while [[ $rest =~ $_RE_NAME_ASSIGN ]]; do
+      nm_tok="${BASH_REMATCH[0]}"
+      raw="$raw${nm_tok%=}
+"
+      ncount=$((ncount + 1))
+      rest="${rest#*"$nm_tok"}"
+    done
+    [ "$ncount" -gt 0 ] || continue
+    # `sort -u` decided both dedupe AND the order the names are tried in, which picks
+    # which name the hint names. Keep the real sort whenever that can matter; a single
+    # name sorts to itself, so skip the fork in the overwhelmingly common case.
+    if [ "$ncount" -gt 1 ]; then
+      names="$(printf '%s' "$raw" | sort -u)"
+    else
+      names="$raw"
+    fi
     [ -n "$names" ] || continue
     local nm
     while IFS= read -r nm; do
@@ -279,14 +368,14 @@ scan_baked_path() {
       *) _is_sed=0 ;;
     esac
     # /Users/<name>/  or  /home/<name>/  — a real per-machine home literal.
-    if printf '%s' "$line" | grep -qE '/(Users|home)/[A-Za-z][A-Za-z0-9._-]+'; then
+    if [[ $line =~ $_RE_HOME_LITERAL ]]; then
       emit "$file" "$lineno" "3-BAKED-PATH" "$line" \
         "machine-specific absolute home literal — use \$HOME or a \${VAR:-default} so the script stays relocatable"
       continue
     fi
     # bare /superx as an ABSOLUTE path segment (not `.superx`, not in a sed
     # delete of a legacy line). The old product root that broke on rename.
-    if printf '%s' "$line" | grep -qE '(^|[^A-Za-z0-9._/])/superx([/"'"'"' ]|$)'; then
+    if [[ $line =~ $_RE_BARE_SUPERX ]]; then
       if [ "$_is_sed" = 1 ]; then continue; fi
       emit "$file" "$lineno" "3-BAKED-PATH" "$line" \
         "bare absolute '/superx' (the old product root) — use a \${VAR:-default} relocatable path"
@@ -338,9 +427,10 @@ scan_tty_read() {
     # Strip double- and single-quoted string CONTENT so the word "read" inside a
     # message ("… read claims first …") is never mistaken for the read command.
     local bare
-    bare="$(printf '%s' "$line" | sed -E "s/\"[^\"]*\"//g; s/'[^']*'//g")"
+    strip_matches "$line" "$_RE_DQ_STRING"; bare="$STRIPPED"
+    strip_matches "$bare" "$_RE_SQ_STRING"; bare="$STRIPPED"
     # Must contain a `read` command word (start of line or after ;/&&/|| / `(`).
-    printf '%s' "$bare" | grep -qE '(^|[;&|({]|then|else|do)[[:space:]]*read([[:space:]]|$)' || continue
+    [[ $bare =~ $_RE_READ_WORD ]] || continue
     # Skip `read` that pulls from a pipe/file/herestring/process-sub (not stdin):
     #   trailing `< …`, `<<< …`, `<<EOF`, or the line is the body of `… | while`.
     case "$bare" in
@@ -367,9 +457,9 @@ scan_tty_read() {
     # for "any key" (animation-skip), reads into a throwaway, never solicits an
     # answer. We exempt it so the face-render polls in bin/heimdall stay clean.
     _is_prompt=0
-    if printf '%s' "$bare" | grep -qE '(^|[[:space:]])-[A-Za-z]*p([[:space:]]|$)'; then
+    if [[ $bare =~ $_RE_PROMPT_FLAG ]]; then
       _is_prompt=1                                   # (a) explicit -p prompt cluster
-    elif printf '%s' "$bare" | grep -qE '(^|[[:space:]])-[A-Za-z]*[sn][A-Za-z0-9]*([[:space:]]|$)'; then
+    elif [[ $bare =~ $_RE_KEYPRESS_FLAG ]]; then
       _is_prompt=0                                   # keypress poll (-s/-n, no -p) → not a prompt
     else
       _is_prompt=1                                   # (b) bare read soliciting an answer
@@ -391,9 +481,8 @@ scan_tty_read() {
       # Enclosing-scope start / boundary at column 0 → stop searching above it,
       # but inspect the boundary line itself first (an `if [ -t 0 ]; then` guard
       # lives on that boundary line).
-      if printf '%s' "$prev" | grep -qE '\[\[?[[:space:]]+!?[[:space:]]*-t[[:space:]]+0[[:space:]]'; then guarded=1; break; fi
-      if printf '%s' "$prev" | grep -qE '(ASSUME_YES|_uyes|--yes|-y)' \
-         && printf '%s' "$prev" | grep -qE '(!?[[:space:]]*-t[[:space:]]+0)'; then guarded=1; break; fi
+      if [[ $prev =~ $_RE_TTY_GUARD ]]; then guarded=1; break; fi
+      if [[ $prev =~ $_RE_YES_GATE ]] && [[ $prev =~ $_RE_TTY_TEST ]]; then guarded=1; break; fi
       case "$prev" in
         # Boundary: a NEW arm/function opening at column 0 means we've left the
         # current scope going up — stop (the guard, if any, must be inside it).
@@ -435,9 +524,9 @@ scan_order_destroy() {
     esac
     # A self-destruction line.
     local destroyed=0
-    printf '%s' "$line" | grep -qE '_heimdall_remove_plugin\b' && destroyed=1
-    printf '%s' "$line" | grep -qE 'rm[[:space:]]+-rf[[:space:]]+"?\$(\{)?(0|PLUGIN_DIR|HEIMDALL_HOME)' && destroyed=1
-    printf '%s' "$line" | grep -qE 'rm[[:space:]]+-rf[[:space:]].*\$HOME/\.heimdall' && destroyed=1
+    [[ $line =~ $_RE_REMOVE_PLUGIN ]]    && destroyed=1
+    [[ $line =~ $_RE_RM_SELF ]]         && destroyed=1
+    [[ $line =~ $_RE_RM_DOTHEIMDALL ]]  && destroyed=1
     [ "$destroyed" -eq 1 ] || continue
     # Scan forward in the same scope for a source/. of a file under the tree.
     # Stop at the next function definition boundary `}` at column 0 (end of scope).
@@ -449,8 +538,7 @@ scan_order_destroy() {
       esac
       is_comment "$nxt" && continue
       # `source FILE` or `. FILE` where FILE references the deleted tree.
-      if printf '%s' "$nxt" | grep -qE '(^|[;&]|then|do|else)[[:space:]]*(source|\.)[[:space:]]+' \
-         && printf '%s' "$nxt" | grep -qE '\$(\{)?(PLUGIN_DIR|HEIMDALL_HOME|HOME)|\.heimdall|\$0'; then
+      if [[ $nxt =~ $_RE_SOURCE_VERB ]] && [[ $nxt =~ $_RE_SOURCE_TARGET ]]; then
         emit "$file" "$((j + 1))" "5-ORDER-DESTROY" "$nxt" \
           "sources a file under a tree deleted at line $((i + 1)) (self-destruct then re-source) → the file is gone; move the source BEFORE the delete"
       fi
