@@ -8,6 +8,46 @@
     "example"
   ],
   "oracles": {
+    "rr-multitenant-isolation": {
+      "gate_type": "example",
+      "description": "Multi-tenant cross-tenant-denial oracle. Grades a candidate isolation module (ES module exporting `default evaluate(attackId)`) against a FIXED all-DENY acceptance table of 25 enumerated cross-tenant attacks drawn from the RED-line table in docs/specs/2026-07-03-rr-isolation-invariants.md, and asserts EVERY attack is DENIED. Covers repo<->team authz (IDOR via repo slug, INV-11), server-derived team_id (INV-1: a wire team_id is never operative), per-team cred/queue/installation partition (INV-2/3, A5), the enqueue-only credential-free public surface (INV-6), the owner-only god aggregate (INV-GOD: /god/* 404s on the PUBLIC surface for every caller and every team secret; owner PKI + valid signature + IAM on the gated service; partitions enumerated server-side even for the owner; IAP assertions VERIFIED, never the edge trusted), dashboard login sessions (INV-LOGIN: server-derived teams, TTL enforced, mint signature verified, never owner), chat-handle binding (INV-CHAT: a bare chat_id is never an identity), and zero-touch auto-team join (INV-AUTOTEAM: collaborator check, gh identity re-derivation, public write threshold, initiate admin/push, HAID possession, repo->team convergence). gate_type is `example`, NOT `differential`: the truth source is a fixed input->expected-output table, not an independently-authored reference implementation recomputed over the same inputs. Gate strength comes instead from the falsifiability sweep — `bin/falsify` requires the golden candidate GREEN and all 23 single-gate-drop mutants RED (score 1.0), so no isolation gate in the model is decorative.",
+      "domain_signals": [
+        "rr-multitenant-isolation",
+        "multi-tenant isolation",
+        "cross-tenant",
+        "tenant partition",
+        "cross-partition read",
+        "IDOR",
+        "server-derived team_id",
+        "team_covers_repo",
+        "enqueue-only public surface",
+        "INV-GOD",
+        "god roster",
+        "/god/",
+        "INV-AUTOTEAM",
+        "repo team auto-join"
+      ],
+      "assets": [
+        {
+          "name": "acceptance-oracle",
+          "kind": "in-repo-dataset",
+          "purpose": "The fixed {attackId -> \"DENY\"} truth table (fixtures/golden/acceptance.json, 25 cases, every expected DENY), transcribed from the spec's RED-line attack table rather than computed by any implementation. It is applied identically to the golden candidate and to every mutant, and it shares no code path with fixtures/model.mjs (the shared codebase golden and mutants are cut from). Weakening it — dropping an attack case — is exactly how test/heimdall-rr-isolation-oracle.test.sh proves the table is load-bearing: the mutant that only flips that case then SURVIVES and the falsify score drops below 1.0.",
+          "dir": "evals/oracles/rr-multitenant-isolation/fixtures/golden"
+        },
+        {
+          "name": "gate-dropped-mutant-corpus",
+          "kind": "in-repo-dataset",
+          "purpose": "23 committed mutants, each the shared isolation model with EXACTLY ONE isolation gate dropped, pinned via manifest.json to the single attack it flips DENY->ALLOW. The falsifiability sweep requires all 23 KILLED plus the golden GREEN, which is the meta-proof that each registered gate actually stops a real cross-tenant attack. Two acceptance cases (enqueue-cross-partition, G2-team-secret-god) have no dedicated mutant of their own — they exercise gates already pinned by an earlier case (serverDerivedTeam via A1-spoof-team-id, publicSurfaceRoute via G1-god-on-public), so they are graded on every run but are not the first_divergence for any mutant.",
+          "dir": "evals/oracles/rr-multitenant-isolation/fixtures/mutants"
+        }
+      ],
+      "gate_command": "bin/falsify rr-multitenant-isolation --assert-score 1.0",
+      "reference": {
+        "independent": true,
+        "kind": "in-repo-dataset",
+        "dir": "evals/oracles/rr-multitenant-isolation/fixtures/golden"
+      }
+    },
     "team-copilot": {
       "gate_type": "differential",
       "description": "Unified team co-piloting oracle (REDUM TEAM-LENS arm). Folds an identical seeded teammate work-state stream through the REAL redum team lens (bin/lib/redum.factor_for_task with team_lens=True, driven over a real on-disk claim+checkpoint ledger) and an independently-authored reference fold, normalizes both to a common comparable partition (the team-candidate roster [surface, haid, human, class, adoptable] \u2014 NOT the raw records), and asserts they are identical across all seeds. Catches whole-aggregate co-piloting bugs a per-record property check passes: a cross-team read (RT-ISO), a reaped-vs-in-flight misclassification (RT-CLASS, the code\u222awork bridge: don't-reinvent live work / don't-redo dropped work), a dropped teammate row (RT-DROP), or a teammate's goal prose leaking into a surfaced candidate (RT-LEAK). The team residual signal at the commit gate is WARN-only (never blocks); the local same-repo redum duplicate gate is unchanged (still hard-blocks).",
