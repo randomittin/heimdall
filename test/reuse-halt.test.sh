@@ -146,7 +146,7 @@ reset_tree
 
 # ── reinvention (reuse-hostile) reference diff: reimplements the helpers inline ─
 # Four duplicated capabilities + one consumer => 1/5 = 0.20 reuse (< 0.30 floor).
-# See test/reuse-mini-git.sh for why the consumer is credited as the lone reuse.
+# See test/reuse-mini-git.test.sh for why the consumer is credited as the lone reuse.
 cat > "$REPO/api/users.js" <<'EOF'
 export function formatUser(user) { return user.first + " " + user.last; }
 export function getUser(id) {

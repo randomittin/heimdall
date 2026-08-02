@@ -156,7 +156,7 @@ build / a specific assertion) — never self-report.
 > here is a genuine signal that `hmd` reinvented when reuse was the obviously-correct
 > path — exactly what C3 is meant to measure.
 
-> **Falsifiability of the reuse signal:** the C2 fixture (`test/reuse-mini-git.sh`)
+> **Falsifiability of the reuse signal:** the C2 fixture (`test/reuse-mini-git.test.sh`)
 > already proves the metric distinguishes a reuse solution (≥0.60) from a
 > reinvention solution (<0.30) on a controlled diff. C3 is the *cold breadth*
 > extension of that proven instrument; we are not asked to re-prove the metric, only
@@ -423,5 +423,5 @@ contain the feature.
 - **Forward features F2–F6** — gated behind the C3 verdict; out of scope until C3
   returns GENERALIZES.
 - **Re-proving the reuse metric itself** — its falsification lives in
-  `test/reuse-mini-git.sh` + `test/reuse-metric.test.sh`; C3 applies the proven
+  `test/reuse-mini-git.test.sh` + `test/reuse-metric.test.sh`; C3 applies the proven
   instrument, it does not re-validate it.
