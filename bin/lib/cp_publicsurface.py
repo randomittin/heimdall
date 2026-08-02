@@ -97,8 +97,14 @@ import cp_credforward  # LEAST-PRIVILEGE cred WRITE-FORWARD (POST /team/cred). O
 #   POST /enroll    — token-gated PKI bootstrap (pre-auth; cp_enroll).
 #   POST /presence  — the signed heartbeat (cp_presence; rate-limited + replay-checked here).
 #   GET  /roster    — the online-team read (cp_presence; signed, a read so no nonce).
-#   GET  /healthz   — the Cloud Run liveness probe (pre-auth; cp_diag).
-#   GET  /readyz    — the Cloud Run readiness probe (pre-auth; cp_diag).
+#   GET  /healthz   — the Cloud Run liveness probe (pre-auth; cp_diag). SERVED by the app, but
+#       NOT reachable from OUTSIDE on Cloud Run: Google's edge intercepts an external GET
+#       /healthz and answers its own HTML 404 before the request reaches the container (the 404
+#       carries no x-cloud-trace-context; a /readyz 200 does). The entry STAYS — the app must
+#       answer the platform's own probe and every local/self-host caller — but an EXTERNAL
+#       reachability check MUST use /readyz (go-live.sh §7.0, docs/team-validation-runbook.md §1.1).
+#   GET  /readyz    — the Cloud Run readiness probe (pre-auth; cp_diag). The externally reachable
+#       one, and the stronger signal: it proves the seam booted AND the state backend initialised.
 #
 # PLUS the TEAM-PRIVATE browser-read seam (app-layer only — NOT a signed/IAM route, so it is
 # additive to the gcloud display string above; the static heimdall-site dashboard fetches it):

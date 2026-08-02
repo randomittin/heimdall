@@ -75,6 +75,12 @@ set -euo pipefail
 # the GO-LIVE-RUNBOOK, and the {POST /enroll, POST /presence, GET /roster, GET /healthz,
 # GET /readyz} contract the server's HEIMDALL_PUBLIC_SURFACE gate enforces.
 # check-public-surface.sh asserts this exact line appears verbatim in the README.
+#
+# GET /healthz IS served by the app (test/cp-public-allowlist-serves.test.sh proves every entry
+# here resolves to a handler) but is NOT reachable from outside on Cloud Run — Google's edge
+# answers its own HTML 404 for an external GET /healthz before the request reaches the container.
+# That is a platform behaviour, not a deploy defect: do NOT drop it from this contract, and do
+# NOT use it to verify a deploy. Every external reachability check probes /readyz instead.
 PUBLIC_SURFACE_ROUTES="POST /enroll, POST /presence, GET /roster, GET /healthz, GET /readyz"
 
 # ── config (every value overridable from the env; defaults match README §0) ──────────
