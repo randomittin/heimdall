@@ -40,7 +40,7 @@ Construct (or pick) a **small multi-module repo** where the correct solution to 
 - Measure reuse % via Component 1.
 - **Acceptance (C2):** reuse ≥ a stated threshold (start at **≥ 60%** for a task this reuse-friendly; justify if you change it). The agent must call the existing `format`/`db`/`User`, not reinvent them. If it reinvents, that's a real finding — report the reuse % and *what* it duplicated.
 
-Make this a **permanent harness fixture** (`test/reuse-mini-git.sh` or fold into the conformance suite) so reuse regressions fail loudly later.
+Make this a **permanent harness fixture** (`test/reuse-mini-git.test.sh` or fold into the conformance suite) so reuse regressions fail loudly later.
 
 ---
 

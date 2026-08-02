@@ -130,6 +130,16 @@ suite_timeout() {
     issue-loop-integration.test.sh)  override=420 ;;
     # measured 56s solo / 102s under --jobs 6 — the closest suite to the old 120s cliff.
     heimdall-context-capsule.test.sh) override=300 ;;
+    # measured 93s SOLO (28 passed, 0 failed). It drives SIX real installs — a full
+    # git clone of this repo plus install.sh runs for: the primary stranger HOME, the
+    # idempotency re-run, a fresh first-run-ordering HOME, and three graceful-degrade
+    # variants — then a real uninstall + a re-uninstall. Clone/IO-bound, so it contends
+    # hard with the other IO-heavy suites (selfscan's gitleaks tree pass). At the
+    # measured ~1.8x parallel factor that is ~167s, only 13s under the 180s default:
+    # a cliff, and this suite only became glob-visible when it was renamed to
+    # .test.sh, so it has never yet been budgeted. 3x solo matches the tier the other
+    # IO-heavy suites sit in (selfscan 203->600 = 2.96x, issue-loop 133->420 = 3.16x).
+    install-stranger.test.sh)        override=300 ;;
   esac
   [ "$override" -gt "$TIMEOUT" ] && { echo "$override"; return 0; }
   echo "$TIMEOUT"

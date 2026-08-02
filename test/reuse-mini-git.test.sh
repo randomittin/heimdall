@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# test/reuse-mini-git.sh — S-6 C2 controlled mini-git reuse proof.
+# test/reuse-mini-git.test.sh — S-6 C2 controlled mini-git reuse proof.
 #
 # Builds a SMALL multi-module repo where the correct solution to a task OBVIOUSLY
 # requires reusing existing code, then proves the reuse metric measures it:

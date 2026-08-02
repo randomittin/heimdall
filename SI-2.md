@@ -128,7 +128,7 @@ many call a symbol that already existed in the repo (reuse) versus reinventing i
 - `suspected_duplicates` — new units that re-declare a pre-existing capability
   (`{ new_unit, duplicates, file }`), i.e. reinvention.
 - `engine` — `treesitter` when the AST backend loads, `heuristic` on fallback.
-  The two backends are held to the **same verdict**: `test/reuse-mini-git.sh`
+  The two backends are held to the **same verdict**: `test/reuse-mini-git.test.sh`
   and `test/si-2-attest.test.sh` both assert AST/heuristic agreement on the
   reuse classification, so swapping the detection substrate does not change the
   metric's behavior.
@@ -252,5 +252,5 @@ on a **real** temp git repo, with **no model spend** and **no token cost**
    exits 0 (graceful partial, never blocks);
 7. tree-sitter and heuristic engines reach the same reuse verdict.
 
-The AST/heuristic engine agreement asserted in `test/reuse-mini-git.sh` (and
+The AST/heuristic engine agreement asserted in `test/reuse-mini-git.test.sh` (and
 mirrored here) stays green — the reuse substrate swap is behavior-preserving.
