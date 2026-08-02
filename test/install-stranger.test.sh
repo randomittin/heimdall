@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# install-stranger.sh — stranger-environment acceptance harness for install.sh
+# install-stranger.test.sh — stranger-environment acceptance harness for install.sh
 #
 # Reproduces a clean curl-install in a stripped env (a fresh $HOME, a minimal
 # PATH carrying only claude/node/git) and asserts the four launch-blocking
@@ -19,8 +19,8 @@
 #      double-append), so the headline `hmd demo` actually runs.
 #
 # Usage:
-#   test/install-stranger.sh                 # uses repo of this checkout @ HEAD
-#   REPO=/path REF=<sha|tag> test/install-stranger.sh
+#   test/install-stranger.test.sh                 # uses repo of this checkout @ HEAD
+#   REPO=/path REF=<sha|tag> test/install-stranger.test.sh
 #
 # Exit 0 = all guarantees hold. Non-zero = a guarantee regressed (prints which).
 set -uo pipefail

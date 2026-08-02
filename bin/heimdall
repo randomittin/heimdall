@@ -46,11 +46,46 @@ SETUP_MARKER="$HEIMDALL_HOME_DIR/setup-done"
 # Legacy marker location — inside the install dir (pre user-home migration).
 SETUP_MARKER_LEGACY="$PLUGIN_DIR/.setup-done"
 
+# ── Teardown guard: NOTHING may recreate the home dir during an uninstall ──
+#
+# THE BUG THIS CLOSES: the run-count bump (hmd_bump_run_count, far below) runs
+# UNCONDITIONALLY in the preamble — BEFORE the subcommand `case` dispatches — so
+# `hmd uninstall` re-created $HEIMDALL_HOME_DIR (holding a fresh .run-count) on its
+# way in. Worse, the resurrected dir then DEFEATED _heimdall_remove_plugin's own
+# plugin.json guard (dir present but not a plugin tree → removal skipped), so
+# ~/.heimdall survived the uninstall and every subsequent one. Uninstall was never
+# idempotent, and the leftover was invisible because the suite that proved it was
+# not discovered by the runner (test/install-stranger.test.sh).
+#
+# THE SHAPE OF THE FIX: one flag, computed ONCE from the dispatch word, plus ONE
+# function that is the only thing allowed to create the home dir. A NEW subcommand
+# does not have to remember anything — it calls _heimdall_home_ensure like every
+# other writer and inherits the guard for free. The only thing to keep in sync is
+# the teardown verb list right here, which is a property of teardown itself, not of
+# whatever subcommands get added later. Keyed on $1 BEFORE any shift, so it always
+# sees the real invocation.
+HEIMDALL_TEARDOWN=0
+case "${1:-}" in
+  uninstall|--uninstall) HEIMDALL_TEARDOWN=1 ;;
+esac
+
+# _heimdall_home_ensure — the ONE creator of $HEIMDALL_HOME_DIR.
+# Returns 0 when the dir exists / was created; non-zero when it must NOT exist
+# (teardown) or could not be created. Every caller guards with `|| return` / `|| true`,
+# so a refusal is never fatal under `set -euo pipefail`.
+_heimdall_home_ensure() {
+  [ "${HEIMDALL_TEARDOWN:-0}" -eq 1 ] && return 1
+  mkdir -p "$HEIMDALL_HOME_DIR" 2>/dev/null || return 1
+  return 0
+}
+
 # _write_setup_marker — record first-run setup as complete in the USER home.
 # mkdir -p the home first (a cold box may not have it yet). NEVER writes into
 # $PLUGIN_DIR. Idempotent; failures are swallowed so a degraded FS never aborts.
 _write_setup_marker() {
-  mkdir -p "$HEIMDALL_HOME_DIR" 2>/dev/null || true
+  # Routed through the ONE creator so a teardown never resurrects the home dir it
+  # is about to remove — and so no setup marker is written on the way out.
+  _heimdall_home_ensure || return 0
   touch "$SETUP_MARKER" 2>/dev/null || true
   # Also drop a best-effort marker at the legacy install-dir location. This is a
   # NON-authoritative convenience copy: idempotency + cold/warm detection key off
@@ -76,7 +111,7 @@ fi
 # When HEIMDALL_TRACE_ORDER points at a file, each first-run phase appends one
 # ordered marker to it (setup:auth → setup:companion → setup:skills →
 # launch:task) and the launcher short-circuits just before the real `claude`
-# exec. This is how test/install-stranger.sh proves, WITHOUT a live model call,
+# exec. This is how test/install-stranger.test.sh proves, WITHOUT a live model call,
 # that auth + companion-plugin setup fully complete BEFORE the first task
 # launches. A no-op when the env var is unset, so normal runs are unaffected.
 _trace_order() {
@@ -392,6 +427,71 @@ f1_onboard_if_cold() {
 # to ~/.local; an unguarded rm -rf would delete ~/.local. Fixed location + a
 # plugin.json check make deleting the wrong dir impossible.
 #
+# ── Credential inventory (shared by both removal paths) ──
+#
+# Echoes the credential-bearing entries present directly under $1, one per line.
+# These are the items whose loss is NOT always recoverable — a signing identity or a
+# control-plane enrolment may have to be re-minted by a human. Everything else under
+# the home is regenerated on next run and is safe to sweep.
+_heimdall_credential_entries() {
+  local dir="$1" name
+  [ -d "$dir" ] || return 0
+  for name in pki signing gh-app team.json cp-endpoint.json remote.json; do
+    [ -e "$dir/$name" ] && printf '%s\n' "$dir/$name"
+  done
+  return 0
+}
+
+# ── State-home sweep (uninstall completeness, credential-safe) ──
+#
+# Removes Heimdall's GENERATED state from a STATE-ONLY $HOME/.heimdall — the
+# git-clone layout, where the plugin tree lives elsewhere and the home holds only
+# generated state. The wholesale plugin-tree branch below can never match it (no
+# plugin.json), so before this it survived uninstall wholly untouched: run-count,
+# logs, sigil cache, persona, caches, everything.
+#
+# CREDENTIALS ARE PRESERVED, NOT DELETED. Uninstalling a tool should not leave its
+# scratch state behind, but it also must not silently destroy key material the user
+# may still need. Preserved items are printed WITH their full path, so removing them
+# stays an explicit, informed user action rather than a side effect of `uninstall`.
+#
+# NOT IN SCOPE — the per-repo team secret (<repo>/.heimdall/team.json): it lives
+# inside the user's own repositories, never in $HOME, and uninstalling the tool must
+# not reach into a project tree. Ditto $TMPDIR/heimdall-edits (the edit ledger): OS
+# temp is self-cleaning and is shared with still-running sessions.
+#
+# Raises $REMOVED_ANY only when something was actually swept.
+_heimdall_sweep_state_home() {
+  local home_dir entry base kept swept D R
+  D='\033[2m'; R='\033[0m'
+  home_dir="$HOME/.heimdall"
+  [ -d "$home_dir" ] || return 0
+  kept=0; swept=0
+  for entry in "$home_dir"/* "$home_dir"/.[!.]*; do
+    [ -e "$entry" ] || continue          # unmatched glob stays literal — skip it
+    base="${entry##*/}"
+    case "$base" in
+      pki|signing|gh-app|team.json|cp-endpoint.json|remote.json)
+        kept=$((kept + 1))
+        printf "  ${D}kept${R} %s ${D}(credential — delete it yourself if you want it gone)${R}\n" "$entry"
+        ;;
+      *)
+        if rm -rf "$entry" 2>/dev/null; then swept=$((swept + 1)); fi
+        ;;
+    esac
+  done
+  if [ "$swept" -gt 0 ]; then
+    printf "  ${D}removed${R} %s state item(s) from %s\n" "$swept" "$home_dir"
+    REMOVED_ANY=1
+  fi
+  if [ "$kept" -eq 0 ]; then
+    rmdir "$home_dir" 2>/dev/null || true     # reclaim only when nothing was preserved
+  else
+    printf "  ${D}kept${R} %s ${D}(holds %s credential item(s))${R}\n" "$home_dir" "$kept"
+  fi
+  return 0
+}
+
 # Removes: both entry points (hmd, heimdall) + the plugin dir, and nothing else.
 # Sets $REMOVED_ANY (0/1) and prints exactly what was removed.
 _heimdall_remove_plugin() {
@@ -411,9 +511,30 @@ _heimdall_remove_plugin() {
       rm -f "$entry" && { printf "  ${D}removed${R} %s\n" "$entry"; REMOVED_ANY=1; }
     fi
   done
-  # Plugin directory — ONLY if verifiably a Heimdall plugin tree (the hard guard).
-  if [ -d "$plugin_dir" ] && [ -f "$plugin_dir/.claude-plugin/plugin.json" ]; then
+  # Plugin directory — ONLY if verifiably a Heimdall plugin tree (the hard guard)
+  # AND ONLY at the canonical location install.sh actually writes. install.sh
+  # hardcodes PLUGIN_DIR="$HOME/.heimdall", so a tree ANYWHERE ELSE is by
+  # construction not an install — it is the user's own checkout. Deleting that
+  # (uncommitted work and all) on `uninstall` is unrecoverable, so it is reported
+  # and left alone. This branch was previously unreachable: the preamble run-count
+  # bump always created $HOME/.heimdall first, so `[ ! -d "$plugin_dir" ]` never
+  # held. Closing the resurrection bug makes it reachable, hence the explicit guard.
+  if [ "$plugin_dir" = "$HOME/.heimdall" ] \
+     && [ -d "$plugin_dir" ] && [ -f "$plugin_dir/.claude-plugin/plugin.json" ]; then
+    # The canonical install dir is BOTH the program and its state, so removing it is
+    # the uninstall — but name any credential going with it first, so the loss is
+    # announced rather than silent. The user asked for exactly this directory.
+    _heimdall_credential_entries "$plugin_dir" | while IFS= read -r _cred; do
+      [ -n "$_cred" ] && printf "  ${D}removing credential${R} %s\n" "$_cred"
+    done
     rm -rf "$plugin_dir" && { printf "  ${D}removed${R} %s\n" "$plugin_dir"; REMOVED_ANY=1; }
+  elif [ "$plugin_dir" != "$HOME/.heimdall" ] && [ -d "$plugin_dir" ]; then
+    printf "  ${D}kept${R} %s ${D}(your own checkout, not an install — delete it yourself)${R}\n" "$plugin_dir"
+  fi
+  # State-only $HOME/.heimdall — no plugin.json, so the branch above cannot match it.
+  # No-op when the wholesale removal above already reclaimed the directory.
+  if [ -d "$HOME/.heimdall" ]; then
+    _heimdall_sweep_state_home
   fi
   # Best-effort plugin/marketplace deregistration (never fatal).
   if command -v claude >/dev/null 2>&1; then
@@ -1077,7 +1198,9 @@ hmd_run_count() {                     # echo the current count (0 when absent/ga
 hmd_bump_run_count() {
   [ -n "${HEIMDALL_RUN_COUNTED:-}" ] && return 0
   export HEIMDALL_RUN_COUNTED=1
-  mkdir -p "$HEIMDALL_HOME_DIR" 2>/dev/null || return 0
+  # Routed through the ONE creator. This call site IS the uninstall-resurrection
+  # bug: it runs in the preamble on EVERY invocation, uninstall included.
+  _heimdall_home_ensure || return 0
   local prev n; prev="$(hmd_run_count)"; n=$((prev + 1))
   printf '%s\n' "$n" > "$HEIMDALL_RUN_COUNT_FILE" 2>/dev/null || true
   # First crossing into the unlocked band (prev<5 -> n>=5): arm the one-shot reveal.
@@ -1193,7 +1316,7 @@ case "${1:-}" in
           echo "  pick one of: $(python3 "$SIGIL_PY" --list-heroes 2>/dev/null | tr '\n' ' ')" >&2
           exit 2
         fi
-        mkdir -p "$HEIMDALL_HOME_DIR" 2>/dev/null || true
+        _heimdall_home_ensure || true
         printf '%s\n' "$_name" > "$SIGIL_CHOICE_FILE"
         printf "  sigil set to %s (unlocked, %s runs)\n" "$_name" "$_runs"
         exit 0

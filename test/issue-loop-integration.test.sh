@@ -38,7 +38,7 @@ LOOP_LIB="$ROOT/bin/lib/issue_loop.py"
 QUEUE_LIB="$ROOT/bin/lib/issue_queue.py"
 PR_LIB="$ROOT/bin/lib/issue_pr.py"
 SECRET_SCAN="$ROOT/bin/secret-scan"
-STRANGER="$ROOT/test/install-stranger.sh"
+STRANGER="$ROOT/test/install-stranger.test.sh"
 
 PASS=0
 FAIL=0
@@ -426,7 +426,7 @@ if [ -x "$STRANGER" ]; then
     bad "clean-install: the stranger-test FAILED — base install affected"
   fi
 else
-  bad "clean-install: test/install-stranger.sh not found/executable"
+  bad "clean-install: test/install-stranger.test.sh not found/executable"
 fi
 
 # ── (7) SECURITY — a planted credential is caught by the gitleaks gate ─────────

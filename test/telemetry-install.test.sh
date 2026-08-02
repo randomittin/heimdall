@@ -31,7 +31,7 @@
 #      step=path + duration_ms, driven through the REAL wrapper + schema (no
 #      clone/network), proving install.sh's own step is instrumented.
 #
-#   F. STRANGER-TEST STILL GREEN — test/install-stranger.sh stays exit 0 (the
+#   F. STRANGER-TEST STILL GREEN — test/install-stranger.test.sh stays exit 0 (the
 #      instrumentation did not regress the real clean-install path). SLOW: takes
 #      >170s; skipped unless HEIMDALL_TEST_SLOW=1 is set.
 #
@@ -425,22 +425,22 @@ fi
 #    completes well under the 120s CI guard. Run explicitly to validate the
 #    full clean-install path (required before any release).
 # ─────────────────────────────────────────────────────────────────────────────
-echo "F. STRANGER-TEST STILL GREEN (install-stranger.sh stays exit 0):"
+echo "F. STRANGER-TEST STILL GREEN (install-stranger.test.sh stays exit 0):"
 if [ "${HEIMDALL_TEST_SLOW:-0}" != "1" ]; then
   echo "  [SKIP] HEIMDALL_TEST_SLOW not set — stranger test omitted (~170s)"
   echo "         Run with HEIMDALL_TEST_SLOW=1 to enable"
 else
-  STRANGER="$REPO/test/install-stranger.sh"
+  STRANGER="$REPO/test/install-stranger.test.sh"
   if [ -f "$STRANGER" ]; then
     st_rc=0
     bash "$STRANGER" >/dev/null 2>&1 || st_rc=$?
     if [ "$st_rc" -eq 0 ]; then
-      ok "install-stranger.sh still passes (instrumentation did not regress clean-install)"
+      ok "install-stranger.test.sh still passes (instrumentation did not regress clean-install)"
     else
-      bad "install-stranger.sh FAILED (rc=$st_rc) — instrumentation regressed the install path"
+      bad "install-stranger.test.sh FAILED (rc=$st_rc) — instrumentation regressed the install path"
     fi
   else
-    bad "install-stranger.sh not found — cannot prove the clean-install path is green"
+    bad "install-stranger.test.sh not found — cannot prove the clean-install path is green"
   fi
 fi
 

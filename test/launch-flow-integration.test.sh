@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # launch-flow-integration.test.sh — the END-TO-END gate for the internal-launch
 # readiness work: it chains the COLD-LAUNCH seam that the per-piece unit tests
-# (update-prompt.test.sh, install-stranger.sh) each cover in isolation — update-
+# (update-prompt.test.sh, install-stranger.test.sh) each cover in isolation — update-
 # check (piece 1) + F1 onboarding (piece 3) + the demo pointer — into ONE flow,
 # in both non-TTY and a real pty, and proves the pointed-to first task runs.
 #
