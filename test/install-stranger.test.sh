@@ -88,7 +88,11 @@ in_stranger() { # $1=HOME, rest=cmd — run a command as the stranger would
 }
 
 TMPH="$(mktemp -d)"
-trap 'rm -rf "$TMPH" "$FAKE_DIR"' EXIT
+# PROBE_TREE is built in §7 from the INSTALLED tree and drives the §7f–§7k
+# uninstall-reversal scenarios. Declared up here so the cleanup trap can name it
+# unconditionally under `set -u`.
+PROBE_TREE=""
+trap 'rm -rf "$TMPH" "$FAKE_DIR" ${PROBE_TREE:+"$PROBE_TREE"}' EXIT
 
 echo "stranger-install harness  repo=$REPO  ref=${REF:0:12}  HOME=$TMPH"
 echo "--------------------------------------------------------------------"
@@ -511,6 +515,17 @@ SAVED_TPL="${TMPDIR:-/tmp}/heimdall-saved-launcher.$(printf 'X%.0s' 1 2 3 4 5 6)
 SAVED_LAUNCHER="$(mktemp "$SAVED_TPL")"
 cp "$REAL_LAUNCHER" "$SAVED_LAUNCHER" 2>/dev/null && chmod +x "$SAVED_LAUNCHER" 2>/dev/null || true
 
+# A minimal PLUGIN TREE copied out of the INSTALLED clone, for the §7f–§7k
+# uninstall-reversal scenarios. Copied from $RESOLVED_PLUGIN (not from $REPO) so
+# those scenarios exercise the artifacts the install actually placed, and taken
+# NOW because the uninstall below deletes that tree. It holds the launcher plus
+# heimdall-dream-schedule, so `hmd uninstall` resolves PLUGIN_DIR to this tree and
+# reaches the real LaunchAgent off-switch rather than its no-helper fallback.
+PROBE_TREE="$(mktemp -d)"; mkdir -p "$PROBE_TREE/bin"
+cp "$RESOLVED_PLUGIN/bin/heimdall" "$PROBE_TREE/bin/heimdall" 2>/dev/null || true
+cp "$RESOLVED_PLUGIN/bin/heimdall-dream-schedule" "$PROBE_TREE/bin/heimdall-dream-schedule" 2>/dev/null || true
+chmod +x "$PROBE_TREE/bin/heimdall" "$PROBE_TREE/bin/heimdall-dream-schedule" 2>/dev/null || true
+
 # (7·0a) RESERVED-SUBCOMMAND NON-TTY CLASS — the launcher-preamble regression.
 # THE BUG (fixed in bin/heimdall, locked here): the F1 launch resolution-order
 # (f1_orient → f1_persona_check → first_run_setup, which includes the companion
@@ -665,6 +680,202 @@ if [ "$UNINST_RC" -eq 0 ] && [ "$SECOND_RC" -eq 0 ]; then
   fi
 else
   bad "uninstall not idempotent — exit codes: first=$UNINST_RC second=$SECOND_RC (expected 0/0)"
+fi
+
+# ── (7f–7k) UNINSTALL REVERSES WHAT LIVES OUTSIDE THE INSTALL TREE ───────────
+#
+# install.sh makes two registrations the plugin-dir removal can never reach:
+#   · a launchd LaunchAgent (com.heimdall.dream) that fires the overnight sweep
+#     nightly at 03:00 — it OUTLIVED the install and kept firing forever
+#   · statusLine + subagentStatusLine in ~/.claude/settings.json, pointing INTO
+#     the install tree — after uninstall they named a deleted script
+#
+# ISOLATION — every scenario below is triple-isolated and touches NOTHING real:
+#   1. HOME is a throwaway mktemp -d, so ~/.claude/settings.json is a fixture
+#   2. launchctl is STUBBED: $LAUNCHCTL points at a recorder, and the stub dir is
+#      also FIRST on PATH so even a bare `launchctl` call would hit the recorder
+#   3. HEIMDALL_LAUNCH_AGENTS_DIR redirects the plist into the sandbox
+# The real user's GUI launchd domain is never a possible target here.
+#
+# WHY §7f NEEDS HEIMDALL_REAL_HOME. launchctl does NOT resolve through $HOME — it
+# targets the real logged-in user's session domain — so uninstall refuses to touch
+# it unless the passwd-database home matches $HOME. That refusal is the whole point
+# of the guard (it is what stops THIS suite from unloading the developer's own live
+# agent), but it also means a throwaway HOME can never reach the positive branch.
+# HEIMDALL_REAL_HOME overrides only the RESOLVED passwd home, so §7f can drive the
+# real-user branch while isolation (2) and (3) still stand between it and anything
+# real. §7g omits it and proves the guard fires on its own.
+
+# Fresh throwaway HOME carrying a recording launchctl stub.
+new_probe_home() {
+  local sb; sb="$(mktemp -d)"
+  mkdir -p "$sb/LaunchAgents" "$sb/stub" "$sb/.claude"
+  cat > "$sb/stub/launchctl" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$sb/launchctl.calls"
+exit 0
+EOF
+  chmod +x "$sb/stub/launchctl"
+  printf '%s' "$sb"
+}
+# Drive the real `hmd uninstall --yes` from PROBE_TREE against a sandbox HOME.
+# $1=HOME, remaining args are extra NAME=VALUE env entries. Output → $PROBE_OUT.
+uninstall_probe() {
+  local h="$1"; shift
+  local of rc; of="$(mktemp)"
+  env -i HOME="$h" TERM="dumb" PATH="$h/stub:/usr/bin:/bin" \
+    HEIMDALL_LAUNCH_AGENTS_DIR="$h/LaunchAgents" LAUNCHCTL="$h/stub/launchctl" \
+    "$@" "$PROBE_TREE/bin/heimdall" uninstall --yes </dev/null >"$of" 2>&1
+  rc=$?
+  PROBE_OUT="$(cat "$of")"; rm -f "$of"
+  return "$rc"
+}
+plant_plist() { printf '<plist>nightly</plist>\n' > "$1/LaunchAgents/com.heimdall.dream.plist"; }
+
+if [ ! -x "$PROBE_TREE/bin/heimdall" ] || [ ! -x "$PROBE_TREE/bin/heimdall-dream-schedule" ]; then
+  bad "uninstall-reversal probes unavailable — installed tree lacked heimdall/heimdall-dream-schedule"
+else
+
+# (7f) REAL-USER UNINSTALL REMOVES THE NIGHTLY LAUNCHAGENT.
+SB="$(new_probe_home)"; plant_plist "$SB"
+uninstall_probe "$SB" "HEIMDALL_REAL_HOME=$SB" || true
+CALLS="$(cat "$SB/launchctl.calls" 2>/dev/null || true)"
+if [ ! -e "$SB/LaunchAgents/com.heimdall.dream.plist" ] \
+   && printf '%s' "$CALLS" | grep -q 'com\.heimdall\.dream\.plist'; then
+  ok "real-user uninstall removes the nightly LaunchAgent (launchctl called: $CALLS)"
+else
+  bad "real-user uninstall left the nightly LaunchAgent behind (calls='$CALLS', plist still present=$([ -e "$SB/LaunchAgents/com.heimdall.dream.plist" ] && echo yes || echo no))"
+fi
+# EXACT LABEL ONLY — a call naming anything but com.heimdall.dream would mean
+# uninstall can unload a job that is not ours.
+if [ -n "$CALLS" ] && printf '%s\n' "$CALLS" | grep -vq 'com\.heimdall\.dream'; then
+  bad "launchctl was invoked for a label that is NOT com.heimdall.dream: $CALLS"
+else
+  ok "every launchctl invocation names the exact label com.heimdall.dream"
+fi
+rm -rf "$SB"
+
+# (7g) SANDBOX GUARD — a synthetic HOME must NOT reach launchd. This is the
+# assertion that keeps this very suite from stomping the developer's live agent.
+SB="$(new_probe_home)"; plant_plist "$SB"
+uninstall_probe "$SB" || true
+if [ ! -f "$SB/launchctl.calls" ]; then
+  ok "synthetic HOME: launchctl was NEVER called (sandbox guard held)"
+else
+  bad "sandbox guard FAILED — launchctl was called under a throwaway HOME: $(cat "$SB/launchctl.calls")"
+fi
+if [ -e "$SB/LaunchAgents/com.heimdall.dream.plist" ]; then
+  ok "synthetic HOME: the LaunchAgent plist was left untouched"
+else
+  bad "sandbox guard FAILED — the plist was removed under a throwaway HOME"
+fi
+rm -rf "$SB"
+
+# (7h) STATUSLINE DE-REGISTERED, UNRELATED KEYS BYTE-IDENTICAL. The fixture is
+# deliberately hand-formatted (irregular inner spacing, mixed one-line and block
+# members) so a whole-file re-serialization cannot pass: it would reflow these
+# bytes. Our two keys sit in the middle, so a correct removal is PURE DELETION —
+# the diff must contain no added lines at all.
+SB="$(new_probe_home)"
+SET="$SB/.claude/settings.json"
+cat > "$SET" <<'JSON'
+{
+  "model": "opusplan",
+  "statusLine": {
+    "type": "command",
+    "command": "bash -c '[ -x \"/inst/hooks/statusline.sh\" ] && exec bash \"/inst/hooks/statusline.sh\"; exit 0'",
+    "refreshInterval": 2
+  },
+  "env": {   "KEEP_ME":     "yes",
+        "COUNT": 1 },
+  "subagentStatusLine": {"type": "command", "command": "bash /inst/hooks/subagent-statusline.sh"},
+  "permissions": {"allow": ["Bash(ls:*)"]}
+}
+JSON
+SNAP="$SB/settings.before"; cp "$SET" "$SNAP"
+uninstall_probe "$SB" || true
+if ! grep -q 'statusLine' "$SET" 2>/dev/null; then
+  ok "uninstall removed both statusLine + subagentStatusLine from ~/.claude/settings.json"
+else
+  bad "statusLine survived uninstall — Claude Code still points at a deleted script"
+fi
+ADDED="$(diff "$SNAP" "$SET" 2>/dev/null | grep -c '^>' || true)"; : "${ADDED:=0}"
+if [ "$ADDED" -eq 0 ]; then
+  ok "settings.json was PURE DELETION — diff adds/reflows zero lines"
+else
+  bad "settings.json was rewritten, not spliced — $ADDED added/reflowed line(s): $(diff "$SNAP" "$SET" | tr '\n' ' ')"
+fi
+SL_KEEP_MISS=""
+while IFS= read -r frag; do
+  grep -qF "$frag" "$SET" 2>/dev/null || SL_KEEP_MISS="$SL_KEEP_MISS | $frag"
+done <<'FRAGS'
+"model": "opusplan"
+"env": {   "KEEP_ME":     "yes",
+        "COUNT": 1 },
+"permissions": {"allow": ["Bash(ls:*)"]}
+FRAGS
+if [ -z "$SL_KEEP_MISS" ]; then
+  ok "unrelated settings keys survive BYTE-IDENTICAL (model, env with its hand spacing, permissions)"
+else
+  bad "unrelated settings key(s) altered:$SL_KEEP_MISS"
+fi
+python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$SET" >/dev/null 2>&1 \
+  && ok "settings.json is still valid JSON after the splice" \
+  || bad "settings.json is NOT valid JSON after the splice: $(cat "$SET")"
+# A backup must exist, be printed, and match the pre-uninstall bytes exactly.
+BK="$(printf '%s\n' "$PROBE_OUT" | grep 'heimdall-uninstall-' | head -1 | awk '{print $NF}')"
+if [ -n "$BK" ] && [ -f "$BK" ] && cmp -s "$BK" "$SNAP"; then
+  ok "uninstall printed a backup path whose bytes match the pre-uninstall file"
+else
+  bad "backup missing / not printed / not byte-identical (parsed='$BK')"
+fi
+rm -rf "$SB"
+
+# (7i) OUR KEY LAST — removing the final member must take the now-dangling comma
+# with it and still leave valid JSON plus untouched neighbours.
+SB="$(new_probe_home)"
+SET="$SB/.claude/settings.json"
+printf '{\n  "theme":   "dark",\n  "subagentStatusLine": {"command": "/inst/hooks/subagent-statusline.sh"}\n}\n' > "$SET"
+uninstall_probe "$SB" || true
+if ! grep -q 'subagentStatusLine' "$SET" 2>/dev/null \
+   && grep -qF '"theme":   "dark"' "$SET" 2>/dev/null \
+   && python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$SET" >/dev/null 2>&1; then
+  ok "removing the LAST member drops its dangling comma and keeps neighbours verbatim"
+else
+  bad "last-member removal broke the file: $(cat "$SET" 2>/dev/null)"
+fi
+rm -rf "$SB"
+
+# (7j) MALFORMED settings.json — a hand-edited/truncated file must survive
+# BYTE-IDENTICAL and must not crash the uninstall.
+SB="$(new_probe_home)"
+SET="$SB/.claude/settings.json"
+printf '{ "statusLine": { "command": "/inst/hooks/statusline.sh"\n' > "$SET"
+SNAP="$SB/settings.before"; cp "$SET" "$SNAP"
+uninstall_probe "$SB"; MAL_RC=$?
+if [ "$MAL_RC" -eq 0 ] && [ -f "$SET" ] && cmp -s "$SET" "$SNAP"; then
+  ok "malformed ~/.claude/settings.json survives byte-identical, uninstall exits 0"
+else
+  bad "malformed settings.json was damaged or crashed uninstall (rc=$MAL_RC, now: $(cat "$SET" 2>/dev/null))"
+fi
+if printf '%s' "$PROBE_OUT" | grep -q 'not valid JSON'; then
+  ok "malformed settings.json is REPORTED, not silently skipped"
+else
+  bad "malformed settings.json was skipped silently: $(printf '%s' "$PROBE_OUT" | tr '\n' ' ')"
+fi
+rm -rf "$SB"
+
+# (7k) ABSENT settings.json — a clean no-op that conjures no file.
+SB="$(new_probe_home)"
+rm -f "$SB/.claude/settings.json"
+uninstall_probe "$SB"; ABS_RC=$?
+if [ "$ABS_RC" -eq 0 ] && [ ! -e "$SB/.claude/settings.json" ]; then
+  ok "absent ~/.claude/settings.json: uninstall exits 0 and creates nothing"
+else
+  bad "absent settings.json mishandled (rc=$ABS_RC, created=$([ -e "$SB/.claude/settings.json" ] && echo yes || echo no))"
+fi
+rm -rf "$SB"
+
 fi
 
 echo "--------------------------------------------------------------------"

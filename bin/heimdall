@@ -504,7 +504,11 @@ _heimdall_remove_plugin() {
   fi
 
   D='\033[2m'; G='\033[32m'; R='\033[0m'
-  REMOVED_ANY=0
+  # ACCUMULATE, never reset. The steps that run BEFORE this one (PATH export,
+  # nightly LaunchAgent, statusLine) may already have removed something; a reset
+  # here would make the closing summary claim "Nothing to remove — Heimdall was
+  # not installed here" on the very same run that just printed what it removed.
+  REMOVED_ANY="${REMOVED_ANY:-0}"
   # Both entry points — unlink each hardlink/copy independently.
   for entry in "$bin_dir/hmd" "$bin_dir/heimdall"; do
     if [ -e "$entry" ] || [ -L "$entry" ]; then
@@ -610,6 +614,349 @@ _heimdall_remove_path_export() {
     fi
     rm -f "$tmp" 2>/dev/null || true
   done
+}
+
+# ── Real-user detection (fail-safe gate for side effects $HOME cannot isolate) ──
+#
+# Echoes the home directory of the user this process actually runs as, resolved
+# from the PASSWD DATABASE (getpwuid) — a source $HOME cannot influence. Empty
+# output means "could not determine", which every caller MUST treat as unsafe.
+#
+# HEIMDALL_REAL_HOME is the test seam, the same family as the LAUNCHCTL and
+# HEIMDALL_LAUNCH_AGENTS_DIR seams bin/heimdall-dream-schedule already documents.
+# It overrides only the RESOLVED passwd home, so the acceptance suite can drive the
+# real-user branch under a throwaway HOME with launchctl stubbed. Setting it can
+# never by itself reach a real domain: the launchd call still goes through
+# $LAUNCHCTL and the plist still comes from $HEIMDALL_LAUNCH_AGENTS_DIR.
+_heimdall_real_user_home() {
+  local h user
+  if [ -n "${HEIMDALL_REAL_HOME:-}" ]; then
+    printf '%s' "${HEIMDALL_REAL_HOME}"
+    return 0
+  fi
+  h=""
+  if command -v python3 >/dev/null 2>&1; then
+    h="$(python3 -c 'import pwd,os;print(pwd.getpwuid(os.getuid()).pw_dir)' 2>/dev/null || true)"
+  fi
+  if [ -z "$h" ] && command -v dscl >/dev/null 2>&1; then
+    user="$(id -un 2>/dev/null || true)"
+    if [ -n "$user" ]; then
+      h="$(dscl . -read "/Users/$user" NFSHomeDirectory 2>/dev/null | awk '{print $2}' || true)"
+    fi
+  fi
+  printf '%s' "$h"
+}
+
+# TRUE when both arguments name the SAME directory. Compares physical paths so a
+# real user whose home is reached through a symlink is not misread as synthetic
+# (that misread would silently leave the nightly job installed — the exact bug
+# this guard exists to close).
+_heimdall_same_dir() {
+  local a="$1" b="$2"
+  [ -n "$a" ] && [ -n "$b" ] || return 1
+  [ "$a" = "$b" ] && return 0
+  [ -d "$a" ] && [ -d "$b" ] || return 1
+  a="$(cd "$a" 2>/dev/null && pwd -P)" || return 1
+  b="$(cd "$b" 2>/dev/null && pwd -P)" || return 1
+  [ "$a" = "$b" ]
+}
+
+# ── Nightly-LaunchAgent removal (uninstall completeness) ──
+#
+# install.sh's ensure_dream_schedule registers a per-user launchd LaunchAgent
+# (label com.heimdall.dream) that fires the overnight /dream sweep at 03:00.
+# Uninstall never reversed it, so the job OUTLIVED the install and kept firing
+# nightly forever against a deleted tree. This reverses it.
+#
+# WHY THIS NEEDS A GUARD. launchctl does NOT resolve through $HOME — it targets the
+# real logged-in user's GUI session domain (gui/<uid>). A throwaway HOME therefore
+# does NOT isolate it, so an unguarded call here would let any harness or CI run
+# that performs a real uninstall unload the DEVELOPER'S OWN live nightly agent.
+# This step runs only when it can prove it is the real user in the real home.
+#
+# THE PROOF DOES NOT TRUST THE CALLER. _heimdall_real_user_home reads the passwd
+# database independently of $HOME and we compare. A synthetic HOME self-identifies
+# with zero cooperation from whoever spawned the run — a guard that required every
+# future caller to remember an env var would fail the first time one forgot.
+# HEIMDALL_NO_DREAM_SCHEDULE=1 remains the EXPLICIT opt-out (the same variable
+# install.sh's ensure_dream_schedule honors, so a dev who declined the schedule at
+# install never has launchd touched at uninstall either); the passwd comparison is
+# the backstop for everyone who does not set it.
+#
+# FAIL SAFE at every unknown — not macOS, no resolvable passwd home, or any
+# mismatch → launchd is not touched at all.
+#
+# NEVER SOMEONE ELSE'S JOB. Removal is pinned to the exact label com.heimdall.dream.
+# The primary path delegates to bin/heimdall-dream-schedule, which OWNS that label
+# and derives the plist path from it; the fallback below repeats the label only for
+# a partial install whose helper is already gone. No wildcard, no directory scan.
+#
+# Raises $REMOVED_ANY only when a plist was actually removed.
+_heimdall_remove_dream_schedule() {
+  local D R label la_dir plist sched real had
+  D='\033[2m'; R='\033[0m'
+  label="com.heimdall.dream"
+  la_dir="${HEIMDALL_LAUNCH_AGENTS_DIR:-$HOME/Library/LaunchAgents}"
+  plist="$la_dir/$label.plist"
+
+  # Explicit opt-out — the harness/CI switch, checked before anything else.
+  [ "${HEIMDALL_NO_DREAM_SCHEDULE:-0}" = "1" ] && return 0
+  # launchd is the macOS scheduler; nothing to reverse anywhere else.
+  [ "$(uname -s 2>/dev/null)" = "Darwin" ] || return 0
+
+  # Fail-safe sandbox gate.
+  real="$(_heimdall_real_user_home)"
+  if ! _heimdall_same_dir "$real" "$HOME"; then
+    # Only say so when there is actually a plist here, so a sandbox with nothing
+    # installed stays silent instead of reporting a job that never existed.
+    if [ -e "$plist" ]; then
+      printf "  ${D}kept${R} %s ${D}(synthetic HOME — refusing to touch the real launchd domain)${R}\n" "$plist"
+    fi
+    return 0
+  fi
+
+  had=0; [ -e "$plist" ] && had=1
+  sched="$PLUGIN_DIR/bin/heimdall-dream-schedule"
+  if [ -x "$sched" ]; then
+    # The helper owns the label + plist path and is already an idempotent off
+    # switch. --repo is pinned to $HOME so a deleted or unreadable cwd cannot make
+    # its repo resolution fail. Env seams pass straight through.
+    "$sched" uninstall --repo "$HOME" >/dev/null 2>&1 || true
+  else
+    # Partial install: the helper is gone but its LaunchAgent may not be.
+    "${LAUNCHCTL:-launchctl}" unload -w "$plist" >/dev/null 2>&1 || true
+    rm -f "$plist" 2>/dev/null || true
+  fi
+  if [ "$had" -eq 1 ] && [ ! -e "$plist" ]; then
+    printf "  ${D}removed${R} %s ${D}(nightly /dream LaunchAgent)${R}\n" "$plist"
+    REMOVED_ANY=1
+  fi
+  return 0
+}
+
+# ── Claude Code statusLine de-registration (uninstall completeness) ──
+#
+# install.sh's ensure_statusline_registered writes statusLine + subagentStatusLine
+# into ${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json pointing at scripts inside
+# the install tree. Uninstall never reversed it, so after removal Claude Code was
+# left pointing statusLine at a deleted script. This reverses exactly those keys.
+#
+# BYTE PRESERVATION. The file is a USER config that may hold anything else, so it is
+# never re-serialized. The python below locates the byte SPAN of each top-level
+# member using the stdlib's own JSON primitives (scanstring + raw_decode) and
+# SPLICES those spans out; every surviving key keeps its original bytes, including
+# hand-applied formatting. The spliced text is then re-parsed and compared against
+# the expected object — if anything but the dropped keys moved, nothing is written.
+#
+# OURS-ONLY. The match uses the SAME markers install.sh matches on (its WANT table),
+# so this removes precisely what install considered its own, including a stale path
+# from an older install location, and leaves a user's own custom statusLine alone.
+#
+# HOSTILE-INPUT SAFE. Absent → no-op. Invalid JSON, unreadable, or a hand-edited
+# shape we cannot splice → reported and LEFT UNTOUCHED, never rewritten and never
+# deleted. A backup is taken before any write and its path is printed.
+#
+# Raises $REMOVED_ANY only when a key was actually removed.
+# The splice itself, in its OWN function so the here-document sits at function
+# level. bash 3.2 — the macOS system shell this must keep running under — cannot
+# parse a here-document nested inside a command substitution, so the obvious
+# `report="$(python3 - <<'PY' … PY)"` is a hard syntax error there. The caller
+# captures this function's stdout instead.
+#   $1     settings.json path
+#   stdout one TAB-separated "<token>\t<detail>" line per outcome (see the
+#          caller's case table); always exits 0 so a python failure degrades to an
+#          empty report rather than aborting the uninstall.
+_heimdall_statusline_splice() {
+  HMD_SL_SETTINGS="$1" python3 - <<'PY' 2>/dev/null || true
+import contextlib, json, os, shutil, sys, tempfile, time
+from json.decoder import scanstring
+
+path = os.environ["HMD_SL_SETTINGS"]
+# The markers install.sh's ensure_statusline_registered matches on. Exact reversal:
+# what install treated as ours is what uninstall removes.
+MARKERS = [("statusLine", "hooks/statusline.sh"),
+           ("subagentStatusLine", "subagent-statusline.sh")]
+WS = " \t\n\r"
+
+
+def say(tok, detail=""):
+    sys.stdout.write("%s\t%s\n" % (tok, detail))
+
+
+try:
+    with open(path) as fh:
+        raw = fh.read()
+except Exception:
+    say("unreadable", path); sys.exit(0)
+
+try:
+    data = json.loads(raw)
+except Exception:
+    say("invalid", path); sys.exit(0)
+if not isinstance(data, dict):
+    say("invalid", path); sys.exit(0)
+
+drop = []
+for key, marker in MARKERS:
+    cur = data.get(key)
+    if cur is None:
+        continue
+    if isinstance(cur, dict) and marker in (cur.get("command") or ""):
+        drop.append(key)
+    else:
+        say("kept-custom", key)
+if not drop:
+    say("none", path); sys.exit(0)
+
+
+def skip_ws(s, i):
+    n = len(s)
+    while i < n and s[i] in WS:
+        i += 1
+    return i
+
+
+def top_members(s):
+    """Byte spans of every top-level member, via the stdlib's own JSON scanners."""
+    dec = json.JSONDecoder()
+    out = []
+    i = skip_ws(s, 0)
+    if i >= len(s) or s[i] != "{":
+        raise ValueError("top level is not an object")
+    i = skip_ws(s, i + 1)
+    if i < len(s) and s[i] == "}":
+        return out
+    while True:
+        i = skip_ws(s, i)
+        if i >= len(s) or s[i] != '"':
+            raise ValueError("expected a member key")
+        kstart = i
+        key, i = scanstring(s, i + 1)
+        i = skip_ws(s, i)
+        if i >= len(s) or s[i] != ":":
+            raise ValueError("expected ':' after key")
+        i = skip_ws(s, i + 1)
+        _, i = dec.raw_decode(s, i)
+        out.append({"key": key, "start": kstart, "end": i})
+        i = skip_ws(s, i)
+        if i < len(s) and s[i] == ",":
+            i = skip_ws(s, i + 1)
+            continue
+        if i < len(s) and s[i] == "}":
+            return out
+        raise ValueError("unterminated object")
+
+
+try:
+    members = top_members(raw)
+except Exception:
+    say("error", "could not locate the keys byte-exactly; left untouched"); sys.exit(0)
+
+# Cut ranges chosen so every SURVIVING member keeps its exact original bytes:
+#   followed by another member -> cut through that member's key start (takes the
+#     separating comma and whitespace with it, leaving the next member's indent)
+#   last member, predecessor survives -> cut from the predecessor's end (takes the
+#     now-dangling comma)
+#   last member, predecessor also dropped or none -> cut just this member (the
+#     predecessor's own cut already reaches here)
+# The three cases are disjoint by construction, so applying them right-to-left
+# never invalidates an earlier offset.
+cuts = []
+for n, m in enumerate(members):
+    if m["key"] not in drop:
+        continue
+    if n + 1 < len(members):
+        cuts.append((m["start"], members[n + 1]["start"]))
+    elif n > 0 and members[n - 1]["key"] not in drop:
+        cuts.append((members[n - 1]["end"], m["end"]))
+    else:
+        cuts.append((m["start"], m["end"]))
+
+if [m for m in members if m["key"] not in drop]:
+    new = raw
+    for a, b in sorted(cuts, reverse=True):
+        new = new[:a] + new[b:]
+else:
+    # Nothing else was in the file; an empty object is the honest result and there
+    # are no unrelated bytes left to preserve. The file itself is never deleted.
+    new = "{}\n"
+
+expect = dict((k, v) for k, v in data.items() if k not in drop)
+try:
+    got = json.loads(new)
+except Exception:
+    say("error", "splice produced invalid JSON; left untouched"); sys.exit(0)
+if got != expect:
+    say("error", "splice would have changed unrelated keys; left untouched"); sys.exit(0)
+
+stamp = time.strftime("%Y%m%d%H%M%S")
+backup = "%s.heimdall-uninstall-%s.bak" % (path, stamp)
+try:
+    shutil.copy2(path, backup)
+except Exception:
+    say("error", "could not write a backup; left untouched"); sys.exit(0)
+
+tmp = ""
+try:
+    mode = os.stat(path).st_mode & 0o7777
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".",
+                               prefix=".settings.", suffix=".tmp")
+    with os.fdopen(fd, "w") as fh:
+        fh.write(new)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+except Exception:
+    if tmp:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+    say("error", "could not rewrite the file; left untouched (backup: %s)" % backup)
+    sys.exit(0)
+
+say("backup", backup)
+for key in drop:
+    say("removed", key)
+PY
+}
+
+_heimdall_remove_statusline() {
+  local D R cfg settings report tok detail
+  D='\033[2m'; R='\033[0m'
+  cfg="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+  settings="$cfg/settings.json"
+  [ -f "$settings" ] || return 0
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    # install.sh cannot register without python3 either, so normally there is
+    # nothing here. If a registration IS present, say so rather than leave Claude
+    # Code silently pointed at a script this uninstall is about to delete.
+    if grep -q 'hooks/statusline.sh' "$settings" 2>/dev/null; then
+      printf "  ${D}kept${R} %s ${D}(python3 unavailable — remove its heimdall statusLine entries by hand)${R}\n" "$settings"
+    fi
+    return 0
+  fi
+
+  report="$(_heimdall_statusline_splice "$settings")"
+
+  while IFS=$'\t' read -r tok detail; do
+    case "$tok" in
+      removed)
+        printf "  ${D}removed${R} %s ${D}from %s${R}\n" "$detail" "$settings"
+        REMOVED_ANY=1 ;;
+      backup)
+        printf "  ${D}backup${R} %s\n" "$detail" ;;
+      kept-custom)
+        printf "  ${D}kept${R} %s ${D}in %s (yours, not heimdall's)${R}\n" "$detail" "$settings" ;;
+      invalid)
+        printf "  ${D}kept${R} %s ${D}(not valid JSON — left untouched; remove its heimdall statusLine entries by hand)${R}\n" "$detail" ;;
+      unreadable)
+        printf "  ${D}kept${R} %s ${D}(unreadable — left untouched)${R}\n" "$detail" ;;
+      error)
+        printf "  ${D}kept${R} %s ${D}(%s)${R}\n" "$settings" "$detail" ;;
+    esac
+  done <<EOF
+$report
+EOF
+  return 0
 }
 
 # ── Ensure Claude Code is installed ──
@@ -1543,7 +1890,18 @@ case "${1:-}" in
     # not be read from disk and silently never runs (that was the bug: PATH survived).
     # The PATH remover must run BEFORE plugin removal so it is guaranteed to execute.
     # (The --uninstall flag arm already orders it this way.)
+    # ORDER IS LOAD-BEARING for ALL of these, not just PATH: every step that
+    # reverses something OUTSIDE the install tree must run before the tree itself
+    # is deleted, because this script's own backing file lives inside it.
+    #   · the nightly LaunchAgent's plist lives in ~/Library/LaunchAgents, and its
+    #     removal delegates to $PLUGIN_DIR/bin/heimdall-dream-schedule — a helper
+    #     _heimdall_remove_plugin is about to delete.
+    #   · the statusLine registration lives in ~/.claude/settings.json and points
+    #     INTO the tree, so it must be de-registered before the target vanishes.
+    REMOVED_ANY=0
     _heimdall_remove_path_export
+    _heimdall_remove_dream_schedule
+    _heimdall_remove_statusline
     _heimdall_remove_plugin
 
     printf "\n"
@@ -1989,6 +2347,13 @@ if [[ "${1:-}" == "--uninstall" ]]; then
       printf "  ${D}×${R} legacy superx PATH entry removed from $(basename "$rc")\n"
     fi
   done
+  # Reverse the two registrations that live OUTSIDE the install tree, via the same
+  # shared removers `hmd uninstall` uses — and BEFORE the tree is deleted, since
+  # the LaunchAgent removal delegates to a helper inside it. Both are self-guarding
+  # (launchd is touched only for a proven real user; settings.json is spliced only
+  # where install wrote).
+  _heimdall_remove_dream_schedule
+  _heimdall_remove_statusline
   sleep 0.1
   # Remove the plugin dir + entry points via the SHARED guarded path — never an
   # unguarded `rm -rf "$HOME/.heimdall"`. Same guard as `hmd uninstall`.
