@@ -1025,6 +1025,103 @@ else
   bad "install.sh not found in the installed tree at $INSTALLED_SH — cannot assert the state word"
 fi
 
+# (8f) THE SECOND MECHANISM — A GENUINE $HOME IS NOT ENOUGH.
+#
+# §8a–§8d all vary $HOME. The incident did not. The run that actually rewrote the
+# developer's live com.heimdall.dream.plist was a REAL user, in their REAL passwd home,
+# talking to their REAL launchd domain — every check in §8a–§8d passes for it. What was
+# wrong was the TREE: it installed from an agent worktree, so the nightly job was pinned
+# to .claude/worktrees/agent-<id>/bin/heimdall-dream, a checkout that is later reaped.
+# The job then points at nothing, and — because launchd never complains about a program
+# that no longer exists — the only symptom is that dreams silently stop arriving.
+#
+# So §8f holds HOME genuine (HEIMDALL_REAL_HOME, the same seam §8b uses) and varies ONLY
+# worktree-ness. A pass here means the passwd guard was satisfied and something else
+# refused: the ephemeral-checkout guard. Isolation is §8's, unchanged — stubbed launchctl
+# on $LAUNCHCTL *and* first on PATH, redirected LaunchAgents dir, and §8e re-hashes the
+# real plist afterwards.
+WT_MAIN="$(mktemp -d)"; mkdir -p "$WT_MAIN/bin/lib"
+cp "$PROBE_TREE/bin/heimdall-dream-schedule" "$WT_MAIN/bin/heimdall-dream-schedule" 2>/dev/null || true
+cp "$PROBE_TREE/bin/heimdall-dream"          "$WT_MAIN/bin/heimdall-dream" 2>/dev/null || true
+cp "$PROBE_TREE/bin/lib/real-home.sh"        "$WT_MAIN/bin/lib/real-home.sh" 2>/dev/null || true
+chmod +x "$WT_MAIN/bin/heimdall-dream-schedule" "$WT_MAIN/bin/heimdall-dream" 2>/dev/null || true
+git -C "$WT_MAIN" init -q >/dev/null 2>&1
+git -C "$WT_MAIN" add -A >/dev/null 2>&1
+git -C "$WT_MAIN" -c user.email=t@t -c user.name=t commit -qm probe >/dev/null 2>&1
+WT_EPHEM="$(mktemp -d)"; rmdir "$WT_EPHEM" 2>/dev/null || true
+git -C "$WT_MAIN" worktree add --detach -q "$WT_EPHEM" >/dev/null 2>&1
+
+# Same isolation as schedule_probe, but driving an arbitrary helper path. $1=HOME,
+# $2=helper, $3=--repo target, rest = extra env (PATH overrides included).
+worktree_probe() {
+  local h="$1" helper="$2" repo="$3"; shift 3
+  local of rc; of="$(mktemp)"
+  env -i HOME="$h" TERM="dumb" PATH="$h/stub:/usr/bin:/bin" \
+    HEIMDALL_LAUNCH_AGENTS_DIR="$h/LaunchAgents" LAUNCHCTL="$h/stub/launchctl" \
+    HEIMDALL_DREAM_LOG="$h/dream.log" HEIMDALL_REAL_HOME="$h" \
+    "$@" "$helper" install --repo "$repo" </dev/null >"$of" 2>&1
+  rc=$?
+  SCHED_OUT="$(cat "$of")"; rm -f "$of"
+  return "$rc"
+}
+
+if [ -x "$WT_EPHEM/bin/heimdall-dream-schedule" ] && [ -f "$WT_EPHEM/.git" ]; then
+  SB="$(new_probe_home)"
+  worktree_probe "$SB" "$WT_EPHEM/bin/heimdall-dream-schedule" "$WT_EPHEM"; SCHED_RC=$?
+  # THE ASSERTION THAT WOULD HAVE PREVENTED THE INCIDENT.
+  if [ ! -f "$SB/launchctl.calls" ]; then
+    ok "genuine HOME + worktree checkout: launchctl was NEVER invoked (the second-mechanism assertion)"
+  else
+    bad "EPHEMERAL GUARD FAILED — launchctl was called from a worktree checkout: $(tr '\n' ' ' < "$SB/launchctl.calls")"
+  fi
+  if [ ! -e "$SB/LaunchAgents/com.heimdall.dream.plist" ]; then
+    ok "genuine HOME + worktree checkout: no plist written (refusal precedes write_plist)"
+  else
+    bad "EPHEMERAL GUARD FAILED — a plist was written from a worktree checkout"
+  fi
+  if [ "$SCHED_RC" -eq 5 ]; then
+    ok "the worktree refusal exits 5 — distinguishable from sandboxed (4) and failure (3)"
+  else
+    bad "worktree refusal exit code was $SCHED_RC (expected 5): $(printf '%s' "$SCHED_OUT" | tr '\n' ' ' | cut -c1-200)"
+  fi
+  if printf '%s' "$SCHED_OUT" | grep -q 'ephemeral checkout'; then
+    ok "the worktree refusal says WHY (ephemeral checkout), so the next operator can act"
+  else
+    bad "worktree refusal wording missing (out: $(printf '%s' "$SCHED_OUT" | tr '\n' ' ' | cut -c1-200))"
+  fi
+  rm -rf "$SB"
+
+  # The guard must not depend on the `git` binary being on PATH: a stripped launchd/cron
+  # environment has almost nothing on it. With git unreachable the filesystem detector
+  # (the .git-file `gitdir:` shape) has to carry the refusal ALONE — proving the two
+  # detectors are independently sufficient rather than one plus decoration.
+  SB="$(new_probe_home)"
+  worktree_probe "$SB" "$WT_EPHEM/bin/heimdall-dream-schedule" "$WT_EPHEM" PATH="$SB/stub"; SCHED_RC=$?
+  if [ ! -f "$SB/launchctl.calls" ] && [ "$SCHED_RC" -eq 5 ]; then
+    ok "worktree refusal holds with NO git on PATH (the filesystem detector is sufficient alone)"
+  else
+    bad "guard leaked without git on PATH (rc=$SCHED_RC, calls=$(tr '\n' ' ' < "$SB/launchctl.calls" 2>/dev/null))"
+  fi
+  rm -rf "$SB"
+
+  # THE CONTROL. Byte-identical helper, same genuine HOME, same stubs — checked out as
+  # the MAIN worktree. It must still register, or the guard is just an outage: the whole
+  # point is that a real user installing from their canonical checkout still succeeds.
+  SB="$(new_probe_home)"
+  worktree_probe "$SB" "$WT_MAIN/bin/heimdall-dream-schedule" "$WT_MAIN"; SCHED_RC=$?
+  if [ "$SCHED_RC" -eq 0 ] && [ -f "$SB/LaunchAgents/com.heimdall.dream.plist" ] \
+     && grep -qF "<string>$WT_MAIN/bin/heimdall-dream</string>" "$SB/LaunchAgents/com.heimdall.dream.plist"; then
+    ok "the SAME helper in the MAIN worktree still registers (rc=0, plist names its own dream bin)"
+  else
+    bad "main-worktree control failed — the guard refuses a canonical checkout (rc=$SCHED_RC, out: $(printf '%s' "$SCHED_OUT" | tr '\n' ' ' | cut -c1-200))"
+  fi
+  rm -rf "$SB"
+else
+  bad "§8f fixture not built — cannot assert the ephemeral-checkout guard (helper=$([ -x "$WT_EPHEM/bin/heimdall-dream-schedule" ] && echo yes || echo no), worktree=$([ -f "$WT_EPHEM/.git" ] && echo yes || echo no))"
+fi
+git -C "$WT_MAIN" worktree remove --force "$WT_EPHEM" >/dev/null 2>&1 || true
+rm -rf "$WT_MAIN" "$WT_EPHEM"
+
 # (8e) THE REAL PLIST IS UNTOUCHED. The final backstop: whatever the probes above did,
 # the developer's own nightly job must be byte-for-byte what it was when §8 started.
 if [ -n "$REAL_PLIST_BEFORE" ]; then
