@@ -339,6 +339,57 @@ else
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
+# 8b. LAUNCH-PATH HELPER DEGRADATION — a missing bin/heimdall-model-resolve must
+#     NOT brick the launcher, and its presence must still be honoured.
+#
+#     bin/heimdall runs under `set -euo pipefail`. Every other launch-path helper
+#     is guarded (`[ -x "$SKILL_MGR" ]`, `[ -x "$face" ] || return 0`), but the
+#     model-tier resolver was called bare inside a command substitution:
+#         MODEL_FLAG="--model $("$PLUGIN_DIR/bin/heimdall-model-resolve" opus)"
+#     With the helper absent (partial install, lost +x bit, older layout) the
+#     substitution exits 127 and `set -e` aborted the WHOLE launcher — the user's
+#     task never ran. That is the defect this section pins, from both sides:
+#       A. resolver ABSENT  → launcher still reaches launch:task (degrades to the
+#          bare tier alias, which is byte-identical to what the helper prints
+#          when no HEIMDALL_MODEL_<TIER> pin is set).
+#       B. resolver PRESENT → launcher still CALLS it (a fallback that silently
+#          replaced the resolver would defeat float-to-latest / pin overrides).
+# ══════════════════════════════════════════════════════════════════════════════
+
+# A. resolver absent — this is the state every other case in this file runs in.
+reset
+rm -f "$FAKE_BIN/heimdall-model-resolve"
+run_hmd "some-unknown-task-resolver-absent"
+
+if claude_reached; then
+  ok "launch survives a MISSING heimdall-model-resolve (no 127 abort)"
+else
+  bad "missing heimdall-model-resolve aborted the launcher before launch:task"
+  cat "$TRACE_FILE" >&2
+fi
+
+# B. resolver present — plant a recording stub and assert it is actually used.
+reset
+make_stub heimdall-model-resolve
+run_hmd "some-unknown-task-resolver-present"
+
+if claude_reached; then
+  ok "launch reaches launch:task with heimdall-model-resolve present"
+else
+  bad "launch failed to reach launch:task with the resolver present"
+  cat "$TRACE_FILE" >&2
+fi
+
+if stub_called "heimdall-model-resolve" && args_contain "heimdall-model-resolve ARGS: opus"; then
+  ok "present resolver IS invoked for the opus tier (fallback does not shadow it)"
+else
+  bad "heimdall-model-resolve present but never invoked with the opus tier"
+  cat "$STUB_OUT" >&2
+fi
+
+rm -f "$FAKE_BIN/heimdall-model-resolve"
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 9. Syntax check
 # ══════════════════════════════════════════════════════════════════════════════
 if bash -n "$REAL_BIN" 2>/dev/null; then
