@@ -335,7 +335,8 @@ def enroll(haid, pubkey, *, provided_token, team_secret=None, handle=None,
     # 6.5. CAPS — a NET-NEW haid only (idempotent/conflict/switch already returned above).
     #      PER-TEAM first (bounds how much one secret can bloat its team), then the GLOBAL
     #      registry ceiling (bounds total growth regardless of rate / key-IP rotation).
-    if cp_auth.team_member_count(team_id, home=home) >= team_max_members():
+    members_before = cp_auth.team_member_count(team_id, home=home)
+    if members_before >= team_max_members():
         return {"ok": False, "reason": "team_full"}
     if _registry_key_count(home) >= enroll_max_keys():
         return {"ok": False, "reason": "enroll_registry_full"}
@@ -350,6 +351,18 @@ def enroll(haid, pubkey, *, provided_token, team_secret=None, handle=None,
     if not cp_auth.register_key(haid, pubkey, owner=False, team_id=team_id,
                                 project=project, enrolled_at=int(_time.time()), home=home):
         return {"ok": False, "reason": "registry_write_failed"}
+
+    # 8. LAUNCH-FUNNEL STAMPS (server-side, DERIVED — no new client payload, no egress; the
+    #    IDENTITY.md:32-38 line holds). Both are pure bookkeeping on facts THIS call already
+    #    established, and neither can fail the enroll (cp_funnel degrades to False):
+    #      • the K-FACTOR edge — `members_before` is the count computed for the cap check just
+    #        above, so the 1 -> 2 transition is stamped with NO extra registry read, write-once.
+    #      • the DENOMINATOR — an append-only day counter, because the enrolled_at this call
+    #        just stamped is EVICTED by cp_registry_hygiene and would otherwise decay away.
+    #    Lazy import (mirrors cp_anomaly above) — keeps the pre-auth route's load surface minimal.
+    import cp_funnel  # lazy — the derived-fact stamps; never a transport, never a call home.
+    cp_funnel.stamp_team_grew(team_id, members_before=members_before, home=home)
+    cp_funnel.record_enroll(home=home)
     return {"ok": True, "haid": haid, "team_id": team_id}
 
 
