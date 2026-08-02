@@ -485,8 +485,17 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST "${PUBLIC_URL}/dispatch" \
 Confirm the public surface itself is alive:
 
 ```bash
-curl -s -o /dev/null -w '%{http_code}\n' "${PUBLIC_URL}/healthz"   # Expect: 200
+curl -s -o /dev/null -w '%{http_code}\n' "${PUBLIC_URL}/readyz"   # Expect: 200
 ```
+
+> Probe `/readyz`, **not** `/healthz`. Both are served by the same pre-auth handler
+> (`bin/lib/cp_diag.py`) and both are in the public allowlist, but Google's Cloud Run edge
+> intercepts an **external** `GET /healthz` and answers its own HTML 404 before the request
+> reaches the container — the 404 carries no `x-cloud-trace-context`, the `/readyz` 200 does.
+> A 404 here means the edge ate the probe, **not** that the service is down. `/readyz` is also
+> the stronger probe: it proves the route seam booted and the state backend initialised
+> (`{"status":"ready","booted":true,…}`), where `/healthz` only proves the interpreter is
+> alive. `deploy/cloud-run/go-live.sh` §7.0 verifies the same way.
 
 ### 7.2 The GATED service still DEMANDS the IAM token (Cloud Run edge)
 
