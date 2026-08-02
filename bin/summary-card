@@ -453,7 +453,10 @@ print(str(len(ag))+"|"+",".join("%s:%s"%(t,roles[t]) for t in order))
   fi
 
   # ══ ROW 3 · GATES (falsify · corpus · stub) + gate-health for the Bifröst ══
-  local gates_red=0 gates_ran=0
+  # Three-valued gate health, not two: a gate can be RED (ran, found a problem)
+  # or UNVERIFIED (could not run at all). Conflating them is how a run that
+  # checked NOTHING renders as a clean bill.
+  local gates_red=0 gates_ran=0 gates_unverified=0
   # falsify — passing/total over evals/oracles/*/report.json
   local oradir="${HEIMDALL_RECEIPT_ORACLE_DIR:-$ROOT/evals/oracles}"
   local f_seg_p="" f_col="" f_pass=0 f_tot=0
@@ -492,7 +495,17 @@ print("%d %d"%(p,t))
     fi
   fi
   [ -n "$c_seg_p" ] || { c_seg_p="corpus n/a"; c_col="${rD}${c_seg_p}${rR}"; }
-  # stub — verify-edits --json (warnings=0 & verdict!=FAIL → clean)
+  # stub — verify-edits --json. THREE verdicts, never two:
+  #   NON_VERIFIED → the session edit ledger was absent, so nothing was checked.
+  #                  Neither a pass nor a failure: "stub?" in warn colour, and it
+  #                  CLOSES the Bifröst. Keyed on the VERDICT alone — verify-edits
+  #                  also ships a warnings:1 value on that payload to trip the old
+  #                  `warnings>0` path, but this gate does not read it and stays
+  #                  correct if that value is ever dropped.
+  #   FAIL, or warnings>0 → verification ran and found a real problem: "stub✗", red.
+  #   anything else       → verification ran and the edits check out: "stub✓", green.
+  # "stub n/a" (dim) stays reserved for a DIFFERENT thing: no payload at all
+  # (verify-edits absent or its output unparseable).
   local sgate_json="" sg_src="${HEIMDALL_RECEIPT_STUB_JSON:-}"
   if [ -n "$sg_src" ]; then
     [ -f "$sg_src" ] && sgate_json="$(cat "$sg_src" 2>/dev/null)"
@@ -509,12 +522,17 @@ print("%s %s"%(d.get("warnings",-1), d.get("verdict","")))
 ' 2>/dev/null)"
   fi
   if [ -n "$nf_parsed" ]; then
-    gates_ran=1
     local nf_warn="${nf_parsed%% *}" nf_verd="${nf_parsed##* }"
-    if [ "$nf_verd" = "FAIL" ] || { [ "${nf_warn:-0}" -gt 0 ] 2>/dev/null; }; then
-      nf_seg_p="stub✗"; nf_col="${rRED}${nf_seg_p}${rR}"; gates_red=1
+    if [ "$nf_verd" = "NON_VERIFIED" ]; then
+      # Deliberately does NOT set gates_ran: this gate did not run.
+      nf_seg_p="stub?"; nf_col="${rW}${nf_seg_p}${rR}"; gates_unverified=1
     else
-      nf_seg_p="stub✓"; nf_col="${rG}${nf_seg_p}${rR}"
+      gates_ran=1
+      if [ "$nf_verd" = "FAIL" ] || { [ "${nf_warn:-0}" -gt 0 ] 2>/dev/null; }; then
+        nf_seg_p="stub✗"; nf_col="${rRED}${nf_seg_p}${rR}"; gates_red=1
+      else
+        nf_seg_p="stub✓"; nf_col="${rG}${nf_seg_p}${rR}"
+      fi
     fi
   else
     nf_seg_p="stub n/a"; nf_col="${rD}${nf_seg_p}${rR}"
@@ -522,11 +540,17 @@ print("%s %s"%(d.get("warnings",-1), d.get("verdict","")))
   local gates_plain="${f_seg_p} · ${c_seg_p} · ${nf_seg_p}"
   local gates_col="${f_col}${rD} · ${rR}${c_col}${rD} · ${rR}${nf_col}"
 
-  # ══ ROW 4 · BIFRÖST — open only when every gate that RAN is green ══
+  # ══ ROW 4 · BIFRÖST — open only when every gate RAN and every one is green ══
+  # Precedence: RED beats UNVERIFIED beats OPEN. Both closed states hold the run
+  # back, but the copy says WHICH — "is red" (we checked, it's broken) is a
+  # different fact from "could not verify" (we never got to check).
   local bi_plain bi_col
   if [ "$gates_red" = 1 ]; then
     bi_plain="✗ CLOSED — a gate is red, held back"
     bi_col="${rRED}${rB}✗ CLOSED${rR}${rRED} — a gate is red, held back${rR}"
+  elif [ "$gates_unverified" = 1 ]; then
+    bi_plain="✗ CLOSED — a gate could not verify"
+    bi_col="${rW}${rB}✗ CLOSED${rR}${rW} — a gate could not verify${rR}"
   elif [ "$gates_ran" = 1 ]; then
     bi_plain="✓ OPEN — nothing shipped unproven"
     bi_col="${rG}${rB}✓ OPEN${rR}${rG} — nothing shipped unproven${rR}"
@@ -660,6 +684,14 @@ print(d.get("rendered") or "—")
     printf "%s\n" "╚═ ${url} ${ffill}╝"
   fi
   printf "\n"
+
+  # Exit status carries the same vocabulary verify-edits uses one layer down, so
+  # a scripted caller reads the receipt the way a human reads the Bifröst row:
+  #   0 nothing held back · 1 a gate is RED · 2 a gate could NOT be verified.
+  # The card always RENDERS (a non-zero here is a verdict, never a crash).
+  [ "$gates_red" = 1 ] && return 1
+  [ "$gates_unverified" = 1 ] && return 2
+  return 0
 }
 
 # rrow LABEL PLAIN COLORED DIM RESET — one receipt content row, padded to width.
@@ -677,7 +709,7 @@ rrow() {
 
 if [ "$MODE" = "receipt" ]; then
   render_receipt
-  exit 0
+  exit $?
 fi
 
 printf "\n"

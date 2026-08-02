@@ -195,6 +195,83 @@ fi
 printf '%s' "$PIPED" | grep -q "HEIMDALL RUN RECEIPT" && ok "piped receipt still readable (plain text)" \
   || bad "piped receipt lost its content"
 
+# ── 6. NON_VERIFIED — the THIRD state: "could not verify" is NOT a pass ───────
+# bin/verify-edits exits 2 with verdict NON_VERIFIED when the session edit ledger
+# is absent: the tracker hook never fired, so NOTHING was checked. Rendering that
+# as the green check would be the exact false-green the ledger-presence fix closed
+# one layer DOWN, reappearing one layer UP. The receipt must treat it as its own
+# state: never the green check, never silently identical to a real FAIL.
+#
+# render_rc SGATE_FIXTURE HOLDOUT -> sets NV_OUT (ansi-stripped) + NV_RC (card's
+# own exit status, NOT the tail of a pipe — pipefail is off in this suite).
+render_rc() {
+  local raw
+  NV_RC=0
+  raw="$(SGATE="$1" render "$2")" || NV_RC=$?
+  NV_OUT="$(printf '%s\n' "$raw" | strip_ansi)"
+}
+
+# Byte-for-byte the payload bin/verify-edits emits on an absent ledger,
+# tripwire (warnings:1) included.
+SGATE_NV="$WORK/sgate-nonverified.json"
+cat > "$SGATE_NV" <<'JSON'
+{"verdict":"NON_VERIFIED","reason":"edit-ledger-absent","ledger":"/tmp/heimdall-edits/ledger-x.log","files_edited":null,"checks_passed":0,"checks_failed":0,"warnings":1,"paths":[]}
+JSON
+
+render_rc "$SGATE_NV" "$HOLDOUT_EST"
+echo "$NV_OUT" | grep -q "stub$GC" && bad "NON_VERIFIED rendered the GREEN check — false-green: $(echo "$NV_OUT" | grep -i gates)" \
+  || ok "NON_VERIFIED never renders the green stub check"
+echo "$NV_OUT" | grep -q "nothing shipped unproven" && bad "NON_VERIFIED green-washed the Bifrost (OPEN copy leaked)" \
+  || ok "NON_VERIFIED does NOT open the Bifrost"
+echo "$NV_OUT" | grep -qi "CLOSED" && ok "NON_VERIFIED closes the Bifrost (nothing ships unverified)" \
+  || bad "Bifrost stayed open on a NON_VERIFIED gate: $(echo "$NV_OUT" | grep -i bif)"
+[ "$NV_RC" -eq 2 ] && ok "NON_VERIFIED → receipt exits 2 (mirrors verify-edits' own code)" \
+  || bad "NON_VERIFIED exit did not reflect it (want 2, got $NV_RC)"
+# ...and it SAYS which: not-verified is distinguishable from a real failure.
+echo "$NV_OUT" | grep -q "could not verify" && ok "receipt SAYS 'could not verify' (distinct from 'a gate is red')" \
+  || bad "NON_VERIFIED not distinguished from FAIL in the copy: $(echo "$NV_OUT" | grep -i bif)"
+echo "$NV_OUT" | grep -q "is red, held back" && bad "NON_VERIFIED mislabelled as a red/failed gate" \
+  || ok "NON_VERIFIED is NOT mislabelled as a failure"
+
+# ── 6b. TRIPWIRE INDEPENDENCE — the assertion that keeps this fix honest ──────
+# verify-edits currently also sets warnings:1 on that payload purely to trip the
+# old `warnings>0` reddening. That is a workaround living in another file. With
+# warnings forced to 0 the receipt MUST still refuse to go green — otherwise this
+# card depends on a magic field value and anyone "tidying up" that 1 silently
+# restores the false-green.
+SGATE_NV0="$WORK/sgate-nonverified-nowarn.json"
+cat > "$SGATE_NV0" <<'JSON'
+{"verdict":"NON_VERIFIED","reason":"edit-ledger-absent","ledger":"/tmp/heimdall-edits/ledger-x.log","files_edited":null,"checks_passed":0,"checks_failed":0,"warnings":0,"paths":[]}
+JSON
+
+render_rc "$SGATE_NV0" "$HOLDOUT_EST"
+echo "$NV_OUT" | grep -q "stub$GC" && bad "warnings:0 NON_VERIFIED went GREEN — card depends on the warnings tripwire" \
+  || ok "warnings:0 NON_VERIFIED still NOT green (no dependency on the tripwire)"
+echo "$NV_OUT" | grep -q "nothing shipped unproven" && bad "warnings:0 NON_VERIFIED opened the Bifrost (tripwire-dependent)" \
+  || ok "warnings:0 NON_VERIFIED still closes the Bifrost"
+[ "$NV_RC" -eq 2 ] && ok "warnings:0 NON_VERIFIED still exits 2 (verdict alone drives it)" \
+  || bad "warnings:0 NON_VERIFIED exit regressed to $NV_RC — tripwire-dependent"
+
+# ── 6c. The other two states are UNCHANGED by the third one ───────────────────
+render_rc "$SGATE_OK" "$HOLDOUT_EST"
+echo "$NV_OUT" | grep -q "stub$GC" && ok "PASS payload still renders the green check" \
+  || bad "PASS regressed: $(echo "$NV_OUT" | grep -i gates)"
+echo "$NV_OUT" | grep -q "nothing shipped unproven" && ok "PASS payload still OPENs the Bifrost" \
+  || bad "PASS no longer opens the Bifrost: $(echo "$NV_OUT" | grep -i bif)"
+[ "$NV_RC" -eq 0 ] && ok "PASS payload still exits 0" \
+  || bad "PASS exit regressed (want 0, got $NV_RC)"
+
+# verdict FAIL with warnings:0 — the verdict alone must redden (not just warnings).
+SGATE_FAILV="$WORK/sgate-failverdict.json"
+echo '{"files_edited":2,"checks_passed":1,"checks_failed":1,"warnings":0,"verdict":"FAIL","paths":[]}' > "$SGATE_FAILV"
+render_rc "$SGATE_FAILV" "$HOLDOUT_EST"
+echo "$NV_OUT" | grep -q "stub$GX" && ok "FAIL payload still renders the red cross" \
+  || bad "FAIL regressed: $(echo "$NV_OUT" | grep -i gates)"
+echo "$NV_OUT" | grep -q "is red, held back" && ok "FAIL still reads as a RED gate (not 'could not verify')" \
+  || bad "FAIL copy regressed: $(echo "$NV_OUT" | grep -i bif)"
+[ "$NV_RC" -eq 1 ] && ok "FAIL payload exits 1 (distinct from NON_VERIFIED's 2)" \
+  || bad "FAIL exit wrong (want 1, got $NV_RC)"
+
 echo ""
 echo "──────────────────────────────────────────────"
 echo "  $PASS passed, $FAIL failed"
