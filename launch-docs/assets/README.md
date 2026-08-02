@@ -9,6 +9,34 @@ gate history (`bin/heimdall-clip`) or a 6-watchman fixture
 fixture technique `conformance/statusline/viral-statusline.fixture.sh` and
 `test/heimdall-team-board.test.sh` use for their own multi-teammate proofs.
 
+## Provenance — read this before embedding anything here
+
+**Every asset in this directory is currently `fixture`-provenance. None of them
+may be referenced from README.md.** The renderers are real; some of the data
+they rendered is seeded — `wall.png` labels five teammates who do not exist, and
+the "14 merges proven" figure on `wall.svg` / `wall.json` / `wall.txt` counts
+lines in a `printf`-written `beats.log`, not merges this repo proved.
+
+That fact is stated honestly below, but prose in *this* file protects nobody: a
+README reader never opens this directory. So provenance is also declared
+machine-readably in **`provenance.json`** (one entry per asset: `real` or
+`fixture`, each with a `reason` and a `receipt`), and enforced by
+**`test/asset-provenance-gate.test.sh`**, which fails RED if a `fixture` asset is
+referenced from README.md, the npm README mirror, or `site/`.
+
+The gate is fail-closed: an asset that is undeclared, or carries an unrecognised
+provenance value, is treated as `fixture`. That default lives in the test, not in
+the manifest, so no edit to `provenance.json` can widen what counts as `real`.
+Adding a file here without a `provenance.json` entry turns the gate RED (the
+manifest and the directory must agree in both directions), which is the point —
+a blocklist of filenames would rot the first time someone added `wall2.png`.
+
+HTML comments are stripped before scanning, so README.md's `HEIMDALL:HERO-ASSET`
+slot can keep naming `wall.gif` as the expected future path without tripping it.
+Run `test/asset-provenance-gate.test.sh --self-test` to watch the gate go RED on
+a planted fixture embed, a deleted manifest, an emptied manifest, and a
+receipt-less provenance claim.
+
 ## Files
 
 - **`wall.png`** — the shareable hero image (1576×520): 6 deterministic
@@ -26,7 +54,13 @@ fixture technique `conformance/statusline/viral-statusline.fixture.sh` and
   `hmd-statusline.py` team wall + the `heimdall-clip` card, concatenated
   with explanatory headers.
 - **`wall.json`** — `bin/heimdall-clip --wall --json` verbatim: the same
-  proven-wall moment as structured data (`schema: clip_v1`).
+  proven-wall moment as structured data (`schema: clip_v1`). Its `file` field
+  names `src/auth/session.ts` — a path this repo has never had (there is no
+  `src/` directory at all), which is the clearest single tell that the clip
+  assets were rendered against a seeded verdict rather than real gate history.
+- **`provenance.json`** — the machine-readable provenance declaration the gate
+  reads (`schema: asset_provenance_v1`). Not an asset; a receipt about the
+  assets.
 
 ## Why there is no wall.gif
 

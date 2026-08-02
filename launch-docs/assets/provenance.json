@@ -1,0 +1,39 @@
+{
+  "schema": "asset_provenance_v1",
+  "purpose": "Machine-readable provenance for every file in launch-docs/assets/. Enforced by test/asset-provenance-gate.test.sh, which fails RED if any 'fixture' asset is referenced from a reader-facing surface (README.md, the npm README mirror, site/). A README reader never opens this directory's README, so the prose disclosure there cannot protect them on its own.",
+  "provenance_values": {
+    "real": "Every rendered datum came from this repo's actual state: real gate history, real team presence, real identities. Safe to embed on a reader-facing surface.",
+    "fixture": "At least one rendered datum was seeded — invented teammates, a seeded verdict/beats file, a scratch workspace. The renderer is real; the data is not. NEVER safe to embed on a reader-facing surface."
+  },
+  "fail_closed": "The gate hardcodes 'fixture' as the default for any asset that is undeclared here or carries an unrecognised provenance value. That default lives in the test, NOT in this file — there is deliberately no manifest field that can widen what counts as 'real'. An unmarked asset is not assumed real.",
+  "assets": [
+    {
+      "file": "wall.png",
+      "provenance": "fixture",
+      "reason": "Depicts six labelled watchmen, five of whom do not exist: arjun, kai, maya, nadia, priya are invented teammates seeded as .heimdall/team/*.json heartbeats in a scratch workspace. The 'six watchmen online' stat line counts those inventions, and the '14 merges proven' figure comes from the same seeded beats.log as wall.svg. The sigil renderer (bin/heimdall-sigil-png) and the compositing are real; the people are not.",
+      "receipt": "launch-docs/assets/README.md § 'Fixture identities used' names all five invented teammates; § 'Regenerating' step 2 shows the printf that seeds them."
+    },
+    {
+      "file": "wall.svg",
+      "provenance": "fixture",
+      "reason": "Byte-for-byte what bin/heimdall-clip --wall --svg emits, but it was run against a SEEDED gate history: the '14 merges proven by the watchman' headline counts printf-written lines in .heimdall/receipts/beats.log, not merges this repo actually proved. Real renderer, seeded input.",
+      "receipt": "launch-docs/assets/README.md § 'Regenerating' step 1 is the printf that writes the 14-pass/1-deny beats.log the count is read from."
+    },
+    {
+      "file": "wall.json",
+      "provenance": "fixture",
+      "reason": "The same seeded clip_v1 moment as wall.svg, as structured data. Its two headline fields are both seeded: proven_count 14 comes from the printf-written beats.log, and file 'src/auth/session.ts' names a path that has never existed in this repo (there is no src/ directory at all).",
+      "receipt": "launch-docs/assets/README.md § 'Regenerating' step 1 writes that exact verdict.json; `ls src/auth/session.ts` in this repo returns 'No such file or directory'."
+    },
+    {
+      "file": "wall.txt",
+      "provenance": "fixture",
+      "reason": "Concatenates both seeded renders. Its section 1 team wall shows the invented teammates arjun/kai/maya plus a '+2' overflow tag standing in for nadia and priya; its section 2 card carries the same seeded '14 merges proven' count. The file's own header says so in prose, which is honest but invisible to a README reader.",
+      "receipt": "launch-docs/assets/wall.txt lines 8-12 name the six-watchman fixture; lines 20-22 name the seeded beats.log."
+    }
+  ],
+  "notes": [
+    "There is currently no 'real' asset in this directory. That is the honest state, not an omission: the hero recording README.md's HEIMDALL:HERO-ASSET slot is waiting for (launch-docs/assets/wall.gif) has not been produced, because asciinema/agg are absent from the machine that built these and this repo's real team wall currently renders one row, 'rj', 0 online.",
+    "Adding an asset here does not make it embeddable. To declare one 'real', its reason must survive the question a reader would ask: is every name, number and verdict on this image something this repo actually did?"
+  ]
+}
