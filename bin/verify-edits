@@ -12,13 +12,23 @@
 #   verify-edits --quick      File existence + stub check only
 #   verify-edits --diff       Show git diff of all edited files
 #   verify-edits --json       Output as JSON
+#
+# Exit codes:
+#   0  PASS (or WARN) — verification ran and the edits check out
+#   1  FAIL           — verification ran and found problems
+#   2  NON-VERIFIED   — verification could NOT run: the session edit ledger is
+#                       absent, i.e. the PostToolUse edit-tracker hook never
+#                       fired. Distinct from 1 so "nothing was checked" can
+#                       never be mistaken for "everything is fine".
 set -euo pipefail
 
 PLUGIN_DIR="${CLAUDE_PLUGIN_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
 TRACKER="$PLUGIN_DIR/bin/edit-tracker"
 
-if [ ! -x "$TRACKER" ]; then
-  echo "edit-tracker not built. Building..."
+# Rebuild when missing OR stale: a binary older than its source may predate
+# `status`, which would make every run look NON-VERIFIED.
+if [ ! -x "$TRACKER" ] || [ "$PLUGIN_DIR/bin/edit-tracker.c" -nt "$TRACKER" ]; then
+  echo "edit-tracker not built or stale. Building..."
   clang -O2 -Wall -Wextra -o "$TRACKER" "$PLUGIN_DIR/bin/edit-tracker.c" 2>/dev/null || {
     echo "Build failed. Run: clang -O2 -Wall -Wextra -o bin/edit-tracker bin/edit-tracker.c"
     exit 1
@@ -31,9 +41,59 @@ FAIL=0
 WARN=0
 ISSUES=""
 
-paths=$("$TRACKER" paths 2>/dev/null)
+# ── Gate 0: ledger presence (proof the tracker actually ran) ──
+# ABSENT ledger => the PostToolUse edit-tracker hook never fired. "Zero edits" is
+#   then UNKNOWABLE, not proven, so we report NON-VERIFIED (exit 2) — never a pass.
+# PRESENT + zero entries => the session genuinely made no edits. That is a pass,
+#   and stays quiet so read-only/planning sessions do not get a false alarm.
+# An edit-tracker too old to know `status` prints nothing here and is treated as
+# absent — fail closed, because it also cannot prove anything was tracked.
+ledger_state=$("$TRACKER" status 2>/dev/null || true)
+case "$ledger_state" in
+  "present "*) ledger_present=1; ledger_file="${ledger_state#present }" ;;
+  "absent "*)  ledger_present=0; ledger_file="${ledger_state#absent }" ;;
+  *)           ledger_present=0; ledger_file="(edit-tracker status unavailable)" ;;
+esac
+
+if [ "$ledger_present" -eq 0 ]; then
+  if [ "$MODE" = "--json" ]; then
+    echo "{"
+    echo "  \"verdict\": \"NON_VERIFIED\","
+    echo "  \"reason\": \"edit-ledger-absent\","
+    echo "  \"ledger\": \"$ledger_file\","
+    echo "  \"files_edited\": null,"
+    echo "  \"checks_passed\": 0,"
+    echo "  \"checks_failed\": 0,"
+    # warnings=1 is load-bearing: downstream receipt gates (bin/summary-card)
+    # only redden on verdict=="FAIL" or warnings>0. Without it, a run that
+    # verified NOTHING would render as a green gate — the same false-green,
+    # one layer up.
+    echo "  \"warnings\": 1,"
+    echo "  \"paths\": []"
+    echo "}"
+    exit 2
+  fi
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "[heimdall] verify-edits: NOT VERIFIED — edit tracking unavailable"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "Session edit ledger does not exist:"
+  echo "  $ledger_file"
+  echo ""
+  echo "The PostToolUse edit-tracker hook never ran, so no edit this session was"
+  echo "recorded. This is NOT a clean bill of health — it means NOTHING was"
+  echo "checked. Treat every edit this session as UNVERIFIED."
+  echo ""
+  echo "Fix: load heimdall's hooks (hooks/hooks.json PostToolUse Write|Edit ->"
+  echo "bin/edit-tracker log), then re-run. To start tracking from this point:"
+  echo "  $TRACKER init"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "VERDICT: NON-VERIFIED"
+  exit 2
+fi
+
+paths=$("$TRACKER" paths 2>/dev/null || true)
 if [ -z "$paths" ]; then
-  echo "[heimdall] verify-edits: No edits tracked this session."
+  echo "[heimdall] verify-edits: No edits tracked this session (ledger present, 0 edits)."
   exit 0
 fi
 
