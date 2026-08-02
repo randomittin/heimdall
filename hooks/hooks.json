@@ -68,11 +68,11 @@
         ]
       },
       {
-        "matcher": "Write|Edit",
+        "matcher": "Write|Edit|MultiEdit|NotebookEdit",
         "hooks": [
           {
             "type": "command",
-            "command": "INPUT=$(cat); TOOL=$(echo \"$INPUT\" | jq -r '.tool_name // \"unknown\"'); FPATH=$(echo \"$INPUT\" | jq -r '.tool_input.file_path // empty'); if [ -n \"$FPATH\" ]; then \"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}/bin/edit-tracker\" log \"$TOOL\" \"$FPATH\" 2>/dev/null || true; fi; if [ -f heimdall-state.json ]; then heimdall-state mark-dirty 2>/dev/null || true; elif [ -f superx-state.json ]; then heimdall-state mark-dirty 2>/dev/null || true; fi; if [ -f .heimdall-no-autocommit ] || [ -f .superx-no-autocommit ]; then exit 0; fi; count=$(git diff --name-only 2>/dev/null | wc -l | tr -d ' '); if [ \"$count\" -ge 5 ] && [ -d .git ]; then git add -A && git commit -m \"heimdall: auto-checkpoint (${count} files)\" --no-verify 2>/dev/null || true; fi"
+            "command": "INPUT=$(cat); TOOL=$(echo \"$INPUT\" | jq -r '.tool_name // \"unknown\"'); FPATH=$(echo \"$INPUT\" | jq -r '.tool_input.file_path // .tool_input.notebook_path // empty'); if [ -n \"$FPATH\" ]; then \"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}/bin/edit-tracker\" log \"$TOOL\" \"$FPATH\" 2>/dev/null || true; fi; if [ -f heimdall-state.json ]; then heimdall-state mark-dirty 2>/dev/null || true; elif [ -f superx-state.json ]; then heimdall-state mark-dirty 2>/dev/null || true; fi; if [ -f .heimdall-no-autocommit ] || [ -f .superx-no-autocommit ]; then exit 0; fi; count=$(git diff --name-only 2>/dev/null | wc -l | tr -d ' '); if [ \"$count\" -ge 5 ] && [ -d .git ]; then git add -A && git commit -m \"heimdall: auto-checkpoint (${count} files)\" --no-verify 2>/dev/null || true; fi"
           }
         ]
       },
