@@ -44,7 +44,7 @@ Stronger gates catch more classes of bug with fewer false passes. When a task's 
 
 - **differential** — Run the same inputs through the implementation **and** an independent reference implementation; the gate passes only if every observable output (results, state, event stream) matches across all inputs/seeds. Strongest: any divergence is a failure. Example: `exchange-lob` replays seeded order flow through both the optimized engine and a naive O(n²) matcher.
 - **trace-diff** — Compare the implementation's emitted execution trace line-for-line against a known-correct reference trace. Catches divergence at the step where it first occurs. Example: `emulator-gb` diffs per-instruction CPU state against gameboy-doctor truth logs and asserts Blargg pass markers.
-- **verdict** — Score the implementation's output against a reference using a metric + threshold, yielding a single pass/fail verdict. Tolerates bounded, non-exact differences. Example: `raytracer-calib` scores a render against a golden image via SSIM ≥ 0.99.
+- **verdict** — Score the implementation's output against a reference using a metric + threshold, yielding a single pass/fail verdict. Tolerates bounded, non-exact differences (e.g. scoring a render against a golden image via SSIM ≥ 0.99). **No oracle currently registers this type** — it stays in the ranking so a future metric-scored gate slots in at the right strength.
 - **property** — Assert invariants/properties that any correct implementation must satisfy (e.g. conservation laws, idempotence, monotonicity) across generated inputs. No full reference output required.
 - **example** — Assert against a fixed set of input→expected-output examples. Weakest: only covers the enumerated cases.
 
@@ -54,7 +54,15 @@ Stronger gates catch more classes of bug with fewer false passes. When a task's 
 |----|-----------|--------|----------------|
 | `emulator-gb` | trace-diff | Game Boy / LR35902 emulation | external-dataset (Blargg ROMs + gameboy-doctor traces) |
 | `exchange-lob` | differential | limit-order-book matching engine | separate-agent (independent O(n²) matcher) |
-| `raytracer-calib` | verdict | ray tracing (calibration only) | in-repo golden render |
+| `issue-collection` | differential | anonymized issue-collection k-anon aggregate | separate-agent (independent reference aggregator) |
+| `ponytail-underdelivery` | example | write-time under-delivery guard (`roman(n)`) | in-repo-dataset (fixed 16-case acceptance table + 3 mutants) |
+| `rr-multitenant-isolation` | example | multi-tenant cross-tenant denial | in-repo-dataset (fixed 25-case all-DENY table + 23 mutants) |
+| `symbol-reuse` | differential | cross-project symbol reuse | separate-agent (independent reference fold) |
+| `team-checkpoint` | differential | shared team-checkpoint roster | separate-agent (independent reference fold) |
+| `team-copilot` | differential | team co-piloting (redum team lens) | separate-agent (independent reference fold) |
+| `triage-coord` | differential | team issue-triage claim coordination | separate-agent (independent reference fold) |
+
+This table is **gate-checked, not hand-maintained**: `bash test/oracle-registry-integrity.test.sh` fails if it drifts from `registry.json` (missing row, phantom row, or mismatched `gate_type`), and also fails if any entry's `gate_command` points at a path that does not exist.
 
 ## Planner `domain_signals` auto-selection
 
