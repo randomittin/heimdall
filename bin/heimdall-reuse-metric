@@ -166,7 +166,22 @@ else
   # In the working-tree case ALSO include untracked-but-not-ignored files: a real
   # `hmd "task"` run writes NEW files that are not yet committed/staged, and those
   # are exactly the units we must measure.
-  CHANGED="$(git -C "$REPO" diff --name-only --diff-filter=ACMR $DIFF_ARGS 2>/dev/null || true)"
+  # ANTI-VACUOUS: capture git's exit status instead of swallowing it. A failing
+  # `git diff` (unresolvable ref, corrupt index) returns an EMPTY file list, which
+  # is byte-indistinguishable from "nothing changed" — so a broken invocation would
+  # emit reason:"no-changed-files" and read as an honest empty measurement. It is
+  # not: nothing was examined. Report the git failure by name instead.
+  DIFF_ERRF="$(mktemp -t "reuse-diff.$(printf 'X%.0s' 1 2 3 4 5 6)")"
+  set +e
+  CHANGED="$(git -C "$REPO" diff --name-only --diff-filter=ACMR $DIFF_ARGS 2>"$DIFF_ERRF")"
+  DIFF_RC=$?
+  set -e
+  DIFF_ERR="$(tr '\n' ' ' < "$DIFF_ERRF" 2>/dev/null | cut -c1-300)"
+  rm -f "$DIFF_ERRF"
+  if [ "$DIFF_RC" -ne 0 ]; then
+    emit_degraded "git-diff-failed rc=${DIFF_RC} for '${DIFF_ARGS}': ${DIFF_ERR:-no stderr}"
+    exit 0
+  fi
   if [ -z "$AFTER" ] && [ "$STAGED" -eq 0 ]; then
     UNTRACKED="$(git -C "$REPO" ls-files --others --exclude-standard 2>/dev/null || true)"
     CHANGED="$(printf '%s\n%s\n' "$CHANGED" "$UNTRACKED" | grep -v '^$' | sort -u || true)"

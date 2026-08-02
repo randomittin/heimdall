@@ -109,14 +109,42 @@ else
   esac
 fi
 
+# ANTI-VACUOUS: a failing `git rev-list` returns an EMPTY commit list, which is
+# byte-indistinguishable from "this range is genuinely empty" — so a typo'd or
+# unresolvable revision spec would print "nothing to check" and exit 0, reporting
+# clean over a scope that was never resolved. Capture the status and say so.
+rev_list_or_die() { # rev_list_or_die <scope-label> <rev-list args...>
+  local label="$1"; shift
+  local errf out rc err
+  errf="$(mktemp -t "hci-revlist.$(printf 'X%.0s' 1 2 3 4 5 6)")"
+  set +e
+  out="$(git rev-list "$@" 2>"$errf")"
+  rc=$?
+  set -e
+  err="$(tr '\n' ' ' < "$errf" 2>/dev/null | cut -c1-300)"
+  rm -f "$errf"
+  if [ "$rc" -ne 0 ]; then
+    echo "heimdall-check-identities: git rev-list failed for scope ${label} (rc=${rc}): ${err:-no stderr}" >&2
+    echo "  Refusing to report 'nothing to check' over a scope git could not resolve —" >&2
+    echo "  an unresolved range yields zero commits, and zero commits would read as a" >&2
+    echo "  clean allowlist sweep. Fix the revision spec and re-run." >&2
+    exit 2
+  fi
+  printf '%s' "$out"
+}
+
+SCOPE_DESC=""
 case "$MODE" in
   all)
-    COMMITS="$(git rev-list --all 2>/dev/null || true)"
+    SCOPE_DESC="--all (every ref)"
+    COMMITS="$(rev_list_or_die "$SCOPE_DESC" --all)"
     ;;
   ranges)
-    COMMITS="$(git rev-list "${RANGES[@]}" 2>/dev/null || true)"
+    SCOPE_DESC="${RANGES[*]}"
+    COMMITS="$(rev_list_or_die "$SCOPE_DESC" "${RANGES[@]}")"
     ;;
   prepush)
+    SCOPE_DESC="--pre-push (refs on stdin)"
     collect_pre_push_stdin
     ;;
 esac
@@ -126,9 +154,14 @@ if [ -n "$COMMITS" ]; then
   COMMITS="$(printf '%s\n' "$COMMITS" | sort -u)"
 fi
 
-# Nothing in scope => nothing to enforce.
+# Nothing in scope => nothing to enforce. Say that in the SAME receipt-count shape
+# the success path uses, so an empty sweep can never be misread as a clean one: the
+# numerator and denominator are both zero and that is stated out loud.
 if [ -z "$COMMITS" ]; then
-  echo "heimdall-check-identities: no commits in scope — nothing to check." >&2
+  echo "guard: identities=0/0 allowlisted — EMPTY SCOPE (${SCOPE_DESC})" >&2
+  echo "  The allowlist was enforced over ZERO commits. This is NOT a clean bill of" >&2
+  echo "  health; it means nothing was examined. If you expected commits here, the" >&2
+  echo "  revision spec is wrong." >&2
   exit 0
 fi
 

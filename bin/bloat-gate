@@ -110,6 +110,20 @@ if ! git -C "$REPO" rev-parse "${RANGE%%..*}" >/dev/null 2>&1; then
   EMPTY_TREE="$(git -C "$REPO" hash-object -t tree /dev/null 2>/dev/null || echo 4b825dc642cb6eb9a060e54bf8d69288fbee4904)"
   RANGE="${EMPTY_TREE}..${HEAD_REF:-HEAD}"
 fi
+# ANTI-VACUOUS (range endpoint). The RIGHT endpoint must resolve too. An
+# unresolvable head ref makes `git diff` fail, the 2>/dev/null below swallows the
+# error, and the change set comes back EMPTY — byte-indistinguishable from
+# "nothing changed", which would render a clean `pass` over a scan that never
+# happened. A bad revision is a USAGE error (exit 2), never a clean wave.
+RANGE_RHS="${RANGE##*..}"
+[ -n "$RANGE_RHS" ] || RANGE_RHS="HEAD"
+if ! git -C "$REPO" rev-parse --verify --quiet "${RANGE_RHS}^{commit}" >/dev/null 2>&1 \
+   && ! git -C "$REPO" rev-parse --verify --quiet "${RANGE_RHS}^{tree}" >/dev/null 2>&1; then
+  echo "error: range endpoint does not resolve in $REPO: '${RANGE_RHS}' (range '$RANGE')" >&2
+  echo "       refusing to emit a verdict over a range git cannot compute — a diff that" >&2
+  echo "       errors returns zero files, and zero files would read as a clean pass." >&2
+  exit 2
+fi
 
 # ── Config + thresholds (config <- defaults, CLI <- config) ───────────
 # Built-in defaults (documented in .planning/bloat.json).
@@ -148,11 +162,20 @@ done < <(printf '%s' "$EXCLUDES_JSON" | jq -r '.[]?')
 # ── Changed files in the range (filtered by excludes) ─────────────────
 # Added/Copied/Modified/Renamed files; deletions are irrelevant to bloat.
 # bash 3.2-safe: read into arrays via a while loop (no mapfile).
+# RAW_N / N_EXCLUDED / N_MISSING are the anti-vacuous receipt: they record how many
+# files the range actually produced and exactly why each dropped one was dropped, so
+# an empty analysis set can never be mistaken for a clean one.
 CHANGED=(); JS_TS=(); PY=()
+RAW_N=0; N_EXCLUDED=0; N_MISSING=0
 while IFS= read -r f; do
   [ -n "$f" ] || continue
-  if [ -n "$EXCLUDE_RE" ] && printf '%s' "$f" | grep -Eq "$EXCLUDE_RE"; then continue; fi
-  [ -f "$REPO/$f" ] || continue
+  RAW_N=$((RAW_N + 1))
+  if [ -n "$EXCLUDE_RE" ] && printf '%s' "$f" | grep -Eq "$EXCLUDE_RE"; then
+    N_EXCLUDED=$((N_EXCLUDED + 1)); continue
+  fi
+  if [ ! -f "$REPO/$f" ]; then
+    N_MISSING=$((N_MISSING + 1)); continue
+  fi
   CHANGED+=("$f")
   case "$f" in
     *.js|*.jsx|*.ts|*.tsx|*.mjs|*.cjs) JS_TS+=("$f") ;;
@@ -293,8 +316,13 @@ if [ "${#JS_TS[@]}" -gt 0 ]; then
     rs_total=0
     while IFS= read -r pat; do
       [ -n "$pat" ] || continue
-      c="$( cd "$REPO" && ast-grep run --pattern "$pat" --json "${JS_TS[@]}" 2>/dev/null | jq 'length' 2>/dev/null || echo 0 )"
-      [ -n "$c" ] && [ "$c" != "null" ] || c=0
+      # ast-grep --json can emit a STREAM of documents; `jq length` would then print
+      # one integer per document and the arithmetic below would see a multi-line
+      # operand ("0\n0") and abort with a syntax error. Slurp and sum so the count is
+      # always exactly one integer.
+      c="$( cd "$REPO" && ast-grep run --pattern "$pat" --json "${JS_TS[@]}" 2>/dev/null \
+            | jq -s '[.[] | length] | add // 0' 2>/dev/null || echo 0 )"
+      case "$c" in ''|*[!0-9]*) c=0 ;; esac
       rs_total=$(( rs_total + c ))
     done <<< "$RS_PATTERNS"
     RS_COUNT="$rs_total"
@@ -308,6 +336,22 @@ fi
 #    from env so a re-run can record "−N lines after simplification"). 0 if unset.
 SIMPLIFY_DELTA="${HEIMDALL_BLOAT_SIMPLIFY_DELTA:-0}"
 
+# ── ANTI-VACUOUS scan receipt ─────────────────────────────────────────────────
+# How many items did this gate actually examine, and how many of the HARD axes
+# could actually run? Without these numbers a "no findings" verdict is
+# indistinguishable from "nothing was examined" — the exact defect class that
+# makes a gate inert while it reports green.
+ANALYZABLE=$(( ${#JS_TS[@]} + ${#PY[@]} ))
+HARD_RAN=0
+if [ "$DEAD_STATUS" = "ran" ]; then HARD_RAN=$((HARD_RAN + 1)); fi
+if [ "$DUP_STATUS"  = "ran" ]; then HARD_RAN=$((HARD_RAN + 1)); fi
+if [ "$CC_STATUS"   = "ran" ]; then HARD_RAN=$((HARD_RAN + 1)); fi
+# INCONCLUSIVE: there WAS analyzable code but not one hard axis had a tool to
+# measure it. The numbers are honest zeros, but they certify nothing — the same
+# word bin/debloat's card already uses for this state.
+INCONCLUSIVE=0
+if [ "$ANALYZABLE" -gt 0 ] && [ "$HARD_RAN" -eq 0 ]; then INCONCLUSIVE=1; fi
+
 # ── Assemble metrics (open-keyed; consumers read the contract fields) ─
 metrics="$(jq -nc \
   --arg range "$RANGE" --arg mode "$MODE" \
@@ -319,8 +363,13 @@ metrics="$(jq -nc \
   --arg rss "$RS_STATUS" --argjson rsc "${RS_COUNT:-0}" --arg rst "$RS_TOOL" --arg rsn "$RS_NOTE" \
   --argjson sd "${SIMPLIFY_DELTA:-0}" \
   --argjson nfiles "${#CHANGED[@]}" \
+  --argjson rawn "${RAW_N:-0}" --argjson nexcl "${N_EXCLUDED:-0}" --argjson nmiss "${N_MISSING:-0}" \
+  --argjson anlz "${ANALYZABLE:-0}" --argjson hran "${HARD_RAN:-0}" --argjson incon "${INCONCLUSIVE:-0}" \
   '{
     range:$range, mode:$mode, files_analyzed:$nfiles,
+    scan: {files_in_range:$rawn, files_analyzed:$nfiles, dropped_by_exclude_globs:$nexcl,
+           dropped_absent_from_worktree:$nmiss, analyzable_files:$anlz,
+           hard_axes_ran:$hran, hard_axes_total:3, inconclusive:($incon==1)},
     dead_code:   {status:$ds,  tool:$dt, new_unreferenced:$dc, threshold:$dth, note:$dn},
     duplication: {status:$ups, tool:$ut, pct:(if $up=="" then null else ($up|tonumber) end), threshold_pct:$uth, note:$un},
     complexity:  {status:$cs,  tool:$ct, max_new_cc:$cm, threshold:$cth, over:($cov==1), note:$cn},
@@ -336,6 +385,16 @@ metrics="$(jq -nc \
 # fails. An axis that did not RUN cannot fail (honest skip != fail).
 FAIL_REASONS=()
 if [ "$MODE" != "off" ]; then
+  # ── ANTI-VACUOUS FLOOR (runs before the axis checks) ────────────────────────
+  # A gate that examined ZERO files has not found "no bloat" — it has found
+  # nothing at all, and reporting `pass` would certify an unexamined change set.
+  # Both shapes below are hard failures: the caller's range or exclude_globs is
+  # wrong, and that is a defect in the gate invocation, not a clean wave.
+  if [ "$RAW_N" -eq 0 ]; then
+    FAIL_REASONS+=("vacuous scan: the diff range ${RANGE} produced ZERO files — the gate examined nothing, so a 'pass' would certify an unexamined change set (check --base/--head/--diff; an empty range is not a clean wave)")
+  elif [ "${#CHANGED[@]}" -eq 0 ]; then
+    FAIL_REASONS+=("vacuous scan: all ${RAW_N} changed file(s) in ${RANGE} were dropped before analysis (${N_EXCLUDED} by exclude_globs, ${N_MISSING} absent from the worktree) — the gate examined nothing; a glob like '**' compiles to the regex '.*' and swallows the entire change set (fix exclude_globs in ${CONFIG})")
+  fi
   if [ "$DEAD_STATUS" = "ran" ] && awk -v c="${DEAD_COUNT:-0}" -v t="${TH_DEAD:-0}" 'BEGIN{exit !(c+0 > t+0)}'; then
     FAIL_REASONS+=("dead code: ${DEAD_COUNT} new unreferenced export(s) via ${DEAD_TOOL} (max ${TH_DEAD})")
   fi
@@ -376,8 +435,12 @@ else
   # If mode=off, say so honestly in the hint.
   if [ "$MODE" = "off" ]; then
     FIX="Bloat gate in observability-only mode (off): metrics reported, no axis enforced."
+  elif [ "$INCONCLUSIVE" = "1" ]; then
+    # Loud SKIP, not a clean bill of health: real files were in scope but not one
+    # hard axis had a tool to measure them, so the zeros certify nothing.
+    FIX="Bloat gate INCONCLUSIVE for ${RANGE}: ${ANALYZABLE} analyzable file(s) examined but 0/3 hard axes could run (dead=${DEAD_STATUS}, duplication=${DUP_STATUS}, complexity=${CC_STATUS}) — the zeros are honest but they measure NOTHING. Install knip|ts-prune (JS/TS dead code), vulture (py dead code), jscpd (duplication), eslint (JS/TS complexity) or radon (py complexity) before treating this as clean."
   else
-    FIX="Bloat gate clean for new code in ${RANGE}: dead=${DEAD_COUNT}, dup=${DUP_PCT:-n/a}%, max-cc=${CC_MAX} (skipped axes are honest skips, not passes)."
+    FIX="Bloat gate clean for new code in ${RANGE}: ${#CHANGED[@]} file(s) examined (${RAW_N} in range), ${HARD_RAN}/3 hard axes ran — dead=${DEAD_COUNT}, dup=${DUP_PCT:-n/a}%, max-cc=${CC_MAX} (skipped axes are honest skips, not passes)."
   fi
   jq -n --arg gate_id "bloat" --arg status "$STATUS" \
         --argjson metrics "$metrics" --arg fix_hint "$FIX" \
@@ -388,6 +451,11 @@ else
   EXIT=0
 fi
 
-echo "bloat-gate: status=$STATUS  range=$RANGE  mode=$MODE  report=$REPORT" >&2
+SCAN_RECEIPT="examined=${#CHANGED[@]}/${RAW_N} files  analyzable=${ANALYZABLE}  hard-axes-ran=${HARD_RAN}/3"
+echo "bloat-gate: status=$STATUS  range=$RANGE  mode=$MODE  $SCAN_RECEIPT  report=$REPORT" >&2
+if [ "$STATUS" = "pass" ] && [ "$MODE" != "off" ] && [ "$INCONCLUSIVE" = "1" ]; then
+  echo "bloat-gate: INCONCLUSIVE — ${ANALYZABLE} analyzable file(s) but 0/3 hard axes had a tool" >&2
+  echo "            on PATH. This 'pass' measured nothing; it is NOT a clean bill of health." >&2
+fi
 [ "$PRINT_JSON" = "1" ] && cat "$REPORT"
 exit "$EXIT"

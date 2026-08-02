@@ -55,28 +55,75 @@ grep -qF "${CANON}" "${README}" \
   || fail "README is missing the canonical public route set '${CANON}'"
 
 # ── 3. BOUNDARY — no gated route in the public set; no dispatch role in the deploy ───
-# Pull the documented public set line out of the README and assert no gated path is in it.
-PUBLIC_LINE="$(grep -F "${CANON}" "${README}" | head -1)"
-for r in "${GATED_ROUTES[@]}"; do
-  if printf '%s' "${PUBLIC_LINE}" | grep -qF "${r}"; then
-    fail "gated route ${r} leaked into the documented PUBLIC set"
+# Scan EVERY line that documents the canonical public set, not just the first. A
+# `head -1` here made this check vacuous: a leak on the second or third canonical
+# line was never examined, so the same defect passed or failed purely on its line
+# number. The count is asserted below so an empty scan can never read as clean.
+scan_public_lines() { # scan_public_lines <label> <file>
+  local label="$1" file="$2" n=0 leaked=0 line r
+  while IFS= read -r line; do
+    [ -n "${line}" ] || continue
+    n=$((n + 1))
+    for r in "${GATED_ROUTES[@]}"; do
+      if printf '%s' "${line}" | grep -qF "${r}"; then
+        fail "gated route ${r} leaked into the ${label}'s documented PUBLIC set: ${line}"
+        leaked=1
+      fi
+    done
+  done <<EOF
+$(grep -F "${CANON}" "${file}")
+EOF
+  if [ "${n}" -eq 0 ]; then
+    fail "VACUOUS: 0 canonical public-set lines found in ${label} — the gated-route scan examined nothing"
+    return 1
   fi
-done
-[ "${FAILED}" -eq 0 ] && pass "no gated route appears in the documented public set"
+  [ "${leaked}" -eq 0 ] && pass "no gated route in any of the ${n} canonical public-set line(s) in ${label}"
+  return 0
+}
+scan_public_lines "README" "${README}"
 
 # The public deploy must NOT grant any job-dispatch role. A dispatch role named in a
 # `#` comment is fine (the script EXPLAINS what it deliberately omits); what must never
 # appear is an EXECUTABLE grant — a non-comment line carrying both an IAM grant verb
 # (add-iam-policy-binding / create role) and a dispatch role. Strip comment lines first.
 NONCOMMENT="$(grep -vE '^[[:space:]]*#' "${DEPLOY_SH}")"
-BAD="$(printf '%s\n' "${NONCOMMENT}" \
-       | grep -E 'add-iam-policy-binding|roles create|--role=' \
-       | grep -E 'run\.jobs\.run|roles/run\.developer|heimdallJobRunner' || true)"
-if [ -n "${BAD}" ]; then
-  fail "public deploy has an EXECUTABLE dispatch-role grant:"
-  printf '%s\n' "${BAD}" >&2
+NONCOMMENT_N="$(printf '%s\n' "${NONCOMMENT}" | grep -c '[^[:space:]]' || true)"
+# ANTI-VACUOUS: zero executable lines means this assertion scanned an empty haystack.
+# "No dispatch grant found" over nothing examined is not a finding, it is a blind spot.
+if [ "${NONCOMMENT_N}" -eq 0 ]; then
+  fail "VACUOUS: ${DEPLOY_SH} has 0 executable (non-comment) lines — the dispatch-role scan examined nothing"
 else
-  pass "public deploy grants no dispatch role in any executable line (comments aside)"
+  # Join backslash line-continuations FIRST. `gcloud ... --role \` + newline +
+  # `roles/run.developer` is one logical command but two physical lines, and a
+  # per-physical-line grep sees an IAM verb with no role and a role with no verb,
+  # so it matches neither and the grant sails through.
+  JOINED="$(printf '%s\n' "${NONCOMMENT}" | awk '
+    { if (buf != "") { sub(/^[ \t]+/, ""); line = buf " " $0 } else { line = $0 }
+      if (line ~ /\\$/) { sub(/\\$/, "", line); buf = line } else { buf = ""; print line } }
+    END { if (buf != "") print buf }')"
+  DISPATCH_RE='run\.jobs\.run|roles/run\.developer|heimdallJobRunner'
+  # A grant line: an IAM verb AND a dispatch role on the same logical line. `--role`
+  # (not `--role=`) so the space-separated form `--role roles/run.developer` counts.
+  BAD="$(printf '%s\n' "${JOINED}" \
+         | grep -E 'add-iam-policy-binding|roles create|--role' \
+         | grep -E "${DISPATCH_RE}" || true)"
+  # Second shape: the role BOUND TO A VARIABLE (`ROLE=roles/run.developer`) and later
+  # passed as `--role="$ROLE"`. The grant line then carries no literal role, so the
+  # correlation above matches neither line and the grant sails through. Deliberately
+  # scoped to ASSIGNMENTS, not to any mention: this script legitimately PRINTS the
+  # role names in operator-facing `say "... no run.jobs.run ..."` messages, and a
+  # string in an echo cannot become a grant.
+  ASSIGN_RE="(^|[[:space:]]|;)(export[[:space:]]+|local[[:space:]]+|readonly[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*=[\"']?(${DISPATCH_RE})"
+  VARBOUND="$(printf '%s\n' "${JOINED}" | grep -E "${ASSIGN_RE}" || true)"
+  if [ -n "${BAD}" ]; then
+    fail "public deploy has an EXECUTABLE dispatch-role grant:"
+    printf '%s\n' "${BAD}" >&2
+  elif [ -n "${VARBOUND}" ]; then
+    fail "public deploy BINDS a dispatch role to a variable — it can reach a grant indirectly via --role=\"\$VAR\":"
+    printf '%s\n' "${VARBOUND}" >&2
+  else
+    pass "no dispatch-role grant or role-bound variable in any of the ${NONCOMMENT_N} executable line(s) of the public deploy (comments aside)"
+  fi
 fi
 
 # The public deploy MUST set the app-layer gate and MUST be --allow-unauthenticated.
@@ -101,12 +148,9 @@ if [ -f "${RUNBOOK}" ]; then
   grep -qF "${CANON}" "${RUNBOOK}" \
     && pass "runbook carries the identical canonical public route set" \
     || fail "runbook is missing the canonical public route set '${CANON}'"
-  # No gated route may appear in the runbook's documented public-set line either.
-  RB_PUBLIC_LINE="$(grep -F "${CANON}" "${RUNBOOK}" | head -1)"
-  for r in "${GATED_ROUTES[@]}"; do
-    printf '%s' "${RB_PUBLIC_LINE}" | grep -qF "${r}" \
-      && fail "gated route ${r} leaked into the runbook's documented public set"
-  done
+  # No gated route may appear in ANY of the runbook's documented public-set lines
+  # (same head -1 vacuity as the README scan above — every line gets examined).
+  scan_public_lines "runbook" "${RUNBOOK}"
 else
   fail "missing ${RUNBOOK} (the go-live runbook the deploy sequence depends on)"
 fi
