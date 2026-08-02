@@ -71,6 +71,12 @@ run()  { if [ "$DRY" = 1 ]; then printf '  \033[90m$ %s\033[0m\n' "$*"; else "$@
 # gcloud runs as a separate, clean-argv statement in the non-dry branch below.
 show() { [ "$DRY" = 1 ] && printf '  \033[90m$ %s\033[0m\n' "$*"; return 0; }
 
+# the ONE safe-crontab helper, shared with deploy/gce/provision-maintainer-vm.sh so the
+# non-destructive read can never be fixed in one call site and left rotten in the other.
+[ -r "$ROOT/bin/lib/crontab-safe.sh" ] || die "missing $ROOT/bin/lib/crontab-safe.sh (needed to install the maintainer cron safely)"
+# shellcheck source=../../bin/lib/crontab-safe.sh
+. "$ROOT/bin/lib/crontab-safe.sh"
+
 [ -n "$REPO" ] || die "missing --repo <owner/repo>"
 printf '%s' "$REPO" | grep -qE '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$' \
   || die "--repo must be <owner>/<name> (got: $REPO)"
@@ -177,15 +183,16 @@ arch_a() {
     run "$LOOP run --max 1 --repo $ROOT"
   fi
   # idempotent cron: runner-beat every minute (Arch A liveness) + cycle on schedule
-  local beatline cycleline tmpc
+  local beatline cycleline
   beatline="* * * * * . $ENVFILE; $LOOP runner-beat --repo $REPO >/dev/null 2>&1 # heimdall-maintainer-beat"
   cycleline="$CRON . $ENVFILE; $LOOP run --max $MAXN --repo $ROOT >/dev/null 2>&1 # heimdall-maintainer-cycle"
   if [ "$DRY" = 1 ]; then
     run "crontab: add (dedup on marker) —"; printf '    %s\n    %s\n' "$beatline" "$cycleline"
   else
-    tmpc="$(mktemp)"; crontab -l 2>/dev/null | grep -v 'heimdall-maintainer-' > "$tmpc" || true
-    printf '%s\n%s\n' "$beatline" "$cycleline" >> "$tmpc"
-    crontab "$tmpc"; rm -f "$tmpc"
+    # safe replace: aborts (changing NOTHING) if `crontab -l` fails for any reason other than
+    # "no crontab exists", and backs the current crontab up to a timestamped file first.
+    heimdall_crontab_install 'heimdall-maintainer-' "$beatline" "$cycleline" \
+      || die "could not install the maintainer cron — your crontab was NOT modified (see the error above)."
     say "cron installed (runner-beat 1/min + cycle '$CRON')"
   fi
 }
