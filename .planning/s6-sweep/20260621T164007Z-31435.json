@@ -1,0 +1,160 @@
+{
+  "run_id": "20260621T164007Z-31435",
+  "ts": "2026-06-21T16:49:51Z",
+  "manifest": "/tmp/rerun3-manifest.json",
+  "budget": 3000000,
+  "budget_source": "default",
+  "budget_exceeded": false,
+  "total_token_spend": 2165593,
+  "total_non_cache_tokens": 261605,
+  "total_entries": 3,
+  "n_effective": 3,
+  "ran": 3,
+  "aborted": false,
+  "abort_reason": "",
+  "distribution": {
+    "ran": 3,
+    "working_output_pass": 1,
+    "reuse_measured": [
+      0.375
+    ],
+    "working_output_rate": 0.3333333333333333,
+    "reuse_median": 0.375,
+    "reuse_min": 0.375,
+    "reuse_max": 0.375
+  },
+  "results": [
+    {
+      "repo_url": "https://github.com/psf/cachecontrol",
+      "pinned_sha": "495b215d25568432aeb983c31f696447a777b4b5",
+      "resolved_sha": "495b215d25568432aeb983c31f696447a777b4b5",
+      "task": "Add an in-memory LRU cache backend with a max-entries cap by subclassing the existing base cache.",
+      "status": "ran",
+      "reuse_pct": 0.375,
+      "reused_symbols": [
+        "clear",
+        "BaseCache",
+        "FileCache",
+        "RedisCache",
+        "SeparateBodyFileCache",
+        "file_cache",
+        "redis_cache"
+      ],
+      "reused_symbols_expected": [
+        "BaseCache",
+        "DictCache",
+        "CacheController"
+      ],
+      "working_output": {
+        "pass": true,
+        "baseline_pass": true,
+        "baseline_exit": 0,
+        "baseline_cmd": "pip install -e . && pytest -q",
+        "assertion_pass": true,
+        "assertion_exit": 0,
+        "assertion_cmd": "printf '%s\\n' 'import inspect' 'import cachecontrol.cache as _M, cachecontrol.caches as _C' 'from cachecontrol.cache import BaseCache, DictCache, SeparateBodyBaseCache' 'from cachecontrol.caches import FileCache, SeparateBodyFileCache, RedisCache' '_existing=(BaseCache,DictCache,SeparateBodyBaseCache,FileCache,SeparateBodyFileCache,RedisCache)' '_seen={}' 'for _mod in (_M,_C):' '    for _v in vars(_mod).values():' '        if inspect.isclass(_v) and issubclass(_v,BaseCache) and _v not in _existing:' '            _seen[_v]=True' 'cands=list(_seen)' 'c=None' 'for cls in cands:' '    for kw in (\"max_entries\",\"maxsize\",\"max_size\",\"capacity\",\"maxentries\"):' '        try:' '            c=cls(**{kw:2}); break' '        except TypeError:' '            c=None' '    if c is None:' '        try:' '            c=cls(2)' '        except TypeError:' '            c=None' '    if c is not None:' '        break' 'assert c is not None, (\"no new in-memory LRU BaseCache subclass found; candidates=%r\" % [x.__name__ for x in cands])' 'c.set(\"a\",b\"1\"); c.set(\"b\",b\"2\")' 'assert c.get(\"a\")==b\"1\" and c.get(\"b\")==b\"2\", \"get/set broken\"' 'c.set(\"c\",b\"3\")' 'live=[k for k in (\"a\",\"b\",\"c\") if c.get(k) is not None]' 'assert len(live)<=2, (\"cap not enforced; live=%r\" % live)' 'assert c.get(\"c\")==b\"3\", \"newest entry evicted\"' 'assert c.get(\"a\") is None, (\"oldest entry not evicted; live=%r\" % live)' 'c.delete(\"c\"); assert c.get(\"c\") is None, \"delete broken\"' 'print(\"ok\", type(c).__name__, live)' > zz_s6_cc_probe.py && python zz_s6_cc_probe.py ; rc=$?; rm -f zz_s6_cc_probe.py; exit $rc",
+        "evidence": "baseline_cmd (exit 0):\nObtaining file:///private/var/folders/t3/17x0hkw12n3g0qy3sjkggbsr0000gn/T/s6-sweep.XXXXXX.ba3TRXnkMk/repo-0\n  Installing build dependencies: started\n  Installing build dependencies: finished with status 'done'\n  Checking if build backend supports build_editable: started\n  Checking if build backend supports build_editable: finished with status 'done'\n  Getting requirements to build editable: started\n  Getting requirements to build editable: finished with status 'done'\n  Preparing editable metadata (pyproject.toml): started\n  Preparing editable metadata (pyproject.toml): finished with status 'done'\nRequirement already satisfied: requests>=2.16.0 in /Users/rj/.pyenv/versions/3.11.14/lib/python3.11/site-packages (from CacheControl==0.14.4) (2.31.0)\nRequirement already satisfied: msgpack<2.0.0,>=0.5.2 in /Users/rj/.pyenv/versions/3.11.14/lib/python3.11/site-packages (from CacheControl==0.14.4) (1.2.1)\nRequirement already satisfied: charset-normalizer<4,>=2 in /Users/rj/.pyenv/versions/3.11.\n...[truncated]...\n    Successfully uninstalled CacheControl-0.14.4\nSuccessfully installed CacheControl-0.14.4\n\n[notice] A new release of pip is available: 26.0.1 -> 26.1.2\n[notice] To update, run: pip install --upgrade pip\n........................................................................ [ 61%]\n.............................................                            [100%]\n=============================== warnings summary ===============================\n../../../../../../../../Users/rj/.pyenv/versions/3.11.14/lib/python3.11/site-packages/requests/__init__.py:109\n  /Users/rj/.pyenv/versions/3.11.14/lib/python3.11/site-packages/requests/__init__.py:109: RequestsDependencyWarning: urllib3 (2.6.3) or chardet (7.4.0.post2)/charset_normalizer (3.4.4) doesn't match a supported version!\n    warnings.warn(\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\n117 passed, 1 warning in 1.57s\nassertion_cmd (exit 0):\n/Users/rj/.pyenv/versions/3.11.14/lib/python3.11/site-packages/requests/__init__.py:109: RequestsDependencyWarning: urllib3 (2.6.3) or chardet (7.4.0.post2)/charset_normalizer (3.4.4) doesn't match a supported version!\n  warnings.warn(\nok LRUCache ['b', 'c']"
+      },
+      "token_spend": 596701,
+      "non_cache_tokens": 90193,
+      "budget_exceeded": false,
+      "session_id": "50cafe66-8902-4963-b8af-db6d270409ae",
+      "token_usage": {
+        "input_tokens": 17969,
+        "output_tokens": 7137,
+        "cache_creation_tokens": 65087,
+        "cache_read_tokens": 506508,
+        "total_tokens": 596701,
+        "non_cache_tokens": 90193,
+        "turns": 1,
+        "session_id": "50cafe66-8902-4963-b8af-db6d270409ae",
+        "total_cost_usd": 1.203927,
+        "cost_source": "reported",
+        "model": "claude-opus-4-8",
+        "usage_available": true
+      }
+    },
+    {
+      "repo_url": "https://github.com/spf13/cobra",
+      "pinned_sha": "ad460ea8f249db69c943a365fb84f3a59042d54e",
+      "resolved_sha": "ad460ea8f249db69c943a365fb84f3a59042d54e",
+      "task": "Add a Command.AliasFor(name) helper that returns the canonical command an alias resolves to, reusing the existing alias lookup.",
+      "status": "ran",
+      "reuse_pct": null,
+      "reused_symbols": [],
+      "reused_symbols_expected": [
+        "Command.Find",
+        "Aliases"
+      ],
+      "working_output": {
+        "pass": false,
+        "baseline_pass": true,
+        "baseline_exit": 0,
+        "baseline_cmd": "go build ./... && go test ./...",
+        "assertion_pass": false,
+        "assertion_exit": 1,
+        "assertion_cmd": "printf '%s\\n' 'package cobra' 'import \\\"testing\\\"' 'func TestS6AliasForProbe(t *testing.T){' '  root:=&Command{Use:\\\"root\\\"}' '  child:=&Command{Use:\\\"commit\\\", Aliases:[]string{\\\"co\\\"}, Run:func(_ *Command,_ []string){}}' '  root.AddCommand(child)' '  got:=root.AliasFor(\\\"co\\\")' '  if got!=child { t.Fatalf(\\\"AliasFor(co)=%v want commit child\\\", got) }' '}' > zz_s6_aliasfor_probe_test.go && go test -run TestS6AliasForProbe ./ ; rc=$?; rm -f zz_s6_aliasfor_probe_test.go; exit $rc",
+        "evidence": "baseline_cmd (exit 0):\nok  \tgithub.com/spf13/cobra\t0.603s\nok  \tgithub.com/spf13/cobra/doc\t(cached)\nassertion_cmd (exit 1):\n# github.com/spf13/cobra\nzz_s6_aliasfor_probe_test.go:2:8: illegal character U+005C '\\'\nFAIL\tgithub.com/spf13/cobra [setup failed]\nFAIL"
+      },
+      "token_spend": 549405,
+      "non_cache_tokens": 76256,
+      "budget_exceeded": false,
+      "session_id": "6c69ee12-d089-4bfe-af88-6a3ac077ef04",
+      "token_usage": {
+        "input_tokens": 17325,
+        "output_tokens": 4299,
+        "cache_creation_tokens": 54632,
+        "cache_read_tokens": 473149,
+        "total_tokens": 549405,
+        "non_cache_tokens": 76256,
+        "turns": 1,
+        "session_id": "6c69ee12-d089-4bfe-af88-6a3ac077ef04",
+        "total_cost_usd": 1.002231,
+        "cost_source": "reported",
+        "model": "claude-opus-4-8",
+        "usage_available": true
+      }
+    },
+    {
+      "repo_url": "https://github.com/dtolnay/anyhow",
+      "pinned_sha": "841522b2aa09732fecee40804440d2c35c68c480",
+      "resolved_sha": "841522b2aa09732fecee40804440d2c35c68c480",
+      "task": "Add Context::context_with_code<C>(self, code: i32, context: C) attaching a numeric code + message, reusing the existing context-attachment machinery so the message still appears via {:#} and the chain is walkable via Error::chain.",
+      "status": "ran",
+      "reuse_pct": null,
+      "reused_symbols": [],
+      "reused_symbols_expected": [
+        "Error::context",
+        "ContextError"
+      ],
+      "working_output": {
+        "pass": false,
+        "baseline_pass": true,
+        "baseline_exit": 0,
+        "baseline_cmd": "cargo test",
+        "assertion_pass": false,
+        "assertion_exit": 101,
+        "assertion_cmd": "printf '%s\\n' 'use anyhow::{anyhow, Context};' '#[test]' 'fn s6_context_with_code_probe() {' '    let base = anyhow!(\\\"root cause\\\");' '    let n0 = base.chain().count();' '    let res: Result<(), anyhow::Error> = Err(base);' '    let err = res.context_with_code(42, \\\"wrapped message\\\").unwrap_err();' '    let disp = format!(\\\"{:#}\\\", err);' '    assert!(disp.contains(\\\"wrapped message\\\"), \\\"display missing context message: {}\\\", disp);' '    assert!(err.chain().count() > n0, \\\"chain did not grow: {} !> {}\\\", err.chain().count(), n0);' '}' > tests/zz_s6_context_with_code_probe.rs && cargo test --test zz_s6_context_with_code_probe s6_context_with_code_probe ; rc=$?; rm -f tests/zz_s6_context_with_code_probe.rs; exit $rc",
+        "evidence": "baseline_cmd (exit 0):\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.11s\n     Running unittests src/lib.rs (target/debug/deps/anyhow-a87d13bb72752b44)\n\nrunning 3 tests\ntest fmt::tests::two_digits ... ok\ntest fmt::tests::one_digit ... ok\ntest fmt::tests::no_digits ... ok\n\ntest result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n     Running tests/compiletest.rs (target/debug/deps/compiletest-149e51570cd3a40b)\n\nrunning 1 test\ntest ui ... ignored, requires nightly\n\ntest result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n     Running tests/test_autotrait.rs (target/debug/deps/test_autotrait-958707849a95ef36)\n\nrunning 5 tests\ntest test_ref_unwind_safe ... ok\ntest test_send ... ok\ntest test_sync ... ok\ntest test_unpin ... ok\ntest test_unwind_safe ... ok\n\ntest result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n     Running tests/test_backtrace.rs (target/debug/deps/test_backtrac\n...[truncated]...\nest src/lib.rs - (line 169) ... ok\ntest src/lib.rs - (line 181) ... ok\ntest src/lib.rs - (line 22) ... ok\ntest src/lib.rs - (line 54) ... ok\ntest src/lib.rs - (line 98) ... ok\ntest src/lib.rs - Chain (line 402) ... ok\ntest src/lib.rs - Context (line 481) ... ok\ntest src/lib.rs - Context (line 545) ... ok\ntest src/lib.rs - Context (line 585) ... ok\ntest src/lib.rs - Context::context_with_code (line 640) ... ok\ntest src/lib.rs - Error (line 373) ... ok\ntest src/lib.rs - Result (line 429) ... ok\ntest src/lib.rs - Result (line 443) ... ok\ntest src/macros.rs - macros::anyhow (line 188) ... ok\ntest src/macros.rs - macros::bail (line 13) ... ok\ntest src/macros.rs - macros::bail (line 31) ... ok\ntest src/macros.rs - macros::ensure (line 143) ... ok\ntest src/macros.rs - macros::ensure (line 154) ... ok\n\ntest result: ok. 27 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.58s\nassertion_cmd (exit 101):\n   Compiling anyhow v1.0.102 (/private/var/folders/t3/17x0hkw12n3g0qy3sjkggbsr0000gn/T/s6-sweep.XXXXXX.ba3TRXnkMk/repo-2)\nerror: unknown start of token: \\\n --> tests/zz_s6_context_with_code_probe.rs:4:24\n  |\n4 |     let base = anyhow!(\\\"root cause\\\");\n  |                        ^\n\nerror[E0765]: unterminated double quote string\n  --> tests/zz_s6_context_with_code_probe.rs:4:25\n   |\n 4 |       let base = anyhow!(\\\"root cause\\\");\n   |  _________________________^\n 5 | |     let n0 = base.chain().count();\n 6 | |     let res: Result<(), anyhow::Error> = Err(base);\n 7 | |     let err = res.context_with_code(42, \\\"wrapped message\\\").unwrap_err();\n...  |\n10 | |     assert!(err.chain().count() > n0, \\\"chain did not grow: {} !> {}\\\", err.chain().count(), n0);\n11 | | }\n   | |__^\n\nFor more information about this error, try `rustc --explain E0765`.\nerror: could not compile `anyhow` (test \"zz_s6_context_with_code_probe\") due to 2 previous errors"
+      },
+      "token_spend": 1019487,
+      "non_cache_tokens": 95156,
+      "budget_exceeded": false,
+      "session_id": "b4bc5b06-68b4-4d2d-99d5-d7ee3e27605a",
+      "token_usage": {
+        "input_tokens": 16559,
+        "output_tokens": 10842,
+        "cache_creation_tokens": 67755,
+        "cache_read_tokens": 924331,
+        "total_tokens": 1019487,
+        "non_cache_tokens": 95156,
+        "turns": 1,
+        "session_id": "b4bc5b06-68b4-4d2d-99d5-d7ee3e27605a",
+        "total_cost_usd": 1.529499,
+        "cost_source": "reported",
+        "model": "claude-opus-4-8",
+        "usage_available": true
+      }
+    }
+  ]
+}
