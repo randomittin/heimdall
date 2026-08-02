@@ -136,6 +136,14 @@ NORM
     normalize_digests "$TMP"
   }
 
+  # reset_site — a scratch site checkout with NOTHING left over from the previous mutant.
+  # Overwriting one file is not enough once a mutant plants a whole subtree: a leftover
+  # fixture would make the next mutant's red (or green) unattributable to its own plant.
+  reset_site() {
+    rm -rf "$SITE_TMP"
+    mkdir -p "$SITE_TMP"
+  }
+
   # assert_red <label> <expected-substring> — require BOTH a non-zero exit AND the
   # SPECIFIC failure the mutation should have caused. Asserting the reason rather
   # than a pass/fail count is deliberate: counts shift every time a surface is added,
@@ -247,9 +255,105 @@ $(VERSION_DRIFT_REPO="$TMP" HEIMDALL_SITE_DIR="$NO_SITE" bash "$SELF_DIR/version
 VOID
   assert_red "every pinned digest removed" "VACUOUS"
 
+  # ── Scaffolding-exclusion mutants (surface 7) ────────────────────────────────
+  # These three pin the FALSE-POSITIVE class, in all three directions: the fixture must be
+  # ignored, a real published surface beside it must still be caught, and an exclusion that
+  # swallows the whole site must go red rather than green.
+
+  # Mutant 10 — A GATE'S OWN FIXTURE IS NOT DRIFT. heimdall-site/gates/copy-parity.js pins
+  # LIVE_TAG='v9.9.9' on purpose (its whole method is to drive the page with a tag that
+  # differs from the pinned one) and NAMES the meta tag inside a throw-message string it does
+  # not declare. The sweep read both as shipped drift and went red against a clean site. That
+  # is the worst kind of red — wrong, and therefore training everyone to ignore the next one.
+  fresh_copy
+  reset_site
+  MUT_SITE="$SITE_TMP"
+  printf '<meta name="heimdall-version" content="%s">\n' "$SELF_TAG" > "$SITE_TMP/proof.html"
+  mkdir -p "$SITE_TMP/gates"
+  { printf "const LIVE_TAG = 'v9.9.9';   // != the pinned tag, on purpose\n"
+    printf "if (!m) throw new Error('no <meta name=\"heimdall-version\"> found');\n"
+  } > "$SITE_TMP/gates/copy-parity.js"
+  assert_green "site gates/ fixture pinning v9.9.9 (scaffolding, not a published surface)"
+
+  # Mutant 11 — THE EXCLUSION MUST NOT BE TOO BROAD. Same fixture still in place, but now a
+  # PUBLISHED file carries a genuinely stale fallback literal. Check (d) is one of the two the
+  # false positive fired on, so it is precisely the check at risk of being neutered by the fix;
+  # an over-broad rule would swallow this too and the gate would go quietly, wrongly green.
+  printf "const FALLBACK = 'v0.0.1';\n" > "$SITE_TMP/version.js"
+  assert_red "real fallback drift in a published file beside an excluded fixture" \
+             "site JS version fallback drift"
+
+  # Mutant 12 — the exclusion's OWN anti-vacuous guard. A checkout that is entirely scaffolding
+  # must go RED for having examined nothing, never sail through green on an empty set. This is
+  # the exact shape of the sibling gate's shipped bug: a filter discarded every hit and the
+  # check passed vacuously with a real defect planted.
+  reset_site
+  mkdir -p "$SITE_TMP/gates"
+  printf "const LIVE_TAG = 'v9.9.9';\n" > "$SITE_TMP/gates/copy-parity.js"
+  assert_red "site checkout that is entirely scaffolding" "examined ZERO published files"
+
   echo "version-drift --self-test: PASS"
   exit 0
 fi
+
+# ── Scaffolding exclusion — ONE rule, applied at TRAVERSAL, shared by both sweeps ────
+# A gate's own FIXTURES carry deliberately-wrong data. heimdall-site/gates/copy-parity.js
+# pins LIVE_TAG='v9.9.9' because its whole method is to drive each page with a tag that
+# DIFFERS from the pinned one (a copy handler tracking the live tag on only one side has to
+# fail there), and it names <meta name="heimdall-version"> inside a throw-message for a tag
+# it does not declare. Reading either as a shipped version string is a FALSE RED — and a red
+# that is WRONG is worse than no gate at all: the human who investigates once, finds "oh,
+# it's just a fixture", and moves on has been trained to ignore the next red too, including
+# a true one. Both false positives were live here: '<unparseable>' and 'v9.9.9'.
+#
+# The rule is DIRECTORY ROLE, never a filename blocklist. Both repos keep verification
+# scaffolding in a dedicated directory — this repo in test/ and conformance/gates/ (whose
+# contents are *.fixture.sh), the site in gates/ — and publish everything else. Naming
+# copy-parity.js would rot the moment a second fixture lands; naming the ROLE does not.
+# Role-scoping also preserves the sweep's entire reason to exist: it still discovers NEW
+# published surfaces the day someone adds a page, which narrowing to a list of today's
+# known-good files would destroy.
+#
+# Matched by BASENAME (-name), never by path substring, and applied to TRAVERSAL rather
+# than to result strings. That is not a style preference — it is this session's other bug:
+# a sibling gate filtered its results with `grep -v '/.claude/worktrees/'` while $ROOT was
+# ITSELF inside a worktree, so the filter discarded every hit and the check went green with
+# a real defect planted. A result-string filter can silently match everything; a prune by
+# directory name cannot.
+SCAFFOLDING_DIRS="test tests gates node_modules"
+
+# find_files <mode> <root> <ext>...
+#   published  — prune dot-dirs AND scaffolding; the set the sweeps actually assert over.
+#   candidates — prune dot-dirs only; the denominator, so the sweep can REPORT how many
+#                files its own exclusion removed instead of removing them silently.
+#
+# Dot-dirs are pruned in both modes: .git is binary object storage, and .planning archives
+# design comps and incident write-ups pinned to long-dead tags (v2.0.5) — history, not drift.
+#
+# -mindepth 1 is the other half of the vacuous-filter lesson above: find evaluates the prune
+# predicates against the START directory too, so a checkout that happens to BE named `gates`
+# would prune its own root and yield ZERO files — a vacuous green from an empty set. Measured
+# on this box: `find /tmp/x/gates -type d -name gates -prune -o -type f -print` prints nothing
+# at all, while the same command with -mindepth 1 prints every file. (The pre-existing
+# `-name '.?*'` rather than '.*' is the same defence for dot-names, and is kept.)
+find_files() {
+  local mode="$1" root="$2"; shift 2
+  local fx d e first=1
+  fx=( -mindepth 1 -type d '(' -name '.?*' )
+  if [ "$mode" = published ]; then
+    for d in $SCAFFOLDING_DIRS; do fx+=( -o -name "$d" ); done
+  fi
+  fx+=( ')' -prune -o -type f '(' )
+  for e in "$@"; do
+    if [ "$first" -eq 1 ]; then
+      fx+=( -name "$e" ); first=0
+    else
+      fx+=( -o -name "$e" )
+    fi
+  done
+  fx+=( ')' -print )
+  find "$root" "${fx[@]}" 2>/dev/null | sort
+}
 
 # ── Pinned-install-digest discovery (surface 8) ───────────────────────────────
 # How close a 64-hex token has to sit to an install URL to be read as that URL's digest.
@@ -304,10 +408,10 @@ LINES
 }
 
 # discover_digests <scope> <root>
-# Dot-directories are pruned for the reason the site sweep already prunes them (.planning
-# archives incident write-ups pinned to dead tags — history, not drift). `test`/`tests` are
-# pruned because gate FIXTURES carry deliberately-wrong digests, including this file's own
-# historical-defect mutant; scanning them would gate the fixtures instead of the product.
+# Scaffolding is pruned by the shared SCAFFOLDING_DIRS rule above, and for the same reason
+# in both sweeps: gate FIXTURES carry deliberately-wrong digests — including this file's own
+# historical-defect mutant, and any the site's copy-parity gate grows for the install command
+# it exists to verify — so scanning them would gate the fixtures instead of the product.
 discover_digests() {
   local scope="$1" root="$2" f rel
   while IFS= read -r f; do
@@ -315,11 +419,7 @@ discover_digests() {
     rel="${f#$root/}"
     scan_one_file "$scope" "$rel" "$f"
   done <<FILES
-$(find "$root" \
-    -type d \( -name '.?*' -o -name 'node_modules' -o -name 'test' -o -name 'tests' \) -prune -o \
-    -type f \( -name '*.md' -o -name '*.txt' -o -name '*.json' -o -name '*.toml' \
-            -o -name '*.html' -o -name '*.js' -o -name '*.sh' -o -name '*.yml' \
-            -o -name '*.yaml' \) -print 2>/dev/null | sort)
+$(find_files published "$root" '*.md' '*.txt' '*.json' '*.toml' '*.html' '*.js' '*.sh' '*.yml' '*.yaml')
 FILES
 }
 
@@ -476,21 +576,32 @@ HEIMDALL_SITE_DIR="${HEIMDALL_SITE_DIR:-$REPO/../heimdall-site}"
 if [ ! -d "$HEIMDALL_SITE_DIR" ]; then
   echo "  site: SKIPPED — nothing at $HEIMDALL_SITE_DIR (set HEIMDALL_SITE_DIR to gate it)"
 else
-  # Published surfaces only. Dot-dirs are pruned: .git is binary object storage, and
-  # .planning holds archived design comps pinned to long-dead tags (v2.0.5) — that is
-  # history, not drift. `-name '.?*'` (not '.*') is deliberate: '.*' also matches the
-  # start directory itself and would prune the entire tree, silently gating nothing.
+  # Published surfaces only — dot-dirs and scaffolding pruned by the shared rule above.
   SITE_PUB=()
   SITE_PUB_N=0
   while IFS= read -r f; do
     [ -n "$f" ] || continue
     SITE_PUB+=("$f"); SITE_PUB_N=$((SITE_PUB_N+1))
   done <<EOF
-$(find "$HEIMDALL_SITE_DIR" -type d -name '.?*' -prune -o -type f \
-    \( -name '*.html' -o -name '*.js' -o -name '*.txt' \) -print | sort)
+$(find_files published "$HEIMDALL_SITE_DIR" '*.html' '*.js' '*.txt')
 EOF
-  echo "  site: $HEIMDALL_SITE_DIR ($SITE_PUB_N published files)"
+  SITE_CAND_N="$(find_files candidates "$HEIMDALL_SITE_DIR" '*.html' '*.js' '*.txt' | grep -c .)"
+  SITE_EXCL_N=$((SITE_CAND_N - SITE_PUB_N))
+  echo "  site: $HEIMDALL_SITE_DIR ($SITE_PUB_N published files examined, $SITE_EXCL_N excluded as scaffolding)"
   SITE_CHECKED=0
+
+  # The exclusion's own anti-vacuous guard. Every filter can be too broad, and a filter that
+  # is too broad does not announce itself — it just leaves nothing to assert over and the
+  # sweep passes for free. Printing the excluded count above makes an over-broad rule visible
+  # rather than silent; failing here makes a TOTALLY-broad one impossible to miss.
+  # The two ways this can happen are different defects with different fixes, so they are
+  # reported differently: a gate whose failure text misdescribes the cause sends the reader
+  # hunting the wrong thing, which is the same wolf-crying this exclusion exists to stop.
+  if [ "$SITE_PUB_N" -eq 0 ] && [ "$SITE_CAND_N" -gt 0 ]; then
+    bad "site present at $HEIMDALL_SITE_DIR but the sweep examined ZERO published files — all $SITE_CAND_N candidate(s) were excluded as scaffolding ($SCAFFOLDING_DIRS). An exclusion that swallows the whole site is a vacuous sweep, not a clean one"
+  elif [ "$SITE_PUB_N" -eq 0 ]; then
+    bad "site present at $HEIMDALL_SITE_DIR but it holds no .html/.js/.txt files at all — HEIMDALL_SITE_DIR is pointed at the wrong directory, or the checkout is empty. Gating nothing is not gating cleanly"
+  fi
 
   # (a) <meta name="heimdall-version"> on every published page. Matched with the
   # leading '<meta ' so the JS that READS the tag (querySelector('meta[name=...]'))
