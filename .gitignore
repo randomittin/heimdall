@@ -12,8 +12,18 @@ __pycache__/
 venv/
 # Node
 node_modules/
+# heimdall runtime state — per-checkout local state, never commit.
+# Holds user data (agent_history, token budget, conflict_log) and is the store
+# the pre-push quality gate reads. It is created by `heimdall-state init`, so it
+# is absent in a fresh clone and in every agent worktree — that absence is normal,
+# not a setup failure. Ignored under both the current and legacy (superx) names;
+# the rename left the heimdall name untracked-but-unignored, which showed up as
+# permanent `git status` noise for every user.
+heimdall-state.json
+heimdall-state.json.lock
 # superx runtime state — never commit, contains user data
 superx-state.json
+superx-state.json.lock
 superx-session.json
 superx-history.json
 superx-checkpoint.json
