@@ -8,6 +8,40 @@
     "example"
   ],
   "oracles": {
+    "ponytail-underdelivery": {
+      "gate_type": "example",
+      "description": "Under-delivery guard oracle (Heimdall x ponytail write-time lazy-ladder). Grades a candidate feature module (ES module exporting `default function roman(n)`) against a FIXED {n -> expected} acceptance table of 16 enumerated cases, chosen to cover the two requirements a too-aggressive minimalist is tempted to cut: subtractive notation (IV, IX, XL, XC, CD, CM) and the full required 1..3999 range (thousands via M). It exists to prove the write-time lazy ladder adopted in agents/coder.md cannot cause an agent to ship a half-built feature -- a deliberately under-delivered 'lazy' shortcut FAILS the gate, because minimalism may cut gold-plating but never scope. gate_type is `example`, NOT `differential`: the truth source is a fixed input->expected-output table, not an independently-authored reference implementation recomputed over the same inputs. Gate strength comes instead from the falsifiability sweep -- `bin/falsify` requires the golden candidate GREEN and all 3 under-delivery mutants RED (score 1.0), one per ladder-risk mode (hard part skipped, required criterion silently dropped, terse-but-broken).",
+      "domain_signals": [
+        "ponytail-underdelivery",
+        "under-delivery",
+        "underdelivery guard",
+        "lazy ladder",
+        "write-time minimalism",
+        "YAGNI cuts gold-plating",
+        "roman numeral",
+        "subtractive notation"
+      ],
+      "assets": [
+        {
+          "name": "acceptance-oracle",
+          "kind": "in-repo-dataset",
+          "purpose": "The fixed {n -> expected} truth table (fixtures/golden/acceptance.json, 16 cases) plus the fully-delivered golden candidate. The table is transcribed from the canonical Roman-numeral spec rather than computed by any implementation, and run.sh applies it identically to the golden and to every mutant. Weakening it -- stripping the subtractive and thousands cases -- is exactly how test/heimdall-underdelivery-guard.test.sh proves the table is load-bearing: the 'hard-part-skipped' mutant then SURVIVES and the falsify score drops from 3/3 = 1.0000 to 1/3 = 0.3333.",
+          "dir": "evals/oracles/ponytail-underdelivery/fixtures/golden"
+        },
+        {
+          "name": "under-delivery-mutant-corpus",
+          "kind": "in-repo-dataset",
+          "purpose": "3 committed mutants, each real running code implementing the same feature with EXACTLY ONE under-delivery defect, pinned via manifest.json to the acceptance case it first fails: hard-part-skipped (roman(4) yields IIII, subtractive branch never written), criterion-dropped (roman(1000) yields empty, required range silently narrowed to 1..999), terse-but-broken (roman(1) yields empty, off-by-one in the smallest one-liner). The falsifiability sweep requires all 3 KILLED plus the golden GREEN, which is the meta-proof that the acceptance table actually stops each shortcut mode rather than decorating it.",
+          "dir": "evals/oracles/ponytail-underdelivery/fixtures/mutants"
+        }
+      ],
+      "gate_command": "bin/falsify ponytail-underdelivery --assert-score 1.0",
+      "reference": {
+        "independent": true,
+        "kind": "in-repo-dataset",
+        "dir": "evals/oracles/ponytail-underdelivery/fixtures/golden"
+      }
+    },
     "rr-multitenant-isolation": {
       "gate_type": "example",
       "description": "Multi-tenant cross-tenant-denial oracle. Grades a candidate isolation module (ES module exporting `default evaluate(attackId)`) against a FIXED all-DENY acceptance table of 25 enumerated cross-tenant attacks drawn from the RED-line table in docs/specs/2026-07-03-rr-isolation-invariants.md, and asserts EVERY attack is DENIED. Covers repo<->team authz (IDOR via repo slug, INV-11), server-derived team_id (INV-1: a wire team_id is never operative), per-team cred/queue/installation partition (INV-2/3, A5), the enqueue-only credential-free public surface (INV-6), the owner-only god aggregate (INV-GOD: /god/* 404s on the PUBLIC surface for every caller and every team secret; owner PKI + valid signature + IAM on the gated service; partitions enumerated server-side even for the owner; IAP assertions VERIFIED, never the edge trusted), dashboard login sessions (INV-LOGIN: server-derived teams, TTL enforced, mint signature verified, never owner), chat-handle binding (INV-CHAT: a bare chat_id is never an identity), and zero-touch auto-team join (INV-AUTOTEAM: collaborator check, gh identity re-derivation, public write threshold, initiate admin/push, HAID possession, repo->team convergence). gate_type is `example`, NOT `differential`: the truth source is a fixed input->expected-output table, not an independently-authored reference implementation recomputed over the same inputs. Gate strength comes instead from the falsifiability sweep — `bin/falsify` requires the golden candidate GREEN and all 23 single-gate-drop mutants RED (score 1.0), so no isolation gate in the model is decorative.",
@@ -206,30 +240,6 @@
         "independent": true,
         "kind": "separate-agent",
         "dir": "evals/oracles/exchange-lob/reference"
-      }
-    },
-    "raytracer-calib": {
-      "gate_type": "verdict",
-      "calibration_only": true,
-      "description": "Ray-tracer rendering oracle used only to calibrate the gate harness (not as a pass/fail gate for shipped work). Renders a fixed scene and issues a verdict by comparing output against a reference image via SSIM at a high similarity threshold.",
-      "domain_signals": [
-        "raytracer",
-        "ray tracing",
-        "SSIM",
-        "render",
-        "path tracing"
-      ],
-      "assets": [
-        {
-          "name": "reference-render",
-          "kind": "in-repo-dataset",
-          "purpose": "Golden reference render of the calibration scene at fixed resolution/seed. The verdict gate scores the implementation's render against this image with SSIM.",
-          "dir": "evals/oracles/raytracer-calib/reference"
-        }
-      ],
-      "gate_command": "evals/oracles/raytracer-calib/gate.sh --ssim-threshold 0.99",
-      "reference": {
-        "independent": true
       }
     },
     "symbol-reuse": {
