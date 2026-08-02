@@ -133,7 +133,17 @@ rm -rf "$FB8" "$ARGLOG" "$LEGYAML" "$LEGYAML2"
 #    over a file rather than an absence of evidence.
 RROOT="$(cd "$(dirname "$S")/../.." && pwd)"
 SBX_STUB="$(mktemp -d)"; SBX_LOG="$SBX_STUB/crontab.invocations"; : > "$SBX_LOG"
-for t in claude gh gcloud; do printf '#!/usr/bin/env bash\nexit 0\n' > "$SBX_STUB/$t"; chmod +x "$SBX_STUB/$t"; done
+for t in gh gcloud; do printf '#!/usr/bin/env bash\nexit 0\n' > "$SBX_STUB/$t"; chmod +x "$SBX_STUB/$t"; done
+# `claude` is a RECORDING stub too: collect_secrets runs `claude setup-token`, which mints a
+# ~1-year credential into the KEYCHAIN — account-scoped state $HOME does not isolate either.
+# A sandboxed run must refuse BEFORE minting one, so the refusal has to precede collect_secrets.
+CLAUDE_LOG="$SBX_STUB/claude.invocations"; : > "$CLAUDE_LOG"
+cat > "$SBX_STUB/claude" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$CLAUDE_LOG"
+exit 0
+EOF
+chmod +x "$SBX_STUB/claude"
 cat > "$SBX_STUB/crontab" <<EOF
 #!/usr/bin/env bash
 # RECORDING STUB — logs EVERY invocation, the READ included. Never touches a real crontab.
@@ -167,6 +177,9 @@ printf '%s' "$OUT9" | grep -q 'sandboxed' && ok "synthetic HOME: prints the stat
   || bad "synthetic HOME: side effects ran before the refusal (env file exists)"
 printf '%s' "$OUT9" | grep -q 'passwd home' && ok "synthetic HOME: states WHY (passwd-home mismatch)" \
   || bad "synthetic HOME: refusal gives no diagnosable reason"
+[ ! -s "$CLAUDE_LOG" ] \
+  && ok "synthetic HOME: 'claude setup-token' NEVER ran (no ~1y keychain credential minted)" \
+  || bad "synthetic HOME: claude was invoked before the refusal — $(tr '\n' ';' < "$CLAUDE_LOG")"
 
 # 9b. --hybrid reaches arch_a too — the default MODE, so the plain-run path is covered.
 : > "$SBX_LOG"; rm -f "$SBX_STUB/installed.cron"
@@ -197,7 +210,7 @@ chmod +x "$FR/bin/heimdall-maintain-loop"
 cmp -s "$S" "$FR/deploy/cloud-run/deploy-maintainer.sh" \
   && ok "positive branch runs a BYTE-IDENTICAL copy of the shipped script (cannot drift)" \
   || bad "positive-branch copy differs from the shipped script"
-: > "$SBX_LOG"; rm -f "$SBX_STUB/installed.cron"
+: > "$SBX_LOG"; rm -f "$SBX_STUB/installed.cron"; : > "$CLAUDE_LOG"
 POS_HOME="$(mktemp -d)"
 OUT9P="$(printf 'oauthval\nbotval\n' | env HOME="$POS_HOME" HEIMDALL_REAL_HOME="$POS_HOME" \
   PATH="$SBX_STUB:/usr/bin:/bin" bash "$FR/deploy/cloud-run/deploy-maintainer.sh" \
@@ -215,6 +228,9 @@ grep -q 'heimdall-maintainer-cycle' "$SBX_STUB/installed.cron" 2>/dev/null \
 grep -q 'backup-db.sh' "$SBX_STUB/installed.cron" 2>/dev/null \
   && ok "real operator: the unrelated job was PRESERVED (safe-replace still applies)" \
   || bad "real operator: an unrelated crontab job was LOST"
+grep -q 'setup-token' "$CLAUDE_LOG" \
+  && ok "real operator: 'claude setup-token' STILL runs (the mint path is untouched)" \
+  || bad "real operator: setup-token no longer runs — the guard broke the token mint"
 
 # 9d. The guard must not OVER-fire: --dry-run needs no creds, touches nothing, and must
 #     still print the cron plan under a synthetic HOME (an over-guard is churn that hides

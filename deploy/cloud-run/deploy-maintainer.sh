@@ -350,10 +350,17 @@ case "$MODE" in
   cloud) { [ "$MINT_LEGACY" = 1 ] || [ "$GH_APP" = 1 ]; } && PROMPT_TOKENS=1 ;;
 esac
 
+# The Arch-A sandbox guard runs BEFORE collect_secrets for the two modes that reach arch_a.
+# collect_secrets calls `claude setup-token`, which mints a ~1-year credential into the
+# keychain — account-scoped state that $HOME does NOT isolate either. A sandboxed run must
+# not mint one on its way to a refusal, so the refusal has to land first. The call inside
+# arch_a STAYS: that is the one a future caller of arch_a cannot route around. The guard is
+# a pure predicate + exit, so running it twice costs nothing and can never disagree.
+# --cloud is deliberately NOT guarded: it touches no machine-scoped local state.
 case "$MODE" in
-  local)  collect_secrets; arch_a ;;
+  local)  require_real_crontab_owner; collect_secrets; arch_a ;;
   cloud)  collect_secrets; arch_b ;;
-  hybrid) collect_secrets; arch_a; arch_b ;;
+  hybrid) require_real_crontab_owner; collect_secrets; arch_a; arch_b ;;
 esac
 register_schedule
 echo; say "done ($MODE)."
