@@ -6,6 +6,8 @@
 - Task touches 2+ independent files → one agent per file, ALL spawned together
 - NEVER: spawn agent → wait → spawn another agent for independent work
 - NEVER: read file → read next file → read next file (batch all reads in one message)
+- NEVER: pass `name:` to Agent unless you will `SendMessage` it — `name:` → mailbox-resident agent, never self-terminates, never returns a result (measured 0/43 named completed vs 59/66 unnamed)
+- Identify a spawn's work via `description:`, never `name:` (R13)
 
 ## Rules
 - All code, configs, docs go in this project directory

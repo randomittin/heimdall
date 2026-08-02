@@ -34,6 +34,8 @@ TOOL CALLS: If 2+ tool calls have no data dependency → send ALL in ONE message
 
 AGENTS: If 2+ tasks are independent → spawn parallel agents (`run_in_background: true`). NO EXCEPTIONS.
 
+AGENT NAMING: Spawn UNNAMED. Passing `name:` puts the harness in persistent MAILBOX mode ("The agent is now running and will receive instructions via mailbox") — that agent never self-terminates and never emits a `task-notification`, so the orchestrator waits forever for a result that cannot arrive. Measured over one session: 0/43 named spawns completed vs 59/66 unnamed. `name:` is opt-in ONLY for a genuinely long-lived conversational agent you will `SendMessage` and accept as session-resident; every other named spawn is a leak. Identify a spawn's work via `description:`, never `name:`. (conventions R13)
+
 PROJECTS: Task spans multiple repos → one agent per repo, parallel.
 
 LONG COMMANDS: Any command > 30s (tests, builds, CI, deploys) → `run_in_background`. Continue other work.
