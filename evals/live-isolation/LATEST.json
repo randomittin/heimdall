@@ -1,0 +1,130 @@
+{
+  "tool": "heimdall-live-verify",
+  "run_utc": "2026-08-02T20:00:05Z",
+  "git_sha": "663a8455cb10d12c22b65b922ec345f54db4eec0",
+  "git_dirty": false,
+  "control_plane": "https://heimdall-cp-public-eqfrs7sfuq-uc.a.run.app",
+  "site": "https://runheimdall.dev",
+  "project": "github.com/randomittin/heimdall",
+  "routes_registered": 35,
+  "backend": "firestore",
+  "backend_ready": true,
+  "verdict": "PASS",
+  "counts": {
+    "run": 11,
+    "pass": 11,
+    "fail": 0,
+    "unreachable": 0,
+    "unrun": 1
+  },
+  "checks": [
+    {
+      "id": "readyz",
+      "label": "GET /readyz \u2014 control plane ready, backend genuinely reachable",
+      "command": "curl -sS --max-time 15 'https://heimdall-cp-public-eqfrs7sfuq-uc.a.run.app/readyz'",
+      "expected": "200 \u00b7 status=\"ready\"",
+      "observed": "200 \u00b7 status=\"ready\"",
+      "result": "PASS",
+      "body": "{\"status\": \"ready\", \"booted\": true, \"routes_registered\": 35, \"stores_reachable\": true, \"backend\": \"firestore\", \"backend_ready\": true, \"version\": \"1.0\"}"
+    },
+    {
+      "id": "config",
+      "label": "GET /config \u2014 presence timing contract served",
+      "command": "curl -sS --max-time 15 'https://heimdall-cp-public-eqfrs7sfuq-uc.a.run.app/config'",
+      "expected": "200",
+      "observed": "200",
+      "result": "PASS",
+      "body": "{\"beat_interval_s\": 20, \"refresh_interval_s\": 15, \"ttl_s\": 45, \"tier\": 0}"
+    },
+    {
+      "id": "corpus-unsigned",
+      "label": "POST /corpus unsigned \u2014 PKI chokepoint refuses an unsigned write",
+      "command": "curl -sS --max-time 15 -X POST -H 'Content-Type: application/json' -d '{}' 'https://heimdall-cp-public-eqfrs7sfuq-uc.a.run.app/corpus'",
+      "expected": "401 \u00b7 error=\"missing_signature\"",
+      "observed": "401 \u00b7 error=\"missing_signature\"",
+      "result": "PASS",
+      "body": "{\"error\": \"missing_signature\"}"
+    },
+    {
+      "id": "roster-team-no-secret",
+      "label": "GET /roster-team with NO team secret \u2014 outsider denied",
+      "command": "curl -sS --max-time 15 'https://heimdall-cp-public-eqfrs7sfuq-uc.a.run.app/roster-team?project=github.com%2Frandomittin%2Fheimdall'",
+      "expected": "403 \u00b7 error=\"team_secret_required\"",
+      "observed": "403 \u00b7 error=\"team_secret_required\"",
+      "result": "PASS",
+      "body": "{\"error\": \"team_secret_required\", \"online\": []}"
+    },
+    {
+      "id": "roster-team-random-secret",
+      "label": "GET /roster-team with a RANDOM secret \u2014 hashes to an empty partition, leaks no other tenant",
+      "command": "curl -sS --max-time 15 -H 'X-Heimdall-Team-Secret: <random 43-char secret>' 'https://heimdall-cp-public-eqfrs7sfuq-uc.a.run.app/roster-team?project=github.com%2Frandomittin%2Fheimdall'",
+      "expected": "200 \u00b7 online=[]",
+      "observed": "200 \u00b7 online=[]",
+      "result": "PASS",
+      "body": "{\"project\": \"github.com/randomittin/heimdall\", \"online\": []}"
+    },
+    {
+      "id": "roster-public-retired",
+      "label": "GET /roster-public \u2014 the fully-public roster stays retired",
+      "command": "curl -sS --max-time 15 'https://heimdall-cp-public-eqfrs7sfuq-uc.a.run.app/roster-public?project=github.com%2Frandomittin%2Fheimdall'",
+      "expected": "403 \u00b7 error=\"roster_public_retired\"",
+      "observed": "403 \u00b7 error=\"roster_public_retired\"",
+      "result": "PASS",
+      "body": "{\"error\": \"roster_public_retired\", \"online\": []}"
+    },
+    {
+      "id": "cp-god",
+      "label": "GET /god/ on the public control plane \u2014 the god surface must be ABSENT, not merely unauthorized",
+      "command": "curl -sS --max-time 15 'https://heimdall-cp-public-eqfrs7sfuq-uc.a.run.app/god/'",
+      "expected": "404 \u00b7 error=\"no_such_route\"",
+      "observed": "404 \u00b7 error=\"no_such_route\"",
+      "result": "PASS",
+      "body": "{\"error\": \"no_such_route\"}"
+    },
+    {
+      "id": "cp-dispatch",
+      "label": "GET /dispatch on the public control plane \u2014 dispatch surface absent",
+      "command": "curl -sS --max-time 15 'https://heimdall-cp-public-eqfrs7sfuq-uc.a.run.app/dispatch'",
+      "expected": "404 \u00b7 error=\"no_such_route\"",
+      "observed": "404 \u00b7 error=\"no_such_route\"",
+      "result": "PASS",
+      "body": "{\"error\": \"no_such_route\"}"
+    },
+    {
+      "id": "site-dashboard",
+      "label": "GET /dashboard on the public site \u2014 the shipped dashboard is reachable",
+      "command": "curl -sS --max-time 15 'https://runheimdall.dev/dashboard'",
+      "expected": "200",
+      "observed": "200",
+      "result": "PASS",
+      "body": ""
+    },
+    {
+      "id": "site-god",
+      "label": "GET /god/ on the public site \u2014 no god surface on the marketing origin",
+      "command": "curl -sS --max-time 15 'https://runheimdall.dev/god/'",
+      "expected": "404",
+      "observed": "404",
+      "result": "PASS",
+      "body": ""
+    },
+    {
+      "id": "local-oracle",
+      "label": "bin/falsify rr-multitenant-isolation --assert-score 1.0 \u2014 every cross-tenant mutant killed",
+      "command": "bin/falsify rr-multitenant-isolation --assert-score 1.0",
+      "expected": "exit 0 \u00b7 score 1.0 (golden passes, no mutant survives)",
+      "observed": "exit 0 \u00b7 SCORE: 23/23 = 1.0000 (golden passing)",
+      "result": "PASS",
+      "body": ""
+    }
+  ],
+  "unrun": [
+    {
+      "id": "beat-roster-own-watchman",
+      "label": "Check 4 of the canonical five \u2014 beat -> own watchman visible on /roster-team",
+      "status": "UNRUN (requires operator consent \u2014 production write)",
+      "reason": "A presence beat WRITES a roster record to the live control plane. This verifier is read-only by construction and will never run it unattended. The written record self-expires after ttl_s (45s per /config), but it is still a production write, so it needs a human operator's consent. Its absence is why this receipt does NOT claim full coverage of the canonical five.",
+      "operator_command": "cd <repo>\nbin/heimdall-presence beat\nbin/heimdall-presence roster --json | python3 -c \"\nimport json,sys\nd = json.load(sys.stdin)\nhaids = [e.get('haid') for e in d.get('online', [])]\nprint('HAIDs on roster:', haids)\nassert haids, 'FAIL: empty roster - beat did not propagate'\nprint('PASS: %d entry/entries' % len(haids))\n\""
+    }
+  ]
+}

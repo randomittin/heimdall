@@ -1,0 +1,494 @@
+#!/usr/bin/env bash
+# heimdall-live-verify — READ-ONLY live verification of the multi-tenant isolation boundary
+# against the DEPLOYED control plane, emitting a committed, timestamped RECEIPT.
+#
+# WHY THIS EXISTS. "Has the isolation boundary ever been verified against the deployed control
+# plane?" used to take forensic archaeology to answer. The five canonical checks lived only as
+# a recipe string in .planning/settings.json (`commands.live_verify`) plus prose in
+# docs/team-validation-runbook.md §4, and the ONLY record of a live run was prose inside
+# .planning/PARTB-ANSWERS.md §2 (2026-07-17). That path is GITIGNORED, so the evidence was
+# unfindable — and it rotted silently: it captured routes_registered=27 while the live control
+# plane now reports 35, and the local oracle went 6/6 -> 23/23. Nothing wrote a timestamped
+# artifact, so staleness was invisible and un-auditable.
+#
+# For a project whose brand is "nothing ships unproven", the privacy boundary protecting real
+# teammates' presence data needs a durable proof-of-verification artifact. This is it.
+#
+# WHAT IT DOES. Runs every check that CAN run read-only (ten live HTTP probes + the local
+# falsification oracle), then writes a receipt to a COMMITTED path recording, per check: the
+# exact command, what was expected, what was observed, and PASS/FAIL — plus the run timestamp,
+# the repo git sha at run time, and the live `routes_registered` value so the NEXT reader can
+# detect staleness with a plain `git diff` instead of an investigation.
+#
+# READ-ONLY BY CONSTRUCTION. Every probe is a GET except one deliberate unsigned POST /corpus,
+# which the PKI chokepoint refuses (401 missing_signature) BEFORE any state change — that
+# refusal is the thing being verified. No gcloud, no enrollment, no deploys, no presence beat.
+#
+# WHAT IT DELIBERATELY DOES NOT DO. Check 4 of the canonical five (beat -> own watchman visible
+# on roster-team) is a production WRITE. It is structurally out of scope for an unattended
+# read-only verifier and is NEVER run here. It appears in every receipt as
+# `UNRUN (requires operator consent — production write)` alongside the exact command an
+# operator would run. A receipt must never imply coverage it does not have.
+#
+# HONEST DEGRADATION. With no network, each probe reports UNREACHABLE and the verdict is
+# UNREACHABLE — never a fabricated PASS. Every request is bounded with `curl --max-time`
+# (timeout(1) does not exist on macOS, so it is never used).
+#
+# Usage:
+#   heimdall-live-verify [options]
+#     --out-dir DIR   receipt directory        (default: <root>/evals/live-isolation)
+#     --json          also print the receipt JSON to stdout
+#     --quiet         suppress the per-check human lines
+#     -h | --help     this help
+#
+# Environment overrides (all optional; the defaults hit the real deployed surface):
+#   HEIMDALL_LV_CP        control-plane base URL   (default: ~/.heimdall/cp-endpoint.json, else
+#                                                   the shipped public default)
+#   HEIMDALL_LV_SITE      marketing/site base URL  (default: https://runheimdall.dev)
+#   HEIMDALL_LV_PROJECT   project slug to probe    (default: derived from remote.origin.url)
+#   HEIMDALL_LV_CURL      curl binary              (default: curl) — the test's hermetic seam
+#   HEIMDALL_LV_FALSIFY   oracle runner            (default: <root>/bin/falsify)
+#   HEIMDALL_LV_MAXTIME   per-request bound, secs  (default: 15)
+#
+# Exit: 0 every RUN check PASSed · 1 at least one RUN check FAILED · 3 at least one check was
+#       UNREACHABLE (and none failed) · 2 usage error.
+# A receipt is written in ALL of those cases — a green claim must be falsifiable, and a red or
+# unreachable run is exactly the state a future reader most needs recorded.
+
+set -uo pipefail
+
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+BINDIR="$(dirname "$SELF")"
+ROOT="$(cd "$BINDIR/.." && pwd)"
+
+usage() { sed -n '2,57p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+PY="$(command -v python3 || true)"
+if [ -z "$PY" ]; then
+  echo "error: python3 not found (required to parse control-plane JSON)" >&2
+  exit 2
+fi
+
+OUT_DIR=""
+EMIT_JSON=0
+QUIET=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --out-dir) OUT_DIR="${2:?--out-dir needs a directory}"; shift 2 ;;
+    --json)    EMIT_JSON=1; shift ;;
+    --quiet)   QUIET=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "error: unknown argument: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+CURL="${HEIMDALL_LV_CURL:-curl}"
+FALSIFY="${HEIMDALL_LV_FALSIFY:-$ROOT/bin/falsify}"
+MAXTIME="${HEIMDALL_LV_MAXTIME:-15}"
+SITE="${HEIMDALL_LV_SITE:-https://runheimdall.dev}"
+[ -n "$OUT_DIR" ] || OUT_DIR="$ROOT/evals/live-isolation"
+
+# ── resolve the control-plane URL: explicit override > the dev's global endpoint file >
+# the shipped public default (the same precedence bin/heimdall-invite uses).
+resolve_cp() {
+  if [ -n "${HEIMDALL_LV_CP:-}" ]; then printf '%s' "${HEIMDALL_LV_CP%/}"; return 0; fi
+  LV_CFG="${HOME:-}/.heimdall/cp-endpoint.json" "$PY" - <<'PYEOF'
+import json, os, sys
+cfg = os.environ.get("LV_CFG", "")
+url = ""
+try:
+    if cfg and os.path.exists(cfg):
+        url = json.load(open(cfg)).get("url") or ""
+except Exception:
+    url = ""
+sys.stdout.write((url or "https://heimdall-cp-public-eqfrs7sfuq-uc.a.run.app").rstrip("/"))
+PYEOF
+}
+CP="$(resolve_cp)"
+
+# ── project slug, derived exactly as docs/team-validation-runbook.md §4 derives it.
+resolve_project() {
+  if [ -n "${HEIMDALL_LV_PROJECT:-}" ]; then printf '%s' "$HEIMDALL_LV_PROJECT"; return 0; fi
+  git -C "$ROOT" config --get remote.origin.url 2>/dev/null | \
+    sed -e 's#^[a-zA-Z][a-zA-Z0-9+.-]*://##' -e 's#^[^@/]*@##' \
+        -e 's#:[0-9][0-9]*/#/#' -e 's#:#/#' -e 's#\.git$##' -e 's#/$##' | tr '[:upper:]' '[:lower:]'
+}
+PROJECT="$(resolve_project)"
+if [ -z "$PROJECT" ]; then
+  echo "error: could not derive a project slug (no remote.origin.url); set HEIMDALL_LV_PROJECT" >&2
+  exit 2
+fi
+PROJECT_Q="$(LV_P="$PROJECT" "$PY" -c 'import os,urllib.parse,sys; sys.stdout.write(urllib.parse.quote(os.environ["LV_P"], safe=""))')"
+
+WORKDIR="$(mktemp -d)"; trap 'rm -rf "$WORKDIR"' EXIT
+RESULTS="$WORKDIR/results.ndjson"; : > "$RESULTS"
+
+N_PASS=0; N_FAIL=0; N_UNREACH=0
+
+say() { [ "$QUIET" = "1" ] || printf '%b\n' "$1"; }
+
+# ── JSON field read from a response body: prints compact JSON of the value, or __MISSING__.
+lv_jget() {
+  LV_F="$1" LV_K="$2" "$PY" - <<'PYEOF'
+import json, os, sys
+try:
+    d = json.load(open(os.environ["LV_F"]))
+    v = d[os.environ["LV_K"]]
+except Exception:
+    sys.stdout.write("__MISSING__")
+else:
+    sys.stdout.write(json.dumps(v, separators=(",", ":")))
+PYEOF
+}
+
+# ── bounded body capture for the receipt. JSON ONLY, deliberately: the control plane's JSON
+# bodies ARE the evidence, but an HTML page is not. Capturing the site's markup would bury the
+# staleness signal under kilobytes of CSS and make an unrelated marketing-copy tweak dirty this
+# receipt — defeating the whole point of a diff-detectable artifact. Non-JSON captures nothing;
+# for those checks the status code is the evidence.
+lv_body() {
+  LV_F="$1" "$PY" - <<'PYEOF'
+import json, os, sys
+try:
+    raw = open(os.environ["LV_F"], "rb").read(4096).decode("utf-8", "replace").strip()
+    json.loads(raw)
+except Exception:
+    raw = ""
+sys.stdout.write(raw[:2000])
+PYEOF
+}
+
+# ── append one result record (python3 does the escaping; values ride the env, never the shell).
+lv_record() {
+  LV_ID="$1" LV_LABEL="$2" LV_COMMAND="$3" LV_EXPECTED="$4" LV_OBSERVED="$5" \
+  LV_RESULT="$6" LV_BODY="$7" "$PY" - >> "$RESULTS" <<'PYEOF'
+import json, os, sys
+rec = {k: os.environ["LV_" + k.upper()]
+       for k in ("id", "label", "command", "expected", "observed", "result", "body")}
+sys.stdout.write(json.dumps(rec) + "\n")
+PYEOF
+}
+
+tally() {
+  case "$1" in
+    PASS)        N_PASS=$((N_PASS+1));    say "  \033[32mPASS\033[0m $2" ;;
+    FAIL)        N_FAIL=$((N_FAIL+1));    say "  \033[31mFAIL\033[0m $2" ;;
+    UNREACHABLE) N_UNREACH=$((N_UNREACH+1)); say "  \033[33mUNRE\033[0m $2" ;;
+  esac
+}
+
+# ── one live HTTP probe.
+#   lv_http <id> <label> <GET|POST> <url> <header|""> <expect_status> <json_key|""> <json_expect|"">
+# Compares the status code and, when a json_key is given, the compact JSON value at that key.
+# The body predicate is what makes this more than a status check: /roster-team with a random
+# secret answering 200 is only correct if `online` is EMPTY — a 200 carrying another tenant's
+# roster is a privacy breach that a status-only check would wave through.
+lv_http() {
+  local id="$1" label="$2" method="$3" url="$4" hdr="$5" want_status="$6" jkey="$7" jwant="$8"
+  local bodyf="$WORKDIR/body.$id" code rc observed expected result jval disp
+
+  expected="$want_status"
+  [ -n "$jkey" ] && expected="$expected · $jkey=$jwant"
+
+  disp="curl -sS --max-time $MAXTIME"
+  set -- -sS -o "$bodyf" -w '%{http_code}' --max-time "$MAXTIME"
+  if [ "$method" = "POST" ]; then
+    set -- "$@" -X POST -H 'Content-Type: application/json' -d '{}'
+    disp="$disp -X POST -H 'Content-Type: application/json' -d '{}'"
+  fi
+  if [ -n "$hdr" ]; then
+    set -- "$@" -H "$hdr"
+    # never echo a secret value into a committed receipt — the name and shape are the evidence.
+    disp="$disp -H '${hdr%%:*}: <random 43-char secret>'"
+  fi
+  set -- "$@" "$url"
+  disp="$disp '$url'"
+
+  : > "$bodyf"
+  code="$("$CURL" "$@" 2>/dev/null)"; rc=$?
+
+  if [ "$rc" != "0" ] || [ -z "$code" ]; then
+    observed="UNREACHABLE (curl exit $rc)"
+    result="UNREACHABLE"
+    lv_record "$id" "$label" "$disp" "$expected" "$observed" "$result" ""
+    tally "$result" "$label — $observed"
+    return 0
+  fi
+
+  observed="$code"
+  result="PASS"
+  [ "$code" = "$want_status" ] || result="FAIL"
+  if [ -n "$jkey" ]; then
+    jval="$(lv_jget "$bodyf" "$jkey")"
+    observed="$observed · $jkey=$jval"
+    [ "$jval" = "$jwant" ] || result="FAIL"
+  fi
+
+  lv_record "$id" "$label" "$disp" "$expected" "$observed" "$result" "$(lv_body "$bodyf")"
+  tally "$result" "$label — expected [$expected] observed [$observed]"
+}
+
+say "\033[1mheimdall-live-verify\033[0m  cp=$CP  site=$SITE  project=$PROJECT"
+
+# ── the ten read-only live probes ────────────────────────────────────────────────────────
+lv_http readyz "GET /readyz — control plane ready, backend genuinely reachable" \
+  GET "$CP/readyz" "" 200 status '"ready"'
+
+lv_http config "GET /config — presence timing contract served" \
+  GET "$CP/config" "" 200 "" ""
+
+lv_http corpus-unsigned "POST /corpus unsigned — PKI chokepoint refuses an unsigned write" \
+  POST "$CP/corpus" "" 401 error '"missing_signature"'
+
+lv_http roster-team-no-secret "GET /roster-team with NO team secret — outsider denied" \
+  GET "$CP/roster-team?project=$PROJECT_Q" "" 403 error '"team_secret_required"'
+
+RAND_SECRET="$("$PY" -c 'import secrets,sys; sys.stdout.write(secrets.token_urlsafe(32))')"
+lv_http roster-team-random-secret "GET /roster-team with a RANDOM secret — hashes to an empty partition, leaks no other tenant" \
+  GET "$CP/roster-team?project=$PROJECT_Q" "X-Heimdall-Team-Secret: $RAND_SECRET" 200 online '[]'
+
+lv_http roster-public-retired "GET /roster-public — the fully-public roster stays retired" \
+  GET "$CP/roster-public?project=$PROJECT_Q" "" 403 error '"roster_public_retired"'
+
+lv_http cp-god "GET /god/ on the public control plane — the god surface must be ABSENT, not merely unauthorized" \
+  GET "$CP/god/" "" 404 error '"no_such_route"'
+
+lv_http cp-dispatch "GET /dispatch on the public control plane — dispatch surface absent" \
+  GET "$CP/dispatch" "" 404 error '"no_such_route"'
+
+lv_http site-dashboard "GET /dashboard on the public site — the shipped dashboard is reachable" \
+  GET "$SITE/dashboard" "" 200 "" ""
+
+lv_http site-god "GET /god/ on the public site — no god surface on the marketing origin" \
+  GET "$SITE/god/" "" 404 "" ""
+
+# ── the local falsification oracle ───────────────────────────────────────────────────────
+# Complements the live probes: the probes prove the DEPLOYED surface behaves; the oracle proves
+# the isolation logic still kills every known cross-tenant mutant. Recording the score makes
+# oracle drift (this went 6/6 -> 23/23 since the last recorded run) diff-detectable too.
+run_oracle() {
+  local id="local-oracle" out rc score result
+  local label="bin/falsify rr-multitenant-isolation --assert-score 1.0 — every cross-tenant mutant killed"
+  local disp="bin/falsify rr-multitenant-isolation --assert-score 1.0"
+  out="$("$FALSIFY" rr-multitenant-isolation --assert-score 1.0 2>&1)"; rc=$?
+  score="$(printf '%s\n' "$out" | grep -E '^ *SCORE:' | tail -1 | sed 's/^ *//')"
+  [ -n "$score" ] || score="(no SCORE line; falsify exit $rc)"
+  if [ "$rc" = "0" ]; then result="PASS"; else result="FAIL"; fi
+  lv_record "$id" "$label" "$disp" "exit 0 · score 1.0 (golden passes, no mutant survives)" \
+    "exit $rc · $score" "$result" ""
+  tally "$result" "$label — exit $rc · $score"
+}
+run_oracle
+
+# ── readyz-derived staleness anchors ─────────────────────────────────────────────────────
+READY_BODY="$WORKDIR/body.readyz"
+ROUTES="$(lv_jget "$READY_BODY" routes_registered)"
+BACKEND="$(lv_jget "$READY_BODY" backend)"
+BACKEND_READY="$(lv_jget "$READY_BODY" backend_ready)"
+
+GIT_SHA="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || printf 'unknown')"
+# git_dirty answers "was the VERIFIED CODE modified at run time?", so the receipt's own output
+# directory is excluded. Counting it would make the flag structurally always-true (writing the
+# receipt dirties the tree), which would render it meaningless as a trust signal.
+OUT_REL="$(LV_R="$ROOT" LV_O="$OUT_DIR" "$PY" -c 'import os,sys; sys.stdout.write(os.path.relpath(os.environ["LV_O"], os.environ["LV_R"]))')"
+GIT_DIRTY="$(git -C "$ROOT" status --porcelain 2>/dev/null | LV_PREFIX="$OUT_REL" "$PY" - <<'PYEOF'
+import os, sys
+prefix = os.environ["LV_PREFIX"].rstrip("/") + "/"
+for line in sys.stdin:
+    path = line[3:].strip().strip('"')
+    path = path.split(" -> ")[-1]          # renames report "old -> new"
+    if path and not path.startswith(prefix):
+        sys.stdout.write("true")
+        break
+else:
+    sys.stdout.write("false")
+PYEOF
+)"
+RUN_UTC="$("$PY" -c 'import datetime,sys; sys.stdout.write(datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))')"
+
+if   [ "$N_FAIL"    -gt 0 ]; then VERDICT="FAIL";        EXIT_CODE=1
+elif [ "$N_UNREACH" -gt 0 ]; then VERDICT="UNREACHABLE"; EXIT_CODE=3
+else                              VERDICT="PASS";        EXIT_CODE=0
+fi
+
+mkdir -p "$OUT_DIR"
+
+# ── render both receipts ─────────────────────────────────────────────────────────────────
+# LATEST.{md,json} are STABLE paths, deliberately overwritten each run: a stable path is what
+# makes drift a one-line `git diff`, and git history is already the per-run archive
+# (`git log -p evals/live-isolation/LATEST.md` replays every past receipt).
+LV_RESULTS="$RESULTS" LV_OUT="$OUT_DIR" LV_RUN_UTC="$RUN_UTC" LV_GIT_SHA="$GIT_SHA" \
+LV_GIT_DIRTY="$GIT_DIRTY" LV_CP="$CP" LV_SITE="$SITE" LV_PROJECT="$PROJECT" \
+LV_ROUTES="$ROUTES" LV_BACKEND="$BACKEND" LV_BACKEND_READY="$BACKEND_READY" \
+LV_VERDICT="$VERDICT" LV_NPASS="$N_PASS" LV_NFAIL="$N_FAIL" LV_NUNREACH="$N_UNREACH" \
+LV_EMIT_JSON="$EMIT_JSON" "$PY" - <<'PYEOF'
+import json, os, sys
+
+env = os.environ
+checks = []
+with open(env["LV_RESULTS"]) as fh:
+    for line in fh:
+        line = line.strip()
+        if line:
+            checks.append(json.loads(line))
+
+
+def jnum(raw, fallback=None):
+    """readyz values arrive as compact JSON ('35', 'true', '"firestore"') or __MISSING__."""
+    try:
+        return json.loads(raw)
+    except Exception:
+        return fallback
+
+
+# The one canonical check that is structurally out of scope for a read-only verifier.
+UNRUN = [{
+    "id": "beat-roster-own-watchman",
+    "label": "Check 4 of the canonical five — beat -> own watchman visible on /roster-team",
+    "status": "UNRUN (requires operator consent — production write)",
+    "reason": (
+        "A presence beat WRITES a roster record to the live control plane. This verifier is "
+        "read-only by construction and will never run it unattended. The written record "
+        "self-expires after ttl_s (45s per /config), but it is still a production write, so it "
+        "needs a human operator's consent. Its absence is why this receipt does NOT claim full "
+        "coverage of the canonical five."
+    ),
+    "operator_command": (
+        "cd <repo>\n"
+        "bin/heimdall-presence beat\n"
+        "bin/heimdall-presence roster --json | python3 -c \"\n"
+        "import json,sys\n"
+        "d = json.load(sys.stdin)\n"
+        "haids = [e.get('haid') for e in d.get('online', [])]\n"
+        "print('HAIDs on roster:', haids)\n"
+        "assert haids, 'FAIL: empty roster - beat did not propagate'\n"
+        "print('PASS: %d entry/entries' % len(haids))\n"
+        "\""
+    ),
+}]
+
+receipt = {
+    "tool": "heimdall-live-verify",
+    "run_utc": env["LV_RUN_UTC"],
+    "git_sha": env["LV_GIT_SHA"],
+    "git_dirty": env["LV_GIT_DIRTY"] == "true",
+    "control_plane": env["LV_CP"],
+    "site": env["LV_SITE"],
+    "project": env["LV_PROJECT"],
+    "routes_registered": jnum(env["LV_ROUTES"]),
+    "backend": jnum(env["LV_BACKEND"]),
+    "backend_ready": jnum(env["LV_BACKEND_READY"]),
+    "verdict": env["LV_VERDICT"],
+    "counts": {
+        "run": len(checks),
+        "pass": int(env["LV_NPASS"]),
+        "fail": int(env["LV_NFAIL"]),
+        "unreachable": int(env["LV_NUNREACH"]),
+        "unrun": len(UNRUN),
+    },
+    "checks": checks,
+    "unrun": UNRUN,
+}
+
+out = env["LV_OUT"]
+with open(os.path.join(out, "LATEST.json"), "w") as fh:
+    json.dump(receipt, fh, indent=2, sort_keys=False)
+    fh.write("\n")
+
+
+def cell(s):
+    """markdown table cell: collapse newlines, escape the column delimiter."""
+    return (s or "").replace("|", "\\|").replace("\n", " ").strip()
+
+
+BADGE = {"PASS": "**PASS**", "FAIL": "**FAIL**", "UNREACHABLE": "**UNREACHABLE**"}
+
+
+def scalar(v):
+    """Render a receipt scalar the way the wire spells it: true, not Python's True."""
+    return v if isinstance(v, str) else json.dumps(v)
+
+md = []
+md.append("# Live isolation verification receipt")
+md.append("")
+md.append("Generated by `bin/heimdall-live-verify` — do not hand-edit. This file is a STABLE path,")
+md.append("overwritten on every run, so drift against the deployed control plane shows up as a plain")
+md.append("`git diff`. Every past receipt is in git history: `git log -p evals/live-isolation/LATEST.md`.")
+md.append("")
+md.append("| field | value |")
+md.append("|---|---|")
+md.append("| verdict | %s |" % BADGE.get(receipt["verdict"], receipt["verdict"]))
+md.append("| run_utc | `%s` |" % receipt["run_utc"])
+md.append("| git_sha | `%s` |" % receipt["git_sha"])
+md.append("| git_dirty | `%s` |" % str(receipt["git_dirty"]).lower())
+md.append("| control_plane | `%s` |" % receipt["control_plane"])
+md.append("| site | `%s` |" % receipt["site"])
+md.append("| project | `%s` |" % receipt["project"])
+md.append("| routes_registered | `%s` |" % scalar(receipt["routes_registered"]))
+md.append("| backend | `%s` (ready: `%s`) |" % (scalar(receipt["backend"]),
+                                                scalar(receipt["backend_ready"])))
+md.append("| checks run | %d — %d passed, %d failed, %d unreachable |" % (
+    receipt["counts"]["run"], receipt["counts"]["pass"],
+    receipt["counts"]["fail"], receipt["counts"]["unreachable"]))
+md.append("| checks NOT run | %d (see below — this receipt does NOT claim full coverage) |"
+          % receipt["counts"]["unrun"])
+md.append("")
+md.append("`routes_registered` is the staleness tripwire: if the deployed control plane's route")
+md.append("count moves and this receipt was not re-run, the diff is the alarm.")
+md.append("")
+md.append("## Checks RUN")
+md.append("")
+md.append("| # | check | command | expected | observed | result |")
+md.append("|---|---|---|---|---|---|")
+for i, c in enumerate(checks, 1):
+    md.append("| %d | %s | `%s` | `%s` | `%s` | %s |" % (
+        i, cell(c["label"]), cell(c["command"]), cell(c["expected"]),
+        cell(c["observed"]), BADGE.get(c["result"], c["result"])))
+md.append("")
+
+bodies = [c for c in checks if c.get("body")]
+if bodies:
+    md.append("### Captured response bodies")
+    md.append("")
+    for c in bodies:
+        md.append("- `%s`:" % c["id"])
+        md.append("")
+        md.append("  ```json")
+        for line in c["body"].splitlines() or [""]:
+            md.append("  " + line)
+        md.append("  ```")
+    md.append("")
+
+md.append("## Checks NOT run")
+md.append("")
+for u in UNRUN:
+    md.append("### %s" % u["label"])
+    md.append("")
+    md.append("**%s**" % u["status"])
+    md.append("")
+    md.append(u["reason"])
+    md.append("")
+    md.append("The exact command an operator would run:")
+    md.append("")
+    md.append("```bash")
+    md.extend(u["operator_command"].splitlines())
+    md.append("```")
+    md.append("")
+
+with open(os.path.join(out, "LATEST.md"), "w") as fh:
+    fh.write("\n".join(md).rstrip() + "\n")
+
+if env["LV_EMIT_JSON"] == "1":
+    json.dump(receipt, sys.stdout, indent=2)
+    sys.stdout.write("\n")
+PYEOF
+RENDER_RC=$?
+if [ "$RENDER_RC" != "0" ]; then
+  echo "error: failed to render the receipt into $OUT_DIR (python exit $RENDER_RC)" >&2
+  exit 2
+fi
+
+say ""
+say "verdict \033[1m$VERDICT\033[0m — $N_PASS passed, $N_FAIL failed, $N_UNREACH unreachable, 1 unrun (production write)"
+say "receipt $OUT_DIR/LATEST.md"
+exit "$EXIT_CODE"
