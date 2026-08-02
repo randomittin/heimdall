@@ -1104,8 +1104,11 @@ if [ -x "$WT_EPHEM/bin/heimdall-dream-schedule" ] && [ -f "$WT_EPHEM/.git" ]; th
     [ "${_b##*/}" = "git" ] && continue
     ln -sf "$_b" "$SB/nogit/${_b##*/}" 2>/dev/null || true
   done
-  command -v git >/dev/null 2>&1 && PATH="$SB/nogit" command -v git >/dev/null 2>&1 \
-    && bad "probe setup: git still reachable on the no-git PATH — the assertion below is vacuous"
+  # Probe in a FRESH process: bash caches command locations in a hash table and
+  # `command -v` consults it before PATH, so an in-shell check reports a stale hit.
+  if env -i PATH="$SB/nogit" /bin/sh -c 'command -v git' >/dev/null 2>&1; then
+    bad "probe setup: git still reachable on the no-git PATH — the assertion below is vacuous"
+  fi
   worktree_probe "$SB" "$WT_EPHEM/bin/heimdall-dream-schedule" "$WT_EPHEM" PATH="$SB/stub:$SB/nogit"; SCHED_RC=$?
   if [ ! -f "$SB/launchctl.calls" ] && [ "$SCHED_RC" -eq 5 ]; then
     ok "worktree refusal holds with NO git on PATH (the filesystem detector is sufficient alone)"
