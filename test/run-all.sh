@@ -15,6 +15,12 @@
 #   3. EVERY SUITE IS TIME-BOUND. timeout(1) does not exist on macOS, so each suite runs
 #      under a perl alarm in its OWN process group; on expiry the whole group is TERM'd then
 #      KILL'd and the suite is reported TIMEOUT. A hung suite cannot stall the run.
+#      The budget is PER SUITE, not one global number (see suite_timeout). A handful of
+#      suites are legitimately slow for a MEASURED, understood reason; the rest are not.
+#      One global bump big enough for the slowest would let a genuinely HUNG suite sit for
+#      minutes before being reaped, so the slow ones get a named, justified override and
+#      everything else keeps a tight default. The budget each suite ran under is PRINTED
+#      next to every TIMEOUT, so an override can never quietly hide a slowdown.
 #   4. LIVE/CREDENTIALED SUITES ARE CLASSIFIED, NOT HIDDEN. Suites that deploy, publish, or
 #      talk to the deployed control plane are SKIPPED by default and printed WITH THEIR
 #      REASON in the summary. --include-live runs them. A skipped suite is never silently
@@ -33,7 +39,8 @@
 #   test/run-all.sh --include-live      # also run deploy/publish/prod-facing suites
 #   test/run-all.sh --filter statusline # only suites whose path matches the regex
 #   test/run-all.sh --jobs 1            # fully serial
-#   test/run-all.sh --timeout 300       # per-suite seconds (default 120)
+#   test/run-all.sh --timeout 300       # DEFAULT per-suite seconds (default 180); suites
+#                                       # with a measured override keep theirs if it is larger
 #   test/run-all.sh --no-retry          # do not re-run reds serially
 #
 # Exit 0 = every suite that ran passed. Nonzero = at least one FAIL / TIMEOUT / DISCREPANCY,
@@ -45,7 +52,7 @@ SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$SELF_DIR/.." && pwd)"
 
 # ── defaults ──
-TIMEOUT=120
+TIMEOUT=180
 MIN_SUITES=100
 FILTER=""
 INCLUDE_LIVE=0
@@ -60,7 +67,7 @@ while [ $# -gt 0 ]; do
     --include-live) INCLUDE_LIVE=1; shift ;;
     --no-retry)     RETRY_REDS=0; shift ;;
     --jobs)         JOBS="${2:-4}"; shift 2 ;;
-    --timeout)      TIMEOUT="${2:-120}"; shift 2 ;;
+    --timeout)      TIMEOUT="${2:-180}"; shift 2 ;;
     --min)          MIN_SUITES="${2:-100}"; shift 2 ;;
     --filter)       FILTER="${2:-}"; shift 2 ;;
     -h|--help)      sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
@@ -96,6 +103,36 @@ live_reason() {
       echo "probes the deployed public surface over the network" ;;
     *) echo "" ;;
   esac
+}
+
+# ── PER-SUITE TIME BUDGET ─────────────────────────────────────────────────────────────────
+# Default is $TIMEOUT. A suite listed here is legitimately slow for a reason we MEASURED,
+# and gets a named override; every measurement below is a SOLO wall-clock on an M-series
+# mac, then multiplied for parallel contention. Observed contention factor: the
+# heimdall-context-capsule suite runs 56s solo and was clocked at 102s under --jobs 6
+# (~1.8x). Budgets are therefore >= 2x the solo time, then rounded up for headroom.
+#
+# Why overrides instead of one big global number: the global default is what protects the
+# run from a GENUINELY HUNG suite (network wait, lock, prompt). Raising it to fit the
+# slowest suite would let every hang burn that much wall clock before being reaped. Naming
+# the slow suites keeps the hang detector tight for the other ~230.
+#
+# The effective budget is max(default, override) so `--timeout 600` still raises everything
+# and an override never drops below its measured need.
+suite_timeout() {
+  local base="$(basename "$1")" override=0
+  case "$base" in
+    # gitleaks history pass (~40s alone) PLUS a full tree-mode pass; both are I/O-bound
+    # scans over the whole repo and contend hard when run alongside 5 other suites.
+    selfscan.test.sh)                override=600 ;;
+    # measured 133s SOLO (21 passed, 2 failed) — it drives a real install (install-stranger)
+    # plus the full pick->orient->fix->GATE->attest->open_pr path against real seams.
+    issue-loop-integration.test.sh)  override=420 ;;
+    # measured 56s solo / 102s under --jobs 6 — the closest suite to the old 120s cliff.
+    heimdall-context-capsule.test.sh) override=300 ;;
+  esac
+  [ "$override" -gt "$TIMEOUT" ] && { echo "$override"; return 0; }
+  echo "$TIMEOUT"
 }
 
 # ── TIMEOUT WRAPPER ───────────────────────────────────────────────────────────────────────
@@ -152,7 +189,7 @@ DISCOVERED=${#ALL[@]}
 
 echo ""
 echo "${BLD}heimdall test runner${OFF}  repo=$REPO"
-echo "discovered ${BLD}${DISCOVERED}${OFF} suites   (glob test/*.test.sh -> ${GLOB_COUNT})   jobs=$JOBS timeout=${TIMEOUT}s"
+echo "discovered ${BLD}${DISCOVERED}${OFF} suites   (glob test/*.test.sh -> ${GLOB_COUNT})   jobs=$JOBS timeout=${TIMEOUT}s (default; slow suites carry a measured override)"
 [ -n "$FILTER" ] && echo "filter: /$FILTER/  (floor check applies to the unfiltered glob)"
 echo "--------------------------------------------------------------------------------------"
 
@@ -191,13 +228,15 @@ trap cleanup EXIT INT TERM
 
 # ── EXECUTE (bounded parallelism; bash 3.2 has no `wait -n`, so poll with kill -0) ─────────
 run_one() {
-  local idx="$1" suite="$2" t0 t1 rc
+  local idx="$1" suite="$2" t0 t1 rc budget
+  budget="$(suite_timeout "$suite")"
   t0=$(date +%s)
-  timeout_run "$TIMEOUT" bash "$suite" >"$WORK/$idx.out" 2>&1
+  timeout_run "$budget" bash "$suite" >"$WORK/$idx.out" 2>&1
   rc=$?
   t1=$(date +%s)
   printf '%s\n' "$rc" >"$WORK/$idx.rc"
   printf '%s\n' "$((t1 - t0))" >"$WORK/$idx.dur"
+  printf '%s\n' "$budget" >"$WORK/$idx.budget"
 }
 
 START=$(date +%s)
@@ -261,7 +300,8 @@ for i in $(seq 0 $((TO_RUN - 1))); do
   fi
 
   if [ "$rc" = "124" ]; then
-    status="TIMEOUT"; n_timeout=$((n_timeout + 1)); TIMEDOUT+=("$name")
+    status="TIMEOUT"; n_timeout=$((n_timeout + 1))
+    TIMEDOUT+=("$name|$(cat "$WORK/$i.budget" 2>/dev/null || echo "$TIMEOUT")")
   elif [ "$rc" != "0" ]; then
     status="FAIL"; n_fail=$((n_fail + 1)); FAILED+=("$name")
   elif [ "$p" = "?" ]; then
@@ -308,8 +348,10 @@ if [ "$n_fail" -gt 0 ]; then
   echo ""
 fi
 if [ "$n_timeout" -gt 0 ]; then
-  echo "${RED}${BLD}TIMEOUT (${n_timeout})${OFF} — killed after ${TIMEOUT}s, process group reaped:"
-  for x in ${TIMEDOUT[@]+"${TIMEDOUT[@]}"}; do echo "  bash test/$x"; done
+  echo "${RED}${BLD}TIMEOUT (${n_timeout})${OFF} — killed at the suite's budget, process group reaped:"
+  for x in ${TIMEDOUT[@]+"${TIMEDOUT[@]}"}; do
+    printf '  %-56s %s\n' "bash test/${x%%|*}" "(budget ${x#*|}s)"
+  done
   echo ""
 fi
 if [ "$n_discrep" -gt 0 ]; then
