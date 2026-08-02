@@ -119,10 +119,28 @@ FIX_RAW="$("$PY" -c 'import json;print(json.dumps({"repo":"acme/widget","number"
 # evidence cmd exits 0 -> GATE-PASS (a recorded REAL exit, the cardinal-rule source).
 PASS_OUT="$("$LOOP_CMD" run-once --repo "$REPO" --evidence "true" --print 2>"$WORK/pass.err")" || true
 PASS_ID="$(printf '%s' "$PASS_OUT" | jq -r '.issue.id')"
-if printf '%s' "$PASS_OUT" | jq -e '.state == "PR_OPEN" and .pr_ready == true and .pr_opened == true' >/dev/null 2>&1; then
-  ok "PASS: issue flowed pick->orient->fix->GATE->attest->open_pr (state PR_OPEN, real open_pr fired)"
+# open_pr's TERMINAL ACTION fired: the issue reached PR_OPEN and the branch was built.
+# pr_opened is deliberately FALSE here: with no HEIMDALL_PR_BOT_TOKEN, gh_bot_runner
+# degrades to the record-only _default_gh_runner (issue_pr.py:869) — it builds the
+# artifact and pushes NOTHING, because the agent must NEVER push with personal creds.
+# This harness promises "no live creds, no network, no real PR" (header), so demanding
+# pr_opened==true would demand exactly the credentialed push the design forbids. We pin
+# the branch VALUE (open_pr really ran) and assert the degradation is record-only, which
+# also makes the SECURITY property falsifiable: if the agent ever started pushing with
+# ambient creds, this goes RED where a pr_opened==true check would have gone GREEN.
+if printf '%s' "$PASS_OUT" | jq -e '
+     .state == "PR_OPEN" and .pr_ready == true
+     and .pr.branch == "heimdall/issue/github-acme-widget-21"' >/dev/null 2>&1; then
+  ok "PASS: issue flowed pick->orient->fix->GATE->attest->open_pr (PR_OPEN, branch built by the real open_pr)"
 else
-  bad "PASS: routine fix did not reach PR_OPEN via the real open_pr"
+  bad "PASS: routine fix did not reach PR_OPEN via the real open_pr ($(printf '%s' "$PASS_OUT" | jq -c '{state,pr_ready,branch:.pr.branch}' 2>/dev/null))"
+fi
+if printf '%s' "$PASS_OUT" | jq -e '
+     .pr_opened == false and .pr.pushed == null
+     and .pr.url == null and .pr.error == null' >/dev/null 2>&1; then
+  ok "PASS: with NO bot token open_pr is record-only — nothing pushed, no live gh, no error"
+else
+  bad "PASS: credential-free run did not degrade to record-only ($(printf '%s' "$PASS_OUT" | jq -c '.pr' 2>/dev/null))"
 fi
 # orient REUSED SI-1 (the capsule exists + was attached); attest REUSED SI-2.
 if [ -f "$HEIMDALL_HOME/context.json" ] \
@@ -153,6 +171,54 @@ if [ "$SECTIONS_OK" = "1" ]; then
   ok "PASS: PR body renders all SI-2 sections (claims/contracts/evidence/reuse/risk)"
 else
   bad "PASS: PR body is missing an SI-2 section"
+fi
+# The POSITIVE half of the open_pr contract, proven WITHOUT creds: given a runner,
+# open_pr invokes it EXACTLY once and surfaces the resulting PR url. A MOCK stands in
+# for `gh` (no network, no real PR), which is the seam the design documents for tests.
+# Together with the record-only assertion above this covers both arms of the branch —
+# strictly more than the old single `pr_opened == true` check, which could only ever
+# pass by handing the suite a live bot token.
+MOCK_PR="$(MOCK_ISSUE="$(printf '%s' "$PASS_OUT" | jq -c '.issue')" \
+  MOCK_RECORD="$(printf '%s' "$PASS_OUT" | jq -c '.attestation')" \
+  REPO="$REPO" HEIMDALL_PR_BOT_TOKEN="" \
+  PYTHONPATH="$ROOT/bin/lib:$PYTHONPATH" "$PY" - <<'PYEOF'
+import json, os
+import issue_pr
+
+calls = []
+def fake_gh(argv):
+    # the external edge, mocked: records the create and reports a PR url.
+    calls.append(argv)
+    return {"ok": True, "pushed": True, "exit": 0, "error": None,
+            "url": "https://github.com/acme/widget/pull/7"}
+
+art = issue_pr.open_pr(json.loads(os.environ["MOCK_ISSUE"]),
+                       json.loads(os.environ["MOCK_RECORD"]),
+                       repo=os.environ["REPO"], gh_runner=fake_gh)
+gh = art.get("gh") or {}
+print(json.dumps({
+    "runner_calls": len(calls),
+    "url": gh.get("url"),
+    "branch": art.get("branch"),
+    "merged": art.get("merged"),
+    "source_closed": art.get("source_closed"),
+    "resolution_posted": art.get("resolution_posted"),
+}))
+PYEOF
+)" || MOCK_PR=""
+if printf '%s' "$MOCK_PR" | jq -e '
+     .runner_calls == 1 and .url == "https://github.com/acme/widget/pull/7"
+     and .branch == "heimdall/issue/github-acme-widget-21"' >/dev/null 2>&1; then
+  ok "PASS: given a gh runner, open_pr fires it EXACTLY once and surfaces the PR url"
+else
+  bad "PASS: open_pr did not drive the injected gh runner ($MOCK_PR)"
+fi
+# even on the opened path autonomy STOPS: no merge, no source close, no writeback.
+if printf '%s' "$MOCK_PR" | jq -e '
+     .merged == false and .source_closed == false and .resolution_posted == false' >/dev/null 2>&1; then
+  ok "PASS: open_pr opens and STOPS — merged/source_closed/resolution_posted all false"
+else
+  bad "PASS: open_pr advanced past opening the PR ($MOCK_PR)"
 fi
 
 # ── (3) THE CARDINAL RULE — gate-FAIL -> NO PR, flagged honestly (falsifiable) ─
