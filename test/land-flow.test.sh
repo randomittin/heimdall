@@ -194,5 +194,10 @@ git -C "$WORK/incompat.git" rev-parse --verify -q refs/heads/feat-greet >/dev/nu
 # ════════════════════════════════════════════════════════════════════════════
 echo "─────────────────────────────────────────────────────────────────────────"
 echo "land-flow: PASS=$PASS FAIL=$FAIL"
+if [ "$FAIL" -eq 0 ]; then
+  echo "ALL GREEN — both conflict classes proven falsifiable."
+fi
+# Machine-readable roll-up for test/run-all.sh. Printed on BOTH paths so an
+# unparseable-but-green suite (indistinguishable from an empty one) is impossible.
+echo "land-flow: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
-echo "ALL GREEN — both conflict classes proven falsifiable."

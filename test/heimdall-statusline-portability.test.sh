@@ -30,10 +30,18 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REG="$REPO_ROOT/bin/heimdall-statusline-register"
 
 FAILS=0
-ok()  { printf 'OK  %s\n' "$*"; }
+OKS=0
+ok()  { OKS=$((OKS+1)); printf 'OK  %s\n' "$*"; }
 bad() { printf 'BAD %s\n' "$*"; FAILS=$((FAILS+1)); }
 
-command -v python3 >/dev/null 2>&1 || { echo "SKIP: python3 unavailable"; exit 0; }
+# A skip must never look like a pass: exit 0 with no roll-up line is exactly how a
+# vacuous gate hides. Report the skip LOUDLY and as a zero-assertion row.
+command -v python3 >/dev/null 2>&1 || {
+  echo "SKIP: python3 unavailable"
+  echo "RESULT: SKIPPED (0 assertions ran — this is NOT a pass)"
+  echo "heimdall-statusline-portability: 0 passed, 0 failed (SKIPPED — python3 unavailable)"
+  exit 0
+}
 
 # ── Build a teammate checkout at a NON-/Users/rj path (a fresh temp root). Copy only
 # the statusline surfaces the registration + render touch. HOME is a separate fresh
@@ -67,7 +75,12 @@ PY
 
 # ── 0) the bin exists and is executable ──
 if [ -x "$REG" ]; then ok "bin/heimdall-statusline-register present + executable"
-else bad "bin/heimdall-statusline-register missing/not executable ($REG)"; echo "FAILS=$FAILS"; exit 1; fi
+else
+  bad "bin/heimdall-statusline-register missing/not executable ($REG)"
+  echo "FAILS=$FAILS"
+  echo "heimdall-statusline-portability: $OKS passed, $FAILS failed"
+  exit 1
+fi
 
 # ── 1) virgin teammate register (NO CLAUDE_PLUGIN_ROOT → root resolves from the bin's
 #       OWN location = the teammate checkout). Must write ~/.claude/settings.json. ──
@@ -177,5 +190,7 @@ case "$SS" in
 esac
 
 echo
-if [ "$FAILS" = 0 ]; then echo "PASS — statusline portable + propagates to any teammate"; exit 0
-else echo "FAIL — $FAILS assertion(s) failed"; exit 1; fi
+if [ "$FAILS" = 0 ]; then echo "PASS — statusline portable + propagates to any teammate"
+else echo "FAIL — $FAILS assertion(s) failed"; fi
+echo "heimdall-statusline-portability: $OKS passed, $FAILS failed"
+[ "$FAILS" = 0 ] && exit 0 || exit 1

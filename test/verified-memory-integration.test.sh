@@ -440,7 +440,11 @@ case "$B6_R_LIVE_SYMS" in *PostgresStore*) bad "the lie leaked into the LIVE set
 echo
 if [ "$FAIL" -eq 0 ]; then
   printf '\033[32mINTEGRATION GATE PASSED — all %d assertions across the 6 wired blocks\033[0m\n' "$PASS"
+  # Machine-readable roll-up for test/run-all.sh. Printed LAST on BOTH paths so an
+  # unparseable-but-green suite (indistinguishable from an empty one) is impossible.
+  printf 'verified-memory-integration: %d passed, %d failed\n' "$PASS" "$FAIL"
   exit 0
 fi
 printf '\033[31mINTEGRATION GATE FAILED — %d/%d assertions failed\033[0m\n' "$FAIL" "$((PASS + FAIL))"
+printf 'verified-memory-integration: %d passed, %d failed\n' "$PASS" "$FAIL"
 exit 1

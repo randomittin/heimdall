@@ -226,4 +226,12 @@ wait "$WPID_OTHER" 2>/dev/null || true
 echo ""
 echo "──────────────────────────────────────────────────────────────────────"
 echo "  PASS=$PASS  FAIL=$FAIL"
-[ "$FAIL" -eq 0 ] && { echo "  ALL GREEN"; exit 0; } || { echo "  REGRESSION"; exit 1; }
+if [ "$FAIL" -eq 0 ]; then
+  echo "  ALL GREEN"
+  echo "heimdall-reap-idle: $PASS passed, $FAIL failed"
+  exit 0
+else
+  echo "  REGRESSION"
+  echo "heimdall-reap-idle: $PASS passed, $FAIL failed"
+  exit 1
+fi

@@ -31,7 +31,14 @@ pass=0; fail=0
 ok()  { pass=$((pass+1)); printf '  ok   %s\n' "$1"; }
 bad() { fail=$((fail+1)); printf '  FAIL %s\n' "$1"; }
 
-command -v python3 >/dev/null 2>&1 || { echo "SKIP: python3 unavailable"; exit 0; }
+# A skip must never look like a pass: exit 0 with no roll-up line is exactly how a
+# vacuous gate hides. Report the skip LOUDLY and as a zero-assertion row.
+command -v python3 >/dev/null 2>&1 || {
+  echo "SKIP: python3 unavailable"
+  echo "RESULT: SKIPPED (0 assertions ran — this is NOT a pass)"
+  echo "heimdall-layout: 0 passed, 0 failed (SKIPPED — python3 unavailable)"
+  exit 0
+}
 [ -f "$MOD" ] || { echo "FATAL: hmd_layout.py missing at $MOD"; exit 2; }
 
 echo "== py_compile =="
@@ -39,19 +46,28 @@ if python3 -m py_compile "$MOD" 2>/dev/null; then ok "py_compile clean"; else ba
 
 echo "== unit assertions =="
 # One python process runs every assertion; each prints `ok <name>` / `FAIL <name>`.
-python3 - "$MOD" <<'PY'
+# The REAL per-assertion count (not just this bash-level phase) is written to
+# UNIT_COUNTS_FILE so the summary below reports the true total (py_compile + every
+# named python check) instead of collapsing ~49 checks into one coarse phase.
+UNIT_COUNTS_FILE="$(mktemp "${TMPDIR:-/tmp}/hmd-layout-counts.XXXXXX")"
+python3 - "$MOD" "$UNIT_COUNTS_FILE" <<'PY'
 import sys, os, re, importlib.util
 MOD = sys.argv[1]
+COUNTS_FILE = sys.argv[2]
 spec = importlib.util.spec_from_file_location("hmd_layout", MOD)
 m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 
 ANSI = re.compile(r"\033\[[0-9;]*m")
 rc = 0
+n_ok = 0
+n_bad = 0
 def check(name, cond):
-    global rc
+    global rc, n_ok, n_bad
     if cond:
+        n_ok += 1
         print("  ok   " + name)
     else:
+        n_bad += 1
         print("  FAIL " + name); rc = 1
 
 vw = m.vis_width
@@ -148,12 +164,34 @@ check("tier 30 tiny", wt(30) == "tiny")
 check("pad negative width -> empty", pt("x", -3) == "")
 check("compose empty inputs", m.compose_with_sigil([], [], cols=80, gutter=2) == [])
 
+with open(COUNTS_FILE, "w") as f:
+    f.write("%d %d\n" % (n_ok, n_bad))
 sys.exit(rc)
 PY
-if [ $? -eq 0 ]; then ok "all unit assertions"; else bad "unit assertions (see FAIL lines above)"; fi
+RC=$?
+UNIT_OK=0; UNIT_BAD=0
+if [ -r "$UNIT_COUNTS_FILE" ]; then
+  read -r UNIT_OK UNIT_BAD < "$UNIT_COUNTS_FILE" 2>/dev/null
+fi
+rm -f "$UNIT_COUNTS_FILE"
+case "$UNIT_OK"  in ''|*[!0-9]*) UNIT_OK=0 ;; esac
+case "$UNIT_BAD" in ''|*[!0-9]*) UNIT_BAD=0 ;; esac
+pass=$((pass + UNIT_OK))
+fail=$((fail + UNIT_BAD))
+if [ "$RC" -eq 0 ]; then
+  printf '  ok   all unit assertions (%d checks)\n' "$UNIT_OK"
+else
+  printf '  FAIL unit assertions: %d of %d checks failed (see FAIL lines above)\n' "$UNIT_BAD" "$((UNIT_OK + UNIT_BAD))"
+fi
 
 echo
 echo "== summary =="
 printf 'pass=%d fail=%d\n' "$pass" "$fail"
-[ "$fail" -eq 0 ] || exit 1
-echo "PASS"
+if [ "$fail" -eq 0 ]; then
+  echo "PASS"
+  echo "heimdall-layout: $pass passed, $fail failed"
+  exit 0
+else
+  echo "heimdall-layout: $pass passed, $fail failed"
+  exit 1
+fi
