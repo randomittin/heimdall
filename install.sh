@@ -691,11 +691,19 @@ ensure_claude_mem() {
 #     stops it. It is SELF-DETECTING (passwd database, which $HOME cannot influence), so
 #     unlike HEIMDALL_NO_DREAM_SCHEDULE it does not depend on the caller remembering
 #     anything. The opt-out still works and still wins; this sits underneath it.
-# Prints ONE state word (the caller renders the ✓ line + the disable hint):
+#   - EPHEMERAL FLOOR: the helper also REFUSES (exit 5) when the paths it would pin live
+#     inside a LINKED git worktree. The same incident had a SECOND cause the passwd check
+#     cannot see: that run had a genuine $HOME and still registered a job pointing at
+#     .claude/worktrees/agent-<id>, a checkout built to be reaped. A nightly job pinned to
+#     a reaped path does not fail loudly — it silently never runs again.
+# Prints ONE state word (the caller renders the ✓ line + the disable hint). They are
+# distinct because they are DIFFERENT operator actions, and a state word that collapses
+# two causes into one is how a silent outage survives the next person who looks:
 #   scheduled    — the nightly LaunchAgent was (re)installed + loaded (idempotent)
 #   optout       — HEIMDALL_NO_DREAM_SCHEDULE=1 → skipped by request
 #   unsupported  — not macOS, or launchctl absent → skipped (use the cron/cloud routine)
 #   sandboxed    — synthetic $HOME → the helper refused to touch the real launchd domain
+#   ephemeral    — worktree checkout → the helper refused to pin a job to a disposable tree
 #   skipped      — schedule helper / dream bin missing, or launchctl load failed (non-fatal)
 ensure_dream_schedule() {
   local plugin_dir="$1"
@@ -717,6 +725,7 @@ ensure_dream_schedule() {
   case "$rc" in
     0) printf 'scheduled' ;;
     4) printf 'sandboxed' ;;
+    5) printf 'ephemeral' ;;
     *) printf 'skipped' ;;
   esac
 }
@@ -1406,6 +1415,15 @@ main() {
       _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" dream-schedule succeeded "$DS_T0"
       step_ok "Scheduling nightly /dream (03:00)" \
         "skipped (synthetic HOME — refusing to touch the real launchd domain)" ;;
+    ephemeral)
+      # NOT a failure either: this install is running out of a disposable checkout (a
+      # linked git worktree), so pinning the nightly job here would wire it to a path
+      # that disappears when the tree is reaped — a job that then silently never runs.
+      # Named distinctly from 'sandboxed' so the operator knows the fix is "re-run from
+      # the main checkout", not "fix your HOME".
+      _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" dream-schedule succeeded "$DS_T0"
+      step_ok "Scheduling nightly /dream (03:00)" \
+        "skipped (ephemeral checkout — re-run from the main worktree to schedule)" ;;
     *)  # skipped — helper/dream bin missing or launchctl load failed. Non-fatal.
       _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" dream-schedule failed "$DS_T0" \
         dream-schedule-unavailable "schedule helper missing or launchctl load failed"
