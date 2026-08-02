@@ -12,7 +12,7 @@
 # test/f1-frontdoor.test.sh, which proves the standalone units.
 #
 # HOW IT DRIVES THE LAUNCHER WITHOUT A LIVE MODEL CALL (mirrors the v2.0.3
-# first-run-ordering probe in test/install-stranger.sh):
+# first-run-ordering probe in test/install-stranger.test.sh):
 #   - HEIMDALL_TRACE_ORDER=<file>  — the launcher appends one ordered marker per
 #     phase (orient, setup:auth, setup:companion, setup:skills, resume,
 #     persona-check, onboard, launch:task) and SHORT-CIRCUITS just before the real

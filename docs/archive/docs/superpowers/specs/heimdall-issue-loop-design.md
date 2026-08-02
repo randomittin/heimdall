@@ -261,7 +261,7 @@ with the resolution (PR url + SI-2 evidence summary) -> move `id` to `resolved{m
   by `.heimdall/` gitignore). The committed config holds ONLY the env-var NAME, never the value. **No token literal ever lands in a committed file.**
 - **Lazy/optional (MarkItDown clean-install pattern):** if a connector's creds env is absent -> `health().active == False`,
   the source is simply **inactive**, `fetch_issues` returns `[]`, the loop skips it — **no crash, no abort.** With NO connectors
-  configured the loop is **inert**: base install + stranger-test (`test/install-stranger.sh`) green, exactly the MarkItDown
+  configured the loop is **inert**: base install + stranger-test (`test/install-stranger.test.sh`) green, exactly the MarkItDown
   graceful-skip contract (`test/markitdown.test.sh` (c)).
 - **gitleaks gate respected:** the existing `bin/secret-scan` + `.gitleaks.toml` catch any planted credential in the diff.
   **Do NOT add a broad allowlist glob** to `.gitleaks.toml` for this feature — only specific fixture files if a test must carry
@@ -329,7 +329,7 @@ the real seams end-to-end. Each spec **Harness assertion** + **Acceptance** bull
 | 4 | never self-merge / self-close (human gate holds) | After `PR_OPEN`: assert source issue still OPEN (mock `close_issue` NOT called), PR NOT merged; grep proves no `merge_pr` symbol exists in any `bin/lib/issue_*.py` |
 | 4b | on human merge -> close + writeback | Invoke `issue-pr on-merge <pr>` with mock-merged PR -> mock `close_issue` + `post_resolution` called once each; `id` -> `resolved{merged:true}` |
 | 5 | 4th adapter slots in w/o loop edits | Register a `FakeJiraConnector` via a new module + import line; assert it `fetch`es into the queue with ZERO edits to `issue_loop.py` / `issue_queue.py` (git diff empty for those) |
-| 6 | no-connectors -> inert + stranger-test green | Empty config -> `issue-loop run-once` exits 0 inert (nothing picked); `test/install-stranger.sh` still green |
+| 6 | no-connectors -> inert + stranger-test green | Empty config -> `issue-loop run-once` exits 0 inert (nothing picked); `test/install-stranger.test.sh` still green |
 | 7 | planted credential leak caught by gitleaks | Stage a fixture config carrying a `sk_live_`-shaped token -> `bin/secret-scan` exits 1 (finding); a clean config exits 0 |
 
 **Falsifiability:** assertion #3 (cardinal rule) and #4 (human gate) are the load-bearing red tests — each must be shown to go
@@ -347,7 +347,7 @@ RED on a known-bad build (a loop that PR's on agent-claim fails #3; a loop with 
 - **Pluggable-adapter seam** — pattern mirrored from `bin/lib/designmatch_targets/__init__.py` (ABC + registry + register/get/available + launch-import line).
 - **Runtime-home + atomic-write discipline** — `${HEIMDALL_HOME:-<repo>/.heimdall}`, `.tmp`->`os.replace`, sorted keys (from SI-1/SI-2).
 - **House CLI shape** — bash wrapper over python lib, `sed`-extracted `--help`, exit-code conventions (from `heimdall-redum`/`heimdall-attest`).
-- **MarkItDown lazy/optional + stranger-test** — `test/markitdown.test.sh` graceful-skip + `test/install-stranger.sh` inert-when-unconfigured.
+- **MarkItDown lazy/optional + stranger-test** — `test/markitdown.test.sh` graceful-skip + `test/install-stranger.test.sh` inert-when-unconfigured.
 - **Claim-before-work dedup** — heimdall-ledger "claim surfaces before editing" discipline, applied to in-flight tracking.
 - **Real Heimdall task + full gates** — the fix step IS the existing coder path; the loop sequences it, adds no new fix engine.
 
