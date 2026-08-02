@@ -7,51 +7,109 @@
 # HAID ledger, so when one dies, hangs, or fails, heimdall has ZERO visibility —
 # the harness still shows it in its FleetView and the swarm count keeps counting a
 # corpse. This tool gives heimdall its OWN honest view: it enumerates the harness's
-# per-subagent task-output files, classifies each by staleness + terminal marker,
-# serves a correct LIVE count for the statusline, and records a reaper decision in
-# heimdall's own registry so a dead/stale subagent stops inflating the count.
+# per-subagent task-output files, classifies each against the PARENT SESSION
+# TRANSCRIPT (the only place a terminal signal actually exists), serves a correct
+# LIVE count for the statusline, and records a reaper decision in heimdall's own
+# registry so a dead/stale/finished subagent stops inflating the count.
 #
 # HONEST BOUNDARY (do not overclaim) ──────────────────────────────────────────
 # The harness's task-output files are NOT ours — we NEVER delete them. `reap` only
 # writes to heimdall's own reaped-registry so heimdall's list/count exclude the
 # corpse thereafter. This tool CANNOT and DOES NOT remove an entry from Claude
 # Code's FleetView; that surface is owned by the harness. What we give heimdall is
-# real visibility + a stale/failed reaper + a correct live-agent count — nothing
-# more, nothing faked.
+# real visibility + a reaper + a correct live-agent count — nothing more, nothing
+# faked.
 #
 # THE DATA SOURCE ─────────────────────────────────────────────────────────────
-# The harness writes one file per spawned subagent under the session's task dir:
-#   <tmp>/claude-<uid>/<slugified-cwd>/<session-id>/tasks/<task-id>.output
-# Each `.output` is either a symlink to the subagent's live transcript jsonl or a
-# plain file; either way its (symlink-followed) mtime = the subagent's LAST
-# ACTIVITY. Presence = spawned. now-mtime = staleness. We fail CLOSED to "no
-# agents" if the dir can't be resolved — never crash, never fabricate.
+# TWO sources, because neither alone tells the truth.
+#
+# 1. The task dir — one file per ASYNC (unnamed) subagent:
+#      <tmp>/claude-<uid>/<slugified-cwd>/<session-id>/tasks/<task-id>.output
+#    Each `.output` is either a symlink to the subagent's live transcript jsonl or
+#    a plain file; either way its (symlink-followed) mtime = the subagent's LAST
+#    ACTIVITY. Presence = spawned. now-mtime = staleness.
+#
+#    There is NO sibling `<task-id>.status` file. The harness never writes one —
+#    verified: `find /private/tmp/claude-501 -name '*.status'` returns ZERO hits
+#    across ~50 session dirs that hold 50 `.output` files. Any code keying off
+#    `.status` is unreachable, which is why none remains here.
+#
+# 2. The PARENT SESSION TRANSCRIPT — the only real terminal signal:
+#      ~/.claude/projects/<slugified-cwd>/<session-id>.jsonl
+#    Derived from the task dir (its parent dir IS the session id), so we always read
+#    the transcript belonging to the SAME session we enumerated — never a stranger's.
+#    Two record shapes matter:
+#      - a `user` record whose STRING content carries
+#          <task-notification><task-id>...</task-id><tool-use-id>...</tool-use-id>
+#          <status>completed|failed</status></task-notification>
+#        => the subagent stopped. `<status>` is the ONLY real failed/done signal.
+#      - an `assistant` record with a content block
+#          {"type":"tool_use","name":"Agent","input":{...}}
+#        => a spawn. An `input.name` makes it a MAILBOX agent (see below).
+#
+# THE MAILBOX ZOMBIE CLASS ────────────────────────────────────────────────────
+# If the Agent tool input carries a `name`, the harness makes the subagent a
+# persistent MAILBOX agent: its tool_result reads "The agent is now running and
+# will receive instructions via mailbox." It NEVER self-terminates and NEVER emits
+# a task-notification. Measured across every readable transcript on this machine:
+# named spawns 1/103 ever notified; unnamed spawns 183/209 notified. These sit in
+# FleetView as `idle` forever. `orphans` exists to name them so an operator can see
+# exactly which spawns leaked — the fix is to stop passing `name` for fire-and-
+# forget work.
+#
+# WHAT WE CANNOT PROVE (honest limit) ─────────────────────────────────────────
+# A mailbox agent has NO task-id and NO `.output` file — its spawn tool_result
+# returns a handle like `agent_id: <name>@session-xxxx`, not a hex task-id, and
+# 0 of 103 named agent_ids ever appeared as a `.output` file on disk. So mailbox
+# agents are enumerated FROM THE TRANSCRIPT and keyed by that handle, with their
+# age taken from the spawn record's timestamp (there is no mtime to read). They are
+# deliberately NOT correlated to any task-dir row, because no such row exists — we
+# classify only what we can prove and never guess a mapping.
+#
+# We fail CLOSED at every step: no task dir, no transcript, no python3, or an
+# unparseable transcript all degrade to pure staleness classification. Never crash,
+# never fabricate.
 #
 # SUBCOMMANDS ─────────────────────────────────────────────────────────────────
-#   list [--json]   enumerate spawned subagents: id, age(s), state
-#                   states: live | stale | failed | done | reaped
-#   count           print the number of LIVE subagents (statusline consumes this)
-#   reap [--json]   record stale/terminal subagents in heimdall's reaped-registry
-#                   (idempotent); print what was reaped. Never touches harness files.
+#   list [--json]    enumerate subagents: id, age(s), state, name
+#                    states: live | stale | done | failed | mailbox | reaped
+#   count            print the number of LIVE subagents (statusline consumes this)
+#   orphans [--json] print ONLY the mailbox agents (named spawns that never
+#                    notified) with their names — the leak report
+#   reap [--json]    record done/failed/stale/mailbox subagents in heimdall's
+#                    reaped-registry (idempotent); print what was reaped.
+#                    Never touches harness files.
 #   -h | --help
 #
 # STATE MODEL ─────────────────────────────────────────────────────────────────
 #   reaped  — already recorded in the reaped-registry (excluded from live + count)
-#   failed  — a sibling <id>.status marks failure/error (terminal)
-#   done    — a sibling <id>.status marks completion (terminal)
+#   failed  — a task-notification for this task-id carried <status>failed</status>
+#   done    — a task-notification for this task-id carried <status>completed</status>
+#   mailbox — spawned WITH a `name` and never notified: a persistent mailbox agent
+#             that will never finish on its own. NOT counted as live.
 #   stale   — age >= HMD_AGENT_STALE_SECS (default 900) and not terminal
-#   live    — age < threshold, not terminal, not reaped   ← the ONLY counted state
+#   live    — age < threshold, not terminal, not reaped   <- the ONLY counted state
+#
+#   RESUMED SUBAGENTS: the harness's own notification note says a task-notification
+#   fires each time an agent stops, and the same task-id may notify again after the
+#   user resumes it. So a notification is NOT permanently terminal: if the `.output`
+#   was written AFTER the notification timestamp, the subagent is working again and
+#   we classify it by age (live/stale), not done/failed. Flush jitter can only push
+#   a just-finished agent back to `live` for one stale window — the SAFE direction.
+#   The unsafe direction (reaping an agent that is actively working) cannot happen.
 #
 # ENV ─────────────────────────────────────────────────────────────────────────
 #   HMD_AGENT_STALE_SECS   live/stale threshold in seconds (default 900) — the
 #                          SAME convention agent-pool health-check uses.
 #   HMD_AGENT_TASKDIR      override the task dir (skips discovery). Used by tests.
+#   HMD_AGENT_TRANSCRIPT   override the session transcript jsonl (skips derivation).
+#                          Used by tests. Ignored unless it is a readable file.
 #   HMD_AGENT_REAPED_FILE  override the reaped-registry path (default
 #                          ${HEIMDALL_HOME:-$HOME/.heimdall}/agents-reaped.json).
 #   HMD_AGENT_CWD          cwd whose slug is used for task-dir discovery (default PWD).
 #   HMD_NOW                override "now" epoch seconds (deterministic tests).
 #
-# Exit: 0 always for list/count/reap (fail-closed, degraded, never crashes);
+# Exit: 0 always for list/count/orphans/reap (fail-closed, degraded, never crashes);
 #       2 only on usage error.
 set -uo pipefail
 
@@ -64,6 +122,12 @@ NOW="${HMD_NOW:-}"
 case "$NOW" in ''|*[!0-9]*) NOW="$(date +%s)" ;; esac
 HMD_HOME="${HEIMDALL_HOME:-${HOME:-}/.heimdall}"
 REAPED_FILE="${HMD_AGENT_REAPED_FILE:-$HMD_HOME/agents-reaped.json}"
+
+# Transcript-derived facts, loaded ONCE per enumerate(). Packed into strings
+# because bash 3.2 (macOS default) has no associative arrays.
+FACT_DONE=" "      # " <task-id>:<notify-epoch> ... "
+FACT_FAILED=" "    # " <task-id>:<notify-epoch> ... "
+FACT_MAILBOX=""    # rows of "<handle>\t<name>\t<spawn-epoch>\n"
 
 # ── portable mtime (follow symlink → the transcript's real last-activity time) ─
 _mtime() { stat -L -f%m "$1" 2>/dev/null || stat -L -c%Y "$1" 2>/dev/null || echo 0; }
@@ -106,6 +170,165 @@ resolve_taskdir() {
   printf '%s' "$newest"
 }
 
+# ── transcript discovery ──────────────────────────────────────────────────────
+# The task dir is <...>/<slug>/<session-id>/tasks, so the session id and cwd slug
+# are both readable straight off the path — that yields the EXACT transcript for the
+# session we just enumerated, with no cross-session guessing. Fail CLOSED to "".
+resolve_transcript() {
+  if [ -n "${HMD_AGENT_TRANSCRIPT:-}" ]; then
+    if [ -f "$HMD_AGENT_TRANSCRIPT" ] && [ -r "$HMD_AGENT_TRANSCRIPT" ]; then
+      printf '%s' "$HMD_AGENT_TRANSCRIPT"
+    fi
+    return 0
+  fi
+  local taskdir base sess slug p
+  taskdir="${1:-}"
+  [ -n "$taskdir" ] || return 0
+  taskdir="${taskdir%/}"
+  case "$taskdir" in */tasks) ;; *) return 0 ;; esac
+  base="${taskdir%/tasks}"
+  sess="${base##*/}"
+  slug="${base%/*}"; slug="${slug##*/}"
+  [ -n "$sess" ] && [ -n "$slug" ] || return 0
+  p="${HOME:-}/.claude/projects/$slug/$sess.jsonl"
+  if [ -f "$p" ] && [ -r "$p" ]; then
+    printf '%s' "$p"
+  fi
+  return 0
+}
+
+# ── transcript parse (python3: no pip deps, handles the file's very long lines) ─
+# Emits TSV facts, one per line:
+#   D<TAB><task-id><TAB><notify-epoch>          notified, status completed
+#   F<TAB><task-id><TAB><notify-epoch>          notified, status failed
+#   M<TAB><handle><TAB><name><TAB><spawn-epoch> named spawn that never notified
+# Silent + empty on any error (missing python3, unreadable file, garbage content).
+# Output is written only after the whole file parses, so a mid-read failure yields
+# NO facts and the caller degrades to pure staleness — the fail-closed direction.
+transcript_facts() {
+  local tr="${1:-}"
+  [ -n "$tr" ] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+  python3 - "$tr" 2>/dev/null <<'PYEOF'
+import calendar, json, re, sys
+
+TS_RE = re.compile(r'(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})')
+AID_RE = re.compile(r'agent_?[Ii]d:\s*(\S+)')
+WS_RE = re.compile(r'[\t\r\n]+')
+
+
+def to_epoch(ts):
+    """ISO8601-Z timestamp -> epoch seconds; 0 when absent or unparseable."""
+    if not isinstance(ts, str):
+        return 0
+    m = TS_RE.match(ts)
+    if not m:
+        return 0
+    try:
+        y, mo, d, h, mi, s = (int(x) for x in m.groups())
+        return calendar.timegm((y, mo, d, h, mi, s, 0, 1, -1))
+    except (ValueError, OverflowError):
+        return 0
+
+
+def clean(s):
+    """Flatten whitespace so a value can never break the TSV contract."""
+    return WS_RE.sub(' ', s).strip()
+
+
+path = sys.argv[1] if len(sys.argv) > 1 else ''
+notif = {}          # task-id -> [state, epoch]  (latest notification wins)
+notif_tuid = set()  # tool-use ids that produced a notification
+spawn = {}          # tool_use id -> [name, epoch]
+agent_id = {}       # tool_use id -> agent id / handle from the spawn's tool_result
+
+try:
+    fh = open(path, encoding='utf-8', errors='replace')
+except OSError:
+    sys.exit(0)
+
+with fh:
+    for line in fh:
+        # Cheap prefilter: transcripts are huge and mostly irrelevant records.
+        if ('task-notification' not in line and '"Agent"' not in line
+                and 'via mailbox' not in line
+                and 'Async agent launched' not in line):
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(rec, dict):
+            continue
+        msg = rec.get('message')
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get('content')
+        ts = to_epoch(rec.get('timestamp'))
+
+        if isinstance(content, str):
+            if '<task-notification>' not in content:
+                continue
+            m = re.search(r'<status>([^<]*)</status>', content)
+            status = (m.group(1) if m else '').lower()
+            state = 'F' if ('fail' in status or 'error' in status) else 'D'
+            for tid in re.findall(r'<task-id>([^<]+)</task-id>', content):
+                tid = clean(tid)
+                if not tid:
+                    continue
+                prev = notif.get(tid)
+                if prev is None or ts >= prev[1]:
+                    notif[tid] = [state, ts]
+            for tu in re.findall(r'<tool-use-id>([^<]+)</tool-use-id>', content):
+                tu = clean(tu)
+                if tu:
+                    notif_tuid.add(tu)
+            continue
+
+        if not isinstance(content, list):
+            continue
+        for b in content:
+            if not isinstance(b, dict):
+                continue
+            if b.get('type') == 'tool_use' and b.get('name') == 'Agent':
+                tu = b.get('id')
+                if not isinstance(tu, str) or not tu:
+                    continue
+                inp = b.get('input')
+                nm = inp.get('name') if isinstance(inp, dict) else None
+                spawn[tu] = [clean(nm) if isinstance(nm, str) else '', ts]
+            elif b.get('type') == 'tool_result':
+                tu = b.get('tool_use_id')
+                if not isinstance(tu, str) or not tu:
+                    continue
+                t = b.get('content')
+                if isinstance(t, list):
+                    t = ' '.join(x.get('text', '') for x in t
+                                 if isinstance(x, dict) and isinstance(x.get('text'), str))
+                if not isinstance(t, str):
+                    continue
+                m = AID_RE.search(t)
+                if m:
+                    agent_id[tu] = clean(m.group(1))
+
+out = []
+for tid, pair in notif.items():
+    out.append('%s\t%s\t%d' % (pair[0], tid, pair[1]))
+
+for tu, pair in spawn.items():
+    name, ts = pair
+    if not name:
+        continue                      # unnamed spawns are task-dir rows, not mailbox
+    aid = agent_id.get(tu, '')
+    if tu in notif_tuid or (aid and aid in notif):
+        continue                      # it DID notify -> not a mailbox zombie
+    out.append('M\t%s\t%s\t%d' % (aid or tu, name, ts))
+
+if out:
+    sys.stdout.write('\n'.join(out) + '\n')
+PYEOF
+}
+
 # ── reaped-registry membership (loaded ONCE; no subprocess per file) ──────────
 # A space-padded id list so `case` can test membership without spawning grep.
 load_reaped() {
@@ -116,45 +339,113 @@ load_reaped() {
   printf ' %s ' "$ids"
 }
 
-# ── terminal marker: a sibling <id>.status whose content names the outcome ────
-# Cheap: only touched when the status file exists (rare). Absent → not terminal.
-_terminal_state() {
-  local sfile="$1" s=""
-  [ -f "$sfile" ] || return 0
-  s="$(tr '[:upper:]' '[:lower:]' < "$sfile" 2>/dev/null)"
-  case "$s" in
-    *fail*|*error*)        printf 'failed' ;;
-    *done*|*complete*)     printf 'done'   ;;
+# ── packed-fact lookup: " id:epoch " → epoch (bash 3.2 has no assoc arrays) ───
+# Matches on " $id:" so one id can never match another's prefix.
+_fact_epoch() {
+  local packed="$1" id="$2" rest
+  case "$packed" in
+    *" $id:"*)
+      rest="${packed#*" $id:"}"
+      printf '%s' "${rest%% *}"
+      ;;
   esac
 }
 
-# ── core enumeration: emits `id<TAB>age<TAB>state` per subagent, sorted by id ──
-# Shared by list/count/reap so classification lives in exactly one place.
+# ── core enumeration: emits `id<TAB>age<TAB>state<TAB>name` per subagent ──────
+# Shared by list/count/orphans/reap so classification lives in exactly one place.
 enumerate() {
-  local taskdir reaped f id mt age term state
+  local taskdir transcript reaped facts f id mt age state nstate nep
+  local key nm sts mage mstate kind a b c
   taskdir="$(resolve_taskdir)"
-  [ -n "$taskdir" ] && [ -d "$taskdir" ] || return 0   # fail-closed: no agents
+  transcript="$(resolve_transcript "$taskdir")"
   reaped="$(load_reaped)"
-  for f in "$taskdir"/*.output; do
-    [ -e "$f" ] || continue
-    id="${f##*/}"; id="${id%.output}"
-    mt="$(_mtime "$f")"
-    age=$(( NOW - mt ))
-    [ "$age" -lt 0 ] && age=0
-    state=""
-    case "$reaped" in *" $id "*) state="reaped" ;; esac
-    if [ -z "$state" ]; then
-      term="$(_terminal_state "$taskdir/$id.status")"
-      if [ -n "$term" ]; then
-        state="$term"
-      elif [ "$age" -ge "$STALE_SECS" ]; then
-        state="stale"
-      else
-        state="live"
-      fi
+
+  FACT_DONE=" "; FACT_FAILED=" "; FACT_MAILBOX=""
+  facts="$(transcript_facts "$transcript")"
+  if [ -n "$facts" ]; then
+    while IFS=$'\t' read -r kind a b c; do
+      case "$kind" in
+        D) [ -n "$a" ] && FACT_DONE="$FACT_DONE$a:${b:-0} " ;;
+        F) [ -n "$a" ] && FACT_FAILED="$FACT_FAILED$a:${b:-0} " ;;
+        M) [ -n "$a" ] && FACT_MAILBOX="$FACT_MAILBOX$a"$'\t'"$b"$'\t'"${c:-0}"$'\n' ;;
+      esac
+    done <<< "$facts"
+  fi
+
+  {
+    # ── task-dir rows: the async (unnamed) subagents ──────────────────────────
+    if [ -n "$taskdir" ] && [ -d "$taskdir" ]; then
+      for f in "$taskdir"/*.output; do
+        [ -e "$f" ] || continue
+        id="${f##*/}"; id="${id%.output}"
+        mt="$(_mtime "$f")"
+        age=$(( NOW - mt ))
+        [ "$age" -lt 0 ] && age=0
+        state=""
+        case "$reaped" in *" $id "*) state="reaped" ;; esac
+        if [ -z "$state" ]; then
+          nstate=""
+          nep="$(_fact_epoch "$FACT_FAILED" "$id")"
+          if [ -n "$nep" ]; then
+            nstate="failed"
+          else
+            nep="$(_fact_epoch "$FACT_DONE" "$id")"
+            [ -n "$nep" ] && nstate="done"
+          fi
+          # Resumed: it wrote AFTER it notified → working again, not terminal.
+          # Only applies when the notify time parsed; otherwise trust the notify.
+          if [ -n "$nstate" ] && [ "${nep:-0}" -gt 0 ] 2>/dev/null \
+             && [ "$mt" -gt "$nep" ] 2>/dev/null; then
+            nstate=""
+          fi
+          if [ -n "$nstate" ]; then
+            state="$nstate"
+          elif [ "$age" -ge "$STALE_SECS" ]; then
+            state="stale"
+          else
+            state="live"
+          fi
+        fi
+        printf '%s\t%s\t%s\t%s\n' "$id" "$age" "$state" ""
+      done
     fi
-    printf '%s\t%s\t%s\n' "$id" "$age" "$state"
-  done | sort
+
+    # ── mailbox rows: named spawns that never notified (no task-id, no .output) ─
+    if [ -n "$FACT_MAILBOX" ]; then
+      while IFS=$'\t' read -r key nm sts; do
+        [ -n "$key" ] || continue
+        case "$sts" in ''|*[!0-9]*) sts=0 ;; esac
+        if [ "$sts" -gt 0 ] 2>/dev/null; then
+          mage=$(( NOW - sts ))
+          [ "$mage" -lt 0 ] && mage=0
+        else
+          mage=0
+        fi
+        mstate="mailbox"
+        case "$reaped" in *" $key "*) mstate="reaped" ;; esac
+        printf '%s\t%s\t%s\t%s\n' "$key" "$mage" "$mstate" "$nm"
+      done <<< "$FACT_MAILBOX"
+    fi
+  } | sort
+}
+
+# ── shared renderers ─────────────────────────────────────────────────────────
+rows_to_json() {
+  jq -R -s '
+    split("\n") | map(select(length>0) | split("\t"))
+    | map({id: .[0], age_secs: (.[1]|tonumber), state: .[2],
+           name: (if ((.[3] // "") == "") then null else .[3] end)})'
+}
+
+rows_to_table() {
+  # 42 wide: mailbox handles are "<name>@session-xxxxxxxx" and run past 40 chars in
+  # practice, so a narrower id column leaves the real rows ragged.
+  local id age state name
+  printf '%-42s %8s  %-8s %s\n' "SUBAGENT" "AGE(s)" "STATE" "NAME"
+  while IFS=$'\t' read -r id age state name; do
+    [ -n "$id" ] || continue
+    printf '%-42s %8s  %-8s %s\n' "$id" "$age" "$state" "$name"
+  done
 }
 
 # ── subcommands ───────────────────────────────────────────────────────────────
@@ -164,31 +455,46 @@ cmd_list() {
   rows="$(enumerate)"
   if [ -n "$as_json" ]; then
     if [ -z "$rows" ]; then echo '[]'; return 0; fi
-    printf '%s\n' "$rows" | jq -R -s '
-      split("\n") | map(select(length>0) | split("\t"))
-      | map({id: .[0], age_secs: (.[1]|tonumber), state: .[2]})'
+    printf '%s\n' "$rows" | rows_to_json
     return 0
   fi
   if [ -z "$rows" ]; then
     echo "no tracked subagents"
     return 0
   fi
-  printf '%-20s %8s  %s\n' "SUBAGENT" "AGE(s)" "STATE"
-  printf '%s\n' "$rows" | while IFS=$'\t' read -r id age state; do
-    printf '%-20s %8s  %s\n' "$id" "$age" "$state"
-  done
+  printf '%s\n' "$rows" | rows_to_table
 }
 
 cmd_count() {
   # LIVE only — the statusline's authoritative live-subagent count. Stale, terminal
-  # (failed/done), and reaped subagents are all excluded, so a corpse never inflates.
+  # (done/failed), mailbox, and reaped subagents are all excluded, so a corpse never
+  # inflates the number.
   local n
   n="$(enumerate | awk -F'\t' '$3=="live"' | wc -l | tr -d ' ')"
   printf '%s\n' "${n:-0}"
 }
 
+cmd_orphans() {
+  # The leak report: named spawns the harness turned into persistent mailbox agents.
+  # They never notify and never self-terminate, so they are the ones an operator has
+  # to stop creating.
+  local as_json="" rows
+  [ "${1:-}" = "--json" ] && as_json=1
+  rows="$(enumerate | awk -F'\t' '$3=="mailbox"')"
+  if [ -n "$as_json" ]; then
+    if [ -z "$rows" ]; then echo '[]'; return 0; fi
+    printf '%s\n' "$rows" | rows_to_json
+    return 0
+  fi
+  if [ -z "$rows" ]; then
+    echo "no mailbox agents (no named spawns leaked)"
+    return 0
+  fi
+  printf '%s\n' "$rows" | rows_to_table
+}
+
 cmd_reap() {
-  local as_json="" rows reap_ids reason id age state now added
+  local as_json="" rows reason id age state name now added tmp
   [ "${1:-}" = "--json" ] && as_json=1
   rows="$(enumerate)"
   # Ensure the registry exists as a JSON object so jq can merge into it.
@@ -197,17 +503,18 @@ cmd_reap() {
   now="$(now_iso)"
   added=""   # newline list of "id reason" recorded THIS run (idempotency proof)
   if [ -n "$rows" ]; then
-    while IFS=$'\t' read -r id age state; do
+    while IFS=$'\t' read -r id age state name; do
       case "$state" in
-        stale)         reason="stale" ;;
-        failed)        reason="failed" ;;
-        done)          reason="done" ;;
-        *)             continue ;;   # live + already-reaped are never (re)recorded
+        stale)    reason="stale" ;;
+        failed)   reason="failed" ;;
+        done)     reason="done" ;;
+        mailbox)  reason="mailbox" ;;
+        *)        continue ;;   # live + already-reaped are never (re)recorded
       esac
       # Merge one record into the registry; jq is the single writer (atomic replace).
       if tmp="$(mktemp "${REAPED_FILE}.XXXXXX" 2>/dev/null)"; then
-        if jq --arg id "$id" --arg at "$now" --arg r "$reason" \
-              '. + {($id): {reaped_at:$at, reason:$r}}' \
+        if jq --arg id "$id" --arg at "$now" --arg r "$reason" --arg n "$name" \
+              '. + {($id): {reaped_at:$at, reason:$r, name:(if $n=="" then null else $n end)}}' \
               "$REAPED_FILE" > "$tmp" 2>/dev/null; then
           mv "$tmp" "$REAPED_FILE" 2>/dev/null || rm -f "$tmp" 2>/dev/null
           added="$added$id $reason"$'\n'
@@ -234,14 +541,16 @@ cmd_reap() {
   done
 }
 
-usage() { sed -n '2,55p' "$0" | sed 's/^# \{0,1\}//'; }
+# Print the header comment block verbatim — never drifts as the header grows.
+usage() { awk 'NR>1 && /^#/ { sub(/^# ?/, ""); print; next } NR>1 { exit }' "$0"; }
 
 main() {
   local sub="${1:-}"
   case "$sub" in
-    list)   shift; cmd_list "$@" ;;
-    count)  shift; cmd_count "$@" ;;
-    reap)   shift; cmd_reap "$@" ;;
+    list)    shift; cmd_list "$@" ;;
+    count)   shift; cmd_count "$@" ;;
+    orphans) shift; cmd_orphans "$@" ;;
+    reap)    shift; cmd_reap "$@" ;;
     -h|--help|help|'') usage ;;
     *) echo "error: unknown subcommand: $sub" >&2; usage >&2; exit 2 ;;
   esac
