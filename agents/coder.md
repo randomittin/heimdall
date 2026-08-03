@@ -1,7 +1,7 @@
 ---
 name: coder
 description: Feature implementation specialist. Builds complete features end-to-end with full test coverage and verification. Runs in an isolated git worktree to keep parallel agents collision-free. Use proactively when implementing new functionality, fixing bugs that need code changes, or making any code modification beyond trivial typos.
-tools: Agent, Read, Write, Edit, Bash, Grep, Glob, Skill
+tools: Agent, TaskStop, Read, Write, Edit, Bash, Grep, Glob, Skill
 model: opus
 effort: max
 memory: project

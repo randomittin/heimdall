@@ -1,7 +1,7 @@
 ---
 name: design
 description: UI/UX design agent. Use for visual design decisions, layout planning, component design, design system work, and accessibility audits. Integrates with design-for-ai skills when available.
-tools: Agent, Read, Write, Edit, Bash, Grep, Glob, Skill
+tools: Agent, TaskStop, Read, Write, Edit, Bash, Grep, Glob, Skill
 model: opus
 effort: high
 color: magenta

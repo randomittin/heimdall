@@ -1,7 +1,7 @@
 ---
 name: heimdall
 description: Autonomous superskill manager. Use proactively for any multi-step development task. Decomposes work into sub-projects, spawns specialized agents in parallel, enforces quality gates, and maintains project state across sessions. Thinks like a CTO.
-tools: Agent, Read, Write, Edit, Bash, Grep, Glob, Skill, TodoWrite
+tools: Agent, SendMessage, TaskStop, Read, Write, Edit, Bash, Grep, Glob, Skill, TodoWrite
 model: opus
 memory: project
 effort: max
