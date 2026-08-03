@@ -566,11 +566,12 @@ Full roster (all require `hmd:` prefix): `hmd:architect`, `hmd:planner`, `hmd:wa
 - Wave agents run in parallel within each wave
 - Each wave-executor gets FRESH context: plan file + context doc + relevant source files only
 - Never pass accumulated conversation history between waves — this prevents context bloat and hallucination drift
-- For large waves (10 parallel agents): consider Agent Teams for shared task lists
+- For large waves (10 parallel agents): use the wave-ordered role template in `skills/heimdall/references/agent-templates.md` ("Parallel Role Team Template"). Do NOT reach for harness Agent Teams — teammates are named, and named spawns are denied (R13)
 
 ### 4c. Agent Instructions
 
 When spawning an agent, provide:
+0. **Role identity in `description:`, never `name:`** — `description: "auth module — src/auth/**"`. A spawn carrying `name:` is DENIED (exit 2) by the `PreToolUse` `Agent` hook: `name:` assigns mailbox residency at spawn time, so that agent never self-terminates, never returns a result, and cannot be terminated by you. Measured: 0/43 named spawns completed vs 59/66 unnamed. `HEIMDALL_ALLOW_NAMED_AGENT=1` exists only for a long-lived agent you will `SendMessage` — which you cannot do from here. (R13)
 1. **Specific scope**: exactly what to build/test/review, with file boundaries
 2. **Skills to invoke**: tell the agent which skills to use via `Skill(skill: "name")`. Be explicit:
    - Coder agents: `superpowers:test-driven-development`, `superpowers:systematic-debugging`, and domain-specific skills
