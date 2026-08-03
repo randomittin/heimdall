@@ -34,7 +34,9 @@ TOOL CALLS: If 2+ tool calls have no data dependency → send ALL in ONE message
 
 AGENTS: If 2+ tasks are independent → spawn parallel agents (`run_in_background: true`). NO EXCEPTIONS.
 
-AGENT NAMING: Spawn UNNAMED. Passing `name:` puts the harness in persistent MAILBOX mode ("The agent is now running and will receive instructions via mailbox") — that agent never self-terminates and never emits a `task-notification`, so the orchestrator waits forever for a result that cannot arrive. Measured over one session: 0/43 named spawns completed vs 59/66 unnamed. `name:` is opt-in ONLY for a genuinely long-lived conversational agent you will `SendMessage` and accept as session-resident; every other named spawn is a leak. Identify a spawn's work via `description:`, never `name:`. (conventions R13)
+AGENT NAMING: Spawn UNNAMED. Passing `name:` puts the harness in persistent MAILBOX mode ("The agent is now running and will receive instructions via mailbox") — that agent never self-terminates and never emits a `task-notification`, so awaiting the spawn call waits forever for a result that cannot arrive. Measured over one session: 0/43 named spawns completed vs 59/66 unnamed. `name:` is opt-in ONLY for a genuinely long-lived conversational agent you will `SendMessage` and accept as session-resident; every other named spawn is a leak. Identify a spawn's work via `description:`, never `name:`. (conventions R13)
+
+A named agent is NOT unkillable: `TaskStop` closes it by name or agent ID and `SendMessage` resumes it. What you lose with `name:` is the RESULT on the spawn call, not control of the agent. Close what you open → "Closing Idle Agents" below.
 
 R13 IS ENFORCED, NOT ADVISORY: the `PreToolUse` `Agent` hook DENIES (exit 2) any spawn carrying `name:`, with the reason on stderr. To take the opt-in above, set `HEIMDALL_ALLOW_NAMED_AGENT=1` — that is the only way through, and it is deliberate. The gate fails CLOSED: a payload it cannot parse is denied, never waved through. Proof: `bash test/agent-name-gate.test.sh`.
 
@@ -49,6 +51,24 @@ Violating parallelism is a bug. Sequential tool calls for independent operations
 The hook `bin/parallelism-tracker` is invoked on every Read/Bash/Edit/Write to nudge after 3 consecutive solo turns and grade the session at end. Aim for `parallel_ratio ≥ 0.5` in `.planning/metrics.jsonl`.
 
 TIMELINES: NEVER estimate work in weeks or months. AI agents run in parallel — human work-week cadence is meaningless. Phases that have no dependency run simultaneously, not sequentially. "Wave 0: ~90 min (4 parallel agents)" is RIGHT. "Phase 0: Weeks 1-2" is WRONG.
+
+## Closing Idle Agents — automatic, no human input
+
+You spawn agents. You close them. Nobody asks you to.
+
+**The signal already arrives.** When a spawned agent parks, the harness delivers an `idle_notification` to the parent: `{"type":"idle_notification","from":"<agent name>","idleReason":"available"}`.
+
+**THE RULE: on an `idle_notification` from an agent whose work is complete, call `TaskStop` on it.** Same turn, no confirmation prompt. `TaskStop` takes a background task ID, or a teammate / named background agent by agent ID or name — so the notification's `from` is a valid argument.
+
+Judgement, not reflex:
+
+- **Delivered its result and parked** → stop it.
+- **Deliberately resident** for a multi-turn conversation you intend to continue via `SendMessage` → keep it, and say so explicitly ("keeping <name>: still driving it for X"). A keep you cannot justify in one sentence is a leak.
+- **Still working** → NEVER stop it. Killing live work is far worse than a lingering idle row. `idleReason: "available"` means parked-and-available — confirm the notification says that; never stop on an inference that an agent "looks done".
+
+Agents parked BEFORE this rule applied send no fresh notification. Sweep with `bin/heimdall-agents orphans` (lists parked mailbox teammates by name), then `TaskStop` each completed one. Run the sweep at session start and after any multi-wave task.
+
+**Verification PENDING a session restart.** `TaskStop` was declared on the agent definitions in `b214eb1`; definitions load at session start, so the session that authored this rule had no `TaskStop` and could not exercise it end-to-end. Documented, not yet proven — first session after restart, confirm `TaskStop` closes a parked teammate and `bin/heimdall-agents orphans` drops it. Full guidance: [agent-templates.md](references/agent-templates.md).
 
 ## Available Commands
 

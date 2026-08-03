@@ -571,7 +571,7 @@ Full roster (all require `hmd:` prefix): `hmd:architect`, `hmd:planner`, `hmd:wa
 ### 4c. Agent Instructions
 
 When spawning an agent, provide:
-0. **Role identity in `description:`, never `name:`** — `description: "auth module — src/auth/**"`. A spawn carrying `name:` is DENIED (exit 2) by the `PreToolUse` `Agent` hook: `name:` assigns mailbox residency at spawn time, so that agent never self-terminates, never returns a result, and cannot be terminated by you. Measured: 0/43 named spawns completed vs 59/66 unnamed. `HEIMDALL_ALLOW_NAMED_AGENT=1` exists only for a long-lived agent you will `SendMessage` — which you cannot do from here. (R13)
+0. **Role identity in `description:`, never `name:`** — `description: "auth module — src/auth/**"`. A spawn carrying `name:` is DENIED (exit 2) by the `PreToolUse` `Agent` hook: `name:` assigns mailbox residency at spawn time, so that agent never self-terminates and never returns a result to the spawn call. Measured: 0/43 named spawns completed vs 59/66 unnamed. `HEIMDALL_ALLOW_NAMED_AGENT=1` exists only for a long-lived agent you will `SendMessage` — which you CAN do: your `tools:` line declares `SendMessage` and `TaskStop`, so you can drive a named agent and close it. Name one → you own its lifecycle (§4d). (R13)
 1. **Specific scope**: exactly what to build/test/review, with file boundaries
 2. **Skills to invoke**: tell the agent which skills to use via `Skill(skill: "name")`. Be explicit:
    - Coder agents: `superpowers:test-driven-development`, `superpowers:systematic-debugging`, and domain-specific skills
@@ -583,6 +583,38 @@ When spawning an agent, provide:
 4. **Constraints**: what NOT to do (prevent overlap with other wave agents)
 5. **Acceptance criteria**: the specific checks this agent must pass before reporting done
 6. **State updates**: commands to run on completion (`heimdall-state set ...`)
+
+### 4d. Closing Idle Agents — automatic, no human input
+
+You spawn agents. You close them. Nobody asks you to.
+
+**The signal already arrives.** When a spawned agent parks, the harness delivers an `idle_notification` teammate message to you:
+
+```json
+{"type":"idle_notification","from":"<agent name>","idleReason":"available"}
+```
+
+**The rule: on receiving an `idle_notification` from an agent whose work is complete, call `TaskStop` on it.** Immediately, in the same turn, without asking the user. `TaskStop` accepts a background task ID, or an agent-team teammate / named background agent by agent ID or name — so the `from` field of the notification is a valid argument.
+
+Apply judgement, not reflex. Three cases:
+
+| Situation | Action |
+|---|---|
+| Agent delivered its result and parked | **`TaskStop` it.** |
+| Agent deliberately kept resident for a multi-turn conversation you intend to continue via `SendMessage` | **Keep it** — and state why in your reasoning ("keeping <name>: still driving it for X"). A keep you cannot justify in one sentence is a leak. |
+| Agent still working | **Never `TaskStop` it.** |
+
+**Never `TaskStop` an agent that is still working.** Killing live work is far worse than a lingering idle row — a dead orchestration wave costs a rerun; an idle row costs a line of output. `idleReason: "available"` means parked-and-available, so the notification is your evidence: confirm it says `"available"` before stopping. Never stop on an inference that an agent "looks done" or "has been quiet a while".
+
+**Agents that parked before this rule applied** send no fresh notification — nothing will remind you. Sweep them explicitly:
+
+```bash
+bin/heimdall-agents orphans      # lists parked mailbox teammates by name
+```
+
+`TaskStop` each listed name whose work is complete, applying the same three checks. Run this sweep at session start and at the end of any multi-wave task.
+
+**Verification status: PENDING a session restart.** `TaskStop` was declared on the agent definitions in `b214eb1`; definitions load at session start, so the session that authored this rule did not have `TaskStop` and could NOT exercise it end-to-end. The rule is written, not proven. First session after restart: confirm `TaskStop` closes a parked teammate and that `bin/heimdall-agents orphans` drops it from the list. Until that check runs, treat the mechanism as documented-but-unverified and say so if asked.
 
 ---
 

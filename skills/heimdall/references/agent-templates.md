@@ -144,10 +144,12 @@ For large tasks requiring 3+ parallel workers.
 
 **Roles are carried in `description:`, never `name:`.** A spawn carrying `name:` is DENIED (exit 2)
 by the `PreToolUse` `Agent` hook. `name:` assigns mailbox residency at spawn time: that agent never
-self-terminates, never returns a result, and the parent cannot terminate it — no signalable PID, no
-socket, no terminate marker. Measured: 0/43 named spawns completed vs 59/66 unnamed. It is not
-recoverable by prompt — a controlled pair testing a "terminate, do not await messages" clause
-produced one `idle_notification` each either way, both recorded `"taskKind": "in_process_teammate"`.
+self-terminates and never returns a result to the spawn call. Measured: 0/43 named spawns completed
+vs 59/66 unnamed. It is not recoverable by PROMPT — a controlled pair testing a "terminate, do not
+await messages" clause produced one `idle_notification` each either way, both recorded
+`"taskKind": "in_process_teammate"`. It IS recoverable by TOOL: `TaskStop` closes a named agent by
+name or agent ID, `SendMessage` resumes it. So `name:` now costs a leak you must remember to clean
+up — not an unkillable row. See "Closing an idle agent" below.
 (conventions R13; proof: `bash test/agent-name-gate.test.sh`)
 
 Spawn every role in a wave in ONE message, each `run_in_background: true`:
@@ -185,8 +187,44 @@ Within a wave: ALL agents in ONE message. Between waves: let the wave return fir
 One case: a long-lived conversational agent you will actually drive with `SendMessage` across the
 session. `HEIMDALL_ALLOW_NAMED_AGENT=1` is the deliberate opt-in.
 
-Accept what it costs: that agent is mailbox-resident for the WHOLE session. It never self-terminates,
-never returns a result to the parent, and **cannot be closed** — the parent has no way to reach it,
-and `SendMessage` is not enabled in the orchestrator context, so in an orchestrator you cannot even
-use the thing you named it for. A role that does a unit of work and reports back is NOT this case.
-Spawn it unnamed.
+That opt-in is now genuinely usable. `agents/heimdall.md` declares `SendMessage` and `TaskStop`, so
+an orchestrator can drive the agent it named AND close it when done.
+
+What did NOT change: the agent is mailbox-resident, never self-terminates, and never returns a result
+to the spawn call. You collect its output via `SendMessage`, not by awaiting the spawn.
+
+Accept what it costs: you OWN its lifecycle. Nothing reaps it for you. If you name it, you must
+`TaskStop` it. A role that does a unit of work and reports back is NOT this case. Spawn it unnamed.
+
+### Closing an idle agent — automatic, no human input
+
+When a spawned agent parks, the harness delivers an `idle_notification` to the parent:
+
+```json
+{"type":"idle_notification","from":"<agent name>","idleReason":"available"}
+```
+
+**The rule: on an `idle_notification` from an agent whose work is complete, call `TaskStop` on it.**
+Immediately, without asking. This is judgement, not reflex:
+
+- Delivered its result and parked → **stop it.**
+- Deliberately kept resident for a multi-turn conversation you intend to continue via `SendMessage`
+  → **keep it**, and say so explicitly in your reasoning ("keeping <name>: still driving it for X").
+  A keep you cannot justify in one sentence is a leak.
+- **Never `TaskStop` an agent that is still working.** Killing live work is far worse than a
+  lingering idle row. `idleReason: "available"` means parked-and-available — confirm the notification
+  actually says that. Never stop on an inference that an agent "looks done".
+
+Agents that parked BEFORE this rule applied send no fresh notification. Sweep them:
+
+```bash
+bin/heimdall-agents orphans      # lists parked mailbox teammates by name
+```
+
+`TaskStop` each name whose work is complete, applying the same three checks.
+
+**Verification status: PENDING a session restart.** `TaskStop` was added to the agent definitions in
+`b214eb1`; definitions load at session start, so the session that wrote this rule did not have
+`TaskStop` available and could NOT exercise it end-to-end. The rule is written, not yet proven. First
+session after restart: confirm `TaskStop` closes a parked teammate and that `bin/heimdall-agents
+orphans` drops it from the list.
