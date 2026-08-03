@@ -12,10 +12,11 @@
 # so a dead/parked subagent stops inflating the count — automatically, on a hook,
 # with no human input.
 #
-# CAN A PARKED "MAILBOX" AGENT BE KILLED?  NO — MEASURED, NOT ASSUMED ─────────
+# CAN A PARKED "MAILBOX" AGENT BE CLEARED?  YES — BUT NEVER BY THIS TOOL ──────
 # An Agent spawn carrying `name:` becomes a mailbox teammate. Its sidecar
 # <transcript>.meta.json says so verbatim: "taskKind":"in_process_teammate".
-# Measured on this machine, 2026-08-03:
+# Measured on this machine, 2026-08-03 — why nothing OUTSIDE the harness reaches
+# a parked teammate, which is why this tool cannot be the thing that clears it:
 #   • NO PROCESS TO SIGNAL. `pgrep -x claude` lists only top-level session
 #     processes. 5 parked teammates in one session produced 0 extra PIDs, and
 #     `lsof` on a parked agent's transcript returns no holder. "in_process" is
@@ -34,12 +35,27 @@
 #     regular subagents produced 213 (80.1%). A mailbox agent reaches end_turn,
 #     finishes its work, and then parks forever awaiting a message that no
 #     terminate path exists to send.
-# CONCLUSION: from outside the harness a parked teammate CANNOT be terminated
-# while its session lives. Only restarting that session clears it from FleetView.
-# This tool therefore does the strongest HONEST thing instead: it detects them
-# automatically, excludes them from every heimdall count, reaps the ones that are
-# PROVABLY gone, and prints a loud, precise report naming what only a restart can
-# clear. It never claims a kill it did not perform.
+# CONCLUSION: no signal, no file and no message reaches a parked teammate from
+# outside, so THIS TOOL cannot clear one and never claims to. The HARNESS can:
+#   • `TaskStop` — Claude Code 2.1.198+ ("stops a running background task by ID.
+#     It also accepts an agent-team teammate or a named background agent by agent
+#     ID or name"). This machine runs 2.1.220 and b214eb1 declared TaskStop on
+#     every heimdall agent that can spawn. This is the programmatic path.
+#   • `/tasks` → select → Ctrl+X — the same clear, performed by hand.
+#   • restarting the owning session — the blunt fallback, always available.
+# SAY "DOCUMENTED", NOT "PROVEN": agent definitions load at session start, so
+# TaskStop was not available to the session that wrote this and NOBODY has yet
+# exercised it against a parked teammate end to end. Report it as the documented
+# mechanism pending verification — do not upgrade that wording without a run.
+# WHAT DID NOT CHANGE: `name:` is still a defect and the PreToolUse deny stands.
+# A named agent NEVER returns a result to its spawn call and NEVER self-terminates
+# (measured 0/43 named spawns completed vs 59/66 unnamed; a controlled pair
+# emitted one idle_notification each, both "taskKind":"in_process_teammate").
+# TaskStop converts a wedge into a leak — it does not make `name:` safe.
+# This tool therefore does the strongest HONEST thing available to it: it detects
+# parked teammates automatically, excludes them from every heimdall count, reaps
+# the ones that are PROVABLY gone, and prints a loud, precise report naming every
+# mechanism that clears them. It never claims a kill it did not perform.
 #
 # HONEST BOUNDARY (do not overclaim) ──────────────────────────────────────────
 # The harness's task files are NOT ours — we NEVER delete or modify them. `reap`
@@ -85,8 +101,8 @@
 #   reap [--json]    record terminal/parked subagents in heimdall's registry
 #                    (idempotent). Never touches harness files.
 #   sweep [--json]   AUTOMATION ENTRY POINT: reap + print an actionable report
-#                    naming any agent only a session restart can clear. Idempotent,
-#                    safe to run repeatedly, exit 0 always.
+#                    naming every parked agent and every mechanism that clears it.
+#                    Idempotent, safe to run repeatedly, exit 0 always.
 #   -h | --help
 #
 # STATE MODEL (precedence order — first match wins) ───────────────────────────
@@ -105,8 +121,9 @@
 #   orphaned  — NO completion evidence AND the owning session is GONE, so this
 #               in-process agent is provably dead with nothing to show for it.
 #   mailbox   — taskKind=in_process_teammate, no notification, session ALIVE.
-#               Parked forever. Excluded from the live count; CLEARABLE ONLY BY
-#               RESTARTING the session.
+#               Parked until something clears it. Excluded from the live count.
+#               Cleared from INSIDE the harness — TaskStop, /tasks → Ctrl+X, or a
+#               session restart — never by this tool.
 #   stale     — age >= HMD_AGENT_STALE_SECS (default 900), not working
 #   live      — age < threshold, regular subagent      ← counted, with `working`
 #
@@ -573,9 +590,9 @@ cmd_count() {
 
 # ── orphans: the operator-facing view of what needs attention ────────────────
 # Everything that is NOT live, NOT working and NOT a returned result: parked
-# mailbox teammates (restart-only), provably-dead orphans, wedged and stale
-# agents. This is the class the tool exists to surface, so it gets its own
-# subcommand rather than making an operator eyeball a full `list`.
+# mailbox teammates (clearable only from inside the harness), provably-dead
+# orphans, wedged and stale agents. This is the class the tool exists to surface,
+# so it gets its own subcommand rather than making an operator eyeball a `list`.
 _orphan_rows() {
   enumerate | awk -F'\t' '$3=="mailbox" || $3=="orphaned" || $3=="hung" || $3=="stale"'
 }
@@ -602,7 +619,8 @@ cmd_orphans() {
   if printf '%s\n' "$rows" | awk -F'\t' '$3=="mailbox"{f=1} END{exit !f}'; then
     echo
     echo "  mailbox = parked in-process teammate: no PID to signal, no control file."
-    echo "  ONLY A RESTART OF THE OWNING SESSION CLEARS THESE."
+    echo "  CLEAR FROM INSIDE THE HARNESS — this tool cannot: TaskStop <id|name>,"
+    echo "  or /tasks → select → Ctrl+X, or restart the owning session."
   fi
 }
 
@@ -673,7 +691,8 @@ cmd_reap() {
 # Reaps everything reapable, then reports honestly. The distinction it draws is
 # the whole point: `orphaned` agents are GONE (we proved the session died);
 # `mailbox` agents are still resident in a live session and NOTHING outside the
-# harness can clear them — so we name them and name the only action that works.
+# harness can clear them — so we name them and name every action that does clear
+# them, flagging which of those is documented-but-not-yet-verified.
 cmd_sweep() {
   local as_json="" added rows parked_now parked_all n_reap n_parked
   [ "${1:-}" = "--json" ] && as_json=1
@@ -704,15 +723,30 @@ cmd_sweep() {
   n_reap="$(printf '%s' "$added" | grep -c . 2>/dev/null || echo 0)"
   n_parked="$(printf '%s' "$parked_all" | grep -c . 2>/dev/null || echo 0)"
 
+  # JSON CONTRACT — `clearable_by` is a LIST OF MECHANISM IDENTIFIERS, never a
+  # sentence. A consumer must be able to branch (`index("TaskStop")`) instead of
+  # parsing prose, and a list is the only shape that can carry more than one
+  # mechanism — which is the whole correction: restart is no longer the only way.
+  # Elements are the literal invocable name where one exists (the `TaskStop` tool,
+  # the `/tasks` command) and a kebab token where none does (`session-restart`).
+  # Ordered programmatic → interactive → blunt fallback, so element 0 is the one
+  # an automated consumer should reach for.
+  # `clearable_by_verified` is the SUBSET proven end to end on this machine.
+  # TaskStop is documented (Claude Code 2.1.198+, this machine runs 2.1.220) but
+  # unexercised — agent definitions load at session start — so it is deliberately
+  # ABSENT from the verified list. Do not add it there without a run that proves
+  # it; the test asserts its absence precisely so that upgrade must be conscious.
   if [ -n "$as_json" ]; then
     jq -n --arg reaped "$added" --arg parked "$parked_all" '
+      ($parked | split("\n") | map(select(length>0))) as $p |
       {
         reaped: ($reaped | split("\n") | map(select(length>0) | split("\t"))
                  | map({task_id: .[0], reason: .[1], name: .[2]})),
-        parked_mailbox: ($parked | split("\n") | map(select(length>0) | split("\t"))
-                 | map({task_id: .[0], name: .[1]})),
-        clearable_by: (if ($parked | split("\n") | map(select(length>0)) | length) > 0
-                       then "session restart only" else null end)
+        parked_mailbox: ($p | map(split("\t")) | map({task_id: .[0], name: .[1]})),
+        clearable_by: (if ($p | length) > 0
+                       then ["TaskStop", "/tasks", "session-restart"] else null end),
+        clearable_by_verified: (if ($p | length) > 0
+                       then ["session-restart"] else null end)
       }'
     return 0
   fi
@@ -746,7 +780,11 @@ cmd_sweep() {
         printf '       • %s\n' "$id"
       fi
     done
-    echo "     ONLY A RESTART OF THE OWNING SESSION CLEARS THESE FROM FleetView."
+    echo "     CLEAR THEM FROM INSIDE THE HARNESS — this tool cannot:"
+    echo "       • TaskStop <agent-id|name>  (Claude Code 2.1.198+; documented,"
+    echo "         not yet verified end to end — definitions load at session start)"
+    echo "       • /tasks → select → Ctrl+X  (the same clear, by hand)"
+    echo "       • restart the owning session (blunt fallback, always works)"
     echo "     Prevention: never pass name: to the Agent tool (see CLAUDE.md)."
   fi
 }
