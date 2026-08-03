@@ -35,10 +35,13 @@
 #                                    + gc disk. Prints reclaimed MB + freed resident RAM.
 #   heimdall-cleanup --advise        READ-ONLY memory-pressure advisory for the SessionStart
 #                                    hook: when swap/wired are genuinely HIGH (>= REBOOT_*_PCT)
-#                                    it prints an HONEST reboot recommendation — and when the
-#                                    pressure is NOT heimdall (no hmd python leak) it SAYS SO and
-#                                    points at a restart, so the user is never left thinking hmd
-#                                    is the hog. Silent on a healthy machine. Honors the opt-out.
+#                                    it reports the two axes HONESTLY — swap is elastic (macOS
+#                                    reclaims it unaided), wired RAM is kernel-side and a reboot
+#                                    reclaims it only until its holder re-arms — and NAMES the
+#                                    persistent holder when one is cheaply detectable. When the
+#                                    pressure is NOT heimdall (no hmd python leak) it SAYS SO, so
+#                                    the user is never left thinking hmd is the hog. Silent on a
+#                                    healthy machine. Honors the opt-out.
 #   heimdall-cleanup --deep          SUGGEST-only handoff to the mac-deep-clean skill for the
 #                                    heavier, confirm-gated disk cleanup. Reaps NOTHING itself.
 #   heimdall-cleanup --auto          the HOOK path (SessionStart/End). Runs gc (hmd disk) always;
@@ -74,10 +77,10 @@ ORPHAN_WARN="${HMD_SYSMON_ORPHAN_WARN:-20}"    # >= → SUGGEST a reap
 ORPHAN_CRIT="${HMD_SYSMON_ORPHAN_CRIT:-80}"    # >= → a runaway; --auto reaps unasked
 SWAP_WARN_PCT="${HMD_SYSMON_SWAP_WARN_PCT:-40}"
 MEM_AVAIL_WARN_PCT="${HMD_CLEANUP_MEM_AVAIL_WARN_PCT:-15}"   # linux: MemAvailable% below → warn
-# reboot-advisory thresholds: at/above these, the pressure is kernel-wired RAM + swap that
-# heimdall CANNOT free — only a reboot clears it. Set genuinely-high (above the WARN grades)
-# so a healthy machine is never nagged. When crossed AND hmd is clean, the report says so
-# honestly and points at a reboot instead of letting the user think hmd is the hog.
+# memory-advisory thresholds: at/above these, the pressure is swap + kernel-wired RAM that
+# heimdall CANNOT free. Set genuinely-high (above the WARN grades) so a healthy machine is
+# never nagged. When crossed AND hmd is clean, the advisory says so honestly and describes
+# what actually holds the memory instead of letting the user think hmd is the hog.
 REBOOT_SWAP_PCT="${HMD_CLEANUP_REBOOT_SWAP_PCT:-80}"    # swap % of total in use → reboot-worthy
 REBOOT_WIRED_PCT="${HMD_CLEANUP_REBOOT_WIRED_PCT:-80}"  # wired RAM % of total → reboot-worthy
 
@@ -123,9 +126,27 @@ done
 # ── shared probes (read-only) ────────────────────────────────────────────────────
 
 # raw `pid ppid command…` rows — from the test seam, or live ps (both BSD + Linux forms).
-_ps_rows() {
+_ps_rows_live() {
   if [ -n "$PS_ROWS_FILE" ]; then cat "$PS_ROWS_FILE" 2>/dev/null; return 0; fi
   ps -axo pid=,ppid=,command= 2>/dev/null || ps -eo pid=,ppid=,command= 2>/dev/null || true
+}
+
+# ONE ps snapshot per read-only run. Both consumers — the orphan scope and the wired-holder
+# probe — read the SAME rows, so they can never disagree about what was running, and the
+# advisory pays for ps once instead of twice (ps is the most expensive probe in the path).
+# Priming must happen OUTSIDE a command substitution or the cache is lost with the subshell,
+# so do_report/do_advise call _ps_prime at their top level. Unprimed callers (do_apply) fall
+# through to a live read exactly as before.
+_PS_ROWS_CACHE=""; _PS_ROWS_PRIMED=0
+_ps_prime() {
+  [ "$_PS_ROWS_PRIMED" = 1 ] && return 0
+  _PS_ROWS_CACHE="$(_ps_rows_live)"
+  _PS_ROWS_PRIMED=1
+  return 0
+}
+_ps_rows() {
+  if [ "$_PS_ROWS_PRIMED" = 1 ]; then printf '%s\n' "$_PS_ROWS_CACHE"; return 0; fi
+  _ps_rows_live
 }
 
 # the reap SCOPE — delegated entirely to sysmon's matcher (single source of truth).
@@ -217,43 +238,115 @@ _probe_disk() {
 
 _rank() { case "$1" in crit) echo 2 ;; warn) echo 1 ;; *) echo 0 ;; esac; }
 
-# ── reboot advisory (HONEST attribution) ──────────────────────────────────────────
-# genuinely-HIGH memory pressure = swap OR wired at/above the reboot thresholds. This is
-# kernel-wired RAM + swap that heimdall did not cause and CANNOT free — only a reboot clears
-# it. Reads the real vm_stat/vm.swapusage figures (via sysmon) that _probe_memory already set.
+# ── memory advisory (HONEST attribution) ──────────────────────────────────────────
+# genuinely-HIGH memory pressure = swap OR wired at/above the advisory thresholds. This is
+# swap + kernel-wired RAM that heimdall did not cause and cannot free. Reads the real
+# vm_stat/vm.swapusage figures (via sysmon) that _probe_memory already set.
 _reboot_worthy() {
   [ "$swap_pct" -ge "$REBOOT_SWAP_PCT" ] 2>/dev/null && return 0
   [ "$wired_pct" -ge "$REBOOT_WIRED_PCT" ] 2>/dev/null && return 0
   return 1
 }
 
-# print the reboot recommendation. Attribution is the whole point: when hmd is CLEAN (no python
-# leak) SAY SO and point at a reboot; when hmd IS holding RAM (orphan leak) recommend --apply
-# FIRST, then reboot for the residual wired/swap. Every number is a real reading.
+# ── persistent wired-memory holders (CHEAP detection; PRINT-PATH ONLY) ────────────
+# Wired RAM is kernel-side: heimdall cannot free it, and neither does a reboot DURABLY — a
+# restart drops the pages, but any holder that re-arms at boot re-wires them straight back.
+# So the only durable advice is to name the HOLDER, and we name one ONLY when we can see it.
+# Two probes, both cheap, neither walking the filesystem:
+#   · mount(8)  — one getmntinfo read. Mounted OS/simulator runtime volumes hold wired kernel
+#                 memory continuously and re-mount at every boot (the case measured here).
+#   · ps rows   — already collected for the orphan scope (see _ps_prime), so this costs
+#                 nothing extra. A running hypervisor wires its guest RAM for the VM's life.
+# Detecting a holder is NOT a claim that it accounts for all wired RAM — it is a candidate
+# the user can act on. When neither probe sees anything we print NOTHING and the caller falls
+# back to saying the holder is unidentified: an advisory that confidently prescribes the wrong
+# action is worse than one that describes the situation and stops. Both probes fail quiet, so
+# a broken detector degrades the wording instead of breaking SessionStart.
+MOUNT_CMD="${HMD_CLEANUP_MOUNT_CMD:-/sbin/mount}"
+
+_wired_holders() {
+  local simvols vms
+  simvols="$(_num "$("$MOUNT_CMD" 2>/dev/null | grep -c 'CoreSimulator' 2>/dev/null || true)")"
+  if [ "$simvols" -gt 0 ]; then
+    printf '      · %s mounted simulator runtime volume(s) — a reboot re-mounts and re-wires them\n' "$simvols"
+    printf '        review:  xcrun simctl runtime list\n'
+    printf '        durable: sudo xcrun simctl runtime delete <build-id>   (UNUSED runtimes only)\n'
+  fi
+  vms="$(_ps_rows 2>/dev/null \
+    | grep -Eo 'com\.docker\.(virtualization|hyperkit)|vmware-vmx|prl_vm_app|VBoxHeadless|VirtualBoxVM|qemu-system-[a-z0-9_]+|Virtualization\.VirtualMachine' 2>/dev/null \
+    | sort -u | tr '\n' ' ')"
+  vms="${vms% }"
+  if [ -n "$vms" ]; then
+    printf '      · running hypervisor/VM: %s — guest RAM stays wired for the VM'\''s lifetime\n' "$vms"
+    printf '        durable: shut the VM down, or lower its RAM allocation\n'
+  fi
+  return 0
+}
+
+# the DISK axis, reported SEPARATELY. Reclaiming hmd disk does not relieve memory pressure,
+# and a --quick scan deliberately skips the worktree + retired-version passes — so its total
+# is PARTIAL. We say that instead of quoting a partial figure as the hmd-owned total.
+#   $1 hmd-reclaimable disk MB (meaningful only on a full scan)
+_disk_axis_note() {
+  if [ "$QUICK" = 1 ]; then
+    printf '    disk (separate axis — reclaiming it does not relieve memory): this quick scan\n'
+    printf '          skips the worktree + retired-version passes, so hmd'\''s disk figure is NOT\n'
+    printf '          measured here. Run `heimdall-cleanup report` for the full number.\n'
+  else
+    printf '    disk (separate axis — reclaiming it does not relieve memory): ~%sMB of hmd-owned\n' "$1"
+    printf '          garbage is reclaimable now.\n'
+  fi
+  return 0
+}
+
+# print the memory advisory. Attribution is the whole point:
+#   · hmd's OWN share (orphaned python) is named and reaped FIRST when there is one, and the
+#     figure is labelled MEMORY axis so it is never read as covering disk too;
+#   · swap is reported as ELASTIC — macOS sizes it on demand and reclaims it on its own as
+#     pressure eases, so a high swap % is a symptom to watch, not by itself an action;
+#   · wired RAM is reported as kernel-side and REBOOT-TEMPORARY, with the persistent holder
+#     named when one is detectable and declared unidentified when it is not.
+# Every number is a real reading.
 #   $1 orphans   $2 resident-MB held by those orphans   $3 hmd-reclaimable disk MB
 _reboot_advisory() {
-  local orphans="$1" rss="$2" reclaim_mb="$3"
+  local orphans="$1" rss="$2" reclaim_mb="$3" holders
+  holders="$(_wired_holders 2>/dev/null || true)"
+
   if [ "$orphans" -gt 0 ]; then
     printf '  • memory pressure is HIGH (swap %sG/%sG = %s%%, wired %s%%). Part of it IS heimdall —\n' \
       "$swap_used_g" "$swap_total_g" "$swap_pct" "$wired_pct"
-    printf '    %s orphaned hmd python holding ~%sMB resident. Reap heimdall'\''s OWN leak FIRST:\n' "$orphans" "$rss"
+    printf '    %s orphaned hmd python holding ~%sMB resident (MEMORY axis). Reap heimdall'\''s OWN\n' "$orphans" "$rss"
+    printf '    leak FIRST:\n'
     printf '        heimdall-cleanup --apply\n'
-    printf '    The remainder is kernel-wired RAM + swap, which clear ONLY on reboot — after the reap,\n'
-    printf '    a restart clears the residue. Heimdall reaps only its own footprint and cannot free\n'
-    printf '    kernel-wired memory.\n'
-    printf '      → run --apply, then save your work and reboot\n'
   else
     printf '  • memory pressure is HIGH (swap %sG/%sG = %s%%, wired %s%%) — and this is NOT heimdall:\n' \
       "$swap_used_g" "$swap_total_g" "$swap_pct" "$wired_pct"
-    printf '    no hmd python leak, ~%sMB of hmd-owned garbage total. Wired RAM and swap are\n' "$reclaim_mb"
-    printf '    kernel/driver-locked and clear ONLY on reboot — a restart is the fix. Heimdall reaps\n'
-    printf '    only its own footprint; it cannot free kernel-wired memory.\n'
-    printf '      → save your work, then reboot\n'
+    printf '    no hmd python leak — 0 heimdall processes, ~%sMB of this RAM is heimdall'\''s (MEMORY axis).\n' "$rss"
   fi
+
+  printf '    swap: macOS sizes swap on demand and reclaims it on its own as pressure eases,\n'
+  printf '          without a reboot. A high swap %% is a symptom to watch, not by itself an action.\n'
+  printf '    wired: kernel-side. Heimdall cannot free kernel-wired memory — and neither does a\n'
+  printf '           reboot, durably: a restart drops the pages, but a holder that re-arms at\n'
+  printf '           boot re-wires them. A reboot is a TEMPORARY reclaim, not the fix; removing\n'
+  printf '           the holder is.\n'
+  if [ -n "$holders" ]; then
+    printf '    persistent holders visible from here:\n'
+    printf '%s\n' "$holders"
+    printf '      → remove the holder for a durable reclaim; a reboot only buys time\n'
+  else
+    printf '    no persistent holder identified from here — wired RAM is held by kernel-side\n'
+    printf '    consumers heimdall cannot enumerate (VMs, OS/simulator runtimes, drivers, system\n'
+    printf '    extensions). If wired RAM returns after a restart, the holder is persistent.\n'
+    printf '      → identify the persistent holder before treating a reboot as the fix\n'
+  fi
+  _disk_axis_note "$reclaim_mb"
+  return 0
 }
 
 # ── REPORT (read-only) ────────────────────────────────────────────────────────────
 do_report() {
+  _ps_prime          # one ps snapshot shared by the orphan scope and the wired-holder probe
   _probe_memory
   _probe_disk
   local pids orphans rss
@@ -319,7 +412,8 @@ do_report() {
   if _reboot_worthy; then
     _reboot_advisory "$orphans" "$rss" "$reclaim_mb"
   elif [ "$mem_status" != "ok" ]; then
-    printf '  • memory pressure: after any reap, wired RAM + swap only fully clear on reboot.\n'
+    printf '  • memory pressure: reaping hmd'\''s own footprint does not touch wired RAM. macOS\n'
+    printf '    reclaims swap on its own as pressure eases; wired RAM needs its holder removed.\n'
   fi
   if [ "$disk_status" != "ok" ]; then
     printf '  • disk is under pressure — heavier cleanup (caches / dead repos / SDK bloat):\n'
@@ -373,7 +467,7 @@ do_apply() {
     return 0
   fi
 
-  printf 'heimdall-cleanup --apply: reaped %d orphaned heimdall python (~%dMB resident freed; wired RAM/swap clear on reboot), reclaimed ~%dMB disk.\n' \
+  printf 'heimdall-cleanup --apply: reaped %d orphaned heimdall python (~%dMB resident freed; kernel-wired RAM is not heimdall'\''s to free), reclaimed ~%dMB disk.\n' \
     "$reaped" "$rss" "$reclaim_mb"
   return 0
 }
@@ -385,6 +479,7 @@ do_advise() {
   if opted_out; then return 0; fi
   _probe_memory
   _reboot_worthy || return 0   # non-spammy: silent on a healthy / merely-warn machine
+  _ps_prime          # one ps snapshot shared by the orphan scope and the wired-holder probe
 
   local pids orphans rss
   pids="$(_orphan_pids)"
