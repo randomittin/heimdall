@@ -311,9 +311,12 @@ SWJ="$("$AGENTS" sweep --json 2>/dev/null)"
   || bad "clearable_by not a list (got type '$(printf '%s' "$SWJ" | jq -r '.clearable_by|type')')"
 printf '%s' "$SWJ" | jq -e '.clearable_by | index("TaskStop")' >/dev/null 2>&1 \
   && ok "sweep --json clearable_by names TaskStop" || bad "clearable_by omits TaskStop"
-[ "$(printf '%s' "$SWJ" | jq -r '.clearable_by | length')" -ge 2 ] \
+# `type=="array" and` is load-bearing: jq's `length` on the old scalar returns the
+# STRING length (20), which would sail past a bare `>= 2` and green-light exactly
+# the claim this asserts is gone.
+printf '%s' "$SWJ" | jq -e '.clearable_by | type == "array" and length >= 2' >/dev/null 2>&1 \
   && ok "sweep --json offers more than one mechanism (not restart-only)" \
-  || bad "clearable_by lists only one mechanism — the restart-only claim survives"
+  || bad "clearable_by lists fewer than 2 mechanisms — the restart-only claim survives"
 printf '%s' "$SWJ" | jq -e '.clearable_by | index("session-restart")' >/dev/null 2>&1 \
   && ok "sweep --json keeps session-restart as fallback" || bad "clearable_by dropped session-restart"
 # Honesty tripwire: TaskStop is documented, NOT verified end to end. It must be
