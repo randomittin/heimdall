@@ -30,6 +30,12 @@
       "provenance": "fixture",
       "reason": "Concatenates both seeded renders. Its section 1 team wall shows the invented teammates arjun/kai/maya plus a '+2' overflow tag standing in for nadia and priya; its section 2 card carries the same seeded '14 merges proven' count. The file's own header says so in prose, which is honest but invisible to a README reader.",
       "receipt": "launch-docs/assets/wall.txt lines 8-12 name the six-watchman fixture; lines 20-22 name the seeded beats.log."
+    },
+    {
+      "file": "wall-fallback.gif",
+      "provenance": "fixture",
+      "reason": "A GENERATED placeholder, not a render of this repo's state, so it cannot be 'real' — the fail-closed default is the correct answer here. It is however the SAFEST possible fixture: it deliberately depicts no teammate, no handle, no verdict, no merge count and no file path, precisely because a fallback image of a bustling wall would repeat the wall.png/wall.json fabrication it exists alongside. Its entire rendered content is the words 'NO LIVE PRESENCE' and 'Static placeholder - this image is not a live wall.', which are true in both states it serves (roster empty, or control plane unreachable). It says nothing about a demo either: it also renders for a real dev whose real team is merely idle, and labelling their team a demo would be its own dishonesty - the demo label is a separate roster-triggered banner in the embed.",
+      "receipt": "Reproducible from source: `bin/heimdall-seed-demo-wall --emit-fallback-gif <path>` regenerates it, and that generator is the only place its pixels are defined - open it to see there is no teammate/verdict/count data to fabricate. test/demo-wall-honesty.test.sh asserts the rendered strings stay free of any teammate/verdict/count claim, and that the site copy is byte-identical to this one."
     }
   ],
   "notes": [

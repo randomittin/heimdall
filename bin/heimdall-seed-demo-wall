@@ -51,6 +51,10 @@
 #   heimdall-seed-demo-wall --out FILE          Also write that roster JSON to FILE.
 #   heimdall-seed-demo-wall --project ID        Override the demo project id.
 #   heimdall-seed-demo-wall --live              REFUSED unless the confirm phrase is set.
+#   heimdall-seed-demo-wall --emit-fallback-gif PATH
+#                                               Regenerate the static wall fallback GIF the
+#                                               embed degrades to. Reproducible from source
+#                                               so the committed binary is not a mystery.
 #
 #   Go live (writes to the live control plane):
 #     HEIMDALL_SEED_LIVE_CONFIRM='SEED THE PUBLIC DEMO TEAM' \
@@ -76,6 +80,7 @@ COUNT=5
 AS_JSON=0
 OUT_FILE=""
 LIVE=0
+EMIT_GIF=""
 DEMO_PROJECT="$DEMO_PROJECT_DEFAULT"
 
 die() { printf 'heimdall-seed-demo-wall: %s\n' "$1" >&2; exit "${2:-2}"; }
@@ -93,6 +98,8 @@ while [ $# -gt 0 ]; do
     --project=*) DEMO_PROJECT="${1#*=}" ;;
     --out)   shift; OUT_FILE="${1:-}"; [ -n "$OUT_FILE" ] || die "--out needs a path" ;;
     --out=*) OUT_FILE="${1#*=}" ;;
+    --emit-fallback-gif)   shift; EMIT_GIF="${1:-}"; [ -n "$EMIT_GIF" ] || die "--emit-fallback-gif needs a path" ;;
+    --emit-fallback-gif=*) EMIT_GIF="${1#*=}" ;;
     --json)  AS_JSON=1 ;;
     --live)  LIVE=1 ;;
     --dry)   LIVE=0 ;;
@@ -112,6 +119,82 @@ PY="$(command -v python3 || command -v python || true)"
 [ -n "$PY" ] || die "python3 not found — the local CP profile needs it"
 [ -f "$LIB/cp_presence.py" ] || die "missing $LIB/cp_presence.py (not a heimdall checkout?)"
 [ -f "$LIB/cp_auth.py" ] || die "missing $LIB/cp_auth.py (not a heimdall checkout?)"
+
+# ─── the static fallback GIF ──────────────────────────────────────────────────
+# What the embed degrades to when the live roster is EMPTY or UNREACHABLE, so a
+# reader never meets a blank wall. Deliberately depicts NO teammates, NO verdicts
+# and NO counts — an image of a bustling wall would be the fabrication this repo
+# already got bitten by. It says only what is true in both degrade cases: there is
+# no live presence to show, and the thing you are looking at is a static image.
+#
+# It does NOT say "demo": this same asset renders for a real dev whose real team
+# is simply idle, and calling their team a demo would be its own dishonesty. The
+# demo label is a separate, roster-triggered banner in the embed.
+#
+# TRANSPARENT background with mid-tone ink, because the site ships BOTH a dark and
+# a light theme and one flat-background GIF cannot serve both. Alpha is thresholded
+# to GIF's 1-bit transparency, so there is no halo on either theme; the asset is
+# emitted at 2x and displayed at 1x, which hides the resulting aliasing.
+if [ -n "$EMIT_GIF" ]; then
+  EMIT_GIF="$EMIT_GIF" "$PY" - <<'PYEOF' || die "fallback GIF generation failed" 4
+import os
+import sys
+
+try:
+    from PIL import Image, ImageDraw, ImageFont
+except ImportError:
+    sys.stderr.write("fallback GIF needs Pillow (pip install Pillow)\n")
+    raise SystemExit(1)
+
+W, H = 1200, 300           # 2x of the 600x150 display box
+INK_2 = (0x99, 0xA1, 0xAB)  # --ink-2: legible on #07080A and on #FAFBFC alike
+INK_3 = (0x7E, 0x86, 0x91)  # --ink-3
+ACCENT = (0x42, 0x64, 0xFF)  # --accent
+
+FONT_DIRS = ("/System/Library/Fonts/Supplemental", "/Library/Fonts", "/System/Library/Fonts")
+
+
+def load(names, size):
+    for d in FONT_DIRS:
+        for n in names:
+            p = os.path.join(d, n)
+            if os.path.exists(p):
+                try:
+                    return ImageFont.truetype(p, size)
+                except OSError:
+                    continue
+    raise SystemExit("no usable TTF found in %s" % (FONT_DIRS,))
+
+
+bold = load(("Arial Bold.ttf", "Helvetica.ttc", "Verdana Bold.ttf"), 52)
+small = load(("Arial.ttf", "Helvetica.ttc", "Verdana.ttf"), 27)
+
+img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+d = ImageDraw.Draw(img)
+
+
+def centered(text, font, fill, y):
+    left, top, right, bottom = d.textbbox((0, 0), text, font=font)
+    d.text(((W - (right - left)) / 2 - left, y), text, font=font, fill=fill)
+    return bottom - top
+
+
+# A short accent rule reads as "a panel lives here" without asserting any content.
+d.rectangle([(W / 2 - 34, 62), (W / 2 + 34, 66)], fill=ACCENT + (255,))
+centered("NO LIVE PRESENCE", bold, INK_2 + (255,), 104)
+centered("Static placeholder — this image is not a live wall.", small, INK_3 + (255,), 186)
+
+# Threshold alpha to GIF's 1-bit transparency: index 255 is reserved as the
+# transparent slot, so the adaptive palette gets the remaining 255 entries.
+alpha = img.split()[3]
+transparent = alpha.point(lambda a: 255 if a < 128 else 0)
+pal = img.convert("RGB").convert("P", palette=Image.ADAPTIVE, colors=255)
+pal.paste(255, mask=transparent)
+pal.save(os.environ["EMIT_GIF"], transparency=255, optimize=True)
+sys.stderr.write("wrote %s (%dx%d, transparent)\n" % (os.environ["EMIT_GIF"], W, H))
+PYEOF
+  exit 0
+fi
 
 # ─── the sandbox guard ────────────────────────────────────────────────────────
 # The one thing this script must never do is write into the caller's real
