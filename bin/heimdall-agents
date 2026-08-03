@@ -47,22 +47,46 @@
 # corpse thereafter. This tool CANNOT remove an entry from Claude Code's
 # FleetView; that surface is owned by the harness.
 #
-# THE DATA SOURCE ─────────────────────────────────────────────────────────────
-#   <tmp>/claude-<uid>/<slug>/<session-id>/tasks/<task-id>.output
-# Each `.output` is a symlink to the subagent's transcript jsonl (or a plain
-# file). Authoritative metadata is the transcript's sibling `.meta.json`
-# (agentType, name, taskKind). Files with NO agent metadata and a background-Bash
-# id shape (b + 8-9 alnum) are BACKGROUND SHELL TASKS, not agents — the previous
-# version counted them as subagents; they are now excluded.
+# THE DATA SOURCES — TWO OF THEM, AND BOTH ARE REQUIRED ───────────────────────
+# (1) THE TASK DIR   <tmp>/claude-<uid>/<slug>/<session>/tasks/<task-id>.output
+#     Each `.output` is a symlink to the subagent's transcript jsonl (or a plain
+#     file). Authoritative metadata is the transcript's sibling `.meta.json`
+#     (agentType, name, taskKind). Files with NO agent metadata and a
+#     background-Bash id shape (b + 8-9 alnum) are BACKGROUND SHELL TASKS, not
+#     agents, and are excluded.
+#     MEASURED 2026-08-03: the symlink routinely points CROSS-SESSION — a task
+#     dir under session 2ac8810f held links to transcripts under session
+#     da3a8887. Never assume the task dir's session owns the transcript.
+# (2) THE SUBAGENTS DIR  ~/.claude/projects/<slug>/<session>/subagents/
+#     A parked mailbox teammate NEVER gets a task-dir `.output` entry. MEASURED:
+#     the session owning 17 parked teammates had NO `tasks/` dir at all, only
+#     `scratchpad/`. Those agents exist ONLY as `agent-<id>.jsonl` plus an
+#     `agent-<id>.meta.json` sidecar here. Enumerating the task dir alone is
+#     BLIND to the exact agents this tool exists to surface, so the inventory is
+#     the UNION of both sources, deduped by id.
+#
+# COMPLETION EVIDENCE — WHAT PROVES AN AGENT FINISHED ─────────────────────────
+# When a subagent stops, the harness enqueues a record into its PARENT session
+# transcript (~/.claude/projects/<slug>/<session>.jsonl):
+#   {"type":"queue-operation","operation":"enqueue",…,"content":
+#    "<task-notification>\n<task-id>ID</task-id>\n<tool-use-id>…</tool-use-id>\n
+#     <output-file>…</output-file>\n<status>completed</status>\n<summary>…"}
+# That notification is AUTHORITATIVE and is the only positive proof of a result
+# being returned. Measured statuses: completed | failed | killed. Measured on
+# this machine: 244 notifications across one session — and 0 of the 17 parked
+# teammates had one, which is precisely why they leak.
 #
 # SUBCOMMANDS ─────────────────────────────────────────────────────────────────
-#   list [--json]   enumerate subagents: id, age(s), state, name
-#   count           print the number of LIVE subagents (statusline consumes this)
-#   reap [--json]   record terminal/parked subagents in heimdall's registry
-#                   (idempotent). Never touches harness files.
-#   sweep [--json]  AUTOMATION ENTRY POINT: reap + print an actionable report
-#                   naming any agent only a session restart can clear. Idempotent,
-#                   safe to run repeatedly, exit 0 always.
+#   list [--json]    enumerate subagents: id, age(s), state, name
+#   count            print the number of LIVE subagents (statusline consumes this)
+#   orphans [--json] OPERATOR VIEW: only the agents that need attention —
+#                    parked mailbox teammates, provably-dead orphans, wedged and
+#                    stale agents. Excludes anything live, working or completed.
+#   reap [--json]    record terminal/parked subagents in heimdall's registry
+#                    (idempotent). Never touches harness files.
+#   sweep [--json]   AUTOMATION ENTRY POINT: reap + print an actionable report
+#                    naming any agent only a session restart can clear. Idempotent,
+#                    safe to run repeatedly, exit 0 always.
 #   -h | --help
 #
 # STATE MODEL (precedence order — first match wins) ───────────────────────────
@@ -72,19 +96,37 @@
 #               NEVER reaped. This is the guard that makes a 40-minute build safe.
 #   hung      — awaiting a tool result for >= HMD_AGENT_HUNG_SECS (default 3600).
 #               An hour on one tool call is not work; it is a wedge.
-#   failed    — terminal failure marker
-#   done      — terminal completion marker
-#   orphaned  — owning session process is GONE, so this in-process agent is
-#               PROVABLY dead. The only state we can honestly call terminated.
-#   mailbox   — taskKind=in_process_teammate, session still ALIVE. Parked forever.
-#               Excluded from live count; CLEARABLE ONLY BY RESTARTING the session.
+#   done      — a task-notification says `completed`. THE AGENT SUCCEEDED. This
+#               outranks every negative state, including a dead session: the work
+#               was finished and returned before the session went away. Calling a
+#               success `orphaned` is the single worst lie this tool can tell.
+#   failed    — a task-notification says `failed`, or a terminal `.status` marker
+#   killed    — a task-notification says `killed`
+#   orphaned  — NO completion evidence AND the owning session is GONE, so this
+#               in-process agent is provably dead with nothing to show for it.
+#   mailbox   — taskKind=in_process_teammate, no notification, session ALIVE.
+#               Parked forever. Excluded from the live count; CLEARABLE ONLY BY
+#               RESTARTING the session.
 #   stale     — age >= HMD_AGENT_STALE_SECS (default 900), not working
 #   live      — age < threshold, regular subagent      ← counted, with `working`
+#
+# LIVENESS — WHY NOT pgrep ─────────────────────────────────────────────────────
+# MEASURED 2026-08-03: `pgrep -x claude` returned 2 pids whose lsof cwds were
+# /Users/rj/Downloads/code/rally and /…/SuperSmartVerify. The heimdall session
+# that was running AT THAT MOMENT appeared in neither. Deciding liveness from the
+# process table alone therefore produced false "dead" verdicts for every agent in
+# the live session — the root cause of completed agents being labelled `orphaned`.
+# A session's own transcript is written continuously while it runs, so its mtime
+# is a reliable, read-only liveness signal and is consulted FIRST. The pgrep/lsof
+# probe remains as a fallback for sessions that are idle but still resident.
 #
 # ENV ─────────────────────────────────────────────────────────────────────────
 #   HMD_AGENT_STALE_SECS    live/stale threshold, seconds (default 900)
 #   HMD_AGENT_HUNG_SECS     awaiting-a-tool-result wedge threshold (default 3600)
+#   HMD_AGENT_SESSION_LIVE_SECS  a session transcript touched more recently than
+#                           this proves the session is alive (default STALE_SECS)
 #   HMD_AGENT_TASKDIR       override the task dir (skips discovery). Tests use it.
+#   HMD_AGENT_SUBAGENTS_DIR override the subagents dir (skips discovery)
 #   HMD_AGENT_REAPED_FILE   override registry (default
 #                           ${HEIMDALL_HOME:-$HOME/.heimdall}/agents-reaped.json)
 #   HMD_AGENT_PROJECTS_DIR  override ~/.claude/projects (tests)
@@ -96,8 +138,8 @@
 #   HMD_NOW                 override "now" epoch seconds (deterministic tests)
 #   HMD_AGENT_NO_SWEEP      if set to 1, `sweep` is an explicit opt-out no-op
 #
-# Exit: 0 always for list/count/reap/sweep (fail-closed, degraded, never crashes);
-#       2 only on usage error.
+# Exit: 0 always for list/count/orphans/reap/sweep (fail-closed, degraded, never
+#       crashes); 2 only on usage error.
 set -uo pipefail
 
 command -v jq >/dev/null 2>&1 || { echo "error: jq is required" >&2; exit 2; }
@@ -107,6 +149,8 @@ STALE_SECS="${HMD_AGENT_STALE_SECS:-}"
 case "$STALE_SECS" in ''|*[!0-9]*) STALE_SECS=900 ;; esac
 HUNG_SECS="${HMD_AGENT_HUNG_SECS:-}"
 case "$HUNG_SECS" in ''|*[!0-9]*) HUNG_SECS=3600 ;; esac
+SESSION_LIVE_SECS="${HMD_AGENT_SESSION_LIVE_SECS:-}"
+case "$SESSION_LIVE_SECS" in ''|*[!0-9]*) SESSION_LIVE_SECS="$STALE_SECS" ;; esac
 NOW="${HMD_NOW:-}"
 case "$NOW" in ''|*[!0-9]*) NOW="$(date +%s)" ;; esac
 HMD_HOME="${HEIMDALL_HOME:-${HOME:-}/.heimdall}"
@@ -195,11 +239,35 @@ live_slugs() {
 _slug_of_taskdir()    { local b="${1%/tasks}"; b="${b%/*}"; printf '%s' "${b##*/}"; }
 _session_of_taskdir() { local b="${1%/tasks}"; printf '%s' "${b##*/}"; }
 
+# A session's own transcript. The harness appends to it continuously while the
+# session runs, so its mtime is direct, read-only evidence of liveness.
+_session_transcript() {
+  local slug="$1" sess="$2"
+  [ -n "$slug" ] && [ -n "$sess" ] || return 0
+  printf '%s' "$PROJECTS_DIR/$slug/$sess.jsonl"
+}
+
+# session_is_alive <slug> [session]
+# EVIDENCE ORDER MATTERS. The process probe alone is provably unreliable (see the
+# LIVENESS note in the header: the running session was invisible to pgrep/lsof),
+# so a freshly-written session transcript is consulted FIRST. Only when that
+# yields nothing do we fall back to the process table.
 session_is_alive() {
-  local slug="$1" ls
+  local slug="$1" sess="${2:-}" f mt
   [ -n "$slug" ] || return 1
-  ls="$(live_slugs)"
-  case "$ls" in *" $slug "*) return 0 ;; esac
+  # Explicit override (hermetic tests / callers that already know) wins outright.
+  if [ "${HMD_AGENT_LIVE_SLUGS+defined}" = "defined" ]; then
+    case "$(live_slugs)" in *" $slug "*) return 0 ;; esac
+    return 1
+  fi
+  if [ -n "$sess" ]; then
+    f="$(_session_transcript "$slug" "$sess")"
+    if [ -n "$f" ] && [ -f "$f" ]; then
+      mt="$(_mtime "$f")"
+      if [ $(( NOW - mt )) -lt "$SESSION_LIVE_SECS" ] 2>/dev/null; then return 0; fi
+    fi
+  fi
+  case "$(live_slugs)" in *" $slug "*) return 0 ;; esac
   return 1
 }
 
@@ -249,7 +317,7 @@ resolve_subagentsdirs() {
 # The `.output` is normally a symlink straight to the transcript. If not, derive
 # the canonical projects path. Returns "" when nothing resolves.
 _transcript_for() {
-  local taskdir="$1" id="$2" out tgt sess slug
+  local taskdir="$1" id="$2" out tgt sess slug cand d
   out="$taskdir/$id.output"
   if [ -L "$out" ]; then
     tgt="$(readlink "$out" 2>/dev/null)"
@@ -258,19 +326,69 @@ _transcript_for() {
   sess="$(_session_of_taskdir "$taskdir")"
   slug="$(_slug_of_taskdir "$taskdir")"
   [ -n "$sess" ] && [ -n "$slug" ] || return 0
-  printf '%s' "$PROJECTS_DIR/$slug/$sess/subagents/agent-$id.jsonl"
+  cand="$PROJECTS_DIR/$slug/$sess/subagents/agent-$id.jsonl"
+  if [ ! -f "$cand" ]; then
+    # The task dir's own session frequently does NOT own the transcript (measured
+    # cross-session links). Sweep the slug's other sessions before giving up.
+    for d in "$PROJECTS_DIR/$slug"/*/subagents/"agent-$id.jsonl"; do
+      [ -f "$d" ] && { printf '%s' "$d"; return 0; }
+    done
+  fi
+  printf '%s' "$cand"
 }
 
-# Last transcript event kind: "tool_use" when the agent is AWAITING A TOOL RESULT
-# (⇒ genuinely working), else the message's stop_reason, else "".
-_last_event_kind() {
-  local f="$1"
-  [ -n "$f" ] && [ -f "$f" ] || return 0
-  tail -n 1 "$f" 2>/dev/null | jq -r '
-    (.message.content? // null) as $c
-    | if ($c|type) == "array" and ([ $c[] | select(.type? == "tool_use") ] | length) > 0
-      then "tool_use"
-      else (.message.stop_reason? // "") end' 2>/dev/null | head -n 1
+# Session that OWNS a transcript: <projects>/<slug>/<session>/subagents/agent-x.jsonl
+_session_of_transcript() {
+  local d="${1%/*}"          # strip /agent-x.jsonl  -> .../<session>/subagents
+  d="${d%/subagents}"        # -> .../<session>
+  case "$d" in */*) printf '%s' "${d##*/}" ;; esac
+}
+
+# TRUE when the agent is AWAITING A TOOL RESULT ⇒ genuinely alive regardless of
+# mtime. A cheap substring prefilter on the last line skips a jq spawn for the
+# overwhelming majority of transcripts, keeping `count` fast for the statusline.
+_awaiting_tool_result() {
+  local f="$1" line
+  [ -n "$f" ] && [ -f "$f" ] || return 1
+  line="$(tail -n 1 "$f" 2>/dev/null)"
+  case "$line" in *'"type":"tool_use"'*) ;; *) return 1 ;; esac
+  [ "$(printf '%s' "$line" | jq -r '
+      (.message.content? // null) as $c
+      | if ($c|type) == "array" and ([ $c[] | select(.type? == "tool_use") ] | length) > 0
+        then "tool_use" else "" end' 2>/dev/null | head -n 1)" = "tool_use" ]
+}
+
+# ── the notification index: AUTHORITATIVE completion evidence ────────────────
+# Scans the given parent session transcripts for <task-notification> blocks and
+# builds a " id:status id:status " lookup string, LAST notification winning (an
+# agent may stop, be resumed, and stop again). Parsed straight off the raw JSONL
+# with grep+perl — no jq — because these transcripts reach 16MB and this runs on
+# the statusline path. Built at most once per invocation.
+_NOTIF_IDX=""
+_NOTIF_LOADED=""
+build_notif_index() {
+  local files="$1" f existing=""
+  _NOTIF_LOADED=1
+  for f in $files; do
+    [ -f "$f" ] && existing="$existing $f"
+  done
+  [ -n "$existing" ] || { _NOTIF_IDX=" "; return 0; }
+  # shellcheck disable=SC2086
+  _NOTIF_IDX="$(grep -hF '<task-notification>' $existing 2>/dev/null \
+    | perl -ne 'while(m{<task-id>([^<]+)</task-id>.*?<status>([^<]+)</status>}g){print "$1\t$2\n"}' 2>/dev/null \
+    | awk -F'\t' 'NF==2{last[$1]=$2} END{printf " "; for(k in last) printf "%s:%s ", k, last[k]}')"
+  [ -n "$_NOTIF_IDX" ] || _NOTIF_IDX=" "
+}
+
+# Terminal status for one task id, or "" when the harness never notified.
+_notif_status() {
+  local id="$1"
+  [ -n "$_NOTIF_LOADED" ] || return 0
+  case "$_NOTIF_IDX" in
+    *" $id:completed "*) printf 'completed' ;;
+    *" $id:failed "*)    printf 'failed'    ;;
+    *" $id:killed "*)    printf 'killed'    ;;
+  esac
 }
 
 # ── terminal marker: a sibling <id>.status (fixtures / future harness use) ─────
@@ -287,64 +405,127 @@ _terminal_state() {
 # ── core enumeration ──────────────────────────────────────────────────────────
 # Emits `id<TAB>age<TAB>state<TAB>name` per subagent, sorted by id. Shared by
 # list/count/reap/sweep so classification lives in exactly ONE place.
+# Candidate rows: `id<TAB>transcript` for the UNION of both sources, deduped.
+# Source 1 is the task dir. Source 2 is the subagents dir, restricted to parked
+# mailbox teammates — the class that never gets an `.output` entry. A `grep -l`
+# over the sidecars narrows 157 files to the handful that matter in one process.
+_collect_candidates() {
+  local taskdir="$1" subdirs="$2" f d m id tr meta seen=" "
+  if [ -n "$taskdir" ] && [ -d "$taskdir" ]; then
+    for f in "$taskdir"/*.output; do
+      [ -e "$f" ] || continue
+      id="${f##*/}"; id="${id%.output}"
+      tr="$(_transcript_for "$taskdir" "$id")"
+      meta=""
+      [ -n "$tr" ] && [ -f "${tr%.jsonl}.meta.json" ] && meta="${tr%.jsonl}.meta.json"
+      # NOT AN AGENT: a background Bash task. The harness writes those into the
+      # very same dir with a b+8/9 id and no agent metadata at all.
+      if [ -z "$meta" ] && { [ -z "$tr" ] || [ ! -f "$tr" ]; }; then
+        case "$id" in
+          b[0-9a-z][0-9a-z][0-9a-z][0-9a-z][0-9a-z][0-9a-z][0-9a-z][0-9a-z]|\
+          b[0-9a-z][0-9a-z][0-9a-z][0-9a-z][0-9a-z][0-9a-z][0-9a-z][0-9a-z][0-9a-z])
+            continue ;;
+        esac
+      fi
+      case "$seen" in *" $id "*) continue ;; esac
+      seen="$seen$id "
+      printf '%s\t%s\n' "$id" "$tr"
+    done
+  fi
+  for d in $subdirs; do
+    [ -d "$d" ] || continue
+    for m in $(grep -lF 'in_process_teammate' "$d"/*.meta.json 2>/dev/null); do
+      id="${m##*/}"; id="${id%.meta.json}"; id="${id#agent-}"
+      [ -n "$id" ] || continue
+      case "$seen" in *" $id "*) continue ;; esac
+      seen="$seen$id "
+      printf '%s\t%s\n' "$id" "${m%.meta.json}.jsonl"
+    done
+  done
+}
+
 enumerate() {
-  local taskdir reaped f id mt age term state name kind meta tr last alive slug
+  local taskdir subdirs reaped cands sessions tsess slug
+  local id tr meta mt age term state name kind nstat sess row
   taskdir="$(resolve_taskdir)"
-  [ -n "$taskdir" ] && [ -d "$taskdir" ] || return 0   # fail-closed: no agents
+  subdirs="$(resolve_subagentsdirs current)"
+  cands="$(_collect_candidates "$taskdir" "$subdirs")"
+  [ -n "$cands" ] || return 0          # fail-closed: no agents
+
   reaped="$(load_reaped)"
-  slug="$(_slug_of_taskdir "$taskdir")"
-  for f in "$taskdir"/*.output; do
-    [ -e "$f" ] || continue
-    id="${f##*/}"; id="${id%.output}"
-    mt="$(_mtime "$f")"
+  if [ -n "$taskdir" ]; then
+    slug="$(_slug_of_taskdir "$taskdir")"
+    tsess="$(_session_of_taskdir "$taskdir")"
+  else
+    slug="$(_slug_now)"; tsess=""
+  fi
+
+  # Every session that could hold a task-notification for these agents: the task
+  # dir's own session plus the session that actually owns each transcript (they
+  # differ in practice).
+  sessions=" "
+  [ -n "$tsess" ] && sessions=" $tsess "
+  while IFS=$'\t' read -r id tr; do
+    [ -n "$tr" ] || continue
+    sess="$(_session_of_transcript "$tr")"
+    [ -n "$sess" ] || continue
+    case "$sessions" in *" $sess "*) ;; *) sessions="$sessions$sess " ;; esac
+  done <<< "$cands"
+  local notif_files="" s
+  for s in $sessions; do
+    notif_files="$notif_files $(_session_transcript "$slug" "$s")"
+  done
+  build_notif_index "$notif_files"
+
+  while IFS=$'\t' read -r id tr; do
+    [ -n "$id" ] || continue
+    mt=0
+    if [ -n "$tr" ] && [ -e "$tr" ]; then mt="$(_mtime "$tr")"
+    elif [ -n "$taskdir" ] && [ -e "$taskdir/$id.output" ]; then mt="$(_mtime "$taskdir/$id.output")"
+    fi
     age=$(( NOW - mt ))
     [ "$age" -lt 0 ] && age=0
 
-    tr="$(_transcript_for "$taskdir" "$id")"
     meta=""; name=""; kind=""
-    if [ -n "$tr" ]; then
+    if [ -n "$tr" ] && [ -f "${tr%.jsonl}.meta.json" ]; then
       meta="${tr%.jsonl}.meta.json"
-      if [ -f "$meta" ]; then
-        name="$(jq -r '.name // ""' "$meta" 2>/dev/null)"
-        kind="$(jq -r '.taskKind // ""' "$meta" 2>/dev/null)"
-      else
-        meta=""
-      fi
-    fi
-
-    # NOT AN AGENT: a background Bash task. The harness writes those into the very
-    # same dir with a b+8/9 id and no agent metadata. Counting them as subagents
-    # was a false positive in the previous version.
-    if [ -z "$meta" ] && { [ -z "$tr" ] || [ ! -f "$tr" ]; }; then
-      case "$id" in
-        b[0-9a-z][0-9a-z][0-9a-z][0-9a-z][0-9a-z][0-9a-z][0-9a-z][0-9a-z]|\
-        b[0-9a-z][0-9a-z][0-9a-z][0-9a-z][0-9a-z][0-9a-z][0-9a-z][0-9a-z][0-9a-z])
-          continue ;;
-      esac
+      name="$(jq -r '.name // ""' "$meta" 2>/dev/null)"
+      kind="$(jq -r '.taskKind // ""' "$meta" 2>/dev/null)"
     fi
     [ -n "$name" ] || name="-"
+    sess="$(_session_of_transcript "$tr")"
+    [ -n "$sess" ] || sess="$tsess"
 
     state=""
     case "$reaped" in *" $id "*) state="reaped" ;; esac
 
+    # THE GUARD, FIRST: an agent awaiting a tool result is alive regardless of
+    # age, of a dead session, or of any earlier notification (it may have been
+    # resumed). This is what makes a 40-minute build safe from the reaper.
+    if [ -z "$state" ] && _awaiting_tool_result "$tr"; then
+      if [ "$age" -ge "$HUNG_SECS" ]; then state="hung"; else state="working"; fi
+    fi
+
+    # AUTHORITATIVE COMPLETION EVIDENCE, SECOND. A notified result outranks every
+    # negative state below — most importantly `orphaned`. An agent that finished
+    # and returned its report is a success, not a corpse, and stays a success
+    # even after its session is gone.
     if [ -z "$state" ]; then
-      # THE GUARD, FIRST: an agent awaiting a tool result is alive regardless of
-      # age. Only consult the transcript once the cheap age test says "suspect" —
-      # a fresh agent is live either way, so `count` stays fast.
-      if [ "$age" -ge "$STALE_SECS" ]; then
-        last="$(_last_event_kind "$tr")"
-        if [ "$last" = "tool_use" ]; then
-          if [ "$age" -ge "$HUNG_SECS" ]; then state="hung"; else state="working"; fi
-        fi
-      fi
+      nstat="$(_notif_status "$id")"
+      case "$nstat" in
+        completed) state="done"   ;;
+        failed)    state="failed" ;;
+        killed)    state="killed" ;;
+      esac
     fi
 
     if [ -z "$state" ]; then
-      term="$(_terminal_state "$taskdir/$id.status")"
+      term=""
+      [ -n "$taskdir" ] && term="$(_terminal_state "$taskdir/$id.status")"
       if [ -n "$term" ]; then
         state="$term"
-      elif [ "$age" -ge "$STALE_SECS" ] && ! session_is_alive "$slug"; then
-        # Owning session process is gone ⇒ this in-process agent is provably dead.
+      elif [ "$age" -ge "$STALE_SECS" ] && ! session_is_alive "$slug" "$sess"; then
+        # No completion evidence AND the owning session is gone ⇒ provably dead.
         state="orphaned"
       elif [ "$kind" = "in_process_teammate" ]; then
         state="mailbox"
@@ -355,7 +536,7 @@ enumerate() {
       fi
     fi
     printf '%s\t%s\t%s\t%s\n' "$id" "$age" "$state" "$name"
-  done | sort
+  done <<< "$cands" | sort
 }
 
 # ── subcommands ───────────────────────────────────────────────────────────────
@@ -374,9 +555,11 @@ cmd_list() {
     echo "no tracked subagents"
     return 0
   fi
-  printf '%-22s %8s  %-9s %s\n' "SUBAGENT" "AGE(s)" "STATE" "NAME"
+  # Width 42: named teammates carry their name in the id (atermprobe-<16 hex>),
+  # so a 22-column field ragged-wrapped every agent this tool most needs to show.
+  printf '%-42s %8s  %-9s %s\n' "SUBAGENT" "AGE(s)" "STATE" "NAME"
   printf '%s\n' "$rows" | while IFS=$'\t' read -r id age state name; do
-    printf '%-22s %8s  %-9s %s\n' "$id" "$age" "$state" "$name"
+    printf '%-42s %8s  %-9s %s\n' "$id" "$age" "$state" "$name"
   done
 }
 
@@ -386,6 +569,41 @@ cmd_count() {
   local n
   n="$(enumerate | awk -F'\t' '$3=="live" || $3=="working"' | wc -l | tr -d ' ')"
   printf '%s\n' "${n:-0}"
+}
+
+# ── orphans: the operator-facing view of what needs attention ────────────────
+# Everything that is NOT live, NOT working and NOT a returned result: parked
+# mailbox teammates (restart-only), provably-dead orphans, wedged and stale
+# agents. This is the class the tool exists to surface, so it gets its own
+# subcommand rather than making an operator eyeball a full `list`.
+_orphan_rows() {
+  enumerate | awk -F'\t' '$3=="mailbox" || $3=="orphaned" || $3=="hung" || $3=="stale"'
+}
+
+cmd_orphans() {
+  local as_json="" rows
+  [ "${1:-}" = "--json" ] && as_json=1
+  rows="$(_orphan_rows)"
+  if [ -n "$as_json" ]; then
+    if [ -z "$rows" ]; then echo '[]'; return 0; fi
+    printf '%s\n' "$rows" | jq -R -s '
+      split("\n") | map(select(length>0) | split("\t"))
+      | map({id: .[0], age_secs: (.[1]|tonumber), state: .[2], name: .[3]})'
+    return 0
+  fi
+  if [ -z "$rows" ]; then
+    echo "no orphaned, parked or wedged subagents"
+    return 0
+  fi
+  printf '%-42s %8s  %-9s %s\n' "SUBAGENT" "AGE(s)" "STATE" "NAME"
+  printf '%s\n' "$rows" | while IFS=$'\t' read -r id age state name; do
+    printf '%-42s %8s  %-9s %s\n' "$id" "$age" "$state" "$name"
+  done
+  if printf '%s\n' "$rows" | awk -F'\t' '$3=="mailbox"{f=1} END{exit !f}'; then
+    echo
+    echo "  mailbox = parked in-process teammate: no PID to signal, no control file."
+    echo "  ONLY A RESTART OF THE OWNING SESSION CLEARS THESE."
+  fi
 }
 
 # Record one id in heimdall's own registry. jq is the single writer.
@@ -415,6 +633,7 @@ _do_reap() {
       stale)    reason="stale" ;;
       failed)   reason="failed" ;;
       done)     reason="done" ;;
+      killed)   reason="killed" ;;
       hung)     reason="hung" ;;
       orphaned) reason="orphaned" ;;
       mailbox)  reason="mailbox-parked" ;;
@@ -532,15 +751,18 @@ cmd_sweep() {
   fi
 }
 
-usage() { sed -n '2,110p' "$0" | sed 's/^# \{0,1\}//'; }
+# Print the comment header, stopping at the first non-comment line so the help
+# text cannot drift out of sync with the file when the header changes length.
+usage() { sed -n '2,${/^[^#]/q;p;}' "$0" | sed 's/^# \{0,1\}//'; }
 
 main() {
   local sub="${1:-}"
   case "$sub" in
-    list)   shift; cmd_list "$@" ;;
-    count)  shift; cmd_count "$@" ;;
-    reap)   shift; cmd_reap "$@" ;;
-    sweep)  shift; cmd_sweep "$@" ;;
+    list)    shift; cmd_list "$@" ;;
+    count)   shift; cmd_count "$@" ;;
+    orphans) shift; cmd_orphans "$@" ;;
+    reap)    shift; cmd_reap "$@" ;;
+    sweep)   shift; cmd_sweep "$@" ;;
     -h|--help|help|'') usage ;;
     *) echo "error: unknown subcommand: $sub" >&2; usage >&2; exit 2 ;;
   esac
