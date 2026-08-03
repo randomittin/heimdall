@@ -1,0 +1,424 @@
+#!/usr/bin/env bash
+# heimdall-weekly-log — the weekly "what the watchman learned" changelog generator.
+#
+# Turns the last week of merged commits, the learned-rule review queue, and
+# cohort-credited fixes into TWO staged drafts: a /log post and a release-notes
+# slice, sized for a ~2-minute human edit. It NEVER publishes. Output lands under
+# launch-docs/drafts/ carrying `publish: false`, and the generator makes no
+# network call of any kind.
+#
+# THE CONSENT + k-ANONYMITY CONTRACT (DATA.md §7 — k >= 5, the floor that section
+# already mandates for "blog figures", which is exactly this surface):
+#   * A NAMED team credit requires RECORDED CONSENT: the `Credit-Team:` commit
+#     trailer. That trailer is the provenance, so every credit traces to a sha.
+#     No trailer -> the fix still ships in the changelog, anonymised.
+#   * The credit cohort is k-anonymous. Fewer than k distinct credited teams and
+#     the whole credits block collapses to the SUPPRESSION MARKER, matching
+#     bin/lib/cp_corpus_aggregate.py:121 (_publish_bucket): a reader may see that
+#     a small cell EXISTS (the distinct-team count) and never any of its detail.
+#   * Commit BODIES are never copied. Only subjects reach a draft, and every
+#     subject is scrubbed of mechanically-detectable identifiers (emails,
+#     @handles) first.
+#   * When in doubt it DROPS the detail. This runs unattended every Monday, and a
+#     generator that leaks a customer detail once is never trusted again.
+#
+# FACTUAL DISCIPLINE: every line traces to a commit sha read from `git log`, never
+# from a transcript. Nothing is rounded or estimated. The release-notes slice
+# carries a provenance block so each number can be re-derived by hand.
+#
+# RULE VOCABULARY (bin/lib/cp_corpus_synth.py:7): rule synthesis is SHADOW ONLY —
+# proposals land with enforced=false / status="pending_review" and a human
+# promotes them out of band. Drafts therefore say "proposals awaiting review".
+# Heimdall does not auto-synthesize rules and this generator never writes that it does.
+#
+# Usage:
+#   heimdall-weekly-log [options]
+#
+# Options:
+#   --since <when>      Window start, any git date expr (default: "7 days ago")
+#   --until <when>      Window end, any git date expr (default: "now")
+#   --k <n>             k-anonymity floor for the credit cohort (default: 5)
+#   --out <dir>         Draft output directory (default: <repo>/launch-docs/drafts)
+#   --repo <dir>        Repository to read history from (default: this checkout)
+#   --proposals <path>  Learned-rule review queue (ndjson). Default:
+#                       <repo>/.planning/corpus/proposals/queue.ndjson
+#   --stdout            Print the /log draft to stdout; write no files
+#   --slice             With --stdout, print the release-notes slice instead
+#   -h, --help          This text
+#
+# Exit: 0 drafts generated (including an honest zero-activity draft); 2 usage/env.
+set -euo pipefail
+
+SELF="$0"
+usage() { sed -n '2,47p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+command -v git >/dev/null 2>&1 || { echo "error: git is required" >&2; exit 2; }
+command -v jq  >/dev/null 2>&1 || { echo "error: jq is required" >&2; exit 2; }
+
+SINCE="7 days ago"
+UNTIL="now"
+K_MIN=5
+OUT_DIR=""
+REPO_DIR=""
+PROPOSALS=""
+TO_STDOUT=false
+WANT_SLICE=false
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --since)     SINCE="${2:?--since needs a value}"; shift 2 ;;
+    --until)     UNTIL="${2:?--until needs a value}"; shift 2 ;;
+    --k)         K_MIN="${2:?--k needs a value}"; shift 2 ;;
+    --out)       OUT_DIR="${2:?--out needs a value}"; shift 2 ;;
+    --repo)      REPO_DIR="${2:?--repo needs a value}"; shift 2 ;;
+    --proposals) PROPOSALS="${2:?--proposals needs a value}"; shift 2 ;;
+    --stdout)    TO_STDOUT=true; shift ;;
+    --slice)     WANT_SLICE=true; shift ;;
+    -h|--help)   usage; exit 0 ;;
+    *) echo "error: unknown option: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+case "$K_MIN" in
+  ''|*[!0-9]*) echo "error: --k must be a positive integer" >&2; exit 2 ;;
+esac
+[ "$K_MIN" -ge 1 ] || { echo "error: --k must be >= 1" >&2; exit 2; }
+
+if [ -z "$REPO_DIR" ]; then
+  REPO_DIR="$(cd "$(dirname "$SELF")/.." && pwd)"
+fi
+[ -d "$REPO_DIR" ] || { echo "error: --repo is not a directory: $REPO_DIR" >&2; exit 2; }
+git -C "$REPO_DIR" rev-parse --git-dir >/dev/null 2>&1 \
+  || { echo "error: not a git repository: $REPO_DIR" >&2; exit 2; }
+
+[ -n "$OUT_DIR" ]   || OUT_DIR="$REPO_DIR/launch-docs/drafts"
+[ -n "$PROPOSALS" ] || PROPOSALS="$REPO_DIR/.planning/corpus/proposals/queue.ndjson"
+
+US=$'\x1f'   # field separator inside one commit record
+RS=$'\x1e'   # separator between multiple Credit-Team values on one commit
+
+WORK="$(mktemp -d)"
+cleanup() { rm -rf "$WORK"; }
+trap cleanup EXIT
+
+# ── the guards ───────────────────────────────────────────────────────────────
+
+# Strip mechanically-detectable identifiers out of any text bound for a public
+# draft. Emails and @handles name a person; neither carries recorded consent, so
+# neither survives into a draft. This is a floor, not a claim of completeness —
+# the only text allowed to NAME anyone is a Credit-Team trailer value.
+scrub_identifying() {
+  printf '%s' "$1" | sed -E \
+    -e 's/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z][A-Za-z]+/[redacted-email]/g' \
+    -e 's/(^|[[:space:]])@[A-Za-z0-9_-][A-Za-z0-9_-]+/\1[redacted-handle]/g'
+}
+
+# The conventional-commit type of a subject, or "other".
+commit_type() {
+  printf '%s' "$1" | sed -nE 's/^([a-z]+)(\([^)]*\))?!?:.*/\1/p'
+}
+
+# ── read the window ──────────────────────────────────────────────────────────
+# --no-merges: merge commits restate their branch; the work is in the non-merge
+# commits. Bodies are never requested, so no incident detail can reach a draft.
+
+git -C "$REPO_DIR" log --no-merges \
+  --since="$SINCE" --until="$UNTIL" \
+  --pretty=tformat:"%h${US}%s${US}%(trailers:key=Credit-Team,valueonly,separator=${RS})" \
+  > "$WORK/raw.txt" 2>/dev/null || :
+
+: > "$WORK/entries.txt"     # type <US> sha <US> scrubbed subject
+: > "$WORK/credits.txt"     # team <US> sha
+: > "$WORK/teams.txt"       # one credited team per line (pre-dedupe)
+
+TOTAL=0
+SKIPPED_AUTOMATION=0
+
+while IFS="$US" read -r sha subject credits; do
+  [ -n "${sha:-}" ] || continue
+  TOTAL=$((TOTAL + 1))
+
+  # Session bookkeeping is not shipped work. Excluded from the reader-facing
+  # sections and counted in provenance so the arithmetic stays auditable.
+  case "$subject" in
+    "heimdall: session-end checkpoint"*|"heimdall: checkpoint"*)
+      SKIPPED_AUTOMATION=$((SKIPPED_AUTOMATION + 1)); continue ;;
+  esac
+
+  safe_subject="$(scrub_identifying "$subject")"
+  ctype="$(commit_type "$safe_subject")"
+  [ -n "$ctype" ] || ctype="other"
+  printf '%s%s%s%s%s\n' "$ctype" "$US" "$sha" "$US" "$safe_subject" >> "$WORK/entries.txt"
+
+  # CONSENT: only a Credit-Team trailer produces a named credit, and it is
+  # bound to this sha — that binding is the provenance.
+  if [ -n "${credits:-}" ]; then
+    printf '%s\n' "$credits" | tr "$RS" '\n' | while IFS= read -r team; do
+      team="$(printf '%s' "$team" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+      [ -n "$team" ] || continue
+      printf '%s%s%s\n' "$(scrub_identifying "$team")" "$US" "$sha" >> "$WORK/credits.txt"
+      printf '%s\n' "$(scrub_identifying "$team")" >> "$WORK/teams.txt"
+    done
+  fi
+done < "$WORK/raw.txt"
+
+# `wc -l` over a known-newline-terminated file, not `grep -c`: grep prints 0 AND
+# exits 1 on no match, so a `|| echo 0` fallback would emit the count twice.
+count_lines() { wc -l < "$1" | tr -d '[:space:]'; }
+
+SHIPPED=$(count_lines "$WORK/entries.txt")
+
+sort -u "$WORK/teams.txt" > "$WORK/teams.uniq"
+DISTINCT_TEAMS=$(count_lines "$WORK/teams.uniq")
+cut -d"$US" -f2 "$WORK/credits.txt" | sort -u | sed '/^$/d' > "$WORK/credited-shas.txt"
+CREDITED_COMMITS=$(count_lines "$WORK/credited-shas.txt")
+
+# THE HARD GATE — mirrors bin/lib/cp_corpus_aggregate.py:121 (_publish_bucket).
+# Below k_min the cohort publishes NO detail, only that a small cell exists.
+CREDITS_SUPPRESSED=false
+if [ "$DISTINCT_TEAMS" -lt "$K_MIN" ]; then
+  CREDITS_SUPPRESSED=true
+fi
+
+# ── the learned-rule review queue ────────────────────────────────────────────
+# Shadow loop output. A count is written only when the queue was actually read;
+# an unreadable queue yields no claim at all, because an untraceable number is cut.
+
+PROPOSALS_READ=false
+PENDING_RULES=0
+if [ -f "$PROPOSALS" ]; then
+  PROPOSALS_READ=true
+  PENDING_RULES=$(jq -s '[.[] | select(.status == "pending_review")] | length' \
+                    "$PROPOSALS" 2>/dev/null || echo 0)
+  case "$PENDING_RULES" in ''|*[!0-9]*) PENDING_RULES=0 ;; esac
+fi
+
+# ── dates ────────────────────────────────────────────────────────────────────
+WEEK_END="$(git -C "$REPO_DIR" log -1 --since="$SINCE" --until="$UNTIL" \
+              --pretty=tformat:%cs 2>/dev/null | head -1 || :)"
+[ -n "$WEEK_END" ] || WEEK_END="$(date -u +%Y-%m-%d)"
+WEEK_START="$(git -C "$REPO_DIR" log --since="$SINCE" --until="$UNTIL" \
+                --pretty=tformat:%cs 2>/dev/null | tail -1 || :)"
+[ -n "$WEEK_START" ] || WEEK_START="$WEEK_END"
+GENERATED="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+SLUG="log-week-$WEEK_END"
+
+type_label() {
+  case "$1" in
+    feat)     echo "Shipped" ;;
+    fix)      echo "Fixed" ;;
+    perf)     echo "Faster" ;;
+    refactor) echo "Reshaped" ;;
+    docs)     echo "Documented" ;;
+    test)     echo "Proven" ;;
+    chore)    echo "Housekeeping" ;;
+    *)        echo "Other" ;;
+  esac
+}
+
+count_type() {
+  awk -F"$US" -v t="$1" '$1 == t { c++ } END { print c + 0 }' "$WORK/entries.txt"
+}
+
+emit_type_section() {
+  # $1 type, $2 heading
+  local t="$1" heading="$2" n
+  n="$(count_type "$t")"
+  [ "$n" -gt 0 ] || return 0
+  printf '### %s\n\n' "$heading"
+  awk -F"$US" -v t="$t" '$1 == t { printf "- %s (`%s`)\n", $3, $2 }' "$WORK/entries.txt"
+  printf '\n'
+}
+
+# ── the /log post draft ──────────────────────────────────────────────────────
+
+render_post() {
+  if [ "$SHIPPED" -eq 0 ]; then
+    cat <<EOF
+---
+title: Nothing shipped this week
+date: $WEEK_END
+slug: $SLUG
+description: No commits landed in the window $WEEK_START to $WEEK_END. The log records that too.
+tags: [changelog, weekly]
+author: Heimdall Engineering
+status: draft
+publish: false
+generated: $GENERATED
+generator: bin/heimdall-weekly-log
+window: $WEEK_START..$WEEK_END
+---
+
+No commits landed between $WEEK_START and $WEEK_END.
+
+A week with no work in it is a fact about the week. Writing a summary anyway would
+make this log a thing you cannot read for signal, so the entry stays empty and true.
+
+*Nothing ships unproven.*
+EOF
+    return 0
+  fi
+
+  cat <<EOF
+---
+title: What the watchman learned, week ending $WEEK_END
+date: $WEEK_END
+slug: $SLUG
+description: $SHIPPED commits landed between $WEEK_START and $WEEK_END. Every line below carries the sha it came from.
+tags: [changelog, weekly]
+author: Heimdall Engineering
+status: draft
+publish: false
+generated: $GENERATED
+generator: bin/heimdall-weekly-log
+window: $WEEK_START..$WEEK_END
+---
+
+$SHIPPED commits landed between $WEEK_START and $WEEK_END. Each line carries the sha
+it was read from, so any claim here can be checked with \`git show\`.
+
+EOF
+
+  emit_type_section feat     "$(type_label feat)"
+  emit_type_section fix      "$(type_label fix)"
+  emit_type_section perf     "$(type_label perf)"
+  emit_type_section refactor "$(type_label refactor)"
+  emit_type_section test     "$(type_label test)"
+  emit_type_section docs     "$(type_label docs)"
+  emit_type_section chore    "$(type_label chore)"
+  emit_type_section other    "$(type_label other)"
+
+  if [ "$PROPOSALS_READ" = true ]; then
+    printf '## Rules\n\n'
+    if [ "$PENDING_RULES" -gt 0 ]; then
+      printf '%s proposals are awaiting review. A proposal is a clustered deny-context, not\n' "$PENDING_RULES"
+      printf 'an enforced rule: it lands with enforced=false and a human promotes it, or does\n'
+      printf 'not, out of band. Nothing in that queue gates anything today.\n\n'
+    else
+      printf 'The review queue is empty. No proposals are awaiting review.\n\n'
+    fi
+  fi
+
+  printf '## Credits\n\n'
+  if [ "$CREDITS_SUPPRESSED" = true ]; then
+    if [ "$DISTINCT_TEAMS" -eq 0 ]; then
+      printf 'No fix this week carried a recorded team credit.\n\n'
+    else
+      printf 'Credited fixes this week came from %s distinct teams, under the k-anonymity\n' "$DISTINCT_TEAMS"
+      printf 'floor of %s. The cohort is too small to name anyone without making them\n' "$K_MIN"
+      printf 'identifiable, so the names are withheld and the fixes are listed above unattributed.\n\n'
+    fi
+  else
+    printf '%s credited fixes came from %s teams, each named with recorded consent.\n\n' \
+      "$CREDITED_COMMITS" "$DISTINCT_TEAMS"
+    sort -u "$WORK/credits.txt" \
+      | awk -F"$US" '{ printf "- %s (`%s`)\n", $1, $2 }'
+    printf '\n'
+  fi
+
+  printf '*Nothing ships unproven.*\n'
+}
+
+# ── the release-notes slice (the operator's staging surface) ─────────────────
+
+render_slice() {
+  cat <<EOF
+# Release notes — week ending $WEEK_END
+
+Window: $WEEK_START..$WEEK_END
+Generated: $GENERATED by bin/heimdall-weekly-log
+Status: DRAFT — staged, not published.
+
+EOF
+
+  if [ "$SHIPPED" -eq 0 ]; then
+    printf 'No commits landed in this window. Nothing to release.\n\n'
+  else
+    emit_type_section feat     "$(type_label feat)"
+    emit_type_section fix      "$(type_label fix)"
+    emit_type_section perf     "$(type_label perf)"
+    emit_type_section refactor "$(type_label refactor)"
+    emit_type_section test     "$(type_label test)"
+    emit_type_section docs     "$(type_label docs)"
+    emit_type_section chore    "$(type_label chore)"
+    emit_type_section other    "$(type_label other)"
+  fi
+
+  cat <<EOF
+## Provenance
+
+Every number above is re-derivable from git. Nothing is rounded or estimated.
+
+- commits in window (--no-merges): $TOTAL
+- excluded as session bookkeeping: $SKIPPED_AUTOMATION
+- classified into the sections above: $SHIPPED
+- source: \`git -C <repo> log --no-merges --since="$SINCE" --until="$UNTIL"\`
+
+## Consent and k-anonymity
+
+- k-anonymity floor: $K_MIN distinct teams (DATA.md §7, which binds blog figures)
+- distinct credited teams in window: $DISTINCT_TEAMS
+- commits carrying a Credit-Team trailer: $CREDITED_COMMITS
+EOF
+
+  if [ "$CREDITS_SUPPRESSED" = true ]; then
+    cat <<EOF
+- credits block: SUPPRESSED
+- suppression reason: k_anonymity ($DISTINCT_TEAMS < $K_MIN)
+
+The credited teams are withheld from the draft. The fixes themselves are listed
+unattributed. Republishing them requires the cohort to reach $K_MIN distinct teams,
+not an override here.
+EOF
+  else
+    cat <<EOF
+- credits block: PUBLISHED ($DISTINCT_TEAMS >= $K_MIN)
+
+Each named team is named because a \`Credit-Team:\` trailer on the crediting commit
+records the consent, and the sha next to the name is that provenance.
+EOF
+  fi
+
+  printf '\n'
+  if [ "$PROPOSALS_READ" = true ]; then
+    printf -- '- learned-rule queue: %s (read)\n' "$PROPOSALS"
+    printf -- '- proposals awaiting review: %s\n' "$PENDING_RULES"
+  else
+    printf -- '- learned-rule queue: %s (absent — no rule claim made)\n' "$PROPOSALS"
+  fi
+  cat <<'EOF'
+
+Rule promotion is human-reviewed and manual. Proposals land with enforced=false
+and status=pending_review; nothing in the queue gates anything until a maintainer
+promotes it out of band.
+
+## Before publishing
+
+1. Read the subject lines. Cut anything that is noise to a reader outside the repo.
+2. Confirm the credits block matches what those teams agreed to.
+3. Move the post out of drafts/ and set `publish: true` by hand.
+EOF
+}
+
+# ── output ───────────────────────────────────────────────────────────────────
+
+if [ "$TO_STDOUT" = true ]; then
+  if [ "$WANT_SLICE" = true ]; then render_slice; else render_post; fi
+  exit 0
+fi
+
+mkdir -p "$OUT_DIR"
+POST_PATH="$OUT_DIR/$SLUG.md"
+SLICE_PATH="$OUT_DIR/release-notes-week-$WEEK_END.md"
+render_post  > "$POST_PATH"
+render_slice > "$SLICE_PATH"
+
+echo "staged draft:         $POST_PATH"
+echo "staged release notes: $SLICE_PATH"
+echo "window:               $WEEK_START..$WEEK_END ($SHIPPED commits)"
+if [ "$CREDITS_SUPPRESSED" = true ]; then
+  echo "credits:              suppressed (k_anonymity, $DISTINCT_TEAMS < $K_MIN)"
+else
+  echo "credits:              published ($DISTINCT_TEAMS teams >= k=$K_MIN)"
+fi
+echo "published:            no — drafts only, publish: false"
