@@ -305,7 +305,20 @@ FNR == 1 { region = 0; regionkinds = "" }
   # :BEGIN is tested before the bare form because BEGIN and END both satisfy the kind class — testing
   # the bare form first would read `HEIMDALL:PIN:TAG:BEGIN` as a same-line marker and leave the
   # region open forever, silently governing the rest of the file.
-  if (match(line, /HEIMDALL:PIN:[A-Z0-9,]+:BEGIN/)) {
+  #
+  # The PRE-EXISTING generated region is recognised HERE as well as by render_readme, with the
+  # identical TAG,VERSION meaning test/version-pin-conformance.test.sh assigns it. Without this
+  # branch the grammar meant two different things in two places: render_readme regenerates the
+  # region from a template but only for the ROOT README, while packages/runheimdall/README.md
+  # carries the same region and NOTHING rewrote it — so its version badge sat at the previous
+  # release while the conformance gate counted the marker as proof that something did. A marker that
+  # reads as proof and is rewritten by nothing is the exact defect this file exists to end, and
+  # it was live on the npm package README, the surface that already shipped a wrong digest once.
+  if (line ~ /HEIMDALL:VERSION:BEGIN/) {
+    region = 1; regionkinds = "TAG,VERSION"; govern = regionkinds
+  } else if (line ~ /HEIMDALL:VERSION:END/) {
+    region = 0; regionkinds = ""
+  } else if (match(line, /HEIMDALL:PIN:[A-Z0-9,]+:BEGIN/)) {
     k = substr(line, RSTART, RLENGTH); sub(/^HEIMDALL:PIN:/, "", k); sub(/:BEGIN$/, "", k)
     region = 1; regionkinds = k; govern = k
   } else if (line ~ /HEIMDALL:PIN:END/) {
@@ -348,7 +361,7 @@ pin_files() {
     -o -type f '(' -name '*.md' -o -name '*.txt' -o -name '*.json' -o -name '*.toml' \
                    -o -name '*.html' -o -name '*.js' -o -name '*.sh' \
                    -o -name '*.yml' -o -name '*.yaml' ')' -print 2>/dev/null \
-    | sort | xargs grep -lF 'HEIMDALL:PIN:' 2>/dev/null || true
+    | sort | xargs grep -lE 'HEIMDALL:(PIN|VERSION):' 2>/dev/null || true
 }
 
 # assert_pin_render <src> <rendered> <label> — the same refuse-to-write guard render_readme and
@@ -362,6 +375,10 @@ assert_pin_render() {
   if grep -Eq 'HEIMDALL:PIN:[A-Z0-9,]*VERSION' "$src"; then
     grep -Fq "$VERSION" "$out" \
       || die "pin render for $lbl produced no '$VERSION' despite a VERSION marker — refusing to write"
+  fi
+  if grep -Fq 'HEIMDALL:VERSION:BEGIN' "$src"; then
+    grep -Fq "$VERSION" "$out" \
+      || die "pin render for $lbl produced no '$VERSION' despite a HEIMDALL:VERSION region — refusing to write"
   fi
   if grep -Eq 'HEIMDALL:PIN:[A-Z0-9,]*SHA256' "$src"; then
     [ -n "$DIGEST" ] \

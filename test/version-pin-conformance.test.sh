@@ -691,6 +691,15 @@ if [ -f "$RENDERER" ]; then
   grep -Fq 'HEIMDALL:PIN:' "$RENDERER" \
     && ok "bin/heimdall-render-version speaks the HEIMDALL:PIN grammar this gate enforces" \
     || bad "bin/heimdall-render-version does not mention HEIMDALL:PIN — the markers this gate demands would be decoration, rewritten by nothing"
+  # The same demand for the OTHER grammar this gate credits. The sweep above treats a
+  # HEIMDALL:VERSION region as governing TAG,VERSION, which is a claim that something rewrites
+  # what is inside it. That claim was FALSE for packages/runheimdall/README.md: render_readme
+  # only ever regenerated the ROOT README, so the npm package's version badge held the previous
+  # release while this gate reported the line as governed. Credit that the renderer cannot back
+  # is exactly the "marker that lies" this file refuses everywhere else.
+  grep -Fq 'HEIMDALL:VERSION:BEGIN' "$RENDERER" \
+    && ok "bin/heimdall-render-version also renders the HEIMDALL:VERSION regions this gate credits as governed" \
+    || bad "the sweep credits HEIMDALL:VERSION regions as governed, but bin/heimdall-render-version never matches HEIMDALL:VERSION:BEGIN in its pin pass — every such region is decoration, and this gate is vouching for it"
 else
   bad "bin/heimdall-render-version missing — nothing renders the marked pins"
 fi
