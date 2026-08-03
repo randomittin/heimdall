@@ -13,6 +13,11 @@ written in /ghost voice. Every factual number still traces to the repo:
 Tagline everywhere = **Nothing ships unproven.** (RJ-locked). Website `https://runheimdall.dev` ·
 GitHub `https://github.com/randomittin/heimdall` · License `MIT`.
 
+**"Alternative to" / comparison fields** (AlternativeTo, LibHunt, StackShare all ask in some
+form): do not improvise. The sanctioned answers live in
+[`COMPARISON-SHORT-FORMS.md`](COMPARISON-SHORT-FORMS.md) §2, with the guard list in §3. Long form
+behind them: [`log-runner-and-gate.md`](log-runner-and-gate.md).
+
 ---
 
 ## Reusable description blocks
@@ -45,7 +50,7 @@ Your AI agents can't grade their own homework. Heimdall gates every change behin
 | Categories | Developer Tools · Code Review · AI Coding Assistants |
 | Platforms | macOS, Linux (bash 3.2+). Windows not documented. |
 | License | Open Source · MIT |
-| "Alternative to" | Leave blank / skip — no honest 1:1 substitute. If forced: "an open-source verification layer for AI coding agents." Do NOT claim "alternative to Copilot/Claude Code." |
+| "Alternative to" | Use the sanctioned answer in [`COMPARISON-SHORT-FORMS.md`](COMPARISON-SHORT-FORMS.md) §2 (FULL block for a free-text field, ONE-LINE for a capped one). Still: do NOT claim "alternative to Copilot / Claude Code / OpenHands" — there is no 1:1 substitute, and a forced product slot stays empty. |
 
 ## 3.2 OpenAlternative — ⛔ DEFERRED (2026-07-30)
 > Hard-gated: requires **≥10 stars** (repo has 5) AND "Real Application, not CLIs/scripts/AI wrappers"
