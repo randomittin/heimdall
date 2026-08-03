@@ -333,10 +333,18 @@ FNR == 1 { region = 0; regionkinds = "" }
 # holds FIXTURES with deliberately-wrong versions, and rendering a fixture would destroy the
 # gate that depends on it. -mindepth 1 because find evaluates -prune against the START
 # directory too: a checkout literally named `gates` would otherwise prune itself to zero files.
+#
+# drafts/ and archive/ are pruned here for a sharper reason than "the gate ignores them": this
+# is the code that would do the damage. A dated weekly changelog line like
+# `chore(release): v2.3.8 (063155f)` is a quotation of what that commit actually said, and a
+# renderer let loose on it would rewrite it to v2.3.9 while leaving the sha — forging a commit
+# subject that never existed, and falsifying the file's own promise that every line can be
+# checked with `git show`. Refusing to render history is not an omission, it is the feature.
 pin_files() {
   local root="$1"
   find "$root" -mindepth 1 -type d \
-      '(' -name '.?*' -o -name test -o -name tests -o -name gates -o -name node_modules ')' -prune \
+      '(' -name '.?*' -o -name test -o -name tests -o -name gates -o -name node_modules \
+          -o -name drafts -o -name archive ')' -prune \
     -o -type f '(' -name '*.md' -o -name '*.txt' -o -name '*.json' -o -name '*.toml' \
                    -o -name '*.html' -o -name '*.js' -o -name '*.sh' \
                    -o -name '*.yml' -o -name '*.yaml' ')' -print 2>/dev/null \
