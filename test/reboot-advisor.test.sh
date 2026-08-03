@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
 #
-# reboot-advisor.test.sh — acceptance for the HONEST reboot recommendation in
+# reboot-advisor.test.sh — acceptance for the HONEST memory advisory in
 # bin/heimdall-cleanup. RJ's ask: when memory pressure is high but the cause is NOT
-# heimdall, SAY SO and point at a reboot — never let the user infer hmd is the hog.
+# heimdall, SAY SO — never let the user infer hmd is the hog. This suite covers the
+# ATTRIBUTION half; test/wired-holder-advisory.test.sh covers the REMEDY half (a reboot is
+# a temporary reclaim, not the fix — name the persistent holder instead).
 #
 #   bash test/reboot-advisor.test.sh    (exit 0 = all cases pass)
 #
 # THE PROPERTIES, each planted with a fixture a regression flips:
-#   · high memory pressure + hmd CLEAN  → the report AND --advise emit a reboot
-#     recommendation that EXPLICITLY states this is NOT heimdall              (cases 1,2,5)
-#   · the cited swap%/wired figures MATCH the fixture's readings (no bare claim)  (case 3)
+#   · high memory pressure + hmd CLEAN  → the report AND --advise emit a memory
+#     advisory that EXPLICITLY states this is NOT heimdall                    (cases 1,2,5)
+#   · the cited swap%/wired figures MATCH the fixture's readings (no bare claim), and the
+#     hmd MB figure is scoped to the AXIS that measured it (memory is not disk)  (case 3)
 #   · low pressure → NO reboot nag (non-spammy on a healthy machine)             (case 4)
 #   · high pressure + an hmd python LEAK → recommend --apply FIRST, then reboot  (case 6)
 #   · the opt-out (env + marker) fully silences the --advise path                (case 7)
@@ -120,10 +123,19 @@ if printf '%s\n' "$out" | grep -q '95%' && printf '%s\n' "$out" | grep -q 'wired
 else
   bad "cited numbers do NOT match the fixture — a figure was fabricated or dropped"
 fi
-# and the tiny hmd footprint is quantified so the contrast is self-evident
-printf '%s\n' "$out" | grep -q '~0MB of hmd-owned garbage' \
-  && ok "report quantifies the hmd footprint (~0MB) so huge-pressure-vs-tiny-hmd is self-evident" \
-  || bad "report did not cite the actual hmd-reclaimable MB"
+# and the tiny hmd footprint is quantified — but SCOPED to the axis that measured it. The
+# ~0MB used to be printed as "hmd-owned garbage total", which read as covering memory AND
+# disk; a forensic sweep found 100MB of reapable merged worktrees on disk at that same
+# moment. So the memory figure must be labelled MEMORY, and disk reported as its own axis.
+if printf '%s\n' "$out" | grep -q 'MEMORY axis' \
+   && printf '%s\n' "$out" | grep -q '~0MB of hmd-owned'; then
+  ok "report quantifies the hmd footprint PER AXIS (memory labelled, disk reported separately)"
+else
+  bad "report did not cite the hmd-reclaimable MB scoped to the axis that measured it"
+fi
+printf '%s\n' "$out" | grep -q 'of hmd-owned garbage total' \
+  && bad "report still presents one figure as the hmd-owned TOTAL (memory and disk conflated)" \
+  || ok "report no longer conflates the memory and disk figures into a single 'total'"
 
 # ── 4. NON-SPAMMY: low pressure → NO reboot nag ──────────────────────────────────
 lout="$(run_clean "$JSON_LOW" "" report 2>&1)"
