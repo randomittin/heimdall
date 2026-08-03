@@ -1,0 +1,111 @@
+# Heimdall — the install SANDBOX image (path 3 of the README install table).
+#
+# WHY THIS EXISTS. Paths 1 and 2 (`curl … | bash`, `npx runheimdall`) run the
+# installer with YOUR user's privileges against YOUR $HOME. This image runs the
+# SAME install.sh inside a container, so a cautious first-timer can read the
+# script, watch it run, and throw the entire result away with `docker rm`. Every
+# $HOME mutation the installer makes — ~/.heimdall, ~/.claude/settings.json, the
+# ~/.local/bin symlinks, the shell-rc PATH export — lands in a container layer,
+# not on your machine.
+#
+# THIS IS NOT THE OTHER TWO DOCKERFILES IN THIS REPO. Do not merge them:
+#   Dockerfile      — Cloud Run control-plane image (bin/heimdall-control-plane)
+#   Dockerfile.mcp  — the MCP server image
+# This file installs the END-USER CLI and is never deployed anywhere.
+#
+# ── WHAT THIS CONTAINER DOES *NOT* PROTECT ───────────────────────────────────
+# Read this before you trust it. A sandbox you misunderstand is worse than none.
+#
+#   1. A MOUNTED REPO IS NOT ISOLATED. `-v "$PWD:/work"` is a hole you punched on
+#      purpose. Anything hmd writes under /work lands on your real disk. Mount
+#      `:ro` if you only want hmd to read.
+#
+#   2. ACCOUNT-SCOPED SERVICES ARE NOT SANDBOXED BY $HOME. This image is Linux,
+#      so launchd and the macOS keychain do not exist inside it and the nightly
+#      LaunchAgent step reports `unsupported` (install.sh:697). That is the
+#      container being a different OS — not a sandbox defending you. On macOS,
+#      `launchctl` addresses your per-user session domain: a fake $HOME redirects
+#      only the plist FILE (bin/heimdall-dream-schedule:54) while `launchctl load`
+#      (bin/heimdall-dream-schedule:143) still hits your REAL account. That is how
+#      a "sandboxed" test in this repo once rewrote the developer's live
+#      LaunchAgent. The switch is HEIMDALL_NO_DREAM_SCHEDULE=1, never $HOME.
+#
+#   3. THE NETWORK IS OPEN. Team presence is ON by default (IDENTITY.md:32-38),
+#      and this build clones the pinned tag from GitHub. `hmd presence sever`
+#      is the zero-egress switch.
+#
+# ── BUILD + RUN ──────────────────────────────────────────────────────────────
+# Build from a clone, so the install.sh you inspected is byte-for-byte the one
+# that runs — no fetch, no digest to trust, no pipe into a shell:
+#
+#   git clone https://github.com/randomittin/heimdall && cd heimdall
+#   less install.sh
+#   docker build -f Dockerfile.install -t heimdall-sandbox .
+#   docker run --rm -it heimdall-sandbox
+#
+# Let hmd read your real project without granting write access:
+#   docker run --rm -it -v "$PWD:/work:ro" heimdall-sandbox
+#
+# Zero egress for the whole container (strongest posture):
+#   docker run --rm -it --network none heimdall-sandbox
+
+# Node is a hard requirement: Claude Code ships as an npm package, and install.sh
+# aborts its preflight without it. `lts-slim` tracks the Debian-slim LTS line and
+# carries no version pin this repo would have to keep in sync.
+FROM node:lts-slim
+
+# install.sh's runtime dependencies. git clones the pinned tag; jq is a declared
+# prerequisite; python3 backs presence; ca-certificates makes the TLS clone work;
+# bash is the interpreter (the slim base ships dash as /bin/sh); less is what the
+# "read it before you run it" step needs to actually be possible inside the image.
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y \
+       bash ca-certificates curl git jq less python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Claude Code — install.sh preflights for it and fail-closes with
+# "[fail] Claude Code not found / state: nothing installed" when it is absent,
+# writing nothing. Installing it here is what makes the build a real smoke test
+# of the install path rather than a test of the preflight's error branch.
+RUN npm install -g @anthropic-ai/claude-code \
+    && npm cache clean --force
+
+# Non-root, with a real home for the installer to populate — mirrors the least
+# privilege posture of the control-plane image (Dockerfile:53-55). `hmd` needs no
+# sudo, and this proves it.
+RUN useradd --create-home --shell /bin/bash heimdall
+USER heimdall
+WORKDIR /home/heimdall
+
+# The script from YOUR build context — the one you just read. Copied rather than
+# fetched, so this path has no download to verify and no digest to go stale.
+COPY --chown=heimdall:heimdall install.sh /home/heimdall/install.sh
+
+# Run the real installer, unattended, then drop the ONE per-machine secret it
+# mints, in the SAME layer so no image layer ever contains it:
+#   ~/.heimdall/team.json — a 43-char auto-solo team bearer secret. An image is a
+#   copyable artifact; a baked team secret would be shared by every container
+#   started from it. Absent, presence silently re-mints a fresh solo team on first
+#   run (bin/heimdall-presence:412-417), so each container gets its own identity.
+#
+# HEIMDALL_NO_DREAM_SCHEDULE=1 is belt-and-braces: the nightly LaunchAgent step is
+# already Darwin-gated (install.sh:697) and cannot fire on Linux. It is set
+# explicitly so this file states the intent rather than relying on the guard.
+RUN HEIMDALL_NO_DREAM_SCHEDULE=1 bash /home/heimdall/install.sh </dev/null \
+    && rm -f /home/heimdall/.heimdall/team.json
+
+# The installer appends this to the shell rc for future logins; set it in the
+# image so a non-login `docker run` gets a working `hmd` immediately.
+ENV PATH="/home/heimdall/.local/bin:${PATH}"
+
+# Build-time proof that the install path actually produced a working CLI. A broken
+# installer fails the BUILD here — the cheapest place to catch it — instead of
+# shipping an image whose documented entry point does not run. Same guard style as
+# the control-plane image's dependency check (Dockerfile:51).
+RUN hmd version
+
+# /work is the mount point for the user's repo. See hazard 1 above: a read-write
+# mount here is NOT isolated from your real disk.
+WORKDIR /work
+
+CMD ["bash"]
