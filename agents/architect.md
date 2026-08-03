@@ -225,7 +225,7 @@ Format:
 
 Each task `prompt` must be a complete spawn prompt the agent can execute with no further context (it runs in a fresh process). Always emit `waves.json` for plans with 11+ parallel tasks; optional but recommended for any multi-wave plan.
 
-Task `id` is a plan-file label for dependency wiring — it is NOT a spawn `name:`. Dispatch each task with its `id` (or scope) in `description:`; a spawn carrying `name:` is denied (exit 2) by the `PreToolUse` `Agent` hook, since `name:` makes the agent mailbox-resident so it never returns a result (R13).
+Task `id` is a plan-file label for dependency wiring — it is NOT a spawn `name:`. Dispatch each task with its `id` (or scope) in `description:`; a spawn carrying `name:` draws a warning from the `PreToolUse` `Agent` hook (exit 0 — it proceeds, it is not blocked), since `name:` makes the agent mailbox-resident so it never returns a result on the spawn call and the spawner must close it with `TaskStop` (R13).
 
 ## Red Flags — name them before reporting the plan DONE
 

@@ -142,8 +142,12 @@ After completion, run:
 
 For large tasks requiring 3+ parallel workers.
 
-**Roles are carried in `description:`, never `name:`.** A spawn carrying `name:` is DENIED (exit 2)
-by the `PreToolUse` `Agent` hook. `name:` assigns mailbox residency at spawn time: that agent never
+**Roles are carried in `description:`, never `name:`.** A spawn carrying `name:` draws a WARNING from
+the `PreToolUse` `Agent` hook — exit 0, notice on stderr; the spawn proceeds. (It used to be denied
+with exit 2. The deny assumed a named agent could not be closed, which `TaskStop` disproved, and the
+matcher fires on every Agent spawn in every project — so it broke legitimate named teammates
+elsewhere.) The default is still unnamed, because `name:` assigns mailbox residency at spawn time:
+that agent never
 self-terminates and never returns a result to the spawn call. Measured: 0/43 named spawns completed
 vs 59/66 unnamed. It is not recoverable by PROMPT — a controlled pair testing a "terminate, do not
 await messages" clause produced one `idle_notification` each either way, both recorded
@@ -185,10 +189,13 @@ Within a wave: ALL agents in ONE message. Between waves: let the wave return fir
 ### When a named agent is genuinely right
 
 One case: a long-lived conversational agent you will actually drive with `SendMessage` across the
-session. `HEIMDALL_ALLOW_NAMED_AGENT=1` is the deliberate opt-in.
+session. `HEIMDALL_ALLOW_NAMED_AGENT=1` marks it deliberate and silences the hook's notice — the
+spawn was never blocked, so the flag only says "I already know".
 
-That opt-in is now genuinely usable. `agents/heimdall.md` declares `SendMessage` and `TaskStop`, so
-an orchestrator can drive the agent it named AND close it when done.
+That case is genuinely usable. `agents/heimdall.md` declares `SendMessage` and `TaskStop`, so an
+orchestrator can drive the agent it named AND close it when done. Naming one makes its lifecycle
+YOUR job: nothing comes back on the spawn call, so you collect via `SendMessage` and close via
+`TaskStop`.
 
 What did NOT change: the agent is mailbox-resident, never self-terminates, and never returns a result
 to the spawn call. You collect its output via `SendMessage`, not by awaiting the spawn.
@@ -223,8 +230,13 @@ bin/heimdall-agents orphans      # lists parked mailbox teammates by name
 
 `TaskStop` each name whose work is complete, applying the same three checks.
 
-**Verification status: PENDING a session restart.** `TaskStop` was added to the agent definitions in
-`b214eb1`; definitions load at session start, so the session that wrote this rule did not have
-`TaskStop` available and could NOT exercise it end-to-end. The rule is written, not yet proven. First
-session after restart: confirm `TaskStop` closes a parked teammate and that `bin/heimdall-agents
-orphans` drops it from the list.
+**Verification status: `TaskStop` is CONFIRMED PRESENT and functional.** It ships in Claude Code
+2.1.198+ and was added to the agent definitions in `b214eb1`; definitions load at session start, so
+the session that first wrote this rule could not exercise it — a later session could, and `TaskStop`
+correctly enumerated the running agent set.
+
+**Verified scoping limit — this is the part that bites.** `TaskStop` only reaches agents the CALLING
+SESSION spawned. A cross-session stop returns `No task found with ID`. So you can always close what
+YOU opened, and you can NEVER close what another session opened. That is precisely why
+`bin/heimdall-agents orphans` still earns its place: agents stranded by a dead session are beyond
+`TaskStop`'s reach and need the sweep.

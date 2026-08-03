@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# agent-name-gate.test.sh — convention R13 is ENFORCED, not advisory.
+# agent-name-gate.test.sh — convention R13 WARNS; it does not block.
 #
 # WHY THIS FILE EXISTS
 # --------------------
@@ -9,56 +9,70 @@
 #
 #     "The agent is now running and will receive instructions via mailbox."
 #
-# Such an agent never self-terminates and never emits a task-notification. The
-# orchestrator therefore waits forever for a result that CANNOT arrive, and the
-# entry sits `idle` in FleetView until the session dies.
-#
-# Measured across 109 spawns in one real session:
+# Such an agent never self-terminates and never emits a task-notification, so the
+# spawn call itself never yields a result. Measured across 109 spawns in one real
+# session:
 #     with    name:  ->   0 of 43 ever completed
 #     without name:  ->  59 of 66 completed
 #
-# R13 lived in skills/heimdall/SKILL.md as advice. Advice is not a gate: the
-# install-side launchd guard was advisory (an opt-out env var a caller had to
-# remember), it was forgotten within the hour, and it repointed a real nightly
-# job at a doomed worktree. So the rule now BLOCKS, with a deliberate opt-in
-# for the one legitimate case (a long-lived agent you will drive by SendMessage).
+# That measurement still stands, and it is why R13 defaults to unnamed spawns.
+#
+# WHY THIS IS A WARNING AND NOT A DENY
+# ------------------------------------
+# The gate originally exited 2. That rested on a second claim — that the
+# orchestrator had no way to close a named agent — and that claim is now FALSE.
+# `TaskStop` ships in Claude Code 2.1.198+ and was granted to every spawning
+# agent, so a spawner CAN close what it opens. Named agents are a supported,
+# documented feature.
+#
+# Meanwhile the blast radius of the deny was total: this matcher fires on EVERY
+# Agent spawn in EVERY project (heimdall loads via --plugin-dir), so unrelated
+# repos that legitimately spawn named teammates had those spawns hard-fail. A
+# convention default must not break a supported harness feature everywhere.
+#
+# So the hook now WARNS and lets the spawn proceed. The warning carries the one
+# thing the spawner must know: nothing will come back through the spawn call, and
+# the spawner owns the cleanup via TaskStop.
 #
 # WHAT THIS SUITE PROVES
 # ----------------------
-#   1. A spawn carrying name: is DENIED (exit 2) and the reason reaches STDERR.
-#      A PreToolUse hook's block reason is read from stderr; a receipt printed
-#      only to stdout renders as "No stderr output" — this repo hit exactly that
-#      in the stub gate. So stderr is asserted, not assumed.
-#   2. An ordinary unnamed spawn is untouched (exit 0). A gate that blocks
-#      everything is not a gate, it is an outage.
-#   3. HEIMDALL_ALLOW_NAMED_AGENT=1 opts in deliberately.
-#   4. THE REGRESSION: a payload carrying real JSON \n escapes inside a string is
+#   1. A spawn carrying name: PROCEEDS (exit 0) and a warning reaches STDERR.
+#      A PreToolUse hook's message is read from stderr; a receipt printed only to
+#      stdout renders as "No stderr output" — this repo hit exactly that in the
+#      stub gate. So stderr is asserted, not assumed.
+#   2. The warning is ACTIONABLE: it names TaskStop (the cleanup the spawner now
+#      owns), the orphan-finder, the mailbox cause, and the no-result consequence.
+#   3. Nothing blocks. No exit 2 anywhere, on any input, ever.
+#   4. An ordinary unnamed spawn is silent — a warning on every spawn is noise,
+#      and noise gets muted, which is how a signal dies.
+#   5. HEIMDALL_ALLOW_NAMED_AGENT=1 SUPPRESSES the warning ("I know what I'm
+#      doing"). It used to be the only way through; now it is a mute switch.
+#   6. THE REGRESSION: a payload carrying real JSON \n escapes inside a string is
 #      still parsed and judged correctly. `echo "$INPUT" | jq` corrupts such a
-#      payload (macOS /bin/sh expands backslash escapes), jq exits 5, the var
-#      goes empty and the gate skips ITSELF — the bug that disabled 215 of 312
+#      payload (macOS /bin/sh expands backslash escapes), jq exits 5, the var goes
+#      empty and the gate skips ITSELF — the bug that disabled 215 of 312
 #      PreToolUse:Bash invocations here. Both the named and the unnamed
 #      escape-carrying payloads are asserted, so a corrupted parse cannot pass by
 #      accidentally landing on the right verdict.
-#   5. FAIL CLOSED: an unreadable payload does NOT become a silent allow.
-#      Treating "cannot parse" as "no name present" is byte-for-byte the
-#      fail-open shape above, so it is denied instead.
+#   7. A payload the hook cannot read WARNS rather than denies. Fail-safe now
+#      means "say something", never "block a spawn".
 #
-# Usage:  bash test/agent-name-gate.test.sh   (exit 0 = R13 is enforced)
+# Usage:  bash test/agent-name-gate.test.sh   (exit 0 = R13 warns correctly)
 set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$SELF_DIR/.." && pwd)"
 HOOKS="$REPO/hooks/hooks.json"
 
-# The escape hatch must not leak in from the caller's environment, or every deny
-# assertion below would be silently opted out of and the suite would read green.
+# The mute switch must not leak in from the caller's environment, or every
+# warning assertion below would be silently suppressed and the suite read green.
 unset HEIMDALL_ALLOW_NAMED_AGENT
 
 PASS=0; FAIL=0
 ok()  { printf '  \033[32mPASS\033[0m %s\n' "$1"; PASS=$((PASS+1)); }
 bad() { printf '  \033[31mFAIL\033[0m %s\n' "$1"; FAIL=$((FAIL+1)); }
 
-echo "agent-name-gate (R13 enforcement)  repo=$REPO"
+echo "agent-name-gate (R13 warning contract)  repo=$REPO"
 echo "--------------------------------------------------------------------"
 
 if ! command -v jq >/dev/null 2>&1; then
@@ -80,7 +94,7 @@ RC=0
 
 # ── extract the real hook command straight out of hooks.json ────────────────
 # Driving the shipped command itself (never a copy) is what makes this suite
-# falsifiable: neuter the gate in hooks.json and these assertions go red.
+# falsifiable: neuter the warning in hooks.json and these assertions go red.
 jq -r '[.hooks.PreToolUse[] | select(.matcher == "Agent")] | .[0].hooks[0].command // empty' \
   "$HOOKS" > "$GATE"
 
@@ -97,8 +111,8 @@ fire() {
   RC=$?
 }
 
-# fire_optin <payload-file> — same, with the deliberate escape hatch set.
-fire_optin() {
+# fire_muted <payload-file> — same, with the deliberate mute switch set.
+fire_muted() {
   (
     cd "$SANDBOX" || exit 99
     CLAUDE_PLUGIN_ROOT="$REPO" HEIMDALL_ALLOW_NAMED_AGENT=1 sh "$GATE" < "$1" >"$OUT" 2>"$ERR"
@@ -106,11 +120,15 @@ fire_optin() {
   RC=$?
 }
 
-errhas() { grep -qF "$1" "$ERR" 2>/dev/null; }
+errhas()  { grep -qF "$1" "$ERR" 2>/dev/null; }
+# The warning's signature marker. Asserting on a distinctive token (not merely
+# "stderr is non-empty") is what keeps "no warning" cases honest: the
+# parallelism-tracker in the same hook may legitimately write to stderr too.
+warned()  { grep -qF 'BIFRÖST' "$ERR" 2>/dev/null; }
 
 # ── 0. ANTI-VACUOUS: the thing under test actually exists ───────────────────
-# A suite that extracted an empty command would "pass" every allow assertion and
-# prove nothing at all. Establish the subject before judging it.
+# A suite that extracted an empty command would "pass" every proceed assertion
+# and prove nothing at all. Establish the subject before judging it.
 if [ ! -s "$GATE" ]; then
   bad "no PreToolUse Agent hook command found — nothing is under test, aborting"
   echo "--------------------------------------------------------------------"
@@ -120,7 +138,7 @@ fi
 ok "extracted the shipped PreToolUse:Agent hook command ($(wc -c <"$GATE" | tr -d ' ') bytes)"
 
 if [ "$AGENT_MATCHERS" = "1" ]; then
-  ok "exactly one PreToolUse:Agent matcher — the gate extends it, no competing hook"
+  ok "exactly one PreToolUse:Agent matcher — the warning extends it, no competing hook"
 else
   bad "expected 1 PreToolUse:Agent matcher, found $AGENT_MATCHERS — a competing hook was added"
 fi
@@ -168,115 +186,179 @@ else
   bad "fixture is not escape-carrying — the regression case would prove nothing"
 fi
 
-# ── 1. a NAMED spawn is denied, with an actionable reason on STDERR ─────────
+# ── 1. a NAMED spawn PROCEEDS, and carries a warning on STDERR ──────────────
 fire "$NAMED"
-if [ "$RC" = "2" ]; then
-  ok "named spawn BLOCKED (exit 2)"
+if [ "$RC" = "0" ]; then
+  ok "named spawn PROCEEDS (exit 0) — the hook warns, it does not block"
 else
-  bad "named spawn was NOT blocked (exit $RC) — R13 is still advisory"
+  bad "named spawn was blocked (exit $RC) — a supported harness feature is hard-failing"
 fi
 
-if [ -s "$ERR" ]; then
-  ok "block reason reaches stderr (renders, instead of 'No stderr output')"
+if warned; then
+  ok "warning reaches stderr (renders, instead of 'No stderr output')"
 else
-  bad "block reason never reached stderr — the block lands with no receipt"
+  bad "no warning on stderr — the spawn proceeds with the caller told nothing"
+fi
+
+# A PreToolUse hook that exits 0 must not emit a deny-shaped {"error": ...}
+# document on stdout; that is the blocking contract, and shipping it at exit 0
+# is an ambiguous half-block.
+if grep -q '"error"' "$OUT" 2>/dev/null; then
+  bad "named spawn emitted a deny-shaped {\"error\":...} on stdout — that is a block, not a warning"
+else
+  ok "named spawn emits no deny-shaped {\"error\":...} document"
+fi
+
+if errhas 'TaskStop'; then
+  ok "warning names TaskStop — the cleanup the spawner now owns"
+else
+  bad "warning never names TaskStop — the caller is told to worry with no way to act"
+fi
+
+if errhas 'heimdall-agents orphans'; then
+  ok "warning points at bin/heimdall-agents orphans for finding leaked agents"
+else
+  bad "warning does not point at the orphan finder"
 fi
 
 if errhas 'HEIMDALL_ALLOW_NAMED_AGENT'; then
-  ok "reason names the escape hatch (HEIMDALL_ALLOW_NAMED_AGENT=1)"
+  ok "warning names the mute switch (HEIMDALL_ALLOW_NAMED_AGENT=1)"
 else
-  bad "reason does not name the escape hatch — the block is a dead end"
+  bad "warning does not name the mute switch — it cannot be silenced deliberately"
 fi
 
 if errhas 'description:'; then
-  ok "reason points at description: as the way to identify the work"
+  ok "warning points at description: as the way to identify the work"
 else
-  bad "reason does not point at description: — no actionable alternative given"
+  bad "warning does not point at description: — no alternative offered"
 fi
 
 if grep -qi 'mailbox' "$ERR" 2>/dev/null; then
-  ok "reason explains the mailbox-resident cause"
+  ok "warning explains the mailbox-resident cause"
 else
-  bad "reason does not explain WHY a named spawn hangs (mailbox residency)"
+  bad "warning does not explain WHY a named spawn never reports (mailbox residency)"
 fi
 
 if grep -qiE 'never (self-terminate|return)' "$ERR" 2>/dev/null; then
-  ok "reason states the consequence (never self-terminates / never returns)"
+  ok "warning states the consequence (never self-terminates / never returns a result)"
 else
-  bad "reason does not state that a named spawn never returns"
+  bad "warning does not state that a named spawn never returns a result"
 fi
 
-# ── 2. an ordinary UNNAMED spawn is untouched ───────────────────────────────
+# The measured evidence is the whole reason the default is unnamed. Losing it
+# turns the warning into an unfalsifiable opinion.
+if grep -qE '0 of 43|0/43' "$ERR" 2>/dev/null; then
+  ok "warning keeps the measurement (0 of 43 named completed vs 59 of 66 unnamed)"
+else
+  bad "warning dropped the measured evidence — the advice is now unfalsifiable"
+fi
+
+# ── 2. an ordinary UNNAMED spawn is silent ──────────────────────────────────
 fire "$UNNAMED"
 if [ "$RC" = "0" ]; then
   ok "unnamed spawn passes through (exit 0)"
 else
-  bad "unnamed spawn was blocked (exit $RC) — the gate is an outage, not a gate"
+  bad "unnamed spawn was blocked (exit $RC) — the hook is an outage, not a notice"
 fi
 
-if grep -q 'BIFR' "$ERR" 2>/dev/null; then
-  bad "unnamed spawn emitted a block receipt — false positive"
+if warned; then
+  bad "unnamed spawn emitted a warning — false positive, and noise gets muted"
 else
-  ok "unnamed spawn emits no block receipt"
+  ok "unnamed spawn emits no warning"
 fi
 
-# ── 3. the deliberate opt-in ────────────────────────────────────────────────
-fire_optin "$NAMED"
+# ── 3. the deliberate mute switch ───────────────────────────────────────────
+fire_muted "$NAMED"
 if [ "$RC" = "0" ]; then
-  ok "HEIMDALL_ALLOW_NAMED_AGENT=1 lets a named spawn through (deliberate opt-in)"
+  ok "HEIMDALL_ALLOW_NAMED_AGENT=1 + named spawn still proceeds (exit 0)"
 else
-  bad "escape hatch did not work (exit $RC) — a legitimate SendMessage agent is unbuildable"
+  bad "mute switch broke the spawn (exit $RC) — opting in must never be worse than not"
+fi
+
+if warned; then
+  bad "HEIMDALL_ALLOW_NAMED_AGENT=1 did NOT suppress the warning — the mute switch is dead"
+else
+  ok "HEIMDALL_ALLOW_NAMED_AGENT=1 suppresses the warning (deliberate opt-in)"
 fi
 
 # ── 4. THE REGRESSION: escapes inside a JSON string must not corrupt judgment ─
+# If `echo|jq` ever comes back, jq exits 5, NAME goes empty, and the named case
+# below silently stops warning. Asserting exit 0 alone would NOT catch that (the
+# broken hook also exits 0), so the warning itself is the assertion that bites.
 fire "$ESC_NAMED"
-if [ "$RC" = "2" ]; then
-  ok "escape-carrying NAMED payload still blocked — printf parsing holds"
+if [ "$RC" = "0" ]; then
+  ok "escape-carrying NAMED payload proceeds (exit 0)"
 else
-  bad "escape-carrying named payload escaped the gate (exit $RC) — the echo|jq bug is back"
+  bad "escape-carrying named payload was blocked (exit $RC)"
+fi
+
+if warned; then
+  ok "escape-carrying NAMED payload still WARNS — printf parsing holds"
+else
+  bad "escape-carrying named payload produced no warning — the echo|jq bug is back"
 fi
 
 if grep -q 'parse error' "$ERR" 2>/dev/null; then
-  bad "jq parse error on an escape-carrying payload — the gate cannot see its own input"
+  bad "jq parse error on an escape-carrying payload — the hook cannot see its own input"
 else
   ok "no jq parse error on an escape-carrying payload"
 fi
 
 fire "$ESC_UNNAMED"
 if [ "$RC" = "0" ]; then
-  ok "escape-carrying UNNAMED payload still passes — no verdict flip from escapes"
+  ok "escape-carrying UNNAMED payload proceeds (exit 0)"
 else
-  bad "escape-carrying unnamed payload was blocked (exit $RC) — parsing is corrupting the verdict"
+  bad "escape-carrying unnamed payload was blocked (exit $RC)"
 fi
 
-# ── 5. FAIL CLOSED: an unreadable payload is not a silent bypass ────────────
+if warned; then
+  bad "escape-carrying UNNAMED payload warned — parsing is corrupting the verdict"
+else
+  ok "escape-carrying UNNAMED payload stays silent — no verdict flip from escapes"
+fi
+
+# ── 5. FAIL-SAFE now means WARN, never BLOCK ────────────────────────────────
 fire "$MALFORMED"
-if [ "$RC" != "0" ]; then
-  ok "malformed payload does NOT silently allow (exit $RC)"
+if [ "$RC" = "0" ]; then
+  ok "malformed payload does NOT block the spawn (exit 0)"
 else
-  bad "malformed payload silently ALLOWED — unparseable became 'unnamed', the fail-open shape"
+  bad "malformed payload blocked the spawn (exit $RC) — a bad payload must never cost a spawn"
 fi
 
-if [ -s "$ERR" ]; then
-  ok "malformed payload still produces a reason on stderr"
+if warned; then
+  ok "malformed payload still warns (unreadable is not silently 'unnamed')"
 else
-  bad "malformed payload blocked with no explanation on stderr"
+  bad "malformed payload passed silently — an unverifiable spawn with no notice"
 fi
 
 fire "$EMPTY"
-if [ "$RC" != "0" ]; then
-  ok "empty payload does NOT silently allow (exit $RC)"
+if [ "$RC" = "0" ]; then
+  ok "empty payload does NOT block the spawn (exit 0)"
 else
-  bad "empty payload silently ALLOWED — jq exits 0 on empty stdin, so this must be caught explicitly"
+  bad "empty payload blocked the spawn (exit $RC)"
 fi
 
-# ── 6. STRUCTURAL: the gate is wired the way it must stay wired ─────────────
+if warned; then
+  ok "empty payload still warns (jq exits 0 on empty stdin, so this is caught explicitly)"
+else
+  bad "empty payload passed silently — absence of name: was assumed, not verified"
+fi
+
+# ── 6. STRUCTURAL: the hook is wired the way it must stay wired ─────────────
 CMD_TEXT=$(cat "$GATE")
 
 case "$CMD_TEXT" in
   *tool_input.name*) ok "hook reads .tool_input.name (the field that triggers mailbox mode)" ;;
-  *) bad "hook never reads .tool_input.name — nothing enforces R13" ;;
+  *) bad "hook never reads .tool_input.name — nothing implements R13" ;;
 esac
+
+# The load-bearing downgrade assertion. A behavioural test can only sample the
+# payloads it thought of; this one proves no input at all can produce a block.
+if printf '%s' "$CMD_TEXT" | grep -qE 'exit[[:space:]]+2'; then
+  bad "hook still contains an 'exit 2' — some input path can still DENY a spawn"
+else
+  ok "hook contains no 'exit 2' — no input path can block a spawn"
+fi
 
 if printf '%s' "$CMD_TEXT" | grep -qE "printf[[:space:]]+'%s'[[:space:]]+\"\\\$INPUT\"[[:space:]]*\|[[:space:]]*jq"; then
   ok "payload reaches jq via printf '%s' (byte-exact), not echo"
