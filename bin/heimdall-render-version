@@ -17,15 +17,56 @@
 #                                Rewritten in place with anchored regexes keyed on their
 #                                surrounding text — only those two spots move; every other line
 #                                (and any historical version reference) is passed through untouched.
+#   3. MARKED PINS (HEIMDALL:PIN) — every remaining hand-typed version/digest, in this repo AND
+#                                in the marketing site checkout. See the grammar below.
 #
 # The remaining surfaces (packages/runheimdall/package.json, vercel.json, _redirects,
 # install.sh DEFAULT_REF) are tag-derived and rendered by release/sync-release.sh, which
 # ship.sh calls with the same tag. This script deliberately does NOT duplicate that logic.
 #
+# ── 3. The HEIMDALL:PIN marker grammar ───────────────────────────────────────
+# Surfaces 1, 2 and 2b are each rendered by a rule keyed on that ONE spot's surrounding text.
+# That does not scale to a marketing site: runheimdall.dev carries ~35 hand-typed pins across
+# a dozen published pages, and hand-typing is exactly how it came to serve v2.0.16, v2.2.2,
+# v2.2.6 and 2.3.3 simultaneously while the plugin shipped 2.3.8 — and how README.md pinned a
+# sha256 that did not describe the bytes beside it, killing the advertised install (`shasum -c`
+# prints FAILED, the `&&` chain aborts, nothing after it runs).
+#
+# So the pin declares itself, in place, and this renderer rewrites it from plugin.json:
+#
+#   HEIMDALL:PIN:<KINDS>              governs the line it sits on
+#   HEIMDALL:PIN:<KINDS>:BEGIN        opens a region  ─┐ governs every line between them
+#   HEIMDALL:PIN:END                  closes it       ─┘ (and the BEGIN line itself)
+#
+# <KINDS> is a comma-joined subset of:
+#   TAG      every `vX.Y.Z` on the line   -> v<manifest version>
+#   VERSION  every bare `X.Y.Z`           -> <manifest version>
+#   SHA256   every pinned 64-hex digest   -> the sha256 of THIS tag's install.sh
+#   FROZEN   deliberately NOT current     -> left alone (a foreign/historical version)
+#
+# The marker lives inside whatever comment syntax the file already uses (`<!-- -->`, `//`, `#`)
+# so it is inert in the published artifact. The region form exists for the two real surfaces
+# that CANNOT take an inline comment: JSON-LD inside <script type="application/ld+json"> (a
+# comment there is raw text and breaks JSON.parse) and a fenced install snippet whose bytes a
+# reader copies verbatim. Both open a region on a structurally-inert line beside them.
+#
+# This is deliberately the SAME idea as the HEIMDALL:VERSION markers above, extended rather
+# than replaced. A second, competing marker scheme would itself become a drift source.
+#
+# test/version-pin-conformance.test.sh is the other half: it goes RED on any pin that is
+# neither marked here nor structurally owned by a renderer, so a NEW hand-typed version cannot
+# land unnoticed. It parses the grammar independently rather than asking this script, because a
+# gate that consults the thing it gates agrees with a broken parser and passes vacuously.
+#
 # Usage:
 #   bin/heimdall-render-version            # render surfaces from plugin.json, in place
 #   bin/heimdall-render-version --check    # exit 1 if any surface is stale (renders nothing)
 #   bin/heimdall-render-version --print    # print the authoritative version, exit
+#   bin/heimdall-render-version --list-pins  # print every pin-bearing file (path per line)
+#
+# The site checkout is OPTIONAL and located via $HEIMDALL_SITE_DIR, else ../heimdall-site.
+# Absent => the site surfaces are SKIPPED out loud, never a failure: a contributor without the
+# site must not eat a red, exactly as test/version-drift.test.sh treats it.
 #
 # Exit 0 = surfaces match the manifest (or were rendered to match).
 set -euo pipefail
@@ -45,6 +86,7 @@ MODE="render"
 case "${1:-}" in
   --check) MODE="check" ;;
   --print) MODE="print" ;;
+  --list-pins) MODE="list-pins" ;;
   -h|--help) grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
   "") ;;
   *) die "unknown arg: $1 (try --help)" ;;
@@ -162,13 +204,223 @@ render_readme_pins() {
   printf '  rendered README version pins -> %s\n' "$VERSION"
 }
 
+# ── 3. Marked pins (HEIMDALL:PIN) — this repo AND the marketing site ─────────
+SITE_DIR="${HEIMDALL_SITE_DIR:-$ROOT/../heimdall-site}"
+
+# The digest a SHA256 pin renders to: the sha256 of install.sh AT THE TAG THE PIN POINTS AT.
+# Which bytes those are depends on whether that tag exists yet, and getting this wrong in either
+# direction is a live defect, so both cases are resolved explicitly:
+#
+#   tag EXISTS (between releases)  -> the blob at the tag. Those are the bytes a reader's `curl`
+#       actually fetches, so they are the bytes the published digest must describe. Hashing the
+#       working tree here would report every in-flight edit to install.sh as "stale pins" and
+#       tempt someone to "fix" a correct README into pinning a digest for bytes GitHub does not
+#       serve — which is the shipped defect, re-created by the tool meant to prevent it.
+#   tag DOES NOT EXIST (a release in flight)  -> the working tree with DEFAULT_REF templated to
+#       the tag, which is exactly what those bytes will be once tagged. ship.sh bumps
+#       plugin.json BEFORE rendering, so a release always lands in this branch, and it computes
+#       the digest by the identical method release/sync-release.sh uses for its own NEW_SHA —
+#       the two cannot disagree about what this release's install.sh hashes to.
+#
+# Empty (never zero, never guessed) when install.sh or a hasher is missing; a SHA256 pin then
+# REFUSES to render rather than writing a wrong digest, because a wrong digest does not degrade
+# the install, it ABORTS it: `shasum -c` prints FAILED and the `&&` chain stops.
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
+
+compute_install_digest() {
+  local src="$ROOT/install.sh" tmp
+  if git -C "$ROOT" cat-file -e "v${VERSION}:install.sh" 2>/dev/null; then
+    tmp="$(mktemp "${TMPDIR:-/tmp}/hmd-pin-install.XXXXXX")" || return 0
+    git -C "$ROOT" show "v${VERSION}:install.sh" > "$tmp" 2>/dev/null
+    sha256_of "$tmp"
+    rm -f "$tmp"
+    return 0
+  fi
+  [ -f "$src" ] || return 0
+  tmp="$(mktemp "${TMPDIR:-/tmp}/hmd-pin-install.XXXXXX")" || return 0
+  sed -E "s|^([[:space:]]*local DEFAULT_REF=)\"[^\"]*\"|\1\"v${VERSION}\"|" "$src" > "$tmp" 2>/dev/null
+  sha256_of "$tmp"
+  rm -f "$tmp"
+}
+DIGEST="$(compute_install_digest || true)"
+
+# One awk pass per file: track region state, rewrite every governed token, pass everything else
+# through byte for byte. Kept as a single-quoted string rather than a heredoc — bash 3.2.57
+# cannot parse a heredoc inside a command substitution, and the callers use one.
+#
+# The 64-hex pattern is built by explicit repetition rather than the `{64}` interval: an awk
+# that does not honour intervals would silently match nothing, and a digest sweep that silently
+# matches nothing is a false green — the precise failure mode this whole file exists to end.
+PIN_AWK='
+BEGIN {
+  hexre = ""
+  for (i = 0; i < 64; i++) hexre = hexre "[0-9a-fA-F]"
+}
+# Rewrite every semver token on the line. A token preceded by "v" is a TAG; anything else is a
+# bare VERSION. Each is rewritten only when its own kind is governed, so `HEIMDALL:PIN:TAG`
+# beside a foreign bare version leaves that version alone.
+function rewrite_semver(s, dotag, dover,   out, rest, pre, tok, nxt, istag) {
+  out = ""; rest = s
+  while (match(rest, /[0-9]+\.[0-9]+\.[0-9]+/)) {
+    pre  = substr(rest, 1, RSTART - 1)
+    tok  = substr(rest, RSTART, RLENGTH)
+    rest = substr(rest, RSTART + RLENGTH)
+    nxt  = substr(rest, 1, 1)
+    istag = (pre != "" && substr(pre, length(pre), 1) == "v")
+    # `1.2.3.4` is a dotted number, not a semver: a trailing ".<digit>" means this match is a
+    # SLICE of something longer, and half-rewriting it would corrupt the line.
+    if (nxt == "." && substr(rest, 2, 1) ~ /[0-9]/) { out = out pre tok; continue }
+    if (istag && dotag)        out = out pre ver
+    else if (!istag && dover)  out = out pre ver
+    else                       out = out pre tok
+  }
+  return out rest
+}
+# Rewrite every pinned 64-hex digest. A 65+ hex run is NOT a digest, so a 64-char slice of one
+# is passed through — rewriting it would produce a well-formed digest that describes nothing.
+function rewrite_digest(s,   out, rest, pre, tok, nxt, prv) {
+  out = ""; rest = s
+  while (match(rest, hexre)) {
+    pre  = substr(rest, 1, RSTART - 1)
+    tok  = substr(rest, RSTART, RLENGTH)
+    rest = substr(rest, RSTART + RLENGTH)
+    nxt  = substr(rest, 1, 1)
+    prv  = (pre == "") ? "" : substr(pre, length(pre), 1)
+    if (nxt ~ /[0-9a-fA-F]/ || prv ~ /[0-9a-fA-F]/) { out = out pre tok; continue }
+    out = out pre digest
+  }
+  return out rest
+}
+FNR == 1 { region = 0; regionkinds = "" }
+{
+  line = $0
+  govern = ""
+  # The kind class is [A-Z0-9,] and not [A-Z,] because SHA256 carries digits: the narrower class
+  # matched `HEIMDALL:PIN:TAG,SHA` out of `HEIMDALL:PIN:TAG,SHA256:BEGIN`, read it as a same-line
+  # marker, and left the region unopened — every pin inside it silently ungoverned.
+  # :BEGIN is tested before the bare form because BEGIN and END both satisfy the kind class — testing
+  # the bare form first would read `HEIMDALL:PIN:TAG:BEGIN` as a same-line marker and leave the
+  # region open forever, silently governing the rest of the file.
+  if (match(line, /HEIMDALL:PIN:[A-Z0-9,]+:BEGIN/)) {
+    k = substr(line, RSTART, RLENGTH); sub(/^HEIMDALL:PIN:/, "", k); sub(/:BEGIN$/, "", k)
+    region = 1; regionkinds = k; govern = k
+  } else if (line ~ /HEIMDALL:PIN:END/) {
+    region = 0; regionkinds = ""
+  } else if (match(line, /HEIMDALL:PIN:[A-Z0-9,]+/)) {
+    k = substr(line, RSTART, RLENGTH); sub(/^HEIMDALL:PIN:/, "", k)
+    govern = k
+  } else if (region == 1) {
+    govern = regionkinds
+  }
+
+  if (govern == "" || govern ~ /FROZEN/) { print line; next }
+
+  out = line
+  dotag = (govern ~ /(^|,)TAG(,|$)/)
+  dover = (govern ~ /(^|,)VERSION(,|$)/)
+  if (dotag || dover) out = rewrite_semver(out, dotag, dover)
+  if (govern ~ /(^|,)SHA256(,|$)/ && digest != "") out = rewrite_digest(out)
+  print out
+}
+'
+
+# pin_files <root> — every published file under <root> that actually carries a marker.
+# Same directory-role prune as test/version-drift.test.sh and the conformance gate: scaffolding
+# holds FIXTURES with deliberately-wrong versions, and rendering a fixture would destroy the
+# gate that depends on it. -mindepth 1 because find evaluates -prune against the START
+# directory too: a checkout literally named `gates` would otherwise prune itself to zero files.
+pin_files() {
+  local root="$1"
+  find "$root" -mindepth 1 -type d \
+      '(' -name '.?*' -o -name test -o -name tests -o -name gates -o -name node_modules ')' -prune \
+    -o -type f '(' -name '*.md' -o -name '*.txt' -o -name '*.json' -o -name '*.toml' \
+                   -o -name '*.html' -o -name '*.js' -o -name '*.sh' \
+                   -o -name '*.yml' -o -name '*.yaml' ')' -print 2>/dev/null \
+    | sort | xargs grep -lF 'HEIMDALL:PIN:' 2>/dev/null || true
+}
+
+# assert_pin_render <src> <rendered> <label> — the same refuse-to-write guard render_readme and
+# render_readme_pins carry: a rewrite that silently produced nothing must not pass as "rendered".
+assert_pin_render() {
+  local src="$1" out="$2" lbl="$3"
+  if grep -Eq 'HEIMDALL:PIN:[A-Z0-9,]*TAG' "$src"; then
+    grep -Fq "v$VERSION" "$out" \
+      || die "pin render for $lbl produced no 'v$VERSION' despite a TAG marker — refusing to write"
+  fi
+  if grep -Eq 'HEIMDALL:PIN:[A-Z0-9,]*VERSION' "$src"; then
+    grep -Fq "$VERSION" "$out" \
+      || die "pin render for $lbl produced no '$VERSION' despite a VERSION marker — refusing to write"
+  fi
+  if grep -Eq 'HEIMDALL:PIN:[A-Z0-9,]*SHA256' "$src"; then
+    [ -n "$DIGEST" ] \
+      || die "$lbl carries a SHA256 pin but install.sh could not be hashed — refusing to leave a stale digest beside an install URL (a wrong digest does not degrade the install, it aborts it at \`shasum -c\`)"
+    grep -Fq "$DIGEST" "$out" \
+      || die "pin render for $lbl produced no current digest despite a SHA256 marker — refusing to write"
+  fi
+}
+
+PIN_FILES_SEEN=0
+PIN_FILES_RENDERED=0
+
+render_pins_in() {
+  local root="$1" label="$2" f rel tmp
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    rel="${f#$root/}"
+    PIN_FILES_SEEN=$((PIN_FILES_SEEN + 1))
+    tmp="$(mktemp "${TMPDIR:-/tmp}/hmd-pin.XXXXXX")" || die "mktemp failed"
+    awk -v ver="$VERSION" -v digest="$DIGEST" "$PIN_AWK" "$f" > "$tmp" \
+      || { rm -f "$tmp"; die "pin render failed for $label/$rel"; }
+    assert_pin_render "$f" "$tmp" "$label/$rel" || { rm -f "$tmp"; exit 1; }
+    if cmp -s "$f" "$tmp"; then rm -f "$tmp"; continue; fi
+    if [ "$MODE" = "check" ]; then
+      note_stale "$label/$rel marked pins do not match manifest '$VERSION'"
+      rm -f "$tmp"; continue
+    fi
+    cat "$tmp" > "$f" || { rm -f "$tmp"; die "could not write $f"; }
+    rm -f "$tmp"
+    PIN_FILES_RENDERED=$((PIN_FILES_RENDERED + 1))
+    printf '  rendered marked pins in %s -> %s\n' "$label/$rel" "$VERSION"
+  done <<PINFILES
+$(pin_files "$root")
+PINFILES
+}
+
+# The site is a SIBLING checkout, not a subdirectory. Absent => SKIPPED and said out loud,
+# never a failure: a contributor without the site must not eat a red for not having it.
+render_site_pins() {
+  if [ ! -d "$SITE_DIR" ]; then
+    printf '  site: SKIPPED — nothing at %s (set HEIMDALL_SITE_DIR to render it)\n' "$SITE_DIR"
+    return 0
+  fi
+  render_pins_in "$(cd "$SITE_DIR" && pwd)" site
+}
+
+if [ "$MODE" = "list-pins" ]; then
+  pin_files "$ROOT"
+  [ -d "$SITE_DIR" ] && pin_files "$(cd "$SITE_DIR" && pwd)"
+  exit 0
+fi
+
 printf 'heimdall-render-version: manifest=%s mode=%s\n' "$VERSION" "$MODE"
 render_version_file
 render_readme
 render_readme_pins
+render_pins_in "$ROOT" repo
+render_site_pins
+
+# A sweep that found no marker at all is not "clean", it is unwired: the markers were removed,
+# or the discovery filter now excludes everything. Either way nothing is being rendered and the
+# next release re-opens the exact drift this file closes, so it is a hard error, not a shrug.
+[ "$PIN_FILES_SEEN" -gt 0 ] \
+  || die "ZERO files carrying a HEIMDALL:PIN marker were found under $ROOT — the marked-pin renderer is wired to nothing (see test/version-pin-conformance.test.sh)"
 
 if [ "$MODE" = "check" ]; then
   [ "$STALE" -eq 0 ] || die "version surfaces are STALE — run bin/heimdall-render-version"
-  printf '  all rendered surfaces match plugin.json (%s)\n' "$VERSION"
+  printf '  all rendered surfaces match plugin.json (%s), across %s pin-bearing file(s)\n' "$VERSION" "$PIN_FILES_SEEN"
 fi
 exit 0
