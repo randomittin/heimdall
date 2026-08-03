@@ -188,9 +188,15 @@ fi
 
 # --- 4. the stub gate's block reason reaches stderr -------------------------
 STUB_CMD="$SANDBOX/pre-stub-hook.sh"
+# Select on the stub gate's OWN receipt text, not on the shared "BIFRÖST" brand.
+# Every Heimdall block gate emits a BIFRÖST receipt, so `contains("BIFR")` stops
+# identifying anything as soon as a second one exists — it silently resolved to
+# the PreToolUse:Agent gate (R13 name enforcement) and this block fed a Write
+# payload to a hook that judges Agent spawns. A selector that can drift onto the
+# wrong hook proves nothing about the hook it names.
 extract_cmd '
   [.hooks.PreToolUse[]
-   | select(any(.hooks[]?; (.command // "") | contains("BIFR")))]
+   | select(any(.hooks[]?; (.command // "") | contains("blocked a stub")))]
   | .[0].hooks[0].command' > "$STUB_CMD"
 
 if [ ! -s "$STUB_CMD" ]; then
