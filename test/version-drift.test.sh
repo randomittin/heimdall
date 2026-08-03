@@ -322,6 +322,17 @@ fi
 # directory name cannot.
 SCAFFOLDING_DIRS="test tests gates node_modules"
 
+# Dated archives are pruned by that same one mechanism, and for the reason already given two
+# paragraphs up for .planning/: a dated document is history, not drift. launch-docs/drafts/
+# holds weekly changelogs whose lines are verbatim git commit subjects — `chore(release):
+# v2.3.8 (063155f)` is a quotation of what commit 063155f actually said. It agrees with the
+# manifest this week by coincidence and will disagree at the next bump, at which point this
+# sweep would report a drift whose only correct fix is to falsify the record. A gate that can
+# only be satisfied by lying is a gate that gets deleted, so it must not ask.
+# test/version-pin-conformance.test.sh prunes the identical set and makes it prove, every run,
+# that what it removed really was archival.
+ARCHIVE_DIRS="drafts archive"
+
 # find_files <mode> <root> <ext>...
 #   published  — prune dot-dirs AND scaffolding; the set the sweeps actually assert over.
 #   candidates — prune dot-dirs only; the denominator, so the sweep can REPORT how many
@@ -341,7 +352,7 @@ find_files() {
   local fx d e first=1
   fx=( -mindepth 1 -type d '(' -name '.?*' )
   if [ "$mode" = published ]; then
-    for d in $SCAFFOLDING_DIRS; do fx+=( -o -name "$d" ); done
+    for d in $SCAFFOLDING_DIRS $ARCHIVE_DIRS; do fx+=( -o -name "$d" ); done
   fi
   fx+=( ')' -prune -o -type f '(' )
   for e in "$@"; do

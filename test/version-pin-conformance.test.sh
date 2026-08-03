@@ -74,18 +74,56 @@
 # yet decided at the moment this gate runs. Shape is the durable question anyway: any digest
 # published beside an install URL is a pin that must be rendered, whatever it currently says.
 #
-# ── Scaffolding exclusion ─────────────────────────────────────────────────────
+# ── Scaffolding and dated-archive exclusion ───────────────────────────────────
 # Identical rule to test/version-drift.test.sh, and for the same reason: gate FIXTURES carry
 # deliberately-wrong versions (v9.9.9) and deliberately-unmarked pins — including this file's
 # own mutants. Pruned by DIRECTORY ROLE at traversal, never by a filename blocklist, and with
 # -mindepth 1 so a checkout that happens to BE named `gates` cannot prune its own root to zero
 # and pass vacuously off an empty set.
+#
+# Dated archives (drafts/, archive/) are pruned by that same one mechanism, for a reason set out
+# in full at ARCHIVE_DIRS below: a dated changelog QUOTES a version, it does not CLAIM one, and
+# rendering a quotation forges history rather than refreshing it. The exclusion is not free —
+# section 2 of the gate makes it prove, every run, that what it removed really was archival.
 set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="${VERSION_PIN_REPO:-$(cd "$SELF_DIR/.." && pwd)}"
 
 SCAFFOLDING_DIRS="test tests gates node_modules"
+
+# ── Dated-archive exclusion ───────────────────────────────────────────────────
+# A dated archive is NOT a pin, and marking one would make the renderer produce falsehoods.
+#
+# launch-docs/drafts/log-week-2026-08-03.md line 140 reads:
+#     - chore(release): v2.3.8 (`063155f`)
+# That is a verbatim quotation of commit 063155f's subject line, and the document's own preamble
+# promises "each line carries the sha it was read from, so any claim here can be checked with
+# `git show`". Mark it and the next bump rewrites it to `chore(release): v2.3.9 (063155f)` — a
+# commit subject that never existed, attached to a real and checkable sha. Drift makes a document
+# STALE; rendering history makes it LIE with a receipt attached, which is strictly worse, and it
+# is the same class of error as rewriting a dated design spec to match present enforcement — a
+# thing this repo has already refused to do once.
+#
+# A pin rots because it claims to be CURRENT. A dated changelog entry claims only that something
+# happened inside a named past window, and that stays true forever. These lines trip a
+# current-version sweep at all only because the week they record happens to be the week 2.3.8
+# shipped: at the next release they stop matching on their own. A finding that disappears without
+# anyone fixing anything was never drift — it was a temporal collision.
+#
+# The precedent is already here. test/version-drift.test.sh prunes .planning/ because it
+# "archives design comps and incident write-ups pinned to long-dead tags (v2.0.5) — history, not
+# drift". A dated weekly changelog is that same object, so it gets that same rule rather than a
+# second mechanism: pruned by DIRECTORY ROLE at traversal, matched by basename, with -mindepth 1
+# so a checkout that happens to BE named `drafts` cannot prune its own root to zero.
+#
+# DATED_DIRS is the subset that must PROVE it is dated. `drafts/` is a STAGING directory —
+# things move OUT of it, and the next thing to land there could be live listing copy — so an
+# undated file in it reds the gate (obligation A below). `archive/` is TERMINAL: history is the
+# whole point of it, and this repo's design specs there are genuinely undated.
+ARCHIVE_DIRS="drafts archive"
+DATED_DIRS="drafts"
+
 DIGEST_WINDOW=8
 
 # ── STRUCTURAL allowlist ─────────────────────────────────────────────────────
@@ -110,18 +148,41 @@ packages/runheimdall/package.json|release/sync-release.sh|"$ROOT/packages/runhei
 # find_files <mode> <root> — see the header. published prunes dot-dirs AND scaffolding;
 # candidates prunes dot-dirs only, so the sweep can REPORT what its own exclusion removed
 # instead of removing it silently.
+#
+# The file-type predicate is declared ONCE and shared by every traversal below, so the sweep,
+# the exclusion, and the exclusion's proof obligation can never disagree about what "a file" is —
+# a disagreement there would be invisible and would silently shrink whichever one drifted.
+PUBLISHED_TYPES=( -type f '('
+  -name '*.md' -o -name '*.txt' -o -name '*.json' -o -name '*.toml'
+  -o -name '*.html' -o -name '*.js' -o -name '*.sh' -o -name '*.yml' -o -name '*.yaml'
+  -o -name 'VERSION' -o -name '_redirects' ')' -print )
+
 find_files() {
   local mode="$1" root="$2"
   local fx d
   fx=( -mindepth 1 -type d '(' -name '.?*' )
   if [ "$mode" = published ]; then
-    for d in $SCAFFOLDING_DIRS; do fx+=( -o -name "$d" ); done
+    for d in $SCAFFOLDING_DIRS $ARCHIVE_DIRS; do fx+=( -o -name "$d" ); done
   fi
-  fx+=( ')' -prune -o -type f '('
-        -name '*.md' -o -name '*.txt' -o -name '*.json' -o -name '*.toml'
-        -o -name '*.html' -o -name '*.js' -o -name '*.sh' -o -name '*.yml' -o -name '*.yaml'
-        -o -name 'VERSION' -o -name '_redirects' ')' -print )
+  fx+=( ')' -prune -o "${PUBLISHED_TYPES[@]}" )
   find "$root" "${fx[@]}" 2>/dev/null | sort
+}
+
+# find_archived <root> [dirs] — the files the archive role removed from the published set.
+# Enumerated rather than forgotten. Every other exemption in this gate carries a live proof
+# obligation (STRUCTURAL names a renderer, an anchor, an assertion and a line shape); an
+# exclusion whose contents cannot be listed is one that cannot be checked, and would be the
+# single place in this gate where "trust me" still works.
+find_archived() {
+  local root="$1" dirs="${2:-$ARCHIVE_DIRS}" d ad
+  for d in $dirs; do
+    while IFS= read -r ad; do
+      [ -n "$ad" ] || continue
+      find "$ad" "${PUBLISHED_TYPES[@]}" 2>/dev/null
+    done <<ARCHDIRS
+$(find "$root" -mindepth 1 -type d -name '.?*' -prune -o -type d -name "$d" -print 2>/dev/null)
+ARCHDIRS
+  done | sort -u
 }
 
 # ── The single source of truth ───────────────────────────────────────────────
@@ -442,6 +503,44 @@ VOID
   printf 'Install %s today.\n' "$SELF_TAG" > "$SITE_TMP/mirror.txt"
   assert_red "a real unmarked pin in a published file beside an excluded fixture" "UNMARKED"
 
+  # Mutant 13 — the dated-archive exemption, in the direction it exists for. A weekly changelog
+  # QUOTES the current tag inside a commit subject it read from git. Rendering that would forge
+  # history, so the sweep must not demand a marker on it.
+  fresh_copy
+  MUT_SITE="$NO_SITE"
+  mkdir -p "$TMP/launch-docs/drafts"
+  { printf -- '---\ndate: 1999-01-01\n---\n'
+    printf -- '- chore(release): %s (`deadbee`)\n' "$SELF_TAG"
+  } > "$TMP/launch-docs/drafts/log-week-1999-01-01.md"
+  assert_green "an unmarked tag quoted inside a DATED archive draft"
+
+  # Mutant 14 — and the hole that exemption could have opened. An install snippet is a published
+  # surface whatever directory it sits in: its digest aborts the `&&` chain at `shasum -c` when it
+  # rots, which is the concrete way installs broke here twice. The archive excuse must not reach
+  # it. Dated, so it can only be RED for the install-surface reason and not for the date.
+  fresh_copy
+  mkdir -p "$TMP/launch-docs/drafts"
+  { printf -- '---\ndate: 1999-01-01\n---\n'
+    printf 'curl -fsSL %s -o heimdall-install.sh\n' "$INSTALL_URL"
+    printf 'echo "%s  heimdall-install.sh" | shasum -a 256 -c -\n' "$FAKE_DIGEST"
+  } > "$TMP/launch-docs/drafts/install-1999-01-01.md"
+  assert_red "a live install snippet parked inside an archive directory" "live install URL"
+
+  # Mutant 15 — the other half of the same hole. `drafts/` is a STAGING directory, so the next
+  # file to land in it may well be live listing copy rather than dated history. Undated means the
+  # exemption does not describe it, and a human has to decide rather than inherit a pass.
+  fresh_copy
+  mkdir -p "$TMP/launch-docs/drafts"
+  printf 'Install %s today — the listing blurb.\n' "$SELF_TAG" > "$TMP/launch-docs/drafts/listing-copy.md"
+  assert_red "undated live copy parked inside the dated-archive staging directory" "undated file"
+
+  # Mutant 16 — the exclusion must be no WIDER than the directory it names. A pin one level up,
+  # outside drafts/, is an ordinary published surface and must still be caught; a prune that
+  # leaked to the parent would silently exempt all of launch-docs/.
+  fresh_copy
+  printf 'Install %s from the mirror.\n' "$SELF_TAG" > "$TMP/launch-docs/live-listing.md"
+  assert_red "a pin in the parent of an archive directory (exclusion must not widen)" "UNMARKED"
+
   echo "version-pin-conformance --self-test: PASS"
   exit 0
 fi
@@ -511,14 +610,68 @@ OWNED
   return 1
 }
 
-# ── 2. Anti-vacuous: the sweep must have had something to assert over ─────────
+# ── 2. ARCHIVE exemption integrity — checked BEFORE it is used to excuse anything ──
+# The dated-archive prune is the only exclusion in this gate that removes files a HUMAN wrote and
+# a reader can reach, so it is the one most able to hide a live surface. It therefore pays for
+# itself with two obligations, both re-checked on every run over the exact files it removed:
+#
+#   A. DATED PROVENANCE. Every file under a DATED_DIRS directory must carry an ISO date — in its
+#      basename, or in a date:/window:/generated: field. This is the obligation that keeps
+#      `drafts/` from becoming a hole: the moment someone drops undated live copy there (a
+#      listing blurb, a submission draft) the gate reds and a human has to decide, instead of the
+#      file quietly inheriting an exemption written for weekly changelogs.
+#   B. NO INSTALL SURFACE. No archived file, dated or not, may carry an install URL. The install
+#      snippet is the pin whose rot BREAKS rather than ages: a wrong digest aborts the published
+#      `&&` chain at `shasum -c` and nothing after it runs. A file holding one is a live install
+#      surface whatever directory it sits in, and no archive excuse may reach it.
+#
+# What this deliberately does NOT claim: it is not a proof that nothing published can ever sit in
+# an archive directory. It is a proof that the two shapes that actually caused damage here —
+# undated live copy, and a hand-typed install snippet — cannot.
+ARCHIVE_N=0
+ARCHIVE_OK=1
+ARCH_ROOTS="$REPO"
+[ -d "$SITE_DIR" ] && ARCH_ROOTS="$ARCH_ROOTS
+$(cd "$SITE_DIR" && pwd)"
+
+while IFS= read -r aroot; do
+  [ -n "$aroot" ] || continue
+  while IFS= read -r af; do
+    [ -n "$af" ] || continue
+    ARCHIVE_N=$((ARCHIVE_N+1))
+    if grep -Eq 'raw\.githubusercontent\.com/[^/]+/heimdall/[^/]+/install\.sh' "$af" 2>/dev/null; then
+      bad "archived file ${af#$aroot/} carries a live install URL — an install snippet is a published surface whatever directory it sits in, and its digest aborts the \`&&\` chain at \`shasum -c\` when it rots. Move it out of the archive directory, or mark it (HEIMDALL:PIN:TAG,SHA256)"
+      ARCHIVE_OK=0
+    fi
+  done <<ARCHFILES
+$(find_archived "$aroot")
+ARCHFILES
+  while IFS= read -r df; do
+    [ -n "$df" ] || continue
+    case "${df##*/}" in
+      *[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*) continue ;;
+    esac
+    grep -Eq '^(date|window|generated)[[:space:]]*:' "$df" 2>/dev/null && continue
+    bad "undated file ${df#$aroot/} sits in a staging directory ($DATED_DIRS) that is exempted from the pin sweep BECAUSE its contents are dated history. This one carries no ISO date in its name and no date:/window:/generated: field, so the exemption does not describe it — date it, or move it somewhere the sweep can see it"
+    ARCHIVE_OK=0
+  done <<DATEDFILES
+$(find_archived "$aroot" "$DATED_DIRS")
+DATEDFILES
+done <<ROOTS
+$ARCH_ROOTS
+ROOTS
+
+[ "$ARCHIVE_OK" -eq 1 ] \
+  && ok "every one of the $ARCHIVE_N dated-archive file(s) excluded from the sweep is genuinely archival (dated, and carrying no install surface)"
+
+# ── 3. Anti-vacuous: the sweep must have had something to assert over ─────────
 if [ "$N_OK" -eq 0 ] && [ "$N_BAD" -eq 0 ]; then
   bad "VACUOUS sweep: ZERO occurrences of $VER / $TAG / a pinned install digest were found in ANY swept file. Either the sweep is pointed at the wrong tree or its file filter now excludes everything — a gate that asserts over an empty set passes for free"
 else
   ok "sweep is non-vacuous ($((N_OK + N_BAD)) pin occurrence(s) found to assert over)"
 fi
 
-# ── 3. THE LOAD-BEARING ASSERTION — zero unmarked hardcoded versions ─────────
+# ── 4. THE LOAD-BEARING ASSERTION — zero unmarked hardcoded versions ─────────
 UNMARKED=0
 while IFS='|' read -r kind loc lineno found reason text; do
   [ "$kind" = "BAD" ] || continue
@@ -530,7 +683,7 @@ $(printf '%s\n' "$RECORDS" | grep '^BAD|' || true)
 BADREC
 [ "$UNMARKED" -eq 0 ] && ok "ZERO unmarked hardcoded versions — every pin is rendered from plugin.json or structurally owned"
 
-# ── 4. The markers must actually be reachable by the renderer ────────────────
+# ── 5. The markers must actually be reachable by the renderer ────────────────
 # A marker the renderer cannot see is decoration. This asserts the renderer names the same
 # marker token this gate parses, so the two cannot drift apart into a false green.
 RENDERER="$REPO/bin/heimdall-render-version"
@@ -542,7 +695,7 @@ else
   bad "bin/heimdall-render-version missing — nothing renders the marked pins"
 fi
 
-# ── 5. Markers must exist at all ─────────────────────────────────────────────
+# ── 6. Markers must exist at all ─────────────────────────────────────────────
 [ "$N_MARK" -gt 0 ] \
   && ok "$N_MARK HEIMDALL:PIN marker(s) present across the swept surfaces" \
   || bad "ZERO HEIMDALL:PIN markers found — either every pin vanished or the marker parser matches nothing; both make this gate vacuous"
