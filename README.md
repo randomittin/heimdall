@@ -40,6 +40,31 @@ The bot is powered by Heimdall's local engine: a Claude Code plugin that turns o
 
 ## Install
 
+Three paths. Each is labelled with what it actually does to your machine — pick the risk you are willing to take, not the shortest command.
+
+| # | Path | What it runs | Honest risk |
+|---|---|---|---|
+| **1** | **One-liner** (below) | Downloads `install.sh`, checks its sha256, then **runs it as you** | **Highest.** A script fetched over the network, executing with your user's privileges — it can do anything you can do. The digest check is the only thing between you and whatever those bytes are. Verify it, or take path 3. |
+| **2** | **npm** — `npx runheimdall` | The same `install.sh`, fetched over https and sha256-checked against a digest baked in at publish time ([`bin/runheimdall.js`](packages/runheimdall/bin/runheimdall.js)), then handed to `bash` | **Same as path 1.** The wrapper is thin and the script still runs as you. You gain not having to hand-copy a digest. You gain no isolation. |
+| **3** | **Docker sandbox** — [`Dockerfile.install`](Dockerfile.install) | The same `install.sh`, **copied from your own clone** — nothing fetched, no digest to trust — run **inside a container** | **Lowest, with real caveats.** Every `$HOME` change lands in a layer you delete. It does **not** isolate a repo you mount, and it is not a macOS sandbox. [Caveats below.](#path-3--the-docker-sandbox) |
+
+**Whichever you pick, this is what the installer writes outside the repo.** Measured from a real run against a throwaway `$HOME`, not asserted:
+
+| Written | What it is |
+|---|---|
+| `~/.heimdall/` | A full git clone of this repo — the installed checkout `hmd` runs from |
+| `~/.local/bin/hmd`, `~/.local/bin/heimdall` | Symlinks into `~/.heimdall/bin/heimdall` |
+| `~/.claude/settings.json` | Adds `statusLine` + `subagentStatusLine`, and registers the plugin under `enabledPlugins` / `extraKnownMarketplaces`. Honors `$CLAUDE_CONFIG_DIR`, and never clobbers a `statusLine` you set yourself |
+| `~/.zshrc` / `~/.bashrc` / `~/.profile` | One appended `export PATH=…` line for `~/.local/bin` — only when it is not already on `PATH` |
+| `~/Library/LaunchAgents/com.heimdall.dream.plist` | **macOS only** — a nightly 03:00 LaunchAgent (`com.heimdall.dream`) that runs the overnight sweep with no session open and survives logout and reboot. Opt out with `HEIMDALL_NO_DREAM_SCHEDULE=1` |
+| `~/.heimdall/team.json` | An auto-minted solo **team secret** — a bearer capability. Treat it like a credential |
+
+No sudo. Idempotent — re-run to upgrade. `hmd uninstall` reverses all of it.
+
+**Network posture is default-ON.** Team presence and the cloud features reach the control plane as soon as you use them: a signed heartbeat carrying your handle, verdict, and current filename — scoped to your team, never your code or file contents. That is a feature, and it is on until you switch it off. `hmd presence sever` gives zero egress. Field-by-field contract: [DATA.md](DATA.md). The precisely scoped claims are under [Your code stays yours](#your-code-stays-yours).
+
+### Path 1 — the one-liner
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/randomittin/heimdall/168646ba9e3ded2b7f1297d0109ac4afc33439d2/install.sh -o heimdall-install.sh \
   && echo "fafe31e30b481882a43ab93aaab742b1e90b0d4bde31498aa8f58f3f23585b33  heimdall-install.sh" | shasum -a 256 -c - \
@@ -87,7 +112,28 @@ for machines with no `minisign` binary, and the fail-closed behavior of the auto
 
 **Prerequisites:** Claude Code 1.0+ · Git · `jq` (`brew install jq`)
 
-**Also on npm:** [`npx runheimdall`](https://www.npmjs.com/package/runheimdall) — same pinned tag, same sha256 check, zero clone required.
+### Path 2 — npm
+
+[`npx runheimdall`](https://www.npmjs.com/package/runheimdall) — same pinned tag, same sha256 check, zero clone required. It fetches the pinned `install.sh`, verifies it against the digest baked in at publish time, and aborts before executing anything if the bytes disagree. Convenience, not containment: what finally runs is the same script, with the same privileges as path 1.
+
+### Path 3 — the Docker sandbox
+
+For a first look that does not touch your machine. Build from a clone, so the `install.sh` you read is byte-for-byte the one that runs — nothing is fetched, so there is no digest for you to trust:
+
+```bash
+git clone https://github.com/randomittin/heimdall && cd heimdall
+less install.sh                                     # what you read is what runs
+docker build -f Dockerfile.install -t heimdall-sandbox .
+docker run --rm -it heimdall-sandbox                # hmd is already on PATH
+```
+
+`--rm` discards every `$HOME` mutation in the table above the moment the container exits. The image also drops the auto-minted `team.json` during the build, so containers never share one team secret.
+
+**What the container does not isolate** — a sandbox you misunderstand is worse than no sandbox:
+
+- **A mounted repo is not isolated.** `-v "$PWD:/work"` is a hole you punched on purpose: anything `hmd` writes under `/work` lands on your real disk. Mount `:ro` if you only want `hmd` to read your code.
+- **It is not a macOS sandbox.** The image is Linux, so launchd and the keychain do not exist inside it and the nightly LaunchAgent step is skipped as `unsupported`. That is the container being a different OS — not a boundary defending your account. `launchctl` and the keychain are **account-scoped**: a fake `$HOME` relocates only the plist *file*, while `launchctl load` still registers the job in your real per-user session. A sandboxed test in this repo learned that the hard way, by rewriting the developer's live LaunchAgent. The switch is `HEIMDALL_NO_DREAM_SCHEDULE=1` — never `$HOME`.
+- **The network is open.** The build clones from GitHub, and presence is on by default. `docker run --network none` gives the container zero egress; `hmd presence sever` does the same at the application level.
 
 ### Your code stays yours
 
