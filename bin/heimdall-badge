@@ -14,7 +14,13 @@
 # OFFLINE-SAFE: the SVG is generated locally (no shields.io round-trip), so `--svg`
 # always yields a committable badge even with no network. The default markdown
 # points its <img> at the runheimdall.dev badge endpoint (the viral image host) and
-# links to runheimdall.dev — BOTH surfaces carry the backlink.
+# links to runheimdall.dev — BOTH surfaces carry the backlink, tagged `?ref=badge`
+# so a click arriving from a pasted badge is distinguishable from cold traffic.
+#
+# YOU DO NOT HAVE TO KNOW THIS COMMAND EXISTS: the statusline offers the badge on its
+# own the moment this repo's 10th merge is proven — one ambient line, shown exactly
+# once ever (sentinels/hmd-statusline.py :: badge_offer_notice, which records the
+# firing in <repo>/.heimdall/.badge-offer so it never repeats).
 #
 # Usage:
 #   hmd badge                 the README markdown snippet (default)
@@ -27,10 +33,20 @@
 # Exit: 0 always (a repo with no verdict store is not an error — it just reads 0).
 set -uo pipefail
 
-BACKLINK="https://runheimdall.dev"
+ORIGIN="https://runheimdall.dev"
+# Attribution tag on the badge's OWN urls, so a click arriving from a pasted README
+# badge is distinguishable from cold traffic. It rides the BADGE ONLY — heimdall-clip
+# must never gain one: launch-docs/assets/wall.svg is declared in
+# launch-docs/assets/provenance.json as "byte-for-byte what bin/heimdall-clip --wall
+# --svg emits", so any param injected into clip's output falsifies that receipt.
+# test/clip-share-artifact.test.sh holds that wall up.
+BADGE_REF="badge"
+BACKLINK="$ORIGIN?ref=$BADGE_REF"
 LABEL="🛡 heimdall"
 
-usage() { sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'; }
+# Print the header block verbatim (lines 2..33 — through the `Exit:` line, stopping
+# before `set -uo pipefail`), stripped of its leading `# `.
+usage() { sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'; }
 
 MODE="markdown"
 while [ $# -gt 0 ]; do
@@ -74,7 +90,7 @@ fi
 # user's own repo name; never a secret). Non-alnum collapses to '-'.
 SLUG="$(basename "$REPO" 2>/dev/null | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '-' | sed 's/-\{1,\}/-/g; s/^-//; s/-$//')"
 [ -n "$SLUG" ] || SLUG="repo"
-ENDPOINT="$BACKLINK/badge/$SLUG.svg"
+ENDPOINT="$ORIGIN/badge/$SLUG.svg?ref=$BADGE_REF"
 
 # ── the offline-safe static SVG (shields.io-style, generated locally) ─────────
 # Rough monospace-ish width estimate: ~7px/char + side padding. A static badge does
