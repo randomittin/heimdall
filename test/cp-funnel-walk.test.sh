@@ -320,8 +320,20 @@ fi
 echo
 echo "6. badge-rendered: no server-side signal exists, and none was invented"
 # 6a the badge renders LOCALLY: zero outbound primitives in the client.
-EGRESS_RX='urllib\.request|urlopen|http\.client|httplib|requests\.(get|post|put|request)|socket\.(socket|create_connection)|subprocess.*curl|\bcurl\b'
-if ! grep -qE "$EGRESS_RX" "$REPO/bin/heimdall-badge" 2>/dev/null; then
+#     `curl` is matched ONLY IN COMMAND POSITION -- start of line, or after a control operator
+#     ( ; & | ( ) { } ` $( ), optionally through a modifier word (sudo/env/exec/if/!/...) --
+#     because that, not the mere presence of the word, is what makes the shell RUN it. The token
+#     inside `echo "... curl ..."` or after a `#` is an argument or a comment: inert text, not
+#     egress. A bare \bcurl\b red on the reinstall help line that half of bin/ prints, and a
+#     privacy gate that cries wolf on documentation gets muted -- taking the real red with it.
+#     Nothing is given up: curl|bash, $(curl ...), backtick, sudo curl and piped-into curl are
+#     all still caught (test/cp-funnel.test.sh 4e calibrates this exact pattern on a fixture of
+#     both shapes). The file MUST exist -- a missing file makes `! grep` succeed, which would
+#     turn a deleted badge into a silent PASS.
+EGRESS_RX='urllib\.request|urlopen|http\.client|httplib|requests\.(get|post|put|request)|socket\.(socket|create_connection)|subprocess.*curl|(^|[;&|(){}`]|\$\()[[:space:]]*((if|then|else|elif|do|while|until|!|sudo|env|exec|command|nohup|time|xargs)[[:space:]]+)*curl([[:space:]]|$)'
+if [ ! -f "$REPO/bin/heimdall-badge" ]; then
+  bad "6a bin/heimdall-badge is MISSING -- the no-egress scan covered nothing"
+elif ! grep -qE "$EGRESS_RX" "$REPO/bin/heimdall-badge"; then
   ok "6a bin/heimdall-badge has ZERO outbound primitives -- a badge render is invisible to the server, so no lawful stamp for it can exist"
 else
   bad "6a heimdall-badge gained a network call -- a badge-render beacon BREAKS IDENTITY.md:32-38"
