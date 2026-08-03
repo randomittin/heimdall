@@ -1102,6 +1102,72 @@ def update_notice():
     return f"{AM}⬆ {latest_raw} available{X} {FAINT}·{X} {DIM}hmd --update{X}"
 
 
+# The proven-merge count that earns the badge offer. Exact, not a floor: the offer is a
+# one-shot moment, so it belongs to the merge that crosses the line and to no other.
+BADGE_OFFER_AT = 10
+
+def _proven_merges(beats_path):
+    """Count of `pass` verdicts in a beats.log — one `<iso-ts>\\t<verdict>\\t<file>` line per
+    gated commit. Byte-wise and streaming: a half-written or binary-garbled line can never
+    raise, and the file is never held in memory. This is the SAME reader shape as
+    bin/heimdall-badge:59-63 and bin/heimdall-clip:61-65, so the HUD's number and the
+    number `hmd badge` prints cannot drift apart. Any fault → None (never a false count)."""
+    try:
+        n = 0
+        with open(beats_path, "rb") as f:
+            for raw in f:
+                parts = raw.split(b"\t")
+                if len(parts) >= 2 and parts[1].strip() == b"pass":
+                    n += 1
+        return n
+    except Exception:
+        return None
+
+def badge_offer_notice(cwd, width=None):
+    """The badge OFFER: one ambient line, shown EXACTLY ONCE, the moment this repo's 10th
+    merge is proven. A dev only runs `hmd badge` if they know it exists, so the offer has
+    to come to them — but exactly once, because a nudge that reappears every session gets
+    muted, and then the nudge that MATTERS is muted with it.
+
+    PURE LOCAL READ: <cwd>/.heimdall/receipts/beats.log, the same store `hmd badge --count`
+    counts. No network, no subprocess — this is on the interactive render path.
+
+    Returns '' unless the count is EXACTLY BADGE_OFFER_AT and the once-only stamp
+    (<cwd>/.heimdall/.badge-offer) does not already exist.
+
+    FIT BEFORE FIRE: `width` is the content width the caller can actually give this row.
+    A notice that would not fit whole is not shown AND not stamped — burning the one shot
+    on a row the terminal clips would spend it on nobody.
+
+    FAIL-CLOSED ON PERSISTENCE: the stamp is written BEFORE the notice is returned and a
+    failed write suppresses the notice, because an offer we cannot record is an offer that
+    repeats. O_EXCL makes the create the atomic winner-takes-it, so two concurrent renders
+    cannot both fire it."""
+    hd = os.path.join(cwd, ".heimdall")
+    stamp = os.path.join(hd, ".badge-offer")
+    try:
+        if os.path.exists(stamp):
+            return ""
+    except Exception:
+        return ""
+    n = _proven_merges(os.path.join(hd, "receipts", "beats.log"))
+    if n != BADGE_OFFER_AT:
+        return ""
+    note = (f"{GR}🛡 {n} proven merges{X} {FAINT}·{X} {DIM}hmd badge{X} "
+            f"{FAINT}→ pin it to your README{X}")
+    if width is not None and vis(note) > width:
+        return ""
+    try:
+        fd = os.open(stamp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        try:
+            os.write(fd, (json.dumps({"count": n, "epoch": int(time.time())}) + "\n").encode())
+        finally:
+            os.close(fd)
+    except Exception:
+        return ""
+    return note
+
+
 
 
 # ── Row-3 segments ─────────────────────────────────────────────────────────────
@@ -1424,9 +1490,21 @@ def main():
     # compose_with_sigil), shown only when it fits WHOLE in the content width so a narrow
     # terminal never wraps the line nor clips the `hmd --update` command.
     content_rows = [row1, row2, row3, row4]
+    content_w = LAYOUT.remaining_width(sigrows, cols, GUTTER)
     note = update_notice()
-    if note and vis(note) <= LAYOUT.remaining_width(sigrows, cols, GUTTER):
+    if note and vis(note) <= content_w:
         content_rows.append(note)
+
+    # ── the BADGE OFFER (one-shot): the 10th proven merge earns a README badge, and the
+    # dev learns that WITHOUT running a command. Same pure-local-read, same one-extra-row
+    # mechanism as the update note above, but it fires exactly once ever — badge_offer_notice
+    # persists a stamp as it fires and returns '' forever after, so a repo past its 10th
+    # merge renders byte-identically (the density goldens stay exact). It is handed the
+    # content width so it can decline to fire rather than spend its one shot on a row this
+    # terminal would clip.
+    offer = badge_offer_notice(cwd, content_w)
+    if offer:
+        content_rows.append(offer)
 
     # ── the parallel-agent SWARM block (bottom rows) — spectacle + per-agent receipt.
     # Rendered ONLY when >1 REAL live agent is in agent-pool; 1-or-fewer → swarm is None
