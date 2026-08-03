@@ -282,8 +282,12 @@ if [ "$proc_status" != "ok" ]; then
   echo "      heimdall-sysmon --reap-hmd-orphans"
 fi
 if [ "$mem_status" != "ok" ]; then
-  echo "  • memory pressure: after the reap, wired RAM + swap only fully clear on reboot:"
-  echo "      sudo reboot"
+  echo "  • memory pressure: reaping heimdall's own orphans does not touch wired RAM."
+  echo "    swap is elastic — macOS reclaims it on its own as pressure eases, no reboot needed."
+  echo "    wired RAM is kernel-side: a reboot drops it, but any holder that re-arms at boot"
+  echo "    re-wires it, so a restart is a TEMPORARY reclaim. Identify the persistent holder"
+  echo "    (VMs, mounted OS/simulator runtime volumes, drivers, system extensions) and remove it."
+  echo "      heimdall-cleanup --advise    # names the holder when one is detectable"
 fi
 if [ "$disk_status" != "ok" ]; then
   echo "  • disk is ${disk_used_pct}% full — run the deep clean: invoke the 'mac-deep-clean' skill"

@@ -64,8 +64,15 @@ Overall exit code = the worst section. Thresholds override via `HMD_SYSMON_*` en
 
 - **procs WARN/CRIT** → Heimdall is leaking. Suggest the scoped self-reap (below). This is the
   single highest-value action — it's do-nothing python pinning RAM.
-- **memory WARN/CRIT** → after reaping, wired RAM + swap only fully clear on **reboot** (killing
-  procs does not free non-pageable wired memory). Print `sudo reboot` as a manual step.
+- **memory WARN/CRIT** → reaping does not touch wired RAM (killing procs does not free
+  non-pageable wired memory). Split the two axes, because they behave differently:
+  - **swap** is elastic — macOS sizes it on demand and reclaims it on its own as pressure
+    eases, with no reboot. A high swap % is a symptom to watch, not by itself an action.
+  - **wired** is kernel-side. A reboot drops the pages, but any holder that re-arms at boot
+    re-wires them immediately — so a restart is a **temporary reclaim, not the fix**. Name
+    the persistent holder instead: `heimdall-cleanup --advise` detects the cheaply-visible
+    ones (mounted OS/simulator runtime volumes, running hypervisors) and says the holder is
+    unidentified when it cannot see one. Never prescribe a reboot as *the* fix.
 - **disk WARN/CRIT** → hand off to **mac-deep-clean** (tiered, read-only investigation first,
   then deletes only caches / dead repos / SDK-simulator bloat).
 
@@ -84,7 +91,8 @@ marker) is **never** matched. The detector and the reaper share ONE matcher (`--
 is that matcher exposed for testing), so what it counts is exactly what it would kill.
 
 Safety: this only reaps Heimdall's OWN garbage. For anything foreign, or a full disk sweep,
-defer to the user / mac-deep-clean. Wired RAM after a long uptime is reboot-only — say so.
+defer to the user / mac-deep-clean. Wired RAM is outside Heimdall's reach entirely — say so,
+and say that a reboot only reclaims it until its holder re-arms.
 
 ## Optional: proactive nudge at session start
 
