@@ -1977,21 +1977,6 @@ case "${1:-}" in
     fi
     exec "$PRESENCE_BIN" "$@"
     ;;
-  rules)
-    # Pass-through to heimdall-rules (propose). V7: cluster the corpus DENIES,
-    # draft candidate rules with their evidence trail, stage them locally for
-    # HUMAN review. It proposes; it never promotes — promotion stays a hand
-    # decision, every time. All args/flags forwarded verbatim. Bin resolved via
-    # $PLUGIN_DIR — never hardcoded (mirrors the presence)/context) cases).
-    shift
-    RULES_BIN="$PLUGIN_DIR/bin/heimdall-rules"
-    if [ ! -x "$RULES_BIN" ]; then
-      echo "  Error: heimdall-rules not found at $RULES_BIN" >&2
-      echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
-      exit 1
-    fi
-    exec "$RULES_BIN" "$@"
-    ;;
   context)
     # Pass-through to heimdall-context-sync (sync/on/off/status). CONTEXT-SYNC: the
     # rolling session state (worklog.json + context.md + cases/ + verdicts.ndjson)
@@ -2139,6 +2124,20 @@ case "${1:-}" in
       exit 1
     fi
     exec "$BADGE_BIN" "$@"
+    ;;
+  metrics)
+    # Pass-through to heimdall-metrics: the weekly launch one-pager — WAU, teams-2+,
+    # K-factor proxy and funnel drop-offs, READ off the server-derived funnel store.
+    # Read-only and egress-free; a number that was never measured renders "unavailable"
+    # rather than 0. All args forwarded verbatim (report/--json/--k-min/--days/--home).
+    shift
+    METRICS_BIN="$PLUGIN_DIR/bin/heimdall-metrics"
+    if [ ! -x "$METRICS_BIN" ]; then
+      echo "  Error: heimdall-metrics not found at $METRICS_BIN" >&2
+      echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+      exit 1
+    fi
+    exec "$METRICS_BIN" "$@"
     ;;
   clip)
     # Pass-through to heimdall-clip: export a gate/wall MOMENT as a shareable card

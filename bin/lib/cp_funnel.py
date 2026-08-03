@@ -285,6 +285,24 @@ def enroll_count(*, day=None, home=None):
         return 0
 
 
+def families(*, home=None):
+    """THE AVAILABILITY PROBE — which funnel families have EVER been written.
+
+    This is what lets a reader tell "never collected" from a real zero, which is the whole
+    difference between a metric and a lie. A stage deployed AFTER the data it would have counted
+    has an ABSENT family, and its count must render "unavailable", not 0 — a 0 there would assert
+    "nobody did this" about a period nobody was measuring.
+
+    Returns a set of family names, or None when the BACKEND ITSELF could not be read (a store
+    fault is also not a zero). Portable across backends: list_names on the funnel root yields the
+    directory names locally and the first path segment after the "funnel__" doc-id prefix on
+    Firestore — the same family set either way, and never backend.path()."""
+    try:
+        return set(_backend(home).list_names(_FUNNEL_REL, suffix=""))
+    except Exception:  # noqa: BLE001 — an unreadable store is UNKNOWN, never an empty set.
+        return None
+
+
 def _count_records(rel_dir, *, home=None):
     """The number of stamps in one funnel family. list_names only (never backend.path()), so it
     reads identically on the local and Firestore backends. A missing family reads as 0."""
