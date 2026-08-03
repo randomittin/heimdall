@@ -290,6 +290,28 @@ fi
   && ok "G12 --json pins promoted:false" \
   || bad "G12 --json does not pin promoted:false"
 
+# ── G13: `hmd rules propose` routes to the tool ───────────────────────────────
+# The documented entry point is the router, not the bare bin. If the arm is ever
+# dropped, every doc line that says `hmd rules propose` becomes a lie.
+ROUTED_JSON="$TMP/routed.json"
+if "$REPO/bin/hmd" rules propose --corpus "$FX_POS" --out "$TMP/routed.md" --json \
+     > "$ROUTED_JSON" 2>"$TMP/routed.err"; then
+  ok "G13 \`hmd rules propose\` routes and exits 0"
+else
+  bad "G13 \`hmd rules propose\` failed: $(cat "$TMP/routed.err")"
+fi
+[ "$(jq -r '.tool' "$ROUTED_JSON" 2>/dev/null)" = "heimdall-rules" ] \
+  && ok "G13 the router reaches heimdall-rules (tool=heimdall-rules)" \
+  || bad "G13 the router did not reach heimdall-rules"
+# Routed and direct invocations must agree — a router that silently drops flags
+# would otherwise surface as a mysteriously different proposal.
+if [ "$(jq -Sc '.candidates' "$ROUTED_JSON" 2>/dev/null)" \
+   = "$(jq -Sc '.candidates' "$POS_JSON" 2>/dev/null)" ]; then
+  ok "G13 routed invocation forwards flags verbatim (same candidates as direct)"
+else
+  bad "G13 routed and direct invocations disagree — flags are not forwarded verbatim"
+fi
+
 echo "--------------------------------------------------------------------"
 printf 'rules-propose: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
