@@ -16,9 +16,13 @@
 #      `.output` entry — it exists ONLY as a transcript + `.meta.json` under
 #      <projects>/<slug>/<session>/subagents/. Enumerating the task dir alone is
 #      blind to the exact agents the tool exists to surface.
-#   4. LYING ABOUT A KILL — a parked teammate CANNOT be terminated from outside
-#      the harness. Exclude it from the live count, say plainly that only a
-#      session restart clears it, never claim it was killed.
+#   4. LYING ABOUT A KILL — or about a remedy. NOTHING outside the harness can
+#      terminate a parked teammate, so the tool must never claim it killed one.
+#      It must exclude it from the live count and name the mechanisms that DO
+#      clear it (TaskStop, /tasks, session restart) — without the two opposite
+#      overstatements: that a restart is the ONLY way (false since Claude Code
+#      2.1.198+ shipped TaskStop), or that TaskStop is PROVEN (unexercised —
+#      agent definitions load at session start). Section (8) locks both edges.
 #
 # THE FIXTURE MIRRORS SHAPES READ OFF DISK ON 2026-08-03, not invention:
 #
@@ -284,13 +288,44 @@ J2="$("$AGENTS" reap --json)"
 RN="$(jq 'keys|length' "$REAPED" 2>/dev/null)"
 [ "$RN" = "8" ] && ok "registry exactly 8 after re-reap (no drift)" || bad "registry drifted to $RN keys, expected 8"
 
-# ── (8) sweep: reports parked mailbox + names the ONLY remedy ────────────────
+# ── (8) sweep: reports parked mailbox + names EVERY real remedy, honestly ────
+# Both edges are asserted. Understating (restart-only) is the stale claim this
+# section used to enshrine; overstating (TaskStop proven) is the equal and
+# opposite lie. A test that merely string-matched whatever the tool emits would
+# catch neither, so every assertion below names the property, not the phrasing.
 SW="$("$AGENTS" sweep 2>&1)"
 printf '%s' "$SW" | grep -q "ve-server"      && ok "sweep names the parked agent"        || bad "sweep omitted parked agent name"
-printf '%s' "$SW" | grep -qi "restart"       && ok "sweep states restart is the remedy"  || bad "sweep failed to state the remedy"
+printf '%s' "$SW" | grep -q "TaskStop"       && ok "sweep names TaskStop as the programmatic remedy" || bad "sweep failed to name TaskStop"
+printf '%s' "$SW" | grep -qi "restart"       && ok "sweep still offers session restart as fallback"  || bad "sweep dropped the restart fallback"
+printf '%s' "$SW" | grep -qiE 'only a restart|restart only|restart-only' \
+  && bad "sweep STILL claims restart is the only remedy" || ok "sweep no longer claims restart-only"
+printf '%s' "$SW" | grep -qi 'not yet verified' \
+  && ok "sweep flags TaskStop as documented-not-proven" || bad "sweep overstates TaskStop as proven"
 printf '%s' "$SW" | grep -qiE 'killed the|terminated the' && bad "sweep FALSELY claims a kill" || ok "sweep never claims a kill it did not perform"
 SWJ="$("$AGENTS" sweep --json 2>/dev/null)"
-[ "$(printf '%s' "$SWJ" | jq -r '.clearable_by')" = "session restart only" ] && ok "sweep --json reports clearable_by" || bad "sweep --json clearable_by wrong"
+# CONTRACT: clearable_by is a LIST of mechanism ids, so a consumer branches on
+# membership instead of parsing a sentence. The old scalar "session restart only"
+# must be gone AND the list must actually name the mechanism that replaced it.
+[ "$(printf '%s' "$SWJ" | jq -r '.clearable_by | type')" = "array" ] \
+  && ok "sweep --json clearable_by is a machine-readable list" \
+  || bad "clearable_by not a list (got type '$(printf '%s' "$SWJ" | jq -r '.clearable_by|type')')"
+printf '%s' "$SWJ" | jq -e '.clearable_by | index("TaskStop")' >/dev/null 2>&1 \
+  && ok "sweep --json clearable_by names TaskStop" || bad "clearable_by omits TaskStop"
+# `type=="array" and` is load-bearing: jq's `length` on the old scalar returns the
+# STRING length (20), which would sail past a bare `>= 2` and green-light exactly
+# the claim this asserts is gone.
+printf '%s' "$SWJ" | jq -e '.clearable_by | type == "array" and length >= 2' >/dev/null 2>&1 \
+  && ok "sweep --json offers more than one mechanism (not restart-only)" \
+  || bad "clearable_by lists fewer than 2 mechanisms — the restart-only claim survives"
+printf '%s' "$SWJ" | jq -e '.clearable_by | index("session-restart")' >/dev/null 2>&1 \
+  && ok "sweep --json keeps session-restart as fallback" || bad "clearable_by dropped session-restart"
+# Honesty tripwire: TaskStop is documented, NOT verified end to end. It must be
+# absent from the verified subset until a run proves it — so the upgrade is a
+# deliberate act that turns this assertion red, never a silent wording drift.
+printf '%s' "$SWJ" | jq -e '.clearable_by_verified | index("TaskStop") | not' >/dev/null 2>&1 \
+  && ok "sweep --json does NOT claim TaskStop is verified" || bad "clearable_by_verified overstates TaskStop as proven"
+printf '%s' "$SWJ" | jq -e '.clearable_by_verified | index("session-restart")' >/dev/null 2>&1 \
+  && ok "sweep --json marks session-restart as the verified mechanism" || bad "clearable_by_verified omits session-restart"
 [ "$(printf '%s' "$SWJ" | jq -r '.parked_mailbox|length')" -ge 1 ] && ok "sweep --json lists parked mailbox agents" || bad "sweep --json parked list empty"
 
 # ── (9) sweep is idempotent and safe to re-run ──────────────────────────────
