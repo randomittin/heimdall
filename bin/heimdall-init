@@ -296,7 +296,17 @@ write_post_commit
 git -C "$REPO" config core.hooksPath "$HOOKS_REL"
 
 # ── keep the transient local state out of the repo's own git noise ─────────────
+# The file belongs to the repo, so the ONLY edit we ever make to a line we did not
+# write is restoring a missing final newline — exactly as write_agents_md does above,
+# and for the same reason. Without it a bare `>>` welds our first pattern onto the
+# repo's last line ("node_modules" + ".heimdall/verdict.json"), which silently kills
+# BOTH rules: theirs stops matching and ours never starts. It also defeats the
+# grep -qxF dedupe below (a welded line is not a whole-line match), so every re-init
+# would append the pattern again.
 GI="$REPO/.gitignore"
+if [ -s "$GI" ] && [ "$(tail -c 1 "$GI" | od -An -tx1 | tr -d '[:space:]')" != "0a" ]; then
+  printf '\n' >> "$GI" 2>/dev/null || true
+fi
 for pat in ".heimdall/verdict.json" ".heimdall/receipts/" ".heimdall/audit.json"; do
   if [ -f "$GI" ] && grep -qxF "$pat" "$GI" 2>/dev/null; then continue; fi
   printf '%s\n' "$pat" >> "$GI" 2>/dev/null || true
