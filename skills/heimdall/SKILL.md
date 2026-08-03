@@ -38,7 +38,7 @@ AGENT NAMING: Spawn UNNAMED. Passing `name:` puts the harness in persistent MAIL
 
 A named agent is NOT unkillable: `TaskStop` closes it by name or agent ID and `SendMessage` resumes it. What you lose with `name:` is the RESULT on the spawn call, not control of the agent. Close what you open → "Closing Idle Agents" below.
 
-R13 IS ENFORCED, NOT ADVISORY: the `PreToolUse` `Agent` hook DENIES (exit 2) any spawn carrying `name:`, with the reason on stderr. To take the opt-in above, set `HEIMDALL_ALLOW_NAMED_AGENT=1` — that is the only way through, and it is deliberate. The gate fails CLOSED: a payload it cannot parse is denied, never waved through. Proof: `bash test/agent-name-gate.test.sh`.
+R13 WARNS; IT DOES NOT BLOCK. The `PreToolUse` `Agent` hook lets every spawn through (exit 0) and prints a notice on stderr when one carries `name:`. It used to deny (exit 2). That deny rested on the orchestrator having no way to close a named agent — `TaskStop` made that false — and the matcher fires on EVERY Agent spawn in EVERY project (heimdall loads via `--plugin-dir`), so it hard-failed legitimate named teammates in unrelated repos. What stays true is the measurement (0/43 named completed vs 59/66 unnamed), so unnamed remains the default. The notice carries the part you must act on: **no result arrives via the spawn call, and THE SPAWNER OWNS THE CLEANUP** — `TaskStop` it when its work is done, and find leaks with `bin/heimdall-agents orphans`. `HEIMDALL_ALLOW_NAMED_AGENT=1` now silences the notice rather than unlocking the spawn. Fail-SAFE, not fail-closed: a payload the hook cannot parse still warns and still proceeds — a malformed payload must never cost a spawn. Proof: `bash test/agent-name-gate.test.sh`.
 
 PROJECTS: Task spans multiple repos → one agent per repo, parallel.
 
@@ -68,7 +68,7 @@ Judgement, not reflex:
 
 Agents parked BEFORE this rule applied send no fresh notification. Sweep with `bin/heimdall-agents orphans` (lists parked mailbox teammates by name), then `TaskStop` each completed one. Run the sweep at session start and after any multi-wave task.
 
-**Verification PENDING a session restart.** `TaskStop` was declared on the agent definitions in `b214eb1`; definitions load at session start, so the session that authored this rule had no `TaskStop` and could not exercise it end-to-end. Documented, not yet proven — first session after restart, confirm `TaskStop` closes a parked teammate and `bin/heimdall-agents orphans` drops it. Full guidance: [agent-templates.md](references/agent-templates.md).
+**`TaskStop` is CONFIRMED PRESENT and functional.** It ships in Claude Code 2.1.198+ and was declared on the agent definitions in `b214eb1`; a later session exercised it and it correctly enumerated the running agent set. **Verified scoping limit:** `TaskStop` only reaches agents the CALLING SESSION spawned — a cross-session stop returns `No task found with ID`. So an orchestrator can close its own named agents but never another session's, which is exactly why `bin/heimdall-agents orphans` still matters for agents stranded by a dead session. Full guidance: [agent-templates.md](references/agent-templates.md).
 
 ## Available Commands
 

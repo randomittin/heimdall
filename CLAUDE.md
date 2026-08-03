@@ -8,6 +8,7 @@
 - NEVER: read file → read next file → read next file (batch all reads in one message)
 - NEVER: pass `name:` to Agent unless you will `SendMessage` it — `name:` → mailbox-resident agent, never self-terminates, never returns a result (measured 0/43 named completed vs 59/66 unnamed)
 - Identify a spawn's work via `description:`, never `name:` (R13)
+- The `PreToolUse` `Agent` hook WARNS on `name:` (stderr, exit 0) — it does not block. Name one → you own its lifecycle: collect via `SendMessage`, close with `TaskStop`, sweep leaks with `bin/heimdall-agents orphans`
 
 ## Rules
 - All code, configs, docs go in this project directory

@@ -566,12 +566,12 @@ Full roster (all require `hmd:` prefix): `hmd:architect`, `hmd:planner`, `hmd:wa
 - Wave agents run in parallel within each wave
 - Each wave-executor gets FRESH context: plan file + context doc + relevant source files only
 - Never pass accumulated conversation history between waves — this prevents context bloat and hallucination drift
-- For large waves (10 parallel agents): use the wave-ordered role template in `skills/heimdall/references/agent-templates.md` ("Parallel Role Team Template"). Do NOT reach for harness Agent Teams — teammates are named, and named spawns are denied (R13)
+- For large waves (10 parallel agents): use the wave-ordered role template in `skills/heimdall/references/agent-templates.md` ("Parallel Role Team Template"). Do NOT reach for harness Agent Teams — teammates are named, and a named spawn never returns a result on the spawn call, so you own closing each one with `TaskStop` (R13)
 
 ### 4c. Agent Instructions
 
 When spawning an agent, provide:
-0. **Role identity in `description:`, never `name:`** — `description: "auth module — src/auth/**"`. A spawn carrying `name:` is DENIED (exit 2) by the `PreToolUse` `Agent` hook: `name:` assigns mailbox residency at spawn time, so that agent never self-terminates and never returns a result to the spawn call. Measured: 0/43 named spawns completed vs 59/66 unnamed. `HEIMDALL_ALLOW_NAMED_AGENT=1` exists only for a long-lived agent you will `SendMessage` — which you CAN do: your `tools:` line declares `SendMessage` and `TaskStop`, so you can drive a named agent and close it. Name one → you own its lifecycle (§4d). (R13)
+0. **Role identity in `description:`, never `name:`** — `description: "auth module — src/auth/**"`. A spawn carrying `name:` draws a WARNING from the `PreToolUse` `Agent` hook — exit 0, notice on stderr; the spawn proceeds (it is no longer denied, because `TaskStop` gives you a way to close a named agent, and the hook fires in every project including ones that name teammates legitimately). Default to `description:` anyway: `name:` assigns mailbox residency at spawn time, so that agent never self-terminates and never returns a result to the spawn call. Measured: 0/43 named spawns completed vs 59/66 unnamed. `HEIMDALL_ALLOW_NAMED_AGENT=1` silences the notice for the one legitimate case — a long-lived agent you will `SendMessage` — which you CAN do: your `tools:` line declares `SendMessage` and `TaskStop`, so you can drive a named agent and close it. Name one → you own its lifecycle (§4d): collect via `SendMessage`, never by awaiting the spawn, and `TaskStop` it when done. (R13)
 1. **Specific scope**: exactly what to build/test/review, with file boundaries
 2. **Skills to invoke**: tell the agent which skills to use via `Skill(skill: "name")`. Be explicit:
    - Coder agents: `superpowers:test-driven-development`, `superpowers:systematic-debugging`, and domain-specific skills
@@ -614,7 +614,7 @@ bin/heimdall-agents orphans      # lists parked mailbox teammates by name
 
 `TaskStop` each listed name whose work is complete, applying the same three checks. Run this sweep at session start and at the end of any multi-wave task.
 
-**Verification status: PENDING a session restart.** `TaskStop` was declared on the agent definitions in `b214eb1`; definitions load at session start, so the session that authored this rule did not have `TaskStop` and could NOT exercise it end-to-end. The rule is written, not proven. First session after restart: confirm `TaskStop` closes a parked teammate and that `bin/heimdall-agents orphans` drops it from the list. Until that check runs, treat the mechanism as documented-but-unverified and say so if asked.
+**Verification status: `TaskStop` is CONFIRMED PRESENT and functional.** It ships in Claude Code 2.1.198+ and was declared on the agent definitions in `b214eb1`; definitions load at session start, so the session that authored this rule could not exercise it — a later session could, and `TaskStop` correctly enumerated the running agent set. **Verified scoping limit:** `TaskStop` reaches ONLY agents the calling session spawned; a cross-session stop returns `No task found with ID`. You can always close what you opened and never what another session opened — so agents stranded by a dead session are beyond `TaskStop` and need the `bin/heimdall-agents orphans` sweep.
 
 ---
 
