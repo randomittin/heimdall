@@ -138,32 +138,55 @@ After completion, run:
   heimdall-state set '.plan.sub_projects[INDEX].status' '"complete"'
 ```
 
-## Agent Team Template
+## Parallel Role Team Template
 
-For large tasks requiring 3+ parallel workers:
+For large tasks requiring 3+ parallel workers.
+
+**Roles are carried in `description:`, never `name:`.** A spawn carrying `name:` is DENIED (exit 2)
+by the `PreToolUse` `Agent` hook. `name:` assigns mailbox residency at spawn time: that agent never
+self-terminates, never returns a result, and the parent cannot terminate it — no signalable PID, no
+socket, no terminate marker. Measured: 0/43 named spawns completed vs 59/66 unnamed. It is not
+recoverable by prompt — a controlled pair testing a "terminate, do not await messages" clause
+produced one `idle_notification` each either way, both recorded `"taskKind": "in_process_teammate"`.
+(conventions R13; proof: `bash test/agent-name-gate.test.sh`)
+
+Spawn every role in a wave in ONE message, each `run_in_background: true`:
 
 ```
-Create an agent team to build [PROJECT DESCRIPTION].
-
-Team structure:
-- architect: Analyze codebase and create decomposition plan (use architect agent type)
-- designer: Handle UI/UX design, component design, design tokens (use design agent type)
-- coder-auth: Handle authentication module (use coder agent type)
-- coder-api: Handle API endpoints (use coder agent type)
-- coder-frontend: Handle UI components (use coder agent type)
-- test-runner: Continuous testing as code lands (use test-runner agent type)
-- lint-quality: Enforce code standards after each coder completes (use lint-quality agent type)
-- reviewer: Review all changes before merge (use reviewer agent type)
-- docs-writer: Keep docs in sync with implementation (use docs-writer agent type)
-
-Coordination:
-- Architect produces plan first, then other agents begin
-- Designer works in parallel with backend coders (no file overlap)
-- Auth and API can work in parallel (no file overlap)
-- Frontend depends on API and designer being complete
-- Test runner watches for completed sub-projects
-- Lint-quality runs after each coder finishes
-- Reviewer runs after all coders + test-runner complete
-- Docs-writer runs last with full context
-- Require plan approval for each teammate before implementation
+Agent(subagent_type: "hmd:architect",    description: "decompose codebase into sub-projects")
+Agent(subagent_type: "hmd:design",       description: "UI/UX, component design, design tokens")
+Agent(subagent_type: "hmd:coder",        description: "auth module — src/auth/**")
+Agent(subagent_type: "hmd:coder",        description: "API endpoints — src/api/**")
+Agent(subagent_type: "hmd:coder",        description: "UI components — src/components/**")
+Agent(subagent_type: "hmd:test-runner",  description: "test suite as code lands")
+Agent(subagent_type: "hmd:lint-quality", description: "lint after each coder completes")
+Agent(subagent_type: "hmd:reviewer",     description: "review all changes before merge")
+Agent(subagent_type: "hmd:docs-writer",  description: "sync docs with implementation")
 ```
+
+The identity that used to live in a teammate name (`coder-auth`) goes in `description:`
+("auth module — src/auth/**"). Same information, and it dispatches.
+
+File scopes MUST be disjoint within a wave — two agents writing one file collide.
+
+Coordination is wave ordering, not one flat batch:
+
+- Wave 0: architect alone → decomposition plan. Plan is approved before wave 1 spawns.
+- Wave 1: design + auth coder + API coder — parallel, disjoint scopes
+- Wave 2: frontend coder — depends on API + design
+- Wave 3: test-runner + lint-quality
+- Wave 4: reviewer — after all coders and tests
+- Wave 5: docs-writer — last, with full context
+
+Within a wave: ALL agents in ONE message. Between waves: let the wave return first.
+
+### When a named agent is genuinely right
+
+One case: a long-lived conversational agent you will actually drive with `SendMessage` across the
+session. `HEIMDALL_ALLOW_NAMED_AGENT=1` is the deliberate opt-in.
+
+Accept what it costs: that agent is mailbox-resident for the WHOLE session. It never self-terminates,
+never returns a result to the parent, and **cannot be closed** — the parent has no way to reach it,
+and `SendMessage` is not enabled in the orchestrator context, so in an orchestrator you cannot even
+use the thing you named it for. A role that does a unit of work and reports back is NOT this case.
+Spawn it unnamed.

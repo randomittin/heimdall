@@ -63,7 +63,7 @@ You are a single agent, but parallelism applies to YOUR tool calls inside this a
 - **Edits**: When edits across files are independent (no shared state), send all Edit/Write calls in ONE message.
 - **Bash**: When commands are independent (e.g., `npm test`, `npm run lint`, `git status`), batch them in one message.
 - **Long commands**: Any test/build/install over 30s → `run_in_background: true`, continue other work in the meantime.
-- **Sub-decomposition**: If your scope contains 2+ independent files, spawn `Agent` subprocesses (one per file) with `subagent_type: "hmd:coder"` (NAMESPACED — bare `coder` fails dispatch with "Agent type not found") and `run_in_background: true`. Provide each child a self-contained prompt (scope, files, acceptance criteria, model tier from the table below). Aggregate child statuses into your own status report.
+- **Sub-decomposition**: If your scope contains 2+ independent files, spawn `Agent` subprocesses (one per file) with `subagent_type: "hmd:coder"` (NAMESPACED — bare `coder` fails dispatch with "Agent type not found") and `run_in_background: true`. Identify each child by `description:` (e.g. `description: "parser — src/parse.ts"`), NEVER by `name:` — a named spawn is denied (exit 2) by the `PreToolUse` `Agent` hook, because `name:` makes the child mailbox-resident: it never self-terminates and never returns a result to you, so you would wait forever for a status that cannot arrive (R13). Provide each child a self-contained prompt (scope, files, acceptance criteria, model tier from the table below). Aggregate child statuses into your own status report.
 
 Sequential tool calls for independent operations is a bug. Default to parallel.
 
