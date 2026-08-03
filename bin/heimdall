@@ -1977,6 +1977,21 @@ case "${1:-}" in
     fi
     exec "$PRESENCE_BIN" "$@"
     ;;
+  rules)
+    # Pass-through to heimdall-rules (propose). V7: cluster the corpus DENIES,
+    # draft candidate rules with their evidence trail, stage them locally for
+    # HUMAN review. It proposes; it never promotes — promotion stays a hand
+    # decision, every time. All args/flags forwarded verbatim. Bin resolved via
+    # $PLUGIN_DIR — never hardcoded (mirrors the presence)/context) cases).
+    shift
+    RULES_BIN="$PLUGIN_DIR/bin/heimdall-rules"
+    if [ ! -x "$RULES_BIN" ]; then
+      echo "  Error: heimdall-rules not found at $RULES_BIN" >&2
+      echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+      exit 1
+    fi
+    exec "$RULES_BIN" "$@"
+    ;;
   context)
     # Pass-through to heimdall-context-sync (sync/on/off/status). CONTEXT-SYNC: the
     # rolling session state (worklog.json + context.md + cases/ + verdicts.ndjson)
