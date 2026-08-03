@@ -36,6 +36,8 @@ AGENTS: If 2+ tasks are independent → spawn parallel agents (`run_in_backgroun
 
 AGENT NAMING: Spawn UNNAMED. Passing `name:` puts the harness in persistent MAILBOX mode ("The agent is now running and will receive instructions via mailbox") — that agent never self-terminates and never emits a `task-notification`, so the orchestrator waits forever for a result that cannot arrive. Measured over one session: 0/43 named spawns completed vs 59/66 unnamed. `name:` is opt-in ONLY for a genuinely long-lived conversational agent you will `SendMessage` and accept as session-resident; every other named spawn is a leak. Identify a spawn's work via `description:`, never `name:`. (conventions R13)
 
+R13 IS ENFORCED, NOT ADVISORY: the `PreToolUse` `Agent` hook DENIES (exit 2) any spawn carrying `name:`, with the reason on stderr. To take the opt-in above, set `HEIMDALL_ALLOW_NAMED_AGENT=1` — that is the only way through, and it is deliberate. The gate fails CLOSED: a payload it cannot parse is denied, never waved through. Proof: `bash test/agent-name-gate.test.sh`.
+
 PROJECTS: Task spans multiple repos → one agent per repo, parallel.
 
 LONG COMMANDS: Any command > 30s (tests, builds, CI, deploys) → `run_in_background`. Continue other work.
