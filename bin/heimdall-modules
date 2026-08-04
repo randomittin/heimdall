@@ -843,7 +843,7 @@ PAYLOAD_BLOCKER=""
 PAYLOAD_REMEDY=""
 acquire_upstream() {
   local name="$1" mf="$2"
-  local fetch tool pkg probe state reason ran=false rc="null"
+  local fetch tool pkg probe ran=false rc="null"
   PAYLOAD_PRESENT=0; PAYLOAD_BLOCKER=""; PAYLOAD_REMEDY=""
 
   fetch="$(jq -r '.installs_via.fetch // ""' "$mf")"
@@ -854,7 +854,7 @@ acquire_upstream() {
   pkg=""
   [ -n "$probe" ] && pkg="$(upstream_package "$fetch" 2>/dev/null || true)"
 
-  record() {
+  payload_record() {
     PAYLOAD_JSON="$(jq -n --arg f "$fetch" --arg p "$probe" --arg pkg "$pkg" \
       --arg st "$1" --arg why "$2" --arg rem "${3:-}" --arg at "$(now_iso)" \
       --argjson present "$([ "$PAYLOAD_PRESENT" -eq 1 ] && echo true || echo false)" \
@@ -865,7 +865,7 @@ acquire_upstream() {
   }
 
   if [ -z "$pkg" ] || [ -z "$probe" ]; then
-    record registered \
+    payload_record registered \
       "hmd has no way to ask \`$tool\` what it actually installed, so the fetch was NOT run — an install it cannot verify is an install it will not claim" \
       "$fetch"
     return 0
@@ -876,19 +876,19 @@ acquire_upstream() {
   capture "$probe" "$HMD_MODULE_PROBE_TIMEOUT"
   if [ "$CAP_RC" -eq 0 ] && probe_lists_package "$CAP_OUT" "$pkg"; then
     PAYLOAD_PRESENT=1
-    record present "\`$pkg\` was already present in \`$probe\` — nothing to fetch" ""
+    payload_record present "\`$pkg\` was already present in \`$probe\` — nothing to fetch" ""
     return 0
   fi
 
   if ! state_is_canonical; then
-    record registered \
+    payload_record registered \
       "the payload installs machine-wide but this run books it into $STATE, which is not hmd's module state root ($DEFAULT_STATE_ROOT) — a global install recorded somewhere \`remove\` does not look is an orphan, so it was NOT run" \
       "$fetch"
     return 0
   fi
 
   if [ "$HMD_MODULE_FETCH_DRYRUN" = "1" ]; then
-    record registered \
+    payload_record registered \
       "HMD_MODULE_FETCH_DRYRUN=1 — the fetch was decided and logged, not run. The probe still ran and \`$pkg\` is not present." \
       "$fetch"
     return 0
@@ -901,7 +901,7 @@ acquire_upstream() {
   if [ "$CAP_RC" -ne 0 ]; then
     PAYLOAD_BLOCKER="the fetch exited $CAP_RC: $(printf '%s' "$CAP_OUT" | tail -3 | tr '\n' ' ')"
     PAYLOAD_REMEDY="$fetch"
-    record absent "$PAYLOAD_BLOCKER" "$PAYLOAD_REMEDY"
+    payload_record absent "$PAYLOAD_BLOCKER" "$PAYLOAD_REMEDY"
     return 1
   fi
 
@@ -909,12 +909,12 @@ acquire_upstream() {
   capture "$probe" "$HMD_MODULE_PROBE_TIMEOUT"
   if [ "$CAP_RC" -eq 0 ] && probe_lists_package "$CAP_OUT" "$pkg"; then
     PAYLOAD_PRESENT=1
-    record present "\`$pkg\` is listed by \`$probe\` after the fetch" ""
+    payload_record present "\`$pkg\` is listed by \`$probe\` after the fetch" ""
     return 0
   fi
   PAYLOAD_BLOCKER="the fetch exited 0 but \`$probe\` does not list \`$pkg\` — nothing landed"
   PAYLOAD_REMEDY="$fetch"
-  record absent "$PAYLOAD_BLOCKER" "$PAYLOAD_REMEDY"
+  payload_record absent "$PAYLOAD_BLOCKER" "$PAYLOAD_REMEDY"
   return 1
 }
 
