@@ -56,6 +56,7 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 import issue_queue        # REUSE heimdall_home() — never re-derive the runtime home
+import memory_codec as mc  # §8 — the storage-codec seam (plain unless a codec exists)
 import telemetry          # REUSE _scrub shape gate — the store stays gitleaks-clean
 import vm_gitcheck as vmg  # piece A — the git-check engine (verify | reconcile | weight)
 
@@ -149,26 +150,66 @@ def _append(entry, home):
     """Append ONE JSON line to entries.ndjson, rotating first if oversized. Returns
     True on success, False on any IO failure (graceful-degrade — a disk error drops
     the write rather than raising into the caller). The store is the audit log; the
-    live view folds to the latest revision per id."""
+    live view folds to the latest revision per id.
+
+    THE WRITE HALF OF THE §8 CODEC SEAM. The entry passes through
+    memory_codec.encode_entry on its way to disk, so a storage codec shrinks what is
+    stored WITHOUT hmd giving up a single truth semantic:
+      • the secret/shape gate has ALREADY run (write() rejects a secret-shaped claim
+        before we are reached) — a codec can never smuggle a credential past it;
+      • encode_entry touches PAYLOAD fields only and never a verifier input, so the
+        commit_ref / refs / status / weight written here are bit-identical to the
+        verified entry the git-check produced;
+      • with no codec installed (the default) encode_entry is the identity and the
+        stored bytes are exactly what they were before this seam existed.
+    """
     try:
         ldir = memory_dir(home)
         os.makedirs(ldir, exist_ok=True)
         path = os.path.join(ldir, "entries.ndjson")
         _maybe_rotate(path)
-        line = json.dumps(entry, sort_keys=True, separators=(",", ":"))
+        line = json.dumps(mc.encode_entry(entry), sort_keys=True,
+                          separators=(",", ":"))
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(line + "\n")
             fh.flush()
-        return True
     except OSError:
         return False
+    _codec_hint(path)
+    return True
+
+
+def _codec_hint(store_path):
+    """Surface the ONE optional codec hint on stderr, at most once per store, when
+    the store has grown heavy and no codec is installed. stderr because stdout is
+    the CLI's JSON contract. Best-effort: a hint never affects whether a write
+    succeeded, and it never repeats — a hint that repeats gets muted, and then the
+    hint that matters gets muted with it."""
+    try:
+        hint = mc.maybe_hint(store_path)
+    except Exception:  # noqa: BLE001 — a hint must never break a write
+        return
+    if hint:
+        sys.stderr.write("hmd: %s\n" % hint)
 
 
 def _read_raw(home=None):
     """Stream every stored entry line across entries*.ndjson (the active log + any
     rotated siblings), parsing each. Tolerant: a bad line is skipped, an absent
     store yields []. Read-only — never writes. This is the raw audit log, in write
-    order (oldest → newest)."""
+    order (oldest → newest).
+
+    THE READ HALF OF THE §8 CODEC SEAM, AND THE REASON A CODEC CANNOT CORRUPT A
+    VERDICT. Every line is decoded here, at the store boundary, BEFORE any consumer
+    exists — so vm_gitcheck.verify() and every gate above it read raw text, always.
+    The gates-read-raw invariant (bin/lib/hmd-gate-endpoint.sh: "generation may run
+    compressed; judgment may not") holds for storage exactly as it holds for the
+    model endpoint: compression in a judge's input corrupts the judge.
+
+    A payload that will not decode back to the text its digest names is
+    UNRECOVERABLE, and is skipped by the same rule that already governs a corrupt
+    JSON line — never repaired, never partially served. A truncated memory served as
+    whole would be a lie about what was remembered."""
     out = []
     try:
         ldir = memory_dir(home)
@@ -192,8 +233,13 @@ def _read_raw(home=None):
                         obj = json.loads(line)
                     except (ValueError, TypeError):
                         continue  # corrupt line → skip, never crash a reader
-                    if isinstance(obj, dict) and obj.get("id"):
-                        out.append(obj)
+                    if not (isinstance(obj, dict) and obj.get("id")):
+                        continue
+                    try:
+                        obj = mc.decode_entry(obj)
+                    except mc.CodecCorruption:
+                        continue  # unrecoverable payload → skip, never serve it
+                    out.append(obj)
         except OSError:
             continue
     return out
