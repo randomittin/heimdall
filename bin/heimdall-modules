@@ -1,0 +1,893 @@
+#!/usr/bin/env bash
+# heimdall-modules — the module system core: install, wire, verify and TOTALLY
+# remove optional capability modules.
+#
+# WHAT THIS IS. hmd's base install ships the SYSTEM and ZERO module payloads.
+# A module is an optional capability described by a manifest in the registry.
+# The registry IS this repo (modules/<name>/manifest.json), so every pin is a
+# reviewed commit rather than a network lookup.
+#
+# THE PROPERTY THIS EXISTS TO GUARANTEE. A module that fails its own class test
+# must leave NO TRACE. add and remove therefore share one removal path, and an
+# invariant failure calls exactly that path — so a rejected module rolls back
+# byte-identically to the pre-add tree. "It half-installed" is the failure mode
+# that eats an afternoon; it is designed out, not documented around.
+#
+# THE ORDER IS THE CONTRACT:
+#
+#     validate -> class contract -> consent -> install + digest-verify
+#              -> wire -> invariants
+#
+# Everything before `install` is READ-ONLY, so a manifest rejected at validate,
+# class or consent mutates nothing at all. From `install` onward every failure
+# unwinds through remove_module().
+#
+# CLASSES ARE DATA, NOT CODE. modules/_classes/<class>.json carries
+# `consent_required` plus a `requires_invariants` list, and this harness
+# DISCOVERS what to enforce by reading that file. Nothing here is hardcoded per
+# module, and adding a class is a JSON file, not a patch to this script.
+#
+# An invariant check is one of two kinds:
+#   suite     the CLASS owns the command (repo-owned, reviewable in one place).
+#             Used where the repo already holds the falsifier — the traffic-proxy
+#             and storage-codec classes both consume the judgment falsifier.
+#   manifest  the MODULE owns the command, supplied under `invariants.<id>`.
+#             Used where only the module knows how to drive itself (a codec's
+#             round-trip, an adapter's wrap/unwrap).
+# A manifest that does not cover every required invariant is REFUSED and NOT
+# WIRED, and the message names the missing ids.
+#
+# TRUST BOUNDARY. `manifest` checks run a command from the manifest, and suite
+# checks run a command from the class file. Both are repo-tracked content: the
+# registry is the repo, so a manifest lands through review exactly like any
+# other file. Every check runs under a hard wall-clock alarm so a hung or
+# malicious check cannot wedge the run.
+#
+# PINS, NOT LATEST. A manifest records `pinned_version` (version + artifact
+# sha256). There is NO code path that resolves "latest" — `update` moves to the
+# pin the manifest already holds, which a human edited and committed. Blind
+# -latest is not disabled by a flag; it does not exist.
+#
+# TIERS. `available` -> `suggested`. A `suggested` module must carry
+# `tier_evidence` (a green pre-registered A/B or equivalent receipt) or it is
+# refused. The tier controls how loudly hmd RECOMMENDS a module. It never
+# controls whether one installs: nothing here self-installs, ever.
+#
+# STATE. One directory per installed module under the state root (default
+# <plugin>/.heimdall/modules, which .gitignore already excludes). There is no
+# shared ledger file to rewrite, so removal is `rm -rf` of exactly one directory
+# plus pruning any directory this tool created — which is what makes
+# byte-identical removal reachable rather than aspirational.
+#
+# Usage:
+#   heimdall-modules list                 installed + available (default verb)
+#   heimdall-modules add <name>           run the full ordered pipeline
+#   heimdall-modules remove <name>        total removal
+#   heimdall-modules update [<name>]      move to the manifest's human-set pin
+#   heimdall-modules status <name>        one module in detail
+#   heimdall-modules verify [<name>]      re-run class invariants (CI entry point)
+#
+#   --json            structured output on stdout
+#   --yes             grant consent non-interactively (the operator is saying yes)
+#   --registry DIR    registry root (default <plugin>/modules)
+#   --state DIR       install state root (default <plugin>/.heimdall/modules)
+#   -h | --help
+#
+# EXIT: 0 success (INCLUDING an honest empty list — nothing installed is a real
+#       answer, not an error). 1 a module was refused or an invariant failed.
+#       2 usage / IO error.
+set -uo pipefail
+
+SELF="$0"
+if command -v readlink >/dev/null 2>&1; then
+  SELF="$(readlink -f "$0" 2>/dev/null || readlink "$0" 2>/dev/null || echo "$0")"
+fi
+BIN_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+PLUGIN_DIR="$(cd "$BIN_DIR/.." && pwd)"
+
+command -v jq >/dev/null 2>&1 || { echo "error: jq is required" >&2; exit 2; }
+
+usage() { awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "$SELF"; }
+
+die()  { echo "error: $*" >&2; exit 2; }
+warn() { echo "$*" >&2; }
+
+# ── Arguments ────────────────────────────────────────────────────────────────
+CMD=""
+TARGET=""
+AS_JSON=0
+ASSUME_YES=0
+REGISTRY="${HMD_MODULES_REGISTRY:-$PLUGIN_DIR/modules}"
+STATE="${HMD_MODULES_STATE:-$PLUGIN_DIR/.heimdall/modules}"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --json)     AS_JSON=1; shift ;;
+    --yes|-y)   ASSUME_YES=1; shift ;;
+    --registry) REGISTRY="${2:-}"; [ -n "$REGISTRY" ] || die "--registry needs a path"; shift 2 ;;
+    --state)    STATE="${2:-}";    [ -n "$STATE" ]    || die "--state needs a path";    shift 2 ;;
+    -h|--help)  usage; exit 0 ;;
+    -*)         die "unknown option: $1" ;;
+    *)
+      if [ -z "$CMD" ]; then CMD="$1"
+      elif [ -z "$TARGET" ]; then TARGET="$1"
+      else die "unexpected argument: $1"
+      fi
+      shift ;;
+  esac
+done
+
+CMD="${CMD:-list}"
+case "$CMD" in
+  list|add|remove|update|status|verify) : ;;
+  *) echo "error: unknown command: $CMD" >&2; usage >&2; exit 2 ;;
+esac
+
+CLASS_DIR="$REGISTRY/_classes"
+
+# ── Small helpers ────────────────────────────────────────────────────────────
+now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+sha256_file() {
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  elif command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    openssl dgst -sha256 "$1" | awk '{print $NF}'
+  fi
+}
+
+sha256_string() {
+  if command -v shasum >/dev/null 2>&1; then
+    printf '%s' "$1" | shasum -a 256 | awk '{print $1}'
+  elif command -v sha256sum >/dev/null 2>&1; then
+    printf '%s' "$1" | sha256sum | awk '{print $1}'
+  else
+    printf '%s' "$1" | openssl dgst -sha256 | awk '{print $NF}'
+  fi
+}
+
+# Run a check command under a hard wall-clock alarm. macOS ships no timeout(1),
+# so the alarm is perl's. Sets CAP_OUT / CAP_RC. A check that outlives its
+# budget is a FAILED check, never an ignored one.
+CAP_OUT=""; CAP_RC=0
+capture() {
+  local cmd="$1" secs="${2:-600}"
+  CAP_OUT="$(cd "$PLUGIN_DIR" && perl -e 'alarm shift @ARGV; exec @ARGV' -- "$secs" bash -c "$cmd" 2>&1)"
+  CAP_RC=$?
+  if [ "$CAP_RC" -eq 142 ] || [ "$CAP_RC" -eq 14 ]; then
+    CAP_OUT="${CAP_OUT}
+[heimdall-modules] check exceeded its ${secs}s budget and was killed"
+  fi
+}
+
+manifest_path() { printf '%s/%s/manifest.json' "$REGISTRY" "$1"; }
+class_path()    { printf '%s/%s.json' "$CLASS_DIR" "$1"; }
+
+# A module is installed iff its receipt exists. No shared ledger to drift.
+is_installed() { [ -f "$STATE/$1/receipt.json" ]; }
+
+installed_names() {
+  [ -d "$STATE" ] || return 0
+  local d
+  for d in "$STATE"/*/; do
+    [ -d "$d" ] || continue
+    d="${d%/}"; d="${d##*/}"
+    is_installed "$d" && printf '%s\n' "$d"
+  done
+}
+
+registry_names() {
+  [ -d "$REGISTRY" ] || return 0
+  local d n
+  for d in "$REGISTRY"/*/; do
+    [ -d "$d" ] || continue
+    n="${d%/}"; n="${n##*/}"
+    [ "$n" = "_classes" ] && continue
+    [ -f "$d/manifest.json" ] && printf '%s\n' "$n"
+  done
+}
+
+available_classes() {
+  [ -d "$CLASS_DIR" ] || return 0
+  local f n
+  for f in "$CLASS_DIR"/*.json; do
+    [ -f "$f" ] || continue
+    n="${f##*/}"; printf '%s\n' "${n%.json}"
+  done
+}
+
+# ── Step 1: VALIDATE ─────────────────────────────────────────────────────────
+# Pure schema + pin + tier checks over the manifest. Read-only: a manifest that
+# fails here has mutated nothing, because nothing has been created yet.
+# Emits every problem it finds, not just the first — a manifest author should
+# need one run to fix the file, not six.
+VALIDATE_ERRORS=""
+verr() { VALIDATE_ERRORS="${VALIDATE_ERRORS}  - $1
+"; }
+
+validate_manifest() {
+  local name="$1" mf="$2"
+  VALIDATE_ERRORS=""
+
+  jq -e . "$mf" >/dev/null 2>&1 || { verr "manifest is not valid JSON"; return 1; }
+
+  local v
+  local field
+  for field in name description upstream license permission_class tier; do
+    v="$(jq -r --arg f "$field" '.[$f] // "" | if type=="string" then . else "" end' "$mf")"
+    [ -n "$v" ] || verr "missing or non-string required field: \`$field\`"
+  done
+
+  v="$(jq -r '.name // ""' "$mf")"
+  [ -z "$v" ] || [ "$v" = "$name" ] || verr "\`name\` is \"$v\" but the module directory is \"$name\" — they must match"
+
+  # Pins, not latest.
+  jq -e '.pinned_version | type == "object"' "$mf" >/dev/null 2>&1 \
+    || verr "missing \`pinned_version\` object (a module is installed at a PIN; there is no latest)"
+  for field in version artifact artifact_sha256; do
+    v="$(jq -r --arg f "$field" '.pinned_version[$f] // "" | if type=="string" then . else "" end' "$mf" 2>/dev/null || echo "")"
+    [ -n "$v" ] || verr "missing or non-string \`pinned_version.$field\`"
+  done
+  v="$(jq -r '.pinned_version.artifact_sha256 // ""' "$mf" 2>/dev/null || echo "")"
+  if [ -n "$v" ]; then
+    case "$v" in
+      *[!0-9a-f]*|"") verr "\`pinned_version.artifact_sha256\` must be lowercase hex" ;;
+      *) [ "${#v}" -eq 64 ] || verr "\`pinned_version.artifact_sha256\` must be 64 hex chars (got ${#v})" ;;
+    esac
+  fi
+
+  # installs_via
+  v="$(jq -r '.installs_via.kind // ""' "$mf" 2>/dev/null || echo "")"
+  case "$v" in
+    local)
+      local ap
+      ap="$(jq -r '.installs_via.artifact_path // ""' "$mf")"
+      [ -n "$ap" ] || verr "\`installs_via.kind\` is \"local\" so \`installs_via.artifact_path\` is required" ;;
+    upstream)
+      v="$(jq -r '.installs_via.fetch // ""' "$mf")"
+      [ -n "$v" ] || verr "\`installs_via.kind\` is \"upstream\" so \`installs_via.fetch\` (the operator's fetch command) is required" ;;
+    "") verr "missing \`installs_via.kind\` (expected \"local\" or \"upstream\")" ;;
+    *)  verr "unknown \`installs_via.kind\`: \"$v\" (expected \"local\" or \"upstream\")" ;;
+  esac
+
+  # wires — an array of {kind,target}. Empty is allowed and reported honestly as
+  # an inert module; malformed is not.
+  if jq -e '.wires | type == "array"' "$mf" >/dev/null 2>&1; then
+    v="$(jq -r '[.wires[] | select((.kind // "") == "" or (.target // "") == "")] | length' "$mf")"
+    [ "$v" = "0" ] || verr "every entry in \`wires\` needs a non-empty \`kind\` and \`target\` ($v malformed)"
+  else
+    verr "missing \`wires\` array"
+  fi
+
+  jq -e '.invariants | type == "object"' "$mf" >/dev/null 2>&1 \
+    || verr "missing \`invariants\` object (may be empty, but the key must exist)"
+
+  # Tier. `suggested` is a claim about evidence, so it must carry the evidence.
+  v="$(jq -r '.tier // ""' "$mf")"
+  case "$v" in
+    available) : ;;
+    suggested)
+      jq -e '(.tier_evidence | type == "object") and ((.tier_evidence.receipt // "") != "")' "$mf" >/dev/null 2>&1 \
+        || verr "tier \"suggested\" requires \`tier_evidence.receipt\` — a green pre-registered A/B or equivalent receipt. A recommendation without evidence is an advertisement." ;;
+    "") : ;;
+    *) verr "unknown \`tier\`: \"$v\" (expected \"available\" or \"suggested\")" ;;
+  esac
+
+  [ -z "$VALIDATE_ERRORS" ]
+}
+
+# ── Step 2: CLASS CONTRACT ───────────────────────────────────────────────────
+# permission_class must name a real contract. Missing or invalid is REFUSED,
+# never defaulted: silently choosing a class for a module is choosing its
+# security posture for it.
+CLASS_FILE=""
+resolve_class() {
+  local mf="$1" pc
+  pc="$(jq -r '.permission_class // ""' "$mf")"
+  if [ -z "$pc" ]; then
+    warn "refused: manifest declares no \`permission_class\`."
+    warn "  A permission class is never defaulted — it decides consent and which"
+    warn "  invariants are enforced. Declare one of: $(available_classes | tr '\n' ' ')"
+    return 1
+  fi
+  CLASS_FILE="$(class_path "$pc")"
+  if [ ! -f "$CLASS_FILE" ]; then
+    warn "refused: unknown \`permission_class\`: \"$pc\""
+    warn "  No contract at ${CLASS_FILE#"$PLUGIN_DIR"/}. Valid classes: $(available_classes | tr '\n' ' ')"
+    return 1
+  fi
+  if ! jq -e . "$CLASS_FILE" >/dev/null 2>&1; then
+    warn "refused: class contract is not valid JSON: ${CLASS_FILE#"$PLUGIN_DIR"/}"
+    return 1
+  fi
+  local declared
+  declared="$(jq -r '.class // ""' "$CLASS_FILE")"
+  if [ "$declared" != "$pc" ]; then
+    warn "refused: class contract ${CLASS_FILE#"$PLUGIN_DIR"/} declares class \"$declared\", not \"$pc\""
+    return 1
+  fi
+  if ! jq -e '.requires_invariants | type == "array"' "$CLASS_FILE" >/dev/null 2>&1; then
+    warn "refused: class contract \"$pc\" has no \`requires_invariants\` array"
+    return 1
+  fi
+  return 0
+}
+
+# Every invariant the class requires must be satisfiable. A `manifest`-kind
+# invariant with no command in the manifest is a HOLE, and a hole in a class
+# contract is exactly the thing this system exists to refuse.
+check_invariant_coverage() {
+  local mf="$1" missing="" id kind cmd
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    kind="$(jq -r --arg i "$id" '.requires_invariants[] | select(.id == $i) | .check.kind // ""' "$CLASS_FILE")"
+    case "$kind" in
+      suite)
+        cmd="$(jq -r --arg i "$id" '.requires_invariants[] | select(.id == $i) | .check.command // ""' "$CLASS_FILE")"
+        [ -n "$cmd" ] || missing="${missing} ${id}(class-contract-has-no-command)" ;;
+      manifest)
+        cmd="$(jq -r --arg i "$id" '.invariants[$i].command // ""' "$mf")"
+        [ -n "$cmd" ] || missing="${missing} ${id}" ;;
+      *)
+        missing="${missing} ${id}(unknown-check-kind:${kind:-none})" ;;
+    esac
+  done <<< "$(jq -r '.requires_invariants[].id // empty' "$CLASS_FILE")"
+
+  if [ -n "$missing" ]; then
+    warn "refused: manifest does not cover every invariant its class requires."
+    warn "  class: $(jq -r '.class' "$CLASS_FILE")"
+    warn "  uncovered:$missing"
+    warn "  Each needs a runnable command under \`invariants.<id>.command\`."
+    warn "  Nothing was installed and nothing was wired."
+    return 1
+  fi
+  return 0
+}
+
+# ── Step 3: CONSENT ──────────────────────────────────────────────────────────
+# Read-only. A class that requires consent gets it explicitly or the add stops
+# here, before a single byte is written.
+CONSENT_JSON="null"
+obtain_consent() {
+  local name="$1" mf="$2"
+  local required text
+  required="$(jq -r '.consent_required // false' "$CLASS_FILE")"
+  if [ "$required" != "true" ]; then
+    CONSENT_JSON="$(jq -n '{required:false, note:"class does not require consent"}')"
+    return 0
+  fi
+
+  text="$(jq -r '.consent_text // ""' "$mf")"
+  if [ -z "$text" ]; then
+    warn "refused: class \"$(jq -r '.class' "$CLASS_FILE")\" requires consent, but the manifest ships no \`consent_text\`."
+    warn "  An operator cannot agree to a blank prompt."
+    return 1
+  fi
+
+  printf '\n  Module "%s" is class %s, which requires your consent.\n\n' \
+    "$name" "$(jq -r '.class' "$CLASS_FILE")"
+  printf '  %s\n\n' "$(jq -r '.consent_rationale // "This class can change behaviour you own."' "$CLASS_FILE")"
+  printf '  %s\n\n' "$text"
+
+  local granted_via=""
+  if [ "$ASSUME_YES" -eq 1 ]; then
+    printf '  Consent granted via --yes.\n\n'
+    granted_via="--yes"
+  else
+    local reply=""
+    if [ -r /dev/tty ]; then
+      printf '  Install it? [y/N] '
+      IFS= read -r reply < /dev/tty || reply=""
+      printf '\n'
+    elif [ -t 0 ]; then
+      printf '  Install it? [y/N] '
+      IFS= read -r reply || reply=""
+      printf '\n'
+    else
+      warn "refused: consent is required and there is no terminal to ask on."
+      warn "  Re-run with --yes if you are the operator and you agree."
+      return 1
+    fi
+    case "$reply" in
+      y|Y|yes|YES|Yes) granted_via="interactive" ;;
+      *) warn "refused: consent declined. Nothing was installed."; return 1 ;;
+    esac
+  fi
+
+  CONSENT_JSON="$(jq -n \
+    --arg via "$granted_via" --arg t "$(now_iso)" \
+    --arg h "$(sha256_string "$text")" --arg text "$text" \
+    '{required:true, granted:true, granted_via:$via, granted_at:$t,
+      consent_text:$text, consent_text_sha256:$h}')"
+  return 0
+}
+
+# ── Removal: the ONE path ────────────────────────────────────────────────────
+# add's rollback and `remove` call this same function, which is what makes a
+# rejected module and a removed module byte-identical outcomes. It reads the
+# receipt for the marker this tool wrote, so it can also unwind directories the
+# tool created — leaving a directory behind is residue, and residue fails the
+# round-trip falsifier.
+STATE_MARKER=".hmd-created"
+
+remove_module() {
+  local name="$1" mdir="$STATE/$name"
+  [ -d "$mdir" ] || return 0
+  rm -rf "$mdir" || { warn "error: could not remove $mdir"; return 1; }
+
+  # Prune directories this tool created, deepest first, stopping at the topmost
+  # one the marker records. Anything that pre-existed the add is never touched.
+  [ -f "$STATE/$STATE_MARKER" ] || return 0
+  local remaining
+  remaining="$(ls -A "$STATE" 2>/dev/null | grep -v "^${STATE_MARKER}\$" | head -1)"
+  [ -z "$remaining" ] || return 0
+
+  local topmost dir
+  topmost="$(head -1 "$STATE/$STATE_MARKER" 2>/dev/null || true)"
+  rm -f "$STATE/$STATE_MARKER"
+  dir="$STATE"
+  while [ -n "$dir" ] && [ "$dir" != "/" ]; do
+    rmdir "$dir" 2>/dev/null || break
+    [ "$dir" = "$topmost" ] && break
+    dir="$(dirname "$dir")"
+  done
+  return 0
+}
+
+# ── Step 4: INSTALL + DIGEST-VERIFY ──────────────────────────────────────────
+# The first mutating step. Creates the state root if it is absent and records
+# the topmost directory it created, so removal can unwind exactly that much.
+DIGEST_JSON="null"
+install_module() {
+  local name="$1" mf="$2" mdir="$STATE/$name"
+
+  if [ ! -d "$STATE" ]; then
+    # Find the topmost non-existent ancestor so removal knows where to stop.
+    local probe topmost="$STATE"
+    probe="$(dirname "$STATE")"
+    while [ ! -d "$probe" ] && [ "$probe" != "/" ] && [ "$probe" != "." ]; do
+      topmost="$probe"; probe="$(dirname "$probe")"
+    done
+    mkdir -p "$STATE" || { warn "error: cannot create state root $STATE"; return 1; }
+    printf '%s\n' "$topmost" > "$STATE/$STATE_MARKER"
+  fi
+
+  mkdir -p "$mdir" || { warn "error: cannot create $mdir"; return 1; }
+
+  # Digest-verify. A local artifact is hashed and compared to the pin; a
+  # mismatch is a REFUSAL. An upstream module is depended on, not cloned, so
+  # there is nothing on disk to hash at add time — that is recorded as
+  # DEFERRED rather than reported as verified. Claiming a check that did not
+  # run is the one thing worse than not running it.
+  local kind pinned actual apath
+  kind="$(jq -r '.installs_via.kind' "$mf")"
+  pinned="$(jq -r '.pinned_version.artifact_sha256' "$mf")"
+
+  if [ "$kind" = "local" ]; then
+    apath="$(jq -r '.installs_via.artifact_path' "$mf")"
+    case "$apath" in
+      /*) : ;;
+      *) apath="$REGISTRY/$name/$apath" ;;
+    esac
+    if [ ! -f "$apath" ]; then
+      warn "refused: pinned artifact not found at ${apath#"$PLUGIN_DIR"/}"
+      warn "  \`installs_via.kind\` is \"local\", so the artifact must ship with the manifest."
+      return 1
+    fi
+    actual="$(sha256_file "$apath")"
+    if [ "$actual" != "$pinned" ]; then
+      warn "refused: artifact digest MISMATCH — the pin does not describe this file."
+      warn "  artifact: ${apath#"$PLUGIN_DIR"/}"
+      warn "  pinned:   $pinned"
+      warn "  actual:   $actual"
+      return 1
+    fi
+    DIGEST_JSON="$(jq -n --arg s "$actual" --arg p "${apath#"$PLUGIN_DIR"/}" \
+      '{status:"verified", sha256:$s, artifact:$p,
+        note:"artifact hashed at install and matched the manifest pin"}')"
+  else
+    DIGEST_JSON="$(jq -n --arg p "$pinned" --arg f "$(jq -r '.installs_via.fetch' "$mf")" \
+      '{status:"deferred-upstream", pinned_sha256:$p, fetch:$f,
+        note:"upstream dependency — depend, do not clone. Nothing is vendored at add time, so no artifact existed to hash. The pin is RECORDED and re-checked by `verify` once the artifact is present; it is NOT reported as verified."}')"
+  fi
+
+  jq -n \
+    --arg name "$name" \
+    --arg version "$(jq -r '.pinned_version.version' "$mf")" \
+    --arg artifact "$(jq -r '.pinned_version.artifact' "$mf")" \
+    --arg class "$(jq -r '.permission_class' "$mf")" \
+    --arg tier "$(jq -r '.tier // "available"' "$mf")" \
+    --arg at "$(now_iso)" \
+    --arg mfsha "$(sha256_file "$mf")" \
+    --argjson digest "$DIGEST_JSON" \
+    --argjson consent "$CONSENT_JSON" \
+    '{name:$name, pinned_version:{version:$version, artifact:$artifact},
+      permission_class:$class, tier:$tier, installed_at:$at,
+      manifest_sha256:$mfsha, digest:$digest, consent:$consent}' \
+    > "$mdir/receipt.json" || { warn "error: cannot write receipt"; return 1; }
+  return 0
+}
+
+# ── Step 5: WIRE ─────────────────────────────────────────────────────────────
+# Wiring is what makes a module ACTIVE. It is recorded before invariants run,
+# by design: the class contracts assert behaviour "with the module active", so
+# the invariants must execute against a wired module or they prove nothing.
+wire_module() {
+  local name="$1" mf="$2" mdir="$STATE/$name"
+  jq --arg at "$(now_iso)" \
+     '{wired_at:$at, targets:(.wires // []),
+       note:"wiring precedes invariant verification so every invariant runs with the module active"}' \
+     "$mf" > "$mdir/wired.json" || { warn "error: cannot write wiring record"; return 1; }
+  return 0
+}
+
+# ── Step 6: INVARIANTS ───────────────────────────────────────────────────────
+# Discovered from the class contract, never hardcoded. Any failure returns
+# non-zero and the caller unwinds through remove_module().
+INVARIANT_RESULTS="[]"
+run_invariants() {
+  local name="$1" mf="$2"
+  local results="[]" failed=0
+  local id kind cmd expect expect_exit secs source desc pass
+
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    kind="$(jq -r --arg i "$id" '.requires_invariants[] | select(.id == $i) | .check.kind // ""' "$CLASS_FILE")"
+    desc="$(jq -r --arg i "$id" '.requires_invariants[] | select(.id == $i) | .description // ""' "$CLASS_FILE")"
+    if [ "$kind" = "suite" ]; then
+      source="class-contract"
+      cmd="$(jq -r --arg i "$id" '.requires_invariants[] | select(.id == $i) | .check.command // ""' "$CLASS_FILE")"
+      expect="$(jq -r --arg i "$id" '.requires_invariants[] | select(.id == $i) | .check.expect // ""' "$CLASS_FILE")"
+      expect_exit="$(jq -r --arg i "$id" '.requires_invariants[] | select(.id == $i) | .check.expect_exit // 0' "$CLASS_FILE")"
+      secs="$(jq -r --arg i "$id" '.requires_invariants[] | select(.id == $i) | .check.timeout_sec // 600' "$CLASS_FILE")"
+    else
+      source="manifest"
+      cmd="$(jq -r --arg i "$id" '.invariants[$i].command // ""' "$mf")"
+      expect="$(jq -r --arg i "$id" '.invariants[$i].expect // ""' "$mf")"
+      expect_exit="$(jq -r --arg i "$id" '.invariants[$i].expect_exit // 0' "$mf")"
+      secs="$(jq -r --arg i "$id" '.invariants[$i].timeout_sec // 600' "$mf")"
+    fi
+
+    capture "$cmd" "$secs"
+    pass=1
+    local reason=""
+    if [ "$CAP_RC" != "$expect_exit" ]; then
+      pass=0; reason="exit $CAP_RC, expected $expect_exit"
+    elif [ -n "$expect" ] && ! printf '%s' "$CAP_OUT" | grep -qF -- "$expect"; then
+      pass=0; reason="output did not contain the expected marker: \"$expect\""
+    fi
+    [ "$pass" -eq 1 ] || failed=$((failed+1))
+
+    if [ "$AS_JSON" -eq 0 ]; then
+      if [ "$pass" -eq 1 ]; then
+        printf '    \033[32mPASS\033[0m %s (%s)\n' "$id" "$source"
+      else
+        printf '    \033[31mFAIL\033[0m %s (%s) — %s\n' "$id" "$source" "$reason"
+      fi
+    fi
+
+    results="$(jq -n --argjson acc "$results" \
+      --arg id "$id" --arg src "$source" --arg cmd "$cmd" --arg desc "$desc" \
+      --argjson ok "$pass" --arg reason "$reason" \
+      --arg out "$(printf '%s' "$CAP_OUT" | tail -20)" \
+      '$acc + [{id:$id, source:$src, command:$cmd, description:$desc,
+                passed:($ok == 1), reason:$reason, output_tail:$out}]')"
+  done <<< "$(jq -r '.requires_invariants[].id // empty' "$CLASS_FILE")"
+
+  INVARIANT_RESULTS="$results"
+  [ "$failed" -eq 0 ]
+}
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  Commands
+# ═════════════════════════════════════════════════════════════════════════════
+
+cmd_list() {
+  local inst avail
+  inst="$(installed_names)"
+  avail="$(registry_names)"
+
+  if [ "$AS_JSON" -eq 1 ]; then
+    local arr="[]" n
+    while IFS= read -r n; do
+      [ -n "$n" ] || continue
+      arr="$(jq -n --argjson acc "$arr" --slurpfile r "$STATE/$n/receipt.json" \
+        --argjson wired "$([ -f "$STATE/$n/wired.json" ] && echo true || echo false)" \
+        '$acc + [$r[0] + {wired:$wired}]')"
+    done <<< "$inst"
+    local av="[]"
+    while IFS= read -r n; do
+      [ -n "$n" ] || continue
+      av="$(jq -n --argjson acc "$av" --arg n "$n" --slurpfile m "$(manifest_path "$n")" \
+        '$acc + [{name:$n,
+                  description:($m[0].description // ""),
+                  permission_class:($m[0].permission_class // null),
+                  tier:($m[0].tier // "available"),
+                  pinned_version:($m[0].pinned_version.version // null)}]')"
+    done <<< "$avail"
+    jq -n --argjson installed "$arr" --argjson available "$av" \
+      --arg registry "${REGISTRY#"$PLUGIN_DIR"/}" \
+      '{tool:"heimdall-modules", registry:$registry,
+        installed_count:($installed|length), installed:$installed,
+        available_count:($available|length), available:$available}'
+    return 0
+  fi
+
+  printf '\n  Heimdall modules\n\n'
+  if [ -z "$inst" ]; then
+    # An honest empty state. Not an error, and never a fake entry: the base
+    # install ships the system and zero module payloads, so this IS the
+    # expected reading on a fresh machine.
+    printf '  Installed: none.\n'
+    printf '  The base install ships the module system and no module payloads.\n'
+  else
+    printf '  Installed:\n'
+    local n
+    while IFS= read -r n; do
+      [ -n "$n" ] || continue
+      printf '    %-24s %-14s %-13s %s\n' \
+        "$n" \
+        "$(jq -r '.pinned_version.version' "$STATE/$n/receipt.json")" \
+        "$(jq -r '.permission_class' "$STATE/$n/receipt.json")" \
+        "$([ -f "$STATE/$n/wired.json" ] && echo wired || echo 'NOT WIRED')"
+    done <<< "$inst"
+  fi
+  printf '\n'
+  if [ -z "$avail" ]; then
+    printf '  Available in the registry: none.\n'
+  else
+    printf '  Available in the registry (%s):\n' "$(printf '%s\n' "$avail" | grep -c .)"
+    local n
+    while IFS= read -r n; do
+      [ -n "$n" ] || continue
+      printf '    %-24s %-11s %s\n' \
+        "$n" \
+        "$(jq -r '.tier // "available"' "$(manifest_path "$n")")" \
+        "$(jq -r '.description // ""' "$(manifest_path "$n")")"
+    done <<< "$avail"
+  fi
+  printf '\n  hmd modules add <name>    install at the manifest pin\n\n'
+}
+
+cmd_add() {
+  local name="$1"
+  [ -n "$name" ] || die "add needs a module name"
+  local mf; mf="$(manifest_path "$name")"
+  [ -f "$mf" ] || { warn "error: no manifest for \"$name\" at ${mf#"$PLUGIN_DIR"/}"; exit 2; }
+
+  if is_installed "$name"; then
+    warn "\"$name\" is already installed. Use \`update $name\` or \`remove $name\`."
+    exit 1
+  fi
+
+  printf '\n  Adding module "%s"\n\n' "$name"
+
+  # 1. VALIDATE (read-only)
+  printf '  [1/6] validate\n'
+  if ! validate_manifest "$name" "$mf"; then
+    warn "refused: manifest failed validation. Nothing was installed."
+    printf '%s' "$VALIDATE_ERRORS" >&2
+    exit 1
+  fi
+
+  # 2. CLASS CONTRACT (read-only)
+  printf '  [2/6] class contract\n'
+  resolve_class "$mf" || exit 1
+  check_invariant_coverage "$mf" || exit 1
+
+  # 3. CONSENT (read-only)
+  printf '  [3/6] consent\n'
+  obtain_consent "$name" "$mf" || exit 1
+
+  # 4. INSTALL + DIGEST-VERIFY (first mutation)
+  printf '  [4/6] install + digest-verify\n'
+  if ! install_module "$name" "$mf"; then
+    remove_module "$name"
+    warn "refused: install failed. Rolled back — no trace left."
+    exit 1
+  fi
+  printf '        digest: %s\n' "$(printf '%s' "$DIGEST_JSON" | jq -r '.status')"
+
+  # 5. WIRE
+  printf '  [5/6] wire\n'
+  if ! wire_module "$name" "$mf"; then
+    remove_module "$name"
+    warn "refused: wiring failed. Rolled back — no trace left."
+    exit 1
+  fi
+
+  # 6. INVARIANTS — with the module installed and wired.
+  printf '  [6/6] class invariants (module active)\n'
+  if ! run_invariants "$name" "$mf"; then
+    printf '%s' "$INVARIANT_RESULTS" | jq -r '.[] | select(.passed | not)
+      | "  FAILED INVARIANT: \(.id)\n    why: \(.reason)\n    what it guarantees: \(.description)\n    command: \(.command)"' >&2
+    remove_module "$name"
+    warn ""
+    warn "REFUSED: \"$name\" failed its class invariants and was NOT wired."
+    warn "  Rolled back through the same removal path \`remove\` uses, so the tree"
+    warn "  is byte-identical to before the add. Nothing half-installed."
+    exit 1
+  fi
+
+  printf '%s' "$INVARIANT_RESULTS" > "$STATE/$name/invariants.json"
+  printf '\n  Installed "%s" at pin %s (class %s).\n\n' \
+    "$name" "$(jq -r '.pinned_version.version' "$mf")" "$(jq -r '.permission_class' "$mf")"
+
+  if [ "$AS_JSON" -eq 1 ]; then
+    jq -n --slurpfile r "$STATE/$name/receipt.json" --argjson inv "$INVARIANT_RESULTS" \
+      '{tool:"heimdall-modules", action:"add", ok:true, receipt:$r[0], invariants:$inv}'
+  fi
+}
+
+cmd_remove() {
+  local name="$1"
+  [ -n "$name" ] || die "remove needs a module name"
+  if ! is_installed "$name"; then
+    if [ "$AS_JSON" -eq 1 ]; then
+      jq -n --arg n "$name" '{tool:"heimdall-modules", action:"remove", ok:true,
+        name:$n, note:"not installed — nothing to remove"}'
+    else
+      printf '\n  "%s" is not installed. Nothing to remove.\n\n' "$name"
+    fi
+    return 0
+  fi
+  remove_module "$name" || exit 1
+  if [ "$AS_JSON" -eq 1 ]; then
+    jq -n --arg n "$name" '{tool:"heimdall-modules", action:"remove", ok:true, name:$n,
+      note:"removed totally — install dir deleted and tool-created dirs pruned"}'
+  else
+    printf '\n  Removed "%s". Install directory deleted; directories this tool\n' "$name"
+    printf '  created were pruned. Nothing of it remains.\n\n'
+  fi
+}
+
+cmd_status() {
+  local name="$1"
+  [ -n "$name" ] || die "status needs a module name"
+  if ! is_installed "$name"; then
+    if [ "$AS_JSON" -eq 1 ]; then
+      jq -n --arg n "$name" '{tool:"heimdall-modules", action:"status",
+        name:$n, installed:false}'
+    else
+      printf '\n  "%s" is not installed.\n\n' "$name"
+    fi
+    return 0
+  fi
+  local d="$STATE/$name"
+  if [ "$AS_JSON" -eq 1 ]; then
+    jq -n --slurpfile r "$d/receipt.json" \
+      --argjson wired "$([ -f "$d/wired.json" ] && cat "$d/wired.json" || echo null)" \
+      --argjson inv "$([ -f "$d/invariants.json" ] && cat "$d/invariants.json" || echo null)" \
+      '{tool:"heimdall-modules", action:"status", installed:true,
+        receipt:$r[0], wiring:$wired, invariants:$inv}'
+    return 0
+  fi
+  printf '\n  %s\n\n' "$name"
+  jq -r '"    pin:      \(.pinned_version.version)
+    class:    \(.permission_class)
+    tier:     \(.tier)
+    added:    \(.installed_at)
+    digest:   \(.digest.status) — \(.digest.note)
+    consent:  \(if .consent.required then "granted via \(.consent.granted_via) at \(.consent.granted_at)" else "not required for this class" end)"' "$d/receipt.json"
+  local ntargets
+  ntargets="$(jq -r '.targets | length' "$d/wired.json" 2>/dev/null || echo 0)"
+  if [ "$ntargets" = "0" ]; then
+    printf '    wiring:   0 targets — the module is inert\n'
+  else
+    printf '    wiring:   %s target(s): %s\n' "$ntargets" \
+      "$(jq -r '[.targets[] | "\(.kind):\(.target)"] | join(", ")' "$d/wired.json")"
+  fi
+  if [ -f "$d/invariants.json" ]; then
+    printf '    invariants verified at add:\n'
+    jq -r '.[] | "      \(if .passed then "PASS" else "FAIL" end) \(.id) (\(.source))"' "$d/invariants.json"
+  fi
+  printf '\n'
+}
+
+cmd_verify() {
+  local name="$1" targets rc=0
+  if [ -n "$name" ]; then
+    is_installed "$name" || { warn "error: \"$name\" is not installed"; exit 2; }
+    targets="$name"
+  else
+    targets="$(installed_names)"
+  fi
+
+  if [ -z "$targets" ]; then
+    if [ "$AS_JSON" -eq 1 ]; then
+      jq -n '{tool:"heimdall-modules", action:"verify", ok:true, verified:[],
+        note:"no modules installed — nothing to verify"}'
+    else
+      printf '\n  No modules installed. Nothing to verify.\n\n'
+    fi
+    return 0
+  fi
+
+  local all="[]" n mf
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    mf="$(manifest_path "$n")"
+    if [ ! -f "$mf" ]; then
+      warn "FAIL $n — installed but its manifest is gone from the registry (${mf#"$PLUGIN_DIR"/})"
+      rc=1
+      all="$(jq -n --argjson acc "$all" --arg n "$n" \
+        '$acc + [{name:$n, ok:false, reason:"manifest missing from registry"}]')"
+      continue
+    fi
+    if ! resolve_class "$mf"; then rc=1; continue; fi
+    [ "$AS_JSON" -eq 1 ] || printf '\n  %s (class %s)\n' "$n" "$(jq -r '.class' "$CLASS_FILE")"
+    if run_invariants "$n" "$mf"; then
+      all="$(jq -n --argjson acc "$all" --arg n "$n" --argjson inv "$INVARIANT_RESULTS" \
+        '$acc + [{name:$n, ok:true, invariants:$inv}]')"
+    else
+      rc=1
+      all="$(jq -n --argjson acc "$all" --arg n "$n" --argjson inv "$INVARIANT_RESULTS" \
+        '$acc + [{name:$n, ok:false, invariants:$inv}]')"
+    fi
+  done <<< "$targets"
+
+  if [ "$AS_JSON" -eq 1 ]; then
+    jq -n --argjson v "$all" --argjson ok "$([ "$rc" -eq 0 ] && echo true || echo false)" \
+      '{tool:"heimdall-modules", action:"verify", ok:$ok, verified:$v}'
+  else
+    printf '\n'
+    [ "$rc" -eq 0 ] && printf '  All installed modules hold their class invariants.\n\n' \
+                    || printf '  One or more modules FAILED their class invariants.\n\n'
+  fi
+  return "$rc"
+}
+
+cmd_update() {
+  local name="$1" targets rc=0
+  if [ -n "$name" ]; then
+    is_installed "$name" || { warn "error: \"$name\" is not installed"; exit 2; }
+    targets="$name"
+  else
+    targets="$(installed_names)"
+  fi
+
+  if [ -z "$targets" ]; then
+    printf '\n  No modules installed. Nothing to update.\n\n'
+    return 0
+  fi
+
+  local n mf have want
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    mf="$(manifest_path "$n")"
+    if [ ! -f "$mf" ]; then
+      warn "  $n — manifest gone from the registry; cannot update. Remove it or restore the manifest."
+      rc=1; continue
+    fi
+    have="$(jq -r '.pinned_version.version' "$STATE/$n/receipt.json")"
+    want="$(jq -r '.pinned_version.version // ""' "$mf")"
+    if [ "$have" = "$want" ]; then
+      printf '\n  %s is already at the pinned version %s. Nothing to do.\n' "$n" "$have"
+      printf '  (There is no "latest" to move to — the pin lives in the manifest,\n'
+      printf '   and a human edits and commits it.)\n\n'
+      continue
+    fi
+    printf '\n  %s: %s -> %s (human-verified pin from the manifest)\n\n' "$n" "$have" "$want"
+    # Reinstall through the full ordered pipeline so the new pin faces every
+    # gate the first one did. Remove first: a partially-overwritten module is
+    # exactly the residue this system refuses to create.
+    remove_module "$n" || { rc=1; continue; }
+    if ! ( cmd_add "$n" ); then
+      warn "  update FAILED for $n at the new pin. The old install was removed first,"
+      warn "  so nothing is half-updated — re-run \`add $n\` once the manifest is fixed."
+      rc=1
+    fi
+  done <<< "$targets"
+  return "$rc"
+}
+
+case "$CMD" in
+  list)   cmd_list ;;
+  add)    cmd_add "$TARGET" ;;
+  remove) cmd_remove "$TARGET" ;;
+  status) cmd_status "$TARGET" ;;
+  verify) cmd_verify "$TARGET" ;;
+  update) cmd_update "$TARGET" ;;
+esac

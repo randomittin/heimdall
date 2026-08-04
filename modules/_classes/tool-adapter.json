@@ -1,0 +1,20 @@
+{
+  "class": "tool-adapter",
+  "version": "1",
+  "summary": "A module that wraps an external tool so hmd can drive it.",
+  "why_this_class_exists": "An adapter edits the operator's own configuration surface — hooksPath, AGENTS.md — which is shared with tools hmd does not own. Wrapping must therefore be exactly reversible, and a foreign region of a shared file must survive untouched.",
+  "consent_required": true,
+  "consent_rationale": "The module writes to configuration the operator owns and other tools read. Editing someone's hooksPath or AGENTS.md without asking is indistinguishable from a hostile change, however well-intentioned.",
+  "requires_invariants": [
+    {
+      "id": "wrap-unwrap-reversible",
+      "description": "wrap then unwrap must return the input byte-identically. An adapter that cannot un-wrap what it wrapped has made the operator's tool permanently hmd-shaped, which is a one-way door.",
+      "check": { "kind": "manifest" }
+    },
+    {
+      "id": "fence-preservation",
+      "description": "hooksPath and any generated AGENTS.md region must be fenced, and content OUTSIDE the fence must survive byte-identically. The operator's own lines and a foreign generator's region are not ours to rewrite.",
+      "check": { "kind": "manifest" }
+    }
+  ]
+}
