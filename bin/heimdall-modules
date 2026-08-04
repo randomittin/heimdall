@@ -93,6 +93,20 @@
 #   --state DIR       install state root (default <plugin>/.heimdall/modules)
 #   -h | --help
 #
+# PAYLOADS ARE FETCHED, AND THEN PROVEN. For `installs_via.kind == "upstream"`,
+# `add` RUNS the recorded fetch and then asks the installer whether the package is
+# actually there. The word "Installed" is printed only for a payload the WORLD
+# confirms; a fetch that exits 0 having installed nothing reports ABSENT and rolls
+# back. Anything short of a confirmed payload reads "Registered … PAYLOAD NOT
+# PRESENT" with the exact command that finishes the job.
+#
+#   HMD_MODULE_FETCH_DRYRUN=1   TEST seam: decide and log the fetch, never run it.
+#                     Presence is still read from the world afterwards, so this can
+#                     only ever report LESS than the truth. Nothing here can fake a
+#                     present payload.
+#   HMD_MODULE_FETCH_TIMEOUT    wall-clock budget for the fetch (default 1800s).
+#   HMD_MODULE_PROBE_TIMEOUT    wall-clock budget for the presence probe (60s).
+#
 # EXIT: 0 success (INCLUDING an honest empty list — nothing installed is a real
 #       answer, not an error). 1 a module was refused or an invariant failed.
 #       2 usage / IO error.
@@ -722,12 +736,196 @@ remove_module() {
   return 0
 }
 
+# ── Upstream payload: run the fetch, then PROVE it landed ────────────────────
+# DEPEND, DON'T CLONE means no source is vendored into this repo. It does NOT
+# mean the dependency never arrives: `uv tool install` is depending, not cloning.
+# So `add` RUNS `installs_via.fetch` and then asks the WORLD whether the thing is
+# there.
+#
+# WHY THE WORLD AND NOT THE EXIT CODE. An installer that exits 0 having installed
+# nothing is not hypothetical — it is the exact shape of the bug this section was
+# written to kill: hmd printed `Installed "headroom" at pin 0.33.0` while
+# `uv tool list` said `No tools installed`. An exit code is the fetch's opinion of
+# itself. The probe is a fact. Only the fact may print a green word.
+#
+# hmd NEVER RUNS A FETCH IT CANNOT CHECK. If the recorded command drives an
+# installer this file has no probe for, the fetch does not run at all and the
+# module is REGISTERED at its pin with the operator's command quoted. Running an
+# install and then guessing whether it worked is the failure being fixed; doing it
+# for an unknown installer would just move the guess somewhere less visible.
+#
+# AND ONLY FOR THE CANONICAL STATE ROOT. The fetch mutates the MACHINE — a tool
+# store and a bin directory that live outside $STATE entirely — while hmd's only
+# record of that mutation is the receipt under $STATE. Point --state (or
+# HMD_MODULES_STATE) at a scratch directory and that record goes somewhere a
+# normal `hmd modules remove` never looks, leaving a machine-global tool nobody
+# can find or reverse. So a machine-global install happens only when hmd's
+# bookkeeping IS the machine's bookkeeping. Elsewhere: registered, with the
+# command printed, and nothing done behind the operator's back.
+#
+# A caller that genuinely owns its state root (a second checkout, or the fetch
+# acceptance suite driving a fake installer) says so with
+# HMD_MODULE_STATE_IS_CANONICAL=1. That opts INTO doing real work, never into
+# claiming it: the world-probe still decides what may be called present.
+DEFAULT_STATE_ROOT="$PLUGIN_DIR/.heimdall/modules"
+HMD_MODULE_STATE_IS_CANONICAL="${HMD_MODULE_STATE_IS_CANONICAL:-0}"
+state_is_canonical() {
+  [ "$HMD_MODULE_STATE_IS_CANONICAL" = "1" ] && return 0
+  [ "$STATE" = "$DEFAULT_STATE_ROOT" ]
+}
+
+# TEST SEAM, mirroring HEIMDALL_MODULE_RECONCILE_DRYRUN: decide and log, never
+# execute. It is safe by construction because presence is STILL read from the
+# world afterwards — a dryrun can only ever report LESS than the truth, never
+# more. There is deliberately no lever that fakes a present payload.
+HMD_MODULE_FETCH_DRYRUN="${HMD_MODULE_FETCH_DRYRUN:-0}"
+
+# Asking an installer what it holds is a local read: fast, or broken. A probe
+# that hangs is a FAILED probe, which reads as "not present" — the safe answer.
+HMD_MODULE_PROBE_TIMEOUT="${HMD_MODULE_PROBE_TIMEOUT:-60}"
+
+# A big source build is legitimately slow, so the fetch budget is generous — but
+# it IS a budget. An unbounded fetch is how an install wedges a machine.
+HMD_MODULE_FETCH_TIMEOUT="${HMD_MODULE_FETCH_TIMEOUT:-1800}"
+
+# The package a fetch command installs, read from the command itself — the same
+# rule module_preflight.sh already uses to derive the tool and the interpreter,
+# so no manifest has to restate it. `--from <pkg>` wins when present: that is the
+# installer's own way of naming the distribution when it differs from the command.
+# Empty means "not a shape this file can read", which is what makes hmd decline.
+upstream_package() {
+  local tok spec="" pending=""
+  for tok in ${1:-}; do
+    tok="${tok#[\"\']}"; tok="${tok%[\"\']}"
+    [ -n "$tok" ] || continue
+    if [ -n "$pending" ]; then
+      [ "$pending" = "--from" ] && { spec="$tok"; break; }
+      pending=""; continue
+    fi
+    case "$tok" in
+      --from=*) spec="${tok#--from=}"; break ;;
+      --from|--python|-p|--with|--index|--index-url|--extra-index-url|--constraint|-c|--exclude-newer|--python-preference)
+                pending="$tok" ;;
+      -*)       : ;;
+      uv|uvx|pipx|tool|install|add|global) : ;;
+      *)        [ -n "$spec" ] || spec="$tok" ;;
+    esac
+  done
+  [ -n "$spec" ] || return 1
+  # headroom-ai[all]==0.33.0 -> headroom-ai
+  spec="$(printf '%s' "$spec" | sed -e 's/\[.*$//' -e 's/[<>=!~;].*$//')"
+  [ -n "$spec" ] || return 1
+  printf '%s' "$spec"
+}
+
+# The command that asks an installer what it ACTUALLY has. No entry here means no
+# fetch — see above.
+upstream_probe_cmd() {
+  case "$1" in
+    uv|uvx) printf 'uv tool list' ;;
+    *)      return 1 ;;
+  esac
+}
+
+# EXACT first-field match, never a substring: "headroom-ai-extras" must not be
+# allowed to answer for "headroom-ai".
+probe_lists_package() {
+  printf '%s' "$1" | awk -v p="$2" '$1 == p { found = 1 } END { exit found ? 0 : 1 }'
+}
+
+# Acquire (or decline to acquire) an upstream payload, then record what is TRUE.
+# Sets PAYLOAD_JSON and PAYLOAD_PRESENT; on an honest failure also PAYLOAD_BLOCKER
+# and PAYLOAD_REMEDY. Returns 1 only for "we tried and it did not land" — the
+# cases where hmd deliberately does not try are a 0 with present=false.
+PAYLOAD_JSON="null"
+PAYLOAD_PRESENT=0
+PAYLOAD_BLOCKER=""
+PAYLOAD_REMEDY=""
+acquire_upstream() {
+  local name="$1" mf="$2"
+  local fetch tool pkg probe ran=false rc="null"
+  PAYLOAD_PRESENT=0; PAYLOAD_BLOCKER=""; PAYLOAD_REMEDY=""
+
+  fetch="$(jq -r '.installs_via.fetch // ""' "$mf")"
+  tool="$(printf '%s' "$fetch" | awk '{print $1}')"
+  probe="$(upstream_probe_cmd "$tool" 2>/dev/null || true)"
+  # Only read a package name out of a command whose installer we can question.
+  # Recording a "package" nobody can look up would be a fact-shaped guess.
+  pkg=""
+  [ -n "$probe" ] && pkg="$(upstream_package "$fetch" 2>/dev/null || true)"
+
+  payload_record() {
+    PAYLOAD_JSON="$(jq -n --arg f "$fetch" --arg p "$probe" --arg pkg "$pkg" \
+      --arg st "$1" --arg why "$2" --arg rem "${3:-}" --arg at "$(now_iso)" \
+      --argjson present "$([ "$PAYLOAD_PRESENT" -eq 1 ] && echo true || echo false)" \
+      --argjson ran "$ran" --argjson rc "$rc" \
+      '{present:$present, state:$st, reason:$why, remedy:$rem, package:$pkg,
+        fetch:$f, fetch_ran:$ran, fetch_exit:$rc, probe:$p, checked_at:$at,
+        note:"`present` is read from the installer, never inferred from the fetch exit code."}')"
+  }
+
+  if [ -z "$pkg" ] || [ -z "$probe" ]; then
+    payload_record registered \
+      "hmd has no way to ask \`$tool\` what it actually installed, so the fetch was NOT run — an install it cannot verify is an install it will not claim" \
+      "$fetch"
+    return 0
+  fi
+
+  # Already there? Then there is nothing to spend. Checked before the seam and
+  # before the state-root rule, because a true fact outranks both.
+  capture "$probe" "$HMD_MODULE_PROBE_TIMEOUT"
+  if [ "$CAP_RC" -eq 0 ] && probe_lists_package "$CAP_OUT" "$pkg"; then
+    PAYLOAD_PRESENT=1
+    payload_record present "\`$pkg\` was already present in \`$probe\` — nothing to fetch" ""
+    return 0
+  fi
+
+  if ! state_is_canonical; then
+    payload_record registered \
+      "the payload installs machine-wide but this run books it into $STATE, which is not hmd's module state root ($DEFAULT_STATE_ROOT) — a global install recorded somewhere \`remove\` does not look is an orphan, so it was NOT run" \
+      "$fetch"
+    return 0
+  fi
+
+  if [ "$HMD_MODULE_FETCH_DRYRUN" = "1" ]; then
+    payload_record registered \
+      "HMD_MODULE_FETCH_DRYRUN=1 — the fetch was decided and logged, not run. The probe still ran and \`$pkg\` is not present." \
+      "$fetch"
+    return 0
+  fi
+
+  [ "$QUIET" -eq 1 ] || printf '        fetching: %s\n' "$fetch"
+  ran=true
+  capture "$fetch" "$HMD_MODULE_FETCH_TIMEOUT"
+  rc="$CAP_RC"
+  if [ "$CAP_RC" -ne 0 ]; then
+    PAYLOAD_BLOCKER="the fetch exited $CAP_RC: $(printf '%s' "$CAP_OUT" | tail -3 | tr '\n' ' ')"
+    PAYLOAD_REMEDY="$fetch"
+    payload_record absent "$PAYLOAD_BLOCKER" "$PAYLOAD_REMEDY"
+    return 1
+  fi
+
+  # THE DIFFERENTIAL. exit 0 is a claim; the probe is the check.
+  capture "$probe" "$HMD_MODULE_PROBE_TIMEOUT"
+  if [ "$CAP_RC" -eq 0 ] && probe_lists_package "$CAP_OUT" "$pkg"; then
+    PAYLOAD_PRESENT=1
+    payload_record present "\`$pkg\` is listed by \`$probe\` after the fetch" ""
+    return 0
+  fi
+  PAYLOAD_BLOCKER="the fetch exited 0 but \`$probe\` does not list \`$pkg\` — nothing landed"
+  PAYLOAD_REMEDY="$fetch"
+  payload_record absent "$PAYLOAD_BLOCKER" "$PAYLOAD_REMEDY"
+  return 1
+}
+
 # ── Step 4: INSTALL + DIGEST-VERIFY ──────────────────────────────────────────
 # The first mutating step. Creates the state root if it is absent and records
 # the topmost directory it created, so removal can unwind exactly that much.
 DIGEST_JSON="null"
+INSTALL_OUTCOME="ok"
 install_module() {
   local name="$1" mf="$2" mdir="$STATE/$name"
+  INSTALL_OUTCOME="refused"
 
   if [ ! -d "$STATE" ]; then
     # Find the topmost non-existent ancestor so removal knows where to stop.
@@ -773,10 +971,24 @@ install_module() {
     DIGEST_JSON="$(jq -n --arg s "$actual" --arg p "${apath#"$PLUGIN_DIR"/}" \
       '{status:"verified", sha256:$s, artifact:$p,
         note:"artifact hashed at install and matched the manifest pin"}')"
+    # A local module's artifact IS its payload, and it was just hashed.
+    PAYLOAD_PRESENT=1
+    PAYLOAD_JSON="$(jq -n --arg p "${apath#"$PLUGIN_DIR"/}" --arg at "$(now_iso)" \
+      '{present:true, state:"present", package:null, fetch:null, fetch_ran:false,
+        probe:"sha256 of the shipped artifact", artifact:$p, checked_at:$at,
+        reason:"`installs_via.kind` is \"local\" — the payload ships with the manifest and was hashed against the pin"}')"
   else
+    # THE FETCH RUNS HERE, and only a world-probe may call it present.
+    if ! acquire_upstream "$name" "$mf"; then
+      INSTALL_OUTCOME="absent"
+      return 1
+    fi
+    local dstatus="deferred-upstream"
+    [ "$PAYLOAD_PRESENT" -eq 1 ] && dstatus="present-upstream"
     DIGEST_JSON="$(jq -n --arg p "$pinned" --arg f "$(jq -r '.installs_via.fetch' "$mf")" \
-      '{status:"deferred-upstream", pinned_sha256:$p, fetch:$f,
-        note:"upstream dependency — depend, do not clone. Nothing is vendored at add time, so no artifact existed to hash. The pin is RECORDED and re-checked by `verify` once the artifact is present; it is NOT reported as verified."}')"
+      --arg st "$dstatus" \
+      '{status:$st, pinned_sha256:$p, fetch:$f,
+        note:"upstream dependency — depend, do not clone. Nothing is vendored at add time, so no artifact existed to hash HERE. `status` records whether the payload is present on the machine; the pin is RECORDED and re-checked by `verify`. Neither state is ever reported as a verified artifact digest."}')"
   fi
 
   jq -n \
@@ -790,12 +1002,14 @@ install_module() {
     --arg at "$(now_iso)" \
     --arg mfsha "$(sha256_file "$mf")" \
     --argjson digest "$DIGEST_JSON" \
+    --argjson payload "$PAYLOAD_JSON" \
     --argjson consent "$CONSENT_JSON" \
     '{name:$name, pinned_version:{version:$version, artifact:$artifact},
       permission_class:$class, permission_classes:$classes,
       tier:$tier, default_included:$default_included, installed_at:$at,
-      manifest_sha256:$mfsha, digest:$digest, consent:$consent}' \
+      manifest_sha256:$mfsha, digest:$digest, payload:$payload, consent:$consent}' \
     > "$mdir/receipt.json" || { warn "error: cannot write receipt"; return 1; }
+  INSTALL_OUTCOME="ok"
   return 0
 }
 
@@ -985,14 +1199,40 @@ cmd_add() {
   printf '  [4/7] consent\n'
   obtain_consent "$name" "$mf" || exit 1
 
-  # 5. INSTALL + DIGEST-VERIFY (first mutation)
+  # 5. INSTALL + ACQUIRE + DIGEST-VERIFY (first mutation)
   printf '  [5/7] install + digest-verify\n'
   if ! install_module "$name" "$mf"; then
+    # A payload that did not land is NOT a refusal — nothing is wrong with the
+    # module or the machine's consent. It is an absence, and it unwinds through
+    # the same removal path `remove` uses so the tree is byte-identical.
+    if [ "$INSTALL_OUTCOME" = "absent" ]; then
+      remove_module "$name"
+      warn ""
+      warn "ABSENT: \"$name\" was NOT installed — the payload did not arrive."
+      warn "  blocker: $PAYLOAD_BLOCKER"
+      warn "  remedy:  $PAYLOAD_REMEDY"
+      warn "  Rolled back through the same removal path \`remove\` uses, so the tree"
+      warn "  is byte-identical to before the add. hmd itself is unaffected and"
+      warn "  fully working; this module is optional and stays absent."
+      warn "  Retry when the cause is addressed: hmd modules repair $name"
+      if [ "$AS_JSON" -eq 1 ]; then
+        jq -n --arg n "$name" --argjson payload "$PAYLOAD_JSON" \
+          '{tool:"heimdall-modules", action:"add", ok:false, name:$n,
+            state:"absent", stage:"acquire", installed:false, payload:$payload,
+            note:"the payload did not land, so nothing was installed and nothing was claimed. hmd is unaffected."}'
+      fi
+      exit 1
+    fi
     remove_module "$name"
     warn "refused: install failed. Rolled back — no trace left."
     exit 1
   fi
   printf '        digest: %s\n' "$(printf '%s' "$DIGEST_JSON" | jq -r '.status')"
+  if [ "$PAYLOAD_PRESENT" -eq 1 ]; then
+    printf '        payload: PRESENT — %s\n' "$(printf '%s' "$PAYLOAD_JSON" | jq -r '.reason')"
+  else
+    printf '        payload: NOT PRESENT — %s\n' "$(printf '%s' "$PAYLOAD_JSON" | jq -r '.reason')"
+  fi
 
   # 6. WIRE
   printf '  [6/7] wire\n'
@@ -1023,12 +1263,30 @@ cmd_add() {
     warn "  whose evidence cannot be written is not an install."
     exit 1
   fi
-  printf '\n  Installed "%s" at pin %s (class %s).\n\n' \
-    "$name" "$(jq -r '.pinned_version.version' "$mf")" "$CLASS_JOINED"
+  # THE WORD "Installed" IS A CLAIM ABOUT THE MACHINE, so only the machine may
+  # authorise it. This printed unconditionally once, over an upstream module whose
+  # fetch had never run — a green word above an empty `uv tool list`. The module
+  # being REGISTERED (validated, pinned, wired, invariants green) is a real and
+  # useful outcome and is reported as exactly that, with the command that finishes
+  # the job. It is not dressed up as an install.
+  local ver; ver="$(jq -r '.pinned_version.version' "$mf")"
+  if [ "$PAYLOAD_PRESENT" -eq 1 ]; then
+    printf '\n  Installed "%s" at pin %s (class %s).\n\n' "$name" "$ver" "$CLASS_JOINED"
+  else
+    printf '\n  Registered "%s" at pin %s (class %s) — PAYLOAD NOT PRESENT.\n' \
+      "$name" "$ver" "$CLASS_JOINED"
+    printf '  %s\n' "$(printf '%s' "$PAYLOAD_JSON" | jq -r '.reason')"
+    printf '  The module is pinned, wired and holding its class invariants; the\n'
+    printf '  payload itself is not on this machine. Get it with:\n'
+    printf '    %s\n\n' "$(printf '%s' "$PAYLOAD_JSON" | jq -r '.remedy')"
+  fi
 
   if [ "$AS_JSON" -eq 1 ]; then
     jq -n --slurpfile r "$STATE/$name/receipt.json" --argjson inv "$INVARIANT_RESULTS" \
-      '{tool:"heimdall-modules", action:"add", ok:true, receipt:$r[0], invariants:$inv}'
+      --argjson present "$([ "$PAYLOAD_PRESENT" -eq 1 ] && echo true || echo false)" \
+      '{tool:"heimdall-modules", action:"add", ok:true,
+        state:(if $present then "installed" else "registered" end),
+        payload_present:$present, receipt:$r[0], invariants:$inv}'
   fi
 }
 
@@ -1261,10 +1519,6 @@ cmd_update() {
 # ONE MECHANISM, TWO CALLERS. `hmd update` drives this same repair path through
 # the same library (bin/lib/module_preflight.sh). There is no second updater and
 # no second remedy table — a fix written once is the fix everywhere.
-
-# A big source build is legitimately slow, so the fetch budget is generous — but
-# it IS a budget. An unbounded fetch is how a background repair wedges a machine.
-HMD_MODULE_FETCH_TIMEOUT="${HMD_MODULE_FETCH_TIMEOUT:-1800}"
 
 PREFLIGHT_LIB="$BIN_DIR/lib/module_preflight.sh"
 load_preflight() {
@@ -1506,6 +1760,31 @@ cmd_repair() {
   if [ "$addrc" -ne 0 ]; then
     record_failure "$name" "add" "the ordered install pipeline refused the module (exit $addrc) — see \`hmd modules add $name\` for the full reason"
     [ "$QUIET" -eq 1 ] || warn "  repair could not complete the install pipeline for \"$name\"."
+    return 1
+  fi
+
+  # `add` above owns the world-probe, and it writes the answer onto the receipt.
+  # Read it rather than assuming: a pipeline that exited 0 having REGISTERED a
+  # module whose payload never arrived is not a repair, and saying "Repaired" over
+  # it is the same false green this file was corrected to stop printing.
+  local present; present="$(jq -r '.payload.present // false' "$STATE/$name/receipt.json" 2>/dev/null || echo false)"
+  if [ "$present" != "true" ]; then
+    local why remedy
+    why="$(jq -r '.payload.reason // "the payload is not present on this machine"' "$STATE/$name/receipt.json" 2>/dev/null)"
+    remedy="$(jq -r '.payload.remedy // ""' "$STATE/$name/receipt.json" 2>/dev/null)"
+    record_failure "$name" "acquire" "$why"
+    if [ "$AS_JSON" -eq 1 ]; then
+      jq -n --arg n "$name" --arg why "$why" --arg rem "$remedy" \
+        '{tool:"heimdall-modules", action:"repair", ok:false, name:$n,
+          state:"registered", stage:"acquire", changed:true, payload_present:false,
+          reason:$why, remedy:$rem,
+          note:"the module is registered at its pin and wired, but the payload is not on this machine — that is not a repair and is not reported as one"}'
+    elif [ "$QUIET" -eq 0 ]; then
+      warn "  \"$name\" is registered at its pin but the PAYLOAD IS NOT PRESENT."
+      warn "    why: $why"
+      [ -n "$remedy" ] && warn "    get it: $remedy"
+      warn "  hmd is unaffected — the module stays optional and absent."
+    fi
     return 1
   fi
 
