@@ -279,6 +279,43 @@ if widths_ok:
 else:
     bad("D2 offline column broke the exact-width contract")
 
+# ── E. BROWSER CONTRACT — /roster-team stays ONLINE-ONLY ──────────────────────
+# roster() widening must not leak away devs into a response field literally named "online",
+# which the dashboard renders as present — that would just move the false-online misread to
+# another surface. The wall greys away teammates; the browser API keeps its stated contract.
+print("\nE. BROWSER: /roster-team keeps its online-only contract")
+
+os.environ["HEIMDALL_PUBLIC_SURFACE"] = "1"
+import cp_auth                                  # noqa: E402
+
+SECRET = "wall-offline-window-test-secret"
+BROWSER_TEAM = cp_auth.derive_team_id(SECRET)
+BPROJ = "acme/browser-wall"
+# The route reads the REAL clock (it takes no `now=`), so these must be seeded against it:
+# 10s ago is live, 15 min ago is away-but-inside-the-7-day-window. Anchoring them to the
+# frozen NOW above would put both outside the window and pass E2 for the wrong reason.
+import time as _time                            # noqa: E402
+REAL_NOW = _time.time()
+for haid, age in (("haid:blive.b-1", 10), ("haid:baway.b-2", 900)):
+    P.record_presence(haid, project=BPROJ, team_id=BROWSER_TEAM,
+                      handle=haid.split(":")[-1].split(".")[0],
+                      verdict="idle", file="-", ts=REAL_NOW - age)
+
+resp = P.roster_team_route({"method": "GET", "route_path": "/roster-team",
+                            "query": {"project": BPROJ}, "team_secret": SECRET,
+                            "peer_ip": "10.0.0.9"}, home=HOME)
+handles = [r.get("handle") for r in (resp.body.get("online") or [])]
+
+if "blive" in handles:
+    ok("E1 the live dev is still served to the browser read")
+else:
+    bad("E1 the live dev vanished from /roster-team: %r" % (handles,))
+
+if "baway" not in handles:
+    ok("E2 an AWAY dev is NOT smuggled into the browser's \"online\" list (contract intact)")
+else:
+    bad("E2 an away dev leaked into /roster-team's online list — a false-online on the dashboard")
+
 print("\n" + "=" * 60)
 print("wall-offline-window: %d passed, %d failed" % (P_N[0], F_N[0]))
 print("=" * 60)

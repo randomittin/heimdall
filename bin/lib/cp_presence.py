@@ -28,8 +28,13 @@
 #     empty (see test/cp-presence.test.sh).
 #
 #   • "ONLINE" = a heartbeat within PRESENCE_TTL_SECONDS (default 45s). The record stores
-#     `ts` as epoch seconds; roster() drops any dev whose ts is older than the TTL — a
-#     dev who closed their laptop falls off the roster on its own, no explicit logout.
+#     `ts` as epoch seconds; a dev past the TTL reads online:false — a dev who closed their
+#     laptop goes away on its own, no explicit logout.
+#   • "ON THE WALL" = a heartbeat within PRESENCE_OFFLINE_WINDOW_SECONDS (default 7 days).
+#     THIS, not the TTL, is what roster() drops on. An away dev inside the window is RETURNED
+#     with online:false + state "offline" so the statusline can grey them; past the window they
+#     leave the wall. Membership used to be online-only, which ERASED away teammates — and made
+#     a wall showing only yourself indistinguishable from a wall that was broken.
 #
 # THE VERIFIED-HAID WRITE KEY (mirrors cp_ingest §5). The heartbeat route stores under
 # the SERVER-VERIFIED identity.haid, NEVER a body field — a dev cannot write another
@@ -53,7 +58,8 @@
 #
 # THE INTERFACE the server BINDS to (stable; cp_boot imports, never edits cp_server):
 #   record_presence(haid, *, project, handle, verdict, file, home, ts, now) -> dict
-#   roster(project, *, home, now, ttl) -> list[dict]  — the ONLINE devs for a project.
+#   roster(project, *, home, now, ttl, offline_window) -> list[dict]  — the WALL devs for a
+#     project: online ones plus away ones inside the 7-day window (online:false).
 #   beat_route(identity, request, ...) / roster_route(identity, request, ...)
 #   register(*, home=None)  — wire POST /presence + GET /roster into cp_server's seam.
 #
@@ -777,7 +783,15 @@ def roster_team_route(request, *, home=None):
     # Hash the presented secret to the partition handle (one-way; no secret-to-secret compare,
     # no stored secret). The raw secret is consumed here and never stored/echoed.
     team_id = cp_auth.derive_team_id(secret)
-    online = [_team_view(view) for view in roster(project, team_id, home=home)]
+    # ONLINE-ONLY, deliberately. roster() now also returns AWAY devs (past the 45s TTL, inside
+    # the 7-day offline window) so the STATUSLINE wall can grey them instead of erasing them —
+    # but this route's response field is literally named "online" and the browser client renders
+    # everything in it as present. Widening it here would silently turn every away teammate into
+    # a false-online on the dashboard: the exact misread the offline window exists to prevent,
+    # just moved to another surface. The browser contract stays what it says it is; when the
+    # dashboard learns to render an away state it can opt in via the view's own flag.
+    online = [_team_view(view) for view in roster(project, team_id, home=home)
+              if view.get("online")]
     return cp_server.Response(
         200, {"project": project, "online": online}, headers=_CORS_HEADERS)
 

@@ -69,11 +69,44 @@ field** — the writer never invents a gate, a verdict, or a teammate.
   (old file, or no gated run yet) ⇒ `[]`.
 - **`verdict`** ← the overall verdict from the same `verdict.json` `.verdict` (`pass`/`deny`),
   mapped to `{state,label}`. No `verdict.json` ⇒ `{"pending","PENDING"}`.
-- **`team`** ← the presence **roster** (`bin/heimdall-presence roster --json`) — the online devs
-  on this project's team. Each roster row `{haid, handle, verdict, file, age_seconds, state}`
-  maps to a `team[]` entry. The **sigil** hue is the sigil core's `glyph_color(haid)`
-  (`sentinels/hmd_sigil.py`) rendered as `#RRGGBB` — the **same** hue every sigil surface
-  (statusline, banner, TUI) paints for that identity.
+- **`team`** ← the presence **roster** (`bin/heimdall-presence roster --json`) — the devs on this
+  project's team who are **on the wall**. Each roster row
+  `{haid, handle, verdict, file, age_seconds, state, online}` maps to a `team[]` entry. The
+  **sigil** hue is the sigil core's `glyph_color(haid)` (`sentinels/hmd_sigil.py`) rendered as
+  `#RRGGBB` — the **same** hue every sigil surface (statusline, banner, TUI) paints for that
+  identity. The `online` flag is carried through **verbatim**; an absent flag stays `null` and
+  the statusline falls back to its own heartbeat TTL. The writer never synthesises it.
+
+### The wall window — who gets a slot (three clocks, one decision each)
+
+| Clock | Constant | Default | Decides |
+|---|---|---|---|
+| Online TTL | `cp_presence.DEFAULT_TTL_SECONDS` | 45s | `online: true` vs `false` |
+| Activity window | `cp_presence.DEFAULT_ACTIVITY_TTL_SECONDS` | 120s | `active` vs `idle` (online devs only) |
+| **Offline wall window** | `cp_presence.DEFAULT_OFFLINE_WINDOW_SECONDS` / `hmd_ledger.OFFLINE_WINDOW` | **7 days** | **membership — a slot at all** |
+
+A teammate whose last heartbeat is **within 7 days** keeps a wall slot and renders in an
+explicit **OFFLINE** state; past 7 days they leave the wall, so it stays a current-team view
+rather than a graveyard. Both constants are **named at both layers** and must stay in step;
+the server side is env-tunable via `HEIMDALL_PRESENCE_OFFLINE_WINDOW_SECONDS`.
+
+**Why the window exists.** Membership used to be online-only: an away teammate was *erased*,
+so a wall showing only yourself was indistinguishable from a wall that was **broken** — a real
+presence outage looked exactly like a quiet afternoon. Rendering "away" explicitly is what makes
+the difference visible.
+
+**Offline is unmistakable, never a subtly-different online** — three independent signals, so no
+single failure mode (no-color terminal, mono tier, colorblind viewer) can make away read as
+present: the Row4 segment `⊘off 3d` (a glyph absent from the online vocabulary `◉ ⚡ ✗ ○`, plus
+the literal word `off`), the sigil strip rendered in the **mono** tier so the identity hue drains
+out, and the name dropped to the faintest hue. At narrow width the dot goes **hollow** (`○` away
+vs `●` here). Offline **outranks** the Row4 branch line — a stale teammate still carries a branch
+from their last beat, and `⎇feature/x` under an unmarked name reads as someone working *now*.
+
+**No privacy change.** An offline row is the same partition behind the same repo team secret,
+projecting exactly the fields an online row already did — it reveals nothing a live teammate
+would not. Retirement (`hmd presence off`) still drops a dev at the read authority, so opt-out
+stays real rather than becoming "visible, but greyed".
 
 ## The fallback contract — the writer must not write garbage
 
