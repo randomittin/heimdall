@@ -156,6 +156,15 @@ _assert_disjoint()
 # name → (encode, decode). `plain` is always present and is always the fallback.
 _BACKENDS = {}
 
+# The subset of _BACKENDS that arrived through register_backend() rather than
+# through detection. Provenance is tracked EXPLICITLY because it is not derivable
+# from the name: `headroom` is both the name detection binds and the obvious name
+# an operator reaches for when wiring the library in by hand. Inferring "explicit"
+# by excluding that name meant an operator's registration was filtered out of the
+# explicit set, fell through to detection, and silently landed on plain — a
+# registration that returned successfully and then did nothing.
+_EXPLICIT = set()
+
 # Cached detection: (name, reason). Populated on first use; cleared by reset_state().
 _DETECTED = None
 
@@ -185,7 +194,13 @@ def register_backend(name, encode, decode):
     rather than corrupting the store.
 
     Registering `plain` is refused — plain is the guaranteed fallback and must stay
-    the identity function, otherwise "degrade to plain" would mean nothing."""
+    the identity function, otherwise "degrade to plain" would mean nothing.
+
+    `headroom` IS a legal name to register under, and doing so WINS over detection:
+    it is the obvious name for an operator hand-wiring the library, and a call that
+    returned successfully while quietly leaving the seam on plain was a trap. The
+    registration is recorded in _EXPLICIT, so the reserved name no longer collides
+    with the detection path."""
     if name == PLAIN:
         raise ValueError(
             "memory_codec: the plain backend is the guaranteed identity fallback "
@@ -194,6 +209,7 @@ def register_backend(name, encode, decode):
     if not callable(encode) or not callable(decode):
         raise TypeError("memory_codec: encode and decode must both be callable")
     _BACKENDS[name] = (encode, decode)
+    _EXPLICIT.add(name)
     reset_state()
 
 
@@ -204,6 +220,7 @@ def unregister_backend(name):
     if name == PLAIN:
         return False
     removed = _BACKENDS.pop(name, None) is not None
+    _EXPLICIT.discard(name)
     reset_state()
     return removed
 
@@ -276,9 +293,9 @@ def _detect():
     if _DETECTED is not None:
         return _DETECTED
 
-    explicit = [n for n in _BACKENDS if n not in (PLAIN, HEADROOM)]
+    explicit = sorted(n for n in _EXPLICIT if n in _BACKENDS)
     if explicit:
-        _DETECTED = (sorted(explicit)[0], None)
+        _DETECTED = (explicit[0], None)
         return _DETECTED
 
     try:

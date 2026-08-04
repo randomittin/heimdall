@@ -512,6 +512,150 @@ grep -q "$SECRET" "$STORE" 2>/dev/null \
   || ok "the secret is ABSENT from the store — the gate runs before the codec"
 
 echo
+echo "H. register_backend(\"headroom\") IS NOT A SILENT NO-OP (the reserved-name trap):"
+
+py <<'PY' > "$WORK/h.out" 2>"$WORK/h.err"
+import importlib.machinery, os, sys, types, zlib
+sys.path.insert(0, os.environ["LIBDIR"])
+import memory_codec as mc
+import verified_memory as vm
+import vm_gitcheck as vmg
+
+# `headroom` is the name an operator obviously reaches for when wiring the real
+# library in by hand. It is ALSO the name the detection path owns, and that
+# collision used to make the registration vanish: _detect() filtered the literal
+# name out of the explicit list, fell through to detection, found no library, and
+# landed on plain — while status() reported "headroom is not importable", which is
+# a false statement about a backend sitting in the registry. Silence plus a wrong
+# diagnostic is the worst of both; an operator has no thread to pull.
+def enc(t):
+    return zlib.compress(t.encode("utf-8"), 9)
+
+def dec(w):
+    return zlib.decompress(w).decode("utf-8")
+
+mc.register_backend("headroom", enc, dec)
+
+st = mc.status()
+print("BACKEND_NAME=%s" % mc.backend_name())
+print("AVAILABLE=%s" % mc.available())
+print("REGISTERED_HAS_HEADROOM=%s" % ("headroom" in st["registered"]))
+# The diagnostic must not assert the library is missing while its name is bound.
+print("REASON_NOT_LYING=%s" % (not (st["reason"] or "").startswith("headroom is not importable")))
+# The operator's own callables must still be the bound pair — not clobbered.
+print("PAIR_IS_OPERATORS=%s" % (mc._BACKENDS["headroom"] == (enc, dec)))
+
+# It must actually CODE, not merely be named: a wire form, tagged headroom, that
+# round-trips byte-identically.
+text = "headroom-named payload " + ("k" * 600)
+env = mc.encode_text(text)
+print("ENGAGED=%s" % mc.is_wire(env))
+print("WIRE_TAG=%s" % (env.get("$hmdc") if mc.is_wire(env) else "<none>"))
+print("ROUNDTRIP=%s" % (mc.decode_text(env) == text))
+
+# ...and through the REAL store path, so this proves WIRING and not just the codec.
+repo, cache, sha = os.environ["GR"], os.environ["CACHE"], os.environ["SHA"]
+home = os.path.abspath(os.path.join(os.environ["HOME_DIR"], "..", "home-headroom-name"))
+entry = vmg.make_entry("headroom-named backend reaches the store", sha,
+                       [{"path": "lib/memory_codec.py", "symbol": "register_backend"}],
+                       entry_id="vm-codec-hname")
+entry = vmg.verify(entry, repo, cache_dir=cache)
+entry.pop("cache", None)
+with open(os.path.join(repo, "lib", "vm_gitcheck.py"), "r", encoding="utf-8") as fh:
+    entry["summary"] = fh.read()
+before = entry["status"]
+assert vm._append(entry, home), "the store refused the write"
+
+import json as _json
+with open(vm.entries_path(home), encoding="utf-8") as fh:
+    stored = _json.loads(fh.read().strip())
+print("STORE_TAGGED=%s" % (mc.is_wire(stored["summary"]) and stored["summary"]["$hmdc"] == "headroom"))
+print("STORE_VERIFIER_LITERAL=%s" % (stored["commit_ref"] == sha and stored["status"] == before))
+back = {e["id"]: e for e in vm._read_raw(home)}
+print("STORE_ROUNDTRIP=%s" % (back["vm-codec-hname"]["summary"] == entry["summary"]))
+print("VERDICT_UNMOVED=%s" % (vmg.verify(back["vm-codec-hname"], repo, cache_dir=cache)["status"] == before))
+
+# Removing it returns the seam to its detected state — no sticky registration.
+mc.unregister_backend("headroom")
+print("AFTER_UNREGISTER=%s" % mc.backend_name())
+
+# EXPLICIT BEATS DETECTION, even when a real library IS importable. A fake
+# `headroom` exposing the (compress, decompress) pair the seam probes for is
+# installed in sys.modules with a spec, so find_spec sees it and import_module
+# returns it — the exact shape a genuine install presents. Detection alone must
+# pick it up (proving the fixture is real), and an explicit registration must then
+# override it rather than being overwritten by it.
+fake = types.ModuleType("headroom")
+fake.__spec__ = importlib.machinery.ModuleSpec("headroom", loader=None)
+fake.compress = lambda t: "LIB:" + t
+fake.decompress = lambda w: w[4:]
+sys.modules["headroom"] = fake
+mc.reset_state()
+mc._BACKENDS.pop("headroom", None)
+print("DETECTION_FINDS_LIB=%s" % (mc.backend_name() == "headroom"))
+print("LIB_PAIR_ACTIVE=%s" % (mc._BACKENDS["headroom"][0] is fake.compress))
+
+mc.register_backend("headroom", enc, dec)
+print("EXPLICIT_BEATS_DETECTION=%s" % (mc.backend_name() == "headroom" and mc._BACKENDS["headroom"] == (enc, dec)))
+probe = "override probe " + ("m" * 600)
+env2 = mc.encode_text(probe)
+print("OPERATOR_CODEC_RAN=%s" % (mc.is_wire(env2) and env2.get("e") == "b64" and mc.decode_text(env2) == probe))
+PY
+RC=$?
+[ "$RC" -eq 0 ] || bad "block H driver exited $RC: $(cat "$WORK/h.err")"
+grep -q '^BACKEND_NAME=headroom$' "$WORK/h.out" \
+  && ok "register_backend(\"headroom\") ACTIVATES the backend (it is not a silent no-op)" \
+  || bad "registering under the reserved name headroom was discarded: $(grep '^BACKEND_NAME=' "$WORK/h.out")"
+grep -q '^AVAILABLE=True$' "$WORK/h.out" \
+  && ok "available() reports the registered headroom backend as active" \
+  || bad "available() still reports no codec after a headroom registration"
+grep -q '^REGISTERED_HAS_HEADROOM=True$' "$WORK/h.out" \
+  && ok "the registry lists headroom (the registration was accepted)" \
+  || bad "headroom is missing from the registry"
+grep -q '^REASON_NOT_LYING=True$' "$WORK/h.out" \
+  && ok "status() does NOT claim 'headroom is not importable' while headroom is bound" \
+  || bad "status() reported a false reason about a registered backend"
+grep -q '^PAIR_IS_OPERATORS=True$' "$WORK/h.out" \
+  && ok "the operator's own encode/decode pair stays bound (detection did not clobber it)" \
+  || bad "the registered pair was replaced"
+grep -q '^ENGAGED=True$' "$WORK/h.out" \
+  && ok "the backend actually CODES — a wire form is produced, not just a name" \
+  || bad "no wire form was produced — the backend is named but inert"
+grep -q '^WIRE_TAG=headroom$' "$WORK/h.out" \
+  && ok "the envelope is tagged headroom (so it decodes back through the same pair)" \
+  || bad "the envelope carries the wrong backend tag: $(grep '^WIRE_TAG=' "$WORK/h.out")"
+grep -q '^ROUNDTRIP=True$' "$WORK/h.out" \
+  && ok "the headroom-named backend round-trips byte-identically" \
+  || bad "the headroom-named backend lost data"
+grep -q '^STORE_TAGGED=True$' "$WORK/h.out" \
+  && ok "a real store write lands as a headroom-tagged envelope (WIRING, not just codec)" \
+  || bad "the store did not route through the headroom-named backend"
+grep -q '^STORE_VERIFIER_LITERAL=True$' "$WORK/h.out" \
+  && ok "verifier fields stay literal on disk under the headroom-named backend" \
+  || bad "a verifier field was encoded by the headroom-named backend"
+grep -q '^STORE_ROUNDTRIP=True$' "$WORK/h.out" \
+  && ok "the stored payload reads back byte-identically through _read_raw" \
+  || bad "the store round-trip lost the payload"
+grep -q '^VERDICT_UNMOVED=True$' "$WORK/h.out" \
+  && ok "the verdict does not move with the headroom-named backend in the path" \
+  || bad "the verdict moved under the headroom-named backend"
+grep -q '^AFTER_UNREGISTER=plain$' "$WORK/h.out" \
+  && ok "unregistering returns the seam to plain (no sticky registration)" \
+  || bad "the seam did not return to plain after unregister"
+grep -q '^DETECTION_FINDS_LIB=True$' "$WORK/h.out" \
+  && ok "detection picks up an importable headroom library (the fixture is real)" \
+  || bad "detection did not find the importable headroom fixture — the override arm would be vacuous"
+grep -q '^LIB_PAIR_ACTIVE=True$' "$WORK/h.out" \
+  && ok "detection binds the LIBRARY's own entrypoint pair" \
+  || bad "detection did not bind the library's pair"
+grep -q '^EXPLICIT_BEATS_DETECTION=True$' "$WORK/h.out" \
+  && ok "an explicit registration OVERRIDES a detected library (register_backend is deliberate)" \
+  || bad "detection overwrote an explicit registration"
+grep -q '^OPERATOR_CODEC_RAN=True$' "$WORK/h.out" \
+  && ok "the operator's codec is the one that actually ran, not the detected library's" \
+  || bad "the detected library's codec ran despite an explicit registration"
+
+echo
 if [ "$FAIL" -eq 0 ]; then
   printf '\033[32mALL %d PROOFS PASSED\033[0m\n' "$PASS"
 else
