@@ -62,7 +62,7 @@ grep -ci headroom heimdall-site/{index,faq}.html llms{,-full}.txt → 0, 0, 0, 0
 
 Now the mitigation, which is real and matters: **nothing auto-installs it.** The shipped `install.sh` at v2.3.8 contains no reference to modules at all (verified against the fetched published bytes). `bin/heimdall-autoupdate` transition 3 explicitly *defers* consent-requiring modules and never passes `--yes`. The manifest disclosure is, genuinely, some of the most honest technical writing in the repo — it volunteers that the storage-codec half **cannot engage** from the documented install, and says so in the same breath as declaring the class.
 
-But there is a hard contradiction between two shipped code paths. On a manual update the user is told (`bin/heimdall-autoupdate:517-522`):
+But there is a hard contradiction between two shipped code paths. On a manual update the user is told (`bin/heimdall-autoupdate:518-523`):
 
 ```
 heimdall: "headroom" ships in hmd's default module set and is not installed here.
@@ -77,7 +77,7 @@ Same file's header comment then claims defence-in-depth that does not exist for 
 
 **Response: FIX BEFORE LAUNCH**, three small changes, none of them to the design:
 
-1. Reword `bin/heimdall-autoupdate:519` — it must not say "requires your explicit consent" for a module whose question is waived. Say: *"class traffic-proxy + storage-codec. An update will never install it for you. It discloses what it does at install time and does not stop to ask."*
+1. Reword `bin/heimdall-autoupdate:520` — it must not say "requires your explicit consent" for a module whose question is waived. Say: *"class traffic-proxy + storage-codec. An update will never install it for you. It discloses what it does at install time and does not stop to ask."*
 2. Correct the "two gates" comment at `bin/heimdall-autoupdate:404-406` — one gate stands for Headroom.
 3. Put **one paragraph** in `README.md` and one in `SECURITY.md`. Not a page. The manifest's own `consent_text` is already the right paragraph; lift it. The defence "we disclose it" is only true where a reader will find the disclosure, and right now the only reader who finds it is one who already decided to install.
 
@@ -224,7 +224,7 @@ The exposure is forward-looking. The digest is duplicated across `README.md` (×
 
 **Truth.** Verified. My first read was wrong and I want to record that: `.git/hooks/` is empty, but `git config core.hooksPath` is `/Users/rj/Downloads/heimdall/.heimdall/hooks`, and a real `pre-push` lives there. It is good work — it chains any pre-existing hook first, and `HMD_SKIP=1` writes a visible unproven-merge receipt rather than silently bypassing.
 
-The failure mode is the tail (`.heimdall/hooks/pre-push:29-35`):
+The failure mode is the tail (`.heimdall/hooks/pre-push:5` for the baked path, `:29-34` for the guard):
 
 ```sh
 HMD_BIN="/Users/rj/Downloads/heimdall/bin"     # baked absolute path
@@ -309,9 +309,9 @@ These held up under deliberate attempts to break them. They are launch assets.
 2. **Put the digest-checked one-liner on the homepage** — `heimdall-site/index.html:405`. The digest is already in `llms-full.txt:43` and `netlify.toml:25`. *(#4)*
 3. **Fix the corpus count regex** — `bin/heimdall-gate-run:101`. `3/13` is currently written into every shareable receipt. *(#5)*
 4. **Stop printing `digest-verify` where no digest is verified**, and delete the false *"re-checked by `verify`"* from `bin/heimdall-modules:993`. *(#3)*
-5. **Reconcile the Headroom consent messages** — `bin/heimdall-autoupdate:519` promises a question the add path waives; the "two gates" comment at `:404-406` is wrong for the one module it names. *(#2)*
+5. **Reconcile the Headroom consent messages** — `bin/heimdall-autoupdate:520` promises a question the add path waives; the "two gates" comment at `:404-406` is wrong for the one module it names. *(#2)*
 6. **One Headroom paragraph in `README.md` + `SECURITY.md`.** Lift the manifest's `consent_text`. *(#2)*
-7. **Make the pre-push hook fail closed** when `heimdall-gate-run` cannot be resolved — `.heimdall/hooks/pre-push:32-35`, plus `bin/heimdall-init` which generates it. *(#10)*
+7. **Make the pre-push hook fail closed** when `heimdall-gate-run` cannot be resolved — `.heimdall/hooks/pre-push:29-34`, plus `bin/heimdall-init` which generates it. *(#10)*
 
 Everything else on this list can ship as disclosure.
 
