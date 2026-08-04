@@ -1,0 +1,24 @@
+[
+  {"handle":"anu",   "haid":"haid:anu.a1",   "tier":"online",      "online":true,  "last_seen_ts":1699999990, "last_commit_ts":1699913600, "sources":["presence","git"]},
+  {"handle":"bo",    "haid":"haid:bo.b2",    "tier":"online",      "online":true,  "last_seen_ts":1699999975, "last_commit_ts":null,       "sources":["presence"]},
+
+  {"handle":"cara",  "haid":"haid:cara.c3",  "tier":"contributed", "online":false, "last_seen_ts":null,       "last_commit_ts":1699740800, "sources":["git"]},
+  {"handle":"dev",   "haid":"haid:dev.d4",   "tier":"contributed", "online":false, "last_seen_ts":null,       "last_commit_ts":1699654400, "sources":["git","github"]},
+  {"handle":"eli",   "haid":null,            "tier":"contributed", "online":false, "last_seen_ts":null,       "last_commit_ts":1699568000, "sources":["git"]},
+  {"handle":"fin",   "haid":"haid:fin.f6",   "tier":"contributed", "online":false, "last_seen_ts":null,       "last_commit_ts":1699481600, "sources":["git"]},
+  {"handle":"gus",   "haid":"haid:gus.g7",   "tier":"contributed", "online":false, "last_seen_ts":null,       "last_commit_ts":1699395200, "sources":["git"]},
+
+  {"handle":"hana",  "haid":"haid:hana.h8",  "tier":"away",        "online":false, "last_seen_ts":1699992800, "last_commit_ts":1699913600, "sources":["presence","git"]},
+  {"handle":"ike",   "haid":"haid:ike.i9",   "tier":"away",        "online":false, "last_seen_ts":1699971200, "last_commit_ts":null,       "sources":["presence"]},
+  {"handle":"jo",    "haid":"haid:jo.j10",   "tier":"away",        "online":false, "last_seen_ts":1699827200, "last_commit_ts":null,       "sources":["presence"]},
+  {"handle":"kim",   "haid":"haid:kim.k11",  "tier":"away",        "online":false, "last_seen_ts":1699568000, "last_commit_ts":null,       "sources":["presence"]},
+
+  {"handle":"lena",  "haid":"haid:lena.l12", "tier":"member",      "online":false, "last_seen_ts":null,       "last_commit_ts":null,       "sources":["github"]},
+  {"handle":"mo",    "haid":"haid:mo.m13",   "tier":"member",      "online":false, "last_seen_ts":null,       "last_commit_ts":null,       "sources":["github"]},
+  {"handle":"nia",   "haid":"haid:nia.n14",  "tier":"member",      "online":false, "last_seen_ts":null,       "last_commit_ts":null,       "sources":["github"]},
+  {"handle":"omar",  "haid":"haid:omar.o15", "tier":"member",      "online":false, "last_seen_ts":null,       "last_commit_ts":null,       "sources":["github"]},
+  {"handle":"pia",   "haid":"haid:pia.p16",  "tier":"member",      "online":false, "last_seen_ts":null,       "last_commit_ts":null,       "sources":["github"]},
+  {"handle":"quin",  "haid":"haid:quin.q17", "tier":"member",      "online":false, "last_seen_ts":null,       "last_commit_ts":null,       "sources":["github"]},
+  {"handle":"rae",   "haid":"haid:rae.r18",  "tier":"member",      "online":false, "last_seen_ts":null,       "last_commit_ts":null,       "sources":["github"]},
+  {"handle":"sam",   "haid":"haid:sam.s19",  "tier":"member",      "online":false, "last_seen_ts":null,       "last_commit_ts":null,       "sources":["github"]}
+]
