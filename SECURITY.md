@@ -84,15 +84,26 @@ whether an action is authorized, ask us first at `security@runheimdall.dev`.
 For which releases receive fixes, see [Supported versions](#supported-versions)
 above.
 
-## The Headroom proxy — a local process that reads your prompts
+## The Headroom proxy — a local process that can read your prompts
 
 hmd's default module set includes **Headroom**
 ([`modules/headroom/manifest.json`](modules/headroom/manifest.json), Apache-2.0):
-a local context-compression proxy. Install it, and a process on your machine sits
-between your coding tool and the model provider, reads the prompts and context on
-their way out, and rewrites them to be smaller. That is what it is for. It is
-documented here because someone auditing hmd's security posture should not have to
-discover it by reading a manifest.
+a local context-compression proxy. Point traffic at it and a process on your
+machine sits between your coding tool and the model provider, reads the prompts
+and context on their way out, and rewrites them to be smaller. That is what it is
+for. It is documented here because someone auditing hmd's security posture should
+not have to discover it by reading a manifest.
+
+**Installing it is not wiring it.** `hmd modules add headroom` installs the
+package and applies neither wire the manifest declares. `bin/heimdall-wrap`
+contains no reference to the module and the memory-codec seam reports
+`backend=plain`, so on a stock install hmd sends nothing through this proxy and
+your traffic goes exactly where it went before. Both facts are *measured* at add
+time rather than asserted here: `[6/7] wire` prints each declared wire as
+`RECORDED, not routed` beside the measurement behind it, and `hmd modules status
+headroom` reads back the same record. What follows describes what this module can
+reach **if you route traffic through it** — which is the state worth threat-
+modelling, and the reason the scrubs below exist at all.
 
 ### What it is
 
@@ -116,7 +127,7 @@ discover it by reading a manifest.
 
 | Traffic | Through the proxy? | What enforces that |
 |---|---|---|
-| Model **generation** traffic from your coding tool | **May be** — that is the module's purpose | — |
+| Model **generation** traffic from your coding tool | **Only if you route it there** — that is the module's purpose, and hmd does not do it for you | Nothing in hmd points generation at the proxy: the `wrap-chain` wire is declared and not applied, which `[6/7] wire` and `hmd modules status headroom` both report as `RECORDED, not routed`. Falsifier: [`test/wire-kind-dispatch.test.sh`](test/wire-kind-dispatch.test.sh), which measures the wire against the repo and refuses any declared wire kind the code has no handler for |
 | Any call that produces a **verdict** (gate, oracle, verifier, panel) | **No** | `hmd_gate_exec` in [`bin/lib/hmd-gate-endpoint.sh`](bin/lib/hmd-gate-endpoint.sh) unsets `ANTHROPIC_BASE_URL`, the HTTP/HTTPS/ALL/NO_PROXY pairs and the whole `HEADROOM_*` namespace, then pins the endpoint to the real provider. Falsifier: [`test/gate-judgment-uncompressed.test.sh`](test/gate-judgment-uncompressed.test.sh) |
 | **Control-plane, enrollment, team and presence** traffic | **No** | `hmd_signed_exec` in the same file. [`test/cp-signed-no-rewriting-proxy.test.sh`](test/cp-signed-no-rewriting-proxy.test.sh) is a runtime differential with a positive control, and it **fails closed**: an unreachable control plane reports `NON_VERIFIED` and fails the invariant rather than passing quietly |
 
