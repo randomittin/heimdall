@@ -63,6 +63,13 @@ LEDGER = _load("hmd_ledger")      # import hmd_ledger — the ledger reader (rea
 # The line is BUILT in 24-bit truecolor + full unicode; CAPS.emit() downgrades the
 # finished bytes in ONE pass at write time (truecolor+full = byte-identical NO-OP).
 CAPS = TC.detect(sys.argv)
+# The MONO render tier, used ONLY to drain the identity hue out of an AWAY teammate's sigil
+# (see team_columns). Built once; None if the sigil core cannot supply it, in which case the
+# offline column still reads offline from its faint name + the `⊘off` Row4 segment.
+try:
+    _MONO_CAPS = SIG.tier_caps(TC.MONO, CAPS.unicode_tier)
+except Exception:
+    _MONO_CAPS = None
 USE_COLOR = CAPS.use_color()
 def _c(s): return s if USE_COLOR else ""
 def _write(s):
@@ -545,7 +552,12 @@ def roster_presence(cwd):
             # older roster records → "" (the render then shows no branch line, back-compat).
             "branch": r.get("branch") or "",
             "ts": ts,
-            "online": True,
+            # The server's own flag — the roster now carries away teammates (past the 45s TTL,
+            # inside the 7-day offline window) as online:false so they render greyed instead of
+            # vanishing. Absent on an older CP → assume online (the row was returned at all,
+            # which on that CP could only mean live). NEVER hardcoded true: a wall that invents
+            # a present teammate is worse than an empty one.
+            "online": r.get("online") if isinstance(r.get("online"), bool) else True,
         })
     return out
 
@@ -889,9 +901,51 @@ TEAM_STATE = {  # ledger state → (glyph, word, color) for the Row4 state segme
 }
 
 
+def _last_seen(now, ts):
+    """A last-seen age in AT MOST 3 cells — `9m` / `59m` / `3h` / `23h` / `6d`. The team strip
+    is 8 cells wide and the offline segment spends 5 on `⊘off `, so the age must stay tiny; the
+    largest unit that fits wins. Bounded by the 7-day wall window, so `7d` is the widest case."""
+    secs = max(0, int(now - ts))
+    if secs < 3600:
+        return "%dm" % (secs // 60)
+    if secs < 86400:
+        return "%dh" % (secs // 3600)
+    return "%dd" % (secs // 86400)
+
+
+def _team_offline_seg(m, now):
+    """Row4 OFFLINE segment — `⊘off 3d` in the faintest hue. A teammate whose heartbeat is past
+    the online TTL but inside the 7-day wall window is AWAY, and this is the only thing on their
+    column that says so in WORDS.
+
+    UNMISTAKABLE BY CONSTRUCTION, three ways that do not depend on each other:
+      • the glyph `⊘` appears NOWHERE in the online vocabulary (◉ rev / ⚡ wrk / ✗ deny / ○ idle),
+      • the literal word `off` survives --no-color, a mono terminal, and a colorblind viewer —
+        color alone would fail all three,
+      • the last-seen age is the ONE number shown, so "away since when" is explicit.
+    Offline must never be a subtly-different online: a viewer who misreads this as present is
+    the exact failure the 7-day window exists to prevent."""
+    ts = m.get("ts")
+    if isinstance(ts, (int, float)) and not isinstance(ts, bool):
+        return f"{FAINT}⊘off {_last_seen(now, ts)}{X}"
+    return f"{FAINT}⊘off{X}"
+
+
+def _is_offline(m):
+    """True iff this member is an AWAY teammate — the producer's explicit online:false, or the
+    "offline" state the server/ledger pins on them. Absent both (an older status.json) they are
+    treated as present, exactly as before: presence is never INVENTED, only ever carried."""
+    if m.get("online") is False:
+        return True
+    return (m.get("state") or "") == "offline"
+
+
 def _team_state_seg(m, now):
     """Row4 per-member state (Spec v2 §6): `◉ rev` mint / `⚡ wrk` gold / `✗ deny` red, or
-    `○ <N>m` faint (last-seen minutes) for an idle/unknown state."""
+    `○ <N>m` faint (last-seen minutes) for an idle/unknown state. An AWAY teammate gets the
+    explicit offline segment instead — checked FIRST so no online glyph can ever claim them."""
+    if _is_offline(m):
+        return _team_offline_seg(m, now)
     g = TEAM_STATE.get(m.get("state") or "")
     if g:
         glyph, word, col = g
@@ -927,8 +981,13 @@ def team_columns(members, team_w, overflow, now, states=True, self_branch=""):
     tops = []; bots = []; names = []; sts = []
     for i, m in enumerate(members):
         seed = m.get("haid") or m.get("user") or m.get("sigil") or "?"
+        away = _is_offline(m)
+        # An AWAY teammate's sigil renders in the MONO tier: the identity hue — the thing that
+        # reads as "present" — drains out of their column, while the glyph SHAPE still says who
+        # they are. Online teammates keep their natural palette, so the two never look alike.
+        strip_caps = _MONO_CAPS if (away and _MONO_CAPS is not None) else CAPS
         try:
-            strip2 = SIG.eye_strip(seed, CAPS)               # 2 text-rows × 8 cells, eyes visible
+            strip2 = SIG.eye_strip(seed, strip_caps)          # 2 text-rows × 8 cells, eyes visible
             if len(strip2) < 2:
                 raise ValueError
         except Exception:
@@ -937,8 +996,10 @@ def team_columns(members, team_w, overflow, now, states=True, self_branch=""):
         g = gap if i else ""
         tops.append(g + lp + strip2[0])
         bots.append(g + lp + strip2[1])
-        hue = _team_hue(seed, m.get("sigil")) if USE_COLOR else None
-        ncol = sgr(SIG._hex_rgb(hue)) if hue else DIM
+        # An away teammate's NAME also drops to the faintest hue — never their hero colour,
+        # which is the strongest "this person is here" cue on the whole wall.
+        hue = None if away else (_team_hue(seed, m.get("sigil")) if USE_COLOR else None)
+        ncol = sgr(SIG._hex_rgb(hue)) if hue else (FAINT if away else DIM)
         nm = LAYOUT.pad_or_truncate(str(m.get("user") or ""), LAYOUT.TEAM_STRIP_W)
         names.append(g + lp + f"{ncol}{nm}{X}")
         # Row4: EVERY same-repo teammate with a recorded branch shows it UNDER their name
@@ -946,7 +1007,14 @@ def team_columns(members, team_w, overflow, now, states=True, self_branch=""):
         # branch falls back to the state segment. The branch line rides even in the mid tier
         # (states=False) since it is NEW data absent from prior renders.
         mb = str(m.get("branch") or "").strip()
-        if mb:
+        if away:
+            # OFFLINE OUTRANKS EVERYTHING on Row4 — the branch line AND the mid-tier state drop.
+            # A stale teammate carries a recorded branch from their last beat, and showing
+            # `⎇feature/x` under a name with no offline marker reads as someone working on that
+            # branch RIGHT NOW. That is the exact misread this feature exists to prevent, so the
+            # away label is the one thing that always survives.
+            r4seg = _team_state_seg(m, now)
+        elif mb:
             r4seg = _team_branch_seg(mb)
         elif states:
             r4seg = _team_state_seg(m, now)
@@ -965,11 +1033,17 @@ def team_columns(members, team_w, overflow, now, states=True, self_branch=""):
 
 
 def team_dots(members):
-    """Narrow-tier inline team indicator (Spec v2 §7): one `●` per online teammate, tinted
-    by the teammate hue, space-joined — rides the Row1 right rail."""
+    """Narrow-tier inline team indicator (Spec v2 §7): one `●` per online teammate, tinted by
+    the teammate hue, space-joined — rides the Row1 right rail. An AWAY teammate gets a HOLLOW
+    `○` in the faintest hue: at this width there is no room for a word, so the fill of the dot
+    carries the whole signal — filled = here, hollow = away. Shape, not just colour, so the
+    distinction survives a mono terminal."""
     dots = []
     for m in members:
         seed = m.get("haid") or m.get("user") or m.get("sigil") or "?"
+        if _is_offline(m):
+            dots.append(f"{FAINT}○{X}")
+            continue
         hue = _team_hue(seed, m.get("sigil")) if USE_COLOR else None
         col = sgr(SIG._hex_rgb(hue)) if hue else DIM
         dots.append(f"{col}●{X}")

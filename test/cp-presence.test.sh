@@ -14,10 +14,12 @@
 #      A2. a FRESH process reads roster(project) and sees devA — cross-process durable.
 #   B. CROSS-DEV READ (one writes, another reads):
 #      B1. devA + devB each beat (separate processes); a THIRD process's roster lists BOTH.
-#   C. TTL drops a stale dev:
-#      C1. a dev whose heartbeat is older than the TTL is NOT on the roster.
-#      C2. the SAME dev, read with a `now` inside the TTL, IS on the roster (the window,
-#          not the data, decides — falsifiable both directions).
+#   C. The TTL demotes a stale dev; the 7-day wall window is what DROPS one:
+#      C1. a dev older than the TTL keeps its wall slot but reads online:false (greyed, not
+#          erased — erasing made an away team and a broken wall look identical).
+#      C1b. a dev past the 7-day wall window IS dropped (the wall stays bounded).
+#      C2. the SAME dev, read with a `now` inside the TTL, is ONLINE (the window, not the
+#          data, decides — falsifiable in every direction).
 #   D. FALSIFIABLE — break external-keying => the cross-read FAILS:
 #      D1. the SAME records that the firestore roster returns are INVISIBLE to a reader on
 #          the LOCAL (home-keyed) backend with a fresh home — proving the cross-dev read
@@ -357,15 +359,30 @@ P.record_presence(os.environ["PRES_HAID"], project=proj, team_id=os.environ["TEA
 tid = os.environ["TEAM_ID"]
 stale = [x.get("haid") for x in P.roster(proj, tid, now=2000.0)]          # 1000s old > 45s TTL
 fresh = [x.get("haid") for x in P.roster(proj, tid, now=1000.0 + 10.0)]   # 10s old < 45s TTL
-print(json.dumps({"stale": stale, "fresh": fresh}))
+gone  = [x.get("haid") for x in P.roster(proj, tid, now=1000.0 + 8 * 86400)]  # 8d > 7d window
+# the ONLINE flag on the stale read — present on the wall, but explicitly NOT online.
+stale_online = [x.get("online") for x in P.roster(proj, tid, now=2000.0)
+                if x.get("haid") == os.environ["PRES_HAID"]]
+print(json.dumps({"stale": stale, "fresh": fresh, "gone": gone,
+                  "stale_online": stale_online}))
 PYEOF
 )"
 C_STALE_HAS_C="$(printf '%s' "$C_OUT" | "$PY" -c "import json,sys;print('$DEV_C' in json.load(sys.stdin)['stale'])" 2>/dev/null)"
 C_FRESH_HAS_C="$(printf '%s' "$C_OUT" | "$PY" -c "import json,sys;print('$DEV_C' in json.load(sys.stdin)['fresh'])" 2>/dev/null)"
-if [ "$C_STALE_HAS_C" = "False" ]; then
-  ok "C1 a dev whose heartbeat is older than the TTL is DROPPED from the roster"
+C_GONE_HAS_C="$(printf '%s' "$C_OUT" | "$PY" -c "import json,sys;print('$DEV_C' in json.load(sys.stdin)['gone'])" 2>/dev/null)"
+C_STALE_ONLINE="$(printf '%s' "$C_OUT" | "$PY" -c "import json,sys;print(json.load(sys.stdin)['stale_online'])" 2>/dev/null)"
+# Past the TTL a dev is no longer ONLINE, but it keeps its wall slot for 7 days so the
+# statusline can grey it. Dropping it outright is what made an away team and a broken wall
+# render identically.
+if [ "$C_STALE_HAS_C" = "True" ] && [ "$C_STALE_ONLINE" = "[False]" ]; then
+  ok "C1 a dev older than the TTL stays on the wall but is explicitly online:false"
 else
-  bad "C1 a stale dev stayed on the roster (TTL not enforced) — out=$C_OUT"; cat "$EXT/c.err" >&2
+  bad "C1 stale dev wrong (on_wall=$C_STALE_HAS_C online=$C_STALE_ONLINE) — out=$C_OUT"; cat "$EXT/c.err" >&2
+fi
+if [ "$C_GONE_HAS_C" = "False" ]; then
+  ok "C1b a dev past the 7-day wall window is DROPPED (the window still bounds the wall)"
+else
+  bad "C1b a dev 8 days stale stayed on the roster — out=$C_OUT"
 fi
 if [ "$C_FRESH_HAS_C" = "True" ]; then
   ok "C2 the SAME dev read within the TTL window IS online (the window decides, not the data)"

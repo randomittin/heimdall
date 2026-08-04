@@ -28,8 +28,13 @@
 #     empty (see test/cp-presence.test.sh).
 #
 #   • "ONLINE" = a heartbeat within PRESENCE_TTL_SECONDS (default 45s). The record stores
-#     `ts` as epoch seconds; roster() drops any dev whose ts is older than the TTL — a
-#     dev who closed their laptop falls off the roster on its own, no explicit logout.
+#     `ts` as epoch seconds; a dev past the TTL reads online:false — a dev who closed their
+#     laptop goes away on its own, no explicit logout.
+#   • "ON THE WALL" = a heartbeat within PRESENCE_OFFLINE_WINDOW_SECONDS (default 7 days).
+#     THIS, not the TTL, is what roster() drops on. An away dev inside the window is RETURNED
+#     with online:false + state "offline" so the statusline can grey them; past the window they
+#     leave the wall. Membership used to be online-only, which ERASED away teammates — and made
+#     a wall showing only yourself indistinguishable from a wall that was broken.
 #
 # THE VERIFIED-HAID WRITE KEY (mirrors cp_ingest §5). The heartbeat route stores under
 # the SERVER-VERIFIED identity.haid, NEVER a body field — a dev cannot write another
@@ -53,7 +58,8 @@
 #
 # THE INTERFACE the server BINDS to (stable; cp_boot imports, never edits cp_server):
 #   record_presence(haid, *, project, handle, verdict, file, home, ts, now) -> dict
-#   roster(project, *, home, now, ttl) -> list[dict]  — the ONLINE devs for a project.
+#   roster(project, *, home, now, ttl, offline_window) -> list[dict]  — the WALL devs for a
+#     project: online ones plus away ones inside the 7-day window (online:false).
 #   beat_route(identity, request, ...) / roster_route(identity, request, ...)
 #   register(*, home=None)  — wire POST /presence + GET /roster into cp_server's seam.
 #
@@ -105,6 +111,28 @@ DEFAULT_TTL_SECONDS = 45.0
 PRESENCE_ACTIVITY_TTL_ENV = "HEIMDALL_PRESENCE_ACTIVITY_TTL_SECONDS"
 DEFAULT_ACTIVITY_TTL_SECONDS = 120.0
 
+# ── the OFFLINE WALL WINDOW (a dev this recent still gets a slot, greyed out) ──
+#
+# THE DEFECT THIS CLOSES. Membership used to be online-only: a dev past the 45s TTL was
+# DROPPED from the roster entirely. A teammate who simply was not beating right now did not
+# read as "away" — they VANISHED, so a wall showing only yourself was indistinguishable from
+# a wall that was broken. Presence outages hid inside that ambiguity for days.
+#
+# THE MODEL. THREE clocks now, each owning exactly one decision:
+#   • the online TTL (45s)        -> ONLINE vs OFFLINE  (is this dev beating right now?)
+#   • the activity window (120s)  -> ACTIVE vs IDLE     (within the online set only)
+#   • THIS window (7 days)        -> MEMBERSHIP         (does this dev get a wall slot at all?)
+# A dev whose last heartbeat is inside this window is RETURNED with online:false and the
+# explicit state "offline"; past it they are dropped, so the wall stays a current-team view
+# and never decays into a graveyard of everyone who ever touched the repo.
+#
+# NOT A PRIVACY CHANGE. An offline row is the SAME partition, behind the SAME team secret,
+# projecting the SAME fields an online row already did — it reveals nothing a live teammate
+# would not. Retirement (`hmd presence off`) still drops a dev at the read authority, so
+# opt-out stays real rather than becoming "visible, but greyed".
+PRESENCE_OFFLINE_WINDOW_ENV = "HEIMDALL_PRESENCE_OFFLINE_WINDOW_SECONDS"
+DEFAULT_OFFLINE_WINDOW_SECONDS = 7 * 24 * 60 * 60.0   # 7 days
+
 # A conservative slug bound for a project / HAID used as a path segment (mirrors
 # cp_ingest._SLUG_MAX). Keeps the store human-greppable + filesystem-safe + bounded, and
 # (critically for the Firestore flat encoding) produces only single "_" runs from a
@@ -138,6 +166,21 @@ def activity_ttl_seconds():
     except (TypeError, ValueError):
         return DEFAULT_ACTIVITY_TTL_SECONDS
     return val if val > 0 else DEFAULT_ACTIVITY_TTL_SECONDS
+
+
+def offline_window_seconds():
+    """The OFFLINE-wall window in seconds (HEIMDALL_PRESENCE_OFFLINE_WINDOW_SECONDS, default
+    7 days). A dev whose heartbeat is within this window keeps a wall slot (greyed, online:
+    false); older than it they leave the wall. A malformed / non-positive env value falls back
+    to the default rather than crashing a read (mirrors ttl_seconds/activity_ttl_seconds)."""
+    raw = os.environ.get(PRESENCE_OFFLINE_WINDOW_ENV)
+    if not raw:
+        return DEFAULT_OFFLINE_WINDOW_SECONDS
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_OFFLINE_WINDOW_SECONDS
+    return val if val > 0 else DEFAULT_OFFLINE_WINDOW_SECONDS
 
 
 # ── store layout (a keyed record per (project, verified-haid) — StateBackend rel) ──
@@ -367,6 +410,21 @@ def is_online(record, *, now=None, ttl=None):
     return (when - ts) <= window
 
 
+def is_on_wall(record, *, now=None, window=None):
+    """True iff a presence record earns a WALL SLOT — its heartbeat is within the OFFLINE
+    window (7 days by default), whether or not it is still online. This is the MEMBERSHIP
+    predicate; is_online is the narrower ONLINE-vs-OFFLINE one. A record with no/garbled ts
+    is off the wall (never a fabricated teammate). `now`/`window` are injectable for tests."""
+    if not isinstance(record, dict):
+        return False
+    ts = record.get("ts")
+    if not isinstance(ts, (int, float)) or isinstance(ts, bool):
+        return False
+    when = now if now is not None else time.time()
+    span = window if window is not None else offline_window_seconds()
+    return (when - ts) <= span
+
+
 def derive_state(record, *, now=None, activity_ttl=None):
     """The wall state of an ONLINE presence record: "active" or "idle".
 
@@ -392,12 +450,20 @@ def derive_state(record, *, now=None, activity_ttl=None):
     return "active" if -window <= delta <= window else "idle"
 
 
-def roster(project, team_id, *, home=None, now=None, ttl=None, activity_ttl=None):
-    """The ONLINE devs for a (project, team): the fold of the latest heartbeat per dev,
-    filtered to those within the TTL, sorted by haid for a stable view. Read-only; an absent
-    partition yields [] (honest empty — a nonexistent team and an idle team are
-    indistinguishable, no existence oracle). Each returned record carries an added
-    "online": True and "age_seconds" (now - ts, rounded) for the renderer.
+def roster(project, team_id, *, home=None, now=None, ttl=None, activity_ttl=None,
+           offline_window=None):
+    """The WALL devs for a (project, team): the fold of the latest heartbeat per dev, sorted
+    by haid for a stable view. Read-only; an absent partition yields [] (honest empty — a
+    nonexistent team and an idle team are indistinguishable, no existence oracle).
+
+    MEMBERSHIP is the OFFLINE WINDOW (7 days), not the online TTL. Each returned record
+    carries "age_seconds" (now - ts, rounded) plus:
+      • online:true  + state "active"|"idle"  — heartbeat within the 45s TTL (still beating)
+      • online:false + state "offline"        — heartbeat older than the TTL but inside the
+                                                7-day window (away, NOT erased)
+    A dev past the window is dropped, so the wall stays a current-team view. Returning the
+    away teammates is the point: before this, "everyone is offline" and "presence is broken"
+    rendered IDENTICALLY (an empty wall), which is how a real outage stayed invisible.
 
     `team_id` SCOPES the read to exactly ONE partition dir (presence/<project>/<team_id>/) —
     the isolation guarantee: a read for team A never enumerates team B's records. The caller
@@ -415,12 +481,15 @@ def roster(project, team_id, *, home=None, now=None, ttl=None, activity_ttl=None
     when = now if now is not None else time.time()
     window = ttl if ttl is not None else ttl_seconds()
     act_window = activity_ttl if activity_ttl is not None else activity_ttl_seconds()
+    wall_window = offline_window if offline_window is not None else offline_window_seconds()
     out = []
     team_dir = _team_rel(project, team_id)
     for name in backend.list_names(team_dir, suffix=_RECORD_SUFFIX):
         rel = os.path.join(team_dir, name)
         record = backend.get_record(rel)
-        if not is_online(record, now=when, ttl=window):
+        # MEMBERSHIP is the 7-day wall window; the 45s TTL only decides online-vs-offline
+        # below. A record outside the window (or with no usable ts) leaves the wall entirely.
+        if not is_on_wall(record, now=when, window=wall_window):
             continue
         # RETIREMENT (opt-out) is honored HERE, at the READ AUTHORITY — the server
         # drops a retired dev from EVERY roster read (the signed /roster AND the
@@ -433,12 +502,16 @@ def roster(project, team_id, *, home=None, now=None, ttl=None, activity_ttl=None
         if isinstance(record, dict) and record.get("retired"):
             continue
         view = dict(record)
-        view["online"] = True
+        online = is_online(record, now=when, ttl=window)
+        view["online"] = online
         view["age_seconds"] = round(when - record["ts"], 1)
-        # The DERIVED wall state (ADDITIVE — the record on disk is unchanged). ACTIVE when the
-        # dev's activity_ts is fresh, IDLE when it is stale/absent. OFFLINE never reaches here
-        # (is_online dropped it above), so an idle beater stays on the wall, demoted not dropped.
-        view["state"] = derive_state(record, now=when, activity_ttl=act_window)
+        # The DERIVED wall state (ADDITIVE — the record on disk is unchanged). Within the online
+        # TTL: ACTIVE when the dev's activity_ts is fresh, IDLE when it is stale/absent, so an
+        # idle beater stays on the wall demoted rather than dropped. Past the TTL but inside the
+        # 7-day window: the EXPLICIT "offline" state — never "idle", which a renderer would paint
+        # as a present-but-quiet teammate. Offline must never be a subtly-different online.
+        view["state"] = (derive_state(record, now=when, activity_ttl=act_window)
+                         if online else "offline")
         out.append(view)
     out.sort(key=lambda r: str(r.get("haid") or ""))
     return out
@@ -710,7 +783,15 @@ def roster_team_route(request, *, home=None):
     # Hash the presented secret to the partition handle (one-way; no secret-to-secret compare,
     # no stored secret). The raw secret is consumed here and never stored/echoed.
     team_id = cp_auth.derive_team_id(secret)
-    online = [_team_view(view) for view in roster(project, team_id, home=home)]
+    # ONLINE-ONLY, deliberately. roster() now also returns AWAY devs (past the 45s TTL, inside
+    # the 7-day offline window) so the STATUSLINE wall can grey them instead of erasing them —
+    # but this route's response field is literally named "online" and the browser client renders
+    # everything in it as present. Widening it here would silently turn every away teammate into
+    # a false-online on the dashboard: the exact misread the offline window exists to prevent,
+    # just moved to another surface. The browser contract stays what it says it is; when the
+    # dashboard learns to render an away state it can opt in via the view's own flag.
+    online = [_team_view(view) for view in roster(project, team_id, home=home)
+              if view.get("online")]
     return cp_server.Response(
         200, {"project": project, "online": online}, headers=_CORS_HEADERS)
 

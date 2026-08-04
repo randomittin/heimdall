@@ -77,9 +77,13 @@ P.record_presence("haid:b", project=proj, team_id=tid, handle="b", verdict="watc
 # devC — IDLE via ABSENT activity_ts (backward-compat: an old client / bare keeper beat).
 P.record_presence("haid:c", project=proj, team_id=tid, handle="c", verdict="working",
                   file="y.py", ts=NOW - 8, home=home)
-# devD — OFFLINE: ts 500s old (> TTL). Must not appear on the roster at all.
+# devD — OFFLINE: ts 500s old (> the 45s TTL) but well inside the 7-day wall window, so it
+# stays on the roster carrying the explicit "offline" state. It must NOT read active/idle.
 P.record_presence("haid:d", project=proj, team_id=tid, handle="d", verdict="working",
                   file="z.py", ts=NOW - 500, activity_ts=NOW - 500, home=home)
+# devE — GONE: ts 8 days old, past the wall window entirely. Must not appear at all.
+P.record_presence("haid:e", project=proj, team_id=tid, handle="e", verdict="working",
+                  file="w.py", ts=NOW - 8 * 86400, activity_ts=NOW - 8 * 86400, home=home)
 
 def states(now):
     r = P.roster(proj, tid, home=home, now=now, ttl=ttl, activity_ttl=act)
@@ -128,10 +132,24 @@ else
   bad "B an idle beater dropped or mis-derived (on_now/states wrong — out=$OUT)"
 fi
 
-# C. OFFLINE — ts past the TTL => absent from the roster (never idle-lingering).
-[ "$(get "'haid:d' in d['on_now']")" = "False" ] \
-  && ok "C devD (ts > TTL) is OFFLINE — dropped from the roster entirely" \
-  || bad "C an offline dev lingered on the roster (out=$OUT)"
+# C. OFFLINE — ts past the TTL but inside the 7-day wall window => STAYS on the roster under
+# the explicit "offline" state. Erasing them is what made a quiet team and a broken wall look
+# identical; the one thing that must never happen is offline reading as active/idle.
+C_ON="$(get "'haid:d' in d['on_now']")"
+C_STATE="$(get "d['now'].get('haid:d')")"
+if [ "$C_ON" = "True" ] && [ "$C_STATE" = "offline" ]; then
+  ok "C devD (ts > TTL, inside the window) stays on the wall as OFFLINE — greyed, not erased"
+else
+  bad "C devD did not read OFFLINE on the wall (on=$C_ON state=$C_STATE — out=$OUT)"
+fi
+[ "$C_STATE" != "active" ] && [ "$C_STATE" != "idle" ] \
+  && ok "C2 FALSIFIABLE: an offline dev never derives active/idle (never a false-online)" \
+  || bad "C2 an offline dev derived a LIVE state ($C_STATE) — reads as present"
+
+# C3. The outer bound still bites: past the 7-day window a dev leaves the wall for good.
+[ "$(get "'haid:e' in d['on_now']")" = "False" ] \
+  && ok "C3 devE (8 days stale) is DROPPED — the wall is bounded, not a graveyard" \
+  || bad "C3 a dev past the 7-day window lingered on the roster (out=$OUT)"
 
 # C-trace. INJECTED CLOCK: devA flips active->idle by advancing `now` past the activity window
 # while a keeper heartbeat keeps its ts inside the TTL — the clock decides, and it never drops.
