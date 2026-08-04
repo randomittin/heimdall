@@ -15,12 +15,17 @@
 #
 # THE ORDER IS THE CONTRACT:
 #
-#     validate -> class contract -> consent -> install + digest-verify
-#              -> wire -> invariants
+#     validate -> class contract -> preflight -> consent
+#              -> install + digest-verify -> wire -> invariants
 #
 # Everything before `install` is READ-ONLY, so a manifest rejected at validate,
-# class or consent mutates nothing at all. From `install` onward every failure
-# unwinds through remove_module().
+# class, preflight or consent mutates nothing at all. From `install` onward every
+# failure unwinds through remove_module().
+#
+# PREFLIGHT SITS BEFORE CONSENT deliberately: nobody should be asked to agree to
+# an install that cannot happen. It converts the preconditions an install depends
+# on into named checks with named fixes, so a failure arrives as a command the
+# operator can run rather than as a compiler traceback ten minutes in.
 #
 # CLASSES ARE DATA, NOT CODE. modules/_classes/<class>.json carries
 # `consent_required` plus a `requires_invariants` list, and this harness
@@ -74,9 +79,16 @@
 #   heimdall-modules update [<name>]      move to the manifest's human-set pin
 #   heimdall-modules status <name>        one module in detail
 #   heimdall-modules verify [<name>]      re-run class invariants (CI entry point)
+#   heimdall-modules preflight <name>     can it install? every precondition + its fix
+#   heimdall-modules repair <name>        preflight, fix what is fixable, re-attempt
+#   heimdall-modules defer <name>         record install intent; do NOT fetch now
+#   heimdall-modules pending              names wanting a repair (empty = no work)
+#   heimdall-modules optout <name>        deliberately decline; nothing re-installs it
+#   heimdall-modules optin <name>         undo an optout
 #
 #   --json            structured output on stdout
 #   --yes             grant consent non-interactively (the operator is saying yes)
+#   --quiet           no stdout on success (the backgrounded `hmd update` path)
 #   --registry DIR    registry root (default <plugin>/modules)
 #   --state DIR       install state root (default <plugin>/.heimdall/modules)
 #   -h | --help
@@ -105,6 +117,7 @@ CMD=""
 TARGET=""
 AS_JSON=0
 ASSUME_YES=0
+QUIET=0
 REGISTRY="${HMD_MODULES_REGISTRY:-$PLUGIN_DIR/modules}"
 STATE="${HMD_MODULES_STATE:-$PLUGIN_DIR/.heimdall/modules}"
 
@@ -112,6 +125,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --json)     AS_JSON=1; shift ;;
     --yes|-y)   ASSUME_YES=1; shift ;;
+    --quiet|-q) QUIET=1; shift ;;
     --registry) REGISTRY="${2:-}"; [ -n "$REGISTRY" ] || die "--registry needs a path"; shift 2 ;;
     --state)    STATE="${2:-}";    [ -n "$STATE" ]    || die "--state needs a path";    shift 2 ;;
     -h|--help)  usage; exit 0 ;;
@@ -127,7 +141,7 @@ done
 
 CMD="${CMD:-list}"
 case "$CMD" in
-  list|add|remove|update|status|verify) : ;;
+  list|add|remove|update|status|verify|preflight|repair|defer|pending|optout|optin) : ;;
   *) echo "error: unknown command: $CMD" >&2; usage >&2; exit 2 ;;
 esac
 
@@ -171,6 +185,92 @@ class_path()    { printf '%s/%s.json' "$CLASS_DIR" "$1"; }
 
 # A module is installed iff its receipt exists. No shared ledger to drift.
 is_installed() { [ -f "$STATE/$1/receipt.json" ]; }
+
+# ── lifecycle side-records: the three states that are NOT "installed" ────────
+# "Not installed" is three different facts, and conflating them is what makes an
+# optional module feel broken:
+#   opted out      the operator declined. Nothing may ever re-install it.
+#   install failed we tried and it did not work. WHICH STAGE failed is the fact
+#                  that turns a shrug into a fix.
+#   not attempted  no install has run — either deferred on purpose, or untouched.
+# One file per fact, mirroring `is_installed`'s rule that a state is a file's
+# existence and never an entry in a ledger that can drift.
+#
+# These live under $STATE/.modstate/<name>/ — deliberately OUTSIDE $STATE/<name>/,
+# because remove_module() rm -rf's that directory to guarantee byte-identical
+# rollback. A failure record kept inside it would either be destroyed by the
+# rollback (losing the diagnosis) or survive it (breaking byte-identity). Outside,
+# both properties hold — and `add` never writes here AT ALL, so the add/remove
+# round trip stays byte-identical exactly as before. Recording a failure is
+# `repair`'s job, because `repair` is the verb that owns retrying.
+MODSTATE="$STATE/.modstate"
+optout_file()   { printf '%s/%s/optout.json'   "$MODSTATE" "$1"; }
+failure_file()  { printf '%s/%s/failure.json'  "$MODSTATE" "$1"; }
+deferred_file() { printf '%s/%s/deferred.json' "$MODSTATE" "$1"; }
+
+# An opt-out is honoured from the two places that actually HAVE a writer: this
+# tool's own record (written by `optout`, cleared by `optin`) and an env switch
+# the operator sets directly.
+#
+# There is deliberately NO third source. An earlier draft also read a home-level
+# file, but nothing in this repo writes one — `grep -rn HEIMDALL_NO_MODULES` over
+# install.sh and heimdall-autoupdate returns nothing. A reader for a file that is
+# never written is not a feature; it is a branch that can only ever report the
+# default, which reads as a working opt-out that silently is not one. When the
+# install side grows a writer, this is where its reader goes.
+is_opted_out() {
+  local name="$1"
+  [ -f "$(optout_file "$name")" ] && return 0
+  case ",${HMD_MODULE_OPTOUT:-}," in *",$name,"*) return 0 ;; esac
+  return 1
+}
+
+has_failed()  { [ -f "$(failure_file "$1")" ]; }
+is_deferred() { [ -f "$(deferred_file "$1")" ]; }
+
+# The one question every caller asks: which state is this module in? Prints
+# exactly one of: installed | opted-out | failed | deferred | not-attempted
+module_state() {
+  local name="$1"
+  is_opted_out "$name" && { printf 'opted-out'; return 0; }
+  is_installed "$name" && { printf 'installed'; return 0; }
+  has_failed   "$name" && { printf 'failed';    return 0; }
+  is_deferred  "$name" && { printf 'deferred';  return 0; }
+  printf 'not-attempted'
+}
+
+# Write a side-record, creating only what is needed. Best-effort BY CONTRACT: a
+# state root we cannot write is not a reason to fail the caller — the module is
+# optional and hmd must keep working without it.
+write_modstate() {
+  local name="$1" file="$2" json="$3"
+  mkdir -p "$MODSTATE/$name" 2>/dev/null || return 0
+  printf '%s\n' "$json" > "$file" 2>/dev/null || true
+}
+
+# Clear a side-record and prune the per-module dir if it is now empty, so a
+# resolved failure leaves nothing that still reads like an unresolved one.
+clear_modstate() {
+  local name="$1" file="$2"
+  rm -f "$file" 2>/dev/null || true
+  rmdir "$MODSTATE/$name" 2>/dev/null || true
+  rmdir "$MODSTATE" 2>/dev/null || true
+}
+
+# Record a failure with the STAGE that failed and a retry clock. The clock is
+# what stops a permanently-broken module re-attempting on every single `hmd
+# update` — a retry storm is how a background repair becomes noise.
+record_failure() {
+  local name="$1" stage="$2" detail="$3"
+  local prior=0
+  [ -f "$(failure_file "$name")" ] \
+    && prior="$(jq -r '.attempts // 0' "$(failure_file "$name")" 2>/dev/null || echo 0)"
+  case "$prior" in ''|*[!0-9]*) prior=0 ;; esac
+  write_modstate "$name" "$(failure_file "$name")" "$(jq -n \
+    --arg s "$stage" --arg d "$detail" --arg at "$(now_iso)" \
+    --argjson n "$((prior+1))" --argjson epoch "$(date +%s 2>/dev/null || echo 0)" \
+    '{stage:$s, detail:$d, failed_at:$at, attempts:$n, last_attempt_epoch:$epoch}')"
+}
 
 installed_names() {
   [ -d "$STATE" ] || return 0
@@ -776,7 +876,7 @@ cmd_add() {
   printf '\n  Adding module "%s"\n\n' "$name"
 
   # 1. VALIDATE (read-only)
-  printf '  [1/6] validate\n'
+  printf '  [1/7] validate\n'
   if ! validate_manifest "$name" "$mf"; then
     warn "refused: manifest failed validation. Nothing was installed."
     printf '%s' "$VALIDATE_ERRORS" >&2
@@ -784,17 +884,22 @@ cmd_add() {
   fi
 
   # 2. CLASS CONTRACT (read-only)
-  printf '  [2/6] class contract\n'
+  printf '  [2/7] class contract\n'
   resolve_classes "$mf" || exit 1
   check_invariant_coverage "$mf" || exit 1
   check_default_included "$mf" || exit 1
 
-  # 3. CONSENT (read-only)
-  printf '  [3/6] consent\n'
+  # 3. PREFLIGHT (read-only) — before consent on purpose: nobody should be asked
+  #    to agree to an install that cannot happen.
+  printf '  [3/7] preflight\n'
+  add_preflight "$name" "$mf" || exit 1
+
+  # 4. CONSENT (read-only)
+  printf '  [4/7] consent\n'
   obtain_consent "$name" "$mf" || exit 1
 
-  # 4. INSTALL + DIGEST-VERIFY (first mutation)
-  printf '  [4/6] install + digest-verify\n'
+  # 5. INSTALL + DIGEST-VERIFY (first mutation)
+  printf '  [5/7] install + digest-verify\n'
   if ! install_module "$name" "$mf"; then
     remove_module "$name"
     warn "refused: install failed. Rolled back — no trace left."
@@ -802,16 +907,16 @@ cmd_add() {
   fi
   printf '        digest: %s\n' "$(printf '%s' "$DIGEST_JSON" | jq -r '.status')"
 
-  # 5. WIRE
-  printf '  [5/6] wire\n'
+  # 6. WIRE
+  printf '  [6/7] wire\n'
   if ! wire_module "$name" "$mf"; then
     remove_module "$name"
     warn "refused: wiring failed. Rolled back — no trace left."
     exit 1
   fi
 
-  # 6. INVARIANTS — with the module installed and wired.
-  printf '  [6/6] class invariants (module active)\n'
+  # 7. INVARIANTS — with the module installed and wired.
+  printf '  [7/7] class invariants (module active)\n'
   if ! run_invariants "$name" "$mf"; then
     printf '%s' "$INVARIANT_RESULTS" | jq -r '.[] | select(.passed | not)
       | "  FAILED INVARIANT: \(.id)\n    why: \(.reason)\n    what it guarantees: \(.description)\n    command: \(.command)"' >&2
@@ -865,13 +970,49 @@ cmd_remove() {
 cmd_status() {
   local name="$1"
   [ -n "$name" ] || die "status needs a module name"
+  # NOT INSTALLED IS THREE DIFFERENT FACTS. "not installed" alone is the answer
+  # that makes an optional module feel broken: the user cannot tell whether they
+  # declined it, whether it tried and failed, or whether it simply has not run
+  # yet. Each wants a different next action, so each gets its own answer — and the
+  # failed one names the STAGE that failed, which is what turns a shrug into a fix.
   if ! is_installed "$name"; then
+    local st; st="$(module_state "$name")"
     if [ "$AS_JSON" -eq 1 ]; then
-      jq -n --arg n "$name" '{tool:"heimdall-modules", action:"status",
-        name:$n, installed:false}'
-    else
-      printf '\n  "%s" is not installed.\n\n' "$name"
+      jq -n --arg n "$name" --arg st "$st" \
+        --argjson optout "$([ -f "$(optout_file "$name")" ] && cat "$(optout_file "$name")" || echo null)" \
+        --argjson failure "$([ -f "$(failure_file "$name")" ] && cat "$(failure_file "$name")" || echo null)" \
+        --argjson deferred "$([ -f "$(deferred_file "$name")" ] && cat "$(deferred_file "$name")" || echo null)" \
+        '{tool:"heimdall-modules", action:"status", name:$n, installed:false,
+          state:$st, optout:$optout, failure:$failure, deferred:$deferred}'
+      return 0
     fi
+    printf '\n  %s\n\n' "$name"
+    case "$st" in
+      opted-out)
+        printf '    state:    OPTED OUT — not installed because you declined it.\n'
+        printf '    Nothing will re-install it, including `hmd update`.\n'
+        printf '    Change your mind: hmd modules optin %s\n' "$name" ;;
+      failed)
+        printf '    state:    not installed — INSTALL FAILED at stage: %s\n' \
+          "$(jq -r '.stage // "unknown"' "$(failure_file "$name")" 2>/dev/null)"
+        printf '    when:     %s (attempt %s)\n' \
+          "$(jq -r '.failed_at // "?"' "$(failure_file "$name")" 2>/dev/null)" \
+          "$(jq -r '.attempts // "?"' "$(failure_file "$name")" 2>/dev/null)"
+        printf '    why:      %s\n' \
+          "$(jq -r '.detail // "no detail recorded"' "$(failure_file "$name")" 2>/dev/null)"
+        printf '\n    Diagnose: hmd modules preflight %s\n' "$name"
+        printf '    Retry:    hmd modules repair %s\n' "$name" ;;
+      deferred)
+        printf '    state:    NOT YET ATTEMPTED — not installed; deferred by design.\n'
+        printf '    hmd installed fast and left this for the background; it will be\n'
+        printf '    attempted on the next `hmd update`, or now with:\n'
+        printf '              hmd modules repair %s\n' "$name" ;;
+      *)
+        printf '    state:    NOT ATTEMPTED — not installed, and no install was tried.\n'
+        printf '    Install:     hmd modules add %s\n' "$name"
+        printf '    Check first: hmd modules preflight %s\n' "$name" ;;
+    esac
+    printf '\n'
     return 0
   fi
   local d="$STATE/$name"
@@ -1002,11 +1143,384 @@ cmd_update() {
   return "$rc"
 }
 
+# ═════════════════════════════════════════════════════════════════════════════
+#  Preflight, repair, and the deliberate opt-out
+# ═════════════════════════════════════════════════════════════════════════════
+#
+# THE PROBLEM THESE SOLVE. An upstream module's install command has many more
+# ways to fail than to succeed, and almost every failure surfaces as something
+# that is not a diagnosis — a compiler traceback, a connect timeout, or a
+# "command not found" for a binary that installed perfectly but landed off PATH.
+# `preflight` converts each of those into a precondition with a named fix BEFORE
+# anything is attempted; `repair` re-runs it, fixes what it can, and re-attempts
+# idempotently so a partial install never needs a manual teardown.
+#
+# ONE MECHANISM, TWO CALLERS. `hmd update` drives this same repair path through
+# the same library (bin/lib/module_preflight.sh). There is no second updater and
+# no second remedy table — a fix written once is the fix everywhere.
+
+# A big source build is legitimately slow, so the fetch budget is generous — but
+# it IS a budget. An unbounded fetch is how a background repair wedges a machine.
+HMD_MODULE_FETCH_TIMEOUT="${HMD_MODULE_FETCH_TIMEOUT:-1800}"
+
+PREFLIGHT_LIB="$BIN_DIR/lib/module_preflight.sh"
+load_preflight() {
+  if [ ! -f "$PREFLIGHT_LIB" ]; then
+    warn "error: preflight library missing at ${PREFLIGHT_LIB#"$PLUGIN_DIR"/}"
+    warn "  It ships with hmd itself, so this is a damaged install — re-run the"
+    warn "  hmd installer to restore it. No module verb can run without it."
+    return 1
+  fi
+  # shellcheck source=/dev/null
+  . "$PREFLIGHT_LIB" || { warn "error: preflight library could not load"; return 1; }
+  return 0
+}
+
+# WHICH PREFLIGHT FAILURES BLOCK AN `add` — and why the rest do not.
+#
+# `add` on an upstream module is a DECLARATION, not a download. Its own digest
+# step says so in as many words: "depend, do not clone. Nothing is vendored at
+# add time." `add` records the pin, wires the module and runs the class
+# invariants; it never runs `installs_via.fetch`. The verb that fetches is
+# `repair`, and `repair` blocks on EVERY blocking check for exactly that reason.
+#
+# So `add` refuses on precisely the checks that would falsify what IT writes:
+#   pin       the receipt would record a pin the artifact can never be proven against
+#   disk      there is not room to write the receipt and its invariant evidence
+#   platform  no wheel and no toolchain — the payload can never run on this box
+# Every other failure is RENDERED in full, with its remedy and with the repair
+# command that needs it. Refusing an add for a precondition the add never touches
+# would be a FALSE refusal, and a false refusal is how a gate teaches people to
+# route around it.
+ADD_BLOCKING_CHECKS="pin disk platform"
+
+# Runs preflight for `add`, prints what it found, and returns non-zero only when
+# a check `add` itself depends on is failing. Read-only: nothing here mutates.
+add_preflight() {
+  local name="$1" mf="$2"
+  load_preflight || return 1
+  hmd_preflight "$name" "$mf" "$STATE"
+
+  local blockers advisories
+  blockers="$(printf '%s' "$PF_RESULTS" | jq -r --arg ids "$ADD_BLOCKING_CHECKS" \
+    '($ids | split(" ")) as $b
+     | .[] | select(.status == "fail") | select([.id] | inside($b))
+     | "        \(.id): \(.requirement)\n          found: \(.found)\n          fix:   \(.remedy)"')"
+  advisories="$(printf '%s' "$PF_RESULTS" | jq -r --arg ids "$ADD_BLOCKING_CHECKS" \
+    '($ids | split(" ")) as $b
+     | .[] | select(.status == "fail") | select([.id] | inside($b) | not)
+     | "        \(.id): \(.found)\n          fix: \(.remedy)"')"
+
+  if [ -n "$blockers" ]; then
+    warn "refused: a precondition this install depends on is not met."
+    printf '%s\n' "$blockers" >&2
+    warn "  Nothing was installed and nothing was wired."
+    warn "  Full report: hmd modules preflight $name"
+    return 1
+  fi
+
+  if [ -n "$advisories" ]; then
+    printf '        preflight: %s check(s) the PAYLOAD needs are not met yet.\n' \
+      "$(printf '%s\n' "$advisories" | grep -c 'fix:')"
+    printf '%s\n' "$advisories"
+    printf '        The module records at its pin now; `hmd modules repair %s`\n' "$name"
+    printf '        fetches the payload and requires the fixes above.\n'
+  else
+    printf '        preflight: every precondition met.\n'
+  fi
+  return 0
+}
+
+cmd_preflight() {
+  local name="$1"
+  [ -n "$name" ] || die "preflight needs a module name"
+  load_preflight || exit 2
+  local mf; mf="$(manifest_path "$name")"
+  hmd_preflight "$name" "$mf" "$STATE"
+  local rc=$?
+  if [ "$AS_JSON" -eq 1 ]; then
+    jq -n --arg n "$name" --argjson checks "$PF_RESULTS" \
+      --argjson ok "$([ "$rc" -eq 0 ] && echo true || echo false)" \
+      --argjson failed "$PF_FAILED" --argjson warned "$PF_WARNED" \
+      --arg st "$(module_state "$name")" \
+      '{tool:"heimdall-modules", action:"preflight", name:$n, ok:$ok,
+        module_state:$st, blocking_failures:$failed, warnings:$warned,
+        checks:$checks}'
+  else
+    hmd_preflight_render "$name"
+  fi
+  return "$rc"
+}
+
+# The ONE precondition repair can resolve on its own. Everything else needs a
+# decision only the operator can make — install a toolchain, free disk, open a
+# firewall — so repair NAMES those instead of guessing at them. Sets REPAIR_FIXED.
+REPAIR_FIXED=0
+repair_fixable() {
+  local mf="$1"
+  REPAIR_FIXED=0
+  local fetch tool pyver
+  fetch="$(jq -r '.installs_via.fetch // ""' "$mf")"
+  tool="$(pf_derive_tool "$fetch")"
+  pyver="$(pf_derive_python "$fetch")"
+  [ -n "$pyver" ] || return 0
+  [ "$tool" = "uv" ] || return 0
+  # Read the preflight result rather than re-probing PATH: if the tool check did
+  # not pass, the MISSING TOOL is the failure to report, not something to work
+  # around — and asking a tool that is not there to fix anything is noise.
+  printf '%s' "$PF_RESULTS" \
+    | jq -e '.[] | select(.id == "tool" and .status == "pass")' >/dev/null 2>&1 || return 0
+  printf '%s' "$PF_RESULTS" \
+    | jq -e '.[] | select(.id == "python" and .status == "fail")' >/dev/null 2>&1 || return 0
+
+  # Provisioning an interpreter is a real download, which is why it is never a
+  # side effect of `preflight` or of any read path. `repair` IS the deliberate
+  # act, so here it is allowed — and bounded.
+  [ "$QUIET" -eq 1 ] || printf '  fixing:  provisioning python %s via uv…\n' "$pyver"
+  pf_bounded "$HMD_MODULE_FETCH_TIMEOUT" "uv python install '$pyver'"
+  if [ "$PF_RC" -eq 0 ]; then
+    REPAIR_FIXED=1
+  else
+    [ "$QUIET" -eq 1 ] || warn "  could not provision python $pyver: $(printf '%s' "$PF_OUT" | tail -3)"
+  fi
+  return 0
+}
+
+# The repair/verify entry point. Idempotent by construction: healthy is a no-op,
+# broken is rebuilt through the SAME ordered pipeline a first install faces.
+cmd_repair() {
+  local name="$1"
+  [ -n "$name" ] || die "repair needs a module name"
+
+  # 1. AN OPT-OUT IS FINAL. A repair that silently reinstalls what someone
+  #    deliberately declined is worse than shipping no opt-out at all: it teaches
+  #    the user that their choice does not stick. Checked FIRST, before any work.
+  if is_opted_out "$name"; then
+    if [ "$AS_JSON" -eq 1 ]; then
+      jq -n --arg n "$name" '{tool:"heimdall-modules", action:"repair", ok:true,
+        name:$n, state:"opted-out", changed:false,
+        note:"opted out — repair honours the choice and does nothing"}'
+    elif [ "$QUIET" -eq 0 ]; then
+      printf '\n  "%s" is opted out. Nothing to repair — your choice stands.\n' "$name"
+      printf '  Undo it with: hmd modules optin %s\n\n' "$name"
+    fi
+    return 0
+  fi
+
+  load_preflight || return 2
+  local mf; mf="$(manifest_path "$name")"
+  if [ ! -f "$mf" ]; then
+    record_failure "$name" "manifest" "no manifest for \"$name\" in the registry"
+    [ "$QUIET" -eq 1 ] || warn "error: no manifest for \"$name\" at ${mf#"$PLUGIN_DIR"/}"
+    return 1
+  fi
+
+  # 2. ALREADY HEALTHY → a TRUE no-op. This is the property that lets `hmd
+  #    update` call repair on every run: a working module costs one invariant
+  #    pass, prints nothing, and re-downloads nothing.
+  if is_installed "$name"; then
+    if ( AS_JSON=0; cmd_verify "$name" ) >/dev/null 2>&1; then
+      clear_modstate "$name" "$(failure_file "$name")"
+      clear_modstate "$name" "$(deferred_file "$name")"
+      if [ "$AS_JSON" -eq 1 ]; then
+        jq -n --arg n "$name" '{tool:"heimdall-modules", action:"repair", ok:true,
+          name:$n, state:"installed", changed:false,
+          note:"already installed and holding its invariants — no work done"}'
+      elif [ "$QUIET" -eq 0 ]; then
+        printf '\n  "%s" is installed and holds its invariants. Nothing to repair.\n\n' "$name"
+      fi
+      return 0
+    fi
+    # Installed but FAILING its invariants — a partial install. Unwind through
+    # the one removal path and re-attempt, so recovery never needs the user to
+    # hand-delete anything.
+    [ "$QUIET" -eq 1 ] || printf '\n  "%s" is installed but FAILS its invariants — rebuilding it.\n' "$name"
+    remove_module "$name" || {
+      record_failure "$name" "rollback" "could not remove the partial install at $STATE/$name"
+      return 1
+    }
+  fi
+
+  [ "$QUIET" -eq 1 ] || printf '\n  Repairing "%s"\n\n' "$name"
+
+  # 3. PREFLIGHT — every precondition, each with its fix. `repair` gates on ALL
+  #    of them, unlike `add`: this is the verb that actually runs the fetch.
+  hmd_preflight "$name" "$mf" "$STATE"
+  # 4. Fix what is fixable, then re-check so the decision is made on fresh facts.
+  if [ "$PF_FAILED" -ne 0 ]; then
+    repair_fixable "$mf"
+    [ "$REPAIR_FIXED" -eq 1 ] && hmd_preflight "$name" "$mf" "$STATE"
+  fi
+
+  if [ "$PF_FAILED" -ne 0 ]; then
+    record_failure "$name" "preflight" \
+      "$PF_FAILED blocking precondition(s): $(printf '%s' "$PF_RESULTS" | jq -r '[.[] | select(.status=="fail") | .id] | join(", ")')"
+    if [ "$AS_JSON" -eq 1 ]; then
+      jq -n --arg n "$name" --argjson checks "$PF_RESULTS" --argjson f "$PF_FAILED" \
+        '{tool:"heimdall-modules", action:"repair", ok:false, name:$n,
+          state:"failed", stage:"preflight", blocking_failures:$f, checks:$checks}'
+    elif [ "$QUIET" -eq 0 ]; then
+      hmd_preflight_render "$name"
+      printf '  Repair stopped: %s precondition(s) need you. Each fix is above.\n' "$PF_FAILED"
+      printf '  Nothing was installed and hmd is unaffected.\n\n'
+    fi
+    return 1
+  fi
+
+  # 5. FETCH. Output is captured, not streamed, so a compiler traceback lands in
+  #    the failure record where `status` can quote it — rather than scrolling
+  #    past in a terminal nobody was watching.
+  local fetch; fetch="$(jq -r '.installs_via.fetch // ""' "$mf")"
+  if [ -n "$fetch" ] && [ "$(jq -r '.installs_via.kind // ""' "$mf")" = "upstream" ]; then
+    [ "$QUIET" -eq 1 ] || printf '  fetching: %s\n' "$fetch"
+    pf_bounded "$HMD_MODULE_FETCH_TIMEOUT" "$fetch"
+    if [ "$PF_RC" -ne 0 ]; then
+      record_failure "$name" "fetch" "$(printf '%s' "$PF_OUT" | tail -5)"
+      if [ "$AS_JSON" -eq 1 ]; then
+        jq -n --arg n "$name" --arg out "$(printf '%s' "$PF_OUT" | tail -5)" --argjson rc "$PF_RC" \
+          '{tool:"heimdall-modules", action:"repair", ok:false, name:$n,
+            state:"failed", stage:"fetch", exit_code:$rc, output_tail:$out}'
+      elif [ "$QUIET" -eq 0 ]; then
+        warn ""
+        warn "  FETCH FAILED (exit $PF_RC). The install command did not complete:"
+        warn "    $fetch"
+        printf '%s\n' "$PF_OUT" | tail -5 | sed 's/^/    /' >&2
+        warn ""
+        warn "  hmd is unaffected — the module stays absent and \`status\` says why."
+        warn "  Re-run when the cause is addressed: hmd modules repair $name"
+      fi
+      return 1
+    fi
+  fi
+
+  # 6. The ordered pipeline. Every gate the first install would have faced.
+  local addrc=0
+  if [ "$QUIET" -eq 1 ]; then
+    ( cmd_add "$name" ) >/dev/null 2>&1 || addrc=$?
+  else
+    ( cmd_add "$name" ) || addrc=$?
+  fi
+  if [ "$addrc" -ne 0 ]; then
+    record_failure "$name" "add" "the ordered install pipeline refused the module (exit $addrc) — see \`hmd modules add $name\` for the full reason"
+    [ "$QUIET" -eq 1 ] || warn "  repair could not complete the install pipeline for \"$name\"."
+    return 1
+  fi
+
+  clear_modstate "$name" "$(failure_file "$name")"
+  clear_modstate "$name" "$(deferred_file "$name")"
+  if [ "$AS_JSON" -eq 1 ]; then
+    jq -n --arg n "$name" '{tool:"heimdall-modules", action:"repair", ok:true,
+      name:$n, state:"installed", changed:true, note:"repaired and installed"}'
+  elif [ "$QUIET" -eq 0 ]; then
+    printf '  Repaired "%s".\n\n' "$name"
+  fi
+  return 0
+}
+
+# Record the DEFERRED intent — the "not yet attempted" fact, stated on purpose so
+# `status` can distinguish it from "we tried and it failed".
+cmd_defer() {
+  local name="$1"
+  [ -n "$name" ] || die "defer needs a module name"
+  if is_opted_out "$name"; then
+    [ "$QUIET" -eq 1 ] || printf '\n  "%s" is opted out — not deferring an install nobody asked for.\n\n' "$name"
+    return 0
+  fi
+  if is_installed "$name"; then
+    [ "$QUIET" -eq 1 ] || printf '\n  "%s" is already installed. Nothing to defer.\n\n' "$name"
+    return 0
+  fi
+  write_modstate "$name" "$(deferred_file "$name")" "$(jq -n --arg at "$(now_iso)" \
+    '{deferred_at:$at,
+      reason:"the install is not blocked on here; the payload is fetched in the background",
+      next:"attempted by the next `hmd update`, or now with `hmd modules repair`"}')"
+  if [ "$AS_JSON" -eq 1 ]; then
+    jq -n --arg n "$name" '{tool:"heimdall-modules", action:"defer", ok:true,
+      name:$n, state:"deferred"}'
+  elif [ "$QUIET" -eq 0 ]; then
+    printf '\n  "%s" install deferred — hmd is ready now; the module follows in the background.\n\n' "$name"
+  fi
+  return 0
+}
+
+# Names that WANT a repair attempt, one per line, and NOTHING when none do.
+#
+# THIS IS THE CHEAP DECISION `hmd update` makes before spending anything. It is
+# deliberately a set of file-existence tests and never a preflight run: the
+# healthy case must cost a stat() per module, print nothing and download nothing,
+# because it runs on a schedule. Empty output means "no work" and the caller
+# returns immediately.
+#
+# The retry backoff is what stops a permanently-broken module turning every
+# session into a retry storm — a module that failed an hour ago is not retried;
+# one that failed yesterday is.
+HMD_MODULE_RETRY_INTERVAL="${HMD_MODULE_RETRY_INTERVAL:-86400}"
+cmd_pending() {
+  [ -d "$MODSTATE" ] || return 0
+  local d n now epoch age
+  now="$(date +%s 2>/dev/null || echo 0)"
+  for d in "$MODSTATE"/*/; do
+    [ -d "$d" ] || continue
+    n="${d%/}"; n="${n##*/}"
+    # An opt-out wins over every other record. Checked first, always.
+    is_opted_out "$n" && continue
+    is_installed "$n" && continue
+    if has_failed "$n"; then
+      epoch="$(jq -r '.last_attempt_epoch // 0' "$(failure_file "$n")" 2>/dev/null || echo 0)"
+      case "$epoch" in ''|*[!0-9]*) epoch=0 ;; esac
+      age=$(( now - epoch ))
+      if [ "$age" -ge 0 ] && [ "$age" -lt "$HMD_MODULE_RETRY_INTERVAL" ]; then continue; fi
+      printf '%s\n' "$n"
+      continue
+    fi
+    is_deferred "$n" && printf '%s\n' "$n"
+  done
+  return 0
+}
+
+cmd_optout() {
+  local name="$1"
+  [ -n "$name" ] || die "optout needs a module name"
+  write_modstate "$name" "$(optout_file "$name")" "$(jq -n --arg at "$(now_iso)" \
+    '{opted_out_at:$at,
+      note:"deliberate opt-out. No install path — including `hmd update` — may re-install this module."}')"
+  # A pending install intent is no longer wanted; clear it so nothing acts on it.
+  clear_modstate "$name" "$(deferred_file "$name")"
+  if [ "$AS_JSON" -eq 1 ]; then
+    jq -n --arg n "$name" '{tool:"heimdall-modules", action:"optout", ok:true,
+      name:$n, state:"opted-out"}'
+  elif [ "$QUIET" -eq 0 ]; then
+    printf '\n  Opted out of "%s". Nothing will install it, including `hmd update`.\n' "$name"
+    printf '  Undo: hmd modules optin %s\n\n' "$name"
+  fi
+  return 0
+}
+
+cmd_optin() {
+  local name="$1"
+  [ -n "$name" ] || die "optin needs a module name"
+  clear_modstate "$name" "$(optout_file "$name")"
+  if [ "$AS_JSON" -eq 1 ]; then
+    jq -n --arg n "$name" --arg st "$(module_state "$name")" \
+      '{tool:"heimdall-modules", action:"optin", ok:true, name:$n, state:$st}'
+  elif [ "$QUIET" -eq 0 ]; then
+    printf '\n  "%s" is no longer opted out.\n' "$name"
+    printf '  Install it with: hmd modules repair %s\n\n' "$name"
+  fi
+  return 0
+}
+
 case "$CMD" in
-  list)   cmd_list ;;
-  add)    cmd_add "$TARGET" ;;
-  remove) cmd_remove "$TARGET" ;;
-  status) cmd_status "$TARGET" ;;
-  verify) cmd_verify "$TARGET" ;;
-  update) cmd_update "$TARGET" ;;
+  list)      cmd_list ;;
+  add)       cmd_add "$TARGET" ;;
+  remove)    cmd_remove "$TARGET" ;;
+  status)    cmd_status "$TARGET" ;;
+  verify)    cmd_verify "$TARGET" ;;
+  update)    cmd_update "$TARGET" ;;
+  preflight) cmd_preflight "$TARGET" ;;
+  repair)    cmd_repair "$TARGET" ;;
+  defer)     cmd_defer "$TARGET" ;;
+  pending)   cmd_pending ;;
+  optout)    cmd_optout "$TARGET" ;;
+  optin)     cmd_optin "$TARGET" ;;
 esac
