@@ -1,0 +1,32 @@
+{
+  "by": "RJ",
+  "generated_ts": 1785869326,
+  "goal": "none",
+  "last_state": "# Heimdall \u2014 STATE (2026-08-03)\n\n## Current phase\n**Gate-integrity remediation, complete.** Worked the agent-doable half of `heimdall-path-to-viral.md`;\nthe work turned into a false-green hunt when the first full test-board run exposed 8 red suites (7 unknown)\nand the pre-push chain was found to be silently no-opping. 66 commits on `main`, **unpushed**. Agent never pushes.\n\n## What's done\nSee `.planning/CHECKPOINT.md` for the annotated list with commit hashes. Headlines:\n- `echo|jq` payload corruption disabled the entire pre-push chain (215/312 hook invocations). Fixed + class-guarded.\n- 5 gates proven vacuous by plant-and-check; secrets gate passed over zero files; all fixed.\n- Install one-liner was dead on both READMEs (wrong digest, then wrong ref). Fixed, verified end-to-end.\n- A live false privacy claim on the marketing site, in 3 places. Fixed and pushed (site repo `243103b`).\n- Single test runner built; all 8 red suites now green; 13 unparsed suites now report counts.\n- D11 funnel built server-side with zero new client egress; D12 posts live; A1 receipt committed.\n\n## What's in progress\n- `bin/heimdall-selfscan` tree-mode blind spot \u2014 staged in `.claude/worktrees/agent-a0e437c9bb4108256`, not landed\n  (agent truncated mid-fix with a known-broken assertion in its own test).\n- Full board re-run writing to `/tmp/board2.log`.\n\n## What's next\nNothing agent-doable of consequence. The remaining launch-plan items are RJ-credentialed:\nsession restart, control-plane redeploy, A1 check 4, A2 recording, push, submissions, posting.\n\n## Blockers\n- Today's hook fixes are inactive until the session restarts (hook config loads at session start).\n- The D11 funnel records nothing until the control plane is redeployed.\n- B6 hero is blocked on A2, which needs a non-empty team wall + `asciinema`/`agg` installed.\n\n## Decisions made\n- **R13**: Agent spawns are UNNAMED by default. `name:` makes a mailbox-resident agent that never returns\n  (measured 0/43 named completed vs 59/66 unnamed).\n- **D11 amended to 5 stages.** The 8-stage version cannot ship without amending a signed constitution-level claim\n  in IDENTITY.md; K-factor's numerator and denominator are both in the free tier, so the rationale survives.\n- **Fail closed everywhere.** An unreachable verifier renders NON_VERIFIED, never OPEN. An empty scan fails loudly.\n- **Allowlist secrets by SHA, never by path** \u2014 a path entry blinds the gate to a future real credential.\n- **Quality gate blocks on a real FAIL verdict only**; absent state warns loudly but proceeds (auto-init would\n  block every fresh clone and train users onto `--no-verify`).\n- **`?src=copy` removed rather than surfaced** \u2014 disclosing it destroys the metric it collects.\n\n## Key files changed\n`hooks/hooks.json` \u00b7 `bin/heimdall` \u00b7 `bin/verify-edits` \u00b7 `bin/edit-tracker.c` \u00b7 `bin/summary-card` \u00b7\n`bin/heimdall-selfscan` \u00b7 `bin/bloat-gate` \u00b7 `bin/heimdall-live-verify` \u00b7 `bin/lib/cp_funnel.py` \u00b7\n`bin/lib/crontab-safe.sh` \u00b7 `deploy/cloud-run/check-public-surface.sh` \u00b7 `evals/oracles/registry.json` \u00b7\n`README.md` \u00b7 `packages/runheimdall/README.md` \u00b7 `test/run-all.sh` + ~30 suites.",
+  "open_cases": [],
+  "recent_commits": [
+    "eb61741 feat(roster): the wall knows everyone on the repo, not just who is beating",
+    "caebaad merge: make three gates report what actually happened",
+    "9c1a217 merge: stop printing \"digest-verify\" where no digest is verified",
+    "f0b823f fix(gates): make three gates report what actually happened",
+    "ee943aa fix(modules): stop printing \"digest-verify\" where no digest is verified",
+    "98364a3 feat(roster): salvage repo-roster data layer (module + suite + fixture)",
+    "a6f524c merge: name the binding constraint, and stop the codec seam misreporting itself",
+    "9744d1d docs(headroom): name the BINDING constraint on the storage-codec half",
+    "b9640cb docs(analysis): finish line-number citation corrections",
+    "167e36a docs(analysis): correct two line-number citations in the red-team audit",
+    "10cea10 docs(analysis): HN red-team pre-launch audit \u2014 13 findings, 7 must-fix",
+    "e53feaa fix(memory-codec): register_backend(\"headroom\") was a silent no-op",
+    "d48b307 docs(analysis): HN red-team interim findings",
+    "b4c5223 docs(analysis): start HN red-team audit",
+    "30a8073 heimdall: session-end checkpoint (1 files)",
+    "deeba30 merge: isolate headroom-module from the machine's install state",
+    "9cad9a9 merge: show away teammates as offline instead of erasing them",
+    "98497d0 test(headroom): isolate the suite from the machine's install state",
+    "11692a2 fix(wall): keep /roster-team online-only; document the 7-day window",
+    "3bf6ebb feat(wall): render away teammates as UNMISTAKABLY offline"
+  ],
+  "repo": "randomittin/heimdall",
+  "schema": "hmd-context/worklog@1",
+  "summary": "Auto-checkpoint \u2014 2026-08-04T17:59:08Z"
+}
