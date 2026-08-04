@@ -8,43 +8,35 @@
 # It snapshots the week's metrics BEFORE adopting Headroom and AFTER a week of
 # use, then renders the comparison and computes a PRE-REGISTERED verdict.
 #
-# DEPEND, DON'T CLONE (spec §6). This harness does NOT install, bundle, vendor or
+# DEPEND, DON'T CLONE. This harness does NOT install, bundle, vendor or
 # auto-install Headroom, and does NOT wrap anything. Headroom need not be present:
 # it reads metrics, and the Headroom-sourced figures (tokens, $) are OPERATOR
 # INPUT read off Headroom's own dashboard. Absent Headroom IS the "before" arm.
 #
-# THE PRE-REGISTERED VERDICT RULE — written BEFORE the data, hashed so a receipt
-# proves it was not edited afterwards (`preregister` prints the rule + rule_hash;
-# every report carries the same hash):
+# THE PRE-REGISTERED RULE lives in `rule_text` below and is hashed, so a receipt
+# proves the rule was not rewritten after the data landed. It is the executable
+# form of the pre-registration published in
+# launch-docs/log-compression-and-gates.md §"Pre-registration". Where the two
+# could disagree, that post is authoritative and this tool is the bug.
 #
-#   If oracle pass-rate OR falsify survival degrades beyond noise
-#       -> `headroom unwrap claude`, publish the NEGATIVE receipt.
-#   If neutral-or-better
-#       -> keep, publish the POSITIVE receipt.
+# FOUR PRE-REGISTERED OUTCOMES — all four are publishable:
+#   1. falsify survival is CATEGORICAL. A mutant surviving in arm B that dies in
+#      arm A is a hard stop with NO confidence interval attached. `bin/falsify
+#      <domain> --assert-score 1.0` reports PASS only when every mutant dies, so a
+#      survivor is not a bad score — it is a broken gate, and a safety finding.
+#   2. oracle pass-rate is STATISTICAL. Wilson score 95% interval per arm; the
+#      arm B minus arm A difference gets a PAIRED BOOTSTRAP over tasks, 10,000
+#      resamples, reported as a 95% interval. Degradation is declared only when
+#      that interval lies ENTIRELY BELOW ZERO.
+#   3. retry-count and time-to-green are LABELLED COST, never merged into a
+#      correctness claim. They are reported and can never move the verdict.
+#   4. UNDERPOWERED IS A RESULT. If the half-width of the pass-rate difference
+#      interval exceeds the pre-committed +/-10pp threshold, the verdict is
+#      `underpowered` — "this run could not tell" — and NEVER `keep`. An
+#      underpowered null reported as "no degradation found" is the most common way
+#      an honest A/B turns into an advertisement, and this tool refuses to do it.
 #
-# Both outcomes are publishable. A negative receipt is worth as much as a positive
-# one, and this tool renders it with equal confidence — it names the verdict and
-# the exact action, never a hedge.
-#
-# HOW "BEYOND NOISE" IS DETERMINED — stated plainly, never manufactured:
-#   The two verdict metrics are DETERMINISTIC gate outcomes. Re-running bin/falsify
-#   over an unchanged tree yields a byte-identical result: a mutant either survives
-#   or it does not. There is no sampling process, therefore no sampling noise, so
-#   the defensible noise band is EXACTLY ZERO and any degradation is real. That is
-#   why this tool prints NO confidence interval on the verdict metrics — a CI over
-#   a deterministic measurement would be theatre.
-#   The residual uncertainty is a CONFOUND, not noise: the tree changes between the
-#   two arms, so a drop could be Headroom or could be that week's commits. A
-#   one-week n cannot separate them, and the report SAYS SO rather than dressing
-#   the ambiguity in a fabricated interval.
-#   The non-deterministic metrics (time-to-green, agent deaths) DO carry sampling
-#   noise. They never drive the verdict, and when n is below MIN_N_FOR_INTERVAL
-#   the report refuses to print an interval and says the sample is too small.
-#
-# LABELLING CONVENTION — adopted from Headroom's own methodology, which labels
-# estimated-vs-measured numbers and always attaches a CI + explicit label to any
-# counterfactual figure. Credit to Headroom for the convention. Here EVERY figure
-# carries exactly one provenance label:
+# LABELLING CONVENTION — every figure carries exactly one provenance label:
 #   measured     — read from a real signal in this repo (or run now, deterministically)
 #   estimated    — derived by a stated estimator; ALWAYS carries its interval
 #   unavailable  — no data. Rendered as `unavailable`, NEVER as 0. A 0 meaning "no
@@ -63,7 +55,8 @@
 #   heimdall-headroom-ab preregister                 Print the verdict rule + rule_hash
 #   heimdall-headroom-ab snapshot --arm before|after [opts]
 #   heimdall-headroom-ab report  --before <f> --after <f>
-#   heimdall-headroom-ab verdict --before <f> --after <f>   keep|unwrap|indeterminate
+#   heimdall-headroom-ab verdict --before <f> --after <f>   keep|unwrap|underpowered|indeterminate
+#   heimdall-headroom-ab stats   --before <f> --after <f>   the raw statistics JSON
 #   heimdall-headroom-ab -h|--help
 #
 # snapshot options:
@@ -84,7 +77,6 @@ if command -v readlink >/dev/null 2>&1; then
   SELF="$(readlink -f "$0" 2>/dev/null || readlink "$0" 2>/dev/null || echo "$0")"
 fi
 BIN_DIR="$(cd "$(dirname "$SELF")" && pwd)"
-PLUGIN_DIR="$(cd "$BIN_DIR/.." && pwd)"
 FALSIFY="$BIN_DIR/falsify"
 AGENTS="$BIN_DIR/heimdall-agents"
 
@@ -97,41 +89,72 @@ fi
 B='\033[1m'; R='\033[0m'
 
 command -v jq >/dev/null 2>&1 || { printf "error: jq is required\n" >&2; exit 2; }
+command -v python3 >/dev/null 2>&1 \
+  || { printf "error: python3 is required (Wilson + paired bootstrap)\n" >&2; exit 2; }
 
-usage() { sed -n '2,80p' "$SELF" | sed 's/^# \{0,1\}//'; }
+# Prints the header block as help. Walks comment lines until the first line of
+# code, so adding or removing header lines can never desync the help text from
+# the file (a fixed `sed -n '2,80p'` range silently truncates the moment it does).
+usage() { awk 'NR>1 && /^#/ { sub(/^# ?/, ""); print; next } NR>1 && !/^#/ { exit }' "$SELF"; }
 
-# Below this n, the report REFUSES to print an interval and says the sample is
-# too small, rather than manufacturing significance on a one-week sample.
+# Below this n, an ESTIMATED context metric refuses to print an interval and says
+# the sample is too small rather than manufacturing significance.
 MIN_N_FOR_INTERVAL=20
 
 # ── THE PRE-REGISTERED RULE ───────────────────────────────────────────────────
-# Canonical text. Hashed to prove the rule predates the data. Changing ONE byte
+# Canonical text, hashed to prove the rule predates the data. Changing ONE byte
 # changes rule_hash, so a receipt whose hash differs from the pre-registration is
 # self-evidently a rule rewritten after seeing a disappointing result.
 rule_text() {
   cat <<'RULE'
-PRE-REGISTERED VERDICT RULE (Headroom one-week A/B) v1
+PRE-REGISTERED VERDICT RULE (Headroom one-week A/B) v2
+Executable form of launch-docs/log-compression-and-gates.md §"Pre-registration".
+That post is authoritative; where this rule and the post disagree, this is a bug.
+
 Decision metrics (and ONLY these two):
-  1. oracle pass-rate  — fraction of oracle domains whose golden check passes.
-                         Higher is better. Degraded iff after < before.
-  2. falsify survival  — fraction of mutants that SURVIVE the gate.
-                         Lower is better. Degraded iff after > before.
-Verdict:
-  If either decision metric degrades beyond noise -> UNWRAP:
-     run `headroom unwrap claude` and publish the NEGATIVE receipt.
-  If neither degrades (neutral-or-better)        -> KEEP:
-     keep the wrapper and publish the POSITIVE receipt.
-  If either decision metric is unavailable in either arm -> INDETERMINATE:
-     publish neither verdict. An absent measurement is NOT evidence of success
+  1. falsify survival — CATEGORICAL, never statistical.
+     A mutant that survives in arm B and dies in arm A is a hard stop. No
+     confidence interval is attached to a gate that failed to kill something it
+     is contractually required to kill (`bin/falsify <domain> --assert-score 1.0`
+     reports PASS only when every mutant dies). One such survivor and the finding
+     is "compression broke the gate": a safety finding, not a performance one.
+     The decision is on the SURVIVOR COUNT, not on a rate.
+  2. oracle pass-rate — STATISTICAL.
+     Per-arm rates carry a Wilson score 95% interval. The arm B minus arm A
+     difference carries a PAIRED BOOTSTRAP over tasks, 10,000 resamples, fixed
+     seed so a receipt reproduces, reported as a 95% interval. Degradation is
+     declared ONLY when that interval lies ENTIRELY BELOW ZERO.
+     Pairing is by task: a task that ran in only one arm is EXCLUDED and the
+     exclusion is counted and reported.
+     Degenerate-bootstrap guard, fixed here in advance: when there are ZERO
+     discordant pairs the resampled interval collapses to zero width, which is an
+     artefact of the resampling and not evidence of precision. In that case the
+     interval is widened to the rule-of-three bound (+/- 3/n) and labelled as
+     such, so a run with no disagreement can never masquerade as a precise null.
+
+Verdict, resolved in this order:
+  a. A decision metric unavailable in either arm       -> INDETERMINATE.
+     Publish neither receipt. An absent measurement is NOT evidence of success
      and must never resolve to KEEP by default.
-Noise band:
-  Both decision metrics are deterministic gate outcomes with no sampling process,
-  so the noise band is exactly zero and any degradation counts. No confidence
-  interval is computed for them; the residual uncertainty is a confound (the tree
-  changed between arms), which a one-week sample cannot separate, and the report
-  states this rather than manufacturing significance.
-Non-decision metrics (tokens, cost, time-to-green, agent deaths, gate retries)
-are reported for context and NEVER alter the verdict.
+  b. Falsify survivors increased in arm B              -> UNWRAP (categorical).
+  c. Pass-rate difference interval entirely below zero -> UNWRAP (statistical).
+     Run `headroom unwrap claude` and publish the NEGATIVE receipt.
+  d. Interval half-width greater than 10 percentage    -> UNDERPOWERED.
+     points (the pre-committed power threshold)           "This run could not
+     tell." Publish the underpowered result AS the finding. Never report an
+     underpowered null as "no degradation found".
+  e. Otherwise                                         -> KEEP.
+     Neutral-or-better AND adequately powered. Keep the wrapper, publish the
+     POSITIVE receipt.
+
+A favourable result is held to the same standard: if gate outcomes IMPROVE in
+arm B it gets the same interval, the same label and the same power check.
+
+Non-decision metrics — gate retry-count, time-to-green, tokens, cost, agent
+deaths — are LABELLED COST. They are reported for context and can NEVER alter
+the verdict, and are never merged into a correctness claim. Time-to-green in
+arm B carries the proxy's own latency, which is a real cost but not evidence
+about the code.
 RULE
 }
 
@@ -145,47 +168,71 @@ rule_hash() {
   fi
 }
 
-# ── Measurement: oracle pass-rate + falsify survival (both deterministic) ─────
+# ── Measurement: oracle pass-rate + falsify survival ──────────────────────────
 # Runs bin/falsify over every oracle domain that ships mutant fixtures.
 #   golden passes  <=> the SCORE line reads "(golden passing)"
 #   killed/total    <=  "SCORE: k/t"
+# The PER-DOMAIN records are what make the paired design possible: the bootstrap
+# resamples over TASKS, so aggregate counts alone are not enough.
 # A domain whose measurement ERRORS (timeout, missing runner) is counted in
 # `errors` and excluded from both numerators AND denominators — it is a
 # measurement failure, not a gate result, and folding it into either direction
 # would silently move the headline number.
-measure_oracles() {  # repo -> JSON {domains,golden_pass,mutants,survived,errors}
-  local repo="$1" d dom out score k t
+measure_oracles() {  # repo -> JSON {domains,golden_pass,mutants,survived,errors,per_task}
+  local repo="$1" d dom out score k t gp
   local domains=0 golden_pass=0 mut_total=0 mut_killed=0 errors=0
+  local per="[]"
   if [ -x "$FALSIFY" ] && [ -d "$repo/evals/oracles" ]; then
     for d in "$repo/evals/oracles"/*/; do
       [ -d "$d/fixtures/mutants" ] || continue
       dom="$(basename "$d")"
       set +e
       out="$(HEIMDALL_ORACLES_DIR="$repo/evals/oracles" \
-             perl -e 'alarm 180; exec @ARGV' -- "$FALSIFY" "$dom" 2>&1)"
+             perl -e 'alarm 300; exec @ARGV' -- "$FALSIFY" "$dom" 2>&1)"
       set -e
       score="$(printf '%s' "$out" | sed -n 's/^SCORE:[[:space:]]*\([0-9][0-9]*\/[0-9][0-9]*\).*/\1/p' | head -1)"
       if [ -z "$score" ]; then errors=$((errors + 1)); continue; fi
       domains=$((domains + 1))
       k="${score%%/*}"; t="${score##*/}"
+      gp=0
       if printf '%s' "$out" | grep -q '(golden passing)'; then
+        gp=1
         golden_pass=$((golden_pass + 1))
         # Mutant counts are only meaningful when the golden precondition held;
         # falsify emits 0/0 otherwise, which would fake a perfect survival rate.
         mut_total=$((mut_total + t)); mut_killed=$((mut_killed + k))
       fi
+      per="$(printf '%s' "$per" | jq -c \
+        --arg dom "$dom" --argjson gp "$gp" --argjson t "$t" --argjson k "$k" \
+        '. + [{domain:$dom, golden_pass:$gp,
+               mutants:(if $gp==1 then $t else 0 end),
+               survived:(if $gp==1 then ($t-$k) else 0 end)}]')"
     done
   fi
   jq -cn --argjson dm "$domains" --argjson gp "$golden_pass" \
          --argjson mt "$mut_total" --argjson mk "$mut_killed" --argjson er "$errors" \
-    '{domains:$dm, golden_pass:$gp, mutants:$mt, survived:($mt-$mk), errors:$er}'
+         --argjson per "$per" \
+    '{domains:$dm, golden_pass:$gp, mutants:$mt, survived:($mt-$mk), errors:$er, per_task:$per}'
 }
 
 # ── Measurement: agent deaths (truncation / API-error fatalities) ─────────────
 # bin/heimdall-agents classifies real Claude Code subagent transcripts as
-# failed|killed|done|live|working|stale. failed+killed inside the window = deaths.
-# CRITICAL: an EMPTY tracker list means the tracker is BLIND to this project (no
-# transcripts resolved), which is `unavailable` — NOT a measured zero. A populated
+# failed|killed|done|live|working|mailbox|stale. failed+killed in window = deaths.
+#
+# WHY THE TRACKER AND NOT A GLOB OVER THE TASK DIR: a task dir holds one
+# `<id>.output` per BACKGROUND TASK, and background *Bash* commands land there
+# next to agent spawns. Bash task ids are `b…` plain files; agent ids are `a…`
+# symlinks to a transcript. Counting `*.output` therefore counts shell commands
+# as if they were agents — measured on this repo it over-counted 58 against the
+# tracker's 44, and every one of the extra entries was a background shell
+# command, which cannot die of truncation because it is not an agent. The tracker
+# resolves transcripts, so it is the correct source and the glob is not.
+#
+# SCOPE CAVEAT, recorded in the snapshot so a receipt cannot hide it: the tracker
+# enumerates the CURRENT session's task dir and subagents dir, keyed off the
+# project slug derived from the working directory. Run from a git worktree it
+# resolves a different slug and sees nothing. That is why an EMPTY list is
+# `unavailable` (the tracker is BLIND here) and not a measured zero — a populated
 # list with no failures IS a measured zero. Collapsing those two would be the
 # exact ambiguity this harness exists to prevent.
 measure_agent_deaths() {  # repo window_days -> JSON {value,provenance,n,reason}
@@ -205,14 +252,15 @@ measure_agent_deaths() {  # repo window_days -> JSON {value,provenance,n,reason}
   total="$(printf '%s' "$js" | jq -r 'length')"
   if [ "$total" -eq 0 ]; then
     jq -cn '{value:null, provenance:"unavailable", n:0,
-             reason:"agent tracker resolved no transcripts for this project — blind, not zero"}'
+             reason:"agent tracker resolved no transcripts for this working directory — blind, not zero (the project slug follows cwd, so a worktree resolves a different slug)"}'
     return 0
   fi
   deaths="$(printf '%s' "$js" | jq -r --argjson cut "$cutoff" \
     '[ .[] | select((.state=="failed" or .state=="killed") and (.age_secs <= $cut)) ] | length')"
   jq -cn --argjson v "$deaths" --argjson n "$total" \
     '{value:$v, provenance:"measured", n:$n,
-      source:"bin/heimdall-agents list --json (state failed|killed within window)"}'
+      source:"bin/heimdall-agents list --json (state failed|killed within window)",
+      scope:"current session + working-directory project slug, NOT the repo whole-history count"}'
 }
 
 # ── Measurement: gate retries ─────────────────────────────────────────────────
@@ -238,7 +286,8 @@ measure_gate_retries() {  # repo window_days -> JSON
     jq -cn '{value:null, provenance:"unavailable", reason:"gate-runs.jsonl unparseable"}'
     return 0
   fi
-  jq -cn --argjson v "$n" '{value:$v, provenance:"measured", source:".heimdall/gate-runs.jsonl deny records in window"}'
+  jq -cn --argjson v "$n" \
+    '{value:$v, provenance:"measured", source:".heimdall/gate-runs.jsonl deny records in window"}'
 }
 
 # ── Estimation: time-to-green ─────────────────────────────────────────────────
@@ -304,7 +353,7 @@ headroom_metric() {  # value label -> JSON
   if [ -z "$v" ]; then
     jq -cn --arg l "$label" \
       '{value:null, provenance:"unavailable",
-        reason:"not supplied — read \($l) off Headroom'"'"'s dashboard and pass it in"}'
+        reason:"not supplied — read \($l) off Headroom dashboard and pass it in"}'
   else
     jq -cn --argjson v "$v" --arg l "$label" \
       '{value:$v, provenance:"measured", source:"Headroom dashboard (operator-supplied)"}'
@@ -313,7 +362,7 @@ headroom_metric() {  # value label -> JSON
 
 # ── snapshot ──────────────────────────────────────────────────────────────────
 cmd_snapshot() {
-  local arm="" repo="" out="" days=7 tin="" tout="" cost="" hjson=""
+  local arm="" repo="" out="" days=7 tin="" tout="" cost="" hjson="" n
   while [ $# -gt 0 ]; do
     case "$1" in
       --arm)           arm="${2:?--arm needs before|after}"; shift 2 ;;
@@ -372,8 +421,9 @@ cmd_snapshot() {
     --argjson cost "$(headroom_metric "$cost" "spend in USD")" '
     # A denominator of zero cannot produce a rate — that is unavailable, not 0.0.
     def rate($num; $den): if $den == 0 then null else (($num / $den) * 10000 | round) / 10000 end;
-    { schema:"heimdall-headroom-ab/v1", arm:$arm, ts:$ts, repo:$repo,
+    { schema:"heimdall-headroom-ab/v2", arm:$arm, ts:$ts, repo:$repo,
       window_days:$days, rule_hash:$rh,
+      per_task: $orc.per_task,
       metrics: {
         oracle_pass_rate: (
           if $orc.domains == 0
@@ -381,14 +431,14 @@ cmd_snapshot() {
                 reason:"no oracle domain with mutant fixtures could be measured"}
           else {value: rate($orc.golden_pass; $orc.domains), provenance:"measured",
                 n:$orc.domains, passed:$orc.golden_pass, errors:$orc.errors,
-                source:"bin/falsify golden check per oracle domain (deterministic)"} end),
+                source:"bin/falsify golden check per oracle domain"} end),
         falsify_survival: (
           if $orc.mutants == 0
           then {value:null, provenance:"unavailable", n:0,
                 reason:"no mutant ran under a passing golden — no survival rate exists"}
           else {value: rate($orc.survived; $orc.mutants), provenance:"measured",
                 n:$orc.mutants, survived:$orc.survived, errors:$orc.errors,
-                source:"bin/falsify mutant sweep, survived/total (deterministic)"} end),
+                source:"bin/falsify mutant sweep, survived/total (denominator matches falsify own SCORE line, guards included)"} end),
         agent_deaths: $deaths,
         gate_retries: $retries,
         time_to_green_mins: $ttg,
@@ -402,31 +452,181 @@ cmd_snapshot() {
   fi
 }
 
-# ── verdict engine — the SINGLE source of truth for report + verdict ──────────
-# Mechanically applies the pre-registered rule. Nothing here is arguable at
-# render time: the verdict is computed from the two decision metrics only.
-compute_verdict() {  # before.json after.json -> JSON {verdict,reasons[],...}
-  jq -n --slurpfile b "$1" --slurpfile a "$2" '
-    ($b[0].metrics) as $B | ($a[0].metrics) as $A
-    | ($B.oracle_pass_rate.value) as $bo | ($A.oracle_pass_rate.value) as $ao
-    | ($B.falsify_survival.value) as $bf | ($A.falsify_survival.value) as $af
-    | (($bo == null) or ($ao == null) or ($bf == null) or ($af == null)) as $missing
-    # Deterministic metrics -> zero noise band -> any degradation counts.
-    | (($missing | not) and ($ao < $bo)) as $oracle_down
-    | (($missing | not) and ($af > $bf)) as $falsify_down
-    | { verdict: (if $missing then "indeterminate"
-                  elif ($oracle_down or $falsify_down) then "unwrap"
-                  else "keep" end),
-        oracle_degraded: $oracle_down, falsify_degraded: $falsify_down,
-        oracle: {before:$bo, after:$ao, delta: (if $missing then null else ($ao - $bo) end)},
-        falsify: {before:$bf, after:$af, delta: (if $missing then null else ($af - $bf) end)},
-        reasons: ( [ if $missing then
-                       "a decision metric is unavailable in at least one arm — an absent measurement is not evidence of success"
-                     else empty end,
-                     if $oracle_down then "oracle pass-rate degraded: \($bo) -> \($ao)" else empty end,
-                     if $falsify_down then "falsify survival worsened (more mutants survived): \($bf) -> \($af)" else empty end,
-                     if (($missing|not) and ($oracle_down|not) and ($falsify_down|not))
-                       then "neither decision metric degraded (neutral-or-better)" else empty end ] ) }'
+# ── the statistics: Wilson per arm, paired bootstrap on the difference ────────
+# Deterministic: the bootstrap RNG is seeded with a fixed constant recorded in the
+# output, so re-running over the same two snapshots reproduces every digit. A
+# receipt whose numbers move between runs is not a receipt.
+stats_py() {
+  cat <<'PY'
+import json, math, random, sys
+
+Z = 1.959963984540054      # two-sided 95%
+BOOT = 10000               # pre-registered resample count
+SEED = 20260804            # fixed => reproducible receipt
+POWER_HALFWIDTH = 0.10     # pre-registered +/- 10 percentage points
+
+
+def wilson(k, n):
+    """Wilson score interval — the pre-registered per-arm interval."""
+    if n <= 0:
+        return None
+    p = k / n
+    d = 1.0 + Z * Z / n
+    centre = (p + Z * Z / (2 * n)) / d
+    half = Z * math.sqrt(p * (1 - p) / n + Z * Z / (4 * n * n)) / d
+    return {"lo": max(0.0, centre - half), "hi": min(1.0, centre + half),
+            "kind": "Wilson 95%"}
+
+
+def percentile(sorted_vals, q):
+    n = len(sorted_vals)
+    idx = int(math.floor(q * (n - 1)))
+    return sorted_vals[max(0, min(n - 1, idx))]
+
+
+def load(path):
+    with open(path) as fh:
+        return json.load(fh)
+
+
+def main():
+    before, after = load(sys.argv[1]), load(sys.argv[2])
+    bt = {d["domain"]: d for d in (before.get("per_task") or [])}
+    at = {d["domain"]: d for d in (after.get("per_task") or [])}
+
+    shared = sorted(set(bt) & set(at))
+    excluded = sorted(set(bt) ^ set(at))
+
+    out = {
+        "seed": SEED, "resamples": BOOT,
+        "power_halfwidth_threshold": POWER_HALFWIDTH,
+        "paired_tasks": len(shared),
+        "excluded_tasks": excluded,
+        "excluded_count": len(excluded),
+    }
+
+    if not shared:
+        out["verdict"] = "indeterminate"
+        out["reasons"] = [
+            "no task ran in BOTH arms — a paired design needs paired tasks, and "
+            "an absent measurement is not evidence of success"]
+        print(json.dumps(out))
+        return
+
+    b_pass = [bt[d]["golden_pass"] for d in shared]
+    a_pass = [at[d]["golden_pass"] for d in shared]
+    n = len(shared)
+
+    kb, ka = sum(b_pass), sum(a_pass)
+    out["oracle"] = {
+        "before": {"passed": kb, "n": n, "rate": kb / n, "interval": wilson(kb, n)},
+        "after": {"passed": ka, "n": n, "rate": ka / n, "interval": wilson(ka, n)},
+    }
+
+    # Paired difference, arm B (after) minus arm A (before), resampled over TASKS.
+    diffs = [a - b for a, b in zip(a_pass, b_pass)]
+    observed = sum(diffs) / n
+    discordant = sum(1 for d in diffs if d != 0)
+
+    rnd = random.Random(SEED)
+    resampled = []
+    for _ in range(BOOT):
+        total = 0
+        for _ in range(n):
+            total += diffs[rnd.randrange(n)]
+        resampled.append(total / n)
+    resampled.sort()
+    lo, hi = percentile(resampled, 0.025), percentile(resampled, 0.975)
+
+    degenerate = discordant == 0
+    if degenerate:
+        # Zero discordant pairs => every resample is identical => a zero-width
+        # interval that reflects the resampling, not the evidence. The rule-of-
+        # three bound is the pre-registered replacement.
+        bound = 3.0 / n
+        lo, hi = -bound, bound
+        kind = ("rule-of-three (+/- 3/n): zero discordant pairs, so the paired "
+                "bootstrap is degenerate and its zero-width interval would be an "
+                "artefact, not precision")
+    else:
+        kind = "paired bootstrap 95%% (%d resamples over tasks, seed %d)" % (BOOT, SEED)
+
+    half_width = (hi - lo) / 2.0
+    degraded = hi < 0                      # interval ENTIRELY below zero
+    underpowered = half_width > POWER_HALFWIDTH
+
+    out["oracle"]["difference"] = {
+        "observed": observed, "lo": lo, "hi": hi, "kind": kind,
+        "half_width": half_width, "discordant_pairs": discordant,
+        "degenerate_bootstrap": degenerate,
+    }
+    out["power"] = {
+        "half_width": half_width, "threshold": POWER_HALFWIDTH,
+        "underpowered": underpowered,
+    }
+
+    # Falsify survival — CATEGORICAL. Decided on the survivor COUNT.
+    sb = sum(bt[d]["survived"] for d in shared)
+    sa = sum(at[d]["survived"] for d in shared)
+    worsened = [d for d in shared if at[d]["survived"] > bt[d]["survived"]]
+    categorical_stop = sa > sb
+    out["falsify"] = {
+        "survivors_before": sb, "survivors_after": sa,
+        "domains_worsened": worsened, "categorical_stop": categorical_stop,
+        "mutants_before": sum(bt[d]["mutants"] for d in shared),
+        "mutants_after": sum(at[d]["mutants"] for d in shared),
+    }
+
+    reasons = []
+    if categorical_stop:
+        verdict = "unwrap"
+        reasons.append(
+            "CATEGORICAL STOP: falsify survivors rose %d -> %d (%s). A mutant that "
+            "survives in arm B and dies in arm A is a broken gate, not a bad score. "
+            "No confidence interval applies."
+            % (sb, sa, ", ".join(worsened) or "aggregate"))
+    elif degraded:
+        verdict = "unwrap"
+        reasons.append(
+            "oracle pass-rate degraded: the B-A difference interval "
+            "[%.3f, %.3f] lies entirely below zero" % (lo, hi))
+    elif underpowered:
+        verdict = "underpowered"
+        reasons.append(
+            "UNDERPOWERED: the pass-rate difference interval half-width is %.1fpp, "
+            "wider than the pre-committed +/-%.0fpp threshold. This run could not "
+            "tell. Reporting that as a clean null is exactly how an honest A/B "
+            "becomes an advertisement."
+            % (half_width * 100, POWER_HALFWIDTH * 100))
+        if degenerate:
+            reasons.append(
+                "the %d paired tasks produced zero discordant pairs, so the "
+                "interval is the rule-of-three bound rather than a zero-width "
+                "bootstrap artefact" % n)
+    else:
+        verdict = "keep"
+        reasons.append(
+            "neither decision metric degraded and the run is adequately powered: "
+            "difference interval [%.3f, %.3f], half-width %.1fpp within the "
+            "+/-%.0fpp threshold"
+            % (lo, hi, half_width * 100, POWER_HALFWIDTH * 100))
+
+    if excluded:
+        reasons.append(
+            "%d task(s) ran in only one arm and were EXCLUDED from the paired "
+            "analysis: %s" % (len(excluded), ", ".join(excluded)))
+
+    out["verdict"] = verdict
+    out["reasons"] = reasons
+    print(json.dumps(out))
+
+
+main()
+PY
+}
+
+compute_stats() {  # before.json after.json -> stats JSON
+  stats_py | python3 - "$1" "$2"
 }
 
 require_snap() {  # path
@@ -492,9 +692,9 @@ render_row() {  # key label unit better(higher|lower) pct(0|1)
 
 cmd_report() {
   parse_ba "$@"
-  local vj verdict rh_live rh_b rh_a
-  vj="$(compute_verdict "$BEFORE_F" "$AFTER_F")"
-  verdict="$(printf '%s' "$vj" | jq -r '.verdict')"
+  local sj verdict rh_live rh_b rh_a underp reasons
+  sj="$(compute_stats "$BEFORE_F" "$AFTER_F")"
+  verdict="$(printf '%s' "$sj" | jq -r '.verdict')"
   # The report states the rule it ACTUALLY graded by (the live rule this binary
   # applies), not whatever an arm happens to have recorded — otherwise an arm
   # missing a hash would hide the grading rule behind "unknown". Each arm's
@@ -507,26 +707,25 @@ cmd_report() {
   printf "\n"
   printf "  ${P}${B}░▒▓█${R} ${C}${B}H E I M D A L L   ×   H E A D R O O M   A / B${R} ${P}${B}█▓▒░${R}\n"
   printf "  ${V}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${R}\n"
-  printf "  ${D}before: %s${R}\n" "$(jq -r '"\(.ts)  \(.repo)  window \(.window_days)d"' "$BEFORE_F")"
-  printf "  ${D}after : %s${R}\n\n" "$(jq -r '"\(.ts)  \(.repo)  window \(.window_days)d"' "$AFTER_F")"
+  printf "  ${D}arm A (before): %s${R}\n" "$(jq -r '"\(.ts)  \(.repo)  window \(.window_days)d"' "$BEFORE_F")"
+  printf "  ${D}arm B (after ): %s${R}\n\n" "$(jq -r '"\(.ts)  \(.repo)  window \(.window_days)d"' "$AFTER_F")"
 
-  printf "  %-22s %14s  %14s  %12s  %s\n" "METRIC" "BEFORE" "AFTER" "DELTA" "PROVENANCE"
+  printf "  %-22s %14s  %14s  %12s  %s\n" "METRIC" "ARM A" "ARM B" "DELTA" "PROVENANCE"
   printf "  %-22s %14s  %14s  %12s  %s\n" \
     "----------------------" "--------------" "--------------" "------------" "----------"
 
   printf "  ${B}decision metrics${R} ${D}(these and only these compute the verdict)${R}\n"
   render_row oracle_pass_rate   "oracle pass-rate"   ""      higher 1
   render_row falsify_survival   "falsify survival"   ""      lower  1
-  printf "\n  ${B}context metrics${R} ${D}(reported, never verdict-altering)${R}\n"
-  render_row agent_deaths       "agent deaths"       ""      lower  0
+  printf "\n  ${B}labelled cost${R} ${D}(reported, NEVER merged into a correctness claim)${R}\n"
   render_row gate_retries       "gate retries"       ""      lower  0
   render_row time_to_green_mins "time-to-green"      " min"  lower  0
+  render_row agent_deaths       "agent deaths"       ""      lower  0
   render_row tokens_in          "tokens in"          ""      lower  0
   render_row tokens_out         "tokens out"         ""      lower  0
   render_row cost_usd           "cost (USD)"         ""      lower  0
 
   # Reasons a figure is absent — printed so `unavailable` is never a shrug.
-  local reasons
   reasons="$(jq -r '.metrics | to_entries[]
               | select(.value.provenance == "unavailable")
               | "    \(.key): \(.value.reason // "no reason recorded")"' "$AFTER_F" 2>/dev/null || true)"
@@ -535,26 +734,50 @@ cmd_report() {
     printf '%s\n' "$reasons" | while IFS= read -r l; do printf "  ${D}%s${R}\n" "$l"; done
   fi
 
-  # How "beyond noise" was determined — stated plainly, every run.
-  printf "\n  ${B}how \"beyond noise\" was determined${R}\n"
-  printf "  ${D}    The two decision metrics are DETERMINISTIC gate outcomes — re-running${R}\n"
-  printf "  ${D}    bin/falsify on an unchanged tree reproduces them exactly. With no sampling${R}\n"
-  printf "  ${D}    process there is no sampling noise, so the noise band is exactly zero and${R}\n"
-  printf "  ${D}    ANY degradation counts. No CI is printed for them: a confidence interval${R}\n"
-  printf "  ${D}    over a deterministic measurement would be theatre.${R}\n"
-  printf "  ${D}    Residual uncertainty is a CONFOUND, not noise — the tree changed between${R}\n"
-  printf "  ${D}    arms, and a one-week n cannot separate Headroom from that week's commits.${R}\n"
-  printf "  ${D}    Context metrics that DO carry sampling noise print an interval only at${R}\n"
-  printf "  ${D}    n>=%s; below that the report refuses to manufacture significance.${R}\n" "$MIN_N_FOR_INTERVAL"
+  # ── the statistics, exactly as pre-registered ───────────────────────────────
+  printf "\n  ${B}oracle pass-rate — STATISTICAL${R} ${D}(Wilson per arm, paired bootstrap on the difference)${R}\n"
+  if printf '%s' "$sj" | jq -e '.oracle' >/dev/null 2>&1; then
+    printf '%s' "$sj" | jq -r '
+      "    arm A: \(.oracle.before.passed)/\(.oracle.before.n) = \((.oracle.before.rate*1000|round)/10)%  [\(.oracle.before.interval.kind) \((.oracle.before.interval.lo*1000|round)/10)–\((.oracle.before.interval.hi*1000|round)/10)%]",
+      "    arm B: \(.oracle.after.passed)/\(.oracle.after.n) = \((.oracle.after.rate*1000|round)/10)%  [\(.oracle.after.interval.kind) \((.oracle.after.interval.lo*1000|round)/10)–\((.oracle.after.interval.hi*1000|round)/10)%]",
+      "    B − A: \((.oracle.difference.observed*1000|round)/10)pp   95% interval [\((.oracle.difference.lo*1000|round)/10), \((.oracle.difference.hi*1000|round)/10)]pp",
+      "           \(.oracle.difference.kind)",
+      "           discordant pairs: \(.oracle.difference.discordant_pairs) of \(.paired_tasks)"
+    ' | while IFS= read -r l; do printf "  ${D}%s${R}\n" "$l"; done
+
+    printf "\n  ${B}power check${R} ${D}(pre-committed ±10pp threshold — underpowered is a RESULT)${R}\n"
+    underp="$(printf '%s' "$sj" | jq -r '.power.underpowered')"
+    if [ "$underp" = "true" ]; then
+      printf '%s' "$sj" | jq -r '"    half-width \((.power.half_width*1000|round)/10)pp > threshold \((.power.threshold*1000|round)/10)pp → UNDERPOWERED"' \
+        | while IFS= read -r l; do printf "  ${W}%s${R}\n" "$l"; done
+    else
+      printf '%s' "$sj" | jq -r '"    half-width \((.power.half_width*1000|round)/10)pp ≤ threshold \((.power.threshold*1000|round)/10)pp → conclusive"' \
+        | while IFS= read -r l; do printf "  ${G}%s${R}\n" "$l"; done
+    fi
+  else
+    printf "  ${W}    no paired tasks — the statistics could not be computed${R}\n"
+  fi
+
+  printf "\n  ${B}falsify survival — CATEGORICAL${R} ${D}(no CI: --assert-score 1.0 semantics)${R}\n"
+  if printf '%s' "$sj" | jq -e '.falsify' >/dev/null 2>&1; then
+    printf '%s' "$sj" | jq -r '
+      "    survivors  arm A: \(.falsify.survivors_before) of \(.falsify.mutants_before) mutants    arm B: \(.falsify.survivors_after) of \(.falsify.mutants_after)",
+      "    a survivor in arm B that dies in arm A is a HARD STOP — a safety finding, not a score"
+    ' | while IFS= read -r l; do printf "  ${D}%s${R}\n" "$l"; done
+  fi
+
+  printf "\n  ${B}pairing${R}\n"
+  printf '%s' "$sj" | jq -r '"    paired tasks: \(.paired_tasks)    excluded (ran in one arm only): \(.excluded_count)"' \
+    | while IFS= read -r l; do printf "  ${D}%s${R}\n" "$l"; done
 
   # ── the verdict ─────────────────────────────────────────────────────────────
   printf "\n  ${V}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${R}\n"
   printf "  ${B}PRE-REGISTERED VERDICT${R}  ${D}rule_hash: %s${R}\n" "$rh_live"
   if [ "$rh_b" != "$rh_live" ] || [ "$rh_a" != "$rh_live" ]; then
-    printf "  ${P}${B}! RULE PROVENANCE${R} ${P}arm hashes (before=%s after=%s) do not both match the${R}\n" "$rh_b" "$rh_a"
+    printf "  ${P}${B}! RULE PROVENANCE${R} ${P}arm hashes (A=%s B=%s) do not both match the${R}\n" "$rh_b" "$rh_a"
     printf "  ${P}  rule applied here (%s) — an arm was registered under a different rule, or none.${R}\n" "$rh_live"
   fi
-  printf '%s\n' "$(printf '%s' "$vj" | jq -r '.reasons[]')" \
+  printf '%s' "$sj" | jq -r '.reasons[]' \
     | while IFS= read -r l; do [ -n "$l" ] && printf "  ${D}· %s${R}\n" "$l"; done
 
   case "$verdict" in
@@ -564,8 +787,13 @@ cmd_report() {
       printf "  ${D}experiment: the pre-registered rule fired exactly as written, before the data${R}\n"
       printf "  ${D}existed. A negative receipt is as publishable as a positive one.${R}\n" ;;
     keep)
-      printf "\n  ${G}${B}VERDICT: KEEP${R} ${G}— neither decision metric degraded (neutral-or-better).${R}\n"
-      printf "  ${G}Keep the wrapper. Publish the POSITIVE receipt.${R}\n" ;;
+      printf "\n  ${G}${B}VERDICT: KEEP${R} ${G}— neither decision metric degraded, and the run is powered${R}\n"
+      printf "  ${G}enough to say so. Keep the wrapper. Publish the POSITIVE receipt.${R}\n" ;;
+    underpowered)
+      printf "\n  ${W}${B}VERDICT: UNDERPOWERED${R} ${W}— this run could not tell.${R}\n"
+      printf "  ${W}Publish the UNDERPOWERED result AS the finding${R} ${D}— not as a null. The interval${R}\n"
+      printf "  ${D}is wider than the pre-committed ±10pp threshold, so declaring the two arms${R}\n"
+      printf "  ${D}equivalent would be an unsupported claim. More paired tasks are needed.${R}\n" ;;
     *)
       printf "\n  ${W}${B}VERDICT: INDETERMINATE${R} ${W}— a decision metric is unavailable in an arm.${R}\n"
       printf "  ${W}Publish NEITHER receipt.${R} ${D}An absent measurement is not evidence of success${R}\n"
@@ -577,7 +805,12 @@ cmd_report() {
 
 cmd_verdict() {
   parse_ba "$@"
-  compute_verdict "$BEFORE_F" "$AFTER_F" | jq -r '.verdict'
+  compute_stats "$BEFORE_F" "$AFTER_F" | jq -r '.verdict'
+}
+
+cmd_stats() {
+  parse_ba "$@"
+  compute_stats "$BEFORE_F" "$AFTER_F" | jq .
 }
 
 # ── dispatch ──────────────────────────────────────────────────────────────────
@@ -596,6 +829,7 @@ case "$1" in
   snapshot)  shift; cmd_snapshot "$@" ;;
   report)    shift; cmd_report   "$@" ;;
   verdict)   shift; cmd_verdict  "$@" ;;
+  stats)     shift; cmd_stats    "$@" ;;
   *) printf "  ${P}x${R} unknown subcommand: ${B}%s${R}\n" "$1" >&2
      printf "  ${D}Run ${C}heimdall-headroom-ab --help${D} for usage.${R}\n" >&2
      exit 2 ;;
