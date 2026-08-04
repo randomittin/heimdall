@@ -215,7 +215,7 @@ done
 # not precede wiring.
 LINE_CONSENT=$(printf '%s\n' "$OUT" | grep -n 'consent'          | head -1 | cut -d: -f1)
 LINE_INSTALL=$(printf '%s\n' "$OUT" | grep -n 'install + digest' | head -1 | cut -d: -f1)
-LINE_WIRE=$(printf '%s\n'    "$OUT" | grep -n '\[5/6\] wire'     | head -1 | cut -d: -f1)
+LINE_WIRE=$(printf '%s\n'    "$OUT" | grep -n '\[6/7\] wire'     | head -1 | cut -d: -f1)
 LINE_INV=$(printf '%s\n'     "$OUT" | grep -n 'class invariants' | head -1 | cut -d: -f1)
 [ -n "$LINE_CONSENT" ] && [ -n "$LINE_INSTALL" ] && [ "$LINE_CONSENT" -lt "$LINE_INSTALL" ] \
   && ok "consent precedes install (nothing is written before the operator agrees)" \
