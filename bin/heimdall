@@ -2207,6 +2207,25 @@ case "${1:-}" in
     fi
     exec "$MODULES_BIN" "$@"
     ;;
+  weekly-log)
+    # Pass-through to heimdall-weekly-log: the weekly "what the watchman learned"
+    # changelog generator (consent + k-anonymity gated, DATA.md §7 — see the
+    # generator's own --help for the full contract). It only ever STAGES drafts
+    # under launch-docs/drafts/ (publish: false) and makes no network call of any
+    # kind — this route adds reachability only, it changes no generator behaviour.
+    # This is the DOCUMENTED entry point, so every flag forwards verbatim
+    # (--since/--until/--k/--out/--repo/--proposals/--stdout/--slice), mirroring
+    # the rules)/modules) arms above: a routed run and a direct bin run are
+    # byte-identical.
+    shift
+    WEEKLY_LOG_BIN="$PLUGIN_DIR/bin/heimdall-weekly-log"
+    if [ ! -x "$WEEKLY_LOG_BIN" ]; then
+      echo "  Error: heimdall-weekly-log not found at $WEEKLY_LOG_BIN" >&2
+      echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+      exit 1
+    fi
+    exec "$WEEKLY_LOG_BIN" "$@"
+    ;;
   wrap|unwrap)
     # §7 Pass-through to heimdall-wrap: ONE command that installs the Layer-0 git
     # hooks, writes the AGENTS.md fenced block, starts presence and launches the
@@ -2619,6 +2638,7 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   echo "  heimdall join <secret>    Join a teammate's team"
   echo "  heimdall connect          Connect a Claude credential for remote jobs"
   echo "  heimdall presence         Control presence (off/on/status/roster)"
+  echo "  heimdall weekly-log       Weekly changelog draft generator (drafts only)"
   echo ""
   echo "heimdall launches Claude Code with:"
   echo "  --dangerously-skip-permissions    full autonomy"
