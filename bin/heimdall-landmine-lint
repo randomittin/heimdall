@@ -155,14 +155,27 @@ is_comment() {
 # from a variable (bash 3.2 requires an UNQUOTED right-hand side for `=~`, and a
 # variable is the portable way to spell that).
 #
-# The `\b`-bearing patterns in scan_unguarded_var are deliberately LEFT on sed:
-# BSD sed's `\b` does not behave as a word boundary here (measured: `s/^.*\bdir=//`
-# leaves `local dir="$1" sub="$dir/.heimdall"` untouched), so rewriting them in a
-# true-word-boundary engine would silently CHANGE which class-2 lines are flagged.
-# A performance fix must not move a verdict; those stay exactly as they are.
+# The `\b`-bearing patterns in scan_unguarded_var were once held back from this treatment on
+# the theory that moving them would change a verdict, because BSD sed's `\b` is NOT a word
+# boundary (measured: `s/^.*\bdir=//` leaves `local dir="$1" sub="$dir/.heimdall"` untouched —
+# BSD reads it as a LITERAL `b`, confirmed by `s/.*\b(local|declare)[[:space:]]+//` turning
+# `blocal dir="$1"` into `dir="$1"`). That premise was backwards. `sed -E` and bash's `=~`
+# BOTH compile through the platform's libc regcomp, so `\b` means the SAME thing to both on
+# any given host — a literal `b` on BSD, a word boundary on glibc. Moving them does not reach
+# a DIFFERENT engine; it reaches the SAME engine without the fork. Equivalence is not argued
+# from that alone, it is MEASURED: old vs new findings are diffed over the whole shipped tree
+# and over a 1106-line corpus of every real `local`/`declare` line in it plus adversarial
+# `b`-adjacency shapes, which is the only way a `\b` change could show up.
+#
+# This block was ~50% of total runtime (35.9s of 71s profiled). It paid ~15 fork/exec PER
+# candidate line — one subshell+sed for the body, one per NAME for `after`, one per name for
+# `deref`, one grep per name, `sort -u`, plus a heredoc temp file per line — and the tree's
+# growth pushed the real-tree scan past the 60s budget the harness enforces.
 _RE_SIGPIPE_HEAD='\|[[:space:]]*head([[:space:]]+-[cn][[:space:]]*[0-9]+)?[[:space:]]*(\)|`|;|$)'
 _RE_SIGPIPE_GUARD='head[^|]*\|\|[[:space:]]*(true|:|echo)'
 _RE_NAME_ASSIGN='[A-Za-z_][A-Za-z0-9_]*='
+# The `local`/`declare` keyword plus any short-flag cluster — the prefix the body sed stripped.
+_RE_LOCAL_KEYWORD='.*\b(local|declare)[[:space:]]+(-[A-Za-z]+[[:space:]]+)*'
 _RE_HOME_LITERAL='/(Users|home)/[A-Za-z][A-Za-z0-9._-]+'
 _RE_BARE_SUPERX='(^|[^A-Za-z0-9._/])/superx([/"'"'"' ]|$)'
 _RE_DQ_STRING='"[^"]*"'
@@ -184,20 +197,28 @@ _RE_RM_DOTHEIMDALL='rm[[:space:]]+-rf[[:space:]].*\$HOME/\.heimdall'
 _RE_SOURCE_VERB='(^|[;&]|then|do|else)[[:space:]]*(source|\.)[[:space:]]+'
 _RE_SOURCE_TARGET='\$(\{)?(PLUGIN_DIR|HEIMDALL_HOME|HOME)|\.heimdall|\$0'
 
-# Delete every match of $2 from $1, leftmost-first, without forking sed. Equivalent
-# to `s/RE//g` for the quote patterns used here: the prefix before a leftmost match
-# provably contains no quote character, so re-scanning from the start after each
-# removal cannot manufacture a match that a left-to-right sed pass would have missed.
-# The result lands in the global STRIPPED rather than on stdout — a `$(…)` capture
-# would fork a subshell per line and reintroduce exactly the cost being removed.
+# Delete every match of $2 from $1 without forking sed — `s/RE//g` semantics exactly.
+# "Exactly" is load-bearing: sed resumes scanning AFTER each match and never re-reads
+# text it has already passed, so the text on either side of a removal is never allowed
+# to join up and form a new match. This walks the string the same way, carrying the
+# already-scanned prefix in `kept`, because class 2 now feeds it a caller-built pattern
+# over arbitrary source rather than only the two quote patterns whose shape used to make
+# a restart-from-the-start loop coincidentally equivalent.
+# $2 must be UNANCHORED: the seek uses the first LITERAL occurrence of the matched text,
+# which is the match position only when an earlier occurrence would itself have matched.
+# The result lands in the global STRIPPED rather than on stdout — a `$(…)` capture would
+# fork a subshell per line and reintroduce exactly the cost being removed.
 STRIPPED=""
 strip_matches() {
-  local s="$1" re="$2" m
+  local s="$1" re="$2" m kept=""
   while [[ $s =~ $re ]]; do
     m="${BASH_REMATCH[0]}"
-    s="${s%%"$m"*}${s#*"$m"}"
+    # A zero-width match cannot advance the cursor; sed leaves the remainder verbatim.
+    [ -n "$m" ] || break
+    kept="$kept${s%%"$m"*}"
+    s="${s#*"$m"}"
   done
-  STRIPPED="$s"
+  STRIPPED="$kept$s"
 }
 
 # Does this file run under strict mode (set -e and/or pipefail)? Class 1 only
@@ -291,7 +312,14 @@ scan_unguarded_var() {
     # statement on the same line (`local x=1; use $x`) is NOT the trap (x already
     # exists by then). Truncating at `;` is what keeps this high-confidence.
     local body
-    body="$(printf '%s' "$line" | sed -E 's/.*\b(local|declare)[[:space:]]+(-[A-Za-z]+[[:space:]]+)*//')"
+    if [[ $line =~ $_RE_LOCAL_KEYWORD ]]; then
+      # `.*` anchors the match at offset 0, so sed's leftmost-longest replacement is a
+      # PREFIX removal and `${line#…}` reproduces it byte for byte. No match => sed left
+      # the line alone, which on BSD (literal `b`) is the overwhelmingly common case.
+      body="${line#"${BASH_REMATCH[0]}"}"
+    else
+      body="$line"
+    fi
     body="${body%%;*}"
     # Collect names assigned in the statement: tokens of the form  NAME=
     # Bash-native equivalent of `grep -oE '[A-Za-z_][A-Za-z0-9_]*=' | sed 's/=$//'`:
@@ -317,25 +345,36 @@ scan_unguarded_var() {
       names="$raw"
     fi
     [ -n "$names" ] || continue
-    local nm
-    while IFS= read -r nm; do
+    # Walk the newline-separated names in-shell. A `while read … <<EOF` heredoc would
+    # spill a temp file to disk for EVERY candidate line, which on this tree is over a
+    # thousand file creations per scan and four scans per push.
+    local nm pending="$names"
+    while [ -n "$pending" ]; do
+      nm="${pending%%$'\n'*}"
+      if [ "$nm" = "$pending" ]; then pending=""; else pending="${pending#*$'\n'}"; fi
       [ -n "$nm" ] || continue
       # The trap fires when `$nm` is dereferenced in the RHS of the SAME local —
       # i.e. AFTER this name's own `nm=` but still inside the local statement.
       # Take the body from this name's assignment to the next assignment and look
       # for a deref of nm there; strip the `nm=` itself so the assignment LHS
       # never counts as a use.
-      local after deref
-      after="$(printf '%s' "$body" | sed -E "s/^.*\b${nm}=//")"
-      deref="$(printf '%s' "$after" | sed -E "s/\b${nm}=//g")"
-      if printf '%s' "$deref" | grep -qE "\\\$\\{?${nm}([^A-Za-z0-9_]|\\})"; then
+      # `nm` came out of $_RE_NAME_ASSIGN, so it is [A-Za-z_][A-Za-z0-9_]* — no regex
+      # metacharacter can reach these patterns from the scanned source.
+      local after deref re_after re_deref
+      re_after="^.*\\b${nm}="
+      if [[ $body =~ $re_after ]]; then
+        after="${body#"${BASH_REMATCH[0]}"}"
+      else
+        after="$body"
+      fi
+      strip_matches "$after" "\\b${nm}="; deref="$STRIPPED"
+      re_deref="\\\$\\{?${nm}([^A-Za-z0-9_]|\\})"
+      if [[ $deref =~ $re_deref ]]; then
         emit "$file" "$lineno" "2-UNGUARDED-VAR" "$line" \
           "'\$${nm}' is dereferenced in the same 'local' that declares it (RHS expands before the local exists → unbound under set -u); split into two statements"
         break
       fi
-    done <<EOF
-$names
-EOF
+    done
   done < "$file"
 }
 
