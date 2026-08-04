@@ -412,6 +412,34 @@ for forbidden in 'curl' 'wget' 'git clone' 'npm install' 'pip install' 'brew ins
 done
 hmd remove pinned >/dev/null 2>&1
 
+# The pin MOVING is the path that actually does work, so it gets its own test.
+mkmodule shifting fx-open
+hmd add shifting --yes >/dev/null 2>&1
+[ "$(jq -r '.pinned_version.version' "$STATE/shifting/receipt.json")" = "1.0.0" ] \
+  && ok "installed at the original pin" || bad "wrong starting pin"
+jq '.pinned_version.version = "2.0.0"' "$REG/shifting/manifest.json" > "$REG/shifting/m.tmp" \
+  && mv "$REG/shifting/m.tmp" "$REG/shifting/manifest.json"
+OUT="$(hmd update shifting --yes 2>&1)"; RC=$?
+[ "$RC" -eq 0 ] && ok "update moves to the human-edited pin" || bad "update failed (exit $RC)"
+printf '%s' "$OUT" | grep -q '1.0.0 -> 2.0.0' \
+  && ok "update names both pins" || bad "update did not report the move"
+[ "$(jq -r '.pinned_version.version' "$STATE/shifting/receipt.json" 2>/dev/null)" = "2.0.0" ] \
+  && ok "the receipt now records the new pin" || bad "receipt still on the old pin"
+[ -f "$STATE/shifting/invariants.json" ] \
+  && ok "the new pin faced the class invariants too" || bad "new pin skipped the invariants"
+
+# A pin that fails its invariants must leave NOTHING — never a half-update.
+jq '.pinned_version.version = "3.0.0" | .invariants["module-owned"].command = "printf NOPE; exit 1"' \
+  "$REG/shifting/manifest.json" > "$REG/shifting/m.tmp" \
+  && mv "$REG/shifting/m.tmp" "$REG/shifting/manifest.json"
+OUT="$(hmd update shifting --yes 2>&1)"; RC=$?
+[ "$RC" -ne 0 ] && ok "update to a pin that fails its invariants exits non-zero" \
+                || bad "a bad pin was accepted by update"
+[ ! -e "$STATE/shifting" ] \
+  && ok "a failed update leaves NOTHING — never a half-updated module" \
+  || bad "failed update left a half-updated module behind"
+[ "$(tree_sum "$STATE")" = "$STATE_PRE" ] && ok "state clean after the update tests" || bad "state dirty"
+
 echo
 echo "G18 — base install: the system, and zero module payloads"
 [ -d "$REAL_CLASSES" ] && ok "modules/_classes ships with the base install" || bad "no class dir"

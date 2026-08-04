@@ -708,7 +708,14 @@ cmd_add() {
     exit 1
   fi
 
-  printf '%s' "$INVARIANT_RESULTS" > "$STATE/$name/invariants.json"
+  # Checked: an unwritable state dir here would otherwise report a successful
+  # install whose invariant evidence silently does not exist.
+  if ! printf '%s' "$INVARIANT_RESULTS" > "$STATE/$name/invariants.json"; then
+    remove_module "$name"
+    warn "refused: could not record invariant results. Rolled back — an install"
+    warn "  whose evidence cannot be written is not an install."
+    exit 1
+  fi
   printf '\n  Installed "%s" at pin %s (class %s).\n\n' \
     "$name" "$(jq -r '.pinned_version.version' "$mf")" "$(jq -r '.permission_class' "$mf")"
 
