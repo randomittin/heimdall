@@ -1,0 +1,30 @@
+{
+  "class": "storage-codec",
+  "version": "1",
+  "summary": "A module that encodes or compresses data hmd writes to disk.",
+  "why_this_class_exists": "A codec that loses a byte loses a receipt, and a receipt that cannot be re-verified is indistinguishable from a claim nobody checked. So fidelity is contractual, and absence of the codec must degrade to plain storage rather than to an error.",
+  "consent_required": false,
+  "consent_rationale": "A codec is transparent by contract: it round-trips byte-identically and falls back to plain when absent, so it changes no observable behaviour. Nothing leaves the machine that would not have left it anyway. The fidelity and fallback invariants below are what make that transparency true rather than asserted — if either fails the module is rolled back, which is a stronger guarantee than a prompt.",
+  "requires_invariants": [
+    {
+      "id": "round-trip-fidelity",
+      "description": "encode then decode must return the input byte-identically, or the decoded artifact must re-verify green under its own verifier. The module supplies the command; a codec is the only thing that knows how to drive itself.",
+      "check": { "kind": "manifest" }
+    },
+    {
+      "id": "plain-fallback-when-absent",
+      "description": "With the codec absent, reads of previously-plain data must still succeed silently. A codec that turns its own absence into an error has converted an optional module into a hard dependency.",
+      "check": { "kind": "manifest" }
+    },
+    {
+      "id": "never-touches-judgment-inputs",
+      "description": "A codec must never sit between a gate and the bytes it judges. Enforced with the repo's own judgment falsifier, run with the module active — the same suite the traffic-proxy class consumes, because the failure mode is identical: a judge reading transformed input.",
+      "check": {
+        "kind": "suite",
+        "command": "bash test/gate-judgment-uncompressed.test.sh",
+        "expect": "25 passed, 0 failed",
+        "expect_exit": 0
+      }
+    }
+  ]
+}

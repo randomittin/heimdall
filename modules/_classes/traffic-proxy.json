@@ -1,0 +1,30 @@
+{
+  "class": "traffic-proxy",
+  "version": "1",
+  "summary": "A module that sits on the wire between hmd and a model provider.",
+  "why_this_class_exists": "A proxy can rewrite, compress, cache or re-route request bodies. Generation may run compressed; JUDGMENT MAY NOT. A judge reading compressed context emits false greens, which is the one failure mode the project exists to prevent. So this class is the most dangerous one in the system and carries the strictest contract.",
+  "consent_required": true,
+  "consent_rationale": "The module observes and can mutate traffic that leaves the machine. That is not a transparent change, so it is never applied without the operator saying yes out loud.",
+  "requires_invariants": [
+    {
+      "id": "gates-read-raw",
+      "description": "The gates-read-raw falsifier must pass WITH THIS MODULE ACTIVE. Invariants run after wiring, so the module is already installed and wired when this executes — a proxy that leaks into gate traffic fails here and is rolled back.",
+      "check": {
+        "kind": "suite",
+        "command": "bash test/gate-judgment-uncompressed.test.sh",
+        "expect": "25 passed, 0 failed",
+        "expect_exit": 0
+      }
+    },
+    {
+      "id": "non-interactive-passthrough",
+      "description": "A non-interactive (piped / CI) invocation must pass through unchanged. The module supplies the command that proves it; a proxy that only behaves on a TTY is a proxy that breaks CI silently.",
+      "check": { "kind": "manifest" }
+    },
+    {
+      "id": "no-signed-traffic-routing",
+      "description": "Control-plane, enrollment and signed traffic must NEVER be routed through the module. The module supplies the command that proves its own bypass — signed bytes that pass through a rewriter stop verifying.",
+      "check": { "kind": "manifest" }
+    }
+  ]
+}

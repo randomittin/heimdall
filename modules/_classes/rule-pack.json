@@ -1,0 +1,20 @@
+{
+  "class": "rule-pack",
+  "version": "1",
+  "summary": "A module that ships convention / stack-pack rules for the gate to apply.",
+  "why_this_class_exists": "A rule that fires on legitimate code gets the whole gate muted, and a muted gate is worse than no gate because it reads as green. So a rule arrives with the evidence that it can FAIL, and with the credit for whoever earned it.",
+  "consent_required": false,
+  "consent_rationale": "A rule pack proposes; it never promotes. Promotion stays a human decision on every rule (bin/heimdall-rules holds the same line), so installing the pack changes what is AVAILABLE to review, not what is in force. The falsifier requirement below is the real control: a rule that cannot be shown to fail never gets wired.",
+  "requires_invariants": [
+    {
+      "id": "rules-ship-falsifiers",
+      "description": "Every rule in the pack ships a case that makes it FAIL. A rule with no falsifier is untested opinion — it might be dead code, and dead code in a gate reads as a pass. The module supplies the command that runs its own falsifiers.",
+      "check": { "kind": "manifest" }
+    },
+    {
+      "id": "attribution-preserved",
+      "description": "Credit on each rule survives installation. A rule distilled from a team's denies carries that team's attribution under the recorded-consent and k-anonymity rules of DATA.md §7; a pack that flattens attribution launders provenance.",
+      "check": { "kind": "manifest" }
+    }
+  ]
+}
