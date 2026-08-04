@@ -97,8 +97,14 @@ fi
 #    A case the gates once caught must still be caught (CI-inversion guard).
 if [ "$DENY" = 0 ] && [ -x "$CORPUS" ] && [ -f "$REPO/evals/corpus/INDEX.json" ]; then
   OUT="$( cd "$REPO" && CORPUS_DIR="$REPO/evals/corpus" ORACLES_DIR="$REPO/evals/oracles" "$CORPUS" run 2>&1 )"; rc=$?
-  # honest detail: the corpus pass count "N/M" if the runner prints one, else empty.
-  CCOUNT="$(printf '%s' "$OUT" | sed -n 's/.*\([0-9][0-9]*\/[0-9][0-9]*\).*/\1/p' | tail -1)"
+  # honest detail: the corpus pass count "N/M", read from the runner's MACHINE-READABLE
+  # contract line (`corpus-catch-rate: N/M`, column 0) — never scraped from the human
+  # scorecard. A floating `.*\([0-9]*\/[0-9]*\).*` backtracks to the SHORTEST tail match
+  # inside a two-digit count, so a perfect `13/13` run recorded `3/13`; verdict.json is a
+  # SHAREABLE receipt (hmd verdict, the beat, heimdall-clip), so that wrong number left
+  # the machine. Anchoring to the runner's own field makes the receipt equal the run.
+  # Empty when the runner printed no such line — honest-empty, never fabricated.
+  CCOUNT="$(printf '%s\n' "$OUT" | sed -n 's/^corpus-catch-rate:[[:space:]]*\([0-9][0-9]*\/[0-9][0-9]*\)[[:space:]]*$/\1/p' | tail -1)"
   if [ "$rc" -ne 0 ]; then
     DENY=1; FAIL_GATE="corpus"
     add_reason "corpus regression — a case the gates once caught is no longer caught"
@@ -116,21 +122,33 @@ TOP_FILE="$(git diff --cached --name-only 2>/dev/null | sed '/^$/d' | head -1)"
 VDIR="$REPO/.heimdall"
 VFILE="$VDIR/verdict.json"
 mkdir -p "$VDIR" 2>/dev/null || true
+VERDICT_JSON=""
 if [ "$HAVE_JQ" = 1 ]; then
   # `gates` is the ADDITIVE per-gate array the statusline reads (bin/heimdall-status-json);
   # empty-input jq -s yields [] (honest empty when no oracle/corpus gate ran).
   GATES_ARR="$(printf '%s' "$GATES_NDJSON" | jq -sc '.' 2>/dev/null || echo '[]')"
-  jq -cn --arg v "$VERDICT" --arg ph "$PHASE" --arg ts "$TS" \
+  VERDICT_JSON="$(jq -cn --arg v "$VERDICT" --arg ph "$PHASE" --arg ts "$TS" \
          --arg gate "$FAIL_GATE" --arg file "$TOP_FILE" --arg reasons "$REASONS" \
          --argjson gates "$GATES_ARR" \
     '{verdict:$v, phase:$ph, ts:$ts, gate:($gate // ""), file:$file,
       reasons: ($reasons | if . == "" then [] else split("\n") end), gates:$gates}' \
-    > "$VFILE" 2>/dev/null || true
-else
-  # jq-less fallback: a minimal, valid one-line object. gates:[] (structured recording needs jq).
-  printf '{"verdict":"%s","phase":"%s","ts":"%s","gate":"%s","file":"%s","gates":[]}\n' \
-    "$VERDICT" "$PHASE" "$TS" "$FAIL_GATE" "$TOP_FILE" > "$VFILE" 2>/dev/null || true
+    2>/dev/null || true)"
 fi
+if [ -z "$VERDICT_JSON" ]; then
+  # jq-less fallback: a minimal, valid one-line object. gates:[] (structured recording needs jq).
+  VERDICT_JSON="$(printf '{"verdict":"%s","phase":"%s","ts":"%s","gate":"%s","file":"%s","gates":[]}' \
+    "$VERDICT" "$PHASE" "$TS" "$FAIL_GATE" "$TOP_FILE")"
+fi
+printf '%s\n' "$VERDICT_JSON" > "$VFILE" 2>/dev/null || true
+
+# ── --json: EMIT the verdict we just assembled (the flag's whole contract) ─────
+# This is the headless entrypoint a plain git hook or a CI job runs, and --json is
+# the first thing anyone wiring it up reaches for. It emits the SAME object persisted
+# to verdict.json — one source of truth, no second serializer to drift. Printed on
+# BOTH pass and deny (a deny is exactly the payload a CI job needs), and printed even
+# when $VFILE could not be written, so the caller is never handed silence. Without the
+# flag stdout stays empty: the documented "PASS = exit 0, quiet" contract is unchanged.
+[ -n "$JSON" ] && printf '%s\n' "$VERDICT_JSON"
 
 # ── PASS ──────────────────────────────────────────────────────────────────────
 if [ "$DENY" = 0 ]; then

@@ -433,6 +433,13 @@ print_scorecard() {
   echo
   echo "[corpus catch-rate — ${SC_VERSION}]"
   echo "  ${SC_CAUGHT}/${SC_TOTAL} caught = ${SC_RATE_PCT}%"
+  # THE MACHINE SEAM. The line above is for humans and its shape is free to change;
+  # this one is a CONTRACT: `corpus-catch-rate: <caught>/<total>` at column 0, nothing
+  # else on the line. Consumers that record the count into a receipt (bin/heimdall-gate-run
+  # -> .heimdall/verdict.json, which is SHAREABLE) read THIS line, anchored, instead of
+  # scanning the run for something that looks like a fraction. Scraping the human output
+  # is what wrote "3/13" into the receipt of a perfect "13/13" run.
+  echo "corpus-catch-rate: ${SC_CAUGHT}/${SC_TOTAL}"
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
