@@ -32,11 +32,31 @@
 #   credential, which gets the gate disabled and reopens BUG 3. The tree pass must
 #   scan the PUSHABLE set. Proof F fences that (full rationale at the F block).
 #
+#   BUG 5 — MISATTRIBUTION. selfscan bundles FOUR independent verdicts (history
+#   secrets, tree secrets, identities, landmines) into ONE exit code, and every
+#   proof here used to read that bundled code as a stand-in for the one gate it
+#   was actually about. So each proof silently asserted "all four gates are
+#   clean". On 2026-08-04 three genuine strict-mode landmines in
+#   bin/heimdall-modules turned SIX assertions in this file red, four of them
+#   reporting "false positive in the new tree pass" for a tree pass that had
+#   scanned ~12 MB and found nothing. The suite pointed at the wrong file, in the
+#   wrong subsystem, owned by someone else. Worse, the anti-vacuous byte count
+#   was read off selfscan's FINAL success line, so a block in any later gate
+#   erased the proof that the tree had been scanned at all — the exact vacuity
+#   ("clean" indistinguishable from "never ran") the floor exists to prevent,
+#   reintroduced one level up. Fixed on both sides: selfscan now emits a
+#   per-sub-gate verdict the moment each gate concludes, and every assertion below
+#   reads THAT instead of the bundled exit code. The landmine gate — owned by
+#   test/landmine-lint.test.sh — is reported here as a non-scoring NOTE.
+#
 # Six proofs, all runnable, none skippable:
 #
 #   A. PARITY — bare `gitleaks detect --log-opts=--all` over heimdall's history
-#      and `heimdall-selfscan` AGREE: both exit 0 (clean). selfscan must not
-#      invent findings bare gitleaks does not see.
+#      and heimdall-selfscan's history-SECRET verdict AGREE: both clean. selfscan
+#      must not invent findings bare gitleaks does not see. Asserted against the
+#      secret verdict specifically, because that is what BUG 2 is a claim about —
+#      the bundled exit code also answers for identities and landmines, which
+#      bare gitleaks never evaluates.
 #
 #   B. SCOPING — run the gate from an UNRELATED throwaway repo (foreign author,
 #      benign content). The gate must NOT block on heimdall's internals: it must
@@ -69,6 +89,38 @@ SELFSCAN="$REPO/bin/heimdall-selfscan"
 PASS=0; FAIL=0
 ok()  { printf '  \033[32mPASS\033[0m %s\n' "$1"; PASS=$((PASS + 1)); }
 bad() { printf '  \033[31mFAIL\033[0m %s\n' "$1"; FAIL=$((FAIL + 1)); }
+# A NON-SCORING diagnostic, used for exactly one thing: reporting the state of a
+# sub-gate that a DIFFERENT suite owns (see "attribution" below). It never
+# substitutes for an assertion about anything this file is responsible for.
+note() { printf '  \033[33mNOTE\033[0m %s\n' "$1"; }
+
+# ── reading selfscan's per-sub-gate evidence ────────────────────────────────
+# heimdall-selfscan emits `guard: gate=<name> verdict=<clean|blocked> [k=v ...]`
+# the MOMENT each sub-gate concludes. Every assertion below reads that runtime
+# signal instead of the bundled exit code.
+#
+# ATTRIBUTION — why this replaced `rc == 0`:
+# selfscan bundles FOUR independent verdicts (history secrets, tree secrets,
+# identities, landmines) into ONE exit status. An assertion that reads the
+# bundled rc as a stand-in for "the tree pass is clean" is really asserting "all
+# four gates are clean", so it fails for reasons that have nothing to do with the
+# property under test. That is not hypothetical: on 2026-08-04 three genuine
+# strict-mode landmines in bin/heimdall-modules turned SIX assertions in this
+# file red, four of them printing "false positive in the new tree pass" while the
+# tree pass had in fact scanned ~12 MB and found nothing. The misattribution cost
+# more than the bug. Reading the per-gate verdict makes each proof attributable
+# to the gate it is actually about.
+#
+# ANTI-VACUOUS: an ABSENT verdict reads as empty, never as "clean". Every call
+# site below must therefore compare against the literal `clean` — a gate that
+# never reported can never satisfy one of these assertions.
+gate_verdict() {
+  sed -n "s/^guard: gate=$2 verdict=\([a-z][a-z-]*\).*/\1/p" "$1" | tail -1
+}
+# gate_field <errfile> <gate> <field> — a numeric k=v field off that gate's line.
+gate_field() {
+  sed -n "s/^guard: gate=$2 .*[[:space:]]$3=\([0-9][0-9]*\).*/\1/p" "$1" | tail -1
+}
 
 [ -x "$SELFSCAN" ] || { echo "FATAL: selfscan not executable at $SELFSCAN"; exit 2; }
 command -v gitleaks >/dev/null 2>&1 || { echo "FATAL: gitleaks not installed — cannot prove parity"; exit 2; }
@@ -79,25 +131,58 @@ trap 'rm -rf "$WORK"' EXIT
 # ─────────────────────────────────────────────────────────────────────────────
 # A. PARITY — bare gitleaks history scan == selfscan, both clean.
 # ─────────────────────────────────────────────────────────────────────────────
-echo "A. PARITY (bare gitleaks history == selfscan):"
+echo "A. PARITY (bare gitleaks history == selfscan's SECRET verdict):"
 bare_rc=0
 ( cd "$REPO" && gitleaks detect --source . --log-opts="--all" --no-banner ) >/dev/null 2>&1 || bare_rc=$?
+A_ERR="$WORK/a-selfscan.err"
 self_rc=0
-( cd "$REPO" && "$SELFSCAN" ) >/dev/null 2>&1 || self_rc=$?
+( cd "$REPO" && "$SELFSCAN" ) >"$A_ERR" 2>&1 || self_rc=$?
 if [ "$bare_rc" -eq 0 ]; then
   ok "bare gitleaks over heimdall history is clean (rc=0)"
 else
   bad "bare gitleaks over heimdall history is NOT clean (rc=$bare_rc) — history regression, fix that first"
 fi
-if [ "$self_rc" -eq 0 ]; then
-  ok "selfscan over heimdall history is clean (rc=0)"
+# BUG 2 is a claim about the SECRET scan: a config-blind selfscan flags heimdall's
+# own fixtures that bare gitleaks (which auto-discovers .gitleaks.toml) does not.
+# So parity is asserted against selfscan's history-SECRET verdict. The old form
+# compared bare_rc to the bundled exit code — a category error, since the bundled
+# code also carries identity and landmine outcomes that bare gitleaks never
+# evaluates, and a landmine therefore read as "the allowlist is broken".
+a_hist="$(gate_verdict "$A_ERR" history-secrets)"
+if [ "$a_hist" = "clean" ]; then
+  ok "selfscan's history-secret gate is clean (verdict=clean)"
 else
-  bad "selfscan reports findings/identity/landmine bare gitleaks does not (rc=$self_rc)"
+  bad "selfscan's history-secret gate reports '${a_hist:-no verdict emitted}' — findings bare gitleaks does not see"
 fi
-if [ "$bare_rc" -eq "$self_rc" ]; then
-  ok "bare gitleaks and selfscan AGREE (both rc=$self_rc)"
+if { [ "$bare_rc" -eq 0 ] && [ "$a_hist" = "clean" ]; } \
+   || { [ "$bare_rc" -ne 0 ] && [ "$a_hist" = "blocked" ]; }; then
+  ok "bare gitleaks and selfscan's secret scan AGREE (bare rc=$bare_rc, selfscan verdict=$a_hist)"
 else
-  bad "DISAGREEMENT — bare=$bare_rc selfscan=$self_rc (the 14-false-positive class)"
+  bad "DISAGREEMENT — bare rc=$bare_rc vs selfscan secret verdict='${a_hist:-none}' (the 14-false-positive class)"
+fi
+# The other two gates this suite owns must also be clean over the real repo.
+a_tree="$(gate_verdict "$A_ERR" tree-secrets)"
+a_ident="$(gate_verdict "$A_ERR" identities)"
+if [ "$a_tree" = "clean" ]; then
+  ok "selfscan's tree-secret gate is clean over the real repo (verdict=clean)"
+else
+  bad "selfscan's tree-secret gate reports '${a_tree:-no verdict emitted}' over the real repo"
+fi
+if [ "$a_ident" = "clean" ]; then
+  ok "selfscan's identity gate is clean over the real repo (verdict=clean)"
+else
+  bad "selfscan's identity gate reports '${a_ident:-no verdict emitted}' over the real repo"
+fi
+# The landmine gate is the FOURTH bundled verdict and is owned by
+# test/landmine-lint.test.sh, which drives the native pre-push hook over a clean
+# clone and fails there when a landmine lands. Reporting it here as a
+# non-scoring NOTE keeps the information visible without this suite failing for a
+# defect in some unrelated script — while the suite that owns it still goes red.
+a_lint="$(gate_verdict "$A_ERR" landmines)"
+if [ "$a_lint" != "clean" ]; then
+  note "landmine gate reports '${a_lint:-no verdict emitted}' (selfscan overall rc=$self_rc)."
+  note "  That gate is owned by test/landmine-lint.test.sh — it is RED there, not here."
+  grep -E '^/.*:[0-9]+ ' "$A_ERR" | sed 's/^/        /' | head -5
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -242,18 +327,24 @@ else
   fi
   chmod +x "$CLONE/bin/heimdall-selfscan"
 
-  # (i) TRUE NEGATIVE + ANTI-VACUOUS.
+  # (i) TRUE NEGATIVE + ANTI-VACUOUS — asserted on the TREE gate's own verdict,
+  # not on the bundled exit code, so a block in an unrelated sub-gate can neither
+  # fail this proof nor erase the measurement it depends on.
   clean_rc=0
   ( cd "$CLONE" && ./bin/heimdall-selfscan ) >"$WORK/e-clean.err" 2>&1 || clean_rc=$?
-  if [ "$clean_rc" -eq 0 ]; then
-    ok "pristine clone scans CLEAN through the full gate (rc=0)"
+  e_tree="$(gate_verdict "$WORK/e-clean.err" tree-secrets)"
+  if [ "$e_tree" = "clean" ]; then
+    ok "pristine clone: tree pass returns verdict=clean — no false positive"
   else
-    bad "pristine clone was BLOCKED (rc=$clean_rc) — false positive in the new tree pass"
-    sed 's/^/      /' "$WORK/e-clean.err" | tail -20
+    bad "pristine clone: tree pass returned '${e_tree:-no verdict emitted}' — false positive in the tree pass"
+    grep -E 'BLOCKED|File:|Secret:' "$WORK/e-clean.err" | sed 's/^/      /' | head -10
   fi
-  # The gate prints `tree=0/<bytes>B`; a clean verdict over a trivial volume means
-  # the scan never reached the tree (wrong --source, empty checkout).
-  TREE_B="$(sed -n 's/.*tree=0\/\([0-9][0-9]*\)B.*/\1/p' "$WORK/e-clean.err" | tail -1)"
+  # A clean verdict over a trivial volume means the scan never reached the tree
+  # (wrong --source, empty checkout). The volume is read off the tree gate's OWN
+  # line, which selfscan emits the moment that gate concludes — previously this
+  # came off the final success line, so ANY later gate blocking destroyed the
+  # evidence and this assertion reported "(none)" for a scan that had read 12 MB.
+  TREE_B="$(gate_field "$WORK/e-clean.err" tree-secrets bytes)"
   if [ -n "$TREE_B" ] && [ "$TREE_B" -gt 100000 ]; then
     ok "tree pass examined a plausible volume (${TREE_B} bytes) — the clean verdict is non-vacuous"
   else
@@ -291,22 +382,39 @@ else
          /# --- identity allowlist over the FULL history/!d
        }' "$WORK/selfscan.orig" > "$MUT"
   chmod +x "$MUT"
-  # The mutation must be REAL — otherwise the RED below is meaningless theatre.
-  # Match the INVOCATION, not the flag anywhere: the header comment documents
-  # `--no-git` in prose and legitimately survives the excision, so a bare
-  # `grep -- --no-git` would report a false "mutation failed".
-  if grep -q 'gitleaks detect.*--no-git' "$WORK/selfscan.orig" \
-     && ! grep -q 'gitleaks detect.*--no-git' "$MUT"; then
-    ok "mutation is real (tree-scan invocation present in the original, absent in the mutant)"
-  else
-    bad "mutation did not strip the tree-scan invocation — the RED below would prove nothing"
-  fi
   mut_rc=0
-  ( cd "$CLONE" && ./bin/heimdall-selfscan ) >/dev/null 2>&1 || mut_rc=$?
-  if [ "$mut_rc" -eq 0 ]; then
-    ok "WITHOUT the tree pass the same secret sails through (rc=0) — the step earns its place"
+  ( cd "$CLONE" && ./bin/heimdall-selfscan ) >"$WORK/e-mut.err" 2>&1 || mut_rc=$?
+
+  # The mutation must be REAL — otherwise the RED below is meaningless theatre.
+  #
+  # ANCHORED TO THE EXECUTING CODE PATH, not to the file's text. The earlier form
+  # of this check grepped the SOURCE for the tree-scan invocation, and an even
+  # earlier one grepped for `--no-git` ANYWHERE in the file — which the header
+  # comment documents in prose and which therefore survives the excision intact.
+  # That assertion was satisfiable BY A COMMENT IN THE FILE IT CHECKED: it could
+  # report "mutation is real" for a mutant that still ran the tree scan, and
+  # "mutation failed" for one that did not. A text grep cannot distinguish code
+  # from commentary, so it proves nothing about what RAN.
+  #
+  # The A/B below is over observed behaviour instead: the same planted secret,
+  # the same clone, the original vs the mutant. The original's tree gate REPORTS
+  # (blocked, having found the secret); the mutant's tree gate never reports at
+  # all, because it no longer exists. No comment can emit a runtime verdict.
+  orig_tree="$(gate_verdict "$WORK/e-planted.err" tree-secrets)"
+  mut_tree="$(gate_verdict "$WORK/e-mut.err" tree-secrets)"
+  if [ -n "$orig_tree" ] && [ -z "$mut_tree" ]; then
+    ok "mutation is real AT RUNTIME (original's tree gate reported '$orig_tree'; mutant emits no tree verdict)"
   else
-    bad "mutant still blocked (rc=$mut_rc) — proof (iii) is not attributable to the tree pass"
+    bad "mutation not proven by runtime signal (original='${orig_tree:-none}', mutant='${mut_tree:-none}') — the RED below would prove nothing"
+  fi
+  # "Sails through" = the working-tree secret is no longer detected. Asserted on
+  # the absence of the WORKING TREE block rather than on rc==0: the bundled exit
+  # code also carries identity and landmine outcomes, so a landmine elsewhere in
+  # the repo would otherwise masquerade as "the tree pass was never load-bearing".
+  if ! grep -q "WORKING TREE" "$WORK/e-mut.err"; then
+    ok "WITHOUT the tree pass the same secret sails through undetected — the step earns its place"
+  else
+    bad "mutant still reported a WORKING TREE block — proof (iii) is not attributable to the tree pass"
   fi
   # Restore -> the block must come back (RED -> GREEN round trip closed).
   cp "$WORK/selfscan.orig" "$MUT"
@@ -395,13 +503,16 @@ else
     ok "premise: all 3 planted paths are .gitignored (no push can carry them)"
   fi
 
-  # (i) IGNORED IS OUT — the gate must stay clean.
+  # (i) IGNORED IS OUT — the TREE gate must stay clean with the pollution present.
+  # Attributed to the tree gate: this proof is about what the tree pass reads, and
+  # the bundled exit code would also answer for identities and landmines.
   scoped_rc=0
   ( cd "$SCOPE" && ./bin/heimdall-selfscan ) >"$WORK/f-ignored.err" 2>&1 || scoped_rc=$?
-  if [ "$scoped_rc" -eq 0 ]; then
-    ok "secrets in .gitignored paths do NOT block (rc=0) — no wolf-crying on unpushable files"
+  f_tree="$(gate_verdict "$WORK/f-ignored.err" tree-secrets)"
+  if [ "$f_tree" = "clean" ]; then
+    ok "secrets in .gitignored paths do NOT block (tree verdict=clean) — no wolf-crying on unpushable files"
   else
-    bad "gate BLOCKED on .gitignored, unpushable files (rc=$scoped_rc) — the every-push-is-blocked failure"
+    bad "tree gate returned '${f_tree:-no verdict emitted}' on .gitignored, unpushable files — the every-push-is-blocked failure"
     grep -iE 'BLOCKED|File:' "$WORK/f-ignored.err" | sed 's/^/      /' | head -8
   fi
 
@@ -410,14 +521,20 @@ else
   cp "$SMUT" "$WORK/selfscan.scoped"
   sed 's|--source "$TREE_TMP"|--source "$HEIMDALL_TOP"|g' "$WORK/selfscan.scoped" > "$SMUT"
   chmod +x "$SMUT"
-  if grep -q -- '--source "$TREE_TMP"' "$WORK/selfscan.scoped" \
-     && ! grep -q -- '--source "$TREE_TMP"' "$SMUT"; then
-    ok "mutation is real (scoped --source in the original, raw-filesystem --source in the mutant)"
-  else
-    bad "mutation did not repoint the tree scan — the RED below would prove nothing"
-  fi
   unscoped_rc=0
   ( cd "$SCOPE" && ./bin/heimdall-selfscan ) >"$WORK/f-unscoped.err" 2>&1 || unscoped_rc=$?
+  # Mutation proven by the VOLUME the tree gate reports it read, not by grepping
+  # the source. Repointing --source from the materialised pushable set to the raw
+  # repo top strictly widens the walk (it picks up .git, the ignored pollution,
+  # every untracked scratch file), so the mutant MUST report more bytes than the
+  # scoped run did. That is the scoping change observable in the executing path.
+  f_scoped_b="$(gate_field "$WORK/f-ignored.err" tree-secrets bytes)"
+  f_unscoped_b="$(gate_field "$WORK/f-unscoped.err" tree-secrets bytes)"
+  if [ -n "$f_scoped_b" ] && [ -n "$f_unscoped_b" ] && [ "$f_unscoped_b" -gt "$f_scoped_b" ]; then
+    ok "mutation is real AT RUNTIME (tree scan widened ${f_scoped_b} -> ${f_unscoped_b} bytes)"
+  else
+    bad "tree scan volume did not widen (scoped=${f_scoped_b:-none}, unscoped=${f_unscoped_b:-none}) — the RED below would prove nothing"
+  fi
   if [ "$unscoped_rc" -ne 0 ] && grep -q "WORKING TREE" "$WORK/f-unscoped.err"; then
     ok "WITHOUT the scoping the same ignored files DO block (rc=$unscoped_rc) — the scoping earns its place"
   else

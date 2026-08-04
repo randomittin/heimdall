@@ -63,9 +63,28 @@
 #     a configurable allowlist is an escape hatch.
 #
 # Success signal (so a silent `--no-verify` skip is detectable by ABSENCE):
-#   on full success this prints ONE line to stderr:
+#   on full success this prints, as its LAST line, to stderr:
 #       guard: gitleaks=0 · identities=N/N allowlisted
 #   The absence of that line on a push means the gate did not run.
+#
+# Per-sub-gate evidence (emitted as each gate CONCLUDES, pass or fail):
+#       guard: gate=<name> verdict=<clean|blocked> [k=v ...]
+#   for gate ∈ {history-secrets, tree-secrets, identities, landmines}.
+#
+#   Why per-gate and not just the final line: this script bundles four
+#   INDEPENDENT verdicts into one exit code. Emitting evidence only on total
+#   success means any later gate DESTROYS the proof that an earlier one ran —
+#   block on a landmine in some unrelated script and "the tree scan examined
+#   11 MB and found nothing" becomes indistinguishable from "the tree scan
+#   never happened". That is exactly the vacuity the anti-vacuous byte floor
+#   below exists to prevent, reintroduced one level up. It is not theoretical:
+#   on 2026-08-04 three landmines in bin/heimdall-modules turned six
+#   tree-mode assertions red, four of them reporting a "false positive in the
+#   tree pass" that had not occurred. A verdict is therefore printed the moment
+#   its gate concludes and is never contingent on a later, unrelated gate.
+#
+#   Consumers should key on `gate=<name> verdict=` and treat unknown trailing
+#   k=v fields as additive; new fields may be appended.
 #
 # Exit codes:
 #   0  clean — no secret in history OR the working tree, every identity
@@ -84,6 +103,34 @@ set -euo pipefail
 # on purpose — a configurable allowlist would be an escape hatch.
 ALLOWED_IDENTITIES="rj@runheimdall.dev
 noreply@anthropic.com"
+
+# --- per-sub-gate evidence -------------------------------------------------
+# Print one sub-gate's verdict THE MOMENT that gate concludes, so the record of
+# what was examined survives a block in any LATER, unrelated gate (see the
+# "Per-sub-gate evidence" note in the header). Always stderr, so stdout stays
+# free for anything a caller wants to capture.
+#
+# `printf`, never `echo`: this file is part of the fail-open gate surface
+# enforced by test/gate-echo-parser-guard.test.sh, and under /bin/sh `echo`
+# expands backslash escapes — the defect that silently no-opped 215 of 312 hook
+# invocations. printf is byte-exact.
+selfscan_verdict() {
+  local gate="$1"
+  local verdict="$2"
+  local detail="${3:-}"
+  if [ -n "$detail" ]; then
+    printf 'guard: gate=%s verdict=%s %s\n' "$gate" "$verdict" "$detail" >&2
+  else
+    printf 'guard: gate=%s verdict=%s\n' "$gate" "$verdict" >&2
+  fi
+}
+
+# Extract gitleaks' self-reported scan volume ("scanned ~N bytes") from a run's
+# output. Empty when absent — callers must treat that as "unmeasured", never as
+# zero, because an unparseable volume is precisely the unprovable case.
+selfscan_scanned_bytes() {
+  printf '%s\n' "$1" | sed -n 's/.*scanned ~\([0-9][0-9]*\) bytes.*/\1/p' | tail -1
+}
 
 # --- SCOPING: police HEIMDALL's repo, and ONLY heimdall's -------------------
 # This script lives at <heimdall-top>/bin/heimdall-selfscan. The native pre-push
@@ -154,7 +201,9 @@ else
   SCAN_OUT=$(gitleaks detect --source "$HEIMDALL_TOP" --log-opts="--all" --no-banner 2>&1) && SCAN_RC=0 || SCAN_RC=$?
 fi
 
+SCAN_BYTES="$(selfscan_scanned_bytes "$SCAN_OUT")"
 if [ "$SCAN_RC" -ne 0 ]; then
+  selfscan_verdict history-secrets blocked "bytes=${SCAN_BYTES:-unmeasured}"
   # Nonzero from gitleaks == leak found (or a hard scan error). Show the finding.
   echo "BLOCKED: gitleaks detected a secret in Heimdall's OWN history." >&2
   echo "A credential anywhere in history blocks the push. Scrub it from history" >&2
@@ -164,6 +213,7 @@ if [ "$SCAN_RC" -ne 0 ]; then
   echo "------------------------------------------------------------" >&2
   exit 1
 fi
+selfscan_verdict history-secrets clean "bytes=${SCAN_BYTES:-unmeasured}"
 
 # --- scan the WORKING TREE for secrets (--no-git) --------------------------
 # A SECOND secret check, NOT a replacement for the history walk above. The two
@@ -256,6 +306,7 @@ MAT_RC=0
 ) || MAT_RC=$?
 
 if [ "$MAT_RC" -ne 0 ]; then
+  selfscan_verdict tree-secrets blocked "reason=materialise-failed rc=$MAT_RC"
   echo "BLOCKED: could not materialise Heimdall's pushable file set for the" >&2
   echo "working-tree scan (rc=$MAT_RC). The gate cannot build the surface it is" >&2
   echo "supposed to certify, so this push is refused rather than passed blind." >&2
@@ -270,7 +321,9 @@ else
   TREE_OUT=$(gitleaks detect --source "$TREE_TMP" --no-git --no-banner --no-color 2>&1) && TREE_RC=0 || TREE_RC=$?
 fi
 
+TREE_BYTES="$(selfscan_scanned_bytes "$TREE_OUT")"
 if [ "$TREE_RC" -ne 0 ]; then
+  selfscan_verdict tree-secrets blocked "reason=finding bytes=${TREE_BYTES:-unmeasured}"
   echo "BLOCKED: gitleaks detected a secret in Heimdall's WORKING TREE." >&2
   echo "This is the on-disk copy — the history scan above can be clean while a" >&2
   echo "credential sits in a tracked file. Remove the value from the file (for a" >&2
@@ -304,8 +357,8 @@ fi
 # is pointed at the wrong place or the materialisation collapsed — never on
 # ordinary growth or pruning of the repo.
 TREE_MIN_BYTES=100000
-TREE_BYTES="$(printf '%s\n' "$TREE_OUT" | sed -n 's/.*scanned ~\([0-9][0-9]*\) bytes.*/\1/p' | tail -1)"
 if [ -z "$TREE_BYTES" ] || [ "$TREE_BYTES" -lt "$TREE_MIN_BYTES" ]; then
+  selfscan_verdict tree-secrets blocked "reason=below-floor bytes=${TREE_BYTES:-unmeasured} floor=$TREE_MIN_BYTES"
   echo "BLOCKED: the working-tree secret scan examined too little to certify" >&2
   echo "anything (bytes=${TREE_BYTES:-unparseable}, floor=${TREE_MIN_BYTES})." >&2
   echo "A gate reporting clean over a surface it never read is a vacuous gate." >&2
@@ -316,6 +369,10 @@ if [ -z "$TREE_BYTES" ] || [ "$TREE_BYTES" -lt "$TREE_MIN_BYTES" ]; then
   echo "------------------------------------------------------------" >&2
   exit 1
 fi
+# The tree gate is clean AND provably non-empty. Emitted HERE — inside the tree
+# pass, before any later gate can run — so this evidence cannot be erased by an
+# unrelated block downstream.
+selfscan_verdict tree-secrets clean "bytes=$TREE_BYTES floor=$TREE_MIN_BYTES"
 
 # --- identity allowlist over the FULL history -----------------------------
 # Author AND committer email of every commit on every ref must be allowlisted.
@@ -340,6 +397,7 @@ $IDENTITIES
 EOF
 
 if [ -n "$bad_identities" ]; then
+  selfscan_verdict identities blocked "allowlisted=$allowed_count/$total_count"
   echo "BLOCKED: non-allowlisted author/committer identity in Heimdall's history." >&2
   echo "Every commit's author AND committer email (over --all) must be one of:" >&2
   printf '%s\n' "$ALLOWED_IDENTITIES" | sed 's/^/  - /' >&2
@@ -349,6 +407,7 @@ if [ -n "$bad_identities" ]; then
   echo "allowlist override for this gate." >&2
   exit 1
 fi
+selfscan_verdict identities clean "allowlisted=$allowed_count/$total_count"
 
 # --- strict-mode landmine lint over Heimdall's OWN shell scripts -----------
 # Third blocking check (alongside secrets + identities): a static lint for the
@@ -367,6 +426,7 @@ elif command -v heimdall-landmine-lint >/dev/null 2>&1; then
   LINT="$(command -v heimdall-landmine-lint)"
 fi
 if [ -z "$LINT" ]; then
+  selfscan_verdict landmines blocked "reason=linter-absent"
   echo "BLOCKED: heimdall-landmine-lint not found — the strict-mode landmine gate" >&2
   echo "cannot run, so this push is refused. Restore bin/heimdall-landmine-lint." >&2
   exit 1
@@ -375,6 +435,7 @@ LINT_OUT=""
 LINT_RC=0
 LINT_OUT="$("$LINT" 2>&1)" && LINT_RC=0 || LINT_RC=$?
 if [ "$LINT_RC" -ne 0 ]; then
+  selfscan_verdict landmines blocked "reason=finding rc=$LINT_RC"
   echo "BLOCKED: heimdall-landmine-lint found a strict-mode landmine in Heimdall's" >&2
   echo "OWN shell scripts. A silent-failure landmine must not leave the machine —" >&2
   echo "guard it (|| true / \${var:-default} / [ -t 0 ] / reorder) before pushing." >&2
@@ -383,6 +444,7 @@ if [ "$LINT_RC" -ne 0 ]; then
   echo "------------------------------------------------------------" >&2
   exit 1
 fi
+selfscan_verdict landmines clean
 
 # --- success: emit the single detectable signal line ----------------------
 # The leading `guard: gitleaks=0 · identities=N/N allowlisted` substring is the
