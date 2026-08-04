@@ -387,23 +387,48 @@ repair_modules() {
 #      updater that is switched off repairs nothing ever again.
 #   2. OPTED OUT → nothing, and NOT EVEN A MENTION. Re-offering something the operator
 #      declined is a soft revert; it teaches them to ignore the tool or to disable it.
-#   3. ABSENT + CONSENT REQUIRED → DEFERRED, with the exact command printed on a manual
-#      update and silence on the background one. See the note below — this is the one
-#      genuinely load-bearing decision in the file.
-#   4. ABSENT + NO CONSENT REQUIRED → ACQUIRED, detached on the background path so a
-#      multi-GB fetch can never hold up SessionStart.
+#   3. ABSENT + CONSENT REQUIRED AND NOT WAIVED → DEFERRED, with the exact command
+#      printed on a manual update and silence on the background one. See the note
+#      below — this is the one genuinely load-bearing decision in the file.
+#   4. ABSENT + NOBODY HAS TO BE ASKED → ACQUIRED, detached on the background path so a
+#      multi-GB fetch can never hold up SessionStart. Two shapes reach this branch: a
+#      module no declared class demands consent for, and a module whose own manifest
+#      WAIVES the question. The second is DISCLOSED before it is acquired.
 #
-# WHY CONSENT-REQUIRED MODULES ARE DEFERRED RATHER THAN ACQUIRED. Headroom is class
-# traffic-proxy, whose contract sets `consent_required`. The only way this process
-# could install it unattended is to pass `--yes` to `heimdall-modules add`, i.e. to
-# assert on the operator's behalf that they agreed to put a process on the wire that
-# reads their prompts. A background job answering a consent prompt is not an install
-# path, it is a forged signature. So we never pass `--yes` from here — not on the
-# manual path either — and `heimdall-modules` independently refuses a consent-required
-# install when stdin is not a terminal. Two gates, and BOTH would have to be wrong for
-# a silent install to happen. What the user gets instead is the module named, the
-# reason stated, and one command to run. That is a smaller thing than an automatic
-# install and it is the honest version of it.
+# WHY A CONSENT-REQUIRED MODULE IS DEFERRED RATHER THAN ACQUIRED, AND WHAT ACTUALLY
+# STANDS BETWEEN A BACKGROUND JOB AND A SILENT INSTALL.
+#
+# The only way this process could install a consent-required module unattended is to
+# pass `--yes` to `heimdall-modules add`, i.e. to assert on the operator's behalf that
+# they agreed to put a process on the wire that reads their prompts. A background job
+# answering a consent prompt is not an install path, it is a forged signature. So we
+# never pass `--yes` from here — not on the manual path either. THAT IS ONE GATE AND IT
+# IS UNCONDITIONAL: no manifest, no class and no flag can make this file consent for a
+# human. test/module-reconcile.test.sh R8 asserts it structurally.
+#
+# An earlier version of this comment claimed a SECOND gate — that `heimdall-modules`
+# independently refuses a consent-required install when stdin is not a terminal, so
+# "two gates, and BOTH would have to be wrong". That was false for the one module it
+# named. Headroom's manifest carries `consent_waived: true`, and `obtain_consent`
+# returns on the waiver BEFORE it ever reaches the `[ -t 0 ]` terminal check, so the
+# non-TTY refusal never runs for it. One gate stands, not two.
+#
+# WHAT STANDS IN THE SECOND GATE'S PLACE FOR A WAIVED MODULE — and why the owner chose
+# it. Headroom ships as part of hmd: that is a DISTRIBUTION decision, so hmd discloses
+# what it does rather than staging a question whose answer was already made. The waiver
+# is not a hole in the consent system, it is a named, bounded exception to it:
+#   PER-MODULE   it lives in modules/headroom/manifest.json, NOT in
+#                modules/_classes/traffic-proxy.json. The class contract still sets
+#                `consent_required: true`, so every OTHER traffic-proxy module hmd ever
+#                ships still stops and asks. Flipping the class would have disarmed
+#                consent for modules nobody has written yet.
+#   DISCLOSED    the module's `consent_text` is printed in full before the acquisition
+#                on the loud path, and again by `heimdall-modules add` itself.
+#   RECORDED     the receipt stores waived:true, the reason, the class that demanded
+#                consent, and the sha256 of the disclosure text that was shown.
+#   DECLINABLE   `hmd modules optout <name>` refuses it permanently, and transition 2
+#                above then never mentions it again.
+# Deleting `consent_waived` from the manifest restores the prompt with no code change.
 #
 # NOTHING HERE CAN BREAK THE UPDATE. Every path returns 0, the detached child's exit
 # code is discarded, and a synchronous acquisition failure is swallowed after being
@@ -435,7 +460,11 @@ module_opted_out() {
 # both a storage codec and a traffic proxy still intercepts traffic, so the strictest
 # class wins. Reading the SAME class files means the two cannot drift into disagreeing
 # about whether something may be installed unattended.
-module_needs_consent() {
+#
+# STRICTLY THE CLASS QUESTION. This says nothing about whether a HUMAN must be asked —
+# `module_needs_consent` below answers that, and it is the one callers want. Splitting
+# them keeps the class union in one place while the waiver rides on top of it.
+module_class_requires_consent() {
   local mf="$1" cls cf
   [ -f "$mf" ] || return 1
   while IFS= read -r cls; do
@@ -445,6 +474,63 @@ module_needs_consent() {
     [ "$(jq -r '.consent_required // false' "$cf" 2>/dev/null)" = "true" ] && return 0
   done <<< "$(jq -r '.permission_class | if type=="array" then .[] else . end' "$mf" 2>/dev/null)"
   return 1
+}
+
+# Has THIS ONE MODULE waived the consent QUESTION in its own manifest? Mirrors
+# `heimdall-modules obtain_consent` field for field, including its precondition:
+# obtain_consent REFUSES an install whose `consent_text` is blank — an operator cannot
+# be told by a blank disclosure any more than they can agree to one — and it checks that
+# BEFORE it reads the waiver. So a waiver with nothing to disclose is not a waiver here
+# either; honouring it would only mean acquiring a module the installer then refuses.
+#
+# The waiver is per-module by construction: it is read from the MANIFEST and never from
+# modules/_classes/*.json, so it cannot leak to the class.
+module_consent_waived() {
+  local mf="$1"
+  [ -f "$mf" ] || return 1
+  [ "$(jq -r '.consent_waived // false' "$mf" 2>/dev/null)" = "true" ] || return 1
+  [ -n "$(jq -r '.consent_text // ""' "$mf" 2>/dev/null)" ] || return 1
+  return 0
+}
+
+# Must a HUMAN be asked before this module may be acquired unattended?
+#
+# THIS IS THE FUNCTION THE UPDATER ACTS ON, and it exists because the updater and the
+# installer once disagreed about the same module. `heimdall-modules` honoured Headroom's
+# `consent_waived` and installed with no prompt; this file read only the CLASS contract,
+# so it deferred forever and told the user an update "will never install it for you"
+# while handing them a command that installs without asking. Two independent notions of
+# "does this need consent" is how that happened, so there is now exactly one precedence
+# and both binaries compute it the same way:
+#
+#   1. the union of the declared CLASSES decides whether consent is required at all;
+#   2. a required consent may be WAIVED by the module's OWN manifest;
+#   3. a waiver with no `consent_text` is inert, because the installer refuses it too.
+#
+# Waived means the QUESTION is not asked. It never means the operator is not TOLD:
+# reconcile_modules prints the disclosure before it acquires.
+module_needs_consent() {
+  local mf="$1"
+  module_class_requires_consent "$mf" || return 1
+  module_consent_waived "$mf" && return 1
+  return 0
+}
+
+# The disclosure for a module whose consent question is waived, printed BEFORE the
+# acquisition rather than after it. `heimdall-modules add` prints the module's own
+# `consent_text` again during the add; this exists so the operator is told even when the
+# add refuses at an earlier step (validate, class contract, preflight) and never reaches
+# its own disclosure — a waiver removes the question, never the telling.
+print_waiver_disclosure() {
+  local name="$1" mf="$2"
+  printf 'heimdall:   class %s. Consent for this module is WAIVED in its own manifest,\n' \
+    "$(module_class_list "$mf")"
+  printf 'heimdall:   so hmd tells you what it does instead of stopping to ask you.\n'
+  printf 'heimdall:   The waiver covers "%s" alone: the class contract is unmodified, so\n' "$name"
+  printf 'heimdall:   every other module of that class still requires your explicit consent.\n'
+  printf 'heimdall:   why: %s\n' "$(jq -r '.consent_waived_reason // "(no reason recorded)"' "$mf" 2>/dev/null)"
+  printf 'heimdall:   what it does: %s\n' "$(jq -r '.consent_text // ""' "$mf" 2>/dev/null)"
+  printf 'heimdall:   Do not want it? hmd modules optout %s\n' "$name"
 }
 
 # The classes a module declares, rendered for a human ("traffic-proxy + storage-codec").
@@ -513,6 +599,8 @@ reconcile_modules() {
     fi
 
     # 3. ABSENT, AND A HUMAN MUST SAY YES. Never installed from here — see the header.
+    # A module whose own manifest waives the question does NOT reach this branch; it
+    # falls through to 4 and is disclosed there.
     if module_needs_consent "$mf"; then
       [ "$dry" = "1" ] && log_line "reconcile: $n defer-consent"
       if [ "$mode" = "loud" ]; then
@@ -525,15 +613,34 @@ reconcile_modules() {
       continue
     fi
 
-    # 4. ABSENT, AND NO DECLARED CLASS REQUIRES CONSENT → acquire it.
+    # 4. ABSENT, AND NOBODY HAS TO BE ASKED → acquire it. Either no declared class
+    # requires consent, or one does and this module's own manifest waives the QUESTION.
+    # The waived case is logged distinctly and disclosed before anything is fetched, so
+    # "it was acquired without a prompt" can never be read off the log as "it was
+    # acquired without the operator being told".
+    local waived=0
+    module_consent_waived "$mf" && waived=1
     if [ "$dry" = "1" ]; then
-      log_line "reconcile: $n would-acquire"
+      if [ "$waived" -eq 1 ]; then
+        log_line "reconcile: $n would-acquire (consent waived in its manifest — disclosed, not asked)"
+      else
+        log_line "reconcile: $n would-acquire"
+      fi
       continue
     fi
-    log_line "reconcile: $n acquiring — in the default set, absent, not opted out"
+    if [ "$waived" -eq 1 ]; then
+      log_line "reconcile: $n acquiring — consent waived in its manifest; disclosure shown, question not asked"
+    else
+      log_line "reconcile: $n acquiring — in the default set, absent, not opted out"
+    fi
 
     if [ "$mode" = "loud" ]; then
-      printf 'heimdall: "%s" is in the default module set and is not installed — acquiring it now…\n' "$n"
+      if [ "$waived" -eq 1 ]; then
+        printf 'heimdall: "%s" ships as part of hmd and is not installed here — acquiring it now…\n' "$n"
+        print_waiver_disclosure "$n" "$mf"
+      else
+        printf 'heimdall: "%s" is in the default module set and is not installed — acquiring it now…\n' "$n"
+      fi
       if "$MODULES_BIN" add "$n"; then
         # An exit-0 add does NOT mean the payload landed. `add` succeeds for a
         # module that registered at its pin without its payload — an unprobeable
@@ -569,7 +676,15 @@ reconcile_modules() {
     fi
     # NOTE the absent `--yes`. It is absent on purpose and must stay absent: it is the
     # single flag that would turn this background job into something that consents on
-    # the operator's behalf.
+    # the operator's behalf. It is the one gate the header describes, and it holds on
+    # every branch of this function.
+    #
+    # WHERE THE DISCLOSURE GOES ON THIS PATH. The background branch is silent by design
+    # — a chatty SessionStart updater gets switched off — so `add`'s stdout, which
+    # includes the module's full `consent_text` and the waiver block, is redirected into
+    # $LOG_FILE verbatim rather than discarded. Nothing waived is acquired without the
+    # disclosure being written down somewhere the operator can read it, and `hmd
+    # --update` prints it to the terminal in full.
     if command -v setsid >/dev/null 2>&1; then
       setsid bash -c "'$MODULES_BIN' add '$n' >>'$LOG_FILE' 2>&1" >/dev/null 2>&1 &
     else
@@ -804,6 +919,15 @@ cmd_status() {
         printf '  %-16s absent — class %s requires your explicit consent\n' \
           "$n" "$(module_class_list "$mf")"
         printf '  %-16s   install it with: hmd modules add %s\n' "" "$n"
+      elif module_consent_waived "$mf"; then
+        # Its class DOES require consent; this one module's manifest waives the
+        # question. Saying "requires your explicit consent" here would describe a
+        # prompt no path in hmd will ever show for it.
+        printf '  %-16s absent — ships as part of hmd; the next update acquires it\n' "$n"
+        printf '  %-16s   class %s. Consent is waived in its own manifest: hmd discloses\n' \
+          "" "$(module_class_list "$mf")"
+        printf '  %-16s   what it does and does not stop to ask. See: hmd modules status %s\n' "" "$n"
+        printf '  %-16s   decline it with: hmd modules optout %s\n' "" "$n"
       else
         printf '  %-16s absent — will be acquired on the next update\n' "$n"
       fi
