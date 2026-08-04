@@ -326,8 +326,14 @@ EXTRA="$(ls -A "$REG/headroom" | grep -v '^manifest.json$' | head -5)"
   || bad "vendored payload in modules/headroom: $EXTRA"
 # No Headroom source anywhere in the tree: a vendored copy would carry its own
 # package metadata, which is what we look for rather than the mere word.
-VEND="$(find "$REPO" -type d \( -name 'headroom' -o -name 'headroom_ai' \) \
-        -not -path '*/.git/*' -not -path "$REG/headroom" 2>/dev/null | head -3)"
+# Prune agent worktrees by DIRECTORY NAME, not by path prefix: every agent worktree
+# carries its own copy of modules/headroom/, and $REPO may itself sit inside one — a
+# path-prefix filter then matches everything and the scan silently examines nothing.
+# -mindepth 1 keeps a checkout literally named .claude from pruning its own root.
+VEND="$(find "$REPO" -mindepth 1 \
+        \( -type d -name '.git' -o -type d -name 'worktrees' -o -type d -name 'node_modules' \) -prune -o \
+        -type d \( -name 'headroom' -o -name 'headroom_ai' \) \
+        -not -path "$REG/headroom" -print 2>/dev/null | head -3)"
 [ -z "$VEND" ] && ok "no Headroom package tree is vendored anywhere in the repo" \
                || bad "possible vendored Headroom source: $VEND"
 # No published Headroom artifact may be sitting in the tree either. The one
