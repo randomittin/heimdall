@@ -11,12 +11,24 @@
 # mutation and proves a check DISAPPEARS, which is the whole reason the dual class
 # is not cosmetic.
 #
-# HEADROOM IS NOT INSTALLED ON THIS MACHINE AND THIS SUITE NEVER INSTALLS IT.
-# The absent path is therefore the live case, and every invariant the manifest
-# ships has to be green with the library absent — because install can fail (no uv,
-# no network, wrong Python) and an operator can decline outright. A module whose
-# checks only pass when it is present is a module that cannot be honestly shipped
-# in a default set.
+# THIS SUITE OWNS ITS STATE ROOTS; THE MACHINE'S IS NONE OF ITS BUSINESS.
+# H1 used to assert "nothing is installed" against hmd's CANONICAL state root
+# ($PLUGIN_DIR/.heimdall/modules) — a directory whose contents are simply whatever
+# the operator installed. That made five assertions here statements about the
+# developer's machine, and they went RED the day the owner ran `hmd modules add
+# headroom` for real. Headroom is `default_included: true`, so HAVING it is the
+# normal state for everyone: a suite that only passes on machines that never
+# adopted the feature is worthless exactly when it matters. Every list/status
+# assertion below therefore runs against a scratch --state this file creates.
+#
+# THE ABSENCE ASSERTIONS ARE KEPT, NOT DELETED — they are a real property. Install
+# can fail (no uv, no network, wrong Python) and an operator can decline outright,
+# so every invariant the manifest ships has to be green with the library absent; a
+# module whose checks only pass when it is present cannot be honestly shipped in a
+# default set. They are simply pointed at a root where the module is genuinely
+# absent, which this file controls. And they are now paired with the PRESENT arm
+# (H1b), which is both the case an operator is actually in and the falsifier that
+# stops "not installed" from being a constant this suite would happily accept.
 #
 # WHY THE MUTATIONS RUN AGAINST A COPY. Every corrupt-the-manifest arm builds a
 # temp registry from a byte-identical copy of the real one (asserted in H0), so an
@@ -26,8 +38,10 @@
 # Guarantees proved:
 #   H0  the manifest is valid JSON, covers the schema, and the temp copy the
 #       mutation arms use is byte-identical to the shipped file.
-#   H1  `hmd modules` lists headroom as AVAILABLE and NOT INSTALLED, and
-#       `status headroom` is honest that it is absent.
+#   H1  `hmd modules` lists headroom as AVAILABLE, and against a state root where
+#       it is genuinely absent, list/status are honest about that absence.
+#   H1b the same surfaces against a root this file really installs into are honest
+#       about PRESENCE — the falsifier that proves H1 reads state, not a constant.
 #   H2  permission_class is DUAL, and both named classes exist in the registry.
 #   H3  the add path runs BOTH classes' invariants with the module wired, and the
 #       recorded evidence proves the judgment falsifier really ran at 25/0 —
@@ -47,7 +61,9 @@
 #   H10 default_included is a boolean distribution fact, kept separate from tier,
 #       and it does not waive the disclosure text.
 #   H11 DEPEND, DON'T CLONE — the module directory holds a manifest and nothing
-#       else, and no Headroom source is vendored anywhere in the tree.
+#       else, and no Headroom source is vendored anywhere in the tree. The verdict
+#       is taken from a candidate directory's CONTENTS, never its path, and H11b
+#       proves that rule still fires on a vendoring hidden in an excluded shape.
 #   H12 CP / enroll / signed traffic is scrubbed of LOCAL REWRITERS — and is NOT
 #       blanket-bypassed, because a corporate CONNECT proxy must keep working.
 #
@@ -89,6 +105,17 @@ mutate() {
     && mv "$MREG/headroom/m.tmp" "$MREG/headroom/manifest.json"
 }
 
+# Two state roots this file owns outright, against the REAL registry. `list` and
+# `status` with no --state read hmd's canonical root, so every install-state
+# assertion gets an explicit one instead: nothing is ever added to ABSENT_STATE,
+# and H1b really does add the module to PRESENT_STATE. Both cases then hold on any
+# machine, adopted or not.
+ABSENT_STATE="$TMP/state/absent"
+PRESENT_STATE="$TMP/state/present"
+mkdir -p "$ABSENT_STATE"
+hmd_absent()  { "$MODS" --state "$ABSENT_STATE"  "$@"; }
+hmd_present() { "$MODS" --state "$PRESENT_STATE" "$@"; }
+
 echo
 echo "H0 — the manifest is valid and the mutation copy is byte-identical"
 jq -e . "$MANIFEST" >/dev/null 2>&1 \
@@ -114,7 +141,10 @@ jq -e '.installs_via.fetch | test("uv tool install")' "$MANIFEST" >/dev/null 2>&
 
 echo
 echo "H1 — listed as AVAILABLE, and honest that it is NOT installed"
-LIST="$("$MODS" list 2>&1)"
+# Against ABSENT_STATE: a state root this file created and never added to, so
+# "nothing is installed" is a fact the suite established rather than one it
+# inherited from whoever ran hmd on this machine last.
+LIST="$(hmd_absent list 2>&1)"
 printf '%s' "$LIST" | grep -q 'headroom' \
   && ok "\`hmd modules\` lists headroom" || bad "headroom is not listed"
 printf '%s' "$LIST" | grep -qE 'headroom +available' \
@@ -122,19 +152,66 @@ printf '%s' "$LIST" | grep -qE 'headroom +available' \
 printf '%s' "$LIST" | grep -q 'Installed: none' \
   && ok "nothing is installed — the base install ships zero payloads" \
   || bad "something is reported installed"
-JLIST="$("$MODS" --json list 2>/dev/null)"
+JLIST="$(hmd_absent --json list 2>/dev/null)"
 [ "$(printf '%s' "$JLIST" | jq -r '.installed_count')" = "0" ] \
   && ok "json list agrees: installed_count is 0" || bad "json list reports an install"
 [ "$(printf '%s' "$JLIST" | jq -r '.available[] | select(.name=="headroom") | .tier')" = "available" ] \
   && ok "json list reports headroom at tier available" || bad "json tier is wrong"
-STATUS="$("$MODS" status headroom 2>&1)"
+STATUS="$(hmd_absent status headroom 2>&1)"
 printf '%s' "$STATUS" | grep -q 'not installed' \
   && ok "\`status headroom\` is honest that it is absent" || bad "status is not honest about absence"
-[ "$("$MODS" --json status headroom 2>/dev/null | jq -r '.installed')" = "false" ] \
+[ "$(hmd_absent --json status headroom 2>/dev/null | jq -r '.installed')" = "false" ] \
   && ok "json status reports installed:false" || bad "json status is not honest"
-python3 "$REPO/bin/lib/memory_codec.py" status 2>&1 | grep -q 'available: no' \
-  && ok "the codec seam reports available:no — Headroom really is absent here" \
-  || bad "the codec seam claims a backend that is not installed"
+# NOT a state-root fact — an IMPORT-PATH one, and it is why the absent path stays
+# the live case even on a machine that has adopted the module. The sanctioned
+# install is `uv tool install`, which puts headroom-ai in an isolated uv tool venv
+# that hmd's python3 cannot see, so `import headroom` fails whether or not the
+# module is added and the seam must stay on the plain backend. Asserting the
+# REASON as well as the verdict is what stops a seam that has silently stopped
+# looking from reading as a seam that looked and found nothing.
+CODEC="$(python3 "$REPO/bin/lib/memory_codec.py" status 2>&1)"
+printf '%s' "$CODEC" | grep -q 'available: no' \
+  && ok "the codec seam is on the plain backend — the uv-tool install never reaches hmd's import path" \
+  || bad "the codec seam claims a backend hmd cannot import"
+printf '%s' "$CODEC" | grep -q 'not importable' \
+  && ok "…and it NAMES the reason: headroom is not importable from hmd's interpreter" \
+  || bad "the seam reports plain without saying headroom is unimportable"
+
+echo
+echo "H1b — and honest about PRESENCE, against a root this file really installs into"
+# THE FALSIFIER FOR H1. Identical surfaces, a state root where the module is
+# genuinely installed, opposite answers. Without this arm, every "not installed"
+# above would pass just as happily against a tool that printed the words
+# unconditionally. It is also the case an operator is actually in: headroom is
+# default_included, so PRESENT is the normal state and deserves its own honesty
+# assertions rather than being the case nobody checked.
+PIN="$(jq -r '.pinned_version.version' "$MANIFEST")"
+PADD="$(hmd_present add headroom --yes 2>&1)"; PRC=$?
+[ "$PRC" -eq 0 ] && ok "the module installs into a state root the suite owns (exit 0)" \
+  || { bad "add into the scratch present root failed (exit $PRC)"; printf '%s\n' "$PADD" | tail -15; }
+PLIST="$(hmd_present list 2>&1 | tr -s ' ')"
+printf '%s' "$PLIST" | grep -q 'Installed: none' \
+  && bad "list still reports 'Installed: none' with the module installed" \
+  || ok "list stops claiming an empty install set once the module is there"
+printf '%s' "$PLIST" | grep -qF "headroom $PIN" \
+  && ok "list names headroom at the manifest pin ($PIN)" || bad "list does not report the installed pin"
+PJLIST="$(hmd_present --json list 2>/dev/null)"
+[ "$(printf '%s' "$PJLIST" | jq -r '.installed_count')" = "1" ] \
+  && ok "json list agrees: installed_count is 1" || bad "json list did not count the install"
+[ "$(printf '%s' "$PJLIST" | jq -r '[.installed[] | select(.name=="headroom")] | length')" = "1" ] \
+  && ok "json list names headroom under installed" || bad "json list lost the installed module"
+PSTATUS="$(hmd_present status headroom 2>&1 | tr -s ' ')"
+printf '%s' "$PSTATUS" | grep -q 'not installed' \
+  && bad "status still claims absence with the module installed" \
+  || ok "\`status headroom\` is honest about PRESENCE — it stops claiming absence"
+printf '%s' "$PSTATUS" | grep -qF "pin: $PIN" \
+  && ok "status reports the pin it installed" || bad "status does not report the installed pin"
+[ "$(hmd_present --json status headroom 2>/dev/null | jq -r '.installed')" = "true" ] \
+  && ok "json status reports installed:true" || bad "json status hides the install"
+hmd_present remove headroom >/dev/null 2>&1
+[ "$(hmd_present --json status headroom 2>/dev/null | jq -r '.installed')" = "false" ] \
+  && ok "…and back to installed:false after remove — the readout TRACKS state, it is not a constant" \
+  || bad "status still reports installed after remove"
 
 echo
 echo "H2 — permission_class is DUAL and both contracts exist"
@@ -159,7 +236,7 @@ if [ -f "$INV" ]; then
     && ok "all six invariants across both classes ran" \
     || bad "expected 6 invariants, got $(jq -r 'length' "$INV")"
   [ "$(jq -r '[.[] | select(.passed)] | length' "$INV")" = "6" ] \
-    && ok "all six passed with Headroom ABSENT" || bad "not all six passed"
+    && ok "all six passed with the codec library NOT importable" || bad "not all six passed"
   [ "$(jq -r '[.[] | select(.class=="traffic-proxy")] | length' "$INV")" = "3" ] \
     && ok "three of them are attributed to traffic-proxy" || bad "traffic-proxy count wrong"
   [ "$(jq -r '[.[] | select(.class=="storage-codec")] | length' "$INV")" = "3" ] \
@@ -325,16 +402,53 @@ EXTRA="$(ls -A "$REG/headroom" | grep -v '^manifest.json$' | head -5)"
 [ -z "$EXTRA" ] \
   && ok "modules/headroom holds manifest.json and nothing else" \
   || bad "vendored payload in modules/headroom: $EXTRA"
-# No Headroom source anywhere in the tree: a vendored copy would carry its own
-# package metadata, which is what we look for rather than the mere word.
+# No Headroom source anywhere in the tree. What makes a directory a VENDORING is
+# what is INSIDE it, so that is what is judged — never its path.
+#
+# hmd legitimately owns directories called `headroom` and it always will: the
+# registry entry (modules/headroom/, one manifest) and, the moment anybody runs
+# `hmd modules add headroom`, the install record ($STATE/headroom/, receipts hmd
+# writes itself). Flagging those by name is what made this check fail on the
+# owner's machine for doing the thing the module exists to do. Excluding them BY
+# PATH would have been worse: `.heimdall/modules/headroom` is a path a real
+# vendoring could be dropped into, and the check would then have been blind there
+# forever.
+#
+# So the exclusion is an INVENTORY, not a path. A candidate is cleared only if
+# every file beneath it is one of the four records hmd writes itself; anything else
+# — a .py, a pyproject.toml, a PKG-INFO, a LICENSE, one stray source file — is
+# foreign, and a directory holding foreign files is reported. Headroom's source
+# cannot be spelled in manifest.json/receipt.json/wired.json/invariants.json, so no
+# genuine vendoring can satisfy the inventory, wherever it is put. H11b proves that
+# on the exact shape this fix stopped flagging.
+HMD_OWN_RECORDS='manifest.json receipt.json wired.json invariants.json'
+
+# Files under $1 that hmd does not write itself. Empty ⇒ hmd bookkeeping only.
+foreign_files() {
+  find "$1" -type f 2>/dev/null | while IFS= read -r f; do
+    case " $HMD_OWN_RECORDS " in
+      *" ${f##*/} "*) ;;
+      *) printf '%s\n' "$f" ;;
+    esac
+  done
+}
+
+# Every directory under $1 that is NAMED like a Headroom package tree AND holds
+# something other than hmd's own records.
 # Prune agent worktrees by DIRECTORY NAME, not by path prefix: every agent worktree
 # carries its own copy of modules/headroom/, and $REPO may itself sit inside one — a
 # path-prefix filter then matches everything and the scan silently examines nothing.
 # -mindepth 1 keeps a checkout literally named .claude from pruning its own root.
-VEND="$(find "$REPO" -mindepth 1 \
-        \( -type d -name '.git' -o -type d -name 'worktrees' -o -type d -name 'node_modules' \) -prune -o \
-        -type d \( -name 'headroom' -o -name 'headroom_ai' \) \
-        -not -path "$REG/headroom" -print 2>/dev/null | head -3)"
+scan_vendored() {
+  find "$1" -mindepth 1 \
+      \( -type d -name '.git' -o -type d -name 'worktrees' -o -type d -name 'node_modules' \) -prune -o \
+      -type d \( -name 'headroom' -o -name 'headroom_ai' \) -print 2>/dev/null \
+  | while IFS= read -r d; do
+      [ -n "$(foreign_files "$d")" ] && printf '%s\n' "$d"
+    done
+}
+
+VEND="$(scan_vendored "$REPO" | head -3)"
 [ -z "$VEND" ] && ok "no Headroom package tree is vendored anywhere in the repo" \
                || bad "possible vendored Headroom source: $VEND"
 # No published Headroom artifact may be sitting in the tree either. The one
@@ -346,6 +460,40 @@ VENDFILE="$(find "$REPO" \( -name 'headroom_ai-*' -o -name 'headroom-*.tar.gz' \
 [ -z "$VENDFILE" ] \
   && ok "no Headroom sdist or wheel is vendored in the tree" \
   || bad "vendored Headroom artifact: $VENDFILE"
+
+echo
+echo "H11b — FALSIFIER: the content rule still fires on a vendoring hidden in an hmd shape"
+# A green scan proves nothing until the same scan can go RED. These trees are built
+# under $TMP, outside $REPO, so they cannot disturb the real assertion above.
+VFX="$TMP/vendorscan"
+# (a) the two shapes hmd genuinely owns: the registry entry, and the install record
+#     `add` writes — the exact directory that used to fail this check.
+mkdir -p "$VFX/clean/modules/headroom" "$VFX/clean/.heimdall/modules/headroom"
+printf '{}\n' > "$VFX/clean/modules/headroom/manifest.json"
+for r in receipt wired invariants; do printf '{}\n' > "$VFX/clean/.heimdall/modules/headroom/$r.json"; done
+[ -z "$(scan_vendored "$VFX/clean")" ] \
+  && ok "GREEN: hmd's own registry entry AND install record are both cleared" \
+  || bad "the scan flags hmd's own bookkeeping: $(scan_vendored "$VFX/clean")"
+# (b) source smuggled INTO the install record. This is the whole question: the
+#     directory the fix stopped flagging is precisely where a violation would now
+#     try to hide, so a path-based exclusion would be blind here and this must fire.
+cp -R "$VFX/clean" "$VFX/smuggled"
+printf 'def compress(text):\n    return text\n' > "$VFX/smuggled/.heimdall/modules/headroom/__init__.py"
+printf '%s' "$(scan_vendored "$VFX/smuggled")" | grep -q '\.heimdall/modules/headroom' \
+  && ok "RED: one .py inside the install record is reported — the exclusion is an inventory, not a path" \
+  || bad "a vendoring hidden in the install-state directory was MISSED"
+# (c) an ordinary vendoring anywhere else is still caught…
+mkdir -p "$VFX/plain/vendor/headroom"
+printf 'def compress(text):\n    return text\n' > "$VFX/plain/vendor/headroom/__init__.py"
+printf '[project]\nname = "headroom"\n' > "$VFX/plain/vendor/headroom/pyproject.toml"
+printf '%s' "$(scan_vendored "$VFX/plain")" | grep -q 'vendor/headroom' \
+  && ok "RED: a plain vendored source tree is reported" || bad "an outright vendoring was missed"
+# (d) …and it cannot launder itself by wearing an hmd-shaped filename, because the
+#     rule clears a directory only when EVERY file in it is one of hmd's records.
+cp "$VFX/clean/modules/headroom/manifest.json" "$VFX/plain/vendor/headroom/manifest.json"
+printf '%s' "$(scan_vendored "$VFX/plain")" | grep -q 'vendor/headroom' \
+  && ok "RED: adding a manifest.json beside the source does not clear it" \
+  || bad "a vendoring laundered itself with an hmd-shaped filename"
 
 echo
 echo "H12 — CP / enroll / signed traffic is scrubbed of LOCAL REWRITERS"
