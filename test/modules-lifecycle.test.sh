@@ -207,14 +207,14 @@ STATE_PRE="$(tree_sum "$STATE")"
 
 OUT="$(hmd add good --yes 2>&1)"; RC=$?
 [ "$RC" -eq 0 ] && ok "add succeeded" || { bad "add failed (exit $RC)"; printf '%s\n' "$OUT"; }
-for step in 'validate' 'class contract' 'consent' 'install + digest-verify' 'wire' 'class invariants'; do
+for step in 'validate' 'class contract' 'consent' 'install + provenance' 'wire' 'class invariants'; do
   printf '%s' "$OUT" | grep -qF "$step" \
     && ok "pipeline ran step: $step" || bad "pipeline never reported: $step"
 done
 # The order is the contract: install must not precede consent, invariants must
 # not precede wiring.
 LINE_CONSENT=$(printf '%s\n' "$OUT" | grep -n 'consent'          | head -1 | cut -d: -f1)
-LINE_INSTALL=$(printf '%s\n' "$OUT" | grep -n 'install + digest' | head -1 | cut -d: -f1)
+LINE_INSTALL=$(printf '%s\n' "$OUT" | grep -n '\[5/7\] install' | head -1 | cut -d: -f1)
 LINE_WIRE=$(printf '%s\n'    "$OUT" | grep -n '\[6/7\] wire'     | head -1 | cut -d: -f1)
 LINE_INV=$(printf '%s\n'     "$OUT" | grep -n 'class invariants' | head -1 | cut -d: -f1)
 [ -n "$LINE_CONSENT" ] && [ -n "$LINE_INSTALL" ] && [ "$LINE_CONSENT" -lt "$LINE_INSTALL" ] \

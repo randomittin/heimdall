@@ -6,8 +6,9 @@
 #
 # THE DEFECT THIS FILE EXISTS TO KEEP DEAD. `hmd modules add headroom` printed
 #
-#     [5/7] install + digest-verify
-#           digest: deferred-upstream
+#     [5/7] install + digest-verify        (the step was CALLED that at the time;
+#           digest: deferred-upstream       it is `install + provenance` now — see
+#                                           test/module-provenance-honesty.test.sh)
 #     Installed "headroom" at pin 0.33.0 (class traffic-proxy + storage-codec).
 #
 # while `uv tool list` said `No tools installed`. Nothing had been fetched: the

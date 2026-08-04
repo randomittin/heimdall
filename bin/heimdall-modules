@@ -16,7 +16,17 @@
 # THE ORDER IS THE CONTRACT:
 #
 #     validate -> class contract -> preflight -> consent
-#              -> install + digest-verify -> wire -> invariants
+#              -> install + provenance -> wire -> invariants
+#
+# THE STEP IS CALLED "provenance", NOT "digest-verify", AND THAT NAMING IS LOAD-
+# BEARING. A digest is verified on exactly one path: `installs_via.kind == "local"`,
+# where the shipped artifact is hashed HERE and compared to the pin. An `upstream`
+# module is fetched from a package index, and hmd hashes NOTHING on that path — it
+# records the pin and asks the installer whether the payload arrived. Printing
+# "digest-verify" over that would assert a check that never ran, which is the exact
+# failure this file exists to design out. The step therefore reports PROVENANCE (what
+# is known about where the payload came from) and says, in words, whether an artifact
+# was hashed. See install_module().
 #
 # Everything before `install` is READ-ONLY, so a manifest rejected at validate,
 # class, preflight or consent mutates nothing at all. From `install` onward every
@@ -923,7 +933,7 @@ acquire_upstream() {
   return 1
 }
 
-# ── Step 4: INSTALL + DIGEST-VERIFY ──────────────────────────────────────────
+# ── Step 4: INSTALL + PROVENANCE ─────────────────────────────────────────────
 # The first mutating step. Creates the state root if it is absent and records
 # the topmost directory it created, so removal can unwind exactly that much.
 DIGEST_JSON="null"
@@ -946,11 +956,14 @@ install_module() {
 
   mkdir -p "$mdir" || { warn "error: cannot create $mdir"; return 1; }
 
-  # Digest-verify. A local artifact is hashed and compared to the pin; a
-  # mismatch is a REFUSAL. An upstream module is depended on, not cloned, so
-  # there is nothing on disk to hash at add time — that is recorded as
-  # DEFERRED rather than reported as verified. Claiming a check that did not
-  # run is the one thing worse than not running it.
+  # PROVENANCE. Exactly one branch below verifies a digest: `local`, where the
+  # shipped artifact is hashed HERE and compared to the pin, and a mismatch is a
+  # REFUSAL. The `upstream` branch hashes NOTHING — the payload is fetched by a
+  # package installer into that installer's own store, so no artifact ever exists
+  # HERE to hash, and the pin is RECORDED rather than checked. `digest.verified`
+  # is the machine-readable form of that distinction and is true only on the
+  # branch that actually hashed something. Claiming a check that did not run is
+  # the one thing worse than not running it.
   local kind pinned actual apath
   kind="$(jq -r '.installs_via.kind' "$mf")"
   pinned="$(jq -r '.pinned_version.artifact_sha256' "$mf")"
@@ -975,7 +988,7 @@ install_module() {
       return 1
     fi
     DIGEST_JSON="$(jq -n --arg s "$actual" --arg p "${apath#"$PLUGIN_DIR"/}" \
-      '{status:"verified", sha256:$s, artifact:$p,
+      '{status:"verified", verified:true, sha256:$s, artifact:$p,
         note:"artifact hashed at install and matched the manifest pin"}')"
     # A local module's artifact IS its payload, and it was just hashed.
     PAYLOAD_PRESENT=1
@@ -993,8 +1006,8 @@ install_module() {
     [ "$PAYLOAD_PRESENT" -eq 1 ] && dstatus="present-upstream"
     DIGEST_JSON="$(jq -n --arg p "$pinned" --arg f "$(jq -r '.installs_via.fetch' "$mf")" \
       --arg st "$dstatus" \
-      '{status:$st, pinned_sha256:$p, fetch:$f,
-        note:"upstream dependency — depend, do not clone. Nothing is vendored at add time, so no artifact existed to hash HERE. `status` records whether the payload is present on the machine; the pin is RECORDED and re-checked by `verify`. Neither state is ever reported as a verified artifact digest."}')"
+      '{status:$st, verified:false, pinned_sha256:$p, fetch:$f,
+        note:"upstream dependency — depend, do not clone. NO ARTIFACT DIGEST WAS VERIFIED and none is claimed: nothing is vendored at add time, so no artifact ever existed HERE to hash. The pin is RECORDED ONLY, and nothing in hmd re-checks it afterwards — `verify` re-runs the class invariants and reads no digest at all. `status` says whether the payload is PRESENT on the machine, which is an installer probe rather than a hash. `verified` is false in every upstream state."}')"
   fi
 
   jq -n \
@@ -1206,8 +1219,8 @@ cmd_add() {
   printf '  [4/7] consent\n'
   obtain_consent "$name" "$mf" || exit 1
 
-  # 5. INSTALL + ACQUIRE + DIGEST-VERIFY (first mutation)
-  printf '  [5/7] install + digest-verify\n'
+  # 5. INSTALL + ACQUIRE + PROVENANCE (first mutation)
+  printf '  [5/7] install + provenance\n'
   if ! install_module "$name" "$mf"; then
     # A payload that did not land is NOT a refusal — nothing is wrong with the
     # module or the machine's consent. It is an absence, and it unwinds through
@@ -1234,7 +1247,19 @@ cmd_add() {
     warn "refused: install failed. Rolled back — no trace left."
     exit 1
   fi
-  printf '        digest: %s\n' "$(printf '%s' "$DIGEST_JSON" | jq -r '.status')"
+  # WHAT THIS LINE IS ALLOWED TO SAY. It is DERIVED from `digest.verified`, never
+  # written as a fixed string, so the words "artifact digest VERIFIED" can only be
+  # printed by the branch that actually hashed an artifact. Every other state prints
+  # "NOT verified here" in those words, next to the status that says why. A reader
+  # who sees `present-upstream` must not be able to read a hash into it.
+  if [ "$(printf '%s' "$DIGEST_JSON" | jq -r '.verified')" = "true" ]; then
+    printf '        provenance: artifact digest VERIFIED here against the manifest pin (%s)\n' \
+      "$(printf '%s' "$DIGEST_JSON" | jq -r '.status')"
+  else
+    printf '        provenance: pin RECORDED — artifact digest NOT verified here (%s)\n' \
+      "$(printf '%s' "$DIGEST_JSON" | jq -r '.status')"
+    printf '        %s\n' "$(printf '%s' "$DIGEST_JSON" | jq -r '.note')"
+  fi
   if [ "$PAYLOAD_PRESENT" -eq 1 ]; then
     printf '        payload: PRESENT — %s\n' "$(printf '%s' "$PAYLOAD_JSON" | jq -r '.reason')"
   else
@@ -1392,7 +1417,8 @@ cmd_status() {
     class:    \(.permission_class)
     tier:     \(.tier)
     added:    \(.installed_at)
-    digest:   \(.digest.status) — \(.digest.note)
+    provenance: \(if (.digest.verified // false) then "artifact digest VERIFIED here against the manifest pin" else "pin RECORDED — artifact digest NOT verified here" end) (\(.digest.status))
+              \(.digest.note)
     consent:  \(if (.consent.waived // false) then
                    "WAIVED for this module — disclosed, not asked, at \(.consent.granted_at)
               why:      \(.consent.waived_reason // "")
@@ -1542,20 +1568,30 @@ load_preflight() {
 
 # WHICH PREFLIGHT FAILURES BLOCK AN `add` — and why the rest do not.
 #
-# `add` on an upstream module is a DECLARATION, not a download. Its own digest
-# step says so in as many words: "depend, do not clone. Nothing is vendored at
-# add time." `add` records the pin, wires the module and runs the class
-# invariants; it never runs `installs_via.fetch`. The verb that fetches is
-# `repair`, and `repair` blocks on EVERY blocking check for exactly that reason.
+# `add` DOES RUN `installs_via.fetch`. An earlier version of this comment said it
+# never did, and that was false: acquire_upstream() executes the recorded fetch
+# whenever the installer is probeable and the state root is canonical, and the add
+# prints `fetching: …` while it happens. Anything written here has to describe THAT
+# code, because a comment that describes a design the file abandoned is how a
+# reviewer ends up certifying the wrong thing.
+#
+# The distinction that actually decides this list is REFUSAL vs ABSENCE:
+#   REFUSED  hmd will not RECORD the install, because the receipt it would write
+#            would be false. Nothing is attempted.
+#   ABSENT   hmd attempted the fetch and the payload did not land. The module is
+#            rolled back through remove_module() and reported ABSENT with the
+#            blocker and the remedy — see the `absent` branch in cmd_add.
 #
 # So `add` refuses on precisely the checks that would falsify what IT writes:
 #   pin       the receipt would record a pin the artifact can never be proven against
 #   disk      there is not room to write the receipt and its invariant evidence
 #   platform  no wheel and no toolchain — the payload can never run on this box
 # Every other failure is RENDERED in full, with its remedy and with the repair
-# command that needs it. Refusing an add for a precondition the add never touches
-# would be a FALSE refusal, and a false refusal is how a gate teaches people to
-# route around it.
+# command that needs it, and then the fetch is still attempted: a missing `uv`
+# makes the fetch fail, which is an honest ABSENT with the exact fix, not a refusal
+# to record anything. Refusing an add for a precondition that only decides whether
+# the PAYLOAD lands would be a FALSE refusal, and a false refusal is how a gate
+# teaches people to route around it.
 ADD_BLOCKING_CHECKS="pin disk platform"
 
 # Runs preflight for `add`, prints what it found, and returns non-zero only when
