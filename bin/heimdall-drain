@@ -49,6 +49,12 @@ AGENT_POOL="$BINDIR/agent-pool"
 SESSION_FORK="$BINDIR/session-fork"
 ATTEST="$BINDIR/heimdall-attest"
 
+# THE JUDGMENT INVARIANT: resolve_verdict() produces the PROVEN|BLOCKED verdict, so it runs
+# with judgment pinned to the real provider — a context-compressing proxy exported into the
+# shell may shape GENERATION (run_task), never the verdict.
+# shellcheck source=lib/hmd-gate-endpoint.sh
+. "$BINDIR/lib/hmd-gate-endpoint.sh"
+
 PY="$(command -v python3 || command -v python || true)"
 [ -n "$PY" ] || { echo "error: python3 not found" >&2; exit 2; }
 [ -x "$QUEUE" ] || { echo "error: missing $QUEUE" >&2; exit 2; }
@@ -121,7 +127,10 @@ resolve_verdict() {
   local id="$1" prompt="$2"
   if [ -n "${HEIMDALL_WATCH_VERDICT_CMD:-}" ]; then
     local out
-    out="$(HEIMDALL_WATCH_VERDICT_CMD="" bash -c "$HEIMDALL_WATCH_VERDICT_CMD \"\$1\" \"\$2\"" _ "$id" "$prompt" 2>/dev/null || true)"
+    # `env VAR=` (not a bare `VAR= hmd_gate_exec` prefix): an assignment prefixed to a
+    # FUNCTION can leak into the caller's shell, which would blank the seam for every later
+    # iteration of the drain loop. Passing it through env keeps it scoped to this child.
+    out="$(hmd_gate_exec env HEIMDALL_WATCH_VERDICT_CMD="" bash -c "$HEIMDALL_WATCH_VERDICT_CMD \"\$1\" \"\$2\"" _ "$id" "$prompt" 2>/dev/null || true)"
     case "$out" in
       *PROVEN*)  echo "PROVEN";  return 0 ;;
       *BLOCKED*) echo "BLOCKED"; return 0 ;;
@@ -130,7 +139,7 @@ resolve_verdict() {
   fi
   if [ -x "$ATTEST" ] && git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
     local rec passed
-    rec="$("$ATTEST" emit --repo "$REPO" --print --quiet --id "watch-$id" 2>/dev/null || true)"
+    rec="$(hmd_gate_exec "$ATTEST" emit --repo "$REPO" --print --quiet --id "watch-$id" 2>/dev/null || true)"
     passed="$(printf '%s' "$rec" | jget evidence.all_passed)"
     [ "$passed" = "true" ] && { echo "PROVEN"; return 0; }
     echo "BLOCKED"; return 0

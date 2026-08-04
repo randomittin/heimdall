@@ -76,6 +76,12 @@ PLUGIN_DIR="$(cd "$BIN_DIR/.." && pwd)"
 # can render a sub-1.0 board). It never changes default behavior.
 ORACLES_DIR="${HEIMDALL_ORACLES_DIR:-$PLUGIN_DIR/evals/oracles}"
 
+# THE JUDGMENT INVARIANT: falsify's whole output is a VERDICT (a mutant-kill score that
+# gates the push), so every gate it runs reads UNCOMPRESSED context from the real provider
+# — never a context-compressing proxy the ambient shell happens to export. See run_gate().
+# shellcheck source=lib/hmd-gate-endpoint.sh
+. "$PLUGIN_DIR/bin/lib/hmd-gate-endpoint.sh"
+
 command -v jq >/dev/null 2>&1 || { echo "error: jq is required" >&2; exit 2; }
 
 usage() { sed -n '2,60p' "$SELF"; }
@@ -200,10 +206,12 @@ run_gate() {
   # When the domain ships a separate independently-derived truth log (emulator-gb,
   # R-2), forward it as --truth so the diff is input-vs-independent-truth, never the
   # X-vs-X self-diff run.sh's default truth would produce.
+  # hmd_gate_exec: judgment runs UNCOMPRESSED. The gate subprocess is handed a scrubbed,
+  # provider-pinned env so no exported proxy can reach the thing producing the PASS/FAIL.
   if [ -n "$GOLDEN_TRUTH" ]; then
-    bash "$RUN_SH" --input "$input" --truth "$GOLDEN_TRUTH" --report "$report" >/dev/null 2>&1 || true
+    hmd_gate_exec bash "$RUN_SH" --input "$input" --truth "$GOLDEN_TRUTH" --report "$report" >/dev/null 2>&1 || true
   else
-    bash "$RUN_SH" --input "$input" --report "$report" >/dev/null 2>&1 || true
+    hmd_gate_exec bash "$RUN_SH" --input "$input" --report "$report" >/dev/null 2>&1 || true
   fi
   echo "$report"
 }
