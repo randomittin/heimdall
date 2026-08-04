@@ -463,6 +463,17 @@ validate_manifest() {
   if jq -e '.wires | type == "array"' "$mf" >/dev/null 2>&1; then
     v="$(jq -r '[.wires[] | select((.kind // "") == "" or (.target // "") == "")] | length' "$mf")"
     [ "$v" = "0" ] || verr "every entry in \`wires\` needs a non-empty \`kind\` and \`target\` ($v malformed)"
+    # EVERY DECLARED KIND MUST RESOLVE TO A HANDLER. A kind the dispatcher cannot
+    # act on could only ever be recorded and never applied — and a recorded wire
+    # is byte-identical to a live one on the record, the install output and
+    # `status`, which is precisely how a module comes to claim a capability the
+    # code does not deliver. Refused here, read-only, before anything is written.
+    local wk
+    while IFS= read -r wk; do
+      [ -n "$wk" ] || continue
+      wire_kind_known "$wk" \
+        || verr "unknown wire kind \"$wk\" in \`wires\` — no handler exists for it, so it could only ever be recorded and never applied. Known kinds: $WIRE_KINDS"
+    done <<< "$(jq -r '.wires[]?.kind // empty' "$mf")"
   else
     verr "missing \`wires\` array"
   fi
@@ -1036,13 +1047,130 @@ install_module() {
 # Wiring is what makes a module ACTIVE. It is recorded before invariants run,
 # by design: the class contracts assert behaviour "with the module active", so
 # the invariants must execute against a wired module or they prove nothing.
+#
+# THIS STEP ONCE WROTE `targets: (.wires // [])` AND RETURNED. It dispatched on
+# nothing and touched no target, so a module could declare a wire the code had no
+# handler for and the record, the step's green, and `status` all read exactly like
+# a wired module's. Headroom shipped in that state: both its declared wires were
+# inert and nothing anywhere said so. The honest state and the dishonest state
+# were byte-identical on every surface a reader checks — which is the shape of
+# every overclaim, and why silence here is the bug.
+#
+# The kinds this binary can actually act on. A manifest may declare only a kind
+# that appears here: validate refuses anything else read-only (see the wires block
+# in validate_manifest) and wire_apply refuses it again as the backstop.
+WIRE_KINDS='wrap-chain storage-codec-backend env'
+
+wire_kind_known() {
+  case " $WIRE_KINDS " in
+    *" $1 "*) return 0 ;;
+    *)        return 1 ;;
+  esac
+}
+
+# Each handler answers ONE question about ONE declared wire: is it ROUTED on this
+# machine right now, or merely RECORDED? The answer is MEASURED from the machine,
+# never written as a fixed string — the same discipline the provenance line in
+# cmd_add follows, and for the same reason: a status that cannot be wrong cannot
+# be trusted. WIRE_MEASURED distinguishes "measured and not routed" from "could
+# not be measured here", because reporting an unmeasurable wire as not-routed is
+# a lie of the same species as reporting an inert one as wired.
+WIRE_MEASURED=0
+WIRE_ROUTED=0
+WIRE_DETAIL=""
+wire_apply() {
+  local name="$1" kind="$2" target="$3"
+  WIRE_MEASURED=0; WIRE_ROUTED=0; WIRE_DETAIL=""
+  local f bk
+  case "$kind" in
+    wrap-chain)
+      # The target is a file in the hmd tree that is supposed to offer the chain.
+      # A wire pointing at a file that does not exist is a defect in the manifest,
+      # not an inert wire, so it is refused rather than recorded.
+      f="$PLUGIN_DIR/$target"
+      [ -f "$f" ] || { WIRE_DETAIL="the target does not exist in this tree: $target"; return 1; }
+      WIRE_MEASURED=1
+      if grep -qi -- "$name" "$f" 2>/dev/null; then
+        WIRE_ROUTED=1
+        WIRE_DETAIL="$target references \"$name\", so the chain it offers can reach the module"
+      else
+        WIRE_DETAIL="$target contains no reference to \"$name\" — hmd routes nothing through the module"
+      fi
+      ;;
+    storage-codec-backend)
+      # Ask the codec seam itself which backend is live. The seam is the only
+      # authority on that; anything else here would be this file's opinion.
+      f="$PLUGIN_DIR/$target"
+      [ -f "$f" ] || { WIRE_DETAIL="the target does not exist in this tree: $target"; return 1; }
+      bk="$(python3 "$f" status --json 2>/dev/null | jq -r '.backend // empty' 2>/dev/null)"
+      if [ -z "$bk" ]; then
+        WIRE_DETAIL="$target could not be asked which backend is live, so this wire is unmeasured here"
+        return 0
+      fi
+      WIRE_MEASURED=1
+      if [ "$bk" = "$name" ]; then
+        WIRE_ROUTED=1
+        WIRE_DETAIL="$target reports backend=$bk — the seam is on the module's codec"
+      else
+        WIRE_DETAIL="$target reports backend=$bk, not \"$name\" — the seam is not on the module's codec"
+      fi
+      ;;
+    env)
+      # The target names an environment variable. A proxy reaches a request path
+      # by exactly this mechanism, which is why hmd_gate_exec scrubs it.
+      case "$target" in
+        ""|[0-9]*|*[!A-Za-z0-9_]*)
+          WIRE_DETAIL="\"$target\" is not a usable environment variable name"; return 1 ;;
+      esac
+      WIRE_MEASURED=1
+      if [ -n "${!target:-}" ]; then
+        WIRE_ROUTED=1
+        WIRE_DETAIL="\$$target is set in this environment"
+      else
+        WIRE_DETAIL="\$$target is not set in this environment"
+      fi
+      ;;
+    *)
+      # Unreachable through `add` — validate refuses an unknown kind first. Kept
+      # as the backstop for any future caller that reaches wiring without
+      # validating, so "recorded" and "applied" can never be confused again.
+      WIRE_DETAIL="no handler for wire kind \"$kind\" — known kinds: $WIRE_KINDS"
+      return 1
+      ;;
+  esac
+  return 0
+}
+
+WIRE_RECORDS="[]"
 wire_module() {
   local name="$1" mf="$2"
   local mdir="$STATE/$name"
-  jq --arg at "$(now_iso)" \
-     '{wired_at:$at, targets:(.wires // []),
-       note:"wiring precedes invariant verification so every invariant runs with the module active"}' \
-     "$mf" > "$mdir/wired.json" || { warn "error: cannot write wiring record"; return 1; }
+  local n i kind target
+  WIRE_RECORDS="[]"
+
+  n="$(jq -r '(.wires // []) | length' "$mf")"
+  i=0
+  while [ "$i" -lt "$n" ]; do
+    kind="$(jq -r --argjson i "$i" '.wires[$i].kind // ""' "$mf")"
+    target="$(jq -r --argjson i "$i" '.wires[$i].target // ""' "$mf")"
+    if ! wire_apply "$name" "$kind" "$target"; then
+      warn "error: wire \"$kind\" -> \"$target\" cannot be applied: $WIRE_DETAIL"
+      return 1
+    fi
+    WIRE_RECORDS="$(jq -n --argjson acc "$WIRE_RECORDS" \
+      --arg kind "$kind" --arg target "$target" --arg detail "$WIRE_DETAIL" \
+      --argjson measured "$WIRE_MEASURED" --argjson routed "$WIRE_ROUTED" \
+      '$acc + [{kind:$kind, target:$target, measured:($measured == 1),
+                routed:($routed == 1), detail:$detail}]')" \
+      || { warn "error: cannot build the wiring record"; return 1; }
+    i=$((i+1))
+  done
+
+  jq -n --arg at "$(now_iso)" --argjson wires "$WIRE_RECORDS" \
+     '{wired_at:$at, declared:($wires | length),
+       routed:([$wires[] | select(.routed)] | length), wires:$wires,
+       note:"wiring precedes invariant verification so every invariant runs with the module active. `routed` is MEASURED per wire at add time, never asserted: a declared wire nothing routes through is recorded as declared-and-not-routed rather than as wiring."}' \
+     > "$mdir/wired.json" || { warn "error: cannot write wiring record"; return 1; }
   return 0
 }
 
@@ -1267,11 +1395,26 @@ cmd_add() {
   fi
 
   # 6. WIRE
-  printf '  [6/7] wire\n'
+  # The literal "[6/7] wire" token is load-bearing: modules-lifecycle asserts the
+  # step ORDER against it (wiring must precede invariants). The qualifier is what
+  # stops the label overstating what the step does.
+  printf '  [6/7] wire — apply each declared wire, then report what is actually routed\n'
   if ! wire_module "$name" "$mf"; then
     remove_module "$name"
     warn "refused: wiring failed. Rolled back — no trace left."
     exit 1
+  fi
+  # SAME RULE AS THE PROVENANCE LINE ABOVE. The word ROUTED is DERIVED from a
+  # measurement a handler took, never printed as a fixed string, so it can only
+  # appear over a wire something actually goes through. A declared wire nothing
+  # routes through prints "RECORDED, not routed" in those words — because
+  # "[6/7] wire" over a silent green is exactly how an inert module came to look
+  # installed and active.
+  if [ "$(printf '%s' "$WIRE_RECORDS" | jq -r 'length')" = "0" ]; then
+    printf '        no wires declared — the module is inert by its own manifest\n'
+  else
+    printf '%s' "$WIRE_RECORDS" | jq -r '.[] |
+      "        \(.kind) -> \(.target): \(if (.measured | not) then "NOT MEASURED" elif .routed then "ROUTED" else "RECORDED, not routed" end) — \(.detail)"'
   fi
 
   # 7. INVARIANTS — with the module installed and wired.
@@ -1425,13 +1568,20 @@ cmd_status() {
               scope:    class \(.consent.consent_required_by // "?") still requires consent from every other module"
                  elif .consent.required then "granted via \(.consent.granted_via) at \(.consent.granted_at)"
                  else "not required for this class" end)"' "$d/receipt.json"
-  local ntargets
-  ntargets="$(jq -r '.targets | length' "$d/wired.json" 2>/dev/null || echo 0)"
-  if [ "$ntargets" = "0" ]; then
-    printf '    wiring:   0 targets — the module is inert\n'
+  # This line reads the SAME measured record the wire step wrote, so it cannot
+  # drift from it. It used to print "N target(s)" over a list of declared wires,
+  # which described an inert module and a live one identically.
+  local nwires nrouted
+  nwires="$(jq -r '(.wires // []) | length' "$d/wired.json" 2>/dev/null || echo 0)"
+  [ -n "$nwires" ] || nwires=0
+  if [ "$nwires" = "0" ]; then
+    printf '    wiring:   0 wires declared — the module is inert\n'
   else
-    printf '    wiring:   %s target(s): %s\n' "$ntargets" \
-      "$(jq -r '[.targets[] | "\(.kind):\(.target)"] | join(", ")' "$d/wired.json")"
+    nrouted="$(jq -r '[(.wires // [])[] | select(.routed)] | length' "$d/wired.json" 2>/dev/null || echo 0)"
+    printf '    wiring:   %s declared, %s ROUTED when measured at add time\n' "$nwires" "$nrouted"
+    jq -r '(.wires // [])[] |
+      "              \(.kind) -> \(.target): \(if (.measured | not) then "NOT MEASURED" elif .routed then "ROUTED" else "RECORDED, not routed" end)"' \
+      "$d/wired.json" 2>/dev/null
   fi
   if [ -f "$d/invariants.json" ]; then
     printf '    invariants verified at add:\n'
