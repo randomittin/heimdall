@@ -2197,6 +2197,57 @@ case "${1:-}" in
     fi
     exec "$RULES_BIN" "$@"
     ;;
+  modules)
+    shift
+    MODULES_BIN="$PLUGIN_DIR/bin/heimdall-modules"
+    if [ ! -x "$MODULES_BIN" ]; then
+      echo "  Error: heimdall-modules not found at $MODULES_BIN" >&2
+      echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+      exit 1
+    fi
+    exec "$MODULES_BIN" "$@"
+    ;;
+  wrap|unwrap)
+    # §7 Pass-through to heimdall-wrap: ONE command that installs the Layer-0 git
+    # hooks, writes the AGENTS.md fenced block, starts presence and launches the
+    # configured tool — and one that reverses every byte of it. The verb itself is
+    # part of the contract, so it is NOT shifted away: `hmd unwrap codex` reaches
+    # the runner as `unwrap codex`. All flags forward verbatim (--always/--default/
+    # --no-launch), so a routed run and a direct bin run behave identically.
+    WRAP_BIN="$PLUGIN_DIR/bin/heimdall-wrap"
+    if [ ! -x "$WRAP_BIN" ]; then
+      echo "  Error: heimdall-wrap not found at $WRAP_BIN" >&2
+      echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+      exit 1
+    fi
+    exec "$WRAP_BIN" "$@"
+    ;;
+  '')
+    # §7 EMPTY ARGS → wrap-and-launch the default tool.
+    #
+    # DISTINCT FROM THE UNKNOWN-TOKEN PATH, deliberately. An unknown token still
+    # falls through to the Claude task prompt below — that fall-through is what
+    # makes `hmd fix the login bug` work, and test/heimdall-cli-routing.test.sh §8
+    # pins it. Only the EMPTY invocation means "set this repo up and start", so
+    # only the empty invocation routes here. test/wrap-lifecycle.test.sh §8 asserts
+    # both behaviours separately; collapsing either into the other goes RED.
+    #
+    # THE GUARD: heimdall-wrap launches `claude` by exec'ing THIS script back (it
+    # owns model-tier resolution, the permission flags and the preamble). Without
+    # HEIMDALL_WRAP_LAUNCHED that re-entry would route straight back into wrap —
+    # the CLI-level twin of the shim's re-entry refusal.
+    #
+    # NEVER FATAL: a missing or non-executable runner falls through to the
+    # interactive launch below, which is exactly the pre-§7 behaviour. This script
+    # runs under `set -euo pipefail`, where a bare call to an absent helper exits
+    # 127 and kills the whole launcher — so the guard is `[ -x ]`, never a bare call.
+    if [ "${HEIMDALL_WRAP_LAUNCHED:-0}" != "1" ]; then
+      WRAP_BIN="$PLUGIN_DIR/bin/heimdall-wrap"
+      if [ -x "$WRAP_BIN" ]; then
+        exec "$WRAP_BIN" launch
+      fi
+    fi
+    ;;
 esac
 
 # ── Command handlers ──

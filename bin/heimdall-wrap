@@ -1,0 +1,583 @@
+#!/usr/bin/env bash
+# heimdall-wrap — §7: put ANY coding tool behind the Heimdall gate with one command,
+# and take it back out with one more.
+#
+#   hmd wrap <tool>     install Layer-0 git hooks → write the AGENTS.md fenced block
+#                       → start presence → launch <tool> already configured.
+#   hmd unwrap <tool>   reverse EVERY one of those changes.
+#
+# <tool> ∈ claude · cursor · codex · gemini · aider
+#
+# ── THE CONTRACT THAT MATTERS: REVERSIBILITY ──────────────────────────────────
+# A dev will only let a tool rewire their repo if they believe they can get the
+# repo back. So `unwrap` is not best-effort cleanup — it restores the tree BYTE
+# FOR BYTE, and test/wrap-lifecycle.test.sh proves it with a checksum taken before
+# wrap and after unwrap. Any residue at all — a leftover hook, a surviving fence,
+# an extra .gitignore line, a stale core.hooksPath — moves the sum and goes RED.
+#
+# HOW THAT IS ACHIEVED: wrap SNAPSHOTS before it touches anything.
+#   · every file it will append to is copied byte-for-byte,
+#   · every path under <repo>/.heimdall is listed BEFORE the change, so unwrap can
+#     remove exactly what appeared and nothing that predates us,
+#   · both git config keys are recorded, including "was unset".
+# The snapshot lives in $HEIMDALL_HOME/wrap-state/<repo-key>/<tool>/ — OUTSIDE the
+# repo, deliberately. Bookkeeping stored inside the repo would itself be residue,
+# and un-tracking it would need a .gitignore line that is also residue.
+#
+# ── IDEMPOTENCE ───────────────────────────────────────────────────────────────
+# Re-wrap is a refresh, not a second install: the snapshot is taken only on the
+# FIRST wrap, so wrap ×3 → unwrap ×1 still lands on the original bytes. A second
+# unwrap is a no-op that exits 0.
+#
+# ── WHY `set -e` IS ABSENT ────────────────────────────────────────────────────
+# Deliberate. This script's job is to make reversible side effects; a mid-sequence
+# abort is the one outcome worse than a clean failure, because it leaves a repo
+# half-wrapped with no snapshot yet written. Every step here checks its own status
+# explicitly and reports. `set -u` and `pipefail` stay on — they catch typos and
+# broken pipelines without turning any single non-zero into an unwind.
+set -uo pipefail
+
+SELF="$0"
+if command -v readlink >/dev/null 2>&1; then
+  SELF="$(readlink -f "$0" 2>/dev/null || readlink "$0" 2>/dev/null || echo "$0")"
+fi
+PLUGIN_DIR="$(cd "$(dirname "$SELF")/.." && pwd)"
+BIN_DIR="$PLUGIN_DIR/bin"
+HEIMDALL_HOME_DIR="${HEIMDALL_HOME:-$HOME/.heimdall}"
+
+C='\033[38;2;0;212;255m'; G='\033[38;2;78;204;163m'; W='\033[38;2;255;200;80m'
+D='\033[2m'; B='\033[1m'; R='\033[0m'
+
+# The five tools §7 names. One list, used by validation, detection and help alike.
+TOOLS="claude cursor codex gemini aider"
+
+QUIET=0
+say()  { [ "$QUIET" -eq 1 ] || printf "$@"; }
+die()  { printf "  ${W}heimdall wrap:${R} %s\n" "$1" >&2; exit "${2:-1}"; }
+
+# ── First-run ordering trace (same seam bin/heimdall uses) ────────────────────
+# When HEIMDALL_TRACE_ORDER points at a file we append one marker and stop just
+# before the real exec, so an acceptance suite can prove the wrap steps ran and
+# WHICH tool was selected without launching a live tool. No-op when unset.
+_trace_order() {
+  [ -n "${HEIMDALL_TRACE_ORDER:-}" ] || return 0
+  printf '%s\n' "$1" >> "$HEIMDALL_TRACE_ORDER" 2>/dev/null || true
+}
+
+# ── repo + state paths ────────────────────────────────────────────────────────
+REPO="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+
+# repo_key — a filesystem-safe name for the repo, so one HEIMDALL_HOME can hold
+# snapshots for many repos without collision. Derived from the absolute path, not
+# hashed: a human debugging a stuck unwrap can read which repo a directory is for.
+repo_key() { printf '%s' "$REPO" | sed 's|[^A-Za-z0-9._-]|_|g'; }
+
+state_dir() { printf '%s/wrap-state/%s/%s' "$HEIMDALL_HOME_DIR" "$(repo_key)" "$1"; }
+
+USER_DEFAULT_FILE="$HEIMDALL_HOME_DIR/wrap-default"
+REPO_DEFAULT_FILE="$REPO/.heimdall/wrap/default"
+SHIM_DIR="$HEIMDALL_HOME_DIR/shims"
+
+# ── tool validation ───────────────────────────────────────────────────────────
+is_tool() {
+  local t="${1:-}" k
+  for k in $TOOLS; do [ "$t" = "$k" ] && return 0; done
+  return 1
+}
+
+# ── default-tool resolution ───────────────────────────────────────────────────
+# Order: repo config → user config → installed-tool detection → ask once (TTY
+# only) → claude. Detection walks $TOOLS in order so the answer is deterministic
+# on a box with several tools installed; the dev overrides it once with --default
+# and never sees the question again.
+resolve_default() {
+  local t
+  if [ -r "$REPO_DEFAULT_FILE" ]; then
+    t="$(head -n1 "$REPO_DEFAULT_FILE" 2>/dev/null | tr -d '[:space:]')"
+    if is_tool "$t"; then printf '%s' "$t"; return 0; fi
+  fi
+  if [ -r "$USER_DEFAULT_FILE" ]; then
+    t="$(head -n1 "$USER_DEFAULT_FILE" 2>/dev/null | tr -d '[:space:]')"
+    if is_tool "$t"; then printf '%s' "$t"; return 0; fi
+  fi
+  for t in $TOOLS; do
+    if command -v "$t" >/dev/null 2>&1; then printf '%s' "$t"; return 0; fi
+  done
+  # Nothing installed and nothing configured. Ask ONLY on a real TTY — a piped or
+  # CI invocation must never block on a read no one will answer.
+  if [ -t 0 ] && [ -t 1 ]; then
+    printf "  ${B}Which coding tool should Heimdall wrap?${R} ${D}(%s)${R}\n" "$TOOLS" >&2
+    printf "  tool: " >&2
+    local answer=""
+    read -r answer 2>/dev/null || answer=""
+    answer="$(printf '%s' "$answer" | tr -d '[:space:]')"
+    if is_tool "$answer"; then
+      remember_default "$answer"
+      printf '%s' "$answer"
+      return 0
+    fi
+  fi
+  printf 'claude'
+}
+
+remember_default() {
+  mkdir -p "$HEIMDALL_HOME_DIR" 2>/dev/null || return 1
+  printf '%s\n' "$1" > "$USER_DEFAULT_FILE" 2>/dev/null || return 1
+}
+
+# ── append guard ──────────────────────────────────────────────────────────────
+# THE HAZARD, already paid for once here: bin/heimdall-init appended to .gitignore
+# with a bare `>>`, welding its first pattern onto a file whose last line carried
+# no newline and destroying the dev's own rule (test/init-gitignore-append.test.sh).
+# Every file this script appends to goes through here first.
+ensure_trailing_newline() {
+  local f="$1"
+  [ -f "$f" ] && [ -s "$f" ] || return 0
+  [ "$(tail -c 1 "$f" | od -An -tx1 | tr -d '[:space:]')" = "0a" ] && return 0
+  printf '\n' >> "$f" 2>/dev/null || return 1
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SNAPSHOT — everything unwrap needs, captured BEFORE the first change.
+# Written once; a re-wrap leaves the original snapshot alone so N wraps still
+# reverse to the pre-first-wrap bytes.
+# ══════════════════════════════════════════════════════════════════════════════
+snapshot() {
+  local tool="$1" sd; sd="$(state_dir "$tool")"
+  [ -f "$sd/manifest" ] && return 0          # already wrapped — keep the original
+
+  mkdir -p "$sd/files" || return 1
+
+  # Files wrap creates or appends to. Copied byte-for-byte when present; recorded
+  # as absent when not, so unwrap knows to DELETE rather than restore.
+  : > "$sd/absent"
+  local rel
+  for rel in AGENTS.md .gitignore; do
+    if [ -f "$REPO/$rel" ]; then
+      mkdir -p "$sd/files/$(dirname "$rel")" 2>/dev/null || true
+      cp "$REPO/$rel" "$sd/files/$rel" || return 1
+    else
+      printf '%s\n' "$rel" >> "$sd/absent"
+    fi
+  done
+
+  # The pre-change path list for <repo>/.heimdall. unwrap removes exactly the
+  # paths that appeared and never one that predates the wrap, so a repo that was
+  # already using Heimdall keeps its receipts, verdicts and audit.
+  if [ -d "$REPO/.heimdall" ]; then
+    ( cd "$REPO" && find .heimdall -print 2>/dev/null ) | LC_ALL=C sort > "$sd/heimdall-before.list"
+  else
+    : > "$sd/heimdall-before.list"
+  fi
+
+  # Both git config keys init writes, including "was unset" as an explicit value —
+  # restoring an unset key by writing an empty string is not the same thing.
+  {
+    printf 'tool=%s\n' "$tool"
+    printf 'repo=%s\n' "$REPO"
+    printf 'prev_hookspath=%s\n' "$(git -C "$REPO" config --get core.hooksPath 2>/dev/null || printf '__UNSET__')"
+    printf 'prev_prevhookspath=%s\n' "$(git -C "$REPO" config --get heimdall.prevHooksPath 2>/dev/null || printf '__UNSET__')"
+  } > "$sd/manifest" || return 1
+  return 0
+}
+
+manifest_get() {
+  local sd="$1" key="$2" line
+  [ -f "$sd/manifest" ] || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in "$key="*) printf '%s' "${line#"$key"=}"; return 0 ;; esac
+  done < "$sd/manifest"
+  return 1
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# WRAP
+# ══════════════════════════════════════════════════════════════════════════════
+do_wrap() {
+  local tool="$1" always="$2" no_launch="$3"
+  is_tool "$tool" || die "unknown tool '$tool' — expected one of: $TOOLS" 2
+
+  git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1 \
+    || die "not a git repository: $REPO — run \`git init\` first (the gate lives in git hooks)" 2
+
+  snapshot "$tool" || die "could not write the wrap snapshot under $HEIMDALL_HOME_DIR — refusing to change a repo I could not un-change"
+
+  say "\n  ${C}${B}wrapping %s${R} ${D}%s${R}\n\n" "$tool" "$REPO"
+
+  # ── 1. Layer 0: the git hooks + the AGENTS.md fence + the .gitignore lines ──
+  # Delegated to bin/heimdall-init, which already owns all three writes and every
+  # guard they need (fence idempotence, hook chaining, the trailing-newline rule).
+  # Re-implementing them here would fork three contracts that three suites pin.
+  local init_bin="$BIN_DIR/heimdall-init"
+  if [ -x "$init_bin" ]; then
+    if ( cd "$REPO" && "$init_bin" >/dev/null 2>&1 ); then
+      say "  ${G}✓${R} git hooks ${D}.heimdall/hooks (pre-commit · pre-push · post-commit)${R}\n"
+      say "  ${G}✓${R} AGENTS.md ${D}fenced block — every coding agent reads that this repo is gated${R}\n"
+    else
+      die "hmd init failed inside $REPO — nothing was wrapped"
+    fi
+  else
+    die "heimdall-init not found at $init_bin — reinstall: curl -fsSL https://runheimdall.dev/install | bash"
+  fi
+
+  # ── 2. presence ─────────────────────────────────────────────────────────────
+  # Fire-and-forget by contract: presence is a nicety, and a control plane that is
+  # unreachable (offline, air-gapped, dead port) must never fail a wrap.
+  local presence_bin="$BIN_DIR/heimdall-presence"
+  if [ -x "$presence_bin" ]; then
+    ( "$presence_bin" keeper-start >/dev/null 2>&1 & ) || true
+    say "  ${G}✓${R} presence ${D}started${R}\n"
+  else
+    say "  ${D}· presence unavailable — hooks still enforce${R}\n"
+  fi
+
+  # ── 3. the PATH shim (--always) ─────────────────────────────────────────────
+  if [ "$always" -eq 1 ]; then
+    if install_shim "$tool"; then
+      say "  ${G}✓${R} shim ${D}%s — \`%s\` is now a wrapped session${R}\n" "$SHIM_DIR/$tool" "$tool"
+    else
+      say "  ${W}·${R} shim not installed ${D}(%s is not on PATH)${R}\n" "$tool"
+    fi
+  fi
+
+  say "\n  ${G}${B}✓ %s is wrapped.${R} ${D}unwrap with: hmd unwrap %s${R}\n\n" "$tool" "$tool"
+
+  [ "$no_launch" -eq 1 ] && return 0
+  launch_tool "$tool"
+}
+
+# ── launch ────────────────────────────────────────────────────────────────────
+# For claude the launcher is bin/heimdall ITSELF — it already resolves the model
+# tier, the permission flags, the plugin dir and the system-prompt preamble, and
+# re-implementing that here would fork the launch contract. HEIMDALL_WRAP_LAUNCHED
+# stops the bare-`hmd` arm from routing straight back here (the CLI-level twin of
+# the shim's re-entry guard). Other tools are exec'd directly.
+launch_tool() {
+  local tool="$1"
+  _trace_order "wrap:launch:$tool"
+  [ -n "${HEIMDALL_TRACE_ORDER:-}" ] && exit 0
+
+  if [ "$tool" = "claude" ] && [ -x "$BIN_DIR/heimdall" ]; then
+    HEIMDALL_WRAP_LAUNCHED=1 exec "$BIN_DIR/heimdall"
+  fi
+  local real; real="$(real_binary "$tool")"
+  [ -n "$real" ] || die "$tool is not installed (not found on PATH) — the repo is wrapped; install $tool and run it"
+  HEIMDALL_WRAP_LAUNCHED=1 exec "$real"
+}
+
+# real_binary TOOL — the tool's absolute path with our own shim dir REMOVED from
+# PATH first. Without that removal a `--always` shim resolves itself and bakes its
+# own path in as "the real binary" — the fork loop, welded in permanently.
+real_binary() {
+  local tool="$1" p cleaned="" shimdir_phys resolved
+  shimdir_phys="$SHIM_DIR"
+  cleaned=""
+  local IFS_SAVE="$IFS"; IFS=:
+  for p in $PATH; do
+    [ -n "$p" ] || continue
+    [ "$p" = "$shimdir_phys" ] && continue
+    cleaned="${cleaned:+$cleaned:}$p"
+  done
+  IFS="$IFS_SAVE"
+  resolved="$(PATH="$cleaned" command -v "$tool" 2>/dev/null || true)"
+  [ -n "$resolved" ] || return 1
+  case "$resolved" in /*) : ;; *) return 1 ;; esac
+  # Resolve symlinks so the shim pins the file the tool actually is.
+  if command -v readlink >/dev/null 2>&1; then
+    resolved="$(readlink -f "$resolved" 2>/dev/null || printf '%s' "$resolved")"
+  fi
+  printf '%s' "$resolved"
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SHIM — `hmd wrap <tool> --always` makes the tool's OWN command a wrapped session.
+#
+# Three hazards, each closed in the generated body below and each pinned by a test:
+#   1. FORK LOOP. The shim is named after the tool and sits on PATH, so resolving
+#      the tool by name from inside it finds itself. The real path is baked in at
+#      ABSOLUTE, resolved at install time with the shim dir stripped from PATH, and
+#      a re-entry guard refuses a second pass outright.
+#   2. BROKEN AUTOMATION. A shim that wraps every invocation breaks every script
+#      and CI job the dev owns. Non-TTY invocations, and the print/pipe flags, exec
+#      the real binary with argv untouched — no wrap, no output, no delay.
+#   3. EATEN SELF-UPDATE. A shim living in the tool's own directory is clobbered by
+#      (or clobbers) the tool's next self-update. It lives in $HEIMDALL_HOME/shims,
+#      which is never where a tool writes itself.
+# ══════════════════════════════════════════════════════════════════════════════
+install_shim() {
+  local tool="$1" real shim
+  real="$(real_binary "$tool")" || return 1
+  [ -n "$real" ] || return 1
+
+  mkdir -p "$SHIM_DIR" || return 1
+  shim="$SHIM_DIR/$tool"
+
+  # Refuse to pin ourselves. real_binary already strips the shim dir, so reaching
+  # here means something else placed a shim in the resolved path — install anyway
+  # would weld a fork loop into the dev's PATH.
+  if [ "$real" = "$shim" ]; then
+    printf "  ${W}heimdall wrap:${R} refusing to shim %s — the resolved binary IS the shim (%s)\n" "$tool" "$shim" >&2
+    return 1
+  fi
+
+  cat > "$shim" <<EOSHIM
+#!/usr/bin/env bash
+# Generated by \`hmd wrap $tool --always\`. Remove with \`hmd unwrap $tool\`.
+#
+# Runs the Heimdall wrap, then execs the REAL $tool. Never re-enters itself, and
+# never touches a non-interactive invocation.
+HMD_REAL="$real"
+HMD_TOOL="$tool"
+HMD_WRAP="$BIN_DIR/heimdall-wrap"
+
+# 1. RE-ENTRY REFUSAL. Already inside a wrapped session -> straight to the real
+#    binary. This is what makes a fork loop impossible rather than merely unlikely.
+if [ -n "\${HEIMDALL_WRAP_SHIM_ACTIVE:-}" ]; then
+  exec "\$HMD_REAL" "\$@"
+fi
+
+# 2. AUTOMATION PASSES THROUGH UNTOUCHED. No TTY on either side means a script, a
+#    pipe or a CI job; wrapping those would break the dev's pipelines, and a tool
+#    that breaks automation is a tool that gets uninstalled.
+if [ ! -t 0 ] || [ ! -t 1 ]; then
+  exec "\$HMD_REAL" "\$@"
+fi
+#    The print/non-interactive flags are a pipe even when a TTY is attached.
+for _hmd_arg in "\$@"; do
+  case "\$_hmd_arg" in
+    -p|--print|--non-interactive|--no-interactive) exec "\$HMD_REAL" "\$@" ;;
+  esac
+done
+
+# 3. INTERACTIVE: wrap this repo, then hand over. The wrap is best-effort — a repo
+#    that cannot be wrapped (not a git repo, read-only tree) still gets its tool.
+if [ -x "\$HMD_WRAP" ]; then
+  HEIMDALL_WRAP_SHIM_ACTIVE="\$HMD_TOOL" "\$HMD_WRAP" wrap "\$HMD_TOOL" --no-launch --quiet || true
+fi
+HEIMDALL_WRAP_SHIM_ACTIVE="\$HMD_TOOL" exec "\$HMD_REAL" "\$@"
+EOSHIM
+  chmod +x "$shim" || return 1
+
+  install_path_block
+  return 0
+}
+
+# ── shell rc: put the shim dir on PATH ────────────────────────────────────────
+# A fenced block, appended through the same trailing-newline guard every other
+# append here uses, and removed whole by unwrap. Idempotent: the fence is the
+# dedupe key, so N installs leave exactly one block.
+RC_BEGIN='# >>> heimdall wrap shim >>>'
+RC_END='# <<< heimdall wrap shim <<<'
+
+shell_rc() {
+  case "${SHELL:-}" in
+    */bash) printf '%s/.bashrc' "$HOME" ;;
+    */zsh)  printf '%s/.zshrc'  "$HOME" ;;
+    *)      printf '%s/.zshrc'  "$HOME" ;;   # macOS default login shell
+  esac
+}
+
+install_path_block() {
+  local rc; rc="$(shell_rc)"
+  [ -n "$rc" ] || return 0
+  if [ -f "$rc" ] && grep -Fqx "$RC_BEGIN" "$rc" 2>/dev/null; then return 0; fi
+  ensure_trailing_newline "$rc"
+  {
+    printf '%s\n' "$RC_BEGIN"
+    printf 'export PATH="%s:$PATH"\n' "$SHIM_DIR"
+    printf '%s\n' "$RC_END"
+  } >> "$rc" 2>/dev/null || return 1
+  say "  ${D}  PATH line added to %s — open a new shell (or source it) to pick it up${R}\n" "$rc"
+  return 0
+}
+
+# remove_path_block — delete the fenced block and NOTHING else. awk over the two
+# markers, so a dev's own edits above and below the fence pass through untouched.
+# When the block was the only content the file is left empty rather than deleted:
+# an rc file we did not create is not ours to remove.
+remove_path_block() {
+  local rc; rc="$(shell_rc)" tmp
+  [ -n "$rc" ] && [ -f "$rc" ] || return 0
+  grep -Fqx "$RC_BEGIN" "$rc" 2>/dev/null || return 0
+  tmp="$(mktemp "${TMPDIR:-/tmp}/hmd-rc.XXXXXX")" || return 1
+  awk -v b="$RC_BEGIN" -v e="$RC_END" '
+    $0 == b { inblock = 1; next }
+    $0 == e { inblock = 0; next }
+    !inblock { print }
+  ' "$rc" > "$tmp" || { rm -f "$tmp"; return 1; }
+  cat "$tmp" > "$rc" || { rm -f "$tmp"; return 1; }
+  rm -f "$tmp"
+  return 0
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# UNWRAP — reverse every change, in reverse order.
+# ══════════════════════════════════════════════════════════════════════════════
+do_unwrap() {
+  local tool="$1" sd
+  is_tool "$tool" || die "unknown tool '$tool' — expected one of: $TOOLS" 2
+  sd="$(state_dir "$tool")"
+
+  # Nothing recorded → nothing to reverse. Exits 0: an unwrap that has already
+  # happened is a success, not an error, or scripts cannot call it safely.
+  if [ ! -f "$sd/manifest" ]; then
+    say "  ${D}%s is not wrapped in this repo — nothing to undo${R}\n" "$tool"
+    return 0
+  fi
+
+  local prev_hooks prev_prev
+  prev_hooks="$(manifest_get "$sd" prev_hookspath)"
+  prev_prev="$(manifest_get "$sd" prev_prevhookspath)"
+
+  # 1. shim + PATH block
+  if [ -e "$SHIM_DIR/$tool" ]; then
+    rm -f "$SHIM_DIR/$tool" 2>/dev/null || true
+    remove_path_block
+    rmdir "$SHIM_DIR" 2>/dev/null || true
+  fi
+
+  # 2. git config — restore the exact prior state, including "was unset".
+  if [ "$prev_hooks" = "__UNSET__" ]; then
+    git -C "$REPO" config --unset core.hooksPath 2>/dev/null || true
+  else
+    git -C "$REPO" config core.hooksPath "$prev_hooks" 2>/dev/null || true
+  fi
+  if [ "$prev_prev" = "__UNSET__" ]; then
+    git -C "$REPO" config --unset heimdall.prevHooksPath 2>/dev/null || true
+  else
+    git -C "$REPO" config heimdall.prevHooksPath "$prev_prev" 2>/dev/null || true
+  fi
+  # `git config --unset` of the last key in a section leaves the empty section
+  # header behind, which is a byte the repo did not have before. Only ever
+  # removes OUR section, and only when it is empty.
+  if ! git -C "$REPO" config --get-regexp '^heimdall\.' >/dev/null 2>&1; then
+    git -C "$REPO" config --remove-section heimdall 2>/dev/null || true
+  fi
+
+  # 3. appended files — restore the backup, or delete what did not exist.
+  local rel
+  if [ -f "$sd/absent" ]; then
+    while IFS= read -r rel || [ -n "$rel" ]; do
+      [ -n "$rel" ] || continue
+      rm -f "$REPO/$rel" 2>/dev/null || true
+    done < "$sd/absent"
+  fi
+  if [ -d "$sd/files" ]; then
+    while IFS= read -r rel || [ -n "$rel" ]; do
+      [ -n "$rel" ] || continue
+      rel="${rel#./}"
+      mkdir -p "$REPO/$(dirname "$rel")" 2>/dev/null || true
+      cat "$sd/files/$rel" > "$REPO/$rel" 2>/dev/null || true
+    done < <( cd "$sd/files" && find . -type f 2>/dev/null | sed 's|^\./||' )
+  fi
+
+  # 4. <repo>/.heimdall — remove exactly the paths that appeared, deepest first,
+  #    never one that predates the wrap. A repo already using Heimdall keeps its
+  #    receipts, verdict and audit; a repo that had no .heimdall loses the whole
+  #    directory, because without the wrap none of it would exist.
+  if [ -d "$REPO/.heimdall" ] && [ -f "$sd/heimdall-before.list" ]; then
+    local now_list added
+    now_list="$(mktemp "${TMPDIR:-/tmp}/hmd-now.XXXXXX")" || now_list=""
+    if [ -n "$now_list" ]; then
+      ( cd "$REPO" && find .heimdall -print 2>/dev/null ) | LC_ALL=C sort > "$now_list"
+      # Deepest-first so a directory is only removed after its contents.
+      added="$(LC_ALL=C comm -13 "$sd/heimdall-before.list" "$now_list" 2>/dev/null | awk '{print length($0)"\t"$0}' | LC_ALL=C sort -rn | cut -f2-)"
+      local p
+      while IFS= read -r p || [ -n "$p" ]; do
+        [ -n "$p" ] || continue
+        case "$p" in .heimdall|.heimdall/*) : ;; *) continue ;; esac
+        if [ -d "$REPO/$p" ]; then rmdir "$REPO/$p" 2>/dev/null || true
+        else rm -f "$REPO/$p" 2>/dev/null || true; fi
+      done <<EOF
+$added
+EOF
+      rm -f "$now_list"
+    fi
+    rmdir "$REPO/.heimdall" 2>/dev/null || true
+  fi
+
+  # 5. the snapshot itself — the last thing to go, so a failure above leaves the
+  #    state on disk and the unwrap can simply be run again.
+  rm -rf "$sd" 2>/dev/null || true
+  rmdir "$(dirname "$sd")" 2>/dev/null || true
+
+  say "  ${G}✓${R} %s unwrapped ${D}%s — repo restored${R}\n" "$tool" "$REPO"
+  return 0
+}
+
+# ── status ────────────────────────────────────────────────────────────────────
+do_status() {
+  local t sd any=0
+  for t in $TOOLS; do
+    sd="$(state_dir "$t")"
+    if [ -f "$sd/manifest" ]; then
+      any=1
+      printf "  %-8s ${G}wrapped${R}" "$t"
+      [ -e "$SHIM_DIR/$t" ] && printf " ${D}+ shim${R}"
+      printf "\n"
+    fi
+  done
+  [ "$any" -eq 1 ] || printf "  ${D}no tool is wrapped in %s${R}\n" "$REPO"
+  return 0
+}
+
+usage() {
+  printf "\n  ${B}hmd wrap${R} — put a coding tool behind the Heimdall gate\n\n"
+  printf "    ${C}hmd wrap${R} [tool]            wrap this repo and launch the tool\n"
+  printf "    ${C}hmd wrap${R} <tool> --always   also make \`<tool>\` itself a wrapped session\n"
+  printf "    ${C}hmd wrap${R} <tool> --default  remember <tool> as the default\n"
+  printf "    ${C}hmd unwrap${R} <tool>          reverse every change\n"
+  printf "    ${C}hmd wrap${R} status            what is wrapped here\n\n"
+  printf "  tools: ${D}%s${R}\n\n" "$TOOLS"
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DISPATCH
+# ══════════════════════════════════════════════════════════════════════════════
+CMD="${1:-}"
+[ $# -gt 0 ] && shift
+
+TOOL=""; ALWAYS=0; NO_LAUNCH=0; SET_DEFAULT=0
+for arg in "$@"; do
+  case "$arg" in
+    --always)     ALWAYS=1 ;;
+    --no-launch)  NO_LAUNCH=1 ;;
+    --default)    SET_DEFAULT=1 ;;
+    --quiet|-q)   QUIET=1 ;;
+    -h|--help)    usage; exit 0 ;;
+    -*)           die "unknown flag '$arg'" 2 ;;
+    *)            [ -n "$TOOL" ] || TOOL="$arg" ;;
+  esac
+done
+
+case "$CMD" in
+  wrap)
+    case "$TOOL" in
+      status) do_status; exit 0 ;;
+      '')     TOOL="$(resolve_default)" ;;
+    esac
+    [ "$SET_DEFAULT" -eq 1 ] && { is_tool "$TOOL" || die "unknown tool '$TOOL' — expected one of: $TOOLS" 2; remember_default "$TOOL"; }
+    do_wrap "$TOOL" "$ALWAYS" "$NO_LAUNCH"
+    ;;
+  unwrap)
+    [ -n "$TOOL" ] || TOOL="$(resolve_default)"
+    do_unwrap "$TOOL"
+    ;;
+  launch)
+    # The bare-`hmd` entry point: resolve the default tool, wrap, launch.
+    TOOL="$(resolve_default)"
+    do_wrap "$TOOL" "$ALWAYS" "$NO_LAUNCH"
+    ;;
+  default)
+    resolve_default; printf '\n'
+    ;;
+  status)
+    do_status
+    ;;
+  ''|-h|--help|help)
+    usage
+    ;;
+  *)
+    die "unknown command '$CMD' — try: wrap | unwrap | status | default" 2
+    ;;
+esac
