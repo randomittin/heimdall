@@ -48,7 +48,8 @@
 #       and it does not waive the disclosure text.
 #   H11 DEPEND, DON'T CLONE — the module directory holds a manifest and nothing
 #       else, and no Headroom source is vendored anywhere in the tree.
-#   H12 CP / enroll / signed traffic is never routed through any proxy.
+#   H12 CP / enroll / signed traffic is scrubbed of LOCAL REWRITERS — and is NOT
+#       blanket-bypassed, because a corporate CONNECT proxy must keep working.
 #
 # Usage:  bash test/headroom-module.test.sh   (exit 0 = every guarantee holds)
 set -uo pipefail
@@ -347,19 +348,35 @@ VENDFILE="$(find "$REPO" \( -name 'headroom_ai-*' -o -name 'headroom-*.tar.gz' \
   || bad "vendored Headroom artifact: $VENDFILE"
 
 echo
-echo "H12 — CP / enroll / signed traffic never routes through a proxy"
-CP_FILES="bin/heimdall-control-plane bin/heimdall-connect bin/heimdall-team
-bin/heimdall-invite bin/heimdall-cp-inspect bin/heimdall-presence"
-HITS=""
-for f in $CP_FILES; do
-  [ -f "$REPO/$f" ] || continue
-  if grep -qE 'HEADROOM_|HTTPS?_PROXY|ALL_PROXY|https?_proxy|all_proxy|ANTHROPIC_BASE_URL|CLAUDE_CODE_BASE_URL' "$REPO/$f" 2>/dev/null; then
-    HITS="$HITS $f"
-  fi
+echo "H12 — CP / enroll / signed traffic is scrubbed of LOCAL REWRITERS"
+# This check USED to demand these files never MENTION a proxy variable. That was inverted:
+# a script that never mentions a proxy is exactly the script that silently INHERITS an
+# ambient one, because curl and urllib both read HTTPS_PROXY/ALL_PROXY from the environment
+# whether or not the caller ever heard of them. Measured before the fix — a
+# `heimdall-presence beat` under a loopback rewriter delivered POST /presence to the
+# REWRITER — so the mention is now the DEFENSE, not the defect.
+# The live differential lives in test/cp-signed-no-rewriting-proxy.test.sh; what is asserted
+# here is the wiring that differential depends on.
+SIGNED_FILES="bin/heimdall-presence bin/heimdall-connect bin/heimdall-team"
+UNSCRUBBED=""
+for f in $SIGNED_FILES; do
+  grep -q 'hmd_signed_exec' "$REPO/$f" 2>/dev/null || UNSCRUBBED="$UNSCRUBBED $f"
 done
-[ -z "$HITS" ] \
-  && ok "no control-plane / enroll / team / presence surface reads a proxy var" \
-  || bad "proxy routing reached a signed-traffic surface:$HITS"
+[ -z "$UNSCRUBBED" ] \
+  && ok "every signed / enrollment surface routes its client through hmd_signed_exec" \
+  || bad "a signed-traffic surface does not scrub local rewriters:$UNSCRUBBED"
+
+# …and the scrub must never become a BLANKET bypass. A corporate HTTPS proxy CONNECT-tunnels
+# TLS, so it cannot rewrite signed bytes, and in a locked-down estate it is the only egress —
+# forcing `--noproxy` would break hmd for those operators to defend against a threat their
+# proxy does not pose.
+BLANKET=""
+for f in $SIGNED_FILES; do
+  grep -q -- '--noproxy' "$REPO/$f" 2>/dev/null && BLANKET="$BLANKET $f"
+done
+[ -z "$BLANKET" ] \
+  && ok "no signed surface blanket-bypasses proxies — a corporate CONNECT proxy still works" \
+  || bad "a signed surface forces a blanket proxy bypass:$BLANKET"
 # And the gate scrub still covers Headroom's own namespace.
 grep -q 'HEADROOM_BASE_URL' "$REPO/bin/lib/hmd-gate-endpoint.sh" \
   && ok "the gate scrub covers Headroom's own routing namespace" \
