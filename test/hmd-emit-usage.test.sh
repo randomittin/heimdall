@@ -43,6 +43,101 @@ command -v jq >/dev/null 2>&1 || { echo "FATAL: jq required for the JSON asserti
 WORK="$(mktemp -d -t "emit-usage-test.$(printf 'X%.0s' 1 2 3 4 5 6)")"
 trap 'rm -rf "$WORK"' EXIT
 
+# ── (0) LIB_ONLY MUST RETURN TO ITS CALLER — probed in a CHILD, never in-process ─
+# WHY THIS PROBE EXISTS, AND WHY IT CANNOT BE FOLDED INTO THE SOURCE BELOW:
+# `source` inherits the CALLER's positional parameters, so this suite sources
+# bin/heimdall with an EMPTY "$@". The launcher's dispatch reads empty args as
+# "wrap this repo and launch" and that arm ends in `exec heimdall-wrap launch` —
+# which REPLACES this process outright. While that regression was live the suite
+# ran ZERO assertions, printed NO "N passed, M failed" line, and still exited 0:
+# run-all.sh classified it UNPARSED ("counts UNKNOWN, not assumed pass") and every
+# board run silently re-wrapped the repo as a side effect.
+# An in-process `source` can NEVER report that failure — there is no process left
+# to report it. So the contract is probed in a CHILD that has to print a sentinel
+# to prove it survived, and this suite refuses to source until the probe passes.
+# PLUGIN_DIR IS DERIVED FROM "$0", AND WHEN SOURCED "$0" IS THE *CALLER*. So the
+# probe must sit one level under a directory that looks like the plugin root, or
+# the launcher resolves $PLUGIN_DIR/bin/heimdall-wrap to a non-existent path, the
+# `[ -x ]` guard declines, and the probe survives a launcher that is in fact still
+# broken. This mirror reproduces that topology exactly — and overrides ONLY the
+# wrap runner with a recorder, because a real `heimdall-wrap launch` would install
+# git hooks, rewrite AGENTS.md and start a presence keeper for real. The bug must
+# be observable without paying for it.
+PROBE_ROOT="$WORK/probe"
+mkdir -p "$PROBE_ROOT/bin" "$PROBE_ROOT/test"
+for _f in "$ROOT"/bin/*; do
+  _b="$(basename "$_f")"
+  # NEVER link the wrap runner: the recorder below is written with `>`, which
+  # follows a symlink and would truncate the REAL bin/heimdall-wrap.
+  [ "$_b" = "heimdall-wrap" ] && continue
+  ln -sf "$_f" "$PROBE_ROOT/bin/$_b"
+done
+[ -e "$ROOT/.claude-plugin" ] && ln -sf "$ROOT/.claude-plugin" "$PROBE_ROOT/.claude-plugin"
+cat > "$PROBE_ROOT/bin/heimdall-wrap" <<'WRAP_EOF'
+#!/usr/bin/env bash
+# Stands in for the wrap runner so the dispatch is OBSERVED, never performed.
+printf '%s\n' "LAUNCHER_DISPATCH_RAN"
+exit 0
+WRAP_EOF
+chmod +x "$PROBE_ROOT/bin/heimdall-wrap"
+
+PROBE="$PROBE_ROOT/test/lib-only-probe.sh"
+cat > "$PROBE" <<'PROBE_EOF'
+#!/usr/bin/env bash
+# Survives only if sourcing under HEIMDALL_LIB_ONLY=1 RETURNS. If the launcher
+# dispatch runs instead, exec replaces us and the sentinel is never printed.
+#
+# `set --` REPRODUCES THIS SUITE'S EXACT CONDITION and is load-bearing: the path
+# arrives by ENV precisely so it cannot sit in "$@". Passed as a positional it
+# would be inherited by the sourced script as a non-empty "$1", which falls into
+# the launcher's unknown-token arm and quietly DODGES the empty-args arm this
+# probe exists to catch — a probe that cannot see the bug is worse than none.
+set --
+HEIMDALL_LIB_ONLY=1 source "$HMD_PATH" || exit 90
+declare -F capture_and_emit_usage >/dev/null 2>&1 || exit 91
+printf '%s\n' "LIB_ONLY_SURVIVED"
+PROBE_EOF
+PROBE_STDOUT="$WORK/lib-only-probe.out"
+set +e
+HMD_PATH="$HMD" bash "$PROBE" > "$PROBE_STDOUT" 2>/dev/null
+PROBE_RC=$?
+set -e
+
+# Three-way, so a probe that dies for an UNRELATED reason is never misreported as
+# the dispatch bug: sentinel => contract held; recorder => dispatch ran; neither
+# => the source aborted early and the probe itself needs looking at.
+if grep -qF "LIB_ONLY_SURVIVED" "$PROBE_STDOUT" 2>/dev/null; then
+  ok "(0) HEIMDALL_LIB_ONLY=1 source RETURNS to its caller (no launcher dispatch, no exec)"
+elif grep -qF "LAUNCHER_DISPATCH_RAN" "$PROBE_STDOUT" 2>/dev/null; then
+  bad "(0) HEIMDALL_LIB_ONLY=1 source ran the LAUNCHER DISPATCH and exec'd wrap (rc=$PROBE_RC)"
+  printf '%s\n' "  Sourcing in-process would replace THIS suite too, so it stops here rather"
+  printf '%s\n' "  than vanishing with no counts line. Fix: bin/heimdall must honour"
+  printf '%s\n' "  HEIMDALL_LIB_ONLY BEFORE its argument dispatch, not after it."
+  printf '\n%s\n' "  hmd-emit-usage tests: $PASS passed, $FAIL failed"
+  exit 1
+else
+  bad "(0) library-mode probe neither returned nor dispatched (rc=$PROBE_RC) — source aborted early"
+  printf '%s\n' "  ---- probe stdout ----"
+  cat "$PROBE_STDOUT" 2>/dev/null
+  printf '%s\n' "  ----------------------"
+  printf '\n%s\n' "  hmd-emit-usage tests: $PASS passed, $FAIL failed"
+  exit 1
+fi
+
+# (0b) A library-mode source is SILENT: it defines functions and returns. Any stdout
+# beyond the sentinel means a launcher/bootstrap path executed (banner, wrap card,
+# setup chatter) — the "NO setup side-effects" half of the contract, which can break
+# on its own even when the process happens to survive.
+# `! grep -qv` ("no line fails to match") rather than a -c count: `grep -cv` prints
+# 0 and EXITS 1 when nothing is selected, so the arithmetic form would silently read
+# the `||` fallback instead of the count.
+if [ -s "$PROBE_STDOUT" ] && ! grep -qvF "LIB_ONLY_SURVIVED" "$PROBE_STDOUT"; then
+  ok "(0b) library-mode source is silent — no launcher/bootstrap output, no setup side-effects"
+else
+  bad "(0b) library-mode source printed launcher/bootstrap output (setup side-effects ran)"
+  cat "$PROBE_STDOUT" 2>/dev/null
+fi
+
 # ── Source hmd in library-only mode so we get the functions, not the bootstrap ─
 # HEIMDALL_LIB_ONLY=1 makes bin/heimdall define its functions then return before
 # the main launch path. Sourcing must succeed (rc 0) and expose the capture fn.
@@ -55,7 +150,9 @@ if [ "$SRC_RC" -eq 0 ] && declare -F capture_and_emit_usage >/dev/null 2>&1; the
   ok "(lib) hmd sources in HEIMDALL_LIB_ONLY mode and exposes capture_and_emit_usage"
 else
   bad "(lib) hmd did not source cleanly / no capture_and_emit_usage (rc=$SRC_RC)"
-  echo "  hmd-emit-usage tests: $PASS passed, $((FAIL+1)) failed"
+  # bad() already incremented FAIL; printing FAIL+1 here over-reported the failure
+  # count by one on this early-exit path.
+  echo "  hmd-emit-usage tests: $PASS passed, $FAIL failed"
   exit 1
 fi
 

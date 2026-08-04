@@ -1551,6 +1551,25 @@ hmd_bump_run_count() {
   fi
   return 0
 }
+# ── LIBRARY-ONLY MODE, part 1 of 2: SKIP THE LAUNCHER DISPATCH ────────────────
+# The acceptance harness sources this file with HEIMDALL_LIB_ONLY=1 to exercise
+# individual functions. `source` inherits the CALLER's positional parameters, so a
+# harness that takes no arguments of its own arrives here with an EMPTY "$1" and
+# lands on the `''` arm below — whose entire job is to `exec heimdall-wrap launch`,
+# replacing the harness process outright.
+#
+# That is not hypothetical. test/hmd-emit-usage.test.sh ran ZERO of its assertions,
+# printed no "N passed, M failed" line and still exited 0 — run-all.sh reported it
+# UNPARSED, "counts UNKNOWN, not assumed pass" — while silently re-wrapping the repo
+# on every board run.
+#
+# The stop-here guard cannot prevent this: it sits ~2000 lines BELOW, because the
+# functions library mode exists to expose are defined after this dispatch. So
+# library mode skips the run-count bump and the whole dispatch HERE, then stops at
+# part 2 once those definitions have been read. Both halves are required; neither
+# alone makes the documented "no setup side-effects" contract true.
+if [ -z "${HEIMDALL_LIB_ONLY:-}" ]; then
+
 hmd_bump_run_count || true
 
 case "${1:-}" in
@@ -2268,6 +2287,9 @@ case "${1:-}" in
     fi
     ;;
 esac
+
+fi
+# ── end LIBRARY-ONLY MODE part 1 — dispatch skipped when sourced as a library ──
 
 # ── Command handlers ──
 
@@ -3543,7 +3565,9 @@ PYEOF
 
 # ── Main: ensure deps, then launch Claude ──
 
-# LIBRARY-ONLY MODE: when HEIMDALL_LIB_ONLY=1 the script defines its functions
+# LIBRARY-ONLY MODE, part 2 of 2 (part 1 skips the dispatch, far above — this half
+# is NOT sufficient on its own; see the note there).
+# When HEIMDALL_LIB_ONLY=1 the script defines its functions
 # and stops here WITHOUT running the bootstrap/launch path. This lets the
 # acceptance harness source bin/heimdall and exercise individual functions (e.g.
 # capture_and_emit_usage) in isolation, with NO setup side-effects and NO real
