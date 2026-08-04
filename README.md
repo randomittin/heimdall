@@ -63,6 +63,15 @@ No sudo. Idempotent — re-run to upgrade. `hmd uninstall` reverses all of it.
 
 **Network posture is default-ON.** Team presence and the cloud features reach the control plane as soon as you use them: a signed heartbeat carrying your handle, verdict, and current filename — scoped to your team, never your code or file contents. That is a feature, and it is on until you switch it off. `hmd presence sever` gives zero egress. Field-by-field contract: [DATA.md](DATA.md). The precisely scoped claims are under [Your code stays yours](#your-code-stays-yours).
 
+**hmd's default module set includes a proxy that reads your prompts.** [Headroom](#headroom--the-one-shipped-module-and-its-honest-limits) is `default_included: true` in [`modules/headroom/manifest.json`](modules/headroom/manifest.json): a **local** context-compression proxy that sits between your coding tool and the model provider, reads the prompts and context on their way out, and rewrites them to be smaller. It runs as a process you own and can inspect, and it introduces no Heimdall-operated destination — that traffic goes to the same provider it went to before. Four things to know before you install:
+
+- **Nothing installs it for you.** `install.sh` has no module code path at all, and the background updater refuses to acquire a consent-required class unattended — it names the module and hands you the command. Until you run `hmd modules add headroom`, `hmd modules status headroom` reports `NOT ATTEMPTED`.
+- **That command is a remote code install, and no digest is verified.** It runs `uv tool install --python 3.13 "headroom-ai[all]==<pin>"` against PyPI. hmd hashes nothing on that path and does not claim to: the lifecycle step is named `install + provenance`, not `digest-verify`, and the receipt records `verified: false` alongside the pin it did not check. It also pulls an ML stack — Rust wheels, an ONNX runtime, HuggingFace tokenizers — so this is the one place hmd stops being near-stdlib.
+- **The consent question is waived; the disclosure is not.** `consent_waived` sits on that one module's manifest. [`modules/_classes/traffic-proxy.json`](modules/_classes/traffic-proxy.json) still reads `consent_required: true`, so every other traffic-proxy module hmd ships still asks. The consent text still prints, both declared class contracts still run their invariants, and the receipt records `granted_via: manifest-waiver`. This is a deliberate maintainer decision: disclosed, not asked.
+- **Gates read raw, and signed traffic steps around it.** Generation may run compressed; judgment may not. Verdict-producing commands run through `hmd_gate_exec`, and control-plane, enrollment and presence traffic through `hmd_signed_exec` ([`bin/lib/hmd-gate-endpoint.sh`](bin/lib/hmd-gate-endpoint.sh)); both drop `ANTHROPIC_BASE_URL`, the proxy pairs and the whole `HEADROOM_*` namespace before pinning the endpoint to the real provider. [`test/gate-judgment-uncompressed.test.sh`](test/gate-judgment-uncompressed.test.sh) goes red the moment a gate request reaches the proxy.
+
+`hmd modules remove headroom` returns the tree byte-identically. Threat model, the full reachability table and every way to decline it: [SECURITY.md](SECURITY.md#the-headroom-proxy--a-local-process-that-reads-your-prompts). Mechanics and honest limits: [Modules](#modules).
+
 ### Path 1 — the one-liner
 
 <!-- HEIMDALL:PIN:TAG,SHA256:BEGIN -->
@@ -234,10 +243,12 @@ The two classes that mutate something you own — the wire, and your own config 
 
 ```
 [1/7] validate → [2/7] class contract → [3/7] preflight → [4/7] consent
-    → [5/7] install + digest-verify → [6/7] wire → [7/7] class invariants (module active)
+    → [5/7] install + provenance → [6/7] wire → [7/7] class invariants (module active)
 ```
 
 Steps 1–4 are read-only, so anything rejected at validate, class, preflight or consent mutates nothing at all. **Preflight sits before consent on purpose** — nobody should be asked to agree to an install that cannot happen. Step 5 is the first mutation, and from there every failure unwinds through **the same removal path `remove` uses**, so a module that fails its own class test leaves a byte-identical tree. Wiring precedes invariants deliberately: the contracts assert behaviour *with the module active*, so a check run against an unwired module would prove nothing.
+
+**Step 5 is called `provenance`, not `digest-verify`, and the naming is load-bearing.** A digest is verified on exactly one path: a `local` module, whose artifact ships in this repo and is hashed here against its pin. An `upstream` module is fetched from a package index and hmd hashes **nothing** — it records the pin and asks the installer whether the payload arrived. The receipt reads `verified: false` in every upstream state, and nothing re-checks that pin later: `hmd modules verify` re-runs the class invariants and reads no digest at all. Printing `digest-verify` over that would assert a check that never ran.
 
 ### Consent leaves a receipt
 

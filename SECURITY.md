@@ -84,6 +84,114 @@ whether an action is authorized, ask us first at `security@runheimdall.dev`.
 For which releases receive fixes, see [Supported versions](#supported-versions)
 above.
 
+## The Headroom proxy — a local process that reads your prompts
+
+hmd's default module set includes **Headroom**
+([`modules/headroom/manifest.json`](modules/headroom/manifest.json), Apache-2.0):
+a local context-compression proxy. Install it, and a process on your machine sits
+between your coding tool and the model provider, reads the prompts and context on
+their way out, and rewrites them to be smaller. That is what it is for. It is
+documented here because someone auditing hmd's security posture should not have to
+discover it by reading a manifest.
+
+### What it is
+
+- **Local, and not a Heimdall service.** It runs on your machine as a process you
+  own and can inspect. hmd routes nothing to a Heimdall endpoint through it and it
+  introduces no Heimdall-operated destination — your model traffic goes to the same
+  provider it went to before, by way of a hop you control.
+- **Not vendored.** None of Headroom's source is in this repo; hmd depends on the
+  published package at the pin recorded in the manifest, which is the single source
+  of truth for that pin. The forwarding behaviour is Headroom's own code, at that
+  pin, under Apache-2.0 — readable at
+  <https://github.com/headroomlabs-ai/headroom>.
+- **Shipped by default, installed by you.** `default_included: true` is a
+  *distribution* fact, not a claim that it helps and not an unattended install.
+  `install.sh` has no module code path, and `bin/heimdall-autoupdate` will not
+  acquire a consent-required class unattended — doing so would mean passing `--yes`
+  on your behalf, which is a forged signature rather than an install path. It names
+  the module and prints the command instead.
+
+### What it can and cannot reach
+
+| Traffic | Through the proxy? | What enforces that |
+|---|---|---|
+| Model **generation** traffic from your coding tool | **May be** — that is the module's purpose | — |
+| Any call that produces a **verdict** (gate, oracle, verifier, panel) | **No** | `hmd_gate_exec` in [`bin/lib/hmd-gate-endpoint.sh`](bin/lib/hmd-gate-endpoint.sh) unsets `ANTHROPIC_BASE_URL`, the HTTP/HTTPS/ALL/NO_PROXY pairs and the whole `HEADROOM_*` namespace, then pins the endpoint to the real provider. Falsifier: [`test/gate-judgment-uncompressed.test.sh`](test/gate-judgment-uncompressed.test.sh) |
+| **Control-plane, enrollment, team and presence** traffic | **No** | `hmd_signed_exec` in the same file. [`test/cp-signed-no-rewriting-proxy.test.sh`](test/cp-signed-no-rewriting-proxy.test.sh) is a runtime differential with a positive control, and it **fails closed**: an unreachable control plane reports `NON_VERIFIED` and fails the invariant rather than passing quietly |
+
+**Why judgment is the hard line.** A judge reading compressed context emits
+confident false greens — the one failure mode this project exists to prevent. So
+the scrub is applied at the gate-*execution* boundary rather than inside any single
+client, which is what makes it cover the whole chain instead of one caller. The
+signed path is deliberately narrower than the judgment path: a corporate
+`HTTPS_PROXY` **survives** it, because such a proxy CONNECT-tunnels TLS, cannot
+rewrite signed bytes, and is often an estate's only egress — blanket-bypassing it
+would break hmd for those operators to defend against a threat their proxy does not
+pose.
+
+### Consent is waived. Disclosure is not.
+
+Headroom carries `consent_waived: true` on its own manifest, so `hmd modules add
+headroom` discloses and proceeds rather than stopping to ask. This is a deliberate
+decision by the maintainer, and its blast radius is exactly one module:
+[`modules/_classes/traffic-proxy.json`](modules/_classes/traffic-proxy.json) still
+reads `consent_required: true`, so every other traffic-proxy module hmd ever ships
+still asks. Waiving the field on the *class* would have silently disarmed consent
+for modules nobody has written yet.
+
+What the waiver does **not** change: the consent text still prints at add time,
+both declared class contracts still run their invariants with the module active,
+and the receipt records `granted_via: manifest-waiver` so the waiver is visible
+after the fact rather than indistinguishable from a yes you typed.
+
+### The remote-install caveat
+
+**`hmd modules add headroom` performs a remote code install and verifies no
+digest.** Stated plainly, because it is the sharpest thing on this page:
+
+- The fetch is `uv tool install --python 3.13 "headroom-ai[all]==<pin>"`, resolved
+  from PyPI at install time and executed as you.
+- hmd hashes **nothing** on that path. The lifecycle step is named
+  `install + provenance` rather than `digest-verify` precisely so it cannot imply a
+  check that never ran. A digest is verified on exactly one path — a `local` module
+  whose artifact ships in this repo — and Headroom is not one.
+- The receipt records `verified: false` in every upstream state, together with the
+  pin it did **not** check. Nothing re-checks it afterwards either: `hmd modules
+  verify` re-runs the class invariants and reads no digest at all.
+- Trust therefore rests on PyPI, on `uv`, and on the upstream project — the same
+  trust any `pip install` asks for, stated here rather than left implied.
+- It pulls an ML stack (Rust wheels, an ONNX runtime, HuggingFace tokenizers), so
+  install size and time are materially larger than hmd's own. This is the one place
+  hmd stops being near-stdlib.
+
+A failed Headroom install does not fail `hmd install`: the module reports ABSENT
+with the blocker named and rolls back, and hmd keeps working without it.
+
+### How to decline it, or remove it
+
+Two surfaces read opt-out signals, and they do **not** overlap — each verb honours
+the signals of the surface it belongs to:
+
+| Signal | Read by | Effect |
+|---|---|---|
+| `hmd modules optout headroom` | `bin/heimdall-modules` | persisted as this tool's own record; nothing re-installs it, and `repair`, `defer` and `pending` refuse to act |
+| `HMD_MODULE_OPTOUT=headroom` | `bin/heimdall-modules` | the same, for a single invocation |
+| `HEIMDALL_NO_MODULES=1` | `bin/heimdall-autoupdate` | no module is acquired automatically, at all |
+| `~/.heimdall/modules-optout` | `bin/heimdall-autoupdate` | one module name per line, read on the updater's acquisition path. Nothing in this repo *writes* this file — an operator writes it by hand |
+
+`install.sh` reads none of these, because it acquires no modules in the first
+place: there is no installer flag to suppress and none is offered. Every signal
+above governs acquisition that would happen **on your behalf**, so
+`HEIMDALL_NO_MODULES=1` does not block an explicit `hmd modules add` — an operator
+typing the command themselves is not what an opt-out for unattended installs is
+trying to stop.
+
+**Removal is total.** `hmd modules remove headroom` unwinds through the same
+`remove_module()` path a failed install rolls back through, which is what makes the
+result byte-identical rather than merely tidy. `uv tool uninstall headroom-ai`
+removes the tool itself.
+
 ## Secret hygiene
 
 Heimdall treats leaked credentials as a build defect, not an afterthought — and
