@@ -61,8 +61,16 @@ import time
 
 # ── tunables ─────────────────────────────────────────────────────────────────
 CACHE_TTL = 5.0            # spec §5 — whole-read cache lifetime, seconds
-TEAM_TTL = 300             # spec §6 — a teammate heartbeat is live for 5 minutes
+TEAM_TTL = 300             # spec §6 — a teammate heartbeat reads LIVE for 5 minutes
 TEAM_CAP = 3               # spec §6 — at most 3 names, then a "+N" overflow
+
+# ── the OFFLINE WALL WINDOW (mirrors cp_presence.DEFAULT_OFFLINE_WINDOW_SECONDS) ──
+# A teammate whose last heartbeat is within this window keeps a wall slot and renders in an
+# explicit OFFLINE state; past it they leave the wall. TEAM_TTL above still decides LIVE vs
+# OFFLINE — this only decides who gets a slot AT ALL. Before this window existed an offline
+# teammate was simply erased, so a wall showing only yourself looked exactly like a broken
+# wall; that ambiguity is what this closes. Must stay in step with the server constant.
+OFFLINE_WINDOW = 7 * 24 * 60 * 60.0   # 7 days
 
 _MOD_DIR = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_MOD_DIR)   # <repo>/sentinels/hmd_ledger.py → <repo>
@@ -211,11 +219,25 @@ def _self_ids():
     return ids
 
 
-def filter_team(team, now=None, self_ids=None, cap=TEAM_CAP, ttl=TEAM_TTL):
+def filter_team(team, now=None, self_ids=None, cap=TEAM_CAP, ttl=TEAM_TTL,
+                window=OFFLINE_WINDOW):
     """Spec §6 team cluster. From the raw team[] keep entries whose heartbeat `ts` is within
-    `ttl` seconds of `now` and that are NOT self, normalize each to {user,sigil,branch,state,ts}
-    (state via _norm_state, so a teammate 'deny' stays 'deny' and the statusline reds the name),
-    freshest-first, then cap to `cap` names. Returns (members[<=cap], overflow_count)."""
+    `window` seconds of `now` (7 days) and that are NOT self, normalize each to
+    {user,haid,sigil,branch,state,ts,online}, order them, then cap to `cap` names.
+    Returns (members[<=cap], overflow_count).
+
+    LIVE vs OFFLINE. An entry is LIVE when the producer marked it `online: true`, or — for a
+    producer that predates the flag — when its heartbeat is within `ttl` (5 min). Anything
+    older keeps its slot with `online: False` and the explicit state "offline", so an away
+    teammate renders greyed instead of VANISHING. That erasure is the defect this closes: a
+    wall showing only yourself used to be indistinguishable from a wall that was broken.
+
+    An offline entry's state is pinned to "offline" and never sent through _norm_state, which
+    maps anything unknown to "running" — that would paint an away teammate as actively
+    working. Offline must never be a subtly-different online.
+
+    ORDER: LIVE first, then deny (the screenshot signal the statusline reds), then freshest.
+    So an offline teammate can never evict a live one from the `cap` slots."""
     if now is None:
         now = _now()
     if self_ids is None:
@@ -227,16 +249,20 @@ def filter_team(team, now=None, self_ids=None, cap=TEAM_CAP, ttl=TEAM_TTL):
         if not isinstance(e, dict):
             continue
         ts = e.get("ts")
-        if not isinstance(ts, (int, float)):
+        if not isinstance(ts, (int, float)) or isinstance(ts, bool):
             continue
-        if now - ts > ttl:
-            continue   # stale heartbeat → teammate has left the wall
+        if now - ts > window:
+            continue   # beyond the offline window → teammate has left the wall for good
         user = e.get("user")
         sigil = e.get("sigil")
         haid = e.get("haid")
         # self-exclude: match on any identifier the entry carries
         if any(v is not None and str(v) in self_ids for v in (user, sigil, haid)):
             continue
+        # The producer's explicit flag wins; absent it, the 5-min heartbeat TTL decides
+        # (back-compat with a status.json written before `online` was carried through).
+        flag = e.get("online")
+        online = bool(flag) if isinstance(flag, bool) else (now - ts <= ttl)
         live.append({
             "user": str(user) if user is not None else "",
             # preserve the teammate's OWN HAID so the statusline can render THEIR sigil
@@ -244,12 +270,14 @@ def filter_team(team, now=None, self_ids=None, cap=TEAM_CAP, ttl=TEAM_TTL):
             "haid": str(haid) if haid is not None else "",
             "sigil": str(sigil) if sigil is not None else "",
             "branch": str(e.get("branch") or ""),
-            "state": _norm_state(e.get("state")),
+            "state": _norm_state(e.get("state")) if online else "offline",
             "ts": ts,
+            "online": online,
         })
-    # DENY FIRST, then freshest. A gate-deny is the screenshot signal the statusline
-    # reds — it must never be silently capped out below fresher passing teammates.
-    live.sort(key=lambda m: (m["state"] != "deny", -m["ts"]))
+    # LIVE FIRST, then DENY, then freshest. A gate-deny is the screenshot signal the statusline
+    # reds — it must never be silently capped out below fresher passing teammates; and no
+    # offline teammate may ever displace a live one.
+    live.sort(key=lambda m: (not m["online"], m["state"] != "deny", -m["ts"]))
     overflow = max(0, len(live) - cap)
     return live[:cap], overflow
 
