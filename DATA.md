@@ -159,8 +159,33 @@ human:
 env:
   os_class             # coded (e.g. darwin|linux)
   ci                   # bool
+  context_proxied      # bool — is the provider BASE URL redirected by the environment
+  proxy_vendor         # coded vendor tag (e.g. "headroom"); ABSENT when none is named
   hmd_version          # coded version tag
 ```
+
+`context_proxied` and `proxy_vendor` exist to answer one research question: does
+running an agent through a proxied base URL correlate with deny classes? Both are
+read from environment variables only — nothing is executed, probed, or installed,
+and the named tool need not be present. Like every field above, they are written to
+the **local spool only**; this release sends nothing.
+
+- **`context_proxied`** is true when a base-URL redirect is set:
+  `ANTHROPIC_BASE_URL`, `ANTHROPIC_API_URL`, `ANTHROPIC_DEFAULT_BASE_URL`, or
+  `CLAUDE_CODE_BASE_URL` (a strict subset of the routing vars
+  `bin/lib/hmd-gate-endpoint.sh` scrubs from every gate child). It records
+  *redirection* — not compression: an enterprise LiteLLM/Bedrock gateway sets a base
+  URL and compresses nothing.
+- `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY` (and the lowercase forms)
+  are **deliberately excluded**. A corporate egress proxy sets those and redirects no
+  base URL, so counting them would mark every developer behind a corporate network as
+  proxied — an enterprise-correlated bias in the very data meant to measure proxying.
+- **`proxy_vendor`** is emitted only when the environment names a vendor namespace
+  (`HEADROOM_*` → `"headroom"`). When no vendor is named the key is **absent**, never
+  `"unknown"` — an absent key is the honest shape for "none observed".
+
+The exclusion and the absent-when-unknown rule are gated by
+`test/pmr-context-proxied.test.sh`, not merely intended.
 
 An **outcome** record (`pmr_outcome_v1`) later joins a change to whether it was
 reverted / hotfixed / survived — again only booleans and coded buckets, passed

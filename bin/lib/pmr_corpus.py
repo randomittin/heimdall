@@ -472,8 +472,10 @@ def project(job):
       verify:{gates_run[], verdict, deny_reasons[coded], retry_count,
               time_to_green_s, mutants_run, survived, bloat_budget_delta},
       human: {merged, overridden, override_latency_s},
-      env:   {os_class, ci, hmd_version},
+      env:   {os_class, ci, hmd_version, context_proxied, proxy_vendor},
     }
+    The two env research fields are AMBIENT unless the caller states them: see
+    _default_context_proxied / _default_proxy_vendor below.
     """
     att = job.get("attestation") or {}
     ids = job.get("ids") or {}
@@ -510,6 +512,12 @@ def project(job):
         deny_reasons = _tag_list(
             f.get("code") for f in (risk.get("flags") or []) if f.get("code")
         )
+
+    # env research fields — AMBIENT unless the caller states them. context_proxied is
+    # always present (a boolean is an answer either way); proxy_vendor is OMITTED when
+    # no vendor is named, so absence reads as "none observed", never as a vendor.
+    proxied = env.get("context_proxied")
+    proxy_vendor = _tag(env.get("proxy_vendor") or _default_proxy_vendor())
 
     rec = {
         "schema": SCHEMA_PMR,
@@ -566,9 +574,13 @@ def project(job):
         "env": {
             "os_class": _tag(env.get("os_class") or _default_os_class()),
             "ci": bool(env.get("ci", False)),
+            "context_proxied": (_default_context_proxied() if proxied is None
+                                else bool(proxied)),
             "hmd_version": _tag(env.get("hmd_version") or "unknown"),
         },
     }
+    if proxy_vendor:
+        rec["env"]["proxy_vendor"] = proxy_vendor
     return rec
 
 
@@ -577,6 +589,56 @@ def _default_os_class():
         return (os.uname().sysname or "unknown").lower()
     except (AttributeError, OSError):
         return sys.platform or "unknown"
+
+
+# ── ambient PROXY detection (env research fields — LOCAL spool only, §1) ──────
+#
+# These answer ONE research question: does routing a coding agent through a proxied
+# base URL correlate with deny classes? They add ZERO egress — PMR is written to the
+# local spool and nothing ships this release (DATA.md:15, this file's header) — so the
+# cost is two more locally-spooled leaves and the IDENTITY.md claims stand untouched.
+
+# The base-URL redirect vars. A STRICT SUBSET of _HMD_GATE_ROUTING_VARS in
+# bin/lib/hmd-gate-endpoint.sh:54-70 — the SAME enumeration the gates-read-raw defense
+# scrubs, so the research field and that defense cannot drift apart (section A of
+# test/pmr-context-proxied.test.sh gates the subset relation against that file).
+#
+# DELIBERATELY EXCLUDED: HTTP_PROXY / HTTPS_PROXY / ALL_PROXY / NO_PROXY and their
+# lowercase forms. A corporate egress proxy sets those and redirects no base URL, so
+# counting them would fire true for every developer behind a corporate network and
+# plant an enterprise-correlated bias in the very corpus meant to measure proxying.
+# A confounded signal is worse than no signal. The exclusion is gated, not intended.
+_PROXY_BASE_URL_VARS = (
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_API_URL",
+    "ANTHROPIC_DEFAULT_BASE_URL",
+    "CLAUDE_CODE_BASE_URL",
+)
+
+# Vendor namespace -> the coded vendor tag. Detection is a PURE ENV READ: nothing is
+# executed, probed, or installed, and the named tool need not be present at all.
+_PROXY_VENDOR_NAMESPACES = (("HEADROOM_", "headroom"),)
+
+
+def _default_context_proxied():
+    """True iff the ambient env REDIRECTS the client's provider base URL. Named for
+    what is actually observable — redirection — and NOT for compression: an enterprise
+    LiteLLM/Bedrock gateway sets a base URL and compresses nothing, so a compression
+    claim would be false on exactly those rows. An exported-but-EMPTY var redirects
+    nothing and does not count."""
+    return any((os.environ.get(var) or "").strip() for var in _PROXY_BASE_URL_VARS)
+
+
+def _default_proxy_vendor():
+    """The coded vendor tag when the ambient env names a proxy vendor, else None — in
+    which case the caller OMITS the field entirely. "unknown" is not used: it would
+    assert a vendor on every unproxied session, and an absent key is the honest shape
+    for "no vendor observed"."""
+    for prefix, vendor in _PROXY_VENDOR_NAMESPACES:
+        for key, value in os.environ.items():
+            if key.startswith(prefix) and (value or "").strip():
+                return vendor
+    return None
 
 
 # ── the emit path: project -> guard -> secret-scan -> queue (§1/§2/§5.1) ──────
