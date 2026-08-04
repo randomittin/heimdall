@@ -1,0 +1,410 @@
+#!/usr/bin/env bash
+# heimdall-seed-demo-wall — seed N BOT identities into a PUBLIC-BY-DESIGN demo team,
+# so the site's live wall embed has something to render before the real team is big
+# enough to fill it.
+#
+# ─── THE HONESTY CONTRACT (read this before you change anything) ───────────────
+# This repo's entire pitch is that presence on the wall is REAL. A wall populated
+# by this script is DECORATIVE, and every surface that can show it must say so.
+# This directory has already been bitten once: launch-docs/assets/wall.* depict
+# five INVENTED teammates (arjun, kai, maya, nadia, priya) and name a source path
+# (src/auth/session.ts) this repo has never had. test/asset-provenance-gate.test.sh
+# now blocks fixture-derived assets from reader-facing surfaces, fail-closed.
+#
+# So this script is built to make the fake UNMISTAKABLE, at three layers:
+#   1. NAMING — every seeded handle is `demo-bot-NN`, a shape no human teammate can
+#      hold. A screenshot of this roster can never be misread as real adoption.
+#   2. DATA FLOOR — the only fields written are the ones a row NEEDS to render.
+#      verdict is `watching` (the weakest of pass/working/deny/watching — a bot that
+#      is merely present has PROVEN NOTHING, and claiming `pass` would fabricate a
+#      proof). `file` is a literal self-description, never a repo path, because
+#      naming a plausible-but-nonexistent path is exactly the wall.json sin.
+#      There are no merge counts and no gate history here. None are invented.
+#   3. LABELLING — the site embed detects the `demo-bot-` prefix (and the demo
+#      project id) and renders a VISIBLE demo banner over the wall. That detection
+#      is enforced by test/demo-wall-honesty.test.sh, which goes RED if the label
+#      is dropped. The label is the product of this naming, so keep them in sync:
+#      DEMO_HANDLE_PREFIX below is the contract the embed reads.
+#
+# NEVER declare anything this produces `real` in launch-docs/assets/provenance.json.
+#
+# ─── SAFETY ───────────────────────────────────────────────────────────────────
+# DRY-RUN IS THE DEFAULT and it never speaks to the network. It exercises the
+# whole shape end-to-end against a LOCAL CP PROFILE: a throwaway HEIMDALL_HOME
+# driving the same cp_presence store + the same GET /roster-team route handler the
+# deployed control plane serves. Same code, local store, zero packets.
+#
+# The real ~/.heimdall (live team secret, PKI signing key, presence state) is NEVER
+# touched: dry-run mints its own HEIMDALL_HOME under a mktemp dir and REFUSES to
+# run if that path resolves inside the caller's real home (see assert_sandboxed).
+#
+# Live execution writes to the live control plane and therefore demands an
+# explicit, unmissable opt-in — BOTH the --live flag AND the exact confirmation
+# phrase in $HEIMDALL_SEED_LIVE_CONFIRM. One alone is refused. There is no
+# live-by-default path and no way to reach one by omitting an argument.
+#
+# Usage:
+#   heimdall-seed-demo-wall                     DRY-RUN (default): seed 5 bots into a
+#                                               local CP profile, read them back, report.
+#   heimdall-seed-demo-wall --count 8           Seed 8 bots instead of 5.
+#   heimdall-seed-demo-wall --json              Emit ONLY the roster JSON (CP wire shape).
+#   heimdall-seed-demo-wall --out FILE          Also write that roster JSON to FILE.
+#   heimdall-seed-demo-wall --project ID        Override the demo project id.
+#   heimdall-seed-demo-wall --live              REFUSED unless the confirm phrase is set.
+#   heimdall-seed-demo-wall --emit-fallback-gif PATH
+#                                               Regenerate the static wall fallback GIF the
+#                                               embed degrades to. Reproducible from source
+#                                               so the committed binary is not a mystery.
+#
+#   Go live (writes to the live control plane):
+#     HEIMDALL_SEED_LIVE_CONFIRM='SEED THE PUBLIC DEMO TEAM' \
+#       heimdall-seed-demo-wall --live --count 5
+#
+set -uo pipefail
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(cd "$SELF_DIR/.." && pwd)"
+LIB="$REPO/bin/lib"
+
+# ─── THE DEMO CONTRACT ────────────────────────────────────────────────────────
+# DEMO_HANDLE_PREFIX is load-bearing: the site embed keys its visible demo banner
+# off this exact string. Changing it here without changing the embed silently
+# un-labels the demo wall — test/demo-wall-honesty.test.sh fails if they diverge.
+DEMO_HANDLE_PREFIX="demo-bot-"
+DEMO_PROJECT_DEFAULT="heimdall-demo-wall"
+DEMO_VERDICT="watching"
+DEMO_FILE="(synthetic presence - no real edit)"
+LIVE_CONFIRM_PHRASE="SEED THE PUBLIC DEMO TEAM"
+
+COUNT=5
+AS_JSON=0
+OUT_FILE=""
+LIVE=0
+EMIT_GIF=""
+DEMO_PROJECT="$DEMO_PROJECT_DEFAULT"
+
+die() { printf 'heimdall-seed-demo-wall: %s\n' "$1" >&2; exit "${2:-2}"; }
+
+usage() {
+  sed -n '2,60p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  exit 0
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --count)   shift; COUNT="${1:-}"; [ -n "$COUNT" ] || die "--count needs a value" ;;
+    --count=*) COUNT="${1#*=}" ;;
+    --project)   shift; DEMO_PROJECT="${1:-}"; [ -n "$DEMO_PROJECT" ] || die "--project needs a value" ;;
+    --project=*) DEMO_PROJECT="${1#*=}" ;;
+    --out)   shift; OUT_FILE="${1:-}"; [ -n "$OUT_FILE" ] || die "--out needs a path" ;;
+    --out=*) OUT_FILE="${1#*=}" ;;
+    --emit-fallback-gif)   shift; EMIT_GIF="${1:-}"; [ -n "$EMIT_GIF" ] || die "--emit-fallback-gif needs a path" ;;
+    --emit-fallback-gif=*) EMIT_GIF="${1#*=}" ;;
+    --json)  AS_JSON=1 ;;
+    --live)  LIVE=1 ;;
+    --dry)   LIVE=0 ;;
+    -h|--help) usage ;;
+    *) die "unknown argument '$1' (try --help)" ;;
+  esac
+  shift
+done
+
+case "$COUNT" in
+  ''|*[!0-9]*) die "--count must be a positive integer (got '$COUNT')" ;;
+esac
+[ "$COUNT" -ge 1 ] || die "--count must be at least 1 (got '$COUNT')"
+[ "$COUNT" -le 50 ] || die "--count is capped at 50 (got '$COUNT') — a demo wall is a demo, not a crowd"
+
+PY="$(command -v python3 || command -v python || true)"
+[ -n "$PY" ] || die "python3 not found — the local CP profile needs it"
+[ -f "$LIB/cp_presence.py" ] || die "missing $LIB/cp_presence.py (not a heimdall checkout?)"
+[ -f "$LIB/cp_auth.py" ] || die "missing $LIB/cp_auth.py (not a heimdall checkout?)"
+
+# ─── the static fallback GIF ──────────────────────────────────────────────────
+# What the embed degrades to when the live roster is EMPTY or UNREACHABLE, so a
+# reader never meets a blank wall. Deliberately depicts NO teammates, NO verdicts
+# and NO counts — an image of a bustling wall would be the fabrication this repo
+# already got bitten by. It says only what is true in both degrade cases: there is
+# no live presence to show, and the thing you are looking at is a static image.
+#
+# It does NOT say "demo": this same asset renders for a real dev whose real team
+# is simply idle, and calling their team a demo would be its own dishonesty. The
+# demo label is a separate, roster-triggered banner in the embed.
+#
+# TRANSPARENT background with mid-tone ink, because the site ships BOTH a dark and
+# a light theme and one flat-background GIF cannot serve both. Alpha is thresholded
+# to GIF's 1-bit transparency, so there is no halo on either theme; the asset is
+# emitted at 2x and displayed at 1x, which hides the resulting aliasing.
+if [ -n "$EMIT_GIF" ]; then
+  EMIT_GIF="$EMIT_GIF" "$PY" - <<'PYEOF' || die "fallback GIF generation failed" 4
+import os
+import sys
+
+try:
+    from PIL import Image, ImageDraw, ImageFont
+except ImportError:
+    sys.stderr.write("fallback GIF needs Pillow (pip install Pillow)\n")
+    raise SystemExit(1)
+
+W, H = 1200, 300           # 2x of the 600x150 display box
+INK_2 = (0x99, 0xA1, 0xAB)  # --ink-2: legible on #07080A and on #FAFBFC alike
+INK_3 = (0x7E, 0x86, 0x91)  # --ink-3
+ACCENT = (0x42, 0x64, 0xFF)  # --accent
+
+FONT_DIRS = ("/System/Library/Fonts/Supplemental", "/Library/Fonts", "/System/Library/Fonts")
+
+
+def load(names, size):
+    for d in FONT_DIRS:
+        for n in names:
+            p = os.path.join(d, n)
+            if os.path.exists(p):
+                try:
+                    return ImageFont.truetype(p, size)
+                except OSError:
+                    continue
+    raise SystemExit("no usable TTF found in %s" % (FONT_DIRS,))
+
+
+bold = load(("Arial Bold.ttf", "Helvetica.ttc", "Verdana Bold.ttf"), 52)
+small = load(("Arial.ttf", "Helvetica.ttc", "Verdana.ttf"), 27)
+
+img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+d = ImageDraw.Draw(img)
+
+
+def centered(text, font, fill, y):
+    left, top, right, bottom = d.textbbox((0, 0), text, font=font)
+    d.text(((W - (right - left)) / 2 - left, y), text, font=font, fill=fill)
+    return bottom - top
+
+
+# A short accent rule reads as "a panel lives here" without asserting any content.
+d.rectangle([(W / 2 - 34, 62), (W / 2 + 34, 66)], fill=ACCENT + (255,))
+centered("NO LIVE PRESENCE", bold, INK_2 + (255,), 104)
+centered("Static placeholder — this image is not a live wall.", small, INK_3 + (255,), 186)
+
+# Threshold alpha to GIF's 1-bit transparency: index 255 is reserved as the
+# transparent slot, so the adaptive palette gets the remaining 255 entries.
+alpha = img.split()[3]
+transparent = alpha.point(lambda a: 255 if a < 128 else 0)
+pal = img.convert("RGB").convert("P", palette=Image.ADAPTIVE, colors=255)
+pal.paste(255, mask=transparent)
+pal.save(os.environ["EMIT_GIF"], transparency=255, optimize=True)
+sys.stderr.write("wrote %s (%dx%d, transparent)\n" % (os.environ["EMIT_GIF"], W, H))
+PYEOF
+  exit 0
+fi
+
+# ─── the sandbox guard ────────────────────────────────────────────────────────
+# The one thing this script must never do is write into the caller's real
+# ~/.heimdall. Every exercise runs under a mktemp HEIMDALL_HOME; this asserts that
+# home is genuinely outside the caller's home dir before a single record is written.
+assert_sandboxed() {
+  sandbox="$1"
+  case "$sandbox" in
+    "$HOME"|"$HOME"/*) die "REFUSING: sandbox home '$sandbox' is inside the real HOME ($HOME)" 3 ;;
+  esac
+  [ -n "$sandbox" ] || die "REFUSING: empty sandbox home" 3
+  [ -d "$sandbox" ] || die "REFUSING: sandbox home '$sandbox' is not a directory" 3
+}
+
+# Bot N's identity. The handle shape is the honesty contract; the haid mirrors the
+# real `haid:<handle>.<machine>` format with a machine segment that is itself a
+# disclaimer, so even a raw HAID in a log reads as synthetic.
+bot_handle() { printf '%s%02d' "$DEMO_HANDLE_PREFIX" "$1"; }
+bot_haid()   { printf 'haid:%s%02d.synthetic' "$DEMO_HANDLE_PREFIX" "$1"; }
+
+# ─── LIVE GUARD ───────────────────────────────────────────────────────────────
+# Both signals required. --live alone is refused, and the confirm phrase alone does
+# nothing. The refusal prints the exact command so the operator opts in knowingly
+# rather than discovering the flag by trial and error.
+if [ "$LIVE" -eq 1 ]; then
+  if [ "${HEIMDALL_SEED_LIVE_CONFIRM:-}" != "$LIVE_CONFIRM_PHRASE" ]; then
+    cat >&2 <<EOF
+heimdall-seed-demo-wall: REFUSING to run live.
+
+  --live writes bot presence to the LIVE control plane. It requires the
+  confirmation phrase as well as the flag, so it can never happen by accident:
+
+    HEIMDALL_SEED_LIVE_CONFIRM='$LIVE_CONFIRM_PHRASE' \\
+      $0 --live --count $COUNT
+
+  Nothing was written. Run without --live for the dry-run against a local CP profile.
+EOF
+    exit 3
+  fi
+fi
+
+# ─── the local CP profile ─────────────────────────────────────────────────────
+SANDBOX="$(mktemp -d -t heimdall-demo-wall)"
+trap 'rm -rf "$SANDBOX"' EXIT
+SANDBOX_HOME="$SANDBOX/home"
+mkdir -p "$SANDBOX_HOME"
+assert_sandboxed "$SANDBOX_HOME"
+
+# The demo team secret. Public-by-design: this team is MEANT to be readable by
+# anyone looking at the site, which is exactly why nothing real may ever beat into
+# it. Minted fresh per dry-run (nothing persists); live reads the operator's.
+if [ "$LIVE" -eq 1 ]; then
+  TEAM_SECRET="${HEIMDALL_DEMO_TEAM_SECRET:-}"
+  [ -n "$TEAM_SECRET" ] || die "live seeding needs \$HEIMDALL_DEMO_TEAM_SECRET (the demo team's secret)" 3
+else
+  TEAM_SECRET="$("$PY" -c 'import secrets;print(secrets.token_urlsafe(32))')"
+fi
+
+ROSTER_JSON="$SANDBOX/roster.json"
+
+if [ "$LIVE" -eq 1 ]; then
+  # ── LIVE PATH — real enroll + real signed beats through the real client. ──
+  # Each bot gets its OWN presence dir so heimdall-presence auto-bootstraps a
+  # distinct signing key and enrolls it, exactly as a real teammate's first beat
+  # does. Every call is bounded by perl's alarm (macOS has no timeout(1)) so an
+  # unreachable CP cannot hang the seeding run.
+  CP_URL="${HEIMDALL_CP_URL:-${BASE_URL:-}}"
+  [ -n "$CP_URL" ] || die "live seeding needs \$HEIMDALL_CP_URL (the control plane endpoint)" 3
+  TEAM_DIR="$SANDBOX/team/.heimdall"
+  mkdir -p "$TEAM_DIR"
+  printf '{"team_secret":"%s","created":%s,"source":"heimdall-seed-demo-wall"}\n' \
+    "$TEAM_SECRET" "$(date +%s)" > "$TEAM_DIR/team.json"
+  chmod 600 "$TEAM_DIR/team.json"
+
+  printf 'seeding %d demo bots LIVE into %s (project=%s)\n' "$COUNT" "$CP_URL" "$DEMO_PROJECT" >&2
+  SEEDED=0
+  i=1
+  while [ "$i" -le "$COUNT" ]; do
+    handle="$(bot_handle "$i")"
+    haid="$(bot_haid "$i")"
+    pres_dir="$SANDBOX/bots/$handle/.heimdall"
+    mkdir -p "$pres_dir"
+    if env HOME="$SANDBOX_HOME" HEIMDALL_HOME="$SANDBOX_HOME/.heimdall" \
+           HEIMDALL_PRESENCE_DIR="$pres_dir" HEIMDALL_TEAM_DIR="$TEAM_DIR" \
+           HEIMDALL_CP_URL="$CP_URL" \
+           HMD_HAID="$haid" HMD_HANDLE="$handle" HMD_PROJECT="$DEMO_PROJECT" \
+           HMD_VERDICT="$DEMO_VERDICT" HMD_FILE="$DEMO_FILE" \
+           perl -e 'alarm 25; exec @ARGV' -- "$REPO/bin/heimdall-presence" beat >/dev/null 2>&1; then
+      SEEDED=$((SEEDED+1))
+      printf '  beat ok   %s\n' "$handle" >&2
+    else
+      printf '  beat FAIL %s (continuing)\n' "$handle" >&2
+    fi
+    i=$((i+1))
+  done
+
+  # Read the live wall back through the same public route the browser uses.
+  env HOME="$SANDBOX_HOME" HEIMDALL_HOME="$SANDBOX_HOME/.heimdall" \
+      HEIMDALL_TEAM_DIR="$TEAM_DIR" HEIMDALL_CP_URL="$CP_URL" \
+      perl -e 'alarm 25; exec @ARGV' -- \
+      curl -fsS -H "X-Heimdall-Team-Secret: $TEAM_SECRET" \
+        "$CP_URL/roster-team?project=$DEMO_PROJECT" > "$ROSTER_JSON" 2>/dev/null \
+    || die "live roster read-back failed (seeded $SEEDED/$COUNT) — the wall was written but could not be verified" 4
+  MODE_LABEL="LIVE (wrote to $CP_URL)"
+else
+  # ── DRY-RUN PATH — the same cp_presence store + the same GET /roster-team route
+  # handler the deployed CP serves, against a throwaway local home. No network. ──
+  TEAM_SECRET="$TEAM_SECRET" DEMO_PROJECT="$DEMO_PROJECT" COUNT="$COUNT" \
+  DEMO_VERDICT="$DEMO_VERDICT" DEMO_FILE="$DEMO_FILE" \
+  DEMO_HANDLE_PREFIX="$DEMO_HANDLE_PREFIX" LIB="$LIB" \
+  HEIMDALL_HOME="$SANDBOX_HOME/.heimdall" HEIMDALL_PUBLIC_SURFACE=1 \
+  "$PY" - > "$ROSTER_JSON" <<'PYEOF' || die "dry-run seeding failed" 4
+import json, os, sys
+
+sys.path.insert(0, os.environ["LIB"])
+import cp_auth
+import cp_presence as P
+
+project = os.environ["DEMO_PROJECT"]
+prefix = os.environ["DEMO_HANDLE_PREFIX"]
+count = int(os.environ["COUNT"])
+secret = os.environ["TEAM_SECRET"]
+
+# The partition handle the browser read will derive from the presented secret.
+# Seeding under the SAME derivation is what makes the read-back a real proof.
+team_id = cp_auth.derive_team_id(secret)
+
+for i in range(1, count + 1):
+    handle = "%s%02d" % (prefix, i)
+    P.record_presence(
+        "haid:%s.synthetic" % handle,
+        project=project,
+        team_id=team_id,
+        handle=handle,
+        verdict=os.environ["DEMO_VERDICT"],
+        file=os.environ["DEMO_FILE"],
+    )
+
+# Read it back through the REAL route handler the deployed CP serves for the
+# browser — same auth path (secret header -> derived team_id), same wire shape.
+resp = P.roster_team_route({
+    "method": "GET",
+    "route_path": "/roster-team",
+    "query": {"project": project},
+    "team_secret": secret,
+    "peer_ip": "127.0.0.1",
+})
+if resp.status != 200:
+    sys.stderr.write("roster read-back returned %s: %r\n" % (resp.status, resp.body))
+    raise SystemExit(1)
+json.dump(resp.body, sys.stdout, indent=2, sort_keys=True)
+sys.stdout.write("\n")
+PYEOF
+  MODE_LABEL="DRY-RUN (local CP profile — no network, no live write)"
+fi
+
+[ -s "$ROSTER_JSON" ] || die "roster read-back produced nothing" 4
+
+# ─── the honesty self-check ───────────────────────────────────────────────────
+# Refuse to hand back a roster this script cannot label. If a row ever appears
+# without the demo prefix, the embed's demo detection would miss it and that row
+# would render as a real teammate — so fail loudly instead of emitting it.
+UNLABELLED="$(DEMO_HANDLE_PREFIX="$DEMO_HANDLE_PREFIX" "$PY" - "$ROSTER_JSON" <<'PYEOF'
+import json, os, sys
+
+prefix = os.environ["DEMO_HANDLE_PREFIX"]
+with open(sys.argv[1], "r", encoding="utf-8") as fh:
+    body = json.load(fh)
+rows = body.get("online") or []
+bad = [r.get("handle") for r in rows if not str(r.get("handle") or "").startswith(prefix)]
+print(len(bad))
+PYEOF
+)"
+[ "$UNLABELLED" = "0" ] \
+  || die "REFUSING to emit: $UNLABELLED seeded row(s) lack the '$DEMO_HANDLE_PREFIX' prefix and would render as real teammates" 5
+
+if [ -n "$OUT_FILE" ]; then
+  cp "$ROSTER_JSON" "$OUT_FILE" || die "could not write --out '$OUT_FILE'"
+fi
+
+if [ "$AS_JSON" -eq 1 ]; then
+  cat "$ROSTER_JSON"
+  exit 0
+fi
+
+ONLINE_N="$("$PY" -c 'import json,sys;print(len((json.load(open(sys.argv[1])).get("online") or [])))' "$ROSTER_JSON")"
+
+cat <<EOF
+heimdall-seed-demo-wall
+  mode      $MODE_LABEL
+  project   $DEMO_PROJECT
+  seeded    $COUNT bot identit$([ "$COUNT" -eq 1 ] && echo y || echo ies)
+  on wall   $ONLINE_N
+  provenance  DEMO / fixture — never 'real'. Declared in launch-docs/assets/provenance.json.
+
+  Every handle carries the '$DEMO_HANDLE_PREFIX' prefix. The site embed keys its
+  VISIBLE demo banner off that prefix, so this roster cannot render unlabelled.
+
+EOF
+"$PY" - "$ROSTER_JSON" <<'PYEOF'
+import json, sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as fh:
+    body = json.load(fh)
+for r in body.get("online") or []:
+    print("  %-14s %-9s %-32s %ss ago" % (
+        r.get("handle") or "?", r.get("verdict") or "-",
+        r.get("file") or "-", r.get("age_seconds")))
+PYEOF
+
+if [ -n "$OUT_FILE" ]; then
+  printf '\n  roster JSON -> %s\n' "$OUT_FILE"
+fi
