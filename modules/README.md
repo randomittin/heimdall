@@ -29,13 +29,39 @@ The lifecycle test enforces that no module directory grows a vendored payload.
 | `upstream` | yes | where the thing actually comes from |
 | `license` | yes | the upstream licence |
 | `pinned_version` | yes | `{version, artifact, artifact_sha256}` — 64 lowercase hex |
-| `permission_class` | yes | one of the four classes; **never defaulted** |
+| `permission_class` | yes | one of the four classes, **or a list of them**; **never defaulted** |
 | `installs_via` | yes | `{kind:"local", artifact_path}` or `{kind:"upstream", fetch}` |
 | `wires` | yes | array of `{kind, target}`; may be empty (reported as inert) |
 | `invariants` | yes | `{<id>: {command, expect?, expect_exit?, timeout_sec?}}` |
-| `tier` | yes | `available` or `suggested` |
+| `tier` | yes | `available` or `suggested` — an **evidence** claim |
 | `tier_evidence` | if `suggested` | `{receipt}` — a green pre-registered A/B or equivalent |
+| `default_included` | no | boolean — a **distribution** fact, deliberately not a tier |
 | `consent_text` | if the class requires consent | what the operator is agreeing to |
+
+### A module may claim SEVERAL classes
+
+`permission_class` accepts a list. A context proxy that also encodes what it
+compressed is genuinely both a `traffic-proxy` and a `storage-codec`, and each
+class it claims contributes its own invariants — **the union runs, never the
+first match.** Declaring only one class does not error; it quietly stops running
+the other class's checks, so every class dropped is a check silently lost. Each
+recorded invariant result carries the class that demanded it, which is what makes
+a later drop visible in the receipt.
+
+### `tier` is evidence; `default_included` is distribution
+
+They are separate fields because they answer different questions. `tier` is a
+claim about what has been *measured* — `suggested` requires a green
+pre-registered A/B under `tier_evidence` — while `default_included` records
+whether the module ships in hmd's default set, which is a packaging decision and
+proves nothing about whether it helps. Keeping them apart is what stops a
+distribution choice laundering itself into an evidence claim. A module can be
+default-included and honestly unproven at the same time; several are.
+
+A `default_included` module reaches every machine that installs hmd, so if any
+class it claims requires consent, its `consent_text` must exist at **validate**
+time — a disclosure that only materialises at a prompt somebody may never be
+shown is not a disclosure.
 
 A manifest with a missing or unknown `permission_class` is **refused, not
 defaulted** — the class decides consent and which invariants are enforced, so

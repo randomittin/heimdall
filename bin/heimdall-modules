@@ -27,6 +27,14 @@
 # DISCOVERS what to enforce by reading that file. Nothing here is hardcoded per
 # module, and adding a class is a JSON file, not a patch to this script.
 #
+# A MODULE MAY CLAIM SEVERAL CLASSES. `permission_class` takes a string or a
+# list, and every class named contributes its invariants — the UNION runs, never
+# the first match. A module that proxies traffic AND encodes what it stores is
+# genuinely both, and modelling only one would not fail loudly: it would quietly
+# stop running the other class's checks. Consent is the union too (if any class
+# requires it, it is required), and each recorded result carries the class that
+# demanded it so a class dropped later is visible in the receipt.
+#
 # An invariant check is one of two kinds:
 #   suite     the CLASS owns the command (repo-owned, reviewable in one place).
 #             Used where the repo already holds the falsifier — the traffic-proxy
@@ -211,10 +219,33 @@ validate_manifest() {
 
   local v
   local field
-  for field in name description upstream license permission_class tier; do
+  for field in name description upstream license tier; do
     v="$(jq -r --arg f "$field" '.[$f] // "" | if type=="string" then . else "" end' "$mf")"
     [ -n "$v" ] || verr "missing or non-string required field: \`$field\`"
   done
+
+  # permission_class is a STRING or a NON-EMPTY ARRAY of strings. A module can sit
+  # in more than one class at once — a context proxy that also stores what it
+  # compressed is genuinely both a traffic-proxy and a storage-codec — and each
+  # class it claims contributes its own invariants. Modelling only the first would
+  # silently skip the second class's checks, which is the same as not declaring it.
+  if ! jq -e '(.permission_class | type) as $t
+              | ($t == "string" and (.permission_class | length) > 0)
+                or ($t == "array" and (.permission_class | length) > 0
+                    and all(.permission_class[]; type == "string" and length > 0))' \
+       "$mf" >/dev/null 2>&1; then
+    verr "missing or invalid \`permission_class\` — expected a non-empty string, or a non-empty array of strings for a module that sits in several classes at once"
+  fi
+
+  # default_included — a DISTRIBUTION fact (does this ship in hmd's default module
+  # set), deliberately NOT a tier. `tier` is an EVIDENCE claim and `suggested`
+  # means a green pre-registered A/B exists; shipping something by default is a
+  # packaging decision that proves nothing about whether it helps. Conflating them
+  # would let a distribution choice launder itself into an evidence claim.
+  if jq -e 'has("default_included")' "$mf" >/dev/null 2>&1; then
+    jq -e '.default_included | type == "boolean"' "$mf" >/dev/null 2>&1 \
+      || verr "\`default_included\` must be a boolean (a distribution fact, separate from \`tier\`, which is an evidence claim)"
+  fi
 
   v="$(jq -r '.name // ""' "$mf")"
   [ -z "$v" ] || [ "$v" = "$name" ] || verr "\`name\` is \"$v\" but the module directory is \"$name\" — they must match"
@@ -278,36 +309,69 @@ validate_manifest() {
 # permission_class must name a real contract. Missing or invalid is REFUSED,
 # never defaulted: silently choosing a class for a module is choosing its
 # security posture for it.
-CLASS_FILE=""
-resolve_class() {
-  local mf="$1" pc
-  pc="$(jq -r '.permission_class // ""' "$mf")"
-  if [ -z "$pc" ]; then
+# A module may claim SEVERAL classes. Every class it claims is resolved and every
+# one of them contributes its invariants — the union is enforced, never the first
+# match. Dropping a class would drop that class's checks silently, so an unknown
+# or duplicated entry is refused outright rather than skipped.
+CLASS_FILES=""   # newline-separated contract paths, in manifest order
+CLASS_NAMES=""   # newline-separated class names, in manifest order
+CLASS_JOINED=""  # "traffic-proxy + storage-codec" — for receipts and display
+
+# The declared classes, one per line. Normalises the string and array forms so
+# every caller downstream sees a list.
+manifest_classes() {
+  jq -r 'if (.permission_class | type) == "array" then .permission_class[]
+         else (.permission_class // empty) end
+         | select(type == "string" and . != "")' "$1" 2>/dev/null
+}
+
+resolve_classes() {
+  local mf="$1" pc cf declared list seen=""
+  CLASS_FILES=""; CLASS_NAMES=""; CLASS_JOINED=""
+
+  list="$(manifest_classes "$mf")"
+  if [ -z "$list" ]; then
     warn "refused: manifest declares no \`permission_class\`."
     warn "  A permission class is never defaulted — it decides consent and which"
     warn "  invariants are enforced. Declare one of: $(available_classes | tr '\n' ' ')"
     return 1
   fi
-  CLASS_FILE="$(class_path "$pc")"
-  if [ ! -f "$CLASS_FILE" ]; then
-    warn "refused: unknown \`permission_class\`: \"$pc\""
-    warn "  No contract at ${CLASS_FILE#"$PLUGIN_DIR"/}. Valid classes: $(available_classes | tr '\n' ' ')"
-    return 1
-  fi
-  if ! jq -e . "$CLASS_FILE" >/dev/null 2>&1; then
-    warn "refused: class contract is not valid JSON: ${CLASS_FILE#"$PLUGIN_DIR"/}"
-    return 1
-  fi
-  local declared
-  declared="$(jq -r '.class // ""' "$CLASS_FILE")"
-  if [ "$declared" != "$pc" ]; then
-    warn "refused: class contract ${CLASS_FILE#"$PLUGIN_DIR"/} declares class \"$declared\", not \"$pc\""
-    return 1
-  fi
-  if ! jq -e '.requires_invariants | type == "array"' "$CLASS_FILE" >/dev/null 2>&1; then
-    warn "refused: class contract \"$pc\" has no \`requires_invariants\` array"
-    return 1
-  fi
+
+  while IFS= read -r pc; do
+    [ -n "$pc" ] || continue
+    case " $seen " in
+      *" $pc "*)
+        warn "refused: \`permission_class\` lists \"$pc\" more than once."
+        return 1 ;;
+    esac
+    seen="$seen $pc"
+
+    cf="$(class_path "$pc")"
+    if [ ! -f "$cf" ]; then
+      warn "refused: unknown \`permission_class\`: \"$pc\""
+      warn "  No contract at ${cf#"$PLUGIN_DIR"/}. Valid classes: $(available_classes | tr '\n' ' ')"
+      return 1
+    fi
+    if ! jq -e . "$cf" >/dev/null 2>&1; then
+      warn "refused: class contract is not valid JSON: ${cf#"$PLUGIN_DIR"/}"
+      return 1
+    fi
+    declared="$(jq -r '.class // ""' "$cf")"
+    if [ "$declared" != "$pc" ]; then
+      warn "refused: class contract ${cf#"$PLUGIN_DIR"/} declares class \"$declared\", not \"$pc\""
+      return 1
+    fi
+    if ! jq -e '.requires_invariants | type == "array"' "$cf" >/dev/null 2>&1; then
+      warn "refused: class contract \"$pc\" has no \`requires_invariants\` array"
+      return 1
+    fi
+
+    CLASS_FILES="${CLASS_FILES}${cf}
+"
+    CLASS_NAMES="${CLASS_NAMES}${pc}
+"
+    [ -z "$CLASS_JOINED" ] && CLASS_JOINED="$pc" || CLASS_JOINED="$CLASS_JOINED + $pc"
+  done <<< "$list"
   return 0
 }
 
@@ -315,30 +379,55 @@ resolve_class() {
 # invariant with no command in the manifest is a HOLE, and a hole in a class
 # contract is exactly the thing this system exists to refuse.
 check_invariant_coverage() {
-  local mf="$1" missing="" id kind cmd
-  while IFS= read -r id; do
-    [ -n "$id" ] || continue
-    kind="$(jq -r --arg i "$id" '.requires_invariants[] | select(.id == $i) | .check.kind // ""' "$CLASS_FILE")"
-    case "$kind" in
-      suite)
-        cmd="$(jq -r --arg i "$id" '.requires_invariants[] | select(.id == $i) | .check.command // ""' "$CLASS_FILE")"
-        [ -n "$cmd" ] || missing="${missing} ${id}(class-contract-has-no-command)" ;;
-      manifest)
-        cmd="$(jq -r --arg i "$id" '.invariants[$i].command // ""' "$mf")"
-        [ -n "$cmd" ] || missing="${missing} ${id}" ;;
-      *)
-        missing="${missing} ${id}(unknown-check-kind:${kind:-none})" ;;
-    esac
-  done <<< "$(jq -r '.requires_invariants[].id // empty' "$CLASS_FILE")"
+  local mf="$1" missing="" id kind cmd cf pc
+  while IFS= read -r cf; do
+    [ -n "$cf" ] || continue
+    pc="$(jq -r '.class' "$cf")"
+    while IFS= read -r id; do
+      [ -n "$id" ] || continue
+      kind="$(jq -r --arg i "$id" '.requires_invariants[] | select(.id == $i) | .check.kind // ""' "$cf")"
+      case "$kind" in
+        suite)
+          cmd="$(jq -r --arg i "$id" '.requires_invariants[] | select(.id == $i) | .check.command // ""' "$cf")"
+          [ -n "$cmd" ] || missing="${missing} ${pc}/${id}(class-contract-has-no-command)" ;;
+        manifest)
+          cmd="$(jq -r --arg i "$id" '.invariants[$i].command // ""' "$mf")"
+          [ -n "$cmd" ] || missing="${missing} ${pc}/${id}" ;;
+        *)
+          missing="${missing} ${pc}/${id}(unknown-check-kind:${kind:-none})" ;;
+      esac
+    done <<< "$(jq -r '.requires_invariants[].id // empty' "$cf")"
+  done <<< "$CLASS_FILES"
 
   if [ -n "$missing" ]; then
     warn "refused: manifest does not cover every invariant its class requires."
-    warn "  class: $(jq -r '.class' "$CLASS_FILE")"
+    warn "  classes: $CLASS_JOINED"
     warn "  uncovered:$missing"
     warn "  Each needs a runnable command under \`invariants.<id>.command\`."
     warn "  Nothing was installed and nothing was wired."
     return 1
   fi
+  return 0
+}
+
+# A default-included module reaches EVERY machine that installs hmd, so a hole in
+# its disclosure is not a per-operator problem — it is a fleet-wide one. If any
+# class it claims requires consent, the disclosure text must exist at VALIDATE
+# time, not merely at the moment of a prompt somebody might never see.
+check_default_included() {
+  local mf="$1" cf
+  [ "$(jq -r '.default_included // false' "$mf")" = "true" ] || return 0
+  while IFS= read -r cf; do
+    [ -n "$cf" ] || continue
+    [ "$(jq -r '.consent_required // false' "$cf")" = "true" ] || continue
+    if [ -z "$(jq -r '.consent_text // ""' "$mf")" ]; then
+      warn "refused: \`default_included\` is true and class \"$(jq -r '.class' "$cf")\" requires consent,"
+      warn "  but the manifest ships no \`consent_text\`. A module in the default set"
+      warn "  reaches every machine, so its disclosure must exist before it ships —"
+      warn "  not at a prompt an operator may never be shown."
+      return 1
+    fi
+  done <<< "$CLASS_FILES"
   return 0
 }
 
@@ -348,23 +437,36 @@ check_invariant_coverage() {
 CONSENT_JSON="null"
 obtain_consent() {
   local name="$1" mf="$2"
-  local required text
-  required="$(jq -r '.consent_required // false' "$CLASS_FILE")"
+  local required="false" text cf pc consenting="" rationales=""
+  # Consent is the UNION across the declared classes: if any one of them requires
+  # it, it is required. The strictest class wins, because a module that is both a
+  # storage codec and a traffic proxy still intercepts traffic.
+  while IFS= read -r cf; do
+    [ -n "$cf" ] || continue
+    [ "$(jq -r '.consent_required // false' "$cf")" = "true" ] || continue
+    required="true"
+    pc="$(jq -r '.class' "$cf")"
+    [ -z "$consenting" ] && consenting="$pc" || consenting="$consenting + $pc"
+    rationales="${rationales}  ${pc}: $(jq -r '.consent_rationale // "This class can change behaviour you own."' "$cf")
+"
+  done <<< "$CLASS_FILES"
+
   if [ "$required" != "true" ]; then
-    CONSENT_JSON="$(jq -n '{required:false, note:"class does not require consent"}')"
+    CONSENT_JSON="$(jq -n --arg c "$CLASS_JOINED" \
+      '{required:false, note:("no declared class requires consent (" + $c + ")")}')"
     return 0
   fi
 
   text="$(jq -r '.consent_text // ""' "$mf")"
   if [ -z "$text" ]; then
-    warn "refused: class \"$(jq -r '.class' "$CLASS_FILE")\" requires consent, but the manifest ships no \`consent_text\`."
+    warn "refused: class \"$consenting\" requires consent, but the manifest ships no \`consent_text\`."
     warn "  An operator cannot agree to a blank prompt."
     return 1
   fi
 
   printf '\n  Module "%s" is class %s, which requires your consent.\n\n' \
-    "$name" "$(jq -r '.class' "$CLASS_FILE")"
-  printf '  %s\n\n' "$(jq -r '.consent_rationale // "This class can change behaviour you own."' "$CLASS_FILE")"
+    "$name" "$consenting"
+  printf '%s\n' "$rationales"
   printf '  %s\n\n' "$text"
 
   local granted_via=""
@@ -494,14 +596,17 @@ install_module() {
     --arg name "$name" \
     --arg version "$(jq -r '.pinned_version.version' "$mf")" \
     --arg artifact "$(jq -r '.pinned_version.artifact' "$mf")" \
-    --arg class "$(jq -r '.permission_class' "$mf")" \
+    --arg class "$CLASS_JOINED" \
+    --argjson classes "$(printf '%s' "$CLASS_NAMES" | jq -R -s 'split("\n") | map(select(. != ""))')" \
     --arg tier "$(jq -r '.tier // "available"' "$mf")" \
+    --argjson default_included "$(jq -r '.default_included // false' "$mf")" \
     --arg at "$(now_iso)" \
     --arg mfsha "$(sha256_file "$mf")" \
     --argjson digest "$DIGEST_JSON" \
     --argjson consent "$CONSENT_JSON" \
     '{name:$name, pinned_version:{version:$version, artifact:$artifact},
-      permission_class:$class, tier:$tier, installed_at:$at,
+      permission_class:$class, permission_classes:$classes,
+      tier:$tier, default_included:$default_included, installed_at:$at,
       manifest_sha256:$mfsha, digest:$digest, consent:$consent}' \
     > "$mdir/receipt.json" || { warn "error: cannot write receipt"; return 1; }
   return 0
@@ -527,18 +632,25 @@ INVARIANT_RESULTS="[]"
 run_invariants() {
   local name="$1" mf="$2"
   local results="[]" failed=0
-  local id kind cmd expect expect_exit secs source desc pass
+  local id kind cmd expect expect_exit secs source desc pass cf pc
 
+  # Every declared class contributes its invariants, and each result carries the
+  # class that demanded it. Two classes asking for the same guarantee run twice
+  # and are reported twice, on purpose: the receipt has to show which contract
+  # each green belongs to, or dropping a class later would go unnoticed.
+  while IFS= read -r cf; do
+    [ -n "$cf" ] || continue
+    pc="$(jq -r '.class' "$cf")"
   while IFS= read -r id; do
     [ -n "$id" ] || continue
-    kind="$(jq -r --arg i "$id" '.requires_invariants[] | select(.id == $i) | .check.kind // ""' "$CLASS_FILE")"
-    desc="$(jq -r --arg i "$id" '.requires_invariants[] | select(.id == $i) | .description // ""' "$CLASS_FILE")"
+    kind="$(jq -r --arg i "$id" '.requires_invariants[] | select(.id == $i) | .check.kind // ""' "$cf")"
+    desc="$(jq -r --arg i "$id" '.requires_invariants[] | select(.id == $i) | .description // ""' "$cf")"
     if [ "$kind" = "suite" ]; then
       source="class-contract"
-      cmd="$(jq -r --arg i "$id" '.requires_invariants[] | select(.id == $i) | .check.command // ""' "$CLASS_FILE")"
-      expect="$(jq -r --arg i "$id" '.requires_invariants[] | select(.id == $i) | .check.expect // ""' "$CLASS_FILE")"
-      expect_exit="$(jq -r --arg i "$id" '.requires_invariants[] | select(.id == $i) | .check.expect_exit // 0' "$CLASS_FILE")"
-      secs="$(jq -r --arg i "$id" '.requires_invariants[] | select(.id == $i) | .check.timeout_sec // 600' "$CLASS_FILE")"
+      cmd="$(jq -r --arg i "$id" '.requires_invariants[] | select(.id == $i) | .check.command // ""' "$cf")"
+      expect="$(jq -r --arg i "$id" '.requires_invariants[] | select(.id == $i) | .check.expect // ""' "$cf")"
+      expect_exit="$(jq -r --arg i "$id" '.requires_invariants[] | select(.id == $i) | .check.expect_exit // 0' "$cf")"
+      secs="$(jq -r --arg i "$id" '.requires_invariants[] | select(.id == $i) | .check.timeout_sec // 600' "$cf")"
     else
       source="manifest"
       cmd="$(jq -r --arg i "$id" '.invariants[$i].command // ""' "$mf")"
@@ -559,19 +671,21 @@ run_invariants() {
 
     if [ "$AS_JSON" -eq 0 ]; then
       if [ "$pass" -eq 1 ]; then
-        printf '    \033[32mPASS\033[0m %s (%s)\n' "$id" "$source"
+        printf '    \033[32mPASS\033[0m %s (%s · %s)\n' "$id" "$pc" "$source"
       else
-        printf '    \033[31mFAIL\033[0m %s (%s) — %s\n' "$id" "$source" "$reason"
+        printf '    \033[31mFAIL\033[0m %s (%s · %s) — %s\n' "$id" "$pc" "$source" "$reason"
       fi
     fi
 
     results="$(jq -n --argjson acc "$results" \
       --arg id "$id" --arg src "$source" --arg cmd "$cmd" --arg desc "$desc" \
+      --arg class "$pc" \
       --argjson ok "$pass" --arg reason "$reason" \
       --arg out "$(printf '%s' "$CAP_OUT" | tail -20)" \
-      '$acc + [{id:$id, source:$src, command:$cmd, description:$desc,
+      '$acc + [{id:$id, class:$class, source:$src, command:$cmd, description:$desc,
                 passed:($ok == 1), reason:$reason, output_tail:$out}]')"
-  done <<< "$(jq -r '.requires_invariants[].id // empty' "$CLASS_FILE")"
+  done <<< "$(jq -r '.requires_invariants[].id // empty' "$cf")"
+  done <<< "$CLASS_FILES"
 
   INVARIANT_RESULTS="$results"
   [ "$failed" -eq 0 ]
@@ -671,8 +785,9 @@ cmd_add() {
 
   # 2. CLASS CONTRACT (read-only)
   printf '  [2/6] class contract\n'
-  resolve_class "$mf" || exit 1
+  resolve_classes "$mf" || exit 1
   check_invariant_coverage "$mf" || exit 1
+  check_default_included "$mf" || exit 1
 
   # 3. CONSENT (read-only)
   printf '  [3/6] consent\n'
@@ -717,7 +832,7 @@ cmd_add() {
     exit 1
   fi
   printf '\n  Installed "%s" at pin %s (class %s).\n\n' \
-    "$name" "$(jq -r '.pinned_version.version' "$mf")" "$(jq -r '.permission_class' "$mf")"
+    "$name" "$(jq -r '.pinned_version.version' "$mf")" "$CLASS_JOINED"
 
   if [ "$AS_JSON" -eq 1 ]; then
     jq -n --slurpfile r "$STATE/$name/receipt.json" --argjson inv "$INVARIANT_RESULTS" \
@@ -820,8 +935,8 @@ cmd_verify() {
         '$acc + [{name:$n, ok:false, reason:"manifest missing from registry"}]')"
       continue
     fi
-    if ! resolve_class "$mf"; then rc=1; continue; fi
-    [ "$AS_JSON" -eq 1 ] || printf '\n  %s (class %s)\n' "$n" "$(jq -r '.class' "$CLASS_FILE")"
+    if ! resolve_classes "$mf"; then rc=1; continue; fi
+    [ "$AS_JSON" -eq 1 ] || printf '\n  %s (class %s)\n' "$n" "$CLASS_JOINED"
     if run_invariants "$n" "$mf"; then
       all="$(jq -n --argjson acc "$all" --arg n "$n" --argjson inv "$INVARIANT_RESULTS" \
         '$acc + [{name:$n, ok:true, invariants:$inv}]')"
