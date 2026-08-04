@@ -128,25 +128,21 @@ CLASS_DIR="$REGISTRY/_classes"
 # ── Small helpers ────────────────────────────────────────────────────────────
 now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
-sha256_file() {
-  if command -v shasum >/dev/null 2>&1; then
-    shasum -a 256 "$1" | awk '{print $1}'
-  elif command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$1" | awk '{print $1}'
-  else
-    openssl dgst -sha256 "$1" | awk '{print $NF}'
-  fi
-}
+# Pick a sha256 tool once, and REFUSE clearly if the machine has none rather
+# than letting a "command not found" surface as an empty digest — an empty
+# digest compared against a pin would silently never match, which reads as a
+# tampered artifact instead of a missing tool.
+HASHER=""
+if command -v shasum >/dev/null 2>&1; then HASHER="shasum -a 256"
+elif command -v sha256sum >/dev/null 2>&1; then HASHER="sha256sum"
+elif command -v openssl >/dev/null 2>&1; then HASHER="openssl dgst -sha256"
+fi
+[ -n "$HASHER" ] || die "no sha256 tool available (need one of: shasum, sha256sum, openssl)"
 
-sha256_string() {
-  if command -v shasum >/dev/null 2>&1; then
-    printf '%s' "$1" | shasum -a 256 | awk '{print $1}'
-  elif command -v sha256sum >/dev/null 2>&1; then
-    printf '%s' "$1" | sha256sum | awk '{print $1}'
-  else
-    printf '%s' "$1" | openssl dgst -sha256 | awk '{print $NF}'
-  fi
-}
+# Every one of the three prints the digest as the only 64-hex token on the line,
+# in three different layouts. Extracting the token normalises all three.
+sha256_file()   { $HASHER "$1" | grep -oE '[0-9a-f]{64}' | head -1; }
+sha256_string() { printf '%s' "$1" | $HASHER | grep -oE '[0-9a-f]{64}' | head -1; }
 
 # Run a check command under a hard wall-clock alarm. macOS ships no timeout(1),
 # so the alarm is perl's. Sets CAP_OUT / CAP_RC. A check that outlives its
@@ -377,16 +373,17 @@ obtain_consent() {
     granted_via="--yes"
   else
     local reply=""
-    if [ -r /dev/tty ]; then
-      printf '  Install it? [y/N] '
-      IFS= read -r reply < /dev/tty || reply=""
-      printf '\n'
-    elif [ -t 0 ]; then
+    # Ask only when stdin is a terminal. A piped or CI invocation is REFUSED
+    # rather than prompted: reading /dev/tty behind a pipe would seize a
+    # terminal the caller did not offer, and defaulting to yes would install a
+    # consent-required module nobody agreed to. Refusing is the safe read of
+    # an ambiguous situation.
+    if [ -t 0 ]; then
       printf '  Install it? [y/N] '
       IFS= read -r reply || reply=""
       printf '\n'
     else
-      warn "refused: consent is required and there is no terminal to ask on."
+      warn "refused: consent is required and stdin is not a terminal."
       warn "  Re-run with --yes if you are the operator and you agree."
       return 1
     fi
@@ -705,7 +702,7 @@ cmd_add() {
       | "  FAILED INVARIANT: \(.id)\n    why: \(.reason)\n    what it guarantees: \(.description)\n    command: \(.command)"' >&2
     remove_module "$name"
     warn ""
-    warn "REFUSED: \"$name\" failed its class invariants and was NOT wired."
+    warn "REFUSED: \"$name\" failed its class invariants and is NOT WIRED."
     warn "  Rolled back through the same removal path \`remove\` uses, so the tree"
     warn "  is byte-identical to before the add. Nothing half-installed."
     exit 1
