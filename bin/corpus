@@ -74,6 +74,12 @@ BIN_DIR="$(cd "$(dirname "$SELF")" && pwd)"
 PLUGIN_DIR="$(cd "$BIN_DIR/.." && pwd)"
 CORPUS_DIR="${CORPUS_DIR:-$PLUGIN_DIR/evals/corpus}"
 ORACLES_DIR="${ORACLES_DIR:-$PLUGIN_DIR/evals/oracles}"
+
+# THE JUDGMENT INVARIANT: corpus scores CATCH/MISS — a verdict — so every gate it runs
+# reads UNCOMPRESSED context from the real provider, never a context-compressing proxy the
+# ambient shell exports. See gate_invoke().
+# shellcheck source=lib/hmd-gate-endpoint.sh
+. "$PLUGIN_DIR/bin/lib/hmd-gate-endpoint.sh"
 INDEX="$CORPUS_DIR/INDEX.json"
 STATUS_MD="$CORPUS_DIR/CORPUS-STATUS.md"
 
@@ -117,9 +123,9 @@ run_gate() {
   local run_sh="$1" input="$2" truth="${3:-}" report
   report="$(mktemp)"
   if [ -n "$truth" ]; then
-    bash "$run_sh" --input "$input" --truth "$truth" --report "$report" >/dev/null 2>&1 || true
+    hmd_gate_exec bash "$run_sh" --input "$input" --truth "$truth" --report "$report" >/dev/null 2>&1 || true
   else
-    bash "$run_sh" --input "$input" --report "$report" >/dev/null 2>&1 || true
+    hmd_gate_exec bash "$run_sh" --input "$input" --report "$report" >/dev/null 2>&1 || true
   fi
   echo "$report"
 }
