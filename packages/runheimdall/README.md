@@ -1,8 +1,8 @@
 # Heimdall 🛡️
 
-**A cloud bot that fixes your GitHub issues and opens a proven PR. You review, you merge.**
+**Every PR ships the runnable evidence that the fix passes.**
 
-Every PR ships the runnable evidence that the fix passes. The bot opens it on a `heimdall/*` branch **as a scoped GitHub App** — never as you, never on `main`, and it never self-merges. A human always gates the merge.
+A cloud bot that fixes your GitHub issues and opens a proven PR. You review, you merge. The bot opens it on a `heimdall/*` branch **as a scoped GitHub App** — never as you, never on `main`, and it never self-merges. A human always gates the merge.
 
 [![Claude Code](https://img.shields.io/badge/Claude%20Code-plugin-e056a0?style=flat-square)](https://code.claude.com)
 [![License: MIT](https://img.shields.io/badge/License-MIT-9b59b6?style=flat-square)](LICENSE)
