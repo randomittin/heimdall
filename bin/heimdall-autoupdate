@@ -535,7 +535,25 @@ reconcile_modules() {
     if [ "$mode" = "loud" ]; then
       printf 'heimdall: "%s" is in the default module set and is not installed — acquiring it now…\n' "$n"
       if "$MODULES_BIN" add "$n"; then
-        printf 'heimdall:   "%s" installed.\n' "$n"
+        # An exit-0 add does NOT mean the payload landed. `add` succeeds for a
+        # module that registered at its pin without its payload — an unprobeable
+        # installer, or a fetch deliberately withheld. Announcing "installed"
+        # off the exit code alone is how a green word ends up standing over an
+        # absent install, which is the defect this whole path exists to kill.
+        # So ask the receipt what is actually on the machine: state is
+        # "installed" only when the payload was verified PRESENT.
+        _st="$("$MODULES_BIN" --json status "$n" 2>/dev/null \
+               | jq -r '.receipt.payload.state // "installed"' 2>/dev/null)"
+        [ -n "$_st" ] || _st="installed"
+        if [ "$_st" = "installed" ]; then
+          printf 'heimdall:   "%s" installed.\n' "$n"
+        else
+          _rem="$("$MODULES_BIN" --json status "$n" 2>/dev/null \
+                  | jq -r '.receipt.payload.remedy // ""' 2>/dev/null)"
+          printf 'heimdall:   "%s" registered at its pin — payload NOT on this machine.\n' "$n"
+          [ -n "$_rem" ] && printf 'heimdall:   get it with: %s\n' "$_rem"
+          log_line "reconcile: $n registered-without-payload (state=$_st)"
+        fi
       else
         printf 'heimdall:   "%s" could not be installed right now. hmd itself is updated regardless;\n' "$n" >&2
         printf 'heimdall:   the module stays absent — see: hmd modules status %s\n' "$n" >&2
