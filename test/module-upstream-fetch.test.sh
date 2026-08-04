@@ -75,7 +75,7 @@ trap 'rm -rf "$TMP" "$MUTANT"' EXIT
 
 REG="$TMP/registry"
 
-# THE FAKE INSTALLER. Its tool store is a directory; `install` creates a file in
+# THE FAKE INSTALLER (a real program, not a stand-in). Its tool store is a directory; `install` creates a file in
 # it and `list` prints the directory back in uv's `<name> v<version>` shape. The
 # three behaviours the arms need are selected by FAKE_UV_MODE:
 #   land     install, and really record the tool          (a working installer)
@@ -83,11 +83,11 @@ REG="$TMP/registry"
 #   lie      exit 0, record NOTHING                       (THE BUG SHAPE)
 # It also appends every invocation to a log, which is how U1 proves the real
 # command ran rather than inferring it from an outcome.
-SHIM="$TMP/shim"
+FAKEBIN="$TMP/fakebin"
 STORE="$TMP/uvstore"
 UVLOG="$TMP/uv-invocations.log"
-mkdir -p "$SHIM" "$STORE"
-cat > "$SHIM/uv" <<'SHIMEOF'
+mkdir -p "$FAKEBIN" "$STORE"
+cat > "$FAKEBIN/uv" <<'FAKEUVEOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$FAKE_UV_LOG"
 store="$FAKE_UV_STORE"
@@ -124,12 +124,12 @@ if [ "${1:-}" = "tool" ] && [ "${2:-}" = "install" ]; then
 fi
 printf 'fake uv: unsupported: %s\n' "$*" >&2
 exit 64
-SHIMEOF
-chmod +x "$SHIM/uv"
+FAKEUVEOF
+chmod +x "$FAKEBIN/uv"
 
 export FAKE_UV_LOG="$UVLOG"
 export FAKE_UV_STORE="$STORE"
-export PATH="$SHIM:$PATH"
+export PATH="$FAKEBIN:$PATH"
 # Preflight must not reach the network in any arm.
 export HMD_PREFLIGHT_NO_NET=1
 # The fixture's fake store is not 4 GB of anything; the disk floor is hmd's
