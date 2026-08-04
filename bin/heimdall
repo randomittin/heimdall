@@ -2252,8 +2252,11 @@ esac
 
 # ── Command handlers ──
 
-# --update: pull latest via git
-if [[ "${1:-}" == "--update" ]]; then
+# --update: pull latest via git.
+# `update` (bare) is accepted as an alias because the staleness notice below
+# advertises exactly that form — a user told to run `hmd update` must not land
+# on the splash banner and conclude the update silently did nothing.
+if [[ "${1:-}" == "--update" || "${1:-}" == "update" ]]; then
   apply_heimdall_theme 2>/dev/null || true
 
   # Animated update banner
