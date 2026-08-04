@@ -18,8 +18,15 @@
 # payload, and no write outside a throwaway HOME / temp registry / temp state root.
 #
 # WHAT IT PROVES (each with the falsifier that makes it mean something):
-#   R1. REAL registry: headroom is in the default set, is absent, is not opted out
-#       → update DEFERS it honestly and names the exact command. No receipt is created.
+#   R1. REAL registry: headroom is in the default set, is absent, is not opted out, and
+#       its own manifest WAIVES the consent question → update ACQUIRES it, records that
+#       the waiver (not a prompt) is why, and stops claiming an update "will never
+#       install it for you". The decide-only seam still writes no receipt.
+#       R1 read the other way round until the updater was fixed: it consulted only the
+#       CLASS contract, so it deferred a module `hmd modules add` installs with no
+#       prompt, and the two binaries disagreed about the same module. The waiver-aware
+#       transitions live in test/autoupdate-consent-waiver.test.sh; R1 pins the one
+#       decision the REAL registry produces today.
 #   R2. HEALTHY → no-op: zero stdout, zero stderr, and the registry + state trees are
 #       BYTE-IDENTICAL before and after (a tree signature over names + content hashes).
 #   R3. BROKEN (receipt present, payload gone) is NOT re-acquired — it belongs to the
@@ -138,24 +145,28 @@ run_upd() {
 printf "\n\033[1mmodule-reconcile — an install that predates a default module acquires it\033[0m\n\n"
 
 # ── R1. REAL registry: headroom is in the default set, absent, not opted out ─────
-printf "\033[1mR1  real registry — headroom is deferred honestly, never silently installed\033[0m\n"
+printf "\033[1mR1  real registry — headroom's own waiver makes the update acquire it\033[0m\n"
 H="$(mk_home)"; S="$(mk_state)"
 OUT="$(run_upd "$H" "$REPO/modules" "$S" HEIMDALL_MODULE_RECONCILE_DRYRUN=1 "$BIN" update 2>&1)"
 RC=$?
 [ "$RC" -eq 0 ] && ok "update exits 0 with a default module absent" \
                 || bad "update exited $RC (a missing module must never fail the update)"
-printf '%s' "$OUT" | grep -q 'headroom' \
-  && ok "update NAMES the absent default module" \
-  || bad "update said nothing about the absent default module: $OUT"
-printf '%s' "$OUT" | grep -q 'hmd modules add headroom' \
-  && ok "update names the EXACT command that acquires it" \
-  || bad "update did not print the exact acquire command"
+grep -q 'reconcile: headroom would-acquire' "$H/autoupdate.log" 2>/dev/null \
+  && ok "the decision is ACQUIRE — the updater honours the module's own waiver" \
+  || bad "headroom was not selected for acquisition: $(cat "$H/autoupdate.log" 2>/dev/null)"
+grep -q 'reconcile: headroom would-acquire.*consent waived' "$H/autoupdate.log" 2>/dev/null \
+  && ok "the log SAYS the waiver is why — an unprompted acquire is not an undisclosed one" \
+  || bad "the acquire decision does not record the waiver as its reason: $(cat "$H/autoupdate.log" 2>/dev/null)"
 [ ! -f "$S/headroom/receipt.json" ] \
-  && ok "nothing was installed (no receipt) — consent was not laundered" \
-  || bad "a receipt appeared: a consent-required module was installed unattended"
-grep -q 'reconcile: headroom defer-consent' "$H/autoupdate.log" 2>/dev/null \
-  && ok "the deferral is recorded with its reason (defer-consent)" \
-  || bad "no defer-consent decision in the log: $(cat "$H/autoupdate.log" 2>/dev/null)"
+  && ok "nothing was installed (no receipt) — the decide-only seam decides and stops" \
+  || bad "a receipt appeared under HEIMDALL_MODULE_RECONCILE_DRYRUN=1"
+if grep -q 'reconcile: headroom defer-consent' "$H/autoupdate.log" 2>/dev/null; then
+  bad "headroom is still deferred — the updater is reading the CLASS contract and ignoring the manifest waiver"
+elif printf '%s' "$OUT" | grep -q 'will never install it for you'; then
+  bad "update still tells the operator it will never install a module it now acquires"
+else
+  ok "the old defer-consent decision and its contradictory sentence are both gone"
+fi
 
 # ── R2. HEALTHY → no-op, zero output, byte-identical trees ───────────────────────
 printf "\n\033[1mR2  healthy — no-op, zero output, byte-identical trees\033[0m\n"
