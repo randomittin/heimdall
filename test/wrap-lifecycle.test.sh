@@ -153,6 +153,7 @@ run_wrap() {
     HEIMDALL_NO_INTRO=1 \
     HEIMDALL_NO_TEAM_AUTOSHARE=1 \
     HMD_AUTO_TEAM_DISABLE=1 \
+    SHELL=/bin/zsh \
     HEIMDALL_CP_URL="http://127.0.0.1:1" \
     perl -e 'alarm 120; exec @ARGV or exit 127' -- "$HWRAP" "$@" ) >/dev/null 2>&1
 }
@@ -170,6 +171,7 @@ run_wrap_v() {
     HEIMDALL_NO_INTRO=1 \
     HEIMDALL_NO_TEAM_AUTOSHARE=1 \
     HMD_AUTO_TEAM_DISABLE=1 \
+    SHELL=/bin/zsh \
     HEIMDALL_CP_URL="http://127.0.0.1:1" \
     perl -e 'alarm 120; exec @ARGV or exit 127' -- "$HWRAP" "$@" ) 2>&1
 }
@@ -231,7 +233,19 @@ grep -Fqx "$AG_BEGIN" "$R1/AGENTS.md" 2>/dev/null \
   && ok "1d wrap wrote the AGENTS.md fenced block" \
   || bad "1d AGENTS.md fence missing after wrap"
 
-grep -q 'heimdall-presence' "$STUB_OUT" 2>/dev/null \
+# Presence is started DETACHED by contract — a wrap must never block on a control
+# plane that may be offline. So this polls for the effect rather than assuming the
+# child has already been scheduled; a bounded wait is how you assert an async side
+# effect without inventing a synchronous contract the product does not have.
+await_stub() {
+  local needle="$1" i=0
+  while [ "$i" -lt 100 ]; do
+    grep -q "$needle" "$STUB_OUT" 2>/dev/null && return 0
+    i=$((i+1)); sleep 0.1
+  done
+  return 1
+}
+await_stub 'heimdall-presence' \
   && ok "1e wrap started presence" \
   || bad "1e presence was never started" "$(cat "$STUB_OUT")"
 
@@ -336,9 +350,14 @@ grep -qx 'node_modules' "$R3/.gitignore" \
   && ok "3d the dev's own pre-commit hook file is untouched" \
   || bad "3d wrap destroyed a pre-existing hook"
 
-[ "$(git_cfg "$R3" heimdall.prevHooksPath)" = "$R3/myhooks" ] \
+# Compared against git's OWN view of the repo root: on macOS /var is a symlink to
+# /private/var, so mktemp's path and `rev-parse --show-toplevel` are the same
+# directory spelled two ways. Comparing the raw mktemp path would fail on the
+# spelling, not on the behaviour.
+R3_PHYS="$(git -C "$R3" rev-parse --show-toplevel 2>/dev/null)"
+[ "$(git_cfg "$R3" heimdall.prevHooksPath)" = "$R3_PHYS/myhooks" ] \
   && ok "3e the prior hooksPath is recorded for chaining" \
-  || bad "3e prior hooksPath not chained" "$(git_cfg "$R3" heimdall.prevHooksPath)"
+  || bad "3e prior hooksPath not chained" "want $R3_PHYS/myhooks got $(git_cfg "$R3" heimdall.prevHooksPath)"
 
 run_wrap "$R3" unwrap codex
 [ "$(tree_sum "$R3")" = "$B3" ] \
@@ -383,11 +402,22 @@ else
   bad "4a no shim installed by --always" "looked for $SHIM"
 fi
 
-REAL_TOOL="$TOOLBIN/claude"
+# The PHYSICAL path: the shim resolves symlinks at install time so it pins the file
+# the tool actually is (/var → /private/var on macOS). Asserting on the physical
+# spelling tests the pinning, not the symlink layout of $TMPDIR.
+REAL_TOOL="$(cd "$TOOLBIN" && pwd -P)/claude"
 if [ -x "$SHIM" ] && grep -Fq "$REAL_TOOL" "$SHIM"; then
   ok "4b the shim holds the real binary's ABSOLUTE path ($REAL_TOOL)"
 else
-  bad "4b the shim does not pin the real binary by absolute path"
+  bad "4b the shim does not pin the real binary by absolute path" "$(grep -m1 HMD_REAL= "$SHIM" 2>/dev/null)"
+fi
+# ...and NOT by bare name: a shim that re-resolves `claude` through PATH finds
+# itself. This is the falsifier for 4b — an absolute path present somewhere in the
+# file would satisfy 4b even if the exec line still used the bare name.
+if [ -x "$SHIM" ] && ! grep -Eq '^[[:space:]]*exec[[:space:]]+"?(claude|\$\{?HMD_TOOL)' "$SHIM"; then
+  ok "4b2 no exec line resolves the tool by bare NAME (that is the fork loop)"
+else
+  bad "4b2 the shim execs the tool by name — it will find itself on PATH"
 fi
 
 # SELF-UPDATE SAFETY: the shim must not sit in the tool's own directory.
@@ -482,6 +512,41 @@ run_wrap "$R4" unwrap claude
   && ok "4k unwrap removes the PATH shim" \
   || bad "4k the shim survived unwrap"
 
+# ── the shell rc is a file wrap APPENDS to, so it inherits the weld hazard ─────
+# The dev's rc predates us and outlives us: our PATH line must land as its own
+# whole line even when the file ends without a newline, must appear exactly once
+# however many times --always runs, and must vanish on unwrap leaving every line
+# the dev wrote byte-identical.
+RC="$WORK/fakehome/.zshrc"
+mkdir -p "$WORK/fakehome"
+printf 'export EDITOR=vim\nalias gs="git status"' > "$RC"   # NO trailing newline
+RC_PRIOR_SUM="$(shasum < "$RC" | awk '{print $1}')"
+
+R4e="$(new_repo shimrc)"
+git -C "$R4e" commit -qm init --allow-empty >/dev/null 2>&1
+run_wrap "$R4e" wrap codex --always --no-launch
+run_wrap "$R4e" wrap codex --always --no-launch
+
+grep -qx 'alias gs="git status"' "$RC" \
+  && ok "4l the dev's last rc line survives as a WHOLE line (no weld)" \
+  || bad "4l the PATH block welded onto the dev's last rc line" "$(cat "$RC")"
+
+[ "$(grep -c '>>> heimdall wrap shim >>>' "$RC" 2>/dev/null | tr -d ' ')" = "1" ] \
+  && ok "4m exactly one PATH block after two --always installs (idempotent)" \
+  || bad "4m the rc PATH block duplicated" "$(cat "$RC")"
+
+grep -Fq "$WORK/fakehome/.heimdall/shims" "$RC" 2>/dev/null \
+  && ok "4n the block puts the shim dir on PATH" \
+  || bad "4n the rc block does not reference the shim dir" "$(cat "$RC")"
+
+run_wrap "$R4e" unwrap codex
+grep -q 'heimdall wrap shim' "$RC" 2>/dev/null \
+  && bad "4o the rc PATH block survived unwrap" "$(cat "$RC")" \
+  || ok "4o unwrap removes the rc PATH block"
+[ "$(shasum < "$RC" | awk '{print $1}')" = "$RC_PRIOR_SUM" ] \
+  && ok "4p the dev's rc is byte-identical again (sha1 $RC_PRIOR_SUM)" \
+  || bad "4p the rc differs after the round trip" "$(cat "$RC")"
+
 # ══════════════════════════════════════════════════════════════════════════════
 # 5. DEFAULT RESOLUTION — config → detection → asked once, remembered.
 # ══════════════════════════════════════════════════════════════════════════════
@@ -516,9 +581,16 @@ if run_wrap "$R5" wrap notatool --no-launch; then
 else
   ok "5d an unknown tool is REFUSED (nonzero)"
 fi
-run_wrap_v "$R5" wrap notatool --no-launch | grep -qi 'notatool' \
+# Captured into a variable rather than piped into grep: this script runs under
+# `pipefail`, so `run_wrap_v … | grep` inherits the PRODUCER's exit 2 (the refusal
+# itself) and the assertion would read as a failure even when the match succeeds.
+REFUSAL="$(run_wrap_v "$R5" wrap notatool --no-launch)"
+printf '%s' "$REFUSAL" | grep -qi 'notatool' \
   && ok "5e the refusal names the offending tool" \
-  || bad "5e the refusal is silent about which tool failed"
+  || bad "5e the refusal is silent about which tool failed" "[$REFUSAL]"
+printf '%s' "$REFUSAL" | grep -q 'claude cursor codex gemini aider' \
+  && ok "5f the refusal lists the tools that ARE accepted" \
+  || bad "5f the refusal does not say what would have worked"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 6. PER-TOOL LAUNCH SMOKE — every tool exercised against a fake binary, and the

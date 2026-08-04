@@ -226,7 +226,10 @@ do_wrap() {
   local presence_bin="$BIN_DIR/heimdall-presence"
   if [ -x "$presence_bin" ]; then
     ( "$presence_bin" keeper-start >/dev/null 2>&1 & ) || true
-    say "  ${G}✓${R} presence ${D}started${R}\n"
+    # "starting", not "started": the call is detached, so its outcome is not known
+    # here. Claiming a result we did not observe is the silent-failure shape this
+    # codebase refuses everywhere else — `hmd presence status` is the real answer.
+    say "  ${G}✓${R} presence ${D}starting — check with: hmd presence status${R}\n"
   else
     say "  ${D}· presence unavailable — hooks still enforce${R}\n"
   fi
@@ -358,7 +361,7 @@ HEIMDALL_WRAP_SHIM_ACTIVE="\$HMD_TOOL" exec "\$HMD_REAL" "\$@"
 EOSHIM
   chmod +x "$shim" || return 1
 
-  install_path_block
+  install_path_block "$(state_dir "$tool")"
   return 0
 }
 
@@ -378,9 +381,21 @@ shell_rc() {
 }
 
 install_path_block() {
-  local rc; rc="$(shell_rc)"
+  local sd="$1" rc
+  rc="$(shell_rc)"
   [ -n "$rc" ] || return 0
   if [ -f "$rc" ] && grep -Fqx "$RC_BEGIN" "$rc" 2>/dev/null; then return 0; fi
+  mkdir -p "$sd" 2>/dev/null || true
+  printf '%s\n' "$rc" > "$sd/rc-path" 2>/dev/null || true
+  # A file that ends WITHOUT a newline is about to be given one, because our marker
+  # would otherwise land mid-line and stop being a marker. That newline is a byte
+  # the dev's file never had, so the prior bytes are recorded here — used at removal
+  # time purely as a COMPARISON (never an overwrite), so the added byte can be taken
+  # back when, and only when, nothing else has changed since.
+  if [ -f "$rc" ] && [ -s "$rc" ] \
+     && [ "$(tail -c 1 "$rc" | od -An -tx1 | tr -d '[:space:]')" != "0a" ]; then
+    cp "$rc" "$sd/rc-before" 2>/dev/null || true
+  fi
   ensure_trailing_newline "$rc"
   {
     printf '%s\n' "$RC_BEGIN"
@@ -396,7 +411,10 @@ install_path_block() {
 # When the block was the only content the file is left empty rather than deleted:
 # an rc file we did not create is not ours to remove.
 remove_path_block() {
-  local rc; rc="$(shell_rc)" tmp
+  local sd="$1" rc tmp probe
+  rc="$(shell_rc)"
+  # Prefer the rc we actually wrote to: the dev may have changed $SHELL since.
+  [ -f "$sd/rc-path" ] && rc="$(head -n1 "$sd/rc-path" 2>/dev/null)"
   [ -n "$rc" ] && [ -f "$rc" ] || return 0
   grep -Fqx "$RC_BEGIN" "$rc" 2>/dev/null || return 0
   tmp="$(mktemp "${TMPDIR:-/tmp}/hmd-rc.XXXXXX")" || return 1
@@ -407,6 +425,19 @@ remove_path_block() {
   ' "$rc" > "$tmp" || { rm -f "$tmp"; return 1; }
   cat "$tmp" > "$rc" || { rm -f "$tmp"; return 1; }
   rm -f "$tmp"
+
+  # Hand back the final newline we added — but ONLY when the file is otherwise
+  # exactly as we found it. If the dev has appended anything since, that trailing
+  # newline is now genuinely theirs and stripping it would corrupt their last line.
+  if [ -f "$sd/rc-before" ]; then
+    probe="$(mktemp "${TMPDIR:-/tmp}/hmd-rc.XXXXXX")" || return 0
+    cat "$sd/rc-before" > "$probe" 2>/dev/null
+    printf '\n' >> "$probe"
+    if cmp -s "$probe" "$rc"; then
+      cat "$sd/rc-before" > "$rc" 2>/dev/null || true
+    fi
+    rm -f "$probe"
+  fi
   return 0
 }
 
@@ -429,10 +460,12 @@ do_unwrap() {
   prev_hooks="$(manifest_get "$sd" prev_hookspath)"
   prev_prev="$(manifest_get "$sd" prev_prevhookspath)"
 
-  # 1. shim + PATH block
-  if [ -e "$SHIM_DIR/$tool" ]; then
-    rm -f "$SHIM_DIR/$tool" 2>/dev/null || true
-    remove_path_block
+  # 1. shim + PATH block. The rc line is SHARED by every shim, so it only comes out
+  #    when the last one does — unwrapping codex must not un-PATH a cursor shim that
+  #    is still installed.
+  rm -f "$SHIM_DIR/$tool" 2>/dev/null || true
+  if [ ! -d "$SHIM_DIR" ] || [ -z "$(ls -A "$SHIM_DIR" 2>/dev/null)" ]; then
+    remove_path_block "$sd"
     rmdir "$SHIM_DIR" 2>/dev/null || true
   fi
 
