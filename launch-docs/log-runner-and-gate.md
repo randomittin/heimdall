@@ -2,7 +2,7 @@
 title: A runner is not a gate
 date: 2026-08-03
 slug: log-runner-and-gate
-description: OpenHands and GitHub's Copilot coding agent run agents. Heimdall decides whether the output is trustworthy. Two jobs, and the second one gets harder every time the first one gets better.
+description: OpenHands and GitHub's Copilot cloud agent run agents. Heimdall decides whether the output is trustworthy. Two jobs, and the second one gets harder every time the first one gets better.
 tags: [openhands, github copilot, falsifiability, code review, agent platforms]
 author: Heimdall Engineering
 read_time: 9 min read
@@ -21,25 +21,33 @@ problems, and the better the first category gets, the more load it puts on the s
 
 A runner takes a task, gives an agent a machine, and hands back a diff.
 
-OpenHands is that, open source. Its own README describes a platform for software development
-agents that "can do anything a human developer can: modify code, run commands, browse the web,
-call APIs" — [All-Hands-AI/OpenHands](https://github.com/All-Hands-AI/OpenHands), README.
-Agent Canvas is its interface for working with more than one agent at a time:
-`[SOURCE: one sentence describing Agent Canvas, written from docs.all-hands.dev verbatim — what the
-canvas is and what it lets you do. Do not paraphrase from memory; open the page and quote it.]`
+OpenHands is that, open source. Its README today leads with Agent Canvas, described in its own
+words as "the self-hosted developer control center for coding agents and automations" — a thing
+that "turns your coding agents into a self-hosted, always-on engineering team," running locally by
+default but able to connect to multiple agent backends in Docker, on VMs, or inside your own
+infrastructure. It is explicitly not single-agent and not single-vendor: it runs "OpenHands, Claude
+Code, Codex, Gemini, or any ACP-compatible agent across local, remote, and cloud backends" —
+[OpenHands/OpenHands](https://github.com/OpenHands/OpenHands), README, retrieved 2026-08-04.
 
-GitHub's Copilot coding agent is that, hosted inside GitHub. Per GitHub's own documentation, you
-assign an issue to Copilot, it works in an ephemeral environment powered by GitHub Actions, pushes
-its commits to a draft pull request, and requests your review when it is finished — GitHub Docs,
-*About Copilot coding agent*.
+GitHub's Copilot cloud agent is that, hosted inside GitHub. Per GitHub's own documentation, it
+"works autonomously in a GitHub Actions-powered environment to complete development tasks assigned
+through GitHub issues or GitHub Copilot Chat prompts," and while working it "has access to its own
+ephemeral development environment, powered by GitHub Actions, where it can explore your code, make
+changes, execute automated tests and linters and more." It can "research a repository, create a
+plan, make code changes on a branch, and optionally open a pull request" —
+[About GitHub Copilot cloud agent](https://docs.github.com/en/copilot/concepts/agents/cloud-agent/about-cloud-agent),
+retrieved 2026-08-04.
 
 Neither product claims to be the thing that decides whether the diff is correct, and GitHub's
-documentation is unusually explicit about the boundary: Actions workflows on Copilot's pull
-requests require approval from a user with write access before they run, Copilot cannot approve
-its own pull request, and existing branch protection rules and required reviews still apply —
-GitHub Docs, *Responsible use of GitHub Copilot coding agent*. The platform hands the decision
-back to a human on purpose. That is the correct design. It also tells you exactly where the load
-lands.
+documentation is unusually explicit about the boundary. On its own page of risks and mitigations:
+draft pull requests created by the agent "must be reviewed and merged by a human"; the agent
+"cannot mark its pull requests as 'Ready for review' and cannot approve or merge a pull request";
+by default Actions workflows "are not triggered until Copilot cloud agent's code is reviewed and a
+user with write access to the repository clicks the Approve and run workflows button"; and the
+agent "is also subject to any branch protections and required checks for the working repository" —
+[Risks and mitigations](https://docs.github.com/en/copilot/concepts/agents/cloud-agent/risks-and-mitigations),
+retrieved 2026-08-04. The platform hands the decision back to a human on purpose. That is the
+correct design. It also tells you exactly where the load lands.
 
 ## The load lands on a person
 
@@ -165,10 +173,10 @@ against. A claim that cannot be confirmed at the cited page gets cut, not soften
 
 | # | Claim as written | Must be confirmed at | Status |
 |---|---|---|---|
-| 1 | OpenHands is an open-source platform for software development agents; agents "can do anything a human developer can: modify code, run commands, browse the web, call APIs" | `https://github.com/All-Hands-AI/OpenHands` — README, opening section. Quote must match verbatim. | **CUT — sentence not in current README, replaced.** `All-Hands-AI/OpenHands` now redirects to `OpenHands/OpenHands`; the README has been rewritten around Agent Canvas and this sentence does not appear in it. Confirmed against [OpenHands/OpenHands](https://github.com/OpenHands/OpenHands), README, retrieved 2026-08-04. The body paragraph above still carries the old, now-false quote and needs to be rewritten around Agent Canvas (see row 2, still open) before this post can ship. |
-| 2 | Agent Canvas — what it is | `https://docs.all-hands.dev` — the Agent Canvas page. | **PLACEHOLDER — write from the doc** |
-| 3 | Copilot coding agent: assign an issue → works in an ephemeral environment powered by GitHub Actions → pushes commits to a draft PR → requests review | GitHub Docs, *About Copilot coding agent* (`docs.github.com`, Copilot → coding agent). Confirm the exact URL, it has moved before. | **CORRECTED — product renamed, one phrase not live.** The product is now documented as **Copilot cloud agent**, not "coding agent"; the old `.../coding-agent` URL redirects to `.../cloud-agent`. The ephemeral-GitHub-Actions-environment claim is confirmed verbatim. "Requests your review" is not the live wording — the doc says it can "research a repository, create a plan, make code changes on a branch, and optionally open a pull request." Confirmed against [About GitHub Copilot cloud agent](https://docs.github.com/en/copilot/concepts/agents/cloud-agent/about-cloud-agent), retrieved 2026-08-04. The body paragraph above still says "Copilot coding agent" / "requests your review" and needs updating to match before ship. |
-| 4 | Actions workflows on Copilot's PRs need approval from a user with write access; Copilot cannot approve its own PR; branch protections and required reviews still apply | GitHub Docs, *Responsible use of GitHub Copilot coding agent* + the coding-agent security page. | **CONFIRMED — all three, verbatim.** The correct page title is *Risks and mitigations for Copilot cloud agent* (the "Responsible use" title guessed here does not exist under that name — the page was renamed along with the product). Confirmed against [Risks and mitigations](https://docs.github.com/en/copilot/concepts/agents/cloud-agent/risks-and-mitigations), retrieved 2026-08-04: draft PRs "must be reviewed and merged by a human"; the agent "cannot mark its pull requests as 'Ready for review' and cannot approve or merge a pull request"; Actions workflows "are not triggered until Copilot cloud agent's code is reviewed and a user with write access to the repository clicks the Approve and run workflows button"; the agent "is also subject to any branch protections and required checks for the working repository." |
+| 1 | OpenHands is an open-source platform for software development agents; agents "can do anything a human developer can: modify code, run commands, browse the web, call APIs" | `https://github.com/All-Hands-AI/OpenHands` — README, opening section. Quote must match verbatim. | **CUT — sentence not in current README, replaced.** `All-Hands-AI/OpenHands` now redirects to `OpenHands/OpenHands`; the README has been rewritten around Agent Canvas and this sentence does not appear in it. Confirmed against [OpenHands/OpenHands](https://github.com/OpenHands/OpenHands), README, retrieved 2026-08-04. The body paragraph above has been rewritten around Agent Canvas and now quotes the live README; the old quote appears nowhere in the body. |
+| 2 | Agent Canvas — what it is | `https://docs.all-hands.dev` — the Agent Canvas page. | **SOURCED — quoted verbatim from the README.** `docs.all-hands.dev` now redirects to `docs.openhands.dev/overview/introduction`, so the description was taken from the project's own README instead, where Agent Canvas is the headline: "the self-hosted developer control center for coding agents and automations", which "turns your coding agents into a self-hosted, always-on engineering team", running "OpenHands, Claude Code, Codex, Gemini, or any ACP-compatible agent across local, remote, and cloud backends". Confirmed against [OpenHands/OpenHands](https://github.com/OpenHands/OpenHands), README, retrieved 2026-08-04. |
+| 3 | Copilot coding agent: assign an issue → works in an ephemeral environment powered by GitHub Actions → pushes commits to a draft PR → requests review | GitHub Docs, *About Copilot coding agent* (`docs.github.com`, Copilot → coding agent). Confirm the exact URL, it has moved before. | **CORRECTED — product renamed, one phrase not live.** The product is now documented as **Copilot cloud agent**, not "coding agent"; the old `.../coding-agent` URL redirects to `.../cloud-agent`. The ephemeral-GitHub-Actions-environment claim is confirmed verbatim. "Requests your review" is not the live wording — the doc says it can "research a repository, create a plan, make code changes on a branch, and optionally open a pull request." Confirmed against [About GitHub Copilot cloud agent](https://docs.github.com/en/copilot/concepts/agents/cloud-agent/about-cloud-agent), retrieved 2026-08-04. The body paragraph above now says **Copilot cloud agent** throughout and quotes the live wording; "requests your review" appears nowhere in the body, and neither does the drafted "assign an issue … pushes its commits to a draft pull request" sequence, which the live page does not state in those terms. |
+| 4 | Actions workflows on Copilot's PRs need approval from a user with write access; Copilot cannot approve its own PR; branch protections and required reviews still apply | GitHub Docs, *Responsible use of GitHub Copilot coding agent* + the coding-agent security page. | **CONFIRMED — all three, verbatim.** The correct page title is *Risks and mitigations for Copilot cloud agent* (the "Responsible use" title guessed here does not exist under that name — the page was renamed along with the product). Confirmed against [Risks and mitigations](https://docs.github.com/en/copilot/concepts/agents/cloud-agent/risks-and-mitigations), retrieved 2026-08-04: draft PRs "must be reviewed and merged by a human"; the agent "cannot mark its pull requests as 'Ready for review' and cannot approve or merge a pull request"; Actions workflows "are not triggered until Copilot cloud agent's code is reviewed and a user with write access to the repository clicks the Approve and run workflows button"; the agent "is also subject to any branch protections and required checks for the working repository." The body paragraph above now cites this page by its live title and quotes all four lines verbatim. |
 
 Heimdall-side claims, all traceable in-repo, no external check needed:
 `bin/falsify --assert-score 1.0` semantics and the 6/6 + 3/3 flagship scores → `evals/flagship/STATUS.md` ·
