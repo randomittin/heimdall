@@ -278,7 +278,7 @@ jq -e '.invariants["round-trip-fidelity"].command | test("memory_codec")' "$MANI
 jq -e '.invariants["plain-fallback-when-absent"].command | test("memory_codec")' "$MANIFEST" >/dev/null 2>&1 \
   && ok "plain-fallback-when-absent drives the same seam" || bad "fallback check is not wired to the codec"
 # test/memory-codec.test.sh is the suite that guards that seam; it must exist and
-# still be the 42/0 gate the storage-codec attachment point relies on.
+# still be the 59/0 gate the storage-codec attachment point relies on.
 [ -f "$REPO/test/memory-codec.test.sh" ] \
   && ok "test/memory-codec.test.sh — the codec seam's own gate — exists" \
   || bad "the codec seam has no gate suite"
