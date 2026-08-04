@@ -84,6 +84,16 @@ STAMP="$HMD_HOME/.last-update-check"
 OPT_OUT_FILE="$HMD_HOME/no-autoupdate"
 LOG_FILE="$HMD_HOME/autoupdate.log"
 
+# ── the module system's view (mirrors bin/heimdall-modules' OWN defaults exactly) ──
+# Same env vars, same fallbacks, so redirecting one redirects both and a test can point
+# the pair at a throwaway tree. HMD_MODULES_BIN is a TEST seam: it lets the acceptance
+# suite exercise the acquisition path against a stub instead of installing a real
+# payload. Never set in production.
+MODULES_REGISTRY="${HMD_MODULES_REGISTRY:-$PLUGIN_DIR/modules}"
+MODULES_STATE="${HMD_MODULES_STATE:-$PLUGIN_DIR/.heimdall/modules}"
+MODULES_BIN="${HMD_MODULES_BIN:-$PLUGIN_DIR/bin/heimdall-modules}"
+MODULES_OPTOUT_FILE="$HMD_HOME/modules-optout"
+
 INTERVAL="${HEIMDALL_UPDATE_INTERVAL:-86400}"   # default 24h between background checks.
 
 # ── tiny helpers ───────────────────────────────────────────────────────────────
@@ -328,7 +338,7 @@ reassert_dream_schedule() {
 # that lets the acceptance suite prove a broken module actually becomes a repaired
 # one. Never set in production, where the whole point is that it is detached.
 repair_modules() {
-  local mods="$PLUGIN_DIR/bin/heimdall-modules"
+  local mods="$MODULES_BIN"
   [ -x "$mods" ] || return 0
   command -v jq >/dev/null 2>&1 || return 0
 
@@ -352,6 +362,225 @@ repair_modules() {
     fi
     disown 2>/dev/null || true
   done <<< "$pending"
+  return 0
+}
+
+# ── reconcile the INSTALLED module set against the DEFAULT set ───────────────────
+# THE GAP REPAIR CANNOT CLOSE. `repair` fixes a module install that was ATTEMPTED and
+# broke. It is useless to the machine whose hmd shipped BEFORE the module existed:
+# that install never had a failed attempt to retry, it has nothing at all, and until
+# now nothing in the update path ever read the registry to notice. Upgrading hmd moved
+# its version forward and left its capability set frozen at whatever the original
+# install shipped. Repair and FIRST ACQUISITION are different problems; this is the
+# second one.
+#
+# THE RULE IS NOT "INSTALL HEADROOM". It is: for every manifest the registry marks
+# `default_included`, make the installed set match. Headroom is simply the only module
+# that currently answers to it. The next default module is picked up by the same loop
+# with no new code, which is the whole point of deriving the set from data.
+#
+# THE FOUR TRANSITIONS, and why each behaves the way it does:
+#   1. INSTALLED → nothing. One stat() of the receipt and we are done: no preflight, no
+#      network, no output, no write of any kind. This is the branch that runs on nearly
+#      every machine on nearly every session, and its cost is the reason a backgrounded
+#      SessionStart update stays invisible. A chatty updater gets switched off, and an
+#      updater that is switched off repairs nothing ever again.
+#   2. OPTED OUT → nothing, and NOT EVEN A MENTION. Re-offering something the operator
+#      declined is a soft revert; it teaches them to ignore the tool or to disable it.
+#   3. ABSENT + CONSENT REQUIRED → DEFERRED, with the exact command printed on a manual
+#      update and silence on the background one. See the note below — this is the one
+#      genuinely load-bearing decision in the file.
+#   4. ABSENT + NO CONSENT REQUIRED → ACQUIRED, detached on the background path so a
+#      multi-GB fetch can never hold up SessionStart.
+#
+# WHY CONSENT-REQUIRED MODULES ARE DEFERRED RATHER THAN ACQUIRED. Headroom is class
+# traffic-proxy, whose contract sets `consent_required`. The only way this process
+# could install it unattended is to pass `--yes` to `heimdall-modules add`, i.e. to
+# assert on the operator's behalf that they agreed to put a process on the wire that
+# reads their prompts. A background job answering a consent prompt is not an install
+# path, it is a forged signature. So we never pass `--yes` from here — not on the
+# manual path either — and `heimdall-modules` independently refuses a consent-required
+# install when stdin is not a terminal. Two gates, and BOTH would have to be wrong for
+# a silent install to happen. What the user gets instead is the module named, the
+# reason stated, and one command to run. That is a smaller thing than an automatic
+# install and it is the honest version of it.
+#
+# NOTHING HERE CAN BREAK THE UPDATE. Every path returns 0, the detached child's exit
+# code is discarded, and a synchronous acquisition failure is swallowed after being
+# logged. hmd upgrades whether or not a module does; the module stays absent and
+# `heimdall-autoupdate status` names precisely why.
+
+# The module opt-out signal. TWO are read here and — state this plainly — NEITHER is
+# written by anything in this repository today:
+#
+#   HEIMDALL_NO_MODULES=1              global: no module is ever acquired, full stop.
+#   $HEIMDALL_HOME/modules-optout      one module name per line; `#` starts a comment.
+#
+# install.sh does not create modules-optout, `hmd modules` does not create it, and this
+# updater does not create it either. It is READ-ONLY-FOR-NOW: an operator writes it by
+# hand, and a future install-side opt-out will write it too. We deliberately do not
+# invent a writer here, because the install side owns where that decision is recorded
+# and two writers with two formats is exactly how an opt-out ends up half-honored.
+# Reading a signal nobody writes yet costs one file test; guessing its format and
+# writing it from the wrong side costs the user's trust once and permanently.
+module_opted_out() {
+  local name="$1"
+  [ "${HEIMDALL_NO_MODULES:-0}" = "1" ] && return 0
+  [ -f "$MODULES_OPTOUT_FILE" ] || return 1
+  grep -qE "^[[:space:]]*${name}[[:space:]]*$" "$MODULES_OPTOUT_FILE" 2>/dev/null
+}
+
+# Does any class this module declares demand an operator's explicit yes? The union
+# decides, exactly as `heimdall-modules obtain_consent` computes it: a module that is
+# both a storage codec and a traffic proxy still intercepts traffic, so the strictest
+# class wins. Reading the SAME class files means the two cannot drift into disagreeing
+# about whether something may be installed unattended.
+module_needs_consent() {
+  local mf="$1" cls cf
+  [ -f "$mf" ] || return 1
+  while IFS= read -r cls; do
+    [ -n "$cls" ] || continue
+    cf="$MODULES_REGISTRY/_classes/$cls.json"
+    [ -f "$cf" ] || continue
+    [ "$(jq -r '.consent_required // false' "$cf" 2>/dev/null)" = "true" ] && return 0
+  done <<< "$(jq -r '.permission_class | if type=="array" then .[] else . end' "$mf" 2>/dev/null)"
+  return 1
+}
+
+# The classes a module declares, rendered for a human ("traffic-proxy + storage-codec").
+module_class_list() {
+  jq -r '.permission_class | if type=="array" then join(" + ") else . end' "$1" 2>/dev/null
+}
+
+# Every module the registry ships in hmd's DEFAULT set. Derived from the manifests, so
+# adding a module to the default set is a data change and never a code change here.
+default_module_names() {
+  [ -d "$MODULES_REGISTRY" ] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  local d n mf
+  for d in "$MODULES_REGISTRY"/*/; do
+    [ -d "$d" ] || continue
+    n="${d%/}"; n="${n##*/}"
+    [ "$n" = "_classes" ] && continue
+    mf="$d/manifest.json"
+    [ -f "$mf" ] || continue
+    [ "$(jq -r '.default_included // false' "$mf" 2>/dev/null)" = "true" ] || continue
+    printf '%s\n' "$n"
+  done
+}
+
+# reconcile_modules <quiet|loud>
+#   quiet — the backgrounded SessionStart path. Silent on every branch; acquisition is
+#           detached so a large fetch cannot hold the session open.
+#   loud  — the `hmd --update` path, where a human is watching and an absent default
+#           module must be NAMED rather than silently skipped.
+#
+# HEIMDALL_MODULE_RECONCILE_DRYRUN=1 decides and logs but never spawns — the seam the
+# acceptance suite uses to read the decision without installing anything.
+# HEIMDALL_MODULE_ACQUIRE_SYNC=1 runs an acquisition in the foreground; the seam that
+# proves the real spawn path reaches `heimdall-modules add`. Neither is set in production.
+reconcile_modules() {
+  local mode="${1:-quiet}"
+  [ -x "$MODULES_BIN" ] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  local dry="${HEIMDALL_MODULE_RECONCILE_DRYRUN:-0}"
+
+  local names; names="$(default_module_names)"
+  [ -n "$names" ] || return 0
+
+  local n mf
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    mf="$MODULES_REGISTRY/$n/manifest.json"
+
+    # 1. ALREADY INSTALLED. The receipt is the module system's own definition of
+    # installed, so this costs one stat() and produces nothing. A module whose receipt
+    # exists but whose payload is broken is ALSO caught here and deliberately left
+    # alone: repair_modules owns that transition, and handling it in both places is how
+    # you get a double install.
+    if [ -f "$MODULES_STATE/$n/receipt.json" ]; then
+      [ "$dry" = "1" ] && log_line "reconcile: $n skip-installed"
+      continue
+    fi
+
+    # 2. OPTED OUT. Checked before anything is read, printed or spawned.
+    # FALSIFIER ANCHOR: test/module-reconcile.test.sh mutates the line below into
+    # `if false; then` and asserts the module IS then selected — which is what proves
+    # the opt-out assertion can go RED and is therefore worth its GREEN.
+    if module_opted_out "$n"; then
+      [ "$dry" = "1" ] && log_line "reconcile: $n skip-optout"
+      continue
+    fi
+
+    # 3. ABSENT, AND A HUMAN MUST SAY YES. Never installed from here — see the header.
+    if module_needs_consent "$mf"; then
+      [ "$dry" = "1" ] && log_line "reconcile: $n defer-consent"
+      if [ "$mode" = "loud" ]; then
+        printf 'heimdall: "%s" ships in hmd'"'"'s default module set and is not installed here.\n' "$n"
+        printf 'heimdall:   it is class %s, which requires your explicit consent — so an update\n' \
+          "$(module_class_list "$mf")"
+        printf 'heimdall:   will never install it for you. Install it yourself with:\n'
+        printf 'heimdall:     hmd modules add %s\n' "$n"
+      fi
+      continue
+    fi
+
+    # 4. ABSENT, AND NO DECLARED CLASS REQUIRES CONSENT → acquire it.
+    if [ "$dry" = "1" ]; then
+      log_line "reconcile: $n would-acquire"
+      continue
+    fi
+    log_line "reconcile: $n acquiring — in the default set, absent, not opted out"
+
+    if [ "$mode" = "loud" ]; then
+      printf 'heimdall: "%s" is in the default module set and is not installed — acquiring it now…\n' "$n"
+      if "$MODULES_BIN" add "$n"; then
+        printf 'heimdall:   "%s" installed.\n' "$n"
+      else
+        printf 'heimdall:   "%s" could not be installed right now. hmd itself is updated regardless;\n' "$n" >&2
+        printf 'heimdall:   the module stays absent — see: hmd modules status %s\n' "$n" >&2
+        log_line "reconcile: $n acquire-failed (module absent; hmd update unaffected)"
+      fi
+      continue
+    fi
+
+    # The synchronous seam exists only so a test can observe the invocation.
+    if [ "${HEIMDALL_MODULE_ACQUIRE_SYNC:-0}" = "1" ]; then
+      "$MODULES_BIN" add "$n" >>"$LOG_FILE" 2>&1 || log_line "reconcile: $n acquire-failed"
+      continue
+    fi
+    # NOTE the absent `--yes`. It is absent on purpose and must stay absent: it is the
+    # single flag that would turn this background job into something that consents on
+    # the operator's behalf.
+    if command -v setsid >/dev/null 2>&1; then
+      setsid bash -c "'$MODULES_BIN' add '$n' >>'$LOG_FILE' 2>&1" >/dev/null 2>&1 &
+    else
+      ( "$MODULES_BIN" add "$n" >>"$LOG_FILE" 2>&1 ) >/dev/null 2>&1 &
+    fi
+    disown 2>/dev/null || true
+  done <<< "$names"
+  return 0
+}
+
+# Why a given default module is not installed, named precisely enough to act on.
+# Delegates to the preflight library — the one place that knows how to turn "uv is not
+# on PATH" into "curl -LsSf https://astral.sh/uv/install.sh | sh" — and reports only its
+# BLOCKING failures. Network probes are off: `status` must answer promptly, and every
+# reason that keeps a module off a machine (no uv, no interpreter, no disk) is a local
+# check. Runs in a subshell so the library's globals never leak into the caller.
+module_blockers() {
+  local name="$1" mf="$2"
+  local lib="$SELF_DIR/lib/module_preflight.sh"
+  [ -f "$lib" ] || return 0
+  ( HMD_PREFLIGHT_NO_NET=1
+    # shellcheck source=/dev/null
+    . "$lib" 2>/dev/null || exit 0
+    hmd_preflight "$name" "$mf" "$MODULES_STATE" >/dev/null 2>&1
+    printf '%s' "$PF_RESULTS" | jq -r '
+      .[] | select(.status == "fail")
+      | "                   blocked: " + .requirement + " — " + .found
+        + (if .remedy == "" then "" else "\n                   fix:     " + .remedy end)' 2>/dev/null
+  ) 2>/dev/null
   return 0
 }
 
@@ -486,6 +715,11 @@ run_check() {
   # never affect this check's exit code.
   repair_modules || true
 
+  # Then bring an install that PREDATES a default module up to the current default set.
+  # Repair cannot help that machine — it never had a failed install to retry. Quiet
+  # mode: silent on every branch, detached on the only branch that does any work.
+  reconcile_modules quiet || true
+
   local installed latest
   installed="$(installed_version)"
   latest="$(latest_version)"
@@ -528,6 +762,36 @@ cmd_status() {
   else
     printf 'autoupdate: on\n'
   fi
+
+  # The DEFAULT MODULE SET: what hmd ships by default, what this machine actually has,
+  # and — for anything missing — the precise reason plus the command that fixes it. An
+  # absent optional module is a supported state, so this reports rather than warns; the
+  # thing that is NOT acceptable is a module silently missing with no way to find out why.
+  local defaults; defaults="$(default_module_names 2>/dev/null)"
+  if [ -n "$defaults" ]; then
+    printf 'modules:\n'
+    local n mf
+    while IFS= read -r n; do
+      [ -n "$n" ] || continue
+      mf="$MODULES_REGISTRY/$n/manifest.json"
+      if [ -f "$MODULES_STATE/$n/receipt.json" ]; then
+        printf '  %-16s installed\n' "$n"
+        continue
+      fi
+      if module_opted_out "$n"; then
+        printf '  %-16s absent — opted out; nothing will reinstall it\n' "$n"
+        continue
+      fi
+      if module_needs_consent "$mf"; then
+        printf '  %-16s absent — class %s requires your explicit consent\n' \
+          "$n" "$(module_class_list "$mf")"
+        printf '  %-16s   install it with: hmd modules add %s\n' "" "$n"
+      else
+        printf '  %-16s absent — will be acquired on the next update\n' "$n"
+      fi
+      module_blockers "$n" "$mf"
+    done <<< "$defaults"
+  fi
   exit 0
 }
 
@@ -547,6 +811,12 @@ cmd_update() {
   # after that check would never run on exactly the machines that need it.
   # Never fatal: a module that cannot be repaired must not stop hmd upgrading.
   repair_modules || true
+
+  # And acquire anything in the default module set this install never had — the case a
+  # user who installed hmd before the module existed is in. Loud here because a human
+  # asked for this update and is watching: an absent default module is NAMED, with the
+  # one command that installs it. Never fatal, for the same reason repair is not.
+  reconcile_modules loud || true
 
   installed="$(installed_version)"
   latest="$(latest_version)"
