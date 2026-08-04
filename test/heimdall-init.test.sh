@@ -251,6 +251,78 @@ grep -q "heimdall-verdict" "$STUB_OUT" && grep -qF -- "--json" "$STUB_OUT" \
 grep -q "launch:task" "$TRACE" && bad "8d hmd verdict WRONGLY fell through to Claude" || ok "8d hmd verdict does NOT fall through to Claude"
 
 # ══════════════════════════════════════════════════════════════════════════════
+# 10. FAIL CLOSED + RELOCATABLE — an unresolvable gate runner must BLOCK, and a
+#     MOVED plugin dir must not silently disarm the gate.
+#
+#     The generated hook bakes the plugin bin dir it was installed from. Move,
+#     rename or uninstall that dir and every later commit used to sail through
+#     green, silent and UNGATED — a gate that passes when it is absent is not a
+#     gate. An unverifiable invariant is never allowed to read as a pass
+#     (modules/headroom/manifest.json, no-signed-traffic-routing), so a hook that
+#     cannot resolve its runner must say so loudly and exit nonzero.
+# ══════════════════════════════════════════════════════════════════════════════
+# A throwaway plugin bin: a REAL copy of heimdall-init (it resolves symlinks, so a
+# symlinked init would bake the real bin dir) + symlinks to the runners it needs.
+PLUG="$WORK/plug/bin"; mkdir -p "$PLUG"
+cp "$INIT_BIN" "$PLUG/heimdall-init"; chmod +x "$PLUG/heimdall-init"
+for b in heimdall-gate-run heimdall-verdict heimdall-presence; do
+  [ -e "$BIN/$b" ] && ln -sf "$BIN/$b" "$PLUG/$b"
+done
+
+# The fail-closed proof needs the hook's PATH fallback to GENUINELY miss — a dev box
+# carries the plugin bin on PATH, which would mask the bug. /usr/bin:/bin has git but
+# is not an install target for the plugin; both facts are asserted, never assumed.
+GATELESS_PATH="/usr/bin:/bin"
+if PATH="$GATELESS_PATH" command -v heimdall-gate-run >/dev/null 2>&1; then
+  bad "10a precondition: heimdall-gate-run IS reachable on $GATELESS_PATH — the fail-closed proof cannot run here"
+elif ! PATH="$GATELESS_PATH" command -v git >/dev/null 2>&1; then
+  bad "10a precondition: git is not on $GATELESS_PATH — the fail-closed proof cannot run here"
+else
+  ok "10a precondition: a PATH carrying git and PROVABLY no heimdall-gate-run"
+fi
+
+R4="$WORK/r4"; newrepo "$R4"
+( cd "$R4" && env PATH="$NOCLAUDE_PATH" HOME="$HOME" "$PLUG/heimdall-init" ) >/dev/null 2>&1
+gateless() { local r="$1"; shift; ( cd "$r" && env PATH="$GATELESS_PATH" HOME="$HOME" git "$@" ); }
+
+# GREEN control: with the plugin bin present the gate runs and the commit lands.
+printf 'a\n' > "$R4/one.txt"
+gateless "$R4" add -A >/dev/null 2>&1
+gateless "$R4" commit -m "gated" >/dev/null 2>"$WORK/r4a.err"; R4A=$?
+[ "$R4A" = 0 ] && [ "$(commits_of "$R4")" = 1 ] \
+  && ok "10b control: with the plugin bin present the gate runs and the commit lands" \
+  || bad "10b the control commit failed" "exit=$R4A $(cat "$WORK/r4a.err")"
+
+# RED LINE: move the plugin away -> the runner resolves NOWHERE (baked path dead,
+# repo has no bin/, PATH proven clean). The commit must be REFUSED, loudly.
+mv "$WORK/plug" "$WORK/plug-moved"
+printf 'b\n' > "$R4/two.txt"
+gateless "$R4" add -A >/dev/null 2>&1
+gateless "$R4" commit -m "ungated?" >/dev/null 2>"$WORK/r4b.err"; R4B=$?
+[ "$R4B" != 0 ] \
+  && ok "10c FAIL CLOSED: an unresolvable gate runner BLOCKS the commit (exit $R4B)" \
+  || bad "10c the gate FAILED OPEN — a missing runner let the commit through"
+[ "$(commits_of "$R4")" = 1 ] && ok "10d FAIL CLOSED: no commit was created" \
+  || bad "10d an ungated commit landed" "commits=$(commits_of "$R4")"
+grep -q 'heimdall-gate-run' "$WORK/r4b.err" \
+  && ok "10e the block NAMES the runner it could not resolve (loud, never silent)" \
+  || bad "10e the block did not name heimdall-gate-run" "$(cat "$WORK/r4b.err")"
+
+# RELOCATABLE: the plugin is still gone, but the repo carries its own bin — a heimdall
+# checkout that was moved or renamed. The hook must resolve the runner from the REPO.
+mkdir -p "$R4/bin"; ln -sf "$GATE_BIN" "$R4/bin/heimdall-gate-run"
+rm -f "$R4/.heimdall/verdict.json"        # so a fresh verdict PROVES this run happened
+gateless "$R4" add -A >/dev/null 2>&1
+gateless "$R4" commit -m "relocated" >/dev/null 2>"$WORK/r4c.err"; R4C=$?
+[ "$R4C" = 0 ] && [ "$(commits_of "$R4")" = 2 ] \
+  && ok "10f RELOCATABLE: with the baked plugin path dead, the hook resolves the runner from the REPO" \
+  || bad "10f the hook could not resolve a repo-local runner" "exit=$R4C $(cat "$WORK/r4c.err")"
+V4="$( cd "$R4" && "$VERDICT_BIN" --field verdict 2>/dev/null )"
+[ "$V4" = "pass" ] && ok "10g the repo-resolved runner actually RAN (a fresh verdict was persisted)" \
+  || bad "10g no fresh verdict — the repo-resolved runner did not run" "got '$V4'"
+mv "$WORK/plug-moved" "$WORK/plug"
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 9. syntax: the bins AND the generated hooks parse clean
 # ══════════════════════════════════════════════════════════════════════════════
 _syn=1
