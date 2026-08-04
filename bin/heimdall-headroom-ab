@@ -1,0 +1,602 @@
+#!/usr/bin/env bash
+# heimdall-headroom-ab — the receipt harness for a one-week Headroom A/B.
+#
+# Headroom is a local context-compression proxy that wraps the `claude` CLI. This
+# harness answers ONE question with a publishable receipt: does wrapping sessions
+# in Headroom degrade the quality signals only a gate system can produce?
+#
+# It snapshots the week's metrics BEFORE adopting Headroom and AFTER a week of
+# use, then renders the comparison and computes a PRE-REGISTERED verdict.
+#
+# DEPEND, DON'T CLONE (spec §6). This harness does NOT install, bundle, vendor or
+# auto-install Headroom, and does NOT wrap anything. Headroom need not be present:
+# it reads metrics, and the Headroom-sourced figures (tokens, $) are OPERATOR
+# INPUT read off Headroom's own dashboard. Absent Headroom IS the "before" arm.
+#
+# THE PRE-REGISTERED VERDICT RULE — written BEFORE the data, hashed so a receipt
+# proves it was not edited afterwards (`preregister` prints the rule + rule_hash;
+# every report carries the same hash):
+#
+#   If oracle pass-rate OR falsify survival degrades beyond noise
+#       -> `headroom unwrap claude`, publish the NEGATIVE receipt.
+#   If neutral-or-better
+#       -> keep, publish the POSITIVE receipt.
+#
+# Both outcomes are publishable. A negative receipt is worth as much as a positive
+# one, and this tool renders it with equal confidence — it names the verdict and
+# the exact action, never a hedge.
+#
+# HOW "BEYOND NOISE" IS DETERMINED — stated plainly, never manufactured:
+#   The two verdict metrics are DETERMINISTIC gate outcomes. Re-running bin/falsify
+#   over an unchanged tree yields a byte-identical result: a mutant either survives
+#   or it does not. There is no sampling process, therefore no sampling noise, so
+#   the defensible noise band is EXACTLY ZERO and any degradation is real. That is
+#   why this tool prints NO confidence interval on the verdict metrics — a CI over
+#   a deterministic measurement would be theatre.
+#   The residual uncertainty is a CONFOUND, not noise: the tree changes between the
+#   two arms, so a drop could be Headroom or could be that week's commits. A
+#   one-week n cannot separate them, and the report SAYS SO rather than dressing
+#   the ambiguity in a fabricated interval.
+#   The non-deterministic metrics (time-to-green, agent deaths) DO carry sampling
+#   noise. They never drive the verdict, and when n is below MIN_N_FOR_INTERVAL
+#   the report refuses to print an interval and says the sample is too small.
+#
+# LABELLING CONVENTION — adopted from Headroom's own methodology, which labels
+# estimated-vs-measured numbers and always attaches a CI + explicit label to any
+# counterfactual figure. Credit to Headroom for the convention. Here EVERY figure
+# carries exactly one provenance label:
+#   measured     — read from a real signal in this repo (or run now, deterministically)
+#   estimated    — derived by a stated estimator; ALWAYS carries its interval
+#   unavailable  — no data. Rendered as `unavailable`, NEVER as 0. A 0 meaning "no
+#                  data" is indistinguishable from a 0 meaning "it did not happen",
+#                  and that ambiguity is exactly how a metric lies.
+#
+# METRIC PROVENANCE MAP
+#   oracle_pass_rate    measured    bin/falsify golden check per oracle domain
+#   falsify_survival    measured    bin/falsify mutant sweep (survived / total)
+#   agent_deaths        measured    bin/heimdall-agents (failed+killed in window)
+#   gate_retries        measured    .heimdall/gate-runs.jsonl deny records, if kept
+#   time_to_green_mins  estimated   git fix-chain intervals, median + IQR
+#   tokens_in/out,cost  measured    operator input, read off Headroom's dashboard
+#
+# Usage:
+#   heimdall-headroom-ab preregister                 Print the verdict rule + rule_hash
+#   heimdall-headroom-ab snapshot --arm before|after [opts]
+#   heimdall-headroom-ab report  --before <f> --after <f>
+#   heimdall-headroom-ab verdict --before <f> --after <f>   keep|unwrap|indeterminate
+#   heimdall-headroom-ab -h|--help
+#
+# snapshot options:
+#   --repo <dir>        Repo to measure (default: git toplevel, else cwd)
+#   --out <path>        Where to write the snapshot JSON (default: stdout)
+#   --window-days <n>   History window (default 7)
+#   --tokens-in <n>     From Headroom's dashboard. Omitted -> unavailable, never 0.
+#   --tokens-out <n>    From Headroom's dashboard.
+#   --cost <usd>        From Headroom's dashboard.
+#   --headroom-json <f> Read {tokens_in,tokens_out,cost_usd} from a JSON file instead.
+#
+# Read-only: this harness never writes to the measured repo, never calls the
+# network, and never spends a token.
+set -euo pipefail
+
+SELF="$0"
+if command -v readlink >/dev/null 2>&1; then
+  SELF="$(readlink -f "$0" 2>/dev/null || readlink "$0" 2>/dev/null || echo "$0")"
+fi
+BIN_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+PLUGIN_DIR="$(cd "$BIN_DIR/.." && pwd)"
+FALSIFY="$BIN_DIR/falsify"
+AGENTS="$BIN_DIR/heimdall-agents"
+
+if [[ "${COLORTERM:-}" == "truecolor" || "${COLORTERM:-}" == "24bit" || "${TERM:-}" == *256color* ]]; then
+  P='\033[38;2;224;86;160m'; C='\033[38;2;0;212;255m'; V='\033[38;2;155;89;182m'
+  G='\033[38;2;78;204;163m'; D='\033[38;2;100;100;120m'; W='\033[38;2;255;200;80m'
+else
+  P='\033[35m'; C='\033[36m'; V='\033[34m'; G='\033[32m'; D='\033[37m'; W='\033[33m'
+fi
+B='\033[1m'; R='\033[0m'
+
+command -v jq >/dev/null 2>&1 || { printf "error: jq is required\n" >&2; exit 2; }
+
+usage() { sed -n '2,80p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+# Below this n, the report REFUSES to print an interval and says the sample is
+# too small, rather than manufacturing significance on a one-week sample.
+MIN_N_FOR_INTERVAL=20
+
+# ── THE PRE-REGISTERED RULE ───────────────────────────────────────────────────
+# Canonical text. Hashed to prove the rule predates the data. Changing ONE byte
+# changes rule_hash, so a receipt whose hash differs from the pre-registration is
+# self-evidently a rule rewritten after seeing a disappointing result.
+rule_text() {
+  cat <<'RULE'
+PRE-REGISTERED VERDICT RULE (Headroom one-week A/B) v1
+Decision metrics (and ONLY these two):
+  1. oracle pass-rate  — fraction of oracle domains whose golden check passes.
+                         Higher is better. Degraded iff after < before.
+  2. falsify survival  — fraction of mutants that SURVIVE the gate.
+                         Lower is better. Degraded iff after > before.
+Verdict:
+  If either decision metric degrades beyond noise -> UNWRAP:
+     run `headroom unwrap claude` and publish the NEGATIVE receipt.
+  If neither degrades (neutral-or-better)        -> KEEP:
+     keep the wrapper and publish the POSITIVE receipt.
+  If either decision metric is unavailable in either arm -> INDETERMINATE:
+     publish neither verdict. An absent measurement is NOT evidence of success
+     and must never resolve to KEEP by default.
+Noise band:
+  Both decision metrics are deterministic gate outcomes with no sampling process,
+  so the noise band is exactly zero and any degradation counts. No confidence
+  interval is computed for them; the residual uncertainty is a confound (the tree
+  changed between arms), which a one-week sample cannot separate, and the report
+  states this rather than manufacturing significance.
+Non-decision metrics (tokens, cost, time-to-green, agent deaths, gate retries)
+are reported for context and NEVER alter the verdict.
+RULE
+}
+
+rule_hash() {
+  if command -v shasum >/dev/null 2>&1; then
+    rule_text | shasum -a 256 | awk '{print substr($1,1,16)}'
+  elif command -v sha256sum >/dev/null 2>&1; then
+    rule_text | sha256sum | awk '{print substr($1,1,16)}'
+  else
+    printf 'nohash'
+  fi
+}
+
+# ── Measurement: oracle pass-rate + falsify survival (both deterministic) ─────
+# Runs bin/falsify over every oracle domain that ships mutant fixtures.
+#   golden passes  <=> the SCORE line reads "(golden passing)"
+#   killed/total    <=  "SCORE: k/t"
+# A domain whose measurement ERRORS (timeout, missing runner) is counted in
+# `errors` and excluded from both numerators AND denominators — it is a
+# measurement failure, not a gate result, and folding it into either direction
+# would silently move the headline number.
+measure_oracles() {  # repo -> JSON {domains,golden_pass,mutants,survived,errors}
+  local repo="$1" d dom out score k t
+  local domains=0 golden_pass=0 mut_total=0 mut_killed=0 errors=0
+  if [ -x "$FALSIFY" ] && [ -d "$repo/evals/oracles" ]; then
+    for d in "$repo/evals/oracles"/*/; do
+      [ -d "$d/fixtures/mutants" ] || continue
+      dom="$(basename "$d")"
+      set +e
+      out="$(HEIMDALL_ORACLES_DIR="$repo/evals/oracles" \
+             perl -e 'alarm 180; exec @ARGV' -- "$FALSIFY" "$dom" 2>&1)"
+      set -e
+      score="$(printf '%s' "$out" | sed -n 's/^SCORE:[[:space:]]*\([0-9][0-9]*\/[0-9][0-9]*\).*/\1/p' | head -1)"
+      if [ -z "$score" ]; then errors=$((errors + 1)); continue; fi
+      domains=$((domains + 1))
+      k="${score%%/*}"; t="${score##*/}"
+      if printf '%s' "$out" | grep -q '(golden passing)'; then
+        golden_pass=$((golden_pass + 1))
+        # Mutant counts are only meaningful when the golden precondition held;
+        # falsify emits 0/0 otherwise, which would fake a perfect survival rate.
+        mut_total=$((mut_total + t)); mut_killed=$((mut_killed + k))
+      fi
+    done
+  fi
+  jq -cn --argjson dm "$domains" --argjson gp "$golden_pass" \
+         --argjson mt "$mut_total" --argjson mk "$mut_killed" --argjson er "$errors" \
+    '{domains:$dm, golden_pass:$gp, mutants:$mt, survived:($mt-$mk), errors:$er}'
+}
+
+# ── Measurement: agent deaths (truncation / API-error fatalities) ─────────────
+# bin/heimdall-agents classifies real Claude Code subagent transcripts as
+# failed|killed|done|live|working|stale. failed+killed inside the window = deaths.
+# CRITICAL: an EMPTY tracker list means the tracker is BLIND to this project (no
+# transcripts resolved), which is `unavailable` — NOT a measured zero. A populated
+# list with no failures IS a measured zero. Collapsing those two would be the
+# exact ambiguity this harness exists to prevent.
+measure_agent_deaths() {  # repo window_days -> JSON {value,provenance,n,reason}
+  local repo="$1" days="$2" js cutoff total deaths
+  cutoff=$((days * 86400))
+  if [ ! -x "$AGENTS" ]; then
+    jq -cn '{value:null, provenance:"unavailable", reason:"bin/heimdall-agents not present"}'
+    return 0
+  fi
+  set +e
+  js="$( cd "$repo" 2>/dev/null && perl -e 'alarm 120; exec @ARGV' -- "$AGENTS" list --json 2>/dev/null )"
+  set -e
+  if [ -z "$js" ] || ! printf '%s' "$js" | jq -e 'type=="array"' >/dev/null 2>&1; then
+    jq -cn '{value:null, provenance:"unavailable", reason:"agent tracker returned no parseable list"}'
+    return 0
+  fi
+  total="$(printf '%s' "$js" | jq -r 'length')"
+  if [ "$total" -eq 0 ]; then
+    jq -cn '{value:null, provenance:"unavailable", n:0,
+             reason:"agent tracker resolved no transcripts for this project — blind, not zero"}'
+    return 0
+  fi
+  deaths="$(printf '%s' "$js" | jq -r --argjson cut "$cutoff" \
+    '[ .[] | select((.state=="failed" or .state=="killed") and (.age_secs <= $cut)) ] | length')"
+  jq -cn --argjson v "$deaths" --argjson n "$total" \
+    '{value:$v, provenance:"measured", n:$n,
+      source:"bin/heimdall-agents list --json (state failed|killed within window)"}'
+}
+
+# ── Measurement: gate retries ─────────────────────────────────────────────────
+# bin/heimdall-gate-run persists ONLY the latest verdict to .heimdall/verdict.json
+# (it overwrites), so a WINDOW count needs an append-only history log. Where a
+# deployment keeps one (.heimdall/gate-runs.jsonl), we count its deny records;
+# where it does not, this is `unavailable` with the reason stated — a single
+# retained verdict cannot be honestly reported as a week's retry count.
+measure_gate_retries() {  # repo window_days -> JSON
+  local repo="$1" days="$2" log since n
+  log="$repo/.heimdall/gate-runs.jsonl"
+  if [ ! -f "$log" ]; then
+    jq -cn '{value:null, provenance:"unavailable",
+             reason:"no .heimdall/gate-runs.jsonl; heimdall-gate-run retains only the latest verdict.json"}'
+    return 0
+  fi
+  since="$(date -u -v-"${days}"d +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+           || date -u -d "${days} days ago" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "")"
+  n="$(jq -s --arg since "$since" \
+        '[ .[] | select(.verdict=="deny") | select($since=="" or (.ts // "") >= $since) ] | length' \
+        "$log" 2>/dev/null || echo "")"
+  if [ -z "$n" ]; then
+    jq -cn '{value:null, provenance:"unavailable", reason:"gate-runs.jsonl unparseable"}'
+    return 0
+  fi
+  jq -cn --argjson v "$n" '{value:$v, provenance:"measured", source:".heimdall/gate-runs.jsonl deny records in window"}'
+}
+
+# ── Estimation: time-to-green ─────────────────────────────────────────────────
+# ESTIMATOR (stated so it can be argued with): a "fix-chain" commit is one whose
+# subject starts with fix|test|revert, or mentions a red-to-green event (false-
+# green, regression, flake, retry, unbreak). Its elapsed time since the commit
+# immediately before it approximates how long that red took to go green. We report
+# the MEDIAN and the IQR as the interval. This is a PROXY over commit timestamps,
+# not a stopwatch on the gate — hence `estimated`, never `measured`.
+estimate_time_to_green() {  # repo window_days -> JSON
+  local repo="$1" days="$2" log deltas rc
+  log="$( git -C "$repo" log --since="${days} days ago" --pretty=format:'%ct%x09%s' 2>/dev/null )" || log=""
+  if [ -z "$log" ]; then
+    jq -cn '{value:null, provenance:"unavailable", n:0,
+             reason:"no commits in window — nothing to estimate from"}'
+    return 0
+  fi
+  # The subject array is `subj`, NOT `sub` — `sub` is a reserved awk builtin and
+  # using it as an array name is a syntax error. That bug once made this estimator
+  # die and report "no fix-chain commits": a CRASH disguised as an honest zero.
+  # So awk's exit status is checked explicitly and a failed estimator reports
+  # `unavailable` naming the failure — never an empty result passed off as no-data.
+  set +e
+  deltas="$( printf '%s\n' "$log" | awk -F'\t' '{ ct[NR]=$1; subj[NR]=$2 } END {
+        for (i = NR - 1; i >= 1; i--) {           # log is newest-first; walk to oldest
+          s = tolower(subj[i])
+          if (s ~ /^(fix|test|revert)[(:]/ || s ~ /false-green|regression|flake|retry|unbreak/) {
+            d = (ct[i] - ct[i+1]) / 60            # i+1 is the chronologically previous commit
+            if (d >= 0) printf "%.4f\n", d
+          }
+        }
+      }' )"
+  rc=$?
+  set -e
+  if [ "$rc" -ne 0 ]; then
+    jq -cn --argjson rc "$rc" \
+      '{value:null, provenance:"unavailable",
+        reason:"fix-chain estimator failed (awk exit \($rc)) — reporting the failure, not a zero"}'
+    return 0
+  fi
+  if [ -z "$deltas" ]; then
+    jq -cn '{value:null, provenance:"unavailable", n:0,
+             reason:"no fix-chain commits in window — nothing to estimate from"}'
+    return 0
+  fi
+  printf '%s\n' "$deltas" | jq -s --argjson minn "$MIN_N_FOR_INTERVAL" '
+    sort as $s | ($s|length) as $n
+    | def q($p): $s[ (($n - 1) * $p) | floor ];
+      { value: (if $n % 2 == 1 then $s[($n/2)|floor]
+                else (($s[$n/2 - 1] + $s[$n/2]) / 2) end),
+        provenance: "estimated", n: $n,
+        estimator: "median elapsed time from the preceding commit to each fix-chain commit (git)",
+        interval: (if $n >= $minn then {lo: q(0.25), hi: q(0.75), kind: "IQR"} else null end),
+        interval_note: (if $n >= $minn then null
+                        else "n<\($minn): too small for a defensible interval — none computed" end) }'
+}
+
+# ── Headroom-sourced figures: operator input ONLY. Never invented. ────────────
+# The harness cannot see Headroom's dashboard, so it accepts these as input. Not
+# supplied => unavailable. It will never render 0 to mean "I could not find out".
+headroom_metric() {  # value label -> JSON
+  local v="$1" label="$2"
+  if [ -z "$v" ]; then
+    jq -cn --arg l "$label" \
+      '{value:null, provenance:"unavailable",
+        reason:"not supplied — read \($l) off Headroom'"'"'s dashboard and pass it in"}'
+  else
+    jq -cn --argjson v "$v" --arg l "$label" \
+      '{value:$v, provenance:"measured", source:"Headroom dashboard (operator-supplied)"}'
+  fi
+}
+
+# ── snapshot ──────────────────────────────────────────────────────────────────
+cmd_snapshot() {
+  local arm="" repo="" out="" days=7 tin="" tout="" cost="" hjson=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --arm)           arm="${2:?--arm needs before|after}"; shift 2 ;;
+      --repo)          repo="${2:?--repo needs a dir}"; shift 2 ;;
+      --out)           out="${2:?--out needs a path}"; shift 2 ;;
+      --window-days)   days="${2:?--window-days needs a number}"; shift 2 ;;
+      --tokens-in)     tin="${2:?--tokens-in needs a number}"; shift 2 ;;
+      --tokens-out)    tout="${2:?--tokens-out needs a number}"; shift 2 ;;
+      --cost)          cost="${2:?--cost needs a number}"; shift 2 ;;
+      --headroom-json) hjson="${2:?--headroom-json needs a path}"; shift 2 ;;
+      *) printf "  ${P}x${R} unknown snapshot flag: %s\n" "$1" >&2; exit 2 ;;
+    esac
+  done
+  case "$arm" in before|after) ;; *) printf "  ${P}x${R} --arm must be before|after\n" >&2; exit 2 ;; esac
+  case "$days" in ''|*[!0-9]*) printf "  ${P}x${R} --window-days must be a positive integer\n" >&2; exit 2 ;; esac
+  [ "$days" -gt 0 ] || { printf "  ${P}x${R} --window-days must be > 0\n" >&2; exit 2; }
+  for n in "$tin" "$tout"; do
+    case "$n" in ''|*[!0-9]*) [ -z "$n" ] || { printf "  ${P}x${R} token counts must be integers\n" >&2; exit 2; } ;; esac
+  done
+  if [ -n "$cost" ] && ! printf '%s' "$cost" | grep -qE '^[0-9]+(\.[0-9]+)?$'; then
+    printf "  ${P}x${R} --cost must be a non-negative number\n" >&2; exit 2
+  fi
+
+  if [ -z "$repo" ]; then
+    repo="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+  fi
+  [ -d "$repo" ] || { printf "  ${P}x${R} no such repo dir: %s\n" "$repo" >&2; exit 2; }
+  # A receipt must name an absolute location — "." is not reproducible evidence.
+  repo="$( cd "$repo" && pwd -P )"
+
+  # A JSON file of Headroom figures is an alternative to the three flags.
+  if [ -n "$hjson" ]; then
+    [ -f "$hjson" ] || { printf "  ${P}x${R} no such --headroom-json: %s\n" "$hjson" >&2; exit 2; }
+    jq -e . "$hjson" >/dev/null 2>&1 || { printf "  ${P}x${R} --headroom-json is not valid JSON\n" >&2; exit 2; }
+    [ -n "$tin" ]  || tin="$(jq -r '.tokens_in  // empty' "$hjson")"
+    [ -n "$tout" ] || tout="$(jq -r '.tokens_out // empty' "$hjson")"
+    [ -n "$cost" ] || cost="$(jq -r '.cost_usd   // empty' "$hjson")"
+  fi
+
+  printf "  ${D}measuring %s arm over %s (window %sd) …${R}\n" "$arm" "$repo" "$days" >&2
+
+  local orc deaths retries ttg
+  orc="$(measure_oracles "$repo")"
+  deaths="$(measure_agent_deaths "$repo" "$days")"
+  retries="$(measure_gate_retries "$repo" "$days")"
+  ttg="$(estimate_time_to_green "$repo" "$days")"
+
+  local snap
+  snap="$(jq -n \
+    --arg arm "$arm" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --arg repo "$repo" --argjson days "$days" --arg rh "$(rule_hash)" \
+    --argjson orc "$orc" --argjson deaths "$deaths" \
+    --argjson retries "$retries" --argjson ttg "$ttg" \
+    --argjson tin "$(headroom_metric "$tin" "tokens in")" \
+    --argjson tout "$(headroom_metric "$tout" "tokens out")" \
+    --argjson cost "$(headroom_metric "$cost" "spend in USD")" '
+    # A denominator of zero cannot produce a rate — that is unavailable, not 0.0.
+    def rate($num; $den): if $den == 0 then null else (($num / $den) * 10000 | round) / 10000 end;
+    { schema:"heimdall-headroom-ab/v1", arm:$arm, ts:$ts, repo:$repo,
+      window_days:$days, rule_hash:$rh,
+      metrics: {
+        oracle_pass_rate: (
+          if $orc.domains == 0
+          then {value:null, provenance:"unavailable", n:0,
+                reason:"no oracle domain with mutant fixtures could be measured"}
+          else {value: rate($orc.golden_pass; $orc.domains), provenance:"measured",
+                n:$orc.domains, passed:$orc.golden_pass, errors:$orc.errors,
+                source:"bin/falsify golden check per oracle domain (deterministic)"} end),
+        falsify_survival: (
+          if $orc.mutants == 0
+          then {value:null, provenance:"unavailable", n:0,
+                reason:"no mutant ran under a passing golden — no survival rate exists"}
+          else {value: rate($orc.survived; $orc.mutants), provenance:"measured",
+                n:$orc.mutants, survived:$orc.survived, errors:$orc.errors,
+                source:"bin/falsify mutant sweep, survived/total (deterministic)"} end),
+        agent_deaths: $deaths,
+        gate_retries: $retries,
+        time_to_green_mins: $ttg,
+        tokens_in: $tin, tokens_out: $tout, cost_usd: $cost } }')"
+
+  if [ -n "$out" ]; then
+    printf '%s\n' "$snap" > "$out"
+    printf "  ${G}ok${R} ${D}snapshot written: %s${R}\n" "$out" >&2
+  else
+    printf '%s\n' "$snap"
+  fi
+}
+
+# ── verdict engine — the SINGLE source of truth for report + verdict ──────────
+# Mechanically applies the pre-registered rule. Nothing here is arguable at
+# render time: the verdict is computed from the two decision metrics only.
+compute_verdict() {  # before.json after.json -> JSON {verdict,reasons[],...}
+  jq -n --slurpfile b "$1" --slurpfile a "$2" '
+    ($b[0].metrics) as $B | ($a[0].metrics) as $A
+    | ($B.oracle_pass_rate.value) as $bo | ($A.oracle_pass_rate.value) as $ao
+    | ($B.falsify_survival.value) as $bf | ($A.falsify_survival.value) as $af
+    | (($bo == null) or ($ao == null) or ($bf == null) or ($af == null)) as $missing
+    # Deterministic metrics -> zero noise band -> any degradation counts.
+    | (($missing | not) and ($ao < $bo)) as $oracle_down
+    | (($missing | not) and ($af > $bf)) as $falsify_down
+    | { verdict: (if $missing then "indeterminate"
+                  elif ($oracle_down or $falsify_down) then "unwrap"
+                  else "keep" end),
+        oracle_degraded: $oracle_down, falsify_degraded: $falsify_down,
+        oracle: {before:$bo, after:$ao, delta: (if $missing then null else ($ao - $bo) end)},
+        falsify: {before:$bf, after:$af, delta: (if $missing then null else ($af - $bf) end)},
+        reasons: ( [ if $missing then
+                       "a decision metric is unavailable in at least one arm — an absent measurement is not evidence of success"
+                     else empty end,
+                     if $oracle_down then "oracle pass-rate degraded: \($bo) -> \($ao)" else empty end,
+                     if $falsify_down then "falsify survival worsened (more mutants survived): \($bf) -> \($af)" else empty end,
+                     if (($missing|not) and ($oracle_down|not) and ($falsify_down|not))
+                       then "neither decision metric degraded (neutral-or-better)" else empty end ] ) }'
+}
+
+require_snap() {  # path
+  [ -f "$1" ] || { printf "  ${P}x${R} no such snapshot: %s\n" "$1" >&2; exit 2; }
+  jq -e '.metrics' "$1" >/dev/null 2>&1 \
+    || { printf "  ${P}x${R} not a heimdall-headroom-ab snapshot: %s\n" "$1" >&2; exit 2; }
+}
+
+parse_ba() {  # sets BEFORE_F / AFTER_F
+  BEFORE_F=""; AFTER_F=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --before) BEFORE_F="${2:?--before needs a path}"; shift 2 ;;
+      --after)  AFTER_F="${2:?--after needs a path}"; shift 2 ;;
+      *) printf "  ${P}x${R} unknown flag: %s\n" "$1" >&2; exit 2 ;;
+    esac
+  done
+  [ -n "$BEFORE_F" ] && [ -n "$AFTER_F" ] \
+    || { printf "  ${P}x${R} need --before <f> --after <f>\n" >&2; exit 2; }
+  require_snap "$BEFORE_F"; require_snap "$AFTER_F"
+}
+
+# ── rendering ─────────────────────────────────────────────────────────────────
+# Renders ONE metric row. Every row ends in its provenance label; an estimate
+# also carries its interval (or an explicit refusal to compute one). An
+# unavailable figure renders the word `unavailable` and NO digits at all, so it
+# can never be misread as a measured zero.
+render_row() {  # key label unit better(higher|lower) pct(0|1)
+  local key="$1" label="$2" unit="$3" better="$4" pct="$5"
+  local row
+  row="$(jq -n --slurpfile b "$BEFORE_F" --slurpfile a "$AFTER_F" \
+    --arg k "$key" --arg unit "$unit" --arg better "$better" --argjson pct "$pct" '
+    ($b[0].metrics[$k]) as $B | ($a[0].metrics[$k]) as $A
+    | def fmt($m): if $m == null or $m.value == null then "unavailable"
+                   elif $pct == 1 then "\((($m.value * 1000) | round) / 10)%"
+                   else "\($m.value)\($unit)" end;
+      def prov($m): if $m == null then "unavailable" else $m.provenance end;
+      def iv($m): if $m == null or $m.interval == null then
+                    (if $m != null and $m.interval_note != null then "  [\($m.interval_note)]" else "" end)
+                  else "  [\($m.interval.kind) \((($m.interval.lo*10)|round)/10)–\((($m.interval.hi*10)|round)/10)]" end;
+      (if $B == null or $A == null or $B.value == null or $A.value == null then null
+       else ($A.value - $B.value) end) as $d
+    | { before: fmt($B), after: fmt($A),
+        delta: (if $d == null then "unavailable"
+                elif $pct == 1 then "\(if $d > 0 then "+" else "" end)\((($d * 1000) | round) / 10)pp"
+                else "\(if $d > 0 then "+" else "" end)\((($d * 100) | round) / 100)\($unit)" end),
+        dir: (if $d == null or $d == 0 then "flat"
+              elif ($better == "higher" and $d > 0) or ($better == "lower" and $d < 0) then "better"
+              else "worse" end),
+        prov: (if prov($B) == prov($A) then prov($B) else "\(prov($B))/\(prov($A))" end),
+        iv: (iv($A)) }' )"
+  local bv av dv dir prov ivt col
+  bv="$(printf '%s' "$row" | jq -r '.before')"
+  av="$(printf '%s' "$row" | jq -r '.after')"
+  dv="$(printf '%s' "$row" | jq -r '.delta')"
+  dir="$(printf '%s' "$row" | jq -r '.dir')"
+  prov="$(printf '%s' "$row" | jq -r '.prov')"
+  ivt="$(printf '%s' "$row" | jq -r '.iv')"
+  case "$dir" in better) col="$G" ;; worse) col="$P" ;; *) col="$D" ;; esac
+  printf "  %-22s %14s  %14s  ${col}%12s${R}  ${D}%s${R}${D}%s${R}\n" \
+    "$label" "$bv" "$av" "$dv" "$prov" "$ivt"
+}
+
+cmd_report() {
+  parse_ba "$@"
+  local vj verdict rh_live rh_b rh_a
+  vj="$(compute_verdict "$BEFORE_F" "$AFTER_F")"
+  verdict="$(printf '%s' "$vj" | jq -r '.verdict')"
+  # The report states the rule it ACTUALLY graded by (the live rule this binary
+  # applies), not whatever an arm happens to have recorded — otherwise an arm
+  # missing a hash would hide the grading rule behind "unknown". Each arm's
+  # recorded hash is then checked AGAINST it, so a snapshot registered under a
+  # different (or no) rule is called out rather than silently accepted.
+  rh_live="$(rule_hash)"
+  rh_b="$(jq -r '.rule_hash // "unregistered"' "$BEFORE_F")"
+  rh_a="$(jq -r '.rule_hash // "unregistered"' "$AFTER_F")"
+
+  printf "\n"
+  printf "  ${P}${B}░▒▓█${R} ${C}${B}H E I M D A L L   ×   H E A D R O O M   A / B${R} ${P}${B}█▓▒░${R}\n"
+  printf "  ${V}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${R}\n"
+  printf "  ${D}before: %s${R}\n" "$(jq -r '"\(.ts)  \(.repo)  window \(.window_days)d"' "$BEFORE_F")"
+  printf "  ${D}after : %s${R}\n\n" "$(jq -r '"\(.ts)  \(.repo)  window \(.window_days)d"' "$AFTER_F")"
+
+  printf "  %-22s %14s  %14s  %12s  %s\n" "METRIC" "BEFORE" "AFTER" "DELTA" "PROVENANCE"
+  printf "  %-22s %14s  %14s  %12s  %s\n" \
+    "----------------------" "--------------" "--------------" "------------" "----------"
+
+  printf "  ${B}decision metrics${R} ${D}(these and only these compute the verdict)${R}\n"
+  render_row oracle_pass_rate   "oracle pass-rate"   ""      higher 1
+  render_row falsify_survival   "falsify survival"   ""      lower  1
+  printf "\n  ${B}context metrics${R} ${D}(reported, never verdict-altering)${R}\n"
+  render_row agent_deaths       "agent deaths"       ""      lower  0
+  render_row gate_retries       "gate retries"       ""      lower  0
+  render_row time_to_green_mins "time-to-green"      " min"  lower  0
+  render_row tokens_in          "tokens in"          ""      lower  0
+  render_row tokens_out         "tokens out"         ""      lower  0
+  render_row cost_usd           "cost (USD)"         ""      lower  0
+
+  # Reasons a figure is absent — printed so `unavailable` is never a shrug.
+  local reasons
+  reasons="$(jq -r '.metrics | to_entries[]
+              | select(.value.provenance == "unavailable")
+              | "    \(.key): \(.value.reason // "no reason recorded")"' "$AFTER_F" 2>/dev/null || true)"
+  if [ -n "$reasons" ]; then
+    printf "\n  ${D}why a figure is unavailable (never rendered as 0):${R}\n"
+    printf '%s\n' "$reasons" | while IFS= read -r l; do printf "  ${D}%s${R}\n" "$l"; done
+  fi
+
+  # How "beyond noise" was determined — stated plainly, every run.
+  printf "\n  ${B}how \"beyond noise\" was determined${R}\n"
+  printf "  ${D}    The two decision metrics are DETERMINISTIC gate outcomes — re-running${R}\n"
+  printf "  ${D}    bin/falsify on an unchanged tree reproduces them exactly. With no sampling${R}\n"
+  printf "  ${D}    process there is no sampling noise, so the noise band is exactly zero and${R}\n"
+  printf "  ${D}    ANY degradation counts. No CI is printed for them: a confidence interval${R}\n"
+  printf "  ${D}    over a deterministic measurement would be theatre.${R}\n"
+  printf "  ${D}    Residual uncertainty is a CONFOUND, not noise — the tree changed between${R}\n"
+  printf "  ${D}    arms, and a one-week n cannot separate Headroom from that week's commits.${R}\n"
+  printf "  ${D}    Context metrics that DO carry sampling noise print an interval only at${R}\n"
+  printf "  ${D}    n>=%s; below that the report refuses to manufacture significance.${R}\n" "$MIN_N_FOR_INTERVAL"
+
+  # ── the verdict ─────────────────────────────────────────────────────────────
+  printf "\n  ${V}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${R}\n"
+  printf "  ${B}PRE-REGISTERED VERDICT${R}  ${D}rule_hash: %s${R}\n" "$rh_live"
+  if [ "$rh_b" != "$rh_live" ] || [ "$rh_a" != "$rh_live" ]; then
+    printf "  ${P}${B}! RULE PROVENANCE${R} ${P}arm hashes (before=%s after=%s) do not both match the${R}\n" "$rh_b" "$rh_a"
+    printf "  ${P}  rule applied here (%s) — an arm was registered under a different rule, or none.${R}\n" "$rh_live"
+  fi
+  printf '%s\n' "$(printf '%s' "$vj" | jq -r '.reasons[]')" \
+    | while IFS= read -r l; do [ -n "$l" ] && printf "  ${D}· %s${R}\n" "$l"; done
+
+  case "$verdict" in
+    unwrap)
+      printf "\n  ${P}${B}VERDICT: UNWRAP${R} ${P}— a decision metric degraded. Run:${R} ${B}headroom unwrap claude${R}\n"
+      printf "  ${P}Publish the NEGATIVE receipt.${R} ${D}This is a real result, not a failure of the${R}\n"
+      printf "  ${D}experiment: the pre-registered rule fired exactly as written, before the data${R}\n"
+      printf "  ${D}existed. A negative receipt is as publishable as a positive one.${R}\n" ;;
+    keep)
+      printf "\n  ${G}${B}VERDICT: KEEP${R} ${G}— neither decision metric degraded (neutral-or-better).${R}\n"
+      printf "  ${G}Keep the wrapper. Publish the POSITIVE receipt.${R}\n" ;;
+    *)
+      printf "\n  ${W}${B}VERDICT: INDETERMINATE${R} ${W}— a decision metric is unavailable in an arm.${R}\n"
+      printf "  ${W}Publish NEITHER receipt.${R} ${D}An absent measurement is not evidence of success${R}\n"
+      printf "  ${D}and must never default to KEEP. Re-run the missing arm, then re-grade.${R}\n" ;;
+  esac
+  printf "\n  ${D}Labelling convention (measured vs estimated, intervals on counterfactuals)${R}\n"
+  printf "  ${D}adopted from Headroom's own methodology — credit to Headroom.${R}\n\n"
+}
+
+cmd_verdict() {
+  parse_ba "$@"
+  compute_verdict "$BEFORE_F" "$AFTER_F" | jq -r '.verdict'
+}
+
+# ── dispatch ──────────────────────────────────────────────────────────────────
+[ $# -ge 1 ] || { usage; exit 0; }
+case "$1" in
+  -h|--help)   usage; exit 0 ;;
+  preregister)
+    shift
+    printf "\n  ${B}PRE-REGISTERED VERDICT RULE${R} ${D}— written before the data, hashed so a receipt${R}\n"
+    printf "  ${D}proves it was not rewritten afterwards.${R}\n\n"
+    rule_text | while IFS= read -r l; do printf "  %s\n" "$l"; done
+    printf "\n  ${B}rule_hash: %s${R}\n" "$(rule_hash)"
+    printf "  ${D}Any edit to the rule changes this hash. A report whose rule_hash differs${R}\n"
+    printf "  ${D}from this one was graded by a different rule — treat it as unregistered.${R}\n\n"
+    ;;
+  snapshot)  shift; cmd_snapshot "$@" ;;
+  report)    shift; cmd_report   "$@" ;;
+  verdict)   shift; cmd_verdict  "$@" ;;
+  *) printf "  ${P}x${R} unknown subcommand: ${B}%s${R}\n" "$1" >&2
+     printf "  ${D}Run ${C}heimdall-headroom-ab --help${D} for usage.${R}\n" >&2
+     exit 2 ;;
+esac
