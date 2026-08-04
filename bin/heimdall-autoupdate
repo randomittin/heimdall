@@ -298,6 +298,63 @@ reassert_dream_schedule() {
   return 0
 }
 
+# ── repair deferred / broken optional modules (the recurring, hands-off moment) ──
+# WHY THIS LIVES HERE. `hmd install` must not block on a multi-GB download, so an
+# optional module is legitimately ABSENT right after a successful install — and a
+# module that failed on Monday because the network was down should simply be
+# working on Tuesday without anyone noticing it was broken. This function is the
+# only moment that recurs without the user doing anything, so this is where the
+# retry belongs. There is no second repair mechanism: it shells out to the SAME
+# `heimdall-modules repair` a human runs by hand.
+#
+# THE FOUR RULES IT OBEYS, and why each matters:
+#   1. HEALTHY IS A NO-OP, SILENTLY. The decision is `heimdall-modules pending`,
+#      a set of file-existence tests — no preflight, no network, no output. A
+#      machine with nothing pending pays one process spawn and prints nothing,
+#      which is what keeps a backgrounded SessionStart update invisible.
+#   2. IT NEVER BLOCKS. The repair is DETACHED exactly like apply_update's
+#      installer, so a multi-GB fetch cannot hold up the check that spawned it.
+#   3. IT CAN NEVER BREAK THE UPDATE. Every failure path returns 0 and the
+#      detached child's exit code is discarded. hmd's own upgrade succeeds even
+#      if the module repair fails outright; the module simply stays absent and
+#      `hmd modules status <name>` says which stage failed.
+#   4. AN OPT-OUT IS FINAL. We do NOT re-check the opt-out here — `heimdall-modules
+#      repair` refuses an opted-out module itself, and `pending` filters it out.
+#      Keeping that decision in ONE place is what stops the two copies drifting
+#      into a state where update quietly reinstalls something the user declined.
+#      An opt-out that silently reverts is worse than no opt-out at all.
+#
+# HEIMDALL_MODULE_REPAIR_SYNC=1 runs the repair in the FOREGROUND — the test seam
+# that lets the acceptance suite prove a broken module actually becomes a repaired
+# one. Never set in production, where the whole point is that it is detached.
+repair_modules() {
+  local mods="$PLUGIN_DIR/bin/heimdall-modules"
+  [ -x "$mods" ] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+
+  local pending
+  pending="$("$mods" pending 2>/dev/null || true)"
+  # The healthy case: nothing pending → nothing spawned, nothing logged, no output.
+  [ -n "$pending" ] || return 0
+
+  local n
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    log_line "module-repair: $n needs attention — attempting repair"
+    if [ "${HEIMDALL_MODULE_REPAIR_SYNC:-0}" = "1" ]; then
+      "$mods" repair "$n" --quiet >>"$LOG_FILE" 2>&1 || true
+      continue
+    fi
+    if command -v setsid >/dev/null 2>&1; then
+      setsid bash -c "'$mods' repair '$n' --quiet >>'$LOG_FILE' 2>&1" >/dev/null 2>&1 &
+    else
+      ( "$mods" repair "$n" --quiet >>"$LOG_FILE" 2>&1 ) >/dev/null 2>&1 &
+    fi
+    disown 2>/dev/null || true
+  done <<< "$pending"
+  return 0
+}
+
 # ── apply (the atomic, detached, NEXT-session upgrade — SIGNATURE-GATED) ─────────
 # Re-run the LATEST tag's idempotent installer DETACHED so it never blocks SessionStart —
 # but ONLY after its install.sh signature verifies against the IN-REPO public key. This is
@@ -422,6 +479,13 @@ run_check() {
   # throttled check honors the window from this moment.
   touch_stamp
 
+  # Heal deferred/broken optional modules BEFORE the version resolution, because
+  # this is the case that matters most: hmd is usually already current, so a
+  # repair placed after the semver decision would never run on the machines that
+  # need it. Detached, silent when there is nothing to do, and its outcome can
+  # never affect this check's exit code.
+  repair_modules || true
+
   local installed latest
   installed="$(installed_version)"
   latest="$(latest_version)"
@@ -476,6 +540,14 @@ cmd_status() {
 # release is REFUSED exactly like the background path (apply_update is the shared gate).
 cmd_update() {
   local installed latest
+
+  # `hmd update` repairs optional modules too, not just hmd itself. Placed FIRST
+  # and unconditionally, because the common case is that hmd is already current —
+  # and "already on the latest version" exits early below, so a repair placed
+  # after that check would never run on exactly the machines that need it.
+  # Never fatal: a module that cannot be repaired must not stop hmd upgrading.
+  repair_modules || true
+
   installed="$(installed_version)"
   latest="$(latest_version)"
 
