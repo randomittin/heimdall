@@ -228,6 +228,30 @@ is_opted_out() {
 has_failed()  { [ -f "$(failure_file "$1")" ]; }
 is_deferred() { [ -f "$(deferred_file "$1")" ]; }
 
+# The waiver a module DECLARES, read from its manifest — as distinct from the
+# waiver a receipt RECORDS, which only exists once something is installed. Both
+# surfaces are needed and they answer different questions: the receipt answers
+# "was I asked?", this answers "will I be asked?". A reader deciding whether to
+# accept a module is asking the second one, and on a fresh machine the receipt
+# does not exist yet — so a waiver visible only in the receipt would be visible
+# only after it had already been applied, which is not disclosure at all.
+# Prints a JSON object, or the literal `null` when no waiver is declared.
+declared_waiver_json() {
+  local mf out="null"
+  mf="$(manifest_path "$1")"
+  if [ -f "$mf" ]; then
+    out="$(jq -c 'if (.consent_waived // false) == true
+                  then {waived:true,
+                        reason:(.consent_waived_reason // ""),
+                        declared_in:"module manifest (`consent_waived`)",
+                        disclosure_still_shown:true,
+                        scope:"this module only — the class contract is unmodified"}
+                  else null end' "$mf" 2>/dev/null || printf 'null')"
+  fi
+  [ -n "$out" ] || out="null"
+  printf '%s' "$out"
+}
+
 # The one question every caller asks: which state is this module in? Prints
 # exactly one of: installed | opted-out | failed | deferred | not-attempted
 module_state() {
@@ -345,6 +369,33 @@ validate_manifest() {
   if jq -e 'has("default_included")' "$mf" >/dev/null 2>&1; then
     jq -e '.default_included | type == "boolean"' "$mf" >/dev/null 2>&1 \
       || verr "\`default_included\` must be a boolean (a distribution fact, separate from \`tier\`, which is an evidence claim)"
+  fi
+
+  # consent_waived — a PER-MODULE waiver of the consent QUESTION. Never of the
+  # disclosure, never of the class invariants, never of reversibility.
+  #
+  # WHY IT LIVES HERE AND NOT ON THE CLASS. The one-word alternative is to set
+  # `consent_required: false` in modules/_classes/<class>.json, and it is wrong by
+  # a wide margin: that field governs the CLASS, so flipping it disarms consent for
+  # every module of that class hmd ever ships, permanently, including ones nobody
+  # has written yet. A distribution decision about ONE module is recorded on that
+  # one module, so the blast radius is exactly the thing that was decided.
+  #
+  # AND IT MUST SAY WHY. A silent waiver is indistinguishable from a bug, and the
+  # reader who finds it later has no way to tell whether it was chosen or leaked
+  # in. So an unexplained waiver is REFUSED here rather than honoured quietly —
+  # the declaration is the whole reason a waiver is defensible at all.
+  if jq -e 'has("consent_waived")' "$mf" >/dev/null 2>&1; then
+    if ! jq -e '.consent_waived | type == "boolean"' "$mf" >/dev/null 2>&1; then
+      verr "\`consent_waived\` must be a boolean — a waiver is never inferred from a truthy string"
+    elif [ "$(jq -r '.consent_waived' "$mf")" = "true" ]; then
+      v="$(jq -r '.consent_waived_reason // "" | if type=="string" then . else "" end' "$mf")"
+      [ -n "$v" ] \
+        || verr "\`consent_waived\` is true but \`consent_waived_reason\` is missing — a waiver that does not say why is indistinguishable from a mistake, and the reason is what a reviewer needs most"
+      v="$(jq -r '.consent_text // "" | if type=="string" then . else "" end' "$mf")"
+      [ -n "$v" ] \
+        || verr "\`consent_waived\` is true but the manifest ships no \`consent_text\` — a waiver removes the QUESTION, never the DISCLOSURE. The operator is still told what is being installed."
+    fi
   fi
 
   v="$(jq -r '.name // ""' "$mf")"
@@ -564,10 +615,46 @@ obtain_consent() {
     return 1
   fi
 
-  printf '\n  Module "%s" is class %s, which requires your consent.\n\n' \
-    "$name" "$consenting"
+  # A WAIVER removes the QUESTION, never the DISCLOSURE. The text below is
+  # printed either way — a waived operator is TOLD what is happening and why they
+  # were not asked; they simply are not asked. Deleting the disclosure instead is
+  # the version of this that would actually be indefensible.
+  local waived="false" waived_reason=""
+  if [ "$(jq -r '.consent_waived // false' "$mf")" = "true" ]; then
+    waived="true"
+    waived_reason="$(jq -r '.consent_waived_reason // ""' "$mf")"
+  fi
+
+  if [ "$waived" = "true" ]; then
+    printf '\n  Module "%s" is class %s, which requires consent — WAIVED for this module.\n\n' \
+      "$name" "$consenting"
+  else
+    printf '\n  Module "%s" is class %s, which requires your consent.\n\n' \
+      "$name" "$consenting"
+  fi
   printf '%s\n' "$rationales"
   printf '  %s\n\n' "$text"
+
+  if [ "$waived" = "true" ]; then
+    printf '  CONSENT WAIVED — this is disclosure, not a question.\n'
+    printf '  Declared in this module'"'"'s own manifest (`consent_waived`), NOT in the\n'
+    printf '  class contract: class %s still requires consent from every OTHER\n' "$consenting"
+    printf '  module that claims it. The waiver covers "%s" alone.\n\n' "$name"
+    printf '    why: %s\n\n' "$waived_reason"
+    printf '  Waived here is the QUESTION only. The class invariants below still run\n'
+    printf '  with the module active, and `hmd modules remove %s` still returns the\n' "$name"
+    printf '  tree byte-identically. Decline it outright: hmd modules optout %s\n\n' "$name"
+    CONSENT_JSON="$(jq -n \
+      --arg t "$(now_iso)" --arg h "$(sha256_string "$text")" --arg text "$text" \
+      --arg r "$waived_reason" --arg c "$consenting" \
+      '{required:true, waived:true, granted:true, granted_via:"manifest-waiver",
+        granted_at:$t, waived_reason:$r,
+        waived_by:"module manifest (`consent_waived`)",
+        consent_required_by:$c,
+        note:"The class contract still requires consent. This module carries an explicit per-module waiver, so the disclosure was SHOWN and the question was NOT asked. Deleting `consent_waived` from the manifest restores the prompt; the class contract was never modified.",
+        consent_text:$text, consent_text_sha256:$h}')"
+    return 0
+  fi
 
   local granted_via=""
   if [ "$ASSUME_YES" -eq 1 ]; then
@@ -982,8 +1069,10 @@ cmd_status() {
         --argjson optout "$([ -f "$(optout_file "$name")" ] && cat "$(optout_file "$name")" || echo null)" \
         --argjson failure "$([ -f "$(failure_file "$name")" ] && cat "$(failure_file "$name")" || echo null)" \
         --argjson deferred "$([ -f "$(deferred_file "$name")" ] && cat "$(deferred_file "$name")" || echo null)" \
+        --argjson waiver "$(declared_waiver_json "$name")" \
         '{tool:"heimdall-modules", action:"status", name:$n, installed:false,
-          state:$st, optout:$optout, failure:$failure, deferred:$deferred}'
+          state:$st, consent_waiver:$waiver,
+          optout:$optout, failure:$failure, deferred:$deferred}'
       return 0
     fi
     printf '\n  %s\n\n' "$name"
@@ -1012,6 +1101,15 @@ cmd_status() {
         printf '    Install:     hmd modules add %s\n' "$name"
         printf '    Check first: hmd modules preflight %s\n' "$name" ;;
     esac
+    local dw; dw="$(declared_waiver_json "$name")"
+    if [ "$dw" != "null" ]; then
+      printf '\n    consent:  WAIVED for this module — when it installs you will be\n'
+      printf '              TOLD what it does, not asked to approve it.\n'
+      printf '              why: %s\n' "$(printf '%s' "$dw" | jq -r '.reason')"
+      printf '              Declared in this module'"'"'s manifest. The class contract is\n'
+      printf '              unmodified, so every other module of that class still asks.\n'
+      printf '              Decline it outright: hmd modules optout %s\n' "$name"
+    fi
     printf '\n'
     return 0
   fi
@@ -1030,7 +1128,12 @@ cmd_status() {
     tier:     \(.tier)
     added:    \(.installed_at)
     digest:   \(.digest.status) — \(.digest.note)
-    consent:  \(if .consent.required then "granted via \(.consent.granted_via) at \(.consent.granted_at)" else "not required for this class" end)"' "$d/receipt.json"
+    consent:  \(if (.consent.waived // false) then
+                   "WAIVED for this module — disclosed, not asked, at \(.consent.granted_at)
+              why:      \(.consent.waived_reason // "")
+              scope:    class \(.consent.consent_required_by // "?") still requires consent from every other module"
+                 elif .consent.required then "granted via \(.consent.granted_via) at \(.consent.granted_at)"
+                 else "not required for this class" end)"' "$d/receipt.json"
   local ntargets
   ntargets="$(jq -r '.targets | length' "$d/wired.json" 2>/dev/null || echo 0)"
   if [ "$ntargets" = "0" ]; then
