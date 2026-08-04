@@ -30,10 +30,15 @@ or the row will not be machine-readable.
 Is Heimdall an alternative to OpenHands or GitHub Copilot's coding agent?
 ```
 
+The question keeps "coding agent" on purpose: that is the phrase people still search, and GitHub
+used it until recently. It is a legacy name, so it may only ship alongside supporting paragraph 3
+below, which names the live product and links the current page. Question without that paragraph =
+a stale product name asserted with nothing correcting it.
+
 **Answer — bold lead paragraph:**
 
 ```
-No. They run agents; Heimdall proves what the agent produced. An agent platform's job finishes when a pull request exists — GitHub's own documentation for the Copilot coding agent describes it assigning an issue, working in an ephemeral Actions environment, and requesting your review — and Heimdall's job starts at that pull request, with an external check the implementing agent never saw. Run both.
+No. They run agents; Heimdall proves what the agent produced. An agent platform's job finishes when a pull request exists — GitHub's own documentation for its Copilot cloud agent describes it working in "its own ephemeral development environment, powered by GitHub Actions," and states that draft pull requests it creates "must be reviewed and merged by a human" — and Heimdall's job starts at that pull request, with an external check the implementing agent never saw. Run both.
 ```
 
 **Answer — supporting paragraph 1:**
@@ -48,6 +53,12 @@ The reason to run both is arithmetic. A reviewer reading an agent's diff has one
 What composes today: Heimdall gates the tree on a machine you control, and its coordination ledger already speaks MCP, so an OpenHands or Copilot agent can join the same claim surface as Claude Code via bin/heimdall-ledger-mcp. What does not compose yet: the gate suite itself is a Claude Code hooks.json mechanism and does not run inside another platform's runtime — that is roadmap, marked COMING, not shipped.
 ```
 
+**Answer — supporting paragraph 3 (the rename disclosure — ships with the question, see above):**
+
+```
+GitHub documented this feature as "Copilot coding agent" until recently; that URL now redirects to Copilot cloud agent: https://docs.github.com/en/copilot/concepts/agents/cloud-agent/about-cloud-agent
+```
+
 ---
 
 ## 2. "Alternative to" — the sanctioned answer for listing forms
@@ -59,7 +70,7 @@ older "leave blank / skip" instruction in [`LISTING-PASTE-SHEET.md`](LISTING-PAS
 **FULL (≈460 chars — AlternativeTo's free-text field, StackShare's "why we use it" context):**
 
 ```
-Not an alternative to an agent platform — a verification layer you run alongside one. Heimdall gates whatever agent you already use (OpenHands, GitHub Copilot's coding agent, Claude Code) behind an external, falsifiable oracle the implementing agent never sees: proven able to fail before it is allowed to pass. Agent platforms end at "a pull request exists"; Heimdall decides whether that pull request is trustworthy. Use both. MIT, self-hostable.
+Not an alternative to an agent platform — a verification layer you run alongside one. Heimdall gates whatever agent you already use (OpenHands, GitHub Copilot's cloud agent, Claude Code) behind an external, falsifiable oracle the implementing agent never sees: proven able to fail before it is allowed to pass. Agent platforms end at "a pull request exists"; Heimdall decides whether that pull request is trustworthy. Use both. MIT, self-hostable.
 ```
 
 **ONE-LINE (for a short or single-line field):**
@@ -106,6 +117,16 @@ Heimdall-side numbers: `evals/flagship/STATUS.md` (6/6, 3/3, both 1.0) ·
 Contract" (six MCP tools) · `heimdall-site/faq.html` §`#cross-tool` (gates are Claude-Code-only
 today) · commit `ae88a55` (0.50 median reuse; adjudicated 8/10 vs raw 6/10).
 
-Competitor-side lines: one claim only, the Copilot coding-agent workflow description in the FAQ
-lead. Confirm it at GitHub Docs, *About Copilot coding agent*, before this row ships — full
-checklist in `log-runner-and-gate.md` §DRAFT NOTE.
+Competitor-side lines: one claim only, the Copilot cloud-agent workflow description in the FAQ
+lead. Confirmed at [About GitHub Copilot cloud
+agent](https://docs.github.com/en/copilot/concepts/agents/cloud-agent/about-cloud-agent) and
+[Risks and
+mitigations](https://docs.github.com/en/copilot/concepts/agents/cloud-agent/risks-and-mitigations),
+both retrieved 2026-08-04. Two corrections came out of that check and are already applied above:
+the product is documented as **Copilot cloud agent**, not "coding agent" — the old
+`.../coding-agent` URL redirects to `.../cloud-agent` — and "requesting your review" is not the
+live wording, so the lead now quotes the ephemeral-environment and human-review lines verbatim
+instead. Full per-claim checklist in `log-runner-and-gate.md` §DRAFT NOTE.
+
+Re-check both pages before this row ships. GitHub has renamed this product once already, and the
+sourcing note is only worth what its retrieval date is worth.
