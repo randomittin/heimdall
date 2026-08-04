@@ -6,15 +6,17 @@
 >
 > **Hard rule, same as [`log-runner-and-gate.md`](log-runner-and-gate.md):** every sentence in the
 > submitted text that describes Headroom must be confirmed against Headroom's own live
-> documentation first. The drafting environment had no network access. A claim that cannot be
-> confirmed at the cited page gets cut, not softened.
+> documentation first. The drafting environment had no network access; the §6 rows were resolved
+> later against live sources and the evidence is logged in §8. A claim that cannot be confirmed at
+> the cited page gets cut, not softened — rows 4 and 5 are still open and constrain what may be
+> said.
 
 ---
 
 ## 1. The line
 
 ```
-Heimdall — verification gates for the output side: Headroom shrinks what the agent reads, Heimdall proves what it ships.
+Heimdall — verification gates for the output side: Headroom compresses what the agent reads, Heimdall proves what it ships.
 ```
 
 That is the entry. Everything below exists so the line can be pasted without rereading anything.
@@ -36,7 +38,7 @@ Companion listing: Heimdall (verification gates for agent output)
 **Body:**
 
 ```
-Heimdall — verification gates for the output side: Headroom shrinks what the agent reads, Heimdall proves what it ships.
+Heimdall — verification gates for the output side: Headroom compresses what the agent reads, Heimdall proves what it ships.
 
 That is the proposed line. Context, so the decision takes a minute:
 
@@ -110,21 +112,35 @@ It says "put it wherever it fits" for exactly that reason: a sentence naming the
 structure is a factual claim that goes stale the next time they reorganise, and a wrong one turns
 a courteous ask into a correction they have to make.
 
-Before opening the issue, read their README top to bottom and confirm:
+Resolved from their README on 2026-08-04 (§8). Re-read it before opening the issue anyway — the
+answers below are a snapshot, and the point of §4 is that this structure moves.
 
-1. Which section actually collects companion or adjacent tooling, and what it is called today.
-2. The exact bullet format used by the entries already in it — leading link, bolded name, trailing
-   period, badge row or none. Match it byte for byte if they ask for a PR.
-3. Whether they have a contributing or listing policy that governs additions to that section. If
-   there is a stated policy, follow it instead of this file.
+1. **There is no general companion-tooling section.** Their README curates adjacent tools in two
+   places, and neither is an open list: (a) the **Stack & integrations** blockquote at the end of
+   `## Compared to`, which is maintainer-authored prose naming *their* recommended companion
+   (Serena, installed by default on `headroom wrap`, plus Ponytail); (b) `### Community projects`
+   under `## Community`, which held exactly one entry — a Claude Code plugin that surfaces
+   Headroom's own token savings in a status line.
+2. Bullet format in `### Community projects` is `- **[Name](url)** — lowercase description.` with
+   an em dash and a trailing period. Match it byte for byte if they ask for a PR.
+3. `CONTRIBUTING.md` has **no listing policy** — no row covers "add my project to the README". Its
+   routing table sends bugs to a PR, anything architectural to "an issue or ask in Discord first",
+   and questions to Discord `#help`. It also caps open PRs at 10 per author. Opening an issue, as
+   §2 says, is the route their own table endorses for a non-bug ask.
+
+**The consequence for §2:** the only entry currently in `### Community projects` is a project built
+*on* Headroom. Heimdall is not. Do not assert that section — or any section — is the right home.
+Let "put it wherever it fits" carry it, which is what the submitted body already does.
 
 ---
 
 ## 5. Guard list — what must never appear on this surface
 
 - Never characterise Headroom as missing, lacking, or not solving anything. The entry describes
-  what each tool does. "Headroom shrinks what the agent reads" is a description of its function,
-  and it must match their own wording for that function or be replaced with their wording.
+  what each tool does. "Headroom compresses what the agent reads" is a description of its
+  function, and it matches their own wording for it — README, `## What it does` preamble:
+  "Headroom compresses everything your AI agent reads". Verified 2026-08-04 (§8, row 1). If they
+  reword their headline, this clause follows theirs.
 - Never "alternative to". Heimdall is not a substitute for a compression proxy, and there is no
   in-repo benchmark against any named product (`SUBMISSIONS.md` §6).
 - Never a bare privacy absolute. The scoped S1–S6 set in `README.md` §"Your code stays yours" is
@@ -149,11 +165,11 @@ row that cannot be confirmed is cut from the submitted text rather than reworded
 
 | # | Claim, and where it appears | Must be confirmed at | Status |
 |---|---|---|---|
-| 1 | "Headroom shrinks what the agent reads" — the core comparative clause in the entry line | `https://github.com/headroomlabs-ai/headroom` — README, the project's own one-line self-description. Replace our verb with theirs if they differ. | **UNVERIFIED — confirm wording** |
-| 2 | Headroom is a local-first context-compression proxy | Same README, opening section. If "local-first" is not their word, drop it — it is doing work in the §3 reply about both tools running on your machine. | **UNVERIFIED — confirm** |
-| 3 | The repo slug is `headroomlabs-ai/headroom` and the licence is Apache-2.0 | The repo page and its `LICENSE` file. The slug is pasted into the submission target; a wrong slug files the issue on a stranger's repo. | **UNVERIFIED — confirm both** |
-| 4 | Headroom curates companion tools in a README section, and that section is the right home for this entry | Their README. See §4 — resolve the section name and bullet format there, and keep the claim out of the submitted body regardless. | **UNVERIFIED — resolve before opening** |
-| 5 | Community channel exists and is the right place for the follow-up in §3 | The community/Discord link **in their README**. Do not guess or reconstruct an invite URL; resolve it from the README and use that. Confirm the channel's rules on tool links before posting anything. | **UNVERIFIED — resolve the real link** |
+| 1 | "Headroom compresses what the agent reads" — the core comparative clause in the entry line | `https://github.com/headroomlabs-ai/headroom` — README, the project's own one-line self-description. Replace our verb with theirs if they differ. | **CONFIRMED 2026-08-04 — verb corrected** (§8) |
+| 2 | Headroom is a local-first context-compression proxy | Same README, opening section. If "local-first" is not their word, drop it — it is doing work in the §3 reply about both tools running on your machine. | **CONFIRMED 2026-08-04 — "local-first" is their word, verbatim** (§8) |
+| 3 | The repo slug is `headroomlabs-ai/headroom` and the licence is Apache-2.0 | The repo page and its `LICENSE` file. The slug is pasted into the submission target; a wrong slug files the issue on a stranger's repo. | **CONFIRMED 2026-08-04 — both** (§8) |
+| 4 | Headroom curates companion tools in a README section, and that section is the right home for this entry | Their README. See §4 — resolve the section name and bullet format there, and keep the claim out of the submitted body regardless. | **SPLIT 2026-08-04 — first half confirmed, second half still UNVERIFIED and evidence runs against it.** A curated surface exists (`### Community projects`; plus the Stack & integrations blockquote), but it is not a general companion list and its only entry is a project built *on* Headroom. "Right home" is the maintainers' call, not ours. Claim neither in the submitted body. (§4, §8) |
+| 5 | Community channel exists and is the right place for the follow-up in §3 | The community/Discord link **in their README**. Do not guess or reconstruct an invite URL; resolve it from the README and use that. Confirm the channel's rules on tool links before posting anything. | **LINK RESOLVED 2026-08-04 — `https://discord.gg/yRmaUNpsPJ`, taken from their README, invite live, server "Headroom". Rules on tool links remain UNVERIFIED** — they are not published anywhere fetchable and were not read. Do not post the §3 A/B reply to Discord until someone has joined and read the rules. (§8) |
 | 6 | Star count, if it is ever cited anywhere | The repo page. It moves daily. Preference: never cite it. It is not an argument. | **DO NOT CITE** |
 
 ---
@@ -174,3 +190,28 @@ S1 verbatim, "Gates run 100% locally. Your code never leaves your machine." → 
 0.50 median reuse across 8 cold repos; adjudicated 8/10 vs raw machine count 6/10 → commit
 `ae88a55`, `docs/archive/docs/superpowers/specs/heimdall-S6-C3-findings.md` §THE FINDING ·
 MIT licence → `LICENSE`.
+
+---
+
+## 8. Headroom-side sourcing — external, fetched 2026-08-04
+
+Primary sources only: their repo, their `LICENSE`, their `CONTRIBUTING.md`, the PyPI JSON index for
+`headroom-ai`, and the Discord invite in their README. No blog, no summary, no recollection.
+
+| # | Resolved value | Source URL | Fetched |
+|---|---|---|---|
+| 1 | Their headline is **"The context compression layer for AI agents"**; the preamble is **"Headroom compresses everything your AI agent reads — tool outputs, logs, RAG chunks, files, and conversation history — before it reaches the LLM."** Verb is *compresses*. Ours was *shrinks* → changed. (Their README does use "shrinks" once — "Everything above shrinks the prompt you **send**" — so the original was not false, but the headline verb is theirs to set.) | `https://raw.githubusercontent.com/headroomlabs-ai/headroom/main/README.md` | 2026-08-04 |
+| 2 | **"local-first" is theirs, verbatim**, in the README subtitle: "library · proxy · MCP · content-aware compressors · local-first · reversible", and again under `## Headroom for teams`: "free, local-first, your data never leaves your machine". **"proxy" is theirs too**: "Headroom is the **proxy** — that's what we build and offer." Note it is one of several modes (library · proxy · agent wrap · MCP), so "a proxy" under-describes it; the phrase stands, the §3 reply must not imply proxy is the only mode. | Same README (subtitle; `## What it does`; `## Compared to` → Stack & integrations) | 2026-08-04 |
+| 3 | **Slug `headroomlabs-ai/headroom` is canonical.** The older `chopratejas/headroom` 301-redirects to it (verified by following redirects; both raw READMEs are byte-identical). **Licence Apache-2.0**, confirmed three ways: the repo `LICENSE` file is the Apache License 2.0 text; the README badge; and PyPI `license_expression: "Apache-2.0"`. | `https://github.com/headroomlabs-ai/headroom` · `https://raw.githubusercontent.com/headroomlabs-ai/headroom/main/LICENSE` · `https://pypi.org/pypi/headroom-ai/json` | 2026-08-04 |
+| 4 | `### Community projects` exists under `## Community` — one entry, format `- **[Name](url)** — description.` The other companion surface is the **Stack & integrations** blockquote closing `## Compared to`. `CONTRIBUTING.md` states no listing policy; its routing table sends non-bug asks to an issue or Discord. See §4. **"Right home" was not confirmed and is not claimable.** | Same README (`## Community`, `## Compared to`) · `https://raw.githubusercontent.com/headroomlabs-ai/headroom/main/CONTRIBUTING.md` | 2026-08-04 |
+| 5 | Discord invite **`https://discord.gg/yRmaUNpsPJ`**, read from the README (nav row and `## Community`), not reconstructed. Invite resolves live to the server named **"Headroom"**. `CONTRIBUTING.md` names `#help` for questions. **Rules on tool links were not read** — see §6 row 5. | Same README · invite resolved at `https://discord.com/api/v10/invites/yRmaUNpsPJ` | 2026-08-04 |
+| 6 | Star count — **not fetched, not resolved, not cited.** Deliberately excluded: it decays. | — | — |
+
+**Pin cross-check (reported, not edited — `modules/**` is another agent's surface).** The pin in
+`modules/headroom/manifest.json`, `headroom-ai[all]==0.33.0` with sdist digest
+`97d817e5…deeb5a`, is **correct**. PyPI records `0.33.0` as the current version, `yanked: false`,
+and the sdist `headroom_ai-0.33.0.tar.gz` digest is
+`97d817e5923903d72bed24f75e0424e9cb7f86b3ddde0fc1acec4f3f85deeb5a` — an exact match. The `all`
+extra exists in the package's `provides_extra`. The manifest's `upstream_note` about PyPI still
+recording the pre-rename `chopratejas/headroom` path is also accurate, and the redirect is
+confirmed above. No manifest change is needed or was made.
