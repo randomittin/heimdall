@@ -2181,6 +2181,22 @@ case "${1:-}" in
     fi
     exec "$WATCH_BIN" "$@"
     ;;
+  rules)
+    # Pass-through to heimdall-rules: cluster the corpus DENIES by shared root
+    # pattern and STAGE candidate rules for human review (SCHEMA.md §4, "3+ cases
+    # sharing a root pattern graduate into a convention / stack-pack rule"). It
+    # proposes; it never promotes. This is the DOCUMENTED entry point, so the arm
+    # must forward every flag verbatim (--corpus/--out/--period/--min-support/--json)
+    # — a routed run and a direct bin run must produce byte-identical candidates.
+    shift
+    RULES_BIN="$PLUGIN_DIR/bin/heimdall-rules"
+    if [ ! -x "$RULES_BIN" ]; then
+      echo "  Error: heimdall-rules not found at $RULES_BIN" >&2
+      echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+      exit 1
+    fi
+    exec "$RULES_BIN" "$@"
+    ;;
 esac
 
 # ── Command handlers ──
