@@ -360,10 +360,16 @@ esac
 
 # E — the label must MEAN something.
 HUMAN_VIS="$(rget '.human_visible')"
+# ANTI-VACUOUS. "carries no banner" is trivially true of an empty render, so the
+# human rows must be ON the page for their lack of a banner to mean anything —
+# the D4 guard, applied to the negative case.
 case "$HUMAN_VIS" in
   *"Demo wall"*|*"not teammates"*)
     bad "E1 a REAL-looking roster was labelled a demo — the label is unconditional and meaningless" ;;
-  *) ok "E1 a real-looking roster renders with NO demo banner — the label discriminates" ;;
+  *"haid:rj.mbp-7f3a"*)
+    ok "E1 a real-looking roster renders with NO demo banner — the label discriminates" ;;
+  *)
+    bad "E1 the real-looking roster did not render at all — the 'no banner' check would be vacuous. visible text: ${HUMAN_VIS:0:200}" ;;
 esac
 [ "$(rget '.is_demo_human')" = "false" ] \
   && ok "E2 isDemoRoster() returns false for an all-human roster (no false positive)" \
@@ -383,18 +389,27 @@ esac
 FALLBACK_SRC="$(rget '.fallback_html' | sed -n 's/.*src="\([^"]*\)".*/\1/p')"
 EMPTY_HTML="$(rget '.empty_html')"
 ERROR_HTML="$(rget '.error_html')"
-case "$EMPTY_HTML" in
-  *"$FALLBACK_SRC"*) ok "G1 an EMPTY roster degrades to the static fallback, not a blank wall" ;;
-  *) bad "G1 the empty-roster state does not render the fallback image" ;;
-esac
-case "$ERROR_HTML" in
-  *"$FALLBACK_SRC"*) ok "G2 an UNREACHABLE control plane degrades to the static fallback" ;;
-  *) bad "G2 the unreachable state does not render the fallback image" ;;
-esac
-if [ -n "$FALLBACK_SRC" ] && [ -f "$SITE_DIR/$FALLBACK_SRC" ]; then
-  ok "G3 the fallback the embed points at ($FALLBACK_SRC) exists in the site repo"
+# ANTI-VACUOUS. An empty $FALLBACK_SRC collapses the two patterns below to *""*,
+# which matches every string — including the empty render of an embed that failed
+# to load. Both degrade checks would then pass having compared nothing at all.
+if [ -z "$FALLBACK_SRC" ]; then
+  bad "G1 fallbackHTML() names no image src — the empty-roster degrade cannot be verified"
+  bad "G2 fallbackHTML() names no image src — the unreachable degrade cannot be verified"
+  bad "G3 the embed points at no file at all"
 else
-  bad "G3 the embed points at '$FALLBACK_SRC', which is not a file in the site repo"
+  case "$EMPTY_HTML" in
+    *"$FALLBACK_SRC"*) ok "G1 an EMPTY roster degrades to the static fallback, not a blank wall" ;;
+    *) bad "G1 the empty-roster state does not render the fallback image" ;;
+  esac
+  case "$ERROR_HTML" in
+    *"$FALLBACK_SRC"*) ok "G2 an UNREACHABLE control plane degrades to the static fallback" ;;
+    *) bad "G2 the unreachable state does not render the fallback image" ;;
+  esac
+  if [ -f "$SITE_DIR/$FALLBACK_SRC" ]; then
+    ok "G3 the fallback the embed points at ($FALLBACK_SRC) exists in the site repo"
+  else
+    bad "G3 the embed points at '$FALLBACK_SRC', which is not a file in the site repo"
+  fi
 fi
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -403,11 +418,27 @@ fi
 echo
 echo "H. the fallback asset is declared fixture, honest, and identical across repos"
 
-if [ -f "$ASSET" ] && [ -f "$SITE_DIR/$FALLBACK_SRC" ] \
-   && [ "$(shasum -a 256 "$ASSET" | awk '{print $1}')" = "$(shasum -a 256 "$SITE_DIR/$FALLBACK_SRC" | awk '{print $1}')" ]; then
-  ok "H1 the served copy is byte-identical to the provenance-declared copy (no drift)"
+# Each failure mode reports its OWN cause. Collapsing "declared copy missing",
+# "embed names nothing", "served copy missing" and "the bytes differ" into a single
+# `differ` verdict makes this gate cry drift that never happened — which is exactly
+# what it did while the two files were in fact byte-identical. An assertion has to
+# say the true thing when it fails, or it sends the next reader to fix the wrong bug.
+ASSET_SUM=""; SERVED_SUM=""; SERVED=""
+[ -f "$ASSET" ] && ASSET_SUM="$(shasum -a 256 "$ASSET" | awk '{print $1}')"
+if [ -n "$FALLBACK_SRC" ]; then
+  SERVED="$SITE_DIR/$FALLBACK_SRC"
+  [ -f "$SERVED" ] && SERVED_SUM="$(shasum -a 256 "$SERVED" | awk '{print $1}')"
+fi
+if [ -z "$ASSET_SUM" ]; then
+  bad "H1 the provenance-declared copy does not exist: $ASSET"
+elif [ -z "$FALLBACK_SRC" ]; then
+  bad "H1 the embed names no fallback image, so there is nothing to compare against $ASSET"
+elif [ -z "$SERVED_SUM" ]; then
+  bad "H1 the embed points at '$FALLBACK_SRC', which the site repo does not serve ($SERVED)"
+elif [ "$ASSET_SUM" != "$SERVED_SUM" ]; then
+  bad "H1 served '$FALLBACK_SRC' ($SERVED_SUM) != declared $(basename "$ASSET") ($ASSET_SUM) — provenance does not describe what ships"
 else
-  bad "H1 the site copy and launch-docs/assets/wall-fallback.gif differ — provenance does not describe what ships"
+  ok "H1 the served copy is byte-identical to the provenance-declared copy (${ASSET_SUM:0:12}…)"
 fi
 
 ASSET_PROV="$($JQ -r --arg f "$(basename "$ASSET")" \
