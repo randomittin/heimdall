@@ -7,7 +7,11 @@
 # A verification tool whose installer is itself verifiable:
 #   - function-wrapped (last line is `main "$@"`) — a dropped curl|bash never
 #     executes a half-downloaded script
-#   - no stdin reads, no interactive prompts (stdin IS the script under a pipe)
+#   - no stdin reads and no prompts ON THE PIPED PATH (stdin IS the script under a
+#     pipe). The one interactive prompt in this script — the optional team
+#     control-plane URL — is gated on `[ -t 0 ]`, so it cannot fire under
+#     `curl | bash` or in CI. A TTY operator who wants to set it is offered it;
+#     nobody is ever blocked on a read that a pipe cannot answer.
 #   - no sudo, no eval/base64/obfuscation
 #   - pinned to a release ref (HEIMDALL_REF) — what you read is what runs
 #   - idempotent: re-run upgrades cleanly, never errors "already exists"

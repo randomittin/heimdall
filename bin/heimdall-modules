@@ -227,11 +227,15 @@ deferred_file() { printf '%s/%s/deferred.json' "$MODSTATE" "$1"; }
 # the operator sets directly.
 #
 # There is deliberately NO third source. An earlier draft also read a home-level
-# file, but nothing in this repo writes one — `grep -rn HEIMDALL_NO_MODULES` over
-# install.sh and heimdall-autoupdate returns nothing. A reader for a file that is
-# never written is not a feature; it is a branch that can only ever report the
-# default, which reads as a working opt-out that silently is not one. When the
-# install side grows a writer, this is where its reader goes.
+# file, but nothing in this repo WRITES one. Note the evidence is NOT that nobody
+# mentions the signal: bin/heimdall-autoupdate READS both HEIMDALL_NO_MODULES and
+# $HEIMDALL_HOME/modules-optout on its own acquisition path, so a grep for either
+# name does return hits. The point is that no WRITER exists anywhere — install.sh
+# does not create modules-optout, `hmd modules` does not create it, and the
+# updater does not create it either, as that updater's own header states. A reader
+# for a file that is never written is not a feature; it is a branch that can only
+# ever report the default, which reads as a working opt-out that silently is not
+# one. When the install side grows a writer, this is where its reader goes.
 is_opted_out() {
   local name="$1"
   [ -f "$(optout_file "$name")" ] && return 0

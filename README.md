@@ -192,6 +192,87 @@ Scaffolds a real full-stack task, builds it, ends with a summary card and a foll
 | Debloat scanner | `heimdall-debloat --report-only` | Shipped |
 | Parallel workers | `hmd --team N "task"` (N tmux panes, independent — no shared state) | Shipped (no coordination layer) |
 | Benchmark suite | `heimdall-bench` | Shipped |
+| Optional capability modules | `hmd modules` | Shipped |
+
+---
+
+## Modules
+
+Optional capability modules. **The base install ships the module system and zero module payloads** — [`modules/`](modules/) holds manifests and class contracts, never vendored code. The registry *is this repo*, so every pin is a reviewed commit rather than a network lookup, and there is no code path that resolves "latest". **Nothing self-installs.**
+
+```bash
+hmd modules                    # list — honest when nothing is installed
+hmd modules add <name>         # the full ordered pipeline
+hmd modules remove <name>      # total removal
+hmd modules update [<name>]    # move to the manifest's human-set pin
+hmd modules status <name>      # one module in detail
+hmd modules verify [<name>]    # re-run class invariants (the CI entry point)
+hmd modules preflight <name>   # can this install happen? read-only, asks nothing
+hmd modules repair <name>      # retry an install, recording which stage failed
+hmd modules defer <name>       # not now — hmd is ready, the module follows later
+hmd modules pending            # what is deferred or awaiting a retry
+hmd modules optout <name>      # decline; no install path may re-install it
+hmd modules optin <name>       # undo an optout
+```
+
+Every verb accepts `--json`; `add` accepts `--yes`. `--registry` and `--state` relocate the registry and install state, which is how the suite runs hermetically.
+
+### Four permission classes
+
+A module declares its class — or several — in its manifest, and a missing or unknown class is **refused, not defaulted**: the class decides consent and which invariants are enforced, so picking one silently would be picking a security posture on the operator's behalf. When a module declares several, **the union of their invariants runs, never the first match.**
+
+| Class | Consent | Invariants enforced |
+|---|---|---|
+| `traffic-proxy` | **required** | gates read raw · non-interactive passthrough · signed and control-plane traffic never routed through it |
+| `tool-adapter` | **required** | wrap/unwrap byte-identical · hooksPath and AGENTS.md fences preserved |
+| `storage-codec` | not required | round-trip fidelity · plain fallback when absent · never touches judgment inputs |
+| `rule-pack` | not required | rules ship falsifiers · attribution preserved |
+
+The two classes that mutate something you own — the wire, and your own config files — ask. The two that are transparent by contract do not, and their invariants are what make that transparency true rather than asserted: a codec that loses a byte, or a pack that flattens attribution, is rolled back rather than merely disclosed.
+
+### The lifecycle order is the contract
+
+```
+[1/7] validate → [2/7] class contract → [3/7] preflight → [4/7] consent
+    → [5/7] install + digest-verify → [6/7] wire → [7/7] class invariants (module active)
+```
+
+Steps 1–4 are read-only, so anything rejected at validate, class, preflight or consent mutates nothing at all. **Preflight sits before consent on purpose** — nobody should be asked to agree to an install that cannot happen. Step 5 is the first mutation, and from there every failure unwinds through **the same removal path `remove` uses**, so a module that fails its own class test leaves a byte-identical tree. Wiring precedes invariants deliberately: the contracts assert behaviour *with the module active*, so a check run against an unwired module would prove nothing.
+
+### Consent leaves a receipt
+
+An install that required consent records how it was granted — `granted_via` is one of `interactive`, `--yes`, or `manifest-waiver` — alongside the exact `consent_text` shown and its `consent_text_sha256`. Consent required with a non-TTY stdin is **refused, not prompted and not defaulted to yes**; `--yes` is the operator saying so on purpose.
+
+A module in the default set reaches machines the author will never meet, so `default_included: true` is refused at **validate** time if any class it claims requires consent and the manifest ships no `consent_text`. A disclosure that only materialises at a prompt somebody may never be shown is not a disclosure.
+
+### Opting out
+
+Two surfaces read opt-out signals, and **they do not overlap** — each verb honours the signals of the surface it belongs to:
+
+| Signal | Read by | Effect |
+|---|---|---|
+| `HEIMDALL_NO_MODULES=1` | `bin/heimdall-autoupdate` | no module is acquired automatically, at all |
+| `~/.heimdall/modules-optout` | `bin/heimdall-autoupdate` | one module name per line; `#` starts a comment |
+| `hmd modules optout <name>` | `bin/heimdall-modules` | persisted; `repair`, `defer` and `pending` all refuse to act |
+| `HMD_MODULE_OPTOUT=a,b` | `bin/heimdall-modules` | the same, for one invocation |
+
+**`install.sh` acquires no modules at all** — the installer has no module code path, so there is no installer flag to suppress and none is offered. Automatic acquisition lives in the background updater, which is why `HEIMDALL_NO_MODULES=1` bites there. The consequence, stated plainly: every one of these signals governs acquisition that happens **on your behalf**. `HEIMDALL_NO_MODULES=1` suppresses automatic acquisition and does **not** block an explicit `hmd modules add <name>` — an operator typing the command themselves is not what an opt-out for unattended installs is trying to stop.
+
+### Headroom — the one shipped module, and its honest limits
+
+[`modules/headroom/manifest.json`](modules/headroom/manifest.json) pins [Headroom](https://github.com/headroomlabs-ai/headroom) (Apache-2.0), a local context-compression proxy. **Depend, don't clone** — none of its source is vendored here. The manifest is the single source of truth for the pin and its artifact digest; this page deliberately does not restate the version, because a second hand-maintained copy of a pin is how pins drift.
+
+It is `default_included`, and its consent *question* is waived on the module itself. `modules/_classes/traffic-proxy.json` still reads `consent_required: true`, so every other traffic-proxy module hmd ever ships still asks; the waiver's blast radius is this one module. Waived is the question, never the disclosure — the consent text still prints, both declared classes still run their invariants with the module active, and `hmd modules remove headroom` still returns the tree byte-identically.
+
+Being in the default set is a **distribution** fact, not a claim that it helps, and not an unattended install:
+
+- **The background updater will not install it for you.** Acquisition reads the *class* contract, and `traffic-proxy` requires consent — so `heimdall-autoupdate` names the module, states the class, and hands you `hmd modules add headroom` rather than acquiring it. Until you run that command, `heimdall-autoupdate status` reports it `absent` with the reason and `hmd modules status headroom` reports `NOT ATTEMPTED`.
+- **It is the one place hmd stops being near-stdlib.** The fetch is `uv tool install --python 3.13 "headroom-ai[all]==<pin>"`, which pulls an ML stack — Rust wheels, an ONNX runtime, HuggingFace tokenizers. Install size and time are materially larger than hmd's own.
+- **A failed Headroom install does not fail `hmd install`.** hmd works; the module reports ABSENT with the blocker and the remedy named, and rolls back through the removal path. It is never silently assumed present.
+- **The storage-codec half does not engage via the documented install.** `uv tool install` lands the package in an isolated per-tool venv that hmd's `python3` cannot import, so the memory codec stays on its `plain` backend on every machine that installs it the sanctioned way. The manifest records that as a measurement rather than letting a green `add` imply otherwise. Treat compression on the storage seam as a contract the seam honours *if* a backend ever arrives — not as a description of any running machine.
+- **Gates read raw.** Generation traffic may traverse the proxy; judgment traffic may not. Every verdict-producing execution runs through `hmd_gate_exec`, which unsets `ANTHROPIC_BASE_URL`, the HTTP/HTTPS/ALL/NO_PROXY pairs and Headroom's own `HEADROOM_*` namespace before pinning the endpoint to the real provider. A judge reading compressed context emits confident false greens, which is the failure this whole project exists to prevent.
+
+Full manifest schema, class-contract details and the lifecycle rationale: [`modules/README.md`](modules/README.md).
 
 ---
 
@@ -286,3 +367,7 @@ throttled (~24h), detached (never block the session), idempotent, and opt-out:
   `autoUpdates:true`, and re-runs `claude update`. Never touches an npm/brew-managed install,
   never uninstalls anything else, never touches credentials. Off: `HEIMDALL_NO_SELFHEAL=1`
   or `~/.heimdall/no-selfheal`. Inspect: `heimdall-cc-selfheal status`.
+- **Default module reconciliation** (same updater): compares the installed [modules](#modules)
+  against the default set. A module whose class requires consent is **never** acquired here —
+  it is named, with the `hmd modules add` command to run. Off: `HEIMDALL_NO_MODULES=1` or
+  `~/.heimdall/modules-optout`. Inspect: `heimdall-autoupdate status`.
