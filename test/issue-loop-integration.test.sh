@@ -22,7 +22,10 @@
 #       back via connector.post_resolution.
 #   (5) PLUGGABILITY: a 4th dummy adapter slots in via the connector registry with
 #       ZERO edits to the loop (git diff empty for issue_loop.py / issue_queue.py).
-#   (6) CLEAN INSTALL: NO connectors configured -> loop inert; stranger-test green.
+#   (6) CLEAN INSTALL: NO connectors configured -> loop inert. The base-install half
+#       (the nested install-stranger suite, ~428s) is gated behind HEIMDALL_TEST_SLOW=1;
+#       that suite runs on the board in its own right, so this is de-duplication, not a
+#       coverage cut. See the note at the check itself.
 #   (7) SECURITY: a planted gitleaks-shaped credential is caught by the gate
 #       (bin/secret-scan exit 1 on plant, exit 0 clean) — in a THROWAWAY repo so
 #       the real tree stays clean.
@@ -419,7 +422,27 @@ if [ "$INERT_RC" -eq 0 ] && printf '%s' "$INERT_OUT" | jq -e '.state == "IDLE" a
 else
   bad "clean-install: the loop was not inert with no connectors configured (rc=$INERT_RC)"
 fi
-if [ -x "$STRANGER" ]; then
+# The base-install half of this claim is a WHOLE nested suite. install-stranger drives
+# FIVE real installs and measures 428s solo, so this one call was 412s of this suite's
+# 442s wall clock — which is exactly what pushed it past its 420s budget and reported it
+# as a TIMEOUT: an absence of verdict, on a suite that actually passes 26/26.
+#
+# It is also pure duplication. Since install-stranger was renamed to *.test.sh it is
+# discovered by test/run-all.sh's glob and already runs on the board WITH ITS OWN
+# VERDICT, so nesting it buys no signal the board lacks — it only pays for it a second
+# time and couples THIS suite's budget to another suite's growth. That coupling is not
+# hypothetical: install-stranger doubled (29 -> 58 assertions) and took this suite red
+# with it, without a line of issue-loop code changing.
+#
+# Gated behind HEIMDALL_TEST_SLOW=1 — the same gate test/telemetry-install.test.sh:429
+# already uses for this same nested suite. Skipping is LOUD (never silent), and names
+# where the coverage actually lives so it can be traced rather than assumed.
+if [ "${HEIMDALL_TEST_SLOW:-0}" != "1" ]; then
+  echo "  [SKIP] HEIMDALL_TEST_SLOW not set — nested stranger test omitted (~428s)"
+  echo "         coverage is NOT lost: test/install-stranger.test.sh runs on the"
+  echo "         board in its own right, with its own verdict"
+  echo "         Run with HEIMDALL_TEST_SLOW=1 to also nest it here"
+elif [ -x "$STRANGER" ]; then
   if "$STRANGER" >"$WORK/stranger.out" 2>&1; then
     ok "clean-install: the stranger-test (base install) stays green (exit 0)"
   else

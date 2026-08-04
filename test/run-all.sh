@@ -125,21 +125,35 @@ suite_timeout() {
     # gitleaks history pass (~40s alone) PLUS a full tree-mode pass; both are I/O-bound
     # scans over the whole repo and contend hard when run alongside 5 other suites.
     selfscan.test.sh)                override=600 ;;
-    # measured 133s SOLO (21 passed, 2 failed) — it drives a real install (install-stranger)
-    # plus the full pick->orient->fix->GATE->attest->open_pr path against real seams.
-    issue-loop-integration.test.sh)  override=420 ;;
+    # issue-loop-integration.test.sh deliberately has NO override any more. It carried 420s
+    # only because its §6 ran the WHOLE install-stranger suite inline; measured 2026-08-04,
+    # that ONE nested call was 412s of its 442s wall clock and is what pushed it past 420s
+    # into a TIMEOUT — while the suite itself passes 26/26. The nested run is now gated
+    # behind HEIMDALL_TEST_SLOW=1 (the gate test/telemetry-install.test.sh:429 already used
+    # for the same nested suite), so its own work measures 28s SOLO and the tight default is
+    # the correct budget. Do NOT re-add an override to "fix" a timeout here: with 28s of work
+    # under a 180s default, a timeout means something genuinely hung.
     # measured 56s solo / 102s under --jobs 6 — the closest suite to the old 120s cliff.
     heimdall-context-capsule.test.sh) override=300 ;;
-    # measured 93s SOLO (28 passed, 0 failed). It drives SIX real installs — a full
-    # git clone of this repo plus install.sh runs for: the primary stranger HOME, the
-    # idempotency re-run, a fresh first-run-ordering HOME, and three graceful-degrade
-    # variants — then a real uninstall + a re-uninstall. Clone/IO-bound, so it contends
-    # hard with the other IO-heavy suites (selfscan's gitleaks tree pass). At the
-    # measured ~1.8x parallel factor that is ~167s, only 13s under the 180s default:
-    # a cliff, and this suite only became glob-visible when it was renamed to
-    # .test.sh, so it has never yet been budgeted. 3x solo matches the tier the other
-    # IO-heavy suites sit in (selfscan 203->600 = 2.96x, issue-loop 133->420 = 3.16x).
-    install-stranger.test.sh)        override=300 ;;
+    # measured 428s SOLO (57 passed, 0 failed) on an M-series mac, 2026-08-04.
+    # It drives FIVE real installs — the primary stranger HOME, the idempotency re-run,
+    # a fresh first-run-ordering HOME, and the two graceful-degrade variants — then a
+    # real uninstall + re-uninstall and ~29 launchd/settings sandbox probes.
+    # WHERE THE TIME GOES, because "install" sounds cheap and is not: ONE install.sh run
+    # is ~77s — git clone 4s, marketplace register 7s, plugin install 8s, Ed25519 crypto
+    # backend 4s, claude-mem setup 21s, and the post-install validation gate ~23s (it
+    # boots Claude Code HEADLESS via --cc-verify and runs presence doctor). Five of those
+    # is ~385s of the 428s; every sandbox probe added since the last budget is only ~44s.
+    # So this is IO/network/subprocess-bound real work, not a hang: it exits 0.
+    #
+    # The previous note here read "measured 93s SOLO (28 passed, 0 failed)" and set 300s.
+    # That figure does not reproduce — the suite now reports 57 assertions and a SINGLE
+    # install costs more than a quarter of the old budget. 300s was therefore not a suite
+    # going slow, it was a stale budget converting a PASSING suite into a TIMEOUT, which
+    # is an absence of verdict and strictly worse than a red.
+    # 900s ~= 2.1x the measured solo, keeping the documented ~1.8x parallel-contention
+    # factor inside the budget, and sits in the same tier as selfscan (203->600 = 2.96x).
+    install-stranger.test.sh)        override=900 ;;
   esac
   [ "$override" -gt "$TIMEOUT" ] && { echo "$override"; return 0; }
   echo "$TIMEOUT"
