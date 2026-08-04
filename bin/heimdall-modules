@@ -713,7 +713,8 @@ obtain_consent() {
 STATE_MARKER=".hmd-created"
 
 remove_module() {
-  local name="$1" mdir="$STATE/$name"
+  local name="$1"
+  local mdir="$STATE/$name"
   [ -d "$mdir" ] || return 0
   rm -rf "$mdir" || { warn "error: could not remove $mdir"; return 1; }
 
@@ -924,7 +925,8 @@ acquire_upstream() {
 DIGEST_JSON="null"
 INSTALL_OUTCOME="ok"
 install_module() {
-  local name="$1" mf="$2" mdir="$STATE/$name"
+  local name="$1" mf="$2"
+  local mdir="$STATE/$name"
   INSTALL_OUTCOME="refused"
 
   if [ ! -d "$STATE" ]; then
@@ -1018,7 +1020,8 @@ install_module() {
 # by design: the class contracts assert behaviour "with the module active", so
 # the invariants must execute against a wired module or they prove nothing.
 wire_module() {
-  local name="$1" mf="$2" mdir="$STATE/$name"
+  local name="$1" mf="$2"
+  local mdir="$STATE/$name"
   jq --arg at "$(now_iso)" \
      '{wired_at:$at, targets:(.wires // []),
        note:"wiring precedes invariant verification so every invariant runs with the module active"}' \
