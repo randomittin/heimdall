@@ -238,8 +238,16 @@ def read_team(roster_raw, now):
             if isinstance(age, (int, float)) and not isinstance(age, bool):
                 ts = int(now - age)
         state = r.get("state") if isinstance(r.get("state"), str) else None
+        # The server's ONLINE flag, carried through VERBATIM. The roster now returns away
+        # teammates (heartbeat past the 45s TTL but inside the 7-day offline window) with
+        # online:false + state "offline" instead of dropping them, and the statusline greys
+        # those rather than erasing them. A row with no flag (an older CP) stays None, and
+        # hmd_ledger.filter_team falls back to its own heartbeat TTL — never a fabricated
+        # "online": inventing presence is worse than an empty wall.
+        online = r.get("online") if isinstance(r.get("online"), bool) else None
         team.append({
             "user": str(user),
+            "online": online,
             # the teammate's OWN HAID — so the statusline resolves THEIR sigil hero
             # (hero_for/pin), not a fixed hero recolored for everyone. honest-null when
             # the roster row carries no haid.
