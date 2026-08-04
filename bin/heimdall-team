@@ -98,6 +98,11 @@ if command -v readlink >/dev/null 2>&1; then
 fi
 BIN_DIR="$(cd "$(dirname "$SELF")" 2>/dev/null && pwd)"
 LIB_DIR="$BIN_DIR/lib"
+# The SIGNED-PATH scrub — /team/auto carries an Ed25519 key-POSSESSION assertion, so a local
+# REWRITING proxy in this path invalidates the proof of possession. hmd_signed_exec drops
+# the rewriters and keeps a corporate CONNECT proxy (it tunnels TLS and cannot rewrite).
+# shellcheck source=lib/hmd-gate-endpoint.sh
+. "$LIB_DIR/hmd-gate-endpoint.sh"
 INVITE_CLI="$BIN_DIR/heimdall-invite"
 IDENTITY_CLI="$BIN_DIR/heimdall-identity"
 HAID_CLI="$BIN_DIR/heimdall-haid"
@@ -597,7 +602,8 @@ gh_auto() { # $1 = loud|quiet
   # and is NEVER echoed. python prints 6 secret-free lines: status, ok, team_id, mode, project, reason.
   local RES
   RES="$(HMD_URL="$URL" HMD_REPO="$SLUG" HMD_GH_USER="$GH_USER" HMD_GH_PROOF="$GH_PROOF" \
-         HMD_HAID="$HAID" HMD_SEED_FILE="$SEED_FILE" HMD_LIB="$LIB_DIR" "$PY" - <<'PYEOF'
+         HMD_HAID="$HAID" HMD_SEED_FILE="$SEED_FILE" HMD_LIB="$LIB_DIR" \
+         hmd_signed_exec "$PY" - <<'PYEOF'
 import json, os, sys
 import secrets, time
 import urllib.error

@@ -69,6 +69,14 @@ SELF="$SELF_DIR/heimdall-presence"   # this bin, resolved dynamically (the keepe
 REPO="$(cd "$SELF_DIR/.." && pwd)"
 LIB="$REPO/bin/lib"
 
+# The SIGNED-PATH scrub. Presence carries Ed25519-signed beats AND the unsigned /enroll
+# bootstrap, so a local rewriting proxy in this path is a broken signature or a compromised
+# install. hmd_signed_exec drops the rewriters (HEADROOM_*, loopback proxy vars, the model
+# base-URL pins) and deliberately KEEPS a corporate CONNECT proxy, which tunnels TLS and is
+# often the only egress an estate has.
+# shellcheck source=lib/hmd-gate-endpoint.sh
+. "$LIB/hmd-gate-endpoint.sh"
+
 # ── control-plane URL + opt-out consent (SINGLE SOURCE OF TRUTH) ──────────────────
 # Sourced: the canonical public CP URL literal ($HEIMDALL_DEFAULT_CP_URL) + the consent
 # store helpers (_cp_consent_decision / _cp_consent_url / _write_cp_consent). The gate
@@ -502,7 +510,7 @@ run_client() {
   PRES_STRICT="$STRICT" PRES_INTERACTIVE="$INTERACTIVE" \
   PRES_CRYPTO_WARN_STAMP="$CRYPTO_WARN_STAMP" \
   PRES_GH_USER="${PRES_GH_USER:-}" PRES_GH_PROOF="${PRES_GH_PROOF:-}" PRES_REPO="${PRES_REPO:-}" \
-  "$PY" - <<'PYEOF'
+  hmd_signed_exec "$PY" - <<'PYEOF'
 import contextlib
 import json
 import os

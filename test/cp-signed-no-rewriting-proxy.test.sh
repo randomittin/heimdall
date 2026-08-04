@@ -197,7 +197,7 @@ check "1.2 POSITIVE CONTROL — an unscrubbed child inherits both routing vars" 
 # 1.3 every generic proxy var pointed at loopback is scrubbed, upper and lower case.
 LOOPBACK_SURVIVORS="$(HTTP_PROXY="$RW_URL" HTTPS_PROXY="$RW_URL" ALL_PROXY="$RW_URL" \
   http_proxy="$RW_URL" https_proxy="$RW_URL" all_proxy="$RW_URL" \
-  hmd_signed_exec env | grep -icE '^(http_proxy|https_proxy|all_proxy)=')"
+  signed_env | grep -icE '^(http_proxy|https_proxy|all_proxy)=')"
 check "1.3 a LOOPBACK proxy var is scrubbed in every spelling (6 -> 0)" \
   '[ "$LOOPBACK_SURVIVORS" = "0" ]'
 
@@ -206,13 +206,13 @@ check "1.3 a LOOPBACK proxy var is scrubbed in every spelling (6 -> 0)" \
 HEADROOM_SURVIVORS="$(HEADROOM_BASE_URL=https://headroom.corp.example:8443 \
   HEADROOM_PROXY=https://headroom.corp.example:8443 \
   HEADROOM_PROXY_URL=https://headroom.corp.example:8443 \
-  hmd_signed_exec env | grep -c '^HEADROOM_')"
+  signed_env | grep -c '^HEADROOM_')"
 check "1.4 the HEADROOM_* namespace is scrubbed even when it points OFF-box" \
   '[ "$HEADROOM_SURVIVORS" = "0" ]'
 
 BASEURL_SURVIVORS="$(ANTHROPIC_BASE_URL="$RW_URL" ANTHROPIC_API_URL="$RW_URL" \
   ANTHROPIC_DEFAULT_BASE_URL="$RW_URL" CLAUDE_CODE_BASE_URL="$RW_URL" \
-  hmd_signed_exec env | grep -cE '^(ANTHROPIC_|CLAUDE_CODE_BASE_URL)')"
+  signed_env | grep -cE '^(ANTHROPIC_|CLAUDE_CODE_BASE_URL)')"
 check "1.5 the model base-URL overrides are scrubbed (4 -> 0)" \
   '[ "$BASEURL_SURVIVORS" = "0" ]'
 
@@ -222,21 +222,21 @@ check "1.5 the model base-URL overrides are scrubbed (4 -> 0)" \
 CORP="http://proxy.corp.example:3128"
 CORP_SURVIVORS="$(HTTP_PROXY="$CORP" HTTPS_PROXY="$CORP" ALL_PROXY="$CORP" \
   http_proxy="$CORP" https_proxy="$CORP" all_proxy="$CORP" \
-  hmd_signed_exec env | grep -icE '^(http_proxy|https_proxy|all_proxy)=')"
+  signed_env | grep -icE '^(http_proxy|https_proxy|all_proxy)=')"
 check "1.6 a NON-loopback (corporate CONNECT) proxy SURVIVES the scrub (6 -> 6)" \
   '[ "$CORP_SURVIVORS" = "6" ]'
 
 # 1.7 loopback wears many spellings; the classifier has to parse a host, not match a string.
 for spec in "http://localhost:9" "http://127.9.9.9:9" "http://[::1]:9" "http://0.0.0.0:9" \
             "127.0.0.1:9" "http://user:pw@127.0.0.1:9" "https://LOCALHOST:9" "socks5://127.0.0.1:9"; do
-  n="$(HTTPS_PROXY="$spec" hmd_signed_exec env | grep -c '^HTTPS_PROXY=')"
+  n="$(HTTPS_PROXY="$spec" signed_env | grep -c '^HTTPS_PROXY=')"
   check "1.7 loopback recognised: $spec" '[ "$n" = "0" ]'
 done
 
 # 1.8 …and it must not over-match. A corporate proxy whose USERINFO merely contains a
 # loopback-looking string is still a corporate proxy: parse the host, never the whole value.
 NOT_LOOPBACK="$(HTTPS_PROXY="http://127.0.0.1:pw@proxy.corp.example:3128" \
-  hmd_signed_exec env | grep -c '^HTTPS_PROXY=')"
+  signed_env | grep -c '^HTTPS_PROXY=')"
 check "1.8 a corporate host with loopback-looking USERINFO is NOT scrubbed" \
   '[ "$NOT_LOOPBACK" = "1" ]'
 
@@ -244,7 +244,7 @@ check "1.8 a corporate host with loopback-looking USERINFO is NOT scrubbed" \
 # starved judge is not a protected judge) and the signed path inherits that reasoning: a
 # signed request with no credential is not a safer request, it is a failed one.
 CREDS="$(CLAUDE_CODE_OAUTH_TOKEN=tok ANTHROPIC_API_KEY=key \
-  hmd_signed_exec env | grep -cE '^(CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_API_KEY)=')"
+  signed_env | grep -cE '^(CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_API_KEY)=')"
 check "1.9 credentials are NOT scrubbed — we neutralize ROUTING, never AUTH" \
   '[ "$CREDS" = "2" ]'
 
@@ -252,7 +252,7 @@ check "1.9 credentials are NOT scrubbed — we neutralize ROUTING, never AUTH" \
 # so it can never route signed bytes into a rewriter — and dropping it would silently push
 # an estate's internal hosts back THROUGH the corporate proxy.
 NOPROXY="$(NO_PROXY=internal.corp no_proxy=internal.corp \
-  hmd_signed_exec env | grep -ic '^no_proxy=')"
+  signed_env | grep -ic '^no_proxy=')"
 check "1.10 NO_PROXY survives — an allowlist can only reduce proxying, never cause it" \
   '[ "$NOPROXY" = "2" ]'
 
@@ -320,13 +320,20 @@ check "2.5 the /enroll bootstrap reaches the control plane under a rewriter" \
 check "2.5 …and ZERO enrollment bytes arrived at the rewriter" \
   '[ "$(arrivals rewriter)" = "0" ]'
 
-# 2.6 the second signed surface: heimdall-connect's Ed25519-signed POST /team/install.
-# The seed created by the beats above is what signs it.
+# 2.6 the second signed surface: heimdall-connect's Ed25519-signed POST /team/cred and
+# /team/install. The seed created by the beats above is what signs them. A SYNTHETIC
+# shape-valid oauth token (never a real secret, and it travels only to 127.0.0.1) takes the
+# env auto-detect branch so the run is non-interactive — same fixture shape as
+# test/heimdall-connect.test.sh.
 export HOME="$WORK/home"
+TOKEN="sk-ant-oat01-$("$PY" -c 'import secrets,string; a=string.ascii_letters+string.digits+"_-"; print("".join(secrets.choice(a) for _ in range(90)))')"
 reset_logs
-http_proxy="$RW_URL" HTTP_PROXY="$RW_URL" https_proxy="$RW_URL" HTTPS_PROXY="$RW_URL" \
+CLAUDE_CODE_OAUTH_TOKEN="$TOKEN" \
+  http_proxy="$RW_URL" HTTP_PROXY="$RW_URL" https_proxy="$RW_URL" HTTPS_PROXY="$RW_URL" \
   "$ROOT/bin/heimdall-connect" --endpoint "$CP_URL" \
-  --gh-app-installation-id 12345 --repo acme/widgets >/dev/null 2>&1
+  --gh-app-installation-id 12345 --repo acme/widgets </dev/null >/dev/null 2>&1
+check "2.6 a signed connect POST /team/cred reaches the control plane" \
+  'grep -q "/team/cred" "$WORK/cp.log"'
 check "2.6 a signed connect POST /team/install reaches the control plane" \
   'grep -q "/team/install" "$WORK/cp.log"'
 check "2.6 …and ZERO signed bytes arrived at the rewriter" \
@@ -359,7 +366,7 @@ if [ -n "$NONLOOP" ]; then
   check "2.7 LIVE — a corporate proxy on $NONLOOP still CARRIES the signed request" \
     '[ "$(arrivals corp)" -ge 1 ]'
 else
-  CORP_KEPT="$(HTTP_PROXY=http://proxy.corp.example:3128 hmd_signed_exec env | grep -c '^HTTP_PROXY=')"
+  CORP_KEPT="$(HTTP_PROXY=http://proxy.corp.example:3128 signed_env | grep -c '^HTTP_PROXY=')"
   check "2.7 STRUCTURAL (no non-loopback interface) — a corporate proxy var is preserved" \
     '[ "$CORP_KEPT" = "1" ]'
 fi

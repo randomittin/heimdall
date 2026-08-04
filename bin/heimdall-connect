@@ -62,6 +62,12 @@ set -euo pipefail
 SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 BINDIR="$(dirname "$SELF")"
 LIB="$BINDIR/lib"                                   # the shipped cp_auth signer + claude_cred oracle live here.
+# The SIGNED-PATH scrub — /team/cred and /team/install are Ed25519-signed over the exact
+# wire bytes, so a local REWRITING proxy in this path invalidates them. hmd_signed_exec
+# drops the rewriters and keeps a corporate CONNECT proxy (it tunnels TLS, so it cannot
+# rewrite, and it is often the only egress).
+# shellcheck source=lib/hmd-gate-endpoint.sh
+. "$LIB/hmd-gate-endpoint.sh"
 CP_ENDPOINT_JSON="$HOME/.heimdall/cp-endpoint.json" # the CP {url, enroll_token} — SAME file heimdall-presence/rr read.
 CONNECT_STATE="${HEIMDALL_CONNECT_STATE:-$HOME/.heimdall/connect-state.json}"  # LOCAL value-free marker (kind+ts only).
 # Shipped DEFAULT public-surface URL (lowest precedence — config/flag/env override it).
@@ -253,7 +259,7 @@ PYEOF
 # `OK\t<a>\t<team_id>` (a = kind|installation_id), `HTTP\t<code>\t<err>`, or `ERR\t<reason>`.
 register_py() {
   LIB="$LIB" CP_URL="$CP_URL" CP_HAID="$CP_HAID" CP_SEED_FILE="$CP_SEED_FILE" \
-  "$PY" - <<'PYEOF'
+  hmd_signed_exec "$PY" - <<'PYEOF'
 import json, os, secrets, sys, time
 import urllib.error, urllib.request
 
