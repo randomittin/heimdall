@@ -581,9 +581,14 @@ def _spawn_presence(cwd, handle, verdict, present=True):
             roster_due = False
     if roster_due:
         tmp = cache + ".%d.tmp" % os.getpid()
-        pieces.append("%s roster --json > %s 2>/dev/null && mv -f %s %s; rm -f %s" %
+        # `rm -f` the TEMP as well as the lock. The `&&` short-circuits when the refresh
+        # exits non-zero, so `mv` never runs — and without this the temp is orphaned on
+        # EVERY failed background refresh. Measured before the fix: 1163 orphaned
+        # `.roster-cache.json.<pid>.tmp` files beside a single live cache, on a statusline
+        # that respawns this on every prompt.
+        pieces.append("%s roster --json > %s 2>/dev/null && mv -f %s %s; rm -f %s %s" %
                       (shlex.quote(bin_path), shlex.quote(tmp), shlex.quote(tmp),
-                       shlex.quote(cache), shlex.quote(lock)))
+                       shlex.quote(cache), shlex.quote(tmp), shlex.quote(lock)))
     if wall_due:
         try:
             open(wlock, "w").close()
@@ -591,10 +596,10 @@ def _spawn_presence(cwd, handle, verdict, present=True):
             wall_due = False
     if wall_due:
         wtmp = wall_cache + ".%d.tmp" % os.getpid()
-        pieces.append("%s %s --repo %s --blocking > %s 2>/dev/null && mv -f %s %s; rm -f %s" %
+        pieces.append("%s %s --repo %s --blocking > %s 2>/dev/null && mv -f %s %s; rm -f %s %s" %
                       (shlex.quote(sys.executable or "python3"), shlex.quote(roster_lib),
                        shlex.quote(cwd), shlex.quote(wtmp), shlex.quote(wtmp),
-                       shlex.quote(wall_cache), shlex.quote(wlock)))
+                       shlex.quote(wall_cache), shlex.quote(wtmp), shlex.quote(wlock)))
     if not pieces: return
     try:
         subprocess.Popen(["/bin/sh", "-c", "; ".join(pieces)], cwd=cwd, env=env,

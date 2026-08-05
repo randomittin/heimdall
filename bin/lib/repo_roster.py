@@ -1348,9 +1348,73 @@ def _cache_read(path, ttl, now, negative_ttl=None):
     return payload, (0 <= (now - float(stamp)) <= effective)
 
 
+# No legitimate writer holds a temp this long — it opens, dumps and renames in one breath.
+_TMP_ORPHAN_AGE_S = 120
+
+
+def _pid_alive(pid):
+    """True if that pid is still running. Used to decide whether a leftover temp file
+    has an owner that might still be writing it."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True          # exists, owned by someone else
+    except (OSError, OverflowError, ValueError):
+        return True          # unknown -> assume alive, never reap on a guess
+    return True
+
+
+def _reap_orphan_tmps(path):
+    """Remove `<path>.<pid>.tmp` files whose OWNING PROCESS IS GONE.
+
+    The write below is atomic-by-rename and cleans up on any EXCEPTION — but a process
+    KILLED between the open and the rename runs no handler at all, and this module is
+    routinely run under a hard `alarm` bound and as a detached background refresh. Those
+    kills leak a temp every time. Measured on the author's machine: 1161 orphans beside a
+    single live cache, growing on a statusline that renders on EVERY prompt.
+
+    Reaping keys on the pid embedded in the name, so a temp whose owner is STILL RUNNING
+    is never touched — a concurrent writer mid-rename must not have its file pulled out
+    from under it. Best-effort throughout: a failure to reap must never fail the write it
+    is housekeeping for."""
+    directory = os.path.dirname(path) or "."
+    base = os.path.basename(path)
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return
+    for name in names:
+        if not (name.startswith(base + ".") and name.endswith(".tmp")):
+            continue
+        middle = name[len(base) + 1:-len(".tmp")]
+        if not middle.isdigit():
+            continue                      # not our shape — leave it alone
+        full = os.path.join(directory, name)
+        # AGE IS THE PRIMARY DISCRIMINATOR, not the pid. PIDs are REUSED: with a thousand
+        # orphans on the disk, many of those recorded numbers now belong to unrelated live
+        # processes, so a pid-only check refuses to reap almost everything — measured, that
+        # is exactly why the first version of this reaper cleared nothing. A real writer
+        # holds its temp for milliseconds, so anything older than the floor is orphaned no
+        # matter who owns that number now. Below the floor we still defer to a live pid, so
+        # a concurrent writer mid-rename is never touched.
+        try:
+            age = time.time() - os.path.getmtime(full)
+        except OSError:
+            continue
+        if age < _TMP_ORPHAN_AGE_S and _pid_alive(int(middle)):
+            continue                      # young AND a live writer owns it
+        try:
+            os.remove(full)
+        except OSError:
+            pass
+
+
 def _cache_write(path, payload):
     if not path or not isinstance(payload, dict):
         return False
+    _reap_orphan_tmps(path)
     tmp = "%s.%d.tmp" % (path, os.getpid())
     try:
         with open(tmp, "w") as handle:
