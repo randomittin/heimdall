@@ -56,6 +56,7 @@ TC = _load("hmd_termcaps")
 GAUGE = _load("hmd_gauge")        # import hmd_gauge — the Row2 full-bleed gauge
 LAYOUT = _load("hmd_layout")      # import hmd_layout — exact-width row assembly
 LEDGER = _load("hmd_ledger")      # import hmd_ledger — the ledger reader (read_status)
+WALL = _load("hmd_wall")          # import hmd_wall — the repo wall reader (repo_roster cache)
 
 # ── terminal capability tier ─────────────────────────────────────────────────
 # CC's statusLine is non-TTY but truecolor. hmd_termcaps.detect() grades a tier from
@@ -494,7 +495,20 @@ def _spawn_presence(cwd, handle, verdict, present=True):
         roster_due = (not fresh) and (not locked)
     except Exception:
         roster_due = False
-    if not beat_due and not roster_due:
+    # The WALL refresh — repo_roster's ~62ms build (O(n²) identity unification), kept OFF the
+    # render path entirely. It rides this SAME already-throttled child, so a warm wall costs
+    # ZERO extra forks; the 15-min cache TTL plus a 120s lock bounds it to at most one build
+    # per repo per refresh window. --blocking is right HERE and only here: this child is
+    # detached and nothing waits on it, so warming the git/github caches synchronously just
+    # means the file it writes is complete.
+    wall_cache = WALL.wall_cache_path(cwd); wlock = wall_cache + ".lock"
+    roster_lib = os.path.join(BIN_DIR, "lib", "repo_roster.py")
+    try:
+        wall_due = (os.access(roster_lib, os.R_OK) and WALL.refresh_due(cwd) and
+                    not (os.path.exists(wlock) and now - os.path.getmtime(wlock) < 120))
+    except Exception:
+        wall_due = False
+    if not beat_due and not roster_due and not wall_due:
         return
     try:
         os.makedirs(os.path.join(cwd, ".heimdall"), exist_ok=True)
@@ -521,6 +535,17 @@ def _spawn_presence(cwd, handle, verdict, present=True):
         pieces.append("%s roster --json > %s 2>/dev/null && mv -f %s %s; rm -f %s" %
                       (shlex.quote(bin_path), shlex.quote(tmp), shlex.quote(tmp),
                        shlex.quote(cache), shlex.quote(lock)))
+    if wall_due:
+        try:
+            open(wlock, "w").close()
+        except Exception:
+            wall_due = False
+    if wall_due:
+        wtmp = wall_cache + ".%d.tmp" % os.getpid()
+        pieces.append("%s %s --repo %s --blocking > %s 2>/dev/null && mv -f %s %s; rm -f %s" %
+                      (shlex.quote(sys.executable or "python3"), shlex.quote(roster_lib),
+                       shlex.quote(cwd), shlex.quote(wtmp), shlex.quote(wtmp),
+                       shlex.quote(wall_cache), shlex.quote(wlock)))
     if not pieces: return
     try:
         subprocess.Popen(["/bin/sh", "-c", "; ".join(pieces)], cwd=cwd, env=env,
@@ -528,6 +553,7 @@ def _spawn_presence(cwd, handle, verdict, present=True):
                          stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
     except Exception:
         if roster_due: _quiet_rm(lock)
+        if wall_due: _quiet_rm(wlock)
 
 def roster_presence(cwd):
     """SERVER-synced ONLINE team, served instantly from the short-TTL roster cache."""
@@ -872,18 +898,48 @@ TEAM_COL_GAP = 4       # 2nd-column gutter: blank cells between the content colu
                        # live statusLine region (RJ's right-side truncation). See main().
 
 
-def _team_members(cwd, ledger):
-    """Up to 3 teammates + a `+N` overflow, from the ledger team[] (status.json mirror)
-    else the live roster cache (team_presence). Each member carries its OWN haid so the
-    cluster resolves per-teammate. Returns (members[<=3], overflow)."""
+def _wall_self_ids(handle, seed):
+    """The identifiers that mean "me", built with ZERO subprocesses.
+
+    hmd_ledger._self_ids() resolves the same set but SHELLS OUT to bin/heimdall-identity
+    twice; that is affordable there only because it sits behind the ledger's 5s cache. The
+    wall needs the self-set on EVERY render, so it reuses the identity main() already
+    resolved through the statusline's own 5s identity cache plus the free env/$USER probes.
+    Forking here would cost two subprocesses per keystroke — measured at +33ms per render."""
+    ids = set()
+    for v in (handle, seed, os.environ.get("HMD_HANDLE"), os.environ.get("HMD_HAID"),
+              os.environ.get("USER")):
+        if v and str(v).strip():
+            ids.add(str(v).strip())
+    return ids
+
+
+def _team_members(cwd, ledger, self_ids=None):
+    """THE WALL: everyone who works on THIS repo, ranked, each carrying its own tier.
+
+    Reads the precomputed wall cache (hmd_wall — repo_roster's output, refreshed by the
+    detached child below) and overlays LIVE presence, so the git/github tiers render TODAY
+    without a control plane while the present tense stays decided by the 45s heartbeat alone.
+
+    The wall wins only when it knows about MORE people than the ledger mirror does. That
+    keeps every pre-existing render bit-identical when the wall adds nothing (a cold cache,
+    a non-git dir, a solo repo) while fixing the case this exists for — a roster of 23 people
+    rendering as one lonely sigil.
+
+    Returns (members, overflow). The members are NOT capped here: team_zone_alloc packs as
+    many columns as actually fit and folds the remainder into an explicit `+N`, so the cap is
+    made by the code that knows the real width instead of a hardcoded 3."""
+    live = team_presence(cwd)
+    wall, _of = WALL.read_members(cwd, live=live, self_ids=self_ids or set())
     members = list(ledger.get("team") or [])
     overflow = int(ledger.get("team_overflow") or 0)
+    if len(wall) > len(members):
+        return wall, 0
     if not members:
-        tp = team_presence(cwd)
         members = [{"user": m.get("name") or "?", "haid": m.get("haid"),
                     "sigil": "", "branch": m.get("branch") or "",
-                    "state": m.get("verdict") or ""} for m in tp[:3]]
-        overflow = max(0, len(tp) - 3)
+                    "state": m.get("verdict") or ""} for m in live[:3]]
+        overflow = max(0, len(live) - 3)
     return members[:3], overflow
 
 
@@ -913,40 +969,76 @@ def _last_seen(now, ts):
     return "%dd" % (secs // 86400)
 
 
-def _team_offline_seg(m, now):
-    """Row4 OFFLINE segment — `⊘off 3d` in the faintest hue. A teammate whose heartbeat is past
-    the online TTL but inside the 7-day wall window is AWAY, and this is the only thing on their
-    column that says so in WORDS.
+# Row4 NON-PRESENT tier vocabulary — EXTENDS the offline vocabulary 9cad9a9 established
+# (`⊘off 3d`) to the two git/github tiers, rather than inventing a competing one. Each entry
+# is a glyph that appears NOWHERE in the online set (◉ ⚡ ✗ ○ ●) PLUS a literal word, so the
+# tier survives --no-color, a mono terminal AND a colorblind viewer — colour alone fails all
+# three. The channels are deliberately split: COLOUR carries only the binary present/absent,
+# the WORD carries the four-way tier. That split is what stops a subtle hue from ever being
+# the only thing standing between "here" and "not here".
+TEAM_TIER = {              # tier → (glyph, word, show_age)
+    "away":        ("⊘", "off", True),    # a heartbeat, but stale     → `⊘off 3d`
+    "contributed": ("⌁", "git", True),    # a commit, no presence ever → `⌁git 3d`
+    "member":      ("⌂", "mem", False),   # on the repo, no signal     → `⌂mem`
+}
+
+
+def _tier_of(m):
+    """The member's presence TIER — the ONE classifier every render decision reads.
+
+    A wall member carries its tier explicitly (hmd_wall). A LEGACY member — an older ledger
+    status.json or a local heartbeat file, neither of which has a tier key — keeps the
+    pre-existing two-state mapping EXACTLY: an explicit online:false or the pinned "offline"
+    state means away, and anything else is treated as present just as before. Presence is
+    never INVENTED here, only ever carried."""
+    t = m.get("tier")
+    if t in WALL.TIER_RANK:
+        return t
+    if m.get("online") is False or (m.get("state") or "") == "offline":
+        return "away"
+    return WALL.PRESENT_TIER
+
+
+def _drained(m):
+    """True iff this member is NOT present, and so must render with the identity hue DRAINED
+    (MONO sigil + faintest name). Exactly one tier — `online` — is present; every other tier
+    is absent. The hero colour therefore appears if and only if the person is here RIGHT NOW,
+    which is the single strongest cue on the wall and the one that must never lie."""
+    return _tier_of(m) != WALL.PRESENT_TIER
+
+
+def _team_tier_seg(m, now):
+    """Row4 NON-PRESENT segment — `⊘off 3d` / `⌁git 3d` / `⌂mem` in the faintest hue. This is
+    the only thing on an absent person's column that says so in WORDS.
 
     UNMISTAKABLE BY CONSTRUCTION, three ways that do not depend on each other:
-      • the glyph `⊘` appears NOWHERE in the online vocabulary (◉ rev / ⚡ wrk / ✗ deny / ○ idle),
-      • the literal word `off` survives --no-color, a mono terminal, and a colorblind viewer —
-        color alone would fail all three,
-      • the last-seen age is the ONE number shown, so "away since when" is explicit.
-    Offline must never be a subtly-different online: a viewer who misreads this as present is
-    the exact failure the 7-day window exists to prevent."""
+      • the glyph is outside the online vocabulary (◉ rev / ⚡ wrk / ✗ deny / ○ idle),
+      • the literal word survives --no-color, a mono terminal, and a colorblind viewer —
+        colour alone would fail all three,
+      • the age is the ONE number shown, and it is the age of the tier's OWN signal (last
+        heartbeat for `off`, last COMMIT for `git`), so the number never labels a clock it
+        did not come from. `mem` shows none, because a member has no signal to date.
+    An absent person must never be a subtly-different present one: a viewer who misreads this
+    is the exact failure this wall exists to prevent."""
+    glyph, word, show_age = TEAM_TIER.get(_tier_of(m), TEAM_TIER["member"])
     ts = m.get("ts")
-    if isinstance(ts, (int, float)) and not isinstance(ts, bool):
-        return f"{FAINT}⊘off {_last_seen(now, ts)}{X}"
-    return f"{FAINT}⊘off{X}"
-
-
-def _is_offline(m):
-    """True iff this member is an AWAY teammate — the producer's explicit online:false, or the
-    "offline" state the server/ledger pins on them. Absent both (an older status.json) they are
-    treated as present, exactly as before: presence is never INVENTED, only ever carried."""
-    if m.get("online") is False:
-        return True
-    return (m.get("state") or "") == "offline"
+    if show_age and isinstance(ts, (int, float)) and not isinstance(ts, bool):
+        return f"{FAINT}{glyph}{word} {_last_seen(now, ts)}{X}"
+    return f"{FAINT}{glyph}{word}{X}"
 
 
 def _team_state_seg(m, now):
     """Row4 per-member state (Spec v2 §6): `◉ rev` mint / `⚡ wrk` gold / `✗ deny` red, or
-    `○ <N>m` faint (last-seen minutes) for an idle/unknown state. An AWAY teammate gets the
-    explicit offline segment instead — checked FIRST so no online glyph can ever claim them."""
-    if _is_offline(m):
-        return _team_offline_seg(m, now)
-    g = TEAM_STATE.get(m.get("state") or "")
+    `○ <N>m` faint (last-seen minutes) for an idle/unknown state. A NON-PRESENT teammate gets
+    the explicit tier segment instead — checked FIRST so no online glyph can ever claim them."""
+    if _drained(m):
+        return _team_tier_seg(m, now)
+    # A wall member carries the LIVE verdict verbatim ("working"), a ledger member carries an
+    # already-normalized state ("running"); _norm_state maps both and is idempotent. Only a
+    # NON-EMPTY state is mapped — _norm_state sends the unknown/empty case to "running", and
+    # painting a teammate with no reported verdict as "actively working" would be fabrication.
+    raw = str(m.get("state") or "").strip()
+    g = TEAM_STATE.get(LEDGER._norm_state(raw)) if raw else None
     if g:
         glyph, word, col = g
         return f"{col}{glyph} {word}{X}"
@@ -981,7 +1073,7 @@ def team_columns(members, team_w, overflow, now, states=True, self_branch=""):
     tops = []; bots = []; names = []; sts = []
     for i, m in enumerate(members):
         seed = m.get("haid") or m.get("user") or m.get("sigil") or "?"
-        away = _is_offline(m)
+        away = _drained(m)
         # An AWAY teammate's sigil renders in the MONO tier: the identity hue — the thing that
         # reads as "present" — drains out of their column, while the glyph SHAPE still says who
         # they are. Online teammates keep their natural palette, so the two never look alike.
@@ -1032,21 +1124,38 @@ def team_columns(members, team_w, overflow, now, states=True, self_branch=""):
     return r1, r2, r3, r4
 
 
-def team_dots(members):
-    """Narrow-tier inline team indicator (Spec v2 §7): one `●` per online teammate, tinted by
-    the teammate hue, space-joined — rides the Row1 right rail. An AWAY teammate gets a HOLLOW
-    `○` in the faintest hue: at this width there is no room for a word, so the fill of the dot
-    carries the whole signal — filled = here, hollow = away. Shape, not just colour, so the
-    distinction survives a mono terminal."""
+# Narrow-tier marks — a SHAPE ramp by how much signal we have on the person, descending:
+# a filled disc (a live heartbeat), a hollow ring (a heartbeat, but stale), a dotted ring (no
+# heartbeat ever, but commits), a speck (on the repo, nothing else). At this width there is no
+# room for a word, so the mark's SHAPE carries the whole signal — and only `●` is filled, so
+# present-vs-absent reads at a glance even on a mono terminal where every mark is one colour.
+TEAM_DOT = {"online": "●", "away": "○", "contributed": "◌", "member": "·"}
+TEAM_DOT_CAP = 4       # the narrow tier is 40-59 cols; past this the rail crowds out identity
+
+
+def team_dots(members, cap=TEAM_DOT_CAP):
+    """Narrow-tier inline team indicator (Spec v2 §7): one mark per teammate, space-joined,
+    riding the Row1 right rail. A PRESENT teammate's disc is tinted by their identity hue;
+    every absent tier is the faintest hue AND a distinct shape, so the distinction survives
+    --no-color and a mono terminal.
+
+    Bounded by `cap` with an explicit `+N` tail: 23 people would be 45 cells of dots on a
+    40-cell rail, and dropping the remainder silently would re-create the very bug this wall
+    fixes. Members arrive rank-ordered (present first), so the `+N` can only ever hide people
+    who are NOT here."""
     dots = []
-    for m in members:
+    for m in members[:cap]:
         seed = m.get("haid") or m.get("user") or m.get("sigil") or "?"
-        if _is_offline(m):
-            dots.append(f"{FAINT}○{X}")
+        tier = _tier_of(m)
+        if tier != WALL.PRESENT_TIER:
+            dots.append(f"{FAINT}{TEAM_DOT.get(tier, '·')}{X}")
             continue
         hue = _team_hue(seed, m.get("sigil")) if USE_COLOR else None
         col = sgr(SIG._hex_rgb(hue)) if hue else DIM
-        dots.append(f"{col}●{X}")
+        dots.append(f"{col}{TEAM_DOT['online']}{X}")
+    rest = len(members) - len(dots)
+    if rest > 0:
+        dots.append(f"{FAINT}+{rest}{X}")
     return " ".join(dots)
 
 def daemon_seg(ledger):
@@ -1452,7 +1561,7 @@ def main():
     # team_zone_alloc reserves the team zone from the RIGHT edge BEFORE the gauge is sized —
     # the order swap that stops a teammate eye-strip from ever being truncated. mid → 2
     # members + +N (states drop); narrow → the roster becomes inline dots on Row1 (no zone).
-    members, overflow = _team_members(cwd, ledger)
+    members, overflow = _team_members(cwd, ledger, _wall_self_ids(handle, seed))
     roster = list(members)                               # kept for the narrow-tier dots
     team_states = True
     if tier == "mid":
