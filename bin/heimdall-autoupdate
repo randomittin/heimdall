@@ -308,6 +308,41 @@ reassert_dream_schedule() {
   return 0
 }
 
+# ── ask for the nightly /dream's one macOS permission, on the MANUAL update only ──
+#
+# THE GAP THE RE-ASSERT ABOVE CANNOT CLOSE. reassert_dream_schedule keeps the LaunchAgent
+# pointed at current code. It cannot make that agent READABLE: when $PLUGIN_DIR sits
+# inside ~/Downloads, ~/Documents or ~/Desktop, macOS refuses every read at 03:00 because
+# a LaunchAgent carries no TCC grant. Re-registering a job that cannot read its own repo
+# just re-registers the failure. Only a human can lift it, and nothing in the update path
+# ever asked — so the machine reported "blocked: tcc-denied" nightly, forever.
+#
+# WHY HERE AND NOWHERE ELSE IN THIS FILE. `hmd --update` is one of the two moments a
+# person is demonstrably present and expecting hmd to do maintenance work. The other is
+# install. The BACKGROUND `check` is the opposite of that — detached, spawned by a
+# SessionStart hook — and it must never reach this function: test/dream-install-wire.test.sh
+# §11 asserts run_check does not call it, so a later "helpful" hoist cannot put a prompt
+# on an unattended path unnoticed.
+#
+# --interactive-only IS THE WHOLE SAFETY ARGUMENT. It is the helper's own
+# `[ -t 0 ] && [ -t 1 ]` gate, used to choose between asking and DEFERRING. `hmd --update`
+# from a terminal asks; the same command redirected, piped or detached does nothing at all
+# — no output, no stdin read, and crucially no marker, so the one-shot is not spent on
+# nobody and the next human still gets asked. We do not re-test the terminal here: a
+# second copy of that gate would be free to drift from the one that matters.
+#
+# Gated like reassert_dream_schedule (macOS + the same HEIMDALL_NO_DREAM_SCHEDULE off
+# switch — no nightly job means nothing to grant a permission for) and BEST-EFFORT: it
+# never changes the update's exit code.
+ask_dream_permission() {
+  [ "${HEIMDALL_NO_DREAM_SCHEDULE:-0}" = "1" ] && return 0
+  [ "$(uname -s 2>/dev/null)" = "Darwin" ] || return 0
+  local perm="$SELF_DIR/heimdall-dream-permission"
+  [ -x "$perm" ] || return 0
+  "$perm" ask --repo "$PLUGIN_DIR" --interactive-only || true
+  return 0
+}
+
 # ── repair deferred / broken optional modules (the recurring, hands-off moment) ──
 # WHY THIS LIVES HERE. `hmd install` must not block on a multi-GB download, so an
 # optional module is legitimately ABSENT right after a successful install — and a
@@ -959,6 +994,14 @@ cmd_update() {
   # asked for this update and is watching: an absent default module is NAMED, with the
   # one command that installs it. Never fatal, for the same reason repair is not.
   reconcile_modules loud || true
+
+  # And ask for the nightly /dream's one macOS permission if it is still outstanding.
+  # Placed HERE, before the version resolution, for the same reason repair_modules is:
+  # the common case is that hmd is already current, and "already on the latest version"
+  # exits below — so an ask placed after that check would never run on the machines that
+  # have been failing at 03:00 for weeks. Idempotent (asked once, then silent), silent
+  # when no grant is needed, and a no-op when nobody is at the terminal.
+  ask_dream_permission || true
 
   installed="$(installed_version)"
   latest="$(latest_version)"

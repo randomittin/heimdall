@@ -734,6 +734,49 @@ ensure_dream_schedule() {
   esac
 }
 
+# ── The ONE permission the nightly /dream may need, asked at setup ────────────
+#
+# WHAT THE SCHEDULE STEP ABOVE LEAVES OPEN. It registers a LaunchAgent that will read
+# $PLUGIN_DIR at 03:00. A LaunchAgent carries NO TCC grant, so if that directory sits
+# inside ~/Downloads, ~/Documents or ~/Desktop, macOS refuses every read and the job is
+# dead the moment it is created. The remedy needs a human — macOS exposes no API to
+# request or set Full Disk Access — and until now nothing ever ASKED for it. The machine
+# simply reported "blocked: tcc-denied" every night. This is the ask, placed at the one
+# moment during setup when a person may actually be there.
+#
+# AND WHY IT DEFERS RATHER THAN PRINTS. The published install is `curl … | bash`. There
+# is no terminal on that path, and this file's own header promises no stdin reads under a
+# pipe. A prompt would wedge it. But the printed fallback is not harmless either: it
+# scrolls past unread AND the helper records that the operator was asked, spending the
+# one-shot on nobody — after which the first person to open a terminal gets silence.
+# Not asking is recoverable; asking nobody is not.
+#
+# So we pass --interactive-only, which is the helper's own `[ -t 0 ] && [ -t 1 ]` gate
+# used to choose between asking and DEFERRING: with a human it prints the block and puts
+# the choice to him in this same flow; with a pipe it does nothing at all — no output, no
+# stdin read, no marker — and the ask stays armed for the first interactive surface
+# (`hmd --update`, or the SessionStart notice that already points at it). We deliberately
+# do NOT re-test `[ -t 0 ]` here: two copies of that gate drift, and a drifted gate is the
+# one that hangs the installer.
+#
+# THIS FUNCTION IS SILENT BY CONSTRUCTION. Every word the operator sees comes from the
+# helper, so nothing here can leak a question into the pipe. It ALWAYS returns 0 — a
+# permission ask must never be able to fail an install that otherwise succeeded — and it
+# is macOS-gated exactly like the schedule it serves, because a grant with no LaunchAgent
+# to grant it for is noise.
+ensure_dream_permission() {
+  local plugin_dir="$1"
+  # The nightly job's OFF SWITCH is this ask's off switch too: no schedule, nothing to grant.
+  [ "${HEIMDALL_NO_DREAM_SCHEDULE:-0}" = "1" ] && return 0
+  [ "$(uname -s 2>/dev/null)" = "Darwin" ] || return 0
+  local perm="$plugin_dir/bin/heimdall-dream-permission"
+  [ -x "$perm" ] || return 0
+  # `ask` already exits 0 on every path and stays silent unless a grant is genuinely
+  # needed; the guard is belt-and-braces against a partial clone.
+  "$perm" ask --repo "$plugin_dir" --interactive-only || true
+  return 0
+}
+
 # ── Install-step telemetry (dossier §3 + §8) ────────────────────────────────
 #
 # install.sh's own step — the PATH export — emits started→succeeded|failed +
@@ -1433,6 +1476,16 @@ main() {
         dream-schedule-unavailable "schedule helper missing or launchctl load failed"
       step_ok "Scheduling nightly /dream (03:00)" "skipped" ;;
   esac
+
+  # A job now exists that will read $PLUGIN_DIR unattended at 03:00 — so this is the
+  # moment to ask for the one macOS permission that can stop it, while a human may still
+  # be here. ONLY when the schedule was actually registered: 'sandboxed', 'ephemeral' and
+  # the rest mean no LaunchAgent was created, and a permission question for a job that
+  # does not exist is noise the operator learns to ignore. Silent by construction, silent
+  # under a pipe, and it can never fail the install (see ensure_dream_permission).
+  if [ "$DS_STATE" = "scheduled" ]; then
+    ensure_dream_permission "$PLUGIN_DIR" || true
+  fi
 
   # ── 5. Success card (A4) ──────────────────────────────────────────────────
   # VER is the ACTUAL installed version (git tag → manifest), never a literal.

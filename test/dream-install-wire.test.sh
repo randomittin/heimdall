@@ -283,6 +283,227 @@ else
   bad "9 install.sh has no operator-facing wording for the ephemeral refusal"
 fi
 
+# ══ THE PERMISSION ASK, WIRED INTO SETUP AND UPDATE ══════════════════════════════
+#
+# WHY IT HAS TO BE WIRED AT ALL. §2 registers a nightly LaunchAgent. When the repo that
+# agent must read sits inside ~/Downloads|Documents|Desktop, macOS refuses every read at
+# 03:00 and the job is dead on arrival — a LaunchAgent carries no TCC grant. The remedy
+# exists (bin/heimdall-dream-permission) and its own suite proves it. What was missing is
+# a MOMENT: nothing ever ran it at the two times a human is actually there, so the
+# machine reported "blocked: tcc-denied" nightly and was never once asked.
+#
+# WHY IT MUST NOT BE WIRED NAIVELY. The published install is `curl … | bash`: no
+# terminal, and install.sh:10 states outright that the piped path reads no stdin. A
+# prompt there wedges a pipe, and even the printed fallback is harmful — it scrolls past
+# unread while the marker records that the operator was asked, spending the one-shot on
+# nobody. So both call sites pass --interactive-only: ask when a human is present, defer
+# silently otherwise, and stay armed either way.
+#
+#   (10) SETUP  — install.sh's ensure_dream_permission
+#   (11) UPDATE — heimdall-autoupdate's ask_dream_permission (manual path only)
+#   (12) UPDATE — bin/heimdall's dev-checkout branch, which exits before the updater
+
+PERM_SRC="$ROOT/bin/heimdall-dream-permission"
+[ -x "$PERM_SRC" ] || { echo "FATAL: permission helper missing: $PERM_SRC" >&2; exit 2; }
+
+# A FAKE HOME is what makes "protected" testable: the predicate asks whether a path is
+# under <home>/Downloads|Documents|Desktop, so a throwaway home yields a genuinely
+# protected tree with none of the developer's real ~/Downloads involved. HEIMDALL_REAL_HOME
+# points the passwd-derived answer at the same tree (the seam bin/lib/real-home.sh
+# documents), and HEIMDALL_HOME/STATUS/LaunchAgents stay redirected as everywhere else.
+PHOME="$WORK/phome"; mkdir -p "$PHOME/Downloads"
+PHOME="$(cd "$PHOME" && pwd -P)"
+PMARK="$WORK/phmd/dream-permission.json"     # the "already asked" marker
+PSTATUS="$WORK/pstatus.json"
+POPENLOG="$WORK/perm-open-calls"
+POPEN="$WORK/perm-mock-open"
+cat > "$POPEN" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$POPENLOG"
+exit 0
+EOF
+chmod +x "$POPEN"
+
+# Two plugin trees: one INSIDE the protected folder (arms the ask), one outside (must
+# never ask). Both carry the permission helper and the libs it needs, exactly as a real
+# install does.
+mk_plugin_tree() {
+  local d="$1"
+  mkdir -p "$d/bin/lib"
+  cp "$PERM_SRC" "$d/bin/heimdall-dream-permission"
+  cp "$ROOT/bin/lib/real-home.sh" "$d/bin/lib/real-home.sh"
+  cp "$ROOT/bin/lib/tcc-paths.sh" "$d/bin/lib/tcc-paths.sh"
+  chmod +x "$d/bin/heimdall-dream-permission"
+}
+PROT_PLUG="$PHOME/Downloads/heimdall"; mk_plugin_tree "$PROT_PLUG"
+SAFE_PLUG="$WORK/safe-plugin";         mk_plugin_tree "$SAFE_PLUG"
+
+# The runner records result=blocked, which is the evidence the ask classifies on.
+write_pstatus() {
+  cat > "$PSTATUS" <<EOF
+{
+  "schema": 1,
+  "ts": "2026-08-05T03:20:07Z",
+  "label": "com.heimdall.dream",
+  "result": "blocked",
+  "reason": "tcc-denied",
+  "repo": "$1",
+  "denied_path": "$1",
+  "detail": "ls: $1: Operation not permitted",
+  "exit": 75
+}
+EOF
+}
+
+# $1 = plugin dir, $2 = install.sh|autoupdate fn, rest = extra exports (e.g. the tty seam)
+run_perm() {
+  local plugin_dir="$1" which="$2"; shift 2
+  ( set +e
+    export HOME="$PHOME" HEIMDALL_REAL_HOME="$PHOME" \
+           HEIMDALL_HOME="$WORK/phmd" HEIMDALL_DREAM_STATUS="$PSTATUS" \
+           HEIMDALL_DREAM_PERMISSION_STATE="$PMARK" \
+           HEIMDALL_LAUNCH_AGENTS_DIR="$LA" HEIMDALL_DREAM_LOG="$LOG" \
+           LAUNCHCTL="$SHIM" HEIMDALL_OPEN="$POPEN" \
+           HEIMDALL_DREAM_PERMISSION_TIMEOUT=5 "$@"
+    if [ "$which" = install ]; then
+      export HEIMDALL_INSTALL_SOURCE_ONLY=1
+      source "$INSTALL_SH"
+      ensure_dream_permission "$plugin_dir"
+    else
+      export HEIMDALL_AUTOUPDATE_SOURCE_ONLY=1
+      source "$plugin_dir/bin/heimdall-autoupdate"
+      ask_dream_permission
+    fi )
+}
+
+# ── 10. SETUP: install.sh asks at first run — and NEVER in the pipe ───────────────
+rm -f "$PMARK"; : > "$POPENLOG"
+write_pstatus "$PROT_PLUG"
+
+P_OUT="$(printf 'B\ny\n' | run_perm "$PROT_PLUG" install 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && [ -z "$P_OUT" ]; then
+  ok "10 PIPED INSTALL: install-wire prints NOTHING and exits 0 (curl|bash stays clean)"
+else
+  bad "10 piped install spoke or failed (rc=$rc, out='$(printf '%s' "$P_OUT" | head -2 | tr '\n' ' ')')"
+fi
+# THE ANTI-BURN ASSERTION. If the piped install spent the marker, the first human to open
+# a terminal would be met with silence — strictly worse than never wiring this at all.
+[ ! -f "$PMARK" ] \
+  && ok "10 PIPED INSTALL: the one-shot is NOT spent — the ask stays armed for a human" \
+  || bad "10 the piped install spent the ask on nobody (marker at $PMARK)"
+[ ! -s "$POPENLOG" ] && ok "10 PIPED INSTALL: opened nothing" \
+  || bad "10 the piped install opened System Settings: $(tr '\n' ' ' < "$POPENLOG")"
+
+# stdin must be left UNREAD — that is what makes wedging a pipe impossible rather than
+# merely unlikely. install.sh:10 claims no stdin reads on the piped path; this holds it.
+LEFT="$(printf 'B\ny\n' | { run_perm "$PROT_PLUG" install >/dev/null 2>&1; cat; })"
+[ "$LEFT" = "$(printf 'B\ny')" ] \
+  && ok "10 PIPED INSTALL: stdin left UNREAD — install.sh's zero-stdin contract holds" \
+  || bad "10 the install-wire consumed stdin: got '$LEFT'"
+
+# …and with a human present it DOES ask, in the same flow, at setup.
+rm -f "$PMARK"; : > "$POPENLOG"
+H_OUT="$(printf 'c\n' | run_perm "$PROT_PLUG" install HEIMDALL_DREAM_PERMISSION_TTY=1 2>&1)"
+if printf '%s' "$H_OUT" | grep -q 'Full Disk Access' \
+   && printf '%s' "$H_OUT" | grep -q 'Your choice'; then
+  ok "10 SETUP WITH A HUMAN: install-wire puts the permission choice to him"
+else
+  bad "10 install-wire did not ask a present human: $(printf '%s' "$H_OUT" | tr '\n' ' ' | cut -c1-200)"
+fi
+[ -f "$PMARK" ] && ok "10 SETUP: the ask records that it was made" || bad "10 no marker after asking"
+
+# IDEMPOTENT THROUGH THE WIRING. Re-running setup must not re-ask; that is the property
+# that keeps this from becoming a nag on every install and every update.
+H2="$(printf 'c\n' | run_perm "$PROT_PLUG" install HEIMDALL_DREAM_PERMISSION_TTY=1 2>&1)"
+[ -z "$H2" ] \
+  && ok "10 IDEMPOTENT: a second setup is SILENT (asked once, never nags)" \
+  || bad "10 setup re-asked: $(printf '%s' "$H2" | tr '\n' ' ' | cut -c1-160)"
+
+# A plugin dir OUTSIDE every protected folder needs no grant, so it must never ask —
+# which is the case on nearly every machine (~/.heimdall is not protected).
+rm -f "$PMARK"
+S_OUT="$(printf 'c\n' | run_perm "$SAFE_PLUG" install HEIMDALL_DREAM_PERMISSION_TTY=1 2>&1)"
+[ -z "$S_OUT" ] \
+  && ok "10 a plugin dir outside every protected folder is never asked about" \
+  || bad "10 install-wire nagged an install that needs nothing: $S_OUT"
+
+# STATIC: the deferral flag is what makes the piped path safe. Losing it would restore
+# the exact failure this section exists to prevent, silently.
+if grep -q 'ensure_dream_permission "\$PLUGIN_DIR"' "$INSTALL_SH" \
+   && grep -q -- '--interactive-only' "$INSTALL_SH"; then
+  ok "10 install.sh calls ensure_dream_permission and passes --interactive-only"
+else
+  bad "10 install.sh does not wire the permission ask with --interactive-only"
+fi
+
+# ── 11. UPDATE: heimdall-autoupdate asks on the MANUAL path only ─────────────────
+cp "$UPDATER" "$PROT_PLUG/bin/heimdall-autoupdate"
+chmod +x "$PROT_PLUG/bin/heimdall-autoupdate"
+cp "$UPDATER" "$SAFE_PLUG/bin/heimdall-autoupdate"
+chmod +x "$SAFE_PLUG/bin/heimdall-autoupdate"
+
+rm -f "$PMARK"; : > "$POPENLOG"
+U_OUT="$(printf 'B\ny\n' | run_perm "$PROT_PLUG" update 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && [ -z "$U_OUT" ]; then
+  ok "11 DETACHED UPDATE: prints nothing, exits 0 (a backgrounded update never asks)"
+else
+  bad "11 detached update spoke or failed (rc=$rc, out='$(printf '%s' "$U_OUT" | head -2 | tr '\n' ' ')')"
+fi
+[ ! -f "$PMARK" ] \
+  && ok "11 DETACHED UPDATE: the one-shot is NOT spent" \
+  || bad "11 a detached update spent the ask on nobody"
+
+rm -f "$PMARK"; : > "$POPENLOG"
+UH="$(printf 'c\n' | run_perm "$PROT_PLUG" update HEIMDALL_DREAM_PERMISSION_TTY=1 2>&1)"
+if printf '%s' "$UH" | grep -q 'Full Disk Access' && printf '%s' "$UH" | grep -q 'Your choice'; then
+  ok "11 UPDATE WITH A HUMAN: hmd --update puts the permission choice to him"
+else
+  bad "11 the update path did not ask a present human: $(printf '%s' "$UH" | tr '\n' ' ' | cut -c1-200)"
+fi
+UH2="$(printf 'c\n' | run_perm "$PROT_PLUG" update HEIMDALL_DREAM_PERMISSION_TTY=1 2>&1)"
+[ -z "$UH2" ] \
+  && ok "11 IDEMPOTENT: a second update is SILENT (an update must never become a nag)" \
+  || bad "11 update re-asked: $(printf '%s' "$UH2" | tr '\n' ' ' | cut -c1-160)"
+
+# The nightly job's OFF SWITCH turns the ask off too: a user who declined the schedule
+# has nothing to grant a permission for, and asking anyway is pure noise.
+rm -f "$PMARK"
+UO="$(printf 'c\n' | run_perm "$PROT_PLUG" update HEIMDALL_DREAM_PERMISSION_TTY=1 HEIMDALL_NO_DREAM_SCHEDULE=1 2>&1)"
+{ [ -z "$UO" ] && [ ! -f "$PMARK" ]; } \
+  && ok "11 HEIMDALL_NO_DREAM_SCHEDULE=1 silences the ask (no schedule ⇒ nothing to grant)" \
+  || bad "11 the schedule opt-out did not silence the permission ask: $UO"
+
+# THE BACKGROUND PATH MUST NOT CALL IT AT ALL. run_check is what the SessionStart hook
+# fires, detached; even a deferring ask has no business there, and a future edit that
+# "helpfully" moved the call up would reintroduce a prompt on an unattended path.
+if sed -n '/^run_check()/,/^}/p' "$UPDATER" | grep -q 'ask_dream_permission'; then
+  bad "11 the BACKGROUND check calls the permission ask — it must be manual-only"
+else
+  ok '11 the background check never calls the ask (manual "update" path only)'
+fi
+if sed -n '/^cmd_update()/,/^}/p' "$UPDATER" | grep -q 'ask_dream_permission'; then
+  ok '11 the manual "update" path calls the ask'
+else
+  bad "11 cmd_update does not call the permission ask"
+fi
+
+# ── 12. UPDATE: the dev-checkout branch exits before the updater is ever reached ──
+#
+# `hmd --update` on a contributor's editable clone refuses to auto-update and exits 0
+# WITHOUT delegating to heimdall-autoupdate. That is exactly the shape of the machine
+# where this permission is actually needed (a checkout living in ~/Downloads), so wiring
+# only §11 would leave the one user who has the problem unasked on every update.
+HMD_BIN="$ROOT/bin/heimdall"
+[ -x "$HMD_BIN" ] || { echo "FATAL: launcher missing: $HMD_BIN" >&2; exit 2; }
+bash -n "$HMD_BIN" && ok "12 bash -n bin/heimdall" || bad "12 bin/heimdall syntax error"
+DEVBRANCH="$(sed -n '/This looks like a development checkout/,/^  fi$/p' "$HMD_BIN")"
+if printf '%s' "$DEVBRANCH" | grep -q 'heimdall-dream-permission' \
+   && printf '%s' "$DEVBRANCH" | grep -q -- '--interactive-only'; then
+  ok "12 the dev-checkout update branch asks (with --interactive-only) before it exits"
+else
+  bad "12 the dev-checkout branch of hmd --update never asks — the one machine that needs it"
+fi
+
 echo ""
 echo "── dream-install-wire: $PASS passed, $FAIL failed ──"
 [ "$FAIL" -eq 0 ] || exit 1

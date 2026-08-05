@@ -587,6 +587,72 @@ else
   bad "(19) the printed block drifted between runs"
 fi
 
+# ── (20) --interactive-only: DEFER rather than spend the one-shot in a pipe ──────
+#
+# THE CALL SITE THIS EXISTS FOR. The published install is `curl … | bash`. Plain `ask`
+# is right for a hook or a manual run — it prints the block and records that it did. But
+# an installer running under a pipe has NO human: the block scrolls past unread and the
+# marker is spent, so the FIRST person who ever sits at a terminal is met with silence.
+# That is strictly worse than not asking at all, because the one chance was consumed by
+# nobody.
+#
+# So the install and update paths pass --interactive-only, which means: ask NOW if a
+# human is demonstrably here, otherwise do NOTHING AT ALL and stay armed. Nothing means
+# nothing — no block, no marker, no stdin read, exit 0.
+#
+# THE GATE IS THE SAME ONE. --interactive-only reuses can_prompt() verbatim, so there is
+# exactly one definition of "a human is present" in the file and a caller cannot invent a
+# second that disagrees with it. §20e is the falsifier: a real pty still prompts.
+echo
+echo "  -- deferral arm (--interactive-only) --"
+
+rm -f "$STATE"; : > "$OPENLOG"
+write_status "$STATUSF" blocked tcc-denied "$PROT_REPO"
+
+D_RC=0
+D_OUT="$(printf 'B\ny\n' | "$PERM" ask --repo "$PROT_REPO" --interactive-only 2>&1)" || D_RC=$?
+[ -z "$D_OUT" ] \
+  && ok "(20) --interactive-only with no TTY prints NOTHING — no block scrolls past in a pipe" \
+  || bad "(20) --interactive-only printed into a pipe: $(printf '%s' "$D_OUT" | head -3 | tr '\n' ' ')"
+[ "$D_RC" = 0 ] && ok "(20) --interactive-only with no TTY exits 0" \
+  || bad "(20) --interactive-only exited $D_RC"
+[ ! -s "$OPENLOG" ] && ok "(20) --interactive-only with no TTY opens nothing" \
+  || bad "(20) --interactive-only opened something: $(tr '\n' ' ' < "$OPENLOG")"
+
+# THE ANTI-BURN ASSERTION — the whole point. A deferred ask must leave the one-shot
+# UNSPENT, or wiring it into a piped installer would permanently mute the first real ask.
+[ ! -f "$STATE" ] \
+  && ok "(20) --interactive-only does NOT spend the one-shot marker when it defers" \
+  || bad "(20) a headless --interactive-only wrote the marker — the first real ask is now muted"
+
+# And it cannot block on the pipe either: an unread stdin is what makes that impossible.
+LEFTOVER2="$(printf 'B\ny\n' | { "$PERM" ask --repo "$PROT_REPO" --interactive-only >/dev/null 2>&1; cat; })"
+[ "$LEFTOVER2" = "$(printf 'B\ny')" ] \
+  && ok "(20) --interactive-only leaves stdin UNREAD — a piped installer cannot wedge" \
+  || bad "(20) --interactive-only consumed stdin: got '$LEFTOVER2'"
+
+# The deferral is only worth anything if the ask is still THERE afterwards.
+STILL="$("$PERM" ask --repo "$PROT_REPO" 2>&1)"
+printf '%s' "$STILL" | grep -q 'Full Disk Access' \
+  && ok "(20) after a deferral the ask is still ARMED — the first human still gets it" \
+  || bad "(20) a deferred ask went missing: $(printf '%s' "$STILL" | tr '\n' ' ' | cut -c1-160)"
+
+# (20e) FALSIFIER: the gate is genuinely the tty. With a REAL pty, --interactive-only
+# does NOT defer — it asks. If this went green while §20's silence also went green for
+# the wrong reason (e.g. the flag disabling the ask outright), this assertion catches it.
+rm -f "$STATE"; : > "$OPENLOG"
+if command -v script >/dev/null 2>&1; then
+  PTY_D="$(script -q /dev/null "$PERM" ask --repo "$PROT_REPO" --interactive-only </dev/null 2>&1 | tr -d '\r' || true)"
+  printf '%s' "$PTY_D" | grep -q "$PROMPT_MARK" \
+    && ok "(20) FALSIFIER: with a REAL pty --interactive-only ASKS (it defers, it never disables)" \
+    || bad "(20) --interactive-only failed to ask on a real terminal"
+  printf '%s' "$PTY_D" | grep -q 'Full Disk Access' \
+    && ok "(20) the pty path still prints the full block before the prompt" \
+    || bad "(20) --interactive-only dropped the block on a real terminal"
+else
+  bad "(20) script(1) unavailable — cannot prove --interactive-only asks on a real tty"
+fi
+
 echo "------------------------------"
 if [ "$FAIL" -eq 0 ]; then
   printf "dream-permission: \033[32m%d passed\033[0m, 0 failed\n" "$PASS"
