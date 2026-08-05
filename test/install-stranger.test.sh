@@ -536,6 +536,12 @@ cp "$RESOLVED_PLUGIN/bin/lib/real-home.sh" "$PROBE_TREE/bin/lib/real-home.sh" 2>
 # undefined predicate REFUSES the install — so omitting it would push §8 onto that branch
 # and turn a refusal-shaped assertion green for entirely the wrong reason.
 cp "$RESOLVED_PLUGIN/bin/lib/tcc-paths.sh" "$PROBE_TREE/bin/lib/tcc-paths.sh" 2>/dev/null || true
+# heimdall-dream-runner is ProgramArguments[0] since the clock/runner split (245ede5): the
+# register path STAGES it outside the repo and REFUSES outright when the source is absent
+# ("heimdall-dream-runner missing at ..."). This probe tree predates that split and never
+# grew the file, so §8's install probes had been failing on a missing fixture rather than
+# on anything they were written to test — 4 failures that were pre-existing on main.
+cp "$RESOLVED_PLUGIN/bin/heimdall-dream-runner" "$PROBE_TREE/bin/heimdall-dream-runner" 2>/dev/null || true
 # heimdall-dream is the binary the schedule REGISTERS. §8 needs it present because
 # cmd_install refuses without an executable dream bin, and the plist it writes must
 # name this exact path. It is never executed here — only stat'd and embedded.
@@ -756,8 +762,9 @@ plant_plist() { printf '<plist>nightly</plist>\n' > "$1/LaunchAgents/com.heimdal
 if [ ! -x "$PROBE_TREE/bin/heimdall" ] || [ ! -x "$PROBE_TREE/bin/heimdall-dream-schedule" ] \
    || [ ! -f "$PROBE_TREE/bin/lib/real-home.sh" ] || [ ! -x "$PROBE_TREE/bin/heimdall-dream" ] \
    || [ ! -f "$PROBE_TREE/bin/lib/tcc-paths.sh" ] \
+   || [ ! -f "$PROBE_TREE/bin/heimdall-dream-runner" ] \
    || [ ! -f "$PROBE_TREE/install.sh" ]; then
-  bad "launchd-guard probes unavailable — installed tree lacked heimdall / heimdall-dream-schedule / heimdall-dream / bin/lib/real-home.sh / bin/lib/tcc-paths.sh / install.sh"
+  bad "launchd-guard probes unavailable — installed tree lacked heimdall / heimdall-dream-schedule / heimdall-dream / heimdall-dream-runner / bin/lib/real-home.sh / bin/lib/tcc-paths.sh / install.sh"
 else
 
 # (7f) REAL-USER UNINSTALL REMOVES THE NIGHTLY LAUNCHAGENT.
@@ -1051,6 +1058,7 @@ cp "$PROBE_TREE/bin/heimdall-dream-schedule" "$WT_MAIN/bin/heimdall-dream-schedu
 cp "$PROBE_TREE/bin/heimdall-dream"          "$WT_MAIN/bin/heimdall-dream" 2>/dev/null || true
 cp "$PROBE_TREE/bin/lib/real-home.sh"        "$WT_MAIN/bin/lib/real-home.sh" 2>/dev/null || true
 cp "$PROBE_TREE/bin/lib/tcc-paths.sh"        "$WT_MAIN/bin/lib/tcc-paths.sh" 2>/dev/null || true
+cp "$PROBE_TREE/bin/heimdall-dream-runner"   "$WT_MAIN/bin/heimdall-dream-runner" 2>/dev/null || true
 chmod +x "$WT_MAIN/bin/heimdall-dream-schedule" "$WT_MAIN/bin/heimdall-dream" 2>/dev/null || true
 git -C "$WT_MAIN" init -q >/dev/null 2>&1
 git -C "$WT_MAIN" add -A >/dev/null 2>&1
