@@ -136,18 +136,42 @@ def read_wall(repo, path=None):
     return out
 
 
-def refresh_due(repo, ttl=WALL_CACHE_TTL, path=None, now=None):
-    """True when the wall cache is COLD or older than `ttl`.
+def refresh_due(repo, ttl=WALL_CACHE_TTL, path=None, now=None, producer=None):
+    """True when the wall cache is COLD, older than `ttl`, or OLDER THAN ITS PRODUCER.
 
     Stat-only, so asking is free: a fresh cache means the render forks NOTHING. This is what
     keeps the 62ms roster build off the hot path without letting the wall go stale.
+
+    THE PRODUCER RULE (`producer` = the path of the roster lib the refresh child runs).
+    A cache keyed only on TIME is a second source of truth: it outlives the code that made
+    it. That shipped — repo_roster gained the identity merge at 10:07 while the wall cache
+    had been written at 10:05, so for the next fifteen minutes the renderer served the
+    PRE-FIX snapshot and put the owner on his own wall as a second person, while the roster
+    CLI run against the same repo in the same second returned one row.
+
+    This cache is a MEMO of repo_roster.build(), so its key must include the identity of the
+    function it memoises, not just the clock. A producer mtime NEWER than the snapshot means
+    the snapshot came out of a previous version of that function → COLD, whatever its age.
+    One `stat` (microseconds, no read, no hash), and the next render's already-throttled
+    child rewrites the cache with the current code. That is what leaves exactly ONE code
+    path — today's build() — deciding who is on the wall.
+
+    An unstattable producer degrades to the plain age rule: a wall that is merely stale is a
+    far smaller fault than a wall that forks a roster build on every single prompt.
     """
     p = path or wall_cache_path(repo)
     when = float(now) if now is not None else time.time()
     try:
-        return (when - os.path.getmtime(p)) > float(ttl)
+        cached_at = os.path.getmtime(p)
     except Exception:
         return True   # absent/unstattable → cold, so the child should warm it
+    if producer:
+        try:
+            if os.path.getmtime(producer) > cached_at:
+                return True
+        except Exception:
+            pass      # no producer to compare against → the age rule alone decides
+    return (when - cached_at) > float(ttl)
 
 
 def _live_index(live, when, online_ttl):

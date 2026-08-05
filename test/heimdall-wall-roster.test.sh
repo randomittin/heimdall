@@ -372,6 +372,41 @@ if not W.refresh_due(r):
 else:
     bad("F3 a fresh cache asked for a refresh (would fork every prompt)")
 
+# ── F4–F6: THE CACHE MAY NOT OUTLIVE THE CODE THAT PRODUCED IT ────────────────────
+# The MEASURED defect: repo_roster gained the identity merge at 10:07 and the wall cache had
+# been written at 10:05. For the next 15 minutes (WALL_CACHE_TTL) the renderer kept serving
+# the PRE-FIX snapshot — the owner rendered as TWO people on the wall while the roster CLI,
+# run against the same repo at the same moment, returned ONE. The cache was a SECOND source
+# of truth for identity, keyed only on time, so it survived the fix that invalidated it.
+#
+# A memo may not outlive its producer. The cache is a memo of repo_roster.build(), so a
+# producer NEWER than the snapshot means the snapshot came from a previous version of the
+# code and is COLD regardless of its age. That is what makes exactly one code path — the
+# current build() — decide who is on the wall.
+r = repo("f_producer")
+put_wall(r, [row("rj", "online")])
+producer = os.path.join(TMP, "f_producer", "producer.py")
+with open(producer, "w") as f:
+    f.write("# the roster lib\n")
+cache_mtime = os.path.getmtime(W.wall_cache_path(r))
+
+os.utime(producer, (cache_mtime - 60, cache_mtime - 60))     # lib OLDER than the snapshot
+if not W.refresh_due(r, producer=producer):
+    ok("F4 a cache NEWER than its producer stays warm — no fork per prompt on a steady lib")
+else:
+    bad("F4 a cache newer than its producer was called stale (would fork every prompt)")
+
+os.utime(producer, (cache_mtime + 60, cache_mtime + 60))     # lib NEWER than the snapshot
+if W.refresh_due(r, producer=producer):
+    ok("F5 a cache OLDER than its producer is COLD — a roster fix can never serve stale identity")
+else:
+    bad("F5 a cache predating its producer stayed warm — the 10:05-vs-10:07 wall bug is live")
+
+if not W.refresh_due(r, producer=os.path.join(TMP, "f_producer", "absent.py")):
+    ok("F6 an UNSTATTABLE producer falls back to the age rule (degrades, never forks forever)")
+else:
+    bad("F6 a missing producer forced a refresh on every prompt")
+
 # ══════════════════════════════════════════════════════════════════════════════════
 print("\nG. DEGRADATION: the statusline never crashes, hangs, or blanks the line")
 

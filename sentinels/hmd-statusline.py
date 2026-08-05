@@ -512,8 +512,14 @@ def _spawn_presence(cwd, handle, verdict, present=True):
     # means the file it writes is complete.
     wall_cache = WALL.wall_cache_path(cwd); wlock = wall_cache + ".lock"
     roster_lib = os.path.join(BIN_DIR, "lib", "repo_roster.py")
+    # `producer=roster_lib` keys the cache on the CODE as well as the clock: a wall cache
+    # written before the roster lib it memoises is COLD on sight, so a roster fix (an identity
+    # merge, a tier change) can never keep serving its pre-fix answer for the rest of the TTL.
+    # Without it the renderer and `repo_roster.py --repo <same repo>` disagreed for 15 minutes
+    # after every roster change — two sources of truth for who is on the wall.
     try:
-        wall_due = (os.access(roster_lib, os.R_OK) and WALL.refresh_due(cwd) and
+        wall_due = (os.access(roster_lib, os.R_OK) and
+                    WALL.refresh_due(cwd, producer=roster_lib) and
                     not (os.path.exists(wlock) and now - os.path.getmtime(wlock) < 120))
     except Exception:
         wall_due = False
