@@ -1025,6 +1025,10 @@ def _last_seen(now, ts):
 # three. The channels are deliberately split: COLOUR carries only the binary present/absent,
 # the WORD carries the four-way tier. That split is what stops a subtle hue from ever being
 # the only thing standing between "here" and "not here".
+# The Row4 absent segment's cell budget, matching the team column. The AGE is budgeted
+# first inside it and never truncated; the branch takes only what genuinely remains.
+_ABSENT_SEG_CELLS = 8
+
 TEAM_TIER = {              # tier → (glyph, word, show_age)
     "away":        ("⊘", "off", True),    # a heartbeat, but stale     → `⊘off 3d`
     "contributed": ("⌁", "git", True),    # a commit, no presence ever → `⌁git 3d`
@@ -1070,10 +1074,29 @@ def _team_tier_seg(m, now):
     An absent person must never be a subtly-different present one: a viewer who misreads this
     is the exact failure this wall exists to prevent."""
     glyph, word, show_age = TEAM_TIER.get(_tier_of(m), TEAM_TIER["member"])
+    # The WORD slot prefers the person's BRANCH when we know it. `git` is the same string on
+    # every contributed row — it spends the widest field on the column telling you a source
+    # that never varies, while `fix/mdr-preview-cardid` says what they were actually doing.
+    # The tier stays readable without it: the glyph is already outside the online vocabulary
+    # and differs per tier, and the hue still carries present/absent. When there is no branch
+    # (no tip they authored) the word returns, so the slot is never empty and the tier is
+    # never unlabelled.
     ts = m.get("ts")
-    if show_age and isinstance(ts, (int, float)) and not isinstance(ts, bool):
-        return f"{FAINT}{glyph}{word} {_last_seen(now, ts)}{X}"
-    return f"{FAINT}{glyph}{word}{X}"
+    has_age = show_age and isinstance(ts, (int, float)) and not isinstance(ts, bool)
+    age = _last_seen(now, ts) if has_age else ""
+    branch = str(m.get("last_branch") or "").strip()
+
+    # THE AGE OUTRANKS THE BRANCH, always. The segment is 8 cells; `<glyph><branch> <age>`
+    # does not fit both at that width, and the earlier attempt clipped the AGE — producing
+    # `⌁main 1…`, which drops the very number that says "not here" and leaves a bare branch
+    # under a name. That is the presence misread this wall exists to prevent, so the branch
+    # is shown ONLY when it fits WHOLE alongside a WHOLE age. Otherwise the tier word
+    # returns. A wider terminal earns the branch; a narrow one never trades away the signal.
+    room = _ABSENT_SEG_CELLS - len(glyph) - (len(age) + 1 if age else 0)
+    label = branch if (branch and 0 < len(branch) <= room) else word
+    if age:
+        return f"{FAINT}{glyph}{label} {age}{X}"
+    return f"{FAINT}{glyph}{label}{X}"
 
 
 def _team_state_seg(m, now):

@@ -588,7 +588,7 @@ echo
 # ═════════════════════════════════════════════════════════════════════════════
 echo "── I. THE FROZEN CONTRACT (exact keys, exact types, exact tier vocabulary) ──"
 # ═════════════════════════════════════════════════════════════════════════════
-WANT_KEYS="haid,handle,last_commit_ts,last_seen_ts,online,sources,tier"
+WANT_KEYS="haid,handle,last_branch,last_commit_ts,last_seen_ts,online,sources,tier"
 KEYSETS="$(get "$OUT" "'|'.join(d['keysets'])")"
 [ "$KEYSETS" = "$WANT_KEYS" ] \
   && ok "I  every row has EXACTLY the 7 contract keys and no others" \

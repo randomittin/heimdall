@@ -131,6 +131,9 @@ def read_wall(repo, path=None):
             "online": r.get("online") is True,
             "last_seen_ts": _num(r.get("last_seen_ts")),
             "last_commit_ts": _num(r.get("last_commit_ts")),
+            # Display only — never an identity key, never a presence fact. A branch name is
+            # repo metadata, so carrying it reveals nothing a git log would not.
+            "last_branch": str(r.get("last_branch") or ""),
             "sources": [str(s) for s in (r.get("sources") or []) if s],
         })
     return out
@@ -325,6 +328,13 @@ def wall_members(rows, self_ids=None, now=None, cap=None):
             # a fact about their last commit, and `⎇feature/x` under a name reads as someone
             # working on it right now — the exact misread this wall exists to prevent.
             "branch": str(r.get("branch") or "") if online else "",
+            # A SECOND, deliberately separate key. `branch` above stays PRESENT-ONLY because a
+            # bare `⎇feature/x` under a name reads as someone working on it right now.
+            # `last_branch` is the historical fact and is only ever rendered inside the faint
+            # absent segment, WITH the age — `⌁fix/mdr-preview 16h` cannot be misread as
+            # presence the way a bare branch can. Two keys, because they mean different things:
+            # collapsing them is what would reintroduce the misread.
+            "last_branch": str(r.get("last_branch") or ""),
             "state": str(r.get("verdict") or "") if online else tier,
             "ts": _tier_ts(r),
             "online": online,

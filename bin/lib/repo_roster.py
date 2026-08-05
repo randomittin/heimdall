@@ -526,7 +526,7 @@ def is_bot(name=None, email=None, login=None):
 # ═════════════════════════════════════════════════════════════════════════════════════════════
 
 def fragment(kind, *, handle=None, haid=None, email=None, name=None, login=None,
-             online=False, last_seen_ts=None, last_commit_ts=None):
+             online=False, last_seen_ts=None, last_commit_ts=None, last_branch=None):
     """Build one identity fragment. `kind` is the source that produced it and is the ONLY way a
     row can acquire the "presence" source, hence the only way it can carry a presence fact."""
     frag = {
@@ -542,6 +542,8 @@ def fragment(kind, *, handle=None, haid=None, email=None, name=None, login=None,
         "online": bool(online),
         "last_seen_ts": last_seen_ts,
         "last_commit_ts": last_commit_ts,
+        # The branch of the LATEST commit — display only, never an identity key.
+        "last_branch": (str(last_branch).strip() if last_branch else ""),
         "evidence": [],
     }
     return _derive(frag)
@@ -769,6 +771,14 @@ def _absorb(target, other, evidence):
     target["self_machine"] = target.get("self_machine") or other.get("self_machine") or ""
     target["online"] = bool(target["online"]) or bool(other["online"])
     target["last_seen_ts"] = _max_ts(target["last_seen_ts"], other["last_seen_ts"])
+    # A branch is not a scalar you can max() — it belongs to whichever commit is newer.
+    _t_ts, _o_ts = target.get("last_commit_ts"), other.get("last_commit_ts")
+    if isinstance(_o_ts, (int, float)) and not isinstance(_o_ts, bool) and (
+            not isinstance(_t_ts, (int, float)) or isinstance(_t_ts, bool) or _o_ts > _t_ts):
+        if other.get("last_branch"):
+            target["last_branch"] = other["last_branch"]
+    elif not target.get("last_branch"):
+        target["last_branch"] = other.get("last_branch") or ""
     target["last_commit_ts"] = _max_ts(target["last_commit_ts"], other["last_commit_ts"])
     target["evidence"] = list(target["evidence"]) + list(other["evidence"]) + list(evidence)
     return _derive(target)
@@ -956,17 +966,73 @@ def _git_payload_to_fragments(payload, when, window_days):
         if is_bot(name=(names[0] if names else None), email=email):
             continue
         frag = fragment("git", email=email, name=(names[0] if names else None),
-                        last_commit_ts=float(last))
+                        last_commit_ts=float(last),
+                        last_branch=author.get("last_branch"))
         for extra in names[1:]:
             frag["names"].add(extra.strip())
         out.append(_derive(frag))
     return out
 
 
+
+def _branch_tips(repo):
+    """email -> the branch whose tip that person most recently authored.
+
+    `git log --source`/`%S` cannot answer this: git reaches nearly every commit through
+    `refs/remotes/origin/HEAD` first, so it reports that for almost everyone. Branch tips
+    are the honest source — "the branch they last worked on" IS a branch they are the tip
+    of. One bounded for-each-ref, sorted newest first, so the first hit per email wins.
+
+    Bare remote names (`origin`) and `origin/HEAD` are skipped: they are pointers, not
+    branches, and rendering `origin` under someone's name says nothing.
+    """
+    code, out, _err = _run([
+        "git", "-C", repo, "for-each-ref", "--sort=-committerdate",
+        "refs/heads", "refs/remotes",
+        "--format=%(authoremail)" + _UNIT_SEP + "%(refname:short)",
+    ], GIT_TIMEOUT_SECONDS)
+    if code != 0:
+        return {}
+    tips = {}
+    for line in out.splitlines():
+        parts = line.split(_UNIT_SEP)
+        if len(parts) != 2:
+            continue
+        email = parts[0].strip().lower().lstrip("<").rstrip(">")
+        ref = parts[1].strip()
+        if not email or not ref or ref.endswith("/HEAD") or "/" not in ref and ref == "origin":
+            continue
+        if ref.startswith("origin/"):
+            ref = ref[len("origin/"):]
+        if not ref or ref == "HEAD":
+            continue
+        tips.setdefault(email, ref)
+    return tips
+
+
+def _short_ref(ref):
+    """`refs/heads/feat/x` -> `feat/x`, `refs/remotes/origin/main` -> `main`.
+
+    A ref path is plumbing; a branch name is what a human recognises. Anything we do not
+    recognise is returned unchanged rather than mangled — a slightly long branch name is
+    honest, a truncated-to-nonsense one is not.
+    """
+    if not ref:
+        return ""
+    for prefix in ("refs/heads/", "refs/remotes/origin/", "refs/remotes/", "refs/tags/"):
+        if ref.startswith(prefix):
+            return ref[len(prefix):]
+    return ref
+
+
 def _git_probe(repo, when, window_days):
     """One bounded `git log --all` over the window. Any failure is a clean {ok: False}."""
     cutoff = when - window_days * 86400.0
     since = time.strftime("%Y-%m-%dT%H:%M:%S+0000", time.gmtime(max(0.0, cutoff)))
+    # `--source` + `%S` reports the REF each commit was reached from, which is what makes a
+    # branch name available at all: `%D` only decorates commits a ref points AT, so every
+    # commit behind a tip would come back blank. We already pay for `--all`; the ref rides
+    # along on the same walk rather than costing a second one on the statusline's hot path.
     code, out, _err = _run([
         "git", "-C", repo, "log", "--all", "--no-show-signature",
         "--since=" + since, "--max-count=%d" % GIT_MAX_COMMITS,
@@ -986,10 +1052,14 @@ def _git_probe(repo, when, window_days):
             ts = float(raw_ts)
         except (TypeError, ValueError):
             continue
-        entry = by_email.setdefault(email, {"email": email, "names": [], "last_commit_ts": ts})
+        entry = by_email.setdefault(email, {"email": email, "names": [],
+                                            "last_commit_ts": ts, "last_branch": ""})
         entry["last_commit_ts"] = max(entry["last_commit_ts"], ts)
         if name and name not in entry["names"]:
             entry["names"].append(name)
+    branches = _branch_tips(repo)
+    for email, entry in by_email.items():
+        entry["last_branch"] = branches.get(email, "")
     return {"ok": True, "ts": when, "days": window_days,
             "authors": sorted(by_email.values(), key=lambda a: a["email"])}
 
@@ -1147,9 +1217,17 @@ def _read_json(path):
         return None
 
 
+# Bump when a cached PAYLOAD's SHAPE changes. The key is part of the cache filename, so a
+# bump orphans every stale file instead of serving it. Learned the hard way: `last_branch`
+# was added to the git payload, the key did not move, and the roster kept returning
+# branch-less rows from a cache written by the previous code — indistinguishable from the
+# feature not working. A cache that outlives the code that produced it is a liar.
+_PAYLOAD_SCHEMA = 2
+
+
 def _cache_key(subject, kind, window):
-    raw = "%s\x1f%s\x1f%s" % (os.path.realpath(str(subject)) if os.path.isdir(str(subject))
-                              else str(subject), kind, window)
+    raw = "%s\x1f%s\x1f%s\x1fv%d" % (os.path.realpath(str(subject)) if os.path.isdir(str(subject))
+                              else str(subject), kind, window, _PAYLOAD_SCHEMA)
     digest = 0
     for ch in raw:
         digest = (digest * 131 + ord(ch)) & 0xFFFFFFFFFFFF
@@ -1355,6 +1433,7 @@ def rows(clusters, *, now, git_days):
             "online": bool(has_presence and cluster["online"]),
             "last_seen_ts": cluster["last_seen_ts"] if has_presence else None,
             "last_commit_ts": cluster["last_commit_ts"],
+            "last_branch": cluster.get("last_branch") or "",
             "sources": _sources(cluster),
         })
     return out
