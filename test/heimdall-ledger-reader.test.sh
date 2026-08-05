@@ -16,7 +16,9 @@
 #   2. missing file → daemon:"down" + empty gates/team, verdict None (no crash).
 #   3. malformed JSON → the SAME safe default (no crash).
 #   4. legacy statusline.json → mapped into the normalized shape.
-#   5. team filter: drops heartbeats >5min old, EXCLUDES self, caps at 3 + "+N".
+#   5. team filter (post 7-day OFFLINE WINDOW): a heartbeat older than 5min is NO LONGER
+#      dropped — it KEEPS its wall slot marked offline and only leaves past the 7-day
+#      window. EXCLUDES self, sorts live-first, caps at 3 + "+N" over every RETAINED member.
 #   6. gate-deny teammate keeps state "deny" (the statusline colors the name red).
 #   7. 5s cache HIT: a 2nd read within 5s does NOT re-read the source status.json
 #      (proven by mutating the source after the 1st read — the cache wins);
@@ -126,40 +128,60 @@ print("OK")
 [ "$OUT" = "OK" ] && ok "legacy statusline.json mapped to normalized shape" || bad "legacy mapping wrong: $OUT"
 clean
 
-# ── 5) team filter: stale-drop + self-exclude + cap 3 (+N) + deny-preserve ──
-echo "== 5) team filter: >5min drop, self-exclude, cap 3 (+N), deny preserved =="
+# ── 5) team filter: offline-retain + window-drop + self-exclude + cap 3 (+N) ──
+echo "== 5) team filter: offline retained, >7d dropped, self-excluded, cap 3 (+N) =="
 fresh
-# now=100000. self = "rj". stale entry ts=99000 (>300s old) must drop. 5 fresh
-# non-self members (one denies) → capped to 3 + overflow 2. self excluded.
+# now=1000000. self = "rj".
+#   away    ts=999000  → 1000s old: PAST the 5min live TTL but INSIDE the 7-day window, so it
+#                       KEEPS a wall slot marked offline (it is not present, it is not erased).
+#                       Offline sorts last, so it is capped out of the 3 rendered names while
+#                       still being COUNTED in the overflow — 6 retained − cap 3 = "+3".
+#   ancient ts=300000  → 700000s (8.1 days) old: BEYOND the window, dropped outright.
+# 5 live non-self members (one denies) + away = 6 retained → 3 rendered + overflow 3.
 cat > "$WS/ledger/status.json" <<'JSON'
 {"daemon": false, "gates": [], "verdict": null,
  "team": [
-   {"user":"rj",    "sigil":"A","branch":"main","state":"pass",   "ts":99999},
-   {"user":"stale", "sigil":"S","branch":"old", "state":"pass",   "ts":99000},
-   {"user":"mira",  "sigil":"M","branch":"feat","state":"deny",   "ts":99900},
-   {"user":"kai",   "sigil":"K","branch":"feat","state":"running","ts":99950},
-   {"user":"lena",  "sigil":"L","branch":"dev", "state":"pass",   "ts":99960},
-   {"user":"omar",  "sigil":"O","branch":"dev", "state":"pass",   "ts":99970},
-   {"user":"priya", "sigil":"P","branch":"dev", "state":"pass",   "ts":99980}
+   {"user":"rj",     "sigil":"A","branch":"main","state":"pass",   "ts":999999},
+   {"user":"away",   "sigil":"S","branch":"old", "state":"pass",   "ts":999000},
+   {"user":"ancient","sigil":"Z","branch":"gone","state":"pass",   "ts":300000},
+   {"user":"mira",   "sigil":"M","branch":"feat","state":"deny",   "ts":999900},
+   {"user":"kai",    "sigil":"K","branch":"feat","state":"running","ts":999950},
+   {"user":"lena",   "sigil":"L","branch":"dev", "state":"pass",   "ts":999960},
+   {"user":"omar",   "sigil":"O","branch":"dev", "state":"pass",   "ts":999970},
+   {"user":"priya",  "sigil":"P","branch":"dev", "state":"pass",   "ts":999980}
  ]}
 JSON
-OUT="$(HEIMDALL_HOME="$WS" HMD_STATUSLINE_TMP="$TMPC" HMD_NOW=100000 HMD_HANDLE=rj pyrun '
+OUT="$(HEIMDALL_HOME="$WS" HMD_STATUSLINE_TMP="$TMPC" HMD_NOW=1000000 HMD_HANDLE=rj pyrun '
+import json, os
 r = L.read_status("sess-team")
 t = r["team"]
 users = [m["user"] for m in t]
 assert "rj" not in users, ("self not excluded", users)
-assert "stale" not in users, ("stale not dropped", users)
+assert "ancient" not in users, ("beyond-window member not dropped", users)
+assert "away" not in users, ("offline member outranked a live one", users)
 assert len(t) == 3, ("cap not 3", users)
-assert r["team_overflow"] == 2, ("overflow wrong", r["team_overflow"])
+assert r["team_overflow"] == 3, ("overflow wrong", r["team_overflow"])
+# every RENDERED member is live — offline can never displace someone who is here now
+assert all(m["online"] for m in t), ("a rendered member was offline", t)
 # deny teammate keeps state deny → statusline reds the name
 mira = [m for m in t if m["user"]=="mira"]
 assert mira and mira[0]["state"] == "deny", ("deny not preserved", t)
 # normalized member shape
 for m in t:
     assert set(m.keys()) >= {"user","sigil","branch","state","ts"}, m
+# RETENTION, past the cap: the away teammate still HOLDS a slot (that is what the overflow
+# counts) and is marked offline — never normalized into a working state.
+raw = json.load(open(os.path.join(os.environ["HEIMDALL_HOME"], "ledger", "status.json")))["team"]
+allm, _of = L.filter_team(raw, now=1000000, self_ids={"rj"}, cap=10)
+names = [m["user"] for m in allm]
+assert "away" in names, ("offline teammate was ERASED, not retained", names)
+assert "ancient" not in names, ("beyond-window teammate retained", names)
+assert len(allm) == 6, ("retained count wrong", names)
+a = [m for m in allm if m["user"]=="away"][0]
+assert a["online"] is False and a["state"] == "offline", ("offline mismarked", a)
 print("OK")
 ' 2>&1)"
-[ "$OUT" = "OK" ] && ok "team filter: stale-drop + self-exclude + cap3(+2) + deny kept" || bad "team filter wrong: $OUT"
+[ "$OUT" = "OK" ] && ok "team filter: offline retained+counted, >7d dropped, self-excl, cap3(+3)" || bad "team filter wrong: $OUT"
 clean
 
 # ── 6) 5s cache hit: 2nd read within 5s does NOT re-read the source ──────────
