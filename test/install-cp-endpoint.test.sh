@@ -26,13 +26,12 @@ REF="$(git -C "$REPO" rev-parse HEAD)"
 # ── Hermeticity guard ────────────────────────────────────────────────────────
 # This suite runs the REAL install.sh, which resolves an existing `hmd` via
 # `command -v hmd`. If the dev's inherited PATH carries <repo>/bin, the installer
-# would treat the repo's OWN tracked bin/hmd as a stale shadow and OVERWRITE it in
-# place — mutating a tracked file (the dev-env-breaking bug). Two defenses:
+# would treat that checkout's OWN tracked bin/hmd as a stale shadow and OVERWRITE it
+# in place — mutating a tracked file (the dev-env-breaking bug). Two defenses:
 #   1) run install.sh under a CONTROLLED PATH (SYS) — python3/git + system dirs
 #      only, never the inherited PATH — so `command -v hmd` finds nothing to touch;
-#   2) a tripwire that RESTORES + fails loudly if any tracked bin/ file changed.
+#   2) the clobber target is a PRIVATE CLONE (see $SRC below), diffed by content.
 SYS="$(dirname "$(command -v python3)"):$(dirname "$(command -v git)"):/usr/bin:/bin"
-BIN_GUARD_BEFORE="$(git -C "$REPO" status --porcelain -- bin/ 2>/dev/null)"
 
 # A unique, obviously-fake token so the "no leak" grep is meaningful — it must
 # never appear in the repo tree, only in the throwaway $HOME under test.
@@ -56,31 +55,60 @@ EOF
 chmod +x "$FAKE_DIR/claude"
 
 TMP_ROOT="$(mktemp -d)"
-# Cleanup + tripwire: a hermetic install test must NEVER mutate a tracked file.
-# If bin/ changed on ANY exit path, restore it and shout (belt to the explicit
-# assertion in the body, which owns the exit code).
+# Cleanup touches ONLY this suite's own temp dirs. It deliberately does NOT revert
+# anything in the developer's tree — see the $SRC note below for why that reverting
+# tripwire was removed.
 cleanup() {
-  local after; after="$(git -C "$REPO" status --porcelain -- bin/ 2>/dev/null)"
-  if [ "$after" != "$BIN_GUARD_BEFORE" ]; then
-    printf '\n\033[31mFATAL\033[0m test mutated tracked bin/ — restoring:\n%s\n' "$after" >&2
-    git -C "$REPO" checkout -- bin/ 2>/dev/null || true
-  fi
   rm -rf "$FAKE_DIR" "$TMP_ROOT"
 }
 trap cleanup EXIT
 
+# ── THE CLOBBER TARGET: a PRIVATE source checkout ─────────────────────────────
+# The guarantee under test is "install.sh, pointed at a LOCAL checkout, never writes
+# into that checkout's bin/" (install.sh pins it via SOURCE_GUARD_ROOTS, keyed on
+# HEIMDALL_REPO). This test used to point the installer at the DEVELOPER'S OWN worktree
+# and diff `git status --porcelain -- bin/` before/after. That was unsound twice over:
+#   - FALSE REDS: the snapshot spans the whole ~30s run, so ANY concurrent edit to bin/
+#     by a teammate or a parallel agent was misattributed to install.sh (run-all.sh runs
+#     suites in PARALLEL, so this was not hypothetical).
+#   - DESTRUCTIVE: on mismatch the cleanup trap ran `git checkout -- bin/` against that
+#     SHARED tree, discarding a teammate's uncommitted work to "restore" it. Measured:
+#     a landed bin/heimdall-modules change was silently reverted mid-session.
+# The installer now gets its own private clone, so the clobber target cannot be touched
+# by anyone else. The guarantee is unchanged; the measurement is now deterministic and
+# no shared tree is ever written to or reverted.
+SRC="$TMP_ROOT/src"
+git clone --quiet "$REPO" "$SRC" 2>/dev/null \
+  || { echo "FATAL: could not create the private source clone of $REPO"; exit 2; }
+
+# Content manifest of bin/: sha256 of every file plus the set of executables. STRICTLY
+# STRONGER than the old `git status --porcelain -- bin/`, which reports only files git
+# tracks — a write to a gitignored or untracked path under bin/ was invisible to it and
+# is caught here.
+bin_manifest() {
+  find "$1/bin" -type f -print0 2>/dev/null | LC_ALL=C sort -z \
+    | xargs -0 shasum -a 256 2>/dev/null
+  find "$1/bin" -type f -perm -u+x -print 2>/dev/null | LC_ALL=C sort
+}
+BIN_GUARD_BEFORE="$(bin_manifest "$SRC")"
+# Anti-vacuous: an empty manifest would make the clobber assertion pass trivially.
+[ -n "$BIN_GUARD_BEFORE" ] \
+  || { echo "FATAL: private clone has no bin/ files — the clobber guard would be vacuous"; exit 2; }
+
 # Owner perm bits of a path, portable across macOS (stat -f) and Linux (stat -c).
 mode_of() { stat -f '%Lp' "$1" 2>/dev/null || stat -c '%a' "$1" 2>/dev/null; }
 
-# Run install.sh from THIS working tree (the installer under test) against a fresh
-# HOME, with a fake claude on PATH and the real environment's secrets unset so the
-# run can never touch the developer's real ~/.claude or CP config. stdin is /dev/null
-# so the TTY-gated prompt path is NOT taken (mirrors curl|bash / CI).
+# Run install.sh from THIS working tree (the installer under test — so uncommitted
+# changes to install.sh ARE covered) against a fresh HOME, with a fake claude on PATH
+# and the real environment's secrets unset so the run can never touch the developer's
+# real ~/.claude or CP config. HEIMDALL_REPO points at the PRIVATE CLONE, so the tree
+# the installer may write into is $SRC and never the developer's own. stdin is
+# /dev/null so the TTY-gated prompt path is NOT taken (mirrors curl|bash / CI).
 run_install() { # $1=HOME  $2=CP_URL (may be empty)  $3=CP_TOKEN (may be empty)
   env -u CLAUDE_CONFIG_DIR -u HEIMDALL_HOME -u HEIMDALL_FORCE \
       -u HEIMDALL_CP_PKI_KEY -u PKI_SEED -u BASE_URL \
       HOME="$1" TERM="dumb" HEIMDALL_NO_COLOR=1 \
-      HEIMDALL_REPO="$REPO" HEIMDALL_REF="$REF" \
+      HEIMDALL_REPO="$SRC" HEIMDALL_REF="$REF" \
       HEIMDALL_CP_URL="$2" HEIMDALL_ENROLL_TOKEN="$3" \
       PATH="$FAKE_DIR:$SYS" \
       bash "$REPO/install.sh" </dev/null 2>&1
@@ -198,12 +226,17 @@ else
   ok "enroll token never appears in any tracked file; .example is example-only"
 fi
 
-# ── (5) HERMETIC — the install runs left the repo's tracked bin/ pristine ───────
-BIN_GUARD_AFTER="$(git -C "$REPO" status --porcelain -- bin/ 2>/dev/null)"
+# ── (5) HERMETIC — the install runs left the source checkout's bin/ pristine ────
+# Byte-for-byte over EVERY file under bin/ (not just the git-tracked ones), against a
+# private clone no other process can touch — so a mismatch here can only have been
+# caused by install.sh itself.
+BIN_GUARD_AFTER="$(bin_manifest "$SRC")"
 if [ "$BIN_GUARD_AFTER" = "$BIN_GUARD_BEFORE" ]; then
-  ok "hermetic: install runs never mutated the repo's tracked bin/ (no clobber)"
+  ok "hermetic: install runs never mutated the source checkout's bin/ (no clobber)"
 else
-  bad "install run MUTATED tracked bin/ (non-hermetic): $BIN_GUARD_AFTER"
+  bad "install run MUTATED the source checkout's bin/ (non-hermetic): $(
+    diff <(printf '%s\n' "$BIN_GUARD_BEFORE") <(printf '%s\n' "$BIN_GUARD_AFTER") \
+      | grep -E '^[<>]' | head -4 | tr '\n' ' ')"
 fi
 
 # ── Tally ──────────────────────────────────────────────────────────────────────
