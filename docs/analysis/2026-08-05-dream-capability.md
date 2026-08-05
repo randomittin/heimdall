@@ -118,7 +118,7 @@ Verified individually against current disk state. (Fixed and confirmed: #5 corpu
 |---|---|---|
 | **#7** spend cap fails open, advertised flat | `bin/lib/cp_daily_budget.py` unchanged (correct by design); the offending copy is `heimdall-site/index.html:245` — **separate repo** at `/Users/rj/Downloads/heimdall-site` | **No** from this repo. A `SECURITY.md` paragraph here *is* doable |
 | **#8** 29 `[RECEIPT:]` markers | Still 16 in `launch-docs/SHOW-HN-DRAFT.md`, 13 in `log-compression-and-gates.md` = 29 exactly | **NO — owner-blocked.** See §3 |
-| **#9** tag vs main diverged | `git describe` → `v2.3.8`; `origin/main` → `063155f`; **259** unpushed | **No — owner decision** (cut the tag) <!-- HEIMDALL:PIN:FROZEN — a `git describe` reading taken on the audit date, paired with the sha it was read beside --> |
+| **#9** tag vs main diverged | `git describe` → `v2.3.8`; `origin/main` → `063155f`; **259** unpushed | **No — owner decision** (cut the tag) <!-- HEIMDALL:PIN:FROZEN — a git-describe reading taken on the audit date, paired with the sha it was read beside --> |
 | **#10** pre-push fails open | Generator fixed, **installed hook stale** — see row 2 above | **Yes** |
 | **#11** bearer secret in shell history | `grep -n 'bearer\|shell history' SECURITY.md` → **no match**. Rotate command shipped, disclosure did not | **Yes** — one SECURITY.md paragraph |
 | **#12** `cp-funnel` 4d absence-grep | `test/cp-funnel.test.sh:427` still `if ! grep -qE … "$LIB/funnel.py" 2>/dev/null`, no `[ -f ]` guard | **Yes** — one line, ~5 min |
