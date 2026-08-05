@@ -2354,6 +2354,16 @@ if [[ "${1:-}" == "--update" || "${1:-}" == "update" ]]; then
       printf "    ${C}cd %s && git pull --ff-only${R}\n" "$PLUGIN_DIR"
       printf "  ${D}or, for a clean reinstall of the released build:${R}\n"
       printf "    ${C}hmd --reinstall${R}\n\n"
+      # THE NIGHTLY /dream PERMISSION STILL GETS ASKED HERE — this branch exits without
+      # ever reaching bin/heimdall-autoupdate, where the ask normally lives, and a dev
+      # checkout is precisely the shape that needs it: a clone living in ~/Downloads is
+      # unreadable to the 03:00 LaunchAgent, because a LaunchAgent carries no TCC grant.
+      # Wiring only the updater would leave the one machine with the problem unasked on
+      # every single update. --interactive-only is the helper's own tty gate: a human at
+      # this terminal is asked here and now; a scripted `hmd --update` does nothing at all
+      # and leaves the ask armed. Best-effort — it can never change this branch's exit 0.
+      PERM="$PLUGIN_DIR/bin/heimdall-dream-permission"
+      [ -x "$PERM" ] && { "$PERM" ask --repo "$PLUGIN_DIR" --interactive-only || true; }
       exit 0
     fi
   fi
