@@ -184,8 +184,18 @@ signed_env() {
   esac
 }
 
+# COUNT, never `grep -q`. `grep -q` exits the instant it matches, and the canary is the
+# FIRST line `env` prints — so grep tore the pipe down while signed_env was still writing
+# the remaining ~4KB, SIGPIPE-killed the producer, and `set -o pipefail` reported the
+# pipeline as 141. That is a verdict about the ambient environment's SIZE, not about the
+# scrub: the same assertion passed under a small env and failed under a large one, and it
+# failed while the canary was in fact surviving intact. Counting drains the stream, so the
+# producer always finishes and the exit status means what it says. Every sibling assertion
+# below already counts for this reason. `= "1"` is also strictly stronger than `-q`: it
+# pins EXACTLY one canary line, so a duplicated or partial readback is red too.
+CANARY_SEEN="$(signed_env | grep -c '^HMD_SCRUB_CANARY=alive$')"
 check "1.1 the readback canary survives, so absence assertions mean something" \
-  'signed_env | grep -q "^HMD_SCRUB_CANARY=alive$"'
+  '[ "$CANARY_SEEN" = "1" ]'
 
 # 1.2 POSITIVE CONTROL — without the scrub a child really does inherit the routing vars.
 # Everything below asserts a var is ABSENT; if inheritance did not happen in the first
