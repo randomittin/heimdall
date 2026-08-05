@@ -13,7 +13,7 @@ I did **not** run the full board (~80 min). What ran:
 
 | Probe | Command | Result |
 |---|---|---|
-| Published one-liner, end to end | `curl -fsSL .../v2.3.8/install.sh \| shasum -a 256` | `28bbdcd…d84580` — **matches** |
+| Published one-liner, end to end | `curl -fsSL .../v2.3.8/install.sh \| shasum -a 256` | `28bbdcd…d84580` — **matches** <!-- HEIMDALL:PIN:FROZEN — a probe result measured on the audit date, not a current claim --> |
 | npm wrapper pin | read `packages/runheimdall/package.json` | tag + sha256 both correct |
 | Stale-digest sweep | grep `168646ba` / `fafe31e` across both repos | only in `test/version-drift.test.sh` as documented history |
 | Isolation oracle | `bin/falsify rr-multitenant-isolation --assert-score 1.0` | `SCORE: 23/23 = 1.0000`, exit 0 |
@@ -60,7 +60,7 @@ grep -ci headroom README.md SECURITY.md CHANGELOG.md            → 0, 0, 0
 grep -ci headroom heimdall-site/{index,faq}.html llms{,-full}.txt → 0, 0, 0, 0
 ```
 
-Now the mitigation, which is real and matters: **nothing auto-installs it.** The shipped `install.sh` at v2.3.8 contains no reference to modules at all (verified against the fetched published bytes). `bin/heimdall-autoupdate` transition 3 explicitly *defers* consent-requiring modules and never passes `--yes`. The manifest disclosure is, genuinely, some of the most honest technical writing in the repo — it volunteers that the storage-codec half **cannot engage** from the documented install, and says so in the same breath as declaring the class.
+Now the mitigation, which is real and matters: **nothing auto-installs it.** The shipped `install.sh` at v2.3.8 contains no reference to modules at all (verified against the fetched published bytes). `bin/heimdall-autoupdate` transition 3 explicitly *defers* consent-requiring modules and never passes `--yes`. The manifest disclosure is, genuinely, some of the most honest technical writing in the repo — it volunteers that the storage-codec half **cannot engage** from the documented install, and says so in the same breath as declaring the class. <!-- HEIMDALL:PIN:FROZEN — names the tag whose published bytes were actually read; a later tag was never inspected -->
 
 But there is a hard contradiction between two shipped code paths. On a manual update the user is told (`bin/heimdall-autoupdate:518-523`):
 
@@ -113,10 +113,12 @@ The rest of this surface is **DEFENSIBLE** and the rebuttal is strong: nothing i
 
 **Truth.** Verified on the **live site**, not just locally:
 
+<!-- HEIMDALL:PIN:FROZEN:BEGIN — a verbatim transcript of what the live site served on the audit date. Rendering it would restate the quotation as a fresh measurement nobody took. -->
 ```
 $ curl -fsSL https://runheimdall.dev/ | grep -o 'curl -fsSL[^<]*'
 curl -fsSL https://raw.githubusercontent.com/randomittin/heimdall/v2.3.8/install.sh | bash
 ```
+<!-- HEIMDALL:PIN:END -->
 
 That is the only `curl` on the page (`heimdall-site/index.html:405`). No digest appears anywhere in `index.html`. Meanwhile `README.md:47` grades this exact path **"Highest"** risk and says *"The digest check is the only thing between you and whatever those bytes are. Verify it, or take path 3."* And `llms.txt:17` advertises *"Tag-pinned and sha256-checked one-liner; the `&&` chain is load-bearing"* — describing a command the site does not print.
 
@@ -204,17 +206,19 @@ The real problem is operational, not reputational: **the drafted post is unposta
 
 **Truth.** Verified:
 
+<!-- HEIMDALL:PIN:FROZEN:BEGIN — a transcript of commands actually run on the audit date. Moving the tag here would attach a real, checkable sha to a `git show` nobody ran. -->
 ```
 git log --oneline origin/main..HEAD | wc -l   → 236
 git show v2.3.8:install.sh | shasum -a 256    → 28bbdcd…d84580   (README + site + npm agree)
 git show HEAD:install.sh   | shasum -a 256    → b3ec4ba…c387c
 ```
+<!-- HEIMDALL:PIN:END -->
 
 Right now this is **correct behaviour**, not a bug: the README pins the *tag*, the tag's bytes hash to the advertised digest, and the published one-liner verifies. `test/version-drift.test.sh` exists precisely because this went wrong three times before, and it currently holds.
 
 The exposure is forward-looking. The digest is duplicated across `README.md` (×2), `heimdall-site/llms-full.txt:43`, `heimdall-site/netlify.toml:25`, and `packages/runheimdall/package.json`, plus the tag string in `heimdall-site/index.html:405` and `robots`/`sitemap`-adjacent copy. Cutting v2.3.9 means updating six places in two repos, and history says that is where it breaks.
 
-**Response: DEFENSIBLE today** — evidence: fetch `https://raw.githubusercontent.com/randomittin/heimdall/v2.3.8/install.sh`, `shasum -a 256`, compare to `README.md:71`. It matches. **But do not launch mid-release.** Cut the tag, verify all six sites, then post. Do not push 236 commits and re-tag while a thread is live.
+**Response: DEFENSIBLE today** — evidence: fetch `https://raw.githubusercontent.com/randomittin/heimdall/v2.3.8/install.sh`, `shasum -a 256`, compare to `README.md:71`. It matches. **But do not launch mid-release.** Cut the tag, verify all six sites, then post. Do not push 236 commits and re-tag while a thread is live. <!-- HEIMDALL:PIN:FROZEN — cites the tag that was actually fetched and compared; the verdict is scoped to it -->
 
 ---
 
@@ -289,7 +293,7 @@ These held up under deliberate attempts to break them. They are launch assets.
 
 | Claim | Evidence |
 |---|---|
-| The published one-liner verifies end to end | `curl -fsSL https://raw.githubusercontent.com/randomittin/heimdall/v2.3.8/install.sh -o f && shasum -a 256 f` → `28bbdcd333ad36380c6ac1f133b654dc2c719d6773710c224ef7c57c44d84580`, matching `README.md:71` |
+| The published one-liner verifies end to end | `curl -fsSL https://raw.githubusercontent.com/randomittin/heimdall/v2.3.8/install.sh -o f && shasum -a 256 f` → `28bbdcd333ad36380c6ac1f133b654dc2c719d6773710c224ef7c57c44d84580`, matching `README.md:71` <!-- HEIMDALL:PIN:FROZEN — the tag and the digest are one receipt; rendering either alone would publish a pairing that was never verified --> |
 | No stale digests anywhere | `168646ba` / `fafe31e` appear **only** in `test/version-drift.test.sh`, as the documented regression they now gate |
 | Clean secret history | `gitleaks detect` over 1171 commits: no leaks with the project config, with default rules, and with `--gitleaks-ignore-path /dev/null` |
 | The `$HOME`-cannot-isolate incident is fixed properly | `bin/lib/real-home.sh` reads the passwd DB via `getpwuid`, not an env opt-out, because *"one forgot, and that is precisely how the incident happened"*. Fail-safe: every "don't know" answers NO. This is the best file in the repo — **put it in the launch post.** |
