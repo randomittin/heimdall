@@ -535,12 +535,23 @@ cp "$RESOLVED_PLUGIN/bin/lib/real-home.sh" "$PROBE_TREE/bin/lib/real-home.sh" 2>
 # cmd_install refuses without an executable dream bin, and the plist it writes must
 # name this exact path. It is never executed here — only stat'd and embedded.
 cp "$RESOLVED_PLUGIN/bin/heimdall-dream" "$PROBE_TREE/bin/heimdall-dream" 2>/dev/null || true
+# heimdall-dream-runner is the program launchd actually EXECS: the schedule stages it into
+# $HEIMDALL_HOME/bin and pins it as ProgramArguments[0], with the dream bin at [2], so a
+# TCC-denied repo read is DETECTED and reported rather than vanishing. install_runner
+# therefore refuses (exit 3) when the runner is absent from the source tree, and it refuses
+# BEFORE write_plist — so a probe tree lacking it puts §8b and §8f's control on a
+# missing-file branch that has nothing to do with the launchd guard they exist to assert.
+# A real install is a full `git clone` of the plugin (install.sh:1051), so the runner always
+# ships beside the schedule that stages it; the probe tree has to model that layout or it
+# stops representing the thing under test. Its presence is asserted below, so a failed copy
+# FAILS LOUD rather than silently re-opening this same hole.
+cp "$RESOLVED_PLUGIN/bin/heimdall-dream-runner" "$PROBE_TREE/bin/heimdall-dream-runner" 2>/dev/null || true
 # install.sh too — §8d sources it (HEIMDALL_INSTALL_SOURCE_ONLY=1) to assert the state
 # word its ensure_dream_schedule returns. Copied HERE, from the INSTALLED tree, because
 # the uninstall below deletes $RESOLVED_PLUGIN before §8 runs.
 cp "$RESOLVED_PLUGIN/install.sh" "$PROBE_TREE/install.sh" 2>/dev/null || true
 chmod +x "$PROBE_TREE/bin/heimdall" "$PROBE_TREE/bin/heimdall-dream-schedule" \
-         "$PROBE_TREE/bin/heimdall-dream" 2>/dev/null || true
+         "$PROBE_TREE/bin/heimdall-dream" "$PROBE_TREE/bin/heimdall-dream-runner" 2>/dev/null || true
 
 # (7·0a) RESERVED-SUBCOMMAND NON-TTY CLASS — the launcher-preamble regression.
 # THE BUG (fixed in bin/heimdall, locked here): the F1 launch resolution-order
@@ -750,8 +761,9 @@ plant_plist() { printf '<plist>nightly</plist>\n' > "$1/LaunchAgents/com.heimdal
 
 if [ ! -x "$PROBE_TREE/bin/heimdall" ] || [ ! -x "$PROBE_TREE/bin/heimdall-dream-schedule" ] \
    || [ ! -f "$PROBE_TREE/bin/lib/real-home.sh" ] || [ ! -x "$PROBE_TREE/bin/heimdall-dream" ] \
+   || [ ! -x "$PROBE_TREE/bin/heimdall-dream-runner" ] \
    || [ ! -f "$PROBE_TREE/install.sh" ]; then
-  bad "launchd-guard probes unavailable — installed tree lacked heimdall / heimdall-dream-schedule / heimdall-dream / bin/lib/real-home.sh / install.sh"
+  bad "launchd-guard probes unavailable — installed tree lacked heimdall / heimdall-dream-schedule / heimdall-dream / heimdall-dream-runner / bin/lib/real-home.sh / install.sh"
 else
 
 # (7f) REAL-USER UNINSTALL REMOVES THE NIGHTLY LAUNCHAGENT.
@@ -1043,8 +1055,15 @@ fi
 WT_MAIN="$(mktemp -d)"; mkdir -p "$WT_MAIN/bin/lib"
 cp "$PROBE_TREE/bin/heimdall-dream-schedule" "$WT_MAIN/bin/heimdall-dream-schedule" 2>/dev/null || true
 cp "$PROBE_TREE/bin/heimdall-dream"          "$WT_MAIN/bin/heimdall-dream" 2>/dev/null || true
+# The runner travels with the schedule here for the same reason it does in $PROBE_TREE: the
+# CONTROL below must register successfully, and install_runner refuses without it. Copied
+# before the commit so the ephemeral worktree checked out of $WT_MAIN carries it too — the
+# ephemeral arm must be refused by the CHECKOUT guard, not by a missing file, or it would
+# pass for the wrong reason and stop proving anything about the incident.
+cp "$PROBE_TREE/bin/heimdall-dream-runner"   "$WT_MAIN/bin/heimdall-dream-runner" 2>/dev/null || true
 cp "$PROBE_TREE/bin/lib/real-home.sh"        "$WT_MAIN/bin/lib/real-home.sh" 2>/dev/null || true
-chmod +x "$WT_MAIN/bin/heimdall-dream-schedule" "$WT_MAIN/bin/heimdall-dream" 2>/dev/null || true
+chmod +x "$WT_MAIN/bin/heimdall-dream-schedule" "$WT_MAIN/bin/heimdall-dream" \
+         "$WT_MAIN/bin/heimdall-dream-runner" 2>/dev/null || true
 git -C "$WT_MAIN" init -q >/dev/null 2>&1
 git -C "$WT_MAIN" add -A >/dev/null 2>&1
 git -C "$WT_MAIN" -c user.email=t@t -c user.name=t commit -qm probe >/dev/null 2>&1
