@@ -1551,6 +1551,27 @@ hmd_bump_run_count() {
   fi
   return 0
 }
+# ── LIBRARY-ONLY MODE: RESOLVE THE FLAG ONCE, TRUTHILY ────────────────────────
+# Both halves of library mode used to test the raw variable for EMPTINESS
+# (-z here, -n at part 2). Emptiness is the wrong question for a boolean: it makes
+# every non-empty value mean ON, so `HEIMDALL_LIB_ONLY=0` -- a caller explicitly
+# turning the flag OFF -- turned it ON and silenced the entire CLI. `hmd version`
+# then printed NOTHING and exited 0, and so did every other subcommand.
+#
+# That failure is invisible by construction, which is what makes it worth a named
+# variable: no output, no error, exit 0. It is the same shape as the incident
+# recorded below (hmd-emit-usage exiting 0 having asserted nothing), and anyone
+# who exports HEIMDALL_LIB_ONLY=0 in a shell gets an `hmd` that silently does
+# nothing at all. Resolve to a normalized 0/1 ONCE, here, and let both guards read
+# the answer instead of re-deriving it differently at two sites ~2000 lines apart.
+#
+# Assigned unconditionally (never :-) so a stray HMD_LIB_ONLY in the caller's
+# environment cannot decide this.
+case "${HEIMDALL_LIB_ONLY:-}" in
+  ''|0|no|NO|No|off|OFF|Off|false|FALSE|False) HMD_LIB_ONLY=0 ;;
+  *)                                           HMD_LIB_ONLY=1 ;;
+esac
+
 # ── LIBRARY-ONLY MODE, part 1 of 2: SKIP THE LAUNCHER DISPATCH ────────────────
 # The acceptance harness sources this file with HEIMDALL_LIB_ONLY=1 to exercise
 # individual functions. `source` inherits the CALLER's positional parameters, so a
@@ -1568,7 +1589,7 @@ hmd_bump_run_count() {
 # library mode skips the run-count bump and the whole dispatch HERE, then stops at
 # part 2 once those definitions have been read. Both halves are required; neither
 # alone makes the documented "no setup side-effects" contract true.
-if [ -z "${HEIMDALL_LIB_ONLY:-}" ]; then
+if [ "$HMD_LIB_ONLY" = 0 ]; then
 
 hmd_bump_run_count || true
 
@@ -3573,7 +3594,7 @@ PYEOF
 # capture_and_emit_usage) in isolation, with NO setup side-effects and NO real
 # `claude` call. A no-op for normal runs (the var is unset), so the launcher is
 # unaffected. `return` works when sourced; the `|| exit 0` covers a direct run.
-if [ -n "${HEIMDALL_LIB_ONLY:-}" ]; then
+if [ "$HMD_LIB_ONLY" = 1 ]; then
   return 0 2>/dev/null || exit 0
 fi
 

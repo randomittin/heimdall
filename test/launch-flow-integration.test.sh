@@ -32,8 +32,12 @@ pty_run() { script -q /dev/null bash -c "$1" 2>&1; }
 
 echo "── (1) COLD LAUNCH NON-TTY is inert + never hangs (the hang-discipline seam) ──"
 OUT_NT="$(eval "$ONBOARD" 2>&1)"            # onboarding piped (non-TTY) → must be silent
-VER="$(HEIMDALL_LIB_ONLY=0 "$HMD" version 2>/dev/null | head -1)"   # reserved subcmd, non-TTY
-VRC=$?
+# Capture the status of `hmd version` ITSELF, not of the pipeline's LAST stage. This was
+# `... | head -1` with a following VRC=$?, which records head's status -- head exits 0 on any
+# input, including none -- so the rc arm of the assertion below could never fail and the check
+# was reporting rc=0 for a subcommand that had in fact printed nothing at all.
+VER_RAW="$(HEIMDALL_LIB_ONLY=0 "$HMD" version 2>/dev/null)"; VRC=$?   # reserved subcmd, non-TTY
+VER="$(printf '%s\n' "$VER_RAW" | head -1)"
 if [ -z "$OUT_NT" ] && printf '%s' "$VER" | grep -q '^Heimdall v[0-9]' && [ "$VRC" -eq 0 ]; then
   ok "(1) non-TTY: onboarding silent + reserved 'version' completes fast ($VER), no hang"
 else
