@@ -88,6 +88,7 @@
 #   heimdall-modules remove <name>        total removal
 #   heimdall-modules update [<name>]      move to the manifest's human-set pin
 #   heimdall-modules status <name>        one module in detail
+#   heimdall-modules rewire <name>        re-run the wire step ONLY; refresh the record
 #   heimdall-modules verify [<name>]      re-run class invariants (CI entry point)
 #   heimdall-modules preflight <name>     can it install? every precondition + its fix
 #   heimdall-modules repair <name>        preflight, fix what is fixable, re-attempt
@@ -165,7 +166,7 @@ done
 
 CMD="${CMD:-list}"
 case "$CMD" in
-  list|add|remove|update|status|verify|preflight|repair|defer|pending|optout|optin) : ;;
+  list|add|remove|update|status|rewire|verify|preflight|repair|defer|pending|optout|optin) : ;;
   *) echo "error: unknown command: $CMD" >&2; usage >&2; exit 2 ;;
 esac
 
@@ -1487,6 +1488,107 @@ cmd_remove() {
   fi
 }
 
+# WHY THIS MEASURES INSTEAD OF REPLAYING. This paragraph used to print the verdict
+# wired.json recorded at add time, on the stated reasoning that reading the same
+# record the wire step wrote cannot drift from it. It cannot drift from the RECORD.
+# It can drift from the MACHINE, and it did: Headroom's canonical record was
+# written before the wrap-chain handler existed, so it carries no per-wire verdict
+# at all, while bin/heimdall-wrap references the module and a live add measures
+# ROUTED. Nothing on the machine could correct it either — `add` refuses an
+# installed module and `update` reports nothing to do. That is the fourth artifact
+# in one day to outlive the code that produced it, after a roster payload cache, a
+# wall cache and an installed pre-push hook.
+#
+# A verdict measured on READ cannot go stale, so this measures on read. The
+# add-time record is kept as PROVENANCE, and when the two disagree the
+# DISAGREEMENT is printed rather than either side being silently preferred —
+# quietly overwriting the loser is how the drift stayed invisible the first time.
+#
+# READ-ONLY, AND THAT IS LOAD-BEARING. Every handler wire_apply dispatches to is a
+# measurement and nothing else: a grep of a file, a `status --json` question to the
+# codec seam, an environment read. `status` writes nothing, which is what makes it
+# safe to run against a live install. `rewire` is the verb that writes.
+#
+# EXTRACTED INTO ITS OWN FUNCTION ON PURPOSE: test/wire-kind-dispatch.test.sh W7
+# reconstructs the replaying body of this function to prove the measured
+# assertions can fail, and a mutant needs a function boundary to replace.
+status_wiring() {
+  local name="$1" d="$2"
+  local mf n i kind target lines="" nrouted=0 recorded
+
+  # Re-deriving needs the DECLARATION, which lives in the manifest. If the module
+  # is installed but its manifest has left the registry, what it declares is
+  # genuinely unknown here — so this says so and falls back to the record labelled
+  # as history, rather than reporting "0 wires declared, the module is inert",
+  # which would be a fresh lie told to fix an old one.
+  mf="$(manifest_path "$name")"
+  if [ ! -f "$mf" ]; then
+    printf '    wiring:   CANNOT BE MEASURED — "%s" is installed but its manifest is gone\n' "$name"
+    printf '              from the registry (%s), so what it declares is\n' "${mf#"$PLUGIN_DIR"/}"
+    printf '              unknown here. The add-time record below is HISTORY, not a\n'
+    printf '              statement about this machine now:\n'
+    jq -r '(.wires // [])[] |
+      "              \(.kind) -> \(.target): recorded \(if (.measured | not) then "NOT MEASURED" elif .routed then "ROUTED" else "not routed" end) at add time"' \
+      "$d/wired.json" 2>/dev/null
+    printf '              Diagnose: hmd modules verify %s\n' "$name"
+    return 0
+  fi
+
+  n="$(jq -r '(.wires // []) | length' "$mf" 2>/dev/null || echo 0)"
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  if [ "$n" = "0" ]; then
+    printf '    wiring:   0 wires declared — the module is inert\n'
+    return 0
+  fi
+
+  # Same indexed walk wire_module() uses, so the two read a manifest identically.
+  i=0
+  while [ "$i" -lt "$n" ]; do
+    kind="$(jq -r --argjson i "$i" '.wires[$i].kind // ""' "$mf")"
+    target="$(jq -r --argjson i "$i" '.wires[$i].target // ""' "$mf")"
+    if ! wire_apply "$name" "$kind" "$target"; then
+      lines="$lines              $kind -> $target: CANNOT BE APPLIED — $WIRE_DETAIL
+"
+    elif [ "$WIRE_MEASURED" -eq 0 ]; then
+      lines="$lines              $kind -> $target: NOT MEASURABLE HERE — $WIRE_DETAIL
+"
+    elif [ "$WIRE_ROUTED" -eq 1 ]; then
+      nrouted=$((nrouted + 1))
+      lines="$lines              $kind -> $target: ROUTED (measured now)
+"
+    else
+      lines="$lines              $kind -> $target: NOT ROUTED (measured now)
+"
+    fi
+    i=$((i+1))
+  done
+
+  printf '    wiring:   %s declared, %s ROUTED (measured now, not replayed)\n' "$n" "$nrouted"
+  printf '%s' "$lines"
+
+  # DRIFT. The record is provenance; the measurement above is the answer. Saying
+  # which one is stale, and naming the command that fixes it, is the difference
+  # between a reader who can act and a reader who has to guess.
+  [ -f "$d/wired.json" ] || {
+    printf '              note: there is no add-time wiring record for this module. The\n'
+    printf '                    measurement above is the only account: hmd modules rewire %s\n' "$name"
+    return 0
+  }
+  if [ "$(jq -r '.wires | type' "$d/wired.json" 2>/dev/null)" != "array" ]; then
+    printf '              note: the add-time record carries NO per-wire verdict — it predates\n'
+    printf '                    the wire dispatcher entirely. The measurement above is the\n'
+    printf '                    truth; refresh the record: hmd modules rewire %s\n' "$name"
+    return 0
+  fi
+  recorded="$(jq -r '[.wires[] | select(.routed)] | length' "$d/wired.json" 2>/dev/null || echo "")"
+  if [ -n "$recorded" ] && [ "$recorded" != "$nrouted" ]; then
+    printf '              note: the add-time record says %s ROUTED, the machine says %s — the\n' "$recorded" "$nrouted"
+    printf '                    record predates the current tree. The measurement above is the\n'
+    printf '                    truth; refresh the record: hmd modules rewire %s\n' "$name"
+  fi
+  return 0
+}
+
 cmd_status() {
   local name="$1"
   [ -n "$name" ] || die "status needs a module name"
@@ -1568,26 +1670,75 @@ cmd_status() {
               scope:    class \(.consent.consent_required_by // "?") still requires consent from every other module"
                  elif .consent.required then "granted via \(.consent.granted_via) at \(.consent.granted_at)"
                  else "not required for this class" end)"' "$d/receipt.json"
-  # This line reads the SAME measured record the wire step wrote, so it cannot
-  # drift from it. It used to print "N target(s)" over a list of declared wires,
-  # which described an inert module and a live one identically.
-  local nwires nrouted
-  nwires="$(jq -r '(.wires // []) | length' "$d/wired.json" 2>/dev/null || echo 0)"
-  [ -n "$nwires" ] || nwires=0
-  if [ "$nwires" = "0" ]; then
-    printf '    wiring:   0 wires declared — the module is inert\n'
-  else
-    nrouted="$(jq -r '[(.wires // [])[] | select(.routed)] | length' "$d/wired.json" 2>/dev/null || echo 0)"
-    printf '    wiring:   %s declared, %s ROUTED when measured at add time\n' "$nwires" "$nrouted"
-    jq -r '(.wires // [])[] |
-      "              \(.kind) -> \(.target): \(if (.measured | not) then "NOT MEASURED" elif .routed then "ROUTED" else "RECORDED, not routed" end)"' \
-      "$d/wired.json" 2>/dev/null
-  fi
+  status_wiring "$name" "$d"
   if [ -f "$d/invariants.json" ]; then
     printf '    invariants verified at add:\n'
     jq -r '.[] | "      \(if .passed then "PASS" else "FAIL" end) \(.id) (\(.source))"' "$d/invariants.json"
   fi
   printf '\n'
+}
+
+# THE RECORD NEEDED A WAY BACK. `status` measures on read, so a stale wired.json
+# can no longer be mistaken for the truth — but it still sits on disk being stale,
+# and until this verb existed there was NO path that rewrote it: `add` refuses an
+# installed module, `update` moves pins and reports "nothing to do" when the pin
+# has not moved, and `repair` is for modules that are not installed. Headroom's
+# canonical record therefore kept a pre-dispatcher verdict across every command a
+# user could reasonably reach for.
+#
+# WHAT IT DOES, AND EVERYTHING IT DOES NOT. It re-runs step 6 against a module that
+# is ALREADY INSTALLED, and only step 6: no fetch, no consent, no install, no
+# invariant run, no removal, no rollback. It calls the same wire_module() the add
+# path calls, so a refreshed record cannot describe a different measurement than an
+# add would have taken — there is no second implementation of wiring to drift from
+# the first.
+#
+# IDEMPOTENT BY CONSTRUCTION. The verdicts are derived from the machine, so two
+# runs on an unchanged machine write the same verdicts. wire_module() writes the
+# record only after every wire has been applied, so a wire the dispatcher REFUSES
+# leaves the previous record untouched rather than truncating it — a refresh that
+# cannot complete must not destroy the provenance it was trying to update.
+cmd_rewire() {
+  local name="$1"
+  [ -n "$name" ] || die "rewire needs a module name"
+  if ! is_installed "$name"; then
+    warn "error: \"$name\" is not installed — there is no wiring record to refresh."
+    warn "  Install it first: hmd modules add $name"
+    exit 2
+  fi
+  local mf; mf="$(manifest_path "$name")"
+  [ -f "$mf" ] || { warn "error: no manifest for \"$name\" at ${mf#"$PLUGIN_DIR"/}"; exit 2; }
+
+  if ! wire_module "$name" "$mf"; then
+    warn "refused: \"$name\" could not be re-wired. The previous wiring record is"
+    warn "  UNCHANGED — a refresh that cannot complete does not overwrite the record"
+    warn "  it was refreshing. The install itself was not touched."
+    exit 1
+  fi
+
+  local declared routed
+  declared="$(printf '%s' "$WIRE_RECORDS" | jq -r 'length')"
+  routed="$(printf '%s' "$WIRE_RECORDS" | jq -r '[.[] | select(.routed)] | length')"
+
+  if [ "$AS_JSON" -eq 1 ]; then
+    jq -n --arg n "$name" --argjson wires "$WIRE_RECORDS" \
+      '{tool:"heimdall-modules", action:"rewire", ok:true, name:$n,
+        declared:($wires | length), routed:([$wires[] | select(.routed)] | length),
+        wires:$wires,
+        note:"step 6 re-run against the installed module. Nothing was fetched, consented, installed or verified; only the wiring record was rewritten from a fresh measurement."}'
+  elif [ "$QUIET" -eq 0 ]; then
+    printf '\n  Re-wired "%s" — %s declared, %s ROUTED as measured just now.\n\n' \
+      "$name" "$declared" "$routed"
+    if [ "$declared" = "0" ]; then
+      printf '    no wires declared — the module is inert by its own manifest\n'
+    else
+      printf '%s' "$WIRE_RECORDS" | jq -r '.[] |
+        "    \(.kind) -> \(.target): \(if (.measured | not) then "NOT MEASURED" elif .routed then "ROUTED" else "RECORDED, not routed" end) — \(.detail)"'
+    fi
+    printf '\n  The wiring record now matches this machine. Nothing was fetched and the\n'
+    printf '  install was not touched: this re-ran the wire step and nothing else.\n\n'
+  fi
+  return 0
 }
 
 cmd_verify() {
@@ -2090,6 +2241,7 @@ case "$CMD" in
   add)       cmd_add "$TARGET" ;;
   remove)    cmd_remove "$TARGET" ;;
   status)    cmd_status "$TARGET" ;;
+  rewire)    cmd_rewire "$TARGET" ;;
   verify)    cmd_verify "$TARGET" ;;
   update)    cmd_update "$TARGET" ;;
   preflight) cmd_preflight "$TARGET" ;;
