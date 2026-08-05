@@ -39,6 +39,64 @@ bad() { FAIL=$((FAIL+1)); printf "  \033[31mFAIL\033[0m %s\n" "$1"; }
 [ -x "$UPDATER" ]  || { echo "FATAL: updater missing/not executable: $UPDATER" >&2; exit 2; }
 [ -f "$LAUNCHER" ] || { echo "FATAL: launcher missing: $LAUNCHER" >&2; exit 2; }
 
+# ══════════════════════════════════════════════════════════════════════════════
+# HERMETIC SANDBOX FOR THE MACHINE-SCOPED SURFACES — read this before editing.
+#
+# THE INCIDENT THIS PREVENTS (it happened, to this suite, on a developer's machine).
+# Cases A/B/G below drive a FOREGROUND signed apply. apply_update ends by calling
+# heimdall-autoupdate's reassert_dream_schedule, which runs the REAL
+# bin/heimdall-dream-schedule install — three hops from anything this file names.
+# That helper writes ~/Library/LaunchAgents/com.heimdall.dream.plist and stages its
+# runner into $HEIMDALL_HOME/bin. This suite set HEIMDALL_HOME to a bare `mktemp -d`
+# and set nothing else, so the developer's live nightly LaunchAgent was OVERWRITTEN
+# with a plist whose ProgramArguments[0] pointed at /var/folders/…/tmp.*/bin — a
+# directory reaped minutes later. The nightly job was left pinned to a path that no
+# longer existed: no error, dreams simply stopped arriving.
+#
+# WHY $HOME IS NOT THE ANSWER. Setting HOME=$(mktemp -d) would isolate WHERE the
+# plist lands but NOT which launchd hears about it — `launchctl` targets the
+# logged-in user's GUI session domain (gui/<uid>), which no environment variable
+# reaches. bin/lib/real-home.sh documents that floor in full. So each machine-scoped
+# surface is redirected at ITS OWN seam, and the passwd-DB floor is driven too.
+#
+# FOUR SEAMS, EACH INDEPENDENTLY SUFFICIENT (defence in depth, deliberately):
+#   HEIMDALL_REAL_HOME         → the passwd floor. Makes heimdall_home_is_real FALSE,
+#                                so require_real_launchd_domain REFUSES outright and
+#                                nothing is written even into the sandbox. This is the
+#                                seam that needs no cooperation from future callers.
+#   HEIMDALL_LAUNCH_AGENTS_DIR → if that refusal is ever removed, the plist still
+#                                lands here, inside the sandbox, not in ~/Library.
+#   LAUNCHCTL                  → the launchd domain itself. A shim records calls, so
+#                                the real per-user launchd is never contacted.
+#   HEIMDALL_HOME              → the staged runner + logs land here, not in ~/.heimdall.
+#
+# This mirrors test/heimdall-dream-schedule.test.sh, which established the pattern.
+# NOTHING about the signed-apply proofs below changes: A–H still exercise the real
+# signature-verification and ref-pinning behaviour, only against a sandbox.
+# ══════════════════════════════════════════════════════════════════════════════
+SANDBOX="$(mktemp -d -t hmd-apply-sandbox.XXXXXX)"
+trap 'rm -rf "$SANDBOX" 2>/dev/null || true' EXIT
+
+SB_LA="$SANDBOX/LaunchAgents"          # stand-in for ~/Library/LaunchAgents
+SB_HOME="$SANDBOX/heimdall-home"       # stand-in for ~/.heimdall
+SB_REAL="$SANDBOX/passwd-home"         # a passwd home that is provably NOT $HOME
+SB_CALLS="$SANDBOX/launchctl-calls"    # every launchctl invocation, one per line
+mkdir -p "$SB_LA" "$SB_HOME" "$SB_REAL"
+
+SB_LAUNCHCTL="$SANDBOX/mock-launchctl"
+cat > "$SB_LAUNCHCTL" <<EOF
+#!/usr/bin/env bash
+# Records the call and succeeds. The real launchd domain is never reached.
+echo "\$@" >> "$SB_CALLS"
+exit 0
+EOF
+chmod +x "$SB_LAUNCHCTL"
+
+export HEIMDALL_LAUNCH_AGENTS_DIR="$SB_LA"
+export LAUNCHCTL="$SB_LAUNCHCTL"
+export HEIMDALL_HOME="$SB_HOME"
+export HEIMDALL_REAL_HOME="$SB_REAL"
+
 echo "── update-signed-apply ──"
 
 # ── syntax ────────────────────────────────────────────────────────────────────
@@ -94,7 +152,8 @@ if ! command -v minisign >/dev/null 2>&1; then
 fi
 
 WORK="$(mktemp -d -t hmd-apply.XXXXXX)"
-cleanup() { rm -rf "$WORK" 2>/dev/null || true; }
+# Replaces the SANDBOX-only trap installed above; both trees must still be reclaimed.
+cleanup() { rm -rf "$WORK" "$SANDBOX" 2>/dev/null || true; }
 trap cleanup EXIT
 
 PUB="$WORK/key.pub"; SEC="$WORK/key.key"
@@ -214,6 +273,26 @@ else
   bad "H tampered big-jump should refuse loudly + nonzero + no exec (rc=$rc rec='$(cat "$REC" 2>/dev/null)' err='$ERR')"
 fi
 rm -rf "$H"
+
+# ── I. SANDBOX INTEGRITY: the machine-scoped seams survived every case above ──────
+# The apply cases each export their own per-case env. A future case that forgot to
+# carry a seam through — or unset one — would silently re-open the exact hole that
+# overwrote a developer's live LaunchAgent. This asserts, AFTER all of A–H have run,
+# that every seam still resolves INSIDE the sandbox. It is the cheap tripwire that
+# makes the isolation above self-verifying rather than merely intended.
+SB_LEAK=""
+for _sv in HEIMDALL_LAUNCH_AGENTS_DIR LAUNCHCTL HEIMDALL_HOME HEIMDALL_REAL_HOME; do
+  eval "_svv=\${$_sv:-}"
+  case "$_svv" in
+    "$SANDBOX"/*) : ;;
+    *) SB_LEAK="$SB_LEAK $_sv=${_svv:-<UNSET>}" ;;
+  esac
+done
+if [ -z "$SB_LEAK" ]; then
+  ok "I sandbox intact — every machine-scoped seam still points inside \$SANDBOX"
+else
+  bad "I MACHINE-SCOPED SEAM ESCAPED the sandbox:$SB_LEAK"
+fi
 
 echo ""
 echo "── update-signed-apply: $PASS passed, $FAIL failed ──"
