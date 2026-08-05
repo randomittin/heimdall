@@ -50,9 +50,13 @@
 #
 # COMMANDS
 #   check         --repo DIR [--json]   exit 0 = nothing to grant, 1 = a grant is needed
-#   ask           --repo DIR [--force] [--no-interactive]
+#   ask           --repo DIR [--force] [--no-interactive] [--interactive-only]
 #                                       prompt when a human is present, else print the
 #                                       block. ONCE either way; ALWAYS exits 0 (hook-safe)
+#                                       --interactive-only DEFERS instead of printing:
+#                                       with no human it does nothing at all and stays
+#                                       armed. That is the form the INSTALL and UPDATE
+#                                       paths use — see the note on cmd_ask.
 #   open-settings                       open macOS's Full Disk Access pane (explicit only)
 #   reset         [--repo DIR]          forget the block was shown (re-arm the ask)
 #
@@ -103,6 +107,7 @@ REPO=""
 JSON=0
 FORCE=0
 NO_INTERACTIVE=0
+INTERACTIVE_ONLY=0
 
 die() { echo "heimdall-dream-permission: error: $*" >&2; exit 2; }
 
@@ -113,6 +118,7 @@ parse_args() {
       --json)  JSON=1; shift ;;
       --force) FORCE=1; shift ;;
       --no-interactive) NO_INTERACTIVE=1; shift ;;
+      --interactive-only) INTERACTIVE_ONLY=1; shift ;;
       *) die "unknown argument: $1" ;;
     esac
   done
@@ -579,7 +585,27 @@ cmd_check() {
 # ask — ALWAYS exits 0. It is wired into the install path and pointed at from a
 # SessionStart notice; a permission prompt that can break the thing it advises about is a
 # worse bug than the one it reports.
+#
+# --interactive-only — DEFER TO THE FIRST HUMAN INSTEAD OF SPENDING THE ASK ON NOBODY.
+#
+#   The published install is `curl … | bash`, and `hmd --update` can run detached. On
+#   those paths the printed block is not a remedy, it is litter: it scrolls past unread,
+#   and — worse — the marker records that the operator was asked. The one chance is then
+#   spent, and the first person who actually sits down at a terminal is met with silence.
+#   Not asking is recoverable; asking nobody is not.
+#
+#   So the install and update call sites pass this flag, which means: ask NOW if a human
+#   is demonstrably present, otherwise do NOTHING AT ALL and leave the ask armed for the
+#   moment one is. Nothing means nothing — no block, no marker, no stdin read, exit 0.
+#
+#   IT IS THE SAME GATE, NOT A SECOND ONE. can_prompt() is called verbatim, so there is
+#   exactly one definition of "a human is here" in this file. A caller that rolled its own
+#   `[ -t 0 ]` could drift from it; this cannot. And the flag only ever REMOVES the
+#   printed fallback — with a real terminal the behaviour is byte-for-byte plain `ask`.
 cmd_ask() {
+  if [ "$INTERACTIVE_ONLY" = 1 ] && ! can_prompt; then
+    return 0
+  fi
   classify
   if [ "$STATE" != "needs-grant" ]; then
     # SELF-CLEARING. Dropping the marker on any non-asking state is what makes a
