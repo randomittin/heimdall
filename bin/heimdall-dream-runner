@@ -98,6 +98,11 @@ json_escape() {
   printf '%s' "$s"
 }
 
+# REPO_REACHABLE is recorded on every status, including the successful ones. A run that
+# succeeded WITHOUT the repo is the normal case on this machine now, and saying so is
+# what keeps the operator from concluding the TCC denial went away.
+REPO_REACHABLE="yes"
+
 # write_status <result> <reason> <denied_path> <detail> <exit>
 # Written atomically (tmp + mv) so a reader never sees a half-written record.
 write_status() {
@@ -115,6 +120,7 @@ write_status() {
   "result": "$(json_escape "$result")",
   "reason": "$(json_escape "$reason")",
   "repo": "$(json_escape "$REPO")",
+  "repo_reachable": "$(json_escape "$REPO_REACHABLE")",
   "dream": "$(json_escape "$DREAM")",
   "denied_path": "$(json_escape "$denied")",
   "detail": "$(json_escape "$detail")",
@@ -222,11 +228,32 @@ probe_python() {
   return 1
 }
 
-# Both pinned paths matter: the repo dream must READ, and the dream script itself.
-BLOCKED=0
+# THE REPO IS NO LONGER A PRECONDITION — THAT IS THE FIX.
+#
+# This probe used to gate the whole run: an unreadable repo meant exit 75, because dream
+# kept its state inside it. It no longer does. dream's state lives under $HEIMDALL_HOME
+# (bin/lib/dream_data.py), which is not TCC-guarded and is measured writable from
+# launchd, so a denied repo costs the run NOTHING it needs. Continuing to treat it as
+# fatal would keep the job dead for a reason that has been removed, and would report
+# "blocked" on a night it could have produced a perfectly good report.
+#
+# It is still PROBED, because the answer is worth recording: the status says whether the
+# repo was reachable, so a successful run does not read as evidence the denial lifted.
+# The one thing that changed is that the answer no longer stops the run.
+REPO_ERR=""
+REPO_DENIED=""
 if ! probe_dir "$REPO"; then
-  BLOCKED=1
-elif ! probe_file "$DREAM"; then
+  REPO_REACHABLE="no"
+  REPO_ERR="$PROBE_ERR"
+  REPO_DENIED="$PROBE_PATH"
+fi
+
+# THE DREAM SCRIPT IS STILL A HARD PRECONDITION. It is the program: unreadable means
+# nothing runs, which is the silent-death case this runner exists to make loud. Staged
+# outside the protected tree by heimdall-dream-schedule, so under TCC it stays readable
+# exactly when the repo does not.
+BLOCKED=0
+if ! probe_file "$DREAM"; then
   BLOCKED=1
 fi
 
@@ -279,6 +306,20 @@ fi
 # With a pin, exec THROUGH it — the shebang's `env python3` is never consulted, so the
 # job cannot drift onto whatever interpreter the launchd PATH happens to surface. Without
 # one, the shebang runs exactly as it always has.
+# EXPORTED, not merely set. dream shells out to heimdall-self-improve and
+# heimdall-issue-loop, and the latter defaults its queue to <repo>/.heimdall — inside the
+# denied tree. Handing the whole child process group one state dir is what keeps every
+# hop of the run on the reachable side of the denial.
+export HEIMDALL_HOME
+
+if [ "$REPO_REACHABLE" = no ]; then
+  # Say it BEFORE the run, so the log reads as a diagnosis rather than a surprise if
+  # dream then fails for some unrelated reason.
+  echo "heimdall dream: repo unreadable ($REPO_DENIED: $REPO_ERR)"
+  echo "  continuing anyway — dream reads its state from $HEIMDALL_HOME, not the repo."
+  echo "  the morning report will land there; the next terminal session copies it back."
+fi
+
 if [ -n "$PYTHON" ]; then
   "$PYTHON" "$DREAM" --repo "$REPO" "${FORWARD[@]}"
 else
@@ -287,7 +328,13 @@ fi
 RC=$?
 
 if [ "$RC" = 0 ]; then
-  write_status ok "" "" "" 0
+  # A run that succeeded without the repo is still a success — but it is recorded with
+  # the denial attached, so nobody reads the ok as proof the grant landed.
+  if [ "$REPO_REACHABLE" = no ]; then
+    write_status ok repo-unreachable "$REPO_DENIED" "$REPO_ERR" 0
+  else
+    write_status ok "" "" "" 0
+  fi
 else
   write_status error dream-failed "" "dream exited $RC" "$RC"
   echo "heimdall dream FAILED — $DREAM exited $RC. Recorded at $STATUS." >&2

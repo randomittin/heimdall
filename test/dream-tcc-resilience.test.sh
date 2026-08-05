@@ -43,6 +43,7 @@ RUNNER="$ROOT/bin/heimdall-dream-runner"
 NOTICE="$ROOT/bin/heimdall-dream-notice"
 SCHED="$ROOT/bin/heimdall-dream-schedule"
 DREAM="$ROOT/bin/heimdall-dream"
+PY="$(command -v python3 || command -v python)"
 
 PASS=0
 FAIL=0
@@ -84,49 +85,92 @@ else
   bad "(1) status did not record ok: $(cat "$OKSTATUS" 2>/dev/null | head -5)"
 fi
 
-# ── (2) RUNNER, denied repo: never a silent success ──────────────────────────────
+# ── (2) RUNNER, denied repo: NOW IT RUNS ANYWAY ──────────────────────────────────
 # A user-owned dir at mode 000 yields a REAL kernel access denial without root. TCC's
 # EPERM and this EACCES are the same class of event to the runner: the repo cannot be
-# read, so the run did not happen and must not be reported as if it had.
+# read at all.
+#
+# THIS CONTRACT DELIBERATELY INVERTED. It used to assert exit 75 + result=blocked,
+# because dream kept its state inside the repo and genuinely could not run without it.
+# It no longer does — the state lives under $HEIMDALL_HOME (bin/lib/dream_data.py), so a
+# denied repo costs the run nothing it needs. Continuing to fail here would keep the
+# nightly job dead for a reason that has been removed. The loud-failure path is NOT
+# weakened by this: case (2b) below proves exit 75 still fires when dream truly cannot
+# run, which is the case that mattered all along.
 DENIED="$WORK/denied"; mkdir -p "$DENIED/.planning"
+DENIED_HOME="$WORK/denied-home"; mkdir -p "$DENIED_HOME"
 chmod 000 "$DENIED"
 DSTATUS="$WORK/denied-status.json"
 drc=0
-"$RUNNER" --dream "$DREAM" --repo "$DENIED" --status "$DSTATUS" run --overnight \
-  >"$WORK/denied.log" 2>&1 || drc=$?
+HEIMDALL_HOME="$DENIED_HOME" "$RUNNER" --dream "$DREAM" --repo "$DENIED" \
+  --status "$DSTATUS" run --overnight >"$WORK/denied.log" 2>&1 || drc=$?
 chmod 755 "$DENIED"
 
-if [ "$drc" = 75 ]; then
-  ok "(2) denied repo exits 75 (EX_TEMPFAIL) — never a silent 0"
+if [ "$drc" = 0 ]; then
+  ok "(2) denied repo now RUNS — the relocated state dir needs no grant"
 else
-  bad "(2) denied repo exit was $drc, expected 75"
+  bad "(2) denied repo exit was $drc, expected 0: $(head -5 "$WORK/denied.log")"
 fi
 
-if [ -f "$DSTATUS" ] && grep -q '"result": "blocked"' "$DSTATUS"; then
-  ok "(2) status records result=blocked"
+# THE ARTIFACT IS THE PROOF. A report on disk, written by a run that could not read one
+# byte of the repo, is the whole claim of this change.
+DENIED_REPORT="$(HEIMDALL_HOME="$DENIED_HOME" "$PY" \
+  "$ROOT/bin/lib/dream_data.py" planning --repo "$DENIED" 2>/dev/null)/dream/$TODAY.md"
+if [ -s "$DENIED_REPORT" ]; then
+  ok "(2) the denied-repo run produced a real report at the relocated root"
 else
-  bad "(2) status did not record blocked: $(cat "$DSTATUS" 2>/dev/null | head -8)"
+  bad "(2) no report at $DENIED_REPORT"
 fi
 
-# the VERBATIM OS error is preserved — a diagnosis must not be paraphrased away
-if grep -q 'denied_path' "$DSTATUS" && grep -qi 'permitted\|denied' "$DSTATUS"; then
-  ok "(2) status preserves the denied path and the verbatim OS error"
+# and it is HONEST about the denial — an ok that hid it would read as "the grant landed"
+if grep -q '"repo_reachable": "no"' "$DSTATUS"; then
+  ok "(2) status records repo_reachable=no — success is not mistaken for a grant"
 else
-  bad "(2) status lost the denial detail: $(cat "$DSTATUS" 2>/dev/null | head -8)"
+  bad "(2) status hid the denial: $(cat "$DSTATUS" 2>/dev/null | head -10)"
 fi
 
-# and it SHOUTS into the log rather than dying quietly
-if grep -qi 'BLOCKED' "$WORK/denied.log"; then
-  ok "(2) runner shouts BLOCKED into the dream log"
+if [ -f "$DSTATUS" ] && grep -q '"result": "ok"' "$DSTATUS"; then
+  ok "(2) status records result=ok for a run that genuinely produced its report"
 else
-  bad "(2) runner failed quietly: $(cat "$WORK/denied.log" 2>/dev/null | head -3)"
+  bad "(2) status did not record ok: $(cat "$DSTATUS" 2>/dev/null | head -8)"
 fi
 
-# no report may be fabricated for a run that never happened
+# nothing may be written INTO the denied repo — the point is that it is never touched
 if [ ! -f "$DENIED/.planning/dream/$TODAY.md" ]; then
-  ok "(2) FALSIFIER: no report fabricated for a run that never happened"
+  ok "(2) FALSIFIER: nothing was written into the denied repo"
 else
-  bad "(2) a report exists for a blocked run"
+  bad "(2) the run wrote into the denied repo"
+fi
+
+# ── (2b) THE LOUD PATH SURVIVES: dream itself unreachable is still a hard failure ──
+# Relaxing the repo probe must not relax the one that matters. The dream script IS the
+# program; if it cannot be read, nothing ran, and that is the silent death this runner
+# was built to make loud. Same fixture shape as the old (2), pointed at the right target.
+GONE="$WORK/gone-dream"
+GSTATUS="$WORK/gone-status.json"
+grc=0
+HEIMDALL_HOME="$DENIED_HOME" "$RUNNER" --dream "$GONE" --repo "$WORK" \
+  --status "$GSTATUS" run --overnight >"$WORK/gone.log" 2>&1 || grc=$?
+
+if [ "$grc" = 75 ]; then
+  ok "(2b) an unreadable dream still exits 75 (EX_TEMPFAIL) — never a silent 0"
+else
+  bad "(2b) unreadable dream exit was $grc, expected 75"
+fi
+if [ -f "$GSTATUS" ] && grep -q '"result": "blocked"' "$GSTATUS"; then
+  ok "(2b) status still records result=blocked when nothing could run"
+else
+  bad "(2b) status did not record blocked: $(cat "$GSTATUS" 2>/dev/null | head -8)"
+fi
+if grep -q 'denied_path' "$GSTATUS" && grep -qi 'no such file\|permitted\|denied' "$GSTATUS"; then
+  ok "(2b) status preserves the denied path and the verbatim OS error"
+else
+  bad "(2b) status lost the denial detail: $(cat "$GSTATUS" 2>/dev/null | head -8)"
+fi
+if grep -qi 'BLOCKED' "$WORK/gone.log"; then
+  ok "(2b) runner still shouts BLOCKED into the dream log"
+else
+  bad "(2b) runner failed quietly: $(head -3 "$WORK/gone.log")"
 fi
 
 # ── notice fixtures ──────────────────────────────────────────────────────────────
