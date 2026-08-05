@@ -430,6 +430,98 @@ else:
     bad("G2 legacy member mapping broke: %r / %r" % (S._tier_of(legacy_live),
                                                      S._tier_of(legacy_away)))
 
+# ══════════════════════════════════════════════════════════════════════════════════
+print("\nH. ONE CODE PATH: the renderer's wall == the roster, from EVERY source")
+# The MEASURED defect. _team_members had THREE member sources — the wall cache, the
+# ledger mirror, and a live-presence fallback — and only the first two excluded SELF.
+# While the wall cache was stale the wall path won and self was dropped correctly; the
+# moment the roster merged the owner into ONE row the wall path yielded zero members,
+# the live fallback took over, and the owner reappeared on his own wall. The renderer
+# and `repo_roster.py --repo <same repo>` disagreed AGAIN, one layer up.
+#
+# Two sources of truth for identity is how both bugs exist. So the property asserted
+# here is not "the fallback also excludes self" — it is that the renderer's member list
+# EQUALS the roster's, whichever source supplied it.
+
+
+def put_presence(r, rows):
+    with open(S._roster_cache_path(r), "w") as f:
+        json.dump(rows, f)
+
+
+def beat(handle, haid, age=1.0):
+    return {"handle": handle, "haid": haid, "verdict": "working", "file": "",
+            "branch": "", "age_seconds": age, "online": True}
+
+
+SELF_IDS = {"rj", "haid:rj.box-46d5"}
+
+# H1 — the exact live shape: the roster merged the owner into ONE row, so the wall has
+# nobody left to show. The fallback must not resurrect him from the presence cache.
+r = repo("h_selfonly")
+put_wall(r, [row("rj", "online", haid="haid:rj.box-46d5", last_seen_ts=NOW - 1)])
+put_presence(r, [beat("rj", "haid:rj.box-46d5")])
+ms, of = S._team_members(r, {"team": [], "team_overflow": 0}, SELF_IDS)
+if [m.get("user") for m in ms] == [] and of == 0:
+    ok("H1 a wall of ONLY self renders ZERO columns — no source may re-add the owner")
+else:
+    bad("H1 self came back through a fallback: %r" % ([m.get("user") for m in ms],))
+
+# H2 — FALSIFIABILITY. The pre-fix fallback is reconstructed verbatim from the live
+# presence rows with no self gate; it MUST produce the owner, or H1 proves nothing.
+mutant = [{"user": m.get("name") or "?", "haid": m.get("haid")}
+          for m in S.team_presence(r)[:3]]
+if [m["user"] for m in mutant] == ["rj"]:
+    ok("H2 the UNGATED fallback yields ['rj'] — H1 discriminates, it is not vacuous")
+else:
+    bad("H2 the mutant fallback did not reproduce the defect: %r" % (mutant,))
+
+# H3 — THE EQUALITY. For the same repo the renderer's member list must be exactly the
+# roster's rows minus self, in the roster's own order. This is the assertion that would
+# have caught both divergences on the first render.
+crowd = [row("rj", "online", haid="haid:rj.box-46d5", last_seen_ts=NOW - 1),
+         row("akshat", "contributed", last_commit_ts=NOW - DAY),
+         row("anu", "away", last_seen_ts=NOW - 3 * DAY),
+         row("madala", "member")]
+r = repo("h_equal")
+put_wall(r, crowd)
+put_presence(r, [beat("rj", "haid:rj.box-46d5")])
+want = [c["handle"] for c in crowd if c["handle"] not in SELF_IDS]
+ms, of = S._team_members(r, {"team": [], "team_overflow": 0}, SELF_IDS)
+if [m.get("user") for m in ms] == want and of == 0:
+    ok("H3 renderer wall == roster rows minus self, in roster order: %s" % (want,))
+else:
+    bad("H3 renderer/roster divergence: renderer=%r roster=%r"
+        % ([m.get("user") for m in ms], want))
+
+# H4 — the ledger mirror is a THIRD source and is gated by the same one gate. A stale
+# status.json naming the owner may not put him back either.
+r = repo("h_ledger")
+put_wall(r, [])
+put_presence(r, [])
+stale_ledger = {"team": [{"user": "rj", "haid": "haid:rj.box-46d5", "state": "running"},
+                         {"user": "akshat", "haid": None, "state": "running"}],
+                "team_overflow": 0}
+ms, _of = S._team_members(r, stale_ledger, SELF_IDS)
+if [m.get("user") for m in ms] == ["akshat"]:
+    ok("H4 a stale LEDGER mirror naming self is gated too — one gate, every source")
+else:
+    bad("H4 the ledger source bypassed the self gate: %r" % ([m.get("user") for m in ms],))
+
+# H5 — the gate matches on HAID as well as handle. After the merge the roster may name
+# the owner by his GitHub login while the render still knows him by his HAID; matching
+# only the handle would put him straight back on the wall.
+r = repo("h_haid")
+put_wall(r, [])
+put_presence(r, [])
+ms, _of = S._team_members(
+    r, {"team": [{"user": "randomittin", "haid": "haid:rj.box-46d5", "state": "running"}],
+        "team_overflow": 0}, SELF_IDS)
+if [m.get("user") for m in ms] == []:
+    ok("H5 self is matched by HAID even under a different handle (the merge renames)")
+else:
+    bad("H5 a renamed self row survived the gate: %r" % ([m.get("user") for m in ms],))
+
 print("\n" + "=" * 60)
 print("wall-roster: %d passed, %d failed" % (P_N[0], F_N[0]))
 print("=" * 60)
