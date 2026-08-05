@@ -766,10 +766,9 @@ plant_plist() { printf '<plist>nightly</plist>\n' > "$1/LaunchAgents/com.heimdal
 
 if [ ! -x "$PROBE_TREE/bin/heimdall" ] || [ ! -x "$PROBE_TREE/bin/heimdall-dream-schedule" ] \
    || [ ! -f "$PROBE_TREE/bin/lib/real-home.sh" ] || [ ! -x "$PROBE_TREE/bin/heimdall-dream" ] \
-   || [ ! -x "$PROBE_TREE/bin/heimdall-dream-runner" ] \
    || [ ! -f "$PROBE_TREE/bin/lib/tcc-paths.sh" ] \
    || [ ! -f "$PROBE_TREE/install.sh" ]; then
-  bad "launchd-guard probes unavailable — installed tree lacked heimdall / heimdall-dream-schedule / heimdall-dream / heimdall-dream-runner / bin/lib/real-home.sh / bin/lib/tcc-paths.sh / install.sh"
+  bad "launchd-guard probes unavailable — installed tree lacked heimdall / heimdall-dream-schedule / heimdall-dream / bin/lib/real-home.sh / bin/lib/tcc-paths.sh / install.sh"
 else
 
 # (7f) REAL-USER UNINSTALL REMOVES THE NIGHTLY LAUNCHAGENT.
