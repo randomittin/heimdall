@@ -66,6 +66,21 @@ def _now():
 
 
 def _planning_dir(repo):
+    """THE SINGLE CHOKE POINT for every repo-relative path in this file — all four state
+    files (metrics.jsonl, queue-stats.json, routing-overrides.json, experiments.jsonl)
+    reach the disk through here via _p().
+
+    HEIMDALL_PLANNING_DIR redirects the lot. That matters because the nightly LaunchAgent
+    cannot read a repo under ~/Downloads at all (macOS TCC denies the JOB, not the
+    program), so bin/heimdall-dream runs this loop against a relocated state dir under
+    $HEIMDALL_HOME instead — see bin/lib/dream_data.py for why that is the only remedy
+    left once moving the repo and granting Full Disk Access are both off the table.
+
+    Absent the variable this is byte-for-byte the old behaviour, so an interactive run
+    and every existing caller are untouched."""
+    override = os.environ.get("HEIMDALL_PLANNING_DIR")
+    if override:
+        return override
     return os.path.join(repo, ".planning")
 
 
