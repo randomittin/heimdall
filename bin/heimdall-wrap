@@ -45,6 +45,13 @@ PLUGIN_DIR="$(cd "$(dirname "$SELF")/.." && pwd)"
 BIN_DIR="$PLUGIN_DIR/bin"
 HEIMDALL_HOME_DIR="${HEIMDALL_HOME:-$HOME/.heimdall}"
 
+# The headroom wrap-chain wire (modules/headroom/manifest.json wires[0]). Sourcing it is
+# inert: it defines functions and routes nothing until launch_tool calls hmd_headroom_chain,
+# which itself routes nothing unless the module is added, un-opted-out and its proxy is
+# live. Absent file -> the chain simply never engages, which is a supported state.
+# shellcheck source=lib/hmd-headroom-chain.sh
+[ -r "$BIN_DIR/lib/hmd-headroom-chain.sh" ] && . "$BIN_DIR/lib/hmd-headroom-chain.sh"
+
 C='\033[38;2;0;212;255m'; G='\033[38;2;78;204;163m'; W='\033[38;2;255;200;80m'
 D='\033[2m'; B='\033[1m'; R='\033[0m'
 
@@ -257,6 +264,26 @@ do_wrap() {
 # the shim's re-entry guard). Other tools are exec'd directly.
 launch_tool() {
   local tool="$1"
+
+  # ── the headroom wrap-chain hop ─────────────────────────────────────────────
+  # GENERATION traffic only, via ONE variable on ONE child. See
+  # bin/lib/hmd-headroom-chain.sh for why HTTPS_PROXY is deliberately never set,
+  # and why judgment is unaffected (hmd_gate_exec scrubs ANTHROPIC_BASE_URL).
+  # Best-effort by contract: every failure path leaves the tool launching
+  # unproxied, exactly as it did before this wire existed.
+  if type hmd_headroom_chain >/dev/null 2>&1 && hmd_headroom_chain "$PLUGIN_DIR"; then
+    export ANTHROPIC_BASE_URL="$HMD_HEADROOM_BASE_URL"
+    _trace_order "wrap:headroom:routed:$HMD_HEADROOM_BASE_URL"
+    # DISCLOSURE, not decoration. A proxy the user cannot see is the thing this
+    # repo's own README refuses to ship, so being proxied is stated every time.
+    say "  ${G}✓${R} headroom ${D}generation routed via %s — judgment is not (hmd modules status headroom)${R}\n" \
+      "$HMD_HEADROOM_BASE_URL"
+  else
+    _trace_order "wrap:headroom:unrouted:${HMD_HEADROOM_WHY:-chain unavailable}"
+    [ -n "${HMD_HEADROOM_WHY:-}" ] && \
+      say "  ${D}· headroom not routing — %s${R}\n" "$HMD_HEADROOM_WHY"
+  fi
+
   _trace_order "wrap:launch:$tool"
   [ -n "${HEIMDALL_TRACE_ORDER:-}" ] && exit 0
 
