@@ -39,9 +39,8 @@ TAGLINE="nothing ships unproven"
 # place — mutating a tracked file (the dev-env-breaking bug). Two defenses:
 #   1) run install.sh under a CONTROLLED PATH (SYS) — python3/git + system dirs
 #      only, never the inherited PATH — so `command -v hmd` finds nothing to touch;
-#   2) a tripwire that RESTORES + fails loudly if any tracked bin/ file changed.
+#   2) the clobber target is a PRIVATE CLONE (see $SRC below), diffed by content.
 SYS="$(dirname "$(command -v python3)"):$(dirname "$(command -v git)"):/usr/bin:/bin"
-BIN_GUARD_BEFORE="$(git -C "$REPO" status --porcelain -- bin/ 2>/dev/null)"
 
 PASS=0; FAIL=0
 ok()  { printf '  \033[32mPASS\033[0m %s\n' "$1"; PASS=$((PASS+1)); }
@@ -61,18 +60,48 @@ case "${1:-}" in
 esac
 EOF
 chmod +x "$FAKE_DIR/claude"
-# Cleanup + tripwire: a hermetic install test must NEVER mutate a tracked file.
-# If bin/ changed on ANY exit path, restore it and shout (belt to the explicit
-# assertion in the body, which owns the exit code).
+# Cleanup touches ONLY this suite's own temp dirs. It deliberately does NOT revert
+# anything in the developer's tree — see the $SRC note below for why that reverting
+# tripwire was removed.
 cleanup() {
-  local after; after="$(git -C "$REPO" status --porcelain -- bin/ 2>/dev/null)"
-  if [ "$after" != "$BIN_GUARD_BEFORE" ]; then
-    printf '\n\033[31mFATAL\033[0m test mutated tracked bin/ — restoring:\n%s\n' "$after" >&2
-    git -C "$REPO" checkout -- bin/ 2>/dev/null || true
-  fi
   rm -rf "$TMP_ROOT" "$FAKE_DIR"
 }
 trap cleanup EXIT
+
+# ── THE CLOBBER TARGET: a PRIVATE source checkout ─────────────────────────────
+# The guarantee under test is "install.sh, pointed at a LOCAL checkout, never writes
+# into that checkout's bin/" (install.sh pins it via SOURCE_GUARD_ROOTS, keyed on
+# HEIMDALL_REPO). This test used to point the installer at the DEVELOPER'S OWN worktree
+# and diff `git status --porcelain -- bin/` before/after. That was unsound twice over:
+#   - FALSE REDS: the snapshot spans the whole ~30s run, so ANY concurrent edit to bin/
+#     by a teammate or a parallel agent was misattributed to install.sh (run-all.sh runs
+#     suites in PARALLEL, so this was not hypothetical).
+#   - DESTRUCTIVE: on mismatch the cleanup trap ran `git checkout -- bin/` against that
+#     SHARED tree, discarding a teammate's uncommitted work to "restore" it. Measured:
+#     a landed bin/heimdall-modules change was silently reverted mid-session.
+# The installer now gets its own private clone, so the clobber target cannot be touched
+# by anyone else. The guarantee is unchanged; the measurement is now deterministic and
+# no shared tree is ever written to or reverted.
+#
+# $BANNER / $INSTALL / bin/secret-scan are still read FROM $REPO — those are READ-ONLY
+# uses (render, `bash -n`, static grep), which is exactly what this suite is asserting on.
+SRC="$TMP_ROOT/src"
+git clone --quiet "$REPO" "$SRC" 2>/dev/null \
+  || { echo "FATAL: could not create the private source clone of $REPO"; exit 2; }
+
+# Content manifest of bin/: sha256 of every file plus the set of executables. STRICTLY
+# STRONGER than the old `git status --porcelain -- bin/`, which reports only files git
+# tracks — a write to a gitignored or untracked path under bin/ was invisible to it and
+# is caught here.
+bin_manifest() {
+  find "$1/bin" -type f -print0 2>/dev/null | LC_ALL=C sort -z \
+    | xargs -0 shasum -a 256 2>/dev/null
+  find "$1/bin" -type f -perm -u+x -print 2>/dev/null | LC_ALL=C sort
+}
+BIN_GUARD_BEFORE="$(bin_manifest "$SRC")"
+# Anti-vacuous: an empty manifest would make the clobber assertion pass trivially.
+[ -n "$BIN_GUARD_BEFORE" ] \
+  || { echo "FATAL: private clone has no bin/ files — the clobber guard would be vacuous"; exit 2; }
 
 # Count ESC (0x1b) bytes in a file — the ANSI detector for the paste-clean check.
 esc_count() { LC_ALL=C tr -cd '\033' < "$1" | wc -c | tr -d ' '; }
@@ -235,7 +264,7 @@ ICARD="$TMP_ROOT/install-tty.out"
 IRC="$(pty_run "$ICARD" 90 -- env -u NO_COLOR -u HEIMDALL_NO_COLOR \
         -u CLAUDE_CONFIG_DIR -u HEIMDALL_HOME \
         HOME="$INST_HOME_I" TERM="xterm-256color" \
-        HEIMDALL_REPO="$REPO" HEIMDALL_REF="$REF" PATH="$FAKE_DIR:$SYS" \
+        HEIMDALL_REPO="$SRC" HEIMDALL_REF="$REF" PATH="$FAKE_DIR:$SYS" \
         HEIMDALL_IDENTITY_DIR="$EMPTY_ID" HMD_HAID="$SEED" \
         bash "$INSTALL")"
 IRC="$(printf '%s' "$IRC" | tail -1)"
@@ -267,7 +296,7 @@ fi
 NCARD="$TMP_ROOT/install-pipe.out"
 env -u CLAUDE_CONFIG_DIR -u HEIMDALL_HOME \
     HOME="$INST_HOME_N" TERM="dumb" HEIMDALL_NO_COLOR=1 \
-    HEIMDALL_REPO="$REPO" HEIMDALL_REF="$REF" PATH="$FAKE_DIR:$SYS" \
+    HEIMDALL_REPO="$SRC" HEIMDALL_REF="$REF" PATH="$FAKE_DIR:$SYS" \
     bash "$INSTALL" </dev/null > "$NCARD" 2>&1; NRC=$?
 [ "$NRC" -eq 0 ] && ok "non-interactive install exits 0" \
                  || bad "non-interactive install exit $NRC (want 0)"
@@ -280,12 +309,17 @@ NEC="$(esc_count "$NCARD")"
 [ "$NEC" = "0" ] && ok "non-interactive install output is ANSI-free (clean logs)" \
                  || bad "non-interactive install leaked $NEC ANSI bytes"
 
-# ── HERMETIC — the install runs left the repo's tracked bin/ pristine ───────────
-BIN_GUARD_AFTER="$(git -C "$REPO" status --porcelain -- bin/ 2>/dev/null)"
+# ── HERMETIC — the install runs left the source checkout's bin/ pristine ────────
+# Byte-for-byte over EVERY file under bin/ (not just the git-tracked ones), against a
+# private clone no other process can touch — so a mismatch here can only have been
+# caused by install.sh itself.
+BIN_GUARD_AFTER="$(bin_manifest "$SRC")"
 if [ "$BIN_GUARD_AFTER" = "$BIN_GUARD_BEFORE" ]; then
-  ok "hermetic: install runs never mutated the repo's tracked bin/ (no clobber)"
+  ok "hermetic: install runs never mutated the source checkout's bin/ (no clobber)"
 else
-  bad "install run MUTATED tracked bin/ (non-hermetic): $BIN_GUARD_AFTER"
+  bad "install run MUTATED the source checkout's bin/ (non-hermetic): $(
+    diff <(printf '%s\n' "$BIN_GUARD_BEFORE") <(printf '%s\n' "$BIN_GUARD_AFTER") \
+      | grep -E '^[<>]' | head -4 | tr '\n' ' ')"
 fi
 
 # ── Tally ─────────────────────────────────────────────────────────────────────
