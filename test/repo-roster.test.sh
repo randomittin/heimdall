@@ -793,6 +793,195 @@ else
 fi
 
 echo
+# ═════════════════════════════════════════════════════════════════════════════
+echo "── K. THE SECOND EMAIL (one human, two addresses, a TWO-LETTER local-part) ──"
+# ═════════════════════════════════════════════════════════════════════════════
+# THE MEASURED DEFECT, one layer deeper than J. The owner commits from TWO addresses:
+#
+#     rj@runheimdall.dev | randomittin / rj / RJ   <- git config user.email, so the anchor
+#                                                     claims it by plain `email` equality
+#     rj@superpe.co      | RJ                      <- renders as a SECOND person, `rj~2`
+#
+# Section J's anchor claims the first address and the presence row (self_device), so the wall
+# shows `rj` online AND `rj~2` contributed — today's collision disambiguator working correctly
+# on what it believes is a second human. It is not: it is the same human under a second email.
+#
+# WHY NO EXISTING CLASS REACHES IT. A two-character local-part falls below EVERY length floor
+# at once, so this is ZERO signals — not a weight-floor miss that some tuning could close:
+#     localpart    needs len >= 3   `rj` is 2
+#     name         needs len >= 4   `RJ` folds to `rj`, 2
+#     haid_human   reads haid_humans, which the anchor never has (it carries self_humans)
+#     self_device  needs a HAID on the OTHER side; a git row has none
+# Measured on the real module before the fix: signals() -> [] and would_merge -> (False, []).
+#
+# THE RULE UNDER TEST. A git identity folds into the LOCAL identity when it shares BOTH the
+# exact email local-part AND an exact display name with the anchor. Length floors do not apply
+# — being short is the whole point — and the class is SELF-ANCHORED, so it adds no edge between
+# any two OBSERVED identities and therefore cannot merge two teammates.
+KREPO="$TMP/krepo"; mkdir -p "$KREPO"
+git -C "$KREPO" init -q 2>/dev/null
+git -C "$KREPO" symbolic-ref HEAD refs/heads/main
+git -C "$KREPO" config commit.gpgsign false
+git -C "$KREPO" config user.email "rj@runheimdall.dev"
+git -C "$KREPO" config user.name "RJ"
+kcommit() {   # kcommit <display-name> <email> <days-ago> <slug>
+  printf '%s\n' "$4" > "$KREPO/$4.txt"
+  git -C "$KREPO" add -A >/dev/null 2>&1
+  GIT_AUTHOR_NAME="$1" GIT_AUTHOR_EMAIL="$2" \
+  GIT_COMMITTER_NAME="$1" GIT_COMMITTER_EMAIL="$2" \
+  GIT_AUTHOR_DATE="$(( NOW - $3 * DAY )) +0000" \
+  GIT_COMMITTER_DATE="$(( NOW - $3 * DAY )) +0000" \
+    git -C "$KREPO" commit -q -m "$4" >/dev/null 2>&1
+}
+# ── the owner, under BOTH addresses ──
+kcommit "randomittin" "rj@runheimdall.dev" 5 "k-anchor-email"
+kcommit "RJ"          "rj@runheimdall.dev" 4 "k-anchor-name"
+kcommit "RJ"          "rj@superpe.co"      3 "k-second-email"
+# ── THE PAIR THAT MUST STAY SPLIT. Two REAL people who differ on BOTH conjuncts:
+#    locals set() / {'ravikiran'} and name_folds {'ravikiran2904'} / {'ravikiranuo'}. Exact
+#    local-part AND exact name refuses them independently of any weight logic. ──
+kcommit "Ravikiran2904" "143786551+Ravikiran2904@users.noreply.github.com" 6 "k-ravi-gh"
+kcommit "Ravikiranuo"   "ravikiran@uo.app"                                 7 "k-ravi-uo"
+# ── TWO STRANGERS sharing a two-letter local-part AND an exact display name, NEITHER of whom
+#    is the anchor. Every length floor blocks them today; the new class must not reach them
+#    either, because it fires ONLY when one side is the SELF anchor. If it were undirected,
+#    these two humans would collapse into one — the exact catastrophe the module forbids. ──
+kcommit "XY" "xy@alpha.example" 8 "k-xy-alpha"
+kcommit "XY" "xy@beta.example"  9 "k-xy-beta"
+
+mkdir -p "$KREPO/.heimdall"
+KPRESENCE="$KREPO/.heimdall/.roster-cache.json"
+cat > "$KPRESENCE" <<'JSON'
+[
+  {"haid":"haid:rj.krj-macbook-46d5","handle":"rj","project":"github.com/randomittin/heimdall",
+   "online":true, "state":"active", "age_seconds":9, "ts":1799999991, "verdict":"working"}
+]
+JSON
+
+# drive_k <label> <libdir> <no-self-flag> [--explain] -> the frozen array (or the audit view)
+drive_k() {
+  fresh_cache "k-$1"
+  HMD_ROSTER_NO_SELF="$3" \
+  HMD_ROSTER_SELF_EMAIL="rj@runheimdall.dev" HMD_ROSTER_SELF_NAME="RJ" \
+  HMD_ROSTER_SELF_MACHINE="KRJ-MacBook" \
+  HMD_ROSTER_NO_GITHUB=1 \
+  HMD_ROSTER_CACHE_DIR="$CACHE_DIR" HMD_ROSTER_NOW="$NOW" \
+    "$PY" "$2/repo_roster.py" --repo "$KREPO" --git-days 90 --blocking \
+    ${4:-} --presence-cache "$KPRESENCE" 2>/dev/null
+}
+kq() { printf '%s' "$1" | "$PY" -c "import json,sys;d=json.load(sys.stdin);print($2)" 2>/dev/null; }
+# Identity-based probes, not handle-based: `rj~2` is the SYMPTOM, but the thing being proved is
+# which ADDRESSES landed on one person, which explain()["people"]["identities"] states directly.
+K_HAS_BOTH="sum(1 for p in d['people'] if 'rj@runheimdall.dev' in p['identities'] and 'rj@superpe.co' in p['identities'])"
+K_HAS_EITHER="sum(1 for p in d['people'] if 'rj@runheimdall.dev' in p['identities'] or 'rj@superpe.co' in p['identities'])"
+
+K_ROWS="$(drive_k green "$LIB" "")"
+K_EXP="$(drive_k greenx "$LIB" "" --explain)"
+
+# K1 — the owner is ONE person carrying BOTH addresses.
+K_ONE="$(kq "$K_EXP" "$K_HAS_BOTH")"
+K_EITHER="$(kq "$K_EXP" "$K_HAS_EITHER")"
+if [ "$K_ONE" = "1" ] && [ "$K_EITHER" = "1" ]; then
+  ok "K1 both of the owner's addresses land on exactly ONE person — the second email folded in"
+else
+  bad "K1 the owner is still split (people holding both=$K_ONE, holding either=$K_EITHER)"
+fi
+
+# K2 — the SYMPTOM is gone: no disambiguated `rj~N` row survives on the wall.
+K_DUP="$(kq "$K_ROWS" "sum(1 for r in d if r['handle'].startswith('rj~'))")"
+[ "$K_DUP" = "0" ] \
+  && ok "K2 no \`rj~N\` row remains — the collision disambiguator has nothing left to split" \
+  || bad "K2 $K_DUP disambiguated rj~N row(s) still render (handles=$(kq "$K_ROWS" "[r['handle'] for r in d]"))"
+
+# K3 — the BEST tier and the device HAID survive the fold, so the owner keeps ONE face. A
+# git-only second address must never demote a live presence row or steal its sigil key.
+K_TIER="$(kq "$K_ROWS" "next((r['tier'] for r in d if 'presence' in r['sources']), 'NONE')")"
+K_HAID="$(kq "$K_ROWS" "next((r['haid'] for r in d if 'presence' in r['sources']), 'NONE')")"
+K_SRC="$(kq "$K_ROWS" "next((','.join(r['sources']) for r in d if 'presence' in r['sources']), 'NONE')")"
+if [ "$K_TIER" = "online" ] && [ "$K_HAID" = "haid:rj.krj-macbook-46d5" ] \
+   && [ "$K_SRC" = "presence,git" ]; then
+  ok "K3 the merged owner stays tier=online with THIS DEVICE's HAID and both sources retained"
+else
+  bad "K3 the fold damaged the owner row (tier=$K_TIER haid=$K_HAID sources=$K_SRC)"
+fi
+
+# K4 — RAVIKIRAN STAYS SPLIT. Two real people, differing on BOTH conjuncts.
+K_RAVI="$(kq "$K_EXP" "sum(1 for p in d['people'] if any('ravikiran' in i.lower() for i in p['identities']))")"
+[ "$K_RAVI" = "2" ] \
+  && ok "K4 ravikiran2904 / ravikiranuo remain TWO people — both conjuncts differ, so it refuses" \
+  || bad "K4 the ravikiran pair collapsed to $K_RAVI person(s) — a REAL human was erased"
+
+# K5 — SELF-ANCHORED. Two OBSERVED strangers who share a two-letter local-part AND an exact
+# display name stay two people: the class cannot fire when neither side is the anchor.
+K_XY="$(kq "$K_EXP" "sum(1 for p in d['people'] if any(i.startswith('xy@') for i in p['identities']))")"
+[ "$K_XY" = "2" ] \
+  && ok "K5 two OBSERVED identities sharing local-part AND name stay SPLIT — the class is anchored" \
+  || bad "K5 the class merged two observed strangers ($K_XY person(s)) — it is not self-anchored"
+
+# K6 — the conjunction is a real AND. Each half alone must refuse.
+k_pair() {   # k_pair <anchor-email> <anchor-name> <other-email> <other-name> -> True/False
+  HMD_ROSTER_NO_SELF= HMD_ROSTER_SELF_EMAIL="$1" HMD_ROSTER_SELF_NAME="$2" \
+  HMD_ROSTER_SELF_MACHINE="KRJ-MacBook" HMD_ROSTER_NO_GITHUB=1 \
+  OTHER_EMAIL="$3" OTHER_NAME="$4" "$PY" - <<'PYEOF' 2>/dev/null
+import os, sys
+sys.path.insert(0, os.environ["LIB"])
+import repo_roster as RR
+anchor = RR.self_fragment(None)
+other = RR.fragment("git", email=os.environ["OTHER_EMAIL"], name=os.environ["OTHER_NAME"])
+print(RR.would_merge(anchor, other)[0])
+PYEOF
+}
+K_BOTH="$(k_pair "rj@runheimdall.dev" "RJ" "rj@superpe.co"    "RJ")"
+K_LOCAL="$(k_pair "rj@runheimdall.dev" "RJ" "rj@superpe.co"    "Raj Kumar")"
+K_NAME="$(k_pair "rj@runheimdall.dev" "RJ" "rjain@superpe.co" "RJ")"
+if [ "$K_BOTH" = "True" ] && [ "$K_LOCAL" = "False" ] && [ "$K_NAME" = "False" ]; then
+  ok "K6 exact local-part AND exact name is a real conjunction — either half alone REFUSES"
+else
+  bad "K6 the conjunction leaks (both=$K_BOTH local-only=$K_LOCAL name-only=$K_NAME)"
+fi
+
+# K7 — a ROLE address is not a human. `dev@` on two domains must never fold, exactly as the
+# localpart/haid_human classes already refuse it, or one shared role account would swallow
+# whoever else uses it on another domain.
+K_GENERIC="$(k_pair "dev@runheimdall.dev" "Dev" "dev@other.example" "Dev")"
+[ "$K_GENERIC" = "False" ] \
+  && ok "K7 a GENERIC role local-part (dev@) never folds — the class excludes role addresses" \
+  || bad "K7 dev@runheimdall.dev absorbed dev@other.example — role addresses are not excluded"
+
+echo
+# ═════════════════════════════════════════════════════════════════════════════
+echo "── K-RED. FALSIFIABILITY: break the new rule, watch the owner split again ──"
+# ═════════════════════════════════════════════════════════════════════════════
+# ONE delta: the two directional probes in signals() are ANDed instead of ORed. Because the
+# class fires only when its FIRST argument is the anchor, requiring BOTH directions is
+# unsatisfiable — so this both DISABLES the class and PROVES it is directional.
+KMUT_DIR="$TMP/k-mutant"; mkdir -p "$KMUT_DIR"
+sed -e 's/_self_email_alias(a, b) or _self_email_alias(b, a)/_self_email_alias(a, b) and _self_email_alias(b, a)/' \
+    "$LIB/repo_roster.py" > "$KMUT_DIR/repo_roster.py"
+if grep -q '_self_email_alias(a, b) and _self_email_alias(b, a)' "$KMUT_DIR/repo_roster.py"; then
+  RED_PASS=$((RED_PASS+1)); ok "K-RED mutant built: the two directional probes ANDed (the ONLY delta)"
+else
+  RED_FAIL=$((RED_FAIL+1)); bad "K-RED mutation did not apply — signals() does not dispatch the class there"
+fi
+K_MUT_EXP="$(drive_k kmutant "$KMUT_DIR" "" --explain)"
+K_MUT_ROWS="$(drive_k kmutantr "$KMUT_DIR" "")"
+K_MUT_BOTH="$(kq "$K_MUT_EXP" "$K_HAS_BOTH")"
+K_MUT_EITHER="$(kq "$K_MUT_EXP" "$K_HAS_EITHER")"
+K_MUT_DUP="$(kq "$K_MUT_ROWS" "sum(1 for r in d if r['handle'].startswith('rj~'))")"
+if [ "$K_MUT_BOTH" = "0" ] && [ "$K_MUT_EITHER" = "2" ] && [ "$K_MUT_DUP" = "1" ]; then
+  RED_PASS=$((RED_PASS+1)); ok "K-RED with the class disabled the owner splits into 2 with an \`rj~2\` (RED observed)"
+else
+  RED_FAIL=$((RED_FAIL+1)); bad "K-RED the mutant still unified (both=$K_MUT_BOTH either=$K_MUT_EITHER rj~N=$K_MUT_DUP) — K1 does not test the class"
+fi
+# And the mutant must damage NOBODY else, which is what proves the delta is confined.
+K_MUT_RAVI="$(kq "$K_MUT_EXP" "sum(1 for p in d['people'] if any('ravikiran' in i.lower() for i in p['identities']))")"
+if [ "$K_ONE" = "1" ] && [ "$K_MUT_RAVI" = "2" ]; then
+  RED_PASS=$((RED_PASS+1)); ok "K-RED restored: the real module unifies the owner and still splits ravikiran (GREEN observed)"
+else
+  RED_FAIL=$((RED_FAIL+1)); bad "K-RED restored module wrong (owner=$K_ONE mutant-ravikiran=$K_MUT_RAVI)"
+fi
+
+echo
 echo "============================================================"
 printf "repo-roster: %d passed, %d failed\n" "$PASS" "$FAIL"
 printf "falsifiability (C-RED): %d observed, %d unobserved  [mutant must FAIL, real must PASS]\n" \
