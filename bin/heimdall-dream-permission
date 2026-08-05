@@ -36,9 +36,23 @@
 #   job resolved, not the script. Granting that Full Disk Access grants it to every other
 #   use of the same interpreter, and an operator deserves to know that before clicking.
 #
+# IT PROMPTS WHEN — AND ONLY WHEN — A HUMAN IS THERE TO ANSWER.
+#   Printing a block that ends in "now go type another command" is homework, and the owner
+#   said so: "the user would grant this, but prompt from hmd is required". So with a real
+#   terminal on BOTH stdin and stdout, `ask` puts the choice to him and acts on the answer
+#   in the same flow — including opening the Full Disk Access pane for him.
+#
+#   Everywhere else — the SessionStart hook, a pipe, CI, `curl | bash` — it falls back to
+#   the printed block and exits 0. That arm does not even READ stdin, which is what makes
+#   blocking impossible rather than merely unlikely: a prompt that wedges an unattended job
+#   is far worse than the homework it replaces. Interactive answers additionally time out
+#   to "do nothing", so even a terminal nobody is watching cannot hang.
+#
 # COMMANDS
 #   check         --repo DIR [--json]   exit 0 = nothing to grant, 1 = a grant is needed
-#   ask           --repo DIR [--force]  print the block ONCE; ALWAYS exits 0 (hook-safe)
+#   ask           --repo DIR [--force] [--no-interactive]
+#                                       prompt when a human is present, else print the
+#                                       block. ONCE either way; ALWAYS exits 0 (hook-safe)
 #   open-settings                       open macOS's Full Disk Access pane (explicit only)
 #   reset         [--repo DIR]          forget the block was shown (re-arm the ask)
 #
@@ -48,6 +62,9 @@
 #   HEIMDALL_DREAM_PERMISSION_STATE  the "already asked" marker
 #   HEIMDALL_LAUNCH_AGENTS_DIR       plist dir, read to name the exact binary to grant
 #   HEIMDALL_OPEN                    the `open` binary (test seam)
+#   HEIMDALL_DREAM_PERMISSION_TTY    force the interactive branch (test seam; the REAL
+#                                    gate is a terminal on stdin AND stdout)
+#   HEIMDALL_DREAM_PERMISSION_TIMEOUT seconds to wait for an answer (default 300)
 
 set -u
 
@@ -85,6 +102,7 @@ LAUNCHD_PATH="/usr/bin:/bin:/usr/sbin:/sbin"
 REPO=""
 JSON=0
 FORCE=0
+NO_INTERACTIVE=0
 
 die() { echo "heimdall-dream-permission: error: $*" >&2; exit 2; }
 
@@ -94,6 +112,7 @@ parse_args() {
       --repo)  REPO="${2:-}"; shift 2 ;;
       --json)  JSON=1; shift ;;
       --force) FORCE=1; shift ;;
+      --no-interactive) NO_INTERACTIVE=1; shift ;;
       *) die "unknown argument: $1" ;;
     esac
   done
@@ -351,6 +370,191 @@ print_block() {
   p "=============================================================================="
 }
 
+# ── interactivity ────────────────────────────────────────────────────────────────
+#
+# THE GATE IS THE ENTIRE SAFETY ARGUMENT. Both descriptors must be a terminal: stdout
+# alone would still let a piped-stdin caller be prompted at, and stdin alone would prompt
+# into a log nobody reads. Requiring both is the closest thing to "a human is sitting
+# there" that a shell can actually check. Everything else — hooks, pipes, CI, curl | bash
+# — takes the printed arm, which never touches stdin at all.
+can_prompt() {
+  [ "$NO_INTERACTIVE" = 1 ] && return 1
+  [ "${HEIMDALL_DREAM_PERMISSION_TTY:-0}" = "1" ] && return 0
+  [ -t 0 ] && [ -t 1 ]
+}
+
+# ask_line <prompt> — read one answer into $ANSWER.
+# rc 1 on EOF **or** timeout, and every caller treats that as "do nothing". A terminal is
+# not proof anyone is watching it (a detached tmux pane is a terminal), so the bounded
+# read is what turns "unlikely to hang" into "cannot hang".
+ANSWER=""
+ask_line() {
+  ANSWER=""
+  printf '%s' "$1"
+  if ! read -r -t "${HEIMDALL_DREAM_PERMISSION_TIMEOUT:-300}" ANSWER; then
+    echo ""
+    return 1
+  fi
+  return 0
+}
+
+open_pane() {
+  if ! command -v "$OPEN_BIN" >/dev/null 2>&1 && [ ! -x "$OPEN_BIN" ]; then
+    return 1
+  fi
+  "$OPEN_BIN" "$FDA_PANE" >/dev/null 2>&1
+}
+
+# ── [B] grant Full Disk Access ───────────────────────────────────────────────────
+#
+# hmd OPENS THE PANE; THE HUMAN GRANTS. That division is not a limitation we are being
+# coy about — macOS provides no API to set Full Disk Access, so the pane is genuinely the
+# whole of what any program can do here.
+#
+# AND IT DOES NOT PRETEND TO KNOW THE OUTCOME. macOS will not let a program read its own
+# permission state either, so "did it work?" is unanswerable from in here. Claiming
+# success because he clicked would be exactly the invented-confidence this whole feature
+# exists to replace. Instead: re-probe, say what is still visible, say what is not, and
+# name the one thing that WILL prove it — a scheduled run recording result: ok, which is
+# also what makes this ask go quiet on its own.
+flow_grant() {
+  local interp pinned prog
+  prog="$(plist_arg 0)"
+  [ -n "$prog" ] || prog="$HEIMDALL_HOME/bin/heimdall-dream-runner"
+  interp="$(resolve_shebang_interpreter "$prog")"
+  pinned="$(plist_pinned_python)"
+  [ -n "$interp" ] || interp="$pinned"
+
+  echo ""
+  p "  Before you do — the blast radius. macOS judges the INTERPRETER, not the script,"
+  p "  so the grant would land on:"
+  if [ -n "$interp" ]; then
+    p "    $interp"
+  else
+    p "    the scheduled interpreter (named in the error above)"
+  fi
+  p "  Full Disk Access on that binary reaches EVERY program that runs through it, not"
+  p "  just Heimdall. [A] avoids this entirely if moving the repo is an option."
+  echo ""
+  if ! ask_line "  Open System Settings at Full Disk Access now? [y/N] "; then
+    p "  No answer — leaving everything as it is. Nothing was changed."
+    return 0
+  fi
+  case "$ANSWER" in
+    y|Y|yes|YES|Yes) : ;;
+    *) p "  Left it alone. Nothing was changed."; return 0 ;;
+  esac
+
+  if open_pane; then
+    p "  Opened System Settings > Privacy & Security > Full Disk Access."
+  else
+    p "  Could not open it automatically. Open it by hand:"
+    p "    System Settings > Privacy & Security > Full Disk Access"
+  fi
+  p "  Click +, press Cmd+Shift+G, and add:"
+  if [ -n "$interp" ]; then
+    p "    $interp"
+  else
+    p "    the interpreter named in the error above"
+  fi
+  p "  then switch it ON."
+  echo ""
+  ask_line "  Press Enter when you are done (or Ctrl-C to leave it): " || true
+
+  # Re-probe. This is a MEASUREMENT of what is still knowable, not a verdict on his click.
+  classify
+  echo ""
+  if [ "$STATE" != "needs-grant" ]; then
+    p "  Re-checked: $REPO no longer needs a grant."
+    p "  The 03:00 run should work from here. Confirm with:"
+    p "    heimdall-dream-permission check --repo $REPO"
+    return 0
+  fi
+  p "  Re-checked. I cannot tell you whether the grant landed — macOS does not let any"
+  p "  program read its own permission state, which is the same restriction that stops"
+  p "  hmd granting this for you. So, precisely:"
+  p "    what I can still see : $REPO is inside $PROT_ROOT"
+  p "                           (structural — a grant does not change it)"
+  p "    what I cannot see    : whether Full Disk Access is now set for"
+  p "                           $([ -n "$interp" ] && printf '%s' "$interp" || printf 'the scheduled interpreter')"
+  p "    the proof that counts: the next scheduled run records  result: ok  in"
+  p "                           $STATUS, and this ask goes quiet by itself."
+  p "    check any time       : heimdall-dream-permission check --repo $REPO"
+}
+
+# ── [A] move the repo out of the protected folder ────────────────────────────────
+#
+# THE MOVE GETS ITS OWN CONFIRMATION, AND A LITERAL WORD. Relocating a live checkout as a
+# side effect of a permission prompt would be the worst kind of helpful — so [A] prints
+# paste-ready commands by default and only moves anything when he types MOVE, which no
+# reflexive "y" can produce by accident.
+#
+# AND IT REFUSES WHEN THE MOVE WOULD BREAK THINGS. A linked worktree records an ABSOLUTE
+# gitdir path, so moving the main checkout detaches every one of them at once. This repo
+# routinely carries dozens. Refusing and saying why beats a helpful move that detonates
+# them; `git worktree repair` can fix it afterwards, but only if he chose it knowingly.
+flow_move() {
+  local dest wt_count
+  dest="$HOME/$(basename "$REPO")"
+
+  echo ""
+  p "  Paste-ready:"
+  p "    mv $REPO $dest"
+  p "    $dest/bin/heimdall-dream-schedule install --repo $dest"
+  echo ""
+
+  wt_count=0
+  if command -v git >/dev/null 2>&1 && [ -d "$REPO/.git" ]; then
+    wt_count="$(git -C "$REPO" worktree list 2>/dev/null | sed -n '2,$p' | grep -c . || printf '0')"
+  fi
+  if [ "$wt_count" -gt 0 ] 2>/dev/null && [ "$wt_count" != 0 ]; then
+    p "  I will NOT move it for you: this checkout has $wt_count linked git worktree(s),"
+    p "  and each one records an ABSOLUTE path back to here. Moving the main checkout"
+    p "  detaches all of them at once. If you want to go ahead, run the mv yourself and"
+    p "  then repair them:"
+    p "    git -C $dest worktree repair"
+    return 0
+  fi
+  if [ -e "$dest" ]; then
+    p "  I will NOT move it for you: $dest already exists."
+    return 0
+  fi
+
+  if ! ask_line "  Move it now? Type MOVE to confirm, anything else cancels: "; then
+    p "  No answer — nothing was moved."
+    return 0
+  fi
+  if [ "$ANSWER" != "MOVE" ]; then
+    p "  Cancelled. Nothing was moved."
+    return 0
+  fi
+  if mv "$REPO" "$dest" 2>/dev/null; then
+    p "  Moved to $dest."
+    p "  Now re-register the nightly job from the new location (run it yourself — this"
+    p "  writes to launchd, and that should be your keystroke, not mine):"
+    p "    $dest/bin/heimdall-dream-schedule install --repo $dest"
+  else
+    p "  Move FAILED — nothing was changed. Check permissions on $REPO and $dest."
+  fi
+}
+
+# interactive_flow — put the choice to him and act on it.
+interactive_flow() {
+  echo ""
+  if ! ask_line "  Your choice — [A] move the repo, [B] grant Full Disk Access, [C] not now: "; then
+    p "  No answer — leaving everything as it is."
+    return 0
+  fi
+  case "$ANSWER" in
+    a|A) flow_move ;;
+    b|B) flow_grant ;;
+    c|C|"") p "  Left as is. The 03:00 run stays blocked and Heimdall will keep saying so." ;;
+    *)   p "  Not one of A, B or C — leaving everything as it is."
+         p "  Run this again when you have decided:"
+         p "    heimdall-dream-permission ask --repo $REPO --force" ;;
+  esac
+}
+
 # ── subcommands ──────────────────────────────────────────────────────────────────
 cmd_check() {
   classify
@@ -388,7 +592,12 @@ cmd_ask() {
     return 0
   fi
   print_block
+  # The marker is written BEFORE the prompt on purpose: whatever he answers — including
+  # walking away — the ask has been made, and re-asking every session would be the nag
+  # this feature is explicitly not. `--force` brings it back on demand, and real evidence
+  # (a scheduled run recording result: ok) clears it automatically.
   write_marker
+  can_prompt && interactive_flow
   return 0
 }
 

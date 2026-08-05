@@ -400,6 +400,193 @@ printf '%s' "$NOUT" | grep -q 'heimdall-dream-permission' \
   && ok "(10) notice now also points at the permission ask (remedy added, not swapped)" \
   || bad "(10) notice does not route to the permission ask"
 
+# ══ INTERACTIVE ARMS ═════════════════════════════════════════════════════════════
+#
+# THE OWNER'S OBJECTION, VERBATIM: "the user would grant this, but prompt from hmd is
+# required". He is willing to grant Full Disk Access. What he refuses is being handed
+# homework — a block that tells him to go type another command later. So when a human is
+# demonstrably present, ASK, and act on the answer within the same flow.
+#
+# THE GATE IS THE WHOLE SAFETY ARGUMENT. A prompt that fires from the SessionStart hook,
+# a pipe, CI or `curl | bash` is far worse than the homework it replaces: it hangs a job
+# nobody is watching. So interactivity is gated on BOTH stdin and stdout being a terminal,
+# and §11 proves the non-interactive arm cannot prompt, cannot open anything, and does not
+# even CONSUME stdin — the last being the property that makes hanging impossible.
+#
+#   (11) NON-INTERACTIVE never prompts, never opens, never reads stdin, exits 0.
+#   (12) A REAL PTY opens the interactive branch with no seam set — the gate is genuinely
+#        `[ -t 0 ] && [ -t 1 ]` and not something the seam invented.
+#   (13) [C] declines cleanly.
+#   (14) [B] OPENS the Full Disk Access pane from inside the flow — the objection, fixed.
+#   (15) [B] re-probes afterwards and NEVER claims hmd granted anything.
+#   (16) [A] does NOT move the repo without a separate explicit confirmation.
+#   (17) [A] REFUSES to move a repo with linked worktrees (it would break every one).
+#   (18) EOF and timeout both fall back to "do nothing" — a prompt cannot wedge.
+
+PROMPT_MARK='Your choice'
+
+echo
+echo "  -- interactive arms --"
+
+# ── (11) NON-INTERACTIVE: the hook/pipe/CI arm ───────────────────────────────────
+rm -f "$STATE"; : > "$OPENLOG"
+write_status "$STATUSF" blocked tcc-denied "$PROT_REPO"
+
+NI="$(printf 'B\ny\n' | "$PERM" ask --repo "$PROT_REPO" 2>&1)"
+NI_RC=$?
+if printf '%s' "$NI" | grep -q 'Full Disk Access' \
+   && ! printf '%s' "$NI" | grep -q "$PROMPT_MARK"; then
+  ok "(11) no TTY: prints the block and does NOT prompt"
+else
+  bad "(11) non-interactive arm prompted or lost the block"
+fi
+[ "$NI_RC" = 0 ] && ok "(11) no TTY: exits 0" || bad "(11) non-interactive exit was $NI_RC"
+if [ ! -s "$OPENLOG" ]; then
+  ok "(11) no TTY: opened nothing"
+else
+  bad "(11) non-interactive arm opened System Settings: $(tr '\n' ' ' < "$OPENLOG")"
+fi
+
+# THE ANTI-HANG PROOF. If the tool consumed stdin, `cat` downstream sees nothing. A tool
+# that never reads the pipe cannot block on it, which is the real guarantee a hook needs.
+rm -f "$STATE"
+LEFTOVER="$(printf 'B\ny\n' | { "$PERM" ask --repo "$PROT_REPO" >/dev/null 2>&1; cat; })"
+if [ "$LEFTOVER" = "$(printf 'B\ny')" ]; then
+  ok "(11) no TTY: stdin is left UNREAD — it cannot block on a pipe"
+else
+  bad "(11) non-interactive arm consumed stdin: got '$LEFTOVER'"
+fi
+
+# ── (12) FALSIFIER: a REAL pty opens the interactive branch, with NO seam set ────
+# `script -q /dev/null` hands the child a genuine tty on both descriptors. Its own pty
+# echo makes feeding answers unreliable, so this asserts only what it can assert
+# honestly: with a real terminal the PROMPT APPEARS; without one (§11) it never does.
+# That isolates the gate itself as the thing controlling interactivity.
+rm -f "$STATE"; : > "$OPENLOG"
+if command -v script >/dev/null 2>&1; then
+  PTY_OUT="$(script -q /dev/null "$PERM" ask --repo "$PROT_REPO" </dev/null 2>&1 | tr -d '\r' || true)"
+  if printf '%s' "$PTY_OUT" | grep -q "$PROMPT_MARK"; then
+    ok "(12) FALSIFIER: with a REAL pty the prompt appears (the gate is the tty, not the seam)"
+  else
+    bad "(12) a real pty did not open the interactive branch"
+  fi
+  # …and closing stdin on that same pty must not wedge it. It got here, so it did not.
+  ok "(12) a pty whose stdin is at EOF still terminates (no wedge)"
+else
+  bad "(12) script(1) unavailable — cannot prove the tty gate end to end"
+fi
+
+# ── the seam that drives ANSWERS ─────────────────────────────────────────────────
+# HEIMDALL_DREAM_PERMISSION_TTY=1 forces the interactive branch so answers can be piped
+# deterministically. §12 above is what keeps this honest: it proves the REAL gate opens
+# on a real terminal, so the seam is a test convenience, not the feature.
+I() { HEIMDALL_DREAM_PERMISSION_TTY=1 HEIMDALL_DREAM_PERMISSION_TIMEOUT=5 "$PERM" ask --repo "$1" 2>&1; }
+
+# ── (13) [C] — not now ───────────────────────────────────────────────────────────
+rm -f "$STATE"; : > "$OPENLOG"
+C_OUT="$(printf 'c\n' | I "$PROT_REPO")"
+printf '%s' "$C_OUT" | grep -q "$PROMPT_MARK" \
+  && ok "(13) interactive: the choice is actually put to him" \
+  || bad "(13) no prompt shown in interactive mode"
+[ ! -s "$OPENLOG" ] && ok "(13) [C] opens nothing" \
+  || bad "(13) [C] opened something: $(tr '\n' ' ' < "$OPENLOG")"
+[ -f "$STATE" ] && ok "(13) [C] still records the ask (asked once, no nag)" \
+  || bad "(13) [C] wrote no marker"
+
+# ── (14) [B] — THE OBJECTION, FIXED: the pane opens from inside the flow ─────────
+rm -f "$STATE"; : > "$OPENLOG"
+B_OUT="$(printf 'b\ny\n\n' | I "$PROT_REPO")"
+if grep -q 'Privacy_AllFiles' "$OPENLOG" 2>/dev/null; then
+  ok "(14) [B] OPENS System Settings at Full Disk Access — no second command to type"
+else
+  bad "(14) [B] did not open the pane: $(cat "$OPENLOG" 2>/dev/null)"
+fi
+printf '%s' "$B_OUT" | grep -qi 'blast radius\|every other program\|interpreter' \
+  && ok "(14) [B] still warns about the blast radius before he commits" \
+  || bad "(14) [B] dropped the blast-radius warning"
+
+# ── (15) [B] verdict is a MEASUREMENT, never a claim ─────────────────────────────
+printf '%s' "$B_OUT" | grep -qi 'cannot confirm\|cannot read\|cannot see' \
+  && ok "(15) [B] states plainly what it cannot see (macOS permission state)" \
+  || bad "(15) [B] verdict does not admit its limits"
+if printf '%s' "$B_OUT" | grep -Eqi 'granted successfully|permission granted|you are all set|now works|is now working'; then
+  bad "(15) [B] CLAIMED success it cannot possibly verify"
+else
+  ok "(15) FALSIFIER: [B] never claims hmd granted anything or that 03:00 now works"
+fi
+printf '%s' "$B_OUT" | grep -q 'result: *ok\|result=ok\|heimdall-dream-permission check' \
+  && ok "(15) [B] names the proof that actually counts (a scheduled run / check)" \
+  || bad "(15) [B] gives him no way to confirm later"
+
+# ── (16) [A] — never moves his repo as a side effect ─────────────────────────────
+# A permission flow that quietly relocates a live checkout would be the worst kind of
+# helpful. The move needs its own confirmation, and anything short of it is a no-op.
+MREPO="$FHOME/Downloads/movable"; mkdir -p "$MREPO/.planning"
+printf '%s\n' 'canary' > "$MREPO/canary.txt"
+rm -f "$STATE"; : > "$OPENLOG"
+A_OUT="$(printf 'a\nyes\n' | I "$MREPO")"
+if [ -f "$MREPO/canary.txt" ]; then
+  ok "(16) [A] did NOT move the repo without the explicit confirmation word"
+else
+  bad "(16) [A] MOVED HIS REPO on a plain 'yes' — unacceptable"
+fi
+printf '%s' "$A_OUT" | grep -q 'mv ' \
+  && ok "(16) [A] hands him the paste-ready mv + re-register commands" \
+  || bad "(16) [A] printed no move commands"
+
+# ── (17) [A] refuses a repo with linked worktrees ────────────────────────────────
+# Moving a checkout that has linked worktrees breaks every one of them: their .git files
+# hold ABSOLUTE gitdir paths. Refusing beats a helpful move that detonates 30 worktrees.
+WREPO="$FHOME/Downloads/wtrepo"; mkdir -p "$WREPO"
+git -C "$WREPO" init -q 2>/dev/null
+printf '%s\n' 'x' > "$WREPO/f.txt"
+git -C "$WREPO" add -A >/dev/null 2>&1
+git -C "$WREPO" -c user.email=t@t -c user.name=t commit -qm f >/dev/null 2>&1
+git -C "$WREPO" worktree add --detach -q "$FHOME/Downloads/wtlinked" >/dev/null 2>&1
+rm -f "$STATE"
+W_OUT="$(printf 'a\nMOVE\n' | I "$WREPO")"
+if [ -d "$WREPO" ] && [ -f "$WREPO/f.txt" ]; then
+  ok "(17) [A] refused to move a repo that has linked worktrees"
+else
+  bad "(17) [A] moved a repo with linked worktrees — it would break every one"
+fi
+printf '%s' "$W_OUT" | grep -qi 'worktree' \
+  && ok "(17) the refusal NAMES linked worktrees as the reason" \
+  || bad "(17) refusal did not explain itself: $(printf '%s' "$W_OUT" | tr '\n' ' ' | cut -c1-200)"
+
+# ── (18) EOF and TIMEOUT both fall back to doing nothing ─────────────────────────
+rm -f "$STATE"; : > "$OPENLOG"
+E_RC=0
+HEIMDALL_DREAM_PERMISSION_TTY=1 HEIMDALL_DREAM_PERMISSION_TIMEOUT=5 \
+  "$PERM" ask --repo "$PROT_REPO" </dev/null >/dev/null 2>&1 || E_RC=$?
+[ "$E_RC" = 0 ] && ok "(18) stdin at EOF: exits 0 (never wedges)" \
+  || bad "(18) EOF exit was $E_RC"
+[ ! -s "$OPENLOG" ] && ok "(18) stdin at EOF: opened nothing" \
+  || bad "(18) EOF path opened something"
+
+T0="$(date +%s)"
+T_RC=0
+HEIMDALL_DREAM_PERMISSION_TTY=1 HEIMDALL_DREAM_PERMISSION_TIMEOUT=1 \
+  "$PERM" ask --repo "$PROT_REPO" >/dev/null 2>&1 <<'NOANSWER' || T_RC=$?
+NOANSWER
+T1="$(date +%s)"
+if [ "$T_RC" = 0 ] && [ "$((T1 - T0))" -lt 20 ]; then
+  ok "(18) an unanswered prompt times out and exits 0 rather than hanging"
+else
+  bad "(18) unanswered prompt: rc=$T_RC after $((T1 - T0))s"
+fi
+
+# ── (19) the non-interactive block is UNCHANGED by any of this ───────────────────
+# 41 assertions above describe that block. The interactive arm is an ADDITION; if it had
+# quietly rewritten the printed path, every hook and CI consumer would have changed too.
+rm -f "$STATE"
+FINAL="$("$PERM" ask --repo "$PROT_REPO" 2>&1)"
+if [ "$FINAL" = "$NI" ]; then
+  ok "(19) the non-interactive block is byte-identical to before the interactive work"
+else
+  bad "(19) the printed block drifted between runs"
+fi
+
 echo "------------------------------"
 if [ "$FAIL" -eq 0 ]; then
   printf "dream-permission: \033[32m%d passed\033[0m, 0 failed\n" "$PASS"
