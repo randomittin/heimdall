@@ -29,11 +29,21 @@
 #   of failing mute.
 #
 # USAGE
-#   heimdall-dream-runner --dream PATH --repo DIR [--status FILE] [dream args...]
+#   heimdall-dream-runner --dream PATH --repo DIR [--python PATH] [--status FILE] [dream args...]
 #
 #   Trailing args are forwarded verbatim to dream after `--repo DIR`, so the plist keeps
 #   encoding the full, readable overnight command:
 #       heimdall-dream-runner --dream <bin> --repo <repo> run --overnight
+#
+# --python: THE INTERPRETER IS PINNED, NOT SEARCHED FOR.
+#   dream is `#!/usr/bin/env python3`, and `env` resolves through $PATH. A LaunchAgent
+#   with no PATH key gets /usr/bin:/bin:/usr/sbin:/sbin — a different search path than any
+#   interactive shell, on a machine that may well have three python3s installed. Relying on
+#   the shebang means the nightly run and the run the operator tested by hand are not
+#   provably the same program. heimdall-dream-schedule resolves a concrete interpreter at
+#   INSTALL time (while a real user's PATH exists) and writes it into the plist; this runner
+#   execs through it. Absent the flag the shebang is used exactly as before, so a runner
+#   invoked by hand still behaves the way it always did.
 #
 # ENV
 #   HEIMDALL_HOME          state dir (default $HOME/.heimdall)
@@ -41,7 +51,8 @@
 #
 # EXIT
 #   0   dream ran and succeeded
-#   75  EX_TEMPFAIL — the repo was unreachable; dream did NOT run (never a silent 0)
+#   75  EX_TEMPFAIL — the repo or the interpreter was unreachable; dream did NOT run
+#       (never a silent 0)
 #   *   dream's own exit code when dream ran and failed
 
 set -u
@@ -53,6 +64,7 @@ LABEL="com.heimdall.dream"
 
 DREAM=""
 REPO=""
+PYTHON=""
 FORWARD=()
 
 die() { echo "heimdall-dream-runner: error: $*" >&2; exit 2; }
@@ -61,8 +73,9 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --dream)  DREAM="${2:-}"; shift 2 ;;
     --repo)   REPO="${2:-}";  shift 2 ;;
+    --python) PYTHON="${2:-}"; shift 2 ;;
     --status) STATUS="${2:-}"; shift 2 ;;
-    --help|-h) sed -n '2,48p' "$SELF" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --help|-h) sed -n '2,58p' "$SELF" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) FORWARD+=("$1"); shift ;;
   esac
 done
@@ -175,11 +188,36 @@ advice_for() {
       echo "  fix:   re-register the schedule from the live checkout:"
       echo "           heimdall-dream-schedule install --repo <repo>"
       ;;
+    python-unusable)
+      echo "  cause: the python3 interpreter pinned into this job cannot run. It was verified"
+      echo "         at install time, so it has since been removed, upgraded out from under"
+      echo "         the pin, or had its permissions changed (a pyenv/homebrew version bump"
+      echo "         does exactly this)."
+      echo "  fix:   re-register the schedule, which re-resolves and re-pins the interpreter:"
+      echo "           heimdall-dream-schedule install --repo $REPO"
+      ;;
     *)
       echo "  cause: the repo could not be read; the OS error is recorded verbatim above."
       echo "  fix:   run '$DREAM --repo $REPO run' from a terminal to see the failure directly."
       ;;
   esac
+}
+
+# THE PINNED INTERPRETER IS A THIRD PATH THAT CAN VANISH.
+# Splitting the clock from the runner gave the plist two paths to check; pinning the
+# interpreter gives it a third. A pin that no longer runs is the same registered-but-dead
+# job as a deleted script, and it fails in the same place — before dream produces a line —
+# so it gets the same treatment: a probe, a structured status, and exit 75. Verifying it
+# means RUNNING it, not stat-ing it: an interpreter can be present, executable, and still
+# unable to start (a pyenv shim whose version was uninstalled is exactly that).
+PYTHON_ERR=""
+probe_python() {
+  local py="$1" err
+  if err="$("$py" -c 'import sys' 2>&1 >/dev/null)"; then
+    return 0
+  fi
+  PYTHON_ERR="${err:-$py could not execute}"
+  return 1
 }
 
 # Both pinned paths matter: the repo dream must READ, and the dream script itself.
@@ -188,6 +226,33 @@ if ! probe_dir "$REPO"; then
   BLOCKED=1
 elif ! probe_file "$DREAM"; then
   BLOCKED=1
+fi
+
+# Only probe the interpreter once the repo and script are known reachable, so a TCC
+# denial is still reported as a TCC denial rather than being masked by a later check.
+PYTHON_BLOCKED=0
+if [ "$BLOCKED" = 0 ] && [ -n "$PYTHON" ]; then
+  if [ ! -x "$PYTHON" ]; then
+    PYTHON_ERR="not executable: $PYTHON"
+    PYTHON_BLOCKED=1
+  elif ! probe_python "$PYTHON"; then
+    PYTHON_BLOCKED=1
+  fi
+fi
+
+if [ "$PYTHON_BLOCKED" = 1 ]; then
+  write_status blocked python-unusable "$PYTHON" "$PYTHON_ERR" 75
+  echo "=============================================================================="
+  echo "heimdall dream BLOCKED — $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "  the nightly dream did NOT run. No report was written."
+  echo "  interpreter: $PYTHON"
+  echo "  error:  $PYTHON_ERR"
+  echo "  reason: python-unusable"
+  advice_for python-unusable
+  echo "  this failure is recorded at $STATUS and will be surfaced by heimdall-dream-notice"
+  echo "  at the start of your next Heimdall session."
+  echo "=============================================================================="
+  exit 75
 fi
 
 if [ "$BLOCKED" = 1 ]; then
@@ -209,7 +274,14 @@ if [ "$BLOCKED" = 1 ]; then
 fi
 
 # ── reachable: run the real dream ────────────────────────────────────────────────
-"$DREAM" --repo "$REPO" "${FORWARD[@]}"
+# With a pin, exec THROUGH it — the shebang's `env python3` is never consulted, so the
+# job cannot drift onto whatever interpreter the launchd PATH happens to surface. Without
+# one, the shebang runs exactly as it always has.
+if [ -n "$PYTHON" ]; then
+  "$PYTHON" "$DREAM" --repo "$REPO" "${FORWARD[@]}"
+else
+  "$DREAM" --repo "$REPO" "${FORWARD[@]}"
+fi
 RC=$?
 
 if [ "$RC" = 0 ]; then

@@ -40,10 +40,14 @@
 #   HEIMDALL_DREAM_LOG           log file       (default: $HOME/.heimdall/logs/dream.log)
 #   LAUNCHCTL                    launchctl bin  (default: launchctl)
 #   HEIMDALL_REAL_HOME           passwd home    (default: resolved from getpwuid)
+#   HEIMDALL_DREAM_PYTHON        interpreter to pin (default: resolved — see resolve_python)
 #   These let the acceptance suite prove install/idempotent/status/uninstall with a
 #   shimmed launchctl and a tmp dir — no root, no real agent loaded.
 #
-# Exit status: 0 ok · 2 usage / unsupported platform · 3 runtime · 4 refused (see below).
+# Exit status: 0 ok · 2 usage / unsupported platform · 3 runtime · 4 refused: synthetic
+# HOME · 5 refused: ephemeral checkout · 6 refused: TCC-protected artifact path.
+# The refusals are numbered DISTINCTLY on purpose — each one is a different operator
+# action, and a code that collapses two causes is how a silent outage survives triage.
 
 set -euo pipefail
 
@@ -138,6 +142,187 @@ xml_escape() {
 
 is_macos() { [ "$(uname -s)" = "Darwin" ]; }
 
+# ── Path identity, for paths that DO NOT EXIST YET ───────────────────────────────
+#
+# bin/lib/real-home.sh's heimdall_physical_path resolves an EXISTING path. The artifact
+# directories below are created BY this install, so on a first run they are absent and
+# that helper cannot answer. absolute_physical walks up to the deepest ancestor that does
+# exist, resolves THAT physically (so a symlinked $HOME cannot launder a path past the
+# guard), then re-appends the tail it walked off.
+absolute_physical() {
+  local p="${1:-}" tail="" base
+  [ -n "$p" ] || return 1
+  case "$p" in /*) : ;; *) p="$PWD/$p" ;; esac
+  while [ ! -d "$p" ] && [ "$p" != "/" ]; do
+    base="$(basename "$p")"
+    tail="/$base$tail"
+    p="$(dirname "$p")"
+  done
+  p="$(cd "$p" 2>/dev/null && pwd -P)" || return 1
+  case "$p" in
+    /) printf '%s' "$tail" ;;
+    *) printf '%s%s' "$p" "$tail" ;;
+  esac
+}
+
+# same_physical_file <a> <b> — TRUE when both names resolve to the SAME path.
+#
+# WHY THIS EXISTS. `cp X X` is not a no-op on macOS: it prints "are identical (not
+# copied)" and EXITS 1. install_runner treated that as a staging failure and died, so the
+# helper exited 3 and install.sh rendered the state word 'skipped' — meaning EVERY default
+# `curl | bash` install registered no nightly dream at all, silently. The default layout
+# puts the plugin tree at $HOME/.heimdall and defaults $HEIMDALL_HOME to the same path, so
+# the runner's source and its staging destination are one file. Asking the question
+# directly is the fix; letting `cp` answer it with an exit code is what broke.
+same_physical_file() {
+  local a b
+  a="$(absolute_physical "${1:-}")" || return 1
+  b="$(absolute_physical "${2:-}")" || return 1
+  [ "$a" = "$b" ]
+}
+
+# ── Modes are SET, never INHERITED ───────────────────────────────────────────────
+#
+# `mkdir -p` and `chmod +x` take their bits from the caller's umask. Under `umask 000`
+# that yields a 0777 WORLD-WRITABLE executable which the user's launchd then runs every
+# night — any local process could rewrite it between runs. An installer cannot choose its
+# caller's umask, so it must state the mode it needs.
+#
+# 0700 for directories: $HEIMDALL_HOME holds pki/, signing/, team.json and cp-endpoint.json.
+# Nothing under it is for group or other, and the directory bit is the boundary that makes
+# every file mode inside it moot for anyone but the owner.
+ensure_private_dir() {
+  local d="${1:-}"
+  [ -n "$d" ] || die "ensure_private_dir: empty path"
+  mkdir -p "$d" || die "cannot create $d"
+  chmod 0700 "$d" || die "cannot set mode 0700 on $d"
+}
+
+# ── The launchd-reachability guard (exit 6) ──────────────────────────────────────
+#
+# THE RUNNER EXISTS TO SURVIVE A TCC DENIAL AND REPORT IT. Staging it inside a protected
+# folder puts the reporter behind the same locked door as the thing it reports on, which
+# is exactly the shape of the ten-night silence: the job died on its first syscall and no
+# code of ours was left running to notice. A LaunchAgent carries no TCC grant, so a
+# program, a log, or a plist under ~/Downloads, ~/Documents or ~/Desktop is unreachable at
+# 03:00 no matter how correct everything else is.
+#
+# THE REPO IS DELIBERATELY EXEMPT. A protected repo is the case the runner's probe already
+# handles by failing loudly and writing a structured status (commit 245ede5). This guard
+# covers only the paths the job needs IN ORDER TO report that — its program, its output,
+# and its registration. Guarding the repo too would refuse the very machine the loud-
+# failure path was built for.
+#
+# BOTH HOMES ARE CHECKED. $HOME may be synthetic while the artifact path is written in
+# terms of the real user's home (or the reverse), so the passwd home is consulted as well.
+TCC_PROTECTED_SUBDIRS="Downloads Documents Desktop"
+
+# path_is_tcc_protected <path> — prints the protected root and returns 0 when <path> is
+# inside one; returns 1 otherwise.
+path_is_tcc_protected() {
+  local abs home sub homes real
+  abs="$(absolute_physical "${1:-}")" || return 1
+  real=""
+  if type heimdall_real_user_home >/dev/null 2>&1; then
+    real="$(heimdall_real_user_home 2>/dev/null || true)"
+  fi
+  homes="${HOME:-}
+$real"
+  while IFS= read -r home; do
+    [ -n "$home" ] || continue
+    home="$(cd "$home" 2>/dev/null && pwd -P)" || continue
+    for sub in $TCC_PROTECTED_SUBDIRS; do
+      case "$abs/" in
+        "$home/$sub/"*) printf '%s' "$home/$sub"; return 0 ;;
+      esac
+    done
+  done <<EOF
+$homes
+EOF
+  return 1
+}
+
+refuse_unreachable() {
+  local what="$1" path="$2" prot="$3"
+  echo "not scheduled $PLIST (TCC-protected artifact path — the job could not report its own failure)" >&2
+  echo "  $what is inside $prot, a folder macOS TCC protects: $path" >&2
+  echo "  A LaunchAgent holds no TCC grant, so at 03:00 this path is unreadable and the" >&2
+  echo "  job dies before it can say why — the exact silent failure this runner exists to" >&2
+  echo "  prevent. Point HEIMDALL_HOME at a non-protected directory (the default," >&2
+  echo "  \$HOME/.heimdall, is measured reachable from a LaunchAgent). Nothing was written." >&2
+  exit 6
+}
+
+# Gated BEFORE any write, so a refusal leaves no plist, no staged runner, and issues no
+# launchctl verb — the same total-refusal contract exits 4 and 5 already hold to.
+require_reachable_artifacts() {
+  local prot logdir
+  if prot="$(path_is_tcc_protected "$RUNNER_DIR")"; then
+    refuse_unreachable "the scheduled program's directory" "$RUNNER_DIR" "$prot"
+  fi
+  logdir="$(dirname "$LOG")"
+  if prot="$(path_is_tcc_protected "$logdir")"; then
+    refuse_unreachable "the job's log directory" "$logdir" "$prot"
+  fi
+  if prot="$(path_is_tcc_protected "$LA_DIR")"; then
+    refuse_unreachable "the LaunchAgents directory" "$LA_DIR" "$prot"
+  fi
+  return 0
+}
+
+# ── The interpreter is RESOLVED at install time, not guessed at 03:00 ────────────
+#
+# bin/heimdall-dream is `#!/usr/bin/env python3`, and `env` resolves through $PATH. A
+# LaunchAgent with no PATH key gets /usr/bin:/bin:/usr/sbin:/sbin, which is a DIFFERENT
+# search path than any interactive shell. Measured on the machine this was written for,
+# three interpreters answer to the name python3:
+#     /usr/bin/python3            3.9.6    ← what the launchd PATH finds
+#     ~/.pyenv/shims/python3      3.11.14  ← what the terminal finds
+#     /opt/homebrew/bin/python3   3.14.4
+# So the nightly run and the run the operator tested by hand were never guaranteed to be
+# the same program. That is a latent failure with no symptom until the day the versions
+# diverge enough to matter, and it was a contributing factor in the original incident
+# (the error naming Xcode's python3 was the job telling us which one it had picked).
+#
+# VALIDATION USES THE LAUNCHD ENVIRONMENT, NOT THIS ONE. An interpreter that only works
+# because the installing shell exported something is not an interpreter the 03:00 job can
+# use. `/usr/bin/env -i` strips the shell's world so the candidate is tested the way
+# launchd will actually see it — which is what makes this a measurement instead of a hope.
+LAUNCHD_PATH="/usr/bin:/bin:/usr/sbin:/sbin"
+PYTHON_FALLBACKS="/opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3"
+
+python_runs() {
+  local py="${1:-}"
+  [ -n "$py" ] && [ -x "$py" ] || return 1
+  /usr/bin/env -i HOME="${HOME:-/}" PATH="$LAUNCHD_PATH" "$py" -c 'import sys' >/dev/null 2>&1
+}
+
+# resolve_python — print an ABSOLUTE, VERIFIED python3, or return 1.
+# Preference order: an explicit pin, then the installing user's own python3 (so the
+# nightly job runs what the operator runs), then absolute fallbacks. Returning 1 is not
+# fatal: the plist simply carries no pin and the runner reports a structured, loud failure
+# at 03:00 rather than the install refusing on a box we cannot fully inspect.
+resolve_python() {
+  local py
+  py="${HEIMDALL_DREAM_PYTHON:-}"
+  if [ -n "$py" ]; then
+    python_runs "$py" && { printf '%s' "$py"; return 0; }
+    return 1
+  fi
+  py="$(command -v python3 2>/dev/null || true)"
+  if [ -n "$py" ]; then
+    case "$py" in
+      /*) : ;;
+      *)  py="$(cd "$(dirname "$py")" 2>/dev/null && pwd -P)/$(basename "$py")" ;;
+    esac
+    python_runs "$py" && { printf '%s' "$py"; return 0; }
+  fi
+  for py in $PYTHON_FALLBACKS; do
+    python_runs "$py" && { printf '%s' "$py"; return 0; }
+  done
+  return 1
+}
+
 # ── The install-side sandbox guard (fail-safe, self-detecting) ───────────────────
 #
 # WHY REGISTRATION NEEDS THIS. `launchctl load` does NOT resolve through $HOME — it
@@ -229,21 +414,53 @@ require_durable_pinned_paths() {
 # install is idempotent (fixed path, overwritten in place) and heimdall-autoupdate
 # re-asserts the schedule after every update, which makes this the normal refresh path
 # rather than a manual chore that would rot.
+#
+# WHEN THE SOURCE *IS* THE DESTINATION, THERE IS NOTHING TO COPY. The default install
+# layout puts the plugin tree at $HOME/.heimdall and $HEIMDALL_HOME defaults to the same
+# path, so RUNNER_SRC and RUNNER name ONE file. `cp X X` exits 1 on macOS, which this
+# used to treat as a staging failure — the helper died with exit 3 and install.sh printed
+# the state word 'skipped', so a stranger's install registered no nightly dream and said
+# nothing about it. The file is already exactly where it must be; the only work left is
+# to assert its mode.
 install_runner() {
   [ -f "$RUNNER_SRC" ] || die "heimdall-dream-runner missing at $RUNNER_SRC"
-  mkdir -p "$RUNNER_DIR" || die "cannot create $RUNNER_DIR"
-  cp "$RUNNER_SRC" "$RUNNER" || die "cannot stage the runner at $RUNNER"
-  chmod +x "$RUNNER"        || die "cannot make $RUNNER executable"
+  ensure_private_dir "$HEIMDALL_HOME"
+  ensure_private_dir "$RUNNER_DIR"
+  if ! same_physical_file "$RUNNER_SRC" "$RUNNER"; then
+    cp "$RUNNER_SRC" "$RUNNER" || die "cannot stage the runner at $RUNNER"
+  fi
+  # EXPLICIT, never `chmod +x` — under `umask 000` that would leave a world-writable
+  # program that launchd executes nightly. 0755 is the tree's convention for a bin; the
+  # 0700 directory above is what actually keeps it out of anyone else's reach.
+  chmod 0755 "$RUNNER" || die "cannot set mode 0755 on $RUNNER"
 }
 
 # ── emit the plist (the single source of the scheduled argv) ─────────────────────
 write_plist() {
-  mkdir -p "$LA_DIR" "$(dirname "$LOG")"
+  # $LA_DIR is Apple's directory, not ours — create it if absent but never restyle the
+  # mode of one that already exists. The log tree IS ours, so it gets stated modes: 0700
+  # on the directory, and the file created here at 0600 rather than left for launchd to
+  # create under whatever umask loaded the job. The log carries repo paths and verbatim
+  # OS errors, which is diagnostic detail about this machine and nobody else's business.
+  mkdir -p "$LA_DIR" || die "cannot create $LA_DIR"
+  ensure_private_dir "$(dirname "$LOG")"
+  [ -e "$LOG" ] || : > "$LOG"
+  chmod 0600 "$LOG" || die "cannot set mode 0600 on $LOG"
   local e_dream e_repo e_log e_runner e_wd
   e_dream="$(xml_escape "$DREAM")"
   e_repo="$(xml_escape "$REPO")"
   e_log="$(xml_escape "$LOG")"
   e_runner="$(xml_escape "$RUNNER")"
+  # The interpreter pin, when one resolved. Emitted AFTER --repo and BEFORE the forwarded
+  # `run --overnight`, which keeps ProgramArguments[0] (the runner) and [2] (the dream bin)
+  # at the indices cmd_status extracts. Adding an argument that shifted those would quietly
+  # blind the silent-death detector at the very moment the argv grew a third path to watch.
+  local py_block=""
+  if [ -n "${PYTHON:-}" ]; then
+    py_block="    <string>--python</string>
+    <string>$(xml_escape "$PYTHON")</string>
+"
+  fi
   # WorkingDirectory must be a path the JOB can getcwd(). Pinning it to the repo is what
   # produced the `shell-init: error retrieving current directory: getcwd: cannot access
   # parent directories: Operation not permitted` lines in the real log — launchd could not
@@ -265,7 +482,7 @@ write_plist() {
     <string>$e_dream</string>
     <string>--repo</string>
     <string>$e_repo</string>
-    <string>run</string>
+$py_block    <string>run</string>
     <string>--overnight</string>
   </array>
   <key>StartCalendarInterval</key>
@@ -286,6 +503,9 @@ write_plist() {
 </dict>
 </plist>
 PLIST
+  # 0644 — launchd's own convention for a LaunchAgent, and the hard rule either way is
+  # that a file naming the program the system runs nightly is never world-writable.
+  chmod 0644 "$PLIST" || die "cannot set mode 0644 on $PLIST"
 }
 
 # ── launchctl helpers (unload-before-load == idempotent; tolerant of "not loaded") ─
@@ -371,7 +591,13 @@ Use the cron/cloud routine documented in commands/dream.md instead."
   require_real_launchd_domain
   # Second gate: never pin the nightly job to a checkout that is built to be reaped.
   require_durable_pinned_paths
+  # Third gate: never stage the job's own artifacts where launchd cannot reach them.
+  require_reachable_artifacts
   [ -x "$DREAM" ] || die "heimdall-dream not executable at $DREAM"
+  # Resolve the interpreter while a real user's PATH is available. Empty is tolerated:
+  # the plist then carries no pin and the runner falls back at 03:00 — loudly, with a
+  # recorded status, never a silent success.
+  PYTHON="$(resolve_python || true)"
   install_runner
   write_plist
   unload_agent   # drop any prior copy so a re-install never yields two loaded jobs
@@ -394,6 +620,16 @@ cmd_uninstall() {
   # off switch — tolerate a non-macOS box and an already-absent agent (idempotent).
   unload_agent
   rm -f "$PLIST"
+  # Reclaim the STAGED COPY of the runner, so uninstall reverses what install added.
+  #
+  # ONLY WHEN IT IS A COPY. In the default layout the plugin tree IS $HEIMDALL_HOME, so
+  # the "staged" runner is the installation's own file. `heimdall-dream-schedule uninstall`
+  # is the documented OFF SWITCH — a user turning the nightly job off must not have it
+  # quietly amputate part of the install. When the two paths differ the copy is ours and
+  # nothing else refers to it, so leaving it would orphan a file the user never placed.
+  if [ -e "$RUNNER" ] && ! same_physical_file "$RUNNER_SRC" "$RUNNER"; then
+    rm -f "$RUNNER" 2>/dev/null || true
+  fi
   if [ "$JSON" = 1 ]; then
     printf '{"installed":false,"loaded":false,"label":"%s","plist":"%s"}\n' "$LABEL" "$PLIST"
   else
