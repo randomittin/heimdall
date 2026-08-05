@@ -25,8 +25,9 @@
 #                           install is still NON-FATAL (the success card renders).
 #
 # HERMETIC: `claude` + `python3` are controlled PATH fakes; install.sh runs under a
-# controlled PATH with a tripwire that RESTORES + fails loudly if any tracked bin/
-# file changed (mirrors install-crypto-backend.test.sh). git checkout -- bin/ on exit.
+# controlled PATH against a PRIVATE CLONE of the repo, and the clobber assertion is a
+# sha256 content manifest of that clone's bin/ (mirrors install-crypto-backend.test.sh).
+# Nothing in the developer's own tree is ever written to or reverted.
 #
 # Usage:  test/install-validate.test.sh
 # Exit 0 = all guarantees hold. Non-zero = a guarantee regressed (prints which).
@@ -43,7 +44,6 @@ need git; need python3; need jq
 REAL_PY="$(command -v python3)"
 
 SYS="$(dirname "$(command -v git)"):/usr/bin:/bin"
-BIN_GUARD_BEFORE="$(git -C "$REPO" status --porcelain -- bin/ 2>/dev/null)"
 
 PASS=0; FAIL=0
 ok()  { printf '  \033[32mPASS\033[0m %s\n' "$1"; PASS=$((PASS+1)); }
@@ -104,16 +104,51 @@ chmod +x "$FAKE_DIR/python3"
 ln -s "$FAKE_DIR/python3" "$FAKE_DIR/python"
 FAKE_PATH="$FAKE_DIR:$SYS"
 
+# Cleanup touches ONLY this suite's own temp dirs. It deliberately does NOT revert
+# anything in the developer's tree — see the $SRC note below for why that reverting
+# tripwire was removed.
 cleanup() {
-  local after; after="$(git -C "$REPO" status --porcelain -- bin/ 2>/dev/null)"
-  if [ "$after" != "$BIN_GUARD_BEFORE" ]; then
-    printf '\n\033[31mFATAL\033[0m test mutated tracked bin/ — restoring:\n%s\n' "$after" >&2
-    git -C "$REPO" checkout -- bin/ 2>/dev/null || true
-  fi
   chmod -R u+w "$TMP_ROOT" 2>/dev/null || true
   rm -rf "$FAKE_DIR" "$TMP_ROOT" 2>/dev/null || true
 }
 trap cleanup EXIT
+
+# ── THE CLOBBER TARGET: a PRIVATE source checkout ─────────────────────────────
+# The guarantee under test is "install.sh, pointed at a LOCAL checkout, never writes
+# into that checkout's bin/" (install.sh pins it via SOURCE_GUARD_ROOTS, keyed on
+# HEIMDALL_REPO). This test used to point the installer at the DEVELOPER'S OWN worktree
+# and diff `git status --porcelain -- bin/` before/after. That was unsound twice over:
+#   - FALSE REDS: the snapshot spans the whole ~30s run, so ANY concurrent edit to bin/
+#     by a teammate or a parallel agent was misattributed to install.sh (run-all.sh runs
+#     suites in PARALLEL, so this was not hypothetical).
+#   - DESTRUCTIVE: on mismatch the cleanup trap ran `git checkout -- bin/` against that
+#     SHARED tree, discarding a teammate's uncommitted work to "restore" it. Measured:
+#     a landed bin/heimdall-modules change was silently reverted mid-session.
+# The installer now gets its own private clone, so the clobber target cannot be touched
+# by anyone else. The guarantee is unchanged; the measurement is now deterministic and
+# no shared tree is ever written to or reverted.
+#
+# The DOCTOR still runs against $REPO — that is a READ-ONLY view: heimdall-doctor-install
+# validates and never writes into --plugin-dir, and it pins HEIMDALL_TEAM_DIR to $HOME
+# so its synthetic beat cannot mint a team.json into the checkout
+# (bin/heimdall-doctor-install:197-207). Only install.sh, which CAN write, is redirected.
+SRC="$TMP_ROOT/src"
+git clone --quiet "$REPO" "$SRC" 2>/dev/null \
+  || { echo "FATAL: could not create the private source clone of $REPO"; exit 2; }
+
+# Content manifest of bin/: sha256 of every file plus the set of executables. STRICTLY
+# STRONGER than the old `git status --porcelain -- bin/`, which reports only files git
+# tracks — a write to a gitignored or untracked path under bin/ was invisible to it and
+# is caught here.
+bin_manifest() {
+  find "$1/bin" -type f -print0 2>/dev/null | LC_ALL=C sort -z \
+    | xargs -0 shasum -a 256 2>/dev/null
+  find "$1/bin" -type f -perm -u+x -print 2>/dev/null | LC_ALL=C sort
+}
+BIN_GUARD_BEFORE="$(bin_manifest "$SRC")"
+# Anti-vacuous: an empty manifest would make the clobber assertion pass trivially.
+[ -n "$BIN_GUARD_BEFORE" ] \
+  || { echo "FATAL: private clone has no bin/ files — the clobber guard would be vacuous"; exit 2; }
 
 # Seed a fresh HOME with a Claude settings.json. Flags: $2 statusline(y/n), $3
 # claude-mem(enabled|misconfigured|absent). Presence is forced OFF (offline) so the
@@ -231,11 +266,11 @@ else
   bad "GATES-READY: a failing first-cc did not gate (rc=$RC): $(printf '%s' "$OUT" | grep -iE 'runtime' | tr '\n' ' ' | cut -c1-160)"
 fi
 
-# ── install.sh ready-gate (runs the REAL installer from a clone of REF) ─────────
+# ── install.sh ready-gate (runs the REAL installer against the PRIVATE clone) ───
 run_install() { # $1=HOME  $2=MARKER  rest=extra env
   local home="$1" marker="$2"; shift 2
   env -i HOME="$home" TERM="dumb" PATH="$FAKE_PATH" \
-    HEIMDALL_NO_COLOR=1 HEIMDALL_REPO="$REPO" HEIMDALL_REF="$REF" \
+    HEIMDALL_NO_COLOR=1 HEIMDALL_REPO="$SRC" HEIMDALL_REF="$REF" \
     CLAUDE_CONFIG_DIR="$home/.claude" HMD_DOCTOR_CLAUDE="$FAKE_DIR/claude" \
     HMD_CRYPTO_MARKER="$marker" HMD_DOCTOR_CC_TIMEOUT=10 "$@" \
     bash "$INSTALLER" </dev/null 2>&1
@@ -273,12 +308,17 @@ else
   bad "RED install: still declared ready despite a broken part: $(printf '%s' "$OUTH" | grep -iE 'NOT READY|Run:.*demo' | tr '\n' ' ' | cut -c1-160)"
 fi
 
-# ══ HERMETIC — the install/doctor runs left tracked bin/ pristine ═════════════
-BIN_GUARD_AFTER="$(git -C "$REPO" status --porcelain -- bin/ 2>/dev/null)"
+# ══ HERMETIC — the install runs left the source checkout's bin/ pristine ══════
+# Byte-for-byte over EVERY file under bin/ (not just the git-tracked ones), against a
+# private clone no other process can touch — so a mismatch here can only have been
+# caused by install.sh itself.
+BIN_GUARD_AFTER="$(bin_manifest "$SRC")"
 if [ "$BIN_GUARD_AFTER" = "$BIN_GUARD_BEFORE" ]; then
-  ok "hermetic: runs never mutated the repo's tracked bin/ (no clobber)"
+  ok "hermetic: runs never mutated the source checkout's bin/ (no clobber)"
 else
-  bad "runs MUTATED tracked bin/ (non-hermetic): $BIN_GUARD_AFTER"
+  bad "runs MUTATED the source checkout's bin/ (non-hermetic): $(
+    diff <(printf '%s\n' "$BIN_GUARD_BEFORE") <(printf '%s\n' "$BIN_GUARD_AFTER") \
+      | grep -E '^[<>]' | head -4 | tr '\n' ' ')"
 fi
 
 echo "--------------------------------------------------------------------"
