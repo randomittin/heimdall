@@ -331,6 +331,21 @@ registered_command() {
   printf '%s' "$out"
 }
 
+# TWO PINNED PATHS, TWO WAYS TO DIE SILENTLY.
+# Splitting the clock from the runner gave the plist a second path that must exist:
+# ProgramArguments[0] is the staged runner, and the --dream target it execs is a
+# SEPARATE path inside the repo. Either one vanishing produces the same registered-but-
+# dead job the detector above exists to catch, so both are checked. Watching only
+# ProgramArguments[0] would have quietly narrowed the guard at the exact moment it
+# gained a second thing to guard — the failure mode this file keeps re-learning.
+registered_dream() {
+  local out
+  [ -f "$PLIST" ] || return 0
+  command -v plutil >/dev/null 2>&1 || return 0
+  out="$(plutil -extract ProgramArguments.2 raw -o - "$PLIST" 2>/dev/null)" || return 0
+  printf '%s' "$out"
+}
+
 # Minimal JSON string escaping for a value that comes from OUTSIDE this script (the
 # plist on disk) — a path holding a quote or backslash would otherwise emit JSON that
 # no consumer can parse.
@@ -387,19 +402,27 @@ cmd_uninstall() {
 }
 
 cmd_status() {
-  local installed loaded regcmd stale
+  local installed loaded regcmd regdream stale stale_path
   [ -f "$PLIST" ] && installed=true || installed=false
   if is_loaded; then loaded=true; else loaded=false; fi
-  # A job whose ProgramArguments[0] no longer exists is REGISTERED but DEAD: launchd
-  # will keep listing it and will keep never running it. Surface that as its own state.
+  # A job pinned to a path that no longer exists is REGISTERED but DEAD: launchd will
+  # keep listing it and will keep never running it. Surface that as its own state.
+  # Both pinned paths are checked — the staged runner AND the dream bin it execs.
   regcmd="$(registered_command)"
+  regdream="$(registered_dream)"
   stale=false
-  if [ "$installed" = true ] && [ -n "$regcmd" ] && [ ! -x "$regcmd" ]; then
-    stale=true
+  stale_path=""
+  if [ "$installed" = true ]; then
+    if [ -n "$regcmd" ] && [ ! -x "$regcmd" ]; then
+      stale=true; stale_path="$regcmd"
+    elif [ -n "$regdream" ] && [ ! -x "$regdream" ]; then
+      stale=true; stale_path="$regdream"
+    fi
   fi
   if [ "$JSON" = 1 ]; then
-    printf '{"installed":%s,"loaded":%s,"stale":%s,"label":"%s","plist":"%s","registered_command":"%s","command":"%s --repo %s run --overnight","log":"%s"}\n' \
-      "$installed" "$loaded" "$stale" "$LABEL" "$PLIST" "$(json_escape "$regcmd")" "$DREAM" "$REPO" "$LOG"
+    printf '{"installed":%s,"loaded":%s,"stale":%s,"label":"%s","plist":"%s","registered_command":"%s","registered_dream":"%s","stale_path":"%s","command":"%s --repo %s run --overnight","log":"%s"}\n' \
+      "$installed" "$loaded" "$stale" "$LABEL" "$PLIST" "$(json_escape "$regcmd")" \
+      "$(json_escape "$regdream")" "$(json_escape "$stale_path")" "$DREAM" "$REPO" "$LOG"
   else
     if [ "$stale" = true ]; then
       echo "$LABEL: registered but DEAD — its command no longer exists"
@@ -414,7 +437,7 @@ cmd_status() {
     echo "  command: $DREAM --repo $REPO run --overnight"
     echo "  log:     $LOG"
     if [ "$stale" = true ]; then
-      echo "  MISSING: the registered command is gone: $regcmd"
+      echo "  MISSING: a path this job is pinned to is gone: $stale_path"
       echo "           launchd still lists this job and will never run it. Re-register"
       echo "           from your MAIN checkout: heimdall-dream-schedule install"
     fi
