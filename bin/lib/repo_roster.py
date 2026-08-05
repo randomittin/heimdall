@@ -81,6 +81,74 @@
 #   Clustering runs to a FIXED POINT over merged clusters, so evidence accumulated by a merge
 #   can unlock the next one (git noreply -> login -> the GitHub collaborator row).
 #
+# ── THE LOCAL IDENTITY — the one human this machine can resolve with CERTAINTY ────────────────
+#
+# The rule above is deliberately conservative because a wrong merge HIDES a real person. That
+# stays. But it costs the OWNER the one row he looks at every keystroke: measured on this repo,
+# the presence fragment `haid:rj.rishabhs-macbook-air-46d5` (handle `rj`) and the git fragment
+# `rj@runheimdall.dev` (names RJ / rj / randomittin) scored haid_human=2 — ONE class, weight 2,
+# one short of the floor — so they REFUSED, and the owner rendered TWICE: once as `rj` (online,
+# his pinned batsy sigil) and once as `randomi…` (contributed, a hash-assigned hero, because a
+# row with haid=null seeds its sigil from the handle string instead). Two rows, two faces, one
+# human. explain() had been reporting it as a near-miss the whole time: `rj vs rj w=2`.
+#
+# The asymmetry that closes it: for EVERY OTHER person on the wall we only have observed
+# artefacts (a commit, a collaborator entry), but for the human at THIS keyboard we can ASK the
+# machine directly. Those answers are FIRST-PARTY SELF-ASSERTIONS, not inferences, so they carry
+# a confidence no similarity heuristic ever will. collect() builds ONE extra fragment — the SELF
+# ANCHOR (kind "self") — out of exactly four locally-verifiable facts:
+#
+#   git user.email   `git -C <repo> config --get user.email`   CERTAIN for the git rows: it is
+#                    BY DEFINITION the address this checkout stamps on commits, so anchor-to-git
+#                    is plain `email` equality (the existing weight-3 class), not a guess.
+#   git user.name    `git -C <repo> config --get user.name`    Corroborating only. Carried so the
+#                    cluster keeps the owner's chosen display spelling; never merges on its own.
+#   GitHub login     `gh api user --jq .login`                 CERTAIN for the github row: the
+#                    login of the account this machine is AUTHENTICATED as. Anchor-to-github is
+#                    plain `login` equality (weight 3). Optional — see the degradation note.
+#   device identity  scutil LocalHostName / hostnamectl --static, slugified, + the email
+#                    local-part                                CERTAIN for the presence row, via
+#                    the new `self_device` class below.
+#
+#   self_device  3  a HAID whose human slug AND machine slug BOTH equal this machine's own.
+#                   bin/heimdall-haid CONSTRUCTS a HAID as `haid:<slug(email local-part)>.
+#                   <slug(stable device name)>-<hash4>`, so matching both components is
+#                   STRUCTURAL — it re-derives the identity from the same two inputs the minting
+#                   code used, on the machine that minted it. Two humans could only collide by
+#                   sharing an email local-part AND a physical laptop.
+#
+#   WHY NOT THE WHOLE HAID STRING. hash4 folds in the PLUGIN CHECKOUT PATH, so a second checkout
+#   or a git worktree of the plugin re-mints it (measured: the same laptop yields ...-46d5 from
+#   the main checkout and ...-fa94 from a worktree). Requiring hash4 would refuse exactly the
+#   case this exists to merge, so self_device pins human+machine and deliberately ignores it.
+#
+# FOUR PROPERTIES THIS MUST NOT BREAK, each enforced structurally rather than by convention:
+#
+#   1. NOBODY ELSE'S RULE MOVES. self_device fires ONLY when one side is the anchor (kind
+#      "self"), which collect() creates exactly once. Every other pair is scored by the
+#      untouched rule above, so `ravikiran2904` / `ravikiranuo` still REFUSE at weight 2 and
+#      stay two rows. No weight, floor, or class used by anyone else changed.
+#   2. THE ANCHOR CANNOT INVENT A PERSON. It contributes no "source" (_SOURCE_ORDER has no
+#      "self"), so a cluster it never merged into has EMPTY sources and rows() drops it. An
+#      owner with no presence, no commits in the window and no collaborator entry adds no row.
+#   3. THE ANCHOR CANNOT LEAK PRESENCE. tier_of() still requires a "presence" kind for the
+#      online/away tiers, and the anchor's kind is "self". Without the team secret there are no
+#      presence fragments to merge with, the anchor folds into git/github only, and
+#      presence_free() still holds — asserted by test/repo-roster.test.sh.
+#   4. IT DEGRADES LIKE EVERYTHING ELSE. Each of the four facts is independently optional: no
+#      git config, no `gh`, no scutil, or a non-git dir each simply drop their own signal. With
+#      all four missing the anchor is not built at all and the roster is byte-identical to the
+#      conservative behaviour. `gh api user` is cached on the SAME policy as the collaborator
+#      probe (6h positive / 10min negative) and NEVER blocks the render path.
+#
+# ── ONE PERSON, ONE FACE ─────────────────────────────────────────────────────────────────────
+#
+# The renderer seeds a sigil from `row["haid"] or row["handle"]` and only a REAL HAID resolves
+# to a hero (sentinels/hmd_sigil.py `_is_haid`), so WHICH HAID a merged row keeps decides which
+# face a human wears. _pick_haid() therefore prefers THIS DEVICE's HAID for the self cluster
+# before falling back to the lexicographic pick, which makes the merged row's sigil key equal to
+# the one the statusline's own identity block uses BY CONSTRUCTION rather than by luck.
+#
 # ── CACHING (the statusline runs on EVERY prompt) ─────────────────────────────────────────────
 #
 #   git    TTL   300s (5 min).  `git log --all` measures ~0.2s on a 100-ref repo — not a
@@ -318,6 +386,127 @@ def haid_parts(haid):
     return (match.group(1), match.group(2)) if match else ("", "")
 
 
+def local_machine_slug():
+    """This machine's STABLE device slug, or '' — byte-identical to bin/heimdall-haid's
+    derive_machine(), because self_device compares against HAIDs that function minted.
+
+    Rides the OS's stable device identity (macOS scutil LocalHostName, Linux hostnamectl
+    --static) and falls back to `hostname -s`. A purely numeric/dotted host is REFUSED for the
+    same reason heimdall-haid refuses it: on a DHCP/mDNS network `hostname -s` can be the box's
+    own IP fragment, which is transient, and an anchor riding a transient name would silently
+    stop matching the owner's HAID the next time he changed networks."""
+    override = os.environ.get("HMD_ROSTER_SELF_MACHINE")
+    if override is not None:
+        return slug(override)
+    for argv in (["scutil", "--get", "LocalHostName"], ["hostnamectl", "--static"],
+                 ["hostname", "-s"]):
+        code, out, _err = _run(argv, GIT_TIMEOUT_SECONDS)
+        host = out.strip() if code == 0 else ""
+        if not host or not re.sub(r"[0-9.]+", "", host):
+            continue          # empty, or an IP fragment — never a device name
+        return slug(host)
+    return ""
+
+
+def local_git_identity(repo):
+    """(user.email, user.name) as THIS checkout would stamp on a commit, else ('', '').
+
+    `git config --get` resolves the full precedence chain (repo -> global -> system), so a
+    per-repo override is honoured exactly as the committer would experience it."""
+    email_override = os.environ.get("HMD_ROSTER_SELF_EMAIL")
+    name_override = os.environ.get("HMD_ROSTER_SELF_NAME")
+    if email_override is not None or name_override is not None:
+        return (email_override or "").strip(), (name_override or "").strip()
+    if not repo:
+        return "", ""
+    values = []
+    for key in ("user.email", "user.name"):
+        code, out, _err = _run(["git", "-C", repo, "config", "--get", key], GIT_TIMEOUT_SECONDS)
+        values.append(out.strip() if code == 0 else "")
+    return values[0], values[1]
+
+
+def local_github_login(repo, *, cache_dir=None, blocking=None, now=None):
+    """The login this machine is AUTHENTICATED to GitHub as, or ''.
+
+    Same degradation and caching policy as the collaborator probe — a missing/unauthed/offline
+    `gh` is cached negatively so it is not re-shelled every prompt, and on the hot path a cold
+    cache spawns the detached refresh and this render simply goes without the signal."""
+    when = float(now) if now is not None else time.time()
+    override = os.environ.get("HMD_ROSTER_SELF_LOGIN")
+    if override is not None:
+        return override.strip()
+    if os.environ.get("HMD_ROSTER_NO_GITHUB"):
+        return ""
+    path = _cache_file(cache_dir, repo, _cache_key("self", "ghuser", 0))
+    payload, fresh = _cache_read(path, GITHUB_CACHE_TTL_SECONDS, when,
+                                 negative_ttl=GITHUB_NEGATIVE_TTL_SECONDS)
+    if not fresh:
+        if blocking is True:
+            payload = _github_user_probe(when)
+            _cache_write(path, payload)
+        else:
+            _spawn_refresh(repo, git_window_days(), cache_dir)
+            if payload is None:
+                return ""
+    if not isinstance(payload, dict) or not payload.get("ok"):
+        return ""
+    login = payload.get("login")
+    return login if isinstance(login, str) and _LOGIN_RE.match(login) else ""
+
+
+def _github_user_probe(when):
+    """One bounded `gh api user`. Every failure mode collapses to {ok: False, reason}."""
+    env = dict(os.environ)
+    env.update({"GH_PROMPT_DISABLED": "1", "GH_NO_UPDATE_NOTIFIER": "1", "GH_PAGER": "cat",
+                "PAGER": "cat", "NO_COLOR": "1", "CLICOLOR": "0", "GIT_TERMINAL_PROMPT": "0"})
+    code, out, err = _run(["gh", "api", "user", "--jq", ".login"], GITHUB_TIMEOUT_SECONDS, env=env)
+    if code == 127:
+        return {"ok": False, "ts": when, "reason": "gh_absent", "login": ""}
+    if code == -1:
+        return {"ok": False, "ts": when, "reason": "timeout", "login": ""}
+    if code != 0:
+        return {"ok": False, "ts": when, "reason": _github_failure_reason(err), "login": ""}
+    login = out.strip().strip('"')
+    if not login or not _LOGIN_RE.match(login) or is_bot(login=login):
+        return {"ok": False, "ts": when, "reason": "no_login", "login": ""}
+    return {"ok": True, "ts": when, "login": login}
+
+
+def self_fragment(repo, *, cache_dir=None, blocking=None, now=None):
+    """The SELF ANCHOR — the local human, built from first-party self-assertions only.
+
+    None when this machine can assert nothing (no git identity, no login, no device name), in
+    which case the roster is byte-identical to the purely conservative behaviour. The anchor
+    carries no presence fact and no source of its own; it exists purely as a BRIDGE that lets
+    the owner's presence, git and github fragments recognise each other.
+
+    $HMD_ROSTER_NO_SELF disables it outright. A hermetic test MUST set it: without it the
+    anchor reads the developer's real git config, real device name and real `gh` auth, so the
+    fixture's result would depend on whose laptop ran the suite."""
+    if os.environ.get("HMD_ROSTER_NO_SELF"):
+        return None
+    email, name = local_git_identity(repo)
+    login = local_github_login(repo, cache_dir=cache_dir, blocking=blocking, now=now)
+    machine = local_machine_slug()
+    if is_bot(name=name, email=email, login=login):
+        return None
+    # Candidate human slugs, mirroring heimdall-haid's derive_human(): the email local-part
+    # first, then $USER. Generic role names are dropped — `haid:dev.<machine>` must not become
+    # a licence to absorb whoever else uses a `dev@` address on this box.
+    humans = set()
+    local, _domain = split_email(email)
+    for candidate in (slug(local), slug(os.environ.get("USER") or "")):
+        if candidate and candidate not in _GENERIC_LOCALPARTS and candidate not in _GENERIC_NAMES:
+            humans.add(candidate)
+    if not email and not login and not humans:
+        return None
+    frag = fragment("self", email=(email or None), name=(name or None), login=(login or None))
+    frag["self_humans"] = humans
+    frag["self_machine"] = machine
+    return _derive(frag)
+
+
 def is_bot(name=None, email=None, login=None):
     """True for automation identities (dependabot, github-actions, the web-flow committer)."""
     for value in (name, login):
@@ -424,6 +613,8 @@ def signals(a, b, known_logins=frozenset()):
         found.append(("email", 3))
     if a["logins"] & b["logins"]:
         found.append(("login", 3))
+    if _self_device_match(a, b) or _self_device_match(b, a):
+        found.append(("self_device", 3))
     known = {fold(l) for l in known_logins if fold(l)}
     for left, right in ((a, b), (b, a)):
         right_logins = {fold(l) for l in right["logins"]} | known
@@ -495,6 +686,26 @@ def signals(a, b, known_logins=frozenset()):
     return found
 
 
+def _self_device_match(anchor, other):
+    """True iff `anchor` is the SELF anchor and `other` carries a HAID minted on THIS machine
+    for THIS human — human slug AND machine slug both equal.
+
+    Directional on purpose: it can only fire when one side is the local anchor, so it adds no
+    edge between any two OBSERVED identities and therefore cannot merge two teammates. hash4 is
+    deliberately ignored (it folds in the plugin checkout path — see the header)."""
+    if "self" not in anchor["kinds"]:
+        return False
+    machine = anchor.get("self_machine") or ""
+    humans = anchor.get("self_humans") or set()
+    if not machine or not humans:
+        return False
+    for haid in other["haids"]:
+        human, haid_machine = haid_parts(haid)
+        if human and haid_machine == machine and human in humans:
+            return True
+    return False
+
+
 def _name_subset(a, b):
     """One display name's tokens are a PROPER subset of the other's, sharing the first token.
 
@@ -542,6 +753,7 @@ def _clone(frag):
     out = dict(frag)
     for key in _SET_KEYS:
         out[key] = set(frag.get(key) or ())
+    out["self_humans"] = set(frag.get("self_humans") or ())
     out["evidence"] = list(frag.get("evidence") or ())
     return _derive(out)
 
@@ -550,6 +762,11 @@ def _absorb(target, other, evidence):
     """Fold `other` into `target`, keeping the freshest timestamps and the union of identities."""
     for key in _SET_KEYS:
         target[key] = set(target.get(key) or ()) | set(other.get(key) or ())
+    # The anchor's device facts survive the fold in EITHER direction, so the cluster stays
+    # recognisable as "me" no matter which side unify() happened to absorb into.
+    target["self_humans"] = set(target.get("self_humans") or ()) | set(other.get("self_humans")
+                                                                      or ())
+    target["self_machine"] = target.get("self_machine") or other.get("self_machine") or ""
     target["online"] = bool(target["online"]) or bool(other["online"])
     target["last_seen_ts"] = _max_ts(target["last_seen_ts"], other["last_seen_ts"])
     target["last_commit_ts"] = _max_ts(target["last_commit_ts"], other["last_commit_ts"])
@@ -1079,9 +1296,21 @@ def _handle_candidates(cluster):
 
 
 def _pick_haid(cluster):
-    """One HAID for the row. A human on two machines has two HAIDs; take the lexicographically
-    smallest so the choice is stable across renders rather than flapping."""
+    """One HAID for the row — and therefore ONE sigil, since the renderer seeds the face from
+    `haid or handle` and only a real HAID resolves to a hero.
+
+    A human on two machines has two HAIDs. THIS DEVICE's wins for the self cluster, so the
+    owner's row seeds the same face as the statusline's own identity block by construction
+    rather than by luck; everyone else takes the lexicographically smallest, which is stable
+    across renders rather than flapping with whichever alias happened to win a merge."""
     valid = sorted(h for h in cluster["haids"] if _HAID_RE.match(str(h).strip()))
+    machine = cluster.get("self_machine") or ""
+    humans = cluster.get("self_humans") or set()
+    if machine and humans:
+        for haid in valid:
+            human, haid_machine = haid_parts(haid)
+            if human and haid_machine == machine and human in humans:
+                return haid
     return valid[0] if valid else None
 
 
@@ -1110,6 +1339,11 @@ def rows(clusters, *, now, git_days):
     ordered = sorted(clusters, key=lambda c: _presort_key(c, now=now, git_days=git_days))
     used, out = set(), []
     for cluster in ordered:
+        if not _sources(cluster):
+            # Nothing OBSERVED this person — the only fragment here is the self anchor, which
+            # merged with nothing. It is evidence about who the local user IS, never evidence
+            # that they belong on this repo's wall, so it emits no row.
+            continue
         tier = tier_of(cluster, now=now, git_days=git_days)
         has_presence = "presence" in cluster["kinds"]
         handle = _unique_handle(cluster, used)
@@ -1177,9 +1411,13 @@ def presence_free(roster_rows):
 # ═════════════════════════════════════════════════════════════════════════════════════════════
 
 def collect(repo=None, *, now=None, git_days=None, presence_cache=None, cache_dir=None,
-            blocking=None, use_presence=True, use_git=True, use_github=True):
+            blocking=None, use_presence=True, use_git=True, use_github=True, use_self=True):
     """Gather every fragment, then unify. Each source is independently skippable and each one
-    degrades to [] on its own, so any subset of the three still produces a roster."""
+    degrades to [] on its own, so any subset of the three still produces a roster.
+
+    The SELF ANCHOR is added LAST and is not a source — it observes nobody. It exists so the
+    local human's presence, git and github fragments can recognise each other on first-party
+    evidence instead of the similarity heuristics everyone else is scored by."""
     when = float(now) if now is not None else time.time()
     window = float(git_days) if git_days is not None else git_window_days()
     repo_dir = repo if repo else _git_toplevel(os.getcwd())
@@ -1192,16 +1430,21 @@ def collect(repo=None, *, now=None, git_days=None, presence_cache=None, cache_di
     gh_frags = github_fragments(repo_dir, cache_dir=cache_dir, blocking=blocking,
                                 now=when) if use_github else []
     frags.extend(gh_frags)
+    if use_self:
+        anchor = self_fragment(repo_dir, cache_dir=cache_dir, blocking=blocking, now=when)
+        if anchor is not None:
+            frags.append(anchor)
     known = {next(iter(f["logins"])) for f in gh_frags if f["logins"]}
     return unify(frags, known), known, when, window
 
 
 def build(repo=None, *, now=None, git_days=None, presence_cache=None, cache_dir=None,
-          blocking=None, use_presence=True, use_git=True, use_github=True):
+          blocking=None, use_presence=True, use_git=True, use_github=True, use_self=True):
     """THE ENTRY POINT the renderer calls. Returns the frozen contract. Never raises."""
     clusters, _known, when, window = collect(
         repo, now=now, git_days=git_days, presence_cache=presence_cache, cache_dir=cache_dir,
-        blocking=blocking, use_presence=use_presence, use_git=use_git, use_github=use_github)
+        blocking=blocking, use_presence=use_presence, use_git=use_git, use_github=use_github,
+        use_self=use_self)
     return rows(clusters, now=when, git_days=window)
 
 
@@ -1243,7 +1486,13 @@ def refresh(repo, *, git_days=None, cache_dir=None, now=None):
     git_payload = _git_probe(repo, when, window)
     _cache_write(_cache_file(cache_dir, repo, _cache_key(repo, "git", window)), git_payload)
     gh_payload = {"ok": False, "reason": "not_github", "logins": [], "ts": when}
+    user_payload = {"ok": False, "reason": "skipped", "login": "", "ts": when}
     slug_ = github_slug(repo)
+    if not os.environ.get("HMD_ROSTER_NO_GITHUB"):
+        # The authenticated login is a MACHINE fact, not a repo fact, so it is warmed even for
+        # a non-github remote: it is what anchors the local human to their collaborator row.
+        user_payload = _github_user_probe(when)
+        _cache_write(_cache_file(cache_dir, repo, _cache_key("self", "ghuser", 0)), user_payload)
     if slug_ and not os.environ.get("HMD_ROSTER_NO_GITHUB"):
         gh_payload = _github_probe(slug_, when)
         _cache_write(_cache_file(cache_dir, repo, _cache_key(slug_, "github", 0)), gh_payload)
@@ -1252,8 +1501,8 @@ def refresh(repo, *, git_days=None, cache_dir=None, now=None):
         try:
             os.remove(os.path.join(directory, ".repo-roster-refresh.lock"))
         except OSError:
-            return {"git": git_payload, "github": gh_payload}
-    return {"git": git_payload, "github": gh_payload}
+            return {"git": git_payload, "github": gh_payload, "github_user": user_payload}
+    return {"git": git_payload, "github": gh_payload, "github_user": user_payload}
 
 
 # ═════════════════════════════════════════════════════════════════════════════════════════════
@@ -1280,6 +1529,8 @@ Options:
   --no-presence         skip the presence source
   --no-git              skip the git source
   --no-github           skip the github source
+  --no-self             skip the local-identity anchor (the owner may split into 2 rows;
+                        $HMD_ROSTER_NO_SELF does the same — hermetic tests must set it)
   -h, --help
 
 Output is the frozen JSON array (or, with --explain, the audit object). Exit is ALWAYS 0 for a
@@ -1290,8 +1541,9 @@ roster — an empty roster is the honest degraded answer, never an error. 2 is a
 def _cli(argv):
     opts = {"repo": None, "git_days": None, "presence_cache": None, "cache_dir": None,
             "now": None, "blocking": None, "explain": False, "refresh": False,
-            "use_presence": True, "use_git": True, "use_github": True}
-    flags = {"--no-presence": "use_presence", "--no-git": "use_git", "--no-github": "use_github"}
+            "use_presence": True, "use_git": True, "use_github": True, "use_self": True}
+    flags = {"--no-presence": "use_presence", "--no-git": "use_git", "--no-github": "use_github",
+             "--no-self": "use_self"}
     values = {"--repo": "repo", "--git-days": "git_days", "--presence-cache": "presence_cache",
               "--cache-dir": "cache_dir", "--now": "now"}
     index = 0
@@ -1332,7 +1584,7 @@ def _cli(argv):
     kwargs = {"now": now, "git_days": git_days, "presence_cache": opts["presence_cache"],
               "cache_dir": cache_dir, "blocking": opts["blocking"],
               "use_presence": opts["use_presence"], "use_git": opts["use_git"],
-              "use_github": opts["use_github"]}
+              "use_github": opts["use_github"], "use_self": opts["use_self"]}
     payload = explain(repo, **kwargs) if opts["explain"] else build(repo, **kwargs)
     sys.stdout.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
     return 0
