@@ -459,12 +459,28 @@ Only extract patterns that are genuinely reusable (not one-off fixes). Quality >
 
 Beyond extracting skills, actively learn execution patterns:
 
-**What to track** (in `.planning/metrics.jsonl`, one JSON line per task):
-- Task description, model used, effort level
-- Time to completion (wall clock)
-- Acceptance criteria pass rate on first attempt
-- Number of retries needed
-- Files touched, lines changed
+**How to track it.** After EVERY completed task, run `bin/heimdall-metric` — one command,
+one appended line. This is not optional bookkeeping: it is the ONLY input the
+self-improve/dream loop has. You are the only component that knows which tier ran a task,
+so if you skip this, `/dream` has nothing to learn from and correctly reports "nothing to
+suggest" forever.
+
+```bash
+heimdall-metric task --type <lint|docs|code|test|review|plan|design|security> \
+                     --model <haiku|sonnet|opus> --effort <default|max> \
+                     --outcome <pass|fail> --retries <N> --wall-secs <N> \
+                     --source orchestrator
+```
+
+- `--outcome` is whether acceptance criteria passed **on the first try at this tier**.
+  A task that needed a retry was mis-routed, so it is `fail` here even if it later passed.
+- `--final <pass|fail>` records the eventual verdict when it differs from `--outcome`.
+- On escalation, emit one record **per tier** and tag the hop:
+  `--model haiku --outcome fail --escalated-to sonnet`, then a second record for sonnet.
+- It never fails: a bad flag or an unwritable dir is a silent no-op at exit 0, so it can
+  never break the task that is reporting success. Never pass `--strict`.
+- It records the task TYPE and outcome only. There is no field for a prompt, a diff, or a
+  file path, and free text is slugged and length-capped — never try to smuggle detail in.
 
 **What to learn:**
 - Which model tier succeeds most often for which task types → adjust default routing
@@ -473,11 +489,19 @@ Beyond extracting skills, actively learn execution patterns:
 - Common failure modes → add to pre-checks
 
 **Feedback loop:**
-After every 10 completed tasks, analyze `.planning/metrics.jsonl`:
-1. If haiku tasks fail > 30% → bump those task types to sonnet default
-2. If opus tasks always pass first try on certain types → try sonnet for cost savings
-3. Write routing adjustments to `.planning/routing-overrides.json`
-4. Planner reads routing-overrides when assigning model tiers
+Do NOT hand-analyze `.planning/metrics.jsonl` and do NOT hand-edit routing. Run the gated
+loop, which refuses to act on thin evidence:
+
+1. `heimdall-self-improve collect` → the comparable scalar per `(task_type, model)`
+2. `heimdall-self-improve hypotheses --min-samples 20` → testable candidates
+3. `heimdall-self-improve experiment start --hypothesis <id> --min-samples 20 --min-delta 0.15`
+4. `heimdall-self-improve experiment evaluate --id <exp>` → KEEP on a measured delta, else
+   automatic rollback
+
+A routing change needs **at least 20 observations** for that `(task_type, model)` cell.
+Below that a pass-rate is noise: at 3 samples, a variant that is genuinely no better still
+clears a 0.10 delta about 73% of the time. `/dream` enforces this floor and will clamp a
+smaller `--min-samples` up rather than hand you a verdict it cannot support.
 
 ### Reasoning Bank — Learn from Past Executions
 

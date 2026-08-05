@@ -50,21 +50,26 @@ trap 'rm -rf "$WORK"' EXIT
 
 mk_repo() { local d="$WORK/$1"; mkdir -p "$d/.planning"; echo "$d"; }
 
-# same seed as the self-improve suite:
-#   lint/sonnet 1/4 pass (0.25) -> failing -> escalate suggestion
-#   docs/opus   3/3 pass (1.00) zero retries -> cheapen suggestion
+# The same RATIOS the self-improve suite uses, at a sample count that clears the
+# SAMPLE-SIZE FLOOR in bin/heimdall-dream (MIN_SAMPLES_FLOOR): dream refuses a
+# routing verdict below 20 observations per (task_type, model), because at a
+# handful of samples a pass-rate is noise — a variant that is truly no better
+# clears a 0.10 delta ~73% of the time at n=3. Only the COUNT is raised here; every
+# rate below is identical to the original seed, so the measured deltas are too.
+#   lint/sonnet  5/20 pass (0.25) -> failing -> escalate suggestion
+#   docs/opus   20/20 pass (1.00) zero retries -> cheapen suggestion
 #   queue dead lint-timeout x4 -> a precheck issue with a proposed fix
 seed_metrics() {
-  cat > "$1/.planning/metrics.jsonl" <<'EOF'
-{"ts":"2026-07-01T00:00:00Z","metric":"parallelism","total_turns":5,"parallel_ratio":0.3}
-{"ts":"2026-07-01T01:00:00Z","metric":"task","task_type":"lint","model":"sonnet","outcome":"fail","retries":2,"wall_secs":30}
-{"ts":"2026-07-01T02:00:00Z","metric":"task","task_type":"lint","model":"sonnet","outcome":"fail","retries":3,"wall_secs":40}
-{"ts":"2026-07-01T03:00:00Z","metric":"task","task_type":"lint","model":"sonnet","outcome":"pass","retries":1,"wall_secs":20}
-{"ts":"2026-07-01T04:00:00Z","metric":"task","task_type":"lint","model":"sonnet","outcome":"fail","retries":2,"wall_secs":35}
-{"ts":"2026-07-01T05:00:00Z","metric":"task","task_type":"docs","model":"opus","outcome":"pass","retries":0,"wall_secs":10}
-{"ts":"2026-07-01T06:00:00Z","metric":"task","task_type":"docs","model":"opus","outcome":"pass","retries":0,"wall_secs":12}
-{"ts":"2026-07-01T07:00:00Z","metric":"task","task_type":"docs","model":"opus","outcome":"pass","retries":0,"wall_secs":9}
-EOF
+  {
+    printf '%s\n' '{"ts":"2026-07-01T00:00:00Z","metric":"parallelism","total_turns":5,"parallel_ratio":0.3}'
+    i=0
+    while [ "$i" -lt 20 ]; do
+      if [ "$i" -lt 5 ]; then o=pass; else o=fail; fi
+      printf '{"ts":"2026-07-01T01:%02d:00Z","metric":"task","task_type":"lint","model":"sonnet","outcome":"%s","retries":2,"wall_secs":30}\n' "$i" "$o"
+      printf '{"ts":"2026-07-01T02:%02d:00Z","metric":"task","task_type":"docs","model":"opus","outcome":"pass","retries":0,"wall_secs":10}\n' "$i"
+      i=$((i+1))
+    done
+  } > "$1/.planning/metrics.jsonl"
   cat > "$1/.planning/queue-stats.json" <<'EOF'
 {"dead":[{"reason":"lint-timeout","task_type":"lint","count":4}],"done":[]}
 EOF

@@ -12,9 +12,17 @@ applied to Heimdall's own routing and planning — see
 distilled mechanics this is built on.
 
 autoresearch's one non-negotiable rule, imported wholesale: **an improvement persists only with a
-measured delta over a baseline on enough samples — never because it seemed better.** The mechanical
-parts (aggregation, hypothesis generation, override apply/rollback, experiment logging) live in
+measured delta over a baseline — never because it seemed better.** The mechanical parts
+(aggregation, hypothesis generation, override apply/rollback, experiment logging) live in
 `bin/heimdall-self-improve`; your job is the judgement of *which* hypothesis is worth an experiment.
+
+**Where this DEPARTS from autoresearch, on purpose.** autoresearch runs *one* 5-minute training run
+per experiment and compares `val_bpb` — a low-variance continuous scalar, where n=1 is a usable
+measurement. It has no sample-size rule at all. Heimdall's scalar is a *proportion* (first-try
+acceptance pass-rate), which is far noisier: at 3 samples, a routing variant that is genuinely no
+better still clears a 0.10 delta about **73%** of the time. So the sample-size floor is Heimdall's
+own addition, not something inherited — and it is load-bearing. Do not describe it as autoresearch's
+discipline; autoresearch simply never needed one.
 
 ## When this runs
 
@@ -47,15 +55,36 @@ and the queue dead/done stats:
 heimdall-self-improve collect --repo .          # the aggregated scalar per (task_type, model)
 ```
 
+**Evidence does not appear on its own — something has to emit it.** The producer is
+`bin/heimdall-metric`, called by the orchestrator after every completed task (see
+`agents/heimdall.md` → *Pattern Learning*). If nobody calls it, `collect` returns zero records and
+`/dream` honestly reports "nothing to suggest" — which is the correct behavior, not a bug to route
+around. Check the corpus before blaming the loop:
+
+```bash
+heimdall-metric where --repo .                                   # the corpus path
+grep -c '"metric":"task"' "$(heimdall-metric where --repo .)"    # how much evidence exists
+```
+
 Task-outcome record shape (one JSON line; non-`task` records are ignored):
-`{"metric":"task","task_type":"lint","model":"sonnet","outcome":"pass"|"fail","retries":N,"wall_secs":N,"ts":"..."}`.
+
+```json
+{"ts":"...","metric":"task","schema":1,"task_type":"lint","model":"sonnet","effort":"default",
+ "outcome":"fail","final":"pass","retries":1,"escalated_to":"opus","wall_secs":42,
+ "source":"orchestrator","session":"..."}
+```
+
+`outcome` is first-try acceptance at that tier — the scalar routing is graded on. `final` is the
+eventual verdict, kept separate so "we got there in the end" cannot launder a bad routing decision.
+One record = one routing observation, so an escalating task emits one row per tier it touched.
+
 Queue dead/done stats (optional) live at `.planning/queue-stats.json`:
 `{"dead":[{"reason":"lint-timeout","task_type":"lint","count":4}], "done":[...]}`.
 
 ### 2. Hypothesize
 
 ```bash
-heimdall-self-improve hypotheses --repo . --min-samples 3
+heimdall-self-improve hypotheses --repo . --min-samples 20
 ```
 
 Emits testable candidates, each with its measured baseline evidence:
@@ -67,7 +96,10 @@ Emits testable candidates, each with its measured baseline evidence:
 - **precheck** (`hyp-precheck-<reason>`) — a recurring dead-task reason cluster → suggests a
   pre-check or a new `.planning/skills/*.md` pattern (surfaced for a human, not auto-A/B'd).
 
-The `--min-samples` gate is the autoresearch invariant: **no hypothesis without enough evidence.**
+The `--min-samples` gate is the invariant: **no hypothesis without enough evidence.** Pass **20**
+or more. The CLI's own default is 3, which is a historical default and far too low for a
+proportion — `/dream` hard-clamps to a floor of 20 (`MIN_SAMPLES_FLOOR` in `bin/heimdall-dream`) and
+will not let a caller argue it down. When you drive the CLI by hand, you are the floor: pass it.
 
 Pick the ONE highest-value hypothesis. Prefer an escalate on a high-traffic failing type; a cheapen
 only when the baseline is genuinely flawless.
@@ -79,7 +111,7 @@ tracked — exactly like autoresearch's fixed 5-min budget makes runs comparable
 
 ```bash
 heimdall-self-improve experiment start --hypothesis hyp-esc-lint-sonnet \
-    --min-samples 3 --min-delta 0.10 --repo .
+    --min-samples 20 --min-delta 0.15 --repo .
 ```
 
 This writes `.planning/routing-overrides.json` (which the planner reads when assigning model tiers),
@@ -127,7 +159,10 @@ current picture (active overrides, validated wins, open experiments).
 
 ## Reference
 
+- Producer: `bin/heimdall-metric` (emits the `metric:"task"` records everything below reads).
 - CLI: `bin/heimdall-self-improve` (stdlib python3; `-h` for full usage).
 - Distilled source mechanics: `docs/analysis/autoresearch-distilled.md`.
 - The SONA-inspired feedback loop this formalizes: `agents/heimdall.md` → *Pattern Learning*.
-- Acceptance: `test/heimdall-self-improve.test.sh` (hermetic; proves the falsifier).
+- Acceptance: `test/heimdall-self-improve.test.sh` (hermetic; proves the falsifier),
+  `test/heimdall-metric.test.sh` (proves the producer, the floor, and both falsifiability
+  directions: recommends against an obviously-worse tier, declines on a null corpus).

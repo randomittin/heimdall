@@ -45,6 +45,45 @@ BIN_DIR = os.path.dirname(os.path.realpath(__file__))
 SELF_IMPROVE = os.path.join(BIN_DIR, "heimdall-self-improve")
 ISSUE_LOOP = os.path.join(BIN_DIR, "heimdall-issue-loop")
 
+# ── THE SAMPLE-SIZE FLOOR (not negotiable by a flag) ──────────────────────────
+#
+# Heimdall's comparable scalar is a PROPORTION (first-try acceptance pass-rate),
+# not a low-variance continuous scalar. autoresearch compares val_bpb, where a
+# single 5-minute run is a usable measurement; a pass-rate over a handful of
+# tasks is mostly noise. So the sample discipline has to be OURS, and it has to
+# be quantified rather than asserted.
+#
+# The question that sets the floor: if a routing variant is TRULY NO BETTER than
+# baseline, how often does it still clear `delta >= min_delta` by luck alone?
+# That is the false-KEEP rate — the rate at which this loop "learns" something
+# untrue. Worst case over baseline pass-rates, exact binomial:
+#
+#     n=3   min_delta=0.10  ->  72.9%      <- the shipped default. A coin flip.
+#     n=10  min_delta=0.10  ->  38.3%
+#     n=20  min_delta=0.10  ->  25.2%
+#     n=20  min_delta=0.15  ->  13.2%      <- the floor enforced here
+#     n=30  min_delta=0.15  ->   7.1%
+#     n=20  min_delta=0.20  ->   5.8%
+#
+# At the previously shipped n=3, a change that is genuinely worthless is KEPT
+# nearly three times in four. That is not a falsifier, it is a rubber stamp, and
+# it would have been the FIRST thing to produce a confident-sounding but false
+# "Heimdall improved itself overnight" line the moment task records existed.
+#
+# 20 is chosen as the smallest floor that (a) puts the worst-case false-keep rate
+# into the teens when paired with min_delta 0.15, and (b) is still REACHABLE — a
+# common task_type accumulates ~20 observations in a couple of maintainer cycles,
+# so the loop converges in days, not months. Pushing to n=30 buys ~6 points of
+# error rate at the cost of roughly doubling time-to-first-verdict; that trade is
+# not worth it while a wrong KEEP is cheap, reversible, and re-evaluated on the
+# very next /dream.
+#
+# The floor is a FLOOR: --min-samples may raise it, never lower it. An operator
+# who could argue it down would eventually argue it down to 3 on the night the
+# data looked exciting, which is exactly the failure mode it exists to prevent.
+MIN_SAMPLES_FLOOR = 20
+DEF_MIN_DELTA = 0.15
+
 
 def _now():
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -105,7 +144,11 @@ def _issue_queue(repo):
 def cmd_run(args):
     repo = args.repo
     date = args.date or _today()
-    ms = str(args.min_samples)
+    # Clamp UP to the floor. A caller asking for less evidence than the floor is
+    # asking to be fooled; honour the request only when it is stricter than ours.
+    floor_enforced = args.min_samples < MIN_SAMPLES_FLOOR
+    min_samples = max(args.min_samples, MIN_SAMPLES_FLOOR)
+    ms = str(min_samples)
 
     # 1. COLLECT the comparable scalar + FORM hypotheses (real self-improve output).
     collect = _si(repo, "collect")
@@ -161,7 +204,7 @@ def cmd_run(args):
 
     report = _render(date, repo, args.mode, total_records, routing_hyps,
                      precheck_hyps, queue, kept, discarded, validated, started,
-                     args.min_delta, honest_empty)
+                     args.min_delta, honest_empty, min_samples, floor_enforced)
 
     path = _report_path(repo, date, args.out)
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -173,6 +216,10 @@ def cmd_run(args):
         "report_path": path,
         "mode": args.mode,
         "honest_empty": honest_empty,
+        "min_samples": min_samples,
+        "min_samples_floor": MIN_SAMPLES_FLOOR,
+        "min_samples_floor_enforced": floor_enforced,
+        "min_delta": args.min_delta,
         "pushed": False,  # agent-never-pushes: this bin performs NO push/merge.
         "counts": {
             "suggested_changes": len(routing_hyps) + (1 if started else 0),
@@ -199,7 +246,8 @@ def cmd_run(args):
 # ── the morning report (markdown) — every line sourced from real output ─────────
 
 def _render(date, repo, mode, total_records, routing_hyps, precheck_hyps, queue,
-            kept, discarded, validated, started, min_delta, honest_empty):
+            kept, discarded, validated, started, min_delta, honest_empty,
+            min_samples, floor_enforced):
     L = []
     L.append("# Dream Journal — %s" % date)
     L.append("")
@@ -212,6 +260,15 @@ def _render(date, repo, mode, total_records, routing_hyps, precheck_hyps, queue,
     L.append("- repo: `%s`" % repo)
     L.append("- mode: `%s`" % mode)
     L.append("- task-outcome records seen: **%d**" % total_records)
+    L.append("- sample-size floor: **%d** observations per `(task_type, model)` before "
+             "any routing verdict is allowed (min-delta `%.2f`). Below the floor a "
+             "pass-rate is noise: at 3 samples a variant that is truly no better "
+             "still clears the delta ~73%% of the time, so no verdict is offered."
+             % (min_samples, min_delta))
+    if floor_enforced:
+        L.append("- the requested `--min-samples` was **below** the sample-size floor "
+                 "and was clamped up to **%d**. The floor may be raised, never lowered."
+                 % min_samples)
     L.append("")
 
     if honest_empty:
@@ -360,8 +417,12 @@ def build_parser():
 
     r = sub.add_parser("run", help="run the overnight loop and write the morning report")
     r.add_argument("--date", default=None, help="report date (default: today UTC)")
-    r.add_argument("--min-samples", type=int, default=3)
-    r.add_argument("--min-delta", type=float, default=0.10)
+    r.add_argument("--min-samples", type=int, default=MIN_SAMPLES_FLOOR,
+                   help="observations required before a routing verdict (floor: %d; "
+                        "may be raised, never lowered)" % MIN_SAMPLES_FLOOR)
+    r.add_argument("--min-delta", type=float, default=DEF_MIN_DELTA,
+                   help="pass-rate improvement required to KEEP (default: %.2f)"
+                        % DEF_MIN_DELTA)
     r.add_argument("--out", default=None, help="override report path")
     r.add_argument("--mode", default="on-demand", choices=["overnight", "on-demand"])
     r.add_argument("--overnight", dest="mode", action="store_const", const="overnight",
