@@ -426,10 +426,15 @@ flow_grant() {
   [ -n "$interp" ] || interp="$pinned"
 
   echo ""
-  p "  Before you do: macOS judges the INTERPRETER, not the script. Granting Full Disk"
-  p "  Access to $([ -n "$interp" ] && printf '%s' "$interp" || printf 'that binary') gives it to every other program that runs"
-  p "  through it — that is the blast radius, and it is why [A] is the better answer when"
-  p "  moving the repo is an option at all."
+  p "  Before you do — the blast radius. macOS judges the INTERPRETER, not the script,"
+  p "  so the grant would land on:"
+  if [ -n "$interp" ]; then
+    p "    $interp"
+  else
+    p "    the scheduled interpreter (named in the error above)"
+  fi
+  p "  Full Disk Access on that binary reaches EVERY program that runs through it, not"
+  p "  just Heimdall. [A] avoids this entirely if moving the repo is an option."
   echo ""
   if ! ask_line "  Open System Settings at Full Disk Access now? [y/N] "; then
     p "  No answer — leaving everything as it is. Nothing was changed."
