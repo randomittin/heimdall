@@ -68,8 +68,17 @@ CAPS = TC.detect(sys.argv)
 # (see team_columns). Built once; None if the sigil core cannot supply it, in which case the
 # offline column still reads offline from its faint name + the `⊘off` Row4 segment.
 try:
-    _MONO_CAPS = SIG.tier_caps(TC.MONO, CAPS.unicode_tier)
-except Exception:
+    _MONO_CAPS = SIG.tier_caps(TC.MONO, CAPS.unicode)
+except AttributeError as _e:
+    # NEVER widen this to `except Exception`. It used to, and it swallowed a typo
+    # (CAPS.unicode_tier — the PARAMETER name, not the attribute) for as long as the
+    # feature existed. _MONO_CAPS stayed None, the drain never ran, and every absent
+    # teammate rendered at full presence saturation: a wall showing nine vivid faces
+    # in a repo with nobody online. The honesty signal was dead code and said nothing.
+    # A drain that cannot be built is a wall that cannot tell absence from presence,
+    # so it fails LOUDLY on stderr rather than degrading to a confident lie.
+    sys.stderr.write("hmd: sigil mono tier unavailable (%s) — absent teammates "
+                     "cannot be drained; wall honesty is DEGRADED\n" % _e)
     _MONO_CAPS = None
 USE_COLOR = CAPS.use_color()
 def _c(s): return s if USE_COLOR else ""
