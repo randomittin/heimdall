@@ -45,6 +45,12 @@ SCHED_SRC="$ROOT/bin/heimdall-dream-schedule"
 RUNNER_SRC="$ROOT/bin/heimdall-dream-runner"
 DREAM_SRC="$ROOT/bin/heimdall-dream"
 LIB_SRC="$ROOT/bin/lib/real-home.sh"
+# The register path resolves the TCC-protected-path predicate through this shared lib
+# (see the sourcing note in bin/heimdall-dream-schedule). Omitting it from a fixture tree
+# does not merely change a message: require_reachable_artifacts fails SAFE on an undefined
+# predicate and refuses the install outright, so every section below would fail for a
+# reason that has nothing to do with what it is testing.
+TCC_LIB_SRC="$ROOT/bin/lib/tcc-paths.sh"
 
 PASS=0
 FAIL=0
@@ -55,6 +61,7 @@ for f in "$SCHED_SRC" "$RUNNER_SRC" "$DREAM_SRC"; do
   [ -x "$f" ] || { echo "FATAL: $f not executable" >&2; exit 2; }
 done
 [ -r "$LIB_SRC" ] || { echo "FATAL: $LIB_SRC not readable" >&2; exit 2; }
+[ -r "$TCC_LIB_SRC" ] || { echo "FATAL: $TCC_LIB_SRC not readable" >&2; exit 2; }
 command -v plutil >/dev/null 2>&1 || { echo "FATAL: plutil required (macOS)" >&2; exit 2; }
 
 WORK="$(mktemp -d -t dream-install-root)"
@@ -80,7 +87,8 @@ build_install_tree() {
   cp "$SCHED_SRC"  "$d/bin/heimdall-dream-schedule"
   cp "$RUNNER_SRC" "$d/bin/heimdall-dream-runner"
   cp "$DREAM_SRC"  "$d/bin/heimdall-dream"
-  cp "$LIB_SRC"    "$d/bin/lib/real-home.sh"
+  cp "$LIB_SRC"     "$d/bin/lib/real-home.sh"
+  cp "$TCC_LIB_SRC" "$d/bin/lib/tcc-paths.sh"
   chmod 0755 "$d/bin/heimdall-dream-schedule" "$d/bin/heimdall-dream-runner" \
              "$d/bin/heimdall-dream"
 }

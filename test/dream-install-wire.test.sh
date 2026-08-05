@@ -116,6 +116,10 @@ CANON="$(cd "$CANON" && pwd -P)"
 cp "$SCHED" "$CANON/bin/heimdall-dream-schedule"
 cp "$DREAM" "$CANON/bin/heimdall-dream"
 cp "$ROOT/bin/lib/real-home.sh" "$CANON/bin/lib/real-home.sh"
+# tcc-paths.sh supplies the protected-path predicate the register path gates its own
+# artifacts on. It fails SAFE when undefined (refuse, exit 6), so a fixture missing this
+# file does not degrade — it stops installing entirely.
+cp "$ROOT/bin/lib/tcc-paths.sh" "$CANON/bin/lib/tcc-paths.sh"
 # The runner is ProgramArguments[0] — the register path stages it outside the repo, so a
 # checkout without it cannot install (by design: a plist pointing at a program that does
 # not exist is the silent-death mode this whole change exists to end).

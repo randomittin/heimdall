@@ -1,0 +1,430 @@
+#!/usr/bin/env bash
+# heimdall-dream-permission — ASK the operator for the one permission the nightly /dream
+# needs, ONCE, at first run — instead of failing at 03:00 forever and hoping he reads a log.
+#
+# WHERE THIS SITS IN THE STORY.
+#   Commit 245ede5 fixed the SILENCE: the nightly runner now lives outside the protected
+#   repo, probes it, records a structured status and exits 75 instead of dying mute. That
+#   turned 24 invisible days into a visible failure. But visible is not fixed — the machine
+#   now says "blocked: tcc-denied" every single night, and nobody ever ASKS the operator
+#   for the grant that would end it. This is that ask.
+#
+# ARMED BY STRUCTURE, DISARMED BY EVIDENCE.
+#   It ARMS on a structural fact: the repo lives inside a folder macOS gates (~/Downloads,
+#   ~/Documents, ~/Desktop), and a LaunchAgent carries no TCC grant, so the 03:00 job
+#   cannot read it. It DISARMS on evidence from the launchd domain itself — a scheduled run
+#   that recorded result=ok is proof the job CAN read the repo, which is the only honest way
+#   to know a grant landed. Nothing here is self-reported and nothing needs the operator to
+#   remember to tick a box: the status file can only say "ok" after the job actually ran.
+#   When it disarms it DELETES its marker, so a later recurrence asks again rather than
+#   being permanently muted by a success that has since stopped being true.
+#
+# IT DETECTS AND ASKS. IT NEVER ACTS.
+#   macOS exposes NO API to request or set Full Disk Access — not to us, not to anyone —
+#   and it does NOT raise its own prompt for a launchd job (measured in 245ede5: a probe
+#   LaunchAgent was refused with no prompt shown, and at 03:00 there is nobody awake to
+#   answer one anyway). So this never invokes tccutil, never touches the TCC database, and
+#   never opens System Settings on its own. `open-settings` is a SEPARATE verb the human
+#   runs, and all it does is hand the request to macOS's own UI. A tool that implied it
+#   could grant this would send him hunting for a dialog that is never coming.
+#
+# WHY THE FIRST OPTION IS "MOVE THE REPO".
+#   It needs no permission at all, which makes it strictly narrower than any grant. The
+#   grant route is offered honestly with its blast radius attached, because the binary
+#   macOS judges for a scheduled shell script is a SHARED system interpreter — measured on
+#   this machine: the denial named /Applications/Xcode.app/.../python3, the interpreter the
+#   job resolved, not the script. Granting that Full Disk Access grants it to every other
+#   use of the same interpreter, and an operator deserves to know that before clicking.
+#
+# COMMANDS
+#   check         --repo DIR [--json]   exit 0 = nothing to grant, 1 = a grant is needed
+#   ask           --repo DIR [--force]  print the block ONCE; ALWAYS exits 0 (hook-safe)
+#   open-settings                       open macOS's Full Disk Access pane (explicit only)
+#   reset         [--repo DIR]          forget the block was shown (re-arm the ask)
+#
+# ENV
+#   HEIMDALL_HOME                    state dir (default $HOME/.heimdall)
+#   HEIMDALL_DREAM_STATUS            the runner's status file
+#   HEIMDALL_DREAM_PERMISSION_STATE  the "already asked" marker
+#   HEIMDALL_LAUNCH_AGENTS_DIR       plist dir, read to name the exact binary to grant
+#   HEIMDALL_OPEN                    the `open` binary (test seam)
+
+set -u
+
+SELF="$0"
+BINDIR="$(cd "$(dirname "$0")" && pwd)"
+
+# real-home.sh first: heimdall_tcc_protected_root consults the PASSWD home as well as
+# $HOME, and can only do so when that helper is defined. Both are sourced best-effort —
+# see the fail-safe note on classify() for what an unreadable lib means here.
+if [ -r "$BINDIR/lib/real-home.sh" ]; then
+  # shellcheck disable=SC1091
+  . "$BINDIR/lib/real-home.sh" 2>/dev/null || true
+fi
+if [ -r "$BINDIR/lib/tcc-paths.sh" ]; then
+  # shellcheck disable=SC1091
+  . "$BINDIR/lib/tcc-paths.sh" 2>/dev/null || true
+fi
+
+HEIMDALL_HOME="${HEIMDALL_HOME:-$HOME/.heimdall}"
+STATUS="${HEIMDALL_DREAM_STATUS:-$HEIMDALL_HOME/dream-status.json}"
+MARKER="${HEIMDALL_DREAM_PERMISSION_STATE:-$HEIMDALL_HOME/dream-permission.json}"
+LA_DIR="${HEIMDALL_LAUNCH_AGENTS_DIR:-$HOME/Library/LaunchAgents}"
+PLIST="$LA_DIR/com.heimdall.dream.plist"
+OPEN_BIN="${HEIMDALL_OPEN:-open}"
+
+# The pane macOS opens for a Full Disk Access request. This is a URL handed to the OS,
+# not a mutation — the human still does every part of the granting.
+FDA_PANE="x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"
+
+# The launchd PATH is /usr/bin:/bin:/usr/sbin:/sbin — a DIFFERENT search path than any
+# interactive shell. Resolving a `#!/usr/bin/env X` shebang against anything else would
+# name a binary the 03:00 job never actually runs, which is worse than naming none.
+LAUNCHD_PATH="/usr/bin:/bin:/usr/sbin:/sbin"
+
+REPO=""
+JSON=0
+FORCE=0
+
+die() { echo "heimdall-dream-permission: error: $*" >&2; exit 2; }
+
+parse_args() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repo)  REPO="${2:-}"; shift 2 ;;
+      --json)  JSON=1; shift ;;
+      --force) FORCE=1; shift ;;
+      *) die "unknown argument: $1" ;;
+    esac
+  done
+  [ -n "$REPO" ] || REPO="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+  REPO="$(cd "$REPO" 2>/dev/null && pwd)" || die "repo not a directory: $REPO"
+}
+
+# ── flat-JSON field reads (no jq: the scheduled context does not have it, and a tool
+# that needs a dependency the failing context lacks fails exactly when it is needed) ──
+json_field() { # json_field <file> <key>
+  [ -f "$1" ] || return 0
+  sed -n "s/^[[:space:]]*\"$2\"[[:space:]]*:[[:space:]]*\"\(.*\)\"[[:space:]]*,\{0,1\}[[:space:]]*\$/\1/p" \
+    "$1" 2>/dev/null | head -1
+}
+
+json_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\t'/ }"
+  s="${s//$'\n'/ }"
+  s="${s//$'\r'/ }"
+  printf '%s' "$s"
+}
+
+# ── classification ───────────────────────────────────────────────────────────────
+#
+# THE STATUS FILE IS ONLY CONSULTED WHEN IT IS ABOUT THIS REPO. A status left behind by a
+# different checkout describes a different job; quoting its denied path under this repo's
+# heading would be a fabricated diagnosis, and treating its result=ok as proof would
+# disarm an ask for a grant that was never given.
+#
+# FAIL SAFE. When bin/lib/tcc-paths.sh could not be sourced the predicate is undefined and
+# this cannot tell protected from safe. It answers "unknown" and stays SILENT rather than
+# guessing: a spurious permission demand teaches the operator to ignore the one real one,
+# and the loud 03:00 failure path (runner exit 75 + the SessionStart notice) is untouched
+# by this file and still reports the outage on its own.
+STATE=""
+REASON=""
+PROT_ROOT=""
+S_DENIED=""
+S_DETAIL=""
+S_TS=""
+S_RESULT=""
+
+classify() {
+  STATE=""; REASON=""; PROT_ROOT=""
+  S_DENIED=""; S_DETAIL=""; S_TS=""; S_RESULT=""
+
+  if ! type heimdall_tcc_protected_root >/dev/null 2>&1; then
+    STATE="unknown"; REASON="predicate-unavailable"
+    return 0
+  fi
+
+  if ! PROT_ROOT="$(heimdall_tcc_protected_root "$REPO")"; then
+    PROT_ROOT=""
+    STATE="ok"; REASON="repo-not-protected"
+    return 0
+  fi
+
+  local s_repo
+  s_repo="$(json_field "$STATUS" repo)"
+  if [ -n "$s_repo" ] && [ "$s_repo" = "$REPO" ]; then
+    S_RESULT="$(json_field "$STATUS" result)"
+    S_DENIED="$(json_field "$STATUS" denied_path)"
+    S_DETAIL="$(json_field "$STATUS" detail)"
+    S_TS="$(json_field "$STATUS" ts)"
+  fi
+
+  if [ "$S_RESULT" = "ok" ]; then
+    STATE="granted"; REASON="scheduled-run-succeeded"
+    return 0
+  fi
+
+  STATE="needs-grant"; REASON="tcc-protected-repo"
+  return 0
+}
+
+# subject — WHAT the block was about. The marker suppresses a repeat only for the SAME
+# subject, so a different repo (or the same repo moved under a different protected root)
+# is a genuinely different grant and gets asked about again.
+subject() { printf '%s|%s' "$REPO" "$PROT_ROOT"; }
+
+marker_subject() { json_field "$MARKER" subject; }
+
+write_marker() {
+  local dir tmp
+  dir="$(dirname "$MARKER")"
+  mkdir -p "$dir" 2>/dev/null || true
+  chmod 0700 "$dir" 2>/dev/null || true
+  tmp="$MARKER.$$.tmp"
+  cat > "$tmp" <<EOF
+{
+  "schema": 1,
+  "asked_ts": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "subject": "$(json_escape "$(subject)")",
+  "repo": "$(json_escape "$REPO")",
+  "protected_root": "$(json_escape "$PROT_ROOT")",
+  "reason": "$(json_escape "$REASON")"
+}
+EOF
+  mv -f "$tmp" "$MARKER" 2>/dev/null || rm -f "$tmp" 2>/dev/null || true
+}
+
+# ── naming the EXACT binary a Full Disk Access grant must be given to ────────────
+#
+# "Grant Full Disk Access to the scheduled interpreter" is useless advice if the operator
+# cannot tell WHICH binary that is — the System Settings picker wants a concrete path.
+# The plist is the single source of the scheduled argv, so the answer is read from it
+# rather than guessed. plutil is the platform's own plist reader and ships with every
+# macOS; where it is absent there is no launchd either, so printing nothing beats
+# fabricating an answer.
+#
+# TCC JUDGES THE INTERPRETER, NOT THE SCRIPT. Measured on this machine: the denial named
+# /Applications/Xcode.app/Contents/Developer/usr/bin/python3 — the interpreter the job
+# resolved through the shebang — never the script path in ProgramArguments[0]. So the
+# shebang is followed, and `#!/usr/bin/env X` is resolved against the LAUNCHD path,
+# because that is the search path the 03:00 job actually has.
+plist_arg() { # plist_arg <index>
+  [ -f "$PLIST" ] || return 0
+  command -v plutil >/dev/null 2>&1 || return 0
+  plutil -extract "ProgramArguments.$1" raw -o - "$PLIST" 2>/dev/null || return 0
+}
+
+# the value following --python in the scheduled argv (the pinned interpreter, when one
+# was resolved at install time), searched over a bounded argv.
+plist_pinned_python() {
+  local i=0 a
+  while [ "$i" -lt 12 ]; do
+    a="$(plist_arg "$i")"
+    [ -n "$a" ] || break
+    if [ "$a" = "--python" ]; then
+      plist_arg $((i + 1))
+      return 0
+    fi
+    i=$((i + 1))
+  done
+  return 0
+}
+
+resolve_shebang_interpreter() { # <script path>
+  local script="$1" line interp arg
+  [ -n "$script" ] && [ -r "$script" ] || return 0
+  line="$(head -1 "$script" 2>/dev/null)" || return 0
+  case "$line" in '#!'*) : ;; *) return 0 ;; esac
+  line="${line#\#!}"
+  # shellcheck disable=SC2086
+  set -- $line
+  interp="${1:-}"
+  arg="${2:-}"
+  [ -n "$interp" ] || return 0
+  # `#!/usr/bin/env X` — resolve X the way the 03:00 job would.
+  case "$interp" in
+    */env)
+      [ -n "$arg" ] || return 0
+      local d
+      for d in $(printf '%s' "$LAUNCHD_PATH" | tr ':' ' '); do
+        if [ -x "$d/$arg" ]; then printf '%s' "$d/$arg"; return 0; fi
+      done
+      return 0
+      ;;
+    *) printf '%s' "$interp" ;;
+  esac
+}
+
+# ── the block ────────────────────────────────────────────────────────────────────
+p() { printf '%s\n' "$*"; }
+
+print_block() {
+  local prog interp pinned safe_suggest
+  prog="$(plist_arg 0)"
+  [ -n "$prog" ] || prog="$HEIMDALL_HOME/bin/heimdall-dream-runner"
+  interp="$(resolve_shebang_interpreter "$prog")"
+  pinned="$(plist_pinned_python)"
+  safe_suggest="$HOME/$(basename "$REPO")"
+
+  p "=============================================================================="
+  p "  HEIMDALL NEEDS ONE PERMISSION DECISION FROM YOU  —  once, about a minute"
+  p "=============================================================================="
+  p ""
+  p "  WHAT IS BROKEN"
+  p "    The nightly dream at 03:00 cannot read this repo, so no morning report is"
+  p "    ever written. Running it by hand still works — this is only the unattended run."
+  p ""
+  p "      repo        : $REPO"
+  if [ -n "$S_DENIED" ]; then
+    p "      denied      : $S_DENIED"
+  fi
+  if [ -n "$S_DETAIL" ]; then
+    p "      os error    : $S_DETAIL"
+  fi
+  if [ -n "$S_TS" ]; then
+    p "      last attempt: $S_TS  (blocked)"
+  fi
+  p ""
+  p "  WHY"
+  p "    This repo lives inside $PROT_ROOT, a folder macOS protects."
+  p "    A scheduled LaunchAgent carries NO permission grant, so every read is refused"
+  p "    before the dream can start. Your terminal is a different case — it already holds"
+  p "    the grant, which is exactly why running it by hand works today."
+  p ""
+  p "  WHAT WILL NOT WORK — so you do not spend time on it"
+  p "    - Heimdall cannot grant this itself. macOS exposes no API to request or set Full"
+  p "      Disk Access. Only you can, and only in System Settings."
+  p "    - macOS shows no prompt for a background job. Measured: a probe LaunchAgent was"
+  p "      refused with no prompt at all — and at 03:00 nobody is awake to click one."
+  p "    - Moving the program or the log does not help, and is already done: the runner"
+  p "      lives outside the protected folder at"
+  p "        $HEIMDALL_HOME/bin/heimdall-dream-runner"
+  p "      which is the only reason you are reading this instead of getting silence."
+  p ""
+  p "  PICK ONE"
+  p ""
+  p "    [A]  MOVE THE REPO OUT OF THE PROTECTED FOLDER   — no permission needed at all"
+  p ""
+  p "           mv $REPO $safe_suggest"
+  p "           $safe_suggest/bin/heimdall-dream-schedule install --repo $safe_suggest"
+  p ""
+  p "         Recommended. Nothing to grant, nothing to maintain, no click, and it"
+  p "         cannot be revoked by a macOS update."
+  p ""
+  p "    [B]  GRANT FULL DISK ACCESS                      — one human click, broad grant"
+  p ""
+  p "           1.  heimdall-dream-permission open-settings"
+  p "               (opens System Settings > Privacy & Security > Full Disk Access)"
+  p "           2.  click +, press Cmd+Shift+G, and add:"
+  if [ -n "$interp" ]; then
+    p "                 $interp"
+  fi
+  if [ -n "$pinned" ] && [ "$pinned" != "$interp" ]; then
+    p "                 $pinned"
+  fi
+  if [ -z "$interp" ] && [ -z "$pinned" ]; then
+    p "                 the interpreter named in the error above"
+  fi
+  p "           3.  switch it ON, then re-register:"
+  p "                 heimdall-dream-schedule install --repo $REPO"
+  p ""
+  p "         BLAST RADIUS, HONESTLY: macOS judges the INTERPRETER, not the script —"
+  p "         the recorded denial named the interpreter, not the job. Those paths are"
+  p "         shared system binaries, so granting them Full Disk Access grants it to"
+  p "         every other program that runs through them. Prefer [A] unless you have a"
+  p "         specific reason not to."
+  p ""
+  p "    [C]  DO NOTHING                                  — keep running it by hand"
+  p ""
+  p "           $REPO/bin/heimdall-dream --repo $REPO run"
+  p ""
+  p "         Your terminal holds the grant, so this works right now. The 03:00 run stays"
+  p "         broken and Heimdall keeps telling you so at the start of each session."
+  p ""
+  p "  Shown once. It will not ask again unless something changes, and it goes quiet by"
+  p "  itself the moment a scheduled run succeeds. To see it again:"
+  p "    heimdall-dream-permission ask --repo $REPO --force"
+  p "=============================================================================="
+}
+
+# ── subcommands ──────────────────────────────────────────────────────────────────
+cmd_check() {
+  classify
+  local asked=false
+  [ -f "$MARKER" ] && [ "$(marker_subject)" = "$(subject)" ] && asked=true
+  if [ "$JSON" = 1 ]; then
+    printf '{"schema":1,"state":"%s","reason":"%s","repo":"%s","protected_root":"%s","asked":%s,"denied_path":"%s","detail":"%s","last_attempt":"%s"}\n' \
+      "$STATE" "$REASON" "$(json_escape "$REPO")" "$(json_escape "$PROT_ROOT")" \
+      "$asked" "$(json_escape "$S_DENIED")" "$(json_escape "$S_DETAIL")" "$(json_escape "$S_TS")"
+  else
+    case "$STATE" in
+      needs-grant) echo "needs-grant: $REPO is inside $PROT_ROOT — the 03:00 job cannot read it" ;;
+      granted)     echo "granted: the scheduled job has read $REPO successfully ($S_TS)" ;;
+      ok)          echo "ok: $REPO is not inside a macOS-protected folder — no grant needed" ;;
+      *)           echo "unknown: the protected-path predicate is unavailable (bin/lib/tcc-paths.sh)" ;;
+    esac
+  fi
+  [ "$STATE" = "needs-grant" ] && return 1
+  return 0
+}
+
+# ask — ALWAYS exits 0. It is wired into the install path and pointed at from a
+# SessionStart notice; a permission prompt that can break the thing it advises about is a
+# worse bug than the one it reports.
+cmd_ask() {
+  classify
+  if [ "$STATE" != "needs-grant" ]; then
+    # SELF-CLEARING. Dropping the marker on any non-asking state is what makes a
+    # recurrence re-arm: the operator is asked again if the grant is ever lost, instead of
+    # being permanently muted by a success that has stopped being true.
+    rm -f "$MARKER" 2>/dev/null || true
+    return 0
+  fi
+  if [ "$FORCE" != 1 ] && [ -f "$MARKER" ] && [ "$(marker_subject)" = "$(subject)" ]; then
+    return 0
+  fi
+  print_block
+  write_marker
+  return 0
+}
+
+cmd_reset() {
+  rm -f "$MARKER" 2>/dev/null || true
+  echo "permission ask re-armed (removed $MARKER)"
+}
+
+# open-settings — the ONLY thing in this file that touches the GUI, and it runs only when
+# a human typed it. It hands a URL to macOS; macOS does the rest, and the operator does
+# every part of the granting.
+cmd_open_settings() {
+  if ! command -v "$OPEN_BIN" >/dev/null 2>&1 && [ ! -x "$OPEN_BIN" ]; then
+    echo "cannot open System Settings automatically — open it by hand:" >&2
+    echo "  System Settings > Privacy & Security > Full Disk Access" >&2
+    return 2
+  fi
+  "$OPEN_BIN" "$FDA_PANE" >/dev/null 2>&1 || {
+    echo "could not open the pane — open it by hand:" >&2
+    echo "  System Settings > Privacy & Security > Full Disk Access" >&2
+    return 2
+  }
+  echo "opened System Settings > Privacy & Security > Full Disk Access"
+  echo "  click +, press Cmd+Shift+G, and add the interpreter named by:"
+  echo "    heimdall-dream-permission ask --force"
+}
+
+usage() { sed -n '2,50p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+[ $# -ge 1 ] || { usage >&2; exit 2; }
+CMD="$1"; shift
+case "$CMD" in
+  -h|--help)     usage; exit 0 ;;
+  check)         parse_args "$@"; cmd_check ;;
+  ask)           parse_args "$@"; cmd_ask ;;
+  reset)         parse_args "$@"; cmd_reset ;;
+  open-settings) cmd_open_settings ;;
+  *) echo "error: unknown command: $CMD" >&2; usage >&2; exit 2 ;;
+esac

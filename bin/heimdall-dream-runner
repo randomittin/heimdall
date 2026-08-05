@@ -177,7 +177,9 @@ advice_for() {
       echo "           $DREAM --repo $REPO run"
       echo "         to restore unattended 03:00 runs instead, grant Full Disk Access to the"
       echo "         scheduled interpreter in System Settings > Privacy & Security, or move the"
-      echo "         repo out of the protected folder."
+      echo "         repo out of the protected folder. Both routes, spelled out with runnable"
+      echo "         commands and the exact binary a grant would apply to:"
+      echo "           heimdall-dream-permission ask --repo $REPO --force"
       ;;
     permission-denied)
       echo "  cause: filesystem permissions deny this job access to the repo."

@@ -165,6 +165,11 @@ case "$KIND" in
     p "    unattended  : to restore true 03:00 runs, either move the repo out of the"
     p "                  protected folder, or grant Full Disk Access to the scheduled"
     p "                  interpreter in System Settings > Privacy & Security."
+    # The DECISION belongs to the operator, and until now nothing ever put it in front of
+    # him — this notice named the cause every session and left him to work out the rest.
+    # The block spells out both routes with runnable commands and the exact binary a grant
+    # would apply to. Routed rather than inlined: this hook must stay a few file reads.
+    p "    your options: heimdall-dream-permission ask --repo $REPO --force"
     ;;
   missing-path)
     p "    cause       : the scheduled job is pinned to a path that no longer exists."

@@ -70,6 +70,23 @@ if [ -r "$BINDIR/lib/real-home.sh" ]; then
   . "$BINDIR/lib/real-home.sh" 2>/dev/null || true
 fi
 
+# ── Shared TCC-protected-path predicate (bin/lib/tcc-paths.sh) ───────────────────
+# The SAME question is asked from two directions and the two answers must never drift:
+# here it gates the job's OWN ARTIFACTS (refuse to stage a reporter behind the locked
+# door it reports on — exit 6 below), and in bin/heimdall-dream-permission it gates the
+# REPO, which this guard deliberately exempts, to decide whether to ASK the operator for
+# a grant. A drifted copy would let this register a job it privately knows cannot run
+# while the ask never fires. Same reasoning that put real-home.sh in a lib, same
+# best-effort sourcing: each consumer below refuses when the predicate is undefined.
+if [ -r "$BINDIR/lib/tcc-paths.sh" ]; then
+  # shellcheck disable=SC1091
+  . "$BINDIR/lib/tcc-paths.sh" 2>/dev/null || true
+fi
+
+# The first-run permission ask. Lives beside this helper so `install` can hand the
+# operator the one decision only he can make, at the moment he is standing there.
+PERMISSION="$BINDIR/heimdall-dream-permission"
+
 LABEL="com.heimdall.dream"
 LA_DIR="${HEIMDALL_LAUNCH_AGENTS_DIR:-$HOME/Library/LaunchAgents}"
 HEIMDALL_HOME="${HEIMDALL_HOME:-$HOME/.heimdall}"
@@ -142,29 +159,6 @@ xml_escape() {
 
 is_macos() { [ "$(uname -s)" = "Darwin" ]; }
 
-# ── Path identity, for paths that DO NOT EXIST YET ───────────────────────────────
-#
-# bin/lib/real-home.sh's heimdall_physical_path resolves an EXISTING path. The artifact
-# directories below are created BY this install, so on a first run they are absent and
-# that helper cannot answer. absolute_physical walks up to the deepest ancestor that does
-# exist, resolves THAT physically (so a symlinked $HOME cannot launder a path past the
-# guard), then re-appends the tail it walked off.
-absolute_physical() {
-  local p="${1:-}" tail="" base
-  [ -n "$p" ] || return 1
-  case "$p" in /*) : ;; *) p="$PWD/$p" ;; esac
-  while [ ! -d "$p" ] && [ "$p" != "/" ]; do
-    base="$(basename "$p")"
-    tail="/$base$tail"
-    p="$(dirname "$p")"
-  done
-  p="$(cd "$p" 2>/dev/null && pwd -P)" || return 1
-  case "$p" in
-    /) printf '%s' "$tail" ;;
-    *) printf '%s%s' "$p" "$tail" ;;
-  esac
-}
-
 # same_physical_file <a> <b> — TRUE when both names resolve to the SAME path.
 #
 # WHY THIS EXISTS. `cp X X` is not a no-op on macOS: it prints "are identical (not
@@ -174,10 +168,18 @@ absolute_physical() {
 # puts the plugin tree at $HOME/.heimdall and defaults $HEIMDALL_HOME to the same path, so
 # the runner's source and its staging destination are one file. Asking the question
 # directly is the fix; letting `cp` answer it with an exit code is what broke.
+#
+# IT REFUSES RATHER THAN GUESS. heimdall_absolute_physical comes from bin/lib/tcc-paths.sh,
+# which is sourced best-effort. Answering "different files" without it would send the
+# default layout back through `cp X X` — the exact path that made every stranger's install
+# register no nightly dream and say nothing. A missing predicate is a broken tree, so it
+# fails loudly here instead of producing a wrong answer quietly.
 same_physical_file() {
   local a b
-  a="$(absolute_physical "${1:-}")" || return 1
-  b="$(absolute_physical "${2:-}")" || return 1
+  type heimdall_absolute_physical >/dev/null 2>&1 \
+    || die "bin/lib/tcc-paths.sh did not load — cannot resolve $1 against $2"
+  a="$(heimdall_absolute_physical "${1:-}")" || return 1
+  b="$(heimdall_absolute_physical "${2:-}")" || return 1
   [ "$a" = "$b" ]
 }
 
@@ -215,33 +217,8 @@ ensure_private_dir() {
 #
 # BOTH HOMES ARE CHECKED. $HOME may be synthetic while the artifact path is written in
 # terms of the real user's home (or the reverse), so the passwd home is consulted as well.
-TCC_PROTECTED_SUBDIRS="Downloads Documents Desktop"
-
-# path_is_tcc_protected <path> — prints the protected root and returns 0 when <path> is
-# inside one; returns 1 otherwise.
-path_is_tcc_protected() {
-  local abs home sub homes real
-  abs="$(absolute_physical "${1:-}")" || return 1
-  real=""
-  if type heimdall_real_user_home >/dev/null 2>&1; then
-    real="$(heimdall_real_user_home 2>/dev/null || true)"
-  fi
-  homes="${HOME:-}
-$real"
-  while IFS= read -r home; do
-    [ -n "$home" ] || continue
-    home="$(cd "$home" 2>/dev/null && pwd -P)" || continue
-    for sub in $TCC_PROTECTED_SUBDIRS; do
-      case "$abs/" in
-        "$home/$sub/"*) printf '%s' "$home/$sub"; return 0 ;;
-      esac
-    done
-  done <<EOF
-$homes
-EOF
-  return 1
-}
-
+# The predicate itself is heimdall_tcc_protected_root, from bin/lib/tcc-paths.sh — see
+# the sourcing note at the top of this file for why it is shared rather than local.
 refuse_unreachable() {
   local what="$1" path="$2" prot="$3"
   echo "not scheduled $PLIST (TCC-protected artifact path — the job could not report its own failure)" >&2
@@ -257,14 +234,22 @@ refuse_unreachable() {
 # launchctl verb — the same total-refusal contract exits 4 and 5 already hold to.
 require_reachable_artifacts() {
   local prot logdir
-  if prot="$(path_is_tcc_protected "$RUNNER_DIR")"; then
+  # Fail safe on an undefined predicate, exactly as require_durable_pinned_paths does:
+  # "cannot tell whether the job can reach its own artifacts" must never read as "yes".
+  if ! type heimdall_tcc_protected_root >/dev/null 2>&1; then
+    echo "not scheduled $PLIST (cannot verify the job's artifacts are reachable)" >&2
+    echo "  bin/lib/tcc-paths.sh did not load, so the protected-path predicate is" >&2
+    echo "  unavailable and this refuses rather than guess. Nothing was written." >&2
+    exit 6
+  fi
+  if prot="$(heimdall_tcc_protected_root "$RUNNER_DIR")"; then
     refuse_unreachable "the scheduled program's directory" "$RUNNER_DIR" "$prot"
   fi
   logdir="$(dirname "$LOG")"
-  if prot="$(path_is_tcc_protected "$logdir")"; then
+  if prot="$(heimdall_tcc_protected_root "$logdir")"; then
     refuse_unreachable "the job's log directory" "$logdir" "$prot"
   fi
-  if prot="$(path_is_tcc_protected "$LA_DIR")"; then
+  if prot="$(heimdall_tcc_protected_root "$LA_DIR")"; then
     refuse_unreachable "the LaunchAgents directory" "$LA_DIR" "$prot"
   fi
   return 0
@@ -613,6 +598,21 @@ Use the cron/cloud routine documented in commands/dream.md instead."
     echo "  log:     $LOG"
     echo "  loaded:  $(is_loaded && echo yes || echo no)"
     echo "  disable: heimdall-dream-schedule uninstall"
+    # ── THE FIRST-RUN PERMISSION ASK ──────────────────────────────────────────────
+    #
+    # The repo is deliberately EXEMPT from require_reachable_artifacts: a protected repo
+    # is the case the runner handles by failing loudly. But "fails loudly every night
+    # forever" is not an outcome — it is a question nobody asked the operator. So at the
+    # moment he is standing here having just registered the job, and ONLY when a grant is
+    # genuinely needed, tell him plainly what is missing and what his options are.
+    #
+    # AFTER the install summary, so the block is the last thing on screen. NEVER in --json
+    # mode: that output has parsers. Fully best-effort — a permission prompt must not be
+    # able to fail an install that otherwise succeeded, and the ask is idempotent on its
+    # own (it records what it showed and stays quiet on a re-install).
+    if [ -x "$PERMISSION" ]; then
+      "$PERMISSION" ask --repo "$REPO" 2>/dev/null || true
+    fi
   fi
 }
 
@@ -627,9 +627,19 @@ cmd_uninstall() {
   # is the documented OFF SWITCH — a user turning the nightly job off must not have it
   # quietly amputate part of the install. When the two paths differ the copy is ours and
   # nothing else refers to it, so leaving it would orphan a file the user never placed.
-  if [ -e "$RUNNER" ] && ! same_physical_file "$RUNNER_SRC" "$RUNNER"; then
+  #
+  # The `type` check keeps the OFF SWITCH working on a tree whose lib did not load: with
+  # no way to tell a staged copy from the installation's own file, the safe answer is to
+  # leave it alone. Uninstall may orphan a file; it must never amputate an install.
+  if [ -e "$RUNNER" ] && type heimdall_absolute_physical >/dev/null 2>&1 \
+     && ! same_physical_file "$RUNNER_SRC" "$RUNNER"; then
     rm -f "$RUNNER" 2>/dev/null || true
   fi
+  # Reversibility extends to the ask: uninstall drops the marker recording that the
+  # first-run permission block was shown, so a later re-install asks again from scratch.
+  # `uninstall` is the documented undo, and an undo that leaves state behind is a leak.
+  rm -f "${HEIMDALL_DREAM_PERMISSION_STATE:-$HEIMDALL_HOME/dream-permission.json}" \
+    2>/dev/null || true
   if [ "$JSON" = 1 ]; then
     printf '{"installed":false,"loaded":false,"label":"%s","plist":"%s"}\n' "$LABEL" "$PLIST"
   else
