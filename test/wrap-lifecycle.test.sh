@@ -122,6 +122,10 @@ for t in $TOOLS; do
   cat > "$TOOLBIN/$t" <<'EOTOOL'
 #!/usr/bin/env bash
 printf 'TOOL %s ARGS: %s\n' "$(basename "$0")" "$*" >> "${HMD_TOOL_OUT:-/dev/null}"
+# The launched tool also reports whether the one-hop re-entry marker reached it.
+# Deliberately NOT prefixed "TOOL <name>" — 4e counts lines matching that exact
+# string, and a second matching line per launch would silently double the count.
+printf 'WRAPMARK %s: %s\n' "$(basename "$0")" "${HEIMDALL_WRAP_LAUNCHED:-unset}" >> "${HMD_TOOL_OUT:-/dev/null}"
 exit 0
 EOTOOL
   chmod +x "$TOOLBIN/$t"
@@ -144,6 +148,7 @@ new_repo() {
 run_wrap() {
   local d="$1"; shift
   ( cd "$d" && \
+    env -u HEIMDALL_WRAP_LAUNCHED \
     HOME="$WORK/fakehome" \
     HEIMDALL_HOME="$WORK/fakehome/.heimdall" \
     PATH="$TOOLBIN:$PATH" \
@@ -162,6 +167,7 @@ run_wrap() {
 run_wrap_v() {
   local d="$1"; shift
   ( cd "$d" && \
+    env -u HEIMDALL_WRAP_LAUNCHED \
     HOME="$WORK/fakehome" \
     HEIMDALL_HOME="$WORK/fakehome/.heimdall" \
     PATH="$TOOLBIN:$PATH" \
@@ -623,6 +629,44 @@ grep -q 'TOOL cursor' "$TOOL_OUT" \
   && ok "6launch wrap without --no-launch actually EXECS the tool" \
   || bad "6launch the tool was never launched" "$(cat "$TOOL_OUT")"
 
+# ── THE ONE-HOP MARKER MUST DIE AFTER ONE HOP ────────────────────────────────
+# HEIMDALL_WRAP_LAUNCHED exists to stop ONE recursion: heimdall-wrap execs
+# bin/heimdall, and that heimdall must not route straight back into wrap. It is
+# set as an env assignment on `exec`, so it lands in the new process image's
+# environ and is inherited by EVERY descendant, for the whole life of the
+# session — which turned a one-hop guard into a permanent kill switch for the
+# bare-`hmd` arm. Measured before the fix: a wrapped session's `claude` was
+# launched with HEIMDALL_WRAP_LAUNCHED=1, so every `hmd` typed inside it fell
+# through to the task prompt instead of wrapping.
+#
+# Two leak paths, asserted separately because they have different causes:
+#   cursor/codex/… — heimdall-wrap execs the tool DIRECTLY. No tool reads this
+#                    variable, so setting it there is pure leakage.
+#   claude         — heimdall-wrap execs bin/heimdall, which is the one real
+#                    reader. It must CONSUME the marker so the session it goes
+#                    on to launch never sees it.
+grep -q 'WRAPMARK cursor: unset' "$TOOL_OUT" \
+  && ok "6mark the marker does NOT leak into a directly-exec'd tool" \
+  || bad "6mark heimdall-wrap leaked HEIMDALL_WRAP_LAUNCHED into cursor" \
+         "$(grep WRAPMARK "$TOOL_OUT" | tr '\n' ' ')"
+
+# The full production chain: wrap → bin/heimdall → the claude session. This is
+# the launch every wrapped user actually gets.
+R6c="$(new_repo launchclaude)"
+git -C "$R6c" commit -qm init --allow-empty >/dev/null 2>&1
+: > "$TOOL_OUT"
+run_wrap "$R6c" wrap claude
+# POSITIVE CONTROL first: without a real session launch in the log, the absence
+# assertion below would pass by saying nothing at all.
+grep -q 'TOOL claude ARGS: --agent heimdall' "$TOOL_OUT" \
+  && ok "6chain the wrap→heimdall→claude chain really launched a session" \
+  || bad "6chain no session launch in the log — the marker check would be vacuous" \
+         "$(cat "$TOOL_OUT")"
+grep -q 'WRAPMARK claude: 1' "$TOOL_OUT" \
+  && bad "6chain the marker survived into the claude session — bare hmd is disarmed there" \
+         "$(grep WRAPMARK "$TOOL_OUT" | tr '\n' ' ')" \
+  || ok "6chain bin/heimdall CONSUMES the marker — the session inherits nothing"
+
 for t in $TOOLS; do
   if command -v "$t" >/dev/null 2>&1; then
     RR="$(new_repo "real-$t")"
@@ -667,7 +711,14 @@ route_stub heimdall-wrap
 
 run_hmd() {
   : > "$ROUTE_OUT"; : > "$TRACE"
-  ( PATH="$ROUTE_DIR/bin:$PATH" \
+  # THE SUITE MUST CONTROL ITS OWN BASELINE. HEIMDALL_WRAP_LAUNCHED is the one-hop
+  # marker heimdall-wrap sets when it re-enters bin/heimdall, and the bare-`hmd` arm
+  # reads it. Anyone running this suite from INSIDE a wrapped session inherits it, and
+  # every §8 assertion below would then measure the ambient session instead of the
+  # dispatch — 8a/8b/8e went red for exactly that reason. `env -u` pins the precondition
+  # the assertions are actually about: a bare `hmd` that is NOT already one hop from wrap.
+  ( env -u HEIMDALL_WRAP_LAUNCHED \
+    PATH="$ROUTE_DIR/bin:$PATH" \
     HOME="$WORK/fakehome" \
     HEIMDALL_HOME="$ROUTE_DIR/home" \
     HEIMDALL_NO_INTRO=1 HEIMDALL_NO_UPDATE_CHECK=1 \
