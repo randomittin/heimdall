@@ -1,0 +1,339 @@
+#!/usr/bin/env python3
+# heimdall-metric — the TASK-OUTCOME EMITTER. The missing PRODUCER for the
+# self-improve / dream loop.
+#
+# WHY THIS EXISTS: bin/heimdall-self-improve implements a real, tested falsifier
+# (keep an override ONLY on a measured pass-rate delta over a baseline, else roll
+# back) and bin/heimdall-dream wraps it for the overnight run. Both read
+# .planning/metrics.jsonl looking for metric:"task" records. NOTHING IN THIS REPO
+# EVER WROTE ONE. The corpus carried only metric:"parallelism" rows from
+# bin/parallelism-tracker.c, so dream computed honest_empty=True every night,
+# forever: a correct engine with its fuel line unconnected. This bin is the fuel
+# line. It does not change the algorithm; it supplies the evidence.
+#
+# THE RECORD (one JSON object per line, appended to .planning/metrics.jsonl):
+#   ts            ISO-8601 UTC emit time
+#   metric        always "task" (the discriminator self-improve filters on)
+#   schema        record schema version
+#   task_type     WHAT KIND of work (slug, <=32 chars) — the routing subject
+#   model         WHICH TIER ran it: haiku | sonnet | opus — the routing variable
+#   effort        the effort level the tier ran at (slug, <=16 chars)
+#   outcome       pass | fail — did the acceptance criteria pass ON THE FIRST TRY
+#                 at this tier. THIS IS THE COMPARABLE SCALAR routing is graded on
+#                 (Heimdall's val_bpb). A task that needed a retry was MIS-ROUTED,
+#                 so it reads "fail" here even if it eventually succeeded.
+#   final         pass | fail — the EVENTUAL verdict after retries/escalation.
+#                 Deliberately separate from `outcome`: conflating them would let
+#                 "we got there in the end" launder a bad routing decision.
+#   retries       attempts beyond the first, at this tier
+#   escalated_to  the tier this task was escalated to after this tier ran out of
+#                 road (haiku->sonnet->opus), else null
+#   wall_secs     wall-clock seconds this attempt took
+#   source        which lane emitted it (orchestrator | queue | cli | ...)
+#   session       the session id, when the environment exposes one
+#
+# One record = one ROUTING OBSERVATION ("how did task_type X do on tier Y"). A
+# task that escalates emits one record per tier it touched, so a two-hop
+# haiku->sonnet->opus run yields three clean, independently-aggregatable rows
+# rather than one blurred summary.
+#
+# DESIGN CONSTRAINTS (all enforced below, all covered by test/heimdall-metric.test.sh):
+#
+#   * NEVER FAILS A TASK. Emission is telemetry, not work. Every failure path —
+#     unwritable dir, absent .planning, malformed call, oversized record — is a
+#     SILENT no-op at exit 0. A metrics write must never surface an error to the
+#     user or break the task that was trying to report success. `--strict` is the
+#     opt-in that makes failures visible; only tests pass it, never callers.
+#
+#   * CHEAP AND NON-BLOCKING. No locking, no read-modify-write, no fsync, no
+#     network. One os.write() of one short line to an O_APPEND fd, then exit.
+#     Concurrent agents cannot lose each other's writes (O_APPEND seeks to EOF
+#     under the kernel's file lock) and cannot interleave (a single write() of a
+#     record this small is not split). Records are hard-capped well under that
+#     boundary; an oversized record is dropped rather than risk a torn line.
+#
+#   * NO SECRETS, NO PROMPT CONTENT, NO FILE CONTENTS. There is no field for a
+#     prompt, a body, a diff, or a path — the schema simply has nowhere to put
+#     one. Every free-text input is SLUGGED (lowercased, non [a-z0-9_-] collapsed
+#     to "-") and length-capped, so a caller that passes a whole prompt as the
+#     task type gets a 32-char slug, not a leak. This repo is gitleaks-clean over
+#     1171 commits; the emitter is built so it cannot be the thing that breaks it.
+#
+#   * CORPUS INTEGRITY. `model` is validated against the routing ladder
+#     (haiku|sonnet|opus) and `outcome`/`final` against pass|fail, because those
+#     are the keys the consumer ROUTES on — an off-ladder value would silently
+#     poison the evidence. `task_type`/`effort`/`source` are shape-validated
+#     (slug) rather than membership-validated, because their vocabularies grow.
+#
+# Usage:
+#   heimdall-metric task --type SLUG --model haiku|sonnet|opus --outcome pass|fail
+#                        [--effort SLUG] [--final pass|fail] [--retries N]
+#                        [--escalated-to haiku|sonnet|opus] [--wall-secs N]
+#                        [--source SLUG] [--repo DIR] [--strict]
+#   heimdall-metric where [--repo DIR]      # print the metrics file path
+#   -h | --help
+#
+# Exit status: 0 always on the emit path (by design). With --strict: 2 usage /
+# rejected input, 3 write failure.
+
+import os
+import sys
+import time
+
+SCHEMA_VERSION = 1
+
+# The routing ladder the consumer (bin/heimdall-self-improve) escalates along.
+# Membership-validated: an off-ladder tier is unroutable evidence, so it is dropped.
+TIERS = ("haiku", "sonnet", "opus")
+OUTCOMES = ("pass", "fail")
+
+TYPE_MAX = 32        # task_type slug cap — short enough that no prompt survives
+EFFORT_MAX = 16      # effort/source slug cap
+RECORD_MAX = 1024    # hard byte cap; a single write() this small is never torn
+
+
+def _now():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _slug(value, cap):
+    """Lowercase, collapse every non [a-z0-9_-] run to a single '-', trim, cap.
+
+    This is the ONLY door free text can come through, so it is also the privacy
+    control: a prompt, a file path, or a secret offered as a task type leaves as
+    a short slug. Returns "" when nothing survives (the caller then drops)."""
+    if value is None:
+        return ""
+    out = []
+    prev_dash = False
+    for ch in str(value).lower():
+        if ("a" <= ch <= "z") or ("0" <= ch <= "9") or ch == "_":
+            out.append(ch)
+            prev_dash = False
+        elif not prev_dash and out:
+            out.append("-")
+            prev_dash = True
+        if len(out) >= cap:
+            break
+    return "".join(out).strip("-_")[:cap]
+
+
+class Rejected(Exception):
+    """Input the emitter refuses to record (would poison or leak the corpus)."""
+
+
+def _metrics_path(repo):
+    planning = os.environ.get("HEIMDALL_PLANNING_DIR")
+    if not planning:
+        planning = os.path.join(repo, ".planning")
+    return os.path.join(planning, "metrics.jsonl")
+
+
+def _int(value, name, lo=0):
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        raise Rejected("%s must be an integer, got %r" % (name, value))
+    if n < lo:
+        raise Rejected("%s must be >= %d, got %d" % (name, lo, n))
+    return n
+
+
+def _json_str(value):
+    """Minimal JSON string escaper. The inputs are already slugged to
+    [a-z0-9_-], so this only ever has to handle the trivial case — but it is
+    written correctly rather than assumed, because `session` comes from the
+    environment and is not ours to trust."""
+    out = ['"']
+    for ch in value:
+        if ch == '"' or ch == "\\":
+            out.append("\\" + ch)
+        elif ch == "\n":
+            out.append("\\n")
+        elif ch == "\r":
+            out.append("\\r")
+        elif ch == "\t":
+            out.append("\\t")
+        elif ch < " " or ch == "\x7f":
+            out.append("\\u%04x" % ord(ch))
+        else:
+            out.append(ch)
+    out.append('"')
+    return "".join(out)
+
+
+def _build(args):
+    """Validate + shape the record. Raises Rejected on anything unrecordable."""
+    task_type = _slug(args.type, TYPE_MAX)
+    if not task_type:
+        raise Rejected("--type is required and must contain [a-z0-9_-]")
+
+    model = _slug(args.model, EFFORT_MAX)
+    if model not in TIERS:
+        raise Rejected("--model must be one of %s, got %r" % ("|".join(TIERS), args.model))
+
+    outcome = _slug(args.outcome, EFFORT_MAX)
+    if outcome not in OUTCOMES:
+        raise Rejected("--outcome must be pass|fail, got %r" % (args.outcome,))
+
+    final = _slug(args.final, EFFORT_MAX) if args.final is not None else outcome
+    if final not in OUTCOMES:
+        raise Rejected("--final must be pass|fail, got %r" % (args.final,))
+
+    escalated_to = None
+    if args.escalated_to is not None:
+        escalated_to = _slug(args.escalated_to, EFFORT_MAX)
+        if escalated_to not in TIERS:
+            raise Rejected("--escalated-to must be one of %s, got %r"
+                           % ("|".join(TIERS), args.escalated_to))
+
+    effort = _slug(args.effort, EFFORT_MAX) or "default"
+    source = _slug(args.source, EFFORT_MAX) or "cli"
+
+    retries = _int(args.retries, "--retries")
+    wall_secs = _int(args.wall_secs, "--wall-secs")
+
+    session = _slug(os.environ.get("CLAUDE_SESSION_ID")
+                    or os.environ.get("SESSION_ID") or "", EFFORT_MAX) or "default"
+
+    # Field ORDER is fixed and hand-rendered (not json.dumps) so the line is
+    # byte-predictable, greppable by eye, and cheap to build.
+    parts = [
+        '"ts":%s' % _json_str(_now()),
+        '"metric":"task"',
+        '"schema":%d' % SCHEMA_VERSION,
+        '"task_type":%s' % _json_str(task_type),
+        '"model":%s' % _json_str(model),
+        '"effort":%s' % _json_str(effort),
+        '"outcome":%s' % _json_str(outcome),
+        '"final":%s' % _json_str(final),
+        '"retries":%d' % retries,
+        '"escalated_to":%s' % (_json_str(escalated_to) if escalated_to else "null"),
+        '"wall_secs":%d' % wall_secs,
+        '"source":%s' % _json_str(source),
+        '"session":%s' % _json_str(session),
+    ]
+    line = "{" + ",".join(parts) + "}\n"
+    raw = line.encode("utf-8")
+    if len(raw) > RECORD_MAX:
+        # Unreachable with slugged inputs; kept because the atomicity guarantee
+        # below is only true for short writes, and a guarantee you do not enforce
+        # is a guarantee you do not have.
+        raise Rejected("record %d bytes exceeds the %d-byte atomic-append cap"
+                       % (len(raw), RECORD_MAX))
+    return raw
+
+
+def _append(path, raw):
+    """ONE os.write() to an O_APPEND fd. No lock, no read-modify-write, no fsync.
+
+    O_APPEND makes the kernel seek to EOF atomically with the write, so parallel
+    agents never clobber each other; a single write of a record this small is
+    never split, so lines never interleave. Raises OSError on failure — the
+    caller decides whether that is visible."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    try:
+        os.write(fd, raw)
+    finally:
+        os.close(fd)
+
+
+def cmd_task(args):
+    try:
+        raw = _build(args)
+    except Rejected as exc:
+        if args.strict:
+            sys.stderr.write("error: %s\n" % exc)
+            return 2
+        return 0  # never fail a task over telemetry
+
+    path = _metrics_path(args.repo)
+    try:
+        if not os.path.isdir(os.path.dirname(path)):
+            raise OSError("metrics directory absent: %s" % os.path.dirname(path))
+        _append(path, raw)
+    except OSError as exc:
+        if args.strict:
+            sys.stderr.write("error: metrics write failed: %s\n" % exc)
+            return 3
+        return 0  # a metrics write failing is a no-op, never the user's problem
+    return 0
+
+
+def cmd_where(args):
+    print(_metrics_path(args.repo))
+    return 0
+
+
+def build_parser():
+    import argparse
+
+    class _Parser(argparse.ArgumentParser):
+        """argparse exits 2 on a usage error, which would fail the caller's task
+        over a telemetry typo. Route usage errors through Rejected instead so the
+        never-fails contract covers a malformed call exactly like a failed write.
+        (Subparsers inherit this class: add_subparsers defaults parser_class to
+        type(self).) -h/--help still exits normally."""
+
+        def error(self, message):
+            raise Rejected(message)
+
+    ap = _Parser(
+        prog="heimdall-metric",
+        description="Append a task-outcome record to .planning/metrics.jsonl — the "
+                    "evidence bin/heimdall-self-improve and bin/heimdall-dream "
+                    "consume. Never fails the task that emits it.")
+    ap.add_argument("--repo", default=".", help="repo root (default: cwd)")
+    ap.add_argument("--strict", action="store_true",
+                    help="surface emit failures (tests only; callers never pass this)")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    t = sub.add_parser("task", help="record ONE routing observation")
+    t.add_argument("--type", required=True,
+                   help="task type slug (the routing subject): lint, docs, code, ...")
+    t.add_argument("--model", required=True,
+                   help="tier that ran it: %s" % "|".join(TIERS))
+    t.add_argument("--outcome", required=True,
+                   help="pass|fail — acceptance criteria ON THE FIRST TRY at this tier")
+    t.add_argument("--final", default=None,
+                   help="pass|fail — eventual verdict after retries (default: --outcome)")
+    t.add_argument("--effort", default="default", help="effort level slug")
+    t.add_argument("--retries", default=0, help="attempts beyond the first, at this tier")
+    t.add_argument("--escalated-to", dest="escalated_to", default=None,
+                   help="tier this task escalated to, if any")
+    t.add_argument("--wall-secs", dest="wall_secs", default=0,
+                   help="wall-clock seconds for this attempt")
+    t.add_argument("--source", default="cli", help="emitting lane slug")
+    t.set_defaults(fn=cmd_task)
+
+    w = sub.add_parser("where", help="print the metrics file path")
+    w.set_defaults(fn=cmd_where)
+
+    return ap
+
+
+def main(argv):
+    strict = "--strict" in argv
+    try:
+        args = build_parser().parse_args(argv)
+    except Rejected as exc:
+        if strict:
+            sys.stderr.write("error: %s\n" % exc)
+            return 2
+        return 0  # a malformed call is a no-op, never the caller's problem
+    args.repo = os.path.abspath(args.repo)
+    return args.fn(args)
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main(sys.argv[1:]))
+    except BrokenPipeError:
+        raise SystemExit(0)
+    except SystemExit:
+        raise
+    except Exception as exc:  # last-resort guard: telemetry never breaks a task
+        if "--strict" in sys.argv:
+            sys.stderr.write("error: %s\n" % exc)
+            raise SystemExit(3)
+        raise SystemExit(0)
