@@ -28,6 +28,15 @@
 # fixed string cannot go wrong, and therefore cannot be trusted. W3 and W4 are what
 # stop the answer regressing into a constant.
 #
+# AND MEASURED AGAIN WHEN IT IS READ. A measurement taken once and then replayed
+# forever is a fixed string with extra steps. Headroom's canonical wiring record
+# proved it: written before the wrap-chain handler existed, it carries no per-wire
+# verdict at all, while bin/heimdall-wrap references the module and a live add
+# measures ROUTED — and no path on the machine rewrote it, because `add` refuses an
+# installed module and `update` reports nothing to do. W7 holds the line the record
+# could not: `status` measures when you READ it, names the disagreement when the
+# stored record contradicts the machine, and `rewire` is the path that corrects it.
+#
 # THIS SUITE IS OFFLINE AND CHEAP BY CONSTRUCTION. It drives the dispatcher through
 # FIXTURE modules that declare the real kinds and the real targets, under a fixture
 # class whose invariants are `printf`. The full add-path coverage for the shipped
@@ -43,13 +52,20 @@
 #       variable flips `routed` false -> true. A fixed string cannot do that.
 #   W4  for the shipped kinds, the recorded status agrees with an INDEPENDENT
 #       measurement of this repo taken by this file. A differential, so it stays
-#       correct if someone genuinely wires the module later.
+#       correct if someone genuinely wires the module later. The fixture carries
+#       the SHIPPED module's name, because the name is part of what gets measured.
 #   W5  PROVE-RED, both layers: a mutant with validate's refusal neutered lets the
 #       bogus kind reach [5/7]; a mutant with the dispatcher ALSO reverted to the
 #       old record-and-return body installs it to a silent green. Restored binary
 #       refuses both times.
 #   W6  [6/7] reports per wire, out loud, whether it ROUTED or only RECORDED, so
-#       an inert wire cannot read as a live one on the terminal either.
+#       an inert wire cannot read as a live one on the terminal either — proved on
+#       ONE module carrying one of each.
+#   W7  `status` measures at READ time, not at add time: the same install and the
+#       same record print two different verdicts under two different machines, the
+#       disagreement with the stored record is named out loud, and `rewire`
+#       refreshes the record without re-fetching or disturbing the install.
+#       PROVE-RED: a mutant whose status REPLAYS the record fails every one.
 #
 # Usage:  bash test/wire-kind-dispatch.test.sh   (exit 0 = every guarantee holds)
 set -uo pipefail
@@ -198,9 +214,20 @@ echo "W4 — the shipped kinds' recorded status agrees with an independent measu
 # match. Written as a differential on purpose: if someone genuinely wires the
 # module later, both sides move together and this stays green. Only a record that
 # has stopped tracking reality can fail it.
-mkmodule mirror "$(jq -c '[.wires[] | {kind, target}]' "$REPO/modules/headroom/manifest.json")"
-hmd add mirror --yes >/dev/null 2>&1
-MW="$STATE/mirror/wired.json"
+#
+# THE FIXTURE'S NAME IS PART OF THE MEASUREMENT, which is why it is the shipped
+# module's name and not a neutral label. Every handler asks its question ABOUT THE
+# MODULE BEING WIRED: wrap-chain greps the target for the module's own name,
+# storage-codec-backend compares the seam's live backend against it. A fixture
+# called something else therefore makes the binary answer "is bin/heimdall-wrap
+# wired to MIRROR?" (it never is) while the independent grep below asks "is it
+# wired to HEADROOM?" (it is) — two different questions about two different
+# subjects, a mismatch guaranteed by construction, and a red that accuses the
+# record of drifting when nothing has drifted at all. A differential is only one
+# if both sides name the same subject.
+mkmodule headroom "$(jq -c '[.wires[] | {kind, target}]' "$REPO/modules/headroom/manifest.json")"
+hmd add headroom --yes >/dev/null 2>&1
+MW="$STATE/headroom/wired.json"
 if [ -f "$MW" ]; then
   # wrap-chain: is the target file actually referencing the module?
   WT="$(jq -r '.wires[] | select(.kind=="wrap-chain") | .target' "$MW")"
@@ -226,9 +253,9 @@ if [ -f "$MW" ]; then
   [ "$(jq -r '.wires | length' "$MW")" = "2" ] \
     && ok "both declared wires are recorded, neither dropped" || bad "wire count wrong"
 else
-  bad "no wiring record for the mirror fixture"
+  bad "no wiring record for the shipped-wires fixture"
 fi
-hmd remove mirror >/dev/null 2>&1
+hmd remove headroom >/dev/null 2>&1
 
 echo
 echo "W5 — PROVE-RED: neuter each layer and watch the bogus kind get through"
@@ -333,21 +360,181 @@ OUT3="$("$MODS" --registry "$REG" --state "$MSTATE3" add bogus --yes 2>&1)"; RC3
 echo
 echo "W6 — [6/7] says out loud what it actually did, per wire"
 
-OUT="$(hmd add mirror --yes 2>&1)"
+# The fixture carries Headroom's real wires AND its real name (see W4), so this
+# one module presents one LIVE wire and one INERT wire in a single step. That is
+# the strongest available form of the guarantee: the two outcomes have to be
+# distinguishable from each other on the same terminal, in the same run, not
+# merely distinguishable across two separate fixtures.
+OUT="$(hmd add headroom --yes 2>&1)"
 printf '%s' "$OUT" | grep -q '\[6/7\] wire' \
   && ok "the step is still labelled [6/7] wire (the ordering gate's anchor survives)" \
   || bad "[6/7] wire label is gone — modules-lifecycle's order assertion would break"
-printf '%s' "$OUT" | grep -q 'RECORDED' \
-  && ok "an inert wire prints RECORDED on the terminal, not a bare green" \
-  || bad "[6/7] does not distinguish recorded from routed"
+printf '%s' "$OUT" | grep -q ': RECORDED, not routed' \
+  && ok "an inert wire prints \"RECORDED, not routed\", not a bare green" \
+  || bad "[6/7] does not report an inert wire as recorded-not-routed"
+printf '%s' "$OUT" | grep -q ': ROUTED' \
+  && ok "and a LIVE wire on the same module prints ROUTED — the two are distinguishable" \
+  || bad "[6/7] does not report a live wire as ROUTED"
 printf '%s' "$OUT" | grep -q 'wrap-chain' \
   && ok "each declared wire is named in the step output" || bad "wires are not named at [6/7]"
-# The status verb reads the same record, so it cannot drift from it.
-SOUT="$(hmd status mirror 2>&1)"
-printf '%s' "$SOUT" | grep -qi 'recorded' \
-  && ok "\`status\` reports the same recorded-not-routed truth" \
-  || bad "\`status\` still describes declared wires as if they were wired"
-hmd remove mirror >/dev/null 2>&1
+hmd remove headroom >/dev/null 2>&1
+
+echo
+echo "W7 — \`status\` measures the machine at READ time, and names the record it contradicts"
+
+# THE PREMISE THIS SECTION REPLACES. W6 used to end by asserting that `status`
+# printed the word "recorded", on the stated reasoning that "the status verb reads
+# the same record, so it cannot drift from it". It cannot drift from the RECORD.
+# It can drift from the MACHINE, and on the owner's install it had: Headroom's
+# canonical wired.json predates the wrap-chain handler and carries no per-wire
+# verdict at all, while bin/heimdall-wrap references the module and a live add
+# measures ROUTED. `add` refuses an installed module and `update` reports nothing
+# to do, so nothing on the machine could correct it. An assertion that a replayed
+# record is self-consistent is an assertion that cannot fail.
+#
+# So the property asserted here is the stronger one: the verdict `status` prints is
+# measured WHEN YOU READ IT, and the add-time record is kept as provenance whose
+# disagreement is SURFACED rather than silently preferred. An `env` wire is the
+# subject because this file can flip its routedness at will, which turns "measured
+# at read time" from a claim about wording into a differential — the SAME install
+# and the SAME record must print two different verdicts under two different
+# machines. No replaying implementation can do that, which is what the mutant at
+# the end of this section demonstrates instead of assuming.
+
+hmd add envwire --yes >/dev/null 2>&1
+EW="$STATE/envwire/wired.json"
+[ "$(jq -r '.wires[0].routed' "$EW" 2>/dev/null)" = "false" ] \
+  && ok "setup: the add-time record for the env wire says routed=false" \
+  || bad "setup: the env fixture did not record routed=false"
+
+# Arm 1 — the machine agrees with the record.
+S_OFF="$(hmd status envwire 2>&1)"
+printf '%s' "$S_OFF" | grep -q 'measured now' \
+  && ok "\`status\` states its verdict was measured NOW, not replayed from the record" \
+  || bad "\`status\` does not report a verdict measured at read time"
+printf '%s' "$S_OFF" | grep -q ': NOT ROUTED (measured now)' \
+  && ok "with the target unset it measures NOT ROUTED" \
+  || bad "unset target did not measure NOT ROUTED"
+printf '%s' "$S_OFF" | grep -q 'add-time record says' \
+  && bad "it reported drift while the record and the machine agree" \
+  || ok "and reports NO drift, because the record and the machine agree"
+
+# Arm 2 — same install, same record, one thing different about the machine. This
+# is the arm a replaying status cannot pass, and it is also the drifted state the
+# mutant below is run against.
+S_ON="$(HMD_WIRE_FIXTURE_URL="http://127.0.0.1:8080" hmd status envwire 2>&1)"
+printf '%s' "$S_ON" | grep -q ': ROUTED (measured now)' \
+  && ok "exporting the target flips the SAME record's status to ROUTED — read-time measurement" \
+  || bad "status did not move when the machine moved — it is replaying the record"
+printf '%s' "$S_ON" | grep -q 'add-time record says 0 ROUTED' \
+  && ok "and the DRIFT is named out loud, quoting what the stored record claims" \
+  || bad "status silently preferred one side instead of naming the disagreement"
+[ "$(jq -r '.wires[0].routed' "$EW" 2>/dev/null)" = "false" ] \
+  && ok "\`status\` did NOT rewrite the record behind the reader's back — it stays read-only" \
+  || bad "status mutated the stored record; a read must not be a write"
+
+# PROVE-RED. Everything above is a property the shipped binary has, so on its own
+# it cannot show those assertions are load-bearing. This mutant restores the
+# REPLAYING body of status_wiring() — the code that shipped before this change,
+# verbatim — and is run against the SAME drifted state. It must fail every arm.
+cat > "$TMP/replay-body.sh" <<'REPLAY'
+status_wiring() {
+  local name="$1" d="$2"
+  local nwires nrouted
+  nwires="$(jq -r '(.wires // []) | length' "$d/wired.json" 2>/dev/null || echo 0)"
+  [ -n "$nwires" ] || nwires=0
+  if [ "$nwires" = "0" ]; then
+    printf '    wiring:   0 wires declared — the module is inert\n'
+  else
+    nrouted="$(jq -r '[(.wires // [])[] | select(.routed)] | length' "$d/wired.json" 2>/dev/null || echo 0)"
+    printf '    wiring:   %s declared, %s ROUTED when measured at add time\n' "$nwires" "$nrouted"
+    jq -r '(.wires // [])[] |
+      "              \(.kind) -> \(.target): \(if (.measured | not) then "NOT MEASURED" elif .routed then "ROUTED" else "RECORDED, not routed" end)"' \
+      "$d/wired.json" 2>/dev/null
+  fi
+}
+REPLAY
+
+M3SRC="$TMP/mutant-replay-status.sh"
+awk -v body="$TMP/replay-body.sh" '
+  /^status_wiring\(\) \{/ { skip = 1
+    while ((getline line < body) > 0) print line
+    close(body); next }
+  skip && /^\}/ { skip = 0; next }
+  skip { next }
+  { print }
+' "$MODS" > "$M3SRC"
+
+if cmp -s "$M3SRC" "$MODS"; then
+  bad "the status mutation changed nothing — every PROVE-RED arm below would be vacuous"
+else
+  ok "mutant 3 differs from the shipped binary (status reverted to replaying the record)"
+fi
+bash -n "$M3SRC" 2>/dev/null \
+  && ok "mutant 3 is syntactically valid bash (a broken mutant proves nothing)" \
+  || bad "mutant 3 does not parse — the reconstruction is wrong"
+mkfarm "$TMP/farm3" "$M3SRC"
+M3OUT="$(HMD_WIRE_FIXTURE_URL="http://127.0.0.1:8080" \
+         "$TMP/farm3/bin/heimdall-modules" --registry "$REG" --state "$STATE" status envwire 2>&1)"
+printf '%s' "$M3OUT" | grep -q 'measured now' \
+  && bad "mutant 3 still claims a read-time measurement — the reconstruction is wrong" \
+  || ok "RED: the replaying status makes no read-time claim, so arm 1's assertion fails on it"
+printf '%s' "$M3OUT" | grep -q 'add-time record says' \
+  && bad "mutant 3 flagged drift — a replaying status cannot detect drift, so this is wrong" \
+  || ok "RED: it cannot see the drift at all, so arm 2's drift assertion fails on it"
+printf '%s' "$M3OUT" | grep -q ': RECORDED, not routed' \
+  && ok "RED: and it reports the wire as not routed while the machine has it ROUTED — the exact defect" \
+  || bad "mutant 3 did not reproduce the replayed verdict"
+
+# GREEN again on the shipped binary, same state, same machine. The restore is what
+# makes the REDs above evidence rather than noise.
+S_RESTORE="$(HMD_WIRE_FIXTURE_URL="http://127.0.0.1:8080" hmd status envwire 2>&1)"
+printf '%s' "$S_RESTORE" | grep -q ': ROUTED (measured now)' \
+  && ok "GREEN: the shipped binary measures the same state as ROUTED again" \
+  || bad "the shipped binary did not restore the measured verdict"
+
+# ── the REFRESH PATH ─────────────────────────────────────────────────────────
+# Drift that can be SEEN but not CORRECTED is half an answer, and the half that
+# leaves a stale record on disk for the next reader. `rewire` re-runs step 6 and
+# nothing else against an already-installed module: no fetch, no consent, no
+# invariant run, no removal. It calls the same wire_module() the add path calls,
+# so a refreshed record cannot describe a different measurement than an add would
+# have taken — there is no second implementation to drift.
+RCPT_BEFORE="$(sha_file "$STATE/envwire/receipt.json")"
+INV_BEFORE="$(sha_file "$STATE/envwire/invariants.json")"
+RW="$(HMD_WIRE_FIXTURE_URL="http://127.0.0.1:8080" hmd rewire envwire 2>&1)"; RCRW=$?
+[ "$RCRW" -eq 0 ] \
+  && ok "\`rewire\` on an installed module exits 0" \
+  || bad "\`rewire\` failed (exit $RCRW): $(printf '%s' "$RW" | tail -2 | tr '\n' ' ')"
+[ "$(jq -r '.wires[0].routed' "$EW" 2>/dev/null)" = "true" ] \
+  && ok "and REWROTE the stale record to what the machine actually says (routed=true)" \
+  || bad "rewire did not refresh the stored record"
+[ "$(sha_file "$STATE/envwire/receipt.json")" = "$RCPT_BEFORE" ] \
+  && ok "the receipt is BYTE-IDENTICAL — nothing was re-fetched, re-consented or re-installed" \
+  || bad "rewire disturbed the install receipt"
+[ "$(sha_file "$STATE/envwire/invariants.json")" = "$INV_BEFORE" ] \
+  && ok "the invariant evidence is BYTE-IDENTICAL — rewire re-ran no invariants" \
+  || bad "rewire disturbed the invariant record"
+S_FIX="$(HMD_WIRE_FIXTURE_URL="http://127.0.0.1:8080" hmd status envwire 2>&1)"
+printf '%s' "$S_FIX" | grep -q 'add-time record says' \
+  && bad "the drift note survived the refresh — rewire did not actually correct the record" \
+  || ok "and the drift note is GONE, because the record now agrees with the machine"
+
+# Idempotent: same machine, run it again, identical verdicts.
+WSUM="$(jq -S '{declared, routed, wires}' "$EW")"
+HMD_WIRE_FIXTURE_URL="http://127.0.0.1:8080" hmd rewire envwire >/dev/null 2>&1
+[ "$(jq -S '{declared, routed, wires}' "$EW")" = "$WSUM" ] \
+  && ok "a second \`rewire\` on an unchanged machine produces identical verdicts (idempotent)" \
+  || bad "rewire is not idempotent — two runs on one machine disagree"
+
+# It refuses what it cannot refresh rather than inventing a record for it.
+PRE_RW="$(tree_sum "$STATE")"
+hmd rewire not-a-module >/dev/null 2>&1 \
+  && bad "rewire accepted a module that is not installed" \
+  || ok "rewire REFUSES a module that is not installed"
+[ "$(tree_sum "$STATE")" = "$PRE_RW" ] \
+  && ok "and left the state tree BYTE-IDENTICAL doing so" || bad "the refused rewire left residue"
+hmd remove envwire >/dev/null 2>&1
 
 echo
 echo "--------------------------------------------------------------------"
