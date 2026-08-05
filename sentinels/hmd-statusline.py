@@ -512,8 +512,14 @@ def _spawn_presence(cwd, handle, verdict, present=True):
     # means the file it writes is complete.
     wall_cache = WALL.wall_cache_path(cwd); wlock = wall_cache + ".lock"
     roster_lib = os.path.join(BIN_DIR, "lib", "repo_roster.py")
+    # `producer=roster_lib` keys the cache on the CODE as well as the clock: a wall cache
+    # written before the roster lib it memoises is COLD on sight, so a roster fix (an identity
+    # merge, a tier change) can never keep serving its pre-fix answer for the rest of the TTL.
+    # Without it the renderer and `repo_roster.py --repo <same repo>` disagreed for 15 minutes
+    # after every roster change — two sources of truth for who is on the wall.
     try:
-        wall_due = (os.access(roster_lib, os.R_OK) and WALL.refresh_due(cwd) and
+        wall_due = (os.access(roster_lib, os.R_OK) and
+                    WALL.refresh_due(cwd, producer=roster_lib) and
                     not (os.path.exists(wlock) and now - os.path.getmtime(wlock) < 120))
     except Exception:
         wall_due = False
@@ -923,6 +929,29 @@ def _wall_self_ids(handle, seed):
     return ids
 
 
+def _not_self(members, ids):
+    """THE ONE MEMBERSHIP GATE — drop the local human from a candidate wall list.
+
+    You are the big hero sigil on the left, never a column on your own wall. Every source of
+    wall members passes through here, because the alternative shipped twice: hmd_wall applied
+    its own self-exclusion, the ledger mirror applied `filter_team`'s, and the live-presence
+    fallback applied NONE. While the wall cache was stale the wall path won and the owner was
+    dropped correctly; the moment repo_roster merged him into a single row the wall path
+    yielded zero members, the ungated fallback took over, and he reappeared on his own wall.
+
+    Matching is on HANDLE **and** HAID. The roster merge can rename a person — the owner's
+    merged row may carry his GitHub login while this render still knows him by the HAID his
+    machine minted — so a handle-only gate lets a renamed self straight back through."""
+    keep = []
+    for m in members or []:
+        if not isinstance(m, dict):
+            continue
+        if any(str(m.get(k) or "") in ids for k in ("user", "name", "handle", "haid")):
+            continue
+        keep.append(m)
+    return keep
+
+
 def _team_members(cwd, ledger, self_ids=None):
     """THE WALL: everyone who works on THIS repo, ranked, each carrying its own tier.
 
@@ -935,20 +964,31 @@ def _team_members(cwd, ledger, self_ids=None):
     a non-git dir, a solo repo) while fixing the case this exists for — a roster of 23 people
     rendering as one lonely sigil.
 
+    THREE SOURCES, ONE GATE. The wall cache, the ledger mirror and the live-presence fallback
+    are three ways to LEARN about a teammate, but membership is decided in exactly one place:
+    _not_self, applied to each candidate list before it can win. A degraded source may show
+    LESS than the roster; it may never show someone the roster excludes. That equality —
+    renderer == roster-minus-self, whatever the source — is asserted in
+    test/heimdall-wall-roster.test.sh section H.
+
     Returns (members, overflow). The members are NOT capped here: team_zone_alloc packs as
     many columns as actually fit and folds the remainder into an explicit `+N`, so the cap is
     made by the code that knows the real width instead of a hardcoded 3."""
+    ids = {str(s).strip() for s in (self_ids or set()) if s and str(s).strip()}
     live = team_presence(cwd)
-    wall, _of = WALL.read_members(cwd, live=live, self_ids=self_ids or set())
-    members = list(ledger.get("team") or [])
+    wall, _of = WALL.read_members(cwd, live=live, self_ids=ids)
+    # Gated BEFORE the comparison: an ungated ledger would count self and make a correct,
+    # self-excluded wall look smaller than it is.
+    members = _not_self(ledger.get("team"), ids)
     overflow = int(ledger.get("team_overflow") or 0)
     if len(wall) > len(members):
         return wall, 0
     if not members:
-        members = [{"user": m.get("name") or "?", "haid": m.get("haid"),
-                    "sigil": "", "branch": m.get("branch") or "",
-                    "state": m.get("verdict") or ""} for m in live[:3]]
-        overflow = max(0, len(live) - 3)
+        others = _not_self([{"user": m.get("name") or "?", "haid": m.get("haid"),
+                             "sigil": "", "branch": m.get("branch") or "",
+                             "state": m.get("verdict") or ""} for m in live], ids)
+        members = others[:3]
+        overflow = max(0, len(others) - 3)
     return members[:3], overflow
 
 
