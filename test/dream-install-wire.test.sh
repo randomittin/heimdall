@@ -116,6 +116,10 @@ CANON="$(cd "$CANON" && pwd -P)"
 cp "$SCHED" "$CANON/bin/heimdall-dream-schedule"
 cp "$DREAM" "$CANON/bin/heimdall-dream"
 cp "$ROOT/bin/lib/real-home.sh" "$CANON/bin/lib/real-home.sh"
+# tcc-paths.sh supplies the protected-path predicate the register path gates its own
+# artifacts on. It fails SAFE when undefined (refuse, exit 6), so a fixture missing this
+# file does not degrade — it stops installing entirely.
+cp "$ROOT/bin/lib/tcc-paths.sh" "$CANON/bin/lib/tcc-paths.sh"
 # The runner is ProgramArguments[0] — the register path stages it outside the repo, so a
 # checkout without it cannot install (by design: a plist pointing at a program that does
 # not exist is the silent-death mode this whole change exists to end).
@@ -144,9 +148,17 @@ fi
 # $1 = plugin_dir; remaining args = extra `export`s (e.g. an opt-out or PATH override).
 run_ensure() {
   local plugin_dir="$1"; shift
+  # HEIMDALL_HOME IS PART OF THE ISOLATION, NOT AN EXTRA.
+  # The register path STAGES the runner into $HEIMDALL_HOME/bin. Redirecting the
+  # LaunchAgents dir, the log and launchctl isolates everything launchd can see but NOT
+  # that staging: unset, HEIMDALL_HOME defaults to the real $HOME/.heimdall, so every run
+  # of this suite overwrote the developer's actual ~/.heimdall/bin/heimdall-dream-runner
+  # with whatever the checkout under test happened to contain. Measured, not theoretical —
+  # it rewrote that exact file during a session. §7-8 below already pass $HMDHOME for this
+  # reason; §2-6 went through this helper and did not.
   ( set +e
     export HEIMDALL_LAUNCH_AGENTS_DIR="$LA" HEIMDALL_DREAM_LOG="$LOG" LAUNCHCTL="$SHIM" \
-           HEIMDALL_INSTALL_SOURCE_ONLY=1 "$@"
+           HEIMDALL_HOME="$HMDHOME" HEIMDALL_INSTALL_SOURCE_ONLY=1 "$@"
     source "$INSTALL_SH"
     ensure_dream_schedule "$plugin_dir" )
 }

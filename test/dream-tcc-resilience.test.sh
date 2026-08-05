@@ -242,6 +242,7 @@ CANON="$WORK/canonical"
 mkdir -p "$CANON/bin/lib"
 cp "$SCHED" "$CANON/bin/heimdall-dream-schedule"
 cp "$ROOT/bin/lib/real-home.sh" "$CANON/bin/lib/real-home.sh"
+cp "$ROOT/bin/lib/tcc-paths.sh" "$CANON/bin/lib/tcc-paths.sh"
 cp "$DREAM" "$CANON/bin/heimdall-dream"
 cp "$RUNNER" "$CANON/bin/heimdall-dream-runner"
 chmod +x "$CANON/bin/heimdall-dream-schedule" "$CANON/bin/heimdall-dream" \

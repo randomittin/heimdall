@@ -90,15 +90,17 @@ export HEIMDALL_HOME="$WORK/heimdall-home"
 # §6 isolates — a refusal there cannot be blamed on different code or a different path
 # spelling, only on worktree-ness.
 #
-# Only the three files the REGISTER path touches are checked in (the helper, the shared
-# real-user lib it sources, and the dream bin it stats and embeds), so both checkouts
-# are instant. heimdall-dream is never EXECUTED from here — §5 drives run-now from
-# $ROOT for that.
+# Only the files the REGISTER path touches are checked in (the helper, the two shared libs
+# it sources, the dream bin it stats and embeds, and the runner it stages), so both
+# checkouts are instant. heimdall-dream is never EXECUTED from here — §5 drives run-now
+# from $ROOT for that. The lib list is not decoration: both libs fail SAFE when undefined,
+# so a fixture missing one refuses to install rather than degrading quietly.
 CANON="$WORK/canonical"
 EPHEM="$WORK/ephemeral"
 mkdir -p "$CANON/bin/lib"
 cp "$CLI" "$CANON/bin/heimdall-dream-schedule"
 cp "$ROOT/bin/lib/real-home.sh" "$CANON/bin/lib/real-home.sh"
+cp "$ROOT/bin/lib/tcc-paths.sh" "$CANON/bin/lib/tcc-paths.sh"
 cp "$DREAM" "$CANON/bin/heimdall-dream"
 # heimdall-dream-runner is ProgramArguments[0]: the register path stages it OUTSIDE the
 # repo (see the TCC note in bin/heimdall-dream-schedule), so it is a fourth file the

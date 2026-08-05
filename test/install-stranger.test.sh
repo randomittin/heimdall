@@ -531,6 +531,11 @@ PROBE_TREE="$(mktemp -d)"; mkdir -p "$PROBE_TREE/bin/lib"
 cp "$RESOLVED_PLUGIN/bin/heimdall" "$PROBE_TREE/bin/heimdall" 2>/dev/null || true
 cp "$RESOLVED_PLUGIN/bin/heimdall-dream-schedule" "$PROBE_TREE/bin/heimdall-dream-schedule" 2>/dev/null || true
 cp "$RESOLVED_PLUGIN/bin/lib/real-home.sh" "$PROBE_TREE/bin/lib/real-home.sh" 2>/dev/null || true
+# bin/lib/tcc-paths.sh is the SECOND shared predicate the register path resolves through
+# (is an artifact path inside a macOS-protected folder?). It fails safe the same way — an
+# undefined predicate REFUSES the install — so omitting it would push §8 onto that branch
+# and turn a refusal-shaped assertion green for entirely the wrong reason.
+cp "$RESOLVED_PLUGIN/bin/lib/tcc-paths.sh" "$PROBE_TREE/bin/lib/tcc-paths.sh" 2>/dev/null || true
 # heimdall-dream is the binary the schedule REGISTERS. §8 needs it present because
 # cmd_install refuses without an executable dream bin, and the plist it writes must
 # name this exact path. It is never executed here — only stat'd and embedded.
@@ -762,8 +767,9 @@ plant_plist() { printf '<plist>nightly</plist>\n' > "$1/LaunchAgents/com.heimdal
 if [ ! -x "$PROBE_TREE/bin/heimdall" ] || [ ! -x "$PROBE_TREE/bin/heimdall-dream-schedule" ] \
    || [ ! -f "$PROBE_TREE/bin/lib/real-home.sh" ] || [ ! -x "$PROBE_TREE/bin/heimdall-dream" ] \
    || [ ! -x "$PROBE_TREE/bin/heimdall-dream-runner" ] \
+   || [ ! -f "$PROBE_TREE/bin/lib/tcc-paths.sh" ] \
    || [ ! -f "$PROBE_TREE/install.sh" ]; then
-  bad "launchd-guard probes unavailable — installed tree lacked heimdall / heimdall-dream-schedule / heimdall-dream / heimdall-dream-runner / bin/lib/real-home.sh / install.sh"
+  bad "launchd-guard probes unavailable — installed tree lacked heimdall / heimdall-dream-schedule / heimdall-dream / heimdall-dream-runner / bin/lib/real-home.sh / bin/lib/tcc-paths.sh / install.sh"
 else
 
 # (7f) REAL-USER UNINSTALL REMOVES THE NIGHTLY LAUNCHAGENT.
@@ -1062,6 +1068,7 @@ cp "$PROBE_TREE/bin/heimdall-dream"          "$WT_MAIN/bin/heimdall-dream" 2>/de
 # pass for the wrong reason and stop proving anything about the incident.
 cp "$PROBE_TREE/bin/heimdall-dream-runner"   "$WT_MAIN/bin/heimdall-dream-runner" 2>/dev/null || true
 cp "$PROBE_TREE/bin/lib/real-home.sh"        "$WT_MAIN/bin/lib/real-home.sh" 2>/dev/null || true
+cp "$PROBE_TREE/bin/lib/tcc-paths.sh"        "$WT_MAIN/bin/lib/tcc-paths.sh" 2>/dev/null || true
 chmod +x "$WT_MAIN/bin/heimdall-dream-schedule" "$WT_MAIN/bin/heimdall-dream" \
          "$WT_MAIN/bin/heimdall-dream-runner" 2>/dev/null || true
 git -C "$WT_MAIN" init -q >/dev/null 2>&1
