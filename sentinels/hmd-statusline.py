@@ -444,6 +444,39 @@ def identity(cwd, fallback, session_id=""):
         return cached   # fork failed → reuse last-known-good (== team-self), never $USER
     return _sigil_override_seed(fallback), fallback   # cold + broken fork → transient, UNCACHED
 
+_ROSTER_LIB = os.path.join(BIN_DIR, "lib", "repo_roster.py")
+
+
+def _github_handle(cwd, fallback):
+    """The GitHub login the owner is publicly known by, for the Row1 identity — else
+    `fallback` (the identity handle Row1 showed before).
+
+    `rj` is a git-config nickname. `randomittin` is the name on his commits, on his
+    teammates' walls and on every roster row — so the header was introducing him under the
+    one name that appears nowhere else in the product.
+
+    ONE RESOLVER, REUSED. repo_roster.local_github_login() already answers this (the
+    git-config / HAID / `gh api user` chain, cached positively and negatively), and the
+    roster exists so that there is a SINGLE answer to "who am I". Re-deriving it here would
+    put a second chain directly above the wall the first one builds, free to disagree with
+    it — so this asks, and does not re-implement.
+
+    CACHE READS ONLY (`spawn=False`). This runs on every keystroke: it may not probe `gh`,
+    and may not even fork the roster's detached refresh, because the wall refresh child
+    already warms this exact cache file — the signal simply lands on a later prompt. A
+    missing `gh`, an unauthenticated or rate-limited one, no network, and a cold cache all
+    resolve to '' and fall back, so Row1 degrades to the previous handle and is NEVER blank.
+    Never raises: a broken or absent roster lib is just another way to have no signal."""
+    try:
+        spec = importlib.util.spec_from_file_location("hmd_repo_roster", _ROSTER_LIB)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        login = mod.local_github_login(cwd, spawn=False)
+    except Exception:
+        return fallback
+    return login.strip() if isinstance(login, str) and login.strip() else fallback
+
+
 def _sigil_override_seed(seed):
     """Honor `hmd sigil set <hero>` (unlocked after >=5 runs — matches the heimdall-sigil CLI
     threshold); else the seed unchanged."""
@@ -1849,7 +1882,12 @@ def main():
     # tier-narrowed Row1 drops `· Opus 4.8` / `heimdall:branch` as whole units — never a
     # mid-token `…` (Spec v2 §2). Reserve 1c so the two runs never abut with no gap.
     avail1 = max(0, content_budget - vis(right1) - 1)
-    left1 = row1_left(handle, model, repo_seg, cseg, avail1)
+    # DISPLAY ONLY. `handle` stays the identity everything else is keyed on — the presence
+    # beat published to teammates and the self-exclusion that keeps the owner off his own
+    # wall — because those match on what the ledger and the roster already know him as.
+    # Row1 is the one place a human is being INTRODUCED, so it is the one place that spends
+    # a lookup on the name that human answers to in public.
+    left1 = row1_left(_github_handle(cwd, handle), model, repo_seg, cseg, avail1)
 
     # ── Row2 — the context gauge (CTX%·↓tokens on the fill, $cost on the track end) ──
     # narrow → bar-only (labels off). render_gauge splices the labels inside the bar's cell
