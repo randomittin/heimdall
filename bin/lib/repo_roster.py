@@ -122,12 +122,44 @@
 #   the main checkout and ...-fa94 from a worktree). Requiring hash4 would refuse exactly the
 #   case this exists to merge, so self_device pins human+machine and deliberately ignores it.
 #
+#   self_email  3  a git identity that shares BOTH the exact email local-part AND an exact
+#                  display name with the LOCAL git identity — the owner's SECOND ADDRESS.
+#                  Measured: he commits as `rj@runheimdall.dev` (which IS the anchor, so plain
+#                  email equality claims it) and also as `rj@superpe.co`, both signed `RJ`.
+#                  That second pair scored ZERO signals — not a weight-floor miss, zero — because
+#                  a TWO-CHARACTER local-part falls below every length floor at once: localpart
+#                  needs >= 3, name needs >= 4, haid_human reads haid_humans which the anchor
+#                  never has, and self_device needs a HAID the git row does not carry. So the
+#                  wall rendered him TWICE, `rj` online plus `rj~2` contributed — the collision
+#                  disambiguator working correctly on what it believed was a second person.
+#
+#   WHY A SHORT TOKEN IS SAFE HERE AND NOWHERE ELSE. The length floors exist because a short
+#   token shared by two STRANGERS is coincidence. This class never compares two strangers: one
+#   side is the SELF ANCHOR, so the question is not "are these two people the same?" but "is this
+#   identity MINE?" — and the machine can answer that from `git config`. The two conjuncts are
+#   drawn from DIFFERENT user-configured fields (the address and the display name) and must BOTH
+#   match EXACTLY, so a colliding local-part alone never folds and prefix/similarity matching is
+#   admitted at no length. Generic role local-parts (dev@, admin@, ...) are excluded exactly as
+#   they are from localpart/haid_human, so a shared role account still swallows nobody.
+#   Measured against the pair that MUST stay split: `Ravikiran2904` under
+#   `143786551+Ravikiran2904@users.noreply.github.com` versus `Ravikiranuo` under
+#   `ravikiran@uo.app` differ on BOTH conjuncts (locals set() vs {'ravikiran'}; name_folds
+#   {'ravikiran2904'} vs {'ravikiranuo'}), so exact-local-part AND exact-name refuses them
+#   independently of the weight logic — and neither is the anchor, so the class never even runs.
+#
+#   BOTH anchored classes score the anchor's OWN first-party facts (self_machine, self_humans,
+#   self_locals, self_name_folds), never the cluster's `locals`/`name_folds`. That distinction is
+#   load-bearing: a cluster's observed identity sets GROW as it absorbs rows, so scoring against
+#   them would quietly let a self-anchored class reach facts this machine never asserted, and its
+#   reach would depend on merge ORDER. The self_* keys can only ever come from self_fragment().
+#
 # FOUR PROPERTIES THIS MUST NOT BREAK, each enforced structurally rather than by convention:
 #
-#   1. NOBODY ELSE'S RULE MOVES. self_device fires ONLY when one side is the anchor (kind
-#      "self"), which collect() creates exactly once. Every other pair is scored by the
-#      untouched rule above, so `ravikiran2904` / `ravikiranuo` still REFUSE at weight 2 and
-#      stay two rows. No weight, floor, or class used by anyone else changed.
+#   1. NOBODY ELSE'S RULE MOVES. self_device and self_email fire ONLY when one side is the
+#      anchor (kind "self"), which collect() creates exactly once. Every other pair is scored by
+#      the untouched rule above, so `ravikiran2904` / `ravikiranuo` still REFUSE at weight 2 and
+#      stay two rows. No weight, floor, or class used by anyone else changed — and no floor was
+#      RELAXED to close the second-address case, because relaxing one would have moved everyone.
 #   2. THE ANCHOR CANNOT INVENT A PERSON. It contributes no "source" (_SOURCE_ORDER has no
 #      "self"), so a cluster it never merged into has EMPTY sources and rows() drops it. An
 #      owner with no presence, no commits in the window and no collaborator entry adds no row.
@@ -513,6 +545,12 @@ def self_fragment(repo, *, cache_dir=None, blocking=None, now=None):
     frag = fragment("self", email=(email or None), name=(name or None), login=(login or None))
     frag["self_humans"] = humans
     frag["self_machine"] = machine
+    # The two halves of self_email, as their OWN first-party keys (see _SELF_SET_KEYS). Kept
+    # raw rather than slugged so the local-part compares byte-equal against another address's
+    # local-part, and role addresses are dropped here so the class simply cannot fire on them.
+    folded = fold(name)
+    frag["self_locals"] = {local} if local and local not in _GENERIC_LOCALPARTS else set()
+    frag["self_name_folds"] = {folded} if folded and folded not in _GENERIC_NAMES else set()
     return _derive(frag)
 
 
@@ -626,6 +664,8 @@ def signals(a, b, known_logins=frozenset()):
         found.append(("login", 3))
     if _self_device_match(a, b) or _self_device_match(b, a):
         found.append(("self_device", 3))
+    if _self_email_alias(a, b) or _self_email_alias(b, a):
+        found.append(("self_email", 3))
     known = {fold(l) for l in known_logins if fold(l)}
     for left, right in ((a, b), (b, a)):
         right_logins = {fold(l) for l in right["logins"]} | known
@@ -717,6 +757,29 @@ def _self_device_match(anchor, other):
     return False
 
 
+def _self_email_alias(anchor, other):
+    """True iff `anchor` is the SELF anchor and `other` is the SAME human under a SECOND EMAIL —
+    the exact email local-part AND an exact display name BOTH shared with the local git identity.
+
+    Directional on purpose, exactly like _self_device_match: it can only fire when one side is
+    the local anchor, so it adds no edge between any two OBSERVED identities and therefore cannot
+    merge two teammates. Two strangers who happen to share a short address and a display name are
+    still two rows; only the machine's own `git config` can pull an identity into the local one.
+
+    NO LENGTH FLOOR, deliberately — being short is the entire defect. `rj@runheimdall.dev` and
+    `rj@superpe.co`, both signed `RJ`, are one human whose two-character local-part sits below
+    every floor in signals() simultaneously. The floors guard against a short token shared by two
+    STRANGERS; this comparison has no stranger in it. Both conjuncts come from DIFFERENT
+    user-configured fields and must match exactly, so an address collision alone never folds."""
+    if "self" not in anchor["kinds"]:
+        return False
+    locals_ = anchor.get("self_locals") or set()
+    folds = anchor.get("self_name_folds") or set()
+    if not locals_ or not folds:
+        return False
+    return bool(locals_ & other["locals"]) and bool(folds & other["name_folds"])
+
+
 def _name_subset(a, b):
     """One display name's tokens are a PROPER subset of the other's, sharing the first token.
 
@@ -757,6 +820,12 @@ def would_merge(a, b, known_logins=frozenset()):
 
 _SET_KEYS = ("kinds", "handles", "haids", "emails", "names", "logins", "logins_raw")
 
+# The anchor's FIRST-PARTY facts, held apart from the OBSERVED identity sets above. A cluster's
+# `locals` / `name_folds` GROW as it absorbs rows, so a self-anchored class scored against those
+# would reach facts this machine never asserted and its reach would depend on merge ORDER. Only
+# self_fragment() ever writes these, which is what keeps self_device/self_email honest.
+_SELF_SET_KEYS = ("self_humans", "self_locals", "self_name_folds")
+
 
 def _clone(frag):
     """A deep-enough copy: every identity set is fresh so absorbing never mutates the caller's
@@ -764,7 +833,8 @@ def _clone(frag):
     out = dict(frag)
     for key in _SET_KEYS:
         out[key] = set(frag.get(key) or ())
-    out["self_humans"] = set(frag.get("self_humans") or ())
+    for key in _SELF_SET_KEYS:
+        out[key] = set(frag.get(key) or ())
     out["evidence"] = list(frag.get("evidence") or ())
     return _derive(out)
 
@@ -773,10 +843,12 @@ def _absorb(target, other, evidence):
     """Fold `other` into `target`, keeping the freshest timestamps and the union of identities."""
     for key in _SET_KEYS:
         target[key] = set(target.get(key) or ()) | set(other.get(key) or ())
-    # The anchor's device facts survive the fold in EITHER direction, so the cluster stays
-    # recognisable as "me" no matter which side unify() happened to absorb into.
-    target["self_humans"] = set(target.get("self_humans") or ()) | set(other.get("self_humans")
-                                                                      or ())
+    # The anchor's first-party facts survive the fold in EITHER direction, so the cluster stays
+    # recognisable as "me" no matter which side unify() happened to absorb into. collect()
+    # appends the anchor LAST, so it is normally the side that gets popped and folded INTO an
+    # observed row — without this the owner's SECOND address could never be claimed afterwards.
+    for key in _SELF_SET_KEYS:
+        target[key] = set(target.get(key) or ()) | set(other.get(key) or ())
     target["self_machine"] = target.get("self_machine") or other.get("self_machine") or ""
     target["online"] = bool(target["online"]) or bool(other["online"])
     target["last_seen_ts"] = _max_ts(target["last_seen_ts"], other["last_seen_ts"])
