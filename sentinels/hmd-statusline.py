@@ -37,6 +37,7 @@ Ships via hooks/statusline.sh → python3 ${CLAUDE_PLUGIN_ROOT}/sentinels/hmd-st
 Modes:
   --widget   emit only the watchman+verdict segment (ccstatusline coexistence)
 """
+import hashlib
 import re as _re_drain
 import sys, os, json, time, re, hashlib, importlib.util, subprocess, shlex, contextlib
 
@@ -1317,6 +1318,33 @@ def _drain_hue(rows):
     return [_RGB_RE.sub(_drain_rgb, row) for row in rows]
 
 
+# ── a stable hero seed for a teammate with no HAID ────────────────────────────────────────
+# hmd_sigil auto-assigns one of 190 heroes ONLY to a real `haid:human.machine-hash4` seed;
+# a bare handle stays on the curated/animal path, which is a 2-SHADE silhouette. That rule
+# is deliberate — it keeps every existing golden untouched — so this does not change it.
+#
+# But a wall built from git history is mostly people with NO HAID (they have never run hmd),
+# and 2 shades means the only thing distinguishing them was hue. Draining that hue for an
+# absent teammate then collapsed the whole strip into identical grey blocks: eight teammates,
+# one face. Measured: every git-derived member returned shades=2.
+#
+# So a member without a HAID gets a DETERMINISTIC synthetic one, shaped to satisfy the same
+# regex, derived from their handle plus the project so the same person is the same hero on
+# the same wall forever. It is never persisted, never sent anywhere, and never treated as an
+# identity — it exists only to pick a face.
+def _hero_seed(member, project=""):
+    haid = (member.get("haid") or "").strip()
+    if haid:
+        return haid
+    handle = str(member.get("user") or member.get("handle") or "").strip().lower()
+    if not handle:
+        return member.get("sigil") or "?"
+    slug = _re_drain.sub(r"[^a-z0-9-]", "", handle) or "x"
+    scope = _re_drain.sub(r"[^a-z0-9-]", "", str(project or "wall").lower()) or "wall"
+    h4 = hashlib.sha256(("%s@%s" % (slug, scope)).encode()).hexdigest()[:4]
+    return "haid:%s.%s-%s" % (slug, scope, h4)
+
+
 def team_columns(members, team_w, overflow, now, states=True, self_branch=""):
     """Render `members` into the four team-zone row strings — each EXACTLY `team_w` visible
     cells. Rows 1–2: the 8-cell eye_strip (natural palette, eyes visible) riding the RIGHT
@@ -1334,7 +1362,7 @@ def team_columns(members, team_w, overflow, now, states=True, self_branch=""):
     labels = wall_labels([m.get("user") for m in members], LAYOUT.TEAM_STRIP_W)
     tops = []; bots = []; names = []; sts = []
     for i, m in enumerate(members):
-        seed = m.get("haid") or m.get("user") or m.get("sigil") or "?"
+        seed = _hero_seed(m)
         away = _drained(m)
         # An AWAY teammate's sigil renders in the MONO tier: the identity hue — the thing that
         # reads as "present" — drains out of their column, while the glyph SHAPE still says who
@@ -1409,7 +1437,7 @@ def team_dots(members, cap=TEAM_DOT_CAP):
     who are NOT here."""
     dots = []
     for m in members[:cap]:
-        seed = m.get("haid") or m.get("user") or m.get("sigil") or "?"
+        seed = _hero_seed(m)
         tier = _tier_of(m)
         if tier != WALL.PRESENT_TIER:
             dots.append(f"{FAINT}{TEAM_DOT.get(tier, '·')}{X}")

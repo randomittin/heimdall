@@ -45,6 +45,23 @@ BIN_DIR = os.path.dirname(os.path.realpath(__file__))
 SELF_IMPROVE = os.path.join(BIN_DIR, "heimdall-self-improve")
 ISSUE_LOOP = os.path.join(BIN_DIR, "heimdall-issue-loop")
 
+# ── the relocated state root (what makes an unattended 03:00 run possible at all) ──
+#
+# macOS TCC denies a LaunchAgent every read under ~/Downloads, ~/Documents and ~/Desktop,
+# and it denies the JOB rather than the program — measured in 245ede5, a probe agent
+# living outside the protected tree was refused the repo exactly as a repo-resident script
+# was. So dream keeps its state under $HEIMDALL_HOME, which is not gated and is measured
+# writable from launchd, and the nightly run then touches nothing under the repo.
+#
+# The import is GUARDED and the fallback is the old repo-relative behaviour. dream must
+# still run on a checkout whose bin/lib was not staged alongside it; degrading to the
+# path that has always worked is strictly better than refusing to run.
+sys.path.insert(0, os.path.join(BIN_DIR, "lib"))
+try:
+    import dream_data as _dd
+except ImportError:
+    _dd = None
+
 # ── THE SAMPLE-SIZE FLOOR (not negotiable by a flag) ──────────────────────────
 #
 # Heimdall's comparable scalar is a PROPORTION (first-try acceptance pass-rate),
@@ -98,20 +115,157 @@ def _die(msg, code=3):
     raise SystemExit(code)
 
 
+def _state_dir(repo):
+    """Where the self-improve loop reads and writes its four state files. The relocated
+    root when it can be had, else the repo's own .planning — see _dd.resolve_planning."""
+    if _dd is None:
+        return os.path.join(repo, ".planning")
+    try:
+        return _dd.resolve_planning(repo)
+    except OSError:
+        return os.path.join(repo, ".planning")
+
+
+def _usable_dir(path):
+    """Can this directory be written RIGHT NOW? Asked of the OS rather than inferred from
+    mode bits, because a TCC denial is invisible to the bits."""
+    if _dd is not None:
+        return _dd.writable_dir(path)
+    return os.path.isdir(path) and os.access(path, os.W_OK | os.X_OK)
+
+
+def _relocated_report_dir(repo):
+    """The relocated report directory, or None when there is no relocated root to use."""
+    if _dd is None:
+        return None
+    try:
+        return os.path.join(_dd.planning_dir(repo), "dream")
+    except OSError:
+        return None
+
+
+def _report_dirs(repo):
+    """Every directory this run should drop the morning report into, MOST HUMAN-VISIBLE
+    FIRST. The head of the list is what `where` prints and what the run reports as its
+    path; the tail is written too, best-effort.
+
+    THE REPO COPY IS NOT OPTIONAL WHEN IT IS REACHABLE. The report is the artifact a human
+    reads and git tracks, and .planning/dream is where the existing ones already live. An
+    interactive run must keep landing there, or this "fix" would quietly relocate the one
+    output the owner actually looks at. The relocated copy is what the 03:00 job can write
+    when the repo is denied — so a normal terminal run writes BOTH, and the nightly run
+    writes only the one it can reach."""
+    dirs = []
+    repo_dir = os.path.join(repo, ".planning", "dream")
+    if _usable_dir(os.path.dirname(repo_dir)) or _usable_dir(repo):
+        dirs.append(repo_dir)
+    relocated = _relocated_report_dir(repo)
+    if relocated and relocated not in dirs:
+        dirs.append(relocated)
+    if not dirs:
+        dirs.append(repo_dir)
+    return dirs
+
+
 def _report_path(repo, date, out):
     if out:
         return out
-    return os.path.join(repo, ".planning", "dream", "%s.md" % date)
+    return os.path.join(_report_dirs(repo)[0], "%s.md" % date)
+
+
+def _write_report(repo, date, out, body):
+    """Write the report everywhere it can go. Returns (primary_path, all_written).
+
+    A failure to write ONE destination is not a failed run — under TCC the repo copy
+    simply cannot be made, and that is the entire scenario this exists for. The run fails
+    only if NOTHING could be written, which is a genuine loss of the artifact."""
+    if out:
+        targets = [out]
+    else:
+        targets = [os.path.join(d, "%s.md" % date) for d in _report_dirs(repo)]
+
+    written = []
+    last_exc = None
+    for path in targets:
+        try:
+            parent = os.path.dirname(path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(body)
+            written.append(path)
+        except OSError as exc:
+            last_exc = exc
+
+    if not written:
+        _die("cannot write the morning report to %s: %s"
+             % (", ".join(targets), last_exc))
+    return written[0], written
+
+
+def _backfill_reports(repo):
+    """Copy reports the SCHEDULED run could only write to the relocated root back into
+    <repo>/.planning/dream, so they reach git and the human's usual place.
+
+    This is what keeps the nightly artifact from being stranded. The 03:00 job cannot
+    write the repo; the next terminal session can, and it holds the TCC grant. Copy-only
+    and never overwrite: a report already in the repo is authoritative, and this must
+    never be able to damage one. Returns the count copied."""
+    src_dir = _relocated_report_dir(repo)
+    if not src_dir:
+        return 0
+    dst_dir = os.path.join(repo, ".planning", "dream")
+    try:
+        if not os.path.isdir(src_dir):
+            return 0
+        if not (_usable_dir(dst_dir) or _usable_dir(os.path.dirname(dst_dir))):
+            return 0
+        os.makedirs(dst_dir, exist_ok=True)
+        names = sorted(os.listdir(src_dir))
+    except OSError:
+        return 0
+
+    copied = 0
+    for name in names:
+        if not name.endswith(".md"):
+            continue
+        dst = os.path.join(dst_dir, name)
+        if os.path.exists(dst):
+            continue
+        try:
+            with open(os.path.join(src_dir, name), "r", encoding="utf-8") as fh:
+                blob = fh.read()
+            with open(dst, "w", encoding="utf-8") as fh:
+                fh.write(blob)
+            copied += 1
+        except OSError:
+            continue
+    return copied
 
 
 # ── reuse: shell out to the sibling self-improve bin (the keep-gate is REUSED, not
 #    reimplemented). Returns parsed JSON stdout; None on a non-zero exit. ──────────
 
+def _child_env(repo):
+    """The environment every sibling runs under.
+
+    HEIMDALL_PLANNING_DIR points self-improve at the relocated state dir — it is that
+    bin's single path choke point, so one variable moves all four of its state files at
+    once. HEIMDALL_HOME is asserted for the same reason one level out: heimdall-issue-loop
+    defaults its queue to <repo>/.heimdall, which under launchd is inside the denied tree.
+    Both are set only for the children, never exported into this process."""
+    env = dict(os.environ)
+    env["HEIMDALL_PLANNING_DIR"] = _state_dir(repo)
+    env.setdefault("HEIMDALL_HOME", _dd.heimdall_home() if _dd is not None
+                   else os.path.join(os.path.expanduser("~"), ".heimdall"))
+    return env
+
+
 def _si(repo, *args):
     if not os.path.exists(SELF_IMPROVE):
         _die("sibling bin not found: %s" % SELF_IMPROVE)
     cmd = [sys.executable, SELF_IMPROVE, "--repo", repo] + list(args)
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    proc = subprocess.run(cmd, capture_output=True, text=True, env=_child_env(repo))
     if proc.returncode != 0:
         return {"_error": proc.stderr.strip() or proc.stdout.strip(),
                 "_rc": proc.returncode}
@@ -130,7 +284,7 @@ def _issue_queue(repo):
     if not os.path.exists(ISSUE_LOOP):
         return None
     proc = subprocess.run([sys.executable, ISSUE_LOOP, "status", "--repo", repo],
-                          capture_output=True, text=True)
+                          capture_output=True, text=True, env=_child_env(repo))
     if proc.returncode != 0:
         return None
     try:
@@ -206,14 +360,17 @@ def cmd_run(args):
                      precheck_hyps, queue, kept, discarded, validated, started,
                      args.min_delta, honest_empty, min_samples, floor_enforced)
 
-    path = _report_path(repo, date, args.out)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as fh:
-        fh.write(report)
+    path, written = _write_report(repo, date, args.out, report)
+    # Reports the 03:00 job could only strand in the relocated root are pulled back into
+    # the repo now, while this process holds the grant that the LaunchAgent never has.
+    backfilled = _backfill_reports(repo) if not args.out else 0
 
     summary = {
         "date": date,
         "report_path": path,
+        "report_paths": written,
+        "state_dir": _state_dir(repo),
+        "backfilled_reports": backfilled,
         "mode": args.mode,
         "honest_empty": honest_empty,
         "min_samples": min_samples,

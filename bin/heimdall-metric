@@ -129,6 +129,40 @@ def _metrics_path(repo):
     return os.path.join(planning, "metrics.jsonl")
 
 
+def _relocated_metrics_path(repo):
+    """The SECOND target: dream's relocated state dir under $HEIMDALL_HOME.
+
+    WHY THIS EMITTER WRITES TWICE. The consumer (bin/heimdall-dream, nightly, via
+    launchd) cannot read a repo inside ~/Downloads — macOS TCC denies the JOB no matter
+    where its program lives — so it reads a relocated corpus under $HEIMDALL_HOME
+    instead. An emitter that wrote only into the repo would keep filling a file the
+    nightly job is structurally unable to open: the fuel line reconnected to the wrong
+    tank. Writing both keeps the repo copy accumulating in git exactly as before AND
+    keeps the scheduled consumer supplied.
+
+    Returns None when the relocated root is unavailable or is the same file as the repo
+    target, so the caller writes once. An explicit HEIMDALL_PLANNING_DIR is an operator
+    pinning the path deliberately and is honoured as the only target."""
+    if os.environ.get("HEIMDALL_PLANNING_DIR"):
+        return None
+    try:
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib"))
+        import dream_data
+    except Exception:
+        return None
+    try:
+        # seed=False: this is the hot telemetry path, called once per task. Copying the
+        # corpus here would put a file copy inside a call that promises to be one write.
+        # bin/heimdall-dream seeds on the read side, which is where a stale corpus would
+        # actually be noticed.
+        dest = dream_data.ensure_root(repo, seed=False)
+    except Exception:
+        return None
+    if not dest:
+        return None
+    return os.path.join(dest, "metrics.jsonl")
+
+
 def _int(value, name, lo=0):
     try:
         n = int(value)
@@ -247,14 +281,29 @@ def cmd_task(args):
             return 2
         return 0  # never fail a task over telemetry
 
-    path = _metrics_path(args.repo)
-    try:
-        if not os.path.isdir(os.path.dirname(path)):
-            raise OSError("metrics directory absent: %s" % os.path.dirname(path))
-        _append(path, raw)
-    except OSError as exc:
+    # BOTH targets are attempted, and the record counts as emitted if EITHER lands. The
+    # two failure modes are opposite and both survivable: under launchd the repo is
+    # TCC-denied while $HEIMDALL_HOME is writable; on a machine with no $HOME to speak of
+    # the reverse. Requiring both would turn either into a total loss of the observation.
+    targets = [_metrics_path(args.repo)]
+    relocated = _relocated_metrics_path(args.repo)
+    if relocated and relocated not in targets:
+        targets.append(relocated)
+
+    wrote = 0
+    last_exc = None
+    for path in targets:
+        try:
+            if not os.path.isdir(os.path.dirname(path)):
+                raise OSError("metrics directory absent: %s" % os.path.dirname(path))
+            _append(path, raw)
+            wrote += 1
+        except OSError as exc:
+            last_exc = exc
+
+    if wrote == 0:
         if args.strict:
-            sys.stderr.write("error: metrics write failed: %s\n" % exc)
+            sys.stderr.write("error: metrics write failed: %s\n" % last_exc)
             return 3
         return 0  # a metrics write failing is a no-op, never the user's problem
     return 0
