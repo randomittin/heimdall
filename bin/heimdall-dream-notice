@@ -1,0 +1,192 @@
+#!/usr/bin/env bash
+# heimdall-dream-notice — surface a FAILING nightly /dream where the operator will see it.
+#
+# THE BUG THIS FIXES IS THE SILENCE, NOT THE DENIAL.
+#   The nightly dream failed ten consecutive nights. It wrote twelve error lines into
+#   ~/.heimdall/logs/dream.log and nothing else, and the owner found out only by opening
+#   that file by hand. A log nobody reads is not a failure signal — it is the absence of
+#   one. Whatever the underlying cause (TCC, a deleted checkout, a broken dream run), the
+#   next failure has to arrive in front of the operator without being asked for.
+#
+#   This runs from the SessionStart hook and prints to the session. It is FAST (a few
+#   file reads, no dream run, no network), DEPENDENCY-FREE (no jq), and ALWAYS exits 0 —
+#   a monitor that can break the thing it monitors is a worse bug than the one it reports.
+#
+# WHEN IT SPEAKS
+#   • the last scheduled attempt recorded blocked/error and no report has superseded it
+#   • or the newest report is >= --min-gap days old (default 2)
+#   The second is the BACKSTOP for the case that actually happened: the job died so early
+#   that nothing of ours ran to record a status. The artifact's own absence is the signal.
+#
+# WHEN IT STAYS QUIET
+#   • no schedule installed and no status recorded (nothing to be silent about)
+#   • today's report exists (self-clearing — a caught-up dream stops the nagging with no
+#     acknowledge step, because the artifact IS the acknowledgement)
+#
+# USAGE
+#   heimdall-dream-notice [--repo DIR] [--status FILE] [--min-gap N] [--json]
+
+set -u
+
+REPO=""
+STATUS=""
+MIN_GAP=2
+JSON=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --repo)    REPO="${2:-}"; shift 2 ;;
+    --status)  STATUS="${2:-}"; shift 2 ;;
+    --min-gap) MIN_GAP="${2:-2}"; shift 2 ;;
+    --json)    JSON=1; shift ;;
+    --help|-h) sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) shift ;;
+  esac
+done
+
+[ -n "$REPO" ] || REPO="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+HEIMDALL_HOME="${HEIMDALL_HOME:-$HOME/.heimdall}"
+[ -n "$STATUS" ] || STATUS="${HEIMDALL_DREAM_STATUS:-$HEIMDALL_HOME/dream-status.json}"
+LA_DIR="${HEIMDALL_LAUNCH_AGENTS_DIR:-$HOME/Library/LaunchAgents}"
+PLIST="$LA_DIR/com.heimdall.dream.plist"
+LOG="${HEIMDALL_DREAM_LOG:-$HEIMDALL_HOME/logs/dream.log}"
+case "$MIN_GAP" in ''|*[!0-9]*) MIN_GAP=2 ;; esac
+
+emit_json() { # <alert> <reason> <gap> <last>
+  printf '{"alert":%s,"reason":"%s","gap_days":%s,"last_report":"%s","repo":"%s","status_file":"%s"}\n' \
+    "$1" "$2" "$3" "$4" "$REPO" "$STATUS"
+}
+
+quiet() {
+  [ "$JSON" = 1 ] && emit_json false "${1:-healthy}" "${2:--1}" "${3:-}"
+  exit 0
+}
+
+# ── a schedule that was never installed has nothing to report ────────────────────
+if [ ! -f "$PLIST" ] && [ ! -f "$STATUS" ]; then
+  quiet not-scheduled
+fi
+
+# ── read the recorded status (flat JSON, one field per line — no jq on any path) ──
+json_field() {
+  [ -f "$STATUS" ] || return 0
+  sed -n "s/^[[:space:]]*\"$1\"[[:space:]]*:[[:space:]]*\"\(.*\)\"[[:space:]]*,\{0,1\}[[:space:]]*\$/\1/p" \
+    "$STATUS" 2>/dev/null | head -1
+}
+
+S_RESULT="$(json_field result)"
+S_REASON="$(json_field reason)"
+S_DATE="$(json_field date)"
+S_TS="$(json_field ts)"
+S_DENIED="$(json_field denied_path)"
+S_DETAIL="$(json_field detail)"
+S_DREAM="$(json_field dream)"
+
+# ── newest report on disk ────────────────────────────────────────────────────────
+DREAM_DIR="$REPO/.planning/dream"
+LAST=""
+if [ -d "$DREAM_DIR" ]; then
+  LAST="$(ls -1 "$DREAM_DIR" 2>/dev/null \
+    | sed -n 's/^\([0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]\)\.md$/\1/p' \
+    | sort | tail -1)"
+fi
+
+TODAY="$(date -u +%Y-%m-%d)"
+
+to_epoch() {
+  [ -n "$1" ] || return 1
+  date -u -j -f "%Y-%m-%d %H:%M:%S" "$1 00:00:00" +%s 2>/dev/null \
+    || date -u -d "$1" +%s 2>/dev/null
+}
+
+GAP=-1
+if [ -n "$LAST" ]; then
+  L_EPOCH="$(to_epoch "$LAST" || true)"
+  T_EPOCH="$(to_epoch "$TODAY" || true)"
+  if [ -n "$L_EPOCH" ] && [ -n "$T_EPOCH" ]; then
+    GAP=$(( (T_EPOCH - L_EPOCH) / 86400 ))
+    [ "$GAP" -lt 0 ] && GAP=0
+  fi
+fi
+
+# ── decide ───────────────────────────────────────────────────────────────────────
+# A recorded failure is superseded the moment a report dated on/after it exists: the
+# dream was caught up, so there is nothing left to tell the operator.
+ALERT=0
+KIND=""
+case "$S_RESULT" in
+  blocked|error)
+    if [ -z "$LAST" ] || [ -z "$S_DATE" ] || [ "$LAST" \< "$S_DATE" ]; then
+      ALERT=1; KIND="${S_REASON:-$S_RESULT}"
+    fi
+    ;;
+esac
+
+if [ "$ALERT" = 0 ] && [ -n "$LAST" ] && [ "$GAP" -ge "$MIN_GAP" ]; then
+  ALERT=1; KIND="stale-artifact"
+fi
+
+[ "$ALERT" = 1 ] || quiet healthy "$GAP" "$LAST"
+
+if [ "$JSON" = 1 ]; then
+  emit_json true "$KIND" "$GAP" "$LAST"
+  exit 0
+fi
+
+# ── speak ────────────────────────────────────────────────────────────────────────
+p() { printf '[heimdall] %s\n' "$*"; }
+
+REMEDY="$REPO/bin/heimdall-dream"
+[ -x "$REMEDY" ] || REMEDY="${S_DREAM:-heimdall-dream}"
+
+echo ""
+if [ "$GAP" -ge 0 ]; then
+  p "NIGHTLY DREAM IS NOT RUNNING — no report for $GAP days."
+else
+  p "NIGHTLY DREAM IS NOT RUNNING — no report has ever been produced."
+fi
+[ -n "$LAST" ] && p "    last report : .planning/dream/$LAST.md"
+
+if [ -n "$S_RESULT" ] && [ "$S_RESULT" != ok ]; then
+  p "    last attempt: ${S_TS:-unknown} — $S_RESULT (${S_REASON:-unspecified})"
+  [ -n "$S_DENIED" ] && p "    denied path : $S_DENIED"
+  [ -n "$S_DETAIL" ] && p "    os error    : $S_DETAIL"
+fi
+
+case "$KIND" in
+  tcc-denied)
+    p "    cause       : macOS TCC denies the 03:00 LaunchAgent access to the folder"
+    p "                  holding this repo (~/Downloads, ~/Documents and ~/Desktop are"
+    p "                  protected). A LaunchAgent carries no TCC grant, so the job is"
+    p "                  refused before dream can start — it cannot even open its own"
+    p "                  script. Moving the script or the output does NOT fix this."
+    p "    run now     : $REMEDY --repo $REPO run"
+    p "                  (a terminal session HOLDS the grant, so this works today)"
+    p "    unattended  : to restore true 03:00 runs, either move the repo out of the"
+    p "                  protected folder, or grant Full Disk Access to the scheduled"
+    p "                  interpreter in System Settings > Privacy & Security."
+    ;;
+  missing-path)
+    p "    cause       : the scheduled job is pinned to a path that no longer exists."
+    p "    fix         : heimdall-dream-schedule install --repo $REPO"
+    ;;
+  permission-denied)
+    p "    cause       : filesystem permissions deny the scheduled job access to the repo."
+    p "    run now     : $REMEDY --repo $REPO run"
+    ;;
+  dream-failed)
+    p "    cause       : dream ran but exited nonzero — see the log below."
+    p "    run now     : $REMEDY --repo $REPO run"
+    ;;
+  *)
+    p "    cause       : the scheduled dream has not produced a report and did not say why."
+    p "                  A scheduled job that fails invisibly looks exactly like one that"
+    p "                  never ran, so this is reported rather than assumed benign."
+    p "    run now     : $REMEDY --repo $REPO run"
+    p "    check       : heimdall-dream-schedule status --repo $REPO"
+    ;;
+esac
+p "    details     : $STATUS"
+p "    log         : $LOG"
+echo ""
+exit 0

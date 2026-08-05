@@ -68,9 +68,38 @@ fi
 
 LABEL="com.heimdall.dream"
 LA_DIR="${HEIMDALL_LAUNCH_AGENTS_DIR:-$HOME/Library/LaunchAgents}"
-LOG="${HEIMDALL_DREAM_LOG:-$HOME/.heimdall/logs/dream.log}"
+HEIMDALL_HOME="${HEIMDALL_HOME:-$HOME/.heimdall}"
+LOG="${HEIMDALL_DREAM_LOG:-$HEIMDALL_HOME/logs/dream.log}"
 LAUNCHCTL="${LAUNCHCTL:-launchctl}"
 PLIST="$LA_DIR/$LABEL.plist"
+
+# ── WHERE THE SCHEDULED PROGRAM LIVES, AND WHY IT IS NOT IN THE REPO ─────────────
+#
+# ProgramArguments[0] used to be <repo>/bin/heimdall-dream. On a machine whose repo sits
+# under a TCC-protected folder (~/Downloads, ~/Documents, ~/Desktop) that is unrunnable:
+# a LaunchAgent holds no TCC grant, so launchd could not even OPEN the script. The job
+# died on its first syscall — `can't open file ...: [Errno 1] Operation not permitted` —
+# for ten consecutive nights, and because the program itself was inside the denied tree
+# there was no code of ours left running to notice or report it. The failure had no
+# reporter because the reporter was behind the same locked door.
+#
+# So the scheduled program is now a small runner INSTALLED OUTSIDE the repo, under
+# $HEIMDALL_HOME (~/.heimdall — not a TCC-protected location; measured writable from a
+# probe LaunchAgent while every read under ~/Downloads was denied). The runner always
+# gets to run, probes the repo, and either execs the real dream or records a structured
+# failure that bin/heimdall-dream-notice surfaces in the operator's next session.
+#
+# THIS DOES NOT DEFEAT TCC and does not pretend to — a denied repo is still denied, and
+# that was measured rather than assumed: a probe LaunchAgent whose program was /bin/sh at
+# a NON-protected path was refused every read under ~/Downloads exactly as the
+# repo-resident script was. What the split buys is that the denial is DETECTED and
+# REPORTED instead of vanishing into a log nobody reads.
+#
+# The dream bin and --repo are still both encoded in the plist, so the scheduled argv
+# stays readable and the ephemeral-checkout guards below still gate both pinned paths.
+RUNNER_SRC="$BINDIR/heimdall-dream-runner"
+RUNNER_DIR="$HEIMDALL_HOME/bin"
+RUNNER="$RUNNER_DIR/heimdall-dream-runner"
 
 usage() { sed -n '2,40p' "$SELF" | sed 's/^# \{0,1\}//'; }
 die()   { echo "error: $*" >&2; exit 3; }
@@ -189,13 +218,39 @@ require_durable_pinned_paths() {
   return 0
 }
 
+# ── stage the runner outside the repo (the program launchd is guaranteed to reach) ─
+#
+# COPIED, NOT SYMLINKED. A symlink back into the repo would resolve INTO the protected
+# tree at 03:00 and be denied exactly like the old direct-exec plist — the link readable,
+# its target not, which is the same silent death with one extra step. A copy is the only
+# form that survives the denial it exists to report.
+#
+# RE-COPIED ON EVERY INSTALL, so the staged runner cannot drift from the checkout:
+# install is idempotent (fixed path, overwritten in place) and heimdall-autoupdate
+# re-asserts the schedule after every update, which makes this the normal refresh path
+# rather than a manual chore that would rot.
+install_runner() {
+  [ -f "$RUNNER_SRC" ] || die "heimdall-dream-runner missing at $RUNNER_SRC"
+  mkdir -p "$RUNNER_DIR" || die "cannot create $RUNNER_DIR"
+  cp "$RUNNER_SRC" "$RUNNER" || die "cannot stage the runner at $RUNNER"
+  chmod +x "$RUNNER"        || die "cannot make $RUNNER executable"
+}
+
 # ── emit the plist (the single source of the scheduled argv) ─────────────────────
 write_plist() {
   mkdir -p "$LA_DIR" "$(dirname "$LOG")"
-  local e_dream e_repo e_log
+  local e_dream e_repo e_log e_runner e_wd
   e_dream="$(xml_escape "$DREAM")"
   e_repo="$(xml_escape "$REPO")"
   e_log="$(xml_escape "$LOG")"
+  e_runner="$(xml_escape "$RUNNER")"
+  # WorkingDirectory must be a path the JOB can getcwd(). Pinning it to the repo is what
+  # produced the `shell-init: error retrieving current directory: getcwd: cannot access
+  # parent directories: Operation not permitted` lines in the real log — launchd could not
+  # even enter the directory, so every child shell inherited a broken cwd. dream is told
+  # where the repo is via --repo, so cwd carries no information; $HOME is always reachable
+  # by the user's own LaunchAgent.
+  e_wd="$(xml_escape "$HOME")"
   cat > "$PLIST" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -205,6 +260,8 @@ write_plist() {
   <string>$LABEL</string>
   <key>ProgramArguments</key>
   <array>
+    <string>$e_runner</string>
+    <string>--dream</string>
     <string>$e_dream</string>
     <string>--repo</string>
     <string>$e_repo</string>
@@ -221,7 +278,7 @@ write_plist() {
   <key>RunAtLoad</key>
   <false/>
   <key>WorkingDirectory</key>
-  <string>$e_repo</string>
+  <string>$e_wd</string>
   <key>StandardOutPath</key>
   <string>$e_log</string>
   <key>StandardErrorPath</key>
@@ -274,6 +331,21 @@ registered_command() {
   printf '%s' "$out"
 }
 
+# TWO PINNED PATHS, TWO WAYS TO DIE SILENTLY.
+# Splitting the clock from the runner gave the plist a second path that must exist:
+# ProgramArguments[0] is the staged runner, and the --dream target it execs is a
+# SEPARATE path inside the repo. Either one vanishing produces the same registered-but-
+# dead job the detector above exists to catch, so both are checked. Watching only
+# ProgramArguments[0] would have quietly narrowed the guard at the exact moment it
+# gained a second thing to guard — the failure mode this file keeps re-learning.
+registered_dream() {
+  local out
+  [ -f "$PLIST" ] || return 0
+  command -v plutil >/dev/null 2>&1 || return 0
+  out="$(plutil -extract ProgramArguments.2 raw -o - "$PLIST" 2>/dev/null)" || return 0
+  printf '%s' "$out"
+}
+
 # Minimal JSON string escaping for a value that comes from OUTSIDE this script (the
 # plist on disk) — a path holding a quote or backslash would otherwise emit JSON that
 # no consumer can parse.
@@ -300,6 +372,7 @@ Use the cron/cloud routine documented in commands/dream.md instead."
   # Second gate: never pin the nightly job to a checkout that is built to be reaped.
   require_durable_pinned_paths
   [ -x "$DREAM" ] || die "heimdall-dream not executable at $DREAM"
+  install_runner
   write_plist
   unload_agent   # drop any prior copy so a re-install never yields two loaded jobs
   load_agent
@@ -329,19 +402,27 @@ cmd_uninstall() {
 }
 
 cmd_status() {
-  local installed loaded regcmd stale
+  local installed loaded regcmd regdream stale stale_path
   [ -f "$PLIST" ] && installed=true || installed=false
   if is_loaded; then loaded=true; else loaded=false; fi
-  # A job whose ProgramArguments[0] no longer exists is REGISTERED but DEAD: launchd
-  # will keep listing it and will keep never running it. Surface that as its own state.
+  # A job pinned to a path that no longer exists is REGISTERED but DEAD: launchd will
+  # keep listing it and will keep never running it. Surface that as its own state.
+  # Both pinned paths are checked — the staged runner AND the dream bin it execs.
   regcmd="$(registered_command)"
+  regdream="$(registered_dream)"
   stale=false
-  if [ "$installed" = true ] && [ -n "$regcmd" ] && [ ! -x "$regcmd" ]; then
-    stale=true
+  stale_path=""
+  if [ "$installed" = true ]; then
+    if [ -n "$regcmd" ] && [ ! -x "$regcmd" ]; then
+      stale=true; stale_path="$regcmd"
+    elif [ -n "$regdream" ] && [ ! -x "$regdream" ]; then
+      stale=true; stale_path="$regdream"
+    fi
   fi
   if [ "$JSON" = 1 ]; then
-    printf '{"installed":%s,"loaded":%s,"stale":%s,"label":"%s","plist":"%s","registered_command":"%s","command":"%s --repo %s run --overnight","log":"%s"}\n' \
-      "$installed" "$loaded" "$stale" "$LABEL" "$PLIST" "$(json_escape "$regcmd")" "$DREAM" "$REPO" "$LOG"
+    printf '{"installed":%s,"loaded":%s,"stale":%s,"label":"%s","plist":"%s","registered_command":"%s","registered_dream":"%s","stale_path":"%s","command":"%s --repo %s run --overnight","log":"%s"}\n' \
+      "$installed" "$loaded" "$stale" "$LABEL" "$PLIST" "$(json_escape "$regcmd")" \
+      "$(json_escape "$regdream")" "$(json_escape "$stale_path")" "$DREAM" "$REPO" "$LOG"
   else
     if [ "$stale" = true ]; then
       echo "$LABEL: registered but DEAD — its command no longer exists"
@@ -356,7 +437,7 @@ cmd_status() {
     echo "  command: $DREAM --repo $REPO run --overnight"
     echo "  log:     $LOG"
     if [ "$stale" = true ]; then
-      echo "  MISSING: the registered command is gone: $regcmd"
+      echo "  MISSING: a path this job is pinned to is gone: $stale_path"
       echo "           launchd still lists this job and will never run it. Re-register"
       echo "           from your MAIN checkout: heimdall-dream-schedule install"
     fi

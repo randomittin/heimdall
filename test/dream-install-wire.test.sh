@@ -116,11 +116,15 @@ CANON="$(cd "$CANON" && pwd -P)"
 cp "$SCHED" "$CANON/bin/heimdall-dream-schedule"
 cp "$DREAM" "$CANON/bin/heimdall-dream"
 cp "$ROOT/bin/lib/real-home.sh" "$CANON/bin/lib/real-home.sh"
+# The runner is ProgramArguments[0] — the register path stages it outside the repo, so a
+# checkout without it cannot install (by design: a plist pointing at a program that does
+# not exist is the silent-death mode this whole change exists to end).
+cp "$ROOT/bin/heimdall-dream-runner" "$CANON/bin/heimdall-dream-runner"
 # A real COPY of the updater, never a symlink: it resolves its own PLUGIN_DIR from
 # BASH_SOURCE through readlink -f, so a link would point §7 straight back at $ROOT.
 cp "$UPDATER" "$CANON/bin/heimdall-autoupdate"
 chmod +x "$CANON/bin/heimdall-dream-schedule" "$CANON/bin/heimdall-dream" \
-         "$CANON/bin/heimdall-autoupdate"
+         "$CANON/bin/heimdall-dream-runner" "$CANON/bin/heimdall-autoupdate"
 git -C "$CANON" init -q
 git -C "$CANON" add -A >/dev/null 2>&1
 git -C "$CANON" -c user.email=t@t -c user.name=t commit -qm fixture >/dev/null 2>&1

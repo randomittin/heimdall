@@ -77,6 +77,11 @@ PLIST="$LA/com.heimdall.dream.plist"
 export HEIMDALL_LAUNCH_AGENTS_DIR="$LA"
 export HEIMDALL_DREAM_LOG="$LOG"
 export LAUNCHCTL="$SHIM"
+# The register path STAGES the runner into $HEIMDALL_HOME/bin. Redirect it into the
+# throwaway tree: unredirected, this suite would write into the developer's real
+# ~/.heimdall on every run. $HOME does not isolate that, and a test writing into real
+# user state is exactly the class of accident this file's guards exist to prevent.
+export HEIMDALL_HOME="$WORK/heimdall-home"
 
 # ── the CANONICAL vs EPHEMERAL fixture pair ──────────────────────────────────────
 # Two checkouts of the SAME commit, holding BYTE-IDENTICAL copies of the helper under
@@ -95,7 +100,12 @@ mkdir -p "$CANON/bin/lib"
 cp "$CLI" "$CANON/bin/heimdall-dream-schedule"
 cp "$ROOT/bin/lib/real-home.sh" "$CANON/bin/lib/real-home.sh"
 cp "$DREAM" "$CANON/bin/heimdall-dream"
-chmod +x "$CANON/bin/heimdall-dream-schedule" "$CANON/bin/heimdall-dream"
+# heimdall-dream-runner is ProgramArguments[0]: the register path stages it OUTSIDE the
+# repo (see the TCC note in bin/heimdall-dream-schedule), so it is a fourth file the
+# register path touches and the fixture must carry it.
+cp "$ROOT/bin/heimdall-dream-runner" "$CANON/bin/heimdall-dream-runner"
+chmod +x "$CANON/bin/heimdall-dream-schedule" "$CANON/bin/heimdall-dream" \
+         "$CANON/bin/heimdall-dream-runner"
 git -C "$CANON" init -q
 git -C "$CANON" add -A >/dev/null 2>&1
 git -C "$CANON" -c user.email=t@t -c user.name=t commit -qm fixture >/dev/null 2>&1
@@ -271,6 +281,12 @@ fi
 # complain at 03:00 when it has vanished — `launchctl list` keeps reporting the job — so
 # `status` cheerfully said "registered (installed + loaded)" about a job that had not run
 # in weeks. An operator whose nightly job died had no signal at all.
+#
+# TWO PINNED PATHS NOW. ProgramArguments[0] is the runner staged outside the repo (see
+# the TCC note in the helper) and the --dream target is a second path inside it. Either
+# vanishing kills the job the same silent way, so the detector must watch BOTH — and this
+# section proves both, because a guard that narrowed to one path while gaining a second
+# would reproduce the incident it was written for.
 : > "$CALLS"; rm -f "$PLIST"
 "$CLI_CANON" install --repo "$CANON" >/dev/null 2>&1
 # Simulate the reap: the tree the plist points at goes away, exactly as a worktree does.
@@ -278,8 +294,8 @@ mv "$DREAM_CANON" "$DREAM_CANON.reaped"
 DTXT="$("$CLI_CANON" status --repo "$CANON")"
 DJSON="$("$CLI_CANON" status --repo "$CANON" --json)"
 if [ "$(echo "$DJSON" | jq -r '.stale')" = "true" ] \
-   && [ "$(echo "$DJSON" | jq -r '.registered_command')" = "$DREAM_CANON" ]; then
-  ok "(7) status --json flags a plist pinned to a missing command (stale=true + the path)"
+   && [ "$(echo "$DJSON" | jq -r '.stale_path')" = "$DREAM_CANON" ]; then
+  ok "(7) status --json flags a plist pinned to a missing DREAM bin (stale=true + the path)"
 else
   bad "(7) status --json did not flag the dead job: $DJSON"
 fi
@@ -295,6 +311,25 @@ grep -Eq '^(load|unload|bootstrap|bootout)' "$CALLS" \
   && bad "(7) status mutated launchd — a read-only subcommand must never repair" \
   || ok "(7) status issues no launchctl load/unload — detection cannot become a hijack vector"
 mv "$DREAM_CANON.reaped" "$DREAM_CANON"
+
+# The SECOND pinned path: the staged runner is ProgramArguments[0]. If it is deleted the
+# job cannot start at all — a strictly deadlier failure than a missing dream bin, and one
+# the pre-split detector could not have expressed.
+STAGED_RUNNER="$HEIMDALL_HOME/bin/heimdall-dream-runner"
+if [ -x "$STAGED_RUNNER" ]; then
+  mv "$STAGED_RUNNER" "$STAGED_RUNNER.reaped"
+  RJSON="$("$CLI_CANON" status --repo "$CANON" --json)"
+  if [ "$(echo "$RJSON" | jq -r '.stale')" = "true" ] \
+     && [ "$(echo "$RJSON" | jq -r '.stale_path')" = "$STAGED_RUNNER" ]; then
+    ok "(7) status also flags a missing staged RUNNER (both pinned paths guarded)"
+  else
+    bad "(7) a deleted runner went undetected: $RJSON"
+  fi
+  mv "$STAGED_RUNNER.reaped" "$STAGED_RUNNER"
+else
+  bad "(7) runner was not staged at $STAGED_RUNNER"
+fi
+
 # And the repair path itself: a re-install from the canonical tree heals the plist.
 "$CLI_CANON" install --repo "$CANON" >/dev/null 2>&1
 [ "$("$CLI_CANON" status --repo "$CANON" --json | jq -r '.stale')" = "false" ] \
