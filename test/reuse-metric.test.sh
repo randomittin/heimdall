@@ -29,6 +29,12 @@ PY="$(command -v python3 || command -v python)"
 WORK="$(mktemp -d -t "reuse-test.$(printf 'X%.0s' 1 2 3 4 5 6)")"
 trap 'rm -rf "$WORK"' EXIT
 
+# HERMETIC: anything that reaches the metric emitter or dream also reaches their
+# relocated state dir under $HEIMDALL_HOME (bin/lib/dream_data.py). Redirect it at the
+# throwaway tree so no case here can write to the operator's real ~/.heimdall.
+export HEIMDALL_HOME="$WORK/heimdall-home"
+mkdir -p "$HEIMDALL_HOME"
+
 # ── build a base repo with pre-existing capability ────────────────────────────
 REPO="$WORK/repo"
 mkdir -p "$REPO/utils" "$REPO/db" "$REPO/api"

@@ -48,6 +48,15 @@ PY="$(command -v python3 || command -v python)"
 WORK="$(mktemp -d -t "dream-test.$(printf 'X%.0s' 1 2 3 4 5 6)")"
 trap 'rm -rf "$WORK"' EXIT
 
+# HERMETIC: dream keeps its state under $HEIMDALL_HOME (bin/lib/dream_data.py), because
+# the nightly LaunchAgent cannot read a repo inside a TCC-protected folder. Left
+# unredirected, every case below would write its throwaway corpus into the OPERATOR'S
+# real ~/.heimdall/data — which is exactly how this suite once overwrote his live
+# LaunchAgent plist. The state dir is a seam precisely so a test can own it; point it at
+# the throwaway tree, which the trap above already reclaims.
+export HEIMDALL_HOME="$WORK/heimdall-home"
+mkdir -p "$HEIMDALL_HOME"
+
 mk_repo() { local d="$WORK/$1"; mkdir -p "$d/.planning"; echo "$d"; }
 
 # The same RATIOS the self-improve suite uses, at a sample count that clears the
@@ -120,10 +129,15 @@ grep -q "hyp-precheck-lint-timeout" "$REP" \
 grep -q "KEPT" "$REP" && grep -Eq "delta \*\*\+0\.(5|50)" "$REP" \
   && ok "(4) kept improvement is measured better-than-baseline (delta +0.50 reported)" \
   || bad "(4) kept improvement not reported with a measured delta"
-# and the override is now validated on disk (the gate persisted it, dream did not)
-[ "$(jq -r '.overrides.lint.status' "$R/.planning/routing-overrides.json")" = "validated" ] \
+# and the override is now validated on disk (the gate persisted it, dream did not).
+# The overrides file lives in dream's RELOCATED state dir, not <repo>/.planning: the
+# nightly job cannot read a TCC-protected repo, so the self-improve loop it drives keeps
+# its four state files under $HEIMDALL_HOME. Ask the module where that is rather than
+# rebuilding the hashed path here, so this assertion cannot drift from the derivation.
+STATE="$("$PY" "$ROOT/bin/lib/dream_data.py" planning --repo "$R")"
+[ "$(jq -r '.overrides.lint.status' "$STATE/routing-overrides.json")" = "validated" ] \
   && ok "(4) winning override persisted as validated by the self-improve gate" \
-  || bad "(4) override not validated on disk"
+  || bad "(4) override not validated on disk ($STATE/routing-overrides.json)"
 
 # (6) agent-never-pushes
 [ "$(echo "$SUM" | jq -r '.pushed')" = "false" ] \

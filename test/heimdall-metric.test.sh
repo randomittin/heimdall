@@ -60,6 +60,14 @@ PY="$(command -v python3 || command -v python)"
 WORK="$(mktemp -d -t hmd-metric-test)"
 trap 'chmod -R u+w "$WORK" 2>/dev/null || true; rm -rf "$WORK"' EXIT
 
+# HERMETIC: the emitter writes BOTH the repo's .planning and dream's relocated state dir
+# under $HEIMDALL_HOME (bin/lib/dream_data.py), so that the nightly LaunchAgent — which
+# cannot read a TCC-protected repo at all — still sees new evidence. Unredirected, every
+# throwaway record below would land in the OPERATOR'S real ~/.heimdall/data. Point it at
+# the throwaway tree the trap already reclaims.
+export HEIMDALL_HOME="$WORK/heimdall-home"
+mkdir -p "$HEIMDALL_HOME"
+
 mk_repo() { local d="$WORK/$1"; mkdir -p "$d/.planning"; printf '%s' "$d"; }
 rows()    { [ -f "$1/.planning/metrics.jsonl" ] || return 0
             wc -l < "$1/.planning/metrics.jsonl" | tr -d ' '; }
