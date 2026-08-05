@@ -59,6 +59,13 @@ NOW=1800000000
 export NOW
 DAY=86400
 
+# ── the LOCAL-IDENTITY ANCHOR is OFF for every fixture below. It reads the real git config,
+# the real device name and the real `gh` auth of whoever runs this suite, so leaving it on
+# would make these results depend on the developer's laptop. Section J turns it back on with
+# every input injected explicitly, which is the only way to test it hermetically.
+HMD_ROSTER_NO_SELF=1
+export HMD_ROSTER_NO_SELF
+
 echo "============================================================"
 echo "REPO-ROSTER falsifier — identity unification, tiers, degradation"
 echo "  lib=$LIB  tmp=$TMP  now=$NOW"
@@ -132,6 +139,13 @@ export GH_CALLS
 cat > "$FAKEBIN/gh" <<'SH'
 #!/bin/sh
 printf 'call\n' >> "$GH_CALLS"
+# `gh api user` — the AUTHENTICATED login, which is what anchors the local human to their
+# collaborator row. Only the success path is special-cased; every failure mode below is
+# shared with the collaborator probe, so both degrade through identical code.
+if [ "${2:-}" = "user" ] && [ "${GH_MODE:-ok}" = "ok" ]; then
+  echo randomittin
+  exit 0
+fi
 case "${GH_MODE:-ok}" in
   ok)
     cat <<'EOF'
@@ -609,10 +623,173 @@ AMB="$(PATH="$FAKEBIN:$PATH" GH_MODE=ok HMD_ROSTER_CACHE_DIR="$TMP/cache-cli" \
   "$PY" "$LIB/repo_roster.py" --repo "$GITREPO" --git-days 90 --blocking --explain 2>/dev/null \
   | "$PY" -c 'import json,sys;d=json.load(sys.stdin);print(len(d.get("near_misses",[])), len(d.get("people",[])))' 2>/dev/null || echo "ERR")"
 AMB_NEAR="$(printf '%s' "$AMB" | cut -d' ' -f1)"
+# The anchor-OFF baseline that section J compares against, so "the anchor changed nobody
+# else" is measured against this suite's own numbers rather than a hardcoded constant.
+N_PEOPLE="$(printf '%s' "$AMB" | cut -d' ' -f2)"
 if [ -n "$AMB_NEAR" ] && [ "$AMB_NEAR" != "ERR" ] && [ "$AMB_NEAR" -ge 1 ]; then
   ok "I3 --explain surfaces $AMB_NEAR residual near-miss pair(s) — ambiguity is visible, not guessed"
 else
   bad "I3 --explain did not surface the residual ambiguity (got '$AMB')"
+fi
+
+echo
+# ═════════════════════════════════════════════════════════════════════════════
+echo "── J. THE LOCAL IDENTITY (the owner must appear exactly ONCE, with ONE face) ──"
+# ═════════════════════════════════════════════════════════════════════════════
+# Reproduces the MEASURED defect on the owner's own heimdall repo: the presence fragment
+# `haid:rj.<machine>-46d5` (handle `rj`) and the git author `rj@runheimdall.dev` (display
+# names RJ / randomittin) score haid_human=2 — ONE class, one short of the merge floor — so
+# they refuse, and the owner renders TWICE: `rj` online, plus a second `randomittin` row
+# whose haid is null and whose sigil therefore seeds off the HANDLE STRING instead of a
+# HAID, producing a completely different face.
+#
+# Every input is injected, so this proves the rule and not the developer's laptop.
+JREPO="$TMP/jrepo"; mkdir -p "$JREPO"
+git -C "$JREPO" init -q 2>/dev/null
+git -C "$JREPO" config user.email "rj@runheimdall.dev"
+git -C "$JREPO" config user.name "RJ"
+jcommit() {   # jcommit <display-name> <days-ago> <slug>
+  printf '%s\n' "$3" > "$JREPO/$3.txt"
+  git -C "$JREPO" add -A >/dev/null 2>&1
+  GIT_AUTHOR_NAME="$1" GIT_AUTHOR_EMAIL="rj@runheimdall.dev" \
+  GIT_COMMITTER_NAME="$1" GIT_COMMITTER_EMAIL="rj@runheimdall.dev" \
+  GIT_AUTHOR_DATE="$(( NOW - $2 * DAY )) +0000" \
+  GIT_COMMITTER_DATE="$(( NOW - $2 * DAY )) +0000" \
+    git -C "$JREPO" commit -q -m "$3" >/dev/null 2>&1
+}
+jcommit "RJ"          4 "j-one"
+jcommit "randomittin" 2 "j-two"
+
+mkdir -p "$JREPO/.heimdall"
+JPRESENCE="$JREPO/.heimdall/.roster-cache.json"
+cat > "$JPRESENCE" <<'JSON'
+[
+  {"haid":"haid:rj.rjs-macbook-air-46d5","handle":"rj","project":"github.com/randomittin/heimdall",
+   "online":true, "state":"active", "age_seconds":9, "ts":1799999991, "verdict":"working"}
+]
+JSON
+# A HAID for the SAME human slug on a DIFFERENT box — self_device must NOT fire on it.
+JPRESENCE_OTHER="$TMP/j-other-presence.json"
+cat > "$JPRESENCE_OTHER" <<'JSON'
+[
+  {"haid":"haid:rj.some-other-box-1234","handle":"rj","project":"github.com/randomittin/heimdall",
+   "online":true, "state":"active", "age_seconds":9, "ts":1799999991, "verdict":"working"}
+]
+JSON
+
+# drive_j <presence-or-NONE> <machine-slug-or-EMPTY> <no-self-flag> -> the frozen array
+drive_j() {
+  fresh_cache "j-$(printf '%s' "$1$2$3" | tr -c 'a-zA-Z0-9' '-')"
+  PATH="$FAKEBIN:$PATH" GH_MODE=ok \
+  HMD_ROSTER_NO_SELF="$3" \
+  HMD_ROSTER_SELF_EMAIL="rj@runheimdall.dev" HMD_ROSTER_SELF_NAME="RJ" \
+  HMD_ROSTER_SELF_MACHINE="$2" \
+  HMD_ROSTER_GITHUB_SLUG="randomittin/heimdall" \
+  HMD_ROSTER_CACHE_DIR="$CACHE_DIR" HMD_ROSTER_NOW="$NOW" \
+    "$PY" "$LIB/repo_roster.py" --repo "$JREPO" --git-days 90 --blocking \
+    --presence-cache "$1" 2>/dev/null
+}
+jq_get() { printf '%s' "$1" | "$PY" -c "import json,sys;d=json.load(sys.stdin);print($2)" 2>/dev/null; }
+# The J repo has exactly ONE git author and ONE presence row — both the owner — so any row
+# carrying a presence or git source IS the owner. Counting those instead of the whole array
+# keeps these proofs about the merge and immune to the collaborator fixture's member rows.
+OWNER="[r for r in d if 'presence' in r['sources'] or 'git' in r['sources']]"
+
+# J1 RED — anchor OFF reproduces the screenshot exactly: two rows, the git row haid-less.
+J_RED="$(drive_j "$JPRESENCE" "RJs-MacBook-Air" 1)"
+J_RED_N="$(jq_get "$J_RED" "len($OWNER)")"
+J_RED_HAIDLESS="$(jq_get "$J_RED" "sum(1 for r in $OWNER if r['haid'] is None)")"
+if [ "$J_RED_N" = "2" ] && [ "$J_RED_HAIDLESS" = "1" ]; then
+  ok "J1 RED anchor OFF -> the owner splits into 2 rows, one with haid=null (the 2-face bug)"
+else
+  bad "J1 RED did not reproduce the split (rows=$J_RED_N haidless=$J_RED_HAIDLESS)"
+fi
+
+# J2 GREEN — anchor ON folds them into exactly one person carrying ALL THREE sources.
+J_OUT="$(drive_j "$JPRESENCE" "RJs-MacBook-Air" "")"
+J_N="$(jq_get "$J_OUT" "len($OWNER)")"
+J_SRC="$(jq_get "$J_OUT" "','.join($OWNER[0]['sources']) if $OWNER else 'NONE'")"
+if [ "$J_N" = "1" ] && [ "$J_SRC" = "presence,git,github" ]; then
+  ok "J2 GREEN anchor ON -> exactly ONE row, sources presence+git+github (all retained)"
+else
+  bad "J2 GREEN did not unify the owner (rows=$J_N sources=$J_SRC)"
+fi
+
+# J3 — the BEST tier survives. A git-derived row must never demote a live presence row.
+J_TIER="$(jq_get "$J_OUT" "d[0]['tier'] if d else 'NONE'")"
+J_ONLINE="$(jq_get "$J_OUT" "d[0]['online'] if d else 'NONE'")"
+[ "$J_TIER" = "online" ] && [ "$J_ONLINE" = "True" ] \
+  && ok "J3 the merged row keeps the BEST tier (online) — git did not demote presence" \
+  || bad "J3 merged row lost its tier (tier=$J_TIER online=$J_ONLINE)"
+
+# J4 — ONE FACE. The surviving row must carry THIS DEVICE's HAID, because the renderer seeds
+# the sigil from `haid or handle` and only a real HAID resolves to a hero.
+J_HAID="$(jq_get "$J_OUT" "d[0]['haid'] if d else 'NONE'")"
+[ "$J_HAID" = "haid:rj.rjs-macbook-air-46d5" ] \
+  && ok "J4 the merged row's sigil key is THIS DEVICE's HAID — one stable face, not an alias" \
+  || bad "J4 merged row carries the wrong sigil key (got '$J_HAID')"
+
+# J5 — self_device needs BOTH components. Same human slug, DIFFERENT machine -> no merge.
+J_OTHER="$(drive_j "$JPRESENCE_OTHER" "RJs-MacBook-Air" "")"
+J_OTHER_N="$(jq_get "$J_OTHER" "len($OWNER)")"
+[ "$J_OTHER_N" = "2" ] \
+  && ok "J5 a HAID from ANOTHER machine does NOT merge — self_device pins human AND device" \
+  || bad "J5 merged across devices (rows=$J_OTHER_N) — the anchor is too aggressive"
+
+# J6 — no device name resolvable -> the anchor cannot claim the presence row, so the module
+# falls back to exactly the conservative answer rather than guessing.
+J_NOMACH="$(drive_j "$JPRESENCE" "" "")"
+J_NOMACH_N="$(jq_get "$J_NOMACH" "len($OWNER)")"
+[ "$J_NOMACH_N" = "2" ] \
+  && ok "J6 with no resolvable device name the anchor degrades to the conservative 2 rows" \
+  || bad "J6 anchor merged without a device name (rows=$J_NOMACH_N)"
+
+# J7 — PRIVACY. No presence cache = no team secret. The anchor still merges git+github, and
+# the result must carry NO presence fact whatsoever.
+J_NOPRES="$(drive_j NONE "RJs-MacBook-Air" "")"
+J_NOPRES_N="$(jq_get "$J_NOPRES" "len($OWNER)")"
+J_FREE="$(printf '%s' "$J_NOPRES" | "$PY" -c "
+import json,sys,os
+sys.path.insert(0, os.environ['LIB'])
+import repo_roster as RR
+print(RR.presence_free(json.load(sys.stdin)))" 2>/dev/null)"
+if [ "$J_NOPRES_N" = "1" ] && [ "$J_FREE" = "True" ]; then
+  ok "J7 without the team secret the anchor still unifies git+github and leaks NO presence"
+else
+  bad "J7 privacy/degradation broke (rows=$J_NOPRES_N presence_free=$J_FREE)"
+fi
+
+# J8 — THE ANCHOR CANNOT INVENT A PERSON. An owner with no presence, no commits in the window
+# and no collaborator entry contributes only a sourceless cluster, which emits no row.
+fresh_cache j-phantom
+J_PHANTOM="$(PATH="$FAKEBIN:$PATH" GH_MODE=ok \
+  HMD_ROSTER_NO_SELF= HMD_ROSTER_SELF_EMAIL="nobody@nowhere.example" \
+  HMD_ROSTER_SELF_NAME="Nobody" HMD_ROSTER_SELF_MACHINE="Ghost-Box" \
+  HMD_ROSTER_SELF_LOGIN="nobody-at-all" HMD_ROSTER_NO_GITHUB=1 \
+  HMD_ROSTER_CACHE_DIR="$CACHE_DIR" HMD_ROSTER_NOW="$NOW" \
+  "$PY" "$LIB/repo_roster.py" --repo "$JREPO" --git-days 1 --blocking \
+  --presence-cache NONE 2>/dev/null)"
+J_PHANTOM_N="$(jq_get "$J_PHANTOM" "len(d)")"
+[ "$J_PHANTOM_N" = "0" ] \
+  && ok "J8 an anchor that matched nothing emits NO row — it cannot invent a wall member" \
+  || bad "J8 the anchor fabricated $J_PHANTOM_N row(s) from local config alone"
+
+# J9 — NOBODY ELSE'S RULE MOVED. The main fixture's person count and its refused pair are
+# byte-identical with the anchor enabled, so the conservative rule is genuinely untouched.
+fresh_cache j-collateral
+J_MAIN="$(PATH="$FAKEBIN:$PATH" GH_MODE=ok \
+  HMD_ROSTER_NO_SELF= HMD_ROSTER_SELF_EMAIL="rj@runheimdall.dev" \
+  HMD_ROSTER_SELF_NAME="RJ" HMD_ROSTER_SELF_MACHINE="RJs-MacBook-Air" \
+  HMD_ROSTER_SELF_LOGIN="randomittin" \
+  HMD_ROSTER_CACHE_DIR="$CACHE_DIR" HMD_ROSTER_NOW="$NOW" \
+  "$PY" "$LIB/repo_roster.py" --repo "$GITREPO" --git-days 90 --blocking --explain \
+  --presence-cache "$PRESENCE_FULL" 2>/dev/null)"
+J_MAIN_N="$(jq_get "$J_MAIN" "d['counts']['people']")"
+J_MAIN_NEAR="$(jq_get "$J_MAIN" "len(d['near_misses'])")"
+if [ "$J_MAIN_N" = "$N_PEOPLE" ] && [ "$J_MAIN_NEAR" = "$AMB_NEAR" ]; then
+  ok "J9 the anchor changes NOBODY else: still $J_MAIN_N people, still $J_MAIN_NEAR near-miss(es)"
+else
+  bad "J9 collateral damage (people $J_MAIN_N vs $N_PEOPLE, near-misses $J_MAIN_NEAR vs $AMB_NEAR)"
 fi
 
 echo
