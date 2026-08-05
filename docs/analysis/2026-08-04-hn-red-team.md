@@ -216,7 +216,7 @@ git show HEAD:install.sh   | shasum -a 256    → b3ec4ba…c387c
 
 Right now this is **correct behaviour**, not a bug: the README pins the *tag*, the tag's bytes hash to the advertised digest, and the published one-liner verifies. `test/version-drift.test.sh` exists precisely because this went wrong three times before, and it currently holds.
 
-The exposure is forward-looking. The digest is duplicated across `README.md` (×2), `heimdall-site/llms-full.txt:43`, `heimdall-site/netlify.toml:25`, and `packages/runheimdall/package.json`, plus the tag string in `heimdall-site/index.html:405` and `robots`/`sitemap`-adjacent copy. Cutting v2.3.9 means updating six places in two repos, and history says that is where it breaks.
+The exposure is forward-looking. The digest is duplicated across `README.md` (×2), `heimdall-site/llms-full.txt:43`, `heimdall-site/netlify.toml:25`, and `packages/runheimdall/package.json`, plus the tag string in `heimdall-site/index.html:405` and `robots`/`sitemap`-adjacent copy. Cutting v2.3.9 means updating six places in two repos, and history says that is where it breaks. <!-- HEIMDALL:PIN:FROZEN — names the specific release cut this exposure was scoped to on the audit date; rendering it would restate a dated forecast as a claim about whatever ships next -->
 
 **Response: DEFENSIBLE today** — evidence: fetch `https://raw.githubusercontent.com/randomittin/heimdall/v2.3.8/install.sh`, `shasum -a 256`, compare to `README.md:71`. It matches. **But do not launch mid-release.** Cut the tag, verify all six sites, then post. Do not push 236 commits and re-tag while a thread is live. <!-- HEIMDALL:PIN:FROZEN — cites the tag that was actually fetched and compared; the verdict is scoped to it -->
 

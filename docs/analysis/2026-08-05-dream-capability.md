@@ -138,7 +138,7 @@ Be clear-eyed: **dream will not clear a single launch blocker.**
   The only agent-doable move is to **write the different post** — the one supported by
   evidence that exists today (isolation oracle 23/23, the 29-bug bring-up ladder, 0.50
   median reuse at `ae88a55`). That is a judgement call, not a dream output.
-- **Cutting v2.3.9** — six digest/tag sites across two repos, one of which is not here.
+- **Cutting v2.3.9** — six digest/tag sites across two repos, one of which is not here. <!-- HEIMDALL:PIN:FROZEN — the release cut this deferral was written about; a later tag would misattribute the owner decision to a different release -->
   Owner decision, and red-team #9's own advice is *"do not launch mid-release."*
 - **Anything in `heimdall-site/`** — separate repo, not this working tree.
 - **The `metric:"task"` history** — dream cannot conjure the past. Even after wiring the
