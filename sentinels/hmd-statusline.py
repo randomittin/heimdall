@@ -37,6 +37,7 @@ Ships via hooks/statusline.sh → python3 ${CLAUDE_PLUGIN_ROOT}/sentinels/hmd-st
 Modes:
   --widget   emit only the watchman+verdict segment (ccstatusline coexistence)
 """
+import re as _re_drain
 import sys, os, json, time, re, hashlib, importlib.util, subprocess, shlex, contextlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -1131,6 +1132,31 @@ def _team_branch_seg(branch):
     return f"{BRANCHC}⎇{b}{X}"
 
 
+# ── the AWAY hue drain ────────────────────────────────────────────────────────────────────
+# MONO was the wrong tool and shipped as blank bars: TC.MONO removes COLOUR, so eye_strip
+# emitted bare `▄▄▄▄▄▄▄▄` and an absent teammate lost their FACE, not just their hue. The
+# owner saw "two empty lines with my own handle". Draining is a DESATURATION, not a colour
+# strip — map each pixel to its luminance so the portrait survives in greyscale and the
+# identity hue (the thing that reads as "present") is what goes.
+_DRAIN_SCALE = 0.72   # sit clearly below a present column without collapsing the shape
+_DRAIN_FLOOR = 26     # keep the darkest pixels off pure black so structure stays readable
+_RGB_RE = _re_drain.compile(r"\x1b\[(38|48);2;(\d{1,3});(\d{1,3});(\d{1,3})m")
+
+
+def _drain_rgb(match):
+    layer, r, g, b = match.group(1), *(int(x) for x in match.groups()[1:])
+    # Rec.709 luminance: the perceptual grey of that colour, so a bright hue stays bright
+    # and a dark one stays dark — which is exactly what preserves facial structure.
+    y = int(0.2126 * r + 0.7152 * g + 0.0722 * b)
+    y = max(_DRAIN_FLOOR, min(255, int(y * _DRAIN_SCALE)))
+    return "\x1b[%s;2;%d;%d;%dm" % (layer, y, y, y)
+
+
+def _drain_hue(rows):
+    """Greyscale an already-emitted sigil strip. Shape preserved, identity hue gone."""
+    return [_RGB_RE.sub(_drain_rgb, row) for row in rows]
+
+
 def team_columns(members, team_w, overflow, now, states=True, self_branch=""):
     """Render `members` into the four team-zone row strings — each EXACTLY `team_w` visible
     cells. Rows 1–2: the 8-cell eye_strip (natural palette, eyes visible) riding the RIGHT
@@ -1149,9 +1175,12 @@ def team_columns(members, team_w, overflow, now, states=True, self_branch=""):
         # An AWAY teammate's sigil renders in the MONO tier: the identity hue — the thing that
         # reads as "present" — drains out of their column, while the glyph SHAPE still says who
         # they are. Online teammates keep their natural palette, so the two never look alike.
-        strip_caps = _MONO_CAPS if (away and _MONO_CAPS is not None) else CAPS
         try:
-            strip2 = SIG.eye_strip(seed, strip_caps)          # 2 text-rows × 8 cells, eyes visible
+            # Always render the REAL strip, then drain. Rendering it through a colourless
+            # tier is what erased the face; desaturating a full-colour render keeps it.
+            strip2 = SIG.eye_strip(seed, CAPS)                # 2 text-rows × 8 cells, eyes visible
+            if away:
+                strip2 = _drain_hue(strip2)
             if len(strip2) < 2:
                 raise ValueError
         except Exception:

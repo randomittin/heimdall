@@ -50,6 +50,16 @@ on = colours("online")
 for t in ("away", "contributed", "member"):
     print("%s=%s" % (t, "distinct" if colours(t) != on else "IDENTICAL"))
 print("online_has_hue=%s" % ("yes" if len(on) > 1 else "no"))
+
+# A drained sigil must still be a FACE. The first drain used the MONO tier, which removes
+# colour outright, so an absent teammate rendered as blank `▄▄▄▄▄▄▄▄` bars — recognisable
+# as nobody. Draining is DESATURATION: the hue goes, the structure stays.
+import hmd_sigil as SIG
+strip = SIG.eye_strip("haid:probe.x-1", m.CAPS)
+drained = m._drain_hue(strip)
+shades = sorted(set(re.findall(r"38;2;(\d+);(\d+);(\d+)", "".join(drained))))
+print("drain_shades=%d" % len(shades))
+print("drain_all_grey=%s" % ("yes" if all(a == b == c for a, b, c in shades) else "no"))
 PY
 )"
 
@@ -68,7 +78,18 @@ for t in away contributed member; do
   esac
 done
 
-# 3. Online must carry MORE than the faint hue, or "distinct" would be trivially
+# 3. The drained strip must retain STRUCTURE — more than one shade — or the face is gone.
+case "$probe" in
+  *"drain_shades=0"*|*"drain_shades=1"*) bad "a drained sigil collapsed to one shade — the face is gone, not drained" ;;
+  *"drain_shades="*) ok ;;
+  *) bad "could not measure the drained sigil's shades" ;;
+esac
+case "$probe" in
+  *"drain_all_grey=yes"*) ok ;;
+  *) bad "a drained sigil still carries a non-grey pixel — the identity hue did not drain" ;;
+esac
+
+# 4. Online must carry MORE than the faint hue, or "distinct" would be trivially
 #    satisfied by draining everything, including the people who ARE here.
 case "$probe" in
   *"online_has_hue=yes"*) ok ;;
