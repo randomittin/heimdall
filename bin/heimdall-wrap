@@ -292,7 +292,11 @@ launch_tool() {
   fi
   local real; real="$(real_binary "$tool")"
   [ -n "$real" ] || die "$tool is not installed (not found on PATH) — the repo is wrapped; install $tool and run it"
-  HEIMDALL_WRAP_LAUNCHED=1 exec "$real"
+  # NO marker here. bin/heimdall is its only reader, and this exec goes to
+  # cursor/codex/gemini/aider instead — so setting it would not guard anything,
+  # it would only plant HEIMDALL_WRAP_LAUNCHED=1 in that tool's environ and in
+  # every descendant, disarming bare `hmd` for the rest of the session.
+  exec "$real"
 }
 
 # real_binary TOOL — the tool's absolute path with our own shim dir REMOVED from

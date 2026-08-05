@@ -2300,7 +2300,18 @@ case "${1:-}" in
     # interactive launch below, which is exactly the pre-§7 behaviour. This script
     # runs under `set -euo pipefail`, where a bare call to an absent helper exits
     # 127 and kills the whole launcher — so the guard is `[ -x ]`, never a bare call.
-    if [ "${HEIMDALL_WRAP_LAUNCHED:-0}" != "1" ]; then
+    if [ "${HEIMDALL_WRAP_LAUNCHED:-0}" = "1" ]; then
+      # ONE HOP, THEN GONE. heimdall-wrap set this on the `exec` that re-entered
+      # this script, so it lives in our environ and every process we go on to
+      # launch — the claude session, and every `hmd` the user runs INSIDE it —
+      # would inherit it. That turned a one-hop recursion guard into a permanent
+      # kill switch: bare `hmd` in a wrapped session silently took the task
+      # prompt instead of wrapping, on the entry point most people use for
+      # everything. Consume it here, where it has just done its only job, so the
+      # guard still stops the wrap→heimdall→wrap loop and stops nothing else.
+      # `unset` drops it from the exported environment, not just this shell.
+      unset HEIMDALL_WRAP_LAUNCHED
+    else
       WRAP_BIN="$PLUGIN_DIR/bin/heimdall-wrap"
       if [ -x "$WRAP_BIN" ]; then
         exec "$WRAP_BIN" launch
