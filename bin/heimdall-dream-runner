@@ -1,0 +1,221 @@
+#!/usr/bin/env bash
+# heimdall-dream-runner — the LAUNCHD-SIDE entry point for the nightly /dream.
+#
+# WHY THIS EXISTS (the 10-night silence).
+#   The nightly LaunchAgent used to run bin/heimdall-dream DIRECTLY. When the repo lives
+#   under a TCC-protected directory (~/Downloads, ~/Documents, ~/Desktop) launchd cannot
+#   read it — not the script, not the directory — because a LaunchAgent carries no TCC
+#   grant. The job died on its very first syscall with
+#       python3: can't open file '<repo>/bin/heimdall-dream': [Errno 1] Operation not permitted
+#   and, because ProgramArguments[0] was itself inside the protected tree, there was no
+#   code of ours left running to notice. Ten nights produced twelve log lines and nothing
+#   else. A scheduled job that fails invisibly is indistinguishable from one that never ran.
+#
+# WHAT THIS CHANGES.
+#   This runner is installed OUTSIDE the protected tree (default ~/.heimdall/bin), so it
+#   ALWAYS gets to run, even when the repo is unreachable. It PROBES the repo first and
+#   then either (a) execs the real dream, or (b) records a structured, machine-readable
+#   failure that bin/heimdall-dream-notice surfaces in the operator's next session.
+#   Either way the outcome is written down. Silence stops being a possible outcome.
+#
+# WHAT IT DELIBERATELY DOES NOT DO.
+#   It does NOT try to defeat TCC. That was measured, not assumed: a probe LaunchAgent
+#   whose program was /bin/sh at a NON-protected path was denied every read under
+#   ~/Downloads exactly as the repo-resident script was, while a write to ~/.heimdall
+#   succeeded. The denial follows the launchd JOB, not the interpreter's location, so
+#   "move the script" and "relocate the output" are both non-fixes. Restoring true
+#   unattended 03:00 runs on such a machine requires a Full Disk Access grant, which is
+#   a human clicking System Settings; this runner's job is to say so, precisely, instead
+#   of failing mute.
+#
+# USAGE
+#   heimdall-dream-runner --dream PATH --repo DIR [--status FILE] [dream args...]
+#
+#   Trailing args are forwarded verbatim to dream after `--repo DIR`, so the plist keeps
+#   encoding the full, readable overnight command:
+#       heimdall-dream-runner --dream <bin> --repo <repo> run --overnight
+#
+# ENV
+#   HEIMDALL_HOME          state dir (default $HOME/.heimdall)
+#   HEIMDALL_DREAM_STATUS  status file (default $HEIMDALL_HOME/dream-status.json)
+#
+# EXIT
+#   0   dream ran and succeeded
+#   75  EX_TEMPFAIL — the repo was unreachable; dream did NOT run (never a silent 0)
+#   *   dream's own exit code when dream ran and failed
+
+set -u
+
+SELF="$0"
+HEIMDALL_HOME="${HEIMDALL_HOME:-$HOME/.heimdall}"
+STATUS="${HEIMDALL_DREAM_STATUS:-$HEIMDALL_HOME/dream-status.json}"
+LABEL="com.heimdall.dream"
+
+DREAM=""
+REPO=""
+FORWARD=()
+
+die() { echo "heimdall-dream-runner: error: $*" >&2; exit 2; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dream)  DREAM="${2:-}"; shift 2 ;;
+    --repo)   REPO="${2:-}";  shift 2 ;;
+    --status) STATUS="${2:-}"; shift 2 ;;
+    --help|-h) sed -n '2,48p' "$SELF" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) FORWARD+=("$1"); shift ;;
+  esac
+done
+
+[ -n "$DREAM" ] || die "--dream is required"
+[ -n "$REPO" ]  || die "--repo is required"
+[ ${#FORWARD[@]} -gt 0 ] || FORWARD=(run --overnight)
+
+# ── JSON emission without jq ──────────────────────────────────────────────────────
+# The launchd PATH is /usr/bin:/bin:/usr/sbin:/sbin — jq is NOT on it, and a status
+# writer that depends on a tool the scheduled context lacks would fail exactly when it
+# is needed most. printf only.
+json_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\t'/ }"
+  s="${s//$'\n'/ }"
+  s="${s//$'\r'/ }"
+  printf '%s' "$s"
+}
+
+# write_status <result> <reason> <denied_path> <detail> <exit>
+# Written atomically (tmp + mv) so a reader never sees a half-written record.
+write_status() {
+  local result="$1" reason="$2" denied="$3" detail="$4" code="$5"
+  local dir tmp
+  dir="$(dirname "$STATUS")"
+  mkdir -p "$dir" 2>/dev/null || true
+  tmp="$STATUS.$$.tmp"
+  cat > "$tmp" <<EOF
+{
+  "schema": 1,
+  "ts": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "date": "$(date -u +%Y-%m-%d)",
+  "label": "$LABEL",
+  "result": "$(json_escape "$result")",
+  "reason": "$(json_escape "$reason")",
+  "repo": "$(json_escape "$REPO")",
+  "dream": "$(json_escape "$DREAM")",
+  "denied_path": "$(json_escape "$denied")",
+  "detail": "$(json_escape "$detail")",
+  "exit": $code
+}
+EOF
+  mv -f "$tmp" "$STATUS" 2>/dev/null || true
+}
+
+# ── the reachability probe ────────────────────────────────────────────────────────
+# Classify from the OS's OWN error text rather than guessing. EPERM ("Operation not
+# permitted") is the TCC signature; EACCES ("Permission denied") is ordinary mode bits;
+# ENOENT is the stale-path case (a plist pinned to a tree that was deleted). They need
+# different advice, so they get different reasons.
+PROBE_ERR=""
+PROBE_PATH=""
+
+# THE PROBE MUST ATTEMPT WHAT THE JOB ACTUALLY NEEDS, NOT MERELY STAT IT.
+# `ls -d <dir>` only stats the directory, which needs a lookup on the PARENT — it
+# succeeds on a directory whose own bits deny everything, so it reported "reachable"
+# for a repo dream could not read one line of. Listing the directory's CONTENTS is the
+# access dream genuinely requires, and reading a byte of the script is the access
+# launchd itself was refused. Probe both, for real.
+probe_dir() {
+  local path="$1" err
+  if err="$(ls -- "$path" 2>&1 >/dev/null)"; then
+    return 0
+  fi
+  PROBE_ERR="$err"
+  PROBE_PATH="$path"
+  return 1
+}
+
+probe_file() {
+  local path="$1" err
+  if err="$(head -c 1 -- "$path" 2>&1 >/dev/null)"; then
+    return 0
+  fi
+  PROBE_ERR="$err"
+  PROBE_PATH="$path"
+  return 1
+}
+
+classify() {
+  case "$1" in
+    *"Operation not permitted"*)    printf '%s' "tcc-denied" ;;
+    *"Permission denied"*)          printf '%s' "permission-denied" ;;
+    *"No such file or directory"*)  printf '%s' "missing-path" ;;
+    *)                              printf '%s' "probe-failed" ;;
+  esac
+}
+
+advice_for() {
+  case "$1" in
+    tcc-denied)
+      echo "  cause: macOS TCC denies this LaunchAgent access to the directory holding the repo."
+      echo "         A LaunchAgent carries no TCC grant, so every read under a protected folder"
+      echo "         (~/Downloads, ~/Documents, ~/Desktop) returns EPERM before dream can start."
+      echo "  fix:   run the dream from a normal terminal session, which DOES hold the grant:"
+      echo "           $DREAM --repo $REPO run"
+      echo "         to restore unattended 03:00 runs instead, grant Full Disk Access to the"
+      echo "         scheduled interpreter in System Settings > Privacy & Security, or move the"
+      echo "         repo out of the protected folder."
+      ;;
+    permission-denied)
+      echo "  cause: filesystem permissions deny this job access to the repo."
+      echo "  fix:   check ownership/mode on $PROBE_PATH"
+      ;;
+    missing-path)
+      echo "  cause: the scheduled path no longer exists — the plist is pinned to a deleted tree."
+      echo "  fix:   re-register the schedule from the live checkout:"
+      echo "           heimdall-dream-schedule install --repo <repo>"
+      ;;
+    *)
+      echo "  cause: the repo could not be read; the OS error is recorded verbatim above."
+      echo "  fix:   run '$DREAM --repo $REPO run' from a terminal to see the failure directly."
+      ;;
+  esac
+}
+
+# Both pinned paths matter: the repo dream must READ, and the dream script itself.
+BLOCKED=0
+if ! probe_dir "$REPO"; then
+  BLOCKED=1
+elif ! probe_file "$DREAM"; then
+  BLOCKED=1
+fi
+
+if [ "$BLOCKED" = 1 ]; then
+  REASON="$(classify "$PROBE_ERR")"
+  write_status blocked "$REASON" "$PROBE_PATH" "$PROBE_ERR" 75
+  # SHOUT into the log. This is the last thing the scheduled context can do, and it is
+  # the difference between "twelve error lines nobody reads" and a diagnosis.
+  echo "=============================================================================="
+  echo "heimdall dream BLOCKED — $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "  the nightly dream did NOT run. No report was written."
+  echo "  denied: $PROBE_PATH"
+  echo "  error:  $PROBE_ERR"
+  echo "  reason: $REASON"
+  advice_for "$REASON"
+  echo "  this failure is recorded at $STATUS and will be surfaced by heimdall-dream-notice"
+  echo "  at the start of your next Heimdall session."
+  echo "=============================================================================="
+  exit 75
+fi
+
+# ── reachable: run the real dream ────────────────────────────────────────────────
+"$DREAM" --repo "$REPO" "${FORWARD[@]}"
+RC=$?
+
+if [ "$RC" = 0 ]; then
+  write_status ok "" "" "" 0
+else
+  write_status error dream-failed "" "dream exited $RC" "$RC"
+  echo "heimdall dream FAILED — $DREAM exited $RC. Recorded at $STATUS." >&2
+fi
+exit "$RC"

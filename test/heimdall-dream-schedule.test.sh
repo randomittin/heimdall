@@ -95,7 +95,12 @@ mkdir -p "$CANON/bin/lib"
 cp "$CLI" "$CANON/bin/heimdall-dream-schedule"
 cp "$ROOT/bin/lib/real-home.sh" "$CANON/bin/lib/real-home.sh"
 cp "$DREAM" "$CANON/bin/heimdall-dream"
-chmod +x "$CANON/bin/heimdall-dream-schedule" "$CANON/bin/heimdall-dream"
+# heimdall-dream-runner is ProgramArguments[0]: the register path stages it OUTSIDE the
+# repo (see the TCC note in bin/heimdall-dream-schedule), so it is a fourth file the
+# register path touches and the fixture must carry it.
+cp "$ROOT/bin/heimdall-dream-runner" "$CANON/bin/heimdall-dream-runner"
+chmod +x "$CANON/bin/heimdall-dream-schedule" "$CANON/bin/heimdall-dream" \
+         "$CANON/bin/heimdall-dream-runner"
 git -C "$CANON" init -q
 git -C "$CANON" add -A >/dev/null 2>&1
 git -C "$CANON" -c user.email=t@t -c user.name=t commit -qm fixture >/dev/null 2>&1
