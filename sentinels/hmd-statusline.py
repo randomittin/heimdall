@@ -444,6 +444,39 @@ def identity(cwd, fallback, session_id=""):
         return cached   # fork failed → reuse last-known-good (== team-self), never $USER
     return _sigil_override_seed(fallback), fallback   # cold + broken fork → transient, UNCACHED
 
+_ROSTER_LIB = os.path.join(BIN_DIR, "lib", "repo_roster.py")
+
+
+def _github_handle(cwd, fallback):
+    """The GitHub login the owner is publicly known by, for the Row1 identity — else
+    `fallback` (the identity handle Row1 showed before).
+
+    `rj` is a git-config nickname. `randomittin` is the name on his commits, on his
+    teammates' walls and on every roster row — so the header was introducing him under the
+    one name that appears nowhere else in the product.
+
+    ONE RESOLVER, REUSED. repo_roster.local_github_login() already answers this (the
+    git-config / HAID / `gh api user` chain, cached positively and negatively), and the
+    roster exists so that there is a SINGLE answer to "who am I". Re-deriving it here would
+    put a second chain directly above the wall the first one builds, free to disagree with
+    it — so this asks, and does not re-implement.
+
+    CACHE READS ONLY (`spawn=False`). This runs on every keystroke: it may not probe `gh`,
+    and may not even fork the roster's detached refresh, because the wall refresh child
+    already warms this exact cache file — the signal simply lands on a later prompt. A
+    missing `gh`, an unauthenticated or rate-limited one, no network, and a cold cache all
+    resolve to '' and fall back, so Row1 degrades to the previous handle and is NEVER blank.
+    Never raises: a broken or absent roster lib is just another way to have no signal."""
+    try:
+        spec = importlib.util.spec_from_file_location("hmd_repo_roster", _ROSTER_LIB)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        login = mod.local_github_login(cwd, spawn=False)
+    except Exception:
+        return fallback
+    return login.strip() if isinstance(login, str) and login.strip() else fallback
+
+
 def _sigil_override_seed(seed):
     """Honor `hmd sigil set <hero>` (unlocked after >=5 runs — matches the heimdall-sigil CLI
     threshold); else the seed unchanged."""
@@ -1132,6 +1165,128 @@ def _team_branch_seg(branch):
     return f"{BRANCHC}⎇{b}{X}"
 
 
+# ── the wall NAME LABEL — collision-safe truncation ───────────────────────────────────────
+# THE PROPERTY: no two visible columns may share a rendered label.
+#
+# The roster deliberately REFUSES to merge two people it cannot prove are one, because a
+# wrong merge hides a human. `ravikiran2904` and `ravikiranuo` are two such people. The
+# renderer then re-merged them at the very last step: an 8-cell name slot cut both at 7
+# chars + `…` and emitted `ravikir…` twice, adjacent. Every bit of upstream caution was
+# undone by the final `[:7]`.
+#
+# The cut itself was never the defect — a real `…`, consistently placed, reads as
+# deliberate rather than broken. What it lacked was a fallback for the case where the
+# difference does not live in the head. So the label is chosen off a LADDER, and a name
+# only climbs it when it actually collides:
+#
+#   1. the PLAIN head cut (`priyadh…`)  — unchanged for everyone who is already unique,
+#      so collision handling never rewrites the innocent;
+#   2. a MIDDLE cut (`ravi…904` / `ravi…nuo`) — the same 8 cells, respent on the part
+#      that actually differs, with the narrowest tail that separates the group widened
+#      to _LABEL_TAIL_MIN so the suffix reads as a suffix and not as a typo;
+#   3. an explicit ORDINAL (`akshat·2`) — reached only when the names carry no difference
+#      to show at all. Two rows with the same handle are a roster-level anomaly, but the
+#      guarantee this makes cannot depend on an invariant the renderer cannot see, and a
+#      visible ordinal at least says "two rows claim this name" instead of quietly
+#      drawing one person twice.
+_LABEL_TAIL_MIN = 3   # the shortest tail that reads as a suffix rather than a stray char
+
+
+def _label_key(label):
+    """(characters, was-it-cut) — what a reader actually tells two columns apart by.
+
+    The `…` is only a signal where it separates a CUT label from a WHOLE one: `priyadh…`
+    beside `priyadh` honestly says "there is more name here that did not fit". Between two
+    cut labels its POSITION carries no identity at all, so `superpe…` beside `superp…e` is
+    two renderings of the same seven characters and reads as one person. Keying on the
+    pair is what stops the ladder from answering a collision by shuffling the ellipsis."""
+    return (label.replace("…", "").strip(), "…" in label)
+
+
+def _mid_label(name, width, tail):
+    """`name` cut in the MIDDLE — `head…tail` — in exactly `width` cells, or None when the
+    cut cannot be made honestly.
+
+    A name that already FITS is never cut: `akshat` is six characters in an eight-cell
+    slot, so `akshat…t` would claim characters were elided that never existed. Inventing a
+    cut to win a tie-break is fabrication, and it is not available to this ladder."""
+    head = width - 1 - tail
+    if head < 1 or tail < 1 or len(name) <= width:
+        return None
+    return LAYOUT.pad_or_truncate(name[:head] + "…" + name[-tail:], width)
+
+
+def _ordinal_label(name, width, k):
+    """`name` with an explicit `·k` discriminator — `akshat·2` — in exactly `width` cells."""
+    suffix = "·%d" % k
+    body = LAYOUT.pad_or_truncate(name, max(1, width - len(suffix))).rstrip()
+    return LAYOUT.pad_or_truncate(body + suffix, width)
+
+
+def wall_labels(names, width):
+    """`names` → one EXACTLY-`width`-cell label each, with NO two labels equal.
+
+    Deterministic: the same roster renders the same labels every time. Never raises —
+    every rung of the ladder is a pure string operation over data already in hand.
+    """
+    names = [str(n or "") for n in names]
+    plain = [LAYOUT.pad_or_truncate(n, width) for n in names]
+    out = list(plain)
+
+    # ── rung 2, per GROUP. Distinctness is MONOTONE in the tail length — two names whose
+    # last `t` chars differ also differ over their last `t+1` — so the first tail that
+    # separates a group is the threshold, and widening it to _LABEL_TAIL_MIN can only
+    # ever keep it separated. That is why the widen loop below is safe to take blind.
+    for label in sorted({p for p in plain if plain.count(p) > 1}):
+        idxs = [i for i, p in enumerate(plain) if p == label]
+        for tail in range(1, width - 1):
+            cand = [_mid_label(names[i], width, tail) for i in idxs]
+            if any(c is None for c in cand) or len(set(cand)) != len(cand):
+                continue
+            wider = [_mid_label(names[i], width, max(tail, _LABEL_TAIL_MIN)) for i in idxs]
+            if all(c is not None for c in wider) and len(set(wider)) == len(wider):
+                cand = wider
+            for i, c in zip(idxs, cand):
+                out[i] = c
+            break
+        else:
+            # No cut anywhere in the slot exposes a difference — the names share both a
+            # head and a tail (`superpe-alpha-node` / `superpe-omega-node`), or they are
+            # the same string twice. Ordinal the WHOLE group rather than only the loser:
+            # `super…·1` beside `super…·2` reads as a deliberate pair, where leaving one
+            # bare would quietly nominate it as the real one.
+            for n, i in enumerate(idxs, 1):
+                out[i] = _ordinal_label(names[i], width, n)
+
+    # ── the global sweep. A middle cut resolves its own group but is not yet proven
+    # unique against the REST of the wall (two groups with different heads can share a
+    # shorter head), and names that differ only in the middle never separated at all.
+    # One ordered pass settles both, and is the only place rung 3 can be reached.
+    seen = {}
+    for i, label in enumerate(out):
+        if _label_key(label) not in seen:
+            seen[_label_key(label)] = i
+            continue
+        alt = None
+        for tail in range(1, width - 1):
+            cand = _mid_label(names[i], width, tail)
+            if cand is not None and _label_key(cand) not in seen:
+                alt = cand
+                break
+        if alt is None:
+            # `seen` holds at most len(names)-1 keys and this range yields len(names)+1
+            # DISTINCT candidates (the `·k` suffixes differ and are never clipped, since
+            # the body is shortened to make room), so one of them is always free.
+            for k in range(2, len(names) + 3):
+                cand = _ordinal_label(names[i], width, k)
+                if _label_key(cand) not in seen:
+                    alt = cand
+                    break
+        out[i] = alt if alt is not None else label
+        seen[_label_key(out[i])] = i
+    return out
+
+
 # ── the AWAY hue drain ────────────────────────────────────────────────────────────────────
 # MONO was the wrong tool and shipped as blank bars: TC.MONO removes COLOUR, so eye_strip
 # emitted bare `▄▄▄▄▄▄▄▄` and an absent teammate lost their FACE, not just their hue. The
@@ -1168,6 +1323,10 @@ def team_columns(members, team_w, overflow, now, states=True, self_branch=""):
     (r1, r2, r3, r4). `self_branch` is retained for callers but no longer gates the branch line."""
     lp = " " * (LAYOUT.TEAM_MEMBER_W - LAYOUT.TEAM_STRIP_W)   # 7c left pad → strip on the right 8c
     gap = " " * LAYOUT.TEAM_MEMBER_GAP
+    # `members` is ALREADY the visible set — main() slices it to team_zone_alloc's shown_n
+    # before calling here — so the labels are resolved against exactly the columns a viewer
+    # will see, which is the scope the no-two-columns-alike property is about.
+    labels = wall_labels([m.get("user") for m in members], LAYOUT.TEAM_STRIP_W)
     tops = []; bots = []; names = []; sts = []
     for i, m in enumerate(members):
         seed = m.get("haid") or m.get("user") or m.get("sigil") or "?"
@@ -1193,8 +1352,7 @@ def team_columns(members, team_w, overflow, now, states=True, self_branch=""):
         # which is the strongest "this person is here" cue on the whole wall.
         hue = None if away else (_team_hue(seed, m.get("sigil")) if USE_COLOR else None)
         ncol = sgr(SIG._hex_rgb(hue)) if hue else (FAINT if away else DIM)
-        nm = LAYOUT.pad_or_truncate(str(m.get("user") or ""), LAYOUT.TEAM_STRIP_W)
-        names.append(g + lp + f"{ncol}{nm}{X}")
+        names.append(g + lp + f"{ncol}{labels[i]}{X}")
         # Row4: EVERY same-repo teammate with a recorded branch shows it UNDER their name
         # (the branch line) — matching OR differing from self_branch; a teammate with no
         # branch falls back to the state segment. The branch line rides even in the mid tier
@@ -1724,7 +1882,12 @@ def main():
     # tier-narrowed Row1 drops `· Opus 4.8` / `heimdall:branch` as whole units — never a
     # mid-token `…` (Spec v2 §2). Reserve 1c so the two runs never abut with no gap.
     avail1 = max(0, content_budget - vis(right1) - 1)
-    left1 = row1_left(handle, model, repo_seg, cseg, avail1)
+    # DISPLAY ONLY. `handle` stays the identity everything else is keyed on — the presence
+    # beat published to teammates and the self-exclusion that keeps the owner off his own
+    # wall — because those match on what the ledger and the roster already know him as.
+    # Row1 is the one place a human is being INTRODUCED, so it is the one place that spends
+    # a lookup on the name that human answers to in public.
+    left1 = row1_left(_github_handle(cwd, handle), model, repo_seg, cseg, avail1)
 
     # ── Row2 — the context gauge (CTX%·↓tokens on the fill, $cost on the track end) ──
     # narrow → bar-only (labels off). render_gauge splices the labels inside the bar's cell

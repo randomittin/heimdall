@@ -426,12 +426,20 @@ def local_git_identity(repo):
     return values[0], values[1]
 
 
-def local_github_login(repo, *, cache_dir=None, blocking=None, now=None):
+def local_github_login(repo, *, cache_dir=None, blocking=None, now=None, spawn=True):
     """The login this machine is AUTHENTICATED to GitHub as, or ''.
 
     Same degradation and caching policy as the collaborator probe — a missing/unauthed/offline
     `gh` is cached negatively so it is not re-shelled every prompt, and on the hot path a cold
-    cache spawns the detached refresh and this render simply goes without the signal."""
+    cache spawns the detached refresh and this render simply goes without the signal.
+
+    `spawn=False` makes this a PURE CACHE READ: a cold or stale cache returns the stale answer
+    (or '') without even the detached refresh fork. That is what the statusline Row1 needs —
+    it resolves this on every keystroke, and the wall refresh child already warms this exact
+    file, so paying a fork here would buy a signal that is arriving anyway. This is a mode of
+    the ONE resolver on purpose: a caller that cannot afford the fork must still get its answer
+    from this function, because a second chain is how the header and the roster start
+    disagreeing about who you are."""
     when = float(now) if now is not None else time.time()
     override = os.environ.get("HMD_ROSTER_SELF_LOGIN")
     if override is not None:
@@ -446,7 +454,8 @@ def local_github_login(repo, *, cache_dir=None, blocking=None, now=None):
             payload = _github_user_probe(when)
             _cache_write(path, payload)
         else:
-            _spawn_refresh(repo, git_window_days(), cache_dir)
+            if spawn:
+                _spawn_refresh(repo, git_window_days(), cache_dir)
             if payload is None:
                 return ""
     if not isinstance(payload, dict) or not payload.get("ok"):
