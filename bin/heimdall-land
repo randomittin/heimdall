@@ -344,7 +344,20 @@ if git -C "$REPO" rev-parse --verify -q "$MAIN" >/dev/null; then
     emit_and_exit 3
   fi
 fi
-git -C "$REPO" branch -f "$MAIN" "$LANDED_SHA" >/dev/null 2>&1 || true
+# Advancing local main is NOT best-effort. The push below publishes refs/heads/$MAIN,
+# so a swallowed failure here ships the OLD sha under a land receipt: local main
+# unchanged, remote main unchanged, land still logging "pushed 'main'" and exiting 0
+# "landed". git refuses `branch -f` on a branch another worktree holds — the normal
+# Heimdall layout, main in one worktree and work in another — so this is a live
+# failure mode, not a theoretical one. Surface it and STOP rather than publish stale.
+if ! BRANCH_ERR="$(git -C "$REPO" branch -f "$MAIN" "$LANDED_SHA" 2>&1)"; then
+  DECISION="stopped"
+  REASON="could not advance local '$MAIN' to the landed commit — refusing to push a stale ref"
+  ESCALATION="git could not move '$MAIN' to $LANDED_SHA in $REPO: ${BRANCH_ERR:-unknown git error}. The merge is committed in the integration worktree, but '$MAIN' still points at $MAIN_SHA — pushing now would publish the OLD state under a land receipt. Free the branch (usually: the worktree that has '$MAIN' checked out) and re-run land."
+  log "land: STOP — $REASON"
+  log "land: git said: ${BRANCH_ERR:-<no output>}"
+  emit_and_exit 3
+fi
 
 # Push to SHARED main: a normal (non-force) push, authorized by the clean
 # merged-state gate. Held for the human under --no-shared-push (or when a force

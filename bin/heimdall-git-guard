@@ -21,7 +21,17 @@ repo="${1:-}"
 if [ -z "$repo" ]; then
   repo="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 fi
-lock="$repo/.git/index.lock"
+
+# The index lock lives in the GIT DIR — which is NOT "$repo/.git" in a linked worktree.
+# There `.git` is a FILE ("gitdir: …") and the real dir is <common>/.git/worktrees/<name>,
+# so the old "$repo/.git/index.lock" path never existed and the guard silently found
+# nothing to heal in exactly the place Heimdall's own agents run (hmd:coder and
+# hmd:wave-executor spawn with `isolation: worktree`). `rev-parse --absolute-git-dir`
+# (git >= 2.13) returns the right dir for BOTH shapes: <repo>/.git in a normal checkout,
+# the per-worktree dir in a worktree. Falls back to the literal path when rev-parse
+# cannot answer (not a repo, or a pre-2.13 git), which is the previous behaviour.
+gitdir="$(git -C "$repo" rev-parse --absolute-git-dir 2>/dev/null || printf '%s/.git' "$repo")"
+lock="$gitdir/index.lock"
 
 # Is a git process alive (i.e. might legitimately own the lock)? Overridable via
 # HMD_GIT_GUARD_PGREP for testing the conservative wait/preserve path deterministically
