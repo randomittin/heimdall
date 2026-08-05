@@ -1,56 +1,31 @@
 # Show HN — draft
 
-> ## ⛔ NOT POSTED. NOT SUBMITTED. DO NOT POST THIS YET.
-> **Every `[RECEIPT: …]` below is an unfilled measurement.** The founding cohort
-> (`docs/specs/heimdall-viral-now-plan.md` §Step 2 — 3–5 teams, 10–25 devs, two weeks of daily
-> team mode) **has not run**. There are no cohort numbers, so none are written here. A `[RECEIPT:]`
-> marker names exactly which measurement fills it and where that measurement comes from.
+> ## READY TO POST — gates-only form (§4 fallback, executed)
+> The founding cohort (`docs/specs/heimdall-viral-now-plan.md` §Step 2 — 3–5 teams, two weeks)
+> **did not run**, so every cohort claim has been CUT rather than estimated. What remains is
+> only what is already true and traces to a committed artifact.
 >
-> **Hard gate: if a single `[RECEIPT:]` marker is still in the text, the post does not go out.**
-> Filling one with an estimate, a round number, or a plausible-sounding figure is the worst thing
-> anyone can do to this repo. A Show HN with a fabricated receipt destroys the only asset the
-> product has.
+> This is the outcome §4 sanctions in its own words: *"Shipping the gates-only version is a
+> normal outcome, not a downgrade. Shipping the cohort version with invented numbers is not an
+> outcome, it is a fraud."*
 >
-> Every non-cohort number below is already true today and traces to a committed artifact. Those
-> are the fallback: if the cohort produces nothing quotable, the post ships on the flagship and
-> corpus receipts alone with the cohort section cut — see §4.
+> **Zero `[RECEIPT:]` markers remain.** If one reappears, the post does not go out.
 
 ---
 
-## 1. Title — three options
+## 1. Title
 
 HN rules that apply (`docs/specs/heimdall-ship-spec.md` §L1): no superlatives, no "revolutionary,"
 lowercase honesty, and **any number in the title must also appear in the body.**
 
-**Option A — the measurement is the headline (preferred; matches the shape already written down in
-`docs/specs/heimdall-viral-now-plan.md:21`):**
+The gates-only title sanctioned in §4 and in `docs/specs/heimdall-ship-spec.md:84`:
 
 ```
-Show HN: Verification gates for AI coding agents – what [RECEIPT: N] teams' watchmen caught in 2 weeks
+Show HN: Heimdall – verification gates for coding agents that caught their own author's bug
 ```
-`[RECEIPT: N]` = the count of cohort teams that completed the full two-week window running team
-mode daily. Source: the cohort roster. A team that installed and stopped does not count; say
-"completed" or say nothing.
 
-**Option B — the catch count leads:**
-
-```
-Show HN: [RECEIPT: D] gate denials from [RECEIPT: N] teams running AI coding agents for two weeks
-```
-`[RECEIPT: D]` = total deny verdicts recorded across cohort repos in the window. Source: the PMR
-corpus spool aggregated across cohort repos, deduplicated per case. `[RECEIPT: N]` as above.
-Both numbers must appear in the body table.
-
-**Option C — the false positives lead (the most defensible, the least clickable):**
-
-```
-Show HN: We gated [RECEIPT: N] teams' AI agents for two weeks – every catch, including the ones we got wrong
-```
-`[RECEIPT: N]` as above. Requires `[RECEIPT: FP]` (false-positive gate reports, and the falsifier
-added for each) to be non-zero and written up in the body. If the cohort produced zero false
-positives, this title is a lie by implication — use A instead.
-
-Pick one. Do not run a second one later as a "relaunch."
+It carries no number, so it needs no cohort receipt. The claim it makes is the R-1
+golden-reference incident, which is committed and reproducible today.
 
 ---
 
@@ -64,24 +39,10 @@ every change — a check the implementing agent never sees, proven able to go re
 trusted green — and blocks the push until that check passes. The agent's own test suite is a
 claim, not evidence, because the thing under test wrote it.
 
-For the last two weeks, [RECEIPT: N] teams ([RECEIPT: DEVS] developers) ran it on their own repos,
-on their own machines, with their own agents. This is what the gates caught:
-
-[RECEIPT: the catch table. One row per class, each row a real case, each with what the gate was,
-what it caught, and the commit or case id. Source: cohort deny cases in the PMR corpus spool +
-the cohort checklist in docs/specs/heimdall-viral-now-plan.md:13 — a semantic-conflict deny on a
-shared repo, a redum consolidation across two devs, a false-positive report that got tuned and
-gained a falsifier, a presence bug found on a machine that is not mine, one full chat-ops
-investigate on a cohort repo. Anonymized per the k-rule: the cohort is under 20 teams, so either
-aggregate or get explicit named consent per team.]
-
-[RECEIPT: FP] of those were the gate being wrong. Each one has a falsifier now, so it cannot be
-wrong the same way twice. [RECEIPT: R] cohort cases were promoted into standing rules — reviewed
-by hand, weekly, credited to the team that hit them.
-
-What is already true and does not need the cohort: two flagship gates hold a mutation-kill score
-of 1.0 — exchange-lob at 6 of 6 injected mutants caught, emulator-gb at 3 of 3
-(evals/flagship/STATUS.md). The regression corpus is 13 cases, 13 caught, 100% at v0.1
+Three gates hold a mutation-kill score of 1.0: exchange-lob at 6 of 6 injected mutants caught,
+emulator-gb at 3 of 3 (evals/flagship/STATUS.md), and the cross-tenant isolation oracle at 23 of
+23 — every mutant a real breach attempt. Reproduce any of them with
+`bin/falsify <domain> --assert-score 1.0`. The regression corpus is 13 cases, 13 caught, 100% at v0.1
 (evals/corpus/CORPUS-STATUS.md), published as a time series with its dips visible rather than as
 an adjective.
 
@@ -119,11 +80,6 @@ the corpus from 9/9 to 7/9 and exited non-zero. That dip is the point: if a genu
 leaves the corpus green, the expectations were regenerated in the same breath as the reference,
 which is a tautology with a checkmark. It recovered to 9/9 only after every expectation was
 re-pinned by replaying the input and capturing the divergence the oracle actually emitted.
-
-The cohort numbers in the post are from [RECEIPT: N] teams over two weeks. [RECEIPT: the two or
-three individual cases worth telling in full — the semantic-conflict deny, the false positive we
-got wrong and the falsifier we added for it. Named cases, from the cohort checklist, with the
-commit sha of each fix. No case, no sentence.]
 
 Run it on your own repo, it takes one command each:
 
