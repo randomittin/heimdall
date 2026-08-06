@@ -1458,22 +1458,30 @@ def micro(seed_or_hero, color=None, caps=None):
 # DEDICATED PATH: sigil_render()/the goldens are byte-UNTOUCHED — eye_strip is a parallel
 # crop over the SAME resolved 8×8 grid (custom_for for heroes, grid_for for curated/animal),
 # packed via the shared `_cell` (`▄`: fg = BOTTOM px, bg = TOP px). 8 cols × 2 text-rows.
-def _eye_pixels(seed_or_hero):
+def _eye_pixels(seed_or_hero, want_eye=False):
     """(pxfn, eye_count) for a seed — the ONE resolution both strip widths share.
 
     `pxfn(r, c)` is the RGB of grid pixel (r, c); `eye_count[r]` is how many EYE pixels sit
     in grid row r (what _eye_strip_top centers the crop window on). A hero resolves through
     its authored TOKEN grid + palette; every other seed through the composited VALUE grid —
     exactly as before, so eye_strip's bytes are unchanged. Raises for a seed the sigil core
-    cannot resolve; both callers catch that and degrade to blank rows."""
+    cannot resolve; both callers catch that and degrade to blank rows.
+
+    `want_eye=True` additionally returns `iseye(r, c)` — whether that pixel IS an eye — which
+    the mini strip needs to protect eye pixels from being averaged away. It is a third return
+    value rather than the default so eye_strip's call signature and bytes stay untouched."""
     got = custom_for(seed_or_hero)
     if got is not None:                                  # hero: authored token grid + palette
         grid, pal = got
-        return ((lambda r, c: pal.get(grid[r][c], pal['.'])),
-                [sum(1 for c in range(W) if grid[r][c] == '2') for r in range(W)])
-    grid, hue, eye = grid_for(seed_or_hero)              # curated / animal: value grid
-    return ((lambda r, c: cell_color(grid[r][c], hue, eye)),
-            [sum(1 for c in range(W) if grid[r][c] == 2) for r in range(W)])
+        pxfn = lambda r, c: pal.get(grid[r][c], pal['.'])
+        iseye = lambda r, c: grid[r][c] == '2'
+        count = [sum(1 for c in range(W) if grid[r][c] == '2') for r in range(W)]
+    else:
+        grid, hue, eye = grid_for(seed_or_hero)          # curated / animal: value grid
+        pxfn = lambda r, c: cell_color(grid[r][c], hue, eye)
+        iseye = lambda r, c: grid[r][c] == 2
+        count = [sum(1 for c in range(W) if grid[r][c] == 2) for r in range(W)]
+    return (pxfn, iseye, count) if want_eye else (pxfn, count)
 
 
 def _eye_strip_top(eye_count, default=3, win=4):
@@ -1525,17 +1533,34 @@ def eye_strip(seed_or_hero, caps=None):
 # left content panel until its Row4 rate-limit BARS self-downgraded to plain text and the
 # Row3 gate row dropped its details. Halving the strip is where the headroom comes from.
 #
-# WHY A BOX-AVERAGE AND NOT A CROP — this was MEASURED over all 58 heroes, not assumed
-# (test/heimdall-sigil-eyestrip-mini.test.sh re-derives every number and locks it):
-#   • 2×1 horizontal box-average : median 6 distinct shades, 1 hero under 3, 0 collisions
-#   • face bounding-box crop     : median 3 shades, 8 heroes under 3, and it drains some
-#                                  heroes to ONE shade — the exact 2-shade-blob regression
-#                                  3f5e959 was written to fix
-#   • eye-preserving average     : median 5 shades, 2 heroes under 3, 0 collisions
-# The average WINS because it keeps all eight source columns' information: two adjacent
-# pixels of different hues produce a THIRD, intermediate tone, so compressing the strip
-# adds shades rather than spending them. The 4-cell strip collides on 0 of the 1653 hero
-# pairs — exactly as identity-bearing as the 8-cell one.
+# WHY A BOX-AVERAGE WITH AN EYE RESCUE — MEASURED over all 58 heroes + 12 real HAIDs, not
+# assumed (test/heimdall-sigil-eyestrip-mini.test.sh re-derives every number and locks it;
+# `shades` = distinct rendered colours, `eyes` = seeds whose authored eye colour survives out
+# of the 11 whose 8-cell strip shows it, `drain` = worst shade count after _drain_hue):
+#   • 2×1 average + EYE RESCUE : shades med 6 min 3, 0 under 3, 0 regress, eyes 11/11, drain 3 ✓
+#   • plain 2×1 average        : shades med 6 min 2, 1 under 3, 0 regress, eyes  3/11, drain 2
+#   • 2×1 average, ALWAYS keep : shades med 5 min 2, 2 under 3, 1 regress, eyes 11/11, drain 2
+#   • face bounding-box crop   : shades med 3 min 2, 8 under 3, 7 regress, eyes  6/11, drain 1
+# The rescue is not a tie-break — it strictly dominates all three rivals on every column. All
+# four collide on 0 of the 1653 hero pairs, so identity is not what separates them.
+#
+# An average beats a crop outright: it keeps all eight source columns' information, and two
+# adjacent pixels of different hues produce a THIRD, intermediate tone, so compressing the
+# strip ADDS shades rather than spending them. The crop throws half the face away and drains
+# heroes to ONE shade — the exact 2-shade-blob regression 3f5e959 was written to fix.
+#
+# THE EYE RESCUE IS THE WHOLE POINT, and it is why the plain average lost despite the same
+# median. Many heroes have SINGLE-PIXEL eyes: daredevil's sit at columns 1 and 6, so the pairs
+# (0,1) and (6,7) blend each eye into the surrounding body and the authored eye colour vanishes
+# from the strip entirely — only 3 of 11 eyes survive. That is "the hair crop" failure by
+# another route, a face rendered without its eyes, which heimdall-statusline-fullbleed.test.sh
+# gates as TEAM-UNCUT ("teammate eye color present on rows 1–2").
+#
+# But the obvious carve-out — keep EVERY eye pixel verbatim — overcorrects and costs a hero
+# shades (see _keep_eyes): antman's eye band is half eye pixels, so every pair turns pure eye
+# colour and his signature red disappears. It trades one identity failure for another. Rescuing
+# the eye into ONE cell, and only when the average erased it, buys back all 11 eyes at no cost
+# to any hero's palette. The eyes must survive compression; the rest of the face may blend.
 EYE_STRIP_MINI_W = W // 2      # 4 cells: one output cell per adjacent source-column pair
 
 
@@ -1544,27 +1569,49 @@ def _px_avg(a, b):
     return ((a[0] + b[0] + 1) // 2, (a[1] + b[1] + 1) // 2, (a[2] + b[2] + 1) // 2)
 
 
+def _keep_eyes(px, rows, pxfn, iseye):
+    """Guarantee the seed's EYE COLOUR survives the 2:1 squeeze. Mutates `px` in place.
+
+    Restores the eye into exactly ONE cell, and ONLY when the averaging erased it outright.
+    That "only when lost" condition is the whole rule: preserving every eye pixel
+    unconditionally repaints a hero whose eye TOKEN covers a large area (antman's band is
+    half eye pixels) entirely in eye colour, erasing his signature red — trading one identity
+    failure for another. Averaging already preserves an eye whose pair is two eye pixels,
+    since the average of two equal pixels is that pixel, so the dense heroes need no help and
+    the sparse ones get exactly as much as the property requires.
+
+    The restored cell is the pair carrying the most eye pixels (ties: topmost, then leftmost),
+    so the eye lands where the face actually has one rather than at an arbitrary index."""
+    eye = next((pxfn(r, c) for r in rows for c in range(W) if iseye(r, c)), None)
+    if eye is None or any(p == eye for row in px for p in row):
+        return
+    def density(rc):
+        i, c = rc
+        return (sum(1 for k in (2 * c, 2 * c + 1) if iseye(rows[i], k)), -i, -c)
+    i, c = max(((i, c) for i in range(len(rows)) for c in range(EYE_STRIP_MINI_W)), key=density)
+    px[i][c] = eye
+
+
 def eye_strip_mini(seed_or_hero, caps=None):
     """The seed's eye strip at HALF width — 2 `▄` text-rows, EXACTLY 4 cells each.
 
     Same contract as eye_strip (same seeds, same 4 pixel-rows of vertical detail, same
     auto-centered eye window, same one-pass `caps` tier downgrade, never raises), with the
-    eight source columns box-averaged down to four (see the section header for why that
-    compression and not a crop). Degrades to two blank 4-cell rows on ANY fault — the
-    statusline must never error."""
+    eight source columns box-averaged down to four — and the authored eye colour RESCUED into
+    one cell when the average would have erased it, because a single-pixel eye otherwise
+    blends into the face and leaves a teammate rendered eyeless (see the section header).
+    Degrades to two blank 4-cell rows on ANY fault — the statusline must never error."""
     caps = caps or TC.detect()
     blank = caps.emit(" " * EYE_STRIP_MINI_W)
     try:
-        pxfn, eye_count = _eye_pixels(seed_or_hero)
+        pxfn, iseye, eye_count = _eye_pixels(seed_or_hero, want_eye=True)
         top = _eye_strip_top(eye_count)                  # 4-px window top row, eye-centered
-        lines = []
-        for tr in (top, top + 2):                        # (top,top+1),(top+2,top+3)
-            line = ""
-            for c in range(EYE_STRIP_MINI_W):
-                lo, hi = 2 * c, 2 * c + 1                # the adjacent source-column pair
-                line += _cell(_px_avg(pxfn(tr, lo), pxfn(tr, hi)),
-                              _px_avg(pxfn(tr + 1, lo), pxfn(tr + 1, hi)))
-            lines.append(line)
+        rows = (top, top + 1, top + 2, top + 3)          # the 4 pixel-rows of the crop window
+        px = [[_px_avg(pxfn(r, 2 * c), pxfn(r, 2 * c + 1))     # each output pixel = one
+               for c in range(EYE_STRIP_MINI_W)] for r in rows]  # adjacent source-column pair
+        _keep_eyes(px, rows, pxfn, iseye)                # …unless that lost the eyes entirely
+        lines = ["".join(_cell(px[tr][c], px[tr + 1][c])  # ▄: bg = TOP px, fg = BOTTOM px
+                         for c in range(EYE_STRIP_MINI_W)) for tr in (0, 2)]
     except Exception:
         return [blank, blank]
     return caps.emit("\n".join(lines)).split("\n")

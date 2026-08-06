@@ -4,21 +4,28 @@
 # teammates cost ~106 cells of wall instead of 151 and the left content panel keeps its
 # full-tier floor.
 #
-# WHY A MEASURED COMPRESSION, NOT A CROP. Three candidates were rendered for all 58 heroes
-# and scored before one was chosen (scratch harness, numbers reproduced by section 3/4 here):
-#   (a) 2×1 horizontal box-AVERAGE  — median 6 shades, 1 hero under 3, 0 collisions
-#   (b) face bounding-box crop      — median 3 shades, 8 heroes under 3, and a DRAINED strip
-#                                     collapsing to ONE shade (the exact 3f5e959 regression)
-#   (c) eye-preserving 2×1 average  — median 5 shades, 2 heroes under 3, 0 collisions
-# (a) won on every axis, so (a) is what ships. This suite locks the properties that decided
-# it, so a future "simplification" to a crop goes RED instead of quietly losing the faces.
+# WHY A MEASURED COMPRESSION, NOT A CROP. Four candidates were rendered for all 58 heroes
+# (+ 12 real HAIDs for the eye count) and scored before one was chosen — every number below is
+# re-derived by the sections here and by --prove-red, which owns a falsifier for each loser:
+#   (a) plain 2×1 box-AVERAGE      — shades med 6 min 2, 1 under 3, 0 regress, eyes  3/11
+#   (b) face bounding-box crop     — shades med 3 min 2, 8 under 3, 7 regress, eyes  6/11, and
+#                                    a DRAINED strip collapsing to ONE shade (3f5e959, exactly)
+#   (c) average, keep EVERY eye px — shades med 5 min 2, 2 under 3, 1 regress, eyes 11/11
+#   (d) average + EYE RESCUE       — shades med 6 min 3, 0 under 3, 0 regress, eyes 11/11  ✓
+# (d) — average everywhere, then restore the authored eye into ONE cell IFF the average erased
+# it — strictly dominates all three on every column, so (d) ships. All four collide on 0 of the
+# 1653 hero pairs, so identity is not what separates them; the eyes and the shade floor are.
+# This suite locks the properties that decided it, so a future "simplification" to a crop or to
+# the obvious plain average goes RED instead of quietly rendering teammates eyeless.
 #
 # CONTRACT:
 #   1. SHAPE      — exactly 2 text-rows × EXACTLY 4 visible cells, for all 58 heroes, real
 #                   HAIDs, toy seeds; TOTAL (garbage/None/int never raises, still 2×4).
-#   2. SHADES     — a mini strip keeps >= 3 distinct RGB values for a typical hero, and NEVER
-#                   fewer than that hero's own 8-cell eye_strip: compression may not cost a
-#                   hero shades it already had. A 1–2 shade blob is the bug 3f5e959 fixed.
+#   2. SHADES     — EVERY hero's mini strip keeps >= 3 distinct RGB values, and never fewer
+#                   than that hero's own 8-cell eye_strip: compression may not cost a hero
+#                   shades it already had. A 1–2 shade blob is the bug 3f5e959 fixed. "Every",
+#                   not "typical": the shipped rule leaves 0 of 58 under 3, so an allowance for
+#                   one straggler would be slack the code does not need.
 #   3. COLLISIONS — over ALL of HERO_ORDER, ZERO pairs render byte-identical. The 4-cell strip
 #                   is exactly as identity-bearing as the 8-cell one (which is also 0).
 #   4. DRAIN      — hmd-statusline._drain_hue() greyscales a mini strip to ALL-grey while
@@ -103,6 +110,74 @@ def bad_bbox_crop(seed):
            for tr in (top, top + 2)]
     return tc.emit("\n".join(out)).split("\n")
 
+def _eyefn(seed):
+    """is_eye(r, c) for a seed — the same eye test the real strip's rescue reads."""
+    got = S.custom_for(seed)
+    if got is not None:
+        g, _pal = got
+        return lambda r, c: g[r][c] == '2'
+    g, _hue, _eye = S.grid_for(seed)
+    return lambda r, c: g[r][c] == 2
+
+
+def _avg_strip(seed, keep_every_eye):
+    """The 2×1 box-average, optionally with EVERY eye pixel kept verbatim — candidates (a)
+    and (c). Both build from the same grid the real strip reads, so a falsifier differs from
+    the SUT only in the compression rule."""
+    px, _is_bg, ec = _resolve(seed)
+    iseye = _eyefn(seed)
+    top = S._eye_strip_top(ec)
+    avg = lambda a, b: ((a[0] + b[0] + 1) // 2, (a[1] + b[1] + 1) // 2, (a[2] + b[2] + 1) // 2)
+    def merge(r, lo, hi):
+        if keep_every_eye and iseye(r, lo):
+            return px(r, lo)
+        if keep_every_eye and iseye(r, hi):
+            return px(r, hi)
+        return avg(px(r, lo), px(r, hi))
+    out = []
+    for tr in (top, top + 2):
+        line = ""
+        for c in range(MINI_W):
+            lo, hi = 2 * c, 2 * c + 1
+            line += S._cell(merge(tr, lo, hi), merge(tr + 1, lo, hi))
+        out.append(line)
+    return tc.emit("\n".join(out)).split("\n")
+
+
+def bad_plain_average(seed):
+    """KNOWN-BAD (a): the box-average with NO eye handling at all — the obvious compression,
+    and the one a reader reaches for first. It ties the real strip's median, which is exactly
+    why it needs a falsifier: a hero with SINGLE-PIXEL eyes (daredevil's sit at columns 1 and
+    6) has each eye blended into the body by the pairs (0,1) and (6,7), so the authored eye
+    colour disappears from the strip and the teammate renders eyeless."""
+    return _avg_strip(seed, keep_every_eye=False)
+
+
+def bad_always_eye(seed):
+    """KNOWN-BAD (c): the OVERCORRECTION — keep every eye pixel verbatim, not just a rescued
+    one. It buys back all the eyes, then spends a hero's palette to do it: antman's eye band is
+    half eye pixels, so every pair turns pure eye colour and his signature red vanishes. Proves
+    the real rule's "only when the average erased it" condition is load-bearing, not decoration."""
+    return _avg_strip(seed, keep_every_eye=True)
+
+
+def eye_needle(seed):
+    """The seed hero's AUTHORED eye colour as it appears in an emitted strip, or None when
+    the hero has no authored eye (joker and friends) — those cannot carry the property."""
+    e = S.HERO_SIGILS.get(S.hero_for(seed), {}).get("eye")
+    return ("2;%d;%d;%d" % S._hex_rgb(e)) if e else None
+
+
+def eyes_kept(fn):
+    """Seeds whose 8-cell strip shows the authored eye colour, and how many keep it at 4c.
+    Scoped to the seeds that HAVE the property at 8 cells — asking a strip to preserve an eye
+    its own full-width source never showed would be measuring nothing."""
+    have = [h for h in HEROES + HAIDS
+            if eye_needle(h) and eye_needle(h) in "\n".join(S.eye_strip(h, tc))]
+    kept = [h for h in have if eye_needle(h) in "\n".join(fn(h))]
+    return have, kept
+
+
 def bad_silhouette(seed):
     """KNOWN-BAD: a single-hue on/off recolour — the `mud` the eye_strip header rejects.
     Shape survives, identity does not."""
@@ -161,7 +236,35 @@ if MODE == "prove-red":
         "prove-red COLLISIONS: the single-hue silhouette collides %d hero pairs vs the real %d (RED)"
         % (s_pairs, real_pairs))
 
-    # KNOWN-BAD 4 — a 3-cell strip must fail the exact-width property.
+    # KNOWN-BAD 4 — the PLAIN box-average. Must flip EYES-KEPT. This is the falsifier that
+    # matters most, because the plain average is the compression a reader would reach for
+    # first (it even scores a shade better on the median) and its failure is invisible in
+    # every aggregate metric — it only shows up when you ask for the eyes by name.
+    have, kept = eyes_kept(bad_plain_average)
+    _have2, real_kept = eyes_kept(lambda h: S.eye_strip_mini(h, tc))
+    (ok if len(kept) < len(real_kept) == len(have) else bad)(
+        "prove-red EYES-KEPT: the plain average keeps the authored eye for %d/%d seeds where "
+        "the real strip keeps %d/%d (RED)" % (len(kept), len(have), len(real_kept), len(have)))
+
+    # KNOWN-BAD 5 — the OVERCORRECTION: keep EVERY eye pixel, not just a rescued one. It keeps
+    # the eyes (so EYES-KEPT cannot catch it) and must be caught by SHADES / NO-REGRESS instead.
+    # This is the falsifier for the real rule's "only when the average erased it" condition:
+    # without that condition the suite would still be green here, and antman would lose his red.
+    a_pairs, a_under3, _a_drain = score(bad_always_eye)
+    _h3, a_kept = eyes_kept(bad_always_eye)
+    a_regress = [h for h in HEROES
+                 if len(shades(bad_always_eye(h))) < min(3, len(shades(S.eye_strip(h, tc))))]
+    (ok if len(a_kept) == len(have) else bad)(
+        "prove-red OVERCORRECTION-IS-SUBTLE: keeping every eye pixel keeps %d/%d eyes, so only "
+        "the shade gates can catch it" % (len(a_kept), len(have)))
+    (ok if a_regress else bad)(
+        "prove-red NO-REGRESS: keeping every eye pixel costs %d hero(es) shades they had at 8 "
+        "cells %r vs the real 0 (RED)" % (len(a_regress), a_regress[:3]))
+    (ok if a_under3 > real_under3 else bad)(
+        "prove-red SHADES: keeping every eye pixel leaves %d heroes under 3 shades vs the real "
+        "%d (RED)" % (a_under3, real_under3))
+
+    # KNOWN-BAD 6 — a 3-cell strip must fail the exact-width property.
     three = ["".join(S._cell((1, 2, 3), (4, 5, 6)) for _ in range(3))] * 2
     (ok if any(vis(r) != MINI_W for r in three) else bad)(
         "prove-red SHAPE: a 3-cell strip is not %dc (RED)" % MINI_W)
@@ -195,7 +298,7 @@ for junk in (None, 12345, ["x"], {"a": 1}, object()):
 low = [h for h in HEROES if len(shades(S.eye_strip_mini(h, tc))) < 3]
 counts = sorted(len(shades(S.eye_strip_mini(h, tc))) for h in HEROES)
 median = counts[len(counts) // 2]
-(ok if len(low) <= 1 else bad)(
+(ok if not low else bad)(
     "SHADES: median=%d min=%d — %d hero(es) under 3 shades %s"
     % (median, counts[0], len(low), low[:6]))
 regress = [h for h in HEROES
@@ -203,6 +306,20 @@ regress = [h for h in HEROES
 (ok if not regress else bad)(
     "SHADES-NO-REGRESS: no hero loses shades it had at 8 cells%s"
     % ("" if not regress else " — %r" % regress[:6]))
+
+# ── 2b) EYES KEPT: the authored eye colour survives the compression, every seed ──
+# THE PROPERTY the compression choice turns on. A single-pixel eye (daredevil's are at
+# columns 1 and 6) would be averaged into the body by a plain 2×1 box-average, leaving a
+# teammate rendered eyeless — the same "not a face" failure 3f5e959 fixed from the other
+# direction, and what heimdall-statusline-fullbleed's TEAM-UNCUT gates end-to-end.
+have, kept = eyes_kept(lambda h: S.eye_strip_mini(h, tc))
+(ok if have else bad)(
+    "EYES-MEASURABLE: %d seeds carry an authored eye at 8 cells (a 0 here would make the "
+    "next check vacuous)" % len(have))
+(ok if len(kept) == len(have) else bad)(
+    "EYES-KEPT: the authored eye colour survives at 4 cells for %d/%d seeds%s"
+    % (len(kept), len(have), "" if len(kept) == len(have)
+       else " — lost %r" % sorted(set(have) - set(kept))[:6]))
 
 # ── 3) COLLISIONS: zero byte-identical pairs over ALL of HERO_ORDER ──────────────
 keyed = {}
