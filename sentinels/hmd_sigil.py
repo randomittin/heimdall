@@ -1458,6 +1458,24 @@ def micro(seed_or_hero, color=None, caps=None):
 # DEDICATED PATH: sigil_render()/the goldens are byte-UNTOUCHED — eye_strip is a parallel
 # crop over the SAME resolved 8×8 grid (custom_for for heroes, grid_for for curated/animal),
 # packed via the shared `_cell` (`▄`: fg = BOTTOM px, bg = TOP px). 8 cols × 2 text-rows.
+def _eye_pixels(seed_or_hero):
+    """(pxfn, eye_count) for a seed — the ONE resolution both strip widths share.
+
+    `pxfn(r, c)` is the RGB of grid pixel (r, c); `eye_count[r]` is how many EYE pixels sit
+    in grid row r (what _eye_strip_top centers the crop window on). A hero resolves through
+    its authored TOKEN grid + palette; every other seed through the composited VALUE grid —
+    exactly as before, so eye_strip's bytes are unchanged. Raises for a seed the sigil core
+    cannot resolve; both callers catch that and degrade to blank rows."""
+    got = custom_for(seed_or_hero)
+    if got is not None:                                  # hero: authored token grid + palette
+        grid, pal = got
+        return ((lambda r, c: pal.get(grid[r][c], pal['.'])),
+                [sum(1 for c in range(W) if grid[r][c] == '2') for r in range(W)])
+    grid, hue, eye = grid_for(seed_or_hero)              # curated / animal: value grid
+    return ((lambda r, c: cell_color(grid[r][c], hue, eye)),
+            [sum(1 for c in range(W) if grid[r][c] == 2) for r in range(W)])
+
+
 def _eye_strip_top(eye_count, default=3, win=4):
     """The top grid-row of the 4-px eye-strip crop window, auto-centered on the eyes.
     `eye_count[r]` = number of eye pixels in grid row r. Default window is rows
@@ -1489,15 +1507,7 @@ def eye_strip(seed_or_hero, caps=None):
     caps = caps or TC.detect()
     blank = caps.emit(" " * W)
     try:
-        got = custom_for(seed_or_hero)
-        if got is not None:                              # hero: authored token grid + palette
-            grid, pal = got
-            pxfn = lambda r, c: pal.get(grid[r][c], pal['.'])
-            eye_count = [sum(1 for c in range(W) if grid[r][c] == '2') for r in range(W)]
-        else:                                            # curated / animal: value grid
-            grid, hue, eye = grid_for(seed_or_hero)
-            pxfn = lambda r, c: cell_color(grid[r][c], hue, eye)
-            eye_count = [sum(1 for c in range(W) if grid[r][c] == 2) for r in range(W)]
+        pxfn, eye_count = _eye_pixels(seed_or_hero)
     except Exception:
         return [blank, blank]
     top = _eye_strip_top(eye_count)                      # 4-px window top row, eye-centered
@@ -1507,6 +1517,56 @@ def eye_strip(seed_or_hero, caps=None):
         for c in range(W):
             line += _cell(pxfn(tr, c), pxfn(tr + 1, c))  # ▄: bg = TOP px, fg = BOTTOM px
         lines.append(line)
+    return caps.emit("\n".join(lines)).split("\n")
+
+
+# ── EYE-STRIP MINI — the SAME eye band at HALF the width (4 cells) ───────────────
+# The wall pays TEAM_MEMBER_W per teammate, and nine 15-cell columns (151 cells) starved the
+# left content panel until its Row4 rate-limit BARS self-downgraded to plain text and the
+# Row3 gate row dropped its details. Halving the strip is where the headroom comes from.
+#
+# WHY A BOX-AVERAGE AND NOT A CROP — this was MEASURED over all 58 heroes, not assumed
+# (test/heimdall-sigil-eyestrip-mini.test.sh re-derives every number and locks it):
+#   • 2×1 horizontal box-average : median 6 distinct shades, 1 hero under 3, 0 collisions
+#   • face bounding-box crop     : median 3 shades, 8 heroes under 3, and it drains some
+#                                  heroes to ONE shade — the exact 2-shade-blob regression
+#                                  3f5e959 was written to fix
+#   • eye-preserving average     : median 5 shades, 2 heroes under 3, 0 collisions
+# The average WINS because it keeps all eight source columns' information: two adjacent
+# pixels of different hues produce a THIRD, intermediate tone, so compressing the strip
+# adds shades rather than spending them. The 4-cell strip collides on 0 of the 1653 hero
+# pairs — exactly as identity-bearing as the 8-cell one.
+EYE_STRIP_MINI_W = W // 2      # 4 cells: one output cell per adjacent source-column pair
+
+
+def _px_avg(a, b):
+    """The box-average of two adjacent pixels, per channel, rounded half-up."""
+    return ((a[0] + b[0] + 1) // 2, (a[1] + b[1] + 1) // 2, (a[2] + b[2] + 1) // 2)
+
+
+def eye_strip_mini(seed_or_hero, caps=None):
+    """The seed's eye strip at HALF width — 2 `▄` text-rows, EXACTLY 4 cells each.
+
+    Same contract as eye_strip (same seeds, same 4 pixel-rows of vertical detail, same
+    auto-centered eye window, same one-pass `caps` tier downgrade, never raises), with the
+    eight source columns box-averaged down to four (see the section header for why that
+    compression and not a crop). Degrades to two blank 4-cell rows on ANY fault — the
+    statusline must never error."""
+    caps = caps or TC.detect()
+    blank = caps.emit(" " * EYE_STRIP_MINI_W)
+    try:
+        pxfn, eye_count = _eye_pixels(seed_or_hero)
+        top = _eye_strip_top(eye_count)                  # 4-px window top row, eye-centered
+        lines = []
+        for tr in (top, top + 2):                        # (top,top+1),(top+2,top+3)
+            line = ""
+            for c in range(EYE_STRIP_MINI_W):
+                lo, hi = 2 * c, 2 * c + 1                # the adjacent source-column pair
+                line += _cell(_px_avg(pxfn(tr, lo), pxfn(tr, hi)),
+                              _px_avg(pxfn(tr + 1, lo), pxfn(tr + 1, hi)))
+            lines.append(line)
+    except Exception:
+        return [blank, blank]
     return caps.emit("\n".join(lines)).split("\n")
 
 # BACK-COMPAT ALIAS — top_half is the old teammate-render entry point still called by
