@@ -256,18 +256,18 @@ else:
     bad("C4 branch masked the offline state — row4=%r reads as a present teammate" % vis(r4))
 
 # ── D. BUDGET — the wall stays width-bound ────────────────────────────────────
-print("\nD. BUDGET: offline segments respect the 8-cell strip")
+print("\nD. BUDGET: offline segments respect the 8-cell label slot")
 
 widths_ok = True
 worst = None
 for age in (90, 600, 3600, 5 * 3600, 23 * 3600, DAY, 3 * DAY, 6 * DAY, 7 * DAY - 60):
     s = vis(S._team_state_seg({"user": "x", "state": "offline", "ts": NOW - age,
                                "online": False}, NOW))
-    if len(s) > S.LAYOUT.TEAM_STRIP_W:
+    if len(s) > S.LAYOUT.TEAM_LABEL_W:
         widths_ok = False
         worst = (age, s)
 if widths_ok:
-    ok("D1 every offline segment across the whole window fits the 8-cell strip")
+    ok("D1 every offline segment across the whole window fits the 8-cell label slot")
 else:
     bad("D1 offline segment overflows the strip at age=%s: %r" % worst)
 

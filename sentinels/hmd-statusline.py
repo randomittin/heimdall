@@ -1065,9 +1065,10 @@ def _last_seen(now, ts):
 # three. The channels are deliberately split: COLOUR carries only the binary present/absent,
 # the WORD carries the four-way tier. That split is what stops a subtle hue from ever being
 # the only thing standing between "here" and "not here".
-# The Row4 absent segment's cell budget, matching the team column. The AGE is budgeted
-# first inside it and never truncated; the branch takes only what genuinely remains.
-_ABSENT_SEG_CELLS = 8
+# The Row4 absent segment's cell budget — the team column's LABEL slot, read from the
+# layout so the two can never drift. The AGE is budgeted first inside it and never
+# truncated; the branch takes only what genuinely remains.
+_ABSENT_SEG_CELLS = LAYOUT.TEAM_LABEL_W
 
 TEAM_TIER = {              # tier → (glyph, word, show_age)
     "away":        ("⊘", "off", True),    # a heartbeat, but stale     → `⊘off 3d`
@@ -1166,7 +1167,7 @@ def _team_branch_seg(branch):
     in the faint branch hue, shown UNDER the teammate's name for ANY teammate with a recorded
     branch — whether or not it matches yours — so who's on which branch of the SAME repo reads
     at a glance. Terse (no space after the glyph) to keep the most branch chars in the 8-cell
-    strip; the caller pad_or_truncate()s it to the strip width (a long branch clips with `…`)."""
+    label slot; the caller pad_or_truncate()s it to TEAM_LABEL_W (a long branch clips with `…`)."""
     b = str(branch or "").strip()
     return f"{BRANCHC}⎇{b}{X}"
 
@@ -1347,19 +1348,24 @@ def _hero_seed(member, project=""):
 
 def team_columns(members, team_w, overflow, now, states=True, self_branch=""):
     """Render `members` into the four team-zone row strings — each EXACTLY `team_w` visible
-    cells. Rows 1–2: the 8-cell eye_strip (natural palette, eyes visible) riding the RIGHT
-    of each 15c column. Row 3: the NAME (hero hue, ≤ strip width) under the strip, plus a
-    trailing `+N` overflow tag. Row 4: the teammate's BRANCH (`⎇<branch>`) whenever they have
+    cells. Rows 1–2: the 4-cell eye_strip_mini (natural palette, eyes visible) riding the
+    RIGHT of each 10c column. Row 3: the NAME (hero hue, ≤ TEAM_LABEL_W) right-aligned in the
+    same column, plus a trailing `+N` overflow tag. Row 4: the BRANCH (`⎇<branch>`) whenever they have
     a recorded branch — EVERY same-repo teammate surfaces their branch on the line UNDER their
     name, not only cross-branch ones; a teammate with no branch falls back to the state segment
     (blank when `states` is False — the mid tier). Members are joined by a 2-cell gap. Returns
     (r1, r2, r3, r4). `self_branch` is retained for callers but no longer gates the branch line."""
-    lp = " " * (LAYOUT.TEAM_MEMBER_W - LAYOUT.TEAM_STRIP_W)   # 7c left pad → strip on the right 8c
+    # The strip and the label are BOTH right-aligned to the column's right edge, each behind
+    # its own pad — the strip is narrower than the label, so they need different pads to land
+    # on the same edge. Right-alignment is what keeps the name reading as belonging to the
+    # face directly above it once the two stopped being the same width.
+    lp = " " * (LAYOUT.TEAM_MEMBER_W - LAYOUT.TEAM_STRIP_W)   # 6c pad → strip on the right 4c
+    lpl = " " * (LAYOUT.TEAM_MEMBER_W - LAYOUT.TEAM_LABEL_W)  # 2c pad → label on the right 8c
     gap = " " * LAYOUT.TEAM_MEMBER_GAP
     # `members` is ALREADY the visible set — main() slices it to team_zone_alloc's shown_n
     # before calling here — so the labels are resolved against exactly the columns a viewer
     # will see, which is the scope the no-two-columns-alike property is about.
-    labels = wall_labels([m.get("user") for m in members], LAYOUT.TEAM_STRIP_W)
+    labels = wall_labels([m.get("user") for m in members], LAYOUT.TEAM_LABEL_W)
     tops = []; bots = []; names = []; sts = []
     for i, m in enumerate(members):
         seed = _hero_seed(m)
@@ -1370,7 +1376,7 @@ def team_columns(members, team_w, overflow, now, states=True, self_branch=""):
         try:
             # Always render the REAL strip, then drain. Rendering it through a colourless
             # tier is what erased the face; desaturating a full-colour render keeps it.
-            strip2 = SIG.eye_strip(seed, CAPS)                # 2 text-rows × 8 cells, eyes visible
+            strip2 = SIG.eye_strip_mini(seed, CAPS)           # 2 text-rows × 4 cells, eyes visible
             if away:
                 strip2 = _drain_hue(strip2)
             if len(strip2) < 2:
@@ -1385,7 +1391,7 @@ def team_columns(members, team_w, overflow, now, states=True, self_branch=""):
         # which is the strongest "this person is here" cue on the whole wall.
         hue = None if away else (_team_hue(seed, m.get("sigil")) if USE_COLOR else None)
         ncol = sgr(SIG._hex_rgb(hue)) if hue else (FAINT if away else DIM)
-        names.append(g + lp + f"{ncol}{labels[i]}{X}")
+        names.append(g + lpl + f"{ncol}{labels[i]}{X}")
         # Row4: EVERY same-repo teammate with a recorded branch shows it UNDER their name
         # (the branch line) — matching OR differing from self_branch; a teammate with no
         # branch falls back to the state segment. The branch line rides even in the mid tier
@@ -1405,9 +1411,9 @@ def team_columns(members, team_w, overflow, now, states=True, self_branch=""):
         else:
             r4seg = None
         if r4seg is not None:
-            sts.append(g + lp + LAYOUT.pad_or_truncate(r4seg, LAYOUT.TEAM_STRIP_W))
+            sts.append(g + lpl + LAYOUT.pad_or_truncate(r4seg, LAYOUT.TEAM_LABEL_W))
         else:
-            sts.append(g + " " * (len(lp) + LAYOUT.TEAM_STRIP_W))
+            sts.append(g + " " * (len(lpl) + LAYOUT.TEAM_LABEL_W))
     tag_seg = f"{DIM} +%d{X}" % overflow if overflow > 0 else ""
     r1 = LAYOUT.pad_or_truncate("".join(tops), team_w)         # tag slot stays blank on the sigil rows
     r2 = LAYOUT.pad_or_truncate("".join(bots), team_w)
@@ -1696,6 +1702,46 @@ def gate_labels(gates, avail, colored=True):
             return seg
     return seg   # marks-only still over budget → caller clips
 
+
+# ── the CONTENT PANEL's width floor (reserved BEFORE the team zone packs) ──────
+def _gauge_max_for(tier):
+    """The Row2 gauge's tier ceiling — read by BOTH the renderer and panel_floor, so the
+    width the panel RESERVES can never drift from the width it later SPENDS."""
+    return LAYOUT.GAUGE_MAX_W if tier == "full" else 32
+
+
+def _bar_w_for(tier):
+    """The Row4 micro-gauge bar width per tier (0 → plain text). Same one-source rule: a
+    wider bar has to move the reservation with it or the reservation is a lie."""
+    return 12 if tier == "full" else (8 if tier == "mid" else 0)
+
+
+def panel_floor(tier, data, now, gates, session_id, dur_ms):
+    """The cells the CONTENT PANEL needs at `tier` to render its rows WHOLE — MEASURED off
+    the very builders that render them, never a constant, so a change to a bar, a label or a
+    gate segment moves this number with it instead of silently under-reserving.
+
+    The rows are STACKED, so the floor is the WIDEST of them, not their sum:
+      Row2  the context gauge at its tier ceiling (40c full / 32c mid);
+      Row4  micro_row at its natural width — `avail=None` asks it what it WANTS, which is
+            the two bars, their labels, the ` · ` separator and any `·5h` reset suffix;
+      Row3  gate_labels at its RICHEST level (mark + id + detail), FULL TIER ONLY, because
+            mid's documented contract is that the gate details are the first thing to drop.
+    Row1 is excluded on purpose: it already degrades by WHOLE SEGMENTS (row1_left drops
+    `· Opus 4.8`, then the repo) and so has no width it must have.
+
+    main() hands this to team_zone_alloc as `content_floor`, which reserves it before the
+    team packs. Without it the team took the right edge first, and a NINE-teammate wall on a
+    200-col terminal left the panel 36c — less than the 44c its own bars need — so Row4
+    self-downgraded to plain text on the widest terminal in the room. The panel is the
+    fixed-cost anchor; the wall is the elastic one, and it folds whole members into `+N`."""
+    want = max(_gauge_max_for(tier),
+               vis(micro_row(data, now, _bar_w_for(tier), session_id, dur_ms, avail=None)))
+    if tier == "full":
+        want = max(want, vis(gate_labels(gates, None, colored=True)))
+    return want
+
+
 def subagent_ghost(agents):
     """A faint right-rail ghost naming the busiest live subagent (the most recently
     started) + the active count. '' when no subagent is live."""
@@ -1863,7 +1909,7 @@ def main():
         team_states = False                              # §7 mid: states drop (name only)
 
     inner = cols - 9                                     # everything right of the 9c sigil zone
-    # team_zone_alloc sizes the team zone + caps members so the gauge keeps its floor; we take
+    # team_zone_alloc sizes the team zone + caps members so the PANEL keeps its floor; we take
     # its rows-zone width as the CONTENT BUDGET (build the rows at their richest that fits).
     # The team is then placed as a COMPACT 2ND COLUMN hugging the content (a TEAM_COL_GAP
     # gutter), NOT flush to the right edge: a flush-right team at a wide terminal sits out at
@@ -1873,16 +1919,20 @@ def main():
     if tier in ("full", "mid") and members:
         # reserve the SAME TEAM_COL_GAP gutter the compose step renders, so content_budget is
         # the exact col1 ceiling — col1_w + gap + team_w <= inner, never a hard-clamp `…` clip.
+        # content_floor is the PANEL's measured need (panel_floor), reserved BEFORE the team
+        # packs: the panel is the fixed-cost anchor, the wall is elastic and folds whole
+        # members into `+N`. Reserving only the gauge minimum here is what let nine teammates
+        # squeeze a 200-col panel down to 36c and turn its Row4 bars into plain text.
         content_budget, team_w, shown_n, of, _alloc_gap = LAYOUT.team_zone_alloc(
-            cols, len(members), overflow, rows_gap=TEAM_COL_GAP)
+            cols, len(members), overflow, rows_gap=TEAM_COL_GAP,
+            content_floor=panel_floor(tier, data, t, gates, session_id, dur_ms))
         members = members[:shown_n]
         team_gap = TEAM_COL_GAP
     else:
         content_budget, team_w, of, team_gap = inner, 0, overflow, 0
 
     # the gauge is the ONLY flexible element in the rows zone: 40c full / 32c mid, min 24.
-    gauge_max = LAYOUT.GAUGE_MAX_W if tier == "full" else 32
-    gauge_w = max(0, min(gauge_max, content_budget))
+    gauge_w = max(0, min(_gauge_max_for(tier), content_budget))
 
     if team_w > 0:
         t1, t2, t3, t4 = team_columns(members, team_w, of, t, states=team_states,
@@ -1932,8 +1982,7 @@ def main():
     row3_zone = gate_labels(gates, content_budget, colored=True)
 
     # ── Row4 — the 5h + 7d limit micro-gauges (session stats when rate_limits is absent) ──
-    bar_w = 12 if tier == "full" else (8 if tier == "mid" else 0)
-    row4_zone = micro_row(data, t, bar_w, session_id, dur_ms, avail=content_budget)
+    row4_zone = micro_row(data, t, _bar_w_for(tier), session_id, dur_ms, avail=content_budget)
 
     # ── COMPACT column-1: shrink the content column to the NATURAL width of its widest row so
     # the team column HUGS the content (a TEAM_COL_GAP gutter) instead of the far edge. col1_w

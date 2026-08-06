@@ -254,12 +254,28 @@ def compose_with_sigil(sigil_rows, content_rows, cols, gutter=2, unicode_tier=FU
 
 
 # ── team-first zone allocation (Spec v2 §2 — THE anti-truncation rule) ──────────
-# Spec v2 §6 team-zone geometry: each teammate is a fixed 15-cell column (an 8-cell
-# eye-strip + a 1-cell gap + a 6-cell name/state label) and adjacent members are
-# separated by a 2-cell gap. @full 3 members = 3×15 + 2×2 = 49c.
-TEAM_MEMBER_W = 15        # per-member column width (8c strip + 1c gap + 6c label)
+# Spec v2 §6 team-zone geometry: each teammate is a fixed 10-cell column holding a
+# 4-cell eye_strip_mini (rows 1–2) and an 8-cell name/state label (rows 3–4), BOTH
+# right-aligned to the column's right edge — they share the column, not the ink, since
+# no row carries a strip and a label at once. Adjacent members are separated by a 2-cell
+# gap. @full 9 members = 9×10 + 8×2 = 106c; 3 members = 3×10 + 2×2 = 34c.
+#
+# The column was 15c (an 8-cell eye_strip behind a 7c pad) until nine teammates on a
+# 200-col terminal cost 9×15 + 8×2 = 151 cells and left the content panel 36 — narrower
+# than the 44c its own Row4 rate-limit bars need, so they self-downgraded to plain text
+# on the widest terminal in the room. Halving the strip (hmd_sigil.eye_strip_mini) is
+# what buys that back, and `content_floor` below is what keeps it bought.
+#
+# 10 is TIGHT, not round. Adjacent LABELS must stay separated by at least a strip width
+# or two columns read as one run:
+#     (TEAM_MEMBER_W - TEAM_LABEL_W) + TEAM_MEMBER_GAP >= TEAM_STRIP_W
+# 10 satisfies it with nothing to spare; 9 breaks it. TEAM_LABEL_W stays 8 because that
+# is the slot wall_labels() truncates into — shrinking it would buy cells by cutting
+# names, which is the opposite of what this change is for.
+TEAM_MEMBER_W = 10        # per-member column width (a 4c strip + an 8c label, both right-aligned)
 TEAM_MEMBER_GAP = 2       # blank cells between adjacent member columns
-TEAM_STRIP_W = 8          # the eye-strip is 8 cells (rides the RIGHT of the column)
+TEAM_STRIP_W = 4          # the eye-strip is 4 cells (rides the RIGHT of the column)
+TEAM_LABEL_W = 8          # the name / branch / state slot (rides the RIGHT of the column)
 ROWS_GAP = 2              # blank cells between the rows-zone and the team zone
 GAUGE_MIN_W = 24          # Spec v2 §2 — the Row2 gauge never shrinks below this
 GAUGE_MAX_W = 40          # Spec v2 §2 — the Row2 gauge never grows beyond this
@@ -267,15 +283,26 @@ GAUGE_MAX_W = 40          # Spec v2 §2 — the Row2 gauge never grows beyond th
 
 def team_zone_alloc(cols, n_members, overflow=0, sigil_w=8, sigil_gap=1,
                     member_w=TEAM_MEMBER_W, member_gap=TEAM_MEMBER_GAP,
-                    rows_gap=ROWS_GAP, gauge_min=GAUGE_MIN_W):
+                    rows_gap=ROWS_GAP, gauge_min=GAUGE_MIN_W, content_floor=None):
     """Spec v2 §2 zone allocation — the ORDER SWAP that fixes the truncation bug.
 
     The team zone is reserved FIRST from the RIGHT edge (before the gauge is sized),
     so a teammate eye-strip can NEVER be truncated. The rows zone (identity / gauge /
     gates / micro-gauges) takes whatever is left, and the gauge is the only flexible
     element in it (clamped 24–40c by the caller). Team members are packed greedily and
-    CAPPED so the gauge keeps at least `gauge_min` cells; the first member that would
-    breach that floor — and every one after it — folds into the `+N` overflow tag.
+    CAPPED so the rows zone keeps at least `content_floor` cells; the first member that
+    would breach that floor — and every one after it — folds into the `+N` overflow tag.
+
+    `content_floor` is what the rows the caller is about to build actually NEED (it
+    measures them — see hmd-statusline.panel_floor); None keeps the historical `gauge_min`.
+    Reserving it BEFORE the team packs is what makes the CONTENT PANEL the fixed-cost
+    anchor and the TEAM the elastic one, and a wide terminal then cannot hand the panel
+    less than its own rows. Reserving only `gauge_min` is what let nine teammates leave a
+    200-col panel 36c wide and force its bars to render as text.
+
+    The claim is BOUNDED at half the inner width, so the reverse failure cannot happen
+    either: a pathological rows zone (an eight-gate ledger wanting 600c) must not be able
+    to starve the wall down to nobody. Below `gauge_min` the floor never goes.
 
     Geometry: `sigil_w + sigil_gap` fixed on the left (9c), then the rows zone, then a
     `rows_gap`, then the team zone flush to the right edge. Exactly:
@@ -294,7 +321,9 @@ def team_zone_alloc(cols, n_members, overflow=0, sigil_w=8, sigil_gap=1,
     if n_members <= 0 or inner <= 0:
         return inner, 0, 0, max(0, int(overflow)), 0
 
-    team_budget = inner - gauge_min - rows_gap          # widest the team zone may take
+    floor = gauge_min if content_floor is None else \
+        max(gauge_min, min(int(content_floor), inner // 2))
+    team_budget = inner - floor - rows_gap              # widest the team zone may take
     if team_budget < member_w:
         return inner, 0, 0, int(overflow) + n_members, 0   # not even one member fits → solo
 

@@ -38,7 +38,10 @@ LAYOUT = m.LAYOUT
 
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 NOW = 1785869500
-MW, GAP, SW = LAYOUT.TEAM_MEMBER_W, LAYOUT.TEAM_MEMBER_GAP, LAYOUT.TEAM_STRIP_W
+# The label rides the column's LABEL slot (TEAM_LABEL_W), which is wider than the 4-cell
+# eye-strip above it — both right-aligned to the same edge, so the label's start is
+# MW - TEAM_LABEL_W into the column, not MW - TEAM_STRIP_W.
+MW, GAP, SW = LAYOUT.TEAM_MEMBER_W, LAYOUT.TEAM_MEMBER_GAP, LAYOUT.TEAM_LABEL_W
 PAD = MW - SW
 
 
@@ -156,7 +159,7 @@ case "$probe" in
 esac
 case "$probe" in
   *"A_width=ok"*) ok ;;
-  *) bad "a disambiguated label is not exactly TEAM_STRIP_W cells — the column grid breaks" ;;
+  *) bad "a disambiguated label is not exactly TEAM_LABEL_W cells — the column grid breaks" ;;
 esac
 
 # B — the second pair in the same roster
