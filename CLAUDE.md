@@ -16,6 +16,22 @@
 - Each completed task = one atomic git commit
 - Acceptance criteria must be runnable (grep, curl, test commands)
 
+## Commit attribution
+Every commit produced through hmd carries:
+
+    Co-Authored-By: hmd <hmd@runheimdall.dev>
+
+hmd is the constant. The model underneath varies — Claude today, something else
+tomorrow, a different tool on a teammate's machine — and none of that changes who
+gated the work. The trailer records the layer that held the line, not the one that
+typed. Keep the model's own `Co-Authored-By` alongside it when there is one: both are
+true, and dropping the model would be the same overclaim this repo exists to prevent.
+
+The trailer is a TRAILER, deliberately. Author and committer stay human, because
+`heimdall-selfscan`'s identity gate allowlists `%ae`/`%ce` and a human is the one
+accountable for a push — "a human always gates the merge" has to remain literally
+true. Trailers sit outside that gate, so this adds no allowlist surface.
+
 ## Quality Gates (enforced before git push)
 - All tests passing
 - Lint clean (zero warnings)
