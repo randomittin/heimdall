@@ -1911,11 +1911,9 @@ def main():
     inner = cols - 9                                     # everything right of the 9c sigil zone
     # team_zone_alloc sizes the team zone + caps members so the PANEL keeps its floor; we take
     # its rows-zone width as the CONTENT BUDGET (build the rows at their richest that fits).
-    # The team is then placed as a COMPACT 2ND COLUMN hugging the content (a TEAM_COL_GAP
-    # gutter), NOT flush to the right edge: a flush-right team at a wide terminal sits out at
-    # $COLUMNS, which overshoots CC's narrower live statusLine region and gets clipped (RJ's
-    # right-side truncation). Left-packing keeps the whole render only as wide as its content +
-    # team, so nothing ever rides the far edge; the per-row hard clamp pads the tail with blanks.
+    # The team is then placed FLUSH RIGHT, against the right edge of CC's paint region, with
+    # every unspent cell absorbed as gutter BETWEEN the panel and the first member (see the
+    # `team_gap` derivation below). TEAM_COL_GAP is therefore the MINIMUM gutter, not the gutter.
     if tier in ("full", "mid") and members:
         # reserve the SAME TEAM_COL_GAP gutter the compose step renders, so content_budget is
         # the exact col1 ceiling — col1_w + gap + team_w <= inner, never a hard-clamp `…` clip.
@@ -1984,24 +1982,40 @@ def main():
     # ── Row4 — the 5h + 7d limit micro-gauges (session stats when rate_limits is absent) ──
     row4_zone = micro_row(data, t, _bar_w_for(tier), session_id, dur_ms, avail=content_budget)
 
-    # ── COMPACT column-1: shrink the content column to the NATURAL width of its widest row so
-    # the team column HUGS the content (a TEAM_COL_GAP gutter) instead of the far edge. col1_w
-    # is >= every row's natural width (no new truncation) and <= the content budget. Solo
-    # (team_w==0) keeps the full inner width so the watchman rail stays right-anchored. ──
+    # ── COMPACT column-1: shrink the content column to the NATURAL width of its widest row.
+    # col1_w is >= every row's natural width (no new truncation) and <= the content budget.
+    # Solo (team_w==0) keeps the full inner width so the watchman rail stays right-anchored. ──
     if team_w > 0:
         nat1 = vis(left1) + (1 + vis(right1) if right1 else 0)
         col1_w = min(content_budget,
                      max(nat1, gauge_w, vis(row3_zone), vis(row4_zone)))
         col1_w = max(1, col1_w)
+        # FLUSH RIGHT: every cell col1 did not need becomes GUTTER, so the wall lands hard
+        # against the right edge instead of trailing off into filler blanks. The slack has to
+        # go somewhere; putting it BEFORE the first member keeps the wall a wall — a column
+        # a reader's eye finds in the same place on every terminal — whereas putting it after
+        # (the old left-pack) left nine members adrift mid-screen at 200 cols.
+        #
+        # This reverses the earlier left-pack, and the reason it is now safe is CC_REGION_RESERVE.
+        # Left-packing was a SECOND mitigation for RJ's right-edge truncation, added when the
+        # renderer still targeted raw $COLUMNS and CC hard-clipped the 4 cells it reserves for
+        # its own spacing. resolve_cols() now measures that region and renders INSIDE it, so
+        # "flush right" is flush against CC's real paint region, not against a right edge that
+        # was never ours. Keeping both mitigations cost the layout its right anchor for nothing.
+        #
+        # The panel is untouched: col1_w and content_budget are exactly what they were, so this
+        # can only ever GROW the gutter (>= TEAM_COL_GAP, since col1_w <= content_budget and
+        # content_budget + team_w + TEAM_COL_GAP == inner). The panel never gives up a cell.
+        team_gap = max(TEAM_COL_GAP, inner - col1_w - team_w)
     else:
         col1_w = content_budget
 
     row1_zone = LAYOUT.left_right(left1, right1, col1_w)
 
     def compose(zone, col):
-        """content column (padded to col1_w) + the TEAM_COL_GAP gutter + the team column. Solo
-        → just the padded content column. Sum <= inner; the caller's exact-width clamp pads the
-        trailing blanks so the team never rides the far edge (the anti-truncation left-pack)."""
+        """content column (padded to col1_w) + the `team_gap` gutter + the team column. Solo
+        → just the padded content column. With a team the three sum to EXACTLY `inner`, so the
+        team lands on the right edge and the caller's clamp has no trailing blanks to add."""
         z = LAYOUT.pad_or_truncate(zone, col1_w)
         return z if team_w <= 0 else z + " " * team_gap + col
 

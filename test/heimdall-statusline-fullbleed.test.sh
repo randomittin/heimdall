@@ -167,6 +167,32 @@ def team_home(now=1752410000, gates=True, team=True):
         json.dump(status, f)
     return home
 
+def big_wall_cwd(n, now=1752410000):
+    """A cwd whose WALL CACHE names `n` teammates — the only roster source that can exceed
+    three, since the ledger-mirror path in _team_members caps at three before the allocator
+    ever sees it. A cap test seeded through the ledger would silently test n=3."""
+    cwd = tempfile.mkdtemp()
+    os.makedirs(os.path.join(cwd, ".heimdall"), exist_ok=True)
+    wall = [{"handle": "mate%02d" % i, "haid": "haid:mate%02d.mbp-%04x" % (i, i * 7919),
+             "tier": "online", "ts": now - i} for i in range(n)]
+    with open(os.path.join(cwd, ".heimdall", ".wall-cache.json"), "w") as f:
+        json.dump(wall, f)
+    return cwd
+
+def sigil_runs(row):
+    """Lengths of the contiguous SIGIL (48;2 bg) runs in a row, left to right. On Row1 this
+    is exactly [main hero] + [one eye-strip per SHOWN teammate], so its length counts the
+    rendered wall EXACTLY — a `>=` bg-cell total cannot tell 5 columns from 9."""
+    out = []; n = 0
+    for c in bg_cells(row):
+        if c:
+            n += 1
+        elif n:
+            out.append(n); n = 0
+    if n:
+        out.append(n)
+    return out
+
 # ════════════════════════ FALSIFIER PROPERTIES ════════════════════════
 def inv_row_exact():
     # Spec v2 §8.1 — every row EXACTLY COLUMNS cells at the six tiers, SOLO and with a team.
@@ -224,6 +250,98 @@ def inv_team_uncut():
     needle = "2;%d;%d;%d" % (er, eg, eb)
     (ok if any(needle in r for r in rs[:2]) else bad)(
         "TEAM-UNCUT: teammate eye color present on rows 1–2 (eyes visible, not the hair crop)")
+
+def inv_team_cap():
+    # THE WALL IS CAPPED AT FIVE COLUMNS, and it packs FLUSH RIGHT.
+    #
+    # A 200-col terminal had room for eleven 10c columns, so eleven rendered: a wall that
+    # grows with the terminal turns the widest screen in the room into the busiest one, and
+    # eleven near-identical 4c strips read as texture, not as people. Five is the ceiling the
+    # wall is legible at; everyone past it folds into the SAME `+N` the width-fit path already
+    # uses, so nobody is ever dropped silently and no sigil is ever sliced to fit.
+    #
+    # THE 5 AND THE 16 BELOW ARE LITERALS ON PURPOSE. Deriving them from LAYOUT.TEAM_MAX_SHOWN
+    # would make this test move with the very constant it exists to pin — raise the cap and a
+    # derived assertion re-derives its own expectation and stays green, which is a test that
+    # cannot fail. (The GEOMETRY constants in inv_team_uncut are derived precisely because they
+    # are NOT the thing under test there.) 21 members, cap 5 ⇒ 5 shown and the badge reads +16.
+    TOTAL, CAP = 21, 5
+    rows_zone_w, team_w, shown, of, gap = L.team_zone_alloc(200, TOTAL, 0,
+                                                            rows_gap=SL_TEAM_COL_GAP)
+    (ok if (shown == CAP and of == TOTAL - CAP) else bad)(
+        "TEAM-CAP: allocator caps %d members at %d shown / +%d (got %d / +%d)"
+        % (TOTAL, CAP, TOTAL - CAP, shown, of))
+    # the zone is the capped columns + the tag — never a sliced member.
+    want_team_w = CAP * L.TEAM_MEMBER_W + (CAP - 1) * L.TEAM_MEMBER_GAP + len(" +%d" % of)
+    (ok if team_w == want_team_w else bad)(
+        "TEAM-CAP: capped zone is %d whole columns + the tag = %dc (got %dc)"
+        % (CAP, want_team_w, team_w))
+
+    # END-TO-END through the REAL renderer. The cap is a CEILING the WIDTH-FIT path still sits
+    # under: at 200/160 the terminal has room for more than five, so five is what the cap is
+    # holding back and the count is asserted EXACTLY. At 120 the panel floor legitimately binds
+    # FIRST (the panel's own rows claim their width before the wall packs), so the wall lands
+    # below the cap there — asserting five at 120 would be asserting something false to make
+    # this gate look stronger, so 120 asserts the two things that ARE true: never MORE than the
+    # cap, and every member still accounted for.
+    for cols in (200, 160, 120):
+        cwd = big_wall_cwd(TOTAL)
+        home = team_home(team=False)
+        out, rc, err = render(cols, canned(cwd, cols), home=home)
+        shutil.rmtree(cwd, ignore_errors=True); shutil.rmtree(home, ignore_errors=True)
+        rs = rows(out)
+        if len(rs) < 4 or rc != 0:
+            bad("TEAM-CAP@%d: render failed rc=%d rows=%d err=%r" % (cols, rc, len(rs), err[:60]))
+            continue
+        # Row1's sigil runs are the 8c main hero then one 4c strip per shown teammate, so the
+        # run list IS the visible column count — a `>=` bg-cell total cannot tell 5 from 11.
+        got_runs = sigil_runs(rs[0])
+        n_shown = len(got_runs) - 1
+        if cols >= 160:
+            want_runs = [8] + [L.TEAM_STRIP_W] * CAP
+            (ok if got_runs == want_runs else bad)(
+                "TEAM-CAP@%d: Row1 renders EXACTLY %d eye-strips — runs %s (want %s)"
+                % (cols, CAP, got_runs, want_runs))
+        else:
+            (ok if (got_runs[:1] == [8] and 0 < n_shown <= CAP
+                    and got_runs[1:] == [L.TEAM_STRIP_W] * n_shown) else bad)(
+                "TEAM-CAP@%d: Row1 renders %d whole eye-strips, never more than the cap %d — runs %s"
+                % (cols, n_shown, CAP, got_runs))
+        # NOBODY IS DROPPED SILENTLY: the badge accounts for every member not on the wall.
+        badge = re.search(r"\+(\d+)\s*$", strip(rs[2]).rstrip())
+        got_of = int(badge.group(1)) if badge else -1
+        (ok if got_of == TOTAL - n_shown else bad)(
+            "TEAM-CAP@%d: Row3 badge reads `+%d` — %d shown + %d folded == %d total"
+            % (cols, TOTAL - n_shown, n_shown, got_of, TOTAL))
+        # FLUSH RIGHT: NO SLACK after the wall. Rows 1/2/4 reserve the `+N` badge's cells
+        # (Row3 is the row that spends them), so the only blanks allowed past the last
+        # eye-strip are exactly that badge slot — anything more is the wall stopping short,
+        # which is what left nine members adrift mid-screen on a 200-col terminal.
+        tag_w = len(" +%d" % got_of) if got_of > 0 else 0
+        p1 = strip(rs[0])
+        slack = len(p1) - len(p1.rstrip(" "))
+        (ok if slack == tag_w else bad)(
+            "TEAM-CAP@%d: %d blank cells past the last eye-strip == the `+N` slot (%d) — flush RIGHT"
+            % (cols, slack, tag_w))
+        # and nothing was sliced to get there.
+        (ok if all("…" not in strip(r) for r in rs) else bad)(
+            "TEAM-CAP@%d: no `…` anywhere — whole members fold into `+N`, never a cut sigil" % cols)
+
+    # THE UNAMBIGUOUS FLUSH-RIGHT CASE: exactly CAP members, so there is no badge to reserve
+    # the tail and the last visible cell of rows 1–2 must BE the last teammate's eye-strip.
+    cwd = big_wall_cwd(CAP)
+    home = team_home(team=False)
+    out, rc, err = render(200, canned(cwd, 200), home=home)
+    shutil.rmtree(cwd, ignore_errors=True); shutil.rmtree(home, ignore_errors=True)
+    rs = rows(out)
+    tails = [bg_cells(r)[-1] if bg_cells(r) else False for r in rs[:2]]
+    (ok if (len(rs) >= 2 and all(tails)) else bad)(
+        "TEAM-CAP: %d members / no badge → rows 1–2 END on a teammate sigil cell (%s)"
+        % (CAP, tails))
+    (ok if sigil_runs(rs[0]) == [8] + [L.TEAM_STRIP_W] * CAP else bad)(
+        "TEAM-CAP: %d members render as %d columns with no `+N` — runs %s"
+        % (CAP, CAP, sigil_runs(rs[0])))
+
 
 def inv_ledger_gone():
     # Spec v2 §8.3 — no ledger at all → `– gates offline` on Row3, an EMPTY team zone, exit 0.
@@ -388,6 +506,7 @@ if MODE == "prove-red":
     prove_red()
 else:
     for name, fn in (("row-exact", inv_row_exact), ("team-uncut", inv_team_uncut),
+                     ("team-cap", inv_team_cap),
                      ("ledger-gone", inv_ledger_gone), ("fallback", inv_fallback),
                      ("perf", inv_perf)):
         print("== %s ==" % name)
