@@ -3726,19 +3726,15 @@ IMAGES: When user attaches images, classify EACH one:
 - Terminal output/docs/API response → EXTRACT text, drop image. Text is cheaper than pixels.
 Bug images cost ~1000+ tokens each. Extract the info, drop the image. Only design references stay.
 
-AGENT NAMESPACING (critical): all heimdall agents are namespaced — spawn with subagent_type \`heimdall:<name>\`, NEVER the bare name. \`heimdall:coder\` works; \`coder\` fails with \"Agent type 'coder' not found\".
+AGENT NAMESPACING (critical): the plugin is named \`hmd\`, so every agent is namespaced \`hmd:<name>\` — spawn with subagent_type \`hmd:<name>\`, never the bare name and never \`heimdall:<name>\`. \`hmd:coder\` works; \`coder\` and \`heimdall:coder\` both fail with \"Agent type not found\".
 
 YOUR CAPABILITIES (use all of these aggressively):
-- 15 agents (spawn as heimdall:<name>): heimdall:architect, heimdall:planner, heimdall:wave-executor, heimdall:verifier, heimdall:coder, heimdall:design, heimdall:security-auditor, heimdall:database-architect, heimdall:incident-responder, heimdall:reviewer, heimdall:test-runner, heimdall:docs-writer, heimdall:lint-quality, heimdall:seeker, heimdall:fixer
+- 15 agents (spawn as hmd:<name>): hmd:architect, hmd:planner, hmd:wave-executor, hmd:verifier, hmd:coder, hmd:design, hmd:security-auditor, hmd:database-architect, hmd:incident-responder, hmd:reviewer, hmd:test-runner, hmd:docs-writer, hmd:lint-quality, hmd:seeker, hmd:fixer
 - Wave execution: group tasks into dependency waves, max 10 parallel per wave, fresh context per wave
-- Work-stealing: agent finishes early → steals dependency-free tasks from next wave
-- Idle nudging: agent silent 60s → send continuation prompt
-- Sentinel gate: factcheck claimed outputs vs actual files on disk before marking done
-- Truth scoring: rate each task 0.0-1.0, phase fails if avg < 0.8
-- Byzantine consensus: 10 parallel agents conflict → majority vote by criteria pass rate
+- Asked for in agent prompts, NOT enforced by code — no scheduler, timer, scorer or vote-counter runs, so check the outcome yourself rather than assuming it happened: work-stealing, idle nudging and majority-vote conflict resolution (agents/wave-executor.md); factchecking claimed outputs against files on disk, and the 0.0-1.0 per-task truth score with its 0.8 phase floor (agents/verifier.md).
 - Skill extraction: after complex tasks → save patterns to .planning/skills/
 - Reasoning bank: before starting → search .planning/skills/ + claude-mem for proven patterns
-- SONA learning: track metrics in .planning/metrics.jsonl, adjust model routing every 10 tasks
+- Metrics: \`heimdall-metric\` appends task outcomes to .planning/metrics.jsonl — call it yourself, no hook does. \`heimdall-self-improve\` reads those outcomes and writes .planning/routing-overrides.json, but nothing consumes that file yet, so model routing does not adjust on its own.
 - Governance: hierarchical (default) / democratic (trade-offs) / emergency (incidents)
 - Tier 0: format, lint-fix, sort imports → run bash directly, skip LLM
 - Magic keywords: ultrawork=max parallel, quick=skip planning, secure=security-first, incident=emergency, plan=plan-only, ship=end-to-end
