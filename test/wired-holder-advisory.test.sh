@@ -116,6 +116,14 @@ EOF
 
 # advise() — $1 json, $2 mount rows file (or the literal 'BROKEN'), $3 ps rows file,
 # $4 orphan pid list, rest = extra argv. Uses $BIN so the mutant can be swapped in.
+#
+# --verbose IS THE ADVISORY THIS SUITE IS ABOUT. `--advise` on its own now emits ONE line —
+# the SessionStart output budget — and the full block that names the holder, both durable
+# actions and the swap/wired/disk axes moved behind --verbose. Nothing here was weakened:
+# the detection and the wording are the same code, so every assertion below still runs
+# against the identical text. The terse line's own contract (that it still fires, still
+# attributes the pressure honestly, and still points here) is pinned by
+# test/sessionstart-quiet.test.sh cases (6)-(8).
 BIN="$CLEAN"
 advise() {
   local json="$1" mounts="$2" psrows="$3" orphans="$4"; shift 4
@@ -127,7 +135,7 @@ advise() {
   SYSMON_JSON="$json" SYSMON_ORPHANS="$orphans" \
   HMD_GC_TMP_ROOTS="$GTMP" HMD_GC_TEMP_TTL_MIN=99999 HMD_GC_CC_VERSIONS="$GVER" \
   HEIMDALL_HOME="$WORK/home-empty" \
-  bash "$BIN" --advise --repo "$WORK/home-empty" "$@" 2>&1
+  bash "$BIN" --advise --verbose --repo "$WORK/home-empty" "$@" 2>&1
 }
 
 # the FALSE claim the forensic sweep killed. Any of these in the output = a regression.

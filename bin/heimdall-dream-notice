@@ -24,7 +24,9 @@
 #     acknowledge step, because the artifact IS the acknowledgement)
 #
 # USAGE
-#   heimdall-dream-notice [--repo DIR] [--status FILE] [--min-gap N] [--json]
+#   heimdall-dream-notice [--repo DIR] [--status FILE] [--min-gap N] [--json] [--verbose]
+#   Default output is ONE line — the SessionStart budget. --verbose prints the full block
+#   (cause, both unattended routes, status + log paths). Detection is identical in both.
 
 set -u
 
@@ -32,6 +34,7 @@ REPO=""
 STATUS=""
 MIN_GAP=2
 JSON=0
+VERBOSE=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -39,6 +42,7 @@ while [ $# -gt 0 ]; do
     --status)  STATUS="${2:-}"; shift 2 ;;
     --min-gap) MIN_GAP="${2:-2}"; shift 2 ;;
     --json)    JSON=1; shift ;;
+    --verbose|-v) VERBOSE=1; shift ;;
     --help|-h) sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) shift ;;
   esac
@@ -138,6 +142,43 @@ p() { printf '[heimdall] %s\n' "$*"; }
 
 REMEDY="$REPO/bin/heimdall-dream"
 [ -x "$REMEDY" ] || REMEDY="${S_DREAM:-heimdall-dream}"
+
+# how long it has been broken — one phrase, shared by both renderings. The newest report's
+# DATE rides along when there is one: it is the artifact the operator diffs against, and a
+# gap in days alone does not say which file that is.
+if [ "$GAP" -ge 0 ]; then
+  WHEN="no report for $GAP days"
+  [ -n "$LAST" ] && WHEN="$WHEN, last $LAST"
+else
+  WHEN="no report ever"
+fi
+
+# ── the ONE-LINE default (the SessionStart output budget) ────────────────────────
+# This block ran at the top of EVERY session and spent eighteen lines describing a condition
+# that, in the case it was written for, had not changed in twenty-six days and needed exactly
+# one human action. So the default is now one line carrying only what changes a decision —
+# WHAT broke, WHERE, the single command that fixes it, and where to read the rest. The full
+# explanation is not deleted, it is behind --verbose.
+#
+# The DECISION above is untouched: ALERT/KIND are computed identically, so a dream that
+# starts failing is still caught on the first session after it does. Only the rendering
+# is shorter. A hook that went quiet by detecting less would be a silent failure — strictly
+# worse than the eighteen lines it replaced.
+if [ "$VERBOSE" != 1 ]; then
+  case "$KIND" in
+    tcc-denied)
+      p "NIGHTLY DREAM IS NOT RUNNING — macOS TCC denies the scheduled job access to ${S_DENIED:-$REPO} ($WHEN) · fix: heimdall-dream-permission ask --repo $REPO --force · detail: heimdall-dream-notice --verbose" ;;
+    missing-path)
+      p "NIGHTLY DREAM IS NOT RUNNING — the scheduled job is pinned to a path that no longer exists ($WHEN) · fix: heimdall-dream-schedule install --repo $REPO · detail: heimdall-dream-notice --verbose" ;;
+    permission-denied)
+      p "NIGHTLY DREAM IS NOT RUNNING — filesystem permissions deny the scheduled job access to the repo ($WHEN) · run now: $REMEDY --repo $REPO run · detail: heimdall-dream-notice --verbose" ;;
+    dream-failed)
+      p "NIGHTLY DREAM IS NOT RUNNING — dream ran but exited nonzero ($WHEN); log: $LOG · run now: $REMEDY --repo $REPO run · detail: heimdall-dream-notice --verbose" ;;
+    *)
+      p "NIGHTLY DREAM IS NOT RUNNING — $WHEN and the scheduled job did not say why (an invisible failure looks exactly like a job that never ran) · run now: $REMEDY --repo $REPO run · detail: heimdall-dream-notice --verbose" ;;
+  esac
+  exit 0
+fi
 
 echo ""
 if [ "$GAP" -ge 0 ]; then
