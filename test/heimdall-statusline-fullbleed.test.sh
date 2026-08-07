@@ -198,14 +198,21 @@ def inv_team_uncut():
     out, rc, err = render(120, canned(c, 120), home=home)
     shutil.rmtree(c, ignore_errors=True); shutil.rmtree(home, ignore_errors=True)
     rs = rows(out)
-    (ok if (shown == 3 and team_w == 49) else bad)(
-        "TEAM-UNCUT: allocator packs 3 members @120 → team_w=%d shown=%d (want 49/3)" % (team_w, shown))
+    # DERIVED, not hardcoded: this assertion carried a literal 49 (the old 3*15+2*2) and went
+    # red the moment the column narrowed to 10c. A geometry constant belongs in ONE place —
+    # re-deriving it here keeps the check honest across the next geometry change too.
+    want_team_w = 3 * L.TEAM_MEMBER_W + 2 * L.TEAM_MEMBER_GAP
+    (ok if (shown == 3 and team_w == want_team_w) else bad)(
+        "TEAM-UNCUT: allocator packs 3 members @120 → team_w=%d shown=%d (want %d/3)"
+        % (team_w, shown, want_team_w))
     # (a) NO ellipsis anywhere — the left-pack guarantees no row ever needs a mid-token clip.
     clean = all("…" not in strip(r) for r in rs)
     (ok if clean else bad)("TEAM-UNCUT: no `…` anywhere (left-pack ⇒ nothing rides the far edge)")
-    # (b) rows 1–2 carry the main sigil (8c) PLUS every teammate eye-strip (8c each) as sigil
-    # bg-cells: total active-bg cells on each of rows 1–2 >= 8·(1 + shown).
-    want_bg = 8 * (1 + shown)
+    # (b) rows 1–2 carry the main sigil (8c) PLUS every teammate eye-strip as sigil bg-cells.
+    # The main hero is still 8c; a TEAMMATE is now a 4c eye_strip_mini, so the two widths are
+    # no longer the same number and the old uniform `8 * (1 + shown)` overcounted by 4 per
+    # teammate. Derived from the layout constant so it tracks the geometry.
+    want_bg = 8 + L.TEAM_STRIP_W * shown
     r12_ok = (len(rs) >= 2 and sum(bg_cells(rs[0])) >= want_bg
               and sum(bg_cells(rs[1])) >= want_bg)
     (ok if r12_ok else bad)(
@@ -346,10 +353,20 @@ def prove_red():
     shutil.rmtree(home, ignore_errors=True); shutil.rmtree(c, ignore_errors=True)
     (ok if widths != {120} else bad)("prove-red row-width: pad disabled → rows %s != {120} (RED)" % sorted(widths))
 
-    # 2) team-truncation RED: widen eye_strip to 12 cells → the team columns overflow team_w,
-    #    so pad_or_truncate clips them and a `…` appears INSIDE the team-zone span.
+    # 2) team-truncation RED: widen the teammate strip past its column → the team columns
+    #    overflow team_w, pad_or_truncate clips them, and a `…` appears INSIDE the team span.
+    #
+    #    THIS MUTANT SILENTLY STOPPED FIRING. It patched `eye_strip`, but team_columns now
+    #    renders teammates through `eye_strip_mini` — so the mutation landed on a function the
+    #    render path no longer calls, nothing overflowed, no `…` appeared, and the harness
+    #    reported the known-bad as SAFE. An anti-truncation gate that cannot go red is exactly
+    #    the false green this suite exists to catch, so it is re-pointed at the live entry
+    #    point rather than deleted. Both names are patched: whichever the render path uses,
+    #    the mutation must reach it, and this check must fail loudly if that stops being true.
     m2 = load(SL, "sl_mut2")
-    m2.SIG.eye_strip = lambda *a, **k: ["X" * 12, "X" * 12]
+    _fat = 3 * L.TEAM_MEMBER_W          # ≥ the whole column, so the overflow is unambiguous
+    m2.SIG.eye_strip_mini = lambda *a, **k: ["X" * _fat, "X" * _fat]
+    m2.SIG.eye_strip = lambda *a, **k: ["X" * _fat, "X" * _fat]
     _rzw, team_w, _sh, _of, _g = L.team_zone_alloc(120, 3, 0)
     home = team_home(); c = tempfile.mkdtemp(); _seed_cwd(c); _env(home, c)
     rs = _run(m2, c)
