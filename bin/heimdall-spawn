@@ -108,6 +108,10 @@ _sentinel_for_kind() {
 }
 
 # ── Subcommand: brief ────────────────────────────────────────────────
+# The hydrator's verdict IS this subcommand's verdict. It returns 1 for an
+# INCOMPLETE brief and 3 for NON_VERIFIED; both must reach the caller, because a
+# human or script asking "what context will this spawn get?" is entitled to hear
+# "less than it asked for" rather than a clean exit over a thin answer.
 cmd_brief() {
   local sj="$1" root="$2"
   brief_hydrate "$sj" "$root"
@@ -199,8 +203,28 @@ cmd_run() {
   trap '_release_slot "$slot"' EXIT
 
   # Build the brief (printed to the spawn's log; the sentinel itself is fed refs).
+  #
+  # A REFUSED BRIEF ABORTS THE SPAWN, BEFORE ANY WORK. `|| true` used to stand
+  # here, which meant a spawn whose capsules or invariants were missing ran
+  # anyway on a brief nobody could tell was thin — and then wrote a report that
+  # every downstream consumer read as a real verdict. A spawn that cannot be
+  # briefed has no verdict, and "no verdict" must never leave here as pass.
+  #
+  # Both INCOMPLETE (1) and NON_VERIFIED (3) map to exit 1 — this command's
+  # "fail" — rather than passing through. Exit 3 already means "queued, try
+  # later" in this tool's contract, and exit 2 is an IO error that callers such
+  # as heimdall-watch deliberately do not count as a failure. Failure is the
+  # loudest slot available, and it is the honest one.
   echo "── heimdall-spawn: $sid (kind=$kind, trigger=$trigger, lane=$lane) ──"
-  brief_hydrate "$sj" "$root" || true
+  local brief_rc=0
+  brief_hydrate "$sj" "$root" || brief_rc=$?
+  if [ "$brief_rc" -ne 0 ]; then
+    case "$brief_rc" in
+      3) echo "error: spawn '$sid' NOT run — its brief is NON_VERIFIED (a ref store could not be read). Fix the store, then re-run." >&2 ;;
+      *) echo "error: spawn '$sid' NOT run — its brief is INCOMPLETE (refs the spawn asked for do not resolve). Fix the refs, then re-run." >&2 ;;
+    esac
+    exit 1
+  fi
 
   # Assemble sentinel args from the spawn context (refs only).
   local diff_ref criteria spec invariants range

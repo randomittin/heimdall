@@ -23,6 +23,12 @@
 # unresolved ref marks the whole brief INCOMPLETE and exits non-zero, and an
 # unreachable resolver is NON_VERIFIED (exit 3) — never downgraded to "absent".
 #
+# That policy is not implemented here. It lives in bin/lib/brief-core.sh, which
+# sentinels/lib/brief.sh — the assembler the spawn path uses — shares verbatim.
+# The two used to be independent code with OPPOSITE failure semantics, and the
+# one nobody was watching degraded silently. Two assemblers cannot be held in
+# agreement by intention; they can only share the decision.
+#
 # Usage:
 #   heimdall-brief build --task <id> --spec <text> [--symbols a,b] [--files p,q]
 #       [--capsules x,y] [--invariants <ref>] [--callers N] [--repo DIR]
@@ -46,9 +52,19 @@ SELF="$0"
 SOURCE_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=lib/protocol.sh
 . "$SOURCE_DIR/lib/protocol.sh"
+# shellcheck source=lib/brief-core.sh
+. "$SOURCE_DIR/lib/brief-core.sh"
 proto_resolve_paths "$SELF"
 proto_require_jq
-proto_ensure_dirs
+# The protocol store is where capsules and the alias table live. If it cannot be
+# created we have no place to look, and a brief whose refs were never checked is
+# NON_VERIFIED — not a brief with nothing in it. Bare `proto_ensure_dirs` would
+# die under set -e with a raw mkdir error and exit 1, which reads downstream as
+# "checked, and INCOMPLETE".
+if ! proto_ensure_dirs 2>/dev/null; then
+  brief_core_nonverified "protocol store unreachable at $PROTO_DIR" \
+    "it could not be created, so no ref could be looked up" || exit 3
+fi
 
 usage() { sed -n '2,42p' "$SELF" | sed 's/^# \{0,1\}//'; }
 
@@ -79,10 +95,20 @@ fi
 
 GRAPH_BIN="${HEIMDALL_GRAPH_BIN:-$SOURCE_DIR/heimdall-graph}"
 
+# Base for repo-relative refs (--invariants). Mirrors how heimdall-graph picks
+# its root, so a ref means the same thing to both: --repo when given, else the
+# git repo containing $PWD, else $PWD.
+if [ -n "$repo" ]; then
+  REF_BASE="$repo"
+else
+  REF_BASE="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+fi
+
 WORKDIR="$(mktemp -d)"
 trap 'rm -rf "$WORKDIR"' EXIT
-BODY="$WORKDIR/body"; MISSING="$WORKDIR/missing"
-: > "$BODY"; : > "$MISSING"
+BODY="$WORKDIR/body"; INVLINE="$WORKDIR/inv"
+: > "$BODY"; : > "$INVLINE"
+brief_core_init "$WORKDIR"
 
 # Split a comma list into trimmed, non-empty lines. bash 3.2 has no safe empty
 # array expansion under `set -u`, so lists travel as lines, never as arrays.
@@ -108,8 +134,7 @@ graph_q() {
 # there; 2 means nobody looked. Treating them alike would turn a broken install
 # into "no context needed" and emit a confidently empty brief.
 resolver_down() {
-  echo "error: symbol resolver unreachable — $GRAPH_BIN exited $GRAPH_RC ($1)" >&2
-  echo "NON_VERIFIED: refusing to emit a brief whose symbols were never checked." >&2
+  brief_core_nonverified "symbol resolver unreachable — $GRAPH_BIN exited $GRAPH_RC" "$1" || true
   exit 3
 }
 
@@ -161,7 +186,7 @@ if [ -n "$symbols" ]; then
         echo "  $s = $av [curated alias — not a code symbol]"
       else
         echo "  $s = <UNRESOLVED>"
-        echo "symbol $s — not in the symbol graph and not in the alias table" >> "$MISSING"
+        brief_core_missing "symbol $s — not in the symbol graph and not in the alias table"
       fi
     done <<< "$(list_iter "$symbols")"
     if [ -n "$caller_caveat" ]; then
@@ -187,7 +212,7 @@ if [ -n "$files" ]; then
           ;;
         4)
           echo "  $f = <UNRESOLVED>"
-          echo "file $f — not in the symbol index (wrong path, or an unindexed language)" >> "$MISSING"
+          brief_core_missing "file $f — not in the symbol index (wrong path, or an unindexed language)"
           ;;
         *) resolver_down "outlining $f" ;;
       esac
@@ -197,47 +222,34 @@ if [ -n "$files" ]; then
 fi
 
 # ── capsules ─────────────────────────────────────────────────────────────────
+# Resolution and refusal come from the shared core, so the spawn path's
+# assembler cannot answer this differently. The store is probed there too: an
+# empty store is a legitimate state and a referenced capsule is then genuinely
+# absent (exit 1), while a store that cannot be read is NON_VERIFIED (exit 3).
 if [ -n "$capsules" ]; then
-  cap_ok=1
-  cap_ids=""
-  while IFS= read -r c; do
-    [ -n "$c" ] || continue
-    cap_ids="$cap_ids $c"
-    if [ ! -f "$CAPSULE_DIR/$c.md" ]; then
-      cap_ok=0
-      echo "capsule $c — no such capsule in $CAPSULE_DIR" >> "$MISSING"
-    fi
-  done <<< "$(list_iter "$capsules")"
-  {
-    echo "CONTEXT CAPSULES (dependency closure of referenced ids ONLY):"
-    if [ "$cap_ok" -eq 1 ] && [ -n "$cap_ids" ]; then
-      set +e
-      # shellcheck disable=SC2086 — ids are validated, whitespace-free tokens
-      hyd="$("$SOURCE_DIR/heimdall-capsule" hydrate $cap_ids 2>&1)"
-      hyd_rc=$?
-      set -e
-      if [ "$hyd_rc" -eq 0 ]; then
-        printf '%s\n' "$hyd" | sed 's/^/  /'
-      else
-        echo "  <UNRESOLVED>"
-        echo "capsule closure incomplete — hydrate failed: $hyd" >> "$MISSING"
-      fi
-    else
-      echo "  <UNRESOLVED>"
-    fi
-    echo
-  } >> "$BODY"
+  cap_rc=0
+  # shellcheck disable=SC2046 — ids are trimmed, whitespace-free tokens
+  brief_core_capsules "$SOURCE_DIR/heimdall-capsule" $(list_iter "$capsules") >> "$BODY" || cap_rc=$?
+  [ "$cap_rc" -eq 0 ] || exit "$cap_rc"
+fi
+
+# ── invariants ref ───────────────────────────────────────────────────────────
+# Validated BEFORE the emit, because a dangling invariants ref has to count
+# toward the unresolved total that decides whether this brief is refused at all.
+if [ -n "$invariants" ]; then
+  inv_rc=0
+  brief_core_invariants "$invariants" "$REF_BASE" > "$INVLINE" || inv_rc=$?
+  [ "$inv_rc" -eq 0 ] || exit "$inv_rc"
 fi
 
 # ── emit ─────────────────────────────────────────────────────────────────────
-nmissing="$(wc -l < "$MISSING" | tr -d ' ')"
+nmissing="$(brief_core_missing_count)"
 
 echo "=== DELTA BRIEF — task $task ==="
 echo "# Refs only. Not the plan, not prior conversation, not restated criteria."
 if [ "$nmissing" -gt 0 ]; then
   echo
-  echo "!! THIS BRIEF IS INCOMPLETE — $nmissing ref(s) UNRESOLVED. DO NOT SPAWN ON IT."
-  echo "!! Acting on it means working without context the task said it needed."
+  brief_core_incomplete_banner "$nmissing"
 fi
 echo
 echo "TASK SPEC:"
@@ -245,18 +257,15 @@ echo "  $spec"
 echo
 cat "$BODY"
 
-if [ -n "$invariants" ]; then
-  echo "INVARIANTS REF: $invariants"
+if [ -s "$INVLINE" ]; then
+  cat "$INVLINE"
   echo
 fi
 
 if [ "$nmissing" -gt 0 ]; then
-  echo "UNRESOLVED REFS ($nmissing) — THIS BRIEF IS INCOMPLETE:"
-  sed 's/^/  !! /' "$MISSING"
-  echo
-  echo "Refusing to certify a brief that is missing context the task referenced."
-  proto_log "brief" "refused" "task=$task unresolved=$nmissing symbols=$symbols files=$files capsules=$capsules"
+  brief_core_unresolved_block "$nmissing"
+  proto_log "brief" "refused" "task=$task unresolved=$nmissing symbols=$symbols files=$files capsules=$capsules invariants=$invariants"
   exit 1
 fi
 
-proto_log "brief" "build" "task=$task symbols=$symbols files=$files capsules=$capsules"
+proto_log "brief" "build" "task=$task symbols=$symbols files=$files capsules=$capsules invariants=$invariants"

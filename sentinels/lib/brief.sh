@@ -7,103 +7,130 @@
 #   { task spec, symbol-table ref, referenced capsule IDs, invariants ref }
 #
 # This library hydrates a spawn's context from its spawn json's `context` block
-# WITHOUT ever pulling in a full plan. It references capsules by id/path and
-# DEGRADES GRACEFULLY: if H-4's `capsules/` dir is not present yet, capsule
-# hydration is skipped (the inline brief is used as-is) — never faked, never a
-# fabricated capsule body.
+# WITHOUT ever pulling in a full plan. It references capsules by id/path.
+#
+# IT USED TO DEGRADE GRACEFULLY. THAT WAS THE BUG.
+#   Every unresolvable ref printed "(unavailable: … — skipped)" and the function
+#   returned 0. bin/heimdall-spawn is the path a real spawn takes, so a spawn
+#   whose capsules or invariants were missing ran anyway, on a brief nobody
+#   could tell was thin. A thin brief is strictly worse than a fat one: the
+#   agent cannot see the gap, produces confidently wrong work, and every gate
+#   downstream reads a green run. Meanwhile bin/heimdall-brief — the OTHER
+#   assembler, for the same artefact — refused the same refs outright. Two
+#   assemblers, opposite failure semantics, and the silent one was the one on
+#   the live path.
+#
+#   It also read capsules from $root/capsules/ while bin/heimdall-capsule writes
+#   $PLANNING_DIR/protocol/capsules/. Nothing ever wrote to the path it read, so
+#   "capsules/ dir not present yet — H-4 pending" was printed forever about a
+#   mechanism that had in fact landed. A store nothing writes to is empty
+#   forever and looks fine.
+#
+# BOTH ARE FIXED BY DELETION, NOT BY DUPLICATION. The resolution and the refusal
+# now come from bin/lib/brief-core.sh, which bin/heimdall-brief shares verbatim,
+# and capsules come from bin/lib/protocol.sh's CAPSULE_DIR — the one definition
+# of where capsules live. Neither behaviour is restated here, so neither can
+# drift from the other again.
 #
 # The `context` block of a spawn json (see .planning/spawns/SCHEMA.md) is a
 # free-form object; the keys this hydrator understands:
-#   context.capsules     : array of capsule ids (resolved to capsules/<id>.md)
-#   context.invariants   : path to an INVARIANTS file (e.g. "INVARIANTS.md")
+#   context.capsules     : array of capsule ids (resolved in CAPSULE_DIR)
+#   context.invariants   : an invariants ref, <path> or <path>#<anchor>
 #   context.symbols      : path to a symbol table (e.g. "symbols.json")
 #   context.criteria     : array of acceptance-criteria ids (kept as ids; the
 #                          resolver is H-4's `heimdall resolve`, not ours)
 #   context.diff_ref     : a git ref/range the spawn grades (e.g. "HEAD~1..HEAD")
 #
-# Functions print to stdout a compact, human-readable brief. They NEVER read a
-# plan file; if a referenced artifact is absent they emit a one-line
-# "(unavailable: <reason>)" marker and continue — honest degradation.
+# Paths in context are relative to the spawn's repo root (the <repo-root> arg);
+# capsule IDS are not paths and always resolve in the canonical store.
 
-# Resolve the repo root that owns capsules/ etc. Caller passes it explicitly so
-# this lib stays cwd-independent (agent threads reset cwd between bash calls).
+_BRIEF_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+_BRIEF_PLUGIN_DIR="$(cd "$_BRIEF_LIB_DIR/../.." && pwd)"
+# shellcheck source=../../bin/lib/protocol.sh
+. "$_BRIEF_PLUGIN_DIR/bin/lib/protocol.sh"
+# shellcheck source=../../bin/lib/brief-core.sh
+. "$_BRIEF_PLUGIN_DIR/bin/lib/brief-core.sh"
+# Resolved against bin/heimdall-brief's own path, not this file's, so CAPSULE_DIR
+# comes out byte-identical to what the other entry point computes. Passing this
+# lib's path would put PROTO_BIN_DIR in sentinels/ and silently invent a second
+# store — the exact class of bug this rewrite removes.
+proto_resolve_paths "$_BRIEF_PLUGIN_DIR/bin/heimdall-brief"
 
 # Hydrate the brief for a spawn json. Args:
 #   <spawn-json-path> <repo-root>
-# Prints the assembled brief; returns 0 always (missing refs degrade, not fail).
+# Prints the assembled brief. Returns:
+#   0 every referenced ref resolved
+#   1 INCOMPLETE — a ref was looked for and is absent; DO NOT SPAWN on it
+#   2 the spawn json itself is unusable (missing file, no jq)
+#   3 NON_VERIFIED — a store or file could not be read, so nothing was checked
 brief_hydrate() {
   local spawn_json="$1" root="$2"
   command -v jq >/dev/null 2>&1 || { echo "error: jq is required for brief hydration" >&2; return 2; }
   [ -f "$spawn_json" ] || { echo "error: spawn json not found: $spawn_json" >&2; return 2; }
 
-  local kind trigger
-  kind="$(jq -r '.kind // "unknown"' "$spawn_json")"
-  trigger="$(jq -r '.trigger // "unknown"' "$spawn_json")"
+  local work rc=0
+  work="$(mktemp -d)" || { echo "error: cannot create a work dir for brief hydration" >&2; return 2; }
+  brief_core_init "$work"
 
-  echo "── BRIEF (minimal-context; capsule refs only, never a full plan) ──"
-  echo "kind:    $kind"
-  echo "trigger: $trigger"
+  local body="$work/body"
+  : > "$body"
 
-  # diff ref the spawn grades
-  local diff_ref
-  diff_ref="$(jq -r '.context.diff_ref // empty' "$spawn_json")"
-  [ -n "$diff_ref" ] && echo "diff_ref: $diff_ref"
+  # ── the spawn's own framing: not refs, so nothing here can dangle ──────────
+  {
+    local kind trigger diff_ref criteria
+    kind="$(jq -r '.kind // "unknown"' "$spawn_json")"
+    trigger="$(jq -r '.trigger // "unknown"' "$spawn_json")"
+    echo "kind:    $kind"
+    echo "trigger: $trigger"
 
-  # acceptance-criteria ids — kept AS IDS (H-4's resolver expands them; we don't
-  # restate the criteria text, that would defeat compression-by-reference)
-  local criteria
-  criteria="$(jq -r '(.context.criteria // []) | join(", ")' "$spawn_json")"
-  [ -n "$criteria" ] && echo "criteria (ids): $criteria"
+    diff_ref="$(jq -r '.context.diff_ref // empty' "$spawn_json")"
+    [ -n "$diff_ref" ] && echo "diff_ref: $diff_ref"
 
-  # symbol table ref
-  local symbols
+    # acceptance-criteria ids — kept AS IDS (H-4's resolver expands them; we
+    # don't restate the criteria text, that would defeat compression-by-reference)
+    criteria="$(jq -r '(.context.criteria // []) | join(", ")' "$spawn_json")"
+    [ -n "$criteria" ] && echo "criteria (ids): $criteria"
+  } >> "$body"
+
+  # ── refs, every one of which is checked ────────────────────────────────────
+  local symbols invariants capsule_ids
   symbols="$(jq -r '.context.symbols // empty' "$spawn_json")"
   if [ -n "$symbols" ]; then
-    if [ -f "$root/$symbols" ]; then
-      echo "symbols: $symbols (present)"
-    else
-      echo "symbols: $symbols (unavailable: H-4 symbol table not present yet — skipped)"
-    fi
+    brief_core_file_ref "symbols" "$symbols" "$root" >> "$body" || rc=$?
+    [ "$rc" -eq 0 ] || { rm -rf "$work"; return "$rc"; }
   fi
 
-  # invariants ref
-  local invariants
   invariants="$(jq -r '.context.invariants // empty' "$spawn_json")"
   if [ -n "$invariants" ]; then
-    if [ -f "$root/$invariants" ]; then
-      echo "invariants: $invariants (present)"
-    else
-      echo "invariants: $invariants (unavailable: file not present — skipped)"
-    fi
+    brief_core_invariants "$invariants" "$root" >> "$body" || rc=$?
+    [ "$rc" -eq 0 ] || { rm -rf "$work"; return "$rc"; }
   fi
 
-  # capsule refs — the H-4 mechanism. Degrade gracefully if capsules/ absent.
-  local capsule_ids
-  capsule_ids="$(jq -r '(.context.capsules // []) | .[]' "$spawn_json")"
-  if [ -n "$capsule_ids" ]; then
-    echo "capsule refs:"
-    if [ ! -d "$root/capsules" ]; then
-      # H-4 not landed yet: reference the ids, skip hydration. NEVER fabricate.
-      while IFS= read -r cid; do
-        [ -n "$cid" ] || continue
-        echo "  - $cid (unavailable: capsules/ dir not present yet — H-4 pending, hydration skipped)"
-      done <<<"$capsule_ids"
-    else
-      while IFS= read -r cid; do
-        [ -n "$cid" ] || continue
-        local cpath="$root/capsules/$cid.md"
-        if [ -f "$cpath" ]; then
-          # Capsules are <=10 lines; include the body inline (it IS the minimal
-          # context). Reference by id so the trail stays auditable.
-          echo "  - $cid (capsules/$cid.md):"
-          sed 's/^/      /' "$cpath"
-        else
-          echo "  - $cid (unavailable: capsules/$cid.md not found — skipped)"
-        fi
-      done <<<"$capsule_ids"
-    fi
+  capsule_ids="$(jq -r '(.context.capsules // []) | .[]' "$spawn_json" | tr '\n' ' ')"
+  if [ -n "${capsule_ids// /}" ]; then
+    # shellcheck disable=SC2086 — capsule ids are whitespace-free tokens
+    brief_core_capsules "$_BRIEF_PLUGIN_DIR/bin/heimdall-capsule" $capsule_ids >> "$body" || rc=$?
+    [ "$rc" -eq 0 ] || { rm -rf "$work"; return "$rc"; }
   fi
+
+  # ── emit ──────────────────────────────────────────────────────────────────
+  local nmissing
+  nmissing="$(brief_core_missing_count)"
+
+  echo "── BRIEF (minimal-context; capsule refs only, never a full plan) ──"
+  if [ "$nmissing" -gt 0 ]; then
+    brief_core_incomplete_banner "$nmissing"
+  fi
+  cat "$body"
   echo "── END BRIEF ──"
+
+  if [ "$nmissing" -gt 0 ]; then
+    brief_core_unresolved_block "$nmissing"
+    rm -rf "$work"
+    return 1
+  fi
+  rm -rf "$work"
+  return 0
 }
 
 # Assert a brief does NOT smuggle a full plan. The contract forbids embedding a

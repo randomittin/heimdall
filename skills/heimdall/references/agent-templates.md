@@ -13,10 +13,16 @@ bin/heimdall-brief build \
   --symbols <comma-list of symbols the task touches> \
   --files   <comma-list of files the task edits> \
   --capsules <prior-wave capsule ids> \
-  --invariants INVARIANTS.md
+  --invariants 'CLAUDE.md#code-quality--zero-tolerance'
 ```
 
-Paste its stdout in as the `Context:` block. Symbols resolve against the live
+Paste its stdout in as the `Context:` block. The invariants ref is `<path>` or
+`<path>#<anchor>`, repo-relative, and is **checked** — the file must exist and
+the anchor must resolve to a real heading, or the brief refuses. That is not
+pedantry: the invariants ref is how a spawn inherits the no-stub and quality
+rules, so a ref that quietly points at nothing hands the agent a belief it was
+given constraints it never received. This example previously said
+`INVARIANTS.md`, which has never existed at the repo root. Symbols resolve against the live
 symbol index (`bin/heimdall-graph`), so each one arrives as a real
 `file:line-range` plus the sites that call it, and each `--files` entry arrives
 as an outline of spans rather than a file body.

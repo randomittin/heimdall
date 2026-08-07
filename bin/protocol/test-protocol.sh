@@ -110,8 +110,18 @@ fi
 echo "== [4] delta brief — refs only, NOT the plan =="
 # Plant a plan file that must NOT leak into the brief.
 echo "SECRET_FULL_PLAN_BODY do not leak this" > "$TMP_PLANNING/PLAN-alpha.md"
+# The invariants ref is repo-relative and is now VALIDATED, not echoed. This
+# fixture used to pass `INVARIANTS.md`, which has never existed at the repo
+# root — a dangling ref that rode through silently for months and is exactly
+# the defect the validation was added for. A spawn handed that ref believes it
+# inherited the no-stub rules it was never actually given.
 BR="$("$BRIEF" build --task 3.2 --spec "implement book diff" \
-       --symbols F12,C3 --capsules wave2 --invariants INVARIANTS.md)"
+       --symbols F12,C3 --capsules wave2 --invariants "CLAUDE.md#code-quality--zero-tolerance")"
+printf '%s' "$BR" | grep -q "verified: file + anchor"; check $? "brief VERIFIES the invariants ref (file + anchor), not just echoes it"
+expect_fail "brief REFUSES an invariants ref whose file does not exist" \
+  "$BRIEF" build --task 3.2 --spec "dangle" --invariants "INVARIANTS.md"
+expect_fail "brief REFUSES an invariants ref whose anchor does not exist" \
+  "$BRIEF" build --task 3.2 --spec "dangle" --invariants "CLAUDE.md#no-such-section"
 printf '%s' "$BR" | grep -q "implement book diff"; check $? "brief includes task spec"
 printf '%s' "$BR" | grep -q "F12"; check $? "brief includes symbol refs"
 printf '%s' "$BR" | grep -q "wave2"; check $? "brief includes capsule refs"
