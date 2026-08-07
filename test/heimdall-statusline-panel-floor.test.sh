@@ -362,13 +362,36 @@ for c in 200 160 120 90 60 40; do
 done
 
 # The headline, observed on the REAL emitted bytes rather than on the budget math.
-out200="$(render 200)"
-if printf '%s' "$out200" | grep -q '▓'; then
-  E_PASS=$((E_PASS+1)); printf '  ok   BARS@200: Row4 emits real ▓ micro-gauge bars\n'
-else E_FAIL=$((E_FAIL+1)); printf '  FAIL BARS@200: Row4 emitted no ▓ — the bars downgraded to text\n'; fi
-if printf '%s' "$out200" | grep -q '41/41'; then
-  E_PASS=$((E_PASS+1)); printf '  ok   GATES@200: Row3 keeps its gate details\n'
-else E_FAIL=$((E_FAIL+1)); printf '  FAIL GATES@200: Row3 dropped the gate details\n'; fi
+#
+# WHY THESE WIDTHS, AND WHY NOT ONLY 200 — this suite shipped once asserting the headline
+# at 200 ALONE and was a FALSE GREEN: a reviewer deleted `content_floor=panel_floor(...)`
+# from main()'s call site and the gate still reported 20/0 while the real 160c render had
+# fully regressed to plain-text loaders. The cause is that every other section reaches the
+# floor through the `budgets()` helper, which re-implements main()'s wiring by calling
+# team_zone_alloc(content_floor=...) itself — so it proves the LIBRARY composes and never
+# that PRODUCTION composes it. 200c cannot catch that, because nine 10-cell columns already
+# leave the panel 81c there: the floor is INERT at 200 by construction.
+#
+# 120 and 160 are the floor's load-bearing range — measured: at both widths the 10c columns
+# ALONE still render Row4 as TEXT, so the bars appear if and only if main() actually applies
+# the floor. These two assertions are the only ones in the file that observe the shipped
+# call site, and they are what makes the gate falsifiable. Removing that call site MUST turn
+# them red; if it does not, this gate has regressed to decoration again.
+for hc in 120 160 200; do
+  outw="$(render "$hc")"
+  if printf '%s' "$outw" | grep -q '▓'; then
+    E_PASS=$((E_PASS+1)); printf '  ok   BARS@%s: Row4 emits real ▓ micro-gauge bars\n' "$hc"
+  else
+    E_FAIL=$((E_FAIL+1))
+    printf '  FAIL BARS@%s: Row4 emitted no ▓ — the bars downgraded to text (the panel floor did not reach main())\n' "$hc"
+  fi
+  if printf '%s' "$outw" | grep -q '41/41'; then
+    E_PASS=$((E_PASS+1)); printf '  ok   GATES@%s: Row3 keeps its gate details\n' "$hc"
+  else
+    E_FAIL=$((E_FAIL+1))
+    printf '  FAIL GATES@%s: Row3 dropped the gate details (the panel floor did not reach main())\n' "$hc"
+  fi
+done
 
 printf '\n  %d passed, %d failed\n' "$E_PASS" "$E_FAIL"
 [ "$FAIL" -eq 0 ] && [ "$E_FAIL" -eq 0 ]
