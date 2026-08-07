@@ -1,0 +1,146 @@
+#!/usr/bin/env bash
+# heimdall-graph — symbol-graph navigation, so an agent stops reading whole files.
+#
+# The expensive way to answer "what calls pad_or_truncate() and what breaks if
+# I change it" is grep, then Read five files in full, then Read their callers in
+# full — and throw away 95% of those bytes. This answers the same question from
+# an index: definition with a line range, every reference as file:line, one hop
+# each way, and the transitive caller set. Reach for `outline` BEFORE reading a
+# file: it gives you the spans so you can Read only the one you need.
+#
+# Usage:
+#   heimdall-graph def      <symbol>   where it is defined, with its line range
+#   heimdall-graph refs     <symbol>   every call/reference site as file:line
+#   heimdall-graph callers  <symbol>   one hop in  — who calls it
+#   heimdall-graph callees  <symbol>   one hop out — what it calls
+#   heimdall-graph impact   <symbol>   transitive KNOWN callers + blind spots
+#   heimdall-graph outline  <file>     a file's symbols with line ranges
+#   heimdall-graph index               rebuild the index, print stats
+#   heimdall-graph status              index freshness + cache location
+#   heimdall-graph -h | --help
+#
+# Flags:
+#   --json         structured output instead of TAB columns
+#   --limit N      cap results (default 40; 0 = no cap). A capped list always
+#                  ends in "+N more" so a short answer is never mistaken for
+#                  a complete one.
+#   --repo DIR     index DIR instead of the git repo containing $PWD
+#
+# Correctness note: `impact` reports KNOWN callers and is NOT exhaustive — it
+# prints its own blind spots (dynamic dispatch, eval, shell indirection, plugin
+# loading, cross-language calls). Read them before concluding a change is safe.
+#
+# Freshness: the cache (${HEIMDALL_HOME:-<repo>/.heimdall}/symbolgraph.json)
+# carries a repo-state stamp over every indexed file's path/size/mtime. A stamp
+# mismatch rebuilds; a stale answer is never served.
+#
+# Exit status:
+#   0  query answered
+#   2  usage error (bad subcommand, missing argument, broken install)
+#   4  symbol or file not in the index (the index says so; it never invents one)
+
+set -euo pipefail
+
+# ── Resolve the sibling python lib RELOCATABLY (mirrors bin/heimdall-ast) ─────
+SELF_SRC="$0"
+case "$SELF_SRC" in
+  */*) : ;;
+  *)
+    RESOLVED="$(command -v "$SELF_SRC" 2>/dev/null || true)"
+    [ -n "$RESOLVED" ] && SELF_SRC="$RESOLVED"
+    ;;
+esac
+BIN_DIR="$(cd "$(dirname "$SELF_SRC")" 2>/dev/null && pwd)"
+LIB="$BIN_DIR/lib/symbolgraph_cli.py"
+
+usage() { sed -n '11,37p' "$SELF_SRC" | sed 's/^# \{0,1\}//'; }
+
+if [ ! -f "$LIB" ]; then
+  echo "heimdall-graph: cannot find lib/symbolgraph_cli.py next to $BIN_DIR (broken install?)" >&2
+  exit 2
+fi
+
+PY="$(command -v python3 || command -v python || true)"
+if [ -z "$PY" ]; then
+  echo "heimdall-graph: python3 not found — the symbol index needs it (stdlib only)" >&2
+  exit 2
+fi
+
+# ── Subcommand ────────────────────────────────────────────────────────────────
+if [ "$#" -lt 1 ]; then
+  usage >&2
+  exit 2
+fi
+
+CMD="$1"
+shift || true
+
+NEEDS_ARG=yes
+case "$CMD" in
+  -h|--help)
+    usage
+    exit 0
+    ;;
+  def|refs|callers|callees|impact|outline)
+    : ;;
+  index|status)
+    NEEDS_ARG=no ;;
+  *)
+    echo "heimdall-graph: unknown command '$CMD' (want: def | refs | callers | callees | impact | outline | index | status)" >&2
+    usage >&2
+    exit 2
+    ;;
+esac
+
+# ── Flags ─────────────────────────────────────────────────────────────────────
+ARG=""
+REPO=""
+LIMIT=40
+AS_JSON=0
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --json)   AS_JSON=1; shift ;;
+    --limit)
+      LIMIT="${2:-}"
+      [ -n "$LIMIT" ] || { echo "heimdall-graph: --limit needs a value" >&2; exit 2; }
+      shift 2 ;;
+    --limit=*) LIMIT="${1#--limit=}"; shift ;;
+    --repo)
+      REPO="${2:-}"
+      [ -n "$REPO" ] || { echo "heimdall-graph: --repo needs a value" >&2; exit 2; }
+      shift 2 ;;
+    --repo=*) REPO="${1#--repo=}"; shift ;;
+    -h|--help) usage; exit 0 ;;
+    -*)
+      echo "heimdall-graph: unknown option '$1'" >&2
+      exit 2 ;;
+    *)
+      if [ -z "$ARG" ]; then
+        ARG="$1"
+      else
+        echo "heimdall-graph: unexpected extra argument '$1'" >&2
+        exit 2
+      fi
+      shift ;;
+  esac
+done
+
+case "$LIMIT" in
+  ''|*[!0-9]*) echo "heimdall-graph: --limit must be a non-negative integer (got '$LIMIT')" >&2; exit 2 ;;
+esac
+
+if [ "$NEEDS_ARG" = yes ] && [ -z "$ARG" ]; then
+  echo "heimdall-graph: $CMD needs an argument" >&2
+  usage >&2
+  exit 2
+fi
+
+if [ -n "$REPO" ]; then
+  [ -d "$REPO" ] || { echo "heimdall-graph: --repo is not a directory: $REPO" >&2; exit 2; }
+  REPO="$(cd "$REPO" && pwd)"
+else
+  REPO="$("$PY" -c 'import sys,os; sys.path.insert(0, sys.argv[1]); import symbolgraph; sys.stdout.write(symbolgraph.repo_root(os.getcwd()))' "$BIN_DIR/lib")"
+fi
+
+exec "$PY" "$LIB" "$CMD" "$REPO" "$LIMIT" "$AS_JSON" "$ARG"
