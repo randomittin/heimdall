@@ -196,7 +196,7 @@ The plans you emit MUST NOT instruct coders to write stub, dummy, placeholder, m
 
 The project enforces rules deterministically via hooks (not advisory). When planning, account for:
 
-- **Write/Edit content scan** blocks files containing `// TODO`, `placeholder`, bare `stub`/`shim`, `NotImplementedError`, lone `pass`, empty function bodies. Tasks specifying any of these will fail at hook level.
+- **Write/Edit content scan** matches code shape, not scary words. It blocks a code-comment `// TODO` / `# TODO` / `FIXME`, a not-implemented marker (`NotImplementedError`, `todo!()`, `unimplemented!()`), a `throw new Error('not implemented')`, a lone `pass` body, and empty function or arrow bodies. It does NOT block the bare words `placeholder`, `stub` or `shim` in prose or data, and it skips `*.md`, `*.txt`, `*.json`, `*.ndjson` and anything under `fixtures/` or `evals/`. Tasks specifying any of the blocked shapes will fail at hook level.
 - **Bash `git push`** runs `heimdall-state check-quality-gates`; push fails if tests/lint not green. Tasks that defer testing will block at push.
 - **Agent spawn tracker** nudges on sequential solo agent spawns; plans should batch independent agents into single-message waves (the parallelism rule).
 - **PostToolUse `edit-tracker`** auto-logs all writes; `verify-edits --quick` runs at SessionEnd. Tasks should expect their edits to be fact-checked.

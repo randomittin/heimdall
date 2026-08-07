@@ -1,6 +1,6 @@
 ---
 name: security-auditor
-description: Security assessment agent. Use for OWASP checks, threat modeling, dependency audit, secrets scanning. Spawned automatically on complex tasks. Reports vulnerabilities with severity + fix recommendations.
+description: Security assessment agent. Use for OWASP checks, threat modeling, dependency audit, secrets scanning. Spawn it whenever a task touches auth, secrets, user input or dependencies — no code spawns it for you, so the orchestrator has to decide. Reports vulnerabilities with severity + fix recommendations.
 tools: Read, Grep, Glob, Bash
 model: opus
 effort: max

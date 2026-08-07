@@ -65,7 +65,7 @@ Every piece of work Heimdall produces passes through mandatory quality gates bef
 **State key**: `.quality_gates.dirty`
 
 **Protocol**:
-- Any Write/Edit tool use triggers `heimdall-state mark-dirty` via PostToolUse hook
+- Any Write/Edit tool use triggers `heimdall-state mark-dirty` via PostToolUse hook — but only in a repo that already has a `heimdall-state.json` (or a legacy `superx-state.json`). Without one the hook skips the call, so run `heimdall-state init` first or this gate never arms.
 - Test runner clears dirty flag via `heimdall-state mark-clean`
 - Push is blocked while dirty = true
 
