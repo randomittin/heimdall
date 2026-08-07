@@ -1,20 +1,45 @@
 #!/usr/bin/env bash
 # heimdall-brief — delta-brief builder (Token-Frugal Protocol v2, mechanism 4).
 #
-# A spawned agent's brief = task spec + symbol table (referenced entries only)
-# + referenced capsule IDs (hydrated to their dependency closure)
-# + invariants ref. NEVER the plan, NEVER prior conversation, NEVER restated
-# acceptance criteria. The brief is the on-the-wire context a delta-spawn gets.
+# A spawned agent's brief = task spec + the few symbols/files it actually
+# references, resolved to spans + blast radius, + referenced capsule IDs
+# (hydrated to their dependency closure) + invariants ref. NEVER the plan,
+# NEVER prior conversation, NEVER restated acceptance criteria. The brief is
+# the on-the-wire context a delta-spawn gets.
 #
-# Compression by reference: the brief carries IDs and resolves the few symbols /
-# capsules the task actually needs — not the whole symbol table, not the plan.
+# Symbols resolve from bin/heimdall-graph — the live symbol index over the real
+# tree — NOT from a hand-maintained copy of it. That direction is deliberate:
+# two indexes of the same code drift, and a drifted index is a false-green
+# generator (it answers confidently with yesterday's truth). The graph is the
+# single source of truth for code symbols. `.planning/protocol/symbols.json`
+# keeps its ORIGINAL and different job: curated shorthand aliases (F12 =
+# src/matching/engine.ts) that no code index could know. Aliases are consulted
+# only for names the code index has never heard of, and when both answer, the
+# graph wins and the collision is ANNOUNCED rather than silently resolved.
+#
+# Fail closed, fail loud. A brief missing context the task asked for is worse
+# than a fat one: the agent cannot tell anything is absent, so it produces
+# confidently wrong work that every downstream gate then sees as green. So an
+# unresolved ref marks the whole brief INCOMPLETE and exits non-zero, and an
+# unreachable resolver is NON_VERIFIED (exit 3) — never downgraded to "absent".
 #
 # Usage:
-#   heimdall-brief build --task <id> --spec <text> [--symbols a,b] \
-#       [--capsules x,y] [--invariants <ref>]
+#   heimdall-brief build --task <id> --spec <text> [--symbols a,b] [--files p,q]
+#       [--capsules x,y] [--invariants <ref>] [--callers N] [--repo DIR]
 #   -h, --help
 #
-# Output: a human-readable brief on stdout. Exit 0 ok; 1 missing ref; 2 usage.
+# Flags:
+#   --symbols a,b   code symbols (or curated alias ids) the task references
+#   --files p,q     files the task touches — emitted as OUTLINES (spans), so an
+#                   agent reads the one span it needs instead of the whole file
+#   --callers N     caller rows per symbol (default 5; 0 = none)
+#   --repo DIR      resolve against DIR instead of the repo containing $PWD
+#
+# Confidence markers ride through from the graph and are never stripped:
+#   ~ low-confidence edge (shell literal match)   ? ambiguous (name collision)
+#
+# Exit: 0 ok; 1 one or more refs unresolved (brief INCOMPLETE); 2 usage;
+#       3 resolver unreachable (NON_VERIFIED — the index never answered).
 set -euo pipefail
 
 SELF="$0"
@@ -25,61 +50,200 @@ proto_resolve_paths "$SELF"
 proto_require_jq
 proto_ensure_dirs
 
-usage() { sed -n '2,19p' "$SELF" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,42p' "$SELF" | sed 's/^# \{0,1\}//'; }
 
 [ $# -ge 1 ] || { echo "error: 'build' subcommand required" >&2; usage >&2; exit 2; }
 case "$1" in -h|--help) usage; exit 0 ;; build) shift ;; *) echo "error: unknown subcommand: $1" >&2; exit 2 ;; esac
 
-task=""; spec=""; symbols=""; capsules=""; invariants=""
+task=""; spec=""; symbols=""; files=""; capsules=""; invariants=""; repo=""; callers_cap=5
 while [ $# -gt 0 ]; do
   case "$1" in
     --task)       task="${2:?--task needs a value}"; shift 2 ;;
     --spec)       spec="${2:?--spec needs a value}"; shift 2 ;;
     --symbols)    symbols="${2:?--symbols needs a value}"; shift 2 ;;
+    --files)      files="${2:?--files needs a value}"; shift 2 ;;
     --capsules)   capsules="${2:?--capsules needs a value}"; shift 2 ;;
     --invariants) invariants="${2:?--invariants needs a value}"; shift 2 ;;
+    --callers)    callers_cap="${2:?--callers needs a value}"; shift 2 ;;
+    --repo)       repo="${2:?--repo needs a value}"; shift 2 ;;
     *) echo "error: unknown flag: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
 [ -n "$task" ] || { echo "error: --task is required" >&2; exit 2; }
 [ -n "$spec" ] || { echo "error: --spec is required" >&2; exit 2; }
+case "$callers_cap" in ''|*[!0-9]*) echo "error: --callers must be a non-negative integer" >&2; exit 2 ;; esac
+if [ -n "$repo" ]; then
+  [ -d "$repo" ] || { echo "error: --repo is not a directory: $repo" >&2; exit 2; }
+  repo="$(cd "$repo" && pwd)"
+fi
+
+GRAPH_BIN="${HEIMDALL_GRAPH_BIN:-$SOURCE_DIR/heimdall-graph}"
+
+WORKDIR="$(mktemp -d)"
+trap 'rm -rf "$WORKDIR"' EXIT
+BODY="$WORKDIR/body"; MISSING="$WORKDIR/missing"
+: > "$BODY"; : > "$MISSING"
+
+# Split a comma list into trimmed, non-empty lines. bash 3.2 has no safe empty
+# array expansion under `set -u`, so lists travel as lines, never as arrays.
+list_iter() { printf '%s' "$1" | tr ',' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^$' || true; }
+
+# Ask the graph. Sets GRAPH_OUT / GRAPH_RC. Exit 0 = answered, 4 = proven
+# absent, anything else = the index did not answer and we must NOT guess.
+GRAPH_OUT=""; GRAPH_RC=0
+graph_q() {
+  local cmd="$1" arg="$2"
+  set +e
+  if [ -n "$repo" ]; then
+    GRAPH_OUT="$("$GRAPH_BIN" "$cmd" "$arg" --json --limit 0 --repo "$repo" 2>/dev/null)"
+  else
+    GRAPH_OUT="$("$GRAPH_BIN" "$cmd" "$arg" --json --limit 0 2>/dev/null)"
+  fi
+  GRAPH_RC=$?
+  set -e
+}
+
+# An unreachable resolver is NON_VERIFIED, never OPEN. Distinguishing this from
+# exit 4 is the whole point: 4 means the index looked and the symbol is not
+# there; 2 means nobody looked. Treating them alike would turn a broken install
+# into "no context needed" and emit a confidently empty brief.
+resolver_down() {
+  echo "error: symbol resolver unreachable — $GRAPH_BIN exited $GRAPH_RC ($1)" >&2
+  echo "NON_VERIFIED: refusing to emit a brief whose symbols were never checked." >&2
+  exit 3
+}
+
+alias_value() { jq -r --arg id "$1" '.symbols[$id] // empty' "$SYMBOLS_FILE"; }
+
+# ── symbols ──────────────────────────────────────────────────────────────────
+if [ -n "$symbols" ]; then
+  {
+    echo "SYMBOLS (referenced only — resolved from the live symbol graph):"
+    while IFS= read -r s; do
+      [ -n "$s" ] || continue
+      graph_q def "$s"
+      case "$GRAPH_RC" in
+        0) ;;
+        4) GRAPH_OUT="" ;;
+        *) resolver_down "querying def $s" ;;
+      esac
+
+      av="$(alias_value "$s")"
+
+      if [ -n "$GRAPH_OUT" ]; then
+        jq -r '.definitions[] | "  \(.n) = \(.f):\(.a)-\(.b) (\(.k), \(.l))"' <<< "$GRAPH_OUT"
+        ndefs="$(jq -r '.definitions | length' <<< "$GRAPH_OUT")"
+        [ "$ndefs" -gt 1 ] && echo "    ? $ndefs definitions share this name — disambiguate before editing"
+        if [ -n "$av" ]; then
+          echo "    !! COLLISION: alias table also defines $s = $av"
+          echo "    !! using the graph (ground truth); the alias is stale or means something else"
+        fi
+        if [ "$callers_cap" -gt 0 ]; then
+          graph_q callers "$s"
+          if [ "$GRAPH_RC" -eq 0 ]; then
+            jq -r --argjson n "$callers_cap" '
+              (.callers // []) as $c
+              | ($c[:$n][] | "    <- called by \(if .edge=="quoted" then "~" else "" end)\(if .ambiguous then "?" else "" end)\(.caller) at \(.file):\(.line)"),
+                (if ($c|length) > $n then "    <- +\(($c|length) - $n) more caller site(s)" else empty end)
+            ' <<< "$GRAPH_OUT"
+          fi
+        fi
+      elif [ -n "$av" ]; then
+        echo "  $s = $av [curated alias — not a code symbol]"
+      else
+        echo "  $s = <UNRESOLVED>"
+        echo "symbol $s — not in the symbol graph and not in the alias table" >> "$MISSING"
+      fi
+    done <<< "$(list_iter "$symbols")"
+    echo
+  } >> "$BODY"
+fi
+
+# ── files (outlines, never bodies) ───────────────────────────────────────────
+if [ -n "$files" ]; then
+  {
+    echo "FILES (outline only — spans, so you read one span instead of the file):"
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      graph_q outline "$f"
+      case "$GRAPH_RC" in
+        0)
+          echo "  $f"
+          jq -r '(.symbols // [])[] | "    \(.a)-\(.b)\t\(.k)\t\(.n)"' <<< "$GRAPH_OUT"
+          jq -r 'if (.hidden // 0) > 0 then "    +\(.hidden) more symbol(s)" else empty end' <<< "$GRAPH_OUT"
+          ;;
+        4)
+          echo "  $f = <UNRESOLVED>"
+          echo "file $f — not in the symbol index (wrong path, or an unindexed language)" >> "$MISSING"
+          ;;
+        *) resolver_down "outlining $f" ;;
+      esac
+    done <<< "$(list_iter "$files")"
+    echo
+  } >> "$BODY"
+fi
+
+# ── capsules ─────────────────────────────────────────────────────────────────
+if [ -n "$capsules" ]; then
+  cap_ok=1
+  cap_ids=""
+  while IFS= read -r c; do
+    [ -n "$c" ] || continue
+    cap_ids="$cap_ids $c"
+    if [ ! -f "$CAPSULE_DIR/$c.md" ]; then
+      cap_ok=0
+      echo "capsule $c — no such capsule in $CAPSULE_DIR" >> "$MISSING"
+    fi
+  done <<< "$(list_iter "$capsules")"
+  {
+    echo "CONTEXT CAPSULES (dependency closure of referenced ids ONLY):"
+    if [ "$cap_ok" -eq 1 ] && [ -n "$cap_ids" ]; then
+      set +e
+      # shellcheck disable=SC2086 — ids are validated, whitespace-free tokens
+      hyd="$("$SOURCE_DIR/heimdall-capsule" hydrate $cap_ids 2>&1)"
+      hyd_rc=$?
+      set -e
+      if [ "$hyd_rc" -eq 0 ]; then
+        printf '%s\n' "$hyd" | sed 's/^/  /'
+      else
+        echo "  <UNRESOLVED>"
+        echo "capsule closure incomplete — hydrate failed: $hyd" >> "$MISSING"
+      fi
+    else
+      echo "  <UNRESOLVED>"
+    fi
+    echo
+  } >> "$BODY"
+fi
+
+# ── emit ─────────────────────────────────────────────────────────────────────
+nmissing="$(wc -l < "$MISSING" | tr -d ' ')"
 
 echo "=== DELTA BRIEF — task $task ==="
 echo "# Refs only. Not the plan, not prior conversation, not restated criteria."
+if [ "$nmissing" -gt 0 ]; then
+  echo
+  echo "!! THIS BRIEF IS INCOMPLETE — $nmissing ref(s) UNRESOLVED. DO NOT SPAWN ON IT."
+  echo "!! Acting on it means working without context the task said it needed."
+fi
 echo
 echo "TASK SPEC:"
 echo "  $spec"
 echo
-
-if [ -n "$symbols" ]; then
-  echo "SYMBOLS (referenced only):"
-  IFS=',' read -r -a syms <<< "$symbols"
-  for s in "${syms[@]}"; do
-    s="$(printf '%s' "$s" | tr -d ' ')"
-    [ -n "$s" ] || continue
-    v="$(jq -r --arg id "$s" '.symbols[$id] // empty' "$SYMBOLS_FILE")"
-    if [ -n "$v" ]; then echo "  $s = $v"; else echo "  $s = <UNRESOLVED>"; fi
-  done
-  echo
-fi
-
-if [ -n "$capsules" ]; then
-  echo "CONTEXT CAPSULES (dependency closure of referenced ids ONLY):"
-  IFS=',' read -r -a caps <<< "$capsules"
-  cap_args=()
-  for c in "${caps[@]}"; do
-    c="$(printf '%s' "$c" | tr -d ' ')"
-    [ -n "$c" ] && cap_args+=("$c")
-  done
-  if [ "${#cap_args[@]}" -gt 0 ]; then
-    "$SOURCE_DIR/heimdall-capsule" hydrate "${cap_args[@]}" | sed 's/^/  /'
-  fi
-  echo
-fi
+cat "$BODY"
 
 if [ -n "$invariants" ]; then
   echo "INVARIANTS REF: $invariants"
   echo
 fi
 
-proto_log "brief" "build" "task=$task symbols=$symbols capsules=$capsules"
+if [ "$nmissing" -gt 0 ]; then
+  echo "UNRESOLVED REFS ($nmissing) — THIS BRIEF IS INCOMPLETE:"
+  sed 's/^/  !! /' "$MISSING"
+  echo
+  echo "Refusing to certify a brief that is missing context the task referenced."
+  proto_log "brief" "refused" "task=$task unresolved=$nmissing symbols=$symbols files=$files capsules=$capsules"
+  exit 1
+fi
+
+proto_log "brief" "build" "task=$task symbols=$symbols files=$files capsules=$capsules"
