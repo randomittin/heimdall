@@ -8,6 +8,14 @@
             "command": "\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}/bin/parallel-gate\" 2>/dev/null || true"
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "CTX=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}/bin/heimdall-ctx-meter\"; if [ -x \"$CTX\" ]; then \"$CTX\" notice; fi; exit 0"
+          }
+        ]
       }
     ],
     "PreToolUse": [
