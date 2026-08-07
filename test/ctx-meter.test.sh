@@ -256,12 +256,24 @@ has "$JSON" 'NON_VERIFIED' && ok "a blob with no context signal -> NON_VERIFIED,
                            || bad "an absent context signal became a comfortable number: $JSON"
 
 # ── L. the notice goes to STDERR — it must not become context bloat ──────────────
+# EVERY speaking state, not only the cliff. The ceiling and the blind notice render
+# through a DIFFERENT printer than the ruled cliff block, so a cliff-only version of this
+# proof leaves the routine path free to leak onto stdout — and it did: a mutation that
+# moved the ceiling printer to stdout survived the first version of this section.
 sec "L. STDERR, NOT CONTEXT (a context warning must not itself cost context):"
-rm -rf "$HEIMDALL_HOME"; publish 812000
+for L_TOK in 214000 720000 812000; do
+  rm -rf "$HEIMDALL_HOME"; publish "$L_TOK"
+  notice
+  [ -z "$OUT" ] && ok "$L_TOK tok: stdout empty — nothing injected into the model's context" \
+                || bad "$L_TOK tok wrote to stdout; UserPromptSubmit stdout becomes context: $OUT"
+  [ -n "$ERR" ] && ok "$L_TOK tok: spoken on stderr, where the operator sees it" \
+                || bad "$L_TOK tok: nothing on stderr"
+done
+# and the blind notice — the one that fires precisely when nothing can be measured
+rm -rf "$HEIMDALL_HOME"
 notice
-[ -z "$OUT" ] && ok "stdout is empty — nothing is injected into the model's context" \
-              || bad "wrote to stdout; UserPromptSubmit stdout becomes context: $OUT"
-[ -n "$ERR" ] && ok "the notice is on stderr, where the operator sees it" || bad "nothing on stderr"
+[ -z "$OUT" ] && ok "NON_VERIFIED: stdout empty" || bad "the blind notice wrote to stdout: $OUT"
+[ -n "$ERR" ] && ok "NON_VERIFIED: spoken on stderr" || bad "the blind notice printed nothing at all"
 
 # ── M. WIRED into the REAL per-prompt hook (SessionStart-only would be useless) ──
 sec "M. WIRED @ UserPromptSubmit — the hook that fires per prompt:"
