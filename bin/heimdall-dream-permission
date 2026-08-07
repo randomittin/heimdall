@@ -163,10 +163,11 @@ S_DENIED=""
 S_DETAIL=""
 S_TS=""
 S_RESULT=""
+S_REACH=""
 
 classify() {
   STATE=""; REASON=""; PROT_ROOT=""
-  S_DENIED=""; S_DETAIL=""; S_TS=""; S_RESULT=""
+  S_DENIED=""; S_DETAIL=""; S_TS=""; S_RESULT=""; S_REACH=""
 
   if ! type heimdall_tcc_protected_root >/dev/null 2>&1; then
     STATE="unknown"; REASON="predicate-unavailable"
@@ -186,11 +187,43 @@ classify() {
     S_DENIED="$(json_field "$STATUS" denied_path)"
     S_DETAIL="$(json_field "$STATUS" detail)"
     S_TS="$(json_field "$STATUS" ts)"
+    S_REACH="$(json_field "$STATUS" repo_reachable)"
   fi
 
+  # A completed run is NOT evidence the grant landed.
+  #
+  # dream reads its state from $HEIMDALL_HOME, not from the repo, so it runs to
+  # completion and records result=ok even when TCC refused it the repo entirely —
+  # all it loses is the mirror-back of the report. Treating that result=ok as proof
+  # of a grant is what made this ask self-silencing: the first scheduled run after
+  # the denial flipped STATE to "granted", and since "needs-grant" is the only state
+  # that speaks (see the callers), the ask went quiet permanently while the denial
+  # it exists to report was still in force. Twenty-six days of blocked runs went
+  # unmentioned that way.
+  #
+  # So the grant is only claimed when the run actually reached the repo. The runner
+  # records repo_reachable on EVERY status (default yes, set no on the TCC path), so
+  # this reads a field that is always present on anything it writes.
+  #
+  # Missing or empty means the status predates that field: reachability is then
+  # unrecorded, not confirmed, and an unverifiable gate is NON_VERIFIED, never OPEN.
+  # It costs at most one extra ask — the one-shot marker suppresses the repeat — and
+  # that is the cheap side of this trade. Silence is the expensive side.
   if [ "$S_RESULT" = "ok" ]; then
-    STATE="granted"; REASON="scheduled-run-succeeded"
-    return 0
+    case "$S_REACH" in
+      yes)
+        STATE="granted"; REASON="scheduled-run-succeeded"
+        return 0
+        ;;
+      no)
+        STATE="needs-grant"; REASON="run-completed-repo-unreachable"
+        return 0
+        ;;
+      *)
+        STATE="needs-grant"; REASON="run-completed-reachability-unrecorded"
+        return 0
+        ;;
+    esac
   fi
 
   STATE="needs-grant"; REASON="tcc-protected-repo"

@@ -105,7 +105,11 @@ PROT_REPO="$FHOME/Downloads/heimdall"      # the shape of the owner's real machi
 SAFE_REPO="$FHOME/src/heimdall"            # the shape after option [A]
 mkdir -p "$PROT_REPO/.planning" "$SAFE_REPO/.planning"
 
-write_status() { # write_status <file> <result> <reason> <denied_path>
+write_status() { # write_status <file> <result> <reason> <denied_path> [repo_reachable]
+  # repo_reachable defaults to yes because the runner defaults it to yes and only
+  # flips it to no on the TCC path. It is written on EVERY status the runner emits,
+  # so a fixture omitting it does not model anything the runner can produce — pass
+  # it explicitly whenever the case under test turns on reachability.
   cat > "$1" <<EOF
 {
   "schema": 1,
@@ -118,6 +122,7 @@ write_status() { # write_status <file> <result> <reason> <denied_path>
   "dream": "$PROT_REPO/bin/heimdall-dream",
   "denied_path": "$4",
   "detail": "ls: $4: Operation not permitted",
+  "repo_reachable": "${5:-yes}",
   "exit": 75
 }
 EOF
@@ -254,10 +259,17 @@ FORCED="$("$PERM" ask --repo "$PROT_REPO" --force 2>&1)"
 RESHOWN="$("$PERM" ask --repo "$PROT_REPO" 2>&1)"
 [ -n "$RESHOWN" ] && ok "(4) reset re-arms the ask" || bad "(4) reset did not re-arm"
 
-# ── (5) DISARMED BY EVIDENCE — a successful scheduled run proves the grant landed ──
-# This is the assertion behind "does not re-ask once granted". Nothing is self-reported:
-# result=ok can only be written by the runner AFTER the launchd job actually read the repo.
-write_status "$STATUSF" ok "" ""
+# ── (5) DISARMED BY EVIDENCE — a run that REACHED the repo proves the grant landed ──
+# This is the assertion behind "does not re-ask once granted".
+#
+# The premise this block used to carry — "result=ok can only be written by the runner
+# AFTER the launchd job actually read the repo" — was false, and believing it is what
+# made the ask self-silencing. dream reads its state from $HEIMDALL_HOME, so it runs to
+# completion and records result=ok even when TCC refused it the repo; all it loses is
+# the mirror-back of the report. That is precisely why the runner records
+# repo_reachable beside the result. The evidence of a grant is REACHABILITY, never
+# completion, so both fields are pinned here.
+write_status "$STATUSF" ok "" "" yes
 GRC=0
 GJSON="$("$PERM" check --repo "$PROT_REPO" --json)" || GRC=$?
 if [ "$(printf '%s' "$GJSON" | jq -r '.state')" = "granted" ] && [ "$GRC" = 0 ]; then
@@ -274,10 +286,49 @@ QUIET="$("$PERM" ask --repo "$PROT_REPO" 2>&1)"
   && ok "(5) the marker is CLEARED on success, so a later recurrence re-arms honestly" \
   || bad "(5) a stale marker survived success — a recurrence would go unasked"
 
-write_status "$STATUSF" blocked tcc-denied "$PROT_REPO"
+write_status "$STATUSF" blocked tcc-denied "$PROT_REPO" no
 REARM="$("$PERM" ask --repo "$PROT_REPO" 2>&1)"
 [ -n "$REARM" ] && ok "(5) a RECURRENCE after success asks again (not permanently muted)" \
   || bad "(5) a recurrence was silently swallowed"
+
+# ── (5b) A COMPLETED RUN IS NOT A GRANT — the fail-open this ask was losing to ──────
+# The runner finishes and writes result=ok even when TCC handed it nothing: dream's
+# state lives in $HEIMDALL_HOME, so a denied repo costs it only the report mirror-back.
+# Reading result=ok as proof of a grant flipped state to "granted", and since
+# needs-grant is the ONLY state that speaks, the ask went silent while the denial it
+# exists to report was still in force. That is a gate reporting OPEN because it could
+# not reach its subject, which this repo forbids outright.
+"$PERM" reset --repo "$PROT_REPO" >/dev/null 2>&1
+write_status "$STATUSF" ok "" "$PROT_REPO" no
+URC=0
+UJSON="$("$PERM" check --repo "$PROT_REPO" --json)" || URC=$?
+if [ "$(printf '%s' "$UJSON" | jq -r '.state')" = "needs-grant" ]; then
+  ok "(5b) result=ok with repo_reachable=no does NOT disarm — completion is not reachability"
+else
+  bad "(5b) a run that never reached the repo disarmed the ask: rc=$URC $UJSON"
+fi
+
+[ "$(printf '%s' "$UJSON" | jq -r '.reason')" = "run-completed-repo-unreachable" ] \
+  && ok "(5b) the reason names the real cause, not a generic protected-repo verdict" \
+  || bad "(5b) reason was $(printf '%s' "$UJSON" | jq -r '.reason')"
+
+SPEAKS="$("$PERM" ask --repo "$PROT_REPO" 2>&1)"
+[ -n "$SPEAKS" ] \
+  && ok "(5b) and the ask actually SPEAKS — the user hears about a denial still in force" \
+  || bad "(5b) the ask stayed silent on an unreachable repo"
+
+# Reachability UNRECORDED (a status written before the runner carried the field) is not
+# a confirmed grant either. Unverifiable is NON_VERIFIED, never OPEN. Cost of being
+# wrong in this direction is one extra ask, which the one-shot marker then suppresses.
+"$PERM" reset --repo "$PROT_REPO" >/dev/null 2>&1
+grep -v '"repo_reachable"' "$STATUSF" > "$STATUSF.tmp" && mv "$STATUSF.tmp" "$STATUSF"
+grep -q 'repo_reachable' "$STATUSF" \
+  && bad "(5b) fixture still carries repo_reachable — the unrecorded case is untested" \
+  || ok "(5b) fixture models a status written before repo_reachable existed"
+NJSON="$("$PERM" check --repo "$PROT_REPO" --json)" || true
+[ "$(printf '%s' "$NJSON" | jq -r '.state')" = "needs-grant" ] \
+  && ok "(5b) unrecorded reachability fails CLOSED (needs-grant), never assumes a grant" \
+  || bad "(5b) an unrecorded reachability was treated as granted: $NJSON"
 
 # ── (6) A NON-PROTECTED REPO NEVER ASKS ──────────────────────────────────────────
 rm -f "$STATE"
