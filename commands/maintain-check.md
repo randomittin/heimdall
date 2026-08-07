@@ -104,32 +104,43 @@ heimdall-maintain-loop heartbeat --repo .
 If Slack skills are available and the user has opted in, post the heartbeat to the
 configured channel.
 
-## Self-Improvement — every Nth cycle
+## Self-Improvement — run it yourself
 
-The maintainer doesn't only fix issues; it improves its OWN capability over time. After every
-`self_improve.every` completed cycles (default 10 — the checkpoint carries `cycle`), step back and
-run ONE bounded self-improvement experiment via the `self-improve` skill / `bin/heimdall-self-improve`:
+The maintainer can improve its OWN capability over time, not only fix issues. Run ONE bounded
+self-improvement experiment through the `self-improve` skill / `bin/heimdall-self-improve` as a
+deliberate step-back BETWEEN fix batches — never mid-fix:
 
 ```bash
-# fire only on the Nth cycle (cheap, deterministic, no-op otherwise):
-CYCLE=$(heimdall-maintain-loop heartbeat --repo . | grep -oE 'cycle [0-9]+' | grep -oE '[0-9]+')
-EVERY=$(heimdall-state get '.maintainer.self_improve.every' 2>/dev/null); EVERY=${EVERY:-10}
-if [ -n "$CYCLE" ] && [ "$EVERY" -gt 0 ] && [ $((CYCLE % EVERY)) -eq 0 ]; then
-  # 1) surface testable hypotheses from the accumulated evidence
-  heimdall-self-improve hypotheses --repo . --min-samples 3
-  # 2) evaluate any OPEN experiment whose variant has now accrued enough samples
-  #    (KEEP only on a measured delta; else it rolls the override back — the falsifier)
-  for exp in $(heimdall-self-improve status --repo . | jq -r '.open_experiments[]?'); do
-    heimdall-self-improve experiment evaluate --id "$exp" --repo .
-  done
-fi
+# 1) surface testable hypotheses from the accumulated evidence.
+#    --min-samples here filters which (task_type, model) cells are even worth a hypothesis;
+#    it is NOT the keep-gate. The keep-gate is `experiment start --min-samples`, and that
+#    one carries the real floor (20 — see skills/self-improve/SKILL.md on why 3 is too few
+#    to keep a change on).
+heimdall-self-improve hypotheses --repo . --min-samples 3
+
+# 2) evaluate any OPEN experiment whose variant has now accrued enough samples
+#    (KEEP only on a measured delta; else it rolls the override back — the falsifier)
+for exp in $(heimdall-self-improve status --repo . | jq -r '.open_experiments[]?'); do
+  heimdall-self-improve experiment evaluate --id "$exp" --repo .
+done
 ```
 
-Then invoke the `self-improve` skill to pick the single highest-value hypothesis and `experiment
-start` it (bounded — the next cycles run the variant). An "improvement" persists ONLY with a measured
-pass-rate delta over its baseline; otherwise the override is rolled back. See
-`skills/self-improve/SKILL.md` and `docs/analysis/autoresearch-distilled.md`. This is a deliberate
-step-back BETWEEN fix batches — never mid-fix.
+Then pick the single highest-value hypothesis and `experiment start` it (bounded — the next cycles
+run the variant). An "improvement" persists ONLY with a measured pass-rate delta over its baseline;
+otherwise the override is rolled back. See `skills/self-improve/SKILL.md` and
+`docs/analysis/autoresearch-distilled.md`.
+
+### Not implemented: the automatic every-Nth-cycle trigger
+
+There is no automatic trigger. `self_improve` is not a key `heimdall-state init` creates, so
+`heimdall-state get '.maintainer.self_improve.every'` returns the string `null` — which means a
+`${EVERY:-10}` fallback never engages, and `[ "$EVERY" -gt 0 ]` fails with *"integer expression
+expected"*. Any cycle-counting guard built on that key evaluates false on every cycle, forever.
+`grep -rn self_improve bin/ hooks/ sentinels/ modules/` returns nothing: no code reads the key, and
+nothing counts cycles toward it.
+
+Self-improvement runs when you run it — from this section, from `/hmd:self-improve`, or overnight
+via `/dream`.
 
 For an OVERNIGHT pass that runs this loop **plus** a maintainer sweep and leaves a morning report
 (`.planning/dream/YYYY-MM-DD.md`), use `/dream` (`commands/dream.md`) — shadow-first, never pushes.

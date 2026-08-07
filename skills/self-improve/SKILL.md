@@ -1,6 +1,6 @@
 ---
 name: self-improve
-description: The deliberate self-improvement loop for the maintainer — after every Nth maintenance cycle (or on /hmd:self-improve), step back from fixing issues and improve Heimdall's OWN capability. Ports karpathy/autoresearch to Heimdall's routing/planning: collect evidence from metrics.jsonl + queue dead/done stats → form testable hypotheses → run a bounded routing experiment → evaluate against a measured delta → keep the improvement ONLY if it beats a baseline on enough samples, else roll it back. Falsifiability over vibes. Use when a maintainer run has completed N cycles, when the user asks Heimdall to "get better over time", "improve itself", "tune routing", "learn from past runs", or invokes /hmd:self-improve.
+description: The deliberate self-improvement loop for the maintainer — step back from fixing issues and improve Heimdall's OWN capability. Ports karpathy/autoresearch to Heimdall's routing/planning: collect evidence from metrics.jsonl + queue dead/done stats → form testable hypotheses → run a bounded routing experiment → evaluate against a measured delta → keep the improvement ONLY if it beats a baseline on enough samples, else roll it back. Falsifiability over vibes. Runs when invoked, not on a timer. Use between maintainer fix batches, when the user asks Heimdall to "get better over time", "improve itself", "tune routing", "learn from past runs", or invokes /hmd:self-improve.
 ---
 
 # self-improve — improve the improver
@@ -26,10 +26,13 @@ discipline; autoresearch simply never needed one.
 
 ## When this runs
 
-- **Every Nth maintainer cycle.** `/hmd:maintain-check` fires this after every `self_improve.every`
-  completed cycles (default 10 — matching the "after every 10 completed tasks" cadence in
-  `agents/heimdall.md` → *Pattern Learning (SONA-inspired)*). One experiment per invocation.
 - **On demand:** the user runs `/hmd:self-improve` or asks Heimdall to improve/tune itself.
+  One experiment per invocation.
+- **Between maintainer fix batches.** `/hmd:maintain-check` documents this as a step you run
+  yourself. There is no automatic every-Nth-cycle trigger — `self_improve` is not a key
+  `heimdall-state init` creates, nothing in `bin/ hooks/ sentinels/ modules/` reads it, and nothing
+  counts cycles toward it. See *Not implemented: the automatic every-Nth-cycle trigger* in
+  `commands/maintain-check.md`.
 - **Overnight (`/dream`):** the `/dream` command wraps this loop for an off-hours run and
   leaves a morning report (`.planning/dream/YYYY-MM-DD.md`) — see `commands/dream.md`. It
   reuses this exact keep-gate (surface-first; only measured, reversible wins persist).
@@ -114,9 +117,14 @@ heimdall-self-improve experiment start --hypothesis hyp-esc-lint-sonnet \
     --min-samples 20 --min-delta 0.15 --repo .
 ```
 
-This writes `.planning/routing-overrides.json` (which the planner reads when assigning model tiers),
-snapshots the baseline **and the prior override** (for exact reversibility), and appends an OPEN
-record to `.planning/experiments.jsonl`. Let the next maintainer cycles run the variant.
+This writes `.planning/routing-overrides.json`, snapshots the baseline **and the prior override**
+(for exact reversibility), and appends an OPEN record to `.planning/experiments.jsonl`. Let the next
+maintainer cycles run the variant.
+
+**Nothing consumes `routing-overrides.json` yet.** `heimdall-self-improve` is its only reader and
+writer; no planner, agent or spawn path looks at it, so a validated override does not change which
+model actually gets spawned. Until that wiring exists, treat an override as a recorded, measured
+finding — and apply it by hand if you want it to take effect.
 
 ### 4. Evaluate (measured — the falsifier)
 
@@ -140,7 +148,8 @@ current picture (active overrides, validated wins, open experiments).
 
 ## What a validated improvement becomes
 
-- **Routing:** a `validated` entry in `.planning/routing-overrides.json` (the planner consumes it).
+- **Routing:** a `validated` entry in `.planning/routing-overrides.json` — a recorded measured win,
+  not yet a live routing change (nothing reads that file; see step 3).
 - **Pattern:** a precheck cluster → a new `.planning/skills/*.md` reusable pattern (write it, cite
   the dead-reason cluster + count as evidence).
 - **Capability gap the repo should own:** if the fix belongs in the codebase (a flaky test, a
