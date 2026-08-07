@@ -1,0 +1,14 @@
+{
+  "active_goal": "[dropped]",
+  "branch": "worktree-agent-a8c96451278145dc1",
+  "claimed_surfaces": [],
+  "haid": "haid:unknown.rishabhs-macbook-air-353b",
+  "head_sha": "d53c11e",
+  "human": "unknown",
+  "phase": "unknown",
+  "progress_pct": 0,
+  "resumable": true,
+  "schema": "team_checkpoint_v1",
+  "task_ref": "[dropped]",
+  "updated_at": "2026-08-07T14:04:07Z"
+}
