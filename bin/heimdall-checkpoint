@@ -48,6 +48,184 @@ END_MARK="<!-- heimdall-auto-checkpoint:end -->"
 
 _timestamp() { date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "unknown"; }
 
+# Best-effort wall-clock ceiling for a single external command. macOS ships no
+# timeout(1); perl's alarm+exec is the portable substitute. Falls back to running
+# unbounded if perl is missing — still non-fatal, since the outer SessionEnd hook
+# chain already wraps this whole script at 10s (hooks/hooks.json).
+_bounded() {
+  local secs="$1"; shift
+  if command -v perl >/dev/null 2>&1; then
+    perl -e 'alarm shift; exec @ARGV' "$secs" "$@"
+  else
+    "$@"
+  fi
+}
+
+# Resolve a sibling bin/ tool by this script's OWN location, not PATH — same
+# resolution _publish_shared already uses below for checkpoint_share.py/heimdall-haid.
+_sibling_tool() {
+  local name="$1" self bindir
+  self="$0"
+  command -v readlink >/dev/null 2>&1 && self="$(readlink -f "$0" 2>/dev/null || readlink "$0" 2>/dev/null || echo "$0")"
+  bindir="$(cd "$(dirname "$self")" 2>/dev/null && pwd)"
+  if [ -x "$bindir/$name" ]; then
+    printf '%s' "$bindir/$name"
+  else
+    command -v "$name" 2>/dev/null || true
+  fi
+}
+
+# "Nothing is lost" proof (mechanical, no LLM): enumerate every git worktree of this
+# repo and report whether each holds uncommitted changes or commits not yet merged
+# into the base branch. `git log` on ONE checkout cannot answer this — the fear a
+# context-reset has to overcome is "did I just lose another agent's work", and this
+# is the only mechanical way to check every worktree at once. Bounded to wt_max
+# entries so a runaway worktree count can never blow the SessionEnd time budget.
+_worktree_ledger() {
+  local project_dir="$1"
+  local wt_max=25
+  git -C "$project_dir" rev-parse --git-dir >/dev/null 2>&1 || return 0
+
+  local raw
+  raw=$(git -C "$project_dir" worktree list --porcelain 2>/dev/null)
+  [ -n "$raw" ] || return 0
+
+  local base
+  base=$(printf '%s\n' "$raw" | awk '/^$/{exit} /^branch /{print $2}')
+  base=${base#refs/heads/}
+  [ -n "$base" ] || base="main"
+
+  local wt_paths total_count
+  wt_paths=$(printf '%s\n' "$raw" | awk '/^worktree /{print $2}')
+  total_count=$(printf '%s\n' "$wt_paths" | grep -c .)
+  [ -n "$total_count" ] || total_count=0
+
+  local scanned=0 clean=0 flagged_count=0 flagged_lines="" wt n merged ok
+  while IFS= read -r wt; do
+    [ -n "$wt" ] || continue
+    scanned=$((scanned + 1))
+    if [ "$scanned" -gt "$wt_max" ]; then
+      scanned=$((scanned - 1))
+      break
+    fi
+
+    if [ ! -d "$wt" ]; then
+      flagged_count=$((flagged_count + 1))
+      flagged_lines="${flagged_lines}- MISSING \`${wt}\` — worktree directory no longer exists"$'\n'
+      continue
+    fi
+
+    n=$(git -C "$wt" status --porcelain 2>/dev/null | grep -c .)
+    [ -n "$n" ] || n=0
+
+    merged=yes
+    git -C "$wt" merge-base --is-ancestor HEAD "$base" 2>/dev/null || merged=no
+
+    ok=yes
+    if [ "$n" != "0" ]; then
+      ok=no
+      flagged_lines="${flagged_lines}- DIRTY \`${wt}\` — ${n} uncommitted file(s)"$'\n'
+    fi
+    if [ "$merged" = "no" ]; then
+      ok=no
+      flagged_lines="${flagged_lines}- UNMERGED \`${wt}\` — HEAD has commits not on \`${base}\`"$'\n'
+    fi
+    if [ "$ok" = "yes" ]; then
+      clean=$((clean + 1))
+    else
+      flagged_count=$((flagged_count + 1))
+    fi
+  done <<WTPATHS
+$wt_paths
+WTPATHS
+
+  local more=""
+  if [ "$total_count" -gt "$wt_max" ] 2>/dev/null; then
+    more=" (+$((total_count - wt_max)) more not scanned)"
+  fi
+
+  printf '### Worktree ledger — nothing-lost proof (%s of %s worktree(s) scanned%s)\n' "$scanned" "$total_count" "$more"
+  printf -- '> Base ref: `%s`. Clean = zero uncommitted files AND HEAD merged into base.\n\n' "$base"
+  if [ "$flagged_count" -eq 0 ]; then
+    printf -- '- All %s scanned worktree(s) are clean. Nothing to rescue before a restart.\n\n' "$scanned"
+  else
+    printf -- '- %s/%s clean, %s flagged — rescue these before restarting:\n' "$clean" "$scanned" "$flagged_count"
+    printf '%s\n' "$flagged_lines"
+  fi
+}
+
+# This session's edited files (mechanical, no LLM): `git log` cannot attribute an
+# edit to a SESSION — only the edit-tracker ledger (PostToolUse hook) can. An
+# absent/untracked ledger is NOT the same as zero edits, so this section is omitted
+# rather than printed as "0 files" when the ledger itself never ran.
+_session_edits() {
+  local tracker
+  tracker="$(_sibling_tool edit-tracker)"
+  [ -n "$tracker" ] || return 0
+
+  local summary
+  summary=$(_bounded 2 "$tracker" summary 2>/dev/null)
+  [ -n "$summary" ] || return 0
+  case "$summary" in
+    *"NOT VERIFIED"*) return 0 ;;
+  esac
+
+  printf '### This session'"'"'s edited files (edit-tracker — git log cannot attribute these)\n'
+  printf '```\n%s\n```\n\n' "$summary"
+}
+
+# Gate state (mechanical, no LLM): a resuming session must know a gate is RED BEFORE
+# it tries to push — `git log` has no concept of gate status. The exit code is the
+# ONLY authoritative signal: 0=clean, 2=failing, anything else (missing
+# heimdall-state.json, missing binary, timeout, ...) is NOT-EVALUATED and must
+# never be read as a pass.
+_gate_state() {
+  local project_dir="$1"
+  local hstate verdict detail rc
+  hstate="$(_sibling_tool heimdall-state)"
+
+  verdict="NOT-EVALUATED"; detail=""
+  if [ -n "$hstate" ]; then
+    detail=$(cd "$project_dir" 2>/dev/null && _bounded 3 "$hstate" check-quality-gates 2>&1)
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+      verdict="PASS"
+    elif [ "$rc" -eq 2 ]; then
+      verdict="FAILING"
+    fi
+  fi
+
+  printf '### Gate state (push-gate verdict — %s)\n' "$verdict"
+  if [ "$verdict" = "FAILING" ]; then
+    printf '> RED — do not push until this clears. Detail:\n```\n%s\n```\n\n' "$detail"
+  elif [ "$verdict" = "PASS" ]; then
+    printf '> Clean — `heimdall-state check-quality-gates` exited 0.\n\n'
+  else
+    printf '> Never evaluated this run (no heimdall-state.json, no heimdall-state binary, or it timed out). Not a pass — run `heimdall-state check-quality-gates` before pushing.\n\n'
+  fi
+
+  local reports f st gid hint failcount=0 faillines=""
+  if command -v jq >/dev/null 2>&1 && [ -d "$project_dir/evals/oracles" ]; then
+    reports=$(find "$project_dir/evals/oracles" -maxdepth 2 -name report.json 2>/dev/null | head -50)
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      st=$(jq -r '.status // empty' "$f" 2>/dev/null)
+      if [ "$st" = "fail" ]; then
+        failcount=$((failcount + 1))
+        gid=$(jq -r '.gate_id // "unknown"' "$f" 2>/dev/null)
+        hint=$(jq -r '.fix_hint // ""' "$f" 2>/dev/null)
+        faillines="${faillines}- FAIL \`${gid}\` (\`${f#"$project_dir"/}\`)${hint:+ — $hint}"$'\n'
+      fi
+    done <<REPORTS
+$reports
+REPORTS
+  fi
+  if [ "$failcount" -gt 0 ]; then
+    printf '### Failing eval oracle gates (%s)\n' "$failcount"
+    printf '%s\n' "$faillines"
+  fi
+}
+
 # Build the machine-readable auto-checkpoint block (stdout). Pure, no side effects.
 _build_block() {
   local project_dir="$1" ts="$2"
@@ -78,17 +256,22 @@ _build_block() {
   fi
 
   local dirty_count
-  dirty_count=$(printf '%s\n' "$changed" | grep -c . 2>/dev/null || echo 0)
+  dirty_count=$(printf '%s\n' "$changed" | grep -c .)
+  [ -n "$dirty_count" ] || dirty_count=0
 
   printf '%s\n' "$BEGIN_MARK"
   printf '## Auto-checkpoint — %s\n\n' "$ts"
   printf '> Written automatically at session end (mechanical, no LLM). Run `/hmd:save`\n'
   printf '> for a richer human/LLM-authored handoff — it enriches this same file.\n\n'
-  printf '- **Branch:** %s\n' "$branch"
-  printf '- **HEAD:** %s\n' "$head_sha"
-  printf '- **Phase:** %s\n' "$phase"
-  printf '- **Active goal:** %s\n' "$goal"
-  printf '- **Uncommitted files:** %s\n\n' "$dirty_count"
+  printf -- '- **Branch:** %s\n' "$branch"
+  printf -- '- **HEAD:** %s\n' "$head_sha"
+  printf -- '- **Phase:** %s\n' "$phase"
+  printf -- '- **Active goal:** %s\n' "$goal"
+  printf -- '- **Uncommitted files:** %s\n\n' "$dirty_count"
+
+  _worktree_ledger "$project_dir"
+  _session_edits
+  _gate_state "$project_dir"
 
   printf '### Recent commits\n'
   if [ -n "$commits" ]; then
@@ -104,7 +287,13 @@ _build_block() {
   fi
 
   printf '### Resume\n'
-  printf 'Read this file, then `heimdall` to resume. If a goal is set above, restore it with `/goal <condition>`.\n'
+  printf 'Runnable, in order:\n'
+  printf '```bash\n'
+  printf 'cat "%s/.planning/CHECKPOINT.md"    # this file, full context\n' "$project_dir"
+  printf 'heimdall-state check-quality-gates  # gate must be green before any push\n'
+  printf 'git -C "%s" status --porcelain      # confirm nothing changed since this write\n' "$project_dir"
+  printf '```\n'
+  printf 'Then `heimdall` to resume. If a goal is set above, restore it with `/goal <condition>`.\n'
   printf '%s\n' "$END_MARK"
 }
 
