@@ -173,6 +173,106 @@ else
   bad "(2b) runner failed quietly: $(head -3 "$WORK/gone.log")"
 fi
 
+# ── (2c/2d) THE PRODUCTION FAILURE MODE, REPRODUCED WITH A REAL EPERM ────────────
+#
+# WHY THE chmod 000 FIXTURE ABOVE IS NOT ENOUGH. It is a good stand-in for "the directory
+# cannot be listed", but it is NOT the event TCC raises, and the difference is load-bearing:
+#
+#   chmod 000 dir   ->  ls: ... Permission denied      EACCES   os.path.isdir() == True
+#   TCC-denied dir  ->  ls: ... Operation not permitted EPERM   os.path.isdir() == False
+#
+# stat() on a mode-000 directory SUCCEEDS, because it only needs lookup on the PARENT. TCC
+# refuses the path itself, so stat() fails outright. Measured both ways on this machine.
+# Every guard written as `os.path.isdir(repo)` therefore behaves OPPOSITELY under the real
+# denial than it does under the fixture — which is exactly how a bug survives a green suite.
+#
+# sandbox-exec gives us the real errno without needing a TCC grant, a LaunchAgent, or any
+# mutation of real state: it only RESTRICTS a child. `deny file-read*` on a subpath produces
+# the same EPERM the nightly job gets, so these two cases test the condition RJ's machine is
+# actually in, rather than a fixture that merely resembles it.
+command -v sandbox-exec >/dev/null 2>&1 \
+  || { echo "FATAL: sandbox-exec required to reproduce a real TCC-class denial" >&2; exit 2; }
+
+# PHYSICALLY RESOLVED: sandbox profiles match on the resolved path, and mktemp hands back
+# /var/... while /var is a symlink to /private/var. An unresolved path would silently fail
+# to match the deny rule and the case would pass for the wrong reason.
+SBX="$(cd "$WORK" && pwd -P)/protected"
+mkdir -p "$SBX/bin" "$SBX/.planning"
+cp "$DREAM" "$SBX/bin/heimdall-dream"
+SBX_HOME="$WORK/sbx-home"; mkdir -p "$SBX_HOME"
+DENY="(version 1)(allow default)(deny file-read* (subpath \"$SBX\"))"
+
+# FIRST, prove the fixture really does reproduce the recorded event. A sandbox that failed
+# to deny would make every assertion below pass vacuously.
+SBX_ERR="$(sandbox-exec -p "$DENY" /bin/ls "$SBX" 2>&1 || true)"
+if printf '%s' "$SBX_ERR" | grep -q 'Operation not permitted'; then
+  ok "(2c) the fixture reproduces the recorded EPERM verbatim — not a look-alike EACCES"
+else
+  bad "(2c) sandbox did not produce EPERM, so the cases below prove nothing: $SBX_ERR"
+fi
+
+# (2c) THE EXACT SHAPE OF THE INSTALLED PLIST: the runner is reachable, but the dream script
+# it must exec lives inside the denied tree. This is what fires on RJ's machine every night.
+# The earlier cases point at a MISSING dream, which classifies as missing-path; only a real
+# EPERM can prove the tcc-denied branch — the one whose advice mentions Full Disk Access.
+TSTATUS="$WORK/tcc-status.json"
+trc=0
+sandbox-exec -p "$DENY" env HEIMDALL_HOME="$SBX_HOME" "$RUNNER" \
+  --dream "$SBX/bin/heimdall-dream" --repo "$SBX" --status "$TSTATUS" run --overnight \
+  >"$WORK/tcc.log" 2>&1 || trc=$?
+
+if [ "$trc" = 75 ]; then
+  ok "(2c) a TCC-denied dream script exits 75 — the nightly block is never a silent 0"
+else
+  bad "(2c) TCC-denied run exit was $trc, expected 75: $(head -3 "$WORK/tcc.log")"
+fi
+if grep -q '"result": "blocked"' "$TSTATUS" 2>/dev/null; then
+  ok "(2c) it records result=blocked — NON_VERIFIED, never a green it did not earn"
+else
+  bad "(2c) status did not record blocked: $(head -12 "$TSTATUS" 2>/dev/null | tr '\n' ' ')"
+fi
+if grep -q '"reason": "tcc-denied"' "$TSTATUS" 2>/dev/null; then
+  ok "(2c) and classifies it as tcc-denied — the diagnosis, not a generic probe failure"
+else
+  bad "(2c) reason was not tcc-denied: $(grep '"reason"' "$TSTATUS" 2>/dev/null)"
+fi
+if grep -q 'Operation not permitted' "$TSTATUS" 2>/dev/null; then
+  ok "(2c) the verbatim OS error survives into the status a human reads"
+else
+  bad "(2c) status lost the verbatim OS error: $(head -12 "$TSTATUS" 2>/dev/null | tr '\n' ' ')"
+fi
+if grep -qi 'BLOCKED' "$WORK/tcc.log" && grep -qi 'Full Disk Access\|heimdall-dream-permission' "$WORK/tcc.log"; then
+  ok "(2c) the log shouts BLOCKED and routes to the remedy that actually applies"
+else
+  bad "(2c) the log did not shout a TCC remedy: $(head -6 "$WORK/tcc.log")"
+fi
+
+# (2d) THE GUARD THE FIXTURE COULD NOT REACH. With the toolchain readable and only the REPO
+# denied, dream must not abort claiming the repo is "not a directory" — it exists and is
+# healthy, and the runner has already decided (92daf9d) that a denied repo costs the run
+# nothing it needs. A guard that cannot tell "denied" from "missing" turns the supported
+# case into a hard stop AND reports a false cause for it.
+DSTAT2="$WORK/sbx-dream-status.json"
+srun=0
+sandbox-exec -p "$DENY" env HEIMDALL_HOME="$SBX_HOME" "$PY" "$DREAM" \
+  --repo "$SBX" run --overnight >"$WORK/sbx-dream.log" 2>&1 || srun=$?
+
+if ! grep -qi 'repo not a directory' "$WORK/sbx-dream.log"; then
+  ok "(2d) dream does NOT misreport a denied repo as 'not a directory'"
+else
+  bad "(2d) dream reported a FALSE cause for a healthy repo: $(head -2 "$WORK/sbx-dream.log")"
+fi
+if [ "$srun" = 0 ]; then
+  ok "(2d) dream still completes its run when only the repo is out of reach"
+else
+  bad "(2d) dream aborted (exit $srun) on a denied repo: $(head -3 "$WORK/sbx-dream.log")"
+fi
+if [ ! -e "$SBX/.planning/dream" ]; then
+  ok "(2d) FALSIFIER: the sandboxed run wrote nothing into the denied tree"
+else
+  bad "(2d) the run wrote into the denied tree"
+fi
+
 # ── notice fixtures ──────────────────────────────────────────────────────────────
 LA="$WORK/LaunchAgents"; mkdir -p "$LA"
 printf '%s\n' '<plist></plist>' > "$LA/com.heimdall.dream.plist"

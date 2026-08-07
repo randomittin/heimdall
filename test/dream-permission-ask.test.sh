@@ -37,9 +37,10 @@
 #   (7) A CHANGED SUBJECT (different repo) asks again — it is a different grant.
 #   (8) REVERSIBLE — heimdall-dream-schedule uninstall removes what the ask added.
 #   (9) WIRED — heimdall-dream-schedule install surfaces the block on a protected repo.
-#  (10) THE LOUD PATH FROM 245ede5 STILL FIRES — the runner still exits 75 and records
-#       blocked, and the notice still names TCC and the denied path. The ask ADDS a
-#       remedy; it must never become a substitute for the failure report.
+#  (10) THE LOUD PATH FROM 245ede5 STILL FIRES — when nothing could run the runner still
+#       exits 75 and records blocked, a denied repo is still RECORDED as unreachable, and
+#       the notice still names TCC and the denied path. The ask ADDS a remedy; it must
+#       never become a substitute for the failure report.
 
 set -euo pipefail
 
@@ -371,22 +372,88 @@ fi
 # ── (10) THE LOUD PATH FROM 245ede5 STILL FIRES ──────────────────────────────────
 # The ask is an ADDITION. If it ever became a substitute for the failure report we would
 # be back to a job whose only signal is one the operator has to go looking for.
+#
+# RETARGETED, NOT RELAXED. This block used to point the runner at a repo at mode 000 and
+# demand exit 75. 92daf9d deliberately removed that trigger: dream's state moved to
+# $HEIMDALL_HOME, so an unreadable repo no longer costs the run anything it needs, and
+# failing there kept the nightly job dead for a reason that had been removed. That commit
+# inverted the same fixture in dream-tcc-resilience (2)/(2b) but left this copy pointing at
+# the retired trigger, where it went red measuring the fixture instead of the guarantee.
+# The guarantee is "nothing ran ⇒ it says so, loudly", and its live trigger is an
+# unreachable DREAM SCRIPT — still a hard precondition. Both halves are asserted here: the
+# loud path on the target that still fires it, and the honesty of the denied-repo path the
+# ask itself exists for. Nothing is dropped; (10b) is net-new coverage.
+DENIED_HOME="$WORK/denied-home"; mkdir -p "$DENIED_HOME"
+
+# (10a) NOTHING COULD RUN — the silent-death case, on the target that still causes it.
+GONE="$WORK/gone-dream"            # deliberately never created: the program is unreadable
+GSTATUS="$WORK/gone-status.json"
+GRC=0
+HEIMDALL_HOME="$DENIED_HOME" "$RUNNER" --dream "$GONE" --repo "$WORK" \
+  --status "$GSTATUS" run --overnight >"$WORK/gone.log" 2>&1 || GRC=$?
+
+[ "$GRC" = 75 ] && ok "(10) runner STILL exits 75 when nothing could run — never a silent 0" \
+  || bad "(10) runner exit regressed to $GRC"
+grep -q '"result": "blocked"' "$GSTATUS" 2>/dev/null \
+  && ok "(10) runner STILL records result=blocked" \
+  || bad "(10) runner stopped recording the blocked status"
+grep -qi 'BLOCKED' "$WORK/gone.log" \
+  && ok "(10) runner STILL shouts into the dream log" \
+  || bad "(10) runner went quiet"
+
+# (10b) THE REPO IS DENIED — the exact situation the ask exists for. The run proceeds, but
+# a bare "ok" would read as proof the grant landed and nobody would ever look again.
 DENIED="$WORK/denied"; mkdir -p "$DENIED/.planning"
 chmod 000 "$DENIED"
 DSTATUS="$WORK/denied-status.json"
 DRC=0
-"$RUNNER" --dream "$DREAM" --repo "$DENIED" --status "$DSTATUS" run --overnight \
-  >"$WORK/denied.log" 2>&1 || DRC=$?
+HEIMDALL_HOME="$DENIED_HOME" "$RUNNER" --dream "$DREAM" --repo "$DENIED" \
+  --status "$DSTATUS" run --overnight >"$WORK/denied.log" 2>&1 || DRC=$?
 chmod 755 "$DENIED"
 
-[ "$DRC" = 75 ] && ok "(10) runner STILL exits 75 on a denied repo — never a silent 0" \
-  || bad "(10) runner exit regressed to $DRC"
-grep -q '"result": "blocked"' "$DSTATUS" 2>/dev/null \
-  && ok "(10) runner STILL records result=blocked" \
-  || bad "(10) runner stopped recording the blocked status"
-grep -qi 'BLOCKED' "$WORK/denied.log" \
-  && ok "(10) runner STILL shouts into the dream log" \
-  || bad "(10) runner went quiet"
+grep -q '"repo_reachable": "no"' "$DSTATUS" 2>/dev/null \
+  && ok "(10) a denied repo is RECORDED unreachable — an ok never reads as a landed grant" \
+  || bad "(10) status hid the denial (exit $DRC): $(head -12 "$DSTATUS" 2>/dev/null | tr '\n' ' ')"
+grep -qi 'repo unreadable' "$WORK/denied.log" \
+  && ok "(10) the run names the denial BEFORE dream starts — a diagnosis, not a surprise" \
+  || bad "(10) the denied-repo run went quiet about the denial"
+[ ! -e "$DENIED/.planning/dream" ] \
+  && ok "(10) FALSIFIER: nothing was written into the denied repo" \
+  || bad "(10) the run wrote into the denied repo"
+
+# (10c) THE ALARM IS NOT STUCK ON. An assertion that only ever fires one way cannot tell a
+# working alarm from a jammed one: if the runner exited 75 unconditionally, (10a) would
+# still be green and would still prove nothing. So hand the SAME runner a dream it can read
+# and require the shouting to STOP. That is what makes (10a) evidence rather than
+# coincidence — the 75 tracked the breakage, and ended when the breakage did.
+OKREPO="$WORK/okrepo"; mkdir -p "$OKREPO/.planning"
+RSTATUS="$WORK/restored-status.json"
+RRC=0
+HEIMDALL_HOME="$DENIED_HOME" "$RUNNER" --dream "$DREAM" --repo "$OKREPO" \
+  --status "$RSTATUS" run --overnight >"$WORK/restored.log" 2>&1 || RRC=$?
+
+[ "$RRC" = 0 ] \
+  && ok "(10) FALSIFIER: a readable dream returns the runner to exit 0 — the 75 was earned" \
+  || bad "(10) runner still failing after restore ($RRC) — (10a) proved nothing: $(head -3 "$WORK/restored.log")"
+grep -q '"result": "ok"' "$RSTATUS" 2>/dev/null \
+  && ok "(10) FALSIFIER: and the status returns to ok — the alarm is not jammed on" \
+  || bad "(10) status stuck at non-ok: $(head -8 "$RSTATUS" 2>/dev/null | tr '\n' ' ')"
+! grep -qi 'BLOCKED' "$WORK/restored.log" \
+  && ok "(10) FALSIFIER: and the log stops shouting — silence is earned, not permanent" \
+  || bad "(10) runner still shouting BLOCKED on a healthy run"
+
+# and the thing the operator ACTUALLY sees surfaces the genuine failure. A status file
+# nobody reads is the 10-night silence with extra steps.
+#
+# A REPO WITH NO REPORT FOR TODAY, deliberately — not $OKREPO. The (10c) run above just
+# wrote today's report into $OKREPO, and notice is designed to self-clear once a report
+# supersedes a stale blocked status (case (6) of dream-tcc-resilience). Pointing this at
+# $OKREPO would assert silence is a failure when silence is the correct answer there.
+BREPO="$WORK/blocked-repo"; mkdir -p "$BREPO/.planning/dream"
+BNOTICE="$("$NOTICE" --repo "$BREPO" --status "$GSTATUS" 2>&1 || true)"
+printf '%s' "$BNOTICE" | grep -qi 'not running\|blocked' \
+  && ok "(10) heimdall-dream-notice surfaces the blocked run to the operator" \
+  || bad "(10) notice stayed silent about a blocked run: $BNOTICE"
 
 NREPO="$WORK/nrepo"; mkdir -p "$NREPO/.planning/dream"
 NSTATUS="$WORK/notice-status.json"
