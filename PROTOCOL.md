@@ -128,11 +128,24 @@ conversation, or restated criteria.
 
 ```bash
 heimdall-brief build --task 3.2 --spec "implement book diff" \
-  --symbols F12,C3 --capsules w2 --invariants INVARIANTS.md
+  --symbols F12,C3 --capsules w2 --invariants 'CLAUDE.md#code-quality--zero-tolerance'
 ```
 
 The brief resolves only the few symbols the task names and hydrates only the
 referenced capsules' closure — a planted `PLAN-*.md` body never appears in it.
+
+Every ref is checked, and an unchecked ref is never emitted as if it were fine.
+An unresolvable symbol, file, capsule or invariants ref marks the whole brief
+`INCOMPLETE` and exits **1**; a resolver or store that could not be read at all
+exits **3** (`NON_VERIFIED`), because "it is not there" and "I could not look"
+need different repairs. The invariants ref takes `<path>` or `<path>#<anchor>`
+and both halves are verified — a dangling one would let a spawn believe it had
+inherited quality rules it never received.
+
+`bin/heimdall-brief` and `sentinels/lib/brief.sh` (the assembler on the
+`heimdall-spawn` path) share one implementation of that policy,
+`bin/lib/brief-core.sh`, so the two entry points cannot drift into disagreeing
+about what counts as resolved.
 
 ## 5 — Blackboard
 
