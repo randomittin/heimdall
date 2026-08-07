@@ -75,10 +75,13 @@ Write nothing else unprompted. These are answers, not a campaign.
 **If asked "what does it actually do to my workflow":**
 
 ```
-One command wires it: `hmd guard install` puts a PreToolUse hook on Claude Code's Bash tool,
-matching `git push`, and runs secret-scan, a full-history self-scan, `bin/falsify` and
-`bin/corpus` before the push leaves the tool call. Non-zero exit from any of them is a hard block
-with the real reason attached. Gates run 100% locally. Your code never leaves your machine.
+Nothing to wire — the gate ships with the plugin as a Claude Code PreToolUse hook on the Bash
+tool, matching `git push`. Before the push leaves the tool call it runs a secret scan, a
+full-history self-scan, `bin/falsify <domain> --assert-score 1.0` over every oracle domain, and
+`bin/corpus run`. Non-zero exit from any of them is a hard block with the real reason attached.
+A separate native git pre-push hook covers what that one structurally cannot see — a push a human
+types in a terminal — and it checks commit identity and re-runs the full-history secret scan.
+Gates run 100% locally. Your code never leaves your machine.
 ```
 
 **If asked "why should we care, specifically":**
@@ -147,8 +150,9 @@ Let "put it wherever it fits" carry it, which is what the submitted body already
   the only correct framing; `test/truth-pass-claims.test.sh` goes red if a bare one reappears on a
   read-surface.
 - Never quote "8/10 working output" without the word **adjudicated**. The raw machine count is
-  6/10 at commit `ae88a55`. The reuse figure that stands unqualified is 0.50 median across 8 cold
-  repos.
+  6/10, recorded in the full-10 run JSON (`.planning/s6-sweep/20260620T050833Z-88787.json`,
+  `"working_output_pass": 6`); the adjudication that lifts it to 8/10 is in the findings file at
+  commit `ae88a55`. The reuse figure that stands unqualified is 0.50 median across 8 cold repos.
 - Never "auto-synthesizes rules". `/dream` works the codebase overnight and leaves a morning
   report; it never auto-pushes. Promoting a case into a standing rule is a manual, human-reviewed
   weekly decision.
@@ -168,8 +172,8 @@ row that cannot be confirmed is cut from the submitted text rather than reworded
 | 1 | "Headroom compresses what the agent reads" — the core comparative clause in the entry line | `https://github.com/headroomlabs-ai/headroom` — README, the project's own one-line self-description. Replace our verb with theirs if they differ. | **CONFIRMED 2026-08-04 — verb corrected** (§8) |
 | 2 | Headroom is a local-first context-compression proxy | Same README, opening section. If "local-first" is not their word, drop it — it is doing work in the §3 reply about both tools running on your machine. | **CONFIRMED 2026-08-04 — "local-first" is their word, verbatim** (§8) |
 | 3 | The repo slug is `headroomlabs-ai/headroom` and the licence is Apache-2.0 | The repo page and its `LICENSE` file. The slug is pasted into the submission target; a wrong slug files the issue on a stranger's repo. | **CONFIRMED 2026-08-04 — both** (§8) |
-| 4 | Headroom curates companion tools in a README section, and that section is the right home for this entry | Their README. See §4 — resolve the section name and bullet format there, and keep the claim out of the submitted body regardless. | **SPLIT 2026-08-04 — first half confirmed, second half still UNVERIFIED and evidence runs against it.** A curated surface exists (`### Community projects`; plus the Stack & integrations blockquote), but it is not a general companion list and its only entry is a project built *on* Headroom. "Right home" is the maintainers' call, not ours. Claim neither in the submitted body. (§4, §8) |
-| 5 | Community channel exists and is the right place for the follow-up in §3 | The community/Discord link **in their README**. Do not guess or reconstruct an invite URL; resolve it from the README and use that. Confirm the channel's rules on tool links before posting anything. | **LINK RESOLVED 2026-08-04 — `https://discord.gg/yRmaUNpsPJ`, taken from their README, invite live, server "Headroom". Rules on tool links remain UNVERIFIED** — they are not published anywhere fetchable and were not read. Do not post the §3 A/B reply to Discord until someone has joined and read the rules. (§8) |
+| 4 | Headroom curates companion tools in a README section, and that section is the right home for this entry | Their README. See §4 — resolve the section name and bullet format there, and keep the claim out of the submitted body regardless. | **RESOLVED BY CUTTING THE SECOND HALF — re-read live 2026-08-08.** First half confirmed: a curated surface exists (`### Community projects`, still exactly one entry; plus the Stack & integrations blockquote). The second half is claimed nowhere and stays that way — the section is not a general companion list, its one entry is a project built *on* Headroom, and "right home" is the maintainers' call. The submitted body names no section; "put it wherever it fits" carries it. (§4, §8) |
+| 5 | Community channel exists and is the right place for the follow-up in §3 | The community/Discord link **in their README**. Do not guess or reconstruct an invite URL; resolve it from the README and use that. Confirm the channel's rules on tool links before posting anything. | **LINK RE-RESOLVED LIVE 2026-08-08 — `https://discord.gg/yRmaUNpsPJ`, read from their README (nav row and `## Community`), not reconstructed; invite still resolves, server "Headroom". Rules on tool links remain UNVERIFIED** — they sit behind the join, are published nowhere fetchable, and have not been read. Do not post the §3 A/B reply to Discord until someone has joined and read them. (§8) |
 | 6 | Star count, if it is ever cited anywhere | The repo page. It moves daily. Preference: never cite it. It is not an argument. | **DO NOT CITE** |
 
 ---
@@ -179,16 +183,26 @@ row that cannot be confirmed is cut from the submitted text rather than reworded
 `bin/falsify --assert-score 1.0` semantics, exchange-lob 6/6 and emulator-gb 3/3, both at
 falsifiability 1.0 → `evals/flagship/STATUS.md` ·
 13 cases, 13 caught, 100% at v0.1 → `evals/corpus/CORPUS-STATUS.md` ·
-`hmd guard install`, `PreToolUse` on `Bash` matching `git push` → `heimdall-site/faq.html`
-§`#stop-broken-code` ·
+the `PreToolUse` gate on `Bash` matching `git push`, and the chain it runs — secret-scan →
+`bin/heimdall-selfscan` → `bin/falsify <domain> --assert-score 1.0` per oracle domain →
+`bin/corpus run`, each a hard block on non-zero → `hooks/hooks.json` (the `PreToolUse` `Bash`
+matcher) ·
+the native git pre-push hook, its two layers (identity over the push range, then full-history
+selfscan) and the fact that it does **not** run the oracles → `hooks/git/pre-push` header;
+`hmd guard install` installs it → `bin/heimdall:1733` ·
 gates are Claude-Code-only today, cross-tool marked COMING → `heimdall-site/faq.html`
 §`#cross-tool` ·
 the coordination ledger over MCP, six tools, stdio JSON-RPC → `PROTOCOL.md` §"MCP Interop
 Contract" ·
 S1 verbatim, "Gates run 100% locally. Your code never leaves your machine." → `README.md`
 §"Your code stays yours", gated by `test/truth-pass-claims.test.sh` ·
-0.50 median reuse across 8 cold repos; adjudicated 8/10 vs raw machine count 6/10 → commit
-`ae88a55`, `docs/archive/docs/superpowers/specs/heimdall-S6-C3-findings.md` §THE FINDING ·
+0.50 median reuse across 8 cold repos, with the full sorted per-repo table → commit `ae88a55`,
+`docs/archive/docs/superpowers/specs/heimdall-S6-C3-findings.md` (sorted: 0.2581, 0.375, 0.40,
+0.50, 0.50, 0.56, 0.6552, 0.9524 → median 0.50), and the four adjudication layers behind the 8/10
+in that file §THE FINDING ·
+the raw machine count 6/10 → the full-10 run JSON `.planning/s6-sweep/20260620T050833Z-88787.json`
+(`"working_output_pass": 6`, `"working_output_rate": 0.6`, `"reuse_median": 0.5`). The findings
+file carries the adjudication, not the raw count — cite the run JSON for 6/10 ·
 MIT licence → `LICENSE`.
 
 ---
@@ -206,6 +220,13 @@ Primary sources only: their repo, their `LICENSE`, their `CONTRIBUTING.md`, the 
 | 4 | `### Community projects` exists under `## Community` — one entry, format `- **[Name](url)** — description.` The other companion surface is the **Stack & integrations** blockquote closing `## Compared to`. `CONTRIBUTING.md` states no listing policy; its routing table sends non-bug asks to an issue or Discord. See §4. **"Right home" was not confirmed and is not claimable.** | Same README (`## Community`, `## Compared to`) · `https://raw.githubusercontent.com/headroomlabs-ai/headroom/main/CONTRIBUTING.md` | 2026-08-04 |
 | 5 | Discord invite **`https://discord.gg/yRmaUNpsPJ`**, read from the README (nav row and `## Community`), not reconstructed. Invite resolves live to the server named **"Headroom"**. `CONTRIBUTING.md` names `#help` for questions. **Rules on tool links were not read** — see §6 row 5. | Same README · invite resolved at `https://discord.com/api/v10/invites/yRmaUNpsPJ` | 2026-08-04 |
 | 6 | Star count — **not fetched, not resolved, not cited.** Deliberately excluded: it decays. | — | — |
+
+**Re-read live 2026-08-08.** Every row above was re-fetched from the same primary sources and
+still holds: headline and preamble verbs unchanged; "local-first" and "proxy" still their words;
+`headroomlabs-ai/headroom` still canonical (HTTP 200, no redirect); `### Community projects` still
+one entry, still a project built *on* Headroom; the Discord invite still resolves to server
+"Headroom". One thing did not move and still cannot be resolved from a terminal: the channel's
+rules on tool links sit behind the join. §6 row 5 stays UNVERIFIED for that reason.
 
 **Pin cross-check (reported, not edited — `modules/**` is another agent's surface).** The pin in
 `modules/headroom/manifest.json`, `headroom-ai[all]==0.33.0` with sdist digest
