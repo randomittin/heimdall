@@ -7,6 +7,7 @@
 | Doc | Purpose | Status |
 | --- | --- | --- |
 | [autoresearch-distilled.md](autoresearch-distilled.md) | Distilled, transferable mechanics from the autoresearch investigation. | Current (tracked) |
+| [token-spend-forensics.md](token-spend-forensics.md) | Where the token spend actually goes, measured from session transcripts; causes ranked by cost. Re-runnable via [`token-spend-forensics.py`](token-spend-forensics.py). | Current (tracked) |
 
 ## Local-only (gitignored — generated, not committed)
 

@@ -199,7 +199,13 @@ S1 verbatim, "Gates run 100% locally. Your code never leaves your machine." → 
 0.50 median reuse across 8 cold repos, with the full sorted per-repo table → commit `ae88a55`,
 `docs/archive/docs/superpowers/specs/heimdall-S6-C3-findings.md` (sorted: 0.2581, 0.375, 0.40,
 0.50, 0.50, 0.56, 0.6552, 0.9524 → median 0.50), and the four adjudication layers behind the 8/10
-in that file §THE FINDING ·
+in that file §THE FINDING. **That table spans two runs, and anyone diffing it against the run
+JSONs will see it** — seven values are the full-10 run, but `cachecontrol` is `0.375` from the
+hardened re-run (`.planning/s6-sweep/20260621T164007Z-31435.json`, `reuse_pct: 0.375`, 7 symbols),
+not the `0.3333` that same repo scored in the full-10 run (6 symbols). That is the adjudication
+doing its job, not a discrepancy: cachecontrol passed only on the hardened re-run, because its
+original probe auto-discovered the shipped `FileCache` and crashed in pre-existing code. Say
+"hardened re-run" if anyone asks. The median is 0.50 on either value, so nothing published moves ·
 the raw machine count 6/10 → the full-10 run JSON `.planning/s6-sweep/20260620T050833Z-88787.json`
 (`"working_output_pass": 6`, `"working_output_rate": 0.6`, `"reuse_median": 0.5`). The findings
 file carries the adjudication, not the raw count — cite the run JSON for 6/10 ·

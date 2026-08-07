@@ -37,9 +37,10 @@
 #   (7) A CHANGED SUBJECT (different repo) asks again — it is a different grant.
 #   (8) REVERSIBLE — heimdall-dream-schedule uninstall removes what the ask added.
 #   (9) WIRED — heimdall-dream-schedule install surfaces the block on a protected repo.
-#  (10) THE LOUD PATH FROM 245ede5 STILL FIRES — the runner still exits 75 and records
-#       blocked, and the notice still names TCC and the denied path. The ask ADDS a
-#       remedy; it must never become a substitute for the failure report.
+#  (10) THE LOUD PATH FROM 245ede5 STILL FIRES — when nothing could run the runner still
+#       exits 75 and records blocked, a denied repo is still RECORDED as unreachable, and
+#       the notice still names TCC and the denied path. The ask ADDS a remedy; it must
+#       never become a substitute for the failure report.
 
 set -euo pipefail
 
@@ -104,7 +105,11 @@ PROT_REPO="$FHOME/Downloads/heimdall"      # the shape of the owner's real machi
 SAFE_REPO="$FHOME/src/heimdall"            # the shape after option [A]
 mkdir -p "$PROT_REPO/.planning" "$SAFE_REPO/.planning"
 
-write_status() { # write_status <file> <result> <reason> <denied_path>
+write_status() { # write_status <file> <result> <reason> <denied_path> [repo_reachable]
+  # repo_reachable defaults to yes because the runner defaults it to yes and only
+  # flips it to no on the TCC path. It is written on EVERY status the runner emits,
+  # so a fixture omitting it does not model anything the runner can produce — pass
+  # it explicitly whenever the case under test turns on reachability.
   cat > "$1" <<EOF
 {
   "schema": 1,
@@ -117,6 +122,7 @@ write_status() { # write_status <file> <result> <reason> <denied_path>
   "dream": "$PROT_REPO/bin/heimdall-dream",
   "denied_path": "$4",
   "detail": "ls: $4: Operation not permitted",
+  "repo_reachable": "${5:-yes}",
   "exit": 75
 }
 EOF
@@ -253,10 +259,17 @@ FORCED="$("$PERM" ask --repo "$PROT_REPO" --force 2>&1)"
 RESHOWN="$("$PERM" ask --repo "$PROT_REPO" 2>&1)"
 [ -n "$RESHOWN" ] && ok "(4) reset re-arms the ask" || bad "(4) reset did not re-arm"
 
-# ── (5) DISARMED BY EVIDENCE — a successful scheduled run proves the grant landed ──
-# This is the assertion behind "does not re-ask once granted". Nothing is self-reported:
-# result=ok can only be written by the runner AFTER the launchd job actually read the repo.
-write_status "$STATUSF" ok "" ""
+# ── (5) DISARMED BY EVIDENCE — a run that REACHED the repo proves the grant landed ──
+# This is the assertion behind "does not re-ask once granted".
+#
+# The premise this block used to carry — "result=ok can only be written by the runner
+# AFTER the launchd job actually read the repo" — was false, and believing it is what
+# made the ask self-silencing. dream reads its state from $HEIMDALL_HOME, so it runs to
+# completion and records result=ok even when TCC refused it the repo; all it loses is
+# the mirror-back of the report. That is precisely why the runner records
+# repo_reachable beside the result. The evidence of a grant is REACHABILITY, never
+# completion, so both fields are pinned here.
+write_status "$STATUSF" ok "" "" yes
 GRC=0
 GJSON="$("$PERM" check --repo "$PROT_REPO" --json)" || GRC=$?
 if [ "$(printf '%s' "$GJSON" | jq -r '.state')" = "granted" ] && [ "$GRC" = 0 ]; then
@@ -273,10 +286,49 @@ QUIET="$("$PERM" ask --repo "$PROT_REPO" 2>&1)"
   && ok "(5) the marker is CLEARED on success, so a later recurrence re-arms honestly" \
   || bad "(5) a stale marker survived success — a recurrence would go unasked"
 
-write_status "$STATUSF" blocked tcc-denied "$PROT_REPO"
+write_status "$STATUSF" blocked tcc-denied "$PROT_REPO" no
 REARM="$("$PERM" ask --repo "$PROT_REPO" 2>&1)"
 [ -n "$REARM" ] && ok "(5) a RECURRENCE after success asks again (not permanently muted)" \
   || bad "(5) a recurrence was silently swallowed"
+
+# ── (5b) A COMPLETED RUN IS NOT A GRANT — the fail-open this ask was losing to ──────
+# The runner finishes and writes result=ok even when TCC handed it nothing: dream's
+# state lives in $HEIMDALL_HOME, so a denied repo costs it only the report mirror-back.
+# Reading result=ok as proof of a grant flipped state to "granted", and since
+# needs-grant is the ONLY state that speaks, the ask went silent while the denial it
+# exists to report was still in force. That is a gate reporting OPEN because it could
+# not reach its subject, which this repo forbids outright.
+"$PERM" reset --repo "$PROT_REPO" >/dev/null 2>&1
+write_status "$STATUSF" ok "" "$PROT_REPO" no
+URC=0
+UJSON="$("$PERM" check --repo "$PROT_REPO" --json)" || URC=$?
+if [ "$(printf '%s' "$UJSON" | jq -r '.state')" = "needs-grant" ]; then
+  ok "(5b) result=ok with repo_reachable=no does NOT disarm — completion is not reachability"
+else
+  bad "(5b) a run that never reached the repo disarmed the ask: rc=$URC $UJSON"
+fi
+
+[ "$(printf '%s' "$UJSON" | jq -r '.reason')" = "run-completed-repo-unreachable" ] \
+  && ok "(5b) the reason names the real cause, not a generic protected-repo verdict" \
+  || bad "(5b) reason was $(printf '%s' "$UJSON" | jq -r '.reason')"
+
+SPEAKS="$("$PERM" ask --repo "$PROT_REPO" 2>&1)"
+[ -n "$SPEAKS" ] \
+  && ok "(5b) and the ask actually SPEAKS — the user hears about a denial still in force" \
+  || bad "(5b) the ask stayed silent on an unreachable repo"
+
+# Reachability UNRECORDED (a status written before the runner carried the field) is not
+# a confirmed grant either. Unverifiable is NON_VERIFIED, never OPEN. Cost of being
+# wrong in this direction is one extra ask, which the one-shot marker then suppresses.
+"$PERM" reset --repo "$PROT_REPO" >/dev/null 2>&1
+grep -v '"repo_reachable"' "$STATUSF" > "$STATUSF.tmp" && mv "$STATUSF.tmp" "$STATUSF"
+grep -q 'repo_reachable' "$STATUSF" \
+  && bad "(5b) fixture still carries repo_reachable — the unrecorded case is untested" \
+  || ok "(5b) fixture models a status written before repo_reachable existed"
+NJSON="$("$PERM" check --repo "$PROT_REPO" --json)" || true
+[ "$(printf '%s' "$NJSON" | jq -r '.state')" = "needs-grant" ] \
+  && ok "(5b) unrecorded reachability fails CLOSED (needs-grant), never assumes a grant" \
+  || bad "(5b) an unrecorded reachability was treated as granted: $NJSON"
 
 # ── (6) A NON-PROTECTED REPO NEVER ASKS ──────────────────────────────────────────
 rm -f "$STATE"
@@ -371,22 +423,88 @@ fi
 # ── (10) THE LOUD PATH FROM 245ede5 STILL FIRES ──────────────────────────────────
 # The ask is an ADDITION. If it ever became a substitute for the failure report we would
 # be back to a job whose only signal is one the operator has to go looking for.
+#
+# RETARGETED, NOT RELAXED. This block used to point the runner at a repo at mode 000 and
+# demand exit 75. 92daf9d deliberately removed that trigger: dream's state moved to
+# $HEIMDALL_HOME, so an unreadable repo no longer costs the run anything it needs, and
+# failing there kept the nightly job dead for a reason that had been removed. That commit
+# inverted the same fixture in dream-tcc-resilience (2)/(2b) but left this copy pointing at
+# the retired trigger, where it went red measuring the fixture instead of the guarantee.
+# The guarantee is "nothing ran ⇒ it says so, loudly", and its live trigger is an
+# unreachable DREAM SCRIPT — still a hard precondition. Both halves are asserted here: the
+# loud path on the target that still fires it, and the honesty of the denied-repo path the
+# ask itself exists for. Nothing is dropped; (10b) is net-new coverage.
+DENIED_HOME="$WORK/denied-home"; mkdir -p "$DENIED_HOME"
+
+# (10a) NOTHING COULD RUN — the silent-death case, on the target that still causes it.
+GONE="$WORK/gone-dream"            # deliberately never created: the program is unreadable
+GSTATUS="$WORK/gone-status.json"
+GRC=0
+HEIMDALL_HOME="$DENIED_HOME" "$RUNNER" --dream "$GONE" --repo "$WORK" \
+  --status "$GSTATUS" run --overnight >"$WORK/gone.log" 2>&1 || GRC=$?
+
+[ "$GRC" = 75 ] && ok "(10) runner STILL exits 75 when nothing could run — never a silent 0" \
+  || bad "(10) runner exit regressed to $GRC"
+grep -q '"result": "blocked"' "$GSTATUS" 2>/dev/null \
+  && ok "(10) runner STILL records result=blocked" \
+  || bad "(10) runner stopped recording the blocked status"
+grep -qi 'BLOCKED' "$WORK/gone.log" \
+  && ok "(10) runner STILL shouts into the dream log" \
+  || bad "(10) runner went quiet"
+
+# (10b) THE REPO IS DENIED — the exact situation the ask exists for. The run proceeds, but
+# a bare "ok" would read as proof the grant landed and nobody would ever look again.
 DENIED="$WORK/denied"; mkdir -p "$DENIED/.planning"
 chmod 000 "$DENIED"
 DSTATUS="$WORK/denied-status.json"
 DRC=0
-"$RUNNER" --dream "$DREAM" --repo "$DENIED" --status "$DSTATUS" run --overnight \
-  >"$WORK/denied.log" 2>&1 || DRC=$?
+HEIMDALL_HOME="$DENIED_HOME" "$RUNNER" --dream "$DREAM" --repo "$DENIED" \
+  --status "$DSTATUS" run --overnight >"$WORK/denied.log" 2>&1 || DRC=$?
 chmod 755 "$DENIED"
 
-[ "$DRC" = 75 ] && ok "(10) runner STILL exits 75 on a denied repo — never a silent 0" \
-  || bad "(10) runner exit regressed to $DRC"
-grep -q '"result": "blocked"' "$DSTATUS" 2>/dev/null \
-  && ok "(10) runner STILL records result=blocked" \
-  || bad "(10) runner stopped recording the blocked status"
-grep -qi 'BLOCKED' "$WORK/denied.log" \
-  && ok "(10) runner STILL shouts into the dream log" \
-  || bad "(10) runner went quiet"
+grep -q '"repo_reachable": "no"' "$DSTATUS" 2>/dev/null \
+  && ok "(10) a denied repo is RECORDED unreachable — an ok never reads as a landed grant" \
+  || bad "(10) status hid the denial (exit $DRC): $(head -12 "$DSTATUS" 2>/dev/null | tr '\n' ' ')"
+grep -qi 'repo unreadable' "$WORK/denied.log" \
+  && ok "(10) the run names the denial BEFORE dream starts — a diagnosis, not a surprise" \
+  || bad "(10) the denied-repo run went quiet about the denial"
+[ ! -e "$DENIED/.planning/dream" ] \
+  && ok "(10) FALSIFIER: nothing was written into the denied repo" \
+  || bad "(10) the run wrote into the denied repo"
+
+# (10c) THE ALARM IS NOT STUCK ON. An assertion that only ever fires one way cannot tell a
+# working alarm from a jammed one: if the runner exited 75 unconditionally, (10a) would
+# still be green and would still prove nothing. So hand the SAME runner a dream it can read
+# and require the shouting to STOP. That is what makes (10a) evidence rather than
+# coincidence — the 75 tracked the breakage, and ended when the breakage did.
+OKREPO="$WORK/okrepo"; mkdir -p "$OKREPO/.planning"
+RSTATUS="$WORK/restored-status.json"
+RRC=0
+HEIMDALL_HOME="$DENIED_HOME" "$RUNNER" --dream "$DREAM" --repo "$OKREPO" \
+  --status "$RSTATUS" run --overnight >"$WORK/restored.log" 2>&1 || RRC=$?
+
+[ "$RRC" = 0 ] \
+  && ok "(10) FALSIFIER: a readable dream returns the runner to exit 0 — the 75 was earned" \
+  || bad "(10) runner still failing after restore ($RRC) — (10a) proved nothing: $(head -3 "$WORK/restored.log")"
+grep -q '"result": "ok"' "$RSTATUS" 2>/dev/null \
+  && ok "(10) FALSIFIER: and the status returns to ok — the alarm is not jammed on" \
+  || bad "(10) status stuck at non-ok: $(head -8 "$RSTATUS" 2>/dev/null | tr '\n' ' ')"
+! grep -qi 'BLOCKED' "$WORK/restored.log" \
+  && ok "(10) FALSIFIER: and the log stops shouting — silence is earned, not permanent" \
+  || bad "(10) runner still shouting BLOCKED on a healthy run"
+
+# and the thing the operator ACTUALLY sees surfaces the genuine failure. A status file
+# nobody reads is the 10-night silence with extra steps.
+#
+# A REPO WITH NO REPORT FOR TODAY, deliberately — not $OKREPO. The (10c) run above just
+# wrote today's report into $OKREPO, and notice is designed to self-clear once a report
+# supersedes a stale blocked status (case (6) of dream-tcc-resilience). Pointing this at
+# $OKREPO would assert silence is a failure when silence is the correct answer there.
+BREPO="$WORK/blocked-repo"; mkdir -p "$BREPO/.planning/dream"
+BNOTICE="$("$NOTICE" --repo "$BREPO" --status "$GSTATUS" 2>&1 || true)"
+printf '%s' "$BNOTICE" | grep -qi 'not running\|blocked' \
+  && ok "(10) heimdall-dream-notice surfaces the blocked run to the operator" \
+  || bad "(10) notice stayed silent about a blocked run: $BNOTICE"
 
 NREPO="$WORK/nrepo"; mkdir -p "$NREPO/.planning/dream"
 NSTATUS="$WORK/notice-status.json"
