@@ -116,6 +116,7 @@ resolver_down() {
 alias_value() { jq -r --arg id "$1" '.symbols[$id] // empty' "$SYMBOLS_FILE"; }
 
 # ── symbols ──────────────────────────────────────────────────────────────────
+caller_caveat=""
 if [ -n "$symbols" ]; then
   {
     echo "SYMBOLS (referenced only — resolved from the live symbol graph):"
@@ -146,6 +147,14 @@ if [ -n "$symbols" ]; then
               | ($c[:$n][] | "    <- called by \(if .edge=="quoted" then "~" else "" end)\(if .ambiguous then "?" else "" end)\(.caller) at \(.file):\(.line)"),
                 (if ($c|length) > $n then "    <- +\(($c|length) - $n) more caller site(s)" else empty end)
             ' <<< "$GRAPH_OUT"
+            # Carry the graph's OWN caveat verbatim. A bare caller list reads as
+            # "these are all of them"; a static index cannot see dynamic
+            # dispatch, shell indirection or cross-language calls, and an agent
+            # that reads the list as complete will call an unsafe change safe.
+            # Sourced from the query, never paraphrased — a local copy drifts.
+            if [ -z "$caller_caveat" ] && [ "$(jq -r '(.callers // []) | length' <<< "$GRAPH_OUT")" -gt 0 ]; then
+              caller_caveat="$(jq -r '.limitations[0] // empty' <<< "$GRAPH_OUT")"
+            fi
           fi
         fi
       elif [ -n "$av" ]; then
@@ -155,6 +164,10 @@ if [ -n "$symbols" ]; then
         echo "symbol $s — not in the symbol graph and not in the alias table" >> "$MISSING"
       fi
     done <<< "$(list_iter "$symbols")"
+    if [ -n "$caller_caveat" ]; then
+      echo "  ! callers: $caller_caveat"
+      echo "  ! full blind-spot list: heimdall-graph impact <symbol>"
+    fi
     echo
   } >> "$BODY"
 fi

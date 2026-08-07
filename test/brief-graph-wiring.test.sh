@@ -226,6 +226,28 @@ if [ -f "$BIG" ]; then
   fi
 fi
 
+# ── (m) callers are labelled NON-EXHAUSTIVE, in the graph's own words ────────
+# A caller list printed bare reads as "these are all of them". A static index
+# cannot see dynamic dispatch, shell indirection or cross-language calls, so an
+# agent that treats the list as complete will conclude a change is safe when it
+# is not. The brief must carry the caveat, and must SOURCE it from the graph
+# rather than paraphrasing it — a paraphrase is a second copy that can drift.
+run_brief build --task T10 --spec "assess blast radius" --symbols leaf_target
+if printf '%s' "$OUT" | grep -qi "not exhaustive"; then
+  ok "(m) caller list carries the non-exhaustiveness caveat"
+else
+  bad "(m) OVERCLAIM: callers printed as if complete, with no blind-spot notice"
+  printf '%s\n' "$OUT" | sed 's/^/      /'
+fi
+# The wording must match the graph's canonical LIMITATIONS[0], not a local copy.
+canon="$(bin/heimdall-graph callers leaf_target --json --repo "$REPO" 2>/dev/null \
+         | jq -r '.limitations[0] // empty')"
+if [ -n "$canon" ] && printf '%s' "$OUT" | grep -qF "$canon"; then
+  ok "(m) the caveat is the graph's own string — it cannot drift from the source"
+else
+  bad "(m) caveat text does not match the graph's canonical limitations[0]"
+fi
+
 # ── (l) ROUTING: the brief must be reachable from the real spawn path ────────
 # This tool was built, documented, and then referenced from nowhere for months.
 # `test/bin-reachability-gate.test.sh` RULE B did not catch it, because
