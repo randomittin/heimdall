@@ -43,9 +43,25 @@ Spawn up to **10 parallel Agent subprocesses** using `run_in_background: true`. 
 - Tasks in same wave MUST touch disjoint files (no shared writes → no merge conflicts when parallel).
 - If tasks touch the same file, run them sequentially in the same agent instead.
 
-## Idle Nudging
+## Idle agents — what you can actually do
 
-If a background agent hasn't reported progress in 60 seconds, send a continuation message: "Continue working on your assigned task and report progress."
+You have no `SendMessage`, so you CANNOT nudge a running agent. This section used to tell you
+to send a continuation message after 60 seconds of silence; that was never executable from
+here, and following it would have meant reporting a nudge you never sent.
+
+Two things are true instead:
+
+- An UNNAMED spawn returns its result to you when it finishes. Silence means still working,
+  not stuck — there is no progress channel to read, so waiting is correct.
+- Only a NAMED spawn can be messaged, and naming one makes it mailbox-resident: it never
+  self-terminates and never returns a result to the spawn call. You do not have the tool to
+  collect from it, so do not name one. That is the orchestrator's job.
+
+So: size each task to finish in a single pass, and prefer several small spawns over one long
+one — a task that needs nudging is a task that was scoped too big. `TaskStop` is your only
+lever on a spawn that is genuinely wedged, and it is destructive: it kills live work, so use
+it only when you have evidence the agent is finished or stuck, never on a hunch about elapsed
+time.
 
 ## Work-Stealing
 
