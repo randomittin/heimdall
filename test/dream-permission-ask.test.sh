@@ -421,6 +421,40 @@ grep -qi 'repo unreadable' "$WORK/denied.log" \
   && ok "(10) FALSIFIER: nothing was written into the denied repo" \
   || bad "(10) the run wrote into the denied repo"
 
+# (10c) THE ALARM IS NOT STUCK ON. An assertion that only ever fires one way cannot tell a
+# working alarm from a jammed one: if the runner exited 75 unconditionally, (10a) would
+# still be green and would still prove nothing. So hand the SAME runner a dream it can read
+# and require the shouting to STOP. That is what makes (10a) evidence rather than
+# coincidence — the 75 tracked the breakage, and ended when the breakage did.
+OKREPO="$WORK/okrepo"; mkdir -p "$OKREPO/.planning"
+RSTATUS="$WORK/restored-status.json"
+RRC=0
+HEIMDALL_HOME="$DENIED_HOME" "$RUNNER" --dream "$DREAM" --repo "$OKREPO" \
+  --status "$RSTATUS" run --overnight >"$WORK/restored.log" 2>&1 || RRC=$?
+
+[ "$RRC" = 0 ] \
+  && ok "(10) FALSIFIER: a readable dream returns the runner to exit 0 — the 75 was earned" \
+  || bad "(10) runner still failing after restore ($RRC) — (10a) proved nothing: $(head -3 "$WORK/restored.log")"
+grep -q '"result": "ok"' "$RSTATUS" 2>/dev/null \
+  && ok "(10) FALSIFIER: and the status returns to ok — the alarm is not jammed on" \
+  || bad "(10) status stuck at non-ok: $(head -8 "$RSTATUS" 2>/dev/null | tr '\n' ' ')"
+! grep -qi 'BLOCKED' "$WORK/restored.log" \
+  && ok "(10) FALSIFIER: and the log stops shouting — silence is earned, not permanent" \
+  || bad "(10) runner still shouting BLOCKED on a healthy run"
+
+# and the thing the operator ACTUALLY sees surfaces the genuine failure. A status file
+# nobody reads is the 10-night silence with extra steps.
+#
+# A REPO WITH NO REPORT FOR TODAY, deliberately — not $OKREPO. The (10c) run above just
+# wrote today's report into $OKREPO, and notice is designed to self-clear once a report
+# supersedes a stale blocked status (case (6) of dream-tcc-resilience). Pointing this at
+# $OKREPO would assert silence is a failure when silence is the correct answer there.
+BREPO="$WORK/blocked-repo"; mkdir -p "$BREPO/.planning/dream"
+BNOTICE="$("$NOTICE" --repo "$BREPO" --status "$GSTATUS" 2>&1 || true)"
+printf '%s' "$BNOTICE" | grep -qi 'not running\|blocked' \
+  && ok "(10) heimdall-dream-notice surfaces the blocked run to the operator" \
+  || bad "(10) notice stayed silent about a blocked run: $BNOTICE"
+
 NREPO="$WORK/nrepo"; mkdir -p "$NREPO/.planning/dream"
 NSTATUS="$WORK/notice-status.json"
 write_status "$NSTATUS" blocked tcc-denied "$PROT_REPO"
