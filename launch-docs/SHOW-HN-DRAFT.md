@@ -39,10 +39,10 @@ every change — a check the implementing agent never sees, proven able to go re
 trusted green — and blocks the push until that check passes. The agent's own test suite is a
 claim, not evidence, because the thing under test wrote it.
 
-Three gates hold a mutation-kill score of 1.0: exchange-lob at 6 of 6 injected mutants caught,
-emulator-gb at 3 of 3 (evals/flagship/STATUS.md), and the cross-tenant isolation oracle at 23 of
-23 — every mutant a real breach attempt. Reproduce any of them with
-`bin/falsify <domain> --assert-score 1.0`. The regression corpus is 13 cases, 13 caught, 100% at v0.1
+Three gates hold a mutation-kill score of 1.0: exchange-lob at 6 of 6 injected mutants caught and
+emulator-gb at 3 of 3 (evals/flagship/STATUS.md), plus rr-multitenant-isolation at 23 of 23, where
+every mutant is a real cross-tenant breach attempt (evals/live-isolation/LATEST.md). Reproduce any
+of them with `bin/falsify <domain> --assert-score 1.0` — those three names are the argument. The regression corpus is 13 cases, 13 caught, 100% at v0.1
 (evals/corpus/CORPUS-STATUS.md), published as a time series with its dips visible rather than as
 an adjective.
 
@@ -85,7 +85,13 @@ Run it on your own repo, it takes one command each:
 
   bin/falsify <domain> --assert-score 1.0     # prove a gate can fail
   bin/corpus run                              # replay every failure we've ever caught
-  hmd guard install                           # gate git push behind both
+  hmd guard install                           # native pre-push hook, so your own pushes are gated too
+
+The push gate itself ships with the plugin: a PreToolUse hook on Claude Code's Bash tool, matching
+`git push`, running the secret scans, falsify over every oracle domain, and corpus before the push
+leaves the tool call. That hook only ever sees a push the agent issues. `hmd guard install` is the
+other half — a native git pre-push hook that checks commit identity and re-scans full history, so
+a push you type yourself is covered too.
 
 Known limitations, stated up front:
 
@@ -108,8 +114,10 @@ Known limitations, stated up front:
 
 The hosted side (`rr`) opens a scoped PR on your own repo with your own Claude subscription and
 your own GitHub App install — BYOC, no shared keys, never on main, never self-merged. Getting it
-running on real Cloud Run took a 29-bug bring-up; all 29 are named and published, including the
-keystone where our loop hard-coded PR_OPEN and had been reporting success for every failed run.
+running on real Cloud Run took a 29-bug bring-up; all 29 are named and published in
+docs/CHANGES-SINCE-TEAMS.md, including the keystone (#28, phantom-PR_OPEN) where open_pr's return
+value was discarded, so a failed `gh pr create` silently faked PR_OPEN — every run since bug #21
+had been reporting success while failing.
 
 What I want from this thread: tear at the falsifiability scoring. If you can construct a defect
 class our mutant suites structurally cannot catch, that's a real finding and I'll open the issue
@@ -141,9 +149,10 @@ Adapted from `docs/specs/heimdall-ship-spec.md` §L1.
 
 - [ ] Zero `[RECEIPT:]` markers remain in the posted text.
 - [ ] Every number in the title also appears in the body.
-- [ ] Every cohort number is traceable to a named case or an aggregate someone can recount.
-- [ ] Anonymization cleared: cohort is under 20 teams, so aggregate carefully or hold explicit
-      named consent per team.
+- [x] Cohort numbers: **n/a — the cohort did not run and every cohort claim was cut.** These two
+      rows stay visible rather than deleted, so that anyone re-adding a cohort paragraph has to
+      clear them first: every cohort number traceable to a named case or a recountable aggregate,
+      and anonymization cleared (under 20 teams → aggregate carefully or hold named consent).
 - [ ] `bin/falsify` and `bin/corpus` reproduce the quoted scores on a clean checkout.
 - [ ] The install one-liner works on a fresh machine at the currently pinned tag and sha256.
 - [ ] Known-limitations list re-checked against the repo the morning of the post.
