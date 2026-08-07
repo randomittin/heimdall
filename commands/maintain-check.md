@@ -113,9 +113,15 @@ deliberate step-back BETWEEN fix batches — never mid-fix:
 ```bash
 # 1) surface testable hypotheses from the accumulated evidence.
 #    --min-samples here filters which (task_type, model) cells are even worth a hypothesis;
-#    it is NOT the keep-gate. The keep-gate is `experiment start --min-samples`, and that
-#    one carries the real floor (20 — see skills/self-improve/SKILL.md on why 3 is too few
-#    to keep a change on).
+#    it is NOT the keep-gate. The keep-gate is `experiment start --min-samples`.
+#
+#    That keep-gate does NOT default to the floor. Both subcommands default to
+#    DEF_MIN_SAMPLES = 3 (bin/heimdall-self-improve). The floor of 20 lives in
+#    MIN_SAMPLES_FLOOR (bin/heimdall-dream), which clamps upward — so it applies when you go
+#    through `/dream`, and NOT when you call heimdall-self-improve directly, as this block
+#    does. Pass 20 explicitly on the keep-gate or you are keeping a routing change on
+#    3 observations, where a variant that is genuinely no better still clears a 0.10 delta
+#    about 73% of the time. See skills/self-improve/SKILL.md.
 heimdall-self-improve hypotheses --repo . --min-samples 3
 
 # 2) evaluate any OPEN experiment whose variant has now accrued enough samples
