@@ -37,6 +37,28 @@ fi
 BLOB=""
 [ -t 0 ] || BLOB="$(cat 2>/dev/null)"
 
+# ── PUBLISH the context reading for the per-prompt meter (bin/heimdall-ctx-meter) ──
+# Claude Code exposes context size in exactly ONE place: this statusLine stdin blob
+# (context_window.total_input_tokens). No hook receives it — UserPromptSubmit sees only
+# the prompt and the session id. So the BAR is the publisher: it hands the meter the
+# SAME blob its own CTX% gauge reads, and the UserPromptSubmit hook reads what the meter
+# stored. One parser of one field — a second estimator that could disagree with the
+# number on screen would be worse than no meter at all.
+#
+# Why it matters (docs/analysis/token-spend-forensics.md): one session ran 15 days at a
+# mean context of 501,000 tokens and cost $913.54 — 82.8% of a three-week $1,103 bill.
+# Capping at ~150K provably recovers $369.50. Drift is invisible without this.
+#
+# Same never-error contract as the rest of the bar: hard time ceiling when one is
+# available, output fully discarded, every failure path a no-op.
+CTX_METER="$HERE/../bin/heimdall-ctx-meter"
+if [ -n "$BLOB" ] && [ -x "$CTX_METER" ]; then
+  CTO=""
+  command -v timeout  >/dev/null 2>&1 && CTO="timeout 2"
+  [ -z "$CTO" ] && command -v gtimeout >/dev/null 2>&1 && CTO="gtimeout 2"
+  printf '%s' "$BLOB" | $CTO "$CTX_METER" publish >/dev/null 2>&1 || true
+fi
+
 # ── LIVE harness-subagent count (reconciled: stale/failed/reaped EXCLUDED) ──────
 # Claude Code Agent-tool subagents (hmd:coder &c.) are owned by the harness and
 # never enter agent-pool, so a dead/hung one would keep inflating any raw count.

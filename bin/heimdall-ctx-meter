@@ -1,0 +1,417 @@
+#!/usr/bin/env bash
+# heimdall-ctx-meter — the context meter. Makes runaway context IMPOSSIBLE TO MISS.
+#
+# THE MEASUREMENT THIS EXISTS TO ENFORCE (docs/analysis/token-spend-forensics.md)
+# ------------------------------------------------------------------------------
+# Three weeks: 234 sessions, 3,830 requests, $1,103.05. ONE session is $913.54 of it
+# — 82.8% — because it ran 15 days at a MEAN context of 501,000 tokens (peak 998,857)
+# and never restarted. Capping context at ~150K recovers $369.50 of that, provably.
+#
+# The proof is the owner's own two days, same repo, same working style, nothing skipped:
+#     2026-08-05 · 476 reqs · 731,707 mean ctx -> $0.366  / request
+#     2026-08-07 · 153 reqs · 118,678 mean ctx -> $0.0593 / request    = 6.17x cheaper
+#
+# Above ~800K a SECOND, independent cost appears: cache-creation per request jumps from
+# ~13,320 tokens (quintiles 2-4, flat) to 42,183 (quintile 5) — 3.2x, a cliff not a
+# slope (Pearson r is only 0.092, so it is not linear drift). That surcharge alone is
+# $118.92. Re-establishing a fresh session costs ~35K of preamble, about $0.02.
+#
+# Cost = turns x context. The turns are inherent to this repo's verification discipline.
+# The context size is not. So this meter watches exactly one variable: context size.
+#
+# WHY IT IS SPLIT INTO publish/read/notice
+# ----------------------------------------
+# Claude Code exposes context size in exactly ONE place: the statusLine stdin blob
+# (`context_window.total_input_tokens`). Hooks do not receive it — UserPromptSubmit sees
+# only the prompt and the session id. So:
+#
+#     hooks/statusline.sh --(the blob it already slurps)--> `publish` --> a tiny record
+#     hooks.json UserPromptSubmit ------------------------> `notice`  --> reads it
+#
+# This is deliberately ONE parser of ONE field. A second estimator that could disagree
+# with the CTX% on screen would be worse than no meter at all, so the meter reads the
+# same `context_window` object the status bar's gauge reads and nothing else.
+#
+# FAIL CLOSED, AND QUIET-SAFE
+#   - No record, a STALE record, a corrupt record, or a blob carrying no context signal
+#     all resolve to NON_VERIFIED. An unreachable verifier is NEVER "OK". Reporting a
+#     comfortable number the meter did not measure is the one failure that would be
+#     worse than not existing, because it buys confidence nothing earned.
+#   - NON_VERIFIED is told to the operator ONCE per session, never every turn.
+#   - Below the ceiling it prints NOTHING, on either stream.
+#   - The notice goes to STDERR. UserPromptSubmit stdout becomes model context, and a
+#     context warning that itself costs context every turn would be self-defeating.
+#   - Every verb exits 0 on garbage. It runs in the prompt path; it must never be able
+#     to break a turn.
+#
+# USAGE
+#   heimdall-ctx-meter publish [--session SID]   # stdin: the statusLine JSON blob
+#   heimdall-ctx-meter read    [--session SID] [--json]
+#   heimdall-ctx-meter notice  [--session SID]   # stdin: the UserPromptSubmit JSON
+#
+# ENVIRONMENT (defaults are the measured figures, not taste)
+#   HEIMDALL_HOME       state root (default ~/.heimdall)
+#   HMD_CTX_CEILING     150000  target ceiling — the cap that recovers $369.50
+#   HMD_CTX_CLIFF_NEAR  700000  ~7 requests of headroom at the measured 13,320 tok/req
+#   HMD_CTX_CLIFF       800000  measured quintile-5 boundary (804,141): cache-write 3.2x
+#   HMD_CTX_TTL         900     seconds a reading stays current; older -> NON_VERIFIED
+#   HMD_CTX_REARM       100000  further growth before the ceiling notice repeats
+#   HMD_CTX_NOW         epoch-second override (tests)
+
+set -uo pipefail
+
+CEILING="${HMD_CTX_CEILING:-150000}"
+CLIFF_NEAR="${HMD_CTX_CLIFF_NEAR:-700000}"
+CLIFF="${HMD_CTX_CLIFF:-800000}"
+TTL="${HMD_CTX_TTL:-900}"
+REARM="${HMD_CTX_REARM:-100000}"
+
+# The measured per-request context delta (quintiles 2-4, flat at ~13,320 tok/req). Used
+# ONLY to convert remaining headroom into "how many requests do I have left" — which is
+# the number that makes the warning actionable instead of decorative.
+DELTA_PER_REQ=13320
+
+HEIMDALL_HOME="${HEIMDALL_HOME:-$HOME/.heimdall}"
+CTX_DIR="${HMD_CTX_DIR:-$HEIMDALL_HOME/ctx}"
+
+_now() { printf '%s' "${HMD_CTX_NOW:-$(date +%s 2>/dev/null || printf 0)}"; }
+
+# 214000 -> 214,000. BSD/GNU sed compatible.
+_commas() { printf '%s' "${1:-}" | sed -e :a -e 's/\(.*[0-9]\)\([0-9]\{3\}\)/\1,\2/;ta'; }
+
+_is_int() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+
+# ── argument parse ───────────────────────────────────────────────────────────────
+VERB="${1:-}"; [ $# -gt 0 ] && shift
+SESSION=""
+JSON_OUT=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --session) SESSION="${2:-}"; shift 2 ;;
+    --json)    JSON_OUT=1; shift ;;
+    --help|-h) sed -n '2,72p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) shift ;;
+  esac
+done
+
+# ── stdin, slurped at most once (it is consumable only once) ─────────────────────
+# A hook's stdin can be open-but-idle, and an unbounded `cat` there blocks the PROMPT —
+# measured at 8s against a stdin held open for 8s. This runs in the per-prompt path, so
+# the read is time-boxed. macOS ships no timeout(1); perl's alarm survives exec, which is
+# the portable ceiling. A truncated blob simply fails to parse -> NON_VERIFIED, which is
+# the correct fail-closed answer, never a comfortable number.
+STDIN_BLOB=""
+_slurp() {
+  [ -t 0 ] && return 0
+  if command -v perl >/dev/null 2>&1; then
+    STDIN_BLOB="$(perl -e 'alarm 2; exec @ARGV' cat 2>/dev/null || true)"
+  else
+    STDIN_BLOB="$(cat 2>/dev/null || true)"
+  fi
+  return 0
+}
+
+# Pull a field out of arbitrary JSON. python3 first (the same interpreter the watchman
+# parses the blob with, so the semantics match), jq as the fallback.
+_json_get() { # <json> <python-expr-path> <jq-path>
+  local blob="$1" pypath="$2" jqpath="$3" out=""
+  if command -v python3 >/dev/null 2>&1; then
+    out="$(printf '%s' "$blob" | python3 -c '
+import json, sys
+try:
+    b = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+if not isinstance(b, dict):
+    sys.exit(0)
+cw = b.get("context_window")
+cw = cw if isinstance(cw, dict) else {}
+want = sys.argv[1]
+def num(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+if want == "session":
+    v = b.get("session_id")
+    if isinstance(v, str) and v:
+        print(v)
+elif want == "tokens":
+    v = cw.get("total_input_tokens")
+    if num(v) and v >= 0:
+        print(int(v))
+    else:
+        p, w = cw.get("used_percentage"), cw.get("context_window_size")
+        if num(p) and num(w) and w > 0 and p >= 0:
+            print(int(round(float(p) * float(w) / 100.0)))
+elif want == "pct":
+    v = cw.get("used_percentage")
+    if num(v):
+        print(("%.4f" % float(v)).rstrip("0").rstrip("."))
+elif want == "window":
+    v = cw.get("context_window_size")
+    if num(v) and v > 0:
+        print(int(v))
+' "$pypath" 2>/dev/null || true)"
+    printf '%s' "$out"; return 0
+  fi
+  if command -v jq >/dev/null 2>&1; then
+    out="$(printf '%s' "$blob" | jq -r "$jqpath" 2>/dev/null | grep -v '^null$' | head -1 || true)"
+    printf '%s' "$out"; return 0
+  fi
+  printf ''
+}
+
+# ── publish — the ONLY writer of a reading ───────────────────────────────────────
+# Silent, atomic, always exit 0. A blob with no context signal writes NOTHING: leaving
+# the previous (age-checked) reading in place is honest, inventing a 0 is not.
+do_publish() {
+  _slurp
+  [ -n "$STDIN_BLOB" ] || exit 0
+
+  local sid tokens pct window rec tmp
+  sid="$SESSION"
+  [ -n "$sid" ] || sid="$(_json_get "$STDIN_BLOB" session '.session_id // empty')"
+  [ -n "$sid" ] || sid="${CLAUDE_SESSION_ID:-}"
+  [ -n "$sid" ] || sid="default"
+  sid="$(printf '%s' "$sid" | tr -cd 'A-Za-z0-9._-' | cut -c1-96)"
+  [ -n "$sid" ] || sid="default"
+
+  tokens="$(_json_get "$STDIN_BLOB" tokens '.context_window.total_input_tokens // empty')"
+  _is_int "$tokens" || exit 0                      # no context signal -> write nothing
+  pct="$(_json_get "$STDIN_BLOB" pct '.context_window.used_percentage // empty')"
+  window="$(_json_get "$STDIN_BLOB" window '.context_window.context_window_size // empty')"
+  _is_int "$window" || window=0
+  [ -n "$pct" ] || pct=0
+
+  mkdir -p "$CTX_DIR" 2>/dev/null || exit 0
+  rec="$CTX_DIR/$sid.json"
+  tmp="$rec.$$.tmp"
+  {
+    printf '{\n'
+    printf '  "session": "%s",\n' "$sid"
+    printf '  "tokens": %s,\n' "$tokens"
+    printf '  "pct": %s,\n' "$pct"
+    printf '  "window": %s,\n' "$window"
+    printf '  "ts": %s,\n' "$(_now)"
+    printf '  "source": "statusline"\n'
+    printf '}\n'
+  } > "$tmp" 2>/dev/null && mv "$tmp" "$rec" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+  exit 0
+}
+
+# ── record reading (no jq: this runs per prompt and must not depend on it) ───────
+_rec_field() { # <file> <key>
+  sed -n "s/^[[:space:]]*\"$2\"[[:space:]]*:[[:space:]]*\"\{0,1\}\([^\",}]*\)\"\{0,1\}[[:space:]]*,\{0,1\}[[:space:]]*\$/\1/p" \
+    "$1" 2>/dev/null | head -1
+}
+
+# Newest record whose mtime is inside the TTL — the fallback when no session id is
+# resolvable. In practice the foreground session is the one that just rendered its bar.
+_newest_record() {
+  [ -d "$CTX_DIR" ] || return 0
+  ls -t "$CTX_DIR"/*.json 2>/dev/null | head -1
+}
+
+STATE=""; TOKENS=""; PCT=""; WINDOW=""; AGE=""; REASON=""; RESOLVED_SID=""
+
+# Resolve session -> record -> STATE. Sets the globals above. Never fails.
+_resolve() {
+  local sid="$SESSION" rec="" now age
+  [ -n "$sid" ] || sid="${CLAUDE_SESSION_ID:-}"
+  if [ -z "$sid" ] && [ -n "$STDIN_BLOB" ]; then
+    sid="$(_json_get "$STDIN_BLOB" session '.session_id // empty')"
+  fi
+  sid="$(printf '%s' "$sid" | tr -cd 'A-Za-z0-9._-' | cut -c1-96)"
+  RESOLVED_SID="$sid"
+
+  [ -n "$sid" ] && [ -f "$CTX_DIR/$sid.json" ] && rec="$CTX_DIR/$sid.json"
+  [ -n "$rec" ] || rec="$(_newest_record)"
+
+  if [ -z "$rec" ] || [ ! -f "$rec" ]; then
+    STATE="NON_VERIFIED"; REASON="no-reading"; return 0
+  fi
+
+  TOKENS="$(_rec_field "$rec" tokens)"
+  PCT="$(_rec_field "$rec" pct)"
+  WINDOW="$(_rec_field "$rec" window)"
+  local ts; ts="$(_rec_field "$rec" ts)"
+  [ -n "$RESOLVED_SID" ] || RESOLVED_SID="$(_rec_field "$rec" session)"
+
+  if ! _is_int "$TOKENS" || ! _is_int "$ts"; then
+    STATE="NON_VERIFIED"; REASON="malformed"; TOKENS=""; return 0
+  fi
+
+  now="$(_now)"
+  age=$(( now - ts )); [ "$age" -lt 0 ] && age=0
+  AGE="$age"
+  if [ "$age" -gt "$TTL" ]; then
+    STATE="NON_VERIFIED"; REASON="stale"; return 0
+  fi
+
+  if   [ "$TOKENS" -ge "$CLIFF" ];      then STATE="CLIFF"
+  elif [ "$TOKENS" -ge "$CLIFF_NEAR" ]; then STATE="CLIFF_NEAR"
+  elif [ "$TOKENS" -ge "$CEILING" ];    then STATE="CEILING"
+  else                                       STATE="OK"
+  fi
+}
+
+# ── read ─────────────────────────────────────────────────────────────────────────
+do_read() {
+  # A query verb must not touch stdin it does not need. When the session is already
+  # known there is nothing to parse, so stdin is left alone entirely.
+  if [ -z "$SESSION" ] && [ -z "${CLAUDE_SESSION_ID:-}" ]; then _slurp; fi
+  _resolve
+  if [ "$JSON_OUT" = 1 ]; then
+    printf '{"state":"%s","tokens":%s,"pct":%s,"window":%s,"age_s":%s,"ttl_s":%s,"reason":"%s","session":"%s","ceiling":%s,"cliff_near":%s,"cliff":%s}\n' \
+      "$STATE" "${TOKENS:-null}" "${PCT:-null}" "${WINDOW:-null}" "${AGE:-null}" \
+      "$TTL" "$REASON" "$RESOLVED_SID" "$CEILING" "$CLIFF_NEAR" "$CLIFF"
+  elif [ "$STATE" = "NON_VERIFIED" ]; then
+    printf 'NON_VERIFIED (%s)\n' "$REASON"
+  else
+    printf '%s %s tokens\n' "$STATE" "$(_commas "$TOKENS")"
+  fi
+  exit 0
+}
+
+# ── notice bookkeeping — a SEPARATE file from the reading, so publish (statusline)
+# and notice (prompt hook) never contend for the same inode. ─────────────────────
+NOTE_FILE=""
+_note_path() {
+  local sid="${RESOLVED_SID:-default}"
+  [ -n "$sid" ] || sid="default"
+  NOTE_FILE="$CTX_DIR/$sid.notice"
+}
+_note_get() { [ -f "$NOTE_FILE" ] && _rec_field "$NOTE_FILE" "$1" || printf ''; }
+_note_put() { # <state> <tokens>
+  mkdir -p "$CTX_DIR" 2>/dev/null || return 0
+  local tmp="$NOTE_FILE.$$.tmp"
+  {
+    printf '{\n'
+    printf '  "state": "%s",\n' "$1"
+    printf '  "tokens": %s,\n' "${2:-0}"
+    printf '  "ts": %s\n' "$(_now)"
+    printf '}\n'
+  } > "$tmp" 2>/dev/null && mv "$tmp" "$NOTE_FILE" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+}
+
+# ── the renders. Everything goes to stderr (see the header). ────────────────────
+RULE='━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
+e() { printf '%s\n' "$*" >&2; }
+p() { printf '[heimdall] %s\n' "$*" >&2; }
+
+# Routine escalation: two plain lines, the shape the dream/health advisories use.
+render_ceiling() {
+  local tok="$1"
+  e ""
+  p "CONTEXT $(_commas "$tok") tokens — past the ${CEILING_H} ceiling. Checkpoint and restart: run /hmd:save, then start a fresh session."
+  p "    measured on this repo, same working style: \$0.366/req at 731K context vs \$0.0593/req at 118K — 6.17x. A restart re-pays ~35K of preamble (~\$0.02); staying here cost \$369.50 over one session."
+  e ""
+}
+
+# Severe escalation: a ruled block. It must NOT read as more routine output — a notice
+# that scrolls past unread is worth nothing.
+render_cliff() {
+  local tok="$1" state="$2" headroom reqs
+  e ""
+  e "$RULE"
+  if [ "$state" = "CLIFF" ]; then
+    e "  ⛔ HEIMDALL — CONTEXT EMERGENCY · $(_commas "$tok") tokens · PAST THE $(_commas "$CLIFF") CACHE CLIFF"
+  else
+    headroom=$(( CLIFF - tok )); [ "$headroom" -lt 0 ] && headroom=0
+    reqs=$(( headroom / DELTA_PER_REQ ))
+    e "  ⛔ HEIMDALL — CONTEXT EMERGENCY · $(_commas "$tok") tokens · $(_commas "$headroom") FROM THE $(_commas "$CLIFF") CACHE CLIFF"
+    e "     that is about ${reqs} more requests at this repo's measured 13,320 tokens/request."
+  fi
+  e "$RULE"
+  if [ "$state" = "CLIFF" ]; then
+    e "  You are paying the cliff NOW. Above $(_commas "$CLIFF") this session writes 42,183 cache"
+    e "  tokens per request instead of the flat 13,320 it writes below — 3.2x, measured."
+    e "  That surcharge alone cost \$118.92."
+  else
+    e "  Above $(_commas "$CLIFF") cache-creation jumps from a flat 13,320 tokens/request to"
+    e "  42,183 — 3.2x, measured. It is a cliff, not a slope: it arrives all at once."
+  fi
+  e "  Every request here bills \$0.366 instead of \$0.0593 — 6.17x, from your own two days."
+  e ""
+  e "  STOP AND RESTART:   /hmd:save     then exit and open a fresh session."
+  e "  Resuming costs ~35K of preamble, about \$0.02. Not restarting cost \$913.54 once."
+  e "$RULE"
+  e ""
+}
+
+# The meter cannot see. Say so — ONCE — and never imply things are fine.
+render_blind() {
+  local why="$1" cause
+  case "$why" in
+    stale)      cause="the last reading is ${AGE}s old (ceiling ${TTL}s) — the status bar has stopped publishing" ;;
+    malformed)  cause="the stored reading is corrupt and was not trusted" ;;
+    *)          cause="no reading has been published for this session" ;;
+  esac
+  e ""
+  p "CONTEXT METER CANNOT READ THIS SESSION — so it is NOT telling you that you are fine."
+  p "    cause : $cause"
+  p "    why it matters: unmeasured context is how one session reached 501,000 mean tokens and cost \$913.54."
+  p "    fix   : the meter reads what the status bar reads. Re-register it with \`heimdall-statusline-register register\`, or check hooks/statusline.sh still runs."
+  p "    until then, watch CTX% on the status bar yourself. This notice appears once per session."
+  e ""
+}
+
+# ── notice — the per-prompt verb. Silent in the normal case, always exit 0. ──────
+do_notice() {
+  _slurp
+  _resolve
+  _note_path
+
+  local prev_state prev_tokens
+  prev_state="$(_note_get state)"
+  prev_tokens="$(_note_get tokens)"
+  _is_int "$prev_tokens" || prev_tokens=0
+
+  case "$STATE" in
+    OK)
+      # Below the ceiling: say NOTHING, and clear the bookkeeping so a later climb
+      # back over the ceiling is announced fresh rather than swallowed by a cooldown.
+      [ -n "$prev_state" ] && [ "$prev_state" != "OK" ] && _note_put OK "${TOKENS:-0}"
+      exit 0
+      ;;
+    NON_VERIFIED)
+      [ "$prev_state" = "NON_VERIFIED" ] && exit 0     # quiet-safe: once per session
+      render_blind "$REASON"
+      _note_put NON_VERIFIED 0
+      exit 0
+      ;;
+    CEILING)
+      # Re-speak on GROWTH, not per prompt. A drop (a compact or a restart) re-baselines
+      # silently — otherwise the next climb is measured from a high-water mark that no
+      # longer exists and a 500K ascent passes in total silence.
+      if [ "$prev_state" = "CEILING" ]; then
+        if [ "$TOKENS" -lt "$prev_tokens" ]; then
+          _note_put CEILING "$TOKENS"; exit 0
+        fi
+        [ "$TOKENS" -lt $(( prev_tokens + REARM )) ] && exit 0
+      fi
+      render_ceiling "$TOKENS"
+      _note_put CEILING "$TOKENS"
+      exit 0
+      ;;
+    CLIFF_NEAR|CLIFF)
+      # An emergency is not rate-limited. The correct response ends the session, so this
+      # cannot become wallpaper for long — and at $0.366/request the notice is free.
+      render_cliff "$TOKENS" "$STATE"
+      _note_put "$STATE" "$TOKENS"
+      exit 0
+      ;;
+  esac
+  exit 0
+}
+
+CEILING_H="$(_commas "$CEILING")"
+
+case "$VERB" in
+  publish) do_publish ;;
+  read)    do_read ;;
+  notice)  do_notice ;;
+  ''|--help|-h|help) sed -n '2,72p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  *)
+    printf 'heimdall-ctx-meter: unknown verb "%s" (expected publish|read|notice)\n' "$VERB" >&2
+    exit 64
+    ;;
+esac
