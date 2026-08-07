@@ -78,12 +78,7 @@ Write or update project-specific execution settings:
   },
   "model_routing": {
     "default_code": "opus",
-    "default_effort": "high",
-    "overrides": {
-      "*.test.ts": "sonnet",
-      "*.md": "sonnet",
-      "*.css": "haiku"
-    }
+    "_note": "default_code is the ONLY routing key any code reads (bin/heimdall:3783). Add default_effort or per-glob tier overrides if you like — nothing dereferences them, so they are a note to the orchestrator, not a setting."
   },
   "commands": {
     "test": "npm test",
@@ -97,7 +92,9 @@ Write or update project-specific execution settings:
 }
 ```
 
-This file is read mechanically on every `heimdall` launch (injected into preamble alongside CHECKPOINT.md). Claude doesn't need to "discover" test/lint/build commands — they're hardcoded from the first run.
+The whole file is injected verbatim into the preamble on every `heimdall` launch, alongside CHECKPOINT.md (`bin/heimdall:3092`). Claude doesn't need to "discover" test/lint/build commands — they're there from the first run.
+
+What "injected" does and does not mean: exactly one key changes behaviour mechanically, `model_routing.default_code`, which picks the launch model at `bin/heimdall:3783`. Everything else — the commands, parallelism numbers, governance, avoid_dirs, preferences — is text the orchestrator reads and is expected to honour. That is an instruction to a model, not an enforced setting, so verify it was honoured rather than assuming the file made it so.
 
 ### 4. Git checkpoint
 ```bash
