@@ -56,6 +56,7 @@ standalone_reason() {
   case "$1" in
     generate-changelog)        printf 'BY DESIGN — release tooling the maintainer runs when cutting a release' ;;
     heimdall-banner-test)      printf 'BY DESIGN — manual wcwidth acceptance harness for the launch banner; a human eyeballs it' ;;
+    heimdall-headroom-ab)      printf 'BY DESIGN — the maintainer-run A/B receipt harness for the Headroom pre-registration; two snapshots a week apart, then a report a human publishes' ;;
     heimdall-live-verify)      printf 'BY DESIGN — on-demand live isolation verification that emits a committed receipt' ;;
     heimdall-seed-demo-wall)   printf 'BY DESIGN — one-shot demo seeding a human runs before a demo' ;;
     heimdall-team-converge)    printf 'BY DESIGN — one-shot forward migration healing an existing team split; run once, by hand' ;;
@@ -194,9 +195,9 @@ fi
 # 2b. The allowlist must not rot: an entry that has since been wired up is stale,
 #     and a stale exclusion is how a gate quietly stops gating.
 STALE=""
-for n in generate-changelog heimdall-banner-test heimdall-board heimdall-live-verify \
-         heimdall-queue-mcp heimdall-registry-hygiene heimdall-seed-demo-wall \
-         heimdall-team-converge; do
+for n in generate-changelog heimdall-banner-test heimdall-board heimdall-headroom-ab \
+         heimdall-live-verify heimdall-queue-mcp heimdall-registry-hygiene \
+         heimdall-seed-demo-wall heimdall-team-converge; do
   if [ -f "$ROOT/bin/$n" ] && [ "$(referenced_by "$ROOT" "$n")" != "0" ]; then
     STALE="$STALE $n"
   fi
