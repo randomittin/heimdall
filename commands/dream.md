@@ -85,19 +85,19 @@ Find the path any time with `heimdall-dream --repo . where`.
 ## Schedule it for off-hours (reuse the existing scheduler)
 
 `/dream` does not build its own scheduler — it rides the existing `/schedule` (cron
-cloud routine), `/routine`, or `/loop`:
+cloud routine) or `/loop`:
 
 ```bash
 # nightly at 03:00 via the cron cloud routine (survives session restarts):
 /schedule "/dream --overnight" --cron "0 3 * * *"
 
-# or via /routine:
-/routine "run /dream --overnight" --every 24h
+# or every 24h inside a live session:
+/loop 24h /dream --overnight
 ```
 
 ### Auto-background on THIS box (macOS launchd — no live session needed)
 
-`/schedule` and `/routine` are cloud routines. To run `/dream` automatically in the
+`/schedule` runs cloud routines, and `/loop` needs a live session. To run `/dream` automatically in the
 background on the local machine — nightly, with NO session open, surviving logout and
 reboot — use the platform-native scheduler (launchd) via `bin/heimdall-dream-schedule`.
 It registers a per-user LaunchAgent `com.heimdall.dream` (lives in

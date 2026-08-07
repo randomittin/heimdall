@@ -1,6 +1,6 @@
 ---
 name: maintain
-description: Run automated maintenance — seeker finds bugs from pod logs and raises GitHub issues, fixer picks them up and creates PRs. Can run as a one-shot or scheduled via /routine.
+description: Run automated maintenance — seeker finds bugs from pod logs and raises GitHub issues, fixer picks them up and creates PRs. Can run as a one-shot or scheduled via /schedule.
 ---
 
 # Maintain — Automated Bug Detection & Fix Pipeline
@@ -12,7 +12,7 @@ Two-phase maintenance: **seek** then **fix**.
 `/hmd:maintain` — run once (seek + fix)
 `/hmd:maintain seek` — only find bugs, raise issues
 `/hmd:maintain fix` — only fix existing issues
-`/hmd:maintain auto` — schedule recurring via /routine
+`/hmd:maintain auto` — schedule recurring via /schedule
 
 ## Connectors — GitHub issues are the DEFAULT trigger
 
@@ -58,12 +58,12 @@ Spawn a **fixer agent** to:
 
 Set up recurring maintenance:
 ```
-/routine "run /hmd:maintain" --every 6h
+/schedule "/hmd:maintain" --cron "0 */6 * * *"
 ```
 
-Or manually schedule:
+Or every 6h inside a live session:
 ```
-/schedule "/hmd:maintain" --cron "0 */6 * * *"
+/loop 6h /hmd:maintain
 ```
 
 This runs seeker first, waits for issues to be created, then runs fixer on the new + existing issues.
