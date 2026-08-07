@@ -226,6 +226,36 @@ if [ -f "$BIG" ]; then
   fi
 fi
 
+# ── (l) ROUTING: the brief must be reachable from the real spawn path ────────
+# This tool was built, documented, and then referenced from nowhere for months.
+# `test/bin-reachability-gate.test.sh` RULE B did not catch it, because
+# bin/heimdall-protocol names it — a dead chain that cites itself still counts
+# as "reachable". So the routing itself is gated here: the surfaces that
+# actually compose a spawn prompt must name the brief.
+routed_in() {
+  local f="$1"
+  [ -f "$ROOT/$f" ] || { bad "(l) routing target missing: $f"; return; }
+  if grep -q "heimdall-brief" "$ROOT/$f"; then
+    ok "(l) spawn path routes through the brief: $f"
+  else
+    bad "(l) UNROUTED: $f composes spawn context without naming heimdall-brief"
+  fi
+}
+routed_in "skills/heimdall/references/agent-templates.md"
+routed_in "agents/heimdall.md"
+routed_in "agents/wave-executor.md"
+
+# FALSIFIABILITY of the routing detector itself: strip the reference from a
+# throwaway copy and the same check must go dark. A grep that always says yes
+# is not a gate.
+cp "$ROOT/agents/wave-executor.md" "$WORK/unrouted.md"
+grep -v "heimdall-brief" "$WORK/unrouted.md" > "$WORK/unrouted.stripped" || true
+if grep -q "heimdall-brief" "$WORK/unrouted.stripped"; then
+  bad "(l) the routing detector cannot go dark — it is not evidence"
+else
+  ok "(l) FALSIFIABLE: strip the reference and the routing check goes dark"
+fi
+
 echo
 echo "  brief↔graph wiring tests: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

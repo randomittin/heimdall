@@ -603,7 +603,7 @@ When spawning an agent, provide:
    - Review agents: `pr-review-toolkit:review-pr`, `pr-review-toolkit:silent-failure-hunter`, `pr-review-toolkit:type-design-analyzer`
    - Test agents: `superpowers:test-driven-development`, `pr-review-toolkit:pr-test-analyzer`
    - Docs agents: `claude-md-management:claude-md-improver`
-3. **Context files**: which files to read (plan, context doc, source files)
+3. **Context**: a delta brief, built by `bin/heimdall-brief build --task <id> --spec <text> [--symbols a,b] [--files p,q] [--capsules x,y]` and pasted in — symbol spans + their callers + touched-file outlines + capsule closure, never the plan text. Exit 1 (INCOMPLETE) or 3 (NON_VERIFIED) means **do not spawn**. See `skills/heimdall/references/agent-templates.md`
 4. **Constraints**: what NOT to do (prevent overlap with other wave agents)
 5. **Acceptance criteria**: the specific checks this agent must pass before reporting done
 6. **State updates**: commands to run on completion (`heimdall-state set ...`)

@@ -2,6 +2,50 @@
 
 Templates for spawning each agent type with appropriate context.
 
+## Composing the `Context:` block — build a delta brief, never paste the plan
+
+Every template below has a `Context:` block. Build it with `bin/heimdall-brief`:
+
+```bash
+bin/heimdall-brief build \
+  --task <task-id> \
+  --spec "<one-line task spec>" \
+  --symbols <comma-list of symbols the task touches> \
+  --files   <comma-list of files the task edits> \
+  --capsules <prior-wave capsule ids> \
+  --invariants INVARIANTS.md
+```
+
+Paste its stdout in as the `Context:` block. Symbols resolve against the live
+symbol index (`bin/heimdall-graph`), so each one arrives as a real
+`file:line-range` plus the sites that call it, and each `--files` entry arrives
+as an outline of spans rather than a file body.
+
+**"Self-contained" means the agent needs no follow-up conversation. It does NOT
+mean restating the plan.** A brief is self-contained: spans say where to look,
+callers say what a change touches, capsules carry the decisions from prior
+waves. That is what the agent needs to act. The plan text is what the
+*orchestrator* needed in order to choose the task; re-sending it buys the agent
+nothing and is paid for on every request for the rest of that agent's life.
+
+Why this is the default: cost is `turns × context`, and context is the half that
+is not inherent. This repo measured 476 requests at 731K mean context costing
+$0.366/request against 153 requests at 118K costing $0.0593 — **6.17× cheaper
+with nothing skipped** (`docs/analysis/token-spend-forensics.md`). A fat spawn
+prompt pays that multiple again inside every subagent.
+
+**The exit code is a gate, not advice:**
+
+| exit | meaning | what you do |
+|---|---|---|
+| 0 | every ref resolved | spawn |
+| 1 | a ref is `<UNRESOLVED>` — brief is INCOMPLETE | **do not spawn.** Fix the ref or drop it |
+| 3 | resolver unreachable — NON_VERIFIED | **do not spawn.** Repair the index first |
+
+A thin brief is strictly worse than a fat one: the agent cannot tell that
+context is missing, so it works confidently from a gap and every downstream gate
+sees a green run. Never paste a brief that exited non-zero.
+
 ## Architect Agent
 
 ```
@@ -29,8 +73,9 @@ Scope:
 - [Files to create/modify]
 
 Context:
-- [Relevant existing files]
-- [Patterns to follow]
+- [paste `heimdall-brief build --task ... --symbols ... --files ...` output:
+   symbol spans + their callers + touched-file outlines + capsule closure]
+- [Patterns to follow, as file:line exemplars]
 - [Skills to apply]
 
 Constraints:

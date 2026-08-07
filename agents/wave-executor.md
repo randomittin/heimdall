@@ -40,6 +40,7 @@ Spawn up to **10 parallel Agent subprocesses** using `run_in_background: true`. 
 - Wave has ≤10 tasks? Spawn all in one turn.
 - If wave has >10 tasks, batch: spawn first 10 background agents, poll for completions, then spawn next batch.
 - Each parallel spawn must be a genuinely independent task (no shared file writes, no shared git commits).
+- Build each child's context with `bin/heimdall-brief build --task <id> --spec <text> --symbols <a,b> --files <p,q>` and paste its output — symbol spans, their callers, and touched-file outlines. Do NOT forward the plan file or your own conversation: the child pays for those bytes on every request it makes. If the brief exits 1 (INCOMPLETE) or 3 (NON_VERIFIED), fix the ref before spawning — never hand over a context gap the child cannot see.
 - Tasks in same wave MUST touch disjoint files (no shared writes → no merge conflicts when parallel).
 - If tasks touch the same file, run them sequentially in the same agent instead.
 
