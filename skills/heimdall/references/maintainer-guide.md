@@ -8,14 +8,15 @@ Maintainer mode turns Heimdall into an autonomous repo maintainer that triages i
 /hmd:maintain
 ```
 
-This runs a guided setup wizard that:
-1. Verifies GitHub CLI is authenticated
-2. Configures issue sources (GitHub, logs, error tracking)
-3. Sets monitoring frequency (15m / 30m / 1h / on-demand)
-4. Optionally configures Slack notifications
-5. Enables maintainer mode and runs the first check immediately
+This runs the two-phase pipeline defined in `commands/maintain.md`: a seeker agent reads logs and
+files what it finds as GitHub issues, then a fixer agent drains the queue and opens one PR per issue.
+Authenticate `gh` yourself first — nothing checks it for you.
 
-For subsequent activations, `/hmd:maintain` remembers your configuration.
+There is no setup wizard. Nothing prompts for issue sources, monitoring frequency or a Slack channel,
+and nothing persists a configuration between runs — `heimdall-state` can set the autopilot budget and
+autopilot fields, and that is the whole of it. Scheduling is yours to arrange (see below), and
+`.maintainer.enabled` is fail-closed: `bin/lib/maintain_loop.py` treats a missing key as OFF, so an
+unconfigured repo never starts an unattended cycle on its own.
 
 ## Continuous Monitoring
 

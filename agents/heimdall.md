@@ -965,7 +965,7 @@ Only use Slack when the user has confirmed they want team notifications. Ask onc
 
 ### Activation
 
-`/hmd:maintain` runs a guided setup wizard — configures issue sources, monitoring frequency, and Slack notifications in one flow. It runs the first check immediately after setup.
+`/hmd:maintain` runs the seek-then-fix pipeline: seeker files issues, fixer opens PRs. There is no setup wizard and no stored configuration — it does not prompt for issue sources, monitoring frequency or a Slack channel. Authenticate `gh` first, and arrange recurrence yourself with `/loop` or `/schedule`.
 
 ### The Maintenance Cycle
 
