@@ -597,12 +597,51 @@ def build_parser():
     return ap
 
 
+def _require_repo(repo):
+    """Reject a repo that is genuinely WRONG; tolerate one that is merely UNREADABLE.
+
+    `os.path.isdir` cannot tell those apart — it answers False both for a path that does
+    not exist and for one the OS refuses to stat — and under TCC the nightly job gets the
+    second for a repo that is perfectly healthy. That difference is not theoretical; it is
+    measured, and it inverts between the two denials:
+
+        chmod 000 dir    EACCES   os.path.isdir() == True   (stat needs only the PARENT)
+        TCC-denied dir   EPERM    os.path.isdir() == False  (the path itself is refused)
+
+    So this guard passed every test written against a mode-000 fixture while aborting the
+    real 03:00 run — one step AFTER heimdall-dream-runner had correctly decided to
+    continue — and blamed a repo that was fine. The distinction is drawn on the errno,
+    which is the only thing that actually carries it:
+
+      * stats fine and is a directory  -> proceed.
+      * PermissionError (EPERM/EACCES) -> proceed. This is the TCC case. dream reads its
+        state from $HEIMDALL_HOME, so an unreachable repo costs it nothing it needs; only
+        the mirror-back of the report into the repo is lost, and the next terminal session
+        (which holds the grant) copies it across.
+      * anything else (ENOENT, a file, a dead symlink) -> a genuine mistake: a typo, or a
+        plist pinned to a deleted tree. Still fatal, because nothing downstream can
+        recover from it and continuing would fabricate a report about nothing.
+
+    NARROWED, NOT DELETED. The unreachable case is handed to a run that is honest about
+    it: the runner records repo_reachable=no alongside the result, so a completed run is
+    never mistaken for evidence the grant landed.
+    """
+    try:
+        if os.path.isdir(repo):
+            return
+        os.stat(repo)
+    except PermissionError:
+        return
+    except OSError:
+        _die("repo not a directory: %s" % repo, 2)
+    _die("repo not a directory: %s" % repo, 2)
+
+
 def main(argv):
     ap = build_parser()
     args = ap.parse_args(argv)
     args.repo = os.path.abspath(args.repo)
-    if not os.path.isdir(args.repo):
-        _die("repo not a directory: %s" % args.repo, 2)
+    _require_repo(args.repo)
     return args.fn(args)
 
 
