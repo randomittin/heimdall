@@ -971,7 +971,7 @@ Only use Slack when the user has confirmed they want team notifications. Ask onc
 
 Each `/hmd:maintain-check` invocation runs one cycle:
 
-1. **Scan** — pull new issues from all configured sources (GitHub, logs, error tracking)
+1. **Scan** — pull open GitHub issues; `bin/heimdall-issue-queue` normalizes them into the queue the fixer drains. That is the one wired source. Logs reach the queue indirectly: a seeker agent reads them itself (kubectl, gcloud, docker, plain files) and files what it finds as GitHub issues. Nothing polls Sentry or Elastic, and no code reads `maintainer.log_paths` or `maintainer.error_tracking`.
 2. **Filter** — skip issues already tracked in `maintainer.pending_fixes`
 3. **Triage** — classify severity x confidence, route per the matrix:
 
@@ -986,7 +986,7 @@ Each `/hmd:maintain-check` invocation runs one cycle:
 
 4. **Fix** — spawn agents for each routed issue (coder, test-runner, lint-quality, reviewer)
 5. **Release** — when 3+ items in queue or oldest is >24h: batch into patch release with semver bump, changelog, and GitHub release
-6. **Communicate** — post summary to user / Slack channel
+6. **Communicate** — report the summary to the user. Posting it to Slack needs the `slack:*` skills to be installed; there is no Slack client in this repo and nothing reads `maintainer.slack_channel`.
 
 ### Continuous Monitoring
 
