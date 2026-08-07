@@ -220,8 +220,17 @@ for cols in (160, 200):
         "PANEL@%d: all 9 teammates accounted for — %d shown + %d in +N"
         % (cols, b["shown"], b["of"]))
 b200 = budgets(200)
-(ok if b200["shown"] == 9 and b200["of"] == 0 else bad)(
-    "PANEL@200: all 9 columns fit (%d shown, +%d) in %dc of team zone"
+# This assertion exists to prove the PANEL FLOOR is not what limits the wall at 200 cols.
+# It used to say so by checking all 9 columns fit. Since TEAM_MAX_SHOWN landed, 5 is the
+# ceiling however wide the terminal is, so "all 9 fit" is no longer a true statement about
+# a healthy layout — but the thing it was GUARDING still matters and is now stated directly:
+# at 200 the LEGIBILITY cap is what binds, not the floor. If the floor ever starts starving
+# the team zone, `shown` drops BELOW the cap and this goes red, which is the failure the
+# original check was built to catch. 5 is a literal on purpose — deriving it from
+# TEAM_MAX_SHOWN would let a raised cap re-derive its own expectation and stay green.
+(ok if b200["shown"] == 5 else bad)(
+    "PANEL@200: the wall is held at the cap of 5 by LEGIBILITY, not starved by the floor "
+    "(%d shown, +%d, %dc of team zone)"
     % (b200["shown"], b200["of"], b200["tw"]))
 
 # ── 4) THE FLOOR NEVER EATS THE WHOLE WALL ───────────────────────────────────────

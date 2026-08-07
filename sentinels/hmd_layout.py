@@ -280,10 +280,23 @@ ROWS_GAP = 2              # blank cells between the rows-zone and the team zone
 GAUGE_MIN_W = 24          # Spec v2 §2 — the Row2 gauge never shrinks below this
 GAUGE_MAX_W = 40          # Spec v2 §2 — the Row2 gauge never grows beyond this
 
+# The wall's LEGIBILITY ceiling, independent of how much room the terminal has. Width fit was
+# the only cap until now, so the wall grew with the screen: a 200-col terminal fit eleven 10c
+# columns and rendered eleven, turning the widest display in the room into the busiest one.
+# Past about five, near-identical 4c eye-strips stop reading as PEOPLE and start reading as
+# texture — the roster becomes a bar chart of itself. Five is a display bound, not a geometry
+# one, which is why it lives beside the geometry constants instead of being derived from them.
+#
+# It costs nobody: members past the cap fold into the SAME `+N` badge the width-fit path
+# already uses, so the count stays honest (21 members, cap 5 → `+16`) and no sigil is ever
+# sliced to fit. It is a CEILING, not a floor — a narrow terminal still shows fewer.
+TEAM_MAX_SHOWN = 5
+
 
 def team_zone_alloc(cols, n_members, overflow=0, sigil_w=8, sigil_gap=1,
                     member_w=TEAM_MEMBER_W, member_gap=TEAM_MEMBER_GAP,
-                    rows_gap=ROWS_GAP, gauge_min=GAUGE_MIN_W, content_floor=None):
+                    rows_gap=ROWS_GAP, gauge_min=GAUGE_MIN_W, content_floor=None,
+                    max_shown=TEAM_MAX_SHOWN):
     """Spec v2 §2 zone allocation — the ORDER SWAP that fixes the truncation bug.
 
     The team zone is reserved FIRST from the RIGHT edge (before the gauge is sized),
@@ -292,6 +305,12 @@ def team_zone_alloc(cols, n_members, overflow=0, sigil_w=8, sigil_gap=1,
     element in it (clamped 24–40c by the caller). Team members are packed greedily and
     CAPPED so the rows zone keeps at least `content_floor` cells; the first member that
     would breach that floor — and every one after it — folds into the `+N` overflow tag.
+
+    TWO CAPS, ONE BADGE. `max_shown` (TEAM_MAX_SHOWN) is the LEGIBILITY ceiling — the wall
+    never shows more than five columns however wide the terminal is — and the width fit is
+    the SPACE ceiling. Whichever binds first wins; both fold WHOLE members into the same
+    `+N`, so `shown + overflow_out` always equals `n_members + overflow` and nobody is ever
+    dropped silently or sliced in half.
 
     `content_floor` is what the rows the caller is about to build actually NEED (it
     measures them — see hmd-statusline.panel_floor); None keeps the historical `gauge_min`.
@@ -327,18 +346,25 @@ def team_zone_alloc(cols, n_members, overflow=0, sigil_w=8, sigil_gap=1,
     if team_budget < member_w:
         return inner, 0, 0, int(overflow) + n_members, 0   # not even one member fits → solo
 
+    # The LEGIBILITY cap is applied BEFORE the width walk, not after it: the members it folds
+    # away are already in `of` while the walk runs, so the `+N` tag the walk reserves room for
+    # is the FINAL badge width, not a narrower one it would later overflow.
+    cap = n_members if max_shown is None else min(n_members, max(0, int(max_shown)))
+    if cap <= 0:
+        return inner, 0, 0, int(overflow) + n_members, 0
+
     shown = 0
     used = 0
-    of = int(overflow)
-    for i in range(n_members):
+    of = int(overflow) + (n_members - cap)              # everyone past the cap → +N up front
+    for i in range(cap):
         piece = member_w + (member_gap if shown else 0)
-        rest = of + (n_members - i - 1)                 # members that would remain unshown
+        rest = of + (cap - i - 1)                       # members that would remain unshown
         tag_w = len(" +%d" % rest) if rest > 0 else 0   # reserve room for the eventual +N tag
         if used + piece + tag_w <= team_budget:
             shown += 1
             used += piece
         else:
-            of = of + (n_members - i)                   # drop this + all remaining → +N
+            of = of + (cap - i)                         # drop this + all remaining → +N
             break
     if shown == 0:
         return inner, 0, 0, of, 0
