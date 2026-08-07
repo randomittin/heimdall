@@ -26,7 +26,7 @@ Long orchestration sessions leak disk: finished subagents leave behind git workt
 
 Reap now: `bin/heimdall-reap-idle --apply`
 
-**Wired automatically:** SessionStart prints a one-line hint when merged worktrees are reapable; SessionEnd runs `heimdall-reap-idle --apply` (merged-only cleanup, never unmerged). In the **maintain cycle**, run `bin/heimdall-reap-idle --apply` at the top of each sweep so accumulated merged worktrees from prior fix/seek waves are reclaimed before new agents spawn.
+**Wired automatically:** SessionStart prints a one-line hint when merged worktrees are reapable. SessionEnd reaps them, but through a chain rather than directly — the hook calls `heimdall-cleanup --auto`, which runs `heimdall-gc`, which delegates worktree reaping to `heimdall-reap-idle --apply` (`bin/heimdall-gc:192-217`). The hook only calls `heimdall-reap-idle` itself as a last-resort fallback, when neither `heimdall-cleanup` nor `heimdall-gc` is present. Merged-only on every path: `heimdall-reap-idle` classifies from git with `merge-base --is-ancestor` and keeps unmerged work, always. In the **maintain cycle**, run `bin/heimdall-reap-idle --apply` at the top of each sweep so accumulated merged worktrees from prior fix/seek waves are reclaimed before new agents spawn.
 
 ## PARALLELISM IS MANDATORY — enforced at every level
 
