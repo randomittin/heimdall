@@ -41,7 +41,10 @@
 #                                    persistent holder when one is cheaply detectable. When the
 #                                    pressure is NOT heimdall (no hmd python leak) it SAYS SO, so
 #                                    the user is never left thinking hmd is the hog. Silent on a
-#                                    healthy machine. Honors the opt-out.
+#                                    healthy machine. Honors the opt-out. Emits ONE line (the
+#                                    SessionStart output budget); add --verbose for the full
+#                                    sixteen-line advisory. The DETECTION is identical either
+#                                    way — verbosity changes rendering, never what is found.
 #   heimdall-cleanup --deep          SUGGEST-only handoff to the mac-deep-clean skill for the
 #                                    heavier, confirm-gated disk cleanup. Reaps NOTHING itself.
 #   heimdall-cleanup --auto          the HOOK path (SessionStart/End). Runs gc (hmd disk) always;
@@ -104,7 +107,7 @@ PS_ROWS_FILE="${HMD_CLEANUP_PS_ROWS:-}"
 KILL_CMD="${HMD_CLEANUP_KILL_CMD:-}"
 
 # ── argv ─────────────────────────────────────────────────────────────────────────
-MODE="report"; JSON=0; QUIET=0; AUTO=0; QUICK=0; REPO=""
+MODE="report"; JSON=0; QUIET=0; AUTO=0; QUICK=0; REPO=""; VERBOSE=0
 while [ $# -gt 0 ]; do
   case "$1" in
     report)          MODE="report" ;;
@@ -113,6 +116,7 @@ while [ $# -gt 0 ]; do
     --deep|deep)     MODE="deep" ;;
     --auto)          MODE="apply"; AUTO=1; QUIET=1 ;;
     --quick)         QUICK=1 ;;
+    --verbose|-v)    VERBOSE=1 ;;
     --json)          JSON=1 ;;
     --quiet|-q)      QUIET=1 ;;
     --repo)          REPO="${2:-}"; shift ;;
@@ -344,6 +348,34 @@ _reboot_advisory() {
   return 0
 }
 
+# the ONE-LINE form of the same advisory, for the SessionStart hook.
+#
+# The full block above is sixteen lines and the machine paid for all of them at the top of
+# every session, to describe a condition that typically had not changed since the last one.
+# A hook gets one line unless it is actionable — so this keeps ONLY the parts that change a
+# decision and routes the explanation to `--advise --verbose`:
+#   · the MEASURED figures, so the claim is never bare;
+#   · the ATTRIBUTION, which is the whole reason this advisory exists — heimdall says out
+#     loud when the pressure is NOT its fault, and equally when part of it IS;
+#   · hmd's OWN remedy (`--apply`) whenever there is one to run, because that is the single
+#     case the machine can actually act on;
+#   · that a reboot is a TEMPORARY reclaim, so the terse form can never be read as endorsing
+#     the "restart is the fix" claim the full block exists to retract.
+# What it drops is explanation, not detection: every probe above still runs.
+_reboot_advisory_line() {
+  local orphans="$1" rss="$2" holders held=""
+  holders="$(_wired_holders 2>/dev/null || true)"
+  [ -n "$holders" ] && held=" a persistent holder IS visible from here —"
+  if [ "$orphans" -gt 0 ]; then
+    printf '[heimdall] memory pressure HIGH (swap %sG/%sG = %s%%, wired %s%%) — Part of it IS heimdall: %s orphaned hmd python holding ~%sMB (MEMORY axis). Reap hmd'\''s own leak FIRST: heimdall-cleanup --apply · a reboot is only a temporary reclaim ·%s detail: heimdall-cleanup --advise --verbose\n' \
+      "$swap_used_g" "$swap_total_g" "$swap_pct" "$wired_pct" "$orphans" "$rss" "$held"
+  else
+    printf '[heimdall] memory pressure HIGH (swap %sG/%sG = %s%%, wired %s%%) — NOT heimdall (no hmd python leak, ~%sMB MEMORY axis). Wired RAM is kernel-side: a reboot is only a temporary reclaim, removing the holder is the fix ·%s detail: heimdall-cleanup --advise --verbose\n' \
+      "$swap_used_g" "$swap_total_g" "$swap_pct" "$wired_pct" "$rss" "$held"
+  fi
+  return 0
+}
+
 # ── REPORT (read-only) ────────────────────────────────────────────────────────────
 do_report() {
   _ps_prime          # one ps snapshot shared by the orphan scope and the wired-holder probe
@@ -493,8 +525,15 @@ do_advise() {
   mb="$(_num "$(printf '%s' "$receipt" | _gc_mb)")"
   reclaim_mb=$(( (kb + 1023) / 1024 + mb ))
 
-  printf '[heimdall] system-health advisory:\n'
-  _reboot_advisory "$orphans" "$rss" "$reclaim_mb"
+  # ONE line by default (the SessionStart budget); the full block on --verbose. The gate
+  # above is identical either way — verbosity changes what is RENDERED, never what is
+  # DETECTED, so a machine under real pressure is reported in both modes.
+  if [ "$VERBOSE" = 1 ]; then
+    printf '[heimdall] system-health advisory:\n'
+    _reboot_advisory "$orphans" "$rss" "$reclaim_mb"
+    return 0
+  fi
+  _reboot_advisory_line "$orphans" "$rss"
   return 0
 }
 
