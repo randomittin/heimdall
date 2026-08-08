@@ -57,6 +57,7 @@ fi
 # ── A fake heimdall plugin repo carrying only what ship.sh's preflight needs ──
 make_fake_repo() {  # $1 = dest dir
   local d="$1" bare="$1.git"
+  [ -n "$d" ] || { echo "FATAL: dest dir path empty" >&2; exit 1; }
   mkdir -p "$d/release" "$d/bin" "$d/.claude-plugin"
   cp "$SHIP" "$d/release/ship.sh"
   cp "$SYNC" "$d/release/sync-release.sh"
@@ -71,6 +72,7 @@ make_fake_repo() {  # $1 = dest dir
   git -C "$d" add -A
   git -C "$d" commit -q -m "initial fake plugin"
   git -C "$d" branch -M main
+  [ -n "$bare" ] || { echo "FATAL: bare path empty" >&2; exit 1; }
   git init -q --bare "$bare"
   git -C "$d" remote add origin "$bare"
   git -C "$d" push -q -u origin main
