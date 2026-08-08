@@ -13,11 +13,60 @@
 # Run it before trusting the script green; this is the gate RJ specified.
 set -euo pipefail
 
+# ── HERMETIC GIT ENV GUARD ──────────────────────────────────────────────────
+# This gate runs as a pre-commit gate, and git EXPORTS its own repo location into
+# every hook it runs (GIT_DIR, GIT_INDEX_FILE, and friends). Those variables beat
+# directory-based discovery, so without this block the throwaway fixture repos
+# below do not resolve to their temp dir — they resolve to THE CALLING REPO. Two
+# things follow, both observed on the live repo:
+#   - `git init` re-initialises the caller (this is how core.bare got flipped),
+#     `git config` rewrites the caller's identity, and the fixture commits land
+#     on the caller's branch;
+#   - the oracle then grades the caller's history instead of its own fixture and
+#     fails on a clean tree — a false RED, which teaches every agent to reach for
+#     HMD_SKIP=1 and dissolves the gate discipline this repo exists to hold.
+# So: neutralise every variable git can inject before touching git at all.
+# GIT_EXEC_PATH is preserved deliberately — it is the one GIT_* variable git
+# itself needs, to locate its own helper binaries.
+# Falsifiability: test/oracle-hermeticity.test.sh strips the block between these
+# two sentinels and asserts the gate goes RED. Keep the sentinels intact.
+unset GIT_DIR GIT_INDEX_FILE GIT_WORK_TREE GIT_OBJECT_DIRECTORY GIT_COMMON_DIR \
+      GIT_NAMESPACE GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_PREFIX \
+      GIT_CONFIG GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM GIT_CONFIG_COUNT \
+      GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_AUTHOR_DATE \
+      GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL GIT_COMMITTER_DATE \
+      GIT_INDEX_VERSION GIT_QUARANTINE_PATH GIT_REFLOG_ACTION GIT_EDITOR \
+      GIT_CEILING_DIRECTORIES GIT_DISCOVERY_ACROSS_FILESYSTEM
+# Sweep whatever else is present (GIT_CONFIG_KEY_0/GIT_CONFIG_VALUE_0, GIT_TRACE*
+# — which would also break the empty-stderr assertion — and any variable a future
+# git adds). The explicit list above documents intent; this makes it exhaustive.
+for _gv in $(env | sed -n 's/^\(GIT_[A-Za-z0-9_]*\)=.*/\1/p'); do
+  [ "$_gv" = "GIT_EXEC_PATH" ] || unset "$_gv" 2>/dev/null || true
+done
+unset _gv
+export GIT_CONFIG_NOSYSTEM=1   # ignore /etc/gitconfig
+export GIT_TERMINAL_PROMPT=0   # never block waiting on a credential prompt
+# ── END HERMETIC GIT ENV GUARD ──────────────────────────────────────────────
+
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLUGIN_DIR="$(cd "$DIR/../../.." && pwd)"
 SCRIPT="${GENERATE_CHANGELOG:-$PLUGIN_DIR/bin/generate-changelog}"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
+
+# Second line of defence, now that there is a temp dir to pin to. Clearing the
+# environment stops git from being POINTED at another repo; this stops it from
+# WANDERING into one. If a fixture ever loses its .git, discovery walks upward —
+# the ceiling makes it stop inside $TMP and fail loudly instead of silently
+# adopting whatever repo happens to contain the temp dir. Redirecting HOME/XDG
+# keeps the caller's ~/.gitconfig (core.hooksPath, commit.gpgsign, includeIf)
+# out of the fixtures, so the gate grades the candidate and not the machine.
+TMP_PHYS="$(cd "$TMP" && pwd -P)"
+export GIT_CEILING_DIRECTORIES="$TMP_PHYS:$TMP"
+export HOME="$TMP/home"
+export XDG_CONFIG_HOME="$TMP/home/.config"
+NO_HOOKS="$TMP/no-hooks"
+mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$NO_HOOKS"
 
 pass=0; fail=0
 ok()  { printf '  PASS: %s\n' "$1"; pass=$(( pass + 1 )); }
@@ -32,6 +81,11 @@ mkdir -p "$FIX"
   git init -q
   git config user.email test@heimdall.dev
   git config user.name test
+  # Point hooks at an empty dir: a fixture commit must never run the caller's
+  # gates (a refusing pre-commit hook is what turns an escape into a hard abort),
+  # and must never wait on a signing key the grading machine may or may not have.
+  git config core.hooksPath "$NO_HOOKS"
+  git config commit.gpgsign false
   # Root commit is a no-op anchor: generate-changelog uses SINCE..HEAD, which
   # EXCLUDES SINCE itself, so the anchor must not be a real changelog entry.
   git commit -q --allow-empty -m "init"
@@ -51,6 +105,19 @@ mkdir -p "$FIX"
     git commit -q --allow-empty -m "$subj"
   done
 ) >/dev/null 2>&1
+# Hard precondition: the fixture must resolve to ITSELF. Reaching here with a
+# git-dir outside $TMP means the environment defeated the guard above, so abort
+# loudly instead of grading — or worse, writing to — somebody else's repo.
+FIX_GITDIR="$(cd "$FIX" && git rev-parse --absolute-git-dir)"
+case "$FIX_GITDIR" in
+  "$TMP_PHYS"/*|"$TMP"/*) : ;;
+  *)
+    printf 'run.test.sh: fixture repo escaped its temp dir (git-dir=%s, expected under %s)\n' \
+      "$FIX_GITDIR" "$TMP_PHYS" >&2
+    exit 2
+    ;;
+esac
+
 FIRST=$(cd "$FIX" && git rev-list --max-parents=0 HEAD)
 
 echo "[1] bin/generate-changelog parses (bash -n) and is non-empty"
