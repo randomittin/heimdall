@@ -84,6 +84,48 @@ done
 [ -n "$REPO" ]  || die "--repo is required"
 [ ${#FORWARD[@]} -gt 0 ] || FORWARD=(run --overnight)
 
+# ── the liveness receipt (bin/heimdall-liveness) ──────────────────────────────────
+# dream is the subsystem whose 26-day silence motivated the receipt, so its writer has to
+# survive the EXACT denial it exists to report. The repo copy is unreadable under TCC —
+# the same denial that hid the outage — so the STAGED copy beside this runner is tried
+# FIRST (heimdall-dream-schedule stages it next to the runner, for this reason) and the
+# repo is only the fallback for a checkout that was never installed. A receipt writer that
+# can only run when nothing is wrong is the silence in a new costume.
+LIVENESS="${HMD_LIVENESS_BIN:-}"
+if [ -z "$LIVENESS" ]; then
+  for cand in "$(dirname "$SELF")/heimdall-liveness" "$REPO/bin/heimdall-liveness"; do
+    if [ -x "$cand" ]; then LIVENESS="$cand"; break; fi
+  done
+fi
+
+# receipt <attempt|complete> [reached: yes|no] [detail]
+#
+# COMPLETION IS NOT REACHABILITY. dream's subject is THE REPO IT ANALYSES, so `reached`
+# tracks whether this run demonstrably read that repo — never whether the process exited
+# 0. That distinction is the whole bug: for 26 nights this job completed while TCC denied
+# it the repo, and "completed" was read as "worked".
+#
+# --subject is the repo PATH, so heimdall-liveness re-probes it in THIS process (the same
+# sandbox launchd hands us) and can only ever downgrade a `yes` it contradicts.
+#
+# Never fatal: a nightly job must not die because its own bookkeeping did.
+receipt() {
+  local mode="$1" reached="${2:-}" detail="${3:-}"
+  [ -n "$LIVENESS" ] && [ -x "$LIVENESS" ] || return 0
+  if [ -n "$reached" ]; then
+    "$LIVENESS" "$mode" --subsystem dream --subject "$REPO" \
+      --reached "$reached" --detail "$detail" >/dev/null 2>&1 || true
+  else
+    "$LIVENESS" "$mode" --subsystem dream --subject "$REPO" \
+      --detail "$detail" >/dev/null 2>&1 || true
+  fi
+  return 0
+}
+
+# Recorded BEFORE the probes, so a runner killed mid-night (the case a completion-only
+# receipt cannot see at all) reads attempted-never-completed rather than vanishing.
+receipt attempt "" "scheduled run started"
+
 # ── JSON emission without jq ──────────────────────────────────────────────────────
 # The launchd PATH is /usr/bin:/bin:/usr/sbin:/sbin — jq is NOT on it, and a status
 # writer that depends on a tool the scheduled context lacks would fail exactly when it
@@ -271,6 +313,9 @@ fi
 
 if [ "$PYTHON_BLOCKED" = 1 ]; then
   write_status blocked python-unusable "$PYTHON" "$PYTHON_ERR" 75
+  # The run ENDED here, so it completed — and dream never started, so it read nothing of
+  # the repo. Both facts, separately: that is the receipt's entire point.
+  receipt complete no "blocked: python-unusable ($PYTHON_ERR)"
   echo "=============================================================================="
   echo "heimdall dream BLOCKED — $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "  the nightly dream did NOT run. No report was written."
@@ -287,6 +332,7 @@ fi
 if [ "$BLOCKED" = 1 ]; then
   REASON="$(classify "$PROBE_ERR")"
   write_status blocked "$REASON" "$PROBE_PATH" "$PROBE_ERR" 75
+  receipt complete no "blocked: $REASON ($PROBE_PATH)"
   # SHOUT into the log. This is the last thing the scheduled context can do, and it is
   # the difference between "twelve error lines nobody reads" and a diagnosis.
   echo "=============================================================================="
@@ -338,5 +384,20 @@ if [ "$RC" = 0 ]; then
 else
   write_status error dream-failed "" "dream exited $RC" "$RC"
   echo "heimdall dream FAILED — $DREAM exited $RC. Recorded at $STATUS." >&2
+fi
+
+# THE RECEIPT, AND THE DISTINCTION THAT WAS MISSING FOR 26 NIGHTS.
+#
+# `ok` above and `reached` here are DELIBERATELY not the same verdict. exit 0 with an
+# unreadable repo is a real success for this runner (dream's state moved to $HEIMDALL_HOME,
+# so the report still lands) and it is EXACTLY what read as health while the analysis had
+# no repo to read. So the receipt records reached=yes only when dream both ran AND had the
+# repo — anything less cannot vouch for a subject it never touched.
+if [ "$RC" = 0 ] && [ "$REPO_REACHABLE" = yes ]; then
+  receipt complete yes "dream analysed $REPO"
+elif [ "$RC" = 0 ]; then
+  receipt complete no "completed without the repo ($REPO_DENIED: $REPO_ERR)"
+else
+  receipt complete no "dream exited $RC"
 fi
 exit "$RC"

@@ -52,6 +52,36 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# ── the liveness receipt (bin/heimdall-liveness) ──────────────────────────────────
+# COMPLETION IS NOT REACHABILITY. This job's subject is THE GCP RATE CONSTANTS, and it is
+# the WEAKEST-PROBED of the seven declared subsystems — deliberately, and this is the
+# honest reason: nothing in the tree FETCHES published GCP prices. cp_cost_model owns them
+# as env-overridable in-process constants, so "reached" can only mean the run genuinely
+# EVALUATED that rate table, not that the table still matches Google's published list.
+#
+# That is still a real, falsifiable probe rather than a restatement of exit 0: an empty or
+# unparseable --concurrent produces ZERO modelled rows and exits 0 having touched no rate
+# at all. Such a run records reached=no, because a table it never evaluated is a table it
+# cannot vouch for. Inventing a rate-fetch to strengthen this would be fiction, so the
+# receipt states exactly what it can prove and nothing more.
+LIVENESS="${HMD_LIVENESS_BIN:-$BIN_DIR/heimdall-liveness}"
+LIVENESS_SUBJECT="the GCP rate constants"
+
+receipt() { # <attempt|complete> [reached: yes|no] [detail] — never fatal, never noisy
+  local mode="$1" reached="${2:-}" detail="${3:-}"
+  [ -x "$LIVENESS" ] || return 0
+  if [ -n "$reached" ]; then
+    "$LIVENESS" "$mode" --subsystem cost-model-refresh --subject "$LIVENESS_SUBJECT" \
+      --reached "$reached" --detail "$detail" >/dev/null 2>&1 || true
+  else
+    "$LIVENESS" "$mode" --subsystem cost-model-refresh --subject "$LIVENESS_SUBJECT" \
+      --detail "$detail" >/dev/null 2>&1 || true
+  fi
+  return 0
+}
+
+receipt attempt "" "weekly model re-validation started"
+
 LIB_DIR="$LIB_DIR" CONCURRENT="$CONCURRENT" ACTIVE_HOURS="$ACTIVE_HOURS" BEAT="$BEAT" \
 REFRESH="$REFRESH" ROSTER="$ROSTER" JSON="$JSON" "$PY" - <<'PYEOF'
 import json
@@ -103,4 +133,21 @@ else:
         print("  %-10d $%-13.2f $%-15.2f %.1f%%"
               % (r["concurrent"], r["daily_usd"], r["projected_month_usd"], r["pct_of_budget"]))
     print("fixed floor (gated always-on instance): $%.2f/mo" % cp_cost_model.fixed_floor_usd())
+
+# THE REACHABILITY CHANNEL for the receipt block in the shell above. 10 means the run
+# COMPLETED without modelling a single row, so the rate table was never evaluated. The
+# shell remaps it to 0 — an empty --concurrent has always been a clean no-op, and that
+# stays true; only the receipt learns the difference.
+if not rows:
+    sys.exit(10)
 PYEOF
+JOB_RC=$?
+
+case "$JOB_RC" in
+  0)  receipt complete yes "evaluated the rate table over concurrency: $CONCURRENT" ;;
+  10) receipt complete no "no rows modelled — the rate table was never evaluated"
+      JOB_RC=0 ;;
+  *)  receipt complete no "model re-validation failed (exit $JOB_RC)" ;;
+esac
+
+exit "$JOB_RC"

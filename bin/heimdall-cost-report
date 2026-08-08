@@ -60,6 +60,36 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# ── the liveness receipt (bin/heimdall-liveness) ──────────────────────────────────
+# COMPLETION IS NOT REACHABILITY. This job's subject is THE BIGQUERY BILLING EXPORT —
+# yesterday's ACTUAL infra spend. It is a GCP resource, not a path, so heimdall-liveness
+# cannot probe it and the verdict has to come from the run itself: cp_costjob reports
+# source=actual_billing only when --daily-usd carried real export figures.
+#
+# A run that MODELLED the spend from op counts completed perfectly and never touched the
+# export. It records reached=no, because a projection cannot vouch for a billing export it
+# never read — and a daily cost brake that silently modelled for weeks while the export
+# was broken is the 26-day dream silence with a budget attached.
+LIVENESS="${HMD_LIVENESS_BIN:-$BIN_DIR/heimdall-liveness}"
+LIVENESS_SUBJECT="the BigQuery billing export"
+
+receipt() { # <attempt|complete> [reached: yes|no] [detail] — never fatal, never noisy
+  local mode="$1" reached="${2:-}" detail="${3:-}"
+  [ -x "$LIVENESS" ] || return 0
+  if [ -n "$reached" ]; then
+    "$LIVENESS" "$mode" --subsystem cost-report --subject "$LIVENESS_SUBJECT" \
+      --reached "$reached" --detail "$detail" >/dev/null 2>&1 || true
+  else
+    "$LIVENESS" "$mode" --subsystem cost-report --subject "$LIVENESS_SUBJECT" \
+      --detail "$detail" >/dev/null 2>&1 || true
+  fi
+  return 0
+}
+
+# Before the run, so a job killed mid-query reads attempted-never-completed rather than
+# leaving no trace at all.
+receipt attempt "" "daily cost job started"
+
 LIB_DIR="$LIB_DIR" DAILY_USD="$DAILY_USD" READS="$READS" WRITES="$WRITES" \
 REQUESTS="$REQUESTS" DAU="$DAU" HOME_DIR="$HOME_DIR" SET_LADDER="$SET_LADDER" \
 NOTIFY="$NOTIFY" JSON="$JSON" "$PY" - <<'PYEOF'
@@ -113,4 +143,21 @@ else:
         print("  OWNER ALERT      : fired -> %d owner(s)" % result["owners_alerted"])
     if result["kill_switch_armed"]:
         print("  KILL SWITCH      : ARMED (hard cap reached — verify the GCP budget object)")
+
+# THE REACHABILITY CHANNEL for the receipt block in the shell above. 10 means the run
+# COMPLETED but MODELLED the spend from op counts, so the BigQuery billing export was never
+# read. The shell remaps it to 0, so the documented contract — "exit 0 on a completed run"
+# — is unchanged for every caller; only the receipt learns the difference.
+if result["source"] != "actual_billing":
+    sys.exit(10)
 PYEOF
+JOB_RC=$?
+
+case "$JOB_RC" in
+  0)  receipt complete yes "read the billing export (source=actual_billing)" ;;
+  10) receipt complete no "modelled from op counts — the billing export was never read"
+      JOB_RC=0 ;;
+  *)  receipt complete no "daily cost job failed (exit $JOB_RC)" ;;
+esac
+
+exit "$JOB_RC"

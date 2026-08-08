@@ -60,6 +60,11 @@ present_in()   { local n="$1"; shift; have "$@" || return 1; grep -q  -- "$n" "$
 [ -f "$GEN" ] || { echo "FATAL: $GEN not found"; exit 2; }
 
 WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
+
+# Hermetic home: weekly-log writes a liveness receipt, and this suite runs it over a
+# throwaway fixture repo. Unredirected, a test run would stamp the real
+# ~/.heimdall/liveness/weekly-log.json for a repo that is not this one.
+export HEIMDALL_HOME="$WORK/home"
 REPO="$WORK/fixture"
 OUT="$WORK/out"
 WIN='--since=2026-07-01 --until=2026-08-31'

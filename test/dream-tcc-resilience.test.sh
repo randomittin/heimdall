@@ -60,6 +60,14 @@ WORK="$(mktemp -d -t "dream-tcc-test.$(printf 'X%.0s' 1 2 3 4 5 6)")"
 cleanup() { chmod -R u+rwx "$WORK" 2>/dev/null || true; rm -rf "$WORK"; }
 trap cleanup EXIT
 
+# Hermetic home for the cases that do NOT set one per-invocation — case (1) especially.
+# Case (1) is the SUCCESS path, so unredirected it stamps the real
+# ~/.heimdall/liveness/dream.json with reached=yes for $WORK/okrepo. On this machine
+# dream has been TCC-blocked for 27 days, so that receipt would report the dead
+# subsystem as alive — the exact bug the receipt exists to catch, forged by its own test.
+# Per-invocation HEIMDALL_HOME assignments below still override this.
+export HEIMDALL_HOME="$WORK/home"
+
 # dream dates its reports in UTC (time.gmtime), so every date in this suite is UTC.
 TODAY="$(date -u +%Y-%m-%d)"
 

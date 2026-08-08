@@ -122,6 +122,13 @@ RUNNER_SRC="$BINDIR/heimdall-dream-runner"
 RUNNER_DIR="$HEIMDALL_HOME/bin"
 RUNNER="$RUNNER_DIR/heimdall-dream-runner"
 
+# The liveness receipt writer is staged beside the runner for the SAME reason the runner
+# is staged at all: it must be reachable on the night the repo is not. Left in the repo it
+# could only record a receipt when nothing was wrong, which is precisely the failure mode
+# the receipt exists to end.
+LIVENESS_SRC="$BINDIR/heimdall-liveness"
+LIVENESS="$RUNNER_DIR/heimdall-liveness"
+
 usage() { sed -n '2,40p' "$SELF" | sed 's/^# \{0,1\}//'; }
 die()   { echo "error: $*" >&2; exit 3; }
 
@@ -418,6 +425,31 @@ install_runner() {
   # program that launchd executes nightly. 0755 is the tree's convention for a bin; the
   # 0700 directory above is what actually keeps it out of anyone else's reach.
   chmod 0755 "$RUNNER" || die "cannot set mode 0755 on $RUNNER"
+  install_liveness
+}
+
+# STAGED, NOT REQUIRED. The nightly report is the product; the receipt is how we learn the
+# report stopped arriving. So a tree without heimdall-liveness still installs a working
+# schedule — but it says so on stderr rather than leaving the operator to assume the
+# receipt is being written. Same copy-not-symlink rule as the runner: a link would resolve
+# back into the protected tree at 03:00 and be denied exactly when it is needed.
+install_liveness() {
+  if [ ! -f "$LIVENESS_SRC" ]; then
+    echo "warning: heimdall-liveness missing at $LIVENESS_SRC — the nightly job will run," >&2
+    echo "         but it cannot write a liveness receipt, so a future silence would not" >&2
+    echo "         be reported. Re-install from a complete checkout to restore it." >&2
+    return 0
+  fi
+  if ! same_physical_file "$LIVENESS_SRC" "$LIVENESS"; then
+    if ! cp "$LIVENESS_SRC" "$LIVENESS"; then
+      echo "warning: cannot stage heimdall-liveness at $LIVENESS — the nightly job will" >&2
+      echo "         run, but its liveness receipt will not be written from launchd." >&2
+      return 0
+    fi
+  fi
+  chmod 0755 "$LIVENESS" 2>/dev/null \
+    || echo "warning: cannot set mode 0755 on $LIVENESS — receipt writes may fail." >&2
+  return 0
 }
 
 # ── emit the plist (the single source of the scheduled argv) ─────────────────────
@@ -634,6 +666,12 @@ cmd_uninstall() {
   if [ -e "$RUNNER" ] && type heimdall_absolute_physical >/dev/null 2>&1 \
      && ! same_physical_file "$RUNNER_SRC" "$RUNNER"; then
     rm -f "$RUNNER" 2>/dev/null || true
+  fi
+  # Same rule for the staged receipt writer: reclaim OUR copy, never amputate the
+  # installation's own file when the plugin tree and $HEIMDALL_HOME are one path.
+  if [ -e "$LIVENESS" ] && type heimdall_absolute_physical >/dev/null 2>&1 \
+     && ! same_physical_file "$LIVENESS_SRC" "$LIVENESS"; then
+    rm -f "$LIVENESS" 2>/dev/null || true
   fi
   # Reversibility extends to the ask: uninstall drops the marker recording that the
   # first-run permission block was shown, so a later re-install asks again from scratch.
