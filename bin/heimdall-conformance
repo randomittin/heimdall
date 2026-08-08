@@ -1,0 +1,422 @@
+#!/usr/bin/env bash
+#
+# heimdall-conformance — EXECUTABLE CHECKS FOR THE RULES WE ALREADY WROTE DOWN.
+#
+# WHY THIS FILE EXISTS
+# --------------------
+# In this repo a rule without a falsifier is a comment. Three exhibits from a
+# single session, all the same class:
+#
+#   * the token-frugal brief was built in June and wired to nothing for two
+#     months — every spawn kept pasting the plan, and nothing noticed
+#   * a fail-open ⚠ observation sat known-and-unfixed for three days
+#   * checkpoints silently dropped fields, with no self-check to say so
+#
+# None of those were unknown. All three were WRITTEN DOWN as rules. What was
+# missing in every case was a thing that goes RED. So this binary turns the
+# protocol rules that CAN be checked mechanically into checks, and the honesty
+# rule (from the frugal brief itself) covers the rest:
+#
+#     "a protocol that can't be checked gets a line saying so rather than
+#      silent exemption."
+#
+# `inventory` is that line. It enumerates EVERY normative rule in the source
+# documents and gives each one a verdict — CHECKED (naming the suite that
+# enforces it) or UNCHECKABLE (stating why). A rule may never be simply absent.
+#
+# THE CHECKS
+#   commit-per-unit   an ABANDONED dirty agent worktree = work that was never
+#                     committed. A LIVE one is an agent mid-keystroke and is
+#                     never a violation.
+#   brief-routing     every doc that instructs an Agent spawn must route the
+#                     child's context through `heimdall-brief`, never the plan.
+#   gate-runs-once    two full-gate runs with no edit between them is pure
+#                     waste (the full gate costs ~1374s).
+#   gates-at-end      the first full-gate run of a session must come AFTER some
+#                     work. Gating an unchanged tree proves nothing.
+#
+# FAIL-CLOSED, ALWAYS
+# Repo rule: "gates must fail closed: an unreachable verifier is NON_VERIFIED,
+# never OPEN; an empty scan fails loudly, never passes". Every check here exits
+# 3 when it found nothing to inspect. A check that scans zero units and reports
+# "clean" is how a green-but-blind gate is born, and this file is the direct
+# response to three of those.
+#
+# EXITS
+#   0  conformant — real units inspected, no violations
+#   1  violation(s) found
+#   2  usage error / missing dependency
+#   3  NON_VERIFIED — nothing to inspect, or a source could not be read
+#
+# THIS TOOL NEVER MUTATES ANYTHING. commit-per-unit REPORTS dirty worktrees; it
+# does not clean them. Several agent worktrees are live agent-memory homes and
+# deleting one destroys work in flight.
+#
+# ENV (all scan roots are overridable so the suites can drive real fixtures)
+#   HMD_CONF_REPO         repo root to scan            (default: this bin's ..)
+#   HMD_CONF_WORKTREES    agent worktree dir           (default: $REPO/.claude/worktrees)
+#   HMD_CONF_TRANSCRIPT   session transcript .jsonl    (default: newest for this repo)
+#   HMD_CONF_UNDER_GATE   force the run-all self-check on(1)/off(0)
+#   plus every knob of bin/lib/session-liveness.sh (HMD_AGENT_*, HMD_NOW)
+
+set -uo pipefail
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Resolve to the MAIN checkout, not whatever worktree we were launched from.
+# Agent worktrees live under the main tree's .claude/worktrees, and the Claude
+# session transcript is keyed to the main tree's path — so a run from inside an
+# agent worktree must still inspect the project, or every check would report
+# NON_VERIFIED for the exact agents it is meant to police.
+_main_worktree() {
+  local here="$1" gd cd_
+  gd="$(git -C "$here" rev-parse --git-dir 2>/dev/null)" || { printf '%s' "$here"; return 0; }
+  cd_="$(git -C "$here" rev-parse --git-common-dir 2>/dev/null)" || { printf '%s' "$here"; return 0; }
+  if [ "$gd" = "$cd_" ]; then
+    git -C "$here" rev-parse --show-toplevel 2>/dev/null || printf '%s' "$here"
+  else
+    # A linked worktree: the common dir is the main checkout's .git
+    ( cd "$here" && cd "$(dirname "$cd_")" && pwd )
+  fi
+}
+REPO="${HMD_CONF_REPO:-$(_main_worktree "$(cd "$SELF_DIR/.." && pwd)")}"
+
+# Liveness is SHARED, never re-derived here. bin/heimdall-agents answers the
+# same "is this session alive?" question for reaping, and two copies of that
+# answer would drift — the exact failure PROTOCOL.md cites brief-core.sh for.
+# shellcheck source=lib/session-liveness.sh
+. "$SELF_DIR/lib/session-liveness.sh"
+
+command -v jq >/dev/null 2>&1 || { printf 'heimdall-conformance: jq is required\n' >&2; exit 2; }
+
+WORKTREES="${HMD_CONF_WORKTREES:-$REPO/.claude/worktrees}"
+
+# ── output helpers ────────────────────────────────────────────────────────────
+VIOLATIONS=0
+viol() { printf 'VIOLATION\t%s\n' "$1"; VIOLATIONS=$((VIOLATIONS + 1)); }
+okline() { printf 'OK\t%s\n' "$1"; }
+note() { printf 'NOTE\t%s\n' "$1"; }
+nonverified() { printf 'NON_VERIFIED\t%s\n' "$1" >&2; exit 3; }
+
+# ═════════════════════════════════════════════════════════════════════════════
+# CHECK 1 — agents-commit-per-unit
+# ═════════════════════════════════════════════════════════════════════════════
+# CLAUDE.md: "Each completed task = one atomic git commit."
+# .planning/conventions.md R3: "Worktree agents must commit in-worktree;
+# uncommitted files are destroyed on cleanup."
+#
+# The whole difficulty is telling an ABANDONED worktree from a BUSY one. An
+# agent that is still typing has uncommitted files by definition and flagging
+# it is a false accusation — and a check that cries wolf gets muted, which is
+# how gates die. So liveness decides, and liveness fails toward ALIVE.
+check_commit_per_unit() {
+  [ -d "$WORKTREES" ] || nonverified "commit-per-unit: no worktree root at $WORKTREES"
+
+  local d id dirty live total=0 inspected=0 t age now
+  now="$(hmd_live_now)"
+
+  for d in "$WORKTREES"/agent-*; do
+    [ -d "$d" ] || continue
+    total=$((total + 1))
+    # A directory that is not a git worktree is not evidence about commits.
+    git -C "$d" rev-parse --git-dir >/dev/null 2>&1 || continue
+    inspected=$((inspected + 1))
+
+    id="$(basename "$d")"; id="${id#agent-}"
+    dirty="$(git -C "$d" status --porcelain 2>/dev/null | grep -c '[^[:space:]]')"
+    [ "${dirty:-0}" -gt 0 ] || continue
+
+    t="$(hmd_subagent_transcript "$id")"
+    if [ -n "$t" ]; then
+      age=$(( ( now - $(hmd_live_mtime "$t") ) / 60 ))
+    else
+      age=-1
+    fi
+
+    if hmd_subagent_is_alive "$id"; then
+      okline "live agent mid-work, not a violation	$id	dirty=$dirty	idle_min=$age"
+    else
+      viol "uncommitted work in an abandoned worktree	$id	dirty=$dirty	idle_min=$age"
+    fi
+  done
+
+  # ANTI-VACUOUS. Zero worktrees inspected means this run proved nothing about
+  # commit discipline. Reporting "clean" there is the vacuous green we are here
+  # to prevent, so it is NON_VERIFIED instead.
+  [ "$inspected" -gt 0 ] || nonverified "commit-per-unit: 0 git worktrees under $WORKTREES ($total dir(s) seen) — nothing inspected"
+  note "commit-per-unit inspected $inspected worktree(s)"
+}
+
+# ═════════════════════════════════════════════════════════════════════════════
+# CHECK 2 — spawns-route-through-the-frugal-brief
+# ═════════════════════════════════════════════════════════════════════════════
+# PROTOCOL.md: a spawned agent's brief is "task spec + referenced symbol
+# entries + hydrated capsule closure + an invariants ref" and NEVER "the plan,
+# prior conversation, or restated criteria".
+#
+# The set of spawn-instruction docs is DISCOVERED, not listed. A hardcoded list
+# is exactly how the brief stayed unwired for two months: three files named it,
+# the check passed, and every other spawn path was invisible to the check. Any
+# file that teaches an Agent spawn must also teach the brief, or it is a spawn
+# path that bypasses the brief and this goes RED.
+BRIEF_SPAWN_MARK='subagent_type'
+BRIEF_MARK='heimdall-brief'
+check_brief_routing() {
+  local scanroots="agents skills commands" f n hits=0 root
+  local found=0
+
+  for root in $scanroots; do
+    [ -d "$REPO/$root" ] || continue
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      found=$((found + 1))
+      n="$(grep -c "$BRIEF_MARK" "$REPO/$f" 2>/dev/null)"
+      if [ "${n:-0}" -gt 0 ]; then
+        okline "spawn doc routes through the brief	$f	refs=$n"
+      else
+        viol "spawn doc bypasses the frugal brief	$f	refs=0"
+        hits=$((hits + 1))
+      fi
+    done <<EOF
+$(cd "$REPO" && grep -rl "$BRIEF_SPAWN_MARK" "$root" 2>/dev/null | sort)
+EOF
+  done
+
+  # ANTI-VACUOUS. Finding zero spawn-instruction docs in a repo whose whole
+  # orchestration model is spawning means the detector broke, not that the repo
+  # became clean.
+  [ "$found" -gt 0 ] || nonverified "brief-routing: 0 spawn-instruction docs matched '$BRIEF_SPAWN_MARK' under $REPO — detector is blind"
+  note "brief-routing inspected $found spawn-instruction doc(s)"
+}
+
+# ═════════════════════════════════════════════════════════════════════════════
+# THE SESSION TRANSCRIPT CLASSIFIER  (shared by checks 3 and 4)
+# ═════════════════════════════════════════════════════════════════════════════
+# Ground truth for "what did this session actually do" is the Claude Code
+# transcript: ~/.claude/projects/<slug>/<session>.jsonl, one JSON object per
+# line. We classify two event kinds and ignore everything else:
+#
+#   GATE    a Bash tool_use whose command runs the FULL gate (test/run-all.sh
+#           with no --filter). A filtered run is a targeted re-run, not the
+#           1374s full gate, and must not count.
+#   MUTATE  a Write/Edit/NotebookEdit tool_use — i.e. actual work.
+#
+# Parsing is done entirely in jq. Shelling the command string out to grep would
+# reintroduce the /bin/sh echo-escape trap that test/gate-echo-parser-guard.sh
+# exists to prevent; jq never leaves JSON, so an escaped newline stays escaped.
+#
+# The command string is split on shell separators FIRST, so a gate invocation is
+# only counted when `test/run-all.sh` sits in COMMAND POSITION. Validated
+# against a real 14-invocation session with zero false positives: `pgrep -f
+# run-all.sh`, `wc -l test/run-all.sh`, and a python string literal that merely
+# CONTAINED "bash test/run-all.sh" were all correctly excluded.
+_classify_program() {
+  cat <<'JQ'
+def segments:
+  [splits("(;|&&|\\|\\||\\||\n)")] | map(sub("^\\s+";"") | sub("\\s+$";""));
+def unwrap:
+  sub("^nohup\\s+";"") | sub("^time\\s+";"")
+  | sub("^timeout\\s+[0-9]+\\s+";"")
+  | sub("^(env\\s+[A-Za-z_][A-Za-z0-9_]*=\\S*\\s+)+";"")
+  | sub("^&\\s*";"") | sub("^\\s+";"");
+def is_full_gate:
+  unwrap as $s
+  | (($s | test("^(bash|sh|zsh)\\s+[^ ]*test/run-all\\.sh(\\s|$)"))
+     or ($s | test("^\\.?/?[^ ]*test/run-all\\.sh(\\s|$)")))
+    and ($s | test("--filter") | not);
+select(.type == "assistant") | .timestamp as $ts
+| .message.content[]? | select(.type == "tool_use")
+| if .name == "Bash" then
+    ((.input.command // "") | segments | map(select(is_full_gate)))
+    | select(length > 0) | .[] | [$ts, "GATE", (.[0:100])]
+  elif (.name == "Write" or .name == "Edit" or .name == "NotebookEdit") then
+    [$ts, "MUTATE", ((.input.file_path // "?") | tostring)]
+  else empty end
+| @tsv
+JQ
+}
+
+# Resolve the transcript to read. Explicit override wins; otherwise the newest
+# top-level transcript for THIS repo's project slug.
+_resolve_transcript() {
+  if [ -n "${HMD_CONF_TRANSCRIPT:-}" ]; then printf '%s' "$HMD_CONF_TRANSCRIPT"; return 0; fi
+  local slug dir best="" best_mt=-1 f mt
+  slug="$(hmd_live_slug_for_cwd "$REPO")"
+  dir="$HMD_LIVE_PROJECTS/$slug"
+  for f in "$dir"/*.jsonl; do
+    [ -f "$f" ] || continue
+    mt="$(hmd_live_mtime "$f")"
+    if [ "$mt" -gt "$best_mt" ] 2>/dev/null; then best_mt="$mt"; best="$f"; fi
+  done
+  printf '%s' "$best"
+}
+
+# Emit the classified event stream (ts \t kind \t detail), oldest first.
+_events() {
+  local t prog rc
+  t="$(_resolve_transcript)"
+  [ -n "$t" ] || return 3
+  [ -r "$t" ] || return 3
+  prog="$(mktemp "${TMPDIR:-/tmp}/hmdconf.XXXXXX")"
+  _classify_program >"$prog"
+  jq -r -f "$prog" "$t" 2>/dev/null
+  rc=$?
+  rm -f "$prog"
+  return $rc
+}
+
+# Is this process running underneath a full-gate run? Used as a self-check: if
+# we are demonstrably inside `test/run-all.sh` and the parser reports zero gate
+# invocations, the parser is broken — and a broken parser reports "no duplicate
+# gate runs" forever. This makes the detector verify itself against ground
+# truth on every single full-gate run.
+_under_full_gate() {
+  case "${HMD_CONF_UNDER_GATE:-}" in 1) return 0 ;; 0) return 1 ;; esac
+  local pid="$$" depth=0 line
+  while [ "$depth" -lt 12 ]; do
+    line="$(ps -o ppid=,command= -p "$pid" 2>/dev/null)"
+    [ -n "$line" ] || return 1
+    case "$line" in *run-all.sh*) return 0 ;; esac
+    pid="$(printf '%s' "$line" | awk '{print $1}')"
+    case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$pid" -gt 1 ] || return 1
+    depth=$((depth + 1))
+  done
+  return 1
+}
+
+# Shared load: fills EV (the event stream) or exits 3.
+EV=""
+_load_events() {
+  local t
+  t="$(_resolve_transcript)"
+  [ -n "$t" ] || nonverified "no session transcript found for $REPO (set HMD_CONF_TRANSCRIPT)"
+  [ -r "$t" ] || nonverified "session transcript is unreadable: $t"
+  EV="$(_events)" || nonverified "could not parse session transcript: $t"
+  local n
+  n="$(printf '%s' "$EV" | grep -c '[^[:space:]]')"
+  # An empty classification is NOT a clean session. It means we learned nothing
+  # about gate discipline from this transcript.
+  [ "${n:-0}" -gt 0 ] || nonverified "session transcript yielded 0 gate/edit events: $t"
+  note "transcript $t"
+}
+
+_selfcheck_detector() {
+  local gates="$1"
+  if _under_full_gate && [ "$gates" -eq 0 ]; then
+    viol "detector self-check: running under test/run-all.sh but the parser saw 0 full-gate invocations — the classifier is blind, so every green verdict from it is meaningless"
+  fi
+}
+
+# ═════════════════════════════════════════════════════════════════════════════
+# CHECK 3 — full-gate-runs-once
+# ═════════════════════════════════════════════════════════════════════════════
+# House rule: the full gate runs ONCE, after the work. `bash test/run-all.sh`
+# costs 1374s measured, so a second run over an unchanged tree burns ~23 min to
+# recompute a verdict already on screen.
+#
+# The rule is NOT "count > 1". A long session legitimately gates several
+# separate units of work, and a check that goes permanently red on any long
+# session gets disabled — which is the disease, not the cure. The honest reading
+# of "runs once, after the work" is: two gate runs with NO EDIT BETWEEN THEM.
+# That is unambiguous waste, and it is what actually happened 7 times today.
+check_gate_runs_once() {
+  _load_events
+  local ts kind detail pending="" gates=0 dupes=0
+  while IFS=$'\t' read -r ts kind detail; do
+    [ -n "${kind:-}" ] || continue
+    if [ "$kind" = "GATE" ]; then
+      gates=$((gates + 1))
+      if [ -n "$pending" ]; then
+        viol "duplicate full-gate run with no edit between	first=$pending	second=$ts"
+        dupes=$((dupes + 1))
+      fi
+      pending="$ts"
+    elif [ "$kind" = "MUTATE" ]; then
+      pending=""
+    fi
+  done <<EOF
+$EV
+EOF
+  _selfcheck_detector "$gates"
+  [ "$dupes" -gt 0 ] || okline "no back-to-back full-gate run	gate_runs=$gates"
+  note "gate-runs-once saw $gates full-gate invocation(s)"
+}
+
+# ═════════════════════════════════════════════════════════════════════════════
+# CHECK 4 — gates-at-end
+# ═════════════════════════════════════════════════════════════════════════════
+# Gates run AFTER the work. A full-gate run before the session has edited
+# anything is a verdict about the previous commit, not about this session — it
+# consumes the full 1374s to tell you something you already knew.
+check_gates_at_end() {
+  _load_events
+  local ts kind detail seen_mutate=0 gates=0 early=0
+  while IFS=$'\t' read -r ts kind detail; do
+    [ -n "${kind:-}" ] || continue
+    if [ "$kind" = "MUTATE" ]; then
+      seen_mutate=1
+    elif [ "$kind" = "GATE" ]; then
+      gates=$((gates + 1))
+      if [ "$seen_mutate" -eq 0 ]; then
+        viol "full gate ran before any edit in this session	at=$ts"
+        early=$((early + 1))
+      fi
+    fi
+  done <<EOF
+$EV
+EOF
+  _selfcheck_detector "$gates"
+  [ "$early" -gt 0 ] || okline "every full-gate run followed real work	gate_runs=$gates"
+  note "gates-at-end saw $gates full-gate invocation(s)"
+}
+
+# ═════════════════════════════════════════════════════════════════════════════
+# inventory — THE HONESTY LINE
+# ═════════════════════════════════════════════════════════════════════════════
+# See bin/lib/rule-inventory.sh for the extractor and the classification rules.
+# shellcheck source=lib/rule-inventory.sh
+. "$SELF_DIR/lib/rule-inventory.sh"
+
+usage() {
+  cat >&2 <<'USAGE'
+usage: heimdall-conformance <check>
+
+checks
+  commit-per-unit   abandoned dirty agent worktrees (live ones are never flagged)
+  brief-routing     every spawn-instruction doc routes through heimdall-brief
+  gate-runs-once    two full-gate runs with no edit between them
+  gates-at-end      a full-gate run before any work in the session
+  all               all four, aggregated
+
+inventory
+  inventory         print every normative rule with a CHECKED/UNCHECKABLE verdict
+  inventory --write regenerate the committed inventory artifact
+
+exits: 0 conformant · 1 violation(s) · 2 usage/dependency · 3 NON_VERIFIED
+USAGE
+  exit 2
+}
+
+main() {
+  local cmd="${1:-}"
+  case "$cmd" in
+    commit-per-unit) check_commit_per_unit ;;
+    brief-routing)   check_brief_routing ;;
+    gate-runs-once)  check_gate_runs_once ;;
+    gates-at-end)    check_gates_at_end ;;
+    all)
+      check_commit_per_unit
+      check_brief_routing
+      check_gate_runs_once
+      check_gates_at_end
+      ;;
+    inventory)       shift; rule_inventory "$@"; return $? ;;
+    ''|-h|--help)    usage ;;
+    *)               printf 'heimdall-conformance: unknown check %s\n' "$cmd" >&2; usage ;;
+  esac
+  [ "$VIOLATIONS" -eq 0 ] || return 1
+  return 0
+}
+
+main "$@"
