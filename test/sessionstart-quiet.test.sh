@@ -175,10 +175,30 @@ cat > "$JSON_LOW" <<'EOF'
 EOF
 
 CBIN="$CLEAN"
+
+# The CODE axis (heimdall-deadcode --advise) runs FIRST inside do_advise and is a
+# DIFFERENT subsystem with a DIFFERENT input: it scans the real repo for executables no
+# live entry point reaches. Left un-injected it makes this suite's line-count assertions
+# a function of the repo's current dead-code state — green on a clean tree, red the moment
+# anything (another suite mid-run, a work-in-progress script) leaves an unreachable file
+# in bin/. That is exactly how this suite went red inside a full run while passing solo.
+# Inject a stub that prints nothing and RECORDS that it was called, so the byte/line budget
+# measures the memory advisory alone while the wiring stays proven (see the marker check
+# after case 6 — dropping the deadcode call must still fail this suite).
+DC_MARK="$WORK/deadcode-called"
+DCFAKE="$WORK/deadcode-fake"
+cat > "$DCFAKE" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$DC_MARK"
+exit 0
+EOF
+chmod +x "$DCFAKE"
+
 advise() { # <json> <orphan pids> [extra argv...]
   local json="$1" orphans="$2"; shift 2
   HMD_CLEANUP_OS=Darwin HMD_CLEANUP_SYSMON="$WORK/sysmon-fake" \
   SYSMON_JSON="$json" SYSMON_ORPHANS="$orphans" \
+  HMD_CLEANUP_DEADCODE="$DCFAKE" \
   HMD_GC_TMP_ROOTS="$GTMP" HMD_GC_TEMP_TTL_MIN=99999 HMD_GC_CC_VERSIONS="$GVER" \
   HEIMDALL_HOME="$WORK/home-empty" \
   bash "$CBIN" --advise --quick --repo "$WORK/home-empty" "$@" 2>&1
@@ -192,7 +212,10 @@ al="$(nlines "$aclean")"; ab="$(nbytes "$aclean")"
 [ -n "$aclean" ] && ok "(6) high pressure still SPEAKS (the detector was not disabled)" \
   || bad "(6) --advise went silent under high memory pressure — detection was lost"
 [ "$al" -eq 1 ] && ok "(6) --advise emits exactly ONE line (was 16)" \
-  || bad "(6) --advise emitted $al lines, expected 1"
+  || bad "(6) --advise emitted $al lines, expected 1; got: $(printf '%s' "$aclean" | tr '\n' '|')"
+# The CODE axis must still be invoked — the stub above silences it, it must not delete it.
+[ -s "$DC_MARK" ] && ok "(6) --advise still invokes the CODE-axis sweep (deadcode called)" \
+  || bad "(6) --advise never invoked heimdall-deadcode — the CODE axis was dropped"
 [ "$ab" -le "$BUDGET" ] && ok "(6) --advise line is ${ab}B (budget ${BUDGET}B)" \
   || bad "(6) --advise line is ${ab}B, over the ${BUDGET}B budget"
 if printf '%s' "$aclean" | grep -qi 'NOT heimdall' && printf '%s' "$aclean" | grep -qi 'reboot'; then
@@ -221,7 +244,7 @@ else
   bad "(7) the leak path lost the --apply recommendation: $aleak"
 fi
 [ "$ll" -eq 1 ] && ok "(7) the leak advisory is also ONE line" \
-  || bad "(7) leak advisory emitted $ll lines, expected 1"
+  || bad "(7) leak advisory emitted $ll lines, expected 1; got: $(printf '%s' "$aleak" | tr '\n' '|')"
 
 # ── (8) NOTHING WAS DELETED: --verbose keeps the accuracy corrections verbatim ───
 # These sentences are a RETRACTION of the false "a restart is the fix" claim. They are
