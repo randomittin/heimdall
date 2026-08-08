@@ -64,21 +64,45 @@ SENTINEL_TAG="resume-probe-sentinel-$$"
 
 # A throwaway git project carrying real session knowledge in all six categories, so
 # the probe is grading CONTENT and not a row of "none"s.
+#
+# WHY THIS IS BUILT ONCE AND THEN COPIED
+# --------------------------------------
+# One real `heimdall-checkpoint write` costs ~4s — it forks several hundred processes
+# (six derivations, twelve sha256 read-backs) and runs a gitleaks-backed secret scan.
+# This file needs SIXTEEN saved projects, one per damage case, which is ~70-100s of
+# pure fixture construction during which the suite prints NOTHING. That silence is
+# what made this file read as a hang; it was never hung, it was building.
+#
+# So the expensive save happens exactly once, into a template no case ever touches,
+# and each case gets a byte-for-byte copy (~95ms — 47x cheaper). A copy is a fully
+# independent, complete, correctly-keyed save: the answer key digests cover DERIVED
+# VALUES (phase, goal, the recorded notes, HEAD, branch), and not one of them embeds
+# the project path, so relocating the tree cannot change a single digest. Verified,
+# not assumed — a copy probes GREEN 6/6, and still goes RED naming layer=checkpoint
+# when a field is dropped from it.
+PRISTINE="$TMP/pristine"
+
+build_pristine() {
+  mkdir -p "$PRISTINE"
+  git -C "$PRISTINE" init -q
+  git -C "$PRISTINE" config user.email t@t.t
+  git -C "$PRISTINE" config user.name t
+  printf 'hello\n' > "$PRISTINE/README.md"
+  git -C "$PRISTINE" add README.md
+  git -C "$PRISTINE" commit -qm "initial commit" --no-verify
+  mkdir -p "$PRISTINE/.planning"
+  HEIMDALL_HOME="$PRISTINE/.heimdall" "$CKPT" note in-progress "$SENTINEL_TAG wiring the probe; next step is the completeness gate" >/dev/null 2>&1
+  HEIMDALL_HOME="$PRISTINE/.heimdall" "$CKPT" note gated       "human call pending: does a red probe block or advise" >/dev/null 2>&1
+  HEIMDALL_HOME="$PRISTINE/.heimdall" "$CKPT" note refuted     "refuted: the meter estimates context; it reads the statusline blob" >/dev/null 2>&1
+  HEIMDALL_HOME="$PRISTINE/.heimdall" "$CKPT" note warn        "fail-open observation 2026-08-05 still open" >/dev/null 2>&1
+  HEIMDALL_HOME="$PRISTINE/.heimdall" "$CKPT" write "$PRISTINE" >/dev/null 2>&1
+}
+
 make_saved_project() { # -> project dir on stdout, already checkpointed
   local d
+  [ -d "$PRISTINE/.git" ] || build_pristine
   d="$(mktemp -d "$TMP/proj.XXXXXX")"
-  git -C "$d" init -q
-  git -C "$d" config user.email t@t.t
-  git -C "$d" config user.name t
-  printf 'hello\n' > "$d/README.md"
-  git -C "$d" add README.md
-  git -C "$d" commit -qm "initial commit" --no-verify
-  mkdir -p "$d/.planning"
-  HEIMDALL_HOME="$d/.heimdall" "$CKPT" note in-progress "$SENTINEL_TAG wiring the probe; next step is the completeness gate" >/dev/null 2>&1
-  HEIMDALL_HOME="$d/.heimdall" "$CKPT" note gated       "human call pending: does a red probe block or advise" >/dev/null 2>&1
-  HEIMDALL_HOME="$d/.heimdall" "$CKPT" note refuted     "refuted: the meter estimates context; it reads the statusline blob" >/dev/null 2>&1
-  HEIMDALL_HOME="$d/.heimdall" "$CKPT" note warn        "fail-open observation 2026-08-05 still open" >/dev/null 2>&1
-  HEIMDALL_HOME="$d/.heimdall" "$CKPT" write "$d" >/dev/null 2>&1
+  cp -R "$PRISTINE/." "$d/" 2>/dev/null
   printf '%s' "$d"
 }
 
@@ -101,6 +125,11 @@ run_probe() { # <project> [extra args...]
 }
 has()   { printf '%s' "$1" | grep -qF "$2"; }
 hasre() { printf '%s' "$1" | grep -qE "$2"; }
+# Case-insensitive variant. The probe SHOUTS the words it wants an operator to read
+# ("a bug in the MEMORY STACK"), so an assertion about that wording must not be
+# case-coupled to it — otherwise the check fails while the behaviour it asserts is
+# correct, which is a broken test masquerading as a broken feature.
+hasrei() { printf '%s' "$1" | grep -qiE "$2"; }
 
 # Delete one "- **Label:** ..." line from a checkpoint — the printf-bug class, after
 # the fact: the field is simply not in the bytes a resume reads.
@@ -155,8 +184,8 @@ run_probe "$P"
 hasre "$PROBE_OUT" 'layer=checkpoint|layer.*checkpoint' && ok "the RED names layer=checkpoint (the bug can be filed)" \
                                                         || bad "the RED names no layer: $PROBE_OUT"
 hasre "$PROBE_OUT" 'RED' && ok "the verdict reads RED" || bad "no RED verdict: $PROBE_OUT"
-hasre "$PROBE_OUT" 'stack|memory' && ok "the RED says this is a bug in the STACK, not a probe failure" \
-                                  || bad "the RED does not attribute the failure to the stack: $PROBE_OUT"
+hasrei "$PROBE_OUT" 'stack|memory' && ok "the RED says this is a bug in the STACK, not a probe failure" \
+                                   || bad "the RED does not attribute the failure to the stack: $PROBE_OUT"
 rm -rf "$P"
 
 # ── C. a MANGLED field -> RED (present-but-wrong is not present) ─────────────────
