@@ -2744,6 +2744,7 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   echo "  heimdall join <secret>    Join a teammate's team"
   echo "  heimdall connect          Connect a Claude credential for remote jobs"
   echo "  heimdall presence         Control presence (off/on/status/roster)"
+  echo "  heimdall tier             Model routing table + tier declaration log"
   echo "  heimdall weekly-log       Weekly changelog draft generator (drafts only)"
   echo ""
   echo "heimdall launches Claude Code with:"
