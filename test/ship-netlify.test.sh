@@ -34,6 +34,7 @@ ok()  { printf '  \033[32mPASS\033[0m %s\n' "$1"; PASS=$((PASS+1)); }
 bad() { printf '  \033[31mFAIL\033[0m %s\n' "$1"; FAIL=$((FAIL+1)); }
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/ship-netlify-test.XXXXXX")"
+[ -n "$WORK" ] || { echo "FATAL: WORK path empty (mktemp failed)" >&2; exit 2; }
 cleanup() { rm -rf "$WORK" 2>/dev/null || true; }
 trap cleanup EXIT
 
@@ -82,6 +83,7 @@ TOML
   git -C "$site" add -A
   git -C "$site" commit -q -m "initial site"
   git -C "$site" branch -M main
+  [ -n "$bare" ] || { echo "FATAL: bare path empty" >&2; exit 1; }
   git init -q --bare "$bare"
   git -C "$site" remote add origin "$bare"
   git -C "$site" push -q -u origin main

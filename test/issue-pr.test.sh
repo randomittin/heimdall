@@ -58,6 +58,7 @@ PY="$(command -v python3 || command -v python)"
 
 # ── a throwaway git repo + an isolated runtime home (real queue store seam) ───
 WORK="$(mktemp -d -t "issue-pr-test.$(printf 'X%.0s' 1 2 3 4 5 6)")"
+[ -n "$WORK" ] || { echo "FATAL: WORK path empty (mktemp failed)" >&2; exit 2; }
 trap 'rm -rf "$WORK"' EXIT
 REPO="$WORK/repo"
 mkdir -p "$REPO"
@@ -464,6 +465,7 @@ FAKETOKEN="ghs_FAKEbottoken000000000000000000000000"
 
 # a clone with a real (local, bare) origin + an UNCOMMITTED working-tree fix edit.
 PUSH_REPO="$WORK/pushrepo"; PUSH_BARE="$WORK/pushrepo.git"
+[ -n "$PUSH_BARE" ] || { echo "FATAL: PUSH_BARE path empty" >&2; exit 1; }
 git init --bare -q "$PUSH_BARE"
 mkdir -p "$PUSH_REPO"
 git -C "$PUSH_REPO" init -q
@@ -641,6 +643,7 @@ echo "── (7) BUG #24 — CLEAN COMMIT SCOPE: the push carries ONLY the fix, 
 # pushed diff is EXACTLY the source change. HERMETIC: a LOCAL BARE origin; we assert the fix
 # file LANDS in the remote branch and every junk path is ABSENT (git -C bare ls-tree).
 SCOPE_REPO="$WORK/scoperepo"; SCOPE_BARE="$WORK/scoperepo.git"
+[ -n "$SCOPE_BARE" ] || { echo "FATAL: SCOPE_BARE path empty" >&2; exit 1; }
 git init --bare -q "$SCOPE_BARE"
 mkdir -p "$SCOPE_REPO"
 git -C "$SCOPE_REPO" init -q
@@ -819,6 +822,7 @@ GHEOF
 chmod +x "$FAILGH_BIN/gh"
 
 LOUD_REPO="$WORK/loudrepo"; LOUD_BARE="$WORK/loudrepo.git"
+[ -n "$LOUD_BARE" ] || { echo "FATAL: LOUD_BARE path empty" >&2; exit 1; }
 git init --bare -q "$LOUD_BARE"
 mkdir -p "$LOUD_REPO"
 git -C "$LOUD_REPO" init -q
@@ -925,6 +929,7 @@ chmod +x "$REPOGH/gh"
 # (9b) END-TO-END: open_pr pushes the branch (cwd=clone) THEN runs gh — assert the fake gh
 # was invoked with cwd == the workspace clone AND its argv carried --repo acme/widget.
 CWD_REPO="$WORK/cwdrepo"; CWD_BARE="$WORK/cwdrepo.git"
+[ -n "$CWD_BARE" ] || { echo "FATAL: CWD_BARE path empty" >&2; exit 1; }
 git init --bare -q "$CWD_BARE"
 mkdir -p "$CWD_REPO"
 git -C "$CWD_REPO" init -q

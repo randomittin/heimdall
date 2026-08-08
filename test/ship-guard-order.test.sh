@@ -38,6 +38,7 @@ ok()  { printf '  \033[32mPASS\033[0m %s\n' "$1"; PASS=$((PASS+1)); }
 bad() { printf '  \033[31mFAIL\033[0m %s\n' "$1"; FAIL=$((FAIL+1)); }
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/ship-guard-order-test.XXXXXX")"
+[ -n "$WORK" ] || { echo "FATAL: WORK path empty (mktemp failed)" >&2; exit 2; }
 cleanup() { rm -rf "$WORK" 2>/dev/null || true; }
 trap cleanup EXIT
 

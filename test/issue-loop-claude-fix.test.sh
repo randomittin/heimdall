@@ -40,6 +40,7 @@ for f in "$LIB" "$EV_LIB"; do [ -f "$f" ] || { echo "FATAL: $f missing" >&2; exi
 PY="$(command -v python3 || command -v python)"
 
 WORK="$(mktemp -d -t "issue-loop-claude-fix.$(printf 'X%.0s' 1 2 3 4 5 6)")"
+[ -n "$WORK" ] || { echo "FATAL: WORK path empty (mktemp failed)" >&2; exit 2; }
 trap 'rm -rf "$WORK"' EXIT
 
 export PYTHONPATH="$ROOT/bin/lib:${PYTHONPATH:-}"
@@ -103,6 +104,7 @@ new_repo() {
   local name="$1" rt="$2"
   local repo="$WORK/$name"
   local bare="$WORK/$name.git"
+  [ -n "$bare" ] || { echo "FATAL: bare path empty" >&2; exit 1; }
   git init --bare -q "$bare"
   mkdir -p "$repo"
   git -C "$repo" init -q
@@ -135,6 +137,7 @@ new_tinymath_repo() {
   local name="$1"
   local repo="$WORK/$name"
   local bare="$WORK/$name.git"
+  [ -n "$bare" ] || { echo "FATAL: bare path empty" >&2; exit 1; }
   git init --bare -q "$bare"
   mkdir -p "$repo/tinymath" "$repo/tests"
   git -C "$repo" init -q

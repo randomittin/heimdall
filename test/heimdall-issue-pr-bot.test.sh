@@ -58,6 +58,7 @@ PERSONAL_TOKEN="ghp_PERSONAL_creds_MUST_BE_SCRUBBED_1b2c3d"
 
 # ── a throwaway git repo + an isolated runtime home ───────────────────────────
 WORK="$(mktemp -d -t "issue-pr-bot.$(printf 'X%.0s' 1 2 3 4 5 6)")"
+[ -n "$WORK" ] || { echo "FATAL: WORK path empty (mktemp failed)" >&2; exit 2; }
 trap 'rm -rf "$WORK"' EXIT
 REPO="$WORK/repo"
 mkdir -p "$REPO"
@@ -76,6 +77,7 @@ git -C "$REPO" branch -M main 2>/dev/null || true
 # ('origin' does not appear to be a git repository). A local bare repo is the
 # hermetic equivalent used in test/issue-pr.test.sh §6 — no network, no auth.
 BARE="$WORK/repo.git"
+[ -n "$BARE" ] || { echo "FATAL: BARE path empty" >&2; exit 1; }
 git init --bare -q "$BARE"
 git -C "$REPO" remote add origin "$BARE"
 # an uncommitted fix edit so _commit_and_push_branch has real staged content to
