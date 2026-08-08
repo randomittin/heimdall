@@ -64,21 +64,45 @@ SENTINEL_TAG="resume-probe-sentinel-$$"
 
 # A throwaway git project carrying real session knowledge in all six categories, so
 # the probe is grading CONTENT and not a row of "none"s.
+#
+# WHY THIS IS BUILT ONCE AND THEN COPIED
+# --------------------------------------
+# One real `heimdall-checkpoint write` costs ~4s — it forks several hundred processes
+# (six derivations, twelve sha256 read-backs) and runs a gitleaks-backed secret scan.
+# This file needs SIXTEEN saved projects, one per damage case, which is ~70-100s of
+# pure fixture construction during which the suite prints NOTHING. That silence is
+# what made this file read as a hang; it was never hung, it was building.
+#
+# So the expensive save happens exactly once, into a template no case ever touches,
+# and each case gets a byte-for-byte copy (~95ms — 47x cheaper). A copy is a fully
+# independent, complete, correctly-keyed save: the answer key digests cover DERIVED
+# VALUES (phase, goal, the recorded notes, HEAD, branch), and not one of them embeds
+# the project path, so relocating the tree cannot change a single digest. Verified,
+# not assumed — a copy probes GREEN 6/6, and still goes RED naming layer=checkpoint
+# when a field is dropped from it.
+PRISTINE="$TMP/pristine"
+
+build_pristine() {
+  mkdir -p "$PRISTINE"
+  git -C "$PRISTINE" init -q
+  git -C "$PRISTINE" config user.email t@t.t
+  git -C "$PRISTINE" config user.name t
+  printf 'hello\n' > "$PRISTINE/README.md"
+  git -C "$PRISTINE" add README.md
+  git -C "$PRISTINE" commit -qm "initial commit" --no-verify
+  mkdir -p "$PRISTINE/.planning"
+  HEIMDALL_HOME="$PRISTINE/.heimdall" "$CKPT" note in-progress "$SENTINEL_TAG wiring the probe; next step is the completeness gate" >/dev/null 2>&1
+  HEIMDALL_HOME="$PRISTINE/.heimdall" "$CKPT" note gated       "human call pending: does a red probe block or advise" >/dev/null 2>&1
+  HEIMDALL_HOME="$PRISTINE/.heimdall" "$CKPT" note refuted     "refuted: the meter estimates context; it reads the statusline blob" >/dev/null 2>&1
+  HEIMDALL_HOME="$PRISTINE/.heimdall" "$CKPT" note warn        "fail-open observation 2026-08-05 still open" >/dev/null 2>&1
+  HEIMDALL_HOME="$PRISTINE/.heimdall" "$CKPT" write "$PRISTINE" >/dev/null 2>&1
+}
+
 make_saved_project() { # -> project dir on stdout, already checkpointed
   local d
+  [ -d "$PRISTINE/.git" ] || build_pristine
   d="$(mktemp -d "$TMP/proj.XXXXXX")"
-  git -C "$d" init -q
-  git -C "$d" config user.email t@t.t
-  git -C "$d" config user.name t
-  printf 'hello\n' > "$d/README.md"
-  git -C "$d" add README.md
-  git -C "$d" commit -qm "initial commit" --no-verify
-  mkdir -p "$d/.planning"
-  HEIMDALL_HOME="$d/.heimdall" "$CKPT" note in-progress "$SENTINEL_TAG wiring the probe; next step is the completeness gate" >/dev/null 2>&1
-  HEIMDALL_HOME="$d/.heimdall" "$CKPT" note gated       "human call pending: does a red probe block or advise" >/dev/null 2>&1
-  HEIMDALL_HOME="$d/.heimdall" "$CKPT" note refuted     "refuted: the meter estimates context; it reads the statusline blob" >/dev/null 2>&1
-  HEIMDALL_HOME="$d/.heimdall" "$CKPT" note warn        "fail-open observation 2026-08-05 still open" >/dev/null 2>&1
-  HEIMDALL_HOME="$d/.heimdall" "$CKPT" write "$d" >/dev/null 2>&1
+  cp -R "$PRISTINE/." "$d/" 2>/dev/null
   printf '%s' "$d"
 }
 
@@ -101,6 +125,11 @@ run_probe() { # <project> [extra args...]
 }
 has()   { printf '%s' "$1" | grep -qF "$2"; }
 hasre() { printf '%s' "$1" | grep -qE "$2"; }
+# Case-insensitive variant. The probe SHOUTS the words it wants an operator to read
+# ("a bug in the MEMORY STACK"), so an assertion about that wording must not be
+# case-coupled to it — otherwise the check fails while the behaviour it asserts is
+# correct, which is a broken test masquerading as a broken feature.
+hasrei() { printf '%s' "$1" | grep -qiE "$2"; }
 
 # Delete one "- **Label:** ..." line from a checkpoint — the printf-bug class, after
 # the fact: the field is simply not in the bytes a resume reads.
@@ -155,8 +184,8 @@ run_probe "$P"
 hasre "$PROBE_OUT" 'layer=checkpoint|layer.*checkpoint' && ok "the RED names layer=checkpoint (the bug can be filed)" \
                                                         || bad "the RED names no layer: $PROBE_OUT"
 hasre "$PROBE_OUT" 'RED' && ok "the verdict reads RED" || bad "no RED verdict: $PROBE_OUT"
-hasre "$PROBE_OUT" 'stack|memory' && ok "the RED says this is a bug in the STACK, not a probe failure" \
-                                  || bad "the RED does not attribute the failure to the stack: $PROBE_OUT"
+hasrei "$PROBE_OUT" 'stack|memory' && ok "the RED says this is a bug in the STACK, not a probe failure" \
+                                   || bad "the RED does not attribute the failure to the stack: $PROBE_OUT"
 rm -rf "$P"
 
 # ── C. a MANGLED field -> RED (present-but-wrong is not present) ─────────────────
@@ -301,16 +330,85 @@ rm -rf "$P"
 
 # ── J. wired at session start, before any work ───────────────────────────────────
 sec "J. WIRED @ SessionStart — before any work (a probe wired to nothing is a file):"
-# STRUCTURAL, deliberately: the real SessionStart command also registers the
-# statusline and self-heals the install, so executing it here would write the
-# operator's real ~/.claude. The behaviour is proven above by driving the binary;
-# this proves the binary is actually reached.
+# The probe is armed as its OWN SessionStart entry, which is what makes the rest of
+# this section possible: the giant install command registers the statusline and
+# self-heals ~/.claude, so it could never be executed under test. A dedicated entry
+# can be, so the wiring here is EXECUTED verbatim out of hooks.json rather than
+# merely grepped. A hook asserted only structurally is a hook nobody has ever run.
 SS_CMD="$(jq -r '.hooks.SessionStart[]?.hooks[]?.command // empty' "$HOOKS" 2>/dev/null \
          | grep -F 'heimdall-resume-probe' | head -1)"
+
+# Execute the real command string against a throwaway repo. Sets SS_OUT/SS_RC/SS_SECS.
+SS_OUT=""; SS_RC=0; SS_SECS=0
+run_ss() { # <project-dir> [plugin-root]
+  local d="$1" plug="${2:-$REPO}" s e
+  s=$(date +%s)
+  SS_OUT="$(CLAUDE_PLUGIN_ROOT="$plug" CLAUDE_PROJECT_DIR="$d" HEIMDALL_HOME="$d/.heimdall" \
+            sh -c "$SS_CMD" 2>&1)"
+  SS_RC=$?
+  e=$(date +%s); SS_SECS=$((e - s))
+}
+
 if [ -n "$SS_CMD" ]; then
   ok "a SessionStart hook invokes heimdall-resume-probe"
   has "$SS_CMD" 'CHECKPOINT.md' && ok "the invocation is guarded by an existing checkpoint (silent in repos with nothing to resume)" \
                                 || bad "the probe fires unconditionally — it would speak in repos with no checkpoint"
+
+  # Refuse to execute the install command by accident: if the probe is ever folded
+  # into it, running it here would write the operator's real ~/.claude.
+  if has "$SS_CMD" 'statusline-register' || has "$SS_CMD" 'cc-selfheal' || has "$SS_CMD" 'edit-tracker'; then
+    bad "the probe is fused into the install/self-heal SessionStart command — it must be its own entry so it can fail without taking the install down, and so this suite can execute it hermetically"
+  else
+    ok "the probe's SessionStart wiring is a dedicated, self-contained entry"
+
+    # A RED verdict is the WHOLE POINT of the probe, and it must still not fail the
+    # session that surfaced it. A hook that exits non-zero on a red reads to the
+    # operator as a broken install, and the first thing anyone does to a hook that
+    # breaks session start is delete it.
+    P="$(make_saved_project)"
+    rm -f "$P/.planning/RESUME-KEY.json"
+    run_ss "$P"
+    [ "$SS_RC" -eq 0 ] && ok "a RED probe still exits the hook 0 (a red verdict must never break a session)" \
+                       || bad "a RED probe exited the SessionStart hook $SS_RC — that surfaces as a broken session start"
+    hasrei "$SS_OUT" 'RED' && ok "...and the RED still reaches the operator (bounded, not swallowed)" \
+                           || bad "the RED was swallowed — the gate would be invisible: $SS_OUT"
+    SSL="$(printf '%s\n' "$SS_OUT" | grep -c .)"
+    [ "$SSL" -le 8 ] && ok "the RED stays inside the SessionStart output budget ($SSL lines, ceiling 8)" \
+                     || bad "the RED spent $SSL lines of every session start"
+    rm -rf "$P"
+
+    # Nothing to resume -> the hook must cost NOTHING, or every repo without a
+    # checkpoint pays for a feature it is not using.
+    P="$(mktemp -d "$TMP/nockpt.XXXXXX")"
+    run_ss "$P"
+    [ "$SS_RC" -eq 0 ] && ok "a repo with no checkpoint exits 0" || bad "no-checkpoint repo exited $SS_RC: $SS_OUT"
+    [ -z "$SS_OUT" ] && ok "...and says nothing at all (zero bytes)" || bad "the hook spoke in a repo with nothing to resume: $SS_OUT"
+    rm -rf "$P"
+
+    # A half-installed plugin must not break session start either.
+    P="$(make_saved_project)"
+    NOPLUG="$(mktemp -d "$TMP/noplug.XXXXXX")"
+    run_ss "$P" "$NOPLUG"
+    [ "$SS_RC" -eq 0 ] && ok "a missing probe binary exits 0 (a broken install never blocks a session)" \
+                       || bad "a missing probe binary exited $SS_RC: $SS_OUT"
+    [ -z "$SS_OUT" ] && ok "...and is silent rather than leaking a shell error" || bad "missing binary printed: $SS_OUT"
+    rm -rf "$P" "$NOPLUG"
+
+    # THE ONE THAT MATTERS. This subsystem exists to prove restarts are safe, so a
+    # probe that could wedge would make restarting impossible — the exact inversion
+    # that kept this feature unarmed. Grepping for an `alarm` only proves a ceiling
+    # was TYPED. Substituting a probe that never returns proves it WORKS.
+    WEDGE="$(mktemp -d "$TMP/wedge.XXXXXX")"
+    mkdir -p "$WEDGE/bin"
+    printf '#!/bin/sh\nsleep 300\n' > "$WEDGE/bin/heimdall-resume-probe"
+    chmod +x "$WEDGE/bin/heimdall-resume-probe"
+    P="$(make_saved_project)"
+    run_ss "$P" "$WEDGE"
+    [ "$SS_SECS" -le 30 ] && ok "a WEDGED probe (never returns) still releases the hook in ${SS_SECS}s — the ceiling is real, not decorative" \
+                          || bad "a wedged probe held session start for ${SS_SECS}s — every new session would hang"
+    [ "$SS_RC" -eq 0 ] && ok "...and a wedged probe still exits 0" || bad "a wedged probe exited $SS_RC"
+    rm -rf "$P" "$WEDGE"
+  fi
 else
   bad "NOT WIRED — no SessionStart hook calls heimdall-resume-probe"
 fi
