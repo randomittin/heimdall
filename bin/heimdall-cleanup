@@ -13,6 +13,12 @@
 #   • bin/heimdall-gc      — the DISK authority. Reaps ONLY hmd's own artifacts, each on a
 #     proof of non-use (lsof-guarded retired versions, merged-only worktrees, TTL'd temp).
 #     We drive it in --dry-run for `report` (mutates NOTHING) and full for `--apply`.
+#   • bin/heimdall-deadcode — the CODE authority: which of hmd's OWN executables no live
+#     entry point can reach. Garbage is not only processes and bytes on disk; a subsystem
+#     nothing invokes is garbage too, and it is the kind that a green test suite hides.
+#     bin/heimdall-brief sat built, tested and called by NOTHING for two months. This axis
+#     is REPORT-ONLY in every mode — dead code is never auto-removed, because deciding
+#     whether a tool is abandoned or merely standalone is a human's call, not a reaper's.
 #
 # WHY A NEW ENTRYPOINT (and not "promote sysmon"): sysmon is the memory/proc advisor; gc is
 # the disk collector. Neither covers BOTH axes, and folding gc's disk domain into sysmon (or
@@ -45,6 +51,9 @@
 #                                    SessionStart output budget); add --verbose for the full
 #                                    sixteen-line advisory. The DETECTION is identical either
 #                                    way — verbosity changes rendering, never what is found.
+#   heimdall-cleanup --code          READ-ONLY consumer audit: every executable in bin/ must
+#                                    name what invokes it, or it is reported dead. Delegates
+#                                    wholesale to bin/heimdall-deadcode. Deletes NOTHING.
 #   heimdall-cleanup --deep          SUGGEST-only handoff to the mac-deep-clean skill for the
 #                                    heavier, confirm-gated disk cleanup. Reaps NOTHING itself.
 #   heimdall-cleanup --auto          the HOOK path (SessionStart/End). Runs gc (hmd disk) always;
@@ -72,6 +81,7 @@ set -uo pipefail
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SYSMON="${HMD_CLEANUP_SYSMON:-$SELF_DIR/heimdall-sysmon}"
 GC="${HMD_CLEANUP_GC:-$SELF_DIR/heimdall-gc}"
+DEADCODE="${HMD_CLEANUP_DEADCODE:-$SELF_DIR/heimdall-deadcode}"
 
 OS="${HMD_CLEANUP_OS:-$(uname -s 2>/dev/null || echo unknown)}"
 
@@ -113,6 +123,7 @@ while [ $# -gt 0 ]; do
     report)          MODE="report" ;;
     reap|--apply|apply) MODE="apply" ;;
     --advise|advise) MODE="advise" ;;
+    --code|code)     MODE="code" ;;
     --deep|deep)     MODE="deep" ;;
     --auto)          MODE="apply"; AUTO=1; QUIET=1 ;;
     --quick)         QUICK=1 ;;
@@ -509,6 +520,15 @@ do_apply() {
 # Mutates NOTHING — sysmon read-only, orphan scope, gc --dry-run. Never reaps.
 do_advise() {
   if opted_out; then return 0; fi
+
+  # CODE axis first, and OUTSIDE the memory gate below: dead code and RAM pressure are
+  # independent failures, so a healthy machine must still hear about a subsystem nothing
+  # invokes. heimdall-deadcode throttles itself (weekly by default) and prints nothing at
+  # all when the audit is clean, so this costs a cache read on a normal session start.
+  # This is the PERIODIC SWEEP the consumer audit rides on: SessionStart and SessionEnd
+  # already run heimdall-cleanup, so there is no new schedule to invent or maintain.
+  [ -x "$DEADCODE" ] && "$DEADCODE" --advise 2>/dev/null || true
+
   _probe_memory
   _reboot_worthy || return 0   # non-spammy: silent on a healthy / merely-warn machine
   _ps_prime          # one ps snapshot shared by the orphan scope and the wired-holder probe

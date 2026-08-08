@@ -1,0 +1,221 @@
+#!/usr/bin/env bash
+# heimdall-deadcode — the CONSUMER AUDIT: every executable in bin/ must name what
+# invokes it, or it is reported dead.
+#
+# WHY THIS EXISTS. bin/heimdall-brief, bin/heimdall-capsule and bin/lib/protocol.sh were
+# built complete and tested around 17 Jun 2026 and invoked by NOTHING for two months.
+# Their suites were green the whole time: tests prove the code WORKS, never that anyone
+# CALLS it. Nothing measured the second thing, so nothing noticed.
+#
+# WHY THE OBVIOUS VERSION DOES NOT WORK. There was already a gate asking "does any file
+# name this executable?" — and it cleared heimdall-brief for those two months, because
+# bin/heimdall-protocol named it and heimdall-protocol was itself invoked by nothing. A
+# dead chain citing itself reads as reachable. So this audit does NOT accept a mention
+# as proof of life. It seeds liveness ONLY at real entry points (hooks/hooks.json,
+# .mcp.json, install.sh, the `hmd` CLI, commands/ agents/ skills/, .claude-plugin/,
+# deploy/, .github/workflows/) and propagates outward. A file no live entry point can
+# reach is dead however many other dead files name it. The engine, shared verbatim with
+# test/bin-reachability-gate.test.sh so the two can never disagree, is bin/lib/reachability.sh.
+#
+# THIS COMMAND DELETES NOTHING. It reports. Deciding what to do with a dead subsystem —
+# wire it, drop it, or write down why it stands alone — is a human's call.
+#
+# SUBCOMMANDS
+#   heimdall-deadcode                 the full read-only report: audited / reachable /
+#                                     dead, split into acknowledged and unacknowledged,
+#                                     plus any rot in the exemption registry.
+#   heimdall-deadcode --json          {audited,reachable,dead,unacknowledged,rot,...}
+#   heimdall-deadcode --advise        ONE line for the SessionStart output budget, and
+#                                     ONLY when something is actually wrong. Throttled:
+#                                     it recomputes at most once per HMD_DEADCODE_TTL
+#                                     (default 7 days) and replays the cached verdict in
+#                                     between, so the periodic sweep costs nothing on a
+#                                     normal session start. --advise --force ignores it.
+#   heimdall-deadcode --why NAME      how bin/NAME is reached, as an invoker chain back
+#                                     to a live entry point — or why nothing reaches it.
+#   -h, --help                        this help.
+#
+# EXEMPTIONS live in bin/lib/reachability-exemptions.tsv, one row per name, each with a
+# written reason AND a recheck date. Past that date the exemption stops counting, so a
+# standalone tool cannot go quietly dead under cover of its own excuse.
+#
+# EXIT: 0 clean · 1 rot found (unacknowledged dead code, or a rotten exemption row) ·
+#       2 the scan REFUSED to run. Two is not a pass: a scan that enumerated nothing has
+#       not proved anything, and this repo's gates fail closed.
+set -uo pipefail
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="${HMD_DEADCODE_ROOT:-$(cd "$SELF_DIR/.." && pwd)}"
+LIB="$SELF_DIR/lib/reachability.sh"
+
+[ -f "$LIB" ] || { printf 'heimdall-deadcode: missing engine %s — NOT VERIFIED\n' "$LIB" >&2; exit 2; }
+# shellcheck source=lib/reachability.sh
+. "$LIB"
+
+HMD_HOME="${HEIMDALL_HOME:-${HOME:-/tmp}/.heimdall}"
+CACHE="$HMD_HOME/deadcode-advice"
+TTL="${HMD_DEADCODE_TTL:-604800}"   # 7 days — the sweep's period
+
+MODE="report"; FORCE=0; WHY=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    report)      MODE="report" ;;
+    --json)      MODE="json" ;;
+    --advise)    MODE="advise" ;;
+    --force)     FORCE=1 ;;
+    --why)       MODE="why"; WHY="${2:-}"; shift ;;
+    --why=*)     MODE="why"; WHY="${1#--why=}" ;;
+    -h|--help)   grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) printf 'heimdall-deadcode: unknown argument: %s\n' "$1" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+W="$(mktemp -d "${TMPDIR:-/tmp}/hmd-deadcode-XXXXXX")" || { printf 'heimdall-deadcode: no workdir — NOT VERIFIED\n' >&2; exit 2; }
+trap 'rm -rf "$W"' EXIT INT TERM
+
+# ── the scan (fail-closed: a refusal is never rendered as a pass) ─────────────────
+scan() {
+  if ! reach_build "$ROOT" "$W"; then
+    printf 'heimdall-deadcode: the scan REFUSED to run against %s — no nodes, no entry\n' "$ROOT" >&2
+    printf '  points, or no bin/ executables were enumerated. That is NOT VERIFIED, not a pass.\n' >&2
+    return 2
+  fi
+  return 0
+}
+
+AUDITED=0; REACHABLE=0; DEAD_N=0; UNACK_N=0; ROT_N=0
+DEAD_LIST=""; UNACK_LIST=""; ROT_LIST=""
+collect() {
+  AUDITED="$(reach_subject_count "$W")"
+  REACHABLE=$((AUDITED - $(reach_dead "$W" | grep -c . || true)))
+  DEAD_LIST="$(reach_dead "$W")"
+  DEAD_N="$(printf '%s\n' "$DEAD_LIST" | grep -c . || true)"
+  UNACK_LIST="$(reach_unacknowledged "$ROOT" "$W")"
+  UNACK_N="$(printf '%s\n' "$UNACK_LIST" | grep -c . || true)"
+  ROT_LIST="$(reach_exempt_audit "$ROOT" "$W")"
+  ROT_N="$(printf '%s\n' "$ROT_LIST" | grep -c . || true)"
+}
+
+verdict_rc() { [ "$UNACK_N" -eq 0 ] && [ "$ROT_N" -eq 0 ] && return 0; return 1; }
+
+# ── one-line advisory (silent when clean) ────────────────────────────────────────
+advice_line() {
+  [ "$UNACK_N" -eq 0 ] && [ "$ROT_N" -eq 0 ] && return 0
+  local parts=""
+  [ "$UNACK_N" -gt 0 ] && parts="$UNACK_N bin/ executable(s) reachable from NO live entry point"
+  if [ "$ROT_N" -gt 0 ]; then
+    [ -n "$parts" ] && parts="$parts · "
+    parts="$parts$ROT_N rotten exemption row(s) in bin/lib/reachability-exemptions.tsv"
+  fi
+  printf '[heimdall] dead-code sweep: %s — nothing is deleted; see: heimdall-deadcode\n' "$parts"
+}
+
+case "$MODE" in
+
+  why)
+    [ -n "$WHY" ] || { printf 'heimdall-deadcode --why needs a bin/ name\n' >&2; exit 2; }
+    scan || exit 2
+    if reach_is_live "$W" "$WHY"; then
+      printf 'REACHABLE  %s\n' "$(reach_chain "$W" "$WHY")"
+      exit 0
+    fi
+    if [ ! -f "$ROOT/bin/$WHY" ]; then
+      printf 'heimdall-deadcode: no such executable bin/%s\n' "$WHY" >&2
+      exit 2
+    fi
+    printf 'DEAD       bin/%s is reachable from no live entry point.\n' "$WHY"
+    reason="$(reach_exempt_reason "$ROOT" "$WHY")"
+    if [ -n "$reason" ]; then
+      if reach_exempt_valid "$ROOT" "$WHY"; then
+        printf 'exempt     %s\n' "$reason"
+      else
+        printf 'exempt     ROTTEN (expired or malformed): %s\n' "$reason"
+      fi
+    else
+      printf 'exempt     none — this is unacknowledged dead code.\n'
+    fi
+    exit 1
+    ;;
+
+  advise)
+    if [ "$FORCE" != 1 ] && [ -f "$CACHE" ]; then
+      then_ts="$(head -1 "$CACHE" 2>/dev/null)"
+      now_ts="$(date +%s 2>/dev/null || echo 0)"
+      case "$then_ts" in
+        ''|*[!0-9]*) then_ts=0 ;;
+      esac
+      if [ "$then_ts" -gt 0 ] && [ $((now_ts - then_ts)) -lt "$TTL" ]; then
+        tail -n +2 "$CACHE" 2>/dev/null | grep . || true
+        exit 0
+      fi
+    fi
+    # A refused scan must not be cached as "clean" — leave the previous stamp alone so
+    # the next session retries instead of inheriting a silence nothing established.
+    scan || exit 2
+    collect
+    line="$(advice_line)"
+    if mkdir -p "$HMD_HOME" 2>/dev/null; then
+      { date +%s 2>/dev/null || echo 0; printf '%s\n' "$line"; } > "$CACHE" 2>/dev/null || true
+    fi
+    printf '%s\n' "$line" | grep . || true
+    exit 0
+    ;;
+
+  json)
+    scan || exit 2
+    collect
+    printf '{'
+    printf '"audited":%s,' "$AUDITED"
+    printf '"reachable":%s,' "$REACHABLE"
+    printf '"dead":%s,' "$DEAD_N"
+    printf '"unacknowledged":%s,' "$UNACK_N"
+    printf '"exemption_rot":%s,' "$ROT_N"
+    printf '"dead_names":['
+    printf '%s\n' "$DEAD_LIST" | grep . | awk 'NR>1{printf ","} {printf "\"%s\"", $0}'
+    printf '],"unacknowledged_names":['
+    printf '%s\n' "$UNACK_LIST" | grep . | awk 'NR>1{printf ","} {printf "\"%s\"", $0}'
+    printf '],"rot":['
+    printf '%s\n' "$ROT_LIST" | grep . | awk -F'\t' 'NR>1{printf ","} {printf "{\"kind\":\"%s\",\"name\":\"%s\"}", $1, $2}'
+    printf ']}\n'
+    verdict_rc && exit 0 || exit 1
+    ;;
+
+  report)
+    scan || exit 2
+    collect
+    printf 'heimdall-deadcode — consumer audit of bin/\n'
+    printf '  audited    %s executable(s) in bin/\n' "$AUDITED"
+    printf '  reachable  %s from a live entry point (hook · MCP registration · installer · hmd CLI · command/agent/skill · deploy · CI)\n' "$REACHABLE"
+    printf '  dead       %s reachable from NO live entry point\n' "$DEAD_N"
+    if [ "$DEAD_N" -gt 0 ]; then
+      printf '\n  every dead executable, and why it is acknowledged (or not):\n'
+      printf '%s\n' "$DEAD_LIST" | grep . | while IFS= read -r n; do
+        r="$(reach_exempt_reason "$ROOT" "$n")"
+        if [ -z "$r" ]; then
+          printf '    UNACKNOWLEDGED  %-28s no exemption row — nothing invokes it and nobody has said why\n' "$n"
+        elif reach_exempt_valid "$ROOT" "$n"; then
+          printf '    acknowledged    %-28s %s\n' "$n" "$r"
+        else
+          printf '    ROTTEN EXEMPT   %-28s %s\n' "$n" "$r"
+        fi
+      done
+    fi
+    if [ "$ROT_N" -gt 0 ]; then
+      printf '\n  exemption registry rot (bin/lib/reachability-exemptions.tsv):\n'
+      printf '%s\n' "$ROT_LIST" | grep . | while IFS="$(printf '\t')" read -r kind name detail; do
+        printf '    %-10s %-28s %s\n' "$kind" "$name" "$detail"
+      done
+    fi
+    printf '\n'
+    if verdict_rc; then
+      printf '  verdict    CLEAN — every dead executable carries a written, in-date reason.\n'
+      printf '             "clean" does NOT mean "nothing is dead": %s are, and each one expires.\n' "$DEAD_N"
+      exit 0
+    fi
+    printf '  verdict    ROT — %s unacknowledged, %s rotten exemption row(s).\n' "$UNACK_N" "$ROT_N"
+    printf '             Nothing was deleted. Wire it to a live entry point, remove it, or add a\n'
+    printf '             row to bin/lib/reachability-exemptions.tsv with a reason and a recheck date.\n'
+    exit 1
+    ;;
+esac

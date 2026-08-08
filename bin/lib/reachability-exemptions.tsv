@@ -1,0 +1,61 @@
+# bin/lib/reachability-exemptions.tsv — the ONLY licence for a bin/ executable that no
+# live entry point can reach. Read by bin/lib/reachability.sh; enforced by
+# test/bin-reachability-gate.test.sh; reported by bin/heimdall-deadcode.
+#
+# FORMAT (tab-separated, three columns, one row per name):
+#     name <TAB> recheck-by (YYYY-MM-DD) <TAB> reason
+#
+# WHY EVERY ROW EXPIRES. An exemption that never expires is a second way to go quietly
+# dead. Someone writes "standalone by design" once, nobody looks again, and the binary
+# rots under cover of its own excuse — which is exactly how bin/heimdall-brief would
+# have survived even WITH a reachability gate. So the date is not decoration: past it,
+# the gate FAILS until a human wires the tool up, deletes it, or re-justifies it with a
+# new date. Four rot conditions are enforced against this file, not one:
+#     MALFORMED  no name, no reason, or a recheck date that is not a real ISO date
+#     EXPIRED    past its recheck date
+#     STALE      the name is reachable again, so the exclusion is now hiding nothing
+#     ORPHAN     bin/<name> no longer exists, and a leftover row would silently
+#                pre-clear a future executable that reuses the name
+#
+# THIS FILE IS NOT A REFERENCE SURFACE. It names every exempt executable, so if the
+# scanner read it, writing an exemption would MAKE the binary look reachable and the
+# escape hatch would become the defect. reach_build() excludes it from the node set and
+# the scan set; test/bin-reachability-gate.test.sh §4 proves the exclusion holds.
+#
+# THREE HONEST CATEGORIES. Only the first is a compliment.
+#     BY DESIGN   no runtime caller is possible or wanted — a human runs it directly.
+#     KNOWN GAP   it SHOULD be wired and is not. Recorded rather than hidden.
+#     DEAD        unreachable, found by the 2026-08-08 transitive-liveness audit and
+#                 not yet triaged. Recorded so the ratchet can hold against NEW dead
+#                 code while these are decided. Short recheck window on purpose.
+#
+# ── BY DESIGN ────────────────────────────────────────────────────────────────────
+generate-changelog	2027-02-08	BY DESIGN — release tooling the maintainer runs when cutting a release
+heimdall-banner-test	2027-02-08	BY DESIGN — manual wcwidth acceptance harness for the launch banner; a human eyeballs it
+heimdall-headroom-ab	2027-02-08	BY DESIGN — maintainer-run A/B receipt harness for the Headroom pre-registration; two snapshots a week apart, then a report a human publishes
+heimdall-live-verify	2027-02-08	BY DESIGN — on-demand live isolation verification that emits a committed receipt
+heimdall-seed-demo-wall	2027-02-08	BY DESIGN — one-shot demo seeding a human runs before a demo
+heimdall-team-converge	2027-02-08	BY DESIGN — one-shot forward migration healing an existing team split; run once, by hand
+#
+# ── KNOWN GAP ────────────────────────────────────────────────────────────────────
+heimdall-board	2026-11-08	KNOWN GAP — a read-only view whose siblings (watch/dashboard/verdict/badge/clip) all have hmd case arms; this one has none
+heimdall-queue-mcp	2026-11-08	KNOWN GAP — MCP stdio server NOT registered in .mcp.json, while its sibling heimdall-ledger-mcp is
+heimdall-registry-hygiene	2026-11-08	KNOWN GAP — self-described MONTHLY job with no in-repo scheduler (no cron, LaunchAgent or workflow calls it)
+#
+# ── DEAD — the 2026-08-08 transitive-liveness finding, awaiting triage ───────────
+# Each of these passed the OLD flat "something mentions it" rule and fails the transitive
+# one. In every case the only mouths naming them are themselves unreachable: their own
+# implementation library, a sibling that is equally dead, or each other.
+heimdall-branch-context	2026-09-07	DEAD — named only by its own bin/lib/branch_context.py and by bin/heimdall-collision, which is itself dead. No live entry point reaches it.
+heimdall-check	2026-09-07	DEAD — the conformance checker over bin/lib/checker.py, named only by that library. README.md lists it as Shipped, which documents it without invoking it.
+heimdall-collision	2026-09-07	DEAD — named only by bin/heimdall-land and its own bin/lib/collision.py, both unreachable.
+heimdall-cost-model-refresh	2026-09-07	DEAD — named only by its own bin/lib/cp_cost_model.py. No scheduler, hook or dispatcher arm refreshes the cost model.
+heimdall-cost-report	2026-09-07	DEAD — named only by bin/lib/cp_cost_model.py and bin/heimdall-cost-model-refresh, both unreachable.
+heimdall-issue-corpus	2026-09-07	DEAD — named only by its own bin/lib/issue_corpus.py; the anonymized-issue-collection plan that specified it never wired a caller.
+heimdall-land	2026-09-07	DEAD — named by NOTHING outside itself, not even a library. Last edited 2026-08-05, so this is freshly-touched code with no invoker.
+heimdall-memory	2026-09-07	DEAD — the verified-memory CLI, named only by its own bin/lib/verified_memory.py.
+heimdall-report	2026-09-07	DEAD — named only by bin/lib/report.py and bin/lib/cp_dashboard.py, both unreachable.
+heimdall-s6-manifest	2026-09-07	DEAD — mutual citation with bin/heimdall-s6-sweep and nothing else. Two corpses vouching for each other, built the same week as heimdall-brief.
+heimdall-s6-sweep	2026-09-07	DEAD — mutual citation with bin/heimdall-s6-manifest and nothing else. The S-6 C3 breadth harness has no live caller.
+heimdall-task	2026-09-07	DEAD — named only by bin/heimdall-board, which is itself a recorded KNOWN GAP with no dispatch arm.
+heimdall-vm-bench	2026-09-07	DEAD — named only by its own bin/lib/vm_bench.py.

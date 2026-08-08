@@ -261,6 +261,20 @@ else
   bad "falsifier: word-boundary match is too strict — a real reference was missed"
 fi
 
+# 3a-bis. THE DEAD-CHAIN TRAP (heimdall-brief's historical shape, reconstructed).
+# bin/dead-caller is referenced by NOTHING live; bin/dead-callee is referenced ONLY
+# by bin/dead-caller. "Something mentions it" clears dead-callee — but the only
+# mouth naming it is itself a corpse. Reachability has to mean a path to a LIVE
+# entry point, so BOTH must flag.
+printf '#!/bin/sh\nexec bin/dead-callee\n' > "$SANDBOX/bin/dead-caller"; chmod +x "$SANDBOX/bin/dead-caller"
+printf '#!/bin/sh\nexit 0\n'               > "$SANDBOX/bin/dead-callee"; chmod +x "$SANDBOX/bin/dead-callee"
+SB2_UNREACHED="$(unreachable_in "$SANDBOX")"
+if printf '%s\n' "$SB2_UNREACHED" | grep -qx "dead-callee"; then
+  ok "falsifier: a bin named ONLY by another DEAD bin is still unreachable (dead chain closed)"
+else
+  bad "falsifier: DEAD CHAIN CLEARS — bin/dead-callee passes because bin/dead-caller names it, and nothing names bin/dead-caller. This is exactly how heimdall-brief read 'reachable' for two months."
+fi
+
 # 3b. …and the RULE A parser must actually reject a missing arm. Build a tiny
 #     heimdall-shaped script that advertises a command it never dispatches.
 FAKE="$SANDBOX/fake-heimdall"
