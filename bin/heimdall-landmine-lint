@@ -181,6 +181,16 @@ _RE_BARE_SUPERX='(^|[^A-Za-z0-9._/])/superx([/"'"'"' ]|$)'
 _RE_DQ_STRING='"[^"]*"'
 _RE_SQ_STRING="'[^']*'"
 _RE_READ_WORD='(^|[;&|({]|then|else|do)[[:space:]]*read([[:space:]]|$)'
+# `local`/`declare` as a COMMAND WORD. The substring test this replaced fired on the
+# word "local" inside ordinary prose in a quoted string ("… every worktree and local
+# branch is merged …"), which the name/deref walk below then read as a declaration.
+# Stripping quoted content instead is NOT an option here: the trap this class exists to
+# catch (`local a="$b" b=1`) lives INSIDE a double-quoted RHS, so blanking strings would
+# blind the rule. Requiring the keyword to open a command keeps both halves honest.
+_RE_LOCAL_WORD='(^|[;&|({]|then|else|do)[[:space:]]*(local|declare)([[:space:]]|$)'
+# A heredoc OPENER and the delimiter it names: `<<EOF`, `<<-EOF`, `<<'EOF'`, `<<"EOF"`.
+# The `[^<]`/`^` prefix is what keeps `<<<` (a herestring, not a heredoc) out.
+_RE_HEREDOC_OPEN="(^|[^<])<<-?[[:space:]]*[\"']?([A-Za-z_][A-Za-z0-9_]*)"
 _RE_PROMPT_FLAG='(^|[[:space:]])-[A-Za-z]*p([[:space:]]|$)'
 _RE_KEYPRESS_FLAG='(^|[[:space:]])-[A-Za-z]*[sn][A-Za-z0-9]*([[:space:]]|$)'
 _RE_TTY_GUARD='\[\[?[[:space:]]+!?[[:space:]]*-t[[:space:]]+0[[:space:]]'
@@ -297,10 +307,14 @@ scan_unguarded_var() {
   while IFS= read -r line; do
     lineno=$((lineno + 1))
     is_comment "$line" && continue
+    # Cheap substring gate first (skips the regex for the vast majority of lines),
+    # then the command-word test that decides. Prose containing the word "local"
+    # inside a string passes the substring gate and is rejected here.
     case "$line" in
       *local\ *|*declare\ *|*'	'local\ *) : ;;
       *) continue ;;
     esac
+    [[ $line =~ $_RE_LOCAL_WORD ]] || continue
     # Cheap literal pre-filter: the emit below requires a `$name` DEREFERENCE, so a
     # declaration line with no `$` on it anywhere cannot produce a finding. Strict
     # subset test — it cannot change a verdict, and it skips the sed/grep pipeline
@@ -456,9 +470,23 @@ scan_tty_read() {
   local l
   while IFS= read -r l; do lines+=("$l"); done < "$file"
   local n="${#lines[@]}" i
+  # Heredoc BODY is data, not code. A usage block (`cat <<EOF … read --subsystem NAME …`)
+  # documents a subcommand named `read`; without this the help text is read as an
+  # interactive prompt and the push is blocked on a line that never executes.
+  local hd_delim="" trimmed
   for (( i=0; i<n; i++ )); do
     line="${lines[$i]}"
     local lineno=$((i + 1))
+    if [ -n "$hd_delim" ]; then
+      # `<<-` strips leading TABS from the terminator; comparing the trimmed line
+      # closes both forms and costs nothing on the plain `<<` case.
+      trimmed="${line#"${line%%[![:space:]]*}"}"
+      [ "$trimmed" = "$hd_delim" ] && hd_delim=""
+      continue
+    fi
+    if [[ $line =~ $_RE_HEREDOC_OPEN ]]; then
+      hd_delim="${BASH_REMATCH[2]}"
+    fi
     is_comment "$line" && continue
     # Fast pre-filter: skip lines with no 'read' substring at all. This avoids the
     # sed subprocess for ~95% of lines, the main source of per-file overhead.
