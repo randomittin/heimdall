@@ -147,4 +147,111 @@ advisory at the point of consumption), and work at all outside python/shell/js.
 
 ## Q2 — What does the external `code-review-graph` module add beyond that?
 
-PENDING.
+**I could not obtain the module. It is not present on this machine.** What
+follows is therefore scoped to its one known *claimed* property —
+Tree-sitter multi-language parsing — and that property is labelled
+**documented-capability, NOT measured**. No feature comparison is offered,
+because I have no artifact to compare against and will not invent one.
+
+### Search performed (negative result, ~2 min)
+
+    $ grep -rl "code-review-graph\|code_review_graph" <repo>   # excl .git
+    -> only this file and two sibling analysis docs (i.e. our own prompts)
+
+    $ find /Users/rj/.claude /Users/rj/Downloads/heimdall -maxdepth 4 \
+        -iname "*code-review-graph*"                           -> (no output)
+
+    $ ls /Users/rj/.claude/plugins/data/
+    -> heimdall-inline, hmd-inline, superx-inline, caveman-caveman,
+       claude-mem-thedotmack, superpowers-*, security-guidance-*,
+       playwright-*, ralph-loop-*                              # no match
+
+    $ npm ls -g --depth=0 | grep -i graph                      -> (no output)
+    $ pip3 list | grep -i "code.review\|graph"                 -> (no output)
+
+Not installed as a plugin, not an npm global, not a pip package, not vendored.
+Per instruction, no internet search was attempted.
+
+### The delta on its one claimed property — and it is smaller than it sounds
+
+The claimed property is multi-language parsing via Tree-sitter. Measured local
+state (`bin/heimdall-graph index`, run above):
+
+    lang  javascript   48  tree-sitter
+    lang  python      149  python-ast (exact for static calls)
+    lang  shell       552  quote/heredoc state machine ... (heuristic)
+
+So the *symbol graph* speaks three languages. But the Tree-sitter substrate
+underneath it already speaks six:
+
+    $ python3 -c "import treesitter_ast, json; print(json.dumps(treesitter_ast.backend_info()))"
+    {"available": true, "source": "per-language-grammars", "reason": "",
+     "languages": ["javascript", "typescript", "tsx", "python", "go", "rust"]}
+
+**Tree-sitter multi-language parsing is already installed and reporting
+available in this repo.** The symbol graph simply does not wire it up. Three
+places pin it to JavaScript alone:
+
+- `bin/lib/symbolgraph.py:63-67` — `EXT_LANG` maps only `.py`, `.sh`/`.bash`,
+  `.js`/`.mjs`/`.cjs`. No `.ts`/`.tsx`/`.go`/`.rs`.
+- `bin/lib/symbolgraph.py:566-567` — `_load_treesitter` refuses unless
+  `"javascript" in info["languages"]`, discarding the other five.
+- `bin/lib/symbolgraph.py:571-572` — `_js_extract` hardcodes
+  `mod.extract_from_path(full, "javascript")`.
+
+Consequence for the overlap question: the headline capability of
+`code-review-graph`, as claimed, corresponds in-house to a **wiring gap in
+`symbolgraph.py`, not a missing capability**. Closing Q1's gap 2 (TypeScript /
+Go / Rust reaching the symbol graph, and therefore reaching `heimdall-brief`
+instead of making it refuse) is a change to those three sites plus per-language
+`_*_extract` glue — the parsers, the `Symbol`/`Reference` shapes, and the
+`backend_info()` probe already exist and already work.
+
+### What that property would NOT fix here
+
+Tree-sitter's language list above contains **no bash grammar**. On this repo,
+552 of 749 indexed files (74%) are shell, and shell is the weakest extractor in
+the system (heuristic, `bin/lib/symbolgraph.py:79-83`). The external module's
+claimed strength, if adopted wholesale, would leave the largest and least
+reliable slice of this codebase exactly as it is. For *this* repo, "more
+languages" is not where the accuracy is lost.
+
+### What I am explicitly NOT claiming
+
+I have no evidence about `code-review-graph`'s: graph schema or edge model;
+whether it does generation-side scoping at all or is review-side only (the name
+suggests review-side, which would make the Q1 overlap partial rather than
+total — **UNVERIFIED**); incremental indexing or cache-freshness semantics;
+whether it exposes callers / blast radius / impact; whether it fails loud or
+degrades silently on an unresolvable ref (the property Q1's wiring test spends
+most of its assertions on); accuracy vs. the python-ast path; license;
+performance; or maintenance status. Any of these could be a genuine addition.
+None of them can be asserted from here.
+
+### Q2 bottom line
+
+Module unobtainable locally — stated rather than papered over. On its one known
+claimed property, the honest delta is **narrow**: the multi-language Tree-sitter
+substrate is already present and available in-house
+(`javascript, typescript, tsx, python, go, rust`); only the symbol graph's
+extension table and language gate are pinned to JavaScript. Everything else
+about the module is unassessed, and the decision to adopt it should not be made
+on this document alone.
+
+---
+
+## Confidence summary
+
+| Claim | Basis |
+|---|---|
+| `heimdall-brief` is the generation-side composer, graph-backed | `bin/heimdall-brief:4-8, 96, 150, 168, 206` |
+| Brief emits spans/outlines, never bodies | `bin/heimdall-brief:200-211`; test `(d)` `:138` |
+| Unindexed file → brief refuses (exit 1) | `bin/heimdall-brief:213-216` |
+| Index = 749 files / 5998 symbols / 71746 edges | `bin/heimdall-graph index` output |
+| Outline 1209 B vs raw 34741 B | `wc -c` + `outline --limit 0 \| wc -c` |
+| Languages indexed = py / sh / js only | `bin/lib/symbolgraph.py:63-67` + index output |
+| Tree-sitter substrate has ts/tsx/go/rust today | `treesitter_ast.backend_info()` output |
+| Graph pinned to javascript alone | `bin/lib/symbolgraph.py:566-567, 571-572` |
+| No hook enforces span-scoped reads | **UNVERIFIED** — hook set not audited |
+| `code-review-graph` capabilities beyond Tree-sitter | **UNVERIFIED** — module not obtainable |
+| `code-review-graph` is review-side only | **UNVERIFIED** — inferred from name only |
