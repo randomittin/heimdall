@@ -145,15 +145,34 @@ _trace_order() {
 # is set, since Claude Code maps opus/sonnet/haiku to the newest of that tier. A
 # pin set via the environment is still honoured on the degraded path, so a bench
 # run can never silently resolve to the wrong model.
+#
+# THE REFUSAL IS NOT A DEGRADATION: the resolver denies a non-ZDR tier (fable) in
+# a repo that has not opted in. Falling back to the bare alias there would print
+# exactly the tier the policy just forbade, so a nonzero resolver exit propagates
+# instead of degrading, and its stderr is NOT swallowed. On the degraded path the
+# repo policy cannot be evaluated at all, so the non-ZDR tier is denied outright —
+# deny-by-default is the whole contract.
 resolve_model() {
-  local tier="$1" resolver="$PLUGIN_DIR/bin/heimdall-model-resolve" out=""
+  local tier="$1" resolver="$PLUGIN_DIR/bin/heimdall-model-resolve" out="" rc=0
   if [ -x "$resolver" ]; then
-    out="$("$resolver" "$tier" 2>/dev/null)" || out=""
+    out="$("$resolver" "$tier")" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+      printf 'heimdall: model tier %s refused by heimdall-model-resolve (exit %s)\n' \
+        "'$tier'" "$rc" >&2
+      return "$rc"
+    fi
   else
     case "$tier" in
       opus)   out="${HEIMDALL_MODEL_OPUS:-}" ;;
       sonnet) out="${HEIMDALL_MODEL_SONNET:-}" ;;
       haiku)  out="${HEIMDALL_MODEL_HAIKU:-}" ;;
+      fable)
+        printf 'heimdall: REFUSED tier %s — non-ZDR, and heimdall-model-resolve is\n' \
+          "'$tier'" >&2
+        printf '  unavailable at %s, so repo policy cannot be evaluated. Denying by default.\n' \
+          "$resolver" >&2
+        return 3
+        ;;
     esac
   fi
   printf '%s\n' "${out:-$tier}"
