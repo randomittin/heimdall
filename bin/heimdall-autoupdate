@@ -44,6 +44,37 @@
 #   * NO auth — the repo is public; we NEVER send a token to GitHub.
 #   * NEVER echoes or stores a secret. `set -uo pipefail`, never `set -x`.
 #
+# THE LIVENESS RECEIPT — this subsystem proves it REACHED, never merely that it ran.
+#   bin/lib/liveness-subsystems.conf declares autoupdate's subject as THE GITHUB RELEASES
+#   API, and bin/heimdall-liveness exists because COMPLETION IS NOT REACHABILITY: a check
+#   that exits 0 without ever hearing from GitHub cannot vouch for the version it reports.
+#   So the receipt brackets the RELEASES-API FETCH itself, never the run:
+#
+#     attempt                  immediately BEFORE the curl, so a run killed mid-fetch
+#                              reads attempted-never-completed instead of vanishing.
+#     complete --reached yes   ONLY when that response yielded a parseable release tag.
+#                              A tag in hand IS the proof the subject answered.
+#     complete --reached no    when the fetch was made and produced no usable release
+#                              data — curl failed, empty body, or no tag_name in it.
+#     nothing at all           when this run never TOUCHED the API: throttled, opted out,
+#                              HEIMDALL_LATEST_OVERRIDE injected, or no curl on PATH. An
+#                              attempt that never happened is not a failure, and recording
+#                              one would be a forgery in the other direction. The receipt
+#                              simply ages, and heimdall-liveness DERIVES the missed cycles
+#                              from that age (manifest: 86400s, N=7).
+#
+#   The subject is a URL, so heimdall-liveness cannot probe it and our explicit --reached
+#   IS the whole verdict — which is exactly why it is computed from the RESPONSE and never
+#   from this script's exit status. The `git ls-remote` fallback below still resolves a
+#   version when the API is down; it resolves the same NUMBER without touching the declared
+#   subject, so it can never turn a `no` into a `yes`.
+#
+#   Only the SCHEDULED path (`check` / `--force`, which is the manifest's own remedy)
+#   writes a receipt. Crediting the background job's health to a human running `status` or
+#   `hmd --update` by hand would rebuild the self-silencing monitor this receipt ends.
+#   BEST-EFFORT ON EVERY PATH: a missing or failing heimdall-liveness is a clean no-op,
+#   because a SessionStart hook that breaks the session is worse than an absent receipt.
+#
 # ENV / OVERRIDES (all HEIMDALL_*):
 #   HEIMDALL_NO_AUTOUPDATE=1        opt out (also: ${HOME}/.heimdall/no-autoupdate file).
 #   HEIMDALL_UPDATE_INTERVAL=86400  throttle window in seconds (default 24h).
@@ -84,6 +115,12 @@ STAMP="$HMD_HOME/.last-update-check"
 OPT_OUT_FILE="$HMD_HOME/no-autoupdate"
 LOG_FILE="$HMD_HOME/autoupdate.log"
 
+# The liveness receipt writer, resolved beside THIS script exactly like
+# ask_dream_permission resolves heimdall-dream-permission. HMD_LIVENESS_BIN is a TEST seam
+# mirroring HMD_MODULES_BIN below — it lets the suite point the receipt at a stub, or at
+# nothing to prove the no-op. Never set in production.
+LIVENESS_BIN="${HMD_LIVENESS_BIN:-$SELF_DIR/heimdall-liveness}"
+
 # ── the module system's view (mirrors bin/heimdall-modules' OWN defaults exactly) ──
 # Same env vars, same fallbacks, so redirecting one redirects both and a test can point
 # the pair at a throwaway tree. HMD_MODULES_BIN is a TEST seam: it lets the acceptance
@@ -103,6 +140,28 @@ log_line() {
   mkdir -p "$HMD_HOME" 2>/dev/null || return 0
   local ts; ts="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo '?')"
   printf '%s %s\n' "$ts" "$1" >> "$LOG_FILE" 2>/dev/null || true
+}
+
+# Write one liveness receipt line (see THE LIVENESS RECEIPT in the header).
+#   live_record <attempt|complete> <yes|no|""> <detail>
+# Best-effort on every path: an absent, non-executable or failing heimdall-liveness is a
+# silent no-op, because this runs from a SessionStart hook and must never cost a session.
+# HEIMDALL_HOME is passed explicitly so the receipt always lands beside this updater's own
+# stamp + log, even when a caller set it without exporting it. --subject is the release API
+# URL — a non-path label heimdall-liveness cannot probe, so our --reached is the verdict.
+live_record() {
+  [ -x "$LIVENESS_BIN" ] || return 0
+  local mode="$1" reached="${2:-}" detail="${3:-}"
+  if [ -n "$reached" ]; then
+    HEIMDALL_HOME="$HMD_HOME" "$LIVENESS_BIN" "$mode" \
+      --subsystem autoupdate --subject "$RELEASES_API" \
+      --reached "$reached" --detail "$detail" >/dev/null 2>&1 || true
+  else
+    HEIMDALL_HOME="$HMD_HOME" "$LIVENESS_BIN" "$mode" \
+      --subsystem autoupdate --subject "$RELEASES_API" \
+      --detail "$detail" >/dev/null 2>&1 || true
+  fi
+  return 0
 }
 
 # Strip a leading v and any suffix → a bare X.Y.Z (or '' if not clean semver).
@@ -149,19 +208,32 @@ installed_version() {
 #   2. GitHub releases/latest → .tag_name (no auth; ~5s timeout).
 #   3. git ls-remote --tags → highest semver (fallback when the API is unreachable).
 # Prints a bare X.Y.Z, or '' if nothing resolves (caller treats '' as a clean no-op).
+#
+# $1 == "receipt" ⇒ THIS call is the scheduled subsystem reaching its declared subject, so
+# bracket step 2 with the liveness receipt (see THE LIVENESS RECEIPT in the header). Every
+# other caller resolves the same version silently: `status` and the manual `update` are a
+# human at a keyboard, and their reach says nothing about whether the background job runs.
 latest_version() {
+  local receipt="${1:-}"
+
   local override; override="$(norm_semver "${HEIMDALL_LATEST_OVERRIDE:-}")"
   if [ -n "$override" ]; then
+    # Injected — the API was never contacted, so there is nothing to record either way.
     printf '%s' "$override"; return 0
   fi
 
-  local tag=""
+  local tag="" body="" attempted=0 crc=0
   # 2. Releases API. -f fails on HTTP errors, --max-time bounds the call so an
   # unreachable/slow API can never stall SessionStart. NO Authorization header.
   if command -v curl >/dev/null 2>&1; then
-    local body
+    attempted=1
+    if [ "$receipt" = "receipt" ]; then
+      live_record attempt "" "GET $RELEASES_API"
+    fi
+    # `|| crc=$?` keeps the failure non-fatal AND readable: curl's exit code is the concrete
+    # outcome the receipt reports. A command substitution, not a pipe, so $? is curl's own.
     body="$(curl -fsSL --max-time 5 -H 'Accept: application/vnd.github+json' \
-              "$RELEASES_API" 2>/dev/null || true)"
+              "$RELEASES_API" 2>/dev/null)" || crc=$?
     if [ -n "$body" ]; then
       if command -v jq >/dev/null 2>&1; then
         tag="$(printf '%s' "$body" | jq -r '.tag_name // empty' 2>/dev/null || true)"
@@ -173,9 +245,29 @@ latest_version() {
     fi
   fi
   tag="$(norm_semver "$tag")"
+
+  # THE VERDICT, decided by what the API actually returned — never by an exit status. A
+  # parseable tag IS the proof the subject answered; every other outcome is a fetch that
+  # happened and failed, named precisely enough to act on. Nothing is recorded when curl
+  # is absent: that run never reached for the API at all.
+  if [ "$attempted" = "1" ] && [ "$receipt" = "receipt" ]; then
+    if [ -n "$tag" ]; then
+      live_record complete yes "releases API answered: tag v$tag"
+    elif [ "$crc" -ne 0 ]; then
+      live_record complete no "releases API fetch failed (curl exit $crc)"
+    elif [ -z "$body" ]; then
+      live_record complete no "releases API returned an empty body"
+    else
+      live_record complete no "releases API response carried no parseable tag_name"
+    fi
+  fi
+
   if [ -n "$tag" ]; then printf '%s' "$tag"; return 0; fi
 
   # 3. ls-remote fallback (no local mutation). Highest clean vMAJOR.MINOR.PATCH tag.
+  # It resolves the same NUMBER from a DIFFERENT endpoint, so it deliberately does not
+  # amend the verdict above: a `yes` written here would assert reach of a releases API
+  # that never answered — the exact overclaim the receipt exists to prevent.
   if command -v git >/dev/null 2>&1; then
     local tags
     tags="$(GIT_TERMINAL_PROMPT=0 git ls-remote --tags --refs "$LSREMOTE_URL" 'v[0-9]*' 2>/dev/null \
@@ -890,7 +982,10 @@ run_check() {
 
   local installed latest
   installed="$(installed_version)"
-  latest="$(latest_version)"
+  # `receipt` — THIS is the scheduled subsystem's own reach of the releases API, and the
+  # only call in this file that writes a liveness receipt. The throttled and opted-out
+  # runs returned above without ever getting here, so they record nothing at all.
+  latest="$(latest_version receipt)"
 
   # Can't resolve either side (offline / parse-fail / no version) → clean no-op.
   if [ -z "$installed" ] || [ -z "$latest" ]; then
