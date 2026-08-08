@@ -32,6 +32,7 @@ bad() { FAIL=$((FAIL+1)); printf "  \033[31mFAIL\033[0m %s\n" "$1"; }
 
 XS="$(printf 'X%.0s' 1 2 3 4 5 6 7 8)"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/hmd-land-test.$XS")"
+[ -n "$WORK" ] || { echo "FATAL: WORK path empty (mktemp failed)" >&2; exit 2; }
 trap 'rm -rf "$WORK"' EXIT
 
 git_q() { git -C "$1" "${@:2}"; }
@@ -39,6 +40,7 @@ mkrepo() {
   # $1 = name -> creates a bare remote + a working clone, returns the clone path
   local name="$1"
   local bare="$WORK/$name.git" clone="$WORK/$name"
+  [ -n "$bare" ] || { echo "FATAL: bare path empty" >&2; exit 1; }
   git init -q --bare "$bare"
   git init -q "$clone"
   git -C "$clone" config user.email t@t.dev

@@ -40,6 +40,7 @@ for f in "$LIB" "$EV_LIB"; do [ -f "$f" ] || { echo "FATAL: $f missing" >&2; exi
 PY="$(command -v python3 || command -v python)"
 
 WORK="$(mktemp -d -t "issue-loop-claude-fix.$(printf 'X%.0s' 1 2 3 4 5 6)")"
+[ -n "$WORK" ] || { echo "FATAL: WORK path empty (mktemp failed)" >&2; exit 2; }
 trap 'rm -rf "$WORK"' EXIT
 
 export PYTHONPATH="$ROOT/bin/lib:${PYTHONPATH:-}"
