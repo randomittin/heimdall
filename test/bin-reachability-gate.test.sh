@@ -130,20 +130,36 @@ EOF
   printf "         → wire it into a dispatch path, or add a reasoned, dated row to bin/lib/reachability-exemptions.tsv.\n"
 fi
 
-# 2b. The registry must not rot: an entry that has since been wired up is stale,
-#     and a stale exclusion is how a gate quietly stops gating.
-STALE=""
-for n in generate-changelog heimdall-banner-test heimdall-board heimdall-headroom-ab \
-         heimdall-live-verify heimdall-queue-mcp heimdall-registry-hygiene \
-         heimdall-seed-demo-wall heimdall-team-converge; do
-  if [ -f "$ROOT/bin/$n" ] && reach_is_live "$WORK" "$n"; then
-    STALE="$STALE $n"
-  fi
-done
-if [ -z "$STALE" ]; then
-  ok "exemption registry has no stale entries (every listed name is genuinely unreachable)"
+# 2b. The registry must not rot: an exclusion that outlives its reason is how a gate
+#     quietly stops gating.
+#
+#     This used to be a hardcoded list of NINE NAMES — a copy of the registry, kept in
+#     a file that is not the registry, checking exactly one rot condition. It rotted in
+#     both directions at once. It could not see a row for any other name, so twenty-two
+#     rows were watched by nine. And it judged those nine with the flat matcher, so it
+#     reported all nine "now wired, remove them" when re-checking each one against a
+#     live entry point says every one is still unreachable. Deleting those rows on that
+#     advice would have turned nine acknowledged-dead tools into nine surprise failures.
+#
+#     The engine already audits EVERY row against five rot conditions. Ask it instead of
+#     keeping a second, smaller, staler copy of the question:
+#       MALFORMED  no name, no reason, or a recheck date that is not a real ISO date
+#       DUPLICATE  listed twice, so the later reason is invisible
+#       EXPIRED    past its recheck date — re-justify it, wire it, or delete it
+#       STALE      reachable again, so the exclusion is now hiding nothing
+#       ORPHAN     bin/<name> is gone; the row would pre-clear a future namesake
+ROT="$(reach_exempt_audit "$ROOT" "$WORK")"
+EXEMPT_ROWS="$(reach_exempt_rows "$ROOT" | grep -c . || true)"
+if [ -z "$ROT" ]; then
+  ok "all $EXEMPT_ROWS exemption rows are well-formed, in-date, and still genuinely unreachable"
 else
-  bad "STALE EXEMPTIONS (now reachable — remove the rows so the gate keeps gating):$STALE"
+  while IFS= read -r r; do
+    [ -n "$r" ] || continue
+    bad "EXEMPTION ROT: $(printf '%s' "$r" | tr '\t' ' ')"
+  done <<EOF
+$ROT
+EOF
+  printf "         → bin/lib/reachability-exemptions.tsv: fix the row, or wire the tool up and delete it.\n"
 fi
 
 # 2c. The one that started this: heimdall-git-guard must stay wired. Named
@@ -258,7 +274,33 @@ else
   bad "falsifier: the exemption file VOUCHED for bin/orphan-tool — writing an exemption would make a dead bin read as wired"
 fi
 
-# 3d. …and the RULE A parser must actually reject a missing arm. Build a tiny
+# 3d. The registry rot audit must be able to go RED. §2b passes when the audit returns
+#     nothing, so "no rot found" and "the audit stopped looking" render identically
+#     unless something forces the difference. Feed it one row of each rot kind and
+#     require all five back. HMD_REACH_TODAY is the library's documented test seam, set
+#     here only so EXPIRED does not depend on the day the suite runs.
+{ printf 'bad-date\tnope\tdate is not a real ISO date\n'
+  printf 'ghost-tool\t2099-01-01\tno bin of this name exists\n'
+  printf 'wired-tool\t2099-01-01\tclaims standalone, but a hook reaches it\n'
+  printf 'orphan-tool\t2000-01-01\trecheck date long past\n'
+  printf 'orphan-tool\t2099-01-01\tsecond row for a name already listed\n'
+} > "$SANDBOX/bin/lib/reachability-exemptions.tsv"
+
+HMD_REACH_TODAY="2026-06-01"
+ROT_SB="$(reach_exempt_audit "$SANDBOX" "$SBW2")"
+unset HMD_REACH_TODAY
+
+ROT_MISSING=""
+for k in MALFORMED ORPHAN STALE EXPIRED DUPLICATE; do
+  printf '%s\n' "$ROT_SB" | grep -q "^$k" || ROT_MISSING="$ROT_MISSING $k"
+done
+if [ -z "$ROT_MISSING" ]; then
+  ok "falsifier: registry audit catches all five rot kinds (malformed, orphan, stale, expired, duplicate)"
+else
+  bad "falsifier: registry audit MISSED rot kind(s):$ROT_MISSING — a rotten exemption row would pass §2b unseen"
+fi
+
+# 3e. …and the RULE A parser must actually reject a missing arm. Build a tiny
 #     heimdall-shaped script that advertises a command it never dispatches.
 FAKE="$SANDBOX/fake-heimdall"
 { printf '%s\n' '  echo "  heimdall ghostcmd       Advertised but never routed"'
