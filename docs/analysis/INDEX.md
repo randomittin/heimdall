@@ -7,7 +7,8 @@
 | Doc | Purpose | Status |
 | --- | --- | --- |
 | [autoresearch-distilled.md](autoresearch-distilled.md) | Distilled, transferable mechanics from the autoresearch investigation. | Current (tracked) |
-| [token-spend-forensics.md](token-spend-forensics.md) | Where the token spend actually goes, measured from session transcripts; causes ranked by cost. Re-runnable via [`token-spend-forensics.py`](token-spend-forensics.py). | Current (tracked) |
+| [token-spend-forensics.md](token-spend-forensics.md) | Where the token spend actually goes, measured from session transcripts; causes ranked by cost. Re-runnable via [`token-spend-forensics.py`](token-spend-forensics.py). | Current (tracked) — **row 3 refuted 2026-08-08** |
+| [2026-08-08-security-review-tier-decision.md](2026-08-08-security-review-tier-decision.md) | Why the `security-guidance` reviewer stays on opus: the $57.73 was mis-attributed to the Stop hook and the prescribed fix saved $0. Pins the tier so it is not re-litigated. Guarded by `test/security-review-tier.test.sh`. | Current (tracked) |
 
 ## Local-only (gitignored — generated, not committed)
 

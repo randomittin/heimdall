@@ -16,13 +16,13 @@ Total measured spend: **$1,103.05**. Commits landed in the window: **480**. Blen
 |---|---|---|---|---|---|
 | 1 | **Context never reset.** One 15-day session held a working set that grew to 998,857 tokens and re-read it 2,022 times | **$913.54** (session total); **$369.50** provably recoverable | 82.8% of spend; 33.5% recoverable | **Waste** (the re-reading), inherent (the turns) | Restart/compact at ~150K. His own 2026-08-07 data already proves 6.2× |
 | 2 | **Cache-write blow-up above 800K context.** cache-create jumps 3.2× once context clears 800K | **$118.92** | 10.8% | **Waste** | Same fix as #1 — never operate above ~800K |
-| 3 | **`security-guidance` plugin Stop hook** firing Opus-4-7 on every stop-with-diff, 89 times | **$57.73** | 5.2% | **Waste** (right check, wrong tier) | `export SECURITY_REVIEW_MODEL=claude-haiku-4-5` → ~$11.55, saves **$46.18** |
+| 3 | ~~**`security-guidance` plugin Stop hook** firing Opus-4-7 on every stop-with-diff, 89 times~~ **REFUTED — wrong hook.** It is the PostToolUse commit/push *agentic* review; the Stop hook contributed $0 | **$57.73** | 5.2% | **Inherent** (right check, right tier) | ~~`export SECURITY_REVIEW_MODEL=claude-haiku-4-5`~~ saves **$0.00** — wrong knob. See [`2026-08-08-security-review-tier-decision.md`](./2026-08-08-security-review-tier-decision.md) |
 | 4 | **Preamble carried on every request.** Median 35,174 tok of system prompt + CLAUDE.md stack + hooks, re-read 2,930× | **~$51.53** (estimate) | 4.7% | **Inherent** (mostly) — it is cached at 0.1× and works | Trimming 10K off the stack saves ~$14.65. Low priority |
 | 5 | **Read-only research subagents.** 141 worktree agents; 140 wrote zero files | **$75.04** | 6.8% | **Inherent** — this is correct delegation | Keep. This is what keeps #1 from being worse |
 | 6 | **Re-reading the same file** across sessions — 203 redundant reads, 2.34 MB (55% of all Read bytes) | **~$5.85** (estimate) | 0.5% | **Waste** | Real but immaterial. Do not spend effort here |
 | 7 | **Full test-suite runs** (`bash test/run-all.sh`) — 25 invocations | **6,543 bytes total** | ~0.0% | **Inherent, already optimal** | Nothing to fix — output is already redirected to files |
 
-**Addressable total: ~$540.45 (49.0%)** — and none of it requires giving up a single verification.
+**Addressable total: ~$505 (45.8%)** — and none of it requires giving up a single verification. *(Corrected 2026-08-08: row 3's $46.18 was refuted and removed; the honest Stop-surface saving of ~$8–$14 replaces it. See §Row 3.)*
 
 ---
 
@@ -136,6 +136,8 @@ Pearson r(context, cache-create) across all 2,048 requests is only 0.092 — the
 
 ## Row 3 — The security hook · $57.73
 
+> **⚠ REFUTED 2026-08-08 — this row named the wrong hook and the wrong knob.** The measurement below ($57.73, opus-4-7, 646/646) is sound; the *attribution* and the *fix* are not. The spend is the plugin's **PostToolUse commit/push agentic review** (`SG_AGENTIC_MODEL`), not the Stop hook (`SECURITY_REVIEW_MODEL`) — the Stop hook posts over raw HTTP, writes no session transcript, and so contributed **$0.00** to a figure derived entirely from session transcripts. The prescribed export would therefore have saved **nothing**. Aimed at the correct knob it would have saved ~$46 by downgrading a genuine, tool-using vulnerability reviewer below the tier `bin/heimdall:3691` reserves for security work. **The tier stays opus and this line is irreducible.** Full evidence, the honest ~$8–$14/window alternative, and the config that needs the owner's hand: [`2026-08-08-security-review-tier-decision.md`](./2026-08-08-security-review-tier-decision.md). The paragraphs below are retained as originally written, for provenance.
+
 89 sessions with entrypoint `sdk-py` whose first prompt begins `"Review this change for security vulnerabilities."`
 
 - **646 requests, 37,413,500 tokens, $57.73, mean $0.65/run**, 2026-07-14 → 2026-08-06
@@ -216,7 +218,7 @@ Holding the same 3,830 verified turns at a 150K context yields **~$733.55** inst
 
 1. **Restart or compact the session at ~150K context** — saves **$369.50** (33.5%). Zero verifications lost. Already demonstrated at 6.17× on 2026-08-07.
 2. **Never operate above 800K context** — saves **$118.92** in cache-write blow-up. Same discipline as #1.
-3. **`export SECURITY_REVIEW_MODEL=claude-haiku-4-5`** — saves **$46.18**. One line, keeps the check.
+3. ~~`export SECURITY_REVIEW_MODEL=…`~~ **REFUTED — do not run.** It saves **$0.00**: it retiers the Stop hook, which contributed nothing to the $57.73 (that spend is the *agentic* commit/push review, knob `SG_AGENTIC_MODEL`), and setting the var also suppresses the plugin's fallback. The measured spend is the correct check on the correct tier — **irreducible**. A real ~$8–$14/window saving exists on the Stop surface via `MAX_STOP_HOOK_FIRINGS`. Full reasoning and the owner-applied config: [`2026-08-08-security-review-tier-decision.md`](./2026-08-08-security-review-tier-decision.md).
 4. Trim the CLAUDE.md/hook preamble — ~$1.47 per 1K tokens removed. Marginal.
 5. Do nothing about cache TTL, test-suite output, duplicate reads, or output tokens. Measured, and they are not the problem.
 
