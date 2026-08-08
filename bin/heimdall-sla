@@ -1,0 +1,294 @@
+#!/usr/bin/env bash
+# heimdall-sla — the 24h SLA on ⚠-class observations.
+#
+# THE BUG THIS FIXES IS THE AGING, NOT THE DEFECT.
+#   A recorded fail-open observation sat known-and-unfixed for three days. Nothing was
+#   broken while it did: the observation was filed, stored and queryable the whole time.
+#   It simply aged into invisibility, because no surface ever asked "is this still
+#   unactioned?" A defect queue where an unactioned item can quietly get older is the
+#   same disease as a monitor that can quietly stop — in both cases the absence of a
+#   signal is indistinguishable from the absence of a problem.
+#
+# THE RULE
+#   Every ⚠-class observation must, within 24h of being filed, either be FIXED or carry a
+#   durable recorded triage reason a human wrote. An item with no verdict is a BREACH.
+#   Being old is not a defence — age is the symptom, never the excuse.
+#
+# WHAT COUNTS AS ⚠-CLASS (two lanes, because one is not enough)
+#   lane A  observations typed security_alert / security_note / sensitive — the ⚠ ⚷ ⊘
+#           markers in the claude-mem digest (the glyphs are display-only; the stored
+#           type is the literal lowercase string).
+#   lane B  fail-open-class findings HOWEVER they were typed. This lane exists because
+#           the observation that motivated this whole gate — the dream fail-open bug —
+#           was filed as `discovery` and carried no security marker at all. A check that
+#           trusted the type field would have been blind to its own founding example.
+#
+# WHERE TRIAGE LIVES
+#   .planning/ledger/decisions.md — the existing git-tracked, append-only, HAID-attributed
+#   decision log. No new store. An entry clears an item when it carries, in one block:
+#
+#     SLA-OBS: 16105
+#     SLA-VERDICT: FALSE-POSITIVE
+#     SLA-REASON: <why — a real sentence, >= 40 chars, written by a person>
+#     (and a `haid:` attribution somewhere in the entry)
+#
+#   Verdicts: FIXED · FALSE-POSITIVE · ACCEPTED-RISK · WONTFIX · DEFERRED.
+#   DEFERRED additionally REQUIRES `SLA-UNTIL: YYYY-MM-DD` and re-opens by itself the day
+#   it expires — otherwise "defer" would be a rename of the exact aging this gate kills.
+#
+# SECRECY (deliberate, load-bearing)
+#   Default output, --advise and the weekly section carry the observation ID, its type and
+#   its age — never its TITLE. Titles in this store demonstrably contain live secrets
+#   (session tokens, device addresses, merchant names). The report names an item and its
+#   status; it does not publish the vulnerability. --verbose shows titles for the local
+#   operator, who already has the store on disk. This mirrors INV-C: security detail stays
+#   local, counted opaquely rather than republished.
+#
+# FAIL-CLOSED
+#   Exit 2 (BLIND) when the store cannot be read, when it is empty, or when the ⚠
+#   vocabulary matches nothing across the whole store — that last one is how a classifier
+#   rename would otherwise turn this gate silently green forever. An empty scan is never
+#   an all-clear.
+#
+# USAGE
+#   heimdall-sla [--repo DIR] [--project NAME | --all-projects] [--window-hours N]
+#                [--db PATH] [--decisions PATH] [--deep] [--json|--advise|--verbose]
+#
+# EXIT  0 = no breach · 1 = at least one BREACH · 2 = BLIND (could not scan)
+#       --advise always exits 0: a SessionStart monitor may never break the session.
+
+set -u
+
+REPO=""; DB=""; DECISIONS=""; PROJECT=""; ALL_PROJECTS=0
+WINDOW_H=24; NOW=""; DEEP=0; JSON=0; VERBOSE=0; ADVISE=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    check)            shift ;;
+    --repo)           REPO="${2:-}"; shift 2 ;;
+    --db)             DB="${2:-}"; shift 2 ;;
+    --decisions)      DECISIONS="${2:-}"; shift 2 ;;
+    --project)        PROJECT="${2:-}"; shift 2 ;;
+    --all-projects)   ALL_PROJECTS=1; shift ;;
+    --window-hours)   WINDOW_H="${2:-24}"; shift 2 ;;
+    --now)            NOW="${2:-}"; shift 2 ;;
+    --deep)           DEEP=1; shift ;;
+    --json)           JSON=1; shift ;;
+    --verbose|-v)     VERBOSE=1; shift ;;
+    --advise)         ADVISE=1; shift ;;
+    --help|-h)        sed -n '2,62p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *)                shift ;;
+  esac
+done
+
+[ -n "$REPO" ]      || REPO="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+[ -n "$DB" ]        || DB="${CLAUDE_MEM_DB:-${CLAUDE_MEM_DATA_DIR:-$HOME/.claude-mem}/claude-mem.db}"
+[ -n "$DECISIONS" ] || DECISIONS="$REPO/.planning/ledger/decisions.md"
+[ -n "$PROJECT" ]   || PROJECT="$(basename "$REPO")"
+[ -n "$NOW" ]       || NOW="$(date -u +%s)"
+case "$WINDOW_H" in ''|*[!0-9]*) WINDOW_H=24 ;; esac
+window_s=$(( WINDOW_H * 3600 ))
+
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/hmd-sla.XXXXXX")" || WORK=""
+cleanup() { [ -n "$WORK" ] && rm -rf "$WORK"; }
+trap cleanup EXIT
+
+# ── BLIND: the fail-closed exit ──────────────────────────────────────────────────
+# Reached only when the check cannot prove it actually read the store. It never returns
+# 0, because "I found no breaches" and "I could not look" must never render the same.
+blind() {
+  local why="$1"
+  if [ "$JSON" = 1 ]; then
+    printf '{"status":"blind","reason":"%s","breaches":0,"within_window":0,"triaged":0,"scanned":0,"db":"%s"}\n' "$why" "$DB"
+  elif [ "$ADVISE" = 1 ]; then
+    printf '[heimdall] SECURITY SLA IS BLIND — %s · a check that cannot see is not an all-clear · detail: heimdall-sla --verbose\n' "$why"
+    exit 0
+  else
+    printf 'SLA BLIND — %s\n' "$why" >&2
+    printf '  A check that cannot read its source is not an all-clear. Failing closed.\n' >&2
+    printf '  store: %s\n' "$DB" >&2
+  fi
+  exit 2
+}
+
+command -v sqlite3 >/dev/null 2>&1 || blind "sqlite3 is not installed, so the observation store cannot be read"
+[ -f "$DB" ] || blind "the observation store is unreadable or missing at $DB"
+
+q() { sqlite3 "file:$DB?mode=ro" "$1" 2>/dev/null; }
+
+# ── liveness probes: prove the store was really read ─────────────────────────────
+TOTAL="$(q 'SELECT COUNT(*) FROM observations;')"
+case "${TOTAL:-}" in ''|*[!0-9]*) blind "the observations table could not be queried at $DB" ;; esac
+[ "$TOTAL" -gt 0 ] || blind "the observation store is EMPTY (0 rows) — nothing was scanned"
+
+# The monitor-silently-stopped detector. Today 78 rows carry a ⚠ type. If a classifier
+# rename ever made that zero across the WHOLE store, every future scan would report a
+# clean queue forever. That is the failure this gate was built to prevent, so it is a
+# blind exit rather than a pass.
+CLASSTOTAL="$(q "SELECT COUNT(*) FROM observations WHERE type IN ('security_alert','security_note','sensitive');")"
+case "${CLASSTOTAL:-}" in ''|*[!0-9]*) CLASSTOTAL=0 ;; esac
+[ "$CLASSTOTAL" -gt 0 ] || blind "the ⚠ type vocabulary matched NOTHING in $TOTAL observations — the classifier or the type names changed and this check is blind"
+
+# ── the two lanes ────────────────────────────────────────────────────────────────
+if [ "$DEEP" = 1 ]; then
+  HAY="lower(coalesce(title,'')||' '||coalesce(subtitle,'')||' '||coalesce(text,'')||' '||coalesce(narrative,'')||' '||coalesce(facts,''))"
+else
+  HAY="lower(coalesce(title,'')||' '||coalesce(subtitle,''))"
+fi
+LANE_A="type IN ('security_alert','security_note','sensitive')"
+LANE_B="($HAY LIKE '%fail-open%' OR $HAY LIKE '%fail open%' OR $HAY LIKE '%fails open%' OR $HAY LIKE '%failing open%' OR $HAY LIKE '%self-silenc%')"
+
+if [ "$ALL_PROJECTS" = 1 ]; then SCOPE="1=1"; else SCOPE="project = '$(printf '%s' "$PROJECT" | sed "s/'/''/g")'"; fi
+
+ROWS="$WORK/rows.txt"
+q "SELECT id||'|'||type||'|'||(created_at_epoch/1000)||'|'||replace(replace(coalesce(title,''),'|','/'),char(10),' ')||'|'||CASE WHEN $LANE_A THEN 'A' ELSE 'B' END
+   FROM observations WHERE $SCOPE AND ($LANE_A OR $LANE_B) ORDER BY created_at_epoch ASC;" > "$ROWS"
+
+# ── the recorded triage verdicts ─────────────────────────────────────────────────
+# One record per (observation id) named by an entry, carrying everything needed to judge
+# whether a REASON was actually written: id|verdict|reason_len|has_haid|ack_like|until
+VERDICTS="$WORK/verdicts.txt"
+: > "$VERDICTS"
+if [ -f "$DECISIONS" ]; then
+  awk '
+    function flush(  n,a,k,lr,ack) {
+      if (ids != "") {
+        lr = tolower(reason)
+        gsub(/^[ \t]+/, "", lr); gsub(/[ \t.!]+$/, "", lr)
+        ack = (lr ~ /^(ack|acked|acknowledged|noted|seen|ok|okay|fine|na|n\/a|known|todo|tbd|later|wontfix|-+|\?+)$/) ? 1 : 0
+        n = split(ids, a, /[ ,]+/)
+        for (k = 1; k <= n; k++)
+          if (a[k] ~ /^[0-9]+$/)
+            printf "%s|%s|%d|%d|%d|%s\n", a[k], verdict, length(reason), haid, ack, until
+      }
+      ids = ""; verdict = ""; reason = ""; haid = 0; until = ""
+    }
+    /^##[ \t]/            { flush(); next }
+    /^SLA-OBS:/           { s = $0; sub(/^SLA-OBS:[ \t]*/, "", s);     ids = ids " " s; next }
+    /^SLA-VERDICT:/       { s = $0; sub(/^SLA-VERDICT:[ \t]*/, "", s); gsub(/[ \t]+$/, "", s); verdict = toupper(s); next }
+    /^SLA-REASON:/        { s = $0; sub(/^SLA-REASON:[ \t]*/, "", s);  reason = s; next }
+    /^SLA-UNTIL:/         { s = $0; sub(/^SLA-UNTIL:[ \t]*/, "", s);   gsub(/[^0-9-]/, "", s); until = s; next }
+    /haid:/               { haid = 1 }
+    END                   { flush() }
+  ' "$DECISIONS" > "$VERDICTS" 2>/dev/null || : > "$VERDICTS"
+fi
+
+to_epoch_day() { date -u -j -f "%Y-%m-%d %H:%M:%S" "$1 23:59:59" +%s 2>/dev/null || date -u -d "$1 23:59:59" +%s 2>/dev/null; }
+
+# A verdict CLEARS an item only if it is a closed-vocabulary token, carries a substantive
+# reason, and is attributable. Anything less is an acknowledgement, and an acknowledgement
+# is what let the original observation age for three days.
+MIN_REASON=40
+verdict_for() { # <obs id> -> "" when nothing valid clears it, else "<VERDICT>"
+  local oid="$1" line v rlen haid ack until
+  line="$(grep "^$oid|" "$VERDICTS" 2>/dev/null | tail -1)"
+  [ -n "$line" ] || return 0
+  v="$(printf '%s' "$line" | cut -d'|' -f2)"
+  rlen="$(printf '%s' "$line" | cut -d'|' -f3)"
+  haid="$(printf '%s' "$line" | cut -d'|' -f4)"
+  ack="$(printf '%s' "$line" | cut -d'|' -f5)"
+  until="$(printf '%s' "$line" | cut -d'|' -f6)"
+  case "$v" in FIXED|FALSE-POSITIVE|ACCEPTED-RISK|WONTFIX|DEFERRED) ;; *) return 0 ;; esac
+  [ "$haid" = 1 ] || return 0
+  [ "$ack" = 0 ] || return 0
+  [ "${rlen:-0}" -ge "$MIN_REASON" ] || return 0
+  if [ "$v" = DEFERRED ]; then
+    # A deferral with no expiry would be this gate's own aging loophole, so it needs one
+    # and it re-opens by itself the moment it lapses.
+    [ -n "$until" ] || return 0
+    local ue; ue="$(to_epoch_day "$until")"
+    [ -n "$ue" ] || return 0
+    [ "$NOW" -le "$ue" ] || return 0
+  fi
+  printf '%s' "$v"
+}
+
+# ── evaluate ─────────────────────────────────────────────────────────────────────
+N_BREACH=0; N_WITHIN=0; N_TRIAGED=0; N_SCAN=0
+BREACH_IDS=""; OLDEST_H=0
+BREACH_LINES="$WORK/breach.txt"; : > "$BREACH_LINES"
+
+while IFS='|' read -r oid otype osec otitle olane; do
+  [ -n "${oid:-}" ] || continue
+  N_SCAN=$((N_SCAN + 1))
+  age_s=$(( NOW - osec ))
+  [ "$age_s" -lt 0 ] && age_s=0
+  age_h=$(( age_s / 3600 ))
+
+  [ "$age_s" -gt "$window_s" ] && overdue=1 || overdue=0
+
+  if [ "$overdue" = 0 ]; then
+    N_WITHIN=$((N_WITHIN + 1))
+    continue
+  fi
+
+  v="$(verdict_for "$oid")"
+  if [ -n "$v" ]; then
+    status=triaged
+  else
+    status=breach
+  fi
+
+  if [ "$status" = triaged ]; then
+    N_TRIAGED=$((N_TRIAGED + 1))
+  else
+    N_BREACH=$((N_BREACH + 1))
+    BREACH_IDS="$BREACH_IDS $oid"
+    [ "$age_h" -gt "$OLDEST_H" ] && OLDEST_H="$age_h"
+    printf '%s|%s|%s|%s|%s\n' "$oid" "$otype" "$age_h" "$olane" "$otitle" >> "$BREACH_LINES"
+  fi
+done < "$ROWS"
+
+BREACH_IDS="${BREACH_IDS# }"
+
+# ── report ───────────────────────────────────────────────────────────────────────
+if [ "$JSON" = 1 ]; then
+  printf '{"status":"%s","window_hours":%s,"project":"%s","scanned":%s,"breaches":%s,"within_window":%s,"triaged":%s,"oldest_breach_hours":%s,"breach_ids":[%s]}\n' \
+    "$([ "$N_BREACH" -gt 0 ] && echo breach || echo clean)" "$WINDOW_H" \
+    "$([ "$ALL_PROJECTS" = 1 ] && echo '*' || printf '%s' "$PROJECT")" \
+    "$N_SCAN" "$N_BREACH" "$N_WITHIN" "$N_TRIAGED" "$OLDEST_H" \
+    "$(printf '%s' "$BREACH_IDS" | tr ' ' ',' | sed 's/^,//;s/,$//')"
+  [ "$N_BREACH" -eq 0 ]
+  exit $?
+fi
+
+if [ "$ADVISE" = 1 ]; then
+  # SessionStart budget: one line, and only when it is actionable. Silent on a clean
+  # queue — the recorded triage IS the acknowledgement, so there is no ack step to nag
+  # about. Always exits 0; a monitor may not break the session it warns in.
+  if [ "$N_BREACH" -gt 0 ]; then
+    SHOWN="$(printf '%s' "$BREACH_IDS" | tr ' ' '\n' | head -6 | tr '\n' ' ' | sed 's/ $//')"
+    MORE=""
+    [ "$N_BREACH" -gt 6 ] && MORE=" +$((N_BREACH - 6)) more"
+    printf '[heimdall] SECURITY SLA BREACH — %s ⚠ item(s) past %sh with no recorded triage (oldest %sh): %s%s · see: heimdall-sla --verbose · record a verdict in .planning/ledger/decisions.md\n' \
+      "$N_BREACH" "$WINDOW_H" "$OLDEST_H" "$SHOWN" "$MORE"
+  fi
+  exit 0
+fi
+
+SCOPE_LABEL="$([ "$ALL_PROJECTS" = 1 ] && echo 'all projects' || printf 'project %s' "$PROJECT")"
+
+if [ "$N_BREACH" -gt 0 ]; then
+  printf 'SECURITY SLA: %s BREACH(ES) — %s, %sh window\n\n' "$N_BREACH" "$SCOPE_LABEL" "$WINDOW_H"
+  while IFS='|' read -r oid otype age_h olane otitle; do
+    [ -n "${oid:-}" ] || continue
+    if [ "$VERBOSE" = 1 ]; then
+      printf '  BREACH: %s  [%s, lane %s]  %sh old, no recorded verdict\n          %s\n' \
+        "$oid" "$otype" "$olane" "$age_h" "$otitle"
+    else
+      printf '  BREACH: %s  [%s, lane %s]  %sh old, no recorded verdict\n' \
+        "$oid" "$otype" "$olane" "$age_h"
+    fi
+  done < "$BREACH_LINES"
+  printf '\n  scanned %s · breach %s · within window %s · triaged %s\n' "$N_SCAN" "$N_BREACH" "$N_WITHIN" "$N_TRIAGED"
+  printf '  To clear one, append to %s:\n' "${DECISIONS#$REPO/}"
+  printf '\n    ## %s — security-SLA triage: obs <ID>\n\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  printf '    SLA-OBS: <ID>\n    SLA-VERDICT: FIXED|FALSE-POSITIVE|ACCEPTED-RISK|WONTFIX|DEFERRED\n'
+  printf '    SLA-REASON: <why, in a real sentence>\n\n    *— recorded by `haid:...`*\n\n'
+  [ "$VERBOSE" = 1 ] || printf '  (titles withheld — they carry live secrets; use --verbose locally)\n'
+  exit 1
+fi
+
+printf 'SECURITY SLA: clean — %s, %sh window\n' "$SCOPE_LABEL" "$WINDOW_H"
+printf '  scanned %s · breach 0 · within window %s · triaged %s\n' "$N_SCAN" "$N_WITHIN" "$N_TRIAGED"
+exit 0
