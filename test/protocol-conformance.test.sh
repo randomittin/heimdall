@@ -68,14 +68,13 @@
 # the real ~/.heimdall or today's worktree list — those change hourly and a suite that
 # reads them flaps.
 #
-# KNOWN DEFECT, DELIBERATELY NOT PINNED HERE
-# `bin/lib/rule-inventory.sh`'s verdict table maps rules to enforcer suites that DO NOT
-# EXIST on disk (test/conformance-brief-routing.test.sh, test/session-start-order.test.sh;
-# test/conformance-commit-per-unit.test.sh and test/conformance-inventory.test.sh are named
-# in the table and are likewise absent). A CHECKED verdict naming a nonexistent falsifier is
-# precisely the overclaim the inventory exists to prevent. It is REPORTED rather than pinned
-# because the fix belongs in bin/lib/rule-inventory.sh, which this agent does not own — and a
-# test that asserted the current behaviour were fine would codify the bug.
+# THE ENFORCER-EXISTENCE DEFECT, NOW FIXED AND PINNED
+# `bin/lib/rule-inventory.sh`'s verdict table used to map rules onto enforcer suites that
+# DID NOT EXIST on disk, and still issued CHECKED — precisely the overclaim the inventory
+# exists to prevent, living inside the inventory. `rule_classify` now confirms the enforcer
+# file before issuing the verdict and emits NON_VERIFIED when it is absent. Section (H)
+# below pins BOTH directions on fixtures: a rule naming a present enforcer is CHECKED, and
+# a rule naming an absent one is NON_VERIFIED and never CHECKED.
 
 set -uo pipefail
 
@@ -453,7 +452,7 @@ H50_OUT="$OUT"; H50_RC="$RC"
   && ok "(H) boundary: 50 rules clears the floor and every one is accounted for" \
   || bad "(H) 50 rules exited $H50_RC: $H50_OUT$ERR"
 
-H_ROWS="$(printf '%s' "$H50_OUT" | grep -c '^\(CHECKED\|UNCHECKABLE\|UNCLASSIFIED\)')"
+H_ROWS="$(printf '%s' "$H50_OUT" | grep -c '^\(CHECKED\|NON_VERIFIED\|UNCHECKABLE\|UNCLASSIFIED\)')"
 [ "$H_ROWS" = 50 ] \
   && ok "(H) every extracted rule gets its own verdict row (50/50) — none is silently dropped" \
   || bad "(H) $H_ROWS verdict rows for 50 rules"
@@ -482,12 +481,40 @@ has "$OUT" 'SUMMARY	total=50' \
   && ok "(H) fenced code is excluded — a code sample containing NEVER is not a normative rule" \
   || bad "(H) fenced code inflated the rule count: $(printf '%s' "$OUT" | grep SUMMARY)"
 
-# A rule naming a real enforcer is CHECKED rather than exempted.
-printf -- '- spawned children MUST be briefed with `bin/heimdall-brief`, never the plan\n' >> "$RB50/CLAUDE.md"
+# A rule naming a real enforcer is CHECKED rather than exempted. The enforcer here is
+# hooks/hooks.json, which is in this checkout — CHECKED is only meaningful if the named
+# falsifier can actually be opened.
+printf -- '- a generated file must never write stub code into the working tree\n' >> "$RB50/CLAUDE.md"
+# ...and one naming an enforcer that is NOT on disk. test/session-start-order.test.sh is
+# named by the verdict table and has never existed; a verdict of CHECKED here would be a
+# rule claiming a falsifier nobody can run, which is the overclaim the inventory is for.
+printf -- '- the session-start sweep MUST run before any wave begins\n' >> "$RB50/CLAUDE.md"
 HMD_CONF_REPO="$RB50" conf inventory
-has "$OUT" '^CHECKED	[^	]' \
-  && ok "(H) a rule matching an enforcer is CHECKED and NAMES the enforcer" \
-  || bad "(H) no CHECKED row carried an enforcer name"
+has "$OUT" '^CHECKED	hooks/hooks.json' \
+  && ok "(H) a rule matching an enforcer that EXISTS is CHECKED and NAMES the enforcer" \
+  || bad "(H) no CHECKED row carried a present enforcer's name: $(printf '%s' "$OUT" | grep '^CHECKED')"
+
+has "$OUT" '^NON_VERIFIED	test/session-start-order.test.sh' \
+  && ok "(H) FAIL CLOSED: a rule whose named enforcer is ABSENT reads NON_VERIFIED, and says which file" \
+  || bad "(H) a missing enforcer did not produce a NON_VERIFIED row: $(printf '%s' "$OUT" | grep 'session-start')"
+
+printf '%s' "$OUT" | grep -q '^CHECKED	test/session-start-order' \
+  && bad "(H) an absent enforcer still produced a CHECKED verdict — the overclaim survives" \
+  || ok "(H) ...and it is never CHECKED — an unbacked row cannot report as enforced"
+
+# Nor may it be quietly demoted to UNCHECKABLE: that would relabel a broken claim as a
+# designed exemption, which is the same lie with better manners.
+printf '%s' "$OUT" | grep '^UNCHECKABLE' | grep -q 'session-start sweep' \
+  && bad "(H) the unbacked rule was laundered into UNCHECKABLE — exemption wearing a verdict" \
+  || ok "(H) ...and it is not laundered into UNCHECKABLE either — it stops at NON_VERIFIED"
+
+has "$OUT" 'non_verified=1' \
+  && ok "(H) the SUMMARY counts NON_VERIFIED rows separately — they never hide inside another total" \
+  || bad "(H) the SUMMARY lost the NON_VERIFIED count: $(printf '%s' "$OUT" | grep SUMMARY)"
+
+[ "$RC" = 3 ] \
+  && ok "(H) an inventory holding an unenforced rule exits 3 NON_VERIFIED, never 0" \
+  || bad "(H) an inventory with a missing enforcer exited $RC (want 3)"
 
 # ═══ (I) READ-ONLY ═════════════════════════════════════════════════════════════════
 # The tool's own header promises "THIS TOOL NEVER MUTATES ANYTHING", because several agent
@@ -515,9 +542,16 @@ ALL_RC="$RC"
 # nowhere else — a writer that ignored $REPO would rewrite the real committed artifact.
 mkdir -p "$RB50/skills/heimdall/references"
 HMD_CONF_REPO="$RB50" conf inventory --write
-[ "$RC" = 0 ] && [ -f "$RB50/skills/heimdall/references/protocol-rule-inventory.md" ] \
+# rc is 3, not 0: (H) appended a rule to this fixture whose enforcer is absent. The artifact
+# must be written ANYWAY — an inventory that refuses to publish its own bad news is the
+# silent exemption it was built to refuse.
+[ "$RC" = 3 ] && [ -f "$RB50/skills/heimdall/references/protocol-rule-inventory.md" ] \
   && ok "(I) \`inventory --write\` writes its artifact inside the \$REPO it was pointed at" \
   || bad "(I) --write did not produce an artifact in the fixture repo (rc=$RC): $ERR"
+
+grep -q '^## NON_VERIFIED' "$RB50/skills/heimdall/references/protocol-rule-inventory.md" \
+  && ok "(I) ...and the artifact carries a NON_VERIFIED section, so an unenforced rule is visible on the page" \
+  || bad "(I) the written artifact hides the NON_VERIFIED rows"
 
 REAL_ARTIFACT_AFTER="$( [ -f "$REAL_ARTIFACT" ] && shasum "$REAL_ARTIFACT" | awk '{print $1}' || printf 'absent' )"
 [ "$REAL_ARTIFACT_BEFORE" = "$REAL_ARTIFACT_AFTER" ] \
