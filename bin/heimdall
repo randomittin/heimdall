@@ -2266,6 +2266,29 @@ case "${1:-}" in
     fi
     exec "$MODULES_BIN" "$@"
     ;;
+  tier)
+    # Pass-through to heimdall-tier: the model-routing table and its declaration
+    # log (spec Part 2). Escalation is allowed, silent DRIFT is not — the tool
+    # records which tier a task class actually ran on, with the stated reason
+    # when an agent asks for a higher one, so the weekly audit can tell a
+    # reasoned escalation from a wrong-tier default.
+    #
+    # This arm exists because the tool shipped without it: heimdall-tier was
+    # written, tested, and reachable from nothing — the third such subsystem
+    # found in one session, and the exact shape the consumer audit exists to
+    # catch. A routing table nobody can invoke enforces no routing.
+    #
+    # Every flag forwards verbatim, so a routed run and a direct bin run are
+    # byte-identical.
+    shift
+    TIER_BIN="$PLUGIN_DIR/bin/heimdall-tier"
+    if [ ! -x "$TIER_BIN" ]; then
+      echo "  Error: heimdall-tier not found at $TIER_BIN" >&2
+      echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+      exit 1
+    fi
+    exec "$TIER_BIN" "$@"
+    ;;
   weekly-log)
     # Pass-through to heimdall-weekly-log: the weekly "what the watchman learned"
     # changelog generator (consent + k-anonymity gated, DATA.md §7 — see the

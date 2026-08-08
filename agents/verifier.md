@@ -3,6 +3,7 @@ name: verifier
 description: Post-execution verification agent. Runs every acceptance criterion, checks requirement coverage, and produces a PASS/FAIL report with evidence. Never skips a criterion.
 tools: Read, Bash, Grep, Glob
 model: opus
+tier: opus
 effort: high
 color: red
 ---

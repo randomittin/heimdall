@@ -3,6 +3,7 @@ name: reviewer
 description: Code review agent. Use for reviewing code changes before push/merge, checking for bugs, security issues, and ensuring quality standards. Mandatory before any push.
 tools: Read, Grep, Glob, Bash
 model: opus
+tier: opus
 effort: high
 color: red
 ---
