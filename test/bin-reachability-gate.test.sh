@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
 # test/bin-reachability-gate.test.sh — THE CLASS GUARD for built-but-unreachable code.
 #
-# WHY THIS EXISTS. Five separate instances of ONE bug shipped in this repo:
+# WHY THIS EXISTS. Six separate instances of ONE bug shipped in this repo:
 #   1. `hmd update`            — advertised, fell through to a splash banner.
 #   2. `hmd weekly-log`        — advertised, unrouted.
 #   3. `heimdall-gate-run --json` — a documented flag that silently no-opped.
 #   4. the wrap-chain wire     — a dispatch kind with no handler.
 #   5. `bin/heimdall-git-guard` — fully built, its own suite green 4/0, and
 #      `grep -rl git-guard bin/ hooks/ sentinels/` matched only the file itself.
+#   6. `bin/heimdall-brief`    — built complete, suite green, invoked by NOTHING for two
+#      months. THIS GATE CLEARED IT THE WHOLE TIME, because bin/heimdall-protocol named
+#      it — and nothing invoked heimdall-protocol either. A corpse vouched for a corpse.
 # Each was found by hand, one at a time. This file turns the CLASS into a gate so
-# the sixth instance fails a test the day it is written instead of years later.
+# the seventh instance fails a test the day it is written instead of years later.
 #
 # TWO RULES, deliberately scoped so every failure is a real defect:
 #
@@ -18,120 +21,49 @@
 #     judgement, zero false positives: if we tell a user to type it, typing it must
 #     work. This is instances 1 and 2.
 #
-#   RULE B — SHIPPED ⇒ REACHABLE.  Every executable in bin/ must be named by at
-#     least one dispatch surface (the bin/heimdall dispatcher, another bin, a hook,
-#     a sentinel, a skill/agent, or the installer) — or appear on the STANDALONE
-#     allowlist below with a written reason. This is instance 5.
+#   RULE B — SHIPPED ⇒ REACHABLE FROM A LIVE ENTRY POINT.  Not "some file mentions
+#     it". Instance 6 is the proof that a mention is worth nothing when the mouth
+#     naming it is itself dead. Liveness is SEEDED only at the surfaces the outside
+#     world actually enters through — hooks/hooks.json, .mcp.json, install.sh, the
+#     `hmd` CLI, commands/ agents/ skills/, .claude-plugin/, deploy/, .github/workflows/
+#     — and propagates outward from there. A bin no live entry point can reach is dead
+#     however many other dead files name it. This is instances 5 and 6.
 #
-#     Why an allowlist and not a blanket rule: a blanket rule false-positives on
-#     genuinely standalone tools (an MCP server a client launches, a one-shot
-#     migration, ops tooling a human runs against a deployment). Excluding them by
-#     NAME with a REASON keeps the gate honest — and keeps it a ratchet: a NEW
-#     unreachable executable fails until someone either wires it up or consciously
-#     writes down why it stands alone. Nothing is excluded by pattern.
+# ONE ENGINE, NOT TWO. This file used to carry its OWN flat "does any file name it?"
+# matcher: a second detector, with its own opinion, that disagreed with the one in
+# bin/heimdall-deadcode — it called nine executables "wired" that no live entry point
+# could reach. Two gates with different verdicts is the drift this repo keeps hitting,
+# so the rule now lives exactly ONCE, in bin/lib/reachability.sh, and this file is a
+# thin caller over it. If the engine is wrong, everything that consumes it is wrong
+# together and loudly, which is the only kind of wrong you can actually fix.
 #
-# The detector is itself falsified in §3 against a synthetic tree, so "the gate is
+# EXEMPTIONS are not in this file either. They live one row per name — with a written
+# reason AND a recheck date — in bin/lib/reachability-exemptions.tsv. Keeping them in
+# the registry rather than in a `case` block here is what makes an exemption reviewable
+# and, crucially, EXPIRING: an exclusion that never lapses is a second way to go quietly
+# dead, which is exactly how heimdall-brief would have survived even WITH this gate.
+#
+# The engine is falsified in §3 against a synthetic tree we control, so "the gate is
 # green" can never mean "the gate stopped looking".
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 HMD="$ROOT/bin/heimdall"
+LIB="$ROOT/bin/lib/reachability.sh"
 
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); printf "  \033[32mPASS\033[0m %s\n" "$1"; }
 bad() { FAIL=$((FAIL+1)); printf "  \033[31mFAIL\033[0m %s\n" "$1"; }
 
 [ -f "$HMD" ] || { echo "FATAL: $HMD missing"; exit 2; }
+[ -f "$LIB" ] || { echo "FATAL: reachability engine $LIB missing — RULE B cannot run"; exit 2; }
+# shellcheck source=../bin/lib/reachability.sh
+. "$LIB"
 
-# ══════════════════════════════════════════════════════════════════════════════
-# STANDALONE ALLOWLIST — executables with NO runtime caller BY DESIGN.
-# Every entry is "<name> — why it stands alone". Adding a name here is a
-# deliberate, reviewable act; that is the whole point.
-# ══════════════════════════════════════════════════════════════════════════════
-# Reasons are honest about the difference between "standalone BY DESIGN" and "a known
-# gap we have chosen to record rather than hide". Both are excluded from the failure
-# set; only one of them is a compliment.
-standalone_reason() {
-  case "$1" in
-    generate-changelog)        printf 'BY DESIGN — release tooling the maintainer runs when cutting a release' ;;
-    heimdall-banner-test)      printf 'BY DESIGN — manual wcwidth acceptance harness for the launch banner; a human eyeballs it' ;;
-    heimdall-headroom-ab)      printf 'BY DESIGN — the maintainer-run A/B receipt harness for the Headroom pre-registration; two snapshots a week apart, then a report a human publishes' ;;
-    heimdall-live-verify)      printf 'BY DESIGN — on-demand live isolation verification that emits a committed receipt' ;;
-    heimdall-seed-demo-wall)   printf 'BY DESIGN — one-shot demo seeding a human runs before a demo' ;;
-    heimdall-team-converge)    printf 'BY DESIGN — one-shot forward migration healing an existing team split; run once, by hand' ;;
-    heimdall-board)            printf 'KNOWN GAP — a read-only view whose siblings (watch/dashboard/verdict/badge/clip) all have `hmd` case arms; this one has none' ;;
-    heimdall-queue-mcp)        printf 'KNOWN GAP — MCP stdio server NOT registered in .mcp.json, while its sibling heimdall-ledger-mcp is' ;;
-    heimdall-registry-hygiene) printf 'KNOWN GAP — self-described MONTHLY job with no in-repo scheduler (no cron, LaunchAgent or workflow calls it)' ;;
-    *) return 1 ;;
-  esac
-}
-
-# ══════════════════════════════════════════════════════════════════════════════
-# THE DETECTOR — parameterised on a tree root so §3 can falsify it.
-#
-# reference_surfaces ROOT — the files where a dispatch/hook/install reference to a
-#   bin can legitimately live. A bin named ONLY by its own source (its header
-#   comment, its usage text) is unreachable; that self-match is excluded per name.
-# ══════════════════════════════════════════════════════════════════════════════
-reference_surfaces() {
-  local root="$1"
-  # __pycache__ is EXCLUDED deliberately. A stale `.pyc` carries the module's name, so a
-  # compiled leftover from a since-unwired command counts as a "reference" and the binary
-  # looks reachable when nothing calls it — the gate would hide the very defect it exists
-  # to catch. Build artifacts are not a command surface.
-  { find "$root/bin" "$root/hooks" "$root/sentinels" "$root/skills" \
-         "$root/agents" "$root/commands" "$root/.claude-plugin" "$root/deploy" \
-         -type f -not -path '*/__pycache__/*' -not -name '*.pyc' 2>/dev/null
-    [ -f "$root/install.sh" ] && printf '%s\n' "$root/install.sh"
-    [ -f "$root/.mcp.json" ] && printf '%s\n' "$root/.mcp.json"
-  } 2>/dev/null
-}
-
-# referenced_by ROOT NAME — prints the count of reference-surface files (other than
-# bin/NAME itself) that name this executable.
-#
-# WORD-BOUNDARY, never substring. A plain -F match is wrong in both directions and
-# this file's own falsifier caught it: `heimdall-git-guard` matched inside
-# `heimdall-git-guard-DISABLED`, so DISABLING the routing still read as "reachable"
-# — the gate would have shipped unable to detect the very defect it exists for. The
-# same flaw made `heimdall-team` look reachable because `heimdall-team-converge`
-# contains it. Requiring a non-[A-Za-z0-9_-] neighbour on both sides keeps a real
-# call site (`"$PLUGIN/bin/heimdall-git-guard"`, `bin/heimdall-presence.py`) matching
-# while a longer name that merely CONTAINS this one does not.
-referenced_by() {
-  local root="$1" name="$2" pat
-  pat="(^|[^A-Za-z0-9_-])${name}([^A-Za-z0-9_-]|$)"
-  reference_surfaces "$root" \
-    | grep -vFx "$root/bin/$name" \
-    | tr '\n' '\0' \
-    | xargs -0 grep -lE -- "$pat" 2>/dev/null \
-    | grep -c . || true
-}
-
-# bin_executables ROOT — every executable file directly in bin/ (bin/lib is a
-# library dir, not a command surface; sources and data are not commands).
-bin_executables() {
-  local root="$1" f name
-  for f in "$root"/bin/*; do
-    [ -f "$f" ] || continue
-    [ -x "$f" ] || continue
-    name="$(basename "$f")"
-    case "$name" in *.c|*.h|*.md|*.json|*.py) continue ;; esac
-    printf '%s\n' "$name"
-  done
-}
-
-# unreachable_in ROOT — names with zero external references (allowlist NOT applied;
-# the allowlist is policy, this function is measurement).
-unreachable_in() {
-  local root="$1" name
-  while IFS= read -r name; do
-    [ -n "$name" ] || continue
-    [ "$(referenced_by "$root" "$name")" = "0" ] && printf '%s\n' "$name"
-  done < <(bin_executables "$root")
-  return 0
-}
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/hmd-reach-gate-XXXXXX")"
+SANDBOX="$(mktemp -d "${TMPDIR:-/tmp}/hmd-reach-falsify-XXXXXX")"
+trap 'rm -rf "$WORK" "$SANDBOX"' EXIT INT TERM
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 1. RULE A — every advertised space-form subcommand has a dispatch arm.
@@ -166,116 +98,209 @@ $ADVERTISED
 EOF
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 2. RULE B — every shipped executable is reachable, or explicitly standalone.
+# 2. RULE B — every shipped executable reaches a live entry point, or carries a
+#    valid (reasoned, in-date) row in the exemption registry.
+#
+#    FAIL-CLOSED FIRST. reach_build returns 2 when it enumerates no nodes, no seeds
+#    or no subjects. "The scanner found nothing" and "nothing is wrong" render
+#    identically if you let them, so a refusal is a hard failure here, never a pass.
 # ══════════════════════════════════════════════════════════════════════════════
-TOTAL_BINS="$(bin_executables "$ROOT" | grep -c .)"
-UNREACHED="$(unreachable_in "$ROOT")"
-UNROUTED_COUNT=0
-UNLISTED=""
+reach_build "$ROOT" "$WORK"
+BUILD_RC=$?
 
-while IFS= read -r name; do
-  [ -n "$name" ] || continue
-  UNROUTED_COUNT=$((UNROUTED_COUNT+1))
-  if ! standalone_reason "$name" >/dev/null; then
-    UNLISTED="$UNLISTED $name"
-  fi
-done <<EOF
-$UNREACHED
-EOF
-
-if [ -z "$UNLISTED" ]; then
-  ok "all $TOTAL_BINS bin/ executables reachable or allowlisted ($UNROUTED_COUNT standalone, 0 orphaned)"
-else
-  for n in $UNLISTED; do
-    bad "SHIPPED BUT UNREACHABLE: bin/$n is named by no dispatcher, hook, sentinel, skill or installer"
-  done
-  printf "         → wire it into a dispatch path, or add it to standalone_reason() with a written reason.\n"
+if [ "$BUILD_RC" -ne 0 ]; then
+  bad "reachability engine REFUSED to scan (rc=$BUILD_RC) — RULE B is NOT VERIFIED, not clean"
+  printf "\n  bin-reachability-gate: %d passed, %d failed  (scan refused)\n" "$PASS" "$FAIL"
+  exit 1
 fi
 
-# 2b. The allowlist must not rot: an entry that has since been wired up is stale,
-#     and a stale exclusion is how a gate quietly stops gating.
-STALE=""
-for n in generate-changelog heimdall-banner-test heimdall-board heimdall-headroom-ab \
-         heimdall-live-verify heimdall-queue-mcp heimdall-registry-hygiene \
-         heimdall-seed-demo-wall heimdall-team-converge; do
-  if [ -f "$ROOT/bin/$n" ] && [ "$(referenced_by "$ROOT" "$n")" != "0" ]; then
-    STALE="$STALE $n"
-  fi
-done
-if [ -z "$STALE" ]; then
-  ok "standalone allowlist has no stale entries (every listed name is genuinely unreferenced)"
+TOTAL_BINS="$(reach_subject_count "$WORK")"
+DEAD_COUNT="$(reach_dead "$WORK" | grep -c . || true)"
+UNACKNOWLEDGED="$(reach_unacknowledged "$ROOT" "$WORK")"
+
+if [ -z "$UNACKNOWLEDGED" ]; then
+  ok "all $TOTAL_BINS bin/ executables reach a live entry point or carry a valid exemption ($DEAD_COUNT exempt, 0 orphaned)"
 else
-  bad "STALE ALLOWLIST ENTRIES (now wired — remove them so the gate keeps gating):$STALE"
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    bad "SHIPPED BUT UNREACHABLE: no live entry point reaches bin/$n — every file naming it is itself dead"
+  done <<EOF
+$UNACKNOWLEDGED
+EOF
+  printf "         → wire it into a dispatch path, or add a reasoned, dated row to bin/lib/reachability-exemptions.tsv.\n"
+fi
+
+# 2b. The registry must not rot: an exclusion that outlives its reason is how a gate
+#     quietly stops gating.
+#
+#     This used to be a hardcoded list of NINE NAMES — a copy of the registry, kept in
+#     a file that is not the registry, checking exactly one rot condition. It rotted in
+#     both directions at once. It could not see a row for any other name, so twenty-two
+#     rows were watched by nine. And it judged those nine with the flat matcher, so it
+#     reported all nine "now wired, remove them" when re-checking each one against a
+#     live entry point says every one is still unreachable. Deleting those rows on that
+#     advice would have turned nine acknowledged-dead tools into nine surprise failures.
+#
+#     The engine already audits EVERY row against five rot conditions. Ask it instead of
+#     keeping a second, smaller, staler copy of the question:
+#       MALFORMED  no name, no reason, or a recheck date that is not a real ISO date
+#       DUPLICATE  listed twice, so the later reason is invisible
+#       EXPIRED    past its recheck date — re-justify it, wire it, or delete it
+#       STALE      reachable again, so the exclusion is now hiding nothing
+#       ORPHAN     bin/<name> is gone; the row would pre-clear a future namesake
+ROT="$(reach_exempt_audit "$ROOT" "$WORK")"
+EXEMPT_ROWS="$(reach_exempt_rows "$ROOT" | grep -c . || true)"
+if [ -z "$ROT" ]; then
+  ok "all $EXEMPT_ROWS exemption rows are well-formed, in-date, and still genuinely unreachable"
+else
+  while IFS= read -r r; do
+    [ -n "$r" ] || continue
+    bad "EXEMPTION ROT: $(printf '%s' "$r" | tr '\t' ' ')"
+  done <<EOF
+$ROT
+EOF
+  printf "         → bin/lib/reachability-exemptions.tsv: fix the row, or wire the tool up and delete it.\n"
 fi
 
 # 2c. The one that started this: heimdall-git-guard must stay wired. Named
 #     explicitly so a regression reads as itself and not as a generic count.
-if [ "$(referenced_by "$ROOT" "heimdall-git-guard")" != "0" ]; then
-  ok "heimdall-git-guard is reachable (the defect that motivated this gate stays fixed)"
+if reach_is_live "$WORK" heimdall-git-guard; then
+  ok "heimdall-git-guard is reachable: $(reach_chain "$WORK" heimdall-git-guard)"
 else
   bad "heimdall-git-guard is unreachable again — the self-heal is dead code"
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 3. FALSIFIER — prove the DETECTOR detects, on a synthetic tree.
+# 3. FALSIFIER — prove the ENGINE detects, on a synthetic tree.
 #    A green gate must mean "nothing is orphaned", never "the scan stopped
 #    looking". Both directions are exercised against a tree we control.
 # ══════════════════════════════════════════════════════════════════════════════
-SANDBOX="$(mktemp -d "${TMPDIR:-/tmp}/hmd-reach-falsify-XXXXXX")"
-mkdir -p "$SANDBOX/bin" "$SANDBOX/hooks"
-printf '#!/bin/sh\nexit 0\n' > "$SANDBOX/bin/orphan-tool";          chmod +x "$SANDBOX/bin/orphan-tool"
-printf '#!/bin/sh\nexit 0\n' > "$SANDBOX/bin/wired-tool";           chmod +x "$SANDBOX/bin/wired-tool"
+mkdir -p "$SANDBOX/bin" "$SANDBOX/hooks" "$SANDBOX/sentinels"
+printf '#!/bin/sh\nexit 0\n' > "$SANDBOX/bin/orphan-tool"
+printf '#!/bin/sh\nexit 0\n' > "$SANDBOX/bin/wired-tool"
 # substr-tool is referenced NOWHERE; the only places its name appears are INSIDE the
 # longer name substr-tool-extended. A substring matcher clears it (wrongly).
-printf '#!/bin/sh\nexit 0\n' > "$SANDBOX/bin/substr-tool";          chmod +x "$SANDBOX/bin/substr-tool"
-printf '#!/bin/sh\nexit 0\n' > "$SANDBOX/bin/substr-tool-extended"; chmod +x "$SANDBOX/bin/substr-tool-extended"
+printf '#!/bin/sh\nexit 0\n' > "$SANDBOX/bin/substr-tool"
+printf '#!/bin/sh\nexit 0\n' > "$SANDBOX/bin/substr-tool-extended"
+# THE DEAD-CHAIN TRAP (heimdall-brief's historical shape, reconstructed). dead-caller is
+# named by nothing live; dead-callee is named ONLY by dead-caller.
+printf '#!/bin/sh\nexec bin/dead-callee\n' > "$SANDBOX/bin/dead-caller"
+printf '#!/bin/sh\nexit 0\n'               > "$SANDBOX/bin/dead-callee"
+# THE MUTUAL-CITATION TRAP. Two corpses naming each other manufacture a reference for
+# one another out of nothing. Any rule that stops at "is it named?" clears BOTH; a rule
+# seeded at live entry points clears NEITHER, because the cycle touches no seed. This is
+# not hypothetical — bin/heimdall-s6-manifest and bin/heimdall-s6-sweep are exactly this
+# shape in the real tree, and a naive fix for the dead chain above still passes them.
+printf '#!/bin/sh\nexec bin/mutual-b\n' > "$SANDBOX/bin/mutual-a"
+printf '#!/bin/sh\nexec bin/mutual-a\n' > "$SANDBOX/bin/mutual-b"
+chmod +x "$SANDBOX"/bin/*
 printf '{"hooks":{"X":"run bin/wired-tool now","Y":"run bin/substr-tool-extended now"}}\n' \
   > "$SANDBOX/hooks/hooks.json"
 
-SB_UNREACHED="$(unreachable_in "$SANDBOX")"
+SBW="$WORK/sandbox"
+reach_build "$SANDBOX" "$SBW"
+SB_RC=$?
+SB_DEAD="$(reach_dead "$SBW")"
 
-if printf '%s\n' "$SB_UNREACHED" | grep -qx "orphan-tool"; then
-  ok "falsifier: detector FLAGS an executable no surface references"
+sb_flagged() { printf '%s\n' "$SB_DEAD" | grep -qx "$1"; }
+
+if [ "$SB_RC" -eq 0 ]; then
+  ok "falsifier: engine builds a closure over the synthetic tree"
 else
-  bad "falsifier: detector MISSED an orphaned executable — RULE B does not actually detect"
+  bad "falsifier: engine REFUSED the synthetic tree (rc=$SB_RC) — §3 proves nothing"
 fi
 
-if ! printf '%s\n' "$SB_UNREACHED" | grep -qx "wired-tool"; then
-  ok "falsifier: detector CLEARS an executable a hook references (no false positive)"
+if sb_flagged "orphan-tool"; then
+  ok "falsifier: engine FLAGS an executable no surface references"
 else
-  bad "falsifier: detector flagged a wired executable — RULE B false-positives"
+  bad "falsifier: engine MISSED an orphaned executable — RULE B does not actually detect"
+fi
+
+if ! sb_flagged "wired-tool"; then
+  ok "falsifier: engine CLEARS an executable a live hook references (no false positive)"
+else
+  bad "falsifier: engine flagged a wired executable — RULE B false-positives"
 fi
 
 # The substring trap, pinned. This is not hypothetical: the first cut of this gate
 # used `grep -F` and therefore reported heimdall-git-guard "reachable" even with
 # every call site renamed away. A gate that cannot go red is not a gate.
-if printf '%s\n' "$SB_UNREACHED" | grep -qx "substr-tool"; then
+if sb_flagged "substr-tool"; then
   ok "falsifier: a name that only occurs INSIDE a longer name is still unreachable"
 else
   bad "falsifier: substring match — bin/substr-tool cleared by 'substr-tool-extended'; the gate cannot go red"
 fi
 
-if ! printf '%s\n' "$SB_UNREACHED" | grep -qx "substr-tool-extended"; then
+if ! sb_flagged "substr-tool-extended"; then
   ok "falsifier: the longer name itself is correctly cleared by its real reference"
 else
   bad "falsifier: word-boundary match is too strict — a real reference was missed"
 fi
 
-# 3a-bis. THE DEAD-CHAIN TRAP (heimdall-brief's historical shape, reconstructed).
-# bin/dead-caller is referenced by NOTHING live; bin/dead-callee is referenced ONLY
-# by bin/dead-caller. "Something mentions it" clears dead-callee — but the only
-# mouth naming it is itself a corpse. Reachability has to mean a path to a LIVE
-# entry point, so BOTH must flag.
-printf '#!/bin/sh\nexec bin/dead-callee\n' > "$SANDBOX/bin/dead-caller"; chmod +x "$SANDBOX/bin/dead-caller"
-printf '#!/bin/sh\nexit 0\n'               > "$SANDBOX/bin/dead-callee"; chmod +x "$SANDBOX/bin/dead-callee"
-SB2_UNREACHED="$(unreachable_in "$SANDBOX")"
-if printf '%s\n' "$SB2_UNREACHED" | grep -qx "dead-callee"; then
+# 3a. The dead chain must NOT clear. Both ends of it flag: the head because nothing
+#     live names it, the tail because its only caller is the head.
+if sb_flagged "dead-callee"; then
   ok "falsifier: a bin named ONLY by another DEAD bin is still unreachable (dead chain closed)"
 else
   bad "falsifier: DEAD CHAIN CLEARS — bin/dead-callee passes because bin/dead-caller names it, and nothing names bin/dead-caller. This is exactly how heimdall-brief read 'reachable' for two months."
 fi
 
-# 3b. …and the RULE A parser must actually reject a missing arm. Build a tiny
+if sb_flagged "dead-caller"; then
+  ok "falsifier: the head of the dead chain flags too (naming a corpse is not being alive)"
+else
+  bad "falsifier: bin/dead-caller cleared — the engine credits a file for the references it MAKES"
+fi
+
+# 3b. The mutual-citation trap: two dead bins naming each other must BOTH flag.
+if sb_flagged "mutual-a" && sb_flagged "mutual-b"; then
+  ok "falsifier: two dead bins naming EACH OTHER both stay unreachable (no bootstrapping a cycle into life)"
+else
+  bad "falsifier: MUTUAL CITATION CLEARS — bin/mutual-a and bin/mutual-b vouch for each other and the engine believes them; a reference cycle touching no entry point is still dead"
+fi
+
+# 3c. The exemption registry must NOT be a reference surface. It names every exempt
+#     executable, so if the scanner read it, WRITING AN EXEMPTION WOULD MAKE THE BINARY
+#     LOOK REACHABLE — the escape hatch would silently become a second way to be dead,
+#     and removing the row would then "revive" the tool. Proven, not asserted.
+mkdir -p "$SANDBOX/bin/lib"
+printf 'orphan-tool\t2099-01-01\tfalsifier row — must not confer reachability\n' \
+  > "$SANDBOX/bin/lib/reachability-exemptions.tsv"
+SBW2="$WORK/sandbox-exempt"
+reach_build "$SANDBOX" "$SBW2"
+SB2_DEAD="$(reach_dead "$SBW2")"
+if printf '%s\n' "$SB2_DEAD" | grep -qx "orphan-tool"; then
+  ok "falsifier: the exemption registry is not a reference surface (naming a bin there does not make it reachable)"
+else
+  bad "falsifier: the exemption file VOUCHED for bin/orphan-tool — writing an exemption would make a dead bin read as wired"
+fi
+
+# 3d. The registry rot audit must be able to go RED. §2b passes when the audit returns
+#     nothing, so "no rot found" and "the audit stopped looking" render identically
+#     unless something forces the difference. Feed it one row of each rot kind and
+#     require all five back. HMD_REACH_TODAY is the library's documented test seam, set
+#     here only so EXPIRED does not depend on the day the suite runs.
+{ printf 'bad-date\tnope\tdate is not a real ISO date\n'
+  printf 'ghost-tool\t2099-01-01\tno bin of this name exists\n'
+  printf 'wired-tool\t2099-01-01\tclaims standalone, but a hook reaches it\n'
+  printf 'orphan-tool\t2000-01-01\trecheck date long past\n'
+  printf 'orphan-tool\t2099-01-01\tsecond row for a name already listed\n'
+} > "$SANDBOX/bin/lib/reachability-exemptions.tsv"
+
+HMD_REACH_TODAY="2026-06-01"
+ROT_SB="$(reach_exempt_audit "$SANDBOX" "$SBW2")"
+unset HMD_REACH_TODAY
+
+ROT_MISSING=""
+for k in MALFORMED ORPHAN STALE EXPIRED DUPLICATE; do
+  printf '%s\n' "$ROT_SB" | grep -q "^$k" || ROT_MISSING="$ROT_MISSING $k"
+done
+if [ -z "$ROT_MISSING" ]; then
+  ok "falsifier: registry audit catches all five rot kinds (malformed, orphan, stale, expired, duplicate)"
+else
+  bad "falsifier: registry audit MISSED rot kind(s):$ROT_MISSING — a rotten exemption row would pass §2b unseen"
+fi
+
+# 3e. …and the RULE A parser must actually reject a missing arm. Build a tiny
 #     heimdall-shaped script that advertises a command it never dispatches.
 FAKE="$SANDBOX/fake-heimdall"
 { printf '%s\n' '  echo "  heimdall ghostcmd       Advertised but never routed"'
@@ -296,8 +321,6 @@ if ! fake_has_arm ghostcmd && fake_has_arm realcmd; then
 else
   bad "falsifier: dispatch-arm detector cannot tell routed from unrouted"
 fi
-
-rm -rf "$SANDBOX"
 
 printf "\n  bin-reachability-gate: %d passed, %d failed  (scanned %s executables)\n" \
   "$PASS" "$FAIL" "$TOTAL_BINS"
