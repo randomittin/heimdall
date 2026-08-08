@@ -42,6 +42,12 @@ PY="$(command -v python3 || command -v python)"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
+# Hermetic home. context-sync writes a liveness receipt, and case (4) ends on a
+# SUCCESSFUL push — so without this the suite stamps reached=yes into the real
+# ~/.heimdall for a /var/folders bare remote, and a genuinely dead sync reads as
+# alive. A test may never be the thing that forges the receipt.
+export HEIMDALL_HOME="$WORK/home"
+
 # A REAL throwaway repo wired to a REAL local bare remote (file path — no network).
 # Echoes the repo path; the bare remote lives at "$repo.git".
 new_repo_with_remote() {

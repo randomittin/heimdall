@@ -47,12 +47,21 @@
 #   2  usage error / missing dependency / not a git repo
 #   3  the push failed (remote unreachable / rejected) — the commit is on the local ref
 #
+# LIVENESS RECEIPT — the subject this subsystem must REACH is THE REMOTE, and only the
+# push itself can vouch for that: exit 3 above is discarded by every caller today, so a
+# week of edits with zero successful hmd/context pushes is invisible. Every run that gets
+# as far as a commit records `attempt` before the push and `complete --reached yes|no`
+# after; reached=yes ONLY when the push returned success. A refused scan, a failed commit
+# and a missing remote all record `no`. A run that declined to sync at all (off,
+# throttled, --dry-run) records NOTHING — it made no claim about the remote either way.
+#
 # Env seams (tests / overrides; none carry secrets):
 #   HMD_CONTEXT_VISIBILITY     private|public|unknown — overrides gh visibility detection.
 #   HMD_CONTEXT_REMOTE         the push remote (default: origin; --remote wins).
 #   HEIMDALL_SECRET_SCAN_BIN   a scanner invoked as `<bin> <file>` (exit nonzero = finding).
 #   HEIMDALL_STATE_BIN         heimdall-state binary (default: sibling bin).
 #   HEIMDALL_STATE_FILE        heimdall-state file (default: <repo>/heimdall-state.json).
+#   HMD_LIVENESS_BIN           heimdall-liveness binary (default: sibling bin).
 
 set -euo pipefail
 
@@ -60,7 +69,7 @@ SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 BINDIR="$(dirname "$SELF")"
 CONTEXT_BRANCH="hmd/context"
 
-usage() { sed -n '2,56p' "$SELF" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,64p' "$SELF" | sed 's/^# \{0,1\}//'; }
 
 PY="$(command -v python3 || command -v python || true)"
 if [ -z "$PY" ]; then
@@ -70,6 +79,39 @@ fi
 
 STATE_BIN="${HEIMDALL_STATE_BIN:-$BINDIR/heimdall-state}"
 IDENTITY_BIN="$BINDIR/heimdall-identity"
+LIVENESS_BIN="${HMD_LIVENESS_BIN:-$BINDIR/heimdall-liveness}"
+
+# ── the LIVENESS RECEIPT (additive observation — never changes an exit code) ─────
+# COMPLETION IS NOT REACHABILITY. This subsystem's subject is the REMOTE, so only a
+# push that actually returned success may record reached=yes; every other outcome is
+# `no` or silence. It runs from a PostToolUse/SessionEnd hook, so an observation must
+# NEVER break a session: a missing heimdall-liveness is tolerated and every invocation
+# is silenced and `|| true`-guarded.
+
+# The subject a human reads in `hmd doctor`: the remote's URL with any userinfo
+# STRIPPED — a receipt is state on disk, and a credential-bearing URL must never land
+# in it. Falls back to the remote NAME when no URL resolves (no such remote).
+_liveness_subject() { # <repo> <remote>
+  local url
+  url="$(git -C "$1" remote get-url "$2" 2>/dev/null || true)"
+  case "$url" in
+    '') printf '%s' "$2" ;;
+    *)  printf '%s' "$url" | sed -e 's#://[^/@]*@#://#' ;;
+  esac
+}
+
+_liveness() { # <attempt|complete> <subject> [reached: yes|no] [detail]
+  [ -x "$LIVENESS_BIN" ] || return 0
+  local mode="$1" subject="$2" reached="${3:-}" detail="${4:-}"
+  if [ -n "$reached" ]; then
+    "$LIVENESS_BIN" "$mode" --subsystem context-sync --subject "$subject" \
+      --reached "$reached" --detail "$detail" >/dev/null 2>&1 || true
+  else
+    "$LIVENESS_BIN" "$mode" --subsystem context-sync --subject "$subject" \
+      --detail "$detail" >/dev/null 2>&1 || true
+  fi
+  return 0
+}
 
 # ── per-repo toggle state (gitignored, non-secret) — mirrors presence.json ──────
 _context_state_dir() { printf '%s/.heimdall' "$1"; }
@@ -383,17 +425,27 @@ do_sync() {
     fi
   fi
 
-  local repo_ref stage msg
+  # Past the no-op gates: from here the run intends to touch the remote, so from here
+  # every exit path states whether it did. The subject is resolved once — a run that
+  # dies later still leaves a receipt naming what it was trying to reach.
+  local repo_ref stage msg subject
+  subject="$(_liveness_subject "$repo" "$remote" 2>/dev/null || true)"
   repo_ref="$(_derive_repo_ref "$repo")"
   stage="$(mktemp -d)"
   # shellcheck disable=SC2064
   trap "rm -rf '$stage'" RETURN
 
   assemble_payload "$repo" "$repo_ref" "$stage" || {
+    _liveness complete "$subject" no "payload assembly failed — nothing committed or pushed"
     echo "heimdall-context-sync: failed to assemble the payload" >&2; return 2; }
 
   # THE ORACLE — secret-scan the payload BEFORE any commit or push (fail-closed).
   if ! scan_stage "$stage"; then
+    # The refusal is CORRECT behaviour and still a real outage of the sync: nothing was
+    # committed, nothing was pushed, the remote was never touched. Recording `no` names
+    # that cause the moment it happens instead of leaving staleness to misname it a week
+    # later — and it self-heals on the next sync that scrubs the secret and pushes.
+    _liveness complete "$subject" no "secret-scan refused the payload — nothing committed or pushed"
     echo "BLOCKED: heimdall-context-sync detected a credential SHAPE in the session state." >&2
     echo "Fail-closed: NOTHING was committed or pushed. Scrub the secret from the source and retry." >&2
     return 1
@@ -401,6 +453,9 @@ do_sync() {
 
   msg="hmd context: sync $(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo now) — $repo_ref"
 
+  # A --dry-run commits and pushes nothing by design. It is an inspection, not a cycle,
+  # so it records NOTHING: a human eyeballing the plan must not be able to flip the
+  # subsystem's verdict either way.
   if [ "$dry" = "1" ]; then
     echo "DRY-RUN context-sync plan:"
     echo "  repo    : $repo_ref"
@@ -413,19 +468,31 @@ do_sync() {
 
   local sha
   sha="$(commit_orphan "$repo" "$stage" "$msg")" || {
+    _liveness complete "$subject" no "commit to $CONTEXT_BRANCH failed — nothing pushed"
     echo "heimdall-context-sync: failed to commit the context payload" >&2; return 2; }
+
+  # ATTEMPT is stamped BEFORE the push, so a run killed mid-push (a hook timeout, a
+  # closed laptop, a hung remote) reads attempted-never-completed instead of vanishing.
+  _liveness attempt "$subject" "" "pushing $CONTEXT_BRANCH ($sha) to $remote"
 
   # push the orphan branch to the remote (main is never involved).
   if git -C "$repo" remote get-url "$remote" >/dev/null 2>&1; then
     if git -C "$repo" push -q "$remote" "refs/heads/$CONTEXT_BRANCH:refs/heads/$CONTEXT_BRANCH" 2>/dev/null; then
+      # THE ONLY reached=yes in this file: the push itself returned success.
+      _liveness complete "$subject" yes "pushed $CONTEXT_BRANCH ($sha) to $remote ($repo_ref)"
       echo "context-sync: pushed $CONTEXT_BRANCH ($sha) to $remote ($repo_ref)"
       : > "$stamp" 2>/dev/null || true
       return 0
     fi
+    # The fact exit 3 throws away today: the commit exists locally, the remote does not
+    # have it, and nothing downstream would ever learn that.
+    _liveness complete "$subject" no "push to $remote rejected/unreachable — commit is on local $CONTEXT_BRANCH ($sha)"
     echo "heimdall-context-sync: push to $remote rejected/unreachable — commit is on local $CONTEXT_BRANCH ($sha)" >&2
     : > "$stamp" 2>/dev/null || true
     return 3
   fi
+  # Exit 0, and still unreached: a local-only commit is not a synced one.
+  _liveness complete "$subject" no "no '$remote' remote — committed to local $CONTEXT_BRANCH ($sha) only"
   echo "context-sync: no '$remote' remote — committed to local $CONTEXT_BRANCH ($sha) only"
   : > "$stamp" 2>/dev/null || true
   return 0
