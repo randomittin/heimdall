@@ -47,8 +47,16 @@ printf -- '--------------------------------------------------------------------\
 # ── 1. NO TRACKED SCRIPT/CONFIG PRESCRIBES A SUB-OPUS REVIEWER ──
 # docs/analysis/ is excluded here and checked separately in step 2/3 — those
 # two docs must be free to QUOTE the refuted advice in order to refute it.
+# This file is excluded for the SAME reason docs/analysis/ is: the checker has to
+# be free to write the pattern it forbids, and it does so twice — once in the header
+# quoting the refuted advice, once in the detection regex below, which necessarily
+# contains SECURITY_REVIEW_MODEL … haiku|sonnet and therefore matches itself. The
+# exclusion is exactly one literal path, never a glob, so it cannot widen; and the
+# synthetic probe below proves the pattern still detects after the exclusion, so a
+# self-exclusion can never quietly become a blind spot.
+SELF_REL="test/security-review-tier.test.sh"
 SCAN="$(git ls-files -- 'bin/*' 'hooks/*' 'test/*' 'conformance/*' '*.json' '*.sh' '*.md' \
-        2>/dev/null | grep -v '^docs/analysis/' || true)"
+        2>/dev/null | grep -v '^docs/analysis/' | grep -vFx "$SELF_REL" || true)"
 if [ -z "$SCAN" ]; then
   bad "file scan matched nothing — an empty scan must not pass"
 else
@@ -61,6 +69,18 @@ else
     [ -n "$H" ] && HITS="$HITS
 $f: $H"
   done
+  # PROVE-DETECTS: a green scan above is only worth something if the pattern can still
+  # go red. Feed it a planted downgrade and require a hit. Without this, widening the
+  # exclusions or breaking the regex would read exactly like a clean tree.
+  PROBE="$(mktemp -t sectier-probe)"
+  printf 'export SECURITY_REVIEW_MODEL=claude-haiku-4-5\n' > "$PROBE"
+  if grep -qE '(SECURITY_REVIEW_MODEL|SG_AGENTIC_MODEL)[[:space:]]*=[[:space:]]*"?.*(haiku|sonnet)' "$PROBE"; then
+    ok "PROVE-DETECTS: the scan pattern still flags a planted sub-opus prescription"
+  else
+    bad "PROVE-DETECTS: the scan pattern no longer flags a planted downgrade — the clean verdict above is vacuous"
+  fi
+  rm -f "$PROBE"
+
   if [ -z "$HITS" ]; then
     ok "no tracked script/config downgrades SECURITY_REVIEW_MODEL / SG_AGENTIC_MODEL"
   else
