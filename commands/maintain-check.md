@@ -26,6 +26,18 @@ heimdall-state get '.maintainer.enabled'
 ```
 If `false`, respond: "Maintainer mode is off. Run `/hmd:maintain` to enable." and stop.
 
+2. Check the ⚠-class queue has not aged. Every ⚠ observation owes, within 24h of
+being filed, either a fix or a durable triage reason a human wrote:
+```bash
+heimdall-sla --repo .          # exit 1 on BREACH; each breach names id, class, age
+```
+A BREACH is not a blocker for this cycle — it is work this cycle owes. Fold every
+breached item into the triage below, oldest first, and give each one a verdict.
+The reason this runs here rather than nowhere: the aging IS the bug. An unactioned
+item that quietly gets older is the same disease as a monitor that quietly stops —
+in both cases the absence of a signal is indistinguishable from the absence of a
+problem, so some surface has to ask the question on a schedule.
+
 ## Dry-Run Mode
 
 If `$ARGUMENTS` contains `--dry-run`, DO NOT execute or mutate anything. Show the plan:

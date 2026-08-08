@@ -46,6 +46,19 @@ heimdall-dream --repo . run --json
 heimdall-dream --repo . run --overnight --start-experiment --json
 ```
 
+Then run the executable checks over the rules this repo already wrote down, and fold
+what they find into the same morning report:
+
+```bash
+heimdall-conformance all         # commit-per-unit · brief-routing · gate-runs-once · gates-at-end
+heimdall-conformance inventory   # every normative rule with a CHECKED / UNCHECKABLE verdict
+```
+
+An overnight pass is the right consumer for these: they measure session discipline
+over a window that has already closed, so they can only be answered after the fact.
+A rule with no falsifier is a comment — `inventory` is what says out loud which rules
+are currently only comments, instead of leaving that unmeasured.
+
 `--overnight` is the same run tagged `mode: overnight` (used when a schedule fires it);
 `$ARGUMENTS` may pass `--start-experiment` to let the loop start one bounded experiment.
 
