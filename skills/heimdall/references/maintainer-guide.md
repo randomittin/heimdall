@@ -2,6 +2,49 @@
 
 Maintainer mode turns Heimdall into an autonomous repo maintainer that triages issues, fixes bugs, and manages releases.
 
+**Read this file when `/hmd:maintain` or `/hmd:maintain-check` runs**, or when the user
+asks Heimdall to watch a repo. It is not consulted by ordinary development tasks.
+
+## The Maintenance Cycle (summary)
+
+`/hmd:maintain` runs the seek-then-fix pipeline: a seeker agent files issues, a fixer agent
+opens PRs. **There is no setup wizard and no stored configuration** — it does not prompt for
+issue sources, monitoring frequency or a Slack channel. Authenticate `gh` first, and arrange
+recurrence yourself with `/loop` or `/schedule`.
+
+Each `/hmd:maintain-check` invocation runs one cycle:
+
+1. **Scan** — pull new issues from all configured sources (GitHub, logs, error tracking)
+2. **Filter** — skip issues already tracked in `maintainer.pending_fixes`
+3. **Triage** — classify severity x confidence, route per the matrix:
+
+   | Route | Action |
+   |-------|--------|
+   | Critical x Any | Alert user + spawn hotfix agent + require human merge |
+   | High x High | Spawn coder → test → lint → review → create PR |
+   | High x Medium | Spawn architect to investigate, then fix if found |
+   | Medium/Low x High | Auto-fix, add to release queue for batch |
+   | Medium/Low x Medium | Investigate, add to queue if fixable |
+   | Any x Low | Escalate to user with full context |
+
+4. **Fix** — spawn agents for each routed issue (coder, test-runner, lint-quality, reviewer)
+5. **Release** — when 3+ items in queue or oldest is >24h: batch into patch release with semver bump, changelog, and GitHub release
+6. **Communicate** — report the summary to the user. Posting it to Slack requires the
+   `slack:*` skills to be installed; there is no Slack client in this repo and nothing reads
+   `maintainer.slack_channel`.
+
+Reap merged agent worktrees at the top of each sweep with `bin/heimdall-reap-idle --apply`, so worktrees accumulated by prior fix/seek waves are reclaimed before new agents spawn.
+
+### Key Principle
+
+Every maintainer action reflects CTO-level judgment. Don't just mechanically apply fixes — consider:
+- Is this fix actually the right approach, or does it need a different design?
+- Will this fix create tech debt elsewhere?
+- Should this be escalated even if it looks auto-fixable?
+- Is the issue a symptom of a larger problem?
+
+When in doubt, escalate. A false alarm is better than a bad auto-merge.
+
 ## Activation
 
 ```
@@ -31,6 +74,10 @@ Or for persistent monitoring that survives session restarts:
 ```
 
 Each `/hmd:maintain-check` invocation runs one full cycle: scan → triage → fix → release.
+
+After activation, the user starts continuous monitoring with:
+- `/loop 30m /hmd:maintain-check` — checks every 30 minutes in-session
+- `/schedule` — persistent cron that survives session restarts
 
 ## Issue Ingestion
 
