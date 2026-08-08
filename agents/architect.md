@@ -4,6 +4,7 @@ description: Read-only architecture and planning specialist. Analyzes codebase s
 tools: Read, Write, Edit, Grep, Glob, Bash, Skill
 disallowedTools: Workflow
 model: opus
+tier: opus
 effort: high
 memory: project
 maxTurns: 30

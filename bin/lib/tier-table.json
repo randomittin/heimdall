@@ -1,0 +1,168 @@
+{
+  "schema": "heimdall.tier-table/1",
+  "purpose": "Declared model routing. Task class -> tier, agent template -> task class, observed session -> task class. Read by bin/heimdall-tier (declaration + conformance) and bin/lib/tier_audit.py (drift audit). Changing a tier here changes what the audit calls drift, so this file is the single place the routing decision lives.",
+  "no_pinned_ids": "Tiers are BARE ALIASES on purpose. Claude Code resolves opus|sonnet|haiku to the current generation of that tier; a pinned full model id in an operational path silently ages (that is how Opus 5 shipped while Heimdall kept spawning claude-opus-4-8). Pin only for bench/eval reproducibility, via HEIMDALL_MODEL_<TIER>. model_id_tier_patterns below classify OBSERVED history and are therefore version-free regexes, not pins.",
+
+  "tiers": {
+    "haiku": {
+      "rank": 1,
+      "price_input_per_mtok": 1.0,
+      "price_output_per_mtok": 5.0,
+      "context_window": 200000,
+      "zdr_eligible": true
+    },
+    "sonnet": {
+      "rank": 2,
+      "price_input_per_mtok": 3.0,
+      "price_output_per_mtok": 15.0,
+      "context_window": 1000000,
+      "zdr_eligible": true
+    },
+    "opus": {
+      "rank": 3,
+      "price_input_per_mtok": 5.0,
+      "price_output_per_mtok": 25.0,
+      "context_window": 1000000,
+      "zdr_eligible": true
+    },
+    "fable": {
+      "rank": 3,
+      "price_input_per_mtok": 10.0,
+      "price_output_per_mtok": 50.0,
+      "context_window": 1000000,
+      "zdr_eligible": false
+    }
+  },
+
+  "rank_note": "fable shares opus's rank because spec 2.1 writes the top row as 'Opus / Fable' — either satisfies that class, so an opus-class task seen on fable is not tier drift. Fable's extra cost is governed by the ZDR policy gate and the weekly allowance, not by the drift rank.",
+
+  "cache_price_multipliers": {
+    "cache_read": 0.1,
+    "cache_write_5m": 1.25,
+    "cache_write_1h": 2.0,
+    "note": "Every cache line is a fixed multiple of the tier's own input price, identical across haiku/sonnet/opus/fable. This is why the counterfactual cost of a request at another tier is a single scalar on the forensics harness's cost(), not a second price model that could disagree with it."
+  },
+
+  "non_zdr_tiers": ["fable"],
+  "non_zdr_policy_key": "allow_non_zdr_models",
+  "non_zdr_note": "Claude Fable 5 requires 30-day data retention; a zero-data-retention org gets 400 invalid_request_error on every Fable request. Selection is therefore deny-by-default and must fail LOUDLY — a silent downgrade to a cheaper tier would hide the fact that a repo cannot run this tier at all.",
+
+  "classes": {
+    "hook": {
+      "tier": "haiku",
+      "summary": "Hook bodies: fires per event, bounded input, decision is a classification not a design.",
+      "examples": ["security-guidance Stop hook", "PreToolUse content scans", "SessionStart context injectors"]
+    },
+    "classifier": {
+      "tier": "haiku",
+      "summary": "Label a bounded input against a fixed set of categories."
+    },
+    "formatter": {
+      "tier": "haiku",
+      "summary": "Lint, format, rename, mechanical rewrite with a deterministic oracle."
+    },
+    "janitor": {
+      "tier": "haiku",
+      "summary": "Janitor and reaper tasks: sweep stale state, close orphans, prune logs."
+    },
+    "statusline": {
+      "tier": "haiku",
+      "summary": "Statusline and other render-only surfaces."
+    },
+    "marker_check": {
+      "tier": "haiku",
+      "summary": "Presence/absence checks for markers, sentinels and required fields."
+    },
+    "coder": {
+      "tier": "sonnet",
+      "summary": "Standard coder agents: implement to a stated scope with tests."
+    },
+    "test_writer": {
+      "tier": "sonnet",
+      "summary": "Write and run tests against an existing implementation."
+    },
+    "doc": {
+      "tier": "sonnet",
+      "summary": "Documentation agents: write and sync prose against shipped behaviour."
+    },
+    "triage": {
+      "tier": "sonnet",
+      "summary": "Triage: read signals, group them, decide what deserves escalation."
+    },
+    "orchestrator": {
+      "tier": "opus",
+      "summary": "Decompose work, spawn and supervise agents, hold the plan.",
+      "security_sensitive": true,
+      "no_downgrade_reason": "The orchestrator decides which gates run at all. Weakening it weakens every gate downstream of it."
+    },
+    "architecture": {
+      "tier": "opus",
+      "summary": "Architecture and design reasoning; decisions that outlive the session."
+    },
+    "security_critical": {
+      "tier": "opus",
+      "summary": "Security-critical reasoning: threat modelling, vulnerability assessment, dependency and secret audit.",
+      "security_sensitive": true,
+      "no_downgrade_reason": "A cheaper check that misses a vulnerability costs far more than the whole $57.73 this table was built to recover. If the spend is unacceptable, reduce FREQUENCY — never the tier."
+    },
+    "gate_adjudication": {
+      "tier": "opus",
+      "summary": "Adjudicating a gate: review, verification, deciding whether evidence actually proves the claim.",
+      "security_sensitive": true,
+      "no_downgrade_reason": "A gate that passes work it should have failed is worse than no gate, because it manufactures false confidence."
+    },
+    "forensics": {
+      "tier": "opus",
+      "summary": "Incident and spend forensics: reconstruct what happened from evidence."
+    }
+  },
+
+  "agents": {
+    "heimdall": "orchestrator",
+    "architect": "architecture",
+    "planner": "architecture",
+    "database-architect": "architecture",
+    "design": "coder",
+    "coder": "coder",
+    "wave-executor": "coder",
+    "fixer": "coder",
+    "seeker": "triage",
+    "security-auditor": "security_critical",
+    "reviewer": "gate_adjudication",
+    "verifier": "gate_adjudication",
+    "incident-responder": "forensics",
+    "docs-writer": "doc",
+    "test-runner": "test_writer",
+    "lint-quality": "formatter"
+  },
+
+  "session_signatures": [
+    {
+      "class": "hook",
+      "match": "prompt_prefix",
+      "value": "Review this change for security vulnerabilities.",
+      "label": "security-guidance Stop hook (first pass)",
+      "note": "Classified hook/haiku per spec 2.1 and the owner's adjudication of the 89-run, $57.73 incident as a class. The binding safety rule still applies to the CONTENT: if this check is judged to need stronger reasoning, the correct lever is firing it less often, not a table edit."
+    },
+    {
+      "class": "hook",
+      "match": "prompt_prefix",
+      "value": "You previously flagged these candidate vulnerabilities:",
+      "label": "security-guidance Stop hook (confirmation pass)"
+    },
+    {
+      "class": "orchestrator",
+      "match": "prompt_prefix",
+      "value": "/goal",
+      "label": "goal-driven orchestration session"
+    }
+  ],
+
+  "model_id_tier_patterns": [
+    { "pattern": "^claude-fable", "tier": "fable" },
+    { "pattern": "^claude-mythos", "tier": "fable" },
+    { "pattern": "^claude-opus", "tier": "opus" },
+    { "pattern": "^claude-sonnet", "tier": "sonnet" },
+    { "pattern": "^claude-haiku", "tier": "haiku" }
+  ]
+}

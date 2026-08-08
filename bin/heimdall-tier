@@ -1,0 +1,405 @@
+#!/usr/bin/env python3
+"""heimdall-tier — declare, enforce and report the model tier a task runs at.
+
+WHY: the security-guidance Stop hook ran 89 times on Opus for $57.73 doing work
+the Haiku tier handles. Nothing was wrong with any single run — nothing had ever
+DECLARED what tier that task wanted, so nothing could notice it was running three
+tiers above it. This command makes the declaration explicit and recorded:
+
+    table     print the routing table as encoded
+    declare   record the tier a spawn runs at (and whether it inherited one)
+    check     conformance: every spawn template declares a tier (spec 3.4)
+    policy    report this repo's stance on non-ZDR model tiers
+
+The two rules that shape every decision below:
+
+  * A spawn that declares no tier INHERITS the role default AND LOGS THAT IT DID.
+    Silent inheritance is how drift hides, so the log entry is the product.
+  * An agent may request a HIGHER tier with one line of stated reason, recorded.
+    An escalation with no reason is drift, not escalation — it is still recorded,
+    but as drift, and the command exits nonzero so the caller cannot miss it.
+
+And the rule that outranks cost: a security-sensitive class is never downgraded
+to save money. If such a task is too expensive, the lever is FREQUENCY, not tier.
+A cheaper check that misses a vulnerability costs more than the whole $57.73.
+
+Exit codes:
+    0  ok
+    1  conformance failure
+    2  usage error
+    3  refused — the requested tier is non-ZDR and this repo has not opted in
+    4  refused — escalation above the class tier with no stated reason (drift)
+    5  refused — a security-sensitive class may not be declared below its tier
+"""
+import argparse
+import glob
+import json
+import os
+import subprocess
+import sys
+from datetime import datetime, timezone
+
+SELF_DIR = os.path.dirname(os.path.abspath(__file__))
+TABLE_PATH = os.path.join(SELF_DIR, 'lib', 'tier-table.json')
+RESOLVER = os.path.join(SELF_DIR, 'heimdall-model-resolve')
+
+EXIT_CONFORMANCE = 1
+EXIT_USAGE = 2
+EXIT_NON_ZDR = 3
+EXIT_UNREASONED = 4
+EXIT_SECURITY_DOWNGRADE = 5
+
+
+def load_table():
+    with open(TABLE_PATH) as handle:
+        return json.load(handle)
+
+
+def repo_root(explicit=None):
+    if explicit:
+        return os.path.abspath(explicit)
+    fallback = os.path.dirname(SELF_DIR)
+    try:
+        top = subprocess.run(['git', 'rev-parse', '--show-toplevel'],
+                             capture_output=True, text=True, check=False)
+    except OSError:
+        return fallback
+    if top.returncode == 0 and top.stdout.strip():
+        return top.stdout.strip()
+    return fallback
+
+
+def rank(table, tier):
+    return table['tiers'].get(tier, {}).get('rank')
+
+
+def class_tier(table, name):
+    meta = table['classes'].get(name)
+    if meta is None:
+        raise SystemExit(
+            "heimdall-tier: unknown task class %r (known: %s)"
+            % (name, ', '.join(sorted(table['classes']))))
+    return meta['tier']
+
+
+def gate_tier(tier, repo):
+    """Run the requested tier past the resolver, which owns the non-ZDR policy.
+
+    Resolving here rather than re-reading the policy file keeps ONE parser for
+    the opt-in key; a second one could disagree with the first and quietly widen
+    the gate. Returns the resolver's stderr on refusal, None when allowed.
+    """
+    env = dict(os.environ)
+    env.setdefault('HEIMDALL_REPO', repo)
+    result = subprocess.run([RESOLVER, tier], capture_output=True, text=True,
+                            check=False, env=env)
+    if result.returncode == 0:
+        return None
+    return result.stderr.strip() or ('tier %r refused (exit %d)'
+                                     % (tier, result.returncode))
+
+
+def read_frontmatter(path):
+    """Parse the leading --- fenced block of an agent template.
+
+    Deliberately a line scanner, not a YAML parse: agent frontmatter is flat
+    scalars, and depending on PyYAML would make a conformance gate fail to run
+    on a machine that has not installed it.
+    """
+    fields = {}
+    with open(path, errors='replace') as handle:
+        first = handle.readline()
+        if first.strip() != '---':
+            return fields
+        for line in handle:
+            if line.strip() == '---':
+                break
+            if line.startswith((' ', '\t', '#')) or ':' not in line:
+                continue
+            key, _, value = line.partition(':')
+            fields[key.strip()] = value.strip().strip('"\'')
+    return fields
+
+
+def append_record(repo, record):
+    planning = os.path.join(repo, '.planning')
+    os.makedirs(planning, exist_ok=True)
+    path = os.path.join(planning, 'tier-declarations.jsonl')
+    with open(path, 'a') as handle:
+        handle.write(json.dumps(record, sort_keys=True) + '\n')
+    return path
+
+
+# ── table ────────────────────────────────────────────────────────────────────
+
+def cmd_table(args):
+    table = load_table()
+    if args.json:
+        json.dump(table, sys.stdout, indent=2, sort_keys=True)
+        sys.stdout.write('\n')
+        return 0
+
+    by_tier = {}
+    for name, meta in table['classes'].items():
+        by_tier.setdefault(meta['tier'], []).append(name)
+    order = sorted(table['tiers'], key=lambda t: (table['tiers'][t]['rank'], t))
+
+    print('MODEL ROUTING TABLE  (%s)' % os.path.relpath(TABLE_PATH, repo_root()))
+    print('-' * 74)
+    for tier in order:
+        meta = table['tiers'][tier]
+        classes = sorted(by_tier.get(tier, []))
+        flag = '' if meta.get('zdr_eligible', True) else '  [non-ZDR: opt-in required]'
+        print('%-7s rank %d  $%.2f/$%.2f per Mtok  ctx %s%s'
+              % (tier, meta['rank'], meta['price_input_per_mtok'],
+                 meta['price_output_per_mtok'], format(meta['context_window'], ','), flag))
+        if not classes:
+            print('        (no task class routes here by default)')
+        for name in classes:
+            cmeta = table['classes'][name]
+            mark = ' *' if cmeta.get('security_sensitive') else '  '
+            print('       %s%-18s %s' % (mark, name, cmeta.get('summary', '')))
+    print('-' * 74)
+    print('* security-sensitive: never downgraded to save money. Reduce FREQUENCY instead.')
+    print('\nagent template -> task class')
+    for agent in sorted(table['agents']):
+        print('  %-20s %s' % (agent, table['agents'][agent]))
+    return 0
+
+
+# ── declare ──────────────────────────────────────────────────────────────────
+
+def cmd_declare(args):
+    table = load_table()
+    repo = repo_root(args.repo)
+    name = args.task_class
+    default = class_tier(table, name)
+    meta = table['classes'][name]
+    requested = args.tier
+    reason = (args.reason or '').strip()
+
+    record = {
+        'ts': datetime.now(timezone.utc).isoformat(),
+        'class': name,
+        'requested_tier': requested,
+        'declared_tier': requested or default,
+        'default_tier': default,
+        'inherited': requested is None,
+        'escalated': False,
+        'drift': False,
+        'downgraded': False,
+        'allowed': True,
+        'reason': reason,
+        'agent': args.agent,
+        'spawn': args.spawn,
+        'session': args.session or os.environ.get('CLAUDE_SESSION_ID'),
+    }
+
+    if requested is None:
+        # Spec 2.1: inheritance is permitted, invisible inheritance is not.
+        append_record(repo, record)
+        print(default)
+        sys.stderr.write(
+            'heimdall-tier: %s declared no tier — inheriting the %s default for '
+            'class %r (recorded as inherited)\n'
+            % (args.agent or 'spawn', default, name))
+        return 0
+
+    if rank(table, requested) is None:
+        sys.stderr.write('heimdall-tier: unknown tier %r (known: %s)\n'
+                         % (requested, ', '.join(sorted(table['tiers']))))
+        return EXIT_USAGE
+
+    delta = rank(table, requested) - rank(table, default)
+
+    if delta < 0 and meta.get('security_sensitive'):
+        record['allowed'] = False
+        record['downgraded'] = True
+        append_record(repo, record)
+        sys.stderr.write(
+            'heimdall-tier: REFUSED — class %r is security-sensitive and may not run '
+            'below its %s tier.\n  %s\n  If the spend is unacceptable the lever is '
+            'FREQUENCY, not tier.\n'
+            % (name, default, meta.get('no_downgrade_reason', '')))
+        return EXIT_SECURITY_DOWNGRADE
+
+    if delta != 0 and not reason:
+        # Spec 2.3: an escalation with no reason is drift, not escalation. Record
+        # it as drift so the audit counts it, and fail loudly so the caller knows.
+        record['drift'] = True
+        record['allowed'] = False
+        record['downgraded'] = delta < 0
+        append_record(repo, record)
+        direction = 'above' if delta > 0 else 'below'
+        sys.stderr.write(
+            'heimdall-tier: REFUSED — tier %r is %s the %s default for class %r and no '
+            'reason was given.\n  An escalation with no stated reason is DRIFT, not '
+            'escalation. Pass --reason "<one line>".\n  Recorded as drift.\n'
+            % (requested, direction, default, name))
+        return EXIT_UNREASONED
+
+    refusal = gate_tier(requested, repo)
+    if refusal:
+        record['allowed'] = False
+        record['escalated'] = delta > 0
+        record['downgraded'] = delta < 0
+        append_record(repo, record)
+        sys.stderr.write('heimdall-tier: REFUSED — tier %r is not selectable here.\n%s\n'
+                         % (requested, refusal))
+        return EXIT_NON_ZDR
+
+    record['escalated'] = delta > 0
+    record['downgraded'] = delta < 0
+    append_record(repo, record)
+    print(requested)
+    if delta > 0:
+        sys.stderr.write('heimdall-tier: escalated %s -> %s for class %r: %s\n'
+                         % (default, requested, name, reason))
+    elif delta < 0:
+        sys.stderr.write('heimdall-tier: downgraded %s -> %s for class %r: %s\n'
+                         % (default, requested, name, reason))
+    return 0
+
+
+# ── check ────────────────────────────────────────────────────────────────────
+
+def cmd_check(args):
+    table = load_table()
+    repo = repo_root(args.repo)
+    agents_dir = os.path.join(repo, 'agents')
+    paths = sorted(glob.glob(os.path.join(agents_dir, '*.md')))
+
+    print('TIER CONFORMANCE  (spec 3.4: every spawn template declares a tier)')
+    print('  templates: %s' % agents_dir)
+
+    if not paths:
+        sys.stderr.write(
+            'heimdall-tier: FAIL — no spawn templates found under %s.\n'
+            '  A conformance gate that passes when it found nothing to check is '
+            'worse than no gate: it manufactures confidence. Failing closed.\n'
+            % agents_dir)
+        return EXIT_CONFORMANCE
+
+    failures = []
+    for path in paths:
+        fields = read_frontmatter(path)
+        agent = fields.get('name') or os.path.basename(path)[:-3]
+        rel = os.path.relpath(path, repo)
+
+        cls = table['agents'].get(agent)
+        if not cls:
+            failures.append('%s: agent %r is not mapped to a task class in %s'
+                            % (rel, agent, os.path.relpath(TABLE_PATH, repo)))
+            continue
+
+        declared = fields.get('tier')
+        if not declared:
+            failures.append('%s: declares no tier: — it would inherit the role '
+                            'default invisibly (class %r wants %s)'
+                            % (rel, cls, class_tier(table, cls)))
+            continue
+        if rank(table, declared) is None:
+            failures.append('%s: unknown tier %r' % (rel, declared))
+            continue
+
+        model = fields.get('model')
+        if not model:
+            failures.append('%s: declares tier %r but no model: to cross-check — the '
+                            'declaration cannot be enforced' % (rel, declared))
+            continue
+        if model != declared:
+            failures.append('%s: declares tier %r but runs model %r — the declaration '
+                            'is not what executes' % (rel, declared, model))
+            continue
+
+        default = class_tier(table, cls)
+        delta = rank(table, declared) - rank(table, default)
+        reason = (fields.get('tier_reason') or '').strip()
+        meta = table['classes'][cls]
+
+        if delta < 0 and meta.get('security_sensitive'):
+            failures.append('%s: class %r is security-sensitive and may not be '
+                            'declared below its %s tier (found %r). Reduce frequency, '
+                            'not tier.' % (rel, cls, default, declared))
+            continue
+        if delta != 0 and not reason:
+            failures.append('%s: tier %r departs from the %s default for class %r with '
+                            'no tier_reason: — an escalation with no stated reason is '
+                            'drift' % (rel, declared, default, cls))
+            continue
+
+        marker = '=' if delta == 0 else ('^' if delta > 0 else 'v')
+        print('  %s %-22s %-8s class=%-18s %s'
+              % (marker, agent, declared, cls, reason if delta else ''))
+
+    print('  %d templates checked, %d failing' % (len(paths), len(failures)))
+    if failures:
+        sys.stderr.write('heimdall-tier: FAIL — tier declarations are not conformant:\n')
+        for line in failures:
+            sys.stderr.write('  - %s\n' % line)
+        return EXIT_CONFORMANCE
+    return 0
+
+
+# ── policy ───────────────────────────────────────────────────────────────────
+
+def cmd_policy(args):
+    table = load_table()
+    repo = repo_root(args.repo)
+    key = table['non_zdr_policy_key']
+    print('NON-ZDR MODEL POLICY  repo=%s' % repo)
+    print('  opt-in key: "%s" in .planning/repo-policy.json' % key)
+    print('  %s' % table['non_zdr_note'])
+    for tier in table['non_zdr_tiers']:
+        refusal = gate_tier(tier, repo)
+        if refusal:
+            print('  %-7s DENIED' % tier)
+            for line in refusal.splitlines():
+                print('          %s' % line.strip())
+        else:
+            print('  %-7s allowed (repo opted in)' % tier)
+    for tier in sorted(table['tiers']):
+        if tier not in table['non_zdr_tiers']:
+            print('  %-7s allowed (ZDR-eligible, no opt-in needed)' % tier)
+    return 0
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(
+        prog='heimdall-tier',
+        description='Declare, enforce and report the model tier a task runs at.')
+    sub = parser.add_subparsers(dest='command')
+
+    p_table = sub.add_parser('table', help='print the routing table as encoded')
+    p_table.add_argument('--json', action='store_true', help='emit the raw table')
+    p_table.set_defaults(func=cmd_table)
+
+    p_declare = sub.add_parser('declare', help='record the tier a spawn runs at')
+    p_declare.add_argument('--class', dest='task_class', required=True,
+                           help='task class from the routing table')
+    p_declare.add_argument('--tier', help='requested tier; omit to inherit the default')
+    p_declare.add_argument('--reason',
+                           help='one line justifying a departure from the default')
+    p_declare.add_argument('--agent', help='agent template making the declaration')
+    p_declare.add_argument('--spawn', help='spawn id, when there is one')
+    p_declare.add_argument('--session', help='session id (defaults to $CLAUDE_SESSION_ID)')
+    p_declare.add_argument('--repo', help='repo root to record under')
+    p_declare.set_defaults(func=cmd_declare)
+
+    p_check = sub.add_parser('check', help='conformance: every template declares a tier')
+    p_check.add_argument('--repo', help='repo root to check')
+    p_check.set_defaults(func=cmd_check)
+
+    p_policy = sub.add_parser('policy', help="report this repo's non-ZDR stance")
+    p_policy.add_argument('--repo', help='repo root to report on')
+    p_policy.set_defaults(func=cmd_policy)
+
+    args = parser.parse_args(argv)
+    if not getattr(args, 'func', None):
+        parser.print_help()
+        return EXIT_USAGE
+    return args.func(args)
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

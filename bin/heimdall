@@ -145,15 +145,34 @@ _trace_order() {
 # is set, since Claude Code maps opus/sonnet/haiku to the newest of that tier. A
 # pin set via the environment is still honoured on the degraded path, so a bench
 # run can never silently resolve to the wrong model.
+#
+# THE REFUSAL IS NOT A DEGRADATION: the resolver denies a non-ZDR tier (fable) in
+# a repo that has not opted in. Falling back to the bare alias there would print
+# exactly the tier the policy just forbade, so a nonzero resolver exit propagates
+# instead of degrading, and its stderr is NOT swallowed. On the degraded path the
+# repo policy cannot be evaluated at all, so the non-ZDR tier is denied outright —
+# deny-by-default is the whole contract.
 resolve_model() {
-  local tier="$1" resolver="$PLUGIN_DIR/bin/heimdall-model-resolve" out=""
+  local tier="$1" resolver="$PLUGIN_DIR/bin/heimdall-model-resolve" out="" rc=0
   if [ -x "$resolver" ]; then
-    out="$("$resolver" "$tier" 2>/dev/null)" || out=""
+    out="$("$resolver" "$tier")" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+      printf 'heimdall: model tier %s refused by heimdall-model-resolve (exit %s)\n' \
+        "'$tier'" "$rc" >&2
+      return "$rc"
+    fi
   else
     case "$tier" in
       opus)   out="${HEIMDALL_MODEL_OPUS:-}" ;;
       sonnet) out="${HEIMDALL_MODEL_SONNET:-}" ;;
       haiku)  out="${HEIMDALL_MODEL_HAIKU:-}" ;;
+      fable)
+        printf 'heimdall: REFUSED tier %s — non-ZDR, and heimdall-model-resolve is\n' \
+          "'$tier'" >&2
+        printf '  unavailable at %s, so repo policy cannot be evaluated. Denying by default.\n' \
+          "$resolver" >&2
+        return 3
+        ;;
     esac
   fi
   printf '%s\n' "${out:-$tier}"
@@ -2247,6 +2266,29 @@ case "${1:-}" in
     fi
     exec "$MODULES_BIN" "$@"
     ;;
+  tier)
+    # Pass-through to heimdall-tier: the model-routing table and its declaration
+    # log (spec Part 2). Escalation is allowed, silent DRIFT is not — the tool
+    # records which tier a task class actually ran on, with the stated reason
+    # when an agent asks for a higher one, so the weekly audit can tell a
+    # reasoned escalation from a wrong-tier default.
+    #
+    # This arm exists because the tool shipped without it: heimdall-tier was
+    # written, tested, and reachable from nothing — the third such subsystem
+    # found in one session, and the exact shape the consumer audit exists to
+    # catch. A routing table nobody can invoke enforces no routing.
+    #
+    # Every flag forwards verbatim, so a routed run and a direct bin run are
+    # byte-identical.
+    shift
+    TIER_BIN="$PLUGIN_DIR/bin/heimdall-tier"
+    if [ ! -x "$TIER_BIN" ]; then
+      echo "  Error: heimdall-tier not found at $TIER_BIN" >&2
+      echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+      exit 1
+    fi
+    exec "$TIER_BIN" "$@"
+    ;;
   weekly-log)
     # Pass-through to heimdall-weekly-log: the weekly "what the watchman learned"
     # changelog generator (consent + k-anonymity gated, DATA.md §7 — see the
@@ -2702,6 +2744,7 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   echo "  heimdall join <secret>    Join a teammate's team"
   echo "  heimdall connect          Connect a Claude credential for remote jobs"
   echo "  heimdall presence         Control presence (off/on/status/roster)"
+  echo "  heimdall tier             Model routing table + tier declaration log"
   echo "  heimdall weekly-log       Weekly changelog draft generator (drafts only)"
   echo ""
   echo "heimdall launches Claude Code with:"

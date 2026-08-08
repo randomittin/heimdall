@@ -10,8 +10,22 @@
 # Override:  set HEIMDALL_MODEL_<TIER> to a full id to PIN (bench/eval repro).
 #            e.g. HEIMDALL_MODEL_OPUS=claude-opus-5  → prints that exact id.
 #
-# Usage:  heimdall-model-resolve <opus|sonnet|haiku>
-# Exit:   0 + model string on stdout; nonzero + message on stderr for bad tier.
+# NON-ZDR GATE: the fable tier is not available under zero data retention (it
+# requires 30-day retention, and a ZDR org gets 400 invalid_request_error on
+# every request). Selecting it is therefore DENY-BY-DEFAULT and only a repo that
+# has explicitly opted in — "allow_non_zdr_models": true in its repo policy —
+# may resolve it. The refusal is loud: nonzero exit, a diagnostic on stderr, and
+# NOTHING on stdout. A silent downgrade to a cheaper tier is forbidden, because
+# it would hide the fact that the repo cannot run that tier at all.
+#
+# Policy file, first hit wins:
+#   $HEIMDALL_REPO_POLICY | $HEIMDALL_REPO/.planning/repo-policy.json
+#   | <git toplevel>/.planning/repo-policy.json | <this repo>/.planning/repo-policy.json
+#
+# Usage:  heimdall-model-resolve <opus|sonnet|haiku|fable>
+# Exit:   0 + model string on stdout
+#         2 + message on stderr for an unknown tier
+#         3 + message on stderr when repo policy forbids a non-ZDR tier
 set -euo pipefail
 
 tier="${1:-}"
@@ -20,11 +34,53 @@ case "$tier" in
   opus)   override="${HEIMDALL_MODEL_OPUS:-}" ;;
   sonnet) override="${HEIMDALL_MODEL_SONNET:-}" ;;
   haiku)  override="${HEIMDALL_MODEL_HAIKU:-}" ;;
+  fable)  override="${HEIMDALL_MODEL_FABLE:-}" ;;
   *)
-    echo "heimdall-model-resolve: unknown tier '${tier}' (want: opus|sonnet|haiku)" >&2
+    printf 'heimdall-model-resolve: unknown tier %s (want: opus|sonnet|haiku|fable)\n' \
+      "'${tier}'" >&2
     exit 2
     ;;
 esac
+
+# ── non-ZDR policy gate ──────────────────────────────────────────────────────
+# Only the fable tier is non-ZDR, so ZDR-eligible tiers never pay for this.
+if [ "$tier" = "fable" ]; then
+  policy=""
+  if [ -n "${HEIMDALL_REPO_POLICY:-}" ]; then
+    policy="$HEIMDALL_REPO_POLICY"
+  elif [ -n "${HEIMDALL_REPO:-}" ]; then
+    policy="$HEIMDALL_REPO/.planning/repo-policy.json"
+  else
+    toplevel="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+    if [ -n "$toplevel" ]; then
+      policy="$toplevel/.planning/repo-policy.json"
+    else
+      self_dir="$(cd "$(dirname "$0")" && pwd)"
+      policy="$(cd "$self_dir/.." && pwd)/.planning/repo-policy.json"
+    fi
+  fi
+
+  # Deny unless the key is present with a literal JSON boolean true. The leading
+  # quote in the pattern anchors the key name, so x_allow_non_zdr_models does not
+  # match; requiring a bare `true` means the string "true" is denied. Everything
+  # ambiguous denies — that is the point of a fail-closed gate.
+  allowed=no
+  if [ -f "$policy" ] && LC_ALL=C grep -Eq \
+      '"allow_non_zdr_models"[[:space:]]*:[[:space:]]*true[[:space:]]*([,}]|$)' "$policy"; then
+    allowed=yes
+  fi
+
+  if [ "$allowed" != yes ]; then
+    printf 'heimdall-model-resolve: REFUSED tier %s — not ZDR (Claude Fable 5 requires\n' \
+      "'${tier}'" >&2
+    printf '  30-day data retention; a zero-data-retention org gets 400 invalid_request_error).\n' >&2
+    printf '  This repo has not opted in. To permit it, set "allow_non_zdr_models": true in\n' >&2
+    printf '  %s\n' "$policy" >&2
+    printf '  Refusing rather than downgrading: a silent fallback would hide that this repo\n' >&2
+    printf '  cannot run this tier at all.\n' >&2
+    exit 3
+  fi
+fi
 
 # Pin-override wins (reproducibility); otherwise float to latest via the alias.
 if [ -n "$override" ]; then

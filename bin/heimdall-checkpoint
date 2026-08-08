@@ -17,8 +17,30 @@
 #   A subsequent /hmd:save enriches the same file; this guarantees SOMETHING is
 #   always there.
 #
+# THE COMPLETENESS GATE — why this script can now FAIL
+#   `printf '- **Branch:** %s\n' "$b"` parses the leading `-` as a FLAG under bash
+#   3.2. printf swallowed it, printed nothing, and returned 0 — so every checkpoint
+#   written on this machine silently lost Branch, HEAD, Phase, goal and the dirty
+#   count, for as long as the file existed, while still announcing "auto-saved".
+#   The knowledge was gone and the save reported success.
+#
+#   That was fixed. This gate makes the CLASS impossible to repeat silently: after
+#   writing, the script re-reads the bytes it actually produced and verifies every
+#   field of the resume contract survived, by digest. A save that dropped one FAILS
+#   ITSELF, LOUDLY — stamps the checkpoint INCOMPLETE, publishes no answer key, and
+#   exits non-zero. A checkpoint that quietly drops fields is worse than no
+#   checkpoint, because it is the thing an operator restarts on the strength of.
+#
+# THE ANSWER KEY (spec 1.1) — written HERE, at save time, on purpose
+#   The resume probe grades a fresh session's recovery of this state. It can only do
+#   that against answers recorded WHILE THE KNOWLEDGE WAS STILL PRESENT. A probe
+#   that derived both the question and the answer at resume would grade itself. So
+#   the key is written here, as DIGESTS of the live values (never the values), to
+#   .planning/RESUME-KEY.json — it can grade an answer, and it can never supply one.
+#
 # CONTRACT
-#   - Best-effort / non-fatal: every step tolerates missing git/jq/state. Exit 0.
+#   - Best-effort / non-fatal for every OPTIONAL step: missing git/jq/state degrade
+#     gracefully. The completeness gate is the one exception, by design — see above.
 #   - Idempotent: the auto block is delimited by markers and REPLACED in place, so
 #     re-runs update (mtime advances) rather than appending forever.
 #   - Non-destructive: a manual (marker-less) CHECKPOINT.md is preserved; the auto
@@ -27,7 +49,22 @@
 #
 # USAGE
 #   heimdall-checkpoint write [project_dir]   # write/update .planning/CHECKPOINT.md
+#   heimdall-checkpoint note <kind> <text>    # record session-only knowledge:
+#                                             #   in-progress | gated | refuted | warn
 #   heimdall-checkpoint help
+#
+# EXIT STATUS
+#   0  saved, complete, answer key published
+#   3  saved but INCOMPLETE — a contract field did not survive the write (loud)
+#   1  usage error
+#
+# ENV SEAMS (tests only; neither carries data)
+#   HMD_CKPT_FAULT=<contract-id>  suppress one contract field at write time. This is
+#       the POSITIVE CONTROL for the completeness gate: a gate that cannot be shown
+#       to fire makes every green result meaningless (the repo proved five gates
+#       vacuously green on 2026-08-03). test/checkpoint-completeness.test.sh drives
+#       every id through it.
+#   HEIMDALL_HOME                 relocates the observation store + probe log.
 #
 # DEV-CHECKOUT COVERAGE
 #   This is invoked from the EXISTING SessionEnd command in hooks/hooks.json (it is
@@ -45,6 +82,22 @@ set -uo pipefail
 
 BEGIN_MARK="<!-- heimdall-auto-checkpoint:begin -->"
 END_MARK="<!-- heimdall-auto-checkpoint:end -->"
+
+# The resume contract — the six never-lose categories, their labels, their layers,
+# and the digest. Shared VERBATIM with bin/heimdall-resume-probe so the writer and
+# the grader cannot drift apart. Its absence is fatal: without the contract this
+# script cannot know what completeness means, and a save it cannot verify must not
+# masquerade as one it did.
+_CKPT_SELF="$0"
+command -v readlink >/dev/null 2>&1 && \
+  _CKPT_SELF="$(readlink -f "$0" 2>/dev/null || readlink "$0" 2>/dev/null || echo "$0")"
+_CKPT_BIN="$(cd "$(dirname "$_CKPT_SELF")" 2>/dev/null && pwd)"
+if [ -r "$_CKPT_BIN/lib/resume-contract.sh" ]; then
+  . "$_CKPT_BIN/lib/resume-contract.sh"
+else
+  echo "[heimdall-checkpoint] FATAL: bin/lib/resume-contract.sh is missing — cannot verify a save is complete, so this one is refused." >&2
+  exit 3
+fi
 
 _timestamp() { date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "unknown"; }
 
@@ -81,7 +134,10 @@ _sibling_tool() {
 # context-reset has to overcome is "did I just lose another agent's work", and this
 # is the only mechanical way to check every worktree at once. Bounded to wt_max
 # entries so a runaway worktree count can never blow the SessionEnd time budget.
-_worktree_ledger() {
+WT_SCANNED=0; WT_TOTAL=0; WT_BASE="main"; WT_CLEAN=0
+WT_FLAGGED_COUNT=0; WT_FLAGGED_LINES=""; WT_HELD=""; WT_AVAILABLE=no
+
+_scan_worktrees() {
   local project_dir="$1"
   local wt_max=25
   git -C "$project_dir" rev-parse --git-dir >/dev/null 2>&1 || return 0
@@ -89,18 +145,21 @@ _worktree_ledger() {
   local raw
   raw=$(git -C "$project_dir" worktree list --porcelain 2>/dev/null)
   [ -n "$raw" ] || return 0
+  WT_AVAILABLE=yes
 
   local base
   base=$(printf '%s\n' "$raw" | awk '/^$/{exit} /^branch /{print $2}')
   base=${base#refs/heads/}
   [ -n "$base" ] || base="main"
+  WT_BASE="$base"
 
   local wt_paths total_count
   wt_paths=$(printf '%s\n' "$raw" | awk '/^worktree /{print $2}')
   total_count=$(printf '%s\n' "$wt_paths" | grep -c .)
   [ -n "$total_count" ] || total_count=0
+  WT_TOTAL="$total_count"
 
-  local scanned=0 clean=0 flagged_count=0 flagged_lines="" wt n merged ok
+  local scanned=0 clean=0 flagged_count=0 flagged_lines="" held="" wt n merged ok wtbranch ahead
   while IFS= read -r wt; do
     [ -n "$wt" ] || continue
     scanned=$((scanned + 1))
@@ -112,6 +171,7 @@ _worktree_ledger() {
     if [ ! -d "$wt" ]; then
       flagged_count=$((flagged_count + 1))
       flagged_lines="${flagged_lines}- MISSING \`${wt}\` — worktree directory no longer exists"$'\n'
+      held="${held}${wt} MISSING — the directory is gone; its commits are only in the object store"$'\n'
       continue
     fi
 
@@ -129,6 +189,9 @@ _worktree_ledger() {
     if [ "$merged" = "no" ]; then
       ok=no
       flagged_lines="${flagged_lines}- UNMERGED \`${wt}\` — HEAD has commits not on \`${base}\`"$'\n'
+      wtbranch=$(git -C "$wt" rev-parse --abbrev-ref HEAD 2>/dev/null || echo detached)
+      ahead=$(git -C "$wt" rev-list --count "$base..HEAD" 2>/dev/null || echo "?")
+      held="${held}${wtbranch} (${ahead} commit(s) not on ${base}, at ${wt})"$'\n'
     fi
     if [ "$ok" = "yes" ]; then
       clean=$((clean + 1))
@@ -139,18 +202,24 @@ _worktree_ledger() {
 $wt_paths
 WTPATHS
 
-  local more=""
-  if [ "$total_count" -gt "$wt_max" ] 2>/dev/null; then
-    more=" (+$((total_count - wt_max)) more not scanned)"
+  WT_SCANNED="$scanned"; WT_CLEAN="$clean"
+  WT_FLAGGED_COUNT="$flagged_count"; WT_FLAGGED_LINES="$flagged_lines"; WT_HELD="$held"
+}
+
+_worktree_ledger() {
+  [ "$WT_AVAILABLE" = "yes" ] || return 0
+  local wt_max=25 more=""
+  if [ "$WT_TOTAL" -gt "$wt_max" ] 2>/dev/null; then
+    more=" (+$((WT_TOTAL - wt_max)) more not scanned)"
   fi
 
-  printf '### Worktree ledger — nothing-lost proof (%s of %s worktree(s) scanned%s)\n' "$scanned" "$total_count" "$more"
-  printf -- '> Base ref: `%s`. Clean = zero uncommitted files AND HEAD merged into base.\n\n' "$base"
-  if [ "$flagged_count" -eq 0 ]; then
-    printf -- '- All %s scanned worktree(s) are clean. Nothing to rescue before a restart.\n\n' "$scanned"
+  printf '### Worktree ledger — nothing-lost proof (%s of %s worktree(s) scanned%s)\n' "$WT_SCANNED" "$WT_TOTAL" "$more"
+  printf -- '> Base ref: `%s`. Clean = zero uncommitted files AND HEAD merged into base.\n\n' "$WT_BASE"
+  if [ "$WT_FLAGGED_COUNT" -eq 0 ]; then
+    printf -- '- All %s scanned worktree(s) are clean. Nothing to rescue before a restart.\n\n' "$WT_SCANNED"
   else
-    printf -- '- %s/%s clean, %s flagged — rescue these before restarting:\n' "$clean" "$scanned" "$flagged_count"
-    printf '%s\n' "$flagged_lines"
+    printf -- '- %s/%s clean, %s flagged — rescue these before restarting:\n' "$WT_CLEAN" "$WT_SCANNED" "$WT_FLAGGED_COUNT"
+    printf '%s\n' "$WT_FLAGGED_LINES"
   fi
 }
 
@@ -179,85 +248,246 @@ _session_edits() {
 # ONLY authoritative signal: 0=clean, 2=failing, anything else (missing
 # heimdall-state.json, missing binary, timeout, ...) is NOT-EVALUATED and must
 # never be read as a pass.
-_gate_state() {
+GS_VERDICT="NOT-EVALUATED"; GS_DETAIL=""; GS_FAILCOUNT=0; GS_FAILLINES=""; GS_FAILIDS=""
+
+_scan_gate() {
   local project_dir="$1"
-  local hstate verdict detail rc
+  local hstate rc
   hstate="$(_sibling_tool heimdall-state)"
 
-  verdict="NOT-EVALUATED"; detail=""
+  GS_VERDICT="NOT-EVALUATED"; GS_DETAIL=""
   if [ -n "$hstate" ]; then
-    detail=$(cd "$project_dir" 2>/dev/null && _bounded 3 "$hstate" check-quality-gates 2>&1)
+    GS_DETAIL=$(cd "$project_dir" 2>/dev/null && _bounded 3 "$hstate" check-quality-gates 2>&1)
     rc=$?
     if [ "$rc" -eq 0 ]; then
-      verdict="PASS"
+      GS_VERDICT="PASS"
     elif [ "$rc" -eq 2 ]; then
-      verdict="FAILING"
+      GS_VERDICT="FAILING"
     fi
   fi
 
-  printf '### Gate state (push-gate verdict — %s)\n' "$verdict"
-  if [ "$verdict" = "FAILING" ]; then
-    printf '> RED — do not push until this clears. Detail:\n```\n%s\n```\n\n' "$detail"
-  elif [ "$verdict" = "PASS" ]; then
-    printf '> Clean — `heimdall-state check-quality-gates` exited 0.\n\n'
-  else
-    printf '> Never evaluated this run (no heimdall-state.json, no heimdall-state binary, or it timed out). Not a pass — run `heimdall-state check-quality-gates` before pushing.\n\n'
-  fi
-
-  local reports f st gid hint failcount=0 faillines=""
+  local reports f st gid hint
+  GS_FAILCOUNT=0; GS_FAILLINES=""; GS_FAILIDS=""
   if command -v jq >/dev/null 2>&1 && [ -d "$project_dir/evals/oracles" ]; then
     reports=$(find "$project_dir/evals/oracles" -maxdepth 2 -name report.json 2>/dev/null | head -50)
     while IFS= read -r f; do
       [ -n "$f" ] || continue
       st=$(jq -r '.status // empty' "$f" 2>/dev/null)
       if [ "$st" = "fail" ]; then
-        failcount=$((failcount + 1))
+        GS_FAILCOUNT=$((GS_FAILCOUNT + 1))
         gid=$(jq -r '.gate_id // "unknown"' "$f" 2>/dev/null)
         hint=$(jq -r '.fix_hint // ""' "$f" 2>/dev/null)
-        faillines="${faillines}- FAIL \`${gid}\` (\`${f#"$project_dir"/}\`)${hint:+ — $hint}"$'\n'
+        GS_FAILLINES="${GS_FAILLINES}- FAIL \`${gid}\` (\`${f#"$project_dir"/}\`)${hint:+ — $hint}"$'\n'
+        GS_FAILIDS="${GS_FAILIDS}eval gate ${gid} FAILING${hint:+ (${hint})}"$'\n'
       fi
     done <<REPORTS
 $reports
 REPORTS
   fi
-  if [ "$failcount" -gt 0 ]; then
-    printf '### Failing eval oracle gates (%s)\n' "$failcount"
-    printf '%s\n' "$faillines"
+}
+
+_gate_state() {
+  printf '### Gate state (push-gate verdict — %s)\n' "$GS_VERDICT"
+  if [ "$GS_VERDICT" = "FAILING" ]; then
+    printf '> RED — do not push until this clears. Detail:\n```\n%s\n```\n\n' "$GS_DETAIL"
+  elif [ "$GS_VERDICT" = "PASS" ]; then
+    printf '> Clean — `heimdall-state check-quality-gates` exited 0.\n\n'
+  else
+    printf '> Never evaluated this run (no heimdall-state.json, no heimdall-state binary, or it timed out). Not a pass — run `heimdall-state check-quality-gates` before pushing.\n\n'
   fi
+
+  if [ "$GS_FAILCOUNT" -gt 0 ]; then
+    printf '### Failing eval oracle gates (%s)\n' "$GS_FAILCOUNT"
+    printf '%s\n' "$GS_FAILLINES"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# THE FACTS — git/goal/phase, measured ONCE per run into globals.
+#
+# These used to be derived inside _build_block, which runs in a subshell
+# (block=$(_build_block ...)). The resume contract needs the same values in the
+# PARENT shell — a digest of a value that died with a subshell can grade nothing.
+# So the derivation moved out here and _build_block became a pure printer.
+# ---------------------------------------------------------------------------
+_scan_facts() {
+  local project_dir="$1"
+
+  if git -C "$project_dir" rev-parse --git-dir >/dev/null 2>&1; then
+    FT_BRANCH=$(git -C "$project_dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
+    FT_HEAD=$(git -C "$project_dir" rev-parse --short HEAD 2>/dev/null || echo "none")
+    FT_COMMITS=$(git -C "$project_dir" log --oneline -10 2>/dev/null || true)
+    FT_CHANGED=$(git -C "$project_dir" status --porcelain 2>/dev/null | head -40 || true)
+  else
+    FT_BRANCH="n/a"; FT_HEAD="n/a"; FT_COMMITS=""; FT_CHANGED=""
+  fi
+
+  # Active goal (best-effort; heimdall-state may be absent or uninitialised).
+  FT_GOAL="none"
+  if command -v heimdall-state >/dev/null 2>&1; then
+    FT_GOAL=$( (cd "$project_dir" && heimdall-state goal-get 2>/dev/null) || echo "none" )
+  fi
+  [ -z "$FT_GOAL" ] && FT_GOAL="none"
+
+  # Phase from STATE.md frontmatter if present.
+  FT_PHASE="unknown"
+  if [ -f "$project_dir/.planning/STATE.md" ]; then
+    FT_PHASE=$(awk '/^---$/{c++; next} c==1 && /^phase:/{gsub(/^phase:[[:space:]]*"?/,""); gsub(/"$/,""); print; exit}' \
+      "$project_dir/.planning/STATE.md" 2>/dev/null || echo "unknown")
+    [ -z "$FT_PHASE" ] && FT_PHASE="unknown"
+  fi
+
+  FT_DIRTY=$(printf '%s\n' "$FT_CHANGED" | grep -c .)
+  [ -n "$FT_DIRTY" ] || FT_DIRTY=0
+}
+
+# ---------------------------------------------------------------------------
+# THE SIX DERIVATIONS (spec 1.4) — each produces the ONE line a contract field
+# carries, stored in RC_VAL_<id>. bash 3.2 has no associative arrays, hence eval.
+#
+# Every one of them is TOTAL: it always yields a non-empty answer. A category with
+# nothing in it says so, WITH the evidence that made "nothing" the right answer
+# ("push gate PASS, no open cases") — never an empty string. That is deliberate:
+# an empty field is indistinguishable from a field that got dropped on the way to
+# disk, and telling those two apart is this entire feature.
+# ---------------------------------------------------------------------------
+
+# Read the recorded notes of one category, oldest-last, unescaped.
+_notes_text() { # <project_dir> <contract-id> [max]
+  local store
+  store="$(rc_notes_path "$1")"
+  [ -f "$store" ] || return 0
+  grep -F "\"category\": \"$2\"" "$store" 2>/dev/null \
+    | tail -"${3:-6}" \
+    | sed -n 's/.*"text": "\(.*\)"}$/\1/p' \
+    | sed -e 's/\\"/"/g' -e 's/\\\\/\\/g'
+}
+
+_derive_in_progress() {
+  local project_dir="$1" out notes top
+  out="phase=${FT_PHASE} · goal=${FT_GOAL}"
+  notes="$(_notes_text "$project_dir" in_progress | rc_flatten)"
+  [ -n "$notes" ] && out="${out} · ${notes}"
+  if [ "${FT_DIRTY:-0}" != "0" ]; then
+    top="$(printf '%s\n' "$FT_CHANGED" | head -5 | awk '{ $1=""; sub(/^ /,""); print }' | rc_flatten)"
+    out="${out} · in flight: ${FT_DIRTY} uncommitted file(s) — ${top}"
+  else
+    out="${out} · in flight: 0 uncommitted files"
+  fi
+  printf '%s' "$out"
+}
+
+_derive_gated() {
+  local project_dir="$1" out="" casedir c notes
+  [ "$GS_VERDICT" = "FAILING" ] && out="${out}push gate FAILING — nothing may be pushed until it clears"$'\n'
+  [ "$GS_VERDICT" = "NOT-EVALUATED" ] && out="${out}push gate NOT-EVALUATED — must be run before any push"$'\n'
+  [ -n "$GS_FAILIDS" ] && out="${out}${GS_FAILIDS}"
+  casedir="$(rc_home "$project_dir")/cases"
+  if [ -d "$casedir" ]; then
+    for c in "$casedir"/*; do
+      [ -f "$c" ] || continue
+      out="${out}open case $(basename "$c" | sed 's/\.[^.]*$//')"$'\n'
+    done
+  fi
+  notes="$(_notes_text "$project_dir" gated_decisions)"
+  [ -n "$notes" ] && out="${out}${notes}"$'\n'
+  out="$(printf '%s' "$out" | rc_flatten)"
+  [ -n "$out" ] || out="none — push gate ${GS_VERDICT}, 0 open cases, 0 decisions recorded as gated"
+  printf '%s' "$out"
+}
+
+_derive_held() {
+  local project_dir="$1" out="$WT_HELD" b ahead
+  # Unmerged LOCAL branches too: work can be held on a branch with no worktree.
+  # hmd/context is excluded by construction — it is an orphan ref that is never
+  # merged by design, so listing it every run would make this field pure noise.
+  if git -C "$project_dir" rev-parse --verify --quiet "refs/heads/$WT_BASE" >/dev/null 2>&1; then
+    while IFS= read -r b; do
+      [ -n "$b" ] || continue
+      case "$b" in hmd/context) continue ;; esac
+      printf '%s' "$out" | grep -qF "$b " && continue
+      ahead=$(git -C "$project_dir" rev-list --count "$WT_BASE..$b" 2>/dev/null || echo "?")
+      out="${out}${b} (${ahead} commit(s) not on ${WT_BASE})"$'\n'
+    done <<BRANCHES
+$(git -C "$project_dir" branch --no-merged "$WT_BASE" --format='%(refname:short)' 2>/dev/null)
+BRANCHES
+  fi
+  out="$(printf '%s' "$out" | rc_flatten)"
+  [ -n "$out" ] || out="none — every worktree and local branch is merged into ${WT_BASE}"
+  printf '%s' "$out"
+}
+
+_derive_unpushed() {
+  local project_dir="$1" up ahead notonbase
+  up="$(git -C "$project_dir" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null)"
+  if [ -n "$up" ]; then
+    ahead="$(git -C "$project_dir" rev-list --count "$up..HEAD" 2>/dev/null || echo '?')"
+    printf '%s commit(s) unpushed on %s (HEAD %s, upstream %s)' "$ahead" "$FT_BRANCH" "$FT_HEAD" "$up"
+  else
+    notonbase="$(git -C "$project_dir" rev-list --count "$WT_BASE..HEAD" 2>/dev/null || echo 0)"
+    printf 'no upstream for %s — %s commit(s) not on %s (HEAD %s); nothing has left this machine' \
+      "$FT_BRANCH" "${notonbase:-0}" "$WT_BASE" "$FT_HEAD"
+  fi
+}
+
+_derive_warnings() {
+  local project_dir="$1" out="" notes
+  notes="$(_notes_text "$project_dir" open_warnings)"
+  [ -n "$notes" ] && out="${notes}"$'\n'
+  [ "$GS_VERDICT" = "FAILING" ] && out="${out}⚠ push gate is RED"$'\n'
+  [ -n "$GS_FAILIDS" ] && out="${out}${GS_FAILIDS}"
+  if [ "${WT_FLAGGED_COUNT:-0}" -gt 0 ] 2>/dev/null; then
+    out="${out}⚠ ${WT_FLAGGED_COUNT} worktree(s) flagged dirty or unmerged"$'\n'
+  fi
+  out="$(printf '%s' "$out" | rc_flatten)"
+  [ -n "$out" ] || out="none open — no ⚠ recorded, push gate ${GS_VERDICT}, ${WT_FLAGGED_COUNT:-0} worktree(s) flagged"
+  printf '%s' "$out"
+}
+
+_derive_refuted() {
+  local notes
+  notes="$(_notes_text "$1" refuted_claims 12 | rc_flatten)"
+  [ -n "$notes" ] || notes='none recorded this session — record one with: heimdall-checkpoint note refuted "<claim> → what was actually true"'
+  printf '%s' "$notes"
+}
+
+# Run all six into RC_VAL_<id>. Must run in the PARENT shell.
+_derive_contract() {
+  local project_dir="$1"
+  RC_VAL_in_progress="$(_derive_in_progress "$project_dir")"
+  RC_VAL_gated_decisions="$(_derive_gated "$project_dir")"
+  RC_VAL_held_branches="$(_derive_held "$project_dir")"
+  RC_VAL_unpushed="$(_derive_unpushed "$project_dir")"
+  RC_VAL_open_warnings="$(_derive_warnings "$project_dir")"
+  RC_VAL_refuted_claims="$(_derive_refuted "$project_dir")"
+}
+
+# The contract section — six single-line fields, the exact shape rc_field reads.
+#
+# HMD_CKPT_FAULT is the POSITIVE CONTROL, and it is faithful to the real bug: the
+# leading-dash printf defect dropped a field HERE, at the print, while the value
+# was alive in memory the whole time. Skipping one id reproduces that precisely,
+# which is the only way to know the completeness gate would have caught it.
+_contract_block() {
+  local id label val
+  printf '### What must never be lost (the resume contract)\n'
+  printf '> Graded on the next restart by `heimdall-resume-probe` against the digests in\n'
+  printf '> `.planning/RESUME-KEY.json`, written at save time — while the knowledge is\n'
+  printf '> still present. A field that does not survive this write FAILS the save.\n\n'
+  for id in $RC_IDS; do
+    [ "$id" = "${HMD_CKPT_FAULT:-}" ] && continue
+    label="$(rc_label "$id")"
+    eval "val=\${RC_VAL_$id:-}"
+    printf -- '- **%s:** %s\n' "$label" "$val"
+  done
+  printf '\n'
 }
 
 # Build the machine-readable auto-checkpoint block (stdout). Pure, no side effects.
 _build_block() {
   local project_dir="$1" ts="$2"
-  local branch head_sha commits changed goal phase
-
-  if git -C "$project_dir" rev-parse --git-dir >/dev/null 2>&1; then
-    branch=$(git -C "$project_dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
-    head_sha=$(git -C "$project_dir" rev-parse --short HEAD 2>/dev/null || echo "none")
-    commits=$(git -C "$project_dir" log --oneline -10 2>/dev/null || true)
-    changed=$(git -C "$project_dir" status --porcelain 2>/dev/null | head -40 || true)
-  else
-    branch="n/a"; head_sha="n/a"; commits=""; changed=""
-  fi
-
-  # Active goal (best-effort; heimdall-state may be absent or uninitialised).
-  goal="none"
-  if command -v heimdall-state >/dev/null 2>&1; then
-    goal=$( (cd "$project_dir" && heimdall-state goal-get 2>/dev/null) || echo "none" )
-  fi
-  [ -z "$goal" ] && goal="none"
-
-  # Phase from STATE.md frontmatter if present.
-  phase="unknown"
-  if [ -f "$project_dir/.planning/STATE.md" ]; then
-    phase=$(awk '/^---$/{c++; next} c==1 && /^phase:/{gsub(/^phase:[[:space:]]*"?/,""); gsub(/"$/,""); print; exit}' \
-      "$project_dir/.planning/STATE.md" 2>/dev/null || echo "unknown")
-    [ -z "$phase" ] && phase="unknown"
-  fi
-
-  local dirty_count
-  dirty_count=$(printf '%s\n' "$changed" | grep -c .)
-  [ -n "$dirty_count" ] || dirty_count=0
+  local branch="$FT_BRANCH" head_sha="$FT_HEAD" commits="$FT_COMMITS"
+  local changed="$FT_CHANGED" goal="$FT_GOAL" phase="$FT_PHASE" dirty_count="$FT_DIRTY"
 
   printf '%s\n' "$BEGIN_MARK"
   printf '## Auto-checkpoint — %s\n\n' "$ts"
@@ -268,6 +498,9 @@ _build_block() {
   printf -- '- **Phase:** %s\n' "$phase"
   printf -- '- **Active goal:** %s\n' "$goal"
   printf -- '- **Uncommitted files:** %s\n\n' "$dirty_count"
+
+  # First, because it is the part a restart cannot re-derive from the repo.
+  _contract_block
 
   _worktree_ledger "$project_dir"
   _session_edits
@@ -444,6 +677,153 @@ PYEOF
   return 0
 }
 
+# ---------------------------------------------------------------------------
+# THE COMPLETENESS GATE (spec 1.3)
+#
+# Compares what was DERIVED (live, in memory) against what actually LANDED (read
+# back off the bytes about to be written). Not "did I intend to print it" — the
+# printf leading-dash bug proved intent is worthless here: the value was correct,
+# the print was correct-looking, and the field simply never arrived. Only the
+# read-back can tell you that.
+#
+# Sets CKPT_MISSES (one line per lost field). Returns non-zero if any field is
+# missing, empty, altered, or UNVERIFIABLE. Unverifiable is a failure on purpose:
+# no sha256 on the box means this save cannot be proven complete, and a gate that
+# passes when it cannot check is the tautological gate this repo exists to kill.
+# ---------------------------------------------------------------------------
+CKPT_MISSES=""
+_completeness_gate() { # <written-block-file>
+  local file="$1" id label live back dl db
+  CKPT_MISSES=""
+  for id in $RC_IDS; do
+    label="$(rc_label "$id")"
+    eval "live=\${RC_VAL_$id:-}"
+    if [ -z "$live" ]; then
+      CKPT_MISSES="${CKPT_MISSES}${label} (${id}) — the derivation produced nothing to save"$'\n'
+      continue
+    fi
+    back="$(rc_field "$file" "$label")"
+    if [ -z "$back" ]; then
+      CKPT_MISSES="${CKPT_MISSES}${label} (${id}) — absent from the written checkpoint (it was in memory; it did not reach disk)"$'\n'
+      continue
+    fi
+    dl="$(printf '%s' "$live" | rc_digest)" || dl=""
+    db="$(printf '%s' "$back" | rc_digest)" || db=""
+    if [ -z "$dl" ] || [ -z "$db" ]; then
+      CKPT_MISSES="${CKPT_MISSES}${label} (${id}) — no sha256 on this machine, so completeness cannot be verified"$'\n'
+      continue
+    fi
+    [ "$dl" = "$db" ] || CKPT_MISSES="${CKPT_MISSES}${label} (${id}) — what was written differs from what was derived"$'\n'
+  done
+  [ -z "$CKPT_MISSES" ]
+}
+
+# Stamp an INCOMPLETE banner into the block, right after the heading. Single-line
+# awk -v only: multi-line -v assignments break on BSD awk (macOS default).
+_stamp_incomplete() { # <block> -> stamped block on stdout
+  local stamp
+  stamp="> ⚠ **INCOMPLETE — DO NOT TRUST THIS CHECKPOINT TO RESUME.** Required field(s) did not survive the write: $(printf '%s' "$CKPT_MISSES" | rc_flatten). The resume key was revoked; \`heimdall-resume-probe\` will read RED."
+  printf '%s\n' "$1" | awk -v s="$stamp" '
+    { print }
+    !done && /^## Auto-checkpoint/ { print ""; print s; done = 1 }
+  '
+}
+
+# ---------------------------------------------------------------------------
+# THE ANSWER KEY (spec 1.1)
+#
+# Written HERE, at save time, from the LIVE values — never re-derived at resume.
+# It holds sha256 digests and lengths only: enough to GRADE an answer, never
+# enough to SUPPLY one. That asymmetry is the whole design. A key that carried
+# the answers would let a resume read them straight out and score itself green
+# without the memory stack working at all — a gate that grades its own homework.
+#
+# It also records the state of each LAYER at save time (checkpoint / index /
+# context-branch), so when the probe finds a miss it can name the layer that
+# dropped it instead of reporting an anonymous loss.
+#
+# One answer per line, deliberately: the probe reads it with sed and needs no jq.
+# ---------------------------------------------------------------------------
+_write_key() { # <project_dir> <ts>
+  local project_dir="$1" ts="$2"
+  local key tmp id label layer live dig len notes ncount first now
+  key="$(rc_key_path "$project_dir")"
+  tmp="$key.$$.tmp"
+  notes="$(rc_notes_path "$project_dir")"
+  ncount="$(rc_notes_count "$project_dir")"
+  now="$(date +%s 2>/dev/null || echo 0)"
+  rc_ctx_branch "$project_dir"
+
+  {
+    printf '{\n'
+    printf '  "schema": "hmd-resume-key@1",\n'
+    printf '  "algo": "sha256",\n'
+    printf '  "written_ts": %s,\n' "$now"
+    printf '  "checkpoint_ts": "%s",\n' "$(rc_json_esc "$ts")"
+    printf '  "branch": "%s",\n' "$(rc_json_esc "$FT_BRANCH")"
+    printf '  "head": "%s",\n' "$(rc_json_esc "$FT_HEAD")"
+    printf '  "answers": [\n'
+    first=1
+    for id in $RC_IDS; do
+      label="$(rc_label "$id")"
+      layer="$(rc_layer "$id")"
+      eval "live=\${RC_VAL_$id:-}"
+      dig="$(printf '%s' "$live" | rc_digest)" || dig=""
+      len="$(printf '%s' "$live" | rc_normalize | wc -c | tr -d ' ')"
+      [ "$first" = 1 ] || printf ',\n'
+      first=0
+      printf '    {"id": "%s", "label": "%s", "layer": "%s", "digest": "%s", "answer_len": %s}' \
+        "$id" "$(rc_json_esc "$label")" "$layer" "$dig" "${len:-0}"
+    done
+    printf '\n  ],\n'
+    printf '  "layers": {\n'
+    printf '    "checkpoint": {"path": "%s", "present": true},\n' "$(rc_json_esc "$(rc_ckpt_path "$project_dir")")"
+    printf '    "index": {"path": "%s", "present": %s, "entries": %s},\n' \
+      "$(rc_json_esc "$notes")" "$([ -f "$notes" ] && printf true || printf false)" "$ncount"
+    printf '    "context-branch": {"ref": "refs/heads/hmd/context", "present": %s, "head": "%s", "worklog_ts": %s}\n' \
+      "$([ "$RC_CB_PRESENT" = yes ] && printf true || printf false)" "$RC_CB_HEAD" "$RC_CB_TS"
+    printf '  }\n'
+    printf '}\n'
+  } > "$tmp" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+  mv "$tmp" "$key" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+}
+
+# ---------------------------------------------------------------------------
+# THE RECORDING SEAM (spec 1.4)
+#
+# Three of the six categories are invisible to every tool on this machine: no git
+# command knows the next step, that a decision is parked on a human, or that a
+# claim was disproved. They exist only in the session's head until something
+# writes them down. Without this verb those fields could only ever say "none",
+# and a probe that grades three permanent blanks proves nothing at all.
+# ---------------------------------------------------------------------------
+cmd_note() { # <kind> <text...>
+  local kind="${1:-}" catid text store home
+  shift 2>/dev/null || true
+  text="$*"
+  if [ -z "$kind" ] || [ -z "$text" ]; then
+    echo "[heimdall-checkpoint] usage: heimdall-checkpoint note <in-progress|gated|refuted|warn> <text>" >&2
+    return 1
+  fi
+  catid="$(rc_note_category "$kind")" || {
+    echo "[heimdall-checkpoint] unknown note kind '$kind' — expected one of: in-progress, gated, refuted, warn" >&2
+    return 1
+  }
+  home="$(rc_home "$PWD")"
+  mkdir -p "$home" 2>/dev/null || {
+    echo "[heimdall-checkpoint] cannot create $home — note not recorded" >&2
+    return 1
+  }
+  store="$(rc_notes_path "$PWD")"
+  printf '{"ts": %s, "utc": "%s", "category": "%s", "text": "%s"}\n' \
+    "$(date +%s 2>/dev/null || echo 0)" "$(_timestamp)" "$catid" "$(rc_json_esc "$text")" \
+    >> "$store" || {
+    echo "[heimdall-checkpoint] cannot append to $store — note not recorded" >&2
+    return 1
+  }
+  echo "[heimdall-checkpoint] noted ($catid): $text"
+}
+
 cmd_write() {
   local project_dir="${1:-$PWD}"
   # Resolve; a bad path is non-fatal (we simply do nothing).
@@ -452,36 +832,62 @@ cmd_write() {
 
   mkdir -p "$planning" 2>/dev/null || return 0
 
-  local ts block
+  local ts block probe
   ts=$(_timestamp)
+
+  # Measure once, in THIS shell — the printers below run in a subshell and the
+  # completeness gate needs the same values afterwards.
+  _scan_facts "$project_dir"
+  _scan_worktrees "$project_dir"
+  _scan_gate "$project_dir"
+  _derive_contract "$project_dir"
+
   block=$(_build_block "$project_dir" "$ts") || return 0
+
+  # Verify the BYTES, before they are anywhere a resume could read them.
+  probe=$(mktemp) || return 0
+  printf '%s\n' "$block" > "$probe"
+  if _completeness_gate "$probe"; then
+    rm -f "$probe"
+  else
+    rm -f "$probe"
+    block="$(_stamp_incomplete "$block")"
+    _write_checkpoint "$planning/CHECKPOINT.md" "$block" || true
+    # Revoke any earlier key: grading damaged state against a stale key is how a
+    # broken save scores green. No key means the probe reads RED, which is right.
+    rm -f "$(rc_key_path "$project_dir")" 2>/dev/null
+    {
+      echo "[heimdall-checkpoint] CHECKPOINT INCOMPLETE — NOT SAVED AS USABLE."
+      echo "[heimdall-checkpoint] Required field(s) did not survive the write:"
+      printf '%s' "$CKPT_MISSES" | sed 's/^/[heimdall-checkpoint]   - /'
+      echo "[heimdall-checkpoint] The resume key was revoked; a restart from this file would lose the above."
+      echo "[heimdall-checkpoint] Re-run: heimdall-checkpoint write \"$project_dir\""
+    } >&2
+    return 3
+  fi
 
   _write_checkpoint "$planning/CHECKPOINT.md" "$block" || return 0
 
-  # Derive goal/phase once more for settings (cheap; keeps settings authoritative).
-  local goal phase
-  goal="none"
-  if command -v heimdall-state >/dev/null 2>&1; then
-    goal=$( (cd "$project_dir" && heimdall-state goal-get 2>/dev/null) || echo "none" )
+  # The key is published only AFTER the checkpoint is proven whole. Order matters:
+  # a key beside a damaged checkpoint would let a resume grade itself green.
+  if ! _write_key "$project_dir" "$ts"; then
+    rm -f "$(rc_key_path "$project_dir")" 2>/dev/null
+    echo "[heimdall-checkpoint] CHECKPOINT SAVED BUT UNVERIFIABLE — the answer key could not be written to $(rc_key_path "$project_dir"); the next restart cannot be probed." >&2
+    return 3
   fi
-  [ -z "$goal" ] && goal="none"
-  phase="unknown"
-  if [ -f "$planning/STATE.md" ]; then
-    phase=$(awk '/^---$/{c++; next} c==1 && /^phase:/{gsub(/^phase:[[:space:]]*"?/,""); gsub(/"$/,""); print; exit}' \
-      "$planning/STATE.md" 2>/dev/null || echo "unknown")
-    [ -z "$phase" ] && phase="unknown"
-  fi
-  _update_settings "$planning/settings.json" "$goal" "$phase" "$ts"
+
+  _update_settings "$planning/settings.json" "$FT_GOAL" "$FT_PHASE" "$ts"
 
   # Publish the shareable team checkpoint (P4) — consent-gated + non-fatal, inside publish().
-  _publish_shared "$project_dir" "$phase" "$goal"
+  _publish_shared "$project_dir" "$FT_PHASE" "$FT_GOAL"
 
-  echo "[heimdall-checkpoint] auto-saved $planning/CHECKPOINT.md" >&2
+  echo "[heimdall-checkpoint] auto-saved $planning/CHECKPOINT.md (6/6 resume fields verified, key at $(rc_key_path "$project_dir"))"
   return 0
 }
 
 case "${1:-help}" in
   write) cmd_write "${2:-}" ;;
+  note)  shift; cmd_note "$@" ;;
   help|--help|-h)
     cat <<'USAGE'
 heimdall-checkpoint — mechanical auto-save of forward session state to .planning/
@@ -489,11 +895,28 @@ heimdall-checkpoint — mechanical auto-save of forward session state to .planni
 Usage:
   heimdall-checkpoint write [project_dir]   Write/update .planning/CHECKPOINT.md
                                             (+ STATE.md phase & settings.json goal)
-                                            from git + heimdall-state. Non-fatal,
-                                            idempotent, never clobbers a manual save.
+                                            from git + heimdall-state, then VERIFY
+                                            all six resume-contract fields landed
+                                            and publish .planning/RESUME-KEY.json.
+                                            Idempotent, never clobbers a manual save.
 
-Invoked automatically by the SessionEnd hook. The rich, human-authored handoff is
-/hmd:save (commands/save.md); this is the always-on mechanical safety net.
+  heimdall-checkpoint note <kind> <text>    Record session-only knowledge that no
+                                            git command can see. Kinds:
+                                              in-progress  what you are mid-way through
+                                              gated        parked on a human call
+                                              refuted      a claim this session DISPROVED
+                                              warn         an open ⚠ item
+                                            The next `write` folds these into the
+                                            matching contract field.
+
+Exit status of `write`:
+  0  saved, all six resume fields verified present, key published
+  3  INCOMPLETE — a required field did not survive the write. The checkpoint is
+     stamped, the key is revoked, and stderr names the field. Do not resume from it.
+
+Invoked automatically by the SessionEnd hook, and graded on the next restart by
+heimdall-resume-probe. The rich, human-authored handoff is /hmd:save
+(commands/save.md); this is the always-on mechanical safety net.
 USAGE
     ;;
   *)

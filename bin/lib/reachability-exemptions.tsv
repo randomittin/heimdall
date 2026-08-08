@@ -20,7 +20,16 @@
 # THIS FILE IS NOT A REFERENCE SURFACE. It names every exempt executable, so if the
 # scanner read it, writing an exemption would MAKE the binary look reachable and the
 # escape hatch would become the defect. reach_build() excludes it from the node set and
-# the scan set; test/bin-reachability-gate.test.sh §4 proves the exclusion holds.
+# the scan set; test/bin-reachability-gate.test.sh §3c proves the exclusion holds.
+#
+# RE-VERIFIED 2026-08-08. The gate previously carried its own flat "does any file name
+# it?" matcher and reported the nine BY DESIGN / KNOWN GAP names below as "now wired —
+# remove these rows". They are not wired. Every one of them was re-checked against a
+# live entry point and every one is still unreachable; the flat matcher was reading
+# mentions from other dead files as proof of life. The rows stay. If you meet that
+# "stale, remove them" claim again, re-run `heimdall-deadcode --why <name>` before
+# deleting anything — a row removed on a false staleness report silently converts an
+# acknowledged dead tool into an unacknowledged one.
 #
 # THREE HONEST CATEGORIES. Only the first is a compliment.
 #     BY DESIGN   no runtime caller is possible or wanted — a human runs it directly.

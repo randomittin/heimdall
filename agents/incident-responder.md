@@ -3,6 +3,7 @@ name: incident-responder
 description: Production incident response agent. Root cause analysis, observability-driven debugging, rollback strategy, blameless postmortem. Use when production is broken or errors are spiking.
 tools: Read, Bash, Grep, Glob
 model: opus
+tier: opus
 effort: max
 color: red
 ---

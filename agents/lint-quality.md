@@ -3,6 +3,7 @@ name: lint-quality
 description: Lint and static analysis agent. Use for enforcing code style, running linters, and checking for common code quality issues. Fast and mechanical.
 tools: Read, Bash, Grep, Glob
 model: haiku
+tier: haiku
 color: orange
 ---
 

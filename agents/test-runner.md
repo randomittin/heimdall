@@ -3,6 +3,7 @@ name: test-runner
 description: Test writing and execution agent. Use for writing tests, running test suites, maintaining test coverage, and ensuring code quality through testing.
 tools: Read, Write, Edit, Bash, Grep, Glob
 model: sonnet
+tier: sonnet
 isolation: worktree
 color: yellow
 ---
