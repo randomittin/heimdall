@@ -107,6 +107,14 @@
         "hooks": [
           {
             "type": "command",
+            "command": "PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; RPROBE=\"$PLUGIN/bin/heimdall-resume-probe\"; RPDIR=\"${CLAUDE_PROJECT_DIR:-.}\"; if [ -x \"$RPROBE\" ] && [ -f \"$RPDIR/.planning/CHECKPOINT.md\" ]; then RPOUT=\"$(mktemp 2>/dev/null || printf '/tmp/hmd-resume-probe.%s' \"$$\")\"; if command -v perl >/dev/null 2>&1; then perl -e 'alarm 10; exec @ARGV' \"$RPROBE\" run --repo \"$RPDIR\" >\"$RPOUT\" 2>/dev/null; else \"$RPROBE\" run --repo \"$RPDIR\" >\"$RPOUT\" 2>/dev/null; fi; head -8 \"$RPOUT\" 2>/dev/null; rm -f \"$RPOUT\"; fi; exit 0"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}/bin/heimdall-maintain-loop\" resume-hint --repo \"${CLAUDE_PROJECT_DIR:-.}\" 2>/dev/null || true"
           }
         ]

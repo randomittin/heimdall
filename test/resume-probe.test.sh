@@ -330,16 +330,85 @@ rm -rf "$P"
 
 # ── J. wired at session start, before any work ───────────────────────────────────
 sec "J. WIRED @ SessionStart — before any work (a probe wired to nothing is a file):"
-# STRUCTURAL, deliberately: the real SessionStart command also registers the
-# statusline and self-heals the install, so executing it here would write the
-# operator's real ~/.claude. The behaviour is proven above by driving the binary;
-# this proves the binary is actually reached.
+# The probe is armed as its OWN SessionStart entry, which is what makes the rest of
+# this section possible: the giant install command registers the statusline and
+# self-heals ~/.claude, so it could never be executed under test. A dedicated entry
+# can be, so the wiring here is EXECUTED verbatim out of hooks.json rather than
+# merely grepped. A hook asserted only structurally is a hook nobody has ever run.
 SS_CMD="$(jq -r '.hooks.SessionStart[]?.hooks[]?.command // empty' "$HOOKS" 2>/dev/null \
          | grep -F 'heimdall-resume-probe' | head -1)"
+
+# Execute the real command string against a throwaway repo. Sets SS_OUT/SS_RC/SS_SECS.
+SS_OUT=""; SS_RC=0; SS_SECS=0
+run_ss() { # <project-dir> [plugin-root]
+  local d="$1" plug="${2:-$REPO}" s e
+  s=$(date +%s)
+  SS_OUT="$(CLAUDE_PLUGIN_ROOT="$plug" CLAUDE_PROJECT_DIR="$d" HEIMDALL_HOME="$d/.heimdall" \
+            sh -c "$SS_CMD" 2>&1)"
+  SS_RC=$?
+  e=$(date +%s); SS_SECS=$((e - s))
+}
+
 if [ -n "$SS_CMD" ]; then
   ok "a SessionStart hook invokes heimdall-resume-probe"
   has "$SS_CMD" 'CHECKPOINT.md' && ok "the invocation is guarded by an existing checkpoint (silent in repos with nothing to resume)" \
                                 || bad "the probe fires unconditionally — it would speak in repos with no checkpoint"
+
+  # Refuse to execute the install command by accident: if the probe is ever folded
+  # into it, running it here would write the operator's real ~/.claude.
+  if has "$SS_CMD" 'statusline-register' || has "$SS_CMD" 'cc-selfheal' || has "$SS_CMD" 'edit-tracker'; then
+    bad "the probe is fused into the install/self-heal SessionStart command — it must be its own entry so it can fail without taking the install down, and so this suite can execute it hermetically"
+  else
+    ok "the probe's SessionStart wiring is a dedicated, self-contained entry"
+
+    # A RED verdict is the WHOLE POINT of the probe, and it must still not fail the
+    # session that surfaced it. A hook that exits non-zero on a red reads to the
+    # operator as a broken install, and the first thing anyone does to a hook that
+    # breaks session start is delete it.
+    P="$(make_saved_project)"
+    rm -f "$P/.planning/RESUME-KEY.json"
+    run_ss "$P"
+    [ "$SS_RC" -eq 0 ] && ok "a RED probe still exits the hook 0 (a red verdict must never break a session)" \
+                       || bad "a RED probe exited the SessionStart hook $SS_RC — that surfaces as a broken session start"
+    hasrei "$SS_OUT" 'RED' && ok "...and the RED still reaches the operator (bounded, not swallowed)" \
+                           || bad "the RED was swallowed — the gate would be invisible: $SS_OUT"
+    SSL="$(printf '%s\n' "$SS_OUT" | grep -c .)"
+    [ "$SSL" -le 8 ] && ok "the RED stays inside the SessionStart output budget ($SSL lines, ceiling 8)" \
+                     || bad "the RED spent $SSL lines of every session start"
+    rm -rf "$P"
+
+    # Nothing to resume -> the hook must cost NOTHING, or every repo without a
+    # checkpoint pays for a feature it is not using.
+    P="$(mktemp -d "$TMP/nockpt.XXXXXX")"
+    run_ss "$P"
+    [ "$SS_RC" -eq 0 ] && ok "a repo with no checkpoint exits 0" || bad "no-checkpoint repo exited $SS_RC: $SS_OUT"
+    [ -z "$SS_OUT" ] && ok "...and says nothing at all (zero bytes)" || bad "the hook spoke in a repo with nothing to resume: $SS_OUT"
+    rm -rf "$P"
+
+    # A half-installed plugin must not break session start either.
+    P="$(make_saved_project)"
+    NOPLUG="$(mktemp -d "$TMP/noplug.XXXXXX")"
+    run_ss "$P" "$NOPLUG"
+    [ "$SS_RC" -eq 0 ] && ok "a missing probe binary exits 0 (a broken install never blocks a session)" \
+                       || bad "a missing probe binary exited $SS_RC: $SS_OUT"
+    [ -z "$SS_OUT" ] && ok "...and is silent rather than leaking a shell error" || bad "missing binary printed: $SS_OUT"
+    rm -rf "$P" "$NOPLUG"
+
+    # THE ONE THAT MATTERS. This subsystem exists to prove restarts are safe, so a
+    # probe that could wedge would make restarting impossible — the exact inversion
+    # that kept this feature unarmed. Grepping for an `alarm` only proves a ceiling
+    # was TYPED. Substituting a probe that never returns proves it WORKS.
+    WEDGE="$(mktemp -d "$TMP/wedge.XXXXXX")"
+    mkdir -p "$WEDGE/bin"
+    printf '#!/bin/sh\nsleep 300\n' > "$WEDGE/bin/heimdall-resume-probe"
+    chmod +x "$WEDGE/bin/heimdall-resume-probe"
+    P="$(make_saved_project)"
+    run_ss "$P" "$WEDGE"
+    [ "$SS_SECS" -le 30 ] && ok "a WEDGED probe (never returns) still releases the hook in ${SS_SECS}s — the ceiling is real, not decorative" \
+                          || bad "a wedged probe held session start for ${SS_SECS}s — every new session would hang"
+    [ "$SS_RC" -eq 0 ] && ok "...and a wedged probe still exits 0" || bad "a wedged probe exited $SS_RC"
+    rm -rf "$P" "$WEDGE"
+  fi
 else
   bad "NOT WIRED — no SessionStart hook calls heimdall-resume-probe"
 fi
