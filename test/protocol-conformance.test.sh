@@ -52,7 +52,13 @@
 #   I. READ-ONLY             the fixture tree is byte-identical after a full run, the
 #                            real ~/.heimdall is untouched, and `inventory --write` writes
 #                            inside its own $REPO and nowhere else.
-#   M. MUTATION PROOFS       eight mutants of the tool, each disarming one rule, each
+#   J. MAIN-CHECKOUT RESOLUTION  launched from inside a REAL linked worktree it still
+#                            inspects the main checkout's worktree root. If it resolved to
+#                            the worktree it ran from, every check would report
+#                            NON_VERIFIED for the exact agents it exists to police.
+#   K. EXIT-CODE CONTRACT    0 conformant · 1 violation · 2 usage/dependency · 3
+#                            NON_VERIFIED, with 2 never confusable with 1.
+#   M. MUTATION PROOFS       nine mutants of the tool, each disarming one rule, each
 #                            required to flip a verdict from RED to GREEN.
 #
 # HERMETIC BY CONSTRUCTION
@@ -523,6 +529,60 @@ case "$HEIMDALL_HOME" in
   *)         bad "(I) \$HEIMDALL_HOME is not sandboxed: $HEIMDALL_HOME" ;;
 esac
 
+# ═══ (J) IT RESOLVES TO THE MAIN CHECKOUT, NOT THE WORKTREE IT RAN FROM ════════════
+# Agent worktrees carry a full checkout, so `agent-X/bin/heimdall-conformance` is the copy
+# that actually runs — and agent worktrees live under the MAIN tree's .claude/worktrees.
+# If $REPO resolved to the launching worktree, the worktree root would not exist there and
+# every check would report NON_VERIFIED for the exact agents it is meant to police. This
+# is a REAL linked worktree (git worktree add), not a simulation of one.
+MAINREPO="$WORK/mainrepo"
+mkdir -p "$MAINREPO"
+git -C "$MAINREPO" init -q 2>/dev/null
+git -C "$MAINREPO" -c user.email=fixture@heimdall.test -c user.name=fixture \
+  commit -q --allow-empty -m "fixture root" 2>/dev/null
+mkdir -p "$MAINREPO/.claude/worktrees"
+CHILD="$MAINREPO/.claude/worktrees/agent-child"
+git -C "$MAINREPO" worktree add -q -b fixture-child "$CHILD" 2>/dev/null
+mkdir -p "$CHILD/bin"
+cp "$CONF" "$CHILD/bin/heimdall-conformance"
+ln -s "$ROOT/bin/lib" "$CHILD/bin/lib"
+printf 'work in flight\n' > "$CHILD/uncommitted-work.txt"
+
+if [ -d "$CHILD/.git" ] || [ -f "$CHILD/.git" ]; then
+  ok "(J) fixture: a REAL linked git worktree under the main checkout's .claude/worktrees"
+else
+  bad "(J) could not create the linked worktree fixture — (J) proves nothing"
+fi
+
+# No HMD_CONF_REPO, no HMD_CONF_WORKTREES: resolution is the thing under test.
+OUT="$(env -u HMD_CONF_REPO -u HMD_CONF_WORKTREES "$CHILD/bin/heimdall-conformance" commit-per-unit 2>"$ERRF")"; RC=$?
+ERR="$(cat "$ERRF")"
+[ "$RC" = 0 ] && has "$OUT" 'inspected 1 worktree' \
+  && ok "(J) launched from INSIDE a linked worktree it still inspects the MAIN checkout's worktree root" \
+  || bad "(J) resolution escaped to the launching worktree (rc=$RC): $OUT$ERR"
+
+has "$OUT" 'child' \
+  && ok "(J) and it sees the very agent worktree it was launched from — self-inspection works" \
+  || bad "(J) the launching worktree was invisible to the check: $OUT"
+
+# ═══ (K) THE EXIT-CODE CONTRACT ════════════════════════════════════════════════════
+# The header publishes four exits and other tooling will branch on them: 0 conformant,
+# 1 violation, 2 usage/dependency, 3 NON_VERIFIED. 2 must never be confused with 1.
+conf
+[ "$RC" = 2 ] && has "$ERR" 'usage: heimdall-conformance' && [ -z "$OUT" ] \
+  && ok "(K) no argument is a usage error: exit 2, usage on stderr, nothing on stdout" \
+  || bad "(K) a bare invocation exited $RC: $OUT$ERR"
+
+conf definitely-not-a-check
+[ "$RC" = 2 ] && has "$ERR" 'unknown check definitely-not-a-check' \
+  && ok "(K) an unknown check is exit 2 and NAMES the unknown check — never a silent 0" \
+  || bad "(K) an unknown check exited $RC: $ERR"
+
+conf --help
+[ "$RC" = 2 ] \
+  && ok "(K) --help keeps the usage exit, so a mistyped check can never read as conformant" \
+  || bad "(K) --help exited $RC"
+
 # ═══════════════════════════════════════════════════════════════════════════════════
 # (M) MUTATION PROOFS — break the rule, prove the tool goes RED
 # ═══════════════════════════════════════════════════════════════════════════════════
@@ -643,6 +703,24 @@ else
   [ "$RC" = 0 ] \
     && ok "M8 KILLED: removing the self-check lets a BLIND classifier report a clean session -> (G) is a real check" \
     || bad "M8 SURVIVED: the mutant with no self-check still went RED (rc=$RC): $OUT"
+fi
+
+# ── M9 — main-checkout resolution disarmed ─────────────────────────────────────────
+# Collapse the linked-worktree branch of _main_worktree() to "wherever I was launched
+# from". This is the failure the tool's header warns about: run from an agent worktree it
+# would look for .claude/worktrees INSIDE that worktree, find nothing, and report
+# NON_VERIFIED for every agent it exists to police.
+sed 's|^    ( cd "$here" && cd "$(dirname "$cd_")" && pwd )$|    printf %s "$here"|' \
+  "$CONF" > "$CHILD/bin/conf.m9"
+chmod +x "$CHILD/bin/conf.m9"
+if cmp -s "$CHILD/bin/conf.m9" "$CONF"; then
+  bad "M9 NOT APPLIED: the linked-worktree resolution branch no longer matches"
+else
+  OUT="$(env -u HMD_CONF_REPO -u HMD_CONF_WORKTREES "$CHILD/bin/conf.m9" commit-per-unit 2>"$ERRF")"; RC=$?
+  ERR="$(cat "$ERRF")"
+  [ "$RC" = 3 ] && has "$ERR" 'no worktree root' \
+    && ok "M9 KILLED: resolving \$REPO to the launching worktree turns (J) into NON_VERIFIED -> the main-checkout resolution is load-bearing" \
+    || bad "M9 SURVIVED: with resolution collapsed the run still exited $RC: $OUT$ERR"
 fi
 
 # ── the mutants must not have leaked into the real tool ────────────────────────────
