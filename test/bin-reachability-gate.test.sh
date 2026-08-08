@@ -274,6 +274,37 @@ else
   bad "falsifier: the exemption file VOUCHED for bin/orphan-tool — writing an exemption would make a dead bin read as wired"
 fi
 
+# 3d. The LIVENESS MANIFEST must NOT be a reference surface either. It declares which
+#     subsystems OWE a receipt, naming each one's command in a data column. Declaring
+#     that something SHOULD run is the opposite of evidence that anything runs it.
+#
+#     This is a regression test for a real defect, not a hypothetical. When
+#     heimdall-weekly-log began reading the manifest, the manifest itself became
+#     reachable, and heimdall-cost-report, heimdall-cost-model-refresh and
+#     heimdall-registry-hygiene all inherited liveness through it. The gate then
+#     reported their (correct) exemptions as STALE, and acting on that would have
+#     deleted three good rows and reported three unscheduled jobs as live.
+#
+#     The sandbox reproduces that exact shape: a LIVE hook seeds wired-tool, wired-tool
+#     names the manifest, and the manifest names declared-tool. Pre-fix that chain
+#     cleared declared-tool, so this assertion discriminates rather than passing
+#     vacuously.
+printf '#!/bin/sh\n# reads bin/lib/liveness-subsystems.conf for its schedule\nexit 0\n' \
+  > "$SANDBOX/bin/wired-tool"
+chmod +x "$SANDBOX/bin/wired-tool"
+printf '#!/bin/sh\nexit 0\n' > "$SANDBOX/bin/declared-tool"
+chmod +x "$SANDBOX/bin/declared-tool"
+printf 'declared|86400|3|operator|some subject|declared-tool --apply\n' \
+  > "$SANDBOX/bin/lib/liveness-subsystems.conf"
+SBW3="$WORK/sandbox-manifest"
+reach_build "$SANDBOX" "$SBW3"
+SB3_DEAD="$(reach_dead "$SBW3")"
+if printf '%s\n' "$SB3_DEAD" | grep -qx "declared-tool"; then
+  ok "falsifier: the liveness manifest is not a reference surface (declaring a subsystem does not make it reachable)"
+else
+  bad "falsifier: the liveness manifest VOUCHED for bin/declared-tool — a live reader of the manifest revives every subsystem it declares, and correct exemptions then read STALE"
+fi
+
 # 3d. The registry rot audit must be able to go RED. §2b passes when the audit returns
 #     nothing, so "no rot found" and "the audit stopped looking" render identically
 #     unless something forces the difference. Feed it one row of each rot kind and

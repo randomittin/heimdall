@@ -76,8 +76,28 @@
 #   reach_exempt_reason ROOT NAME     the recorded reason for an exemption.
 #   reach_exempt_valid ROOT NAME      0 iff exempt AND well-formed AND not past recheck.
 
-# The exemption registry, relative to the repo root. Excluded from the graph on purpose.
+# DECLARATION SURFACES. A file that NAMES a program without invoking it must never confer
+# liveness on it, or the graph bootstraps corpses into life. Two exist:
+#
+#   the exemption registry — writing an exemption would otherwise MAKE the name reachable
+#     and silently vouch for the very thing it exempts;
+#   the liveness manifest  — it DECLARES which subsystems owe a receipt, in a data column.
+#     Naming a subsystem there is a statement that it SHOULD run, which is the opposite of
+#     evidence that something runs it. This was not theoretical: once heimdall-weekly-log
+#     began reading the manifest, the manifest went live and cost-report,
+#     cost-model-refresh and registry-hygiene all inherited false reachability through it,
+#     which would have deleted three correct exemptions and reported three unscheduled
+#     jobs as live.
+#
+# Both are excluded from the node set AND the scan set, so they can neither be graded nor
+# vouch for anything.
 REACH_EXEMPT_REL="bin/lib/reachability-exemptions.tsv"
+REACH_MANIFEST_REL="bin/lib/liveness-subsystems.conf"
+
+# reach_strip_decl_surfaces — filter stdin, dropping every declaration surface.
+reach_strip_decl_surfaces() {
+  grep -vFx "$REACH_EXEMPT_REL" | grep -vFx "$REACH_MANIFEST_REL"
+}
 
 # ── node + seed enumeration ───────────────────────────────────────────────────────
 
@@ -86,7 +106,7 @@ reach_nodes() {
   ( cd "$1" 2>/dev/null || exit 0
     find bin hooks sentinels -type f \
          -not -path '*/__pycache__/*' -not -name '*.pyc' -not -name '__init__.py' 2>/dev/null \
-      | grep -vFx "$REACH_EXEMPT_REL" \
+      | reach_strip_decl_surfaces \
       | LC_ALL=C awk -F'/' '{ print $NF "\t" $0 }' \
       | LC_ALL=C sort
     exit 0 )
@@ -138,9 +158,9 @@ reach_build() {
   reach_subjects "$root" | LC_ALL=C sort -u > "$w/subjects"
   [ -s "$w/subjects" ] || return 2
 
-  # Scan every seed and every node once. The exemption file is absent from both, so it
-  # can never vouch for the names it exempts.
-  { cut -f2 "$w/nodes"; cat "$w/seeds"; } | LC_ALL=C sort -u | grep -vFx "$REACH_EXEMPT_REL" > "$w/scanset"
+  # Scan every seed and every node once. Declaration surfaces are absent from both, so
+  # neither the exemption registry nor the liveness manifest can vouch for a name it lists.
+  { cut -f2 "$w/nodes"; cat "$w/seeds"; } | LC_ALL=C sort -u | reach_strip_decl_surfaces > "$w/scanset"
   [ -s "$w/scanset" ] || return 2
 
   # A path containing ':' would make the grep -H output ambiguous and could silently
