@@ -296,6 +296,9 @@ if [ "$RETRY_REDS" -eq 1 ] && [ "$JOBS" -gt 1 ]; then
     retried=$((retried + 1))
     [ -t 1 ] && printf '\r  re-running red #%d alone ...' "$retried"
     cp "$WORK/$i.rc" "$WORK/$i.rc.parallel"
+    # Keep the PARALLEL-phase output too. The solo re-run overwrites $i.out, and the
+    # difference between the two runs is the whole diagnosis for a contaminated suite.
+    cp "$WORK/$i.out" "$WORK/$i.out.parallel" 2>/dev/null || true
     run_one "$i" "${RUN[$i]}"
     newrc="$(cat "$WORK/$i.rc" 2>/dev/null || echo 99)"
     [ "$newrc" = "0" ] && FLAKY+=("${RUN[$i]}")
@@ -309,6 +312,7 @@ ELAPSED=$((END - START))
 n_pass=0; n_fail=0; n_timeout=0; n_unparsed=0; n_discrep=0
 tot_p=0; tot_f=0
 FAILED=(); TIMEDOUT=(); UNPARSED=(); DISCREP=()
+NONGREEN=()   # "idx|name|status" for every suite that did not come back green
 ROWS=()
 
 for i in $(seq 0 $((TO_RUN - 1))); do
@@ -338,7 +342,38 @@ for i in $(seq 0 $((TO_RUN - 1))); do
     status="PASS"; n_pass=$((n_pass + 1))
   fi
   ROWS+=("$status|$name|$p|$f|$rc|${dur}s")
+  [ "$status" = "PASS" ] || NONGREEN+=("$i|$name|$status")
 done
+
+# ── PRESERVE THE EVIDENCE FOR EVERY NON-GREEN SUITE ───────────────────────────────────────
+# $WORK is deleted on exit, so without this every red's output self-destructs and the only
+# way to see WHY a suite failed inside the run is to reproduce the whole 40-minute run. A
+# red that cannot be read is a red that cannot be fixed. Copy out before cleanup fires.
+# Solo-green-but-red-in-run (state contamination) is exactly the case this exists for: the
+# .parallel.out / .out pair is the diagnosis.
+EVIDENCE=""
+if [ "${#NONGREEN[@]}" -gt 0 ]; then
+  # Explicit template, not `-t`: on macOS `-t` treats the argument as a PREFIX and appends
+  # its own suffix, leaving a literal "XXXXXX" in the printed path.
+  EVIDENCE="$(mktemp -d "${TMPDIR:-/tmp}/heimdall-run-all-evidence.XXXXXX")"
+  for e in ${NONGREEN[@]+"${NONGREEN[@]}"}; do
+    ei="${e%%|*}"; erest="${e#*|}"; ename="${erest%%|*}"; estatus="${erest#*|}"
+    cp "$WORK/$ei.out" "$EVIDENCE/${ename%.test.sh}.$estatus.out" 2>/dev/null || true
+    [ -f "$WORK/$ei.out.parallel" ] && \
+      cp "$WORK/$ei.out.parallel" "$EVIDENCE/${ename%.test.sh}.$estatus.parallel.out" 2>/dev/null || true
+  done
+  {
+    printf 'run-all evidence  %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    printf 'jobs=%s  suites_ran=%s  retry_reds=%s\n\n' "$JOBS" "$TO_RUN" "$RETRY_REDS"
+    printf '%-9s %s\n' STATUS SUITE
+    for e in ${NONGREEN[@]+"${NONGREEN[@]}"}; do
+      erest="${e#*|}"
+      printf '%-9s %s\n' "${erest#*|}" "${erest%%|*}"
+    done
+    printf '\n*.out          = the run that produced the verdict (solo re-run when --retry-reds)\n'
+    printf '*.parallel.out = the same suite'"'"'s output during the parallel phase, when present\n'
+  } > "$EVIDENCE/INDEX.txt"
+fi
 
 # ── TABLE ─────────────────────────────────────────────────────────────────────────────────
 printf '%-9s %-52s %6s %6s %5s %7s\n' STATUS SUITE PASSED FAILED EXIT TIME
@@ -407,10 +442,14 @@ echo "suites: ${TO_RUN} ran, ${#SKIP[@]} skipped (live), ${DISCOVERED} discovere
 echo "        ${GRN}${n_pass} pass${OFF}  ${RED}${n_fail} fail${OFF}  ${RED}${n_timeout} timeout${OFF}  ${RED}${n_discrep} discrepancy${OFF}  ${YEL}${n_unparsed} unparsed${OFF}"
 echo "assertions: ${tot_p} passed, ${tot_f} failed  (parsed detail; exit codes above are authoritative)"
 echo "wall clock: ${ELAPSED}s"
+if [ -n "$EVIDENCE" ]; then
+  echo "evidence:   ${EVIDENCE}   (${#NONGREEN[@]} non-green suite output(s) + INDEX.txt — kept, not deleted)"
+fi
 
 BAD=$((n_fail + n_timeout + n_discrep))
 if [ "$BAD" -gt 0 ]; then
   echo "${RED}${BLD}RUN RED${OFF} — $BAD suite(s) not green."
+  [ -n "$EVIDENCE" ] && echo "  read it: ${EVIDENCE}/INDEX.txt"
   exit 1
 fi
 echo "${GRN}${BLD}RUN GREEN${OFF} — all ${TO_RUN} suites that ran passed."
