@@ -1,0 +1,518 @@
+#!/usr/bin/env bash
+# heimdall-liveness — the liveness receipt every scheduled subsystem writes.
+#
+# WHY THIS EXISTS
+# ---------------
+# The nightly /dream did not run for 26 days and NOTHING said so. The proximate bug is
+# fixed (bin/heimdall-dream-permission classify(): a scheduled run wrote result=ok while
+# macOS TCC had denied it the repo, so a COMPLETED run read as a SUCCESSFUL one and the
+# only state that speaks — needs-grant — never fired). The class defect it exposed is
+# larger: a self-silencing monitor. Every scheduled/background subsystem now records the
+# same receipt, so a 26-day silence becomes a 1-day alert.
+#
+#     COMPLETION IS NOT REACHABILITY.
+#
+# A receipt that records only "it ran" reproduces the original bug in every subsystem it
+# touches. So a receipt carries BOTH facts, separately:
+#
+#     last_attempt   — it started
+#     last_complete  — it finished
+#     last_reached   — it demonstrably TOUCHED THE SUBJECT it exists to watch
+#
+# and `reached` records the verdict of that touch. A run that finished without reaching
+# its subject is NON_VERIFIED immediately — its output cannot vouch for something it
+# never read.
+#
+# FAIL CLOSED, ALWAYS
+# -------------------
+# Missing, unparseable, future-dated, or unrecorded all read NON_VERIFIED — never OK.
+# `check` iterates the DECLARED manifest, never the receipt directory, because a
+# directory scan of a subsystem that has never run once lists nothing and calls it
+# health. That is the 26-day silence in a new costume.
+#
+# MISSED CYCLES ARE DERIVED, NEVER STORED
+# ---------------------------------------
+# A counter the subsystem increments itself cannot count the cycles in which the
+# subsystem did not run. So `missed_cycles` is computed at READ time from
+# age(last_reached) / period_s. Nothing has to be alive for the number to be right.
+# It is -1 when it cannot be derived (nothing has ever reached) — never 0, which a
+# reader could mistake for health.
+#
+# NO JQ. The launchd PATH is /usr/bin:/bin:/usr/sbin:/sbin and jq is not on it, so both
+# the writer and the reader are printf + sed only, exactly like the dream status family.
+#
+# Store:    $HEIMDALL_LIVENESS_DIR/<subsystem>.json   (atomic tmp+mv, one field per line)
+# Manifest: bin/lib/liveness-subsystems.conf          (name|period_s|N|scope|subject|remedy)
+#
+# Env seams
+#   HEIMDALL_HOME               state root (default ~/.heimdall)
+#   HEIMDALL_LIVENESS_DIR       receipt dir (default $HEIMDALL_HOME/liveness)
+#   HEIMDALL_LIVENESS_MANIFEST  declared subsystems (default bin/lib/liveness-subsystems.conf)
+#   HEIMDALL_LIVENESS_OPERATOR  1 → this box runs the operator-scope jobs too
+#   HMD_LIVENESS_NOW            clock override, for tests (a staleness gate whose own
+#                               suite depends on the wall clock is not a proof)
+
+set -uo pipefail
+
+HERE="$(cd "$(dirname "$0")" && pwd -P)"
+HEIMDALL_HOME="${HEIMDALL_HOME:-$HOME/.heimdall}"
+LDIR="${HEIMDALL_LIVENESS_DIR:-$HEIMDALL_HOME/liveness}"
+MANIFEST="${HEIMDALL_LIVENESS_MANIFEST:-$HERE/lib/liveness-subsystems.conf}"
+
+# A receipt stamped ahead of now is a forged one — but small clock jitter between a
+# launchd job and a reader is ordinary. 300s separates the two.
+SKEW_TOLERANCE=300
+
+# ── primitives ───────────────────────────────────────────────────────────────────
+
+_now() {
+  case "${HMD_LIVENESS_NOW:-}" in
+    ''|*[!0-9]*) date +%s ;;
+    *)           printf '%s' "$HMD_LIVENESS_NOW" ;;
+  esac
+}
+
+_esc() { # JSON string body: backslash, quote, and any newline/tab folded away
+  printf '%s' "${1:-}" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr '\n\r\t' '   '
+}
+
+_json_str() { # <file> <key> → the quoted string value, or empty
+  [ -f "$1" ] || return 0
+  sed -n "s/^[[:space:]]*\"$2\"[[:space:]]*:[[:space:]]*\"\(.*\)\"[[:space:]]*,\{0,1\}[[:space:]]*\$/\1/p" \
+    "$1" 2>/dev/null | head -1
+}
+
+_json_int() { # <file> <key> → the bare integer value, or 0
+  local v=""
+  if [ -f "$1" ]; then
+    v="$(sed -n "s/^[[:space:]]*\"$2\"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\)[[:space:]]*,\{0,1\}[[:space:]]*\$/\1/p" \
+          "$1" 2>/dev/null | head -1)"
+  fi
+  case "$v" in
+    ''|*[!0-9]*) printf '0' ;;
+    *)           printf '%s' "$v" ;;
+  esac
+}
+
+_die() { printf 'heimdall-liveness: %s\n' "$1" >&2; exit "${2:-2}"; }
+
+_valid_name() { # path-traversal proof: the name becomes a filename
+  case "${1:-}" in
+    ''|*[!A-Za-z0-9_-]*) return 1 ;;
+    *)                   return 0 ;;
+  esac
+}
+
+is_operator() {
+  case "${HEIMDALL_LIVENESS_OPERATOR:-}" in 1|yes|true|YES|TRUE) return 0 ;; esac
+  [ -f "$HEIMDALL_HOME/operator" ] && return 0
+  return 1
+}
+
+# ── the probe ────────────────────────────────────────────────────────────────────
+# It performs the ACCESS the subsystem needs, not a stat. `ls -d` on a TCC-denied
+# directory succeeds — it only stats the parent — which is precisely how a denied dream
+# run looked healthy. Listing the contents is the access that actually gets refused.
+#
+# It runs in the CALLER's process, so it is subject to the same sandbox/TCC denial the
+# caller is: it measures the caller's own reach, not some privileged observer's.
+_probe() { # <subject> → yes | no | unprobeable
+  local s="${1:-}"
+  case "$s" in
+    /*) : ;;
+    *)  printf 'unprobeable'; return 0 ;;     # a URL, an API, a label — not ours to test
+  esac
+  if [ -d "$s" ]; then
+    if ls -- "$s" >/dev/null 2>&1; then printf 'yes'; else printf 'no'; fi
+  elif [ -f "$s" ]; then
+    if head -c 1 -- "$s" >/dev/null 2>&1; then printf 'yes'; else printf 'no'; fi
+  elif ls -- "$s" >/dev/null 2>&1; then
+    printf 'yes'                              # exists but stat lied (denied parent)
+  else
+    printf 'no'                               # absent or unreadable — either way, unreached
+  fi
+}
+
+# ── manifest ─────────────────────────────────────────────────────────────────────
+# name|period_s|miss_threshold|scope|subject_label|remedy
+M_FOUND=0; M_PERIOD=86400; M_THRESH=2; M_SCOPE="local"; M_LABEL=""; M_REMEDY=""
+
+manifest_lookup() { # <name>
+  local want="$1" n p t s l r
+  M_FOUND=0; M_PERIOD=86400; M_THRESH=2; M_SCOPE="local"; M_LABEL=""; M_REMEDY=""
+  [ -f "$MANIFEST" ] || return 0
+  while IFS='|' read -r n p t s l r; do
+    case "$n" in ''|'#'*) continue ;; esac
+    [ "$n" = "$want" ] || continue
+    case "$p" in ''|*[!0-9]*) p=86400 ;; esac
+    case "$t" in ''|*[!0-9]*) t=2 ;; esac
+    case "$s" in operator) s="operator" ;; *) s="local" ;; esac
+    M_FOUND=1; M_PERIOD="$p"; M_THRESH="$t"; M_SCOPE="$s"; M_LABEL="${l:-}"; M_REMEDY="${r:-}"
+    break
+  done < "$MANIFEST"
+  return 0
+}
+
+manifest_names() {
+  local n rest
+  [ -f "$MANIFEST" ] || return 0
+  while IFS='|' read -r n rest; do
+    case "$n" in ''|'#'*) continue ;; esac
+    printf '%s\n' "$n"
+  done < "$MANIFEST"
+}
+
+# ── resolve: a receipt on disk → a verdict ───────────────────────────────────────
+# Order matters and is asserted by test/liveness-receipt.test.sh. Each branch names the
+# REAL cause; a generic "stale" for a job that crashed mid-run would send the operator
+# to the wrong place.
+R_STATE=""; R_REASON=""; R_MISSED=-1
+R_SUBJECT=""; R_ATTEMPT=0; R_COMPLETE=0; R_REACHED_AT=0; R_REACHED=""; R_DETAIL=""; R_UPDATED=0
+
+resolve() { # <name> <period_s> <miss_threshold>
+  local name="$1" period="$2" thresh="$3"
+  local f="$LDIR/$name.json"
+  local now; now="$(_now)"
+
+  R_SUBJECT=""; R_ATTEMPT=0; R_COMPLETE=0; R_REACHED_AT=0; R_REACHED=""; R_DETAIL=""; R_UPDATED=0
+  R_MISSED=-1
+
+  # 1. never wrote one. Absent is NOT fine — it is the loudest case there is.
+  if [ ! -f "$f" ]; then
+    R_STATE="NON_VERIFIED"; R_REASON="no-receipt"; return 0
+  fi
+
+  R_SUBJECT="$(_json_str "$f" subject)"
+  R_REACHED="$(_json_str "$f" reached)"
+  R_DETAIL="$(_json_str "$f" detail)"
+  R_ATTEMPT="$(_json_int "$f" last_attempt)"
+  R_COMPLETE="$(_json_int "$f" last_complete)"
+  R_REACHED_AT="$(_json_int "$f" last_reached)"
+  R_UPDATED="$(_json_int "$f" updated)"
+
+  # 2. unparseable, or stamped in the future. A future timestamp is the one-line forgery
+  #    that would defeat every staleness check at once, so it is malformed by definition.
+  if [ "$R_UPDATED" -le 0 ]; then
+    R_STATE="NON_VERIFIED"; R_REASON="malformed"; return 0
+  fi
+  local horizon=$(( now + SKEW_TOLERANCE ))
+  if [ "$R_UPDATED" -gt "$horizon" ] || [ "$R_ATTEMPT" -gt "$horizon" ] \
+     || [ "$R_COMPLETE" -gt "$horizon" ] || [ "$R_REACHED_AT" -gt "$horizon" ]; then
+    R_STATE="NON_VERIFIED"; R_REASON="malformed"; return 0
+  fi
+
+  # missed cycles, DERIVED — nothing has to be alive for this number to be right
+  if [ "$R_REACHED_AT" -gt 0 ] && [ "$period" -gt 0 ]; then
+    local age=$(( now - R_REACHED_AT ))
+    [ "$age" -lt 0 ] && age=0
+    R_MISSED=$(( age / period ))
+  fi
+
+  # 3. started, never finished — a job that dies mid-run is invisible to a
+  #    completion-only receipt. Given a full period's grace so a normal in-flight run
+  #    is not reported as a crash.
+  if [ "$R_ATTEMPT" -gt "$R_COMPLETE" ] && [ $(( now - R_ATTEMPT )) -ge "$period" ]; then
+    R_STATE="NON_VERIFIED"; R_REASON="attempted-never-completed"; return 0
+  fi
+  # 4. nothing has ever finished
+  if [ "$R_COMPLETE" -le 0 ]; then
+    R_STATE="NON_VERIFIED"; R_REASON="never-completed"; return 0
+  fi
+  # 5. a receipt that does not state reachability is unverifiable — and an unverifiable
+  #    gate is NON_VERIFIED, never OPEN. This is the pre-fix dream receipt exactly.
+  case "$R_REACHED" in
+    yes|no) : ;;
+    *) R_STATE="NON_VERIFIED"; R_REASON="reachability-unrecorded"; return 0 ;;
+  esac
+  # 6. it has finished, but has never once touched its subject
+  if [ "$R_REACHED_AT" -le 0 ]; then
+    R_STATE="NON_VERIFIED"; R_REASON="never-reached"; return 0
+  fi
+  # 7. THE DREAM BUG, GENERALISED: it completed and could not reach. Immediately loud —
+  #    waiting N cycles to speak here would rebuild the 26-day silence.
+  if [ "$R_REACHED" = "no" ]; then
+    R_STATE="NON_VERIFIED"; R_REASON="completed-unreachable"; return 0
+  fi
+  # 8. it reached, but not recently enough
+  if [ "$R_MISSED" -ge "$thresh" ]; then
+    R_STATE="STALE"; R_REASON="stale"; return 0
+  fi
+  R_STATE="OK"; R_REASON="reached"
+  return 0
+}
+
+# ── record: attempt / complete ───────────────────────────────────────────────────
+
+record() { # <mode: attempt|complete> <name> <subject> <explicit reached: yes|no|""> <detail>
+  local mode="$1" name="$2" subject="$3" explicit="$4" detail="$5"
+  local f="$LDIR/$name.json"
+  local now; now="$(_now)"
+
+  # carry the prior receipt forward — last_reached must survive a run that did not reach
+  local p_subject="" p_attempt=0 p_complete=0 p_reached_at=0 p_reached="" p_detail=""
+  if [ -f "$f" ]; then
+    p_subject="$(_json_str "$f" subject)"
+    p_reached="$(_json_str "$f" reached)"
+    p_detail="$(_json_str "$f" detail)"
+    p_attempt="$(_json_int "$f" last_attempt)"
+    p_complete="$(_json_int "$f" last_complete)"
+    p_reached_at="$(_json_int "$f" last_reached)"
+  fi
+
+  [ -n "$subject" ] || subject="$p_subject"
+
+  local w_attempt="$p_attempt" w_complete="$p_complete"
+  local w_reached_at="$p_reached_at" w_reached="$p_reached" w_detail="$detail"
+  [ -n "$w_detail" ] || w_detail="$p_detail"
+
+  if [ "$mode" = "attempt" ]; then
+    w_attempt="$now"
+    # an attempt asserts nothing about reach; the prior verdict stands until a run ends
+    [ -n "$w_reached" ] || w_reached="unrecorded"
+  else
+    w_complete="$now"
+    # a completion is itself proof an attempt happened, for a caller that only calls complete
+    [ "$w_attempt" -gt 0 ] || w_attempt="$now"
+
+    # THE PROBE OUTRANKS THE CLAIM — but only downward. Self-report is what failed the
+    # first time, so a caller asserting `yes` over a subject it demonstrably cannot read
+    # is recorded as NO. The converse is not symmetric: a caller reporting its own
+    # failure is believed, because it can see failures a filesystem probe cannot
+    # (an HTTP 500, a push rejection, a query error).
+    local probed; probed="$(_probe "$subject")"
+    case "$explicit" in
+      no)  w_reached="no" ;;
+      yes) case "$probed" in no) w_reached="no" ;; *) w_reached="yes" ;; esac ;;
+      *)   case "$probed" in
+             yes) w_reached="yes" ;;
+             no)  w_reached="no" ;;
+             *)   w_reached="unrecorded" ;;   # nothing to probe, nothing claimed, no credit
+           esac ;;
+    esac
+    [ "$w_reached" = "yes" ] && w_reached_at="$now"
+  fi
+
+  mkdir -p "$LDIR" 2>/dev/null || true
+  [ -d "$LDIR" ] || { printf 'heimdall-liveness: cannot create %s\n' "$LDIR" >&2; return 1; }
+
+  local tmp="$f.$$.tmp"
+  {
+    printf '{\n'
+    printf '  "schema": 1,\n'
+    printf '  "subsystem": "%s",\n'   "$(_esc "$name")"
+    printf '  "subject": "%s",\n'     "$(_esc "$subject")"
+    printf '  "last_attempt": %s,\n'  "$w_attempt"
+    printf '  "last_complete": %s,\n' "$w_complete"
+    printf '  "last_reached": %s,\n'  "$w_reached_at"
+    printf '  "reached": "%s",\n'     "$w_reached"
+    printf '  "detail": "%s",\n'      "$(_esc "$w_detail")"
+    printf '  "updated": %s\n'        "$now"
+    printf '}\n'
+  } > "$tmp" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+  mv -f "$tmp" "$f" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+  return 0
+}
+
+# ── reporting ────────────────────────────────────────────────────────────────────
+
+applicable_state() { # echoes the reported state, honoring scope
+  if [ "$M_SCOPE" = "operator" ] && ! is_operator; then
+    printf 'NOT_APPLICABLE'
+  else
+    printf '%s' "$R_STATE"
+  fi
+}
+
+entry_json() { # <name> <indent> — resolve+manifest globals must already be set
+  local name="$1" ind="$2" st; st="$(applicable_state)"
+  local decl="false"; [ "$M_FOUND" = 1 ] && decl="true"
+  local appl="true";  [ "$st" = "NOT_APPLICABLE" ] && appl="false"
+  printf '%s{\n' "$ind"
+  printf '%s  "subsystem": "%s",\n'     "$ind" "$(_esc "$name")"
+  printf '%s  "state": "%s",\n'         "$ind" "$st"
+  printf '%s  "reason": "%s",\n'        "$ind" "$R_REASON"
+  printf '%s  "missed_cycles": %s,\n'   "$ind" "$R_MISSED"
+  printf '%s  "period_s": %s,\n'        "$ind" "$M_PERIOD"
+  printf '%s  "miss_threshold": %s,\n'  "$ind" "$M_THRESH"
+  printf '%s  "scope": "%s",\n'         "$ind" "$M_SCOPE"
+  printf '%s  "applicable": %s,\n'      "$ind" "$appl"
+  printf '%s  "declared": %s,\n'        "$ind" "$decl"
+  printf '%s  "subject": "%s",\n'       "$ind" "$(_esc "$R_SUBJECT")"
+  printf '%s  "subject_label": "%s",\n' "$ind" "$(_esc "$M_LABEL")"
+  printf '%s  "last_attempt": %s,\n'    "$ind" "$R_ATTEMPT"
+  printf '%s  "last_complete": %s,\n'   "$ind" "$R_COMPLETE"
+  printf '%s  "last_reached": %s,\n'    "$ind" "$R_REACHED_AT"
+  printf '%s  "reached": "%s",\n'       "$ind" "${R_REACHED:-unrecorded}"
+  printf '%s  "detail": "%s",\n'        "$ind" "$(_esc "$R_DETAIL")"
+  printf '%s  "updated": %s,\n'         "$ind" "$R_UPDATED"
+  printf '%s  "remedy": "%s"\n'         "$ind" "$(_esc "$M_REMEDY")"
+  printf '%s}' "$ind"
+}
+
+_ago() { # <epoch> → "3d 4h ago" | "never"
+  local t="${1:-0}" now d h
+  [ "$t" -gt 0 ] 2>/dev/null || { printf 'never'; return 0; }
+  now="$(_now)"
+  local s=$(( now - t ))
+  [ "$s" -lt 0 ] && s=0
+  d=$(( s / 86400 )); h=$(( (s % 86400) / 3600 ))
+  if [ "$d" -gt 0 ]; then printf '%sd %sh ago' "$d" "$h"
+  elif [ "$h" -gt 0 ]; then printf '%sh ago' "$h"
+  else printf '%sm ago' $(( s / 60 )); fi
+}
+
+entry_line() { # <name> — one human row
+  local name="$1" st; st="$(applicable_state)"
+  local glyph miss
+  case "$st" in
+    OK)             glyph="  ok  " ;;
+    NOT_APPLICABLE) glyph="  --  " ;;
+    STALE)          glyph=" STALE" ;;
+    *)              glyph="  !!  " ;;
+  esac
+  miss="$R_MISSED"; [ "$miss" = "-1" ] && miss="?"
+  printf '%s  %-20s %-26s reached %-14s missed %s/%s\n' \
+    "$glyph" "$name" "$R_REASON" "$(_ago "$R_REACHED_AT")" "$miss" "$M_THRESH"
+}
+
+# ── verbs ────────────────────────────────────────────────────────────────────────
+
+usage() {
+  cat <<'EOF'
+heimdall-liveness — the liveness receipt every scheduled subsystem writes.
+
+  attempt  --subsystem NAME [--subject PATH|LABEL] [--detail TEXT]
+      Record that a run STARTED. Call it first; a run that dies before `complete`
+      is then reported as attempted-never-completed instead of vanishing.
+
+  complete --subsystem NAME [--subject PATH|LABEL] [--reached yes|no] [--detail TEXT]
+      Record that a run FINISHED, and whether it REACHED its subject. When --subject
+      is an absolute path the reach is PROBED (the access itself, not a stat) and the
+      probe overrides a --reached yes it contradicts. --reached no is always believed.
+
+  read  --subsystem NAME [--json]     one subsystem's verdict (exit 0 only when OK)
+  check [--subsystem NAME] [--json]   gate over the declared manifest (exit 1 if any loud)
+  doctor                              the human report, for `hmd doctor`
+  list                                the declared subsystems and their cycles
+
+States: OK | STALE | NON_VERIFIED | NOT_APPLICABLE.
+Missing, unparseable, future-dated and unrecorded ALL read NON_VERIFIED — never OK.
+EOF
+}
+
+SUBSYS=""; SUBJECT=""; REACHED=""; DETAIL=""; AS_JSON=0
+VERB="${1:-}"; [ $# -gt 0 ] && shift
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --subsystem) SUBSYS="${2:-}"; shift 2 ;;
+    --subject)   SUBJECT="${2:-}"; shift 2 ;;
+    --reached)   REACHED="${2:-}"; shift 2 ;;
+    --detail)    DETAIL="${2:-}"; shift 2 ;;
+    --json)      AS_JSON=1; shift ;;
+    -h|--help)   usage; exit 0 ;;
+    *)           _die "unknown option: $1" ;;
+  esac
+done
+
+case "$REACHED" in ''|yes|no) : ;; *) _die "--reached takes yes or no, got: $REACHED" ;; esac
+
+case "$VERB" in
+  attempt|complete)
+    _valid_name "$SUBSYS" || _die "--subsystem is required and must be [A-Za-z0-9_-]"
+    record "$VERB" "$SUBSYS" "$SUBJECT" "$REACHED" "$DETAIL" || exit 1
+    exit 0
+    ;;
+
+  read)
+    _valid_name "$SUBSYS" || _die "--subsystem is required and must be [A-Za-z0-9_-]"
+    manifest_lookup "$SUBSYS"
+    resolve "$SUBSYS" "$M_PERIOD" "$M_THRESH"
+    ST="$(applicable_state)"
+    if [ "$AS_JSON" = 1 ]; then
+      entry_json "$SUBSYS" ""
+      printf '\n'
+    else
+      entry_line "$SUBSYS"
+    fi
+    case "$ST" in OK|NOT_APPLICABLE) exit 0 ;; *) exit 1 ;; esac
+    ;;
+
+  check)
+    RC=0; COUNT=0
+    if [ -n "$SUBSYS" ]; then
+      _valid_name "$SUBSYS" || _die "--subsystem must be [A-Za-z0-9_-]"
+      NAMES="$SUBSYS"
+    else
+      NAMES="$(manifest_names)"
+    fi
+    [ "$AS_JSON" = 1 ] && printf '{\n  "generated": %s,\n  "subsystems": [\n' "$(_now)"
+    FIRST=1
+    for N in $NAMES; do
+      manifest_lookup "$N"
+      resolve "$N" "$M_PERIOD" "$M_THRESH"
+      ST="$(applicable_state)"
+      case "$ST" in OK|NOT_APPLICABLE) : ;; *) RC=1 ;; esac
+      COUNT=$(( COUNT + 1 ))
+      if [ "$AS_JSON" = 1 ]; then
+        [ "$FIRST" = 1 ] || printf ',\n'
+        FIRST=0
+        entry_json "$N" "    "
+      else
+        entry_line "$N"
+      fi
+    done
+    if [ "$AS_JSON" = 1 ]; then
+      [ "$FIRST" = 1 ] || printf '\n'
+      printf '  ],\n  "count": %s,\n  "state": "%s"\n}\n' "$COUNT" \
+        "$( [ "$RC" = 0 ] && printf 'OK' || printf 'LOUD' )"
+    fi
+    exit "$RC"
+    ;;
+
+  doctor)
+    RC=0; LOUD=""
+    printf '\n  liveness — did the scheduled work actually run, and did it reach its subject?\n\n'
+    NAMES="$(manifest_names)"
+    if [ -z "$NAMES" ]; then
+      printf '  !!    no manifest at %s — nothing is being watched\n\n' "$MANIFEST"
+      exit 1
+    fi
+    for N in $NAMES; do
+      manifest_lookup "$N"
+      resolve "$N" "$M_PERIOD" "$M_THRESH"
+      ST="$(applicable_state)"
+      entry_line "$N"
+      case "$ST" in
+        OK|NOT_APPLICABLE) : ;;
+        *) RC=1; LOUD="$LOUD$N|$R_REASON|$M_LABEL|$M_REMEDY
+" ;;
+      esac
+    done
+    if [ "$RC" != 0 ]; then
+      printf '\n  NOT VERIFIED — these subsystems cannot prove they ran and reached:\n\n'
+      printf '%s' "$LOUD" | while IFS='|' read -r n r l fix; do
+        [ -n "$n" ] || continue
+        printf '    %s (%s)\n' "$n" "$r"
+        [ -n "$l" ] && printf '      subject: %s\n' "$l"
+        [ -n "$fix" ] && printf '      fix:     %s\n' "$fix"
+      done
+      printf '\n  A missing receipt is NOT health. It is the 26-day silence in a new costume.\n\n'
+    else
+      printf '\n  all declared subsystems ran and reached their subjects inside their cycles\n\n'
+    fi
+    exit "$RC"
+    ;;
+
+  list)
+    printf '%-20s %-10s %-4s %-9s %s\n' SUBSYSTEM PERIOD N SCOPE SUBJECT
+    for N in $(manifest_names); do
+      manifest_lookup "$N"
+      printf '%-20s %-10s %-4s %-9s %s\n' "$N" "${M_PERIOD}s" "$M_THRESH" "$M_SCOPE" "$M_LABEL"
+    done
+    exit 0
+    ;;
+
+  ''|-h|--help|help) usage; exit 0 ;;
+  *) _die "unknown verb: $VERB (try --help)" ;;
+esac
