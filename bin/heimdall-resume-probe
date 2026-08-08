@@ -1,0 +1,408 @@
+#!/usr/bin/env bash
+# heimdall-resume-probe — THE FALSIFIER FOR THE MEMORY STACK (spec PART 1.1).
+#
+# WHAT THIS IS FOR
+# ----------------
+# The expensive claim this repo wants to make true is: at the 150K meter, checkpoint
+# + restart costs ~$0.02 and loses NOTHING. Every piece of the stack that should make
+# that true already exists — the checkpoint, the observation store, the hmd/context
+# worklog branch, git itself. What was missing was the PROOF, run every time. A
+# restart nobody trusts is a restart nobody takes, and not restarting is the thing
+# that actually costs money.
+#
+# So on every session start with a checkpoint present, this answers — FROM THE
+# PERSISTED STACK ALONE — the six questions a fresh session must be able to answer,
+# and is graded against a key written when the answers were still known.
+#
+# THE ASYMMETRY IS THE WHOLE MECHANISM
+# ------------------------------------
+#     key    = digest( the LIVE value, at SAVE time )      <- bin/heimdall-checkpoint
+#     answer = digest( what the STACK yields, at RESUME time )  <- here
+#
+# A probe that derived both the question and the answer at resume would grade its
+# own homework and prove nothing — the tautological gate this repo exists to prevent.
+# The key holds sha256 digests and lengths ONLY: enough to grade an answer, never
+# enough to supply one. Read .planning/RESUME-KEY.json — there is no prose in it.
+#
+# A MISS IS A BUG IN THE MEMORY STACK, NOT A PROBE FAILURE
+# --------------------------------------------------------
+# Every RED names the FAILING LAYER, because "something was lost" is unactionable:
+#   layer=checkpoint      the field is absent from, or altered in, .planning/CHECKPOINT.md
+#   layer=index           the observation store was deleted or pruned since the save
+#   layer=context-branch  refs/heads/hmd/context vanished or rewound since the save
+#
+# FAIL CLOSED. A probe that CANNOT run is a RED, never a skip: no key, no checkpoint,
+# a corrupt key, no sha256 on the box — all RED. An ungraded resume is not a verified
+# one, and "nothing to check, carry on" is exactly how a memory stack rots unnoticed.
+#
+# NO FALSE REDS. It grades what the STACK REMEMBERS, not whether the world stood
+# still. Committing after a checkpoint is normal work and stays GREEN; the HEAD drift
+# is reported informationally in --json. A repo that never had a context branch is
+# not red for its absence (context-sync is opt-out by design). A gate that cries wolf
+# on ordinary work gets switched off, and then it protects nobody.
+#
+# Usage:
+#   heimdall-resume-probe run [--repo DIR] [--json] [--verbose]
+#   heimdall-resume-probe log [--repo DIR] [--limit N]
+#   heimdall-resume-probe help
+#
+# Exit status of `run`:
+#   0  GREEN — every never-lose category was recovered from the stack
+#   1  RED   — something was lost, or the stack could not be graded at all
+#  64  usage error
+#
+# Env seams (tests relocate all state through these; nothing else is written):
+#   HEIMDALL_HOME   relocates the observation store and the probe log
+
+set -uo pipefail
+
+_PROBE_SELF="$0"
+command -v readlink >/dev/null 2>&1 && \
+  _PROBE_SELF="$(readlink -f "$0" 2>/dev/null || readlink "$0" 2>/dev/null || echo "$0")"
+_PROBE_BIN="$(cd "$(dirname "$_PROBE_SELF")" 2>/dev/null && pwd)"
+
+if [ -r "$_PROBE_BIN/lib/resume-contract.sh" ]; then
+  # shellcheck source=lib/resume-contract.sh
+  . "$_PROBE_BIN/lib/resume-contract.sh"
+else
+  echo "[heimdall] resume probe RED — bin/lib/resume-contract.sh is missing, so the memory stack cannot be graded at all. Fail closed: treat this restart as lossy." >&2
+  exit 1
+fi
+
+# ── reading the answer key ──────────────────────────────────────────────────────
+# The key's format is one answer object per line, which this script owns jointly
+# with the writer. Line-oriented sed keeps the probe free of a jq/python dependency
+# in the one code path that must never fail to run.
+
+_key_str() { # <keyfile> <name> -> first matching string value
+  sed -n "s/^[[:space:]]*\"$2\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$1" 2>/dev/null | head -1
+}
+
+_key_answers() { # <keyfile> -> id|layer|digest|len per line
+  sed -n 's/^[[:space:]]*{"id": "\([a-z_]*\)", "label": "[^"]*", "layer": "\([a-z-]*\)", "digest": "\([0-9a-f]*\)", "answer_len": \([0-9]*\)}.*/\1|\2|\3|\4/p' \
+    "$1" 2>/dev/null
+}
+
+_key_index() { # <keyfile> -> present|entries
+  sed -n 's/.*"index": {"path": "[^"]*", "present": \([a-z]*\), "entries": \([0-9]*\)}.*/\1|\2/p' "$1" 2>/dev/null | head -1
+}
+
+_key_ctx() { # <keyfile> -> present|head|worklog_ts
+  sed -n 's/.*"context-branch": {"ref": "[^"]*", "present": \([a-z]*\), "head": "\([0-9a-f]*\)", "worklog_ts": \([0-9]*\)}.*/\1|\2|\3/p' "$1" 2>/dev/null | head -1
+}
+
+# ── the verdict state, filled by _grade ─────────────────────────────────────────
+VERDICT="RED"
+GRADED=0
+RECOVERED=0
+MISS_LINES=""     # human, one per lost thing
+MISS_IDS=""       # space-separated, for the log
+ANSWER_JSON=""
+LAYER_JSON=""
+L_CKPT="ok"; L_INDEX="n/a"; L_CTX="n/a"
+SAVED_HEAD=""; CUR_HEAD=""; CKPT_TS=""
+
+_miss() { # <what> <layer> <detail>
+  MISS_LINES="${MISS_LINES}  - ${1} — layer=${2}: ${3}"$'\n'
+  MISS_IDS="${MISS_IDS}${1} "
+}
+
+_layer_json() { # <layer> <status> <detail>
+  [ -n "$LAYER_JSON" ] && LAYER_JSON="${LAYER_JSON},"$'\n'
+  LAYER_JSON="${LAYER_JSON}    {\"layer\": \"$1\", \"status\": \"$2\", \"detail\": \"$(rc_json_esc "$3")\"}"
+}
+
+# Grade the stack. Returns 0 GREEN / 1 RED. Never exits, never crashes on garbage.
+_grade() { # <repo>
+  local repo="$1" ckpt key line id layer dig len back bdig alen
+  local ipresent ientries inow cpresent chead cts
+
+  ckpt="$(rc_ckpt_path "$repo")"
+  key="$(rc_key_path "$repo")"
+
+  # 1. the carrier itself
+  if [ ! -f "$ckpt" ]; then
+    L_CKPT="lost"
+    _miss "checkpoint" "checkpoint" "$ckpt does not exist — there is no forward state to resume from"
+    _layer_json checkpoint lost "$ckpt absent"
+    return 1
+  fi
+
+  # 2. the key. No key means nothing can be graded, which is a RED and not a skip:
+  #    an unverified resume is indistinguishable from a lossy one.
+  if [ ! -f "$key" ]; then
+    _miss "answer-key" "checkpoint" "no answer key at $key — the last save either failed its completeness gate or never ran, so this restart cannot be verified lossless"
+    _layer_json checkpoint unverifiable "no $key"
+    return 1
+  fi
+
+  # 3. the key must parse, and must carry every category. Anything less is corrupt,
+  #    and a corrupt key is graded as a loss rather than trusted or ignored.
+  local answers count
+  answers="$(_key_answers "$key")"
+  count="$(printf '%s' "$answers" | grep -c . 2>/dev/null)"
+  [ -n "$count" ] || count=0
+  local want
+  want="$(printf '%s\n' $RC_IDS | grep -c .)"
+  if [ "$count" -lt "$want" ]; then
+    _miss "answer-key" "checkpoint" "the answer key at $key is unreadable or incomplete ($count of $want categories parsed) — it cannot grade this restart"
+    _layer_json checkpoint corrupt "key parsed $count/$want answers"
+    return 1
+  fi
+
+  CKPT_TS="$(_key_str "$key" checkpoint_ts)"
+  SAVED_HEAD="$(_key_str "$key" head)"
+  CUR_HEAD="$(git -C "$repo" rev-parse --short HEAD 2>/dev/null || echo none)"
+
+  # 4. grade every category against the digest taken while the answer was still known
+  while IFS='|' read -r id layer dig len; do
+    [ -n "$id" ] || continue
+    GRADED=$((GRADED + 1))
+    back="$(rc_field "$ckpt" "$(rc_label "$id" 2>/dev/null)")"
+    alen="$(printf '%s' "$back" | rc_normalize | wc -c | tr -d ' ')"
+    [ -n "$alen" ] || alen=0
+    local status="ok"
+    if [ -z "$back" ]; then
+      status="absent"
+      L_CKPT="lossy"
+      _miss "$id" "checkpoint" "$(rc_gloss "$id") — the field is absent from $ckpt"
+    else
+      bdig="$(printf '%s' "$back" | rc_digest)" || bdig=""
+      if [ -z "$bdig" ]; then
+        status="unverifiable"
+        L_CKPT="unverifiable"
+        _miss "$id" "checkpoint" "no sha256 on this machine, so the recovered answer cannot be verified against the key"
+      elif [ "$bdig" != "$dig" ]; then
+        status="altered"
+        L_CKPT="lossy"
+        _miss "$id" "checkpoint" "$(rc_gloss "$id") — the value in $ckpt is not the one that was saved"
+      else
+        RECOVERED=$((RECOVERED + 1))
+      fi
+    fi
+    [ -n "$ANSWER_JSON" ] && ANSWER_JSON="${ANSWER_JSON},"$'\n'
+    ANSWER_JSON="${ANSWER_JSON}    {\"id\": \"$id\", \"layer\": \"$layer\", \"status\": \"$status\", \"answer_len\": $alen, \"saved_len\": ${len:-0}}"
+  done <<ANSWERS
+$answers
+ANSWERS
+  _layer_json checkpoint "$L_CKPT" "$RECOVERED/$GRADED categories recovered from $ckpt"
+
+  # 5. the index layer. Graded on its own because the checkpoint CARRIES what the
+  #    index SOURCED: a store that was deleted or pruned since the save has lost
+  #    observations this checkpoint can no longer be rebuilt from, even while every
+  #    field still reads back clean.
+  local ikey
+  ikey="$(_key_index "$key")"
+  ipresent="${ikey%%|*}"; ientries="${ikey##*|}"
+  [ -n "$ipresent" ] || ipresent="false"
+  case "$ientries" in ''|*[!0-9]*) ientries=0 ;; esac
+  if [ "$ipresent" = "true" ]; then
+    inow="$(rc_notes_count "$repo")"
+    case "$inow" in ''|*[!0-9]*) inow=0 ;; esac
+    if [ "$inow" -eq 0 ]; then
+      L_INDEX="lost"
+      _miss "observation-store" "index" "$(rc_notes_path "$repo") held $ientries observation(s) at save time and is now gone — that knowledge is unrecoverable"
+    elif [ "$inow" -lt "$ientries" ]; then
+      L_INDEX="pruned"
+      _miss "observation-store" "index" "$(rc_notes_path "$repo") has been pruned from $ientries to $inow observation(s) since the save"
+    else
+      L_INDEX="ok"
+    fi
+    _layer_json index "$L_INDEX" "$inow observation(s), $ientries at save"
+  else
+    _layer_json index n/a "no observation store at save time"
+  fi
+
+  # 6. the context branch. Absent-by-design is NOT a miss — context-sync is opt-out
+  #    for public repos, and a gate that is permanently red is a gate nobody reads.
+  #    Present-then-vanished, or rewound to an older worklog, IS a miss.
+  local ckey
+  ckey="$(_key_ctx "$key")"
+  cpresent="${ckey%%|*}"
+  chead="$(printf '%s' "$ckey" | cut -d'|' -f2)"
+  cts="$(printf '%s' "$ckey" | cut -d'|' -f3)"
+  case "$cts" in ''|*[!0-9]*) cts=0 ;; esac
+  if [ "$cpresent" = "true" ]; then
+    rc_ctx_branch "$repo"
+    if [ "$RC_CB_PRESENT" != "yes" ]; then
+      L_CTX="lost"
+      _miss "context-branch" "context-branch" "refs/heads/hmd/context existed at save time (${chead}) and is gone — the shared worklog layer no longer backs this resume"
+    elif [ "${RC_CB_TS:-0}" -lt "$cts" ] 2>/dev/null; then
+      L_CTX="stale"
+      _miss "context-branch" "context-branch" "refs/heads/hmd/context has rewound — its worklog is older than the one recorded at save time"
+    else
+      L_CTX="ok"
+    fi
+    _layer_json context-branch "$L_CTX" "ref present=$RC_CB_PRESENT, worklog_ts=${RC_CB_TS:-0} (saved $cts)"
+  else
+    _layer_json context-branch n/a "no context branch at save time (context-sync not in use here)"
+  fi
+
+  [ -z "$MISS_LINES" ]
+}
+
+# ── the log: the streak IS the receipt ──────────────────────────────────────────
+
+_log_append() { # <repo> <verdict>
+  local repo="$1" verdict="$2" home log
+  # A repo that does not exist gets no log directory conjured for it.
+  [ -d "$repo" ] || return 0
+  home="$(rc_home "$repo")"
+  mkdir -p "$home" 2>/dev/null || return 0
+  log="$(rc_log_path "$repo")"
+  # Ids and layers only — never answer text. The log is a receipt, not a second
+  # copy of the knowledge, and it must stay safe to read anywhere.
+  printf '{"ts": %s, "utc": "%s", "verdict": "%s", "graded": %s, "recovered": %s, "misses": "%s", "head": "%s"}\n' \
+    "$(date +%s 2>/dev/null || echo 0)" \
+    "$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo unknown)" \
+    "$verdict" "$GRADED" "$RECOVERED" \
+    "$(rc_json_esc "$(printf '%s' "$MISS_IDS" | sed -e 's/ $//')")" \
+    "$(rc_json_esc "$CUR_HEAD")" \
+    >> "$log" 2>/dev/null || return 0
+}
+
+_green_streak() { # <repo> -> consecutive GREENs counting back from the latest run
+  local log n=0 line
+  log="$(rc_log_path "$1")"
+  [ -f "$log" ] || { printf '0'; return 0; }
+  while IFS= read -r line; do
+    case "$line" in
+      *'"verdict": "GREEN"'*) n=$((n + 1)) ;;
+      *) break ;;
+    esac
+  done <<STREAK
+$(tail -100 "$log" 2>/dev/null | sed -n '1!G;h;$p')
+STREAK
+  printf '%s' "$n"
+}
+
+# ── rendering ───────────────────────────────────────────────────────────────────
+# Cost is a design constraint, not an afterthought: this runs at every session
+# start, and a verdict that costs meaningful context would defeat the restart it
+# exists to make cheap. A green verdict is ONE line.
+
+_render_human() { # <repo> <streak>
+  if [ "$VERDICT" = "GREEN" ]; then
+    printf '[heimdall] resume probe GREEN — %s/%s never-lose categories recovered from the stack (checkpoint %s · index %s · context-branch %s). Restart is lossless. Streak: %s green.\n' \
+      "$RECOVERED" "$GRADED" "$L_CKPT" "$L_INDEX" "$L_CTX" "$2"
+    return 0
+  fi
+  printf '[heimdall] resume probe RED — %s of %s never-lose categories did NOT survive the restart. This is a bug in the MEMORY STACK, not a probe failure:\n' \
+    "$((GRADED - RECOVERED))" "$GRADED"
+  printf '%s' "$MISS_LINES"
+  printf '  Do not treat this restart as lossless. Fix the named layer, then: heimdall-checkpoint write %s && heimdall-resume-probe run --repo %s\n' "$1" "$1"
+}
+
+_render_json() { # <repo> <streak>
+  printf '{\n'
+  printf '  "schema": "hmd-resume-probe@1",\n'
+  printf '  "verdict": "%s",\n' "$VERDICT"
+  printf '  "repo": "%s",\n' "$(rc_json_esc "$1")"
+  printf '  "graded": %s,\n' "$GRADED"
+  printf '  "recovered": %s,\n' "$RECOVERED"
+  printf '  "green_streak": %s,\n' "$2"
+  printf '  "checkpoint_ts": "%s",\n' "$(rc_json_esc "$CKPT_TS")"
+  printf '  "drift": {"saved_head": "%s", "current_head": "%s", "head_moved": %s},\n' \
+    "$(rc_json_esc "$SAVED_HEAD")" "$(rc_json_esc "$CUR_HEAD")" \
+    "$([ "$SAVED_HEAD" = "$CUR_HEAD" ] && printf false || printf true)"
+  printf '  "answers": [\n%s\n  ],\n' "$ANSWER_JSON"
+  printf '  "layers": [\n%s\n  ],\n' "$LAYER_JSON"
+  printf '  "misses": "%s"\n' "$(rc_json_esc "$(printf '%s' "$MISS_LINES" | rc_flatten)")"
+  printf '}\n'
+}
+
+# ── verbs ───────────────────────────────────────────────────────────────────────
+
+cmd_run() {
+  local repo="$PWD" json=0 verbose=0 raw
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repo) raw="${2:-}"; shift 2 || shift $# ;;
+      --json) json=1; shift ;;
+      --verbose|-v) verbose=1; shift ;;
+      *) echo "[heimdall] resume probe: unknown option '$1'" >&2; return 64 ;;
+    esac
+  done
+  if [ -n "${raw:-}" ]; then
+    repo="$(cd "$raw" 2>/dev/null && pwd)" || repo=""
+    if [ -z "$repo" ]; then
+      # A repo path that cannot be entered is still a verdict, never a crash: this
+      # runs at session start and must not take the session down with it.
+      VERDICT="RED"
+      MISS_LINES="  - repo — layer=checkpoint: cannot read $raw, so the memory stack cannot be graded there"$'\n'
+      if [ "$json" = "1" ]; then _render_json "$raw" 0; else _render_human "$raw" 0; fi
+      return 1
+    fi
+  fi
+
+  if _grade "$repo"; then VERDICT="GREEN"; else VERDICT="RED"; fi
+  _log_append "$repo" "$VERDICT"
+  local streak
+  streak="$(_green_streak "$repo")"
+
+  if [ "$json" = "1" ]; then
+    _render_json "$repo" "$streak"
+  else
+    _render_human "$repo" "$streak"
+    if [ "$verbose" = "1" ] && [ "$VERDICT" = "GREEN" ]; then
+      local id
+      for id in $RC_IDS; do
+        printf '  ok %-16s %s\n' "$id" "$(rc_gloss "$id")"
+      done
+    fi
+  fi
+  [ "$VERDICT" = "GREEN" ]
+}
+
+cmd_log() {
+  local repo="$PWD" limit=10 raw log total greens reds streak
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repo)  raw="${2:-}"; shift 2 || shift $# ;;
+      --limit) limit="${2:-10}"; shift 2 || shift $# ;;
+      *) echo "[heimdall] resume probe: unknown option '$1'" >&2; return 64 ;;
+    esac
+  done
+  [ -n "${raw:-}" ] && { repo="$(cd "$raw" 2>/dev/null && pwd)" || repo="$raw"; }
+  log="$(rc_log_path "$repo")"
+  if [ ! -f "$log" ]; then
+    echo "[heimdall] no resume-probe log at $log — no restart has been verified in this repo yet."
+    return 0
+  fi
+  total="$(grep -c . "$log" 2>/dev/null)";              total="${total:-0}"
+  greens="$(grep -c '"verdict": "GREEN"' "$log" 2>/dev/null)"; greens="${greens:-0}"
+  reds="$(grep -c '"verdict": "RED"' "$log" 2>/dev/null)";     reds="${reds:-0}"
+  streak="$(_green_streak "$repo")"
+  printf '[heimdall] resume-probe receipts — %s runs, %s GREEN, %s RED. Current streak: %s green.\n' \
+    "$total" "$greens" "$reds" "$streak"
+  tail -"$limit" "$log" 2>/dev/null | sed -n \
+    's/.*"utc": "\([^"]*\)".*"verdict": "\([A-Z]*\)", "graded": \([0-9]*\), "recovered": \([0-9]*\), "misses": "\([^"]*\)".*/  \1 \2 \4\/\3 \5/p'
+}
+
+case "${1:-help}" in
+  run) shift; cmd_run "$@" ;;
+  log) shift; cmd_log "$@" ;;
+  help|--help|-h)
+    cat <<'USAGE'
+heimdall-resume-probe — prove a restart lost nothing, before any work is done.
+
+Usage:
+  heimdall-resume-probe run [--repo DIR] [--json] [--verbose]
+      Answer the six never-lose questions from the persisted stack alone and grade
+      them against .planning/RESUME-KEY.json, which bin/heimdall-checkpoint wrote at
+      SAVE time — while the knowledge was still present. Exit 0 GREEN, 1 RED.
+
+  heimdall-resume-probe log [--repo DIR] [--limit N]
+      The receipts. A streak of greens is the evidence that restarting is safe; the
+      first red names exactly which layer of the memory stack to fix.
+
+Every RED names the failing layer — checkpoint, index, or context-branch — because a
+miss here is a bug in the memory stack, not a probe failure. A probe that cannot run
+is a RED, never a skip.
+USAGE
+    ;;
+  *)
+    echo "[heimdall] resume probe: unknown command '${1}'. Try: heimdall-resume-probe help" >&2
+    exit 64
+    ;;
+esac
