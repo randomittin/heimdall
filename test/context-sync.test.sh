@@ -40,6 +40,7 @@ PY="$(command -v python3 || command -v python)"
 [ -x "$STATE_BIN" ] || { echo "FATAL: $STATE_BIN not executable" >&2; exit 2; }
 
 WORK="$(mktemp -d)"
+[ -n "$WORK" ] || { echo "FATAL: WORK path empty (mktemp failed)" >&2; exit 2; }
 trap 'rm -rf "$WORK"' EXIT
 
 # A REAL throwaway repo wired to a REAL local bare remote (file path — no network).
@@ -48,6 +49,7 @@ new_repo_with_remote() {
   local name="$1"
   local repo="$WORK/$name"
   local bare="$WORK/$name.git"
+  [ -n "$bare" ] || { echo "FATAL: bare path empty" >&2; exit 1; }
   git init -q --bare "$bare"
   mkdir -p "$repo/.planning" "$repo/.heimdall"
   git -C "$repo" init -q

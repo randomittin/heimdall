@@ -104,6 +104,7 @@ new_repo() {
   local name="$1" rt="$2"
   local repo="$WORK/$name"
   local bare="$WORK/$name.git"
+  [ -n "$bare" ] || { echo "FATAL: bare path empty" >&2; exit 1; }
   git init --bare -q "$bare"
   mkdir -p "$repo"
   git -C "$repo" init -q
@@ -136,6 +137,7 @@ new_tinymath_repo() {
   local name="$1"
   local repo="$WORK/$name"
   local bare="$WORK/$name.git"
+  [ -n "$bare" ] || { echo "FATAL: bare path empty" >&2; exit 1; }
   git init --bare -q "$bare"
   mkdir -p "$repo/tinymath" "$repo/tests"
   git -C "$repo" init -q

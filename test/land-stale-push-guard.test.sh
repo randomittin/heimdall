@@ -37,6 +37,7 @@ bad() { FAIL=$((FAIL+1)); printf "  \033[31mFAIL\033[0m %s\n" "$1"; }
 command -v jq >/dev/null 2>&1 || { echo "FATAL: jq required"; exit 2; }
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/hmd-land-stale-XXXXXX")"
+[ -n "$WORK" ] || { echo "FATAL: WORK path empty (mktemp failed)" >&2; exit 2; }
 trap 'rm -rf "$WORK"' EXIT
 
 # mkrepo NAME — bare upstream + clone with main pushed + a feature branch checked
@@ -44,6 +45,7 @@ trap 'rm -rf "$WORK"' EXIT
 mkrepo() {
   local n="$1" bare clone
   bare="$WORK/$n.git"; clone="$WORK/$n"
+  [ -n "$bare" ] || { echo "FATAL: bare path empty" >&2; exit 1; }
   git init -q --bare "$bare"
   git clone -q "$bare" "$clone" 2>/dev/null
   git -C "$clone" config user.email land@test.local

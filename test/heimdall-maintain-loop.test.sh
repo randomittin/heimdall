@@ -46,6 +46,7 @@ PY="$(command -v python3 || command -v python)"
 [ -f "$LIB" ] || { echo "FATAL: $LIB missing" >&2; exit 2; }
 
 WORK="$(mktemp -d -t "maintain-loop-test.$(printf 'X%.0s' 1 2 3 4 5 6)")"
+[ -n "$WORK" ] || { echo "FATAL: WORK path empty (mktemp failed)" >&2; exit 2; }
 trap 'rm -rf "$WORK"' EXIT
 
 export PYTHONPATH="$ROOT/bin/lib:${PYTHONPATH:-}"
@@ -169,7 +170,9 @@ R5="$(new_repo checkpoint)"; enable_state "$R5" true 600000; seed "$R5" 5
 # loop HONORS pr_opened=True -> tally pr=1. (Without a token open_pr is record-only and
 # pr_opened is honestly False — no real PR to count.) This keeps section (6)'s "1 PR"
 # heartbeat assertion a genuine production observable, not the old hard-coded fake.
-R5BARE="$WORK/checkpoint.origin.git"; git init --bare -q "$R5BARE"
+R5BARE="$WORK/checkpoint.origin.git"
+[ -n "$R5BARE" ] || { echo "FATAL: R5BARE path empty" >&2; exit 1; }
+git init --bare -q "$R5BARE"
 git -C "$R5" config commit.gpgsign false
 git -C "$R5" remote add origin "$R5BARE"
 PRBIN="$WORK/prbin"; mkdir -p "$PRBIN"
@@ -471,11 +474,13 @@ if [ "\${1:-}" = "issue" ] && [ "\${2:-}" = "list" ]; then
 fi
 if [ "\${1:-}" = "repo" ] && [ "\${2:-}" = "clone" ]; then
   slug="\$3"; dest="\$4"
+  [ -n "\$dest" ] || { echo "FATAL: dest path empty" >&2; exit 1; }
   # HERMETIC ORIGIN: a LOCAL BARE repo stands in for GitHub as \`origin\` so bug #21's
   # real \`git push\` of the heimdall/* branch (open_pr commits+pushes BEFORE gh pr create)
   # lands with NO network — mirrors issue-pr.test.sh §6. A github.com URL here makes
   # open_pr's push hit the real network and fail auth (never hermetic, never green).
   bare="\${dest}.origin.git"
+  [ -n "\$bare" ] || { echo "FATAL: bare path empty" >&2; exit 1; }
   git init -q --bare "\$bare"
   mkdir -p "\$dest"
   git init -q "\$dest"
