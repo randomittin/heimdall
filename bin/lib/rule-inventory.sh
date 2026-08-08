@@ -76,6 +76,64 @@ AGENTS.md|house-convention|A convention about how a human or model should work i
 TBL
 }
 
+# ── enforcer existence ───────────────────────────────────────────────────────
+# A CHECKED verdict names a falsifier. If that file is not on disk, NOTHING
+# enforces the rule and the verdict is an overclaim — the exact failure this
+# inventory exists to catch, living inside the inventory. So the name is
+# resolved against the filesystem, never trusted.
+#
+# THE ENFORCER FIELD is "<path>[ <human descriptor>]". The hooks rows name
+# hooks/hooks.json plus WHICH hook inside it; the leading path is the only part
+# a filesystem can confirm, so that is what is confirmed.
+#
+# RESOLVED AGAINST HEIMDALL'S OWN CHECKOUT, never the scanned rulebook. The
+# table hardcodes this repo's suites, hooks and tools, so pointing the extractor
+# at another project must not report every enforcer missing — that would be a
+# false NON_VERIFIED, which is its own kind of lie. `pwd -P` because the suites
+# symlink bin/lib into fixture trees: the enforcers live where the code really
+# is, not where it was reached from.
+RULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+RULE_ENFORCER_ROOT="${RULE_ENFORCER_ROOT:-$(cd "$RULE_LIB_DIR/../.." && pwd -P)}"
+
+# rule_enforcer_path <enforcer-field> -> the on-disk path it names
+rule_enforcer_path() { printf '%s' "${1%% *}"; }
+
+# rule_enforcer_present <root> <enforcer-field> -> 0 when the named file exists
+rule_enforcer_present() {
+  local p
+  p="$(rule_enforcer_path "$2")"
+  [ -n "$p" ] && [ -e "$1/$p" ]
+}
+
+# rule_enforcer_audit [root] -> one row per verdict-table entry:
+#   <PRESENT|MISSING>\t<enforcer path>\t<rule pattern>
+# exits: 0 every enforcer on disk · 1 at least one missing · 3 NON_VERIFIED
+#
+# ANTI-VACUOUS: a table that yields zero rows is a BROKEN table, not a clean
+# one. An audit that scanned nothing would report "no missing enforcers" — the
+# vacuous green this whole file was written to refuse — so it is loud instead.
+rule_enforcer_audit() {
+  local root="${1:-$RULE_ENFORCER_ROOT}" pat enf rows=0 missing=0
+  while IFS='|' read -r pat enf; do
+    [ -n "${pat:-}" ] || continue
+    rows=$((rows + 1))
+    if rule_enforcer_present "$root" "$enf"; then
+      printf 'PRESENT\t%s\t%s\n' "$(rule_enforcer_path "$enf")" "$pat"
+    else
+      missing=$((missing + 1))
+      printf 'MISSING\t%s\t%s\n' "$(rule_enforcer_path "$enf")" "$pat"
+    fi
+  done <<EOF
+$(rule_checked_table)
+EOF
+  if [ "$rows" -eq 0 ]; then
+    printf 'NON_VERIFIED\tthe verdict table yielded zero rows — the enforcer audit scanned nothing, which is a broken table and never a clean one\n' >&2
+    return 3
+  fi
+  [ "$missing" -eq 0 ] || return 1
+  return 0
+}
+
 # ── extraction ───────────────────────────────────────────────────────────────
 # rule_extract <repo> [sources...]  ->  <file>\t<line>\t<text>
 rule_extract() {
