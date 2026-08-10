@@ -23,6 +23,13 @@
 #   8. The rule text encodes the post's four pre-registered outcomes, and
 #      rule_hash is stable across invocations.
 #   9. DEPEND, DON'T CLONE — the harness never installs or vendors Headroom.
+#  10. CLAUSE (a) IS IMPLEMENTED, NOT JUST PRINTED — a decision metric that was
+#      never MEASURED in an arm resolves to INDETERMINATE and never to KEEP.
+#      Its inseparable other half: a genuinely-measured run still resolves, so
+#      the guard cannot be satisfied by answering `indeterminate` to everything.
+#  11. A missing or null golden result is a VERDICT, not a Python traceback.
+#  12. `verdict` never prints an empty line — an uncomputable comparison fails
+#      CLOSED with a named error and a nonzero exit.
 #
 # Usage:  bash test/headroom-ab.test.sh   (exit 0 = all guarantees hold)
 set -uo pipefail
@@ -228,6 +235,55 @@ grep -q 'why a figure is unavailable' <<<"$rep" \
   && ok "the report explains WHY each figure is unavailable" \
   || bad "the report never explains its unavailable figures"
 
+# ── 6b. AN UNRECORDED METRIC IS EXPLAINED TOO ───────────────────────────────
+# An arm can omit a metric KEY outright — that is what a snapshot taken by a
+# partial or older collector looks like, and it is not an error. The row still
+# renders `unavailable`, so the footnote has to cover it: an `unavailable` with
+# no reason beside it is exactly the shrug this report exists to refuse.
+#
+# This is the regression guard for a reasons list built by walking the entries
+# an arm HAPPENED to carry, which by construction can never mention a key that
+# is not there. With every labelled-cost key deleted, that shape emits nothing
+# at all: six rows say `unavailable` and the explanation block disappears
+# silently, which reads as a receipt that simply had nothing to explain.
+jq 'del(.metrics.tokens_in, .metrics.tokens_out, .metrics.cost_usd,
+        .metrics.agent_deaths, .metrics.gate_retries, .metrics.time_to_green_mins)' \
+  "$TMP/neu-a.json" > "$TMP/gap-a.json"
+jq 'del(.metrics.tokens_in, .metrics.tokens_out, .metrics.cost_usd,
+        .metrics.agent_deaths, .metrics.gate_retries, .metrics.time_to_green_mins)' \
+  "$TMP/neu-b.json" > "$TMP/gap-b.json"
+rep="$("$AB" report --before "$TMP/gap-a.json" --after "$TMP/gap-b.json" 2>&1 | plain)"
+gap_tok="$(printf '%s\n' "$rep" | grep -E '^[[:space:]]+tokens in' | head -1)"
+printf '%s' "$gap_tok" | grep -q 'unavailable' \
+  && ok "a metric key the arm never recorded still renders 'unavailable'" \
+  || bad "an unrecorded metric did not render unavailable: '$gap_tok'"
+printf '%s' "$rep" | grep -q 'why a figure is unavailable' \
+  && ok "…and the explanation block SURVIVES — it is not built from present keys" \
+  || bad "every unavailable figure was unrecorded and the explanation block vanished"
+printf '%s' "$rep" | grep -q 'tokens_in' \
+  && ok "the explanation names tokens_in — a key no arm ever recorded" \
+  || bad "the explanation never names tokens_in: its 'unavailable' is a bare shrug"
+printf '%s' "$rep" | grep -q 'cost_usd' \
+  && ok "the explanation names cost_usd as well" \
+  || bad "the explanation never names cost_usd"
+
+# The explanation must also cover a metric that is missing from ONE arm only —
+# a row goes blank on either arm's absence, so covering arm B alone is not enough.
+jq 'del(.metrics.tokens_in)' "$TMP/neu-a.json" > "$TMP/half-a.json"
+rep="$("$AB" report --before "$TMP/half-a.json" --after "$TMP/neu-b.json" 2>&1 | plain)"
+printf '%s' "$rep" | grep -q 'tokens_in' \
+  && ok "a key missing from arm A ALONE is still named in the explanation" \
+  || bad "arm A's missing key rendered unavailable with no explanation"
+
+# A reasons query that FAILS must say so, not leave the block silently absent.
+# `.metrics` as a non-object is the shape that breaks the walk; the report is
+# still expected to state that it could not explain, rather than print nothing.
+jq '.metrics = "corrupt"' "$TMP/neu-b.json" > "$TMP/bad-b.json"
+rep="$("$AB" report --before "$TMP/neu-a.json" --after "$TMP/bad-b.json" 2>&1 | plain)"
+printf '%s' "$rep" | grep -qi 'could not be computed\|why a figure is unavailable' \
+  && ok "an unreadable metrics block is reported, never silently skipped" \
+  || bad "a failed explanation query left NO trace in the report"
+
 # ── 7. REPRODUCIBILITY ──────────────────────────────────────────────────────
 # A receipt whose numbers move between runs is not a receipt.
 a="$("$AB" stats --before "$TMP/deg-a.json" --after "$TMP/deg-b.json" 2>/dev/null)"
@@ -276,6 +332,191 @@ if command -v headroom >/dev/null 2>&1; then
 else
   ok "headroom absent from PATH and every assertion above still ran — the 'before' arm works"
 fi
+
+# ── 10. CLAUSE (a): AN UNMEASURED DECISION METRIC IS INDETERMINATE ──────────
+# The rule's FIRST clause — "a decision metric unavailable in either arm ->
+# INDETERMINATE … an absent measurement is NOT evidence of success and must
+# never resolve to KEEP by default" — was printed by `preregister` and never
+# implemented. Only ONE availability case was checked (no task ran in both
+# arms), so an arm that swept ZERO mutants sailed past every other clause and
+# landed on KEEP, publishing the POSITIVE receipt for a metric it never measured.
+#
+# THE TWO HALVES ARE INSEPARABLE. 10a proves the blind arm now stops. 10b proves
+# a genuinely-measured run still resolves; without it, `verdict() { echo
+# indeterminate; }` would pass 10a and gut the harness.
+
+# A snapshot whose per_task records are supplied verbatim — the shapes mk_snap
+# cannot express: a PASSING golden that swept zero mutants, and a task carrying
+# no golden result at all.
+mk_raw() {  # path arm per_task_json
+  jq -n --arg arm "$2" --argjson pt "$3" '
+    { schema:"heimdall-headroom-ab/v2", arm:$arm, ts:"2026-08-04T00:00:00Z",
+      repo:"/fixture/repo", window_days:7, rule_hash:"fixture-hash",
+      per_task: $pt,
+      metrics: {
+        oracle_pass_rate:   { value:null, provenance:"unavailable", n:0, reason:"fixture" },
+        falsify_survival:   { value:null, provenance:"unavailable", n:0, reason:"fixture" },
+        agent_deaths:       { value:null, provenance:"unavailable", reason:"fixture" },
+        gate_retries:       { value:null, provenance:"unavailable", reason:"fixture" },
+        time_to_green_mins: { value:null, provenance:"unavailable", reason:"fixture" },
+        tokens_in:          { value:null, provenance:"unavailable", reason:"fixture" },
+        tokens_out:         { value:null, provenance:"unavailable", reason:"fixture" },
+        cost_usd:           { value:null, provenance:"unavailable", reason:"fixture" } } }' > "$1"
+}
+# $1 tasks, every golden PASSING, each sweeping $2 mutants with no survivors.
+pt_swept()    { jq -cn --argjson n "$1" --argjson m "$2" \
+  '[range(0;$n) | {domain:"d\(.)", golden_pass:1, mutants:$m, survived:0}]'; }
+pt_nogold()   { jq -cn --argjson n "$1" \
+  '[range(0;$n) | {domain:"d\(.)", mutants:5, survived:0}]'; }
+pt_nullgold() { jq -cn --argjson n "$1" \
+  '[range(0;$n) | {domain:"d\(.)", golden_pass:null, mutants:5, survived:0}]'; }
+
+# ── 10a. THE REPRODUCER: arm B swept ZERO mutants ───────────────────────────
+mk_raw "$TMP/zm-a.json" before "$(pt_swept 30 10)"
+mk_raw "$TMP/zm-b.json" after  "$(pt_swept 30 0)"
+got="$("$AB" verdict --before "$TMP/zm-a.json" --after "$TMP/zm-b.json" 2>/dev/null)"
+[ "$got" = "indeterminate" ] \
+  && ok "arm B swept ZERO mutants -> verdict '$got' (clause (a))" \
+  || bad "arm B swept zero mutants -> verdict '$got', expected 'indeterminate'"
+[ "$got" != "keep" ] \
+  && ok "a decision metric that was never measured never resolves to KEEP" \
+  || bad "zero mutants resolved to KEEP — an unmeasured metric sold as a pass"
+
+sj="$("$AB" stats --before "$TMP/zm-a.json" --after "$TMP/zm-b.json" 2>/dev/null)"
+[ "$(printf '%s' "$sj" | jq -r '.availability.falsify_survival.after.available')" = "false" ] \
+  && ok "stats records falsify survival as UNAVAILABLE in arm B" \
+  || bad "stats did not mark the blind arm unavailable"
+[ "$(printf '%s' "$sj" | jq -r '.availability.falsify_survival.before.available')" = "true" ] \
+  && ok "…and AVAILABLE in arm A, which really did sweep 300 mutants" \
+  || bad "arm A was wrongly marked unavailable"
+printf '%s' "$sj" | jq -r '.availability.falsify_survival.after.reason' | grep -q 'arm B' \
+  && ok "the availability reason names the ARM" \
+  || bad "the availability reason does not name the arm"
+printf '%s' "$sj" | jq -r '.availability.falsify_survival.after.reason' | grep -qi 'falsify survival' \
+  && ok "the availability reason names the METRIC" \
+  || bad "the availability reason does not name the metric"
+# The evidence of the blindness must survive onto the receipt, not be dropped.
+[ "$(printf '%s' "$sj" | jq -r '.falsify.mutants_before')" = "300" ] \
+  && ok "the receipt still carries arm A's 300 swept mutants" \
+  || bad "mutants_before was dropped from the indeterminate receipt"
+[ "$(printf '%s' "$sj" | jq -r '.falsify.mutants_after')" = "0" ] \
+  && ok "…beside arm B's 0 — the evidence FOR the verdict stays on the receipt" \
+  || bad "mutants_after was dropped from the indeterminate receipt"
+
+rep="$("$AB" report --before "$TMP/zm-a.json" --after "$TMP/zm-b.json" 2>&1 | plain)"
+printf '%s' "$rep" | grep -q 'VERDICT: INDETERMINATE' \
+  && ok "the blind-arm report renders VERDICT: INDETERMINATE" \
+  || bad "the blind-arm report did not render INDETERMINATE"
+printf '%s' "$rep" | grep -q 'NOT MEASURED' \
+  && ok "the report flags the metric NOT MEASURED beside the decision rows" \
+  || bad "the report never says the decision metric was not measured"
+printf '%s' "$rep" | grep -qi 'Publish NEITHER receipt' \
+  && ok "the blind-arm report withholds BOTH receipts" \
+  || bad "the blind-arm report does not withhold both receipts"
+if printf '%s' "$rep" | grep -q 'VERDICT: KEEP'; then
+  bad "the blind-arm report still renders VERDICT: KEEP"
+else
+  ok "the blind-arm report never renders KEEP"
+fi
+
+# ── 10b. PROVE-NARROW: a genuinely-measured run still resolves ──────────────
+mk_raw "$TMP/msr-a.json" before "$(pt_swept 40 5)"
+mk_raw "$TMP/msr-b.json" after  "$(pt_swept 40 5)"
+got="$("$AB" verdict --before "$TMP/msr-a.json" --after "$TMP/msr-b.json" 2>/dev/null)"
+[ "$got" = "keep" ] \
+  && ok "a MEASURED neutral run (200 mutants in both arms) still -> verdict '$got'" \
+  || bad "a measured neutral run -> '$got', expected 'keep' — the guard is too broad"
+sj="$("$AB" stats --before "$TMP/msr-a.json" --after "$TMP/msr-b.json" 2>/dev/null)"
+[ "$(printf '%s' "$sj" | jq -r '[.availability[][] | select(.available==false)] | length')" = "0" ] \
+  && ok "both decision metrics report AVAILABLE in both arms when both really ran" \
+  || bad "a fully-measured run still reported an unavailable metric"
+
+# The other half of narrow: a golden that FAILED legitimately sweeps 0 mutants —
+# bin/falsify emits 0/0 without a passing golden. That zero is EXPLAINED by a
+# measurement, and must not be laundered into 'indeterminate'; the degraded arm
+# still has to publish its NEGATIVE receipt.
+sj="$("$AB" stats --before "$TMP/deg-a.json" --after "$TMP/deg-b.json" 2>/dev/null)"
+[ "$(printf '%s' "$sj" | jq -r '.availability.falsify_survival.after.available')" = "true" ] \
+  && ok "a FAILED golden's zero mutants is explained, not counted as blindness" \
+  || bad "a measured golden failure was misread as an unmeasured falsify sweep"
+got="$("$AB" verdict --before "$TMP/deg-a.json" --after "$TMP/deg-b.json" 2>/dev/null)"
+[ "$got" = "unwrap" ] \
+  && ok "…so the degraded arm still resolves to '$got', not indeterminate" \
+  || bad "clause (a) swallowed a real degradation: verdict '$got'"
+
+# ── 11. A MISSING GOLDEN RESULT IS A VERDICT, NOT A TRACEBACK ───────────────
+# `bt[d]["golden_pass"]` on a snapshot missing the key raised KeyError: exit 1
+# with EMPTY stdout, which `verdict` piped into jq and printed as a BLANK line.
+mk_raw "$TMP/ng-a.json" before "$(pt_swept 30 5)"
+mk_raw "$TMP/ng-b.json" after  "$(pt_nogold 30)"
+got="$("$AB" verdict --before "$TMP/ng-a.json" --after "$TMP/ng-b.json" 2>/dev/null)"
+[ "$got" = "indeterminate" ] \
+  && ok "a MISSING golden result -> verdict '$got'" \
+  || bad "missing golden result -> verdict '$got', expected 'indeterminate'"
+err="$("$AB" verdict --before "$TMP/ng-a.json" --after "$TMP/ng-b.json" 2>&1 >/dev/null)"
+if printf '%s' "$err" | grep -q 'Traceback'; then
+  bad "a missing golden result still raises a Python traceback"
+else
+  ok "a missing golden result raises NO traceback — it is graded, not crashed on"
+fi
+sj="$("$AB" stats --before "$TMP/ng-a.json" --after "$TMP/ng-b.json" 2>/dev/null)"
+[ "$(printf '%s' "$sj" | jq -r '.availability.oracle_pass_rate.after.available')" = "false" ] \
+  && ok "stats marks the oracle pass-rate unavailable in the arm that lost it" \
+  || bad "the missing golden was not recorded as an availability failure"
+printf '%s' "$sj" | jq -r '.availability.oracle_pass_rate.after.reason' | grep -q 'arm B' \
+  && ok "the oracle availability reason names arm B" \
+  || bad "the oracle availability reason does not name the arm"
+
+mk_raw "$TMP/nl-b.json" after "$(pt_nullgold 30)"
+got="$("$AB" verdict --before "$TMP/ng-a.json" --after "$TMP/nl-b.json" 2>/dev/null)"
+[ "$got" = "indeterminate" ] \
+  && ok "a NULL golden result -> verdict '$got' (null is absence, not a fail)" \
+  || bad "null golden result -> verdict '$got', expected 'indeterminate'"
+
+# The report must not explain this as a pairing failure — there ARE 30 pairs.
+rep="$("$AB" report --before "$TMP/ng-a.json" --after "$TMP/ng-b.json" 2>&1 | plain)"
+if printf '%s' "$rep" | grep -q 'no paired tasks'; then
+  bad "the report blames a pairing failure on a run that paired 30 tasks"
+else
+  ok "the report does not invent a pairing failure to explain a missing golden"
+fi
+
+# ── 12. `verdict` NEVER PRINTS AN EMPTY LINE ────────────────────────────────
+# A blank verdict is the worst output this tool can emit: `$(… verdict …)` gives
+# "" and every comparison against it is false, so a caller silently takes
+# whichever branch it happened to write first.
+verdict_is_a_word() {  # before after label
+  local out rc
+  out="$("$AB" verdict --before "$1" --after "$2" 2>/dev/null)"; rc=$?
+  case "$out" in
+    keep|unwrap|underpowered|indeterminate)
+      ok "verdict on $3 is a word, never blank ('$out', exit $rc)" ;;
+    "") bad "verdict on $3 printed an EMPTY line (exit $rc)" ;;
+    *)  bad "verdict on $3 printed an unknown token '$out' (exit $rc)" ;;
+  esac
+}
+verdict_is_a_word "$TMP/zm-a.json"  "$TMP/zm-b.json"  "the zero-mutant arm"
+verdict_is_a_word "$TMP/ng-a.json"  "$TMP/ng-b.json"  "the missing-golden arm"
+verdict_is_a_word "$TMP/msr-a.json" "$TMP/msr-b.json" "the fully-measured arm"
+verdict_is_a_word "$TMP/emp-a.json" "$TMP/emp-b.json" "the unpaired arm"
+
+# …including when the statistics cannot be computed AT ALL. `require_snap` only
+# asserts `.metrics` exists, so a truncated arm whose per_task is not a list of
+# task records reaches the grader intact. It must fail CLOSED — a named error
+# and a nonzero exit — never a blank line with exit 0.
+jq -n '{schema:"heimdall-headroom-ab/v2", arm:"after", metrics:{}, per_task:["truncated"]}' \
+  > "$TMP/broken-b.json"
+out="$("$AB" verdict --before "$TMP/msr-a.json" --after "$TMP/broken-b.json" 2>/dev/null)"; rc=$?
+[ "$out" = "indeterminate" ] \
+  && ok "an uncomputable comparison prints 'indeterminate', not a blank line" \
+  || bad "an uncomputable comparison printed '$out'"
+[ "$rc" -ne 0 ] \
+  && ok "…and exits nonzero ($rc), so a caller cannot read it as a graded run" \
+  || bad "an uncomputable comparison exited 0 — it looks like a successful grade"
+err="$("$AB" verdict --before "$TMP/msr-a.json" --after "$TMP/broken-b.json" 2>&1 >/dev/null)"
+printf '%s' "$err" | grep -qi 'could not be computed' \
+  && ok "the computation failure is NAMED on stderr, not swallowed" \
+  || bad "the computation failure is silent on stderr"
 
 echo ""
 echo "headroom-ab.test.sh: $PASS passed, $FAIL failed."
