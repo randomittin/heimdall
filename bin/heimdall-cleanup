@@ -113,8 +113,16 @@ opted_out() {
 #                         so a test proves the reap SCOPE without signalling any real process.
 #   HMD_CLEANUP_OS        override for `uname -s`, so a test can pin the memory-probe path
 #                         (Darwin→sysmon) deterministically on any CI host.
+#   HMD_CLEANUP_PS_ROWS_FULL  file of `pid ppid pgid tty etime command…` rows, used instead of
+#                         live ps for the UNATTRIBUTED bare-python reap scope (that oracle needs
+#                         tty + age + pgid, which the plain row shape does not carry).
 PS_ROWS_FILE="${HMD_CLEANUP_PS_ROWS:-}"
+PS_ROWS_FULL_FILE="${HMD_CLEANUP_PS_ROWS_FULL:-}"
 KILL_CMD="${HMD_CLEANUP_KILL_CMD:-}"
+
+# how many unattributed bare-stdin python orphans it takes before --advise says anything.
+# hmd cannot prove these are its own, so the floor is a genuine PILE-UP, not a handful.
+BAREPY_ADVISE_MIN="${HMD_CLEANUP_BAREPY_ADVISE_MIN:-40}"
 
 # ── argv ─────────────────────────────────────────────────────────────────────────
 MODE="report"; JSON=0; QUIET=0; AUTO=0; QUICK=0; REPO=""; VERBOSE=0
@@ -167,6 +175,51 @@ _ps_rows() {
 # the reap SCOPE — delegated entirely to sysmon's matcher (single source of truth).
 _orphan_pids() { _ps_rows | "$SYSMON" --filter-orphans 2>/dev/null || true; }
 
+# ── the UNATTRIBUTED bare-stdin python orphans (`python3 -` at ppid 1) ───────────────────
+# These are the pile hmd used to be blind to: no script path, no marker, nothing in the command
+# line that proves whose they are. Scoping again routes through sysmon so detection and reaping
+# cannot diverge, and NOTHING here claims them as heimdall's.
+
+# rich `pid ppid pgid tty etime command…` rows — the reap oracle needs tty + age + pgid.
+_ps_rows_full() {
+  if [ -n "$PS_ROWS_FULL_FILE" ]; then cat "$PS_ROWS_FULL_FILE" 2>/dev/null; return 0; fi
+  ps -axo pid=,ppid=,pgid=,tty=,etime=,command= 2>/dev/null \
+    || ps -eo pid=,ppid=,pgid=,tty=,etime=,command= 2>/dev/null || true
+}
+
+# This reaper's own exclusion set — every ancestor pid up the tree, plus our pgid and sid, so
+# the session that INVOKED us can never be inside its own reap set. Identical in shape to
+# bin/heimdall-reap-idle's _self_exclude (the convention this repo already reaps by), and it
+# MERGES any operator-supplied HMD_BAREPY_SELF_EXCLUDE rather than replacing it.
+_barepy_self_exclude() {
+  local p="$$" acc="" guard=0 pgid sid
+  while [ -n "$p" ] && [ "$p" != "0" ] && [ "$guard" -lt 64 ]; do
+    acc="$acc $p"
+    p="$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')"
+    guard=$((guard+1))
+  done
+  pgid="$( (ps -o pgid= -p $$ 2>/dev/null || echo '') | tr -d ' ' )"
+  sid="$( (ps -o sess= -p $$ 2>/dev/null || echo '') | tr -d ' ' )"
+  printf '%s %s %s %s' "$acc" "$pgid" "$sid" "${HMD_BAREPY_SELF_EXCLUDE:-}"
+}
+
+# the guarded REAP set: aged past the floor, no controlling tty, outside our own tree.
+_barepy_reapable_pids() {
+  _ps_rows_full | HMD_BAREPY_SELF_EXCLUDE="$(_barepy_self_exclude)" \
+    "$SYSMON" --filter-reapable-python-orphans 2>/dev/null || true
+}
+
+# the DETECTED count. Prefers the figure sysmon already returned in the --json read that
+# _probe_memory performed (so the SessionStart path pays no second ps), and falls back to the
+# oracle when that read carried no such field — an older sysmon or a non-Darwin host must
+# degrade to a slower count, never to a silent zero. Reporting 0 because the cheap path was
+# unavailable would rebuild the exact blindness this field exists to remove.
+barepy_n=0; barepy_from_json=0   # filled by _probe_memory when sysmon's --json carries the field
+_barepy_count() {
+  if [ "$barepy_from_json" = 1 ]; then printf '%s\n' "$barepy_n"; return 0; fi
+  _ps_rows | "$SYSMON" --filter-bare-python-orphans 2>/dev/null | grep -c . || echo 0
+}
+
 # resident RAM (MB) held by a set of pids — the REAL memory a reap frees back (wired/swap
 # need a reboot; we never claim otherwise). 0 for synthetic test pids that don't exist.
 _rss_mb() {
@@ -207,6 +260,13 @@ _probe_memory() {
     wired_pct="$(_num "$(printf '%s' "$js" | sed -n 's/.*"wired_pct":\([0-9]*\).*/\1/p')")"
     swap_used_g="$(printf '%s' "$js" | sed -n 's/.*"swap_used_g":\([0-9.]*\).*/\1/p')"; [ -n "$swap_used_g" ] || swap_used_g=0
     swap_total_g="$(printf '%s' "$js" | sed -n 's/.*"swap_total_g":\([0-9.]*\).*/\1/p')"; [ -n "$swap_total_g" ] || swap_total_g=0
+    # the UNATTRIBUTED bare-stdin python orphan count, taken from the read we already paid
+    # for. barepy_from_json records whether the field was actually PRESENT: an older sysmon
+    # emits no such key, and treating that silence as 0 would rebuild the exact blindness
+    # this field exists to remove. _barepy_count falls back to the oracle when it is unset.
+    local bp
+    bp="$(printf '%s' "$js" | sed -n 's/.*"python_orphans_unattributed":\([0-9]*\).*/\1/p')"
+    if [ -n "$bp" ]; then barepy_n="$bp"; barepy_from_json=1; fi
     [ -n "$mem_status" ] || mem_status="ok"
     mem_desc="swap ${swap_used_g}G/${swap_total_g}G (${swap_pct}%) · wired ${wired_pct}%"
     return 0
@@ -374,12 +434,34 @@ _reboot_advisory() {
 #     the "restart is the fix" claim the full block exists to retract.
 # What it drops is explanation, not detection: every probe above still runs.
 _reboot_advisory_line() {
-  local orphans="$1" rss="$2" holders held=""
+  local orphans="$1" rss="$2" barepy holders held=""
+  barepy="$(_num "${3:-0}")"
   holders="$(_wired_holders 2>/dev/null || true)"
   [ -n "$holders" ] && held=" a persistent holder IS visible from here —"
+  # THE 2026-08-08 RETRACTION. On that day this line said "NOT heimdall" while 224 orphaned
+  # `python3 -` processes sat at ppid 1 — hmd's own heredocs, invisible to a matcher that
+  # requires a marker the shape cannot carry. The flat denial is now reserved for a process
+  # table with NOTHING unexplained in it. When unattributed orphans are present hmd says the
+  # honest thing instead: it has no ATTRIBUTABLE leak, and there is a pile it cannot claim
+  # either way. It never asserts ownership it cannot prove, and never denies one it cannot
+  # rule out. The remedy is offered only past the pile-up floor, because pointing an operator
+  # at a reaper over a handful of processes is how a real signal gets tuned out.
+  if [ "$orphans" -le 0 ] && [ "$barepy" -gt 0 ] 2>/dev/null; then
+    local remedy=" hmd will not reap them blindly."
+    [ "$barepy" -ge "$BAREPY_ADVISE_MIN" ] 2>/dev/null && \
+      remedy=" Reap only the aged+detached ones: heimdall-cleanup --apply ·"
+    printf '[heimdall] memory pressure HIGH (swap %sG/%sG = %s%%, wired %s%%) — no ATTRIBUTABLE hmd leak (~%sMB MEMORY axis), but %s unattributed bare-stdin python orphan(s) at ppid 1: ownership UNPROVEN, so hmd neither claims nor denies them.%s%s detail: heimdall-cleanup --advise --verbose\n' \
+      "$swap_used_g" "$swap_total_g" "$swap_pct" "$wired_pct" "$rss" "$barepy" "$remedy" "$held"
+    return 0
+  fi
   if [ "$orphans" -gt 0 ]; then
-    printf '[heimdall] memory pressure HIGH (swap %sG/%sG = %s%%, wired %s%%) — Part of it IS heimdall: %s orphaned hmd python holding ~%sMB (MEMORY axis). Reap hmd'\''s own leak FIRST: heimdall-cleanup --apply · a reboot is only a temporary reclaim ·%s detail: heimdall-cleanup --advise --verbose\n' \
-      "$swap_used_g" "$swap_total_g" "$swap_pct" "$wired_pct" "$orphans" "$rss" "$held"
+    # An attributable leak does not make the unattributed pile disappear; reaping hmd's own
+    # orphans and finding the pressure unchanged is exactly how an operator concludes hmd
+    # lied to them. So the second number rides along, still labelled unproven.
+    local also=""
+    [ "$barepy" -gt 0 ] 2>/dev/null && also=" + ${barepy} unattributed bare-stdin orphan(s), ownership unproven ·"
+    printf '[heimdall] memory pressure HIGH (swap %sG/%sG = %s%%, wired %s%%) — Part of it IS heimdall: %s orphaned hmd python holding ~%sMB (MEMORY axis).%s Reap hmd'\''s own leak FIRST: heimdall-cleanup --apply · a reboot is only a temporary reclaim ·%s detail: heimdall-cleanup --advise --verbose\n' \
+      "$swap_used_g" "$swap_total_g" "$swap_pct" "$wired_pct" "$orphans" "$rss" "$also" "$held"
   else
     printf '[heimdall] memory pressure HIGH (swap %sG/%sG = %s%%, wired %s%%) — NOT heimdall (no hmd python leak, ~%sMB MEMORY axis). Wired RAM is kernel-side: a reboot is only a temporary reclaim, removing the holder is the fix ·%s detail: heimdall-cleanup --advise --verbose\n' \
       "$swap_used_g" "$swap_total_g" "$swap_pct" "$wired_pct" "$rss" "$held"
@@ -492,6 +574,27 @@ do_apply() {
     fi
   fi
 
+  # ── the UNATTRIBUTED pile: MANUAL --apply only, and only the guarded subset ─────────────
+  # These are not provably hmd's, so the rules are deliberately stricter than above:
+  #   · --auto NEVER touches them. An unattended hook killing a process on a guess is worse
+  #     than the blindness it replaced — a wrong reap destroys someone's work silently.
+  #   · the scope comes from sysmon's reap oracle, which requires aged + detached + outside
+  #     this caller's own tree, so it is always a strict subset of what is merely detected.
+  #   · signalling is per-pid: a batched `kill pid pid pid…` was measured on 2026-08-08 to
+  #     leave the whole set alive when any one pid had already exited.
+  local bp_pids bp_n=0
+  if [ "$AUTO" != 1 ]; then
+    bp_pids="$(_barepy_reapable_pids)"
+    bp_n="$(printf '%s\n' "$bp_pids" | grep -c . || true)"; bp_n="$(_num "$bp_n")"
+    if [ "$bp_n" -gt 0 ]; then
+      local p
+      for p in $bp_pids; do
+        if [ -n "$KILL_CMD" ]; then $KILL_CMD "$p" 2>/dev/null || true
+        else kill -TERM "$p" 2>/dev/null || true; fi
+      done
+    fi
+  fi
+
   # disk: full gc (hmd's own worktrees/temp/logs/retired versions — each proof-gated).
   local receipt kb mb reclaim_mb
   receipt="$(_gc_run wet)"
@@ -510,8 +613,13 @@ do_apply() {
     return 0
   fi
 
+  # The two counts stay SEPARATE in the receipt for the same reason they are separate in the
+  # JSON: one number is provably heimdall's, the other is only ever "aged, detached, and not
+  # yours". Merging them would let a reap of unproven processes be reported as hmd cleaning
+  # up after itself.
   printf 'heimdall-cleanup --apply: reaped %d orphaned heimdall python (~%dMB resident freed; kernel-wired RAM is not heimdall'\''s to free), reclaimed ~%dMB disk.\n' \
     "$reaped" "$rss" "$reclaim_mb"
+  [ "$bp_n" -gt 0 ] && printf 'heimdall-cleanup --apply: also signalled %d UNATTRIBUTED bare-stdin python orphan(s) — aged, detached, outside this session'\''s tree. Ownership was never proven; they are reported as unattributed, not as heimdall'\''s.\n' "$bp_n"
   return 0
 }
 
@@ -553,7 +661,7 @@ do_advise() {
     _reboot_advisory "$orphans" "$rss" "$reclaim_mb"
     return 0
   fi
-  _reboot_advisory_line "$orphans" "$rss"
+  _reboot_advisory_line "$orphans" "$rss" "$(_barepy_count)"
   return 0
 }
 

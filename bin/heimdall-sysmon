@@ -29,6 +29,14 @@
 #   heimdall-sysmon --reap-hmd-orphans   kill heimdall's OWN orphaned python leak + its spawner
 #   heimdall-sysmon --filter-orphans     read `pid ppid command…` lines on stdin, print the pids
 #                                        the reaper WOULD target (the scoping oracle — testable)
+#   heimdall-sysmon --filter-bare-python-orphans      read `pid ppid command…` on stdin, print the
+#                                        pids of PPID=1 pythons running a BARE STDIN program
+#                                        (`python3 -`) that carry NO hmd marker — the honest
+#                                        UNATTRIBUTED count (see python_orphans_unattributed).
+#   heimdall-sysmon --filter-reapable-python-orphans  read `pid ppid pgid tty etime command…` on
+#                                        stdin, print the SUBSET of the above that is safe to
+#                                        reap: aged past a floor, no controlling tty, and not in
+#                                        the caller's own process tree (HMD_BAREPY_SELF_EXCLUDE).
 #   heimdall-sysmon --filter-idle-agents read `pid ppid pgid tty %cpu etime command…` rows on stdin,
 #                                        print the pids of FINISHED background heimdall AGENT
 #                                        subprocesses safe to reap (the idle-agent scoping oracle —
@@ -46,6 +54,12 @@ WIRED_WARN_PCT="${HMD_SYSMON_WIRED_WARN_PCT:-55}"  # wired RAM % of total → WA
 ORPHAN_WARN="${HMD_SYSMON_ORPHAN_WARN:-20}"        # heimdall orphaned-python count → WARN
 ORPHAN_CRIT="${HMD_SYSMON_ORPHAN_CRIT:-80}"        # … CRITICAL (a live runaway leak)
 RUNAWAY_ANY="${HMD_SYSMON_RUNAWAY_ANY:-120}"       # ANY single interpreter proc count → runaway
+# UNATTRIBUTED bare-stdin python orphans. Deliberately higher floors than the hmd-owned ones:
+# hmd cannot prove these are its own, so it takes a genuine PILE-UP — not a handful — before it
+# says anything. A steady-state machine sits at 0 here (a live heredoc's parent is alive, so
+# ppid!=1), which is what makes a non-zero reading meaningful at all.
+BAREPY_WARN="${HMD_SYSMON_BAREPY_WARN:-40}"        # unattributed bare-python orphan count → WARN
+BAREPY_CRIT="${HMD_SYSMON_BAREPY_CRIT:-120}"       # … CRITICAL (the 224-proc pile-up measured)
 
 # the SINGLE source of truth for "is this a heimdall-owned python orphan?" — an awk boolean
 # reused by BOTH the counter and the reaper so detection and killing can never diverge. A row
@@ -57,6 +71,83 @@ HMD_ORPHAN_AWK='
     if (cmd ~ /mock_cp\.py/) { print $1; next }
     if (cmd ~ /presence-doctor/) { print $1; next }
     if ((cmd ~ /[Pp]ython/) && (cmd ~ /heimdall|\.heimdall|hmd-/)) { print $1; next }
+  }'
+
+# ── the UNATTRIBUTED bare-stdin python orphan (the silent-monitor fix) ────────────────────
+# MEASURED 2026-08-08: 224 processes were alive at ppid==1, state S, ages up to a day, whose
+# ps command line was exactly `python3 -`. HMD_ORPHAN_AWK above matched NONE of them, because
+# it requires a heimdall marker in the command line — and hmd runs python through stdin
+# heredocs (`python3 - <<'PY'`) at ~25 sites, a form that renders in ps with no script path
+# and no marker at all. So hmd's own detector reported hmd_orphans:0 while the machine sat at
+# swap 94%. Absence of a signal read as absence of a problem: the exact failure this file
+# exists to prevent.
+#
+# THE HONESTY RULE. These are counted SEPARATELY and named for what is actually known about
+# them — that they are unattributed. hmd cannot prove a bare `python3 -` is its own (the
+# command line carries zero attribution; a user's `cat x.py | python3 -` looks identical), so
+# folding them into hmd_orphans would swap one wrong number for another. A false attribution
+# is as bad as the blindness. Callers get the count, the name says what it is, and the reap
+# path below is guarded far more conservatively than the hmd-owned one.
+#
+# SCOPE, deliberately tight: only the interpreter-then-bare-dash form, the exact shape that
+# was measured and the only one that carries NO attribution whatsoever. A stdin script WITH
+# argv (`python3 - /some/path`) is left alone — its argv usually names its owner, and
+# HMD_ORPHAN_AWK already claims it when that owner is heimdall.
+#
+# BAREPY_MATCH is held in its own variable, not inlined, so a test can BLIND it (matches
+# nothing) or WIDEN it (matches everything) and prove the surrounding assertions are capable
+# of failing. A detector whose "clean" verdict cannot be falsified is not a detector.
+BAREPY_MATCH="${HMD_SYSMON_BAREPY_MATCH:-[Pp]ython[0-9.]* -$}"
+
+# The shape+attribution predicate, shared VERBATIM by the counter and the reap oracle so the
+# two can never drift. Returns 1 only for: orphaned to init, matches the bare-stdin shape, and
+# carries none of the markers that would make it hmd's own (those belong to HMD_ORPHAN_AWK —
+# the two sets are disjoint by construction, not by coincidence).
+BARE_PY_PREDICATE='
+  function bare_py_orphan(ppid, cmd) {
+    if (ppid != 1)                   return 0
+    if (cmd ~ /mock_cp\.py/)         return 0
+    if (cmd ~ /presence-doctor/)     return 0
+    if (cmd ~ /heimdall|\.heimdall|hmd-/) return 0
+    return (cmd ~ BAREPY_MATCH)
+  }'
+
+# DETECTION oracle — rows are `pid ppid command…`, the same shape HMD_ORPHAN_AWK consumes so
+# both read ONE ps snapshot. Counts every matching orphan regardless of age or tty: you want
+# to SEE all of them. The reap oracle below is a strict subset.
+BARE_PY_DETECT_AWK="$BARE_PY_PREDICATE"'
+  {
+    cmd=""; for (i=3;i<=NF;i++) cmd=cmd" "$i
+    if (bare_py_orphan($2+0, cmd)) print $1
+  }'
+
+# REAP oracle — rows are `pid ppid pgid tty etime command…`. The SAME predicate, plus the three
+# guards this repo already uses for the idle-agent reaper (see HMD_IDLE_AGENT_AWK): a target
+# must be DETACHED (no controlling terminal — a tty means a human's shell owns it), AGED past a
+# conservative floor, and OUTSIDE the caller's own process tree. Because ownership is unproven
+# here, the floor is an hour by default rather than the minutes an hmd-owned orphan gets.
+BARE_PY_REAP_AWK="$BARE_PY_PREDICATE"'
+  function to_secs(e,   d,a,n,h,m,s,p) {
+    d=0
+    if (e ~ /-/) { split(e,p,"-"); d=p[1]+0; e=p[2] }
+    n=split(e,a,":")
+    if      (n==3) { h=a[1]+0; m=a[2]+0; s=a[3]+0 }
+    else if (n==2) { h=0;      m=a[1]+0; s=a[2]+0 }
+    else           { h=0;      m=0;      s=a[1]+0 }
+    return d*86400 + h*3600 + m*60 + s
+  }
+  {
+    pid=$1; ppid=$2+0; pgid=$3; tty=$4; etime=$5
+    cmd=""; for (i=6;i<=NF;i++) cmd=cmd" "$i
+    if (!bare_py_orphan(ppid, cmd)) next
+    # detached — a device name (ttysNNN, console, anything but ?/-) means an attached session
+    if (tty !~ /^[?-]+$/) next
+    # never the caller'"'"'s own tree (the pid-71532 rule): neither its pid nor its pgid
+    if (index(SELF, " " pid " ")  > 0) next
+    if (index(SELF, " " pgid " ") > 0) next
+    # aged past a conservative floor — a young one may be a heredoc mid-flight
+    if (to_secs(etime) < AGE_MIN) next
+    print pid
   }'
 
 # the SECOND single source of truth — "is this a FINISHED heimdall AGENT subprocess safe to
@@ -118,6 +209,8 @@ for a in "$@"; do
     --quiet|-q) QUIET=1 ;;
     --reap-hmd-orphans|--reap) MODE="reap" ;;
     --filter-orphans) MODE="filter" ;;
+    --filter-bare-python-orphans) MODE="filter-barepy" ;;
+    --filter-reapable-python-orphans) MODE="filter-barepy-reap" ;;
     --filter-idle-agents) MODE="filter-agents" ;;
     -h|--help) grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
   esac
@@ -126,6 +219,20 @@ done
 # ── the scoping oracle: emit the pids the reaper would target, from stdin ps rows ──
 if [ "$MODE" = "filter" ]; then
   awk "$HMD_ORPHAN_AWK"
+  exit 0
+fi
+
+# ── the UNATTRIBUTED scoping oracles: detection, and the strictly-smaller reap subset ──
+if [ "$MODE" = "filter-barepy" ]; then
+  awk -v BAREPY_MATCH="$BAREPY_MATCH" "$BARE_PY_DETECT_AWK"
+  exit 0
+fi
+if [ "$MODE" = "filter-barepy-reap" ]; then
+  # SELF is the caller's own ancestry (pids + pgid + sid), space-padded so `index(SELF," p ")`
+  # is an exact whole-token test rather than a substring hit.
+  awk -v BAREPY_MATCH="$BAREPY_MATCH" \
+      -v SELF=" ${HMD_BAREPY_SELF_EXCLUDE:-} " \
+      -v AGE_MIN="${HMD_BAREPY_AGE_MIN_SEC:-3600}" "$BARE_PY_REAP_AWK"
   exit 0
 fi
 
@@ -200,11 +307,19 @@ _probe_mem() {
 _probe_mem
 
 # ── PROCS: heimdall's own orphaned-python leak + any generic runaway ──────────────
-proc_status="ok"; orphan_hmd=0; py_total=0; runaway_name=""; runaway_n=0
+proc_status="ok"; orphan_hmd=0; orphan_barepy=0; py_total=0; runaway_name=""; runaway_n=0
+# HMD_SYSMON_PS_ROWS — test seam (never set in production): a file of `pid ppid command…`
+# rows used instead of live ps, so the counts in --json can be asserted against a planted
+# fixture without any real process being involved.
 _probe_procs() {
   local rows
-  rows="$(ps -axo pid=,ppid=,command= 2>/dev/null)"
+  if [ -n "${HMD_SYSMON_PS_ROWS:-}" ]; then
+    rows="$(cat "$HMD_SYSMON_PS_ROWS" 2>/dev/null)"
+  else
+    rows="$(ps -axo pid=,ppid=,command= 2>/dev/null)"
+  fi
   orphan_hmd="$(printf '%s\n' "$rows" | awk "$HMD_ORPHAN_AWK" | grep -c . )"
+  orphan_barepy="$(printf '%s\n' "$rows" | awk -v BAREPY_MATCH="$BAREPY_MATCH" "$BARE_PY_DETECT_AWK" | grep -c . )"
   py_total="$(pgrep -x python3 2>/dev/null | grep -c . )"
   local p n
   for p in python3 node bun ruby java deno; do
@@ -213,6 +328,11 @@ _probe_procs() {
   done
   if   [ "$orphan_hmd" -ge "$ORPHAN_CRIT" ] 2>/dev/null; then proc_status="crit"
   elif [ "$orphan_hmd" -ge "$ORPHAN_WARN" ] 2>/dev/null; then proc_status="warn"
+  fi
+  # The unattributed pile GRADES TOO. Counting it without letting it move the severity would
+  # rebuild the same silence one level up: the number would exist and nothing would read it.
+  if   [ "$orphan_barepy" -ge "$BAREPY_CRIT" ] 2>/dev/null; then proc_status="crit"
+  elif [ "$orphan_barepy" -ge "$BAREPY_WARN" ] 2>/dev/null && [ "$proc_status" = "ok" ]; then proc_status="warn"
   fi
   if [ "$runaway_n" -ge "$RUNAWAY_ANY" ] 2>/dev/null; then proc_status="crit"; fi
 }
@@ -225,6 +345,11 @@ for s in "$disk_status" "$mem_status" "$proc_status"; do r="$(_rank "$s")"; [ "$
 sev_word="ok"; [ "$sev" = 1 ] && sev_word="warn"; [ "$sev" = 2 ] && sev_word="crit"
 
 # ── REAP: kill ONLY heimdall's own orphaned python + its spawner, then re-measure ──
+# Scoped by HMD_ORPHAN_AWK alone, so it signals ONLY processes whose command line proves they
+# are heimdall's. The unattributed bare-stdin pile is counted above but NEVER reaped here:
+# killing a process on a guess is the mirror image of the blindness this file just fixed. That
+# set has its own guarded path (heimdall-cleanup --apply), which additionally requires the
+# process to be aged, detached and outside the caller's own tree.
 if [ "$MODE" = "reap" ]; then
   before="$orphan_hmd"
   pids="$(ps -axo pid=,ppid=,command= 2>/dev/null | awk "$HMD_ORPHAN_AWK")"
@@ -252,8 +377,10 @@ if [ "$JSON" = 1 ]; then
     "$disk_status" "${disk_used_pct:-0}" "${disk_free_b:-0}" "${disk_total_b:-0}"
   printf '"memory":{"status":"%s","swap_used_pct":%s,"swap_used_g":%s,"swap_total_g":%s,"wired_pct":%s,"free_pct":%s},' \
     "$mem_status" "${swap_used_pct:-0}" "${swap_used_g:-0}" "${swap_total_g:-0}" "${wired_pct:-0}" "${free_pct:-0}"
-  printf '"procs":{"status":"%s","hmd_orphans":%s,"python3_total":%s,"runaway":"%s","runaway_n":%s}' \
-    "$proc_status" "${orphan_hmd:-0}" "${py_total:-0}" "${runaway_name:-}" "${runaway_n:-0}"
+  # python_orphans_unattributed is ADDITIVE — every pre-existing key keeps its name, position
+  # and meaning, so consumers written against the old shape keep working unchanged.
+  printf '"procs":{"status":"%s","hmd_orphans":%s,"python_orphans_unattributed":%s,"python3_total":%s,"runaway":"%s","runaway_n":%s}' \
+    "$proc_status" "${orphan_hmd:-0}" "${orphan_barepy:-0}" "${py_total:-0}" "${runaway_name:-}" "${runaway_n:-0}"
   printf '}\n'
   exit "$sev"
 fi
@@ -267,8 +394,13 @@ _line "disk"   "$disk_status" "Data $(_bytes_human "$disk_free_b") free · ${dis
 _line "memory" "$mem_status"  "swap ${swap_used_g}G/${swap_total_g}G (${swap_used_pct}%) · free ${free_pct}% · wired ${wired_pct}%"
 if [ "$orphan_hmd" -gt 0 ] || [ "$runaway_n" -ge "$RUNAWAY_ANY" ] 2>/dev/null; then
   _line "procs" "$proc_status" "${orphan_hmd} orphaned heimdall python (mock_cp.py/presence-doctor) · python3 total ${py_total} · peak ${runaway_name}×${runaway_n}"
+elif [ "$orphan_barepy" -gt 0 ]; then
+  _line "procs" "$proc_status" "no ATTRIBUTABLE heimdall python leak · ${orphan_barepy} unattributed bare-stdin python orphan(s) (ppid 1, ownership unproven) · python3 ${py_total}"
 else
   _line "procs" "$proc_status" "no heimdall python leak · python3 ${py_total}"
+fi
+if [ "$orphan_barepy" -gt 0 ] && [ "$orphan_hmd" -gt 0 ]; then
+  _line "procs" "-" "+ ${orphan_barepy} unattributed bare-stdin python orphan(s) (ownership unproven)"
 fi
 
 # ── SUGGESTIONS ─────────────────────────────────────────────────────────────────────
@@ -277,9 +409,17 @@ if [ "$sev" = 0 ]; then
   exit 0
 fi
 echo "suggestion:"
-if [ "$proc_status" != "ok" ]; then
+if [ "$orphan_hmd" -ge "$ORPHAN_WARN" ] 2>/dev/null; then
   echo "  • heimdall is leaking python — reap its OWN orphans (foreign procs untouched):"
   echo "      heimdall-sysmon --reap-hmd-orphans"
+fi
+if [ "$orphan_barepy" -ge "$BAREPY_WARN" ] 2>/dev/null; then
+  echo "  • ${orphan_barepy} unattributed bare-stdin python orphan(s) at ppid 1. hmd CANNOT prove"
+  echo "    these are its own — a bare \`python3 -\` command line carries no attribution — so"
+  echo "    --reap-hmd-orphans deliberately leaves them alone. Inspect them first:"
+  echo "      ps -Ao pid,ppid,lstart,tty,command | awk '\$2==1 && /python3 -\$/'"
+  echo "    then reap only the aged, detached, not-yours ones:"
+  echo "      heimdall-cleanup --apply"
 fi
 if [ "$mem_status" != "ok" ]; then
   echo "  • memory pressure: reaping heimdall's own orphans does not touch wired RAM."
