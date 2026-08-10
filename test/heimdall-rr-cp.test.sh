@@ -105,7 +105,7 @@ has_route=0; echo "$clean3" | grep -q "POST" && echo "$clean3" | grep -q "/rr-ta
 [ "$has_route" = 1 ] && ok "dry-run prints the POST <base>/rr-task plan" \
                      || bad "dry-run did not print the /rr-task POST plan"
 
-body_line="$(printf '%s\n' "$clean3" | grep -o 'body={.*}' | head -n1)"
+body_line="$(grep -o 'body={.*}' <<<"$clean3" | head -n1)"
 body_json="${body_line#body=}"
 if [ -n "$body_json" ]; then
   verdict=$(RR_BODY="$body_json" "$PY" - <<'PYEOF'
@@ -189,7 +189,7 @@ else
   ok "cp-mode plan NEVER contains 'gcloud compute ssh'"
 fi
 # the capsule must ride the API request BODY (a context field), NEVER an ssh/scp ship.
-cap_body="$(printf '%s\n' "$bare_cp" | grep -o 'body={.*}' | head -n1)"
+cap_body="$(grep -o 'body={.*}' <<<"$bare_cp" | head -n1)"
 if echo "$bare_cp" | grep -qiE 'capsule[^\n]*ship|scp '; then
   bad "cp-mode ships the context capsule via ssh/scp (must ride the API body)"
 elif echo "$cap_body" | grep -q '"context"'; then

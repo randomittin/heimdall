@@ -96,7 +96,7 @@ LIVE="$(guard env \
     NO_COLOR=1 HEIMDALL_STATUSLINE_MODE=mono \
     "$BIN" 2>&1)"
 LRC=$?
-WALLS="$(printf '%s' "$LIVE" | grep -ac 'WALL')"
+WALLS="$(grep -ac 'WALL' <<<"$LIVE")"
 BEATS="$(grep -c . "$BEATLOG" 2>/dev/null || echo 0)"
 
 [ "$LRC" -eq 0 ] && ok "(1) live loop exits 0 (cap reached, no hang)" || bad "(1) live loop rc=$LRC"
@@ -121,7 +121,7 @@ CLEARS="$(printf '%s' "$LIVE" | grep -oa $'\033\[2J' | grep -c .)"
 [ "${CLEARS:-0}" -gt 1 ] \
   && ok "(2) live loop clears the screen each cycle (ESC[2J x$CLEARS — auto-refresh reprint)" \
   || bad "(2) live loop did not clear-screen per cycle (count=$CLEARS)"
-printf '%s' "$LIVE" | grep -qa 'LIVE ·' \
+grep -qa 'LIVE ·' <<<"$LIVE" \
   && ok "(2) live loop shows the LIVE footer" \
   || bad "(2) live loop missing the LIVE footer"
 
@@ -134,13 +134,13 @@ ONCE="$(guard env \
     NO_COLOR=1 HEIMDALL_STATUSLINE_MODE=mono \
     "$BIN" --once 2>&1)"
 ORC=$?
-OWALLS="$(printf '%s' "$ONCE" | grep -ac 'WALL')"
+OWALLS="$(grep -ac 'WALL' <<<"$ONCE")"
 OBEATS="$(grep -c . "$BEATLOG" 2>/dev/null || echo 0)"
 [ "$ORC" -eq 0 ] && ok "(3) --once exits 0" || bad "(3) --once rc=$ORC"
 [ "${OWALLS:-0}" -eq 1 ] \
   && ok "(3) --once renders the wall EXACTLY once (single static dump, not the loop)" \
   || bad "(3) --once rendered $OWALLS walls (expected 1)"
-printf '%s' "$ONCE" | grep -qa 'LIVE ·' \
+grep -qa 'LIVE ·' <<<"$ONCE" \
   && bad "(3) --once entered the live loop (LIVE footer present) — must stay a one-shot" \
   || ok "(3) --once is NOT the live loop (no LIVE footer)"
 [ "${OBEATS:-0}" -eq 1 ] \
@@ -156,12 +156,12 @@ NOTTY="$(guard env \
     NO_COLOR=1 HEIMDALL_STATUSLINE_MODE=mono \
     "$BIN" 2>&1)"
 NRC=$?
-NWALLS="$(printf '%s' "$NOTTY" | grep -ac 'WALL')"
+NWALLS="$(grep -ac 'WALL' <<<"$NOTTY")"
 [ "$NRC" -eq 0 ] && ok "(4) non-TTY exits 0 (no hang)" || bad "(4) non-TTY rc=$NRC"
 [ "${NWALLS:-0}" -eq 1 ] \
   && ok "(4) non-TTY (pipe/CI) is a SINGLE static dump (never an infinite loop)" \
   || bad "(4) non-TTY rendered $NWALLS walls (expected 1 — must not loop)"
-printf '%s' "$NOTTY" | grep -qa 'LIVE ·' \
+grep -qa 'LIVE ·' <<<"$NOTTY" \
   && bad "(4) non-TTY entered the live loop — a pipe must never loop" \
   || ok "(4) non-TTY did NOT enter the live loop"
 
@@ -179,7 +179,7 @@ print("live",        we._choose_mode(A(),                 False, True))
 print("dump",        we._choose_mode(A(),                 False, False))
 PY
 )"
-chkmode() { printf '%s' "$MODES" | grep -qx "$1 $2" && ok "(5) mode select: $1 -> $2" || { bad "(5) mode $1 != $2"; printf '%s\n' "$MODES" | sed 's/^/      /'; }; }
+chkmode() { grep -qx "$1 $2" <<<"$MODES" && ok "(5) mode select: $1 -> $2" || { bad "(5) mode $1 != $2"; printf '%s\n' "$MODES" | sed 's/^/      /'; }; }
 chkmode install_tui install_tui
 chkmode once once
 chkmode textual textual
@@ -199,24 +199,24 @@ print("MANAGED " + wd.textual_install_hint({}))
 PY
 )"
 EXE_LINE="$(printf '%s' "$HINT" | sed -n 's/^EXE //p')"
-printf '%s' "$HINT" | grep -qa 'HINT .*-m pip install .*textual' \
+grep -qa 'HINT .*-m pip install .*textual' <<<"$HINT" \
   && ok "(6) hint targets '<python> -m pip install ... textual' (PEP-668 safe)" \
   || { bad "(6) hint is not a '-m pip install textual' form"; printf '%s\n' "$HINT" | sed 's/^/      /'; }
-printf '%s' "$HINT" | grep -qaF "HINT $EXE_LINE" \
+grep -qaF "HINT $EXE_LINE" <<<"$HINT" \
   && ok "(6) hint targets hmd-watch's EXACT interpreter (sys.executable=$EXE_LINE)" \
   || { bad "(6) hint does NOT target sys.executable"; printf '%s\n' "$HINT" | sed 's/^/      /'; }
-printf '%s' "$HINT" | grep -qai 'pipx' \
+grep -qai 'pipx' <<<"$HINT" \
   && bad "(6) hint suggests pipx (isolated venv — hmd's python can't import it)" \
   || ok "(6) hint NEVER suggests pipx (avoids the isolation footgun)"
-printf '%s' "$HINT" | grep -qa 'MANAGED .*--break-system-packages' \
+grep -qa 'MANAGED .*--break-system-packages' <<<"$HINT" \
   && ok "(6) externally-managed (PEP-668) hint carries --break-system-packages" \
   || { bad "(6) externally-managed hint missing --break-system-packages"; printf '%s\n' "$HINT" | sed 's/^/      /'; }
 
 # ── (7) the textual-absent DUMP trailer uses the interpreter-aware hint (not bare pip) ─
-printf '%s' "$ONCE" | grep -qa 'textual not installed' \
+grep -qa 'textual not installed' <<<"$ONCE" \
   && ok "(7) textual-absent dump explains textual is not installed" \
   || bad "(7) textual-absent dump missing the not-installed line"
-printf '%s' "$ONCE" | grep -qa '\-m pip install' && printf '%s' "$ONCE" | grep -qa 'textual' \
+grep -qa '\-m pip install' <<<"$ONCE" && grep -qa 'textual' <<<"$ONCE" \
   && ok "(7) textual-absent dump prints the interpreter-aware install hint" \
   || bad "(7) textual-absent dump missing the interpreter-aware hint"
 
@@ -233,10 +233,10 @@ print("EXE " + (sys.executable or ""))
 PY
 )"
 IEXE="$(printf '%s' "$INST" | sed -n 's/^EXE //p')"
-printf '%s' "$INST" | grep -qaF "ARGV $IEXE -m pip install --user textual" \
+grep -qaF "ARGV $IEXE -m pip install --user textual" <<<"$INST" \
   && ok "(8) --install-tui targets hmd's own interpreter: $IEXE -m pip install --user textual" \
   || { bad "(8) --install-tui argv wrong"; printf '%s\n' "$INST" | sed 's/^/      /'; }
-printf '%s' "$INST" | grep -qai 'pipx' \
+grep -qai 'pipx' <<<"$INST" \
   && bad "(8) --install-tui uses pipx (isolated)" \
   || ok "(8) --install-tui never uses pipx"
 

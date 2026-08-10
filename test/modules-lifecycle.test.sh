@@ -149,9 +149,9 @@ echo "G2 — nothing installed renders honestly"
 OUT="$(hmd list 2>&1)"; RC=$?
 [ "$RC" -eq 0 ] && ok "list exits 0 with nothing installed (not an error)" \
                 || bad "list exited $RC with nothing installed"
-printf '%s' "$OUT" | grep -qi 'installed: none' \
+grep -qi 'installed: none' <<<"$OUT" \
   && ok "list says 'Installed: none' plainly" || bad "list did not state the empty case"
-printf '%s' "$OUT" | grep -qi 'zero module payloads\|no module payloads' \
+grep -qi 'zero module payloads\|no module payloads' <<<"$OUT" \
   && ok "list explains the base install ships no payloads" || bad "no base-install explanation"
 J="$(hmd --json list 2>/dev/null)"
 [ "$(printf '%s' "$J" | jq -r '.installed_count')" = "0" ] \
@@ -184,7 +184,7 @@ echo "G4 — the judgment falsifier is consumed, and NOT weakened"
 for cls in traffic-proxy storage-codec; do
   CMD="$(jq -r '.requires_invariants[] | select(.check.kind == "suite") | .check.command' "$REAL_CLASSES/$cls.json")"
   EXP="$(jq -r '.requires_invariants[] | select(.check.kind == "suite") | .check.expect' "$REAL_CLASSES/$cls.json")"
-  printf '%s' "$CMD" | grep -q 'test/gate-judgment-uncompressed.test.sh' \
+  grep -q 'test/gate-judgment-uncompressed.test.sh' <<<"$CMD" \
     && ok "$cls consumes the gates-read-raw falsifier" || bad "$cls does not run the falsifier"
   [ "$EXP" = "25 passed, 0 failed" ] \
     && ok "$cls pins the falsifier at 25/0" || bad "$cls expects '$EXP', not 25/0"
@@ -208,15 +208,15 @@ STATE_PRE="$(tree_sum "$STATE")"
 OUT="$(hmd add good --yes 2>&1)"; RC=$?
 [ "$RC" -eq 0 ] && ok "add succeeded" || { bad "add failed (exit $RC)"; printf '%s\n' "$OUT"; }
 for step in 'validate' 'class contract' 'consent' 'install + provenance' 'wire' 'class invariants'; do
-  printf '%s' "$OUT" | grep -qF "$step" \
+  grep -qF "$step" <<<"$OUT" \
     && ok "pipeline ran step: $step" || bad "pipeline never reported: $step"
 done
 # The order is the contract: install must not precede consent, invariants must
 # not precede wiring.
-LINE_CONSENT=$(printf '%s\n' "$OUT" | grep -n 'consent'          | head -1 | cut -d: -f1)
-LINE_INSTALL=$(printf '%s\n' "$OUT" | grep -n '\[5/7\] install' | head -1 | cut -d: -f1)
-LINE_WIRE=$(printf '%s\n'    "$OUT" | grep -n '\[6/7\] wire'     | head -1 | cut -d: -f1)
-LINE_INV=$(printf '%s\n'     "$OUT" | grep -n 'class invariants' | head -1 | cut -d: -f1)
+LINE_CONSENT=$(grep -n 'consent' <<<"$OUT"          | head -1 | cut -d: -f1)
+LINE_INSTALL=$(grep -n '\[5/7\] install' <<<"$OUT" | head -1 | cut -d: -f1)
+LINE_WIRE=$(grep -n '\[6/7\] wire' <<<"$OUT"     | head -1 | cut -d: -f1)
+LINE_INV=$(grep -n 'class invariants' <<<"$OUT" | head -1 | cut -d: -f1)
 [ -n "$LINE_CONSENT" ] && [ -n "$LINE_INSTALL" ] && [ "$LINE_CONSENT" -lt "$LINE_INSTALL" ] \
   && ok "consent precedes install (nothing is written before the operator agrees)" \
   || bad "install ran at or before consent"
@@ -247,9 +247,9 @@ fi
 # SIGPIPEs the writer, which `set -o pipefail` then reports as a failed
 # pipeline (141). That would be a false RED about the tool.
 OUT="$(hmd list 2>&1)"
-printf '%s' "$OUT" | grep -q 'good' && ok "list shows the installed module" || bad "list omitted it"
+grep -q 'good' <<<"$OUT" && ok "list shows the installed module" || bad "list omitted it"
 OUT="$(hmd status good 2>&1)"
-printf '%s' "$OUT" | grep -q 'wiring' && ok "status reports wiring" || bad "status omitted wiring"
+grep -q 'wiring' <<<"$OUT" && ok "status reports wiring" || bad "status omitted wiring"
 
 hmd remove good >/dev/null 2>&1
 STATE_POST="$(tree_sum "$STATE")"
@@ -277,7 +277,7 @@ echo "G8/G9 — permission_class is refused, never defaulted"
 mkmodule noclass fx-open '{"permission_class":null}'
 OUT="$(hmd add noclass --yes 2>&1)"; RC=$?
 [ "$RC" -ne 0 ] && ok "missing permission_class is refused" || bad "missing permission_class was accepted"
-printf '%s' "$OUT" | grep -q 'permission_class' \
+grep -q 'permission_class' <<<"$OUT" \
   && ok "the refusal names permission_class" || bad "refusal did not name the field"
 [ ! -e "$STATE/noclass" ] && ok "nothing was installed for the refused manifest" || bad "residue for a refused manifest"
 [ "$(tree_sum "$STATE")" = "$STATE_PRE" ] \
@@ -286,8 +286,8 @@ printf '%s' "$OUT" | grep -q 'permission_class' \
 mkmodule badclass fx-open '{"permission_class":"not-a-real-class"}'
 OUT="$(hmd add badclass --yes 2>&1)"; RC=$?
 [ "$RC" -ne 0 ] && ok "unknown permission_class is refused" || bad "unknown class was accepted"
-printf '%s' "$OUT" | grep -q 'not-a-real-class' && ok "the refusal quotes the bad class" || bad "refusal did not quote it"
-printf '%s' "$OUT" | grep -q 'Valid classes' && ok "the refusal lists the valid classes" || bad "refusal listed no alternatives"
+grep -q 'not-a-real-class' <<<"$OUT" && ok "the refusal quotes the bad class" || bad "refusal did not quote it"
+grep -q 'Valid classes' <<<"$OUT" && ok "the refusal lists the valid classes" || bad "refusal listed no alternatives"
 [ "$(tree_sum "$STATE")" = "$STATE_PRE" ] && ok "unknown-class refusal mutates nothing" || bad "left a trace"
 
 echo
@@ -295,12 +295,12 @@ echo "G10 — a failed class invariant is NOT WIRED and rolls back byte-identica
 mkmodule broken fx-open '{"invariants":{"module-owned":{"command":"printf MODULE-BROKEN; exit 3","expect":"MODULE-OK"}}}'
 OUT="$(hmd add broken --yes 2>&1)"; RC=$?
 [ "$RC" -ne 0 ] && ok "add of an invariant-failing module exits non-zero" || bad "invariant failure was accepted"
-printf '%s' "$OUT" | grep -q 'NOT WIRED' && ok "the refusal says NOT WIRED" || bad "refusal never said NOT WIRED"
-printf '%s' "$OUT" | grep -q 'FAILED INVARIANT: module-owned' \
+grep -q 'NOT WIRED' <<<"$OUT" && ok "the refusal says NOT WIRED" || bad "refusal never said NOT WIRED"
+grep -q 'FAILED INVARIANT: module-owned' <<<"$OUT" \
   && ok "the refusal names the failing invariant" || bad "refusal did not name the invariant"
-printf '%s' "$OUT" | grep -q 'exit 3, expected 0' \
+grep -q 'exit 3, expected 0' <<<"$OUT" \
   && ok "the refusal says WHY it failed" || bad "refusal gave no reason"
-printf '%s' "$OUT" | grep -q 'what it guarantees' \
+grep -q 'what it guarantees' <<<"$OUT" \
   && ok "the refusal explains what the invariant guarantees" || bad "no guarantee explanation"
 [ ! -e "$STATE/broken" ] && ok "the rejected module left no install dir" || bad "rejected module left residue"
 [ "$(tree_sum "$STATE")" = "$STATE_PRE" ] \
@@ -319,8 +319,8 @@ jq '.invariants = {}' "$REG/uncovered/manifest.json" > "$REG/uncovered/m.tmp" \
   || bad "fixture did not actually clear its invariants"
 OUT="$(hmd add uncovered --yes 2>&1)"; RC=$?
 [ "$RC" -ne 0 ] && ok "a manifest missing a required invariant is refused" || bad "hole was accepted"
-printf '%s' "$OUT" | grep -q 'module-owned' && ok "the refusal names the uncovered invariant" || bad "hole not named"
-printf '%s' "$OUT" | grep -qi 'nothing was installed' && ok "the refusal states nothing was installed" || bad "no such statement"
+grep -q 'module-owned' <<<"$OUT" && ok "the refusal names the uncovered invariant" || bad "hole not named"
+grep -qi 'nothing was installed' <<<"$OUT" && ok "the refusal states nothing was installed" || bad "no such statement"
 [ "$(tree_sum "$STATE")" = "$STATE_PRE" ] && ok "coverage refusal mutates nothing" || bad "left a trace"
 
 echo
@@ -329,7 +329,7 @@ mkmodule tampered fx-open
 printf 'this is NOT the pinned artifact\n' > "$REG/tampered/artifact.bin"
 OUT="$(hmd add tampered --yes 2>&1)"; RC=$?
 [ "$RC" -ne 0 ] && ok "an artifact that does not match its pin is refused" || bad "digest mismatch was accepted"
-printf '%s' "$OUT" | grep -qi 'digest MISMATCH' && ok "the refusal says digest MISMATCH" || bad "no mismatch message"
+grep -qi 'digest MISMATCH' <<<"$OUT" && ok "the refusal says digest MISMATCH" || bad "no mismatch message"
 [ "$(tree_sum "$STATE")" = "$STATE_PRE" ] && ok "digest refusal rolls back byte-identically" || bad "left a trace"
 
 mkmodule good fx-open
@@ -355,13 +355,13 @@ mkmodule consented fx-consent
 OUT="$(hmd add consented < /dev/null 2>&1)"; RC=$?
 [ "$RC" -ne 0 ] && ok "a consent_required class refuses a non-interactive add without --yes" \
                || bad "installed a consent-required module with nobody asked"
-printf '%s' "$OUT" | grep -qi 'not a terminal' && ok "the refusal explains there was no terminal" || bad "no explanation"
-printf '%s' "$OUT" | grep -qi 'Re-run with --yes' && ok "the refusal says how to proceed" || bad "no remedy offered"
+grep -qi 'not a terminal' <<<"$OUT" && ok "the refusal explains there was no terminal" || bad "no explanation"
+grep -qi 'Re-run with --yes' <<<"$OUT" && ok "the refusal says how to proceed" || bad "no remedy offered"
 [ "$(tree_sum "$STATE")" = "$STATE_PRE" ] && ok "declined consent mutates nothing" || bad "left a trace"
 
 OUT="$(hmd add consented --yes 2>&1)"; RC=$?
 [ "$RC" -eq 0 ] && ok "--yes grants consent and the add proceeds" || bad "--yes did not work (exit $RC)"
-printf '%s' "$OUT" | grep -qF "Fixture consent text for consented." \
+grep -qF "Fixture consent text for consented." <<<"$OUT" \
   && ok "the manifest's consent_text is actually shown" || bad "consent text never displayed"
 [ "$(jq -r '.consent.granted_via' "$STATE/consented/receipt.json" 2>/dev/null)" = "--yes" ] \
   && ok "the receipt records HOW consent was granted" || bad "consent grant not recorded"
@@ -372,7 +372,7 @@ hmd remove consented >/dev/null 2>&1
 mkmodule quiet fx-open
 OUT="$(hmd add quiet < /dev/null 2>&1)"; RC=$?
 [ "$RC" -eq 0 ] && ok "a class that needs no consent installs without --yes" || bad "prompted when it should not"
-printf '%s' "$OUT" | grep -qi 'requires your consent' \
+grep -qi 'requires your consent' <<<"$OUT" \
   && bad "prompted for a class that does not require consent" \
   || ok "no consent prompt for a class that does not require it"
 [ "$(jq -r '.consent.required' "$STATE/quiet/receipt.json" 2>/dev/null)" = "false" ] \
@@ -384,7 +384,7 @@ echo "G16 — tier: a recommendation must carry its evidence"
 mkmodule loud fx-open '{"tier":"suggested"}'
 OUT="$(hmd add loud --yes 2>&1)"; RC=$?
 [ "$RC" -ne 0 ] && ok "tier 'suggested' without tier_evidence is refused" || bad "unproven suggestion accepted"
-printf '%s' "$OUT" | grep -qi 'tier_evidence' && ok "the refusal names tier_evidence" || bad "refusal did not name it"
+grep -qi 'tier_evidence' <<<"$OUT" && ok "the refusal names tier_evidence" || bad "refusal did not name it"
 
 mkmodule proven fx-open '{"tier":"suggested","tier_evidence":{"receipt":"ab-2026-08-01: 12/12 green, pre-registered"}}'
 RC=0; hmd add proven --yes >/dev/null 2>&1 || RC=$?
@@ -399,9 +399,9 @@ mkmodule pinned fx-open
 hmd add pinned --yes >/dev/null 2>&1
 OUT="$(hmd update pinned 2>&1)"; RC=$?
 [ "$RC" -eq 0 ] && ok "update at the manifest pin exits 0" || bad "update failed (exit $RC)"
-printf '%s' "$OUT" | grep -qi 'already at the pinned version' \
+grep -qi 'already at the pinned version' <<<"$OUT" \
   && ok "update is a no-op at the current pin" || bad "update did something at the same pin"
-printf '%s' "$OUT" | grep -qi 'no "latest" to move to' \
+grep -qi 'no "latest" to move to' <<<"$OUT" \
   && ok "update states there is no latest to move to" || bad "update did not say pins-only"
 for forbidden in 'curl' 'wget' 'git clone' 'npm install' 'pip install' 'brew install'; do
   if grep -qF -- "$forbidden" "$MODS"; then
@@ -421,7 +421,7 @@ jq '.pinned_version.version = "2.0.0"' "$REG/shifting/manifest.json" > "$REG/shi
   && mv "$REG/shifting/m.tmp" "$REG/shifting/manifest.json"
 OUT="$(hmd update shifting --yes 2>&1)"; RC=$?
 [ "$RC" -eq 0 ] && ok "update moves to the human-edited pin" || bad "update failed (exit $RC)"
-printf '%s' "$OUT" | grep -q '1.0.0 -> 2.0.0' \
+grep -q '1.0.0 -> 2.0.0' <<<"$OUT" \
   && ok "update names both pins" || bad "update did not report the move"
 [ "$(jq -r '.pinned_version.version' "$STATE/shifting/receipt.json" 2>/dev/null)" = "2.0.0" ] \
   && ok "the receipt now records the new pin" || bad "receipt still on the old pin"
@@ -473,14 +473,14 @@ mkmodule watched fx-open
 hmd add watched --yes >/dev/null 2>&1
 OUT="$(hmd verify 2>&1)"; RC=$?
 [ "$RC" -eq 0 ] && ok "verify is green while the invariant holds" || bad "verify failed on a good module"
-printf '%s' "$OUT" | grep -qi 'hold their class invariants' && ok "verify says so plainly" || bad "verify was mute"
+grep -qi 'hold their class invariants' <<<"$OUT" && ok "verify says so plainly" || bad "verify was mute"
 # Regress the module's own invariant: verify must notice on the next run.
 jq '.invariants["module-owned"].command = "printf REGRESSED; exit 1"' \
   "$REG/watched/manifest.json" > "$REG/watched/manifest.json.tmp" \
   && mv "$REG/watched/manifest.json.tmp" "$REG/watched/manifest.json"
 OUT="$(hmd verify 2>&1)"; RC=$?
 [ "$RC" -ne 0 ] && ok "verify goes RED the moment the invariant regresses" || bad "verify missed a regression"
-printf '%s' "$OUT" | grep -q 'module-owned' && ok "verify names the regressed invariant" || bad "verify did not name it"
+grep -q 'module-owned' <<<"$OUT" && ok "verify names the regressed invariant" || bad "verify did not name it"
 OUT="$(hmd verify watched 2>&1)"; RC=$?
 [ "$RC" -ne 0 ] && ok "verify <name> targets a single module and still goes RED" || bad "targeted verify missed it"
 hmd remove watched >/dev/null 2>&1

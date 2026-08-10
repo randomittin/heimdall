@@ -96,9 +96,9 @@ export HEIMDALL_STATE_FILE="$T2/heimdall-state.json"
 "$STATE_BIN" init >/dev/null 2>&1
 "$STATE_BIN" set '.project.autonomy_level' '3' >/dev/null 2>&1
 STATUS_OUT="$("$STATE_BIN" status 2>/dev/null)"
-if printf '%s' "$STATUS_OUT" | grep -qiE 'Autonomy:[[:space:]]*3'; then
+if grep -qiE 'Autonomy:[[:space:]]*3' <<<"$STATUS_OUT"; then
   ok "status output renders 'Autonomy: 3' from the stable key"
-else bad "status output missing 'Autonomy: 3' (got: $(printf '%s' "$STATUS_OUT" | grep -i 'level\|autonomy'))"; fi
+else bad "status output missing 'Autonomy: 3' (got: $(grep -i 'level\|autonomy' <<<"$STATUS_OUT"))"; fi
 unset HEIMDALL_STATE_FILE
 rm -rf "$T2"
 

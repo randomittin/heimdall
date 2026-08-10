@@ -196,9 +196,9 @@ awk "BEGIN{exit !($F_VM_CONF > $F_DRIFT_CONF)}" && ok "verified-memory conflict 
 # ─────────────────────────────────────────────────────────────────────────────
 echo "G. THE HUMAN TABLE RENDERS (no fabricated number leaks into the rendered view):"
 TABLE="$("$CLI" run --work "$WORK/repo2" 2>/dev/null)"
-printf '%s' "$TABLE" | grep -q "verified-memory" && ok "table names verified-memory" || bad "table missing verified-memory row"
-printf '%s' "$TABLE" | grep -q "est\." && ok "table labels the estimated arm 'est.' (never a bare estimate)" || bad "table did not label the estimated arm"
-printf '%s' "$TABLE" | grep -qiE "HEADLINE" && ok "table prints the HEADLINE result line" || bad "table missing the headline result"
+grep -q "verified-memory" <<<"$TABLE" && ok "table names verified-memory" || bad "table missing verified-memory row"
+grep -q "est\." <<<"$TABLE" && ok "table labels the estimated arm 'est.' (never a bare estimate)" || bad "table did not label the estimated arm"
+grep -qiE "HEADLINE" <<<"$TABLE" && ok "table prints the HEADLINE result line" || bad "table missing the headline result"
 
 # ─────────────────────────────────────────────────────────────────────────────
 echo

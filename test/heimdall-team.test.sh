@@ -91,9 +91,9 @@ if [ "$RC" -eq 0 ] && [ -f "$TJ1" ] && [ "$(perm_of "$TJ1")" = "600" ] && [ "${#
 else
   bad "(b1) new did not produce a 0600 43-char team.json (rc=$RC perm=$(perm_of "$TJ1") len=${#S1})"; cat "$WORK/new1.err" >&2
 fi
-if printf '%s' "$BODY" | grep -q "HEIMDALL_TEAM_SECRET=" \
-   && printf '%s' "$BODY" | grep -qF "curl -fsSL --proto '=https' https://raw.githubusercontent.com/" \
-   && printf '%s' "$BODY" | grep -qi "team secret"; then
+if grep -q "HEIMDALL_TEAM_SECRET=" <<<"$BODY" \
+   && grep -qF "curl -fsSL --proto '=https' https://raw.githubusercontent.com/" <<<"$BODY" \
+   && grep -qi "team secret" <<<"$BODY"; then
   ok "(b2) new printed the heimdall-invite join one-liner (HEIMDALL_TEAM_SECRET) + a secret caveat"
 else
   bad "(b2) new did not print the join one-liner + caveat:
@@ -121,12 +121,12 @@ EXPECT_TID="$(server_team_id "$S1c")"
 SHOW_TXT="$(HEIMDALL_TEAM_DIR="$TD1" "$CLI" show 2>/dev/null)"
 SHOW_JSON="$(HEIMDALL_TEAM_DIR="$TD1" "$CLI" show --json 2>/dev/null)"
 JSON_TID="$(printf '%s' "$SHOW_JSON" | "$PY" -c 'import json,sys; print(json.load(sys.stdin).get("team_id") or "")' 2>/dev/null || true)"
-if [ -n "$EXPECT_TID" ] && [ "$JSON_TID" = "$EXPECT_TID" ] && printf '%s' "$SHOW_TXT" | grep -qF "$EXPECT_TID"; then
+if [ -n "$EXPECT_TID" ] && [ "$JSON_TID" = "$EXPECT_TID" ] && grep -qF "$EXPECT_TID" <<<"$SHOW_TXT"; then
   ok "(d1) show prints the team_id matching the server derive ($EXPECT_TID)"
 else
   bad "(d1) show team_id mismatch (expect=$EXPECT_TID json=$JSON_TID txt=$SHOW_TXT)"
 fi
-if ! printf '%s' "$SHOW_TXT$SHOW_JSON" | grep -qF "$S1c"; then
+if ! grep -qF "$S1c" <<<"$SHOW_TXT$SHOW_JSON"; then
   ok "(d2) show NEVER prints the secret (text + --json)"
 else
   bad "(d2) show LEAKED the secret"

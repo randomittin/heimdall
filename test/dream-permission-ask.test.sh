@@ -347,7 +347,7 @@ SOUT="$("$PERM" ask --repo "$SAFE_REPO" 2>&1)"
 OTHER="$FHOME/Documents/otherrepo"; mkdir -p "$OTHER/.planning"
 "$PERM" ask --repo "$PROT_REPO" >/dev/null 2>&1
 OTHER_OUT="$("$PERM" ask --repo "$OTHER" 2>&1)"
-if printf '%s' "$OTHER_OUT" | grep -q "$OTHER"; then
+if grep -q "$OTHER" <<<"$OTHER_OUT"; then
   ok "(7) a DIFFERENT repo is a different grant — the block is shown again"
 else
   bad "(7) a new protected repo inherited the old repo's silence"
@@ -396,7 +396,7 @@ if [ "$IRC" = 0 ] && [ -f "$PLIST" ]; then
 else
   bad "(9) install refused a protected repo (rc=$IRC) — the exemption regressed"
 fi
-if printf '%s' "$IOUT" | grep -qi 'Full Disk Access'; then
+if grep -qi 'Full Disk Access' <<<"$IOUT"; then
   ok "(9) install surfaces the permission block — the ask reaches him at first run"
 else
   bad "(9) install said nothing about the permission: $(printf '%s' "$IOUT" | tr '\n' ' ' | cut -c1-200)"
@@ -408,7 +408,7 @@ else
 fi
 # and installing twice must not re-ask — idempotence has to survive the wiring
 I2="$("$CANON/bin/heimdall-dream-schedule" install --repo "$PROT_REPO" 2>&1)" || true
-if printf '%s' "$I2" | grep -qi 'Full Disk Access'; then
+if grep -qi 'Full Disk Access' <<<"$I2"; then
   bad "(9) a re-install re-asked — the wiring broke idempotence"
 else
   ok "(9) a re-install does NOT re-ask (idempotent through the install path)"
@@ -502,7 +502,7 @@ grep -q '"result": "ok"' "$RSTATUS" 2>/dev/null \
 # $OKREPO would assert silence is a failure when silence is the correct answer there.
 BREPO="$WORK/blocked-repo"; mkdir -p "$BREPO/.planning/dream"
 BNOTICE="$("$NOTICE" --repo "$BREPO" --status "$GSTATUS" 2>&1 || true)"
-printf '%s' "$BNOTICE" | grep -qi 'not running\|blocked' \
+grep -qi 'not running\|blocked' <<<"$BNOTICE" \
   && ok "(10) heimdall-dream-notice surfaces the blocked run to the operator" \
   || bad "(10) notice stayed silent about a blocked run: $BNOTICE"
 
@@ -511,10 +511,10 @@ NSTATUS="$WORK/notice-status.json"
 write_status "$NSTATUS" blocked tcc-denied "$PROT_REPO"
 mkdir -p "$LA"; printf '%s\n' '<plist></plist>' > "$PLIST"
 NOUT="$("$NOTICE" --repo "$NREPO" --status "$NSTATUS" 2>&1)"
-{ printf '%s' "$NOUT" | grep -qi 'TCC' && printf '%s' "$NOUT" | grep -q "$PROT_REPO"; } \
+{ grep -qi 'TCC' <<<"$NOUT" && grep -q "$PROT_REPO" <<<"$NOUT"; } \
   && ok "(10) notice STILL names TCC and the exact denied path" \
   || bad "(10) notice lost its diagnosis: $(printf '%s' "$NOUT" | tr '\n' ' ' | cut -c1-200)"
-printf '%s' "$NOUT" | grep -q 'heimdall-dream-permission' \
+grep -q 'heimdall-dream-permission' <<<"$NOUT" \
   && ok "(10) notice now also points at the permission ask (remedy added, not swapped)" \
   || bad "(10) notice does not route to the permission ask"
 
@@ -552,8 +552,8 @@ write_status "$STATUSF" blocked tcc-denied "$PROT_REPO"
 
 NI="$(printf 'B\ny\n' | "$PERM" ask --repo "$PROT_REPO" 2>&1)"
 NI_RC=$?
-if printf '%s' "$NI" | grep -q 'Full Disk Access' \
-   && ! printf '%s' "$NI" | grep -q "$PROMPT_MARK"; then
+if grep -q 'Full Disk Access' <<<"$NI" \
+   && ! grep -q "$PROMPT_MARK" <<<"$NI"; then
   ok "(11) no TTY: prints the block and does NOT prompt"
 else
   bad "(11) non-interactive arm prompted or lost the block"
@@ -583,7 +583,7 @@ fi
 rm -f "$STATE"; : > "$OPENLOG"
 if command -v script >/dev/null 2>&1; then
   PTY_OUT="$(script -q /dev/null "$PERM" ask --repo "$PROT_REPO" </dev/null 2>&1 | tr -d '\r' || true)"
-  if printf '%s' "$PTY_OUT" | grep -q "$PROMPT_MARK"; then
+  if grep -q "$PROMPT_MARK" <<<"$PTY_OUT"; then
     ok "(12) FALSIFIER: with a REAL pty the prompt appears (the gate is the tty, not the seam)"
   else
     bad "(12) a real pty did not open the interactive branch"
@@ -603,7 +603,7 @@ I() { HEIMDALL_DREAM_PERMISSION_TTY=1 HEIMDALL_DREAM_PERMISSION_TIMEOUT=5 "$PERM
 # ── (13) [C] — not now ───────────────────────────────────────────────────────────
 rm -f "$STATE"; : > "$OPENLOG"
 C_OUT="$(printf 'c\n' | I "$PROT_REPO")"
-printf '%s' "$C_OUT" | grep -q "$PROMPT_MARK" \
+grep -q "$PROMPT_MARK" <<<"$C_OUT" \
   && ok "(13) interactive: the choice is actually put to him" \
   || bad "(13) no prompt shown in interactive mode"
 [ ! -s "$OPENLOG" ] && ok "(13) [C] opens nothing" \
@@ -619,20 +619,20 @@ if grep -q 'Privacy_AllFiles' "$OPENLOG" 2>/dev/null; then
 else
   bad "(14) [B] did not open the pane: $(cat "$OPENLOG" 2>/dev/null)"
 fi
-printf '%s' "$B_OUT" | grep -qi 'blast radius\|every other program\|interpreter' \
+grep -qi 'blast radius\|every other program\|interpreter' <<<"$B_OUT" \
   && ok "(14) [B] still warns about the blast radius before he commits" \
   || bad "(14) [B] dropped the blast-radius warning"
 
 # ── (15) [B] verdict is a MEASUREMENT, never a claim ─────────────────────────────
-printf '%s' "$B_OUT" | grep -qi 'cannot confirm\|cannot read\|cannot see' \
+grep -qi 'cannot confirm\|cannot read\|cannot see' <<<"$B_OUT" \
   && ok "(15) [B] states plainly what it cannot see (macOS permission state)" \
   || bad "(15) [B] verdict does not admit its limits"
-if printf '%s' "$B_OUT" | grep -Eqi 'granted successfully|permission granted|you are all set|now works|is now working'; then
+if grep -Eqi 'granted successfully|permission granted|you are all set|now works|is now working' <<<"$B_OUT"; then
   bad "(15) [B] CLAIMED success it cannot possibly verify"
 else
   ok "(15) FALSIFIER: [B] never claims hmd granted anything or that 03:00 now works"
 fi
-printf '%s' "$B_OUT" | grep -q 'result: *ok\|result=ok\|heimdall-dream-permission check' \
+grep -q 'result: *ok\|result=ok\|heimdall-dream-permission check' <<<"$B_OUT" \
   && ok "(15) [B] names the proof that actually counts (a scheduled run / check)" \
   || bad "(15) [B] gives him no way to confirm later"
 
@@ -648,7 +648,7 @@ if [ -f "$MREPO/canary.txt" ]; then
 else
   bad "(16) [A] MOVED HIS REPO on a plain 'yes' — unacceptable"
 fi
-printf '%s' "$A_OUT" | grep -q 'mv ' \
+grep -q 'mv ' <<<"$A_OUT" \
   && ok "(16) [A] hands him the paste-ready mv + re-register commands" \
   || bad "(16) [A] printed no move commands"
 
@@ -668,7 +668,7 @@ if [ -d "$WREPO" ] && [ -f "$WREPO/f.txt" ]; then
 else
   bad "(17) [A] moved a repo with linked worktrees — it would break every one"
 fi
-printf '%s' "$W_OUT" | grep -qi 'worktree' \
+grep -qi 'worktree' <<<"$W_OUT" \
   && ok "(17) the refusal NAMES linked worktrees as the reason" \
   || bad "(17) refusal did not explain itself: $(printf '%s' "$W_OUT" | tr '\n' ' ' | cut -c1-200)"
 
@@ -751,7 +751,7 @@ LEFTOVER2="$(printf 'B\ny\n' | { "$PERM" ask --repo "$PROT_REPO" --interactive-o
 
 # The deferral is only worth anything if the ask is still THERE afterwards.
 STILL="$("$PERM" ask --repo "$PROT_REPO" 2>&1)"
-printf '%s' "$STILL" | grep -q 'Full Disk Access' \
+grep -q 'Full Disk Access' <<<"$STILL" \
   && ok "(20) after a deferral the ask is still ARMED — the first human still gets it" \
   || bad "(20) a deferred ask went missing: $(printf '%s' "$STILL" | tr '\n' ' ' | cut -c1-160)"
 
@@ -761,10 +761,10 @@ printf '%s' "$STILL" | grep -q 'Full Disk Access' \
 rm -f "$STATE"; : > "$OPENLOG"
 if command -v script >/dev/null 2>&1; then
   PTY_D="$(script -q /dev/null "$PERM" ask --repo "$PROT_REPO" --interactive-only </dev/null 2>&1 | tr -d '\r' || true)"
-  printf '%s' "$PTY_D" | grep -q "$PROMPT_MARK" \
+  grep -q "$PROMPT_MARK" <<<"$PTY_D" \
     && ok "(20) FALSIFIER: with a REAL pty --interactive-only ASKS (it defers, it never disables)" \
     || bad "(20) --interactive-only failed to ask on a real terminal"
-  printf '%s' "$PTY_D" | grep -q 'Full Disk Access' \
+  grep -q 'Full Disk Access' <<<"$PTY_D" \
     && ok "(20) the pty path still prints the full block before the prompt" \
     || bad "(20) --interactive-only dropped the block on a real terminal"
 else

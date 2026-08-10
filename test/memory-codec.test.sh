@@ -93,13 +93,13 @@ echo "A. PLAIN FALLBACK with the backend ABSENT (invariant 3 — this machine):"
 ST="$(python3 "$CODEC" status --json 2>/dev/null)"; RC=$?
 [ "$RC" -eq 0 ] && ok "codec status exits 0 with no codec installed" \
                 || bad "codec status exited $RC"
-printf '%s' "$ST" | grep -q '"backend": "plain"' \
+grep -q '"backend": "plain"' <<<"$ST" \
   && ok "backend resolves to plain (headroom absent → degrade, not error)" \
   || bad "backend is not plain: $ST"
-printf '%s' "$ST" | grep -q '"headroom_importable": false' \
+grep -q '"headroom_importable": false' <<<"$ST" \
   && ok "headroom is NOT importable here (it must never be a hard dependency)" \
   || bad "headroom appears importable — this test asserts the absent-backend path"
-printf '%s' "$ST" | grep -q '"available": false' \
+grep -q '"available": false' <<<"$ST" \
   && ok "available=false — 'no codec' is a supported state, not a failure" \
   || bad "available is not false"
 
@@ -111,7 +111,7 @@ OUT="$("$CLI" write --repo "$GR" --home "$HOME_DIR" --cache-dir "$CACHE" \
 [ "$RC" -eq 0 ] && ok "write succeeds with no codec installed (exit 0)" \
                 || bad "write exited $RC with no codec"
 ID_A="$(printf '%s' "$OUT" | python3 -c 'import sys,json; print(json.load(sys.stdin)["entry"]["id"])' 2>/dev/null)"
-printf '%s' "$OUT" | grep -q '"status": "live"' \
+grep -q '"status": "live"' <<<"$OUT" \
   && ok "the entry verifies LIVE at write time — the codec seam changed no verdict" \
   || bad "entry did not verify live"
 [ ! -s "$WORK/a.err" ] && ok "nothing printed to stderr — absence degrades SILENTLY" \
@@ -495,7 +495,7 @@ with open(store, "w", encoding="utf-8") as fh:
 vm._codec_hint(store)
 PY
 )"
-printf '%s' "$HINT_ERR" | grep -qF "hmd: hmd can compress its memory stores via Headroom if installed — optional." \
+grep -qF "hmd: hmd can compress its memory stores via Headroom if installed — optional." <<<"$HINT_ERR" \
   && ok "the hint is emitted on STDERR (stdout stays the JSON contract)" \
   || bad "the hint did not reach stderr: [$HINT_ERR]"
 

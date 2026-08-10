@@ -169,20 +169,20 @@ run_as "$B_HAID" -- "$GATE" publish --attest "$ATTDIR/b.json" >/dev/null 2>&1
 TEAM="$(run_as "$C_HAID" -- "$WHO" team 2>/dev/null)"
 
 # (2) AGGREGATE — all three verdict states present in one view.
-if printf '%s' "$TEAM" | grep -q "PROVEN" && printf '%s' "$TEAM" | grep -q "BLOCKED" && printf '%s' "$TEAM" | grep -qi "pending"; then
+if grep -q "PROVEN" <<<"$TEAM" && grep -q "BLOCKED" <<<"$TEAM" && grep -qi "pending" <<<"$TEAM"; then
   ok "team view shows aggregate PROVEN + BLOCKED + pending across active devs"
 else
   bad "team view is missing one of PROVEN / BLOCKED / pending"
 fi
 
 # (3) BLOCKED IS BLOCKED — the failing gate + loc, never softened.
-if printf '%s' "$TEAM" | grep -Eq 'raj.*BLOCKED.*secret-scan.*cards\.ts:5'; then
+if grep -Eq 'raj.*BLOCKED.*secret-scan.*cards\.ts:5' <<<"$TEAM"; then
   ok "BLOCKED renders with the failing gate + loc (secret-scan, cards.ts:5)"
 else
   bad "BLOCKED was softened / lost its gate+loc receipt"
 fi
 # It must NOT be downgraded to a soft word.
-if printf '%s' "$TEAM" | grep -Eq 'raj.*(warn|ok|passed|fine)'; then
+if grep -Eq 'raj.*(warn|ok|passed|fine)' <<<"$TEAM"; then
   bad "raj's BLOCKED verdict was softened to a non-blocking word"
 else
   ok "raj's BLOCKED verdict is never softened (honest)"
@@ -193,13 +193,13 @@ fi
 # not a P2-parallel store. The verdict view's JSON also reads the activity haid.
 run_as "$B_HAID" -- "$GATE" retract >/dev/null 2>&1
 TEAM_NO_BVERDICT="$(run_as "$C_HAID" -- "$WHO" team 2>/dev/null)"
-if printf '%s' "$TEAM_NO_BVERDICT" | grep -q "raj" && printf '%s' "$TEAM_NO_BVERDICT" | grep -Fq "payments"; then
+if grep -q "raj" <<<"$TEAM_NO_BVERDICT" && grep -Fq "payments" <<<"$TEAM_NO_BVERDICT"; then
   ok "a dev with a P1 activity record but no verdict still appears (JOIN on P1, no parallel store)"
 else
   bad "removing the verdict removed the dev — P2 is NOT reading P1's activity (parallel store)"
 fi
 # And with its verdict gone, raj now reads as pending — never an invented pass.
-if printf '%s' "$TEAM_NO_BVERDICT" | grep -Eq 'raj.*pending'; then
+if grep -Eq 'raj.*pending' <<<"$TEAM_NO_BVERDICT"; then
   ok "a dev whose verdict was retracted reads as pending (not a fabricated pass)"
 else
   bad "a dev with no current verdict did not honestly read pending"
@@ -208,7 +208,7 @@ fi
 run_as "$B_HAID" -- "$GATE" publish --attest "$ATTDIR/b.json" >/dev/null 2>&1
 
 # (5a) NO FABRICATION — priya has activity but never published a verdict → pending.
-if printf '%s' "$TEAM" | grep -Eq 'priya.*pending'; then
+if grep -Eq 'priya.*pending' <<<"$TEAM"; then
   ok "a dev with no published verdict shows pending, never an invented pass"
 else
   bad "a verdict-less dev did not show pending (possible fabricated status)"

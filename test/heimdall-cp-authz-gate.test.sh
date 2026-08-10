@@ -381,7 +381,7 @@ def leak(identity, team_id, home=None):
     return {"secret": cred}
 PYEOF
 FAL_HITS="$("$PY" "$EXT/inv6_scan.py" "$EXT/inv6_falsifier.py")"
-if printf '%s' "$FAL_HITS" | grep -q "get_team_cred"; then
+if grep -q "get_team_cred" <<<"$FAL_HITS"; then
   ok "INV-6 FALSIFIER: a cred-READ (get_team_cred) added to the public surface IS caught — the refined check is load-bearing, not deleted"
 else
   bad "INV-6 FALSIFIER did not fire — the refined check is a no-op that would miss a real cred read (hits=$FAL_HITS)"

@@ -380,7 +380,7 @@ CLOUD_OUT="$(env -u HEIMDALL_CP_PKI_KEY K_SERVICE=svc HEIMDALL_HOME="$(mktemp -d
   "$REPO/bin/heimdall-control-plane" identity --haid haid:cp-server 2>/dev/null)"
 CLOUD_RC=$?
 set -e
-if [ "$CLOUD_RC" -ne 0 ] && printf '%s' "$CLOUD_OUT" | grep -q '"pki_key_absent"'; then
+if [ "$CLOUD_RC" -ne 0 ] && grep -q '"pki_key_absent"' <<<"$CLOUD_OUT"; then
   ok "b1 cloud profile + absent seed REFUSED (exit $CLOUD_RC, reason pki_key_absent) — no per-instance mint"
 else
   bad "b1 cloud profile + absent seed did NOT fail-closed (exit $CLOUD_RC, out=$CLOUD_OUT)"
@@ -392,7 +392,7 @@ LOCAL_OUT="$(env -u HEIMDALL_CP_PKI_KEY -u K_SERVICE -u HEIMDALL_STATE_BACKEND \
   "$REPO/bin/heimdall-control-plane" identity --haid haid:dev 2>/dev/null)"
 LOCAL_RC=$?
 set -e
-if [ "$LOCAL_RC" -eq 0 ] && printf '%s' "$LOCAL_OUT" | grep -q '"key_source": "minted"'; then
+if [ "$LOCAL_RC" -eq 0 ] && grep -q '"key_source": "minted"' <<<"$LOCAL_OUT"; then
   ok "b2 local profile + absent seed still MINTS a dev key (exit 0, key_source=minted) — dev preserved"
 else
   bad "b2 local profile + absent seed broke the dev mint path (exit $LOCAL_RC, out=$LOCAL_OUT)"

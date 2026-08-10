@@ -130,7 +130,7 @@ if [ "$RC" = 0 ]; then
 else
   bad "clean gates => push PROCEEDS (exit 0)" "got exit $RC; stdout=$OUT; stderr=$ERR"
 fi
-if printf '%s' "$OUT" | grep -q 'BLOCKED'; then
+if grep -q 'BLOCKED' <<<"$OUT"; then
   bad "clean gates => no BLOCKED verdict emitted" "stdout=$OUT"
 else
   ok "clean gates => no BLOCKED verdict emitted"
@@ -144,19 +144,19 @@ if [ "$RC" = 0 ]; then
 else
   bad "absent state file => push PROCEEDS" "got exit $RC; stdout=$OUT; stderr=$ERR"
 fi
-if printf '%s' "$ERR" | grep -qi 'UNAVAILABLE'; then
+if grep -qi 'UNAVAILABLE' <<<"$ERR"; then
   ok "absent state file => verdict reported UNAVAILABLE on stderr (loud, not silent)"
 else
   bad "absent state file => verdict reported UNAVAILABLE on stderr" "stderr=$ERR"
 fi
-if printf '%s' "$ERR" | grep -q 'heimdall-state init'; then
+if grep -q 'heimdall-state init' <<<"$ERR"; then
   ok "absent-state warning is ACTIONABLE (names the command that arms the gate)"
 else
   bad "absent-state warning is ACTIONABLE" "stderr=$ERR"
 fi
 
 # === CASE 4: ANTI-VACUOUS — absent data must never be reported as a pass =====
-if printf '%s' "$ERR" | grep -qi 'all quality gates pass'; then
+if grep -qi 'all quality gates pass' <<<"$ERR"; then
   bad "absent state must NOT be reported as gates passing" "stderr=$ERR"
 else
   ok "absent state is NOT reported as a pass (no vacuous green)"
@@ -183,7 +183,7 @@ fi
 # The defect was `; heimdall-state check-quality-gates;` with its exit code
 # discarded. Assert the command never invokes check-quality-gates as a bare
 # statement again (it must be captured into a variable or tested in a condition).
-if printf '%s' "$HOOK_CMD" | grep -qE '(^|;|then|else|do|&&|\|\|)[[:space:]]+"?\$?(HSTATE|heimdall-state)"?[[:space:]]+check-quality-gates[[:space:]]*;'; then
+if grep -qE '(^|;|then|else|do|&&|\|\|)[[:space:]]+"?\$?(HSTATE|heimdall-state)"?[[:space:]]+check-quality-gates[[:space:]]*;' <<<"$HOOK_CMD"; then
   bad "check-quality-gates is not a bare fire-and-forget statement" "found the discarded-exit-code form in hooks.json"
 else
   ok "check-quality-gates is not a bare fire-and-forget statement"
@@ -191,7 +191,7 @@ fi
 
 # The positive half of the same lock: the verdict must actually be CAPTURED.
 # Without this, deleting the call entirely would satisfy the negative check above.
-if printf '%s' "$HOOK_CMD" | grep -qE '\$\([^)]*check-quality-gates'; then
+if grep -qE '\$\([^)]*check-quality-gates' <<<"$HOOK_CMD"; then
   ok "check-quality-gates verdict is captured into a variable (exit code observable)"
 else
   bad "check-quality-gates verdict is captured into a variable" "no \$( ... check-quality-gates ... ) capture found"

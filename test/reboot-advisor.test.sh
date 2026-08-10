@@ -103,22 +103,22 @@ report_high_clean() { env $REBOOT_ENV bash -c '
 
 # ── 1. high pressure + hmd clean → report emits a reboot recommendation ───────────
 out="$(report_high_clean)"
-printf '%s\n' "$out" | grep -qi 'reboot' && ok "report emits a reboot recommendation under high memory pressure" \
+grep -qi 'reboot' <<<"$out" && ok "report emits a reboot recommendation under high memory pressure" \
   || bad "report did NOT recommend a reboot despite swap 95% / wired 85%"
 
 # ── 2. ATTRIBUTION HONESTY: it EXPLICITLY says this is NOT heimdall ───────────────
-if printf '%s\n' "$out" | grep -qi 'NOT heimdall' && printf '%s\n' "$out" | grep -qi 'no hmd python leak'; then
+if grep -qi 'NOT heimdall' <<<"$out" && grep -qi 'no hmd python leak' <<<"$out"; then
   ok "report explicitly attributes the pressure AWAY from heimdall (NOT heimdall · no hmd leak)"
 else
   bad "report failed to say hmd is NOT the cause — the user could infer hmd is the hog"
 fi
-printf '%s\n' "$out" | grep -qi 'cannot free kernel-wired memory' \
+grep -qi 'cannot free kernel-wired memory' <<<"$out" \
   && ok "report states hmd cannot free kernel-wired memory (honest limit of its reach)" \
   || bad "report omitted the honest 'cannot free kernel-wired memory' limit"
 
 # ── 3. TRUTH-PASS: the cited swap%/wired figures MATCH the fixture readings ───────
-if printf '%s\n' "$out" | grep -q '95%' && printf '%s\n' "$out" | grep -q 'wired 85%' \
-   && printf '%s\n' "$out" | grep -q '16.0G/17.0G'; then
+if grep -q '95%' <<<"$out" && grep -q 'wired 85%' <<<"$out" \
+   && grep -q '16.0G/17.0G' <<<"$out"; then
   ok "cited numbers match the fixture (swap 16.0G/17.0G=95%, wired 85%) — no bare claim"
 else
   bad "cited numbers do NOT match the fixture — a figure was fabricated or dropped"
@@ -127,25 +127,25 @@ fi
 # ~0MB used to be printed as "hmd-owned garbage total", which read as covering memory AND
 # disk; a forensic sweep found 100MB of reapable merged worktrees on disk at that same
 # moment. So the memory figure must be labelled MEMORY, and disk reported as its own axis.
-if printf '%s\n' "$out" | grep -q 'MEMORY axis' \
-   && printf '%s\n' "$out" | grep -q '~0MB of hmd-owned'; then
+if grep -q 'MEMORY axis' <<<"$out" \
+   && grep -q '~0MB of hmd-owned' <<<"$out"; then
   ok "report quantifies the hmd footprint PER AXIS (memory labelled, disk reported separately)"
 else
   bad "report did not cite the hmd-reclaimable MB scoped to the axis that measured it"
 fi
-printf '%s\n' "$out" | grep -q 'of hmd-owned garbage total' \
+grep -q 'of hmd-owned garbage total' <<<"$out" \
   && bad "report still presents one figure as the hmd-owned TOTAL (memory and disk conflated)" \
   || ok "report no longer conflates the memory and disk figures into a single 'total'"
 
 # ── 4. NON-SPAMMY: low pressure → NO reboot nag ──────────────────────────────────
 lout="$(run_clean "$JSON_LOW" "" report 2>&1)"
-printf '%s\n' "$lout" | grep -qi 'reboot' \
+grep -qi 'reboot' <<<"$lout" \
   && bad "report nagged about a reboot on a HEALTHY machine (swap 5% / wired 22%)" \
   || ok "no reboot nag on a healthy machine (non-spammy)"
 
 # ── 5. the --advise (SessionStart) path emits the same honest recommendation ──────
 aout="$(run_clean "$JSON_HIGH" "" --advise --quick 2>&1)"
-if printf '%s\n' "$aout" | grep -qi 'reboot' && printf '%s\n' "$aout" | grep -qi 'NOT heimdall'; then
+if grep -qi 'reboot' <<<"$aout" && grep -qi 'NOT heimdall' <<<"$aout"; then
   ok "--advise emits the honest reboot recommendation (SessionStart advisory path)"
 else
   bad "--advise did not emit the honest reboot recommendation: $aout"
@@ -157,9 +157,9 @@ alow="$(run_clean "$JSON_LOW" "" --advise --quick 2>&1)"
 
 # ── 6. high pressure + an hmd LEAK → recommend --apply FIRST, THEN reboot ─────────
 lkout="$(run_clean "$JSON_HIGH" "100 101" --advise --quick 2>&1)"
-if printf '%s\n' "$lkout" | grep -qi 'Part of it IS heimdall' \
-   && printf '%s\n' "$lkout" | grep -q 'heimdall-cleanup --apply' \
-   && printf '%s\n' "$lkout" | grep -qi 'reboot'; then
+if grep -qi 'Part of it IS heimdall' <<<"$lkout" \
+   && grep -q 'heimdall-cleanup --apply' <<<"$lkout" \
+   && grep -qi 'reboot' <<<"$lkout"; then
   ok "with an hmd python leak, advise recommends --apply FIRST then reboot (hmd owns its part)"
 else
   bad "leak case did not recommend --apply-first-then-reboot: $lkout"

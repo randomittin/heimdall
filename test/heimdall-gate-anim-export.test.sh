@@ -43,7 +43,7 @@ R1="$WORK/reels1"
 out1="$(HMD_REELS_DIR="$R1" HMD_GATE_NAME="gate-deny-fixed" \
         bash "$ANIM" deny "oracle/falsify" test-haid 2>&1)"; rc1=$?
 if [ "$rc1" -eq 0 ]; then ok "deny run exits 0"; else bad "deny run exits 0 (rc=$rc1)"; fi
-if printf '%s' "$out1" | grep -q 'artifact'; then ok "deny run prints an artifact line"; else bad "deny run prints an artifact line"; fi
+if grep -q 'artifact' <<<"$out1"; then ok "deny run prints an artifact line"; else bad "deny run prints an artifact line"; fi
 # the printed primary path must point at a real, non-empty file
 prim1="$(printf '%s\n' "$out1" | sed -nE 's/.*artifact[^/]*([/][^ ]*).*/\1/p' | head -1)"
 if [ -n "$prim1" ] && [ -s "$prim1" ]; then ok "printed artifact path is a real non-empty file"; else bad "printed artifact path is a real non-empty file (got '$prim1')"; fi
@@ -64,7 +64,7 @@ if [ -s "$R2/gate-deny-degraded.txt" ]; then ok "degraded deny writes .txt fallb
 # with tools hidden there must be NO gif/png (honest degradation, never a broken file)
 if [ ! -e "$R2/gate-deny-degraded.gif" ] && [ ! -e "$R2/gate-deny-degraded.png" ]; then ok "degraded deny produces no gif/png (honest)"; else bad "degraded deny produces no gif/png (honest)"; fi
 # the primary the run prints must be the .txt
-if printf '%s' "$out2" | grep -q '\.txt'; then ok "degraded deny prints the .txt as artifact"; else bad "degraded deny prints the .txt as artifact"; fi
+if grep -q '\.txt' <<<"$out2"; then ok "degraded deny prints the .txt as artifact"; else bad "degraded deny prints the .txt as artifact"; fi
 
 # ── 3. replay reconstructs verdict/domain from a crafted report.json ────────
 # a fail report → deny

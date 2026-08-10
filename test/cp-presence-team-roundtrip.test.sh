@@ -200,7 +200,7 @@ set +e
 STRICT_ERR="$(env "${common_env[@]}" HMD_PRESENCE_STRICT=1 "$PRESENCE_CLI" beat 2>&1 1>/dev/null)"
 STRICT_RC=$?
 set -e
-if [ "$STRICT_RC" -ne 0 ] && printf '%s' "$STRICT_ERR" | grep -qi "beat"; then
+if [ "$STRICT_RC" -ne 0 ] && grep -qi "beat" <<<"$STRICT_ERR"; then
   ok "E1 STRICT: an undeliverable beat exits nonzero ($STRICT_RC) with a stderr diagnostic ($STRICT_ERR)"
 else
   bad "E1 STRICT: the undeliverable beat faked success (rc=$STRICT_RC, err='$STRICT_ERR')"
@@ -213,7 +213,7 @@ DEF_RC=$?
 set -e
 DEF_STDERR="$(cat "$EXT/def.err")"
 DEF_STDOUT="$(cat "$EXT/def.out")"
-if [ "$DEF_RC" -eq 0 ] && [ -z "$DEF_STDOUT" ] && printf '%s' "$DEF_STDERR" | grep -qi "beat"; then
+if [ "$DEF_RC" -eq 0 ] && [ -z "$DEF_STDOUT" ] && grep -qi "beat" <<<"$DEF_STDERR"; then
   ok "E2 DEFAULT: exit 0 + clean stdout (statusline-safe) yet the drop is NAMED on stderr ($DEF_STDERR)"
 else
   bad "E2 DEFAULT: expected exit0/clean-stdout/stderr-diagnostic (rc=$DEF_RC, out='$DEF_STDOUT', err='$DEF_STDERR')"

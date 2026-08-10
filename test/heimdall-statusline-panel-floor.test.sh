@@ -388,13 +388,13 @@ done
 # them red; if it does not, this gate has regressed to decoration again.
 for hc in 120 160 200; do
   outw="$(render "$hc")"
-  if printf '%s' "$outw" | grep -q '▓'; then
+  if grep -q '▓' <<<"$outw"; then
     E_PASS=$((E_PASS+1)); printf '  ok   BARS@%s: Row4 emits real ▓ micro-gauge bars\n' "$hc"
   else
     E_FAIL=$((E_FAIL+1))
     printf '  FAIL BARS@%s: Row4 emitted no ▓ — the bars downgraded to text (the panel floor did not reach main())\n' "$hc"
   fi
-  if printf '%s' "$outw" | grep -q '41/41'; then
+  if grep -q '41/41' <<<"$outw"; then
     E_PASS=$((E_PASS+1)); printf '  ok   GATES@%s: Row3 keeps its gate details\n' "$hc"
   else
     E_FAIL=$((E_FAIL+1))

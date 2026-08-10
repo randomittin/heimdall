@@ -222,7 +222,7 @@ else
   bad "(6) with the repo unreadable dream still wrote its report (expected $DENIED_REPORT)"
   printf '       output was: %s\n' "$(printf '%s' "$DENIED_OUT" | head -3)"
 fi
-if printf '%s' "$DENIED_OUT" | grep -q 'Traceback'; then
+if grep -q 'Traceback' <<<"$DENIED_OUT"; then
   bad "(6) the unreadable-repo run raised no traceback"
 else
   ok "(6) the unreadable-repo run raised no traceback"

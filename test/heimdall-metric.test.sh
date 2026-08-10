@@ -139,13 +139,13 @@ R4="$(mk_repo noleak)"
   --type 'Fix the AWS key AKIA1234567890ABCDEF in src/config.ts and redeploy prod' \
   --model opus --outcome pass >/dev/null
 L="$(last "$R4")"
-printf '%s' "$L" | grep -q 'AKIA1234567890ABCDEF' \
+grep -q 'AKIA1234567890ABCDEF' <<<"$L" \
   && bad "(5) LEAKED a secret-shaped token into the corpus: $L" \
   || ok "(5) free text cannot carry a secret into the corpus"
 TT="$(printf '%s' "$L" | jq -r '.task_type')"
 [ "${#TT}" -le 32 ] && ok "(5) task_type capped at 32 chars (got ${#TT})" \
   || bad "(5) task_type not capped: ${#TT} chars"
-printf '%s' "$TT" | grep -Eq '^[a-z0-9][a-z0-9_-]*$' \
+grep -Eq '^[a-z0-9][a-z0-9_-]*$' <<<"$TT" \
   && ok "(5) task_type is a strict slug ($TT)" || bad "(5) task_type not slugged: $TT"
 printf '%s' "$L" | jq -e 'has("prompt") or has("body") or has("content") or has("files")' >/dev/null \
   && bad "(5) record carries a prompt/body/content/files key" \

@@ -62,12 +62,12 @@ else
   bad "identity.json is not valid JSON"
 fi
 WHO="$(id "$S1" -- whoami 2>/dev/null)"
-if printf '%s' "$WHO" | grep -q "watchman-rj"; then
+if grep -q "watchman-rj" <<<"$WHO"; then
   ok "whoami reflects the chosen handle (watchman-rj)"
 else
   bad "whoami does not reflect the set handle"
 fi
-if printf '%s' "$WHO" | grep -q "identity-file"; then
+if grep -q "identity-file" <<<"$WHO"; then
   ok "whoami reports source=identity-file once set"
 else
   bad "whoami did not report the identity-file source"

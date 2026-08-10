@@ -59,8 +59,8 @@ else
 
   # 5. Ordering: the guard must appear BEFORE the success printf, otherwise the
   #    string is emitted regardless of what the guard later decides.
-  g="$(printf '%s' "$B" | grep -n '= "installed" \]' | head -1 | cut -d: -f1)"
-  p="$(printf '%s' "$B" | grep -n '"%s" installed' | head -1 | cut -d: -f1)"
+  g="$(grep -n '= "installed" \]' <<<"$B" | head -1 | cut -d: -f1)"
+  p="$(grep -n '"%s" installed' <<<"$B" | head -1 | cut -d: -f1)"
   if [ -n "$g" ] && [ -n "$p" ] && [ "$g" -lt "$p" ]; then ok
   else bad "the success printf is not downstream of the state guard (guard=$g printf=$p)"; fi
 fi

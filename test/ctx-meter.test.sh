@@ -91,9 +91,9 @@ notice() { # [session]
 }
 both() { printf '%s%s' "$OUT" "$ERR"; }
 
-has()   { printf '%s' "$1" | grep -qF "$2"; }
-hasre() { printf '%s' "$1" | grep -qE "$2"; }
-hasrei(){ printf '%s' "$1" | grep -qiE "$2"; }   # case-insensitive: renders SHOUT
+has()   { grep -qF "$2" <<<"$1"; }
+hasre() { grep -qE "$2" <<<"$1"; }
+hasrei(){ grep -qiE "$2" <<<"$1"; }   # case-insensitive: renders SHOUT
 
 # ── 0. the binary exists and is executable ───────────────────────────────────────
 sec "0. THE METER EXISTS:"

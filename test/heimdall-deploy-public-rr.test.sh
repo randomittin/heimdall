@@ -66,7 +66,7 @@ echo "── deploy-public-rr.sh — hermetic W4 falsifier ───────
 # (run with a PATH that has NO fake gcloud — proves dry-run touches no external tool.)
 OUT="$(PATH="/usr/bin:/bin:/usr/sbin:/sbin" bash "$SUT" --dry-run 2>&1)"; RC=$?
 [ "$RC" = "0" ] && ok "dry-run exits 0 with no args/creds" || bad "dry-run exit=$RC (expected 0)"
-plan_has() { printf '%s' "$OUT" | grep -qF "$1" && ok "dry-run plan: $2" || bad "dry-run plan MISSING: $2 ($1)"; }
+plan_has() { grep -qF "$1" <<<"$OUT" && ok "dry-run plan: $2" || bad "dry-run plan MISSING: $2 ($1)"; }
 plan_has "1. preflight"                              "preflight step present"
 plan_has "services enable run.googleapis.com"        "enables run API (guarded)"
 plan_has "secretmanager.googleapis.com"              "enables secretmanager API"
@@ -92,7 +92,7 @@ plan_has "(secret heimdall-gh-app-private-key exists)" "gh-app key secret create
 plan_has "(secret cp-enroll-token exists)"           "enroll-token secret create is idempotent (|| exists)"
 plan_has "serviceAccount:<RESOLVED-RUNTIME-SA>"      "grants bind the RESOLVED SA, not a hardcoded one"
 # the hardcoded runtime SA that caused the live break must NEVER appear in the plan.
-if printf '%s' "$OUT" | grep -qF "heimdall-cp-run@"; then
+if grep -qF "heimdall-cp-run@" <<<"$OUT"; then
   bad "HARDCODED SA LEAK — heimdall-cp-run@ appears in the plan (the exact live-deploy bug)"
 else ok "no hardcoded heimdall-cp-run@ SA anywhere in the plan"; fi
 # ordering: preflight before deploy before verify.
@@ -106,27 +106,27 @@ KEYF="$WORK/app.pem"
 printf -- '-----BEGIN RSA PRIVATE KEY-----\nSENTINELKEYMATERIAL_DO_NOT_ECHO\n-----END RSA PRIVATE KEY-----\n' > "$KEYF"
 OUT="$(PATH="/usr/bin:/bin" bash "$SUT" --dry-run --gh-app-id 8675309SENTINELID --gh-app-key-file "$KEYF" 2>&1)"; RC=$?
 [ "$RC" = "0" ] && ok "dry-run with provided creds still exits 0" || bad "dry-run w/creds exit=$RC (expected 0)"
-if printf '%s' "$OUT" | grep -q "SENTINEL"; then
+if grep -q "SENTINEL" <<<"$OUT"; then
   bad "SECRET LEAK — a SENTINEL value (App id or key material) appeared in the plan output"
 else ok "no secret echoed — neither the App id nor the key PEM appears in the plan"; fi
 
 # ── 3. SA-account preflight warns LOUDLY + refuses (nonzero) ───────────────────────────────
 run_sut "PATH=$FAKEBIN:/usr/bin:/bin" "FAKE_GCLOUD_ACCOUNT=cp-run@heimdall-control-plane.iam.gserviceaccount.com" \
   -- --gh-app-id 123456 --gh-app-key-file "$KEYF"
-if [ "$RC" != "0" ] && printf '%s' "$OUT" | grep -qi "SERVICE ACCOUNT"; then
+if [ "$RC" != "0" ] && grep -qi "SERVICE ACCOUNT" <<<"$OUT"; then
   ok "SA active account -> loud warning + refusal (exit=$RC)"
 else bad "SA active account did NOT warn+refuse (exit=$RC)"; fi
-printf '%s' "$OUT" | grep -q "gserviceaccount.com" \
+grep -q "gserviceaccount.com" <<<"$OUT" \
   && ok "SA warning names the offending *.gserviceaccount.com identity" \
   || bad "SA warning did not surface the gserviceaccount identity"
 
 # ── 4. human account is accepted (control) — no SA warning; stops on the next gate ─────────
 run_sut "PATH=$FAKEBIN:/usr/bin:/bin" "FAKE_GCLOUD_ACCOUNT=rj@superpe.co" "FAKE_PROJECT_RC=1" \
   -- --gh-app-id 123456 --gh-app-key-file "$KEYF"
-if printf '%s' "$OUT" | grep -qi "SERVICE ACCOUNT"; then
+if grep -qi "SERVICE ACCOUNT" <<<"$OUT"; then
   bad "human account wrongly triggered the SA warning"
 else ok "human account -> no SA warning (SA branch is account-specific)"; fi
-printf '%s' "$OUT" | grep -q "human — ok" \
+grep -q "human — ok" <<<"$OUT" \
   && ok "human account is explicitly accepted at preflight" \
   || bad "human account was not accepted at preflight"
 
@@ -134,7 +134,7 @@ printf '%s' "$OUT" | grep -q "human — ok" \
 run_sut "PATH=/usr/bin:/bin" -- --bogus-flag
 [ "$RC" = "2" ] && ok "unknown flag -> exit 2" || bad "unknown flag exit=$RC (expected 2)"
 run_sut "PATH=/usr/bin:/bin" --   # real run, no creds
-if [ "$RC" != "0" ] && printf '%s' "$OUT" | grep -q "gh-app-id"; then
+if [ "$RC" != "0" ] && grep -q "gh-app-id" <<<"$OUT"; then
   ok "real run missing --gh-app-id -> refused (exit=$RC)"
 else bad "real run missing creds not refused (exit=$RC)"; fi
 
@@ -142,15 +142,15 @@ else bad "real run missing creds not refused (exit=$RC)"; fi
 OVR="custom-runtime@heimdall-cp-prod.iam.gserviceaccount.com"
 OUT="$(PATH="/usr/bin:/bin" bash "$SUT" --dry-run --runtime-sa "$OVR" --gh-app-id 1 --gh-app-key-file "$KEYF" 2>&1)"; RC=$?
 [ "$RC" = "0" ] && ok "dry-run with --runtime-sa exits 0" || bad "dry-run --runtime-sa exit=$RC (expected 0)"
-printf '%s' "$OUT" | grep -qF "explicit --runtime-sa" \
+grep -qF "explicit --runtime-sa" <<<"$OUT" \
   && ok "--runtime-sa is reported as the explicit override" \
   || bad "--runtime-sa override not reported"
 # every grant member must be the override, and the auto-detect sentinel must NOT be emitted.
-if printf '%s' "$OUT" | grep -qF "serviceAccount:${OVR}" \
-   && ! printf '%s' "$OUT" | grep -qF "serviceAccount:<RESOLVED-RUNTIME-SA>"; then
+if grep -qF "serviceAccount:${OVR}" <<<"$OUT" \
+   && ! grep -qF "serviceAccount:<RESOLVED-RUNTIME-SA>" <<<"$OUT"; then
   ok "grants bind the --runtime-sa override verbatim (no auto-detect sentinel)"
 else bad "--runtime-sa override not used for the grant members"; fi
-printf '%s' "$OUT" | grep -qE "describe heimdall-control-plane.*serviceAccountName" \
+grep -qE "describe heimdall-control-plane.*serviceAccountName" <<<"$OUT" \
   && bad "--runtime-sa given but the plan still runs the auto-detect describe" \
   || ok "--runtime-sa short-circuits the gated-service describe"
 

@@ -53,8 +53,8 @@ OUT="$(PATH="$SHIMDIR:$PATH" "$ARCHB" --repo acme/widgets --project heimdall-cp-
   || bad "dry-run INVOKED a real tool: $(cat "$SENTINEL" 2>/dev/null)"
 
 echo "== C. the FULL Arch-B plan is printed, in order =="
-has() { printf '%s' "$OUT" | grep -qF "$1" && ok "plan shows: $2" || bad "plan MISSING: $2"; }
-hasre() { printf '%s' "$OUT" | grep -qE "$1" && ok "plan shows: $2" || bad "plan MISSING: $2"; }
+has() { grep -qF "$1" <<<"$OUT" && ok "plan shows: $2" || bad "plan MISSING: $2"; }
+hasre() { grep -qE "$1" <<<"$OUT" && ok "plan shows: $2" || bad "plan MISSING: $2"; }
 hasre 'artifacts repositories create heimdall'                 "b. AR repo create (|| exists)"
 has  'gcloud builds submit'                                    "c. Cloud Build submit (no local docker)"
 has  'Dockerfile.maintainer'                                   "c. builds the maintainer Dockerfile via Cloud Build"
@@ -64,17 +64,17 @@ has  'deploy-maintainer.sh --cloud'                            "e. REUSE deploy-
 hasre 'run jobs describe heimdall-maintainer-job'              "f. verify jobs describe"
 # the docker->Cloud Build switch: the plan must NOT run a LOCAL docker build/push (falsifiable:
 # a reverted script that shells out to `$ docker build`/`$ docker push` fails this).
-if printf '%s' "$OUT" | grep -qE '\$ docker (build|push)'; then
+if grep -qE '\$ docker (build|push)' <<<"$OUT"; then
   bad "c. plan still runs LOCAL docker build/push (must build on Cloud Build)"
 else
   ok "c. plan runs NO local docker build/push (Cloud Build only — deployable without docker)"
 fi
 # ordering: Cloud Build submit precedes digest-pin precedes deploy precedes verify
 order_ok=1
-cb=$(printf '%s' "$OUT" | grep -n 'gcloud builds submit' | head -1 | cut -d: -f1)
-pin=$(printf '%s' "$OUT" | grep -n 'image_summary.digest' | head -1 | cut -d: -f1)
-dep=$(printf '%s' "$OUT" | grep -n 'deploy-maintainer.sh --cloud' | head -1 | cut -d: -f1)
-ver=$(printf '%s' "$OUT" | grep -n 'run jobs describe' | head -1 | cut -d: -f1)
+cb=$(grep -n 'gcloud builds submit' <<<"$OUT" | head -1 | cut -d: -f1)
+pin=$(grep -n 'image_summary.digest' <<<"$OUT" | head -1 | cut -d: -f1)
+dep=$(grep -n 'deploy-maintainer.sh --cloud' <<<"$OUT" | head -1 | cut -d: -f1)
+ver=$(grep -n 'run jobs describe' <<<"$OUT" | head -1 | cut -d: -f1)
 [ -n "$cb" ] && [ -n "$pin" ] && [ -n "$dep" ] && [ -n "$ver" ] \
   && [ "$cb" -lt "$pin" ] && [ "$pin" -lt "$dep" ] && [ "$dep" -lt "$ver" ] || order_ok=0
 [ "$order_ok" = 1 ] && ok "plan order: cloud-build < digest-pin < deploy < verify" || bad "plan steps out of order (cb=$cb pin=$pin dep=$dep ver=$ver)"
@@ -99,7 +99,7 @@ else
 fi
 
 echo "== G. no secret literal echoed in the dry-run output =="
-if printf '%s' "$OUT" | grep -qE 'sk-ant-(oat|api)|ghs-[A-Za-z0-9]'; then
+if grep -qE 'sk-ant-(oat|api)|ghs-[A-Za-z0-9]' <<<"$OUT"; then
   bad "G a token-shaped literal appeared in the plan output"
 else
   ok "G no sk-ant / ghs token literal anywhere in the dry-run plan"

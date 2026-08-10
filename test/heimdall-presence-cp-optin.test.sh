@@ -87,7 +87,7 @@ PERM="$(stat -f '%Lp' "$CONSENT" 2>/dev/null || stat -c '%a' "$CONSENT" 2>/dev/n
 [ "$PERM" = "600" ] && ok "1b cp-consent.json is mode 0600" || bad "1b cp-consent.json perms not 600 (got $PERM)"
 
 CPS="$(p1 cp-status 2>/dev/null)"
-if printf '%s' "$CPS" | grep -q "decision:  connected" && printf '%s' "$CPS" | grep -q "127.0.0.1:1"; then
+if grep -q "decision:  connected" <<<"$CPS" && grep -q "127.0.0.1:1" <<<"$CPS"; then
   ok "1c cp-status shows connected + the resolved url"
 else
   bad "1c cp-status wrong while connected -- $CPS"
@@ -101,7 +101,7 @@ else
 fi
 
 CPS2="$(p1 cp-status 2>/dev/null)"
-if printf '%s' "$CPS2" | grep -q "decision:  severed" && printf '%s' "$CPS2" | grep -qi "LOCAL/offline"; then
+if grep -q "decision:  severed" <<<"$CPS2" && grep -qi "LOCAL/offline" <<<"$CPS2"; then
   ok "1e cp-status shows severed + LOCAL/offline (not contacting the control plane)"
 else
   bad "1e cp-status wrong while severed -- $CPS2"
@@ -195,7 +195,7 @@ PYEOF
 
     # 2c cp-status (undecided) now names DEFAULT ON.
     CPS3="$(pres2 cp-status 2>/dev/null)"
-    if printf '%s' "$CPS3" | grep -q "decision:  undecided" && printf '%s' "$CPS3" | grep -qi "default on"; then
+    if grep -q "decision:  undecided" <<<"$CPS3" && grep -qi "default on" <<<"$CPS3"; then
       ok "2c cp-status (undecided) says default ON"
     else
       bad "2c cp-status undecided did not say default on -- $CPS3"
@@ -319,8 +319,8 @@ echo "5. undecided + non-interactive: one throttled hint, no persist, no block"
 H5="$TMP/home5"; mkdir -p "$H5"
 prompt5() { env -u HEIMDALL_CP_URL HOME="$H5" HMD_HAID="haid:t5" "$BIN" connect-prompt </dev/null; }
 OUT5A="$(prompt5 2>/dev/null)"; RC5A=$?
-if [ "$RC5A" -eq 0 ] && printf '%s' "$OUT5A" | grep -q "hmd presence sever" \
-   && printf '%s' "$OUT5A" | grep -qi "disables team/cloud" \
+if [ "$RC5A" -eq 0 ] && grep -q "hmd presence sever" <<<"$OUT5A" \
+   && grep -qi "disables team/cloud" <<<"$OUT5A" \
    && [ ! -f "$H5/.heimdall/cp-consent.json" ]; then
   ok "5a first call: prints the one-line OPT-OUT notice, exit 0, persists NOTHING (default ON, undecided stays undecided)"
 else

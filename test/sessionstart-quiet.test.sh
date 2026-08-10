@@ -58,7 +58,7 @@ trap cleanup EXIT
 # pointer, and tight enough that the 16/18-line blocks can never come back unnoticed.
 BUDGET=420
 
-nlines() { printf '%s' "$1" | grep -c '' || true; }
+nlines() { grep -c '' <<<"$1" || true; }
 nbytes() { printf '%s' "$1" | wc -c | tr -d ' '; }
 
 echo "sessionstart-quiet.test.sh"
@@ -94,15 +94,15 @@ nrun() { HEIMDALL_LAUNCH_AGENTS_DIR="$LA" "$NOTICE" --repo "$NREPO" --status "$S
 # The whole point of the hook. Quieting it must never cost the cause or the remedy.
 terse="$(nrun)"
 if [ -n "$terse" ] \
-   && printf '%s' "$terse" | grep -qi 'dream' \
-   && printf '%s' "$terse" | grep -qi 'not running' \
-   && printf '%s' "$terse" | grep -q 'TCC' \
-   && printf '%s' "$terse" | grep -qF "$DENIED"; then
+   && grep -qi 'dream' <<<"$terse" \
+   && grep -qi 'not running' <<<"$terse" \
+   && grep -q 'TCC' <<<"$terse" \
+   && grep -qF "$DENIED" <<<"$terse"; then
   ok "(1) TCC-blocked dream still SPEAKS and names the cause (TCC) + the denied path"
 else
   bad "(1) quieted dream-notice lost the cause or the denied path; got: $terse"
 fi
-printf '%s' "$terse" | grep -qi 'heimdall-dream-permission ask\|heimdall-dream .*run' \
+grep -qi 'heimdall-dream-permission ask\|heimdall-dream .*run' <<<"$terse" \
   && ok "(1) the terse notice still carries a RUNNABLE remedy" \
   || bad "(1) terse notice has no runnable remedy; got: $terse"
 
@@ -121,9 +121,9 @@ verb="$(nrun --verbose)"
 vl="$(nlines "$verb")"
 [ "$vl" -ge 10 ] && ok "(3) --verbose still emits the full block ($vl lines)" \
   || bad "(3) --verbose emitted only $vl lines — detail was DELETED, not moved"
-if printf '%s' "$verb" | grep -qi 'Full Disk Access' \
-   && printf '%s' "$verb" | grep -qi 'protected folder' \
-   && printf '%s' "$verb" | grep -qi 'LaunchAgent carries no TCC grant'; then
+if grep -qi 'Full Disk Access' <<<"$verb" \
+   && grep -qi 'protected folder' <<<"$verb" \
+   && grep -qi 'LaunchAgent carries no TCC grant' <<<"$verb"; then
   ok "(3) --verbose keeps the full TCC explanation and BOTH unattended routes"
 else
   bad "(3) --verbose lost part of the TCC explanation: $verb"
@@ -143,7 +143,7 @@ hv="$(HEIMDALL_LAUNCH_AGENTS_DIR="$LA" "$NOTICE" --repo "$HREPO" --status "$HSTA
 
 # ── (5) THE MACHINE CONTRACT IS UNCHANGED ───────────────────────────────────────
 js="$(nrun --json)"
-if printf '%s' "$js" | grep -q '"alert":true' && printf '%s' "$js" | grep -q '"reason":"tcc-denied"'; then
+if grep -q '"alert":true' <<<"$js" && grep -q '"reason":"tcc-denied"' <<<"$js"; then
   ok "(5) --json still reports alert:true + reason:tcc-denied (contract intact)"
 else
   bad "(5) --json contract changed: $js"
@@ -218,12 +218,12 @@ al="$(nlines "$aclean")"; ab="$(nbytes "$aclean")"
   || bad "(6) --advise never invoked heimdall-deadcode — the CODE axis was dropped"
 [ "$ab" -le "$BUDGET" ] && ok "(6) --advise line is ${ab}B (budget ${BUDGET}B)" \
   || bad "(6) --advise line is ${ab}B, over the ${BUDGET}B budget"
-if printf '%s' "$aclean" | grep -qi 'NOT heimdall' && printf '%s' "$aclean" | grep -qi 'reboot'; then
+if grep -qi 'NOT heimdall' <<<"$aclean" && grep -qi 'reboot' <<<"$aclean"; then
   ok "(6) the terse advisory still says the pressure is NOT heimdall"
 else
   bad "(6) attribution honesty was lost in the cut: $aclean"
 fi
-if printf '%s' "$aclean" | grep -q '95%' && printf '%s' "$aclean" | grep -q 'wired 85%'; then
+if grep -q '95%' <<<"$aclean" && grep -q 'wired 85%' <<<"$aclean"; then
   ok "(6) the terse advisory still cites the MEASURED figures (no bare claim)"
 else
   bad "(6) the cited figures were dropped: $aclean"
@@ -237,8 +237,8 @@ printf '%s' "$aclean" | grep -q -- '--verbose' \
 # expensive regression: hmd's own leak would go unreaped and unmentioned.
 aleak="$(advise "$JSON_HIGH" "100 101")"
 ll="$(nlines "$aleak")"
-if printf '%s' "$aleak" | grep -qi 'Part of it IS heimdall' \
-   && printf '%s' "$aleak" | grep -q 'heimdall-cleanup --apply'; then
+if grep -qi 'Part of it IS heimdall' <<<"$aleak" \
+   && grep -q 'heimdall-cleanup --apply' <<<"$aleak"; then
   ok "(7) the leak path still owns hmd's share and still recommends --apply"
 else
   bad "(7) the leak path lost the --apply recommendation: $aleak"
@@ -253,15 +253,15 @@ averb="$(advise "$JSON_HIGH" "" --verbose)"
 vl2="$(nlines "$averb")"
 [ "$vl2" -ge 10 ] && ok "(8) --advise --verbose still emits the full advisory ($vl2 lines)" \
   || bad "(8) --verbose emitted only $vl2 lines — the advisory was DELETED, not moved"
-if printf '%s' "$averb" | grep -qi 'cannot free kernel-wired memory' \
-   && printf '%s' "$averb" | grep -qi 'TEMPORARY reclaim, not the fix' \
-   && printf '%s' "$averb" | grep -qi 'reclaims it on its own' \
-   && printf '%s' "$averb" | grep -qi 'MEMORY axis'; then
+if grep -qi 'cannot free kernel-wired memory' <<<"$averb" \
+   && grep -qi 'TEMPORARY reclaim, not the fix' <<<"$averb" \
+   && grep -qi 'reclaims it on its own' <<<"$averb" \
+   && grep -qi 'MEMORY axis' <<<"$averb"; then
   ok "(8) --verbose keeps every accuracy correction (wired limit · reboot-temporary · swap · axis)"
 else
   bad "(8) an accuracy correction was lost from --verbose: $averb"
 fi
-printf '%s' "$averb" | grep -qE 'a restart is the fix|clear ONLY on reboot' \
+grep -qE 'a restart is the fix|clear ONLY on reboot' <<<"$averb" \
   && bad "(8) the falsified 'restart is the fix' claim came BACK into --verbose" \
   || ok "(8) --verbose still refuses the falsified 'restart is the fix' claim"
 

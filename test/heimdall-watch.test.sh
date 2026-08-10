@@ -200,20 +200,20 @@ fi
 
 # ── (8) TEXTUAL-ABSENT DEGRADE ───────────────────────────────────────────────
 if [ "$wrc" -eq 0 ]; then ok "(8) heimdall-watch-tui --once exits 0"; else bad "(8) --once exit rc=$wrc"; fi
-printf '%s' "$DUMP" | grep -qi 'WALL' && printf '%s' "$DUMP" | grep -qi 'FEED' \
+grep -qi 'WALL' <<<"$DUMP" && grep -qi 'FEED' <<<"$DUMP" \
   && ok "(8) static dump shows WALL + FEED sections" \
   || bad "(8) static dump missing WALL/FEED"
-printf '%s' "$DUMP" | grep -q 'you' && printf '%s' "$DUMP" | grep -q 'merge proven' \
+grep -q 'you' <<<"$DUMP" && grep -q 'merge proven' <<<"$DUMP" \
   && ok "(8) static dump renders roster member + newest feed event" \
   || bad "(8) static dump missing roster/feed content"
 if "$PY" -c 'import textual' 2>/dev/null; then
   ok "(8) textual present — install-hint path not exercised (ok)"
 else
-  printf '%s' "$DUMP" | grep -qi 'pip install textual' \
+  grep -qi 'pip install textual' <<<"$DUMP" \
     && ok "(8) textual-absent prints 'pip install textual' hint" \
     || bad "(8) textual-absent did not print install hint"
 fi
-if printf '%s' "$DUMP" | grep -n 'merge proven\|falsify 12/12' | head -2 \
+if grep -n 'merge proven\|falsify 12/12' <<<"$DUMP" | head -2 \
      | awk 'NR==1{a=$0} END{exit !(a ~ /merge proven/)}'; then
   ok "(8) feed is newest-first"
 else
@@ -240,7 +240,7 @@ chk "+ def get_user(uid, *, ctx):" "failing hunk (added line)"
 chk "12/12" "falsify numbers"
 chk "0.83" "reuse number"
 chk "40" "bloat number"
-printf '%s' "$INSP" | grep -qiE 'retr(y|ies)' && ok "(2) inspector shows retry history" || bad "(2) inspector missing retry history"
+grep -qiE 'retr(y|ies)' <<<"$INSP" && ok "(2) inspector shows retry history" || bad "(2) inspector missing retry history"
 
 # ── (3)+(4) KEYMAP conformance + SHELLS EXISTING CLI ─────────────────────────
 KEYOUT="$("$PY" - "$DATA" <<'PY' 2>&1
@@ -266,11 +266,11 @@ for pair in "j:select" "k:select" "enter:inspect" "c:clip" "i:invite" "p:presenc
     bad "(3) keymap $key NOT -> $act"
   fi
 done
-printf '%s' "$KEYOUT" | grep -qE 'SHELL clip -> hmd clip'         && ok "(4) c shells 'hmd clip'"     || bad "(4) c does not shell hmd clip"
-printf '%s' "$KEYOUT" | grep -qE 'SHELL invite -> hmd invite'     && ok "(4) i shells 'hmd invite'"   || bad "(4) i does not shell hmd invite"
-printf '%s' "$KEYOUT" | grep -qE 'SHELL presence -> hmd presence' && ok "(4) p shells 'hmd presence'" || bad "(4) p does not shell hmd presence"
-printf '%s' "$KEYOUT" | grep -qE 'SHELL approve -> hmd approve'   && ok "(4) a shells 'hmd approve'"  || bad "(4) a does not shell hmd approve"
-printf '%s' "$KEYOUT" | grep -qE 'SHELL deny -> hmd deny'         && ok "(4) d shells 'hmd deny'"     || bad "(4) d does not shell hmd deny"
+grep -qE 'SHELL clip -> hmd clip' <<<"$KEYOUT"         && ok "(4) c shells 'hmd clip'"     || bad "(4) c does not shell hmd clip"
+grep -qE 'SHELL invite -> hmd invite' <<<"$KEYOUT"     && ok "(4) i shells 'hmd invite'"   || bad "(4) i does not shell hmd invite"
+grep -qE 'SHELL presence -> hmd presence' <<<"$KEYOUT" && ok "(4) p shells 'hmd presence'" || bad "(4) p does not shell hmd presence"
+grep -qE 'SHELL approve -> hmd approve' <<<"$KEYOUT"   && ok "(4) a shells 'hmd approve'"  || bad "(4) a does not shell hmd approve"
+grep -qE 'SHELL deny -> hmd deny' <<<"$KEYOUT"         && ok "(4) d shells 'hmd deny'"     || bad "(4) d does not shell hmd deny"
 
 # ── (5)+(6)+(7) ENTITLEMENT ──────────────────────────────────────────────────
 ENT="$("$PY" - "$DATA" <<'PY' 2>&1
@@ -297,7 +297,7 @@ print("SIZE small_history_locked=%s" % e_small.locked("history"))
 print("SIZE big_history_locked=%s"   % e_big.locked("history"))
 PY
 )"
-egrep_ok() { printf '%s' "$ENT" | grep -qxF "$1" && ok "$2" || { bad "$2 (want: $1)"; printf '%s\n' "$ENT" | sed 's/^/      /'; }; }
+egrep_ok() { grep -qxF "$1" <<<"$ENT" && ok "$2" || { bad "$2 (want: $1)"; printf '%s\n' "$ENT" | sed 's/^/      /'; }; }
 egrep_ok "DEFAULT enforced=False"       "(6) dark flag defaults OFF"
 egrep_ok "DEFAULT history_locked=False" "(6) default: history UNLOCKED"
 egrep_ok "DEFAULT wall_locked=False"    "(6) default: wall UNLOCKED"
@@ -336,7 +336,7 @@ fi
 
 # ── (11) dispatcher route: `hmd watch` reaches the TUI launcher ──────────────
 HELP_OUT="$("$ROOT/bin/hmd" watch --help 2>&1 || true)"
-printf '%s' "$HELP_OUT" | grep -qi 'TUI dashboard' \
+grep -qi 'TUI dashboard' <<<"$HELP_OUT" \
   && ok "(11) 'hmd watch' routes to heimdall-watch-tui" \
   || bad "(11) 'hmd watch' did not route to the TUI launcher"
 
@@ -371,7 +371,7 @@ for r in bad_refs:
 print("ARGV", "ALLSAFE" if ok else "HASUNSAFE")
 PY
 )"
-printf '%s' "$SARG" | grep -q 'ARGV ALLSAFE' \
+grep -q 'ARGV ALLSAFE' <<<"$SARG" \
   && ok "(SEC-1) argv-injection: hostile ref never a flag/shell string (rejected, or positional after --)" \
   || { bad "(SEC-1) argv-injection: a data-derived ref reached the CLI as a flag/metachar"; printf '%s\n' "$SARG" | sed 's/^/      /'; }
 
@@ -395,10 +395,10 @@ for act in ["approve", "deny", "clip"]:
 print("LEGITHAID -> %s" % " ".join(wd.build_shell_argv("approve", "hmd", {"ref": "haid:rj-a3f9"})))
 PY
 )"
-printf '%s' "$LEGITARG" | grep -qE 'LEGIT approve -> hmd approve -- a3f1' \
+grep -qE 'LEGIT approve -> hmd approve -- a3f1' <<<"$LEGITARG" \
   && ok "(SEC-1c) legit ref still shells (positional after --)" \
   || { bad "(SEC-1c) legit ref no longer shells"; printf '%s\n' "$LEGITARG" | sed 's/^/      /'; }
-printf '%s' "$LEGITARG" | grep -qE 'LEGITHAID -> hmd approve -- haid:rj-a3f9' \
+grep -qE 'LEGITHAID -> hmd approve -- haid:rj-a3f9' <<<"$LEGITARG" \
   && ok "(SEC-1c) legit haid ref accepted by the allowlist" \
   || { bad "(SEC-1c) legit haid ref rejected by the allowlist"; printf '%s\n' "$LEGITARG" | sed 's/^/      /'; }
 
@@ -438,13 +438,13 @@ rel_blob = json.dumps(wd.read_receipt({"receipt_path": "report-a3f1.json", "ref"
 print("LEGITREL_OK" if "api_contract_break" in rel_blob else "LEGITREL_FAIL")
 PY
 )"
-printf '%s' "$STRAV" | grep -q 'TRAVERSAL ALLREFUSED' \
+grep -q 'TRAVERSAL ALLREFUSED' <<<"$STRAV" \
   && ok "(SEC-2) path-traversal: receipt reads confined to .heimdall (abs / .. / symlink escapes REFUSED)" \
   || { bad "(SEC-2) path-traversal: a crafted receipt_path escaped .heimdall"; printf '%s\n' "$STRAV" | sed 's/^/      /'; }
-printf '%s' "$STRAV" | grep -q 'LEGIT_OK' \
+grep -q 'LEGIT_OK' <<<"$STRAV" \
   && ok "(SEC-2c) legit in-base receipt (absolute) still readable" \
   || { bad "(SEC-2c) legit in-base receipt broke"; printf '%s\n' "$STRAV" | sed 's/^/      /'; }
-printf '%s' "$STRAV" | grep -q 'LEGITREL_OK' \
+grep -q 'LEGITREL_OK' <<<"$STRAV" \
   && ok "(SEC-2c) legit in-base receipt (relative) still readable" \
   || bad "(SEC-2c) legit relative in-base receipt broke"
 

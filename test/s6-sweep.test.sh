@@ -209,8 +209,8 @@ run_sweep() {
 rm -f "$WORK/hmd-was-called" "$WORK/spend-was-called"
 DRY_OUT="$(run_sweep --dry-run 2>&1)"; DRY_RC=$?
 if [ "$DRY_RC" -eq 0 ] \
-   && printf '%s' "$DRY_OUT" | grep -qiE 'dry.?run|plan' \
-   && printf '%s' "$DRY_OUT" | grep -qiE 'estimate' \
+   && grep -qiE 'dry.?run|plan' <<<"$DRY_OUT" \
+   && grep -qiE 'estimate' <<<"$DRY_OUT" \
    && [ ! -e "$WORK/hmd-was-called" ] && [ ! -e "$WORK/spend-was-called" ]; then
   ok "(a) --dry-run validates + prints plan + spend estimate, spends nothing (no hmd, no spend)"
 else
@@ -224,7 +224,7 @@ fi
 rm -f "$WORK/hmd-was-called" "$WORK/spend-was-called"
 DEF_OUT="$(run_sweep 2>&1)"; DEF_RC=$?
 if [ "$DEF_RC" -eq 0 ] \
-   && printf '%s' "$DEF_OUT" | grep -qiE 'dry.?run' \
+   && grep -qiE 'dry.?run' <<<"$DEF_OUT" \
    && [ ! -e "$WORK/hmd-was-called" ]; then
   ok "(b) default (no flags) == dry-run (safe-by-default)"
 else
@@ -375,7 +375,7 @@ if [ -f "$FAIL_REPORT" ]; then
   PASSV="$(jq -r '.results[0].working_output.pass' "$FAIL_REPORT")"
   BASEV="$(jq -r '.results[0].working_output.baseline_pass' "$FAIL_REPORT")"
   EVID="$(jq -r '.results[0].working_output.evidence' "$FAIL_REPORT")"
-  if [ "$PASSV" = "false" ] && [ "$BASEV" = "false" ] && printf '%s' "$EVID" | grep -q "boom"; then
+  if [ "$PASSV" = "false" ] && [ "$BASEV" = "false" ] && grep -q "boom" <<<"$EVID"; then
     ok "(e) working_output from evidence: failing baseline command => pass=false with quoted output"
   else
     bad "(e) failing command not captured as evidence (pass=$PASSV baseline=$BASEV)"; jq '.results[0].working_output' "$FAIL_REPORT"
@@ -407,8 +407,8 @@ if [ "$J1_RC" -eq 0 ] && [ -f "$J1_REPORT" ]; then
   AX="$(printf '%s' "$WO" | jq -r '.assertion_exit')"
   EV="$(printf '%s' "$WO" | jq -r '.evidence')"
   if [ "$P" = "false" ] && [ "$BP" = "true" ] && [ "$AP" = "false" ] && [ "$AX" = "1" ] \
-     && printf '%s' "$EV" | grep -q "suite-green" \
-     && printf '%s' "$EV" | grep -q "behavior-wrong"; then
+     && grep -q "suite-green" <<<"$EV" \
+     && grep -q "behavior-wrong" <<<"$EV"; then
     ok "(j1) baseline PASS + assertion FAIL => working_output.pass=false (both run, both quoted)"
   else
     bad "(j1) split gating wrong (pass=$P baseline=$BP assertion=$AP assertion_exit=$AX)"; printf '%s\n' "$WO"
@@ -517,7 +517,7 @@ fi
 # "ran the pinned sha" is provably distinct from "ran HEAD".
 SYM_AT_OLD="$(git -C "$MOCKREPO" show "$OLD_SHA:utils/feature.js" 2>/dev/null || true)"
 SYM_AT_HEAD="$(git -C "$MOCKREPO" show "$HEAD_SHA:utils/feature.js" 2>/dev/null || true)"
-if [ -z "$SYM_AT_OLD" ] && printf '%s' "$SYM_AT_HEAD" | grep -q "shippedLater"; then
+if [ -z "$SYM_AT_OLD" ] && grep -q "shippedLater" <<<"$SYM_AT_HEAD"; then
   ok "(h0) fixture is sound: shippedLater ABSENT at pinned OLD_SHA, PRESENT at HEAD"
 else
   bad "(h0) fixture not sound (old has symbol? head missing it?) old='${SYM_AT_OLD:0:30}'"

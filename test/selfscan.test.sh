@@ -249,14 +249,14 @@ if [ -n "$CFG" ]; then
   ( cd "$DETECT" && gitleaks detect --source . --config "$CFG" --log-opts="--all" --no-banner --report-format json --report-path "$RPT" ) >/dev/null 2>&1
   FOUND_FILES="$( [ -f "$RPT" ] && cat "$RPT" || echo '[]' )"
   # (i) detection intact: the non-fixture src/ path MUST be flagged.
-  if printf '%s' "$FOUND_FILES" | grep -Fq "$LEAK_PATH"; then
+  if grep -Fq "$LEAK_PATH" <<<"$FOUND_FILES"; then
     ok "real Stripe secret in $LEAK_PATH still CAUGHT under heimdall's shipped config"
   else
     bad "real secret in $LEAK_PATH NOT caught — detection weakened / config too broad"
   fi
   # (ii) allowlist narrow + actually works: the SAME secret in the allowlisted
   # fixture path must NOT be flagged.
-  if printf '%s' "$FOUND_FILES" | grep -Fq "$FIXTURE_PATH"; then
+  if grep -Fq "$FIXTURE_PATH" <<<"$FOUND_FILES"; then
     bad "allowlisted fixture path $FIXTURE_PATH was FLAGGED — the path allowlist is not taking effect"
   else
     ok "identical secret in allowlisted $FIXTURE_PATH NOT flagged (allowlist works, scoped to the fixture)"

@@ -140,7 +140,7 @@ confx() { # confx <binary> <args...>  -> $OUT, $ERR, $RC
 }
 conf() { confx "$CONF" "$@"; }
 
-has() { printf '%s' "$1" | grep -q "$2"; }
+has() { grep -q "$2" <<<"$1"; }
 
 echo ""
 echo "── protocol conformance (bin/heimdall-conformance) ──────────────────────────"
@@ -185,7 +185,7 @@ has "$A_OUT" '^VIOLATION.*abandoned worktree.*abandoned' \
   && ok "(A) and the tool EXITS 1 on it — a gate, not a note" \
   || bad "(A) exit was $A_RC, expected 1"
 
-printf '%s' "$A_OUT" | grep '^VIOLATION' | grep -q '	live	' \
+grep '^VIOLATION' <<<"$A_OUT" | grep -q '	live	' \
   && bad "(A) A LIVE WORKTREE WAS FLAGGED ABANDONED — this verdict discards work in flight" \
   || ok "(A) a LIVE dirty worktree is NEVER flagged — an agent mid-keystroke is not a violation"
 
@@ -193,11 +193,11 @@ has "$A_OUT" '^OK.*live agent mid-work.*	live	' \
   && ok "(A) it is reported positively as live, not merely omitted" \
   || bad "(A) the live worktree produced no OK line: $A_OUT"
 
-printf '%s' "$A_OUT" | grep '^VIOLATION' | grep -q 'noevidence' \
+grep '^VIOLATION' <<<"$A_OUT" | grep -q 'noevidence' \
   && bad "(A) a worktree with NO liveness evidence was accused — liveness must fail toward ALIVE" \
   || ok "(A) no evidence is not evidence of abandonment — an unresolvable id fails toward ALIVE"
 
-printf '%s' "$A_OUT" | grep -q 'clean' \
+grep -q 'clean' <<<"$A_OUT" \
   && bad "(A) a worktree with nothing uncommitted was reported at all: $A_OUT" \
   || ok "(A) a clean worktree is silent — the check is about UNCOMMITTED work only"
 
@@ -210,13 +210,13 @@ has "$A_OUT" 'inspected 4 worktree' \
 # and accusing it.
 touch_at $(( T0 - 899 )) "$SUB/agent-live.jsonl"
 conf commit-per-unit
-printf '%s' "$OUT" | grep '^VIOLATION' | grep -q '	live	' \
+grep '^VIOLATION' <<<"$OUT" | grep -q '	live	' \
   && bad "(A) idle 899s (< the 900s window) was called abandoned — off by one, in the costly direction" \
   || ok "(A) boundary: idle 899s of a 900s window is still ALIVE"
 
 touch_at $(( T0 - 900 )) "$SUB/agent-live.jsonl"
 conf commit-per-unit
-printf '%s' "$OUT" | grep '^VIOLATION' | grep -q '	live	' \
+grep '^VIOLATION' <<<"$OUT" | grep -q '	live	' \
   && ok "(A) boundary: idle exactly 900s crosses the window and IS flagged — the window is real" \
   || bad "(A) at the exact window the worktree was still spared — the staleness test never fires"
 
@@ -452,14 +452,14 @@ H50_OUT="$OUT"; H50_RC="$RC"
   && ok "(H) boundary: 50 rules clears the floor and every one is accounted for" \
   || bad "(H) 50 rules exited $H50_RC: $H50_OUT$ERR"
 
-H_ROWS="$(printf '%s' "$H50_OUT" | grep -c '^\(CHECKED\|NON_VERIFIED\|UNCHECKABLE\|UNCLASSIFIED\)')"
+H_ROWS="$(grep -c '^\(CHECKED\|NON_VERIFIED\|UNCHECKABLE\|UNCLASSIFIED\)' <<<"$H50_OUT")"
 [ "$H_ROWS" = 50 ] \
   && ok "(H) every extracted rule gets its own verdict row (50/50) — none is silently dropped" \
   || bad "(H) $H_ROWS verdict rows for 50 rules"
 
 has "$H50_OUT" 'unclassified=0' \
   && ok "(H) no rule falls through without a verdict" \
-  || bad "(H) some rule was UNCLASSIFIED: $(printf '%s' "$H50_OUT" | grep '^UNCLASSIFIED')"
+  || bad "(H) some rule was UNCLASSIFIED: $(grep '^UNCLASSIFIED' <<<"$H50_OUT")"
 
 # The honesty rule the whole inventory implements: "a protocol that can't be checked gets
 # a line saying so rather than silent exemption." A reasonless UNCHECKABLE is exemption
@@ -492,19 +492,19 @@ printf -- '- the session-start sweep MUST run before any wave begins\n' >> "$RB5
 HMD_CONF_REPO="$RB50" conf inventory
 has "$OUT" '^CHECKED	hooks/hooks.json' \
   && ok "(H) a rule matching an enforcer that EXISTS is CHECKED and NAMES the enforcer" \
-  || bad "(H) no CHECKED row carried a present enforcer's name: $(printf '%s' "$OUT" | grep '^CHECKED')"
+  || bad "(H) no CHECKED row carried a present enforcer's name: $(grep '^CHECKED' <<<"$OUT")"
 
 has "$OUT" '^NON_VERIFIED	test/session-start-order.test.sh' \
   && ok "(H) FAIL CLOSED: a rule whose named enforcer is ABSENT reads NON_VERIFIED, and says which file" \
-  || bad "(H) a missing enforcer did not produce a NON_VERIFIED row: $(printf '%s' "$OUT" | grep 'session-start')"
+  || bad "(H) a missing enforcer did not produce a NON_VERIFIED row: $(grep 'session-start' <<<"$OUT")"
 
-printf '%s' "$OUT" | grep -q '^CHECKED	test/session-start-order' \
+grep -q '^CHECKED	test/session-start-order' <<<"$OUT" \
   && bad "(H) an absent enforcer still produced a CHECKED verdict — the overclaim survives" \
   || ok "(H) ...and it is never CHECKED — an unbacked row cannot report as enforced"
 
 # Nor may it be quietly demoted to UNCHECKABLE: that would relabel a broken claim as a
 # designed exemption, which is the same lie with better manners.
-printf '%s' "$OUT" | grep '^UNCHECKABLE' | grep -q 'session-start sweep' \
+grep '^UNCHECKABLE' <<<"$OUT" | grep -q 'session-start sweep' \
   && bad "(H) the unbacked rule was laundered into UNCHECKABLE — exemption wearing a verdict" \
   || ok "(H) ...and it is not laundered into UNCHECKABLE either — it stops at NON_VERIFIED"
 
@@ -662,7 +662,7 @@ if [ -z "$M2" ]; then
   bad "M2 NOT APPLIED: the liveness branch no longer matches — this mutation proof is dead"
 else
   confx "$M2" commit-per-unit
-  printf '%s' "$OUT" | grep '^VIOLATION' | grep -q '	live	' \
+  grep '^VIOLATION' <<<"$OUT" | grep -q '	live	' \
     && ok "M2 KILLED: forcing every agent DEAD accuses the LIVE worktree -> (A)'s no-false-accusation assertion really watches that" \
     || bad "M2 SURVIVED: a tool that treats every agent as dead still spared the live worktree — the trap is unguarded: $OUT"
 fi

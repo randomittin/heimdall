@@ -127,14 +127,14 @@ mk_install "$WORK/i6"; : > "$WORK/lsof-map"
 out="$(HMD_GC_CC_VERSIONS="$V" HMD_GC_CC_BIN="$BIN" HMD_GC_CC_LOCKS="$L" \
        HMD_GC_CC_KEEP=0 PATH="/nonexistent" \
        /bin/bash "$GC" ccversions 2>&1)"
-if [ -e "$V/2.1.208" ] && printf '%s' "$out" | grep -q "keeping every version"; then
+if [ -e "$V/2.1.208" ] && grep -q "keeping every version" <<<"$out"; then
   ok "no lsof => cannot prove non-use => keeps every version"
 else bad "reaped without a reference oracle — must fail safe to KEEP"; fi
 
 # ── 7. --dry-run reports the reap but deletes nothing ───────────────────────────
 mk_install "$WORK/i7"; : > "$WORK/lsof-map"
 out="$(LIVE_PIDS="" KEEP=0 gc_ccv --dry-run)"
-if [ -e "$V/2.1.208" ] && printf '%s' "$out" | grep -q "reap 2.1.208"; then
+if [ -e "$V/2.1.208" ] && grep -q "reap 2.1.208" <<<"$out"; then
   ok "--dry-run reports the reap and mutates nothing"
 else bad "--dry-run deleted a file or reported nothing"; fi
 
@@ -172,18 +172,18 @@ printf '{"outcome":"failed","status":"install_failed","version_from":"2.1.209","
 out="$(PATH="$WORK/stub:$PATH" HEIMDALL_HOME="$WORK/h10" HEIMDALL_CLAUDE_CONFIG="$WORK/claude.json" \
        HEIMDALL_CC_UPDATE_RESULT="$WORK/update-bad.json" HEIMDALL_CC_VERSIONS="$WORK/none" \
        bash "$HEAL" status 2>&1)"
-if printf '%s' "$out" | grep -q "last-update-failed"; then ok "a recorded install_failed is reported as unhealthy"
+if grep -q "last-update-failed" <<<"$out"; then ok "a recorded install_failed is reported as unhealthy"
 else bad "recorded failure not detected: $out"; fi
 out="$(PATH="$WORK/stub:$PATH" HEIMDALL_HOME="$WORK/h10b" HEIMDALL_CLAUDE_CONFIG="$WORK/claude.json" \
        HEIMDALL_CC_UPDATE_RESULT="$WORK/update-ok.json" HEIMDALL_CC_VERSIONS="$WORK/none" \
        bash "$HEAL" status 2>&1)"
-if printf '%s' "$out" | grep -q "healthy"; then ok "a recorded success is reported healthy"
+if grep -q "healthy" <<<"$out"; then ok "a recorded success is reported healthy"
 else bad "recorded success misreported: $out"; fi
 # a missing result file must never be invented into a fault
 out="$(PATH="$WORK/stub:$PATH" HEIMDALL_HOME="$WORK/h10c" HEIMDALL_CLAUDE_CONFIG="$WORK/claude.json" \
        HEIMDALL_CC_UPDATE_RESULT="$WORK/absent.json" HEIMDALL_CC_VERSIONS="$WORK/none" \
        bash "$HEAL" status 2>&1)"
-if printf '%s' "$out" | grep -q "healthy"; then ok "an absent update-result is not invented into a fault"
+if grep -q "healthy" <<<"$out"; then ok "an absent update-result is not invented into a fault"
 else bad "absent result misreported as unhealthy: $out"; fi
 
 # ── 11. the pin notice: a session on an older binary is told, once, to restart ──
@@ -196,7 +196,7 @@ chmod +x "$WORK/lsof-p-stub"
 out="$(HEIMDALL_HOME="$WORK/h11" HEIMDALL_CLAUDE_CONFIG="$WORK/claude.json" \
        HEIMDALL_CC_VERSIONS="$V" HEIMDALL_CC_PIN_PID=8029 HEIMDALL_CC_LSOF="$WORK/lsof-p-stub" \
        bash "$HEAL" pin-notice 2>&1)"
-if printf '%s' "$out" | grep -q "2.1.209 is pinned" && printf '%s' "$out" | grep -q "2.1.211 is installed"; then
+if grep -q "2.1.209 is pinned" <<<"$out" && grep -q "2.1.211 is installed" <<<"$out"; then
   ok "pin notice names the pinned version, the installed one, and the remedy"
 else bad "pin notice wrong/absent: $out"; fi
 

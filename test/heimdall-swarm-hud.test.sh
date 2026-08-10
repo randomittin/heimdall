@@ -83,7 +83,7 @@ assert_contains "deny carries BIFRÖST receipt" "$OUT" "BIFRÖST"
 assert_contains "shared-memory file surfaces" "$OUT" "test/auth.test.ts"
 assert_contains "lint file surfaces"          "$OUT" "eslint.config.js"
 # one row per live agent: at least the 3 seeded roles each on their own line
-ROLE_ROWS="$(printf '%s\n' "$OUT" | grep -cE 'coder|test-runner|lint')"
+ROLE_ROWS="$(grep -cE 'coder|test-runner|lint' <<<"$OUT")"
 if [ "$ROLE_ROWS" -ge 3 ]; then ok "one row per active agent (>=3)"; else bad "expected >=3 agent rows, got $ROLE_ROWS"; fi
 if [ -n "$CLAIM_HAID" ]; then
   assert_contains "claim-ledger surface (real heimdall-claim)" "$OUT" "src/planner.ts"
@@ -93,7 +93,7 @@ fi
 
 echo "== case 4: pipe / --no-color mode is ANSI-clean plain text =="
 POUT="$(render --no-color)"
-if printf '%s' "$POUT" | grep -q "$(printf '\033')"; then
+if grep -q "$(printf '\033')" <<<"$POUT"; then
   bad "no raw ANSI escapes in --no-color mode"
 else
   ok "no raw ANSI escapes in --no-color mode"

@@ -504,7 +504,7 @@ cln=0
 while IFS= read -r cline; do
   cln=$((cln + 1))
   [ -z "$cline" ] && continue
-  printf '%s\n' "$CAL_CAUGHT" | grep -qx "$cln" || CAL_MISS="$CAL_MISS
+  grep -qx "$cln" <<<"$CAL_CAUGHT" || CAL_MISS="$CAL_MISS
 $cline"
 done <"$EXT/invocations.txt"
 

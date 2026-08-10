@@ -236,8 +236,8 @@ echo "-- (7) CLI — unbound refused, bound served -----------------------------
 
 # Unbound chat via the CLI: the link instruction, NEVER team data.
 CLI_UNBOUND="$("$CHAT_BIN" handle --chat-id "chat:ghost" --text "status" 2>&1 || true)"
-if printf '%s' "$CLI_UNBOUND" | grep -qi "link" && \
-   ! printf '%s' "$CLI_UNBOUND" | grep -q "status for team"; then
+if grep -qi "link" <<<"$CLI_UNBOUND" && \
+   ! grep -q "status for team" <<<"$CLI_UNBOUND"; then
   ok "CLI: unbound chat is refused with the link instruction (no data)"
 else
   bad "CLI: unbound chat was not cleanly refused: $CLI_UNBOUND"
@@ -245,7 +245,7 @@ fi
 
 # Bound chat via the CLI (chat:alice was bound by the python driver, same HEIMDALL_HOME).
 CLI_BOUND="$("$CHAT_BIN" handle --chat-id "chat:alice" --text "status" 2>&1 || true)"
-if printf '%s' "$CLI_BOUND" | grep -q "status for team"; then
+if grep -q "status for team" <<<"$CLI_BOUND"; then
   ok "CLI: a bound chat is served its team status"
 else
   bad "CLI: a bound chat was not served: $CLI_BOUND"
@@ -253,7 +253,7 @@ fi
 
 # Bindings audit surface lists the bound chats.
 CLI_BINDINGS="$("$CHAT_BIN" bindings 2>&1 || true)"
-if printf '%s' "$CLI_BINDINGS" | grep -q "chat:alice"; then
+if grep -q "chat:alice" <<<"$CLI_BINDINGS"; then
   ok "CLI: bindings lists the bound chats"
 else
   bad "CLI: bindings did not list the binding: $CLI_BINDINGS"

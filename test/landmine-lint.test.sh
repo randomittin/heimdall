@@ -91,7 +91,7 @@ assert_class_at_line() {
   # assert_class_at_line CLASS-TAG EXPECTED-LINE HUMAN-LABEL
   local tag="$1" want="$2" label="$3"
   local got
-  got="$(printf '%s\n' "$LINT_OUT" | grep -F "  $tag  " | head -1 || true)"
+  got="$(grep -F "  $tag  " <<<"$LINT_OUT" | head -1 || true)"
   if [ -z "$got" ]; then
     bad "$label — class $tag not flagged at all"
     return
@@ -168,17 +168,17 @@ echo "A2. CLASS-4 HARDENING (non-TTY PROMPT read — timeout is NOT a guard):"
 assert_c4_flagged() {
   # assert_c4_flagged EXPECTED-LINE HUMAN-LABEL
   local want="$1" label="$2" got
-  got="$(printf '%s\n' "$LINT4_OUT" | grep -F "  4-TTY-READ  " \
+  got="$(grep -F "  4-TTY-READ  " <<<"$LINT4_OUT" \
          | sed -E 's/^[^:]*:([0-9]+).*/\1/' | grep -Fx "$want" | head -1 || true)"
   if [ "$got" = "$want" ]; then ok "$label — flagged at line $want"; \
-    else bad "$label — class 4 NOT flagged at line $want (got lines: $(printf '%s' "$LINT4_OUT" | grep -F '  4-TTY-READ  ' | sed -E 's/^[^:]*:([0-9]+).*/\1/' | tr '\n' ' '))"; fi
+    else bad "$label — class 4 NOT flagged at line $want (got lines: $(grep -F '  4-TTY-READ  ' <<<"$LINT4_OUT" | sed -E 's/^[^:]*:([0-9]+).*/\1/' | tr '\n' ' '))"; fi
 }
 assert_c4_flagged "$EXPECT4_PLAIN"     "read -p (unguarded)"
 assert_c4_flagged "$EXPECT4_TCOMBINED" "read -rt 60 -p (timeout-only, combined)"
 assert_c4_flagged "$EXPECT4_TSEPARATE" "read -t 60 -rp (timeout-only, separate)"
 
 # NO false positives: none of the safe forms may appear as a class-4 finding.
-c4_flagged_lines="$(printf '%s\n' "$LINT4_OUT" | grep -F '  4-TTY-READ  ' | sed -E 's/^[^:]*:([0-9]+).*/\1/' | tr '\n' ' ')"
+c4_flagged_lines="$(grep -F '  4-TTY-READ  ' <<<"$LINT4_OUT" | sed -E 's/^[^:]*:([0-9]+).*/\1/' | tr '\n' ' ')"
 nf_clean=1
 for nf in $NOFLAG4_LINES; do
   case " $c4_flagged_lines " in
@@ -188,7 +188,7 @@ done
 [ "$nf_clean" -eq 1 ] && ok "no false positives on guarded read-p / stream loop / file read / keypress poll / herestring"
 
 # Exactly three class-4 findings expected (the three unguarded prompts).
-c4_count="$(printf '%s\n' "$LINT4_OUT" | grep -cF '  4-TTY-READ  ' || true)"
+c4_count="$(grep -cF '  4-TTY-READ  ' <<<"$LINT4_OUT" || true)"
 if [ "$c4_count" = "3" ]; then ok "exactly 3 class-4 findings (the 3 unguarded prompts)"; \
   else bad "expected 3 class-4 findings, got $c4_count"; fi
 

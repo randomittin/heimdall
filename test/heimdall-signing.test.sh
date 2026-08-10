@@ -121,7 +121,7 @@ H="$(mktemp -d)"
 OUT="$(HEIMDALL_HOME="$H" HEIMDALL_LATEST_OVERRIDE="$NEWER" HEIMDALL_VERIFY_ONLY=1 \
   HEIMDALL_INSTALL_ARTIFACT="$ARTIFACT" HEIMDALL_INSTALL_SIG="$SIG_A" \
   HEIMDALL_SIGNING_PUBKEY="$PUB_A" "$UPDATER" --force 2>/dev/null)"
-if printf '%s' "$OUT" | grep -q "verified $NEWER" && grep -q 'verified' "$H/autoupdate.log" 2>/dev/null \
+if grep -q "verified $NEWER" <<<"$OUT" && grep -q 'verified' "$H/autoupdate.log" 2>/dev/null \
    && ! grep -q 'refuse' "$H/autoupdate.log" 2>/dev/null; then
   ok "U1 valid sig → updater VERIFIES + would apply (no refuse)"
 else
@@ -176,7 +176,7 @@ OUT="$(SHIP_SOURCE_ONLY=1 bash -c '
     sign_release_artifact v9.9.9
   echo "RC=$?"
 ' 2>&1)"
-if printf '%s' "$OUT" | grep -qi 'UNSIGNED' && printf '%s' "$OUT" | grep -q 'RC=0'; then
+if grep -qi 'UNSIGNED' <<<"$OUT" && grep -q 'RC=0' <<<"$OUT"; then
   ok "S1 no signing key → ship WARNS + releases UNSIGNED (returns 0, not a hard block)"
 else
   bad "S1 missing-key path wrong: $OUT"

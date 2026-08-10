@@ -139,7 +139,7 @@ refuse_check "absolute path outside root" "$SECRET"
 set +e
 LEAK="$("$MD" "../outside/secret.txt" --root "$ROOTDIR" 2>&1)"
 set -e
-if printf '%s' "$LEAK" | grep -q "TOPSECRET-DO-NOT-READ"; then
+if grep -q "TOPSECRET-DO-NOT-READ" <<<"$LEAK"; then
   bad "(b) SECRET LEAKED through a refused path — guard is not actually blocking"
 else
   ok "(b) refused path leaked no file content (the guard blocks before any read)"
@@ -156,7 +156,7 @@ if [ -z "$MD_PY" ]; then
   SKIP_OUT="$("$MD" "$GOOD" --root "$ROOTDIR" 2>&1)"
   SRC=$?
   set -e
-  if [ "$SRC" -eq 0 ] && printf '%s' "$SKIP_OUT" | grep -qi "markitdown"; then
+  if [ "$SRC" -eq 0 ] && grep -qi "markitdown" <<<"$SKIP_OUT"; then
     ok "(c) markitdown absent → exits 0 with a clear skip/install hint (no crash)"
   else
     bad "(c) graceful-skip wrong (rc=$SRC)"; printf '%s\n' "$SKIP_OUT" | sed 's/^/    /'
@@ -188,7 +188,7 @@ EOF
   SKIP_OUT="$(PATH="$FAKEBIN:$PATH" "$MD" "$GOOD" --root "$ROOTDIR" 2>&1)"
   SRC=$?
   set -e
-  if [ "$SRC" -eq 0 ] && printf '%s' "$SKIP_OUT" | grep -qi "markitdown"; then
+  if [ "$SRC" -eq 0 ] && grep -qi "markitdown" <<<"$SKIP_OUT"; then
     ok "(c) markitdown absent (simulated) → exits 0 with skip/install hint (no crash)"
   else
     bad "(c) graceful-skip wrong (rc=$SRC)"; printf '%s\n' "$SKIP_OUT" | sed 's/^/    /'
@@ -204,7 +204,7 @@ set +e
 OVER_OUT="$(HEIMDALL_MD_MAX_BYTES=100 "$MD" "$BIG" --root "$ROOTDIR" 2>&1)"
 OVER_RC=$?
 set -e
-if [ "$OVER_RC" -eq 4 ] && printf '%s' "$OVER_OUT" | grep -qi 'oversize\|too large'; then
+if [ "$OVER_RC" -eq 4 ] && grep -qi 'oversize\|too large' <<<"$OVER_OUT"; then
   ok "(d) oversize input refused (exit 4) before read — DoS size cap holds"
 else
   bad "(d) oversize not refused (rc=$OVER_RC): $(printf '%s' "$OVER_OUT" | head -1)"
@@ -225,7 +225,7 @@ except Exception as e:
     print("BLOCKED:" + type(e).__name__)
 ' 2>&1)"
 set -e
-if printf '%s' "$EGRESS" | grep -q '^BLOCKED:'; then
+if grep -q '^BLOCKED:' <<<"$EGRESS"; then
   ok "(e) embedded-URL egress killed: offline session raises ($EGRESS) — no fetch primitive"
 else
   bad "(e) offline session did not block egress: $EGRESS"
@@ -244,7 +244,7 @@ except Exception as e:
     print("OTHER:" + type(e).__name__)
 ' 2>&1)"
 set -e
-if printf '%s' "$TMO" | grep -q 'TIMEOUT-REFUSED'; then
+if grep -q 'TIMEOUT-REFUSED' <<<"$TMO"; then
   ok "(f) slow conversion interrupted + refused cleanly — DoS timeout holds"
 else
   bad "(f) timeout did not fire: $TMO"

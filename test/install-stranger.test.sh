@@ -107,10 +107,10 @@ EXPECT_VER="$(git -C "$TMPH/.heimdall" describe --tags --abbrev=0 2>/dev/null \
 [ -n "$EXPECT_VER" ] || EXPECT_VER="$(git -C "$REPO" describe --tags --abbrev=0 2>/dev/null | sed -E 's/^v?([0-9]+\.[0-9]+\.[0-9]+).*/\1/')"
 
 # (2) DYNAMIC VERSION — card must show the real version, not a stale literal.
-if printf '%s' "$CARD" | grep -qE "Heimdall v${EXPECT_VER}([^0-9]|\$)"; then
+if grep -qE "Heimdall v${EXPECT_VER}([^0-9]|\$)" <<<"$CARD"; then
   ok "card shows dynamic version v$EXPECT_VER"
 else
-  bad "card version is not the installed v$EXPECT_VER — got: $(printf '%s' "$CARD" | grep -iE 'Heimdall v[0-9]' | head -1 | sed 's/^ *//')"
+  bad "card version is not the installed v$EXPECT_VER — got: $(grep -iE 'Heimdall v[0-9]' <<<"$CARD" | head -1 | sed 's/^ *//')"
 fi
 
 # (3) CONSISTENT PATH — the card must not claim a single install path that
@@ -118,8 +118,8 @@ fi
 # line, every path it names must be a real, populated location.
 LAUNCHER="$TMPH/.local/bin/hmd"
 [ -e "$LAUNCHER" ] || LAUNCHER="$TMPH/.local/bin/heimdall"
-if printf '%s' "$CARD" | grep -qE 'path:.*\.heimdall' \
-   && ! printf '%s' "$CARD" | grep -qE 'local/bin|launchers?|hmd, heimdall'; then
+if grep -qE 'path:.*\.heimdall' <<<"$CARD" \
+   && ! grep -qE 'local/bin|launchers?|hmd, heimdall' <<<"$CARD"; then
   bad "card states 'path: ~/.heimdall' only — contradicts launchers placed in ~/.local/bin"
 else
   ok "card install location is consistent with what was placed"
@@ -127,8 +127,8 @@ fi
 
 # (1) COMPONENT RESOLUTION — the headline command must resolve its runner.
 DEMO_OUT="$(in_stranger "$TMPH" "$LAUNCHER" demo --dry 2>&1)"
-if printf '%s' "$DEMO_OUT" | grep -qi 'demo runner not found'; then
-  bad "hmd demo: $(printf '%s' "$DEMO_OUT" | grep -i 'not found' | head -1 | sed 's/^ *//')"
+if grep -qi 'demo runner not found' <<<"$DEMO_OUT"; then
+  bad "hmd demo: $(grep -i 'not found' <<<"$DEMO_OUT" | head -1 | sed 's/^ *//')"
 else
   ok "hmd demo resolves heimdall-demo (no 'not found')"
 fi
@@ -154,8 +154,8 @@ if [ -n "$GL_DIR" ] && command -v script >/dev/null 2>&1; then
   wait "$_arc_pid" 2>/dev/null
   kill "$_arc_kp" 2>/dev/null
   ARC="$(sed 's/\x1b\[[0-9;]*m//g' "$ARC_OUT" 2>/dev/null)"
-  _deny="$(printf '%s' "$ARC" | grep -ciE 'caught|denial|barred' || true)"
-  _pass="$(printf '%s' "$ARC" | grep -ciE 'gate ✓|Bifröst open|PASS — secret-scan' || true)"
+  _deny="$(grep -ciE 'caught|denial|barred' <<<"$ARC" || true)"
+  _pass="$(grep -ciE 'gate ✓|Bifröst open|PASS — secret-scan' <<<"$ARC" || true)"
   if [ "${_deny:-0}" -ge 1 ] && [ "${_pass:-0}" -ge 1 ]; then
     ok "demo plays the full deny→fix→pass arc (denial + pass stages both render)"
   else
@@ -170,7 +170,7 @@ fi
 # the same $0→readlink→PLUGIN_DIR resolution; then we directly probe that each
 # component the task path invokes exists beside the resolved launcher.
 VER_OUT="$(in_stranger "$TMPH" "$LAUNCHER" version 2>&1)"
-VER_LINE="$(printf '%s' "$VER_OUT" | grep -iE 'Heimdall v[0-9]' | head -1 | sed 's/^ *//')"
+VER_LINE="$(grep -iE 'Heimdall v[0-9]' <<<"$VER_OUT" | head -1 | sed 's/^ *//')"
 # TIGHTENED (was: merely asserts it RUNS). `hmd version` must report the EXACT
 # release version the launcher resolves (git-describe of the installed tree →
 # manifest fallback) — the SAME value the success card shows. It previously read
@@ -178,11 +178,11 @@ VER_LINE="$(printf '%s' "$VER_OUT" | grep -iE 'Heimdall v[0-9]' | head -1 | sed 
 # v2.0.x line; this gate makes that drift impossible to re-ship.
 if [ -z "$VER_LINE" ]; then
   bad "hmd version failed to run through the launcher: $VER_OUT"
-elif printf '%s' "$VER_OUT" | grep -qE "Heimdall v${EXPECT_VER}([^0-9]|\$)"; then
+elif grep -qE "Heimdall v${EXPECT_VER}([^0-9]|\$)" <<<"$VER_OUT"; then
   # Equals the installed release version. Also explicitly reject the stale 1.1.0
   # whenever the release has moved past it (defense in depth — if EXPECT_VER ever
   # mis-resolves, a literal 1.1.0 still fails loudly here).
-  if [ "$EXPECT_VER" != "1.1.0" ] && printf '%s' "$VER_OUT" | grep -qE 'Heimdall v1\.1\.0([^0-9]|$)'; then
+  if [ "$EXPECT_VER" != "1.1.0" ] && grep -qE 'Heimdall v1\.1\.0([^0-9]|$)' <<<"$VER_OUT"; then
     bad "hmd version reports stale hardcoded 1.1.0 (expected v$EXPECT_VER) — plugin.json drift"
   else
     ok "hmd version reports release version v$EXPECT_VER (not stale 1.1.0): $VER_LINE"
@@ -222,7 +222,7 @@ fi
 if [ -n "$PROFILE" ]; then
   WHICH="$(env -i HOME="$TMPH" TERM="dumb" PATH="/usr/bin:/bin" \
     bash -c "source '$PROFILE' >/dev/null 2>&1; command -v hmd || command -v heimdall" 2>&1)"
-  if printf '%s' "$WHICH" | grep -q '/.local/bin/'; then
+  if grep -q '/.local/bin/' <<<"$WHICH"; then
     ok "after sourcing profile, hmd/heimdall resolves on PATH ($WHICH)"
   else
     bad "after sourcing profile, hmd not on PATH (got: ${WHICH:-<empty>})"
@@ -302,7 +302,7 @@ if [ -n "$PROFILE" ]; then
 fi
 # And the launcher must still resolve its demo runner after the re-install.
 DEMO2="$(in_stranger "$TMPH" "$LAUNCHER" demo --dry 2>&1)"
-if printf '%s' "$DEMO2" | grep -qi 'demo runner not found'; then
+if grep -qi 'demo runner not found' <<<"$DEMO2"; then
   bad "after re-install, hmd demo regressed to 'not found'"
 else
   ok "after re-install, hmd demo still resolves"
@@ -335,7 +335,7 @@ fi
 NARRATE_MISS=""
 for label in 'Fetching Heimdall' 'Registering Heimdall marketplace' \
              'Installing plugin' 'Linking entry point' 'Verifying gates'; do
-  printf '%s' "$CARD" | grep -qF "$label" || NARRATE_MISS="$NARRATE_MISS | $label"
+  grep -qF "$label" <<<"$CARD" || NARRATE_MISS="$NARRATE_MISS | $label"
 done
 if [ -z "$NARRATE_MISS" ]; then
   ok "every installer step is narrated in the transcript (download→register→plugin→link→gates)"
@@ -400,16 +400,16 @@ GRACE_CARD="$(env -i HOME="$TMPH_G" TERM="dumb" PATH="$STRANGER_PATH" \
 GRACE_RC=$?
 GLNK="$TMPH_G/.local/bin/hmd"; [ -e "$GLNK" ] || GLNK="$TMPH_G/.local/bin/heimdall"
 if [ "$GRACE_RC" -eq 0 ] \
-   && printf '%s' "$GRACE_CARD" | grep -qiE 'Heimdall v[0-9].* installed' \
+   && grep -qiE 'Heimdall v[0-9].* installed' <<<"$GRACE_CARD" \
    && [ -e "$GLNK" ]; then
   GDEMO="$(in_stranger "$TMPH_G" "$GLNK" demo --dry 2>&1)"
-  if printf '%s' "$GDEMO" | grep -qi 'demo runner not found'; then
+  if grep -qi 'demo runner not found' <<<"$GDEMO"; then
     bad "graceful-degrade: install completed but hmd demo broke after optional-step failure"
   else
     ok "optional-step failure degrades gracefully — install completes, card renders, launcher works"
   fi
 else
-  bad "optional-step failure BROKE the install (rc=$GRACE_RC, card present=$(printf '%s' "$GRACE_CARD" | grep -qiE 'Heimdall v[0-9].* installed' && echo yes || echo no))"
+  bad "optional-step failure BROKE the install (rc=$GRACE_RC, card present=$(grep -qiE 'Heimdall v[0-9].* installed' <<<"$GRACE_CARD" && echo yes || echo no))"
 fi
 
 # (10b) FALSIFIABLE GRACEFUL-DEGRADE — the degrade guarantee must be PROVABLE, not
@@ -423,10 +423,10 @@ HARD_CARD="$(env -i HOME="$TMPH_G" TERM="dumb" PATH="$STRANGER_PATH" \
   HEIMDALL_FORCE_FAIL_OPTIONAL=1 HEIMDALL_HARD_FAIL_OPTIONAL=1 bash "$REPO/install.sh" 2>&1)"
 HARD_RC=$?
 if [ "$HARD_RC" -ne 0 ] \
-   && ! printf '%s' "$HARD_CARD" | grep -qiE 'Heimdall v[0-9].* installed'; then
+   && ! grep -qiE 'Heimdall v[0-9].* installed' <<<"$HARD_CARD"; then
   ok "graceful-degrade is falsifiable — forced hard-fail-on-optional aborts (rc=$HARD_RC, no card)"
 else
-  bad "graceful-degrade NOT falsifiable — hard-fail variant did not abort (rc=$HARD_RC, card present=$(printf '%s' "$HARD_CARD" | grep -qiE 'Heimdall v[0-9].* installed' && echo yes || echo no))"
+  bad "graceful-degrade NOT falsifiable — hard-fail variant did not abort (rc=$HARD_RC, card present=$(grep -qiE 'Heimdall v[0-9].* installed' <<<"$HARD_CARD" && echo yes || echo no))"
 fi
 rm -rf "$TMPH_G" 2>/dev/null || true
 
@@ -486,7 +486,7 @@ TRACE6="$TMPH/order.trace.notty"
 NOTTY_OUT="$(in_stranger "$TMPH" env PATH="$PROBE_PATH" ANTHROPIC_API_KEY="sk-ant-stranger-notty-probe" \
   HEIMDALL_TRACE_ORDER="$TRACE6" "$LAUNCHER" "noop non-tty animation probe" 2>&1)"
 rm -f "$TRACE6" 2>/dev/null || true
-if printf '%s' "$NOTTY_OUT" | grep -qi 'watchman wakes'; then
+if grep -qi 'watchman wakes' <<<"$NOTTY_OUT"; then
   bad "non-TTY launch leaked the wake-up animation banner (TTY gate failed)"
 else
   ok "non-TTY launch emits no wake-up animation bytes (TTY-gated cosmetic)"
@@ -600,8 +600,8 @@ reserved_notty() { # $1=HOME  $2=timeout_s  rest=cmd…
 reserved_notty "$TMPH" 25 "$LAUNCHER" version; RSV_RC=$?
 if [ "$RSV_RC" -eq 124 ]; then
   bad "non-TTY \`hmd version\` HUNG (watchdog killed it) — reserved path ran the launch preamble"
-elif [ "$RSV_RC" -eq 0 ] && printf '%s' "$RSV_OUT" | grep -qiE 'Heimdall v[0-9]'; then
-  ok "non-TTY \`hmd version\` completes promptly + prints version, no preamble/hang ($(printf '%s' "$RSV_OUT" | grep -iE 'Heimdall v[0-9]' | head -1 | sed 's/^ *//'))"
+elif [ "$RSV_RC" -eq 0 ] && grep -qiE 'Heimdall v[0-9]' <<<"$RSV_OUT"; then
+  ok "non-TTY \`hmd version\` completes promptly + prints version, no preamble/hang ($(grep -iE 'Heimdall v[0-9]' <<<"$RSV_OUT" | head -1 | sed 's/^ *//'))"
 else
   bad "non-TTY \`hmd version\` did not complete cleanly (rc=$RSV_RC, out: $(printf '%s' "$RSV_OUT" | tr '\n' ' '))"
 fi
@@ -615,7 +615,7 @@ rm -rf "$DEMO_NOTTY_TGT" 2>/dev/null || true
 reserved_notty "$TMPH" 30 "$LAUNCHER" demo "$DEMO_NOTTY_TGT" --dry; RSV_RC=$?
 if [ "$RSV_RC" -eq 124 ]; then
   bad "non-TTY \`hmd demo --dry\` HUNG (watchdog killed it) — reserved path ran the launch preamble"
-elif printf '%s' "$RSV_OUT" | grep -qiE 'watchman wakes|npx claude-mem install'; then
+elif grep -qiE 'watchman wakes|npx claude-mem install' <<<"$RSV_OUT"; then
   bad "non-TTY \`hmd demo --dry\` ran the launch preamble (persona/companion leaked) — reserved dispatch regressed"
 elif [ "$RSV_RC" -eq 0 ]; then
   ok "non-TTY \`hmd demo --dry\` completes promptly via the dry path, no preamble/hang"
@@ -630,7 +630,7 @@ fi
 # stalling the whole harness.
 REFUSE_OUT="$(in_stranger "$TMPH" "$LAUNCHER" uninstall </dev/null 2>&1)"
 REFUSE_RC=$?
-if [ "$REFUSE_RC" -eq 2 ] && printf '%s' "$REFUSE_OUT" | grep -qi 'pass --yes'; then
+if [ "$REFUSE_RC" -eq 2 ] && grep -qi 'pass --yes' <<<"$REFUSE_OUT"; then
   ok "non-TTY uninstall without --yes refuses cleanly (exit 2, --yes hint, no hang)"
 else
   bad "non-TTY uninstall without --yes did not refuse cleanly (rc=$REFUSE_RC, out: $(printf '%s' "$REFUSE_OUT" | tr '\n' ' '))"
@@ -683,7 +683,7 @@ else
 fi
 
 # (7d) non-TTY uninstall leaked NO farewell animation bytes.
-if printf '%s' "$UNINST_OUT" | grep -q '▾'; then
+if grep -q '▾' <<<"$UNINST_OUT"; then
   bad "non-TTY uninstall leaked the sad farewell frame (should be TTY-gated)"
 else
   ok "non-TTY uninstall emits no farewell animation bytes (TTY-gated cosmetic)"
@@ -700,7 +700,7 @@ if [ "$UNINST_RC" -eq 0 ] && [ "$SECOND_RC" -eq 0 ]; then
   # The second run must also report it found nothing (idempotent no-op), and must
   # not have resurrected any artifact.
   if [ "$PATHN_2" -eq 0 ] && [ ! -d "$TMPH/.heimdall" ] \
-     && printf '%s' "$SECOND_OUT" | grep -qi 'Nothing to remove'; then
+     && grep -qi 'Nothing to remove' <<<"$SECOND_OUT"; then
     ok "uninstall is idempotent — second run exits 0, finds nothing, PATH still 0"
   else
     bad "second uninstall was not a clean no-op (PATH=$PATHN_2, out: $(printf '%s' "$SECOND_OUT" | tr '\n' ' ' | sed 's/  */ /g'))"
@@ -772,14 +772,14 @@ SB="$(new_probe_home)"; plant_plist "$SB"
 uninstall_probe "$SB" "HEIMDALL_REAL_HOME=$SB" || true
 CALLS="$(cat "$SB/launchctl.calls" 2>/dev/null || true)"
 if [ ! -e "$SB/LaunchAgents/com.heimdall.dream.plist" ] \
-   && printf '%s' "$CALLS" | grep -q 'com\.heimdall\.dream\.plist'; then
+   && grep -q 'com\.heimdall\.dream\.plist' <<<"$CALLS"; then
   ok "real-user uninstall removes the nightly LaunchAgent (launchctl called: $CALLS)"
 else
   bad "real-user uninstall left the nightly LaunchAgent behind (calls='$CALLS', plist still present=$([ -e "$SB/LaunchAgents/com.heimdall.dream.plist" ] && echo yes || echo no))"
 fi
 # EXACT LABEL ONLY — a call naming anything but com.heimdall.dream would mean
 # uninstall can unload a job that is not ours.
-if [ -n "$CALLS" ] && printf '%s\n' "$CALLS" | grep -vq 'com\.heimdall\.dream'; then
+if [ -n "$CALLS" ] && grep -vq 'com\.heimdall\.dream' <<<"$CALLS"; then
   bad "launchctl was invoked for a label that is NOT com.heimdall.dream: $CALLS"
 else
   ok "every launchctl invocation names the exact label com.heimdall.dream"
@@ -854,7 +854,7 @@ python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$SET" >/dev/null 2>&
   && ok "settings.json is still valid JSON after the splice" \
   || bad "settings.json is NOT valid JSON after the splice: $(cat "$SET")"
 # A backup must exist, be printed, and match the pre-uninstall bytes exactly.
-BK="$(printf '%s\n' "$PROBE_OUT" | grep 'heimdall-uninstall-' | head -1 | awk '{print $NF}')"
+BK="$(grep 'heimdall-uninstall-' <<<"$PROBE_OUT" | head -1 | awk '{print $NF}')"
 if [ -n "$BK" ] && [ -f "$BK" ] && cmp -s "$BK" "$SNAP"; then
   ok "uninstall printed a backup path whose bytes match the pre-uninstall file"
 else
@@ -889,7 +889,7 @@ if [ "$MAL_RC" -eq 0 ] && [ -f "$SET" ] && cmp -s "$SET" "$SNAP"; then
 else
   bad "malformed settings.json was damaged or crashed uninstall (rc=$MAL_RC, now: $(cat "$SET" 2>/dev/null))"
 fi
-if printf '%s' "$PROBE_OUT" | grep -q 'not valid JSON'; then
+if grep -q 'not valid JSON' <<<"$PROBE_OUT"; then
   ok "malformed settings.json is REPORTED, not silently skipped"
 else
   bad "malformed settings.json was skipped silently: $(printf '%s' "$PROBE_OUT" | tr '\n' ' ')"
@@ -964,7 +964,7 @@ else
   bad "INSTALL SANDBOX GUARD FAILED — a plist was written under a throwaway HOME"
 fi
 # The refusal must SAY so, in the same words the uninstall side uses.
-if printf '%s' "$SCHED_OUT" | grep -q 'synthetic HOME — refusing to touch the real launchd domain'; then
+if grep -q 'synthetic HOME — refusing to touch the real launchd domain' <<<"$SCHED_OUT"; then
   ok "install refusal prints the uninstall side's exact wording (rc=$SCHED_RC)"
 else
   bad "install refusal wording missing (rc=$SCHED_RC, out: $(printf '%s' "$SCHED_OUT" | tr '\n' ' ' | cut -c1-200))"
@@ -1099,7 +1099,7 @@ if [ -x "$WT_EPHEM/bin/heimdall-dream-schedule" ] && [ -f "$WT_EPHEM/.git" ]; th
   else
     bad "worktree refusal exit code was $SCHED_RC (expected 5): $(printf '%s' "$SCHED_OUT" | tr '\n' ' ' | cut -c1-200)"
   fi
-  if printf '%s' "$SCHED_OUT" | grep -q 'ephemeral checkout'; then
+  if grep -q 'ephemeral checkout' <<<"$SCHED_OUT"; then
     ok "the worktree refusal says WHY (ephemeral checkout), so the next operator can act"
   else
     bad "worktree refusal wording missing (out: $(printf '%s' "$SCHED_OUT" | tr '\n' ' ' | cut -c1-200))"

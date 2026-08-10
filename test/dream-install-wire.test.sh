@@ -404,8 +404,8 @@ LEFT="$(printf 'B\ny\n' | { run_perm "$PROT_PLUG" install >/dev/null 2>&1; cat; 
 # …and with a human present it DOES ask, in the same flow, at setup.
 rm -f "$PMARK"; : > "$POPENLOG"
 H_OUT="$(printf 'c\n' | run_perm "$PROT_PLUG" install HEIMDALL_DREAM_PERMISSION_TTY=1 2>&1)"
-if printf '%s' "$H_OUT" | grep -q 'Full Disk Access' \
-   && printf '%s' "$H_OUT" | grep -q 'Your choice'; then
+if grep -q 'Full Disk Access' <<<"$H_OUT" \
+   && grep -q 'Your choice' <<<"$H_OUT"; then
   ok "10 SETUP WITH A HUMAN: install-wire puts the permission choice to him"
 else
   bad "10 install-wire did not ask a present human: $(printf '%s' "$H_OUT" | tr '\n' ' ' | cut -c1-200)"
@@ -455,7 +455,7 @@ fi
 
 rm -f "$PMARK"; : > "$POPENLOG"
 UH="$(printf 'c\n' | run_perm "$PROT_PLUG" update HEIMDALL_DREAM_PERMISSION_TTY=1 2>&1)"
-if printf '%s' "$UH" | grep -q 'Full Disk Access' && printf '%s' "$UH" | grep -q 'Your choice'; then
+if grep -q 'Full Disk Access' <<<"$UH" && grep -q 'Your choice' <<<"$UH"; then
   ok "11 UPDATE WITH A HUMAN: hmd --update puts the permission choice to him"
 else
   bad "11 the update path did not ask a present human: $(printf '%s' "$UH" | tr '\n' ' ' | cut -c1-200)"
@@ -497,7 +497,7 @@ HMD_BIN="$ROOT/bin/heimdall"
 [ -x "$HMD_BIN" ] || { echo "FATAL: launcher missing: $HMD_BIN" >&2; exit 2; }
 bash -n "$HMD_BIN" && ok "12 bash -n bin/heimdall" || bad "12 bin/heimdall syntax error"
 DEVBRANCH="$(sed -n '/This looks like a development checkout/,/^  fi$/p' "$HMD_BIN")"
-if printf '%s' "$DEVBRANCH" | grep -q 'heimdall-dream-permission' \
+if grep -q 'heimdall-dream-permission' <<<"$DEVBRANCH" \
    && printf '%s' "$DEVBRANCH" | grep -q -- '--interactive-only'; then
   ok "12 the dev-checkout update branch asks (with --interactive-only) before it exits"
 else

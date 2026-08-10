@@ -164,7 +164,7 @@ if [ "$PRIMARY" = "python3 -m pytest $NODE -q" ]; then
 else
   bad "PRIMARY is not the pytest node command (got: '$PRIMARY'; full: $(printf '%s' "$EV1" | tr '\n' '|'))"
 fi
-if printf '%s\n' "$EV1" | grep -qx './run_tests.sh'; then
+if grep -qx './run_tests.sh' <<<"$EV1"; then
   bad "the whole-suite ./run_tests.sh was NOT demoted — it is still in the gating list"
 else
   ok "the whole-suite ./run_tests.sh is DEMOTED (absent from the gating list)"
@@ -192,8 +192,8 @@ fi
 
 echo "── (c) NO named node -> fall back to the whole suite (pre-#25 behavior) ──────────────"
 EV3="$(resolve "$BODY_NO_NODE" "$R1")"
-if printf '%s\n' "$EV3" | grep -qx './run_tests.sh' \
-   && ! printf '%s\n' "$EV3" | grep -q 'pytest .*::'; then
+if grep -qx './run_tests.sh' <<<"$EV3" \
+   && ! grep -q 'pytest .*::' <<<"$EV3"; then
   ok "no node named -> ./run_tests.sh is the evidence (whole-suite fallback unchanged)"
 else
   bad "no-node fallback did not yield the whole suite ($(printf '%s' "$EV3" | tr '\n' '|'))"
@@ -216,7 +216,7 @@ PYEOF
 )"
   [ "$NODE_OUT" = "NONE" ] || { bad "extract_gating_node did NOT reject an injected node: $INJ -> $NODE_OUT"; inj_ok=0; }
   EVI="$(resolve "$IBODY" "$R1")"
-  if printf '%s\n' "$EVI" | grep -qE '[;&$`|(){}<>]|touch|PWNED|curl'; then
+  if grep -qE '[;&$`|(){}<>]|touch|PWNED|curl' <<<"$EVI"; then
     bad "a shell metachar / injected token reached an evidence command: $(printf '%s' "$EVI" | tr '\n' '|')"
     inj_ok=0
   fi
@@ -239,8 +239,8 @@ printf '#!/usr/bin/env bash\ntrue\n' > "$R3/run_tests.sh"; chmod +x "$R3/run_tes
 git -C "$R3" init -q; git -C "$R3" config user.email t@t; git -C "$R3" config user.name t
 git -C "$R3" config commit.gpgsign false; git -C "$R3" add -A; git -C "$R3" commit -qm init
 EVF="$(resolve "$BODY_WITH_NODE" "$R3")"
-if printf '%s\n' "$EVF" | grep -qx './run_tests.sh' \
-   && ! printf '%s\n' "$EVF" | grep -q 'pytest .*::'; then
+if grep -qx './run_tests.sh' <<<"$EVF" \
+   && ! grep -q 'pytest .*::' <<<"$EVF"; then
   ok "named node whose file is ABSENT -> whole-suite fallback (no fabricated node command)"
 else
   bad "absent-file node did not fall back to the whole suite ($(printf '%s' "$EVF" | tr '\n' '|'))"

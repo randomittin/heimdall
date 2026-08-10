@@ -431,7 +431,7 @@ PYEOF
 E_STATUS="$(printf '%s' "$E_OUT" | "$PY" -c "import json,sys;print(json.load(sys.stdin)['status'])" 2>/dev/null)"
 E_ORIGIN="$(printf '%s' "$E_OUT" | "$PY" -c "import json,sys;print(json.load(sys.stdin)['origin'])" 2>/dev/null)"
 E_AH="$(printf '%s' "$E_OUT" | "$PY" -c "import json,sys;print(json.load(sys.stdin)['allow_headers'])" 2>/dev/null)"
-if [ "$E_STATUS" = "204" ] && [ "$E_ORIGIN" = "*" ] && printf '%s' "$E_AH" | grep -q "X-Heimdall-Team-Secret"; then
+if [ "$E_STATUS" = "204" ] && [ "$E_ORIGIN" = "*" ] && grep -q "X-Heimdall-Team-Secret" <<<"$E_AH"; then
   ok "E1 OPTIONS /roster-team -> 204 + Allow-Origin:* + Allow-Headers carries X-Heimdall-Team-Secret"
 else
   bad "E1 the preflight did not return 204+CORS+Allow-Headers (out=$E_OUT)"
@@ -471,19 +471,19 @@ print(",".join([
 PYEOF
 )"
 echo "    allowlist: $F_ALLOW"
-printf '%s' "$F_ALLOW" | grep -q "team_get=True" \
+grep -q "team_get=True" <<<"$F_ALLOW" \
   && ok "F2 the allowlist permits GET /roster-team (the browser team read)" \
   || bad "F2 GET /roster-team is NOT in the public allowlist"
-printf '%s' "$F_ALLOW" | grep -q "team_opt=True" \
+grep -q "team_opt=True" <<<"$F_ALLOW" \
   && ok "F3 the allowlist permits OPTIONS /roster-team (the CORS preflight)" \
   || bad "F3 OPTIONS /roster-team is NOT in the public allowlist"
-printf '%s' "$F_ALLOW" | grep -q "team_post=False" \
+grep -q "team_post=False" <<<"$F_ALLOW" \
   && ok "F4 the allowlist does NOT permit POST /roster-team — READ-ONLY, no write seam" \
   || bad "F4 POST /roster-team is in the allowlist (a write seam leaked)"
-printf '%s' "$F_ALLOW" | grep -q "roster=True" \
+grep -q "roster=True" <<<"$F_ALLOW" \
   && ok "F5 the signed GET /roster is still allowed (the existing read is untouched)" \
   || bad "F5 the signed GET /roster fell out of the allowlist (regression)"
-printf '%s' "$F_ALLOW" | grep -q "dispatch=False" \
+grep -q "dispatch=False" <<<"$F_ALLOW" \
   && ok "F6 a gated route (POST /dispatch) is still NOT public (the boundary holds)" \
   || bad "F6 a gated route leaked into the public allowlist"
 

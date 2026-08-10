@@ -201,13 +201,13 @@ else
 fi
 SUMMARY="$(jq -r '.summary // ""' "$WL" 2>/dev/null)"
 CASES="$(jq -r '.open_cases | join(",")' "$WL" 2>/dev/null)"
-if printf '%s' "$SUMMARY" | grep -q 'GOAL_SENTINEL' \
-   || printf '%s' "$SUMMARY" | grep -qi 'Auth refactor'; then
+if grep -q 'GOAL_SENTINEL' <<<"$SUMMARY" \
+   || grep -qi 'Auth refactor' <<<"$SUMMARY"; then
   ok "the summary round-trips the session's goal/checkpoint ('$SUMMARY')"
 else
   bad "the worklog summary did not carry the session state ('$SUMMARY')"
 fi
-if printf '%s' "$CASES" | grep -q 'case-101'; then
+if grep -q 'case-101' <<<"$CASES"; then
   ok "open_cases round-trips the open case (case-101)"
 else
   bad "open_cases did not carry the open case ('$CASES')"

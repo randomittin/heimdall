@@ -45,9 +45,9 @@ ESC="$(printf '%s' "$OUT" | LC_ALL=C tr -cd '\033' | wc -c | tr -d ' ')"
 [ "$ESC" -eq 0 ] && ok "farewell (piped) emits ZERO ANSI escapes (paste-clean)" || bad "farewell piped leaked $ESC ANSI bytes"
 
 # ── 2. BRAND CLOSE ──
-printf '%s' "$OUT" | grep -qi 'watchman sleeps' && ok "carries the 'watchman sleeps' moment" || bad "missing 'watchman sleeps'"
-printf '%s' "$OUT" | grep -qi 'shipped proven' && ok "carries the 'shipped proven' tagline" || bad "missing 'shipped proven' tagline"
-printf '%s' "$OUT" | grep -q 'HEIMDALL' && ok "carries the HEIMDALL wordmark" || bad "missing HEIMDALL wordmark"
+grep -qi 'watchman sleeps' <<<"$OUT" && ok "carries the 'watchman sleeps' moment" || bad "missing 'watchman sleeps'"
+grep -qi 'shipped proven' <<<"$OUT" && ok "carries the 'shipped proven' tagline" || bad "missing 'shipped proven' tagline"
+grep -q 'HEIMDALL' <<<"$OUT" && ok "carries the HEIMDALL wordmark" || bad "missing HEIMDALL wordmark"
 
 # ── 3. REAL STATS, NEVER FAKED ──
 # COLD-LEDGER ISOLATION (fixes a cold/warm flake): edit-tracker AND
@@ -65,7 +65,7 @@ OUT_COLD="$(TMPDIR="$COLD_TMP/tmp" HEIMDALL_HOME="$COLD_TMP/hmd" HOME="$COLD_TMP
   CLAUDE_SESSION_ID="farewell-cold-$$" CLAUDE_PLUGIN_ROOT="$REPO" \
   bash "$FAREWELL" </dev/null 2>&1)"
 rm -rf "$COLD_TMP" 2>/dev/null || true
-if printf '%s' "$OUT_COLD" | grep -qE '[0-9]+ (file|agent)'; then
+if grep -qE '[0-9]+ (file|agent)' <<<"$OUT_COLD"; then
   bad "farewell invented a stat with a cold (empty) session ledger"
 else
   ok "cold ledger -> no fabricated stat (>=0 stats dropped, tagline-only close)"
@@ -80,7 +80,7 @@ if [ -x "$ET" ]; then
   CLAUDE_SESSION_ID="$SID" "$ET" log Write /tmp/f3.txt >/dev/null 2>&1 || true
   OUT2="$(CLAUDE_SESSION_ID="$SID" CLAUDE_PLUGIN_ROOT="$REPO" bash "$FAREWELL" </dev/null 2>&1)"
   CLAUDE_SESSION_ID="$SID" "$ET" clear >/dev/null 2>&1 || true
-  printf '%s' "$OUT2" | grep -qE '3 files edited' \
+  grep -qE '3 files edited' <<<"$OUT2" \
     && ok "reports the REAL session edit count (3 files edited)" \
     || bad "did not report the real edit count from the session ledger"
 else
@@ -114,10 +114,10 @@ mkdir -p "$U_HOME" 2>/dev/null || true
 : > "$U_HOME/.unlock-pending"
 U1="$(HEIMDALL_HOME="$U_HOME" CLAUDE_PLUGIN_ROOT="$REPO" bash "$FAREWELL" </dev/null 2>&1)"
 U2="$(HEIMDALL_HOME="$U_HOME" CLAUDE_PLUGIN_ROOT="$REPO" bash "$FAREWELL" </dev/null 2>&1)"
-printf '%s' "$U1" | grep -qi 'sigil customization unlocked' \
+grep -qi 'sigil customization unlocked' <<<"$U1" \
   && ok "unlock reveal fires once when armed" \
   || bad "unlock reveal did not fire on the armed close"
-if printf '%s' "$U2" | grep -qi 'sigil customization unlocked'; then
+if grep -qi 'sigil customization unlocked' <<<"$U2"; then
   bad "unlock reveal repeated (must be one-shot)"
 else
   ok "unlock reveal is one-shot (silent on the next close)"
@@ -133,14 +133,14 @@ A_DIR="$(mktemp -d 2>/dev/null || echo /tmp/farewell-share-$$)"
 mkdir -p "$A_DIR/.planning/reels" 2>/dev/null || true
 : > "$A_DIR/.planning/reels/run-share.txt"
 OUT_SHARE="$( cd "$A_DIR" && CLAUDE_PLUGIN_ROOT="$REPO" bash "$FAREWELL" </dev/null 2>&1 )"
-printf '%s' "$OUT_SHARE" | grep -q 'your run card' \
-  && printf '%s' "$OUT_SHARE" | grep -q '.planning/reels/run-share.txt' \
+grep -q 'your run card' <<<"$OUT_SHARE" \
+  && grep -q '.planning/reels/run-share.txt' <<<"$OUT_SHARE" \
   && ok "share CTA points at the REAL fresh run-card artifact" \
   || bad "share CTA missing or wrong path for a fresh artifact"
 # Stale artifact (mtime well outside the freshness window) => NOT surfaced.
 touch -t 202001010000.00 "$A_DIR/.planning/reels/run-share.txt" 2>/dev/null || true
 OUT_STALE="$( cd "$A_DIR" && CLAUDE_PLUGIN_ROOT="$REPO" bash "$FAREWELL" </dev/null 2>&1 )"
-if printf '%s' "$OUT_STALE" | grep -q 'your run card'; then
+if grep -q 'your run card' <<<"$OUT_STALE"; then
   bad "share CTA surfaced a stale artifact (outside freshness window)"
 else
   ok "share CTA drops stale artifacts (freshness-gated)"
@@ -149,7 +149,7 @@ rm -rf "$A_DIR" 2>/dev/null || true
 # No reels dir at all => print NOTHING (never a fabricated path).
 N_DIR="$(mktemp -d 2>/dev/null || echo /tmp/farewell-noshare-$$)"
 OUT_NOART="$( cd "$N_DIR" && CLAUDE_PLUGIN_ROOT="$REPO" bash "$FAREWELL" </dev/null 2>&1 )"
-if printf '%s' "$OUT_NOART" | grep -q 'your run card'; then
+if grep -q 'your run card' <<<"$OUT_NOART"; then
   bad "share CTA fabricated a run-card path with no artifact present"
 else
   ok "share CTA silent when no artifact exists (no fabricated path)"

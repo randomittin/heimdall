@@ -124,8 +124,8 @@ if "$CONNECT" --help >/dev/null 2>&1; then ok "9.1 \`hmd connect --help\` resolv
 OUT="$(CLAUDE_CODE_OAUTH_TOKEN="$TOKEN" HEIMDALL_CP_URL="$FAKE_URL" "$CONNECT" </dev/null 2>&1)"; RC=$?
 OUTP="$(printf '%s' "$OUT" | strip_ansi)"
 [ "$RC" = 0 ] && ok "2.1 env-autodetect connect exits 0" || bad "2.1 env-autodetect exit=$RC ($OUTP)"
-printf '%s' "$OUTP" | grep -qi "no prompt needed" && ok "2.2 CLAUDE_CODE_OAUTH_TOKEN used SILENTLY (no prompt)" || bad "2.2 did not report silent env use"
-printf '%s' "$OUTP" | grep -qi "Paste your" && bad "2.3 a prompt was shown despite a valid env token" || ok "2.3 NO prompt shown (env token present)"
+grep -qi "no prompt needed" <<<"$OUTP" && ok "2.2 CLAUDE_CODE_OAUTH_TOKEN used SILENTLY (no prompt)" || bad "2.2 did not report silent env use"
+grep -qi "Paste your" <<<"$OUTP" && bad "2.3 a prompt was shown despite a valid env token" || ok "2.3 NO prompt shown (env token present)"
 [ -f "$CAP_DIR/team_cred.body" ] && ok "2.4 the credential was forwarded to POST /team/cred" || bad "2.4 /team/cred was not called"
 # the forwarded body carries the CLEAN token + kind (this is the wire body, not argv).
 "$PY" - "$CAP_DIR/team_cred.body" "$TOKEN" <<'PYEOF' && ok "2.5 the forwarded body carries the clean token + kind=oauth_token, NO team_id" || bad "2.5 forwarded body wrong"
@@ -141,12 +141,12 @@ PYEOF
 # ── (1) LAZY STATUS — after (2) a marker exists → bare connect is a no-op ───────
 OUT="$(HEIMDALL_CP_URL="$FAKE_URL" "$CONNECT" </dev/null 2>&1)"; RC=$?
 OUTP="$(printf '%s' "$OUT" | strip_ansi)"
-[ "$RC" = 0 ] && printf '%s' "$OUTP" | grep -qi "already connected" && ok "1.1 re-run while connected → NO-OP status ('already connected')" || bad "1.1 re-run not a no-op ($OUTP)"
-printf '%s' "$OUTP" | grep -qi "Paste your" && bad "1.2 a prompt was shown on a re-run" || ok "1.2 re-run shows NO prompt"
+[ "$RC" = 0 ] && grep -qi "already connected" <<<"$OUTP" && ok "1.1 re-run while connected → NO-OP status ('already connected')" || bad "1.1 re-run not a no-op ($OUTP)"
+grep -qi "Paste your" <<<"$OUTP" && bad "1.2 a prompt was shown on a re-run" || ok "1.2 re-run shows NO prompt"
 # --status shows the KIND, never the token value.
 OUT="$(HEIMDALL_CP_URL="$FAKE_URL" "$CONNECT" --status </dev/null 2>&1 | strip_ansi)"
-printf '%s' "$OUT" | grep -qi "oauth_token" && ok "1.3 --status reports the KIND (oauth_token)" || bad "1.3 --status missing kind"
-printf '%s' "$OUT" | grep -qF "$TOKEN" && bad "1.4 --status LEAKED the token value" || ok "1.4 --status NEVER shows the token value"
+grep -qi "oauth_token" <<<"$OUT" && ok "1.3 --status reports the KIND (oauth_token)" || bad "1.3 --status missing kind"
+grep -qF "$TOKEN" <<<"$OUT" && bad "1.4 --status LEAKED the token value" || ok "1.4 --status NEVER shows the token value"
 # the marker on disk holds NO secret value.
 grep -qF "$TOKEN" "$HOME/.heimdall/connect-state.json" 2>/dev/null && bad "1.5 the marker file stored the token value" || ok "1.5 the local marker holds NO token value (kind+ts only)"
 
@@ -154,7 +154,7 @@ grep -qF "$TOKEN" "$HOME/.heimdall/connect-state.json" 2>/dev/null && bad "1.5 t
 grep -q "read -rs" "$CONNECT" && ok "4.1 the prompt uses \`read -rs\` (hidden, no echo)" || bad "4.1 read -rs not used"
 grep -Eq 'CP_CRED_SECRET=.*register_py|CP_CRED_SECRET="\$clean"' "$CONNECT" && ok "5.1 the secret crosses via the CP_CRED_SECRET ENV (never argv)" || bad "5.1 secret not passed via env"
 # the token value must NEVER appear on any process argv while connect runs (nor on stdout).
-printf '%s' "$OUTP" | grep -qF "$TOKEN" && bad "5.2 the token value appeared on connect output" || ok "5.2 the token value never appears on connect output"
+grep -qF "$TOKEN" <<<"$OUTP" && bad "5.2 the token value appeared on connect output" || ok "5.2 the token value never appears on connect output"
 # scan only EXECUTABLE lines (strip full-line comments — the header DOCUMENTS the ban).
 if grep -vE '^[[:space:]]*#' "$CONNECT" | grep -Eq 'pbpaste|xclip|wl-paste|xsel|pbcopy'; then bad "8.1 a CLIPBOARD tool is CALLED (BANNED)"; else ok "8.1 NO clipboard tool called (pbpaste/xclip/wl-paste absent from code)"; fi
 

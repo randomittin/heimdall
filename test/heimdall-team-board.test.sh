@@ -145,19 +145,19 @@ run_as "$B_HAID" -- "$GATE" publish --attest "$ATTDIR/b.json" >/dev/null 2>&1
 
 BOARD_OUT="$(run_as "$A_HAID" -- "$BOARD" --plain 2>/dev/null)"
 # sarah's row: her surface, her task, PROVEN.
-if printf '%s' "$BOARD_OUT" | grep -Eq 'sarah.*T-login.*PROVEN'; then
+if grep -Eq 'sarah.*T-login.*PROVEN' <<<"$BOARD_OUT"; then
   ok "sarah's row carries her task (T-login) + PROVEN verdict"
 else
   bad "sarah's board row is missing task or PROVEN verdict"
 fi
 # raj's row: his surface + BLOCKED (the honest failing verdict, never softened).
-if printf '%s' "$BOARD_OUT" | grep -Eq 'raj.*payments/cards\.ts.*BLOCKED'; then
+if grep -Eq 'raj.*payments/cards\.ts.*BLOCKED' <<<"$BOARD_OUT"; then
   ok "raj's row carries his surface + BLOCKED verdict (never softened)"
 else
   bad "raj's board row is missing surface or BLOCKED verdict"
 fi
 # exactly one roster row per teammate (2 present teammates → 2 rows).
-ROWS="$(printf '%s' "$BOARD_OUT" | grep -cE '^║ ◉')"
+ROWS="$(grep -cE '^║ ◉' <<<"$BOARD_OUT")"
 if [ "$ROWS" -eq 2 ]; then
   ok "the board renders exactly one row per teammate (2 rows for 2 teammates)"
 else
@@ -181,7 +181,7 @@ if [ "$HELD_RC" -eq 3 ]; then
 else
   bad "precheck-edit did not exit 3 on a held surface (rc=$HELD_RC)"
 fi
-if printf '%s' "$HELD_OUT" | grep -Eq "priya's agent holds auth/login\.tsx#handleSubmit"; then
+if grep -Eq "priya's agent holds auth/login\.tsx#handleSubmit" <<<"$HELD_OUT"; then
   ok "the warning names the holder + the exact held surface"
 else
   bad "the warning did not name the holder/surface: [$HELD_OUT]"
@@ -191,7 +191,7 @@ set +e
 JSON_OUT="$(printf '%s' '{"tool_name":"Edit","tool_input":{"file_path":"auth/login.tsx"}}' \
   | HEIMDALL_PLANNING_DIR="$SHARED" "$PRECHECK" 2>&1)"; JSON_RC=$?
 set -e
-if [ "$JSON_RC" -eq 3 ] && printf '%s' "$JSON_OUT" | grep -q "priya's agent holds"; then
+if [ "$JSON_RC" -eq 3 ] && grep -q "priya's agent holds" <<<"$JSON_OUT"; then
   ok "precheck-edit reads the PreToolUse(Edit) stdin JSON and warns identically"
 else
   bad "precheck-edit did not handle the stdin JSON form (rc=$JSON_RC)"
@@ -230,25 +230,25 @@ JOB
 
 LB_OUT="$(run_as "$A_HAID" -- "$BOARD" --leaderboard --plain 2>/dev/null)"
 # sarah PROVEN 2/2 → 100% pass-rate, and reuse 100% (real numbers).
-if printf '%s' "$LB_OUT" | grep -Eq 'sarah.*100%.*\(2/2\)'; then
+if grep -Eq 'sarah.*100%.*\(2/2\)' <<<"$LB_OUT"; then
   ok "sarah ranks with a REAL 100% gate-pass-rate (2/2 from her verdict)"
 else
   bad "sarah's real pass-rate is missing from the leaderboard"
 fi
-if printf '%s' "$LB_OUT" | grep -Eq 'sarah.*reuse 100%'; then
+if grep -Eq 'sarah.*reuse 100%' <<<"$LB_OUT"; then
   ok "sarah's REAL reuse score (100%) is aggregated onto her ranking"
 else
   bad "the reuse-metric score was not aggregated onto the leaderboard"
 fi
 # raj BLOCKED 1/2 → 50% pass-rate (honest — a failing gate is a real 50%, not hidden).
-if printf '%s' "$LB_OUT" | grep -Eq 'raj.*50%.*\(1/2\)'; then
+if grep -Eq 'raj.*50%.*\(1/2\)' <<<"$LB_OUT"; then
   ok "raj ranks with his REAL 50% pass-rate (1/2 — a BLOCKED verdict is not hidden)"
 else
   bad "raj's real (failing) pass-rate is missing from the leaderboard"
 fi
 # ranking order: the 100% teammate outranks the 50% one.
-SARAH_LINE="$(printf '%s' "$LB_OUT" | grep -n 'sarah' | head -1 | cut -d: -f1)"
-RAJ_LINE="$(printf '%s' "$LB_OUT" | grep -n 'raj' | head -1 | cut -d: -f1)"
+SARAH_LINE="$(grep -n 'sarah' <<<"$LB_OUT" | head -1 | cut -d: -f1)"
+RAJ_LINE="$(grep -n 'raj' <<<"$LB_OUT" | head -1 | cut -d: -f1)"
 if [ -n "$SARAH_LINE" ] && [ -n "$RAJ_LINE" ] && [ "$SARAH_LINE" -lt "$RAJ_LINE" ]; then
   ok "the leaderboard ranks the higher pass-rate teammate first (real ordering)"
 else
@@ -277,12 +277,12 @@ SOLO="$WORK/solo-planning"
 mkdir -p "$SOLO"
 solo_rc=0
 SOLO_OUT="$(HEIMDALL_PLANNING_DIR="$SOLO" HEIMDALL_HAID="haid:solo.mbp-zzzz" "$BOARD" --plain 2>/dev/null)" || solo_rc=$?
-if [ "$solo_rc" -eq 0 ] && printf '%s' "$SOLO_OUT" | grep -q "HEIMDALL TEAM BOARD"; then
+if [ "$solo_rc" -eq 0 ] && grep -q "HEIMDALL TEAM BOARD" <<<"$SOLO_OUT"; then
   ok "the board renders (exit 0) with no teammates — solo degrades gracefully"
 else
   bad "the solo board did not render gracefully (rc=$solo_rc)"
 fi
-if printf '%s' "$SOLO_OUT" | grep -q "solo"; then
+if grep -q "solo" <<<"$SOLO_OUT"; then
   ok "the solo board shows just you (the current identity)"
 else
   bad "the solo board did not show the current identity"
@@ -295,13 +295,13 @@ echo "7. RECONCILE (a claim held with no live presence → shown as a stale clai
 # record. The board must NOT merge her into "online" — it marks the claim stale,
 # reconciling the two substrates honestly (show both, never assert a false union).
 RECON_OUT="$(run_as "$A_HAID" -- "$BOARD" --plain 2>/dev/null)"
-if printf '%s' "$RECON_OUT" | grep -Eq 'priya.*stale'; then
+if grep -Eq 'priya.*stale' <<<"$RECON_OUT"; then
   ok "a claim with no live presence is shown as a stale claim (substrates reconciled)"
 else
   bad "the stale claim was silently merged or dropped (false unified state)"
 fi
 # the online count must not include the stale (presence-less) teammate.
-if printf '%s' "$RECON_OUT" | grep -Eq '2 online'; then
+if grep -Eq '2 online' <<<"$RECON_OUT"; then
   ok "the online count reflects presence only (2), not the stale claim holder"
 else
   bad "the online count wrongly included a presence-less claim holder"

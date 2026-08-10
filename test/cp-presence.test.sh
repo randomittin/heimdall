@@ -309,7 +309,7 @@ r = P.roster(os.environ["PRES_PROJECT"], os.environ["TEAM_ID"])
 print(json.dumps([x.get("haid") for x in r]))
 PYEOF
 )"
-if printf '%s' "$A_READ" | grep -q "$DEV_A" && [ ! -s "$EXT/a_read.err" ]; then
+if grep -q "$DEV_A" <<<"$A_READ" && [ ! -s "$EXT/a_read.err" ]; then
   ok "A2 a FRESH process reads roster(project) and sees devA — cross-process durable, no path()"
 else
   bad "A2 fresh-process roster did NOT see devA (got '$A_READ')"; cat "$EXT/a_read.err" >&2
@@ -335,7 +335,7 @@ import cp_presence as P
 print(json.dumps(sorted(x.get("haid") for x in P.roster(os.environ["PRES_PROJECT"], os.environ["TEAM_ID"]))))
 PYEOF
 )"
-if printf '%s' "$B_READ" | grep -q "$DEV_A" && printf '%s' "$B_READ" | grep -q "$DEV_B"; then
+if grep -q "$DEV_A" <<<"$B_READ" && grep -q "$DEV_B" <<<"$B_READ"; then
   ok "B1 a third process's roster lists BOTH devA and devB (cross-dev, server-synced)"
 else
   bad "B1 the roster did not list both devs (got '$B_READ')"

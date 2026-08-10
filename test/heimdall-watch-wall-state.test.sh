@@ -61,27 +61,27 @@ PYEOF
 )"
 
 # The active row carries ● ; the idle row carries ○.
-act_line="$(printf '%s\n' "$OUT" | grep 'act ' | head -1)"
-idl_line="$(printf '%s\n' "$OUT" | grep 'idl ' | head -1)"
-printf '%s' "$act_line" | grep -q '●' \
+act_line="$(grep 'act ' <<<"$OUT" | head -1)"
+idl_line="$(grep 'idl ' <<<"$OUT" | head -1)"
+grep -q '●' <<<"$act_line" \
   && ok "A active teammate row renders the ● active badge" \
   || bad "A active row missing ● (line: $act_line)"
-printf '%s' "$idl_line" | grep -q '○' \
+grep -q '○' <<<"$idl_line" \
   && ok "B idle teammate row renders the ○ idle badge" \
   || bad "B idle row missing ○ (line: $idl_line)"
 
 # Distinctness: the active glyph and idle glyph are NOT the same character.
-if printf '%s' "$act_line" | grep -q '●' && ! printf '%s' "$act_line" | grep -q '○'; then
+if grep -q '●' <<<"$act_line" && ! grep -q '○' <<<"$act_line"; then
   ok "C active vs idle are rendered DISTINCTLY (● != ○)"
 else
   bad "C active row is not distinct from idle (line: $act_line)"
 fi
 
 # member_state(): the state field wins; a legacy row falls back to the verdict.
-printf '%s' "$OUT" | grep -q 'act=active'  && ok "D member_state honors state=active" || bad "D state=active not honored"
-printf '%s' "$OUT" | grep -q 'idl=idle'    && ok "E member_state honors state=idle"   || bad "E state=idle not honored"
-printf '%s' "$OUT" | grep -q 'leg=idle'    && ok "F legacy row (no state, verdict=watching) => idle fallback" || bad "F watching fallback wrong"
-printf '%s' "$OUT" | grep -q 'legw=active' && ok "G legacy row (no state, verdict=working) => active fallback" || bad "G working fallback wrong"
+grep -q 'act=active' <<<"$OUT"  && ok "D member_state honors state=active" || bad "D state=active not honored"
+grep -q 'idl=idle' <<<"$OUT"    && ok "E member_state honors state=idle"   || bad "E state=idle not honored"
+grep -q 'leg=idle' <<<"$OUT"    && ok "F legacy row (no state, verdict=watching) => idle fallback" || bad "F watching fallback wrong"
+grep -q 'legw=active' <<<"$OUT" && ok "G legacy row (no state, verdict=working) => active fallback" || bad "G working fallback wrong"
 
 echo
 echo "============================================================"

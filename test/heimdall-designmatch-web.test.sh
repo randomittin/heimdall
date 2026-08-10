@@ -107,8 +107,8 @@ echo ""
 echo "1. SEAM lists BOTH rn and web (kill the device wall by ADDING a target):"
 LIST_OUT="$("$TARGET" list 2>&1)"; LIST_RC=$?
 if [ "$LIST_RC" -eq 0 ] \
-   && printf '%s' "$LIST_OUT" | grep -qE '^rn[[:space:]]' \
-   && printf '%s' "$LIST_OUT" | grep -qE '^web[[:space:]]'; then
+   && grep -qE '^rn[[:space:]]' <<<"$LIST_OUT" \
+   && grep -qE '^web[[:space:]]' <<<"$LIST_OUT"; then
   ok "registry lists rn AND web (pluggable seam — no pipeline edit)"
 else
   bad "registry did not list both rn and web (rc=$LIST_RC, out='$LIST_OUT')"
@@ -134,7 +134,7 @@ fi
 echo ""
 echo "3. a typo'd target fails loudly (never silently rn/web):"
 BOGUS_OUT="$("$TARGET" ext bogustarget 2>&1)"; BOGUS_RC=$?
-if [ "$BOGUS_RC" -ne 0 ] && printf '%s' "$BOGUS_OUT" | grep -qi "available"; then
+if [ "$BOGUS_RC" -ne 0 ] && grep -qi "available" <<<"$BOGUS_OUT"; then
   ok "unknown target 'bogustarget' fails loudly listing available keys (rc=$BOGUS_RC)"
 else
   bad "typo target did not fail loudly (rc=$BOGUS_RC, out='$BOGUS_OUT')"
@@ -222,8 +222,8 @@ set +e
 CI_OUT="$("$DM" ci --min 0.95 --app-dir "$APP_FAIL" 2>&1)"
 CI_RC=$?
 set -e
-if [ "$CI_RC" -ne 0 ] && printf '%s' "$CI_OUT" | grep -qi "blocked" \
-   && printf '%s' "$CI_OUT" | grep -q "87" && printf '%s' "$CI_OUT" | grep -q "95"; then
+if [ "$CI_RC" -ne 0 ] && grep -qi "blocked" <<<"$CI_OUT" \
+   && grep -q "87" <<<"$CI_OUT" && grep -q "95" <<<"$CI_OUT"; then
   ok "ci --min 0.95 BLOCKS at 87% (nonzero + 'PR blocked: 87% parity < 95%')"
 else
   bad "ci did not block below threshold (rc=$CI_RC, out='$CI_OUT')"
@@ -238,7 +238,7 @@ set +e
 CI_OUT2="$("$DM" ci --min 0.95 --app-dir "$APP_OK" 2>&1)"
 CI_RC2=$?
 set -e
-if [ "$CI_RC2" -eq 0 ] && printf '%s' "$CI_OUT2" | grep -q "96"; then
+if [ "$CI_RC2" -eq 0 ] && grep -q "96" <<<"$CI_OUT2"; then
   ok "ci --min 0.95 PASSES at 96% (exit 0)"
 else
   bad "ci did not pass above threshold (rc=$CI_RC2, out='$CI_OUT2')"
@@ -251,7 +251,7 @@ set +e
 CI_OUT3="$("$DM" ci --min 0.95 --app-dir "$APP_NONE" 2>&1)"
 CI_RC3=$?
 set -e
-if [ "$CI_RC3" -eq 0 ] && printf '%s' "$CI_OUT3" | grep -qi "skip" \
+if [ "$CI_RC3" -eq 0 ] && grep -qi "skip" <<<"$CI_OUT3" \
    && [ ! -f "$APP_NONE/.designmatch/parity.json" ]; then
   ok "ci skips honestly (exit 0 + 'skip') and did NOT fabricate a parity.json"
 else
@@ -273,7 +273,7 @@ if [ "$HAS_VISUAL" -eq 1 ]; then
     bad "web run should have produced a real parity.json (rc=$WEB_RC, out='$WEB_OUT')"
   fi
 else
-  if [ "$WEB_RC" -eq 0 ] && printf '%s' "$WEB_OUT" | grep -qiE "skip|install" \
+  if [ "$WEB_RC" -eq 0 ] && grep -qiE "skip|install" <<<"$WEB_OUT" \
      && [ ! -f "$WEB_PARITY" ]; then
     ok "web run (visual deps absent) → honest skip (exit 0, no parity.json fabricated)"
   else
@@ -284,10 +284,10 @@ fi
 echo ""
 echo "11. DEVICE PATH UNBROKEN + no regression:"
 HELP_OUT="$("$DM" help 2>&1)"
-if printf '%s' "$HELP_OUT" | grep -q "iterate" \
-   && printf '%s' "$HELP_OUT" | grep -q "regen" \
-   && printf '%s' "$HELP_OUT" | grep -q "web" \
-   && printf '%s' "$HELP_OUT" | grep -q "ci"; then
+if grep -q "iterate" <<<"$HELP_OUT" \
+   && grep -q "regen" <<<"$HELP_OUT" \
+   && grep -q "web" <<<"$HELP_OUT" \
+   && grep -q "ci" <<<"$HELP_OUT"; then
   ok "help surfaces device path (iterate/regen) AND new web/ci subcommands"
 else
   bad "help missing expected subcommands"

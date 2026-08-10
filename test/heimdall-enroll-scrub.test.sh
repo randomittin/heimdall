@@ -50,9 +50,9 @@ echo "── A. SCRUB: no enroll-token on any user surface ───────
 
 # (A1) `rr --help` RUNTIME OUTPUT — the primary CLI help a user reads.
 help_out="$("$RR" --help 2>&1 | strip_ansi)"
-if printf '%s' "$help_out" | grep -qiE "$TOKEN_RX"; then
+if grep -qiE "$TOKEN_RX" <<<"$help_out"; then
   bad "rr --help output must NOT mention an enroll token"
-  printf '%s\n' "$help_out" | grep -inE "$TOKEN_RX" | sed 's/^/       /'
+  grep -inE "$TOKEN_RX" <<<"$help_out" | sed 's/^/       /'
 else
   ok "rr --help output is enroll-token-free (primary CLI help)"
 fi
@@ -119,7 +119,7 @@ else
 fi
 
 # (B2) SECRET-SAFE — the token is NEVER echoed to stdout/stderr (existing invariant holds).
-if printf '%s' "$setup_out" | grep -qF "$SECRET_TOKEN"; then
+if grep -qF "$SECRET_TOKEN" <<<"$setup_out"; then
   bad "the enroll token leaked onto rr setup output (must never be echoed)"
 else
   ok "the enroll token is never echoed by rr setup (0600, argv-free)"

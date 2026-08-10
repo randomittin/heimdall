@@ -135,7 +135,7 @@ if [ -n "$MISSING" ]; then
   # taught, or a gate that silently stopped existing — both need a human.
   bad "gate file(s) missing from the repo — guard is stale or a gate was deleted:$MISSING"
 else
-  ok "every named gate file exists ($(printf '%s' "$GATE_FILES" | grep -c '[^[:space:]]') declared)"
+  ok "every named gate file exists ($(grep -c '[^[:space:]]' <<<"$GATE_FILES") declared)"
 fi
 
 # ── 2. hooks.json command strings (ALWAYS /bin/sh — the confirmed defect site) ─
@@ -155,12 +155,12 @@ else
 fi
 
 # ── 3. THE INVARIANT ─────────────────────────────────────────────────────────
-CLEAN_HITS=$(printf '%s' "$HITS" | grep -c '[^[:space:]]' || true)
+CLEAN_HITS=$(grep -c '[^[:space:]]' <<<"$HITS" || true)
 if [ "${CLEAN_HITS:-0}" -eq 0 ]; then
   ok "no gate/hook/guard file pipes a variable into a parser via echo"
 else
   bad "$CLEAN_HITS unsafe echo-into-parser site(s) in the fail-open surface:"
-  printf '%s\n' "$HITS" | grep '[^[:space:]]' | sed 's/^/         /'
+  grep '[^[:space:]]' <<<"$HITS" | sed 's/^/         /'
   printf '         \033[33mfix: printf %%s (byte-exact) — or printf %%s\\\\n where a trailing newline is required\033[0m\n'
 fi
 
@@ -168,7 +168,7 @@ fi
 # A scan of zero files reporting clean is the failure mode that made five gates
 # read green today. The floor is the count of declared shell gates; it can only
 # be met by really opening them.
-FLOOR=$(printf '%s' "$GATE_FILES" | grep -c '[^[:space:]]')
+FLOOR=$(grep -c '[^[:space:]]' <<<"$GATE_FILES")
 if [ "$SCANNED" -ge "$FLOOR" ] && [ "$SCANNED" -gt 0 ]; then
   ok "anti-vacuous: scanned $SCANNED unit(s) — at or above the floor of $FLOOR"
 else

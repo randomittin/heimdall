@@ -563,7 +563,7 @@ R5="$(new_repo defaults)"
 git -C "$R5" commit -qm init --allow-empty >/dev/null 2>&1
 
 OUT5="$(run_wrap_v "$R5" default)"
-printf '%s' "$OUT5" | grep -qE '^(claude|cursor|codex|gemini|aider)$' \
+grep -qE '^(claude|cursor|codex|gemini|aider)$' <<<"$OUT5" \
   && ok "5a \`wrap default\` resolves a tool with no config (detection): $OUT5" \
   || bad "5a default resolution produced no tool" "$OUT5"
 
@@ -591,10 +591,10 @@ fi
 # `pipefail`, so `run_wrap_v … | grep` inherits the PRODUCER's exit 2 (the refusal
 # itself) and the assertion would read as a failure even when the match succeeds.
 REFUSAL="$(run_wrap_v "$R5" wrap notatool --no-launch)"
-printf '%s' "$REFUSAL" | grep -qi 'notatool' \
+grep -qi 'notatool' <<<"$REFUSAL" \
   && ok "5e the refusal names the offending tool" \
   || bad "5e the refusal is silent about which tool failed" "[$REFUSAL]"
-printf '%s' "$REFUSAL" | grep -q 'claude cursor codex gemini aider' \
+grep -q 'claude cursor codex gemini aider' <<<"$REFUSAL" \
   && ok "5f the refusal lists the tools that ARE accepted" \
   || bad "5f the refusal does not say what would have worked"
 
@@ -784,11 +784,11 @@ run_hmd
 EMPTY_STUB="$(cat "$ROUTE_OUT")"
 EMPTY_TRACE="$(cat "$TRACE")"
 
-printf '%s' "$EMPTY_STUB" | grep -q 'heimdall-wrap ARGS: launch' \
+grep -q 'heimdall-wrap ARGS: launch' <<<"$EMPTY_STUB" \
   && ok "8a EMPTY args wrap-and-launch the default tool (heimdall-wrap launch)" \
   || bad "8a bare hmd did not reach the wrap launcher" "stub=[$EMPTY_STUB]"
 
-printf '%s' "$EMPTY_TRACE" | grep -q 'launch:task' \
+grep -q 'launch:task' <<<"$EMPTY_TRACE" \
   && bad "8b bare hmd fell through to the task prompt instead of wrapping" \
   || ok "8b EMPTY args do NOT take the unknown-token task path"
 
@@ -796,11 +796,11 @@ run_hmd "fix the login bug"
 UNK_STUB="$(cat "$ROUTE_OUT")"
 UNK_TRACE="$(cat "$TRACE")"
 
-printf '%s' "$UNK_TRACE" | grep -q 'launch:task' \
+grep -q 'launch:task' <<<"$UNK_TRACE" \
   && ok "8c UNKNOWN token still falls through to the task prompt (hmd fix the login bug)" \
   || bad "8c the unknown-token fall-through broke" "trace=[$UNK_TRACE]"
 
-printf '%s' "$UNK_STUB" | grep -q 'heimdall-wrap' \
+grep -q 'heimdall-wrap' <<<"$UNK_STUB" \
   && bad "8d an unknown token was hijacked by the wrap launcher" "stub=[$UNK_STUB]" \
   || ok "8d UNKNOWN tokens are NOT routed to wrap"
 

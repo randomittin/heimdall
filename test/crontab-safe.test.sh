@@ -137,7 +137,7 @@ for mode in denied silent; do
     || bad "read-fail[$mode]: DESTRUCTIVE — crontab was installed anyway: $(cat "$STUB_LOG")"
   [ ! -f "$STUB_INSTALLED" ] && ok "read-fail[$mode]: nothing was written to the crontab" \
     || bad "read-fail[$mode]: crontab content was replaced"
-  printf '%s' "$OUT_D" | grep -qi 'not modified\|NOT modified' \
+  grep -qi 'not modified\|NOT modified' <<<"$OUT_D" \
     && ok "read-fail[$mode]: told the user their crontab was NOT modified" \
     || bad "read-fail[$mode]: no clear 'crontab was NOT modified' message"
 done

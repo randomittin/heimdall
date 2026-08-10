@@ -125,9 +125,9 @@ done
 # ── B. a measured negative, never an empty field ─────────────────────────────────
 sec "B. NEGATIVES ARE MEASURED, NOT EMPTY (empty is a dropped field; none is an answer):"
 UNP="$(field_value "$CK" "Unpushed")"
-printf '%s' "$UNP" | grep -qiE 'none|0 ' && ok "fresh repo with nothing unpushed states it: \"$UNP\"" \
+grep -qiE 'none|0 ' <<<"$UNP" && ok "fresh repo with nothing unpushed states it: \"$UNP\"" \
                                          || bad "unpushed field is not a measured negative: \"$UNP\""
-printf '%s' "$UNP" | grep -qE '[0-9]' && ok "the unpushed answer carries a number (evidence, not an adjective)" \
+grep -qE '[0-9]' <<<"$UNP" && ok "the unpushed answer carries a number (evidence, not an adjective)" \
                                       || bad "no count in the unpushed answer: \"$UNP\""
 rm -rf "$P"
 
@@ -179,7 +179,7 @@ for ID in $FIELD_IDS; do
   RC=$?
   ERR="$(cat "$ERRF" 2>/dev/null)"
   L="$(label_of "$ID")"
-  if [ "$RC" -ne 0 ] && printf '%s' "$ERR" | grep -qF "$L"; then
+  if [ "$RC" -ne 0 ] && grep -qF "$L" <<<"$ERR"; then
     ok "$ID dropped -> save FAILS (exit $RC) and stderr names the field"
   else
     bad "$ID dropped -> exit $RC, stderr did not name \"$L\": $ERR"
@@ -190,10 +190,10 @@ done
 P="$(make_project)"
 HEIMDALL_HOME="$P/.heimdall" HMD_CKPT_FAULT="in_progress" "$CKPT" write "$P" >/dev/null 2>"$TMP/loud.txt"
 LOUD="$(cat "$TMP/loud.txt" 2>/dev/null)"
-printf '%s' "$LOUD" | grep -qiE 'incomplete|failed|not saved' \
+grep -qiE 'incomplete|failed|not saved' <<<"$LOUD" \
   && ok "the failure says, in words, that the checkpoint is incomplete" \
   || bad "the failure is silent-ish — no incomplete/failed wording: $LOUD"
-printf '%s' "$LOUD" | grep -qi 'checkpoint' \
+grep -qi 'checkpoint' <<<"$LOUD" \
   && ok "the failure names the subsystem (a resuming operator can act on it)" \
   || bad "the failure does not name the subsystem"
 
@@ -240,10 +240,10 @@ grep -qF "it reads the statusline blob"       "$CK" 2>/dev/null && ok "a refuted
 grep -qF "fail-open observation from 2026-08-05" "$CK" 2>/dev/null && ok "a warn note reaches the Open warnings field"  || bad "warn note lost"
 # the notes land in the right fields, not smeared across all of them
 RCLAIMS="$(field_value "$CK" "Refuted claims")"
-printf '%s' "$RCLAIMS" | grep -qF "it reads the statusline blob" \
+grep -qF "it reads the statusline blob" <<<"$RCLAIMS" \
   && ok "the refuted claim is IN the Refuted claims field (categories are not smeared)" \
   || bad "Refuted claims field does not carry the refuted note: \"$RCLAIMS\""
-printf '%s' "$RCLAIMS" | grep -qF "awaiting a human call" \
+grep -qF "awaiting a human call" <<<"$RCLAIMS" \
   && bad "the gated note leaked into Refuted claims — categories are smeared" \
   || ok "the gated note did NOT leak into Refuted claims"
 # a bad category is a real error, never a silent no-op that loses the knowledge

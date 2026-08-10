@@ -73,7 +73,7 @@ print("INERT" if ic.is_inert(cfg, env={}) else "ACTIVE", "n=%d" % len(active))
 PY
 )"
 ARC=$?
-if [ "$ARC" -eq 0 ] && printf '%s' "$ABSENT_OUT" | grep -q "INERT n=0"; then
+if [ "$ARC" -eq 0 ] && grep -q "INERT n=0" <<<"$ABSENT_OUT"; then
   ok "(a) absent config loads without crash -> inert, 0 active connectors"
 else
   bad "(a) absent config not inert (rc=$ARC): $ABSENT_OUT"
@@ -88,7 +88,7 @@ cfg = ic.load_config(repo)
 print("INERT" if ic.is_inert(cfg, env={}) else "ACTIVE", "n=%d" % len(ic.active_connectors(cfg, env={})))
 PY
 )"
-if printf '%s' "$NOCONN_OUT" | grep -q "INERT n=0"; then
+if grep -q "INERT n=0" <<<"$NOCONN_OUT"; then
   ok "(a) connector-less config -> inert, 0 active connectors"
 else
   bad "(a) connector-less config not inert: $NOCONN_OUT"
@@ -125,10 +125,10 @@ print(json.dumps({"active": st["active"], "configured": st["configured"],
                   "cred_present": st["cred_present"], "reason": st["reason"]}))
 PY
 )"
-if printf '%s' "$CREDLESS_OUT" | grep -q '"active": false' \
-   && printf '%s' "$CREDLESS_OUT" | grep -q '"configured": true' \
-   && printf '%s' "$CREDLESS_OUT" | grep -q '"cred_present": false' \
-   && printf '%s' "$CREDLESS_OUT" | grep -qi 'credential absent'; then
+if grep -q '"active": false' <<<"$CREDLESS_OUT" \
+   && grep -q '"configured": true' <<<"$CREDLESS_OUT" \
+   && grep -q '"cred_present": false' <<<"$CREDLESS_OUT" \
+   && grep -qi 'credential absent' <<<"$CREDLESS_OUT"; then
   ok "(b) configured-but-credless connector -> inactive (no crash), honest reason"
 else
   bad "(b) credless connector not handled: $CREDLESS_OUT"
@@ -141,7 +141,7 @@ cfg = ic.load_config(os.environ["REPO"])
 print("INERT" if ic.is_inert(cfg, env={}) else "ACTIVE")
 PY
 )"
-if printf '%s' "$INERT_CREDLESS" | grep -q "INERT"; then
+if grep -q "INERT" <<<"$INERT_CREDLESS"; then
   ok "(b) sole credless connector -> loop still inert"
 else
   bad "(b) credless connector unexpectedly active: $INERT_CREDLESS"
@@ -163,8 +163,8 @@ val = ic.resolve_cred(cfg["connectors"]["github"], env=env)
 print("resolved_from_env=%s" % (val == "ghp_runtimeValueFromEnvNotCommitted"))
 PY
 )"
-if printf '%s' "$ENV_OUT" | grep -q "active=True present=True names=github" \
-   && printf '%s' "$ENV_OUT" | grep -q "resolved_from_env=True"; then
+if grep -q "active=True present=True names=github" <<<"$ENV_OUT" \
+   && grep -q "resolved_from_env=True" <<<"$ENV_OUT"; then
   ok "(c) credential resolves from ENV at runtime -> connector active"
 else
   bad "(c) env cred resolution failed: $ENV_OUT"
@@ -196,7 +196,7 @@ for name, block in conns.items():
 print("OK" if conns and not bad else "BAD:%s" % bad)
 PY
 )"
-if printf '%s' "$EX_VALID" | grep -q "^OK"; then
+if grep -q "^OK" <<<"$EX_VALID"; then
   ok "(d) .example is valid JSON; every connector declares a *_env NAME (no inline secret)"
 else
   bad "(d) .example structure problem: $EX_VALID"
@@ -231,9 +231,9 @@ SHOW_OUT="$(TEST_GH_TOKEN="REDACTED_SENTINEL_not_a_real_token" "$CLI" show --rep
 SHOW_RC=$?
 set -e
 if [ "$SHOW_RC" -eq 0 ] \
-   && ! printf '%s' "$SHOW_OUT" | grep -q "REDACTED_SENTINEL_not_a_real_token" \
-   && printf '%s' "$SHOW_OUT" | grep -q '"cred_present"' \
-   && printf '%s' "$SHOW_OUT" | grep -q "TEST_GH_TOKEN"; then
+   && ! grep -q "REDACTED_SENTINEL_not_a_real_token" <<<"$SHOW_OUT" \
+   && grep -q '"cred_present"' <<<"$SHOW_OUT" \
+   && grep -q "TEST_GH_TOKEN" <<<"$SHOW_OUT"; then
   ok "(e) 'show' never echoes the secret; surfaces cred_present + env-var NAME only"
 else
   bad "(e) 'show' leak/structure problem (rc=$SHOW_RC): $SHOW_OUT"
@@ -244,7 +244,7 @@ set +e
 ACTIVE_LIST="$(TEST_GH_TOKEN="REDACTED_SENTINEL_not_a_real_token" "$CLI" active --repo "$REPO" 2>&1)"
 AL_RC=$?
 set -e
-if [ "$AL_RC" -eq 0 ] && printf '%s' "$ACTIVE_LIST" | grep -qx "github"; then
+if [ "$AL_RC" -eq 0 ] && grep -qx "github" <<<"$ACTIVE_LIST"; then
   ok "(e) 'active' lists github once its env credential is present"
 else
   bad "(e) 'active' wrong with cred set (rc=$AL_RC): $ACTIVE_LIST"

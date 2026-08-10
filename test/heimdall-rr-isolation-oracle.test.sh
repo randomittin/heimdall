@@ -56,7 +56,7 @@ echo "[1] bin/falsify $DOMAIN --assert-score 1.0 exits 0 (golden passes, every m
 if bash "$FALSIFY" "$DOMAIN" --assert-score 1.0 >"$TMP/falsify.out" 2>&1; then
   fex=0; else fex=$?; fi
 score_line="$(grep -E '^SCORE:' "$TMP/falsify.out" | tail -1)"
-if [ "$fex" -eq 0 ] && printf '%s' "$score_line" | grep -q '= 1.0000'; then
+if [ "$fex" -eq 0 ] && grep -q '= 1.0000' <<<"$score_line"; then
   ok "falsify score == 1.0 ($score_line)"
 else
   bad "falsify did not assert score 1.0 (exit=$fex; $score_line)"; cat "$TMP/falsify.out"

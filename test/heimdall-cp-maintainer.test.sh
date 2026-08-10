@@ -426,14 +426,14 @@ if [ ! -s "$HOUT" ]; then echo "FATAL: H harness produced no output" >&2; cat "$
   || bad "H1 summary NOT attached on nonzero exit (summary_stop=$(hget h1_summary_stop))"
 # H1 — error_tail NAMES the cause...
 H1TAIL="$(hget h1_error_tail)"
-if printf '%s' "$H1TAIL" | grep -q 'RuntimeError: the maintainer child exploded'; then
+if grep -q 'RuntimeError: the maintainer child exploded' <<<"$H1TAIL"; then
   ok "H1 error_tail NAMES the cause: '$H1TAIL'"
 else
   bad "H1 error_tail did not name the cause: '$H1TAIL'"
 fi
 # H1 — ...and token-ish secrets are SCRUBBED from error_tail AND the whole result (falsifier).
 H1JSON="$(hget h1_result_json)"
-if printf '%s' "$H1JSON" | grep -qE 'ghs_ABCDEF|sk-ant-SECRETKEY|BEGIN RSA PRIVATE KEY|MIIkey-material'; then
+if grep -qE 'ghs_ABCDEF|sk-ant-SECRETKEY|BEGIN RSA PRIVATE KEY|MIIkey-material' <<<"$H1JSON"; then
   bad "H1 FALSIFIER: a token-ish secret LEAKED into the result: $H1JSON"
 else
   ok "H1 FALSIFIER: ghs_/sk-ant-/PEM secrets SCRUBBED from error_tail + the whole result"
@@ -450,7 +450,7 @@ fi
   && ok "H2 empty stdout -> summary:null (the parse honestly finds no JSON)" \
   || bad "H2 summary was not null (summary=$(hget h2_summary))"
 H2TAIL="$(hget h2_error_tail)"
-if printf '%s' "$H2TAIL" | grep -q 'RuntimeError: could not read .planning'; then
+if grep -q 'RuntimeError: could not read .planning' <<<"$H2TAIL"; then
   ok "H2 the silent traceback is now NAMED in error_tail: '$H2TAIL'"
 else
   bad "H2 silent failure still swallowed (error_tail='$H2TAIL')"

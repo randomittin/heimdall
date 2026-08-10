@@ -167,13 +167,13 @@ PRE="$(tree_sum "$STATE")"
 OUT="$(hmd add bogus --yes 2>&1)"; RC=$?
 [ "$RC" -ne 0 ] && ok "add REFUSED a module declaring an unhandled wire kind (exit $RC)" \
                 || bad "add ACCEPTED an unhandled wire kind — the defect is back"
-printf '%s' "$OUT" | grep -q 'teleport-chain' \
+grep -q 'teleport-chain' <<<"$OUT" \
   && ok "the refusal names the offending kind" || bad "refusal does not name the kind"
-printf '%s' "$OUT" | grep -qi 'known kinds' \
+grep -qi 'known kinds' <<<"$OUT" \
   && ok "the refusal lists the kinds that DO have handlers" || bad "refusal does not list known kinds"
-printf '%s' "$OUT" | grep -q '\[1/7\] validate' \
+grep -q '\[1/7\] validate' <<<"$OUT" \
   && ok "it was caught at [1/7] validate" || bad "not caught at validate"
-printf '%s' "$OUT" | grep -q '\[5/7\]' \
+grep -q '\[5/7\]' <<<"$OUT" \
   && bad "the refused module reached [5/7] install — validate is not read-only" \
   || ok "it never reached [5/7] install — nothing was fetched or written"
 [ "$(tree_sum "$STATE")" = "$PRE" ] \
@@ -306,7 +306,7 @@ mkfarm "$TMP/farm1" "$M1SRC"
 M1="$TMP/farm1/bin/heimdall-modules"
 MSTATE1="$TMP/mstate1/modules"
 OUT1="$("$M1" --registry "$REG" --state "$MSTATE1" add bogus --yes 2>&1)"; RC1=$?
-printf '%s' "$OUT1" | grep -q '\[5/7\]' \
+grep -q '\[5/7\]' <<<"$OUT1" \
   && ok "RED: with validate neutered the bogus kind reaches [5/7] install" \
   || bad "mutant 1 did not get past validate — the layer-1 proof is inconclusive"
 [ "$RC1" -ne 0 ] \
@@ -366,16 +366,16 @@ echo "W6 — [6/7] says out loud what it actually did, per wire"
 # distinguishable from each other on the same terminal, in the same run, not
 # merely distinguishable across two separate fixtures.
 OUT="$(hmd add headroom --yes 2>&1)"
-printf '%s' "$OUT" | grep -q '\[6/7\] wire' \
+grep -q '\[6/7\] wire' <<<"$OUT" \
   && ok "the step is still labelled [6/7] wire (the ordering gate's anchor survives)" \
   || bad "[6/7] wire label is gone — modules-lifecycle's order assertion would break"
-printf '%s' "$OUT" | grep -q ': RECORDED, not routed' \
+grep -q ': RECORDED, not routed' <<<"$OUT" \
   && ok "an inert wire prints \"RECORDED, not routed\", not a bare green" \
   || bad "[6/7] does not report an inert wire as recorded-not-routed"
-printf '%s' "$OUT" | grep -q ': ROUTED' \
+grep -q ': ROUTED' <<<"$OUT" \
   && ok "and a LIVE wire on the same module prints ROUTED — the two are distinguishable" \
   || bad "[6/7] does not report a live wire as ROUTED"
-printf '%s' "$OUT" | grep -q 'wrap-chain' \
+grep -q 'wrap-chain' <<<"$OUT" \
   && ok "each declared wire is named in the step output" || bad "wires are not named at [6/7]"
 hmd remove headroom >/dev/null 2>&1
 
@@ -409,13 +409,13 @@ EW="$STATE/envwire/wired.json"
 
 # Arm 1 — the machine agrees with the record.
 S_OFF="$(hmd status envwire 2>&1)"
-printf '%s' "$S_OFF" | grep -q 'measured now' \
+grep -q 'measured now' <<<"$S_OFF" \
   && ok "\`status\` states its verdict was measured NOW, not replayed from the record" \
   || bad "\`status\` does not report a verdict measured at read time"
-printf '%s' "$S_OFF" | grep -q ': NOT ROUTED (measured now)' \
+grep -q ': NOT ROUTED (measured now)' <<<"$S_OFF" \
   && ok "with the target unset it measures NOT ROUTED" \
   || bad "unset target did not measure NOT ROUTED"
-printf '%s' "$S_OFF" | grep -q 'add-time record says' \
+grep -q 'add-time record says' <<<"$S_OFF" \
   && bad "it reported drift while the record and the machine agree" \
   || ok "and reports NO drift, because the record and the machine agree"
 
@@ -423,10 +423,10 @@ printf '%s' "$S_OFF" | grep -q 'add-time record says' \
 # is the arm a replaying status cannot pass, and it is also the drifted state the
 # mutant below is run against.
 S_ON="$(HMD_WIRE_FIXTURE_URL="http://127.0.0.1:8080" hmd status envwire 2>&1)"
-printf '%s' "$S_ON" | grep -q ': ROUTED (measured now)' \
+grep -q ': ROUTED (measured now)' <<<"$S_ON" \
   && ok "exporting the target flips the SAME record's status to ROUTED — read-time measurement" \
   || bad "status did not move when the machine moved — it is replaying the record"
-printf '%s' "$S_ON" | grep -q 'add-time record says 0 ROUTED' \
+grep -q 'add-time record says 0 ROUTED' <<<"$S_ON" \
   && ok "and the DRIFT is named out loud, quoting what the stored record claims" \
   || bad "status silently preferred one side instead of naming the disagreement"
 [ "$(jq -r '.wires[0].routed' "$EW" 2>/dev/null)" = "false" ] \
@@ -476,20 +476,20 @@ bash -n "$M3SRC" 2>/dev/null \
 mkfarm "$TMP/farm3" "$M3SRC"
 M3OUT="$(HMD_WIRE_FIXTURE_URL="http://127.0.0.1:8080" \
          "$TMP/farm3/bin/heimdall-modules" --registry "$REG" --state "$STATE" status envwire 2>&1)"
-printf '%s' "$M3OUT" | grep -q 'measured now' \
+grep -q 'measured now' <<<"$M3OUT" \
   && bad "mutant 3 still claims a read-time measurement — the reconstruction is wrong" \
   || ok "RED: the replaying status makes no read-time claim, so arm 1's assertion fails on it"
-printf '%s' "$M3OUT" | grep -q 'add-time record says' \
+grep -q 'add-time record says' <<<"$M3OUT" \
   && bad "mutant 3 flagged drift — a replaying status cannot detect drift, so this is wrong" \
   || ok "RED: it cannot see the drift at all, so arm 2's drift assertion fails on it"
-printf '%s' "$M3OUT" | grep -q ': RECORDED, not routed' \
+grep -q ': RECORDED, not routed' <<<"$M3OUT" \
   && ok "RED: and it reports the wire as not routed while the machine has it ROUTED — the exact defect" \
   || bad "mutant 3 did not reproduce the replayed verdict"
 
 # GREEN again on the shipped binary, same state, same machine. The restore is what
 # makes the REDs above evidence rather than noise.
 S_RESTORE="$(HMD_WIRE_FIXTURE_URL="http://127.0.0.1:8080" hmd status envwire 2>&1)"
-printf '%s' "$S_RESTORE" | grep -q ': ROUTED (measured now)' \
+grep -q ': ROUTED (measured now)' <<<"$S_RESTORE" \
   && ok "GREEN: the shipped binary measures the same state as ROUTED again" \
   || bad "the shipped binary did not restore the measured verdict"
 
@@ -516,7 +516,7 @@ RW="$(HMD_WIRE_FIXTURE_URL="http://127.0.0.1:8080" hmd rewire envwire 2>&1)"; RC
   && ok "the invariant evidence is BYTE-IDENTICAL — rewire re-ran no invariants" \
   || bad "rewire disturbed the invariant record"
 S_FIX="$(HMD_WIRE_FIXTURE_URL="http://127.0.0.1:8080" hmd status envwire 2>&1)"
-printf '%s' "$S_FIX" | grep -q 'add-time record says' \
+grep -q 'add-time record says' <<<"$S_FIX" \
   && bad "the drift note survived the refresh — rewire did not actually correct the record" \
   || ok "and the drift note is GONE, because the record now agrees with the machine"
 

@@ -57,7 +57,7 @@ LINES="$(printf '%s\n' "$OUT" | grep -c .)"
 ID="$(printf '%s' "$OUT" | python3 -c 'import sys,json; print(json.loads(sys.stdin.readline())["id"])' 2>/dev/null)"
 [ "$ID" = "t-run" ] && ok "emitted id is the RUNNING task (t-run)" \
                      || bad "emitted id = '$ID', expected t-run"
-printf '%s' "$OUT" | grep -q 't-done' && bad "completed task id t-done leaked into output" \
+grep -q 't-done' <<<"$OUT" && bad "completed task id t-done leaked into output" \
                                       || ok "completed task id OMITTED entirely"
 CONTENT="$(printf '%s' "$OUT" | python3 -c 'import sys,json; print(json.loads(sys.stdin.readline())["content"])' 2>/dev/null)"
 case "$CONTENT" in
@@ -72,11 +72,11 @@ J3='{"columns":120,"tasks":[
 ]}'
 OUT3="$(run "$J3")"
 C3="$(printf '%s' "$OUT3" | python3 -c 'import sys,json; print(json.loads(sys.stdin.readline())["content"])' 2>/dev/null)"
-printf '%s' "$C3" | grep -q '%'  && bad "pct present when token fields absent: [$C3]" \
+grep -q '%' <<<"$C3"  && bad "pct present when token fields absent: [$C3]" \
                                  || ok "pct omitted when token fields absent"
-printf '%s' "$C3" | grep -q '↓'  && bad "↓tokens present when tokenCount absent: [$C3]" \
+grep -q '↓' <<<"$C3"  && bad "↓tokens present when tokenCount absent: [$C3]" \
                                  || ok "↓tokens omitted when tokenCount absent"
-printf '%s' "$C3" | grep -q '4m10s' && ok "elapsed still rendered: [$C3]" \
+grep -q '4m10s' <<<"$C3" && ok "elapsed still rendered: [$C3]" \
                                     || bad "elapsed missing: [$C3]"
 
 # ── 4) empty tasks + malformed → NO output, exit 0, NO stderr ────────────────────
@@ -115,7 +115,7 @@ print(n)' 2>/dev/null)"
 [ "$VALID" = "2" ] && ok "both running tasks → 2 valid JSON lines with id+content" \
                     || bad "expected 2 valid JSON lines, got '$VALID'"
 # 1.2M humanization for tokenCount 1200000
-printf '%s' "$OUT5" | grep -q '1.2M' && ok "tokens humanized to 1.2M" \
+grep -q '1.2M' <<<"$OUT5" && ok "tokens humanized to 1.2M" \
                                      || bad "1.2M humanization missing"
 
 # ── 6) columns default 80 when absent (no crash, still emits) ────────────────────

@@ -78,7 +78,7 @@ run_brief() {
 
 # ── (a) a code symbol resolves to a REAL span from the graph ─────────────────
 run_brief build --task T1 --spec "touch the leaf" --symbols leaf_target
-if [ "$RC" -eq 0 ] && printf '%s' "$OUT" | grep -q "lib/core.py:4-5"; then
+if [ "$RC" -eq 0 ] && grep -q "lib/core.py:4-5" <<<"$OUT"; then
   ok "(a) code symbol resolves to a real file:span from the graph"
 else
   bad "(a) code symbol did not resolve to a real span (rc=$RC)"
@@ -101,14 +101,14 @@ def middle_hop(x):
     return 2
 EOF
 run_brief build --task T1 --spec "touch the leaf" --symbols leaf_target
-if [ "$RC" -eq 1 ] && printf '%s' "$OUT" | grep -q "UNRESOLVED"; then
+if [ "$RC" -eq 1 ] && grep -q "UNRESOLVED" <<<"$OUT"; then
   ok "(b) FALSIFIABLE: definition deleted → brief refuses, exit 1, says UNRESOLVED"
 else
   bad "(b) deleted definition did NOT make the brief refuse (rc=$RC, want 1)"
   printf '%s\n' "$OUT" | sed 's/^/      /'
 fi
 # ...and it must NOT have emitted a normal-looking brief body alongside the refusal.
-if printf '%s' "$OUT" | grep -q "INCOMPLETE"; then
+if grep -q "INCOMPLETE" <<<"$OUT"; then
   ok "(b) the refusal names the brief as INCOMPLETE, not merely annotated"
 else
   bad "(b) refusal did not mark the brief INCOMPLETE"
@@ -117,7 +117,7 @@ seed_repo
 
 # ── (c) callers ride along, with confidence markers preserved ────────────────
 run_brief build --task T2 --spec "change the leaf" --symbols leaf_target
-if printf '%s' "$OUT" | grep -q "middle_hop"; then
+if grep -q "middle_hop" <<<"$OUT"; then
   ok "(c) callers ride along with the symbol (blast radius, not just location)"
 else
   bad "(c) callers missing from the brief"
@@ -126,13 +126,13 @@ fi
 
 # ── (d) --files emits an OUTLINE (spans), never the file body ────────────────
 run_brief build --task T3 --spec "edit core" --files lib/core.py
-if [ "$RC" -eq 0 ] && printf '%s' "$OUT" | grep -q "entry_point"; then
+if [ "$RC" -eq 0 ] && grep -q "entry_point" <<<"$OUT"; then
   ok "(d) --files emits the outline symbol list"
 else
   bad "(d) --files did not emit an outline (rc=$RC)"
   printf '%s\n' "$OUT" | sed 's/^/      /'
 fi
-if printf '%s' "$OUT" | grep -q "return x + 1"; then
+if grep -q "return x + 1" <<<"$OUT"; then
   bad "(d) LEAK: the brief inlined file BODY text, defeating the whole mechanism"
 else
   ok "(d) the brief carries spans only — no file body leaked in"
@@ -140,7 +140,7 @@ fi
 
 # ── (e) FALSIFIABILITY: unknown file → refuse ────────────────────────────────
 run_brief build --task T3 --spec "edit ghost" --files lib/does_not_exist.py
-if [ "$RC" -eq 1 ] && printf '%s' "$OUT" | grep -q "UNRESOLVED"; then
+if [ "$RC" -eq 1 ] && grep -q "UNRESOLVED" <<<"$OUT"; then
   ok "(e) FALSIFIABLE: unknown file → refuses, exit 1"
 else
   bad "(e) unknown file did not cause a refusal (rc=$RC, want 1)"
@@ -149,7 +149,7 @@ fi
 # ── (f) the curated alias table still works (protocol v2 mechanism 2) ────────
 "$ROOT/bin/heimdall-resolve" set F12 "src/matching/engine.ts" >/dev/null
 run_brief build --task T4 --spec "use the alias" --symbols F12
-if [ "$RC" -eq 0 ] && printf '%s' "$OUT" | grep -q "src/matching/engine.ts"; then
+if [ "$RC" -eq 0 ] && grep -q "src/matching/engine.ts" <<<"$OUT"; then
   ok "(f) curated alias ids still resolve (mechanism 2 not regressed)"
 else
   bad "(f) alias resolution regressed (rc=$RC)"
@@ -159,12 +159,12 @@ fi
 # ── (g) graph beats alias on collision, and says so ──────────────────────────
 "$ROOT/bin/heimdall-resolve" set leaf_target "SOMETHING STALE AND WRONG" >/dev/null
 run_brief build --task T5 --spec "collide" --symbols leaf_target
-if printf '%s' "$OUT" | grep -q "lib/core.py:4-5"; then
+if grep -q "lib/core.py:4-5" <<<"$OUT"; then
   ok "(g) graph wins the collision (ground truth beats a stale alias)"
 else
   bad "(g) stale alias shadowed the graph — drift can now produce a false green"
 fi
-if printf '%s' "$OUT" | grep -qi "COLLISION"; then
+if grep -qi "COLLISION" <<<"$OUT"; then
   ok "(g) the collision is announced, not silently resolved"
 else
   bad "(g) collision was resolved silently"
@@ -194,7 +194,7 @@ fi
 
 # ── (i) a missing capsule is an unresolved ref, not a silent gap ─────────────
 run_brief build --task T7 --spec "hydrate a ghost" --capsules no_such_capsule
-if [ "$RC" -eq 1 ] && printf '%s' "$OUT" | grep -q "UNRESOLVED"; then
+if [ "$RC" -eq 1 ] && grep -q "UNRESOLVED" <<<"$OUT"; then
   ok "(i) missing capsule is reported as an unresolved ref, exit 1"
 else
   bad "(i) missing capsule did not refuse (rc=$RC, want 1)"
@@ -202,7 +202,7 @@ fi
 
 # ── (j) the brief never smuggles the plan back in ────────────────────────────
 run_brief build --task T8 --spec "stay thin" --symbols leaf_target
-if printf '%s' "$OUT" | grep -q "Refs only"; then
+if grep -q "Refs only" <<<"$OUT"; then
   ok "(j) the brief still declares itself refs-only"
 else
   bad "(j) the refs-only contract line went missing"
@@ -233,7 +233,7 @@ fi
 # is not. The brief must carry the caveat, and must SOURCE it from the graph
 # rather than paraphrasing it — a paraphrase is a second copy that can drift.
 run_brief build --task T10 --spec "assess blast radius" --symbols leaf_target
-if printf '%s' "$OUT" | grep -qi "not exhaustive"; then
+if grep -qi "not exhaustive" <<<"$OUT"; then
   ok "(m) caller list carries the non-exhaustiveness caveat"
 else
   bad "(m) OVERCLAIM: callers printed as if complete, with no blind-spot notice"
@@ -242,7 +242,7 @@ fi
 # The wording must match the graph's canonical LIMITATIONS[0], not a local copy.
 canon="$(bin/heimdall-graph callers leaf_target --json --repo "$REPO" 2>/dev/null \
          | jq -r '.limitations[0] // empty')"
-if [ -n "$canon" ] && printf '%s' "$OUT" | grep -qF "$canon"; then
+if [ -n "$canon" ] && grep -qF "$canon" <<<"$OUT"; then
   ok "(m) the caveat is the graph's own string — it cannot drift from the source"
 else
   bad "(m) caveat text does not match the graph's canonical limitations[0]"

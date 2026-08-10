@@ -140,37 +140,37 @@ advise() {
 
 # the FALSE claim the forensic sweep killed. Any of these in the output = a regression.
 FALSE_FIX='a restart is the fix|clear ONLY on reboot|kernel/driver-locked'
-has_false_fix() { printf '%s\n' "$1" | grep -qE "$FALSE_FIX"; }
+has_false_fix() { grep -qE "$FALSE_FIX" <<<"$1"; }
 
 # ── 1. HIGH + a detectable holder → no false "restart is the fix" claim ───────────
 sim="$(advise "$JSON_HIGH" "$WORK/mounts-sim" "$WORK/ps-plain" "" --quick)"
 has_false_fix "$sim" \
   && bad "advisory still claims a restart is THE fix (the falsified claim)" \
   || ok "advisory no longer claims a restart is THE fix"
-printf '%s\n' "$sim" | grep -qiE 'temporary reclaim' \
+grep -qiE 'temporary reclaim' <<<"$sim" \
   && ok "advisory frames a reboot as a TEMPORARY reclaim" \
   || bad "advisory does not say a reboot is only a temporary reclaim: $sim"
 
 # ── 2. the detected holder is NAMED with a durable, non-destructive review step ───
-if printf '%s\n' "$sim" | grep -qi 'simulator runtime volume' \
-   && printf '%s\n' "$sim" | grep -q '4' \
-   && printf '%s\n' "$sim" | grep -q 'xcrun simctl runtime list'; then
+if grep -qi 'simulator runtime volume' <<<"$sim" \
+   && grep -q '4' <<<"$sim" \
+   && grep -q 'xcrun simctl runtime list' <<<"$sim"; then
   ok "names the measured holder (4 mounted simulator runtime volumes) + the review command"
 else
   bad "did not name the detected simulator-runtime holder or its review command: $sim"
 fi
-printf '%s\n' "$sim" | grep -q 'simctl runtime delete' \
+grep -q 'simctl runtime delete' <<<"$sim" \
   && ok "gives the DURABLE action (runtime delete) rather than only a reboot" \
   || bad "no durable action offered for the detected holder"
 
 # ── 3. HIGH + NOTHING detectable → describe and STOP (no invented prescription) ───
 plain="$(advise "$JSON_HIGH" "$WORK/mounts-plain" "$WORK/ps-plain" "" --quick)"
-if printf '%s\n' "$plain" | grep -qi 'no persistent holder identified'; then
+if grep -qi 'no persistent holder identified' <<<"$plain"; then
   ok "with no detectable holder it SAYS the holder is unidentified (describes, then stops)"
 else
   bad "invented or omitted an attribution when nothing was detectable: $plain"
 fi
-printf '%s\n' "$plain" | grep -qi 'simulator runtime volume' \
+grep -qi 'simulator runtime volume' <<<"$plain" \
   && bad "prescribed simulator runtimes on a machine with none mounted (hardcoded answer)" \
   || ok "does NOT hardcode simulator runtimes as the universal answer"
 has_false_fix "$plain" \
@@ -182,13 +182,13 @@ brk="$(advise "$JSON_HIGH" "BROKEN" "$WORK/ps-plain" "" --quick)"; brk_rc=$?
 [ "$brk_rc" -eq 0 ] \
   && ok "a broken detection probe exits 0 (SessionStart is never broken by the advisory)" \
   || bad "broken probe made --advise exit $brk_rc"
-printf '%s\n' "$brk" | grep -qi 'memory pressure is HIGH' \
+grep -qi 'memory pressure is HIGH' <<<"$brk" \
   && ok "advisory still prints when detection is unavailable" \
   || bad "advisory went missing when the detection probe failed: $brk"
-printf '%s\n' "$brk" | grep -qi 'no persistent holder identified' \
+grep -qi 'no persistent holder identified' <<<"$brk" \
   && ok "unavailable detection degrades to the honest 'holder unidentified' wording" \
   || bad "broken probe did not degrade to the honest wording: $brk"
-printf '%s\n' "$brk" | grep -qi 'getmntinfo failed' \
+grep -qi 'getmntinfo failed' <<<"$brk" \
   && bad "probe stderr leaked into the SessionStart advisory" \
   || ok "probe stderr is swallowed (no noise in the advisory)"
 
@@ -199,26 +199,26 @@ low="$(advise "$JSON_LOW" "$WORK/mounts-sim" "$WORK/ps-plain" "" --quick)"
   || bad "advisory spoke on a healthy machine: $low"
 
 # ── 6. MEMORY and DISK are not conflated ─────────────────────────────────────────
-printf '%s\n' "$sim" | grep -q 'MEMORY axis' \
+grep -q 'MEMORY axis' <<<"$sim" \
   && ok "the hmd figure is explicitly scoped to the MEMORY axis" \
   || bad "the hmd figure is not scoped to an axis — memory and disk still conflated: $sim"
-printf '%s\n' "$sim" | grep -qi 'of hmd-owned garbage total' \
+grep -qi 'of hmd-owned garbage total' <<<"$sim" \
   && bad "still presents a partial scan as the hmd-owned TOTAL (the overstatement)" \
   || ok "no longer claims a partial figure is the hmd-owned total"
-if printf '%s\n' "$sim" | grep -qi 'DISK' && printf '%s\n' "$sim" | grep -qi 'quick scan'; then
+if grep -qi 'DISK' <<<"$sim" && grep -qi 'quick scan' <<<"$sim"; then
   ok "--quick declares the DISK axis unmeasured instead of quoting it as a total"
 else
   bad "--quick did not scope the disk axis honestly: $sim"
 fi
 # a FULL (non-quick) run may quote the disk number, but must keep it a separate axis
 full="$(advise "$JSON_HIGH" "$WORK/mounts-sim" "$WORK/ps-plain" "")"
-printf '%s\n' "$full" | grep -qi 'does not relieve memory' \
+grep -qi 'does not relieve memory' <<<"$full" \
   && ok "the disk figure is marked as not relieving memory pressure (axes kept apart)" \
   || bad "full run conflates the disk figure with the memory problem: $full"
 
 # ── 7. swap urgency is not overstated ────────────────────────────────────────────
-if printf '%s\n' "$sim" | grep -qi 'reclaims it on its own' \
-   && printf '%s\n' "$sim" | grep -qi 'without a reboot'; then
+if grep -qi 'reclaims it on its own' <<<"$sim" \
+   && grep -qi 'without a reboot' <<<"$sim"; then
   ok "notes macOS reclaims swap on its own as pressure eases (no reboot needed)"
 else
   bad "swap is presented as requiring intervention: $sim"
@@ -226,17 +226,17 @@ fi
 
 # ── 8. holder detection is not simulator-only — a hypervisor is detected too ──────
 vm="$(advise "$JSON_HIGH" "$WORK/mounts-plain" "$WORK/ps-vm" "" --quick)"
-if printf '%s\n' "$vm" | grep -qi 'com.docker.virtualization' \
-   && printf '%s\n' "$vm" | grep -qiE 'hypervisor|virtual machine|VM'; then
+if grep -qi 'com.docker.virtualization' <<<"$vm" \
+   && grep -qiE 'hypervisor|virtual machine|VM' <<<"$vm"; then
   ok "detects a running hypervisor as a persistent holder (detection is general)"
 else
   bad "did not detect the planted hypervisor: $vm"
 fi
 
 # ── 9. what was TRUE is kept ─────────────────────────────────────────────────────
-if printf '%s\n' "$sim" | grep -qi 'NOT heimdall' \
-   && printf '%s\n' "$sim" | grep -qi 'no hmd python leak' \
-   && printf '%s\n' "$sim" | grep -qi 'cannot free kernel-wired memory'; then
+if grep -qi 'NOT heimdall' <<<"$sim" \
+   && grep -qi 'no hmd python leak' <<<"$sim" \
+   && grep -qi 'cannot free kernel-wired memory' <<<"$sim"; then
   ok "keeps the true claims: not heimdall · no hmd leak · hmd cannot free kernel-wired memory"
 else
   bad "the correction dropped a claim that was TRUE: $sim"
@@ -244,8 +244,8 @@ fi
 
 # ── 10. the hmd-leak path still reaps hmd's OWN footprint first ──────────────────
 leak="$(advise "$JSON_HIGH" "$WORK/mounts-sim" "$WORK/ps-plain" "100 101" --quick)"
-if printf '%s\n' "$leak" | grep -qi 'Part of it IS heimdall' \
-   && printf '%s\n' "$leak" | grep -q 'heimdall-cleanup --apply'; then
+if grep -qi 'Part of it IS heimdall' <<<"$leak" \
+   && grep -q 'heimdall-cleanup --apply' <<<"$leak"; then
   ok "leak path still owns hmd's share and recommends --apply first"
 else
   bad "leak path lost the --apply-first recommendation: $leak"

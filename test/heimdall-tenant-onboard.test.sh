@@ -353,8 +353,8 @@ if printf '%s' "$RR_OUT" | grep -qF -- "$SENTINEL"; then
 else
   ok "7.1 rr connect --dry-run did NOT print the token (the secret is redacted)"
 fi
-printf '%s' "$RR_OUT" | grep -q "redacted" && printf '%s' "$RR_OUT" | grep -q "/team/cred" \
-  && printf '%s' "$RR_OUT" | grep -q "/team/install" && printf '%s' "$RR_OUT" | grep -q "424242" \
+grep -q "redacted" <<<"$RR_OUT" && grep -q "/team/cred" <<<"$RR_OUT" \
+  && grep -q "/team/install" <<<"$RR_OUT" && grep -q "424242" <<<"$RR_OUT" \
   && ok "7.2 the plan shows the POST /team/cred (redacted) + POST /team/install (id 424242) shape" \
   || bad "7.2 the dry-run plan is missing the redacted-secret / route / install-id markers"
 

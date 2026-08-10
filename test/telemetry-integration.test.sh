@@ -45,7 +45,7 @@ echo "── (1) INSTALL: each step emits; a claude-mem failure is captured with
 "$TLM" emit --type install_step --step companion:claude-mem --outcome failed \
     --error-class npm-exec-failed --error-step companion:claude-mem --duration-ms 900 --home "$H" >/dev/null
 DROP="$("$RPT" aggregate --json --home "$H" 2>/dev/null)"
-if printf '%s' "$DROP" | grep -q 'claude-mem' && printf '%s' "$DROP" | grep -q 'npm-exec-failed'; then
+if grep -q 'claude-mem' <<<"$DROP" && grep -q 'npm-exec-failed' <<<"$DROP"; then
   ok "(1) install steps emit; claude-mem failure captured WITH step + error class"
 else
   bad "(1) claude-mem install failure not captured: $DROP"
@@ -84,8 +84,8 @@ print("OK" if ("blocked" in outs and "passed" in outs and outs.index("blocked")<
 echo "── (4) hmd report renders per-run AND aggregate from the real events ──"
 AGG="$("$RPT" aggregate --json --home "$H" 2>/dev/null)"
 PR_RC=0; "$RPT" run "$RUN1" --home "$H" >/dev/null 2>&1 || PR_RC=$?
-HAS_GATE="$(printf '%s' "$AGG" | grep -c 'secret-scan')"
-HAS_DROP="$(printf '%s' "$AGG" | grep -c 'claude-mem')"
+HAS_GATE="$(grep -c 'secret-scan' <<<"$AGG")"
+HAS_DROP="$(grep -c 'claude-mem' <<<"$AGG")"
 if [ "$PR_RC" -eq 0 ] && [ "$HAS_GATE" -ge 1 ] && [ "$HAS_DROP" -ge 1 ]; then
   ok "(4) report: per-run renders (rc=0) + aggregate shows gate-frequency + install drop-off"
 else

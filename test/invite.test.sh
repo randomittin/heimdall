@@ -86,14 +86,14 @@ write_cp_url "$H1" "$FAKE_URL"; write_team "$TD1" "$FAKE_SECRET"
 OUT1="$(HOME="$H1" HEIMDALL_TEAM_DIR="$TD1" "$CLI"; echo "RC=$?")"
 RC1="${OUT1##*RC=}"; BODY1="${OUT1%RC=*}"
 if [ "$RC1" -eq 0 ] \
-   && printf '%s' "$BODY1" | grep -qF "curl -fsSL --proto '=https' https://raw.githubusercontent.com/" \
-   && printf '%s' "$BODY1" | grep -qF "/$PUB_HIGH/install.sh" \
-   && printf '%s' "$BODY1" | grep -qF "set -o pipefail" \
-   && printf '%s' "$BODY1" | grep -qF 'bash "$f"' \
-   && printf '%s' "$BODY1" | grep -qF "HEIMDALL_CP_URL='$FAKE_URL'" \
-   && printf '%s' "$BODY1" | grep -qF "HEIMDALL_TEAM_SECRET='$FAKE_SECRET'" \
-   && ! printf '%s' "$BODY1" | grep -qF "install.sh | HEIMDALL_CP_URL=" \
-   && printf '%s' "$BODY1" | grep -q "contains your team secret"; then
+   && grep -qF "curl -fsSL --proto '=https' https://raw.githubusercontent.com/" <<<"$BODY1" \
+   && grep -qF "/$PUB_HIGH/install.sh" <<<"$BODY1" \
+   && grep -qF "set -o pipefail" <<<"$BODY1" \
+   && grep -qF 'bash "$f"' <<<"$BODY1" \
+   && grep -qF "HEIMDALL_CP_URL='$FAKE_URL'" <<<"$BODY1" \
+   && grep -qF "HEIMDALL_TEAM_SECRET='$FAKE_SECRET'" <<<"$BODY1" \
+   && ! grep -qF "install.sh | HEIMDALL_CP_URL=" <<<"$BODY1" \
+   && grep -q "contains your team secret" <<<"$BODY1"; then
   ok "(b) team secret + url -> download-then-run join, pinned to the highest published tag, inlines both + caveat (exit 0)"
 else
   bad "(b) full-join output wrong (rc=$RC1):
@@ -106,8 +106,8 @@ write_team "$TD2" "$FAKE_SECRET"
 OUT2="$(HOME="$H2" HEIMDALL_TEAM_DIR="$TD2" "$CLI"; echo "RC=$?")"
 RC2="${OUT2##*RC=}"; BODY2="${OUT2%RC=*}"
 if [ "$RC2" -eq 0 ] \
-   && printf '%s' "$BODY2" | grep -qF "HEIMDALL_TEAM_SECRET='$FAKE_SECRET'" \
-   && printf '%s' "$BODY2" | grep -qF "HEIMDALL_CP_URL='$DEFAULT_CP_URL'"; then
+   && grep -qF "HEIMDALL_TEAM_SECRET='$FAKE_SECRET'" <<<"$BODY2" \
+   && grep -qF "HEIMDALL_CP_URL='$DEFAULT_CP_URL'" <<<"$BODY2"; then
   ok "(c) no cp url -> join falls back to the shipped public default url (exit 0)"
 else
   bad "(c) url-default output wrong (rc=$RC2):
@@ -120,9 +120,9 @@ mkdir -p "$TD3"
 OUT3="$(HOME="$H3" HEIMDALL_TEAM_DIR="$TD3" "$CLI" 2>&1; echo "RC=$?")"
 RC3="${OUT3##*RC=}"; BODY3="${OUT3%RC=*}"
 if [ "$RC3" -eq 0 ] \
-   && printf '%s' "$BODY3" | grep -q "no team is configured for this repo" \
-   && ! printf '%s' "$BODY3" | grep -q "Traceback" \
-   && ! printf '%s' "$BODY3" | grep -qE "raw\.githubusercontent\.com/[^ ]+/install\.sh"; then
+   && grep -q "no team is configured for this repo" <<<"$BODY3" \
+   && ! grep -q "Traceback" <<<"$BODY3" \
+   && ! grep -qE "raw\.githubusercontent\.com/[^ ]+/install\.sh" <<<"$BODY3"; then
   ok "(d) no team.json -> helpful setup message, exit 0, no traceback, no fabricated join"
 else
   bad "(d) degrade output wrong (rc=$RC3):
@@ -153,8 +153,8 @@ OUT5="$(HOME="$H5" HEIMDALL_TEAM_DIR="$TD5" HEIMDALL_REF="v99.99.99" \
         HEIMDALL_INVITE_ASSUME_HTTP="404" "$CLI" 2>&1; echo "RC=$?")"
 RC5="${OUT5##*RC=}"; BODY5="${OUT5%RC=*}"
 if [ "$RC5" -ne 0 ] \
-   && ! printf '%s' "$BODY5" | grep -qE "raw\.githubusercontent\.com/[^ ]+/v99\.99\.99/install\.sh -o" \
-   && printf '%s' "$BODY5" | grep -qiE "does not resolve|REFUSING|not (published|resolve)"; then
+   && ! grep -qE "raw\.githubusercontent\.com/[^ ]+/v99\.99\.99/install\.sh -o" <<<"$BODY5" \
+   && grep -qiE "does not resolve|REFUSING|not (published|resolve)" <<<"$BODY5"; then
   ok "(f) unpublished pinned ref -> loud refusal, non-zero exit, NO join emitted"
 else
   bad "(f) FALSIFIER: CLI emitted a join for an unresolvable ref (rc=$RC5):
@@ -168,7 +168,7 @@ H6="$(mk_dir)"; TD6="$(mk_dir)/.heimdall"
 write_cp_url "$H6" "$FAKE_URL"; write_team "$TD6" "$FAKE_SECRET"
 OUT6="$(HOME="$H6" HEIMDALL_TEAM_DIR="$TD6" "$CLI"; echo "RC=$?")"
 RC6="${OUT6##*RC=}"; BODY6="${OUT6%RC=*}"
-EMITTED_REF="$(printf '%s' "$BODY6" | grep -oE 'raw\.githubusercontent\.com/[^ ]+/install\.sh' \
+EMITTED_REF="$(grep -oE 'raw\.githubusercontent\.com/[^ ]+/install\.sh' <<<"$BODY6" \
                 | head -1 | sed -E 's#.*/([^/]+)/install\.sh#\1#')"
 if [ "$RC6" -eq 0 ] && [ "$EMITTED_REF" = "$PUB_HIGH" ]; then
   ok "(g) no pin -> emitted ref is the highest PUBLISHED tag ($EMITTED_REF), not a local-only ref"
@@ -187,14 +187,14 @@ write_cp_url "$H7" "$FAKE_URL"; write_team "$TD7" "$FAKE_SECRET"
 OUT7="$(HOME="$H7" HEIMDALL_TEAM_DIR="$TD7" "$CLI"; echo "RC=$?")"
 RC7="${OUT7##*RC=}"; BODY7="${OUT7%RC=*}"
 # The join line is the last printed line carrying the raw installer URL.
-JOINLINE="$(printf '%s' "$BODY7" | grep -F 'raw.githubusercontent.com' | tail -1)"
+JOINLINE="$(grep -F 'raw.githubusercontent.com' <<<"$BODY7" | tail -1)"
 CURL_PART="${JOINLINE%%&& HEIMDALL_CP_URL=*}"   # everything up to the download's success
 if [ "$RC7" -eq 0 ] \
    && printf '%s' "$JOINLINE" | grep -qF -e '-o "$f"' \
-   && printf '%s' "$JOINLINE" | grep -qF 'bash "$f"' \
-   && printf '%s' "$JOINLINE" | grep -qF "HEIMDALL_TEAM_SECRET='$FAKE_SECRET' bash" \
+   && grep -qF 'bash "$f"' <<<"$JOINLINE" \
+   && grep -qF "HEIMDALL_TEAM_SECRET='$FAKE_SECRET' bash" <<<"$JOINLINE" \
    && printf '%s' "$CURL_PART" | grep -qF -e '-o "$f"' \
-   && ! printf '%s' "$CURL_PART" | grep -qF "$FAKE_SECRET"; then
+   && ! grep -qF "$FAKE_SECRET" <<<"$CURL_PART"; then
   ok "(h) non-swallowing join: downloads to a file then bash <file>; secret only in the bash env, not the download"
 else
   bad "(h) FALSIFIER: one-liner shape wrong or secret in the download portion (rc=$RC7):

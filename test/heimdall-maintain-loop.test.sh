@@ -228,10 +228,10 @@ echo "── (6) HEARTBEAT — renders REAL numbers from the last block ──�
 # reuse R5 (one PASS cycle). The heartbeat must show cycle 1, 1 fixed, 1 PR, PASS.
 HB="$(env HEIMDALL_HOME="$R5/.heimdall" HEIMDALL_STATE_FILE="$R5/heimdall-state.json" \
        HEIMDALL_TOKENS_BIN="$METER_SMALL" "$CMD" heartbeat --repo "$R5")"
-if printf '%s' "$HB" | grep -q 'cycle 1' \
-   && printf '%s' "$HB" | grep -q '1 fixed' \
-   && printf '%s' "$HB" | grep -q '1 PR' \
-   && printf '%s' "$HB" | grep -q 'PASS'; then
+if grep -q 'cycle 1' <<<"$HB" \
+   && grep -q '1 fixed' <<<"$HB" \
+   && grep -q '1 PR' <<<"$HB" \
+   && grep -q 'PASS' <<<"$HB"; then
   ok "heartbeat renders real numbers: '$HB'"
 else
   bad "heartbeat did not render the real PASS numbers: '$HB'"
@@ -241,9 +241,9 @@ R6="$(new_repo hb_fail)"; enable_state "$R6" true 600000; seed "$R6" 61
 run_loop "$R6" "$METER_SMALL" --evidence "false" >/dev/null
 HBF="$(env HEIMDALL_HOME="$R6/.heimdall" HEIMDALL_STATE_FILE="$R6/heimdall-state.json" \
         HEIMDALL_TOKENS_BIN="$METER_SMALL" "$CMD" heartbeat --repo "$R6")"
-if printf '%s' "$HBF" | grep -q '0 fixed' \
-   && printf '%s' "$HBF" | grep -q 'FAIL' \
-   && ! printf '%s' "$HBF" | grep -q 'PASS'; then
+if grep -q '0 fixed' <<<"$HBF" \
+   && grep -q 'FAIL' <<<"$HBF" \
+   && ! grep -q 'PASS' <<<"$HBF"; then
   ok "falsifier: a FAIL run's heartbeat shows 0 fixed + FAIL (numbers are not canned)"
 else
   bad "heartbeat numbers look canned — FAIL run did not flip them: '$HBF'"
@@ -255,7 +255,7 @@ R7="$(new_repo resume)"; enable_state "$R7" true 600000; seed "$R7" 71; seed "$R
 run_loop "$R7" "$METER_SMALL" --max 1 --evidence "true" >/dev/null
 HINT="$(env HEIMDALL_STATE_FILE="$R7/heimdall-state.json" HEIMDALL_TOKENS_BIN="$METER_SMALL" \
          "$CMD" resume-hint --repo "$R7")"
-if printf '%s' "$HINT" | grep -q '/loop 30m /hmd:maintain-check'; then
+if grep -q '/loop 30m /hmd:maintain-check' <<<"$HINT"; then
   ok "positive: stop:null + enabled + budget -> re-arm line emitted"
 else
   bad "resume-hint did NOT emit on a re-armable pause (got: '$HINT')"
@@ -655,7 +655,7 @@ else
   bad "sync did not populate/proceed (stop=$(jget "$OUT" '.stop') cycles=$(jget "$OUT" '.cycles') fixed=$(jget "$OUT" '.tally.fixed'))"
 fi
 PICKED="$(jget "$OUT" '.last.issue')"
-if printf '%s' "$PICKED" | grep -q '#1$'; then
+if grep -q '#1$' <<<"$PICKED"; then
   ok "picked the OLDEST ingested issue first (#1): $PICKED"
 else
   bad "wrong pick order (expected the #1 issue, got: $PICKED)"
@@ -704,7 +704,7 @@ else
   bad "a sync failure was silently reported as empty-queue"
 fi
 NOTE17="$(jget "$OUT" '.note')"
-if printf '%s' "$NOTE17" | grep -q 'queue sync failed' && ! printf '%s' "$NOTE17" | grep -q "$BOT_TOKEN"; then
+if grep -q 'queue sync failed' <<<"$NOTE17" && ! grep -q "$BOT_TOKEN" <<<"$NOTE17"; then
   ok "the summary carries a named, token-scrubbed note: $NOTE17"
 else
   bad "sync-error note missing or leaked a token: $NOTE17"

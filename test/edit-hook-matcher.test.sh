@@ -97,7 +97,7 @@ fi
 # strict reading: any matcher passing here also matches under the looser
 # substring reading, so the assertion holds whichever the harness uses.
 matches_anchored() {
-  printf '%s\n' "$1" | grep -qE "^($MATCHER)$"
+  grep -qE "^($MATCHER)$" <<<"$1"
 }
 
 for TOOL in Write Edit MultiEdit NotebookEdit; do
@@ -164,7 +164,7 @@ else
     )
 
     LOGGED=$(TMPDIR="$SANDBOX" CLAUDE_CODE_SESSION_ID="$SID" "$TRACKER" paths 2>/dev/null)
-    if printf '%s\n' "$LOGGED" | grep -qF "$TARGET"; then
+    if grep -qF "$TARGET" <<<"$LOGGED"; then
       ok "hook command records a '$TOOL' payload in the ledger"
     else
       bad "hook command did NOT record a '$TOOL' payload (ledger: '${LOGGED:-<empty>}')"

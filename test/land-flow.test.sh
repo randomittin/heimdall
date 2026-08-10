@@ -100,11 +100,11 @@ NCONS1="$(printf '%s' "$V1" | jq -r '.consolidations | length')"
 
 # ONE survives: the duplicate definition is gone from the landed shared main.
 LANDED1="$(git -C "$WORK/redundancy.git" show main:src/calc.py 2>/dev/null)"
-DEFS_TOTAL="$(printf '%s' "$LANDED1" | grep -cE '^def total_amount\(' || true)"
-DEFS_DUP="$(printf '%s'   "$LANDED1" | grep -cE '^def totalAmount\('  || true)"
+DEFS_TOTAL="$(grep -cE '^def total_amount\(' <<<"$LANDED1" || true)"
+DEFS_DUP="$(grep -cE '^def totalAmount\(' <<<"$LANDED1"  || true)"
 [ "$DEFS_TOTAL" -eq 1 ] && ok "survivor total_amount present on landed main"        || bad "survivor count=$DEFS_TOTAL (want 1)"
 [ "$DEFS_DUP"   -eq 0 ] && ok "duplicate totalAmount collapsed (0 on landed main)"  || bad "duplicate still present ($DEFS_DUP)"
-printf '%s' "$LANDED1" | grep -qE 'return total_amount\(items\)' \
+grep -qE 'return total_amount\(items\)' <<<"$LANDED1" \
   && ok "caller rewired to the survivor (report -> total_amount)" \
   || bad "caller not rewired to survivor"
 
@@ -175,10 +175,10 @@ NCONS2="$(printf '%s' "$V2" | jq -r '.consolidations | length')"
 
 # Shared main must be UNCHANGED by the failed B land (still at A's landed sha).
 MAIN_AFTER="$(git -C "$WORK/incompat.git" show main:src/user.py 2>/dev/null)"
-printf '%s' "$MAIN_AFTER" | grep -qE '^def fetch_user\(' \
+grep -qE '^def fetch_user\(' <<<"$MAIN_AFTER" \
   && ok "shared main still at A's state (fetch_user) — B did not land" \
   || bad "shared main mutated by a failing land"
-printf '%s' "$MAIN_AFTER" | grep -qE '^def greet\(' \
+grep -qE '^def greet\(' <<<"$MAIN_AFTER" \
   && bad "branch B's greet() leaked onto shared main despite gate failure" \
   || ok "branch B's greet() did NOT reach shared main"
 

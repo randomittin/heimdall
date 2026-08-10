@@ -259,17 +259,17 @@ CONN_SENTINEL="$WORK/conn_body.jsonl"; export CONN_SENTINEL; : > "$CONN_SENTINEL
 : > "$GH_SENTINEL"
 OPEN_OUT="$(open_pr_driver "$PASS_RECORD")"
 BODY="$(printf '%s' "$OPEN_OUT" | jq -r '.body')"
-if printf '%s' "$BODY" | grep -qF "$EVIDENCE_CMD"; then
+if grep -qF "$EVIDENCE_CMD" <<<"$BODY"; then
   ok "PR body renders the runnable evidence command ($EVIDENCE_CMD)"
 else
   bad "PR body does NOT carry the runnable evidence command — human can't see the proof"
 fi
-if printf '%s' "$BODY" | grep -qiE 'all_passed.*true|Runnable evidence'; then
+if grep -qiE 'all_passed.*true|Runnable evidence' <<<"$BODY"; then
   ok "PR body carries the evidence verdict (all_passed) — the proof, not a claim"
 else
   bad "PR body missing the evidence verdict"
 fi
-if printf '%s' "$BODY" | grep -qF '"schema": "si-2.1"'; then
+if grep -qF '"schema": "si-2.1"' <<<"$BODY"; then
   ok "PR body embeds the SI-2 record verbatim (machine-readable)"
 else
   bad "PR body does not embed the SI-2 record"
@@ -279,22 +279,22 @@ fi
 # The bot PR is the ONE surface a drive-by reviewer sees; the footer must turn it into
 # a funnel entrance — a branded line, a self-serve landing link, and the honest human
 # gate — and it must NEVER leak a token (it is STATIC branded text).
-if printf '%s' "$BODY" | grep -qF 'https://runheimdall.dev'; then
+if grep -qF 'https://runheimdall.dev' <<<"$BODY"; then
   ok "PR body footer carries the self-serve onboarding link (runheimdall.dev)"
 else
   bad "PR body footer missing the runheimdall.dev onboarding link — the viral CTA"
 fi
-if printf '%s' "$BODY" | grep -qiF 'want this bot on your repos'; then
+if grep -qiF 'want this bot on your repos' <<<"$BODY"; then
   ok "PR body footer carries the 'want this bot on your repos?' self-serve CTA"
 else
   bad "PR body footer missing the self-serve CTA line"
 fi
-if printf '%s' "$BODY" | grep -qiE 'never merges|a human reviews and merges'; then
+if grep -qiE 'never merges|a human reviews and merges' <<<"$BODY"; then
   ok "PR body footer states the honest constraint (opens the PR, never merges)"
 else
   bad "PR body footer missing the never-merges constraint line"
 fi
-if printf '%s' "$BODY" | grep -qiE 'ghp_|github_pat_|sk-ant-|enroll[_-]?token|oauth[_-]?token|X-Heimdall-Enroll'; then
+if grep -qiE 'ghp_|github_pat_|sk-ant-|enroll[_-]?token|oauth[_-]?token|X-Heimdall-Enroll' <<<"$BODY"; then
   bad "PR body leaked a token-shaped secret (the footer must be static branded text)"
 else
   ok "PR body carries NO token-shaped secret (footer is static branded text only)"
@@ -526,7 +526,7 @@ if [ "$CN" = "heimdall-maintainer[bot]" ] && [ "$AN" = "heimdall-maintainer[bot]
 else
   bad "the fix commit is NOT the bot identity (committer=$CN author=$AN)"
 fi
-if printf '%s' "$CE" | grep -qF 'noreply'; then
+if grep -qF 'noreply' <<<"$CE"; then
   ok "the bot commit email is a noreply address (a [bot] handle, never a real person)"
 else
   bad "the bot commit email is not a noreply address ($CE)"
@@ -681,7 +681,7 @@ fi
 SCOPE_TREE="$(git -C "$SCOPE_BARE" ls-tree -r --name-only "$SCOPE_BRANCH" 2>/dev/null || true)"
 JUNK_HIT=0
 for junk in "__pycache__" ".pytest_cache" ".claude/" ".egg-info" ".heimdall"; do
-  if printf '%s\n' "$SCOPE_TREE" | grep -qF "$junk"; then
+  if grep -qF "$junk" <<<"$SCOPE_TREE"; then
     bad "JUNK LEAKED into the pushed branch: a path matching '$junk' was committed"
     JUNK_HIT=1
   fi
@@ -697,7 +697,7 @@ else
   bad "the fix commit changed $SCOPE_DIFF_N files (expected exactly 1 — the source fix)"
 fi
 # (7d) the scoped exclude is LOCAL to the clone (never a committed .gitignore in the tree).
-if printf '%s\n' "$SCOPE_TREE" | grep -qxF ".gitignore"; then
+if grep -qxF ".gitignore" <<<"$SCOPE_TREE"; then
   bad "a .gitignore was committed — the exclude must be LOCAL (.git/info/exclude), not the tree"
 else
   ok "the scope exclude is local to the clone (.git/info/exclude) — the repo tree is untouched"
@@ -862,17 +862,17 @@ else
   bad "result.pr.pushed did not record the successful push ($LOUD_OUT)"
 fi
 PR_ERR="$(printf '%s' "$LOUD_OUT" | jq -r '.pr.error')"
-if printf '%s' "$PR_ERR" | grep -qiE 'could not be decoded|401'; then
+if grep -qiE 'could not be decoded|401' <<<"$PR_ERR"; then
   ok "the captured pr.error NAMES the cause (the 401 / JWT-decode failure)"
 else
   bad "pr.error did not name the failure cause (got: $PR_ERR)"
 fi
-if printf '%s' "$PR_ERR" | grep -qF "$JWT_LEAK"; then
+if grep -qF "$JWT_LEAK" <<<"$PR_ERR"; then
   bad "pr.error LEAKED the App JWT (eyJ…) — the #26 credential surfaced in a persisted result"
 else
   ok "pr.error SCRUBBED the App JWT (eyJ… redacted — the #26 credential never surfaces)"
 fi
-if printf '%s' "$PR_ERR" | grep -qF "$TOK_LEAK"; then
+if grep -qF "$TOK_LEAK" <<<"$PR_ERR"; then
   bad "pr.error LEAKED the ghs_ bot token"
 else
   ok "pr.error SCRUBBED the ghs_ bot token (no credential in the persisted, human-read pr result)"

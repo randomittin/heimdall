@@ -147,11 +147,11 @@ set -e
 # the count line and that every spec repo_url appears in the printed plan.
 ALL_URLS_PRESENT=1
 while IFS= read -r short; do
-  printf '%s' "$GLUE_OUT" | grep -q "$short" || ALL_URLS_PRESENT=0
+  grep -q "$short" <<<"$GLUE_OUT" || ALL_URLS_PRESENT=0
 done < <(jq -r '.repos[] | (.url|split("/")|last)' "$SPEC")
 if [ "$GLUE_RC" -eq 0 ] \
-   && printf '%s' "$GLUE_OUT" | grep -qiE 'dry.?run' \
-   && printf '%s' "$GLUE_OUT" | grep -qE 'entries[[:space:]]*:[[:space:]]*10' \
+   && grep -qiE 'dry.?run' <<<"$GLUE_OUT" \
+   && grep -qE 'entries[[:space:]]*:[[:space:]]*10' <<<"$GLUE_OUT" \
    && [ "$ALL_URLS_PRESENT" = "1" ]; then
   ok "(f) glue: converter | sweep --manifest - --dry-run accepts + prints the 10-entry plan (no clone/hmd/spend)"
 else

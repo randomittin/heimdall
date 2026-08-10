@@ -123,13 +123,13 @@ run_probe() { # <project> [extra args...]
   local d="$1"; shift
   PROBE_OUT="$(HEIMDALL_HOME="$d/.heimdall" "$PROBE" run --repo "$d" "$@" 2>&1)"; PROBE_RC=$?
 }
-has()   { printf '%s' "$1" | grep -qF "$2"; }
-hasre() { printf '%s' "$1" | grep -qE "$2"; }
+has()   { grep -qF "$2" <<<"$1"; }
+hasre() { grep -qE "$2" <<<"$1"; }
 # Case-insensitive variant. The probe SHOUTS the words it wants an operator to read
 # ("a bug in the MEMORY STACK"), so an assertion about that wording must not be
 # case-coupled to it — otherwise the check fails while the behaviour it asserts is
 # correct, which is a broken test masquerading as a broken feature.
-hasrei() { printf '%s' "$1" | grep -qiE "$2"; }
+hasrei() { grep -qiE "$2" <<<"$1"; }
 
 # Delete one "- **Label:** ..." line from a checkpoint — the printf-bug class, after
 # the fact: the field is simply not in the bytes a resume reads.

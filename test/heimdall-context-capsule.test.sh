@@ -174,8 +174,8 @@ DRYOUT="$(env HEIMDALL_SECRET_SCAN_BIN="$SCAN_CLEAN" HEIMDALL_GCLOUD_BIN="$GCLOU
     HEIMDALL_STATE_BIN="$STATE_BIN" HEIMDALL_STATE_FILE="$R4/heimdall-state.json" \
     "$CAP" ship --vm rr-vm --zone us-central1-a --project my-proj \
     --repo acme/widget --repo-dir "$R4" --dry-run 2>&1)"
-if printf '%s' "$DRYOUT" | grep -q 'rr-context/acme_widget/context.md' \
-   && printf '%s' "$DRYOUT" | grep -qi 'tunnel-through-iap'; then
+if grep -q 'rr-context/acme_widget/context.md' <<<"$DRYOUT" \
+   && grep -qi 'tunnel-through-iap' <<<"$DRYOUT"; then
   ok "dry-run prints the IAP ssh plan + the target path"
 else
   bad "dry-run plan missing the target path or IAP transport"
@@ -185,7 +185,7 @@ if [ ! -f "$STDIN4" ] && [ ! -f "$ARGV4" ]; then
 else
   bad "dry-run still invoked gcloud (argv=$([ -f "$ARGV4" ] && echo yes || echo no))"
 fi
-if ! printf '%s' "$DRYOUT" | grep -q "$SECRET"; then
+if ! grep -q "$SECRET" <<<"$DRYOUT"; then
   ok "the printed plan carries NO secret (redaction + no content in the plan)"
 else
   bad "the dry-run plan leaked the secret"
@@ -229,7 +229,7 @@ STATE
 PLANOUT="$(env HEIMDALL_STATE_FILE="$R6/heimdall-state.json" \
     "$MLOOP" plan --repo "$R6" --context "$CTX" 2>/dev/null)"
 if printf '%s' "$PLANOUT" | jq -e '.context.prepended == true' >/dev/null 2>&1 \
-   && printf '%s' "$PLANOUT" | grep -q 'LOCAL SESSION CONTEXT'; then
+   && grep -q 'LOCAL SESSION CONTEXT' <<<"$PLANOUT"; then
   ok "plan --context surfaces the prepended LOCAL SESSION CONTEXT block"
 else
   bad "plan --context did not show the context block"
@@ -271,7 +271,7 @@ printf 'AUTODETECT_SENTINEL_z1 prior state\n' > "$FAKEHOME/rr-context/acme_widge
 PLANAUTO="$(env HEIMDALL_HOME="$FAKEHOME" HEIMDALL_STATE_FILE="$R8/heimdall-state.json" \
     "$MLOOP" plan --repo "$R8" 2>/dev/null)"
 if printf '%s' "$PLANAUTO" | jq -e '.context.prepended == true' >/dev/null 2>&1 \
-   && printf '%s' "$PLANAUTO" | grep -q 'AUTODETECT_SENTINEL_z1'; then
+   && grep -q 'AUTODETECT_SENTINEL_z1' <<<"$PLANAUTO"; then
   ok "the shipped capsule was auto-detected with NO --context flag"
 else
   bad "auto-detect did not pick up the shipped capsule"

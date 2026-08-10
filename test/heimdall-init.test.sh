@@ -209,11 +209,11 @@ gitrun "$R3" commit -m "no-chain" >/dev/null 2>&1
 # 7. `hmd verdict` prints the repo's last result
 # ══════════════════════════════════════════════════════════════════════════════
 OUT1="$( cd "$R1" && "$VERDICT_BIN" 2>/dev/null )"
-printf '%s' "$OUT1" | grep -q "PASS" && ok "7a hmd verdict prints PASS for the green repo" || bad "7a verdict PASS not shown" "$OUT1"
+grep -q "PASS" <<<"$OUT1" && ok "7a hmd verdict prints PASS for the green repo" || bad "7a verdict PASS not shown" "$OUT1"
 OUT2="$( cd "$R2" && "$VERDICT_BIN" 2>/dev/null )"
-printf '%s' "$OUT2" | grep -q "DENY" && ok "7b hmd verdict prints DENY for the blocked repo" || bad "7b verdict DENY not shown" "$OUT2"
+grep -q "DENY" <<<"$OUT2" && ok "7b hmd verdict prints DENY for the blocked repo" || bad "7b verdict DENY not shown" "$OUT2"
 OUTX="$( cd "$WORK" && git init -q nozone 2>/dev/null; cd "$WORK/nozone" && "$VERDICT_BIN" 2>/dev/null )"
-printf '%s' "$OUTX" | grep -qi "none yet" && ok "7c hmd verdict degrades cleanly when no gate has run" || bad "7c no-verdict message wrong" "$OUTX"
+grep -qi "none yet" <<<"$OUTX" && ok "7c hmd verdict degrades cleanly when no gate has run" || bad "7c no-verdict message wrong" "$OUTX"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 8. ROUTING: `hmd init` / `hmd verdict` route through bin/heimdall, args forwarded,

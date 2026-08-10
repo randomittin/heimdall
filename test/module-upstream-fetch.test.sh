@@ -204,9 +204,9 @@ grep -q 'tool install --python 3.13 lands-pkg\[all\]==1.0.0' "$UVLOG" \
   && ok "the fetch RAN, with the manifest's exact arguments" \
   || { bad "the fetch never ran (log: $(tr '\n' '|' < "$UVLOG"))"; }
 store_has lands-pkg && ok "the installer really recorded the tool" || bad "nothing landed in the store"
-printf '%s' "$OUT" | grep -q 'Installed "lands" at pin 1.0.0' \
+grep -q 'Installed "lands" at pin 1.0.0' <<<"$OUT" \
   && ok 'a PRESENT payload may print `Installed`' || bad "no Installed line for a present payload"
-printf '%s' "$OUT" | grep -q 'payload: PRESENT' \
+grep -q 'payload: PRESENT' <<<"$OUT" \
   && ok "step 5 reports the payload PRESENT" || bad "step 5 did not report presence"
 [ "$(jq -r '.payload.present' "$STATE/lands/receipt.json" 2>/dev/null)" = "true" ] \
   && ok "the receipt records payload.present = true" || bad "receipt does not record presence"
@@ -224,15 +224,15 @@ mkmodule breaks 'uv tool install --python 3.13 "breaks-pkg==1.0.0"'
 store_reset
 STATE_PRE="$(tree_sum "$STATE")"
 OUT="$(FAKE_UV_MODE=fail hmd add breaks --yes 2>&1)"; RC=$?
-printf '%s' "$OUT" | grep -q 'Installed "breaks"' \
+grep -q 'Installed "breaks"' <<<"$OUT" \
   && bad "printed Installed over a failed fetch" \
   || ok 'a failed fetch never prints `Installed`'
-printf '%s' "$OUT" | grep -q 'ABSENT: "breaks" was NOT installed' \
+grep -q 'ABSENT: "breaks" was NOT installed' <<<"$OUT" \
   && ok "it says ABSENT in as many words" || bad "no ABSENT report"
-printf '%s' "$OUT" | grep -q 'blocker:' && ok "the report names the blocker" || bad "no blocker named"
-printf '%s' "$OUT" | grep -q 'remedy:.*uv tool install' \
+grep -q 'blocker:' <<<"$OUT" && ok "the report names the blocker" || bad "no blocker named"
+grep -q 'remedy:.*uv tool install' <<<"$OUT" \
   && ok "the report names the remedy — the operator's exact command" || bad "no remedy named"
-printf '%s' "$OUT" | grep -qi 'hmd itself is unaffected' \
+grep -qi 'hmd itself is unaffected' <<<"$OUT" \
   && ok "it states hmd itself is unaffected" || bad "no statement that hmd is fine"
 [ "$RC" -ne 0 ] && ok "add reports the failure to its caller (exit $RC)" \
                 || bad "add exited 0 over a payload that never arrived"
@@ -250,12 +250,12 @@ OUT="$(FAKE_UV_MODE=lie hmd add liar --yes 2>&1)"; RC=$?
 grep -q 'tool install' "$UVLOG" && ok "the fetch ran and exited 0" || bad "the fetch did not run"
 store_has liar-pkg && bad "the fixture actually installed something — the arm is not testing the bug" \
                    || ok "the world is genuinely empty after that exit 0"
-printf '%s' "$OUT" | grep -q 'Installed "liar"' \
+grep -q 'Installed "liar"' <<<"$OUT" \
   && bad "THE BUG IS BACK: printed Installed over an exit-0 fetch that landed nothing" \
   || ok 'an exit-0 fetch that landed nothing never prints `Installed`'
-printf '%s' "$OUT" | grep -q 'ABSENT: "liar" was NOT installed' \
+grep -q 'ABSENT: "liar" was NOT installed' <<<"$OUT" \
   && ok "it is reported ABSENT" || bad "not reported absent"
-printf '%s' "$OUT" | grep -q 'exited 0 but' \
+grep -q 'exited 0 but' <<<"$OUT" \
   && ok "the blocker says the exit code disagreed with the world" || bad "blocker does not name the disagreement"
 [ "$RC" -ne 0 ] && ok "add does not report success (exit $RC)" || bad "add exited 0"
 [ ! -e "$STATE/liar/receipt.json" ] && ok "no receipt claims an install that did not happen" || bad "receipt written"
@@ -277,8 +277,8 @@ grep -q 'probe_lists_package() {' "$MUTANT" && grep -A1 'probe_lists_package() {
 store_reset
 RED=0; GREEN=0
 MOUT="$(FAKE_UV_MODE=lie HMD_MODULE_STATE_IS_CANONICAL=1 "$MUTANT" --registry "$REG" --state "$STATE" add liar --yes 2>&1)"
-printf '%s' "$MOUT" | grep -q 'Installed "liar"' && RED=$((RED+1))
-printf '%s' "$MOUT" | grep -q 'ABSENT: "liar" was NOT installed' || RED=$((RED+1))
+grep -q 'Installed "liar"' <<<"$MOUT" && RED=$((RED+1))
+grep -q 'ABSENT: "liar" was NOT installed' <<<"$MOUT" || RED=$((RED+1))
 [ "$RED" -eq 2 ] \
   && ok "RED ARM: with the presence check disabled, hmd claims Installed over nothing (2/2 assertions flipped)" \
   || bad "the mutant did not reproduce the defect — RED count $RED/2, so U3 may be vacuous"
@@ -286,8 +286,8 @@ HMD_MODULE_STATE_IS_CANONICAL=1 "$MUTANT" --registry "$REG" --state "$STATE" rem
 
 store_reset
 OUT="$(FAKE_UV_MODE=lie hmd add liar --yes 2>&1)"
-printf '%s' "$OUT" | grep -q 'Installed "liar"' || GREEN=$((GREEN+1))
-printf '%s' "$OUT" | grep -q 'ABSENT: "liar" was NOT installed' && GREEN=$((GREEN+1))
+grep -q 'Installed "liar"' <<<"$OUT" || GREEN=$((GREEN+1))
+grep -q 'ABSENT: "liar" was NOT installed' <<<"$OUT" && GREEN=$((GREEN+1))
 [ "$GREEN" -eq 2 ] \
   && ok "GREEN ARM: the shipped binary reports ABSENT for the same fetch (2/2)" \
   || bad "the shipped binary did not report absent — GREEN count $GREEN/2"
@@ -303,9 +303,9 @@ OUT="$(FAKE_UV_MODE=fail hmd add already --yes 2>&1)"; RC=$?
 grep -q 'tool install' "$UVLOG" \
   && bad "re-fetched a payload that was already present" \
   || ok "no fetch was attempted — the world was asked first"
-printf '%s' "$OUT" | grep -q 'Installed "already" at pin 1.0.0' \
+grep -q 'Installed "already" at pin 1.0.0' <<<"$OUT" \
   && ok "an already-present payload is honestly Installed" || bad "no Installed line"
-printf '%s' "$OUT" | grep -q 'already present' \
+grep -q 'already present' <<<"$OUT" \
   && ok "the reason names that it was already present" || bad "reason does not say so"
 hmd remove already >/dev/null 2>&1
 
@@ -315,14 +315,14 @@ mkmodule opaque 'someinstaller add example@1.0.0'
 store_reset
 OUT="$(hmd add opaque --yes 2>&1)"; RC=$?
 [ "$RC" -eq 0 ] && ok "add exits 0 — registering at a pin is a real outcome" || bad "add exited $RC"
-printf '%s' "$OUT" | grep -q 'Installed "opaque"' \
+grep -q 'Installed "opaque"' <<<"$OUT" \
   && bad "claimed Installed for an unverifiable installer" \
   || ok 'no `Installed` claim for an installer hmd cannot question'
-printf '%s' "$OUT" | grep -q 'Registered "opaque" at pin 1.0.0' \
+grep -q 'Registered "opaque" at pin 1.0.0' <<<"$OUT" \
   && ok "it is reported REGISTERED, which is what actually happened" || bad "no Registered line"
-printf '%s' "$OUT" | grep -q 'PAYLOAD NOT PRESENT' \
+grep -q 'PAYLOAD NOT PRESENT' <<<"$OUT" \
   && ok "the output states the payload is not present" || bad "presence not stated"
-printf '%s' "$OUT" | grep -q 'someinstaller add example@1.0.0' \
+grep -q 'someinstaller add example@1.0.0' <<<"$OUT" \
   && ok "the operator's exact command is printed" || bad "the fetch command was not printed"
 [ "$(jq -r '.payload.present' "$STATE/opaque/receipt.json" 2>/dev/null)" = "false" ] \
   && ok "the receipt records payload.present = false" || bad "receipt does not record absence"
@@ -341,10 +341,10 @@ grep -q 'tool install' "$UVLOG" && bad "the dryrun seam still ran the fetch" || 
 grep -q 'tool list' "$UVLOG" \
   && ok "the world was still probed — the seam weakens the action, not the check" \
   || bad "the seam skipped the probe too"
-printf '%s' "$OUT" | grep -q 'Installed "dry"' \
+grep -q 'Installed "dry"' <<<"$OUT" \
   && bad "the seam manufactured an Installed claim" \
   || ok "a dryrun can never print Installed for an absent payload"
-printf '%s' "$OUT" | grep -q 'Registered "dry"' && ok "it reports Registered" || bad "no Registered line"
+grep -q 'Registered "dry"' <<<"$OUT" && ok "it reports Registered" || bad "no Registered line"
 [ "$RC" -eq 0 ] && ok "the dryrun add exits 0" || bad "dryrun add exited $RC"
 hmd remove dry >/dev/null 2>&1
 # The seam cannot even lie when the payload IS there: presence still comes from
@@ -354,7 +354,7 @@ printf '1.0.0' > "$STORE/dry-pkg"
 : > "$UVLOG"
 OUT="$(HMD_MODULE_FETCH_DRYRUN=1 hmd add dry --yes 2>&1)"
 grep -q 'tool install' "$UVLOG" && bad "dryrun fetched" || ok "still no fetch under the seam"
-printf '%s' "$OUT" | grep -q 'Installed "dry"' \
+grep -q 'Installed "dry"' <<<"$OUT" \
   && ok "with the payload really present, the seam reports the truth: Installed" \
   || bad "the seam suppressed a true presence"
 hmd remove dry >/dev/null 2>&1
@@ -401,7 +401,7 @@ for mode in land lie; do
   store_reset
   OUT="$(FAKE_UV_MODE=$mode hmd add agree --yes 2>&1)"
   SAID_INSTALLED=no
-  printf '%s' "$OUT" | grep -q 'Installed "agree"' && SAID_INSTALLED=yes
+  grep -q 'Installed "agree"' <<<"$OUT" && SAID_INSTALLED=yes
   RECEIPT_SAYS="$(jq -r '.payload.present // false' "$STATE/agree/receipt.json" 2>/dev/null || echo false)"
   WANT=no; [ "$RECEIPT_SAYS" = "true" ] && WANT=yes
   [ "$SAID_INSTALLED" = "$WANT" ] \

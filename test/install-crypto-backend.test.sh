@@ -172,14 +172,14 @@ else
 fi
 # …and, unable to, emitted the LOUD warning that would have saved hours: it must name
 # PRESENCE as broken AND print the manual pip fix command (never a silent pass).
-if printf '%s' "$OUT_A" | grep -qiE 'presence' \
-   && printf '%s' "$OUT_A" | grep -qiE 'pip install .*cryptography'; then
+if grep -qiE 'presence' <<<"$OUT_A" \
+   && grep -qiE 'pip install .*cryptography' <<<"$OUT_A"; then
   ok "backend-missing: LOUD warning names presence + prints the manual pip fix command"
 else
-  bad "backend-missing: NO loud warning about broken presence — the SILENT failure can still ship (out: $(printf '%s' "$OUT_A" | grep -iE 'presence|crypto|pki|ed25519' | tr '\n' ' ' | cut -c1-200))"
+  bad "backend-missing: NO loud warning about broken presence — the SILENT failure can still ship (out: $(grep -iE 'presence|crypto|pki|ed25519' <<<"$OUT_A" | tr '\n' ' ' | cut -c1-200))"
 fi
 # The install must still COMPLETE (non-fatal) — the success card renders.
-if printf '%s' "$OUT_A" | grep -qiE 'Heimdall v[0-9].* installed'; then
+if grep -qiE 'Heimdall v[0-9].* installed' <<<"$OUT_A"; then
   ok "backend-missing: crypto failure is NON-FATAL — the install still completes"
 else
   bad "backend-missing: crypto failure ABORTED the install (must be non-fatal)"
@@ -194,13 +194,13 @@ if [ ! -s "$MARK_B" ]; then
 else
   bad "backend-present: the step ran pip even though the backend already imports ($(cat "$MARK_B" | tr '\n' ' '))"
 fi
-if printf '%s' "$OUT_B" | grep -qiE 'PKI crypto backend|Ed25519'; then
+if grep -qiE 'PKI crypto backend|Ed25519' <<<"$OUT_B"; then
   ok "backend-present: the step reports the PKI backend status (the ✓ signal that would have flagged the outage)"
 else
   bad "backend-present: no PKI-backend status line in the install output"
 fi
 # A healthy backend must NOT print the broken-presence warning.
-if printf '%s' "$OUT_B" | grep -qiE 'presence will be silently broken|presence will not work|crypto backend MISSING'; then
+if grep -qiE 'presence will be silently broken|presence will not work|crypto backend MISSING' <<<"$OUT_B"; then
   bad "backend-present: install printed a broken-presence warning despite a working backend"
 else
   ok "backend-present: no false broken-presence warning"
@@ -216,12 +216,12 @@ else
   bad "backend-fixable: install made no pip attempt"
 fi
 # After a successful install the re-check passes → NO broken-presence warning.
-if printf '%s' "$OUT_C" | grep -qiE 'presence will be silently broken|crypto backend MISSING|presence will not work'; then
+if grep -qiE 'presence will be silently broken|crypto backend MISSING|presence will not work' <<<"$OUT_C"; then
   bad "backend-fixable: install still warned of broken presence after a SUCCESSFUL backend install (re-check missing?)"
 else
   ok "backend-fixable: after installing the backend the re-check passes — no broken-presence warning"
 fi
-if printf '%s' "$OUT_C" | grep -qiE 'Heimdall v[0-9].* installed'; then
+if grep -qiE 'Heimdall v[0-9].* installed' <<<"$OUT_C"; then
   ok "backend-fixable: install completes and reports success"
 else
   bad "backend-fixable: install did not complete"

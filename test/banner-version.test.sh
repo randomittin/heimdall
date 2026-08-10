@@ -74,16 +74,16 @@ rm -rf "$FAKE" "$EMPTY"
 
 # ── 4. WIRED — print_banner uses banner_version, not heimdall_version ──
 PB="$(sed -n '/^print_banner() {/,/^}/p' "$BIN")"
-printf '%s' "$PB" | grep -q 'banner_version' \
+grep -q 'banner_version' <<<"$PB" \
   && ok "print_banner() wires banner_version()" \
   || bad "print_banner() does not call banner_version()"
-printf '%s' "$PB" | grep -qE '_ver="\$\(heimdall_version\)"' \
+grep -qE '_ver="\$\(heimdall_version\)"' <<<"$PB" \
   && bad "print_banner() still calls the git-first heimdall_version() for its version line" \
   || ok "print_banner() no longer uses the git-first heimdall_version() for its version line"
 
 # ── 5. hmd version UNCHANGED (still git-tag first via heimdall_version) ──
 VER_ARM="$(sed -n '/version|--version|-v|-V)/,/;;/p' "$BIN")"
-printf '%s' "$VER_ARM" | grep -q 'heimdall_version' \
+grep -q 'heimdall_version' <<<"$VER_ARM" \
   && ok "hmd version still resolves via heimdall_version() (git-tag first)" \
   || bad "hmd version arm no longer uses heimdall_version() — conformance contract broken"
 

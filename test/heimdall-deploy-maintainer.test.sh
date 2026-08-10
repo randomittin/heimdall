@@ -10,10 +10,10 @@ bash -n "$S" || { echo "FATAL syntax"; exit 2; }
 # 1. dry-run, hybrid, valid repo → exit 0, no creds, prints plan
 OUT="$(bash "$S" --dry-run --hybrid --repo acme/widgets 2>&1)"; rc=$?
 [ "$rc" = 0 ] && ok "dry-run hybrid exit 0 (no creds)" || bad "dry-run rc=$rc"
-printf '%s' "$OUT" | grep -q 'gcloud run jobs replace' && ok "prints Arch-B job replace plan" || bad "no job-replace in plan"
-printf '%s' "$OUT" | grep -q 'runner-beat --repo acme/widgets' && ok "prints Arch-A runner-beat plan" || bad "no runner-beat"
-printf '%s' "$OUT" | grep -qi 'NEVER pushes main' && ok "constraint banner present" || bad "no constraint banner"
-printf '%s' "$OUT" | grep -q 'nothing executed' && ok "dry-run executes nothing" || bad "no dry-run marker"
+grep -q 'gcloud run jobs replace' <<<"$OUT" && ok "prints Arch-B job replace plan" || bad "no job-replace in plan"
+grep -q 'runner-beat --repo acme/widgets' <<<"$OUT" && ok "prints Arch-A runner-beat plan" || bad "no runner-beat"
+grep -qi 'NEVER pushes main' <<<"$OUT" && ok "constraint banner present" || bad "no constraint banner"
+grep -q 'nothing executed' <<<"$OUT" && ok "dry-run executes nothing" || bad "no dry-run marker"
 
 # 2. missing/bad --repo rejected
 bash "$S" --dry-run --hybrid 2>/dev/null; [ $? -ne 0 ] && ok "missing --repo rejected" || bad "missing repo accepted"
@@ -21,10 +21,10 @@ bash "$S" --dry-run --hybrid --repo not-a-slug 2>/dev/null; [ $? -ne 0 ] && ok "
 
 # 3. no token VALUE on stdout (dry-run prompts skipped; a fake token in env must not surface)
 OUT2="$(OAUTH_TOKEN=SECRET-XYZ BOT_TOKEN=SECRET-XYZ bash "$S" --dry-run --cloud --repo acme/widgets 2>&1)"
-printf '%s' "$OUT2" | grep -q 'SECRET-XYZ' && bad "token value leaked to stdout" || ok "no token value on stdout"
+grep -q 'SECRET-XYZ' <<<"$OUT2" && bad "token value leaked to stdout" || ok "no token value on stdout"
 
 # 4. --local mode omits gcloud from the plan's Arch-A section start
-OUT3="$(bash "$S" --dry-run --local --repo acme/widgets 2>&1)"; printf '%s' "$OUT3" | grep -q 'Arch A' && ok "local mode plans Arch A" || bad "local mode missing"
+OUT3="$(bash "$S" --dry-run --local --repo acme/widgets 2>&1)"; grep -q 'Arch A' <<<"$OUT3" && ok "local mode plans Arch A" || bad "local mode missing"
 
 # 5. the Job manifest PARSES + is MULTITENANT-SAFE: metadata.name is heimdall-maintainer-job,
 #    HEIMDALL_CP_PKI_KEY(cp-pki-key) IS mounted, but the PER-TEAM CLAUDE_CODE_OAUTH_TOKEN and
@@ -67,10 +67,10 @@ FAKEBIN="$(mktemp -d)"
 for t in claude gh gcloud; do printf '#!/usr/bin/env bash\nexit 0\n' > "$FAKEBIN/$t"; chmod +x "$FAKEBIN/$t"; done
 # docker is deliberately absent from FAKEBIN — it must NOT be required by cloud preflight.
 OUT5="$(PATH="$FAKEBIN:/usr/bin:/bin" bash "$S" --cloud --repo acme/widgets </dev/null 2>&1)"; rc5=$?
-printf '%s' "$OUT5" | grep -q "missing 'docker'" && bad "cloud preflight still requires docker" || ok "cloud preflight requires NO docker"
-printf '%s' "$OUT5" | grep -q 'Paste the CLAUDE_CODE_OAUTH_TOKEN' && bad "multi-tenant cloud STILL prompts for a token (setup-token leak hazard)" || ok "multi-tenant cloud prompts for NO token"
-printf '%s' "$OUT5" | grep -q 'mint a ~1-year subscription token' && bad "multi-tenant cloud STILL runs claude setup-token (prints a live token)" || ok "multi-tenant cloud does NOT run claude setup-token"
-printf '%s' "$OUT5" | grep -q 'legacy secret mint skipped' && ok "multi-tenant cloud prints the skip note (passed preflight, reached arch_b)" || bad "no multi-tenant skip note (did not reach arch_b past preflight)"
+grep -q "missing 'docker'" <<<"$OUT5" && bad "cloud preflight still requires docker" || ok "cloud preflight requires NO docker"
+grep -q 'Paste the CLAUDE_CODE_OAUTH_TOKEN' <<<"$OUT5" && bad "multi-tenant cloud STILL prompts for a token (setup-token leak hazard)" || ok "multi-tenant cloud prompts for NO token"
+grep -q 'mint a ~1-year subscription token' <<<"$OUT5" && bad "multi-tenant cloud STILL runs claude setup-token (prints a live token)" || ok "multi-tenant cloud does NOT run claude setup-token"
+grep -q 'legacy secret mint skipped' <<<"$OUT5" && ok "multi-tenant cloud prints the skip note (passed preflight, reached arch_b)" || bad "no multi-tenant skip note (did not reach arch_b past preflight)"
 rm -rf "$FAKEBIN"
 
 # 7. FALSIFIER — a manifest that DOES mount the legacy cred secretKeyRefs (single-tenant path)
@@ -93,7 +93,7 @@ YML
 FB7="$(mktemp -d)"
 for t in claude gh gcloud; do printf '#!/usr/bin/env bash\nexit 0\n' > "$FB7/$t"; chmod +x "$FB7/$t"; done
 OUT7="$(PATH="$FB7:/usr/bin:/bin" HEIMDALL_MAINTAINER_JOB_YAML="$LEGYAML" bash "$S" --cloud --repo acme/widgets </dev/null 2>&1)"
-printf '%s' "$OUT7" | grep -q 'Paste the CLAUDE_CODE_OAUTH_TOKEN' && ok "legacy-mount manifest STILL prompts for tokens (single-tenant path preserved)" || bad "legacy-mount manifest did NOT prompt (auto-detect over-skipped)"
+grep -q 'Paste the CLAUDE_CODE_OAUTH_TOKEN' <<<"$OUT7" && ok "legacy-mount manifest STILL prompts for tokens (single-tenant path preserved)" || bad "legacy-mount manifest did NOT prompt (auto-detect over-skipped)"
 rm -rf "$FB7"
 
 # 8. CLEAN ARGV — the mksecret + iam-role helpers must invoke gcloud with a CLEAN argv; the
@@ -166,7 +166,7 @@ OUT9="$(printf 'oauthval\nbotval\n' | env -u HEIMDALL_REAL_HOME HOME="$SBX_HOME"
   PATH="$SBX_STUB:/usr/bin:/bin" bash "$S" --local --repo acme/widgets 2>&1)"; rc9=$?
 [ "$rc9" = 4 ] && ok "synthetic HOME: refused with the DISTINCT exit 4 (refusal, not failure)" \
   || bad "synthetic HOME: rc=$rc9 (expected 4 — operator cannot tell refusal from breakage)"
-printf '%s' "$OUT9" | grep -q 'sandboxed' && ok "synthetic HOME: prints the state word 'sandboxed'" \
+grep -q 'sandboxed' <<<"$OUT9" && ok "synthetic HOME: prints the state word 'sandboxed'" \
   || bad "synthetic HOME: no 'sandboxed' state word in output"
 [ ! -s "$SBX_LOG" ] && ok "synthetic HOME: crontab invoked ZERO times — not even 'crontab -l'" \
   || bad "synthetic HOME: THE REAL CRONTAB WAS REACHED — $(tr '\n' ';' < "$SBX_LOG")"
@@ -175,7 +175,7 @@ printf '%s' "$OUT9" | grep -q 'sandboxed' && ok "synthetic HOME: prints the stat
 [ ! -f "$SBX_HOME/.heimdall/maintainer.env" ] \
   && ok "synthetic HOME: refusal was TOTAL AND EARLY (no env file, no smoke cycle)" \
   || bad "synthetic HOME: side effects ran before the refusal (env file exists)"
-printf '%s' "$OUT9" | grep -q 'passwd home' && ok "synthetic HOME: states WHY (passwd-home mismatch)" \
+grep -q 'passwd home' <<<"$OUT9" && ok "synthetic HOME: states WHY (passwd-home mismatch)" \
   || bad "synthetic HOME: refusal gives no diagnosable reason"
 [ ! -s "$CLAUDE_LOG" ] \
   && ok "synthetic HOME: 'claude setup-token' NEVER ran (no ~1y keychain credential minted)" \
@@ -241,7 +241,7 @@ OUT9D="$(env -u HEIMDALL_REAL_HOME HOME="$DRY_HOME" PATH="$SBX_STUB:/usr/bin:/bi
   bash "$S" --dry-run --hybrid --repo acme/widgets </dev/null 2>&1)"; rc9d=$?
 [ "$rc9d" = 0 ] && ok "--dry-run under a synthetic HOME still exits 0 (guard does not over-fire)" \
   || bad "--dry-run under a synthetic HOME rc=$rc9d (the guard over-fired)"
-printf '%s' "$OUT9D" | grep -q 'crontab: add (dedup on marker)' \
+grep -q 'crontab: add (dedup on marker)' <<<"$OUT9D" \
   && ok "--dry-run still prints the cron plan under a synthetic HOME" \
   || bad "--dry-run no longer prints the cron plan"
 [ ! -s "$SBX_LOG" ] && ok "--dry-run invoked crontab ZERO times" \

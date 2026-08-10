@@ -354,7 +354,7 @@ echo "driver: $OUT"
 [ -s "$EXT/driver.err" ] && { echo "  driver stderr:"; sed 's/^/    /' "$EXT/driver.err"; }
 echo
 
-if [ "$RC" -ne 0 ] || ! printf '%s' "$OUT" | grep -q "^RESULT "; then
+if [ "$RC" -ne 0 ] || ! grep -q "^RESULT " <<<"$OUT"; then
   bad "the driver did not complete (rc=$RC) — see stderr above"
   echo
   echo "cp-rr-enqueue-drain: $PASS passed, $FAIL failed"
@@ -366,12 +366,12 @@ field() { printf '%s' "$JSON" | "$PY" -c "import json,sys;print(json.load(sys.st
 
 # ── (0) both enqueues succeeded (200) via the PUBLIC handler ──
 [ "$(field enqueue_installed | grep -o '^\[200' )" = "[200" ] 2>/dev/null || true
-if printf '%s' "$JSON" | grep -q '"enqueue_installed": \[200'; then
+if grep -q '"enqueue_installed": \[200' <<<"$JSON"; then
   ok "0a PUBLIC enqueue_rr_task(installed) → 200 (server-derived team partition)"
 else
   bad "0a installed enqueue did not return 200: $(field enqueue_installed)"
 fi
-if printf '%s' "$JSON" | grep -q '"enqueue_queueonly": \[200'; then
+if grep -q '"enqueue_queueonly": \[200' <<<"$JSON"; then
   ok "0b PUBLIC enqueue_rr_task(queue-only) → 200 (server-derived team partition)"
 else
   bad "0b queue-only enqueue did not return 200: $(field enqueue_queueonly)"

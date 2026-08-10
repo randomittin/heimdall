@@ -80,17 +80,17 @@ MD="$(cd "$REPO_A" && "$BADGE" --markdown 2>/dev/null)"
 SVG="$(cd "$REPO_A" && "$BADGE" --svg 2>/dev/null)"
 CNT="$(cd "$REPO_A" && "$BADGE" --count 2>/dev/null)"
 
-if printf '%s' "$MD" | grep -qF "$BACKLINK"; then
+if grep -qF "$BACKLINK" <<<"$MD"; then
   ok "(A1) badge markdown carries the runheimdall.dev backlink"
 else
   bad "(A1) badge markdown missing backlink: $MD"
 fi
-if printf '%s' "$MD" | grep -qF "2 proven merges"; then
+if grep -qF "2 proven merges" <<<"$MD"; then
   ok "(A2) badge markdown carries the LOCAL number (2 proven merges)"
 else
   bad "(A2) badge markdown missing the local number: $MD"
 fi
-if printf '%s' "$SVG" | grep -qF "$BACKLINK"; then
+if grep -qF "$BACKLINK" <<<"$SVG"; then
   ok "(A3) badge SVG carries the runheimdall.dev backlink"
 else
   bad "(A3) badge SVG missing backlink"
@@ -102,7 +102,7 @@ else
 fi
 # FALSIFIER: strip the backlink from the markdown → the SAME check must go RED.
 MD_STRIPPED="$(printf '%s' "$MD" | sed "s#$BACKLINK##g")"
-if printf '%s' "$MD_STRIPPED" | grep -qF "$BACKLINK"; then
+if grep -qF "$BACKLINK" <<<"$MD_STRIPPED"; then
   bad "(A5) FALSIFIER broken: backlink check passed on a stripped badge"
 else
   ok "(A5) falsifier real: a badge WITHOUT the backlink fails the backlink check"
@@ -116,17 +116,17 @@ export HEIMDALL_CORPUS_HOME="$WORK/B-home"
 REPO_B="$WORK/B-repo"; make_repo "$REPO_B"
 
 CARD="$(cd "$REPO_B" && "$CLIP" --last 2>/dev/null)"
-if printf '%s' "$CARD" | grep -qF "🛡"; then
+if grep -qF "🛡" <<<"$CARD"; then
   ok "(B1) clip --last renders the sigil (🛡)"
 else
   bad "(B1) clip --last missing the sigil"
 fi
-if printf '%s' "$CARD" | grep -qF "runheimdall.dev"; then
+if grep -qF "runheimdall.dev" <<<"$CARD"; then
   ok "(B2) clip --last carries the runheimdall.dev tag"
 else
   bad "(B2) clip --last missing the runheimdall.dev tag"
 fi
-if printf '%s' "$CARD" | grep -qF "PASS"; then
+if grep -qF "PASS" <<<"$CARD"; then
   ok "(B3) clip --last reflects the fixture verdict (PASS)"
 else
   bad "(B3) clip --last did not reflect the fixture verdict: $CARD"
@@ -139,7 +139,7 @@ else
   bad "(B4) clip --json shape wrong: $CJ_OK"
 fi
 WALL="$(cd "$REPO_B" && "$CLIP" --wall 2>/dev/null)"
-if printf '%s' "$WALL" | grep -qF "🛡" && printf '%s' "$WALL" | grep -qF "2 merges proven"; then
+if grep -qF "🛡" <<<"$WALL" && grep -qF "2 merges proven" <<<"$WALL"; then
   ok "(B5) clip --wall renders the proven wall (sigil + count)"
 else
   bad "(B5) clip --wall wrong: $WALL"
@@ -163,7 +163,7 @@ if [ "$INIT_RC" = "0" ]; then
 else
   bad "(C1) hmd init exit $INIT_RC (audit must not block)"
 fi
-if printf '%s' "$INIT_OUT" | grep -qE "heimdall audited .*: [0-9]+ files, [0-9]+% gate-covered, [0-9]+ reuse candidates"; then
+if grep -qE "heimdall audited .*: [0-9]+ files, [0-9]+% gate-covered, [0-9]+ reuse candidates" <<<"$INIT_OUT"; then
   ok "(C2) init printed the postable audit number"
 else
   bad "(C2) init did not print the audit headline: $INIT_OUT"
@@ -210,7 +210,7 @@ fi
 export HEIMDALL_CORPUS_HOME="$WORK/D-off"
 OFF="$(HEIMDALL_TELEMETRY=off "$FUNNEL" emit init --home "$HEIMDALL_CORPUS_HOME" 2>/dev/null)"
 OFF_N="$(funnel_count "$HEIMDALL_CORPUS_HOME" init)"
-if printf '%s' "$OFF" | grep -q '"reason": *"disabled"' && [ "${OFF_N:-0}" = "0" ]; then
+if grep -q '"reason": *"disabled"' <<<"$OFF" && [ "${OFF_N:-0}" = "0" ]; then
   ok "(D3) consent OFF -> emit is a no-op, ZERO events written"
 else
   bad "(D3) off not honored: $OFF (init count=$OFF_N)"
@@ -220,7 +220,7 @@ export HEIMDALL_CORPUS_HOME="$WORK/D-off2"
 if [ -x "$TEL" ]; then
   "$TEL" off >/dev/null 2>&1
   OFF2="$("$FUNNEL" emit init --home "$HEIMDALL_CORPUS_HOME" 2>/dev/null)"
-  if printf '%s' "$OFF2" | grep -q '"reason": *"disabled"'; then
+  if grep -q '"reason": *"disabled"' <<<"$OFF2"; then
     ok "(D4) persisted 'telemetry off' consent is honored by the funnel (shared consent)"
   else
     bad "(D4) persisted off not honored by funnel: $OFF2"
@@ -233,14 +233,14 @@ export HEIMDALL_CORPUS_HOME="$WORK/D-zc"
 BEFORE_ZC="$(funnel_count "$HEIMDALL_CORPUS_HOME" init)"; BEFORE_ZC="${BEFORE_ZC:-0}"
 ZC="$("$FUNNEL" emit init --context "/Users/rj/secret/app/config.py" --home "$HEIMDALL_CORPUS_HOME" 2>"$WORK/zc.err")"
 AFTER_ZC="$(funnel_count "$HEIMDALL_CORPUS_HOME" init)"; AFTER_ZC="${AFTER_ZC:-0}"
-if printf '%s' "$ZC" | grep -q 'zero-content-blocked' && [ "$BEFORE_ZC" = "$AFTER_ZC" ]; then
+if grep -q 'zero-content-blocked' <<<"$ZC" && [ "$BEFORE_ZC" = "$AFTER_ZC" ]; then
   ok "(D5) planted PATH in a funnel event -> BLOCKED, nothing written (zero-content)"
 else
   bad "(D5) planted path not blocked: $ZC (before=$BEFORE_ZC after=$AFTER_ZC)"
 fi
 # ZERO-CONTENT: a planted source line (code punctuation) => BLOCKED.
 ZC2="$("$FUNNEL" emit join --context "const x = (a,b) => a+b;" --home "$HEIMDALL_CORPUS_HOME" 2>/dev/null)"
-if printf '%s' "$ZC2" | grep -q 'zero-content-blocked'; then
+if grep -q 'zero-content-blocked' <<<"$ZC2"; then
   ok "(D6) planted SOURCE LINE in a funnel event -> BLOCKED (zero-content)"
 else
   bad "(D6) planted source line not blocked: $ZC2"

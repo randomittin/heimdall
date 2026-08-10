@@ -126,7 +126,7 @@ REC_RC=$?
   || bad "seed record failed (rc=$REC_RC)"
 
 regen "$SCREEN" --app-dir "$APP" --canonical "$CANON" --old "$APP/src/screens/$SCREEN.tsx"
-if [ "$REG_RC" -eq 0 ] && printf '%s' "$REG_OUT" | grep -qi 'no-op'; then
+if [ "$REG_RC" -eq 0 ] && grep -qi 'no-op' <<<"$REG_OUT"; then
   ok "UNCHANGED screen → regen NO-OPs (rc=0, hash matches ledger)"
 else
   bad "unchanged screen should no-op (rc=$REG_RC, out='$REG_OUT')"
@@ -146,7 +146,7 @@ fi
 # 1b. CHANGED/NEW: a never-recorded screen → regen proceeds (quarantines + generates).
 APP="$(fresh_app gate_changed "$OLD")"
 regen "$SCREEN" --app-dir "$APP" --canonical "$CANON" --old "$APP/src/screens/$SCREEN.tsx"
-if printf '%s' "$REG_OUT" | grep -qi 'CHANGED (or new)'; then
+if grep -qi 'CHANGED (or new)' <<<"$REG_OUT"; then
   ok "NEW/CHANGED screen → regen PROCEEDS (design changed → regenerating)"
 else
   bad "new screen should proceed to regenerate (out='$REG_OUT')"
@@ -212,13 +212,13 @@ if [ "$REG_RC" -ne 0 ]; then
 else
   bad "dual-gate should block on a behavioral gap (rc=$REG_RC)"
 fi
-if printf '%s' "$REG_OUT" | grep -qi 'dual-gate BLOCKED (behavioral'; then
+if grep -qi 'dual-gate BLOCKED (behavioral' <<<"$REG_OUT"; then
   ok "block reason is BEHAVIORAL (visual was forced PASS — gap is the sole blocker)"
 else
   bad "block reason not behavioral (out='$REG_OUT')"
 fi
 # The REAL behavioral-diff must have reported the unwired handler by name.
-if printf '%s' "$REG_OUT" | grep -qi 'UNMATCHED handler:confirmPurchase'; then
+if grep -qi 'UNMATCHED handler:confirmPurchase' <<<"$REG_OUT"; then
   ok "behavioral gate reports the unmatched unit by name (handler:confirmPurchase)"
 else
   bad "behavioral gate did not name the unmatched unit (out='$REG_OUT')"
@@ -255,13 +255,13 @@ regen "$SCREEN" --app-dir "$APP" --canonical "$CANON" \
   --migrated "$NEW_FULL" \
   --ledger "$LEDGER" \
   --visual-result pass
-if [ "$REG_RC" -eq 0 ] && printf '%s' "$REG_OUT" | grep -qi 'dual-gate PASSED'; then
+if [ "$REG_RC" -eq 0 ] && grep -qi 'dual-gate PASSED' <<<"$REG_OUT"; then
   ok "dual-gate PASSES on full migration + visual pass (rc=0)"
 else
   bad "dual-gate should pass on both-green (rc=$REG_RC, out='$REG_OUT')"
 fi
 # REAL behavioral-diff must have reported K=0 / 100% coverage in the surfaced line.
-if printf '%s' "$REG_OUT" | grep -qiE 'coverage: .*100\.0%.*K=0 unmatched'; then
+if grep -qiE 'coverage: .*100\.0%.*K=0 unmatched' <<<"$REG_OUT"; then
   ok "behavioral gate (REAL) reports K=0 + full coverage on the clean migration"
 else
   bad "behavioral gate did not report a clean K=0 (out='$REG_OUT')"
@@ -290,7 +290,7 @@ fi
 # advanced). This closes the loop: release advances change-detection.
 regen "$SCREEN" --app-dir "$APP" --canonical "$CANON" --ledger "$LEDGER" \
   --old "$APP/src/screens/$SCREEN.tsx"
-if [ "$REG_RC" -eq 0 ] && printf '%s' "$REG_OUT" | grep -qi 'no-op'; then
+if [ "$REG_RC" -eq 0 ] && grep -qi 'no-op' <<<"$REG_OUT"; then
   ok "after release the recorded canonical is UNCHANGED → re-regen no-ops (gate advanced)"
 else
   bad "post-release re-regen should no-op (rc=$REG_RC, out='$REG_OUT')"
@@ -312,7 +312,7 @@ regen "$SCREEN" --app-dir "$APP" --canonical "$CANON" \
   --old "$APP/src/screens/$SCREEN.tsx" \
   --migrated "$NEW_FULL" \
   --visual-result fail
-if [ "$REG_RC" -ne 0 ] && printf '%s' "$REG_OUT" | grep -qi 'dual-gate BLOCKED (visual'; then
+if [ "$REG_RC" -ne 0 ] && grep -qi 'dual-gate BLOCKED (visual' <<<"$REG_OUT"; then
   ok "visual FAIL blocks even with a clean behavioral pass (rc=$REG_RC)"
 else
   bad "visual fail should block despite clean behavioral (rc=$REG_RC, out='$REG_OUT')"
@@ -335,17 +335,17 @@ regen "$SCREEN" --app-dir "$APP" --canonical "$CANON" \
   --migrated "$NEW_FULL" \
   --visual-result pass
 # The surfaced coverage line carries ALL THREE honesty fields.
-if printf '%s' "$REG_OUT" | grep -qE 'coverage: .*%.*backend=structural.*parse_confidence='; then
+if grep -qE 'coverage: .*%.*backend=structural.*parse_confidence=' <<<"$REG_OUT"; then
   ok "dual-gate surfaces coverage_pct + backend + parse_confidence (honest record)"
 else
   bad "coverage honesty fields not surfaced (out='$REG_OUT')"
 fi
-if printf '%s' "$REG_OUT" | grep -qi 'LOW-CONFIDENCE'; then
+if grep -qi 'LOW-CONFIDENCE' <<<"$REG_OUT"; then
   ok "low-confidence parse is FLAGGED in the surfaced coverage (not hidden as a pass)"
 else
   bad "low-confidence parse not flagged (out='$REG_OUT')"
 fi
-if [ "$REG_RC" -ne 0 ] && ! printf '%s' "$REG_OUT" | grep -qi 'dual-gate PASSED'; then
+if [ "$REG_RC" -ne 0 ] && ! grep -qi 'dual-gate PASSED' <<<"$REG_OUT"; then
   ok "low-confidence parse does NOT yield a false green (gate blocked, rc=$REG_RC)"
 else
   bad "low-confidence parse greened (rc=$REG_RC, out='$REG_OUT')"
@@ -387,7 +387,7 @@ echo "7. LANGUAGE SEAM — registry lists rn + register point; typo fails loudly
 set +e
 LIST_OUT="$("$TARGET" list 2>&1)"; LIST_RC=$?
 set +e
-if [ "$LIST_RC" -eq 0 ] && printf '%s' "$LIST_OUT" | grep -qE '^rn[[:space:]]+React Native[[:space:]]+tsx$'; then
+if [ "$LIST_RC" -eq 0 ] && grep -qE '^rn[[:space:]]+React Native[[:space:]]+tsx$' <<<"$LIST_OUT"; then
   ok "targets registry lists rn → React Native → tsx (launch target registered via the seam)"
 else
   bad "registry did not list the rn target (rc=$LIST_RC, out='$LIST_OUT')"
@@ -403,7 +403,7 @@ set +e
 set +e
 BAD_OUT="$("$TARGET" ext flutter 2>&1)"; BAD_RC=$?
 set +e
-if [ "$BAD_RC" -ne 0 ] && printf '%s' "$BAD_OUT" | grep -qi 'no designmatch target'; then
+if [ "$BAD_RC" -ne 0 ] && grep -qi 'no designmatch target' <<<"$BAD_OUT"; then
   ok "unknown target 'flutter' fails loudly listing available keys (add via interface, not pipeline edit)"
 else
   bad "unknown target did not fail loudly (rc=$BAD_RC, out='$BAD_OUT')"

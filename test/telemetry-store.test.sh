@@ -70,7 +70,7 @@ TOKENS_JSON='{"input_tokens":10,"output_tokens":20,"cache_creation_tokens":0,"ca
 out_a="$("$TELE" emit --type token --run-id run-aaa --phase waves --outcome passed \
   --gate test --duration-ms 1234 --commit abc1234 --loc config.py:5 \
   --tokens "$TOKENS_JSON" --extra '{"issue_id":"gh#1"}' --home "$HOME_A")"
-if printf '%s' "$out_a" | grep -Fq '"emitted": true'; then
+if grep -Fq '"emitted": true' <<<"$out_a"; then
   ok "emit reported a write"
 else
   bad "emit did NOT report a write: $out_a"
@@ -123,7 +123,7 @@ HOME_B="$WORK/home-b"
 _GP_PRE="ghp_"; _GP_A="0123456789abcdefghij"; _GP_B="ABCDEFGHIJ012345"
 PLANT_TOK="${_GP_PRE}${_GP_A}${_GP_B}"   # ghp_+36 at runtime; no source literal
 export PLANT_TOK
-if printf '%s' "$PLANT_TOK" | grep -Eq 'ghp_[A-Za-z0-9]{36}'; then
+if grep -Eq 'ghp_[A-Za-z0-9]{36}' <<<"$PLANT_TOK"; then
   ok "planted token is a real gitleaks-shaped PAT (runtime-assembled, falsifiable)"
 else
   bad "planted token is NOT gitleaks-shaped — the proof would be vacuous"
@@ -199,7 +199,7 @@ print("RUN_CONTINUED wrote=%s" % wrote)
 PYEOF
 degrade_rc=0
 DEGRADE_OUT="$(HOMEC="$HOME_C" "$PY" "$WORK/check_degrade.py" 2>&1)" || degrade_rc=$?
-if [ "$degrade_rc" -eq 0 ] && printf '%s' "$DEGRADE_OUT" | grep -q "RUN_CONTINUED wrote=False"; then
+if [ "$degrade_rc" -eq 0 ] && grep -q "RUN_CONTINUED wrote=False" <<<"$DEGRADE_OUT"; then
   ok "write failure swallowed: emit returned False, caller continued, exit 0 (falsifiable)"
 else
   bad "write failure was NOT handled gracefully (rc=$degrade_rc out=$DEGRADE_OUT)"
@@ -220,7 +220,7 @@ echo "D. DISABLED NO-OP (off ⇒ identical to a no-telemetry world):"
 HOME_D="$WORK/home-d"
 dis_out="$(HEIMDALL_TELEMETRY=off "$TELE" emit --type phase --run-id run-ddd \
   --phase planning --outcome started --home "$HOME_D")"
-if printf '%s' "$dis_out" | grep -Fq '"emitted": false'; then
+if grep -Fq '"emitted": false' <<<"$dis_out"; then
   ok "disabled emit reports no write"
 else
   bad "disabled emit did not report a no-op: $dis_out"

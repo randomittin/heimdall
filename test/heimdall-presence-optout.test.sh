@@ -107,8 +107,8 @@ fi
 # status prints the asymmetry ("you can SEE the team; the team cannot see you")
 run1 off >/dev/null 2>&1
 STAT="$(run1 status 2>/dev/null)"
-if printf '%s' "$STAT" | grep -q "effective: OFF" \
-   && printf '%s' "$STAT" | grep -qi "you can still SEE the team; the team cannot see you"; then
+if grep -q "effective: OFF" <<<"$STAT" \
+   && grep -qi "you can still SEE the team; the team cannot see you" <<<"$STAT"; then
   ok "1f status shows effective OFF + the SEE/see-you asymmetry note"
 else
   bad "1f status missing effective-OFF or the asymmetry note -- got: $STAT"
@@ -353,7 +353,7 @@ fi
 # prints "invite your team · hmd invite" (the growth beat); an OPTED-OUT farewell SUPPRESSES it.
 FARE_ON="$TMP/fare_on"; mkdir -p "$FARE_ON/.heimdall"
 FOUT_ON="$(farewell "$FARE_ON")"
-if printf '%s' "$FOUT_ON" | grep -q "hmd invite"; then
+if grep -q "hmd invite" <<<"$FOUT_ON"; then
   ok "6c a solo, presence-ON farewell shows the invite tease (hmd invite) — the tease's real home"
 else
   bad "6c solo-ON farewell missing the invite tease -- $(printf '%s' "$FOUT_ON" | tail -n2)"
@@ -361,7 +361,7 @@ fi
 FARE_OFF="$TMP/fare_off"; mkdir -p "$FARE_OFF/.heimdall"
 printf '{"enabled": false}\n' > "$FARE_OFF/.heimdall/presence.json"
 FOUT_OFF="$(farewell "$FARE_OFF")"
-if ! printf '%s' "$FOUT_OFF" | grep -q "hmd invite"; then
+if ! grep -q "hmd invite" <<<"$FOUT_OFF"; then
   ok "6d FALSIFIER: an OPTED-OUT farewell SUPPRESSES the invite (an invite would be a lie when invisible)"
 else
   bad "6d opted-out farewell still showed the invite tease -- the dev is invisible, the invite lies"

@@ -122,13 +122,13 @@ echo "── Hole 1: one assembler, one failure semantics ──"
 # ── (a1) the spawn path REFUSES an unresolvable capsule ref ──────────────────
 spawn_json '{"capsules":["no_such_capsule"]}'
 run_spawn_brief
-if [ "$RC" -eq 1 ] && printf '%s' "$OUT" | grep -q "INCOMPLETE"; then
+if [ "$RC" -eq 1 ] && grep -q "INCOMPLETE" <<<"$OUT"; then
   ok "(a1) spawn brief REFUSES a missing capsule (exit 1, says INCOMPLETE)"
 else
   bad "(a1) spawn brief degraded instead of refusing (rc=$RC, want 1)"
   printf '%s\n' "$OUT" | sed 's/^/      /'
 fi
-if printf '%s' "$OUT" | grep -qi "skipped"; then
+if grep -qi "skipped" <<<"$OUT"; then
   bad "(a1) the brief still says 'skipped' — silent degradation survives"
 else
   ok "(a1) no 'skipped' degradation marker — the ref is refused, not glossed"
@@ -140,7 +140,7 @@ set +e
 ROUT="$(perl -e 'alarm 120; exec @ARGV' bash "$SPAWN" run "$SJ" --repo "$REPO" 2>&1)"
 RRC=$?
 set -e
-if [ "$RRC" -ne 0 ] && printf '%s' "$ROUT" | grep -q "INCOMPLETE"; then
+if [ "$RRC" -ne 0 ] && grep -q "INCOMPLETE" <<<"$ROUT"; then
   ok "(a2) spawn run aborts on an incomplete brief, naming it (rc=$RRC)"
 else
   bad "(a2) spawn run proceeded on an incomplete brief (rc=$RRC)"
@@ -152,7 +152,7 @@ fi
 # string was present: the brief degraded and the sentinel ran anyway. Its
 # absence is the dispatch never happening, which "no report file" alone cannot
 # distinguish from "ran and crashed early".
-if printf '%s' "$ROUT" | grep -q "not a git repo"; then
+if grep -q "not a git repo" <<<"$ROUT"; then
   bad "(a2) the sentinel WAS dispatched on a thin brief (it reached its own repo check)"
 else
   ok "(a2) the sentinel was never dispatched — refusal happens before any work"
@@ -173,8 +173,8 @@ if [ "$DIRECT_RC" -eq "$RC" ]; then
 else
   bad "(a3) DRIFT: heimdall-brief rc=$DIRECT_RC but the spawn path rc=$RC"
 fi
-if printf '%s' "$DIRECT_OUT" | grep -q "THIS BRIEF IS INCOMPLETE" \
-   && printf '%s' "$OUT" | grep -q "THIS BRIEF IS INCOMPLETE"; then
+if grep -q "THIS BRIEF IS INCOMPLETE" <<<"$DIRECT_OUT" \
+   && grep -q "THIS BRIEF IS INCOMPLETE" <<<"$OUT"; then
   ok "(a3) DRIFT GUARD: both refuse with the same canonical refusal line"
 else
   bad "(a3) DRIFT: the two entry points refuse in different words"
@@ -184,7 +184,7 @@ fi
 "$CAPSULE" write realcap --what "a real capsule in the canonical store" >/dev/null
 spawn_json '{"capsules":["realcap"]}'
 run_spawn_brief
-if [ "$RC" -eq 0 ] && printf '%s' "$OUT" | grep -q "a real capsule in the canonical store"; then
+if [ "$RC" -eq 0 ] && grep -q "a real capsule in the canonical store" <<<"$OUT"; then
   ok "(a4) the spawn path reads the canonical store (\$PLANNING_DIR/protocol/capsules)"
 else
   bad "(a4) canonical-store capsule did not hydrate on the spawn path (rc=$RC)"
@@ -197,7 +197,7 @@ printf -- '---\nid: legacycap\ndepends:\nts: x\n---\nWHAT: only in the old place
   > "$REPO/capsules/legacycap.md"
 spawn_json '{"capsules":["legacycap"]}'
 run_spawn_brief
-if [ "$RC" -eq 1 ] && ! printf '%s' "$OUT" | grep -q "only in the old place"; then
+if [ "$RC" -eq 1 ] && ! grep -q "only in the old place" <<<"$OUT"; then
   ok "(a4) the abandoned \$root/capsules/ path is dead — one store, not two"
 else
   bad "(a4) the legacy capsule path still resolves (rc=$RC) — two stores can drift"
@@ -238,7 +238,7 @@ else
   bad "(a5) unreachable store returned rc=$URC (want 3 — nobody looked, so nothing is absent)"
   printf '%s\n' "$UOUT" | sed 's/^/      /'
 fi
-if printf '%s' "$UOUT" | grep -q "NON_VERIFIED"; then
+if grep -q "NON_VERIFIED" <<<"$UOUT"; then
   ok "(a5) and it SAYS NON_VERIFIED, so the repair is not confused with a bad ref"
 else
   bad "(a5) the unreachable store did not name itself NON_VERIFIED"
@@ -268,13 +268,13 @@ echo "── Hole 2: the invariants ref is validated, not echoed ──"
 
 # ── (b1) a fully resolvable ref is reported as verified ─────────────────────
 run_brief build --task I1 --spec "inherit the rules" --invariants "INVARIANTS.md#$ANCHOR_OK"
-if [ "$RC" -eq 0 ] && printf '%s' "$OUT" | grep -q "INVARIANTS REF"; then
+if [ "$RC" -eq 0 ] && grep -q "INVARIANTS REF" <<<"$OUT"; then
   ok "(b1) a ref whose file and anchor both resolve is accepted (exit 0)"
 else
   bad "(b1) a valid invariants ref was rejected (rc=$RC)"
   printf '%s\n' "$OUT" | sed 's/^/      /'
 fi
-if printf '%s' "$OUT" | grep -qi "verified"; then
+if grep -qi "verified" <<<"$OUT"; then
   ok "(b1) and the brief SAYS it verified the ref, rather than echoing it"
 else
   bad "(b1) the ref was passed through with no evidence it was checked"
@@ -284,13 +284,13 @@ fi
 # ── (b2) FALSIFIABLE: the file is gone ───────────────────────────────────────
 run_brief build --task I2 --spec "inherit the rules" --invariants "GONE.md#$ANCHOR_OK"
 MSG_FILE="$OUT"
-if [ "$RC" -eq 1 ] && printf '%s' "$OUT" | grep -q "UNRESOLVED"; then
+if [ "$RC" -eq 1 ] && grep -q "UNRESOLVED" <<<"$OUT"; then
   ok "(b2) FALSIFIABLE: a ref to a missing FILE refuses, exit 1"
 else
   bad "(b2) a dangling file ref passed silently (rc=$RC, want 1)"
   printf '%s\n' "$OUT" | sed 's/^/      /'
 fi
-if printf '%s' "$OUT" | grep -qi "no such file"; then
+if grep -qi "no such file" <<<"$OUT"; then
   ok "(b2) the diagnosis names the FILE as the missing thing"
 else
   bad "(b2) the diagnosis does not name a missing file"
@@ -299,13 +299,13 @@ fi
 # ── (b3) FALSIFIABLE: the file is there, the anchor is not ───────────────────
 run_brief build --task I3 --spec "inherit the rules" --invariants "INVARIANTS.md#no-such-anchor"
 MSG_ANCHOR="$OUT"
-if [ "$RC" -eq 1 ] && printf '%s' "$OUT" | grep -qi "anchor"; then
+if [ "$RC" -eq 1 ] && grep -qi "anchor" <<<"$OUT"; then
   ok "(b3) FALSIFIABLE: a ref to a missing ANCHOR refuses, exit 1, names the anchor"
 else
   bad "(b3) a dangling anchor passed silently (rc=$RC, want 1)"
   printf '%s\n' "$OUT" | sed 's/^/      /'
 fi
-if printf '%s' "$OUT" | grep -qF "$ANCHOR_OK"; then
+if grep -qF "$ANCHOR_OK" <<<"$OUT"; then
   ok "(b3) and it offers the anchors that DO exist, so the repair is one step"
 else
   bad "(b3) no candidate anchors offered — the operator has to go hunting"
@@ -314,14 +314,14 @@ fi
 # ── (b4) a malformed ref is its own diagnosis ────────────────────────────────
 run_brief build --task I4 --spec "inherit the rules" --invariants "#anchor-with-no-file"
 MSG_MALFORMED="$OUT"
-if [ "$RC" -eq 1 ] && printf '%s' "$OUT" | grep -qi "malformed"; then
+if [ "$RC" -eq 1 ] && grep -qi "malformed" <<<"$OUT"; then
   ok "(b4) a malformed ref refuses, exit 1, and says MALFORMED"
 else
   bad "(b4) a malformed ref was not caught as malformed (rc=$RC)"
   printf '%s\n' "$OUT" | sed 's/^/      /'
 fi
 run_brief build --task I5 --spec "inherit the rules" --invariants "a.md#b#c"
-if [ "$RC" -eq 1 ] && printf '%s' "$OUT" | grep -qi "malformed"; then
+if [ "$RC" -eq 1 ] && grep -qi "malformed" <<<"$OUT"; then
   ok "(b4) a ref with two anchors is malformed too, not silently truncated"
 else
   bad "(b4) a two-anchor ref was not rejected (rc=$RC)"
@@ -330,9 +330,9 @@ fi
 # ── (b5) the three diagnoses are distinct — each is a different repair ───────
 # The per-ref diagnosis lines, not the shared INCOMPLETE banner (which is
 # identical by design). Each names WHICH repair the operator has to make.
-d_file="$(printf '%s' "$MSG_FILE"      | grep "!! invariants" | head -1)"
-d_anch="$(printf '%s' "$MSG_ANCHOR"    | grep "!! invariants" | head -1)"
-d_malf="$(printf '%s' "$MSG_MALFORMED" | grep "!! invariants" | head -1)"
+d_file="$(grep "!! invariants" <<<"$MSG_FILE" | head -1)"
+d_anch="$(grep "!! invariants" <<<"$MSG_ANCHOR" | head -1)"
+d_malf="$(grep "!! invariants" <<<"$MSG_MALFORMED" | head -1)"
 if [ -n "$d_file" ] && [ -n "$d_anch" ] && [ -n "$d_malf" ] \
    && [ "$d_file" != "$d_anch" ] && [ "$d_anch" != "$d_malf" ] && [ "$d_file" != "$d_malf" ]; then
   ok "(b5) missing-file, missing-anchor and malformed are three distinct diagnoses"
@@ -358,7 +358,7 @@ write_invariants
 # ── (b7) the spawn path validates context.invariants identically ─────────────
 spawn_json '{"invariants":"GONE.md"}'
 run_spawn_brief
-if [ "$RC" -eq 1 ] && printf '%s' "$OUT" | grep -q "INCOMPLETE"; then
+if [ "$RC" -eq 1 ] && grep -q "INCOMPLETE" <<<"$OUT"; then
   ok "(b7) the spawn path refuses a dangling context.invariants ref too"
 else
   bad "(b7) the spawn path still echoes a dangling invariants ref (rc=$RC)"

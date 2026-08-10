@@ -413,12 +413,12 @@ echo
 
 # ── (a) NO-RAISE ──
 echo "(a) NO-RAISE — the core request flow under firestore must NOT raise BackendUnavailable"
-if printf '%s' "$OUT" | grep -q "BackendUnavailable"; then
+if grep -q "BackendUnavailable" <<<"$OUT"; then
   STAGE="$(printf '%s' "$OUT" | sed -n 's/.*stage=\([a-z_]*\).*/\1/p')"
   bad "a1 a request handler RAISED BackendUnavailable under firestore (stage=$STAGE) — it still calls path() on a request path (regression)"
-elif printf '%s' "$OUT" | grep -q "^STATUS flow_ok "; then
+elif grep -q "^STATUS flow_ok " <<<"$OUT"; then
   ok "a1 the whole request flow completed under firestore with NO BackendUnavailable"
-elif printf '%s' "$OUT" | grep -q "handler_raised"; then
+elif grep -q "handler_raised" <<<"$OUT"; then
   STAGE="$(printf '%s' "$OUT" | sed -n 's/.*stage=\([a-z_]*\).*/\1/p')"
   bad "a1 a request handler raised under firestore (stage=$STAGE, out: $OUT)"
 else
@@ -428,27 +428,27 @@ echo
 
 # ── (b) RESOLVES ──
 echo "(b) RESOLVES — each handler actually did its work under firestore (read back)"
-if printf '%s' "$OUT" | grep -q "ingest_stored=2"; then
+if grep -q "ingest_stored=2" <<<"$OUT"; then
   ok "b1 INGEST stored both on-schema events under firestore"
 else
   bad "b1 INGEST did not store the events under firestore (out: $OUT)"
 fi
-if printf '%s' "$OUT" | grep -q "job_status=done"; then
+if grep -q "job_status=done" <<<"$OUT"; then
   ok "b2 JOB folded create->running->done (terminal) under firestore — the §4 flight-fix log fold"
 else
   bad "b2 JOB did not fold to the 'done' terminal state under firestore (out: $OUT)"
 fi
-if printf '%s' "$OUT" | grep -q "appr_status=approved"; then
+if grep -q "appr_status=approved" <<<"$OUT"; then
   ok "b3 APPROVAL resolved to 'approved' under firestore"
 else
   bad "b3 APPROVAL did not resolve to approved under firestore (out: $OUT)"
 fi
-if printf '%s' "$OUT" | grep -qE "notify_ok=True" && printf '%s' "$OUT" | grep -qE "inbox_n=[1-9]"; then
+if grep -qE "notify_ok=True" <<<"$OUT" && grep -qE "inbox_n=[1-9]" <<<"$OUT"; then
   ok "b4 NOTIFY delivered to the inbox and polled it back under firestore"
 else
   bad "b4 NOTIFY did not deliver+poll under firestore (out: $OUT)"
 fi
-if printf '%s' "$OUT" | grep -q "disp_ok=True"; then
+if grep -q "disp_ok=True" <<<"$OUT"; then
   ok "b5 DISPATCH fired a non-gated allowlisted action under firestore"
 else
   bad "b5 DISPATCH did not fire under firestore (out: $OUT)"

@@ -450,7 +450,7 @@ ASSET_PROV="$($JQ -r --arg f "$(basename "$ASSET")" \
 # The image itself must carry no teammate/verdict/count claim. Its pixels are
 # defined ONLY by the generator, so the generator is the thing to interrogate.
 GEN_BLOCK="$(sed -n '/the static fallback GIF/,/^fi$/p' "$SEEDER")"
-if printf '%s' "$GEN_BLOCK" | grep -Eqi 'merges|proven|arjun|kai|maya|nadia|priya|teammates online|watchmen'; then
+if grep -Eqi 'merges|proven|arjun|kai|maya|nadia|priya|teammates online|watchmen' <<<"$GEN_BLOCK"; then
   bad "H3 the fallback generator renders a teammate/verdict/count claim"
 else
   ok "H3 the fallback generator renders no teammate, verdict or count — nothing to fabricate"

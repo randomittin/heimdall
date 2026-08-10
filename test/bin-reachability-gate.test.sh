@@ -202,7 +202,7 @@ reach_build "$SANDBOX" "$SBW"
 SB_RC=$?
 SB_DEAD="$(reach_dead "$SBW")"
 
-sb_flagged() { printf '%s\n' "$SB_DEAD" | grep -qx "$1"; }
+sb_flagged() { grep -qx "$1" <<<"$SB_DEAD"; }
 
 if [ "$SB_RC" -eq 0 ]; then
   ok "falsifier: engine builds a closure over the synthetic tree"
@@ -268,7 +268,7 @@ printf 'orphan-tool\t2099-01-01\tfalsifier row — must not confer reachability\
 SBW2="$WORK/sandbox-exempt"
 reach_build "$SANDBOX" "$SBW2"
 SB2_DEAD="$(reach_dead "$SBW2")"
-if printf '%s\n' "$SB2_DEAD" | grep -qx "orphan-tool"; then
+if grep -qx "orphan-tool" <<<"$SB2_DEAD"; then
   ok "falsifier: the exemption registry is not a reference surface (naming a bin there does not make it reachable)"
 else
   bad "falsifier: the exemption file VOUCHED for bin/orphan-tool — writing an exemption would make a dead bin read as wired"
@@ -299,7 +299,7 @@ printf 'declared|86400|3|operator|some subject|declared-tool --apply\n' \
 SBW3="$WORK/sandbox-manifest"
 reach_build "$SANDBOX" "$SBW3"
 SB3_DEAD="$(reach_dead "$SBW3")"
-if printf '%s\n' "$SB3_DEAD" | grep -qx "declared-tool"; then
+if grep -qx "declared-tool" <<<"$SB3_DEAD"; then
   ok "falsifier: the liveness manifest is not a reference surface (declaring a subsystem does not make it reachable)"
 else
   bad "falsifier: the liveness manifest VOUCHED for bin/declared-tool — a live reader of the manifest revives every subsystem it declares, and correct exemptions then read STALE"
@@ -323,7 +323,7 @@ unset HMD_REACH_TODAY
 
 ROT_MISSING=""
 for k in MALFORMED ORPHAN STALE EXPIRED DUPLICATE; do
-  printf '%s\n' "$ROT_SB" | grep -q "^$k" || ROT_MISSING="$ROT_MISSING $k"
+  grep -q "^$k" <<<"$ROT_SB" || ROT_MISSING="$ROT_MISSING $k"
 done
 if [ -z "$ROT_MISSING" ]; then
   ok "falsifier: registry audit catches all five rot kinds (malformed, orphan, stale, expired, duplicate)"
@@ -342,7 +342,7 @@ FAKE="$SANDBOX/fake-heimdall"
 FAKE_ADV="$(sed -n 's/^[[:space:]]*echo "  heimdall \([a-z][a-z0-9-]*\)[[:space:]].*/\1/p' "$FAKE" | sort -u)"
 fake_has_arm() { grep -qE "^[[:space:]]*($1|[a-z0-9|-]+\|$1)(\|[a-z0-9|-]+)*\)[[:space:]]*$" "$FAKE"; }
 
-if printf '%s\n' "$FAKE_ADV" | grep -qx "ghostcmd" && printf '%s\n' "$FAKE_ADV" | grep -qx "realcmd"; then
+if grep -qx "ghostcmd" <<<"$FAKE_ADV" && grep -qx "realcmd" <<<"$FAKE_ADV"; then
   ok "falsifier: --help parser extracts advertised subcommands"
 else
   bad "falsifier: --help parser failed to extract from a known-good sample"

@@ -120,7 +120,7 @@ else
   )
 
   LOGGED=$(TMPDIR="$SANDBOX" CLAUDE_CODE_SESSION_ID="$SID" "$TRACKER" paths 2>/dev/null)
-  if printf '%s\n' "$LOGGED" | grep -qF "$TARGET"; then
+  if grep -qF "$TARGET" <<<"$LOGGED"; then
     ok "edit-logging hook records a realistic (escape-carrying) Write payload"
   else
     bad "edit-logging hook LOST a realistic Write payload (ledger: '${LOGGED:-<empty>}')"

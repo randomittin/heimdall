@@ -191,43 +191,43 @@ echo "--------------------------------------------------------------------"
 # ══ A. GREEN — everything healthy → all systems go, exit 0 ════════════════════
 HA="$TMP_ROOT/A"; seed_home "$HA" y enabled
 OUT="$(run_doctor "$HA" FAKE_CRYPTO_OK=1 --)"; RC=$?
-if [ "$RC" -eq 0 ] && printf '%s' "$OUT" | grep -qi 'all systems go'; then
+if [ "$RC" -eq 0 ] && grep -qi 'all systems go' <<<"$OUT"; then
   ok "GREEN: healthy install validates clean (exit 0, 'all systems go')"
 else
-  bad "GREEN: healthy install did not validate (rc=$RC): $(printf '%s' "$OUT" | grep -iE '✗|NOT READY' | tr '\n' ' ' | cut -c1-160)"
+  bad "GREEN: healthy install did not validate (rc=$RC): $(grep -iE '✗|NOT READY' <<<"$OUT" | tr '\n' ' ' | cut -c1-160)"
 fi
 
 # ══ B. RED crypto — Ed25519 missing → ✗ crypto + pip fix, exit 1 ══════════════
 HB="$TMP_ROOT/B"; seed_home "$HB" y enabled
 OUT="$(run_doctor "$HB" FAKE_CRYPTO_OK=0 --)"; RC=$?
 if [ "$RC" -ne 0 ] \
-   && printf '%s' "$OUT" | grep -qiE '✗ *crypto|crypto .*NOT importable' \
-   && printf '%s' "$OUT" | grep -qi 'pip install .*cryptography'; then
+   && grep -qiE '✗ *crypto|crypto .*NOT importable' <<<"$OUT" \
+   && grep -qi 'pip install .*cryptography' <<<"$OUT"; then
   ok "RED crypto: detected, exits nonzero, prints the actionable pip fix"
 else
-  bad "RED crypto: not detected/gated (rc=$RC): $(printf '%s' "$OUT" | grep -iE 'crypto' | tr '\n' ' ' | cut -c1-160)"
+  bad "RED crypto: not detected/gated (rc=$RC): $(grep -iE 'crypto' <<<"$OUT" | tr '\n' ' ' | cut -c1-160)"
 fi
 
 # ══ C. RED statusline — HUD unregistered → ✗ statusline + register fix, exit 1 ═
 HC="$TMP_ROOT/C"; seed_home "$HC" n enabled
 OUT="$(run_doctor "$HC" FAKE_CRYPTO_OK=1 --)"; RC=$?
 if [ "$RC" -ne 0 ] \
-   && printf '%s' "$OUT" | grep -qiE 'statusline' \
-   && printf '%s' "$OUT" | grep -qi 'heimdall-statusline-register'; then
+   && grep -qiE 'statusline' <<<"$OUT" \
+   && grep -qi 'heimdall-statusline-register' <<<"$OUT"; then
   ok "RED statusline: detected, exits nonzero, prints the register fix"
 else
-  bad "RED statusline: not detected/gated (rc=$RC): $(printf '%s' "$OUT" | grep -iE 'statusline' | tr '\n' ' ' | cut -c1-160)"
+  bad "RED statusline: not detected/gated (rc=$RC): $(grep -iE 'statusline' <<<"$OUT" | tr '\n' ' ' | cut -c1-160)"
 fi
 
 # ══ D. RED claude-mem — misconfigured (mkt known, plugin not enabled) → ✗ ═════
 HD="$TMP_ROOT/D"; seed_home "$HD" y misconfigured
 OUT="$(run_doctor "$HD" FAKE_CRYPTO_OK=1 --)"; RC=$?
 if [ "$RC" -ne 0 ] \
-   && printf '%s' "$OUT" | grep -qiE 'claude-mem .*MISCONFIGURED' \
-   && printf '%s' "$OUT" | grep -qi 'claude plugins install claude-mem@thedotmack'; then
+   && grep -qiE 'claude-mem .*MISCONFIGURED' <<<"$OUT" \
+   && grep -qi 'claude plugins install claude-mem@thedotmack' <<<"$OUT"; then
   ok "RED claude-mem: misconfig detected, exits nonzero, prints the register+install fix"
 else
-  bad "RED claude-mem: not detected/gated (rc=$RC): $(printf '%s' "$OUT" | grep -iE 'claude-mem' | tr '\n' ' ' | cut -c1-160)"
+  bad "RED claude-mem: not detected/gated (rc=$RC): $(grep -iE 'claude-mem' <<<"$OUT" | tr '\n' ' ' | cut -c1-160)"
 fi
 
 # ══ E. BOUNDED + HEADLESS — a hung first-cc is killed at the deadline ══════════
@@ -245,10 +245,10 @@ else
   bad "BOUNDED: harness hung ${ELAPSED}s (the bound did not fire)"
 fi
 # The kill is NON-fatal (runtime ⚠, not ✗) so a slow-but-healthy install still passes.
-if printf '%s' "$OUT" | grep -qiE 'first-run hit the .*bound|killed'; then
+if grep -qiE 'first-run hit the .*bound|killed' <<<"$OUT"; then
   ok "BOUNDED: timeout is reported as a non-fatal ⚠ (bounded, not a hard fail)"
 else
-  bad "BOUNDED: no bounded-timeout report: $(printf '%s' "$OUT" | grep -iE 'runtime' | tr '\n' ' ' | cut -c1-160)"
+  bad "BOUNDED: no bounded-timeout report: $(grep -iE 'runtime' <<<"$OUT" | tr '\n' ' ' | cut -c1-160)"
 fi
 # The first run was HEADLESS: invoked with -p and NO controlling TTY on stdin.
 if [ -f "$CC_MARK_E" ] && grep -q 'NOTTY -p' "$CC_MARK_E"; then
@@ -260,10 +260,10 @@ fi
 # ══ F. GATES-READY — a first-cc that exits nonzero → ✗ runtime → exit 1 ═══════
 HF="$TMP_ROOT/F"; seed_home "$HF" y enabled
 OUT="$(run_doctor "$HF" FAKE_CRYPTO_OK=1 FAKE_CC_MODE=fail HMD_DOCTOR_CC_TIMEOUT=10 -- --cc-verify)"; RC=$?
-if [ "$RC" -ne 0 ] && printf '%s' "$OUT" | grep -qiE 'runtime.*exited|could not start cleanly'; then
+if [ "$RC" -ne 0 ] && grep -qiE 'runtime.*exited|could not start cleanly' <<<"$OUT"; then
   ok "GATES-READY: a failing headless first-cc → ✗ runtime → exit 1 (result gates ready)"
 else
-  bad "GATES-READY: a failing first-cc did not gate (rc=$RC): $(printf '%s' "$OUT" | grep -iE 'runtime' | tr '\n' ' ' | cut -c1-160)"
+  bad "GATES-READY: a failing first-cc did not gate (rc=$RC): $(grep -iE 'runtime' <<<"$OUT" | tr '\n' ' ' | cut -c1-160)"
 fi
 
 # ── install.sh ready-gate (runs the REAL installer against the PRIVATE clone) ───
@@ -279,33 +279,33 @@ run_install() { # $1=HOME  $2=MARKER  rest=extra env
 # ══ G. GREEN install — validation passes → ready go-ahead shown ═══════════════
 HG="$TMP_ROOT/G"; mkdir -p "$HG/.heimdall"; : > "$HG/.heimdall/presence-off"
 OUTG="$(run_install "$HG" "$TMP_ROOT/mark-g" FAKE_CRYPTO_OK=1)"
-if printf '%s' "$OUTG" | grep -qiE 'Heimdall v[0-9].* installed'; then
+if grep -qiE 'Heimdall v[0-9].* installed' <<<"$OUTG"; then
   ok "GREEN install: the success card renders"
 else
   bad "GREEN install: no success card"
 fi
-if printf '%s' "$OUTG" | grep -qi 'all systems go' \
-   && printf '%s' "$OUTG" | grep -qiE 'Run:.*demo'; then
+if grep -qi 'all systems go' <<<"$OUTG" \
+   && grep -qiE 'Run:.*demo' <<<"$OUTG"; then
   ok "GREEN install: validation passed → the 'Run: … demo' go-ahead is shown"
 else
-  bad "GREEN install: ready go-ahead withheld on a healthy install: $(printf '%s' "$OUTG" | grep -iE 'systems go|NOT READY|Run:' | tr '\n' ' ' | cut -c1-160)"
+  bad "GREEN install: ready go-ahead withheld on a healthy install: $(grep -iE 'systems go|NOT READY|Run:' <<<"$OUTG" | tr '\n' ' ' | cut -c1-160)"
 fi
 
 # ══ H. RED install — broken crypto → NOT READY, NO go-ahead, still non-fatal ═══
 HH="$TMP_ROOT/H"; mkdir -p "$HH/.heimdall"; : > "$HH/.heimdall/presence-off"
 OUTH="$(run_install "$HH" "$TMP_ROOT/mark-h" FAKE_CRYPTO_OK=0 FAKE_PIP_OK=0)"
 # The install still COMPLETES (non-fatal) — the success card renders.
-if printf '%s' "$OUTH" | grep -qiE 'Heimdall v[0-9].* installed'; then
+if grep -qiE 'Heimdall v[0-9].* installed' <<<"$OUTH"; then
   ok "RED install: a broken part is NON-FATAL — the success card still renders"
 else
   bad "RED install: the broken part aborted the install (must be non-fatal)"
 fi
 # …but the installer does NOT declare ready: NO 'Run: … demo' go-ahead.
-if printf '%s' "$OUTH" | grep -qiE 'NOT READY' \
-   && ! printf '%s' "$OUTH" | grep -qiE 'Run:.*demo'; then
+if grep -qiE 'NOT READY' <<<"$OUTH" \
+   && ! grep -qiE 'Run:.*demo' <<<"$OUTH"; then
   ok "RED install: installer WITHHELD ready — 'NOT READY' shown, no 'Run: … demo' go-ahead"
 else
-  bad "RED install: still declared ready despite a broken part: $(printf '%s' "$OUTH" | grep -iE 'NOT READY|Run:.*demo' | tr '\n' ' ' | cut -c1-160)"
+  bad "RED install: still declared ready despite a broken part: $(grep -iE 'NOT READY|Run:.*demo' <<<"$OUTH" | tr '\n' ' ' | cut -c1-160)"
 fi
 
 # ══ HERMETIC — the install runs left the source checkout's bin/ pristine ══════

@@ -80,7 +80,7 @@ printf "\n=== heimdall-telemetry (PMR T0 corpus) acceptance ===\n"
 printf "\n[A] pmr_v1 emitted with exact T0 shape + zero source/path\n"
 export HEIMDALL_CORPUS_HOME="$WORK/A"
 EMIT_A="$(clean_job | "$CLI" emit)"
-if printf '%s' "$EMIT_A" | grep -q '"emitted": *true'; then
+if grep -q '"emitted": *true' <<<"$EMIT_A"; then
   ok "(A1) emit reports emitted=true"
 else
   bad "(A1) emit did not report emitted=true: $EMIT_A"
@@ -147,7 +147,7 @@ B_BEFORE="$(spool_count "$HEIMDALL_CORPUS_HOME")"
 # a REAL PATH planted into agent.version.
 PATH_JOB='{"attestation":{"claims":{"file_count":0,"files":[]}},"ids":{"team_id":"t","repo":"r"},"agent":{"tool":"claude-code","version":"/Users/rj/secret/app/config.py"},"verify":{"verdict":"pass"}}'
 B1="$(printf '%s' "$PATH_JOB" | "$CLI" emit 2>"$WORK/B1.err")"
-if printf '%s' "$B1" | grep -q 'zero-content-blocked' \
+if grep -q 'zero-content-blocked' <<<"$B1" \
    && grep -q 'PMR-ALARM' "$WORK/B1.err"; then
   ok "(B1) planted REAL PATH -> emission blocked + alarmed"
 else
@@ -156,7 +156,7 @@ fi
 # a SOURCE LINE planted into a deny_reason.
 SRC_JOB='{"attestation":{"claims":{"file_count":0,"files":[]}},"ids":{"team_id":"t","repo":"r"},"verify":{"verdict":"deny","deny_reasons":["const x = (a, b) => { return a + b; }"]}}'
 B2="$(printf '%s' "$SRC_JOB" | "$CLI" emit 2>"$WORK/B2.err")"
-if printf '%s' "$B2" | grep -q 'zero-content-blocked' \
+if grep -q 'zero-content-blocked' <<<"$B2" \
    && grep -q 'PMR-ALARM' "$WORK/B2.err"; then
   ok "(B2) planted SOURCE LINE -> emission blocked + alarmed"
 else
@@ -196,7 +196,7 @@ SEC_JOB_TMPL='{"attestation":{"claims":{"file_count":0,"files":[]}},"ids":{"team
 SEC_JOB="${SEC_JOB_TMPL/@PLANT_TOK@/$PLANT_TOK}"
 C1="$(printf '%s' "$SEC_JOB" | "$CLI" emit 2>"$WORK/C1.err")"
 C_AFTER="$(spool_count "$HEIMDALL_CORPUS_HOME")"
-if printf '%s' "$C1" | grep -q 'secret-detected-blocked' \
+if grep -q 'secret-detected-blocked' <<<"$C1" \
    && grep -q 'PMR-ALARM' "$WORK/C1.err" \
    && [ "$C_BEFORE" = "$C_AFTER" ]; then
   ok "(C1) planted SECRET -> blocked before queueing + alarmed, nothing written"
@@ -213,14 +213,14 @@ export HEIMDALL_CORPUS_HOME="$WORK/D"
 D_BEFORE="$(spool_count "$HEIMDALL_CORPUS_HOME")"
 D1="$(clean_job | "$CLI" emit)"
 D_AFTER="$(spool_count "$HEIMDALL_CORPUS_HOME")"
-if printf '%s' "$D1" | grep -q '"reason": *"disabled"' && [ "$D_BEFORE" = "$D_AFTER" ]; then
+if grep -q '"reason": *"disabled"' <<<"$D1" && [ "$D_BEFORE" = "$D_AFTER" ]; then
   ok "(D1) consent off -> emit is a no-op, ZERO PMR written"
 else
   bad "(D1) off was not honored: $D1 (before=$D_BEFORE after=$D_AFTER)"
 fi
 # the env kill-switch is honored too.
 D2="$(HEIMDALL_TELEMETRY=off bash -c "$(printf 'clean_job(){ cat <<J\n%s\nJ\n}; ' "$(clean_job)")" 2>/dev/null; clean_job | HEIMDALL_TELEMETRY=off "$CLI" emit)"
-if printf '%s' "$D2" | grep -q '"reason": *"disabled"'; then
+if grep -q '"reason": *"disabled"' <<<"$D2"; then
   ok "(D2) HEIMDALL_TELEMETRY=off env kill-switch honored"
 else
   bad "(D2) env kill-switch not honored: $D2"
@@ -302,7 +302,7 @@ OJOB="$("$PY" -c "import json;print(json.dumps({'attestation':{'claims':{'file_c
 OBS="$(cd "$OREPO" && "$CLI" observe --sha "$(git rev-parse HEAD)")"
 ( cd "$OREPO" && printf 'line1\nline2\nline3\n' > app.py && git add app.py && git commit -qm "Revert \"feat: change line2\"" )
 SCAN="$(cd "$OREPO" && "$CLI" scan)"
-if printf '%s' "$OBS" | grep -q '"observed": *true'; then
+if grep -q '"observed": *true' <<<"$OBS"; then
   ok "(H1) observer seeded the commit (merged sha hash recorded)"
 else
   bad "(H1) observer did not seed: $OBS"
@@ -327,7 +327,7 @@ printf "\n[R] router: hmd telemetry -> engine\n"
 export HEIMDALL_CORPUS_HOME="$WORK/R"
 if [ -x "$HMD" ]; then
   RSTAT="$("$HMD" telemetry status 2>/dev/null | "$PY" -c "import json,sys;d=json.load(sys.stdin);print(d['schema'],d['enabled'])" 2>/dev/null)"
-  if printf '%s' "$RSTAT" | grep -q 'pmr_status_v1'; then
+  if grep -q 'pmr_status_v1' <<<"$RSTAT"; then
     ok "(R1) hmd telemetry status routes to the PMR engine"
   else
     bad "(R1) router did not reach the engine: $RSTAT"

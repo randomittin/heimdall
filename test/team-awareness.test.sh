@@ -123,12 +123,12 @@ fi
 
 # The JOINed team view (heimdall-who team) renders both humans + their surfaces.
 TEAM="$(run_as "$B_HUMAN" -- "$WHO" team 2>/dev/null)"
-if printf '%s' "$TEAM" | grep -q "sarah" && printf '%s' "$TEAM" | grep -q "raj"; then
+if grep -q "sarah" <<<"$TEAM" && grep -q "raj" <<<"$TEAM"; then
   ok "hmd team view JOINs both instances (sarah + raj)"
 else
   bad "hmd team view does not render both instances"
 fi
-if printf '%s' "$TEAM" | grep -Fq "login refactor" && printf '%s' "$TEAM" | grep -Fq "card charges"; then
+if grep -Fq "login refactor" <<<"$TEAM" && grep -Fq "card charges" <<<"$TEAM"; then
   ok "team view renders each instance's active_task"
 else
   bad "team view does not render the per-instance tasks"
@@ -164,7 +164,7 @@ else
 fi
 # The team view must likewise not render the dead peer.
 TEAM_AFTER="$(run_as "$B_HUMAN" -- "$WHO" team 2>/dev/null)"
-if printf '%s' "$TEAM_AFTER" | grep -q "ghost task"; then
+if grep -q "ghost task" <<<"$TEAM_AFTER"; then
   bad "team view STILL renders the crashed instance's task"
 else
   ok "team view does not render the aged-out crashed instance"

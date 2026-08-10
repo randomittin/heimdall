@@ -160,7 +160,7 @@ if have "$(post_file)" "$(slice_file)"; then
 else
   bad "D0 the baseline run produced no drafts; generator said: $baseline_summary"
 fi
-if printf '%s' "$baseline_summary" | grep -q 'credits:              published'; then
+if grep -q 'credits:              published' <<<"$baseline_summary"; then
   ok "D1 5 distinct teams >= k=5 -> the credits block PUBLISHES"
 else bad "D1 a 5-team cohort should publish; summary said: $baseline_summary"; fi
 
@@ -190,7 +190,7 @@ else
   bad "D3a the mutated run produced no drafts; generator said: $mutated_summary"
 fi
 
-if printf '%s' "$mutated_summary" | grep -q 'credits:              suppressed (k_anonymity, 4 < 5)'; then
+if grep -q 'credits:              suppressed (k_anonymity, 4 < 5)' <<<"$mutated_summary"; then
   ok "D3 4 distinct teams < k=5 -> the credits block is SUPPRESSED"
 else bad "D3 a 4-team cohort must suppress; summary said: $mutated_summary"; fi
 
@@ -226,7 +226,7 @@ echo
 echo "   REVERT: the crediting commit is restored -> cohort = 5"
 reverted_summary="$(run_gen)"
 cp "$(post_file)"  "$WORK/reverted-post.md"
-if printf '%s' "$reverted_summary" | grep -q 'credits:              published'; then
+if grep -q 'credits:              published' <<<"$reverted_summary"; then
   ok "D8 after the revert the credits block PUBLISHES again"
 else bad "D8 the revert did not restore normal behaviour: $reverted_summary"; fi
 if diff -q <(grep -v '^generated:' "$WORK/baseline-post.md") \
@@ -251,11 +251,11 @@ else bad "C1 an uncredited commit was dropped entirely"; fi
 uncredited_line="$(grep 'cursor-paginated list endpoint' "$WORK/baseline-post.md" 2>/dev/null || :)"
 if [ -z "$uncredited_line" ]; then
   bad "C2 cannot check attribution — the uncredited line is absent from the draft"
-elif ! printf '%s' "$uncredited_line" | grep -qiE 'acme|globex|initech|umbrella|soylent'; then
+elif ! grep -qiE 'acme|globex|initech|umbrella|soylent' <<<"$uncredited_line"; then
   ok "C2 an uncredited commit is never attributed to any team"
 else bad "C2 an uncredited commit picked up an attribution"; fi
 credit_block="$(sed -n '/^## Credits/,$p' "$WORK/baseline-post.md")"
-credit_shas="$(printf '%s' "$credit_block" | grep -oE '`[0-9a-f]{7,}`' | wc -l | tr -d ' ')"
+credit_shas="$(grep -oE '`[0-9a-f]{7,}`' <<<"$credit_block" | wc -l | tr -d ' ')"
 if [ "$credit_shas" -eq 5 ]; then
   ok "C3 every published credit carries the sha that recorded the consent"
 else bad "C3 expected 5 sha-backed credits, found $credit_shas"; fi
@@ -307,7 +307,7 @@ if grep -q '^publish: false' "$WORK/baseline-post.md"; then ok "G1 the draft car
 else bad "G1 the draft is missing publish: false"; fi
 if grep -q '^status: draft' "$WORK/baseline-post.md"; then ok "G2 the draft carries status: draft"
 else bad "G2 the draft is missing status: draft"; fi
-if printf '%s' "$baseline_summary" | grep -q 'published:            no'; then
+if grep -q 'published:            no' <<<"$baseline_summary"; then
   ok "G3 the run summary states plainly that nothing was published"
 else bad "G3 the run summary does not state that nothing was published"; fi
 # The fixture repo must be untouched: a generator is a reader.

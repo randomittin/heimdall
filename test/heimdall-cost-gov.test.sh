@@ -136,7 +136,7 @@ CK="$(lget "['cfg_keys']")"
 case "$CK" in
   *"'beat_interval_s'"*|*'"beat_interval_s"'*) HAS_BEAT=1 ;; *) HAS_BEAT= ;;
 esac
-{ printf '%s' "$CK" | grep -q "beat_interval_s" && printf '%s' "$CK" | grep -q "refresh_interval_s"; } \
+{ grep -q "beat_interval_s" <<<"$CK" && grep -q "refresh_interval_s" <<<"$CK"; } \
   && ok "§1 body carries {beat_interval_s, refresh_interval_s, ...} (keys=$CK)" \
   || bad "§1 body missing beat/refresh keys (keys=$CK)"
 [ "$(lget "['cfg_cache']")" != "None" ] && [ -n "$(lget "['cfg_cache']")" ] \

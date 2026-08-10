@@ -67,18 +67,18 @@ else
 fi
 
 # ── (c) dry summary prints pass-rate for ladder ON and ladder OFF ─────────────
-if printf '%s\n' "$DRY_TXT" | grep -q 'acceptance-pass-rate  ladder ON' \
-   && printf '%s\n' "$DRY_TXT" | grep -q 'acceptance-pass-rate  ladder OFF'; then
+if grep -q 'acceptance-pass-rate  ladder ON' <<<"$DRY_TXT" \
+   && grep -q 'acceptance-pass-rate  ladder OFF' <<<"$DRY_TXT"; then
   ok "(c) summary prints acceptance-pass-rate for ladder ON and ladder OFF"
 else
   bad "(c) summary missing an on/off pass-rate line"; printf '%s\n' "$DRY_TXT"
 fi
 
 # ── (d) BLANK / n=0: dry has no runs => the ON pass-rate line carries no "%" ──
-ON_LINE="$(printf '%s\n' "$DRY_TXT" | grep 'acceptance-pass-rate  ladder ON' | head -1)"
-OFF_LINE="$(printf '%s\n' "$DRY_TXT" | grep 'acceptance-pass-rate  ladder OFF' | head -1)"
-if printf '%s' "$ON_LINE" | grep -q 'n=0' && ! printf '%s' "$ON_LINE" | grep -q '%' \
-   && printf '%s' "$OFF_LINE" | grep -q 'n=0' && ! printf '%s' "$OFF_LINE" | grep -q '%'; then
+ON_LINE="$(grep 'acceptance-pass-rate  ladder ON' <<<"$DRY_TXT" | head -1)"
+OFF_LINE="$(grep 'acceptance-pass-rate  ladder OFF' <<<"$DRY_TXT" | head -1)"
+if grep -q 'n=0' <<<"$ON_LINE" && ! grep -q '%' <<<"$ON_LINE" \
+   && grep -q 'n=0' <<<"$OFF_LINE" && ! grep -q '%' <<<"$OFF_LINE"; then
   ok "(d) blank/n=0 case reports blank — no fabricated % rate with zero runs"
 else
   bad "(d) blank case not honest (on='$ON_LINE' off='$OFF_LINE')"
@@ -100,19 +100,19 @@ FIX="$WORK/known.jsonl"
   printf '%s\n' '{"metric":"ponytail-ab","task":"T2","mode":"off","ladder":false,"loc":30,"tokens":300,"acceptance_pass":true}'
 } > "$FIX"
 SUM_TXT="$("$AB" --summary "$FIX" 2>&1 | strip)"
-E_ON="$(printf '%s\n'  "$SUM_TXT" | grep 'acceptance-pass-rate  ladder ON'  | head -1)"
-E_OFF="$(printf '%s\n' "$SUM_TXT" | grep 'acceptance-pass-rate  ladder OFF' | head -1)"
-E_LOC="$(printf '%s\n' "$SUM_TXT" | grep 'mean LOC delta'   | head -1)"
-E_TOK="$(printf '%s\n' "$SUM_TXT" | grep 'mean token delta' | head -1)"
-if printf '%s' "$E_ON"  | grep -q '50%'  && printf '%s' "$E_OFF" | grep -q '100%' \
-   && printf '%s' "$E_LOC" | grep -q '17.5' && printf '%s' "$E_TOK" | grep -q '175'; then
+E_ON="$(grep 'acceptance-pass-rate  ladder ON' <<<"$SUM_TXT"  | head -1)"
+E_OFF="$(grep 'acceptance-pass-rate  ladder OFF' <<<"$SUM_TXT" | head -1)"
+E_LOC="$(grep 'mean LOC delta' <<<"$SUM_TXT"   | head -1)"
+E_TOK="$(grep 'mean token delta' <<<"$SUM_TXT" | head -1)"
+if grep -q '50%' <<<"$E_ON"  && grep -q '100%' <<<"$E_OFF" \
+   && grep -q '17.5' <<<"$E_LOC" && grep -q '175' <<<"$E_TOK"; then
   ok "(e) --summary computes pass-rate on=50% off=100%, mean LOC delta 17.5, token delta 175"
 else
   bad "(e) --summary math wrong (on='$E_ON' off='$E_OFF' loc='$E_LOC' tok='$E_TOK')"; printf '%s\n' "$SUM_TXT"
 fi
 
 # ── (f) UNDER-DELIVERY guard fires when ON pass-rate < OFF pass-rate ───────────
-if printf '%s\n' "$SUM_TXT" | grep -qi 'UNDER-DELIVERY'; then
+if grep -qi 'UNDER-DELIVERY' <<<"$SUM_TXT"; then
   ok "(f) under-delivery guard fires when ladder ON pass-rate drops below OFF (the headline check)"
 else
   bad "(f) under-delivery guard did not fire on a 50%<100% drop"; printf '%s\n' "$SUM_TXT"
@@ -124,8 +124,8 @@ set +e
 EMP_OUT="$("$AB" --summary "$EMPTY" 2>&1)"; EMP_RC=$?
 set -e
 EMP_TXT="$(printf '%s' "$EMP_OUT" | strip)"
-EMP_ON="$(printf '%s\n' "$EMP_TXT" | grep 'acceptance-pass-rate  ladder ON' | head -1)"
-if [ "$EMP_RC" -eq 0 ] && printf '%s' "$EMP_ON" | grep -q 'n=0' && ! printf '%s' "$EMP_ON" | grep -q '%'; then
+EMP_ON="$(grep 'acceptance-pass-rate  ladder ON' <<<"$EMP_TXT" | head -1)"
+if [ "$EMP_RC" -eq 0 ] && grep -q 'n=0' <<<"$EMP_ON" && ! grep -q '%' <<<"$EMP_ON"; then
   ok "(g) --summary over empty JSONL => blank/n=0, exit 0 (no fabricated rate)"
 else
   bad "(g) empty summary not blank/exit0 (rc=$EMP_RC on='$EMP_ON')"; printf '%s\n' "$EMP_TXT"

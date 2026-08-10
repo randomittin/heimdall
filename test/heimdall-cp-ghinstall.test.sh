@@ -213,7 +213,7 @@ CROSS_CALLS="$(grep -c "repos=gadgets" "$CALL_LOG" 2>/dev/null | tr -d ' ')"
 
 # ── 7) token NEVER logged / stored ──
 TOKA="$(j tokA)"; TOKB="$(j tokB)"
-STORE_HAS_TOKEN="$(printf '%s' "$(j record_text)" | grep -c "ghs_faketok" 2>/dev/null | tr -d ' ')"
+STORE_HAS_TOKEN="$(grep -c "ghs_faketok" <<<"$(j record_text)" 2>/dev/null | tr -d ' ')"
 # sweep the ENTIRE throwaway home for the token string (nothing under HEIMDALL_HOME may hold it).
 HOME_HAS_TOKEN="$(grep -rl "ghs_faketok" "$HOME_T" 2>/dev/null | wc -l | tr -d ' ')"
 if [ -n "$TOKA" ] && [ -n "$TOKB" ] && [ "$STORE_HAS_TOKEN" = "0" ] && [ "$HOME_HAS_TOKEN" = "0" ]; then

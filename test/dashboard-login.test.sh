@@ -151,7 +151,7 @@ RC=$?
 stop_server
 
 if [ "$RC" -eq 0 ]; then ok "login exits 0 on a 200 approve"; else bad "login exits 0 on a 200 approve (rc=$RC)"; cat "$WORK/err1" >&2; fi
-if printf '%s' "$OUT" | grep -q "approved"; then ok "prints the success line (approved — return to your browser)"; else bad "prints the success line"; printf 'stdout=%s\n' "$OUT" >&2; fi
+if grep -q "approved" <<<"$OUT"; then ok "prints the success line (approved — return to your browser)"; else bad "prints the success line"; printf 'stdout=%s\n' "$OUT" >&2; fi
 
 # The recorded POST: correct path + body fields + a signature that verifies over the
 # byte-identical cp_session.assertion_message.
@@ -212,7 +212,7 @@ start_server 401
 ERR="$(HOME="$HOME_DIR" PATH="$GH_OK_DIR:$PATH" bash "$DASH_BIN" login "$DEVICE_CODE" --yes --haid "$HAID" --url "http://127.0.0.1:$PORT" 2>&1 >/dev/null)"
 RC=$?
 stop_server
-if [ "$RC" -ne 0 ] && printf '%s' "$ERR" | grep -qi "reject"; then ok "401 → clear rejection message + non-zero exit"; else bad "401 handling (rc=$RC, err=$ERR)"; fi
+if [ "$RC" -ne 0 ] && grep -qi "reject" <<<"$ERR"; then ok "401 → clear rejection message + non-zero exit"; else bad "401 handling (rc=$RC, err=$ERR)"; fi
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 4. NOT ENROLLED — no seed for this HAID → clear error, no POST.
@@ -222,7 +222,7 @@ start_server 200
 ERR="$(HOME="$HOME_DIR" PATH="$GH_OK_DIR:$PATH" bash "$DASH_BIN" login "$DEVICE_CODE" --yes --haid "haid:not.enrolled-9999" --url "http://127.0.0.1:$PORT" 2>&1 >/dev/null)"
 RC=$?
 stop_server
-if [ "$RC" -ne 0 ] && printf '%s' "$ERR" | grep -qiE "enroll|not enrolled|signing key"; then ok "not-enrolled → clear error"; else bad "not-enrolled handling (rc=$RC, err=$ERR)"; fi
+if [ "$RC" -ne 0 ] && grep -qiE "enroll|not enrolled|signing key" <<<"$ERR"; then ok "not-enrolled → clear error"; else bad "not-enrolled handling (rc=$RC, err=$ERR)"; fi
 if [ ! -s "$CAPTURE" ]; then ok "not-enrolled makes NO POST"; else bad "not-enrolled must not POST"; fi
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -233,7 +233,7 @@ start_server 200
 ERR="$(HOME="$HOME_DIR" PATH="$GH_UNAUTH_DIR:$PATH" bash "$DASH_BIN" login "$DEVICE_CODE" --yes --haid "$HAID" --url "http://127.0.0.1:$PORT" 2>&1 >/dev/null)"
 RC=$?
 stop_server
-if [ "$RC" -ne 0 ] && printf '%s' "$ERR" | grep -qi "gh auth"; then ok "gh unauthenticated → 'gh auth login' error"; else bad "gh-unauth handling (rc=$RC, err=$ERR)"; fi
+if [ "$RC" -ne 0 ] && grep -qi "gh auth" <<<"$ERR"; then ok "gh unauthenticated → 'gh auth login' error"; else bad "gh-unauth handling (rc=$RC, err=$ERR)"; fi
 if [ ! -s "$CAPTURE" ]; then ok "gh-unauth makes NO POST"; else bad "gh-unauth must not POST"; fi
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -244,7 +244,7 @@ start_server 200
 ERR="$(HOME="$HOME_DIR" PATH="$MINI_BIN" bash "$DASH_BIN" login "$DEVICE_CODE" --yes --haid "$HAID" --url "http://127.0.0.1:$PORT" 2>&1 >/dev/null)"
 RC=$?
 stop_server
-if [ "$RC" -ne 0 ] && printf '%s' "$ERR" | grep -qi "gh"; then ok "gh not installed → clear error"; else bad "gh-missing handling (rc=$RC, err=$ERR)"; fi
+if [ "$RC" -ne 0 ] && grep -qi "gh" <<<"$ERR"; then ok "gh not installed → clear error"; else bad "gh-missing handling (rc=$RC, err=$ERR)"; fi
 if [ ! -s "$CAPTURE" ]; then ok "gh-missing makes NO POST"; else bad "gh-missing must not POST"; fi
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -253,7 +253,7 @@ if [ ! -s "$CAPTURE" ]; then ok "gh-missing makes NO POST"; else bad "gh-missing
 start_server 200
 BOTH="$(HOME="$HOME_DIR" PATH="$GH_OK_DIR:$PATH" bash "$DASH_BIN" login "$DEVICE_CODE" --yes --haid "$HAID" --url "http://127.0.0.1:$PORT" 2>&1)"
 stop_server
-if printf '%s' "$BOTH" | grep -qF "$SEED_B64"; then bad "the signing seed LEAKED to output"; else ok "signing seed never printed"; fi
+if grep -qF "$SEED_B64" <<<"$BOTH"; then bad "the signing seed LEAKED to output"; else ok "signing seed never printed"; fi
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 7b. CONSENT SAFETY — no --yes and a non-interactive stdin MUST refuse (never hang,

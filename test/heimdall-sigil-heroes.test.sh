@@ -43,8 +43,8 @@ $1
 print("::COUNT:: %d %d" % (P[0], F[0]))
 PY
 )"
-  printf '%s\n' "$out" | grep -v '^::COUNT::'
-  local line; line="$(printf '%s\n' "$out" | grep '^::COUNT::')"
+  grep -v '^::COUNT::' <<<"$out"
+  local line; line="$(grep '^::COUNT::' <<<"$out")"
   pass=$((pass + $(echo "$line" | awk '{print $2}')))
   fail=$((fail + $(echo "$line" | awk '{print $3}')))
 }
@@ -114,7 +114,7 @@ if [ -x "$HMD" ]; then
   H="$(mktemp -d)"
   printf '4\n' > "$H/.run-count"                     # run-count 4 (<5) → locked
   OUT="$(HEIMDALL_HOME="$H" "$HMD" sigil set venom 2>&1)"; RC=$?
-  { [ "$RC" -ne 0 ] && printf '%s' "$OUT" | grep -qi "unlocks after 5"; } \
+  { [ "$RC" -ne 0 ] && grep -qi "unlocks after 5" <<<"$OUT"; } \
     && ok "set REFUSED at run-count 4 (exit $RC)" || bad "set not refused at 4 (exit $RC): $OUT"
   [ ! -f "$H/sigil-choice" ] && ok "no override persisted while locked" || bad "override persisted while locked"
 
@@ -125,18 +125,18 @@ if [ -x "$HMD" ]; then
 
   printf '9\n' > "$H/.run-count"
   OUT="$(HEIMDALL_HOME="$H" "$HMD" sigil set batman 2>&1)"; RC=$?
-  { [ "$RC" -ne 0 ] && printf '%s' "$OUT" | grep -q "unknown hero"; } \
+  { [ "$RC" -ne 0 ] && grep -q "unknown hero" <<<"$OUT"; } \
     && ok "set REJECTS an unknown name (exit $RC)" || bad "unknown name not rejected (exit $RC): $OUT"
-  printf '%s' "$OUT" | grep -q "spiderman" && ok "rejection lists the hero pool" || bad "rejection did not list heroes"
+  grep -q "spiderman" <<<"$OUT" && ok "rejection lists the hero pool" || bad "rejection did not list heroes"
   [ "$(cat "$H/sigil-choice" 2>/dev/null)" = "venom" ] && ok "unknown-name reject left the valid choice intact" || bad "choice clobbered by bad set"
 
   OUT="$(HEIMDALL_HOME="$H" "$HMD" sigil 2>&1)"
-  printf '%s' "$OUT" | grep -q "sigil: venom" && ok "hmd sigil reports the override hero" || bad "hmd sigil did not report override: $OUT"
-  printf '%s' "$OUT" | grep -qi "unlocked" && ok "hmd sigil reports unlocked state" || bad "hmd sigil did not report unlocked"
+  grep -q "sigil: venom" <<<"$OUT" && ok "hmd sigil reports the override hero" || bad "hmd sigil did not report override: $OUT"
+  grep -qi "unlocked" <<<"$OUT" && ok "hmd sigil reports unlocked state" || bad "hmd sigil did not report unlocked"
 
   H2="$(mktemp -d)"
   OUT="$(HEIMDALL_HOME="$H2" "$HMD" sigil 2>&1)"
-  printf '%s' "$OUT" | grep -qi "locked" && ok "fresh dev sees the locked message" || bad "fresh dev not locked: $OUT"
+  grep -qi "locked" <<<"$OUT" && ok "fresh dev sees the locked message" || bad "fresh dev not locked: $OUT"
   rm -rf "$H" "$H2"
 else
   bad "bin/heimdall not executable at $HMD"

@@ -106,10 +106,10 @@ echo "-- A. an untriaged ⚠ item past the window is a BREACH ------------------
 OUT="$(run)"; RC="$(rc_of)"
 [ "$RC" = 1 ] && ok "A1 untriaged 25h item -> exit 1 (RED)" \
   || bad "A1 expected exit 1, got $RC" "$OUT"
-printf '%s' "$OUT" | grep -q '\b100\b' \
+grep -q '\b100\b' <<<"$OUT" \
   && ok "A2 the RED output NAMES the breaching observation id (100)" \
   || bad "A2 breach output does not name id 100" "$OUT"
-printf '%s' "$OUT" | grep -q '\b102\b' \
+grep -q '\b102\b' <<<"$OUT" \
   && ok "A3 the 99h-old item is also named (age never converts a breach into a pass)" \
   || bad "A3 the older breach (102) was not reported" "$OUT"
 
@@ -122,17 +122,17 @@ triage 103 FALSE-POSITIVE "classify() reads the status file fresh each run, so t
 OUT="$(run)"; RC="$(rc_of)"
 [ "$RC" = 0 ] && ok "B1 every overdue item triaged -> exit 0 (GREEN)" \
   || bad "B1 expected exit 0 after triage, got $RC" "$OUT"
-printf '%s' "$OUT" | grep -qi 'breach' && printf '%s' "$OUT" | grep -qiv '0 breach' >/dev/null 2>&1
-printf '%s' "$OUT" | grep -q 'BREACH: ' \
+grep -qi 'breach' <<<"$OUT" && grep -qiv '0 breach' <<<"$OUT" >/dev/null 2>&1
+grep -q 'BREACH: ' <<<"$OUT" \
   && bad "B2 a breach was still reported after full triage" "$OUT" \
   || ok "B2 no BREACH line survives a complete triage (self-clearing, no ack step)"
 
 echo "-- C. the window is real: 23h untriaged is NOT yet a breach ---------------------"
 
-printf '%s' "$OUT" | grep -q 'BREACH.*\b101\b' \
+grep -q 'BREACH.*\b101\b' <<<"$OUT" \
   && bad "C1 the 23h item was reported as a breach — the window is not being honored" "$OUT" \
   || ok "C1 the 23h untriaged item is NOT a breach (inside the 24h window)"
-printf '%s' "$(run --json)" | grep -q '"within_window":1' \
+grep -q '"within_window":1' <<<"$(run --json)" \
   && ok "C2 --json accounts for it as within_window (tracked, not silently dropped)" \
   || bad "C2 the 23h item vanished from the accounting" "$(run --json)"
 
@@ -166,27 +166,27 @@ echo "-- E. triage means a REASON a human wrote, not an acknowledgement --------
 new_ledger; triage 100 FIXED "ack"
 triage 102 ACCEPTED-RISK "Hostname is already public in the shipped docs; disclosure adds nothing new to an attacker."
 triage 103 FALSE-POSITIVE "classify() re-reads the status file each run so a granted state cannot persist."
-printf '%s' "$(run)" | grep -q 'BREACH.*\b100\b' \
+grep -q 'BREACH.*\b100\b' <<<"$(run)" \
   && ok "E1 a bare 'ack' is NOT triage — still a breach" || bad "E1 'ack' was accepted as triage" "$(run)"
 
 new_ledger; triage 100 FIXED "Redaction landed in 3a4b255 and the logcat write path is scrubbed before it is flushed." "no attribution here"
 triage 102 ACCEPTED-RISK "Hostname is already public in the shipped docs; disclosure adds nothing new to an attacker."
 triage 103 FALSE-POSITIVE "classify() re-reads the status file each run so a granted state cannot persist."
-printf '%s' "$(run)" | grep -q 'BREACH.*\b100\b' \
+grep -q 'BREACH.*\b100\b' <<<"$(run)" \
   && ok "E2 a verdict with NO HAID attribution is rejected (nobody is accountable for it)" \
   || bad "E2 unattributed verdict was accepted" "$(run)"
 
 new_ledger; triage 100 PROBABLY-FINE "Redaction landed in 3a4b255 and the logcat write path is scrubbed before it is flushed."
 triage 102 ACCEPTED-RISK "Hostname is already public in the shipped docs; disclosure adds nothing new to an attacker."
 triage 103 FALSE-POSITIVE "classify() re-reads the status file each run so a granted state cannot persist."
-printf '%s' "$(run)" | grep -q 'BREACH.*\b100\b' \
+grep -q 'BREACH.*\b100\b' <<<"$(run)" \
   && ok "E3 an unknown verdict token is rejected (the vocabulary is closed)" \
   || bad "E3 bogus verdict token accepted" "$(run)"
 
 new_ledger; triage 999 FIXED "This triage names an observation that is not the one in breach, so it must not clear id 100."
 triage 102 ACCEPTED-RISK "Hostname is already public in the shipped docs; disclosure adds nothing new to an attacker."
 triage 103 FALSE-POSITIVE "classify() re-reads the status file each run so a granted state cannot persist."
-printf '%s' "$(run)" | grep -q 'BREACH.*\b100\b' \
+grep -q 'BREACH.*\b100\b' <<<"$(run)" \
   && ok "E4 a verdict for a DIFFERENT id does not clear this one" || bad "E4 cross-id leak in triage matching" "$(run)"
 
 # DEFERRED is the one verdict that could re-create the disease: "defer" with no expiry is
@@ -204,12 +204,12 @@ clear_others() {
 }
 
 new_ledger; triage_until 100 "Deferring this one until the payment driver rewrite lands next sprint." ""; clear_others
-printf '%s' "$(run)" | grep -q 'BREACH.*\b100\b' \
+grep -q 'BREACH.*\b100\b' <<<"$(run)" \
   && ok "E5 DEFERRED with NO expiry date is rejected (an open-ended defer is just aging)" \
   || bad "E5 an undated deferral was accepted" "$(run)"
 
 new_ledger; triage_until 100 "Deferring this one until the payment driver rewrite lands next sprint." "2020-01-01"; clear_others
-printf '%s' "$(run)" | grep -q 'BREACH.*\b100\b' \
+grep -q 'BREACH.*\b100\b' <<<"$(run)" \
   && ok "E6 an EXPIRED deferral re-opens by itself (the deferral loophole is closed)" \
   || bad "E6 a lapsed deferral still suppressed the item" "$(run)"
 
@@ -223,10 +223,10 @@ echo "-- F. lane B: a fail-open finding typed 'discovery' is still caught ------
 new_ledger; triage 100 FIXED "Redaction landed in 3a4b255 and the logcat write path is scrubbed before it is flushed."
 triage 102 ACCEPTED-RISK "Hostname is already public in the shipped docs; disclosure adds nothing new to an attacker."
 OUT="$(run)"
-printf '%s' "$OUT" | grep -q 'BREACH.*\b103\b' \
+grep -q 'BREACH.*\b103\b' <<<"$OUT" \
   && ok "F1 the self-silencing item typed 'discovery' IS a breach (type field is not trusted alone)" \
   || bad "F1 lane B missed the untagged fail-open finding (this is exactly obs 16105)" "$OUT"
-printf '%s' "$OUT" | grep -q '\b104\b' \
+grep -q '\b104\b' <<<"$OUT" \
   && bad "F2 an ordinary discovery was swept in — lane B is over-broad" "$OUT" \
   || ok "F2 an ordinary 'discovery' with no fail-open character is NOT swept in"
 
@@ -234,26 +234,26 @@ echo "-- G. the report names an item; it never publishes the vulnerability -----
 
 new_ledger
 OUT="$(run)"
-printf '%s' "$OUT" | grep -qF "$SECRET_TITLE" \
+grep -qF "$SECRET_TITLE" <<<"$OUT" \
   && bad "G1 the default report leaked an observation TITLE (titles carry live secrets)" "$OUT" \
   || ok "G1 default report carries ids + status, never the title"
-printf '%s' "$(run --advise)" | grep -qF "$SECRET_TITLE" \
+grep -qF "$SECRET_TITLE" <<<"$(run --advise)" \
   && bad "G2 the SessionStart advisory leaked a title" "$(run --advise)" \
   || ok "G2 the one-line advisory carries no title either"
-printf '%s' "$(run --verbose)" | grep -qF "$SECRET_TITLE" \
+grep -qF "$SECRET_TITLE" <<<"$(run --verbose)" \
   && ok "G3 --verbose DOES show titles (the local operator still needs to see what it is)" \
   || bad "G3 --verbose hid the title too — the detail became unreachable" "$(run --verbose)"
 
 echo "-- H. the SessionStart advisory: one line, self-clearing, never fatal -----------"
 
 ADV="$(run --advise)"
-AL="$(printf '%s' "$ADV" | grep -c '')"
+AL="$(grep -c '' <<<"$ADV")"
 [ "$AL" -eq 1 ] && ok "H1 --advise emits exactly ONE line (the SessionStart budget)" \
   || bad "H1 --advise emitted $AL lines, expected 1" "$ADV"
 AB="$(printf '%s' "$ADV" | wc -c | tr -d ' ')"
 [ "$AB" -le 420 ] && ok "H2 the advisory line is ${AB}B (budget 420B)" \
   || bad "H2 advisory is ${AB}B, over the 420B budget" "$ADV"
-printf '%s' "$ADV" | grep -q 'heimdall-sla' \
+grep -q 'heimdall-sla' <<<"$ADV" \
   && ok "H3 the advisory carries a runnable command to see the detail" || bad "H3 no runnable remedy" "$ADV"
 RC="$(rc_of --advise)"
 [ "$RC" = 0 ] && ok "H4 --advise ALWAYS exits 0 (a monitor may not break the session)" \
@@ -285,7 +285,7 @@ if cmp -s "$M1" "$SLA"; then
   bad "M0 the age-comparison anchor is missing from bin/heimdall-sla — m1 could not be built"
 else
   M1RC="$(m_rc "$M1")"
-  if [ "$M1RC" = 1 ] && printf '%s' "$(m_run "$M1")" | grep -q 'BREACH.*\b100\b'; then
+  if [ "$M1RC" = 1 ] && grep -q 'BREACH.*\b100\b' <<<"$(m_run "$M1")"; then
     bad "M1 SURVIVED: the mutant that can never mark an item overdue still went RED — case A is a tautology"
   else
     ok "M1 KILLED: forcing the age comparison always-false flips case A to green -> case A is a real check"
@@ -300,7 +300,7 @@ if cmp -s "$M2" "$SLA"; then
   bad "M0 the no-verdict-is-breach anchor is missing from bin/heimdall-sla — m2 could not be built"
 else
   M2RC="$(m_rc "$M2")"
-  if [ "$M2RC" = 1 ] && printf '%s' "$(m_run "$M2")" | grep -q 'BREACH.*\b100\b'; then
+  if [ "$M2RC" = 1 ] && grep -q 'BREACH.*\b100\b' <<<"$(m_run "$M2")"; then
     bad "M2 SURVIVED: the mutant that treats a missing verdict as a pass still went RED"
   else
     ok "M2 KILLED: making 'no verdict' a pass flips case A to green -> the breach rule is load-bearing"

@@ -89,7 +89,7 @@ fi
 # examined nothing. Those templates are permanent by design (install-cp-endpoint.test.sh
 # asserts .heimdall/cp-endpoint.json.example is NOT gitignored so it can land), so zero
 # tracked config artifacts is a REGRESSION in this gate's subject, not a legitimate skip.
-CONFIGS="$(printf '%s\n' "$TRACKED" | grep -iE '(cp-endpoint|team)\.json' || true)"
+CONFIGS="$(grep -iE '(cp-endpoint|team)\.json' <<<"$TRACKED" || true)"
 CONFIG_N="$(count_lines "$CONFIGS")"
 if [ "$CONFIG_N" -eq 0 ]; then
   bad "B: ZERO tracked config artifacts to check — this proof examined nothing, so it proves nothing.

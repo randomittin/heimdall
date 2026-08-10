@@ -246,9 +246,9 @@ B3_STALE_STATUS="$(jget "['stale'][0]['status']")"
 # agent treats a stale memory as stale (verify against ground truth before acting).
 recall
 B3_TEXT="$OUT"
-printf '%s' "$B3_TEXT" | grep -q "LIVE — git-confirmed" && ok "capsule block renders a LIVE section (git-confirmed survivors)" || bad "capsule block missing the LIVE section"
-printf '%s' "$B3_TEXT" | grep -q "do NOT act on them" && ok "capsule block renders the STALE warning (do NOT act on stale memory)" || bad "capsule block missing the STALE warning"
-printf '%s' "$B3_TEXT" | grep -qi "MySQLStore" && ok "capsule surfaces the live MySQL claim by its ref" || bad "capsule does not surface the live MySQL ref"
+grep -q "LIVE — git-confirmed" <<<"$B3_TEXT" && ok "capsule block renders a LIVE section (git-confirmed survivors)" || bad "capsule block missing the LIVE section"
+grep -q "do NOT act on them" <<<"$B3_TEXT" && ok "capsule block renders the STALE warning (do NOT act on stale memory)" || bad "capsule block missing the STALE warning"
+grep -qi "MySQLStore" <<<"$B3_TEXT" && ok "capsule surfaces the live MySQL claim by its ref" || bad "capsule does not surface the live MySQL ref"
 
 # 3c. NO-REGRESSION — an ABSENT store → recall behaves EXACTLY as today (a clean install
 # is unaffected). Point HEIMDALL_HOME at an empty home with no memory store: available
@@ -260,7 +260,7 @@ B3_ABS_AVAIL="$(printf '%s' "$B3_ABS_JSON" | python3 -c "import sys,json;print(j
 B3_ABS_TEXT="$(HEIMDALL_HOME="$EMPTY_HOME" "$COMPREHEND" recall "$GR" 2>/dev/null)"
 [ "$B3_ABS_RC" -eq 0 ] && ok "absent-store recall exit 0 (no crash on a clean install)" || bad "absent-store recall exit $B3_ABS_RC (want 0)"
 [ "$B3_ABS_AVAIL" = "False" ] && ok "absent store → available=False (identical to today, no regression)" || bad "absent-store available=$B3_ABS_AVAIL (want False)"
-printf '%s' "$B3_ABS_TEXT" | grep -q "none" && ok "absent store → the honest one-line 'none' block (additive note, not a section)" || bad "absent store did not render the 'none' note"
+grep -q "none" <<<"$B3_ABS_TEXT" && ok "absent store → the honest one-line 'none' block (additive note, not a section)" || bad "absent store did not render the 'none' note"
 
 # ═════════════════════════════════════════════════════════════════════════════
 # BLOCK 4 — BENCH HONEST  (the measured metrics table; CARDINAL: no fabricated number)
@@ -282,10 +282,10 @@ B4_TABLE="$("$BENCH" run 2>/dev/null)"
 [ "$B4_RC" -eq 0 ] && ok "bench run exit 0 (built the fixture repo, scored all 4 methods)" || bad "bench run exit $B4_RC (want 0)"
 
 # 4a. the measured table renders: header + a row per method, over real built commits.
-printf '%s' "$B4_TABLE" | grep -q "Verified-Memory BENCHMARK" && ok "metrics table header rendered" || bad "metrics table header missing"
-printf '%s' "$B4_TABLE" | grep -q "built commits:" && ok "table cites the REAL built fixture commits (staleness from a real git op, not a flag flip)" || bad "table missing the built-commits line"
+grep -q "Verified-Memory BENCHMARK" <<<"$B4_TABLE" && ok "metrics table header rendered" || bad "metrics table header missing"
+grep -q "built commits:" <<<"$B4_TABLE" && ok "table cites the REAL built fixture commits (staleness from a real git op, not a flag flip)" || bad "table missing the built-commits line"
 for m in verified-memory decay llm-judge drift; do
-  printf '%s' "$B4_TABLE" | grep -q "$m" && ok "table has the $m row" || bad "table missing the $m row"
+  grep -q "$m" <<<"$B4_TABLE" && ok "table has the $m row" || bad "table missing the $m row"
 done
 
 # 4b. CARDINAL — NO FABRICATED NUMBER. Two falsifiable proofs:
@@ -331,7 +331,7 @@ B4_DECAY_VERDICT="$(printf '%s' "$B4_JSON" | python3 -c "import sys,json;print(j
 [ "$B4_NULL" = "True" ] && ok "headline null_result=True printed honestly (ties llm-judge → not a clean sweep) — reported, not buried" || bad "null_result=$B4_NULL (want True on this fixture)"
 [ "$B4_LLM_VERDICT" = "null-tie" ] && ok "llm-judge verdict=null-tie (honest: verified-memory ties, does not beat, the double here)" || bad "llm-judge verdict=$B4_LLM_VERDICT (want null-tie)"
 [ "$B4_DECAY_VERDICT" = "verified-memory-wins" ] && ok "decay verdict=verified-memory-wins (a measured, real win where it exists)" || bad "decay verdict=$B4_DECAY_VERDICT (want verified-memory-wins)"
-printf '%s' "$B4_TABLE" | grep -q "NULL NOTE" && ok "the table prints the NULL NOTE — the honest finding is surfaced in the human output" || bad "table did not print the NULL NOTE"
+grep -q "NULL NOTE" <<<"$B4_TABLE" && ok "the table prints the NULL NOTE — the honest finding is surfaced in the human output" || bad "table did not print the NULL NOTE"
 
 # ═════════════════════════════════════════════════════════════════════════════
 # BLOCK 5 — PRIVACY  (no-secret-by-construction; CARDINAL: secret-absent from the store)

@@ -99,8 +99,8 @@ print("::COUNT:: %d %d" % (P[0], F[0]))
 PYEOF
 
 out="$(python3 "$PY" "$SIG")"
-printf '%s\n' "$out" | grep -v '^::COUNT::'
-line="$(printf '%s\n' "$out" | grep '^::COUNT::')"
+grep -v '^::COUNT::' <<<"$out"
+line="$(grep '^::COUNT::' <<<"$out")"
 pass="$(echo "$line" | awk '{print $2}')"; fail="$(echo "$line" | awk '{print $3}')"
 echo ""
 echo "${pass:-0} passed, ${fail:-0} failed"

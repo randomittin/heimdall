@@ -259,7 +259,7 @@ if [ -n "$HITS" ]; then
       esac
     done
     # ...or if THIS line quotes the phrase in order to repudiate it.
-    if [ "$allowed" -eq 0 ] && printf '%s' "$content" | grep -qiE "$REPUDIATIONS"; then
+    if [ "$allowed" -eq 0 ] && grep -qiE "$REPUDIATIONS" <<<"$content"; then
       allowed=1
     fi
     if [ "$allowed" -eq 0 ]; then

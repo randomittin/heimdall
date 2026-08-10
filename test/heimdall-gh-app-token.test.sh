@@ -177,7 +177,7 @@ PYEOF
 
 # ── 5. SECRET-SAFETY — the private key never surfaces (positive control above) ─
 if grep -qF "$NEEDLE" "$TMP/err" 2>/dev/null; then bad "private key leaked to stderr"; else ok "no private-key material on stderr"; fi
-printf '%s' "$OUT" | grep -qF "$NEEDLE" && bad "private key leaked to stdout" || ok "no private-key material on stdout"
+grep -qF "$NEEDLE" <<<"$OUT" && bad "private key leaked to stdout" || ok "no private-key material on stdout"
 # the key is passed via env/file only — never on argv. Prove the bin exposes no key flag.
 grep -q -- '--private-key' "$BIN" && bad "bin takes a key on argv (leak risk)" || ok "bin reads key via env/file, never argv"
 
@@ -246,12 +246,12 @@ PYEOF
 # ── 10. setup-bot.sh --dry-run prints the plan, leaks nothing ────────────────
 OUT10="$(bash "$SETUP" --dry-run 2>&1)"; rc10=$?
 [ "$rc10" = 0 ] && ok "setup-bot --dry-run exit 0 (no creds)" || bad "setup-bot dry-run rc=$rc10"
-printf '%s' "$OUT10" | grep -qi 'Contents' && printf '%s' "$OUT10" | grep -qi 'Pull request' \
+grep -qi 'Contents' <<<"$OUT10" && grep -qi 'Pull request' <<<"$OUT10" \
   && ok "setup plan documents Contents + Pull requests permissions" || bad "permissions not documented"
-printf '%s' "$OUT10" | grep -qi 'Metadata' && ok "setup plan notes Metadata (mandatory) permission" || bad "Metadata not noted"
-printf '%s' "$OUT10" | grep -qiE 'no Administration|NEVER|no workflow' && ok "setup plan states the DENIED scopes" || bad "denied scopes not stated"
-printf '%s' "$OUT10" | grep -qi 'heimdall-gh-app-token' && ok "setup plan verifies via heimdall-gh-app-token" || bad "verify step missing"
-printf '%s' "$OUT10" | grep -qF "$NEEDLE" && bad "setup dry-run leaked key material" || ok "setup dry-run leaks no creds"
+grep -qi 'Metadata' <<<"$OUT10" && ok "setup plan notes Metadata (mandatory) permission" || bad "Metadata not noted"
+grep -qiE 'no Administration|NEVER|no workflow' <<<"$OUT10" && ok "setup plan states the DENIED scopes" || bad "denied scopes not stated"
+grep -qi 'heimdall-gh-app-token' <<<"$OUT10" && ok "setup plan verifies via heimdall-gh-app-token" || bad "verify step missing"
+grep -qF "$NEEDLE" <<<"$OUT10" && bad "setup dry-run leaked key material" || ok "setup dry-run leaks no creds"
 
 echo "──────────"
 echo "gh-app-token: $P passed, $F failed"

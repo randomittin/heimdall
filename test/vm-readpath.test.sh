@@ -168,17 +168,17 @@ echo "D. COMPREHEND shows the git-verified memory status (recall + appended bloc
 
 # `comprehend recall` against the isolated home (pin HEIMDALL_HOME so it reads OUR store).
 RECALL_TEXT="$(HEIMDALL_HOME="$HOME_DIR" "$COMPREHEND" recall "$GR" 2>&1)"
-printf '%s' "$RECALL_TEXT" | grep -q "verified memory" \
+grep -q "verified memory" <<<"$RECALL_TEXT" \
   && ok "recall emits the verified-memory block" || bad "recall has no verified-memory header"
-printf '%s' "$RECALL_TEXT" | grep -qi "LIVE" \
+grep -qi "LIVE" <<<"$RECALL_TEXT" \
   && ok "recall block shows a LIVE section (git-confirmed)" || bad "recall block has no LIVE section"
-printf '%s' "$RECALL_TEXT" | grep -qi "stale" \
+grep -qi "stale" <<<"$RECALL_TEXT" \
   && ok "recall block shows the STALE status (git says it no longer holds)" \
   || bad "recall block does not show the stale status"
 
 # the appended block on `comprehend` itself (stderr) carries the same status.
 CMP_ERR="$(HEIMDALL_HOME="$HOME_DIR" "$COMPREHEND" comprehend "$GR" 2>&1 >/dev/null)"
-printf '%s' "$CMP_ERR" | grep -q "verified memory" \
+grep -q "verified memory" <<<"$CMP_ERR" \
   && ok "comprehend appends the verified-memory block (capsule carries git-verified status)" \
   || bad "comprehend did not append the verified-memory block"
 
@@ -204,14 +204,14 @@ print(json.dumps(d,sort_keys=True))"; }
   || bad "comprehend stdout differs across no-store runs (regression)"
 
 # stdout must NOT contain the verified-memory block (it is stderr-only — pristine JSON).
-printf '%s' "$OUT1" | grep -q "verified memory" \
+grep -q "verified memory" <<<"$OUT1" \
   && bad "verified-memory block leaked into comprehend stdout (capsule JSON polluted)" \
   || ok "comprehend stdout stays pristine JSON (VM block is stderr-only, additive)"
 
 # recall against an empty home → honest 'none', exit 0 (no crash).
 RECALL_NONE="$(HEIMDALL_HOME="$NOSTORE_HOME/h3" "$COMPREHEND" recall "$GR" 2>&1)"; RC=$?
 [ "$RC" -eq 0 ] && ok "recall on absent store exits 0 (graceful, no crash)" || bad "recall exit=$RC (want 0)"
-printf '%s' "$RECALL_NONE" | grep -qi "none" \
+grep -qi "none" <<<"$RECALL_NONE" \
   && ok "recall on absent store reports an honest 'none'" || bad "recall absent-store output not 'none'"
 
 # ─────────────────────────────────────────────────────────────────────────────

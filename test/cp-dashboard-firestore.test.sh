@@ -382,12 +382,12 @@ echo
 
 # ── (a) NO-RAISE ──
 echo "(a) NO-RAISE — the cross-dev dashboard read under firestore must NOT raise BackendUnavailable"
-if printf '%s' "$OUT" | grep -q "BackendUnavailable"; then
+if grep -q "BackendUnavailable" <<<"$OUT"; then
   STAGE="$(printf '%s' "$OUT" | sed -n 's/.*stage=\([a-z_]*\).*/\1/p')"
   bad "a1 a read handler RAISED BackendUnavailable under firestore (stage=$STAGE) — it still calls path() on a read path (regression)"
-elif printf '%s' "$OUT" | grep -q "^STATUS dash_ok "; then
+elif grep -q "^STATUS dash_ok " <<<"$OUT"; then
   ok "a1 the whole dashboard read completed under firestore with NO BackendUnavailable"
-elif printf '%s' "$OUT" | grep -q "handler_raised"; then
+elif grep -q "handler_raised" <<<"$OUT"; then
   STAGE="$(printf '%s' "$OUT" | sed -n 's/.*stage=\([a-z_]*\).*/\1/p')"
   bad "a1 a read handler raised under firestore (stage=$STAGE, out: $OUT)"
 else
@@ -397,17 +397,17 @@ echo
 
 # ── (b) RESOLVES ──
 echo "(b) RESOLVES — the dashboard actually SAW the ingested fleet under firestore (read back)"
-if printf '%s' "$OUT" | grep -q "n_slugs=2"; then
+if grep -q "n_slugs=2" <<<"$OUT"; then
   ok "b1 stored_instances returned BOTH instance slugs under firestore (not [] — the list_names-nesting defect is fixed)"
 else
   bad "b1 stored_instances did not return both slugs under firestore (out: $OUT) — instances silently dropped"
 fi
-if printf '%s' "$OUT" | grep -q "total_events=3"; then
+if grep -q "total_events=3" <<<"$OUT"; then
   ok "b2 read_instance read back all 3 events across the two partitions under firestore"
 else
   bad "b2 read_instance did not read back all events under firestore (out: $OUT)"
 fi
-if printf '%s' "$OUT" | grep -q "has_data=True" && printf '%s' "$OUT" | grep -q "view_instances=2"; then
+if grep -q "has_data=True" <<<"$OUT" && grep -q "view_instances=2" <<<"$OUT"; then
   ok "b3 cross_dev reported has_data + both instances (the /dashboard body is correct under firestore)"
 else
   bad "b3 cross_dev did not report the fleet under firestore (out: $OUT)"

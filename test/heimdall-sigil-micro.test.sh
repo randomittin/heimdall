@@ -42,8 +42,8 @@ $1
 print("::COUNT:: %d %d" % (P[0], F[0]))
 PY
 )"
-  printf '%s\n' "$out" | grep -v '^::COUNT::'
-  local line; line="$(printf '%s\n' "$out" | grep '^::COUNT::')"
+  grep -v '^::COUNT::' <<<"$out"
+  local line; line="$(grep '^::COUNT::' <<<"$out")"
   pass=$((pass + $(echo "$line" | awk '{print $2}')))
   fail=$((fail + $(echo "$line" | awk '{print $3}')))
 }
@@ -122,15 +122,15 @@ ok("ascii folds ▄ -> . (no unicode half-block)") if asc=="."*S.MICRO_W else ba
 echo "== 5) CLI: --seed X --micro [--color] [--tier] prints the 1-row mark =="
 STRIP='s/\x1b\[[0-9;]*m//g'
 OUT="$(python3 "$SIG" --seed batsy --micro --tier truecolor)"; RC=$?
-LINES="$(printf '%s' "$OUT" | grep -c '')"
+LINES="$(grep -c '' <<<"$OUT")"
 VIS="$(printf '%s' "$OUT" | sed "$STRIP")"
 { [ "$RC" -eq 0 ] && [ "$LINES" -eq 1 ]; } \
   && ok "CLI --micro prints exactly 1 line (exit $RC)" || bad "CLI --micro not 1 line (exit $RC, lines=$LINES)"
 [ "$VIS" = "▄▄▄▄" ] && ok "CLI --micro visible mark is 4 ▄ cells" || bad "CLI --micro visible mark wrong: '$VIS'"
 OUT="$(python3 "$SIG" --seed spiderman --micro --color '#2f96ff' --tier truecolor)"
-printf '%s' "$OUT" | grep -q "47;150;255" && ok "CLI --color recolors the mark" || bad "CLI --color not applied"
+grep -q "47;150;255" <<<"$OUT" && ok "CLI --color recolors the mark" || bad "CLI --color not applied"
 OUT="$(python3 "$SIG" --seed joker --micro --tier mono)"
-{ ! printf '%s' "$OUT" | grep -q "38;2"; } && ok "CLI --micro --tier mono has no 24-bit color" || bad "CLI mono leaked color"
+{ ! grep -q "38;2" <<<"$OUT"; } && ok "CLI --micro --tier mono has no 24-bit color" || bad "CLI mono leaked color"
 
 echo "== 6) ADDITIVE: the S/M/L render path is untouched by micro =="
 run_py '

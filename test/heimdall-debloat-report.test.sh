@@ -101,8 +101,8 @@ set -e
 # fabricated "N dead export(s)" count.
 C_DEAD_LINE="$(grep -F 'Dead exports' "$WORK/c.card" || true)"
 if [ "$C_RC" -eq 0 ] \
-   && printf '%s' "$C_DEAD_LINE" | grep -qE 'skipped: needs ' \
-   && ! printf '%s' "$C_DEAD_LINE" | grep -qE 'dead export\(s\)'; then
+   && grep -qE 'skipped: needs ' <<<"$C_DEAD_LINE" \
+   && ! grep -qE 'dead export\(s\)' <<<"$C_DEAD_LINE"; then
   ok "(c) absent tool honest-skips: dead-exports axis reads 'skipped: needs ...', no faked count"
 else
   bad "(c) axis did not honest-skip under minimal PATH (rc=$C_RC line='$C_DEAD_LINE')"
@@ -150,13 +150,13 @@ CLEAN_CARD="$(
   SC_DEP_STATUS=ran SC_DEP_NEW=0 \
   SC_LOC=100 CAND_TOTAL=0 REPO="$WORK/alpha" render_card
 )"
-if printf '%s' "$CLEAN_CARD" | grep -qF '0 dead export(s)' \
-   && printf '%s' "$CLEAN_CARD" | grep -qF '1.2% duplicated' \
-   && printf '%s' "$CLEAN_CARD" | grep -qF 'max cyclomatic 5' \
-   && printf '%s' "$CLEAN_CARD" | grep -qF '100 LOC, ~0 removable' \
-   && printf '%s' "$CLEAN_CARD" | grep -qF '✓' \
-   && printf '%s' "$CLEAN_CARD" | grep -qE 'VERDICT: LEAN' \
-   && ! printf '%s' "$CLEAN_CARD" | grep -qF 'skipped'; then
+if grep -qF '0 dead export(s)' <<<"$CLEAN_CARD" \
+   && grep -qF '1.2% duplicated' <<<"$CLEAN_CARD" \
+   && grep -qF 'max cyclomatic 5' <<<"$CLEAN_CARD" \
+   && grep -qF '100 LOC, ~0 removable' <<<"$CLEAN_CARD" \
+   && grep -qF '✓' <<<"$CLEAN_CARD" \
+   && grep -qE 'VERDICT: LEAN' <<<"$CLEAN_CARD" \
+   && ! grep -qF 'skipped' <<<"$CLEAN_CARD"; then
   ok "(f1) measured+clean run: real values shown, ✓ glyphs, VERDICT LEAN, zero 'skipped'"
 else
   bad "(f1) measured/clean card wrong:\n$CLEAN_CARD"
@@ -171,9 +171,9 @@ HEAVY_CARD="$(
   SC_DEP_STATUS=ran SC_DEP_NEW=0 \
   SC_LOC=100 CAND_TOTAL=0 REPO="$WORK/alpha" render_card
 )"
-if printf '%s' "$HEAVY_CARD" | grep -qF '50 dead export(s)' \
-   && printf '%s' "$HEAVY_CARD" | grep -qF '✗' \
-   && printf '%s' "$HEAVY_CARD" | grep -qE 'VERDICT: BLOATED'; then
+if grep -qF '50 dead export(s)' <<<"$HEAVY_CARD" \
+   && grep -qF '✗' <<<"$HEAVY_CARD" \
+   && grep -qE 'VERDICT: BLOATED' <<<"$HEAVY_CARD"; then
   ok "(f2) heavy dead-code axis grades ✗ and verdict BLOATED (card is not always-green)"
 else
   bad "(f2) heavy card did not grade ✗/BLOATED:\n$HEAVY_CARD"
@@ -188,9 +188,9 @@ SKIP_CARD="$(
   SC_DEP_STATUS=n/a \
   SC_LOC=100 CAND_TOTAL=0 REPO="$WORK/alpha" render_card
 )"
-if printf '%s' "$SKIP_CARD" | grep -qF 'skipped: needs ts-prune/knip/vulture' \
-   && printf '%s' "$SKIP_CARD" | grep -qE 'VERDICT: INCONCLUSIVE' \
-   && ! printf '%s' "$SKIP_CARD" | grep -qF '✓'; then
+if grep -qF 'skipped: needs ts-prune/knip/vulture' <<<"$SKIP_CARD" \
+   && grep -qE 'VERDICT: INCONCLUSIVE' <<<"$SKIP_CARD" \
+   && ! grep -qF '✓' <<<"$SKIP_CARD"; then
   ok "(f3) all-skipped run: honest 'skipped: needs <tool>' + VERDICT INCONCLUSIVE, no fake ✓"
 else
   bad "(f3) all-skipped card not honest:\n$SKIP_CARD"

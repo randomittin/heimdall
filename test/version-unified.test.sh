@@ -42,7 +42,7 @@ fi
 echo "version-unified harness  repo=$REPO  manifest=$MANIFEST_VER"
 echo "--------------------------------------------------------------------"
 
-printf '%s' "$MANIFEST_VER" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' \
+grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' <<<"$MANIFEST_VER" \
   && ok "plugin.json .version is a readable semver ($MANIFEST_VER)" \
   || { bad "plugin.json .version not a semver: '${MANIFEST_VER:-<none>}'"; echo; echo "version-unified.test.sh: $PASS passed, $FAIL failed."; exit 1; }
 

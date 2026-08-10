@@ -151,7 +151,7 @@ else
   bad "(b2) team_id/source not persisted (tid='$(tid_of "$TJ")' src='$(autosrc_of "$TJ")')"
 fi
 if [ -z "$(secret_of "$TJ")" ]; then ok "(b3) NO bearer secret written by the auto path"; else bad "(b3) auto path leaked a secret into team.json"; fi
-if printf '%s' "$OUT" | grep -qi "Initiated the team for fakeorg/init1"; then ok "(b4) printed an honest 'Initiated' line"; else bad "(b4) missing initiate line: $OUT"; fi
+if grep -qi "Initiated the team for fakeorg/init1" <<<"$OUT"; then ok "(b4) printed an honest 'Initiated' line"; else bad "(b4) missing initiate line: $OUT"; fi
 [ "$RC" -eq 0 ] && ok "(b5) auto exited 0 on success" || bad "(b5) auto exit=$RC on success"
 
 # ── (c) JOIN ─────────────────────────────────────────────────────────────────
@@ -159,7 +159,7 @@ set_reply '{"status":200,"body":{"ok":true,"team_id":"99ff88ee77dd","mode":"join
 clear_log
 R="$(mkrepo join1 1)"; TJ="$R/.heimdall/team.json"
 OUT="$(run_auto "$R" 1 auto 2>&1)"
-if [ "$(tid_of "$TJ")" = "99ff88ee77dd" ] && printf '%s' "$OUT" | grep -qi "Joined fakeorg/join1's team via GitHub"; then
+if [ "$(tid_of "$TJ")" = "99ff88ee77dd" ] && grep -qi "Joined fakeorg/join1's team via GitHub" <<<"$OUT"; then
   ok "(c) join persisted team_id + printed 'Joined … via GitHub'"
 else
   bad "(c) join wrong (tid='$(tid_of "$TJ")' out='$OUT')"
@@ -186,7 +186,7 @@ do
   R="$(mkrepo "deny-$name" 1)"; TJ="$R/.heimdall/team.json"
   OUT="$(run_auto "$R" 1 auto 2>&1)"
   # deny -> falls through to the secret ensure, so a solo team.json may exist, but with NO team_id.
-  if printf '%s' "$OUT" | grep -qiF "$needle" && [ -z "$(tid_of "$TJ")" ]; then
+  if grep -qiF "$needle" <<<"$OUT" && [ -z "$(tid_of "$TJ")" ]; then
     ok "(e/$name) printed an actionable deny message + persisted NO team_id"
   else
     bad "(e/$name) deny wrong (tid='$(tid_of "$TJ")' out='$OUT')"
@@ -229,7 +229,7 @@ fb_run "$R2" join "$FAKE" >/dev/null 2>&1
 [ "$(secret_of "$TJ2")" = "$FAKE" ] && ok "(h2) fallback: join stored the teammate secret" || bad "(h2) join did not store the secret"
 SHOW="$(fb_run "$R" show 2>/dev/null)"
 EXP_TID="$(HMD_S="$S" "$PY" -c 'import hashlib,os;print(hashlib.sha256(b"heimdall-team\x00"+os.environ["HMD_S"].encode()).hexdigest()[:32])')"
-printf '%s' "$SHOW" | grep -qF "$EXP_TID" && ok "(h3) fallback: show prints the secret-derived team_id" || bad "(h3) show missing team_id ($EXP_TID)"
+grep -qF "$EXP_TID" <<<"$SHOW" && ok "(h3) fallback: show prints the secret-derived team_id" || bad "(h3) show missing team_id ($EXP_TID)"
 
 # ── (i) COEXISTENCE — a pre-existing bearer secret survives an AUTO formation ─
 set_reply '{"status":200,"body":{"ok":true,"team_id":"coex55coex66","mode":"initiated","project":"fakeorg/coexist"}}'

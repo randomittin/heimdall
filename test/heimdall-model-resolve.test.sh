@@ -65,7 +65,7 @@ err="$("$RESOLVE" bogus 2>&1 >/dev/null)"; rc=$?
 [ "$rc" -ne 0 ] \
   && ok "unknown tier exits nonzero (rc=$rc)" \
   || bad "unknown tier exited 0 — should fail"
-printf '%s' "$err" | grep -qi 'unknown tier' \
+grep -qi 'unknown tier' <<<"$err" \
   && ok "unknown tier writes a message to stderr" \
   || bad "unknown tier produced no stderr diagnostic"
 

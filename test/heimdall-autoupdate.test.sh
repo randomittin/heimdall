@@ -167,9 +167,9 @@ rm -rf "$H"
 # ── D. STATUS (read-only) ─────────────────────────────────────────────────────────
 H="$(mk_home)"
 OUT="$(HEIMDALL_HOME="$H" HEIMDALL_LATEST_OVERRIDE="$NEWER" "$BIN" status 2>/dev/null)"
-if printf '%s' "$OUT" | grep -q "installed: $INSTALLED" \
-   && printf '%s' "$OUT" | grep -q "latest:    $NEWER" \
-   && printf '%s' "$OUT" | grep -q 'pending:   yes' \
+if grep -q "installed: $INSTALLED" <<<"$OUT" \
+   && grep -q "latest:    $NEWER" <<<"$OUT" \
+   && grep -q 'pending:   yes' <<<"$OUT" \
    && [ ! -f "$H/autoupdate.log" ]; then
   ok "D1 status prints installed/latest/pending:yes and applies NOTHING"
 else
@@ -179,7 +179,7 @@ rm -rf "$H"
 
 H="$(mk_home)"
 OUT="$(HEIMDALL_HOME="$H" HEIMDALL_LATEST_OVERRIDE="$SAME" "$BIN" status 2>/dev/null)"
-printf '%s' "$OUT" | grep -q 'pending:   no' \
+grep -q 'pending:   no' <<<"$OUT" \
   && ok "D2 status pending:no when latest==installed" \
   || bad "D2 expected pending:no: $OUT"
 rm -rf "$H"

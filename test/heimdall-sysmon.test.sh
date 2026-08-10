@@ -17,9 +17,9 @@ bad() { F=$((F+1)); echo "  FAIL $1"; }
 # 1. runs, exits 0/1/2, prints the three sections
 out="$("$BIN" 2>&1)"; rc=$?
 case "$rc" in 0|1|2) ok "runs, exit in {0,1,2} (got $rc)";; *) bad "unexpected exit $rc";; esac
-printf '%s\n' "$out" | grep -q 'disk'   && ok "report has a disk section"   || bad "no disk section"
-printf '%s\n' "$out" | grep -q 'memory' && ok "report has a memory section" || bad "no memory section"
-printf '%s\n' "$out" | grep -q 'procs'  && ok "report has a procs section"  || bad "no procs section"
+grep -q 'disk' <<<"$out"   && ok "report has a disk section"   || bad "no disk section"
+grep -q 'memory' <<<"$out" && ok "report has a memory section" || bad "no memory section"
+grep -q 'procs' <<<"$out"  && ok "report has a procs section"  || bad "no procs section"
 
 # 2. --json is valid JSON with the three sections + a severity
 js="$("$BIN" --json 2>/dev/null)"
@@ -73,7 +73,7 @@ printf '%s\n' "$rows" | "$BIN" --filter-orphans | grep -qx 301 && bad "FALSE POS
 #    instead assert the suggestion wiring: force orphan WARN=1 has no effect without real
 #    orphans, so assert the DISK suggestion path deterministically via a forced-full disk.)
 d="$(HMD_SYSMON_DISK_WARN_PCT=0 HMD_SYSMON_DISK_CRIT_PCT=0 "$BIN" 2>&1)"; drc=$?
-printf '%s\n' "$d" | grep -q 'mac-deep-clean' && ok "disk WARN → suggests mac-deep-clean" \
+grep -q 'mac-deep-clean' <<<"$d" && ok "disk WARN → suggests mac-deep-clean" \
   || bad "disk WARN did not suggest mac-deep-clean"
 [ "$drc" = 2 ] && ok "forced-full disk → exit 2 (crit)" || bad "forced-full disk exit != 2 (got $drc)"
 

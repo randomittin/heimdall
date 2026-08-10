@@ -188,14 +188,14 @@ else
   bad "gate arc wrong: g0=$d1_g0 loc=$d1_g0loc g1=$d1_g1"
 fi
 # Only THIS run bleeds in: run 1 has 2 commits (not 3); run 2's commit must not appear.
-if printf '%s' "$d1" | grep -Fq "9990001"; then
+if grep -Fq "9990001" <<<"$d1"; then
   bad "run 2's commit bled into run 1's detail (not keyed by run_id)"
 else
   ok "run isolation: a sibling run's commit does NOT appear in this run's detail"
 fi
 # The human render of a known run is not a crash + shows its outcome.
 human1="$("$REPORT" run "$R1" --home "$HOME_M")"; rc1=$?
-if [ "$rc1" -eq 0 ] && printf '%s' "$human1" | grep -Fq "passed"; then
+if [ "$rc1" -eq 0 ] && grep -Fq "passed" <<<"$human1"; then
   ok "human per-run render exits 0 and shows the outcome"
 else
   bad "human per-run render failed (rc=$rc1)"
@@ -295,7 +295,7 @@ else
 fi
 # The human aggregate render names the claude-mem evidence + exits 0.
 human_agg="$("$REPORT" --home "$HOME_M")"; rc_agg=$?
-if [ "$rc_agg" -eq 0 ] && printf '%s' "$human_agg" | grep -Fq "claude-mem"; then
+if [ "$rc_agg" -eq 0 ] && grep -Fq "claude-mem" <<<"$human_agg"; then
   ok "human aggregate render exits 0 and surfaces the claude-mem evidence"
 else
   bad "human aggregate render failed (rc=$rc_agg)"
@@ -310,14 +310,14 @@ empty_agg="$("$REPORT" --home "$HOME_EMPTY")"; rc_e=$?
 empty_json="$("$REPORT" --json --home "$HOME_EMPTY")"
 e_has="$(jget "$empty_json" has_data)"
 if [ "$rc_e" -eq 0 ] && [ "$e_has" = "false" ] \
-   && printf '%s' "$empty_agg" | grep -Fiq "no data"; then
+   && grep -Fiq "no data" <<<"$empty_agg"; then
   ok "empty store → aggregate renders honest 'no data yet' and exits 0"
 else
   bad "empty store did not degrade honestly: rc=$rc_e has_data=$e_has out='$empty_agg'"
 fi
 # A per-run query against an absent run also degrades honestly (no crash).
 empty_run="$("$REPORT" run run-nonexistent --home "$HOME_EMPTY")"; rc_er=$?
-if [ "$rc_er" -eq 0 ] && printf '%s' "$empty_run" | grep -Fiq "no data"; then
+if [ "$rc_er" -eq 0 ] && grep -Fiq "no data" <<<"$empty_run"; then
   ok "absent run → per-run renders honest 'no data' and exits 0"
 else
   bad "absent run did not degrade honestly: rc=$rc_er out='$empty_run'"
@@ -336,7 +336,7 @@ else
   ok "report authors NO 'vs raw-CC' / savings number (honesty: not its job)"
 fi
 # A measured cost prints carrying its provenance, never as a bare asserted number.
-if printf '%s' "$human1" | grep -Fq "measured"; then
+if grep -Fq "measured" <<<"$human1"; then
   ok "run 1 cost \$0.12 prints carrying its 'measured' provenance"
 else
   bad "run 1 measured cost did not carry provenance: '$human1'"
@@ -355,7 +355,7 @@ else
   bad "fabricated tokens for a token-less run: total_tokens=$nt_tokens has_tokens=$nt_has"
 fi
 notok_human="$("$REPORT" run run-notok --home "$HOME_NOTOK")"
-if printf '%s' "$notok_human" | grep -Fq "—"; then
+if grep -Fq "—" <<<"$notok_human"; then
   ok "token-less run human render shows the honest em-dash for tokens"
 else
   bad "token-less run did not render the honest em-dash: '$notok_human'"

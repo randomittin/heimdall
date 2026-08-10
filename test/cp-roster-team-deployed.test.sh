@@ -430,12 +430,12 @@ N4="$(httpstat GET "$CP_URL/roster-team?project=$PROJECT")"
 echo
 echo "#5 NO secret leaks into the body (the team_secret + a secret-looking field are never echoed)"
 R_BODY="$(printf '%s' "$R_OUT" | "$PY" -c "import json,sys;print(json.load(sys.stdin)['body'])" 2>/dev/null)"
-if printf '%s' "$R_BODY" | grep -q "$SECRET_LIKE"; then
+if grep -q "$SECRET_LIKE" <<<"$R_BODY"; then
   bad "#5a the secret-looking value reached the body (body=$R_BODY)"
 else
   ok "#5a the secret-looking field was scrubbed — NO secret in the body"
 fi
-if printf '%s' "$R_BODY" | grep -qF "$TEAM_SECRET"; then
+if grep -qF "$TEAM_SECRET" <<<"$R_BODY"; then
   bad "#5b the presented team_secret was echoed into the body (body=$R_BODY)"
 else
   ok "#5b the team_secret is NEVER echoed in the body (no-secret-by-construction)"
@@ -481,7 +481,7 @@ except Exception as e:  # noqa: BLE001
 PYEOF
 )"
 P7_STATUS="${P7%%|*}"; P7_REST="${P7#*|}"; P7_ORIGIN="${P7_REST%%|*}"; P7_AH="${P7_REST#*|}"
-if [ "$P7_STATUS" = "204" ] && [ "$P7_ORIGIN" = "*" ] && printf '%s' "$P7_AH" | grep -q "X-Heimdall-Team-Secret"; then
+if [ "$P7_STATUS" = "204" ] && [ "$P7_ORIGIN" = "*" ] && grep -q "X-Heimdall-Team-Secret" <<<"$P7_AH"; then
   ok "#7 OPTIONS /roster-team -> 204 + Allow-Origin:* + Allow-Headers carries X-Heimdall-Team-Secret"
 else
   bad "#7 the preflight did not return 204+CORS+Allow-Headers (got '$P7')"

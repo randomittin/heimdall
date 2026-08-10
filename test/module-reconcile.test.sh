@@ -162,7 +162,7 @@ grep -q 'reconcile: headroom would-acquire.*consent waived' "$H/autoupdate.log" 
   || bad "a receipt appeared under HEIMDALL_MODULE_RECONCILE_DRYRUN=1"
 if grep -q 'reconcile: headroom defer-consent' "$H/autoupdate.log" 2>/dev/null; then
   bad "headroom is still deferred — the updater is reading the CLASS contract and ignoring the manifest waiver"
-elif printf '%s' "$OUT" | grep -q 'will never install it for you'; then
+elif grep -q 'will never install it for you' <<<"$OUT"; then
   bad "update still tells the operator it will never install a module it now acquires"
 else
   ok "the old defer-consent decision and its contradictory sentence are both gone"
@@ -209,7 +209,7 @@ OUT="$(env HOME="$H" HEIMDALL_HOME="$H" HMD_MODULES_REGISTRY="$REG" HMD_MODULES_
 grep -q 'would-acquire' "$H/autoupdate.log" 2>/dev/null \
   && bad "HEIMDALL_NO_MODULES=1 was ignored — the updater selected a module anyway" \
   || ok "HEIMDALL_NO_MODULES=1 suppresses acquisition entirely"
-printf '%s' "$OUT" | grep -q 'codecmod' \
+grep -q 'codecmod' <<<"$OUT" \
   && bad "an opted-out module was still advertised (a nag is a soft revert)" \
   || ok "an opted-out module is not even mentioned"
 [ ! -f "$S/codecmod/receipt.json" ] && ok "no receipt was created under the env opt-out" \
@@ -331,13 +331,13 @@ ST="$(env -i PATH="$NOUV_PATH" HOME="$H" HEIMDALL_HOME="$H" \
         HMD_MODULES_REGISTRY="$REPO/modules" HMD_MODULES_STATE="$S" \
         HEIMDALL_LATEST_OVERRIDE="$VER" HEIMDALL_INSTALLED_OVERRIDE="$VER" \
         HMD_PREFLIGHT_NO_NET=1 bash "$BIN" status 2>&1)"
-printf '%s' "$ST" | grep -q 'headroom' \
+grep -q 'headroom' <<<"$ST" \
   && ok "status lists the absent default module" \
   || bad "status does not mention the module at all: $ST"
-printf '%s' "$ST" | grep -qi 'uv' \
+grep -qi 'uv' <<<"$ST" \
   && ok "status NAMES uv as the blocking reason" \
   || bad "status does not name uv as the reason: $ST"
-printf '%s' "$ST" | grep -q 'astral.sh/uv/install.sh' \
+grep -q 'astral.sh/uv/install.sh' <<<"$ST" \
   && ok "status prints the exact remedy command for uv" \
   || bad "status names the blocker but not the fix: $ST"
 

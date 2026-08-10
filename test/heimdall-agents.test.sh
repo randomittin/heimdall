@@ -231,7 +231,7 @@ DEADW="$(HMD_AGENT_REAPED_FILE="$WORK/reaped-dead.json" HMD_AGENT_LIVE_SLUGS="" 
 # that 141 as the assertion's result — a false RED that has nothing to do with
 # the output's content.
 LIST_TXT="$("$AGENTS" list)"
-printf '%s' "$LIST_TXT" | grep -q "termprobe" && ok "DEFECT-2: plain-text list shows termprobe" \
+grep -q "termprobe" <<<"$LIST_TXT" && ok "DEFECT-2: plain-text list shows termprobe" \
   || bad "DEFECT-2 REGRESSION: plain-text list omits termprobe"
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -241,10 +241,10 @@ printf '%s' "$LIST_TXT" | grep -q "termprobe" && ok "DEFECT-2: plain-text list s
 ORPH_OUT="$("$AGENTS" orphans 2>&1)"; ORPH_RC=$?
 [ "$ORPH_RC" = "0" ] && ok "DEFECT-3: orphans exits 0" \
   || bad "DEFECT-3 REGRESSION: orphans exit $ORPH_RC (output: $(printf '%s' "$ORPH_OUT" | head -1))"
-printf '%s' "$ORPH_OUT" | grep -qi "unknown subcommand" \
+grep -qi "unknown subcommand" <<<"$ORPH_OUT" \
   && bad "DEFECT-3 REGRESSION: orphans is not a known subcommand" \
   || ok "DEFECT-3: orphans is a recognised subcommand"
-printf '%s' "$ORPH_OUT" | grep -q "termprobe" && ok "DEFECT-3: orphans surfaces termprobe" \
+grep -q "termprobe" <<<"$ORPH_OUT" && ok "DEFECT-3: orphans surfaces termprobe" \
   || bad "DEFECT-3: orphans omitted termprobe"
 ORPH_J="$("$AGENTS" orphans --json 2>/dev/null)"
 [ "$(printf '%s' "$ORPH_J" | jq -r 'type')" = "array" ] && ok "DEFECT-3: orphans --json is an array" \
@@ -294,14 +294,14 @@ RN="$(jq 'keys|length' "$REAPED" 2>/dev/null)"
 # opposite lie. A test that merely string-matched whatever the tool emits would
 # catch neither, so every assertion below names the property, not the phrasing.
 SW="$("$AGENTS" sweep 2>&1)"
-printf '%s' "$SW" | grep -q "ve-server"      && ok "sweep names the parked agent"        || bad "sweep omitted parked agent name"
-printf '%s' "$SW" | grep -q "TaskStop"       && ok "sweep names TaskStop as the programmatic remedy" || bad "sweep failed to name TaskStop"
-printf '%s' "$SW" | grep -qi "restart"       && ok "sweep still offers session restart as fallback"  || bad "sweep dropped the restart fallback"
-printf '%s' "$SW" | grep -qiE 'only a restart|restart only|restart-only' \
+grep -q "ve-server" <<<"$SW"      && ok "sweep names the parked agent"        || bad "sweep omitted parked agent name"
+grep -q "TaskStop" <<<"$SW"       && ok "sweep names TaskStop as the programmatic remedy" || bad "sweep failed to name TaskStop"
+grep -qi "restart" <<<"$SW"       && ok "sweep still offers session restart as fallback"  || bad "sweep dropped the restart fallback"
+grep -qiE 'only a restart|restart only|restart-only' <<<"$SW" \
   && bad "sweep STILL claims restart is the only remedy" || ok "sweep no longer claims restart-only"
-printf '%s' "$SW" | grep -qi 'not yet verified' \
+grep -qi 'not yet verified' <<<"$SW" \
   && ok "sweep flags TaskStop as documented-not-proven" || bad "sweep overstates TaskStop as proven"
-printf '%s' "$SW" | grep -qiE 'killed the|terminated the' && bad "sweep FALSELY claims a kill" || ok "sweep never claims a kill it did not perform"
+grep -qiE 'killed the|terminated the' <<<"$SW" && bad "sweep FALSELY claims a kill" || ok "sweep never claims a kill it did not perform"
 SWJ="$("$AGENTS" sweep --json 2>/dev/null)"
 # CONTRACT: clearable_by is a LIST of mechanism ids, so a consumer branches on
 # membership instead of parsing a sentence. The old scalar "session restart only"
@@ -339,7 +339,7 @@ C3="$("$AGENTS" count)"
 
 # ── (10) explicit opt-out ───────────────────────────────────────────────────
 OUT="$(HMD_AGENT_NO_SWEEP=1 "$AGENTS" sweep 2>&1)"
-printf '%s' "$OUT" | grep -q "disabled" && ok "HMD_AGENT_NO_SWEEP=1 disables sweep" || bad "opt-out not honoured"
+grep -q "disabled" <<<"$OUT" && ok "HMD_AGENT_NO_SWEEP=1 disables sweep" || bad "opt-out not honoured"
 
 # ── (11) World B: owning session process is GONE ⇒ provably dead ⇒ orphaned ──
 REAPED_B="$WORK/reaped-b.json"
@@ -372,7 +372,7 @@ LP="$(HMD_AGENT_PROJECTS_DIR="$LIVEPROBE" HMD_AGENT_REAPED_FILE="$WORK/reaped-lp
 CZERO="$(HMD_AGENT_TASKDIR="$WORK/does-not-exist" HMD_AGENT_SUBAGENTS_DIR="$WORK/no-subagents" "$AGENTS" count)"
 [ "$CZERO" = "0" ] && ok "absent task dir → count 0 (fail-closed)" || bad "absent task dir count expected 0, got '$CZERO'"
 LZERO="$(HMD_AGENT_TASKDIR="$WORK/does-not-exist" HMD_AGENT_SUBAGENTS_DIR="$WORK/no-subagents" "$AGENTS" list)"
-printf '%s' "$LZERO" | grep -q "no tracked subagents" && ok "absent task dir → honest empty list" || bad "absent task dir list wrong"
+grep -q "no tracked subagents" <<<"$LZERO" && ok "absent task dir → honest empty list" || bad "absent task dir list wrong"
 SZERO="$(HMD_AGENT_TASKDIR="$WORK/does-not-exist" HMD_AGENT_SUBAGENTS_DIR="$WORK/no-subagents" "$AGENTS" sweep 2>&1)"; SZ_RC=$?
 [ "$SZ_RC" = "0" ] && ok "sweep exits 0 on absent task dir" || bad "sweep exit $SZ_RC on absent task dir"
 OZERO="$(HMD_AGENT_TASKDIR="$WORK/does-not-exist" HMD_AGENT_SUBAGENTS_DIR="$WORK/no-subagents" "$AGENTS" orphans 2>&1)"; OZ_RC=$?

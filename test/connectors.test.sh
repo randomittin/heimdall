@@ -116,7 +116,7 @@ PY
 )"
 RC=$?
 set -e
-if [ "$RC" -eq 0 ] && printf '%s' "$SEAM" | grep -q "SEAM-OK"; then
+if [ "$RC" -eq 0 ] && grep -q "SEAM-OK" <<<"$SEAM"; then
   ok "(a) seam = ABC + registry (register/get/available/active + fail-loud get); 3 adapters self-register"
 else
   bad "(a) seam shape wrong"; printf '%s\n' "$SEAM" | sed 's/^/    /'
@@ -220,7 +220,7 @@ PY
 )"
 RC=$?
 set -e
-if [ "$RC" -eq 0 ] && printf '%s' "$UNIFORM" | grep -q "UNIFORM-OK"; then
+if [ "$RC" -eq 0 ] && grep -q "UNIFORM-OK" <<<"$UNIFORM"; then
   ok "(b) 3 connectors -> uniform issue: all 7 fields, source-prefixed id, honest severity (None when absent)"
 else
   bad "(b) uniform issue mapping failed"; printf '%s\n' "$UNIFORM" | sed 's/^/    /'
@@ -252,7 +252,7 @@ set -e
 # the seam file must be byte-identical (no working-tree edit) — 4th adapter is
 # a NEW module + register() line, never an edit to the registry/ABC.
 SEAM_DIFF="$(cd "$ROOT" && git diff --name-only -- bin/lib/connectors/__init__.py 2>/dev/null || true)"
-if [ "$RC" -eq 0 ] && printf '%s' "$PLUG" | grep -q "PLUG-OK" && [ -z "$SEAM_DIFF" ]; then
+if [ "$RC" -eq 0 ] && grep -q "PLUG-OK" <<<"$PLUG" && [ -z "$SEAM_DIFF" ]; then
   ok "(c) 4th dummy adapter registers + fetches with ZERO edits to __init__.py / ABC"
 else
   bad "(c) pluggability failed (seam_diff='$SEAM_DIFF')"; printf '%s\n' "$PLUG" | sed 's/^/    /'
@@ -298,7 +298,7 @@ PY
 )"
 RC=$?
 set -e
-if [ "$RC" -eq 0 ] && printf '%s' "$DEGRADE" | grep -q "DEGRADE-OK"; then
+if [ "$RC" -eq 0 ] && grep -q "DEGRADE-OK" <<<"$DEGRADE"; then
   ok "(d) absent creds -> inactive + fetch [] + writeback inactive; active() inert/degrades — no crash"
 else
   bad "(d) lazy-degrade failed"; printf '%s\n' "$DEGRADE" | sed 's/^/    /'

@@ -220,7 +220,7 @@ OPEN_OUT="$(open_pr_default "$PASS_RECORD")"
 unset GITHUB_TOKEN
 
 BRANCH="$(printf '%s' "$OPEN_OUT" | jq -r '.branch')"
-if printf '%s' "$BRANCH" | grep -qE '^heimdall/'; then
+if grep -qE '^heimdall/' <<<"$BRANCH"; then
   ok "PR opened from a heimdall/* branch ($BRANCH)"
 else
   bad "PR branch is NOT heimdall/* (got: $BRANCH)"
@@ -341,15 +341,15 @@ else
 fi
 RECEIPT_FILE="$(printf '%s' "$REC_OUT" | jq -r '.receipt_file')"
 RBODY="$(cat "$RECEIPT_FILE")"
-if printf '%s' "$RBODY" | grep -qF "$EVIDENCE_CMD" \
-   && printf '%s' "$RBODY" | grep -qiE 'all_passed.*true' \
-   && printf '%s' "$RBODY" | grep -qF 'issue-loop:github:acme/widget#7'; then
+if grep -qF "$EVIDENCE_CMD" <<<"$RBODY" \
+   && grep -qiE 'all_passed.*true' <<<"$RBODY" \
+   && grep -qF 'issue-loop:github:acme/widget#7' <<<"$RBODY"; then
   ok "receipt carries the runnable evidence cmd + all_passed verdict + attestation ref"
 else
   bad "receipt missing the evidence/verdict/attestation reference"
 fi
 # the receipt table shows the recorded real exit code (0), not a self-report.
-if printf '%s' "$RBODY" | grep -qE '\| +1 +\| `'"$EVIDENCE_CMD"'` +\| +0 +\| +yes +\|'; then
+if grep -qE '\| +1 +\| `' <<<"$RBODY""$EVIDENCE_CMD"'` +\| +0 +\| +yes +\|'; then
   ok "receipt renders the RECORDED REAL EXIT (exit 0, ok=yes) — proof, not a claim"
 else
   bad "receipt did not render the recorded real exit row"
@@ -372,7 +372,7 @@ for f in "$GH_ARGV_LOG" "$GH_TOKEN_SEEN" "$GH_GHTOKEN_SEEN" "$RECEIPT_FILE" "$PR
   fi
 done
 # the driver stdout JSON (open_pr + post_receipt results) must not carry the token.
-if printf '%s' "$OPEN_OUT" | grep -qF "$SENTINEL_TOKEN" || printf '%s' "$REC_OUT" | grep -qF "$SENTINEL_TOKEN"; then
+if grep -qF "$SENTINEL_TOKEN" <<<"$OPEN_OUT" || grep -qF "$SENTINEL_TOKEN" <<<"$REC_OUT"; then
   bad "SENTINEL bot token LEAKED into a driver's stdout result JSON"
   LEAK=1
 fi

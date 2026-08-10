@@ -260,7 +260,7 @@ if printf '%s' "$PIPED" | grep -q $'\x1b'; then
 else
   ok "pipe mode is ANSI-clean (no escape codes)"
 fi
-printf '%s' "$PIPED" | grep -q "HEIMDALL RUN RECEIPT" && ok "piped receipt still readable (plain text)" \
+grep -q "HEIMDALL RUN RECEIPT" <<<"$PIPED" && ok "piped receipt still readable (plain text)" \
   || bad "piped receipt lost its content"
 
 # ── 6. NON_VERIFIED — the THIRD state: "could not verify" is NOT a pass ───────

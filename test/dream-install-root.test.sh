@@ -234,7 +234,7 @@ for prot in Downloads Documents Desktop; do
   fi
 done
 
-if printf '%s' "$GUARD_OUT" | grep -qi 'protected'; then
+if grep -qi 'protected' <<<"$GUARD_OUT"; then
   ok "(3) the refusal NAMES the protected folder as the cause"
 else
   bad "(3) the refusal does not explain itself: $(printf '%s' "$GUARD_OUT" | head -2)"

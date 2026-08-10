@@ -171,18 +171,18 @@ OUT="$(hmd add shipped < /dev/null 2>&1)"; RC=$?
 [ "$RC" -eq 0 ] \
   && ok "a waived module adds non-interactively with NO --yes (exit 0)" \
   || bad "waived add still failed (exit $RC)"
-printf '%s' "$OUT" | grep -qF 'Synthetic disclosure for shipped.' \
+grep -qF 'Synthetic disclosure for shipped.' <<<"$OUT" \
   && ok "the disclosure text is PRINTED — told, not asked" \
   || bad "the disclosure was never shown"
-printf '%s' "$OUT" | grep -qi 'Install it? \[y/N\]' \
+grep -qi 'Install it? \[y/N\]' <<<"$OUT" \
   && bad "it still prompted" || ok "no [y/N] prompt was issued"
-printf '%s' "$OUT" | grep -qi 'waived' \
+grep -qi 'waived' <<<"$OUT" \
   && ok "the output says out loud that consent was waived" \
   || bad "the waiver happened silently — a reader cannot tell they were not asked"
-printf '%s' "$OUT" | grep -qF 'synthetic fixture waiver for the acceptance test' \
+grep -qF 'synthetic fixture waiver for the acceptance test' <<<"$OUT" \
   && ok "the REASON is printed at add time" || bad "the reason was not shown"
 # The pipeline still ran in order, consent included as a real step.
-printf '%s' "$OUT" | grep -q '\[4/7\] consent' \
+grep -q '\[4/7\] consent' <<<"$OUT" \
   && ok "step 4 still RUNS — the waiver answers it, it does not delete it" \
   || bad "the consent step vanished from the pipeline"
 
@@ -193,7 +193,7 @@ OUT4="$(hmd add gated < /dev/null 2>&1)"; RC4=$?
 [ "$RC4" -ne 0 ] \
   && ok "an un-waived traffic-proxy module is REFUSED without consent (exit $RC4)" \
   || bad "an un-waived traffic-proxy module installed with nobody asked — the waiver leaked to the class"
-printf '%s' "$OUT4" | grep -qi 'consent is required' \
+grep -qi 'consent is required' <<<"$OUT4" \
   && ok "it says consent is required" || bad "no consent-required message"
 [ ! -f "$STATE/gated/receipt.json" ] \
   && ok "nothing was installed for the un-waived module" || bad "the un-waived module left a receipt"
@@ -243,10 +243,10 @@ printf '%s' "$J" | jq -e . >/dev/null 2>&1 \
 echo
 echo "W6 — status renders the waiver, installed and not-installed"
 S="$(hmd status shipped 2>&1)"
-printf '%s' "$S" | grep -qi 'waived' \
+grep -qi 'waived' <<<"$S" \
   && ok "status on an INSTALLED waived module shows the waiver" \
   || bad "status hides the waiver on an installed module"
-printf '%s' "$S" | grep -qF 'synthetic fixture waiver for the acceptance test' \
+grep -qF 'synthetic fixture waiver for the acceptance test' <<<"$S" \
   && ok "status shows the REASON" || bad "status shows no reason"
 SJ="$(hmd --json status shipped 2>/dev/null)"
 [ "$(printf '%s' "$SJ" | jq -r '.receipt.consent.waived')" = "true" ] \
@@ -255,7 +255,7 @@ hmd remove shipped >/dev/null 2>&1
 # NOT-INSTALLED is the state a reader is actually in when they go looking, so the
 # waiver has to be visible there too or it is only ever visible after the fact.
 S2="$(hmd status shipped 2>&1)"
-printf '%s' "$S2" | grep -qi 'waived' \
+grep -qi 'waived' <<<"$S2" \
   && ok "status on a NOT-INSTALLED waived module still discloses the waiver" \
   || bad "the waiver is invisible until after it has already been applied"
 SJ2="$(hmd --json status shipped 2>/dev/null)"
@@ -269,7 +269,7 @@ mkproxy mute '{"consent_waived":true}'
 OUT7="$(hmd add mute < /dev/null 2>&1)"; RC7=$?
 [ "$RC7" -ne 0 ] && ok "a waiver with no reason is refused" \
                  || bad "a silent waiver was accepted — that is the indefensible one"
-printf '%s' "$OUT7" | grep -qi 'consent_waived_reason' \
+grep -qi 'consent_waived_reason' <<<"$OUT7" \
   && ok "the refusal names the missing field" || bad "the refusal does not say what is missing"
 [ ! -f "$STATE/mute/receipt.json" ] && ok "the refused waiver installed nothing" || bad "left a receipt"
 
@@ -300,7 +300,7 @@ OUT8="$(hmd add shippedbad < /dev/null 2>&1)"; RC8=$?
 [ "$RC8" -ne 0 ] \
   && ok "a WAIVED module that fails a class invariant is still REFUSED" \
   || bad "the waiver skipped the invariants — consent and invariants got conflated"
-printf '%s' "$OUT8" | grep -q 'FAILED INVARIANT' \
+grep -q 'FAILED INVARIANT' <<<"$OUT8" \
   && ok "the refusal names the failed invariant" || bad "no invariant failure reported"
 [ "$(tree_sum "$STATE")" = "$PRE8" ] \
   && ok "the failed waived module rolled back byte-identically" || bad "left residue"
@@ -312,7 +312,7 @@ mkproxy shippedliar '{"consent_waived":true,
                       "invariants":{"gates-read-raw":{"command":"printf 25 passed, 0 failed","expect":"25 passed, 0 failed"}}}'
 hmd add shippedliar < /dev/null >/dev/null 2>&1
 GRR="$(jq -r '.[] | select(.id == "gates-read-raw") | .command' "$STATE/shippedliar/invariants.json" 2>/dev/null)"
-printf '%s' "$GRR" | grep -q 'test/gate-judgment-uncompressed.test.sh' \
+grep -q 'test/gate-judgment-uncompressed.test.sh' <<<"$GRR" \
   && ok "a waived module CANNOT redefine the class-owned judgment falsifier" \
   || bad "the manifest overrode a class-owned suite check (ran: $GRR)"
 [ "$(jq -r '.[] | select(.id == "gates-read-raw") | .source' "$STATE/shippedliar/invariants.json" 2>/dev/null)" = "class-contract" ] \
@@ -327,13 +327,13 @@ REAL_PRE="$(tree_sum "$RSTATE")"
 OUT9="$("$MODS" --registry "$REAL_REG" --state "$RSTATE" add headroom < /dev/null 2>&1)"; RC9=$?
 [ "$RC9" -eq 0 ] && ok "hmd modules add headroom SUCCEEDS non-interactively (exit 0)" \
                  || bad "real headroom add failed (exit $RC9)"
-printf '%s' "$OUT9" | grep -q '\[4/7\] consent' \
+grep -q '\[4/7\] consent' <<<"$OUT9" \
   && ok "it reaches step 4" || bad "never reached the consent step"
-printf '%s' "$OUT9" | grep -qi 'Install it? \[y/N\]' \
+grep -qi 'Install it? \[y/N\]' <<<"$OUT9" \
   && bad "the real add still prompted" || ok "the real add did NOT prompt"
-printf '%s' "$OUT9" | grep -qF 'Headroom is a local context-compression proxy.' \
+grep -qF 'Headroom is a local context-compression proxy.' <<<"$OUT9" \
   && ok "the real disclosure is printed in full" || bad "the real disclosure was not shown"
-printf '%s' "$OUT9" | grep -q '\[7/7\] class invariants' \
+grep -q '\[7/7\] class invariants' <<<"$OUT9" \
   && ok "it reaches step 7 — the waiver did not short-circuit the pipeline" \
   || bad "never reached the invariants"
 # Both classes' invariants must actually have executed, waiver or no waiver.
@@ -356,7 +356,7 @@ jq -e 'any(.[]; .id == "gates-read-raw" and .source == "class-contract")' "$INV"
 [ "$(jq -r '.consent.waived' "$RSTATE/headroom/receipt.json" 2>/dev/null)" = "true" ] \
   && ok "the real receipt records the waiver" || bad "the real receipt hides the waiver"
 RS="$("$MODS" --registry "$REAL_REG" --state "$RSTATE" status headroom 2>&1)"
-printf '%s' "$RS" | grep -qi 'waived' \
+grep -qi 'waived' <<<"$RS" \
   && ok "hmd modules status headroom shows the waiver" || bad "real status hides the waiver"
 
 echo
@@ -380,7 +380,7 @@ OUT11="$("$MODS" --registry "$FALSIFY_REG" --state "$TMP/fstate/modules" add hea
 [ "$RC11" -ne 0 ] \
   && ok "with the waiver REMOVED, the identical add is GATED again (exit $RC11)" \
   || bad "the add succeeded without the waiver — the waiver is not the thing letting it through"
-printf '%s' "$OUT11" | grep -qi 'consent is required' \
+grep -qi 'consent is required' <<<"$OUT11" \
   && ok "the un-waived headroom refusal names consent as the reason" \
   || bad "refused for some other reason — the RED/GREEN pair does not isolate consent"
 [ ! -f "$TMP/fstate/modules/headroom/receipt.json" ] \

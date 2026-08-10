@@ -159,7 +159,7 @@ decision "$H" headroom | grep -q 'would-acquire' \
 decision "$H" headroom | grep -q 'consent waived' \
   && ok "the log names the WAIVER as the reason — unprompted is not undisclosed" \
   || bad "the acquire decision does not record the waiver: $(decision "$H" headroom)"
-printf '%s' "$OUT" | grep -q 'will never install it for you' \
+grep -q 'will never install it for you' <<<"$OUT" \
   && bad "update still claims it will never install a module it now acquires" \
   || ok "the sentence that contradicted \`hmd modules add\` is gone"
 [ ! -f "$S/headroom/receipt.json" ] \
@@ -196,7 +196,7 @@ done
 [ "$CLASS_WAIVERS" -eq 0 ] \
   && ok "no class contract carries a waiver of its own (checked all $(ls "$REPO"/modules/_classes/*.json | wc -l | tr -d ' '))" \
   || bad "$CLASS_WAIVERS class contract(s) carry consent_waived — the waiver escaped the module"
-printf '%s' "$OUT" | grep -q 'proxyplain' \
+grep -q 'proxyplain' <<<"$OUT" \
   && ok "the deferred module is still NAMED to the operator with its command" \
   || bad "the un-waived module was silently skipped: $OUT"
 
@@ -209,29 +209,29 @@ STUB="$TMPROOT/stub-ok"; mk_stub "$STUB" 0 "$ARGV"
 OUT="$(run_acquire "$BIN" "$H" "$REG" "$S" "$STUB")"
 RC=$?
 [ "$RC" -eq 0 ] && ok "update exits 0 on the acquire path" || bad "update exited $RC"
-printf '%s' "$OUT" | grep -q 'WAIVED in its own manifest' \
+grep -q 'WAIVED in its own manifest' <<<"$OUT" \
   && ok "the operator is told the consent was waived, and where" \
   || bad "the acquisition never says consent was waived: $OUT"
-printf '%s' "$OUT" | grep -q 'SYNTHETIC-DISCLOSURE-BODY' \
+grep -q 'SYNTHETIC-DISCLOSURE-BODY' <<<"$OUT" \
   && ok "the module's own consent_text is printed — the disclosure itself, not a summary" \
   || bad "the disclosure text was never shown: $OUT"
-printf '%s' "$OUT" | grep -q 'synthetic per-module waiver' \
+grep -q 'synthetic per-module waiver' <<<"$OUT" \
   && ok "the REASON for the waiver is printed" \
   || bad "the waiver reason was not shown: $OUT"
-printf '%s' "$OUT" | grep -q 'every other module of that class still requires your explicit consent' \
+grep -q 'every other module of that class still requires your explicit consent' <<<"$OUT" \
   && ok "the per-module SCOPE of the waiver is stated on screen" \
   || bad "the operator is not told the waiver covers this module alone: $OUT"
-printf '%s' "$OUT" | grep -q 'hmd modules optout proxywaived' \
+grep -q 'hmd modules optout proxywaived' <<<"$OUT" \
   && ok "the way to decline it is printed alongside" \
   || bad "no decline path was offered: $OUT"
-D_LINE="$(printf '%s' "$OUT" | grep -n 'SYNTHETIC-DISCLOSURE-BODY' | head -1 | cut -d: -f1)"
-A_LINE="$(printf '%s' "$OUT" | grep -n 'installed\.' | head -1 | cut -d: -f1)"
+D_LINE="$(grep -n 'SYNTHETIC-DISCLOSURE-BODY' <<<"$OUT" | head -1 | cut -d: -f1)"
+A_LINE="$(grep -n 'installed\.' <<<"$OUT" | head -1 | cut -d: -f1)"
 if [ -n "$D_LINE" ] && [ -n "$A_LINE" ] && [ "$D_LINE" -lt "$A_LINE" ]; then
   ok "the disclosure is printed BEFORE the add completes (disclosure=$D_LINE result=$A_LINE)"
 else
   bad "the disclosure does not precede the acquisition result (disclosure=$D_LINE result=$A_LINE)"
 fi
-printf '%s' "$OUT" | grep -q '\[y/N\]' \
+grep -q '\[y/N\]' <<<"$OUT" \
   && bad "the updater issued a prompt — consent belongs in heimdall-modules" \
   || ok "no [y/N] prompt was issued from an unattended path"
 # The QUIET path is silent to the terminal by design, so the disclosure has to land
@@ -261,7 +261,7 @@ OUT="$(env HOME="$H" HEIMDALL_HOME="$H" HMD_MODULES_REGISTRY="$REG" HMD_MODULES_
 grep -q 'would-acquire' "$H/autoupdate.log" 2>/dev/null \
   && bad "HEIMDALL_NO_MODULES=1 was ignored for a waived module" \
   || ok "HEIMDALL_NO_MODULES=1 suppresses a WAIVED module"
-printf '%s' "$OUT" | grep -q 'proxywaived' \
+grep -q 'proxywaived' <<<"$OUT" \
   && bad "an opted-out waived module was still advertised (a nag is a soft revert)" \
   || ok "the opted-out waived module is not even mentioned"
 [ ! -f "$S/proxywaived/receipt.json" ] \
@@ -278,7 +278,7 @@ grep -q 'would-acquire' "$H/autoupdate.log" 2>/dev/null \
 grep -q 'reconcile: proxywaived skip-optout' "$H/autoupdate.log" 2>/dev/null \
   && ok "the opt-out decision is recorded as skip-optout" \
   || bad "no skip-optout recorded: $(cat "$H/autoupdate.log" 2>/dev/null)"
-printf '%s' "$OUT" | grep -q 'proxywaived' \
+grep -q 'proxywaived' <<<"$OUT" \
   && bad "the file-opted-out waived module was still advertised" \
   || ok "the file opt-out is silent too"
 
@@ -295,10 +295,10 @@ RC=$?
 [ ! -f "$S/proxywaived/receipt.json" ] \
   && ok "no receipt was written for the failed acquisition" \
   || bad "a receipt appeared despite the acquisition failing"
-printf '%s' "$OUT" | grep -q 'could not be installed right now' \
+grep -q 'could not be installed right now' <<<"$OUT" \
   && ok "the failure is SAID, not swallowed" \
   || bad "the failed acquisition was silent: $OUT"
-printf '%s' "$OUT" | grep -q '"proxywaived" installed\.' \
+grep -q '"proxywaived" installed\.' <<<"$OUT" \
   && bad "a false \"installed\" was printed over a failed acquisition" \
   || ok "no \"installed.\" claim stands over the failure"
 grep -q 'reconcile: proxywaived acquire-failed' "$H/autoupdate.log" 2>/dev/null \
@@ -308,7 +308,7 @@ ST="$(env -u HEIMDALL_NO_MODULES HOME="$H" HEIMDALL_HOME="$H" \
         HMD_MODULES_REGISTRY="$REG" HMD_MODULES_STATE="$S" \
         HEIMDALL_LATEST_OVERRIDE="$VER" HEIMDALL_INSTALLED_OVERRIDE="$VER" \
         HMD_PREFLIGHT_NO_NET=1 "$BIN" status 2>&1)"
-printf '%s' "$ST" | grep -q 'proxywaived *absent' \
+grep -q 'proxywaived *absent' <<<"$ST" \
   && ok "status reports the module ABSENT afterwards" \
   || bad "status does not report the failed module as absent: $ST"
 
@@ -422,7 +422,7 @@ else
   ARGV="$TMPROOT/argv-f4.log"; : > "$ARGV"
   STUB="$TMPROOT/stub-f4"; mk_stub "$STUB" 0 "$ARGV"
   OUT="$(run_acquire "$MUTANT" "$H" "$REG" "$S" "$STUB")"
-  printf '%s' "$OUT" | grep -q 'SYNTHETIC-DISCLOSURE-BODY' \
+  grep -q 'SYNTHETIC-DISCLOSURE-BODY' <<<"$OUT" \
     && bad "F4 mutant still disclosed — W3 may be passing vacuously" \
     || ok "F4 no disclosure call → the waived module is acquired UNTOLD → W3 can go RED"
 fi

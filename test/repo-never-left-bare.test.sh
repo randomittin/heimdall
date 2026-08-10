@@ -90,7 +90,7 @@ fi
 # absent, or is an unguarded variable reference.
 # ════════════════════════════════════════════════════════════════════════
 is_blank() {
-  ! printf '%s\n' "$1" | grep -qE '[^[:space:]]'
+  ! grep -qE '[^[:space:]]' <<<"$1"
 }
 
 # scan_file PATH — prints one line per finding, tab-separated:
@@ -110,7 +110,7 @@ scan_file() {
     lineno="${rec%%:*}"
     [ -n "$lineno" ] || continue
     line="$(awk -v n="$lineno" 'NR==n{print; exit}' "$path")"
-    if printf '%s\n' "$line" | grep -qE '^[[:space:]]*#'; then continue; fi
+    if grep -qE '^[[:space:]]*#' <<<"$line"; then continue; fi
     lastfield="$(printf '%s\n' "$line" | awk '{print $NF}')"
     case "$lastfield" in
       --bare|-q|--quiet|init|"")
@@ -208,14 +208,14 @@ git init --bare -q "/tmp/some/literal/path.git"
 FIXEOF
 
 BAD1_OUT="$(scan_file "$FIXDIR/bad-unguarded.sh")"
-if printf '%s\n' "$BAD1_OUT" | grep -q '^UNGUARDED'; then
+if grep -q '^UNGUARDED' <<<"$BAD1_OUT"; then
   ok "mutation proof: scanner FLAGS an unguarded variable target (bad-unguarded.sh)"
 else
   bad "mutation proof: scanner MISSED an unguarded variable target (bad-unguarded.sh) — scanner is broken"
 fi
 
 BAD2_OUT="$(scan_file "$FIXDIR/bad-absent.sh")"
-if printf '%s\n' "$BAD2_OUT" | grep -q '^ABSENT'; then
+if grep -q '^ABSENT' <<<"$BAD2_OUT"; then
   ok "mutation proof: scanner FLAGS an absent target argument (bad-absent.sh)"
 else
   bad "mutation proof: scanner MISSED an absent target argument (bad-absent.sh) — scanner is broken"

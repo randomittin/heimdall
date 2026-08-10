@@ -248,7 +248,7 @@ fi
 [ "$EPHEM_RC" = "5" ] \
   && ok "(6) linked worktree refusal exits 5 — distinct from sandboxed (4) and failure (3)" \
   || bad "(6) wrong exit code for a worktree checkout: $EPHEM_RC (want 5)"
-printf '%s' "$EPHEM_OUT" | grep -q 'ephemeral checkout' \
+grep -q 'ephemeral checkout' <<<"$EPHEM_OUT" \
   && ok "(6) refusal names the reason (ephemeral checkout), not a generic failure" \
   || bad "(6) refusal wording missing: $(printf '%s' "$EPHEM_OUT" | tr '\n' ' ' | cut -c1-200)"
 

@@ -172,10 +172,10 @@ err="$(cat "$TMP/err")"
 [ -z "$out" ] \
   && ok "fable refusal writes NOTHING to stdout (no silent downgrade)" \
   || bad "fable refusal printed '$out' on stdout — a caller would use it"
-printf '%s' "$err" | grep -qi 'zdr' \
+grep -qi 'zdr' <<<"$err" \
   && ok "fable refusal names ZDR on stderr" \
   || bad "fable refusal stderr does not mention ZDR: '$err'"
-printf '%s' "$err" | grep -q 'allow_non_zdr_models' \
+grep -q 'allow_non_zdr_models' <<<"$err" \
   && ok "fable refusal names the policy key that would permit it" \
   || bad "fable refusal does not name allow_non_zdr_models: '$err'"
 

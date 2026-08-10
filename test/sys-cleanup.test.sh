@@ -117,7 +117,7 @@ mkdir -p "$WORK/home-empty"
 out="$(run_clean report 2>&1)"; rc=$?
 case "$rc" in 0|1|2) ok "report runs, exit in {0,1,2} (got $rc)";; *) bad "report unexpected exit $rc";; esac
 for sec in memory procs disk reclaim; do
-  printf '%s\n' "$out" | grep -q "$sec" && ok "report has a $sec section" || bad "report missing $sec section"
+  grep -q "$sec" <<<"$out" && ok "report has a $sec section" || bad "report missing $sec section"
 done
 
 # ── 2. SCOPE: report counts EXACTLY the 3 hmd orphans, excludes all 3 foreign rows ─
@@ -184,7 +184,7 @@ else bad "an in-use version was deleted — orchestrator bypassed gc's lsof proo
 # ── 7. --deep reaps NOTHING (suggest-only handoff) ───────────────────────────────
 head -c 2048 /dev/zero > "$GTMP/hmd-fixture.tmp"; : > "$WORK/killed"
 out="$(run_clean --deep 2>&1)"
-if [ -e "$GTMP/hmd-fixture.tmp" ] && [ ! -s "$WORK/killed" ] && printf '%s' "$out" | grep -q "mac-deep-clean"; then
+if [ -e "$GTMP/hmd-fixture.tmp" ] && [ ! -s "$WORK/killed" ] && grep -q "mac-deep-clean" <<<"$out"; then
   ok "--deep is suggest-only (deletes nothing, signals nothing, names mac-deep-clean)"
 else bad "--deep mutated something or omitted the handoff: killed=$(cat "$WORK/killed" 2>/dev/null) out=$out"; fi
 

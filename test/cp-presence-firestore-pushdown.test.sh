@@ -113,7 +113,7 @@ if [ "$RC" -ne 0 ]; then
 fi
 
 # GREEN iff the query is bounded (not the degraded CollectionReference) AND carries >=1 filter.
-if printf '%s' "$OUT" | grep -q "degraded=False" && printf '%s' "$OUT" | grep -qE "n_filters=[1-9]"; then
+if grep -q "degraded=False" <<<"$OUT" && grep -qE "n_filters=[1-9]" <<<"$OUT"; then
   echo "  PASS _prefix_query pushes the doc-id RANGE down (bounded Query, doc-id filters present)"
   echo; echo "RESULT: PASS"
   printf 'cp-presence-firestore-pushdown: 1 passed, 0 failed\n'

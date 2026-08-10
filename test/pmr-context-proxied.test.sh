@@ -108,7 +108,7 @@ fi
 
 NOT_SHARED=""
 for v in $SUBSET; do
-  printf '%s\n' "$GATE_VARS" | grep -qx "$v" || NOT_SHARED="$NOT_SHARED $v"
+  grep -qx "$v" <<<"$GATE_VARS" || NOT_SHARED="$NOT_SHARED $v"
 done
 if [ -z "$NOT_SHARED" ]; then
   ok "(A2) EVERY detected var is also scrubbed by hmd-gate-endpoint.sh -- the research field and the gates-read-raw defense read the same list"
@@ -229,7 +229,7 @@ EMIT="$(printf '%s' '{"attestation":{"claims":{"file_count":1,"unit_count":1,
     HEADROOM_BASE_URL="https://hr.example.internal" "$CLI" emit 2>&1)"
 
 REC="$(ls "$CORPUS_HOME/telemetry/pmr/spool"/*.json 2>/dev/null | head -1)"
-if printf '%s' "$EMIT" | grep -q '"emitted": *true' && [ -n "$REC" ]; then
+if grep -q '"emitted": *true' <<<"$EMIT" && [ -n "$REC" ]; then
   ok "(E2) the real emit path queued the record to the LOCAL spool (no egress -- the spool IS the queue)"
 else
   bad "(E2) emit did not spool a record: $EMIT"

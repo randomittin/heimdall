@@ -201,7 +201,7 @@ read_version_field() {
 }
 
 VER="$(read_version_field "$MANIFEST")"
-printf '%s' "$VER" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' \
+grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' <<<"$VER" \
   || { printf 'version-pin-conformance: plugin.json .version is not semver: %s\n' "${VER:-<none>}" >&2; exit 1; }
 TAG="v$VER"
 
@@ -354,7 +354,7 @@ if [ "${1:-}" = "--self-test" ]; then
          printf '%s\n' "$out" >&2
          exit 1 ;;
     esac
-    summary="$(printf '%s\n' "$out" | grep -E '^version-pin-conformance:' | tail -1)"
+    summary="$(grep -E '^version-pin-conformance:' <<<"$out" | tail -1)"
     echo "  ✓ RED on $label — ${summary:-<no summary line>}"
   }
 
@@ -560,10 +560,10 @@ echo "--------------------------------------------------------------------"
 
 RECORDS="$(collect_records "$SITE_DIR")"
 
-N_MARK="$(printf '%s\n' "$RECORDS" | grep -c '^MARK|' || true)"
-N_OK="$(printf '%s\n' "$RECORDS" | grep -c '^OK|' || true)"
-N_BAD="$(printf '%s\n' "$RECORDS" | grep -c '^BAD|' || true)"
-N_FILES="$(printf '%s\n' "$RECORDS" | grep -E '^(OK|BAD)\|' | awk -F'|' '{print $2}' | sort -u | grep -c . || true)"
+N_MARK="$(grep -c '^MARK|' <<<"$RECORDS" || true)"
+N_OK="$(grep -c '^OK|' <<<"$RECORDS" || true)"
+N_BAD="$(grep -c '^BAD|' <<<"$RECORDS" || true)"
+N_FILES="$(grep -E '^(OK|BAD)\|' <<<"$RECORDS" | awk -F'|' '{print $2}' | sort -u | grep -c . || true)"
 
 echo "  swept: $N_OK governed pin(s) + $N_BAD ungoverned across $N_FILES file(s); $N_MARK marker(s)"
 
@@ -603,7 +603,7 @@ structurally_owned() {
     [ -n "$row" ] || continue
     rloc="${row%%|*}"; rere="${row#*|}"
     [ "$rloc" = "$loc" ] || continue
-    printf '%s\n' "$text" | grep -Eq "$rere" && return 0
+    grep -Eq "$rere" <<<"$text" && return 0
   done <<OWNED
 $STRUCTURAL_ROWS_OK
 OWNED
@@ -679,7 +679,7 @@ while IFS='|' read -r kind loc lineno found reason text; do
   bad "hand-typed version pin at $loc:$lineno [$reason, tokens: ${found%,}] — nothing renders it, so it silently rots at the next bump. Mark it (HEIMDALL:PIN:TAG / :VERSION / :SHA256) so bin/heimdall-render-version rewrites it from plugin.json"
   UNMARKED=$((UNMARKED+1))
 done <<BADREC
-$(printf '%s\n' "$RECORDS" | grep '^BAD|' || true)
+$(grep '^BAD|' <<<"$RECORDS" || true)
 BADREC
 [ "$UNMARKED" -eq 0 ] && ok "ZERO unmarked hardcoded versions — every pin is rendered from plugin.json or structurally owned"
 

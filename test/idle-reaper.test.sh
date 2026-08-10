@@ -122,7 +122,7 @@ mkdir -p "$WORK/home-empty"
 out="$(run_reap --agents-only 2>&1)"
 if [ -s "$WORK/killed" ]; then bad "report signalled a process — report MUST be read-only"
 else ok "report (no --apply) signalled NOTHING (provably read-only)"; fi
-printf '%s\n' "$out" | grep -q "pid 100" && ok "report names finished agent pid 100 as reapable" \
+grep -q "pid 100" <<<"$out" && ok "report names finished agent pid 100 as reapable" \
   || bad "report did not name the reapable agent 100"
 
 # ── 2. SCOPE: --agents-json counts EXACTLY the 2 finished agents ─────────────────

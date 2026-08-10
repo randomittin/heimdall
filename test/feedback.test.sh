@@ -54,20 +54,20 @@ DRY="$("$CLI" "$MSG" --command land --phase merge --dry-run 2>&1)"
 DRY_RC=$?
 set -e
 if [ "$DRY_RC" -eq 0 ] \
-   && printf '%s' "$DRY" | grep -q '"title": "feedback: the merge gate' \
-   && printf '%s' "$DRY" | grep -q "$MSG" \
-   && printf '%s' "$DRY" | grep -q '"feedback"' \
-   && printf '%s' "$DRY" | grep -q '"from-hmd"' \
-   && printf '%s' "$DRY" | grep -q 'hmd version:' \
-   && printf '%s' "$DRY" | grep -q 'command: ' \
-   && printf '%s' "$DRY" | grep -q 'phase: '; then
+   && grep -q '"title": "feedback: the merge gate' <<<"$DRY" \
+   && grep -q "$MSG" <<<"$DRY" \
+   && grep -q '"feedback"' <<<"$DRY" \
+   && grep -q '"from-hmd"' <<<"$DRY" \
+   && grep -q 'hmd version:' <<<"$DRY" \
+   && grep -q 'command: ' <<<"$DRY" \
+   && grep -q 'phase: ' <<<"$DRY"; then
   ok "(a) dry-run builds a feedback: title + message + feedback/from-hmd labels + version footer"
 else
   bad "(a) dry-run payload wrong (rc=$DRY_RC): $DRY"
 fi
 
 # the payload must carry NO code fence and NO obvious session/transcript marker.
-if printf '%s' "$DRY" | grep -q '```' ; then
+if grep -q '```' <<<"$DRY" ; then
   bad "(a) dry-run payload contains a code fence — feedback must be words only"
 else
   ok "(a) dry-run payload contains no code fence (no code/session content)"
@@ -75,7 +75,7 @@ fi
 
 # version in the footer matches plugin.json (real, not faked).
 PVER="$("$PY" -c "import json;print(json.load(open('$ROOT/.claude-plugin/plugin.json'))['version'])")"
-if printf '%s' "$DRY" | grep -q "hmd version: \`$PVER\`"; then
+if grep -q "hmd version: \`$PVER\`" <<<"$DRY"; then
   ok "(a) footer carries the REAL hmd version from plugin.json ($PVER)"
 else
   bad "(a) footer version mismatch (want $PVER): $DRY"
@@ -89,7 +89,7 @@ set +e
 SEC_OUT="$("$CLI" "my token is $SECRET please help" --dry-run 2>&1)"
 SEC_RC=$?
 set -e
-if [ "$SEC_RC" -eq 5 ] && printf '%s' "$SEC_OUT" | grep -qi 'refused'; then
+if [ "$SEC_RC" -eq 5 ] && grep -qi 'refused' <<<"$SEC_OUT"; then
   ok "(b) a message bearing a credential shape is REFUSED (exit 5), nothing built"
 else
   bad "(b) secret guard did not refuse (rc=$SEC_RC): $SEC_OUT"
@@ -99,7 +99,7 @@ set +e
 CLEAN_DRY="$("$CLI" "my token refresh keeps failing please help" --dry-run 2>&1)"
 CLEAN_RC=$?
 set -e
-if [ "$CLEAN_RC" -eq 0 ] && printf '%s' "$CLEAN_DRY" | grep -q '"title":'; then
+if [ "$CLEAN_RC" -eq 0 ] && grep -q '"title":' <<<"$CLEAN_DRY"; then
   ok "(b) honest prose mentioning the WORD token is NOT refused (no false positive)"
 else
   bad "(b) guard false-positived on clean prose (rc=$CLEAN_RC): $CLEAN_DRY"
@@ -112,8 +112,8 @@ NOCFG="$("$CLI" "some feedback" --repo "$REPO" 2>&1)"
 NOCFG_RC=$?
 set -e
 if [ "$NOCFG_RC" -eq 1 ] \
-   && printf '%s' "$NOCFG" | grep -qi 'not configured' \
-   && ! printf '%s' "$NOCFG" | grep -q 'Traceback'; then
+   && grep -qi 'not configured' <<<"$NOCFG" \
+   && ! grep -q 'Traceback' <<<"$NOCFG"; then
   ok "(c) unconfigured github -> clear message, exit 1, no traceback"
 else
   bad "(c) unconfigured handling wrong (rc=$NOCFG_RC): $NOCFG"
@@ -128,8 +128,8 @@ NOCRED="$(env -u FEEDBACK_TEST_TOKEN "$CLI" "some feedback" --repo "$REPO" 2>&1)
 NOCRED_RC=$?
 set -e
 if [ "$NOCRED_RC" -eq 1 ] \
-   && printf '%s' "$NOCRED" | grep -qi 'no credential' \
-   && ! printf '%s' "$NOCRED" | grep -q 'Traceback'; then
+   && grep -qi 'no credential' <<<"$NOCRED" \
+   && ! grep -q 'Traceback' <<<"$NOCRED"; then
   ok "(c) configured-but-credless github -> clear message, exit 1, no traceback"
 else
   bad "(c) credless handling wrong (rc=$NOCRED_RC): $NOCRED"
@@ -185,8 +185,8 @@ JSON
   FILED_RC=$?
   set -e
   if [ "$FILED_RC" -eq 0 ] \
-     && printf '%s' "$FILED" | grep -q 'filed as issue #7' \
-     && printf '%s' "$FILED" | grep -q 'https://example.test/owner/name/issues/7'; then
+     && grep -q 'filed as issue #7' <<<"$FILED" \
+     && grep -q 'https://example.test/owner/name/issues/7' <<<"$FILED"; then
     ok "(d) real POST over mock HTTP -> 'filed as issue #7' + URL printed"
   else
     bad "(d) create-over-http wrong (rc=$FILED_RC): $FILED"
@@ -210,7 +210,7 @@ print("OK" if (title_ok and labels_ok and no_secret and no_fence and path_ok)
       % (title_ok, labels_ok, no_secret, no_fence, cap["path"]))
 PY
 )"
-    if printf '%s' "$VERDICT" | grep -q '^OK'; then
+    if grep -q '^OK' <<<"$VERDICT"; then
       ok "(d) received payload: feedback: title + feedback/from-hmd labels, hit /repos/owner/name/issues, NO secret/code"
     else
       bad "(d) received payload wrong: $VERDICT"
@@ -229,7 +229,7 @@ r = gh.create_issue("t", "b", labels=["feedback"])
 print("ok=%s reason=%s" % (r.get("ok"), r.get("reason")))
 PY
 )"
-if printf '%s' "$DEGRADE" | grep -q "ok=False reason=inactive"; then
+if grep -q "ok=False reason=inactive" <<<"$DEGRADE"; then
   ok "(e) create_issue on a token-less connector -> {ok:False, reason:inactive} (no network)"
 else
   bad "(e) connector degradation contract broken: $DEGRADE"

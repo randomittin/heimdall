@@ -210,7 +210,7 @@ else
   bad "rendered a NON-blank savings string with no baseline: '$f_rendered'"
 fi
 # Defence: assert the rendered slot contains NO digit (a leaked fabricated figure).
-if printf '%s' "$f_rendered" | grep -Eq '[0-9]'; then
+if grep -Eq '[0-9]' <<<"$f_rendered"; then
   bad "rendered savings slot contains a DIGIT with no baseline (fabrication): '$f_rendered'"
 else
   ok "rendered savings slot has NO digit with no baseline (no fabrication)"
@@ -279,7 +279,7 @@ if [ "$e_cs" = "estimated" ] && [ "$e_label" = "est." ] && [ "$e_fact" = "false"
 else
   bad "estimate not labeled/tagged correctly: $fig_est"
 fi
-if printf '%s' "$e_rendered" | grep -Fq "est." && printf '%s' "$e_rendered" | grep -Fq "~"; then
+if grep -Fq "est." <<<"$e_rendered" && grep -Fq "~" <<<"$e_rendered"; then
   ok "estimate RENDERS with the est. label, never as a bare number ('$e_rendered')"
 else
   bad "estimate did not render with the est. label: '$e_rendered'"

@@ -396,9 +396,9 @@ echo
 
 # ── (a) NO-RAISE ──
 echo "(a) NO-RAISE — cp_boot.run_tick under firestore must NOT raise BackendUnavailable"
-if printf '%s' "$OUT" | grep -q "BackendUnavailable"; then
+if grep -q "BackendUnavailable" <<<"$OUT"; then
   bad "a1 run_tick RAISED BackendUnavailable under firestore — the tick chain still calls path() (regression)"
-elif printf '%s' "$OUT" | grep -q "^STATUS tick_ok "; then
+elif grep -q "^STATUS tick_ok " <<<"$OUT"; then
   ok "a1 run_tick completed under firestore with NO BackendUnavailable (the tick path is firestore-safe)"
 else
   bad "a1 run_tick did not reach the tick (out: $OUT)"
@@ -407,12 +407,12 @@ echo
 
 # ── (b) FIRES ──
 echo "(b) FIRES — the due schedule must dispatch under firestore (fired + audit row)"
-if printf '%s' "$OUT" | grep -q "fired_ok=True"; then
+if grep -q "fired_ok=True" <<<"$OUT"; then
   ok "b1 the due sync-queue schedule FIRED a dispatch under firestore (run_tick returned its outcome)"
 else
   bad "b1 the due schedule did NOT fire under firestore (out: $OUT)"
 fi
-if printf '%s' "$OUT" | grep -q "audited=True"; then
+if grep -q "audited=True" <<<"$OUT"; then
   ok "b2 a 'dispatch' audit row for the fired action landed in the firestore-backed audit log"
 else
   bad "b2 no firestore-backed 'dispatch' audit row for the fired action (out: $OUT)"

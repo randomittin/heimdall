@@ -39,7 +39,7 @@ echo "-- consent-off (INV-D) --"
 H="$TMP/off"; mkdir -p "$H"
 OUT="$(HEIMDALL_TELEMETRY=off "$PY" "$LIB" emit \
         --event '{"error_class":"lint"}' --home "$H" 2>/dev/null)"
-if printf '%s' "$OUT" | grep -q '"emitted": false'; then
+if grep -q '"emitted": false' <<<"$OUT"; then
   ok "consent-off: emit returns emitted:false"
 else
   bad "consent-off: emit did not return emitted:false (got: $OUT)"
@@ -57,12 +57,12 @@ H="$TMP/leak"; mkdir -p "$H"
 OUT="$("$PY" "$LIB" emit \
         --event '{"error_class":"lint","message":"/etc/passwd:42 boom()"}' \
         --home "$H" 2>/dev/null)"
-if printf '%s' "$OUT" | grep -qi 'block'; then
+if grep -qi 'block' <<<"$OUT"; then
   ok "leaked-content: planted path/source line is BLOCKED"
 else
   bad "leaked-content: planted content was not blocked (got: $OUT)"
 fi
-if printf '%s' "$OUT" | grep -q '"emitted": true'; then
+if grep -q '"emitted": true' <<<"$OUT"; then
   bad "leaked-content: a blocked emit still reported emitted:true"
 else
   ok "leaked-content: blocked emit did not report emitted:true"
@@ -87,7 +87,7 @@ if [ "$(nfiles "$H/telemetry/issues/outbox")" = "0" ]; then
 else
   bad "security-routing: a security signal reached the send outbox"
 fi
-if printf '%s' "$OUT" | grep -q '"emitted": true'; then
+if grep -q '"emitted": true' <<<"$OUT"; then
   bad "security-routing: a private signal reported emitted:true (would be sent)"
 else
   ok "security-routing: private signal not reported as emitted (not sent)"
@@ -121,17 +121,17 @@ print("BIG_SUPPRESSED", bool(b.get("suppressed")))
 print("KMIN", m.ISSUE_K_ANONYMITY_MIN)
 PYEOF
 )"
-if printf '%s' "$RARE" | grep -q 'RARE_SUPPRESSED True'; then
+if grep -q 'RARE_SUPPRESSED True' <<<"$RARE"; then
   ok "rare-signature: a <10-team bucket is SUPPRESSED"
 else
   bad "rare-signature: a rare bucket was NOT suppressed (got: $RARE)"
 fi
-if printf '%s' "$RARE" | grep -q 'BIG_SUPPRESSED False'; then
+if grep -q 'BIG_SUPPRESSED False' <<<"$RARE"; then
   ok "rare-signature: a >=10-team bucket is served (not over-suppressed)"
 else
   bad "rare-signature: a well-supported bucket was suppressed (got: $RARE)"
 fi
-if printf '%s' "$RARE" | grep -q 'KMIN 10'; then
+if grep -q 'KMIN 10' <<<"$RARE"; then
   ok "rare-signature: ISSUE_K_ANONYMITY_MIN == 10 (RJ decision 3)"
 else
   bad "rare-signature: k threshold is not 10 (got: $RARE)"

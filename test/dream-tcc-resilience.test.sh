@@ -213,7 +213,7 @@ DENY="(version 1)(allow default)(deny file-read* (subpath \"$SBX\"))"
 # FIRST, prove the fixture really does reproduce the recorded event. A sandbox that failed
 # to deny would make every assertion below pass vacuously.
 SBX_ERR="$(sandbox-exec -p "$DENY" /bin/ls "$SBX" 2>&1 || true)"
-if printf '%s' "$SBX_ERR" | grep -q 'Operation not permitted'; then
+if grep -q 'Operation not permitted' <<<"$SBX_ERR"; then
   ok "(2c) the fixture reproduces the recorded EPERM verbatim — not a look-alike EACCES"
 else
   bad "(2c) sandbox did not produce EPERM, so the cases below prove nothing: $SBX_ERR"
@@ -312,19 +312,19 @@ write_status "$NSTATUS" blocked tcc-denied "$TODAY" "/Users/rj/Downloads/heimdal
 
 OUT="$(HEIMDALL_LAUNCH_AGENTS_DIR="$LA" "$NOTICE" --repo "$NREPO" --status "$NSTATUS" 2>&1)"
 
-if printf '%s' "$OUT" | grep -qi 'dream'  && printf '%s' "$OUT" | grep -qi 'not running\|blocked'; then
+if grep -qi 'dream' <<<"$OUT"  && grep -qi 'not running\|blocked' <<<"$OUT"; then
   ok "(3) blocked run produces a LOUD operator-visible notice"
 else
   bad "(3) no loud notice for a blocked run; got: $OUT"
 fi
 
-if printf '%s' "$OUT" | grep -qi 'TCC' && printf '%s' "$OUT" | grep -q '/Users/rj/Downloads/heimdall'; then
+if grep -qi 'TCC' <<<"$OUT" && grep -q '/Users/rj/Downloads/heimdall' <<<"$OUT"; then
   ok "(3) notice names TCC as the cause and the exact denied path"
 else
   bad "(3) notice omits TCC cause or denied path; got: $OUT"
 fi
 
-if printf '%s' "$OUT" | grep -q 'heimdall-dream' && printf '%s' "$OUT" | grep -qi 'run'; then
+if grep -q 'heimdall-dream' <<<"$OUT" && grep -qi 'run' <<<"$OUT"; then
   ok "(3) notice prints a runnable remedy command"
 else
   bad "(3) notice gives no runnable remedy; got: $OUT"
@@ -354,13 +354,13 @@ OLD="$(days_ago 10)"
 printf '%s\n' '# old dream' > "$GREPO/.planning/dream/$OLD.md"
 
 OUT5="$(HEIMDALL_LAUNCH_AGENTS_DIR="$LA" "$NOTICE" --repo "$GREPO" --status "$WORK/does-not-exist.json" 2>&1)"
-if printf '%s' "$OUT5" | grep -qi 'dream' && printf '%s' "$OUT5" | grep -q '10'; then
+if grep -qi 'dream' <<<"$OUT5" && grep -q '10' <<<"$OUT5"; then
   ok "(5) BACKSTOP: 10-night artifact gap is LOUD even with no status file"
 else
   bad "(5) silent on a 10-night gap — the original bug; got: $OUT5"
 fi
 
-if printf '%s' "$OUT5" | grep -q "$OLD"; then
+if grep -q "$OLD" <<<"$OUT5"; then
   ok "(5) notice names the last report date ($OLD)"
 else
   bad "(5) notice omits the last report date; got: $OUT5"

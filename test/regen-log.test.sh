@@ -75,7 +75,7 @@ echo ""
 # ─────────────────────────────────────────────────────────────────────────────
 echo "(a) NEW screen → changed = CHANGED (regenerate):"
 run changed "$SCREEN" "$CANON"
-if [ "$RUN_RC" -eq 0 ] && printf '%s' "$RUN_OUT" | grep -qi 'changed'; then
+if [ "$RUN_RC" -eq 0 ] && grep -qi 'changed' <<<"$RUN_OUT"; then
   ok "new screen reports changed (rc=0, out='$RUN_OUT')"
 else
   bad "new screen should report changed (rc=$RUN_RC, out='$RUN_OUT')"
@@ -84,7 +84,7 @@ fi
 # The hash command must emit a stable, real content hash.
 run hash "$CANON"
 H1="$RUN_OUT"
-if [ "$RUN_RC" -eq 0 ] && printf '%s' "$H1" | grep -qE '^sha256:[0-9a-f]{64}$'; then
+if [ "$RUN_RC" -eq 0 ] && grep -qE '^sha256:[0-9a-f]{64}$' <<<"$H1"; then
   ok "hash emits a sha256 content hash ($H1)"
 else
   bad "hash should emit sha256:<64 hex> (rc=$RUN_RC, out='$H1')"
@@ -98,7 +98,7 @@ if [ "$RUN_RC" -eq 0 ]; then ok "record upserts the ledger entry (rc=0)"; \
 jq_valid "$LEDGER" "after record"
 
 run changed "$SCREEN" "$CANON"
-if [ "$RUN_RC" -ne 0 ] && printf '%s' "$RUN_OUT" | grep -qi 'unchanged'; then
+if [ "$RUN_RC" -ne 0 ] && grep -qi 'unchanged' <<<"$RUN_OUT"; then
   ok "recorded + same canonical reports UNCHANGED (rc=$RUN_RC, out='$RUN_OUT') — no churn"
 else
   bad "same canonical after record should be unchanged (rc=$RUN_RC, out='$RUN_OUT')"
@@ -112,7 +112,7 @@ H2="$RUN_OUT"
 if [ "$H2" != "$H1" ]; then ok "real content change changes the hash ($H1 -> $H2)"; \
   else bad "real content change did NOT change the hash (still $H2)"; fi
 run changed "$SCREEN" "$CANON"
-if [ "$RUN_RC" -eq 0 ] && printf '%s' "$RUN_OUT" | grep -qi 'changed'; then
+if [ "$RUN_RC" -eq 0 ] && grep -qi 'changed' <<<"$RUN_OUT"; then
   ok "modified canonical reports CHANGED again (rc=0, out='$RUN_OUT')"
 else
   bad "modified canonical should report changed (rc=$RUN_RC, out='$RUN_OUT')"
@@ -134,7 +134,7 @@ else
   bad "trivial reformat changed the hash ($H2 -> $H3) — would churn unchanged screen"
 fi
 run changed "$SCREEN" "$CANON"
-if [ "$RUN_RC" -ne 0 ] && printf '%s' "$RUN_OUT" | grep -qi 'unchanged'; then
+if [ "$RUN_RC" -ne 0 ] && grep -qi 'unchanged' <<<"$RUN_OUT"; then
   ok "reformatted-only canonical reports UNCHANGED (rc=$RUN_RC) — no regeneration"
 else
   bad "reformatted-only canonical should be unchanged (rc=$RUN_RC, out='$RUN_OUT')"
@@ -162,7 +162,7 @@ fi
 
 # `list` must enumerate the recorded screen.
 run list
-if [ "$RUN_RC" -eq 0 ] && printf '%s' "$RUN_OUT" | grep -q "$SCREEN"; then
+if [ "$RUN_RC" -eq 0 ] && grep -q "$SCREEN" <<<"$RUN_OUT"; then
   ok "list enumerates the recorded screen"
 else
   bad "list should enumerate the recorded screen (rc=$RUN_RC, out='$RUN_OUT')"
@@ -214,7 +214,7 @@ echo "(extra) missing/empty ledger tolerance:"
 FRESH="$WORK/fresh/sub/regen-log.json"
 FRESH_OUT="$("$CLI" --ledger "$FRESH" changed "$SCREEN" "$CANON" 2>&1)"
 FRESH_RC=$?
-if [ "$FRESH_RC" -eq 0 ] && printf '%s' "$FRESH_OUT" | grep -qi 'changed'; then
+if [ "$FRESH_RC" -eq 0 ] && grep -qi 'changed' <<<"$FRESH_OUT"; then
   ok "changed against a never-created ledger treats screen as new (no crash)"
 else
   bad "missing-ledger changed should report changed (rc=$FRESH_RC, out='$FRESH_OUT')"
@@ -224,7 +224,7 @@ EMPTY="$WORK/empty/regen-log.json"
 mkdir -p "$(dirname "$EMPTY")"; : > "$EMPTY"
 EMPTY_OUT="$("$CLI" --ledger "$EMPTY" changed "$SCREEN" "$CANON" 2>&1)"
 EMPTY_RC=$?
-if [ "$EMPTY_RC" -eq 0 ] && printf '%s' "$EMPTY_OUT" | grep -qi 'changed'; then
+if [ "$EMPTY_RC" -eq 0 ] && grep -qi 'changed' <<<"$EMPTY_OUT"; then
   ok "changed against an empty (0-byte) ledger treats screen as new (no crash)"
 else
   bad "empty-ledger changed should report changed (rc=$EMPTY_RC, out='$EMPTY_OUT')"

@@ -152,7 +152,7 @@ if [ -x "$CARD" ]; then
   CARD_OUT="$(TERM=dumb COLORTERM= "$CARD" "$PROJ_B" 2>/dev/null || true)"
   # strip ANSI, find the tokens row
   TOK_ROW="$(printf '%s\n' "$CARD_OUT" | sed -E 's/\x1b\[[0-9;]*m//g' | grep -i 'tokens' || true)"
-  if printf '%s' "$TOK_ROW" | grep -q '17.0k'; then
+  if grep -q '17.0k' <<<"$TOK_ROW"; then
     ok "summary-card tokens row shows REAL 17.0k (filled from telemetry, not '—')"
   else
     bad "card tokens row not filled from real telemetry: [$TOK_ROW]"
@@ -291,7 +291,7 @@ fi
 if [ -x "$CARD" ]; then
   CARD_E="$(TERM=dumb COLORTERM= "$CARD" "$PROJ_E" 2>/dev/null || true)"
   TOK_E="$(printf '%s\n' "$CARD_E" | sed -E 's/\x1b\[[0-9;]*m//g' | grep -i 'tokens' || true)"
-  if printf '%s' "$TOK_E" | grep -q '—'; then
+  if grep -q '—' <<<"$TOK_E"; then
     ok "summary-card tokens row degrades to '—' under disabled telemetry (no regression)"
   else
     bad "card did not degrade to '—' when telemetry disabled: [$TOK_E]"

@@ -256,7 +256,7 @@ for surface in ${SURFACES+"${SURFACES[@]}"}; do
     # Match the asset as a PATH (`assets/<file>`), which is how any reference that
     # actually renders must be written — a bare prose mention of the filename is
     # honest documentation and is not a fabrication.
-    if printf '%s\n' "$visible" | grep -Fq "assets/$f"; then
+    if grep -Fq "assets/$f" <<<"$visible"; then
       REFS=$((REFS+1))
       printf '    FABRICATED ASSET ON A READER SURFACE: %s references fixture asset %s\n' \
         "${surface#$REPO/}" "$f"

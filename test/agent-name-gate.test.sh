@@ -354,19 +354,19 @@ esac
 
 # The load-bearing downgrade assertion. A behavioural test can only sample the
 # payloads it thought of; this one proves no input at all can produce a block.
-if printf '%s' "$CMD_TEXT" | grep -qE 'exit[[:space:]]+2'; then
+if grep -qE 'exit[[:space:]]+2' <<<"$CMD_TEXT"; then
   bad "hook still contains an 'exit 2' — some input path can still DENY a spawn"
 else
   ok "hook contains no 'exit 2' — no input path can block a spawn"
 fi
 
-if printf '%s' "$CMD_TEXT" | grep -qE "printf[[:space:]]+'%s'[[:space:]]+\"\\\$INPUT\"[[:space:]]*\|[[:space:]]*jq"; then
+if grep -qE "printf[[:space:]]+'%s'[[:space:]]+\" <<<"$CMD_TEXT"\\\$INPUT\"[[:space:]]*\|[[:space:]]*jq"; then
   ok "payload reaches jq via printf '%s' (byte-exact), not echo"
 else
   bad "payload does not reach jq via printf '%s' — escape-carrying input will corrupt"
 fi
 
-if printf '%s' "$CMD_TEXT" | grep -qE "echo[[:space:]]+\"?\\\$[A-Za-z_]"; then
+if grep -qE "echo[[:space:]]+\" <<<"$CMD_TEXT"?\\\$[A-Za-z_]"; then
   bad "hook pipes a shell variable through echo — reintroduces the escape-expansion defect"
 else
   ok "hook never feeds a shell variable through echo"

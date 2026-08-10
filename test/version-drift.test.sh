@@ -160,7 +160,7 @@ NORM
          printf '%s\n' "$out" >&2
          exit 1 ;;
     esac
-    summary="$(printf '%s\n' "$out" | grep -E '^version-drift.test.sh:' | tail -1)"
+    summary="$(grep -E '^version-drift.test.sh:' <<<"$out" | tail -1)"
     echo "  ✓ RED on $label — ${summary:-<no summary line>}"
   }
 
@@ -486,7 +486,7 @@ TAG="v$VER"
 echo "version-drift harness  repo=$REPO  manifest=$VER"
 echo "--------------------------------------------------------------------"
 
-printf '%s' "$VER" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' \
+grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' <<<"$VER" \
   && ok "plugin.json .version is a readable semver ($VER)" \
   || { bad "plugin.json .version not semver: '${VER:-<none>}'"; echo; echo "version-drift.test.sh: $PASS passed, $FAIL failed."; exit 1; }
 

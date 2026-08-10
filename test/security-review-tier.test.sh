@@ -60,7 +60,7 @@ SCAN="$(git ls-files -- 'bin/*' 'hooks/*' 'test/*' 'conformance/*' '*.json' '*.s
 if [ -z "$SCAN" ]; then
   bad "file scan matched nothing — an empty scan must not pass"
 else
-  ok "scanning $(printf '%s\n' "$SCAN" | grep -c '') tracked files for tier downgrades"
+  ok "scanning $(grep -c '' <<<"$SCAN") tracked files for tier downgrades"
   HITS=""
   for f in $SCAN; do
     [ -f "$f" ] || continue
@@ -104,7 +104,7 @@ else
   # The refuted export must never appear as the doc's standing recommendation
   # in the "Fixes, ranked by measured value" list.
   FIXES="$(sed -n '/^## Fixes, ranked by measured value/,/^## /p' "$FORENSICS")"
-  if printf '%s' "$FIXES" | grep -qE 'SECURITY_REVIEW_MODEL=claude-(haiku|sonnet)'; then
+  if grep -qE 'SECURITY_REVIEW_MODEL=claude-(haiku|sonnet)' <<<"$FIXES"; then
     bad "the ranked-fixes list still prescribes a sub-opus SECURITY_REVIEW_MODEL"
   else
     ok "ranked-fixes list no longer prescribes a sub-opus SECURITY_REVIEW_MODEL"

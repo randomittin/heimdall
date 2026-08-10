@@ -150,7 +150,7 @@ has 'gcloud firestore backups schedules list' \
 echo
 echo "G. arg hygiene (usage on --help, refuse a typo)"
 HELP_OUT="$(bash "$SCRIPT" --help 2>/dev/null)"   # capture first (pipefail + grep -q SIGPIPE)
-if printf '%s' "$HELP_OUT" | grep -q 'usage:'; then ok "G --help prints usage"
+if grep -q 'usage:' <<<"$HELP_OUT"; then ok "G --help prints usage"
 else bad "G --help did not print usage"; fi
 if PATH="$FAKEBIN:$PATH" bash "$SCRIPT" --dry-runn >/dev/null 2>&1; then
   bad "G a typo'd flag was accepted (should FATAL)"

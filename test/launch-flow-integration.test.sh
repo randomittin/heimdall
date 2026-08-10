@@ -38,7 +38,7 @@ OUT_NT="$(eval "$ONBOARD" 2>&1)"            # onboarding piped (non-TTY) → mus
 # was reporting rc=0 for a subcommand that had in fact printed nothing at all.
 VER_RAW="$(HEIMDALL_LIB_ONLY=0 "$HMD" version 2>/dev/null)"; VRC=$?   # reserved subcmd, non-TTY
 VER="$(printf '%s\n' "$VER_RAW" | head -1)"
-if [ -z "$OUT_NT" ] && printf '%s' "$VER" | grep -q '^Heimdall v[0-9]' && [ "$VRC" -eq 0 ]; then
+if [ -z "$OUT_NT" ] && grep -q '^Heimdall v[0-9]' <<<"$VER" && [ "$VRC" -eq 0 ]; then
   ok "(1) non-TTY: onboarding silent + reserved 'version' completes fast ($VER), no hang"
 else
   bad "(1) non-TTY cold launch not inert (onboard='$OUT_NT' ver='$VER' rc=$VRC)"
@@ -47,8 +47,8 @@ fi
 echo "── (2) COLD LAUNCH on a real TTY orients the newcomer + points to the demo ──"
 if have_pty; then
   OUT_TTY="$(pty_run "$ONBOARD")"
-  if printf '%s' "$OUT_TTY" | grep -qi 'demo --run' \
-     && printf '%s' "$OUT_TTY" | grep -qiE 'new here|heimdall|build'; then
+  if grep -qi 'demo --run' <<<"$OUT_TTY" \
+     && grep -qiE 'new here|heimdall|build' <<<"$OUT_TTY"; then
     ok "(2) TTY cold launch: orients (what Heimdall is) + points to 'hmd demo --run'"
   else
     bad "(2) TTY onboarding did not orient/point to demo: $OUT_TTY"
@@ -61,8 +61,8 @@ echo "── (3) UPDATE-CHECK accurate: a behind install gets a ONE-LINE notice 
 CB="$WORK/cache-behind.json"; seed_cache "$CB" "v2.0.0" "v2.0.5" "$(date +%s)"
 N="$(print_cache "v2.0.0" "$CB")"
 LINES="$(printf '%s' "$N" | grep -c .)"
-if [ "$LINES" -eq 1 ] && printf '%s' "$N" | grep -q 'v2.0.5' \
-   && printf '%s' "$N" | grep -q 'v2.0.0' && printf '%s' "$N" | grep -qi 'hmd update'; then
+if [ "$LINES" -eq 1 ] && grep -q 'v2.0.5' <<<"$N" \
+   && grep -q 'v2.0.0' <<<"$N" && grep -qi 'hmd update' <<<"$N"; then
   ok "(3) behind: one-line notice names latest(v2.0.5)+installed(v2.0.0)+'hmd update'"
 else
   bad "(3) behind notice wrong (lines=$LINES): $N"
@@ -81,7 +81,7 @@ echo "── (5) SEAM: update notice + onboarding COMPOSE in one cold launch (no
 if have_pty; then
   COMP="HEIMDALL_LIB_ONLY=1 bash -c 'cd \"$REPO\"; source ./bin/heimdall; _update_print_from_cache v2.0.0 \"$CB\"; F1_WAS_FIRST_RUN=1; F1_CONTEXT=empty-dir; f1_onboard_if_cold'"
   OUT_C="$(pty_run "$COMP")"
-  if printf '%s' "$OUT_C" | grep -q 'v2.0.5' && printf '%s' "$OUT_C" | grep -qi 'demo --run'; then
+  if grep -q 'v2.0.5' <<<"$OUT_C" && grep -qi 'demo --run' <<<"$OUT_C"; then
     ok "(5) one cold launch shows BOTH the update notice AND the onboarding demo-pointer"
   else
     bad "(5) update + onboarding did not compose: $OUT_C"
@@ -98,7 +98,7 @@ DEMO_OUT=""
 if [ -x "$REPO/bin/heimdall-demo" ]; then
   DEMO_OUT="$("$REPO/bin/heimdall-demo" --dry 2>&1)"   # exit is 1 by design; we test OUTPUT
 fi
-if [ -n "$DEMO_OUT" ] && printf '%s' "$DEMO_OUT" | grep -qiE 'demo|build|heimdall'; then
+if [ -n "$DEMO_OUT" ] && grep -qiE 'demo|build|heimdall' <<<"$DEMO_OUT"; then
   ok "(6) 'hmd demo --dry' runs + narrates its tour (the demo pointer is a live command)"
 else
   bad "(6) the demo pointer does not resolve to a runnable, narrating command"

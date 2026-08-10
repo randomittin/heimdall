@@ -118,13 +118,13 @@ echo "W1 — \`add\` runs preflight as a named step, before consent"
 OUT="$(hmd add plain --yes 2>&1)"; RC=$?
 [ "$RC" -eq 0 ] && ok "the preflight-gated add still succeeds when preconditions hold" \
                 || { bad "add failed (exit $RC)"; printf '%s\n' "$OUT" | tail -20; }
-printf '%s' "$OUT" | grep -q '\[3/7\] preflight' \
+grep -q '\[3/7\] preflight' <<<"$OUT" \
   && ok "preflight is a named pipeline step, not a silent call" || bad "no preflight step in the add output"
-printf '%s' "$OUT" | grep -q 'preflight: every precondition met' \
+grep -q 'preflight: every precondition met' <<<"$OUT" \
   && ok "the add reports what preflight concluded" || bad "preflight result never reported"
 # Order matters: consenting to an install that cannot happen wastes the yes.
-PF_LINE="$(printf '%s' "$OUT" | grep -n '\[3/7\] preflight' | cut -d: -f1)"
-CN_LINE="$(printf '%s' "$OUT" | grep -n '\[4/7\] consent' | cut -d: -f1)"
+PF_LINE="$(grep -n '\[3/7\] preflight' <<<"$OUT" | cut -d: -f1)"
+CN_LINE="$(grep -n '\[4/7\] consent' <<<"$OUT" | cut -d: -f1)"
 [ -n "$PF_LINE" ] && [ -n "$CN_LINE" ] && [ "$PF_LINE" -lt "$CN_LINE" ] \
   && ok "preflight runs BEFORE consent" || bad "preflight did not precede consent"
 hmd remove plain >/dev/null 2>&1
@@ -138,20 +138,20 @@ echo "W2 — a BLOCKING precondition REFUSES the add and mutates nothing"
 OUT="$(HMD_PREFLIGHT_DISK_FLOOR_MB=999999999 hmd add plain --yes 2>&1)"; RC=$?
 [ "$RC" -ne 0 ] && ok "add REFUSES when a blocking precondition fails (exit $RC)" \
                 || bad "add installed anyway despite a failing precondition"
-printf '%s' "$OUT" | grep -qi 'precondition this install depends on is not met' \
+grep -qi 'precondition this install depends on is not met' <<<"$OUT" \
   && ok "the refusal names the reason" || bad "refusal did not name a precondition"
-printf '%s' "$OUT" | grep -q 'fix:' \
+grep -q 'fix:' <<<"$OUT" \
   && ok "the refusal carries a remediation command" || bad "no remedy offered"
-printf '%s' "$OUT" | grep -qi 'nothing was installed and nothing was wired' \
+grep -qi 'nothing was installed and nothing was wired' <<<"$OUT" \
   && ok "the refusal states nothing was installed" || bad "no such statement"
-printf '%s' "$OUT" | grep -q 'hmd modules preflight plain' \
+grep -q 'hmd modules preflight plain' <<<"$OUT" \
   && ok "the refusal points at the full report" || bad "no pointer to the full report"
 [ ! -e "$STATE/plain" ] && ok "the refused module has no install dir" || bad "refused module left an install dir"
 [ "$(tree_sum "$STATE")" = "$STATE_PRE" ] \
   && ok "a preflight refusal is byte-identical to never having run" \
   || bad "preflight refusal left a trace: $(tree_sum "$STATE") != $STATE_PRE"
 # The gate must stop the pipeline BEFORE consent, not after.
-printf '%s' "$OUT" | grep -q '\[4/7\] consent' \
+grep -q '\[4/7\] consent' <<<"$OUT" \
   && bad "the add reached consent despite a blocking precondition" \
   || ok "the refusal stopped before consent was requested"
 
@@ -177,9 +177,9 @@ OUT="$(hmd add advisory --yes 2>&1)"; RC=$?
 [ "$RC" -eq 0 ] \
   && ok "a precondition the add never touches does NOT refuse the add" \
   || { bad "add refused for a non-blocking check (exit $RC)"; printf '%s\n' "$OUT" | tail -20; }
-printf '%s' "$OUT" | grep -qi 'the PAYLOAD needs are not met yet' \
+grep -qi 'the PAYLOAD needs are not met yet' <<<"$OUT" \
   && ok "the unmet check is still surfaced, not swallowed" || bad "the unmet check was silently dropped"
-printf '%s' "$OUT" | grep -q 'hmd modules repair advisory' \
+grep -q 'hmd modules repair advisory' <<<"$OUT" \
   && ok "the report names the verb that DOES need the fix" || bad "no pointer to repair"
 hmd remove advisory >/dev/null 2>&1
 
@@ -188,7 +188,7 @@ echo "W5 — \`repair\` gates on EVERY blocking check and records the stage"
 OUT="$(HMD_PREFLIGHT_DISK_FLOOR_MB=999999999 hmd repair plain 2>&1)"; RC=$?
 [ "$RC" -ne 0 ] && ok "repair refuses when a precondition blocks (exit $RC)" \
                 || bad "repair proceeded despite a blocking precondition"
-printf '%s' "$OUT" | grep -qi 'blocking failure' \
+grep -qi 'blocking failure' <<<"$OUT" \
   && ok "repair renders the full preflight report" || bad "no preflight report from repair"
 [ "$(jq -r '.stage' "$STATE/.modstate/plain/failure.json" 2>/dev/null)" = "preflight" ] \
   && ok "the failure record names the STAGE that failed" || bad "no stage recorded"
@@ -228,26 +228,26 @@ J="$(hmd --json repair plain 2>/dev/null)"
 echo
 echo "W8 — \`status\` tells the three not-installed states APART"
 S_OPT="$(hmd status plain 2>&1)"
-printf '%s' "$S_OPT" | grep -qi 'OPTED OUT' && ok "opted out reads as OPTED OUT" || bad "opt-out state not distinguished"
-printf '%s' "$S_OPT" | grep -q 'hmd modules optin plain' && ok "the opt-out names how to undo it" || bad "no undo offered"
+grep -qi 'OPTED OUT' <<<"$S_OPT" && ok "opted out reads as OPTED OUT" || bad "opt-out state not distinguished"
+grep -q 'hmd modules optin plain' <<<"$S_OPT" && ok "the opt-out names how to undo it" || bad "no undo offered"
 hmd optin plain >/dev/null 2>&1
 [ "$(hmd --json status plain 2>/dev/null | jq -r '.state')" = "not-attempted" ] \
   && ok "optin returns the module to not-attempted" || bad "optin did not clear the opt-out"
 
 S_NEW="$(hmd status plain 2>&1)"
-printf '%s' "$S_NEW" | grep -qi 'NOT ATTEMPTED' && ok "never-tried reads as NOT ATTEMPTED" || bad "not-attempted state not distinguished"
+grep -qi 'NOT ATTEMPTED' <<<"$S_NEW" && ok "never-tried reads as NOT ATTEMPTED" || bad "not-attempted state not distinguished"
 
 hmd defer plain >/dev/null 2>&1
 S_DEF="$(hmd status plain 2>&1)"
-printf '%s' "$S_DEF" | grep -qi 'NOT YET ATTEMPTED' && ok "deferred reads as NOT YET ATTEMPTED" || bad "deferred state not distinguished"
+grep -qi 'NOT YET ATTEMPTED' <<<"$S_DEF" && ok "deferred reads as NOT YET ATTEMPTED" || bad "deferred state not distinguished"
 [ "$(hmd --json status plain 2>/dev/null | jq -r '.state')" = "deferred" ] \
   && ok "the JSON state is \"deferred\"" || bad "wrong JSON state for deferred"
 
 HMD_PREFLIGHT_DISK_FLOOR_MB=999999999 hmd repair plain >/dev/null 2>&1
 S_FAIL="$(hmd status plain 2>&1)"
-printf '%s' "$S_FAIL" | grep -qi 'INSTALL FAILED at stage: preflight' \
+grep -qi 'INSTALL FAILED at stage: preflight' <<<"$S_FAIL" \
   && ok "a failed install reads as INSTALL FAILED and NAMES the stage" || bad "failed state did not name the stage"
-printf '%s' "$S_FAIL" | grep -q 'hmd modules repair plain' && ok "the failure offers the retry command" || bad "no retry offered"
+grep -q 'hmd modules repair plain' <<<"$S_FAIL" && ok "the failure offers the retry command" || bad "no retry offered"
 # The three must be genuinely different renderings, not one message reworded.
 [ "$S_OPT" != "$S_DEF" ] && [ "$S_DEF" != "$S_FAIL" ] && [ "$S_OPT" != "$S_FAIL" ] \
   && ok "all three not-installed states render differently" || bad "two states render identically"
@@ -301,7 +301,7 @@ NRAN="$(jq -r '[.[].id] | sort | join(",")' "$NST/dual/invariants.json" 2>/dev/n
 [ "$NRC" -eq 0 ] && [ "$NRAN" = "cheap-suite,module-owned" ] \
   && ok "dropping a class does NOT error — it silently runs fewer checks (exit 0, ran: $NRAN)" \
   || bad "the narrowing arm did not behave as documented (exit $NRC, ran: $NRAN)"
-printf '%s' "$NRAN" | grep -q 'codec-fidelity' \
+grep -q 'codec-fidelity' <<<"$NRAN" \
   && bad "the dropped class's check somehow still ran" \
   || ok "codec-fidelity STOPPED RUNNING — so W10's union assertion has real teeth"
 

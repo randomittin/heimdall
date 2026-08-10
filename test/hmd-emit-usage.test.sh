@@ -321,7 +321,7 @@ fi
 # Static guarantee: the capture function body must not read a per-session
 # transcript by the deterministic <projects-root>/<slug>/<session_id>.jsonl rule.
 FNBODY="$(declare -f capture_and_emit_usage)"
-if printf '%s' "$FNBODY" | grep -qE 'projects.?root|\.jsonl|HEIMDALL_PROJECTS_ROOT|claude/projects'; then
+if grep -qE 'projects.?root|\.jsonl|HEIMDALL_PROJECTS_ROOT|claude/projects' <<<"$FNBODY"; then
   bad "(f) capture path still references a transcript path (.jsonl / projects-root) — must be removed"
 else
   ok "(f) capture path reads NO transcript file (no .jsonl / projects-root reference)"

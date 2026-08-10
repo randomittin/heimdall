@@ -108,8 +108,8 @@ bash -n "$LAUNCHER" && ok "bash -n bin/heimdall"            || bad "heimdall syn
 # Strip whole-line comments first: a comment that MENTIONS the old reset (documentation) must
 # not fail the check — only an EXECUTABLE `git reset --hard origin/main` is the regression.
 UPD_BLOCK="$(awk '/^# --update: pull latest/,/^# --reinstall:/' "$LAUNCHER" | grep -vE '^[[:space:]]*#')"
-if ! printf '%s' "$UPD_BLOCK" | grep -q 'reset --hard origin/main' \
-   && printf '%s' "$UPD_BLOCK" | grep -q 'heimdall-autoupdate'; then
+if ! grep -q 'reset --hard origin/main' <<<"$UPD_BLOCK" \
+   && grep -q 'heimdall-autoupdate' <<<"$UPD_BLOCK"; then
   ok "E hmd --update routes through heimdall-autoupdate (no unsigned 'git reset --hard origin/main')"
 else
   bad "E --update still does an unsigned git reset OR does not delegate to heimdall-autoupdate"
@@ -219,7 +219,7 @@ ERR="$(HEIMDALL_HOME="$H" HMD_TEST_RECORD="$REC" \
   HEIMDALL_SIGNING_PUBKEY="$PUB" "$UPDATER" update 2>&1 >/dev/null)"
 rc=$?
 if [ "$rc" -ne 0 ] && [ -z "$(cat "$REC" 2>/dev/null)" ] \
-   && printf '%s' "$ERR" | grep -qi 'refus'; then
+   && grep -qi 'refus' <<<"$ERR"; then
   ok "C manual 'update' TAMPERED → REFUSES fail-closed (exit $rc, stub NOT run, loud stderr)"
 else
   bad "C tamper should refuse loudly + nonzero + no exec (rc=$rc rec='$(cat "$REC" 2>/dev/null)' err='$ERR')"
@@ -234,7 +234,7 @@ OUT="$(HEIMDALL_HOME="$H" HMD_TEST_RECORD="$REC" \
   HEIMDALL_SIGNING_PUBKEY="$PUB" "$UPDATER" update 2>&1)"
 rc=$?
 if [ "$rc" -eq 0 ] && [ -z "$(cat "$REC" 2>/dev/null)" ] \
-   && printf '%s' "$OUT" | grep -qi 'latest'; then
+   && grep -qi 'latest' <<<"$OUT"; then
   ok "D manual 'update' already-current → no apply, says 'latest', exit 0"
 else
   bad "D already-current should no-op cleanly (rc=$rc rec='$(cat "$REC" 2>/dev/null)' out='$OUT')"
@@ -267,7 +267,7 @@ ERR="$(HEIMDALL_HOME="$H" HMD_TEST_RECORD="$REC" \
   HEIMDALL_SIGNING_PUBKEY="$PUB" "$UPDATER" update 2>&1 >/dev/null)"
 rc=$?
 if [ "$rc" -ne 0 ] && [ -z "$(cat "$REC" 2>/dev/null)" ] \
-   && printf '%s' "$ERR" | grep -qi 'refus'; then
+   && grep -qi 'refus' <<<"$ERR"; then
   ok "H climb v2.0.5 → v2.0.20 TAMPERED → REFUSES fail-closed (exit $rc, stub NOT run)"
 else
   bad "H tampered big-jump should refuse loudly + nonzero + no exec (rc=$rc rec='$(cat "$REC" 2>/dev/null)' err='$ERR')"

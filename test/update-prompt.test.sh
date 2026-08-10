@@ -119,8 +119,8 @@ v2.0.5"
 CACHE="$SCRATCH/t1/.heimdall/update-check.json"
 seed_cache "$CACHE" "v2.0.0" "v2.0.5" "$(date +%s)"
 OUT="$(run_print_from_cache "v2.0.0" "$CACHE")"
-if printf '%s' "$OUT" | grep -q "v2.0.5 available" && printf '%s' "$OUT" | grep -q "you have v2.0.0" && printf '%s' "$OUT" | grep -q "hmd update"; then
-  lines="$(printf '%s\n' "$OUT" | grep -c "available")"
+if grep -q "v2.0.5 available" <<<"$OUT" && grep -q "you have v2.0.0" <<<"$OUT" && grep -q "hmd update" <<<"$OUT"; then
+  lines="$(grep -c "available" <<<"$OUT")"
   if [ "$lines" -eq 1 ]; then
     ok "T1 behind: one-line notice names latest+installed+command"
   else
@@ -164,7 +164,7 @@ PYEOF
   echo "FRESH=$fresh"
 ' 2>&1)"
 net_hits="$(wc -l < "$NETLOG" | tr -d ' ')"
-if printf '%s' "$OUT3" | grep -q "FRESH=1" && [ "$net_hits" -eq 0 ]; then
+if grep -q "FRESH=1" <<<"$OUT3" && [ "$net_hits" -eq 0 ]; then
   ok "T3 daily-cache: fresh cache reused, zero network (second same-day launch)"
 else
   bad "T3 daily-cache: fresh=$(printf '%s' "$OUT3" | grep FRESH) net_hits=$net_hits (expected FRESH=1, 0 hits)"
@@ -227,9 +227,9 @@ cat > "$DEVREPO/bin/.claude-plugin/plugin.json" <<'JSON'
 {"name":"hmd","version":"2.0.5"}
 JSON
 OUT6="$(cd "$DEVREPO" && ./bin/heimdall --update </dev/null 2>&1 || true)"
-if printf '%s' "$OUT6" | grep -qi "development checkout" \
-   && printf '%s' "$OUT6" | grep -q "git pull" \
-   && ! printf '%s' "$OUT6" | grep -q "Updated"; then
+if grep -qi "development checkout" <<<"$OUT6" \
+   && grep -q "git pull" <<<"$OUT6" \
+   && ! grep -q "Updated" <<<"$OUT6"; then
   if [ -f "$DEVREPO/file2" ]; then
     ok "T6 hmd update: dev checkout prints manual step, never clobbers the tree"
   else
@@ -253,7 +253,7 @@ else
   OUT7_TTY=""   # no pty tool → skip the TTY half gracefully
 fi
 pipe_clean=0
-printf '%s' "$OUT7_PIPE" | grep -q "New here" || pipe_clean=1
+grep -q "New here" <<<"$OUT7_PIPE" || pipe_clean=1
 if [ "$pipe_clean" -eq 1 ]; then
   ok "T7a onboarding: silent on a non-TTY surface (no prompt, no orientation prose)"
 else
@@ -261,8 +261,8 @@ else
 fi
 if [ -z "$OUT7_TTY" ] && ! command -v script >/dev/null 2>&1; then
   ok "T7b onboarding: (skipped — no pty tool to render the TTY path)"
-elif printf '%s' "$OUT7_TTY" | grep -q "New here" \
-     && printf '%s' "$OUT7_TTY" | grep -q "hmd demo --run"; then
+elif grep -q "New here" <<<"$OUT7_TTY" \
+     && grep -q "hmd demo --run" <<<"$OUT7_TTY"; then
   ok "T7b onboarding: cold TTY run orients the newcomer + points to hmd demo --run"
 else
   bad "T7b onboarding: cold TTY run did not orient + point to the demo: $OUT7_TTY"

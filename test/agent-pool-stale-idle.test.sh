@@ -82,8 +82,8 @@ else
 fi
 
 # 2. REAP REASON is stale-idle, not dead pid.
-if printf '%s' "$(field stale reap_reason)" | grep -q "stale-idle" \
-   && printf '%s' "$HC_OUT" | grep -q "stale-idle"; then
+if grep -q "stale-idle" <<<"$(field stale reap_reason)" \
+   && grep -q "stale-idle" <<<"$HC_OUT"; then
   ok "reap reason is stale-idle (distinct from dead pid)"
 else
   bad "stale reap reason missing: entry='$(field stale reap_reason)' out='$HC_OUT'"
@@ -97,7 +97,7 @@ else
 fi
 
 # 4. PID-DEAD STILL REAPED.
-if [ "$(field dead status)" = "failed" ] && printf '%s' "$HC_OUT" | grep -q "dead pid"; then
+if [ "$(field dead status)" = "failed" ] && grep -q "dead pid" <<<"$HC_OUT"; then
   ok "pid-dead agent still reaped (dead pid)"
 else
   bad "pid-dead reap regressed (status=$(field dead status))"

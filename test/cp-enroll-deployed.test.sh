@@ -457,7 +457,7 @@ fi
 # ──────────────────────────────────────────────────────────────────────────────
 echo
 echo "#7 no-secret: no enroll response body carried the server secret"
-if ! printf '%s' "$ENROLL_OUT$MAL_OUT" | grep -qF "$HEIMDALL_ENROLL_TOKEN"; then
+if ! grep -qF "$HEIMDALL_ENROLL_TOKEN" <<<"$ENROLL_OUT$MAL_OUT"; then
   ok "#7 no enroll response (success or refusal) echoed the server secret — server-only by construction"
 else
   bad "#7 an enroll response carried the server secret over the wire"

@@ -115,7 +115,7 @@ fi
 # stray_caller calls leaf_target. Present → must be reported. Deleted → must not.
 CALLERS_BEFORE="$("$CMD" callers leaf_target --repo "$REPO" 2>/dev/null || true)"
 HAS_STRAY_BEFORE=no
-printf '%s' "$CALLERS_BEFORE" | grep -q 'stray_caller' && HAS_STRAY_BEFORE=yes
+grep -q 'stray_caller' <<<"$CALLERS_BEFORE" && HAS_STRAY_BEFORE=yes
 
 python3 - "$REPO/lib/core.py" <<'PYEOF'
 import re, sys
@@ -128,10 +128,10 @@ PYEOF
 
 CALLERS_AFTER="$("$CMD" callers leaf_target --repo "$REPO" 2>/dev/null || true)"
 HAS_STRAY_AFTER=no
-printf '%s' "$CALLERS_AFTER" | grep -q 'stray_caller' && HAS_STRAY_AFTER=yes
+grep -q 'stray_caller' <<<"$CALLERS_AFTER" && HAS_STRAY_AFTER=yes
 # middle_hop still calls leaf_target — the query must stay ALIVE, not go blank.
 STILL_ALIVE=no
-printf '%s' "$CALLERS_AFTER" | grep -q 'middle_hop' && STILL_ALIVE=yes
+grep -q 'middle_hop' <<<"$CALLERS_AFTER" && STILL_ALIVE=yes
 
 if [ "$HAS_STRAY_BEFORE" = yes ] && [ "$HAS_STRAY_AFTER" = no ] && [ "$STILL_ALIVE" = yes ]; then
   ok "(b) FALSIFIABLE (python): stray_caller found while present, GONE once deleted, middle_hop still found"
@@ -143,7 +143,7 @@ fi
 # ── (c) FALSIFIABILITY, shell ─────────────────────────────────────────────────
 SH_BEFORE="$("$CMD" callers sh_leaf --repo "$REPO" 2>/dev/null || true)"
 SH_HAS_STRAY_BEFORE=no
-printf '%s' "$SH_BEFORE" | grep -q 'sh_stray' && SH_HAS_STRAY_BEFORE=yes
+grep -q 'sh_stray' <<<"$SH_BEFORE" && SH_HAS_STRAY_BEFORE=yes
 
 python3 - "$REPO/bin/tool.sh" <<'PYEOF'
 import sys
@@ -156,9 +156,9 @@ PYEOF
 
 SH_AFTER="$("$CMD" callers sh_leaf --repo "$REPO" 2>/dev/null || true)"
 SH_HAS_STRAY_AFTER=no
-printf '%s' "$SH_AFTER" | grep -q 'sh_stray' && SH_HAS_STRAY_AFTER=yes
+grep -q 'sh_stray' <<<"$SH_AFTER" && SH_HAS_STRAY_AFTER=yes
 SH_STILL_ALIVE=no
-printf '%s' "$SH_AFTER" | grep -q 'sh_middle' && SH_STILL_ALIVE=yes
+grep -q 'sh_middle' <<<"$SH_AFTER" && SH_STILL_ALIVE=yes
 
 if [ "$SH_HAS_STRAY_BEFORE" = yes ] && [ "$SH_HAS_STRAY_AFTER" = no ] && [ "$SH_STILL_ALIVE" = yes ]; then
   ok "(c) FALSIFIABLE (shell): sh_stray found while present, GONE once deleted, sh_middle still found"
@@ -171,7 +171,7 @@ fi
 # Precision proof: the reported span must match what grep/sed say is actually
 # there, on this repo's own source, not a synthetic fixture.
 DEF_OUT="$("$CMD" def pad_or_truncate --repo "$ROOT" 2>/dev/null || true)"
-DEF_SPAN="$(printf '%s' "$DEF_OUT" | grep -o 'sentinels/hmd_layout\.py:[0-9]*-[0-9]*' | head -1)"
+DEF_SPAN="$(grep -o 'sentinels/hmd_layout\.py:[0-9]*-[0-9]*' <<<"$DEF_OUT" | head -1)"
 DEF_START="$(printf '%s' "$DEF_SPAN" | sed 's/.*://; s/-.*//')"
 DEF_END="$(printf '%s' "$DEF_SPAN" | sed 's/.*-//')"
 REAL_START="$(grep -n '^def pad_or_truncate' "$ROOT/sentinels/hmd_layout.py" | head -1 | cut -d: -f1)"
@@ -189,7 +189,7 @@ case "$LINE_AT_START" in
     ;;
 esac
 SH_DEF="$("$CMD" def acquire_lock --repo "$ROOT" 2>/dev/null || true)"
-SH_DEF_LINE="$(printf '%s' "$SH_DEF" | grep -o 'bin/heimdall-state:[0-9]*' | head -1 | sed 's/.*://')"
+SH_DEF_LINE="$(grep -o 'bin/heimdall-state:[0-9]*' <<<"$SH_DEF" | head -1 | sed 's/.*://')"
 SH_REAL_LINE="$(grep -n '^acquire_lock() {' "$ROOT/bin/heimdall-state" | head -1 | cut -d: -f1)"
 
 if [ -n "$DEF_START" ] && [ "$DEF_START" = "$REAL_START" ] && [ "$SPAN_OK" = yes ] \
@@ -202,9 +202,9 @@ fi
 
 # outline must list a file's symbols with ranges and NOT dump the file body.
 OUTLINE="$("$CMD" outline sentinels/hmd_layout.py --repo "$ROOT" --limit 0 2>/dev/null || true)"
-OUTLINE_N="$(printf '%s\n' "$OUTLINE" | grep -c '^[0-9]*-[0-9]*' || true)"
+OUTLINE_N="$(grep -c '^[0-9]*-[0-9]*' <<<"$OUTLINE" || true)"
 REAL_DEFS="$(grep -c '^\(def \|class \)' "$ROOT/sentinels/hmd_layout.py" || true)"
-if [ "$OUTLINE_N" -ge "$REAL_DEFS" ] && printf '%s' "$OUTLINE" | grep -q 'pad_or_truncate'; then
+if [ "$OUTLINE_N" -ge "$REAL_DEFS" ] && grep -q 'pad_or_truncate' <<<"$OUTLINE"; then
   ok "(d2) outline lists $OUTLINE_N symbols with line ranges (>= $REAL_DEFS top-level defs) instead of the file body"
 else
   bad "(d2) outline wrong: got $OUTLINE_N ranges, expected >= $REAL_DEFS"; printf '%s\n' "$OUTLINE" | head -10
@@ -212,9 +212,9 @@ fi
 
 # ── (e) refs reports every site as file:line ──────────────────────────────────
 REFS="$("$CMD" refs leaf_target --repo "$REPO" --limit 0 2>/dev/null || true)"
-REFS_N="$(printf '%s\n' "$REFS" | grep -c 'lib/core\.py:[0-9]' || true)"
+REFS_N="$(grep -c 'lib/core\.py:[0-9]' <<<"$REFS" || true)"
 # after (b) removed stray_caller there are 2 sites left: the def and middle_hop's call
-if [ "$REFS_N" -ge 1 ] && printf '%s' "$REFS" | grep -qE 'lib/core\.py:[0-9]+'; then
+if [ "$REFS_N" -ge 1 ] && grep -qE 'lib/core\.py:[0-9]+' <<<"$REFS"; then
   ok "(e) refs reports $REFS_N site(s) as file:line"
 else
   bad "(e) refs did not report file:line sites"; printf '%s\n' "$REFS" | head -10
@@ -222,7 +222,7 @@ fi
 
 # ── (f) callees = one hop out, resolved vs external ───────────────────────────
 CALLEES="$("$CMD" callees middle_hop --repo "$REPO" --limit 0 2>/dev/null || true)"
-if printf '%s' "$CALLEES" | grep -q 'leaf_target'; then
+if grep -q 'leaf_target' <<<"$CALLEES"; then
   ok "(f) callees middle_hop → leaf_target (one hop out)"
 else
   bad "(f) callees missed the direct callee"; printf '%s\n' "$CALLEES" | head -10
@@ -230,15 +230,15 @@ fi
 
 # ── (g) impact is TRANSITIVE and carries the honest-limitation notice ─────────
 IMPACT="$("$CMD" impact leaf_target --repo "$REPO" --limit 0 2>/dev/null || true)"
-HAS_DIRECT=no;  printf '%s' "$IMPACT" | grep -q 'middle_hop'   && HAS_DIRECT=yes
-HAS_TRANS=no;   printf '%s' "$IMPACT" | grep -q 'entry_point'  && HAS_TRANS=yes
-HAS_TRANS2=no;  printf '%s' "$IMPACT" | grep -q 'method_caller' && HAS_TRANS2=yes
+HAS_DIRECT=no;  grep -q 'middle_hop' <<<"$IMPACT"   && HAS_DIRECT=yes
+HAS_TRANS=no;   grep -q 'entry_point' <<<"$IMPACT"  && HAS_TRANS=yes
+HAS_TRANS2=no;  grep -q 'method_caller' <<<"$IMPACT" && HAS_TRANS2=yes
 # the warning must reach the agent making the decision — in the output, not just docs
-HAS_KNOWN=no;   printf '%s' "$IMPACT" | grep -qi 'known callers' && HAS_KNOWN=yes
+HAS_KNOWN=no;   grep -qi 'known callers' <<<"$IMPACT" && HAS_KNOWN=yes
 HAS_BLIND=no
-if printf '%s' "$IMPACT" | grep -qi 'dynamic dispatch' \
-   && printf '%s' "$IMPACT" | grep -qi 'eval' \
-   && printf '%s' "$IMPACT" | grep -qi 'not exhaustive'; then
+if grep -qi 'dynamic dispatch' <<<"$IMPACT" \
+   && grep -qi 'eval' <<<"$IMPACT" \
+   && grep -qi 'not exhaustive' <<<"$IMPACT"; then
   HAS_BLIND=yes
 fi
 if [ "$HAS_DIRECT" = yes ] && [ "$HAS_TRANS" = yes ] && [ "$HAS_TRANS2" = yes ] \
@@ -260,8 +260,8 @@ assert out != src, "fixture surgery failed — entry_point block not found"
 open(p, 'w').write(out)
 PYEOF
 IMPACT2="$("$CMD" impact leaf_target --repo "$REPO" --limit 0 2>/dev/null || true)"
-GONE=no; printf '%s' "$IMPACT2" | grep -q 'entry_point' || GONE=yes
-KEPT=no; printf '%s' "$IMPACT2" | grep -q 'middle_hop'  && KEPT=yes
+GONE=no; grep -q 'entry_point' <<<"$IMPACT2" || GONE=yes
+KEPT=no; grep -q 'middle_hop' <<<"$IMPACT2"  && KEPT=yes
 if [ "$GONE" = yes ] && [ "$KEPT" = yes ]; then
   ok "(g2) impact is FALSIFIABLE: deleting entry_point drops it from the transitive set, middle_hop survives"
 else
@@ -281,13 +281,13 @@ for i in range(50):
 open(p, "w").write("\n".join(lines) + "\n")
 PYEOF
 CAPPED="$("$CMD" callers leaf_target --repo "$REPO" 2>/dev/null || true)"
-CAPPED_N="$(printf '%s\n' "$CAPPED" | grep -c 'caller_' || true)"
+CAPPED_N="$(grep -c 'caller_' <<<"$CAPPED" || true)"
 UNCAPPED="$("$CMD" callers leaf_target --repo "$REPO" --limit 0 2>/dev/null || true)"
-UNCAPPED_N="$(printf '%s\n' "$UNCAPPED" | grep -c 'caller_' || true)"
+UNCAPPED_N="$(grep -c 'caller_' <<<"$UNCAPPED" || true)"
 HAS_MORE=no
-printf '%s' "$CAPPED" | grep -qE '\+[0-9]+ more \(use --limit 0 for all\)' && HAS_MORE=yes
+grep -qE '\+[0-9]+ more \(use --limit 0 for all\)' <<<"$CAPPED" && HAS_MORE=yes
 SMALL_HAS_MORE=yes
-printf '%s' "$UNCAPPED" | grep -q 'more (use --limit 0 for all)' || SMALL_HAS_MORE=no
+grep -q 'more (use --limit 0 for all)' <<<"$UNCAPPED" || SMALL_HAS_MORE=no
 if [ "$CAPPED_N" -lt "$UNCAPPED_N" ] && [ "$UNCAPPED_N" -ge 50 ] \
    && [ "$HAS_MORE" = yes ] && [ "$SMALL_HAS_MORE" = no ]; then
   ok "(h) result cap holds: default showed $CAPPED_N of $UNCAPPED_N with a '+N more' indicator; --limit 0 shows all, no indicator"
@@ -301,7 +301,7 @@ STAMP1="$("$CMD" status --repo "$REPO" --json 2>/dev/null | jq -r '.stamp' 2>/de
 printf '\n\ndef late_arrival(x):\n    return leaf_target(x)\n' >> "$REPO/lib/core.py"
 FRESH="$("$CMD" callers leaf_target --repo "$REPO" --limit 0 2>/dev/null || true)"
 STAMP2="$("$CMD" status --repo "$REPO" --json 2>/dev/null | jq -r '.stamp' 2>/dev/null || true)"
-SAW_NEW=no; printf '%s' "$FRESH" | grep -q 'late_arrival' && SAW_NEW=yes
+SAW_NEW=no; grep -q 'late_arrival' <<<"$FRESH" && SAW_NEW=yes
 if [ "$SAW_NEW" = yes ] && [ -n "$STAMP1" ] && [ "$STAMP1" != "$STAMP2" ]; then
   ok "(i) freshness: a post-index edit is seen immediately (late_arrival found) and the repo stamp changed"
 else
@@ -311,7 +311,7 @@ fi
 # a deletion must also invalidate — removing a file cannot leave phantom symbols
 rm -f "$REPO/lib/many.py"
 PHANTOM="$("$CMD" callers leaf_target --repo "$REPO" --limit 0 2>/dev/null || true)"
-if ! printf '%s' "$PHANTOM" | grep -q 'caller_00'; then
+if ! grep -q 'caller_00' <<<"$PHANTOM"; then
   ok "(i2) freshness: deleting a file drops its symbols (no phantom callers)"
 else
   bad "(i2) phantom callers survived a file deletion"; printf '%s\n' "$PHANTOM" | head -5
@@ -327,8 +327,8 @@ IMPACT_UNK_OUT="$("$CMD" impact definitely_not_a_real_symbol_xyz --repo "$REPO" 
 IMPACT_UNK_RC=$?
 set -e
 if [ "$UNK_RC" -eq 4 ] && [ "$UNKF_RC" -eq 4 ] && [ "$IMPACT_UNK_RC" -eq 4 ] \
-   && printf '%s' "$UNK_OUT" | grep -qi 'not in index' \
-   && ! printf '%s' "$UNK_OUT" | grep -qi 'traceback'; then
+   && grep -qi 'not in index' <<<"$UNK_OUT" \
+   && ! grep -qi 'traceback' <<<"$UNK_OUT"; then
   ok "(j) unknown symbol and unknown file → exit 4 'not in index', never a crash or an invented answer"
 else
   bad "(j) unknown handling wrong: sym_rc=$UNK_RC file_rc=$UNKF_RC impact_rc=$IMPACT_UNK_RC"

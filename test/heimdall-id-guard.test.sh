@@ -87,12 +87,12 @@ if [ "$RC2" -ne 0 ]; then
 else
   bad "leaked committer should block (got exit 0)"
 fi
-if printf '%s' "$OUT2" | grep -Fq "$LEAK"; then
+if grep -Fq "$LEAK" <<<"$OUT2"; then
   ok "output names the offending email ($LEAK)"
 else
   bad "output must name the offending email $LEAK"
 fi
-if printf '%s' "$OUT2" | grep -Fq "${C3:0:7}"; then
+if grep -Fq "${C3:0:7}" <<<"$OUT2"; then
   ok "output names the offending short sha (${C3:0:7})"
 else
   bad "output must name the offending commit ${C3:0:7}"
@@ -133,7 +133,7 @@ if [ "$RC5" -eq 0 ]; then
 else
   bad "escape hatch should force exit 0 (got exit $RC5)"
 fi
-if printf '%s' "$OUT5" | grep -Fq "HEIMDALL_SKIP_ID_GUARD"; then
+if grep -Fq "HEIMDALL_SKIP_ID_GUARD" <<<"$OUT5"; then
   ok "escape-hatch bypass is announced on stderr"
 else
   bad "escape-hatch bypass must be announced on stderr"

@@ -22,20 +22,20 @@ chmod +x "$TMP/bin/gh"
 OUT="$(PATH="$TMP/bin:$PATH" bash "$S" --dry-run 2>&1)"; rc=$?
 [ "$rc" = 0 ] && ok "dry-run exit 0" || bad "dry-run rc=$rc"
 [ ! -e "$SENT" ] && ok "dry-run never invokes gh (needs no gh)" || bad "dry-run called gh: $(cat "$SENT" 2>/dev/null)"
-printf '%s' "$OUT" | grep -q 'heimdall-maintainer-test' && ok "dry-run prints the repo name" || bad "no repo name in plan"
-printf '%s' "$OUT" | grep -qi 'nothing executed\|zero side effect\|dry-run' && ok "dry-run marks itself (nothing executed)" || bad "no dry-run marker"
+grep -q 'heimdall-maintainer-test' <<<"$OUT" && ok "dry-run prints the repo name" || bad "no repo name in plan"
+grep -qi 'nothing executed\|zero side effect\|dry-run' <<<"$OUT" && ok "dry-run marks itself (nothing executed)" || bad "no dry-run marker"
 
 # 2. dry-run prints the 3 planted ISSUES (title text) + the 3 gating TESTS + the next command
 for t in sum_range average clamp; do
-  printf '%s' "$OUT" | grep -q "$t" && ok "plan mentions bug/test '$t'" || bad "plan missing '$t'"
+  grep -q "$t" <<<"$OUT" && ok "plan mentions bug/test '$t'" || bad "plan missing '$t'"
 done
-printf '%s' "$OUT" | grep -q 'tests/test_sum_range.py' && ok "plan lists test_sum_range.py" || bad "no test_sum_range.py in plan"
-printf '%s' "$OUT" | grep -q 'tests/test_average.py'   && ok "plan lists test_average.py"   || bad "no test_average.py in plan"
-printf '%s' "$OUT" | grep -q 'tests/test_clamp.py'     && ok "plan lists test_clamp.py"     || bad "no test_clamp.py in plan"
-c=$(printf '%s\n' "$OUT" | grep -c 'ISSUE ')
+grep -q 'tests/test_sum_range.py' <<<"$OUT" && ok "plan lists test_sum_range.py" || bad "no test_sum_range.py in plan"
+grep -q 'tests/test_average.py' <<<"$OUT"   && ok "plan lists test_average.py"   || bad "no test_average.py in plan"
+grep -q 'tests/test_clamp.py' <<<"$OUT"     && ok "plan lists test_clamp.py"     || bad "no test_clamp.py in plan"
+c=$(grep -c 'ISSUE ' <<<"$OUT")
 [ "$c" -ge 3 ] && ok "plan enumerates >=3 issues ($c)" || bad "plan lists $c issues (<3)"
-printf '%s' "$OUT" | grep -q 'deploy-maintainer.sh --local --repo' && ok "plan prints the exact next command" || bad "no next-command in plan"
-printf '%s' "$OUT" | grep -qi 'heimdall/.*branch\|human merges\|RJ merges' && ok "plan notes heimdall/* branches + human merges" || bad "no branch/merge note"
+grep -q 'deploy-maintainer.sh --local --repo' <<<"$OUT" && ok "plan prints the exact next command" || bad "no next-command in plan"
+grep -qi 'heimdall/.*branch\|human merges\|RJ merges' <<<"$OUT" && ok "plan notes heimdall/* branches + human merges" || bad "no branch/merge note"
 
 # 3. THE TRIAD — grep the SCRIPT: 3 buggy fns ↔ 3 failing tests ↔ 3 issues, each REAL.
 for fn in 'def sum_range' 'def average' 'def clamp'; do
