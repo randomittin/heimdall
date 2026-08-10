@@ -38,6 +38,10 @@
 #        unattributed orphans are present — the precise sentence that lied on 2026-08-08
 #   (9)  PROVE-DETECTS: a mutant with the bare-stdin clause removed makes (1) go RED, and a
 #        WIDENED matcher makes (2)/(4) go RED. Neither "clean" verdict can be vacuous.
+#   (11) the advisory fires on the ORPHAN axis with memory HEALTHY — the second silence: the
+#        SessionStart advisory used to be reachable only through the memory-pressure gate, so
+#        a pile could grow without bound while nothing was said. Both axes true still yields
+#        ONE line, and below both floors it stays silent.
 #
 # HERMETIC. Every process row is a SYNTHETIC `pid ppid …` fixture fed through a documented
 # test seam, and every kill goes to a recording stub. No real process is ever signalled, no
@@ -281,11 +285,22 @@ cat > "$WORK/json-clean" <<'EOF'
 {"severity":"warn","disk":{"status":"ok","used_pct":50,"free_bytes":0,"total_bytes":0},"memory":{"status":"warn","swap_used_pct":94,"swap_used_g":16.0,"swap_total_g":17.0,"wired_pct":85,"free_pct":2},"procs":{"status":"ok","hmd_orphans":0,"python_orphans_unattributed":0,"python3_total":1,"runaway":"","runaway_n":0}}
 EOF
 
+# the wired-holder probe shells out to /sbin/mount. Left un-injected it makes every byte
+# assertion below a function of how many CoreSimulator volumes happen to be mounted on the
+# host — 42 more bytes on a machine with one, none on CI. Stub it to a machine with no
+# holders so the line length measured here is the line length the code produces.
+cat > "$WORK/mount-none" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod +x "$WORK/mount-none"
+
 CBIN="$CLEAN"
 advise() { # <json file> [extra argv…]
   local json="$1"; shift
   HMD_CLEANUP_OS=Darwin HMD_CLEANUP_SYSMON="$WORK/sysmon-fake" \
   SYSMON_JSON="$json" SYSMON_ORPHANS="" SYSMON_BAREPY="" \
+  HMD_CLEANUP_MOUNT_CMD="$WORK/mount-none" \
   HMD_CLEANUP_DEADCODE="$WORK/none-deadcode" \
   HMD_CLEANUP_PS_ROWS="$WORK/rows-plain" HMD_CLEANUP_PS_ROWS_FULL="$WORK/rows-rich" \
   HMD_GC_TMP_ROOTS="$WORK/gctmp-empty" HMD_GC_TEMP_TTL_MIN=99999 \
@@ -448,6 +463,150 @@ PY
 else
   echo "  SKIP (10) watchdog behaviour (no python3)"
 fi
+
+# ══════════════════════════════════════════════════════════════════════════════════
+# (11) THE ORPHAN AXIS FIRES INDEPENDENTLY OF THE MEMORY AXIS
+# ══════════════════════════════════════════════════════════════════════════════════
+# THE SECOND SILENCE. Case (8) fixed WHAT the advisory says once it speaks. This fixes
+# WHETHER it speaks at all. do_advise reached its emitter only through a memory-pressure
+# gate, so on a machine with healthy RAM an orphan pile of ANY size produced no output:
+# `heimdall-cleanup --advise` was a memory monitor wearing an orphan monitor's name. The two
+# are INDEPENDENT axes — the 224 processes measured on 2026-08-08 accumulated over a day, and
+# a machine that simply had not started swapping yet would have been told nothing at all. A
+# monitor that can only speak while a DIFFERENT monitor is already alarmed adds no signal,
+# and its silence is once again indistinguishable from health.
+#
+# The floors are the ones this codebase already defines, REUSED rather than re-invented:
+#   · ORPHAN_WARN (20)        — the count at which hmd already suggests reaping its own leak
+#   · BAREPY_ADVISE_MIN (40)  — the pile-up floor for orphans hmd cannot attribute
+# Below both, silence is CORRECT, and (11d) pins that: an advisory that fires over a handful
+# of processes is the one that gets tuned out before the real signal arrives.
+#
+# Memory reads HEALTHY in every fixture here (swap 5%, wired 22% — far under the 80/80 reboot
+# thresholds), so the orphan axis is the only thing that can make the advisory speak.
+mk_json() { # <file> <swap_pct> <swap_used_g> <swap_total_g> <wired_pct> <hmd_orphans> <unattributed>
+  cat > "$1" <<EOF
+{"severity":"warn","disk":{"status":"ok","used_pct":50,"free_bytes":0,"total_bytes":0},"memory":{"status":"ok","swap_used_pct":$2,"swap_used_g":$3,"swap_total_g":$4,"wired_pct":$5,"free_pct":40},"procs":{"status":"warn","hmd_orphans":$6,"python_orphans_unattributed":$7,"python3_total":9,"runaway":"","runaway_n":0}}
+EOF
+}
+mk_json "$WORK/json-ok-hmdpile"   5  0.4  8.0 22 24   0
+mk_json "$WORK/json-ok-barepile"  5  0.4  8.0 22  0 224
+mk_json "$WORK/json-ok-clean"     5  0.4  8.0 22  0   0
+mk_json "$WORK/json-ok-below"     5  0.4  8.0 22  3   5
+mk_json "$WORK/json-high-both"   94 16.0 17.0 85 24 224
+
+# the ATTRIBUTABLE count reaches heimdall-cleanup through sysmon's --filter-orphans oracle
+# (the fake echoes SYSMON_ORPHANS), the UNATTRIBUTED one through the --json field. Both are
+# the documented seams; no live process is read and none is signalled.
+ORPH24="$(seq 91000 91023 | tr '\n' ' ')"
+
+advise_axes() { # <json file> <orphan pid list> [extra argv…]
+  local json="$1" orphans="$2"; shift 2
+  HMD_CLEANUP_OS=Darwin HMD_CLEANUP_SYSMON="$WORK/sysmon-fake" \
+  SYSMON_JSON="$json" SYSMON_ORPHANS="$orphans" SYSMON_BAREPY="" \
+  HMD_CLEANUP_MOUNT_CMD="$WORK/mount-none" \
+  HMD_CLEANUP_DEADCODE="$WORK/none-deadcode" \
+  HMD_CLEANUP_PS_ROWS="$WORK/rows-plain" HMD_CLEANUP_PS_ROWS_FULL="$WORK/rows-rich" \
+  HMD_GC_TMP_ROOTS="$WORK/gctmp-empty" HMD_GC_TEMP_TTL_MIN=99999 \
+  HMD_GC_CC_VERSIONS="$WORK/versions-none" \
+  HEIMDALL_HOME="$WORK/home-empty" \
+  bash "$CBIN" --advise --quick --repo "$WORK/home-empty" "$@" 2>&1
+}
+
+# ── (11a) healthy memory + an ATTRIBUTABLE pile → the advisory FIRES ──────────────
+a_hmd="$(advise_axes "$WORK/json-ok-hmdpile" "$ORPH24")"
+ahl="$(grep -c '' <<<"$a_hmd" || true)"
+ahb="$(printf '%s' "$a_hmd" | wc -c | tr -d ' ')"
+[ -n "$a_hmd" ] \
+  && ok "(11a) healthy memory + 24 attributable hmd orphans → the advisory FIRES" \
+  || bad "(11a) SILENT with 24 hmd orphans on a healthy machine — the orphan monitor is still gated behind the memory monitor"
+[ "$ahl" -eq 1 ] \
+  && ok "(11a) the orphan-axis advisory is exactly ONE line (SessionStart budget kept)" \
+  || bad "(11a) orphan-axis advisory emitted $ahl lines, expected 1: $(printf '%s' "$a_hmd" | tr '\n' '|')"
+[ "$ahb" -le "$BUDGET" ] \
+  && ok "(11a) the orphan-axis line is ${ahb}B (budget ${BUDGET}B)" \
+  || bad "(11a) the orphan-axis line is ${ahb}B, over the ${BUDGET}B budget"
+grep -qE '(^| )24 orphaned' <<<"$a_hmd" \
+  && ok "(11a) it cites the MEASURED attributable count (24)" \
+  || bad "(11a) the attributable count never reached the advisory: $a_hmd"
+grep -q 'heimdall-cleanup --apply' <<<"$a_hmd" \
+  && ok "(11a) it carries the runnable remedy for the leak hmd CAN prove is its own" \
+  || bad "(11a) no remedy offered for hmd's own leak: $a_hmd"
+grep -qi 'memory pressure HIGH' <<<"$a_hmd" \
+  && bad "(11a) it claims memory pressure is HIGH on a machine reading swap 5% / wired 22% — a fabricated figure" \
+  || ok "(11a) it does NOT fabricate memory pressure in order to have something to say"
+grep -q 'wired 22%' <<<"$a_hmd" \
+  && ok "(11a) it still cites the real (healthy) memory reading — no bare claim" \
+  || bad "(11a) the measured memory reading was dropped from the line: $a_hmd"
+printf '%s' "$a_hmd" | grep -q -- '--verbose' \
+  && ok "(11a) it points at --verbose for the detail" \
+  || bad "(11a) no pointer to --verbose — the detail became undiscoverable: $a_hmd"
+
+# ── (11b) healthy memory + an UNATTRIBUTED pile → fires, and claims NOTHING ───────
+a_bare="$(advise_axes "$WORK/json-ok-barepile" "")"
+abl="$(grep -c '' <<<"$a_bare" || true)"
+abb="$(printf '%s' "$a_bare" | wc -c | tr -d ' ')"
+[ -n "$a_bare" ] \
+  && ok "(11b) healthy memory + 224 unattributed orphans → the advisory FIRES" \
+  || bad "(11b) SILENT with 224 unattributed orphans on a healthy machine — the 2026-08-08 pile again"
+[ "$abl" -eq 1 ] \
+  && ok "(11b) the unattributed-axis advisory is exactly ONE line" \
+  || bad "(11b) emitted $abl lines, expected 1: $(printf '%s' "$a_bare" | tr '\n' '|')"
+[ "$abb" -le "$BUDGET" ] \
+  && ok "(11b) the unattributed-axis line is ${abb}B (budget ${BUDGET}B)" \
+  || bad "(11b) the unattributed-axis line is ${abb}B, over the ${BUDGET}B budget"
+grep -q '224' <<<"$a_bare" \
+  && ok "(11b) it cites the MEASURED unattributed count (224)" \
+  || bad "(11b) the unattributed count never reached the advisory: $a_bare"
+grep -qiE 'unattributed|unproven|cannot prove' <<<"$a_bare" \
+  && ok "(11b) it says the attribution is UNPROVEN rather than guessing" \
+  || bad "(11b) it attributes the pile without proof: $a_bare"
+grep -qi 'NOT heimdall' <<<"$a_bare" \
+  && bad "(11b) it DENIES ownership of a pile whose ownership is unproven — the 2026-08-08 lie" \
+  || ok "(11b) it neither claims nor denies a pile it cannot attribute"
+grep -qi 'aged' <<<"$a_bare" \
+  && ok "(11b) the remedy is qualified (aged+detached only) — it never offers a blind reap" \
+  || bad "(11b) the remedy implies hmd will reap unproven processes blindly: $a_bare"
+
+# ── (11c) healthy memory + ZERO orphans → SILENT ─────────────────────────────────
+a_clean="$(advise_axes "$WORK/json-ok-clean" "")"
+[ -z "$a_clean" ] \
+  && ok "(11c) healthy memory + zero orphans → SILENT (a healthy machine is never nagged)" \
+  || bad "(11c) the advisory spoke on a machine with nothing wrong on either axis: $a_clean"
+
+# ── (11d) healthy memory + counts BELOW both floors → SILENT ─────────────────────
+a_below="$(advise_axes "$WORK/json-ok-below" "100 101 102")"
+[ -z "$a_below" ] \
+  && ok "(11d) 3 attributable + 5 unattributed (both under the floors) → SILENT (not a nag)" \
+  || bad "(11d) the advisory fired below both documented floors — this is how a real signal gets tuned out: $a_below"
+
+# ── (11e) BOTH axes true → still exactly ONE line ────────────────────────────────
+a_both="$(advise_axes "$WORK/json-high-both" "$ORPH24")"
+abol="$(grep -c '' <<<"$a_both" || true)"
+abob="$(printf '%s' "$a_both" | wc -c | tr -d ' ')"
+[ "$abol" -eq 1 ] \
+  && ok "(11e) memory pressure AND an orphan pile → ONE line, not two" \
+  || bad "(11e) both axes true emitted $abol lines: $(printf '%s' "$a_both" | tr '\n' '|')"
+[ "$abob" -le "$BUDGET" ] \
+  && ok "(11e) the both-axes line is ${abob}B (budget ${BUDGET}B)" \
+  || bad "(11e) the both-axes line is ${abob}B, over the ${BUDGET}B budget"
+if grep -qE '(^| )24 orphaned' <<<"$a_both" && grep -q '224' <<<"$a_both"; then
+  ok "(11e) the one line carries BOTH counts (reaping hmd's own leak must not look like the whole story)"
+else
+  bad "(11e) a count was dropped when both axes fired: $a_both"
+fi
+grep -qi 'Part of it IS heimdall' <<<"$a_both" \
+  && ok "(11e) under real pressure it still owns hmd's share explicitly" \
+  || bad "(11e) the attribution of hmd's own share was lost: $a_both"
+
+# ── (11f) PROVE-RED: the gate is threshold-driven, so it can be suppressed ────────
+# Crank BOTH orphan floors past the fixture and the SAME pile must go silent. If it still
+# speaks, (11a)/(11b) are tautologies — an advisory that always fires proves nothing.
+a_supp="$(HMD_SYSMON_ORPHAN_WARN=100000 HMD_CLEANUP_BAREPY_ADVISE_MIN=100000 \
+  advise_axes "$WORK/json-ok-barepile" "$ORPH24")"
+[ -z "$a_supp" ] \
+  && ok "(11f) PROVE-RED: cranking both orphan floors silences the SAME pile → (11a)/(11b) are falsifiable" \
+  || bad "(11f) PROVE-RED: the advisory spoke with both floors at 100000 — it is not gated on the documented thresholds: $a_supp"
 
 echo
 printf 'orphan-python-detection: %d passed, %d failed\n' "$P" "$F"
