@@ -717,6 +717,13 @@ parse_ba() {  # sets BEFORE_F / AFTER_F
 # also carries its interval (or an explicit refusal to compute one). An
 # unavailable figure renders the word `unavailable` and NO digits at all, so it
 # can never be misread as a measured zero.
+# The metric keys the report RENDERS, in table order. The explanation block below
+# walks this list rather than whatever an arm happened to record: a key a snapshot
+# omits outright still renders `unavailable`, and a list built from present entries
+# can never name it. A render_row added without its key added here is caught by
+# test/headroom-ab.test.sh §6b.
+REPORTED_METRICS="oracle_pass_rate falsify_survival gate_retries time_to_green_mins agent_deaths tokens_in tokens_out cost_usd"
+
 render_row() {  # key label unit better(higher|lower) pct(0|1)
   local key="$1" label="$2" unit="$3" better="$4" pct="$5"
   local row
@@ -788,13 +795,31 @@ cmd_report() {
   render_row tokens_out         "tokens out"         ""      lower  0
   render_row cost_usd           "cost (USD)"         ""      lower  0
 
-  # Reasons a figure is absent — printed so `unavailable` is never a shrug.
-  reasons="$(jq -r '.metrics | to_entries[]
-              | select(.value.provenance == "unavailable")
-              | "    \(.key): \(.value.reason // "no reason recorded")"' "$AFTER_F" 2>/dev/null || true)"
-  if [ -n "$reasons" ]; then
-    printf "\n  ${D}why a figure is unavailable (never rendered as 0):${R}\n"
-    printf '%s\n' "$reasons" | while IFS= read -r l; do printf "  ${D}%s${R}\n" "$l"; done
+  # Reasons a figure is absent — printed so `unavailable` is never a shrug. Driven
+  # by REPORTED_METRICS so a key an arm never recorded is named too, and by BOTH
+  # arms because either one going missing is enough to blank the row.
+  if reasons="$(jq -rn --slurpfile b "$BEFORE_F" --slurpfile a "$AFTER_F" \
+                  --arg keys "$REPORTED_METRICS" '
+      def why($m): if $m == null then "the arm recorded no such metric"
+                   elif $m.value == null then ($m.reason // "no reason recorded")
+                   else null end;
+      ($keys | split(" "))[] as $k
+      | ($b[0].metrics[$k]) as $B | ($a[0].metrics[$k]) as $A
+      | why($B) as $wb | why($A) as $wa
+      | select($wb != null or $wa != null)
+      | if   $wb == $wa  then "    \($k): \($wb)"
+        elif $wb == null then "    \($k) (arm B): \($wa)"
+        elif $wa == null then "    \($k) (arm A): \($wb)"
+        else "    \($k): arm A — \($wb); arm B — \($wa)" end' 2>&1)"; then
+    if [ -n "$reasons" ]; then
+      printf "\n  ${D}why a figure is unavailable (never rendered as 0):${R}\n"
+      printf '%s\n' "$reasons" | while IFS= read -r l; do printf "  ${D}%s${R}\n" "$l"; done
+    fi
+  else
+    # NEVER swallowed: a receipt that loses its own explanation block without
+    # saying so prints `unavailable` figures that read as nothing-to-explain.
+    printf "\n  ${W}  why a figure is unavailable: could not be computed — %s${R}\n" \
+      "$(printf '%s' "$reasons" | tr '\n' ' ')"
   fi
 
   # ── the statistics, exactly as pre-registered ───────────────────────────────
