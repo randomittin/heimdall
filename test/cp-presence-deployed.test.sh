@@ -302,7 +302,7 @@ OWNER_PRIV="$("$PY" -c "import json;print(json.load(open('$EXT/ident.json'))['pr
 echo
 echo "#2 boot the REAL serve subprocess under firestore"
 CP_PORT="$("$PY" -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')"
-"$CLI" serve --host 127.0.0.1 --port "$CP_PORT" --home "$HEIMDALL_HOME" --no-revocation \
+HMD_CP_GUARD_PID=$$ "$CLI" serve --host 127.0.0.1 --port "$CP_PORT" --home "$HEIMDALL_HOME" --no-revocation \
   >"$EXT/serve.out" 2>"$EXT/serve.err" &
 SERVER_PID=$!
 UP=""

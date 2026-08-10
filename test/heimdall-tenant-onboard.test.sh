@@ -109,7 +109,7 @@ echo
 CP_PORT="$("$PY" -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')"
 CP_URL="http://127.0.0.1:$CP_PORT"
 export CP_URL
-HEIMDALL_PUBLIC_SURFACE=1 "$CLI" serve --host 127.0.0.1 --port "$CP_PORT" --home "$HEIMDALL_HOME" --no-revocation \
+HMD_CP_GUARD_PID=$$ HEIMDALL_PUBLIC_SURFACE=1 "$CLI" serve --host 127.0.0.1 --port "$CP_PORT" --home "$HEIMDALL_HOME" --no-revocation \
   >"$EXT/serve.out" 2>"$EXT/serve.err" &
 SERVER_PID=$!
 
@@ -395,7 +395,7 @@ GATED_PORT="$("$PY" -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));
 GATED_URL="http://127.0.0.1:$GATED_PORT"
 # the FAKE privileged GATED service: NO public surface, LOCAL cred store (stands in for the SM-admin
 # runtime SA that CAN write). It re-verifies the signature, re-derives team_id, WRITES the cred.
-HEIMDALL_TEAM_CRED_STORE=local "$CLI" serve --host 127.0.0.1 --port "$GATED_PORT" --home "$HEIMDALL_HOME" --no-revocation \
+HMD_CP_GUARD_PID=$$ HEIMDALL_TEAM_CRED_STORE=local "$CLI" serve --host 127.0.0.1 --port "$GATED_PORT" --home "$HEIMDALL_HOME" --no-revocation \
   >"$EXT/gated.out" 2>"$EXT/gated.err" &
 GATED_PID=$!
 
@@ -405,7 +405,7 @@ export PUBSM_URL
 # the least-privilege PUBLIC surface in SECRET-MANAGER mode: it CANNOT create SM secrets, so /team/cred
 # MUST forward. HEIMDALL_FORWARD_ID_TOKEN stands in for the metadata ID token (no metadata server off
 # Cloud Run); HEIMDALL_GATED_SERVICE_URL points the forward at the fake gated service.
-HEIMDALL_PUBLIC_SURFACE=1 HEIMDALL_TEAM_CRED_STORE=secretmanager \
+HMD_CP_GUARD_PID=$$ HEIMDALL_PUBLIC_SURFACE=1 HEIMDALL_TEAM_CRED_STORE=secretmanager \
   HEIMDALL_GATED_SERVICE_URL="$GATED_URL" HEIMDALL_FORWARD_ID_TOKEN="test-id-token" \
   "$CLI" serve --host 127.0.0.1 --port "$PUBSM_PORT" --home "$HEIMDALL_HOME" --no-revocation \
   >"$EXT/pubsm.out" 2>"$EXT/pubsm.err" &

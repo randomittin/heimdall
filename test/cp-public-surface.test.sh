@@ -142,7 +142,7 @@ waitup(){ for _ in $(seq 1 60); do [ "$(httpstat GET "$1/healthz")" = "200" ] &&
 
 # ── boot the PUBLIC surface (HEIMDALL_PUBLIC_SURFACE=1, enroll IP limit low for determinism) ──
 P1="$(freeport)"; U1="http://127.0.0.1:$P1"
-HEIMDALL_PUBLIC_SURFACE=1 HEIMDALL_CP_PKI_KEY="$PKI" HEIMDALL_ENROLL_TOKEN="$TOKEN" \
+HMD_CP_GUARD_PID=$$ HEIMDALL_PUBLIC_SURFACE=1 HEIMDALL_CP_PKI_KEY="$PKI" HEIMDALL_ENROLL_TOKEN="$TOKEN" \
   HEIMDALL_ENROLL_IP_LIMIT=3 HEIMDALL_DASH_INIT_IP_LIMIT=3 HEIMDALL_DASH_READ_IP_LIMIT=3 \
   HEIMDALL_DASH_INIT_BUDGET_MAX=20 HEIMDALL_HOME="$EXT/pub" \
   "$CLI" serve --host 127.0.0.1 --port "$P1" >/dev/null 2>&1 &
@@ -240,7 +240,7 @@ case "$r" in "429 dash_rosters_ip") ok "dash rosters per-IP flood -> 429 dash_ro
 
 # ── boot the GATED surface (flag OFF) — the control ──
 P2="$(freeport)"; U2="http://127.0.0.1:$P2"
-HEIMDALL_CP_PKI_KEY="$PKI" HEIMDALL_ENROLL_TOKEN="$TOKEN" HEIMDALL_HOME="$EXT/gated" \
+HMD_CP_GUARD_PID=$$ HEIMDALL_CP_PKI_KEY="$PKI" HEIMDALL_ENROLL_TOKEN="$TOKEN" HEIMDALL_HOME="$EXT/gated" \
   "$CLI" serve --host 127.0.0.1 --port "$P2" >/dev/null 2>&1 &
 SRV2=$!
 waitup "$U2" || { bad "gated server did not come up"; echo "cp-public-surface: $PASS passed, $((FAIL+1)) failed"; exit 1; }

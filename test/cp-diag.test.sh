@@ -221,7 +221,7 @@ PYEOF
 # ── F. a LIVE server answers /healthz + /readyz UNSIGNED, no key material ───────
 CLI="$ROOT/bin/heimdall-control-plane"
 CP_PORT="$("$PY" -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')"
-"$CLI" serve --host 127.0.0.1 --port "$CP_PORT" --home "$HEIMDALL_HOME" --no-revocation \
+HMD_CP_GUARD_PID=$$ "$CLI" serve --host 127.0.0.1 --port "$CP_PORT" --home "$HEIMDALL_HOME" --no-revocation \
   >"$WORK/serve.out" 2>"$WORK/serve.err" &
 SPID=$!
 UP=""

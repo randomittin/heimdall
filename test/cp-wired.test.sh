@@ -272,7 +272,7 @@ export CP_PORT CP_HAID="$OWNER_HAID" CP_PRIV="$OWNER_PRIV"
 
 # START the REAL assembled server as a subprocess (cp_boot.boot() runs inside serve()).
 # --no-revocation exercises PURE PKI (no agents.json CLI dependency; the documented flag).
-"$CLI" serve --host 127.0.0.1 --port "$CP_PORT" --home "$HEIMDALL_HOME" --no-revocation \
+HMD_CP_GUARD_PID=$$ "$CLI" serve --host 127.0.0.1 --port "$CP_PORT" --home "$HEIMDALL_HOME" --no-revocation \
   >"$WORK/serve.out" 2>"$WORK/serve.err" &
 SERVER_PID=$!
 

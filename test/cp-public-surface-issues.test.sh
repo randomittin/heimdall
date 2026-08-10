@@ -87,7 +87,7 @@ waitup(){ for _ in $(seq 1 60); do [ "$(httpstat GET "$1/healthz")" = "200" ] &&
 if [ -x "$CLI" ]; then
   PKI="$("$PY" -c "import base64,os;print(base64.b64encode(os.urandom(32)).decode())")"
   P1="$(freeport)"; U1="http://127.0.0.1:$P1"
-  HEIMDALL_PUBLIC_SURFACE=1 HEIMDALL_CP_PKI_KEY="$PKI" HEIMDALL_ENROLL_TOKEN="ps-issues-fixture-$$" \
+  HMD_CP_GUARD_PID=$$ HEIMDALL_PUBLIC_SURFACE=1 HEIMDALL_CP_PKI_KEY="$PKI" HEIMDALL_ENROLL_TOKEN="ps-issues-fixture-$$" \
     HEIMDALL_HOME="$ROOT_T/serve" \
     "$CLI" serve --host 127.0.0.1 --port "$P1" >/dev/null 2>&1 &
   SRV1=$!

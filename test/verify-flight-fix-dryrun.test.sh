@@ -455,7 +455,7 @@ CP_PORT="$("$PY" -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));pri
 # ── start the LOCAL wired server (firestore backend) on HOME_A ──────────────────────
 start_server() {
   local home="$1"
-  "$CLI" serve --host 127.0.0.1 --port "$CP_PORT" --home "$home" --no-revocation \
+  HMD_CP_GUARD_PID=$$ "$CLI" serve --host 127.0.0.1 --port "$CP_PORT" --home "$home" --no-revocation \
     >"$EXT/serve.out" 2>"$EXT/serve.err" &
   SERVER_PID=$!
   # wait for the socket to accept.
@@ -490,7 +490,12 @@ for _ in \$(seq 1 20); do kill -0 "$SERVER_PID" 2>/dev/null || break; sleep 0.1;
 kill -9 "$SERVER_PID" 2>/dev/null || true
 rm -rf "$HOME_A"
 # start a FRESH instance B on a NEW home, SAME external firestore store + SAME port.
-"$CLI" serve --host 127.0.0.1 --port "$CP_PORT" --home "$HOME_B" --no-revocation \
+# HMD_CP_GUARD_PID is deliberately UNESCAPED: this heredoc is unquoted, so $$ expands NOW to
+# THIS test shell's pid and is baked into the hook file. Instance B must outlive the
+# short-lived `bash -c` hook that starts it (the assertions below talk to B) but must still
+# die with the test — escaping it to \$\$ would bind the guard to the hook shell and kill B
+# the instant the hook returns.
+HMD_CP_GUARD_PID=$$ "$CLI" serve --host 127.0.0.1 --port "$CP_PORT" --home "$HOME_B" --no-revocation \
   >"$EXT/serveB.out" 2>"$EXT/serveB.err" &
 echo \$! >"$EXT/serverB.pid"
 # wait for instance B's socket.

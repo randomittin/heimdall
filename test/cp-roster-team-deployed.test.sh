@@ -327,7 +327,7 @@ OWNER_PRIV="$("$PY" -c "import json;print(json.load(open('$EXT/ident.json'))['pr
 echo
 echo "#2 boot the REAL serve subprocess on the PUBLIC surface (HEIMDALL_PUBLIC_SURFACE=1)"
 CP_PORT="$("$PY" -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')"
-HEIMDALL_PUBLIC_SURFACE=1 "$CLI" serve --host 127.0.0.1 --port "$CP_PORT" --home "$HEIMDALL_HOME" --no-revocation \
+HMD_CP_GUARD_PID=$$ HEIMDALL_PUBLIC_SURFACE=1 "$CLI" serve --host 127.0.0.1 --port "$CP_PORT" --home "$HEIMDALL_HOME" --no-revocation \
   >"$EXT/serve.out" 2>"$EXT/serve.err" &
 SERVER_PID=$!
 CP_URL="http://127.0.0.1:$CP_PORT"

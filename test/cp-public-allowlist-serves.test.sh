@@ -137,7 +137,7 @@ URL="http://127.0.0.1:$PORT"
 
 # Generous per-IP caps: a 429 still counts as SERVED, but keeping the limits loose means the
 # sweep reads each route's real gate rather than the limiter, which is the clearer signal.
-HEIMDALL_PUBLIC_SURFACE=1 HEIMDALL_CP_PKI_KEY="$PKI" \
+HMD_CP_GUARD_PID=$$ HEIMDALL_PUBLIC_SURFACE=1 HEIMDALL_CP_PKI_KEY="$PKI" \
   HEIMDALL_ENROLL_TOKEN="allowlist-serves-fixture-token-$$" \
   HEIMDALL_HOME="$EXT/pub" \
   "$CLI" serve --host 127.0.0.1 --port "$PORT" >"$EXT/serve.out" 2>"$EXT/serve.err" &
