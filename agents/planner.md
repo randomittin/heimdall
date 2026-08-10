@@ -80,12 +80,14 @@ For each task, output this exact structure:
 
 Assign each task a model tier AND effort level:
 
-| Tier | Model | Effort | Use for |
+| Tier | `--model` string | Effort | Use for |
 |---|---|---|---|
-| `haiku` | claude-haiku-4-5 | low | lint, format, simple config, file rename |
-| `sonnet` | claude-sonnet-4-6 | default | docs, test writing, research, analysis |
-| `opus` | claude-opus-4-8 | high | code writing, architecture, design, review, DB schema |
-| `opus` | claude-opus-4-8 | max | security audit, incident response, critical architecture decisions |
+| `haiku` | `haiku` | low | lint, format, simple config, file rename |
+| `sonnet` | `sonnet` | default | docs, test writing, research, analysis |
+| `opus` | `opus` | high | code writing, architecture, design, review, DB schema |
+| `opus` | `opus` | max | security audit, incident response, critical architecture decisions |
+
+**The model string is the BARE TIER ALIAS, never a full model id.** Claude Code maps `opus` / `sonnet` / `haiku` to the current generation of that tier, so every spawn gets the latest model of the tier you asked for. A full id is correct on the day it is typed and silently last-generation on the day after — a failure nothing goes red for. Obtain the string from `bin/heimdall-model-resolve <tier>`; that resolver is also the only legitimate way to pin one, via `HEIMDALL_MODEL_<TIER>=<full-id>`, and pinning exists for bench/eval reproducibility alone. Write the TIER into each task spec, never a full model id.
 
 **Default to opus/high for code changes. Reserve max effort for decisions that are expensive to undo (security, architecture, incident response). Use sonnet/default for routine work (docs, tests). Use haiku/low for mechanical tasks (lint, format).**
 

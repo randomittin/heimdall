@@ -252,11 +252,13 @@ Before spawning an agent for a task, check if it's a Tier 0 operation. If yes, r
 
 Assign model tiers to minimize cost while maximizing code quality:
 
-| Tier | Model | Use for | Effort |
+| Tier | `--model` string | Use for | Effort |
 |---|---|---|---|
-| haiku | claude-haiku-4-5 | lint, format, rename, simple config | default |
-| sonnet | claude-sonnet-4-6 | docs, tests, research, analysis | default |
-| opus | claude-opus-4-8 | ALL code, architecture, planning, design, review, security, verification | max |
+| haiku | `haiku` | lint, format, rename, simple config | default |
+| sonnet | `sonnet` | docs, tests, research, analysis | default |
+| opus | `opus` | ALL code, architecture, planning, design, review, security, verification | max |
+
+**The model string is the BARE TIER ALIAS, never a full model id.** Claude Code maps `opus` / `sonnet` / `haiku` to the current generation of that tier, so every spawn gets the latest model of the tier you asked for. A full id is correct on the day it is typed and silently last-generation on the day after — a failure nothing goes red for, and one that quietly costs quality on every code task. Obtain the string from `bin/heimdall-model-resolve <tier>`; that resolver is also the only legitimate way to pin one, via `HEIMDALL_MODEL_<TIER>=<full-id>`, and pinning exists for bench/eval reproducibility alone. Never pass a full model id to a spawn.
 
 **Opus is the default for anything that writes or reviews code.** Heimdall must be amazing at code — never compromise quality to save tokens on coding tasks.
 
