@@ -228,6 +228,55 @@ printf '%s' "$rep" | grep -q 'why a figure is unavailable' \
   && ok "the report explains WHY each figure is unavailable" \
   || bad "the report never explains its unavailable figures"
 
+# ── 6b. AN UNRECORDED METRIC IS EXPLAINED TOO ───────────────────────────────
+# An arm can omit a metric KEY outright — that is what a snapshot taken by a
+# partial or older collector looks like, and it is not an error. The row still
+# renders `unavailable`, so the footnote has to cover it: an `unavailable` with
+# no reason beside it is exactly the shrug this report exists to refuse.
+#
+# This is the regression guard for a reasons list built by walking the entries
+# an arm HAPPENED to carry, which by construction can never mention a key that
+# is not there. With every labelled-cost key deleted, that shape emits nothing
+# at all: six rows say `unavailable` and the explanation block disappears
+# silently, which reads as a receipt that simply had nothing to explain.
+jq 'del(.metrics.tokens_in, .metrics.tokens_out, .metrics.cost_usd,
+        .metrics.agent_deaths, .metrics.gate_retries, .metrics.time_to_green_mins)' \
+  "$TMP/neu-a.json" > "$TMP/gap-a.json"
+jq 'del(.metrics.tokens_in, .metrics.tokens_out, .metrics.cost_usd,
+        .metrics.agent_deaths, .metrics.gate_retries, .metrics.time_to_green_mins)' \
+  "$TMP/neu-b.json" > "$TMP/gap-b.json"
+rep="$("$AB" report --before "$TMP/gap-a.json" --after "$TMP/gap-b.json" 2>&1 | plain)"
+gap_tok="$(printf '%s\n' "$rep" | grep -E '^[[:space:]]+tokens in' | head -1)"
+printf '%s' "$gap_tok" | grep -q 'unavailable' \
+  && ok "a metric key the arm never recorded still renders 'unavailable'" \
+  || bad "an unrecorded metric did not render unavailable: '$gap_tok'"
+printf '%s' "$rep" | grep -q 'why a figure is unavailable' \
+  && ok "…and the explanation block SURVIVES — it is not built from present keys" \
+  || bad "every unavailable figure was unrecorded and the explanation block vanished"
+printf '%s' "$rep" | grep -q 'tokens_in' \
+  && ok "the explanation names tokens_in — a key no arm ever recorded" \
+  || bad "the explanation never names tokens_in: its 'unavailable' is a bare shrug"
+printf '%s' "$rep" | grep -q 'cost_usd' \
+  && ok "the explanation names cost_usd as well" \
+  || bad "the explanation never names cost_usd"
+
+# The explanation must also cover a metric that is missing from ONE arm only —
+# a row goes blank on either arm's absence, so covering arm B alone is not enough.
+jq 'del(.metrics.tokens_in)' "$TMP/neu-a.json" > "$TMP/half-a.json"
+rep="$("$AB" report --before "$TMP/half-a.json" --after "$TMP/neu-b.json" 2>&1 | plain)"
+printf '%s' "$rep" | grep -q 'tokens_in' \
+  && ok "a key missing from arm A ALONE is still named in the explanation" \
+  || bad "arm A's missing key rendered unavailable with no explanation"
+
+# A reasons query that FAILS must say so, not leave the block silently absent.
+# `.metrics` as a non-object is the shape that breaks the walk; the report is
+# still expected to state that it could not explain, rather than print nothing.
+jq '.metrics = "corrupt"' "$TMP/neu-b.json" > "$TMP/bad-b.json"
+rep="$("$AB" report --before "$TMP/neu-a.json" --after "$TMP/bad-b.json" 2>&1 | plain)"
+printf '%s' "$rep" | grep -qi 'could not be computed\|why a figure is unavailable' \
+  && ok "an unreadable metrics block is reported, never silently skipped" \
+  || bad "a failed explanation query left NO trace in the report"
+
 # ── 7. REPRODUCIBILITY ──────────────────────────────────────────────────────
 # A receipt whose numbers move between runs is not a receipt.
 a="$("$AB" stats --before "$TMP/deg-a.json" --after "$TMP/deg-b.json" 2>/dev/null)"
