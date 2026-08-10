@@ -50,7 +50,7 @@ grep -q "240;248;255" <<<"$M" \
   || ok "batsy bypasses the watchman forced-eyes (no aliceblue band)"
 # value-2 over value-5: grid row4='12255221' / row5='15555551' → a top=eye,bot=outline cell.
 # With the ▄ lower-half glyph the bottom pixel (outline) is fg (38;2) and the top (eye) is bg (48;2).
-grep -q "38;2;0;0;0m" <<<"$M"$'\033'"\[48;2;255;252;246m▄" \
+grep -q "38;2;0;0;0m"$'\033'"\[48;2;255;252;246m▄" <<<"$M" \
   && ok "batsy eye(2) composites over outline(5) exactly as authored" \
   || bad "batsy eye-over-outline cell not found (raw palette not honored)"
 

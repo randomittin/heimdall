@@ -349,7 +349,7 @@ else
   bad "receipt missing the evidence/verdict/attestation reference"
 fi
 # the receipt table shows the recorded real exit code (0), not a self-report.
-if grep -qE '\| +1 +\| `' <<<"$RBODY""$EVIDENCE_CMD"'` +\| +0 +\| +yes +\|'; then
+if grep -qE '\| +1 +\| `'"$EVIDENCE_CMD"'` +\| +0 +\| +yes +\|' <<<"$RBODY"; then
   ok "receipt renders the RECORDED REAL EXIT (exit 0, ok=yes) — proof, not a claim"
 else
   bad "receipt did not render the recorded real exit row"

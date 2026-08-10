@@ -360,13 +360,13 @@ else
   ok "hook contains no 'exit 2' — no input path can block a spawn"
 fi
 
-if grep -qE "printf[[:space:]]+'%s'[[:space:]]+\" <<<"$CMD_TEXT"\\\$INPUT\"[[:space:]]*\|[[:space:]]*jq"; then
+if grep -qE "printf[[:space:]]+'%s'[[:space:]]+\"\\\$INPUT\"[[:space:]]*\|[[:space:]]*jq" <<<"$CMD_TEXT"; then
   ok "payload reaches jq via printf '%s' (byte-exact), not echo"
 else
   bad "payload does not reach jq via printf '%s' — escape-carrying input will corrupt"
 fi
 
-if grep -qE "echo[[:space:]]+\" <<<"$CMD_TEXT"?\\\$[A-Za-z_]"; then
+if grep -qE "echo[[:space:]]+\"?\\\$[A-Za-z_]" <<<"$CMD_TEXT"; then
   bad "hook pipes a shell variable through echo — reintroduces the escape-expansion defect"
 else
   ok "hook never feeds a shell variable through echo"
