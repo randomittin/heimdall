@@ -729,7 +729,13 @@ render_row() {  # key label unit better(higher|lower) pct(0|1)
   local row
   row="$(jq -n --slurpfile b "$BEFORE_F" --slurpfile a "$AFTER_F" \
     --arg k "$key" --arg unit "$unit" --arg better "$better" --argjson pct "$pct" '
-    ($b[0].metrics[$k]) as $B | ($a[0].metrics[$k]) as $A
+    # `.metrics` is only guaranteed to EXIST (require_snap checks that much and no more).
+    # A snapshot that carries it as a string — a truncated or half-written arm — used to
+    # abort the whole table on the first row with `Cannot index string with string`, and
+    # the report simply stopped mid-render with exit 0. An unreadable metrics block must
+    # render as `unavailable`, which is what it is, and never as a vanished report.
+    def pick($src): if ($src | type) == "object" then $src[$k] else null end;
+    (pick($b[0].metrics)) as $B | (pick($a[0].metrics)) as $A
     | def fmt($m): if $m == null or $m.value == null then "unavailable"
                    elif $pct == 1 then "\((($m.value * 1000) | round) / 10)%"
                    else "\($m.value)\($unit)" end;
@@ -801,10 +807,14 @@ cmd_report() {
   if reasons="$(jq -rn --slurpfile b "$BEFORE_F" --slurpfile a "$AFTER_F" \
                   --arg keys "$REPORTED_METRICS" '
       def why($m): if $m == null then "the arm recorded no such metric"
+                   elif ($m | type) != "object" then "the arm'"'"'s metrics block is not readable as metrics"
                    elif $m.value == null then ($m.reason // "no reason recorded")
                    else null end;
+      # same tolerance as render_row: a `.metrics` that is not an object yields null per
+      # key rather than aborting the walk, so the explanation survives a truncated arm.
+      def pick($src; $kk): if ($src | type) == "object" then $src[$kk] else "unreadable" end;
       ($keys | split(" "))[] as $k
-      | ($b[0].metrics[$k]) as $B | ($a[0].metrics[$k]) as $A
+      | (pick($b[0].metrics; $k)) as $B | (pick($a[0].metrics; $k)) as $A
       | why($B) as $wb | why($A) as $wa
       | select($wb != null or $wa != null)
       | if   $wb == $wa  then "    \($k): \($wb)"
