@@ -513,6 +513,72 @@ def main():
         print(json.dumps(out))
         return
 
+    # ── CLAUSE (a): IS EACH DECISION METRIC ACTUALLY MEASURED IN BOTH ARMS? ──────────
+    # The rule's first clause was PRINTED by `preregister` and never implemented. Only
+    # one availability case was checked — "no task ran in both arms" — so an arm that
+    # swept ZERO mutants sailed past every later clause and landed on KEEP, publishing a
+    # POSITIVE receipt for a metric it never measured. Measured 2026-08-10: 30 paired
+    # tasks, 300 mutants in arm A, 0 in arm B, verdict `keep`. The stats blob printed
+    # `mutants_before: 300` beside `mutants_after: 0` and said keep anyway.
+    #
+    # The distinction that makes this narrow rather than paranoid: a zero that is
+    # EXPLAINED by a measurement is available, a zero that is explained by nothing is
+    # not. bin/falsify sweeps no mutants when the golden itself failed — that zero is a
+    # measured consequence of a real result, and the degraded arm must still publish its
+    # NEGATIVE receipt. Only a task that PASSED its golden and still swept nothing means
+    # the falsifier did not run.
+    def _oracle_avail(tbl, arm):
+        missing = [d for d in shared if tbl[d].get("golden_pass") is None]
+        if not missing:
+            return {"available": True, "reason": None}
+        return {"available": False, "reason":
+                "oracle pass-rate was NOT MEASURED in %s: %d of %d shared task(s) carry "
+                "no golden result (%s). An absent measurement is neither a pass nor a "
+                "failure." % (arm, len(missing), len(shared), ", ".join(missing[:5]))}
+
+    def _falsify_avail(tbl, arm):
+        blind = [d for d in shared
+                 if tbl[d].get("golden_pass") and not (tbl[d].get("mutants") or 0)]
+        if not blind:
+            return {"available": True, "reason": None}
+        return {"available": False, "reason":
+                "falsify survival was NOT MEASURED in %s: %d of %d shared task(s) passed "
+                "their golden yet swept zero mutants (%s). The falsifier did not run, "
+                "which is not the same as nothing surviving."
+                % (arm, len(blind), len(shared), ", ".join(blind[:5]))}
+
+    availability = {
+        "oracle_pass_rate": {"before": _oracle_avail(bt, "arm A"),
+                             "after":  _oracle_avail(at, "arm B")},
+        "falsify_survival": {"before": _falsify_avail(bt, "arm A"),
+                             "after":  _falsify_avail(at, "arm B")},
+    }
+    out["availability"] = availability
+    unavailable = [e["reason"] for m in availability.values() for e in m.values()
+                   if not e["available"]]
+
+    # The survivor counts are assembled BEFORE the verdict branches, and with .get()
+    # rather than [], so an indeterminate receipt still carries the evidence FOR its own
+    # verdict. A receipt that drops `mutants_after: 0` deletes the very number that
+    # proves the arm was blind.
+    def _sum(tbl, key):
+        return sum((tbl[d].get(key) or 0) for d in shared)
+    out["falsify"] = {
+        "survivors_before": _sum(bt, "survived"), "survivors_after": _sum(at, "survived"),
+        "domains_worsened": [d for d in shared
+                             if (at[d].get("survived") or 0) > (bt[d].get("survived") or 0)],
+        "categorical_stop": _sum(at, "survived") > _sum(bt, "survived"),
+        "mutants_before": _sum(bt, "mutants"), "mutants_after": _sum(at, "mutants"),
+    }
+
+    if unavailable:
+        out["verdict"] = "indeterminate"
+        out["reasons"] = unavailable + [
+            "clause (a): a decision metric unavailable in either arm resolves to "
+            "INDETERMINATE. Publish neither receipt. Re-run the missing arm, then re-grade."]
+        print(json.dumps(out))
+        return
+
     b_pass = [bt[d]["golden_pass"] for d in shared]
     a_pass = [at[d]["golden_pass"] for d in shared]
     n = len(shared)
@@ -566,16 +632,13 @@ def main():
     }
 
     # Falsify survival — CATEGORICAL. Decided on the survivor COUNT.
-    sb = sum(bt[d]["survived"] for d in shared)
-    sa = sum(at[d]["survived"] for d in shared)
-    worsened = [d for d in shared if at[d]["survived"] > bt[d]["survived"]]
-    categorical_stop = sa > sb
-    out["falsify"] = {
-        "survivors_before": sb, "survivors_after": sa,
-        "domains_worsened": worsened, "categorical_stop": categorical_stop,
-        "mutants_before": sum(bt[d]["mutants"] for d in shared),
-        "mutants_after": sum(at[d]["mutants"] for d in shared),
-    }
+    # already assembled above, before the availability branch — read it back rather than
+    # recomputing, so the numbers on an indeterminate receipt and a graded one are by
+    # construction the same numbers.
+    sb = out["falsify"]["survivors_before"]
+    sa = out["falsify"]["survivors_after"]
+    worsened = out["falsify"]["domains_worsened"]
+    categorical_stop = out["falsify"]["categorical_stop"]
 
     reasons = []
     if categorical_stop:
@@ -754,8 +817,16 @@ cmd_report() {
       printf '%s' "$sj" | jq -r '"    half-width \((.power.half_width*1000|round)/10)pp ≤ threshold \((.power.threshold*1000|round)/10)pp → conclusive"' \
         | while IFS= read -r l; do printf "  ${G}%s${R}\n" "$l"; done
     fi
-  else
+  elif [ "$(printf '%s' "$sj" | jq -r '.paired_tasks // 0')" = "0" ]; then
     printf "  ${W}    no paired tasks — the statistics could not be computed${R}\n"
+  else
+    # There ARE pairs; the statistics are withheld because a decision metric was never
+    # measured. Saying "no paired tasks" here would explain the withholding with a
+    # pairing failure that did not happen, and send whoever reads the receipt to fix the
+    # wrong thing.
+    printf "  ${W}    NOT MEASURED — statistics withheld: a decision metric is unavailable in an arm${R}\n"
+    printf '%s' "$sj" | jq -r '[.availability // {} | .[] | to_entries[] | select(.value.available == false) | .value.reason] | .[]' 2>/dev/null \
+      | while IFS= read -r l; do printf "  ${W}    %s${R}\n" "$l"; done
   fi
 
   printf "\n  ${B}falsify survival — CATEGORICAL${R} ${D}(no CI: --assert-score 1.0 semantics)${R}\n"
@@ -805,7 +876,25 @@ cmd_report() {
 
 cmd_verdict() {
   parse_ba "$@"
-  compute_stats "$BEFORE_F" "$AFTER_F" | jq -r '.verdict'
+  # FAIL CLOSED. `compute_stats | jq -r .verdict` printed an EMPTY line whenever the
+  # grader could not run at all — a snapshot that satisfies require_snap (which only
+  # checks that `.metrics` exists) but whose per_task is not a list of task records
+  # reaches the grader intact and dies there. A blank verdict is the worst output this
+  # tool can emit: `$(… verdict …)` yields "", every comparison against it is false, and
+  # the caller silently takes whichever branch it happened to write first. An
+  # uncomputable comparison is INDETERMINATE, said out loud, with a nonzero exit so no
+  # caller can mistake it for a graded run.
+  local sj v
+  sj="$(compute_stats "$BEFORE_F" "$AFTER_F" 2>/dev/null || true)"
+  v="$(printf '%s' "$sj" | jq -r '.verdict // empty' 2>/dev/null || true)"
+  if [ -z "$v" ]; then
+    printf "  ${P}x${R} the comparison could not be computed — the arms did not yield a gradeable\n" >&2
+    printf "     pair (a snapshot may be truncated or not carry per-task records). Reporting\n" >&2
+    printf "     INDETERMINATE: an ungradeable run is never a pass.\n" >&2
+    echo "indeterminate"
+    return 3
+  fi
+  printf '%s\n' "$v"
 }
 
 cmd_stats() {
