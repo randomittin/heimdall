@@ -480,6 +480,9 @@ do_report() {
   # shellcheck disable=SC2086
   rss="$([ "$orphans" -gt 0 ] && _rss_mb $pids || echo 0)"
 
+  local barepy
+  barepy="$(_num "$(_barepy_count)")"
+
   local proc_status="ok"
   [ "$orphans" -ge "$ORPHAN_WARN" ] && proc_status="warn"
   [ "$orphans" -ge "$ORPHAN_CRIT" ] && proc_status="crit"
@@ -503,7 +506,8 @@ do_report() {
     printf '"memory":{"status":"%s","swap_pct":%s,"wired_pct":%s,"avail_pct":%s},' \
       "$mem_status" "$swap_pct" "$wired_pct" "$avail_pct"
     printf '"disk":{"status":"%s"},' "$disk_status"
-    printf '"procs":{"status":"%s","hmd_orphans":%s,"resident_mb":%s},' "$proc_status" "$orphans" "$rss"
+    printf '"procs":{"status":"%s","hmd_orphans":%s,"resident_mb":%s,"python_orphans_unattributed":%s},' \
+      "$proc_status" "$orphans" "$rss" "$barepy"
     printf '"reclaim":{"disk_mb":%s,"temp_files":%s,"temp_kb":%s,"cc_versions":%s,"cc_mb":%s,"worktrees":%s}' \
       "$reclaim_mb" "$tempn" "$kb" "$ccn" "$mb" "$wt"
     printf '}\n'
@@ -517,10 +521,15 @@ do_report() {
   local _l="  %-8s %-5s %s\n"
   printf 'heimdall-cleanup — system health: %s\n' "$(printf '%s' "$sev_word" | tr '[:lower:]' '[:upper:]')"
   printf "$_l" "memory" "$mem_status" "$mem_desc"
+  # "no heimdall python leak" is a claim about what hmd can ATTRIBUTE, and it stays a separate
+  # sentence from the pile it cannot. Reporting only the first number is what made 224 live
+  # processes read as a clean machine on 2026-08-08.
+  local unattr=""
+  [ "$barepy" -gt 0 ] && unattr=" · ${barepy} unattributed bare-stdin python orphan(s) at ppid 1 (ownership unproven)"
   if [ "$orphans" -gt 0 ]; then
-    printf "$_l" "procs" "$proc_status" "${orphans} orphaned heimdall python (~${rss}MB resident, reap-safe)"
+    printf "$_l" "procs" "$proc_status" "${orphans} orphaned heimdall python (~${rss}MB resident, reap-safe)${unattr}"
   else
-    printf "$_l" "procs" "$proc_status" "no heimdall python leak"
+    printf "$_l" "procs" "$proc_status" "no ATTRIBUTABLE heimdall python leak${unattr}"
   fi
   printf "$_l" "disk" "$disk_status" "$disk_desc"
   printf "$_l" "reclaim" "-" "hmd-owned: ${tempn} temp ~${kb}KB · ${ccn} retired claude version(s) ~${mb}MB · ${wt} merged worktree(s) → ~${reclaim_mb}MB reclaimable now"

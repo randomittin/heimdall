@@ -162,9 +162,37 @@ case "$SUB" in
   serve)
     LIB_DIR="$LIB_DIR" HOST="$HOST" PORT="$PORT" HOME_DIR="$HOME_DIR" \
     NO_REVOCATION="$NO_REVOCATION" "$PY" - <<'PYEOF'
-import os, sys
+import os, sys, threading, time
 sys.path.insert(0, os.environ["LIB_DIR"])
 import cp_server
+
+# ── ORPHAN GUARD ────────────────────────────────────────────────────────────────────
+# This server is the SOURCE of the bare-`python3 -` orphan pile measured on 2026-08-08.
+# The chain: `heimdall-control-plane serve … &` runs this bare-stdin heredoc, so in ps the
+# process is exactly `python3 -` — no script path, no marker, nothing that attributes it.
+# The heredoc EOFs immediately (fd 0 is a regular temp file; lsof on a live orphan showed it
+# at EOF), so stdin was never the blocker: cp_server.serve() calls httpd.serve_forever(),
+# an unbounded loop whose ONLY stop signal was its launcher killing $SERVER_PID. When a test
+# dies before that kill — failed assertion, set -e, timeout, ctrl-C — this process reparents
+# to PID 1 and blocks in select() for days.
+#
+# The guard keys on an EXPLICIT pid, never on ppid==1, for the reason
+# test/heimdall-mock-cp-watchdog.test.sh already documents: a server launched through command
+# substitution reparents to launchd mid-run, so a ppid-based guard would kill a LIVE server.
+# Unset → no watchdog, so a supervised or nohup'd deployment is unaffected. A launcher that
+# wants its server to die with it exports HMD_CP_GUARD_PID=$$.
+_guard = int(os.environ.get("HMD_CP_GUARD_PID") or "0")
+if _guard > 0:
+    def _watchdog(pid):
+        while True:
+            try:
+                os.kill(pid, 0)
+            except OSError:
+                os._exit(0)
+            time.sleep(2)
+    threading.Thread(target=_watchdog, args=(_guard,),
+                     name="hmd-cp-orphan-guard", daemon=True).start()
+
 home = os.environ.get("HOME_DIR") or None
 enforce = not os.environ.get("NO_REVOCATION")
 host = os.environ.get("HOST", "127.0.0.1")

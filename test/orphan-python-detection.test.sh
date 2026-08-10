@@ -371,6 +371,84 @@ else
   done
 fi
 
+# ── 10. THE SOURCE. Detecting the pile is half the fix; this is the emitter that made it. ──
+# `heimdall-control-plane serve` runs cp_server.serve() → httpd.serve_forever() from a BARE
+# STDIN heredoc, which is why the leak renders as `python3 -` with nothing to attribute it.
+# Evidence (2026-08-10, live orphans on the reporting machine): lsof on two independent
+# ppid-1 orphans showed fd 0 = a 526-byte /private/var/tmp/sh-thd-* heredoc temp file AT EOF
+# — so stdin never blocked — while fd 1/2 pointed at a dead test's serve.out/serve.err. A
+# sweep of all 316 `… - <<TAG` heredocs in this repo found exactly ONE 526-byte bare-stdin
+# body: bin/heimdall-control-plane's `serve`.
+#
+# Structured exactly like test/heimdall-mock-cp-watchdog.test.sh, the suite that already
+# proves this convention for the mock fixtures: (a) the SHIPPED emitter carries the guard,
+# (b) the guard logic actually terminates an orphan. Both halves are required — (a) alone
+# would pass against a guard that never fires.
+CP="$ROOT/bin/heimdall-control-plane"
+if grep -q '_watchdog' "$CP" && grep -q 'HMD_CP_GUARD_PID' "$CP" && grep -q 'os._exit' "$CP"; then
+  ok "(10) the serve emitter carries the orphan-death watchdog"
+else
+  bad "(10) bin/heimdall-control-plane serve is MISSING the watchdog — serve_forever() can leak again"
+fi
+# The guard must key on an EXPLICIT pid, never on ppid==1: a server launched through command
+# substitution reparents to launchd mid-run, so a ppid guard would kill a LIVE server. This
+# pins the safe design in place so a later "simplification" to getppid()==1 goes red.
+if grep -q 'getppid' "$CP"; then
+  bad "(10) the guard uses getppid — a ppid==1 guard kills LIVE servers reparented by command substitution"
+else
+  ok "(10) the guard keys on an explicit pid, not ppid==1 (live servers stay safe)"
+fi
+# Unset guard ⇒ no watchdog at all, so a supervised/nohup deployment is untouched.
+if grep -q 'HMD_CP_GUARD_PID.*or "0"' "$CP"; then
+  ok "(10) an unset guard disables the watchdog (nohup/supervised deployments unaffected)"
+else
+  bad "(10) the watchdog is not opt-in — an unset HMD_CP_GUARD_PID must leave the server alone"
+fi
+
+# (b) the guard WORKS. Models the SHIPPED loop against a real process, hermetically: the
+# guard is a sleep we own, the watched program is a serve_forever stand-in, and the only
+# pids signalled are ones this test created.
+if command -v python3 >/dev/null 2>&1; then
+  sleep 60 & GUARD=$!
+  HMD_CP_GUARD_PID="$GUARD" python3 - <<'PY' >"$WORK/guard.out" 2>&1 &
+import os, sys, threading, time
+_guard = int(os.environ.get("HMD_CP_GUARD_PID") or "0")
+if _guard > 0:
+    def _watchdog(pid):
+        while True:
+            try:
+                os.kill(pid, 0)
+            except OSError:
+                os._exit(0)
+            time.sleep(0.1)
+    threading.Thread(target=_watchdog, args=(_guard,), daemon=True).start()
+time.sleep(30)
+PY
+  WATCHED=$!
+  # it must still be alive while the guard lives — otherwise the next assertion proves nothing.
+  if kill -0 "$WATCHED" 2>/dev/null; then
+    ok "(10) the guarded server stays alive while its guard lives"
+  else
+    bad "(10) the guarded server died with its guard still alive — the watchdog is trigger-happy"
+  fi
+  kill -9 "$GUARD" 2>/dev/null || true      # SIGKILL: no chance to clean up after itself
+  wait "$GUARD" 2>/dev/null || true
+  gone=""
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    kill -0 "$WATCHED" 2>/dev/null || { gone=1; break; }
+    sleep 0.25
+  done
+  if [ -n "$gone" ]; then
+    ok "(10) the server self-terminated when its guard was SIGKILLed (no orphan left behind)"
+  else
+    bad "(10) the server LEAKED after its guard was SIGKILLed — the watchdog does not fire"
+  fi
+  kill -9 "$WATCHED" 2>/dev/null || true    # never leave this suite's own process behind
+  wait "$WATCHED" 2>/dev/null || true
+else
+  echo "  SKIP (10) watchdog behaviour (no python3)"
+fi
+
 echo
 printf 'orphan-python-detection: %d passed, %d failed\n' "$P" "$F"
 [ "$F" -eq 0 ]

@@ -42,6 +42,7 @@ q="$(HMD_SYSMON_DISK_WARN_PCT=100 HMD_SYSMON_DISK_CRIT_PCT=101 \
      HMD_SYSMON_SWAP_WARN_PCT=101 HMD_SYSMON_SWAP_CRIT_PCT=102 \
      HMD_SYSMON_WIRED_WARN_PCT=101 HMD_SYSMON_ORPHAN_WARN=100000 \
      HMD_SYSMON_ORPHAN_CRIT=100001 HMD_SYSMON_RUNAWAY_ANY=100000 \
+     HMD_SYSMON_BAREPY_WARN=100000 HMD_SYSMON_BAREPY_CRIT=100001 \
      "$BIN" --quiet 2>&1)"; qrc=$?
 [ -z "$q" ] && [ "$qrc" = 0 ] && ok "--quiet silent + exit 0 when healthy" \
   || bad "--quiet not silent/clean when healthy (rc=$qrc out='$q')"
