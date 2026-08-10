@@ -323,6 +323,31 @@ _reboot_worthy() {
   return 1
 }
 
+# ── the ORPHAN axis of the advisory gate (INDEPENDENT of memory) ──────────────────
+# An orphan pile and memory pressure are separate failures with separate causes. The
+# advisory used to be reachable only through _reboot_worthy, which made the orphan monitor
+# a passenger on the memory monitor: on a machine with healthy RAM the pile could grow
+# without bound and nothing was said. That is the same defect the whole orphan-detection
+# effort exists to kill — a monitor whose silence is indistinguishable from health — one
+# level up from where it was first found.
+#
+# Both floors already exist and are REUSED rather than re-invented, so the advisory can
+# never disagree with the report about what counts as a leak:
+#   · ORPHAN_WARN       — the count at which `report` already suggests a reap (hmd's OWN).
+#   · BAREPY_ADVISE_MIN — the pile-up floor for orphans hmd cannot attribute. Deliberately
+#     higher: pointing an operator at a reaper over a handful of processes hmd cannot even
+#     prove are its own is how a real signal gets tuned out before it matters.
+#   $1 attributable hmd orphans   $2 unattributed bare-stdin orphans
+_orphan_worthy() {
+  [ "$(_num "${1:-0}")" -ge "$ORPHAN_WARN" ] 2>/dev/null && return 0
+  [ "$(_num "${2:-0}")" -ge "$BAREPY_ADVISE_MIN" ] 2>/dev/null && return 0
+  return 1
+}
+
+# the ADVISORY GATE: the UNION of the two axes. Either one alone is enough to speak; both
+# together still produce ONE line (the SessionStart output budget), never two.
+_advisory_worthy() { _reboot_worthy || _orphan_worthy "$@"; }
+
 # ── persistent wired-memory holders (CHEAP detection; PRINT-PATH ONLY) ────────────
 # Wired RAM is kernel-side: heimdall cannot free it, and neither does a reboot DURABLY — a
 # restart drops the pages, but any holder that re-arms at boot re-wires them straight back.
@@ -383,8 +408,43 @@ _disk_axis_note() {
 #     named when one is detectable and declared unidentified when it is not.
 # Every number is a real reading.
 #   $1 orphans   $2 resident-MB held by those orphans   $3 hmd-reclaimable disk MB
+#   $4 unattributed bare-stdin orphans (optional; only the ORPHAN-axis branch renders it)
 _reboot_advisory() {
-  local orphans="$1" rss="$2" reclaim_mb="$3" holders
+  local orphans="$1" rss="$2" reclaim_mb="$3" barepy holders
+  barepy="$(_num "${4:-0}")"
+
+  # THE ORPHAN AXIS ON ITS OWN. Reached when the pile crossed its floor and memory did NOT:
+  # saying "memory pressure is HIGH" here would fabricate a reading the probe never took, so
+  # this branch states what was actually measured and explains why it is speaking anyway.
+  # The wired-RAM/holder paragraphs below are deliberately absent — there is no wired-RAM
+  # problem to explain, and padding an advisory with irrelevant remedies is how it stops
+  # being read.
+  if ! _reboot_worthy; then
+    printf '  • memory is HEALTHY (swap %sG/%sG = %s%%, wired %s%%) — this advisory is on the ORPHAN\n' \
+      "$swap_used_g" "$swap_total_g" "$swap_pct" "$wired_pct"
+    printf '    axis, which moves independently of memory. A pile accumulates whether or not RAM is\n'
+    printf '    tight, so a quiet memory reading is NOT evidence of a clean process table.\n'
+    if [ "$orphans" -gt 0 ]; then
+      printf '    %s orphaned hmd python at ppid 1 holding ~%sMB resident (MEMORY axis). This one IS\n' "$orphans" "$rss"
+      printf '    heimdall'\''s, and heimdall says so. Reap its OWN leak:\n'
+      printf '        heimdall-cleanup --apply\n'
+    else
+      printf '    no ATTRIBUTABLE heimdall python leak — 0 hmd-owned orphans.\n'
+    fi
+    if [ "$barepy" -gt 0 ]; then
+      printf '    %s unattributed bare-stdin python orphan(s) at ppid 1. hmd CANNOT prove these are\n' "$barepy"
+      printf '    its own — a bare python3 - command line carries no attribution — so it neither\n'
+      printf '    claims nor denies them, and NEVER reaps them unasked. Inspect them first:\n'
+      printf '        ps -Ao pid,ppid,lstart,tty,command | awk %s\n' "'\$2==1 && /python3 -\$/'"
+      if [ "$barepy" -ge "$BAREPY_ADVISE_MIN" ] 2>/dev/null; then
+        printf '    then reap ONLY the aged, detached, outside-your-own-tree ones:\n'
+        printf '        heimdall-cleanup --apply\n'
+      fi
+    fi
+    _disk_axis_note "$reclaim_mb"
+    return 0
+  fi
+
   holders="$(_wired_holders 2>/dev/null || true)"
 
   if [ "$orphans" -gt 0 ]; then
@@ -469,6 +529,38 @@ _reboot_advisory_line() {
   return 0
 }
 
+# the ONE-LINE form for the ORPHAN axis: memory is FINE and the pile is the entire reason
+# anything is being said. Same attribution discipline as the memory-pressure line above —
+# hmd claims what it can prove and names what it cannot — with one difference: no memory
+# prescription rides along, because there is no memory problem to prescribe for. Inventing
+# a "pressure is HIGH" preamble to reuse the existing sentence would put a figure in front
+# of the operator that no probe ever measured.
+#   $1 orphans   $2 resident-MB held by those orphans   $3 unattributed bare-stdin orphans
+_orphan_advisory_line() {
+  local orphans="$1" rss="$2" barepy own="" unattr="" remedy=""
+  barepy="$(_num "${3:-0}")"
+  if [ "$orphans" -gt 0 ] 2>/dev/null; then
+    own=" ${orphans} orphaned hmd python holding ~${rss}MB (MEMORY axis) is heimdall's OWN leak."
+    remedy=" Reap hmd's own leak: heimdall-cleanup --apply ·"
+  fi
+  if [ "$barepy" -gt 0 ] 2>/dev/null; then
+    unattr=" ${barepy} unattributed bare-stdin python orphan(s): ownership UNPROVEN, hmd neither claims nor denies them."
+    # the remedy for the unproven pile is offered ONLY past the pile-up floor, and only ever
+    # as the GUARDED subset (aged + detached + outside your own tree). hmd must never read as
+    # volunteering to kill processes it cannot prove are its own.
+    if [ "$orphans" -le 0 ] 2>/dev/null; then
+      if [ "$barepy" -ge "$BAREPY_ADVISE_MIN" ] 2>/dev/null; then
+        remedy=" Reap only the aged+detached ones: heimdall-cleanup --apply ·"
+      else
+        unattr="$unattr hmd will not reap them blindly."
+      fi
+    fi
+  fi
+  printf '[heimdall] orphan pile at ppid 1 — memory is HEALTHY (swap %sG/%sG = %s%%, wired %s%%), these are INDEPENDENT axes:%s%s%s detail: heimdall-cleanup --advise --verbose\n' \
+    "$swap_used_g" "$swap_total_g" "$swap_pct" "$wired_pct" "$own" "$unattr" "$remedy"
+  return 0
+}
+
 # ── REPORT (read-only) ────────────────────────────────────────────────────────────
 do_report() {
   _ps_prime          # one ps snapshot shared by the orphan scope and the wired-holder probe
@@ -544,7 +636,7 @@ do_report() {
     printf '      heimdall-cleanup --apply\n'
   fi
   if _reboot_worthy; then
-    _reboot_advisory "$orphans" "$rss" "$reclaim_mb"
+    _reboot_advisory "$orphans" "$rss" "$reclaim_mb" "$barepy"
   elif [ "$mem_status" != "ok" ]; then
     printf '  • memory pressure: reaping hmd'\''s own footprint does not touch wired RAM. macOS\n'
     printf '    reclaims swap on its own as pressure eases; wired RAM needs its holder removed.\n'
@@ -632,9 +724,13 @@ do_apply() {
   return 0
 }
 
-# ── ADVISE (read-only reboot advisory for the SessionStart hook) ──────────────────
-# Speaks ONLY when memory pressure is genuinely HIGH (reboot-worthy). Honors the opt-out.
-# Mutates NOTHING — sysmon read-only, orphan scope, gc --dry-run. Never reaps.
+# ── ADVISE (read-only system-health advisory for the SessionStart hook) ───────────
+# Speaks when EITHER axis is in trouble: memory pressure is genuinely HIGH (reboot-worthy),
+# OR the orphan population has crossed its floor. The two are INDEPENDENT failures — a pile
+# grows whether or not RAM is tight — so gating one behind the other makes the orphan monitor
+# go quiet exactly when nothing else is wrong. Whichever axis fires, the terse form is ONE
+# line (the SessionStart budget), never two. Honors the opt-out. Mutates NOTHING — sysmon
+# read-only, orphan scope, gc --dry-run. Never reaps.
 do_advise() {
   if opted_out; then return 0; fi
 
@@ -647,12 +743,19 @@ do_advise() {
   [ -x "$DEADCODE" ] && "$DEADCODE" --advise 2>/dev/null || true
 
   _probe_memory
-  _reboot_worthy || return 0   # non-spammy: silent on a healthy / merely-warn machine
   _ps_prime          # one ps snapshot shared by the orphan scope and the wired-holder probe
 
-  local pids orphans rss
+  # BOTH axes are measured BEFORE the gate, because either one on its own is reason enough to
+  # speak. Counting orphans only after a memory check is precisely the defect this replaced:
+  # on 2026-08-08 this repo carried 224 live orphans while memory read healthy, and the
+  # advisory said nothing. One ps snapshot per session start is the price of not being blind.
+  local pids orphans rss barepy
   pids="$(_orphan_pids)"
   orphans="$(printf '%s\n' "$pids" | grep -c . || true)"; orphans="$(_num "$orphans")"
+  barepy="$(_num "$(_barepy_count)")"
+
+  _advisory_worthy "$orphans" "$barepy" || return 0   # non-spammy: silent on a genuinely healthy machine
+
   # shellcheck disable=SC2086
   rss="$([ "$orphans" -gt 0 ] && _rss_mb $pids || echo 0)"
 
@@ -667,10 +770,17 @@ do_advise() {
   # DETECTED, so a machine under real pressure is reported in both modes.
   if [ "$VERBOSE" = 1 ]; then
     printf '[heimdall] system-health advisory:\n'
-    _reboot_advisory "$orphans" "$rss" "$reclaim_mb"
+    _reboot_advisory "$orphans" "$rss" "$reclaim_mb" "$barepy"
     return 0
   fi
-  _reboot_advisory_line "$orphans" "$rss" "$(_barepy_count)"
+  # ONE line whichever axis fired. When BOTH are true the memory line takes the slot: it is
+  # the more urgent reading AND it already carries both orphan counts inside it, so nothing is
+  # lost by not printing a second line — and the SessionStart budget stays a hard one line.
+  if _reboot_worthy; then
+    _reboot_advisory_line "$orphans" "$rss" "$barepy"
+  else
+    _orphan_advisory_line "$orphans" "$rss" "$barepy"
+  fi
   return 0
 }
 

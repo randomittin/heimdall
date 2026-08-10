@@ -295,9 +295,12 @@ else
 fi
 
 MUTC="$WORK/heimdall-cleanup.mutant"
-sed 's/^  _reboot_worthy || return 0.*$/  return 0/' "$CLEAN" > "$MUTC"
+# the anchor is the ADVISORY GATE, which is the union of the memory axis and the orphan axis
+# (_advisory_worthy). Mutating it to a bare `return 0` short-circuits do_advise before either
+# axis can render, so the LOUD assertions above have to notice the silence.
+sed 's/^  _advisory_worthy .*$/  return 0/' "$CLEAN" > "$MUTC"
 if cmp -s "$MUTC" "$CLEAN"; then
-  bad "(10) PROVE-RED: the _reboot_worthy anchor is missing from bin/heimdall-cleanup"
+  bad "(10) PROVE-RED: the _advisory_worthy gate anchor is missing from bin/heimdall-cleanup"
 else
   chmod +x "$MUTC"
   CBIN="$MUTC"
