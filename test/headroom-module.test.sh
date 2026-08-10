@@ -145,11 +145,11 @@ echo "H1 — listed as AVAILABLE, and honest that it is NOT installed"
 # "nothing is installed" is a fact the suite established rather than one it
 # inherited from whoever ran hmd on this machine last.
 LIST="$(hmd_absent list 2>&1)"
-printf '%s' "$LIST" | grep -q 'headroom' \
+grep -q 'headroom' <<<"$LIST" \
   && ok "\`hmd modules\` lists headroom" || bad "headroom is not listed"
-printf '%s' "$LIST" | grep -qE 'headroom +available' \
+grep -qE 'headroom +available' <<<"$LIST" \
   && ok "it is listed at tier available" || bad "headroom is not listed as available"
-printf '%s' "$LIST" | grep -q 'Installed: none' \
+grep -q 'Installed: none' <<<"$LIST" \
   && ok "nothing is installed — the base install ships zero payloads" \
   || bad "something is reported installed"
 JLIST="$(hmd_absent --json list 2>/dev/null)"
@@ -158,7 +158,7 @@ JLIST="$(hmd_absent --json list 2>/dev/null)"
 [ "$(printf '%s' "$JLIST" | jq -r '.available[] | select(.name=="headroom") | .tier')" = "available" ] \
   && ok "json list reports headroom at tier available" || bad "json tier is wrong"
 STATUS="$(hmd_absent status headroom 2>&1)"
-printf '%s' "$STATUS" | grep -q 'not installed' \
+grep -q 'not installed' <<<"$STATUS" \
   && ok "\`status headroom\` is honest that it is absent" || bad "status is not honest about absence"
 [ "$(hmd_absent --json status headroom 2>/dev/null | jq -r '.installed')" = "false" ] \
   && ok "json status reports installed:false" || bad "json status is not honest"
@@ -170,10 +170,10 @@ printf '%s' "$STATUS" | grep -q 'not installed' \
 # REASON as well as the verdict is what stops a seam that has silently stopped
 # looking from reading as a seam that looked and found nothing.
 CODEC="$(python3 "$REPO/bin/lib/memory_codec.py" status 2>&1)"
-printf '%s' "$CODEC" | grep -q 'available: no' \
+grep -q 'available: no' <<<"$CODEC" \
   && ok "the codec seam is on the plain backend — the uv-tool install never reaches hmd's import path" \
   || bad "the codec seam claims a backend hmd cannot import"
-printf '%s' "$CODEC" | grep -q 'not importable' \
+grep -q 'not importable' <<<"$CODEC" \
   && ok "…and it NAMES the reason: headroom is not importable from hmd's interpreter" \
   || bad "the seam reports plain without saying headroom is unimportable"
 
@@ -190,10 +190,10 @@ PADD="$(hmd_present add headroom --yes 2>&1)"; PRC=$?
 [ "$PRC" -eq 0 ] && ok "the module installs into a state root the suite owns (exit 0)" \
   || { bad "add into the scratch present root failed (exit $PRC)"; printf '%s\n' "$PADD" | tail -15; }
 PLIST="$(hmd_present list 2>&1 | tr -s ' ')"
-printf '%s' "$PLIST" | grep -q 'Installed: none' \
+grep -q 'Installed: none' <<<"$PLIST" \
   && bad "list still reports 'Installed: none' with the module installed" \
   || ok "list stops claiming an empty install set once the module is there"
-printf '%s' "$PLIST" | grep -qF "headroom $PIN" \
+grep -qF "headroom $PIN" <<<"$PLIST" \
   && ok "list names headroom at the manifest pin ($PIN)" || bad "list does not report the installed pin"
 PJLIST="$(hmd_present --json list 2>/dev/null)"
 [ "$(printf '%s' "$PJLIST" | jq -r '.installed_count')" = "1" ] \
@@ -201,10 +201,10 @@ PJLIST="$(hmd_present --json list 2>/dev/null)"
 [ "$(printf '%s' "$PJLIST" | jq -r '[.installed[] | select(.name=="headroom")] | length')" = "1" ] \
   && ok "json list names headroom under installed" || bad "json list lost the installed module"
 PSTATUS="$(hmd_present status headroom 2>&1 | tr -s ' ')"
-printf '%s' "$PSTATUS" | grep -q 'not installed' \
+grep -q 'not installed' <<<"$PSTATUS" \
   && bad "status still claims absence with the module installed" \
   || ok "\`status headroom\` is honest about PRESENCE — it stops claiming absence"
-printf '%s' "$PSTATUS" | grep -qF "pin: $PIN" \
+grep -qF "pin: $PIN" <<<"$PSTATUS" \
   && ok "status reports the pin it installed" || bad "status does not report the installed pin"
 [ "$(hmd_present --json status headroom 2>/dev/null | jq -r '.installed')" = "true" ] \
   && ok "json status reports installed:true" || bad "json status hides the install"
@@ -317,9 +317,9 @@ mutate 'del(.invariants["round-trip-fidelity"])'
 OUT="$(add_mut hole)"; RC=$?
 [ "$RC" -ne 0 ] && ok "RED ARM: a manifest with an uncovered invariant is refused" \
                || bad "an uncovered invariant was accepted"
-printf '%s' "$OUT" | grep -q 'round-trip-fidelity' \
+grep -q 'round-trip-fidelity' <<<"$OUT" \
   && ok "the refusal names the uncovered invariant" || bad "the refusal did not name the hole"
-printf '%s' "$OUT" | grep -q 'storage-codec' \
+grep -q 'storage-codec' <<<"$OUT" \
   && ok "the refusal names the class that demanded it" || bad "the refusal did not name the class"
 [ ! -e "$TMP/state/hole/headroom" ] \
   && ok "the refused manifest installed nothing" || bad "a refused manifest left residue"
@@ -335,13 +335,13 @@ restore
 mutate '.pinned_version.artifact_sha256 = "not-a-real-digest"'
 OUT="$(add_mut badpin)"; RC=$?
 [ "$RC" -ne 0 ] && ok "a non-hex pin digest is refused" || bad "a bad pin was accepted"
-printf '%s' "$OUT" | grep -q 'artifact_sha256' \
+grep -q 'artifact_sha256' <<<"$OUT" \
   && ok "the refusal names artifact_sha256" || bad "the refusal did not name the field"
 restore
 mutate 'del(.pinned_version)'
 OUT="$(add_mut nopin)"; RC=$?
 [ "$RC" -ne 0 ] && ok "a missing pin is refused — there is no latest" || bad "a missing pin was accepted"
-printf '%s' "$OUT" | grep -q 'pinned_version' \
+grep -q 'pinned_version' <<<"$OUT" \
   && ok "the refusal names pinned_version" || bad "the refusal did not name pinned_version"
 
 echo
@@ -351,7 +351,7 @@ mutate 'del(.consent_text)'
 OUT="$(add_mut noconsent)"; RC=$?
 [ "$RC" -ne 0 ] && ok "a consent-required class with no disclosure text is refused" \
                || bad "a blank consent prompt was accepted"
-printf '%s' "$OUT" | grep -q 'consent_text' \
+grep -q 'consent_text' <<<"$OUT" \
   && ok "the refusal names consent_text" || bad "the refusal did not name consent_text"
 [ ! -e "$TMP/state/noconsent/headroom" ] \
   && ok "the consent refusal installed nothing" || bad "a consent refusal left residue"
@@ -367,9 +367,9 @@ mutate '.tier = "suggested"'
 OUT="$(add_mut suggested)"; RC=$?
 [ "$RC" -ne 0 ] && ok "flipping tier to suggested WITHOUT a receipt is refused" \
                || bad "suggested was reachable without evidence"
-printf '%s' "$OUT" | grep -q 'tier_evidence' \
+grep -q 'tier_evidence' <<<"$OUT" \
   && ok "the refusal demands tier_evidence.receipt" || bad "the refusal did not demand a receipt"
-printf '%s' "$OUT" | grep -qi 'advertisement' \
+grep -qi 'advertisement' <<<"$OUT" \
   && ok "the refusal says why: a recommendation without evidence is an advertisement" \
   || bad "the refusal gave no rationale"
 restore

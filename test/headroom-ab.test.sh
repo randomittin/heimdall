@@ -99,16 +99,16 @@ got="$("$AB" verdict --before "$TMP/deg-a.json" --after "$TMP/deg-b.json" 2>/dev
   || bad "degraded arm -> verdict '$got', expected 'unwrap'"
 
 rep="$("$AB" report --before "$TMP/deg-a.json" --after "$TMP/deg-b.json" 2>&1 | plain)"
-printf '%s' "$rep" | grep -q 'VERDICT: UNWRAP' \
+grep -q 'VERDICT: UNWRAP' <<<"$rep" \
   && ok "degraded report renders VERDICT: UNWRAP" \
   || bad "degraded report did not render VERDICT: UNWRAP"
-printf '%s' "$rep" | grep -q 'headroom unwrap claude' \
+grep -q 'headroom unwrap claude' <<<"$rep" \
   && ok "degraded report names the exact action: headroom unwrap claude" \
   || bad "degraded report never names 'headroom unwrap claude'"
-printf '%s' "$rep" | grep -q 'entirely below zero' \
+grep -q 'entirely below zero' <<<"$rep" \
   && ok "degraded report justifies via the interval lying entirely below zero" \
   || bad "degraded report does not cite the interval position"
-printf '%s' "$rep" | grep -qi 'NEGATIVE receipt' \
+grep -qi 'NEGATIVE receipt' <<<"$rep" \
   && ok "degraded report instructs publishing the NEGATIVE receipt" \
   || bad "degraded report never mentions the negative receipt"
 
@@ -123,10 +123,10 @@ got="$("$AB" verdict --before "$TMP/neu-a.json" --after "$TMP/neu-b.json" 2>/dev
   || bad "neutral powered arm -> verdict '$got', expected 'keep'"
 
 rep="$("$AB" report --before "$TMP/neu-a.json" --after "$TMP/neu-b.json" 2>&1 | plain)"
-printf '%s' "$rep" | grep -q 'VERDICT: KEEP' \
+grep -q 'VERDICT: KEEP' <<<"$rep" \
   && ok "neutral report renders VERDICT: KEEP" \
   || bad "neutral report did not render VERDICT: KEEP"
-printf '%s' "$rep" | grep -qi 'POSITIVE receipt' \
+grep -qi 'POSITIVE receipt' <<<"$rep" \
   && ok "neutral report instructs publishing the POSITIVE receipt" \
   || bad "neutral report never mentions the positive receipt"
 
@@ -145,18 +145,18 @@ got="$("$AB" verdict --before "$TMP/up-a.json" --after "$TMP/up-b.json" 2>/dev/n
   || bad "underpowered arm resolved to keep — an underpowered null sold as a pass"
 
 rep="$("$AB" report --before "$TMP/up-a.json" --after "$TMP/up-b.json" 2>&1 | plain)"
-printf '%s' "$rep" | grep -q 'VERDICT: UNDERPOWERED' \
+grep -q 'VERDICT: UNDERPOWERED' <<<"$rep" \
   && ok "underpowered report renders VERDICT: UNDERPOWERED" \
   || bad "underpowered report did not render VERDICT: UNDERPOWERED"
-printf '%s' "$rep" | grep -qi 'could not tell' \
+grep -qi 'could not tell' <<<"$rep" \
   && ok "underpowered report says the run could not tell" \
   || bad "underpowered report never says the run could not tell"
-if printf '%s' "$rep" | grep -qi 'no degradation found'; then
+if grep -qi 'no degradation found' <<<"$rep"; then
   bad "underpowered report claims 'no degradation found' — the exact banned phrasing"
 else
   ok "underpowered report never claims 'no degradation found'"
 fi
-printf '%s' "$rep" | grep -q '10pp' \
+grep -q '10pp' <<<"$rep" \
   && ok "underpowered report cites the pre-committed 10pp threshold" \
   || bad "underpowered report never cites the 10pp threshold"
 
@@ -171,10 +171,10 @@ got="$("$AB" verdict --before "$TMP/cat-a.json" --after "$TMP/cat-b.json" 2>/dev
   || bad "surviving mutant -> verdict '$got', expected 'unwrap'"
 
 rep="$("$AB" report --before "$TMP/cat-a.json" --after "$TMP/cat-b.json" 2>&1 | plain)"
-printf '%s' "$rep" | grep -q 'CATEGORICAL STOP' \
+grep -q 'CATEGORICAL STOP' <<<"$rep" \
   && ok "categorical report labels the stop CATEGORICAL" \
   || bad "categorical report never labels the stop as categorical"
-printf '%s' "$rep" | grep -qi 'No confidence interval applies' \
+grep -qi 'No confidence interval applies' <<<"$rep" \
   && ok "categorical stop states that no confidence interval applies" \
   || bad "categorical stop does not state the no-CI rule"
 
@@ -211,20 +211,20 @@ sj="$("$AB" stats --before "$TMP/exc-a.json" --after "$TMP/exc-b.json" 2>/dev/nu
 
 # ── 6. MISSING INPUT RENDERS `unavailable`, NEVER 0 ─────────────────────────
 rep="$("$AB" report --before "$TMP/neu-a.json" --after "$TMP/neu-b.json" 2>&1 | plain)"
-tok_line="$(printf '%s\n' "$rep" | grep -E '^[[:space:]]+tokens in' | head -1)"
-printf '%s' "$tok_line" | grep -q 'unavailable' \
+tok_line="$(grep -E '^[[:space:]]+tokens in' <<<"$rep" | head -1)"
+grep -q 'unavailable' <<<"$tok_line" \
   && ok "an unsupplied token count renders 'unavailable'" \
   || bad "tokens-in row did not render unavailable: '$tok_line'"
-if printf '%s' "$tok_line" | grep -qE '(^|[^0-9.])0([^0-9.]|$)'; then
+if grep -qE '(^|[^0-9.])0([^0-9.]|$)' <<<"$tok_line"; then
   bad "tokens-in row rendered a bare 0 for missing data: '$tok_line'"
 else
   ok "tokens-in row renders NO digits at all — cannot be misread as a measured 0"
 fi
-cost_line="$(printf '%s\n' "$rep" | grep -E '^[[:space:]]+cost \(USD\)' | head -1)"
-printf '%s' "$cost_line" | grep -q 'unavailable' \
+cost_line="$(grep -E '^[[:space:]]+cost \(USD\)' <<<"$rep" | head -1)"
+grep -q 'unavailable' <<<"$cost_line" \
   && ok "an unsupplied dollar figure renders 'unavailable', not an invented cost" \
   || bad "cost row did not render unavailable: '$cost_line'"
-printf '%s' "$rep" | grep -q 'why a figure is unavailable' \
+grep -q 'why a figure is unavailable' <<<"$rep" \
   && ok "the report explains WHY each figure is unavailable" \
   || bad "the report never explains its unavailable figures"
 
@@ -257,7 +257,7 @@ h2="$("$AB" preregister 2>/dev/null | plain | grep -o 'rule_hash: [0-9a-f]*' | h
 
 # A snapshot registered under a different rule is called out, not accepted.
 rep="$("$AB" report --before "$TMP/neu-a.json" --after "$TMP/neu-b.json" 2>&1 | plain)"
-printf '%s' "$rep" | grep -q 'RULE PROVENANCE' \
+grep -q 'RULE PROVENANCE' <<<"$rep" \
   && ok "an arm whose rule_hash differs is flagged, not silently accepted" \
   || bad "a mismatched rule_hash was accepted silently"
 
