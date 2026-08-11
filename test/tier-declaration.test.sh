@@ -78,7 +78,8 @@ mk_agent() {
     printf '%s\n' '---'
     printf 'name: %s\n' "$name"
     printf 'description: fixture template for the tier conformance gate\n'
-    printf 'model: %s\n' "$model"
+    # model may be empty on purpose: a `tier: inherit` template pins no model.
+    [ -n "$model" ]  && printf 'model: %s\n' "$model"
     [ -n "$tier" ]   && printf 'tier: %s\n' "$tier"
     [ -n "$reason" ] && printf 'tier_reason: %s\n' "$reason"
     printf '%s\n' '---'
@@ -138,6 +139,63 @@ if [ "$rc" -ne 0 ] && grep -qi 'security' "$TMP/e" "$TMP/o"; then
   ok "conformance REFUSES a security-sensitive class below its tier, reason or not"
 else
   bad "conformance allowed gate_adjudication downgraded to haiku (rc=$rc) — binding rule unenforced"
+fi
+
+# ── 6b. tier: inherit — DELIBERATE DEFERENCE TO THE OPERATOR'S DEFAULT ──
+# The main orchestrator pins no model: it runs on whatever Claude Code default
+# the human chose. That must be DECLARABLE, or the only way to ship it is a
+# blank tier: — which is exactly the invisible drift this gate exists to catch.
+# The invariant is unchanged: the declaration is still cross-checked against
+# what executes, here as an ABSENCE.
+
+FIX_INH_MODEL="$TMP/fix-inherit-model"
+mk_agent "$FIX_INH_MODEL" heimdall opus inherit "deferring to the operator default"
+run_check "$FIX_INH_MODEL"; rc=$?
+if [ "$rc" -ne 0 ] && grep -qi 'both' "$TMP/e" "$TMP/o"; then
+  ok "conformance fails 'inherit' that ALSO pins a model (two claims at once)"
+else
+  bad "conformance passed tier=inherit with model=opus (rc=$rc) — a template claiming both"
+fi
+
+FIX_INH_NOREASON="$TMP/fix-inherit-noreason"
+mk_agent "$FIX_INH_NOREASON" heimdall "" inherit
+run_check "$FIX_INH_NOREASON"; rc=$?
+if [ "$rc" -ne 0 ] && grep -qi 'security-sensitive' "$TMP/e" "$TMP/o"; then
+  ok "conformance fails 'inherit' on a security-sensitive class with NO stated reason"
+else
+  bad "conformance passed unreasoned inherit on class orchestrator (rc=$rc) — the operator default could sit below opus and nobody would have owned that"
+fi
+
+FIX_INH_OK="$TMP/fix-inherit-ok"
+mk_agent "$FIX_INH_OK" heimdall "" inherit "unpinned by owner directive; the risk that the operator default sits below opus is seen and accepted"
+run_check "$FIX_INH_OK"; rc=$?
+[ "$rc" -eq 0 ] \
+  && ok "conformance PASSES 'inherit' on a security-sensitive class WITH a stated reason" \
+  || bad "conformance rejected a reasoned inherit (rc=$rc): $(cat "$TMP/e")"
+
+FIX_INH_PLAIN="$TMP/fix-inherit-plain"
+mk_agent "$FIX_INH_PLAIN" coder "" inherit
+run_check "$FIX_INH_PLAIN"; rc=$?
+[ "$rc" -eq 0 ] \
+  && ok "conformance PASSES 'inherit' with no reason on a NON-sensitive class" \
+  || bad "conformance demanded a reason for inherit on class coder (rc=$rc): $(cat "$TMP/e")"
+
+# inherit is rankless: it must never be read as an escalation or a downgrade.
+FIX_INH_OK2="$TMP/fix-inherit-rankless"
+mk_agent "$FIX_INH_OK2" reviewer "" inherit "operator default, accepted"
+run_check "$FIX_INH_OK2"; rc=$?
+if [ "$rc" -eq 0 ] && ! grep -qi 'below its\|departs from' "$TMP/e" "$TMP/o"; then
+  ok "inherit takes no part in the rank arithmetic (not reported as a downgrade)"
+else
+  bad "inherit was rank-compared on a security-sensitive class (rc=$rc): $(cat "$TMP/e")"
+fi
+
+# and the SHIPPED repo renders the orchestrator as inherit, not as a tier
+"$TIER" check --repo "$REPO" >"$TMP/real.out" 2>"$TMP/real.err"; rc=$?
+if [ "$rc" -eq 0 ] && grep -qE '~ +heimdall +inherit' "$TMP/real.out"; then
+  ok "shipped agents/heimdall.md renders as '~ heimdall inherit' (unpinned, and visibly so)"
+else
+  bad "shipped heimdall.md is not rendered as inherit (rc=$rc): $(cat "$TMP/real.err")"
 fi
 
 # ── 7-9. DECLARATION RECORDS ──

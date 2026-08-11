@@ -69,6 +69,12 @@ def repo_root(explicit=None):
     return fallback
 
 
+# A declaration of deference, not a tier: the template pins no model and runs on
+# the operator's own Claude Code default. It deliberately carries no rank and no
+# price, so it can never take part in the escalate/downgrade arithmetic.
+INHERIT = 'inherit'
+
+
 def rank(table, tier):
     return table['tiers'].get(tier, {}).get('rank')
 
@@ -298,7 +304,9 @@ def cmd_check(args):
                             'default invisibly (class %r wants %s)'
                             % (rel, cls, class_tier(table, cls)))
             continue
-        if rank(table, declared) is None:
+        # `inherit` is rankless by design (see INHERIT), so it must be exempted
+        # here or the rankless check below would misreport it as a typo.
+        if declared != INHERIT and rank(table, declared) is None:
             failures.append('%s: unknown tier %r' % (rel, declared))
             continue
 

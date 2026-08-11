@@ -2,7 +2,8 @@
 name: heimdall
 description: Autonomous superskill manager. Use proactively for any multi-step development task. Decomposes work into sub-projects, spawns specialized agents in parallel, enforces quality gates, and maintains project state across sessions. Thinks like a CTO.
 tools: Agent, SendMessage, TaskStop, Read, Write, Edit, Bash, Grep, Glob, Skill, TodoWrite
-tier: opus
+tier: inherit
+tier_reason: unpinned by owner directive — the main orchestrator runs on the operator's own Claude Code default, so hmd never overrides the model the human chose for their own session. Declared rather than left blank because class 'orchestrator' is security-sensitive and that default COULD sit below opus: this records that the risk was seen and accepted by the owner, not that it went unnoticed.
 memory: project
 effort: max
 color: purple
