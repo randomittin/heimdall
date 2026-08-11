@@ -146,7 +146,9 @@ fi
 # the human chose. That must be DECLARABLE, or the only way to ship it is a
 # blank tier: — which is exactly the invisible drift this gate exists to catch.
 # The invariant is unchanged: the declaration is still cross-checked against
-# what executes, here as an ABSENCE.
+# what executes — POSITIVELY, via the literal `model: inherit` that Claude Code's
+# own agent-file parser honours, so deference is stated rather than inferred from
+# a missing field.
 
 FIX_INH_MODEL="$TMP/fix-inherit-model"
 mk_agent "$FIX_INH_MODEL" heimdall opus inherit "deferring to the operator default"
@@ -155,6 +157,24 @@ if [ "$rc" -ne 0 ] && grep -qi 'both' "$TMP/e" "$TMP/o"; then
   ok "conformance fails 'inherit' that ALSO pins a model (two claims at once)"
 else
   bad "conformance passed tier=inherit with model=opus (rc=$rc) — a template claiming both"
+fi
+
+# The one model value that is NOT a second claim: the literal `inherit`, which
+# says the same thing the tier says. Rejecting it would force deference to be
+# expressed only as silence — and silence is indistinguishable from a forgotten
+# field, which is strictly weaker evidence than a stated one.
+FIX_INH_NATIVE="$TMP/fix-inherit-native"
+mk_agent "$FIX_INH_NATIVE" heimdall inherit inherit "unpinned by owner directive; operator default owned"
+run_check "$FIX_INH_NATIVE"; rc=$?
+if [ "$rc" -eq 0 ]; then
+  ok "conformance ACCEPTS tier: inherit + model: inherit (Claude Code honours it natively)"
+else
+  bad "conformance rejected model: inherit (rc=$rc) — the one model value that agrees with the tier: $(cat "$TMP/e")"
+fi
+if grep -q 'model: inherit' "$TMP/o"; then
+  ok "render distinguishes a STATED deference ('model: inherit') from an omitted field"
+else
+  bad "render does not show how deference was expressed — omission and statement look identical"
 fi
 
 FIX_INH_NOREASON="$TMP/fix-inherit-noreason"

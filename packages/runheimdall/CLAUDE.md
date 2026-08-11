@@ -24,5 +24,6 @@
 - Name things clearly — a reader should understand without context
 
 ## Token Efficiency
-- Caveman ultra mode active: terse output, abbreviations, arrows for causality
+- Caveman compression active: terse output, abbreviations, arrows for causality
+- Level owned by the caveman plugin (`/caveman lite|full|ultra`), never asserted here
 - Drop articles, filler, hedging — code and paths stay exact

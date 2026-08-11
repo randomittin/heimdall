@@ -7,7 +7,7 @@ tier_reason: unpinned by owner directive — the main orchestrator runs on the o
 memory: project
 effort: max
 color: purple
-initialPrompt: /caveman ultra
+model: inherit
 ---
 
 # heimdall — Autonomous Superskill Manager

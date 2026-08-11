@@ -312,17 +312,26 @@ def cmd_check(args):
 
         model = fields.get('model')
 
-        # `tier: inherit` — a DECLARATION OF DEFERENCE. The template deliberately
-        # pins no model and runs on whatever the operator's Claude Code default
-        # is. This is not a hole in the gate: the invariant is still "the
-        # declaration is what executes", and here it is cross-checked as an
-        # ABSENCE. A template that declares inherit while also pinning a model is
-        # claiming two different things at once, so it fails.
+        # `tier: inherit` — a DECLARATION OF DEFERENCE. The template runs on
+        # whatever Claude Code default the operator chose. This is not a hole in
+        # the gate: the invariant is still "the declaration is what executes".
+        #
+        # The cross-check is POSITIVE, not an absence. Claude Code's agent-file
+        # parser accepts the literal `model: inherit` (verified in the shipped
+        # 2.1.227 binary, which lowercases the value and special-cases it before
+        # treating it as a model id), so deference can be stated in the same
+        # field every other template uses — and then the gate checks the same
+        # field for every agent, with no "this one is exempt" branch.
+        # An absent `model:` is still accepted, because it executes identically;
+        # it is just weaker evidence, since silence is indistinguishable from
+        # someone forgetting the field. Naming any OTHER model is two claims at
+        # once and fails.
         if declared == INHERIT:
-            if model:
-                failures.append('%s: declares tier %r but also pins model %r — a template '
+            if model and model != INHERIT:
+                failures.append('%s: declares tier %r but pins model %r — a template '
                                 'cannot both defer to the operator default and name a '
-                                'model' % (rel, declared, model))
+                                'model (use `model: inherit`, which Claude Code honours '
+                                'natively, or omit the field)' % (rel, declared, model))
                 continue
             reason = (fields.get('tier_reason') or '').strip()
             if table['classes'][cls].get('security_sensitive') and not reason:
@@ -334,8 +343,9 @@ def cmd_check(args):
                 continue
             # No rank, so no delta arithmetic: inherit is a deferral, not a price
             # tier, and ranking it would let it be read as an upgrade or a cut.
-            print('  %s %-22s %-8s class=%-18s %s'
-                  % ('~', agent, declared, cls, reason))
+            how = 'model: inherit' if model == INHERIT else 'model: omitted'
+            print('  %s %-22s %-8s class=%-18s (%s) %s'
+                  % ('~', agent, declared, cls, how, reason))
             continue
 
         if not model:
