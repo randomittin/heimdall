@@ -94,5 +94,6 @@ never existed.
 - SessionEnd auto-runs `verify-edits --quick`
 
 ## Token Efficiency
-- Caveman ultra mode active: terse output, abbreviations, arrows for causality
+- Caveman compression active: terse output, abbreviations, arrows for causality
+- The LEVEL is owned by the caveman plugin (`/caveman lite|full|ultra`) and hmd never sets it — so no file here may assert a level. `bin/heimdall` reads the live level from `.caveman-active` and reports that; a hardcoded "ultra" was false on every session hmd has ever run
 - Drop articles, filler, hedging — code and paths stay exact

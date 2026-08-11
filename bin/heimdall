@@ -1281,7 +1281,8 @@ ensure_project_claude_md() {
 - Name things clearly — a reader should understand without context
 
 ## Token Efficiency
-- Caveman ultra mode active: terse output, abbreviations, arrows for causality
+- Caveman compression active: terse output, abbreviations, arrows for causality
+- Level is owned by the caveman plugin (\`/caveman lite|full|ultra\`), not by hmd — do not assert a level here
 - Drop articles, filler, hedging — code and paths stay exact
 CLAUDEMD
 }
@@ -1515,7 +1516,7 @@ print_banner() {
   printf "  ${V}│${R}  ${C}▸${R} autonomous orchestration          ${V}│${R}\n"; sleep 0.05
   printf "  ${V}│${R}  ${C}▸${R} wave-based parallel execution     ${V}│${R}\n"; sleep 0.05
   printf "  ${V}│${R}  ${C}▸${R} smart skill management            ${V}│${R}\n"; sleep 0.05
-  printf "  ${V}│${R}  ${C}▸${R} caveman ultra  ${G}~75%% tokens saved${R}  ${V}│${R}\n"; sleep 0.05
+  printf "  ${V}│${R}  ${C}▸${R} caveman     ${G}~65-75%% tokens saved${R}  ${V}│${R}\n"; sleep 0.05
   printf "  ${V}│${R}  ${C}▸${R} claude-mem     ${G}persistent memory${R}  ${V}│${R}\n"; sleep 0.05
   printf "  ${V}╰─────────────────────────────────────╯${R}\n"
   local short_cwd; short_cwd=$(echo "$WORK_DIR" | sed "s|$HOME|~|")
@@ -3709,7 +3710,36 @@ if [ ! -d "$WORK_DIR/.git" ] && ! git -C "$WORK_DIR" rev-parse --git-dir &>/dev/
   git -C "$WORK_DIR" commit -q -m "initial commit (auto-created by heimdall)" --allow-empty --no-verify 2>/dev/null || true
 fi
 
-# Terse system preamble (caveman style to save tokens)
+# ── Output-compression block: report the level in force, never assert one ──
+#
+# hmd used to hardcode "CAVEMAN ULTRA (max compression, every response)" here.
+# That was false on every session it has ever run: the caveman plugin's level
+# lives in .caveman-active, hmd never writes it, and the observed value is
+# "full". A preamble that ASSERTS a level it does not set is a claim with no
+# mechanism behind it — the exact false-declaration class this repo exists to
+# catch, shipped in its own prompt.
+#
+# It was also a duplicate. When the plugin is installed its own SessionStart
+# hook injects the complete ruleset for the active level. hmd restating a
+# (different, wrong) ruleset underneath it spent tokens to contradict the
+# authority. So: when the plugin is live, name the level and defer. Only when
+# it is absent does hmd supply compression rules of its own — and then it
+# claims no level, because there is no level to claim.
+_cav_flag="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.caveman-active"
+_cav_level=""
+[ -r "$_cav_flag" ] && _cav_level="$(tr -d '[:space:]' < "$_cav_flag" 2>/dev/null || true)"
+if [ -n "$_cav_level" ]; then
+  CAVEMAN_BLOCK="OUTPUT COMPRESSION: caveman plugin active, level \`${_cav_level}\`. Its SessionStart hook already injected that level's rules — follow those. hmd does not restate them and does not override the level."
+  [ "$_cav_level" = "ultra" ] || CAVEMAN_BLOCK="${CAVEMAN_BLOCK}
+Max compression is \`/caveman ultra\` — a user command. hmd will not set it for you, so do not report ultra as active."
+else
+  CAVEMAN_BLOCK="OUTPUT COMPRESSION (caveman plugin not active — these are hmd's own rules, no level claimed):
+Drop articles, filler, pleasantries, hedging, conjunctions. Fragments default. One word > phrase. Abbrev: DB, auth, cfg, req, res, fn, impl, mw, env, repo, PR, CI. Arrows for causality: X → Y.
+Code + errors + paths: exact, unchanged.
+Drop compression for: security warnings, irreversible ops."
+fi
+
+# Terse system preamble (compression rules resolved above, from live state)
 PREAMBLE="PROJECT: $WORK_DIR
 Write ALL files here. Plans → docs/superpowers/plans/, specs → docs/superpowers/specs/, research → docs/analysis/. NEVER write to heimdall plugin dir.
 
@@ -3802,10 +3832,7 @@ AUTO-COMMIT (contextual): After completing ANY task that modifies files, auto-co
 - NEVER ask \"want me to commit?\" — just do it. The user enabled autocommit because they want it automatic.
 - After committing, mention the commit hash in your response (one line, not a ceremony)
 
-CAVEMAN ULTRA (max compression, every response):
-Drop articles, filler, pleasantries, hedging, conjunctions. Fragments default. One word > phrase. Abbrev: DB, auth, cfg, req, res, fn, impl, mw, env, repo, PR, CI. Arrows for causality: X → Y.
-Code + errors + paths: exact, unchanged.
-Drop caveman for: security warnings, irreversible ops.
+${CAVEMAN_BLOCK}
 ---
 ${CHECKPOINT_CONTEXT}
 "

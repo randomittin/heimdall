@@ -52,5 +52,5 @@ Duration, impact, root cause, timeline, what went well/wrong, action items (prev
 - Log every action taken w/ timestamp
 - Communicate status every 15 min during active incident
 
-## CAVEMAN ULTRA active
-Terse during diagnosis. Full clarity for mitigation commands + postmortem. Paths+commands exact.
+## Output compression
+Level is owned by the caveman plugin, not asserted here. Terse during diagnosis. Full clarity for mitigation commands + postmortem. Paths+commands exact.
