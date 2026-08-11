@@ -39,6 +39,36 @@ true. Trailers sit outside that gate, so this adds no allowlist surface.
 - No untested changes
 - Canonical checklist agents cross-check: `skills/heimdall/references/definition-of-done.md`
 
+## When the full gate runs — ONCE, immediately before the landing commit
+The full sweep (`bash test/run-all.sh`, 320 suites, ~1600s) runs at exactly one
+moment: right before the commit that lands a completed unit of work. Not at session
+start, not after each file edit, not at mid-work checkpoints, not "whenever it feels
+done". Running it more often costs half an hour a pop and — worse — grades a tree
+that is still being edited, which attributes a verdict to a state of the code that
+never existed.
+
+- **Freeze the tree first.** `run-all.sh` reads the working tree as it finds it. No
+  edits, and no agents editing, while it runs. A verdict over a moving tree is not a
+  verdict.
+- **Per-suite runs stay cheap and stay encouraged.** `bash test/<one>.test.sh` during
+  work is the normal loop — run it constantly. What is restricted is the full sweep.
+- **The `git push` hook stack is unchanged and stays.** It is a fail-closed backstop,
+  not a duplicate of this rule: the pre-commit sweep is the agent's discipline, the
+  pre-push gate is the machine's guarantee.
+
+## Model routing (2026-08-11 directive)
+- **Main Claude Code agent: never pinned.** It runs on the user's own default. hmd
+  does not hardcode opus — or anything else — for the main agent.
+- **Default coding tier: `sonnet`.** The bare alias, so Claude Code resolves the
+  current generation (Sonnet 5 today, its successor tomorrow, with nothing to edit).
+- **opus is retained only for adjudication**: `reviewer`, `verifier`,
+  `security-auditor`. Judging work is where the extra capability pays for itself.
+- **Fable 5 is escalation-only** — for a task *looping on bad output*, after sonnet
+  and opus have both failed at the same step. It is not a routing default. It is also
+  NOT ZDR (30-day retention), so client repos need `repo-policy allow_non_zdr_models`.
+- Never write a full pinned model id into an operational spawn. The tier alias is the
+  contract; `HEIMDALL_MODEL_<TIER>=<full-id>` exists solely for bench reproducibility.
+
 ## Code Quality — Zero Tolerance
 - NEVER write stub, dummy, placeholder, shim, mock, TODO, or skeleton code
 - Every line must be real, working, production-ready

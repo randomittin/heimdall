@@ -3,7 +3,7 @@ name: architect
 description: Read-only architecture and planning specialist. Analyzes codebase structure, identifies patterns and risks, designs solutions, and emits machine-readable plans (PLAN files + waves.json) with runnable acceptance criteria. Use proactively before any change touching 3+ files, any new system, or when the implementation approach is unclear.
 tools: Read, Write, Edit, Grep, Glob, Bash, Skill
 disallowedTools: Workflow
-model: opus
+model: sonnet
 tier: opus
 effort: high
 memory: project
