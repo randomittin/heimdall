@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+#
+# heimdall-caveman-block — print the output-compression section of hmd's system
+# preamble, describing the caveman level ACTUALLY IN FORCE.
+#
+# WHY THIS EXISTS
+# hmd's preamble used to hardcode "CAVEMAN ULTRA (max compression, every
+# response)". That was false on every session hmd has ever run. The level lives
+# in `.caveman-active`, written by the caveman plugin's own mode-tracker hook
+# when a human types `/caveman lite|full|ultra`. hmd never writes it, cannot
+# write it (that is the operator's config, not hmd's), and the observed value on
+# this machine is `full`. A preamble that ASSERTS a level it does not set is a
+# claim with no mechanism behind it — precisely the false-declaration class this
+# repo exists to catch, shipped inside hmd's own prompt.
+#
+# It was also a DUPLICATE. When the plugin is installed, its SessionStart hook
+# injects the complete ruleset for the active level. hmd restating a different
+# (and wrong) ruleset underneath it spent tokens in order to contradict the
+# authority on the subject. So when the plugin is live, hmd names the level and
+# defers. Only when no level is set does hmd supply compression rules of its
+# own — and then it names no level, because there is none to name.
+#
+# It is a separate executable so the text is TESTABLE. Inline in the launcher it
+# could only be checked by grepping the launcher's source, which proves the
+# string exists, not that the right string is produced for a given state.
+#
+# FAIL-OPEN: any unreadable/odd state degrades to the no-level block. Compression
+# wording is a prompt nicety; refusing to launch hmd over it would be absurd.
+#
+# Usage: heimdall-caveman-block          (level read from the live config dir)
+#        CLAUDE_CONFIG_DIR=<dir> ...     (test fixtures point this at a temp dir)
+set -uo pipefail
+
+flag="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.caveman-active"
+level=""
+if [ -r "$flag" ]; then
+  # The tracker writes a bare word. Strip whitespace; ignore anything that is not
+  # one of the levels it can produce, so a corrupt or hand-edited file degrades to
+  # "no level claimed" instead of hmd parroting arbitrary text as a live setting.
+  raw="$(tr -d '[:space:]' < "$flag" 2>/dev/null || true)"
+  case "$raw" in
+    lite|full|ultra) level="$raw" ;;
+  esac
+fi
+
+if [ -n "$level" ]; then
+  printf 'OUTPUT COMPRESSION: caveman plugin active, level `%s`. Its SessionStart hook already injected that level'"'"'s rules — follow those. hmd does not restate them and does not set the level.\n' "$level"
+  if [ "$level" != ultra ]; then
+    printf 'Max compression is `/caveman ultra`, a user command. hmd will not set it for you — so do not report ultra as active.\n'
+  fi
+else
+  cat <<'NOLEVEL'
+OUTPUT COMPRESSION (no caveman level set — these are hmd's own rules, and they claim no level):
+Drop articles, filler, pleasantries, hedging, conjunctions. Fragments default. One word > phrase. Abbrev: DB, auth, cfg, req, res, fn, impl, mw, env, repo, PR, CI. Arrows for causality: X → Y.
+Code + errors + paths: exact, unchanged.
+Drop compression for: security warnings, irreversible ops.
+NOLEVEL
+fi
+exit 0

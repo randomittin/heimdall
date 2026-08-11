@@ -372,10 +372,14 @@ artifact — flagged so RJ knows which numbers to double check before they go ou
   costs by X%"). `TOKEN-METRIC.md:90-93` explicitly says the metric definition itself is
   **"awaiting RJ's final confirm"** and that `total_tokens` vs `total_cost_usd` savings are
   different numbers that must not be conflated. I did not quote a percentage anywhere.
-- **"Caveman ultra ~75% tokens saved"** (`PARITY.md:225`, `bin/heimdall:310`) — this is a
-  real banner string in the code, but `PROTOCOL.md:9-10` itself distinguishes this
+- **"Caveman ultra ~75% tokens saved"** (was `bin/heimdall:310`, now `bin/heimdall:1519`) —
+  this was a real banner string in the code, but `PROTOCOL.md:9-10` itself distinguishes this
   unmeasured "claimed" 75% from the protocol's own *measured* token ledger number, and warns
   the two must be reported separately. I did not use the 75% figure in any submission draft.
+  **Since corrected in-repo** (2026-08-11): the banner now reads "caveman ~65-75% tokens
+  saved" — the level word was dropped because hmd never selects ultra, and the figure was
+  aligned to the range already used elsewhere in the same file. It is still UNMEASURED and
+  still barred from any headline; the correction removed a contradiction, not the caveat.
 - **Star counts / GitHub popularity for Heimdall itself** — not applicable pre-launch; no
   fabricated numbers used.
 - **Any comparison naming a specific competitor by name** (Copilot, Devin, Cursor, etc.) as

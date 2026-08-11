@@ -223,12 +223,12 @@ Notes. They are why the heimdall tree is ~5x the v1.1.0 tree.)
 | Class | Item | Superx behavior (at v1.1.0) | Status | Heimdall now | Notes |
 |---|---|---|---|---|---|
 | Token | caveman companion auto-install | install caveman@caveman marketplace | kept | kept (`bin/heimdall:172` first_run_setup) | ~65-75% savings claim retained |
-| Token | CAVEMAN ULTRA preamble (max compression every response) | full preamble block: drop articles/filler/hedging, fragments, abbrev list, arrows for causality, exact code/paths, drop for security/irreversible | kept | identical block `bin/heimdall:1183-1184` | verbatim port |
-| Token | CLAUDE.md "Token Efficiency / Caveman ultra mode active" section | auto-written project CLAUDE.md | kept | kept `bin/heimdall:256-258` | — |
+| Token | CAVEMAN ULTRA preamble (max compression every response) | full preamble block: drop articles/filler/hedging, fragments, abbrev list, arrows for causality, exact code/paths, drop for security/irreversible | **corrected** | replaced by a state-read block, `bin/heimdall:3733` → `bin/heimdall-caveman-block` | the asserted level was false on every session ever run — hmd does not set `.caveman-active`, the operator does. Now reports the live level and defers to the plugin's own injected ruleset instead of restating a conflicting one. Pinned by `test/caveman-level-claim.test.sh` |
+| Token | CLAUDE.md "Token Efficiency / Caveman ultra mode active" section | auto-written project CLAUDE.md | **corrected** | `bin/heimdall:1284` now says "Caveman compression active" and names the plugin as the level's owner | same false-level claim, in the CLAUDE.md hmd writes for every project |
 | Token | Terse system preamble (caveman style) | PREAMBLE var in non-interactive launch | kept + improved | preamble externalized to `$PREAMBLE_FILE`, richer routing | `bin/heimdall` |
 | Token | claude-mem persistent memory (cross-session, no repeat context) | first_run_setup `npx claude-mem install` | kept | kept | — |
 | Token | fresh context per wave (context hygiene) | 200K window per wave, no prior-wave garbage | kept | kept | — |
-| Token | banner claim "caveman ultra ~75% tokens saved" | print_banner line | kept | kept `bin/heimdall:310` | — |
+| Token | banner claim "caveman ultra ~75% tokens saved" | print_banner line | **corrected** | `bin/heimdall:1519` now reads "caveman ~65-75% tokens saved" | dropped the level word (hmd installs caveman, which defaults to `full`, and never selects ultra) and aligned the figure to the range already used at `bin/heimdall:2755`. Both were the SAME unmeasured claim stated as two different numbers; the 75% remains unmeasured and is still barred from any public headline |
 | Token | (none) | — | improved (new) | watchman renderers are "zero context cost" (shell/ANSI only, never model) — explicit token-hygiene design law; `bin/debloat`/bloat-gate trims output | net-new efficiency mechanism |
 
 ---
