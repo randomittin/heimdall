@@ -55,6 +55,11 @@ never existed.
 - **The `git push` hook stack is unchanged and stays.** It is a fail-closed backstop,
   not a duplicate of this rule: the pre-commit sweep is the agent's discipline, the
   pre-push gate is the machine's guarantee.
+- **Already machine-enforced.** `bin/heimdall-conformance` reads the session
+  transcript and fails `gate-runs-once` (two full-gate runs with no edit between them)
+  and `gates-at-end` (the first full-gate run must come AFTER real work). This section
+  is the human-readable statement of a rule the enforcer already checks — if the two
+  ever disagree, the enforcer is authoritative and this text is the bug.
 
 ## Model routing (2026-08-11 directive)
 - **Main Claude Code agent: never pinned.** It runs on the user's own default. hmd
