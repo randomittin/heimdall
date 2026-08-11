@@ -82,9 +82,48 @@ if [ "$tier" = "fable" ]; then
   fi
 fi
 
+# ── 1M context window ────────────────────────────────────────────────────────
+# WHY: hmd runs long agentic sessions, and a compaction is not free — it is a
+# lossy rewrite of the very context the agent is reasoning over. Compacting many
+# times over one task is how an agent forgets its own acceptance criteria. So a
+# tier that CAN carry 1M tokens SHOULD.
+#
+# The suffix is only needed where 1M is an opt-in:
+#   sonnet  -> `sonnet[1m]`. VERIFIED against the shipped Claude Code binary
+#              (2.1.227): the alias carries the label "Sonnet 5 with 1M context
+#              window - for long sessions with large codebases", so it still
+#              FLOATS to the current generation. It is not a pin.
+#   opus    -> bare `opus`. Current-gen Opus already documents "1M context
+#              window (default maximum)". `opus[1m]` exists only as the 4.x-era
+#              opt-in (it sits beside claude-opus-4-6[1m]/4-7[1m] in the binary),
+#              so appending it here would buy no context and risk anchoring to
+#              the generation where the flag was needed.
+#   fable   -> bare `fable`, same reason: 1M is already its default maximum.
+#   haiku   -> NO 1M VARIANT EXISTS. The binary ships no `haiku[1m]`, and the
+#              tier's window is 200K. Haiku is therefore silently exempt from
+#              this policy — which is correct, because haiku's jobs (lint,
+#              format, marker checks) are bounded inputs that never approach it.
+#
+# A pin-override always wins and is NEVER suffixed: a pin exists for bench/eval
+# reproducibility, and quietly changing the context window of a pinned model
+# would defeat the only reason to pin.
+#
+# COST: above 200K input tokens the long-context request is billed at a premium
+# over the tier's base rate. bin/lib/tier-table.json carries the base prices and
+# says so at `long_context_premium`. Read that before quoting a spend figure.
+#
+# ESCAPE: HEIMDALL_NO_1M=1 suppresses the suffix (cost-capped runs, or a
+# bench that must reproduce a pre-1M measurement).
+needs_1m_suffix=no
+if [ "$tier" = "sonnet" ] && [ "${HEIMDALL_NO_1M:-}" != "1" ]; then
+  needs_1m_suffix=yes
+fi
+
 # Pin-override wins (reproducibility); otherwise float to latest via the alias.
 if [ -n "$override" ]; then
   printf '%s\n' "$override"
+elif [ "$needs_1m_suffix" = yes ]; then
+  printf '%s[1m]\n' "$tier"
 else
   printf '%s\n' "$tier"
 fi

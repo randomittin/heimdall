@@ -36,6 +36,15 @@
 
   "rank_note": "fable shares opus's rank because spec 2.1 writes the top row as 'Opus / Fable' — either satisfies that class, so an opus-class task seen on fable is not tier drift. Fable's extra cost is governed by the ZDR policy gate and the weekly allowance, not by the drift rank.",
 
+  "long_context_premium": {
+    "applies_above_input_tokens": 200000,
+    "tiers_with_1m_window": ["sonnet", "opus", "fable"],
+    "suffix_required": { "sonnet": "[1m]" },
+    "no_1m_variant": ["haiku"],
+    "note": "The per-tier prices above are BASE rates for requests at or under 200K input tokens. A request that exceeds 200K on a 1M-window tier is billed at a long-context premium over those rates. Any spend figure quoted from this table for a long session is therefore a FLOOR, not the bill. bin/heimdall-model-resolve appends [1m] to sonnet (where 1M is opt-in) and leaves opus/fable bare (1M is already their default maximum); haiku has no 1M variant at all and is exempt.",
+    "why_not_priced_here": "The exact premium multiplier is set by the API's pricing, not by hmd, and hardcoding a number here would create a second cost accounting that can silently disagree with the first. This block records WHERE the premium applies so a reader is never misled into treating a base-rate total as complete; it deliberately does not invent the multiplier."
+  },
+
   "cache_price_multipliers": {
     "cache_read": 0.1,
     "cache_write_5m": 1.25,

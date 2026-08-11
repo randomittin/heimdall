@@ -31,13 +31,30 @@ echo "--------------------------------------------------------------------"
 [ -x "$RESOLVE" ] && ok "bin/heimdall-model-resolve is executable" \
   || bad "bin/heimdall-model-resolve missing or not executable"
 
-# ── 1. DEFAULT FLOAT — bare alias per tier ──
-for tier in opus sonnet haiku; do
+# ── 1. DEFAULT FLOAT — an ALIAS per tier, never a pinned id ──
+# opus and haiku resolve bare. sonnet resolves to 'sonnet[1m]': the 1M-context
+# alias, which still floats to the current generation (Claude Code 2.1.227
+# labels it "Sonnet 5 with 1M context window"). The invariant under test is
+# "float, don't pin" — not "no suffix" — so the expectation is per-tier.
+for tier in opus haiku; do
   got="$(env -u HEIMDALL_MODEL_OPUS -u HEIMDALL_MODEL_SONNET -u HEIMDALL_MODEL_HAIKU \
          "$RESOLVE" "$tier" 2>/dev/null)"
   [ "$got" = "$tier" ] \
     && ok "resolve $tier (no override) -> '$got' (bare alias = latest)" \
     || bad "resolve $tier -> '$got', expected bare alias '$tier'"
+done
+got="$(env -u HEIMDALL_MODEL_SONNET "$RESOLVE" sonnet 2>/dev/null)"
+[ "$got" = "sonnet[1m]" ] \
+  && ok "resolve sonnet (no override) -> '$got' (1M-context alias = latest, long sessions stop compacting)" \
+  || bad "resolve sonnet -> '$got', expected 'sonnet[1m]'"
+# whatever the suffix, no tier may resolve to a pinned generation by default
+for tier in opus sonnet haiku; do
+  got="$(env -u HEIMDALL_MODEL_OPUS -u HEIMDALL_MODEL_SONNET -u HEIMDALL_MODEL_HAIKU \
+         "$RESOLVE" "$tier" 2>/dev/null)"
+  case "$got" in
+    claude-*) bad "default resolve $tier -> '$got' — a pinned id, which silently ages" ;;
+    *) ok "default resolve $tier names no model generation ('$got')" ;;
+  esac
 done
 
 # ── 2. PIN-OVERRIDE WINS ──

@@ -258,9 +258,18 @@ for tier in opus sonnet haiku; do
   out="$(HEIMDALL_REPO_POLICY="$DENY_POLICY" \
          env -u HEIMDALL_MODEL_OPUS -u HEIMDALL_MODEL_SONNET -u HEIMDALL_MODEL_HAIKU \
          "$RESOLVE" "$tier" 2>/dev/null)"; rc=$?
-  [ "$rc" -eq 0 ] && [ "$out" = "$tier" ] \
+  # What this asserts is that the non-ZDR gate does not reach a ZDR-eligible
+  # tier: it resolves, exit 0, and names THIS tier. The match is a prefix rather
+  # than an equality because sonnet legitimately resolves to 'sonnet[1m]' (the
+  # 1M-context alias) — still that tier, still not a pinned id. An equality here
+  # would fail on a context-window change that has nothing to do with ZDR.
+  case "$out" in
+    "$tier"|"$tier"'[1m]') named_tier=yes ;;
+    *) named_tier=no ;;
+  esac
+  [ "$rc" -eq 0 ] && [ "$named_tier" = yes ] \
     && ok "$tier unaffected by non-ZDR policy -> '$out'" \
-    || bad "$tier blocked by non-ZDR policy (rc=$rc out='$out') — over-broad gate"
+    || bad "$tier blocked or renamed by non-ZDR policy (rc=$rc out='$out') — over-broad gate"
 done
 
 echo ""

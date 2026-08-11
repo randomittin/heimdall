@@ -258,13 +258,46 @@ done
 if [ ! -x "$RESOLVE" ]; then
   bad "bin/heimdall-model-resolve missing or not executable — nothing renders a tier into a model string"
 else
-  for tier in opus sonnet haiku; do
+  # opus/haiku resolve to the bare alias. sonnet resolves to the 1M-context
+  # alias `sonnet[1m]` — still an ALIAS (Claude Code picks the current
+  # generation: the shipped 2.1.227 binary labels it "Sonnet 5 with 1M context
+  # window"), so the no-pinned-id rule is intact. The suffix exists because
+  # sonnet is the only tier where the 1M window is opt-in; opus and fable
+  # already carry 1M as their default maximum, and haiku has no 1M variant.
+  for tier in opus haiku; do
     got="$(env -u HEIMDALL_MODEL_OPUS -u HEIMDALL_MODEL_SONNET -u HEIMDALL_MODEL_HAIKU \
            "$RESOLVE" "$tier" 2>/dev/null)"
     [ "$got" = "$tier" ] \
       && ok "default: tier '$tier' resolves to the bare alias '$got' (Claude Code picks the current generation)" \
       || bad "tier '$tier' resolved to '$got', expected the bare alias '$tier'"
   done
+
+  got="$(env -u HEIMDALL_MODEL_SONNET "$RESOLVE" sonnet 2>/dev/null)"
+  [ "$got" = "sonnet[1m]" ] \
+    && ok "default: tier 'sonnet' resolves to '$got' — the 1M-context alias, so long sessions stop compacting" \
+    || bad "tier 'sonnet' resolved to '$got', expected 'sonnet[1m]'"
+  # the suffix must not smuggle in a pinned generation
+  case "$got" in
+    *claude-sonnet-[0-9]*) bad "sonnet resolved to '$got' — a pinned generation, which silently ages" ;;
+    *) ok "sonnet's 1M form names no model generation (still floats to current-gen)" ;;
+  esac
+  # haiku has NO 1M variant — asserting it never grows one by accident
+  got="$(env -u HEIMDALL_MODEL_HAIKU "$RESOLVE" haiku 2>/dev/null)"
+  case "$got" in
+    *'[1m]'*) bad "haiku resolved to '$got' — no haiku[1m] exists; this would be an invalid --model" ;;
+    *) ok "haiku carries no [1m] suffix (no such variant exists; its window is 200K)" ;;
+  esac
+  # opus already defaults to 1M — the 4.x-era suffix must not be re-added
+  got="$(env -u HEIMDALL_MODEL_OPUS "$RESOLVE" opus 2>/dev/null)"
+  case "$got" in
+    *'[1m]'*) bad "opus resolved to '$got' — opus already defaults to a 1M window; the suffix is the 4.x-era opt-in" ;;
+    *) ok "opus carries no [1m] suffix (1M is already its default maximum)" ;;
+  esac
+  # escape hatch: a cost-capped or pre-1M bench run can opt out
+  got="$(env -u HEIMDALL_MODEL_SONNET HEIMDALL_NO_1M=1 "$RESOLVE" sonnet 2>/dev/null)"
+  [ "$got" = "sonnet" ] \
+    && ok "HEIMDALL_NO_1M=1 suppresses the suffix -> '$got' (cost cap / pre-1M bench repro)" \
+    || bad "HEIMDALL_NO_1M=1 gave '$got', expected the bare alias 'sonnet'"
   got="$(HEIMDALL_MODEL_OPUS=claude-opus-9-9 "$RESOLVE" opus 2>/dev/null)"
   [ "$got" = "claude-opus-9-9" ] \
     && ok "override: HEIMDALL_MODEL_OPUS still pins opus -> '$got' (bench/eval repro preserved)" \
