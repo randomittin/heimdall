@@ -26,6 +26,18 @@
 # ({outcome,status,version_from,version_to,error_code}), which is authoritative and free.
 # `claude update` is now issued ONLY after we actually repaired something — never as a probe.
 #
+# THE SECOND FAILURE MODE (added after a real sighting): that record can OUTLIVE the
+# fault it describes. Claude writes it only when it ATTEMPTS an install, so a transient
+# version-check failure recorded while you are ALREADY on the newest version can never be
+# superseded — nothing is left to install, so no attempt happens, so no success record is
+# ever written. Observed: install_failed, version_to=null, error_code=null, on a machine
+# with installMethod=native, autoUpdates=true, PATH fine, dirs writable, releases endpoint
+# 200 and `claude update` reporting "up to date". The banner had been up for hours with
+# nothing wrong. That is a fault report that cannot expire — worse than no banner, because
+# it teaches the operator to ignore the one channel that would show a REAL failure.
+# update_result_obsolete() detects exactly that shape and clears it; see its comment for
+# why age (not just version) is the load-bearing condition.
+#
 # SUBCOMMANDS (the SessionStart hook depends on `check` — keep the interface stable):
 #   heimdall-cc-selfheal check    throttled, background, safe. Detect → repair → log.
 #                                 ALWAYS exit 0 fast; the repair runs DETACHED.
@@ -55,6 +67,8 @@
 #   HEIMDALL_SELFHEAL_DRYRUN=1      TEST seam: detect + log "would-repair", apply NOTHING.
 #   HEIMDALL_CC_UPDATE_RESULT       path to Claude's own last-update-result.json
 #                                   (default ~/.claude/.last-update-result.json). TEST seam.
+#   HEIMDALL_CC_RESULT_STALE_HOURS  age past which a recorded FAILURE is treated as dead
+#                                   rather than live, and cleared (default 6). TEST seam.
 #   HEIMDALL_CC_VERSIONS            claude versions dir. TEST seam.
 #   HEIMDALL_CC_PIN_PID             pid to resolve the running version from. TEST seam.
 #   HEIMDALL_CC_LSOF                `lsof -p <pid>`-style stub. TEST seam.
@@ -69,6 +83,11 @@ CLAUDE_JSON="${HEIMDALL_CLAUDE_CONFIG:-$HOME/.claude.json}"
 INTERVAL="${HEIMDALL_SELFHEAL_INTERVAL:-86400}"
 NPM_CONFLICT="@anthropic-ai/claude-code"
 UPDATE_RESULT="${HEIMDALL_CC_UPDATE_RESULT:-$HOME/.claude/.last-update-result.json}"
+# Hours after which a recorded FAILURE is treated as dead rather than live. A real
+# failing updater retries and rewrites the record, so age is what separates the two.
+# Deliberately well above Claude's own retry cadence so a flapping updater is never
+# mistaken for a settled one. Test seam.
+STALE_HOURS="${HEIMDALL_CC_RESULT_STALE_HOURS:-6}"
 CC_VERSIONS="${HEIMDALL_CC_VERSIONS:-$HOME/.local/share/claude/versions}"
 
 log() {  # one-line, secret-free, best-effort
@@ -140,6 +159,61 @@ print('%s (%s->%s%s)' % (d.get('status') or d.get('outcome') or '?',
     "$UPDATE_RESULT" 2>/dev/null
 }
 
+# Is the recorded failure OBSOLETE — a failure that can never be superseded?
+#
+# THE BUG THIS EXISTS FOR. Claude writes .last-update-result.json only when it
+# ATTEMPTS an install, and the banner renders from that record. So a transient
+# version-check failure (observed: status=install_failed, version_to=null,
+# error_code=null — it never even resolved a target) gets recorded while you are
+# ALREADY on the newest version. Now nothing is left to install, so no further
+# attempt happens, so no success record is ever written, so the record can never
+# be replaced — and the banner shows a dead failure indefinitely. On the machine
+# this was found on it had been showing one for hours with a healthy install:
+# installMethod=native, autoUpdates=true, PATH fine, dirs writable, releases
+# endpoint 200, `claude update` -> "up to date".
+#
+# This is the silent-aging class: not a monitor that stopped, but a fault report
+# that cannot expire. It is strictly worse than no banner, because it trains the
+# operator to ignore the one channel that would report a REAL update failure.
+#
+# WHY THIS IS NOT JUST "DELETE THE ANNOYING FILE". Clearing a record that
+# describes a LIVE failure would hide a real fault. All of these must hold:
+#   1. the record says failed;
+#   2. it is OLD (> STALE_HOURS). A genuinely failing updater retries and
+#      rewrites this file, so an unrefreshed record means nothing has failed
+#      since. This is the load-bearing condition — it is what distinguishes a
+#      dead record from an actively failing one, without any network call;
+#   3. we are already running the newest binary present locally, so there is no
+#      staged install the record could still be describing;
+#   4. the install is otherwise healthy (native, no npm conflict) — if the npm
+#      conflict is present, that is the real fault and repair() fixes THAT.
+# Fail closed: unreadable, unparseable or undatable -> NOT obsolete.
+update_result_obsolete() {
+  [ -r "$UPDATE_RESULT" ] && command -v python3 >/dev/null 2>&1 || return 1
+  is_native || return 1
+  npm_conflict_present && return 1
+  local newest; newest="$(_newest_installed)"
+  [ -n "$newest" ] || return 1
+  python3 -c "import json,sys,datetime
+try: d=json.load(open(sys.argv[1]))
+except Exception: sys.exit(1)
+if not isinstance(d,dict): sys.exit(1)
+if not (d.get('outcome')=='failed' or (d.get('status') or '').endswith('_failed')): sys.exit(1)
+ts=d.get('timestamp')
+if not isinstance(ts,str): sys.exit(1)
+try: t=datetime.datetime.fromisoformat(ts.replace('Z','+00:00'))
+except Exception: sys.exit(1)
+now=datetime.datetime.now(datetime.timezone.utc)
+age_h=(now-t).total_seconds()/3600.0
+if age_h < float(sys.argv[3]): sys.exit(1)   # too recent — could still be live
+# Must already be on the newest local binary, and the record must not name a
+# DIFFERENT target still pending. version_to=null means no target was resolved.
+if (d.get('version_from') or '') != sys.argv[2]: sys.exit(1)
+vt=d.get('version_to')
+if vt not in (None,'',sys.argv[2]): sys.exit(1)
+sys.exit(0)" "$UPDATE_RESULT" "$newest" "$STALE_HOURS" 2>/dev/null
+}
+
 # unhealthy iff (on a native install) the npm conflict exists OR the updater fails.
 # autoUpdates:false alone is NOT treated as unhealthy (could be a deliberate user choice);
 # it is only repaired when a real failure is also present.
@@ -168,12 +242,33 @@ PY
 }
 
 repair() {
-  local did=0
+  local did=0 cleared=0
   if [ "${HEIMDALL_SELFHEAL_DRYRUN:-0}" = "1" ]; then
     npm_conflict_present && log "would-repair: uninstall $NPM_CONFLICT (npm conflict)"
     autoupdates_false && log "would-repair: set autoUpdates=true"
+    update_result_obsolete && log "would-repair: clear obsolete update-failure record ($(update_result_detail))"
     log "would-repair: claude update"
     return 0
+  fi
+  # Clear an obsolete failure record FIRST, and unconditionally log that we did.
+  # Deleting a fault report silently would be its own version of this bug, so the
+  # log line names exactly what was removed. Claude treats an absent record as
+  # "no result" (verified in the 2.1.227 reader: a missing file returns null),
+  # so removal is the supported way to say "this no longer describes anything".
+  if update_result_obsolete; then
+    local detail; detail="$(update_result_detail)"
+    if rm -f "$UPDATE_RESULT" 2>/dev/null; then
+      log "repaired: cleared obsolete update-failure record [$detail] — older than ${STALE_HOURS}h, already on newest local binary, no npm conflict"
+      # Deliberately does NOT set `did`. `did` gates the `claude update` re-stage
+      # at the end of this function, and clearing a dead record is precisely the
+      # case where there is nothing to install. Re-staging here would race the
+      # auto-update poll of every live session for the install lock — which is
+      # how this tool could CAUSE the banner it just removed. Nothing to install,
+      # nothing to run.
+      cleared=1
+    else
+      log "WARN: could not remove obsolete update-failure record at $UPDATE_RESULT"
+    fi
   fi
   if npm_conflict_present; then
     if npm uninstall -g "$NPM_CONFLICT" >/dev/null 2>&1; then
@@ -195,7 +290,7 @@ repair() {
   if [ "$did" = 1 ] && command -v claude >/dev/null 2>&1; then
     if claude update >/dev/null 2>&1; then log "verified: claude update -> ok"; else log "NOTE: claude update non-zero after repair (Claude's own updater will retry)"; fi
   fi
-  [ "$did" = 1 ] && log "self-heal complete" || log "self-heal: nothing to repair (no mutation attempted)"
+  if [ "$did" = 1 ] || [ "$cleared" = 1 ]; then log "self-heal complete"; else log "self-heal: nothing to repair (no mutation attempted)"; fi
 }
 
 throttled() {  # true if checked within the window (skip)
@@ -211,7 +306,13 @@ cmd_status() {  # read-only
   npm_conflict_present && issues="${issues} npm-conflict($NPM_CONFLICT)"
   if updater_failing; then
     detail="$(update_result_detail 2>/dev/null || true)"
-    issues="${issues} last-update-failed${detail:+[$detail]}"
+    # Distinguish a LIVE failure from a dead one. Reporting both as the same thing
+    # is what let a banner sit for hours on a demonstrably healthy install.
+    if update_result_obsolete; then
+      issues="${issues} stale-update-failure${detail:+[$detail]}(obsolete:would-clear)"
+    else
+      issues="${issues} last-update-failed${detail:+[$detail]}"
+    fi
   fi
   autoupdates_false && issues="${issues} autoUpdates:false"
   if [ -n "$issues" ]; then echo "cc-selfheal: UNHEALTHY —$issues (would repair)"; else echo "cc-selfheal: healthy"; fi

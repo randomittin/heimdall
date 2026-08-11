@@ -38,8 +38,24 @@ chmod +x "$BIN/npm" "$BIN/claude"
 
 mkcfg(){ printf '{\n  "installMethod": "%s",\n  "autoUpdates": %s,\n  "numStartups": 7,\n  "userID": "keepme"\n}\n' "$1" "$2" > "$WORK/claude.json"; }
 runheal(){ env -i PATH="$BIN:/usr/bin:/bin" HOME="$WORK" HEIMDALL_HOME="$WORK/.hmd" \
-  HEIMDALL_CLAUDE_CONFIG="$WORK/claude.json" "$@"; }
-fresh(){ rm -rf "$WORK/.hmd" "$CALLS" "$WORK/has-conflict" "$WORK/updater-ok"; }
+  HEIMDALL_CLAUDE_CONFIG="$WORK/claude.json" \
+  HEIMDALL_CC_UPDATE_RESULT="$WORK/upd.json" HEIMDALL_CC_VERSIONS="$WORK/versions" \
+  HEIMDALL_CC_RESULT_STALE_HOURS="${STALE:-6}" "$@"; }
+fresh(){ rm -rf "$WORK/.hmd" "$CALLS" "$WORK/has-conflict" "$WORK/updater-ok" \
+  "$WORK/upd.json" "$WORK/versions"; STALE=6; }
+
+# Write a fake .last-update-result.json: <status> <version_from> <version_to|null> <age_hours>
+mkupd(){ python3 - "$WORK/upd.json" "$1" "$2" "$3" "$4" <<'PY'
+import json,sys,datetime
+p,status,vf,vt,age=sys.argv[1:6]
+ts=(datetime.datetime.now(datetime.timezone.utc)
+    - datetime.timedelta(hours=float(age))).isoformat().replace('+00:00','Z')
+json.dump({"status":status,"version_from":vf,
+           "version_to":(None if vt=="null" else vt),
+           "error_code":None,"timestamp":ts}, open(p,"w"))
+PY
+}
+mkver(){ mkdir -p "$WORK/versions"; for v in "$@"; do : > "$WORK/versions/$v"; done; }
 
 # 1) opt-out (env + file) -> no-op, exit 0, no calls
 fresh; mkcfg native false; touch "$WORK/has-conflict"
@@ -92,6 +108,59 @@ runheal bash "$HEAL" check; M2="$(stat -f %m "$WORK/.hmd/.cc-selfheal-stamp" 2>/
 fresh; mkcfg native false; touch "$WORK/has-conflict"; touch "$WORK/updater-ok"
 T0=$(python3 -c 'import time;print(int(time.time()*1000))'); runheal bash "$HEAL" check; T1=$(python3 -c 'import time;print(int(time.time()*1000))')
 [ "$((T1-T0))" -lt 2000 ] && ok "check non-blocking ($((T1-T0))ms, repair detached)" || bad "check blocked ($((T1-T0))ms)"
+
+# ── 8-12) THE OBSOLETE UPDATE-FAILURE RECORD ────────────────────────────────────
+# Claude writes .last-update-result.json only when it ATTEMPTS an install. A transient
+# failure recorded while ALREADY on the newest version therefore has no possible
+# successor: nothing is left to install, so no attempt happens, so no success record is
+# written, and the "Auto-update failed" banner renders that dead record forever. Before
+# this, cc-selfheal DETECTED the failed record (status said UNHEALTHY) but its only
+# repair was removing an npm conflict — so on a machine with no conflict it logged
+# "nothing to repair" indefinitely while the banner stayed up.
+#
+# What must NOT regress: clearing is gated on the record being DEAD, never merely
+# annoying. Tests 9-12 are the gates; test 8 is the one case that may clear.
+
+# 8) stale failed record + newest local binary + no conflict -> cleared, and NO `claude update`
+fresh; mkcfg native true; touch "$WORK/updater-ok"; mkver 2.1.220 2.1.227; mkupd install_failed 2.1.227 null 9
+runheal bash "$HEAL" status | grep -q 'obsolete:would-clear' \
+  && ok "status: names a dead record as obsolete (not as a live failure)" \
+  || bad "status: dead record reported as if live"
+[ -f "$WORK/upd.json" ] && ok "status: read-only (record still present after status)" || bad "status deleted the record!"
+runheal bash "$HEAL" --force; waitheal
+[ ! -f "$WORK/upd.json" ] && ok "repair: cleared the obsolete update-failure record" || bad "repair: obsolete record survived — banner would persist"
+grep -q 'cleared obsolete update-failure record' "$LOG" 2>/dev/null \
+  && ok "repair: logged exactly what it removed (never a silent delete)" \
+  || bad "repair: removed a fault report without logging it"
+grep -q 'claude update' "$CALLS" 2>/dev/null \
+  && bad "repair: ran 'claude update' after a clear — races the install lock, can CAUSE the banner" \
+  || ok "repair: clearing a dead record never re-stages 'claude update'"
+grep -q 'self-heal complete' "$LOG" 2>/dev/null \
+  && ok "repair: a clear counts as work done (not 'nothing to repair')" \
+  || bad "repair: cleared the record but still logged nothing-to-repair"
+
+# 9) RECENT failed record -> never cleared (a live failure retries and rewrites this file)
+fresh; mkcfg native true; touch "$WORK/updater-ok"; mkver 2.1.227; mkupd install_failed 2.1.227 null 1
+runheal bash "$HEAL" --force; waitheal
+[ -f "$WORK/upd.json" ] && ok "recent failure (<6h) kept — a live fault is never hidden" || bad "recent failure record deleted — would mask a real update failure"
+runheal bash "$HEAL" status | grep -q 'last-update-failed' && ok "status: recent failure reported as live" || bad "status: recent failure not reported as live"
+
+# 10) record names a version we are NOT on -> a staged install may still be pending; keep it
+fresh; mkcfg native true; touch "$WORK/updater-ok"; mkver 2.1.227; mkupd install_failed 2.1.200 2.1.227 48
+runheal bash "$HEAL" --force; waitheal
+[ -f "$WORK/upd.json" ] && ok "record describing a pending upgrade kept (version_from != newest)" || bad "deleted a record describing an install that never landed"
+
+# 11) npm conflict present -> THAT is the real fault; the record is not the thing to clear
+fresh; mkcfg native true; touch "$WORK/has-conflict"; touch "$WORK/updater-ok"; mkver 2.1.227; mkupd install_failed 2.1.227 null 9
+runheal bash "$HEAL" --force; waitheal
+grep -q "uninstalled @anthropic-ai/claude-code" "$CALLS" && ok "conflict+stale record: fixed the conflict (the real fault)" || bad "conflict not repaired"
+[ -f "$WORK/upd.json" ] && ok "conflict+stale record: record kept — it may describe the conflict's failures" || bad "cleared a record while a real conflict existed"
+
+# 12) fail closed: an undatable record is never treated as obsolete
+fresh; mkcfg native true; touch "$WORK/updater-ok"; mkver 2.1.227
+printf '{"status":"install_failed","version_from":"2.1.227","version_to":null,"timestamp":"not-a-date"}\n' > "$WORK/upd.json"
+runheal bash "$HEAL" --force; waitheal
+[ -f "$WORK/upd.json" ] && ok "unparseable timestamp -> fail closed (record kept)" || bad "deleted a record whose age could not be established"
 
 echo "──────────────────────────────────────"
 echo "heimdall-cc-selfheal: $PASS passed, $FAIL failed"
