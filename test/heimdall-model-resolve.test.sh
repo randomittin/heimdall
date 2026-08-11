@@ -72,10 +72,28 @@ got="$(HEIMDALL_MODEL_HAIKU=claude-haiku-9-9 "$RESOLVE" haiku 2>/dev/null)"
   || bad "haiku override -> '$got', expected claude-haiku-9-9"
 
 # Override for one tier must NOT leak into another.
-got="$(HEIMDALL_MODEL_OPUS=claude-opus-9-9 "$RESOLVE" sonnet 2>/dev/null)"
-[ "$got" = "sonnet" ] \
+got="$(env -u HEIMDALL_MODEL_SONNET HEIMDALL_MODEL_OPUS=claude-opus-9-9 "$RESOLVE" sonnet 2>/dev/null)"
+[ "$got" = "sonnet[1m]" ] \
   && ok "opus override does not leak into sonnet -> '$got'" \
-  || bad "sonnet contaminated by opus override -> '$got', expected sonnet"
+  || bad "sonnet contaminated by opus override -> '$got', expected sonnet[1m]"
+
+# ── 2b. THE 1M SUFFIX IS SCOPED AND ESCAPABLE ──
+# A pin exists for bench/eval reproducibility; suffixing it would change the
+# context window of a model someone pinned precisely to hold everything fixed.
+got="$(HEIMDALL_MODEL_SONNET=claude-sonnet-9-9 "$RESOLVE" sonnet 2>/dev/null)"
+case "$got" in
+  *'[1m]'*) bad "pinned sonnet -> '$got' — the suffix must never be appended to a pin" ;;
+  *) ok "a pinned sonnet is never suffixed -> '$got' (bench repro holds everything fixed)" ;;
+esac
+got="$(env -u HEIMDALL_MODEL_HAIKU "$RESOLVE" haiku 2>/dev/null)"
+case "$got" in
+  *'[1m]'*) bad "haiku -> '$got' — no haiku[1m] variant exists; this would be an invalid --model" ;;
+  *) ok "haiku is exempt from the 1M policy ('$got') — no such variant, 200K window" ;;
+esac
+got="$(env -u HEIMDALL_MODEL_SONNET HEIMDALL_NO_1M=1 "$RESOLVE" sonnet 2>/dev/null)"
+[ "$got" = "sonnet" ] \
+  && ok "HEIMDALL_NO_1M=1 opts out -> '$got' (cost cap / pre-1M bench repro)" \
+  || bad "HEIMDALL_NO_1M=1 gave '$got', expected bare 'sonnet'"
 
 # ── 3. UNKNOWN TIER — nonzero + stderr ──
 err="$("$RESOLVE" bogus 2>&1 >/dev/null)"; rc=$?

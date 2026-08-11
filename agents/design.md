@@ -3,8 +3,7 @@ name: design
 description: UI/UX design agent. Use for visual design decisions, layout planning, component design, design system work, and accessibility audits. Integrates with design-for-ai skills when available.
 tools: Agent, TaskStop, Read, Write, Edit, Bash, Grep, Glob, Skill
 model: sonnet
-tier: opus
-tier_reason: design decisions are encoded into components that outlive the session and are expensive to unpick later
+tier: sonnet
 effort: high
 color: magenta
 ---

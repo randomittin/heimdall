@@ -3,7 +3,7 @@ name: architect
 description: Read-only architecture and planning specialist. Analyzes codebase structure, identifies patterns and risks, designs solutions, and emits machine-readable plans (PLAN files + waves.json) with runnable acceptance criteria. Use proactively before any change touching 3+ files, any new system, or when the implementation approach is unclear.
 tools: Read, Write, Edit, Grep, Glob, Bash, Skill
 disallowedTools: Workflow
-model: sonnet
+model: opus
 tier: opus
 effort: high
 memory: project
@@ -142,7 +142,7 @@ Write the full plan to `.planning/PLAN-<phase>.md`. Emit `.planning/waves.json` 
 | `opus` | `opus` | high | code writing, architecture, design, review, DB schema |
 | `opus` | `opus` | max | security audit, incident response, irreversible decisions |
 
-**The model string is the BARE TIER ALIAS, never a full model id.** Claude Code maps `opus` / `sonnet` / `haiku` to the current generation of that tier, so every spawn gets the latest model of the tier you asked for. A full id is correct on the day it is typed and silently last-generation on the day after — a failure nothing goes red for. Obtain the string from `bin/heimdall-model-resolve <tier>`; that resolver is also the only legitimate way to pin one, via `HEIMDALL_MODEL_<TIER>=<full-id>`, and pinning exists for bench/eval reproducibility alone. Never write a full model id into a plan you emit.
+**The model string is a TIER ALIAS, never a full model id.** One alias carries a suffix: `sonnet` resolves to `sonnet[1m]` — the 1M-context window, still an alias and still current-gen. It exists because a compaction is a lossy rewrite of the very context the agent is reasoning over, and compacting repeatedly through one task is how an agent forgets its own acceptance criteria. `opus` already defaults to a 1M window and no `haiku[1m]` exists (200K window), so neither is suffixed. Claude Code maps `opus` / `sonnet` / `haiku` to the current generation of that tier, so every spawn gets the latest model of the tier you asked for. A full id is correct on the day it is typed and silently last-generation on the day after — a failure nothing goes red for. Obtain the string from `bin/heimdall-model-resolve <tier>`; that resolver is also the only legitimate way to pin one, via `HEIMDALL_MODEL_<TIER>=<full-id>`, and pinning exists for bench/eval reproducibility alone. Never write a full model id into a plan you emit.
 
 Default to `opus` + `high` for code changes. Reserve `max` for decisions expensive to undo. Use `sonnet` + `default` for routine work. Use `haiku` + `low` for mechanical tasks. On task failure, escalate one tier (haiku → sonnet → opus); never retry the same tier.
 

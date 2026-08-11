@@ -3,8 +3,7 @@ name: seeker
 description: Bug seeker agent. Pulls fresh logs from Kubernetes pods, analyzes for errors/crashes/anomalies, and raises GitHub issues with reproduction steps. Use when monitoring production or running maintenance sweeps.
 tools: Bash, Read, Write, Grep, Glob
 model: sonnet
-tier: opus
-tier_reason: triage output is filed as issues humans act on directly, so a wrong call propagates outside the session
+tier: sonnet
 effort: high
 color: yellow
 ---

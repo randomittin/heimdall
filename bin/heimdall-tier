@@ -303,9 +303,37 @@ def cmd_check(args):
             continue
 
         model = fields.get('model')
+
+        # `tier: inherit` — a DECLARATION OF DEFERENCE. The template deliberately
+        # pins no model and runs on whatever the operator's Claude Code default
+        # is. This is not a hole in the gate: the invariant is still "the
+        # declaration is what executes", and here it is cross-checked as an
+        # ABSENCE. A template that declares inherit while also pinning a model is
+        # claiming two different things at once, so it fails.
+        if declared == INHERIT:
+            if model:
+                failures.append('%s: declares tier %r but also pins model %r — a template '
+                                'cannot both defer to the operator default and name a '
+                                'model' % (rel, declared, model))
+                continue
+            reason = (fields.get('tier_reason') or '').strip()
+            if table['classes'][cls].get('security_sensitive') and not reason:
+                failures.append('%s: class %r is security-sensitive and declares %r with no '
+                                'tier_reason: — the operator default COULD sit below the %s '
+                                'this class requires, so deferring must be a stated, owned '
+                                'decision rather than silent drift'
+                                % (rel, cls, declared, class_tier(table, cls)))
+                continue
+            # No rank, so no delta arithmetic: inherit is a deferral, not a price
+            # tier, and ranking it would let it be read as an upgrade or a cut.
+            print('  %s %-22s %-8s class=%-18s %s'
+                  % ('~', agent, declared, cls, reason))
+            continue
+
         if not model:
             failures.append('%s: declares tier %r but no model: to cross-check — the '
-                            'declaration cannot be enforced' % (rel, declared))
+                            'declaration cannot be enforced (use tier: %s to defer to the '
+                            'operator default on purpose)' % (rel, declared, INHERIT))
             continue
         if model != declared:
             failures.append('%s: declares tier %r but runs model %r — the declaration '

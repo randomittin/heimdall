@@ -3,8 +3,7 @@ name: fixer
 description: Bug fixer agent. Picks up open GitHub issues labeled 'bug' or 'seeker', creates a fix branch, implements the fix, runs tests, and raises a PR. Use for automated bug fixing from issue queue.
 tools: Agent, TaskStop, Read, Write, Edit, Bash, Grep, Glob
 model: sonnet
-tier: opus
-tier_reason: patches bugs on a branch and opens the PR without a human in the loop on the diff
+tier: sonnet
 effort: high
 color: green
 ---

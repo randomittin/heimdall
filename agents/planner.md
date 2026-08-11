@@ -2,7 +2,7 @@
 name: planner
 description: Creates verified execution plans with acceptance criteria that block progression. Decomposes work into dependency-ordered waves of parallel tasks with grep-verifiable or command-runnable criteria.
 tools: Read, Write, Edit, Bash, Grep, Glob
-model: sonnet
+model: opus
 tier: opus
 effort: high
 color: blue
@@ -87,7 +87,7 @@ Assign each task a model tier AND effort level:
 | `opus` | `opus` | high | code writing, architecture, design, review, DB schema |
 | `opus` | `opus` | max | security audit, incident response, critical architecture decisions |
 
-**The model string is the BARE TIER ALIAS, never a full model id.** Claude Code maps `opus` / `sonnet` / `haiku` to the current generation of that tier, so every spawn gets the latest model of the tier you asked for. A full id is correct on the day it is typed and silently last-generation on the day after — a failure nothing goes red for. Obtain the string from `bin/heimdall-model-resolve <tier>`; that resolver is also the only legitimate way to pin one, via `HEIMDALL_MODEL_<TIER>=<full-id>`, and pinning exists for bench/eval reproducibility alone. Write the TIER into each task spec, never a full model id.
+**The model string is a TIER ALIAS, never a full model id.** One alias carries a suffix: `sonnet` resolves to `sonnet[1m]` — the 1M-context window, still an alias and still current-gen. It exists because a compaction is a lossy rewrite of the very context the agent is reasoning over, and compacting repeatedly through one task is how an agent forgets its own acceptance criteria. `opus` already defaults to a 1M window and no `haiku[1m]` exists (200K window), so neither is suffixed. Claude Code maps `opus` / `sonnet` / `haiku` to the current generation of that tier, so every spawn gets the latest model of the tier you asked for. A full id is correct on the day it is typed and silently last-generation on the day after — a failure nothing goes red for. Obtain the string from `bin/heimdall-model-resolve <tier>`; that resolver is also the only legitimate way to pin one, via `HEIMDALL_MODEL_<TIER>=<full-id>`, and pinning exists for bench/eval reproducibility alone. Write the TIER into each task spec, never a full model id.
 
 **Default to opus/high for code changes. Reserve max effort for decisions that are expensive to undo (security, architecture, incident response). Use sonnet/default for routine work (docs, tests). Use haiku/low for mechanical tasks (lint, format).**
 

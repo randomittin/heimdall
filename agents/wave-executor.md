@@ -3,8 +3,7 @@ name: wave-executor
 description: Executes all tasks in a single wave of a plan. Implements, verifies acceptance criteria, and commits atomically. Spawns parallel subprocesses for independent tasks within the wave.
 tools: Agent, TaskStop, Read, Write, Edit, Bash, Grep, Glob
 model: sonnet
-tier: opus
-tier_reason: executes and commits a whole wave unattended, so a wrong commit costs more than the tier gap
+tier: sonnet
 effort: high
 isolation: worktree
 color: yellow
