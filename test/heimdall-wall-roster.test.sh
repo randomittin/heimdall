@@ -522,6 +522,79 @@ if [m.get("user") for m in ms] == []:
 else:
     bad("H5 a renamed self row survived the gate: %r" % ([m.get("user") for m in ms],))
 
+print("\nI. SCOPE: the machine-global ledger may never put ANOTHER repo's people here")
+# THE MEASURED DEFECT, reported live: "the wall is now showing folks from other repos as
+# well initially and then updates it back to the current project".
+#
+# The ledger mirror is read from ONE MACHINE-GLOBAL file —
+# ${HEIMDALL_HOME}/ledger/status.json — which bin/heimdall-status-json rewrites on every
+# keeper beat from whatever repo that keeper happens to run in. It carried NO project
+# identity, and hmd_ledger.filter_team filters only by time-window and self — never by
+# project. So two live sessions in two repos fight over one slot, and each repo's
+# statusline renders the OTHER repo's roster as if those people were here.
+#
+# It self-corrects a beat later only because _team_members prefers the repo-scoped wall
+# once that wall is BIGGER (len(wall) > len(members)). So the wrong frame is exactly the
+# FIRST one — while the repo-scoped wall cache is still cold. A first paint naming people
+# who are not on this project is a false statement about who is here, screenshotted or not.
+#
+# THE RULE PROVEN HERE: an unknown scope renders as NOTHING. Never as EVERYTHING.
+
+FOREIGN = {"team": [{"user": "priya", "haid": "haid:priya.box-11", "state": "running"},
+                    {"user": "marcus", "haid": "haid:marcus.box-22", "state": "running"},
+                    {"user": "wei", "haid": "haid:wei.box-33", "state": "running"}],
+           "team_overflow": 0}
+
+# I1 — THE DEFECT ITSELF. Cold repo-scoped caches (the FIRST-PAINT condition) plus a global
+# ledger stamped with a DIFFERENT repo must contribute ZERO columns.
+r = repo("i_foreign")
+put_wall(r, [])
+put_presence(r, [])
+ms, of = S._team_members(r, dict(FOREIGN, repo=os.path.join(TMP, "some_other_repo")), SELF_IDS)
+if [m.get("user") for m in ms] == [] and of == 0:
+    ok("I1 a ledger stamped with ANOTHER repo contributes ZERO on the cold first paint")
+else:
+    bad("I1 other repos' people reached this wall's first paint: %r"
+        % ([m.get("user") for m in ms],))
+
+# I2 — NOT VACUOUS. The mirror is SCOPED, not disabled: stamped with THIS repo it still
+# populates the wall. Without this, I1 would pass by simply deleting the ledger source.
+r2 = repo("i_own")
+put_wall(r2, [])
+put_presence(r2, [])
+ms, _of = S._team_members(r2, dict(FOREIGN, repo=r2), SELF_IDS)
+if [m.get("user") for m in ms] == ["priya", "marcus", "wei"]:
+    ok("I2 a ledger stamped with THIS repo still populates it — scoped, not disabled")
+else:
+    bad("I2 the scope gate broke the legitimate same-repo mirror: %r"
+        % ([m.get("user") for m in ms],))
+
+# I3 — FAIL CLOSED. An UNSTAMPED ledger (an older heimdall-status-json, or a torn write)
+# has an UNKNOWN scope. Unknown must render as nothing: the absence of a filter must never
+# be read as "everything".
+r3 = repo("i_unstamped")
+put_wall(r3, [])
+put_presence(r3, [])
+ms, _of = S._team_members(r3, dict(FOREIGN), SELF_IDS)
+if [m.get("user") for m in ms] == []:
+    ok("I3 an UNSTAMPED ledger fails CLOSED — unknown scope shows nothing, not everyone")
+else:
+    bad("I3 an unknown scope degraded to EVERYTHING: %r" % ([m.get("user") for m in ms],))
+
+# I4 — the first paint is SCOPED, not merely BLANKED. With the foreign mirror gated out,
+# the repo-scoped LIVE presence still paints THIS project's teammates on that same first
+# frame. Suppressing the mirror must not cost the wall its own real roster — a flash of
+# nothing would still be a flash.
+r4 = repo("i_firstpaint")
+put_wall(r4, [])
+put_presence(r4, [beat("akshat", "haid:akshat.box-77")])
+ms, _of = S._team_members(r4, dict(FOREIGN, repo=os.path.join(TMP, "elsewhere")), SELF_IDS)
+if [m.get("user") for m in ms] == ["akshat"]:
+    ok("I4 the cold first paint renders THIS repo's live teammate, not a blank wall")
+else:
+    bad("I4 the first paint lost the repo-scoped roster: %r"
+        % ([m.get("user") for m in ms],))
+
 print("\n" + "=" * 60)
 print("wall-roster: %d passed, %d failed" % (P_N[0], F_N[0]))
 print("=" * 60)

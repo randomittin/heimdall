@@ -12,8 +12,15 @@ SOURCE (spec §6):  ${HEIMDALL_HOME:-~/.heimdall}/ledger/status.json
       "daemon": <bool|str>,                         # liveness (informational)
       "gates":  [{"id","state","detail"}, ...],     # the check/circle/cross render feed
       "verdict":{"state","label"},                  # the headline gate verdict
-      "team":   [{"user","sigil","branch","state","ts"}, ...]  # presence mirror
+      "team":   [{"user","sigil","branch","state","ts"}, ...],  # presence mirror
+      "repo":   "<abs repo root>"                   # WHICH repo team[] is the roster OF
     }
+
+SCOPE (why `repo` exists). This source is ONE machine-global file, but `team` is only ever
+the roster of ONE project — whichever repo's keeper wrote it last. Two live sessions in two
+repos fight over the single slot, so a reader in repo A can be handed repo B's roster. This
+module CARRIES the stamp and never interprets it; the renderer compares it against the tree
+it is painting. An absent stamp means UNKNOWN scope, never "all repos".
 
 NORMALIZED RETURN SHAPE (what read_status hands the statusline):
     {
@@ -22,6 +29,7 @@ NORMALIZED RETURN SHAPE (what read_status hands the statusline):
       "verdict": {"state":"pass"|"running"|"deny", "label":str} | None,
       "team":    [{"user","sigil","branch","state","ts"}, ...],   # <=3, self-excluded
       "team_overflow": int,                                       # the "+N" count
+      "repo":    str,                          # the team's scope; "" = UNKNOWN, never "all"
     }
 
 DEGRADE-NOT-CRASH (spec §6): a missing file OR malformed JSON OR non-dict content
@@ -86,7 +94,7 @@ _STATE_ALIASES = {
 }
 
 SAFE_DEFAULT = {"daemon": "down", "gates": [], "verdict": None,
-                "team": [], "team_overflow": 0}
+                "team": [], "team_overflow": 0, "repo": ""}
 
 
 # ── paths (all env-overridable for isolation + testability) ───────────────────
@@ -307,6 +315,8 @@ def _map_legacy():
         "verdict": {"state": state, "label": detail or (str(verdict) if verdict else "")},
         "team": [],
         "team_overflow": 0,
+        # The legacy file carries no roster at all, so there is no scope to declare.
+        "repo": "",
     }
 
 
@@ -372,6 +382,11 @@ def _read_source():
             "verdict": _norm_verdict(d.get("verdict")),
             "team": members,
             "team_overflow": overflow,
+            # WHICH repo team[] is the roster of. Carried, never interpreted here: this reader
+            # has no idea which tree is being rendered. The renderer compares it against the
+            # tree it is painting and drops the mirror when they differ. Absent/unusable → ""
+            # (UNKNOWN), which the renderer fails CLOSED on.
+            "repo": str(d.get("repo") or ""),
         }
     legacy = _map_legacy()                    # new file absent → try the legacy single-verdict
     return legacy if legacy is not None else dict(SAFE_DEFAULT)

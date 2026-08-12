@@ -8,13 +8,20 @@
 # file. It is cheap and bounded — the statusline caches the read for ~5s; this only has to be
 # fast enough to keep that cache warm on the presence beat.
 #
-# THE CONTRACT (Spec v1 §6). One object, four keys:
+# THE CONTRACT (Spec v1 §6). One object, five keys:
 #   {
 #     "daemon": "watching" | "down",
 #     "gates":  [ {"id": "<gate>", "state": "pass"|"running"|"deny", "detail": "<str>"}, ... ],
 #     "verdict":{ "state": "pass"|"deny"|"pending", "label": "<GENERALIZES|BLOCKED|PENDING>" },
-#     "team":   [ {"user":"<h>","sigil":"#RRGGBB","branch":<str|null>,"state":"<st>","ts":<epoch>}, ... ]
+#     "team":   [ {"user":"<h>","sigil":"#RRGGBB","branch":<str|null>,"state":"<st>","ts":<epoch>}, ... ],
+#     "repo":   "<abs repo root>"     # WHICH repo team[] is the roster OF
 #   }
+#   - repo: this file lives at ONE machine-global path, but team[] is only ever the roster of
+#     ONE project — whichever repo's keeper wrote it last. Two live sessions in two repos
+#     therefore FIGHT over this single slot. Stamping the repo is what lets the statusline
+#     tell "this roster is mine" from "this roster is someone else's": it renders team[] only
+#     when the stamp is its own tree, and shows NOTHING when the stamp is absent or foreign.
+#     Without it the wall painted other repos' people as present on this project's wall.
 #   - gates[].state: pass/running/deny -> the statusline renders the check/spinner/cross glyphs.
 #   - team[] entries carry a heartbeat ts, the teammate's sigil hue (deterministic identity
 #     color), a branch (null until presence broadcasts one — see below), and a wall state.
@@ -123,6 +130,10 @@ PY="$(command -v python3 || command -v python || true)"
 if [ -z "$PY" ]; then
   # No python -> we cannot derive sigil hues. Still honor the never-write-garbage contract:
   # emit a schema-valid file with an empty team (honest — the hue source is unavailable).
+  # The "repo" stamp is deliberately OMITTED here rather than interpolated: this branch has no
+  # JSON encoder, and a repo path containing a quote or backslash would emit invalid JSON and
+  # cost the reader the gates and verdict too. An absent stamp reads as UNKNOWN scope, which
+  # the statusline fails CLOSED on — and team[] is empty here anyway, so nothing is lost.
   mkdir -p "$(dirname "$OUT")" 2>/dev/null || true
   tmp="$OUT.tmp.$$"
   printf '{"daemon":"%s","gates":[],"verdict":{"state":"pending","label":"PENDING"},"team":[]}\n' \
@@ -135,6 +146,7 @@ HMD_SIGIL_DIR="$SIGIL_CORE_DIR" \
 HMD_DAEMON="$DAEMON" \
 HMD_VERDICT_FILE="$VERDICT_FILE" \
 HMD_ROSTER_JSON="$ROSTER_JSON" \
+HMD_REPO="$REPO" \
 HMD_OUT="$OUT" \
 HMD_NOW="$NOW" \
 HMD_PRINT="$PRINT" \
@@ -289,6 +301,10 @@ def main():
         "gates": gates,
         "verdict": verdict,
         "team": team,
+        # WHICH repo team[] describes. This file is machine-global and single-slot, so it can
+        # only ever truthfully be the roster of ONE tree; naming that tree is what stops a
+        # reader in a DIFFERENT tree from rendering these people as its own.
+        "repo": os.environ.get("HMD_REPO", "") or "",
     }
     text = json.dumps(status, sort_keys=True) + "\n"
     atomic_write(os.environ["HMD_OUT"], text)

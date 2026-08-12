@@ -23,13 +23,39 @@
 #   (f) pollers: a watcher-shaped process line is REPORTED (K>=1) but NOT killed
 #       without --kill (report-only is default-safe).
 #
+# ── THE GUARD CASES (g1-g5): MERGED IS NOT PERMISSION TO DELETE ──────────────
+# `merge-base --is-ancestor` rules on COMMITS. The removal deletes a DIRECTORY.
+# For a long time the reaper conflated the two and ran `git worktree remove
+# --force` on any worktree whose commits were on main — which deletes modified
+# files, untracked files and gitignored files without a word. These four cases
+# are the falsifiers for that, plus one that proves the guard did not simply
+# switch the tool off:
+#
+#   (g1) merged + a MODIFIED TRACKED file            -> KEPT
+#   (g2) merged + ONLY an UNTRACKED file             -> KEPT  (untracked is the
+#        common shape: a file an agent wrote and has not added yet)
+#   (g3) merged + ONLY a GITIGNORED .claude/agent-memory/ file -> KEPT. This is
+#        the case `git status --porcelain` structurally CANNOT see, and the test
+#        asserts that blindness directly before asserting survival — otherwise
+#        it would pass for the wrong reason.
+#   (g4) merged + an EMPTY .claude/agent-memory/ skeleton, clean tree -> REAPED.
+#        The harness mints that skeleton for every spawn; if its mere existence
+#        protected, the reaper would be a permanent no-op and this suite would
+#        still be green. ANTI-NEUTER.
+#   (g5) merged + `git status` CANNOT RUN (broken gitdir link) -> KEPT. Fail
+#        closed: "we could not tell" is never a licence to delete.
+#
 # Exit 0 = every assertion passed. Non-zero = a regression. Hermetic: throwaway
 # git repos, no network, no real agent-pool, no process is ever actually killed.
+#
+# HMD_REAP_BIN overrides the binary under test, so the guard can be MUTATED OFF
+# in a copy and this suite re-run to prove g1-g3/g5 actually go red. A guard whose
+# removal keeps the suite green is not a guard, it is decoration.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
-REAP="$ROOT/bin/heimdall-reap-idle"
+REAP="${HMD_REAP_BIN:-$ROOT/bin/heimdall-reap-idle}"
 
 [ -x "$REAP" ] || { echo "FATAL: $REAP not executable" >&2; exit 2; }
 command -v git >/dev/null 2>&1 || { echo "FATAL: git not found" >&2; exit 2; }
@@ -37,6 +63,11 @@ command -v git >/dev/null 2>&1 || { echo "FATAL: git not found" >&2; exit 2; }
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); printf "  \033[32mPASS\033[0m %s\n" "$1"; }
 bad() { FAIL=$((FAIL+1)); printf "  \033[31mFAIL\033[0m %s\n" "$1"; }
+
+# Classification predicates over a captured report. Anchored to the decision tag
+# so "agent-x appears somewhere in the output" can never be mistaken for a verdict.
+says_reap() { printf '%s\n' "$1" | grep -E '^\[REAP' | grep -q -- "$2"; }
+says_keep() { printf '%s\n' "$1" | grep -E '^\[KEEP' | grep -q -- "$2"; }
 
 TMPL="$(printf 'X%.0s' 1 2 3 4 5 6)"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/hmd-reap-test.$TMPL")"

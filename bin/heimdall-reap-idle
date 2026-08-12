@@ -10,9 +10,17 @@
 #   3. agent-pool leases whose worktree/process no longer exists.
 #
 # This tool reaps them — but the ONE invariant it never breaks is: NEVER destroy
-# unmerged work. It classifies from GIT itself (merge-base --is-ancestor), never
-# from an agent's self-report that it is "done" (the R2/R7 convention: a truncated
-# agent cannot be trusted to say its branch is safe to delete — git can).
+# work. It classifies from GIT itself, never from an agent's self-report that it is
+# "done" (the R2/R7 convention: a truncated agent cannot be trusted to say its
+# branch is safe to delete — git can).
+#
+# "MERGED" IS NECESSARY AND WAS NEVER SUFFICIENT. For a long time this tool asked
+# git exactly one question — `merge-base --is-ancestor`, "are this worktree's COMMITS
+# on main?" — and treated a yes as permission to run `git worktree remove --force`.
+# It is not permission. A worktree whose every commit is on main can still be holding
+# uncommitted changes and an agent's memory home, and --force deletes both without a
+# word. So a removal now needs TWO proofs, not one: the commits are on main AND there
+# is nothing uncommitted to lose. See wt_protect_reason().
 #
 # ── Worktree classification (per worktree in scope) ──────────────────────────
 #   SCOPE   path (relative to repo root) matches .claude/worktrees/agent-* OR
@@ -20,10 +28,15 @@
 #           the main worktree, this reaper's own worktree) is OUT OF SCOPE and
 #           NEVER touched.
 #   REAP    the worktree tip (branch head, or detached HEAD) is an ANCESTOR of
-#           main => merged/clean/no divergence => `git worktree remove --force`
+#           main => the commits are on main => AND wt_protect_reason() finds
+#           nothing to lose => `git worktree remove --force`
 #           (+ `git branch -D` if it is on a branch other than main).
 #   KEEP    the tip is NOT an ancestor of main => it carries commits not on main
 #           => unmerged work => KEEP and report by name. Never destroyed.
+#   KEEP    PROTECTED — the commits ARE on main, but the worktree still holds
+#           something --force would destroy: uncommitted changes (modified, staged
+#           or untracked), an agent memory home under .claude/agent-memory/, or a
+#           state we could not read at all. Never destroyed.
 #   SKIP    locked worktree whose recorded agent pid is still ALIVE => an agent is
 #           actively working there => leave it alone regardless of merge state.
 #   PRUNE   worktree whose directory has vanished (git marks it prunable) =>
@@ -63,7 +76,8 @@
 # Usage:
 #   heimdall-reap-idle [--apply] [--kill] [--repo <path>] [--main <ref>] [--quiet]
 #
-#   --apply        actually remove merged/clean worktrees + branches, prune, and
+#   --apply        actually remove worktrees that are BOTH merged and provably
+#                  empty of uncommitted work, plus their branches; prune; and
 #                  reconcile agent-pool leases. Without it: report only.
 #   --kill         additionally kill watcher pollers that are children of this
 #                  shell (same process group). Without it: report pollers only.
@@ -72,7 +86,7 @@
 #                  else master, else the primary worktree's branch).
 #   --quiet        suppress the per-worktree decision lines; print only the summary.
 #
-# Exit 0 on success (keeping unmerged work is success, not failure). Exit 2 on a
+# Exit 0 on success (keeping work is success, not failure). Exit 2 on a
 # usage/repo error.
 set -uo pipefail
 
@@ -96,7 +110,7 @@ while [ $# -gt 0 ]; do
     --main)   MAIN_REF="${2:-}"; shift ;;
     --main=*) MAIN_REF="${1#--main=}" ;;
     -h|--help)
-      sed -n '2,72p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,87p' "$0" | sed 's/^# \{0,1\}//'
       exit 0 ;;
     *) echo "heimdall-reap-idle: unknown argument: $1" >&2; exit 2 ;;
   esac
@@ -183,6 +197,8 @@ REAPED=0        # worktrees actually removed (--apply)
 REAP_CAND=0     # worktrees classified reapable (dry-run or apply)
 KEPT=0
 KEPT_NAMES=""
+PROTECTED=0     # merged worktrees held back because they still hold work
+PROTECTED_NAMES=""
 PRUNED=0
 AGENT_CAND=0    # idle agent processes classified reapable
 AGENT_REAPED=0  # idle agent processes actually signalled/reaped (--apply)
@@ -281,6 +297,93 @@ reap_idle_agents() {
   done
 }
 
+# ── the destruction guard ────────────────────────────────────────────────────
+# `git worktree remove --force` deletes the working directory outright. Ancestry
+# says nothing about what is IN that directory, so before any removal the worktree
+# has to clear two further checks:
+#
+#   1. UNCOMMITTED WORK — `git status --porcelain` must come back empty. Modified
+#      tracked files, staged changes and UNTRACKED files all count; untracked is
+#      not the lenient case, it is the common one (a new file an agent has written
+#      but not yet added is exactly the work --force throws away).
+#
+#   2. AN AGENT MEMORY HOME — files under .claude/agent-memory/. That path is
+#      GITIGNORED (.gitignore:33), so check 1 is structurally blind to it: git
+#      reports such a worktree as perfectly clean. Git's silence there is not
+#      evidence of emptiness, it is evidence that git was told not to look. So
+#      this is checked by PATH. An EMPTY .claude/agent-memory/<agent>/ skeleton —
+#      which the harness mints for every spawn — holds nothing and does not
+#      protect; one real file does.
+#
+# WHERE THE DIRTY DEFINITION COMES FROM. It is deliberately the same one
+# bin/heimdall-conformance already uses to decide whether an agent worktree holds
+# uncommitted work ("dirty = `git status --porcelain` non-empty"), so the tool that
+# REPORTS a worktree as live-and-dirty and the tool that DESTROYS it cannot reach
+# opposite verdicts about the same directory — they did, and the destructive one
+# won. What is NOT reused is that check's plumbing: conformance pipes through
+# `grep -c` and so reads a git failure as dirty=0. That is the right fail direction
+# for a tool that only prints and the catastrophic one for a tool that deletes.
+#
+# FAIL CLOSED. Every uncertainty resolves to KEEP: a git that errored, a directory
+# we cannot read, an enumeration that did not complete. A lingering worktree costs
+# disk and is recoverable in one command; a deleted one is not recoverable at all,
+# so the two mistakes are not worth trading. "We could not tell" is never a licence
+# to delete.
+#
+# wt_protect_reason <abspath> — prints WHY this worktree must be kept, or prints
+# nothing at all when it is provably safe to destroy. Always returns 0.
+wt_protect_reason() {
+  local wt="$1" st rc mem memlist memn
+
+  # A directory we cannot enter is a directory whose contents we cannot rule on.
+  if [ ! -d "$wt" ] || [ ! -r "$wt" ] || [ ! -x "$wt" ]; then
+    printf 'PROTECTED: worktree directory is not readable — contents undeterminable (fail-closed)'
+    return 0
+  fi
+
+  # (2) agent memory home — by path, because .gitignore hides it from (1).
+  mem="$wt/.claude/agent-memory"
+  if [ -d "$mem" ]; then
+    if [ ! -r "$mem" ] || [ ! -x "$mem" ]; then
+      printf 'PROTECTED: agent memory home present but unreadable (fail-closed)'
+      return 0
+    fi
+    memlist="$(find "$mem" -type f 2>/dev/null)"; rc=$?
+    if [ "$rc" -ne 0 ]; then
+      printf 'PROTECTED: agent memory home could not be enumerated (fail-closed)'
+      return 0
+    fi
+    memn="$(printf '%s\n' "$memlist" | grep -c . || true)"
+    case "$memn" in ''|*[!0-9]*) memn=1 ;; esac   # unparseable count => assume occupied
+    if [ "$memn" -gt 0 ]; then
+      printf 'PROTECTED: agent memory home holds %s file(s) under .claude/agent-memory/ (gitignored — git status cannot see them)' "$memn"
+      return 0
+    fi
+  fi
+
+  # (1) uncommitted work. --no-optional-locks so probing a worktree an agent is
+  # actively working in never contends for its index.lock.
+  st="$(git -C "$wt" --no-optional-locks status --porcelain 2>/dev/null)"; rc=$?
+  if [ "$rc" -ne 0 ]; then
+    # --no-optional-locks needs git >= 2.14. On an older git the FLAG is the
+    # failure, and concluding "undeterminable" there would protect every worktree
+    # forever — a reaper silently reduced to a no-op. Retry once plainly before
+    # deciding we genuinely cannot tell.
+    st="$(git -C "$wt" status --porcelain 2>/dev/null)"; rc=$?
+  fi
+  if [ "$rc" -ne 0 ]; then
+    printf 'PROTECTED: `git status` failed here — dirtiness undeterminable (fail-closed)'
+    return 0
+  fi
+  if [ -n "$st" ]; then
+    printf 'PROTECTED: %s uncommitted change(s) — modified, staged or untracked files --force would delete' \
+      "$(printf '%s\n' "$st" | grep -c . || true)"
+    return 0
+  fi
+
+  return 0   # nothing to lose
+}
+
 # ── enumerate + classify worktrees ───────────────────────────────────────────
 reap_worktrees() {
   local wt_path="" wt_head="" wt_branch="" wt_detached=0 wt_locked="" wt_prunable=0
@@ -329,8 +432,19 @@ reap_worktrees() {
     local tip="$wt_head"
     [ -n "$tip" ] || tip="$(git -C "$REPO" rev-parse --verify -q "HEAD" 2>/dev/null)"
 
-    # Core rule: tip is an ANCESTOR of main => merged/clean => reap.
+    # Core rule: tip is an ANCESTOR of main => the commits are on main.
     if git -C "$REPO" merge-base --is-ancestor "$tip" "$MAIN_SHA" 2>/dev/null; then
+      # …which is necessary and not sufficient. Ancestry rules on COMMITS; the
+      # removal deletes a DIRECTORY. Prove the directory holds nothing first.
+      local guard
+      guard="$(wt_protect_reason "$abspath")"
+      if [ -n "$guard" ]; then
+        line "KEEP" "$rel" "$guard"
+        PROTECTED=$((PROTECTED+1))
+        PROTECTED_NAMES="${PROTECTED_NAMES:+$PROTECTED_NAMES, }$rel"
+        return 0
+      fi
+
       local why="merged into $MAIN_REF"
       [ "$tip" = "$MAIN_SHA" ] && why="at $MAIN_REF head (no divergence)"
       line "REAP" "$rel" "$why"
@@ -468,11 +582,15 @@ fi
 
 say "─────────────────────────────────────────────────────────────────────────"
 if [ "$APPLY" = 1 ]; then
-  printf 'SUMMARY: reaped %d worktree(s), %d kept-unmerged%s, %d pruned, %d poller(s) found, %d idle agent(s) reaped (~%dMB)\n' \
-    "$REAPED" "$KEPT" "$([ -n "$KEPT_NAMES" ] && echo " ($KEPT_NAMES)")" "$PRUNED" "$POLLERS_FOUND" "$AGENT_REAPED" "$AGENT_RSS_MB"
+  printf 'SUMMARY: reaped %d worktree(s), %d kept-unmerged%s, %d protected%s, %d pruned, %d poller(s) found, %d idle agent(s) reaped (~%dMB)\n' \
+    "$REAPED" "$KEPT" "$([ -n "$KEPT_NAMES" ] && echo " ($KEPT_NAMES)")" \
+    "$PROTECTED" "$([ -n "$PROTECTED_NAMES" ] && echo " ($PROTECTED_NAMES)")" \
+    "$PRUNED" "$POLLERS_FOUND" "$AGENT_REAPED" "$AGENT_RSS_MB"
 else
-  printf 'SUMMARY (dry-run): would reap %d, %d kept-unmerged%s, %d poller(s) found, %d idle agent(s) reapable (~%dMB) — rerun with --apply to reap\n' \
-    "$REAP_CAND" "$KEPT" "$([ -n "$KEPT_NAMES" ] && echo " ($KEPT_NAMES)")" "$POLLERS_FOUND" "$AGENT_CAND" "$AGENT_RSS_MB"
+  printf 'SUMMARY (dry-run): would reap %d, %d kept-unmerged%s, %d protected%s, %d poller(s) found, %d idle agent(s) reapable (~%dMB) — rerun with --apply to reap\n' \
+    "$REAP_CAND" "$KEPT" "$([ -n "$KEPT_NAMES" ] && echo " ($KEPT_NAMES)")" \
+    "$PROTECTED" "$([ -n "$PROTECTED_NAMES" ] && echo " ($PROTECTED_NAMES)")" \
+    "$POLLERS_FOUND" "$AGENT_CAND" "$AGENT_RSS_MB"
 fi
 
 exit 0
