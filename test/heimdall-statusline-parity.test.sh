@@ -26,13 +26,23 @@
 #      (a non-tty pipe, e.g. a CI runner or a misbehaving caller) still gets the
 #      EXISTING, already-tested Spec v2 §8.4 branded-floor fallback — proving the
 #      new tty-only richer path did not regress the old, locked contract.
-#   5. NEVER-ERROR — every path above exits 0.
+#   5. CTX_METER PUBLISH — the renderer still hands its stdin blob to
+#      `bin/heimdall-ctx-meter publish` (feat(ctx) 568c7b8), so the per-prompt
+#      context meter (docs/analysis/token-spend-forensics.md) keeps working. This
+#      is the regression a prior version of THIS refactor actually shipped: the
+#      renderer rewrite silently dropped the publish call and this suite stayed
+#      green throughout, because nothing checked for the ctx-meter's on-disk
+#      record — only the visible bar output. Asserting the SIDE EFFECT (not just
+#      the rendered bytes) is what closes that hole.
+#   6. NEVER-ERROR — every path above exits 0.
 #
 # FALSIFIER (verified by hand during development, not re-run here to keep this
 # suite's runtime bounded): point hooks/statusline.sh at a second, independently
 # maintained copy of the render logic instead of `exec`-delegating to
 # bin/heimdall-statusline -> assertion set 1 goes RED the moment the two copies
-# disagree on so much as one byte.
+# disagree on so much as one byte. Delete the CTX_METER block from
+# bin/heimdall-statusline -> assertion set 5 goes RED (no record written), exactly
+# the failure mode this suite previously missed.
 set -u
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -179,6 +189,31 @@ case "$EMPTY_OUT" in
   *HEIMDALL*) ok "piped-empty: falls back to the branded ⛭ HEIMDALL floor (§8.4 unchanged)" ;;
   *) bad "piped-empty: unexpected output: $EMPTY_OUT" ;;
 esac
+
+echo "== 5) CTX_METER PUBLISH: the SAME blob the bar renders reaches bin/heimdall-ctx-meter publish =="
+# Regression proof: a stale-base refactor once swapped hooks/statusline.sh's inline
+# body for the `exec bin/heimdall-statusline` wrapper WITHOUT porting the CTX_METER
+# publish call into the new target. Section 1 above (byte-identical rendered output)
+# stayed fully green through that regression, because the meter's write is a SIDE
+# EFFECT with no footprint in stdout. So this checks the effect directly: after a
+# render, bin/heimdall-ctx-meter must have written a record under the hermetic
+# $HOME/.heimdall/ctx/ (HOME="$HOMED" is a fresh mktemp -d per call — see render(),
+# never the real user's ~/.heimdall) whose "tokens" field matches
+# context_window.total_input_tokens from the SAME blob just rendered.
+for via in hook cli; do
+  TRIPLE="$(mkws solo)"
+  IFS='|' read -r WS HOMED TMPD <<<"$TRIPLE"
+  J="$(canned "$WS" 120)"
+  render "$via" "$WS" "$HOMED" "$TMPD" 120 "$J" >/dev/null
+  RC=$?
+  CTX_FILE="$(ls "$HOMED/.heimdall/ctx/"*.json 2>/dev/null | head -1)"
+  if [ "$RC" -eq 0 ] && [ -n "$CTX_FILE" ] && grep -q '"tokens": 256000' "$CTX_FILE" 2>/dev/null; then
+    ok "ctx-meter publish via $via: recorded total_input_tokens=256000 from the rendered blob ($CTX_FILE)"
+  else
+    bad "ctx-meter publish via $via: no ctx record with tokens=256000 under \$HOME/.heimdall/ctx (rc=$RC file=${CTX_FILE:-none}) — the renderer is not publishing the context reading"
+  fi
+  rm -rf "$WS" "$HOMED" "$TMPD"
+done
 
 echo
 echo "$pass passed, $fail failed"
