@@ -1,6 +1,13 @@
 # Headroom: did it help?
 
-**Verdict: NOT ACTUALLY RUNNING.**
+**Verdict: MIXED, updated 2026-08-18.** Storage-codec: still not actually running
+(§1-4, unchanged). Traffic-proxy: **is** actually running — found live and engaged
+on this machine, contradicting this doc's original "zero usage evidence" framing for
+that wire — and measured, from its own operational log, to deliver savings on 1 of
+173 recorded attempts while carrying a real tail-latency and reliability defect. See
+§6. Original 2026-08-11 finding preserved below unedited except where noted.
+
+**Original verdict, 2026-08-11: NOT ACTUALLY RUNNING.**
 
 Reason: the storage-codec wire (`bin/lib/memory_codec.py`) never leaves the `plain`
 backend. hmd's own Python cannot import `headroom` (`importlib.util.find_spec`
@@ -12,7 +19,9 @@ encode/decode pair this seam can bind to. The other integration point — the
 `hmd wrap` traffic-proxy chain — is technically wireable (the CLI is installed and on
 `$PATH`) but has zero recorded snapshots anywhere in this repo's history. Nothing has
 been measured on either wire, so there is no receipt to grade and no improvement
-number to report.
+number to report. **(2026-08-18: the "nothing measured" half of this sentence no
+longer holds — see §6. "Zero repo-committed receipts" and "zero real-world usage"
+turned out to be different claims; this doc originally conflated them.)**
 
 This builds on `docs/analysis/2026-08-04-headroom-vs-claude-mem.md`, which found
 Headroom "not installed" at all. That has since changed (headroom-ai v0.33.0 is now
@@ -220,6 +229,115 @@ there is no evidence anywhere that a real coding session has ever run through
 distinguishes a wrapped session from an unwrapped one. Technically wireable is not
 the same as ever exercised in a measured way.
 
+## 6. Live proxy evidence, found independently (2026-08-18)
+
+A user reported hmd feeling slow/expensive and asked whether Headroom was the cause,
+citing `docs/analysis/token-spend-forensics.md` ($1,103.05 / 234 sessions). That
+document was read in full for this update: it names its cost drivers explicitly
+(Row 1, one 15-day session never restarted/compacted, $913.54, 82.8% of spend; Row 2,
+a cache-write cliff above 800K context, $118.92) and **mentions Headroom zero times**.
+`grep -ic headroom docs/analysis/token-spend-forensics.md` → `0`. The forensics doc's
+own two comparison days make the actual driver unambiguous: 2026-08-05 at 731,707
+mean context cost $0.366/request; 2026-08-07 at 118,678 mean context cost
+$0.0593/request — a 6.17× difference **from context size alone, same repo, same
+working style, nothing skipped**. Headroom is not part of that story at all. This
+part of the user's concern rests on a misattribution, and it is corrected here
+plainly rather than acted on.
+
+That would have closed the investigation — except checking Headroom on its own
+terms, independent of the forensics doc, surfaced something the doc's premise didn't
+predict: this session's own environment was already routed through a live Headroom
+proxy:
+
+```
+$ env | grep -i "ANTHROPIC_BASE_URL\|HEADROOM"
+ANTHROPIC_BASE_URL=http://127.0.0.1:8787
+
+$ curl -s --max-time 3 http://127.0.0.1:8787/health
+{"service":"headroom-proxy","status":"healthy","ready":true,"version":"0.33.0",
+ "uptime_seconds":41959.858,
+ "checks":{"upstream":{"url":"https://api.anthropic.com"},
+           "kompress":{"backend":"onnx"},"memory":{"enabled":false}},
+ "runtime":{"compression_executor":{
+    "max_workers":10,"run_seconds_total":3854.66,"run_seconds_max":64.75,
+    "leaked_threads_total":10,"quarantine_activations_total":10,
+    "timed_out_workers_max":1,"quarantine_skips_total":48}}}
+
+$ ps aux | grep 8787
+rj  5157  131.5  1.6 ... R+  7:41AM  93:49.49 .../headroom proxy --host 127.0.0.1 --port 8787
+```
+
+This does not contradict §2 — §2 searched exhaustively for *repo-committed* receipts
+(tracked JSON, git history, the snapshot schema string) and correctly found none. A
+live, gitignored, machine-local proxy with its own local log
+(`~/.heimdall/headroom/proxy.log`) is a different category of evidence that no repo
+search could surface. **"Zero repo-committed receipts" and "zero real-world usage"
+are different claims — this machine falsifies the second while the first still
+holds.**
+
+**Delivered compression, measured directly from the proxy's own log** (2026-08-06
+15:07:34 → 2026-08-18 19:17:17, 1,019 lines, gitignored, local to this machine):
+
+```
+$ grep -o "compression_ratio=[0-9.]*" ~/.heimdall/headroom/proxy.log | sort | uniq -c | sort -rn
+    172 compression_ratio=1.0
+      1 compression_ratio=0.6862745098039216
+```
+
+**172 of 173 recorded `diff_compressor` invocations (99.4%) show a compression ratio
+of exactly 1.0 — no reduction.** One event in 12 days achieved a real ~31%
+reduction. `grep -ic kompress ~/.heimdall/headroom/proxy.log` → `0` — the
+manifest's other named compressor (ONNX-backed `kompress`) leaves no log trace
+distinguishable from `diff_compressor` in this file; there is no log evidence it ran
+at all, let alone that it offsets `diff_compressor`'s near-total ineffectiveness.
+
+**Cost, same evidence:**
+
+- `run_seconds_max=64.75` — a single worst-case compression job ran **64.75
+  seconds, more than double** the package's own configured 30-second compression
+  timeout. The timeout mechanism took over 2× its own ceiling to resolve in at
+  least one real case.
+- `leaked_threads_total=10`, `quarantine_activations_total=10` against ~173 total
+  attempts — a materially high internal failure rate for the compression
+  subsystem, not a rare tail.
+- A live, isolated call to the proxy's own `/stats` endpoint measured **10.19s**
+  (`http_code=200 time_total=10.186827`) against **16.5ms** for `/livez` on the
+  same process, moments apart.
+- `grep -ic "error|exception|traceback|timeout|leaked|quarantine|retry|failed"
+  ~/.heimdall/headroom/proxy.log` → **53** matches over the 12-day window, including
+  repeated `httpx.ReadError`/`httpcore.ReadError` frames from
+  `headroom/proxy/helpers.py:915 in request_with_transient_retry`.
+
+**A correction, made explicitly rather than left standing:** two `ps` samples taken
+alongside the slow `/stats` call above read 82.4% and 131.5% CPU, and an intermediate
+draft of this finding characterized the proxy as under sustained heavy CPU load. A
+clean re-sample taken seconds later, no request in flight, read **18.0% → 0.7% →
+0.1%** over 3 seconds. The accurate characterization: **idle at baseline**
+(consistent with light real volume — 173 compression attempts over 12 days, roughly
+one every two hours), **with real spikes tied to individual jobs**, at least one of
+which ran 64.75s. "Sustained heavy CPU drain" would have been an overclaim against
+this machine's actual traffic; it is retracted here rather than quietly dropped.
+
+**Net, on this machine, right now:** the traffic-proxy wire works in the sense that
+the process is healthy and genuinely engaged in real sessions — but against its one
+stated purpose, it delivers savings on 1 of 173 measured attempts (0.6%) while
+carrying a real tail-latency risk (up to 65s on a single call, past its own
+configured timeout) and a nontrivial internal reliability defect rate (10 leaks / 10
+quarantines per ~173 attempts). **This is not hmd's own code underperforming** —
+`bin/lib/hmd-headroom-chain.sh` and `bin/heimdall-wrap` do exactly what they claim
+(start or reuse a proxy, export one env var, fail open on any error) and are not
+implicated in the thread leaks or the `/stats` latency, which live entirely inside
+the pinned `headroom-ai==0.33.0` binary's own compression executor. The opt-in
+machinery is honest and was never the problem; what it optionally invokes, at this
+pin, is what the numbers above describe.
+
+**Recommended action for this machine:** `hmd unwrap claude` (see
+`bin/heimdall-wrap:626-645` for the subcommand). Not run as part of this
+investigation — the proxy at PID 5157 may be shared by other concurrently-running
+sessions on this machine, and stopping a live, possibly-shared process is an
+operator decision outside a single docs commit, not something to do silently from
+inside an analysis pass.
+
 ## What to do next
 
 Two separate follow-ups, because two separate wires are involved.
@@ -242,13 +360,24 @@ nothing else, and it also pulls Rust/ONNX/HuggingFace into hmd's base install, w
 `bin/lib/memory_codec.py`'s own header says must stay near-stdlib. It was not run;
 no uv/venv state was touched in producing this document.
 
-**Traffic-proxy wire — the one that can actually produce a first receipt:**
+**Traffic-proxy wire — updated 2026-08-18.** §6 found this wire already engaged,
+unmeasured-by-receipt, on at least one machine, and delivering savings on 1 of 173
+attempts. The immediate action on that machine is `hmd unwrap claude` (operator
+call, not run here — see §6). The formal A/B below is still the right way to
+produce a pre-registered, statistically-graded verdict; it just no longer starts
+from a clean "before" — any new `before` snapshot on a machine that has already run
+wrapped for 12 days is not a true unwrapped baseline. A fresh machine, or a real
+`hmd unwrap` first, would be needed for a clean pair:
+
+```sh
+# 1. Confirm the rule that will grade the data (prints rule + rule_hash, nothing to run)
 
 ```sh
 # 1. Confirm the rule that will grade the data (prints rule + rule_hash, nothing to run)
 bin/heimdall-headroom-ab preregister
 
-# 2. Take a "before" snapshot now, unwrapped — absent Headroom IS the "before" arm.
+# 2. Take a "before" snapshot now, unwrapped (run `hmd unwrap claude` first if a
+#    proxy is already engaged, per §6) — absent Headroom IS the "before" arm.
 #    This runs the real oracle/falsify sweep (bin/falsify, per-domain 300s alarm) —
 #    real wall-clock cost, not free. The tool's own bugfix repro (ad62830) recorded
 #    one arm sweeping 300 mutants across 30 paired tasks, as a scale reference; exact
