@@ -2308,6 +2308,23 @@ case "${1:-}" in
     fi
     exec "$STATUS_BIN" "$@"
     ;;
+  cursor-statusline)
+    # Pass-through to heimdall-statusline-register-cursor: register/status/unregister
+    # the Cursor CLI statusLine HUD (~/.cursor/cli-config.json). `hmd init` calls
+    # `register` automatically when Cursor CLI is detected present; this arm exists
+    # so the undo path hmd's own auto-registration announce line points at
+    # (`hmd cursor-statusline unregister`) is a real, reachable command, and so a
+    # user can force `register`/inspect `status` by hand on a machine where Cursor
+    # was installed after the fact. All args forwarded verbatim.
+    shift
+    CURSOR_SL_BIN="$PLUGIN_DIR/bin/heimdall-statusline-register-cursor"
+    if [ ! -x "$CURSOR_SL_BIN" ]; then
+      echo "  Error: heimdall-statusline-register-cursor not found at $CURSOR_SL_BIN" >&2
+      echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+      exit 1
+    fi
+    exec "$CURSOR_SL_BIN" "$@"
+    ;;
   weekly-log)
     # Pass-through to heimdall-weekly-log: the weekly "what the watchman learned"
     # changelog generator (consent + k-anonymity gated, DATA.md §7 — see the

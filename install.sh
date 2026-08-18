@@ -367,6 +367,26 @@ else:
 PY
 }
 
+# Cursor CLI sibling of ensure_statusline_registered() above — same install-time hook
+# point, mirrored for the same reason: pattern-consistency with the one existing
+# statusline registration this installer already does. Gated on Cursor CLI actually
+# being present (bin/heimdall-ai-select detect's cursor-cli.available) so a machine
+# that has never touched Cursor never gets a ~/.cursor/ dir created by this installer.
+# Delegates ALL of idempotency/no-clobber/atomic-write to
+# bin/heimdall-statusline-register-cursor — this wrapper only decides WHETHER to call
+# it. Prints ONE state word (registered|not-applicable|skipped), always returns 0.
+ensure_cursor_statusline_registered() {
+  local plugin_dir="$1"
+  local aisel="$plugin_dir/bin/heimdall-ai-select"
+  local reg="$plugin_dir/bin/heimdall-statusline-register-cursor"
+  [ -x "$aisel" ] && [ -x "$reg" ] || { printf 'skipped'; return 0; }
+  command -v jq >/dev/null 2>&1 || { printf 'skipped'; return 0; }
+  local avail
+  avail="$("$aisel" detect 2>/dev/null | jq -r '[.[] | select(.id=="cursor-cli")] | .[0].available // false' 2>/dev/null || echo false)"
+  [ "$avail" = "true" ] || { printf 'not-applicable'; return 0; }
+  "$reg" register 2>/dev/null || printf 'skipped'
+}
+
 # Drop the per-dev control-plane endpoint config so SERVER-SYNCED TEAM PRESENCE
 # auto-resolves with ZERO manual exports. bin/heimdall-presence reads the CP url +
 # enroll token from $HOME/.heimdall/cp-endpoint.json and persists per-dev Ed25519
@@ -1259,6 +1279,13 @@ main() {
     *)           step_ok "Activating statusline HUD" "skipped (needs python3)" ;;
   esac
 
+  # Cursor CLI sibling — silent unless it actually registers something, so a
+  # non-Cursor machine sees no new install-log noise at all.
+  local CURSOR_SL_STATE; CURSOR_SL_STATE="$(ensure_cursor_statusline_registered "$PLUGIN_DIR")"
+  if [ "$CURSOR_SL_STATE" = "registered" ]; then
+    step_ok "Activating Cursor CLI statusline HUD" "registered (undo: heimdall cursor-statusline unregister)"
+  fi
+
   # Step: configure the control-plane endpoint so SERVER-SYNCED TEAM PRESENCE
   # auto-resolves for THIS dev with zero manual exports. The url comes from the
   # install env (HEIMDALL_CP_URL) or, ONLY on a real interactive TTY, a one-time
@@ -1558,6 +1585,10 @@ main() {
     # first-run write can NEVER leave the watchman HUD unregistered — for the dev AND
     # for the validation the dev will re-run. Silent + non-fatal.
     ensure_statusline_registered "$PLUGIN_DIR" >/dev/null 2>&1 || true
+    # Symmetric defense-in-depth for the Cursor sibling — not a targeted fix for a
+    # known Cursor-side clobber (Cursor CLI never runs during this Claude Code
+    # headless verify), just consistency with the line above. Silent + non-fatal.
+    ensure_cursor_statusline_registered "$PLUGIN_DIR" >/dev/null 2>&1 || true
   fi
 
   # ── 5b. Claim your watchman (the identity hook) ───────────────────────────

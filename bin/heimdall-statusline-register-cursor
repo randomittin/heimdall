@@ -32,21 +32,28 @@
 #         into ~/.cursor/cli-config.json. Prints ONE state word, ALWAYS exits 0.
 #         Never clobbers a user's own custom statusLine.
 #   heimdall-statusline-register-cursor status       read-only: print what it would do.
+#   heimdall-statusline-register-cursor unregister   remove OUR statusLine entry (leaves
+#         a foreign one untouched). Runs independently of opted_out()/ROOT resolution —
+#         a removal must still work after uninstall, or after opting out post-hoc.
 #
 # STATE WORDS (printed on stdout):
-#   registered  — wrote/refreshed our statusLine
-#   current     — already canonical; nothing written
-#   kept-custom — the user has a non-heimdall statusLine; left untouched
-#   skipped     — python3 unavailable, no resolvable root, opted out, or write failed
+#   registered     — wrote/refreshed our statusLine
+#   current        — already canonical; nothing written
+#   kept-custom    — the user has a non-heimdall statusLine; left untouched
+#   skipped        — python3 unavailable, no resolvable root, opted out, or write failed
+#   unregistered   — removed our statusLine entry (unregister only)
+#   not-registered — nothing to remove: no file, or no statusLine key (unregister only)
 #
-# MANUAL-INVOKE ONLY, deliberately. Claude Code's sibling self-bootstraps from a
-# SessionStart hook because the plugin system guarantees that hook reaches every
-# install. Cursor has no plugin system and no equivalent auto-run hook — its OWN
-# separate `.cursor/hooks.json` schema (see ~/.cursor/skills-cursor/create-hook/
-# SKILL.md) is unrelated to statusLine registration and hmd does not populate it.
-# So there is no honest way to make this self-bootstrapping under Cursor today —
-# run it by hand once per machine, the same way you'd hand-configure any other
-# Cursor CLI setting.
+# AUTO-INVOKED FROM `hmd init`, PLUS MANUAL. Cursor has no plugin system and no
+# SessionStart-equivalent auto-run hook — its OWN separate `.cursor/hooks.json`
+# schema (see ~/.cursor/skills-cursor/create-hook/SKILL.md) is unrelated to
+# statusLine registration and hmd does not populate it. So `bin/heimdall-init`
+# closes the gap itself: it detects Cursor CLI via `heimdall-ai-select detect`
+# (cursor-cli.available) and calls `register` here ONLY when that is true — a
+# machine that has never touched Cursor never gets a ~/.cursor/ written. This
+# script still never self-bootstraps from INSIDE a Cursor session (no hook fires
+# it) — every path into it is either `hmd init` or a human running it by hand,
+# the same way you'd hand-configure any other Cursor CLI setting.
 #
 # SAFETY CONTRACT (mirrors bin/heimdall-statusline-register byte-for-byte):
 #   * NEVER clobbers a user's OWN statusLine — writes only when the key is absent or
@@ -76,7 +83,7 @@ SUB="register"
 FORCE_ROOT=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    register|status) SUB="$1" ;;
+    register|status|unregister) SUB="$1" ;;
     --root) shift; FORCE_ROOT="${1:-}" ;;
     --root=*) FORCE_ROOT="${1#--root=}" ;;
     *) : ;;   # tolerate unknown args
@@ -103,6 +110,70 @@ resolve_root() {
   printf '%s' "$r"
 }
 
+CFG="${HEIMDALL_CURSOR_CLI_CONFIG:-$HOME/.cursor/cli-config.json}"
+
+# unregister: removal must keep working even after the install that wrote the entry
+# is gone, or after the opt-out markers were set post-registration — so it runs
+# independently of opted_out()/ROOT, gated only on python3 (needed to safely touch
+# JSON at all).
+if [ "$SUB" = unregister ]; then
+  command -v python3 >/dev/null 2>&1 || { printf 'skipped'; exit 0; }
+  STATE="$(HMD_SL_CFG="$CFG" python3 - <<'PY' 2>/dev/null
+import json, os, sys, tempfile
+
+path = os.environ["HMD_SL_CFG"]
+MARKER = "bin/heimdall-statusline"
+
+if not os.path.exists(path):
+    print("not-registered")
+    sys.exit(0)
+
+try:
+    with open(path) as fh:
+        data = json.load(fh)
+    if not isinstance(data, dict):
+        print("skipped")
+        sys.exit(0)
+except Exception:
+    print("skipped")
+    sys.exit(0)
+
+cur = data.get("statusLine")
+if cur is None:
+    print("not-registered")
+    sys.exit(0)
+
+ours = isinstance(cur, dict) and MARKER in (cur.get("command") or "")
+if not ours:
+    print("kept-custom")
+    sys.exit(0)
+
+del data["statusLine"]
+
+d = os.path.dirname(path) or "."
+try:
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".cli-config.", suffix=".tmp")
+    with os.fdopen(fd, "w") as fh:
+        json.dump(data, fh, indent=2)
+        fh.write("\n")
+    os.replace(tmp, path)
+except Exception:
+    try: os.unlink(tmp)
+    except Exception: pass
+    print("skipped")
+    sys.exit(0)
+
+print("unregistered")
+PY
+  )" || STATE="skipped"
+  [ -z "$STATE" ] && STATE="skipped"
+  printf '%s\n' "$STATE"
+  if [ "$STATE" = unregistered ]; then
+    printf '[heimdall] cursor statusline removed\n' >&2
+  fi
+  exit 0
+fi
+
 opted_out && { printf 'skipped'; exit 0; }
 command -v python3 >/dev/null 2>&1 || { printf 'skipped'; exit 0; }
 
@@ -110,8 +181,6 @@ ROOT="$(resolve_root)"
 if [ -z "$ROOT" ] || [ ! -x "$ROOT/bin/heimdall-statusline" ]; then
   printf 'skipped'; exit 0
 fi
-
-CFG="${HEIMDALL_CURSOR_CLI_CONFIG:-$HOME/.cursor/cli-config.json}"
 
 if [ "$SUB" = status ]; then
   HMD_SL_TARGET="$ROOT/bin/heimdall-statusline" HMD_SL_CFG="$CFG" python3 - <<'PY' 2>/dev/null || printf 'skipped'
