@@ -160,7 +160,33 @@ hmd_headroom_chain() {
   logdir="${HEIMDALL_HOME:-$HOME/.heimdall}/headroom"
   mkdir -p "$logdir" 2>/dev/null || {
     HMD_HEADROOM_WHY="cannot create $logdir — running unproxied"; return 1; }
-  ( "$bin" proxy --host 127.0.0.1 --port "$port" >>"$logdir/proxy.log" 2>&1 & echo $! > "$logdir/proxy.pid" ) \
+  # Timeout-debt quarantine mitigation (upstream #1171/#2360). hmd launches with no
+  # --mode flag, so Headroom's OWN default applies: CACHE mode (cli/proxy.py resolves
+  # mode = flag > HEADROOM_MODE env > "cache", and this file sets neither). We do NOT
+  # set HEADROOM_BACKGROUND_COMPRESSION here — verified against installed 0.35.0
+  # source (proxy/background_compression.py's own docstring, and the enqueue call in
+  # proxy/handlers/anthropic.py) that it is gated behind `is_token_mode(...)` and is a
+  # documented no-op in every mode but token. Setting it on a proxy that always runs in
+  # cache mode would be config that LOOKS like a fix and does nothing.
+  # HEADROOM_COMPRESSION_TIMEOUT_SECONDS is the lever that is real for cache mode: it
+  # is consumed mode-agnostically by the synchronous compression wrapper
+  # (proxy/server.py), so raising it gives a cold-start-large request more wall-clock
+  # budget before Python's inability to preempt a worker thread turns a slow
+  # compression into a leaked thread and a quarantine that blocks OTHER concurrent
+  # sessions' compression too. 130s is ~2x the worst synchronous run measured on this
+  # machine (64.75s, against the 30s upstream default) — a partial mitigation (raises
+  # the bar, does not remove it — a still-larger request can still exceed it), not a
+  # complete fix: upstream has no released way to keep an oversized cold-start context
+  # off the synchronous path in cache mode. 0.35.0 separately bounds the OTHER half of
+  # the blast radius on its own: HEADROOM_COMPRESSION_QUARANTINE_MAX_SECONDS (default
+  # 60s, upstream #2360) now caps how long a leaked worker can block new compression
+  # for OTHER sessions, so that one is left at its upstream default rather than
+  # overridden here. Both vars are scoped to this ONE child only (see the file header
+  # on why ANTHROPIC_BASE_URL gets the same treatment), and both stay overridable by
+  # whatever the operator already exported — same precedent as hmd_headroom_port()
+  # above.
+  ( HEADROOM_COMPRESSION_TIMEOUT_SECONDS="${HEADROOM_COMPRESSION_TIMEOUT_SECONDS:-130}" \
+    "$bin" proxy --host 127.0.0.1 --port "$port" >>"$logdir/proxy.log" 2>&1 & echo $! > "$logdir/proxy.pid" ) \
     || { HMD_HEADROOM_WHY="could not start the Headroom proxy — running unproxied"; return 1; }
 
   # 4. Bounded readiness. The ceiling is the whole point: a proxy that never becomes ready
