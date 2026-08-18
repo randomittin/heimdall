@@ -1,0 +1,187 @@
+#!/usr/bin/env bash
+# heimdall-resume-brief — mechanical resume state for an ORCHESTRATOR picking a
+# truncated/handed-off child agent's WORKTREE back up. Answers, from git plumbing
+# alone, in one command: how far behind base is this tree, what has it committed
+# ahead of base, what is still uncommitted (and therefore AT RISK if the worktree
+# is discarded), and — with --run-tests — which of its own acceptance tests
+# already pass. Replaces the manual `git log base..HEAD` / `git status --porcelain`
+# inspection an orchestrator otherwise re-pays in its own tokens every truncation.
+#
+# DISTINCT FROM bin/heimdall-resume-probe: the probe grades whether ONE session's
+# own CHECKPOINT.md survived ITS OWN restart, against a saved answer key
+# (.planning/RESUME-KEY.json). This tool has no answer key — it derives a state
+# summary of ANY worktree purely from git, including one belonging to a different
+# (possibly still-truncated) agent. Different question, different tool.
+#
+# Usage:
+#   heimdall-resume-brief <worktree-path> [--base <ref>] [--json] [--run-tests]
+#   heimdall-resume-brief -h | --help
+#
+# --base <ref>   what to compare against (default: main)
+# --json         emit structured JSON instead of the human report (requires jq)
+# --run-tests    run ONLY the test files implicated by the touched-file set (this
+#                repo's bin/X <-> test/X.test.sh naming convention) — NEVER the
+#                full suite. The full sweep (test/run-all.sh) is reserved for the
+#                landing commit only; see CLAUDE.md "When the full gate runs". A
+#                test file this branch never touched is never executed here.
+#
+# EXIT: 0 on a successful brief — even one reporting staleness or dirt, which is
+# information, not failure. Nonzero only on a real usage error (bad path, not a
+# git repo): unlike a PreToolUse hook, this is a manually-invoked diagnostic tool,
+# so it fails LOUD rather than fails open.
+set -uo pipefail
+
+usage() { sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; }
+
+WT=""
+BASE="main"
+JSON=0
+RUN_TESTS=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --base) BASE="${2:?--base needs a ref}"; shift 2 ;;
+    --json) JSON=1; shift ;;
+    --run-tests) RUN_TESTS=1; shift ;;
+    -*) echo "heimdall-resume-brief: unknown flag: $1" >&2; exit 2 ;;
+    *) WT="$1"; shift ;;
+  esac
+done
+
+if [ -z "$WT" ]; then
+  echo "heimdall-resume-brief: usage: heimdall-resume-brief <worktree-path> [--base <ref>] [--json] [--run-tests]" >&2
+  exit 2
+fi
+if [ ! -d "$WT" ]; then
+  echo "heimdall-resume-brief: not a directory: $WT" >&2
+  exit 2
+fi
+if ! git -C "$WT" rev-parse --git-dir >/dev/null 2>&1; then
+  echo "heimdall-resume-brief: not a git repo/worktree: $WT" >&2
+  exit 2
+fi
+
+g() { git -C "$WT" "$@"; }
+
+BRANCH="$(g rev-parse --abbrev-ref HEAD 2>/dev/null || echo "HEAD")"
+HEAD_SHA="$(g rev-parse --short HEAD 2>/dev/null || echo "?")"
+HEAD_SUBJ="$(g log -1 --format=%s 2>/dev/null || echo "")"
+BASE_SHA="$(g rev-parse --short "$BASE" 2>/dev/null || echo "")"
+
+AHEAD=0
+BEHIND=0
+COMMITS=""
+if [ -n "$BASE_SHA" ]; then
+  AHEAD="$(g rev-list --count "${BASE}..HEAD" 2>/dev/null || echo 0)"
+  BEHIND="$(g rev-list --count "HEAD..${BASE}" 2>/dev/null || echo 0)"
+  COMMITS="$(g log --format='%h %s' "${BASE}..HEAD" 2>/dev/null || true)"
+fi
+case "$AHEAD" in ''|*[!0-9]*) AHEAD=0 ;; esac
+case "$BEHIND" in ''|*[!0-9]*) BEHIND=0 ;; esac
+
+# Dirty files (working tree + index): porcelain's "XY path" -> strip the 3-char
+# status prefix to leave just the path.
+DIRTY_RAW="$(g status --porcelain 2>/dev/null || true)"
+DIRTY_PATHS="$(printf '%s\n' "$DIRTY_RAW" | sed -n 's/^.\{3\}//p')"
+DIRTY_COUNT=0
+[ -n "$DIRTY_RAW" ] && DIRTY_COUNT="$(printf '%s\n' "$DIRTY_RAW" | grep -c .)"
+
+# Committed-ahead-of-base file list. Three-dot (merge-base) diff, not two-dot:
+# stays correct even when base has moved on since the branch point.
+COMMITTED_FILES=""
+[ -n "$BASE_SHA" ] && COMMITTED_FILES="$(g diff --name-only "${BASE}...HEAD" 2>/dev/null || true)"
+
+# Touched = union of committed-ahead files and currently-dirty files, deduped —
+# a file changed both in a landed commit AND again right now counts once.
+TOUCHED="$(printf '%s\n%s\n' "$COMMITTED_FILES" "$DIRTY_PATHS" | sed '/^$/d' | sort -u)"
+TOUCHED_COUNT=0
+[ -n "$TOUCHED" ] && TOUCHED_COUNT="$(printf '%s\n' "$TOUCHED" | grep -c .)"
+
+# --run-tests: map each touched path to test/<basename>.test.sh by this repo's own
+# naming convention (bin/heimdall-foo <-> test/heimdall-foo.test.sh). Run ONLY the
+# matches that exist. Never the full suite — see header.
+TEST_RESULTS=""
+if [ "$RUN_TESTS" -eq 1 ] && [ -n "$TOUCHED" ]; then
+  CANDIDATES=""
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    case "$f" in
+      test/*.test.sh) CANDIDATES="$CANDIDATES
+$f" ;;
+      *) CANDIDATES="$CANDIDATES
+test/$(basename "$f").test.sh" ;;
+    esac
+  done <<TOUCHED_EOF
+$TOUCHED
+TOUCHED_EOF
+  CANDIDATES="$(printf '%s\n' "$CANDIDATES" | sed '/^$/d' | sort -u)"
+  while IFS= read -r tf; do
+    [ -n "$tf" ] || continue
+    [ -f "$WT/$tf" ] || continue
+    RES="$(cd "$WT" && bash "$tf" 2>&1)"
+    RC=$?
+    TEST_RESULTS="${TEST_RESULTS}--- ${tf} (exit ${RC}) ---
+${RES}
+"
+  done <<CAND_EOF
+$CANDIDATES
+CAND_EOF
+fi
+
+if [ "$JSON" -eq 1 ]; then
+  if ! command -v jq >/dev/null 2>&1; then
+    echo "heimdall-resume-brief: --json requires jq" >&2
+    exit 2
+  fi
+  jq -n \
+    --arg worktree "$WT" --arg branch "$BRANCH" --arg head "$HEAD_SHA" \
+    --arg head_subject "$HEAD_SUBJ" --arg base "$BASE" --arg base_sha "$BASE_SHA" \
+    --argjson ahead_of_base "$AHEAD" --argjson behind_base "$BEHIND" \
+    --argjson dirty "$DIRTY_COUNT" --argjson files_touched "$TOUCHED_COUNT" \
+    --arg commits "$COMMITS" --arg dirty_files "$DIRTY_PATHS" --arg touched "$TOUCHED" \
+    '{worktree:$worktree, branch:$branch, head:$head, head_subject:$head_subject,
+      base:$base, base_sha:$base_sha, ahead_of_base:$ahead_of_base,
+      behind_base:$behind_base, dirty:$dirty, files_touched:$files_touched,
+      commits: ($commits | split("\n") | map(select(length>0))),
+      dirty_files: ($dirty_files | split("\n") | map(select(length>0))),
+      touched_files: ($touched | split("\n") | map(select(length>0)))}'
+  exit 0
+fi
+
+echo "heimdall-resume-brief: $WT"
+echo "  branch: $BRANCH"
+echo "  head: $HEAD_SHA $HEAD_SUBJ"
+echo "  base: $BASE ($BASE_SHA)"
+if [ "$BEHIND" -eq 0 ]; then
+  echo "  behind-base: 0 (up to date)"
+else
+  echo "  behind-base: $BEHIND commit(s)"
+fi
+echo "  ahead-of-base: $AHEAD commit(s)"
+echo "  dirty: $DIRTY_COUNT file(s)"
+echo "  files-touched: $TOUCHED_COUNT file(s) total"
+echo ""
+
+if [ -n "$COMMITS" ]; then
+  echo "Commits ahead of base:"
+  printf '%s\n' "$COMMITS" | sed 's/^/  /'
+  echo ""
+fi
+
+if [ -n "$DIRTY_PATHS" ]; then
+  echo "Dirty files:"
+  printf '%s\n' "$DIRTY_PATHS" | sed 's/^/  /'
+  echo ""
+fi
+
+if [ "$DIRTY_COUNT" -gt 0 ]; then
+  echo "UNCOMMITTED WORK WARNING: $DIRTY_COUNT file(s) will be LOST if this worktree is discarded."
+  echo ""
+fi
+
+if [ -n "$TEST_RESULTS" ]; then
+  echo "Targeted test results (touched files only, not the full suite):"
+  printf '%s\n' "$TEST_RESULTS"
+fi
+
+exit 0

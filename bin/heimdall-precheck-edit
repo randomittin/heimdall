@@ -66,6 +66,14 @@ fi
 # Nothing to check → advisory no-op (fail-open).
 [ -n "$FILE" ] || exit 0
 
+# MECHANICAL mid-task checkpoint: count this edit-operation and, independent of
+# hooks.json's PostToolUse auto-commit (which only fires at 5+ DISTINCT dirty
+# files), commit at an EDIT-OPERATION-COUNT threshold instead. A long task that
+# touches 1-4 files across dozens of edits never crosses the file-count gate, so
+# a truncation mid-task loses everything uncommitted — this closes that gap.
+# Best-effort, fully swallowed: must never affect this script's own exit code.
+"$BIN_DIR/heimdall-wip-commit" note >/dev/null 2>&1 || true
+
 # The ledger read must be cheap and non-fatal. If the claim bin or jq is missing,
 # fail OPEN: a precheck can never be the reason an edit is stopped.
 [ -x "$CLAIM_BIN" ] || exit 0
