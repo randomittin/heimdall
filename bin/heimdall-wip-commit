@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+# heimdall-wip-commit — MECHANICAL mid-task checkpoint commits, independent of the
+# PostToolUse auto-commit hook's file-COUNT gate (hooks/hooks.json fires only when
+# `git diff --name-only | wc -l` >= 5). A long-running agent editing 1-4 files across
+# dozens of tool calls never crosses that gate, so a truncation mid-task loses
+# everything uncommitted. This tool adds an independent EDIT-OPERATION-COUNT gate.
+#
+# Wired via bin/heimdall-precheck-edit (PreToolUse Edit|MultiEdit|Write), which
+# already fires on every real edit — no hooks.json change required or made.
+#
+# Subcommands:
+#   note                   record one edit-operation; commit if threshold is hit
+#   checkpoint             commit immediately if dirty, regardless of the counter
+#   status [--json]        report counter/threshold/dirty-file count
+#   squash [--base REF] [--dry-run]
+#                          collapse consecutive trailing `wip:` commits into one,
+#                          tree contents unchanged. REF defaults to `main`.
+#   help
+#
+# Env:
+#   HEIMDALL_WIP_EDIT_THRESHOLD   edit-ops per commit (default 6)
+#
+# Respects .heimdall-no-autocommit / .superx-no-autocommit at the repo root, same
+# as the PostToolUse hook — a project that opted out of auto-commits stays opted out.
+#
+# All subcommands are best-effort and exit 0 on any internal git failure — a
+# checkpoint tool must never be the reason a coding task fails.
+set -uo pipefail
+
+THRESHOLD="${HEIMDALL_WIP_EDIT_THRESHOLD:-6}"
+case "$THRESHOLD" in ''|*[!0-9]*) THRESHOLD=6 ;; esac
+
+usage() { sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; }
+
+_git_dir()  { git rev-parse --absolute-git-dir 2>/dev/null; }
+_toplevel() { git rev-parse --show-toplevel 2>/dev/null; }
+_count_file() { local gd; gd="$(_git_dir)" || return 1; printf '%s/heimdall-wip-count' "$gd"; }
+
+_no_autocommit() { # <toplevel>
+  [ -f "$1/.heimdall-no-autocommit" ] || [ -f "$1/.superx-no-autocommit" ]
+}
+
+_read_count() { # <file>
+  local n
+  n="$(cat "$1" 2>/dev/null || true)"
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  printf '%s' "$n"
+}
+
+_dirty_count() { git status --porcelain 2>/dev/null | wc -l | tr -d ' '; }
+
+_do_commit() { # <subject>
+  local guard
+  guard="$(dirname "$0")/heimdall-git-guard"
+  [ -x "$guard" ] && "$guard" >/dev/null 2>&1
+  git add -A >/dev/null 2>&1 || return 1
+  git commit -m "$1" -m "heimdall-wip: mechanical mid-task checkpoint" \
+    -m "Co-Authored-By: hmd <hmd@runheimdall.dev>" --no-verify >/dev/null 2>&1
+}
+
+cmd_note() {
+  local top cf count
+  top="$(_toplevel)" || return 0
+  _no_autocommit "$top" && return 0
+  cf="$(_count_file)" || return 0
+  count="$(_read_count "$cf")"
+  count=$((count + 1))
+  if [ "$count" -ge "$THRESHOLD" ]; then
+    if [ "$(_dirty_count)" -gt 0 ]; then
+      _do_commit "wip: ${count} edit-op checkpoint (heimdall-wip)"
+    fi
+    count=0
+  fi
+  printf '%s' "$count" > "$cf" 2>/dev/null
+  return 0
+}
+
+cmd_checkpoint() {
+  local top cf
+  top="$(_toplevel)" || return 0
+  _no_autocommit "$top" && return 0
+  if [ "$(_dirty_count)" -gt 0 ]; then
+    _do_commit "wip: forced checkpoint (heimdall-wip)"
+  fi
+  cf="$(_count_file)" 2>/dev/null && printf '0' > "$cf" 2>/dev/null
+  return 0
+}
+
+cmd_status() {
+  local cf count dirty json=0
+  [ "${1:-}" = "--json" ] && json=1
+  cf="$(_count_file)" || cf=""
+  count=0
+  [ -n "$cf" ] && count="$(_read_count "$cf")"
+  dirty="$(_dirty_count)"
+  if [ "$json" -eq 1 ]; then
+    printf '{"count":%s,"threshold":%s,"dirty":%s}\n' "$count" "$THRESHOLD" "$dirty"
+  else
+    printf 'count=%s threshold=%s dirty=%s\n' "$count" "$THRESHOLD" "$dirty"
+  fi
+}
+
+cmd_squash() {
+  local base="main" dry=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --base) base="${2:?--base needs a ref}"; shift 2 ;;
+      --dry-run) dry=1; shift ;;
+      *) shift ;;
+    esac
+  done
+  git rev-parse --verify --quiet HEAD >/dev/null 2>&1 || { echo "squash: no HEAD, nothing to do"; return 0; }
+  local mb n=0 shas="" subjects="" sha subj line
+  mb="$(git merge-base "$base" HEAD 2>/dev/null || true)"
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    sha="${line%% *}"; subj="${line#* }"
+    [ "$sha" = "$mb" ] && break
+    case "$subj" in
+      wip:*) n=$((n + 1)); shas="$shas $sha"; subjects="${subjects}${subj}
+" ;;
+      *) break ;;
+    esac
+  done < <(git log --format='%H %s' HEAD 2>/dev/null)
+
+  if [ "$n" -lt 2 ]; then
+    echo "squash: fewer than 2 trailing wip commits (found $n) — nothing to squash"
+    return 0
+  fi
+
+  local oldest_sha target
+  oldest_sha="$(printf '%s\n' $shas | tail -1)"
+  target="$(git rev-parse "${oldest_sha}^" 2>/dev/null)" || { echo "squash: cannot resolve parent of $oldest_sha"; return 1; }
+
+  if [ "$dry" -eq 1 ]; then
+    printf 'squash: would collapse %s commits onto %s:\n%s' "$n" "$target" "$subjects"
+    return 0
+  fi
+
+  git reset --soft "$target" >/dev/null 2>&1 || { echo "squash: reset failed"; return 1; }
+  git commit -m "wip: squashed ${n} checkpoint commit(s) (heimdall-wip)" \
+    -m "$subjects" \
+    -m "Co-Authored-By: hmd <hmd@runheimdall.dev>" --no-verify >/dev/null 2>&1
+}
+
+case "${1:-}" in
+  note) shift; cmd_note "$@" ;;
+  checkpoint) shift; cmd_checkpoint "$@" ;;
+  status) shift; cmd_status "$@" ;;
+  squash) shift; cmd_squash "$@" ;;
+  -h|--help|help|"") usage ;;
+  *) echo "heimdall-wip-commit: unknown subcommand: $1" >&2; usage >&2; exit 2 ;;
+esac
+exit 0
