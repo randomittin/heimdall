@@ -112,6 +112,11 @@ The verdict is computed from artifacts on disk, not from your explanation, so yo
 cannot argue your way past a gate. Rewriting or weakening the test is not a path to
 green; it is the exact failure the gate exists to catch.
 
+**Same gate under Cursor CLI.** This file is what Cursor's `agent` reads at session
+start too, and the `pre-commit` check above runs on its diffs exactly as it runs on
+Claude Code's — the one difference is a stub gets caught at commit here instead of
+at the write itself, since Cursor has no pre-write hook to catch it earlier.
+
 AGEOF
   printf '%s\n' "$AG_END"
 }
