@@ -70,12 +70,64 @@ add_gate() {  # id state detail
 "
 }
 
+# ── 0. Tool-agnostic stub/placeholder scan (pre-commit only) ──────────────────
+#    hooks/hooks.json's Write|Edit PreToolUse hook only fires LIVE inside a Claude
+#    Code session, on a Write/Edit tool call. Any other committer — cursor-agent, a
+#    human `git commit`, Claude Code run with hooks skipped — bypasses it entirely;
+#    nothing at the git layer re-checks the staged diff. This closes that gap: it
+#    re-scans the STAGED diff against the identical shared shapes hooks.json uses
+#    (bin/lib/heimdall-stub-patterns.sh — one pattern list, both enforcement points
+#    agree), so the ban holds no matter which tool made the commit. Diff-scoped —
+#    only ADDED lines are scanned, never a whole-file read — so a marker already in
+#    the repo before this change is never flagged, only what THIS change introduces.
+if [ "$PHASE" = "pre-commit" ] && [ "$DENY" = 0 ]; then
+  STUB_LIB="$PLUGIN_DIR/bin/lib/heimdall-stub-patterns.sh"
+  if [ ! -f "$STUB_LIB" ]; then
+    DENY=1; FAIL_GATE="stub-scan"
+    add_reason "stub-scan cannot run: shared pattern lib missing at bin/lib/heimdall-stub-patterns.sh"
+    add_gate "stub-scan" "deny" "lib missing"
+  else
+    STUB_FILES="$(git diff --cached --name-only --diff-filter=ACMR 2>&1)"; rc=$?
+    if [ "$rc" -ne 0 ]; then
+      DENY=1; FAIL_GATE="stub-scan"
+      add_reason "stub-scan cannot run: git diff --cached failed — the gate was never evaluated, which is not a pass"
+      GATE_OUT="$STUB_FILES"
+      add_gate "stub-scan" "deny" "git diff failed"
+    elif [ -n "$STUB_FILES" ]; then
+      . "$STUB_LIB"
+      STUB_SCANNED=0
+      STUB_HIT=""
+      while IFS= read -r F; do
+        [ -n "$F" ] || continue
+        heimdall_stub_exempt_path "$F" && continue
+        ADDED="$(git diff --cached -- "$F" 2>/dev/null | grep -E '^\+' | grep -vE '^\+\+\+' | cut -c2-)"
+        [ -n "$ADDED" ] || continue
+        STUB_SCANNED=$((STUB_SCANNED+1))
+        SHAPE="$(printf '%s\n' "$ADDED" | heimdall_stub_match)"
+        if [ -n "$SHAPE" ]; then
+          STUB_HIT="$SHAPE @ $F"
+          break
+        fi
+      done <<STUBEOF
+$STUB_FILES
+STUBEOF
+      if [ -n "$STUB_HIT" ]; then
+        DENY=1; FAIL_GATE="stub-scan"
+        add_reason "stub introduced by this change: $STUB_HIT"
+        add_gate "stub-scan" "deny" "$STUB_HIT"
+      else
+        add_gate "stub-scan" "pass" "${STUB_SCANNED} file(s) scanned"
+      fi
+    fi
+  fi
+fi
+
 # ── 1. Oracle falsifiability gates over the REPO's own oracle domains ─────────
 #    Identical to the plugin push gate: for each domain with mutant fixtures,
 #    `falsify <domain> --assert-score 1.0` must hold (the gate can still go red).
 #    A non-falsifiable gate (score < 1.0) DENIES — a green suite over a dead gate
 #    must not ship.
-if [ -x "$FALSIFY" ] && [ -d "$REPO/evals/oracles" ]; then
+if [ "$DENY" = 0 ] && [ -x "$FALSIFY" ] && [ -d "$REPO/evals/oracles" ]; then
   for D in "$REPO/evals/oracles"/*/; do
     [ -d "$D/fixtures/mutants" ] || continue
     DOM="$(basename "$D")"
