@@ -57,13 +57,24 @@ fi
 
 # ── Width. The watchman right-pins the verdict against COLUMNS, so whoever's
 # widest, truest signal wins, in this order:
-#   1. $COLUMNS already exported by the caller (Claude Code sets this itself).
-#   2. `render_width_chars` in the stdin JSON (Cursor CLI — see header). Because
-#      Cursor already subtracted its own padding, we must NOT also apply Claude
-#      Code's separate (undocumented, empirically-measured) 4-cell region reserve
-#      on top of a width that was already corrected once — so when width comes
-#      from this field we pin HMD_STATUSLINE_RESERVE=0 (unless the caller already
-#      set that override themselves).
+#   1. `render_width_chars` in the stdin JSON (Cursor CLI ONLY — Claude Code's schema
+#      never sends this key, so its mere presence identifies the host). Cursor's own
+#      docs name THIS field, not $COLUMNS, as the authoritative width, and it ALWAYS
+#      wins over $COLUMNS when present: a no-shell `child_process.spawn` child still
+#      inherits $COLUMNS from Cursor's own launching terminal by default (no explicit
+#      `env` option strips it), and that inherited value can be STALE — no longer the
+#      live width — while render_width_chars is computed fresh on every invocation.
+#      Trusting a stale $COLUMNS over a fresh, authoritative JSON field would silently
+#      render at the WRONG width. Because Cursor already subtracted its own padding,
+#      we must NOT also apply Claude Code's separate (undocumented,
+#      empirically-measured) 4-cell region reserve on top of a width that was already
+#      corrected once — so when width comes from this field we pin
+#      HMD_STATUSLINE_RESERVE=0 (unless the caller already set that override
+#      themselves).
+#   2. $COLUMNS already exported by the caller (Claude Code sets this itself; this is
+#      Claude Code's ONLY width signal — its payload never carries render_width_chars,
+#      so step 1 never fires and this step is unconditionally reached, unchanged from
+#      before this reordering).
 #   3. `tput cols` (a real terminal reachable on our own stdout — the bare
 #      manual-invocation case).
 #   4. 120, the long-standing safe default.
@@ -95,14 +106,25 @@ if isinstance(w, (int, float)) and not isinstance(w, bool) and w > 0:
 
 COLS="${COLUMNS:-}"
 case "$COLS" in ''|*[!0-9]*) COLS="" ;; esac
-if [ -z "$COLS" ]; then
-  RENDER_WIDTH="$(resolve_render_width "$BLOB")"
-  case "$RENDER_WIDTH" in ''|*[!0-9]*) RENDER_WIDTH="" ;; esac
-  if [ -n "$RENDER_WIDTH" ]; then
-    COLS="$RENDER_WIDTH"
-    [ -n "${HMD_STATUSLINE_RESERVE:-}" ] || export HMD_STATUSLINE_RESERVE=0
-  fi
-fi
+# Cheap, dependency-free substring probe for the Cursor-only render_width_chars key —
+# skips the python3/jq subprocess entirely on Claude Code's hot per-prompt path (that
+# key is never in a CC payload, so this case pattern never matches there), while still
+# catching every real Cursor payload so its authoritative width can override a possibly
+# stale inherited $COLUMNS (see the priority comment above). A blob that merely
+# CONTAINS the literal substring in some unrelated string value still degrades safely:
+# resolve_render_width re-parses as JSON and only trusts an actual top-level numeric
+# render_width_chars key, so a false-positive substring match costs one wasted
+# subprocess call, never a wrong width.
+case "$BLOB" in
+  *'"render_width_chars"'*)
+    RENDER_WIDTH="$(resolve_render_width "$BLOB")"
+    case "$RENDER_WIDTH" in ''|*[!0-9]*) RENDER_WIDTH="" ;; esac
+    if [ -n "$RENDER_WIDTH" ]; then
+      COLS="$RENDER_WIDTH"
+      [ -n "${HMD_STATUSLINE_RESERVE:-}" ] || export HMD_STATUSLINE_RESERVE=0
+    fi
+    ;;
+esac
 case "$COLS" in ''|*[!0-9]*) COLS="$(tput cols 2>/dev/null)" ;; esac
 case "$COLS" in ''|*[!0-9]*) COLS=120 ;; esac
 export COLUMNS="$COLS"
@@ -129,10 +151,16 @@ fi
 # Capping at ~150K provably recovers $369.50. Drift is invisible without this.
 #
 # Same never-error contract as the rest of the bar: hard time ceiling when one is
-# available, output fully discarded, every failure path a no-op. Only the Claude Code
-# path carries real context_window data today (Cursor's blob has none), so under
-# Cursor this is a harmless, silent no-op — publish already treats "no context signal"
-# as "write nothing", never a fabricated 0.
+# available, output fully discarded, every failure path a no-op. Cursor's own schema
+# (~/.cursor/skills-cursor/statusline/SKILL.md) DOES carry
+# context_window.total_input_tokens too — documented there as an ESTIMATE derived from
+# used_percentage rather than an exact API count — so this publish call is a REAL write
+# under Cursor as well, not a no-op: it records that estimate under the Cursor
+# session's own session_id. Records are keyed per session_id, so a Cursor estimate can
+# never blend with or overwrite an exact Claude Code reading. The early-session window
+# where Cursor's used_percentage (and by extension total_input_tokens) may be null is
+# already covered by the SAME guard that protects a missing CC signal: publish already
+# treats "no context signal" as "write nothing", never a fabricated 0.
 CTX_METER="$HERE/heimdall-ctx-meter"
 if [ -n "$BLOB" ] && [ -x "$CTX_METER" ]; then
   CTO=""
@@ -165,6 +193,51 @@ if [ -n "$AGENTS_BIN" ]; then
 fi
 case "$HMD_LIVE_SUBAGENTS" in ''|*[!0-9]*) HMD_LIVE_SUBAGENTS=0 ;; esac
 export HMD_LIVE_SUBAGENTS
+
+# ── Cursor host-label normalization ──
+# sentinels/hmd-statusline.py's own model.display_name fallback (when the field is
+# absent/null/empty) defaults to the literal string "Claude" — a holdover from when
+# Claude Code was this bar's only host. Real captured Cursor CLI traffic always
+# carried a populated model.display_name (e.g. "Auto"), so this is an edge case, not
+# the common path — but SKILL.md does not list model.display_name under "may be
+# absent", so a future/early-frame Cursor payload that omits it would silently
+# misattribute the session to Claude. `transcript_path`/`autorun` are Cursor-exclusive
+# keys (SKILL.md; never present in Claude Code's statusLine schema — confirmed against
+# test/heimdall-statusline-parity.test.sh's canned() fixture), so this probe costs
+# Claude Code's hot path nothing: the case pattern never matches there and the whole
+# block is skipped. Only rewrites $BLOB when display_name is genuinely missing — the
+# common case (already populated) prints nothing and leaves $BLOB byte-identical.
+case "$BLOB" in
+  *'"transcript_path"'*|*'"autorun"'*)
+    NORMALIZED=""
+    if command -v python3 >/dev/null 2>&1; then
+      NORMALIZED="$(printf '%s' "$BLOB" | python3 -c '
+import json, sys
+try:
+    b = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+if not isinstance(b, dict):
+    sys.exit(0)
+m = b.get("model")
+if not isinstance(m, dict):
+    m = {}
+if not (m.get("display_name") or "").strip():
+    m["display_name"] = "Cursor"
+    b["model"] = m
+    print(json.dumps(b))
+' 2>/dev/null)"
+    fi
+    if [ -z "$NORMALIZED" ] && command -v jq >/dev/null 2>&1; then
+      NORMALIZED="$(printf '%s' "$BLOB" | jq -c '
+        if ((.model.display_name // "") | length) == 0
+        then .model = ((.model // {}) + {display_name: "Cursor"})
+        else empty end
+      ' 2>/dev/null)"
+    fi
+    [ -n "$NORMALIZED" ] && BLOB="$NORMALIZED"
+    ;;
+esac
 
 # ── PRIMARY: the full-width watchman ──
 # Capture first; emit only on success (nonempty). Any failure falls through.
