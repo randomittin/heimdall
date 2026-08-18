@@ -7,7 +7,7 @@
 # THIS SUITE LOCKS:
 #   1. FRESH WRITE — no existing config -> registers a valid statusLine block:
 #      absolute bare path (no shell wrapper — Cursor spawns with no shell on Unix),
-#      padding=0, updateIntervalMs=2000, type=command.
+#      padding=0, updateIntervalMs=3000, timeoutMs=3000, type=command.
 #   2. IDEMPOTENT — a second `register` on an already-canonical file is a byte-exact
 #      no-op (state=current, file content unchanged).
 #   3. NO-CLOBBER — a pre-existing foreign statusLine is left completely untouched
@@ -26,7 +26,13 @@
 #   7. STATUS (read-only) — matches the register outcome without writing anything.
 #   8. MISSING ROOT — no bin/heimdall-statusline at the resolved root -> skipped,
 #      config file never created.
-#   9. NEVER TOUCHES THE REAL FILE — this whole suite runs with HOME AND
+#   9. UPGRADE — an OURS-but-STALE entry (the exact pre-existing shape this bin
+#      shipped before timeoutMs was added: updateIntervalMs=2000, no timeoutMs key
+#      at all) is refreshed on the next register to the new canonical shape
+#      (state=registered, NOT current) — proving the `cur != want` staleness check
+#      catches a VALUE change, not only the path-staleness case it already covered.
+#      A follow-up register after the refresh is then idempotent, same as case 2.
+#  10. NEVER TOUCHES THE REAL FILE — this whole suite runs with HOME AND
 #      HEIMDALL_CURSOR_CLI_CONFIG both hermetically overridden; explicitly assert the
 #      real $HOME/.cursor/cli-config.json (if any exists on the host running this
 #      suite) is untouched (mtime/hash identical before and after the full run).
@@ -35,6 +41,23 @@
 # suite's runtime bounded): temporarily make the "is this command ours" marker check
 # always false -> assertion set 3 (NO-CLOBBER) goes RED the moment a canonical,
 # already-ours statusLine gets misclassified as foreign and skipped/left stale.
+#
+# KILL-PATH SAFETY (verified by hand, same reason not automated here — the check is
+# inherently timing-dependent on bin/heimdall-statusline's render speed, which is a
+# SIBLING component's active work-in-progress; coupling this suite's pass/fail to
+# that component's evolving latency would make the suite flaky by construction, not
+# a regression guard): sent SIGALRM (via `perl -e 'alarm N; exec @ARGV'` — this
+# sandbox's bash 3.2 has no `timeout(1)`) and SIGTERM at delays from 0.1s-3s into a
+# real, unmodified render of test/fixtures/cursor-real-payload.json. Every kill that
+# landed before natural completion produced exactly 0 stdout bytes and a non-zero
+# exit, in every trial — never a partial byte, never a dangling SGR escape. Root
+# cause traced to bin/heimdall-statusline (out of this suite's scope to edit): every
+# exit path captures its full rendered string into a shell variable via command
+# substitution first, then performs exactly one atomic `printf` to real stdout as
+# its last act before `exit 0` — no code path writes incrementally. That satisfies
+# SKILL.md's documented safe path ("exits non-zero with empty stdout -> previous
+# text kept") by construction, for either of Cursor's two kill triggers (timeout or
+# a superseding new update) — no wrapper is needed here to enforce it.
 set -u
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -80,10 +103,11 @@ assert sl.get("command") == sys.argv[2], "command mismatch: %r != %r" % (sl.get(
 assert sl.get("command").startswith("/"), "command is not an absolute path"
 assert " " not in sl["command"].strip("/").replace(sys.argv[2].strip("/"), ""), "command has extra shell tokens"
 assert sl.get("padding") == 0, "padding != 0: %r" % sl.get("padding")
-assert sl.get("updateIntervalMs") == 2000, "updateIntervalMs != 2000: %r" % sl.get("updateIntervalMs")
+assert sl.get("updateIntervalMs") == 3000, "updateIntervalMs != 3000: %r" % sl.get("updateIntervalMs")
+assert sl.get("timeoutMs") == 3000, "timeoutMs != 3000: %r" % sl.get("timeoutMs")
 print("OK")
 ' "$CFG1" "$TARGET" 2>&1)"
-[ "$CHECK1" = OK ] && ok "fresh write: statusLine shape correct (bare absolute path, no shell wrapper, padding=0, updateIntervalMs=2000)" \
+[ "$CHECK1" = OK ] && ok "fresh write: statusLine shape correct (bare absolute path, no shell wrapper, padding=0, updateIntervalMs=3000, timeoutMs=3000)" \
                    || bad "fresh write: shape check failed: $CHECK1"
 
 echo "== 2) IDEMPOTENT: second register on canonical file is a byte-exact no-op =="
@@ -193,7 +217,34 @@ OUT8="$(HOME="$H8" HEIMDALL_CURSOR_CLI_CONFIG="$CFG8" "$REG" --root "$FAKE_ROOT"
   || bad "missing root: state='$OUT8' rc=$RC8 file-exists=$([ -f "$CFG8" ] && echo yes || echo no)"
 rm -rf "$H8"
 
-echo "== 9) NEVER TOUCHES THE REAL FILE: whole suite ran hermetically =="
+echo "== 9) UPGRADE: an ours-but-stale entry (old shape: updateIntervalMs=2000, no timeoutMs) is refreshed, not left stale =="
+H9="$(hermetic_home)"; CFG9="$H9/.cursor/cli-config.json"; mkdir -p "$H9/.cursor"
+python3 -c '
+import json, sys
+d = {"statusLine": {"type": "command", "command": sys.argv[2], "padding": 0, "updateIntervalMs": 2000}}
+json.dump(d, open(sys.argv[1], "w"))
+' "$CFG9" "$TARGET"
+OUT9="$(HOME="$H9" HEIMDALL_CURSOR_CLI_CONFIG="$CFG9" "$REG" register)"; RC9=$?
+[ "$RC9" = 0 ] && [ "$OUT9" = registered ] \
+  && ok "upgrade: stale-but-ours entry refreshed, state=registered, exit 0" \
+  || bad "upgrade: got state='$OUT9' rc=$RC9, expected 'registered' rc=0 (staleness not detected)"
+CHECK9="$(python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+sl = d.get("statusLine")
+assert sl.get("updateIntervalMs") == 3000, "updateIntervalMs not refreshed: %r" % sl.get("updateIntervalMs")
+assert sl.get("timeoutMs") == 3000, "timeoutMs not added on refresh: %r" % sl.get("timeoutMs")
+print("OK")
+' "$CFG9" 2>&1)"
+[ "$CHECK9" = OK ] && ok "upgrade: refreshed entry carries the new updateIntervalMs=3000/timeoutMs=3000" \
+                    || bad "upgrade: $CHECK9"
+OUT9B="$(HOME="$H9" HEIMDALL_CURSOR_CLI_CONFIG="$CFG9" "$REG" register)"; RC9B=$?
+[ "$RC9B" = 0 ] && [ "$OUT9B" = current ] \
+  && ok "upgrade: follow-up register on the refreshed file is idempotent (state=current)" \
+  || bad "upgrade: follow-up got state='$OUT9B' rc=$RC9B, expected 'current' rc=0"
+rm -rf "$H9"
+
+echo "== 10) NEVER TOUCHES THE REAL FILE: whole suite ran hermetically =="
 REAL_AFTER=""
 if [ -f "$REAL_CFG" ]; then
   REAL_AFTER="$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$REAL_CFG" 2>/dev/null)"
