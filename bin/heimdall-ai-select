@@ -1,0 +1,292 @@
+#!/usr/bin/env bash
+# heimdall-ai-select — detect, default-select, and persist which offline
+# coding-AI CLI backend hmd should prefer (Claude Code, Cursor CLI, ...).
+#
+# Registry is the BACKENDS table below. Add a third CLI (codex, gemini, aider,
+# ...) by appending ONE "id|label|bins|host_env|auth_probe" row — nothing else
+# in this script changes. Modeled on the id -> config lookup in
+# bin/oracle-select (registry-driven resolution over a table of options); this
+# table is embedded rather than a separate JSON file because, unlike
+# evals/oracles/registry.json, nothing outside this single script reads it.
+#
+# Self-host detection is real, not guessed: Claude Code sets CLAUDECODE=1 in
+# every process it launches (confirmed via `env` inside a live session) — so
+# "is Claude Code the CLI already hosting this run" is a plain env-var check,
+# no subprocess needed. Cursor CLI has no equivalent (hmd cannot itself be
+# hosted by cursor-agent — it is a Claude Code plugin), so its host_env is
+# deliberately empty; that is a true structural fact, not an unfinished field.
+set -euo pipefail
+
+command -v jq >/dev/null 2>&1 || { echo "error: jq is required" >&2; exit 3; }
+
+# id | label | comma-separated bin names (first found wins) | host env var (empty = can never self-report as host) | auth probe subcommand (empty = skip probe)
+BACKENDS=(
+  "claude-code|Claude Code|claude|CLAUDECODE|"
+  "cursor-cli|Cursor CLI (cursor-agent)|cursor-agent,agent||status"
+)
+
+PROBE_AUTH=0
+
+usage() {
+  cat <<'EOF'
+Usage: heimdall-ai-select <command> [args]
+
+Commands:
+  detect [--auth]              Print detected backends as a JSON array
+  list [--auth]                Human-readable lettered list of detected backends
+  current [project_dir]        Print the persisted backend id, or "none"
+  default                      Print the computed sensible default backend id
+  select <id|letter|name> [project_dir]
+                                Persist a backend as the preferred one
+  session-start [project_dir]  First-run only: default-select + persist + notice
+
+project_dir defaults to "." (matches bin/heimdall-checkpoint's convention).
+EOF
+}
+
+# ── detection ────────────────────────────────────────────────────────────────
+
+# probe_auth <bin> <subcommand> -> logged_in | not_logged_in | unknown
+# Best-effort and alarm-bounded: AGENTS.md rules out timeout(1) on this box,
+# so a hang is capped with perl's alarm the same way heimdall-resume-probe
+# is wrapped from hooks/hooks.json.
+probe_auth() {
+  local bin="$1" subcmd="$2" out=""
+  if command -v perl >/dev/null 2>&1; then
+    out="$(perl -e 'alarm 3; exec @ARGV' -- "$bin" "$subcmd" 2>/dev/null || true)"
+  else
+    out="$("$bin" "$subcmd" 2>/dev/null || true)"
+  fi
+  case "$out" in
+    *"Logged in"*|*"logged in"*) echo "logged_in" ;;
+    *"Not logged in"*|*"not logged in"*) echo "not_logged_in" ;;
+    *) echo "unknown" ;;
+  esac
+}
+
+# detect_backend id label bins_csv host_env auth_probe -> one JSON object
+detect_backend() {
+  local id="$1" label="$2" bins_csv="$3" host_env="$4" auth_probe="$5"
+
+  local is_host="false"
+  if [ -n "$host_env" ]; then
+    local hv="${!host_env:-}"
+    if [ -n "$hv" ] && [ "$hv" != "0" ] && [ "$hv" != "false" ]; then
+      is_host="true"
+    fi
+  fi
+
+  local found_bin="" b
+  local IFS_OLD="$IFS"
+  IFS=','
+  for b in $bins_csv; do
+    if command -v "$b" >/dev/null 2>&1; then found_bin="$b"; break; fi
+  done
+  IFS="$IFS_OLD"
+
+  local available="false"
+  [ -n "$found_bin" ] && available="true"
+  [ "$is_host" = "true" ] && available="true"
+
+  local auth="unknown"
+  if [ "$is_host" = "true" ]; then
+    auth="active"
+  elif [ "$PROBE_AUTH" = "1" ] && [ -n "$auth_probe" ] && [ -n "$found_bin" ]; then
+    auth="$(probe_auth "$found_bin" "$auth_probe")"
+  fi
+
+  jq -n --arg id "$id" --arg label "$label" --argjson available "$available" \
+        --argjson host "$is_host" --arg bin "$found_bin" --arg auth "$auth" \
+        '{id:$id,label:$label,available:$available,host:$host,bin:$bin,auth:$auth}'
+}
+
+cmd_detect() {
+  local row id label bins_csv host_env auth_probe
+  local objs=()
+  for row in "${BACKENDS[@]}"; do
+    IFS='|' read -r id label bins_csv host_env auth_probe <<<"$row"
+    objs+=("$(detect_backend "$id" "$label" "$bins_csv" "$host_env" "$auth_probe")")
+  done
+  printf '%s\n' "${objs[@]}" | jq -s '.'
+}
+
+cmd_list() {
+  local json avail_count
+  json="$(cmd_detect)"
+  avail_count="$(printf '%s' "$json" | jq '[.[] | select(.available)] | length')"
+  if [ "$avail_count" -eq 0 ]; then
+    echo "No supported AI CLI backend detected on PATH."
+    return 0
+  fi
+  local letters="ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+  local i=0 obj id label host auth tag letter
+  while IFS= read -r obj; do
+    id="$(printf '%s' "$obj" | jq -r '.id')"
+    label="$(printf '%s' "$obj" | jq -r '.label')"
+    host="$(printf '%s' "$obj" | jq -r '.host')"
+    auth="$(printf '%s' "$obj" | jq -r '.auth')"
+    tag=""
+    [ "$host" = "true" ] && tag="$tag (current host)"
+    [ "$auth" = "logged_in" ] && tag="$tag — logged in"
+    [ "$auth" = "not_logged_in" ] && tag="$tag — not logged in"
+    letter="${letters:$i:1}"
+    printf '%s) %s [%s]%s\n' "$letter" "$label" "$id" "$tag"
+    i=$((i + 1))
+  done < <(printf '%s' "$json" | jq -c '.[] | select(.available)')
+}
+
+# default -> the id of the sensible default, or exit 1 if nothing is detected
+cmd_default() {
+  local json avail_ids n
+  json="$(cmd_detect)"
+
+  local host_id
+  host_id="$(printf '%s' "$json" | jq -r '[.[] | select(.available and .host)] | .[0].id // empty')"
+  if [ -n "$host_id" ]; then printf '%s\n' "$host_id"; return 0; fi
+
+  avail_ids="$(printf '%s' "$json" | jq -r '[.[] | select(.available)] | .[].id')"
+  n="$(printf '%s' "$avail_ids" | grep -c . || true)"
+  if [ "$n" -eq 0 ]; then
+    echo "error: no AI CLI backend detected on PATH" >&2
+    return 1
+  fi
+  # exactly one alternative, or the table's first available as a deterministic
+  # fallback — either way, a real choice, never a fabricated one.
+  printf '%s\n' "$avail_ids" | head -1
+}
+
+# ── persistence (.planning/settings.json, additive top-level key) ──────────
+# Mirrors bin/heimdall-checkpoint's _update_settings: read existing file (or
+# {} if missing/corrupt), merge, write via mktemp+mv. Every OTHER top-level
+# key in settings.json (parallelism, model_routing, commands, governance,
+# avoid_dirs, user_preferences, goal, ...) must survive untouched.
+persist_selection() {
+  local id="$1" source="$2" dir="${3:-.}"
+  local planning="$dir/.planning"
+  mkdir -p "$planning"
+  local f="$planning/settings.json"
+
+  local base
+  if [ -f "$f" ]; then
+    base="$(cat "$f" 2>/dev/null)"
+    printf '%s' "$base" | jq -e . >/dev/null 2>&1 || base='{}'
+  else
+    base='{}'
+  fi
+
+  local ts tmp
+  ts="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+  tmp="$(mktemp)"
+  printf '%s' "$base" | jq --arg id "$id" --arg src "$source" --arg ts "$ts" \
+    '.ai_backend = {selected: $id, selected_at: $ts, source: $src}' \
+    >"$tmp" && mv "$tmp" "$f"
+}
+
+cmd_current() {
+  local dir="${1:-.}"
+  local f="$dir/.planning/settings.json"
+  [ -f "$f" ] || { echo "none"; return 0; }
+  local sel
+  sel="$(jq -r '.ai_backend.selected // "none"' "$f" 2>/dev/null || echo "none")"
+  [ -n "$sel" ] || sel="none"
+  printf '%s\n' "$sel"
+}
+
+# resolve_backend arg avail_json -> id on stdout, or empty + non-zero exit
+resolve_backend() {
+  local arg="$1" avail_json="$2" n idx letter_upper resolved=""
+
+  n="$(printf '%s' "$avail_json" | jq 'length')"
+
+  if printf '%s' "$arg" | grep -qE '^[A-Za-z]$'; then
+    letter_upper="$(printf '%s' "$arg" | tr '[:lower:]' '[:upper:]')"
+    idx=$(( $(printf '%d' "'$letter_upper") - $(printf '%d' "'A") ))
+    if [ "$idx" -ge 0 ] && [ "$idx" -lt "$n" ]; then
+      resolved="$(printf '%s' "$avail_json" | jq -r ".[$idx].id")"
+    fi
+  fi
+
+  if [ -z "$resolved" ]; then
+    resolved="$(printf '%s' "$avail_json" | jq -r --arg a "$arg" '[.[] | select(.id == $a)] | .[0].id // empty')"
+  fi
+
+  if [ -z "$resolved" ]; then
+    local needle matches mcount
+    needle="$(printf '%s' "$arg" | tr '[:upper:]' '[:lower:]')"
+    matches="$(printf '%s' "$avail_json" | jq -r --arg a "$needle" \
+      '[.[] | select((.id | ascii_downcase | contains($a)) or (.label | ascii_downcase | contains($a)))] | .[].id')"
+    mcount="$(printf '%s' "$matches" | grep -c . || true)"
+    if [ "$mcount" -eq 1 ]; then
+      resolved="$matches"
+    elif [ "$mcount" -gt 1 ]; then
+      echo "error: '$arg' matches multiple detected backends: $(printf '%s' "$matches" | paste -sd ', ' -)" >&2
+      return 1
+    fi
+  fi
+
+  if [ -z "$resolved" ]; then
+    return 1
+  fi
+  printf '%s\n' "$resolved"
+}
+
+cmd_select() {
+  local arg="${1:?backend id, letter, or name required}"
+  local dir="${2:-.}"
+  local json avail_json n resolved label
+
+  json="$(cmd_detect)"
+  avail_json="$(printf '%s' "$json" | jq -c '[.[] | select(.available)]')"
+  n="$(printf '%s' "$avail_json" | jq 'length')"
+  if [ "$n" -eq 0 ]; then
+    echo "error: no AI CLI backend detected on PATH — nothing to select" >&2
+    return 1
+  fi
+
+  if ! resolved="$(resolve_backend "$arg" "$avail_json")"; then
+    echo "error: '$arg' does not match any detected backend." >&2
+    echo "Detected:" >&2
+    cmd_list >&2
+    return 1
+  fi
+
+  persist_selection "$resolved" "user" "$dir"
+  label="$(printf '%s' "$avail_json" | jq -r --arg id "$resolved" '[.[] | select(.id==$id)] | .[0].label')"
+  echo "AI backend preference set: $label ($resolved)"
+}
+
+cmd_session_start() {
+  local dir="${1:-.}"
+  local current
+  current="$(cmd_current "$dir")"
+  if [ "$current" != "none" ] && [ -n "$current" ]; then
+    return 0
+  fi
+
+  local def
+  if ! def="$(cmd_default 2>/dev/null)"; then
+    return 0
+  fi
+  persist_selection "$def" "auto-default" "$dir"
+
+  local label
+  label="$(cmd_detect | jq -r --arg id "$def" '[.[] | select(.id==$id)] | .[0].label')"
+  echo "[heimdall] AI backend: ${label} (auto-selected). Change with /hmd:switch-ai"
+}
+
+# ── dispatch ─────────────────────────────────────────────────────────────────
+case "${1:-}" in
+  detect)
+    shift; [ "${1:-}" = "--auth" ] && PROBE_AUTH=1
+    cmd_detect
+    ;;
+  list)
+    shift; [ "${1:-}" = "--auth" ] && PROBE_AUTH=1
+    cmd_list
+    ;;
+  current)        cmd_current "${2:-.}" ;;
+  default)        cmd_default ;;
+  select)         cmd_select "${2:-}" "${3:-.}" ;;
+  session-start)  cmd_session_start "${2:-.}" ;;
+  *)              usage; exit 1 ;;
+esac

@@ -142,6 +142,14 @@
             "command": "PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; HP=\"$PLUGIN/bin/heimdall-presence\"; [ -x \"$HP\" ] && \"$HP\" connect-prompt 2>/dev/null || true"
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; AISEL=\"$PLUGIN/bin/heimdall-ai-select\"; [ -x \"$AISEL\" ] && \"$AISEL\" session-start \"${CLAUDE_PROJECT_DIR:-.}\" 2>/dev/null || true"
+          }
+        ]
       }
     ],
     "SessionEnd": [
