@@ -373,9 +373,18 @@ fi
 #    "hmd does not hardcode opus — or anything else — for the main agent").
 #    select_model() must not call the resolver at all here: there is no tier to
 #    resolve when the launch is meant to inherit the operator's own default.
+#    Hermetic: cd into an isolated empty dir before launching. WORK_DIR is
+#    literally $(pwd) (bin/heimdall:24), so without this a bare `run_hmd` here
+#    inherits THIS test's own cwd — which is $REPO when run via run-all.sh or
+#    directly from the repo root. A prior version of this assertion read
+#    $REPO/.planning/settings.json by accident: it passed in a worktree that
+#    happens to lack that file and failed for real on a checkout that has one
+#    committed. cd is required; mktemp alone does not change $(pwd).
 reset
 make_stub heimdall-model-resolve
-run_hmd "some-unknown-task-resolver-present"
+NO_OVERRIDE_DIR="$(mktemp -d /tmp/test-heimdall-no-override-XXXXXX)"
+( cd "$NO_OVERRIDE_DIR" && run_hmd "some-unknown-task-resolver-present" )
+rm -rf "$NO_OVERRIDE_DIR"
 
 if claude_reached; then
   ok "launch reaches launch:task with heimdall-model-resolve present"
@@ -391,11 +400,20 @@ else
   ok "present resolver is NOT invoked absent an override — main agent inherits the operator's default, unpinned"
 fi
 
-# B2. resolver present AND an explicit, opt-in project override requests opus —
-#     THIS is what exercises "a present resolver is not silently bypassed":
-#     .planning/settings.json's model_routing.default_code is the one sanctioned
-#     way to pin the main agent's tier (commands/save.md), so once an operator
-#     sets it, the resolver must actually be called for that tier.
+# B2. resolver present AND a .planning/settings.json project override — the
+#     main agent must STILL stay unpinned. default_code used to be read here
+#     and applied to THIS launch (a second, subtler instance of the exact bug
+#     CLAUDE.md's directive forbids, merely gated behind an opt-in file
+#     instead of being unconditional): no code path anywhere in this repo
+#     ever applied default_code to a DELEGATED coding subagent spawn, so
+#     pinning the main agent was its entire real mechanical effect. Removed
+#     from select_model() (bin/heimdall) and re-documented in
+#     commands/save.md — the file is still injected verbatim into the
+#     preamble by load_checkpoint_context(), so default_code remains visible
+#     to the orchestrator as advisory text for ITS OWN subagent spawns,
+#     exactly like parallelism/governance/avoid_dirs. It must never again
+#     reach this launch's own MODEL_FLAG. Hermetic for the same reason as B:
+#     cd into the dir that owns the constructed settings.json.
 reset
 OVERRIDE_DIR="$(mktemp -d /tmp/test-heimdall-override-XXXXXX)"
 mkdir -p "$OVERRIDE_DIR/.planning"
@@ -405,11 +423,18 @@ EOJSON
 ( cd "$OVERRIDE_DIR" && run_hmd "some-unknown-task-resolver-present-with-override" )
 rm -rf "$OVERRIDE_DIR"
 
-if stub_called "heimdall-model-resolve" && args_contain "heimdall-model-resolve ARGS: opus"; then
-  ok "present resolver IS invoked for an explicit project override (fallback does not shadow it)"
+if claude_reached; then
+  ok "launch reaches launch:task with a project override present"
 else
-  bad "heimdall-model-resolve present but never invoked for an explicit opus project override"
+  bad "launch failed to reach launch:task with a project override present"
+  cat "$TRACE_FILE" >&2
+fi
+
+if stub_called "heimdall-model-resolve"; then
+  bad "heimdall-model-resolve was invoked for the main agent's own launch despite CLAUDE.md's unconditional 'never pinned' — a project-level default_code must stay advisory-only, never a mechanical override of THIS launch"
   cat "$STUB_OUT" >&2
+else
+  ok "project override present but main agent still unpinned — resolver not invoked, default_code is advisory-only (commands/save.md)"
 fi
 
 rm -f "$FAKE_BIN/heimdall-model-resolve"

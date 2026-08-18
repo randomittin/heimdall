@@ -3892,39 +3892,36 @@ ${CHECKPOINT_CONTEXT}
 # ── Smart model selection (runs AFTER checkpoint load) ──
 
 select_model() {
-  # Main Claude Code agent: NEVER pinned (CLAUDE.md "Model routing" directive —
-  # "hmd does not hardcode opus, or anything else, for the main agent"). This
-  # used to open with `MODEL_FLAG="--model $(resolve_model opus)"` and force
-  # opus on every default launch regardless of the operator's own configured
-  # /model default — that unconditional assignment WAS the "hardcoded opus"
-  # bug (the tier alias resolves to whatever generation is current; it read
+  # Main Claude Code agent: NEVER pinned, unconditionally (CLAUDE.md "Model
+  # routing" directive — "hmd does not hardcode opus — or anything else —
+  # for the main agent"). This used to open with
+  # `MODEL_FLAG="--model $(resolve_model opus)"` and force opus on every
+  # default launch regardless of the operator's own configured /model
+  # default — that unconditional assignment WAS the "hardcoded opus" bug
+  # (the tier alias resolves to whatever generation is current; it read
   # "Opus 5" only because Claude Code had just resolved it, not because any
-  # id or generation name is written here). The fix: no flag by default, so
-  # the `claude` binary falls back to its own configured default — mirrors
-  # agents/heimdall.md's own `model: inherit` frontmatter.
+  # id or generation name is written here). The fix: no flag, ever, so the
+  # `claude` binary always falls back to its own configured default —
+  # mirrors agents/heimdall.md's own `model: inherit` frontmatter.
+  #
+  # This function used to ALSO read .planning/settings.json's
+  # model_routing.default_code and apply it to THIS launch when present — a
+  # second, subtler instance of the same bug: hmd overriding the operator's
+  # own /model choice, merely gated behind an opt-in file instead of being
+  # unconditional. No code path anywhere in this repo ever applied
+  # default_code to a DELEGATED coding subagent spawn — agents/*.md's own
+  # `model:` frontmatter is the only thing Claude Code's Task/Agent tooling
+  # reads for that — so pinning THIS agent was the key's entire real
+  # mechanical effect, not a documented alternate use. Removed. default_code
+  # is not gone: the whole settings.json file is still injected verbatim
+  # into every launch's preamble by load_checkpoint_context(), so the
+  # orchestrator still sees the operator's preferred coding tier and can
+  # apply it when IT spawns coding subagents. It is advisory text for the
+  # model, same as parallelism/governance/avoid_dirs/preferences in the same
+  # file — never again a mechanical override of this launch. See
+  # commands/save.md.
   MODEL_FLAG=""
   MODEL_NAME="inherit (operator default)"
-
-  # Explicit, opt-in project override ONLY — documented in commands/save.md
-  # and .planning/settings.json's model_routing._note. This is the operator
-  # choosing a tier for THIS project, not hmd choosing one for them, so it is
-  # not the "hardcode" CLAUDE.md forbids.
-  settings="$WORK_DIR/.planning/settings.json"
-  if [ -f "$settings" ] && command -v python3 &>/dev/null; then
-    override=$(python3 -c "
-import json
-try:
-    s = json.load(open('$settings'))
-    m = s.get('model_routing', {}).get('default_code', '')
-    if m: print(m)
-except: pass
-" 2>/dev/null)
-    case "$override" in
-      haiku)  MODEL_FLAG="--model $(resolve_model haiku)"; MODEL_NAME="haiku (project override)" ;;
-      sonnet) MODEL_FLAG="--model $(resolve_model sonnet)"; MODEL_NAME="sonnet (project override)" ;;
-      opus)   MODEL_FLAG="--model $(resolve_model opus)"; MODEL_NAME="opus (project override)" ;;
-    esac
-  fi
 
   printf "  \033[38;2;155;89;182m▸ Model:\033[0m %s\n" "$MODEL_NAME"
 }
