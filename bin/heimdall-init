@@ -20,10 +20,20 @@
 #      HEIMDALL:AGENTS markers says: this repo is gated, and the oracle is the
 #      only path. A pre-existing AGENTS.md is NEVER clobbered — the block is
 #      appended and re-init re-renders ONLY what is inside the fence.
+#   4. Auto-registers the Cursor CLI statusline HUD — MACHINE-level (~/.cursor/), not
+#      repo-level, and gated on Cursor CLI actually being present (reuses
+#      bin/heimdall-ai-select detect; never a second detector). Absent Cursor: no
+#      file touched, no error, no nag. Idempotent and no-clobber by construction —
+#      bin/heimdall-statusline-register-cursor owns that contract, this just decides
+#      WHETHER to call it, and backs up the config before its first write. Opt out
+#      with --no-cursor-statusline, HEIMDALL_NO_CURSOR_STATUSLINE_REGISTER=1, or
+#      ~/.heimdall/no-cursor-statusline-register (shared with the registrar itself).
+#      Undo any time: `hmd cursor-statusline unregister`.
 #
 # Usage:
-#   heimdall-init [--force]     install (or refresh) the hooks in the current repo
-#   heimdall-init --agents-only re-render ONLY the AGENTS.md fence (no hooks, no config)
+#   heimdall-init [--force]               install (or refresh) the hooks in the current repo
+#   heimdall-init --agents-only           re-render ONLY the AGENTS.md fence (no hooks, no config)
+#   heimdall-init --no-cursor-statusline  skip the Cursor CLI statusline auto-registration step
 #   -h, --help
 #
 # Exit: 0 = installed; 1 = not a git repo / IO error.
@@ -40,14 +50,16 @@ while [ -h "$SELF" ]; do
 done
 BIN_DIR="$(cd "$(dirname "$SELF")" && pwd)"
 
-usage() { sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,39p' "$0" | sed 's/^# \{0,1\}//'; }
 
 FORCE=""
 AGENTS_ONLY=""
+NO_CURSOR_STATUSLINE=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --force) FORCE=1; shift ;;
     --agents-only) AGENTS_ONLY=1; shift ;;
+    --no-cursor-statusline) NO_CURSOR_STATUSLINE=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "heimdall-init: unexpected argument: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -339,6 +351,34 @@ if write_agents_md; then AGENTS_WROTE=1; fi
 HMDTEAM="$PLUGIN_BIN/heimdall-team"
 [ -x "$HMDTEAM" ] && ( "$HMDTEAM" auto >/dev/null 2>&1 & ) || true
 
+# ── Cursor CLI statusline auto-registration (machine-level, gated, best-effort) ──
+# Cursor CLI has no plugin system and no SessionStart-equivalent auto-run hook (see
+# bin/heimdall-statusline-register-cursor's own header) — without this, the HUD is
+# invisible under Cursor unless a user finds and hand-runs that registrar. Gated on
+# Cursor actually being PRESENT (bin/heimdall-ai-select detect's cursor-cli.available)
+# — a machine that has never touched Cursor never gets a ~/.cursor/ dir created by
+# `hmd init`. The registrar owns idempotency/no-clobber/its own opt-out surface; this
+# block only decides WHETHER to call it, and takes a pre-write backup (the registrar's
+# write path does not) since ~/.cursor/cli-config.json is a file hmd does not own.
+CURSOR_STATE=""
+if [ -z "$NO_CURSOR_STATUSLINE" ]; then
+  AISEL="$PLUGIN_BIN/heimdall-ai-select"
+  CURSOR_REG="$PLUGIN_BIN/heimdall-statusline-register-cursor"
+  if [ -x "$AISEL" ] && [ -x "$CURSOR_REG" ] && command -v jq >/dev/null 2>&1; then
+    CURSOR_AVAILABLE="$("$AISEL" detect 2>/dev/null | jq -r '[.[] | select(.id=="cursor-cli")] | .[0].available // false' 2>/dev/null || echo false)"
+    if [ "$CURSOR_AVAILABLE" = "true" ]; then
+      CURSOR_PRECHECK="$("$CURSOR_REG" status 2>/dev/null || echo skipped)"
+      if [ "$CURSOR_PRECHECK" = "would-register" ]; then
+        CURSOR_CFG="${HEIMDALL_CURSOR_CLI_CONFIG:-$HOME/.cursor/cli-config.json}"
+        if [ -f "$CURSOR_CFG" ]; then
+          cp -p "$CURSOR_CFG" "$CURSOR_CFG.heimdall-init-$(date -u +%Y%m%d%H%M%S 2>/dev/null || echo 0).bak" 2>/dev/null || true
+        fi
+        CURSOR_STATE="$("$CURSOR_REG" register 2>/dev/null || echo skipped)"
+      fi
+    fi
+  fi
+fi
+
 # ── done — the watchman is keeping watch ───────────────────────────────────────
 printf '\n'
 printf "  ${G}${B}✓ Heimdall is watching this repo.${R}\n"
@@ -354,6 +394,9 @@ fi
 printf "  ${D}gates run on every commit; deny blocks it.${R}\n"
 printf "  ${D}escape once:${R} ${B}HMD_SKIP=1 git commit …${R} ${D}(logged, never silent)${R}\n"
 printf "  ${D}last verdict:${R} ${C}hmd verdict${R}\n"
+if [ "$CURSOR_STATE" = "registered" ]; then
+  printf "  ${D}cursor HUD →${R} registered ${D}(undo: hmd cursor-statusline unregister)${R}\n"
+fi
 
 # ── Δ2 audit-on-init: a fast, fully-offline repo audit → A NUMBER WORTH POSTING,
 #    printed here and STORED to <repo>/.heimdall/audit.json for `hmd badge`/`hmd
