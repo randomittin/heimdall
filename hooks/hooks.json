@@ -123,6 +123,14 @@
         "hooks": [
           {
             "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}/bin/heimdall-quota-resume\" resume-hint --repo \"${CLAUDE_PROJECT_DIR:-.}\" 2>/dev/null || true"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
             "command": "PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; NOTICE=\"$PLUGIN/bin/heimdall-dream-notice\"; [ -x \"$NOTICE\" ] && \"$NOTICE\" --repo \"${CLAUDE_PROJECT_DIR:-.}\" 2>/dev/null || true"
           }
         ]
