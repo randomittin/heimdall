@@ -2290,6 +2290,24 @@ case "${1:-}" in
     fi
     exec "$TIER_BIN" "$@"
     ;;
+  status)
+    # Pass-through to heimdall-statusline: the CLI-agnostic HUD renderer shared
+    # with Claude Code's registered hooks/statusline.sh (now a thin `exec` wrapper
+    # over this same bin, so both paths render from one source of truth — see
+    # bin/heimdall-statusline's own header, and test/heimdall-statusline-parity.
+    # test.sh which locks it). Callable from any shell regardless of which AI CLI
+    # is driving; run bare (`hmd status`) at a real terminal for the full
+    # multi-row HUD, or pipe a Claude-Code/Cursor-shaped JSON blob on stdin the
+    # same way those hosts do. All args forwarded verbatim.
+    shift
+    STATUS_BIN="$PLUGIN_DIR/bin/heimdall-statusline"
+    if [ ! -x "$STATUS_BIN" ]; then
+      echo "  Error: heimdall-statusline not found at $STATUS_BIN" >&2
+      echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+      exit 1
+    fi
+    exec "$STATUS_BIN" "$@"
+    ;;
   weekly-log)
     # Pass-through to heimdall-weekly-log: the weekly "what the watchman learned"
     # changelog generator (consent + k-anonymity gated, DATA.md §7 — see the
@@ -2746,6 +2764,7 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   echo "  heimdall connect          Connect a Claude credential for remote jobs"
   echo "  heimdall presence         Control presence (off/on/status/roster)"
   echo "  heimdall tier             Model routing table + tier declaration log"
+  echo "  heimdall status           CLI-agnostic statusline HUD (same renderer as the bar)"
   echo "  heimdall weekly-log       Weekly changelog draft generator (drafts only)"
   echo ""
   echo "heimdall launches Claude Code with:"

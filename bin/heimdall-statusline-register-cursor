@@ -1,0 +1,197 @@
+#!/usr/bin/env bash
+# heimdall-statusline-register-cursor — wire the watchman HUD into Cursor CLI's
+# OWN statusLine plug-in point. Cursor is a fully separate host from Claude Code:
+# no plugin system, no SessionStart hook, no CLAUDE_PLUGIN_ROOT — so this is the
+# Cursor-side sibling of bin/heimdall-statusline-register, never a replacement.
+#
+# THE REAL, CONFIRMED PLUG-IN POINT (not assumed — verified against Cursor's own
+# docs before writing a line of this): ~/.cursor/cli-config.json carries a top-level
+# `statusLine` key — {type:"command", command:<path>, padding, updateIntervalMs,
+# timeoutMs} — documented at ~/.cursor/skills-cursor/statusline/SKILL.md. The width
+# signal is DIFFERENT from Claude Code too: Cursor hands `render_width_chars` on the
+# stdin JSON blob instead of exporting $COLUMNS — bin/heimdall-statusline already
+# reads that field itself, so nothing downstream of this registrar needs to know
+# which host is driving it.
+#
+# WHY A BARE ABSOLUTE PATH, no wrapper. bin/heimdall-statusline-register's Claude
+# Code command is `bash -c '[ -x "<path>" ] && exec bash "<path>"; exit 0'` — a shell
+# one-liner. That trick is UNAVAILABLE here: SKILL.md states the command is spawned
+# via `child_process.spawn` with NO shell on Unix (shell-style-split into argv, never
+# handed to /bin/sh). A `bash -c '...'` string would spawn a literal `bash` process
+# whose FIRST argument is the two-word string `-c`+script only if spawn itself did
+# shell-splitting of the whole command into argv — which it does, but there is then
+# no shell alive to INTERPRET `[ -x ... ] && exec ...` inside that argv. So the value
+# here is simply the resolved absolute path to bin/heimdall-statusline — the file
+# Cursor spawns directly. No existence guard is possible from our side; a missing or
+# non-executable target degrades exactly the way SKILL.md documents any failing
+# statusLine command degrades ("previous text is kept") — Cursor's own contract,
+# not ours to fake.
+#
+# SUBCOMMANDS:
+#   heimdall-statusline-register-cursor [register]   idempotently wire `statusLine`
+#         into ~/.cursor/cli-config.json. Prints ONE state word, ALWAYS exits 0.
+#         Never clobbers a user's own custom statusLine.
+#   heimdall-statusline-register-cursor status       read-only: print what it would do.
+#
+# STATE WORDS (printed on stdout):
+#   registered  — wrote/refreshed our statusLine
+#   current     — already canonical; nothing written
+#   kept-custom — the user has a non-heimdall statusLine; left untouched
+#   skipped     — python3 unavailable, no resolvable root, opted out, or write failed
+#
+# MANUAL-INVOKE ONLY, deliberately. Claude Code's sibling self-bootstraps from a
+# SessionStart hook because the plugin system guarantees that hook reaches every
+# install. Cursor has no plugin system and no equivalent auto-run hook — its OWN
+# separate `.cursor/hooks.json` schema (see ~/.cursor/skills-cursor/create-hook/
+# SKILL.md) is unrelated to statusLine registration and hmd does not populate it.
+# So there is no honest way to make this self-bootstrapping under Cursor today —
+# run it by hand once per machine, the same way you'd hand-configure any other
+# Cursor CLI setting.
+#
+# SAFETY CONTRACT (mirrors bin/heimdall-statusline-register byte-for-byte):
+#   * NEVER clobbers a user's OWN statusLine — writes only when the key is absent or
+#     already points at bin/heimdall-statusline (refreshing a stale path).
+#   * NEVER touches, logs, or prints any OTHER key in cli-config.json — that file can
+#     carry Cursor account auth state (authInfo: email/userId/authId); only the
+#     `statusLine` key is ever read or written, every sibling key round-trips as-is.
+#   * Atomic, key-preserving edit (tmp + os.replace) — every other config key survives.
+#   * Missing python3 / unresolvable root / write failure = clean no-op, exit 0.
+#   * Opt out (either suppresses this registrar):
+#       - the SHARED marker, honored by both registrars:
+#         HEIMDALL_NO_STATUSLINE_REGISTER=1 or ${HOME}/.heimdall/no-statusline-register
+#       - a CURSOR-ONLY marker, for a Claude-Code-yes/Cursor-no split:
+#         HEIMDALL_NO_CURSOR_STATUSLINE_REGISTER=1 or
+#         ${HOME}/.heimdall/no-cursor-statusline-register
+#   * set -uo pipefail, never set -x, never echoes file content.
+#
+# OVERRIDES / TEST SEAMS:
+#   --root <dir>              force the plugin root (else this bin's own location).
+#   HEIMDALL_CURSOR_CLI_CONFIG   explicit cli-config.json path (default
+#                                 $HOME/.cursor/cli-config.json). Tests MUST set this —
+#                                 the real file can belong to a live authenticated
+#                                 Cursor identity and must never be touched by a test.
+set -uo pipefail
+
+SUB="register"
+FORCE_ROOT=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    register|status) SUB="$1" ;;
+    --root) shift; FORCE_ROOT="${1:-}" ;;
+    --root=*) FORCE_ROOT="${1#--root=}" ;;
+    *) : ;;   # tolerate unknown args
+  esac
+  shift
+done
+
+opted_out() {
+  [ "${HEIMDALL_NO_STATUSLINE_REGISTER:-0}" = "1" ] && return 0
+  [ -f "${HOME:-/nonexistent}/.heimdall/no-statusline-register" ] && return 0
+  [ "${HEIMDALL_NO_CURSOR_STATUSLINE_REGISTER:-0}" = "1" ] && return 0
+  [ -f "${HOME:-/nonexistent}/.heimdall/no-cursor-statusline-register" ] && return 0
+  return 1
+}
+
+# Resolve the repo/plugin root to an ABSOLUTE path, dynamically, no hardcoded home:
+#   1) --root <dir> (explicit — tests use this)
+#   2) this bin's own location: <root>/bin/heimdall-statusline-register-cursor -> <root>
+resolve_root() {
+  local r bindir
+  if [ -n "$FORCE_ROOT" ]; then printf '%s' "$FORCE_ROOT"; return 0; fi
+  bindir="$(cd "$(dirname "$0")" 2>/dev/null && pwd)" || return 1
+  r="$(cd "$bindir/.." 2>/dev/null && pwd)" || return 1
+  printf '%s' "$r"
+}
+
+opted_out && { printf 'skipped'; exit 0; }
+command -v python3 >/dev/null 2>&1 || { printf 'skipped'; exit 0; }
+
+ROOT="$(resolve_root)"
+if [ -z "$ROOT" ] || [ ! -x "$ROOT/bin/heimdall-statusline" ]; then
+  printf 'skipped'; exit 0
+fi
+
+CFG="${HEIMDALL_CURSOR_CLI_CONFIG:-$HOME/.cursor/cli-config.json}"
+
+if [ "$SUB" = status ]; then
+  HMD_SL_TARGET="$ROOT/bin/heimdall-statusline" HMD_SL_CFG="$CFG" python3 - <<'PY' 2>/dev/null || printf 'skipped'
+import json, os
+target = os.environ["HMD_SL_TARGET"]; path = os.environ["HMD_SL_CFG"]
+MARKER = "bin/heimdall-statusline"
+want = {"type": "command", "command": target, "padding": 0, "updateIntervalMs": 2000}
+try:
+    data = json.load(open(path))
+    if not isinstance(data, dict): data = {}
+except Exception:
+    data = {}
+sl = data.get("statusLine")
+if isinstance(sl, dict) and MARKER not in (sl.get("command") or "") and sl.get("command"):
+    print("kept-custom"); raise SystemExit
+print("current" if sl == want else "would-register")
+PY
+  echo
+  exit 0
+fi
+
+# ── register: idempotent, atomic, custom-preserving merge. Only the `statusLine`
+# key is ever read or written; every sibling key (including a live `authInfo`) is
+# round-tripped byte-for-byte via the same dict, never inspected or logged. ──
+STATE="$(HMD_SL_TARGET="$ROOT/bin/heimdall-statusline" HMD_SL_CFG="$CFG" python3 - <<'PY' 2>/dev/null
+import json, os, sys, tempfile
+
+target = os.environ["HMD_SL_TARGET"]
+path   = os.environ["HMD_SL_CFG"]
+MARKER = "bin/heimdall-statusline"
+
+want = {"type": "command", "command": target, "padding": 0, "updateIntervalMs": 2000}
+
+try:
+    with open(path) as fh:
+        data = json.load(fh)
+    if not isinstance(data, dict):
+        data = {}
+except Exception:
+    data = {}
+
+cur = data.get("statusLine")
+ours = cur is None or (isinstance(cur, dict) and MARKER in (cur.get("command") or ""))
+
+wrote = custom = False
+if not ours:
+    custom = True
+elif cur != want:
+    data["statusLine"] = want
+    wrote = True
+
+if wrote:
+    d = os.path.dirname(path) or "."
+    try:
+        os.makedirs(d, exist_ok=True)
+    except Exception:
+        print("skipped"); sys.exit(0)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".cli-config.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            json.dump(data, fh, indent=2)
+            fh.write("\n")
+        os.replace(tmp, path)
+    except Exception:
+        try: os.unlink(tmp)
+        except OSError: pass
+        print("skipped"); sys.exit(0)
+
+sl = data.get("statusLine")
+if isinstance(sl, dict) and MARKER in (sl.get("command") or ""):
+    print("registered" if wrote else "current")
+elif custom:
+    print("kept-custom")
+else:
+    print("skipped")
+PY
+)" || STATE="skipped"
+[ -z "$STATE" ] && STATE="skipped"
+printf '%s\n' "$STATE"
+if [ "$STATE" = registered ]; then
+  printf '[heimdall] cursor statusline activated — visible next session\n' >&2
+fi
+exit 0
