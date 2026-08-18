@@ -534,6 +534,70 @@ rm -f "$FAKE_BIN/skill-manager"
 rm -f "$SKILLS_OUT"
 
 # ══════════════════════════════════════════════════════════════════════════════
+# 8e. MAIN-AGENT PIN GUARD — --resume and --team must never force --model either.
+#
+#     8b/8c pin select_model()'s own launch path (the bottom-of-file default
+#     route). But bin/heimdall has THREE places that exec/spawn a `claude`
+#     process for the main agent, and the pin bug this suite exists to catch
+#     (CLAUDE.md "Model routing": "Main Claude Code agent: never pinned...
+#     hmd does not hardcode opus — or anything else — for the main agent")
+#     previously lived in ALL THREE:
+#       - select_model()            (covered above, section 8b)
+#       - --resume/--continue relaunch (`claude --continue ...`)
+#       - --team tmux pane spawn       (`tmux send-keys ... claude --agent ...`)
+#     A fix that only touched select_model() would leave --resume and --team
+#     silently re-forcing opus on every relaunch/team pane — this section
+#     closes that gap so the guard covers every operational spawn site, not
+#     just one instance of the class.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# --resume: claude --continue must carry no --model flag.
+reset
+make_stub claude
+run_hmd --resume
+
+if stub_called "claude" && args_contain "claude ARGS: --continue"; then
+  ok "--resume reaches claude --continue"
+else
+  bad "--resume never invoked claude --continue"
+  cat "$STUB_OUT" >&2
+fi
+
+if grep -q -- '--model' "$STUB_OUT" 2>/dev/null; then
+  bad "--resume passed --model to claude — main agent must stay unpinned"
+  cat "$STUB_OUT" >&2
+else
+  ok "--resume passes NO --model flag — main agent inherits the operator's default, unpinned"
+fi
+
+# --team: every spawned pane's claude invocation must carry no --model flag.
+reset
+make_stub tmux
+run_hmd --team 2
+
+if stub_called "tmux" && args_contain "tmux ARGS: new-session"; then
+  ok "--team reaches tmux new-session"
+else
+  bad "--team never invoked tmux new-session"
+  cat "$STUB_OUT" >&2
+fi
+
+if grep -q "claude --agent heimdall" "$STUB_OUT" 2>/dev/null; then
+  ok "--team's send-keys carries the claude --agent heimdall launch line"
+else
+  bad "--team never sent a claude --agent heimdall launch line to any pane"
+  cat "$STUB_OUT" >&2
+fi
+
+if grep -q -- '--model' "$STUB_OUT" 2>/dev/null; then
+  bad "--team passed --model to a spawned pane — main agent must stay unpinned"
+  cat "$STUB_OUT" >&2
+else
+  ok "--team panes get NO --model flag — main agent inherits the operator's default, unpinned"
+fi
+rm -f "$FAKE_BIN/tmux" "$FAKE_BIN/claude"
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 9. Syntax check
 # ══════════════════════════════════════════════════════════════════════════════
 if bash -n "$REAL_BIN" 2>/dev/null; then

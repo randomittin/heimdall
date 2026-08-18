@@ -23,6 +23,18 @@ fi
 PLUGIN_DIR="$(cd "$(dirname "$SELF")/.." && pwd)"
 WORK_DIR="$(pwd)"
 
+# Early default for PERMISSION_FLAG — same default the flag-parsing block at
+# ~line 2806 sets unconditionally before its own --auto check. That block only
+# runs on the default/no-recognized-flag launch path; early-exit branches like
+# --resume and --team reference $PERMISSION_FLAG (unquoted, so it must at
+# least be defined) before ever reaching line 2806, and under `set -u` a
+# reference to an unset variable is fatal regardless of quoting. Setting the
+# same default here — harmlessly re-set (to the same value, or overridden by
+# --auto) once the default path reaches line 2806 — means no early-exit
+# branch can crash on this var, without changing behaviour for any path that
+# already worked.
+PERMISSION_FLAG="--dangerously-skip-permissions"
+
 # Arrow-key selection menu helper (bin/lib/select.sh) — powers every interactive
 # prompt (the persona pick, the uninstall/reinstall confirms) with ↑/↓ + Enter
 # selection, j/k aliases, clean Ctrl-C abort (always restores the terminal), and
