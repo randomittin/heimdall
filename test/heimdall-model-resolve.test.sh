@@ -128,6 +128,26 @@ grep -q 'heimdall-model-resolve' "$REPO/bin/heimdall" \
   && ok "bin/heimdall invokes heimdall-model-resolve" \
   || bad "bin/heimdall never calls heimdall-model-resolve — not wired"
 
+# ── 5. LONG-CONTEXT PREMIUM CLAIM IS TIER-ACCURATE ──
+# tier-table.json's long_context_premium.note must not blanket-claim the
+# premium applies uniformly to every 1M-window tier. Anthropic's own model
+# docs and this repo's own token-spend-forensics.md price opus's 1M window
+# at flat base rate above 200K (no premium term), while sonnet's [1m] is the
+# one tier gated behind an explicit opt-in suffix. Overclaiming the premium
+# for opus would misprice every opus-tier forensic total in this repo.
+TIER_TABLE="$REPO/bin/lib/tier-table.json"
+NOTE_LINE="$(grep -m1 '"note":.*BASE rates' "$TIER_TABLE")"
+if printf '%s' "$NOTE_LINE" | grep -q 'opus does NOT carry'; then
+  ok "long_context_premium note excludes opus from the premium claim"
+else
+  bad "long_context_premium note does not say opus is exempt from the premium"
+fi
+if printf '%s' "$NOTE_LINE" | grep -q 'fable is undocumented'; then
+  ok "long_context_premium note marks fable's premium status as unconfirmed"
+else
+  bad "long_context_premium note does not flag fable as unconfirmed"
+fi
+
 echo ""
 echo "heimdall-model-resolve.test.sh: $PASS passed, $FAIL failed."
 [ "$FAIL" -eq 0 ] || exit 1
