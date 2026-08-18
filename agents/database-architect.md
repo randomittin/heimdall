@@ -3,7 +3,7 @@ name: database-architect
 description: Database design agent. Schema modeling, migration strategy, query optimization, technology evaluation. Use when task involves data layer, models, or persistence.
 tools: Read, Write, Edit, Bash, Grep, Glob
 model: sonnet
-tier: opus
+tier: sonnet
 effort: high
 color: blue
 ---

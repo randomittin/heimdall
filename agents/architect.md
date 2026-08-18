@@ -4,7 +4,7 @@ description: Read-only architecture and planning specialist. Analyzes codebase s
 tools: Read, Write, Edit, Grep, Glob, Bash, Skill
 disallowedTools: Workflow
 model: sonnet
-tier: opus
+tier: sonnet
 effort: high
 memory: project
 maxTurns: 30
