@@ -1,0 +1,325 @@
+#!/usr/bin/env bash
+# heimdall-journal — durable, git-committed, human-readable NARRATIVE log of
+# findings, decisions, corrections, and communications, written DURING work
+# (not a session-end snapshot). Extends the existing mechanical-persistence
+# stack; it does not replace any of it:
+#   - bin/heimdall-checkpoint + .planning/CHECKPOINT.md  -> forward "what to
+#     resume" STATE, rewritten in place each save (a snapshot, not a log).
+#   - bin/lib/resume-contract.sh (.heimdall/resume-notes.ndjson) -> short
+#     flat resume-grading notes; its own header says this store "lives here,
+#     not in git" — the closest existing analog, but not git-committed by
+#     design, and only 4 resume-shaped categories, no evidence field.
+#   - .planning/ledger/decisions.md -> hand-curated, single-file, single-type
+#     ADR log; not sharded, so concurrent writers would collide on one file.
+#   - .planning/metrics.jsonl -> gitignored numeric telemetry, not narrative.
+# heimdall-journal fills the specific remaining gap: an append-only, git-
+# committed, per-(day x writer) file, so the REASONING behind a finding,
+# decision, or correction survives a truncation that conversation memory does
+# not. One writer per file (day + HAID slug) -> no merge conflicts across
+# concurrent worktree agents, the same pattern already used for
+# .planning/ledger/{activity,verdicts,checkpoints}/{slug}.json.
+#
+# Subcommands:
+#   add <type> <subject> [--body TEXT] [--evidence TEXT] [--by HAID]
+#                          type: finding | decision | correction | communication
+#                          ('refuted' is accepted as an alias for 'correction'
+#                          — corrections are the most perishable and most
+#                          valuable entry type, and get first-class status).
+#                          --body is required (or piped on stdin, e.g. via a
+#                          heredoc); a missing, empty, or oversized body or
+#                          subject is REJECTED outright — never silently
+#                          truncated, nothing partially written. On success,
+#                          appends the entry, then makes ONE scoped commit
+#                          (git add of the journal file only) unless opted out.
+#   today [--haid HAID]    print today's file for the resolved (or given) writer.
+#   tail [N]               print the last N entries (default 10) across ALL
+#                          writers' files, oldest-to-newest.
+#   grep <pattern>         real grep across every journal file (file:line
+#                          shaped output); exit code passes through grep's
+#                          own (0 = found, 1 = not found).
+#   path [--date D] [--haid H]
+#                          print the deterministic file path (computed, not
+#                          required to exist) for the given/resolved day+writer.
+#   help
+#
+# Env:
+#   HEIMDALL_HAID   overrides the resolved writer identity — the SAME override
+#                   convention as bin/heimdall-activity (one escape hatch, not
+#                   a new one) — and the hermetic-test seam, since a test repo
+#                   has no real HAID registration to resolve.
+#
+# Respects .heimdall-no-autocommit / .superx-no-autocommit at the repo root,
+# same convention as bin/heimdall-wip-commit — but note what it gates: the
+# entry is ALWAYS appended to disk (durability first, never optional); only
+# the follow-on commit side-effect is skipped when opted out.
+#
+# Read-back is NEVER automatic — nothing this tool writes is loaded into a
+# prompt by default. `today` / `tail` / `grep` are explicit, on-demand reads
+# only. This repo's own docs/analysis/token-spend-forensics.md measured a
+# 6.17x cost difference between a 731K-mean-context day and a 118K one —
+# auto-loading a growing narrative log into every turn would reproduce
+# exactly the cost problem this tool exists to document, not cause.
+#
+# Durability note: unlike heimdall-checkpoint's in-place block rewrite (which
+# needs a manual re-read digest gate to catch a truncated write), this tool
+# only ever APPENDS and then commits — a successful `git commit` IS the
+# completeness proof (git content-addresses the exact bytes by hash), so no
+# separate digest-recompute gate is needed for this shape of write.
+#
+# `add`'s git-commit step is best-effort — a warning on stderr, never a hard
+# failure — for the same reason bin/heimdall-wip-commit's is: a journal tool
+# must never be the reason a coding task fails. Validation failures (bad
+# type, missing/empty/oversized subject or body) are real usage errors and DO
+# exit nonzero with nothing written; those are not best-effort.
+set -uo pipefail
+
+BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HAID_BIN="$BIN_DIR/heimdall-haid"
+
+BODY_MAX=4000
+EVIDENCE_MAX=2000
+SUBJECT_MAX=200
+
+usage() { sed -n '2,73p' "$0" | sed 's/^# \{0,1\}//'; }
+
+_timestamp() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+_toplevel()  { git rev-parse --show-toplevel 2>/dev/null; }
+
+# Portable timeout — bash 3.2/macOS ships no timeout(1); alarm+exec via perl,
+# same pattern as bin/heimdall-checkpoint:108 (_bounded). Falls back to a
+# direct call if perl is somehow unavailable, so this can never itself hang
+# the caller waiting on a missing interpreter.
+_bounded() { # <secs> <cmd...>
+  local secs="$1"; shift
+  if command -v perl >/dev/null 2>&1; then
+    perl -e 'alarm shift; exec @ARGV' "$secs" "$@"
+  else
+    "$@"
+  fi
+}
+
+# Same guard as bin/heimdall-wip-commit:39-41 — a project that opted out of
+# auto-commits stays opted out, for every mechanical tool alike.
+_no_autocommit() { # <toplevel>
+  [ -f "$1/.heimdall-no-autocommit" ] || [ -f "$1/.superx-no-autocommit" ]
+}
+
+# Verbatim from bin/heimdall-activity:156 (also bin/heimdall-gate-surface,
+# bin/heimdall-claim) — duplicated by convention in this codebase rather than
+# shared via bin/lib, so matching the existing duplication, not inventing a
+# new slugging rule.
+haid_slug() { printf '%s' "$1" | tr '/:' '__'; }
+
+# Resolution order matches bin/heimdall-activity:144-153 (HEIMDALL_HAID wins,
+# else `heimdall-haid current`), with one deliberate divergence: on failure
+# heimdall-activity hard-exits (coordination correctness needs a real
+# identity); this tool falls back to a local slug instead, because a journal
+# entry is still worth keeping even when HAID resolution is unavailable, and
+# per the header note above, this tool must never block the caller's task.
+_resolve_haid() {
+  if [ -n "${HEIMDALL_HAID:-}" ]; then
+    printf '%s' "$HEIMDALL_HAID"
+    return 0
+  fi
+  if [ -x "$HAID_BIN" ]; then
+    local h
+    h="$(_bounded 5 "$HAID_BIN" current 2>/dev/null)"
+    if [ -n "$h" ]; then
+      printf '%s' "$h"
+      return 0
+    fi
+  fi
+  printf 'local.%s' "$(whoami 2>/dev/null || echo unknown)"
+}
+
+# <input> -> canonical UPPER type on stdout, or nonzero if not recognized.
+_normalize_type() {
+  local t
+  t="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  case "$t" in
+    finding) printf 'FINDING' ;;
+    decision) printf 'DECISION' ;;
+    correction|refuted) printf 'CORRECTION' ;;
+    communication) printf 'COMMUNICATION' ;;
+    *) printf 'UNKNOWN' ;;
+  esac
+}
+
+# [--date D] [--haid H] -> prints the deterministic journal file path.
+_resolve_file() {
+  local d="" h=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --date) d="${2:-}"; shift 2 ;;
+      --haid) h="${2:-}"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  [ -n "$d" ] || d="$(date -u +%Y-%m-%d)"
+  [ -n "$h" ] || h="$(_resolve_haid)"
+  local top
+  top="$(_toplevel)" || return 1
+  printf '%s/.planning/journal/%s-%s.md' "$top" "$d" "$(haid_slug "$h")"
+}
+
+cmd_add() {
+  local type_in="" subject=""
+  if [ $# -ge 1 ]; then type_in="$1"; shift; fi
+  if [ $# -ge 1 ]; then subject="$1"; shift; fi
+
+  local body="" evidence="" by="" have_body=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --body) body="${2:?--body needs a value}"; have_body=1; shift 2 ;;
+      --evidence) evidence="${2:?--evidence needs a value}"; shift 2 ;;
+      --by) by="${2:?--by needs a value}"; shift 2 ;;
+      *) echo "heimdall-journal: add: unknown flag: $1" >&2; return 2 ;;
+    esac
+  done
+
+  [ -n "$type_in" ] || { echo "heimdall-journal: add: type required (finding|decision|correction|communication)" >&2; return 2; }
+
+  local type
+  type="$(_normalize_type "$type_in")" || {
+    echo "heimdall-journal: add: invalid type '$type_in' — want finding|decision|correction|communication ('refuted' aliases to correction)" >&2
+    return 2
+  }
+
+  [ -n "$subject" ] || { echo "heimdall-journal: add: subject required" >&2; return 2; }
+  case "$subject" in *$'\n'*) echo "heimdall-journal: add: subject must be a single line" >&2; return 2 ;; esac
+  [ "${#subject}" -le "$SUBJECT_MAX" ] || { echo "heimdall-journal: add: subject exceeds ${SUBJECT_MAX} chars" >&2; return 2; }
+
+  if [ "$have_body" -eq 0 ]; then
+    if [ -t 0 ]; then
+      echo "heimdall-journal: add: --body required (or pipe body on stdin)" >&2
+      return 2
+    fi
+    body="$(_bounded 5 cat)"
+  fi
+  [ -n "$body" ] || { echo "heimdall-journal: add: body must not be empty" >&2; return 2; }
+  [ "${#body}" -le "$BODY_MAX" ] || { echo "heimdall-journal: add: body exceeds ${BODY_MAX} chars (${#body} given)" >&2; return 2; }
+  if [ -n "$evidence" ] && [ "${#evidence}" -gt "$EVIDENCE_MAX" ]; then
+    echo "heimdall-journal: add: evidence exceeds ${EVIDENCE_MAX} chars" >&2
+    return 2
+  fi
+
+  local top
+  top="$(_toplevel)" || { echo "heimdall-journal: not a git repo" >&2; return 1; }
+  local haid
+  haid="$(_resolve_haid)"
+  [ -n "$by" ] || by="$haid"
+  local date slug jdir file
+  date="$(date -u +%Y-%m-%d)"
+  slug="$(haid_slug "$haid")"
+  jdir="$top/.planning/journal"
+  file="$jdir/${date}-${slug}.md"
+
+  mkdir -p "$jdir" 2>/dev/null || { echo "heimdall-journal: add: cannot create $jdir" >&2; return 1; }
+
+  local is_new=0
+  [ -f "$file" ] || is_new=1
+
+  local ts
+  ts="$(_timestamp)"
+  {
+    [ "$is_new" -eq 1 ] && printf '# Journal — %s — %s\n\n' "$date" "$haid"
+    printf '## %s — [%s] %s\n\n' "$ts" "$type" "$subject"
+    printf '%s\n' "$body"
+    [ -n "$evidence" ] && printf '\n**Evidence:** %s\n' "$evidence"
+    printf '**By:** %s\n\n' "$by"
+  } >> "$file" || { echo "heimdall-journal: add: write failed: $file" >&2; return 1; }
+
+  if _no_autocommit "$top"; then
+    printf '%s\n' "$file"
+    return 0
+  fi
+
+  if ! git add "$file" >/dev/null 2>&1 || \
+     ! git commit -m "journal: [$type] $subject" \
+       -m "heimdall-journal: mechanical narrative entry" \
+       -m "Co-Authored-By: hmd <hmd@runheimdall.dev>" --no-verify >/dev/null 2>&1; then
+    echo "heimdall-journal: add: warning: entry written but commit failed (dirty index/lock?) — commit $file manually" >&2
+  fi
+
+  printf '%s\n' "$file"
+  return 0
+}
+
+cmd_today() {
+  local f
+  f="$(_resolve_file "$@")" || { echo "heimdall-journal: not a git repo" >&2; return 1; }
+  [ -f "$f" ] && cat "$f"
+  return 0
+}
+
+cmd_path() {
+  local f
+  f="$(_resolve_file "$@")" || { echo "heimdall-journal: not a git repo" >&2; return 1; }
+  printf '%s\n' "$f"
+}
+
+cmd_grep() {
+  local pattern="${1:-}"
+  [ -n "$pattern" ] || { echo "heimdall-journal: grep: pattern required" >&2; return 2; }
+  local top jdir
+  top="$(_toplevel)" || { echo "heimdall-journal: not a git repo" >&2; return 1; }
+  jdir="$top/.planning/journal"
+  [ -d "$jdir" ] || return 1
+  grep -n -- "$pattern" "$jdir"/*.md 2>/dev/null
+}
+
+# Cross-file, chronological (best-effort under second-resolution timestamps):
+# split every file into per-entry blocks, name each temp block file by its
+# entry's own timestamp (zero-padded tiebreakers for source-file order and
+# in-file line order so `ls | sort` is a correct total order even past 9
+# files or 9 entries — a plain unpadded NR/idx sorts "10" before "2"), then
+# print the newest N. Pure POSIX awk/sort/ls — no bash4-only features.
+cmd_tail() {
+  local n="${1:-10}"
+  case "$n" in ''|*[!0-9]*) n=10 ;; esac
+  local top jdir
+  top="$(_toplevel)" || { echo "heimdall-journal: not a git repo" >&2; return 1; }
+  jdir="$top/.planning/journal"
+  [ -d "$jdir" ] || return 0
+
+  local tmp
+  tmp="$(mktemp -d)" || return 1
+  local f idx=0
+  for f in "$jdir"/*.md; do
+    [ -f "$f" ] || continue
+    idx=$((idx + 1))
+    awk -v tmp="$tmp" -v idx="$idx" '
+      function flush() { if (block != "") { print block > outfile; close(outfile) } }
+      BEGIN { block = ""; started = 0 }
+      /^## / {
+        flush()
+        started = 1
+        rest = $0; sub(/^## /, "", rest)
+        split(rest, a, " ")
+        ts = a[1]
+        gsub(/[^0-9TZ.:-]/, "", ts)
+        outfile = tmp "/" ts "__" sprintf("%05d", idx) "__" sprintf("%08d", NR) ".block"
+        block = $0 "\n"
+        next
+      }
+      { if (started) block = block $0 "\n" }
+      END { flush() }
+    ' "$f"
+  done
+  ls "$tmp" 2>/dev/null | sort | tail -n "$n" | while IFS= read -r bf; do
+    cat "$tmp/$bf"
+    echo
+  done
+  rm -rf "$tmp"
+  return 0
+}
+
+case "${1:-}" in
+  add) shift; cmd_add "$@" ;;
+  today) shift; cmd_today "$@" ;;
+  tail) shift; cmd_tail "$@" ;;
+  grep) shift; cmd_grep "$@" ;;
+  path) shift; cmd_path "$@" ;;
+  -h|--help|help|"") usage ;;
+  *) echo "heimdall-journal: unknown subcommand: $1" >&2; usage >&2; exit 2 ;;
+esac
