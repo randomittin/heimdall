@@ -1,0 +1,493 @@
+#!/usr/bin/env bash
+# heimdall-quota-resume — detect a QUOTA-EXHAUSTION agent termination, capture
+# exactly what was already done, and tell the NEXT session precisely when and
+# where to pick back up. No LLM involved anywhere in this file.
+#
+# WHY THIS EXISTS
+#   An agent dies mid-task with everything uncommitted when Claude's own
+#   usage/session/weekly limit is hit:
+#
+#     Agent terminated early due to an API error: You've hit your session
+#     limit · resets 12:40pm (Asia/Calcutta)
+#
+#   Before this tool, resumption was entirely manual: a human had to notice,
+#   then someone had to inspect each affected worktree by hand and reconstruct
+#   what was already done. That reconstruction is the expensive part, and it
+#   is pure mechanical archaeology — git already has the answer.
+#
+#   This tool automates the parts that are genuinely automatable:
+#     1. CLASSIFY the termination text conservatively (bin/lib/quota_stop.py) —
+#        both the Claude-specific "hit your ... limit" phrase AND a well-formed
+#        "resets H:MMam/pm (TZ)" clause must be present. Either alone is
+#        "unknown", and `record` REFUSES to write state for "unknown" text.
+#        See quota_stop.py's module docstring for why that refusal is the
+#        deliberately conservative default.
+#     2. RESOLVE the reset clause to an absolute, timezone-correct epoch
+#        (stdlib zoneinfo — handles "already passed today -> tomorrow" and DST
+#        without BSD/GNU `date` portability problems).
+#     3. RECORD losslessly what was already done: branch, HEAD, commits ahead
+#        of main, every uncommitted file — by reusing bin/heimdall-checkpoint
+#        (best-effort) and bin/lib/real-home.sh, not reimplementing them.
+#     4. SURFACE it at the next SessionStart, silently, UNLESS the window has
+#        actually reopened — mirroring bin/heimdall-maintain-loop's
+#        resume-hint contract: print nothing unless there is something truly
+#        ready to act on. No nagging every session while still waiting.
+#
+# THE HONEST BOUNDARY (read this before assuming more than it delivers)
+#   Heimdall runs INSIDE a Claude Code session. A session that was killed by a
+#   quota error cannot resurrect itself — nothing running inside a dead
+#   process can restart that process. What IS genuinely automatic:
+#     - detecting the stop and computing the exact reset instant correctly
+#     - capturing full, lossless state the MOMENT the stop is observed
+#     - surfacing a precise, silent-unless-ready hint the instant the NEXT
+#       session starts, so a human (or an orchestrator) needs zero
+#       reconstruction to resume
+#     - (optional, `schedule` subcommand, opt-in) a wall-clock OS notification
+#       when the window reopens — still never launches an agent unattended
+#   What is NOT automatic, and this tool does not pretend otherwise: nobody
+#   and nothing restarts the Claude Code process itself. A checkpoint that
+#   makes the next manual start zero-cost is the honest ceiling here.
+#
+# USAGE
+#   heimdall-quota-resume classify [--text T | --file F]        (stdin if neither)
+#   heimdall-quota-resume record --repo DIR [--text T | --file F | --transcript P]
+#                                                                (stdin if none)
+#   heimdall-quota-resume status --repo DIR [--json]
+#   heimdall-quota-resume resume-hint --repo DIR
+#   heimdall-quota-resume clear --repo DIR
+#   heimdall-quota-resume schedule install|uninstall|status|run-now --repo DIR
+#   heimdall-quota-resume help
+#
+# EXIT STATUS
+#   classify     0 quota / 1 unknown (safe default) / 64 usage / 2 no python3
+#   record       0 recorded / 1 REFUSED (not classified as quota — no state
+#                  written; conservative default: treat as a genuine failure,
+#                  not a retryable one) / 64 usage / 2 no python3
+#   status       0 always (absence of a record is informational, not an error)
+#   resume-hint  0 always (never breaks the SessionStart hook chain)
+#   clear        0 always (cleared, or a clean no-op if nothing to clear)
+#
+# STATE (gitignored runtime state, same directory as RESUME-KEY.json/settings.json)
+#   <repo>/.planning/QUOTA-STOP.json      current/latest record
+#   $(rc_home <repo>)/quota-stop.ndjson   append-only audit trail (one line/event)
+#
+# ENV SEAMS (tests only)
+#   HEIMDALL_HOME                 relocates the ndjson audit log (via rc_home)
+#   HEIMDALL_QUOTA_NOW_EPOCH      freezes "now" for classify/record/status/
+#                                 resume-hint — the ONLY way this file's
+#                                 waiting-vs-ready logic is deterministically
+#                                 testable without sleeping for real time
+#   HEIMDALL_QUOTA_SKEW_SECONDS   overrides the clock-skew tolerance (default 120)
+
+set -uo pipefail
+
+_QS_SELF="$0"
+command -v readlink >/dev/null 2>&1 && \
+  _QS_SELF="$(readlink -f "$0" 2>/dev/null || readlink "$0" 2>/dev/null || echo "$0")"
+QS_BIN_DIR="$(cd "$(dirname "$_QS_SELF")" 2>/dev/null && pwd)"
+QS_LIB_DIR="$QS_BIN_DIR/lib"
+
+# rc_home() (the ${HEIMDALL_HOME:-<repo>/.heimdall} resolution) is shared with
+# bin/heimdall-checkpoint / bin/heimdall-resume-probe via this file. Reused
+# here, not reimplemented — but non-fatal if absent, since this tool's core
+# value (classify/record/status/resume-hint) does not depend on it; only the
+# audit-log path does, and that has an inline fallback below.
+if [ -r "$QS_LIB_DIR/resume-contract.sh" ]; then
+  . "$QS_LIB_DIR/resume-contract.sh"
+fi
+if ! command -v rc_home >/dev/null 2>&1; then
+  rc_home() { if [ -n "${HEIMDALL_HOME:-}" ]; then printf '%s' "$HEIMDALL_HOME"; else printf '%s/.heimdall' "$1"; fi; }
+fi
+
+QS_PY="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)"
+
+_qs_now_epoch() { printf '%s' "${HEIMDALL_QUOTA_NOW_EPOCH:-$(date +%s 2>/dev/null || echo 0)}"; }
+_qs_skew()      { printf '%s' "${HEIMDALL_QUOTA_SKEW_SECONDS:-120}"; }
+
+# Git state capture (mechanical, mirrors bin/heimdall-checkpoint's _scan_facts
+# style): what branch, what HEAD, how far ahead of main, what is uncommitted.
+# Sets QS_BRANCH QS_HEAD QS_BASE QS_MERGE_BASE QS_AHEAD QS_UNCOMMITTED_COUNT
+# QS_UNCOMMITTED_FILES QS_EPHEMERAL.
+_qs_scan_git() { # <repo>
+  local repo="$1" changed
+  QS_BRANCH="unknown"; QS_HEAD="none"; QS_BASE="main"; QS_MERGE_BASE=""
+  QS_AHEAD=0; QS_UNCOMMITTED_COUNT=0; QS_UNCOMMITTED_FILES=""; QS_EPHEMERAL="false"
+
+  git -C "$repo" rev-parse --git-dir >/dev/null 2>&1 || return 0
+
+  QS_BRANCH="$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
+  QS_HEAD="$(git -C "$repo" rev-parse --short HEAD 2>/dev/null || echo none)"
+
+  if git -C "$repo" rev-parse --verify --quiet refs/heads/main >/dev/null 2>&1; then
+    QS_BASE="main"
+  elif git -C "$repo" rev-parse --verify --quiet refs/heads/master >/dev/null 2>&1; then
+    QS_BASE="master"
+  else
+    QS_BASE="$QS_BRANCH"
+  fi
+
+  QS_MERGE_BASE="$(git -C "$repo" merge-base "$QS_BASE" HEAD 2>/dev/null || echo "")"
+  QS_AHEAD="$(git -C "$repo" rev-list --count "$QS_BASE..HEAD" 2>/dev/null || echo 0)"
+  [ -n "$QS_AHEAD" ] || QS_AHEAD=0
+
+  changed="$(git -C "$repo" status --porcelain 2>/dev/null)"
+  QS_UNCOMMITTED_COUNT="$(printf '%s\n' "$changed" | grep -c .)"
+  [ -n "$QS_UNCOMMITTED_COUNT" ] || QS_UNCOMMITTED_COUNT=0
+  QS_UNCOMMITTED_FILES="$(printf '%s\n' "$changed" | head -20 | awk '{ $1=""; sub(/^ /,""); print }')"
+
+  if [ -r "$QS_LIB_DIR/real-home.sh" ]; then
+    . "$QS_LIB_DIR/real-home.sh"
+    if command -v heimdall_path_is_ephemeral >/dev/null 2>&1 && heimdall_path_is_ephemeral "$repo" 2>/dev/null; then
+      QS_EPHEMERAL="true"
+    fi
+  fi
+}
+
+cmd_classify() {
+  [ -n "$QS_PY" ] || { echo "[heimdall-quota-resume] no python3/python on PATH — cannot classify" >&2; return 2; }
+  local text="" text_set=0 file=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --text) text="$2"; text_set=1; shift 2 ;;
+      --file) file="$2"; shift 2 ;;
+      *) echo "[heimdall-quota-resume] unknown arg: $1" >&2; return 64 ;;
+    esac
+  done
+  if [ "$text_set" = 1 ]; then
+    printf '%s' "$text" | "$QS_PY" "$QS_LIB_DIR/quota_stop.py" classify
+  elif [ -n "$file" ]; then
+    "$QS_PY" "$QS_LIB_DIR/quota_stop.py" classify --file "$file"
+  else
+    "$QS_PY" "$QS_LIB_DIR/quota_stop.py" classify
+  fi
+}
+
+cmd_record() {
+  [ -n "$QS_PY" ] || { echo "[heimdall-quota-resume] no python3/python on PATH — cannot classify, refusing to record" >&2; return 2; }
+  local repo="" text="" text_set=0 file="" transcript=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repo) repo="$2"; shift 2 ;;
+      --text) text="$2"; text_set=1; shift 2 ;;
+      --file) file="$2"; shift 2 ;;
+      --transcript) transcript="$2"; shift 2 ;;
+      *) echo "[heimdall-quota-resume] unknown arg: $1" >&2; return 64 ;;
+    esac
+  done
+  [ -n "$repo" ] || repo="$PWD"
+  repo="$(cd "$repo" 2>/dev/null && pwd)" || { echo "[heimdall-quota-resume] no such repo dir" >&2; return 64; }
+
+  if [ "$text_set" = 1 ]; then
+    :
+  elif [ -n "$file" ]; then
+    text="$(cat "$file" 2>/dev/null)"
+  elif [ -n "$transcript" ]; then
+    # Best-effort JSONL scan: each line is one JSON record, so a plain grep for
+    # the anchor phrase finds it inside an escaped string field without a full
+    # JSON parse. Takes the LAST match (most recent). No match -> empty text
+    # -> classifies "unknown" below -> record refuses. Fails closed, not open.
+    text="$(grep -E 'hit your [a-zA-Z0-9 -]{0,24}limit' "$transcript" 2>/dev/null | tail -1)"
+  else
+    text="$(cat)"
+  fi
+
+  local now skew detect_out detect_rc
+  now="$(_qs_now_epoch)"
+  skew="$(_qs_skew)"
+  detect_out="$(printf '%s' "$text" | "$QS_PY" "$QS_LIB_DIR/quota_stop.py" detect --now "$now" --skew "$skew")"
+  detect_rc=$?
+  if [ -z "$detect_out" ]; then
+    echo "[heimdall-quota-resume] classifier produced no output (detect_rc=$detect_rc) — refusing to record" >&2
+    return 1
+  fi
+
+  local cls anchor resetclause
+  cls="$(printf '%s' "$detect_out" | jq -r '.class' 2>/dev/null)"
+  if [ "$cls" != "quota" ]; then
+    anchor="$(printf '%s' "$detect_out" | jq -r '.anchor_matched' 2>/dev/null)"
+    resetclause="$(printf '%s' "$detect_out" | jq -r '.reset_clause_matched' 2>/dev/null)"
+    echo "[heimdall-quota-resume] text does not match the quota-stop pattern (anchor_matched=$anchor reset_clause_matched=$resetclause) — REFUSING to record. This may be a genuine failure that needs a human, not a retryable quota window. No state was written." >&2
+    return 1
+  fi
+
+  # Scan git state FIRST, before anything else touches the worktree — this
+  # must reflect exactly what the dying agent left behind, not any side
+  # effect of this tool's own best-effort calls below (heimdall-checkpoint
+  # write creates/updates .planning/CHECKPOINT.md; scanning after that would
+  # misreport our own output as the agent's uncommitted work).
+  _qs_scan_git "$repo"
+
+  # Best-effort: refresh the mechanical checkpoint too. Reused, not
+  # duplicated — bin/heimdall-checkpoint already captures goal/phase/gate
+  # state/worktree ledger; this tool only adds the quota-specific fields
+  # (reset time, raw detection text) that heimdall-checkpoint has no concept of.
+  if [ -x "$QS_BIN_DIR/heimdall-checkpoint" ]; then
+    "$QS_BIN_DIR/heimdall-checkpoint" write "$repo" >/dev/null 2>&1 || true
+  fi
+
+  local planning state ts_iso
+  planning="$repo/.planning"
+  mkdir -p "$planning" 2>/dev/null || { echo "[heimdall-quota-resume] cannot create $planning" >&2; return 1; }
+  state="$planning/QUOTA-STOP.json"
+  ts_iso="$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo unknown)"
+
+  local reset_local reset_tz resolved reset_epoch reset_iso rolled resolve_err raw_trunc files_json
+  reset_local="$(printf '%s' "$detect_out" | jq -r '.reset_local')"
+  reset_tz="$(printf '%s' "$detect_out" | jq -r '.reset_tz')"
+  resolved="$(printf '%s' "$detect_out" | jq -r '.resolved')"
+  reset_epoch="$(printf '%s' "$detect_out" | jq -r '.reset_epoch')"
+  reset_iso="$(printf '%s' "$detect_out" | jq -r '.reset_iso')"
+  rolled="$(printf '%s' "$detect_out" | jq -r '.rolled_to_tomorrow')"
+  resolve_err="$(printf '%s' "$detect_out" | jq -r '.error')"
+  raw_trunc="$(printf '%s' "$text" | cut -c1-500)"
+  files_json="$(printf '%s\n' "$QS_UNCOMMITTED_FILES" | jq -R -s 'split("\n") | map(select(length>0))' 2>/dev/null)"
+  [ -n "$files_json" ] || files_json="[]"
+
+  jq -n \
+    --arg schema "hmd-quota-stop@1" \
+    --arg detected_at "$ts_iso" \
+    --argjson detected_epoch "$now" \
+    --arg raw_text "$raw_trunc" \
+    --arg reset_local "$reset_local" \
+    --arg reset_tz "$reset_tz" \
+    --argjson resolved "${resolved:-false}" \
+    --arg reset_epoch_s "$reset_epoch" \
+    --arg reset_iso_s "$reset_iso" \
+    --arg rolled_s "$rolled" \
+    --arg resolve_error_s "$resolve_err" \
+    --arg repo "$repo" \
+    --argjson worktree_ephemeral "${QS_EPHEMERAL:-false}" \
+    --arg branch "$QS_BRANCH" \
+    --arg head_sha "$QS_HEAD" \
+    --arg base_branch "$QS_BASE" \
+    --arg merge_base "$QS_MERGE_BASE" \
+    --argjson commits_ahead "${QS_AHEAD:-0}" \
+    --argjson uncommitted_count "${QS_UNCOMMITTED_COUNT:-0}" \
+    --argjson uncommitted_files "$files_json" \
+    '{
+      schema: $schema,
+      detected_at: $detected_at,
+      detected_epoch: $detected_epoch,
+      raw_text: $raw_text,
+      reset_local: $reset_local,
+      reset_tz: $reset_tz,
+      resolved: $resolved,
+      reset_epoch: (if $reset_epoch_s == "null" or $reset_epoch_s == "" then null else ($reset_epoch_s | tonumber) end),
+      reset_iso: (if $reset_iso_s == "null" then null else $reset_iso_s end),
+      rolled_to_tomorrow: (if $rolled_s == "true" then true elif $rolled_s == "false" then false else null end),
+      resolve_error: (if $resolve_error_s == "null" then null else $resolve_error_s end),
+      repo: $repo,
+      worktree_ephemeral: $worktree_ephemeral,
+      branch: $branch,
+      head_sha: $head_sha,
+      base_branch: $base_branch,
+      merge_base: $merge_base,
+      commits_ahead_of_main: $commits_ahead,
+      uncommitted_count: $uncommitted_count,
+      uncommitted_files: $uncommitted_files,
+      status: "waiting"
+    }' > "$state.tmp" && mv "$state.tmp" "$state" || { rm -f "$state.tmp" 2>/dev/null; echo "[heimdall-quota-resume] failed to write $state" >&2; return 1; }
+
+  local home ndjson
+  home="$(rc_home "$repo")"
+  mkdir -p "$home" 2>/dev/null || true
+  ndjson="$home/quota-stop.ndjson"
+  jq -c '.' "$state" >> "$ndjson" 2>/dev/null || true
+
+  if [ "$resolved" = "true" ]; then
+    echo "[heimdall-quota-resume] recorded quota stop on branch '$QS_BRANCH' — resets $reset_local ($reset_tz) [$reset_iso]; state at $state"
+  else
+    echo "[heimdall-quota-resume] recorded quota stop on branch '$QS_BRANCH' — reset time COULD NOT BE RESOLVED ($resolve_err); state at $state. resume-hint will surface this every session until 'clear' is run." >&2
+  fi
+  return 0
+}
+
+cmd_status() {
+  local repo="" json=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repo) repo="$2"; shift 2 ;;
+      --json) json=1; shift ;;
+      *) echo "[heimdall-quota-resume] unknown arg: $1" >&2; return 64 ;;
+    esac
+  done
+  [ -n "$repo" ] || repo="$PWD"
+  repo="$(cd "$repo" 2>/dev/null && pwd)" || { echo "[heimdall-quota-resume] no such repo dir" >&2; return 64; }
+
+  local state="$repo/.planning/QUOTA-STOP.json"
+  if [ ! -f "$state" ]; then
+    if [ "$json" = 1 ]; then printf '{}\n'; else echo "[heimdall-quota-resume] no quota stop on record for $repo"; fi
+    return 0
+  fi
+  if [ "$json" = 1 ]; then cat "$state"; return 0; fi
+
+  local status resolved reset_epoch reset_local reset_tz branch now
+  status="$(jq -r '.status' "$state" 2>/dev/null)"
+  if [ "$status" = "cleared" ]; then
+    branch="$(jq -r '.branch' "$state" 2>/dev/null)"
+    echo "[heimdall-quota-resume] no active quota stop (last one on branch '$branch' was cleared at $(jq -r '.cleared_at // "unknown"' "$state" 2>/dev/null))"
+    return 0
+  fi
+
+  resolved="$(jq -r '.resolved' "$state" 2>/dev/null)"
+  reset_epoch="$(jq -r '.reset_epoch' "$state" 2>/dev/null)"
+  reset_local="$(jq -r '.reset_local' "$state" 2>/dev/null)"
+  reset_tz="$(jq -r '.reset_tz' "$state" 2>/dev/null)"
+  branch="$(jq -r '.branch' "$state" 2>/dev/null)"
+  now="$(_qs_now_epoch)"
+
+  if [ "$resolved" != "true" ] || [ "$reset_epoch" = "null" ] || [ -z "$reset_epoch" ]; then
+    echo "[heimdall-quota-resume] UNKNOWN READY-TIME — quota stop detected on branch '$branch' but the reset time could not be parsed ($(jq -r '.resolve_error // "no detail"' "$state" 2>/dev/null)). Check manually."
+    return 0
+  fi
+
+  if [ "$now" -ge "$reset_epoch" ] 2>/dev/null; then
+    echo "[heimdall-quota-resume] READY — quota window should be open now (was due $reset_local $reset_tz on branch '$branch'). Resume: cd $repo && git status"
+  else
+    local remain h m
+    remain=$((reset_epoch - now))
+    h=$((remain / 3600)); m=$(((remain % 3600) / 60))
+    echo "[heimdall-quota-resume] WAITING — resets $reset_local ($reset_tz) on branch '$branch', in ${h}h ${m}m"
+  fi
+  return 0
+}
+
+# resume-hint — mirrors bin/heimdall-maintain-loop's contract: print NOTHING
+# unless there is something a session start genuinely needs to act on. Silent
+# while waiting (no nagging every session); speaks up exactly once the window
+# is ready, and also (the one deliberate exception — see header) when the
+# reset time could never be computed at all, since staying silent there would
+# mean this record is NEVER surfaced again by any mechanism.
+cmd_resume_hint() {
+  local repo=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repo) repo="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  [ -n "$repo" ] || repo="$PWD"
+  repo="$(cd "$repo" 2>/dev/null && pwd)" || return 0
+
+  local state="$repo/.planning/QUOTA-STOP.json"
+  [ -f "$state" ] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+
+  local status
+  status="$(jq -r '.status' "$state" 2>/dev/null)"
+  [ "$status" = "waiting" ] || return 0
+
+  local resolved reset_epoch reset_local reset_tz branch base_branch head_sha uncommitted ahead worktree_ephemeral now
+  resolved="$(jq -r '.resolved' "$state" 2>/dev/null)"
+  reset_epoch="$(jq -r '.reset_epoch' "$state" 2>/dev/null)"
+  reset_local="$(jq -r '.reset_local' "$state" 2>/dev/null)"
+  reset_tz="$(jq -r '.reset_tz' "$state" 2>/dev/null)"
+  branch="$(jq -r '.branch' "$state" 2>/dev/null)"
+  head_sha="$(jq -r '.head_sha' "$state" 2>/dev/null)"
+  base_branch="$(jq -r '.base_branch' "$state" 2>/dev/null)"
+  uncommitted="$(jq -r '.uncommitted_count' "$state" 2>/dev/null)"
+  ahead="$(jq -r '.commits_ahead_of_main' "$state" 2>/dev/null)"
+  worktree_ephemeral="$(jq -r '.worktree_ephemeral' "$state" 2>/dev/null)"
+  now="$(_qs_now_epoch)"
+
+  if [ "$resolved" != "true" ] || [ "$reset_epoch" = "null" ] || [ -z "$reset_epoch" ]; then
+    echo "[heimdall] QUOTA STOP recorded on branch '$branch' but its reset time could not be parsed ($(jq -r '.resolve_error // "no detail"' "$state" 2>/dev/null)) — resume-hint cannot compute readiness automatically. Check manually: heimdall-quota-resume status --repo \"$repo\"; then heimdall-quota-resume clear --repo \"$repo\" once resolved."
+    return 0
+  fi
+
+  [ "$now" -ge "$reset_epoch" ] 2>/dev/null || return 0
+
+  local where=""
+  [ "$worktree_ephemeral" = "true" ] && where=" (ephemeral worktree)"
+  echo "[heimdall] QUOTA WINDOW SHOULD BE OPEN — stopped on branch '$branch' at $head_sha$where, reset was due $reset_local ($reset_tz): $ahead commit(s) not on $base_branch, $uncommitted file(s) uncommitted. Resume: cd \"$repo\" && git status --porcelain. Then: heimdall-quota-resume clear --repo \"$repo\" once you've picked it back up."
+  return 0
+}
+
+cmd_clear() {
+  local repo=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repo) repo="$2"; shift 2 ;;
+      *) echo "[heimdall-quota-resume] unknown arg: $1" >&2; return 64 ;;
+    esac
+  done
+  [ -n "$repo" ] || repo="$PWD"
+  repo="$(cd "$repo" 2>/dev/null && pwd)" || { echo "[heimdall-quota-resume] no such repo dir" >&2; return 64; }
+
+  local state="$repo/.planning/QUOTA-STOP.json"
+  [ -f "$state" ] || { echo "[heimdall-quota-resume] no record to clear for $repo"; return 0; }
+
+  local ts
+  ts="$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo unknown)"
+  jq --arg ts "$ts" '.status = "cleared" | .cleared_at = $ts' "$state" > "$state.tmp" 2>/dev/null \
+    && mv "$state.tmp" "$state" \
+    || { rm -f "$state.tmp" 2>/dev/null; echo "[heimdall-quota-resume] failed to update $state" >&2; return 1; }
+  echo "[heimdall-quota-resume] cleared quota-stop record for $repo"
+  return 0
+}
+
+case "${1:-help}" in
+  classify)     shift; cmd_classify "$@" ;;
+  record)       shift; cmd_record "$@" ;;
+  status)       shift; cmd_status "$@" ;;
+  resume-hint)  shift; cmd_resume_hint "$@" ;;
+  clear)        shift; cmd_clear "$@" ;;
+  schedule)
+    shift
+    SCHED="$QS_BIN_DIR/heimdall-quota-resume-schedule"
+    if [ -x "$SCHED" ]; then
+      exec "$SCHED" "$@"
+    else
+      echo "[heimdall-quota-resume] schedule subcommand not installed on this checkout ($SCHED missing) — the SessionStart resume-hint still works without it, this only adds an opt-in wall-clock OS notification." >&2
+      exit 1
+    fi
+    ;;
+  help|--help|-h)
+    cat <<'USAGE'
+heimdall-quota-resume — detect a QUOTA-EXHAUSTION agent termination, capture
+what was already done, and surface a precise resume hint at the next session.
+
+Usage:
+  heimdall-quota-resume classify [--text T | --file F]     (stdin if neither)
+      Ad hoc: classify raw text. Prints JSON. Exit 0=quota 1=unknown.
+
+  heimdall-quota-resume record --repo DIR [--text T | --file F | --transcript P]
+      The real entry point: an orchestrator (or a human) that just observed
+      an "Agent terminated early ... hit your ... limit ... resets ..."
+      message pipes that text in here. Classifies it; if and only if it is
+      confidently a quota stop, captures full git state (branch, HEAD,
+      commits ahead of main, every uncommitted file) and writes
+      .planning/QUOTA-STOP.json + an audit line to $HEIMDALL_HOME/quota-stop.ndjson.
+      REFUSES (exit 1, writes nothing) for anything not confidently a quota
+      stop — a generic failure is left for a human, not silently retried.
+
+  heimdall-quota-resume status --repo DIR [--json]
+      Human-readable (or --json) read of the current record: no record /
+      WAITING (with time remaining) / READY / UNKNOWN READY-TIME.
+
+  heimdall-quota-resume resume-hint --repo DIR
+      Wired into hooks.json SessionStart. Prints NOTHING unless the window
+      has genuinely reopened (or the reset time could never be parsed) —
+      silent while still waiting, so it never nags.
+
+  heimdall-quota-resume clear --repo DIR
+      Mark the current record resolved once you've resumed. Safe no-op if
+      there is nothing to clear.
+
+  heimdall-quota-resume schedule install|uninstall|status|run-now --repo DIR
+      OPT-IN. A one-shot macOS launchd alarm at the resolved reset instant
+      that fires a local OS notification — never launches an agent. See
+      bin/heimdall-quota-resume-schedule for the honesty boundary on this
+      piece specifically. Not installed by anything automatically.
+
+THE HONEST BOUNDARY: nothing in this file, or in `schedule`, restarts a dead
+Claude Code session. That requires a human (or an external orchestrator) to
+start a new one. What this tool guarantees is that the moment they do, zero
+reconstruction is needed — the state is already there, precisely.
+USAGE
+    ;;
+  *)
+    echo "Unknown command: ${1}. Try: heimdall-quota-resume help" >&2
+    exit 1
+    ;;
+esac
