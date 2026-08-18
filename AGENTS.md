@@ -6,9 +6,13 @@ we sell. Read this before your first edit.
 ## The rules that actually block you
 
 - **No stub, placeholder, TODO, or skeleton code.** A `PreToolUse` hook scans every
-  write for unfinished code shapes (empty bodies, not-implemented throws, `# TODO`
-  comments) and refuses the write. If you cannot implement something fully, say so —
-  faking it is the one failure mode this repo exists to catch.
+  Claude Code write for unfinished code shapes (empty bodies, not-implemented
+  throws, `# TODO` comments) and refuses the write — but that hook only fires
+  inside a live Claude Code session. `bin/heimdall-gate-run`'s `pre-commit` phase
+  backs it up at the git layer: it re-scans the staged diff against the same
+  shared shapes (`bin/lib/heimdall-stub-patterns.sh`), so the ban holds no matter
+  which tool — or human — makes the commit. If you cannot implement something
+  fully, say so — faking it is the one failure mode this repo exists to catch.
 - **Tests are bash.** One file per surface: `test/<name>.test.sh`, run with
   `bash test/<name>.test.sh`. Exit 0 = green. A test prints `PASS`/`FAIL` lines and a
   count. Follow the shape of a neighbouring test rather than inventing a harness.
