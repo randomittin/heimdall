@@ -27,6 +27,60 @@
 # statusLine command degrades ("previous text is kept") — Cursor's own contract,
 # not ours to fake.
 #
+# TIMING VALUES — timeoutMs=3000, updateIntervalMs=3000 (both now explicit; before
+# this, updateIntervalMs=2000 was explicit but timeoutMs was OMITTED, silently
+# inheriting Cursor's own built-in default of 2000ms — SKILL.md's Configuration
+# table: updateIntervalMs default 300ms/floor ">=300ms", timeoutMs default 2000ms,
+# NEITHER field documents an upper clamp).
+#
+# WHY NOT LEAVE THE DEFAULTS ALONE: this repo's own regression test
+# (test/heimdall-statusline-cursor-payload.test.sh, "TIMING" section) already
+# encodes a budget for bin/heimdall-statusline of median<1000ms/max<2000ms — HALF
+# of Cursor's 2000ms default timeout as the "safe" bar, the full 2000ms as the hard
+# kill ceiling. A live measured regression put the real renderer at 2.35s-4.09s
+# (median/max) — 2-4x over that budget — so Cursor's default 2000ms timeout was
+# killing the bar on nearly every invocation. A sibling fix restores the renderer
+# to budget; this bin's job is to register values that give a CORRECTLY FAST
+# renderer real headroom above the 2000ms ceiling that budget already targets,
+# without being raised far enough to quietly tolerate the CURRENT regression —
+# 3000ms stays well under the observed 4.09s worst case, so an un-fixed or
+# re-broken renderer still gets killed, never silently accommodated. 3000 = 1.5x
+# Cursor's own 2000ms default, and sits exactly 1000ms (50%) above the codebase's
+# own pre-existing 2000ms max-render ceiling — the SAME 2x safety-margin ratio
+# that ceiling already uses relative to the median budget, just applied from the
+# other side.
+#
+# WHY updateIntervalMs MOVES WITH timeoutMs, not independently: SKILL.md's
+# "Testing" section names a SECOND, INDEPENDENT kill trigger — "If ... a new
+# update arrives while the script is running, the in-flight process is killed" —
+# firing on ANY invocation still alive when the next becomes eligible, REGARDLESS
+# of timeoutMs. Had updateIntervalMs stayed at 2000 while timeoutMs rose to 3000,
+# a renderer taking (say) 2.2s — comfortably inside the new 3000ms timeout budget —
+# would still get superseded and killed at the 2000ms mark by this SECOND
+# mechanism, making the raised timeoutMs headroom worthless. Keeping the two equal
+# collapses both kill paths into one predictable one: a render either finishes
+# inside 3000ms and displays, or is cleanly timeout-killed — never preempted early
+# by a queued update racing ahead of its own budget.
+#
+# KILL-PATH SAFETY (verified empirically, not just by inspection — method and
+# result recorded in test/heimdall-statusline-register-cursor.test.sh's own
+# "KILL-PATH SAFETY" note): whichever value is registered, both of Cursor's kill
+# triggers (timeout, or a superseding in-flight kill) land on the same non-zero-
+# exit path, and SKILL.md's degrade-safely guarantee ("exits non-zero with empty
+# stdout -> previous text kept") only holds if stdout is actually empty at the
+# moment of death — a truncated ANSI escape on stdout could otherwise leave a
+# user's terminal stuck in a partial color state. bin/heimdall-statusline (out of
+# this bin's scope to edit) already guarantees this by construction: every exit
+# path captures its full rendered string into a shell variable via command
+# substitution first, then performs exactly ONE atomic `printf` of the complete
+# string to real stdout as its last act before `exit 0` — there is no code path
+# that writes partial output incrementally. Sending SIGALRM and SIGTERM at delays
+# from 0.1s to 3s into a real, unmodified render of the real Cursor fixture
+# (test/fixtures/cursor-real-payload.json) reproducibly landed EVERY kill-before-
+# natural-completion at exactly 0 stdout bytes, non-zero exit — never a partial
+# byte, never a dangling SGR. No wrapper is needed on the registration side for
+# this; a bare absolute path (see above) is enough.
+#
 # SUBCOMMANDS:
 #   heimdall-statusline-register-cursor [register]   idempotently wire `statusLine`
 #         into ~/.cursor/cli-config.json. Prints ONE state word, ALWAYS exits 0.
@@ -187,7 +241,7 @@ if [ "$SUB" = status ]; then
 import json, os
 target = os.environ["HMD_SL_TARGET"]; path = os.environ["HMD_SL_CFG"]
 MARKER = "bin/heimdall-statusline"
-want = {"type": "command", "command": target, "padding": 0, "updateIntervalMs": 2000}
+want = {"type": "command", "command": target, "padding": 0, "updateIntervalMs": 3000, "timeoutMs": 3000}
 try:
     data = json.load(open(path))
     if not isinstance(data, dict): data = {}
@@ -212,7 +266,7 @@ target = os.environ["HMD_SL_TARGET"]
 path   = os.environ["HMD_SL_CFG"]
 MARKER = "bin/heimdall-statusline"
 
-want = {"type": "command", "command": target, "padding": 0, "updateIntervalMs": 2000}
+want = {"type": "command", "command": target, "padding": 0, "updateIntervalMs": 3000, "timeoutMs": 3000}
 
 try:
     with open(path) as fh:
