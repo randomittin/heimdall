@@ -298,18 +298,26 @@ else
 fi
 
 # ── N. WIRED into the statusline — the only place context is exposed ─────────────
+# BEHAVIOR, not mechanism. This used to gate on `grep -q 'heimdall-ctx-meter'
+# "$STATUSLINE"` — i.e. the publish call had to appear as a literal line inside
+# hooks/statusline.sh itself. The CLI-agnostic-renderer refactor (feat 80a5c4c) made
+# hooks/statusline.sh a thin `exec` wrapper into the shared bin/heimdall-statusline,
+# and the CTX_METER block moved one level down with it — the grep then found nothing
+# in the wrapper and reported NOT WIRED even though the publisher still runs end to
+# end. Drive the REAL entry point Claude Code registers as `statusLine`
+# (hooks/statusline.sh — see that file's own comment on why the path must never
+# move) with a payload carrying real context tokens, and check for the resulting
+# on-disk record. That is what "wired" means: it survives a refactor that relocates
+# the code as long as the behavior still holds, and it still fails the moment the
+# publish call is deleted from either file, because the wrapper always execs
+# straight into the renderer that holds it.
 sec "N. WIRED @ statusline — the publisher, because only the bar sees context:"
-if grep -q 'heimdall-ctx-meter' "$STATUSLINE"; then
-  ok "hooks/statusline.sh invokes heimdall-ctx-meter"
-  rm -rf "$HEIMDALL_HOME"
-  blob 456000 "$SID" | HEIMDALL_HOME="$HEIMDALL_HOME" bash "$STATUSLINE" >/dev/null 2>&1
-  JSON="$("$METER" read --session "$SID" --json 2>/dev/null)"
-  hasre "$JSON" '"tokens"[[:space:]]*:[[:space:]]*456000' \
-    && ok "driving the REAL statusline published the reading (456,000)" \
-    || bad "statusline did not publish: $JSON"
-else
-  bad "NOT WIRED — hooks/statusline.sh never publishes the reading"
-fi
+rm -rf "$HEIMDALL_HOME"
+blob 456000 "$SID" | HEIMDALL_HOME="$HEIMDALL_HOME" bash "$STATUSLINE" >/dev/null 2>&1
+JSON="$("$METER" read --session "$SID" --json 2>/dev/null)"
+hasre "$JSON" '"tokens"[[:space:]]*:[[:space:]]*456000' \
+  && ok "driving the REAL statusline entry point published the reading (456,000)" \
+  || bad "NOT WIRED — hooks/statusline.sh does not publish a reading: $JSON"
 
 # ── O. never errors, on any verb, with garbage ───────────────────────────────────
 sec "O. NEVER ERRORS (it runs in the prompt path):"
