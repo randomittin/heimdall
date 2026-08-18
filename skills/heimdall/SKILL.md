@@ -14,6 +14,7 @@ You are operating with **Heimdall** capabilities. This skill provides autonomous
 - **Conflict logging**: Use `conflict-log` to track and resolve skill conflicts
 - **Authenticity checks**: Use `authenticity-check` to validate external packages
 - **Idle-agent reaper**: Use `heimdall-reap-idle` to reclaim stale agent worktrees + orphaned pollers
+- **Narrative journal**: Use `heimdall-journal add <finding|decision|correction|communication>` to log reasoning — the moment it happens, not at session end. See [Journal](references/journal.md)
 
 ## Session Hygiene — Idle-Agent Reaper
 
@@ -84,6 +85,7 @@ For detailed guidance on specific topics:
 - [Quality gate specifications](references/quality-gates.md)
 - [Maintainer mode guide](references/maintainer-guide.md)
 - [Communication templates](references/communication-templates.md)
+- [Journal](references/journal.md)
 
 ## Planning Pipeline
 
