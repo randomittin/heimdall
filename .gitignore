@@ -165,3 +165,18 @@ evals/benchmark/results.jsonl
 .heimdall/verdict.json
 .heimdall/receipts/
 .heimdall/audit.json
+
+# Atomic-write scratch/temp artifacts — NEVER source, always a leftover of a
+# temp+rename write. 35830f9 proved these leak into git tracking: the auto-checkpoint
+# PostToolUse hook (hooks/hooks.json, `git add -A && git commit ...`, fires the moment
+# 5+ files are dirty) is blind to file SHAPE, so a scratch file present at the wrong
+# instant gets swept in and committed right alongside real work — it happened again
+# (d6e661d) while this very defect was being investigated. Covers every scratch-name
+# shape this codebase's OWN atomic-write helpers are observed to produce:
+#   bin/heimdall-status-json atomic_write():     <path>.tmp.<pid>       ("%s.tmp.%d")
+#   sentinels/hmd-statusline.py (several):       <path>.<pid>.tmp       (".%d.tmp")
+#   the historical leak itself (35830f9):        <path>.tmp.<pid>.<hex>
+# `git add -A` never stages an ignored path (no -f in the hook command above), so this
+# alone closes the recurrence hole — see test/heimdall-scratch-gitignore.test.sh.
+*.tmp.*
+*.[0-9]*.tmp
