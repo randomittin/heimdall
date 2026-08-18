@@ -141,6 +141,10 @@ chmod +x "$P/test/unrelated.test.sh"
 git -C "$P" add test/unrelated.test.sh
 git -C "$P" commit -qm "add unrelated test (lands on main, before wt branches further)" --no-verify
 git -C "$P" checkout -q wt
+# checkout just pruned test/ as a side effect: removing main's tracked
+# test/unrelated.test.sh from the working tree left the directory empty, and
+# git rmdir's a directory a checkout empties. Recreate before writing into it.
+mkdir -p "$P/test" "$P/bin"
 printf '#!/bin/bash\necho "dummy-test: 1 passed, 0 failed."\nexit 0\n' > "$P/test/widget.test.sh"
 chmod +x "$P/test/widget.test.sh"
 printf '#!/bin/bash\necho widget\n' > "$P/bin/widget"
