@@ -153,7 +153,13 @@ TEAM3 = [{"user": "akshat", "haid": "haid:akshat.mbp-1a2b", "state": "pass"},
          {"user": "kai",    "haid": "haid:kai.mbp-9z8y",    "state": "running"},
          {"user": "mira",   "haid": "haid:mira.mbp-3c4d",   "state": "deny"}]
 
-def team_home(now=1752410000, gates=True, team=True):
+def team_home(now=1752410000, gates=True, team=True, repo=None):
+    """`repo` stamps the ledger mirror's scope (hmd-statusline._ledger_in_scope): an UNSTAMPED
+    mirror (the default here) is UNKNOWN scope and is fail-closed to {} by the SUT, exactly
+    like a real cross-repo mismatch — that IS the fixture most callers want (row-exact/perf
+    don't assert team content, so they render as if the mirror were absent, which is fine).
+    A caller that asserts the ledger-mirror TEAM actually renders (inv_team_uncut) must pass
+    `repo=<the cwd under test>` so the stamp matches and the mirror is recognized as in-scope."""
     home = tempfile.mkdtemp()
     os.makedirs(os.path.join(home, ".heimdall", "ledger"), exist_ok=True)
     status = {"daemon": True}
@@ -163,6 +169,8 @@ def team_home(now=1752410000, gates=True, team=True):
                            {"id": "designmatch", "state": "pass", "detail": ".91"}]
     if team:
         status["team"] = [dict(m, ts=now - 30 * (i + 1)) for i, m in enumerate(TEAM3)]
+    if repo:
+        status["repo"] = repo
     with open(os.path.join(home, ".heimdall", "ledger", "status.json"), "w") as f:
         json.dump(status, f)
     return home
@@ -219,8 +227,11 @@ def inv_team_uncut():
     # rides the far edge), and rows 1–2 carry the teammate eye-strips as contiguous 8-cell SIGIL
     # runs. team_w is derived from the SUT's own allocator (with the SAME TEAM_COL_GAP gutter).
     rows_zone_w, team_w, shown, of, gap = L.team_zone_alloc(120, 3, 0, rows_gap=SL_TEAM_COL_GAP)
-    home = team_home()
+    # cwd created FIRST so the ledger home can stamp `repo=c` — the scope gate
+    # (_ledger_in_scope) fail-closes an unstamped/mismatched mirror to {}, and this property
+    # is asserting the ledger-mirror team DOES render, so the stamp must name this cwd.
     c = tempfile.mkdtemp()
+    home = team_home(repo=c)
     out, rc, err = render(120, canned(c, 120), home=home)
     shutil.rmtree(c, ignore_errors=True); shutil.rmtree(home, ignore_errors=True)
     rs = rows(out)
@@ -486,7 +497,10 @@ def prove_red():
     m2.SIG.eye_strip_mini = lambda *a, **k: ["X" * _fat, "X" * _fat]
     m2.SIG.eye_strip = lambda *a, **k: ["X" * _fat, "X" * _fat]
     _rzw, team_w, _sh, _of, _g = L.team_zone_alloc(120, 3, 0)
-    home = team_home(); c = tempfile.mkdtemp(); _seed_cwd(c); _env(home, c)
+    # cwd FIRST so the ledger home can stamp `repo=c` (same scope-gate reason as
+    # inv_team_uncut above) — an unstamped mirror renders ZERO team members, so this
+    # mutation would never reach eye_strip_mini/eye_strip at all and could never go red.
+    c = tempfile.mkdtemp(); _seed_cwd(c); home = team_home(repo=c); _env(home, c)
     rs = _run(m2, c)
     has_ellipsis = any("…" in strip(r)[-team_w:] for r in rs)
     shutil.rmtree(home, ignore_errors=True); shutil.rmtree(c, ignore_errors=True)
