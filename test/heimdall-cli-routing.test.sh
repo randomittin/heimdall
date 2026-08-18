@@ -368,7 +368,11 @@ else
   cat "$TRACE_FILE" >&2
 fi
 
-# B. resolver present — plant a recording stub and assert it is actually used.
+# B. resolver present, NO project override — assert launch still reaches the
+#    task AND that the main agent is left UNPINNED (CLAUDE.md "Model routing":
+#    "hmd does not hardcode opus — or anything else — for the main agent").
+#    select_model() must not call the resolver at all here: there is no tier to
+#    resolve when the launch is meant to inherit the operator's own default.
 reset
 make_stub heimdall-model-resolve
 run_hmd "some-unknown-task-resolver-present"
@@ -380,10 +384,31 @@ else
   cat "$TRACE_FILE" >&2
 fi
 
-if stub_called "heimdall-model-resolve" && args_contain "heimdall-model-resolve ARGS: opus"; then
-  ok "present resolver IS invoked for the opus tier (fallback does not shadow it)"
+if stub_called "heimdall-model-resolve"; then
+  bad "heimdall-model-resolve was invoked with no project override present — the main agent must stay unpinned"
+  cat "$STUB_OUT" >&2
 else
-  bad "heimdall-model-resolve present but never invoked with the opus tier"
+  ok "present resolver is NOT invoked absent an override — main agent inherits the operator's default, unpinned"
+fi
+
+# B2. resolver present AND an explicit, opt-in project override requests opus —
+#     THIS is what exercises "a present resolver is not silently bypassed":
+#     .planning/settings.json's model_routing.default_code is the one sanctioned
+#     way to pin the main agent's tier (commands/save.md), so once an operator
+#     sets it, the resolver must actually be called for that tier.
+reset
+OVERRIDE_DIR="$(mktemp -d /tmp/test-heimdall-override-XXXXXX)"
+mkdir -p "$OVERRIDE_DIR/.planning"
+cat > "$OVERRIDE_DIR/.planning/settings.json" <<'EOJSON'
+{"model_routing": {"default_code": "opus"}}
+EOJSON
+( cd "$OVERRIDE_DIR" && run_hmd "some-unknown-task-resolver-present-with-override" )
+rm -rf "$OVERRIDE_DIR"
+
+if stub_called "heimdall-model-resolve" && args_contain "heimdall-model-resolve ARGS: opus"; then
+  ok "present resolver IS invoked for an explicit project override (fallback does not shadow it)"
+else
+  bad "heimdall-model-resolve present but never invoked for an explicit opus project override"
   cat "$STUB_OUT" >&2
 fi
 

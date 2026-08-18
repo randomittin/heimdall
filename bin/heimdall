@@ -2704,10 +2704,12 @@ except: pass
   }
   trap cleanup_resume EXIT
 
+  # Main Claude Code agent: never pinned (CLAUDE.md "Model routing" directive) —
+  # a resumed session runs on the operator's own configured default, same as a
+  # fresh launch (select_model() below), so no --model flag is passed here.
   claude --continue \
     --agent heimdall \
     $PERMISSION_FLAG \
-    --model "$(resolve_model opus)" \
     --plugin-dir "$PLUGIN_DIR" \
     --append-system-prompt-file "$RESUME_PREAMBLE_FILE"
   exit $?
@@ -2734,14 +2736,18 @@ if [[ "${1:-}" == "--team" ]]; then
   SESSION="heimdall-team-$$"
   echo "  Spawning $TEAM_SIZE workers in tmux session: $SESSION"
 
+  # Main Claude Code agent: never pinned (CLAUDE.md "Model routing" directive) —
+  # each team pane is another instance of the heimdall persona, so it runs on
+  # the operator's own configured default, exactly like a solo launch. No
+  # --model flag here, same reasoning as select_model() below.
   tmux new-session -d -s "$SESSION" -n "lead"
   # Lead worker gets the task
-  tmux send-keys -t "$SESSION:lead" "cd $WORK_DIR && claude --agent heimdall $PERMISSION_FLAG --model $(resolve_model opus) --plugin-dir $PLUGIN_DIR" Enter
+  tmux send-keys -t "$SESSION:lead" "cd $WORK_DIR && claude --agent heimdall $PERMISSION_FLAG --plugin-dir $PLUGIN_DIR" Enter
 
   # Spawn additional worker panes
   for i in $(seq 2 "$TEAM_SIZE"); do
     tmux split-window -t "$SESSION" -h
-    tmux send-keys -t "$SESSION" "cd $WORK_DIR && claude --agent heimdall $PERMISSION_FLAG --model $(resolve_model opus) --plugin-dir $PLUGIN_DIR" Enter
+    tmux send-keys -t "$SESSION" "cd $WORK_DIR && claude --agent heimdall $PERMISSION_FLAG --plugin-dir $PLUGIN_DIR" Enter
     tmux select-layout -t "$SESSION" tiled
   done
 
@@ -3874,10 +3880,23 @@ ${CHECKPOINT_CONTEXT}
 # ── Smart model selection (runs AFTER checkpoint load) ──
 
 select_model() {
-  MODEL_FLAG="--model $(resolve_model opus)"
-  MODEL_NAME="opus (latest)"
+  # Main Claude Code agent: NEVER pinned (CLAUDE.md "Model routing" directive —
+  # "hmd does not hardcode opus, or anything else, for the main agent"). This
+  # used to open with `MODEL_FLAG="--model $(resolve_model opus)"` and force
+  # opus on every default launch regardless of the operator's own configured
+  # /model default — that unconditional assignment WAS the "hardcoded opus"
+  # bug (the tier alias resolves to whatever generation is current; it read
+  # "Opus 5" only because Claude Code had just resolved it, not because any
+  # id or generation name is written here). The fix: no flag by default, so
+  # the `claude` binary falls back to its own configured default — mirrors
+  # agents/heimdall.md's own `model: inherit` frontmatter.
+  MODEL_FLAG=""
+  MODEL_NAME="inherit (operator default)"
 
-  # 1. Check project settings (loaded from checkpoint)
+  # Explicit, opt-in project override ONLY — documented in commands/save.md
+  # and .planning/settings.json's model_routing._note. This is the operator
+  # choosing a tier for THIS project, not hmd choosing one for them, so it is
+  # not the "hardcode" CLAUDE.md forbids.
   settings="$WORK_DIR/.planning/settings.json"
   if [ -f "$settings" ] && command -v python3 &>/dev/null; then
     override=$(python3 -c "
@@ -3893,18 +3912,6 @@ except: pass
       sonnet) MODEL_FLAG="--model $(resolve_model sonnet)"; MODEL_NAME="sonnet (project override)" ;;
       opus)   MODEL_FLAG="--model $(resolve_model opus)"; MODEL_NAME="opus (project override)" ;;
     esac
-  fi
-
-  # 2. Detect task complexity from prompt (overrides project default)
-  if [ $# -gt 0 ]; then
-    prompt_lower=$(echo "$*" | tr '[:upper:]' '[:lower:]')
-    if echo "$prompt_lower" | grep -qE '^(lint|format|fix typo|rename|bump version|update readme|fix import)'; then
-      MODEL_FLAG="--model $(resolve_model sonnet)"
-      MODEL_NAME="sonnet (simple task)"
-    elif echo "$prompt_lower" | grep -qE '(architect|design system|security audit|incident|migrate|refactor entire)'; then
-      MODEL_FLAG="--model $(resolve_model opus)"
-      MODEL_NAME="opus (complex task)"
-    fi
   fi
 
   printf "  \033[38;2;155;89;182m▸ Model:\033[0m %s\n" "$MODEL_NAME"
