@@ -246,6 +246,90 @@ if command -v python3 >/dev/null 2>&1 && [ -f "$WATCHMAN" ]; then
   # swarm block + HUD collapse to clean plain text in CI/pipes with no truecolor.
   WM="$(printf '%s' "$BLOB" | python3 "$WATCHMAN" "$COLOR_FLAG" 2>/dev/null)"
   if [ -n "$WM" ]; then
+    # ── CTX HONESTY: null/absent used_percentage must never render as "CTX 0%" ──
+    # sentinels/hmd-statusline.py:1828 and sentinels/hmd_gauge.py:311 both
+    # unconditionally coerce a missing used_percentage to 0.0 before the gauge ever
+    # sees it -- there is no "unavailable" branch in render_gauge() (unlike this
+    # same renderer's OWN render_micro_gauge()/micro_text(), which already treats
+    # pct=None as "bare label, never a fabricated 0%" -- hmd_gauge.py:356-443).
+    # That function is out of this file's scope to edit, so the boundary corrects
+    # the ALREADY-RENDERED row instead: this is the ONE row on the whole HUD driven
+    # by used_percentage, so once we know from the pre-render blob that the signal
+    # was genuinely null/absent (never for a real reading, including a genuine 0),
+    # we can find that exact row by its own literal "CTX" label and replace it --
+    # never touching any other row, never re-deriving the gauge's own cell/gradient
+    # model. The replacement reuses this SAME render's own already-chosen color for
+    # the HUD's existing "unknown signal" idiom (the "– gates offline" / "◦ watching"
+    # rows) so it never invents a new visual language, and it degrades to plain,
+    # uncolored text under --no-color exactly like those sibling rows do.
+    WM="$(printf '%s' "$WM" | HMD_CTX_BLOB="$BLOB" HMD_CTX_COLOR="$COLOR_FLAG" python3 -c '
+import json, os, re, sys
+
+text = sys.stdin.read()
+try:
+    blob_raw = os.environ.get("HMD_CTX_BLOB", "")
+    no_color = os.environ.get("HMD_CTX_COLOR", "") == "--no-color"
+    unavailable = False
+    b = json.loads(blob_raw) if blob_raw else {}
+    if isinstance(b, dict):
+        cw = b.get("context_window")
+        if not isinstance(cw, dict):
+            unavailable = True
+        else:
+            up = cw.get("used_percentage")
+            if not isinstance(up, (int, float)) or isinstance(up, bool):
+                unavailable = True
+    if not unavailable:
+        sys.stdout.write(text)
+        sys.exit(0)
+
+    ANSI = re.compile(r"\033\[[0-9;]*m")
+    MARGIN = re.compile(r"^▄+")
+
+    def raw_offset(line, target_idx):
+        visible = 0
+        i = 0
+        n = len(line)
+        while i < n:
+            m = ANSI.match(line, i)
+            if m:
+                i = m.end()
+                continue
+            if visible == target_idx:
+                return i
+            visible += 1
+            i += 1
+        return len(line)
+
+    style_open, style_close = "", ""
+    if not no_color:
+        style_re = re.compile(r"((?:\033\[[0-9;]*m)+)[–◦] ")
+        for probe in text.split("\n"):
+            m = style_re.search(probe)
+            if m:
+                style_open, style_close = m.group(1), "\033[0m"
+                break
+        if not style_open:
+            style_open, style_close = "\033[2m", "\033[0m"
+
+    out = []
+    replaced = False
+    for line in text.split("\n"):
+        plain = ANSI.sub("", line)
+        if not replaced:
+            mm = MARGIN.match(plain)
+            margin_len = mm.end() if mm else 0
+            remainder = plain[margin_len:].lstrip()
+            if remainder.startswith("CTX"):
+                cut = raw_offset(line, margin_len)
+                out.append(line[:cut] + " " + style_open + "– CTX unavailable" + style_close)
+                replaced = True
+                continue
+        out.append(line)
+    sys.stdout.write("\n".join(out))
+except Exception:
+    sys.stdout.write(text)
+' 2>/dev/null || printf '%s' "$WM")"
     printf '%s\n' "$WM"
     exit 0
   fi
