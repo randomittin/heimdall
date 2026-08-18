@@ -202,15 +202,25 @@ def _self_ids():
             ids.add(v.strip())
     bin_id = os.path.join(_ROOT, "bin", "heimdall-identity")
     if os.access(bin_id, os.X_OK):
-        for args in ([bin_id], [bin_id, "--handle"]):
-            try:
-                r = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                   timeout=0.5)
-                v = r.stdout.decode("utf-8", "replace").strip()
-                if v:
-                    ids.add(v)
-            except Exception:
-                continue   # bin absent / jq missing / timeout → file + env cover it
+        # ONE fork, not two: --json carries both SEED and HANDLE from the exact same
+        # resolve_seed()/resolve_handle() heimdall-identity already runs internally
+        # for its bare and --handle arms (see bin/heimdall-identity) — forking it
+        # twice here computed the identical resolution twice. Each fork pays its own
+        # bash+jq(+heimdall-haid, on a cold identity file) startup cost, so this was
+        # measured (cProfile, cold identity file) at ~0.36s of a ~1.1s cold render —
+        # more than the statusline's OWN identity() call. Timeout doubled (0.5 -> 1.0)
+        # since this single call now does the work the two calls used to split.
+        try:
+            r = subprocess.run([bin_id, "--json"], stdout=subprocess.PIPE,
+                               stderr=subprocess.DEVNULL, timeout=1.0)
+            d = json.loads(r.stdout.decode("utf-8", "replace"))
+            if isinstance(d, dict):
+                for k in ("seed", "handle"):
+                    v = d.get(k)
+                    if isinstance(v, str) and v.strip():
+                        ids.add(v.strip())
+        except Exception:
+            pass   # bin absent / jq missing / timeout / bad json → file + env cover it
     idir = os.environ.get("HEIMDALL_IDENTITY_DIR") or os.path.join(os.getcwd(), ".heimdall")
     try:
         with open(os.path.join(idir, "identity.json")) as f:
