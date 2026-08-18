@@ -992,6 +992,50 @@ def _not_self(members, ids):
     return keep
 
 
+def _ledger_in_scope(cwd, ledger):
+    """THE SCOPE GATE — the ledger mirror, but ONLY when it is the roster of THIS tree.
+
+    THE DEFECT THIS CLOSES (reported live): "the wall is now showing folks from other repos
+    as well initially and then updates it back to the current project".
+
+    The mirror comes from ONE machine-global file, ${HEIMDALL_HOME}/ledger/status.json, which
+    bin/heimdall-status-json rewrites on every keeper beat from whatever repo that keeper runs
+    in. Its `team` is therefore the roster of the LAST repo to write it, and hmd_ledger filters
+    it by time-window and self — never by project. Two live sessions in two repos fight over
+    the one slot, so this repo's wall rendered the OTHER repo's people as present here.
+
+    It self-corrected a beat later only because _team_members prefers the repo-scoped wall once
+    that wall is BIGGER, so the wrong frame was exactly the FIRST one — while the repo-scoped
+    wall cache was still cold. A first paint naming people who are not on this project is a
+    false statement about who is here.
+
+    THE RULE: an UNKNOWN scope renders as NOTHING, never as EVERYTHING. An absent stamp (an
+    older writer, a torn write, the no-python fallback) is UNKNOWN — not "all repos" — so it
+    yields {} and the wall falls through to the two sources that are already repo-scoped
+    (<cwd>/.heimdall/.wall-cache.json and .roster-cache.json). The first paint therefore stays
+    POPULATED and correct rather than merely blanked.
+
+    Scope is decided by PATH CONTAINMENT against `cwd`, which is exactly how the rest of the
+    wall resolves scope (both caches live under <cwd>/.heimdall), so the mirror is in scope
+    precisely when those caches are. Containment rather than equality so a session in a
+    SUBDIR of the stamped tree still reads its own roster — that admits no other repo, since
+    a foreign stamp can never contain this cwd. Pure path arithmetic: no fork, no stat, no
+    git — this is the per-keystroke render path. Never raises."""
+    if not isinstance(ledger, dict):
+        return {}
+    stamped = str(ledger.get("repo") or "").strip()
+    if not stamped:
+        return {}          # UNKNOWN scope → show nothing, never everyone
+    try:
+        root = os.path.realpath(stamped)
+        here = os.path.realpath(cwd or ".")
+        if root != here and os.path.commonpath([root, here]) != root:
+            return {}      # the stamp names a DIFFERENT tree → not our roster
+    except Exception:
+        return {}          # unusable stamp (relative, mixed-drive, junk) → fail closed
+    return ledger
+
+
 def _team_members(cwd, ledger, self_ids=None):
     """THE WALL: everyone who works on THIS repo, ranked, each carrying its own tier.
 
@@ -1017,10 +1061,15 @@ def _team_members(cwd, ledger, self_ids=None):
     ids = {str(s).strip() for s in (self_ids or set()) if s and str(s).strip()}
     live = team_presence(cwd)
     wall, _of = WALL.read_members(cwd, live=live, self_ids=ids)
-    # Gated BEFORE the comparison: an ungated ledger would count self and make a correct,
+    # SCOPED first, then self-gated, both BEFORE the comparison. The scope gate drops a mirror
+    # that belongs to another repo; without it this repo's wall renders that repo's people on
+    # the cold first paint. The overflow rides the SAME gate deliberately — an out-of-scope
+    # `+3` would claim three more people are here, which is the identical lie one line shorter.
+    mirror = _ledger_in_scope(cwd, ledger)
+    # Self-gated BEFORE the comparison: an ungated ledger would count self and make a correct,
     # self-excluded wall look smaller than it is.
-    members = _not_self(ledger.get("team"), ids)
-    overflow = int(ledger.get("team_overflow") or 0)
+    members = _not_self(mirror.get("team"), ids)
+    overflow = int(mirror.get("team_overflow") or 0)
     if len(wall) > len(members):
         return wall, 0
     if not members:

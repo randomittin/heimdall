@@ -86,6 +86,14 @@ PS
 chmod +x "$FAKE_PS"
 export HEIMDALL_REAP_PS_CMD="$FAKE_PS"
 
+# The idle-AGENT axis is not what this suite grades, but left unseamed it reads the
+# REAL process table on every invocation — non-hermetic and slow. An empty table
+# keeps that axis a no-op without touching a single real process.
+FAKE_AGENT_PS="$WORK/fake-agent-ps.sh"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$FAKE_AGENT_PS"
+chmod +x "$FAKE_AGENT_PS"
+export HEIMDALL_REAP_AGENT_PS_CMD="$FAKE_AGENT_PS"
+
 # ── Build the fixture repo with four worktrees ──────────────────────────────
 R="$WORK/repo"
 git init -q "$R"
@@ -94,6 +102,10 @@ git -C "$R" config user.name  tester
 git -C "$R" config commit.gpgsign false
 mkdir -p "$R/src"
 echo "base" > "$R/src/base.txt"
+# Mirror the real repo's .gitignore:33 — agent memory is IGNORED, which is exactly
+# why `git status --porcelain` cannot be the only thing standing between an agent's
+# memory home and `git worktree remove --force`.
+printf '.claude/agent-memory/\n' > "$R/.gitignore"
 git -C "$R" add -A
 git -C "$R" commit -qm "base"
 git -C "$R" branch -M main
@@ -120,6 +132,37 @@ REALFEAT_SHA="$(git -C "$R/.worktrees/real-feature" rev-parse HEAD)"
 OUTSIDE="$WORK/outside-live-wt"
 git -C "$R" worktree add -q -b outside-live "$OUTSIDE" main
 
+# ── (g1-g5) MERGED worktrees that still hold something ──────────────────────
+# Every one of these sits AT main head, so ancestry alone classifies all five as
+# reapable. Four must survive anyway; the fifth must not.
+WT="$R/.claude/worktrees"
+
+# (g1) a modified TRACKED file, never committed.
+git -C "$R" worktree add -q -b worktree-agent-dirtytracked "$WT/agent-dirtytracked" main
+echo "edited in place, never committed" > "$WT/agent-dirtytracked/src/base.txt"
+
+# (g2) ONLY an UNTRACKED file — nothing tracked was touched at all.
+git -C "$R" worktree add -q -b worktree-agent-untracked "$WT/agent-untracked" main
+echo "written by an agent, never git-added" > "$WT/agent-untracked/src/token_cumulative.py"
+
+# (g3) ONLY a GITIGNORED agent memory home. git reports this worktree CLEAN.
+git -C "$R" worktree add -q -b worktree-agent-memhome "$WT/agent-memhome" main
+mkdir -p "$WT/agent-memhome/.claude/agent-memory/hmd-coder"
+printf '# Agent Memory\n- [Feedback](feedback_x.md) — one-line hook\n' \
+  > "$WT/agent-memhome/.claude/agent-memory/hmd-coder/MEMORY.md"
+
+# (g4) ANTI-NEUTER: the empty memory skeleton the harness mints for every spawn,
+#      and a clean tree. Holds nothing, so it MUST still be reaped.
+git -C "$R" worktree add -q -b worktree-agent-emptymem "$WT/agent-emptymem" main
+mkdir -p "$WT/agent-emptymem/.claude/agent-memory/hmd-coder"
+
+# (g5) FAIL-CLOSED: the gitdir link points nowhere, so `git status` exits 128.
+#      Verified against git 2.53.0: git does NOT mark this prunable, so the
+#      classifier really does reach the guard rather than short-circuiting.
+git -C "$R" worktree add -q -b worktree-agent-brokengit "$WT/agent-brokengit" main
+echo "content that must not be deleted on a guess" > "$WT/agent-brokengit/src/base.txt"
+printf 'gitdir: /nonexistent/hmd-reap-test/no/such/gitdir\n' > "$WT/agent-brokengit/.git"
+
 echo "── (c) --dry-run (default) mutates NOTHING ─────────────────────────────"
 OUT_DRY="$("$REAP" --repo "$R" 2>&1)"
 if [ -d "$R/.claude/worktrees/agent-merged" ] \
@@ -139,6 +182,44 @@ if echo "$OUT_DRY" | grep -Ei "keep" | grep -q "agent-unmerged"; then
   ok "unmerged agent worktree reported as KEEP"
 else
   bad "unmerged agent worktree NOT reported as KEEP"; echo "$OUT_DRY"
+fi
+
+echo "── (g3-pre) git is STRUCTURALLY BLIND to the memory home ───────────────"
+# Load-bearing: if this ever reported the memory file as dirty, (g3) below would
+# be passing on the dirty-tree axis and proving nothing about the path axis.
+MEMSTAT="$(git -C "$WT/agent-memhome" status --porcelain 2>&1)"; MEMRC=$?
+if [ "$MEMRC" -eq 0 ] && [ -z "$MEMSTAT" ]; then
+  ok "(g3-pre) \`git status --porcelain\` reports the memory-home worktree CLEAN (rc=0, no output)"
+else
+  bad "(g3-pre) memory home was visible to git (rc=$MEMRC) — fixture no longer models .gitignore:33"
+  printf '%s\n' "$MEMSTAT"
+fi
+
+echo "── (g1-g5) merged-but-occupied worktrees are NOT classified reapable ───"
+for CASE in \
+  "agent-dirtytracked|a modified TRACKED file" \
+  "agent-untracked|ONLY an untracked file" \
+  "agent-memhome|ONLY a gitignored .claude/agent-memory/ file" \
+  "agent-brokengit|an unreadable git state (fail-closed)"
+do
+  NAME="${CASE%%|*}"; DESC="${CASE#*|}"
+  if says_reap "$OUT_DRY" "$NAME"; then
+    bad "($NAME) classified REAPABLE despite $DESC — --apply would delete it"
+    printf '%s\n' "$OUT_DRY" | grep -- "$NAME"
+  elif says_keep "$OUT_DRY" "$NAME"; then
+    ok "($NAME) held back as KEEP — $DESC"
+  else
+    bad "($NAME) got no decision line at all — the guard never ran on it"
+    printf '%s\n' "$OUT_DRY"
+  fi
+done
+
+echo "── (g4) ANTI-NEUTER: an EMPTY memory skeleton still reaps ──────────────"
+if says_reap "$OUT_DRY" "agent-emptymem"; then
+  ok "(g4) clean worktree with an empty .claude/agent-memory/ skeleton is still reapable"
+else
+  bad "(g4) the guard swallowed a worktree holding NOTHING — reaper neutered to a no-op"
+  printf '%s\n' "$OUT_DRY" | grep -- "agent-emptymem"
 fi
 
 echo "── (d) --apply removes ONLY the merged worktree ────────────────────────"
@@ -184,6 +265,39 @@ if [ -d "$OUTSIDE" ] && git -C "$R" rev-parse --verify -q outside-live >/dev/nul
   ok "(e) out-of-scope worktree OUTSIDE repo tree was NOT touched (even though merged)"
 else
   bad "(e) out-of-scope worktree was reaped — scope filter FAILED (operator worktrees at risk)"; echo "$OUT_APPLY"
+fi
+
+echo "── (g1-g5) FALSIFIER: --apply destroyed none of the occupied worktrees ─"
+# The real test of a guard is not what the report SAYS, it is what is still on
+# disk after the destructive path has actually run.
+guard_survived() { # <label> <file-that-must-exist> <string-that-must-still-be-in-it>
+  if [ -f "$2" ] && grep -q -- "$3" "$2" 2>/dev/null; then
+    ok "$1"
+  else
+    bad "DATA LOSS: $1 — file gone or content destroyed by --apply ($2)"
+    printf '%s\n' "$OUT_APPLY"
+  fi
+}
+guard_survived "(g1) modified tracked file survived --apply" \
+  "$WT/agent-dirtytracked/src/base.txt" "edited in place, never committed"
+guard_survived "(g2) untracked-only file survived --apply" \
+  "$WT/agent-untracked/src/token_cumulative.py" "written by an agent, never git-added"
+guard_survived "(g3) gitignored agent memory home survived --apply" \
+  "$WT/agent-memhome/.claude/agent-memory/hmd-coder/MEMORY.md" "Agent Memory"
+guard_survived "(g5) undeterminable worktree survived --apply (fail-closed)" \
+  "$WT/agent-brokengit/src/base.txt" "content that must not be deleted on a guess"
+
+if [ ! -d "$WT/agent-emptymem" ]; then
+  ok "(g4) ANTI-NEUTER: the empty-skeleton worktree WAS reaped by --apply"
+else
+  bad "(g4) --apply reaped nothing here — guard is over-broad, reaper reclaims no disk"
+  printf '%s\n' "$OUT_APPLY"
+fi
+
+if echo "$OUT_APPLY" | grep -q "protected"; then
+  ok "apply summary reports a protected count"
+else
+  bad "apply summary never mentions protected worktrees"; echo "$OUT_APPLY"
 fi
 
 echo "── (a) apply report names the reaped one + summary counts ──────────────"

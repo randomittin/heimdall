@@ -496,12 +496,15 @@ else:
 
 # H4 — the ledger mirror is a THIRD source and is gated by the same one gate. A stale
 # status.json naming the owner may not put him back either.
+# The `repo` stamp puts the mirror IN SCOPE (section I) so that the SELF gate is the only
+# thing this case can be failed by — an out-of-scope mirror yields [] for the wrong reason
+# and would make this assertion vacuous.
 r = repo("h_ledger")
 put_wall(r, [])
 put_presence(r, [])
 stale_ledger = {"team": [{"user": "rj", "haid": "haid:rj.box-46d5", "state": "running"},
                          {"user": "akshat", "haid": None, "state": "running"}],
-                "team_overflow": 0}
+                "team_overflow": 0, "repo": r}
 ms, _of = S._team_members(r, stale_ledger, SELF_IDS)
 if [m.get("user") for m in ms] == ["akshat"]:
     ok("H4 a stale LEDGER mirror naming self is gated too — one gate, every source")
@@ -516,7 +519,7 @@ put_wall(r, [])
 put_presence(r, [])
 ms, _of = S._team_members(
     r, {"team": [{"user": "randomittin", "haid": "haid:rj.box-46d5", "state": "running"}],
-        "team_overflow": 0}, SELF_IDS)
+        "team_overflow": 0, "repo": r}, SELF_IDS)   # in scope, so only the SELF gate can fail it
 if [m.get("user") for m in ms] == []:
     ok("H5 self is matched by HAID even under a different handle (the merge renames)")
 else:
@@ -540,10 +543,13 @@ print("\nI. SCOPE: the machine-global ledger may never put ANOTHER repo's people
 #
 # THE RULE PROVEN HERE: an unknown scope renders as NOTHING. Never as EVERYTHING.
 
+# A NON-ZERO overflow deliberately: the `+N` tag rides the same gate as the names. An
+# out-of-scope "+4" claims four more people are here — the identical lie, one line shorter —
+# so leaving overflow ungated must fail these cases too.
 FOREIGN = {"team": [{"user": "priya", "haid": "haid:priya.box-11", "state": "running"},
                     {"user": "marcus", "haid": "haid:marcus.box-22", "state": "running"},
                     {"user": "wei", "haid": "haid:wei.box-33", "state": "running"}],
-           "team_overflow": 0}
+           "team_overflow": 4}
 
 # I1 — THE DEFECT ITSELF. Cold repo-scoped caches (the FIRST-PAINT condition) plus a global
 # ledger stamped with a DIFFERENT repo must contribute ZERO columns.

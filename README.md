@@ -203,6 +203,8 @@ Scaffolds a real full-stack task, builds it, ends with a summary card and a foll
 | Parallel workers | `hmd --team N "task"` (N tmux panes, independent — no shared state) | Shipped (no coordination layer) |
 | Benchmark suite | `heimdall-bench` | Shipped |
 | Optional capability modules | `hmd modules` | Shipped |
+| Cursor CLI host (gate + statusline HUD) | `hmd init` (auto-detects) · [details](#also-gates-cursor-cli) | Shipped |
+| AI backend preference (Claude Code ⇄ Cursor CLI) | `heimdall-ai-select` · `/hmd:switch-ai` | Shipped |
 
 ---
 
