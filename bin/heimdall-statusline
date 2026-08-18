@@ -37,6 +37,46 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 WATCHMAN="$HERE/../sentinels/hmd-statusline.py"
 FACE_BIN="$HERE/heimdall-face"
 
+# ── FAST python3 — resolved ONCE, before any subprocess below ───────────────────
+# MEASURED (this machine): bare `python3` resolves through a pyenv shim
+# (~/.pyenv/shims/python3 execs `pyenv exec python3`, a version-resolution
+# dispatcher) at ~400-450ms/launch — against a DIRECT, non-shim python3 at
+# ~30-70ms. This render path launches python3 up to 4 times (the render-width
+# probe, the watchman, the Cursor host-label normalizer, the CTX-honesty
+# post-process) and hands heimdall-ctx-meter up to 3 more internal launches — at
+# ~400ms each that tax alone accounts for essentially the ENTIRE regression: the
+# watchman alone measured 2.29s real through the shim vs 0.75s cold / 0.11s warm
+# via a direct interpreter, BYTE-IDENTICAL output (diff confirmed) either way.
+# Every script in this render path is stdlib-only (json/os/re/sys) — no repo
+# `.python-version` pins a specific one, and the watchman parses clean on the
+# OLDEST candidate below (system python3 3.9.6) — so there is no correctness
+# reason to pay a shim's resolution cost per launch; any python3 here is correct.
+#
+# Resolution costs ZERO subprocesses: `command -v`/`[ -x ]` are bash builtins.
+# Detection is generic (any dispatcher living in a directory literally named
+# `shims/` — covers pyenv and asdf, which use the identical mechanism) and
+# DEGRADES SAFELY: no faster candidate found -> PATH is untouched, behavior is
+# byte-identical to before this fix (still correct, just slow, exactly like
+# today on a machine with no shim at all — e.g. Linux CI).
+#
+# PATH (not a resolved-path variable substituted at each call site) is
+# deliberately what we fix: every subprocess below still just says `python3`,
+# and inherits this exported PATH — including heimdall-ctx-meter's OWN internal
+# python3 launches, and anything the watchman shells out to via `env python3` /
+# `sys.executable` (sentinels/hmd-statusline.py's background roster/wall
+# refresh) — so those launches speed up too with zero edits to either file.
+case "$(command -v python3 2>/dev/null)" in
+  */shims/*)
+    for _hmd_fast_py3 in /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do
+      if [ -x "$_hmd_fast_py3" ]; then
+        export PATH="$(dirname "$_hmd_fast_py3"):$PATH"
+        break
+      fi
+    done
+    unset _hmd_fast_py3
+    ;;
+esac
+
 # ── Slurp the caller's statusLine stdin blob ONCE so both the watchman and the
 # fallback signal-resolver can read it (stdin is consumable only once).
 #

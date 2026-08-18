@@ -87,10 +87,27 @@ id_field() {
   jq -r --arg k "$1" '.[$k] // "" | tostring' "$IDENTITY_FILE" 2>/dev/null || printf ''
 }
 
+# Memoized `heimdall-haid current` — resolve_seed's fallback and resolve_handle's
+# haid_hint() both reach for this SAME value on a cold identity file (no
+# .heimdall/identity.json), and a single --json call runs both resolvers.
+# heimdall-haid itself forks 4 subprocesses (git config, scutil, git rev-parse,
+# shasum) per call — measured ~70-90ms — so forking it twice per invocation was
+# pure waste. Cache in a process-local var: one heimdall-identity run forks it
+# at most once, however many resolvers ask.
+_HAID_CURRENT_FETCHED=""
+_HAID_CURRENT_VALUE=""
+haid_current_cached() {
+  if [ -z "$_HAID_CURRENT_FETCHED" ]; then
+    _HAID_CURRENT_FETCHED=1
+    [ -x "$HAID_BIN" ] && _HAID_CURRENT_VALUE="$("$HAID_BIN" current 2>/dev/null || true)"
+  fi
+  printf '%s' "$_HAID_CURRENT_VALUE"
+}
+
 # A best-effort HAID for the fallback chain: $HMD_HAID, else heimdall-haid current.
 haid_hint() {
   if [ -n "${HMD_HAID:-}" ]; then printf '%s' "$HMD_HAID"; return 0; fi
-  [ -x "$HAID_BIN" ] && "$HAID_BIN" current 2>/dev/null || printf ''
+  haid_current_cached
 }
 
 # ── Resolution (deterministic, never errors) ──────────────────────────────────
@@ -102,10 +119,8 @@ resolve_seed() {
   v="$(id_field seed)";   [ -n "$v" ] && { printf 'identity-file %s' "$v"; return 0; }
   v="$(id_field handle)"; [ -n "$v" ] && { printf 'identity-file %s' "$v"; return 0; }
   [ -n "${HMD_HAID:-}" ] && { printf 'HMD_HAID %s' "$HMD_HAID"; return 0; }
-  if [ -x "$HAID_BIN" ]; then
-    v="$("$HAID_BIN" current 2>/dev/null || true)"
-    [ -n "$v" ] && { printf 'heimdall-haid %s' "$v"; return 0; }
-  fi
+  v="$(haid_current_cached)"
+  [ -n "$v" ] && { printf 'heimdall-haid %s' "$v"; return 0; }
   v="${USER:-${LOGNAME:-}}"; [ -n "$v" ] && { printf 'USER %s' "$v"; return 0; }
   printf 'default you'
 }
