@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # heimdall-statusline-cursor-payload.test.sh — pins REAL captured Cursor CLI
-# traffic as a regression fixture, plus two host-mapping bugs found while
+# traffic as a regression fixture, plus three host-mapping bugs found while
 # closing the live-render evidence gap on bin/heimdall-statusline.
 #
 # PROVENANCE (test/fixtures/cursor-real-payload.json): captured verbatim from a
@@ -38,13 +38,55 @@
 #   4. TIMING — the real fixture renders with real margin under Cursor's
 #      documented default timeoutMs (2000ms; ~/.cursor/skills-cursor/statusline/
 #      SKILL.md — a non-zero exit past this kills the in-flight process).
+#   5. CTX HONESTY — PUBLISHER — heimdall-ctx-meter (bin/heimdall-ctx-meter
+#      publish) must never write a fabricated 0 reading to
+#      ~/.heimdall/ctx/<session>.json when Cursor's context_window carries
+#      every field as null (this suite's real fixture: total_input_tokens,
+#      used_percentage, context_window_size, current_usage all null). Verified
+#      the meter's own do_publish() already fails closed here (bin/heimdall-
+#      ctx-meter:177-182: `_is_int "$tokens" || exit 0` — no context signal ->
+#      write nothing, matching its own header contract at line 163-164: "A
+#      blob with no context signal writes NOTHING: leaving the previous
+#      (age-checked) reading in place is honest, inventing a 0 is not."), so
+#      this section PINS already-correct behavior as a regression guard, not a
+#      fix.
+#   6. CTX GAUGE — THREE HONEST STATES — a real used_percentage (e.g. 42),
+#      Cursor genuinely reporting no context data at all (this suite's real
+#      fixture: every context_window field null), and a genuine exactly-zero
+#      used_percentage now render three DISTINCT things — `CTX 42%`, an
+#      explicit `– CTX unavailable` marker, and `CTX 0%` respectively — and
+#      the last two are never collapsed into each other. Root cause was in
+#      sentinels/hmd_gauge.py:311 + sentinels/hmd-statusline.py:1828 (both
+#      unconditionally coerce a missing used_percentage to 0.0 before the
+#      gauge ever sees it, out of this suite's scope to edit), so
+#      bin/heimdall-statusline fixes it at the boundary instead: it knows from
+#      the pre-render blob alone whether used_percentage was genuinely
+#      null/absent, and when it was, it finds the one row that used_percentage
+#      drives (by its own literal "CTX" label) in the watchman's ALREADY-
+#      RENDERED output and replaces it — reusing this SAME render's own
+#      already-chosen color for the HUD's existing "unknown signal" idiom (the
+#      "– gates offline" / "◦ watching" rows), never inventing a new one, and
+#      degrading to plain uncolored text under --no-color exactly like those
+#      sibling rows do. A real reading and a genuine zero are provably
+#      untouched by this (6a/6b below).
 #
 # FALSIFIER (verified by hand — see the coder-agent report for this task, which
-# quotes the exact pass/fail counts both ways): comment out the Cursor
-# host-label normalization block in bin/heimdall-statusline -> section 3's
-# "absent display_name -> Cursor" assertion goes RED (renders "Claude"
-# instead); restoring the block returns it to GREEN with no other section
-# affected.
+# quotes the exact pass/fail counts both ways):
+#   - section 3: comment out the Cursor host-label normalization block in
+#     bin/heimdall-statusline -> the "absent display_name -> Cursor" assertion
+#     goes RED (renders "Claude" instead); restoring the block returns GREEN.
+#   - section 5: bin/heimdall-ctx-meter's own null-guard (`_is_int "$tokens" ||
+#     exit 0`) temporarily inverted -> the "null fixture: no record written"
+#     assertion goes RED (a fabricated record IS written instead); reverted
+#     (git diff confirmed empty afterward) -> GREEN.
+#   - section 6 (6a/6b, real+genuine-zero): this suite's own oracle temporarily
+#     inverted (assert the WRONG percentage) -> goes RED as expected; reverted
+#     -> GREEN.
+#   - section 6 (6c/6d, the CTX-honesty fix itself): bin/heimdall-statusline's
+#     own `unavailable` detection temporarily inverted (forced permanently
+#     False) -> both assertions go RED (the real fixture and the
+#     context_window-absent payload both fabricate "CTX 0%" again); reverted
+#     (git diff confirmed empty afterward) -> GREEN.
 set -u
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -122,6 +164,17 @@ def w(l):
   return n
 ws=sorted(set(w(l) for l in sys.stdin.read().split(chr(10)) if l!=""))
 print(",".join(str(x) for x in ws))'
+}
+
+# ANSI-stripped plain text of stdout — same escape-code regex as row_widths()
+# above. Needed for section 6: render_gauge()'s fill cells carry a per-cell
+# interpolated background ramp, so _serialize() emits a fresh SGR before EVERY
+# character inside the bar (fill or track, any pct) — "CTX 42%" is real but
+# never a *contiguous* byte run in $OUT, unlike row1's uniformly-styled model
+# label (sections 1/3's `*HEIMDALL*`/`*"· Cursor"*` etc., which stay contiguous
+# because that text has no per-cell color ramp). Strip ANSI first, then match.
+strip_ansi() {
+  python3 -c 'import sys,re; sys.stdout.write(re.sub(r"\033\[[0-9;]*m","",sys.stdin.read()))'
 }
 
 FIXTURE_JSON="$(cat "$FIXTURE")"
@@ -232,6 +285,89 @@ python3 -c "import sys; sys.exit(0 if float('$MED') < $BUDGET_MS else 1)" \
 python3 -c "import sys; sys.exit(0 if float('$MX') < 2000.0 else 1)" \
   && ok "max render ${MX}ms < Cursor's 2000ms default timeoutMs" \
   || bad "max render ${MX}ms would be KILLED by Cursor's default timeoutMs"
+
+echo "== 5) CTX HONESTY — PUBLISHER: heimdall-ctx-meter never fabricates a 0 =="
+CTX_METER="$ROOT/bin/heimdall-ctx-meter"
+if [ -x "$CTX_METER" ]; then
+  # 5a) the real fixture -- every context_window field is null. The publisher
+  # must write NOTHING (no record file at all), never a fabricated 0.
+  CTXD="$(mktemp -d)"
+  printf '%s' "$FIXTURE_JSON" | HMD_CTX_DIR="$CTXD" "$CTX_METER" publish >/dev/null 2>&1
+  RC=$?
+  NFILES="$(find "$CTXD" -type f 2>/dev/null | wc -l | tr -d ' ')"
+  rm -rf "$CTXD"
+  [ "$RC" = 0 ] && [ "$NFILES" = 0 ] \
+    && ok "publish, real fixture (all context_window fields null): writes NO record (rc=$RC, files=$NFILES)" \
+    || bad "publish, real fixture: expected rc=0 files=0, got rc=$RC files=$NFILES (a null reading must never become a stored 0)"
+
+  # 5b) control: a real numeric reading DOES get written correctly -- proves
+  # 5a's silence is the null-guard firing, not the meter being broken outright.
+  CTXD="$(mktemp -d)"
+  CONTROL_J='{"session_id":"ctx-honesty-control","context_window":{"total_input_tokens":42000,"used_percentage":21.0,"context_window_size":200000}}'
+  printf '%s' "$CONTROL_J" | HMD_CTX_DIR="$CTXD" "$CTX_METER" publish >/dev/null 2>&1
+  REC="$CTXD/ctx-honesty-control.json"
+  if [ -f "$REC" ] && grep -q '"tokens": 42000' "$REC" && grep -q '"pct": 21' "$REC"; then
+    ok "publish, control (real numeric context): writes a correct record (tokens=42000, pct=21)"
+  else
+    bad "publish, control: expected a correct record at $REC, got: $(cat "$REC" 2>/dev/null || echo '<missing>')"
+  fi
+  rm -rf "$CTXD"
+else
+  bad "publisher check skipped: $CTX_METER missing/not executable"
+fi
+
+echo "== 6) CTX GAUGE — real + genuine-zero readings render correctly (not swallowed) =="
+# 6a) a REAL, non-zero used_percentage on a Cursor-shaped payload must render
+# its true value -- proving this task's width/host-label boundary changes
+# never touch or suppress a real reading.
+REAL_J='{"session_id":"ctx6a","transcript_path":"/x","autorun":false,"cwd":"/tmp","workspace":{"current_dir":"/tmp"},"render_width_chars":120,"model":{"display_name":"Auto"},"context_window":{"used_percentage":42.0,"total_input_tokens":84000}}'
+TRIPLE="$(mkws)"; IFS='|' read -r WS HOMED TMPD <<<"$TRIPLE"
+OUT="$(render "$WS" "$HOMED" "$TMPD" "" "$REAL_J")"
+rm -rf "$WS" "$HOMED" "$TMPD"
+PLAIN="$(printf '%s' "$OUT" | strip_ansi)"
+case "$PLAIN" in
+  *"CTX 42%"*) ok "real value (42%): gauge renders the true reading" ;;
+  *) bad "real value (42%): expected \"CTX 42%\" in the rendered output, not found" ;;
+esac
+# 6b) a GENUINE exactly-zero used_percentage (real data, real reading of 0 --
+# NOT the null/absent case) must still render "CTX 0%": zero usage is a fact,
+# not a missing signal, and must not be suppressed either.
+ZEROPCT_J='{"session_id":"ctx6b","transcript_path":"/x","autorun":false,"cwd":"/tmp","workspace":{"current_dir":"/tmp"},"render_width_chars":120,"model":{"display_name":"Auto"},"context_window":{"used_percentage":0,"total_input_tokens":0}}'
+TRIPLE="$(mkws)"; IFS='|' read -r WS HOMED TMPD <<<"$TRIPLE"
+OUT="$(render "$WS" "$HOMED" "$TMPD" "" "$ZEROPCT_J")"
+rm -rf "$WS" "$HOMED" "$TMPD"
+PLAIN="$(printf '%s' "$OUT" | strip_ansi)"
+case "$PLAIN" in
+  *"CTX 0%"*) ok "genuine zero (real used_percentage:0): gauge renders CTX 0% (a fact, not suppressed)" ;;
+  *) bad "genuine zero: expected \"CTX 0%\" in the rendered output, not found" ;;
+esac
+# 6c) the REAL captured fixture (every context_window field null) must render
+# the explicit unavailable marker, in the HUD's existing "unknown signal"
+# visual grammar -- and must NEVER render a numeric "CTX 0%", which would be
+# exactly the coordinator's original defect: a false measurement,
+# indistinguishable on screen from 6b's genuine zero above.
+TRIPLE="$(mkws)"; IFS='|' read -r WS HOMED TMPD <<<"$TRIPLE"
+OUT="$(render "$WS" "$HOMED" "$TMPD" "" "$FIXTURE_JSON")"
+rm -rf "$WS" "$HOMED" "$TMPD"
+PLAIN="$(printf '%s' "$OUT" | strip_ansi)"
+case "$PLAIN" in
+  *"CTX 0%"*) bad "real fixture (all context_window fields null): fabricated \"CTX 0%\" -- a false measurement, indistinguishable from a genuine zero" ;;
+  *"CTX unavailable"*) ok "real fixture (all context_window fields null): renders the explicit unavailable marker, not a fabricated 0%" ;;
+  *) bad "real fixture: expected the unavailable marker (\"CTX unavailable\"), found neither it nor \"CTX 0%\" -- unexpected output" ;;
+esac
+# 6d) a synthetic payload with context_window entirely ABSENT (not merely
+# null subfields -- SKILL.md documents the whole object as something that
+# "may be absent") must be treated identically to the real fixture's shape.
+NOCTX_J='{"session_id":"ctx6d","transcript_path":"/x","autorun":false,"cwd":"/tmp","workspace":{"current_dir":"/tmp"},"render_width_chars":120,"model":{"display_name":"Auto"}}'
+TRIPLE="$(mkws)"; IFS='|' read -r WS HOMED TMPD <<<"$TRIPLE"
+OUT="$(render "$WS" "$HOMED" "$TMPD" "" "$NOCTX_J")"
+rm -rf "$WS" "$HOMED" "$TMPD"
+PLAIN="$(printf '%s' "$OUT" | strip_ansi)"
+case "$PLAIN" in
+  *"CTX 0%"*) bad "context_window entirely absent: fabricated \"CTX 0%\"" ;;
+  *"CTX unavailable"*) ok "context_window entirely absent: renders the explicit unavailable marker" ;;
+  *) bad "context_window entirely absent: expected the unavailable marker, found neither it nor \"CTX 0%\"" ;;
+esac
 
 echo
 echo "$pass passed, $fail failed"
