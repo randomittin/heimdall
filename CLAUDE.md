@@ -61,6 +61,41 @@ never existed.
   is the human-readable statement of a rule the enforcer already checks — if the two
   ever disagree, the enforcer is authoritative and this text is the bug.
 
+## Pre-commit vs pre-push: what stays at commit, what dedups at push
+Two things are easy to conflate and must not be: the ~1600s full sweep above (never
+auto-run, gated by the enforcer) and the small, real per-gate checks below (auto-run by
+design, on every commit/push). "Checks run too often" is only a defect in the second
+group, and only where the SAME check fires twice for one action.
+
+- **The stub-scan and the oracle-falsifiability + corpus-regression gates stay at
+  pre-commit, on purpose — this is a deliberate divergence from "only run just before
+  push".** Agents commit with `--no-verify`, so the native pre-commit hook never fires
+  for agent-driven commits; it exists for a human or a non-Claude-Code tool committing
+  directly, who never goes through the PreToolUse layer at all and may never even
+  `git push` this branch. Deferring these checks to push would mean a broken commit
+  sits in history with the author having already lost the context they had at commit
+  time — for the stub-scan that cost is especially stark, since it is diff-scoped and
+  near-free precisely because it runs at the moment the bad line is introduced. This is
+  tested, documented behavior (`test/heimdall-init.test.sh`'s staged-bad-domain case,
+  `test/gate-receipt-truth.test.sh` Section A) — not an oversight to "fix" by moving it.
+- **The oracle + corpus gates WERE genuinely duplicated at push, and that is fixed.**
+  Both the native `.heimdall/hooks/pre-push` hook (`bin/heimdall-gate-run --phase
+  pre-push`) and the Claude-Code PreToolUse `git push` chain ran the identical
+  falsify-per-domain loop and `bin/corpus run` — back to back, on every agent-issued
+  push, for the same result. Measured against this repo's own oracle corpus: one pass
+  costs on the order of a minute; paying it twice per push was pure waste, and the real
+  substance behind "checks running all the time". The PreToolUse chain now checks
+  whether the native hook is actually wired (`core.hooksPath` = `.heimdall/hooks` and
+  `.heimdall/hooks/pre-push` is executable) and, if so, defers to it — loudly, on
+  stderr, never silently — instead of re-running the same work. If the native hook is
+  NOT wired (a fresh `git worktree add`, before `hmd init` has materialized
+  `.heimdall/hooks` there, runs with none), coverage is unchanged: the inline check
+  still runs. `HMD_SKIP=1` cannot be used to make the PreToolUse layer defer on the
+  assumption the native hook will cover it, since `HMD_SKIP` is that native hook's OWN
+  bypass and has never reached the PreToolUse layer — widening its reach silently would
+  be a real gate weakening, so the dedup guard explicitly excludes it.
+  See `hooks/hooks.json` (the guard) and `test/pre-push-gate-dedup.test.sh` (the proof).
+
 ## Model routing (2026-08-11 directive)
 - **Main Claude Code agent: never pinned.** It runs on the user's own default. hmd
   does not hardcode opus — or anything else — for the main agent.
