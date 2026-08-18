@@ -59,8 +59,8 @@ SPEC = {
     "hook": "haiku", "classifier": "haiku", "formatter": "haiku",
     "janitor": "haiku", "statusline": "haiku", "marker_check": "haiku",
     "coder": "sonnet", "test_writer": "sonnet", "doc": "sonnet", "triage": "sonnet",
-    "orchestrator": "opus", "architecture": "opus", "security_critical": "opus",
-    "gate_adjudication": "opus", "forensics": "opus",
+    "architecture": "sonnet", "forensics": "sonnet",
+    "orchestrator": "opus", "security_critical": "opus", "gate_adjudication": "opus",
 }
 
 table_path, agents_dir = sys.argv[1], sys.argv[2]

@@ -112,8 +112,9 @@
       "no_downgrade_reason": "The orchestrator decides which gates run at all. Weakening it weakens every gate downstream of it."
     },
     "architecture": {
-      "tier": "opus",
-      "summary": "Architecture and design reasoning; decisions that outlive the session."
+      "tier": "sonnet",
+      "summary": "Architecture and design reasoning; decisions that outlive the session.",
+      "tier_note": "Set to opus at this table's 2026-08-08 creation, before CLAUDE.md's 2026-08-11 model-routing directive made sonnet the default coding tier and closed the opus exception list to exactly reviewer/verifier/security-auditor. This entry was stale drift, not a deliberate carve-out: architecture work carries no security_sensitive flag and no no_downgrade_reason (unlike orchestrator/security_critical/gate_adjudication, which do), so it was never meant to be a protected floor."
     },
     "security_critical": {
       "tier": "opus",
@@ -128,8 +129,9 @@
       "no_downgrade_reason": "A gate that passes work it should have failed is worse than no gate, because it manufactures false confidence."
     },
     "forensics": {
-      "tier": "opus",
-      "summary": "Incident and spend forensics: reconstruct what happened from evidence."
+      "tier": "sonnet",
+      "summary": "Incident and spend forensics: reconstruct what happened from evidence.",
+      "tier_note": "Set to opus at this table's 2026-08-08 creation, before CLAUDE.md's 2026-08-11 model-routing directive made sonnet the default coding tier and closed the opus exception list to exactly reviewer/verifier/security-auditor. This entry was stale drift, not a deliberate carve-out: forensics carries no security_sensitive flag and no no_downgrade_reason (unlike orchestrator/security_critical/gate_adjudication, which do), so it was never meant to be a protected floor."
     }
   },
 
