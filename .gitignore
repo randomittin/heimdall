@@ -158,6 +158,16 @@ evals/oracles/*/report.json
 # before write). The SECURITY-SIGNALS lane (.planning/security-signals/) is DELIBERATELY NOT
 # re-included anywhere — a security incident stays local, enforced by this absence (INV-C).
 !.planning/ledger/checkpoints/
+# heimdall-journal — durable, git-committed, human-readable NARRATIVE log of
+# findings/decisions/corrections/communications written DURING work (not a
+# session-end snapshot) — see bin/heimdall-journal. One file per (day x
+# writer): .planning/journal/{YYYY-MM-DD}-{haid-slug}.md, the same one-
+# writer-per-file pattern as the P1-P4 ledger stores above, so many
+# concurrent worktree agents append without merge conflicts. The chain down
+# to .planning/ is already re-included above; un-ignore the journal dir +
+# its per-day-per-writer files (no further nesting, so no journal/* re-
+# ignore is needed the way ledger/* needed one before its own subdirs).
+!.planning/journal/
 .claude/
 evals/benchmark/results.jsonl
 # Git worktrees (heimdall isolation)

@@ -94,6 +94,28 @@ Communicate like a colleague, not a bot.
 
 Keep updates concise. No fluff. Lead with what matters.
 
+## Logging Claims to the Journal
+
+A claim made to the user is worth auditing later against whether it held up.
+When you tell the user something non-trivial — a root-cause diagnosis, a
+measurement, a "this is caused by X" — and it's the kind of claim someone
+might later act on (a directive, a fix, a design change), log it as a
+`communication` entry the moment you make it:
+
+```bash
+bin/heimdall-journal add communication "told user cost delta traces to headroom" \
+  --body "claimed the token-spend-forensics.md cost delta was caused by context headroom; user directed removing/fixing headroom on this claim." \
+  --evidence "stated in session at <timestamp/turn>, not yet independently measured"
+```
+
+If the claim is later proven wrong, don't edit or delete the entry — add a
+`correction` (or its alias, `refuted`) entry referencing the original
+subject. The pair — the claim and its later refutation — is worth more
+together than either alone: it is the exact shape of finding that gets lost
+forever when a session truncates before the correction is ever written down.
+See [Journal](references/journal.md) for the full schema and the four entry
+types.
+
 ## Team Communication via Slack
 
 Read this section when the Slack skills are installed AND the user has opted into
