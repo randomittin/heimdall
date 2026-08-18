@@ -291,6 +291,25 @@ manifest's other named compressor (ONNX-backed `kompress`) leaves no log trace
 distinguishable from `diff_compressor` in this file; there is no log evidence it ran
 at all, let alone that it offsets `diff_compressor`'s near-total ineffectiveness.
 
+**A correction, made explicitly rather than left standing (2026-08-19):** the
+`grep -ic kompress` result above is accurate but was read as "kompress never ran" —
+it actually shows only that this specific file cannot see it. `~/.heimdall/headroom/proxy.log`
+is hmd's own redirected-stdout capture of exactly one Rust component's logger
+(`diff_compressor`, unqualified name); it was never wired to kompress's logger, and —
+symmetrically — `diff_compressor`'s own summary lines never reach headroom's *own*
+native log either. The two logs are disjoint, not overlapping subsets of the same
+data. Headroom's native log (`~/.headroom/logs/proxy.log*`, not examined in this
+section) and its structured savings ledger (`~/.headroom/savings_events.jsonl`,
+`~/.headroom/proxy_savings.json`) show kompress running extensively: 1,181 recovered
+events averaging a 31.24% reduction on the content it's permitted to touch, inside a
+full lifetime aggregate of 0.27%–0.56% across 43,703 requests — against $17,360.72 in
+cache savings over the same window versus $42.90 from compression, a ~405× gap. The
+"172 of 173" `diff_compressor` figure above is unaffected and correctly characterizes
+that one narrow component; it was never a valid stand-in for headroom's compression as
+a whole. Full re-derivation, three independent measurement methods, and the
+architecture explaining why the gap is by design, not a bug:
+[`docs/analysis/2026-08-19-headroom-compression-diagnosis.md`](./2026-08-19-headroom-compression-diagnosis.md).
+
 **Cost, same evidence:**
 
 - `run_seconds_max=64.75` — a single worst-case compression job ran **64.75
