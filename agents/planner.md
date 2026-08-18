@@ -2,7 +2,7 @@
 name: planner
 description: Creates verified execution plans with acceptance criteria that block progression. Decomposes work into dependency-ordered waves of parallel tasks with grep-verifiable or command-runnable criteria.
 tools: Read, Write, Edit, Bash, Grep, Glob
-model: opus
+model: sonnet
 tier: opus
 effort: high
 color: blue

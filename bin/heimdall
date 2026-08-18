@@ -3794,8 +3794,8 @@ Violating parallelism is a bug. Sequential tool calls for independent operations
 
 MODEL ROUTING — when spawning subagents, select model per task:
 - haiku: lint, format, rename, config, simple lookups (fast + cheap)
-- sonnet: docs, tests, research, analysis, simple fixes (good enough)
-- opus: ALL code writing, architecture, design, review, security, DB (quality non-negotiable)
+- sonnet: default for ALL code writing, architecture, design, docs, tests, research, DB — current-gen quality, no opus premium needed
+- opus: adjudication ONLY — hmd:reviewer, hmd:verifier, hmd:security-auditor (judging completed work is where the extra capability earns its cost)
 On failure → escalate: haiku→sonnet→opus. Never retry same tier.
 Check .planning/settings.json for project-specific overrides before spawning.
 
