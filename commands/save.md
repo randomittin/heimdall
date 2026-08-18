@@ -78,7 +78,7 @@ Write or update project-specific execution settings:
   },
   "model_routing": {
     "default_code": "sonnet",
-    "_note": "default_code is the ONLY routing key any code reads (bin/heimdall:3906). Add default_effort or per-glob tier overrides if you like — nothing dereferences them, so they are a note to the orchestrator, not a setting. Absent this override, the main agent is NOT pinned at all — it inherits the operator's own Claude Code default (select_model() in bin/heimdall)."
+    "_note": "default_code is the ONLY routing key any code reads (bin/heimdall:3918). Add default_effort or per-glob tier overrides if you like — nothing dereferences them, so they are a note to the orchestrator, not a setting. Absent this override, the main agent is NOT pinned at all — it inherits the operator's own Claude Code default (select_model() in bin/heimdall)."
   },
   "commands": {
     "test": "npm test",
@@ -92,9 +92,9 @@ Write or update project-specific execution settings:
 }
 ```
 
-The whole file is injected verbatim into the preamble on every `heimdall` launch, alongside CHECKPOINT.md (`bin/heimdall:3092`). Claude doesn't need to "discover" test/lint/build commands — they're there from the first run.
+The whole file is injected verbatim into the preamble on every `heimdall` launch, alongside CHECKPOINT.md (`bin/heimdall:3176`, `load_checkpoint_context()`). Claude doesn't need to "discover" test/lint/build commands — they're there from the first run.
 
-What "injected" does and does not mean: exactly one key changes behaviour mechanically, `model_routing.default_code`, which picks the launch model at `bin/heimdall:3906` — and only when set; absent it, the main agent runs unpinned on the operator's own Claude Code default. Everything else — the commands, parallelism numbers, governance, avoid_dirs, preferences — is text the orchestrator reads and is expected to honour. That is an instruction to a model, not an enforced setting, so verify it was honoured rather than assuming the file made it so.
+What "injected" does and does not mean: exactly one key changes behaviour mechanically, `model_routing.default_code`, which picks the launch model at `bin/heimdall:3918` — and only when set; absent it, the main agent runs unpinned on the operator's own Claude Code default. Everything else — the commands, parallelism numbers, governance, avoid_dirs, preferences — is text the orchestrator reads and is expected to honour. That is an instruction to a model, not an enforced setting, so verify it was honoured rather than assuming the file made it so.
 
 ### 4. Git checkpoint
 ```bash
