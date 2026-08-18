@@ -63,6 +63,28 @@ if [ -z "$PY" ]; then
   exit 2
 fi
 
+# FAST python3 — rewrites ONLY $PY, never PATH. Same tax as bin/heimdall-statusline
+# (full measurement writeup there): bare `python3` can resolve through a pyenv/asdf
+# shim (~400-620ms/launch measured on this dev machine) instead of a direct
+# interpreter (~30-70ms), and this wrapper's `resume-hint` arm runs synchronously in
+# Claude Code's foreground SessionStart path every session. Costs NO new subprocess
+# (only inspects the $PY already resolved above) and — unlike an earlier version of
+# this fix that prepended a directory to PATH — can NEVER unshadow a caller's own
+# PATH-based fakes (e.g. a test's FAKEBIN dir) for any OTHER binary, because PATH
+# itself is never touched. Degrades safely: unshimmed or no faster candidate found
+# -> $PY unchanged, byte-identical behavior to before this fix.
+case "$PY" in
+  */shims/*)
+    for _hmd_fast_py3 in /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do
+      if [ -x "$_hmd_fast_py3" ]; then
+        PY="$_hmd_fast_py3"
+        break
+      fi
+    done
+    unset _hmd_fast_py3
+    ;;
+esac
+
 [ -f "$LIB" ] || { echo "error: missing library: $LIB" >&2; exit 2; }
 
 [ $# -ge 1 ] || { usage >&2; exit 2; }

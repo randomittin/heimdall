@@ -86,7 +86,31 @@ resolve_root() {
 }
 
 opted_out && { printf 'skipped'; exit 0; }
-command -v python3 >/dev/null 2>&1 || { printf 'skipped'; exit 0; }
+
+# FAST python3 — resolved ONCE into $PY3, never PATH. Same tax/fix as
+# bin/heimdall-statusline (full measurement writeup there): bare `python3` can
+# resolve through a pyenv/asdf shim (~400-620ms/launch measured on this dev
+# machine) instead of a direct interpreter (~30-70ms), and this `register` arm
+# runs synchronously in Claude Code's foreground SessionStart path every session.
+# Costs NO new subprocess (reuses this same command -v python3 call, previously
+# discarded to /dev/null) and — unlike an earlier version of this fix that
+# prepended a directory to PATH — can NEVER unshadow a caller's own PATH-based
+# fakes (e.g. a test's FAKEBIN dir) for any OTHER binary, because PATH itself is
+# never touched. Degrades safely: unshimmed or no faster candidate found -> $PY3
+# stays whatever plain `command -v python3` found, byte-identical to before.
+PY3="$(command -v python3 2>/dev/null || true)"
+[ -n "$PY3" ] || { printf 'skipped'; exit 0; }
+case "$PY3" in
+  */shims/*)
+    for _hmd_fast_py3 in /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do
+      if [ -x "$_hmd_fast_py3" ]; then
+        PY3="$_hmd_fast_py3"
+        break
+      fi
+    done
+    unset _hmd_fast_py3
+    ;;
+esac
 
 ROOT="$(resolve_root)"
 if [ -z "$ROOT" ] || [ ! -x "$ROOT/hooks/statusline.sh" ]; then
@@ -98,7 +122,7 @@ CFG="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 SETTINGS="${HEIMDALL_STATUSLINE_SETTINGS:-$CFG/settings.json}"
 
 if [ "$SUB" = status ]; then
-  HMD_SL_PLUGIN="$ROOT" HMD_SL_SETTINGS="$SETTINGS" HMD_SL_MODE=status python3 - <<'PY' 2>/dev/null || printf 'skipped'
+  HMD_SL_PLUGIN="$ROOT" HMD_SL_SETTINGS="$SETTINGS" HMD_SL_MODE=status "$PY3" - <<'PY' 2>/dev/null || printf 'skipped'
 import json, os
 plugin = os.environ["HMD_SL_PLUGIN"]; path = os.environ["HMD_SL_SETTINGS"]
 def cmd(rel):
@@ -129,7 +153,7 @@ fi
 # install.sh's ensure_statusline_registered so both propagation paths converge). ──
 # Capture the state word so the caller (SessionStart hook, synchronous) can surface a
 # ONE-TIME activation note — stdout stays the pure state-word contract, note goes stderr.
-STATE="$(HMD_SL_PLUGIN="$ROOT" HMD_SL_SETTINGS="$SETTINGS" python3 - <<'PY' 2>/dev/null
+STATE="$(HMD_SL_PLUGIN="$ROOT" HMD_SL_SETTINGS="$SETTINGS" "$PY3" - <<'PY' 2>/dev/null
 import json, os, sys, tempfile
 
 plugin = os.environ["HMD_SL_PLUGIN"]
