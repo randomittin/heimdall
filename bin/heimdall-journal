@@ -141,7 +141,7 @@ _normalize_type() {
     decision) printf 'DECISION' ;;
     correction|refuted) printf 'CORRECTION' ;;
     communication) printf 'COMMUNICATION' ;;
-    *) printf 'UNKNOWN' ;;
+    *) return 1 ;;
   esac
 }
 
