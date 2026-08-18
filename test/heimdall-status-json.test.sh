@@ -10,7 +10,10 @@
 # a live control plane, a real keeper, or the user's ~/.heimdall.
 #
 # FALSIFIABLE claims proven:
-#   (1) SCHEMA — the writer emits exactly {daemon, gates[], verdict{}, team[]}, valid JSON.
+#   (1) SCHEMA — the writer emits valid JSON carrying AT LEAST {daemon, gates[], verdict{},
+#       team[]} — the four keys every consumer depends on. Required-subset, not exact-match:
+#       additive fields (see: "repo", claim 10) are legitimate schema growth and must not
+#       fail this gate — a required key going missing/renamed is what this actually guards.
 #   (2) DAEMON LIVENESS is REAL — a live keeper pidfile => daemon "watching"; a dead/absent
 #       pidfile => daemon "down" (not fabricated: a bogus pid reads down).
 #   (3) GATES are READ from the recorded verdict.json (.gates), never invented — the exact
@@ -26,6 +29,9 @@
 #   (8) gate-run RECORDS gates[] — a real (hermetic) gate-run in a throwaway repo persists a
 #       verdict.json that now carries a gates array (empty when no oracle/corpus gate ran).
 #   (9) SYNTAX — bash -n on the writer, py_compile of the sigil core it imports.
+#   (10) REPO STAMP — the writer stamps the INVOKING repo's own root (git rev-parse
+#        --show-toplevel) into "repo", so the statusline can tell "this roster is mine"
+#        from "someone else's" (sentinels/hmd-statusline.py path-containment check).
 
 set -uo pipefail
 
@@ -89,9 +95,18 @@ rc=$?
 [ "$rc" -eq 0 ] && ok "writer exits 0 on the happy path" || bad "writer exit $rc"
 [ -f "$OUT" ] && jq -e . "$OUT" >/dev/null 2>&1 && ok "output is a single valid JSON file" || bad "output missing/invalid"
 
-# schema — exactly the four top-level keys the statusline reads
+# schema — the FOUR keys every consumer depends on must ALL be present (a regression that
+# drops or renames one silently breaks the statusline/ledger). This is deliberately a
+# required-subset check, not an exact-match: an exact-match on a fixed key list is its own
+# defect (it fails on every legitimate additive field — exactly what happened when "repo"
+# was added deliberately and this test broke instead of the schema, see claim 10 below). A
+# check that accepts ANY keys is no gate at all, so the four required keys are each verified.
 KEYS="$(jq -r 'keys | join(",")' "$OUT" 2>/dev/null)"
-[ "$KEYS" = "daemon,gates,team,verdict" ] && ok "schema: top-level keys = daemon,gates,team,verdict" || bad "schema keys wrong: $KEYS"
+MISSING=""
+for k in daemon gates team verdict; do
+  jq -e --arg k "$k" 'has($k)' "$OUT" >/dev/null 2>&1 || MISSING="${MISSING}${k},"
+done
+[ -z "$MISSING" ] && ok "schema: required keys present (daemon,gates,team,verdict) — got: $KEYS" || bad "schema keys missing: $MISSING (got: $KEYS)"
 
 [ "$(jq -r '.daemon' "$OUT")" = "watching" ] && ok "(2) live keeper -> daemon watching" || bad "daemon not watching ($(jq -r '.daemon' "$OUT"))"
 
@@ -187,6 +202,27 @@ echo "-- (9) syntax ------------------------------------------------------------
 bash -n "$WRITER" 2>/dev/null && ok "(9) bash -n writer clean" || bad "(9) bash -n writer FAILED"
 bash -n "$GATE_RUN" 2>/dev/null && ok "(9) bash -n gate-run clean" || bad "(9) bash -n gate-run FAILED"
 "$PY" -m py_compile "$SIGIL_PY" 2>/dev/null && ok "(9) py_compile sigil core clean" || bad "(9) py_compile FAILED"
+
+# ── (10) repo stamp: identifies WHICH repo team[] is the roster of ────────────
+# "repo" is a REAL, consumed field, not a stray key: sentinels/hmd-statusline.py compares
+# it against cwd (path containment) to decide whether a wall's team[] belongs to THIS tree
+# or a foreign one, failing closed (renders nothing) on an absent/mismatched stamp. Proves
+# the writer stamps the INVOKING repo's own root, not a hardcoded/foreign/empty value.
+echo "-- (10) repo stamp identifies which repo team[] belongs to -------------------"
+REPO10="$WORK/repo10"; mkdir -p "$REPO10"
+git -C "$REPO10" init -q
+git -C "$REPO10" config user.email "test@runheimdall.dev"
+git -C "$REPO10" config user.name "test"
+printf 'x\n' > "$REPO10/a.txt"; git -C "$REPO10" add -A; git -C "$REPO10" commit -qm seed
+KDIR10="$WORK/keeper10"; mkdir -p "$KDIR10"
+OUT10="$WORK/status10.json"
+( cd "$REPO10" && env HMD_STATUS_OUT="$OUT10" HEIMDALL_KEEPER_DIR="$KDIR10" \
+    HMD_STATUS_VERDICT_FILE="$WORK/does-not-exist.json" HMD_STATUS_ROSTER_JSON='[]' HMD_STATUS_NOW="$NOW" \
+    "$WRITER" >/dev/null 2>&1 )
+EXPECT_REPO10="$(git -C "$REPO10" rev-parse --show-toplevel)"
+GOT_REPO10="$(jq -r '.repo' "$OUT10")"
+[ "$GOT_REPO10" = "$EXPECT_REPO10" ] && ok "(10) repo = git rev-parse --show-toplevel of the invoking tree" || bad "(10) repo wrong: got '$GOT_REPO10' want '$EXPECT_REPO10'"
+[ "$GOT_REPO10" != "$ROOT" ] && ok "(10) repo stamp is tree-specific (not the heimdall repo itself)" || bad "(10) repo stamp leaked the wrong tree"
 
 echo ""
 echo "  ${PASS} passed, ${FAIL} failed"
