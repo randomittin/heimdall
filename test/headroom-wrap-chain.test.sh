@@ -39,9 +39,14 @@
 #
 # Guarantees proved:
 #   1. The chain starts the recorder and returns a base URL pointed at it.
-#   2. HEADROOM_COMPRESSION_TIMEOUT_SECONDS=130 reaches the child when the caller sets
-#      nothing — the chosen default (~2x the worst synchronous compression run
-#      measured on the machine this was tuned on: 64.75s against Headroom's own 30s).
+#   2. HEADROOM_COMPRESSION_TIMEOUT_SECONDS=30 reaches the child when the caller sets
+#      nothing. This asserted 130 until the 0.35.0 root-cause pass: on 0.35.0 the
+#      budget is not a background-worker budget but a PRE-UPSTREAM stall (upstream
+#      #2357 turned cache-mode cold start into a synchronous
+#      `anthropic_pipeline.apply(..., timeout=COMPRESSION_TIMEOUT_SECONDS)` that runs
+#      before the request is forwarded), so 130s guaranteed the client abandoned the
+#      turn first. 30 is upstream's own default, pinned so hmd's stall ceiling cannot
+#      move if upstream's default does.
 #   3. A caller-exported override reaches the child UNCHANGED — the same
 #      ${VAR:-default} pattern hmd_headroom_port already uses, never clobbered.
 #   4. HEADROOM_BACKGROUND_COMPRESSION is NOT set on the child — locks in the
@@ -59,6 +64,23 @@
 #      UNCHANGED — same ${VAR:-default} precedent as guarantee 3.
 #   8. HEADROOM_KOMPRESS_MAX_TOKENS is scoped to the ONE child process, same as
 #      guarantee 5: it does not leak into the sourcing shell's own environment.
+#   9. HEADROOM_LOSSLESS=1 reaches the child when the caller sets nothing. This is the
+#      var that keeps STREAMING working, not a savings knob: without it Headroom
+#      injects its `headroom_retrieve` tool, `buffered_stream_ccr` goes true, and a
+#      client `stream:true` request is silently forwarded upstream as `stream:false`
+#      and buffered — time-to-first-byte becomes the whole generation, which is the
+#      `0 stream events received` half of the live failure, and it routes essentially
+#      all traffic through the one return path that copies the upstream content-type
+#      verbatim, which is the `non-streaming request was answered with a stream` half.
+#      Upstream: #3071 and #3130, neither fixed in any released version.
+#  10. A caller-exported HEADROOM_LOSSLESS override reaches the child UNCHANGED — same
+#      ${VAR:-default} precedent as guarantees 3 and 7. `0` is a real opt-out (click
+#      types the flag as boolean), so an operator can restore upstream's CCR default.
+#  11. HEADROOM_LOSSLESS is scoped to the ONE child process, same as guarantees 5/8.
+#  12. HEADROOM_NO_CCR is NOT set on the child. It would silence the same downgrade,
+#      but upstream documents it as "lossy compression with no recovery path" whereas
+#      --lossless leaves would-need-a-marker content uncompacted. Asserting the
+#      absence stops a future edit trading fidelity for the same streaming fix.
 #
 # FALSIFIABILITY (run by hand, see the commit message for the transcript): with the
 # HEADROOM_COMPRESSION_TIMEOUT_SECONDS line reverted out of hmd-headroom-chain.sh,
@@ -68,7 +90,8 @@
 # HEADROOM_KOMPRESS_MAX_TOKENS line reds out guarantee 6 alone (the line is absent
 # from the recorded child env) while every other guarantee, 2 included, stays green —
 # the two vars are independently wired and independently falsifiable, not a single
-# guard that happens to cover both.
+# guard that happens to cover both. Reverting only the HEADROOM_LOSSLESS line reds out
+# guarantee 9 alone, on the same terms.
 #
 # Usage:  bash test/headroom-wrap-chain.test.sh   (exit 0 = every guarantee holds)
 set -uo pipefail
@@ -208,11 +231,11 @@ WHY1="$(cat "$TMP/why1" 2>/dev/null || echo "")"
   || bad "the recorder never wrote its environment dump ($ENV1) — nothing to assert on"
 
 echo
-echo "2 — HEADROOM_COMPRESSION_TIMEOUT_SECONDS=130 reaches the child by default"
+echo "2 — HEADROOM_COMPRESSION_TIMEOUT_SECONDS=30 reaches the child by default"
 if [ -s "$ENV1" ]; then
-  grep -q '^HEADROOM_COMPRESSION_TIMEOUT_SECONDS=130$' "$ENV1" \
-    && ok "the child process env carries HEADROOM_COMPRESSION_TIMEOUT_SECONDS=130" \
-    || bad "no HEADROOM_COMPRESSION_TIMEOUT_SECONDS=130 line in the child's recorded env: $(grep '^HEADROOM_COMPRESSION_TIMEOUT_SECONDS=' "$ENV1" 2>/dev/null || echo '<absent entirely>')"
+  grep -q '^HEADROOM_COMPRESSION_TIMEOUT_SECONDS=30$' "$ENV1" \
+    && ok "the child process env carries HEADROOM_COMPRESSION_TIMEOUT_SECONDS=30" \
+    || bad "no HEADROOM_COMPRESSION_TIMEOUT_SECONDS=30 line in the child's recorded env: $(grep '^HEADROOM_COMPRESSION_TIMEOUT_SECONDS=' "$ENV1" 2>/dev/null || echo '<absent entirely>')"
 else
   bad "guarantee 2 skipped — no env dump from guarantee 1 to check"
 fi
@@ -236,7 +259,7 @@ RC2="$(cat "$TMP/rc2" 2>/dev/null || echo 1)"
 [ -s "$TMP/home2/headroom/proxy.pid" ] && LIVE_PIDS="$LIVE_PIDS $(cat "$TMP/home2/headroom/proxy.pid")"
 if [ "$RC2" = "0" ] && [ -s "$ENV2" ]; then
   grep -q '^HEADROOM_COMPRESSION_TIMEOUT_SECONDS=45$' "$ENV2" \
-    && ok "a caller override (45) reaches the child instead of the 130 default" \
+    && ok "a caller override (45) reaches the child instead of the 30 default" \
     || bad "the override did not reach the child: $(grep '^HEADROOM_COMPRESSION_TIMEOUT_SECONDS=' "$ENV2" 2>/dev/null || echo '<absent>')"
 else
   bad "guarantee 3 skipped — chain did not start cleanly (rc=$RC2)"
@@ -338,6 +361,84 @@ SCOPE5="$(cat "$TMP/scope5" 2>/dev/null || echo "<no result>")"
 [ "$SCOPE5" = "SCOPE-OK" ] \
   && ok "HEADROOM_KOMPRESS_MAX_TOKENS does not leak into the sourcing shell after the chain returns" \
   || bad "HEADROOM_KOMPRESS_MAX_TOKENS leaked into the sourcing shell: $SCOPE5"
+
+echo
+echo "9 — HEADROOM_LOSSLESS=1 reaches the child by default (the streaming fix)"
+if [ -s "$ENV1" ]; then
+  grep -q '^HEADROOM_LOSSLESS=1$' "$ENV1" \
+    && ok "the child process env carries HEADROOM_LOSSLESS=1" \
+    || bad "no HEADROOM_LOSSLESS=1 line in the child's recorded env — the proxy will inject headroom_retrieve and silently downgrade streaming requests to buffered non-stream (#3071/#3130): $(grep '^HEADROOM_LOSSLESS=' "$ENV1" 2>/dev/null || echo '<absent entirely>')"
+else
+  bad "guarantee 9 skipped — no env dump from guarantee 1 to check"
+fi
+
+echo
+echo "10 — an operator-supplied HEADROOM_LOSSLESS override reaches the child unchanged"
+PORT6=$((BASE_PORT + 5))
+ENV6="$TMP/env6"
+(
+  export HEADROOM_LOSSLESS=0
+  . "$CHAIN"
+  export HMD_HEADROOM_BIN="$FAKE_BIN"
+  export HMD_MODULES_STATE="$MODSTATE"
+  export HEIMDALL_HOME="$TMP/home6"
+  export HEADROOM_PORT="$PORT6"
+  export HMD_FAKE_HEADROOM_ENV_FILE="$ENV6"
+  hmd_headroom_chain "$TMP/plugin"
+  printf '%s\n' "$?" > "$TMP/rc6"
+)
+RC6="$(cat "$TMP/rc6" 2>/dev/null || echo 1)"
+[ -s "$TMP/home6/headroom/proxy.pid" ] && LIVE_PIDS="$LIVE_PIDS $(cat "$TMP/home6/headroom/proxy.pid")"
+if [ "$RC6" = "0" ] && [ -s "$ENV6" ]; then
+  grep -q '^HEADROOM_LOSSLESS=0$' "$ENV6" \
+    && ok "a caller opt-out (0) reaches the child instead of the 1 default" \
+    || bad "the override did not reach the child: $(grep '^HEADROOM_LOSSLESS=' "$ENV6" 2>/dev/null || echo '<absent>')"
+else
+  bad "guarantee 10 skipped — chain did not start cleanly (rc=$RC6)"
+fi
+
+echo
+echo "11 — HEADROOM_LOSSLESS is scoped to the ONE child; it does not leak into the sourcing shell"
+PORT7=$((BASE_PORT + 6))
+ENV7="$TMP/env7"
+(
+  unset HEADROOM_LOSSLESS
+  . "$CHAIN"
+  export HMD_HEADROOM_BIN="$FAKE_BIN"
+  export HMD_MODULES_STATE="$MODSTATE"
+  export HEIMDALL_HOME="$TMP/home7"
+  export HEADROOM_PORT="$PORT7"
+  export HMD_FAKE_HEADROOM_ENV_FILE="$ENV7"
+  hmd_headroom_chain "$TMP/plugin" >/dev/null 2>&1
+  if [ -z "${HEADROOM_LOSSLESS:-}" ]; then
+    echo "SCOPE-OK" > "$TMP/scope7"
+  else
+    echo "LEAKED=$HEADROOM_LOSSLESS" > "$TMP/scope7"
+  fi
+)
+[ -s "$TMP/home7/headroom/proxy.pid" ] && LIVE_PIDS="$LIVE_PIDS $(cat "$TMP/home7/headroom/proxy.pid")"
+SCOPE7="$(cat "$TMP/scope7" 2>/dev/null || echo "<no result>")"
+[ "$SCOPE7" = "SCOPE-OK" ] \
+  && ok "HEADROOM_LOSSLESS does not leak into the sourcing shell after the chain returns" \
+  || bad "HEADROOM_LOSSLESS leaked into the sourcing shell: $SCOPE7"
+
+echo
+echo "12 — HEADROOM_NO_CCR is NOT the knob this chain reaches for"
+# --no-ccr also stops the headroom_retrieve injection, so it would silence the same
+# streaming downgrade — but upstream documents it as "lossy compression with no
+# recovery path", i.e. it keeps destroying content while removing the way back.
+# --lossless leaves such content uncompacted instead. Asserting the ABSENCE keeps a
+# future edit from swapping in the cheaper-looking var and quietly trading fidelity
+# for the same streaming fix.
+if [ -s "$ENV1" ]; then
+  if grep -q '^HEADROOM_NO_CCR=' "$ENV1"; then
+    bad "HEADROOM_NO_CCR is set on the child — that is the lossy-with-no-recovery variant; HEADROOM_LOSSLESS is the one this chain uses"
+  else
+    ok "HEADROOM_NO_CCR is absent from the child env, as intended"
+  fi
+else
+  bad "guarantee 12 skipped — no env dump from guarantee 1 to check"
+fi
 
 echo
 echo "--------------------------------------------------------------------"

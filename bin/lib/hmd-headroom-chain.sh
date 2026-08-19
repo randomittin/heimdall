@@ -171,16 +171,18 @@ hmd_headroom_chain() {
   # "30") and read by every handler with no mode guard anywhere on it — so raising it
   # gives a cold-start-large request more wall-clock budget before Python's inability
   # to preempt a worker thread turns a slow compression into a leaked thread and a
-  # quarantine that blocks OTHER concurrent sessions' compression too. 130s is ~2x the
-  # worst synchronous run measured on this machine (64.75s, against the 30s upstream
-  # default) — a partial mitigation (raises the bar, does not remove it — a
-  # still-larger request can still exceed it), not a complete fix: upstream has no
-  # released way to keep an oversized cold-start context off the synchronous path in
-  # cache mode. And at the pinned version the OTHER half of the blast radius is NOT
-  # bounded at all: the quarantine at proxy/server.py:1123-1131 holds new work off
-  # "until every known post-timeout worker has genuinely exited", with no time cap and
-  # no env var to impose one. Raising the timeout therefore trades a longer worst-case
-  # stall for a lower chance of entering that unbounded state.
+  # quarantine that blocks OTHER concurrent sessions' compression too. It was raised to
+  # 130s here — ~2x the worst synchronous run measured on this machine, 64.75s against
+  # the 30s upstream default — on that reasoning, and it is now back at 30. The reason
+  # for the reversal is a client-visible cost the "background worker budget" framing
+  # missed entirely, set out under HEADROOM_COMPRESSION_TIMEOUT_SECONDS in the block
+  # immediately above the launch line; read that before raising it again. The half of
+  # the blast radius the raise was meant to reduce is genuinely unbounded at the pinned
+  # version — the quarantine at proxy/server.py:1123-1131 holds new work off "until
+  # every known post-timeout worker has genuinely exited", with no time cap and no env
+  # var to impose one — so this is a real trade, not a free revert: it accepts a higher
+  # chance of entering that state in exchange for never stalling a prompt for two
+  # minutes with nothing on the wire.
   #
   # HEADROOM_KOMPRESS_MAX_TOKENS is the size-gate half of #1171 (fork-assessment doc,
   # docs/superpowers/specs/2026-08-19-headroom-fork-assessment.md §1a; recommended
@@ -234,11 +236,102 @@ hmd_headroom_chain() {
   #     it unset is still right — it is opt-in and off by default — but the mode-no-op
   #     justification is 0.35.0's, so it is no longer stated as this version's reason.
   #
-  # All three vars this file touches (ANTHROPIC_BASE_URL — see the file header —
-  # HEADROOM_COMPRESSION_TIMEOUT_SECONDS, and HEADROOM_KOMPRESS_MAX_TOKENS) are scoped
-  # to this ONE child only, and all three stay overridable by whatever the operator
-  # already exported — same ${VAR:-default} precedent as hmd_headroom_port() above.
-  ( HEADROOM_COMPRESSION_TIMEOUT_SECONDS="${HEADROOM_COMPRESSION_TIMEOUT_SECONDS:-130}" \
+  # HEADROOM_LOSSLESS=1 IS THE ONE SETTING THAT KEEPS STREAMING WORKING. It is not a
+  # savings tuning knob; it is the fix for the live failure that forced the 0.35.0
+  # rollback, and it is why this chain is safe on 0.35.0 at all.
+  #
+  # THE FAILURE, as a live Claude Code session saw it: `API returned an empty or
+  # malformed response (HTTP 200) ... content-type event-stream, body is an event
+  # stream (the non-streaming request was answered with a stream) ... This was the
+  # non-streaming retry of streaming request ... which failed with: other; 0 stream
+  # events received.` Upstream tracks that exact string as headroomlabs-ai/headroom
+  # #3130 (OPEN), with the streaming half as #3071 and the empty-200 half as
+  # #2952/#3019/#3040/#3055. NONE of the fixes are in a released version: #3131 (the
+  # content-type fix) is unmerged, and #3092/#2953 merged only AFTER the 0.35.0 tag.
+  # There is no version to upgrade to; the usage has to route around it.
+  #
+  # THE MECHANISM, measured against an isolated 0.35.0 proxy driven by a local fake
+  # upstream (no credentials, no real API calls), reading what the UPSTREAM actually
+  # received rather than what the client asked for:
+  #   1. Headroom injects its `headroom_retrieve` tool into the tools array whenever a
+  #      session has ever compressed. proxy/handlers/anthropic.py then computes
+  #      `buffered_stream_ccr = stream AND ccr_handler_enabled AND
+  #      _has_headroom_retrieve_tool(...)`, and when true it REWRITES the client's
+  #      `stream:true` to `stream:false` upstream, buffers the entire generation, and
+  #      re-synthesizes SSE afterwards. Time-to-first-byte becomes the whole
+  #      generation. That is symptom 1: the client waits, receives nothing, and
+  #      reports `0 stream events received`.
+  #   2. The buffered/non-streaming return path forwards the upstream response with
+  #      `dict(response.headers)` and pops only content-encoding and content-length —
+  #      `content-type` rides along verbatim. Whenever that path carries an SSE-typed
+  #      upstream reply, the client is handed HTTP 200 + `text/event-stream` for a
+  #      request it made non-streaming. That is symptom 2, and #3130's own diagnosis
+  #      names this code site.
+  # Reproduced here: client `stream:true` -> upstream received `stream:false` with
+  # `headroom_retrieve` appended, and the reply carried the JSON upstream's request-id
+  # under an SSE content-type. Reproduced on 0.33.0 too — the header-copy defect is in
+  # BOTH versions, so this is not a 0.35.0 regression to wait out.
+  #
+  # WHY 0.35.0 MADE IT FIRE CONSTANTLY, and 0.33.0 did not. Upstream #2848 (shipped in
+  # 0.35.0) widened injection from "only markers created THIS turn" to "any marker
+  # present", and made it session-sticky. Measured, same payload, same env, only the
+  # version differing: on 0.33.0 a `<<ccr:...>>` marker already seen in the forwarded
+  # prefix injects NOTHING and the upstream receives `stream:true`; on 0.35.0 that
+  # request AND the following marker-free request both inject the tool and both arrive
+  # upstream as `stream:false`. So 0.35.0 turns an occasional downgrade into a
+  # per-turn one, which is why the failure only became visible after the upgrade.
+  #
+  # WHAT HEADROOM_LOSSLESS=1 DOES ABOUT IT. proxy/server.py's `if config.lossless:`
+  # branch sets `config.ccr_inject_tool = False` (and `ccr_inject_marker = False`,
+  # `router_config.lossless`, `smart_crusher_lossless_only`) — identical wiring in both
+  # versions, so this is safe at the currently pinned 0.33.0 as well as at 0.35.0. With
+  # the tool never injected, `buffered_stream_ccr` can never be true: streaming stays
+  # streaming, and the verbatim-content-type path is only ever reached by genuinely
+  # non-streaming requests, where the upstream reply is JSON anyway. Verified on the
+  # isolated 0.35.0 proxy: upstream receives `stream:true`, the client gets the real
+  # 46-event passthrough stream with the streaming upstream's request-id, and a
+  # `stream:false` request still comes back `application/json`.
+  #
+  # WHY LOSSLESS AND NOT HEADROOM_NO_CCR. Both disable the injection, but `--no-ccr`
+  # is documented as "lossy compression with no recovery path" — it keeps destroying
+  # content while removing the only way to get it back. `--lossless` instead leaves
+  # content that would need a recovery marker UNCOMPACTED. This repo's whole argument
+  # for putting a rewriter in front of generation is that the bytes reaching the model
+  # are not degraded, so the lossy-with-no-recovery variant is not available to it.
+  # The cost is CCR's share of savings only: $42.90 lifetime on this machine against
+  # caching's $17,360.72 (fork-assessment doc §0), and caching is untouched — the proxy
+  # still reports `mode: cache` and a healthy cache component with this set.
+  #
+  # HEADROOM_LOSSLESS=0 is a real opt-out, not a no-op: click types the flag as
+  # boolean, so "0"/"false" resolve to False and restore upstream's CCR default for an
+  # operator who wants it back and accepts the streaming risk.
+  #
+  # HEADROOM_COMPRESSION_TIMEOUT_SECONDS is pinned to upstream's OWN default (30)
+  # rather than the 130 this file carried while 0.35.0 was installed. 130 was chosen as
+  # ~2x a 64.75s synchronous run, on the theory that the budget only bounded a
+  # background worker. On 0.35.0 that is wrong in a client-visible way: upstream #2357
+  # changed cache-mode COLD START from silent passthrough to a full synchronous
+  # `anthropic_pipeline.apply(..., timeout=COMPRESSION_TIMEOUT_SECONDS)` that runs
+  # BEFORE the request is forwarded, so the budget is a pre-upstream stall with zero
+  # bytes sent. Measured across the same requests on both versions: 0.33.0 logged 0
+  # `[router]` invocations (cache mode never entered the content router at all), 0.35.0
+  # logged one per cold start. 130s therefore guarantees the client gives up first on
+  # exactly the largest payload of every session. Pinning 30 rather than dropping the
+  # override keeps hmd's stall ceiling from moving if upstream's default ever does.
+  #
+  # Isolation note for the two vars above: neither was the cause. Re-running the
+  # streaming and non-streaming probes on 0.35.0 with (130s, 10000), with upstream's
+  # (30s, 50000), and with the fix, the downgrade and the content-type mismatch were
+  # byte-identical in both non-fixed configurations — the confound was three
+  # simultaneous changes, and the version's injection widening is the one that matters.
+  #
+  # All four vars this file touches (ANTHROPIC_BASE_URL — see the file header —
+  # HEADROOM_LOSSLESS, HEADROOM_COMPRESSION_TIMEOUT_SECONDS, and
+  # HEADROOM_KOMPRESS_MAX_TOKENS) are scoped to this ONE child only, and all four stay
+  # overridable by whatever the operator already exported — same ${VAR:-default}
+  # precedent as hmd_headroom_port() above.
+  ( HEADROOM_LOSSLESS="${HEADROOM_LOSSLESS:-1}" \
+    HEADROOM_COMPRESSION_TIMEOUT_SECONDS="${HEADROOM_COMPRESSION_TIMEOUT_SECONDS:-30}" \
     HEADROOM_KOMPRESS_MAX_TOKENS="${HEADROOM_KOMPRESS_MAX_TOKENS:-10000}" \
     "$bin" proxy --host 127.0.0.1 --port "$port" >>"$logdir/proxy.log" 2>&1 & echo $! > "$logdir/proxy.pid" ) \
     || { HMD_HEADROOM_WHY="could not start the Headroom proxy — running unproxied"; return 1; }
