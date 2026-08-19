@@ -8,14 +8,19 @@
 # "test/headroom-wrap-chain.test.sh section 5" since it was written, and no such
 # file — or any test exercising hmd_headroom_chain / its HMD_HEADROOM_BIN seam —
 # ever existed. This is that file, scoped first to the timeout-debt quarantine
-# mitigation added during the headroom-ai 0.33.0 -> 0.35.0 upgrade:
+# mitigation first added during the headroom-ai 0.33.0 -> 0.35.0 upgrade (since rolled
+# back — the pinned and installed version is 0.33.0 again):
 # HEADROOM_COMPRESSION_TIMEOUT_SECONDS is now set on the proxy's OWN child process at
 # launch, scoped to that one process. HEADROOM_BACKGROUND_COMPRESSION is deliberately
-# NOT set: verified against installed 0.35.0 source that it is a no-op under the
-# CACHE mode hmd always launches in — proxy/background_compression.py gates its one
-# call site (proxy/handlers/anthropic.py) behind `is_token_mode(...)`, unchanged
-# between 0.33.0 and 0.35.0. Setting it would be config that looks like a fix for the
-# leak/quarantine cascade (upstream #1171) and does nothing.
+# NOT set: it is opt-in and off by default. An earlier version of this header added
+# that it is "a no-op under the CACHE mode hmd always launches in —
+# proxy/background_compression.py gates its one call site behind `is_token_mode(...)`,
+# unchanged between 0.33.0 and 0.35.0". The last clause was wrong: `is_token_mode`
+# appears nowhere in 0.33.0's proxy/background_compression.py, which reads the flag as
+# a plain env bool at proxy/server.py:1090-1092 and gates it at the call sites. The
+# behaviour these sections assert is unaffected — they prove which vars this file's
+# chain does and does not put on the child, not upstream's mode semantics — but the
+# justification was version-specific and is not restated as 0.33.0's.
 #
 # EXTENDED (same session, fork-assessment §1a — see
 # docs/superpowers/specs/2026-08-19-headroom-fork-assessment.md): the chain now also

@@ -426,6 +426,19 @@ was run, live or otherwise.
 
 ## 7. Kompress `backend: null` in `/health` while the log shows `backend=onnx` running (2026-08-19)
 
+> **READ THIS SECTION AS A RECORD OF 0.35.0, NOT OF THE PINNED VERSION.** The
+> measurements below were taken while headroom-ai 0.35.0 was installed on this
+> machine. It no longer is: the machine was rolled back to **0.33.0** later the
+> same day, because 0.35.0 correlated with proxy-mangled streaming responses in a
+> live Claude Code session, and `modules/headroom/manifest.json` pins 0.33.0 to
+> match. The finding is kept rather than deleted for two reasons — it is a real,
+> live-confirmed headroom-ai health-reporting bug that a future upgrade attempt
+> will want to know about, and it is part of the evidence for why 0.35.0 was tried
+> and abandoned. Nothing below has been re-measured against 0.33.0; treat every
+> `/health`, `/debug/warmup` and `proxy/server.py:NNNN` reference here as
+> 0.35.0-specific. §6 and earlier sections describe 0.33.0, which is what runs now.
+
+
 Follow-up from §6, explicitly flagged there and correctly left alone as out of
 scope for that pass. Since §6, headroom-ai was upgraded on this machine 0.33.0
 → 0.35.0 (`uv tool install --python 3.13 "headroom-ai[all]==0.35.0"`), and

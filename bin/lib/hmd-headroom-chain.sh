@@ -163,33 +163,33 @@ hmd_headroom_chain() {
   # Timeout-debt quarantine mitigation (upstream #1171/#2360). hmd launches with no
   # --mode flag, so Headroom's OWN default applies: CACHE mode (cli/proxy.py resolves
   # mode = flag > HEADROOM_MODE env > "cache", and this file sets neither). We do NOT
-  # set HEADROOM_BACKGROUND_COMPRESSION here — verified against installed 0.35.0
-  # source (proxy/background_compression.py's own docstring, and the enqueue call in
-  # proxy/handlers/anthropic.py) that it is gated behind `is_token_mode(...)` and is a
-  # documented no-op in every mode but token. Setting it on a proxy that always runs in
-  # cache mode would be config that LOOKS like a fix and does nothing.
+  # set HEADROOM_BACKGROUND_COMPRESSION here. It is off by default (opt-in,
+  # fail-open) at the pinned version and we leave it there; the version-specific
+  # reasoning for that is in the VERSION NOTE below.
   # HEADROOM_COMPRESSION_TIMEOUT_SECONDS is the lever that is real for cache mode: it
-  # is consumed mode-agnostically by the synchronous compression wrapper
-  # (proxy/server.py), so raising it gives a cold-start-large request more wall-clock
-  # budget before Python's inability to preempt a worker thread turns a slow
-  # compression into a leaked thread and a quarantine that blocks OTHER concurrent
-  # sessions' compression too. 130s is ~2x the worst synchronous run measured on this
-  # machine (64.75s, against the 30s upstream default) — a partial mitigation (raises
-  # the bar, does not remove it — a still-larger request can still exceed it), not a
-  # complete fix: upstream has no released way to keep an oversized cold-start context
-  # off the synchronous path in cache mode. 0.35.0 separately bounds the OTHER half of
-  # the blast radius on its own: HEADROOM_COMPRESSION_QUARANTINE_MAX_SECONDS (default
-  # 60s, upstream #2360) now caps how long a leaked worker can block new compression
-  # for OTHER sessions, so that one is left at its upstream default rather than
-  # overridden here.
+  # is consumed mode-agnostically — defined once in proxy/helpers.py:683-691 (default
+  # "30") and read by every handler with no mode guard anywhere on it — so raising it
+  # gives a cold-start-large request more wall-clock budget before Python's inability
+  # to preempt a worker thread turns a slow compression into a leaked thread and a
+  # quarantine that blocks OTHER concurrent sessions' compression too. 130s is ~2x the
+  # worst synchronous run measured on this machine (64.75s, against the 30s upstream
+  # default) — a partial mitigation (raises the bar, does not remove it — a
+  # still-larger request can still exceed it), not a complete fix: upstream has no
+  # released way to keep an oversized cold-start context off the synchronous path in
+  # cache mode. And at the pinned version the OTHER half of the blast radius is NOT
+  # bounded at all: the quarantine at proxy/server.py:1123-1131 holds new work off
+  # "until every known post-timeout worker has genuinely exited", with no time cap and
+  # no env var to impose one. Raising the timeout therefore trades a longer worst-case
+  # stall for a lower chance of entering that unbounded state.
   #
   # HEADROOM_KOMPRESS_MAX_TOKENS is the size-gate half of #1171 (fork-assessment doc,
   # docs/superpowers/specs/2026-08-19-headroom-fork-assessment.md §1a; recommended
-  # there as "untried... cheapest possible next step"). Installed 0.35.0 already caps
-  # a single content block's estimated size before it reaches the synchronous
-  # ModernBERT ONNX path (content_router.py:1839-1843, default "50000" when unset) —
-  # above the cap the block routes to LogCompressor/TextCrusher instead of ML
-  # (content_router.py:3701-3741). Measured on this machine before choosing 10000:
+  # there as "untried... cheapest possible next step"). Upstream already caps a single
+  # content block's estimated size before it reaches the synchronous ModernBERT ONNX
+  # path (content_router.py:1778-1783, default "50000" when unset) — above the cap the
+  # block routes to LogCompressor/TextCrusher instead of ML (the branch at
+  # content_router.py:3436-3467, whose "kompress size-gate fired" log line is what the
+  # grep below counts). Measured on this machine before choosing 10000:
   # `grep -c "size-gate fired"` across all six rotated ~/.headroom/logs/proxy.log*
   # files is 0 — the 50,000 default has NEVER once fired here, so it adds zero
   # protection today. Measured the traffic it would gate against: the 1,181 kompress
@@ -209,6 +209,30 @@ hmd_headroom_chain() {
   # than several 800+-word calls — so this gates the large-single-block failure mode
   # #1171 names, and does nothing for contention- or model-load-driven latency on
   # small blocks, a separate, still-unresolved mechanism.
+  #
+  # VERSION NOTE — every file:line and default above is 0.33.0's, RE-READ against the
+  # installed tree, not carried over. This block was first written while 0.35.0 was
+  # installed; the machine was rolled back to 0.33.0 the same day (0.35.0 correlated
+  # with proxy-mangled streaming responses in a live session), and
+  # modules/headroom/manifest.json pins 0.33.0 to match. Both vars this block sets were
+  # re-verified as REAL at 0.33.0 rather than assumed — neither became an inert no-op
+  # in the rollback:
+  #   HEADROOM_COMPRESSION_TIMEOUT_SECONDS  proxy/helpers.py:688        default "30"
+  #   HEADROOM_KOMPRESS_MAX_TOKENS          content_router.py:1780      default "50000"
+  # Two claims that WERE true of 0.35.0 and are not true here, recorded so neither gets
+  # relied on again:
+  #   - HEADROOM_COMPRESSION_QUARANTINE_MAX_SECONDS (0.35.0, upstream #2360) does not
+  #     exist in 0.33.0 at all — no such var, and no cap of any kind on the quarantine.
+  #     An earlier version of this comment said that var bounded the other half of the
+  #     blast radius "at its upstream default"; under the pinned version there is no
+  #     default to leave alone, which is why the paragraph above now says unbounded.
+  #   - the reason for not setting HEADROOM_BACKGROUND_COMPRESSION was "gated behind
+  #     is_token_mode(...), a no-op outside token mode", verified in 0.35.0's
+  #     proxy/background_compression.py. That does NOT reproduce at 0.33.0: the string
+  #     `is_token_mode` appears nowhere in that module, and the flag is read as a plain
+  #     env bool at proxy/server.py:1090-1092, gated at its call sites instead. Leaving
+  #     it unset is still right — it is opt-in and off by default — but the mode-no-op
+  #     justification is 0.35.0's, so it is no longer stated as this version's reason.
   #
   # All three vars this file touches (ANTHROPIC_BASE_URL — see the file header —
   # HEADROOM_COMPRESSION_TIMEOUT_SECONDS, and HEADROOM_KOMPRESS_MAX_TOKENS) are scoped
