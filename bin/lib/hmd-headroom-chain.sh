@@ -34,8 +34,9 @@
 #
 # ── ABSENCE IS A SUPPORTED STATE, NEVER A DEPENDENCY ──────────────────────────────────
 # Every failure path in this file returns non-zero with a reason and routes NOTHING. No
-# headroom installed, module removed, opted out, port occupied by a stranger, proxy refuses
-# to start, proxy starts and never becomes ready — all of them land on "run unproxied".
+# headroom installed, module removed, opted out, port occupied by a stranger, a live proxy
+# that cannot be verified to have CCR tool injection off, proxy refuses to start, proxy
+# starts and never becomes ready — all of them land on "run unproxied".
 # There is no path here that can block a prompt, and no unbounded wait: readiness is polled
 # with a hard ceiling, and every probe carries curl's own --max-time (macOS has no
 # timeout(1), so the ceiling has to live in the loop and in the client).
@@ -106,12 +107,15 @@ hmd_headroom_port() {
   printf '%s' "$p"
 }
 
-# hmd_headroom_probe <port> — is a HEADROOM proxy answering there, pointed at OUR provider?
-# Prints the upstream URL on success. Two refusals matter as much as the accept:
+# hmd_headroom_health <port> — is a HEADROOM proxy answering there, pointed at OUR
+# provider? Prints its whole /health body on success. Two refusals matter as much as the
+# accept:
 #   · a listener that is not headroom-proxy  -> we do not route a prompt into a stranger,
 #   · a headroom pointed somewhere else      -> that is a NEW DESTINATION, which is exactly
 #                                               what invariant 5 forbids.
-hmd_headroom_probe() {
+# The BODY rather than one field, because the reuse gate below needs `config.pid` from the
+# same response that answered those two questions — one fetch, one moment in time.
+hmd_headroom_health() {
   local port="$1" body svc up
   body="$(curl -s --max-time 3 "http://127.0.0.1:$port/health" 2>/dev/null)" || return 1
   [ -n "$body" ] || return 1
@@ -119,7 +123,102 @@ hmd_headroom_probe() {
   [ "$svc" = "headroom-proxy" ] || return 1
   up="$(printf '%s' "$body" | jq -r '.checks.upstream.url // empty' 2>/dev/null)"
   [ "$up" = "$HMD_HEADROOM_UPSTREAM" ] || return 1
-  printf '%s' "$up"
+  printf '%s' "$body"
+}
+
+# hmd_headroom_probe <port> — the same accept/refuse decision, printing the upstream
+# URL. Kept as the one-line answer for callers that only need "is a usable proxy
+# there"; the reuse path needs the whole body (for the pid), so it calls
+# hmd_headroom_health directly rather than paying a second /health round trip.
+hmd_headroom_probe() {
+  local body
+  body="$(hmd_headroom_health "$1")" || return 1
+  printf '%s' "$body" | jq -r '.checks.upstream.url // empty' 2>/dev/null
+}
+
+# ── REUSING A PROXY hmd DID NOT START ─────────────────────────────────────────────
+# A proxy answering on the port is reused (see the chain, step 1). That branch is why
+# HEADROOM_LOSSLESS alone did not fix the streaming break it was added for: the var is
+# put on proxies THIS FILE LAUNCHES, and a Headroom proxy is long-lived. One started by
+# `headroom wrap`, by hand, or by an hmd from before that fix keeps injecting
+# `headroom_retrieve` — and every later session that finds it on the port inherits the
+# downgrade, forever, with hmd reporting ROUTED the whole time. Measured on this
+# machine: the proxy on 8787 ran from 11:18 to 17:12 across many sessions, and its logs
+# carry 348 injections in the current log file alone.
+#
+# NOTHING IN /health DISTINGUISHES THE TWO. Measured 2026-08-19 against two real
+# 0.33.0 proxies on isolated workspaces, one launched with HEADROOM_LOSSLESS=0 and one
+# with =1: /health and /settings are byte-identical apart from pid, timestamp and
+# uptime — `lossless` and `ccr` appear in neither. So the check has to read the running
+# PROCESS, which /health does hand us (`config.pid`, loopback-only).
+
+# hmd_headroom_lossless_wanted — is injection-free mode what this chain would launch
+# with right now? Mirrors upstream's own truthiness (_get_env_bool: "true", "1", "yes",
+# "on") against the same ${VAR:-default} the launch line uses, so the gate below and
+# the proxy hmd starts can never disagree about what was asked for.
+hmd_headroom_lossless_wanted() {
+  case "$(printf '%s' "${HEADROOM_LOSSLESS:-1}" | tr '[:upper:]' '[:lower:]')" in
+    true|1|yes|on) return 0 ;;
+  esac
+  return 1
+}
+
+# hmd_headroom_proc_lossless <pid> — verdict on a RUNNING proxy, printed as one of
+# `lossless` / `lossy` / `unverified`. Exit status is 0 only for `lossless`.
+#
+# Two readings, in this order, because they have different platform costs:
+#   1. THE COMMAND LINE. `--lossless` is enough on its own upstream
+#      (`lossless = getattr(args, "lossless", False) or _get_env_bool(...)`), and a
+#      process's argv is readable everywhere. This is also the reading that always
+#      settles hmd's OWN proxy, because the launch below passes the flag precisely so
+#      that it can be verified without depending on 2.
+#   2. THE ENVIRONMENT (`ps eww`). Needed for a stranger that was configured the other
+#      documented way, HEADROOM_LOSSLESS=1 in the env. Environment visibility is NOT
+#      universal — macOS hides it for SIP-signed binaries (/bin/bash, /bin/sleep:
+#      measured, zero env tokens), while a uv-installed interpreter like Headroom's own
+#      exposes it — so `PATH=` is required as proof the dump really contains an
+#      environment. Without that proof an absent HEADROOM_LOSSLESS means "cannot see",
+#      not "not set", and the two must never collapse into the same verdict.
+hmd_headroom_proc_lossless() {
+  local pid="$1" argv dump val
+  case "$pid" in ''|*[!0-9]*) printf 'unverified'; return 1 ;; esac
+  argv="$(ps -ww -o command= -p "$pid" 2>/dev/null)"
+  [ -n "$argv" ] || { printf 'unverified'; return 1; }
+  case " $argv " in *" --lossless "*) printf 'lossless'; return 0 ;; esac
+  dump="$(ps eww -p "$pid" 2>/dev/null | tr ' ' '\n')"
+  printf '%s' "$dump" | grep -q '^PATH=' || { printf 'unverified'; return 1; }
+  val="$(printf '%s' "$dump" | sed -n 's/^HEADROOM_LOSSLESS=//p' | tail -1 | tr '[:upper:]' '[:lower:]')"
+  case "$val" in true|1|yes|on) printf 'lossless'; return 0 ;; esac
+  printf 'lossy'; return 1
+}
+
+# hmd_headroom_reuse_ok <port> <health_body> — THE GATE ITSELF, in one place because the
+# chain (which acts on it) and the report (which shows the operator what the chain will
+# do) must never be able to disagree. Prints the refusal line and returns 1 when the live
+# proxy must not be routed into; prints nothing and returns 0 when reuse is allowed.
+hmd_headroom_reuse_ok() {
+  local port="$1" health="$2" pid verdict
+  # The operator who exported a falsy HEADROOM_LOSSLESS asked for upstream's CCR default
+  # and accepted the streaming risk that comes with it. hmd enforces its own default; it
+  # does not overrule a stated choice — which is also why this needs no second opt-out var.
+  hmd_headroom_lossless_wanted || return 0
+  pid="$(printf '%s' "$health" | jq -r '.config.pid // empty' 2>/dev/null)"
+  verdict="$(hmd_headroom_proc_lossless "$pid")"
+  [ "$verdict" = "lossless" ] && return 0
+  hmd_headroom_reuse_refusal "$port" "$verdict"
+  return 1
+}
+
+# hmd_headroom_reuse_refusal <port> <verdict> — the one line the operator gets when a
+# live proxy is left alone. It names the fix AND the opt-out, because a refusal the
+# operator cannot act on is just an unexplained loss of compression.
+hmd_headroom_reuse_refusal() {
+  case "$2" in
+    lossy)
+      printf 'the Headroom proxy already listening on %s was started WITHOUT lossless mode: it injects headroom_retrieve, so streaming requests reach the provider as stream:false and the client sees `0 stream events received` (upstream #3071/#3130). Restart it (hmd starts one with --lossless), or export HEADROOM_LOSSLESS=0 to accept that and reuse it. Running unproxied.' "$1" ;;
+    *)
+      printf 'the Headroom proxy already listening on %s cannot be verified as lossless — its pid or environment is not readable from here — and an unverified proxy may be injecting headroom_retrieve, which downgrades streaming to buffered (upstream #3071/#3130). Export HEADROOM_LOSSLESS=0 to reuse it anyway. Running unproxied.' "$1" ;;
+  esac
 }
 
 # ── the chain ─────────────────────────────────────────────────────────────────────────
@@ -141,11 +240,25 @@ hmd_headroom_chain() {
 
   port="$(hmd_headroom_port)"
 
-  # 1. ALREADY LIVE? Reuse it. A second proxy on a busy port would fail to bind anyway, and
-  #    an operator who started `headroom proxy` by hand should keep the process they own.
-  if live="$(hmd_headroom_probe "$port")"; then
+  # 1. ALREADY LIVE? Reuse it — but only after checking it is not the thing this chain
+  #    exists to avoid. A second proxy on a busy port would fail to bind anyway, and an
+  #    operator who started `headroom proxy` by hand should keep the process they own; what
+  #    changes here is that hmd no longer ROUTES INTO a proxy whose CCR tool injection is on
+  #    (or unverifiable), because that proxy downgrades every streaming request the session
+  #    makes. See hmd_headroom_proc_lossless above for how the verdict is read, and the
+  #    HEADROOM_LOSSLESS block below for what the injection does. The gate is skipped
+  #    entirely when the operator has opted out of lossless mode: they asked for upstream's
+  #    CCR default, and hmd enforces its own default rather than overruling a stated choice.
+  local health refusal verified=""
+  if health="$(hmd_headroom_health "$port")"; then
+    live="$(printf '%s' "$health" | jq -r '.checks.upstream.url // empty' 2>/dev/null)"
+    if ! refusal="$(hmd_headroom_reuse_ok "$port" "$health")"; then
+      HMD_HEADROOM_WHY="$refusal"
+      return 1
+    fi
+    hmd_headroom_lossless_wanted && verified=", verified lossless"
     HMD_HEADROOM_BASE_URL="http://127.0.0.1:$port"
-    HMD_HEADROOM_WHY="reusing the Headroom proxy already listening on $port (upstream $live)"
+    HMD_HEADROOM_WHY="reusing the Headroom proxy already listening on $port (upstream $live$verified)"
     return 0
   fi
 
@@ -330,10 +443,24 @@ hmd_headroom_chain() {
   # HEADROOM_KOMPRESS_MAX_TOKENS) are scoped to this ONE child only, and all four stay
   # overridable by whatever the operator already exported — same ${VAR:-default}
   # precedent as hmd_headroom_port() above.
+  # THE FLAG IS PASSED AS WELL AS THE VAR, and the duplication is load-bearing rather than
+  # belt-and-braces. Upstream treats them as equivalent inputs
+  # (`lossless = getattr(args, "lossless", False) or _get_env_bool("HEADROOM_LOSSLESS",
+  # False)`), so the flag changes nothing about how THIS proxy behaves. What it changes is
+  # what a LATER hmd can prove about it: a process's argv is readable on every platform,
+  # its environment is not (macOS hides it for SIP-signed binaries), so a proxy launched
+  # with only the env var could survive its own session and then be refused as unverifiable
+  # by the very chain that started it. The var stays because it is the documented knob and
+  # because the operator's own value has to reach the child unchanged; the flag is only
+  # added when the effective value is truthy, so HEADROOM_LOSSLESS=0 remains a real opt-out
+  # rather than being silently overridden by an argument the operator never asked for.
+  local lossless_flag=""
+  hmd_headroom_lossless_wanted && lossless_flag="--lossless"
+  # shellcheck disable=SC2086  # deliberate: an empty $lossless_flag must expand to NO argument
   ( HEADROOM_LOSSLESS="${HEADROOM_LOSSLESS:-1}" \
     HEADROOM_COMPRESSION_TIMEOUT_SECONDS="${HEADROOM_COMPRESSION_TIMEOUT_SECONDS:-30}" \
     HEADROOM_KOMPRESS_MAX_TOKENS="${HEADROOM_KOMPRESS_MAX_TOKENS:-10000}" \
-    "$bin" proxy --host 127.0.0.1 --port "$port" >>"$logdir/proxy.log" 2>&1 & echo $! > "$logdir/proxy.pid" ) \
+    "$bin" proxy --host 127.0.0.1 --port "$port" $lossless_flag >>"$logdir/proxy.log" 2>&1 & echo $! > "$logdir/proxy.pid" ) \
     || { HMD_HEADROOM_WHY="could not start the Headroom proxy — running unproxied"; return 1; }
 
   # 4. Bounded readiness. The ceiling is the whole point: a proxy that never becomes ready
@@ -368,7 +495,15 @@ hmd_headroom_report() {
     printf 'NOT ROUTED — the headroom CLI is not installed'; return 0
   fi
   port="$(hmd_headroom_port)"
-  if live="$(hmd_headroom_probe "$port")"; then
+  local health refusal
+  if health="$(hmd_headroom_health "$port")"; then
+    live="$(printf '%s' "$health" | jq -r '.checks.upstream.url // empty' 2>/dev/null)"
+    if ! refusal="$(hmd_headroom_reuse_ok "$port" "$health")"; then
+      # A refusal the operator cannot see is indistinguishable from a silent proxy: they
+      # would see a running Headroom on the port and assume it is on the wire.
+      printf 'NOT ROUTED — %s' "$refusal"
+      return 0
+    fi
     printf 'ROUTED — generation traffic goes to http://127.0.0.1:%s, which forwards to %s. Judgment does NOT: hmd_gate_exec scrubs it.' "$port" "$live"
   else
     printf 'NOT ROUTED — no Headroom proxy is listening on %s (it starts on the next `hmd wrap`)' "$port"

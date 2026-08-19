@@ -81,6 +81,38 @@
 #      but upstream documents it as "lossy compression with no recovery path" whereas
 #      --lossless leaves would-need-a-marker content uncompacted. Asserting the
 #      absence stops a future edit trading fidelity for the same streaming fix.
+##  13. The proxy the chain STARTS carries `--lossless` on its command line, not only in
+#      its environment. Upstream treats the two as equivalent inputs, so the proxy
+#      behaves identically either way; what the flag buys is that a LATER session can
+#      verify it, because argv is readable on every platform and environments are not
+#      (macOS hides them for SIP-signed binaries — measured: /bin/bash and /bin/sleep
+#      expose zero env tokens to `ps eww`, Headroom's uv-installed interpreter exposes
+#      its full environment).
+#  14. A proxy ALREADY LISTENING that was started WITHOUT lossless mode is NOT reused.
+#      This is the half of the streaming fix guarantee 9 could not reach: the var is
+#      only ever put on proxies this file launches, a Headroom proxy is long-lived, and
+#      one started by `headroom wrap`, by hand, or by an hmd predating the fix keeps
+#      injecting `headroom_retrieve` for every session that finds it on the port.
+#      Nothing in /health or /settings distinguishes the two (measured against two real
+#      0.33.0 proxies: byte-identical apart from pid, timestamp and uptime), so the
+#      verdict is read from the running PROCESS via the pid /health does report.
+#  15. A live proxy carrying HEADROOM_LOSSLESS=1 in its ENVIRONMENT is still reused —
+#      the check must not cost an operator the proxy they correctly configured. Not
+#      observable on a host that hides process environments; reported as a NOTE there,
+#      never as a silent skip.
+#  16. An explicit HEADROOM_LOSSLESS=0 reuses a lossy proxy anyway. That operator asked
+#      for upstream's CCR default and accepted the streaming risk; hmd enforces its own
+#      default rather than overruling a stated choice. This is also the documented
+#      escape hatch, which is why the gate adds no second opt-out variable.
+#  17. The `--lossless` FLAG alone counts, with no env var set — upstream reads
+#      `args.lossless or _get_env_bool(...)`, so an env-only check would refuse a proxy
+#      that is in fact safe.
+#  18. hmd_headroom_report says NOT ROUTED, with the reason, whenever the chain would
+#      refuse. A refusal the operator cannot see is as bad as a silent proxy: they would
+#      see Headroom running on the port and assume it is on the wire.
+#  19. The proxy hmd itself started IS reused by the next chain run. The regression that
+#      pairs with 14: a gate that refused every proxy it did not start in THIS process
+#      would cost every session after the first its compression.
 #
 # FALSIFIABILITY (run by hand, see the commit message for the transcript): with the
 # HEADROOM_COMPRESSION_TIMEOUT_SECONDS line reverted out of hmd-headroom-chain.sh,
@@ -92,6 +124,18 @@
 # the two vars are independently wired and independently falsifiable, not a single
 # guard that happens to cover both. Reverting only the HEADROOM_LOSSLESS line reds out
 # guarantee 9 alone, on the same terms.
+#
+# FALSIFIABILITY OF THE REUSE GATE (run this session, both directions): neutering
+# hmd_headroom_reuse_ok's verdict (making it return 0 unconditionally) turns 14 and 18
+# RED together and nothing else — they are the act-on-it and show-it-to-the-operator
+# halves of one gate, which is why the gate lives in exactly one function. Separately,
+# dropping only the `--lossless` argument from the launch line reds out 13 alone, with
+# 19 still green here because this host happens to expose environments; on a host that
+# does not, that same revert would additionally cost hmd the ability to verify its own
+# proxy. An earlier version of guarantee 14's second assertion matched the bare word
+# "lossless" and stayed GREEN under the first revert, because the REUSE message says
+# "verified lossless" too; it now matches "WITHOUT lossless". That miss was found by
+# running the falsification, not by reading the code.
 #
 # Usage:  bash test/headroom-wrap-chain.test.sh   (exit 0 = every guarantee holds)
 set -uo pipefail
@@ -129,7 +173,7 @@ bash -n "$CHAIN" && ok "bin/lib/hmd-headroom-chain.sh parses (bash -n)" \
 # Separate file (not a nested heredoc) so quoting stays simple and robust.
 HTTP_SERVER_PY="$TMP/fake_http_server.py"
 cat > "$HTTP_SERVER_PY" <<'PYEOF'
-import sys, json
+import os, sys, json
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 port = int(sys.argv[1])
@@ -144,10 +188,15 @@ class Handler(BaseHTTPRequestHandler):
         return None
 
     def do_GET(self):
+        # `config` is loopback-only in the real proxy (server.py `_health_payload`,
+        # include_config=_request_is_loopback(request)) and carries the serving
+        # process's own pid. The chain reads that pid to check whether a proxy it did
+        # not start has CCR tool injection off, so the fixture has to carry it too.
         body = json.dumps(
             {
                 "service": "headroom-proxy",
                 "checks": {"upstream": {"url": "https://api.anthropic.com"}},
+                "config": {"pid": os.getpid()},
             }
         ).encode("utf-8")
         self.send_response(200)
@@ -177,7 +226,7 @@ case "\${1:-}" in
       prev="\$a"
     done
     env > "\${HMD_FAKE_HEADROOM_ENV_FILE:?HMD_FAKE_HEADROOM_ENV_FILE not set}"
-    exec python3 "$HTTP_SERVER_PY" "\$port"
+    exec python3 "$HTTP_SERVER_PY" "\$port" "\$@"
     ;;
   --version)
     echo "headroom, version FAKE-RECORDER"
@@ -438,6 +487,193 @@ if [ -s "$ENV1" ]; then
   fi
 else
   bad "guarantee 12 skipped — no env dump from guarantee 1 to check"
+fi
+
+echo
+echo "13 — the proxy hmd starts carries --lossless on its COMMAND LINE, not only in its env"
+# Upstream treats flag and env var as equivalent inputs, so this changes nothing about
+# how the proxy behaves. It changes what a LATER session can PROVE about it: argv is
+# readable on every platform, environments are not (macOS hides them for SIP-signed
+# binaries — measured: /bin/bash and /bin/sleep expose zero env tokens to `ps eww`).
+# Without the flag, hmd's own long-lived proxy would eventually be refused as
+# unverifiable by the very chain that started it.
+PROXY1_PID="$(cat "$TMP/home1/headroom/proxy.pid" 2>/dev/null || echo "")"
+PROXY1_ARGV="$(ps -ww -o command= -p "${PROXY1_PID:-0}" 2>/dev/null || echo "")"
+case " $PROXY1_ARGV " in
+  *" --lossless "*) ok "the running proxy's argv carries --lossless (${PROXY1_ARGV##*/})" ;;
+  "  ") bad "guarantee 13 skipped — no live proxy from guarantee 1 to inspect (pid '$PROXY1_PID')" ;;
+  *) bad "the proxy hmd started has no --lossless in its argv, so a later session cannot verify it without reading its environment: '$PROXY1_ARGV'" ;;
+esac
+
+# ── fixture: a STRANGER proxy — one hmd did NOT start, already listening when the
+# chain runs. This is the reuse branch, and it is the branch the HEADROOM_LOSSLESS fix
+# could not reach: the var is put on proxies this file LAUNCHES, while a long-lived
+# proxy started by `headroom wrap`, by hand, or by an hmd predating the fix keeps
+# injecting `headroom_retrieve` and keeps downgrading streaming for every session that
+# reuses it. Prints the stranger's pid; the caller adds it to LIVE_PIDS.
+start_stranger() {  # <port> <envfile> [extra proxy args...]
+  local port="$1" envfile="$2"; shift 2
+  HMD_FAKE_HEADROOM_ENV_FILE="$envfile" "$FAKE_BIN" proxy --host 127.0.0.1 --port "$port" "$@" \
+    >/dev/null 2>&1 &
+  local pid=$! i=0
+  while [ "$i" -lt 60 ]; do
+    if curl -s --max-time 2 "http://127.0.0.1:$port/health" 2>/dev/null | grep -q headroom-proxy; then
+      printf '%s' "$pid"; return 0
+    fi
+    sleep 0.25; i=$((i+1))
+  done
+  kill "$pid" >/dev/null 2>&1 || true
+  return 1
+}
+
+# run_chain_against <port> <home> — source the chain and drive it at an already-busy
+# port. Writes rc / url / why to $TMP/<home>.{rc,url,why}.
+run_chain_against() {
+  local port="$1" home="$2"
+  (
+    . "$CHAIN"
+    export HMD_HEADROOM_BIN="$FAKE_BIN"
+    export HMD_MODULES_STATE="$MODSTATE"
+    export HEIMDALL_HOME="$TMP/$home"
+    export HEADROOM_PORT="$port"
+    export HMD_FAKE_HEADROOM_ENV_FILE="$TMP/$home.env"
+    hmd_headroom_chain "$TMP/plugin"
+    printf '%s\n' "$?"                        > "$TMP/$home.rc"
+    printf '%s\n' "$HMD_HEADROOM_BASE_URL"    > "$TMP/$home.url"
+    printf '%s\n' "$HMD_HEADROOM_WHY"         > "$TMP/$home.why"
+  )
+}
+
+echo
+echo "14 — a live proxy started WITHOUT lossless mode is NOT reused"
+PORT8=$((BASE_PORT + 7))
+PID8="$(unset HEADROOM_LOSSLESS; start_stranger "$PORT8" "$TMP/env8")" \
+  && LIVE_PIDS="$LIVE_PIDS $PID8"
+if [ -n "${PID8:-}" ]; then
+  run_chain_against "$PORT8" home8
+  RC8="$(cat "$TMP/home8.rc" 2>/dev/null || echo 0)"
+  WHY8="$(cat "$TMP/home8.why" 2>/dev/null || echo "")"
+  URL8="$(cat "$TMP/home8.url" 2>/dev/null || echo "")"
+  [ "$RC8" != "0" ] && [ -z "$URL8" ] \
+    && ok "the chain refuses to route into a CCR-injecting proxy it did not start (why: $WHY8)" \
+    || bad "the chain reused a proxy started without lossless mode (rc=$RC8 url=$URL8) — every streaming request through it is downgraded to buffered (#3071/#3130)"
+  # Matched on the phrase a REFUSAL uses, not on the bare word "lossless" — the reuse
+  # message says "verified lossless" too, so the loose match passed even with the gate
+  # removed (measured while falsifying this suite).
+  case "$WHY8" in
+    *"WITHOUT lossless"*) ok "the refusal names lossless mode, so the operator can act on it" ;;
+    *) bad "the refusal reason does not name lossless mode: '$WHY8'" ;;
+  esac
+  [ -s "$TMP/home8/headroom/proxy.pid" ] \
+    && bad "the chain started a SECOND proxy after refusing the live one" \
+    || ok "refusing routes nothing and starts nothing"
+else
+  bad "guarantee 14 skipped — the stranger proxy never became ready on $PORT8"
+fi
+
+echo
+echo "15 — a live proxy started WITH HEADROOM_LOSSLESS=1 IS reused"
+PORT9=$((BASE_PORT + 8))
+PID9="$(export HEADROOM_LOSSLESS=1; start_stranger "$PORT9" "$TMP/env9")" \
+  && LIVE_PIDS="$LIVE_PIDS $PID9"
+# Environment visibility is a property of the target binary, not of the host, so it is
+# measured on THIS process rather than assumed or probed on some unrelated pid.
+PS_ENV_VISIBLE=0
+[ -n "${PID9:-}" ] && ps eww -p "$PID9" 2>/dev/null | tr ' ' '\n' | grep -q '^PATH=' \
+  && PS_ENV_VISIBLE=1
+if [ "$PS_ENV_VISIBLE" = "1" ] && [ -n "${PID9:-}" ]; then
+  run_chain_against "$PORT9" home9
+  RC9="$(cat "$TMP/home9.rc" 2>/dev/null || echo 1)"
+  URL9="$(cat "$TMP/home9.url" 2>/dev/null || echo "")"
+  WHY9="$(cat "$TMP/home9.why" 2>/dev/null || echo "")"
+  [ "$RC9" = "0" ] && [ "$URL9" = "http://127.0.0.1:$PORT9" ] \
+    && ok "a verified-lossless live proxy is still reused (why: $WHY9)" \
+    || bad "the chain refused a proxy that IS lossless (rc=$RC9 url=$URL9 why=$WHY9) — the check is over-tight and costs the operator their running proxy"
+elif [ -n "${PID9:-}" ]; then
+  printf '  \033[33mNOTE\033[0m %s\n' "guarantee 15 not observable — this host hides this process's environment from ps, so an env-only-lossless stranger is refused as unverifiable (which is the safe direction, and what guarantee 14 proves)"
+else
+  bad "guarantee 15 skipped — the stranger proxy never became ready on $PORT9"
+fi
+
+echo
+echo "16 — an explicit HEADROOM_LOSSLESS=0 opt-out reuses a lossy proxy anyway"
+# The operator who exports 0 has ASKED for upstream's CCR default and accepted the
+# streaming risk with it. hmd enforces its own default; it does not overrule a choice
+# the operator stated. This is also the documented escape hatch for anyone who wants a
+# reused lossy proxy back, which is why no second opt-out variable exists.
+PORT10=$((BASE_PORT + 9))
+PID10="$(unset HEADROOM_LOSSLESS; start_stranger "$PORT10" "$TMP/env10")" \
+  && LIVE_PIDS="$LIVE_PIDS $PID10"
+if [ -n "${PID10:-}" ]; then
+  ( export HEADROOM_LOSSLESS=0; run_chain_against "$PORT10" home10 )
+  RC10="$(cat "$TMP/home10.rc" 2>/dev/null || echo 1)"
+  URL10="$(cat "$TMP/home10.url" 2>/dev/null || echo "")"
+  [ "$RC10" = "0" ] && [ "$URL10" = "http://127.0.0.1:$PORT10" ] \
+    && ok "HEADROOM_LOSSLESS=0 disables the reuse gate, as the operator asked" \
+    || bad "the reuse gate fired despite an explicit opt-out (rc=$RC10 url=$URL10 why=$(cat "$TMP/home10.why" 2>/dev/null))"
+else
+  bad "guarantee 16 skipped — the stranger proxy never became ready on $PORT10"
+fi
+
+echo
+echo "17 — a proxy started with the --lossless FLAG (no env var) is reused"
+# `lossless = getattr(args, "lossless", False) or _get_env_bool("HEADROOM_LOSSLESS",
+# False)` — the flag alone is enough upstream, so a check that only read the
+# environment would refuse a proxy that is in fact safe.
+PORT11=$((BASE_PORT + 10))
+PID11="$(unset HEADROOM_LOSSLESS; start_stranger "$PORT11" "$TMP/env11" --lossless)" \
+  && LIVE_PIDS="$LIVE_PIDS $PID11"
+if [ -n "${PID11:-}" ]; then
+  run_chain_against "$PORT11" home11
+  RC11="$(cat "$TMP/home11.rc" 2>/dev/null || echo 1)"
+  URL11="$(cat "$TMP/home11.url" 2>/dev/null || echo "")"
+  [ "$RC11" = "0" ] && [ "$URL11" = "http://127.0.0.1:$PORT11" ] \
+    && ok "the --lossless command-line flag counts as lossless, not just the env var" \
+    || bad "a --lossless proxy was refused (rc=$RC11 url=$URL11 why=$(cat "$TMP/home11.why" 2>/dev/null))"
+else
+  bad "guarantee 17 skipped — the stranger proxy never became ready on $PORT11"
+fi
+
+echo
+echo "18 — hmd_headroom_report tells the operator the live proxy is not being used"
+# A silent refusal is as bad as a silent proxy: `hmd modules status headroom` has to
+# say NOT ROUTED, and say why, or the operator sees a running proxy and assumes it is
+# on the wire.
+if [ -n "${PID8:-}" ]; then
+  REPORT8="$(
+    . "$CHAIN"
+    export HMD_MODULES_STATE="$MODSTATE"
+    export HMD_HEADROOM_BIN="$FAKE_BIN"
+    export HEADROOM_PORT="$PORT8"
+    hmd_headroom_report "$TMP/plugin"
+  )"
+  case "$REPORT8" in
+    "NOT ROUTED"*) ok "the report reads: $REPORT8" ;;
+    *) bad "the report claims traffic is routed through a proxy the chain refuses: '$REPORT8'" ;;
+  esac
+else
+  bad "guarantee 18 skipped — no refused stranger proxy from guarantee 14 to report on"
+fi
+
+echo
+echo "19 — the proxy hmd started IS reused by the next chain run (no self-refusal)"
+# The regression this pairs with guarantee 14: a gate that refuses every proxy it did
+# not start in THIS process would cost every session after the first its compression.
+# The chain re-enters the reuse branch against the proxy guarantee 1 launched.
+if [ -n "${PROXY1_PID:-}" ]; then
+  run_chain_against "$PORT1" home12
+  RC12="$(cat "$TMP/home12.rc" 2>/dev/null || echo 1)"
+  URL12="$(cat "$TMP/home12.url" 2>/dev/null || echo "")"
+  WHY12="$(cat "$TMP/home12.why" 2>/dev/null || echo "")"
+  [ "$RC12" = "0" ] && [ "$URL12" = "http://127.0.0.1:$PORT1" ] \
+    && ok "hmd reuses its own still-running proxy (why: $WHY12)" \
+    || bad "hmd refused the proxy it started itself (rc=$RC12 url=$URL12 why=$WHY12)"
+  case "$WHY12" in
+    *"verified lossless"*) ok "the reuse reason records that the verdict was measured, not assumed" ;;
+    *) bad "the reuse reason does not record the lossless verdict: '$WHY12'" ;;
+  esac
+else
+  bad "guarantee 19 skipped — no live proxy from guarantee 1 to reuse"
 fi
 
 echo
