@@ -17,6 +17,13 @@
 # between 0.33.0 and 0.35.0. Setting it would be config that looks like a fix for the
 # leak/quarantine cascade (upstream #1171) and does nothing.
 #
+# EXTENDED (same session, fork-assessment §1a — see
+# docs/superpowers/specs/2026-08-19-headroom-fork-assessment.md): the chain now also
+# sets HEADROOM_KOMPRESS_MAX_TOKENS=10000 on the same child, the size-gate half of
+# #1171. Sections 6-8 below prove the same three properties for this second var that
+# sections 2/3/5 already proved for the first: reaches the child by default, a caller
+# override is respected unchanged, and it does not leak into the sourcing shell.
+#
 # HOW THIS RUNS HERMETICALLY. HMD_HEADROOM_BIN (an existing test seam in the sourced
 # file) points hmd_headroom_chain at a tiny recorder instead of the real `headroom`
 # CLI: no network egress, no ML model, no real proxy. The recorder answers /health
@@ -38,12 +45,25 @@
 #   5. The var is scoped to the ONE child process: it does not leak into the
 #      sourcing shell's own environment (and therefore not into whatever hmd launches
 #      next in that same shell — the coding tool itself) after the chain returns.
+#   6. HEADROOM_KOMPRESS_MAX_TOKENS=10000 reaches the child when the caller sets
+#      nothing — chosen because it is ~2x the single largest real kompress block ever
+#      logged on the machine this was tuned on (2,464 tokens over 1,181 recovered
+#      events; 5,090 words over 775 raw ONNX calls), and the 50,000 upstream default
+#      it replaces was measured to have fired zero times, ever, on that same machine.
+#   7. A caller-exported override of HEADROOM_KOMPRESS_MAX_TOKENS reaches the child
+#      UNCHANGED — same ${VAR:-default} precedent as guarantee 3.
+#   8. HEADROOM_KOMPRESS_MAX_TOKENS is scoped to the ONE child process, same as
+#      guarantee 5: it does not leak into the sourcing shell's own environment.
 #
 # FALSIFIABILITY (run by hand, see the commit message for the transcript): with the
 # HEADROOM_COMPRESSION_TIMEOUT_SECONDS line reverted out of hmd-headroom-chain.sh,
 # guarantee 2 goes RED (`HEADROOM_COMPRESSION_TIMEOUT_SECONDS=` line absent from the
 # recorded child env). Restoring the fix turns it GREEN again with no other guarantee
-# ever moving — this file is not vacuously green.
+# ever moving — this file is not vacuously green. Symmetrically, reverting only the
+# HEADROOM_KOMPRESS_MAX_TOKENS line reds out guarantee 6 alone (the line is absent
+# from the recorded child env) while every other guarantee, 2 included, stays green —
+# the two vars are independently wired and independently falsifiable, not a single
+# guard that happens to cover both.
 #
 # Usage:  bash test/headroom-wrap-chain.test.sh   (exit 0 = every guarantee holds)
 set -uo pipefail
@@ -253,6 +273,66 @@ SCOPE3="$(cat "$TMP/scope3" 2>/dev/null || echo "<no result>")"
 [ "$SCOPE3" = "SCOPE-OK" ] \
   && ok "HEADROOM_COMPRESSION_TIMEOUT_SECONDS does not leak into the sourcing shell after the chain returns" \
   || bad "HEADROOM_COMPRESSION_TIMEOUT_SECONDS leaked into the sourcing shell: $SCOPE3"
+
+echo
+echo "6 — HEADROOM_KOMPRESS_MAX_TOKENS=10000 reaches the child by default"
+if [ -s "$ENV1" ]; then
+  grep -q '^HEADROOM_KOMPRESS_MAX_TOKENS=10000$' "$ENV1" \
+    && ok "the child process env carries HEADROOM_KOMPRESS_MAX_TOKENS=10000" \
+    || bad "no HEADROOM_KOMPRESS_MAX_TOKENS=10000 line in the child's recorded env: $(grep '^HEADROOM_KOMPRESS_MAX_TOKENS=' "$ENV1" 2>/dev/null || echo '<absent entirely>')"
+else
+  bad "guarantee 6 skipped — no env dump from guarantee 1 to check"
+fi
+
+echo
+echo "7 — an operator-supplied HEADROOM_KOMPRESS_MAX_TOKENS override reaches the child unchanged"
+PORT4=$((BASE_PORT + 3))
+ENV4="$TMP/env4"
+(
+  export HEADROOM_KOMPRESS_MAX_TOKENS=7500
+  . "$CHAIN"
+  export HMD_HEADROOM_BIN="$FAKE_BIN"
+  export HMD_MODULES_STATE="$MODSTATE"
+  export HEIMDALL_HOME="$TMP/home4"
+  export HEADROOM_PORT="$PORT4"
+  export HMD_FAKE_HEADROOM_ENV_FILE="$ENV4"
+  hmd_headroom_chain "$TMP/plugin"
+  printf '%s\n' "$?" > "$TMP/rc4"
+)
+RC4="$(cat "$TMP/rc4" 2>/dev/null || echo 1)"
+[ -s "$TMP/home4/headroom/proxy.pid" ] && LIVE_PIDS="$LIVE_PIDS $(cat "$TMP/home4/headroom/proxy.pid")"
+if [ "$RC4" = "0" ] && [ -s "$ENV4" ]; then
+  grep -q '^HEADROOM_KOMPRESS_MAX_TOKENS=7500$' "$ENV4" \
+    && ok "a caller override (7500) reaches the child instead of the 10000 default" \
+    || bad "the override did not reach the child: $(grep '^HEADROOM_KOMPRESS_MAX_TOKENS=' "$ENV4" 2>/dev/null || echo '<absent>')"
+else
+  bad "guarantee 7 skipped — chain did not start cleanly (rc=$RC4)"
+fi
+
+echo
+echo "8 — HEADROOM_KOMPRESS_MAX_TOKENS is scoped to the ONE child; it does not leak into the sourcing shell"
+PORT5=$((BASE_PORT + 4))
+ENV5="$TMP/env5"
+(
+  unset HEADROOM_KOMPRESS_MAX_TOKENS
+  . "$CHAIN"
+  export HMD_HEADROOM_BIN="$FAKE_BIN"
+  export HMD_MODULES_STATE="$MODSTATE"
+  export HEIMDALL_HOME="$TMP/home5"
+  export HEADROOM_PORT="$PORT5"
+  export HMD_FAKE_HEADROOM_ENV_FILE="$ENV5"
+  hmd_headroom_chain "$TMP/plugin" >/dev/null 2>&1
+  if [ -z "${HEADROOM_KOMPRESS_MAX_TOKENS:-}" ]; then
+    echo "SCOPE-OK" > "$TMP/scope5"
+  else
+    echo "LEAKED=$HEADROOM_KOMPRESS_MAX_TOKENS" > "$TMP/scope5"
+  fi
+)
+[ -s "$TMP/home5/headroom/proxy.pid" ] && LIVE_PIDS="$LIVE_PIDS $(cat "$TMP/home5/headroom/proxy.pid")"
+SCOPE5="$(cat "$TMP/scope5" 2>/dev/null || echo "<no result>")"
+[ "$SCOPE5" = "SCOPE-OK" ] \
+  && ok "HEADROOM_KOMPRESS_MAX_TOKENS does not leak into the sourcing shell after the chain returns" \
+  || bad "HEADROOM_KOMPRESS_MAX_TOKENS leaked into the sourcing shell: $SCOPE5"
 
 echo
 echo "--------------------------------------------------------------------"

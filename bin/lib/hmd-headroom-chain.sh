@@ -181,11 +181,41 @@ hmd_headroom_chain() {
   # the blast radius on its own: HEADROOM_COMPRESSION_QUARANTINE_MAX_SECONDS (default
   # 60s, upstream #2360) now caps how long a leaked worker can block new compression
   # for OTHER sessions, so that one is left at its upstream default rather than
-  # overridden here. Both vars are scoped to this ONE child only (see the file header
-  # on why ANTHROPIC_BASE_URL gets the same treatment), and both stay overridable by
-  # whatever the operator already exported — same precedent as hmd_headroom_port()
-  # above.
+  # overridden here.
+  #
+  # HEADROOM_KOMPRESS_MAX_TOKENS is the size-gate half of #1171 (fork-assessment doc,
+  # docs/superpowers/specs/2026-08-19-headroom-fork-assessment.md §1a; recommended
+  # there as "untried... cheapest possible next step"). Installed 0.35.0 already caps
+  # a single content block's estimated size before it reaches the synchronous
+  # ModernBERT ONNX path (content_router.py:1839-1843, default "50000" when unset) —
+  # above the cap the block routes to LogCompressor/TextCrusher instead of ML
+  # (content_router.py:3701-3741). Measured on this machine before choosing 10000:
+  # `grep -c "size-gate fired"` across all six rotated ~/.headroom/logs/proxy.log*
+  # files is 0 — the 50,000 default has NEVER once fired here, so it adds zero
+  # protection today. Measured the traffic it would gate against: the 1,181 kompress
+  # events this proxy ever recovered through its own CCR mechanism (the same events
+  # behind the documented 31.24% average yield) top out at 2,464 tokens (p99.9; mean
+  # 448.8, p99 1,963), and the broader, unfiltered population of every raw ONNX
+  # invocation ever logged here (775 calls) tops out at 5,090 words (a different unit
+  # than the gate's own token estimate, but the same order of magnitude). 10,000 is
+  # roughly 2x the single largest real value observed under either measure, so this
+  # costs nothing measured — all 1,181 of those events, 100% of the $42.90 lifetime
+  # compression savings (small next to caching's $17,360.72 per the fork-assessment
+  # doc's §0, but free to keep), stay exactly as fast as today — while shrinking the
+  # no-man's-land between real traffic and the reconstructed 8.95MB/727-message
+  # cascade five-fold (50,000 -> 10,000). Honest limit, checked against this same log
+  # data before picking a number: inference time here does not scale cleanly with
+  # size — a 47-word call took 15,736ms and a 31-word call took 11,534ms, both slower
+  # than several 800+-word calls — so this gates the large-single-block failure mode
+  # #1171 names, and does nothing for contention- or model-load-driven latency on
+  # small blocks, a separate, still-unresolved mechanism.
+  #
+  # All three vars this file touches (ANTHROPIC_BASE_URL — see the file header —
+  # HEADROOM_COMPRESSION_TIMEOUT_SECONDS, and HEADROOM_KOMPRESS_MAX_TOKENS) are scoped
+  # to this ONE child only, and all three stay overridable by whatever the operator
+  # already exported — same ${VAR:-default} precedent as hmd_headroom_port() above.
   ( HEADROOM_COMPRESSION_TIMEOUT_SECONDS="${HEADROOM_COMPRESSION_TIMEOUT_SECONDS:-130}" \
+    HEADROOM_KOMPRESS_MAX_TOKENS="${HEADROOM_KOMPRESS_MAX_TOKENS:-10000}" \
     "$bin" proxy --host 127.0.0.1 --port "$port" >>"$logdir/proxy.log" 2>&1 & echo $! > "$logdir/proxy.pid" ) \
     || { HMD_HEADROOM_WHY="could not start the Headroom proxy — running unproxied"; return 1; }
 
