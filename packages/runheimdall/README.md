@@ -130,6 +130,8 @@ for machines with no `minisign` binary, and the fail-closed behavior of the auto
 
 **Prerequisites:** Claude Code 1.0+ · Git · `jq` (`brew install jq`)
 
+hmd is itself a Claude Code plugin, so Claude Code is what installs and runs it. If Cursor CLI's `agent` (`cursor-agent`) is also on `PATH`, `hmd init` gates that host too — see [Also gates Cursor CLI](#also-gates-cursor-cli).
+
 ### Path 2 — npm
 
 [`npx runheimdall`](https://www.npmjs.com/package/runheimdall) — same pinned tag, same sha256 check, zero clone required. It fetches the pinned `install.sh`, verifies it against the digest baked in at publish time, and aborts before executing anything if the bytes disagree. Convenience, not containment: what finally runs is the same script, with the same privileges as path 1.
@@ -203,6 +205,8 @@ Scaffolds a real full-stack task, builds it, ends with a summary card and a foll
 | Parallel workers | `hmd --team N "task"` (N tmux panes, independent — no shared state) | Shipped (no coordination layer) |
 | Benchmark suite | `heimdall-bench` | Shipped |
 | Optional capability modules | `hmd modules` | Shipped |
+| Cursor CLI host (gate + statusline HUD) | `hmd init` (auto-detects) · [details](#also-gates-cursor-cli) | Shipped |
+| AI backend preference (Claude Code ⇄ Cursor CLI) | `heimdall-ai-select` · `/hmd:switch-ai` | Shipped |
 
 ---
 
@@ -291,7 +295,7 @@ Full manifest schema, class-contract details and the lifecycle rationale: [`modu
 
 ## Viral statusline — watchman, team wall, gate animation
 
-Heimdall's status bar is a full-width, four-row watchman HUD. It renders entirely shell-side (zero model, zero context cost) and reads Claude Code's `statusLine` JSON on stdin. Three surfaces, by how far they spread:
+Heimdall's status bar is a full-width, four-row watchman HUD. It renders entirely shell-side (zero model, zero context cost) — `bin/heimdall-statusline` is one CLI-agnostic renderer shared by both hosts it wires into. Under Claude Code, `hooks/statusline.sh` reads the `statusLine` JSON Claude Code hands it on stdin. Under Cursor CLI it reads the same shape from Cursor's own `statusLine` plug-in point, swapping only the width signal — Cursor hands `render_width_chars` in that JSON instead of Claude Code's `$COLUMNS`, and the renderer already reads that field itself. Three surfaces, by how far they spread:
 
 **Your sigil — the identity hook.** Every Heimdall identity (`HAID`) gets a unique, deterministic pixel watchman: same identity, same sigil, forever. It anchors the left of the line, prints big on the install card, and shares as a postable block:
 
@@ -323,6 +327,8 @@ bash sentinels/hmd-gate-anim.sh deny "oracle/falsify" $HMD_HAID
 
 `install.sh` wires this for you — it registers both entries into your `~/.claude/settings.json` (honoring `$CLAUDE_CONFIG_DIR`) using the **absolute installed path**, idempotently and without clobbering a `statusLine` you set yourself. The `${CLAUDE_PLUGIN_ROOT}` form above is the plugin-hook spelling; a user-level statusLine resolves no such variable, so the installer fills in the resolved absolute path — which is why the HUD now reaches every dev, not just whoever hand-wired it in dev setup.
 
+Cursor CLI gets the identical renderer through its own plug-in point, registered automatically by `hmd init` — mechanics and the honest limits of that second host are in [Also gates Cursor CLI](#also-gates-cursor-cli) below.
+
 `hooks/statusline.sh` drives the full-width watchman and falls back to the legacy single line if `python3` is missing — it never errors, never blocks. Already a ccstatusline (9.2k★) user? Keep your line and drop the watchman in as a Custom Command widget:
 
 ```bash
@@ -330,6 +336,26 @@ python3 sentinels/hmd-statusline.py --widget   # just the watchman + verdict seg
 ```
 
 The sigil ships solo-first (viral-cheap, no team required); the watch wall is the team-gated headline that lights up once presence is wired into your gate hooks.
+
+---
+
+## Also gates Cursor CLI
+
+hmd is itself a Claude Code plugin, but the gate it wires into git is not plugin-specific. Once a repo has been through `hmd init`, code written by Cursor CLI's `agent` (`cursor-agent`) is checked by the exact same `pre-commit`/`pre-push` → `bin/heimdall-gate-run` path as code written by Claude Code — same stub-scan, same falsify oracle, same `BIFRÖST` deny on the same terms. Cursor also reads `AGENTS.md` at session start the way Claude Code reads `CLAUDE.md`, so the fenced `hmd init` block that tells an agent "this repo is gated" reaches it too.
+
+`hmd init` also auto-registers the watchman HUD into Cursor's own `~/.cursor/cli-config.json` `statusLine` the moment it detects `cursor-agent` on `PATH` (`bin/heimdall-statusline-register-cursor`, verbs `status` / `register` / `unregister`, also reachable as `hmd cursor-statusline`). It is idempotent, never clobbers a `statusLine` you set yourself, and never runs at all against a machine that has never touched Cursor. Opt out with `HEIMDALL_NO_CURSOR_STATUSLINE_REGISTER=1` or `~/.heimdall/no-cursor-statusline-register` (the shared `HEIMDALL_NO_STATUSLINE_REGISTER=1` / `~/.heimdall/no-statusline-register` markers suppress both hosts).
+
+hmd's own sub-agent spawns can delegate work to more than one detected CLI backend. `heimdall-ai-select list --auth` shows what is on `PATH`, and `/hmd:switch-ai` (or `heimdall-ai-select select <letter|id>`) changes which one hmd *prefers*, persisted to `.planning/settings.json` under `ai_backend` with its provenance (`user` vs `auto-default`). That preference is not a live hot-swap: hmd is Claude Code code running inside a Claude Code process, and nothing restarts that process into a different CLI mid-session — switching takes effect for delegated spawns now and for the next session's default, never for the session you're already in.
+
+### What you don't get under Cursor
+
+The gate itself has the same teeth under Cursor as under Claude Code — nothing here weakens what gets blocked. What differs is *when* and *how* it fires:
+
+- **Caught at commit, not at write.** Claude Code's live `PreToolUse` hook blocks a stub the instant it is written. Cursor CLI has no equivalent pre-write hook, so the same stub is instead caught at `git commit` by `bin/heimdall-gate-run`'s backstop — later, but the same gate, and the commit still does not land.
+- **No SessionStart automation.** The auto-update check, `cc-selfheal`, the resume probe, the dream notice, the presence keeper, and `heimdall-ai-select session-start` all fire from Claude Code's SessionStart hook. Cursor has no such hook for hmd to fire from, so `hmd init` is a one-time, by-hand setup rather than something that re-arms itself every session.
+- **No SessionEnd automation.** Checkpoint writes, `verify-edits`, and auto-commit likewise never fire under Cursor — there is no session-end hook to fire them from.
+- **No subagent orchestration.** hmd's `Agent`/`SendMessage` spawning is Claude Agent SDK-specific; it does not run inside a `cursor-agent` process.
+- **Cursor's own `.cursor/hooks.json` is untouched.** Cursor has a separate, unrelated hook mechanism (`sessionStart` / `preToolUse` / `beforeShellExecution`, allow/ask with an exit-code-2 deny); hmd does not populate it and has no plan to.
 
 ---
 
