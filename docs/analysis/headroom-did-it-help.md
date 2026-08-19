@@ -423,3 +423,111 @@ schedule rather than run speculatively inside this investigation.
 `python3 -c "import ..."`, and `memory_codec.py status --json` were run read-only;
 nothing was installed, upgraded, or reconfigured. No `heimdall-headroom-ab snapshot`
 was run, live or otherwise.
+
+## 7. Kompress `backend: null` in `/health` while the log shows `backend=onnx` running (2026-08-19)
+
+Follow-up from §6, explicitly flagged there and correctly left alone as out of
+scope for that pass. Since §6, headroom-ai was upgraded on this machine 0.33.0
+→ 0.35.0 (`uv tool install --python 3.13 "headroom-ai[all]==0.35.0"`), and
+`/health`'s `checks.kompress` now reads `{"enabled":true,"ready":false,
+"status":"degraded","optional":true,"backend":null}`. Upstream's own startup
+log offers an explanation for that — 0.35.0's prefetch-at-startup behavior:
+`"Kompress: prefetching model artifacts for chopratejas/kompress-v2-base
+..."`, `"Kompress model preload deferred until first request"`, `"Kompress:
+artifact prefetch complete ...; the model loads on first use without a
+download stall."` — predicting `backend` flips from `null` to `onnx` once real
+traffic forces the first load. Nobody had watched that happen end-to-end on
+this machine. This section does, and finds a third outcome that neither of
+this investigation's two anticipated branches predicted.
+
+**Real traffic, confirmed first, from the proxy's own request log**
+(`~/.headroom/logs/proxy.log`, not synthesized): live `POST
+https://api.anthropic.com/v1/messages` calls with `status=200` and `PERF`
+lines reporting real `tok_before`/`tok_after`/`tok_saved` figures, e.g. `PERF
+model=claude-sonnet-5 msgs=14 tok_before=76661 tok_after=74801 tok_saved=1860
+... client=claude-code` — ordinary wrapped-session traffic, not a call
+originated for this investigation.
+
+**Two `/health` polls, ~22 minutes apart, both showing `backend:null`:**
+
+```
+poll 1  timestamp 2026-08-19T01:56:12Z  uptime_seconds=23067.28
+        "kompress":{"enabled":true,"ready":false,"status":"degraded","optional":true,"backend":null}
+poll 2  timestamp 2026-08-19T02:18:04Z  uptime_seconds=24379.75
+        "kompress":{"enabled":true,"ready":false,"status":"degraded","optional":true,"backend":null}
+```
+
+**But the log shows `backend=onnx` compressing real content, successfully, for
+hours, well before either poll:**
+
+```
+2026-08-18 18:26:17  Kompress slow compress backend=onnx device=onnx words=22 chunks=1 inference_ms=1656 ratio=0.955 saved=1
+2026-08-18 19:31:13  Kompress slow compress backend=onnx device=onnx words=1759 chunks=6 inference_ms=5772 ratio=0.699 saved=529
+2026-08-18 23:07:21  Kompress slow compress backend=onnx device=onnx words=564 chunks=2 inference_ms=1457 ratio=0.764 saved=133
+```
+
+496 `kompress`-tagged lines in the current log file alone (316 more in the one
+prior rotation checked), the large majority genuine `backend=onnx ...
+saved=N` successes. Exactly 13 are a distinct `WARNING`: `"Kompress execution
+saturated after ~3000ms; skipping chunk=0 for backend=onnx device=onnx after
+deadline path"` — a real per-chunk compression-deadline issue, worth its own
+follow-up, but not an initialization failure and not this section's subject.
+Zero other kompress-tagged `WARNING`/`ERROR`/`CRITICAL` lines exist in the
+current log. One `"Kompress: prefetching model artifacts ..." / "... preload
+deferred until first request" / "... artifact prefetch complete ..."`
+sequence appears once, at 2026-08-19 01:01:49–01:01:57 — roughly an hour
+after the last compression observed in this excerpt, and not immediately
+followed by another confirmed `slow compress` success in the lines checked.
+Separately, the proxy's periodic `TOIN: 699 patterns, 2403 compressions, 4285
+retrievals, 178.3% retrieval rate` heartbeat read identically across eleven
+consecutive 5-minute samples from 05:31:57 to 07:26:24 — no new compression
+in that ~2h window either. So real, successful `onnx` compression is
+well-established earlier in this same process's uptime; what is
+under-determined from the log alone is whether `/health` would have read
+`onnx` DURING that earlier active window — both polls taken here happened to
+land after it had already gone quiet.
+
+**Traced to source rather than left as a correlation.** headroom-ai 0.35.0's
+own `headroom/proxy/server.py` computes `/health`'s (and `/debug/warmup`'s)
+kompress status via `_reconcile_kompress_health()` (`server.py:2767`), which
+tries two ways to detect a loaded model before ever calling
+`proxy.warmup.kompress.mark_loaded(...)`: (a) ask the live `ContentRouter`'s
+own `_kompress`/`_kompress_remote` compressor instance whether `is_ready()` /
+`ready_backend()` report loaded, or (b) fall back to a module-level
+`_kompress_cache.get(HF_MODEL_ID)` lookup in
+`headroom.transforms.kompress_compressor`. Only if one of those two finds a
+loaded model does `warmup.kompress` ever flip away from its startup default.
+
+**Live-confirmed, right now, that neither path has fired.** The proxy's own
+`/debug/warmup` endpoint — named in the source as the single source of truth
+`/health` and `/readyz` are built from — currently reads:
+
+```
+$ curl -s http://localhost:8787/debug/warmup
+"kompress":{"status":"null","info":{"source_status":"deferred"}}
+```
+
+`status` is still the literal string it starts at, `source_status` is still
+`"deferred"` — `mark_loaded()` has never fired for kompress on this process,
+despite the log proving its compressor loaded and ran successfully hundreds
+of times. This was queried live, read-only, with no restart and no config
+change, exactly like the `/health` polls above.
+
+**Verdict: neither of this investigation's two anticipated outcomes.** The
+lazy-load story is correct for the compressor itself — it loads, and it
+works, delivering real measured savings across hundreds of real requests
+(more volume than 0.33.0's single 31%-reduction event referenced in §6, not a
+functional regression). But it is wrong for what `/health` reports about it:
+the health surface and the runtime it claims to describe are simply out of
+sync, on a mechanism now identified by name and file:line rather than
+inferred from a black box. This reads as a headroom-ai 0.35.0
+health-reporting bug — most plausibly in whichever code path actually serves
+the real compressions not being one of the two paths
+`_reconcile_kompress_health()` checks — not a functional regression, and not
+confirmation of the "it flips once traffic arrives" explanation as literally
+stated. Anything that gates or alerts on `checks.kompress.backend`
+specifically (rather than the proxy's own log or its savings ledger) is
+reading a signal that is demonstrably wrong on this machine, on this version.
+Filed as a finding, not patched here — a fix, if any, belongs upstream in
+headroom-ai; neither `modules/headroom/manifest.json` nor
+`bin/lib/hmd-headroom-chain.sh` computes or reports this field.
