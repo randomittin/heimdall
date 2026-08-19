@@ -85,12 +85,20 @@ print("OK")
 clean
 
 # ── 2) missing file → safe default ──────────────────────────────────────────
+# WHOLE-DICT equality on purpose — stricter than cases 3 and 4, which check
+# field by field and so would not notice a key appearing or vanishing. The
+# expected dict therefore has to track hmd_ledger.SAFE_DEFAULT exactly, and
+# `repo` is part of it: hmd-statusline.py's roster gate reads it and fails
+# CLOSED on "" (unknown scope renders nobody rather than everybody), so the
+# key existing in the default is load-bearing. If this assertion goes RED
+# because SAFE_DEFAULT gained a key, add the key here — do not drop it there,
+# and do not relax this to a subset check.
 echo "== 2) missing status.json → daemon:down + empty (no crash) =="
 fresh
 OUT="$(HEIMDALL_HOME="$WS" HEIMDALL_STATE="$WS/repo/.heimdall/statusline.json" \
        HMD_STATUSLINE_TMP="$TMPC" HMD_NOW=1000 pyrun '
 r = L.read_status("sess-missing")
-assert r == {"daemon":"down","gates":[],"verdict":None,"team":[],"team_overflow":0}, r
+assert r == {"daemon":"down","gates":[],"verdict":None,"team":[],"team_overflow":0,"repo":""}, r
 print("OK")
 ' 2>&1)"
 [ "$OUT" = "OK" ] && ok "missing file → exact safe default" || bad "missing-file default wrong: $OUT"

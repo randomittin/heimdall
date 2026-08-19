@@ -72,8 +72,19 @@ def render(cols, self_branch, teammates, now=7000):
         f.write('{"handle":"rj","seed":"rj","created":0}\n')
     with open(os.path.join(cwd, ".heimdall", "statusline.json"), "w") as f:
         f.write('{"verdict":"pass","passed":3,"total":3}\n')
+    # `repo` puts the ledger mirror IN SCOPE, and without it this whole file is
+    # testing nothing. hmd-statusline's _ledger_in_scope() honors the machine-global
+    # ${HEIMDALL_HOME}/ledger/status.json mirror only when its `repo` key is an
+    # absolute path containing the cwd, and fails CLOSED otherwise — an unknown
+    # scope renders as NOTHING, never as EVERYTHING, so another repo's people
+    # cannot appear on this repo's wall. An unstamped fixture is therefore
+    # discarded before any roster is built: the render came back with an empty team
+    # zone and every branch-line assertion below failed for want of a roster to
+    # carry a branch. Stamped with the cwd under test, exactly as the wall-roster
+    # and fullbleed fixtures already are.
     status = {"daemon": True,
               "gates": [{"id": "tests", "state": "pass", "detail": "41/41"}],
+              "repo": cwd,
               "team": [dict(m, ts=now - 30 * (i + 1)) for i, m in enumerate(teammates)]}
     with open(os.path.join(home, ".heimdall", "ledger", "status.json"), "w") as f:
         json.dump(status, f)
