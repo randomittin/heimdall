@@ -75,6 +75,17 @@ trap 'rm -rf "$TMP"' EXIT
 REG="$TMP/registry"
 STATE="$TMP/state/modules"
 
+# Same reasoning as the throwaway HOME above: a precondition this file does not
+# control must not decide its verdict. hmd's generic preflight floor is 4096 MB,
+# sized for a real Rust+ONNX payload rather than these one-file fixtures, and
+# preflight runs at [3/7] — BEFORE consent at [4/7]. Left ambient on a machine at
+# ~2 GB free, every add is refused for disk and the consent arms never execute at
+# all: the waiver assertions then fail reporting "the disclosure was never shown",
+# which is true and entirely about the laptop. Pinned so consent is what gets
+# judged. The library documents the override ("overridable so a test can pin both
+# sides of the boundary"); the floor is proven in module-preflight-wiring.
+export HMD_PREFLIGHT_DISK_FLOOR_MB=1
+
 hmd()      { "$MODS" --registry "$REG"      --state "$STATE" "$@"; }
 hmd_real() { "$MODS" --registry "$REAL_REG" --state "$STATE" "$@"; }
 

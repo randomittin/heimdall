@@ -56,6 +56,16 @@ STATE="$TMP/state/modules"
 # library documents this switch for exactly that reason.
 export HMD_PREFLIGHT_NO_NET=1
 
+# And it must not depend on the developer's free disk either, for the same reason.
+# hmd's floor is 4096 MB, sized for a real Rust+ONNX payload; the fixtures here are
+# one small file. Left ambient on a machine at ~2 GB free, the disk check fails in
+# every arm and takes down the ones aimed at OTHER checks (pin, platform, wiring)
+# as collateral. This DEFAULT is deliberately not a claim about the floor: the arms
+# that test the floor set it inline per command — 999999999 to fail it for real and
+# 1 to satisfy it — so both sides of that boundary stay explicitly pinned and this
+# export cannot weaken them.
+export HMD_PREFLIGHT_DISK_FLOOR_MB=1
+
 hmd() { "$MODS" --registry "$REG" --state "$STATE" "$@"; }
 
 sha_file() { shasum -a 256 "$1" | awk '{print $1}'; }

@@ -86,6 +86,19 @@ bad() { printf '  \033[31mFAIL\033[0m %s\n' "$1"; FAIL=$((FAIL+1)); }
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
+# THE SAME RULE AS THE STATE ROOT ABOVE, APPLIED TO FREE SPACE. hmd's generic
+# preflight floor is 4096 MB, sized for what a REAL Headroom install costs
+# (Rust + ONNX + weights clears a gigabyte on its own). H1b and H3 install into
+# a scratch --state root under $TMP, so that floor is measuring the developer's
+# disk and nothing this suite is about: on a machine sitting at ~2 GB free every
+# add-path assertion here goes RED with `refused: ... disk: at least 4096 MB
+# free`, which is a statement about the laptop, not about the manifest. Pinned
+# low so the add path is what gets judged. The library documents this override
+# ("overridable so a test can pin both sides of the boundary"), and the floor's
+# OWN behaviour is proven — on both sides, with explicit per-command values — in
+# test/module-preflight-wiring.test.sh, which is where that assertion belongs.
+export HMD_PREFLIGHT_DISK_FLOOR_MB=1
+
 sha_file() { shasum -a 256 "$1" | awk '{print $1}'; }
 
 # A temp registry holding the REAL class contracts and a byte-identical copy of

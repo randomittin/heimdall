@@ -85,6 +85,17 @@ STATE="$TMP/state/modules"
 
 hmd() { "$MODS" --registry "$REG" --state "$STATE" "$@"; }
 
+# The fixture modules below are one small file each, installed into $STATE. hmd's
+# generic preflight floor is 4096 MB — sized for a real Rust+ONNX payload, not for
+# these — so leaving it ambient makes every add/round-trip assertion in this file a
+# measurement of the developer's free disk: at ~2 GB free the add is refused with
+# `disk: at least 4096 MB free` and G5..G20 collapse for a reason that has nothing
+# to do with the lifecycle. Pinned, exactly as the state root is pinned, because
+# this suite owns its preconditions. The library documents the override
+# ("overridable so a test can pin both sides of the boundary"); the floor's own
+# behaviour is proven in test/module-preflight-wiring.test.sh.
+export HMD_PREFLIGHT_DISK_FLOOR_MB=1
+
 sha_file() { shasum -a 256 "$1" | awk '{print $1}'; }
 
 # A deterministic fingerprint of a tree that distinguishes ABSENT from EMPTY —

@@ -87,6 +87,16 @@ REG="$TMP/registry"
 STATE="$TMP/state/modules"
 hmd() { "$MODS" --registry "$REG" --state "$STATE" "$@"; }
 
+# OFFLINE AND CHEAP BY CONSTRUCTION, as stated above — and free disk is part of
+# that contract. hmd's generic preflight floor is 4096 MB, sized for a real
+# Rust+ONNX payload; these fixtures are one small file installed into $STATE. Left
+# ambient it makes W3/W4/W6/W7 assertions about the developer's disk instead of the
+# dispatcher: at ~2 GB free every add is refused with `disk: at least 4096 MB free`
+# before wiring is ever reached. Pinned so the handler is what gets judged. The
+# library documents the override ("overridable so a test can pin both sides of the
+# boundary"); the floor itself is proven in test/module-preflight-wiring.test.sh.
+export HMD_PREFLIGHT_DISK_FLOOR_MB=1
+
 sha_file() { shasum -a 256 "$1" | awk '{print $1}'; }
 
 # Distinguishes ABSENT from EMPTY — a refused add that leaves a bare directory
