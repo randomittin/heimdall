@@ -98,6 +98,8 @@ make_stub heimdall-team
 make_stub heimdall-invite
 make_stub heimdall-presence
 make_stub heimdall-connect
+make_stub heimdall-report
+make_stub designmatch
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 1. `hmd team new --force` → execs heimdall-team, args forwarded, no fall-through
@@ -318,6 +320,62 @@ else
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
+# 7g. `hmd report <run_id> --json` → execs heimdall-report, args forwarded,
+#     no fall-through. README's "Telemetry report" row names `hmd report`
+#     Shipped; before the dispatcher arm existed it fell through to the
+#     goal-driven Claude task prompt instead (the overclaim this section pins).
+# ══════════════════════════════════════════════════════════════════════════════
+reset
+run_hmd report abc123 --json
+
+if stub_called "heimdall-report"; then
+  ok "report routes to heimdall-report"
+else
+  bad "report routes to heimdall-report"
+fi
+
+if args_contain "abc123 --json"; then
+  ok "report forwards args verbatim (abc123 --json)"
+else
+  bad "report forwards args verbatim (abc123 --json)"
+  cat "$STUB_OUT" >&2
+fi
+
+if ! claude_reached; then
+  ok "report does NOT fall through to Claude"
+else
+  bad "report MUST NOT reach the Claude fall-through"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 7h. `hmd designmatch diff a.png b.png` → execs designmatch, args forwarded,
+#     no fall-through. README's "Design match" row names `hmd designmatch`
+#     Shipped; before the dispatcher arm existed it fell through to the
+#     goal-driven Claude task prompt instead (the overclaim this section pins).
+# ══════════════════════════════════════════════════════════════════════════════
+reset
+run_hmd designmatch diff a.png b.png
+
+if stub_called "designmatch"; then
+  ok "designmatch routes to designmatch"
+else
+  bad "designmatch routes to designmatch"
+fi
+
+if args_contain "diff a.png b.png"; then
+  ok "designmatch forwards args verbatim (diff a.png b.png)"
+else
+  bad "designmatch forwards args verbatim (diff a.png b.png)"
+  cat "$STUB_OUT" >&2
+fi
+
+if ! claude_reached; then
+  ok "designmatch does NOT fall through to Claude"
+else
+  bad "designmatch MUST NOT reach the Claude fall-through"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 8. FALSIFIER — unknown command falls through to Claude launch path
 #    A routed name must NOT reach fall-through; an unknown one MUST.
 # ══════════════════════════════════════════════════════════════════════════════
@@ -331,8 +389,8 @@ else
   cat "$TRACE_FILE" >&2
 fi
 
-if ! stub_called "heimdall-team" && ! stub_called "heimdall-invite" && ! stub_called "heimdall-presence" && ! stub_called "heimdall-connect"; then
-  ok "unknown command does NOT route to team/invite/presence/connect stubs (falsifier)"
+if ! stub_called "heimdall-team" && ! stub_called "heimdall-invite" && ! stub_called "heimdall-presence" && ! stub_called "heimdall-connect" && ! stub_called "heimdall-report" && ! stub_called "designmatch"; then
+  ok "unknown command does NOT route to team/invite/presence/connect/report/designmatch stubs (falsifier)"
 else
   bad "unknown command must NOT be intercepted by any routing stub"
   cat "$STUB_OUT" >&2
