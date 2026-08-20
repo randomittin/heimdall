@@ -47,35 +47,23 @@ FACE_BIN="$HERE/heimdall-face"
 # ~400ms each that tax alone accounts for essentially the ENTIRE regression: the
 # watchman alone measured 2.29s real through the shim vs 0.75s cold / 0.11s warm
 # via a direct interpreter, BYTE-IDENTICAL output (diff confirmed) either way.
-# Every script in this render path is stdlib-only (json/os/re/sys) — no repo
-# `.python-version` pins a specific one, and the watchman parses clean on the
-# OLDEST candidate below (system python3 3.9.6) — so there is no correctness
-# reason to pay a shim's resolution cost per launch; any python3 here is correct.
 #
-# Resolution costs ZERO subprocesses: `command -v`/`[ -x ]` are bash builtins.
-# Detection is generic (any dispatcher living in a directory literally named
-# `shims/` — covers pyenv and asdf, which use the identical mechanism) and
-# DEGRADES SAFELY: no faster candidate found -> PATH is untouched, behavior is
-# byte-identical to before this fix (still correct, just slow, exactly like
-# today on a machine with no shim at all — e.g. Linux CI).
-#
-# PATH (not a resolved-path variable substituted at each call site) is
-# deliberately what we fix: every subprocess below still just says `python3`,
-# and inherits this exported PATH — including heimdall-ctx-meter's OWN internal
-# python3 launches, and anything the watchman shells out to via `env python3` /
-# `sys.executable` (sentinels/hmd-statusline.py's background roster/wall
-# refresh) — so those launches speed up too with zero edits to either file.
-case "$(command -v python3 2>/dev/null)" in
-  */shims/*)
-    for _hmd_fast_py3 in /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do
-      if [ -x "$_hmd_fast_py3" ]; then
-        export PATH="$(dirname "$_hmd_fast_py3"):$PATH"
-        break
-      fi
-    done
-    unset _hmd_fast_py3
-    ;;
-esac
+# bin/lib/hmd-python.sh (the same library heimdall-ctx-meter already uses)
+# resolves the real interpreter ONCE into $PY3; every call site below uses that
+# variable instead of a bare `python3`. Deliberately NOT a PATH mutation —
+# prepending a real bin/ directory ahead of a caller's own PATH previously
+# unshadowed test/heimdall-maintain-loop.test.sh's fake gh/git fixtures. A
+# resolved variable touches nothing outside this process.
+# DEGRADES SAFELY: hmd_python prints nothing when no working interpreter
+# exists anywhere (missing lib, no python3 at all, or a broken macOS CLT
+# stub), which is exactly the "python3 unavailable" signal every jq/legacy
+# fallback below already handled — same contract as the old
+# `command -v python3` guard, just resolved once instead of probed per call.
+PY3=""
+# shellcheck source=lib/hmd-python.sh
+[ -r "$HERE/lib/hmd-python.sh" ] && . "$HERE/lib/hmd-python.sh"
+if type hmd_python >/dev/null 2>&1; then PY3="$(hmd_python 2>/dev/null || true)"; fi
+[ -n "$PY3" ] || PY3="$(command -v python3 2>/dev/null || true)"
 
 # ── Slurp the caller's statusLine stdin blob ONCE so both the watchman and the
 # fallback signal-resolver can read it (stdin is consumable only once).
@@ -121,8 +109,8 @@ fi
 resolve_render_width() {  # $1=blob -> prints digits, or nothing
   local blob="$1"
   [ -n "$blob" ] || return 0
-  if command -v python3 >/dev/null 2>&1; then
-    printf '%s' "$blob" | python3 -c '
+  if [ -n "$PY3" ]; then
+    printf '%s' "$blob" | "$PY3" -c '
 import json, sys
 try:
     b = json.load(sys.stdin)
@@ -250,8 +238,8 @@ export HMD_LIVE_SUBAGENTS
 case "$BLOB" in
   *'"transcript_path"'*|*'"autorun"'*)
     NORMALIZED=""
-    if command -v python3 >/dev/null 2>&1; then
-      NORMALIZED="$(printf '%s' "$BLOB" | python3 -c '
+    if [ -n "$PY3" ]; then
+      NORMALIZED="$(printf '%s' "$BLOB" | "$PY3" -c '
 import json, sys
 try:
     b = json.load(sys.stdin)
@@ -281,10 +269,10 @@ esac
 
 # ── PRIMARY: the full-width watchman ──
 # Capture first; emit only on success (nonempty). Any failure falls through.
-if command -v python3 >/dev/null 2>&1 && [ -f "$WATCHMAN" ]; then
+if [ -n "$PY3" ] && [ -f "$WATCHMAN" ]; then
   # hand the watchman the SAME color verdict the legacy fallback honors, so the
   # swarm block + HUD collapse to clean plain text in CI/pipes with no truecolor.
-  WM="$(printf '%s' "$BLOB" | python3 "$WATCHMAN" "$COLOR_FLAG" 2>/dev/null)"
+  WM="$(printf '%s' "$BLOB" | "$PY3" "$WATCHMAN" "$COLOR_FLAG" 2>/dev/null)"
   if [ -n "$WM" ]; then
     # ── CTX HONESTY: null/absent used_percentage must never render as "CTX 0%" ──
     # sentinels/hmd-statusline.py:1828 and sentinels/hmd_gauge.py:311 both
@@ -302,7 +290,7 @@ if command -v python3 >/dev/null 2>&1 && [ -f "$WATCHMAN" ]; then
     # the HUD's existing "unknown signal" idiom (the "– gates offline" / "◦ watching"
     # rows) so it never invents a new visual language, and it degrades to plain,
     # uncolored text under --no-color exactly like those sibling rows do.
-    WM="$(printf '%s' "$WM" | HMD_CTX_BLOB="$BLOB" HMD_CTX_COLOR="$COLOR_FLAG" python3 -c '
+    WM="$(printf '%s' "$WM" | HMD_CTX_BLOB="$BLOB" HMD_CTX_COLOR="$COLOR_FLAG" "$PY3" -c '
 import json, os, re, sys
 
 text = sys.stdin.read()
@@ -382,8 +370,8 @@ fi
 resolve_signals() {
   local blob="$1"
   [ -n "$blob" ] || { echo ". - 0"; return; }
-  if command -v python3 >/dev/null 2>&1; then
-    printf '%s' "$blob" | python3 -c '
+  if [ -n "$PY3" ]; then
+    printf '%s' "$blob" | "$PY3" -c '
 import json, os, sys
 try:
     b = json.load(sys.stdin)
@@ -436,7 +424,7 @@ else
 fi
 [ -n "$PROJECT" ] && [ -d "$PROJECT" ] || PROJECT="."
 
-if [ -x "$FACE_BIN" ] && command -v python3 >/dev/null 2>&1; then
+if [ -x "$FACE_BIN" ] && [ -n "$PY3" ]; then
   ARGS=(--statusline "$COLOR_FLAG")
   case "$BURN" in
     ''|'-'|'null') : ;;
@@ -444,7 +432,7 @@ if [ -x "$FACE_BIN" ] && command -v python3 >/dev/null 2>&1; then
   esac
   [ "$EXCEEDS" = "1" ] && ARGS+=(--exceeds)
   ARGS+=("$PROJECT")
-  LINE="$(python3 "$FACE_BIN" "${ARGS[@]}" </dev/null 2>/dev/null | head -n1)"
+  LINE="$("$PY3" "$FACE_BIN" "${ARGS[@]}" </dev/null 2>/dev/null | head -n1)"
   if [ -n "$LINE" ]; then
     printf '%s\n' "$LINE"
     exit 0
@@ -453,8 +441,8 @@ fi
 
 # ── Degraded floor: even the legacy bin is unavailable → idle watchman eyes, then
 # plain text. Never blank, never an error. ──
-if [ -x "$FACE_BIN" ] && command -v python3 >/dev/null 2>&1; then
-  EYES="$(python3 "$FACE_BIN" --eyes "$COLOR_FLAG" "$PROJECT" </dev/null 2>/dev/null | head -n1)"
+if [ -x "$FACE_BIN" ] && [ -n "$PY3" ]; then
+  EYES="$("$PY3" "$FACE_BIN" --eyes "$COLOR_FLAG" "$PROJECT" </dev/null 2>/dev/null | head -n1)"
   [ -n "$EYES" ] && { printf '%s\n' "$EYES"; exit 0; }
 fi
 printf '[ heimdall ]\n'
