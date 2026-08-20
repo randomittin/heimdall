@@ -59,7 +59,7 @@ ok()     { echo "$(green "✓") $*"; }
 info()   { echo "$(cyan "▸") $*"; }
 
 usage() {
-  cat <<EOF
+  cat <<'EOF'
 designmatch — match Claude Design HTML canonical to React Native at ≥95% visual parity.
 
 Usage:
