@@ -40,7 +40,7 @@ _no_autocommit() { # <toplevel>
   [ -f "$1/.heimdall-no-autocommit" ] || [ -f "$1/.superx-no-autocommit" ]
 }
 
-# _gate_in_flight — is a full gate sweep grading this tree RIGHT NOW?
+# _gate_in_flight <toplevel> — is a full gate sweep grading THIS tree RIGHT NOW?
 #
 # CLAUDE.md requires the full sweep to run over a FROZEN tree, on the grounds that "a
 # verdict over a moving tree is not a verdict". This checkpointer is the one thing in the
@@ -50,18 +50,40 @@ _no_autocommit() { # <toplevel>
 # that particular verdict survived — but a checkpointer that races the gate is a coin-flip,
 # not a guarantee, and the fix belongs here rather than in the operator's memory.
 #
-# The marker is written by test/run-all.sh and carries the runner's pid. LIVENESS IS
-# CHECKED, not assumed: a sweep killed with SIGKILL never runs its trap, and a stale file
-# that silently disabled checkpointing forever would be a worse failure than the one this
-# prevents — an agent would lose a day of mid-task checkpoints with nothing on screen to
-# explain why.
-_gate_in_flight() {
-  local marker pid
+# The marker is written by test/run-all.sh and carries the runner's pid on line 1 and the
+# repo it is grading on line 2. TWO checks, and both are load-bearing:
+#
+#   LIVENESS — a sweep killed with SIGKILL never runs its trap, and a stale file that
+#   silently disabled checkpointing forever would be a worse failure than the race it
+#   prevents: an agent would lose a day of mid-task checkpoints with nothing on screen to
+#   explain why.
+#
+#   SCOPE — a sweep freezes the tree IT is grading, not every tree on the machine. The
+#   first version of this guard compared nothing but the pid, so a heimdall sweep
+#   suppressed checkpoints in unrelated repos too. That is not hypothetical: it turned
+#   test/heimdall-wip-commit.test.sh RED inside the very sweep this guard exists to
+#   protect, because that suite drives the checkpointer in its own throwaway repo and
+#   correctly expects a commit. Scoping fixes the defect rather than teaching the suite to
+#   expect the wrong behaviour.
+#
+# A marker with no repo line is treated as covering everything, because an unscoped freeze
+# is the conservative reading and the format only ever appears while a sweep is live.
+_gate_in_flight() { # <toplevel>
+  local marker pid repo
   marker="${HEIMDALL_HOME:-$HOME/.heimdall}/.gate-in-flight"
   [ -f "$marker" ] || return 1
-  pid="$(cat "$marker" 2>/dev/null)"
+  pid="$(sed -n '1p' "$marker" 2>/dev/null)"
   case "$pid" in ''|*[!0-9]*) return 1 ;; esac
-  kill -0 "$pid" 2>/dev/null
+  kill -0 "$pid" 2>/dev/null || return 1
+  repo="$(sed -n '2p' "$marker" 2>/dev/null)"
+  [ -n "$repo" ] || return 0
+  # BOTH SIDES ARE CANONICALISED before comparison. On macOS the usual scratch roots are
+  # symlinks (/tmp -> /private/tmp, /var -> /private/var), so a marker written with the
+  # path the operator typed and a toplevel reported by `git rev-parse` are the SAME
+  # directory spelled two ways — and a raw string compare reads that as "a different
+  # repo" and silently stops freezing the tree it was asked to freeze.
+  _real() { [ -n "$1" ] && [ -d "$1" ] && ( cd "$1" 2>/dev/null && pwd -P ) || printf '%s' "$1"; }
+  [ "$(_real "$repo")" = "$(_real "$1")" ]
 }
 
 _read_count() { # <file>
@@ -97,7 +119,7 @@ cmd_note() {
     # guard sits inside the threshold branch rather than at the top of the function so
     # that this stays true; an earlier placement above the counter returned first and
     # test/gate-in-flight-guard.test.sh guarantee 3 caught it.
-    if _gate_in_flight; then
+    if _gate_in_flight "$top"; then
       printf '%s' "$count" > "$cf" 2>/dev/null
       return 0
     fi

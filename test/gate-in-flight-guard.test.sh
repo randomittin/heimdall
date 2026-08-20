@@ -84,7 +84,7 @@ AFTER="$(commits)"
 echo
 echo "2 — a marker naming a LIVE process suppresses the commit"
 sleep 120 & SLEEPER=$!
-printf '%s\n' "$SLEEPER" > "$MARKER"
+printf '%s\n%s\n' "$SLEEPER" "$SANDBOX" > "$MARKER"
 reset_counter
 printf 'dirty-b\n' >> "$SANDBOX/f.txt"
 BEFORE="$(commits)"
@@ -104,7 +104,7 @@ C="$(wip_count)"
 echo
 echo "4 — a marker naming a DEAD process does NOT suppress"
 kill "$SLEEPER" >/dev/null 2>&1; wait "$SLEEPER" 2>/dev/null; DEAD="$SLEEPER"; SLEEPER=""
-printf '%s\n' "$DEAD" > "$MARKER"
+printf '%s\n%s\n' "$DEAD" "$SANDBOX" > "$MARKER"
 reset_counter
 printf 'dirty-c\n' >> "$SANDBOX/f.txt"
 BEFORE="$(commits)"
@@ -113,6 +113,37 @@ AFTER="$(commits)"
 [ "$AFTER" -gt "$BEFORE" ] \
   && ok "a stale marker (dead pid $DEAD) does not disable checkpointing ($BEFORE -> $AFTER)" \
   || bad "a stale marker silently disabled checkpointing forever ($BEFORE -> $AFTER)"
+
+echo
+echo "4b — a marker naming a DIFFERENT repo does NOT suppress"
+# A sweep freezes the tree IT grades, not every tree on the machine. Without this, a
+# heimdall sweep suppressed checkpoints in unrelated repos — which is how the first
+# version of this guard turned test/heimdall-wip-commit.test.sh RED from inside the very
+# sweep it was meant to protect, since that suite drives the checkpointer in its own
+# throwaway repo and correctly expects a commit.
+sleep 120 & SLEEPER=$!
+printf '%s\n%s\n' "$SLEEPER" "$TMP/some-other-repo" > "$MARKER"
+reset_counter
+printf 'dirty-d\n' >> "$SANDBOX/f.txt"
+BEFORE="$(commits)"
+note_n 6
+AFTER="$(commits)"
+[ "$AFTER" -gt "$BEFORE" ] \
+  && ok "a live gate grading ANOTHER repo does not suppress this one ($BEFORE -> $AFTER)" \
+  || bad "a gate on an unrelated repo froze checkpointing here ($BEFORE -> $AFTER)"
+
+echo
+echo "4c — a live gate grading THIS repo still suppresses"
+printf '%s\n%s\n' "$SLEEPER" "$SANDBOX" > "$MARKER"
+reset_counter
+printf 'dirty-e\n' >> "$SANDBOX/f.txt"
+BEFORE="$(commits)"
+note_n 8
+AFTER="$(commits)"
+[ "$AFTER" = "$BEFORE" ] \
+  && ok "the repo-scoped marker still freezes its own tree (still $AFTER)" \
+  || bad "scoping broke the actual guarantee ($BEFORE -> $AFTER)"
+kill "$SLEEPER" >/dev/null 2>&1; SLEEPER=""
 
 echo
 echo "5 — the marker lives under HEIMDALL_HOME, never in the repo"
@@ -142,6 +173,11 @@ if grep -A 10 '_gate_marker_claim()' "$RUNALL" | grep -q 'kill -0'; then
   ok "claim leaves a LIVE parent's marker alone and takes over a dead one"
 else
   bad "claim overwrites any existing marker — the parent could never release its own"
+fi
+if grep -A 20 '_gate_marker_claim()' "$RUNALL" | grep -q 'show-toplevel'; then
+  ok "the marker records WHICH repo is being graded"
+else
+  bad "the marker carries no repo — a sweep here would freeze checkpointing everywhere"
 fi
 
 echo

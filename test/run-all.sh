@@ -276,7 +276,11 @@ _gate_marker_claim() {
       *) kill -0 "$held" 2>/dev/null && return 0 ;;
     esac
   fi
-  printf '%s\n' "$$" > "$GATE_MARKER" 2>/dev/null || true
+  # Line 1 the pid (liveness), line 2 the repo being graded (scope). Without the repo a
+  # sweep here would freeze checkpointing in every unrelated repo on the machine — which
+  # is exactly how the first version of this marker turned heimdall-wip-commit.test.sh RED
+  # from inside the sweep, since that suite drives the checkpointer in its own temp repo.
+  printf '%s\n%s\n' "$$" "$(git rev-parse --show-toplevel 2>/dev/null || pwd)" > "$GATE_MARKER" 2>/dev/null || true
 }
 _gate_marker_claim
 
@@ -287,7 +291,7 @@ _gate_marker_claim
 # names, so a nested run leaves its parent's claim standing.
 _gate_marker_release() {
   [ -f "$GATE_MARKER" ] || return 0
-  [ "$(cat "$GATE_MARKER" 2>/dev/null)" = "$$" ] || return 0
+  [ "$(sed -n '1p' "$GATE_MARKER" 2>/dev/null)" = "$$" ] || return 0
   rm -f "$GATE_MARKER" 2>/dev/null || true
 }
 cleanup() { rm -rf "$WORK"; _gate_marker_release; }
