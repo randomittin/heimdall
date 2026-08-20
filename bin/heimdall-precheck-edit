@@ -66,6 +66,16 @@ fi
 # Nothing to check → advisory no-op (fail-open).
 [ -n "$FILE" ] || exit 0
 
+# WORKTREE HOOKS GAP: a linked worktree (where hmd:coder/hmd:wave-executor do
+# almost all their work) has no .heimdall/hooks of its own until `hmd init` is
+# re-run FROM INSIDE it — nothing does that automatically, so core.hooksPath's
+# relative value (.heimdall/hooks, set once by `hmd init` in the MAIN checkout)
+# silently resolves to nothing there: no gate hooks, no Co-Authored-By: hmd
+# trailer, on every commit the worktree ever makes. Lazily heal it here, before
+# the wip-commit call below can itself trigger a commit that would otherwise
+# still miss the fix. Best-effort, fully swallowed, matches the line below.
+"$BIN_DIR/heimdall-hooks-link" >/dev/null 2>&1 || true
+
 # MECHANICAL mid-task checkpoint: count this edit-operation and, independent of
 # hooks.json's PostToolUse auto-commit (which only fires at 5+ DISTINCT dirty
 # files), commit at an EDIT-OPERATION-COUNT threshold instead. A long task that

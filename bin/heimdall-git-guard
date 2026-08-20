@@ -22,6 +22,90 @@ if [ -z "$repo" ]; then
   repo="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 fi
 
+# ── SELF-HEAL: core.bare / core.hooksPath ───────────────────────────────────
+# Two measured, separate corruptions of THIS repo's shared .git/config, healed
+# unconditionally on every call (independent of the lock-clearing job below).
+#
+# (1) core.bare=true on a checkout that has a real `.git` entry at its own
+#     root. `git init --bare` run with an empty/unset target degrades to CWD
+#     (test/repo-never-left-bare.test.sh documents the exact call-site shape)
+#     and bricks the checkout: `git status` and everything else needing a
+#     worktree then dies with "fatal: this operation must be run in a work
+#     tree". UNAMBIGUOUS SAFE RULE: a repo that is genuinely bare has NO
+#     `.git` entry at its own root — the root IS the git dir — so if the
+#     standard root+.git layout is present, core.bare can never legitimately
+#     be true, and resetting it is always safe.
+#
+# (2) an ABSOLUTE core.hooksPath. hooks/hooks.json's push-gate dedup does an
+#     EXACT string match against the literal ".heimdall/hooks" to decide
+#     whether the native pre-push hook is wired (test/pre-push-gate-dedup);
+#     an absolute value silently breaks that match. Root cause: a one-off
+#     manual stopgap predating bin/heimdall-hooks-link, which now solves
+#     linked-worktree hook resolution the right way (a symlink, never an
+#     absolute shared config value) — so a lingering absolute value here is
+#     pure vestige. Healed ONLY when it resolves to exactly THIS repo's own
+#     canonical <root>/.heimdall/hooks (derived independently below, never
+#     trusted from the possibly-corrupt value itself) AND that directory has
+#     a real, executable, hmd-named hook — the same existence proof
+#     bin/heimdall-hooks-link itself requires before it will link one.
+#
+# KEY FACT this depends on: `--git-common-dir` (like `--absolute-git-dir`)
+# survives core.bare=true even though `--show-toplevel` does not — so the
+# healer can always find the shared config to fix, even while the very
+# corruption it is fixing is live. Its output is relative to the `-C` target
+# for a normal or bare repo (".git" / ".") but already absolute for a linked
+# worktree (<main>/.git) — resolved uniformly below either way.
+#
+# Best-effort and fail-open throughout: never causes this script to exit
+# non-zero, never touches anything it cannot independently prove is its own.
+_heal_core_config() {
+  local common main_root bare hp hp_real found h
+  common="$(git -C "$repo" rev-parse --git-common-dir 2>/dev/null)" || return 0
+  case "$common" in
+    /*) : ;;
+    *)  common="$(cd "$repo/$common" 2>/dev/null && pwd -P)" || return 0 ;;
+  esac
+  [ -n "$common" ] || return 0
+  case "$common" in
+    /*/.git) main_root="${common%/.git}" ;;
+    *) return 0 ;;  # no .git entry at its own root -- genuinely bare, never touched
+  esac
+
+  bare="$(git -C "$repo" config --get core.bare 2>/dev/null || true)"
+  if [ "$bare" = "true" ]; then
+    git -C "$repo" config core.bare false 2>/dev/null && \
+      printf 'heimdall-git-guard: healed core.bare=true -> false (root has a .git entry; can never legitimately be bare)\n' >&2
+  fi
+
+  hp="$(git -C "$repo" config --get core.hooksPath 2>/dev/null || true)"
+  case "$hp" in
+    /*)
+      # Compare through the resolved path: $hp may be spelled via a symlinked
+      # ancestor (e.g. macOS $TMPDIR under /var/... vs git/pwd's /private/var/...
+      # realpath — see test/git-guard-worktree.test.sh's own MAIN0_REAL note for
+      # the identical class of mismatch) while $main_root is already physical
+      # (derived via `pwd -P` above). Resolve only $hp; a raw string compare
+      # between a physical and a non-canonical path fails for the wrong reason.
+      if [ -d "$hp" ]; then
+        hp_real="$(cd "$hp" 2>/dev/null && pwd -P)"
+        if [ "$hp_real" = "$main_root/.heimdall/hooks" ]; then
+          found=0
+          for h in pre-commit pre-push post-commit prepare-commit-msg; do
+            if [ -x "$hp/$h" ]; then found=1; break; fi
+          done
+          if [ "$found" -eq 1 ]; then
+            git -C "$repo" config core.hooksPath ".heimdall/hooks" 2>/dev/null && \
+              printf 'heimdall-git-guard: healed core.hooksPath (absolute -> relative .heimdall/hooks)\n' >&2
+          fi
+        fi
+      fi
+      ;;
+  esac
+  return 0
+}
+_heal_core_config
+# ── END SELF-HEAL ────────────────────────────────────────────────────────────
+
 # The index lock lives in the GIT DIR — which is NOT "$repo/.git" in a linked worktree.
 # There `.git` is a FILE ("gitdir: …") and the real dir is <common>/.git/worktrees/<name>,
 # so the old "$repo/.git/index.lock" path never existed and the guard silently found

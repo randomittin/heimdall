@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# heimdall-hooks-link — make a LINKED WORKTREE's relative core.hooksPath resolve.
+#
+# THE GAP: `hmd init` (bin/heimdall-init) sets core.hooksPath=.heimdall/hooks —
+# a RELATIVE value, deliberately, so the config keeps working if the repo is
+# ever moved/renamed. Per githooks(5) a relative hooksPath resolves against the
+# root of the working tree that FIRES the hook. For a linked worktree that is
+# the worktree's OWN root — not the checkout `hmd init` actually ran in. A
+# fresh `git worktree add` therefore has no .heimdall/hooks of its own, and
+# nothing re-runs `hmd init` there automatically. Heimdall spawns hmd:coder and
+# hmd:wave-executor with `isolation: worktree` — i.e. almost every commit hmd's
+# own agents make happens in exactly the place this silently has zero hooks:
+# no gate enforcement, no `Co-Authored-By: hmd` trailer (CLAUDE.md "Commit
+# attribution"). Measured, not assumed: a commit made in a freshly created
+# worktree carried neither, before this fix.
+#
+# THE FIX: none of the 4 generated hooks carry per-worktree STATE — the ones
+# that need a repo root (pre-commit/pre-push/post-commit) re-resolve it
+# dynamically at RUN time via `git rev-parse --show-toplevel`, and
+# prepare-commit-msg needs no repo root at all (it only touches the message
+# file git hands it). So the exact same hook FILES are correct no matter which
+# worktree invokes them — there is nothing to regenerate per worktree, only a
+# path to bridge. If this checkout is a linked worktree and its own
+# .heimdall/hooks is missing, symlink it straight at the CANONICAL checkout's
+# .heimdall/hooks. One symlink, no copy to go stale, no re-init ever needed
+# here again.
+#
+# NEVER shares .heimdall/ wholesale: .heimdall/receipts/, .heimdall/verdict.json
+# etc. are genuinely PER-WORKTREE (each worktree's own gate history) and must
+# stay that way. Only hooks/ (pure logic, no state) is linked.
+#
+# Rejected: making core.hooksPath itself absolute. .git/config is ONE file
+# shared by the main checkout and every linked worktree, so a single value has
+# to work everywhere — and an absolute value breaks hooks/hooks.json's
+# push-gate dedup, which does an EXACT string match against the literal
+# ".heimdall/hooks" to decide whether the native pre-push hook is wired
+# (test/pre-push-gate-dedup.test.sh); flipping it absolute would silently
+# double push latency in the real repo. This script never touches
+# core.hooksPath — only bridges the path it already names.
+#
+# CHEAP + IDEMPOTENT + FAIL-OPEN. Meant to be called on every PreToolUse
+# Edit/Write (bin/heimdall-precheck-edit), the same best-effort/fully-swallowed
+# way heimdall-wip-commit already is there. Steady state (already linked, or
+# not a worktree, or hooks not installed here at all) is one `git rev-parse`
+# and a stat — nothing else.
+#
+# NEVER fights a concurrent `hmd init`: acts only when .heimdall/hooks is
+# COMPLETELY ABSENT at this root (no file, no dir, no symlink — even a
+# dangling one is left alone), and `ln -s` (no -f) refuses to clobber an
+# existing name — so a racing writer simply loses the race harmlessly, never
+# corrupts state.
+#
+# Usage: heimdall-hooks-link   (no args; operates on $PWD's repo. exit: always 0)
+set -u
+
+INFO="$(git rev-parse --show-toplevel --git-dir --git-common-dir 2>/dev/null)" || exit 0
+MY_ROOT="$(printf '%s\n' "$INFO" | sed -n 1p)"
+GIT_DIR="$(printf '%s\n' "$INFO" | sed -n 2p)"
+GIT_COMMON_DIR="$(printf '%s\n' "$INFO" | sed -n 3p)"
+[ -n "$MY_ROOT" ] && [ -n "$GIT_DIR" ] && [ -n "$GIT_COMMON_DIR" ] || exit 0
+
+# Not a linked worktree -> this IS (or resolves to) the canonical checkout;
+# the relative hooksPath already works here. Nothing to bridge.
+[ "$GIT_DIR" != "$GIT_COMMON_DIR" ] || exit 0
+
+# Fast path: something is already at .heimdall/hooks (our symlink from a prior
+# call, a real dir from `hmd init` having run directly here, or even a
+# dangling leftover) -- never ours to touch. -e follows symlinks; -L also
+# catches a dangling one, which -e alone would miss.
+if [ -e "$MY_ROOT/.heimdall/hooks" ] || [ -L "$MY_ROOT/.heimdall/hooks" ]; then
+  exit 0
+fi
+
+# Only meaningful when THIS worktree's hooksPath is hmd's own Layer-0 relative
+# default -- a repo that customised core.hooksPath to something else has no
+# business getting a .heimdall/hooks symlink from us.
+HP="$(git config --get core.hooksPath 2>/dev/null || true)"
+[ "$HP" = ".heimdall/hooks" ] || exit 0
+
+# The canonical checkout is the one whose OWN .git IS the shared common dir --
+# standard non-bare layout, so its parent directory is that checkout's root.
+case "$GIT_COMMON_DIR" in
+  /*/.git) MAIN_ROOT="${GIT_COMMON_DIR%/.git}" ;;
+  *) exit 0 ;;
+esac
+CANON_HOOKS="$MAIN_ROOT/.heimdall/hooks"
+
+# The canonical hooks must be real: at least one generated hook present and
+# executable. Never link to an empty, half-written, or nonexistent dir.
+[ -d "$CANON_HOOKS" ] || exit 0
+_found=0
+for h in pre-commit pre-push post-commit prepare-commit-msg; do
+  if [ -x "$CANON_HOOKS/$h" ]; then _found=1; break; fi
+done
+[ "$_found" -eq 1 ] || exit 0
+
+mkdir -p "$MY_ROOT/.heimdall" 2>/dev/null || exit 0
+ln -s "$CANON_HOOKS" "$MY_ROOT/.heimdall/hooks" 2>/dev/null || true
+exit 0
