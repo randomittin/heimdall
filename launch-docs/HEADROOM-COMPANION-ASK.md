@@ -242,3 +242,13 @@ and the sdist `headroom_ai-0.33.0.tar.gz` digest is
 extra exists in the package's `provides_extra`. The manifest's `upstream_note` about PyPI still
 recording the pre-rename `chopratejas/headroom` path is also accurate, and the redirect is
 confirmed above. No manifest change is needed or was made.
+
+> **Superseded 2026-08-20 — the cross-check above was accurate on the day it ran and is kept as
+> the record of that run, not as current fact.** The manifest now pins `0.35.0`
+> (`headroom_ai-0.35.0.tar.gz`, sdist digest `79f61a03…3c0ce9`, confirmed against a downloaded
+> sdist rather than the index alone), and PyPI's current version is `0.35.0`, not `0.33.0`. The
+> pin moved twice in between: 0.35.0 was installed, correlated with mangled streaming, was rolled
+> back to 0.33.0 on 2026-08-19, and was re-pinned once the cause was traced to a
+> `headroom_retrieve` injection present in BOTH versions and suppressed by `--lossless`. Nothing
+> in the paragraph above was wrong when written; a "the pin is **correct**" claim simply cannot
+> stay true across a bump, so it is dated rather than silently rewritten.

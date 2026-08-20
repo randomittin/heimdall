@@ -325,29 +325,34 @@ hmd_headroom_chain() {
   # #1171 names, and does nothing for contention- or model-load-driven latency on
   # small blocks, a separate, still-unresolved mechanism.
   #
-  # VERSION NOTE — every file:line and default above is 0.33.0's, RE-READ against the
-  # installed tree, not carried over. This block was first written while 0.35.0 was
-  # installed; the machine was rolled back to 0.33.0 the same day (0.35.0 correlated
-  # with proxy-mangled streaming responses in a live session), and
-  # modules/headroom/manifest.json pins 0.33.0 to match. Both vars this block sets were
-  # re-verified as REAL at 0.33.0 rather than assumed — neither became an inert no-op
-  # in the rollback:
-  #   HEADROOM_COMPRESSION_TIMEOUT_SECONDS  proxy/helpers.py:688        default "30"
-  #   HEADROOM_KOMPRESS_MAX_TOKENS          content_router.py:1780      default "50000"
-  # Two claims that WERE true of 0.35.0 and are not true here, recorded so neither gets
-  # relied on again:
-  #   - HEADROOM_COMPRESSION_QUARANTINE_MAX_SECONDS (0.35.0, upstream #2360) does not
-  #     exist in 0.33.0 at all — no such var, and no cap of any kind on the quarantine.
-  #     An earlier version of this comment said that var bounded the other half of the
-  #     blast radius "at its upstream default"; under the pinned version there is no
-  #     default to leave alone, which is why the paragraph above now says unbounded.
-  #   - the reason for not setting HEADROOM_BACKGROUND_COMPRESSION was "gated behind
-  #     is_token_mode(...), a no-op outside token mode", verified in 0.35.0's
-  #     proxy/background_compression.py. That does NOT reproduce at 0.33.0: the string
-  #     `is_token_mode` appears nowhere in that module, and the flag is read as a plain
-  #     env bool at proxy/server.py:1090-1092, gated at its call sites instead. Leaving
-  #     it unset is still right — it is opt-in and off by default — but the mode-no-op
-  #     justification is 0.35.0's, so it is no longer stated as this version's reason.
+  # VERSION NOTE — the pin is 0.35.0 again as of 2026-08-20, and every file:line below
+  # was RE-READ against the 0.35.0 sdist rather than carried across the bump. The
+  # history matters because it is the reason the pin moved twice: 0.35.0 was installed,
+  # correlated with proxy-mangled streaming in a live session, and was rolled back to
+  # 0.33.0 on 2026-08-19. The cause was then found and is NOT version-specific — the
+  # headroom_retrieve injection documented below, present in both versions — so
+  # `--lossless` fixes it on either, and the rollback no longer buys anything.
+  #   HEADROOM_COMPRESSION_TIMEOUT_SECONDS  proxy/helpers.py:1043       default "30"
+  #   HEADROOM_KOMPRESS_MAX_TOKENS          content_router.py:1840      default "50000"
+  # Both defaults are unchanged from 0.33.0; only their line numbers moved, which is
+  # exactly why they were re-read instead of assumed.
+  #
+  # WHAT THE BUMP CHANGES, measured rather than read off a changelog:
+  #   - HEADROOM_COMPRESSION_QUARANTINE_MAX_SECONDS (upstream #2360) EXISTS again, at
+  #     proxy/server.py:1169 with a 60.0s default. Under 0.33.0 there was no such var
+  #     and no cap of any kind, so the paragraph above describing the quarantine as
+  #     unbounded is 0.33.0's statement and no longer this version's.
+  #   - HEADROOM_BACKGROUND_COMPRESSION's call sites are gated behind
+  #     `is_token_mode(...)` again (proxy/handlers/anthropic.py:1244 and :1381), so
+  #     leaving it unset is a no-op under the CACHE mode hmd launches in. At 0.33.0 that
+  #     gate did not exist and the flag was read as a plain env bool. Leaving it unset
+  #     was right under both, for different reasons; this is the 0.35.0 reason.
+  #   - upstream #2357 makes cache-mode COLD START synchronous before the request is
+  #     forwarded, which is the one 0.35.0 cost this pin was previously held back for.
+  #     It was MEASURED under this file's own config and does not reproduce: identical
+  #     payload and env, 0.35.0 cold start 948ms against 0.33.0's 1261ms, zero
+  #     `[router]` invocations on either. Held-back-for reasons have to survive
+  #     measurement, and this one did not.
   #
   # HEADROOM_LOSSLESS=1 IS THE ONE SETTING THAT KEEPS STREAMING WORKING. It is not a
   # savings tuning knob; it is the fix for the live failure that forced the 0.35.0
@@ -397,7 +402,7 @@ hmd_headroom_chain() {
   # WHAT HEADROOM_LOSSLESS=1 DOES ABOUT IT. proxy/server.py's `if config.lossless:`
   # branch sets `config.ccr_inject_tool = False` (and `ccr_inject_marker = False`,
   # `router_config.lossless`, `smart_crusher_lossless_only`) — identical wiring in both
-  # versions, so this is safe at the currently pinned 0.33.0 as well as at 0.35.0. With
+  # versions, so this is safe at the currently pinned 0.35.0 as well as at 0.33.0. With
   # the tool never injected, `buffered_stream_ccr` can never be true: streaming stays
   # streaming, and the verbatim-content-type path is only ever reached by genuinely
   # non-streaming requests, where the upstream reply is JSON anyway. Verified on the
@@ -426,11 +431,18 @@ hmd_headroom_chain() {
   # changed cache-mode COLD START from silent passthrough to a full synchronous
   # `anthropic_pipeline.apply(..., timeout=COMPRESSION_TIMEOUT_SECONDS)` that runs
   # BEFORE the request is forwarded, so the budget is a pre-upstream stall with zero
-  # bytes sent. Measured across the same requests on both versions: 0.33.0 logged 0
-  # `[router]` invocations (cache mode never entered the content router at all), 0.35.0
-  # logged one per cold start. 130s therefore guarantees the client gives up first on
-  # exactly the largest payload of every session. Pinning 30 rather than dropping the
-  # override keeps hmd's stall ceiling from moving if upstream's default ever does.
+  # bytes sent: 130s would guarantee the client gives up first on exactly the largest
+  # payload of every session. Pinning 30 rather than dropping the override keeps hmd's
+  # stall ceiling from moving if upstream's default ever does.
+  #
+  # HOW BIG THAT STALL ACTUALLY IS, measured on 2026-08-20 under this file's own config
+  # (--lossless, 30s, 10000) rather than inferred from the changelog: a cold start on a
+  # 213KB tool_result payload cost 948ms on 0.35.0 against 1261ms on 0.33.0, with ZERO
+  # `[router]` invocations on either. The stall #2357 introduces is real in the code and
+  # did not appear in the measurement — because `--lossless` keeps this traffic off the
+  # synchronous ML path that would spend the budget. An earlier version of this comment
+  # cited that same mechanism as the reason to hold the pin at 0.33.0; it did not
+  # survive being measured, and the pin moved.
   #
   # Isolation note for the two vars above: neither was the cause. Re-running the
   # streaming and non-streaming probes on 0.35.0 with (130s, 10000), with upstream's

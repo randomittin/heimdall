@@ -8,8 +8,10 @@
 # "test/headroom-wrap-chain.test.sh section 5" since it was written, and no such
 # file — or any test exercising hmd_headroom_chain / its HMD_HEADROOM_BIN seam —
 # ever existed. This is that file, scoped first to the timeout-debt quarantine
-# mitigation first added during the headroom-ai 0.33.0 -> 0.35.0 upgrade (since rolled
-# back — the pinned and installed version is 0.33.0 again):
+# mitigation first added during the headroom-ai 0.33.0 -> 0.35.0 upgrade (rolled back to
+# 0.33.0 on 2026-08-19 over a streaming failure, then re-pinned to 0.35.0 on 2026-08-20
+# once that failure was traced to an injection present in BOTH versions and fixed by
+# `--lossless`; the pinned version is 0.35.0):
 # HEADROOM_COMPRESSION_TIMEOUT_SECONDS is now set on the proxy's OWN child process at
 # launch, scoped to that one process. HEADROOM_BACKGROUND_COMPRESSION is deliberately
 # NOT set: it is opt-in and off by default. An earlier version of this header added
