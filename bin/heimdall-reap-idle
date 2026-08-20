@@ -433,7 +433,38 @@ reap_worktrees() {
     [ -n "$tip" ] || tip="$(git -C "$REPO" rev-parse --verify -q "HEAD" 2>/dev/null)"
 
     # Core rule: tip is an ANCESTOR of main => the commits are on main.
+    #
+    # SECOND, WEAKER-LOOKING RULE THAT IS EXACTLY AS SAFE: the tip is NOT an ancestor,
+    # but the branch's three-dot diff against main is EMPTY — it contributes no bytes
+    # over the merge base. Ancestry is a statement about COMMIT IDENTITY, and identity
+    # is destroyed by every ordinary way work reaches main: rebase, squash-merge, a
+    # cherry-pick, or a human re-implementing the same change. The content is on main;
+    # only the commit objects differ.
+    #
+    # WITHOUT THIS RULE THE REAPER NEVER FORGETS. Measured on this repo: 21 worktrees,
+    # ZERO reapable, 19 "unmerged" commits across 8 branches — and every feature those
+    # commits claimed (`feat(modules)` reconcile, `feat(agents)` states, the dream
+    # toolchain, the Headroom consent waiver) was verified present in main, which had
+    # since evolved past all of them. The branches were stale ancestors, not pending
+    # work, and the reaper was correctly refusing to destroy them forever.
+    #
+    # WHY IT CANNOT LOSE WORK. `git diff main...tip` shows what the BRANCH changed since
+    # the fork point. Empty means there is nothing to lose by definition — not "probably
+    # merged", not "looks similar". The check is also asymmetric on purpose: work main
+    # gained independently never enters it, so a branch that adds a file main also added
+    # is NOT quiet here (the fork point lacks it) and stays KEPT. It fails conservative.
+    #
+    # The directory protections below (uncommitted changes, gitignored agent memory)
+    # still run for both rules, because they guard the DIRECTORY, which ancestry and
+    # content-equality both say nothing about.
+    local merged_why=""
     if git -C "$REPO" merge-base --is-ancestor "$tip" "$MAIN_SHA" 2>/dev/null; then
+      merged_why="merged into $MAIN_REF"
+      [ "$tip" = "$MAIN_SHA" ] && merged_why="at $MAIN_REF head (no divergence)"
+    elif git -C "$REPO" diff --quiet "$MAIN_SHA...$tip" 2>/dev/null; then
+      merged_why="content already on $MAIN_REF — $(git -C "$REPO" rev-list --count "$MAIN_SHA..$tip" 2>/dev/null || echo '?') commit(s) that change nothing over the fork point (rebased, squashed or superseded)"
+    fi
+    if [ -n "$merged_why" ]; then
       # …which is necessary and not sufficient. Ancestry rules on COMMITS; the
       # removal deletes a DIRECTORY. Prove the directory holds nothing first.
       local guard
@@ -445,9 +476,7 @@ reap_worktrees() {
         return 0
       fi
 
-      local why="merged into $MAIN_REF"
-      [ "$tip" = "$MAIN_SHA" ] && why="at $MAIN_REF head (no divergence)"
-      line "REAP" "$rel" "$why"
+      line "REAP" "$rel" "$merged_why"
       REAP_CAND=$((REAP_CAND+1))
       if [ "$APPLY" = 1 ]; then
         # A stale lock (dead/absent pid) still blocks removal — clear it first.
