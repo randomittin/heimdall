@@ -289,6 +289,36 @@ FNR == 1 { region = 0; regionkinds = "" }
 }
 '
 
+# ── Untracked-file exclusion: docs/analysis/ ──────────────────────────────────
+# docs/analysis/ is this repo's own gitignored scratch space for point-in-time analysis and
+# audit reports (.gitignore's own comment: "user-generated docs (research/plans/specs from
+# real tasks)"). A file dropped there and never committed cannot be a published surface this
+# gate needs to protect — no OTHER checkout will ever contain it, so a version or sha256
+# quoted inside one, as forensic EVIDENCE in a finding rather than a claim of what ships, can
+# never rot anywhere a reader could see it. Marking it would be actively wrong, for the same
+# reason the dated-archive exemption below refuses to mark a changelog: the renderer would
+# overwrite a quoted historical value with today's version, corrupting the finding it quoted.
+#
+# This is deliberately NOT folded into ARCHIVE_DIRS/DATED_DIRS below. This repo also carries
+# two dozen already-TRACKED files directly under docs/analysis/ that predate the gitignore
+# rule (`git ls-files docs/analysis/`), most with no ISO-dated filename — forcing DATED_DIRS'
+# provenance obligation onto them would demand a field none of them have and turn this fix
+# into a fresh wave of failures. Exempting the whole directory unconditionally instead (the
+# SCAFFOLDING_DIRS treatment) would overshoot the other way and hide a genuine unmarked pin
+# added to one of those tracked files. Commit status is the one fact that actually
+# distinguishes the untracked audit report from the tracked ones, and it is exactly — and
+# only — what gets checked, per file, against git's own index. It also needs no separate
+# staleness proof the way the STRUCTURAL and ARCHIVE exemptions above do: git ls-files IS the
+# live truth every run, not a claim about it, so there is no comment string here that can
+# ever drift out of sync with reality.
+untracked_in_docs_analysis() {
+  local rel="$1"
+  case "$rel" in
+    docs/analysis/*) git -C "$REPO" ls-files --error-unmatch -- "$rel" >/dev/null 2>&1 && return 1 || return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # sweep_root <root> <label> — print records for every published file under <root>. Relative
 # paths are emitted so records are stable across the real tree and a throwaway copy.
 sweep_root() {
@@ -296,6 +326,7 @@ sweep_root() {
   while IFS= read -r f; do
     [ -n "$f" ] || continue
     rel="${f#$root/}"
+    if [ "$label" = repo ] && untracked_in_docs_analysis "$rel"; then continue; fi
     awk -v ver="$VER" -v win="$DIGEST_WINDOW" -v loc="$label:$rel" "$PIN_AWK" "$f" "$f"
   done <<FILES
 $(find_files published "$root")
@@ -540,6 +571,29 @@ VOID
   fresh_copy
   printf 'Install %s from the mirror.\n' "$SELF_TAG" > "$TMP/launch-docs/live-listing.md"
   assert_red "a pin in the parent of an archive directory (exclusion must not widen)" "UNMARKED"
+
+  # Mutant 17 — THE ACTUAL BUG. docs/analysis/ is this repo's own gitignored scratch space
+  # (see the untracked_in_docs_analysis comment above); a file dropped there and never
+  # committed is quoted EVIDENCE in an audit finding, not a claim of what ships, and it will
+  # never exist in any OTHER checkout to rot in. It must not need a marker.
+  fresh_copy
+  MUT_SITE="$NO_SITE"
+  mkdir -p "$TMP/docs/analysis"
+  { printf 'Finding: repo pins %s (tag %s) as of this audit.\n' "$SELF_VER" "$SELF_TAG"
+    printf 'curl -fsSL %s -o heimdall-install.sh\n' "$INSTALL_URL"
+    printf 'echo "%s  heimdall-install.sh" | shasum -a 256 -c -\n' "$FAKE_DIGEST"
+  } > "$TMP/docs/analysis/mock-launch-audit.md"
+  assert_green "an unmarked version/tag/digest quoted in an UNTRACKED docs/analysis/ audit report"
+
+  # Mutant 18 — the boundary. docs/analysis/ also carries real, already-TRACKED files
+  # (predating the gitignore rule) that ship in every clone same as any other doc. The
+  # exemption is about commit status, not the directory name, so a hand-typed pin added to
+  # one of THOSE must still be caught.
+  fresh_copy
+  [ -f "$TMP/docs/analysis/INDEX.md" ] \
+    || { echo "  ✗ SELF-TEST FAILED: fixture assumption broken — docs/analysis/INDEX.md is no longer tracked" >&2; exit 1; }
+  printf '\nInstall the %s release from the mirror.\n' "$SELF_TAG" >> "$TMP/docs/analysis/INDEX.md"
+  assert_red "a hand-typed tag added to an already-TRACKED docs/analysis/ file" "UNMARKED"
 
   echo "version-pin-conformance --self-test: PASS"
   exit 0

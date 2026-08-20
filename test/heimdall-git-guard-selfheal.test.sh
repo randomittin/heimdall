@@ -191,6 +191,7 @@ fi
 #    never be touched.
 # ══════════════════════════════════════════════════════════════════════════════
 BAREREPO="$WORK/genuinely-bare.git"
+[ -n "$BAREREPO" ] || { echo "FATAL: BAREREPO path empty" >&2; exit 1; }
 git init -q --bare "$BAREREPO"
 run_with_alarm 10 "$GUARD" "$BAREREPO" >/dev/null 2>&1
 BR_AFTER="$(git -C "$BAREREPO" config --get core.bare 2>/dev/null || true)"
