@@ -18,6 +18,14 @@ network; two of those only ever do so because you asked.
 
 Everything below documents the *real* shapes emitted by the code, field by field.
 
+**Not listed above: auto-commit.** hmd's automatic checkpoint commits
+(`bin/heimdall-autocommit`) are a **repository-mutation** behavior, not a
+data-collection one, so they are not a sixth row in the table above — nothing
+they do puts a byte on any network. They write only to your own git history and
+to a local `.heimdall/receipts/unproven.log` file. See SECURITY.md's
+"Auto-commit" section for what gets committed, when it bypasses your commit
+gate, and how to turn it off.
+
 ---
 
 ## 1. Team presence
