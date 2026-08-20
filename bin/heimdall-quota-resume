@@ -369,6 +369,21 @@ cmd_resume_hint() {
   [ -n "$repo" ] || repo="$PWD"
   repo="$(cd "$repo" 2>/dev/null && pwd)" || return 0
 
+  # Best-effort, independent of the QUOTA-STOP.json record below: surface any
+  # INTERRUPTED SIBLING AGENTS from this repo's own prior session (failed,
+  # killed, orphaned, hung — see bin/heimdall-agent-resume). Complementary, not
+  # a duplicate: QUOTA-STOP.json is written by THIS tool's own `record` for the
+  # ORCHESTRATOR's own stop; agent-resume derives its signal independently from
+  # harness subagent metadata, so it fires even when `record` was never called
+  # (e.g. the orchestrator itself survived but several of its subagents didn't).
+  # Deliberately silent-unless-actionable (never crashes this hook chain) and
+  # deliberately BEFORE the early returns below, so it runs whether or not a
+  # QUOTA-STOP.json record exists at all.
+  local agent_resume="$QS_BIN_DIR/heimdall-agent-resume"
+  if [ -x "$agent_resume" ]; then
+    "$agent_resume" resume-hint --repo "$repo" 2>/dev/null || true
+  fi
+
   local state="$repo/.planning/QUOTA-STOP.json"
   [ -f "$state" ] || return 0
   command -v jq >/dev/null 2>&1 || return 0
@@ -468,7 +483,10 @@ Usage:
   heimdall-quota-resume resume-hint --repo DIR
       Wired into hooks.json SessionStart. Prints NOTHING unless the window
       has genuinely reopened (or the reset time could never be parsed) —
-      silent while still waiting, so it never nags.
+      silent while still waiting, so it never nags. Also (independently of
+      any QUOTA-STOP.json record) runs `heimdall-agent-resume resume-hint`,
+      which surfaces any sibling SUBAGENTS left failed/killed/orphaned/hung
+      by the same quota window — see bin/heimdall-agent-resume.
 
   heimdall-quota-resume clear --repo DIR
       Mark the current record resolved once you've resumed. Safe no-op if
