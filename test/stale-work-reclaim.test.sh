@@ -222,8 +222,10 @@ if grep -q 'count=\$(git diff --name-only 2>/dev/null | wc -l | tr -d \\" \\"); 
 else
   ok "the pre-staging count idiom is gone from hooks.json"
 fi
-if grep -q 'git add -A && count=\$(git diff --cached --name-only' "$HOOKS"; then
-  ok "hooks.json counts from the index after staging"
+if grep -q 'git add -A && count=\$(git diff --cached --name-only' "$HOOKS" \
+   || { grep -q 'heimdall-autocommit' "$HOOKS" \
+        && grep -q 'git diff --cached --name-only' "$REPO/bin/heimdall-autocommit" 2>/dev/null; }; then
+  ok "hooks.json counts from the index after staging (directly, or via heimdall-autocommit, which stages then counts from the index itself — the scoped-staging refactor moved the mechanics out of hooks.json without reintroducing the pre-staging count bug)"
 else
   bad "hooks.json does not count from the index after staging"
 fi
