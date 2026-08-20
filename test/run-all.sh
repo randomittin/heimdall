@@ -247,7 +247,50 @@ if [ "$TO_RUN" -eq 0 ]; then
 fi
 
 WORK="$(mktemp -d -t heimdall-run-all.XXXXXX)"
-cleanup() { rm -rf "$WORK"; }
+
+# ── PUBLISH THAT A GATE IS IN FLIGHT ─────────────────────────────────────────────────
+# CLAUDE.md requires this sweep to grade a FROZEN tree — "a verdict over a moving tree is
+# not a verdict" — but nothing in the repo announced that a sweep was running, so the
+# things that can move the tree had no way to know. bin/heimdall-wip-commit, the
+# edit-count checkpointer wired into the PreToolUse hook, duly committed three in-progress
+# files during a real 337-suite run, moving HEAD and the index under the suites that read
+# git state. This marker is the missing signal, and heimdall-wip-commit is its first
+# reader (it withholds the commit and keeps counting).
+#
+# The pid is in the file so a reader can check LIVENESS: a sweep killed with SIGKILL never
+# reaches the trap below, and a stale marker that silently disabled checkpointing forever
+# would be worse than the race it prevents. It lives under HEIMDALL_HOME, never in the
+# repo, because a marker inside the tree would itself be tree movement.
+GATE_MARKER="${HEIMDALL_HOME:-$HOME/.heimdall}/.gate-in-flight"
+# Do not steal a LIVE parent's claim: if a marker already names a running process, that
+# sweep owns the freeze and this (nested) run must not overwrite it with its own pid —
+# otherwise the parent's own release check would find a foreign pid and leave the marker
+# behind forever. A marker naming a dead pid is stale and is taken over.
+_gate_marker_claim() {
+  local held
+  mkdir -p "$(dirname "$GATE_MARKER")" 2>/dev/null || return 0
+  if [ -f "$GATE_MARKER" ]; then
+    held="$(cat "$GATE_MARKER" 2>/dev/null)"
+    case "$held" in
+      ''|*[!0-9]*) ;;
+      *) kill -0 "$held" 2>/dev/null && return 0 ;;
+    esac
+  fi
+  printf '%s\n' "$$" > "$GATE_MARKER" 2>/dev/null || true
+}
+_gate_marker_claim
+
+# OWNERSHIP-CHECKED REMOVAL. Some suites invoke this runner again with --filter, and a
+# nested run that blindly deleted the marker on exit would un-freeze the OUTER sweep while
+# it was still grading — reintroducing exactly the race the marker exists to close, in the
+# one situation hardest to notice. The marker is only removed by the process whose pid it
+# names, so a nested run leaves its parent's claim standing.
+_gate_marker_release() {
+  [ -f "$GATE_MARKER" ] || return 0
+  [ "$(cat "$GATE_MARKER" 2>/dev/null)" = "$$" ] || return 0
+  rm -f "$GATE_MARKER" 2>/dev/null || true
+}
+cleanup() { rm -rf "$WORK"; _gate_marker_release; }
 trap cleanup EXIT INT TERM
 
 # ── EXECUTE (bounded parallelism; bash 3.2 has no `wait -n`, so poll with kill -0) ─────────

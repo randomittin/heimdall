@@ -515,6 +515,20 @@ reap_pollers() {
 
   [ -n "$ps_out" ] || return 0
 
+  # PRE-FILTER ONCE, PARSE THE SURVIVORS. This function runs on the SessionStart blocking
+  # path, and its loop body used to execute for EVERY process on the machine: three forks
+  # to split the row (printf|awk twice, printf|sed once) and two more to match it
+  # (printf|grep twice). Measured on this machine — 712 processes — that was 12,425 traced
+  # command invocations, 1,436 awk and 717 sed among them, and a FIXED 5.5s before the
+  # first prompt could render (a 1-worktree sandbox repo cost the same 5.4s, which is what
+  # proved the cost was the process table and not the worktrees). The two greps that
+  # decided membership are now run ONCE over the whole table instead of once per row, so
+  # the loop below sees only rows that already matched — normally none. Same rows in, same
+  # decisions out; the per-row parsing is deliberately left alone because it is correct and
+  # now runs on a handful of rows rather than hundreds.
+  ps_out="$(printf '%s\n' "$ps_out" | grep -E "$WATCH_TOOL_RE" 2>/dev/null | grep -E "$WATCH_LOOP_RE" 2>/dev/null)"
+  [ -n "$ps_out" ] || return 0
+
   local pid pgid cmd
   while IFS= read -r ln; do
     [ -n "$ln" ] || continue
@@ -523,9 +537,6 @@ reap_pollers() {
     cmd="$(printf '%s' "$ln" | sed -E 's/^ *[0-9]+ +[0-9]+ +//')"
     case "$pid" in ''|*[!0-9]*) continue ;; esac
     [ "$pid" = "$$" ] && continue  # never flag ourselves
-
-    printf '%s' "$cmd" | grep -qE "$WATCH_TOOL_RE" || continue
-    printf '%s' "$cmd" | grep -qE "$WATCH_LOOP_RE" || continue
 
     POLLERS_FOUND=$((POLLERS_FOUND+1))
     local safe=0

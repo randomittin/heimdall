@@ -40,6 +40,30 @@ _no_autocommit() { # <toplevel>
   [ -f "$1/.heimdall-no-autocommit" ] || [ -f "$1/.superx-no-autocommit" ]
 }
 
+# _gate_in_flight — is a full gate sweep grading this tree RIGHT NOW?
+#
+# CLAUDE.md requires the full sweep to run over a FROZEN tree, on the grounds that "a
+# verdict over a moving tree is not a verdict". This checkpointer is the one thing in the
+# repo that can move the tree without a human asking it to, and it did: during a real
+# 337-suite run it committed three in-progress files as `wip: 6 edit-op checkpoint`, moving
+# HEAD and the index while suites were reading git state. The file bytes were unchanged, so
+# that particular verdict survived — but a checkpointer that races the gate is a coin-flip,
+# not a guarantee, and the fix belongs here rather than in the operator's memory.
+#
+# The marker is written by test/run-all.sh and carries the runner's pid. LIVENESS IS
+# CHECKED, not assumed: a sweep killed with SIGKILL never runs its trap, and a stale file
+# that silently disabled checkpointing forever would be a worse failure than the one this
+# prevents — an agent would lose a day of mid-task checkpoints with nothing on screen to
+# explain why.
+_gate_in_flight() {
+  local marker pid
+  marker="${HEIMDALL_HOME:-$HOME/.heimdall}/.gate-in-flight"
+  [ -f "$marker" ] || return 1
+  pid="$(cat "$marker" 2>/dev/null)"
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  kill -0 "$pid" 2>/dev/null
+}
+
 _read_count() { # <file>
   local n
   n="$(cat "$1" 2>/dev/null || true)"
@@ -66,6 +90,17 @@ cmd_note() {
   count="$(_read_count "$cf")"
   count=$((count + 1))
   if [ "$count" -ge "$THRESHOLD" ]; then
+    # A GATE IN FLIGHT WITHHOLDS THE COMMIT, NOT THE COUNT. The edit happened, so the
+    # counter keeps it and the first checkpoint after the sweep carries it — the count is
+    # deliberately NOT reset here, because resetting would silently drop the work from
+    # every future checkpoint, which is the failure the counter exists to prevent. The
+    # guard sits inside the threshold branch rather than at the top of the function so
+    # that this stays true; an earlier placement above the counter returned first and
+    # test/gate-in-flight-guard.test.sh guarantee 3 caught it.
+    if _gate_in_flight; then
+      printf '%s' "$count" > "$cf" 2>/dev/null
+      return 0
+    fi
     if [ "$(_dirty_count)" -gt 0 ]; then
       _do_commit "wip: ${count} edit-op checkpoint (heimdall-wip)"
     fi

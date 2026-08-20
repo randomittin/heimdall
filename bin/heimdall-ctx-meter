@@ -60,6 +60,20 @@
 
 set -uo pipefail
 
+# The interpreter this script parses hook payloads with. `python3` on PATH is a
+# version-manager shim on many machines (pyenv here), and this script runs on EVERY user
+# prompt: measured 168ms with the shim against 63ms with a real interpreter, all of it in
+# front of the user's own turn. bin/lib/hmd-python.sh resolves and caches a non-shim
+# python3 and prints nothing when there is none, which is exactly the signal the jq
+# fallback below already handles.
+_CTXM_SELF="${BASH_SOURCE[0]}"
+if command -v readlink >/dev/null 2>&1; then
+  _CTXM_SELF="$(readlink -f "$_CTXM_SELF" 2>/dev/null || readlink "$_CTXM_SELF" 2>/dev/null || printf '%s' "$_CTXM_SELF")"
+fi
+_CTXM_LIB="$(cd "$(dirname "$_CTXM_SELF")" && pwd)/lib/hmd-python.sh"
+# shellcheck source=lib/hmd-python.sh
+[ -r "$_CTXM_LIB" ] && . "$_CTXM_LIB"
+
 CEILING="${HMD_CTX_CEILING:-150000}"
 CLIFF_NEAR="${HMD_CTX_CLIFF_NEAR:-700000}"
 CLIFF="${HMD_CTX_CLIFF:-800000}"
@@ -115,8 +129,11 @@ _slurp() {
 # parses the blob with, so the semantics match), jq as the fallback.
 _json_get() { # <json> <python-expr-path> <jq-path>
   local blob="$1" pypath="$2" jqpath="$3" out=""
-  if command -v python3 >/dev/null 2>&1; then
-    out="$(printf '%s' "$blob" | python3 -c '
+  local _py=""
+  if type hmd_python >/dev/null 2>&1; then _py="$(hmd_python 2>/dev/null || true)"; fi
+  [ -n "$_py" ] || _py="$(command -v python3 2>/dev/null || true)"
+  if [ -n "$_py" ]; then
+    out="$(printf '%s' "$blob" | "$_py" -c '
 import json, sys
 try:
     b = json.load(sys.stdin)
