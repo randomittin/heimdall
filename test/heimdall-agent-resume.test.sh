@@ -371,8 +371,8 @@ BOGUS="$("$AR" list --json --repo "/no/such/path/xyz-does-not-exist" 2>/dev/null
   && ok "unreachable --repo path degrades to a valid (likely empty) JSON array, never crashes" \
   || bad "unreachable --repo broke list --json (rc=$BRC out=$BOGUS)"
 
-"$AR" bogus-subcommand >/dev/null 2>/tmp_ar_err.$$; UNK_RC=$?
-UNK_ERR="$(cat "/tmp_ar_err.$$" 2>/dev/null)"; rm -f "/tmp_ar_err.$$"
+"$AR" bogus-subcommand >/dev/null 2>"$WORK/ar_err.$$"; UNK_RC=$?
+UNK_ERR="$(cat "$WORK/ar_err.$$" 2>/dev/null)"; rm -f "$WORK/ar_err.$$"
 [ "$UNK_RC" = "2" ] && printf '%s' "$UNK_ERR" | grep -qi "unknown subcommand" \
   && ok "unknown subcommand exits 2 with a named error on stderr" \
   || bad "unknown subcommand contract broken (rc=$UNK_RC err=$UNK_ERR)"
