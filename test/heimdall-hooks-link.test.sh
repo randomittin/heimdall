@@ -108,7 +108,11 @@ mk_pair() {
   printf '%s %s' "$main" "$wt"
 }
 
-hmd_trailers() { git -C "$1" log -1 --format=%B 2>/dev/null | grep -cE '^Co-Authored-By: hmd <[^>]+>$'; }
+# Matches test/prepare-commit-msg-trailer.test.sh's own TRAILER constant — the
+# CURRENT hmd attribution trailer (runhmd GitHub account, not the retired
+# hmd@runheimdall.dev address / "hmd" display name).
+HMD_TRAILER='Co-Authored-By: runhmd <318965969+runhmd@users.noreply.github.com>'
+hmd_trailers() { git -C "$1" log -1 --format=%B 2>/dev/null | grep -Fc "$HMD_TRAILER"; }
 hooks_kind() { # <dir> -> SYMLINK | REALDIR | MISSING
   if [ -L "$1/.heimdall/hooks" ]; then echo SYMLINK
   elif [ -d "$1/.heimdall/hooks" ]; then echo REALDIR
