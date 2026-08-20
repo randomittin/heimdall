@@ -2269,6 +2269,23 @@ case "${1:-}" in
     fi
     exec "$RULES_BIN" "$@"
     ;;
+  route)
+    # Pass-through to heimdall-route: run a coding tool THROUGH the Headroom chain
+    # without wrapping anything. `hmd wrap` was the chain's only entry point, and it
+    # also installs git hooks, writes the AGENTS.md fence and starts presence — right
+    # for adopting a repo, wrong for "just compress my sessions". Measured cost of that
+    # coupling on the machine this was written on: 140 of 403 sessions in one week
+    # reached the proxy at all. Every flag forwards verbatim, so a routed run and a
+    # direct bin run are byte-identical.
+    shift
+    ROUTE_BIN="$PLUGIN_DIR/bin/heimdall-route"
+    if [ ! -x "$ROUTE_BIN" ]; then
+      echo "  Error: heimdall-route not found at $ROUTE_BIN" >&2
+      echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+      exit 1
+    fi
+    exec "$ROUTE_BIN" "$@"
+    ;;
   modules)
     shift
     MODULES_BIN="$PLUGIN_DIR/bin/heimdall-modules"

@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+# heimdall-route — run a coding tool THROUGH the Headroom chain, and change nothing else.
+#
+#   hmd route claude [args…]   ensure the proxy, then exec `claude` with
+#                              ANTHROPIC_BASE_URL pointed at it.
+#   hmd route --url            print the base URL (empty when not routed) — the
+#                              seam a shell function or an editor launch config uses.
+#   hmd route --status         one line: am I routed right now, and why.
+#
+# ── WHY THIS EXISTS, MEASURED ────────────────────────────────────────────────────────
+# The chain was reachable from exactly one place: `hmd wrap <tool>`, which also installs
+# Layer-0 git hooks, writes the AGENTS.md fenced block and starts presence. Those are
+# the right side effects for adopting a repo and the wrong ones for "I just want my
+# sessions compressed", so a user who launches `claude` directly gets no proxy at all.
+#
+# What that cost, on this machine, over 2026-08-11..19: 140 distinct Claude Code session
+# ids appear in Headroom's logs against 403 session transcripts that existed in the same
+# window — roughly a third of sessions routed. The proxy was not the problem: of the
+# 15,605 request records in those logs, 90.8% carried cache_read > 0 and 42.1% carried
+# tok_saved > 0, and lifetime savings stand at $17,386.56 (cache) + $43.00 (compression)
+# over 43,780 requests. Coverage was the problem, and this file is the coverage fix.
+#
+# ── WHAT IT DOES NOT DO ─────────────────────────────────────────────────────────────
+# It does not wrap. No git hooks, no AGENTS.md fence, no presence beat, no snapshot, no
+# repo bytes touched — so it is safe to put on EVERY launch, in any directory, including
+# ones that are not git repos at all. `hmd wrap` remains the deliberate, reversible,
+# per-repo act it always was; this is the launch-time routing half on its own.
+#
+# It sets ONE variable on ONE child: ANTHROPIC_BASE_URL. HTTPS_PROXY / ALL_PROXY are
+# never set here, for the reason bin/lib/hmd-headroom-chain.sh states at length — they
+# would route the control plane, enrollment, presence and team traffic through a
+# rewriter, and that is how a compression proxy becomes a man-in-the-middle on signed
+# bytes. Judgment is unaffected: hmd_gate_exec scrubs ANTHROPIC_BASE_URL and the whole
+# HEADROOM_* namespace before any verdict-producing execution.
+#
+# ── FAIL-OPEN, AND SAID OUT LOUD ────────────────────────────────────────────────────
+# Every failure lands on "launch the tool unproxied", never on "do not launch". A
+# compression proxy that can stop a session from starting is worse than no compression.
+# And routing is never silent: routed or not, the reason goes to stderr, because a proxy
+# the user cannot see is precisely what this project refuses to ship.
+set -uo pipefail
+
+SELF="$0"
+if command -v readlink >/dev/null 2>&1; then
+  SELF="$(readlink -f "$0" 2>/dev/null || readlink "$0" 2>/dev/null || echo "$0")"
+fi
+BIN_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+PLUGIN_DIR="$(cd "$BIN_DIR/.." && pwd)"
+
+if [ -t 2 ]; then G='\033[32m'; D='\033[90m'; R='\033[0m'; else G=''; D=''; R=''; fi
+
+usage() {
+  cat <<'EOF'
+  hmd route — run a coding tool through the Headroom chain, and change nothing else.
+
+    hmd route <tool> [args…]   ensure the proxy, exec <tool> with ANTHROPIC_BASE_URL set
+    hmd route --url            print the base URL (nothing when not routed)
+    hmd route --status         one line: routed or not, and why
+    hmd route -h | --help      this text
+
+  Unlike `hmd wrap`, this installs nothing and touches no repo bytes — it is safe on
+  every launch, in any directory. Shell integration:
+
+    claude() { command hmd route claude "$@"; }      # zsh/bash, in your rc file
+
+  Failure always degrades to launching the tool unproxied, and always says why.
+EOF
+}
+
+# The chain is a library; sourcing it defines functions and routes nothing.
+# shellcheck source=lib/hmd-headroom-chain.sh
+if [ -r "$BIN_DIR/lib/hmd-headroom-chain.sh" ]; then
+  . "$BIN_DIR/lib/hmd-headroom-chain.sh"
+fi
+
+chain_available() { type hmd_headroom_chain >/dev/null 2>&1; }
+
+# route_now — run the chain once, leaving its answer in the two globals the chain owns:
+# HMD_HEADROOM_BASE_URL on success, HMD_HEADROOM_WHY always. Returns the chain's status.
+#
+# IT DELIBERATELY PRINTS NOTHING. An earlier version printed the URL so callers could
+# write `url="$(route_url)"` — which runs the function in a command-substitution SUBSHELL,
+# where the chain's assignment to HMD_HEADROOM_WHY dies with that subshell. The result
+# was a refusal with no reason on stderr: the user saw an unexplained loss of
+# compression, which is exactly the silence this file's disclosure rule exists to
+# prevent. test/heimdall-route.test.sh guarantee 3 is what caught it.
+route_now() {
+  chain_available || { HMD_HEADROOM_WHY="the headroom chain library is missing from this install"; return 1; }
+  hmd_headroom_chain "$PLUGIN_DIR"
+}
+
+case "${1:-}" in
+  -h|--help|help|'')
+    usage; exit 0 ;;
+  --url)
+    if route_now; then printf '%s\n' "$HMD_HEADROOM_BASE_URL"; exit 0; fi
+    printf '%s\n' "${HMD_HEADROOM_WHY:-no reason reported}" >&2
+    exit 1 ;;
+  --status)
+    if chain_available; then hmd_headroom_report "$PLUGIN_DIR"; printf '\n'
+    else printf 'NOT ROUTED — the headroom chain library is missing from this install\n'; fi
+    exit 0 ;;
+  -*)
+    printf '  unknown flag: %s\n' "$1" >&2; usage >&2; exit 2 ;;
+esac
+
+TOOL="$1"; shift
+
+# The tool is resolved with `command -v` from a NON-interactive shell, so the shell
+# function a user installs for integration (`claude() { hmd route claude "$@"; }`) is
+# not in scope here and cannot recurse into this script.
+REAL="$(command -v "$TOOL" 2>/dev/null || true)"
+if [ -z "$REAL" ]; then
+  printf '  %s is not installed (not found on PATH)\n' "$TOOL" >&2
+  exit 127
+fi
+
+if route_now && [ -n "${HMD_HEADROOM_BASE_URL:-}" ]; then
+  printf "  ${G}✓${R} ${D}headroom: generation routed via %s — judgment is not (hmd route --status)${R}\n" \
+    "$HMD_HEADROOM_BASE_URL" >&2
+  export ANTHROPIC_BASE_URL="$HMD_HEADROOM_BASE_URL"
+else
+  printf "  ${D}· headroom: not routing — %s${R}\n" "${HMD_HEADROOM_WHY:-no reason reported}" >&2
+fi
+
+exec "$REAL" "$@"
