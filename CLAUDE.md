@@ -32,6 +32,21 @@ The trailer is a TRAILER, deliberately. Author and committer stay human, because
 accountable for a push — "a human always gates the merge" has to remain literally
 true. Trailers sit outside that gate, so this adds no allowlist surface.
 
+**Mechanically enforced, not just documented.** A generated `prepare-commit-msg`
+git hook (`.heimdall/hooks/prepare-commit-msg`, emitted by `hmd init` from
+`bin/heimdall-init`) appends the trailer to every commit message that doesn't
+already carry it. This is the one client-side hook `git commit --no-verify` does
+NOT skip — verified empirically, not assumed — which is why prose alone (agents
+were told to add this trailer in their spawn prompts and still routinely didn't:
+55/81 commits since 2026-08-18 had it, 26 did not) isn't enough on its own and
+this now lives in a hook too. Append-only and idempotent: never duplicates the
+trailer, never touches an existing model trailer, and fails OPEN on anything
+malformed or unwritable — an attribution trailer is bookkeeping, not a
+correctness gate, and must never be the reason a commit is lost. History before
+this hook existed was NOT rewritten (~195 unpushed commits at the time — that
+would have changed every SHA); this is enforced going forward only. See
+`test/prepare-commit-msg-trailer.test.sh` (the proof).
+
 ## Quality Gates (enforced before git push)
 - All tests passing
 - Lint clean (zero warnings)
