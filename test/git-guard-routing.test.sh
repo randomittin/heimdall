@@ -54,6 +54,21 @@ pre_bash_body() {
   jq -r '.hooks.PreToolUse[] | select(.matcher=="Bash") | .hooks[0].command' "$HOOKS_JSON"
 }
 
+# routes_to_guard BODY — true if BODY calls the guard directly, or delegates to
+# bin/heimdall-autocommit, which now runs the guard itself before any staging or
+# commit (the scoped-staging refactor, commit 386966f, centralized staging+guard+
+# commit there instead of inlining `git add -A && git commit` per hook). A literal
+# grep on BODY alone went stale the moment that delegation landed even though the
+# guard still fires every time — proven by the behavioural sections below, which
+# execute the real body and watch a stale lock get cleared. This resolves the one
+# hop of indirection the naive grep couldn't see.
+routes_to_guard() {
+  local body="$1"
+  printf '%s\n' "$body" | grep -q 'heimdall-git-guard' && return 0
+  printf '%s\n' "$body" | grep -q 'heimdall-autocommit' \
+    && grep -q 'heimdall-git-guard' "$ROOT/bin/heimdall-autocommit" 2>/dev/null
+}
+
 # mkrepo — a throwaway git repo with 6 tracked files, all dirty (so the autocommit
 # hook's `count >= 5` threshold is met). Echoes the repo path.
 mkrepo() {
@@ -90,19 +105,19 @@ HOOK_STDIN='{"tool_name":"Write","tool_input":{"file_path":"f1","content":"b"},"
 # 1. ROUTING — the guard is referenced from every hmd-driven git-write path.
 #    A built-and-unreachable tool is the exact defect this file exists to stop.
 # ══════════════════════════════════════════════════════════════════════════════
-if post_autocommit_body | grep -q 'heimdall-git-guard'; then
+if routes_to_guard "$(post_autocommit_body)"; then
   ok "PostToolUse auto-checkpoint hook references heimdall-git-guard"
 else
   bad "PostToolUse auto-checkpoint hook does NOT reference heimdall-git-guard"
 fi
 
-if session_end_body | grep -q 'heimdall-git-guard'; then
+if routes_to_guard "$(session_end_body)"; then
   ok "SessionEnd checkpoint hook references heimdall-git-guard"
 else
   bad "SessionEnd checkpoint hook does NOT reference heimdall-git-guard"
 fi
 
-if pre_bash_body | grep -q 'heimdall-git-guard'; then
+if routes_to_guard "$(pre_bash_body)"; then
   ok "PreToolUse Bash hook references heimdall-git-guard (agent-issued git writes)"
 else
   bad "PreToolUse Bash hook does NOT reference heimdall-git-guard"
