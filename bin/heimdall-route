@@ -121,6 +121,14 @@ if route_now && [ -n "${HMD_HEADROOM_BASE_URL:-}" ]; then
   export ANTHROPIC_BASE_URL="$HMD_HEADROOM_BASE_URL"
 else
   printf "  ${D}· headroom: not routing — %s${R}\n" "${HMD_HEADROOM_WHY:-no reason reported}" >&2
+  # FAIL-OPEN means "launch anyway", never "launch anyway, still routed". Without this,
+  # a value the child would otherwise inherit ambiently (a previous manual export, an
+  # outer shell already routed by its own `hmd route` invocation, a stale session) rides
+  # along even though this exact launch was just disclosed as unrouted — the "not
+  # routing" line above would be false for that child. This script owns ANTHROPIC_BASE_URL
+  # on the child in BOTH directions: sets it when routed, clears it when not. Caught by
+  # test/heimdall-route.test.sh guarantee 5 running under this repo's own routed shell.
+  unset ANTHROPIC_BASE_URL
 fi
 
 exec "$REAL" "$@"
