@@ -2410,6 +2410,39 @@ case "${1:-}" in
     fi
     exec "$DESIGNMATCH_BIN" "$@"
     ;;
+  check)
+    # Pass-through to bin/heimdall-check (F2 Checker — duplicate-shape checker,
+    # commit-time; see that bin's own --help for --repo/--base/--tier/--attest/
+    # --block). README's "Redum / conformance checker" row names this exact
+    # command; before this arm existed, `hmd check` fell through to the
+    # goal-driven task prompt below instead of dispatching — the same gap
+    # `report)`/`designmatch)` above exist to close. All args forward verbatim,
+    # so a routed run and a direct bin run are byte-identical.
+    shift
+    CHECK_BIN="$PLUGIN_DIR/bin/heimdall-check"
+    if [ ! -x "$CHECK_BIN" ]; then
+      echo "  Error: heimdall-check not found at $CHECK_BIN" >&2
+      echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+      exit 1
+    fi
+    exec "$CHECK_BIN" "$@"
+    ;;
+  redum)
+    # Pass-through to bin/heimdall-redum (F3 Redum — the redundancy solver;
+    # see that bin's own --help for the `factor`/`gate` subcommands). README's
+    # "Redum / conformance checker" row names this exact command; before this
+    # arm existed, `hmd redum` fell through to the goal-driven task prompt
+    # below instead of dispatching. All args forward verbatim, so a routed run
+    # and a direct bin run are byte-identical.
+    shift
+    REDUM_BIN="$PLUGIN_DIR/bin/heimdall-redum"
+    if [ ! -x "$REDUM_BIN" ]; then
+      echo "  Error: heimdall-redum not found at $REDUM_BIN" >&2
+      echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+      exit 1
+    fi
+    exec "$REDUM_BIN" "$@"
+    ;;
   wrap|unwrap)
     # §7 Pass-through to heimdall-wrap: ONE command that installs the Layer-0 git
     # hooks, writes the AGENTS.md fenced block, starts presence and launches the

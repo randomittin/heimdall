@@ -56,7 +56,6 @@ heimdall-registry-hygiene	2026-11-08	KNOWN GAP — self-described MONTHLY job wi
 # one. In every case the only mouths naming them are themselves unreachable: their own
 # implementation library, a sibling that is equally dead, or each other.
 heimdall-branch-context	2026-09-07	DEAD — named only by its own bin/lib/branch_context.py and by bin/heimdall-collision, which is itself dead. No live entry point reaches it.
-heimdall-check	2026-09-07	DEAD — the conformance checker over bin/lib/checker.py, named only by that library. README.md lists it as Shipped, which documents it without invoking it.
 heimdall-collision	2026-09-07	DEAD — named only by bin/heimdall-land and its own bin/lib/collision.py, both unreachable.
 heimdall-cost-model-refresh	2026-09-07	DEAD — named only by its own bin/lib/cp_cost_model.py. No scheduler, hook or dispatcher arm refreshes the cost model.
 heimdall-cost-report	2026-09-07	DEAD — named only by bin/lib/cp_cost_model.py and bin/heimdall-cost-model-refresh, both unreachable.

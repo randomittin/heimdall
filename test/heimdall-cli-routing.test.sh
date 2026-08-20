@@ -100,6 +100,8 @@ make_stub heimdall-presence
 make_stub heimdall-connect
 make_stub heimdall-report
 make_stub designmatch
+make_stub heimdall-check
+make_stub heimdall-redum
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 1. `hmd team new --force` → execs heimdall-team, args forwarded, no fall-through
@@ -373,6 +375,64 @@ if ! claude_reached; then
   ok "designmatch does NOT fall through to Claude"
 else
   bad "designmatch MUST NOT reach the Claude fall-through"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 7i. `hmd check --tier basic` → execs heimdall-check, args forwarded, no
+#     fall-through. README's "Redum / conformance checker" row names
+#     `heimdall-check` Shipped, but bin/heimdall had no dispatch arm for it and
+#     install.sh never puts bare `heimdall-*` tool names on PATH (only `hmd`/
+#     `heimdall` are symlinked into BIN_DIR) — so the bare name README shows is
+#     unreachable either way; this arm makes `hmd check` the real, working route.
+# ══════════════════════════════════════════════════════════════════════════════
+reset
+run_hmd check --tier basic
+
+if stub_called "heimdall-check"; then
+  ok "check routes to heimdall-check"
+else
+  bad "check routes to heimdall-check"
+fi
+
+if args_contain "--tier basic"; then
+  ok "check forwards args verbatim (--tier basic)"
+else
+  bad "check forwards args verbatim (--tier basic)"
+  cat "$STUB_OUT" >&2
+fi
+
+if ! claude_reached; then
+  ok "check does NOT fall through to Claude"
+else
+  bad "check MUST NOT reach the Claude fall-through"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 7j. `hmd redum factor --task "add auth"` → execs heimdall-redum, args
+#     forwarded, no fall-through. Same README row as 7i names `heimdall-redum`
+#     Shipped; before this arm existed `hmd redum` fell through to the
+#     goal-driven task prompt instead of dispatching.
+# ══════════════════════════════════════════════════════════════════════════════
+reset
+run_hmd redum factor --task "add auth"
+
+if stub_called "heimdall-redum"; then
+  ok "redum routes to heimdall-redum"
+else
+  bad "redum routes to heimdall-redum"
+fi
+
+if args_contain "factor --task add auth"; then
+  ok "redum forwards args verbatim (factor --task add auth)"
+else
+  bad "redum forwards args verbatim (factor --task add auth)"
+  cat "$STUB_OUT" >&2
+fi
+
+if ! claude_reached; then
+  ok "redum does NOT fall through to Claude"
+else
+  bad "redum MUST NOT reach the Claude fall-through"
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
