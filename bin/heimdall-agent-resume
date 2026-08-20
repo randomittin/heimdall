@@ -1,0 +1,397 @@
+#!/usr/bin/env bash
+# heimdall-agent-resume — durable, per-agent RESUME REPORTING for subagents that
+# were interrupted mid-task (quota exhaustion being the measured, repeated
+# cause: "Agent terminated early due to an API error: You've hit your session
+# limit · resets ..." killed 5 agents at once on 2026-08-20; 4 of the 5 had zero
+# commits and lost all reasoning). Answers, in one command: WHICH subagents were
+# interrupted, WHAT they were doing, WHERE their worktree is, WHAT is already
+# safely committed there (so it is never redone), and WHAT is still uncommitted
+# (at risk). Assembles a resume payload ready to hand to SendMessage verbatim.
+#
+# THE HONEST BOUNDARY (read this before assuming more than it delivers) — the
+# same boundary bin/heimdall-quota-resume documents, and it does not move here
+# either: heimdall runs INSIDE a Claude Code session. A subagent that was
+# killed cannot restart itself, and NOTHING running inside this tool can
+# restart it either — resumption happens only when a LIVE orchestrator calls
+# SendMessage to that agent's id, which only a live session can do. What this
+# tool actually delivers: the durable per-agent record ALREADY WRITTEN by the
+# harness at spawn time (every subagent gets a `<transcript>.meta.json`
+# sidecar carrying agentType/worktreePath/worktreeBranch/description — see
+# bin/heimdall-agents' header for the measured shapes) aggregated with
+# git-plumbing facts about its worktree (via bin/heimdall-resume-brief, reused
+# not reimplemented) into one report — so the NEXT orchestrator needs zero
+# reconstruction, not zero action. It still has to read the report and issue
+# the SendMessage calls itself.
+#
+# EXTENDS, DOES NOT COMPETE WITH:
+#   bin/heimdall-agents        owns subagent discovery + state classification.
+#                              `list`/`orphans --json` now ALSO carry
+#                              agent_type/description/worktree_path/
+#                              worktree_branch (see its _meta_extra/
+#                              _rows_to_json). This tool adds a SEMANTIC filter
+#                              ("genuinely interrupted, mid-task") on top and
+#                              never re-derives the id -> transcript ->
+#                              meta.json resolution heimdall-agents owns.
+#   bin/heimdall-resume-brief  owns ahead/behind/dirty/touched-files for ONE
+#                              worktree. Called per interrupted agent that has
+#                              one; never reimplemented here.
+#   bin/heimdall-quota-resume  owns the ORCHESTRATOR's own quota-stop record
+#                              (QUOTA-STOP.json) and the classifier
+#                              (bin/lib/quota_stop.py). Its resume-hint
+#                              SessionStart hook calls THIS tool's
+#                              `resume-hint` as a best-effort, independent
+#                              second signal — see its cmd_resume_hint.
+#
+# WHICH STATES COUNT AS "INTERRUPTED" (default: failed,killed,orphaned,hung) ──
+#   failed/killed — the harness DID enqueue a <task-notification> before the
+#                   agent died. Its <summary> text is the best evidence of
+#                   WHY, and is fed through bin/lib/quota_stop.py (the SAME
+#                   detect() bin/heimdall-quota-resume's own `record` calls)
+#                   to mechanically flag whether this specific interruption
+#                   looks like a quota stop.
+#   orphaned      — NO notification ever arrived AND the owning session is
+#                   gone: provably dead with nothing returned. The clearest
+#                   "this needs a look" signal heimdall-agents has.
+#   hung          — awaiting one tool result for >= HMD_AGENT_HUNG_SECS. This
+#                   is plausibly a common quota-kill shape too: a subagent
+#                   mid-tool-call when the session dies leaves a transcript
+#                   whose last event is a tool_use, which heimdall-agents
+#                   classifies `working`/`hung` — NEVER `orphaned` — regardless
+#                   of whether the owning session is still alive (see its
+#                   _awaiting_tool_result guard, checked BEFORE any liveness
+#                   probe).
+#   (mailbox/stale are heimdall-agents' own hygiene concern — a parked
+#   teammate or an idle-but-alive agent is a DIFFERENT problem, not "was doing
+#   real interruptible task work"; excluded from the default filter, override
+#   with --states to include them.)
+#
+# QUOTA CLASSIFICATION HONESTY — read before trusting `quota.suspected`:
+#   true  — a real anchor+reset-clause match was found in the harness's own
+#           <task-notification><summary> text for this agent (failed/killed
+#           only — that is the ONLY place this tool has CONFIRMED the raw
+#           termination text is recoverable from disk; see the notif index in
+#           bin/heimdall-agents' header for the measured shape).
+#   false — a notification summary WAS found, and the classifier confidently
+#           said it does not match the quota-stop pattern (a genuine failure,
+#           not a retryable window — needs a human, not just a resume).
+#   null  — NO signal available to judge from at all (this is the case for
+#           EVERY orphaned/hung agent by definition — no notification was ever
+#           enqueued for them — and for any failed/killed agent whose
+#           notification could not be located). Reported as "unknown", never
+#           guessed from state alone.
+#
+# USAGE
+#   heimdall-agent-resume list   [--json] [--repo DIR] [--states s1,s2,...]
+#   heimdall-agent-resume report [--json] [--repo DIR] [--states ...]
+#                                [--base REF] [--id ID] [--run-tests]
+#   heimdall-agent-resume resume-hint [--repo DIR]
+#   heimdall-agent-resume help
+#
+# EXIT: 0 always for list/report/resume-hint (fail-closed, degraded, never
+#       crashes — mirrors bin/heimdall-agents); 2 only on a real usage error.
+#
+# ENV (tests only; production leaves these unset)
+#   All bin/heimdall-agents HMD_AGENT_* seams pass straight through unchanged —
+#   this tool never re-implements discovery, it shells out to heimdall-agents.
+#   HMD_AGENT_PROJECTS_DIR        same override, also used here directly to
+#                                 locate parent-session transcripts for
+#                                 <task-notification> summaries.
+#   HEIMDALL_QUOTA_NOW_EPOCH,
+#   HEIMDALL_QUOTA_SKEW_SECONDS   same seams bin/heimdall-quota-resume uses,
+#                                 reused verbatim for the detect() calls here.
+#   HMD_AGENT_RESUME_AGENTS_BIN   override path to heimdall-agents (tests)
+#   HMD_AGENT_RESUME_BRIEF_BIN    override path to heimdall-resume-brief (tests)
+set -uo pipefail
+
+_AR_SELF="$0"
+command -v readlink >/dev/null 2>&1 && \
+  _AR_SELF="$(readlink -f "$0" 2>/dev/null || readlink "$0" 2>/dev/null || echo "$0")"
+AR_BIN_DIR="$(cd "$(dirname "$_AR_SELF")" 2>/dev/null && pwd)"
+AR_LIB_DIR="$AR_BIN_DIR/lib"
+AGENTS_BIN="${HMD_AGENT_RESUME_AGENTS_BIN:-$AR_BIN_DIR/heimdall-agents}"
+BRIEF_BIN="${HMD_AGENT_RESUME_BRIEF_BIN:-$AR_BIN_DIR/heimdall-resume-brief}"
+AR_PY="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)"
+
+command -v jq >/dev/null 2>&1 || { echo "error: jq is required" >&2; exit 2; }
+
+DEFAULT_STATES="failed,killed,orphaned,hung"
+
+# Print the comment header, stopping at the first non-comment line — mirrors
+# bin/heimdall-agents' usage() so the help text cannot drift out of sync with
+# the file when the header changes length.
+usage() { sed -n '2,${/^[^#]/q;p;}' "$0" | sed 's/^# \{0,1\}//'; }
+
+# ── quota classification (reuses bin/lib/quota_stop.py — the SAME classifier
+#    bin/heimdall-quota-resume's own `record` calls; never re-implemented) ────
+_qar_now_epoch() { printf '%s' "${HEIMDALL_QUOTA_NOW_EPOCH:-$(date +%s 2>/dev/null || echo 0)}"; }
+_qar_skew()      { printf '%s' "${HEIMDALL_QUOTA_SKEW_SECONDS:-120}"; }
+
+# classify_text <text> -> JSON {suspected, reset_local, reset_tz, resolved,
+# reset_epoch} on stdout. Never fails the caller: absent python3, absent text,
+# or a non-match all degrade to a well-formed JSON object, never a crash.
+_classify_text() {
+  local text="$1"
+  if [ -z "$AR_PY" ] || [ -z "$text" ] || [ ! -r "$AR_LIB_DIR/quota_stop.py" ]; then
+    printf '%s' '{"suspected":null,"reset_local":null,"reset_tz":null,"resolved":null,"reset_epoch":null}'
+    return 0
+  fi
+  local out cls
+  out="$(printf '%s' "$text" | "$AR_PY" "$AR_LIB_DIR/quota_stop.py" detect \
+          --now "$(_qar_now_epoch)" --skew "$(_qar_skew)" 2>/dev/null)"
+  if [ -z "$out" ]; then
+    printf '%s' '{"suspected":null,"reset_local":null,"reset_tz":null,"resolved":null,"reset_epoch":null}'
+    return 0
+  fi
+  cls="$(printf '%s' "$out" | jq -r '.class' 2>/dev/null)"
+  if [ "$cls" = "quota" ]; then
+    printf '%s' "$out" | jq -c '{
+      suspected: true,
+      reset_local: (.reset_local // null),
+      reset_tz: (.reset_tz // null),
+      resolved: (.resolved // null),
+      reset_epoch: (if (.reset_epoch // null) == null then null else (.reset_epoch|tonumber) end)
+    }' 2>/dev/null && return 0
+  fi
+  printf '%s' '{"suspected":false,"reset_local":null,"reset_tz":null,"resolved":null,"reset_epoch":null}'
+}
+
+# Pull the LAST <summary>…</summary> for a specific task-id out of a set of
+# parent-session transcript files. Mirrors bin/heimdall-agents'
+# build_notif_index grep+perl idiom exactly (same tool, same no-/s rationale:
+# JSONL escapes real newlines, so a whole notification block is one physical
+# line — see that file's header for the measured evidence).
+_notif_summary_for() {
+  local id="$1" files="$2"
+  [ -n "$files" ] || return 0
+  # shellcheck disable=SC2086
+  grep -hF '<task-notification>' $files 2>/dev/null \
+    | AR_ID="$id" perl -ne 'while(m{<task-id>([^<]+)</task-id>.*?<summary>(.*?)</summary>}g){ print "$2\n" if $1 eq $ENV{AR_ID}; }' 2>/dev/null \
+    | tail -1
+}
+
+# ── worktree-path resolution safety (bin/lib/real-home.sh's own caution: a
+#    recorded worktreePath may have been reaped since spawn) ─────────────────
+_worktree_exists() {
+  local p="$1"
+  [ -n "$p" ] && [ -d "$p" ] && git -C "$p" rev-parse --git-dir >/dev/null 2>&1
+}
+
+# ── the interrupted-agent inventory: heimdall-agents list --json, filtered ───
+_interrupted_json() {
+  local repo="$1" states="$2" all
+  all="$(HMD_AGENT_CWD="$repo" "$AGENTS_BIN" list --json 2>/dev/null)"
+  [ -n "$all" ] || { echo '[]'; return 0; }
+  # NOTE the `("," + .state + ",") as $needle |` binding: `.state` MUST be read
+  # while `.` is still the per-row object. Writing the naive
+  # `$states | contains("," + .state + ",")` instead pipes $states into
+  # contains() FIRST, which rebinds `.` to $states (a string) for the
+  # argument expression too -- so `.state` is then evaluated against that
+  # string and jq raises "Cannot index string with string state" on every
+  # single row, unconditionally. Bind the needle from the row's `.` BEFORE
+  # switching context to $states.
+  printf '%s' "$all" | jq -c --arg states ",$states," \
+    '[ .[] | select(("," + .state + ",") as $needle | $states | contains($needle)) ]'
+}
+
+cmd_list() {
+  local as_json="" repo="$PWD" states="$DEFAULT_STATES"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) as_json=1; shift ;;
+      --repo) repo="$2"; shift 2 ;;
+      --states) states="$2"; shift 2 ;;
+      *) echo "heimdall-agent-resume: unknown arg: $1" >&2; return 2 ;;
+    esac
+  done
+  repo="$(cd "$repo" 2>/dev/null && pwd)" || repo="$PWD"
+
+  local rows n
+  rows="$(_interrupted_json "$repo" "$states")"
+  if [ -n "$as_json" ]; then
+    printf '%s\n' "$rows"
+    return 0
+  fi
+  n="$(printf '%s' "$rows" | jq 'length' 2>/dev/null)"
+  [ -n "$n" ] || n=0
+  if [ "$n" -eq 0 ]; then
+    echo "no interrupted subagents (states checked: $states)"
+    return 0
+  fi
+  printf '%-30s %-9s %8s  %s\n' "SUBAGENT" "STATE" "AGE(s)" "DESCRIPTION"
+  printf '%s\n' "$rows" | jq -r '.[] | [.id, .state, (.age_secs|tostring), (.description // "-")] | @tsv' \
+    | while IFS=$'\t' read -r id state age desc; do
+        printf '%-30s %-9s %8s  %s\n' "$id" "$state" "$age" "$desc"
+      done
+}
+
+# Build ONE resume-brief JSON (or a well-formed "unavailable" shape) for a
+# worktree path. Guarded internally as well as at the call site so this stays
+# correct if ever called on its own.
+_brief_json() {
+  local wt="$1" base="$2" run_tests="$3"
+  if ! _worktree_exists "$wt"; then
+    jq -n '{available:false, reason:"worktree path missing or not a git repo (may have been reaped)"}'
+    return 0
+  fi
+  if [ ! -x "$BRIEF_BIN" ]; then
+    jq -n '{available:false, reason:"bin/heimdall-resume-brief not found or not executable"}'
+    return 0
+  fi
+  local args out rc
+  args=("$wt" --base "$base" --json)
+  [ "$run_tests" = "1" ] && args+=(--run-tests)
+  out="$("$BRIEF_BIN" "${args[@]}" 2>&1)"; rc=$?
+  if [ "$rc" -ne 0 ] || ! printf '%s' "$out" | jq -e . >/dev/null 2>&1; then
+    jq -n --arg err "$out" '{available:false, reason:("heimdall-resume-brief failed: " + $err)}'
+    return 0
+  fi
+  printf '%s' "$out" | jq -c '{available:true} + .'
+}
+
+# Human-readable, SendMessage-ready payload for one enriched agent JSON object
+# (id/state/description/agent_type/worktree_path/worktree_branch + quota +
+# resume_brief, as assembled by cmd_report). Reads the object on stdin.
+_payload_for() {
+  jq -r '
+    def yn(x): if x == null then "unknown" elif x then "yes" else "no" end;
+    ("Agent " + .id + " (" + (.agent_type // "unknown type") + ") — interrupted, last known state: " + .state) as $hdr |
+    ("Task: " + (.description // "no description recorded")) as $task |
+    ("Quota exhaustion suspected: " + yn(.quota.suspected) +
+      (if .quota.suspected == true and .quota.reset_local != null
+       then " (resets " + .quota.reset_local + " " + (.quota.reset_tz // "") + ")"
+       else "" end)) as $quota |
+    (if .worktree_path == null then
+       "No isolated worktree recorded for this agent (not spawned with worktree isolation)."
+     elif (.resume_brief == null) then
+       "Worktree: " + .worktree_path + " (no resume-brief available)"
+     elif (.resume_brief.available == false) then
+       "Worktree: " + .worktree_path + " — " + .resume_brief.reason
+     else
+       "Worktree: " + .worktree_path + " (branch " + (.worktree_branch // "?") + ")\n" +
+       (.resume_brief.ahead_of_base|tostring) + " commit(s) already committed ahead of " +
+         (.resume_brief.base // "base") + " — DO NOT REDO these.\n" +
+       (.resume_brief.dirty|tostring) + " uncommitted file(s)" +
+       (if .resume_brief.dirty > 0
+        then " — AT RISK if this worktree is discarded: " + (.resume_brief.dirty_files | join(", "))
+        else " (clean)" end)
+     end) as $wt |
+    $hdr + "\n" + $task + "\n" + $quota + "\n" + $wt + "\n" +
+    "Resume from this state — do not restart from scratch."
+  '
+}
+
+cmd_report() {
+  local as_json="" repo="$PWD" states="$DEFAULT_STATES" base="main" only_id="" run_tests="0"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) as_json=1; shift ;;
+      --repo) repo="$2"; shift 2 ;;
+      --states) states="$2"; shift 2 ;;
+      --base) base="$2"; shift 2 ;;
+      --id) only_id="$2"; shift 2 ;;
+      --run-tests) run_tests="1"; shift ;;
+      *) echo "heimdall-agent-resume: unknown arg: $1" >&2; return 2 ;;
+    esac
+  done
+  repo="$(cd "$repo" 2>/dev/null && pwd)" || repo="$PWD"
+
+  local rows n
+  rows="$(_interrupted_json "$repo" "$states")"
+  if [ -n "$only_id" ]; then
+    rows="$(printf '%s' "$rows" | jq -c --arg id "$only_id" '[ .[] | select(.id == $id) ]')"
+  fi
+  n="$(printf '%s' "$rows" | jq 'length' 2>/dev/null)"; [ -n "$n" ] || n=0
+
+  if [ "$n" -eq 0 ]; then
+    if [ -n "$as_json" ]; then echo '[]'; else echo "no interrupted subagents (states checked: $states)"; fi
+    return 0
+  fi
+
+  # Every parent-session transcript under this repo's Claude-projects slug —
+  # where a <task-notification><summary> for a failed/killed agent would live.
+  # Mirrors bin/heimdall-agents' own _slug_for_cwd exactly (same substitution).
+  local proj_dir slug_now parents="" f
+  proj_dir="${HMD_AGENT_PROJECTS_DIR:-${HOME:-}/.claude/projects}"
+  slug_now="${repo//[^A-Za-z0-9]/-}"
+  if [ -d "$proj_dir/$slug_now" ]; then
+    for f in "$proj_dir/$slug_now"/*.jsonl; do
+      [ -f "$f" ] && parents="$parents $f"
+    done
+  fi
+
+  local combined_all="" obj id wt qtext qjson brief combined payload
+  while IFS= read -r obj; do
+    [ -n "$obj" ] || continue
+    id="$(printf '%s' "$obj" | jq -r '.id')"
+    wt="$(printf '%s' "$obj" | jq -r '.worktree_path // ""')"
+
+    qtext="$(_notif_summary_for "$id" "$parents")"
+    qjson="$(_classify_text "$qtext")"
+
+    if [ -n "$wt" ] && _worktree_exists "$wt"; then
+      brief="$(_brief_json "$wt" "$base" "$run_tests")"
+    elif [ -n "$wt" ]; then
+      brief='{"available":false,"reason":"worktree path recorded but no longer exists on disk (likely reaped)"}'
+    else
+      brief='null'
+    fi
+
+    combined="$(jq -n --argjson base "$obj" --argjson quota "$qjson" --argjson brief "$brief" \
+      '$base + {quota: $quota, resume_brief: $brief}')"
+    payload="$(printf '%s' "$combined" | _payload_for)"
+    combined="$(printf '%s' "$combined" | jq -c --arg payload "$payload" '. + {payload: $payload}')"
+    combined_all="$combined_all$combined"$'\n'
+  done < <(printf '%s' "$rows" | jq -c '.[]')
+
+  local out
+  out="$(printf '%s' "$combined_all" | jq -s '.')"
+
+  if [ -n "$as_json" ]; then
+    printf '%s\n' "$out"
+    return 0
+  fi
+
+  echo "=== $n interrupted subagent(s) — resume payload(s) below, ready for SendMessage ==="
+  echo
+  printf '%s' "$out" | jq -r '[.[].payload] | join("\n\n----------------------------------------\n\n")'
+}
+
+# resume-hint — mirrors bin/heimdall-quota-resume's own contract (and, before
+# it, bin/heimdall-maintain-loop's): print NOTHING unless there is something
+# genuinely actionable. Cheap when clean (one heimdall-agents list --json call
+# + a length check) — this is the SessionStart hot path.
+cmd_resume_hint() {
+  local repo="$PWD"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repo) repo="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  repo="$(cd "$repo" 2>/dev/null && pwd)" || return 0
+
+  local rows n
+  rows="$(_interrupted_json "$repo" "$DEFAULT_STATES")"
+  n="$(printf '%s' "$rows" | jq 'length' 2>/dev/null)"; [ -n "$n" ] || n=0
+  [ "$n" -gt 0 ] || return 0
+
+  echo "[heimdall] $n INTERRUPTED SUBAGENT(S) found from a prior session on this repo:"
+  printf '%s' "$rows" | jq -r '.[] | "  • " + .id + "  [" + .state + "]  " + (.description // "no description")' 2>/dev/null
+  echo "  Full resume payload (git state, safe-to-skip commits, dirty files):"
+  echo "    heimdall-agent-resume report --repo \"$repo\""
+  echo "  Once handled, silence an entry: heimdall-agents reap"
+  return 0
+}
+
+main() {
+  local sub="${1:-}"
+  case "$sub" in
+    list)        shift; cmd_list "$@" ;;
+    report)      shift; cmd_report "$@" ;;
+    resume-hint) shift; cmd_resume_hint "$@" ;;
+    -h|--help|help|'') usage ;;
+    *) echo "error: unknown subcommand: $sub" >&2; usage >&2; exit 2 ;;
+  esac
+}
+
+main "$@"

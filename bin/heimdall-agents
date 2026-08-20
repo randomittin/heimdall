@@ -93,7 +93,11 @@
 # teammates had one, which is precisely why they leak.
 #
 # SUBCOMMANDS ─────────────────────────────────────────────────────────────────
-#   list [--json]    enumerate subagents: id, age(s), state, name
+#   list [--json]    enumerate subagents: id, age(s), state, name (--json ALSO
+#                    carries agent_type/description/worktree_path/
+#                    worktree_branch straight from the harness's own spawn-time
+#                    .meta.json, null when absent — see bin/heimdall-agent-resume,
+#                    which composes on top of this rather than re-deriving it)
 #   count            print the number of LIVE subagents (statusline consumes this)
 #   orphans [--json] OPERATOR VIEW: only the agents that need attention —
 #                    parked mailbox teammates, provably-dead orphans, wedged and
@@ -552,20 +556,54 @@ enumerate() {
         state="live"
       fi
     fi
-    printf '%s\t%s\t%s\t%s\n' "$id" "$age" "$state" "$name"
+    printf '%s\t%s\t%s\t%s\t%s\n' "$id" "$age" "$state" "$name" "$meta"
   done <<< "$cands" | sort
 }
 
 # ── subcommands ───────────────────────────────────────────────────────────────
+# Additive spawn-time fields read straight from the harness's own .meta.json
+# sidecar (see header: "regular meta.json" / "teammate meta.json" shapes).
+# Absent for a non-worktree-isolated spawn (e.g. a read-only reviewer) — that
+# is a normal, expected shape, not an error, so every key defaults to null
+# rather than the row being dropped or the tool erroring. Consumed by
+# bin/heimdall-agent-resume so THAT tool never has to re-derive the
+# id -> transcript -> meta.json resolution this file already owns.
+_meta_extra() {
+  local m="$1"
+  if [ -n "$m" ] && [ -f "$m" ]; then
+    jq -c '{
+      agent_type:      (.agentType // null),
+      description:     (.description // null),
+      worktree_path:   (.worktreePath // null),
+      worktree_branch: (.worktreeBranch // null)
+    }' "$m" 2>/dev/null && return 0
+  fi
+  printf '%s' '{"agent_type":null,"description":null,"worktree_path":null,"worktree_branch":null}'
+}
+
+# Enrich TAB rows (id/age/state/name/meta) into the public JSON contract. `meta`
+# (5th field) is a FILE PATH, never free text, so it is safe to carry through a
+# TAB-delimited row; the free-text fields (description, etc.) are read straight
+# out of the JSON file by jq below, never round-tripped through a shell field
+# separator that an embedded tab/newline in a description could corrupt.
+_rows_to_json() {
+  local rows="$1"
+  [ -n "$rows" ] || { echo '[]'; return 0; }
+  {
+    printf '%s\n' "$rows" | while IFS=$'\t' read -r id age state name meta; do
+      jq -n --arg id "$id" --argjson age "${age:-0}" --arg state "$state" \
+            --arg name "$name" --argjson extra "$(_meta_extra "$meta")" \
+        '{id:$id, age_secs:$age, state:$state, name:$name} + $extra'
+    done
+  } | jq -s '.'
+}
+
 cmd_list() {
   local as_json="" rows
   [ "${1:-}" = "--json" ] && as_json=1
   rows="$(enumerate)"
   if [ -n "$as_json" ]; then
-    if [ -z "$rows" ]; then echo '[]'; return 0; fi
-    printf '%s\n' "$rows" | jq -R -s '
-      split("\n") | map(select(length>0) | split("\t"))
-      | map({id: .[0], age_secs: (.[1]|tonumber), state: .[2], name: .[3]})'
+    _rows_to_json "$rows"
     return 0
   fi
   if [ -z "$rows" ]; then
@@ -575,7 +613,8 @@ cmd_list() {
   # Width 42: named teammates carry their name in the id (atermprobe-<16 hex>),
   # so a 22-column field ragged-wrapped every agent this tool most needs to show.
   printf '%-42s %8s  %-9s %s\n' "SUBAGENT" "AGE(s)" "STATE" "NAME"
-  printf '%s\n' "$rows" | while IFS=$'\t' read -r id age state name; do
+  # shellcheck disable=SC2034  # meta (5th field) feeds only the --json path above
+  printf '%s\n' "$rows" | while IFS=$'\t' read -r id age state name meta; do
     printf '%-42s %8s  %-9s %s\n' "$id" "$age" "$state" "$name"
   done
 }
@@ -602,10 +641,7 @@ cmd_orphans() {
   [ "${1:-}" = "--json" ] && as_json=1
   rows="$(_orphan_rows)"
   if [ -n "$as_json" ]; then
-    if [ -z "$rows" ]; then echo '[]'; return 0; fi
-    printf '%s\n' "$rows" | jq -R -s '
-      split("\n") | map(select(length>0) | split("\t"))
-      | map({id: .[0], age_secs: (.[1]|tonumber), state: .[2], name: .[3]})'
+    _rows_to_json "$rows"
     return 0
   fi
   if [ -z "$rows" ]; then
@@ -613,7 +649,8 @@ cmd_orphans() {
     return 0
   fi
   printf '%-42s %8s  %-9s %s\n' "SUBAGENT" "AGE(s)" "STATE" "NAME"
-  printf '%s\n' "$rows" | while IFS=$'\t' read -r id age state name; do
+  # shellcheck disable=SC2034  # meta (5th field) feeds only the --json path above
+  printf '%s\n' "$rows" | while IFS=$'\t' read -r id age state name meta; do
     printf '%-42s %8s  %-9s %s\n' "$id" "$age" "$state" "$name"
   done
   if printf '%s\n' "$rows" | awk -F'\t' '$3=="mailbox"{f=1} END{exit !f}'; then
@@ -640,13 +677,14 @@ _record_reap() {
 
 # Shared by reap + sweep. Echoes "id<TAB>reason<TAB>name" for each NEW record.
 _do_reap() {
-  local rows id age state name reason now added=""
+  local rows id age state name meta reason now added=""
   rows="$(enumerate)"
   mkdir -p "$(dirname "$REAPED_FILE")" 2>/dev/null || true
   [ -f "$REAPED_FILE" ] || printf '{}\n' > "$REAPED_FILE" 2>/dev/null || true
   now="$(now_iso)"
   [ -n "$rows" ] || return 0
-  while IFS=$'\t' read -r id age state name; do
+  # shellcheck disable=SC2034  # meta (5th field) is unused here, kept for arity
+  while IFS=$'\t' read -r id age state name meta; do
     case "$state" in
       stale)    reason="stale" ;;
       failed)   reason="failed" ;;
