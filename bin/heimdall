@@ -2373,6 +2373,76 @@ case "${1:-}" in
     fi
     exec "$WEEKLY_LOG_BIN" "$@"
     ;;
+  report)
+    # Pass-through to heimdall-report: the read-only telemetry AGGREGATE/DETAIL
+    # query surface (see that bin's own header for the `run <run_id>` / default
+    # `aggregate` subcommands and --json/--home flags). README's "Telemetry
+    # report" row names this exact command; before this arm existed, `hmd
+    # report` fell through to the goal-driven task prompt below instead of
+    # dispatching — the same gap `tier)`/`status)`/`cursor-statusline)` above
+    # exist to close. All args forward verbatim, so a routed run and a direct
+    # bin run are byte-identical.
+    shift
+    REPORT_BIN="$PLUGIN_DIR/bin/heimdall-report"
+    if [ ! -x "$REPORT_BIN" ]; then
+      echo "  Error: heimdall-report not found at $REPORT_BIN" >&2
+      echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+      exit 1
+    fi
+    exec "$REPORT_BIN" "$@"
+    ;;
+  designmatch)
+    # Pass-through to the sibling bin/designmatch CLI (init/wire/render/diff/
+    # iterate/action-types — see that script's own header). README's "Design
+    # match" row names this exact command; before this arm existed, `hmd
+    # designmatch` fell through to the goal-driven task prompt below instead of
+    # dispatching. DISTINCT from the `/hmd:designmatch` slash command
+    # (commands/designmatch.md), which auto-runs just the `init` bootstrap from
+    # inside a Claude session — this arm exposes the full CLI subcommand
+    # surface to a bare shell. All args forward verbatim, so a routed run and a
+    # direct bin run are byte-identical.
+    shift
+    DESIGNMATCH_BIN="$PLUGIN_DIR/bin/designmatch"
+    if [ ! -x "$DESIGNMATCH_BIN" ]; then
+      echo "  Error: designmatch not found at $DESIGNMATCH_BIN" >&2
+      echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+      exit 1
+    fi
+    exec "$DESIGNMATCH_BIN" "$@"
+    ;;
+  check)
+    # Pass-through to bin/heimdall-check (F2 Checker — duplicate-shape checker,
+    # commit-time; see that bin's own --help for --repo/--base/--tier/--attest/
+    # --block). README's "Redum / conformance checker" row names this exact
+    # command; before this arm existed, `hmd check` fell through to the
+    # goal-driven task prompt below instead of dispatching — the same gap
+    # `report)`/`designmatch)` above exist to close. All args forward verbatim,
+    # so a routed run and a direct bin run are byte-identical.
+    shift
+    CHECK_BIN="$PLUGIN_DIR/bin/heimdall-check"
+    if [ ! -x "$CHECK_BIN" ]; then
+      echo "  Error: heimdall-check not found at $CHECK_BIN" >&2
+      echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+      exit 1
+    fi
+    exec "$CHECK_BIN" "$@"
+    ;;
+  redum)
+    # Pass-through to bin/heimdall-redum (F3 Redum — the redundancy solver;
+    # see that bin's own --help for the `factor`/`gate` subcommands). README's
+    # "Redum / conformance checker" row names this exact command; before this
+    # arm existed, `hmd redum` fell through to the goal-driven task prompt
+    # below instead of dispatching. All args forward verbatim, so a routed run
+    # and a direct bin run are byte-identical.
+    shift
+    REDUM_BIN="$PLUGIN_DIR/bin/heimdall-redum"
+    if [ ! -x "$REDUM_BIN" ]; then
+      echo "  Error: heimdall-redum not found at $REDUM_BIN" >&2
+      echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+      exit 1
+    fi
+    exec "$REDUM_BIN" "$@"
+    ;;
   wrap|unwrap)
     # §7 Pass-through to heimdall-wrap: ONE command that installs the Layer-0 git
     # hooks, writes the AGENTS.md fenced block, starts presence and launches the

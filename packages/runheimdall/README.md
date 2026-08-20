@@ -194,12 +194,12 @@ Scaffolds a real full-stack task, builds it, ends with a summary card and a foll
 
 | Capability | Command | Status |
 |---|---|---|
-| Verification gates (secret-scan, bloat, falsify) | `/hmd:verify` in Claude · `bin/falsify` | Shipped |
+| Verification gates (secret-scan, falsify) | Automatic on commit/push (git hooks) · `bin/falsify <domain>` to run one directly | Shipped |
 | Demo task runner | `hmd demo` / `hmd demo --run` | Shipped |
 | Issue-resolution loop | `hmd` (auto-retries failures against corpus) | Shipped |
 | Telemetry report | `hmd report` | Shipped |
 | Design match (visual diff vs spec) | `hmd designmatch` | Shipped |
-| Redum / conformance checker | `heimdall-redum` · `heimdall-check` | Shipped |
+| Redum / conformance checker | `hmd redum` · `hmd check` | Shipped |
 | Reuse engine (cold-repo analysis) | `bin/lib/reuse_analyzer.py` | Shipped |
 | Debloat scanner | `heimdall-debloat --report-only` | Shipped |
 | Parallel workers | `hmd --team N "task"` (N tmux panes, independent — no shared state) | Shipped (no coordination layer) |
