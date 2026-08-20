@@ -1,0 +1,155 @@
+#!/usr/bin/env bash
+# heimdall-autocommit — shared mechanics for hmd's two AUTOMATIC checkpoint call
+# sites (hooks/hooks.json PostToolUse >=5-file gate, and SessionEnd dirty-tree
+# gate). Both used to inline `git add -A && git commit ... --no-verify` directly.
+# That had two confirmed defects, closed here:
+#
+#   B1 — `--no-verify` skips pre-commit, the ONLY place an unproven-merge
+#   receipt was ever written (bin/heimdall-init's generated hook, guarded by a
+#   DIFFERENT bypass, HMD_SKIP=1). An automatic, ungated commit landed with no
+#   receipt at all — "visible, never silent" was false for this bypass path.
+#   This script writes its own receipt to the same
+#   .heimdall/receipts/unproven.log ledger the HMD_SKIP path uses, tagged
+#   AUTOCOMMIT, so both bypass paths show up in one coherent log.
+#
+#   B2 — `git add -A` stages EVERYTHING dirty in the tree, not just what this
+#   session touched. Confirmed real-world consequence: commit d22dfc9 swept a
+#   file written by a different tool (the heimdall-ledger MCP server, which
+#   writes straight to disk — bypassing Claude's Edit/Write tools and therefore
+#   edit-tracker) into a checkpoint commit, alongside six path globs naming an
+#   unrelated private project, landing in a PUBLIC repo. This script stages
+#   only the intersection of (a) paths edit-tracker recorded as touched THIS
+#   session and (b) paths currently dirty per `git status --porcelain` — never
+#   `-A`. An empty intersection — including an absent or empty edit-tracker
+#   ledger — means NO commit. A missed checkpoint is an acceptable cost; a
+#   leaked file is not, so there is no fallback to `-A` under any circumstance.
+#
+# A third, smaller defect rides along: the old PostToolUse inline code counted
+# "(N files)" from `git diff --name-only` (tracked-only) BEFORE staging, so a
+# session that only added new (untracked) files under-counted — the exact
+# shape behind a real "heimdall: session-end checkpoint (0 files)" commit that
+# actually landed 21 insertions. This script counts strictly from
+# `git diff --cached --name-only`, after staging, before committing.
+#
+# Usage: heimdall-autocommit <phase-label>
+#   <phase-label> becomes both the commit subject's "heimdall: <phase> (N
+#   files)" and the receipt's phase field — e.g. "auto-checkpoint" or
+#   "session-end checkpoint". The two hooks.json call sites decide WHEN to
+#   invoke this (their own trigger thresholds are untouched); this script's
+#   only job is HOW to commit safely once invoked.
+#
+# Best-effort throughout, exits 0 always — a checkpoint tool must never be the
+# reason a task fails.
+set -uo pipefail
+
+PHASE="${1:-checkpoint}"
+SELF_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
+
+_no_autocommit() { # <dir>
+  [ -f "$1/.heimdall-no-autocommit" ] || [ -f "$1/.superx-no-autocommit" ]
+}
+
+# Resolve a path's DIRECTORY through any symlinks (`cd` + `pwd -P`, portable
+# back to bash 3.2 — no dependency on a `realpath(1)` binary that may not
+# exist) and re-append the leaf name. The leaf itself need not exist; only the
+# directory has to. Falls back to the input unresolved if the directory can't
+# be entered (e.g. already gone).
+_realpath_of() { # <path>
+  local p="$1" dir base resolved
+  case "$p" in
+    */*) dir="${p%/*}"; base="${p##*/}" ;;
+    *) dir="."; base="$p" ;;
+  esac
+  [ -n "$dir" ] || dir="/"
+  resolved="$(cd "$dir" 2>/dev/null && pwd -P)"
+  if [ -n "$resolved" ]; then
+    printf '%s/%s\n' "$resolved" "$base"
+  else
+    printf '%s\n' "$p"
+  fi
+}
+
+# Paths edit-tracker recorded as touched this session, normalized to be
+# repo-root-relative so they line up with `git status --porcelain` output.
+# edit-tracker stores whatever file_path Claude Code's tool_input carried —
+# normally absolute — used exactly as given (never re-resolved by
+# edit-tracker itself). `git rev-parse --show-toplevel` DOES resolve symlinks,
+# so on a scratch root where they diverge (macOS: /tmp -> /private/tmp) an
+# edit-tracker path would silently fail to prefix-match an already-resolved
+# $top. Each edited path is independently resolved here so both sides land in
+# the same canonical form before comparing — resolving the many possible
+# source spellings, rather than guessing variant spellings of $top.
+_edited_paths() { # <top>  (already resolved, from `git rev-parse --show-toplevel`)
+  local top="$1" tracker p resolved
+  tracker="$SELF_DIR/edit-tracker"
+  [ -x "$tracker" ] || return 0
+  "$tracker" paths 2>/dev/null | while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    case "$p" in
+      /*) resolved="$(_realpath_of "$p")" ;;
+      *) resolved="$p" ;; # already relative — pass through
+    esac
+    case "$resolved" in
+      "$top"/*) printf '%s\n' "${resolved#"$top"/}" ;;
+      /*) ;; # absolute, resolved, but outside this repo — cannot match
+      *) printf '%s\n' "$resolved" ;;
+    esac
+  done
+}
+
+# Currently-dirty repo-relative paths (tracked-modified AND untracked-new).
+# Porcelain v1 format is exactly 2 status chars + 1 space + path, so the path
+# starts at column 4 — shared with every other porcelain consumer in this repo
+# (e.g. bin/heimdall-wip-commit); renamed-file's "old -> new" shape is a known,
+# shared limitation, not handled specially.
+_dirty_paths() {
+  git status --porcelain 2>/dev/null | cut -c4-
+}
+
+main() {
+  local top guard tmp count staged_csv subj rc
+
+  top="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+  cd "$top" 2>/dev/null || exit 0
+
+  _no_autocommit "$top" && exit 0
+
+  guard="$SELF_DIR/heimdall-git-guard"
+  [ -x "$guard" ] && "$guard" >/dev/null 2>&1
+
+  tmp="$(mktemp 2>/dev/null)" || exit 0
+  trap 'rm -f "$tmp" "$tmp.edited" "$tmp.dirty"' EXIT
+
+  _edited_paths "$top" | sort -u > "$tmp.edited"
+  _dirty_paths | sort -u > "$tmp.dirty"
+  comm -12 "$tmp.edited" "$tmp.dirty" > "$tmp"
+
+  [ -s "$tmp" ] || exit 0
+
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    git add -- "$f" >/dev/null 2>&1
+  done < "$tmp"
+
+  count="$(git diff --cached --name-only 2>/dev/null | sed '/^$/d' | wc -l | tr -d ' ')"
+  case "$count" in ''|*[!0-9]*) count=0 ;; esac
+  [ "$count" -gt 0 ] || exit 0
+
+  staged_csv="$(git diff --cached --name-only 2>/dev/null | tr '\n' ',' | sed 's/,$//')"
+  subj="heimdall: ${PHASE} (${count} files)"
+
+  rc=0
+  git commit -m "$subj" -m "Co-Authored-By: runhmd <318965969+runhmd@users.noreply.github.com>" --no-verify >/dev/null 2>&1 || rc=$?
+
+  if [ "$rc" -eq 0 ]; then
+    mkdir -p "$top/.heimdall/receipts" 2>/dev/null || true
+    printf '%s\tAUTOCOMMIT\t%s\tstaged=%s\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)" "$PHASE" "$staged_csv" \
+      >> "$top/.heimdall/receipts/unproven.log" 2>/dev/null || true
+    printf '\033[33mheimdall auto-commit: gate bypassed (--no-verify); unproven-merge receipt logged -> %s\033[0m\n' \
+      "$top/.heimdall/receipts/unproven.log" >&2 2>/dev/null || true
+  fi
+  exit 0
+}
+
+main "$@"

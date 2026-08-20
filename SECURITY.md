@@ -203,6 +203,51 @@ trying to stop.
 result byte-identical rather than merely tidy. `uv tool uninstall headroom-ai`
 removes the tool itself.
 
+## Auto-commit — hmd can commit your working tree without being asked
+
+hmd's own checkpoint mechanism (`bin/heimdall-autocommit`, wired from two call
+sites in [`hooks/hooks.json`](hooks/hooks.json)) can create a git commit on your
+behalf, mid-session, with no prompt — on by default. Anyone auditing a tool that
+mutates repository history unattended should not have to find this by reading
+hook JSON, so it is documented here.
+
+### What it does
+
+- **Two triggers.** Once 5 or more tracked files are dirty (a PostToolUse check),
+  or at session end if anything is dirty at all (a SessionEnd check), hmd stages
+  and commits a checkpoint titled `heimdall: <phase> (N files)`.
+- **Scoped staging — never `git add -A`.** Only paths this session's own
+  Write/Edit tool calls touched (per `edit-tracker paths`) *and* are currently
+  dirty get staged: the intersection of the two, recomputed every time. A file
+  that is dirty for any other reason — a different tool, a manual edit, an
+  unrelated change already in progress — is left alone. An empty intersection,
+  including a missing or empty edit ledger, commits nothing; there is no
+  fallback to staging everything else in the tree.
+- **The commit bypasses your commit gate.** It runs `git commit --no-verify`, so
+  a local `pre-commit` hook (a secret scan, a lint check, anything `hmd init`
+  wired for you) does **not** run for this commit. That is a deliberate
+  trade-off — a checkpoint must never block on a slow or failing gate — but it
+  means an auto-commit is, by construction, exactly as unproven as one made with
+  `HMD_SKIP=1`.
+- **The bypass is logged, never silent.** Every auto-commit appends a line to
+  `.heimdall/receipts/unproven.log` — the same ledger `HMD_SKIP=1` writes to,
+  tagged `AUTOCOMMIT` instead of `HMD_SKIP` — and prints a one-line stderr
+  notice naming the receipt path. Grep that file to see how many of your
+  commits never saw your gate.
+
+### How to decline it
+
+| Signal | Effect |
+|---|---|
+| `heimdall --no-autocommit` | creates `.heimdall-no-autocommit` in the repo root and disables both triggers there |
+| `heimdall --autocommit` | removes it, re-enabling auto-commit |
+| `/hmd:autocommit` (Claude Code command) | reports current state with no args; pass `on`/`off` to set it explicitly from inside a session |
+| `.heimdall-no-autocommit` or `.superx-no-autocommit` (a file, dropped in the repo root by any means) | read directly by both the CLI and the hook — the marker, not the command, is the actual switch |
+
+Declining it does not disable edit *tracking* — `edit-tracker` keeps logging what
+you touch either way — it only stops hmd from committing on your behalf. You
+keep full manual control of when, and what, to commit.
+
 ## Secret hygiene
 
 Heimdall treats leaked credentials as a build defect, not an afterthought — and
