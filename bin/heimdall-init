@@ -331,9 +331,31 @@ EOF
 # by convention. This is the ONE client-side hook `git commit --no-verify` does NOT
 # skip — verified empirically: pre-commit and commit-msg ARE suppressed by
 # --no-verify, prepare-commit-msg still runs — which is exactly why the trailer
-# lives here and not in pre-commit/commit-msg. NOT a gate: append-only, never
-# blocks. Does not consult HMD_SKIP — that escape hatch exists for the
-# pre-commit/pre-push QUALITY gates, and an attribution trailer is not one.
+# lives here and not in pre-commit/commit-msg. NOT a gate: append (plus two
+# targeted removals, below), never blocks. Does not consult HMD_SKIP — that escape
+# hatch exists for the pre-commit/pre-push QUALITY gates, and an attribution
+# trailer is not one.
+#
+# ALSO STRIPS any Anthropic/model Co-Authored-By trailer (owner directive,
+# 2026-08-20 — reverses the earlier "keep the model trailer alongside" policy;
+# full reasoning in CLAUDE.md "Commit attribution"). Matched by email DOMAIN
+# (@anthropic.com), never by the model's display name — the harness writes a
+# human-readable model name into the trailer that changes every release ("Claude
+# Opus 5 (1M context)", "Claude Sonnet 5", …) but the address stays
+# noreply@anthropic.com regardless, so domain-matching never lags a new model
+# name and never risks catching a real human co-author.
+#
+# ALSO NORMALIZES the trailer's own address (owner directive, 2026-08-20): the
+# GitHub machine account `runhmd` now exists, so the trailer moved from
+# `hmd@runheimdall.dev` (never a GitHub-verified address on any account — see
+# CLAUDE.md "Commit attribution" — so it could only ever render as plain text)
+# to runhmd's GitHub-minted `<id>+<login>@users.noreply.github.com` form, which
+# GitHub always resolves to a linked, avatared co-author because GitHub itself
+# issued the address. Any OLD-form trailer already in a message is stripped and
+# replaced with the new one — never left stray, never left alongside it (step
+# 4b below) — matched by the exact old email, not by domain, since
+# @runheimdall.dev is also the human owner's own author/committer address and
+# must never be touched.
 write_prepare_commit_msg() {
   local out="$HOOKS_DIR/prepare-commit-msg"
   cat > "$out" <<EOF
@@ -343,7 +365,7 @@ write_prepare_commit_msg() {
 # for the full rationale (why this hook, why no HMD_SKIP, why fail-open).
 set -u
 MSG_FILE="\${1:-}"
-TRAILER='Co-Authored-By: hmd <hmd@runheimdall.dev>'
+TRAILER='Co-Authored-By: runhmd <318965969+runhmd@users.noreply.github.com>'
 
 # 1. CHAIN any pre-existing prepare-commit-msg — a repo that had its own STILL
 #    runs, first, and its failure still blocks (we never clobber a user's gate).
@@ -356,21 +378,68 @@ fi
 #    malformed or unwritable file must not lose the user's work.
 [ -n "\$MSG_FILE" ] && [ -f "\$MSG_FILE" ] && [ -r "\$MSG_FILE" ] && [ -w "\$MSG_FILE" ] || exit 0
 
-# 3. IDEMPOTENT — the trailer is already present anywhere in the message -> no-op.
+# 3. PROTECT THE EMPTY-MESSAGE ABORT PATH — checked FIRST, before either the
+#    strip or the add below ever inspect trailer content. A plain interactive
+#    \`git commit\` (no -m/-F/template configured) shows ONLY git's own "# Please
+#    enter a commit message..." comment block at this point — nothing the user
+#    typed exists yet, since this hook fires BEFORE the editor opens. Touching
+#    that message (adding OR stripping) would turn a message the user leaves
+#    blank (to abort) into a real commit. So: only act when the message already
+#    has at least one real (non-comment, non-blank) line — true for every
+#    -m/-F, merge, squash and amend message, i.e. every commit hmd's own agents
+#    make.
+grep -v '^#' "\$MSG_FILE" 2>/dev/null | grep -q '[^[:space:]]' || exit 0
+
+# 4. STRIP any Anthropic/model Co-Authored-By trailer (CLAUDE.md "Commit
+#    attribution" — hmd is the one constant co-author; the model underneath is
+#    not carried). Matched by EMAIL DOMAIN (@anthropic.com), never by display
+#    name: the harness writes a human-readable model name into the trailer
+#    ("Claude Opus 5 (1M context)", "Claude Sonnet 5", the next one after
+#    that...) that changes with every release, but the address stays
+#    noreply@anthropic.com regardless of name — so the domain is the one
+#    signal that never lags behind a new model name AND never risks matching a
+#    real human co-author whose name happens to contain "Claude" or "Opus"
+#    (matched by domain, not name, so a human is never caught by this). Runs
+#    unconditionally (not gated on the idempotent check below) so a message
+#    that already carries the hmd trailer ALONGSIDE a stray model trailer
+#    still gets the model trailer removed — the two checks guard different
+#    things (this one removes, the next one only skips a redundant add).
+#    grep -v naturally no-ops when nothing matches, so this is idempotent by
+#    construction: a second run finds nothing left to strip.
+ANTHROPIC_RE='^Co-Authored-By:.*@anthropic\.com'
+if grep -qiE "\$ANTHROPIC_RE" "\$MSG_FILE" 2>/dev/null; then
+  STRIP_TMP="\$(mktemp "\${TMPDIR:-/tmp}/hmd-commit-msg.XXXXXX" 2>/dev/null)"
+  if [ -n "\$STRIP_TMP" ] && grep -viE "\$ANTHROPIC_RE" "\$MSG_FILE" > "\$STRIP_TMP" 2>/dev/null; then
+    cat "\$STRIP_TMP" > "\$MSG_FILE" 2>/dev/null
+  fi
+  rm -f "\$STRIP_TMP" 2>/dev/null
+fi
+
+# 4b. STRIP the OLD-form hmd trailer (Co-Authored-By: * <hmd@runheimdall.dev>) —
+#    the address moved (see the write_prepare_commit_msg doc comment above).
+#    Bounded by the angle bracket to the exact OLD address, unlike step 4's
+#    whole-domain match: @runheimdall.dev is also the human owner's own
+#    author/committer address (rj@runheimdall.dev) and, unlike anthropic.com,
+#    could plausibly host OTHER real teammates too, so only the one retired
+#    local part is matched, never the domain. Runs unconditionally, same
+#    tmp-swap pattern as step 4, so OLD and NEW never both end up in the same
+#    message — the OLD line is always gone before step 5 decides whether the
+#    NEW one is needed.
+OLD_HMD_RE='^Co-Authored-By:.*<hmd@runheimdall\.dev>'
+if grep -qiE "\$OLD_HMD_RE" "\$MSG_FILE" 2>/dev/null; then
+  OLDHMD_TMP="\$(mktemp "\${TMPDIR:-/tmp}/hmd-commit-msg.XXXXXX" 2>/dev/null)"
+  if [ -n "\$OLDHMD_TMP" ] && grep -viE "\$OLD_HMD_RE" "\$MSG_FILE" > "\$OLDHMD_TMP" 2>/dev/null; then
+    cat "\$OLDHMD_TMP" > "\$MSG_FILE" 2>/dev/null
+  fi
+  rm -f "\$OLDHMD_TMP" 2>/dev/null
+fi
+
+# 5. IDEMPOTENT — the hmd trailer is already present anywhere in the message ->
+#    no-op the ADD (the strip above already ran regardless of this check).
 #    Fixed-string, case-insensitive: never risk a duplicate over a casing quirk.
 grep -qiF "\$TRAILER" "\$MSG_FILE" 2>/dev/null && exit 0
 
-# 4. PROTECT THE EMPTY-MESSAGE ABORT PATH. A plain interactive \`git commit\` (no
-#    -m/-F/template configured) shows ONLY git's own "# Please enter a commit
-#    message..." comment block at this point — nothing the user types exists yet,
-#    since this hook fires BEFORE the editor opens. Adding a trailer there would
-#    turn a message the user leaves blank (to abort) into a real commit whose
-#    only content is our trailer. So: only append when the message already has
-#    at least one real (non-comment, non-blank) line — true for every -m/-F,
-#    merge, squash and amend message, i.e. every commit hmd's own agents make.
-grep -v '^#' "\$MSG_FILE" 2>/dev/null | grep -q '[^[:space:]]' || exit 0
-
-# 5. APPEND, via a tmp file swapped in only on full success. If the last content
+# 6. APPEND, via a tmp file swapped in only on full success. If the last content
 #    line already looks like a trailer (Token: value) with nothing after it, join
 #    its paragraph (no blank line) so ours groups with an existing model trailer
 #    instead of splitting into a second paragraph; otherwise start a new trailer
