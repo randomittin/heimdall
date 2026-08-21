@@ -352,18 +352,26 @@ smaller `--min-samples` up rather than hand you a verdict it cannot support.
 
 ### Reasoning Bank — Learn from Past Executions
 
-Before starting a new task, check `.planning/skills/` and claude-mem for similar past work:
+Before starting a new task, check `.planning/skills/` for a matching prior pattern:
 1. Search `.planning/skills/*.md` for matching trigger patterns
-2. Query claude-mem: `/mem-search "similar to: <task description>"`
-3. If a matching pattern found with success history → apply it directly (skip research phase)
-4. If a matching pattern found but it FAILED last time → avoid that approach, try alternative
+2. Matching pattern with success history → apply it directly (skip research phase)
+3. Matching pattern that FAILED last time → avoid that approach, try an alternative
 
-Track success rates per pattern:
-- Pattern applied + verification passed → increment success count
-- Pattern applied + verification failed → increment failure count
-- Success rate < 50% after 3+ uses → archive the pattern (move to `.planning/skills/archived/`)
+**The claude-mem `/mem-search` query that used to be step 2 here is removed, not merely
+unenforced** (measured 2026-08-22: adoption was 0 across ~40 spawns in one session before
+removal). claude-mem's self-reported "98% savings" divides the historical cost of the sessions
+that *produced* a memory by the cost of *reading* it back — not session-token savings. Taken at
+full face value anyway: its automatic `SessionStart` injection already costs ~0.35% of an
+average session's real spend on this repo, and an *active* per-task query on top of it
+(~40 calls/session) would add ~0.22% more — both inside the rounding-error band this repo
+already used to reject Headroom's compression fork (0.5583%/0.271% aggregate). Full measurement:
+`docs/analysis/2026-08-22-reasoning-bank-wiring-decision.md`; reusable lesson:
+`.planning/skills/reasoning-bank-claude-mem-wiring.md`. claude-mem itself stays installed and its
+passive injection is unaffected — only the *active per-task query mandate* is removed.
 
-This creates a feedback loop: Heimdall gets better at YOUR project over time.
+The success/failure-count tracking and auto-archiving once described here were never
+implemented — nothing in this repo increments those counters. Step 1 above is the only
+currently-real step.
 
 ---
 
