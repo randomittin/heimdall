@@ -646,11 +646,19 @@ else:
     bad("I4 the synthesized seed is NOT deterministic: %r vs %r" % (new_seed, seed_again))
 
 # I5 — END TO END: team_columns actually renders THIS seed's hero, not the handle's
-# curated/animal fallback — the sigil strip is byte-identical to eye_strip(new_seed).
+# curated/animal fallback — byte-identical to eye_strip_mini(new_seed). MINI, not the
+# full 8-cell strip: a1d13a6 halved the teammate strip (TEAM_STRIP_W=4), and this test's
+# own left-pad math (TEAM_MEMBER_W - TEAM_STRIP_W) already assumed 4 while the compare
+# still called the 8-cell eye_strip — impossible by construction, hence the red.
 lp = " " * (S.LAYOUT.TEAM_MEMBER_W - S.LAYOUT.TEAM_STRIP_W)
-want_top, want_bot = S.SIG.eye_strip(new_seed, S.CAPS)
+want_top, want_bot = S.SIG.eye_strip_mini(new_seed, S.CAPS)
 r1e, r2e, _r3e, _r4e = S.team_columns([i_nohaid_m], 40, 0, NOW)
-if r1e == lp + want_top and r2e == lp + want_bot:
+# team_columns pads each row to EXACTLY team_w visible cells (its own docstring), so the
+# strip is a byte-identical PREFIX followed only by a reset + spaces. Assert the prefix
+# AND that nothing but reset/space follows, so this cannot pass on a truncated render.
+_tail1, _tail2 = r1e[len(lp + want_top):], r2e[len(lp + want_bot):]
+_pad_ok = _tail1.replace("\x1b[0m", "").strip() == "" and _tail2.replace("\x1b[0m", "").strip() == ""
+if r1e.startswith(lp + want_top) and r2e.startswith(lp + want_bot) and _pad_ok:
     ok("I5 team_columns' sigil strip for this member IS the hero-pool eye_strip render")
 else:
     bad("I5 team_columns did not render the hero-pool strip for the no-HAID online member")
