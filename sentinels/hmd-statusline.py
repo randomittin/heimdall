@@ -66,22 +66,6 @@ WALL = _load("hmd_wall")          # import hmd_wall — the repo wall reader (re
 # The line is BUILT in 24-bit truecolor + full unicode; CAPS.emit() downgrades the
 # finished bytes in ONE pass at write time (truecolor+full = byte-identical NO-OP).
 CAPS = TC.detect(sys.argv)
-# The MONO render tier, used ONLY to drain the identity hue out of an AWAY teammate's sigil
-# (see team_columns). Built once; None if the sigil core cannot supply it, in which case the
-# offline column still reads offline from its faint name + the `⊘off` Row4 segment.
-try:
-    _MONO_CAPS = SIG.tier_caps(TC.MONO, CAPS.unicode)
-except AttributeError as _e:
-    # NEVER widen this to `except Exception`. It used to, and it swallowed a typo
-    # (CAPS.unicode_tier — the PARAMETER name, not the attribute) for as long as the
-    # feature existed. _MONO_CAPS stayed None, the drain never ran, and every absent
-    # teammate rendered at full presence saturation: a wall showing nine vivid faces
-    # in a repo with nobody online. The honesty signal was dead code and said nothing.
-    # A drain that cannot be built is a wall that cannot tell absence from presence,
-    # so it fails LOUDLY on stderr rather than degrading to a confident lie.
-    sys.stderr.write("hmd: sigil mono tier unavailable (%s) — absent teammates "
-                     "cannot be drained; wall honesty is DEGRADED\n" % _e)
-    _MONO_CAPS = None
 USE_COLOR = CAPS.use_color()
 def _c(s): return s if USE_COLOR else ""
 def _write(s):
@@ -937,6 +921,30 @@ def _team_hue(seed, sigil):
     return "#%02x%02x%02x" % (r, g, b)
 
 
+def _hero_seed(m):
+    """The identity seed used to resolve a teammate's HERO (not just their name hue): a REAL
+    haid always wins — sha256-mod-assigned, stable forever (hero_for). A member with no
+    ENROLLED haid still deserves a real hero, not the duller curated/animal 2-shade fallback a
+    bare handle resolves to (hmd_sigil._HAID_RE: "short demo/handle seeds ... stay on the
+    curated/animal path"). So one is synthesized from the handle in the SAME shape a real haid
+    has, so it clears _is_haid and resolves through the 190-hero pool — deterministic, so one
+    handle always draws the same hero.
+
+    This is the gap behind "name lit up, sigil greyed out": _team_hue's accent colour
+    (sigil_accent_color) never checks haid shape, so an online no-haid teammate's NAME was
+    always vivid — but eye_strip -> grid_for DOES gate on haid shape, so their SIGIL fell back
+    to the duller fallback. 3f5e959 gave the WALL's cache builder this same synthesis
+    (bin/lib/repo_roster.py) for its own listing, but it never reached this renderer; this
+    closes that gap at the one place both the sigil and the name key off the same seed."""
+    haid = m.get("haid")
+    if haid and SIG._is_haid(haid):
+        return haid
+    handle = re.sub(r"[^a-z0-9-]+", "-", str(m.get("user") or m.get("sigil") or "?").lower()).strip("-")
+    handle = handle or "teammate"
+    h4 = hashlib.sha256(handle.encode()).hexdigest()[:4]
+    return "haid:%s.wall-%s" % (handle, h4)
+
+
 # team-sigil-rail geometry (Row1 top-row + Row2 bottom-row + Row3 names): each teammate is
 # the TOP HALF of their OWN 8×8 hero (8 cols × 2 `▄` text-rows) in NATURAL colors — the top
 # text-row rides Row1, the bottom text-row rides Row2 (stacked = the recognizable top of the
@@ -1419,9 +1427,11 @@ def team_columns(members, team_w, overflow, now, states=True, self_branch=""):
     for i, m in enumerate(members):
         seed = _hero_seed(m)
         away = _drained(m)
-        # An AWAY teammate's sigil renders in the MONO tier: the identity hue — the thing that
-        # reads as "present" — drains out of their column, while the glyph SHAPE still says who
-        # they are. Online teammates keep their natural palette, so the two never look alike.
+        # An AWAY teammate's sigil is DESATURATED (drained), not tier-swapped to MONO: the
+        # identity hue — the thing that reads as "present" — drains out of their column, while
+        # the glyph SHAPE still says who they are. Online teammates keep their natural palette
+        # (with a real hero, even lacking an enrolled haid — see _hero_seed), so the two never
+        # look alike.
         try:
             # Always render the REAL strip, then drain. Rendering it through a colourless
             # tier is what erased the face; desaturating a full-colour render keeps it.

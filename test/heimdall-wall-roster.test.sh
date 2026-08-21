@@ -601,6 +601,61 @@ else:
     bad("I4 the first paint lost the repo-scoped roster: %r"
         % ([m.get("user") for m in ms],))
 
+# ══════════════════════════════════════════════════════════════════════════════════
+print("\nI. HERO SEED: an ONLINE teammate with no enrolled HAID still gets a real hero")
+# THE REPORTED DEFECT. "the team name lit up when they are online but their sigils are
+# greyed out." _team_hue (the NAME colour) hashes the seed directly — it never checks HAID
+# shape, so the name was ALWAYS vivid. eye_strip -> grid_for DOES gate on HAID shape
+# (hmd_sigil._HAID_RE): a bare handle seed falls to the curated/animal path, which 3f5e959
+# itself called a "2-shade silhouette" next to the 190-hero pool. _hero_seed() closes the
+# gap by synthesizing a HAID-shaped seed from the handle when none is enrolled, so the
+# SIGIL resolves through the same rich pool the NAME's colour always implied.
+
+i_members, _i_of = W.wall_members([
+    row("rj", "online", haid="haid:rj.box-46d5", last_seen_ts=NOW - 1),
+    row("akshat", "online", last_seen_ts=NOW - 1),      # ONLINE, no enrolled HAID
+], self_ids=set(), now=NOW)
+i_haid_m = [m for m in i_members if m["user"] == "rj"][0]
+i_nohaid_m = [m for m in i_members if m["user"] == "akshat"][0]
+
+new_seed = S._hero_seed(i_nohaid_m)
+if S.SIG._is_haid(new_seed) and S.SIG._resolve_custom_spec(new_seed) is not None:
+    ok("I1 an online, no-HAID member's seed resolves through the 190-hero pool: %r" % (new_seed,))
+else:
+    bad("I1 an online, no-HAID member did not reach the hero pool: seed=%r" % (new_seed,))
+
+# I2 — FALSIFIABILITY. The pre-fix seed line is reconstructed verbatim; it MUST fail to
+# reach the hero pool, or I1 proves nothing.
+old_seed = i_nohaid_m.get("haid") or i_nohaid_m.get("user") or i_nohaid_m.get("sigil") or "?"
+if S.SIG._resolve_custom_spec(old_seed) is None:
+    ok("I2 the PRE-FIX bare-handle seed %r stays off the hero pool — I1 discriminates" % (old_seed,))
+else:
+    bad("I2 the pre-fix seed unexpectedly reached the hero pool — I1 is vacuous")
+
+# I3 — a REAL enrolled HAID passes through unchanged (never overridden by a synthetic one).
+if S._hero_seed(i_haid_m) == "haid:rj.box-46d5":
+    ok("I3 a REAL enrolled HAID passes through _hero_seed unchanged")
+else:
+    bad("I3 a real HAID was overridden: %r" % (S._hero_seed(i_haid_m),))
+
+# I4 — determinism: the SAME handle always draws the SAME hero (no per-render flicker).
+seed_again = S._hero_seed(dict(i_nohaid_m))
+if new_seed == seed_again and S.SIG.hero_for(new_seed) == S.SIG.hero_for(seed_again):
+    ok("I4 the synthesized seed is deterministic — one handle always draws the same hero")
+else:
+    bad("I4 the synthesized seed is NOT deterministic: %r vs %r" % (new_seed, seed_again))
+
+# I5 — END TO END: team_columns actually renders THIS seed's hero, not the handle's
+# curated/animal fallback — the sigil strip is byte-identical to eye_strip(new_seed).
+lp = " " * (S.LAYOUT.TEAM_MEMBER_W - S.LAYOUT.TEAM_STRIP_W)
+want_top, want_bot = S.SIG.eye_strip(new_seed, S.CAPS)
+r1e, r2e, _r3e, _r4e = S.team_columns([i_nohaid_m], 40, 0, NOW)
+if r1e == lp + want_top and r2e == lp + want_bot:
+    ok("I5 team_columns' sigil strip for this member IS the hero-pool eye_strip render")
+else:
+    bad("I5 team_columns did not render the hero-pool strip for the no-HAID online member")
+
+# ══════════════════════════════════════════════════════════════════════════════════
 print("\n" + "=" * 60)
 print("wall-roster: %d passed, %d failed" % (P_N[0], F_N[0]))
 print("=" * 60)
