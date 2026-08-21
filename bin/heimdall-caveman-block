@@ -39,13 +39,13 @@ if [ -r "$flag" ]; then
   # "no level claimed" instead of hmd parroting arbitrary text as a live setting.
   raw="$(tr -d '[:space:]' < "$flag" 2>/dev/null || true)"
   case "$raw" in
-    lite|full|ultra) level="$raw" ;;
+    lite|full|ultra|wenyan|wenyan-lite|wenyan-full|wenyan-ultra) level="$raw" ;;
   esac
 fi
 
 if [ -n "$level" ]; then
   printf 'OUTPUT COMPRESSION: caveman plugin active, level `%s`. Its SessionStart hook already injected that level'"'"'s rules — follow those. hmd does not restate them and does not set the level.\n' "$level"
-  if [ "$level" != ultra ]; then
+  if [ "$level" != ultra ] && [ "$level" != wenyan-ultra ]; then
     printf 'Max compression is `/caveman ultra`, a user command. hmd will not set it for you — so do not report ultra as active.\n'
   fi
 else

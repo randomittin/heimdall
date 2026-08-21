@@ -165,6 +165,26 @@ case "$degraded" in
 esac
 
 echo ""
+# ── wenyan-* are real compression levels, not garbage ─────────────────────────
+# caveman-config.js's VALID_MODES includes wenyan, wenyan-lite, wenyan-full and
+# wenyan-ultra. The level parser once matched only lite|full|ultra, so a live
+# wenyan session was reported as "no level set" — the same misreport this whole
+# helper exists to prevent, just for an exotic mode nobody tested.
+for wy in wenyan wenyan-lite wenyan-full wenyan-ultra; do
+  out="$(run_at "$wy")"
+  case "$out" in
+    *"level \`$wy\`"*) ok "$wy reported as its own level" ;;
+    *) bad "$wy was not reported as a level: $out" ;;
+  esac
+done
+
+# wenyan-ultra IS max compression — it must not be told to escalate to ultra.
+out="$(run_at wenyan-ultra)"
+case "$out" in
+  *"Max compression is"*) bad "wenyan-ultra told to escalate — it is already max" ;;
+  *) ok "wenyan-ultra not told to escalate (already max)" ;;
+esac
+
 echo "caveman-level-claim.test.sh: $PASS passed, $FAIL failed."
 [ "$FAIL" -eq 0 ] || exit 1
 exit 0
