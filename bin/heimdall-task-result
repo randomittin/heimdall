@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# heimdall-task-result — the H-4 return path: an agent's finding becomes a
+# capsule (<=10 lines, via heimdall-capsule) plus a schema-valid task_result
+# message referencing it by id (bin/protocol/message-schema.json). Closes the
+# loop the other mechanisms leave open: heimdall-brief compresses main->spawn,
+# this compresses spawn->main. No LLM summarization step -- a file write and
+# an id. See PROTOCOL.md.
+#
+# Usage:
+#   heimdall-task-result done --task <id> --status pass|fail|partial \
+#       --from <role> --what <text> [--where W] [--decision D] [--gotcha G] \
+#       [--depends a,b] [--criteria 1,2,4] [--commit sha] [--msg-id id]
+#   -h, --help
+#
+# Behavior: 1) writes a capsule <task> via heimdall-capsule write; 2) assembles
+# a schema-shaped task_result message referencing capsule:<task>; 3) validates
+# it via heimdall-validate before printing; 4) prints ONLY the compact one-line
+# JSON message on stdout -- nothing else.
+#
+# Exit: 0 ok; 1 capsule write failed; 2 usage/validation error.
+set -euo pipefail
+
+SELF="$0"
+SOURCE_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=lib/protocol.sh
+. "$SOURCE_DIR/lib/protocol.sh"
+proto_resolve_paths "$SELF"
+proto_require_jq
+proto_ensure_dirs
+
+usage() { sed -n '2,20p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+[ $# -ge 1 ] || { echo "error: a subcommand is required" >&2; usage >&2; exit 2; }
+cmd="$1"; shift || true
+case "$cmd" in
+  -h|--help) usage; exit 0 ;;
+  done) ;;
+  *) echo "error: unknown subcommand: $cmd" >&2; usage >&2; exit 2 ;;
+esac
+
+task=""; status=""; from=""; what=""; where=""; decision=""; gotcha=""
+depends=""; criteria=""; commit=""; msg_id=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --task)     task="${2:?--task needs a value}"; shift 2 ;;
+    --status)   status="${2:?--status needs a value}"; shift 2 ;;
+    --from)     from="${2:?--from needs a value}"; shift 2 ;;
+    --what)     what="${2:?--what needs a value}"; shift 2 ;;
+    --where)    where="${2:?--where needs a value}"; shift 2 ;;
+    --decision) decision="${2:?--decision needs a value}"; shift 2 ;;
+    --gotcha)   gotcha="${2:?--gotcha needs a value}"; shift 2 ;;
+    --depends)  depends="${2:?--depends needs a value}"; shift 2 ;;
+    --criteria) criteria="${2:?--criteria needs a value}"; shift 2 ;;
+    --commit)   commit="${2:?--commit needs a value}"; shift 2 ;;
+    --msg-id)   msg_id="${2:?--msg-id needs a value}"; shift 2 ;;
+    *) echo "error: unknown flag: $1" >&2; exit 2 ;;
+  esac
+done
+
+[ -n "$task" ] || { echo "error: --task is required" >&2; exit 2; }
+[ -n "$from" ] || { echo "error: --from is required" >&2; exit 2; }
+[ -n "$what" ] || { echo "error: --what is required (a result must say what happened)" >&2; exit 2; }
+case "$status" in
+  pass|fail|partial) ;;
+  *) echo "error: --status must be pass|fail|partial (got '${status:-<empty>}')" >&2; exit 2 ;;
+esac
+if [ -n "$criteria" ] && ! printf '%s' "$criteria" | grep -qE '^[0-9]+(,[0-9]+)*$'; then
+  echo "error: --criteria must be a comma-separated integer list (got '$criteria')" >&2
+  exit 2
+fi
+
+[ -n "$msg_id" ] || msg_id="tr-$(proto_ts | tr -dc '0-9')-$$"
+
+# 1) Capsule write (delegates to heimdall-capsule; any failure of its own -- the
+# <=10-line cap, a bad flag -- collapses to our exit 1: the result has nowhere
+# to compact to).
+cap_args=(write "$task" --what "$what")
+[ -n "$where" ]    && cap_args+=(--where "$where")
+[ -n "$decision" ] && cap_args+=(--decision "$decision")
+[ -n "$gotcha" ]   && cap_args+=(--gotcha "$gotcha")
+[ -n "$depends" ]  && cap_args+=(--depends "$depends")
+if ! "$SOURCE_DIR/heimdall-capsule" "${cap_args[@]}" >/dev/null; then
+  echo "error: capsule write failed for task $task (heimdall-capsule rejected it)" >&2
+  exit 1
+fi
+
+# 2) Assemble a schema-shaped task_result, referencing the capsule by id only.
+msg="$(jq -nc \
+  --arg type "task_result" --arg from "$from" --arg msg_id "$msg_id" \
+  --arg task "$task" --arg status "$status" --arg capsule "$task" \
+  --arg commit "$commit" \
+  '{type: $type, from: $from, msg_id: $msg_id, task: $task, status: $status, capsule: $capsule}
+   + (if $commit != "" then {commit: $commit} else {} end)')"
+
+if [ -n "$criteria" ]; then
+  msg="$(printf '%s' "$msg" | jq -c --arg c "$criteria" \
+    '.criteria = ($c | split(",") | map(tonumber))')"
+fi
+
+# 3) Self-validate before printing -- never emit a message we haven't checked.
+if ! printf '%s' "$msg" | "$SOURCE_DIR/heimdall-validate" >/dev/null 2>&1; then
+  echo "error: assembled task_result failed schema validation (internal bug)" >&2
+  printf '%s\n' "$msg" >&2
+  exit 2
+fi
+
+proto_log "$from" "task_result" "task=$task status=$status capsule=$task"
+
+# 4) Print ONLY the compact one-line message. Nothing else on stdout.
+printf '%s\n' "$msg"
