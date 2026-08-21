@@ -34,7 +34,11 @@ spec = u.spec_from_file_location("sl", repo + "/sentinels/hmd-statusline.py")
 m = u.module_from_spec(spec)
 spec.loader.exec_module(m)
 
-print("MONO=%s" % ("built" if m._MONO_CAPS is not None else "none"))
+# d3fd560 replaced the MONO render tier with hue DESATURATION (_drain_hue): the
+# identity hue drains out while the glyph SHAPE survives, which a tier swap could
+# not guarantee. This probe therefore asserts the DRAIN MECHANISM EXISTS AND IS
+# CALLABLE, not that one particular implementation of it is present.
+print("MONO=%s" % ("built" if callable(getattr(m, "_drain_hue", None)) else "none"))
 
 NOW = 1785869500
 def colours(tier):
