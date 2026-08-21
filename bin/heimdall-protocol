@@ -13,6 +13,7 @@
 #   5 blackboard       -> heimdall-blackboard
 #   6 token ledger     -> heimdall-ledger
 #   (contract adapter) -> heimdall-gate   (reads report.json; built last/thinnest)
+#   (return path)      -> heimdall-task-result  (task_result message + capsule, in one)
 #
 # Usage:
 #   heimdall-protocol init         create/repair the .planning/protocol/ layout
@@ -23,6 +24,7 @@
 #   heimdall-protocol ledger ...   -> heimdall-ledger
 #   heimdall-protocol validate ... -> heimdall-validate
 #   heimdall-protocol gate ...     -> heimdall-gate
+#   heimdall-protocol task-result ... -> heimdall-task-result
 #   heimdall-protocol demo         measured before/after token-ledger demo
 #   heimdall-protocol log [N]      tail the human-readable protocol.log (last N)
 #   -h, --help
@@ -65,6 +67,7 @@ case "$cmd" in
   ledger)     exec "$SOURCE_DIR/heimdall-ledger" "$@" ;;
   validate)   exec "$SOURCE_DIR/heimdall-validate" "$@" ;;
   gate)       exec "$SOURCE_DIR/heimdall-gate" "$@" ;;
+  task-result) exec "$SOURCE_DIR/heimdall-task-result" "$@" ;;
   log)
     n="${1:-20}"
     proto_ensure_dirs
