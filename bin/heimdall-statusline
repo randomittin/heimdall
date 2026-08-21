@@ -197,43 +197,102 @@ if [ -n "$BLOB" ] && [ -x "$CTX_METER" ]; then
   printf '%s' "$BLOB" | $CTO "$CTX_METER" publish >/dev/null 2>&1 || true
 fi
 
-# ── LIVE harness-subagent count (reconciled: stale/failed/reaped EXCLUDED) ──────
+# ── LIVE harness-subagent count (cached: background refresh, cheap read) ────────
 # Claude Code Agent-tool subagents (hmd:coder &c.) are owned by the harness and
 # never enter agent-pool, so a dead/hung one would keep inflating any raw count.
 # bin/heimdall-agents enumerates them from the harness task dir and returns ONLY
 # the live ones; we publish that as HMD_LIVE_SUBAGENTS so the HUD's agent segment
-# reflects the honest live count. This is heimdall's OWN view — it does NOT (cannot)
-# touch Claude Code's FleetView, and under a non-Claude-Code host there simply is no
-# harness task dir to enumerate, so this degrades to 0 exactly like any other
-# missing-signal field. Kept cheap + fail-safe: a fast stat-only read, hard 1s
-# ceiling, any error → 0. The bar must never block or error on this signal.
+# reflects the honest live count. This is heimdall's OWN view — it does NOT
+# (cannot) touch Claude Code's FleetView, and under a non-Claude-Code host there
+# simply is no harness task dir to enumerate, so that case still degrades to 0
+# exactly as before this fix.
+#
+# WHY CACHED: `heimdall-agents count` parses every harness transcript in the
+# session task dir — measured 73 files/31MB against the main repo when this fix
+# was scoped — which alone can exceed this bar's whole 1000ms budget. The prior
+# fix (see the commit immediately before this one) gave the call a hard 1s
+# ceiling via `perl -e 'alarm 1; exec @ARGV'` (this repo's documented
+# timeout(1)/gtimeout stand-in — macOS ships neither): necessary, but alarm()
+# truncates to whole seconds, so 1s alone was already most of the budget. The
+# computation has to stop happening synchronously on the render path at all.
+#
+# PATTERN: mirrors sentinels/hmd-statusline.py's _spawn_presence() — the only
+# other place this bar solves "expensive signal, must never block a render":
+# a stat-only "is it due" gate, a lock file so concurrent renders don't each
+# fork a refresh, a fully detached child that writes a tmp file and atomically
+# `mv`s it into place, and a render path that only ever READS the cache. Kept
+# in bash here (not imported from that python module) because the underlying
+# signal — and its perl-alarm ceiling — has always lived in this file.
+#
+# HONESTY: a cached count is a real measurement, just up to AGENTS_COUNT_TTL
+# seconds old — fine. A GUESSED one is not. A cache that is MISSING or older
+# than its TTL renders as "" (unknown), never a fabricated number — the same
+# precedent the CTX gauge below already sets (null used_percentage → honest
+# "unavailable", never a fabricated "0%"). TTL matches the existing roster
+# cache's own cadence (fresh<4s / lock<8s): comfortably longer than a Claude
+# Code redraw (>=300ms) or Cursor's updateIntervalMs poll (3000ms), short
+# enough that staleness is never more than a few seconds.
 HMD_LIVE_SUBAGENTS=0
 AGENTS_BIN=""
 if command -v heimdall-agents >/dev/null 2>&1; then AGENTS_BIN="heimdall-agents"
 elif [ -x "$HERE/heimdall-agents" ]; then AGENTS_BIN="$HERE/heimdall-agents"; fi
 if [ -n "$AGENTS_BIN" ]; then
-  # A hard time ceiling when a `timeout` (or macOS `gtimeout`) is available; else run
-  # bare — the count is already a stat-only read, so it stays sub-second regardless.
-  TO=""
-  command -v timeout  >/dev/null 2>&1 && TO="timeout 1"
-  [ -z "$TO" ] && command -v gtimeout >/dev/null 2>&1 && TO="gtimeout 1"
-  # macOS ships NEITHER timeout(1) NOR gtimeout, so both probes above miss and the
-  # "hard ceiling" silently became a no-op. Measured consequence: `count` parses every
-  # harness transcript in the session task dir (73 files / 31MB here) at a steady
-  # 1.38-1.42s, which alone exceeds the bar's whole 1000ms budget. The comment that
-  # used to sit here -- "the count is already a stat-only read, so it stays sub-second
-  # regardless" -- was false, and being false is why the dead guard went unnoticed.
-  # perl is this repo's documented stand-in (AGENTS.md); alarm() takes whole seconds,
-  # so 1 is the floor. Single-quoted so the shell cannot split the `;`.
-  if [ -n "$TO" ]; then
-    HMD_LIVE_SUBAGENTS="$(HMD_AGENT_CWD="$PWD" $TO "$AGENTS_BIN" count 2>/dev/null || true)"
-  elif command -v perl >/dev/null 2>&1; then
-    HMD_LIVE_SUBAGENTS="$(HMD_AGENT_CWD="$PWD" perl -e 'alarm 1; exec @ARGV' -- "$AGENTS_BIN" count 2>/dev/null || true)"
-  else
-    HMD_LIVE_SUBAGENTS="$(HMD_AGENT_CWD="$PWD" "$AGENTS_BIN" count 2>/dev/null || true)"
+  HMD_LIVE_SUBAGENTS=""   # tool exists ⇒ count is cache-driven; "" until proven fresh
+  AC_CWD="${HMD_AGENT_CWD:-$PWD}"
+  AC_DIR="$AC_CWD/.heimdall"
+  AC_CACHE="$AC_DIR/.agents-count-cache"
+  AC_LOCK="$AC_CACHE.lock"
+  AGENTS_COUNT_TTL="${HMD_AGENTS_COUNT_TTL:-4}"
+  AGENTS_LOCK_TTL="${HMD_AGENTS_LOCK_TTL:-8}"
+  case "$AGENTS_COUNT_TTL" in ''|*[!0-9]*) AGENTS_COUNT_TTL=4 ;; esac
+  case "$AGENTS_LOCK_TTL"  in ''|*[!0-9]*) AGENTS_LOCK_TTL=8 ;; esac
+  AC_NOW="$(date +%s 2>/dev/null || echo 0)"
+  case "$AC_NOW" in ''|*[!0-9]*) AC_NOW=0 ;; esac
+
+  AC_FRESH=0
+  if [ -f "$AC_CACHE" ]; then
+    AC_MTIME="$(stat -L -f%m "$AC_CACHE" 2>/dev/null || stat -L -c%Y "$AC_CACHE" 2>/dev/null || echo 0)"
+    case "$AC_MTIME" in ''|*[!0-9]*) AC_MTIME=0 ;; esac
+    if [ $(( AC_NOW - AC_MTIME )) -lt "$AGENTS_COUNT_TTL" ]; then
+      AC_FRESH=1
+      IFS= read -r HMD_LIVE_SUBAGENTS <"$AC_CACHE" 2>/dev/null || HMD_LIVE_SUBAGENTS=""
+    fi
+  fi
+
+  LOCK_FRESH=0
+  if [ -f "$AC_LOCK" ]; then
+    LOCK_MTIME="$(stat -L -f%m "$AC_LOCK" 2>/dev/null || stat -L -c%Y "$AC_LOCK" 2>/dev/null || echo 0)"
+    case "$LOCK_MTIME" in ''|*[!0-9]*) LOCK_MTIME=0 ;; esac
+    [ $(( AC_NOW - LOCK_MTIME )) -lt "$AGENTS_LOCK_TTL" ] && LOCK_FRESH=1
+  fi
+
+  if [ "$AC_FRESH" = 0 ] && [ "$LOCK_FRESH" = 0 ] && mkdir -p "$AC_DIR" 2>/dev/null; then
+    : >"$AC_LOCK" 2>/dev/null
+    AC_TMP="$AC_CACHE.$$.tmp"
+    # Same timeout(1)/gtimeout/perl-alarm/bare fallback chain as the prior fix,
+    # just relocated off the render path: a hard 1s ceiling still bounds a hung
+    # `count` so it can never wedge holding the lock forever. Publishes via a
+    # tmp-write + rename + unconditional lock/tmp cleanup (`;` after `&&`, not
+    # chained) so a failed refresh never leaves an orphaned tmp file (the exact
+    # bug already fixed elsewhere in this repo for the roster/wall caches).
+    _ac_refresh() {
+      "$@" >"$AC_TMP" 2>/dev/null && mv -f "$AC_TMP" "$AC_CACHE"
+      rm -f "$AC_TMP" "$AC_LOCK"
+    }
+    TO=""
+    command -v timeout  >/dev/null 2>&1 && TO="timeout 1"
+    [ -z "$TO" ] && command -v gtimeout >/dev/null 2>&1 && TO="gtimeout 1"
+    if [ -n "$TO" ]; then
+      ( HMD_AGENT_CWD="$AC_CWD" _ac_refresh $TO "$AGENTS_BIN" count ) >/dev/null 2>&1 </dev/null &
+    elif command -v perl >/dev/null 2>&1; then
+      ( HMD_AGENT_CWD="$AC_CWD" _ac_refresh perl -e 'alarm 1; exec @ARGV' -- "$AGENTS_BIN" count ) >/dev/null 2>&1 </dev/null &
+    else
+      ( HMD_AGENT_CWD="$AC_CWD" _ac_refresh "$AGENTS_BIN" count ) >/dev/null 2>&1 </dev/null &
+    fi
+    disown 2>/dev/null || true
   fi
 fi
-case "$HMD_LIVE_SUBAGENTS" in ''|*[!0-9]*) HMD_LIVE_SUBAGENTS=0 ;; esac
+case "$HMD_LIVE_SUBAGENTS" in ''|*[!0-9]*) HMD_LIVE_SUBAGENTS="" ;; esac
 export HMD_LIVE_SUBAGENTS
 
 # ── Cursor host-label normalization ──
