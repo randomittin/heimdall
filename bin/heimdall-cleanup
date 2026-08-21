@@ -54,8 +54,9 @@
 #   heimdall-cleanup --code          READ-ONLY consumer audit: every executable in bin/ must
 #                                    name what invokes it, or it is reported dead. Delegates
 #                                    wholesale to bin/heimdall-deadcode. Deletes NOTHING.
-#   heimdall-cleanup --deep          SUGGEST-only handoff to the mac-deep-clean skill for the
-#                                    heavier, confirm-gated disk cleanup. Reaps NOTHING itself.
+#   heimdall-cleanup --deep          SUGGEST-only handoff to the mac-deep-clean skill — ONLY if
+#                                    it's actually installed (never claims one that isn't) — for
+#                                    the heavier, confirm-gated disk cleanup. Reaps NOTHING itself.
 #   heimdall-cleanup --auto          the HOOK path (SessionStart/End). Runs gc (hmd disk) always;
 #                                    reaps orphaned hmd python ONLY on a genuine runaway
 #                                    (count >= ORPHAN_CRIT) so a live session's keeper is never
@@ -103,6 +104,16 @@ NO_CLEANUP_FILE="$HMD_HOME/no-cleanup"
 opted_out() {
   [ "${HEIMDALL_NO_CLEANUP:-0}" = "1" ] && return 0
   [ -f "$NO_CLEANUP_FILE" ] && return 0
+  return 1
+}
+
+# best-effort: is the mac-deep-clean skill actually installed? Checked at the same
+# locations bin/detect-skills scans (user + project level) — NEVER claim a skill the
+# user doesn't have (the launch-audit lesson: a suggestion is a claim, and pointing at
+# an absent target makes it an overclaim).
+_mac_deep_clean_installed() {
+  [ -f "${HOME:-}/.claude/skills/mac-deep-clean/SKILL.md" ] && return 0
+  [ -f "${REPO:-.}/.claude/skills/mac-deep-clean/SKILL.md" ] && return 0
   return 1
 }
 
@@ -786,7 +797,8 @@ do_advise() {
 
 # ── DEEP (suggest-only handoff — reaps NOTHING) ───────────────────────────────────
 do_deep() {
-  cat <<'EOF'
+  if _mac_deep_clean_installed; then
+    cat <<'EOF'
 heimdall-cleanup --deep — heavier disk cleanup is CONFIRM-GATED, not automatic.
 
 This step reclaims user-facing disk beyond heimdall's own footprint (SDK/simulator
@@ -798,6 +810,21 @@ which investigates READ-ONLY first and deletes only after you confirm each tier.
 heimdall-cleanup itself never auto-deletes anything outside heimdall's own garbage.
 For that safe subset run:  heimdall-cleanup --apply
 EOF
+  else
+    cat <<'EOF'
+heimdall-cleanup --deep — heavier disk cleanup is CONFIRM-GATED, not automatic.
+
+This step would reclaim user-facing disk beyond heimdall's own footprint (SDK/simulator
+bloat, dead repos, large caches) via the tiered mac-deep-clean skill — but that skill is
+NOT installed on this machine, so heimdall will not tell you to invoke it.
+
+heimdall-cleanup itself never auto-deletes anything outside heimdall's own garbage.
+For that safe subset run:  heimdall-cleanup --apply
+
+To investigate the heavier categories yourself (read-only, nothing auto-deleted):
+  du -sh ~/Library/Developer/Xcode/DerivedData ~/Library/Caches/* 2>/dev/null | sort -rh | head
+EOF
+  fi
   return 0
 }
 

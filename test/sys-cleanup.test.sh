@@ -228,6 +228,29 @@ killed_sorted="$(sort -n "$WORK/killed" 2>/dev/null | tr '\n' ' ' | sed 's/ *$//
 if [ "$killed_sorted" = "100 101 102" ]; then ok "--auto on a runaway reaps EXACTLY the hmd orphans"
 else bad "--auto runaway reap wrong — want '100 101 102' got '$killed_sorted'"; fi
 
+# ── 11. --deep's handoff HONESTLY reflects whether mac-deep-clean is actually installed ──
+# mac-deep-clean is a SEPARATE, user-installed skill, never bundled with heimdall — pointing
+# at it when it's absent is an overclaim (the launch-audit lesson). Isolate both branches with
+# their own HOME/REPO fixtures so the result never depends on this machine's real state.
+mkdir -p "$WORK/home-with-mdc/.claude/skills/mac-deep-clean" "$WORK/proj-no-mdc"
+printf -- '---\nname: mac-deep-clean\n---\nfixture\n' > "$WORK/home-with-mdc/.claude/skills/mac-deep-clean/SKILL.md"
+mkdir -p "$WORK/home-no-mdc"
+
+out_has="$(HOME="$WORK/home-with-mdc" bash "$CLEAN" --deep --repo "$WORK/proj-no-mdc" 2>&1)"
+printf '%s\n' "$out_has" | grep -q "invoke the 'mac-deep-clean' skill" \
+  && ok "--deep: skill installed (user-level) -> handoff names it" \
+  || bad "--deep: skill installed but handoff text missing: $out_has"
+
+out_no="$(HOME="$WORK/home-no-mdc" bash "$CLEAN" --deep --repo "$WORK/proj-no-mdc" 2>&1)"
+if printf '%s\n' "$out_no" | grep -q "invoke the 'mac-deep-clean' skill"; then
+  bad "--deep: skill NOT installed but handoff still tells the user to invoke it (overclaim)"
+else
+  ok "--deep: skill not installed -> no overclaim in the handoff text"
+fi
+printf '%s\n' "$out_no" | grep -q 'heimdall-cleanup --apply' \
+  && ok "--deep: absent-skill fallback still points at hmd's own safe subset" \
+  || bad "--deep: absent-skill fallback missing the --apply pointer: $out_no"
+
 echo
 printf 'sys-cleanup: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
