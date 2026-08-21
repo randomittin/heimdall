@@ -9,8 +9,11 @@ A read-only advisor: **does this machine need a cleanup, and is Heimdall causing
 disk + memory pressure, counts Heimdall's own leaked python, and SUGGESTS the fix. It never
 deletes or kills anything unless you explicitly ask for the scoped self-reap.
 
-Pairs with **mac-deep-clean** (the executor that actually reclaims disk). This skill is the
-*trigger* — the thing that notices you need it.
+Pairs with **mac-deep-clean** (the executor that actually reclaims disk) — a separate,
+user-installed skill, NOT bundled with Heimdall. This skill is the *trigger* — the thing
+that notices you need it — and it checks whether mac-deep-clean is actually installed
+(`~/.claude/skills/mac-deep-clean/SKILL.md` or the project-level equivalent) before ever
+naming it, falling back to plain read-only investigation commands when it's absent.
 
 ## Why this exists (the lesson it encodes)
 
@@ -74,7 +77,9 @@ Overall exit code = the worst section. Thresholds override via `HMD_SYSMON_*` en
     ones (mounted OS/simulator runtime volumes, running hypervisors) and says the holder is
     unidentified when it cannot see one. Never prescribe a reboot as *the* fix.
 - **disk WARN/CRIT** → hand off to **mac-deep-clean** (tiered, read-only investigation first,
-  then deletes only caches / dead repos / SDK-simulator bloat).
+  then deletes only caches / dead repos / SDK-simulator bloat) — IF it's installed. Otherwise
+  the suggestion names manual, read-only investigation commands instead (never a skill absent
+  from this machine).
 
 Do NOT auto-delete or auto-reboot. Suggest; let the user confirm.
 
@@ -112,4 +117,7 @@ for.
 - [ ] `heimdall-sysmon --json | jq .` is valid JSON with the three sections.
 - [ ] `--filter-orphans` matches `mock_cp.py`/`presence-doctor` orphans but NOT a foreign
       python nor a non-orphan (proven by `test/heimdall-sysmon.test.sh`).
-- [ ] A reap suggestion appears iff `procs` is WARN/CRIT; a mac-deep-clean suggestion iff `disk` is.
+- [ ] A reap suggestion appears iff `procs` is WARN/CRIT; a mac-deep-clean suggestion iff `disk`
+      is WARN/CRIT AND the skill is actually installed — otherwise a manual read-only fallback
+      (proven by the mac-deep-clean-availability cases in `test/heimdall-sysmon.test.sh` and
+      `test/sys-cleanup.test.sh`).

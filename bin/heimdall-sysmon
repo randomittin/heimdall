@@ -403,6 +403,16 @@ if [ "$orphan_barepy" -gt 0 ] && [ "$orphan_hmd" -gt 0 ]; then
   _line "procs" "-" "+ ${orphan_barepy} unattributed bare-stdin python orphan(s) (ownership unproven)"
 fi
 
+# best-effort: is the mac-deep-clean skill actually installed? Checked at the same
+# locations bin/detect-skills scans (user + project level) — NEVER claim a skill the
+# user doesn't have (the launch-audit lesson: a suggestion is a claim, and pointing at
+# an absent target makes it an overclaim).
+_mac_deep_clean_installed() {
+  [ -f "${HOME:-}/.claude/skills/mac-deep-clean/SKILL.md" ] && return 0
+  [ -f "${CLAUDE_PROJECT_DIR:-.}/.claude/skills/mac-deep-clean/SKILL.md" ] && return 0
+  return 1
+}
+
 # ── SUGGESTIONS ─────────────────────────────────────────────────────────────────────
 if [ "$sev" = 0 ]; then
   echo "suggestion: none — healthy."
@@ -430,7 +440,14 @@ if [ "$mem_status" != "ok" ]; then
   echo "      heimdall-cleanup --advise    # names the holder when one is detectable"
 fi
 if [ "$disk_status" != "ok" ]; then
-  echo "  • disk is ${disk_used_pct}% full — run the deep clean: invoke the 'mac-deep-clean' skill"
-  echo "    (tiered, read-only investigation first; deletes only caches / dead repos / SDK bloat)."
+  if _mac_deep_clean_installed; then
+    echo "  • disk is ${disk_used_pct}% full — run the deep clean: invoke the 'mac-deep-clean' skill"
+    echo "    (tiered, read-only investigation first; deletes only caches / dead repos / SDK bloat)."
+  else
+    echo "  • disk is ${disk_used_pct}% full — no mac-deep-clean skill installed here; reclaim"
+    echo "    heimdall's own safe subset first:  heimdall-cleanup --apply"
+    echo "    then investigate the rest yourself (read-only, nothing auto-deleted):"
+    echo "      du -sh ~/Library/Developer/Xcode/DerivedData ~/Library/Caches/* 2>/dev/null | sort -rh | head"
+  fi
 fi
 exit "$sev"

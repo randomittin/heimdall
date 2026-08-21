@@ -78,6 +78,28 @@ grep -q 'mac-deep-clean' <<<"$d" && ok "disk WARN → suggests mac-deep-clean" \
   || bad "disk WARN did not suggest mac-deep-clean"
 [ "$drc" = 2 ] && ok "forced-full disk → exit 2 (crit)" || bad "forced-full disk exit != 2 (got $drc)"
 
+# 6. disk suggestion is HONEST about mac-deep-clean's actual install state (never overclaims)
+MDC_HOME="$(mktemp -d "${TMPDIR:-/tmp}/heimdall-sysmon-test.XXXXXX")"
+mkdir -p "$MDC_HOME/with/.claude/skills/mac-deep-clean" "$MDC_HOME/without"
+printf -- '---\nname: mac-deep-clean\n---\nfixture\n' > "$MDC_HOME/with/.claude/skills/mac-deep-clean/SKILL.md"
+
+d_has="$(HOME="$MDC_HOME/with" CLAUDE_PROJECT_DIR="$MDC_HOME/without" HMD_SYSMON_DISK_WARN_PCT=0 HMD_SYSMON_DISK_CRIT_PCT=0 "$BIN" 2>&1)"
+printf '%s\n' "$d_has" | grep -q "invoke the 'mac-deep-clean' skill" \
+  && ok "disk WARN + skill installed -> suggestion names it" \
+  || bad "disk WARN + skill installed but suggestion text missing: $d_has"
+
+d_no="$(HOME="$MDC_HOME/without" CLAUDE_PROJECT_DIR="$MDC_HOME/without" HMD_SYSMON_DISK_WARN_PCT=0 HMD_SYSMON_DISK_CRIT_PCT=0 "$BIN" 2>&1)"
+if printf '%s\n' "$d_no" | grep -q "invoke the 'mac-deep-clean' skill"; then
+  bad "disk WARN + skill NOT installed but suggestion still says to invoke it (overclaim)"
+else
+  ok "disk WARN + skill not installed -> no overclaim; falls back to manual investigation"
+fi
+printf '%s\n' "$d_no" | grep -q 'heimdall-cleanup --apply' \
+  && ok "disk WARN fallback still points at heimdall-cleanup --apply" \
+  || bad "disk WARN fallback missing heimdall-cleanup --apply: $d_no"
+
+rm -rf "$MDC_HOME"
+
 echo
 echo "$P passed, $F failed"
 [ "$F" -eq 0 ]
