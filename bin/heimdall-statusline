@@ -217,7 +217,21 @@ if [ -n "$AGENTS_BIN" ]; then
   TO=""
   command -v timeout  >/dev/null 2>&1 && TO="timeout 1"
   [ -z "$TO" ] && command -v gtimeout >/dev/null 2>&1 && TO="gtimeout 1"
-  HMD_LIVE_SUBAGENTS="$(HMD_AGENT_CWD="$PWD" $TO "$AGENTS_BIN" count 2>/dev/null || true)"
+  # macOS ships NEITHER timeout(1) NOR gtimeout, so both probes above miss and the
+  # "hard ceiling" silently became a no-op. Measured consequence: `count` parses every
+  # harness transcript in the session task dir (73 files / 31MB here) at a steady
+  # 1.38-1.42s, which alone exceeds the bar's whole 1000ms budget. The comment that
+  # used to sit here -- "the count is already a stat-only read, so it stays sub-second
+  # regardless" -- was false, and being false is why the dead guard went unnoticed.
+  # perl is this repo's documented stand-in (AGENTS.md); alarm() takes whole seconds,
+  # so 1 is the floor. Single-quoted so the shell cannot split the `;`.
+  if [ -n "$TO" ]; then
+    HMD_LIVE_SUBAGENTS="$(HMD_AGENT_CWD="$PWD" $TO "$AGENTS_BIN" count 2>/dev/null || true)"
+  elif command -v perl >/dev/null 2>&1; then
+    HMD_LIVE_SUBAGENTS="$(HMD_AGENT_CWD="$PWD" perl -e 'alarm 1; exec @ARGV' -- "$AGENTS_BIN" count 2>/dev/null || true)"
+  else
+    HMD_LIVE_SUBAGENTS="$(HMD_AGENT_CWD="$PWD" "$AGENTS_BIN" count 2>/dev/null || true)"
+  fi
 fi
 case "$HMD_LIVE_SUBAGENTS" in ''|*[!0-9]*) HMD_LIVE_SUBAGENTS=0 ;; esac
 export HMD_LIVE_SUBAGENTS
