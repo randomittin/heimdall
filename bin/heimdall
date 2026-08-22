@@ -877,25 +877,43 @@ try:
 except Exception:
     say("error", "could not locate the keys byte-exactly; left untouched"); sys.exit(0)
 
-# Cut ranges chosen so every SURVIVING member keeps its exact original bytes:
-#   followed by another member -> cut through that member's key start (takes the
-#     separating comma and whitespace with it, leaving the next member's indent)
-#   last member, predecessor survives -> cut from the predecessor's end (takes the
-#     now-dangling comma)
-#   last member, predecessor also dropped or none -> cut just this member (the
-#     predecessor's own cut already reaches here)
-# The three cases are disjoint by construction, so applying them right-to-left
-# never invalidates an earlier offset.
+# Cut ranges chosen so every SURVIVING member keeps its exact original bytes.
+# Dropped members are merged into maximal CONSECUTIVE RUNS before cutting — NOT
+# reasoned about one member at a time — because a per-member version only looks
+# one predecessor back, and undercounts exactly the layout install.sh always
+# produces: statusLine + subagentStatusLine land as the trailing TWO members of
+# the object. Per-member logic cut each of their own spans fine but never
+# reached past the run to the dangling comma left by the SURVIVING member two
+# positions back, so `json.loads(new)` failed the sanity check below and the
+# splice bailed out to "left untouched" — meaning the keys quietly survived a
+# real uninstall, and only got removed on a SECOND run after an unrelated
+# rewrite (claude plugins uninstall) reordered the file and made them a
+# single-member-at-a-time case again. Root cause lived here, not in whatever
+# idempotency check calls this.
+#   run followed by a surviving member -> cut through THAT member's key start
+#     (takes the run's own text + the separating comma/whitespace with it)
+#   run reaches the end, a predecessor survives -> cut from the predecessor's
+#     end (takes the now-dangling comma before the run)
+#   run has no neighbour on either side (whole object dropped) -> cut just the
+#     run; unreachable today (the all-dropped branch below short-circuits
+#     first), kept as a defensive fallback
+# Cases are disjoint by construction, so applying them right-to-left never
+# invalidates an earlier offset.
+drop_idx = [n for n, m in enumerate(members) if m["key"] in drop]
 cuts = []
-for n, m in enumerate(members):
-    if m["key"] not in drop:
-        continue
-    if n + 1 < len(members):
-        cuts.append((m["start"], members[n + 1]["start"]))
-    elif n > 0 and members[n - 1]["key"] not in drop:
-        cuts.append((members[n - 1]["end"], m["end"]))
+i = 0
+while i < len(drop_idx):
+    j = i
+    while j + 1 < len(drop_idx) and drop_idx[j + 1] == drop_idx[j] + 1:
+        j += 1
+    lo, hi = drop_idx[i], drop_idx[j]
+    if hi + 1 < len(members):
+        cuts.append((members[lo]["start"], members[hi + 1]["start"]))
+    elif lo > 0:
+        cuts.append((members[lo - 1]["end"], members[hi]["end"]))
     else:
-        cuts.append((m["start"], m["end"]))
+        cuts.append((members[lo]["start"], members[hi]["end"]))
+    i = j + 1
 
 if [m for m in members if m["key"] not in drop]:
     new = raw
