@@ -5,6 +5,10 @@
 
 ---
 
+**Sections:** 0 method · 1 headline · 2 orphaned bins · 3 orphaned agents · 4 the nine known instances · 5 live · 6 reachable · 7 claimed-only · 9 arm-usage control · 10 `--help` coverage · 11 clean surfaces · 12 tests-vs-production · 13 oracles & modules · **14 bottom line**
+
+---
+
 ## 0. How to read this
 
 Four states, applied to every capability hmd claims:
@@ -346,7 +350,7 @@ That is 66+ green assertions across five binaries with **zero measured invocatio
 
 ---
 
-## 8. Bottom line for launch
+## 14. Bottom line for launch
 
 Ordered by what an owner should act on first.
 
