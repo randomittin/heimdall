@@ -30,6 +30,20 @@
 
 set -u
 
+# Best-effort sourcing, mirroring heimdall-dream-permission's own pattern: this notice
+# must stay fast and dependency-free (see the header), so an unreadable lib here means
+# the tcc-denied verbose block falls back to its generic three-folder text rather than
+# failing loud — this hook must never be the thing that breaks a session.
+BINDIR="$(cd "$(dirname "$0")" && pwd)"
+if [ -r "$BINDIR/lib/real-home.sh" ]; then
+  # shellcheck disable=SC1091
+  . "$BINDIR/lib/real-home.sh" 2>/dev/null || true
+fi
+if [ -r "$BINDIR/lib/tcc-paths.sh" ]; then
+  # shellcheck disable=SC1091
+  . "$BINDIR/lib/tcc-paths.sh" 2>/dev/null || true
+fi
+
 REPO=""
 STATUS=""
 MIN_GAP=2
@@ -196,16 +210,37 @@ fi
 
 case "$KIND" in
   tcc-denied)
-    p "    cause       : macOS TCC denies the 03:00 LaunchAgent access to the folder"
-    p "                  holding this repo (~/Downloads, ~/Documents and ~/Desktop are"
-    p "                  protected). A LaunchAgent carries no TCC grant, so the job is"
-    p "                  refused before dream can start — it cannot even open its own"
-    p "                  script. Moving the script or the output does NOT fix this."
-    p "    run now     : $REMEDY --repo $REPO run"
-    p "                  (a terminal session HOLDS the grant, so this works today)"
-    p "    unattended  : to restore true 03:00 runs, either move the repo out of the"
-    p "                  protected folder, or grant Full Disk Access to the scheduled"
-    p "                  interpreter in System Settings > Privacy & Security."
+    NOTICE_FOLDER_LABEL=""
+    if type heimdall_tcc_protected_root >/dev/null 2>&1 && type heimdall_tcc_folder_service >/dev/null 2>&1; then
+      NOTICE_PROT_ROOT="$(heimdall_tcc_protected_root "$REPO" 2>/dev/null)" && \
+        NOTICE_FOLDER_LABEL="$(heimdall_tcc_folder_service "$NOTICE_PROT_ROOT" 2>/dev/null | sed -n 3p)"
+    fi
+    if [ -n "$NOTICE_FOLDER_LABEL" ]; then
+      p "    cause       : macOS TCC denies the 03:00 LaunchAgent access to the folder"
+      p "                  holding this repo — gated by the \"$NOTICE_FOLDER_LABEL\" row"
+      p "                  under Privacy & Security > Files & Folders. A LaunchAgent"
+      p "                  carries no TCC grant, so the job is refused before dream can"
+      p "                  start — it cannot even open its own script. Moving the script"
+      p "                  or the output does NOT fix this."
+      p "    run now     : $REMEDY --repo $REPO run"
+      p "                  (a terminal session HOLDS the grant, so this works today)"
+      p "    unattended  : to restore true 03:00 runs, either move the repo out of the"
+      p "                  protected folder, or flip \"$NOTICE_FOLDER_LABEL\" on for the"
+      p "                  scheduled interpreter — it is listed there already, no + and"
+      p "                  no browsing needed. Full Disk Access also works but is far"
+      p "                  broader than this job needs; treat it as a last resort."
+    else
+      p "    cause       : macOS TCC denies the 03:00 LaunchAgent access to the folder"
+      p "                  holding this repo (~/Downloads, ~/Documents and ~/Desktop are"
+      p "                  protected). A LaunchAgent carries no TCC grant, so the job is"
+      p "                  refused before dream can start — it cannot even open its own"
+      p "                  script. Moving the script or the output does NOT fix this."
+      p "    run now     : $REMEDY --repo $REPO run"
+      p "                  (a terminal session HOLDS the grant, so this works today)"
+      p "    unattended  : to restore true 03:00 runs, either move the repo out of the"
+      p "                  protected folder, or grant Full Disk Access to the scheduled"
+      p "                  interpreter in System Settings > Privacy & Security."
+    fi
     # The DECISION belongs to the operator, and until now nothing ever put it in front of
     # him — this notice named the cause every session and left him to work out the rest.
     # The block spells out both routes with runnable commands and the exact binary a grant

@@ -404,7 +404,7 @@ LEFT="$(printf 'B\ny\n' | { run_perm "$PROT_PLUG" install >/dev/null 2>&1; cat; 
 # …and with a human present it DOES ask, in the same flow, at setup.
 rm -f "$PMARK"; : > "$POPENLOG"
 H_OUT="$(printf 'c\n' | run_perm "$PROT_PLUG" install HEIMDALL_DREAM_PERMISSION_TTY=1 2>&1)"
-if grep -q 'Full Disk Access' <<<"$H_OUT" \
+if grep -q 'Downloads Folder' <<<"$H_OUT" \
    && grep -q 'Your choice' <<<"$H_OUT"; then
   ok "10 SETUP WITH A HUMAN: install-wire puts the permission choice to him"
 else
@@ -455,7 +455,7 @@ fi
 
 rm -f "$PMARK"; : > "$POPENLOG"
 UH="$(printf 'c\n' | run_perm "$PROT_PLUG" update HEIMDALL_DREAM_PERMISSION_TTY=1 2>&1)"
-if grep -q 'Full Disk Access' <<<"$UH" && grep -q 'Your choice' <<<"$UH"; then
+if grep -q 'Downloads Folder' <<<"$UH" && grep -q 'Your choice' <<<"$UH"; then
   ok "11 UPDATE WITH A HUMAN: hmd --update puts the permission choice to him"
 else
   bad "11 the update path did not ask a present human: $(printf '%s' "$UH" | tr '\n' ' ' | cut -c1-200)"

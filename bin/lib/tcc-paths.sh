@@ -33,6 +33,10 @@
 #                                         not exist yet; prints the result, rc 1 on failure
 #   heimdall_tcc_protected_root <path>    prints the protected root and returns 0 when
 #                                         <path> is inside one; rc 1 otherwise
+#   heimdall_tcc_folder_service <root>    prints the 3 lines (service id / pane anchor /
+#                                         human-visible row label) for a root returned by
+#                                         heimdall_tcc_protected_root above; rc 1 when
+#                                         <root> is not one of the folders this recognizes
 
 # The folder names macOS gates behind a per-service TCC entitlement. Kept as a plain
 # word list so a caller can read it in a message without re-deriving it.
@@ -89,4 +93,32 @@ $real"
 $homes
 EOF
   return 1
+}
+
+# heimdall_tcc_folder_service <protected-root> — maps a root PRINTED BY
+# heimdall_tcc_protected_root (never a raw path — the caller is expected to have already
+# resolved one) to the THREE things a caller needs to ask for the RIGHT permission instead
+# of the broadest one that happens to also work:
+#   line 1: the TCC service identifier (documentation/logging only — never queried or set;
+#           this file still never touches the TCC database, see tcc-paths.sh's own header)
+#   line 2: the System Settings deep-link anchor, for
+#           x-apple.systempreferences:com.apple.preference.security?<anchor>
+#   line 3: the human-visible row label, exactly as System Settings' own Files & Folders
+#           category prints it (confirmed against a live SecurityPrivacyExtension.appex)
+#
+# GENERIC BY DESIGN — NEVER HARDCODES ONE FOLDER. Downloads, Documents and Desktop each
+# get their own TCC service; a caller that assumed "Downloads" for every protected root
+# would send an operator whose repo sits in ~/Documents to the wrong pane. rc 1 for any
+# root this does not recognize, so a caller can fall back to naming Full Disk Access
+# instead of guessing a service name that might be wrong.
+heimdall_tcc_folder_service() {
+  local root="${1:-}" base
+  [ -n "$root" ] || return 1
+  base="$(basename "$root")"
+  case "$base" in
+    Downloads) printf 'kTCCServiceSystemPolicyDownloadsFolder\nPrivacy_DownloadsFolder\nDownloads Folder\n' ;;
+    Documents) printf 'kTCCServiceSystemPolicyDocumentsFolder\nPrivacy_DocumentsFolder\nDocuments Folder\n' ;;
+    Desktop)   printf 'kTCCServiceSystemPolicyDesktopFolder\nPrivacy_DesktopFolder\nDesktop Folder\n' ;;
+    *) return 1 ;;
+  esac
 }
