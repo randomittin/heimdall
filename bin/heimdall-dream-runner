@@ -188,6 +188,8 @@ write_status() {
   "repo": "$(json_escape "$REPO")",
   "repo_reachable": "$(json_escape "$REPO_REACHABLE")",
   "dream": "$(json_escape "$DREAM")",
+  "interpreter": "$(json_escape "$INTERPRETER")",
+  "interpreter_cdhash": "$(json_escape "$INTERPRETER_CDHASH")",
   "denied_path": "$(json_escape "$denied")",
   "detail": "$(json_escape "$detail")",
   "exit": $code
