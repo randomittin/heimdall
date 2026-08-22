@@ -594,12 +594,36 @@ reach_build_class() {
 # branch of live-code's own BFS at once, and because reach_class checks THIS set first,
 # the hook-rooted evidence always wins regardless of which parent live-code's map
 # happened to record for it. Requires reach_build_class to have already run (reads its
-# edges-code; does not rebuild it). Writes WORKDIR/{hook-seeds,live-hook,live-hook-paths}.
+# edges-code; does not rebuild it). Writes WORKDIR/{edges-hook,hook-seeds,live-hook,live-hook-paths}.
+#
+# DISPATCHER HOP CEILING — bin/heimdall and bin/hmd are, by reach_root_seeds' own
+# doc comment, "the CLI a human types": a multi-way `case` keyed on a subcommand
+# argument that source-level tokenizing cannot see. Naming both of them once as a
+# seed is right (a hook CAN legitimately invoke `bin/heimdall <fixed-subcommand>` and
+# that one target really is automatic) — but crediting EVERY name the dispatcher's
+# own source mentions is wrong, and it is not hypothetical: bin/heimdall contains on
+# the order of 60 real (non-comment, post-stripping) mentions of other bin names in
+# its dispatch table, and some hook names bin/heimdall directly for an unrelated,
+# narrow purpose. Before this ceiling, that ONE hook edge into the dispatcher was
+# enough for reach_build_hook_class's BFS to walk every one of those ~60 dispatch
+# arms and report them all LIVE — e.g. bin/heimdall-metric's only path was
+# `bin/heimdall-metric <- bin/heimdall [REACHABLE] <- hooks/hooks.json [LIVE]`, a
+# REACHABLE-class hop in the middle laundered into a LIVE verdict at the end, exactly
+# the "absorbing LIVE" rule (above) misapplied to a hop that is actually a runtime
+# branch, not a deterministic relay. A dispatcher's outgoing edges are categorically
+# REACHABLE (a human, or a hook's fixed argument, must still select the branch) and
+# must never propagate LIVE onward, REGARDLESS of whether the dispatcher itself is
+# hook-reachable. The dispatcher file can still classify LIVE if a hook names it
+# directly — only its OWN outgoing mentions are excluded from this closure. edges-code
+# itself (and therefore reach_build_class / REACHABLE) is untouched: a bin reachable
+# ONLY through the dispatcher still correctly reads REACHABLE, never DEAD — this is a
+# classification correction, not a reachability regression.
 reach_build_hook_class() {
   local w="$1"
   LC_ALL=C awk '$0 == "hooks/hooks.json" || $0 == ".mcp.json"' "$w/seeds" > "$w/hook-seeds" 2>/dev/null
+  LC_ALL=C awk -F'\t' '$1 != "bin/heimdall" && $1 != "bin/hmd"' "$w/edges-code" > "$w/edges-hook" 2>/dev/null
 
-  LC_ALL=C awk -v nodesf="$w/nodes" -v seedsf="$w/hook-seeds" -v edgesf="$w/edges-code" '
+  LC_ALL=C awk -v nodesf="$w/nodes" -v seedsf="$w/hook-seeds" -v edgesf="$w/edges-hook" '
     BEGIN {
       while ((getline l < nodesf) > 0) {
         split(l, a, "\t")
