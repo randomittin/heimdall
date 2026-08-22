@@ -27,6 +27,16 @@
 #       restores that prior override exactly; a manual `rollback` does the same.
 #   (9) OUTCOMES RECORDED — every decision appends a decided record with a result
 #       block to experiments.jsonl; status folds the log to latest-per-id.
+#   (16) NULL-OUTCOME BLINDNESS — a "task" record with a real task_type/model but a
+#       null or missing `outcome` carries no pass/fail evidence: it is EXCLUDED from
+#       samples/passes/pass_rate (never silently scored as a failure) yet still
+#       counted in a separate `unknown` bucket and folded into avg_retries/avg_secs/
+#       total_task_records (real telemetry regardless of whether a verdict was ever
+#       recorded). A min-samples floor gates on scorable samples only — unknowns can
+#       never inflate a cell toward it.
+#   (17) THE SAME FIX COVERS experiment evaluate — the falsifier's variant sample
+#       count and pass_rate come from the identical _aggregate() call, so null-
+#       outcome variant records cannot dilute a KEEP/DISCARD verdict either.
 
 set -euo pipefail
 
@@ -330,6 +340,82 @@ ST="$("$CLI" --repo "$R" status)"
 echo "$ST" | jq -e '.consumption_note | test("hand|apply")' >/dev/null \
   && ok "(14) status carries a human-readable consumption_note" \
   || bad "(14) status missing/unclear consumption_note: $(echo "$ST" | jq -r '.consumption_note')"
+
+# ── (16) NULL-OUTCOME BLINDNESS: an unscored record must not depress pass_rate ──
+# real task_type + model, but outcome null/missing — bin/heimdall-metric-hook's
+# honest shape for single-purpose agents since 2026-08-23 (it records volume, never
+# fabricates a verdict SubagentStop's payload cannot supply). 3 scored (2 pass, 1
+# fail) + 5 unscored (4 outcome:null, 1 outcome key omitted) on ONE (task_type,model).
+R="$(mk_repo nulloutcome)"
+cat > "$R/.planning/metrics.jsonl" <<'EOF'
+{"ts":"2026-07-01T00:00:00Z","metric":"task","task_type":"code","model":"sonnet","outcome":"pass","retries":0,"wall_secs":10}
+{"ts":"2026-07-01T01:00:00Z","metric":"task","task_type":"code","model":"sonnet","outcome":"pass","retries":1,"wall_secs":10}
+{"ts":"2026-07-01T02:00:00Z","metric":"task","task_type":"code","model":"sonnet","outcome":"fail","retries":2,"wall_secs":10}
+{"ts":"2026-07-01T03:00:00Z","metric":"task","task_type":"code","model":"sonnet","outcome":null,"retries":1,"wall_secs":10}
+{"ts":"2026-07-01T04:00:00Z","metric":"task","task_type":"code","model":"sonnet","outcome":null,"retries":1,"wall_secs":10}
+{"ts":"2026-07-01T05:00:00Z","metric":"task","task_type":"code","model":"sonnet","outcome":null,"retries":1,"wall_secs":10}
+{"ts":"2026-07-01T06:00:00Z","metric":"task","task_type":"code","model":"sonnet","outcome":null,"retries":1,"wall_secs":10}
+{"ts":"2026-07-01T07:00:00Z","metric":"task","task_type":"code","model":"sonnet","retries":1,"wall_secs":10}
+EOF
+C="$("$CLI" --repo "$R" collect)"
+CELL="$(echo "$C" | jq -c '.cells[] | select(.task_type=="code" and .model=="sonnet")')"
+echo "$CELL" | jq -e '.samples==3' >/dev/null \
+  && ok "(16) unknown-outcome records excluded from samples (3 scorable of 8 seen)" \
+  || bad "(16) samples wrong, expected 3 scorable: $(echo "$CELL" | jq -c .)"
+echo "$CELL" | jq -e '.unknown==5' >/dev/null \
+  && ok "(16) unknown bucket counts null/missing outcome (5: 4 null + 1 omitted key)" \
+  || bad "(16) unknown count wrong: $(echo "$CELL" | jq -c .)"
+PR="$(echo "$CELL" | jq -r '.pass_rate')"
+[ "$PR" = "0.6667" ] \
+  && ok "(16) pass_rate computed over SCORABLE records only (2/3=0.6667, not 2/8=0.25)" \
+  || bad "(16) FALSIFIED: null-outcome records depressed pass_rate — got $PR, want 0.6667"
+AR="$(echo "$CELL" | jq -r '.avg_retries')"
+[ "$AR" = "1.0" ] \
+  && ok "(16) avg_retries still averages over ALL 8 observed records (8/8=1.0) — real telemetry, scored or not" \
+  || bad "(16) avg_retries wrong: $AR"
+TOTAL="$(echo "$C" | jq -r '.total_task_records')"
+[ "$TOTAL" = "8" ] \
+  && ok "(16) total_task_records counts every ingested task record, scored or not (8)" \
+  || bad "(16) total_task_records wrong: $TOTAL"
+# the floor-gate itself must count ONLY scorable evidence: 3 scorable < 4 -> no
+# hypothesis for "code", even though 8 raw records exist (unknowns must never
+# inflate a cell toward a sample-size floor).
+HN="$("$CLI" --repo "$R" hypotheses --min-samples 4)"
+if echo "$HN" | jq -e '.hypotheses[] | select(.subject=="code")' >/dev/null; then
+  bad "(16) min-samples floor counted unscored records toward the gate (leaked a code hypothesis)"
+else
+  ok "(16) min-samples floor counts ONLY scorable records (3 < 4 suppresses the code hypothesis)"
+fi
+
+# ── (17) THE SAME FIX COVERS experiment evaluate (shared _aggregate) ───────────
+# a variant padded with null-outcome records must not dilute the falsifier's
+# measured pass_rate or its sample count — proving the keep-gate and the
+# evaluator share the fix, not just hypotheses' min-samples gate above.
+R="$(mk_repo nulloutcome-eval)"; seed_metrics "$R"
+"$CLI" --repo "$R" experiment start --hypothesis hyp-esc-lint-sonnet --min-samples 3 --min-delta 0.10 >/dev/null
+EXP="$(open_id "$R")"
+# 3 scored pass (a clean 3/3=1.00) + 6 null-outcome pads on the SAME variant cell.
+cat >> "$R/.planning/metrics.jsonl" <<'EOF'
+{"ts":"2999-01-01T01:00:00Z","metric":"task","task_type":"lint","model":"opus","outcome":"pass","retries":0,"wall_secs":18}
+{"ts":"2999-01-01T02:00:00Z","metric":"task","task_type":"lint","model":"opus","outcome":"pass","retries":0,"wall_secs":19}
+{"ts":"2999-01-01T03:00:00Z","metric":"task","task_type":"lint","model":"opus","outcome":"pass","retries":0,"wall_secs":20}
+{"ts":"2999-01-01T04:00:00Z","metric":"task","task_type":"lint","model":"opus","outcome":null,"retries":0,"wall_secs":5}
+{"ts":"2999-01-01T05:00:00Z","metric":"task","task_type":"lint","model":"opus","outcome":null,"retries":0,"wall_secs":5}
+{"ts":"2999-01-01T06:00:00Z","metric":"task","task_type":"lint","model":"opus","outcome":null,"retries":0,"wall_secs":5}
+{"ts":"2999-01-01T07:00:00Z","metric":"task","task_type":"lint","model":"opus","outcome":null,"retries":0,"wall_secs":5}
+{"ts":"2999-01-01T08:00:00Z","metric":"task","task_type":"lint","model":"opus","outcome":null,"retries":0,"wall_secs":5}
+{"ts":"2999-01-01T09:00:00Z","metric":"task","task_type":"lint","model":"opus","outcome":null,"retries":0,"wall_secs":5}
+EOF
+EV="$("$CLI" --repo "$R" experiment evaluate --id "$EXP")"
+[ "$(echo "$EV" | jq -r '.result.samples')" = "3" ] \
+  && ok "(17) evaluate counts only scorable variant samples (3, not 9)" \
+  || bad "(17) evaluate samples wrong: $(echo "$EV" | jq -c '.result')"
+[ "$(echo "$EV" | jq -r '.result.variant_pass_rate')" = "1.0" ] \
+  && ok "(17) evaluate pass_rate ignores null-outcome variant records (1.0, not 0.3333)" \
+  || bad "(17) FALSIFIED: null-outcome variant records diluted the evaluator's pass_rate: $(echo "$EV" | jq -c '.result')"
+[ "$(echo "$EV" | jq -r '.decision')" = "keep" ] \
+  && ok "(17) KEEP correctly reached on the true 3/3 rate — a flawless variant is no longer discarded by null padding" \
+  || bad "(17) evaluate wrongly discarded a flawless variant: $(echo "$EV" | jq -c '.result')"
 
 echo "======================="
 printf "self-improve: \033[32m%d passed\033[0m, " "$PASS"
