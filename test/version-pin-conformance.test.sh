@@ -352,7 +352,7 @@ sweep_root() {
   while IFS= read -r f; do
     [ -n "$f" ] || continue
     rel="${f#$root/}"
-    if [ "$label" = repo ] && { untracked_in_docs_analysis "$rel" || dated_in_docs_analysis "$rel"; }; then continue; fi
+    if [ "$label" = repo ] && untracked_in_docs_analysis "$rel"; then continue; fi
     awk -v ver="$VER" -v win="$DIGEST_WINDOW" -v loc="$label:$rel" "$PIN_AWK" "$f" "$f"
   done <<FILES
 $(find_files published "$root")
@@ -766,6 +766,14 @@ UNMARKED=0
 while IFS='|' read -r kind loc lineno found reason text; do
   [ "$kind" = "BAD" ] || continue
   if [ "$STRUCT_OK" -eq 1 ] && structurally_owned "$loc" "$text"; then continue; fi
+  # A dated docs/analysis/ file's mention is quoted evidence, not a live claim (see
+  # dated_in_docs_analysis() above) -- suppressed HERE, at the BAD-record verdict, not by
+  # skipping the file from sweep_root entirely, so the file's OTHER pins (if any are
+  # correctly MARKED) still show up as OK/MARK records and stay under this gate's watch.
+  # A sweep-level skip was tried and reverted: it hid two files that already carry
+  # legitimate HEIMDALL:PIN markers (2026-08-04-hn-red-team.md, 2026-08-05-dream-capability.md)
+  # from the sweep ENTIRELY, which is a coverage regression, not an exemption.
+  if [ "${loc#repo:}" != "$loc" ] && dated_in_docs_analysis "${loc#repo:}"; then continue; fi
   bad "hand-typed version pin at $loc:$lineno [$reason, tokens: ${found%,}] — nothing renders it, so it silently rots at the next bump. Mark it (HEIMDALL:PIN:TAG / :VERSION / :SHA256) so bin/heimdall-render-version rewrites it from plugin.json"
   UNMARKED=$((UNMARKED+1))
 done <<BADREC
