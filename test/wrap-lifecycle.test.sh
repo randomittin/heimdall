@@ -553,6 +553,132 @@ grep -q 'heimdall wrap shim' "$RC" 2>/dev/null \
   && ok "4p the dev's rc is byte-identical again (sha1 $RC_PRIOR_SUM)" \
   || bad "4p the rc differs after the round trip" "$(cat "$RC")"
 
+# ── HEADROOM/SHIM PARITY — the persistent `--always` shim must reach the SAME
+# wrap-chain hop launch_tool reaches on the one-shot path. Before this fix,
+# install_shim's generated body execs the real binary directly with no headroom
+# sourcing at all: `hmd wrap <tool> --always` (the exact "set up once, forget it"
+# flow) never got headroom-routed on any later invocation, even though a bare
+# `hmd wrap <tool>` (no --always) got it correctly every time via launch_tool.
+# Fully isolated fixtures (own PATH, own fake tool, own fake headroom CLI) so
+# none of this can perturb 4a-4p above.
+echo
+echo "4q. shim/headroom parity (--always must reach the same chain hop)"
+
+HRQ="$WORK/headroomshim"
+mkdir -p "$HRQ/toolbin"
+cat > "$HRQ/toolbin/claude" <<'EOTOOL'
+#!/usr/bin/env bash
+printf 'ABURL: %s\n' "${ANTHROPIC_BASE_URL:-unset}" >> "${HMD_TOOL_OUT:-/dev/null}"
+exit 0
+EOTOOL
+chmod +x "$HRQ/toolbin/claude"
+
+# The HMD_HEADROOM_BIN test seam (bin/lib/hmd-headroom-chain.sh) plus the exact
+# fake-proxy fixture shape test/headroom-wrap-chain.test.sh section 1 already
+# proves in isolation: a fake CLI that dumps straight into a stdlib HTTP /health
+# responder, and a receipt.json marking the module "installed".
+cat > "$HRQ/fake_http_server.py" <<'PYEOF'
+import sys, json, os
+from http.server import BaseHTTPRequestHandler, HTTPServer
+port = int(sys.argv[1])
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        return None
+    def do_GET(self):
+        body = json.dumps({
+            "service": "headroom-proxy",
+            "checks": {"upstream": {"url": "https://api.anthropic.com"}},
+            "config": {"pid": os.getpid()},
+        }).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+HTTPServer(("127.0.0.1", port), Handler).serve_forever()
+PYEOF
+cat > "$HRQ/fake-headroom" <<EOSH
+#!/usr/bin/env bash
+set -uo pipefail
+case "\${1:-}" in
+  proxy)
+    port=8787
+    prev=""
+    for a in "\$@"; do
+      [ "\$prev" = "--port" ] && port="\$a"
+      prev="\$a"
+    done
+    exec python3 "$HRQ/fake_http_server.py" "\$port"
+    ;;
+  --version) echo "headroom, version FAKE-RECORDER" ;;
+  *) exit 2 ;;
+esac
+EOSH
+chmod +x "$HRQ/fake-headroom"
+mkdir -p "$HRQ/modstate/headroom"
+printf '{}\n' > "$HRQ/modstate/headroom/receipt.json"
+HRQ_PORT=$((22000 + ($$ % 3000)))
+HRQ_TOOL_OUT="$HRQ/tool.log"
+
+R4q="$(new_repo shimheadroom)"
+git -C "$R4q" commit -qm init --allow-empty >/dev/null 2>&1
+( cd "$R4q" && \
+  env -u HEIMDALL_WRAP_LAUNCHED -u ANTHROPIC_BASE_URL \
+  HOME="$WORK/fakehome" HEIMDALL_HOME="$WORK/fakehome/.heimdall" \
+  PATH="$HRQ/toolbin:$PATH" \
+  HMD_STUB_OUT="$STUB_OUT" HMD_TOOL_OUT="$TOOL_OUT" \
+  HEIMDALL_NO_UPDATE_CHECK=1 HEIMDALL_NO_INTRO=1 \
+  HEIMDALL_NO_TEAM_AUTOSHARE=1 HMD_AUTO_TEAM_DISABLE=1 \
+  SHELL=/bin/zsh HEIMDALL_CP_URL="http://127.0.0.1:1" \
+  perl -e 'alarm 120; exec @ARGV or exit 127' -- "$HWRAP" wrap claude --always --no-launch ) >/dev/null 2>&1
+SHIMQ="$WORK/fakehome/.heimdall/shims/claude"
+if [ ! -x "$SHIMQ" ]; then
+  bad "4q0 setup: no shim installed for the parity check — the rest of 4q/4r/4s cannot run" "looked for $SHIMQ"
+fi
+
+: > "$HRQ_TOOL_OUT"
+( cd "$R4q" && \
+  env -u ANTHROPIC_BASE_URL \
+  HOME="$WORK/fakehome" HEIMDALL_HOME="$WORK/fakehome/.heimdall" \
+  PATH="$HRQ/toolbin:$PATH" \
+  HMD_HEADROOM_BIN="$HRQ/fake-headroom" HMD_MODULES_STATE="$HRQ/modstate" \
+  HEADROOM_PORT="$HRQ_PORT" HMD_TOOL_OUT="$HRQ_TOOL_OUT" \
+  HEIMDALL_NO_INTRO=1 \
+  perl -e 'alarm 30; exec @ARGV or exit 127' -- "$SHIMQ" --version ) >/dev/null 2>&1
+grep -q "ABURL: http://127.0.0.1:$HRQ_PORT" "$HRQ_TOOL_OUT" 2>/dev/null \
+  && ok "4q the --always shim routes ANTHROPIC_BASE_URL through headroom, same as launch_tool" \
+  || bad "4q the shim did not export ANTHROPIC_BASE_URL — it bypasses the headroom chain" "$(cat "$HRQ_TOOL_OUT" 2>/dev/null)"
+
+# Opt-out must still be honoured from inside the shim (inherited from
+# hmd_headroom_chain -> hmd_headroom_opted_out, never re-implemented locally).
+: > "$HRQ_TOOL_OUT"
+( cd "$R4q" && \
+  env -u ANTHROPIC_BASE_URL \
+  HOME="$WORK/fakehome" HEIMDALL_HOME="$WORK/fakehome/.heimdall" \
+  PATH="$HRQ/toolbin:$PATH" \
+  HMD_HEADROOM_BIN="$HRQ/fake-headroom" HMD_MODULES_STATE="$HRQ/modstate" \
+  HEADROOM_PORT="$HRQ_PORT" HMD_TOOL_OUT="$HRQ_TOOL_OUT" \
+  HMD_HEADROOM_DISABLE=1 \
+  HEIMDALL_NO_INTRO=1 \
+  perl -e 'alarm 30; exec @ARGV or exit 127' -- "$SHIMQ" --version ) >/dev/null 2>&1
+grep -q "ABURL: unset" "$HRQ_TOOL_OUT" 2>/dev/null \
+  && ok "4r HMD_HEADROOM_DISABLE=1 is honoured through the shim (opt-out inherited, not bypassed)" \
+  || bad "4r opt-out was not honoured through the shim" "$(cat "$HRQ_TOOL_OUT" 2>/dev/null)"
+
+# The dominant case TODAY: headroom module not installed. Must still exec cleanly
+# (fail-open) with nothing exported — the no-op path measured at ~0.00s added.
+: > "$HRQ_TOOL_OUT"
+( cd "$R4q" && \
+  env -u ANTHROPIC_BASE_URL \
+  HOME="$WORK/fakehome" HEIMDALL_HOME="$WORK/fakehome/.heimdall" \
+  PATH="$HRQ/toolbin:$PATH" \
+  HMD_TOOL_OUT="$HRQ_TOOL_OUT" \
+  HEIMDALL_NO_INTRO=1 \
+  perl -e 'alarm 30; exec @ARGV or exit 127' -- "$SHIMQ" --version ) >/dev/null 2>&1
+grep -q "ABURL: unset" "$HRQ_TOOL_OUT" 2>/dev/null \
+  && ok "4s headroom-absent stays fail-open through the shim (no export, tool still runs)" \
+  || bad "4s the absent-module case broke or wrongly exported a base URL" "$(cat "$HRQ_TOOL_OUT" 2>/dev/null)"
+
 # ══════════════════════════════════════════════════════════════════════════════
 # 5. DEFAULT RESOLUTION — config → detection → asked once, remembered.
 # ══════════════════════════════════════════════════════════════════════════════
