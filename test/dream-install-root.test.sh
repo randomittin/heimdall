@@ -135,11 +135,24 @@ else
   bad "(1) ProgramArguments[0] is '$PA0_1' — missing or not executable"
 fi
 
+# ProgramArguments[1] is the staged RUNNER — [0] is the INTERPRETER that execs it (a
+# private hmd-dream identity when the bundle tool is available, or an honest /bin/bash
+# fallback otherwise; see test/dream-tcc-resilience.test.sh section 7 for that check).
+# This fixture tree stages no bundle tool, so [0] is expected to be the /bin/bash
+# fallback here — the runner at [1] is OUR OWN staged artifact and what this section
+# about install-tree placement actually cares about.
+PA1_1="$(plutil -extract ProgramArguments.1 raw -o - "$PLIST1" 2>/dev/null || true)"
+if [ -n "$PA1_1" ] && [ -x "$PA1_1" ]; then
+  ok "(1) ProgramArguments[1] ($PA1_1) — the staged runner — exists and is executable"
+else
+  bad "(1) ProgramArguments[1] is '$PA1_1' — missing or not executable"
+fi
+
 # The staged runner must live under $HEIMDALL_HOME, which `hmd uninstall` sweeps
 # wholesale. An artifact outside it would outlive the uninstall.
-case "$PA0_1" in
-  "$PLUGIN1"/*) ok "(1) the scheduled program lives under \$HEIMDALL_HOME (uninstall sweeps it)" ;;
-  *) bad "(1) the scheduled program '$PA0_1' is outside \$HEIMDALL_HOME — uninstall would orphan it" ;;
+case "$PA1_1" in
+  "$PLUGIN1"/*) ok "(1) the staged runner lives under \$HEIMDALL_HOME (uninstall sweeps it)" ;;
+  *) bad "(1) the staged runner '$PA1_1' is outside \$HEIMDALL_HOME — uninstall would orphan it" ;;
 esac
 
 if grep -q 'load' "$LC1" 2>/dev/null; then
@@ -160,7 +173,7 @@ else
   bad "(2) \$HEIMDALL_HOME is 0$M_HOME, expected 0700"
 fi
 
-M_RUNNER="$(mode_of "$PA0_1")"
+M_RUNNER="$(mode_of "$PA1_1")"
 if [ "$M_RUNNER" = "755" ]; then
   ok "(2) the staged runner is 0755"
 else
@@ -268,12 +281,12 @@ fi
 
 # ══ (4) THE INTERPRETER IS PINNED, NOT RESOLVED THROUGH $PATH ════════════════════
 
-PY_PIN="$(plutil -extract ProgramArguments.6 raw -o - "$PLIST1" 2>/dev/null || true)"
-PY_FLAG="$(plutil -extract ProgramArguments.5 raw -o - "$PLIST1" 2>/dev/null || true)"
+PY_PIN="$(plutil -extract ProgramArguments.9 raw -o - "$PLIST1" 2>/dev/null || true)"
+PY_FLAG="$(plutil -extract ProgramArguments.8 raw -o - "$PLIST1" 2>/dev/null || true)"
 if [ "$PY_FLAG" = "--python" ] && [ -n "$PY_PIN" ]; then
   ok "(4) the plist pins an interpreter (--python)"
 else
-  bad "(4) no --python pin in the plist (arg5='$PY_FLAG' arg6='$PY_PIN')"
+  bad "(4) no --python pin in the plist (arg8='$PY_FLAG' arg9='$PY_PIN')"
 fi
 
 case "$PY_PIN" in
@@ -295,19 +308,25 @@ else
   bad "(4) the pinned interpreter does not run under a launchd-like env"
 fi
 
-# BACK-COMPAT: status' silent-death detector reads ProgramArguments.0 (runner) and .2
-# (dream). Inserting the pin must not shift those, or a stale-path job stops being
-# detected — narrowing a guard while adding a feature is how the last outage survived.
-PA2_1="$(plutil -extract ProgramArguments.2 raw -o - "$PLIST1" 2>/dev/null || true)"
-if [ "$PA2_1" = "$PLUGIN1/bin/heimdall-dream" ]; then
-  ok "(4) ProgramArguments[2] is still the dream bin (status' stale detector unbroken)"
+# BACK-COMPAT: status' silent-death detector reads ProgramArguments.0 (the interpreter,
+# generically — see registered_command) and ProgramArguments.1 (the runner — see
+# registered_runner, added for exactly this reason). registered_dream trusts no fixed
+# index at all: it scans for its own --dream flag (plist_flag_value --dream) so a later
+# argument insertion — like the --interpreter/--python pins added here — can never
+# again blind it the way a fixed ProgramArguments.2 once would have. This just proves
+# the dream path is still genuinely present in the plist for that scan to find.
+if grep -q "<string>$PLUGIN1/bin/heimdall-dream</string>" "$PLIST1"; then
+  ok "(4) the dream bin is still encoded in the plist (registered_dream scans by flag, not index)"
 else
-  bad "(4) ProgramArguments[2] is '$PA2_1' — the pin shifted the argv indices"
+  bad "(4) the plist no longer encodes the dream bin path $PLUGIN1/bin/heimdall-dream"
 fi
 
 # ══ (5) THE RUNNER HONORS THE PIN, AND NEVER EXITS 0 WITHOUT ONE ═════════════════
 
-STAGED="$PA0_1"
+# ProgramArguments[1] — the runner. (Same object (1)/(2) already proved exists, is
+# executable, 0755, and lives under $HEIMDALL_HOME; here it is actually invoked with
+# runner CLI flags — ProgramArguments[0], the interpreter, understands none of them.)
+STAGED="$PA1_1"
 
 # 5a. A pinned interpreter that does not exist must be a LOUD, recorded failure.
 S5="$WORK/s5.json"
