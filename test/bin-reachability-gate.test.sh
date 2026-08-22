@@ -405,7 +405,7 @@ fi
 CLASS_SANDBOX="$(mktemp -d "${TMPDIR:-/tmp}/hmd-reach-class-XXXXXX")"
 mkdir -p "$CLASS_SANDBOX/bin" "$CLASS_SANDBOX/hooks" "$CLASS_SANDBOX/commands" "$CLASS_SANDBOX/agents"
 printf '#!/bin/sh\nexit 0\n' > "$CLASS_SANDBOX/bin/hook-direct"
-printf '#!/bin/sh\n# runs bin/human-direct as part of setup\n# also runs bin/dual-path directly from this very seed, one hop out\nexit 0\n' > "$CLASS_SANDBOX/install.sh"
+printf '#!/bin/sh\nbin/human-direct --setup\nbin/dual-path --setup\nexit 0\n' > "$CLASS_SANDBOX/install.sh"
 printf '#!/bin/sh\nexit 0\n' > "$CLASS_SANDBOX/bin/human-direct"
 printf '#!/bin/sh\nexit 0\n' > "$CLASS_SANDBOX/bin/prose-direct"
 printf '#!/bin/sh\nexit 0\n' > "$CLASS_SANDBOX/bin/nobody-calls"
