@@ -457,8 +457,12 @@ proj_root, ledger_path, tokens_bin, json_out = sys.argv[1:5]
 
 mod = None
 try:
-    import importlib.util
-    spec = importlib.util.spec_from_file_location("heimdall_tokens_lib", tokens_bin)
+    import importlib.util, importlib.machinery
+    # heimdall-tokens has no .py suffix, so the no-loader form of
+    # spec_from_file_location cannot guess a loader from the extension and
+    # silently returns None (no exception) -- pass one explicitly.
+    _loader = importlib.machinery.SourceFileLoader("heimdall_tokens_lib", tokens_bin)
+    spec = importlib.util.spec_from_file_location("heimdall_tokens_lib", tokens_bin, loader=_loader)
     if spec and spec.loader:
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
@@ -469,7 +473,7 @@ def emit(state, **fields):
     if json_out == "1":
         rec = {"state": state}
         rec.update(fields)
-        print(json.dumps(rec))
+        print(json.dumps(rec, separators=(",", ":")))
     else:
         reason = fields.get("reason")
         if reason:
@@ -529,7 +533,7 @@ result = {
 if json_out == "1":
     out = {"state": "OK"}
     out.update(result)
-    print(json.dumps(out))
+    print(json.dumps(out, separators=(",", ":")))
 else:
     def pct(x):
         return ("%.6f%%" % (x * 100)) if isinstance(x, (int, float)) else "n/a"
