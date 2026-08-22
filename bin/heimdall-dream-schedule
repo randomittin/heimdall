@@ -542,11 +542,14 @@ write_plist() {
   <string>$LABEL</string>
   <key>ProgramArguments</key>
   <array>
+    <string>$e_interp</string>
     <string>$e_runner</string>
     <string>--dream</string>
     <string>$e_dream</string>
     <string>--repo</string>
     <string>$e_repo</string>
+    <string>--interpreter</string>
+    <string>$e_interp</string>
 $py_block    <string>run</string>
     <string>--overnight</string>
   </array>
@@ -616,19 +619,51 @@ registered_command() {
   printf '%s' "$out"
 }
 
-# TWO PINNED PATHS, TWO WAYS TO DIE SILENTLY.
-# Splitting the clock from the runner gave the plist a second path that must exist:
-# ProgramArguments[0] is the staged runner, and the --dream target it execs is a
-# SEPARATE path inside the repo. Either one vanishing produces the same registered-but-
-# dead job the detector above exists to catch, so both are checked. Watching only
-# ProgramArguments[0] would have quietly narrowed the guard at the exact moment it
-# gained a second thing to guard — the failure mode this file keeps re-learning.
-registered_dream() {
+# plist_program_args — the full ProgramArguments array, one value per line, via the SAME
+# per-index plutil primitive registered_command uses above. There is no jq or other JSON
+# parser to lean on here, and plutil has no "give me the array as lines" mode, so this
+# walks indices until the first one fails to extract — which is exactly where the array
+# ends. `while v="$(plutil ...)"` as the loop CONDITION is deliberate: under
+# `set -euo pipefail` a condition position is always exempt from -e, so the loop's own
+# termination is what ends it, never a script-ending failure.
+plist_program_args() {
+  [ -f "$PLIST" ] || return 0
+  command -v plutil >/dev/null 2>&1 || return 0
+  local i=0 v
+  while v="$(plutil -extract "ProgramArguments.$i" raw -o - "$PLIST" 2>/dev/null)"; do
+    printf '%s\n' "$v"
+    i=$((i+1))
+  done
+}
+
+# plist_flag_value <flag> — the value immediately following <flag> in ProgramArguments.
+# Empty if the flag is absent or is the array's last element.
+plist_flag_value() {
+  local flag="$1" prev="" line
+  while IFS= read -r line; do
+    [ "$prev" = "$flag" ] && { printf '%s' "$line"; return 0; }
+    prev="$line"
+  done < <(plist_program_args)
+}
+
+# THREE PINNED PATHS NOW, THREE WAYS TO DIE SILENTLY.
+# ProgramArguments[0] is the interpreter (registered_command, above — the hmd-dream
+# bundle or a /bin/bash fallback), [1] is the staged runner, and the --dream target it
+# execs is a further, separate path inside the repo. Any one vanishing produces the same
+# registered-but-dead job the detector below exists to catch, so all three are checked.
+# registered_dream scans for its own `--dream` flag rather than trusting a fixed index —
+# a later argument insertion shifting positions must never again blind this the way a
+# fixed ProgramArguments.2 once would have.
+registered_runner() {
   local out
   [ -f "$PLIST" ] || return 0
   command -v plutil >/dev/null 2>&1 || return 0
-  out="$(plutil -extract ProgramArguments.2 raw -o - "$PLIST" 2>/dev/null)" || return 0
+  out="$(plutil -extract ProgramArguments.1 raw -o - "$PLIST" 2>/dev/null)" || return 0
   printf '%s' "$out"
+}
+
+registered_dream() {
+  plist_flag_value --dream
 }
 
 # Minimal JSON string escaping for a value that comes from OUTSIDE this script (the
@@ -722,6 +757,11 @@ cmd_uninstall() {
      && ! same_physical_file "$LIVENESS_SRC" "$LIVENESS"; then
     rm -f "$LIVENESS" 2>/dev/null || true
   fi
+  # The hmd-dream bundle and its recorded identity are always GENERATED, never a file the
+  # user placed — unlike the runner/liveness copies above there is no same_physical_file
+  # case to protect, so uninstall always removes both outright.
+  rm -rf "$BUNDLE_APP" 2>/dev/null || true
+  rm -f "$IDENT_FILE" 2>/dev/null || true
   # Reversibility extends to the ask: uninstall drops the marker recording that the
   # first-run permission block was shown, so a later re-install asks again from scratch.
   # `uninstall` is the documented undo, and an undo that leaves state behind is a leak.
@@ -735,27 +775,31 @@ cmd_uninstall() {
 }
 
 cmd_status() {
-  local installed loaded regcmd regdream stale stale_path
+  local installed loaded regcmd regrunner regdream stale stale_path
   [ -f "$PLIST" ] && installed=true || installed=false
   if is_loaded; then loaded=true; else loaded=false; fi
   # A job pinned to a path that no longer exists is REGISTERED but DEAD: launchd will
   # keep listing it and will keep never running it. Surface that as its own state.
-  # Both pinned paths are checked — the staged runner AND the dream bin it execs.
+  # Three pinned paths are checked — the interpreter, the staged runner, and the dream
+  # bin it execs.
   regcmd="$(registered_command)"
+  regrunner="$(registered_runner)"
   regdream="$(registered_dream)"
   stale=false
   stale_path=""
   if [ "$installed" = true ]; then
     if [ -n "$regcmd" ] && [ ! -x "$regcmd" ]; then
       stale=true; stale_path="$regcmd"
+    elif [ -n "$regrunner" ] && [ ! -x "$regrunner" ]; then
+      stale=true; stale_path="$regrunner"
     elif [ -n "$regdream" ] && [ ! -x "$regdream" ]; then
       stale=true; stale_path="$regdream"
     fi
   fi
   if [ "$JSON" = 1 ]; then
-    printf '{"installed":%s,"loaded":%s,"stale":%s,"label":"%s","plist":"%s","registered_command":"%s","registered_dream":"%s","stale_path":"%s","command":"%s --repo %s run --overnight","log":"%s"}\n' \
+    printf '{"installed":%s,"loaded":%s,"stale":%s,"label":"%s","plist":"%s","registered_command":"%s","registered_runner":"%s","registered_dream":"%s","stale_path":"%s","command":"%s --repo %s run --overnight","log":"%s"}\n' \
       "$installed" "$loaded" "$stale" "$LABEL" "$PLIST" "$(json_escape "$regcmd")" \
-      "$(json_escape "$regdream")" "$(json_escape "$stale_path")" "$DREAM" "$REPO" "$LOG"
+      "$(json_escape "$regrunner")" "$(json_escape "$regdream")" "$(json_escape "$stale_path")" "$DREAM" "$REPO" "$LOG"
   else
     if [ "$stale" = true ]; then
       echo "$LABEL: registered but DEAD — its command no longer exists"
