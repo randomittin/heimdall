@@ -2495,6 +2495,30 @@ case "${1:-}" in
     fi
     exec "$REDUM_BIN" "$@"
     ;;
+  authenticity-check)
+    # Pass-through to bin/authenticity-check: publisher-trust scoring (0-100)
+    # for an npm package, GitHub repo, or installed Claude Code plugin.
+    # PARITY.md records this as "kept" from superx, and
+    # skills/heimdall/SKILL.md tells agents to run it before recommending an
+    # external package — but heimdall-deadcode classified it PROSE-ONLY: its
+    # only caller was that SKILL.md sentence, which names the command but
+    # invokes nothing. Before this arm existed, `hmd authenticity-check` fell
+    # through to the goal-driven task prompt below instead of dispatching —
+    # the same gap `report)`/`check)`/`redum)` above exist to close. Verified
+    # end-to-end 2026-08-22 against real, live data: `npm chalk` and `github
+    # cli/cli` both returned correctly scored JSON from the real npm registry
+    # and GitHub API, so this is working functionality that lacked a path, not
+    # scaffolding. All args forward verbatim, so a routed run and a direct bin
+    # run are byte-identical.
+    shift
+    AUTHENTICITY_CHECK_BIN="$PLUGIN_DIR/bin/authenticity-check"
+    if [ ! -x "$AUTHENTICITY_CHECK_BIN" ]; then
+      echo "  Error: authenticity-check not found at $AUTHENTICITY_CHECK_BIN" >&2
+      echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+      exit 1
+    fi
+    exec "$AUTHENTICITY_CHECK_BIN" "$@"
+    ;;
   wrap|unwrap)
     # §7 Pass-through to heimdall-wrap: ONE command that installs the Layer-0 git
     # hooks, writes the AGENTS.md fenced block, starts presence and launches the
@@ -2942,6 +2966,7 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   echo "  heimdall weekly-log       Weekly changelog draft generator (drafts only)"
   echo "  heimdall sla              Audit ⚠-class observations against the 24h verdict SLA"
   echo "  heimdall report-issue     File a GitHub issue against the heimdall plugin repo"
+  echo "  heimdall authenticity-check <npm|github|plugin> <id>  Publisher trust score 0-100"
   echo ""
   echo "heimdall launches Claude Code with:"
   echo "  --dangerously-skip-permissions    full autonomy"
