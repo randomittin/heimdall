@@ -75,6 +75,11 @@
 #   reach_exempt_audit ROOT WORKDIR   rot findings against the exemption registry.
 #   reach_exempt_reason ROOT NAME     the recorded reason for an exemption.
 #   reach_exempt_valid ROOT NAME      0 iff exempt AND well-formed AND not past recheck.
+#   reach_build_class WORKDIR    second closure over non-*.md edges only (needs reach_build first).
+#   reach_hop_class REFERRER     LIVE / REACHABLE / PROSE-ONLY for one referrer path (pure).
+#   reach_class WORKDIR NAME     the overall class for bin/NAME; empty/rc1 if dead.
+#   reach_chain_classified W N   reach_chain's receipt, each hop tagged with its class.
+#   reach_classify_all WORKDIR   "name<TAB>CLASS" for every live subject.
 
 # DECLARATION SURFACES. A file that NAMES a program without invoking it must never confer
 # liveness on it, or the graph bootstraps corpses into life. Two exist:
@@ -346,5 +351,193 @@ reach_unacknowledged() {
     [ -n "$name" ] || continue
     reach_exempt_valid "$root" "$name" || printf '%s\n' "$name"
   done < "$w/dead"
+  return 0
+}
+
+# ── CALLER CLASS: what KIND of thing is doing the naming ──────────────────────────
+#
+# reach_is_live / reach_dead answer "is there a path from a live entry point at all".
+# That question stays exactly as strict as it has always been — nothing below loosens
+# it, weakens RULE B, or changes one bit of reach_build's own output.
+#
+# But "reachable" was always hiding a second question: reachable BY WHAT? A hop through
+# hooks/hooks.json fires on every matching tool call with no one in the loop. A hop
+# through a real script is deterministic once triggered, but something — a human, a
+# dispatcher — had to trigger it on purpose. A hop through a *.md file is neither: it is
+# a sentence an LLM may or may not have read, may or may not act on, today or never.
+# Three different kinds of evidence were being reported as one word, "REACHABLE", and
+# the gap between them is exactly the gap the 2026-08-22 capability census measured: 51
+# of 177 bin/ executables never fired across 384 real sessions while this engine called
+# every one of them clean.
+#
+#   LIVE         the referrer is hooks/hooks.json or .mcp.json — the harness or an MCP
+#                client executes this registration automatically. No judgment call
+#                sits between "the file says so" and "it runs".
+#   REACHABLE    the referrer is any other non-Markdown file — a real script, a real
+#                dispatch arm, a real config line. Deterministic once triggered, but
+#                the trigger is a deliberate act: a human types `hmd foo`, one script
+#                execs another.
+#   PROSE-ONLY   the referrer is a *.md file, anywhere. An agent had to read that
+#                sentence and choose to act on it. That choice is not automatic and is
+#                not guaranteed, however confidently the sentence reads.
+#
+# THE SHORTEST PATH IS NOT THE STRONGEST PATH. reach_build's BFS records exactly one
+# parent per node — whichever predecessor reaches it in the FEWEST hops — because the
+# only question it was ever asked is binary reachability, where shortest-vs-longest is
+# irrelevant. That is the wrong chain to grade for evidence quality: in this very tree,
+# bin/heimdall-brief is named directly by agents/heimdall.md (one hop from a seed) AND,
+# two hops out, by a real, hook-fired path (hooks/hooks.json -> heimdall-precheck-agent
+# -> heimdall-brief). The one-hop prose mention is shorter, so reach_chain reports IT —
+# and classifying that chain verbatim would report a genuinely hook-wired tool as
+# prose-summoned. That is a worse failure than the one this feature exists to catch:
+# confidently wrong beats merely generous. So classification prefers ANY all-code path
+# over EVERY path that needs a Markdown hop, no matter how many hops shorter the prose
+# path is — see reach_build_class below.
+#
+# PROSE-ONLY IS ABSORBING; AN INTERMEDIATE REACHABLE HOP NEVER DILUTES A LIVE ROOT. A
+# path with zero Markdown hops inherits the strength of its ROOT: if hooks.json or
+# .mcp.json sits at the far end, everything downstream is automatic once that root
+# fires, so the whole path reads LIVE even though some of its hops are individually
+# only REACHABLE-class. This is provably safe, not a weakest-link judgment call: the
+# only two referrers that ever classify LIVE (hooks/hooks.json, .mcp.json) are always
+# seeds, and a seed's own parent is fixed to "<entry-point>" the instant reach_build's
+# BFS starts — nothing can ever be an INTERMEDIATE hop after them. So "the path's root
+# is LIVE" and "no hop downstream needs a Markdown mention" are the only two things
+# reach_class has to check.
+#
+# NOT A HARD GATE (YET). PROSE-ONLY is reported, tallied, and shown — it does not fail
+# bin-reachability-gate and does not flip a verdict from CLEAN to ROT. 51 bins would go
+# red in one commit and the gate would be disabled within a day. Absorbing this into the
+# exemption registry is a follow-up, not this change.
+
+# reach_build_class WORKDIR — a SECOND closure over the SAME scan, restricted to edges
+# whose REFERRER is not a *.md file. Requires reach_build to have already written
+# WORKDIR/{nodes,seeds,edges}; reads them, never re-scans the tree. A node reachable
+# here is reachable without ever having to trust a sentence — a strictly stronger claim
+# than plain reachability, so this closure is always a subset of reach_build's. Because
+# the underlying BFS still explores every node reachable via the allowed edges (not
+# merely one path), "in this closure at all" is a sound test for "some all-code path
+# exists" — not just "the one path found happens to avoid prose". Writes
+# WORKDIR/{edges-code,live-code,live-code-paths}.
+reach_build_class() {
+  local w="$1"
+  LC_ALL=C awk -F'\t' '$1 !~ /\.md$/ { print }' "$w/edges" > "$w/edges-code" 2>/dev/null
+
+  LC_ALL=C awk -v nodesf="$w/nodes" -v seedsf="$w/seeds" -v edgesf="$w/edges-code" '
+    BEGIN {
+      while ((getline l < nodesf) > 0) {
+        split(l, a, "\t")
+        n2p[a[1]] = ((a[1] in n2p) ? n2p[a[1]] " " : "") a[2]
+        base[a[2]] = a[1]
+      }
+      while ((getline s < seedsf) > 0)
+        if (!(s in live)) { live[s] = 1; par[s] = "<entry-point>"; q[++qn] = s }
+      while ((getline e < edgesf) > 0) {
+        split(e, b, "\t")
+        ed[b[1]] = ((b[1] in ed) ? ed[b[1]] " " : "") b[2]
+      }
+      h = 0
+      while (h < qn) {
+        p = q[++h]
+        if (!(p in ed)) continue
+        m = split(ed[p], t, " ")
+        for (j = 1; j <= m; j++) {
+          if (t[j] == base[p]) continue
+          k = split(n2p[t[j]], tp, " ")
+          for (z = 1; z <= k; z++) {
+            tg = tp[z]
+            if (tg == p || (tg in live)) continue
+            live[tg] = 1; par[tg] = p; q[++qn] = tg
+          }
+        }
+      }
+      for (p in live) printf "%s\t%s\n", p, par[p]
+    }' < /dev/null > "$w/live-code"
+
+  cut -f1 "$w/live-code" | LC_ALL=C sort -u > "$w/live-code-paths"
+  return 0
+}
+
+# reach_hop_class REFERRER — the evidentiary weight of ONE hop, from what KIND of file
+# is doing the naming, never from what it says.
+reach_hop_class() {
+  case "$1" in
+    hooks/hooks.json|.mcp.json) printf 'LIVE\n' ;;
+    *.md)                       printf 'PROSE-ONLY\n' ;;
+    *)                          printf 'REACHABLE\n' ;;
+  esac
+}
+
+# reach_chain_root WORKDIR MAPFILE PATH — walk MAPFILE's ("live" or "live-code", same
+# two-column shape) parent links from PATH back to the seed that roots it: the path
+# just before the "<entry-point>" sentinel.
+reach_chain_root() {
+  local w="$1" map="$2" cur="$3" par guard=0
+  while [ "$guard" -lt 64 ]; do
+    guard=$((guard + 1))
+    par="$(LC_ALL=C awk -F'\t' -v p="$cur" '$1 == p { print $2; exit }' "$w/$map")"
+    [ -n "$par" ] && [ "$par" != "<entry-point>" ] || { printf '%s\n' "$cur"; return 0; }
+    cur="$par"
+  done
+  printf '%s\n' "$cur"
+}
+
+# reach_class WORKDIR NAME — LIVE, REACHABLE, or PROSE-ONLY for bin/NAME. rc 1 with no
+# output if bin/NAME is dead. Requires reach_build_class to have already run.
+reach_class() {
+  local w="$1" name="$2" path="bin/$2" root
+  if LC_ALL=C grep -qxF "$path" "$w/live-code-paths" 2>/dev/null; then
+    root="$(reach_chain_root "$w" "live-code" "$path")"
+    case "$root" in
+      hooks/hooks.json|.mcp.json) printf 'LIVE\n' ;;
+      *)                          printf 'REACHABLE\n' ;;
+    esac
+    return 0
+  fi
+  if reach_is_live "$w" "$name"; then
+    printf 'PROSE-ONLY\n'
+    return 0
+  fi
+  return 1
+}
+
+# reach_chain_classified WORKDIR NAME — reach_chain's receipt, each hop tagged with its
+# reach_hop_class. Shows the code-only chain (see reach_build_class) when one exists —
+# so a hook-wired tool shows its real wiring rather than a shorter prose mention that
+# also happens to name it — and falls back to the ordinary transitive chain, which
+# necessarily carries at least one Markdown hop, only when no code-only path exists.
+reach_chain_classified() {
+  local w="$1" name="$2" cur="bin/$2" out="" par cur_cls="" map guard=0
+  if LC_ALL=C grep -qxF "$cur" "$w/live-code-paths" 2>/dev/null; then
+    map="live-code"
+  elif reach_is_live "$w" "$name"; then
+    map="live"
+  else
+    printf 'no path to any live entry point\n'
+    return 1
+  fi
+  while [ "$guard" -lt 64 ]; do
+    guard=$((guard + 1))
+    if [ -n "$cur_cls" ]; then out="${out}${cur} [${cur_cls}]"; else out="${out}${cur}"; fi
+    par="$(LC_ALL=C awk -F'\t' -v p="$cur" '$1 == p { print $2; exit }' "$w/$map")"
+    [ -n "$par" ] || break
+    out="${out} <- "
+    if [ "$par" = "<entry-point>" ]; then out="${out}<entry-point>"; break; fi
+    cur_cls="$(reach_hop_class "$par")"
+    cur="$par"
+  done
+  printf '%s\n' "$out"
+}
+
+# reach_classify_all WORKDIR — "name<TAB>CLASS" for every live subject (dead ones are
+# reach_dead's concern, unchanged: a class answers "how good is the evidence", and a
+# dead name has none). Requires reach_build_class to have already run.
+reach_classify_all() {
+  local w="$1" name cls
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    cls="$(reach_class "$w" "$name")" || continue
+    printf '%s\t%s\n' "$name" "$cls"
+  done < "$w/subjects"
   return 0
 }
