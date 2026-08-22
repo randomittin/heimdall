@@ -34,6 +34,14 @@
 #   heimdall-issue-queue release --id ID
 #       Return an in_flight id to the queued pool (the honest retry path).
 #
+#   heimdall-issue-queue route --id ID [--teammates @file|JSON] [--now EPOCH] [--ttl SECONDS]
+#       SUGGEST-ONLY: print ranked candidate owners for an already-known issue.
+#       Read-only — never claims, assigns, or mutates the queue; a human confirms
+#       the pick. --teammates is a roster (@path or inline JSON array) of
+#       {haid, human, files_touched, ts}; --now (epoch seconds) / --ttl (seconds)
+#       pin the ONLINE decision for a deterministic suggestion in tests. Prints
+#       { id, assigned: false, suggestions }.
+#
 # Store: ${HEIMDALL_HOME:-<repo>/.heimdall}/issues/queue.json, written atomically
 # (.tmp -> os.replace, sorted keys). --config is inline JSON or @path-to-file and
 # supplies the prioritization weights + per-source priority (dossier §3/§7).
@@ -48,7 +56,7 @@ SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 BINDIR="$(dirname "$SELF")"
 QUEUE_LIB="$BINDIR/lib/issue_queue.py"
 
-usage() { sed -n '2,44p' "$SELF" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,52p' "$SELF" | sed 's/^# \{0,1\}//'; }
 
 PY="$(command -v python3 || command -v python || true)"
 if [ -z "$PY" ]; then

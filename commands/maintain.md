@@ -14,22 +14,39 @@ Two-phase maintenance: **seek** then **fix**.
 `/hmd:maintain fix` — only fix existing issues
 `/hmd:maintain auto` — schedule recurring via /schedule
 
-## Connectors — GitHub issues are the DEFAULT trigger
+## This pipeline vs the engine-driven autopilot
 
-The queue is connector-fed. **GitHub issues are the default connector and trigger**:
-`issue_queue` already normalizes them into the queue that the fixer drains. Every
-other source is an *additional* connector that files issues into the SAME queue —
-they do not replace GitHub issues, they feed alongside them:
+This file describes the **prose** seek/fix pipeline: two agents (seeker, fixer)
+making direct `gh` CLI calls. It does **not** use `bin/heimdall-issue-queue` or
+`bin/lib/connectors/` — the seeker files issues straight to GitHub with `gh issue
+create`, and the fixer lists them straight back with `gh issue list --label bug
+--state open`. The shared `bug` label is the only "queue": whatever carries it is
+in scope for the next fixer pass, oldest first.
 
-- **GitHub issues** (default) — a human or a bot opens an issue; it is normalized
-  and picked by the loop. This is the primary path.
-- **k8s / gcloud / Sentry logs** (additional) — the seeker pulls logs, finds
-  errors, and FILES them as issues into the same queue (labeled `bug,seeker`).
-  The log-based seeker is one pluggable connector, not the only entry point.
+A **separate**, engine-driven autopilot (`/hmd:maintain-check`, backed by
+`bin/heimdall-maintain-loop` → `bin/heimdall-issue-loop`) uses the real
+normalized, prioritized, multi-source queue (`bin/heimdall-issue-queue`, piece b
+of the issue-resolution-loop design) — but its own GitHub sync
+(`sync_queue_from_github` in `bin/lib/maintain_loop.py`) talks to `gh` directly
+too, filtered on label `maintainer`, not `bug,seeker`. **A seeker-filed issue is
+not automatically picked up by that engine** — see `commands/maintain-check.md`
+for the gap and the manual workaround. The two pipelines are independent; running
+this one does not feed the other.
 
-Connectors stay pluggable: adding or removing a log source never orphans the
-others, and the fixer path downstream is identical regardless of which connector
-filed the issue.
+## Connectors — pluggable, but not in THIS pipeline
+
+`bin/lib/connectors/` (github/slack/email/corpus) + `bin/heimdall-issue-queue`
+are real and working — proven by direct execution, not just by reading the
+source — but they back the *engine* autopilot above, not the prose pipeline in
+this file. To feed a non-GitHub source into that engine's queue by hand:
+
+```bash
+heimdall-connector fetch <source> --config issue-loop.config.json > raw.json
+heimdall-issue-queue ingest --source <source> --raw @raw.json
+```
+
+Any configured, credentialed source (slack, email, corpus) works this way; an
+unconfigured one degrades to `fetch` returning `[]`, never a crash.
 
 ## Phase 1: Seek
 
@@ -43,8 +60,9 @@ Spawn a **seeker agent** (the log-based connector) to:
 ## Phase 2: Fix
 
 Spawn a **fixer agent** to:
-1. Pick open issues from the queue (default connector: `gh issue list --label bug
-   --state open`, normalized by `issue_queue`).
+1. Pick open issues directly from GitHub: `gh issue list --label bug --state
+   open` (no `issue_queue` involved — see "This pipeline vs the engine-driven
+   autopilot" above).
 2. For each issue (oldest first):
    - Create a `heimdall/*` fix branch from main
    - Implement the minimal fix

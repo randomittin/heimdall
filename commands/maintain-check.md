@@ -116,6 +116,35 @@ heimdall-maintain-loop heartbeat --repo .
 If Slack skills are available and the user has opted in, post the heartbeat to the
 configured channel.
 
+## Issue Sources — what actually reaches this engine
+
+The queue this engine drains (`bin/heimdall-issue-queue`) is fed by
+`sync_queue_from_github()` (`bin/lib/maintain_loop.py`), which lists GitHub
+issues labeled **`maintainer`** and normalizes them via `bin/lib/issue_queue.py`.
+It talks to `gh` directly with its own bot-token auth — it does **not** go
+through `bin/lib/connectors/` or `bin/heimdall-issue-config`, even for GitHub.
+
+**Not implemented: automatic ingestion of seeker-filed issues.** `/hmd:maintain`'s
+seeker agent (`agents/seeker.md`) files issues labeled `bug,seeker` — a different
+label than the `maintainer` label this engine's sync filters on. An issue the
+seeker just filed is invisible to the next `/hmd:maintain-check` cycle until a
+human (or the seeker) also adds the `maintainer` label. The two maintenance
+mechanisms in this repo — this engine, and `commands/maintain.md`'s prose
+seek/fix pipeline — do not compose automatically today.
+
+To feed a **non-GitHub** source (slack, email, corpus) into this same queue by
+hand — verified end-to-end 2026-08-23 against synthetic local data, no network:
+
+```bash
+heimdall-issue-config validate --repo .   # sanity-check the config below first
+heimdall-connector fetch <source> --config issue-loop.config.json > raw.json
+heimdall-issue-queue ingest --source <source> --raw @raw.json
+```
+
+An item ingested this way is picked, prioritized, and fixed identically to a
+GitHub-sourced one — `bin/lib/issue_loop.py` only ever calls
+`issue_queue.IssueQueue(repo=repo).pick()`, agnostic to how an item arrived.
+
 ## Self-Improvement — run it yourself
 
 The maintainer can improve its OWN capability over time, not only fix issues. Run ONE bounded
