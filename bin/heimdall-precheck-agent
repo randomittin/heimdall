@@ -82,7 +82,7 @@ if [ "${HEIMDALL_ALLOW_NAMED_AGENT:-}" != "1" ]; then
     if [ "$NAMERC" -ne 0 ]; then
       printf '⚠️  BIFRÖST — Heimdall named-agent notice: the spawn payload could not be parsed, so a name: cannot be ruled out - warning rather than assuming this spawn is unnamed. %s\n' "$TAIL" >&2
     elif [ -n "$NAME" ]; then
-      printf '⚠️  BIFRÖST — Heimdall named-agent notice:name: was set on the spawn. %s\n' "$TAIL" >&2
+      printf '⚠️  BIFRÖST — Heimdall named-agent notice: name: was set on the spawn. %s\n' "$TAIL" >&2
     fi
   fi
 fi
