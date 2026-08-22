@@ -20,6 +20,8 @@ Every row is tagged **MEASURED** (I ran a command / counted real events) or **IN
 
 **Measurement corpus (MEASURED).** 384 session transcripts across 155 `~/.claude/projects/*heimdall*` directories, 42,296 JSONL records, ~430 MB. For each of the 177 `bin/` executables I counted: appearances inside a `Bash` tool-use `command` string (a real execution), appearances in hook/system feedback, and appearances anywhere else (prose, file reads, tool results). Script: `/private/tmp/claude-501/-Users-rj-Downloads-heimdall/01313446-ae34-4e0c-9f91-4ef0bd66593c/scratchpad/census.py`.
 
+**A second pass closed the obvious hole in that method.** Counting *bin names* would miss a binary invoked through its dispatcher arm (`hmd badge` never contains the string `heimdall-badge`). So I separately counted arm-form invocations — `(hmd|heimdall) <arm>` — across the same corpus (§9). Every orphan verdict below survived that control.
+
 **The one caveat that governs everything below.** "Appears in a Bash command" is an *upper bound* on production liveness — much of this corpus is hmd developing hmd, so an appearance may be an agent testing the tool rather than using it. Conversely, **zero appearances across 384 sessions is strong evidence of orphanhood**, and that is the direction this report leans on.
 
 ---
@@ -242,10 +244,69 @@ Small list — the repo is better here than the orphan count suggests, and today
 
 ---
 
+## 9. Dispatcher-arm usage — the control that confirms §2 (MEASURED)
+
+Counted `(hmd|heimdall) <arm>` occurrences inside real `Bash` tool-use command strings across all 384 transcripts. **23 of 40 arms have never been typed once.**
+
+| Arm | Invocations | Arm | Invocations |
+|---|---|---|---|
+| `route` | 19 | `tier` | 4 |
+| `modules` | 16 | `team` | 3 |
+| `wrap` | 16 | `dashboard` | 3 |
+| `god` | 10 | `init` | 3 |
+| `link` | 6 | `presence` | 2 |
+| `rules` | 6 | `context` | 1 |
+| `status` | 5 | `roster` | 1 |
+| `weekly-log` | 5 | `cursor-statusline` | 1 |
+| `chat` | 4 | | |
+
+**Zero-invocation arms (23):** `help demo rr sigil sigil-png guard uninstall invite join connect beat telemetry verdict badge metrics clip funnel watch report designmatch check redum unwrap`
+
+**Why this matters:** the arms backing every Tier-1/Tier-2 orphan in §2 — `badge`, `verdict`, `funnel`, `watch`, `report`, `redum`, `sigil-png`, `demo`, `check`, `designmatch` — are **all zero**. The orphan verdicts are therefore not an artifact of name-vs-arm counting. Both the binary and its only entry point are cold.
+
+**Single most alarming row: `demo` = 0 arm invocations, `heimdall-demo` = 1 direct invocation, across 384 sessions.** `hmd demo` is the headline next-step printed by `install.sh`'s post-install panel and the whole point of the `hmd:demo` skill ("the first-five-minutes wow"). The primary onboarding path for every new user is, empirically, almost completely unexercised. For a launch, this is the highest-priority item in this report: it is the one orphan a *new user* hits first.
+
+---
+
+## 10. `hmd --help` — the inverse problem (MEASURED)
+
+`bash bin/heimdall help` is clean on claims but very thin on coverage.
+
+- **All 13 advertised flags are genuinely handled** in `bin/heimdall`: `--resume --auto --no-goal --skip-checkpoint --no-autocommit --autocommit --skills --update --setup --team --reinstall --uninstall --help`. Zero CLAIMED-ONLY flags (MEASURED).
+- **All 8 advertised subcommands have real dispatcher arms**: `team invite join connect presence tier status weekly-log`. Zero CLAIMED-ONLY subcommands (MEASURED).
+- **But `--help` documents 8 of ~40 dispatcher arms (20%).** 32 working arms — including `god`, `route`, `modules`, `rules`, `wrap`, `dashboard`, `verdict`, `badge`, `watch`, `report`, `check`, `redum`, `funnel`, `clip`, `metrics` — are **undiscoverable from the CLI's own help**. Note that `route` (19), `modules` (16) and `wrap` (16) are among the *most-used* arms in the entire corpus and none appear in help.
+
+This is the mirror image of CLAIMED-ONLY: not overclaiming, but under-advertising working capability. It is a launch-docs defect rather than a code defect, and it partly explains the orphan rate — an arm nobody can discover is an arm nobody calls.
+
+---
+
+## 11. Surfaces that are genuinely clean (MEASURED)
+
+Recording these explicitly so the census is not read as uniformly negative.
+
+| Surface | Result |
+|---|---|
+| `hooks/hooks.json` → referenced paths | **38/38 resolve.** Zero dangling references. The only two non-executable entries are `bin/edit-tracker.c` and `bin/parallelism-tracker.c` — C *sources* named as compile inputs, not invocations |
+| `skills/` `SKILL.md` coverage | **5/5** present (`designmatch heimdall self-improve stacks system-health`) |
+| `skills/` + `commands/` + `agents/` → `heimdall-*` bin references | **Zero real dangling references.** Six apparent hits are regex artifacts (`heimdall-demo-app` is a repo directory; `heimdall-no-autocommit` is a flag) |
+| `--help` flags / subcommands | **21/21** backed by real code |
+| `install.sh` post-install panel claims | **4/4 exist**: `commands/save.md`, `commands/status.md`, `bin/heimdall-demo` (`hmd demo` arm at `bin/heimdall:1651`), `bin/heimdall-doctor-install` |
+| `bin/lib/reachability-exemptions.tsv` | 20 rows, all well-formed, in-date, and genuinely unreachable; gate §3c proves the registry is not a self-vouching reference surface. Honest design — the problem is what it *doesn't* cover, not what it says |
+
+
+---
+
 ## 8. Bottom line for launch
 
-1. **The reachability gate is not a liveness gate.** It clears 44 never-executed binaries as "reachable". Treat `heimdall-deadcode CLEAN` as *"no unreferenced files"*, never as *"no dead capability"*. This is the single most important correction for anyone reading the repo's own self-assessment.
-2. **~29% of `bin/` (51 of 177) has never executed once in 384 sessions.** Ten of those sit on the onboarding path (`heimdall-funnel`, `heimdall-face`, `heimdall-city`, `heimdall-frontdoor`, `report-issue`, `heimdall-feedback`).
-3. **7 of 16 agent definitions have never been spawned**, including both halves of the advertised `/hmd:maintain` loop and the entire `waves.json` executor.
-4. **Two documented quality gates are effectively unenforced** — lint (0 spawns) and review (4/432).
-5. **`heimdall-brief` is the template defect**: real code, green tests, instructed in prose, never invoked. A passing test proves the code works. It does not prove anything calls it. Four of today's nine known instances had exactly that shape.
+Ordered by what an owner should act on first.
+
+1. **`hmd demo` — the primary onboarding path — is empirically unexercised.** 0 arm invocations, 1 direct invocation, across 384 sessions, while `install.sh` prints it as *the* next step. Highest user-visible risk in the repo: it is the first thing a new user runs and the least-tested thing hmd ships. (§9)
+2. **The reachability gate is not a liveness gate.** `bin/heimdall-deadcode` clears 44 never-executed binaries as "reachable" because it computes transitive *reference* reachability. Its chains bottom out in Markdown prose, human-typed slash commands, and other cold binaries. Read `verdict CLEAN` as *"no unreferenced files"*, never as *"no dead capability"*. (§1)
+3. **~29% of `bin/` (51 of 177) has never executed once**, and 41 of those are unacknowledged by the exemption registry. Ten sit on the onboarding/trust path: `heimdall-funnel`, `heimdall-face`, `heimdall-city`, `heimdall-frontdoor`, `report-issue`, `heimdall-feedback`, `heimdall-badge`, `heimdall-verdict`, `heimdall-report`, `heimdall-sigil-png`. (§2)
+4. **23 of 40 dispatcher arms have never been typed** — and `--help` documents only 8 of them, omitting three of the four most-used arms (`route`, `modules`, `wrap`). Under-advertised capability is a partial *cause* of the orphan rate, not just a symptom. (§9, §10)
+5. **7 of 16 agent definitions have never been spawned** across 432 `Agent` calls, including both halves of the advertised `/hmd:maintain` loop (`seeker`, `fixer`) and the entire `waves.json` executor (`wave-executor`). (§3)
+6. **Two documented quality gates are effectively unenforced**: lint (`lint-quality` 0/432 spawns vs "Lint clean (zero warnings)") and review (`hmd:reviewer` 4/432 vs "Mandatory before any push"). (§3, §7)
+7. **`sysmon` still is not wired.** `grep -c sysmon hooks/hooks.json` → 0. It grades disk CRIT correctly and 44 measured invocations prove agents find it useful — it just never runs on its own. One `SessionStart` line would make it LIVE. (§4 #6)
+8. **`heimdall-brief` is the template defect and it is still inert.** Real code, green tests, instructed in the orchestrator prompt, zero invocations across the entire 08-08 → 08-21 production window. A passing test proves the code works; it does not prove anything calls it. Four of the nine known instances had exactly this shape, which is why the census weighted measured execution over reference reachability throughout. (§1, §4 #1)
+
+**What is genuinely clean** (§11): every hooks.json reference resolves, all 5 skills are discoverable, all 21 `--help` claims are backed by code, all 4 post-install panel claims exist, and the exemption registry is well-built and honest. The repo's problem is not broken claims — today's fixes closed the two worst of those. It is **cold capability**: a large, working, well-tested surface that nothing ever invokes.
