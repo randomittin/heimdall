@@ -2519,6 +2519,45 @@ case "${1:-}" in
     fi
     exec "$AUTHENTICITY_CHECK_BIN" "$@"
     ;;
+  queue)
+    # Pass-through to bin/heimdall-queue (LOCAL continuous-intake work queue:
+    # add/pick/complete/fail/reap/get/list/status/serve) with one carve-out:
+    # `hmd queue drain` routes to the DISTINCT drainer bin/heimdall-drain instead
+    # (heimdall-queue has no "drain" verb of its own — draining is a separate bin
+    # on purpose). bin/lib/reachability-exemptions.tsv records both as a
+    # "two-corpse chain" (heimdall-queue reachable only via heimdall-drain;
+    # heimdall-drain triggered by no cron/hook/dispatcher arm) — that dates from
+    # before this arm existed and is now stale on the "no path in" half; neither
+    # bin is dead code, though: test/gate-judgment-uncompressed.test.sh Case 6
+    # already names bin/heimdall-drain (with bin/falsify) as one of exactly two
+    # real gate clients that must resolve every verdict through hmd_gate_exec —
+    # load-bearing for that invariant regardless of operational trigger, per the
+    # "load-bearing for a gate: WIRE, never DELETE" rule. Verified end-to-end
+    # 2026-08-23 in a scratch HEIMDALL_HOME: add/pick/complete/get/reap on
+    # heimdall-queue, and a full drain cycle (seeded queue -> priority-ordered
+    # pick -> executed -> verdict resolved -> requeue-on-fail) on heimdall-drain,
+    # both against synthetic local data only — no network, no real task run.
+    # This arm gives both the graph-visible path they lacked, the same gap
+    # `report-issue)` / `redum)` / `authenticity-check)` above exist to close.
+    shift
+    if [ "${1:-}" = "drain" ]; then
+      shift
+      DRAIN_BIN="$PLUGIN_DIR/bin/heimdall-drain"
+      if [ ! -x "$DRAIN_BIN" ]; then
+        echo "  Error: heimdall-drain not found at $DRAIN_BIN" >&2
+        echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+        exit 1
+      fi
+      exec "$DRAIN_BIN" "$@"
+    fi
+    QUEUE_BIN="$PLUGIN_DIR/bin/heimdall-queue"
+    if [ ! -x "$QUEUE_BIN" ]; then
+      echo "  Error: heimdall-queue not found at $QUEUE_BIN" >&2
+      echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+      exit 1
+    fi
+    exec "$QUEUE_BIN" "$@"
+    ;;
   wrap|unwrap)
     # §7 Pass-through to heimdall-wrap: ONE command that installs the Layer-0 git
     # hooks, writes the AGENTS.md fenced block, starts presence and launches the
@@ -2967,6 +3006,8 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   echo "  heimdall sla              Audit ⚠-class observations against the 24h verdict SLA"
   echo "  heimdall report-issue     File a GitHub issue against the heimdall plugin repo"
   echo "  heimdall authenticity-check <npm|github|plugin> <id>  Publisher trust score 0-100"
+  echo "  heimdall queue <add|pick|complete|fail|reap|get|list|status|serve>  Local work queue"
+  echo "  heimdall queue drain [--forever|--drain-empty]  Drain the local work queue"
   echo ""
   echo "heimdall launches Claude Code with:"
   echo "  --dangerously-skip-permissions    full autonomy"
