@@ -264,9 +264,21 @@ rm -rf "$(dirname "$WS")"
 # byte-for-byte receipt of clip's output and any injected param breaks it.
 WS="$(mktemp -d)/repo"; seed_ws "$WS" 10
 JSON="$(cd "$WS" && "$BADGE" --json 2>/dev/null)"
-case "$JSON" in *'"endpoint":"https://runheimdall.dev/badge/'*'?ref=badge"'*)
-    ok "attribution: the badge endpoint carries ?ref=badge" ;;
-  *) bad "attribution: the badge endpoint carries no ref param" ;; esac
+# 2026-08-22 (0a4330a): the DEFAULT endpoint moved off the self-hosted path (404 in prod --
+# see bin/heimdall-badge's LIVE-ENDPOINT HONESTY comment) onto shields.io, a live third-party
+# host that never sees our ref param -- it doesn't route anywhere of ours, so tagging it would
+# be dead weight on a URL we don't control. The ref still rides the self-hosted form, now
+# opt-in via HEIMDALL_BADGE_ENDPOINT=self for once that path is actually served.
+case "$JSON" in *'"endpoint":"https://img.shields.io/badge/'*'"'*)
+    ok "attribution: the default endpoint is the live shields.io host" ;;
+  *) bad "attribution: the default endpoint is not the live shields.io host (got: $JSON)" ;; esac
+case "$JSON" in *'"endpoint":"https://runheimdall.dev'*)
+    bad "attribution: the default endpoint still points at the un-served self-host" ;;
+  *) ok "attribution: the default endpoint carries no dead self-host reference" ;; esac
+JSON_SELF="$(cd "$WS" && HEIMDALL_BADGE_ENDPOINT=self "$BADGE" --json 2>/dev/null)"
+case "$JSON_SELF" in *'"endpoint":"https://runheimdall.dev/badge/'*'?ref=badge"'*)
+    ok "attribution: opt-in self-host endpoint (HEIMDALL_BADGE_ENDPOINT=self) carries ?ref=badge" ;;
+  *) bad "attribution: opt-in self-host endpoint carries no ref param (got: $JSON_SELF)" ;; esac
 case "$JSON" in *'"backlink":"https://runheimdall.dev?ref=badge"'*)
     ok "attribution: the badge backlink carries ?ref=badge" ;;
   *) bad "attribution: the badge backlink carries no ref param" ;; esac
