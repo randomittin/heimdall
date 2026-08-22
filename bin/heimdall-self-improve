@@ -46,7 +46,10 @@
 #    "outcome":"pass"|"fail","retries":0,"wall_secs":42, ...}
 # (schema per agents/heimdall.md "Pattern Learning (SONA-inspired)").
 #
-# Exit status: 0 ok · 2 usage · 3 runtime (bad json / missing input) · 4 no-op (empty).
+# Exit status: 0 ok · 2 usage · 3 runtime (bad json / missing input) · 4 no-op (empty) ·
+#              5 policy refusal (routing override contradicts a stated model-routing
+#              policy — see _policy_violation() — with NO bypass flag, mirroring
+#              bin/heimdall-tier's EXIT_SECURITY_DOWNGRADE=5).
 
 import argparse
 import json
@@ -59,6 +62,29 @@ DEF_MIN_SAMPLES = 3          # min variant observations before a verdict is allo
 DEF_MIN_DELTA = 0.10         # required pass-rate improvement to KEEP (measured, not vibes)
 DEF_MAX_PASS_RATE = 0.80     # a task_type at/above this pass-rate is "healthy" — no hypo
 SCHEMA_VERSION = 1
+
+# ── whether ANYTHING mechanically consumes routing-overrides.json (it does not, yet) ──
+#
+# This loop computes and writes overrides; nothing in the actual model-selection path
+# (bin/heimdall-model-resolve, bin/heimdall-tier, and each agents/<name>.md's own
+# tier:/model: frontmatter) reads this file. That gap is deliberate for now: closing it
+# automatically would apply a routing change on days-old, low-volume data with no opt-in
+# and no visible review step, which is worse than the open loop it replaces. `status`
+# surfaces this HONESTLY — rather than letting "validated" be misread as "live" — so a
+# human reading `heimdall-self-improve status` is never misled about what a validated
+# override actually DOES.
+#
+# Flip MECHANICALLY_APPLIED to True ONLY when some real consumer exists AND that
+# consumer's own tests prove it reads this file — never flip it as a paperwork update.
+#   Re-verify with: grep -rl 'routing-overrides' bin/heimdall-model-resolve bin/heimdall-tier agents/*.md
+#   (should currently print NOTHING; last verified 2026-08-23)
+MECHANICALLY_APPLIED = False
+CONSUMPTION_NOTE = (
+    "Nothing in the model-selection path reads routing-overrides.json yet. A "
+    "'validated' override below is a measured finding, not a live routing change — "
+    "apply it by hand (edit the relevant agents/<name>.md tier:/model: frontmatter) "
+    "per skills/self-improve/SKILL.md if you want it to take effect."
+)
 
 
 def _now():
@@ -116,7 +142,12 @@ def _append_jsonl(path, rec):
         fh.write(json.dumps(rec, sort_keys=True) + "\n")
 
 
-def _read_json(path, default=None):
+def _read_json(path, default=None, tolerant=False):
+    """tolerant=True: malformed JSON degrades to `default` with a stderr warning
+    instead of dying (fail-open). Reserved for routing-overrides.json, which
+    skills/self-improve/SKILL.md documents as hand-editable ("apply it by hand") — a
+    human typo there must never take down collect/hypotheses/status/experiment.
+    Every other caller keeps the strict default unchanged."""
     if not path or not os.path.exists(path):
         return default
     with open(path, "r", encoding="utf-8") as fh:
@@ -125,7 +156,12 @@ def _read_json(path, default=None):
         return default
     try:
         return json.loads(txt)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError) as exc:
+        if tolerant:
+            sys.stderr.write(
+                "warning: malformed JSON in %s (%s) — failing open, treating as "
+                "absent\n" % (path, exc))
+            return default
         _die("malformed JSON in %s" % path)
 
 
@@ -204,6 +240,66 @@ def _escalate(model):
 def _cheapen(model):
     if model in _TIER_ORDER and _TIER_ORDER.index(model) > 0:
         return _TIER_ORDER[_TIER_ORDER.index(model) - 1]
+    return None
+
+
+# ── policy guard: refuse a routing override that would contradict a stated policy ──
+#
+# CLAUDE.md "Model routing" states three constraints on any model choice, human or
+# machine-proposed, and this loop PROPOSES model choices (the whole point of the
+# cheapen/escalate hypotheses above) — so it is the one thing in this file that could
+# violate them if left unchecked:
+#   1. "Fable 5 is escalation-only ... It is not a routing default." This loop computes
+#      STANDING per-task_type defaults (an override sits in routing-overrides.json until
+#      rolled back), so fable can never be a legitimate *variant* here — only ever a
+#      human's own one-off escalation choice made outside this loop.
+#   2. "Never write a full pinned model id into an operational spawn. The tier alias is
+#      the contract." A variant model that isn't one of _TIER_ORDER's three aliases is
+#      either a pinned id or a typo — both refused the same way.
+#   3. "opus is retained only for adjudication: reviewer, verifier, security-auditor ...
+#      never downgraded to save money." This loop's cheapen hypothesis (pr>=0.99, zero
+#      retries -> try a cheaper tier) is EXACTLY the "downgrade to save money" move
+#      CLAUDE.md warns against when the subject is adjudication work — a flawless opus
+#      review record is opus doing its job correctly, not evidence a cheaper tier can
+#      replace it.
+#
+# _ADJUDICATION_TASK_TYPES cross-references CLAUDE.md's named roles (reviewer, verifier,
+# security-auditor) against agents/heimdall.md's enumerated `heimdall-metric task --type`
+# vocabulary (lint|docs|code|test|review|plan|design|security) to find the subset a task
+# METRIC RECORD can actually carry: "review" and "security". ("verifier" has no metric
+# task_type of its own — verification work is recorded under whichever task_type it
+# verified — so there is nothing further to add here.) If agents/heimdall.md's enum or
+# CLAUDE.md's adjudication list changes, re-derive this set by hand; it is not read from
+# either file at runtime (both are prose, not data this CLI parses).
+#   Re-verify with: grep -A1 'heimdall-metric task --type' agents/heimdall.md
+#                   grep -A3 'retained only for adjudication' CLAUDE.md
+#   (last verified 2026-08-23)
+_ADJUDICATION_TASK_TYPES = frozenset({"review", "security"})
+
+
+def _policy_violation(subject, variant_model):
+    """None when variant_model is an allowed routing variant for subject; otherwise the
+    human-readable refusal reason. Called from cmd_experiment_start (the only place an
+    override can actually reach disk) so BOTH the hypothesis-derived path and the
+    advanced `--from` path are covered by one check. `--from` is the one that matters in
+    practice — a hypothesis THIS loop generated itself already ran through this exact
+    function inside cmd_hypotheses's cheapen branch and would already be marked
+    non-testable if it violated policy, so the check here is defense-in-depth for that
+    path; `--from` accepts an arbitrary caller-supplied shape and never touches
+    cmd_hypotheses at all, so this is the ONLY check standing between it and disk."""
+    if variant_model == "fable":
+        return ("fable is escalation-only (CLAUDE.md 'Model routing': 'not a routing "
+                 "default'). This loop computes STANDING per-task_type defaults, so "
+                 "fable may never be a variant model here.")
+    if variant_model not in _TIER_ORDER:
+        return ("%r is not a tier alias (know: %s, plus escalation-only fable, which "
+                 "is refused above for a different reason) — CLAUDE.md 'Model routing': "
+                 "never write a full pinned model id into an operational spawn; the tier "
+                 "alias is the contract." % (variant_model, ", ".join(_TIER_ORDER)))
+    if subject in _ADJUDICATION_TASK_TYPES and variant_model != "opus":
+        return ("task_type %r is an adjudication class (CLAUDE.md 'Model routing': opus "
+                 "is retained only for adjudication... never downgraded to save money) — "
+                 "a routing override may not move it off opus." % subject)
     return None
 
 
@@ -286,7 +382,8 @@ def cmd_hypotheses(args):
         elif pr >= 0.99 and cell["avg_retries"] == 0.0:
             down = _cheapen(model)
             if down:
-                hypos.append({
+                blocked = _policy_violation(tt, down)
+                hyp = {
                     "id": "hyp-cheap-%s-%s" % (tt, model),
                     "kind": "routing",
                     "subject": tt,
@@ -297,8 +394,17 @@ def cmd_hypotheses(args):
                                  % (model, down),
                     "baseline": cell,
                     "expected": "pass_rate stays >= baseline on the cheaper tier",
-                    "testable": True,
-                })
+                    "testable": blocked is None,
+                }
+                if blocked:
+                    # Surfaced, not silently dropped — a human can still see WHY the
+                    # loop refuses to auto-test this one (mirrors the precheck kind's
+                    # existing "testable": False convention above). heimdall-dream's
+                    # auto-start candidate picker already skips non-testable
+                    # hypotheses, so this alone keeps it from being silently started —
+                    # no change needed there.
+                    hyp["policy_reason"] = blocked
+                hypos.append(hyp)
 
     # (C) retry-reason clusters -> non-routing precheck suggestions (surfaced, not auto-applied).
     for c in _dead_clusters(queue):
@@ -329,10 +435,23 @@ def cmd_hypotheses(args):
 # ── routing-overrides.json read/write ──────────────────────────────────────────
 
 def _load_overrides(repo):
-    o = _read_json(_p(repo, "routing-overrides.json"), default=None)
-    if o is None:
-        return {"schema": SCHEMA_VERSION, "overrides": {}}
+    """FAIL OPEN: absent, empty, malformed-JSON, or malformed-SHAPE all degrade to the
+    same empty table rather than raising — routing-overrides.json is meant to be
+    hand-edited (skills/self-improve/SKILL.md: "apply it by hand"), so a human typo
+    must never take down collect/hypotheses/status/experiment."""
+    o = _read_json(_p(repo, "routing-overrides.json"), default=None, tolerant=True)
+    if not isinstance(o, dict):
+        if o is not None:
+            sys.stderr.write(
+                "warning: routing-overrides.json top level is %s, not an object — "
+                "failing open, treating as absent\n" % type(o).__name__)
+        o = {"schema": SCHEMA_VERSION, "overrides": {}}
     o.setdefault("overrides", {})
+    if not isinstance(o["overrides"], dict):
+        sys.stderr.write(
+            "warning: routing-overrides.json 'overrides' key is %s, not an object — "
+            "failing open, treating as empty\n" % type(o["overrides"]).__name__)
+        o["overrides"] = {}
     return o
 
 
@@ -374,7 +493,10 @@ def cmd_experiment_start(args):
         if hyp is None:
             _die("hypothesis %r not found in current candidates (re-run hypotheses)" % args.hypothesis, 3)
         if hyp["kind"] != "routing" or not hyp.get("testable"):
-            _die("hypothesis %r is not a testable routing experiment" % args.hypothesis, 3)
+            reason = hyp.get("policy_reason")
+            extra = (" (%s)" % reason) if reason else ""
+            _die("hypothesis %r is not a testable routing experiment%s"
+                 % (args.hypothesis, extra), 3)
         prop = hyp["proposal"]
         subject = prop["task_type"]
         variant_model = prop["to_model"]
@@ -384,6 +506,16 @@ def cmd_experiment_start(args):
         subject = override_spec["task_type"]
         variant_model = override_spec["to_model"]
         baseline = override_spec.get("baseline", {"pass_rate": 0.0, "samples": 0})
+
+    # POLICY GUARD — the one gate both paths above must pass before anything reaches
+    # disk. The hyp-derived path above can only arrive here already-compliant (a
+    # policy-blocked hypothesis is marked non-testable and _die'd above), so this is
+    # defense-in-depth for that path but the FIRST and ONLY check for --from, which
+    # accepts an arbitrary caller-supplied shape and never touches cmd_hypotheses.
+    violation = _policy_violation(subject, variant_model)
+    if violation:
+        _die("REFUSED — routing override %r -> %r contradicts a stated policy: %s"
+             % (subject, variant_model, violation), 5)
 
     ov = _load_overrides(args.repo)
     prev = ov["overrides"].get(subject)  # for reversibility
@@ -573,6 +705,8 @@ def cmd_status(args):
         "experiments_by_status": dict(buckets),
         "open_experiments": [e["id"] for e in exps if e.get("status") == "open"],
         "total_experiments": len(exps),
+        "mechanically_applied": MECHANICALLY_APPLIED,
+        "consumption_note": CONSUMPTION_NOTE,
     }
     print(json.dumps(out, indent=2, sort_keys=True))
     return 0

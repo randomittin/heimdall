@@ -189,6 +189,71 @@ fi
 [ "$(echo "$SUM3" | jq -r '.counts.improvements_kept')" = "0" ] \
   && ok "(5) empty run keeps nothing" || bad "(5) empty run wrongly kept something"
 
+# ── (8) POLICY-GUARD INTEROP: auto-start SKIPS a policy-blocked candidate and
+#     starts the next testable one instead — proves dream's existing
+#     testable-only picker (`h.get("testable")` in cmd_run) needs NO changes to
+#     honor heimdall-self-improve's policy guard; self-improve's cmd_hypotheses
+#     already marks a blocked candidate testable:false, and the picker already
+#     skips non-testable candidates.
+#     Fixture: review/opus flawless 20/20 (adjudication task_type -> a cheapen
+#     candidate is POLICY-BLOCKED off opus, and "review" sorts alphabetically
+#     BEFORE "test") + test/sonnet failing 5/20 (an ordinary, ALLOWED escalate
+#     candidate). If skip-and-continue were broken, auto-start would either
+#     silently start nothing this cycle or wrongly start the blocked one.
+R8="$(mk_repo policyskip)"
+{
+  i=0
+  while [ "$i" -lt 20 ]; do
+    if [ "$i" -lt 5 ]; then o=pass; else o=fail; fi
+    printf '{"ts":"2026-07-01T01:%02d:00Z","metric":"task","task_type":"test","model":"sonnet","outcome":"%s","retries":2,"wall_secs":30}\n' "$i" "$o"
+    printf '{"ts":"2026-07-01T02:%02d:00Z","metric":"task","task_type":"review","model":"opus","outcome":"pass","retries":0,"wall_secs":10}\n' "$i"
+    i=$((i+1))
+  done
+} > "$R8/.planning/metrics.jsonl"
+echo '{"dead":[],"done":[]}' > "$R8/.planning/queue-stats.json"
+"$CLI" --repo "$R8" run --date "$DATE" --start-experiment --json >/dev/null
+STATE8="$("$PY" "$ROOT/bin/lib/dream_data.py" planning --repo "$R8")"
+[ "$(jq -r '.overrides.test.model' "$STATE8/routing-overrides.json" 2>/dev/null)" = "opus" ] \
+  && ok "(8) auto-start SKIPPED the policy-blocked review candidate and started test->opus" \
+  || bad "(8) auto-start did not skip-and-continue correctly: $(cat "$STATE8/routing-overrides.json" 2>/dev/null || echo MISSING)"
+[ "$(jq -r '.overrides | has("review")' "$STATE8/routing-overrides.json" 2>/dev/null)" = "false" ] \
+  && ok "(8) policy-blocked review candidate was never started" \
+  || bad "(8) review candidate was wrongly auto-started despite the policy block"
+# and the report still surfaces the blocked candidate for a human (not silently dropped).
+REP8="$R8/.planning/dream/$DATE.md"
+grep -q "hyp-cheap-review-opus" "$REP8" \
+  && ok "(8) policy-blocked candidate still surfaced in the report for human review" \
+  || bad "(8) policy-blocked candidate silently dropped from the report"
+
+# ── (9) MIN-DELTA FLOOR: --min-delta below the floor is CLAMPED UP, never honored ──
+# mirrors the existing --min-samples floor clamp; an unclamped --min-delta 0.01 would
+# silently reopen the false-keep risk this file's docstring spends ~30 lines quantifying.
+R9="$(mk_repo mindeltafloor)"; seed_metrics "$R9"
+SUM9="$("$CLI" --repo "$R9" run --date "$DATE" --min-delta 0.01 --json)"
+[ "$(echo "$SUM9" | jq -r '.min_delta')" = "0.15" ] \
+  && ok "(9) --min-delta below the floor is clamped up to 0.15, not honored at 0.01" \
+  || bad "(9) min-delta floor not enforced: $(echo "$SUM9" | jq -r '.min_delta')"
+[ "$(echo "$SUM9" | jq -r '.min_delta_floor_enforced')" = "true" ] \
+  && ok "(9) summary flags min_delta_floor_enforced:true" \
+  || bad "(9) summary did not flag the min-delta clamp"
+REP9="$R9/.planning/dream/$DATE.md"
+grep -qi "min-delta.*clamp\|clamp.*min-delta" "$REP9" \
+  && ok "(9) report explains the min-delta clamp to a human" \
+  || bad "(9) report silent about the min-delta clamp"
+# a caller asking for a STRICTER floor (above 0.15) must still be honored (raise-only).
+SUM9B="$("$CLI" --repo "$R9" run --date "$DATE" --min-delta 0.30 --json)"
+[ "$(echo "$SUM9B" | jq -r '.min_delta')" = "0.3" ] \
+  && ok "(9) a stricter --min-delta (above the floor) is honored, not overridden" \
+  || bad "(9) stricter min-delta was not honored: $(echo "$SUM9B" | jq -r '.min_delta')"
+
+# ── (10) NOT-APPLIED CAVEAT: report tells a human overrides are not live yet ────
+# reuses $REP from section (1) above — no live routing consumer exists yet (see
+# heimdall-self-improve's mechanically_applied:false), so a report showing a
+# "validated" override must not let a reader assume it took effect on its own.
+grep -qi "not applied automatically" "$REP" \
+  && ok "(10) report states overrides are NOT applied automatically" \
+  || bad "(10) report is silent about overrides not being mechanically applied"
+
 echo "================"
 printf "dream: \033[32m%d passed\033[0m, " "$PASS"
 if [ "$FAIL" -gt 0 ]; then printf "\033[31m%d failed\033[0m\n" "$FAIL"; exit 1; fi
