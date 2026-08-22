@@ -33,6 +33,10 @@
 #                          deployment → 0600 cp-endpoint.json; never echoed/tracked.
 #                          Unneeded on the open-bounded public CP — see OPERATORS.md.
 #   HEIMDALL_FORCE      rewrite cp-endpoint.json even if values are unchanged
+#   HEIMDALL_INSTALL_CLAUDE_MEM  opt in to installing the claude-mem plugin (default:
+#                                off — zero measured invocations + a 30GB index that
+#                                blocked a build; stays a one-command manual install
+#                                otherwise — see ensure_claude_mem below)
 #
 set -euo pipefail
 
@@ -655,23 +659,35 @@ ensure_crypto_backend() {
 # hmd drives cross-session memory through the Claude Code PLUGIN claude-mem@thedotmack
 # (marketplace `thedotmack` → thedotmack/claude-mem). THAT plugin — not the standalone
 # npm tool — is what provides the /mem-search skill and the SessionStart memory-injection
-# hooks the orchestrator + agents rely on (agents/heimdall.md: "search … claude-mem for
-# proven patterns"). The legacy first-run path (`npx claude-mem install` in bin/heimdall)
+# hooks it wires. The legacy first-run path (`npx claude-mem install` in bin/heimdall)
 # wires claude-mem's OWN npm hooks, which DIVERGE from the CC-plugin hmd expects; this
 # reconciles that by registering the marketplace + installing the plugin the plugin way.
+#
+# NOT installed by default (2026-08-22). Measured: zero invocations across ~40 spawns,
+# its "98% savings" figure is a compression ratio, not session savings (falsified — see
+# docs/analysis/2026-08-22-reasoning-bank-wiring-decision.md), and its Chroma index
+# bloated to 30GB (link_lists.bin alone) and blocked a build. That is ongoing harm, not
+# one-time setup pain, so it drops out of the default preinstall. It stays a ONE-command
+# manual install for anyone who wants it — opt in per-install with
+# HEIMDALL_INSTALL_CLAUDE_MEM=1, or run the fix command this prints later.
 #
 # IDEMPOTENT (fast no-op when already enabled — never re-installs), NON-FATAL (claude-mem
 # is an optional companion Heimdall works without), LOUD on failure. The caller renders
 # the ✓/⚠ line + the exact manual fix. Prints ONE state word:
 #   present     — the plugin is already registered/enabled; nothing done
-#   configured  — registered the marketplace + installed the plugin (now enabled)
+#   declined    — not enabled and NOT opted in (the default) — nothing attempted
+#   configured  — opted in: registered the marketplace + installed the plugin (enabled)
 #   skipped     — the `claude` CLI is absent, so no plugin registration is possible
-#   failed      — a register/install step failed AND the plugin is still not present (LOUD)
+#   failed      — opted in, but a register/install step failed and it's still absent (LOUD)
 ensure_claude_mem() {
   command -v claude >/dev/null 2>&1 || { printf 'skipped'; return 0; }
   local mkt="thedotmack/claude-mem" mkt_name="thedotmack" plugin="claude-mem@thedotmack"
   # Already present? Fast idempotent path — never touch the CLI again.
   if claude plugins list 2>/dev/null | grep -qi 'claude-mem'; then printf 'present'; return 0; fi
+  # Default is OFF (see the block above) — opt in per-install with this var. Checked
+  # AFTER the presence check above, so a plugin already installed some other way is
+  # always reported, and left alone, regardless of this flag.
+  if [ "${HEIMDALL_INSTALL_CLAUDE_MEM:-0}" != "1" ]; then printf 'declined'; return 0; fi
   local rc=0
   # Register the marketplace (idempotent — `add` is a no-op when already known).
   if ! claude plugins marketplace list 2>/dev/null | grep -q "$mkt_name"; then
@@ -1423,9 +1439,13 @@ main() {
   step_begin "Wiring secret-scan + bloat gates"
   step_ok "Wiring secret-scan + bloat gates"
 
-  # Step: set up claude-mem PER HMD's expectations (the CC plugin, not the npm tool)
-  # so /mem-search + the SessionStart memory-injection hooks the orchestrator relies
-  # on are live. OPTIONAL/graceful — a failure is LOUD but never aborts the install.
+  # Step: set up claude-mem PER HMD's expectations (the CC plugin, not the npm tool),
+  # IF opted in — /mem-search + the SessionStart memory-injection hooks it provides.
+  # NOT installed by default (2026-08-22): zero invocations across ~40 measured spawns,
+  # its "98% savings" is a compression ratio not session savings, and its Chroma index
+  # bloated to 30GB and blocked a build — see
+  # docs/analysis/2026-08-22-reasoning-bank-wiring-decision.md. OPTIONAL/graceful either
+  # way — a failure is LOUD but never aborts the install.
   local CM_T0; CM_T0="$(_tele_now_ms)"
   _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" claude-mem started
   step_begin "Setting up claude-mem (memory)"
@@ -1437,6 +1457,10 @@ main() {
     configured)
       _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" claude-mem succeeded "$CM_T0"
       step_ok "Setting up claude-mem (memory)" "plugin registered" ;;
+    declined)
+      _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" claude-mem succeeded "$CM_T0"
+      step_ok "Setting up claude-mem (memory)" \
+        "not installed by default — opt in with HEIMDALL_INSTALL_CLAUDE_MEM=1" ;;
     skipped)
       _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" claude-mem failed "$CM_T0" \
         claude-cli-absent "no claude CLI on PATH"
