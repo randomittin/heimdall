@@ -246,6 +246,14 @@ SUM9B="$("$CLI" --repo "$R9" run --date "$DATE" --min-delta 0.30 --json)"
   && ok "(9) a stricter --min-delta (above the floor) is honored, not overridden" \
   || bad "(9) stricter min-delta was not honored: $(echo "$SUM9B" | jq -r '.min_delta')"
 
+# ── (10) NOT-APPLIED CAVEAT: report tells a human overrides are not live yet ────
+# reuses $REP from section (1) above — no live routing consumer exists yet (see
+# heimdall-self-improve's mechanically_applied:false), so a report showing a
+# "validated" override must not let a reader assume it took effect on its own.
+grep -qi "not applied automatically" "$REP" \
+  && ok "(10) report states overrides are NOT applied automatically" \
+  || bad "(10) report is silent about overrides not being mechanically applied"
+
 echo "================"
 printf "dream: \033[32m%d passed\033[0m, " "$PASS"
 if [ "$FAIL" -gt 0 ]; then printf "\033[31m%d failed\033[0m\n" "$FAIL"; exit 1; fi

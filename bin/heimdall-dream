@@ -543,6 +543,12 @@ def _render(date, repo, mode, total_records, routing_hyps, precheck_hyps, queue,
     L.append("Measured wins from the self-improve keep-gate — an override persists ONLY "
              "with a measured pass-rate delta over its baseline (else it was rolled back).")
     L.append("")
+    L.append("**Not applied automatically.** `.planning/routing-overrides.json` is not "
+             "read by any model-selection path yet — a validated override below is a "
+             "measured finding, not a live routing change. Apply one by hand (edit the "
+             "relevant `agents/<name>.md` `tier:`/`model:` frontmatter) if you want it "
+             "to take effect; until then this section is a recommendation, not a status.")
+    L.append("")
     if kept:
         for e in kept:
             r = e.get("result", {}) or {}
