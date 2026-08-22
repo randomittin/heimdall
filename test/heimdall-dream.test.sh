@@ -189,6 +189,42 @@ fi
 [ "$(echo "$SUM3" | jq -r '.counts.improvements_kept')" = "0" ] \
   && ok "(5) empty run keeps nothing" || bad "(5) empty run wrongly kept something"
 
+# ── (8) POLICY-GUARD INTEROP: auto-start SKIPS a policy-blocked candidate and
+#     starts the next testable one instead — proves dream's existing
+#     testable-only picker (`h.get("testable")` in cmd_run) needs NO changes to
+#     honor heimdall-self-improve's policy guard; self-improve's cmd_hypotheses
+#     already marks a blocked candidate testable:false, and the picker already
+#     skips non-testable candidates.
+#     Fixture: review/opus flawless 20/20 (adjudication task_type -> a cheapen
+#     candidate is POLICY-BLOCKED off opus, and "review" sorts alphabetically
+#     BEFORE "test") + test/sonnet failing 5/20 (an ordinary, ALLOWED escalate
+#     candidate). If skip-and-continue were broken, auto-start would either
+#     silently start nothing this cycle or wrongly start the blocked one.
+R8="$(mk_repo policyskip)"
+{
+  i=0
+  while [ "$i" -lt 20 ]; do
+    if [ "$i" -lt 5 ]; then o=pass; else o=fail; fi
+    printf '{"ts":"2026-07-01T01:%02d:00Z","metric":"task","task_type":"test","model":"sonnet","outcome":"%s","retries":2,"wall_secs":30}\n' "$i" "$o"
+    printf '{"ts":"2026-07-01T02:%02d:00Z","metric":"task","task_type":"review","model":"opus","outcome":"pass","retries":0,"wall_secs":10}\n' "$i"
+    i=$((i+1))
+  done
+} > "$R8/.planning/metrics.jsonl"
+echo '{"dead":[],"done":[]}' > "$R8/.planning/queue-stats.json"
+"$CLI" --repo "$R8" run --date "$DATE" --start-experiment --json >/dev/null
+STATE8="$("$PY" "$ROOT/bin/lib/dream_data.py" planning --repo "$R8")"
+[ "$(jq -r '.overrides.test.model' "$STATE8/routing-overrides.json" 2>/dev/null)" = "opus" ] \
+  && ok "(8) auto-start SKIPPED the policy-blocked review candidate and started test->opus" \
+  || bad "(8) auto-start did not skip-and-continue correctly: $(cat "$STATE8/routing-overrides.json" 2>/dev/null || echo MISSING)"
+[ "$(jq -r '.overrides | has("review")' "$STATE8/routing-overrides.json" 2>/dev/null)" = "false" ] \
+  && ok "(8) policy-blocked review candidate was never started" \
+  || bad "(8) review candidate was wrongly auto-started despite the policy block"
+# and the report still surfaces the blocked candidate for a human (not silently dropped).
+REP8="$R8/.planning/dream/$DATE.md"
+grep -q "hyp-cheap-review-opus" "$REP8" \
+  && ok "(8) policy-blocked candidate still surfaced in the report for human review" \
+  || bad "(8) policy-blocked candidate silently dropped from the report"
+
 echo "================"
 printf "dream: \033[32m%d passed\033[0m, " "$PASS"
 if [ "$FAIL" -gt 0 ]; then printf "\033[31m%d failed\033[0m\n" "$FAIL"; exit 1; fi
