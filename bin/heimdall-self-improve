@@ -43,7 +43,12 @@
 #
 # A task-outcome metric record (one JSON line; non-"task" records are ignored):
 #   {"ts":"...","metric":"task","task_type":"lint","model":"sonnet",
-#    "outcome":"pass"|"fail","retries":0,"wall_secs":42, ...}
+#    "outcome":"pass"|"fail"|null,"retries":0,"wall_secs":42, ...}
+# outcome:null (or the key absent) means genuinely UNKNOWN — e.g. bin/heimdall-
+# metric-hook's SubagentStop bridge, which records real task_type/model volume but
+# can't observe whether acceptance criteria passed. Unknown-outcome records carry
+# no pass/fail evidence: _aggregate() counts them into `unknown`, never `samples`
+# (see its docstring) — never scored as either a pass or (by omission) a fail.
 # (schema per agents/heimdall.md "Pattern Learning (SONA-inspired)").
 #
 # Exit status: 0 ok · 2 usage · 3 runtime (bad json / missing input) · 4 no-op (empty) ·
@@ -200,28 +205,72 @@ def _task_records(metrics_path, since_ts=None):
     return recs
 
 
+def _outcome(r):
+    """Normalize a record's outcome to 'pass' / 'fail' / None (unscored/unknown).
+
+    None covers every shape an honest "we don't know" can take: the key absent
+    entirely, a JSON null, or an empty/unrecognized string. bin/heimdall-metric
+    emits a literal `"outcome":null` whenever its own --outcome flag is omitted
+    (see bin/heimdall-metric-hook, 2026-08-23: single-purpose agents get a real
+    task_type + model but a deliberately-null outcome, because SubagentStop's
+    payload has no field that reveals whether acceptance criteria passed). Both
+    shapes are treated identically — a hand-written or older-schema record could
+    plausibly omit the key rather than null it.
+    """
+    val = r.get("outcome")
+    if val is None:
+        return None
+    s = str(val).strip().lower()
+    return s if s in ("pass", "fail") else None
+
+
 def _aggregate(recs):
-    """(task_type, model) -> {samples, passes, pass_rate, avg_retries, avg_secs}."""
-    acc = defaultdict(lambda: {"samples": 0, "passes": 0, "retries": 0, "secs": 0.0})
+    """(task_type, model) -> {samples, passes, unknown, pass_rate, avg_retries, avg_secs}.
+
+    `samples`/`passes`/`pass_rate` cover ONLY records with a SCORABLE outcome
+    ("pass" or "fail"). A record with a real task_type/model but a null/missing/
+    unrecognized outcome is NOT evidence either way — it is counted into `unknown`
+    instead, never into `samples`, so it can neither depress pass_rate (by
+    counting toward the denominator without ever counting toward `passes`, which
+    would silently read as a failure) nor inflate a cell toward a min-samples
+    floor (this file's own gates in cmd_hypotheses/cmd_experiment_evaluate, and
+    bin/heimdall-dream's raise-only MIN_SAMPLES_FLOOR) on evidence that was never
+    actually measured.
+
+    avg_retries/avg_secs still average over EVERY record seen (scored or not) —
+    retries and wall-clock time are real telemetry the run produced regardless of
+    whether its eventual pass/fail was ever recorded, so excluding them here would
+    trade one blind spot for another (e.g. hiding real retry-friction from the
+    cheapen hypothesis's `avg_retries == 0.0` check whenever most of a tier's runs
+    haven't had --outcome recorded yet).
+    """
+    acc = defaultdict(lambda: {"samples": 0, "passes": 0, "unknown": 0,
+                                "retries": 0, "secs": 0.0})
     for r in recs:
         key = (r["task_type"], r["model"])
         a = acc[key]
-        a["samples"] += 1
-        if str(r.get("outcome", "")).lower() == "pass":
-            a["passes"] += 1
+        outcome = _outcome(r)
+        if outcome is None:
+            a["unknown"] += 1
+        else:
+            a["samples"] += 1
+            if outcome == "pass":
+                a["passes"] += 1
         a["retries"] += int(r.get("retries", 0) or 0)
         a["secs"] += float(r.get("wall_secs", 0) or 0)
     out = {}
     for (tt, model), a in acc.items():
         n = a["samples"]
+        seen = n + a["unknown"]
         out[(tt, model)] = {
             "task_type": tt,
             "model": model,
             "samples": n,
             "passes": a["passes"],
+            "unknown": a["unknown"],
             "pass_rate": round(a["passes"] / n, 4) if n else 0.0,
-            "avg_retries": round(a["retries"] / n, 4) if n else 0.0,
-            "avg_secs": round(a["secs"] / n, 2) if n else 0.0,
+            "avg_retries": round(a["retries"] / seen, 4) if seen else 0.0,
+            "avg_secs": round(a["secs"] / seen, 2) if seen else 0.0,
         }
     return out
 
@@ -318,7 +367,7 @@ def cmd_collect(args):
         "task_types": sorted({r["task_type"] for r in rows}),
         "cells": rows,
         "queue_stats": queue,
-        "total_task_records": sum(r["samples"] for r in rows),
+        "total_task_records": sum(r["samples"] + r["unknown"] for r in rows),
     }
     print(json.dumps(out, indent=2, sort_keys=True))
     return 0
