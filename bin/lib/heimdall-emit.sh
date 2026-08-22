@@ -146,7 +146,6 @@ hmd_emit_result() {
   case "$lines" in ''|*[!0-9]*) lines=0 ;; esac
 
   [ -n "$summary" ] && printf '%s\n' "$summary"
-  cat "$content"
   printf 'evidence: %s  (%s bytes, %s lines — full detail, not truncated)\n' "$dest" "$bytes" "$lines"
   return "$code"
 }
