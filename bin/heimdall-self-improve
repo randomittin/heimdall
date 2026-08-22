@@ -116,7 +116,12 @@ def _append_jsonl(path, rec):
         fh.write(json.dumps(rec, sort_keys=True) + "\n")
 
 
-def _read_json(path, default=None):
+def _read_json(path, default=None, tolerant=False):
+    """tolerant=True: malformed JSON degrades to `default` with a stderr warning
+    instead of dying (fail-open). Reserved for routing-overrides.json, which
+    skills/self-improve/SKILL.md documents as hand-editable ("apply it by hand") — a
+    human typo there must never take down collect/hypotheses/status/experiment.
+    Every other caller keeps the strict default unchanged."""
     if not path or not os.path.exists(path):
         return default
     with open(path, "r", encoding="utf-8") as fh:
@@ -125,7 +130,12 @@ def _read_json(path, default=None):
         return default
     try:
         return json.loads(txt)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError) as exc:
+        if tolerant:
+            sys.stderr.write(
+                "warning: malformed JSON in %s (%s) — failing open, treating as "
+                "absent\n" % (path, exc))
+            return default
         _die("malformed JSON in %s" % path)
 
 
@@ -329,10 +339,23 @@ def cmd_hypotheses(args):
 # ── routing-overrides.json read/write ──────────────────────────────────────────
 
 def _load_overrides(repo):
-    o = _read_json(_p(repo, "routing-overrides.json"), default=None)
-    if o is None:
-        return {"schema": SCHEMA_VERSION, "overrides": {}}
+    """FAIL OPEN: absent, empty, malformed-JSON, or malformed-SHAPE all degrade to the
+    same empty table rather than raising — routing-overrides.json is meant to be
+    hand-edited (skills/self-improve/SKILL.md: "apply it by hand"), so a human typo
+    must never take down collect/hypotheses/status/experiment."""
+    o = _read_json(_p(repo, "routing-overrides.json"), default=None, tolerant=True)
+    if not isinstance(o, dict):
+        if o is not None:
+            sys.stderr.write(
+                "warning: routing-overrides.json top level is %s, not an object — "
+                "failing open, treating as absent\n" % type(o).__name__)
+        o = {"schema": SCHEMA_VERSION, "overrides": {}}
     o.setdefault("overrides", {})
+    if not isinstance(o["overrides"], dict):
+        sys.stderr.write(
+            "warning: routing-overrides.json 'overrides' key is %s, not an object — "
+            "failing open, treating as empty\n" % type(o["overrides"]).__name__)
+        o["overrides"] = {}
     return o
 
 

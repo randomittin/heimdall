@@ -222,6 +222,30 @@ ST="$("$CLI" --repo "$R" status)"
   && ok "(9) status folds the log to latest-per-id (1 kept)" \
   || bad "(9) status fold wrong: $(echo "$ST" | jq -c '.experiments_by_status')"
 
+# ── (10) FAIL-OPEN: malformed routing-overrides.json must not crash the loop ───
+R="$(mk_repo failopen)"; seed_metrics "$R"
+echo '{not valid json' > "$R/.planning/routing-overrides.json"
+set +e
+ST="$("$CLI" --repo "$R" status 2>"$WORK/failopen.stderr")"
+RC=$?
+set -e
+[ "$RC" = "0" ] && [ "$(echo "$ST" | jq -r '.overrides_active')" = "{}" ] \
+  && ok "(10) FAIL-OPEN: malformed routing-overrides.json degrades to empty, no crash" \
+  || bad "(10) malformed routing-overrides.json crashed status (rc=$RC): $ST"
+grep -qi "malformed\|fail.open\|absent" "$WORK/failopen.stderr" \
+  && ok "(10) fail-open is not fail-SILENT: a warning is written to stderr" \
+  || bad "(10) no stderr warning for the discarded malformed file"
+# a malformed 'overrides' key (valid JSON, wrong shape) must ALSO fail open.
+R="$(mk_repo failopen2)"; seed_metrics "$R"
+echo '{"schema":1,"overrides":"not-an-object"}' > "$R/.planning/routing-overrides.json"
+set +e
+ST2="$("$CLI" --repo "$R" status 2>/dev/null)"
+RC2=$?
+set -e
+[ "$RC2" = "0" ] && [ "$(echo "$ST2" | jq -r '.overrides_active')" = "{}" ] \
+  && ok "(10) FAIL-OPEN: malformed 'overrides' shape (not an object) also degrades to empty" \
+  || bad "(10) malformed overrides shape crashed status (rc=$RC2): $ST2"
+
 echo "======================="
 printf "self-improve: \033[32m%d passed\033[0m, " "$PASS"
 if [ "$FAIL" -gt 0 ]; then printf "\033[31m%d failed\033[0m\n" "$FAIL"; exit 1; fi
