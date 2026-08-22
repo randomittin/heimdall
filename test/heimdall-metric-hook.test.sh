@@ -15,12 +15,17 @@
 # It also proves the hook's honesty constraints hold, not just its happy path:
 #   - subagent_type "fork" (live model unobservable) never fabricates a record.
 #   - an agent whose frontmatter model is "inherit"/unknown never fabricates one.
-#   - a final message carrying no recognized Status Contract token (DONE /
-#     DONE_WITH_CONCERNS / NEEDS_CONTEXT / BLOCKED) never fabricates one.
+#   - task_type is real ONLY for the honest single-purpose allowlist (reviewer,
+#     lint-quality, ...) and null for everything else, including multi-purpose
+#     agents like coder — never a slug of agent_type, never a guess.
+#   - outcome is NEVER derived from last_assistant_message — no event in the
+#     SubagentStop payload can verify whether acceptance criteria passed, so
+#     every record's outcome is null regardless of DONE/BLOCKED/anything else
+#     the agent's own final message claims.
 #   - a genuinely unknown agent_type (no matching agents/*.md) never crashes,
 #     never records.
-# Silence in all four cases is the correct behavior being tested — the whole
-# point is "never guess a value to fill a field."
+# Silence/null in all these cases is the correct behavior being tested — the
+# whole point is "never guess a value to fill a field."
 #
 # Guarantees proved:
 #   1. hooks/hooks.json is valid JSON.
@@ -30,13 +35,20 @@
 #      last_assistant_message) appends exactly one correctly-shaped record.
 #   4. hmd:-namespaced agent_type slugs correctly and strips the prefix only
 #      for the agents/*.md lookup, not for the recorded task_type.
-#   5. BLOCKED / NEEDS_CONTEXT map to outcome=fail; DONE / DONE_WITH_CONCERNS
-#      map to outcome=pass.
-#   6. fork / inherit-model / no-status-token / unknown-agent all record
-#      NOTHING (never guessed).
-#   7. effort.level flows through when present; is simply absent (not
+#   5. outcome is ALWAYS null, regardless of DONE/DONE_WITH_CONCERNS/
+#      NEEDS_CONTEXT/BLOCKED in last_assistant_message — no SubagentStop field
+#      can verify a real pass/fail, so none is ever fabricated from prose.
+#   6. task_type is real ONLY for the honest single-purpose allowlist
+#      (lint-quality, docs-writer, test-runner, reviewer, planner, design,
+#      security-auditor) — null for every other agent_type, including
+#      multi-purpose ones like coder. Message content never gates whether a
+#      record is written at all: a known agent+model records regardless of
+#      what (or whether) last_assistant_message says.
+#   7. fork / inherit-model record NOTHING (model genuinely unknown, never
+#      guessed); a genuinely unknown agent_type also records NOTHING.
+#   8. effort.level flows through when present; is simply absent (not
 #      fabricated) when the payload omits it.
-#   8. The hook is fail-open: no jq, a missing heimdall-metric binary, or a
+#   9. The hook is fail-open: no jq, a missing heimdall-metric binary, or a
 #      malformed payload all still exit 0.
 #
 # Usage:  bash test/heimdall-metric-hook.test.sh   (exit 0 = all guarantees hold)
@@ -155,6 +167,13 @@ model: inherit
 ---
 body
 EOF
+cat > "$PLUGIN/agents/lint-quality.md" <<'EOF'
+---
+name: lint-quality
+model: haiku
+---
+body
+EOF
 
 METRICS="$PROJECT/.planning/metrics.jsonl"
 
@@ -186,9 +205,9 @@ if [ "$AFTER" -eq $((BEFORE+1)) ]; then
   ok "agent_type=coder + DONE appends exactly one record"
   REC=$(tail -1 "$METRICS")
   [ "$(printf '%s' "$REC" | jq -r '.metric')" = "task" ]      && ok "record metric=task"      || bad "record metric field wrong: $REC"
-  [ "$(printf '%s' "$REC" | jq -r '.task_type')" = "coder" ]  && ok "record task_type=coder"  || bad "record task_type wrong: $REC"
+  [ "$(printf '%s' "$REC" | jq -r '.task_type')" = "null" ]   && ok "record task_type=null (coder is multi-purpose — never guessed)" || bad "record task_type wrong: $REC"
   [ "$(printf '%s' "$REC" | jq -r '.model')" = "sonnet" ]     && ok "record model=sonnet (from agents/coder.md frontmatter)" || bad "record model wrong: $REC"
-  [ "$(printf '%s' "$REC" | jq -r '.outcome')" = "pass" ]     && ok "record outcome=pass (DONE token)" || bad "record outcome wrong: $REC"
+  [ "$(printf '%s' "$REC" | jq -r '.outcome')" = "null" ]     && ok "record outcome=null (never derived from last_assistant_message, even a DONE)" || bad "record outcome wrong: $REC"
   [ "$(printf '%s' "$REC" | jq -r '.effort')" = "high" ]      && ok "record effort=high (from effort.level)" || bad "record effort wrong: $REC"
   [ "$(printf '%s' "$REC" | jq -r '.source')" = "subagentstop" ] && ok "record source=subagentstop" || bad "record source wrong: $REC"
 else
@@ -202,32 +221,46 @@ AFTER=$(lines_now)
 if [ "$AFTER" -eq $((BEFORE+1)) ]; then
   ok "agent_type=hmd:reviewer + BLOCKED appends exactly one record"
   REC=$(tail -1 "$METRICS")
-  [ "$(printf '%s' "$REC" | jq -r '.task_type')" = "hmd-reviewer" ] && ok "record task_type=hmd-reviewer (raw agent_type slugged, prefix kept)" || bad "record task_type wrong: $REC"
+  [ "$(printf '%s' "$REC" | jq -r '.task_type')" = "review" ]       && ok "record task_type=review (honest allowlist: reviewer's ENTIRE job is review; prefix stripped)" || bad "record task_type wrong: $REC"
   [ "$(printf '%s' "$REC" | jq -r '.model')" = "opus" ]             && ok "record model=opus (agents/reviewer.md, prefix stripped for lookup)" || bad "record model wrong: $REC"
-  [ "$(printf '%s' "$REC" | jq -r '.outcome')" = "fail" ]           && ok "record outcome=fail (BLOCKED token)" || bad "record outcome wrong: $REC"
+  [ "$(printf '%s' "$REC" | jq -r '.outcome')" = "null" ]           && ok "record outcome=null (BLOCKED does not become a fabricated fail)" || bad "record outcome wrong: $REC"
   [ "$(printf '%s' "$REC" | jq -r '.effort')" = "default" ]         && ok "record effort defaults to 'default' when effort.level absent (not fabricated by this hook)" || bad "record effort wrong: $REC"
 else
   bad "agent_type=hmd:reviewer + BLOCKED: expected $((BEFORE+1)) lines, got $AFTER"
 fi
 
 BEFORE=$(lines_now)
+PAYLOAD=$(jq -cn '{agent_type:"lint-quality", last_assistant_message:"lint clean, 0 warnings"}')
+run_hook "$PAYLOAD"
+AFTER=$(lines_now)
+if [ "$AFTER" -eq $((BEFORE+1)) ]; then
+  ok "agent_type=lint-quality appends exactly one record"
+  REC=$(tail -1 "$METRICS")
+  [ "$(printf '%s' "$REC" | jq -r '.task_type')" = "lint" ] && ok "record task_type=lint (honest allowlist: lint-quality's ENTIRE job is lint — proves the table, not a one-off)" || bad "record task_type wrong: $REC"
+  [ "$(printf '%s' "$REC" | jq -r '.model')" = "haiku" ]    && ok "record model=haiku (agents/lint-quality.md frontmatter)" || bad "record model wrong: $REC"
+  [ "$(printf '%s' "$REC" | jq -r '.outcome')" = "null" ]   && ok "record outcome=null" || bad "record outcome wrong: $REC"
+else
+  bad "agent_type=lint-quality: expected $((BEFORE+1)) lines, got $AFTER"
+fi
+
+BEFORE=$(lines_now)
 PAYLOAD=$(jq -cn '{agent_type:"coder", last_assistant_message:"DONE_WITH_CONCERNS. Works but file grew large."}')
 run_hook "$PAYLOAD"
 AFTER=$(lines_now)
-if [ "$AFTER" -eq $((BEFORE+1)) ] && [ "$(tail -1 "$METRICS" | jq -r '.outcome')" = "pass" ]; then
-  ok "DONE_WITH_CONCERNS maps to outcome=pass"
+if [ "$AFTER" -eq $((BEFORE+1)) ] && [ "$(tail -1 "$METRICS" | jq -r '.outcome')" = "null" ]; then
+  ok "DONE_WITH_CONCERNS still records outcome=null (an agent's own claim is not a verified fact)"
 else
-  bad "DONE_WITH_CONCERNS did not map to a pass record (before=$BEFORE after=$AFTER)"
+  bad "DONE_WITH_CONCERNS fabricated a non-null outcome (before=$BEFORE after=$AFTER)"
 fi
 
 BEFORE=$(lines_now)
 PAYLOAD=$(jq -cn '{agent_type:"coder", last_assistant_message:"NEEDS_CONTEXT. Which env should this target?"}')
 run_hook "$PAYLOAD"
 AFTER=$(lines_now)
-if [ "$AFTER" -eq $((BEFORE+1)) ] && [ "$(tail -1 "$METRICS" | jq -r '.outcome')" = "fail" ]; then
-  ok "NEEDS_CONTEXT maps to outcome=fail"
+if [ "$AFTER" -eq $((BEFORE+1)) ] && [ "$(tail -1 "$METRICS" | jq -r '.outcome')" = "null" ]; then
+  ok "NEEDS_CONTEXT still records outcome=null (a hook cannot know if this blocked acceptance)"
 else
-  bad "NEEDS_CONTEXT did not map to a fail record (before=$BEFORE after=$AFTER)"
+  bad "NEEDS_CONTEXT fabricated a non-null outcome (before=$BEFORE after=$AFTER)"
 fi
 
 # --- 6. negative cases: never guess, so never record -------------------------
@@ -249,8 +282,15 @@ BEFORE=$(lines_now)
 PAYLOAD=$(jq -cn '{agent_type:"coder", last_assistant_message:"Ran the migration and updated three files, looks fine to me."}')
 run_hook "$PAYLOAD"
 AFTER=$(lines_now)
-[ "$AFTER" -eq "$BEFORE" ] && ok "final message with no Status Contract token records NOTHING" \
-  || bad "no-token case fabricated a record: before=$BEFORE after=$AFTER"
+if [ "$AFTER" -eq $((BEFORE+1)) ]; then
+  ok "message with no Status Contract token STILL records (coverage fix — message content is never inspected)"
+  REC=$(tail -1 "$METRICS")
+  [ "$(printf '%s' "$REC" | jq -r '.task_type')" = "null" ] && [ "$(printf '%s' "$REC" | jq -r '.outcome')" = "null" ] \
+    && ok "task_type/outcome both null — volume captured honestly, nothing guessed from the prose" \
+    || bad "no-token record fabricated a field: $REC"
+else
+  bad "no-token case recorded nothing — coverage gap not fixed (before=$BEFORE after=$AFTER)"
+fi
 
 BEFORE=$(lines_now)
 PAYLOAD=$(jq -cn '{agent_type:"totally-unknown-agent-xyz", last_assistant_message:"DONE."}')
@@ -263,8 +303,8 @@ BEFORE=$(lines_now)
 PAYLOAD=$(jq -cn '{agent_type:"coder", last_assistant_message:""}')
 run_hook "$PAYLOAD"
 AFTER=$(lines_now)
-[ "$AFTER" -eq "$BEFORE" ] && ok "empty last_assistant_message records NOTHING" \
-  || bad "empty-message case fabricated a record: before=$BEFORE after=$AFTER"
+[ "$AFTER" -eq $((BEFORE+1)) ] && ok "empty last_assistant_message STILL records (message content never gates emission)" \
+  || bad "empty-message case recorded nothing — coverage gap not fixed (before=$BEFORE after=$AFTER)"
 
 # --- 8. fail-open behaviour ---------------------------------------------------
 BEFORE=$(lines_now)
