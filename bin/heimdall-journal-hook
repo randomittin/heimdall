@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+# heimdall-journal-hook — mechanical PostToolUse trigger for bin/heimdall-journal.
+#
+# WHY: the owner asked, verbatim, for hmd to "write summaries while
+# implementing and communicating to user and save these in a journal like
+# code system" and — separately — laid down the standing verdict that "by
+# nature, hmd should use these skills on autopilot and not by an external
+# invocation... coz then what's the point of hmd?!". bin/heimdall-journal
+# shipped (deb83b2) with a complete add/today/tail/grep/path CLI but ZERO
+# mechanical trigger — the only path to it was a sentence in
+# skills/heimdall/SKILL.md, i.e. prose an agent can, and per this repo's own
+# measured 26x adoption gap between hooks that PERFORM and prose that only
+# INSTRUCTS (see bin/heimdall-metric-hook's header for the exact figures),
+# reliably will skip. This hook makes one real, observable milestone — a
+# landed `git commit` — write itself into the journal without depending on
+# any agent remembering to call `heimdall-journal add`.
+#
+# WHAT THIS IS NOT: a general "journal everything" hook. It fires on
+# PostToolUse:Bash — every Bash call, cheap fast-path exit on a non-match,
+# mirroring the existing corpus-capture PostToolUse:Bash block in
+# hooks/hooks.json — and only actually writes when the executed command was
+# git-commit-shaped (the SAME regex already used by the PreToolUse:Bash
+# git-guard chain, hooks/hooks.json:27 — `(^|[;&|]\s*)git\s+commit`) AND that
+# command produced a NEW commit (HEAD advanced past the last SHA this hook
+# itself recorded for the current branch). Detecting "did HEAD move" from
+# git's own ref, rather than trusting a self-reported exit code, is
+# deliberate: it is the one thing this hook can OBSERVE rather than infer,
+# so a failed or no-op `git commit` (nothing staged, hook-blocked upstream,
+# merge conflict) never produces a phantom journal entry.
+#
+# Dedup key is branch-qualified: `heimdall.journalLastCommit-<branch-slug>`,
+# not a single flat key. This repo runs many concurrent worktrees of the
+# SAME clone, and `git config --local` in a worktree writes the shared
+# `.git/config` common to all of them unless `extensions.worktreeConfig` is
+# set — a flat key would let one worktree's commit clobber another's dedup
+# state. Branch-qualifying costs one extra `git rev-parse --abbrev-ref HEAD`
+# call, paid only on the already-rare git-commit-shaped path, and makes the
+# key collision-free across worktrees whose branches differ (the normal
+# case for this repo's own agent-worktree convention).
+#
+# The claim (git config write) happens UNCONDITIONALLY before the journal
+# write is attempted, not after — a crash mid-write loses at most one entry,
+# never double-writes one. A journal is bookkeeping, never a correctness
+# gate (same standard as bin/heimdall-wip-commit and bin/heimdall-metric-hook),
+# so "occasionally silent" beats "occasionally duplicated" or, worse,
+# "occasionally hangs the caller's Bash tool call".
+#
+# The interface of bin/heimdall-journal is NOT modified or reinterpreted
+# here — this script is purely a caller, using exactly the `add <type>
+# <subject> --body TEXT --evidence TEXT` contract documented in that file's
+# own header. Body fallback: heimdall-journal REQUIRES a non-empty body
+# (rejects outright otherwise, by its own explicit design — "never silently
+# truncated, nothing partially written"); a commit with no body (`%b` empty,
+# e.g. a single `-m` commit) uses its own subject as the body rather than
+# being dropped.
+#
+# FAILS OPEN: every guard clause returns 0. No `set -e`. Never blocks the
+# calling Bash tool call, never surfaces an error into the transcript, never
+# retries a dropped entry.
+set -uo pipefail
+
+BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+JOURNAL_BIN="$BIN_DIR/heimdall-journal"
+
+cmd_commit() {
+  local target_repo="."
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repo) target_repo="${2:-.}"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+
+  [ -x "$JOURNAL_BIN" ] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+
+  local input
+  input="$(cat 2>/dev/null || true)"
+  [ -n "$input" ] || return 0
+
+  local cmd
+  cmd="$(printf '%s' "$input" | jq -r '.tool_input.command // empty' 2>/dev/null)"
+  [ -n "$cmd" ] || return 0
+
+  # Same regex as hooks/hooks.json:27's PreToolUse git-guard chain.
+  printf '%s\n' "$cmd" | grep -qE '(^|[;&|]\s*)git\s+commit' || return 0
+
+  (
+    cd "$target_repo" 2>/dev/null || exit 0
+    git rev-parse --git-dir >/dev/null 2>&1 || exit 0
+
+    local sha
+    sha="$(git rev-parse HEAD 2>/dev/null)"
+    [ -n "$sha" ] || exit 0
+
+    local branch slug key last
+    branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)"
+    [ -n "$branch" ] || branch="detached"
+    slug="$(printf '%s' "$branch" | tr -c 'A-Za-z0-9-' '-')"
+    key="heimdall.journalLastCommit-$slug"
+    last="$(git config --local --get "$key" 2>/dev/null || true)"
+    [ "$sha" != "$last" ] || exit 0
+
+    # Claim before writing — see header: a lost entry beats a duplicate.
+    git config --local "$key" "$sha" 2>/dev/null || true
+
+    local subject body
+    subject="$(git log -1 --format=%s "$sha" 2>/dev/null)"
+    [ -n "$subject" ] || exit 0
+    body="$(git log -1 --format=%b "$sha" 2>/dev/null)"
+    [ -n "$body" ] || body="$subject"
+
+    "$JOURNAL_BIN" add communication "$subject" --body "$body" --evidence "commit $sha" >/dev/null 2>&1 || true
+  )
+  return 0
+}
+
+case "${1:-}" in
+  commit) shift; cmd_commit "$@" ;;
+esac
+exit 0
