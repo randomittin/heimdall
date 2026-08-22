@@ -304,6 +304,14 @@ def cmd_run(args):
     min_samples = max(args.min_samples, MIN_SAMPLES_FLOOR)
     ms = str(min_samples)
 
+    # Same discipline for min_delta — MIN_SAMPLES_FLOOR bounds HOW MUCH evidence,
+    # this bounds HOW BIG a delta has to be before it counts; either alone is not
+    # enough (see the false-KEEP table above: n=20/delta=0.10 is still 25.2%, only
+    # n=20/delta=0.15 gets to 13.2%). Clamp UP only, exactly like min_samples above —
+    # an unclamped --min-delta would let a caller silently reopen that gap.
+    min_delta_floor_enforced = args.min_delta < DEF_MIN_DELTA
+    min_delta = max(args.min_delta, DEF_MIN_DELTA)
+
     # 1. COLLECT the comparable scalar + FORM hypotheses (real self-improve output).
     collect = _si(repo, "collect")
     hypos = _si(repo, "hypotheses", "--min-samples", ms)
@@ -337,7 +345,7 @@ def cmd_run(args):
                      and h.get("proposal", {}).get("task_type") not in active), None)
         if cand:
             started = _si(repo, "experiment", "start", "--hypothesis", cand["id"],
-                          "--min-samples", ms, "--min-delta", str(args.min_delta))
+                          "--min-samples", ms, "--min-delta", str(min_delta))
             if isinstance(started, dict) and started.get("started"):
                 started["hypothesis"] = cand
             else:
@@ -358,7 +366,8 @@ def cmd_run(args):
 
     report = _render(date, repo, args.mode, total_records, routing_hyps,
                      precheck_hyps, queue, kept, discarded, validated, started,
-                     args.min_delta, honest_empty, min_samples, floor_enforced)
+                     min_delta, honest_empty, min_samples, floor_enforced,
+                     min_delta_floor_enforced)
 
     path, written = _write_report(repo, date, args.out, report)
     # Reports the 03:00 job could only strand in the relocated root are pulled back into
@@ -376,7 +385,9 @@ def cmd_run(args):
         "min_samples": min_samples,
         "min_samples_floor": MIN_SAMPLES_FLOOR,
         "min_samples_floor_enforced": floor_enforced,
-        "min_delta": args.min_delta,
+        "min_delta": min_delta,
+        "min_delta_floor": DEF_MIN_DELTA,
+        "min_delta_floor_enforced": min_delta_floor_enforced,
         "pushed": False,  # agent-never-pushes: this bin performs NO push/merge.
         "counts": {
             "suggested_changes": len(routing_hyps) + (1 if started else 0),
@@ -404,7 +415,7 @@ def cmd_run(args):
 
 def _render(date, repo, mode, total_records, routing_hyps, precheck_hyps, queue,
             kept, discarded, validated, started, min_delta, honest_empty,
-            min_samples, floor_enforced):
+            min_samples, floor_enforced, min_delta_floor_enforced):
     L = []
     L.append("# Dream Journal — %s" % date)
     L.append("")
@@ -422,10 +433,16 @@ def _render(date, repo, mode, total_records, routing_hyps, precheck_hyps, queue,
              "pass-rate is noise: at 3 samples a variant that is truly no better "
              "still clears the delta ~73%% of the time, so no verdict is offered."
              % (min_samples, min_delta))
-    if floor_enforced:
-        L.append("- the requested `--min-samples` was **below** the sample-size floor "
-                 "and was clamped up to **%d**. The floor may be raised, never lowered."
-                 % min_samples)
+    if floor_enforced or min_delta_floor_enforced:
+        clamped = []
+        if floor_enforced:
+            clamped.append("`--min-samples` was below the sample-size floor and was "
+                           "clamped up to **%d**" % min_samples)
+        if min_delta_floor_enforced:
+            clamped.append("`--min-delta` was below the delta floor and was clamped "
+                           "up to **%.2f**" % min_delta)
+        L.append("- the requested %s. Neither floor may be lowered by a caller."
+                 % " and ".join(clamped))
     L.append("")
 
     if honest_empty:
@@ -578,8 +595,8 @@ def build_parser():
                    help="observations required before a routing verdict (floor: %d; "
                         "may be raised, never lowered)" % MIN_SAMPLES_FLOOR)
     r.add_argument("--min-delta", type=float, default=DEF_MIN_DELTA,
-                   help="pass-rate improvement required to KEEP (default: %.2f)"
-                        % DEF_MIN_DELTA)
+                   help="pass-rate improvement required to KEEP (floor: %.2f; "
+                        "may be raised, never lowered)" % DEF_MIN_DELTA)
     r.add_argument("--out", default=None, help="override report path")
     r.add_argument("--mode", default="on-demand", choices=["overnight", "on-demand"])
     r.add_argument("--overnight", dest="mode", action="store_const", const="overnight",

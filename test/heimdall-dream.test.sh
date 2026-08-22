@@ -225,6 +225,27 @@ grep -q "hyp-cheap-review-opus" "$REP8" \
   && ok "(8) policy-blocked candidate still surfaced in the report for human review" \
   || bad "(8) policy-blocked candidate silently dropped from the report"
 
+# ── (9) MIN-DELTA FLOOR: --min-delta below the floor is CLAMPED UP, never honored ──
+# mirrors the existing --min-samples floor clamp; an unclamped --min-delta 0.01 would
+# silently reopen the false-keep risk this file's docstring spends ~30 lines quantifying.
+R9="$(mk_repo mindeltafloor)"; seed_metrics "$R9"
+SUM9="$("$CLI" --repo "$R9" run --date "$DATE" --min-delta 0.01 --json)"
+[ "$(echo "$SUM9" | jq -r '.min_delta')" = "0.15" ] \
+  && ok "(9) --min-delta below the floor is clamped up to 0.15, not honored at 0.01" \
+  || bad "(9) min-delta floor not enforced: $(echo "$SUM9" | jq -r '.min_delta')"
+[ "$(echo "$SUM9" | jq -r '.min_delta_floor_enforced')" = "true" ] \
+  && ok "(9) summary flags min_delta_floor_enforced:true" \
+  || bad "(9) summary did not flag the min-delta clamp"
+REP9="$R9/.planning/dream/$DATE.md"
+grep -qi "min-delta.*clamp\|clamp.*min-delta" "$REP9" \
+  && ok "(9) report explains the min-delta clamp to a human" \
+  || bad "(9) report silent about the min-delta clamp"
+# a caller asking for a STRICTER floor (above 0.15) must still be honored (raise-only).
+SUM9B="$("$CLI" --repo "$R9" run --date "$DATE" --min-delta 0.30 --json)"
+[ "$(echo "$SUM9B" | jq -r '.min_delta')" = "0.3" ] \
+  && ok "(9) a stricter --min-delta (above the floor) is honored, not overridden" \
+  || bad "(9) stricter min-delta was not honored: $(echo "$SUM9B" | jq -r '.min_delta')"
+
 echo "================"
 printf "dream: \033[32m%d passed\033[0m, " "$PASS"
 if [ "$FAIL" -gt 0 ]; then printf "\033[31m%d failed\033[0m\n" "$FAIL"; exit 1; fi
