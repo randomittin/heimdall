@@ -1528,7 +1528,7 @@ print_banner() {
   printf "  ${V}│${R}  ${C}▸${R} autonomous orchestration          ${V}│${R}\n"; sleep 0.05
   printf "  ${V}│${R}  ${C}▸${R} wave-based parallel execution     ${V}│${R}\n"; sleep 0.05
   printf "  ${V}│${R}  ${C}▸${R} smart skill management            ${V}│${R}\n"; sleep 0.05
-  printf "  ${V}│${R}  ${C}▸${R} caveman     ${G}~65-75%% tokens saved${R}  ${V}│${R}\n"; sleep 0.05
+  printf "  ${V}│${R}  ${C}▸${R} caveman      ${G}terser output${R}      ${V}│${R}\n"; sleep 0.05
   printf "  ${V}│${R}  ${C}▸${R} claude-mem     ${G}persistent memory${R}  ${V}│${R}\n"; sleep 0.05
   printf "  ${V}╰─────────────────────────────────────╯${R}\n"
   local short_cwd; short_cwd=$(echo "$WORK_DIR" | sed "s|$HOME|~|")
@@ -2893,7 +2893,7 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   echo "  --dangerously-skip-permissions    full autonomy"
   echo "  --plugin-dir <heimdall>            heimdall agents + skills"
   echo "  --agent heimdall                   CTO-level orchestrator"
-  echo "  + caveman (token compression)    ~65-75% savings"
+  echo "  + caveman (output compression)   terser wording"
   echo "  + superpowers (brainstorming)    design + debug skills"
   echo "  + claude-mem (persistent memory) cross-session context"
   echo ""
