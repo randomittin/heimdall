@@ -387,6 +387,7 @@ fi
 
 # 4b. The real repo's code-only closure — needed by every real-tree check below.
 reach_build_class "$WORK"
+reach_build_hook_class "$WORK"
 if [ -s "$WORK/live-code-paths" ]; then
   ok "reach_build_class produced a non-empty code-only closure over the real tree"
 else
@@ -398,7 +399,7 @@ fi
 CLASS_SANDBOX="$(mktemp -d "${TMPDIR:-/tmp}/hmd-reach-class-XXXXXX")"
 mkdir -p "$CLASS_SANDBOX/bin" "$CLASS_SANDBOX/hooks" "$CLASS_SANDBOX/commands"
 printf '#!/bin/sh\nexit 0\n' > "$CLASS_SANDBOX/bin/hook-direct"
-printf '#!/bin/sh\n# runs bin/human-direct as part of setup\nexit 0\n' > "$CLASS_SANDBOX/install.sh"
+printf '#!/bin/sh\n# runs bin/human-direct as part of setup\n# also runs bin/dual-path directly from this very seed, one hop out\nexit 0\n' > "$CLASS_SANDBOX/install.sh"
 printf '#!/bin/sh\nexit 0\n' > "$CLASS_SANDBOX/bin/human-direct"
 printf '#!/bin/sh\nexit 0\n' > "$CLASS_SANDBOX/bin/prose-direct"
 printf '#!/bin/sh\nexit 0\n' > "$CLASS_SANDBOX/bin/nobody-calls"
@@ -412,14 +413,25 @@ printf '# mentions bin/prose-direct in prose, nowhere else\n' > "$CLASS_SANDBOX/
 printf '# see bin/brief-shaped for details\n' > "$CLASS_SANDBOX/commands/mentions.md"
 printf '#!/bin/sh\nexec bin/brief-shaped\n' > "$CLASS_SANDBOX/bin/precheck-shaped"
 printf '#!/bin/sh\nexit 0\n' > "$CLASS_SANDBOX/bin/brief-shaped"
+# THE STRONGEST-WINS FALSIFIER: dual-path is reachable by TWO separate ALL-CODE routes
+# at once — install.sh names it directly, ONE hop from a seed and NOT hook-rooted;
+# hooks.json also reaches it, TWO hops out via hook-relay. A single-parent BFS always
+# keeps whichever route it discovers first, and a 1-hop route is always discovered
+# before a 2-hop one regardless of seed ordering — so the OLD (pre-fix) reach_class
+# always recorded install.sh as the parent and reported REACHABLE, never LIVE, no
+# matter how real the hook-fired route also is. The class must be the STRONGEST path
+# over ALL routes, never merely the one a BFS got to first.
+printf '#!/bin/sh\nexec bin/dual-path\n' > "$CLASS_SANDBOX/bin/hook-relay"
+printf '#!/bin/sh\nexit 0\n' > "$CLASS_SANDBOX/bin/dual-path"
 chmod +x "$CLASS_SANDBOX"/bin/* "$CLASS_SANDBOX/install.sh"
-printf '{"hooks":{"X":"run bin/hook-direct now","Y":"run bin/precheck-shaped now"}}\n' \
+printf '{"hooks":{"X":"run bin/hook-direct now","Y":"run bin/precheck-shaped now","Z":"run bin/hook-relay now"}}\n' \
   > "$CLASS_SANDBOX/hooks/hooks.json"
 
 CLASS_WORK="$WORK/class-sandbox"
 reach_build "$CLASS_SANDBOX" "$CLASS_WORK"
 CLASS_BUILD_RC=$?
 reach_build_class "$CLASS_WORK"
+reach_build_hook_class "$CLASS_WORK"
 if [ "$CLASS_BUILD_RC" -eq 0 ]; then
   ok "falsifier: engine builds a closure over the caller-class synthetic tree"
 else
@@ -472,6 +484,29 @@ case "$BS_CHAIN" in
     ;;
   *)
     bad "falsifier: brief-shaped's classified chain has neither a prose hop nor the expected hook root: $BS_CHAIN"
+    ;;
+esac
+
+# THE STRONGEST-WINS FALSIFIER, continued: dual-path must classify LIVE because a
+# hook-rooted all-code route exists, even though a SHORTER, non-hook all-code route to
+# the very same bin also exists and would win any plain single-parent BFS race. This is
+# the two-all-code-paths regression (bin/heimdall-brief hit it for real, via
+# bin/heimdall <-> bin/heimdall-deadcode comments), as opposed to §4c's crux fixture
+# above, which only pits an all-code path against a Markdown one.
+DP_CLASS="$(reach_class "$CLASS_WORK" dual-path)"
+DP_CHAIN="$(reach_chain_classified "$CLASS_WORK" dual-path)"
+if [ "$DP_CLASS" = "LIVE" ]; then
+  ok "falsifier: a hook-rooted all-code route outranks a SHORTER non-hook all-code route to the same bin ($DP_CHAIN)"
+else
+  bad "falsifier: STRONGEST-WINS BROKE — dual-path classified $DP_CLASS via the shorter non-hook route despite a real hook-rooted route also existing; single-parent BFS discovery order picked the weaker path ($DP_CHAIN)"
+fi
+
+case "$DP_CHAIN" in
+  *"hooks/hooks.json"*"[LIVE]"*)
+    ok "falsifier: --why's displayed chain for dual-path shows the hook-rooted route, not the shorter install.sh one"
+    ;;
+  *)
+    bad "falsifier: dual-path's classified chain does not show the expected hook root: $DP_CHAIN"
     ;;
 esac
 
