@@ -1183,6 +1183,31 @@ _keeper_loop() {
   return 0
 }
 
+# _sandbox_home — true when $HOME resolves under an OS temp root ($TMPDIR, /tmp, /var/tmp,
+# and their macOS /private/* real paths — mktemp -d's own territory). EXISTS BECAUSE: a
+# hermetic install (`env -i HOME="$(mktemp -d)" ... install.sh`) reaches the doctor
+# auto-launch below through a REAL SessionStart hook fired by heimdall-doctor-install's
+# headless `claude --cc-verify` probe (install.sh §5a) — a genuine, correct hook firing,
+# NOT a test stubbing keeper-start directly. `env -i` wipes every env var the harness does
+# not explicitly re-list, so the usual test-only escape hatch (a NEW env-var seam) can never
+# reach this deep without editing that harness's allowlist — confirmed empty-handed (the
+# cc-verify probe itself sets no marker either). $HOME is therefore the only signal left
+# standing: the harness MUST set it for the sandbox to mean anything at all, so unlike an
+# added env var it can never simply go missing.
+_sandbox_home() {
+  [ -n "${HOME:-}" ] || return 1
+  local h rt t
+  h="$(cd "$HOME" 2>/dev/null && pwd -P)" || h="$HOME"
+  for t in "${TMPDIR:-}" /tmp /var/tmp /private/tmp /private/var/tmp; do
+    [ -n "$t" ] || continue
+    t="${t%/}"
+    rt="$(cd "$t" 2>/dev/null && pwd -P)" || rt="$t"
+    [ -n "$rt" ] || continue
+    case "$h" in "$rt"|"$rt"/*) return 0 ;; esac
+  done
+  return 1
+}
+
 # keeper-start: consent-gated, idempotent, detached spawn of ONE keeper for this session.
 _keeper_start() {
   # CONSENT OFF -> NO keeper. Mirror `off`: a best-effort retire so we are not on the wall,
@@ -1228,12 +1253,25 @@ _keeper_start() {
   # interpreter, stale throttle, enroll, roster) until presence is HEALTHY, then quiesces.
   # REUSES this already-SessionStart-wired keeper-start path (no new hooks.json edit). The
   # doctor is its OWN detached process (nohup+disown) so it outlives + runs independent of the
-  # keeper loop. SKIPPED under the keeper's beat-injection test seam (HMD_KEEPER_BEAT_BIN) and
-  # an explicit HMD_DOCTOR_DISABLE, so hermetic tests never trigger the doctor's real network.
+  # keeper loop. SKIPPED under the keeper's beat-injection test seam (HMD_KEEPER_BEAT_BIN), an
+  # explicit HMD_DOCTOR_DISABLE, and (below) a sandbox-shaped $HOME — so hermetic tests never
+  # trigger the doctor's real network AND a throwaway sandbox HOME never gets a detached
+  # process that outlives the very directory it was born in.
   DOCTOR_BIN="$SELF_DIR/heimdall-presence-doctor"
   if [ -x "$DOCTOR_BIN" ] && [ -z "${HMD_KEEPER_BEAT_BIN:-}" ] && [ -z "${HMD_DOCTOR_DISABLE:-}" ]; then
-    nohup "$DOCTOR_BIN" --bg </dev/null >/dev/null 2>&1 &
-    disown 2>/dev/null || true
+    # SANDBOX GUARD: $HOME under a temp root (mktemp -d) means something is going to rm -rf it
+    # the moment ITS OWN run ends — a hermetic install harness, most commonly (see
+    # test/install-stranger.test.sh -> install.sh §5a -> heimdall-doctor-install --cc-verify ->
+    # the real SessionStart hook -> here). A detached doctor (up to HMD_DOCTOR_MAX_SECONDS,
+    # default 1800s) has no way to know that on its own, so it outlives its own HOME and
+    # orphans. Observable on purpose (not a silent no-op) — it can only ever print in this one
+    # narrow case, since a real dev's $HOME is never rooted under a temp dir.
+    if _sandbox_home; then
+      printf 'presence keeper: self-heal doctor NOT auto-launched (HOME=%s is a sandbox temp dir)\n' "$HOME"
+    else
+      nohup "$DOCTOR_BIN" --bg </dev/null >/dev/null 2>&1 &
+      disown 2>/dev/null || true
+    fi
   fi
   return 0
 }

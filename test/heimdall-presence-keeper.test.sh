@@ -58,6 +58,10 @@ export HEIMDALL_KEEPER_DIR="$TMP/keeper"  # keeper pidfile home (never ~/.heimda
 mkdir -p "$HEIMDALL_HOME" "$HEIMDALL_KEEPER_DIR"
 # HOME is a throwaway so a stray global presence-off/config never bleeds in from the dev box.
 export HOME="$TMP/fakehome"; mkdir -p "$HOME/.heimdall"
+# Section E's two extra fixture homes — pre-declared (not just assigned in Section E) so
+# `cleanup` below can safely reference them under `set -u` even if the script exits before
+# Section E ever runs (an unset-variable reference inside a trap would itself abort mid-cleanup).
+E1_HOME=""; E2_HOME=""
 cleanup() {
   # best-effort: kill any keeper this test may have left, then remove the tree.
   for pf in "$HEIMDALL_KEEPER_DIR"/*.pid; do
@@ -65,6 +69,8 @@ cleanup() {
     p="$(cat "$pf" 2>/dev/null || true)"
     case "$p" in ''|*[!0-9]*) : ;; *) kill "$p" 2>/dev/null || true ;; esac
   done
+  [ -n "$E1_HOME" ] && rm -rf "$E1_HOME"
+  [ -n "$E2_HOME" ] && rm -rf "$E2_HOME"
   rm -rf "$TMP"
 }
 trap cleanup EXIT
@@ -226,6 +232,76 @@ fi
 NPIDS="$(ls "$HEIMDALL_KEEPER_DIR"/acme_widget__D.pid 2>/dev/null | wc -l | tr -d ' ')"
 [ "$NPIDS" = "1" ] && ok "D2 exactly ONE pidfile for the session" || bad "D2 expected 1 pidfile, found $NPIDS"
 "$BIN" keeper-stop --session D --project "$PROJECT" >/dev/null 2>&1
+
+# ══════════════════════════════════════════════════════════════════════════════
+# E. SANDBOX GUARD — a sandbox-shaped $HOME (mktemp -d's own territory: deleted the
+#    moment the caller — e.g. a hermetic install harness — exits) must NOT receive
+#    the auto-launched self-heal doctor (nohup+disown, up to HMD_DOCTOR_MAX_SECONDS
+#    of life on its own) or it orphans; a real-shaped $HOME still gets it, unchanged
+#    (proves real dev use is unaffected by the guard).
+# ══════════════════════════════════════════════════════════════════════════════
+echo
+echo "E. sandbox-shaped HOME suppresses the doctor auto-launch; real-shaped HOME still gets it"
+
+# Both E cases clear the pre-existing '$URL not connected' gate WITHOUT
+# HMD_KEEPER_BEAT_BIN (that seam already suppresses the doctor launch on its OWN
+# pre-existing condition — using it here would make the proof of the NEW guard
+# vacuous). No cp-endpoint.json is needed: net-default-guard.sh (sourced above)
+# already pins the zero-config baked-in default to a dead local port for this
+# whole file, so an undecided fresh HOME resolves $URL to that dead port with NO
+# real egress — and if the doctor DOES launch, it dials that same dead port and
+# this test kills it within ~1s regardless (HMD_DOCTOR_MAX_CYCLES/MAX_SECONDS=1).
+wait_pid_file() {  # $1 = glob -> prints the first match's content once one appears (~2s bound)
+  local i=0 f
+  while [ "$i" -lt 20 ]; do
+    for f in $1; do [ -f "$f" ] && { cat "$f" 2>/dev/null; return 0; }; done
+    i=$((i + 1)); sleep 0.1 2>/dev/null || sleep 1
+  done
+  return 1
+}
+
+# E1: SANDBOX-shaped HOME (fresh mktemp -d — the exact shape a hermetic install's
+# throwaway $HOME takes) -> the keeper loop still starts, but the doctor must NOT.
+E1_HOME="$(mktemp -d)"; mkdir -p "$E1_HOME/.heimdall"
+E1_DOCDIR="$E1_HOME/.heimdall/doctor"
+env -u HMD_KEEPER_BEAT_BIN -u HMD_DOCTOR_DISABLE HOME="$E1_HOME" \
+  HEIMDALL_DOCTOR_DIR="$E1_DOCDIR" HMD_DOCTOR_MAX_CYCLES=1 HMD_DOCTOR_MAX_SECONDS=1 HMD_DOCTOR_BACKOFF=0 \
+  "$BIN" keeper-start --session E1 --project "$PROJECT" --interval 30 >"$TMP/e1.out" 2>&1
+PF_E1="$HEIMDALL_KEEPER_DIR/acme_widget__E1.pid"
+"$PY" -c "import time;time.sleep(0.3)"
+if [ -f "$PF_E1" ] && kill -0 "$(cat "$PF_E1" 2>/dev/null)" 2>/dev/null; then
+  ok "E1a keeper-start still spawned the keeper loop under a sandbox HOME (unrelated to this guard)"
+else
+  bad "E1a keeper-start did not spawn the keeper loop under a sandbox HOME (unexpected — check the fixture, out=$(cat "$TMP/e1.out" 2>/dev/null))"
+fi
+DOC_PID_E1="$(wait_pid_file "$E1_DOCDIR"/*.pid || true)"
+if [ -z "$DOC_PID_E1" ]; then
+  ok "E1b sandbox HOME: NO doctor pidfile appeared under .heimdall/doctor — guard held (no leak)"
+else
+  bad "E1b sandbox HOME: a doctor pidfile appeared (pid=$DOC_PID_E1) — LEAK, guard did not hold (RED)"
+fi
+"$BIN" keeper-stop --session E1 --project "$PROJECT" >/dev/null 2>&1
+case "$DOC_PID_E1" in ''|*[!0-9]*) : ;; *) kill "$DOC_PID_E1" 2>/dev/null || true ;; esac
+rm -rf "$E1_HOME"; E1_HOME=""
+
+# E2: REAL-shaped HOME (a fixture dir under the repo checkout — never under any OS
+# temp root by construction) -> keeper-start's autoenroll MUST still launch the
+# doctor exactly as before the guard existed (proves real dev use is unaffected).
+E2_HOME="$REPO/.hmd-test-fixture-keeper-e2.$$"; mkdir -p "$E2_HOME/.heimdall"
+E2_DOCDIR="$E2_HOME/.heimdall/doctor"
+env -u HMD_KEEPER_BEAT_BIN -u HMD_DOCTOR_DISABLE HOME="$E2_HOME" \
+  HEIMDALL_DOCTOR_DIR="$E2_DOCDIR" HMD_DOCTOR_MAX_CYCLES=1 HMD_DOCTOR_MAX_SECONDS=1 HMD_DOCTOR_BACKOFF=0 \
+  "$BIN" keeper-start --session E2 --project "$PROJECT" --interval 30 >"$TMP/e2.out" 2>&1
+DOC_PID_E2="$(wait_pid_file "$E2_DOCDIR"/*.pid || true)"
+if [ -n "$DOC_PID_E2" ]; then
+  ok "E2 real-shaped HOME: the doctor STILL auto-launched (pid=$DOC_PID_E2) — real-use behavior unchanged"
+else
+  bad "E2 real-shaped HOME: the doctor did NOT auto-launch — the guard is OVER-BROAD, breaking real use (RED, out=$(cat "$TMP/e2.out" 2>/dev/null))"
+fi
+"$BIN" keeper-stop --session E2 --project "$PROJECT" >/dev/null 2>&1
+case "$DOC_PID_E2" in ''|*[!0-9]*) : ;; *) kill "$DOC_PID_E2" 2>/dev/null || true ;; esac
+"$PY" -c "import time;time.sleep(1.2)"   # let the bounded doctor (MAX_CYCLES=1s) finish naturally too
+rm -rf "$E2_HOME"; E2_HOME=""
 
 echo
 echo "============================================================"
