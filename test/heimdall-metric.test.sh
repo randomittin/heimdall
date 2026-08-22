@@ -39,6 +39,14 @@
 #        argued down with --min-samples.
 #   (13) FALSIFIABILITY — a corpus where a tier is obviously WORSE yields a
 #        recommendation AGAINST that tier (escalate away from it), never toward it.
+#   (14) TRUNCATION WARNS — a --type/--effort/--source value wider than its cap is
+#        still written (truncated), but ONLY after a stderr warning names the
+#        before/after value and the cap — silent truncation of provenance fields
+#        is exactly how "hook-subagentstop" became "hook-subagentsto" with no trace.
+#   (15) HONEST OMISSION — --type/--outcome are OPTIONAL. Omitting either records
+#        it (and --final, when --outcome is omitted) as JSON null rather than
+#        inventing a value — a hook that cannot truthfully know a field must be
+#        able to say so instead of guessing.
 
 set -euo pipefail
 
@@ -300,6 +308,35 @@ printf '%s' "$H" | jq -e '[.hypotheses[] | select(.proposal.to_model=="haiku")] 
 printf '%s' "$H" | jq -e '.hypotheses[] | select(.id=="hyp-cheap-docs-opus")' >/dev/null \
   && ok "(13) flawless expensive tier -> proposes the cheaper tier (cost win)" \
   || bad "(13) missed the cheapen hypothesis"
+
+# ── (14) TRUNCATION WARNS — never silent ──────────────────────────────────────
+R14="$(mk_repo truncwarn)"
+ERR="$("$CLI" --repo "$R14" task --type lint --model sonnet --source hook-subagentstop 2>&1 >/dev/null)"
+printf '%s' "$ERR" | grep -q -- '--source' && printf '%s' "$ERR" | grep -q 'hook-subagentstop' \
+  && ok "(14) an over-cap --source WARNS on stderr, naming the field and the untruncated value" \
+  || bad "(14) truncation was silent: stderr was: $ERR"
+L="$(last "$R14")"
+[ "$(printf '%s' "$L" | jq -r '.source')" = "hook-subagentsto" ] \
+  && ok "(14) the record still gets WRITTEN with the truncated value (warn, never drop)" \
+  || bad "(14) truncated record wrong: $L"
+ERR2="$("$CLI" --repo "$R14" task --type lint --model sonnet --source cli 2>&1 >/dev/null)"
+[ -z "$ERR2" ] && ok "(14) a --source within the cap warns about NOTHING" \
+  || bad "(14) an untruncated value still warned: $ERR2"
+
+# ── (15) HONEST OMISSION — --type/--outcome are optional, never guessed ───────
+R15="$(mk_repo honestomit)"
+"$CLI" --repo "$R15" task --model haiku >/dev/null
+L="$(last "$R15")"
+printf '%s' "$L" | jq -e '.task_type==null and .outcome==null and .final==null and .model=="haiku"' >/dev/null \
+  && ok "(15) omitting --type/--outcome records both (and --final) as null, model still lands" \
+  || bad "(15) honest omission produced a fabricated field: $L"
+[ "$(rows "$R15")" = "1" ] && ok "(15) exactly one row written despite two omitted fields" \
+  || bad "(15) omission wrote $(rows "$R15") rows"
+"$CLI" --repo "$R15" task --model sonnet --type security >/dev/null
+L="$(last "$R15")"
+printf '%s' "$L" | jq -e '.task_type=="security" and .outcome==null' >/dev/null \
+  && ok "(15) --type alone is honored independently of --outcome staying null" \
+  || bad "(15) partial omission wrong: $L"
 
 echo
 echo "-----------------------------------"

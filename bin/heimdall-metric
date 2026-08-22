@@ -118,6 +118,31 @@ def _slug(value, cap):
     return "".join(out).strip("-_")[:cap]
 
 
+def _slug_warn(value, cap, field):
+    """Like _slug, but WARNS ON STDERR when capping is about to cut real
+    content off, instead of truncating in silence. Provenance fields
+    (task_type/effort/source) must never be corrupted without a trace: this
+    repo shipped exactly that bug once already — EFFORT_MAX=16 turning
+    "hook-subagentstop" into "hook-subagentsto" with no signal anywhere
+    (bin/heimdall-metric-hook's own --source call, before it was shortened).
+    Detection re-slugs with a cap wide enough to guarantee no truncation —
+    collapsing can only shrink or hold length, never grow it, so len(value)+1
+    always fits the untruncated result — and compares; both calls go through
+    the same _slug(), so the returned (possibly truncated) value is
+    byte-identical to the un-warned path. Still returns it either way:
+    documented silent no-op on bad input means DROP the record, never
+    CORRUPT one that still gets written."""
+    slug = _slug(value, cap)
+    if value is not None:
+        uncapped = _slug(value, len(str(value)) + 1)
+        if uncapped != slug:
+            sys.stderr.write(
+                "heimdall-metric: warning: --%s truncated %r -> %r (%d-char cap)\n"
+                % (field, uncapped, slug, cap)
+            )
+    return slug
+
+
 class Rejected(Exception):
     """Input the emitter refuses to record (would poison or leak the corpus)."""
 
@@ -198,21 +223,30 @@ def _json_str(value):
 
 def _build(args):
     """Validate + shape the record. Raises Rejected on anything unrecordable."""
-    task_type = _slug(args.type, TYPE_MAX)
-    if not task_type:
-        raise Rejected("--type is required and must contain [a-z0-9_-]")
+    if args.type is None:
+        task_type = None   # genuinely absent — never guessed from a caller's role
+    else:
+        task_type = _slug_warn(args.type, TYPE_MAX, "type")
+        if not task_type:
+            raise Rejected("--type must contain [a-z0-9_-] when provided")
 
     model = _slug(args.model, EFFORT_MAX)
     if model not in TIERS:
         raise Rejected("--model must be one of %s, got %r" % ("|".join(TIERS), args.model))
 
-    outcome = _slug(args.outcome, EFFORT_MAX)
-    if outcome not in OUTCOMES:
-        raise Rejected("--outcome must be pass|fail, got %r" % (args.outcome,))
+    if args.outcome is None:
+        outcome = None      # genuinely unknown — e.g. a hook with no acceptance-check
+    else:
+        outcome = _slug(args.outcome, EFFORT_MAX)
+        if outcome not in OUTCOMES:
+            raise Rejected("--outcome must be pass|fail, got %r" % (args.outcome,))
 
-    final = _slug(args.final, EFFORT_MAX) if args.final is not None else outcome
-    if final not in OUTCOMES:
-        raise Rejected("--final must be pass|fail, got %r" % (args.final,))
+    if args.final is not None:
+        final = _slug(args.final, EFFORT_MAX)
+        if final not in OUTCOMES:
+            raise Rejected("--final must be pass|fail, got %r" % (args.final,))
+    else:
+        final = outcome  # defaults to outcome — None stays None, never fabricated
 
     escalated_to = None
     if args.escalated_to is not None:
@@ -221,8 +255,8 @@ def _build(args):
             raise Rejected("--escalated-to must be one of %s, got %r"
                            % ("|".join(TIERS), args.escalated_to))
 
-    effort = _slug(args.effort, EFFORT_MAX) or "default"
-    source = _slug(args.source, EFFORT_MAX) or "cli"
+    effort = _slug_warn(args.effort, EFFORT_MAX, "effort") or "default"
+    source = _slug_warn(args.source, EFFORT_MAX, "source") or "cli"
 
     retries = _int(args.retries, "--retries")
     wall_secs = _int(args.wall_secs, "--wall-secs")
@@ -236,11 +270,11 @@ def _build(args):
         '"ts":%s' % _json_str(_now()),
         '"metric":"task"',
         '"schema":%d' % SCHEMA_VERSION,
-        '"task_type":%s' % _json_str(task_type),
+        '"task_type":%s' % (_json_str(task_type) if task_type else "null"),
         '"model":%s' % _json_str(model),
         '"effort":%s' % _json_str(effort),
-        '"outcome":%s' % _json_str(outcome),
-        '"final":%s' % _json_str(final),
+        '"outcome":%s' % (_json_str(outcome) if outcome else "null"),
+        '"final":%s' % (_json_str(final) if final else "null"),
         '"retries":%d' % retries,
         '"escalated_to":%s' % (_json_str(escalated_to) if escalated_to else "null"),
         '"wall_secs":%d' % wall_secs,
@@ -338,12 +372,14 @@ def build_parser():
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     t = sub.add_parser("task", help="record ONE routing observation")
-    t.add_argument("--type", required=True,
-                   help="task type slug (the routing subject): lint, docs, code, ...")
+    t.add_argument("--type", default=None,
+                   help="task type slug (the routing subject): lint, docs, code, ... "
+                        "omit when the caller cannot know it honestly (recorded as null)")
     t.add_argument("--model", required=True,
                    help="tier that ran it: %s" % "|".join(TIERS))
-    t.add_argument("--outcome", required=True,
-                   help="pass|fail — acceptance criteria ON THE FIRST TRY at this tier")
+    t.add_argument("--outcome", default=None,
+                   help="pass|fail — acceptance criteria ON THE FIRST TRY at this tier; "
+                        "omit when unknowable at emit time (recorded as null)")
     t.add_argument("--final", default=None,
                    help="pass|fail — eventual verdict after retries (default: --outcome)")
     t.add_argument("--effort", default="default", help="effort level slug")
