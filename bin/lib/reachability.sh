@@ -76,6 +76,8 @@
 #   reach_exempt_reason ROOT NAME     the recorded reason for an exemption.
 #   reach_exempt_valid ROOT NAME      0 iff exempt AND well-formed AND not past recheck.
 #   reach_build_class WORKDIR    second closure over non-*.md edges only (needs reach_build first).
+#   reach_build_hook_class W     third closure: reach_build_class's own edges, seeded ONLY from
+#                                hook/MCP entry points (needs reach_build_class first).
 #   reach_hop_class REFERRER     LIVE / REACHABLE / PROSE-ONLY for one referrer path (pure).
 #   reach_class WORKDIR NAME     the overall class for bin/NAME; empty/rc1 if dead.
 #   reach_chain_classified W N   reach_chain's receipt, each hop tagged with its class.
@@ -405,6 +407,25 @@ reach_unacknowledged() {
 # is LIVE" and "no hop downstream needs a Markdown mention" are the only two things
 # reach_class has to check.
 #
+# TWO ALL-CODE PATHS CAN ALSO COMPETE, NOT JUST CODE-VS-PROSE. Excluding Markdown edges
+# (above) only settles code-vs-prose. Within edges-code alone, a bin can still be
+# reachable by TWO separate all-code routes — one rooted at a hook/MCP seed, one not —
+# and reach_build_class's own BFS is still single-parent: it keeps whichever route it
+# happened to traverse first, which turns on seed processing order (alphabetical), not
+# on which route is stronger evidence. bin/heimdall-brief hit exactly this: a comment in
+# bin/heimdall names bin/heimdall-deadcode, and a comment in bin/heimdall-deadcode names
+# bin/heimdall-brief — an all-code, two-hop route with no Markdown in it anywhere. Because
+# bin/heimdall sorts ahead of hooks/hooks.json in the seed list, that route gets recorded
+# as live-code's parent before the real hooks.json -> heimdall-precheck-agent ->
+# heimdall-brief route — equally all-code, equally two hops — gets its turn. Re-ordering
+# a single-parent map's tie-break is fragile and re-breaks the next time an unrelated
+# comment shuffles discovery order. So this is solved structurally instead:
+# reach_build_hook_class computes a THIRD closure over the very same edges-code, seeded
+# ONLY from hook/MCP entry points. "Is this bin a member of that closure at all" does not
+# care which parent the BFS recorded; it is existence, not a race. reach_class checks
+# live-hook-paths membership BEFORE live-code-paths, so a hook-rooted route always
+# outranks a non-hook route no matter which one BFS happened to discover first.
+#
 # NOT A HARD GATE (YET). PROSE-ONLY is reported, tallied, and shown — it does not fail
 # bin-reachability-gate and does not flip a verdict from CLEAN to ROT. 51 bins would go
 # red in one commit and the gate would be disabled within a day. Absorbing this into the
@@ -458,6 +479,56 @@ reach_build_class() {
   return 0
 }
 
+# reach_build_hook_class WORKDIR — a THIRD closure, over the SAME edges-code as
+# reach_build_class, seeded ONLY from the hook/MCP entry points (hooks/hooks.json,
+# .mcp.json) instead of the full seed set. A node in this closure is reachable WITHOUT
+# ever leaving an automatic-execution root — strictly stronger evidence than "some
+# all-code path exists" (reach_build_class) or "some path exists at all" (reach_build).
+# This is what turns "strongest class wins" into a membership test instead of a
+# single-parent tie-break: a bin can sit in BOTH this closure and a separate, non-hook
+# branch of live-code's own BFS at once, and because reach_class checks THIS set first,
+# the hook-rooted evidence always wins regardless of which parent live-code's map
+# happened to record for it. Requires reach_build_class to have already run (reads its
+# edges-code; does not rebuild it). Writes WORKDIR/{hook-seeds,live-hook,live-hook-paths}.
+reach_build_hook_class() {
+  local w="$1"
+  LC_ALL=C awk '$0 == "hooks/hooks.json" || $0 == ".mcp.json"' "$w/seeds" > "$w/hook-seeds" 2>/dev/null
+
+  LC_ALL=C awk -v nodesf="$w/nodes" -v seedsf="$w/hook-seeds" -v edgesf="$w/edges-code" '
+    BEGIN {
+      while ((getline l < nodesf) > 0) {
+        split(l, a, "\t")
+        n2p[a[1]] = ((a[1] in n2p) ? n2p[a[1]] " " : "") a[2]
+        base[a[2]] = a[1]
+      }
+      while ((getline s < seedsf) > 0)
+        if (!(s in live)) { live[s] = 1; par[s] = "<entry-point>"; q[++qn] = s }
+      while ((getline e < edgesf) > 0) {
+        split(e, b, "\t")
+        ed[b[1]] = ((b[1] in ed) ? ed[b[1]] " " : "") b[2]
+      }
+      h = 0
+      while (h < qn) {
+        p = q[++h]
+        if (!(p in ed)) continue
+        m = split(ed[p], t, " ")
+        for (j = 1; j <= m; j++) {
+          if (t[j] == base[p]) continue
+          k = split(n2p[t[j]], tp, " ")
+          for (z = 1; z <= k; z++) {
+            tg = tp[z]
+            if (tg == p || (tg in live)) continue
+            live[tg] = 1; par[tg] = p; q[++qn] = tg
+          }
+        }
+      }
+      for (p in live) printf "%s\t%s\n", p, par[p]
+    }' < /dev/null > "$w/live-hook"
+
+  cut -f1 "$w/live-hook" | LC_ALL=C sort -u > "$w/live-hook-paths"
+  return 0
+}
+
 # reach_hop_class REFERRER — the evidentiary weight of ONE hop, from what KIND of file
 # is doing the naming, never from what it says.
 reach_hop_class() {
@@ -468,30 +539,25 @@ reach_hop_class() {
   esac
 }
 
-# reach_chain_root WORKDIR MAPFILE PATH — walk MAPFILE's ("live" or "live-code", same
-# two-column shape) parent links from PATH back to the seed that roots it: the path
-# just before the "<entry-point>" sentinel.
-reach_chain_root() {
-  local w="$1" map="$2" cur="$3" par guard=0
-  while [ "$guard" -lt 64 ]; do
-    guard=$((guard + 1))
-    par="$(LC_ALL=C awk -F'\t' -v p="$cur" '$1 == p { print $2; exit }' "$w/$map")"
-    [ -n "$par" ] && [ "$par" != "<entry-point>" ] || { printf '%s\n' "$cur"; return 0; }
-    cur="$par"
-  done
-  printf '%s\n' "$cur"
-}
-
-# reach_class WORKDIR NAME — LIVE, REACHABLE, or PROSE-ONLY for bin/NAME. rc 1 with no
-# output if bin/NAME is dead. Requires reach_build_class to have already run.
+# reach_class WORKDIR NAME — LIVE, REACHABLE, or PROSE-ONLY for bin/NAME: the STRONGEST
+# class over ALL paths, never merely the one path reach_build_class's own BFS happened
+# to record. Structural, not a tie-break: LIVE means some path stays entirely in code
+# AND roots at a hook/MCP seed (membership in live-hook-paths); REACHABLE means some
+# path stays entirely in code but none of those roots at a hook/MCP seed
+# (live-code-paths, checked only once live-hook-paths has ruled LIVE out); PROSE-ONLY
+# means reachable at all, but every all-code closure misses it. Checking live-hook-paths
+# BEFORE live-code-paths is what makes "strongest wins": a bin can be a member of both at
+# once, and membership does not care which parent either map's single-parent BFS
+# recorded. rc 1 with no output if bin/NAME is dead. Requires reach_build_class AND
+# reach_build_hook_class to have already run.
 reach_class() {
-  local w="$1" name="$2" path="bin/$2" root
+  local w="$1" name="$2" path="bin/$2"
+  if LC_ALL=C grep -qxF "$path" "$w/live-hook-paths" 2>/dev/null; then
+    printf 'LIVE\n'
+    return 0
+  fi
   if LC_ALL=C grep -qxF "$path" "$w/live-code-paths" 2>/dev/null; then
-    root="$(reach_chain_root "$w" "live-code" "$path")"
-    case "$root" in
-      hooks/hooks.json|.mcp.json) printf 'LIVE\n' ;;
-      *)                          printf 'REACHABLE\n' ;;
-    esac
+    printf 'REACHABLE\n'
     return 0
   fi
   if reach_is_live "$w" "$name"; then
@@ -502,13 +568,18 @@ reach_class() {
 }
 
 # reach_chain_classified WORKDIR NAME — reach_chain's receipt, each hop tagged with its
-# reach_hop_class. Shows the code-only chain (see reach_build_class) when one exists —
-# so a hook-wired tool shows its real wiring rather than a shorter prose mention that
-# also happens to name it — and falls back to the ordinary transitive chain, which
-# necessarily carries at least one Markdown hop, only when no code-only path exists.
+# reach_hop_class. Walks the STRONGEST closure bin/NAME belongs to: live-hook first (so a
+# LIVE bin's receipt shows its real hook-rooted route, never a shorter or
+# earlier-discovered non-hook route that live-code's own single-parent map might
+# otherwise have recorded for it), then live-code (so a REACHABLE bin's receipt stays
+# all-code, never a shorter prose hop), and only falls back to the ordinary transitive
+# chain — which necessarily carries at least one Markdown hop — when no all-code path
+# exists at all.
 reach_chain_classified() {
   local w="$1" name="$2" cur="bin/$2" out="" par cur_cls="" map guard=0
-  if LC_ALL=C grep -qxF "$cur" "$w/live-code-paths" 2>/dev/null; then
+  if LC_ALL=C grep -qxF "$cur" "$w/live-hook-paths" 2>/dev/null; then
+    map="live-hook"
+  elif LC_ALL=C grep -qxF "$cur" "$w/live-code-paths" 2>/dev/null; then
     map="live-code"
   elif reach_is_live "$w" "$name"; then
     map="live"

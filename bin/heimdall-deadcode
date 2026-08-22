@@ -92,6 +92,7 @@ scan() {
     return 2
   fi
   reach_build_class "$W"
+  reach_build_hook_class "$W"
   return 0
 }
 
