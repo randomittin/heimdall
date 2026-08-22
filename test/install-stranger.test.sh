@@ -16,7 +16,14 @@
 #      were actually placed (no "~/.heimdall" vs "~/.local/bin" contradiction).
 #   4. PATH SETUP — `hmd` is reachable after install: the installer appends the
 #      bin dir to the user's shell profile, idempotently (a second run must not
-#      double-append), so the headline `hmd demo` actually runs.
+#      double-append), so the headline `hmd demo` actually runs. On a fresh
+#      install NEITHER next-step command the card prints — the early success
+#      card's "Next:" line, nor the later "Run:" line (after the validation
+#      gate) — may be a bare `hmd demo`/`heimdall demo`: the profile write
+#      only helps FUTURE shells, so a copy-pasted command must either bake in
+#      `export PATH=...` itself (the "Run:" line has room to) or point at the
+#      one that does (the width-constrained "Next:" line doesn't), never
+#      assume the reader also noticed a separate, later caveat.
 #
 # Usage:
 #   test/install-stranger.test.sh                 # uses repo of this checkout @ HEAD
@@ -226,6 +233,42 @@ if [ -n "$PROFILE" ]; then
     ok "after sourcing profile, hmd/heimdall resolves on PATH ($WHICH)"
   else
     bad "after sourcing profile, hmd not on PATH (got: ${WHICH:-<empty>})"
+  fi
+fi
+
+# (4a) NEXT-STEP COMMANDS ARE NEVER A BROKEN PROMISE — on a fresh install
+# PATH_STATE is "appended": ensure_path_on_profile only ever writes the shell
+# PROFILE FILE, for FUTURE shells — it cannot touch this already-running
+# process's $PATH. TWO places print a next-step command: the early success
+# card's "Next:" line (Section 5), and the later "Run:" line (Section 6, after
+# the validation gate). Neither may be a bare `hmd demo`/`heimdall demo` here —
+# that exact command is command-not-found in the user's CURRENT shell. This
+# regressed once: both lines used to print before the PATH caveat, so the
+# headline command a stranger actually copies failed silently on the single
+# most common path (measured: 0 dispatcher invocations of `hmd demo` across
+# 384 real sessions).
+#
+# The "Run:" line only appears when validation passed (VALIDATED=1); a failed
+# validation gate correctly WITHHOLDS it and prints NOT READY instead —
+# that is a working gate earning its keep, not this bug, so it is asserted
+# separately rather than conflated with a PATH regression.
+if [ -n "$PROFILE" ]; then
+  NEXT_LINE="$(grep -E '^ *Next:' <<<"$CARD" | head -1)"
+  if grep -qE 'Next: *(hmd|heimdall) demo *$' <<<"$NEXT_LINE"; then
+    bad "early card's Next: line is BARE on a fresh install — command-not-found in this shell: ${NEXT_LINE:-<not printed>}"
+  else
+    ok "early card's Next: line does not promise a dead command on a fresh install (${NEXT_LINE:-<not printed>})"
+  fi
+
+  if grep -q 'NOT READY' <<<"$CARD"; then
+    ok "validation gate failed in this environment and correctly withheld the Run: go-ahead (a separate, pre-existing concern from PATH ordering, not this regression)"
+  else
+    RUN_LINE="$(grep -E '^ *Run:' <<<"$CARD" | head -1)"
+    if grep -q 'export PATH=' <<<"$RUN_LINE"; then
+      ok "Run: line is self-contained on a fresh install (embeds export PATH=)"
+    else
+      bad "Run: line is BARE on a fresh install — command-not-found in this shell: ${RUN_LINE:-<not printed>}"
+    fi
   fi
 fi
 
