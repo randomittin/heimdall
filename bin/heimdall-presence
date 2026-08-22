@@ -1230,6 +1230,33 @@ _keeper_start() {
   # doctor is its OWN detached process (nohup+disown) so it outlives + runs independent of the
   # keeper loop. SKIPPED under the keeper's beat-injection test seam (HMD_KEEPER_BEAT_BIN) and
   # an explicit HMD_DOCTOR_DISABLE, so hermetic tests never trigger the doctor's real network.
+  # SANDBOX GUARD. A HOME under a system temp root means this is a sandboxed
+  # install (the hermetic suites run install.sh under `env -i HOME="$(mktemp -d)"`).
+  # The sandbox is deleted when the test ends; a detached doctor is NOT, and it
+  # lives HMD_DOCTOR_MAX_SECONDS (1800) longer as an orphan. Its singleton lock is
+  # per-project and every temp HOME is a distinct project, so the lock never dedupes
+  # them: measured 32 live orphans at load 6.23 on a 10-core box, which then tripped
+  # the suites' own wall-clock watchdogs and made passing code report as hung.
+  #
+  # Why not the HMD_DOCTOR_DISABLE seam directly above: `env -i` strips every parent
+  # variable, so the harness CANNOT hand that flag to the install it launches. The
+  # existing seam still works for a caller that controls the environment; it simply
+  # cannot reach this path. That is why this guard is intrinsic and path-based rather
+  # than another opt-out variable.
+  #
+  # Path-sniffing infers intent from a string, which is a real limitation: a user
+  # whose HOME genuinely lives under a temp root loses the self-healing doctor. That
+  # is the deliberate trade — a rare degraded install beats a guaranteed process leak
+  # on every test run — and HMD_DOCTOR_ALLOW_TMP_HOME=1 exists for anyone (or any
+  # future test asserting the spawn) who needs to override it explicitly.
+  case "${HOME:-}" in
+    /tmp/*|/private/tmp/*|/var/folders/*/T/*)
+      if [ -z "${HMD_DOCTOR_ALLOW_TMP_HOME:-}" ]; then
+        [ -n "${HMD_DEBUG:-}" ] && printf 'heimdall-presence: doctor spawn skipped, HOME is under a temp root (%s)\n' "${HOME:-}" >&2
+        return 0
+      fi
+      ;;
+  esac
   DOCTOR_BIN="$SELF_DIR/heimdall-presence-doctor"
   if [ -x "$DOCTOR_BIN" ] && [ -z "${HMD_KEEPER_BEAT_BIN:-}" ] && [ -z "${HMD_DOCTOR_DISABLE:-}" ]; then
     nohup "$DOCTOR_BIN" --bg </dev/null >/dev/null 2>&1 &
