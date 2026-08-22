@@ -246,6 +246,81 @@ set -e
   && ok "(10) FAIL-OPEN: malformed 'overrides' shape (not an object) also degrades to empty" \
   || bad "(10) malformed overrides shape crashed status (rc=$RC2): $ST2"
 
+# ── (11) POLICY GUARD: fable is not a routing default -> refused (exit 5) ─────
+R="$(mk_repo fable)"
+set +e
+OUT="$("$CLI" --repo "$R" experiment start --hypothesis x \
+  --from '{"task_type":"test","to_model":"fable","baseline":{"pass_rate":0.5,"samples":20}}' \
+  2>"$WORK/fable.stderr")"
+RC=$?
+set -e
+[ "$RC" = "5" ] \
+  && ok "(11) POLICY: fable refused as a routing variant (exit 5)" \
+  || bad "(11) fable variant not refused (rc=$RC): $OUT"
+grep -qi "fable" "$WORK/fable.stderr" \
+  && ok "(11) refusal names fable as the reason" \
+  || bad "(11) refusal reason doesn't mention fable: $(cat "$WORK/fable.stderr")"
+[ ! -f "$R/.planning/routing-overrides.json" ] \
+  && ok "(11) refused override never reached disk" \
+  || bad "(11) fable override was written to disk despite refusal"
+
+# ── (12) POLICY GUARD: adjudication task_type refused OFF opus (exit 5) ────────
+R="$(mk_repo adjud)"
+set +e
+OUT="$("$CLI" --repo "$R" experiment start --hypothesis x \
+  --from '{"task_type":"security","to_model":"sonnet","baseline":{"pass_rate":1.0,"samples":20}}' \
+  2>"$WORK/adjud.stderr")"
+RC=$?
+set -e
+[ "$RC" = "5" ] \
+  && ok "(12) POLICY: adjudication task_type refused off opus (exit 5)" \
+  || bad "(12) adjudication downgrade not refused (rc=$RC): $OUT"
+grep -qi "adjudication" "$WORK/adjud.stderr" \
+  && ok "(12) refusal names the adjudication policy" \
+  || bad "(12) refusal reason doesn't mention adjudication: $(cat "$WORK/adjud.stderr")"
+[ ! -f "$R/.planning/routing-overrides.json" ] \
+  && ok "(12) refused adjudication override never reached disk" \
+  || bad "(12) adjudication override was written to disk despite refusal"
+# positive control: opus itself must remain ALLOWED for an adjudication task_type
+# (the policy blocks a DOWNGRADE off opus, not opus itself).
+R="$(mk_repo adjudok)"
+OUT2="$("$CLI" --repo "$R" experiment start --hypothesis x \
+  --from '{"task_type":"security","to_model":"opus","baseline":{"pass_rate":0.5,"samples":20}}')"
+[ "$(echo "$OUT2" | jq -r '.override_applied')" = "true" ] \
+  && ok "(12) positive control: security->opus is NOT blocked by the adjudication policy" \
+  || bad "(12) opus itself wrongly refused for adjudication task_type: $OUT2"
+
+# ── (13) POLICY GUARD: a pinned model id is refused, not just tier aliases ─────
+R="$(mk_repo pinned)"
+set +e
+OUT="$("$CLI" --repo "$R" experiment start --hypothesis x \
+  --from '{"task_type":"test","to_model":"claude-opus-4-20260101","baseline":{"pass_rate":0.5,"samples":20}}' \
+  2>"$WORK/pinned.stderr")"
+RC=$?
+set -e
+[ "$RC" = "5" ] \
+  && ok "(13) POLICY: a pinned model id is refused as a routing variant (exit 5)" \
+  || bad "(13) pinned model id not refused (rc=$RC): $OUT"
+grep -qi "tier alias" "$WORK/pinned.stderr" \
+  && ok "(13) refusal cites the tier-alias contract" \
+  || bad "(13) refusal reason doesn't cite tier alias contract: $(cat "$WORK/pinned.stderr")"
+[ ! -f "$R/.planning/routing-overrides.json" ] \
+  && ok "(13) refused pinned-id override never reached disk" \
+  || bad "(13) pinned-id override was written to disk despite refusal"
+
+# ── (15) POLICY GUARD: an adjudication cheapen hypothesis is surfaced but NOT testable ──
+R="$(mk_repo policyhyp)"
+cat > "$R/.planning/metrics.jsonl" <<'EOF'
+{"ts":"2026-07-01T00:00:00Z","metric":"task","task_type":"review","model":"opus","outcome":"pass","retries":0,"wall_secs":10}
+{"ts":"2026-07-01T01:00:00Z","metric":"task","task_type":"review","model":"opus","outcome":"pass","retries":0,"wall_secs":11}
+{"ts":"2026-07-01T02:00:00Z","metric":"task","task_type":"review","model":"opus","outcome":"pass","retries":0,"wall_secs":9}
+EOF
+echo '{"dead":[],"done":[]}' > "$R/.planning/queue-stats.json"
+HP="$("$CLI" --repo "$R" hypotheses)"
+echo "$HP" | jq -e '.hypotheses[] | select(.id=="hyp-cheap-review-opus" and .testable==false and (.policy_reason | test("adjudication")))' >/dev/null \
+  && ok "(15) POLICY: adjudication-class cheapen hypothesis surfaced but marked non-testable" \
+  || bad "(15) policy-blocked cheapen hypothesis not correctly annotated: $(echo "$HP" | jq -c '.hypotheses[] | select(.id=="hyp-cheap-review-opus")')"
+
 echo "======================="
 printf "self-improve: \033[32m%d passed\033[0m, " "$PASS"
 if [ "$FAIL" -gt 0 ]; then printf "\033[31m%d failed\033[0m\n" "$FAIL"; exit 1; fi
