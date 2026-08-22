@@ -165,7 +165,7 @@ cmd_add_conflict() {
   local json="${1:?conflict JSON required}"
   local tmp
   tmp=$(mktemp)
-  jq --argjson entry "$json" '.conflict_log += [$entry]' "$STATE_FILE" > "$tmp" && mv "$tmp" "$STATE_FILE"
+  jq --argjson entry "$json" '.conflict_log += [$entry] | .quality_gates.conflict_reflection_done = false' "$STATE_FILE" > "$tmp" && mv "$tmp" "$STATE_FILE"
   release_lock
   echo "Conflict logged."
 }
