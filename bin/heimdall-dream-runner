@@ -29,7 +29,8 @@
 #   of failing mute.
 #
 # USAGE
-#   heimdall-dream-runner --dream PATH --repo DIR [--python PATH] [--status FILE] [dream args...]
+#   heimdall-dream-runner --dream PATH --repo DIR [--python PATH] [--interpreter PATH]
+#                         [--status FILE] [dream args...]
 #
 #   Trailing args are forwarded verbatim to dream after `--repo DIR`, so the plist keeps
 #   encoding the full, readable overnight command:
@@ -44,6 +45,19 @@
 #   INSTALL time (while a real user's PATH exists) and writes it into the plist; this runner
 #   execs through it. Absent the flag the shebang is used exactly as before, so a runner
 #   invoked by hand still behaves the way it always did.
+#
+# --interpreter: RECORDS WHICH IDENTITY ACTUALLY RAN THIS, FOR DRIFT DETECTION.
+#   Separate from --python: this is the INTERPRETER EXECUTING THIS SCRIPT (bash), not the
+#   one dream runs under. heimdall-dream-schedule now points ProgramArguments[0] at a
+#   private, ad-hoc-signed copy of bash (see heimdall-dream-bundle) instead of the shared
+#   system /bin/bash, so a Full Disk Access grant can be narrow. TCC keys that grant to
+#   the exact code identity, though, so if the binary is ever rebuilt (a macOS update
+#   changes /bin/bash; a reinstall regenerates the bundle) the OLD grant silently stops
+#   applying. This flag lets the runner record, in its own status file, the CDHash of
+#   whatever actually executed it — heimdall-dream-permission compares that recording
+#   against the CURRENT on-disk identity to notice the drift instead of assuming a past
+#   grant holds forever. Absent the flag, no identity is recorded and drift cannot be
+#   detected — harmless, just less self-aware.
 #
 # ENV
 #   HEIMDALL_HOME          state dir (default $HOME/.heimdall)
@@ -65,17 +79,19 @@ LABEL="com.heimdall.dream"
 DREAM=""
 REPO=""
 PYTHON=""
+INTERPRETER=""
 FORWARD=()
 
 die() { echo "heimdall-dream-runner: error: $*" >&2; exit 2; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --dream)  DREAM="${2:-}"; shift 2 ;;
-    --repo)   REPO="${2:-}";  shift 2 ;;
-    --python) PYTHON="${2:-}"; shift 2 ;;
-    --status) STATUS="${2:-}"; shift 2 ;;
-    --help|-h) sed -n '2,58p' "$SELF" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --dream)       DREAM="${2:-}"; shift 2 ;;
+    --repo)        REPO="${2:-}"; shift 2 ;;
+    --python)      PYTHON="${2:-}"; shift 2 ;;
+    --interpreter) INTERPRETER="${2:-}"; shift 2 ;;
+    --status)      STATUS="${2:-}"; shift 2 ;;
+    --help|-h) sed -n '2,72p' "$SELF" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) FORWARD+=("$1"); shift ;;
   esac
 done
@@ -83,6 +99,14 @@ done
 [ -n "$DREAM" ] || die "--dream is required"
 [ -n "$REPO" ]  || die "--repo is required"
 [ ${#FORWARD[@]} -gt 0 ] || FORWARD=(run --overnight)
+
+# Best-effort, non-fatal identity recording (see --interpreter above). codesign absent,
+# --interpreter unset, or the path not actually signed all just leave this blank — never
+# worth failing an otherwise-working dream run over.
+INTERPRETER_CDHASH=""
+if [ -n "$INTERPRETER" ] && [ -x "$INTERPRETER" ] && command -v codesign >/dev/null 2>&1; then
+  INTERPRETER_CDHASH="$(codesign -dvvv "$INTERPRETER" 2>&1 | sed -n 's/^CDHash=//p' | head -1)"
+fi
 
 # ── the liveness receipt (bin/heimdall-liveness) ──────────────────────────────────
 # dream is the subsystem whose 26-day silence motivated the receipt, so its writer has to
