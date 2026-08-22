@@ -1,0 +1,188 @@
+diff --git a/bin/heimdall-ctx-meter b/bin/heimdall-ctx-meter
+index fc1f5b6..bb87771 100755
+--- a/bin/heimdall-ctx-meter
++++ b/bin/heimdall-ctx-meter
+@@ -48,6 +48,7 @@
+ #   heimdall-ctx-meter publish [--session SID]   # stdin: the statusLine JSON blob
+ #   heimdall-ctx-meter read    [--session SID] [--json]
+ #   heimdall-ctx-meter notice  [--session SID]   # stdin: the UserPromptSubmit JSON
++#   heimdall-ctx-meter outshare [--json]         # local output-token share vs input (see ENVIRONMENT)
+ #
+ # ENVIRONMENT (defaults are the measured figures, not taste)
+ #   HEIMDALL_HOME       state root (default ~/.heimdall)
+@@ -57,6 +58,9 @@
+ #   HMD_CTX_TTL         900     seconds a reading stays current; older -> NON_VERIFIED
+ #   HMD_CTX_REARM       100000  further growth before the ceiling notice repeats
+ #   HMD_CTX_NOW         epoch-second override (tests)
++#   HMD_CTX_PROJECTS_ROOT  outshare: root walked for *.jsonl transcripts (default ~/.claude/projects)
++#   HMD_HEADROOM_LEDGER    outshare: headroom ledger read for lifetime.total_input_tokens
++#                          (default ~/.headroom/proxy_savings.json)
+ 
+ set -uo pipefail
+ 
+@@ -103,7 +107,7 @@ while [ $# -gt 0 ]; do
+   case "$1" in
+     --session) SESSION="${2:-}"; shift 2 ;;
+     --json)    JSON_OUT=1; shift ;;
+-    --help|-h) sed -n '2,72p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
++    --help|-h) sed -n '2,76p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+     *) shift ;;
+   esac
+ done
+@@ -420,15 +424,151 @@ do_notice() {
+   exit 0
+ }
+ 
++# ── outshare — OUTPUT-TOKEN SHARE of local spend, vs external lifetime input ────
++# The measurement caveman/hmd output-wording compression was missing: what share
++# of token spend is even OUTPUT — the only thing output-wording compression can
++# touch? Sums every local session transcript's REAL usage via heimdall-tokens'
++# sum_session (never a second parser) and compares it against headroom's external
++# lifetime.total_input_tokens, so the ceiling on any output-compression claim is
++# measured, not asserted.
++do_outshare() {
++  local proj_root ledger tokens_bin py out
++  proj_root="${HMD_CTX_PROJECTS_ROOT:-$HOME/.claude/projects}"
++  ledger="${HMD_HEADROOM_LEDGER:-$HOME/.headroom/proxy_savings.json}"
++  tokens_bin="$(cd "$(dirname "$_CTXM_SELF")" && pwd)/heimdall-tokens"
++
++  py=""
++  if type hmd_python >/dev/null 2>&1; then py="$(hmd_python 2>/dev/null || true)"; fi
++  [ -n "$py" ] || py="$(command -v python3 2>/dev/null || true)"
++  [ -n "$py" ] || py="$(command -v python 2>/dev/null || true)"
++  if [ -z "$py" ]; then
++    if [ "$JSON_OUT" = 1 ]; then
++      printf '{"state":"NON_VERIFIED","reason":"no-python3"}\n'
++    else
++      printf 'NON_VERIFIED (no-python3 -- cannot sum transcripts without an interpreter)\n'
++    fi
++    exit 0
++  fi
++
++  out="$("$py" -c '
++import json, os, sys
++
++proj_root, ledger_path, tokens_bin, json_out = sys.argv[1:5]
++
++mod = None
++try:
++    import importlib.util
++    spec = importlib.util.spec_from_file_location("heimdall_tokens_lib", tokens_bin)
++    if spec and spec.loader:
++        mod = importlib.util.module_from_spec(spec)
++        spec.loader.exec_module(mod)
++except Exception:
++    mod = None
++
++def emit(state, **fields):
++    if json_out == "1":
++        rec = {"state": state}
++        rec.update(fields)
++        print(json.dumps(rec))
++    else:
++        reason = fields.get("reason")
++        if reason:
++            print("NON_VERIFIED (%s)" % reason)
++        else:
++            print("NON_VERIFIED")
++
++if mod is None or not hasattr(mod, "sum_session"):
++    emit("NON_VERIFIED", reason="no-tokens-module")
++    sys.exit(0)
++
++totals = {"input_tokens": 0, "output_tokens": 0, "cache_creation_tokens": 0, "cache_read_tokens": 0}
++scanned = 0
++if os.path.isdir(proj_root):
++    for root, _dirs, files in os.walk(proj_root):
++        for name in files:
++            if not name.endswith(".jsonl"):
++                continue
++            rec = mod.sum_session(os.path.join(root, name))
++            if rec.get("error"):
++                continue
++            scanned += 1
++            for k in totals:
++                totals[k] += int(rec.get(k) or 0)
++
++if scanned == 0:
++    emit("NON_VERIFIED", reason="no-transcripts")
++    sys.exit(0)
++
++local_total = sum(totals.values())
++output_share_local = (totals["output_tokens"] / local_total) if local_total > 0 else None
++
++ext_input = None
++try:
++    with open(ledger_path, "r", encoding="utf-8") as fh:
++        led = json.load(fh)
++    v = led.get("lifetime", {}).get("total_input_tokens")
++    if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0:
++        ext_input = int(v)
++except Exception:
++    ext_input = None
++
++output_share_ext = (totals["output_tokens"] / ext_input) if ext_input else None
++
++result = {
++    "sessions_scanned": scanned,
++    "local_input_tokens": totals["input_tokens"],
++    "local_output_tokens": totals["output_tokens"],
++    "local_cache_creation_tokens": totals["cache_creation_tokens"],
++    "local_cache_read_tokens": totals["cache_read_tokens"],
++    "local_total_tokens": local_total,
++    "output_share_of_local_total": output_share_local,
++    "external_lifetime_input_tokens": ext_input,
++    "output_share_vs_external_lifetime_input": output_share_ext,
++}
++
++if json_out == "1":
++    out = {"state": "OK"}
++    out.update(result)
++    print(json.dumps(out))
++else:
++    def pct(x):
++        return ("%.6f%%" % (x * 100)) if isinstance(x, (int, float)) else "n/a"
++    print("sessions scanned                        : %d" % result["sessions_scanned"])
++    print("local input tokens                      : %d" % result["local_input_tokens"])
++    print("local output tokens                     : %d" % result["local_output_tokens"])
++    print("local cache-creation tokens              : %d" % result["local_cache_creation_tokens"])
++    print("local cache-read tokens                  : %d" % result["local_cache_read_tokens"])
++    print("local total tokens                       : %d" % result["local_total_tokens"])
++    print("output share of local total              : %s" % pct(result["output_share_of_local_total"]))
++    if ext_input:
++        print("external lifetime input tokens           : %d" % ext_input)
++        print("output share vs external lifetime input  : %s" % pct(result["output_share_vs_external_lifetime_input"]))
++    else:
++        print("output share vs external lifetime input  : n/a (no headroom ledger)")
++' "$proj_root" "$ledger" "$tokens_bin" "$JSON_OUT" 2>/dev/null)"
++
++  if [ -z "$out" ]; then
++    if [ "$JSON_OUT" = 1 ]; then
++      printf '{"state":"NON_VERIFIED","reason":"outshare-internal-error"}\n'
++    else
++      printf 'NON_VERIFIED (outshare-internal-error)\n'
++    fi
++    exit 0
++  fi
++  printf '%s\n' "$out"
++  exit 0
++}
++
+ CEILING_H="$(_commas "$CEILING")"
+ 
+ case "$VERB" in
+-  publish) do_publish ;;
+-  read)    do_read ;;
+-  notice)  do_notice ;;
+-  ''|--help|-h|help) sed -n '2,72p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
++  publish)  do_publish ;;
++  read)     do_read ;;
++  notice)   do_notice ;;
++  outshare) do_outshare ;;
++  ''|--help|-h|help) sed -n '2,76p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+   *)
+-    printf 'heimdall-ctx-meter: unknown verb "%s" (expected publish|read|notice)\n' "$VERB" >&2
++    printf 'heimdall-ctx-meter: unknown verb "%s" (expected publish|read|notice|outshare)\n' "$VERB" >&2
+     exit 64
+     ;;
+ esac
