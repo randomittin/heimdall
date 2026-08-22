@@ -375,13 +375,34 @@ reach_unacknowledged() {
 #   LIVE         the referrer is hooks/hooks.json or .mcp.json — the harness or an MCP
 #                client executes this registration automatically. No judgment call
 #                sits between "the file says so" and "it runs".
-#   REACHABLE    the referrer is any other non-Markdown file — a real script, a real
-#                dispatch arm, a real config line. Deterministic once triggered, but
-#                the trigger is a deliberate act: a human types `hmd foo`, one script
-#                execs another.
-#   PROSE-ONLY   the referrer is a *.md file, anywhere. An agent had to read that
-#                sentence and choose to act on it. That choice is not automatic and is
-#                not guaranteed, however confidently the sentence reads.
+#   REACHABLE    the referrer is any other non-Markdown file, OR a commands/*.md file —
+#                a real script, a real dispatch arm, a real config line, or a declared
+#                slash-command entry point. Deterministic once triggered, but the
+#                trigger is a deliberate act: a human types `hmd foo` or `/foo`, one
+#                script execs another.
+#   PROSE-ONLY   the referrer is a *.md file OUTSIDE commands/ — agents/, skills/,
+#                docs, or anywhere else prose lives. An agent had to read that sentence
+#                and choose to act on it. That choice is not automatic and is not
+#                guaranteed, however confidently the sentence reads.
+#
+# COMMANDS/*.MD ARE A DECLARED ENTRY POINT, NOT PROSE. A file under commands/ is a
+# Claude Code slash-command definition: a human types `/name` and the harness loads
+# that file's body as the operative instruction for that one turn, for its one
+# declared purpose. That is structurally identical to "a human types `hmd foo`" —
+# already scored REACHABLE — not to agents/heimdall.md or a skills/**/*.md procedure
+# doc, where a bin's name is one instruction among hundreds, mentioned in passing and
+# conditionally acted upon. commands/debloat.md's entire body IS `bin/heimdall-debloat
+# report [<path>]` and its sibling invocations — the command's only content, not an
+# aside inside a larger document. Treating that the same as a stray mention in a
+# 500-line persona doc under-counted real entry points: commands/reflect.md's whole
+# purpose is to run `conflict-log unresolved` and `conflict-log reflect-all`, and
+# scoring that PROSE-ONLY reported a declared, human-triggered command as merely
+# something an agent "might" read and "might" act on. reach_root_seeds already trusts
+# every file under commands/ enough to seed liveness FROM it with no path needed; it
+# would be incoherent to then trust that same directory too little to vouch for a
+# child it names. agents/ and skills/ get no such carve-out: those directories hold
+# multi-purpose reference material where a bin's name is incidental, not the file's
+# entire reason to exist.
 #
 # THE SHORTEST PATH IS NOT THE STRONGEST PATH. reach_build's BFS records exactly one
 # parent per node — whichever predecessor reaches it in the FEWEST hops — because the
@@ -432,17 +453,19 @@ reach_unacknowledged() {
 # exemption registry is a follow-up, not this change.
 
 # reach_build_class WORKDIR — a SECOND closure over the SAME scan, restricted to edges
-# whose REFERRER is not a *.md file. Requires reach_build to have already written
-# WORKDIR/{nodes,seeds,edges}; reads them, never re-scans the tree. A node reachable
-# here is reachable without ever having to trust a sentence — a strictly stronger claim
-# than plain reachability, so this closure is always a subset of reach_build's. Because
-# the underlying BFS still explores every node reachable via the allowed edges (not
-# merely one path), "in this closure at all" is a sound test for "some all-code path
-# exists" — not just "the one path found happens to avoid prose". Writes
+# whose REFERRER is not a *.md file, OR is a commands/*.md file (a declared slash-command
+# entry point — see COMMANDS/*.MD ARE A DECLARED ENTRY POINT above). Requires reach_build
+# to have already written WORKDIR/{nodes,seeds,edges}; reads them, never re-scans the
+# tree. A node reachable here is reachable without ever having to trust an agent's
+# discretionary reading of a sentence — a strictly stronger claim than plain
+# reachability, so this closure is always a subset of reach_build's. Because the
+# underlying BFS still explores every node reachable via the allowed edges (not merely
+# one path), "in this closure at all" is a sound test for "some all-code-or-declared-
+# command path exists" — not just "the one path found happens to avoid prose". Writes
 # WORKDIR/{edges-code,live-code,live-code-paths}.
 reach_build_class() {
   local w="$1"
-  LC_ALL=C awk -F'\t' '$1 !~ /\.md$/ { print }' "$w/edges" > "$w/edges-code" 2>/dev/null
+  LC_ALL=C awk -F'\t' '$1 !~ /\.md$/ || $1 ~ /^commands\// { print }' "$w/edges" > "$w/edges-code" 2>/dev/null
 
   LC_ALL=C awk -v nodesf="$w/nodes" -v seedsf="$w/seeds" -v edgesf="$w/edges-code" '
     BEGIN {
@@ -530,10 +553,13 @@ reach_build_hook_class() {
 }
 
 # reach_hop_class REFERRER — the evidentiary weight of ONE hop, from what KIND of file
-# is doing the naming, never from what it says.
+# is doing the naming, never from what it says. commands/*.md is checked BEFORE the
+# general *.md case: it is a declared slash-command entry point (a human types `/name`),
+# not incidental prose — see COMMANDS/*.MD ARE A DECLARED ENTRY POINT above.
 reach_hop_class() {
   case "$1" in
     hooks/hooks.json|.mcp.json) printf 'LIVE\n' ;;
+    commands/*.md)              printf 'REACHABLE\n' ;;
     *.md)                       printf 'PROSE-ONLY\n' ;;
     *)                          printf 'REACHABLE\n' ;;
   esac
