@@ -42,7 +42,11 @@
 #      stub gate. So stderr is asserted, not assumed.
 #   2. The warning is ACTIONABLE: it names TaskStop (the cleanup the spawner now
 #      owns), the orphan-finder, the mailbox cause, and the no-result consequence.
-#   3. Nothing blocks. No exit 2 anywhere, on any input, ever.
+#   3. Nothing in the named-agent notice path blocks: no exit 2 anywhere in
+#      that code, on any input, ever. (The same delegate script also runs an
+#      unrelated brief-adoption gate with its own legitimate exit 2, for a
+#      NON_VERIFIED protocol store — a different concern, out of this
+#      suite's scope; structural checks below are scoped to exclude it.)
 #   4. An ordinary unnamed spawn is silent — a warning on every spawn is noise,
 #      and noise gets muted, which is how a signal dies.
 #   5. HEIMDALL_ALLOW_NAMED_AGENT=1 SUPPRESSES the warning ("I know what I'm
@@ -347,29 +351,67 @@ fi
 # ── 6. STRUCTURAL: the hook is wired the way it must stay wired ─────────────
 CMD_TEXT=$(cat "$GATE")
 
-case "$CMD_TEXT" in
-  *tool_input.name*) ok "hook reads .tool_input.name (the field that triggers mailbox mode)" ;;
-  *) bad "hook never reads .tool_input.name — nothing implements R13" ;;
-esac
+# hooks.json is thin wiring now: it delegates enforcement to whatever bin/
+# scripts it invokes (currently bin/heimdall-precheck-agent). Checking
+# CMD_TEXT alone would be vacuous for R13 — the .tool_input.name read, the
+# no-exit-2 guarantee, and the printf|jq path all live in the delegate, not in
+# hooks.json's one-liner. Resolve every bin/<script> the command actually
+# invokes and inspect that too.
+RESOLVED="$CMD_TEXT"
+for ref in $(grep -oE 'bin/[A-Za-z0-9_.-]+' <<<"$CMD_TEXT" | sort -u); do
+  refpath="$REPO/$ref"
+  # Only fold in TEXT scripts. bin/ can also hold compiled binaries (e.g.
+  # bin/parallelism-tracker is Mach-O); cat-ing raw binary bytes into this
+  # string makes every later sed/grep over it liable to die with "illegal
+  # byte sequence" the moment it hits invalid UTF-8 mid-binary. `file` is
+  # near-universal; if it is ever missing, skip the ref rather than risk
+  # concatenating something unreadable.
+  if [ -f "$refpath" ] && command -v file >/dev/null 2>&1 && file "$refpath" | grep -qi text; then
+    RESOLVED="$RESOLVED
+$(cat "$refpath")"
+  fi
+done
 
-# The load-bearing downgrade assertion. A behavioural test can only sample the
-# payloads it thought of; this one proves no input at all can produce a block.
-if grep -qE 'exit[[:space:]]+2' <<<"$CMD_TEXT"; then
-  bad "hook still contains an 'exit 2' — some input path can still DENY a spawn"
-else
-  ok "hook contains no 'exit 2' — no input path can block a spawn"
-fi
+# bin/heimdall-precheck-agent is DUAL-purpose: the named-agent notice (R13,
+# this suite) and an unrelated brief-adoption gate with its own legitimate
+# exit 2 (NON_VERIFIED protocol store) and its own jq calls. Checking the
+# whole resolved chain would let the brief-adoption gate's real exit 2 trip
+# the "no exit 2" assertion, and its unrelated jq calls would make the
+# printf|jq assertion pass no matter what the named-agent code does. Scope to
+# the named-agent section only, via the script's own section markers.
+NAMED_SECTION=$(sed -n '/^# -- named-agent notice -/,/^# -- brief-adoption gate -/p' <<<"$RESOLVED" | sed '$d')
 
-if grep -qE "printf[[:space:]]+'%s'[[:space:]]+\"\\\$INPUT\"[[:space:]]*\|[[:space:]]*jq" <<<"$CMD_TEXT"; then
-  ok "payload reaches jq via printf '%s' (byte-exact), not echo"
+if [ -z "$NAMED_SECTION" ]; then
+  bad "could not isolate the named-agent-notice section from the resolved hook chain — structural checks below would be vacuous, skipping them"
+elif grep -q 'NON_VERIFIED' <<<"$NAMED_SECTION"; then
+  bad "named-agent section extraction leaked past its boundary into the brief-adoption gate — section markers may have moved, skipping checks below rather than blaming the wrong code"
 else
-  bad "payload does not reach jq via printf '%s' — escape-carrying input will corrupt"
-fi
+  case "$NAMED_SECTION" in
+    *tool_input.name*) ok "hook reads .tool_input.name (the field that triggers mailbox mode)" ;;
+    *) bad "hook never reads .tool_input.name — nothing implements R13" ;;
+  esac
 
-if grep -qE "echo[[:space:]]+\"?\\\$[A-Za-z_]" <<<"$CMD_TEXT"; then
-  bad "hook pipes a shell variable through echo — reintroduces the escape-expansion defect"
-else
-  ok "hook never feeds a shell variable through echo"
+  # The load-bearing downgrade assertion. A behavioural test can only sample the
+  # payloads it thought of; this one proves no input at all can produce a block,
+  # in the named-agent path specifically — the delegate's unrelated
+  # brief-adoption gate has its own legitimate exit 2 and must not trip this.
+  if grep -qE 'exit[[:space:]]+2' <<<"$NAMED_SECTION"; then
+    bad "named-agent notice contains an 'exit 2' — some input path can still DENY a spawn over R13"
+  else
+    ok "hook contains no 'exit 2' in the named-agent path — no input path can block a spawn over R13"
+  fi
+
+  if grep -qE "printf[[:space:]]+'%s'[[:space:]]+\"\\\$INPUT\"[[:space:]]*\|[[:space:]]*jq" <<<"$NAMED_SECTION"; then
+    ok "payload reaches jq via printf '%s' (byte-exact), not echo"
+  else
+    bad "payload does not reach jq via printf '%s' — escape-carrying input will corrupt"
+  fi
+
+  if grep -qE "echo[[:space:]]+\"?\\\$[A-Za-z_]" <<<"$NAMED_SECTION"; then
+    bad "hook pipes a shell variable through echo — reintroduces the escape-expansion defect"
+  else
+    ok "hook never feeds a shell variable through echo"
+  fi
 fi
 
 case "$CMD_TEXT" in

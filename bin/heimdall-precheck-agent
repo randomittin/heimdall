@@ -75,14 +75,14 @@ INPUT="$(cat 2>/dev/null || true)"
 if [ "${HEIMDALL_ALLOW_NAMED_AGENT:-}" != "1" ]; then
   TAIL="A named spawn goes MAILBOX-RESIDENT - the harness parks it to receive instructions via mailbox, so it never self-terminates and never returns a result to the spawn call. Do NOT await it (measured over 109 spawns in one session: 0 of 43 named ever completed, vs 59 of 66 unnamed) - collect its work another way. THE SPAWNER OWNS THE CLEANUP: call TaskStop on this agent once its work is done. TaskStop only reaches agents THIS session spawned, so a cross-session stop returns \"No task found with ID\". Find leaked ones with: bin/heimdall-agents orphans. If you did not want a mailbox, identify the work with description: instead of name: (convention R13). Set HEIMDALL_ALLOW_NAMED_AGENT=1 to silence this notice."
   if [ -z "$INPUT" ]; then
-    printf 'BIFROST - Heimdall named-agent notice: the spawn payload was EMPTY, so a name: cannot be ruled out - warning rather than assuming this spawn is unnamed. %s\n' "$TAIL" >&2
+    printf '⚠️  BIFRÖST — Heimdall named-agent notice: the spawn payload was EMPTY, so a name: cannot be ruled out - warning rather than assuming this spawn is unnamed. %s\n' "$TAIL" >&2
   elif command -v jq >/dev/null 2>&1; then
     NAME="$(printf '%s' "$INPUT" | jq -r '.tool_input.name // empty' 2>/dev/null)"
     NAMERC=$?
     if [ "$NAMERC" -ne 0 ]; then
-      printf 'BIFROST - Heimdall named-agent notice: the spawn payload could not be parsed, so a name: cannot be ruled out - warning rather than assuming this spawn is unnamed. %s\n' "$TAIL" >&2
+      printf '⚠️  BIFRÖST — Heimdall named-agent notice: the spawn payload could not be parsed, so a name: cannot be ruled out - warning rather than assuming this spawn is unnamed. %s\n' "$TAIL" >&2
     elif [ -n "$NAME" ]; then
-      printf 'BIFROST - Heimdall named-agent notice: name: was set on the spawn. %s\n' "$TAIL" >&2
+      printf '⚠️  BIFRÖST — Heimdall named-agent notice: name: was set on the spawn. %s\n' "$TAIL" >&2
     fi
   fi
 fi
