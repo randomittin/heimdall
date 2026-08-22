@@ -5,7 +5,7 @@
 
 ---
 
-**Sections:** 0 method · 1 headline · 2 orphaned bins · 3 orphaned agents · 4 the nine known instances · 5 live · 6 reachable · 7 claimed-only · 9 arm-usage control · 10 `--help` coverage · 11 clean surfaces · 12 tests-vs-production · 13 oracles & modules · **14 bottom line**
+**Sections:** 0 method · 1 headline · 2 orphaned bins · 3 orphaned agents · 4 the nine known instances · 5 live · 6 reachable · 7 claimed-only · 9 arm-usage control · 10 `--help` coverage · 11 clean surfaces · 12 tests-vs-production · 13 oracles & modules · 15 mid-audit correction · **14 bottom line**
 
 ---
 
@@ -311,7 +311,11 @@ Of the **51 zero-invocation, non-hook-wired binaries** (§2):
 | **Named by at least one test file** | **41** |
 | Named by no test at all | 10 |
 
-**41 of 51 orphans are under test.** Test coverage in this repo is therefore *anti-correlated* with production liveness — the well-tested tools are disproportionately the cold ones, because a test is what a careful author writes instead of a caller.
+**41 of 51 orphans are under test.**
+
+> **Not a copy-paste error.** §2 also reports 41 — the orphans *unacknowledged by the exemption registry*. The two 41s are a genuine coincidence over **different sets**, verified: 8 members differ in each direction. Unacknowledged-but-untested: `authenticity-check`, `conflict-log`, `detect-skills`, `heimdall-blackboard`, `heimdall-checkpoint-share`, `heimdall-face-test`, `report-issue`, `stack-detect`. Acknowledged-but-tested: `generate-changelog`, `heimdall-branch-context`, `heimdall-collision`, `heimdall-cost-model-refresh`, `heimdall-issue-corpus`, `heimdall-registry-hygiene`, `heimdall-s6-manifest`, `heimdall-vm-bench`.
+
+Test coverage in this repo is therefore *anti-correlated* with production liveness — the well-tested tools are disproportionately the cold ones, because a test is what a careful author writes instead of a caller.
 
 **Measured proof that these are green, not merely present.** I ran five dedicated orphan suites:
 
@@ -350,6 +354,32 @@ That is 66+ green assertions across five binaries with **zero measured invocatio
 
 ---
 
+## 15. Mid-audit correction — `heimdall-brief` was wired WHILE this census ran
+
+Recorded rather than quietly folded in, because the timing is itself evidence about how this repo drifts.
+
+`main` moved under this audit. Commit **`0dd97fe` — "feat(precheck-agent): auto-invoke heimdall-brief instead of suggesting it"** (merged as `7916be4`) landed between my first read of `hooks/hooks.json` and my second. My first read recorded `PreToolUse/Agent → bin/heimdall-agents, bin/parallelism-tracker`; the current file reads `PreToolUse/Agent → bin/heimdall-precheck-agent, bin/parallelism-tracker`.
+
+**What changed (MEASURED):**
+
+| Capability | Was (§1, §4 #1) | Now | Evidence |
+|---|---|---|---|
+| `heimdall-brief` | **ORPHANED** — instructed in prose, 0 invocations in the production window | **LIVE** | `grep -c heimdall-precheck-agent hooks/hooks.json` → 1; `bin/heimdall-precheck-agent:70` sets `BRIEF_BIN="$BIN_DIR/heimdall-brief"` and *auto-builds and substitutes* a brief into over-long spawn prompts, refusing the spawn outright on `NON_VERIFIED` |
+| `heimdall-agents` | **LIVE** (`PreToolUse/Agent` hook) | **REACHABLE** — de-wired but heavily used by hand (118 measured invocations, e.g. `heimdall-agents orphans`) | `grep -c heimdall-agents hooks/hooks.json` → **0**; `heimdall-deadcode --why` now clears it via prose in `agents/coder.md` |
+
+**No regression in the swap:** the `name:`-warning behaviour that `CLAUDE.md` documents for the `PreToolUse Agent` hook survived — `grep -cE '\bname:' bin/heimdall-precheck-agent` → 6.
+
+**Three things this correction demonstrates, which matter more than the correction itself:**
+
+1. **The fix is the right shape.** The commit message says the old path was "advisory-only… measured to be ignored 100% of the time (0 real heimdall-brief invocations)" — the same measurement this census made independently. The remedy was to stop *instructing* and start *invoking*. That is exactly the LIVE-vs-REACHABLE gap in §1 being closed by mechanism rather than by prose, and it is the template for the other 50 orphans.
+2. **A prose instruction is confirmed to be worth ~zero adoption.** Two independent measurements now agree on 0% compliance for an instructed-but-uninvoked capability. Any remaining capability whose only "caller" is a sentence in Markdown (§1 lists ten such chains) should be assumed inert until wired.
+3. **`heimdall-agents` shows the failure mode runs both ways.** De-wiring a hook silently converted a LIVE capability into a REACHABLE one, and `heimdall-deadcode` reports no change at all — it said REACHABLE before and says REACHABLE now, because a prose mention in `agents/coder.md` backfilled the vanished hook. **A reference-reachability gate cannot detect a hook being removed.** That is the §1 blind spot demonstrated in the opposite direction, on live code, within one working day.
+
+**Net effect on the census:** the orphan count drops by one (51 → 50 uninvoked). Every other verdict in §§1–14 stands as measured. Sections above were deliberately *not* rewritten — they record the state at audit time, and this section records the delta.
+
+
+---
+
 ## 14. Bottom line for launch
 
 Ordered by what an owner should act on first.
@@ -361,7 +391,7 @@ Ordered by what an owner should act on first.
 5. **7 of 16 agent definitions have never been spawned** across 432 `Agent` calls, including both halves of the advertised `/hmd:maintain` loop (`seeker`, `fixer`) and the entire `waves.json` executor (`wave-executor`). (§3)
 6. **Two documented quality gates are effectively unenforced**: lint (`lint-quality` 0/432 spawns vs "Lint clean (zero warnings)") and review (`hmd:reviewer` 4/432 vs "Mandatory before any push"). (§3, §7)
 7. **`sysmon` still is not wired.** `grep -c sysmon hooks/hooks.json` → 0. It grades disk CRIT correctly and 44 measured invocations prove agents find it useful — it just never runs on its own. One `SessionStart` line would make it LIVE. (§4 #6)
-8. **`heimdall-brief` is the template defect and it is still inert.** Real code, green tests, instructed in the orchestrator prompt, zero invocations across the entire 08-08 → 08-21 production window. A passing test proves the code works; it does not prove anything calls it. Four of the nine known instances had exactly this shape, which is why the census weighted measured execution over reference reachability throughout. (§1, §4 #1)
+8. **`heimdall-brief` was the template defect — and it was fixed mid-audit (§15).** Sibling commit `0dd97fe` wired it into the `PreToolUse/Agent` hook so it now auto-invokes instead of being suggested; it is **LIVE** as of this report. Its history remains the template: Real code, green tests, instructed in the orchestrator prompt, zero invocations across the entire 08-08 → 08-21 production window. A passing test proves the code works; it does not prove anything calls it. Four of the nine known instances had exactly this shape, which is why the census weighted measured execution over reference reachability throughout. (§1, §4 #1)
 
 9. **Test coverage is anti-correlated with liveness: 41 of 51 orphans are under test**, and five sampled orphan suites returned 66+ green assertions with zero invocations between them. `350 suites all green` and `51 binaries never run` are simultaneously true. (§12)
 10. **`evals/oracles/registry.json` is read only by tests** — oracle discovery is path-convention based, so the registry is production-shaped configuration that nothing in production reads. Its 9-entries-vs-10-directories drift is harmless today and load-bearing the day someone wires it up. (§13)
