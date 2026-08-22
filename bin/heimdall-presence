@@ -1184,21 +1184,33 @@ _keeper_loop() {
 }
 
 # _sandbox_home — true when $HOME resolves under an OS temp root ($TMPDIR, /tmp, /var/tmp,
-# and their macOS /private/* real paths — mktemp -d's own territory). EXISTS BECAUSE: a
-# hermetic install (`env -i HOME="$(mktemp -d)" ... install.sh`) reaches the doctor
-# auto-launch below through a REAL SessionStart hook fired by heimdall-doctor-install's
-# headless `claude --cc-verify` probe (install.sh §5a) — a genuine, correct hook firing,
-# NOT a test stubbing keeper-start directly. `env -i` wipes every env var the harness does
-# not explicitly re-list, so the usual test-only escape hatch (a NEW env-var seam) can never
-# reach this deep without editing that harness's allowlist — confirmed empty-handed (the
-# cc-verify probe itself sets no marker either). $HOME is therefore the only signal left
-# standing: the harness MUST set it for the sandbox to mean anything at all, so unlike an
-# added env var it can never simply go missing.
+# their macOS /private/* real paths, and macOS's per-user Darwin temp root — mktemp -d's own
+# territory). EXISTS BECAUSE: a hermetic install (`env -i HOME="$(mktemp -d)" ... install.sh`)
+# reaches the doctor auto-launch below through a REAL SessionStart hook fired by
+# heimdall-doctor-install's headless `claude --cc-verify` probe (install.sh §5a) — a genuine,
+# correct hook firing, NOT a test stubbing keeper-start directly. `env -i` wipes every env var
+# the harness does not explicitly re-list, so the usual test-only escape hatch (a NEW env-var
+# seam) can never reach this deep without editing that harness's allowlist — confirmed
+# empty-handed (the cc-verify probe itself sets no marker either). $HOME is therefore the only
+# signal left standing: the harness MUST set it for the sandbox to mean anything at all, so
+# unlike an added env var it can never simply go missing.
+#
+# CAUGHT LIVE (test/install-stranger.test.sh's real run_install(), post-first-fix): `env -i`
+# ALSO wipes $TMPDIR, and on macOS `mktemp -d` roots its output under the per-user Darwin temp
+# dir (/var/folders/<xx>/<hash>/T/tmp.XXXXXXXX) — a path that is neither /tmp nor /var/tmp, so
+# with $TMPDIR gone the plain path list above never recognizes it and the guard silently does
+# not fire for exactly the real trigger it exists to catch (confirmed: a real install-stranger
+# run leaked 2 live doctors after the first fix landed). `getconf DARWIN_USER_TEMP_DIR` reads
+# that same root via confstr(3) — keyed off the real uid, not an env lookup — so it survives
+# `env -i` intact and needs no cooperation from the wiped environment. Harmless elsewhere:
+# non-macOS (or a stripped-down PATH missing `getconf`) just yields an empty candidate, which
+# the loop below already skips.
 _sandbox_home() {
   [ -n "${HOME:-}" ] || return 1
-  local h rt t
+  local h rt t darwin_tmp
   h="$(cd "$HOME" 2>/dev/null && pwd -P)" || h="$HOME"
-  for t in "${TMPDIR:-}" /tmp /var/tmp /private/tmp /private/var/tmp; do
+  darwin_tmp="$(command -v getconf >/dev/null 2>&1 && getconf DARWIN_USER_TEMP_DIR 2>/dev/null)"
+  for t in "${TMPDIR:-}" /tmp /var/tmp /private/tmp /private/var/tmp "$darwin_tmp"; do
     [ -n "$t" ] || continue
     t="${t%/}"
     rt="$(cd "$t" 2>/dev/null && pwd -P)" || rt="$t"

@@ -58,10 +58,10 @@ export HEIMDALL_KEEPER_DIR="$TMP/keeper"  # keeper pidfile home (never ~/.heimda
 mkdir -p "$HEIMDALL_HOME" "$HEIMDALL_KEEPER_DIR"
 # HOME is a throwaway so a stray global presence-off/config never bleeds in from the dev box.
 export HOME="$TMP/fakehome"; mkdir -p "$HOME/.heimdall"
-# Section E's two extra fixture homes — pre-declared (not just assigned in Section E) so
+# Section E's three extra fixture homes — pre-declared (not just assigned in Section E) so
 # `cleanup` below can safely reference them under `set -u` even if the script exits before
 # Section E ever runs (an unset-variable reference inside a trap would itself abort mid-cleanup).
-E1_HOME=""; E2_HOME=""
+E1_HOME=""; E2_HOME=""; E3_HOME=""
 cleanup() {
   # best-effort: kill any keeper this test may have left, then remove the tree.
   for pf in "$HEIMDALL_KEEPER_DIR"/*.pid; do
@@ -71,6 +71,7 @@ cleanup() {
   done
   [ -n "$E1_HOME" ] && rm -rf "$E1_HOME"
   [ -n "$E2_HOME" ] && rm -rf "$E2_HOME"
+  [ -n "$E3_HOME" ] && rm -rf "$E3_HOME"
   rm -rf "$TMP"
 }
 trap cleanup EXIT
@@ -302,6 +303,32 @@ fi
 case "$DOC_PID_E2" in ''|*[!0-9]*) : ;; *) kill "$DOC_PID_E2" 2>/dev/null || true ;; esac
 "$PY" -c "import time;time.sleep(1.2)"   # let the bounded doctor (MAX_CYCLES=1s) finish naturally too
 rm -rf "$E2_HOME"; E2_HOME=""
+
+# E3: env -i (NOT plain env like E1/E2) with a REAL mktemp -d HOME — mirrors the EXACT shape
+# of test/install-stranger.test.sh's real run_install() (env -i HOME="$TMPH" ...), which wipes
+# $TMPDIR along with everything else not re-listed. On macOS, mktemp -d roots its output under
+# the per-user Darwin temp dir (/var/folders/<xx>/<hash>/T/tmp.XXXXXXXX) — neither /tmp nor
+# /var/tmp — so a $TMPDIR-only check misses it once $TMPDIR itself is gone. This is the exact
+# case that leaked in production: a real install-stranger run left 2 live doctors after the
+# first (TMPDIR-only) guard landed, because it drives keeper-start through env -i, not plain
+# env. getconf DARWIN_USER_TEMP_DIR (env-independent — confstr(3), keyed off the real uid) is
+# what closes it; this section is what proves that closure, not just the fix in isolation.
+E3_HOME="$(mktemp -d)"; mkdir -p "$E3_HOME/.heimdall"
+E3_DOCDIR="$E3_HOME/.heimdall/doctor"
+env -i HOME="$E3_HOME" TERM="dumb" PATH="$PATH" \
+  HEIMDALL_DEFAULT_CP_URL="$HEIMDALL_DEFAULT_CP_URL" HEIMDALL_KEEPER_DIR="$HEIMDALL_KEEPER_DIR" \
+  HEIMDALL_DOCTOR_DIR="$E3_DOCDIR" HMD_DOCTOR_MAX_CYCLES=1 HMD_DOCTOR_MAX_SECONDS=1 HMD_DOCTOR_BACKOFF=0 \
+  "$BIN" keeper-start --session E3 --project "$PROJECT" --interval 30 >"$TMP/e3.out" 2>&1
+DOC_PID_E3="$(wait_pid_file "$E3_DOCDIR"/*.pid || true)"
+if [ -z "$DOC_PID_E3" ]; then
+  ok "E3 env -i (TMPDIR wiped) + real mktemp HOME: NO doctor pidfile appeared — guard holds under the exact install-stranger trigger shape"
+else
+  bad "E3 env -i (TMPDIR wiped) + real mktemp HOME: a doctor pidfile appeared (pid=$DOC_PID_E3) — LEAK under the real trigger shape (RED)"
+fi
+"$BIN" keeper-stop --session E3 --project "$PROJECT" >/dev/null 2>&1
+case "$DOC_PID_E3" in ''|*[!0-9]*) : ;; *) kill "$DOC_PID_E3" 2>/dev/null || true ;; esac
+"$PY" -c "import time;time.sleep(1.2)"   # let the bounded doctor (MAX_CYCLES=1s) finish naturally too
+rm -rf "$E3_HOME"; E3_HOME=""
 
 echo
 echo "============================================================"
