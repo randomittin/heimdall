@@ -160,6 +160,16 @@
         ]
       }
     ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; HOOK=\"$PLUGIN/bin/heimdall-metric-hook\"; if [ -x \"$HOOK\" ]; then \"$HOOK\" stop --repo \"${CLAUDE_PROJECT_DIR:-.}\"; fi; exit 0"
+          }
+        ]
+      }
+    ],
     "SessionEnd": [
       {
         "hooks": [

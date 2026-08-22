@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+# heimdall-metric-hook — mechanical bridge from the SubagentStop hook event to
+# `heimdall-metric task`, so routing-relevant records land in
+# .planning/metrics.jsonl without depending on anyone remembering the prose
+# instruction to call heimdall-metric themselves.
+#
+# WHY: measured in THIS repo, hooks that PERFORM get ~100% adoption while
+# advisory/prose-instructed mechanisms get ignored — 130 parallelism-tracker
+# records vs 5 heimdall-metric records over the same 83-day window
+# (.planning/metrics.jsonl). bin/heimdall-dream has never fired once: "task-
+# outcome records seen: 5" sits under its own 20-per-(task_type,model) sample
+# floor. The fix is not a louder reminder (measured to fail the same way,
+# repeatedly) — it's a hook that calls heimdall-metric itself, unconditionally.
+#
+# WHAT THIS HONESTLY OBSERVES vs WHAT IT REFUSES TO GUESS:
+#   task_type — REAL: SubagentStop's own required `agent_type` field, slugged.
+#   model     — REAL, but STATIC: read from the agent's own agents/<name>.md
+#               frontmatter (`model:` line) — the same table the orchestrator
+#               itself dispatches from. This is NOT the live per-call model:
+#               a spawn-time `model:` override on the Agent tool_input is
+#               invisible to SubagentStop (confirmed: no hook-accessible
+#               `model` field exists outside SessionStart), and
+#               subagent_type=fork always inherits the parent's own live
+#               model (the Agent tool's own documented contract), which a
+#               hook has no way to observe either — so fork calls are SKIPPED
+#               below, never guessed at.
+#   effort    — REAL: SubagentStop's own `effort.level` field, when present.
+#               Omitted (not defaulted) when absent.
+#   outcome   — REAL, mechanical: read from the subagent's own Status
+#               Contract token in `last_assistant_message` (DONE /
+#               DONE_WITH_CONCERNS -> pass; NEEDS_CONTEXT / BLOCKED -> fail).
+#               Every hmd:* agent definition mandates this exact vocabulary as
+#               the FIRST thing in its final message, so this reads a signal
+#               the agent already committed to — not a proxy for one. Checked
+#               only in the first few lines, where the contract places it; a
+#               message carrying neither token there records NOTHING, on
+#               purpose — silence beats a fabricated verdict.
+#   wall_secs, retries, escalated_to — DELIBERATELY OMITTED in this version.
+#               SubagentStop is a single, self-sufficient event with no
+#               correlated start-time or retry-count reachable from it without
+#               a fragile cross-event join (tool_use_id is not echoed back to
+#               SubagentStop). Leaving a field heimdall-metric already
+#               defaults sensibly (0) unset is honest; inventing a start time
+#               to subtract would not be.
+#
+# MUST FAIL OPEN — a metrics emitter is telemetry, not a correctness gate.
+# Every path below reaches exit 0; heimdall-metric is never called with
+# --strict, and its own exit code is always discarded.
+set -uo pipefail
+# No `set -e`, on purpose (mirrors bin/heimdall-precheck-agent): a stray
+# nonzero from jq/grep on an odd payload must fall through to the next guard
+# clause, never abort the script counted as some kind of denial — this hook
+# has no denial path at all, only "record" or "skip".
+
+SELF="$0"
+if command -v readlink >/dev/null 2>&1; then
+  SELF="$(readlink -f "$0" 2>/dev/null || readlink "$0" 2>/dev/null || echo "$0")"
+fi
+BIN_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+PLUGIN_DIR="$(cd "$BIN_DIR/.." && pwd)"
+METRIC_BIN="$BIN_DIR/heimdall-metric"
+
+cmd_stop() {
+  local target_repo="."
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repo) target_repo="${2:-.}"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+
+  local input
+  input="$(cat 2>/dev/null || true)"
+  [ -n "$input" ] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+
+  local agent_type
+  agent_type="$(printf '%s' "$input" | jq -r '.agent_type // empty' 2>/dev/null)"
+  [ -n "$agent_type" ] || return 0
+  [ "$agent_type" != "fork" ] || return 0   # live model unobservable here — skip, never guess
+
+  local task_type
+  task_type="$(printf '%s' "$agent_type" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9_-' '-')"
+  case "$task_type" in ''|-*) return 0 ;; esac
+
+  local name def_file cand
+  name="${agent_type#hmd:}"
+  def_file=""
+  for cand in "$PLUGIN_DIR/agents/$name.md" "$PLUGIN_DIR/agents/$agent_type.md"; do
+    if [ -f "$cand" ]; then def_file="$cand"; break; fi
+  done
+  [ -n "$def_file" ] || return 0
+
+  local model
+  model="$(grep -m1 '^model:' "$def_file" 2>/dev/null | sed -E 's/^model:[[:space:]]*//; s/[[:space:]]+$//')"
+  case "$model" in
+    haiku|sonnet|opus) ;;
+    *) return 0 ;;   # "inherit", unknown, or missing — genuinely unknown, skip rather than guess
+  esac
+
+  local last_msg head_lines outcome
+  last_msg="$(printf '%s' "$input" | jq -r '.last_assistant_message // empty' 2>/dev/null)"
+  [ -n "$last_msg" ] || return 0
+  head_lines="$(printf '%s\n' "$last_msg" | head -3)"
+  if printf '%s' "$head_lines" | grep -qE 'NEEDS_CONTEXT|BLOCKED'; then
+    outcome=fail
+  elif printf '%s' "$head_lines" | grep -qE 'DONE(_WITH_CONCERNS)?'; then
+    outcome=pass
+  else
+    return 0   # no recognized status token near the start — record nothing
+  fi
+
+  local effort
+  effort="$(printf '%s' "$input" | jq -r '.effort.level // empty' 2>/dev/null)"
+
+  [ -x "$METRIC_BIN" ] || return 0
+
+  # --source is capped at 16 chars by heimdall-metric's own EFFORT_MAX (shared
+  # cap for effort/source, bin/heimdall-metric:91) — "subagentstop" (12 chars,
+  # naming the real hook event) fits it; the longer "hook-subagentstop" would
+  # silently truncate to "hook-subagentsto" instead of erroring, since _slug()
+  # truncates rather than rejects.
+  local args=(task --type "$task_type" --model "$model" --outcome "$outcome" --source subagentstop)
+  [ -n "$effort" ] && args+=(--effort "$effort")
+  "$METRIC_BIN" --repo "$target_repo" "${args[@]}" >/dev/null 2>&1 || true
+  return 0
+}
+
+case "${1:-}" in
+  stop) shift; cmd_stop "$@" ;;
+esac
+exit 0
