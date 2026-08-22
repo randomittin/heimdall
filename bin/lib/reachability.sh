@@ -148,6 +148,88 @@ reach_subjects() {
 
 # ── the closure ───────────────────────────────────────────────────────────────────
 
+# reach_extract_tokens ROOT SCANSET — "path:token" for every alphabet-token run in
+# every text file named in SCANSET (paths relative to ROOT), in one comment-aware pass.
+# Binaries are skipped before they're ever opened for tokenizing (a -l pre-pass reusing
+# grep's own -I heuristic, not a filter after the fact — a compiled artifact's byte soup
+# was never a call site). A '#'-to-EOL comment is stripped before tokenizing UNLESS: the
+# '#' sits inside a single- or double-quoted string (bash/python/jq all agree a quoted
+# '#' isn't a comment start), the line is inside a heredoc body (that's the heredoc's own
+# payload, not a comment — left verbatim, tokenized as-is), or the file has no '#'-comment
+# syntax at all (*.md's '#' is a heading marker; *.json/*.c/*.h use different or no
+# comment syntax — *.c/*.h diagnostic-string false positives are a separate, already-
+# tracked gap, not this function's job) — see is_comment_aware() below. A name that only
+# ever appears after a real comment marker is a mention, not an invocation, and must not
+# read as an edge.
+reach_extract_tokens() {
+  local root="$1" scanset="$2"
+  ( cd "$root" \
+      && export LC_ALL=C \
+      && tr '\n' '\0' < "$scanset" \
+      | xargs -0 grep -Il '.' 2>/dev/null \
+      | tr '\n' '\0' \
+      | xargs -0 awk '
+      function is_comment_aware(fname) {
+        if (fname ~ /\.md$/)   return 0
+        if (fname ~ /\.json$/) return 0
+        if (fname ~ /\.c$/)    return 0
+        if (fname ~ /\.h$/)    return 0
+        return 1
+      }
+      function strip_comment(line,    i, n, c, out, in_sq, in_dq) {
+        n = length(line); out = ""; in_sq = 0; in_dq = 0
+        for (i = 1; i <= n; i++) {
+          c = substr(line, i, 1)
+          if (in_sq) { out = out c; if (c == SQ) in_sq = 0; continue }
+          if (in_dq) {
+            out = out c
+            if (c == "\\" && i < n) { i++; out = out substr(line, i, 1); continue }
+            if (c == DQ) in_dq = 0
+            continue
+          }
+          if (c == SQ) { in_sq = 1; out = out c; continue }
+          if (c == DQ) { in_dq = 1; out = out c; continue }
+          if (c == "\\" && i < n) { out = out c substr(line, i + 1, 1); i++; continue }
+          if (c == "#") break
+          out = out c
+        }
+        return out
+      }
+      function emit(fname, line,    rest, tok) {
+        rest = line
+        while (match(rest, /[A-Za-z0-9_.-]+/)) {
+          tok = substr(rest, RSTART, RLENGTH)
+          print fname ":" tok
+          rest = substr(rest, RSTART + RLENGTH)
+        }
+      }
+      BEGIN {
+        SQ = sprintf("%c", 39); DQ = sprintf("%c", 34)
+        heretok_re = "<<-?[ \t]*[" SQ DQ "]?[A-Za-z_][A-Za-z0-9_]*[" SQ DQ "]?"
+      }
+      FNR == 1 { in_heredoc = 0; heredoc_term = ""; heredoc_striptabs = 0; aware = is_comment_aware(FILENAME) }
+      {
+        line = $0
+        if (in_heredoc) {
+          chk = line
+          if (heredoc_striptabs) sub(/^\t+/, "", chk)
+          if (chk == heredoc_term) in_heredoc = 0
+          emit(FILENAME, line); next
+        }
+        if (aware) {
+          if (match(line, heretok_re)) {
+            htok = substr(line, RSTART, RLENGTH)
+            heredoc_striptabs = (htok ~ /^<<-/) ? 1 : 0
+            term = htok
+            sub(/^<<-?[ \t]*/, "", term); gsub(SQ, "", term); gsub(DQ, "", term)
+            heredoc_term = term; in_heredoc = 1
+          }
+          if (index(line, "#") > 0) line = strip_comment(line)
+        }
+        emit(FILENAME, line)
+      }' 2>/dev/null )
+}
+
 # reach_build ROOT WORKDIR — one grep pass over the tree, then a BFS from the seeds.
 # Writes WORKDIR/{nodes,names,seeds,scanset,hits,edges,live,subjects,dead}.
 reach_build() {
@@ -178,14 +260,14 @@ reach_build() {
   # would therefore read DEAD forever, silently. Refuse rather than mis-report.
   if grep -qvE '^[A-Za-z0-9_.-]+$' "$w/names"; then return 2; fi
 
-  # ONE pass over the whole tree. The regex is deliberately SIMPLE (a plain token run,
-  # not a 300-way alternation of every node name): the alternation form measured 52s of
-  # grep CPU against 3.8s here for byte-identical results, and a scan too slow to run is
-  # a scan that gets switched off. -I skips binaries — a compiled artifact's byte soup
-  # is not a call site. Matches are whole leftmost-longest tokens, so a name occurring
-  # INSIDE a longer token comes back as that longer token and fails the exact compare.
-  ( cd "$root" && tr '\n' '\0' < "$w/scanset" \
-      | xargs -0 grep -oIHE '[A-Za-z0-9_.-]+' 2>/dev/null ) \
+  # ONE pass over the whole tree, comment-aware (reach_extract_tokens). The old plain
+  # grep -oIHE alternative was faster in isolation (a plain token run measured 3.8s vs
+  # 52s for a 300-way name alternation) but counted a name mentioned only in a comment
+  # as an invocation edge — 761/1761 code edges (43%) turned out to be comment-only, and
+  # 24 LIVE bins were LIVE only via a comment-fed path. Matches are whole leftmost-
+  # longest tokens, so a name occurring INSIDE a longer token comes back as that longer
+  # token and fails the exact compare, same as before.
+  reach_extract_tokens "$root" "$w/scanset" \
     | LC_ALL=C awk -v namesf="$w/names" '
     BEGIN { while ((getline l < namesf) > 0) nm[l] = 1 }
     {
