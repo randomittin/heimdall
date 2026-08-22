@@ -122,5 +122,5 @@ else
 fi
 
 echo
-printf 'PASS=%d FAIL=%d\n' "$PASS" "$FAIL"
+printf 'cli-help-no-expansion: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
