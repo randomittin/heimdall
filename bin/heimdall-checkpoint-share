@@ -54,7 +54,7 @@ PY="$(command -v python3 || command -v python || true)"
 [ -n "$PY" ] || { echo "error: python3 is required" >&2; exit 2; }
 [ -f "$LIB_DIR/checkpoint_share.py" ] || { echo "error: engine missing: $LIB_DIR/checkpoint_share.py" >&2; exit 2; }
 
-usage() { sed -n '2,53p' "$SELF" | sed 's/^# \{0,1\}//'; }
+usage() { awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$SELF"; }
 
 current_haid() {
   if [ -x "$HAID_BIN" ]; then "$HAID_BIN" current 2>/dev/null || echo "haid:local"; else echo "haid:local"; fi
