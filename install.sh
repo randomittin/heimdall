@@ -1538,10 +1538,50 @@ main() {
     ensure_dream_permission "$PLUGIN_DIR" || true
   fi
 
+  # PATH setup — make `hmd` reachable without the user hand-editing a profile.
+  # ensure_path_on_profile appends a single guarded export to the right shell
+  # profile (idempotent: a grep guard prevents a double-append on re-run). If the
+  # bin dir is already on PATH, it writes nothing and we stay silent.
+  #
+  # Computed BEFORE the success card below (both this one AND the later "Run:"
+  # line in Section 6 depend on it) — this used to run AFTER both, which meant
+  # every next-step line printed first and the PATH caveat second. On a fresh
+  # install PATH_STATE is "appended": the profile FILE now has the export, but
+  # *this* shell's live $PATH does not — ensure_path_on_profile only ever writes
+  # a file for future shells, it cannot mutate the running process's PATH. So
+  # the next-step commands a brand-new user was told to paste were, in the
+  # single most common case, dead on arrival: command-not-found. Measured: 0
+  # dispatcher invocations of `hmd demo` across 384 real sessions. Computing
+  # PATH_STATE first lets every next-step line either bake the export in or
+  # point at the one that does, so nothing printed is a broken promise.
+  # path step telemetry: bracket the PATH-export write. Reuses the SAME TELE_RUN_ID
+  # minted right after the fetch step, so all of this install's steps (fetch →
+  # marketplace → plugin → link → gates → path) share one correlatable run id, and
+  # bin/heimdall's first-run steps can chain off it. (If telemetry was unavailable
+  # at fetch time, TELE_RUN_ID is the opaque run-install-$$ fallback set there.)
+  local PATH_T0; PATH_T0="$(_tele_now_ms)"
+  _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" path started
+
+  local PATH_STATE PATH_RC=0
+  PATH_STATE=$(ensure_path_on_profile "$BIN_DIR") || PATH_RC=$?
+  if [ "$PATH_RC" -eq 0 ]; then
+    _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" path succeeded "$PATH_T0"
+  else
+    _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" path failed "$PATH_T0" \
+      path-export-failed "ensure_path_on_profile exit $PATH_RC"
+  fi
+
   # ── 5. Success card (A4) ──────────────────────────────────────────────────
   # VER is the ACTUAL installed version (git tag → manifest), never a literal.
   local VER; VER=$(resolved_version "$PLUGIN_DIR")
   local PRIMARY="hmd"; [ "$INSTALL_HMD" -eq 1 ] || PRIMARY="heimdall"
+  # This card's "Next:" is a fixed-width box cell (34 chars) — too narrow to
+  # ever bake in `export PATH=... && $PRIMARY demo` for a real home directory.
+  # Rather than print a command that's dead on arrival on a fresh install (the
+  # measured bug), point at the Run: line in Section 6 below, which computed
+  # the same PATH_STATE and DOES have room to spell the export out in full.
+  local NEXT_HINT="$PRIMARY demo"
+  [ "$PATH_STATE" = "appended" ] && NEXT_HINT="see Run: below ↓"
   # Both real install locations, $HOME-collapsed to ~ — the components live in
   # PLUGIN_DIR, the on-PATH launchers are symlinks in BIN_DIR. The card names
   # both so it can never contradict where things were actually placed.
@@ -1555,7 +1595,7 @@ main() {
     printf '   %s│%s  plugin:  %-38s%s│%s\n' "$C_DIM" "$C_RESET" "$SHORT_PATH" "$C_DIM" "$C_RESET"
     printf '   %s│%s  on PATH: %-38s%s│%s\n' "$C_DIM" "$C_RESET" "$SHORT_BIN/$PRIMARY" "$C_DIM" "$C_RESET"
     printf '   %s│%s%-49s%s│%s\n' "$C_DIM" "$C_RESET" "" "$C_DIM" "$C_RESET"
-    printf '   %s│%s  Next:        %s%-34s%s%s│%s\n' "$C_DIM" "$C_RESET" "$C_CYAN" "$PRIMARY demo" "$C_RESET" "$C_DIM" "$C_RESET"
+    printf '   %s│%s  Next:        %s%-34s%s%s│%s\n' "$C_DIM" "$C_RESET" "$C_CYAN" "$NEXT_HINT" "$C_RESET" "$C_DIM" "$C_RESET"
     printf '   %s│%s  In Claude:   /hmd:status  /hmd:save  …          %s│%s\n' "$C_DIM" "$C_RESET" "$C_DIM" "$C_RESET"
     printf '   %s│%s  Docs:        runheimdall.dev                    %s│%s\n' "$C_DIM" "$C_RESET" "$C_DIM" "$C_RESET"
     printf '   %s│%s  Data:        %-34s%s│%s\n' "$C_DIM" "$C_RESET" "DATA.md — telemetry contract" "$C_DIM" "$C_RESET"
@@ -1568,7 +1608,7 @@ main() {
     say "plugin:  $SHORT_PATH"
     say "on PATH: $SHORT_BIN/$PRIMARY"
     say ""
-    say "Next:        $PRIMARY demo"
+    say "Next:        $NEXT_HINT"
     say "In Claude:   /hmd:status  /hmd:save"
     say "Docs:        runheimdall.dev"
     say "Data:        DATA.md — telemetry contract"
@@ -1639,14 +1679,24 @@ main() {
   blank
   local END_TS; END_TS=$(date +%s)
   local ELAPSED=$(( END_TS - START_TS ))
+  # PATH_STATE was computed earlier (right before the Section 5 success card,
+  # which needs the same PATH-aware judgment call for ITS "Next:" line) — see
+  # the comment there for why. Reused here unchanged; ensure_path_on_profile is
+  # idempotent but is only ever called ONCE per install so the two call sites
+  # can never observe different states.
   # The go-ahead is GATED on validation: only a fully-verified install hands the
   # dev on to `hmd demo`. A red gate prints a loud NOT-READY block instead — the
   # exact fix is in the validation output above — and NEVER auto-runs a session.
   if [ "$VALIDATED" -eq 1 ]; then
+    local RUN_CMD="$PRIMARY demo"
+    # PATH_STATE=appended → $BIN_DIR isn't live in *this* shell yet (only the
+    # profile file has it, for future shells) — bake the export into the printed
+    # command so it works verbatim right now, not just after a restart.
+    [ "$PATH_STATE" = "appended" ] && RUN_CMD="export PATH=\"$BIN_DIR:\$PATH\" && $PRIMARY demo"
     if [ "$FANCY" -eq 1 ]; then
-      printf '   Run:  %s%s%s%s demo%s\n' "$C_CYAN" "$C_BOLD" "$PRIMARY" "$C_RESET" "$C_RESET"
+      printf '   Run:  %s%s%s%s%s\n' "$C_CYAN" "$C_BOLD" "$RUN_CMD" "$C_RESET" "$C_RESET"
     else
-      say "   Run:  $PRIMARY demo"
+      say "   Run:  $RUN_CMD"
     fi
   else
     if [ "$FANCY" -eq 1 ]; then
@@ -1659,39 +1709,14 @@ main() {
     printf '   %s  (the install itself completed — the artifacts are in %s)%s\n' \
       "$C_DIM" "$SHORT_PATH" "$C_RESET"
   fi
-  # PATH setup — make `hmd` reachable without the user hand-editing a profile.
-  # ensure_path_on_profile appends a single guarded export to the right shell
-  # profile (idempotent: a grep guard prevents a double-append on re-run). If the
-  # bin dir is already on PATH, it writes nothing and we stay silent.
-  # path step telemetry: bracket the PATH-export write. Reuses the SAME TELE_RUN_ID
-  # minted right after the fetch step, so all of this install's steps (fetch →
-  # marketplace → plugin → link → gates → path) share one correlatable run id, and
-  # bin/heimdall's first-run steps can chain off it. (If telemetry was unavailable
-  # at fetch time, TELE_RUN_ID is the opaque run-install-$$ fallback set there.)
-  local PATH_T0; PATH_T0="$(_tele_now_ms)"
-  _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" path started
-
-  local PATH_STATE PATH_RC=0
-  PATH_STATE=$(ensure_path_on_profile "$BIN_DIR") || PATH_RC=$?
-  if [ "$PATH_RC" -eq 0 ]; then
-    _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" path succeeded "$PATH_T0"
-  else
-    _tele_install_step "$TELE_BIN" "$TELE_RUN_ID" path failed "$PATH_T0" \
-      path-export-failed "ensure_path_on_profile exit $PATH_RC"
-  fi
   case "$PATH_STATE" in
     appended)
-      # The headline `hmd demo` will be command-not-found until PATH refreshes.
-      # Make this a CLEAR required step, not a dim aside — name the exact action.
-      # Recompute the profile here (the appender ran in a subshell — its vars are
-      # gone); profile_for_shell is pure so it returns the same path it wrote.
+      # The Run: line above already embeds the export, so it works verbatim in
+      # THIS shell — this is just the explanation, for anyone who reads on.
       local PROFILE_FILE; PROFILE_FILE=$(profile_for_shell)
       local SHORT_PROFILE; SHORT_PROFILE=$(printf '%s' "$PROFILE_FILE" | sed "s|$HOME|~|")
-      blank
-      printf '   %sOne more step%s — added %s to PATH in %s.\n' \
-        "$C_BOLD" "$C_RESET" "$SHORT_BIN" "$SHORT_PROFILE"
-      printf '   Reopen your terminal, or run now:\n'
-      printf '       %sexport PATH="%s:$PATH"%s\n' "$C_CYAN" "$BIN_DIR" "$C_RESET"
+      printf '   %s(added %s to PATH in %s — new shells will have it automatically)%s\n' \
+        "$C_DIM" "$SHORT_BIN" "$SHORT_PROFILE" "$C_RESET"
       ;;
     present)
       # Profile already carries the export (idempotent re-run): just remind to
