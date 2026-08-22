@@ -372,9 +372,30 @@ if [ -n "\${HEIMDALL_WRAP_SHIM_ACTIVE:-}" ]; then
   exec "\$HMD_REAL" "\$@"
 fi
 
-# 2. AUTOMATION PASSES THROUGH UNTOUCHED. No TTY on either side means a script, a
+# 2. HEADROOM PARITY: reach the same chain hop launch_tool reaches on the
+#    one-shot path, so --always does not silently opt this launch out of
+#    generation routing. Runs BEFORE the automation check below, deliberately:
+#    launch_tool itself never gates the chain on a TTY, and a script or CI job
+#    invoked through this shim is exactly the unattended traffic routing exists
+#    for. Only step 4 below (the repo-mutating wrap: git hooks, presence
+#    keeper, AGENTS.md fence) stays interactive-only — exporting one env var
+#    into the child is not a repo mutation and carries none of the risk that
+#    guard contains. Sourced fresh each run (never baked into the shim body) so
+#    an install/upgrade/opt-out of the headroom module takes effect on the very
+#    next launch with no shim regeneration. Fails open: no lib, no function, or
+#    a chain that declines to route all fall through untouched.
+if [ -r "\$HMD_BIN_DIR/lib/hmd-headroom-chain.sh" ]; then
+  . "\$HMD_BIN_DIR/lib/hmd-headroom-chain.sh"
+  if type hmd_headroom_chain >/dev/null 2>&1 && hmd_headroom_chain "\$HMD_PLUGIN_DIR"; then
+    export ANTHROPIC_BASE_URL="\$HMD_HEADROOM_BASE_URL"
+  fi
+fi
+
+# 3. AUTOMATION PASSES THROUGH UNTOUCHED. No TTY on either side means a script, a
 #    pipe or a CI job; wrapping those would break the dev's pipelines, and a tool
-#    that breaks automation is a tool that gets uninstalled.
+#    that breaks automation is a tool that gets uninstalled. Headroom routing
+#    (step 2) already happened and rides along on the export — only the repo
+#    wrap below is skipped for these.
 if [ ! -t 0 ] || [ ! -t 1 ]; then
   exec "\$HMD_REAL" "\$@"
 fi
@@ -385,23 +406,10 @@ for _hmd_arg in "\$@"; do
   esac
 done
 
-# 3. INTERACTIVE: wrap this repo, then hand over. The wrap is best-effort — a repo
+# 4. INTERACTIVE: wrap this repo, then hand over. The wrap is best-effort — a repo
 #    that cannot be wrapped (not a git repo, read-only tree) still gets its tool.
 if [ -x "\$HMD_WRAP" ]; then
   HEIMDALL_WRAP_SHIM_ACTIVE="\$HMD_TOOL" "\$HMD_WRAP" wrap "\$HMD_TOOL" --no-launch --quiet || true
-fi
-
-# 4. HEADROOM PARITY: reach the same chain hop launch_tool reaches on the
-#    one-shot path, so --always does not silently opt this launch out of
-#    generation routing. Sourced fresh each run (never baked into the shim body)
-#    so an install/upgrade/opt-out of the headroom module takes effect on the
-#    very next launch with no shim regeneration. Fails open: no lib, no function,
-#    or a chain that declines to route all fall through to the plain exec below.
-if [ -r "\$HMD_BIN_DIR/lib/hmd-headroom-chain.sh" ]; then
-  . "\$HMD_BIN_DIR/lib/hmd-headroom-chain.sh"
-  if type hmd_headroom_chain >/dev/null 2>&1 && hmd_headroom_chain "\$HMD_PLUGIN_DIR"; then
-    export ANTHROPIC_BASE_URL="\$HMD_HEADROOM_BASE_URL"
-  fi
 fi
 
 HEIMDALL_WRAP_SHIM_ACTIVE="\$HMD_TOOL" exec "\$HMD_REAL" "\$@"
