@@ -225,7 +225,8 @@ fi
 # (2c) THE EXACT SHAPE OF THE INSTALLED PLIST: the runner is reachable, but the dream script
 # it must exec lives inside the denied tree. This is what fires on RJ's machine every night.
 # The earlier cases point at a MISSING dream, which classifies as missing-path; only a real
-# EPERM can prove the tcc-denied branch — the one whose advice mentions Full Disk Access.
+# EPERM can prove the tcc-denied branch — the one whose advice names the specific TCC
+# folder permission (Full Disk Access only as a demoted last resort).
 TSTATUS="$WORK/tcc-status.json"
 trc=0
 sandbox-exec -p "$DENY" env HEIMDALL_HOME="$SBX_HOME" "$RUNNER" \

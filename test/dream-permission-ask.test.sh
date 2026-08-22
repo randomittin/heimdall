@@ -172,9 +172,13 @@ ARC=0
 # ── (2) THE BLOCK IS COMPLETE ────────────────────────────────────────────────────
 has() { printf '%s' "$BLOCK" | grep -qi -- "$1"; }
 
+has 'Downloads Folder' \
+  && ok "(2) names the missing permission (Downloads Folder — the specific folder, not Full Disk Access)" \
+  || bad "(2) block never names the specific folder permission"
+
 has 'Full Disk Access' \
-  && ok "(2) names the missing permission (Full Disk Access)" \
-  || bad "(2) block never names the permission"
+  && ok "(2) still documents Full Disk Access as an explicit LAST RESORT (demoted, not deleted)" \
+  || bad "(2) Full Disk Access was deleted from the block instead of demoted"
 
 { has 'protect' && has "$FHOME/Downloads"; } \
   && ok "(2) names WHY — the repo sits in a macOS-protected folder" \
@@ -237,13 +241,24 @@ else
   ok "(3) the tool never invokes tccutil and never touches the TCC database"
 fi
 
-# open-settings is a SEPARATE, EXPLICIT verb — the human asked, so macOS's own UI opens.
+# open-settings is a SEPARATE, EXPLICIT verb — the human asked, so macOS's own UI opens,
+# at the SPECIFIC pane the repo actually needs (never Full Disk Access by default now).
 : > "$OPENLOG"
-"$PERM" open-settings >/dev/null 2>&1 || true
-if grep -q 'Privacy_AllFiles' "$OPENLOG" 2>/dev/null; then
-  ok "(3) open-settings opens the Full Disk Access pane — only when explicitly asked"
+"$PERM" open-settings --repo "$PROT_REPO" >/dev/null 2>&1 || true
+if grep -q 'Privacy_DownloadsFolder' "$OPENLOG" 2>/dev/null; then
+  ok "(3) open-settings --repo opens the Downloads Folder pane — the SPECIFIC one, not FDA"
 else
-  bad "(3) open-settings did not open the pane: $(cat "$OPENLOG" 2>/dev/null)"
+  bad "(3) open-settings did not open the folder-specific pane: $(cat "$OPENLOG" 2>/dev/null)"
+fi
+
+# Full Disk Access remains reachable, but ONLY when explicitly requested — LAST RESORT,
+# demoted, never deleted.
+: > "$OPENLOG"
+"$PERM" open-settings --full-disk-access >/dev/null 2>&1 || true
+if grep -q 'Privacy_AllFiles' "$OPENLOG" 2>/dev/null; then
+  ok "(3) open-settings --full-disk-access still reaches the broad pane — LAST RESORT, not deleted"
+else
+  bad "(3) --full-disk-access did not open the FDA pane: $(cat "$OPENLOG" 2>/dev/null)"
 fi
 
 # ── (4) IDEMPOTENT — asked once, never nags ──────────────────────────────────────
@@ -445,7 +460,7 @@ if [ "$IRC" = 0 ] && [ -f "$PLIST" ]; then
 else
   bad "(9) install refused a protected repo (rc=$IRC) — the exemption regressed"
 fi
-if grep -qi 'Full Disk Access' <<<"$IOUT"; then
+if grep -qi 'Downloads Folder' <<<"$IOUT"; then
   ok "(9) install surfaces the permission block — the ask reaches him at first run"
 else
   bad "(9) install said nothing about the permission: $(printf '%s' "$IOUT" | tr '\n' ' ' | cut -c1-200)"
@@ -457,7 +472,7 @@ else
 fi
 # and installing twice must not re-ask — idempotence has to survive the wiring
 I2="$("$CANON/bin/heimdall-dream-schedule" install --repo "$PROT_REPO" 2>&1)" || true
-if grep -qi 'Full Disk Access' <<<"$I2"; then
+if grep -qi 'Downloads Folder' <<<"$I2"; then
   bad "(9) a re-install re-asked — the wiring broke idempotence"
 else
   ok "(9) a re-install does NOT re-ask (idempotent through the install path)"
@@ -570,7 +585,7 @@ grep -q 'heimdall-dream-permission' <<<"$NOUT" \
 # ══ INTERACTIVE ARMS ═════════════════════════════════════════════════════════════
 #
 # THE OWNER'S OBJECTION, VERBATIM: "the user would grant this, but prompt from hmd is
-# required". He is willing to grant Full Disk Access. What he refuses is being handed
+# required". He is willing to grant the permission. What he refuses is being handed
 # homework — a block that tells him to go type another command later. So when a human is
 # demonstrably present, ASK, and act on the answer within the same flow.
 #
@@ -584,7 +599,8 @@ grep -q 'heimdall-dream-permission' <<<"$NOUT" \
 #   (12) A REAL PTY opens the interactive branch with no seam set — the gate is genuinely
 #        `[ -t 0 ] && [ -t 1 ]` and not something the seam invented.
 #   (13) [C] declines cleanly.
-#   (14) [B] OPENS the Full Disk Access pane from inside the flow — the objection, fixed.
+#   (14) [B] OPENS the pane the repo actually needs, from inside the flow — the objection
+#        fixed (the specific folder service now, Full Disk Access only as a last resort).
 #   (15) [B] re-probes afterwards and NEVER claims hmd granted anything.
 #   (16) [A] does NOT move the repo without a separate explicit confirmation.
 #   (17) [A] REFUSES to move a repo with linked worktrees (it would break every one).
@@ -601,7 +617,7 @@ write_status "$STATUSF" blocked tcc-denied "$PROT_REPO"
 
 NI="$(printf 'B\ny\n' | "$PERM" ask --repo "$PROT_REPO" 2>&1)"
 NI_RC=$?
-if grep -q 'Full Disk Access' <<<"$NI" \
+if grep -q 'Downloads Folder' <<<"$NI" \
    && ! grep -q "$PROMPT_MARK" <<<"$NI"; then
   ok "(11) no TTY: prints the block and does NOT prompt"
 else
@@ -663,10 +679,10 @@ grep -q "$PROMPT_MARK" <<<"$C_OUT" \
 # ── (14) [B] — THE OBJECTION, FIXED: the pane opens from inside the flow ─────────
 rm -f "$STATE"; : > "$OPENLOG"
 B_OUT="$(printf 'b\ny\n\n' | I "$PROT_REPO")"
-if grep -q 'Privacy_AllFiles' "$OPENLOG" 2>/dev/null; then
-  ok "(14) [B] OPENS System Settings at Full Disk Access — no second command to type"
+if grep -q 'Privacy_DownloadsFolder' "$OPENLOG" 2>/dev/null; then
+  ok "(14) [B] OPENS System Settings at the Downloads Folder pane — no second command to type"
 else
-  bad "(14) [B] did not open the pane: $(cat "$OPENLOG" 2>/dev/null)"
+  bad "(14) [B] did not open the folder-specific pane: $(cat "$OPENLOG" 2>/dev/null)"
 fi
 grep -qi 'blast radius\|every other program\|interpreter' <<<"$B_OUT" \
   && ok "(14) [B] still warns about the blast radius before he commits" \
@@ -800,7 +816,7 @@ LEFTOVER2="$(printf 'B\ny\n' | { "$PERM" ask --repo "$PROT_REPO" --interactive-o
 
 # The deferral is only worth anything if the ask is still THERE afterwards.
 STILL="$("$PERM" ask --repo "$PROT_REPO" 2>&1)"
-grep -q 'Full Disk Access' <<<"$STILL" \
+grep -q 'Downloads Folder' <<<"$STILL" \
   && ok "(20) after a deferral the ask is still ARMED — the first human still gets it" \
   || bad "(20) a deferred ask went missing: $(printf '%s' "$STILL" | tr '\n' ' ' | cut -c1-160)"
 
@@ -813,7 +829,7 @@ if command -v script >/dev/null 2>&1; then
   grep -q "$PROMPT_MARK" <<<"$PTY_D" \
     && ok "(20) FALSIFIER: with a REAL pty --interactive-only ASKS (it defers, it never disables)" \
     || bad "(20) --interactive-only failed to ask on a real terminal"
-  grep -q 'Full Disk Access' <<<"$PTY_D" \
+  grep -q 'Downloads Folder' <<<"$PTY_D" \
     && ok "(20) the pty path still prints the full block before the prompt" \
     || bad "(20) --interactive-only dropped the block on a real terminal"
 else
