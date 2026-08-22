@@ -573,7 +573,43 @@ printf '\n  caller class census (real tree): %s LIVE, %s REACHABLE, %s PROSE-ONL
   "$LIVE_N" "$REACH_N" "$PROSE_N" "$REACHABLE_TOTAL"
 printf '%s\n' "$CLASS_TSV" | LC_ALL=C awk -F'\t' '$2=="PROSE-ONLY"{print "    PROSE-ONLY  "$1}'
 
-# 4g. The CLI surface itself, not just the library: `heimdall-deadcode --why` must show
+# 4g. ANTI-VACUITY FALSIFIER — reach_vacuity_check must be able to fail, proven against
+#     this file's own real, lived history rather than a contrived number: the
+#     classifier's actual measured PRE-FIX output (131 of 179 scanned executables,
+#     73%) MUST fail the ceiling, and its actual measured CURRENT output (99 of 179,
+#     55%) MUST pass it. If either direction is wrong the ceiling has no teeth — either
+#     it never fires (no different from not having this gate) or it always fires (no
+#     different from a permanently broken build). Both numbers are frozen fixture
+#     values, deliberately independent of whatever $TOTAL_BINS/$LIVE_N happen to be
+#     when this file is next run — see reach_vacuity_check's own comment in
+#     bin/lib/reachability.sh.
+if reach_vacuity_check 179 131; then
+  bad "falsifier: reach_vacuity_check 179 131 (this classifier's actual pre-fix output, 73% LIVE) passed — the anti-vacuity ceiling cannot fail on a genuinely skewed distribution"
+else
+  ok "falsifier: reach_vacuity_check 179 131 (this classifier's actual pre-fix output, 73% LIVE) correctly fails — a skewed distribution trips the ceiling"
+fi
+if reach_vacuity_check 179 99; then
+  ok "falsifier: reach_vacuity_check 179 99 (this classifier's actual current output, 55% LIVE) correctly passes"
+else
+  bad "falsifier: reach_vacuity_check 179 99 (this classifier's actual current output, 55% LIVE) failed — the ceiling is set below the classifier's own honest current output, it would block real progress rather than catch a regression"
+fi
+
+# 4h. ANTI-VACUITY, applied for real. LIVE means "fires without a human typing it" —
+#     useful only while it stays a minority-leaning share of everything scanned. The
+#     two bugs this whole gate exists because of (comment-only mentions counted as
+#     invocation edges; bin/heimdall's ~65-arm dispatch table laundering REACHABLE
+#     hops into LIVE) both manifested as exactly one symptom: a silently bloated LIVE
+#     count. This is the tripwire against a third bug re-inflating it the same way
+#     after everyone has moved on. See reach_vacuity_ceiling's comment in
+#     bin/lib/reachability.sh for why 60%, not some other number.
+VACUITY_PCT=$(( (LIVE_N * 100) / TOTAL_BINS ))
+if reach_vacuity_check "$TOTAL_BINS" "$LIVE_N"; then
+  ok "anti-vacuity: $LIVE_N of $TOTAL_BINS scanned executables ($VACUITY_PCT%) classify LIVE, within the $(reach_vacuity_ceiling)% ceiling"
+else
+  bad "anti-vacuity: $LIVE_N of $TOTAL_BINS scanned executables ($VACUITY_PCT%) classify LIVE, OVER the $(reach_vacuity_ceiling)% ceiling — the caller-class census looks vacuous again; go find what just got miscategorized into LIVE the way comment-only mentions or bin/heimdall's dispatch table once did"
+fi
+
+# 4i. The CLI surface itself, not just the library: `heimdall-deadcode --why` must show
 #     the class inline, or requirement 2 ("--why must show the class of every hop") is
 #     satisfied in the library and nowhere a human or agent actually looks.
 DC_WHY_OUT="$("$ROOT/bin/heimdall-deadcode" --why heimdall-git-guard 2>&1)"

@@ -744,3 +744,53 @@ reach_classify_all() {
   done < "$w/subjects"
   return 0
 }
+
+# reach_vacuity_ceiling — the maximum percentage of ALL scanned bin/ executables
+# (reach_subject_count's denominator: every candidate this file's BFS ever considers,
+# dead ones included, so the number moves only when a file is actually added or
+# removed, never when an exemption row alone reclassifies something) that may
+# legitimately classify LIVE before the caller-class census itself is evidence of a
+# vacuous classifier rather than a genuinely automatic codebase.
+#
+# LIVE means "fires without a human typing it" — a STRUCTURAL claim about the mention
+# graph, not an empirical one, so it will always read higher than any measured
+# invocation frequency: the 2026-08-22 capability census
+# (docs/analysis/2026-08-22-capability-census.md) found only ~43 distinct bins actually
+# fired across 384 real sessions, roughly a quarter of the ~179 scanned here, but a
+# rarely-triggered error-path hook is still honestly LIVE even in a sample where it
+# never happened to fire. Pinning this ceiling down near that ~24-29% empirical floor
+# would fail for the wrong reason as often as the right one.
+#
+# 60 is a judgment call, not a derived constant, chosen to sit strictly between the two
+# real data points this file's own history produced:
+#   - 131 of 179 (73%) — this classifier's actual PRE-FIX output, proven vacuous by
+#     hand (comment-only mentions counted as invocation edges; bin/heimdall's ~65-arm
+#     dispatch table laundering REACHABLE hops into LIVE). MUST fail this ceiling.
+#   - 99 of 179 (55%) — the real tree today, after both fixes, ten bins of headroom
+#     under the ceiling: loose enough that legitimate LIVE growth is not a false
+#     alarm, tight enough that a THIRD hub-laundering bug re-inflating LIVE by more
+#     than that has a real chance of tripping it rather than sliding underneath.
+# Tighten this number only alongside real work that brings LIVE down further — never
+# by widening it to wherever LIVE happens to have drifted, which would make the gate
+# decorative in exactly the way bin/lib/reachability-exemptions.tsv's own dated-row
+# discipline exists to prevent for individual bins.
+reach_vacuity_ceiling() { printf '%s\n' 60; }
+
+# reach_vacuity_check TOTAL LIVE — pass (rc 0) if LIVE is within reach_vacuity_ceiling
+# percent of TOTAL, fail (rc 1) if over it, fail loudly (rc 2, message on stderr) if
+# either argument is not a non-negative integer or TOTAL is 0. Pure integer arithmetic
+# on two numbers the caller supplies, no filesystem access of its own — deliberately,
+# so it is provable against ANY (total, live) pair, synthetic or real, without standing
+# up a tree: see test/bin-reachability-gate.test.sh's RED call (this classifier's own
+# real pre-fix 179/131 pair, which must fail) and GREEN call (this classifier's own
+# real current 179/99 pair, which must pass) for the falsifiability proof, and the
+# real-tree call a few lines later in that same file for the actual standing gate.
+reach_vacuity_check() {
+  local total="$1" live="$2" max_pct pct
+  case "$total" in ''|*[!0-9]*) echo "reach_vacuity_check: TOTAL must be a non-negative integer, got '$total'" >&2; return 2 ;; esac
+  case "$live"  in ''|*[!0-9]*) echo "reach_vacuity_check: LIVE must be a non-negative integer, got '$live'" >&2; return 2 ;; esac
+  [ "$total" -gt 0 ] || { echo "reach_vacuity_check: TOTAL must be > 0" >&2; return 2; }
+  max_pct="$(reach_vacuity_ceiling)"
+  pct=$(( (live * 100) / total ))
+  [ "$pct" -le "$max_pct" ]
+}
