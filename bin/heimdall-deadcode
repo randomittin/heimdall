@@ -33,7 +33,17 @@
 #                                     normal session start. --advise --force ignores it.
 #   heimdall-deadcode --why NAME      how bin/NAME is reached, as an invoker chain back
 #                                     to a live entry point — or why nothing reaches it.
+#                                     Each hop is tagged LIVE / REACHABLE / PROSE-ONLY;
+#                                     see CALLER CLASS below.
 #   -h, --help                        this help.
+#
+# CALLER CLASS. "Reachable" was always three different kinds of evidence reported as one
+# word: a hook that fires with nobody in the loop, a real script someone has to run on
+# purpose, and a sentence in a *.md file an agent may or may not act on. This audit now
+# reports which: LIVE (hooks/hooks.json or .mcp.json), REACHABLE (any other real,
+# non-Markdown reference), or PROSE-ONLY (named only from a *.md file). PROSE-ONLY is
+# reported and counted, not yet a failure — see bin/lib/reachability.sh for why, and for
+# why the chain shown by --why prefers a longer all-code path over a shorter prose one.
 #
 # EXEMPTIONS live in bin/lib/reachability-exemptions.tsv, one row per name, each with a
 # written reason AND a recheck date. Past that date the exemption stops counting, so a
@@ -81,11 +91,13 @@ scan() {
     printf '  points, or no bin/ executables were enumerated. That is NOT VERIFIED, not a pass.\n' >&2
     return 2
   fi
+  reach_build_class "$W"
   return 0
 }
 
 AUDITED=0; REACHABLE=0; DEAD_N=0; UNACK_N=0; ROT_N=0
 DEAD_LIST=""; UNACK_LIST=""; ROT_LIST=""
+CLASS_LIVE=0; CLASS_REACHABLE=0; CLASS_PROSE=0; PROSE_LIST=""
 collect() {
   AUDITED="$(reach_subject_count "$W")"
   REACHABLE=$((AUDITED - $(reach_dead "$W" | grep -c . || true)))
@@ -95,6 +107,12 @@ collect() {
   UNACK_N="$(printf '%s\n' "$UNACK_LIST" | grep -c . || true)"
   ROT_LIST="$(reach_exempt_audit "$ROOT" "$W")"
   ROT_N="$(printf '%s\n' "$ROT_LIST" | grep -c . || true)"
+  local class_tsv
+  class_tsv="$(reach_classify_all "$W")"
+  CLASS_LIVE="$(printf '%s\n' "$class_tsv" | LC_ALL=C awk -F'\t' '$2=="LIVE"' | grep -c . || true)"
+  CLASS_REACHABLE="$(printf '%s\n' "$class_tsv" | LC_ALL=C awk -F'\t' '$2=="REACHABLE"' | grep -c . || true)"
+  PROSE_LIST="$(printf '%s\n' "$class_tsv" | LC_ALL=C awk -F'\t' '$2=="PROSE-ONLY"{print $1}')"
+  CLASS_PROSE="$(printf '%s\n' "$PROSE_LIST" | grep -c . || true)"
 }
 
 verdict_rc() { [ "$UNACK_N" -eq 0 ] && [ "$ROT_N" -eq 0 ] && return 0; return 1; }
@@ -117,7 +135,8 @@ case "$MODE" in
     [ -n "$WHY" ] || { printf 'heimdall-deadcode --why needs a bin/ name\n' >&2; exit 2; }
     scan || exit 2
     if reach_is_live "$W" "$WHY"; then
-      printf 'REACHABLE  %s\n' "$(reach_chain "$W" "$WHY")"
+      cls="$(reach_class "$W" "$WHY")"
+      printf '%-10s %s\n' "$cls" "$(reach_chain_classified "$W" "$WHY")"
       exit 0
     fi
     if [ ! -f "$ROOT/bin/$WHY" ]; then
@@ -168,11 +187,16 @@ case "$MODE" in
     printf '{'
     printf '"audited":%s,' "$AUDITED"
     printf '"reachable":%s,' "$REACHABLE"
+    printf '"class_live":%s,' "$CLASS_LIVE"
+    printf '"class_reachable":%s,' "$CLASS_REACHABLE"
+    printf '"class_prose_only":%s,' "$CLASS_PROSE"
     printf '"dead":%s,' "$DEAD_N"
     printf '"unacknowledged":%s,' "$UNACK_N"
     printf '"exemption_rot":%s,' "$ROT_N"
     printf '"dead_names":['
     printf '%s\n' "$DEAD_LIST" | grep . | awk 'NR>1{printf ","} {printf "\"%s\"", $0}'
+    printf '],"prose_only_names":['
+    printf '%s\n' "$PROSE_LIST" | grep . | awk 'NR>1{printf ","} {printf "\"%s\"", $0}'
     printf '],"unacknowledged_names":['
     printf '%s\n' "$UNACK_LIST" | grep . | awk 'NR>1{printf ","} {printf "\"%s\"", $0}'
     printf '],"rot":['
@@ -187,6 +211,8 @@ case "$MODE" in
     printf 'heimdall-deadcode — consumer audit of bin/\n'
     printf '  audited    %s executable(s) in bin/\n' "$AUDITED"
     printf '  reachable  %s from a live entry point (hook · MCP registration · installer · hmd CLI · command/agent/skill · deploy · CI)\n' "$REACHABLE"
+    printf '             of those: %s LIVE (hook/MCP-fired) · %s REACHABLE (real code/config path) · %s PROSE-ONLY (named only from a *.md file — not a hard failure yet; see --why NAME)\n' \
+      "$CLASS_LIVE" "$CLASS_REACHABLE" "$CLASS_PROSE"
     printf '  dead       %s reachable from NO live entry point\n' "$DEAD_N"
     if [ "$DEAD_N" -gt 0 ]; then
       printf '\n  every dead executable, and why it is acknowledged (or not):\n'

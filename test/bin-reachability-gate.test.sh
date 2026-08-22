@@ -353,6 +353,191 @@ else
   bad "falsifier: dispatch-arm detector cannot tell routed from unrouted"
 fi
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 4. CALLER CLASS — LIVE vs. REACHABLE vs. PROSE-ONLY are three different kinds of
+#    evidence that "reachable" was reporting as one word: a hook that fires with
+#    nobody in the loop, a real script someone has to run on purpose, and a sentence
+#    in a *.md file an agent may or may not act on. This section proves the classifier
+#    on a synthetic tree we control, then checks two named regressions against the
+#    real repo: bin/heimdall-git-guard (hook-wired, existing §2c anchor) and
+#    bin/heimdall-brief (the capability census's headline example — hook-wired for
+#    real, AND named ONE HOP CLOSER by agents/heimdall.md prose, which is exactly why
+#    classification must prefer the all-code path over the shorter one).
+# ══════════════════════════════════════════════════════════════════════════════
+
+# 4a. reach_hop_class is a pure function of the referrer's path — no build needed.
+if [ "$(reach_hop_class "hooks/hooks.json")" = "LIVE" ] && [ "$(reach_hop_class ".mcp.json")" = "LIVE" ]; then
+  ok "reach_hop_class: hooks/hooks.json and .mcp.json classify LIVE"
+else
+  bad "reach_hop_class: a hook/MCP registration surface did not classify LIVE"
+fi
+
+if [ "$(reach_hop_class "agents/whatever.md")" = "PROSE-ONLY" ] && [ "$(reach_hop_class "commands/foo.md")" = "PROSE-ONLY" ]; then
+  ok "reach_hop_class: any *.md referrer classifies PROSE-ONLY"
+else
+  bad "reach_hop_class: a *.md referrer did not classify PROSE-ONLY"
+fi
+
+if [ "$(reach_hop_class "bin/some-script")" = "REACHABLE" ] && [ "$(reach_hop_class "install.sh")" = "REACHABLE" ]; then
+  ok "reach_hop_class: a real non-Markdown referrer classifies REACHABLE"
+else
+  bad "reach_hop_class: a real non-Markdown referrer misclassified"
+fi
+
+# 4b. The real repo's code-only closure — needed by every real-tree check below.
+reach_build_class "$WORK"
+if [ -s "$WORK/live-code-paths" ]; then
+  ok "reach_build_class produced a non-empty code-only closure over the real tree"
+else
+  bad "reach_build_class produced an EMPTY code-only closure — every seed is *.md, or the pass is broken"
+fi
+
+# 4c. A synthetic tree, built fresh so nothing from §3's accumulated sandbox can bleed
+#     into these counts.
+CLASS_SANDBOX="$(mktemp -d "${TMPDIR:-/tmp}/hmd-reach-class-XXXXXX")"
+mkdir -p "$CLASS_SANDBOX/bin" "$CLASS_SANDBOX/hooks" "$CLASS_SANDBOX/commands"
+printf '#!/bin/sh\nexit 0\n' > "$CLASS_SANDBOX/bin/hook-direct"
+printf '#!/bin/sh\n# runs bin/human-direct as part of setup\nexit 0\n' > "$CLASS_SANDBOX/install.sh"
+printf '#!/bin/sh\nexit 0\n' > "$CLASS_SANDBOX/bin/human-direct"
+printf '#!/bin/sh\nexit 0\n' > "$CLASS_SANDBOX/bin/prose-direct"
+printf '#!/bin/sh\nexit 0\n' > "$CLASS_SANDBOX/bin/nobody-calls"
+# THE REQUIRED FIXTURE: a bin referenced ONLY from a *.md file must classify
+# PROSE-ONLY, not REACHABLE.
+printf '# mentions bin/prose-direct in prose, nowhere else\n' > "$CLASS_SANDBOX/commands/only-prose.md"
+# THE CRUX FIXTURE: brief-shaped is named ONE hop away by prose (mentions.md, shorter)
+# AND TWO hops away by a real, hook-fired path (longer) — reconstructing bin/heimdall-
+# brief's own shape, where agents/heimdall.md names it directly and
+# bin/heimdall-precheck-agent also names it via a genuine hook-rooted code path.
+printf '# see bin/brief-shaped for details\n' > "$CLASS_SANDBOX/commands/mentions.md"
+printf '#!/bin/sh\nexec bin/brief-shaped\n' > "$CLASS_SANDBOX/bin/precheck-shaped"
+printf '#!/bin/sh\nexit 0\n' > "$CLASS_SANDBOX/bin/brief-shaped"
+chmod +x "$CLASS_SANDBOX"/bin/* "$CLASS_SANDBOX/install.sh"
+printf '{"hooks":{"X":"run bin/hook-direct now","Y":"run bin/precheck-shaped now"}}\n' \
+  > "$CLASS_SANDBOX/hooks/hooks.json"
+
+CLASS_WORK="$WORK/class-sandbox"
+reach_build "$CLASS_SANDBOX" "$CLASS_WORK"
+CLASS_BUILD_RC=$?
+reach_build_class "$CLASS_WORK"
+if [ "$CLASS_BUILD_RC" -eq 0 ]; then
+  ok "falsifier: engine builds a closure over the caller-class synthetic tree"
+else
+  bad "falsifier: engine REFUSED the caller-class synthetic tree (rc=$CLASS_BUILD_RC) — §4c proves nothing"
+fi
+
+if [ "$(reach_class "$CLASS_WORK" hook-direct)" = "LIVE" ]; then
+  ok "falsifier: a bin named directly by hooks.json classifies LIVE"
+else
+  bad "falsifier: a bin named directly by hooks.json did not classify LIVE"
+fi
+
+if [ "$(reach_class "$CLASS_WORK" human-direct)" = "REACHABLE" ]; then
+  ok "falsifier: a bin named by a real, non-hook, non-Markdown file classifies REACHABLE"
+else
+  bad "falsifier: a bin named by a real non-Markdown, non-hook file misclassified"
+fi
+
+if [ "$(reach_class "$CLASS_WORK" prose-direct)" = "PROSE-ONLY" ]; then
+  ok "falsifier: a bin referenced ONLY from a *.md file classifies PROSE-ONLY, not REACHABLE (the required fixture)"
+else
+  bad "falsifier: a bin referenced only from a *.md file did NOT classify PROSE-ONLY — a prose mention is reading as a genuine caller again"
+fi
+
+if reach_class "$CLASS_WORK" nobody-calls >/dev/null 2>&1; then
+  bad "falsifier: an unreferenced bin returned a class — dead code must have none"
+else
+  ok "falsifier: an unreferenced (dead) bin returns no class"
+fi
+
+# THE CRUX: brief-shaped is one hop from a *.md mention (shorter) and two hops from a
+# hook-fired, all-code path (longer). Classification must prefer the longer all-code
+# path — reporting LIVE — exactly reconstructing why bin/heimdall-brief itself must not
+# read PROSE-ONLY just because agents/heimdall.md also happens to name it more directly
+# than bin/heimdall-precheck-agent does.
+BS_CLASS="$(reach_class "$CLASS_WORK" brief-shaped)"
+BS_CHAIN="$(reach_chain_classified "$CLASS_WORK" brief-shaped)"
+if [ "$BS_CLASS" = "LIVE" ]; then
+  ok "falsifier: a hook-fired all-code path outranks a SHORTER prose mention of the same bin ($BS_CHAIN)"
+else
+  bad "falsifier: THE SHORTEST PATH WON — brief-shaped classified $BS_CLASS via a shorter prose hop despite a real hook-fired path also existing; a hook-wired tool would misreport as prose-summoned ($BS_CHAIN)"
+fi
+
+case "$BS_CHAIN" in
+  *"[PROSE-ONLY]"*)
+    bad "falsifier: the DISPLAYED chain for brief-shaped still routes through a Markdown hop even though an all-code path exists: $BS_CHAIN"
+    ;;
+  *"hooks/hooks.json"*"[LIVE]"*)
+    ok "falsifier: --why's displayed chain for brief-shaped shows the real hook-fired path, not the shorter prose one"
+    ;;
+  *)
+    bad "falsifier: brief-shaped's classified chain has neither a prose hop nor the expected hook root: $BS_CHAIN"
+    ;;
+esac
+
+# 4d. The design constraint this feature must not violate: the classifier's OWN
+#     production caller, bin/heimdall-deadcode, must itself be LIVE or REACHABLE — if
+#     adding a caller-class feature left its own CLI reading PROSE-ONLY, that would be
+#     the exact self-own the task called out by name.
+DC_CLASS="$(reach_class "$WORK" heimdall-deadcode)"
+if [ "$DC_CLASS" = "LIVE" ] || [ "$DC_CLASS" = "REACHABLE" ]; then
+  ok "heimdall-deadcode itself classifies $DC_CLASS, not PROSE-ONLY (the feature does not self-own)"
+else
+  bad "heimdall-deadcode itself classifies ${DC_CLASS:-DEAD} — the caller-class feature would be reporting itself as prose-summoned or worse"
+fi
+
+# 4e. Named regressions against the REAL repo, mirroring §2c's style.
+GG_CLASS="$(reach_class "$WORK" heimdall-git-guard)"
+if [ "$GG_CLASS" = "LIVE" ]; then
+  ok "heimdall-git-guard classifies LIVE: $(reach_chain_classified "$WORK" heimdall-git-guard)"
+else
+  bad "heimdall-git-guard classifies ${GG_CLASS:-DEAD}, not LIVE — the self-heal's hook wiring regressed"
+fi
+
+BRIEF_CLASS="$(reach_class "$WORK" heimdall-brief)"
+if [ "$BRIEF_CLASS" = "LIVE" ]; then
+  ok "heimdall-brief classifies LIVE via its real hook-fired path, not the shorter agents/heimdall.md prose mention: $(reach_chain_classified "$WORK" heimdall-brief)"
+else
+  bad "heimdall-brief classifies ${BRIEF_CLASS:-DEAD}, not LIVE — this is the capability census's headline example; either its hook wiring regressed or the classifier picked the shorter prose path over the real one"
+fi
+
+# 4f. The tallies must partition the reachable set exactly: every reachable subject
+#     gets exactly one class, none skipped, none double-counted.
+CLASS_TSV="$(reach_classify_all "$WORK")"
+CLASS_TOTAL="$(printf '%s\n' "$CLASS_TSV" | grep -c . || true)"
+PROSE_N="$(printf '%s\n' "$CLASS_TSV" | LC_ALL=C awk -F'\t' '$2=="PROSE-ONLY"' | grep -c . || true)"
+LIVE_N="$(printf '%s\n' "$CLASS_TSV" | LC_ALL=C awk -F'\t' '$2=="LIVE"' | grep -c . || true)"
+REACH_N="$(printf '%s\n' "$CLASS_TSV" | LC_ALL=C awk -F'\t' '$2=="REACHABLE"' | grep -c . || true)"
+REACHABLE_TOTAL=$((TOTAL_BINS - DEAD_COUNT))
+if [ "$CLASS_TOTAL" -eq "$REACHABLE_TOTAL" ]; then
+  ok "classification partitions all $REACHABLE_TOTAL reachable bin/ executables exactly ($LIVE_N LIVE, $REACH_N REACHABLE, $PROSE_N PROSE-ONLY)"
+else
+  bad "classification tally mismatch: $CLASS_TOTAL classified vs $REACHABLE_TOTAL actually reachable — reach_classify_all skipped or double-counted a name"
+fi
+
+printf '\n  caller class census (real tree): %s LIVE, %s REACHABLE, %s PROSE-ONLY of %s reachable bin/ executables\n' \
+  "$LIVE_N" "$REACH_N" "$PROSE_N" "$REACHABLE_TOTAL"
+printf '%s\n' "$CLASS_TSV" | LC_ALL=C awk -F'\t' '$2=="PROSE-ONLY"{print "    PROSE-ONLY  "$1}'
+
+# 4g. The CLI surface itself, not just the library: `heimdall-deadcode --why` must show
+#     the class inline, or requirement 2 ("--why must show the class of every hop") is
+#     satisfied in the library and nowhere a human or agent actually looks.
+DC_WHY_OUT="$("$ROOT/bin/heimdall-deadcode" --why heimdall-git-guard 2>&1)"
+if printf '%s' "$DC_WHY_OUT" | grep -q '^LIVE' && printf '%s' "$DC_WHY_OUT" | grep -q '\[LIVE\]'; then
+  ok "heimdall-deadcode --why heimdall-git-guard shows class LIVE on the CLI surface: $DC_WHY_OUT"
+else
+  bad "heimdall-deadcode --why heimdall-git-guard does not show LIVE class on the CLI surface: $DC_WHY_OUT"
+fi
+
+DC_JSON_OUT="$("$ROOT/bin/heimdall-deadcode" --json 2>&1)"
+if printf '%s' "$DC_JSON_OUT" | grep -q '"class_live":[0-9]' \
+  && printf '%s' "$DC_JSON_OUT" | grep -q '"class_reachable":[0-9]' \
+  && printf '%s' "$DC_JSON_OUT" | grep -q '"class_prose_only":[0-9]' \
+  && printf '%s' "$DC_JSON_OUT" | grep -q '"prose_only_names":\['; then
+  ok "heimdall-deadcode --json emits class_live/class_reachable/class_prose_only/prose_only_names"
+else
+  bad "heimdall-deadcode --json is missing one or more caller-class keys: $DC_JSON_OUT"
+fi
 printf "\n  bin-reachability-gate: %d passed, %d failed  (scanned %s executables)\n" \
   "$PASS" "$FAIL" "$TOTAL_BINS"
 [ "$FAIL" -eq 0 ] || exit 1
