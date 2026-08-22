@@ -122,6 +122,16 @@ RUNNER_SRC="$BINDIR/heimdall-dream-runner"
 RUNNER_DIR="$HEIMDALL_HOME/bin"
 RUNNER="$RUNNER_DIR/heimdall-dream-runner"
 
+# hmd-dream: a PRIVATE, ad-hoc-signed copy of bash, built fresh into $RUNNER_DIR by
+# heimdall-dream-bundle. Its only purpose is a narrower TCC identity for
+# ProgramArguments[0] than the shared system /bin/bash — see resolve_interpreter below.
+# Always a GENERATED artifact, never a user-owned file, so uninstall always removes it
+# outright (no same_physical_file guard needed, unlike the runner/liveness copies below).
+BUNDLE_SRC="$BINDIR/heimdall-dream-bundle"
+BUNDLE_APP="$RUNNER_DIR/hmd-dream.app"
+BUNDLE_EXEC="$BUNDLE_APP/Contents/MacOS/hmd-dream"
+IDENT_FILE="$HEIMDALL_HOME/dream-identity.json"
+
 # The liveness receipt writer is staged beside the runner for the SAME reason the runner
 # is staged at all: it must be reachable on the night the repo is not. Left in the repo it
 # could only record a receipt when nothing was wrong, which is precisely the failure mode
@@ -414,6 +424,42 @@ require_durable_pinned_paths() {
 # the state word 'skipped', so a stranger's install registered no nightly dream and said
 # nothing about it. The file is already exactly where it must be; the only work left is
 # to assert its mode.
+# ── resolve which interpreter EXECUTES THE RUNNER, and pin it outright ───────────
+#
+# launchd's posix_spawn resolves ProgramArguments[0] as an executable path directly — a
+# script named there has its own #!/usr/bin/env bash shebang never consulted, the way it
+# would be from an interactive shell. This worked by COINCIDENCE (plain /bin/bash sits on
+# launchd's own minimal PATH); naming the interpreter outright here removes that
+# coincidence AND buys a narrower TCC identity than the alternative.
+#
+# TCC keys a Full Disk Access grant to the RUNNING interpreter's code identity (path +
+# CDHash) — never to the script text it interprets. Naming plain /bin/bash means any
+# grant lands on the same shared system binary every other script on the machine runs
+# through. heimdall-dream-bundle builds a PRIVATE, ad-hoc-signed copy of bash under its
+# own identifier so a grant can be scoped to exactly this job. Building it is best-effort:
+# a machine without codesign, or a non-macOS box, falls back to plain /bin/bash — loudly,
+# on stderr, never silently, since that fallback is exactly the broad-grant case the
+# bundle exists to avoid.
+resolve_interpreter() {
+  if is_macos && [ -x "$BUNDLE_SRC" ]; then
+    local out rc=0
+    out="$("$BUNDLE_SRC" build --out "$RUNNER_DIR" --json 2>&1)" || rc=$?
+    if [ "$rc" -eq 0 ] && [ -x "$BUNDLE_EXEC" ]; then
+      if printf '%s' "$out" | grep -q '"changed": "true"'; then
+        echo "note: the hmd-dream signing identity changed — a previously granted Full" >&2
+        echo "      Disk Access permission may need to be re-confirmed:" >&2
+        echo "      heimdall-dream-permission check --repo $REPO" >&2
+      fi
+      printf '%s' "$BUNDLE_EXEC"
+      return 0
+    fi
+    echo "warning: could not build the hmd-dream identity ($out) — falling back to" >&2
+    echo "         /bin/bash. A Full Disk Access grant would then apply to the shared" >&2
+    echo "         system bash rather than a narrowly scoped copy." >&2
+  fi
+  echo "/bin/bash"
+}
+
 install_runner() {
   [ -f "$RUNNER_SRC" ] || die "heimdall-dream-runner missing at $RUNNER_SRC"
   ensure_private_dir "$HEIMDALL_HOME"
@@ -463,15 +509,17 @@ write_plist() {
   ensure_private_dir "$(dirname "$LOG")"
   [ -e "$LOG" ] || : > "$LOG"
   chmod 0600 "$LOG" || die "cannot set mode 0600 on $LOG"
-  local e_dream e_repo e_log e_runner e_wd
+  local e_dream e_repo e_log e_runner e_wd e_interp
   e_dream="$(xml_escape "$DREAM")"
   e_repo="$(xml_escape "$REPO")"
   e_log="$(xml_escape "$LOG")"
   e_runner="$(xml_escape "$RUNNER")"
-  # The interpreter pin, when one resolved. Emitted AFTER --repo and BEFORE the forwarded
-  # `run --overnight`, which keeps ProgramArguments[0] (the runner) and [2] (the dream bin)
-  # at the indices cmd_status extracts. Adding an argument that shifted those would quietly
-  # blind the silent-death detector at the very moment the argv grew a third path to watch.
+  e_interp="$(xml_escape "${INTERP:-/bin/bash}")"
+  # The interpreter pin, when one resolved. Emitted AFTER --interpreter and BEFORE the
+  # forwarded `run --overnight`. registered_command/registered_runner/registered_dream
+  # no longer depend on this block's presence shifting fixed indices — registered_dream
+  # scans for its own `--dream` flag rather than trusting a position — so growing this
+  # block never blinds the silent-death detector the way a fixed index once could.
   local py_block=""
   if [ -n "${PYTHON:-}" ]; then
     py_block="    <string>--python</string>
@@ -616,6 +664,7 @@ Use the cron/cloud routine documented in commands/dream.md instead."
   # recorded status, never a silent success.
   PYTHON="$(resolve_python || true)"
   install_runner
+  INTERP="$(resolve_interpreter)"
   write_plist
   unload_agent   # drop any prior copy so a re-install never yields two loaded jobs
   load_agent
