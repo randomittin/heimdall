@@ -321,6 +321,16 @@ echo "$HP" | jq -e '.hypotheses[] | select(.id=="hyp-cheap-review-opus" and .tes
   && ok "(15) POLICY: adjudication-class cheapen hypothesis surfaced but marked non-testable" \
   || bad "(15) policy-blocked cheapen hypothesis not correctly annotated: $(echo "$HP" | jq -c '.hypotheses[] | select(.id=="hyp-cheap-review-opus")')"
 
+# ── (14) STATUS SELF-DOCUMENTS: mechanically_applied is false, with a consumption note ──
+R="$(mk_repo statusdoc)"; seed_metrics "$R"
+ST="$("$CLI" --repo "$R" status)"
+[ "$(echo "$ST" | jq -r '.mechanically_applied')" = "false" ] \
+  && ok "(14) status reports mechanically_applied:false (nothing auto-applies overrides yet)" \
+  || bad "(14) status did not report mechanically_applied:false: $(echo "$ST" | jq -c '.mechanically_applied')"
+echo "$ST" | jq -e '.consumption_note | test("hand|apply")' >/dev/null \
+  && ok "(14) status carries a human-readable consumption_note" \
+  || bad "(14) status missing/unclear consumption_note: $(echo "$ST" | jq -r '.consumption_note')"
+
 echo "======================="
 printf "self-improve: \033[32m%d passed\033[0m, " "$PASS"
 if [ "$FAIL" -gt 0 ]; then printf "\033[31m%d failed\033[0m\n" "$FAIL"; exit 1; fi

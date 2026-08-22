@@ -63,6 +63,29 @@ DEF_MIN_DELTA = 0.10         # required pass-rate improvement to KEEP (measured,
 DEF_MAX_PASS_RATE = 0.80     # a task_type at/above this pass-rate is "healthy" — no hypo
 SCHEMA_VERSION = 1
 
+# ── whether ANYTHING mechanically consumes routing-overrides.json (it does not, yet) ──
+#
+# This loop computes and writes overrides; nothing in the actual model-selection path
+# (bin/heimdall-model-resolve, bin/heimdall-tier, and each agents/<name>.md's own
+# tier:/model: frontmatter) reads this file. That gap is deliberate for now: closing it
+# automatically would apply a routing change on days-old, low-volume data with no opt-in
+# and no visible review step, which is worse than the open loop it replaces. `status`
+# surfaces this HONESTLY — rather than letting "validated" be misread as "live" — so a
+# human reading `heimdall-self-improve status` is never misled about what a validated
+# override actually DOES.
+#
+# Flip MECHANICALLY_APPLIED to True ONLY when some real consumer exists AND that
+# consumer's own tests prove it reads this file — never flip it as a paperwork update.
+#   Re-verify with: grep -rl 'routing-overrides' bin/heimdall-model-resolve bin/heimdall-tier agents/*.md
+#   (should currently print NOTHING; last verified 2026-08-23)
+MECHANICALLY_APPLIED = False
+CONSUMPTION_NOTE = (
+    "Nothing in the model-selection path reads routing-overrides.json yet. A "
+    "'validated' override below is a measured finding, not a live routing change — "
+    "apply it by hand (edit the relevant agents/<name>.md tier:/model: frontmatter) "
+    "per skills/self-improve/SKILL.md if you want it to take effect."
+)
+
 
 def _now():
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -682,6 +705,8 @@ def cmd_status(args):
         "experiments_by_status": dict(buckets),
         "open_experiments": [e["id"] for e in exps if e.get("status") == "open"],
         "total_experiments": len(exps),
+        "mechanically_applied": MECHANICALLY_APPLIED,
+        "consumption_note": CONSUMPTION_NOTE,
     }
     print(json.dumps(out, indent=2, sort_keys=True))
     return 0
