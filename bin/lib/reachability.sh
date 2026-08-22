@@ -148,6 +148,88 @@ reach_subjects() {
 
 # ── the closure ───────────────────────────────────────────────────────────────────
 
+# reach_extract_tokens ROOT SCANSET — "path:token" for every alphabet-token run in
+# every text file named in SCANSET (paths relative to ROOT), in one comment-aware pass.
+# Binaries are skipped before they're ever opened for tokenizing (a -l pre-pass reusing
+# grep's own -I heuristic, not a filter after the fact — a compiled artifact's byte soup
+# was never a call site). A '#'-to-EOL comment is stripped before tokenizing UNLESS: the
+# '#' sits inside a single- or double-quoted string (bash/python/jq all agree a quoted
+# '#' isn't a comment start), the line is inside a heredoc body (that's the heredoc's own
+# payload, not a comment — left verbatim, tokenized as-is), or the file has no '#'-comment
+# syntax at all (*.md's '#' is a heading marker; *.json/*.c/*.h use different or no
+# comment syntax — *.c/*.h diagnostic-string false positives are a separate, already-
+# tracked gap, not this function's job) — see is_comment_aware() below. A name that only
+# ever appears after a real comment marker is a mention, not an invocation, and must not
+# read as an edge.
+reach_extract_tokens() {
+  local root="$1" scanset="$2"
+  ( cd "$root" \
+      && export LC_ALL=C \
+      && tr '\n' '\0' < "$scanset" \
+      | xargs -0 grep -Il '.' 2>/dev/null \
+      | tr '\n' '\0' \
+      | xargs -0 awk '
+      function is_comment_aware(fname) {
+        if (fname ~ /\.md$/)   return 0
+        if (fname ~ /\.json$/) return 0
+        if (fname ~ /\.c$/)    return 0
+        if (fname ~ /\.h$/)    return 0
+        return 1
+      }
+      function strip_comment(line,    i, n, c, out, in_sq, in_dq) {
+        n = length(line); out = ""; in_sq = 0; in_dq = 0
+        for (i = 1; i <= n; i++) {
+          c = substr(line, i, 1)
+          if (in_sq) { out = out c; if (c == SQ) in_sq = 0; continue }
+          if (in_dq) {
+            out = out c
+            if (c == "\\" && i < n) { i++; out = out substr(line, i, 1); continue }
+            if (c == DQ) in_dq = 0
+            continue
+          }
+          if (c == SQ) { in_sq = 1; out = out c; continue }
+          if (c == DQ) { in_dq = 1; out = out c; continue }
+          if (c == "\\" && i < n) { out = out c substr(line, i + 1, 1); i++; continue }
+          if (c == "#") break
+          out = out c
+        }
+        return out
+      }
+      function emit(fname, line,    rest, tok) {
+        rest = line
+        while (match(rest, /[A-Za-z0-9_.-]+/)) {
+          tok = substr(rest, RSTART, RLENGTH)
+          print fname ":" tok
+          rest = substr(rest, RSTART + RLENGTH)
+        }
+      }
+      BEGIN {
+        SQ = sprintf("%c", 39); DQ = sprintf("%c", 34)
+        heretok_re = "<<-?[ \t]*[" SQ DQ "]?[A-Za-z_][A-Za-z0-9_]*[" SQ DQ "]?"
+      }
+      FNR == 1 { in_heredoc = 0; heredoc_term = ""; heredoc_striptabs = 0; aware = is_comment_aware(FILENAME) }
+      {
+        line = $0
+        if (in_heredoc) {
+          chk = line
+          if (heredoc_striptabs) sub(/^\t+/, "", chk)
+          if (chk == heredoc_term) in_heredoc = 0
+          emit(FILENAME, line); next
+        }
+        if (aware) {
+          if (match(line, heretok_re)) {
+            htok = substr(line, RSTART, RLENGTH)
+            heredoc_striptabs = (htok ~ /^<<-/) ? 1 : 0
+            term = htok
+            sub(/^<<-?[ \t]*/, "", term); gsub(SQ, "", term); gsub(DQ, "", term)
+            heredoc_term = term; in_heredoc = 1
+          }
+          if (index(line, "#") > 0) line = strip_comment(line)
+        }
+        emit(FILENAME, line)
+      }' 2>/dev/null )
+}
+
 # reach_build ROOT WORKDIR — one grep pass over the tree, then a BFS from the seeds.
 # Writes WORKDIR/{nodes,names,seeds,scanset,hits,edges,live,subjects,dead}.
 reach_build() {
@@ -178,14 +260,14 @@ reach_build() {
   # would therefore read DEAD forever, silently. Refuse rather than mis-report.
   if grep -qvE '^[A-Za-z0-9_.-]+$' "$w/names"; then return 2; fi
 
-  # ONE pass over the whole tree. The regex is deliberately SIMPLE (a plain token run,
-  # not a 300-way alternation of every node name): the alternation form measured 52s of
-  # grep CPU against 3.8s here for byte-identical results, and a scan too slow to run is
-  # a scan that gets switched off. -I skips binaries — a compiled artifact's byte soup
-  # is not a call site. Matches are whole leftmost-longest tokens, so a name occurring
-  # INSIDE a longer token comes back as that longer token and fails the exact compare.
-  ( cd "$root" && tr '\n' '\0' < "$w/scanset" \
-      | xargs -0 grep -oIHE '[A-Za-z0-9_.-]+' 2>/dev/null ) \
+  # ONE pass over the whole tree, comment-aware (reach_extract_tokens). The old plain
+  # grep -oIHE alternative was faster in isolation (a plain token run measured 3.8s vs
+  # 52s for a 300-way name alternation) but counted a name mentioned only in a comment
+  # as an invocation edge — 761/1761 code edges (43%) turned out to be comment-only, and
+  # 24 LIVE bins were LIVE only via a comment-fed path. Matches are whole leftmost-
+  # longest tokens, so a name occurring INSIDE a longer token comes back as that longer
+  # token and fails the exact compare, same as before.
+  reach_extract_tokens "$root" "$w/scanset" \
     | LC_ALL=C awk -v namesf="$w/names" '
     BEGIN { while ((getline l < namesf) > 0) nm[l] = 1 }
     {
@@ -375,13 +457,34 @@ reach_unacknowledged() {
 #   LIVE         the referrer is hooks/hooks.json or .mcp.json — the harness or an MCP
 #                client executes this registration automatically. No judgment call
 #                sits between "the file says so" and "it runs".
-#   REACHABLE    the referrer is any other non-Markdown file — a real script, a real
-#                dispatch arm, a real config line. Deterministic once triggered, but
-#                the trigger is a deliberate act: a human types `hmd foo`, one script
-#                execs another.
-#   PROSE-ONLY   the referrer is a *.md file, anywhere. An agent had to read that
-#                sentence and choose to act on it. That choice is not automatic and is
-#                not guaranteed, however confidently the sentence reads.
+#   REACHABLE    the referrer is any other non-Markdown file, OR a commands/*.md file —
+#                a real script, a real dispatch arm, a real config line, or a declared
+#                slash-command entry point. Deterministic once triggered, but the
+#                trigger is a deliberate act: a human types `hmd foo` or `/foo`, one
+#                script execs another.
+#   PROSE-ONLY   the referrer is a *.md file OUTSIDE commands/ — agents/, skills/,
+#                docs, or anywhere else prose lives. An agent had to read that sentence
+#                and choose to act on it. That choice is not automatic and is not
+#                guaranteed, however confidently the sentence reads.
+#
+# COMMANDS/*.MD ARE A DECLARED ENTRY POINT, NOT PROSE. A file under commands/ is a
+# Claude Code slash-command definition: a human types `/name` and the harness loads
+# that file's body as the operative instruction for that one turn, for its one
+# declared purpose. That is structurally identical to "a human types `hmd foo`" —
+# already scored REACHABLE — not to agents/heimdall.md or a skills/**/*.md procedure
+# doc, where a bin's name is one instruction among hundreds, mentioned in passing and
+# conditionally acted upon. commands/debloat.md's entire body IS `bin/heimdall-debloat
+# report [<path>]` and its sibling invocations — the command's only content, not an
+# aside inside a larger document. Treating that the same as a stray mention in a
+# 500-line persona doc under-counted real entry points: commands/reflect.md's whole
+# purpose is to run `conflict-log unresolved` and `conflict-log reflect-all`, and
+# scoring that PROSE-ONLY reported a declared, human-triggered command as merely
+# something an agent "might" read and "might" act on. reach_root_seeds already trusts
+# every file under commands/ enough to seed liveness FROM it with no path needed; it
+# would be incoherent to then trust that same directory too little to vouch for a
+# child it names. agents/ and skills/ get no such carve-out: those directories hold
+# multi-purpose reference material where a bin's name is incidental, not the file's
+# entire reason to exist.
 #
 # THE SHORTEST PATH IS NOT THE STRONGEST PATH. reach_build's BFS records exactly one
 # parent per node — whichever predecessor reaches it in the FEWEST hops — because the
@@ -432,17 +535,19 @@ reach_unacknowledged() {
 # exemption registry is a follow-up, not this change.
 
 # reach_build_class WORKDIR — a SECOND closure over the SAME scan, restricted to edges
-# whose REFERRER is not a *.md file. Requires reach_build to have already written
-# WORKDIR/{nodes,seeds,edges}; reads them, never re-scans the tree. A node reachable
-# here is reachable without ever having to trust a sentence — a strictly stronger claim
-# than plain reachability, so this closure is always a subset of reach_build's. Because
-# the underlying BFS still explores every node reachable via the allowed edges (not
-# merely one path), "in this closure at all" is a sound test for "some all-code path
-# exists" — not just "the one path found happens to avoid prose". Writes
+# whose REFERRER is not a *.md file, OR is a commands/*.md file (a declared slash-command
+# entry point — see COMMANDS/*.MD ARE A DECLARED ENTRY POINT above). Requires reach_build
+# to have already written WORKDIR/{nodes,seeds,edges}; reads them, never re-scans the
+# tree. A node reachable here is reachable without ever having to trust an agent's
+# discretionary reading of a sentence — a strictly stronger claim than plain
+# reachability, so this closure is always a subset of reach_build's. Because the
+# underlying BFS still explores every node reachable via the allowed edges (not merely
+# one path), "in this closure at all" is a sound test for "some all-code-or-declared-
+# command path exists" — not just "the one path found happens to avoid prose". Writes
 # WORKDIR/{edges-code,live-code,live-code-paths}.
 reach_build_class() {
   local w="$1"
-  LC_ALL=C awk -F'\t' '$1 !~ /\.md$/ { print }' "$w/edges" > "$w/edges-code" 2>/dev/null
+  LC_ALL=C awk -F'\t' '$1 !~ /\.md$/ || $1 ~ /^commands\// { print }' "$w/edges" > "$w/edges-code" 2>/dev/null
 
   LC_ALL=C awk -v nodesf="$w/nodes" -v seedsf="$w/seeds" -v edgesf="$w/edges-code" '
     BEGIN {
@@ -489,12 +594,36 @@ reach_build_class() {
 # branch of live-code's own BFS at once, and because reach_class checks THIS set first,
 # the hook-rooted evidence always wins regardless of which parent live-code's map
 # happened to record for it. Requires reach_build_class to have already run (reads its
-# edges-code; does not rebuild it). Writes WORKDIR/{hook-seeds,live-hook,live-hook-paths}.
+# edges-code; does not rebuild it). Writes WORKDIR/{edges-hook,hook-seeds,live-hook,live-hook-paths}.
+#
+# DISPATCHER HOP CEILING — bin/heimdall and bin/hmd are, by reach_root_seeds' own
+# doc comment, "the CLI a human types": a multi-way `case` keyed on a subcommand
+# argument that source-level tokenizing cannot see. Naming both of them once as a
+# seed is right (a hook CAN legitimately invoke `bin/heimdall <fixed-subcommand>` and
+# that one target really is automatic) — but crediting EVERY name the dispatcher's
+# own source mentions is wrong, and it is not hypothetical: bin/heimdall contains on
+# the order of 60 real (non-comment, post-stripping) mentions of other bin names in
+# its dispatch table, and some hook names bin/heimdall directly for an unrelated,
+# narrow purpose. Before this ceiling, that ONE hook edge into the dispatcher was
+# enough for reach_build_hook_class's BFS to walk every one of those ~60 dispatch
+# arms and report them all LIVE — e.g. bin/heimdall-metric's only path was
+# `bin/heimdall-metric <- bin/heimdall [REACHABLE] <- hooks/hooks.json [LIVE]`, a
+# REACHABLE-class hop in the middle laundered into a LIVE verdict at the end, exactly
+# the "absorbing LIVE" rule (above) misapplied to a hop that is actually a runtime
+# branch, not a deterministic relay. A dispatcher's outgoing edges are categorically
+# REACHABLE (a human, or a hook's fixed argument, must still select the branch) and
+# must never propagate LIVE onward, REGARDLESS of whether the dispatcher itself is
+# hook-reachable. The dispatcher file can still classify LIVE if a hook names it
+# directly — only its OWN outgoing mentions are excluded from this closure. edges-code
+# itself (and therefore reach_build_class / REACHABLE) is untouched: a bin reachable
+# ONLY through the dispatcher still correctly reads REACHABLE, never DEAD — this is a
+# classification correction, not a reachability regression.
 reach_build_hook_class() {
   local w="$1"
   LC_ALL=C awk '$0 == "hooks/hooks.json" || $0 == ".mcp.json"' "$w/seeds" > "$w/hook-seeds" 2>/dev/null
+  LC_ALL=C awk -F'\t' '$1 != "bin/heimdall" && $1 != "bin/hmd"' "$w/edges-code" > "$w/edges-hook" 2>/dev/null
 
-  LC_ALL=C awk -v nodesf="$w/nodes" -v seedsf="$w/hook-seeds" -v edgesf="$w/edges-code" '
+  LC_ALL=C awk -v nodesf="$w/nodes" -v seedsf="$w/hook-seeds" -v edgesf="$w/edges-hook" '
     BEGIN {
       while ((getline l < nodesf) > 0) {
         split(l, a, "\t")
@@ -530,10 +659,13 @@ reach_build_hook_class() {
 }
 
 # reach_hop_class REFERRER — the evidentiary weight of ONE hop, from what KIND of file
-# is doing the naming, never from what it says.
+# is doing the naming, never from what it says. commands/*.md is checked BEFORE the
+# general *.md case: it is a declared slash-command entry point (a human types `/name`),
+# not incidental prose — see COMMANDS/*.MD ARE A DECLARED ENTRY POINT above.
 reach_hop_class() {
   case "$1" in
     hooks/hooks.json|.mcp.json) printf 'LIVE\n' ;;
+    commands/*.md)              printf 'REACHABLE\n' ;;
     *.md)                       printf 'PROSE-ONLY\n' ;;
     *)                          printf 'REACHABLE\n' ;;
   esac
@@ -611,4 +743,54 @@ reach_classify_all() {
     printf '%s\t%s\n' "$name" "$cls"
   done < "$w/subjects"
   return 0
+}
+
+# reach_vacuity_ceiling — the maximum percentage of ALL scanned bin/ executables
+# (reach_subject_count's denominator: every candidate this file's BFS ever considers,
+# dead ones included, so the number moves only when a file is actually added or
+# removed, never when an exemption row alone reclassifies something) that may
+# legitimately classify LIVE before the caller-class census itself is evidence of a
+# vacuous classifier rather than a genuinely automatic codebase.
+#
+# LIVE means "fires without a human typing it" — a STRUCTURAL claim about the mention
+# graph, not an empirical one, so it will always read higher than any measured
+# invocation frequency: the 2026-08-22 capability census
+# (docs/analysis/2026-08-22-capability-census.md) found only ~43 distinct bins actually
+# fired across 384 real sessions, roughly a quarter of the ~179 scanned here, but a
+# rarely-triggered error-path hook is still honestly LIVE even in a sample where it
+# never happened to fire. Pinning this ceiling down near that ~24-29% empirical floor
+# would fail for the wrong reason as often as the right one.
+#
+# 60 is a judgment call, not a derived constant, chosen to sit strictly between the two
+# real data points this file's own history produced:
+#   - 131 of 179 (73%) — this classifier's actual PRE-FIX output, proven vacuous by
+#     hand (comment-only mentions counted as invocation edges; bin/heimdall's ~65-arm
+#     dispatch table laundering REACHABLE hops into LIVE). MUST fail this ceiling.
+#   - 99 of 179 (55%) — the real tree today, after both fixes, ten bins of headroom
+#     under the ceiling: loose enough that legitimate LIVE growth is not a false
+#     alarm, tight enough that a THIRD hub-laundering bug re-inflating LIVE by more
+#     than that has a real chance of tripping it rather than sliding underneath.
+# Tighten this number only alongside real work that brings LIVE down further — never
+# by widening it to wherever LIVE happens to have drifted, which would make the gate
+# decorative in exactly the way bin/lib/reachability-exemptions.tsv's own dated-row
+# discipline exists to prevent for individual bins.
+reach_vacuity_ceiling() { printf '%s\n' 60; }
+
+# reach_vacuity_check TOTAL LIVE — pass (rc 0) if LIVE is within reach_vacuity_ceiling
+# percent of TOTAL, fail (rc 1) if over it, fail loudly (rc 2, message on stderr) if
+# either argument is not a non-negative integer or TOTAL is 0. Pure integer arithmetic
+# on two numbers the caller supplies, no filesystem access of its own — deliberately,
+# so it is provable against ANY (total, live) pair, synthetic or real, without standing
+# up a tree: see test/bin-reachability-gate.test.sh's RED call (this classifier's own
+# real pre-fix 179/131 pair, which must fail) and GREEN call (this classifier's own
+# real current 179/99 pair, which must pass) for the falsifiability proof, and the
+# real-tree call a few lines later in that same file for the actual standing gate.
+reach_vacuity_check() {
+  local total="$1" live="$2" max_pct pct
+  case "$total" in ''|*[!0-9]*) echo "reach_vacuity_check: TOTAL must be a non-negative integer, got '$total'" >&2; return 2 ;; esac
+  case "$live"  in ''|*[!0-9]*) echo "reach_vacuity_check: LIVE must be a non-negative integer, got '$live'" >&2; return 2 ;; esac
+  [ "$total" -gt 0 ] || { echo "reach_vacuity_check: TOTAL must be > 0" >&2; return 2; }
+  max_pct="$(reach_vacuity_ceiling)"
+  pct=$(( (live * 100) / total ))
+  [ "$pct" -le "$max_pct" ]
 }
