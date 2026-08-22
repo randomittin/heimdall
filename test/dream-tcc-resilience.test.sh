@@ -31,9 +31,12 @@
 #   (5) NOTICE is LOUD on an ARTIFACT GAP with NO status file at all — the backstop for the
 #       exact 10-night silence, where the job died before it could report anything.
 #   (6) NOTICE SELF-CLEARS: a blocked status already superseded by a report goes quiet.
-#   (7) SCHEDULE pins ProgramArguments[0] at a runner OUTSIDE the TCC-protected repo, still
-#       encodes the full overnight command, and never sets WorkingDirectory to a path the
-#       job cannot getcwd() (the source of the 'shell-init: getcwd' lines in the real log).
+#   (7) SCHEDULE pins ProgramArguments[1] at a runner OUTSIDE the TCC-protected repo,
+#       ProgramArguments[0] at a named interpreter (the private hmd-dream identity, or an
+#       honest /bin/bash fallback) rather than relying on a shebang launchd's minimal PATH
+#       may not resolve, still encodes the full overnight command, and never sets
+#       WorkingDirectory to a path the job cannot getcwd() (the source of the
+#       'shell-init: getcwd' lines in the real log).
 
 set -euo pipefail
 
@@ -397,8 +400,9 @@ cp "$ROOT/bin/lib/real-home.sh" "$CANON/bin/lib/real-home.sh"
 cp "$ROOT/bin/lib/tcc-paths.sh" "$CANON/bin/lib/tcc-paths.sh"
 cp "$DREAM" "$CANON/bin/heimdall-dream"
 cp "$RUNNER" "$CANON/bin/heimdall-dream-runner"
+cp "$ROOT/bin/heimdall-dream-bundle" "$CANON/bin/heimdall-dream-bundle"
 chmod +x "$CANON/bin/heimdall-dream-schedule" "$CANON/bin/heimdall-dream" \
-         "$CANON/bin/heimdall-dream-runner"
+         "$CANON/bin/heimdall-dream-runner" "$CANON/bin/heimdall-dream-bundle"
 git -C "$CANON" init -q
 git -C "$CANON" add -A >/dev/null 2>&1
 git -C "$CANON" -c user.email=t@t -c user.name=t commit -qm fixture >/dev/null 2>&1
@@ -421,14 +425,36 @@ else
 fi
 
 PA0=""
+PA1=""
 if [ -f "$PLIST7" ]; then
   PA0="$(plutil -extract ProgramArguments.0 raw -o - "$PLIST7" 2>/dev/null || true)"
+  PA1="$(plutil -extract ProgramArguments.1 raw -o - "$PLIST7" 2>/dev/null || true)"
 fi
 
-if [ -n "$PA0" ] && [ "$PA0" = "$HH7/bin/heimdall-dream-runner" ]; then
-  ok "(7) ProgramArguments[0] is the runner installed OUTSIDE the repo ($PA0)"
+# ProgramArguments[1] is the runner now — [0] is the INTERPRETER that execs it (below),
+# named outright so launchd's minimal PATH never has to resolve a shebang.
+if [ -n "$PA1" ] && [ "$PA1" = "$HH7/bin/heimdall-dream-runner" ]; then
+  ok "(7) ProgramArguments[1] is the runner installed OUTSIDE the repo ($PA1)"
 else
-  bad "(7) ProgramArguments[0] is '$PA0', expected $HH7/bin/heimdall-dream-runner"
+  bad "(7) ProgramArguments[1] is '$PA1', expected $HH7/bin/heimdall-dream-runner"
+fi
+
+# ProgramArguments[0]: the hmd-dream bundle when codesign can build one (this fixture
+# ships heimdall-dream-bundle, so on any macOS box with codesign it always can), else the
+# documented, honest /bin/bash fallback — never anything else.
+BUNDLE_EXEC7="$HH7/bin/hmd-dream.app/Contents/MacOS/hmd-dream"
+if command -v codesign >/dev/null 2>&1; then
+  if [ "$PA0" = "$BUNDLE_EXEC7" ] && [ -x "$BUNDLE_EXEC7" ]; then
+    ok "(7) ProgramArguments[0] is the private hmd-dream identity ($PA0)"
+  else
+    bad "(7) ProgramArguments[0] is '$PA0', expected the built $BUNDLE_EXEC7"
+  fi
+else
+  if [ "$PA0" = "/bin/bash" ]; then
+    ok "(7) no codesign on this box: ProgramArguments[0] honestly fell back to /bin/bash"
+  else
+    bad "(7) ProgramArguments[0] is '$PA0', expected the documented /bin/bash fallback"
+  fi
 fi
 
 if [ -x "$HH7/bin/heimdall-dream-runner" ]; then

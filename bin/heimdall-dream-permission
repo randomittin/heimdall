@@ -94,6 +94,13 @@ LA_DIR="${HEIMDALL_LAUNCH_AGENTS_DIR:-$HOME/Library/LaunchAgents}"
 PLIST="$LA_DIR/com.heimdall.dream.plist"
 OPEN_BIN="${HEIMDALL_OPEN:-open}"
 
+# The private, ad-hoc-signed hmd-dream identity heimdall-dream-schedule builds into
+# RUNNER_DIR at install time. Read-only from here — BUILDING is schedule's job, done once
+# at install, before this file's ask ever runs; this file only reports what already
+# exists (`identity`, never `build`).
+BUNDLE="$BINDIR/heimdall-dream-bundle"
+RUNNER_DIR="$HEIMDALL_HOME/bin"
+
 # The pane macOS opens for a Full Disk Access request. This is a URL handed to the OS,
 # not a mutation — the human still does every part of the granting.
 FDA_PANE="x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"
@@ -134,6 +141,14 @@ json_field() { # json_field <file> <key>
     "$1" 2>/dev/null | head -1
 }
 
+# json_field_var — the same reader as json_field above, over a STRING already in hand
+# instead of a file on disk. heimdall-dream-bundle's `identity --json` prints to stdout,
+# not a file, so its output is read this way rather than redirected to a temp file just
+# to satisfy json_field's file-based signature.
+json_field_var() { # json_field_var <string> <key>
+  printf '%s\n' "$1" | sed -n "s/^[[:space:]]*\"$2\"[[:space:]]*:[[:space:]]*\"\(.*\)\"[[:space:]]*,\{0,1\}[[:space:]]*\$/\1/p" | head -1
+}
+
 json_escape() {
   local s="$1"
   s="${s//\\/\\\\}"
@@ -142,6 +157,61 @@ json_escape() {
   s="${s//$'\n'/ }"
   s="${s//$'\r'/ }"
   printf '%s' "$s"
+}
+
+# ── the hmd-dream identity — read-only here; heimdall-dream-schedule is what builds it ──
+BUNDLE_ID_EXISTS=0
+BUNDLE_ID_PATH=""
+BUNDLE_ID_EXEC=""
+BUNDLE_ID_NAME=""
+BUNDLE_ID_CDHASH=""
+
+load_bundle_identity() {
+  BUNDLE_ID_EXISTS=0; BUNDLE_ID_PATH=""; BUNDLE_ID_EXEC=""; BUNDLE_ID_NAME=""; BUNDLE_ID_CDHASH=""
+  [ -x "$BUNDLE" ] || return 0
+  local out rc=0
+  out="$("$BUNDLE" identity --out "$RUNNER_DIR" --json 2>/dev/null)" || rc=$?
+  [ "$rc" -eq 0 ] || return 0
+  BUNDLE_ID_PATH="$(json_field_var "$out" path)"
+  BUNDLE_ID_EXEC="$(json_field_var "$out" executable)"
+  BUNDLE_ID_NAME="$(json_field_var "$out" display_name)"
+  BUNDLE_ID_CDHASH="$(json_field_var "$out" cdhash)"
+  [ -n "$BUNDLE_ID_EXEC" ] && [ -x "$BUNDLE_ID_EXEC" ] && BUNDLE_ID_EXISTS=1
+  return 0
+}
+
+# bundle_current_cdhash — the CDHash of WHATEVER ProgramArguments[0] actually is right
+# now, live and uncached. Never trust a remembered value: TCC keys a grant to code
+# identity, and a rebuilt interpreter gets a NEW CDHash even sitting at the same path.
+bundle_current_cdhash() {
+  local p out
+  p="$(plist_arg 0)"
+  if [ -z "$p" ] || [ ! -x "$p" ] || ! command -v codesign >/dev/null 2>&1; then
+    return 0
+  fi
+  out="$(codesign -dvvv "$p" 2>&1)" || true
+  printf '%s' "$out" | sed -n 's/^CDHash=//p' | head -1
+  return 0
+}
+
+# identity_drifted — true unless the interpreter that earned the LAST successful,
+# repo-reaching run is POSITIVELY CONFIRMED to still be ProgramArguments[0] today. A grant
+# is earned by a human clicking a specific row in System Settings for a specific code
+# identity; when that identity moves — a rebuild, a reinstall, a macOS update that
+# re-signs /bin/bash — the grant does not follow it, and TCC gives no signal that it
+# silently stopped applying. This is the only way we ever find out.
+#
+# FAILS SAFE TOWARD "DRIFTED": an unrecorded or unrecomputable hash on EITHER side counts
+# as drift, never as a pass — trusting a grant we cannot actually confirm is the exact
+# failure this exists to catch.
+identity_drifted() {
+  local recorded current
+  recorded="$(json_field "$STATUS" interpreter_cdhash)"
+  current="$(bundle_current_cdhash)"
+  if [ -n "$recorded" ] && [ -n "$current" ] && [ "$recorded" = "$current" ]; then
+    return 1
+  fi
+  return 0
 }
 
 # ── classification ───────────────────────────────────────────────────────────────
@@ -212,7 +282,11 @@ classify() {
   if [ "$S_RESULT" = "ok" ]; then
     case "$S_REACH" in
       yes)
-        STATE="granted"; REASON="scheduled-run-succeeded"
+        if identity_drifted; then
+          STATE="needs-grant"; REASON="interpreter-identity-changed"
+        else
+          STATE="granted"; REASON="scheduled-run-succeeded"
+        fi
         return 0
         ;;
       no)
@@ -236,6 +310,7 @@ classify() {
 subject() { printf '%s|%s' "$REPO" "$PROT_ROOT"; }
 
 marker_subject() { json_field "$MARKER" subject; }
+marker_reason() { json_field "$MARKER" reason; }
 
 write_marker() {
   local dir tmp
@@ -322,9 +397,11 @@ p() { printf '%s\n' "$*"; }
 
 print_block() {
   local prog interp pinned safe_suggest
+  load_bundle_identity
   prog="$(plist_arg 0)"
   [ -n "$prog" ] || prog="$HEIMDALL_HOME/bin/heimdall-dream-runner"
   interp="$(resolve_shebang_interpreter "$prog")"
+  [ -n "$interp" ] || interp="$prog"
   pinned="$(plist_pinned_python)"
   safe_suggest="$HOME/$(basename "$REPO")"
 
@@ -332,19 +409,32 @@ print_block() {
   p "  HEIMDALL NEEDS ONE PERMISSION DECISION FROM YOU  —  once, about a minute"
   p "=============================================================================="
   p ""
-  p "  WHAT IS BROKEN"
-  p "    The nightly dream at 03:00 cannot read this repo, so no morning report is"
-  p "    ever written. Running it by hand still works — this is only the unattended run."
-  p ""
-  p "      repo        : $REPO"
-  if [ -n "$S_DENIED" ]; then
-    p "      denied      : $S_DENIED"
-  fi
-  if [ -n "$S_DETAIL" ]; then
-    p "      os error    : $S_DETAIL"
-  fi
-  if [ -n "$S_TS" ]; then
-    p "      last attempt: $S_TS  (blocked)"
+  if [ "$REASON" = "interpreter-identity-changed" ]; then
+    p "  WHAT IS BROKEN"
+    p "    The nightly dream at 03:00 HAD the permission it needs — a previous run"
+    p "    reached this repo successfully. But the interpreter it runs through changed"
+    p "    code identity since then (a Heimdall update, a reinstall, or a macOS update"
+    p "    can all do this), and macOS ties the grant to that identity, not to the path."
+    p "    The old grant does not follow the new binary — this is not a bug you caused,"
+    p "    it is what TCC does, by design, whenever the underlying code changes."
+    p ""
+    p "      repo        : $REPO"
+    p "      interpreter : $interp"
+  else
+    p "  WHAT IS BROKEN"
+    p "    The nightly dream at 03:00 cannot read this repo, so no morning report is"
+    p "    ever written. Running it by hand still works — this is only the unattended run."
+    p ""
+    p "      repo        : $REPO"
+    if [ -n "$S_DENIED" ]; then
+      p "      denied      : $S_DENIED"
+    fi
+    if [ -n "$S_DETAIL" ]; then
+      p "      os error    : $S_DETAIL"
+    fi
+    if [ -n "$S_TS" ]; then
+      p "      last attempt: $S_TS  (blocked)"
+    fi
   fi
   p ""
   p "  WHY"
@@ -373,38 +463,89 @@ print_block() {
   p "         Recommended. Nothing to grant, nothing to maintain, no click, and it"
   p "         cannot be revoked by a macOS update."
   p ""
-  p "    [B]  GRANT FULL DISK ACCESS                      — one human click, broad grant"
-  p ""
-  p "           1.  heimdall-dream-permission open-settings"
-  p "               (opens System Settings > Privacy & Security > Full Disk Access)"
-  p "           2.  click +, press Cmd+Shift+G, and add:"
-  if [ -n "$interp" ]; then
-    p "                 $interp"
+  if [ "$BUNDLE_ID_EXISTS" = 1 ]; then
+    p "    [B]  GRANT FULL DISK ACCESS TO hmd-dream          — one click, narrowly scoped"
+    p ""
+    p "           1.  heimdall-dream-permission open-settings"
+    p "               (opens System Settings > Privacy & Security > Full Disk Access)"
+    p "           2.  click +, press Cmd+Shift+G, and paste exactly:"
+    p "                 $BUNDLE_ID_EXEC"
+    p "               It will list as \"$BUNDLE_ID_NAME\" — a private identity built"
+    p "               only for this job, distinct from the system's own /bin/bash."
+    if [ -n "$pinned" ]; then
+      p "           3.  dream ALSO runs through a pinned python interpreter — add this"
+      p "               path too (still the shared system/Homebrew binary; Heimdall does"
+      p "               not build it a private identity the way it does for bash above):"
+      p "                 $pinned"
+    fi
+    p "           4.  switch it ON, then reload the job so launchd stops using its"
+    p "               cached (denied) decision:"
+    p "                 launchctl bootout gui/$(id -u)/com.heimdall.dream 2>/dev/null"
+    p "                 launchctl bootstrap gui/$(id -u) $PLIST"
+    p "               (or, equivalently:  launchctl kickstart -k gui/$(id -u)/com.heimdall.dream)"
+    p "           5.  confirm it actually took, from tonight's real scheduled run —"
+    p "               not from this tool, which cannot see inside System Settings:"
+    p "                 heimdall-dream-permission check --repo $REPO"
+    p ""
+    p "         Recommended over [C] below: this identity is used by nothing else on the"
+    p "         machine, so the grant cannot leak to any other program."
+    p ""
+    p "    [C]  GRANT FULL DISK ACCESS TO THE RAW INTERPRETER  — LAST RESORT, BROAD GRANT"
+    p ""
+    p "           add instead: $interp"
+    p "           BLAST RADIUS, HONESTLY: that path is a shared system binary — granting"
+    p "           it Full Disk Access grants it to every other program that runs through"
+    p "           that same binary, not just this job. Prefer [B] above."
+    p ""
+    p "    [D]  DO NOTHING                                  — keep running it by hand"
+    p ""
+    p "           $REPO/bin/heimdall-dream --repo $REPO run"
+    p ""
+    p "         Your terminal holds the grant, so this works right now. The 03:00 run stays"
+    p "         broken and Heimdall keeps telling you so at the start of each session."
+  else
+    p "    [B]  GRANT FULL DISK ACCESS                      — one human click, broad grant"
+    p ""
+    p "           1.  heimdall-dream-permission open-settings"
+    p "               (opens System Settings > Privacy & Security > Full Disk Access)"
+    p "           2.  click +, press Cmd+Shift+G, and add:"
+    if [ -n "$interp" ]; then
+      p "                 $interp"
+    fi
+    if [ -n "$pinned" ] && [ "$pinned" != "$interp" ]; then
+      p "                 $pinned"
+    fi
+    if [ -z "$interp" ] && [ -z "$pinned" ]; then
+      p "                 the interpreter named in the error above"
+    fi
+    p "           3.  switch it ON, then reload the job so launchd stops using its"
+    p "               cached (denied) decision:"
+    p "                 launchctl bootout gui/$(id -u)/com.heimdall.dream 2>/dev/null"
+    p "                 launchctl bootstrap gui/$(id -u) $PLIST"
+    p "               (or, equivalently:  launchctl kickstart -k gui/$(id -u)/com.heimdall.dream)"
+    p "           4.  confirm it actually took, from tonight's real scheduled run:"
+    p "                 heimdall-dream-permission check --repo $REPO"
+    p ""
+    p "         LAST RESORT: a narrower, private grant (hmd-dream) could not be built on"
+    p "         this machine (codesign unavailable, or heimdall-dream-bundle missing) —"
+    p "         run heimdall-dream-bundle build --out $HEIMDALL_HOME/bin to see why."
+    p "         BLAST RADIUS, HONESTLY: macOS judges the INTERPRETER, not the script —"
+    p "         the recorded denial named the interpreter, not the job. Those paths are"
+    p "         shared system binaries, so granting them Full Disk Access grants it to"
+    p "         every other program that runs through them. Prefer [A] unless you have a"
+    p "         specific reason not to."
+    p ""
+    p "    [C]  DO NOTHING                                  — keep running it by hand"
+    p ""
+    p "           $REPO/bin/heimdall-dream --repo $REPO run"
+    p ""
+    p "         Your terminal holds the grant, so this works right now. The 03:00 run stays"
+    p "         broken and Heimdall keeps telling you so at the start of each session."
   fi
-  if [ -n "$pinned" ] && [ "$pinned" != "$interp" ]; then
-    p "                 $pinned"
-  fi
-  if [ -z "$interp" ] && [ -z "$pinned" ]; then
-    p "                 the interpreter named in the error above"
-  fi
-  p "           3.  switch it ON, then re-register:"
-  p "                 heimdall-dream-schedule install --repo $REPO"
-  p ""
-  p "         BLAST RADIUS, HONESTLY: macOS judges the INTERPRETER, not the script —"
-  p "         the recorded denial named the interpreter, not the job. Those paths are"
-  p "         shared system binaries, so granting them Full Disk Access grants it to"
-  p "         every other program that runs through them. Prefer [A] unless you have a"
-  p "         specific reason not to."
-  p ""
-  p "    [C]  DO NOTHING                                  — keep running it by hand"
-  p ""
-  p "           $REPO/bin/heimdall-dream --repo $REPO run"
-  p ""
-  p "         Your terminal holds the grant, so this works right now. The 03:00 run stays"
-  p "         broken and Heimdall keeps telling you so at the start of each session."
   p ""
   p "  Shown once. It will not ask again unless something changes, and it goes quiet by"
-  p "  itself the moment a scheduled run succeeds. To see it again:"
+  p "  itself the moment a scheduled run succeeds AND still uses the same interpreter"
+  p "  identity you granted. To see it again:"
   p "    heimdall-dream-permission ask --repo $REPO --force"
   p "=============================================================================="
 }
@@ -457,23 +598,41 @@ open_pane() {
 # name the one thing that WILL prove it — a scheduled run recording result: ok, which is
 # also what makes this ask go quiet on its own.
 flow_grant() {
-  local interp pinned prog
+  local interp pinned prog target
+  load_bundle_identity
   prog="$(plist_arg 0)"
   [ -n "$prog" ] || prog="$HEIMDALL_HOME/bin/heimdall-dream-runner"
   interp="$(resolve_shebang_interpreter "$prog")"
+  [ -n "$interp" ] || interp="$prog"
   pinned="$(plist_pinned_python)"
   [ -n "$interp" ] || interp="$pinned"
 
-  echo ""
-  p "  Before you do — the blast radius. macOS judges the INTERPRETER, not the script,"
-  p "  so the grant would land on:"
-  if [ -n "$interp" ]; then
-    p "    $interp"
+  if [ "$BUNDLE_ID_EXISTS" = 1 ]; then
+    target="$BUNDLE_ID_EXEC"
   else
-    p "    the scheduled interpreter (named in the error above)"
+    target="$interp"
   fi
-  p "  Full Disk Access on that binary reaches EVERY program that runs through it, not"
-  p "  just Heimdall. [A] avoids this entirely if moving the repo is an option."
+
+  echo ""
+  if [ "$BUNDLE_ID_EXISTS" = 1 ]; then
+    p "  This grants Full Disk Access to a private identity built only for this job"
+    p "  (\"$BUNDLE_ID_NAME\"), not the shared system interpreter — unlike a raw grant,"
+    p "  nothing else on the machine runs through this exact binary."
+    if [ -n "$pinned" ]; then
+      p "  dream also runs through a separate, still-shared python interpreter"
+      p "  ($pinned) that this narrowing does not cover — add it too if you use --python."
+    fi
+  else
+    p "  Before you do — the blast radius. macOS judges the INTERPRETER, not the script,"
+    p "  so the grant would land on:"
+    if [ -n "$target" ]; then
+      p "    $target"
+    else
+      p "    the scheduled interpreter (named in the error above)"
+    fi
+    p "  Full Disk Access on that binary reaches EVERY program that runs through it, not"
+    p "  just Heimdall. [A] avoids this entirely if moving the repo is an option."
+  fi
   echo ""
   if ! ask_line "  Open System Settings at Full Disk Access now? [y/N] "; then
     p "  No answer — leaving everything as it is. Nothing was changed."
@@ -491,12 +650,20 @@ flow_grant() {
     p "    System Settings > Privacy & Security > Full Disk Access"
   fi
   p "  Click +, press Cmd+Shift+G, and add:"
-  if [ -n "$interp" ]; then
-    p "    $interp"
+  if [ -n "$target" ]; then
+    p "    $target"
   else
     p "    the interpreter named in the error above"
   fi
+  if [ "$BUNDLE_ID_EXISTS" = 1 ] && [ -n "$pinned" ]; then
+    p "  and, separately, if you use --python:"
+    p "    $pinned"
+  fi
   p "  then switch it ON."
+  echo ""
+  p "  Then reload the job so launchd stops using its cached (denied) decision:"
+  p "    launchctl bootout gui/$(id -u)/com.heimdall.dream 2>/dev/null"
+  p "    launchctl bootstrap gui/$(id -u) $PLIST"
   echo ""
   ask_line "  Press Enter when you are done (or Ctrl-C to leave it): " || true
 
@@ -515,7 +682,7 @@ flow_grant() {
   p "    what I can still see : $REPO is inside $PROT_ROOT"
   p "                           (structural — a grant does not change it)"
   p "    what I cannot see    : whether Full Disk Access is now set for"
-  p "                           $([ -n "$interp" ] && printf '%s' "$interp" || printf 'the scheduled interpreter')"
+  p "                           $([ -n "$target" ] && printf '%s' "$target" || printf 'the scheduled interpreter')"
   p "    the proof that counts: the next scheduled run records  result: ok  in"
   p "                           $STATUS, and this ask goes quiet by itself."
   p "    check any time       : heimdall-dream-permission check --repo $REPO"
@@ -579,8 +746,12 @@ flow_move() {
 
 # interactive_flow — put the choice to him and act on it.
 interactive_flow() {
+  local label
+  load_bundle_identity
+  label="grant Full Disk Access"
+  [ "$BUNDLE_ID_EXISTS" = 1 ] && label="grant Full Disk Access to hmd-dream"
   echo ""
-  if ! ask_line "  Your choice — [A] move the repo, [B] grant Full Disk Access, [C] not now: "; then
+  if ! ask_line "  Your choice — [A] move the repo, [B] $label, [C] not now: "; then
     p "  No answer — leaving everything as it is."
     return 0
   fi
@@ -605,7 +776,13 @@ cmd_check() {
       "$asked" "$(json_escape "$S_DENIED")" "$(json_escape "$S_DETAIL")" "$(json_escape "$S_TS")"
   else
     case "$STATE" in
-      needs-grant) echo "needs-grant: $REPO is inside $PROT_ROOT — the 03:00 job cannot read it" ;;
+      needs-grant)
+        if [ "$REASON" = "interpreter-identity-changed" ]; then
+          echo "needs-grant: $REPO's interpreter changed identity since the last granted run — re-grant needed"
+        else
+          echo "needs-grant: $REPO is inside $PROT_ROOT — the 03:00 job cannot read it"
+        fi
+        ;;
       granted)     echo "granted: the scheduled job has read $REPO successfully ($S_TS)" ;;
       ok)          echo "ok: $REPO is not inside a macOS-protected folder — no grant needed" ;;
       *)           echo "unknown: the protected-path predicate is unavailable (bin/lib/tcc-paths.sh)" ;;
@@ -647,7 +824,14 @@ cmd_ask() {
     rm -f "$MARKER" 2>/dev/null || true
     return 0
   fi
-  if [ "$FORCE" != 1 ] && [ -f "$MARKER" ] && [ "$(marker_subject)" = "$(subject)" ]; then
+  # BOTH subject AND reason must match to suppress. Subject alone would let a stale
+  # marker from an earlier, different-reason block silently swallow a genuinely NEW ask —
+  # e.g. the original tcc-protected-repo block gets shown and marked, the operator grants
+  # FDA out-of-band, and months later an unrelated rebuild triggers
+  # interpreter-identity-changed: same subject, different reason, and it deserves to be
+  # shown rather than muted by an ask that was about something else.
+  if [ "$FORCE" != 1 ] && [ -f "$MARKER" ] \
+     && [ "$(marker_subject)" = "$(subject)" ] && [ "$(marker_reason)" = "$REASON" ]; then
     return 0
   fi
   print_block

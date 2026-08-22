@@ -105,11 +105,16 @@ PROT_REPO="$FHOME/Downloads/heimdall"      # the shape of the owner's real machi
 SAFE_REPO="$FHOME/src/heimdall"            # the shape after option [A]
 mkdir -p "$PROT_REPO/.planning" "$SAFE_REPO/.planning"
 
-write_status() { # write_status <file> <result> <reason> <denied_path> [repo_reachable]
+write_status() { # write_status <file> <result> <reason> <denied_path> [repo_reachable] [interpreter_cdhash]
   # repo_reachable defaults to yes because the runner defaults it to yes and only
   # flips it to no on the TCC path. It is written on EVERY status the runner emits,
   # so a fixture omitting it does not model anything the runner can produce — pass
   # it explicitly whenever the case under test turns on reachability.
+  #
+  # interpreter_cdhash defaults to empty — the honest default for every existing case
+  # here, none of which ever recorded a real interpreter identity. Only (5)'s primary
+  # disarm case passes a real one, because identity_drifted() now gates "granted" on it
+  # matching ProgramArguments[0] live, not on result/reachability alone.
   cat > "$1" <<EOF
 {
   "schema": 1,
@@ -123,6 +128,7 @@ write_status() { # write_status <file> <result> <reason> <denied_path> [repo_rea
   "denied_path": "$4",
   "detail": "ls: $4: Operation not permitted",
   "repo_reachable": "${5:-yes}",
+  "interpreter_cdhash": "${6:-}",
   "exit": 75
 }
 EOF
@@ -269,27 +275,70 @@ RESHOWN="$("$PERM" ask --repo "$PROT_REPO" 2>&1)"
 # the mirror-back of the report. That is precisely why the runner records
 # repo_reachable beside the result. The evidence of a grant is REACHABILITY, never
 # completion, so both fields are pinned here.
-write_status "$STATUSF" ok "" "" yes
+# A REAL plist and a REAL system binary's CDHash — so "successful, reachable" can be
+# genuinely CONFIRMED against ProgramArguments[0], not just asserted. /bin/bash is used
+# because it exists and is signed on every macOS box, so this needs no fixture-built
+# binary of its own. Scoped to this section only: unset again once section (5) is done,
+# so it cannot leak an assumption into (6)-(8), which run before (9) sets up its own.
+S5_LA="$WORK/s5-LaunchAgents"
+mkdir -p "$S5_LA"
+S5_PLIST="$S5_LA/com.heimdall.dream.plist"
+cat > "$S5_PLIST" <<PLISTEOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.heimdall.dream</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+  </array>
+</dict>
+</plist>
+PLISTEOF
+S5_CDHASH=""
+if command -v codesign >/dev/null 2>&1; then
+  S5_CDHASH="$(codesign -dvvv /bin/bash 2>&1 | sed -n 's/^CDHash=//p' | head -1)"
+fi
+export HEIMDALL_LAUNCH_AGENTS_DIR="$S5_LA"
+
+write_status "$STATUSF" ok "" "" yes "$S5_CDHASH"
 GRC=0
 GJSON="$("$PERM" check --repo "$PROT_REPO" --json)" || GRC=$?
-if [ "$(printf '%s' "$GJSON" | jq -r '.state')" = "granted" ] && [ "$GRC" = 0 ]; then
-  ok "(5) a scheduled run that recorded result=ok disarms the ask (state=granted, exit 0)"
+if [ -n "$S5_CDHASH" ]; then
+  if [ "$(printf '%s' "$GJSON" | jq -r '.state')" = "granted" ] && [ "$GRC" = 0 ]; then
+    ok "(5) result=ok + reachable + a CONFIRMED matching interpreter identity disarms the ask (state=granted, exit 0)"
+  else
+    bad "(5) a successful, identity-confirmed run did not disarm: rc=$GRC $GJSON"
+  fi
 else
-  bad "(5) a successful scheduled run did not disarm: rc=$GRC $GJSON"
+  # No codesign on this box — identity can never be positively confirmed, so the
+  # fail-safe correctly withholds "granted" rather than trusting an unverifiable match.
+  if [ "$(printf '%s' "$GJSON" | jq -r '.state')" = "needs-grant" ] \
+     && [ "$(printf '%s' "$GJSON" | jq -r '.reason')" = "interpreter-identity-changed" ]; then
+    ok "(5) no codesign on this box: identity cannot be confirmed, so it fails safe to needs-grant instead of claiming granted"
+  else
+    bad "(5) unexpected state without codesign: $GJSON"
+  fi
 fi
 
-QUIET="$("$PERM" ask --repo "$PROT_REPO" 2>&1)"
-[ -z "$QUIET" ] && ok "(5) ask is silent once the scheduled job is proven to reach the repo" \
-  || bad "(5) ask nagged a working schedule: $QUIET"
+if [ -n "$S5_CDHASH" ]; then
+  QUIET="$("$PERM" ask --repo "$PROT_REPO" 2>&1)"
+  [ -z "$QUIET" ] && ok "(5) ask is silent once the scheduled job is proven to reach the repo" \
+    || bad "(5) ask nagged a working schedule: $QUIET"
 
-[ ! -f "$STATE" ] \
-  && ok "(5) the marker is CLEARED on success, so a later recurrence re-arms honestly" \
-  || bad "(5) a stale marker survived success — a recurrence would go unasked"
+  [ ! -f "$STATE" ] \
+    && ok "(5) the marker is CLEARED on success, so a later recurrence re-arms honestly" \
+    || bad "(5) a stale marker survived success — a recurrence would go unasked"
 
-write_status "$STATUSF" blocked tcc-denied "$PROT_REPO" no
-REARM="$("$PERM" ask --repo "$PROT_REPO" 2>&1)"
-[ -n "$REARM" ] && ok "(5) a RECURRENCE after success asks again (not permanently muted)" \
-  || bad "(5) a recurrence was silently swallowed"
+  write_status "$STATUSF" blocked tcc-denied "$PROT_REPO" no
+  REARM="$("$PERM" ask --repo "$PROT_REPO" 2>&1)"
+  [ -n "$REARM" ] && ok "(5) a RECURRENCE after success asks again (not permanently muted)" \
+    || bad "(5) a recurrence was silently swallowed"
+else
+  ok "(5) no codesign on this box: skipping the disarm-dependent sub-assertions — 'granted' is correctly never reached to disarm anything"
+fi
+unset HEIMDALL_LAUNCH_AGENTS_DIR
 
 # ── (5b) A COMPLETED RUN IS NOT A GRANT — the fail-open this ask was losing to ──────
 # The runner finishes and writes result=ok even when TCC handed it nothing: dream's
