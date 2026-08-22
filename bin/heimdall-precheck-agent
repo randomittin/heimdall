@@ -1,0 +1,149 @@
+#!/usr/bin/env bash
+# heimdall-precheck-agent - the PreToolUse/Agent enforcement path (owns BOTH
+# checks hooks/hooks.json used to run inline: the named-agent notice and the
+# brief-adoption gate). Moved out of hooks.json into a real, bash -n'able,
+# testable script for the same reason bin/heimdall-precheck-edit exists for
+# Write|Edit: hooks.json is wiring, this is the logic.
+#
+# -- named-agent notice (unchanged behavior, advisory only) -----------------
+# A `name:` on a spawn makes it MAILBOX-RESIDENT (never self-terminates, never
+# returns a result to the spawn call - measured 0/43 named completed vs 59/66
+# unnamed over 109 spawns in one session). This can never be more than a
+# warning: `name:` has legitimate uses (a long-lived teammate collected via
+# SendMessage), so it only ever prints to stderr. Set
+# HEIMDALL_ALLOW_NAMED_AGENT=1 to silence it.
+#
+# -- brief-adoption gate (this is the mechanical upgrade) --------------------
+# Was advisory-only: a printed suggestion to run heimdall-brief, silenceable,
+# and measured to be ignored 100% of the time (0 real heimdall-brief
+# invocations across ~40 hand-written oversized spawn prompts in one
+# session). A warning is just a prompt delivered by a hook - it fails exactly
+# like a prompt. Claude Code's PreToolUse contract can actually rewrite
+# tool_input (hookSpecificOutput.updatedInput, schema-validated against the
+# target tool and applied - confirmed against the installed CLI binary, not
+# assumed), so this hook now BUILDS the brief for real and substitutes it,
+# instead of asking the orchestrator to.
+#
+# What it can and cannot know: a hook only ever sees tool_input.prompt - free
+# prose, not the symbols/files/capsules a hand-built brief would cite.
+# Pulling those out of prose without guessing isn't possible from here
+# (that's exactly the kind of guess heimdall-brief itself refuses to make),
+# so this calls heimdall-brief with ONLY --task/--spec. That brief is
+# thinner than a hand-built one, but it is not hollow-by-fabrication:
+# heimdall-brief never invents refs it wasn't given, so omitting
+# symbols/files is honest, not fake compliance - the whole failure mode this
+# hook exists to replace.
+#
+# Exemptions (unchanged from the advisory version): subagent_type=fork, a
+# prompt already carrying "=== DELTA BRIEF", a prompt at or under
+# HEIMDALL_BRIEF_WORD_THRESHOLD (default 300) words, or
+# HEIMDALL_ALLOW_LONG_BRIEF=1.
+#
+# The one real deny: heimdall-brief itself can only exit 0 or 3 when called
+# with just --task/--spec (1/INCOMPLETE requires a symbol/file/capsule/
+# invariants ref to be unresolved, and none are ever passed here, so it is
+# structurally unreachable in this script). Exit 3/NON_VERIFIED means the
+# protocol store itself could not be checked - not found empty, unreachable.
+# Substituting in that case would silently claim a brief was verified when it
+# was not, which is worse than the gap this hook closes, so THIS ONE CASE
+# denies (exit 2, {"error": ...} on stdout+stderr, naming the exact command)
+# instead.
+#
+# Everything else - no jq, no heimdall-brief binary, a malformed payload, any
+# other heimdall-brief exit code - fails OPEN (exit 0, unchanged). A broken
+# hook must never be the reason all work stops; only the one deliberate
+# NON_VERIFIED branch above is allowed to block.
+set -uo pipefail
+# No `set -e`, on purpose: see "Everything else... fails OPEN" above. Under
+# -e a single failed jq/wc call on an odd payload would kill the script with
+# THAT command's own exit code, and since hooks.json pipes stdin straight
+# into this script as its last, unguarded statement, an accidental nonzero
+# here reads to Claude Code as a deny. The only deny this script may produce
+# is the deliberate one below; every other path must reach `allow` on
+# purpose, not by falling off a cliff.
+
+SELF="$0"
+if command -v readlink >/dev/null 2>&1; then
+  SELF="$(readlink -f "$0" 2>/dev/null || readlink "$0" 2>/dev/null || echo "$0")"
+fi
+BIN_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+BRIEF_BIN="$BIN_DIR/heimdall-brief"
+
+INPUT="$(cat 2>/dev/null || true)"
+
+# -- named-agent notice -------------------------------------------------------
+if [ "${HEIMDALL_ALLOW_NAMED_AGENT:-}" != "1" ]; then
+  TAIL="A named spawn goes MAILBOX-RESIDENT - the harness parks it to receive instructions via mailbox, so it never self-terminates and never returns a result to the spawn call. Do NOT await it (measured over 109 spawns in one session: 0 of 43 named ever completed, vs 59 of 66 unnamed) - collect its work another way. THE SPAWNER OWNS THE CLEANUP: call TaskStop on this agent once its work is done. TaskStop only reaches agents THIS session spawned, so a cross-session stop returns \"No task found with ID\". Find leaked ones with: bin/heimdall-agents orphans. If you did not want a mailbox, identify the work with description: instead of name: (convention R13). Set HEIMDALL_ALLOW_NAMED_AGENT=1 to silence this notice."
+  if [ -z "$INPUT" ]; then
+    printf 'BIFROST - Heimdall named-agent notice: the spawn payload was EMPTY, so a name: cannot be ruled out - warning rather than assuming this spawn is unnamed. %s\n' "$TAIL" >&2
+  elif command -v jq >/dev/null 2>&1; then
+    NAME="$(printf '%s' "$INPUT" | jq -r '.tool_input.name // empty' 2>/dev/null)"
+    NAMERC=$?
+    if [ "$NAMERC" -ne 0 ]; then
+      printf 'BIFROST - Heimdall named-agent notice: the spawn payload could not be parsed, so a name: cannot be ruled out - warning rather than assuming this spawn is unnamed. %s\n' "$TAIL" >&2
+    elif [ -n "$NAME" ]; then
+      printf 'BIFROST - Heimdall named-agent notice: name: was set on the spawn. %s\n' "$TAIL" >&2
+    fi
+  fi
+fi
+
+# -- brief-adoption gate -------------------------------------------------------
+allow() { exit 0; }
+
+[ -n "$INPUT" ] || allow
+command -v jq >/dev/null 2>&1 || allow
+
+TOOL_INPUT="$(printf '%s' "$INPUT" | jq -c '.tool_input // {}' 2>/dev/null)" || TOOL_INPUT="{}"
+PROMPT="$(printf '%s' "$TOOL_INPUT" | jq -r '.prompt // empty' 2>/dev/null)" || PROMPT=""
+SATYPE="$(printf '%s' "$TOOL_INPUT" | jq -r '.subagent_type // empty' 2>/dev/null)" || SATYPE=""
+
+[ "${HEIMDALL_ALLOW_LONG_BRIEF:-}" != "1" ] || allow
+[ "$SATYPE" != "fork" ] || allow
+[ -n "$PROMPT" ] || allow
+case "$PROMPT" in
+  "=== DELTA BRIEF"*) allow ;;
+esac
+
+WC="$(printf '%s' "$PROMPT" | wc -w | tr -d ' ')"
+case "$WC" in ''|*[!0-9]*) allow ;; esac
+THRESH="${HEIMDALL_BRIEF_WORD_THRESHOLD:-300}"
+case "$THRESH" in ''|*[!0-9]*) THRESH=300 ;; esac
+[ "$WC" -gt "$THRESH" ] || allow
+
+[ -x "$BRIEF_BIN" ] || allow
+
+TASK="brief-$(date +%s)-$$"
+ERRFILE="$(mktemp 2>/dev/null || printf '/tmp/hmd-precheck-agent.%s' "$$")"
+trap 'rm -f "$ERRFILE"' EXIT
+
+if command -v perl >/dev/null 2>&1; then
+  BRIEF_OUT="$(perl -e 'alarm 5; exec @ARGV' -- "$BRIEF_BIN" build --task "$TASK" --spec "$PROMPT" 2>"$ERRFILE")"
+else
+  BRIEF_OUT="$("$BRIEF_BIN" build --task "$TASK" --spec "$PROMPT" 2>"$ERRFILE")"
+fi
+BRIEF_RC=$?
+
+case "$BRIEF_RC" in
+  0)
+    NEW_TOOL_INPUT="$(printf '%s' "$TOOL_INPUT" | jq -c --arg p "$BRIEF_OUT" '.prompt = $p' 2>/dev/null)" || allow
+    [ -n "$NEW_TOOL_INPUT" ] || allow
+    printf 'BIFROST - Heimdall brief-adoption notice: spawn prompt was %s words (over %s) with no heimdall-brief header - auto-built one via heimdall-brief (task %s) and substituted it into the spawn. The spawned agent should read its own === DELTA BRIEF header for the task id and report back via heimdall-task-result done --task %s --status pass|fail|partial --from <role> --what <text>. Set HEIMDALL_ALLOW_LONG_BRIEF=1 to opt a spawn out.\n' "$WC" "$THRESH" "$TASK" "$TASK" >&2
+    jq -cn --argjson ti "$NEW_TOOL_INPUT" \
+      '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "allow", updatedInput: $ti}}'
+    exit 0
+    ;;
+  3)
+    ERRTXT="$(cat "$ERRFILE" 2>/dev/null)"
+    MSG="$(jq -cn --arg task "$TASK" --arg err "$ERRTXT" \
+      '{error: ("BIFROST - Heimdall brief-adoption notice: spawn prompt has no heimdall-brief header, and heimdall-brief reports NON_VERIFIED for it - the protocol store could not be checked, not merely found empty. Substituting a brief here would claim context was verified when it was not, so this spawn is refused instead of silently let through. Run the exact command yourself: heimdall-brief build --task " + $task + " --spec <text> -- then fix the store (make .planning/protocol writable) and retry the spawn. --- " + $err)}' 2>/dev/null)"
+    if [ -z "$MSG" ]; then
+      MSG='{"error": "BIFROST - Heimdall brief-adoption notice: heimdall-brief reports NON_VERIFIED and the failure detail could not be JSON-encoded. Run heimdall-brief build --task <id> --spec <text> yourself to see it."}'
+    fi
+    printf '%s\n' "$MSG"
+    printf '%s\n' "$MSG" >&2
+    exit 2
+    ;;
+  *)
+    allow
+    ;;
+esac
