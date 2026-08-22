@@ -363,6 +363,8 @@ install_shim() {
 HMD_REAL="$real"
 HMD_TOOL="$tool"
 HMD_WRAP="$BIN_DIR/heimdall-wrap"
+HMD_BIN_DIR="$BIN_DIR"
+HMD_PLUGIN_DIR="$PLUGIN_DIR"
 
 # 1. RE-ENTRY REFUSAL. Already inside a wrapped session -> straight to the real
 #    binary. This is what makes a fork loop impossible rather than merely unlikely.
@@ -388,6 +390,20 @@ done
 if [ -x "\$HMD_WRAP" ]; then
   HEIMDALL_WRAP_SHIM_ACTIVE="\$HMD_TOOL" "\$HMD_WRAP" wrap "\$HMD_TOOL" --no-launch --quiet || true
 fi
+
+# 4. HEADROOM PARITY: reach the same chain hop launch_tool reaches on the
+#    one-shot path, so --always does not silently opt this launch out of
+#    generation routing. Sourced fresh each run (never baked into the shim body)
+#    so an install/upgrade/opt-out of the headroom module takes effect on the
+#    very next launch with no shim regeneration. Fails open: no lib, no function,
+#    or a chain that declines to route all fall through to the plain exec below.
+if [ -r "\$HMD_BIN_DIR/lib/hmd-headroom-chain.sh" ]; then
+  . "\$HMD_BIN_DIR/lib/hmd-headroom-chain.sh"
+  if type hmd_headroom_chain >/dev/null 2>&1 && hmd_headroom_chain "\$HMD_PLUGIN_DIR"; then
+    export ANTHROPIC_BASE_URL="\$HMD_HEADROOM_BASE_URL"
+  fi
+fi
+
 HEIMDALL_WRAP_SHIM_ACTIVE="\$HMD_TOOL" exec "\$HMD_REAL" "\$@"
 EOSHIM
   chmod +x "$shim" || return 1
