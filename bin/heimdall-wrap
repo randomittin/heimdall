@@ -313,7 +313,24 @@ real_binary() {
     cleaned="${cleaned:+$cleaned:}$p"
   done
   IFS="$IFS_SAVE"
-  resolved="$(PATH="$cleaned" command -v "$tool" 2>/dev/null || true)"
+  # BINARY-NAME ALIASES. The TOOLS name is the user-facing word; the executable
+  # can differ. Cursor CLI installs as `cursor-agent` (and an `agent` symlink) --
+  # never as `cursor` -- so resolving $tool literally made `hmd wrap cursor` fail
+  # on a box that HAS Cursor CLI, advising "install cursor", which cannot be
+  # followed. bin/heimdall-ai-select:25 already carries the right list
+  # ("cursor-agent,agent"); this brings wrap into agreement rather than adding a
+  # fourth registry. First candidate that resolves wins.
+  _cands="$tool"
+  # Literal name FIRST: it is what the user typed, and a PATH-prepended stand-in
+  # (a test double, a wrapper script, a user shim) must always win over a
+  # system-installed alias. Aliases are a FALLBACK for the real-world case where
+  # the user-facing word is not the executable name.
+  case "$tool" in cursor) _cands="cursor cursor-agent agent" ;; esac
+  resolved=""
+  for _c in $_cands; do
+    resolved="$(PATH="$cleaned" command -v "$_c" 2>/dev/null || true)"
+    [ -n "$resolved" ] && break
+  done
   [ -n "$resolved" ] || return 1
   case "$resolved" in /*) : ;; *) return 1 ;; esac
   # Resolve symlinks so the shim pins the file the tool actually is.

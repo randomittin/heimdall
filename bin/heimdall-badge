@@ -90,7 +90,20 @@ fi
 # user's own repo name; never a secret). Non-alnum collapses to '-'.
 SLUG="$(basename "$REPO" 2>/dev/null | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '-' | sed 's/-\{1,\}/-/g; s/^-//; s/-$//')"
 [ -n "$SLUG" ] || SLUG="repo"
-ENDPOINT="$ORIGIN/badge/$SLUG.svg?ref=$BADGE_REF"
+# LIVE-ENDPOINT HONESTY. $ORIGIN/badge/<slug>.svg is not served today -- measured
+# 2026-08-22: `curl -sIL https://runheimdall.dev/badge/heimdall.svg` -> 404. A default
+# that emits markdown pointing at a 404 is the worst possible overclaim surface,
+# because this command's ENTIRE job is to be pasted into a stranger's README where a
+# broken image is the first thing they and everyone reading their repo sees. So the
+# default now points at shields.io's own static endpoint, which is real and needs no
+# infrastructure from us; the self-hosted dynamic endpoint is opt-in via
+# HEIMDALL_BADGE_ENDPOINT=self once it is actually served. `--svg` (offline, generated
+# locally, no round-trip) remains the zero-dependency path and is unchanged.
+_msg_esc="$(printf '%s' "$MESSAGE" | sed 's/-/--/g; s/_/__/g; s/ /_/g')"
+case "${HEIMDALL_BADGE_ENDPOINT:-shields}" in
+  self) ENDPOINT="$ORIGIN/badge/$SLUG.svg?ref=$BADGE_REF" ;;
+  *)    ENDPOINT="https://img.shields.io/badge/%F0%9F%9B%A1_heimdall-${_msg_esc}-4e5fd9" ;;
+esac
 
 # ── the offline-safe static SVG (shields.io-style, generated locally) ─────────
 # Rough monospace-ish width estimate: ~7px/char + side padding. A static badge does
