@@ -135,7 +135,8 @@ case "$MODE" in
     [ -n "$WHY" ] || { printf 'heimdall-deadcode --why needs a bin/ name\n' >&2; exit 2; }
     scan || exit 2
     if reach_is_live "$W" "$WHY"; then
-      printf 'REACHABLE  %s\n' "$(reach_chain "$W" "$WHY")"
+      cls="$(reach_class "$W" "$WHY")"
+      printf '%-10s %s\n' "$cls" "$(reach_chain_classified "$W" "$WHY")"
       exit 0
     fi
     if [ ! -f "$ROOT/bin/$WHY" ]; then
@@ -186,11 +187,16 @@ case "$MODE" in
     printf '{'
     printf '"audited":%s,' "$AUDITED"
     printf '"reachable":%s,' "$REACHABLE"
+    printf '"class_live":%s,' "$CLASS_LIVE"
+    printf '"class_reachable":%s,' "$CLASS_REACHABLE"
+    printf '"class_prose_only":%s,' "$CLASS_PROSE"
     printf '"dead":%s,' "$DEAD_N"
     printf '"unacknowledged":%s,' "$UNACK_N"
     printf '"exemption_rot":%s,' "$ROT_N"
     printf '"dead_names":['
     printf '%s\n' "$DEAD_LIST" | grep . | awk 'NR>1{printf ","} {printf "\"%s\"", $0}'
+    printf '],"prose_only_names":['
+    printf '%s\n' "$PROSE_LIST" | grep . | awk 'NR>1{printf ","} {printf "\"%s\"", $0}'
     printf '],"unacknowledged_names":['
     printf '%s\n' "$UNACK_LIST" | grep . | awk 'NR>1{printf ","} {printf "\"%s\"", $0}'
     printf '],"rot":['
@@ -205,6 +211,8 @@ case "$MODE" in
     printf 'heimdall-deadcode — consumer audit of bin/\n'
     printf '  audited    %s executable(s) in bin/\n' "$AUDITED"
     printf '  reachable  %s from a live entry point (hook · MCP registration · installer · hmd CLI · command/agent/skill · deploy · CI)\n' "$REACHABLE"
+    printf '             of those: %s LIVE (hook/MCP-fired) · %s REACHABLE (real code/config path) · %s PROSE-ONLY (named only from a *.md file — not a hard failure yet; see --why NAME)\n' \
+      "$CLASS_LIVE" "$CLASS_REACHABLE" "$CLASS_PROSE"
     printf '  dead       %s reachable from NO live entry point\n' "$DEAD_N"
     if [ "$DEAD_N" -gt 0 ]; then
       printf '\n  every dead executable, and why it is acknowledged (or not):\n'
