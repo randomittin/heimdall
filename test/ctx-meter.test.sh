@@ -368,5 +368,161 @@ fi
 [ -d "$HEIMDALL_HOME" ] && ok "state stayed under the overridden HEIMDALL_HOME" \
                         || bad "HEIMDALL_HOME override was not honored"
 
+# ── Q. OUTPUT-TOKEN SHARE (outshare) — the measurement blocker, now falsifiable ──
+# Caveman/hmd output compression narrows OUTPUT wording. Its ceiling is bounded by
+# whatever share of total token spend is even OUTPUT — before this verb, NOTHING
+# in this repo measured that share: headroom's own ledger carries
+# output_tokens_saved permanently at 0, and .planning/metrics.jsonl carries only
+# parallelism fields. `outshare` sums every local session transcript's real
+# message.usage (reusing heimdall-tokens' sum_session — Q6, no second parser) and
+# checks it against headroom's external lifetime.total_input_tokens.
+sec "Q. OUTPUT-TOKEN SHARE (outshare) — the measurement blocker, now falsifiable:"
+
+FIXROOT="$TMP/outshare-fixtures"
+PROJ_A="$FIXROOT/projects/proj-a"
+PROJ_B="$FIXROOT/projects/proj-b"
+mkdir -p "$PROJ_A" "$PROJ_B"
+
+usage_line() { # <input> <output> <cache_creation> <cache_read>
+  printf '{"type":"assistant","sessionId":"fix","message":{"usage":{"input_tokens":%s,"output_tokens":%s,"cache_creation_input_tokens":%s,"cache_read_input_tokens":%s}}}\n' \
+    "$1" "$2" "$3" "$4"
+}
+
+{
+  printf '{"type":"user","message":{"content":"hi"}}\n'   # no usage -> must not count as a turn
+  usage_line 1000 100 50 20
+  usage_line 2000 300 0  80
+} > "$PROJ_A/sess1.jsonl"
+
+{
+  usage_line 500 50 10 0
+} > "$PROJ_B/sess2.jsonl"
+
+printf 'not json at all\nstill not json\n' > "$PROJ_B/garbage.jsonl"  # unparseable -> excluded from sessions_scanned
+printf 'input_tokens=999999\n' > "$PROJ_B/notes.txt"                  # wrong extension -> must never be opened
+
+HEADROOM_OK="$FIXROOT/headroom-ok.json"
+printf '{"lifetime":{"total_input_tokens":4130110220}}\n' > "$HEADROOM_OK"
+HEADROOM_MISSING="$FIXROOT/no-such-headroom-ledger.json"
+
+# Q1/Q2: exact arithmetic — a stub or a hardcoded number cannot satisfy this.
+OJ="$(HMD_CTX_PROJECTS_ROOT="$FIXROOT/projects" HMD_HEADROOM_LEDGER="$HEADROOM_OK" "$METER" outshare --json 2>/dev/null)"
+EXPECT="$(python3 -c '
+import json
+inp, outp, cc, cr = 3500, 450, 60, 100
+local_total = inp + outp + cc + cr
+ext = 4130110220
+print(json.dumps({
+  "local_input_tokens": inp, "local_output_tokens": outp,
+  "local_cache_creation_tokens": cc, "local_cache_read_tokens": cr,
+  "local_total_tokens": local_total,
+  "output_share_of_local_total": outp / local_total,
+  "external_lifetime_input_tokens": ext,
+  "output_share_vs_external_lifetime_input": outp / ext,
+}))
+' 2>/dev/null)"
+CMP="$(python3 -c '
+import json, sys
+got = json.loads(sys.argv[1]); want = json.loads(sys.argv[2])
+bad = []
+for k, v in want.items():
+    g = got.get(k)
+    if isinstance(v, float):
+        if g is None or abs(g - v) > 1e-9:
+            bad.append("%s: got %r want %r" % (k, g, v))
+    elif g != v:
+        bad.append("%s: got %r want %r" % (k, g, v))
+print("OK" if not bad else "; ".join(bad))
+' "$OJ" "$EXPECT" 2>/dev/null)"
+[ "$CMP" = "OK" ] && ok "outshare sums real usage across 2 files exactly (input/output/cache/local-share/external-share)" \
+                   || bad "outshare arithmetic wrong: $CMP" "$OJ"
+
+echo "$OJ" | python3 -c 'import json,sys
+d=json.load(sys.stdin); sys.exit(0 if d.get("state")=="OK" else 1)' 2>/dev/null \
+  && ok "state=OK when transcripts + ledger both resolve" || bad "state was not OK" "$OJ"
+
+SCANNED="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["sessions_scanned"])' <<<"$OJ" 2>/dev/null)"
+[ "$SCANNED" = "2" ] && ok "sessions_scanned=2 — the all-garbage file and the wrong-extension file are both excluded" \
+                      || bad "sessions_scanned wrong (garbage/extension filtering broken)" "got '$SCANNED'"
+
+# Q3: independence — a missing/unreadable headroom ledger degrades ONLY the
+# external-comparison fields; the local measurement must not be dragged down.
+OJ_NOEXT="$(HMD_CTX_PROJECTS_ROOT="$FIXROOT/projects" HMD_HEADROOM_LEDGER="$HEADROOM_MISSING" "$METER" outshare --json 2>/dev/null)"
+python3 -c '
+import json, sys
+d = json.loads(sys.argv[1])
+assert d["state"] == "OK"
+assert d["local_output_tokens"] == 450
+assert d.get("external_lifetime_input_tokens") is None
+assert d.get("output_share_vs_external_lifetime_input") is None
+' "$OJ_NOEXT" 2>/dev/null \
+  && ok "a missing headroom ledger nulls ONLY the external-comparison fields (local share still measured)" \
+  || bad "missing ledger corrupted the local measurement too" "$OJ_NOEXT"
+
+# Q4: no transcripts anywhere -> NON_VERIFIED, never a fabricated zero share.
+EMPTYROOT="$TMP/outshare-empty"; mkdir -p "$EMPTYROOT"
+OJ_EMPTY="$(HMD_CTX_PROJECTS_ROOT="$EMPTYROOT" HMD_HEADROOM_LEDGER="$HEADROOM_OK" "$METER" outshare --json 2>/dev/null)"
+has "$OJ_EMPTY" '"state":"NON_VERIFIED"' && has "$OJ_EMPTY" 'no-transcripts' \
+  && ok "zero transcripts -> NON_VERIFIED (reason no-transcripts), never a fabricated 0% share" \
+  || bad "empty projects root did not fail closed" "$OJ_EMPTY"
+
+# Q5: human-readable mode is labeled, not a bare number dump.
+OH="$(HMD_CTX_PROJECTS_ROOT="$FIXROOT/projects" HMD_HEADROOM_LEDGER="$HEADROOM_OK" "$METER" outshare 2>/dev/null)"
+hasrei "$OH" 'sessions scanned' && hasrei "$OH" 'output share' \
+  && ok "human-readable mode labels its numbers (sessions scanned / output share)" \
+  || bad "human-readable outshare output is not labeled" "$OH"
+
+# Q6: NO SECOND PARSER — outshare must compose with heimdall-tokens' sum_session,
+# never re-implement usage-extraction. Proof K's single-source-of-truth rule
+# applies to output tokens exactly as much as it does to context tokens.
+if grep -q 'heimdall-tokens' "$METER" && ! grep -qE 'def[[:space:]]+sum_session|_extract_usage' "$METER"; then
+  ok "outshare composes with heimdall-tokens (sum_session) rather than re-parsing usage itself"
+else
+  bad "outshare either does not reuse heimdall-tokens or re-implements its parser"
+fi
+
+# Q7: discoverable — --help names the new verb (also proves the help-range bump
+# past this insertion is correct, not silently truncated).
+HELP="$("$METER" --help 2>/dev/null)"
+has "$HELP" 'outshare' && ok "--help documents the outshare verb" \
+                        || bad "--help does not mention outshare"
+
+# Q8: fail-closed when the resolved interpreter cannot actually run.
+#
+# This deliberately does NOT try to hide python3 from PATH. bin/lib/hmd-python.sh
+# (lines 22-27, 74-79) probes the hardcoded absolute path /usr/bin/python3 BEFORE
+# any PATH search, by design -- a documented perf optimization, not an oversight.
+# On any host where /usr/bin/python3 is real and working -- this one included --
+# PATH-stripping cannot simulate "no python anywhere": hmd_python() finds it
+# directly, no PATH lookup involved. Confirmed empirically on this machine:
+# /usr/bin/python3 is a real, executable ~118KB binary, independent of whatever
+# shim `command -v python3` resolves to. A prior version of this test stripped
+# PATH by collecting coreutil directories and asserted a false precondition on
+# every run on this class of host, for exactly this reason.
+#
+# hmd-python.sh ships its own documented test seam instead: HMD_PYTHON, "honoured
+# without probing" (hmd-python.sh:55-60) so a test does not have to pay the 31ms
+# probe cost the file exists to avoid paying on every hook call. Pointing it at a
+# path that does not exist makes hmd_python() hand back an interpreter that cannot
+# run -- exactly what a caller gets on a host where the resolved python turns out
+# broken -- and reaches the same fail-closed guarantee (never fabricate a share)
+# through a door that is reachable on every host, not just python-less ones. The
+# "truly zero interpreters anywhere" branch (command -v python3 also absent) stays
+# in the implementation for genuinely python-less hosts; it is real, honest,
+# defensive code, just not one this suite can hermetically trigger on a host that
+# ships /usr/bin/python3.
+NOPY_TARGET="$FIXROOT/definitely-not-a-real-interpreter"
+if [ -e "$NOPY_TARGET" ]; then
+  bad "Q8 precondition: fixture path unexpectedly exists"
+else
+  OJ_NOPY="$(HMD_PYTHON="$NOPY_TARGET" HMD_CTX_PROJECTS_ROOT="$FIXROOT/projects" HMD_HEADROOM_LEDGER="$HEADROOM_OK" "$METER" outshare --json 2>/dev/null)"
+  has "$OJ_NOPY" '"state":"NON_VERIFIED"' \
+    && ok "an unusable resolved interpreter -> NON_VERIFIED, not a fabricated share" \
+    || bad "unusable interpreter did not fail closed" "$OJ_NOPY"
+  has "$OJ_NOPY" 'output_share_of_local_total' \
+    && bad "a NON_VERIFIED outshare response still carried a share number" "$OJ_NOPY" \
+    || ok "the NON_VERIFIED response carries no share figure at all (nothing to mistake for real)"
+fi
+
 printf '\nctx-meter.test.sh: %s passed, %s failed.\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
