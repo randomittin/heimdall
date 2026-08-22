@@ -16,10 +16,15 @@
 # Exit codes:
 #   0  PASS (or WARN) — verification ran and the edits check out
 #   1  FAIL           — verification ran and found problems
-#   2  NON-VERIFIED   — verification could NOT run: the session edit ledger is
-#                       absent, i.e. the PostToolUse edit-tracker hook never
-#                       fired. Distinct from 1 so "nothing was checked" can
-#                       never be mistaken for "everything is fine".
+#   2  NON-VERIFIED   — verification could NOT establish the truth. Either the
+#                       session edit ledger is absent (the PostToolUse
+#                       edit-tracker hook never fired), OR the ledger claims
+#                       zero edits while git shows an uncommitted, dirty
+#                       working tree — a contradiction that means the ledger
+#                       cannot be trusted (e.g. something reset it mid-session;
+#                       see the ledger-git cross-check below). Distinct from 1
+#                       so "nothing was checked" can never be mistaken for
+#                       "everything is fine".
 set -euo pipefail
 
 PLUGIN_DIR="${CLAUDE_PLUGIN_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
@@ -97,9 +102,66 @@ fi
 
 paths=$("$TRACKER" paths 2>/dev/null || true)
 if [ -z "$paths" ]; then
-  # Ledger PRESENT + zero entries => the session genuinely made no edits: a real
-  # pass. Under --json that must still be a JSON payload — this is the most-hit
-  # --json path (every read-only / planning session), and prose here left the
+  # --- ledger-git cross-check: begin ---
+  # The ledger claims zero edits. Before trusting that, cross-check against
+  # git: a ledger can go from "correctly tracking real edits" to "present and
+  # empty" if something clears it mid-session (e.g. a SessionStart hook
+  # re-firing on compaction/resume without gating on `source` — see
+  # hooks/hooks.json). A dirty working tree while the ledger says zero is
+  # exactly that contradiction: report NON-VERIFIED, not a confident pass.
+  #
+  # `git rev-parse --is-inside-work-tree` (not `[ -d .git ]`) on purpose: in a
+  # git worktree checkout — precisely where this defect was reported —
+  # `.git` is a plain FILE (a `gitdir:` pointer), not a directory, so a
+  # `[ -d .git ]` guard would silently never fire in the one place this check
+  # matters most. No git at all => no ground truth to check against, so fall
+  # through unchanged to the existing pass below.
+  if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    git_dirty=$(git status --porcelain 2>/dev/null || true)
+    if [ -n "$git_dirty" ]; then
+      if [ "$MODE" = "--json" ]; then
+        echo "{"
+        echo "  \"verdict\": \"NON_VERIFIED\","
+        echo "  \"reason\": \"ledger-git-mismatch\","
+        echo "  \"ledger\": \"$ledger_file\","
+        echo "  \"files_edited\": null,"
+        echo "  \"checks_passed\": 0,"
+        echo "  \"checks_failed\": 0,"
+        echo "  \"warnings\": 0,"
+        echo "  \"paths\": []"
+        echo "}"
+        exit 2
+      fi
+      echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      echo "[heimdall] verify-edits: NOT VERIFIED — ledger/git mismatch"
+      echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      echo "The edit ledger reports ZERO edits this session:"
+      echo "  $ledger_file"
+      echo ""
+      echo "...but git shows an uncommitted, dirty working tree:"
+      echo ""
+      printf '%s\n' "$git_dirty" | head -20 || true
+      echo ""
+      echo "A ledger claiming zero edits while git shows real, uncommitted changes"
+      echo "is a contradiction, not a pass. Something most likely reset the ledger"
+      echo "mid-session (e.g. a SessionStart hook re-firing on compaction/resume)"
+      echo "after real edits were already logged. Treat every edit this session as"
+      echo "UNVERIFIED — do not trust the \"0 edits\" count."
+      echo ""
+      echo "Fix: find out why the ledger was reset (a SessionStart hook calling"
+      echo "edit-tracker clear/init without gating on \`source\` is the likely"
+      echo "cause). To resume tracking from this point:"
+      echo "  $TRACKER init"
+      echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      echo "VERDICT: NON-VERIFIED"
+      exit 2
+    fi
+  fi
+  # --- ledger-git cross-check: end ---
+  # Ledger PRESENT + zero entries, and git agrees (clean, or nothing to check
+  # it against) => the session genuinely made no edits: a real pass. Under
+  # --json that must still be a JSON payload — this is the most-hit --json
+  # path (every read-only / planning session), and prose here left the
   # receipt's stub gate unparseable on most real runs.
   if [ "$MODE" = "--json" ]; then
     echo "{"

@@ -12,6 +12,15 @@
 # read-only session, so the ledger's EXISTENCE is now the explicit, checkable
 # fact: init/clear/log create it, `edit-tracker status` reports it.
 #
+# A THIRD case hides inside "present but empty": the ledger can be reset
+# mid-session (e.g. hooks.json's SessionStart firing `edit-tracker clear`
+# with no gate on `source`, so it re-fires on compaction/resume, not just true
+# session start) AFTER real edits were already logged. That leaves the ledger
+# present-and-empty too — indistinguishable from a genuine zero-edit session
+# by presence alone. verify-edits now cross-checks that case against
+# `git status --porcelain`: present + empty + a dirty working tree is a
+# contradiction, reported as NON-VERIFIED (exit 2), never a pass.
+#
 # Guarantees proved:
 #   1. status — absent -> "absent <path>" exit 3; present -> "present" exit 0.
 #   2. ABSENT ledger -> verify-edits does NOT report success (exit 2, NOT
@@ -23,6 +32,13 @@
 #      pre-existing assertion is not weakened).
 #   6. clear leaves the ledger PRESENT-and-empty, never absent.
 #   7. --json never emits a PASS verdict for an absent ledger.
+#   9. PRESENT + zero edits, but git shows a dirty working tree (e.g. the
+#      ledger was reset mid-session after real edits were logged) -> NOT a
+#      pass: verify-edits exits 2, NON_VERIFIED, reason ledger-git-mismatch,
+#      in both plain and --json modes. A clean git tree (or no git at all)
+#      still passes exactly as before (guarantee 3) — no false-red. Proved
+#      falsifiable: a mutant with the cross-check excised reproduces the old
+#      false-green.
 #
 # Usage:  bash test/edit-ledger-presence.test.sh   (exit 0 = all guarantees hold)
 set -uo pipefail
@@ -52,9 +68,19 @@ if ! clang -O2 -Wall -Wextra -o "$TRACKER" "$REPO/bin/edit-tracker.c" 2>/dev/nul
 fi
 ok "edit-tracker.c builds clean (clang -O2 -Wall -Wextra)"
 
-# Run tracker/verify with the sandbox ledger root.
-trk()  { env TMPDIR="$SANDBOX" CLAUDE_CODE_SESSION_ID="$SID" "$TRACKER" "$@"; }
-vfy()  { env TMPDIR="$SANDBOX" CLAUDE_CODE_SESSION_ID="$SID" "$VERIFY" "$@"; }
+# Run tracker/verify with the sandbox ledger root. vfy() runs from a
+# dedicated non-git cwd: bin/verify-edits now cross-checks a present-but-empty
+# ledger against `git status --porcelain` in its cwd, so every assertion below
+# that expects a plain, unconditional PASS must run somewhere with no .git to
+# check against — otherwise these assertions would depend on the ambient
+# state of $REPO's own working tree (dirty during active development) rather
+# than the fixture under test. vfy_in() is the git-aware counterpart used by
+# the cross-check's own tests further down, which need a real, isolated repo.
+NOGIT="$SANDBOX/nogit"
+mkdir -p "$NOGIT"
+trk()    { env TMPDIR="$SANDBOX" CLAUDE_CODE_SESSION_ID="$SID" "$TRACKER" "$@"; }
+vfy()    { ( cd "$NOGIT" && env TMPDIR="$SANDBOX" CLAUDE_CODE_SESSION_ID="$SID" "$VERIFY" "$@" ); }
+vfy_in() { local d="$1"; shift; ( cd "$d" && env TMPDIR="$SANDBOX" CLAUDE_CODE_SESSION_ID="$SID" "$VERIFY" "$@" ); }
 
 # ── 1. STATE: LEDGER ABSENT ──
 rm -rf "$SANDBOX/heimdall-edits"
@@ -361,6 +387,154 @@ else
                          || bad "zero-edit session: receipt exit want 0, got $CARD_RC"
   fi
 fi
+
+# ── 9. LEDGER RESET AFTER REAL EDITS — must not report a clean zero ──
+# This is the actual reported defect: something (e.g. hooks.json's
+# SessionStart firing `edit-tracker clear` unconditionally, with no `source`
+# gate, so it re-fires on compaction/resume and not just true session start)
+# can wipe a ledger that had already logged real edits, leaving it
+# PRESENT-and-EMPTY. Old behaviour: verify-edits could not tell that apart
+# from a genuine zero-edit session and reported a clean PASS. The git
+# cross-check closes that gap — a dirty tree while the ledger says zero is a
+# contradiction, not a pass.
+GITREPO="$SANDBOX/gitrepo"
+mkdir -p "$GITREPO"
+(
+  cd "$GITREPO" &&
+  git init -q &&
+  git config user.email t@t &&
+  git config user.name t &&
+  printf 'baseline\n' > tracked.txt &&
+  git add tracked.txt &&
+  git commit -q -m baseline
+) >/dev/null 2>&1
+
+# Defensive: do not rely on whatever state section 8 left $SID's ledger in.
+trk clear >/dev/null 2>&1
+
+# A real, uncommitted edit happens and gets logged...
+printf 'real edit\n' >> "$GITREPO/tracked.txt"
+trk log Edit "$GITREPO/tracked.txt" >/dev/null 2>&1
+n="$(trk paths 2>/dev/null | wc -l | tr -d ' ')"
+[ "$n" -eq 1 ] && ok "fixture: real edit is logged before the reset (paths=1)" \
+               || bad "fixture: expected 1 logged path before reset, got $n"
+
+# ...then something resets the ledger mid-session (the reproduced hooks.json
+# SessionStart behaviour): clear() unlinks + recreates empty -> present+0.
+trk clear >/dev/null 2>&1
+n="$(trk paths 2>/dev/null | wc -l | tr -d ' ')"
+[ "$n" -eq 0 ] && ok "fixture: ledger is present-and-empty after the reset (paths=0)" \
+               || bad "fixture: expected 0 paths after clear, got $n"
+
+dirty="$(cd "$GITREPO" && git status --porcelain)"
+[ -n "$dirty" ] && ok "fixture: git still shows the real edit as dirty ($dirty)" \
+                || bad "fixture: git unexpectedly clean — fixture is broken"
+
+out="$(vfy_in "$GITREPO" --quick 2>&1)"; rc=$?
+[ "$rc" -eq 2 ] && ok "RESET-AFTER-EDIT: verify-edits exits 2, not a clean zero (got $rc)" \
+                || bad "RESET-AFTER-EDIT: expected exit 2, got $rc — silent false-green reproduced"
+case "$out" in
+  *"VERDICT: PASS"*|*"No edits tracked this session"*)
+    bad "RESET-AFTER-EDIT: output still reads like a clean pass: $out" ;;
+  *) ok "RESET-AFTER-EDIT: output does not read like a clean pass" ;;
+esac
+case "$out" in
+  *"NOT VERIFIED"*"ledger/git mismatch"*) ok "RESET-AFTER-EDIT: banner names the ledger/git mismatch" ;;
+  *) bad "RESET-AFTER-EDIT: missing ledger/git mismatch banner: $out" ;;
+esac
+case "$out" in
+  *"NON-VERIFIED"*) ok "RESET-AFTER-EDIT: verdict line says NON-VERIFIED" ;;
+  *) bad "RESET-AFTER-EDIT: missing NON-VERIFIED verdict: $out" ;;
+esac
+
+joutR="$(vfy_in "$GITREPO" --json 2>&1)"; jrcR=$?
+[ "$jrcR" -eq 2 ] && ok "RESET-AFTER-EDIT: --json exits 2" \
+                  || bad "RESET-AFTER-EDIT: --json expected exit 2, got $jrcR"
+case "$joutR" in
+  *'"verdict": "NON_VERIFIED"'*) ok "RESET-AFTER-EDIT: --json verdict NON_VERIFIED" ;;
+  *) bad "RESET-AFTER-EDIT: --json verdict wrong: $joutR" ;;
+esac
+case "$joutR" in
+  *'"reason": "ledger-git-mismatch"'*) ok "RESET-AFTER-EDIT: --json reason ledger-git-mismatch" ;;
+  *) bad "RESET-AFTER-EDIT: --json missing reason: $joutR" ;;
+esac
+case "$joutR" in
+  *'"verdict": "PASS"'*) bad "RESET-AFTER-EDIT: --json claims PASS" ;;
+  *) ok "RESET-AFTER-EDIT: --json never claims PASS" ;;
+esac
+printf '%s' "$joutR" | JSON_OK \
+  && ok "RESET-AFTER-EDIT: --json stdout is valid JSON" \
+  || bad "RESET-AFTER-EDIT: --json stdout NOT valid JSON: [$joutR]"
+
+# ── 9b. CONTROL: clean git repo + present-and-empty ledger => still a pass ──
+# The cross-check must not turn every zero-edit session in a git repo into a
+# false NON-VERIFIED. Commit the edit so the tree is clean again.
+(
+  cd "$GITREPO" &&
+  git add tracked.txt &&
+  git commit -q -m "commit the edit"
+) >/dev/null 2>&1
+clean="$(cd "$GITREPO" && git status --porcelain)"
+[ -z "$clean" ] && ok "control fixture: git repo is clean after committing" \
+                || bad "control fixture: git repo unexpectedly dirty: $clean"
+
+out="$(vfy_in "$GITREPO" --quick 2>&1)"; rc=$?
+[ "$rc" -eq 0 ] && ok "CLEAN-GIT+ZERO-EDITS: verify-edits still exits 0 (no false-red)" \
+                || bad "CLEAN-GIT+ZERO-EDITS: expected exit 0, got $rc"
+case "$out" in
+  *"No edits tracked this session"*) ok "CLEAN-GIT+ZERO-EDITS: quiet pass message intact" ;;
+  *) bad "CLEAN-GIT+ZERO-EDITS: unexpected output: $out" ;;
+esac
+
+joutC="$(vfy_in "$GITREPO" --json 2>&1)"; jrcC=$?
+[ "$jrcC" -eq 0 ] && ok "CLEAN-GIT+ZERO-EDITS: --json exits 0" \
+                  || bad "CLEAN-GIT+ZERO-EDITS: --json expected exit 0, got $jrcC"
+case "$joutC" in
+  *'"verdict": "PASS"'*) ok "CLEAN-GIT+ZERO-EDITS: --json verdict PASS" ;;
+  *) bad "CLEAN-GIT+ZERO-EDITS: --json verdict wrong: $joutC" ;;
+esac
+
+# ── 9c. PROVE-RED: the assertions above are falsifiable, not tautological ──
+# Delete the cross-check block (bounded by its own anchor comments) from a
+# throwaway copy of verify-edits and confirm the OLD false-clean-zero bug
+# reappears — i.e. that 9/9a above would actually have caught it.
+MUTANT="$SANDBOX/verify-edits.mutant"
+sed '/# --- ledger-git cross-check: begin ---/,/# --- ledger-git cross-check: end ---/d' \
+  "$VERIFY" > "$MUTANT"
+chmod +x "$MUTANT"
+if grep -q "ledger-git-mismatch" "$MUTANT"; then
+  bad "mutant: cross-check block was not actually removed"
+else
+  ok "mutant: cross-check block successfully excised"
+fi
+
+# Recreate the reset-after-edit fixture (the repo is clean from 9b's commit):
+# a fresh real edit, logged, then the ledger is cleared out from under it.
+# CLAUDE_PLUGIN_ROOT must point at the real repo: the mutant lives in
+# $SANDBOX, so without it the mutant's own PLUGIN_DIR self-resolution would
+# look for bin/edit-tracker(.c) next to the sandboxed copy and fail to build.
+printf 'another real edit\n' >> "$GITREPO/tracked.txt"
+trk log Edit "$GITREPO/tracked.txt" >/dev/null 2>&1
+trk clear >/dev/null 2>&1
+mutant_out="$(cd "$GITREPO" && env TMPDIR="$SANDBOX" CLAUDE_CODE_SESSION_ID="$SID" \
+  CLAUDE_PLUGIN_ROOT="$REPO" "$MUTANT" --quick 2>&1)"
+mutant_rc=$?
+[ "$mutant_rc" -eq 0 ] && ok "PROVE-RED: mutant (no cross-check) reproduces the old exit-0 false-green" \
+                       || bad "PROVE-RED: mutant unexpectedly exits $mutant_rc — assertions may be tautological"
+case "$mutant_out" in
+  *"No edits tracked this session"*) ok "PROVE-RED: mutant reproduces the old clean-zero message" ;;
+  *) bad "PROVE-RED: mutant did not reproduce the old message: $mutant_out" ;;
+esac
+
+# ...and confirm the REAL (unmutated) verify-edits is still fixed against an
+# equivalent fixture (the mutant run above consumed the prior dirty state, so
+# this reconfirms GREEN on a fresh one rather than reusing stale state).
+printf 'yet another real edit\n' >> "$GITREPO/tracked.txt"
+trk log Edit "$GITREPO/tracked.txt" >/dev/null 2>&1
+trk clear >/dev/null 2>&1
+real_rc=0; vfy_in "$GITREPO" --quick >/dev/null 2>&1 || real_rc=$?
+[ "$real_rc" -eq 2 ] && ok "GREEN restored: real (unmutated) verify-edits exits 2 on the same fixture" \
+                     || bad "GREEN restored: expected exit 2, got $real_rc"
 
 echo "--------------------------------------------------------------------"
 echo "RESULT: $PASS passed, $FAIL failed"
