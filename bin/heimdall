@@ -2183,6 +2183,33 @@ case "${1:-}" in
     fi
     exec "$VERDICT_BIN" "$@"
     ;;
+  sla)
+    # Pass-through to heimdall-sla: the ⚠-class observation SLA auditor. The standing
+    # rule is that a security_note / sensitive / ⚠ observation gets a verdict within
+    # 24h — FIXED, FALSE-POSITIVE, ACCEPTED-RISK, WONTFIX or DEFERRED — and that "no
+    # verdict recorded" is a BREACH, never a pass.
+    #
+    # WHY THIS ARM EXISTS. heimdall-sla shipped 2026-08-08 with no caller of any kind:
+    # no hook, no arm, named only from prose. `heimdall-deadcode` classified it
+    # PROSE-ONLY. So for two weeks the rule was documented and structurally
+    # unenforceable, and the first run after wiring found 79 breaches out of 84
+    # scanned with 0 triaged. A queue that can age silently is the same defect class
+    # as a monitor that can stop silently — this arm is the invocable path that makes
+    # the rule checkable by a human instead of merely written down.
+    #
+    # Titles are withheld by heimdall-sla itself unless --verbose: observation titles
+    # carry live secrets, and this repo's standing constraint is that a security
+    # finding stays in .planning/ and never goes public. Do not add a flag here that
+    # widens that; forward args verbatim and let the tool keep its own boundary.
+    shift
+    SLA_BIN="$PLUGIN_DIR/bin/heimdall-sla"
+    if [ ! -x "$SLA_BIN" ]; then
+      echo "  Error: heimdall-sla not found at $SLA_BIN" >&2
+      echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+      exit 1
+    fi
+    exec "$SLA_BIN" "$@"
+    ;;
   badge)
     # Pass-through to heimdall-badge: the viral README badge — "🛡 heimdall: N proven
     # merges" with a runheimdall.dev backlink (markdown snippet / offline-safe SVG /
@@ -2888,6 +2915,7 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   echo "  heimdall tier             Model routing table + tier declaration log"
   echo "  heimdall status           CLI-agnostic statusline HUD (same renderer as the bar)"
   echo "  heimdall weekly-log       Weekly changelog draft generator (drafts only)"
+  echo "  heimdall sla              Audit ⚠-class observations against the 24h verdict SLA"
   echo ""
   echo "heimdall launches Claude Code with:"
   echo "  --dangerously-skip-permissions    full autonomy"
