@@ -296,6 +296,56 @@ Recording these explicitly so the census is not read as uniformly negative.
 
 ---
 
+## 12. "Has a passing test" vs "runs in production" — the central distinction (MEASURED)
+
+The task asked for precision here because four of the nine known instances had green tests and zero real invocations. The census quantifies it.
+
+Of the **51 zero-invocation, non-hook-wired binaries** (§2):
+
+| | Count |
+|---|---|
+| **Named by at least one test file** | **41** |
+| Named by no test at all | 10 |
+
+**41 of 51 orphans are under test.** Test coverage in this repo is therefore *anti-correlated* with production liveness — the well-tested tools are disproportionately the cold ones, because a test is what a careful author writes instead of a caller.
+
+**Measured proof that these are green, not merely present.** I ran five dedicated orphan suites:
+
+```
+$ bash test/heimdall-sigil-png.test.sh        → sigil-png: 19 passed, 0 failed        (exit 0)
+$ bash test/heimdall-ponytail-ab.test.sh      → 8 passed, 0 failed                    (exit 0)
+$ bash test/heimdall-context-capsule.test.sh  → ALL GREEN — build gathers state …      (exit 0)
+$ bash test/feedback.test.sh                  → 10 passed, 0 failed                   (exit 0)
+$ bash test/vm-bench.test.sh                  → vm-bench: 29 passed, 0 failed         (exit 0)
+```
+
+That is 66+ green assertions across five binaries with **zero measured invocations between them**. `heimdall-sigil-png` has 19 passing tests and its `hmd sigil-png` arm has never been typed once in 384 sessions. `heimdall-vm-bench` has 29 passing tests and is on the acknowledged-DEAD list.
+
+**Orphans with the heaviest test investment** (test files naming them): `heimdall-issue-queue` (7), `heimdall-gh-app-token` (6), `heimdall-attest` (5), `heimdall-claim` (5), `heimdall-reuse-metric` (5), `heimdall-activity` (4), `heimdall-issue-corpus` (4). Seven binaries, 36 test files, zero invocations.
+
+**Orphans with no test at all (10):** `authenticity-check`, `conflict-log`, `detect-skills`, `heimdall-banner-test`, `heimdall-blackboard`, `heimdall-checkpoint-share`, `heimdall-face-test`, `heimdall-queue-mcp`, `report-issue`, `stack-detect`. These are the genuinely unguarded ones — `report-issue` (backs `/hmd:report-bug`) and `detect-skills` / `stack-detect` (skill auto-detection) are the highest-impact members.
+
+**The rule to carry into launch:** in this repo, `350 test suites, all green` and `51 binaries that have never run` are both true simultaneously and neither contradicts the other. A green suite is evidence about the code; only an invocation count is evidence about the system.
+
+---
+
+## 13. `evals/oracles/` and `modules/` (MEASURED)
+
+**Oracles — the harness is LIVE, the registry is an orphan.**
+
+- `bin/falsify` is hook-wired (`PreToolUse/Bash`) and `bin/corpus` is too, so the oracle harness genuinely runs automatically → **LIVE**.
+- Oracle *discovery is by path convention*, not by registry: `bin/corpus:14` documents the seam as `evals/oracles/<gate>/run.sh` and `bin/corpus:76` resolves `ORACLES_DIR` by path. **Neither `bin/corpus` nor `bin/falsify` reads `registry.json`** (MEASURED — grep over `bin/` returns nothing).
+- `evals/oracles/registry.json` is read by exactly two files, both tests: `test/oracle-registry-integrity.test.sh`, `test/heimdall-hmd-bootstrap.test.sh`. **Verdict: ORPHANED** — a test-only artifact that reads like production configuration.
+- Consequence, and a correction to the obvious first reading: the registry lists 9 entries while 10 oracle directories exist (`changelog-bash32` is unlisted), but because discovery is convention-based, `changelog-bash32` **does** run. The drift is harmless *today* and is exactly the kind of latent inconsistency that becomes a silent gap the moment someone wires the registry up. Worth reconciling before launch, not urgent.
+
+**Modules — works, but thin relative to how loudly it is advertised.**
+
+- `bash bin/heimdall modules` → renders correctly: `headroom 0.35.0 (traffic-proxy + storage-codec wired)`, plus a registry listing `headroom` as available. **REACHABLE**, and genuinely used (16 arm invocations, one of the top-4 most-used arms).
+- `hmd modules` is **README's single most-repeated claim (25 mentions)** and the module system ships **exactly one module** (`modules/headroom/manifest.json`) against four declared classes (`tool-adapter`, `rule-pack`, `storage-codec`, `traffic-proxy`). Not a defect — the machinery is real and exercised — but the docs:capability ratio is the widest in the repo and a reviewer reading README will expect an ecosystem.
+
+
+---
+
 ## 8. Bottom line for launch
 
 Ordered by what an owner should act on first.
@@ -308,5 +358,8 @@ Ordered by what an owner should act on first.
 6. **Two documented quality gates are effectively unenforced**: lint (`lint-quality` 0/432 spawns vs "Lint clean (zero warnings)") and review (`hmd:reviewer` 4/432 vs "Mandatory before any push"). (§3, §7)
 7. **`sysmon` still is not wired.** `grep -c sysmon hooks/hooks.json` → 0. It grades disk CRIT correctly and 44 measured invocations prove agents find it useful — it just never runs on its own. One `SessionStart` line would make it LIVE. (§4 #6)
 8. **`heimdall-brief` is the template defect and it is still inert.** Real code, green tests, instructed in the orchestrator prompt, zero invocations across the entire 08-08 → 08-21 production window. A passing test proves the code works; it does not prove anything calls it. Four of the nine known instances had exactly this shape, which is why the census weighted measured execution over reference reachability throughout. (§1, §4 #1)
+
+9. **Test coverage is anti-correlated with liveness: 41 of 51 orphans are under test**, and five sampled orphan suites returned 66+ green assertions with zero invocations between them. `350 suites all green` and `51 binaries never run` are simultaneously true. (§12)
+10. **`evals/oracles/registry.json` is read only by tests** — oracle discovery is path-convention based, so the registry is production-shaped configuration that nothing in production reads. Its 9-entries-vs-10-directories drift is harmless today and load-bearing the day someone wires it up. (§13)
 
 **What is genuinely clean** (§11): every hooks.json reference resolves, all 5 skills are discoverable, all 21 `--help` claims are backed by code, all 4 post-install panel claims exist, and the exemption registry is well-built and honest. The repo's problem is not broken claims — today's fixes closed the two worst of those. It is **cold capability**: a large, working, well-tested surface that nothing ever invokes.
