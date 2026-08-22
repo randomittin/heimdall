@@ -38,12 +38,14 @@
 #   -h, --help                        this help.
 #
 # CALLER CLASS. "Reachable" was always three different kinds of evidence reported as one
-# word: a hook that fires with nobody in the loop, a real script someone has to run on
-# purpose, and a sentence in a *.md file an agent may or may not act on. This audit now
-# reports which: LIVE (hooks/hooks.json or .mcp.json), REACHABLE (any other real,
-# non-Markdown reference), or PROSE-ONLY (named only from a *.md file). PROSE-ONLY is
-# reported and counted, not yet a failure — see bin/lib/reachability.sh for why, and for
-# why the chain shown by --why prefers a longer all-code path over a shorter prose one.
+# word: a hook that fires with nobody in the loop, a real script or declared slash-
+# command someone has to run on purpose, and a sentence in a *.md file an agent may or
+# may not act on. This audit now reports which: LIVE (hooks/hooks.json or .mcp.json),
+# REACHABLE (any other real, non-Markdown reference, OR a commands/*.md slash-command
+# definition — a declared entry point, not prose), or PROSE-ONLY (named only from a
+# *.md file outside commands/). PROSE-ONLY is reported and counted, not yet a failure —
+# see bin/lib/reachability.sh for why, and for why the chain shown by --why prefers a
+# longer all-code path over a shorter prose one.
 #
 # EXEMPTIONS live in bin/lib/reachability-exemptions.tsv, one row per name, each with a
 # written reason AND a recheck date. Past that date the exemption stops counting, so a
@@ -212,7 +214,7 @@ case "$MODE" in
     printf 'heimdall-deadcode — consumer audit of bin/\n'
     printf '  audited    %s executable(s) in bin/\n' "$AUDITED"
     printf '  reachable  %s from a live entry point (hook · MCP registration · installer · hmd CLI · command/agent/skill · deploy · CI)\n' "$REACHABLE"
-    printf '             of those: %s LIVE (hook/MCP-fired) · %s REACHABLE (real code/config path) · %s PROSE-ONLY (named only from a *.md file — not a hard failure yet; see --why NAME)\n' \
+    printf '             of those: %s LIVE (hook/MCP-fired) · %s REACHABLE (real code/config path or a commands/*.md slash command) · %s PROSE-ONLY (named only from *.md outside commands/ — not a hard failure yet; see --why NAME)\n' \
       "$CLASS_LIVE" "$CLASS_REACHABLE" "$CLASS_PROSE"
     printf '  dead       %s reachable from NO live entry point\n' "$DEAD_N"
     if [ "$DEAD_N" -gt 0 ]; then

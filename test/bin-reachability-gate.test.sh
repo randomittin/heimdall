@@ -373,10 +373,16 @@ else
   bad "reach_hop_class: a hook/MCP registration surface did not classify LIVE"
 fi
 
-if [ "$(reach_hop_class "agents/whatever.md")" = "PROSE-ONLY" ] && [ "$(reach_hop_class "commands/foo.md")" = "PROSE-ONLY" ]; then
-  ok "reach_hop_class: any *.md referrer classifies PROSE-ONLY"
+if [ "$(reach_hop_class "agents/whatever.md")" = "PROSE-ONLY" ] && [ "$(reach_hop_class "skills/whatever/SKILL.md")" = "PROSE-ONLY" ]; then
+  ok "reach_hop_class: an agents/ or skills/ *.md referrer classifies PROSE-ONLY"
 else
-  bad "reach_hop_class: a *.md referrer did not classify PROSE-ONLY"
+  bad "reach_hop_class: an agents/ or skills/ *.md referrer did not classify PROSE-ONLY"
+fi
+
+if [ "$(reach_hop_class "commands/foo.md")" = "REACHABLE" ]; then
+  ok "reach_hop_class: a commands/*.md referrer classifies REACHABLE (a declared slash command, not prose)"
+else
+  bad "reach_hop_class: a commands/*.md referrer did not classify REACHABLE — a declared entry point misread as prose"
 fi
 
 if [ "$(reach_hop_class "bin/some-script")" = "REACHABLE" ] && [ "$(reach_hop_class "install.sh")" = "REACHABLE" ]; then
@@ -397,20 +403,27 @@ fi
 # 4c. A synthetic tree, built fresh so nothing from §3's accumulated sandbox can bleed
 #     into these counts.
 CLASS_SANDBOX="$(mktemp -d "${TMPDIR:-/tmp}/hmd-reach-class-XXXXXX")"
-mkdir -p "$CLASS_SANDBOX/bin" "$CLASS_SANDBOX/hooks" "$CLASS_SANDBOX/commands"
+mkdir -p "$CLASS_SANDBOX/bin" "$CLASS_SANDBOX/hooks" "$CLASS_SANDBOX/commands" "$CLASS_SANDBOX/agents"
 printf '#!/bin/sh\nexit 0\n' > "$CLASS_SANDBOX/bin/hook-direct"
 printf '#!/bin/sh\n# runs bin/human-direct as part of setup\n# also runs bin/dual-path directly from this very seed, one hop out\nexit 0\n' > "$CLASS_SANDBOX/install.sh"
 printf '#!/bin/sh\nexit 0\n' > "$CLASS_SANDBOX/bin/human-direct"
 printf '#!/bin/sh\nexit 0\n' > "$CLASS_SANDBOX/bin/prose-direct"
 printf '#!/bin/sh\nexit 0\n' > "$CLASS_SANDBOX/bin/nobody-calls"
-# THE REQUIRED FIXTURE: a bin referenced ONLY from a *.md file must classify
-# PROSE-ONLY, not REACHABLE.
-printf '# mentions bin/prose-direct in prose, nowhere else\n' > "$CLASS_SANDBOX/commands/only-prose.md"
+# THE REQUIRED FIXTURE: a bin referenced ONLY from a *.md file OUTSIDE commands/ must
+# classify PROSE-ONLY, not REACHABLE. agents/ (not commands/) is the correct home for
+# this fixture: commands/*.md is a declared slash-command entry point, not prose — see
+# COMMANDS/*.MD ARE A DECLARED ENTRY POINT in bin/lib/reachability.sh.
+printf '# mentions bin/prose-direct in prose, nowhere else\n' > "$CLASS_SANDBOX/agents/only-prose.md"
+# THE COMMANDS/*.MD FIXTURE: a bin referenced ONLY from a commands/*.md file must
+# classify REACHABLE, not PROSE-ONLY — a slash command is a human types `/name` away
+# from firing, the same evidentiary weight as install.sh naming a bin directly.
+printf '#!/bin/sh\nexit 0\n' > "$CLASS_SANDBOX/bin/command-direct"
+printf '# running bin/command-direct is the entire purpose of this command\n' > "$CLASS_SANDBOX/commands/does-thing.md"
 # THE CRUX FIXTURE: brief-shaped is named ONE hop away by prose (mentions.md, shorter)
 # AND TWO hops away by a real, hook-fired path (longer) — reconstructing bin/heimdall-
 # brief's own shape, where agents/heimdall.md names it directly and
 # bin/heimdall-precheck-agent also names it via a genuine hook-rooted code path.
-printf '# see bin/brief-shaped for details\n' > "$CLASS_SANDBOX/commands/mentions.md"
+printf '# see bin/brief-shaped for details\n' > "$CLASS_SANDBOX/agents/mentions.md"
 printf '#!/bin/sh\nexec bin/brief-shaped\n' > "$CLASS_SANDBOX/bin/precheck-shaped"
 printf '#!/bin/sh\nexit 0\n' > "$CLASS_SANDBOX/bin/brief-shaped"
 # THE STRONGEST-WINS FALSIFIER: dual-path is reachable by TWO separate ALL-CODE routes
@@ -454,6 +467,12 @@ if [ "$(reach_class "$CLASS_WORK" prose-direct)" = "PROSE-ONLY" ]; then
   ok "falsifier: a bin referenced ONLY from a *.md file classifies PROSE-ONLY, not REACHABLE (the required fixture)"
 else
   bad "falsifier: a bin referenced only from a *.md file did NOT classify PROSE-ONLY — a prose mention is reading as a genuine caller again"
+fi
+
+if [ "$(reach_class "$CLASS_WORK" command-direct)" = "REACHABLE" ]; then
+  ok "falsifier: a bin named ONLY by a commands/*.md file classifies REACHABLE, not PROSE-ONLY (a declared slash command is a real entry point, not prose)"
+else
+  bad "falsifier: a bin named ONLY by a commands/*.md file did NOT classify REACHABLE — a declared slash-command entry point misread as prose"
 fi
 
 if reach_class "$CLASS_WORK" nobody-calls >/dev/null 2>&1; then
