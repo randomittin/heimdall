@@ -2418,6 +2418,31 @@ case "${1:-}" in
     fi
     exec "$REPORT_BIN" "$@"
     ;;
+  report-issue)
+    # Pass-through to bin/report-issue: files a GitHub issue against the heimdall
+    # plugin repo, auto-prepending an "## Environment" block (plugin SHA, OS,
+    # kernel, recent commits, dirty cwd files) before `gh issue create`.
+    # heimdall-deadcode classified it PROSE-ONLY: its only caller was
+    # commands/report-bug.md (the `/hmd:report-bug` slash command), which shells
+    # out to the bin by literal path — a real invocation, but a *.md-only
+    # reference is not an edge the reachability graph can traverse. This arm
+    # gives it the graph-visible path, and gives a bare shell (outside a Claude
+    # session) a way to reach it too — the same gap `report)`/`designmatch)`
+    # above exist to close. Verified end-to-end 2026-08-22 against a scratch gh
+    # shim + scratch git remote: repo-slug resolution, create-label-if-missing,
+    # and body/environment composition all produced correct output with no real
+    # issue ever filed. Requires `gh auth status` to succeed — enforced inside
+    # the bin, not here. All args forward verbatim, so a routed run and a direct
+    # bin run are byte-identical.
+    shift
+    REPORT_ISSUE_BIN="$PLUGIN_DIR/bin/report-issue"
+    if [ ! -x "$REPORT_ISSUE_BIN" ]; then
+      echo "  Error: report-issue not found at $REPORT_ISSUE_BIN" >&2
+      echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+      exit 1
+    fi
+    exec "$REPORT_ISSUE_BIN" "$@"
+    ;;
   designmatch)
     # Pass-through to the sibling bin/designmatch CLI (init/wire/render/diff/
     # iterate/action-types — see that script's own header). README's "Design
@@ -2916,6 +2941,7 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   echo "  heimdall status           CLI-agnostic statusline HUD (same renderer as the bar)"
   echo "  heimdall weekly-log       Weekly changelog draft generator (drafts only)"
   echo "  heimdall sla              Audit ⚠-class observations against the 24h verdict SLA"
+  echo "  heimdall report-issue     File a GitHub issue against the heimdall plugin repo"
   echo ""
   echo "heimdall launches Claude Code with:"
   echo "  --dangerously-skip-permissions    full autonomy"
