@@ -259,7 +259,12 @@ EOF
     echo "cdhash: $cdhash"
     if [ "$changed" = "true" ]; then
       echo "NOTE: identity changed since the last build (was $prev_cdhash)."
-      echo "      A Full Disk Access grant made against the old binary no longer applies."
+      echo "      A Full Disk Access grant made against the old binary no longer applies"
+      echo "      (FDA keys on the code identity). A FOLDER grant — Downloads/Documents/"
+      echo "      Desktop, which is what the nightly dream actually needs — keys on the"
+      echo "      BUNDLE IDENTIFIER and survives this. Measured 2026-08-23: adding an icon"
+      echo "      moved the cdhash 17bc6912 -> c01c9d10 and the run stayed green with the"
+      echo "      existing grant untouched. Re-grant only if the pane says it lapsed."
     fi
   fi
 }
