@@ -33,6 +33,21 @@
 #   7. NO FALSE REDS FROM PARALLELISM. Suites run in parallel for speed, but every suite
 #      that goes red is automatically RE-RUN ALONE before being reported. A suite is only
 #      called red if it is red on its own. One that passes alone is reported PARALLEL-FLAKY.
+#   8. THE TREE ITSELF IS A GUARANTEE. A frozen `git status` is taken before the first suite
+#      starts and again after the very last one (including solo red re-runs) finishes. Any
+#      tracked file a suite added, modified, deleted, or TYPE-CHANGED (e.g. swapped for a
+#      symlink) fails the run LOUDLY, naming the file — never advisory, never silent. This
+#      exists because it already happened for real, twice, undetected for hours each time:
+#      a tracked file (bin/hmd) was replaced on disk by a dangling symlink into a deleted
+#      test sandbox, surfacing only as an easy-to-miss ` T ` in `git status`; separately, a
+#      test fixture leaked a directory into the REPO ROOT when a `set -e` short-circuit in
+#      its own cleanup trap aborted before reaching later cleanup steps. The second shape is
+#      transient — it only happens when a suite fails EARLY — so this check runs even when
+#      every suite comes back green; gating it on "only check if otherwise green" would miss
+#      exactly the failure mode it was added for. See "REPO INTEGRITY" near CLASSIFY RESULTS
+#      below for what counts, what is deliberately excluded (`.planning/`, `~/.heimdall/`,
+#      anything outside the repo — suites legitimately write there), and how a violation is
+#      attributed to a specific suite without a git call per suite.
 #
 # Usage:
 #   test/run-all.sh                     # all non-live suites, parallel, with red re-runs
@@ -297,6 +312,17 @@ _gate_marker_release() {
 cleanup() { rm -rf "$WORK"; _gate_marker_release; }
 trap cleanup EXIT INT TERM
 
+# ── REPO INTEGRITY, BEFORE SIDE (guarantee #8 above) ────────────────────────────────────
+# Snapshot the tree now, before suite #0 has even started. The AFTER side, and the full
+# rationale for what counts / what's excluded / how a violation gets attributed to a suite
+# without a git call per suite, live next to CLASSIFY RESULTS below, where the compare
+# actually happens. --no-renames on both snapshots turns a moved tracked file into a plain
+# delete+add pair instead of one "R  old -> new" line: easier to diff, and a rename IS a
+# mutation of the tree, not a no-op.
+_status_snapshot() { git -C "$REPO" status --porcelain=v1 --no-renames 2>/dev/null | sort; }
+_status_snapshot > "$WORK/status-before.txt"
+git -C "$REPO" stash list > "$WORK/stash-before.txt" 2>/dev/null
+
 # ── EXECUTE (bounded parallelism; bash 3.2 has no `wait -n`, so poll with kill -0) ─────────
 run_one() {
   local idx="$1" suite="$2" t0 t1 rc budget
@@ -308,6 +334,11 @@ run_one() {
   printf '%s\n' "$rc" >"$WORK/$idx.rc"
   printf '%s\n' "$((t1 - t0))" >"$WORK/$idx.dur"
   printf '%s\n' "$budget" >"$WORK/$idx.budget"
+  # t0/t1 exist ONLY so a tree-integrity violation (see REPO INTEGRITY below) can be
+  # narrowed to the suite(s) running when the offending mtime lands. Two tiny writes, no
+  # new subprocess — read only if a violation is actually found.
+  printf '%s\n' "$t0" >"$WORK/$idx.t0"
+  printf '%s\n' "$t1" >"$WORK/$idx.t1"
 }
 
 START=$(date +%s)
@@ -346,6 +377,10 @@ if [ "$RETRY_REDS" -eq 1 ] && [ "$JOBS" -gt 1 ]; then
     # Keep the PARALLEL-phase output too. The solo re-run overwrites $i.out, and the
     # difference between the two runs is the whole diagnosis for a contaminated suite.
     cp "$WORK/$i.out" "$WORK/$i.out.parallel" 2>/dev/null || true
+    # Same reason for .t0/.t1: run_one() overwrites them on the solo re-run, and a tree
+    # violation caused during the PARALLEL phase must still be attributable afterward.
+    cp "$WORK/$i.t0" "$WORK/$i.t0.parallel" 2>/dev/null || true
+    cp "$WORK/$i.t1" "$WORK/$i.t1.parallel" 2>/dev/null || true
     run_one "$i" "${RUN[$i]}"
     newrc="$(cat "$WORK/$i.rc" 2>/dev/null || echo 99)"
     [ "$newrc" = "0" ] && FLAKY+=("${RUN[$i]}")
@@ -354,6 +389,136 @@ if [ "$RETRY_REDS" -eq 1 ] && [ "$JOBS" -gt 1 ]; then
 fi
 END=$(date +%s)
 ELAPSED=$((END - START))
+
+# ── REPO INTEGRITY, AFTER SIDE (guarantee #8 in the header) ─────────────────────────────
+# WHAT COUNTS: any git-status line for a file git ALREADY tracks — staged or unstaged
+# add/modify/delete/typechange. --no-renames (both snapshots) keeps a moved tracked file as
+# a delete+add pair rather than one "R  old -> new" line.
+#
+# WHAT IS DELIBERATELY EXCLUDED: untracked (`??`) and ignored (`!!`) lines — anything git
+# has no opinion about yet. Suites legitimately write `.planning/` notes, `~/.heimdall/`
+# state, and mktemp dirs outside the repo; none of that is corruption. The floor is "did a
+# suite touch a file that was ALREADY git's business."
+#
+# THE ONE EXCEPTION: an untracked entry with no path separator — a bare name, or for a
+# directory "name/" (git does not recurse into an untracked dir to list it) — sitting loose
+# in the REPO ROOT. Nothing legitimate creates a new top-level sibling of .planning/, test/,
+# etc. mid-run. This shape happened for real on 2026-08-23: a test fixture's own E2_HOME
+# leaked into the repo root, untracked, when a `set -e` short-circuit in its cleanup trap's
+# guarded-removal chain aborted before later cleanup steps ran. It only happens when that
+# suite fails EARLY, so a fully green run never touches this path — exactly why this check
+# is unconditional and never gated on "only check if otherwise green".
+#
+# git stash is checked too, separately: a suite that dirties a tracked file and stashes it
+# away before exiting restores a byte-identical tree — invisible to the diff below — but the
+# stash entry survives as residue, and creating one at all proves a tracked file WAS
+# touched. A stash push+pop round trip within one suite nets zero and is genuinely
+# undetectable by any before/after check; that's out of scope, same as this runner declines
+# to sandbox suites more aggressively — this is a detector, not a jail.
+#
+# ATTRIBUTION is deliberately NOT a git-status bracket around every suite. Two reasons:
+#   SOUNDNESS — suites run $JOBS wide. If suite A dirties a file at t=2s while suite B is
+#   also mid-run, a bracket around B would show the same dirty file and could not tell the
+#   two apart; it would accuse the innocent as readily as the guilty.
+#   COST/CONTENTION — a `git status --porcelain` from inside every suite's parallel slot
+#   fires while up to $JOBS-1 OTHER suites run arbitrary commands — including their own git
+#   calls — against this same working tree: real .git/index.lock contention a run-level
+#   snapshot (only called while nothing else is running) does not have.
+# Instead, ONLY when a violation is actually found (never on a clean run, so this cost is
+# never paid when nothing is wrong) the offending path's mtime is cross-referenced against
+# the [t0,t1] wall-clock window already recorded per suite for the timing table — no new
+# git calls, just a stat and integer comparisons — to print a narrowed CANDIDATE list.
+# Honestly labelled as candidates, not a verdict: windows can overlap under parallelism.
+_status_snapshot > "$WORK/status-after.txt"
+git -C "$REPO" stash list > "$WORK/stash-after.txt" 2>/dev/null
+
+grep -Ev '^(\?\?|!!)' "$WORK/status-before.txt" > "$WORK/tracked-before.txt"
+grep -Ev '^(\?\?|!!)' "$WORK/status-after.txt"  > "$WORK/tracked-after.txt"
+diff "$WORK/tracked-before.txt" "$WORK/tracked-after.txt" 2>/dev/null | grep -E '^[<>] ' \
+  > "$WORK/tree-violations.txt"
+
+grep '^??' "$WORK/status-before.txt" | cut -c4- | grep -E '^[^/]+/?$' | sort \
+  > "$WORK/root-untracked-before.txt"
+grep '^??' "$WORK/status-after.txt"  | cut -c4- | grep -E '^[^/]+/?$' | sort \
+  > "$WORK/root-untracked-after.txt"
+comm -13 "$WORK/root-untracked-before.txt" "$WORK/root-untracked-after.txt" \
+  > "$WORK/root-litter.txt" 2>/dev/null
+
+STASH_BEFORE_N=0; [ -s "$WORK/stash-before.txt" ] && STASH_BEFORE_N=$(wc -l < "$WORK/stash-before.txt" | tr -d '[:space:]')
+STASH_AFTER_N=0;  [ -s "$WORK/stash-after.txt"  ] && STASH_AFTER_N=$(wc -l < "$WORK/stash-after.txt"  | tr -d '[:space:]')
+NEW_STASH_N=$((STASH_AFTER_N - STASH_BEFORE_N))
+[ "$NEW_STASH_N" -lt 0 ] && NEW_STASH_N=0
+
+TREEVIOL_PATH_COUNT=0
+: > "$WORK/tree-violation-paths.txt"
+if [ -s "$WORK/tree-violations.txt" ]; then
+  cut -c6- "$WORK/tree-violations.txt" | sort -u > "$WORK/tree-violation-paths.txt"
+  TREEVIOL_PATH_COUNT=$(wc -l < "$WORK/tree-violation-paths.txt" | tr -d '[:space:]')
+fi
+ROOT_LITTER_COUNT=0
+[ -s "$WORK/root-litter.txt" ] && ROOT_LITTER_COUNT=$(wc -l < "$WORK/root-litter.txt" | tr -d '[:space:]')
+
+n_treeviol=$((TREEVIOL_PATH_COUNT + ROOT_LITTER_COUNT + NEW_STASH_N))
+
+# _mtime_of PATH — epoch mtime of a repo-relative path. Plain `stat` (no -L) reports on a
+# symlink itself rather than erroring on a dangling target — exactly the shape that hid for
+# hours once already: a tracked file replaced on disk by a dangling symlink.
+_mtime_of() {
+  local target="$REPO/$1"
+  if [ -e "$target" ] || [ -L "$target" ]; then
+    stat -f %m "$target" 2>/dev/null || true
+  fi
+}
+# _attribute MTIME — best-effort candidate suite list; see the long rationale above.
+_attribute() {
+  local target="$1" i s0 s1 hit="" sfx
+  for i in $(seq 0 $((TO_RUN - 1))); do
+    for sfx in "" ".parallel"; do
+      [ -f "$WORK/$i.t0$sfx" ] || continue
+      s0="$(cat "$WORK/$i.t0$sfx" 2>/dev/null || echo 0)"
+      s1="$(cat "$WORK/$i.t1$sfx" 2>/dev/null || echo 0)"
+      if [ "$target" -ge $((s0 - 1)) ] && [ "$target" -le $((s1 + 1)) ]; then
+        hit="$hit $(basename "${RUN[$i]}")"
+        break
+      fi
+    done
+  done
+  printf '%s' "$hit" | tr -s ' ' '\n' | sort -u | tr '\n' ' '
+}
+# _report_path PATH MISSING_MSG — append one report line: mtime + candidate suites, or a
+# clear reason no mtime could be read.
+_report_path() {
+  local p="$1" missing_msg="$2" mtime cands
+  mtime="$(_mtime_of "$p")"
+  if [ -z "$mtime" ]; then
+    printf '    %-40s (%s)\n' "$p" "$missing_msg" >> "$WORK/tree-report.txt"
+    return
+  fi
+  cands="$(_attribute "$mtime")"
+  if [ -n "$(printf '%s' "$cands" | tr -d '[:space:]')" ]; then
+    printf '    %-40s (mtime %s -- running then: %s)\n' "$p" "$mtime" "$cands" >> "$WORK/tree-report.txt"
+  else
+    printf '    %-40s (mtime %s -- no recorded suite window covers it)\n' "$p" "$mtime" >> "$WORK/tree-report.txt"
+  fi
+}
+
+: > "$WORK/tree-report.txt"
+if [ "$TREEVIOL_PATH_COUNT" -gt 0 ]; then
+  echo "  tracked file(s) changed during the run:" >> "$WORK/tree-report.txt"
+  while IFS= read -r p; do
+    [ -n "$p" ] && _report_path "$p" "gone -- deleted; no mtime left to narrow candidates"
+  done < "$WORK/tree-violation-paths.txt"
+fi
+if [ "$ROOT_LITTER_COUNT" -gt 0 ]; then
+  echo "  untracked entry(ies) appeared loose in the repo ROOT (not nested, not .planning/):" >> "$WORK/tree-report.txt"
+  while IFS= read -r p; do
+    [ -n "$p" ] && _report_path "$p" "already gone by the time this check ran"
+  done < "$WORK/root-litter.txt"
+fi
+if [ "$NEW_STASH_N" -gt 0 ]; then
+  printf '  %d new git-stash entry(ies) left behind (a tracked file WAS mutated mid-run):\n' "$NEW_STASH_N" >> "$WORK/tree-report.txt"
+  head -n "$NEW_STASH_N" "$WORK/stash-after.txt" | sed 's/^/    /' >> "$WORK/tree-report.txt"
+fi
 
 # ── CLASSIFY RESULTS ──────────────────────────────────────────────────────────────────────
 n_pass=0; n_fail=0; n_timeout=0; n_unparsed=0; n_discrep=0
@@ -399,7 +564,7 @@ done
 # Solo-green-but-red-in-run (state contamination) is exactly the case this exists for: the
 # .parallel.out / .out pair is the diagnosis.
 EVIDENCE=""
-if [ "${#NONGREEN[@]}" -gt 0 ]; then
+if [ "${#NONGREEN[@]}" -gt 0 ] || [ "$n_treeviol" -gt 0 ]; then
   # Explicit template, not `-t`: on macOS `-t` treats the argument as a PREFIX and appends
   # its own suffix, leaving a literal "XXXXXX" in the printed path.
   EVIDENCE="$(mktemp -d "${TMPDIR:-/tmp}/heimdall-run-all-evidence.XXXXXX")"
@@ -409,6 +574,12 @@ if [ "${#NONGREEN[@]}" -gt 0 ]; then
     [ -f "$WORK/$ei.out.parallel" ] && \
       cp "$WORK/$ei.out.parallel" "$EVIDENCE/${ename%.test.sh}.$estatus.parallel.out" 2>/dev/null || true
   done
+  if [ "$n_treeviol" -gt 0 ]; then
+    cp "$WORK/tree-report.txt" "$EVIDENCE/TREE-INTEGRITY-VIOLATION.txt" 2>/dev/null || true
+    for tf in status-before.txt status-after.txt stash-before.txt stash-after.txt tree-violations.txt root-litter.txt; do
+      [ -f "$WORK/$tf" ] && cp "$WORK/$tf" "$EVIDENCE/$tf" 2>/dev/null || true
+    done
+  fi
   {
     printf 'run-all evidence  %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
     printf 'jobs=%s  suites_ran=%s  retry_reds=%s\n\n' "$JOBS" "$TO_RUN" "$RETRY_REDS"
@@ -417,6 +588,7 @@ if [ "${#NONGREEN[@]}" -gt 0 ]; then
       erest="${e#*|}"
       printf '%-9s %s\n' "${erest#*|}" "${erest%%|*}"
     done
+    [ "$n_treeviol" -gt 0 ] && printf '%-9s %s\n' TREEVIOL "see TREE-INTEGRITY-VIOLATION.txt ($n_treeviol finding(s))"
     printf '\n*.out          = the run that produced the verdict (solo re-run when --retry-reds)\n'
     printf '*.parallel.out = the same suite'"'"'s output during the parallel phase, when present\n'
   } > "$EVIDENCE/INDEX.txt"
@@ -482,6 +654,12 @@ if [ "${#SKIP[@]}" -gt 0 ]; then
   done
   echo ""
 fi
+if [ "$n_treeviol" -gt 0 ]; then
+  echo "${RED}${BLD}TREE INTEGRITY VIOLATION (${n_treeviol})${OFF} — the working tree was NOT the same after the run as before it:"
+  cat "$WORK/tree-report.txt"
+  echo "  this is a REAL CORRUPTION SIGNAL, not advisory — a suite wrote where only a human or git should."
+  echo ""
+fi
 
 # ── SUMMARY ───────────────────────────────────────────────────────────────────────────────
 echo "--------------------------------------------------------------------------------------"
@@ -489,15 +667,24 @@ echo "suites: ${TO_RUN} ran, ${#SKIP[@]} skipped (live), ${DISCOVERED} discovere
 echo "        ${GRN}${n_pass} pass${OFF}  ${RED}${n_fail} fail${OFF}  ${RED}${n_timeout} timeout${OFF}  ${RED}${n_discrep} discrepancy${OFF}  ${YEL}${n_unparsed} unparsed${OFF}"
 echo "assertions: ${tot_p} passed, ${tot_f} failed  (parsed detail; exit codes above are authoritative)"
 echo "wall clock: ${ELAPSED}s"
+if [ "$n_treeviol" -eq 0 ]; then
+  echo "tree-integrity: clean (before/after git status match; no tracked file touched, no root litter, no new stash)"
+else
+  echo "${RED}tree-integrity: VIOLATED (${n_treeviol} finding(s) -- see TREE INTEGRITY VIOLATION above)${OFF}"
+fi
 if [ -n "$EVIDENCE" ]; then
   echo "evidence:   ${EVIDENCE}   (${#NONGREEN[@]} non-green suite output(s) + INDEX.txt — kept, not deleted)"
 fi
 
-BAD=$((n_fail + n_timeout + n_discrep))
+BAD=$((n_fail + n_timeout + n_discrep + n_treeviol))
 if [ "$BAD" -gt 0 ]; then
-  echo "${RED}${BLD}RUN RED${OFF} — $BAD suite(s) not green."
+  if [ "$n_treeviol" -gt 0 ]; then
+    echo "${RED}${BLD}RUN RED${OFF} — $BAD suite(s)/finding(s) not green, including $n_treeviol TREE INTEGRITY VIOLATION(s)."
+  else
+    echo "${RED}${BLD}RUN RED${OFF} — $BAD suite(s) not green."
+  fi
   [ -n "$EVIDENCE" ] && echo "  read it: ${EVIDENCE}/INDEX.txt"
   exit 1
 fi
-echo "${GRN}${BLD}RUN GREEN${OFF} — all ${TO_RUN} suites that ran passed."
+echo "${GRN}${BLD}RUN GREEN${OFF} — all ${TO_RUN} suites that ran passed, tree untouched."
 exit 0
