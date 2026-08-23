@@ -56,7 +56,7 @@ cleanup() {
   for h in $CASE_HOMES; do rm -rf "$h"; done
   rm -rf "$TMP"
 }
-trap cleanup EXIT
+trap cleanup EXIT INT TERM
 
 wait_pid_file() {  # $1 = glob -> prints first match's content once one appears (~2s bound)
   local i=0 f

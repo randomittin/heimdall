@@ -74,7 +74,7 @@ cleanup() {
   [ -n "$E3_HOME" ] && rm -rf "$E3_HOME"
   rm -rf "$TMP"
 }
-trap cleanup EXIT
+trap cleanup EXIT INT TERM
 
 PROJECT="acme/widget"
 HAID="haid:rj.mbp-keeper"
