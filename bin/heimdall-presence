@@ -1249,7 +1249,6 @@ _keeper_start() {
   # is the deliberate trade — a rare degraded install beats a guaranteed process leak
   # on every test run — and HMD_DOCTOR_ALLOW_TMP_HOME=1 exists for anyone (or any
   # future test asserting the spawn) who needs to override it explicitly.
-<<<<<<< HEAD
   #
   # Considered and rejected: `getconf DARWIN_USER_TEMP_DIR`. It reads this same Darwin
   # per-user temp root through confstr(3) — a syscall keyed off the real uid, not an
@@ -1266,10 +1265,6 @@ _keeper_start() {
   # still zero subprocesses either way.
   case "${HOME:-}" in
     /tmp/*|/private/tmp/*|/var/tmp/*|/private/var/tmp/*|/var/folders/*/T/*)
-=======
-  case "${HOME:-}" in
-    /tmp/*|/private/tmp/*|/var/folders/*/T/*)
->>>>>>> main
       if [ -z "${HMD_DOCTOR_ALLOW_TMP_HOME:-}" ]; then
         [ -n "${HMD_DEBUG:-}" ] && printf 'heimdall-presence: doctor spawn skipped, HOME is under a temp root (%s)\n' "${HOME:-}" >&2
         return 0
