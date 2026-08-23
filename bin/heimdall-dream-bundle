@@ -58,13 +58,21 @@
 set -euo pipefail
 
 SELF="$0"
+BINDIR="$(cd "$(dirname "$0")" && pwd)"
 IDENTIFIER="dev.runheimdall.hmd-dream"
 BUNDLE_NAME="hmd-dream.app"
 EXEC_NAME="hmd-dream"
+ICON_NAME="hmd-dream"
 
 HEIMDALL_HOME="${HEIMDALL_HOME:-$HOME/.heimdall}"
 IDENT_FILE="${HEIMDALL_DREAM_IDENTITY:-$HEIMDALL_HOME/dream-identity.json}"
 SRC_BASH="${HEIMDALL_DREAM_BUNDLE_BASH:-/bin/bash}"
+# Test seam only (mirrors HEIMDALL_DREAM_BUNDLE_BASH above) — the real bundle always
+# ships whatever icon actually lives in the checkout, resolved relative to this
+# script's OWN real directory so it keeps working from an installed clone
+# (bin/heimdall-dream-schedule and bin/heimdall-dream-permission already resolve this
+# tool itself the same way: BINDIR="$(cd "$(dirname "$0")" && pwd)").
+SRC_ICON="${HEIMDALL_DREAM_BUNDLE_ICON:-$BINDIR/../launch-docs/assets/hmd-logo-eye-h.icns}"
 DEFAULT_OUT="$HEIMDALL_HOME/bin"
 
 usage() { sed -n '2,32p' "$SELF" | sed 's/^# \{0,1\}//'; }
