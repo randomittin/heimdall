@@ -28,7 +28,7 @@ command -v python3 >/dev/null 2>&1 || { echo "FATAL: python3 required"; exit 1; 
 [ -x "$HMD" ] || { echo "FATAL: $HMD missing or not executable"; exit 1; }
 
 WORK="$(mktemp -d -t "quota-advisor-test.XXXXXX")"
-trap 'rm -rf "$WORK"' EXIT
+trap 'rm -rf "$WORK"' EXIT INT TERM
 export HOME="$WORK/home"; mkdir -p "$HOME"
 
 echo "heimdall-quota-advisor.test.sh"
@@ -165,6 +165,15 @@ if printf '%s' "$out_fixed" | grep -q "about ${EXPECT_H}h ${EXPECT_M}m from now"
   ok "countdown matches an independently computed epoch (about ${EXPECT_H}h ${EXPECT_M}m)"
 else
   bad "countdown does not match independent computation — got: $(printf '%s' "$out_fixed" | grep 'Resets ')"
+fi
+
+echo "== section 5b: advise --reason is a working alias of check --text (the exact repro that failed) =="
+
+out1b="$(HEIMDALL_QUOTA_NOW_EPOCH="$NOW_FIXED" "$CLI" advise --reason "$MSG_6PM")"; rc1b=$?
+if [ "$rc1b" = 0 ] && [ "$out1b" = "$out_fixed" ]; then
+  ok "advise --reason == check --text, byte-identical (advise is a real, wired verb)"
+else
+  bad "advise --reason should be byte-identical to check --text — rc=$rc1b"
 fi
 
 echo "== section 6: an unresolvable reset time still fires, honestly =="

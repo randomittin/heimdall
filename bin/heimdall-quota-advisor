@@ -43,11 +43,14 @@
 #                                       `heimdall-quota-resume record`
 #                                       writes; `status` reads it, never
 #                                       writes it.
-#   .planning/tier-declarations.jsonl  the SAME log `heimdall-tier declare`
-#                                       writes, read here (best-effort,
-#                                       never written) to state real tier
-#                                       headroom instead of a stale
-#                                       hardcoded number.
+#   .planning/metrics.jsonl            the SAME task-outcome log
+#                                       `heimdall-metric record` writes (and
+#                                       the one docs/analysis/2026-08-23-
+#                                       omniroute-assessment.md itself
+#                                       measured 86%/14% sonnet/opus from),
+#                                       read here (best-effort, never
+#                                       written) to state real tier headroom
+#                                       instead of a stale hardcoded number.
 #
 # NOT ON ANY HOOK PATH
 #   This tool is invoked on demand only (a human hitting the error, or an
@@ -58,11 +61,13 @@
 #   SessionStart hooks.
 #
 # USAGE
-#   heimdall-quota-advisor check [--text T | --file F] [--repo DIR]
-#                                                       (stdin if neither)
+#   heimdall-quota-advisor advise [--reason T | --text T | --file F] [--repo DIR]
+#                                                       (stdin if none given)
 #       Ad hoc: classify raw termination text and, only if it is confidently
 #       a Claude quota/session-limit stop, print the options. Silent + exit 1
-#       otherwise (fail open).
+#       otherwise (fail open). `check` is a shorter alias for `advise`;
+#       `--reason`/`--text` are the same flag under two names — use whichever
+#       reads better at the call site.
 #   heimdall-quota-advisor status [--repo DIR]
 #       Read the existing .planning/QUOTA-STOP.json record (written by
 #       `heimdall-quota-resume record`, if that has already run) and print
@@ -71,8 +76,8 @@
 #   heimdall-quota-advisor help
 #
 # EXIT
-#   check    0 fired (options printed) / 1 silent (not confidently a quota
-#            stop — the fail-open default) / 64 usage error
+#   advise/check  0 fired (options printed) / 1 silent (not confidently a
+#                 quota stop — the fail-open default) / 64 usage error
 #   status   0 always (fired or silent; an advisor must never break a
 #            caller)
 #   help     0
@@ -120,23 +125,28 @@ _qa_detect() {
   printf '%s' "$out"
 }
 
-# ── tier headroom — reuses .planning/tier-declarations.jsonl written by
-#    `heimdall-tier declare`; never invents a second stats source. A live
-#    percentage when the log exists and is non-empty; an honest, still-true
-#    fallback line otherwise — never a hardcoded, staleness-prone number.
+# ── tier headroom — reuses .planning/metrics.jsonl, the SAME task-outcome
+#    log bin/heimdall-metric writes and the SAME file
+#    docs/analysis/2026-08-23-omniroute-assessment.md measured its 86%
+#    sonnet / 14% opus figure from; never invents a second stats source.
+#    That log is gitignored/per-environment (most checkouts will not have
+#    it), so this prints a LIVE percentage when it is present and non-empty,
+#    and an honest, doc-cited fallback otherwise — never a hardcoded,
+#    staleness-prone number presented as current.
 _qa_tier_headroom_line() {
-  local repo="$1" log="$repo/.planning/tier-declarations.jsonl" total sonnet pct
+  local repo="$1" log="$repo/.planning/metrics.jsonl" total sonnet pct
   if [ -r "$log" ] && command -v jq >/dev/null 2>&1; then
-    total="$(grep -c . "$log" 2>/dev/null)"; [ -n "$total" ] || total=0
+    total="$(jq -s '[.[] | select(.metric=="task" and .model)] | length' "$log" 2>/dev/null)"
+    case "$total" in ''|*[!0-9]*) total=0 ;; esac
     if [ "$total" -gt 0 ] 2>/dev/null; then
-      sonnet="$(jq -s '[.[] | select(.declared_tier=="sonnet")] | length' "$log" 2>/dev/null)"
+      sonnet="$(jq -s '[.[] | select(.metric=="task" and .model=="sonnet")] | length' "$log" 2>/dev/null)"
       case "$sonnet" in ''|*[!0-9]*) sonnet=0 ;; esac
       pct=$((sonnet * 100 / total))
-      printf '   This repo already runs %d%% of %d recorded tier declarations on sonnet\n   (the standing default coding tier) -- likely little headroom left to drop\n   further for routine coding work. Check what is live right now: hmd tier table\n' "$pct" "$total"
+      printf '   This repo already runs %d%% of %d recorded task records on sonnet (the\n   standing default coding tier) -- likely little headroom left to drop\n   further for routine coding work.\n' "$pct" "$total"
       return 0
     fi
   fi
-  printf '   This repo already defaults coding work to sonnet (CLAUDE.md, Model\n   routing directive) -- there is usually no cheaper coding tier below it.\n   Check what is actually declared right now: hmd tier table\n'
+  printf '   This repo already defaults coding work to sonnet (CLAUDE.md, Model\n   routing directive) -- there is usually no cheaper coding tier below it.\n   Last measured: 86%% sonnet / 14%% opus across 22 task records (see\n   docs/analysis/2026-08-23-omniroute-assessment.md, Section 3) -- not a\n   live reading from this checkout (.planning/metrics.jsonl is local and\n   not present here), so treat that figure as historical context only.\n'
 }
 
 # ── the advisor message itself (shared by check + status). Ordered by
@@ -186,7 +196,7 @@ cmd_check() {
   local text="" text_set=0 file="" repo="$PWD"
   while [ $# -gt 0 ]; do
     case "$1" in
-      --text) text="${2:-}"; text_set=1; shift 2 ;;
+      --text|--reason) text="${2:-}"; text_set=1; shift 2 ;;
       --file) file="${2:-}"; shift 2 ;;
       --repo) repo="${2:-$PWD}"; shift 2 ;;
       *) echo "heimdall-quota-advisor: unknown arg: $1" >&2; return 64 ;;
@@ -244,7 +254,7 @@ cmd_status() {
 }
 
 case "${1:-help}" in
-  check)          shift; cmd_check "$@" ;;
+  check|advise)   shift; cmd_check "$@" ;;
   status)         shift; cmd_status "$@" ;;
   help|--help|-h) usage ;;
   *) echo "Unknown command: ${1}. Try: heimdall-quota-advisor help" >&2; exit 64 ;;

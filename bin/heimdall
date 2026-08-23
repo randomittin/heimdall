@@ -2576,6 +2576,28 @@ case "${1:-}" in
     fi
     exec "$QUEUE_BIN" "$@"
     ;;
+  quota-advisor)
+    # Pass-through to bin/heimdall-quota-advisor: the honest, NEVER-AUTO-
+    # SWITCHING advisor for a genuine Claude quota/session-limit exhaustion
+    # (see that bin's own header for the OmniRoute safety boundary it
+    # permanently enforces — it never wires OmniRoute's Tier-1 subscription-
+    # reuse mode or its MITM decrypt mode, and never auto-switches a
+    # provider). Before this arm existed, `hmd quota-advisor ...` fell
+    # through to the goal-driven task prompt below instead of dispatching —
+    # the same gap `report)`/`redum)`/`authenticity-check)`/`queue)` above
+    # exist to close, and a live repro here is worse than most: it silently
+    # spawned a real, non-interactive `claude -p` run instead of returning a
+    # plain CLI error. All args forward verbatim, so a routed run and a
+    # direct bin run are byte-identical.
+    shift
+    QUOTA_ADVISOR_BIN="$PLUGIN_DIR/bin/heimdall-quota-advisor"
+    if [ ! -x "$QUOTA_ADVISOR_BIN" ]; then
+      echo "  Error: heimdall-quota-advisor not found at $QUOTA_ADVISOR_BIN" >&2
+      echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
+      exit 1
+    fi
+    exec "$QUOTA_ADVISOR_BIN" "$@"
+    ;;
   wrap|unwrap)
     # §7 Pass-through to heimdall-wrap: ONE command that installs the Layer-0 git
     # hooks, writes the AGENTS.md fenced block, starts presence and launches the
