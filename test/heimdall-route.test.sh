@@ -61,7 +61,26 @@ cleanup() {
 }
 trap cleanup EXIT
 
-BASE_PORT=$((26000 + ($$ % 4000)))
+# Ports are OS-assigned, not PID-derived: a PID-modulo scheme guesses into a fixed,
+# narrow, guessable range with zero collision detection or retry, so any unrelated
+# process already bound to that one exact port turns every downstream guarantee that
+# reuses it red (confirmed: an external occupier on the predicted port alone cascades
+# a clean 19/0 run to 10 passed, 5 failed). All four ports needed below are bound
+# SIMULTANEOUSLY in one interpreter so the OS cannot hand out the same number twice
+# for this run — a collision with something else entirely, after release, is the
+# same small residual TOCTOU window every free-port allocator (incl. the OS itself)
+# has; it is not eliminable, only narrowed from "guaranteed within a 4000-port range
+# on collision" to "requires an unrelated bind in a vanishingly short window."
+read -r PORT1 PORT2 PORT_FAILOPEN PORT_UNUSED <<<"$(python3 -c '
+import socket
+socks = [socket.socket(socket.AF_INET, socket.SOCK_STREAM) for _ in range(4)]
+for s in socks:
+    s.bind(("127.0.0.1", 0))
+ports = [s.getsockname()[1] for s in socks]
+for s in socks:
+    s.close()
+print(" ".join(str(p) for p in ports))
+')"
 
 echo
 echo "1 — the binary exists, parses, and is reachable from the router"
@@ -160,7 +179,6 @@ start_proxy() {
 
 echo
 echo "2 — --url prints the chain's base URL against a verified-lossless proxy"
-PORT1=$BASE_PORT
 PID1="$(start_proxy "$PORT1" --lossless)" && LIVE_PIDS="$LIVE_PIDS $PID1"
 if [ -n "${PID1:-}" ]; then
   URL1="$(HMD_HEADROOM_BIN="$FAKE_BIN" HMD_MODULES_STATE="$MODSTATE" \
@@ -174,7 +192,6 @@ fi
 
 echo
 echo "3 — --url fails, and prints nothing, when the chain refuses the live proxy"
-PORT2=$((BASE_PORT + 1))
 PID2="$(unset HEADROOM_LOSSLESS; start_proxy "$PORT2")" && LIVE_PIDS="$LIVE_PIDS $PID2"
 if [ -n "${PID2:-}" ]; then
   OUT2="$(HMD_HEADROOM_BIN="$FAKE_BIN" HMD_MODULES_STATE="$MODSTATE" \
@@ -221,7 +238,7 @@ ENV5="$TMP/env5"
 EMPTY_STATE="$TMP/empty-modstate"; mkdir -p "$EMPTY_STATE"
 PATH="$TOOLDIR:$PATH" FAKETOOL_ENV_FILE="$ENV5" \
   HMD_HEADROOM_BIN="$FAKE_BIN" HMD_MODULES_STATE="$EMPTY_STATE" \
-  HEIMDALL_HOME="$TMP/home5" HEADROOM_PORT=$((BASE_PORT + 9)) \
+  HEIMDALL_HOME="$TMP/home5" HEADROOM_PORT="$PORT_FAILOPEN" \
   "$ROUTE" faketool >"$TMP/out5" 2>"$TMP/err5"
 RC5=$?
 [ "$RC5" = "0" ] && ok "the tool launched anyway (exit 0)" \
@@ -302,7 +319,7 @@ if [ -n "${PID1:-}" ]; then
     *)           bad "--status printed something unrecognised: '$ST'" ;;
   esac
   ST2="$(HMD_HEADROOM_BIN="$FAKE_BIN" HMD_MODULES_STATE="$MODSTATE" \
-         HEADROOM_PORT=$((BASE_PORT + 19)) "$ROUTE" --status 2>/dev/null)"
+         HEADROOM_PORT="$PORT_UNUSED" "$ROUTE" --status 2>/dev/null)"
   case "$ST2" in
     "NOT ROUTED"*) ok "--status reports NOT ROUTED when no proxy is listening" ;;
     *) bad "--status claimed routing with no proxy on the port: '$ST2'" ;;
