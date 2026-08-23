@@ -91,6 +91,11 @@ run_case() {
   doc_pid="$(wait_pid_file "$docdir"/*.pid || true)"
   "$BIN" keeper-stop --session "$sess" --project "$PROJECT" >/dev/null 2>&1 || true
   case "$doc_pid" in ''|*[!0-9]*) : ;; *) kill "$doc_pid" 2>/dev/null || true ;; esac
+  # give a spawned doctor (HMD_DOCTOR_MAX_CYCLES=1 HMD_DOCTOR_MAX_SECONDS=1 above) its own ~1s
+  # bound to exit naturally too — without this, a `pgrep` immediately after this function
+  # returns can catch it mid-teardown and misreport a live PID that is already on its way out
+  # (matches the same wait E2/E3 in heimdall-presence-keeper.test.sh use for the same reason).
+  "$PY" -c "import time;time.sleep(1.2)"
   if [ "$expect" = "skip" ]; then
     if [ -z "$doc_pid" ]; then ok "$label: no doctor spawned (guard held, envmode=$envmode)"
     else bad "$label: doctor spawned anyway (pid=$doc_pid, envmode=$envmode) — LEAK"; fi
