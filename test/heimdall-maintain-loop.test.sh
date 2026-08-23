@@ -744,6 +744,123 @@ else
   bad "no-issues case regressed (stop=$(jget "$OUT" '.stop') cycles=$(jget "$OUT" '.cycles'))"
 fi
 
+echo "── (20) SEEKER CONTRACT — agents/seeker.md's real --label is ingested by the engine's default filter ─"
+# THE DEFECT this pins: agents/seeker.md used to file `gh issue create --label
+# "bug,seeker"`, while the engine's ingest (sync_queue_from_github,
+# DEFAULT_MAINTAINER_LABEL="maintainer") only ever requests `--label maintainer`.
+# gh's real label filter is a SUPERSET/AND match (an issue must carry EVERY
+# requested label, never just one of several) — those two label sets never
+# overlapped, so a seeker-filed issue was NEVER ingested and seeker/fixer were
+# never spawned by the durable engine. The shared fake `gh` above does not
+# simulate this at all (it serves GH_ISSUE_LIST_JSON unconditionally regardless
+# of --label), so this section brings its OWN label-aware fake, scoped locally.
+#
+# Half (b) reads agents/seeker.md's ACTUAL --label value at RUN TIME rather than
+# hardcoding it, so this test is a live contract: it goes RED again on its own if
+# the label contract between seeker.md and the engine ever regresses.
+
+LBIN="$WORK/fakebin_labels"; mkdir -p "$LBIN"
+cat > "$LBIN/gh" <<'LABELGHEOF'
+#!/usr/bin/env bash
+# Label-aware fake gh, scoped to test (20) only. Replicates GitHub's real
+# `issue list --label` filter: an issue is returned only if its label set is a
+# SUPERSET of the requested --label list (comma-separated = AND, never OR).
+# That distinction is the entire subject of this test, so the fake must not
+# fake it away the way the shared fake above does.
+if [ "${1:-}" = "issue" ] && [ "${2:-}" = "list" ]; then
+  want=""; prev=""
+  for a in "$@"; do
+    [ "$prev" = "--label" ] && want="$a"
+    prev="$a"
+  done
+  jq --arg want "$want" '
+    ( $want | split(",") ) as $wanted
+    | map(select( ($wanted - [ (.labels // [])[].name ]) == [] ))
+  ' "${GH_ISSUE_LIST_JSON:?GH_ISSUE_LIST_JSON unset}"
+  exit 0
+fi
+exit 0
+LABELGHEOF
+chmod +x "$LBIN/gh"
+
+# Fixture (a) — the HISTORICAL broken shape, hardcoded so this regression stays
+# pinned forever no matter what agents/seeker.md says in the future.
+ISSUES_SEEKER_BROKEN="$WORK/issues_seeker_broken.json"
+cat > "$ISSUES_SEEKER_BROKEN" <<'JSON'
+[{"number":101,"title":"[seeker] TypeError: cannot read property of undefined","body":"pre-fix seeker output - labeled bug,seeker only","labels":[{"name":"bug"},{"name":"seeker"}],"createdAt":"2024-01-01T00:00:00Z"}]
+JSON
+
+# Fixture (b) — the LIVE label set, extracted from agents/seeker.md's actual
+# `gh issue create --label "..."` line at RUN time (not hardcoded).
+SEEKER_MD="$ROOT/agents/seeker.md"
+SEEKER_LABELS="$(grep -m1 -- '--label "' "$SEEKER_MD" | sed -n 's/.*--label "\([^"]*\)".*/\1/p')"
+if [ -z "$SEEKER_LABELS" ]; then
+  bad "could not extract a --label value from agents/seeker.md (grep/sed found nothing — has the issue-create block moved or changed shape?)"
+  SEEKER_LABELS="__extraction_failed__"
+fi
+SEEKER_LABELS_JSON="$(printf '%s' "$SEEKER_LABELS" | jq -R 'split(",") | map({name: .})')"
+ISSUES_SEEKER_LIVE="$WORK/issues_seeker_live.json"
+jq -n --argjson labels "$SEEKER_LABELS_JSON" \
+  '[{"number":202,"title":"[seeker] live-extracted contract issue","body":"labels extracted live from agents/seeker.md","labels":$labels,"createdAt":"2024-01-03T00:00:00Z"}]' \
+  > "$ISSUES_SEEKER_LIVE"
+
+SEEKER_SLUG="randomittin/heimdall-seeker-contract-test"
+
+# (a) historical broken label set -> the engine's DEFAULT ingest (no label=
+#     override passed — the exact production call shape used at run()'s only
+#     call site) must ingest NOTHING.
+S20A_HOME="$WORK/seeker_contract_broken_home"; mkdir -p "$S20A_HOME"
+R20A="$("$PY" -c '
+import os, sys
+os.environ["PATH"] = sys.argv[1] + os.pathsep + os.environ.get("PATH", "")
+os.environ["HEIMDALL_HOME"] = sys.argv[2]
+os.environ["GH_ISSUE_LIST_JSON"] = sys.argv[3]
+import maintain_loop as m
+r = m.sync_queue_from_github(sys.argv[4])
+print(r["ingested"])
+' "$LBIN" "$S20A_HOME" "$ISSUES_SEEKER_BROKEN" "$SEEKER_SLUG" 2>&1)"
+if [ "$R20A" = "0" ]; then
+  ok "FALSIFIER: the historical bug,seeker label set ingests 0 issues (the old defect, pinned forever)"
+else
+  bad "historical bug,seeker label set should ingest 0, got: $R20A"
+fi
+
+# (b) agents/seeker.md's CURRENT real label set -> the SAME default ingest call
+#     must ingest exactly 1. Run this BEFORE the seeker.md fix and it fails RED
+#     for the same reason as (a); run it after and it goes GREEN.
+S20B_HOME="$WORK/seeker_contract_live_home"; mkdir -p "$S20B_HOME"
+R20B="$("$PY" -c '
+import os, sys
+os.environ["PATH"] = sys.argv[1] + os.pathsep + os.environ.get("PATH", "")
+os.environ["HEIMDALL_HOME"] = sys.argv[2]
+os.environ["GH_ISSUE_LIST_JSON"] = sys.argv[3]
+import maintain_loop as m
+r = m.sync_queue_from_github(sys.argv[4])
+print(r["ingested"])
+' "$LBIN" "$S20B_HOME" "$ISSUES_SEEKER_LIVE" "$SEEKER_SLUG" 2>&1)"
+if [ "$R20B" = "1" ]; then
+  ok "agents/seeker.md's LIVE label set (\"$SEEKER_LABELS\") IS ingested by the engine's default filter (ingested=1)"
+else
+  bad "agents/seeker.md's LIVE label set (\"$SEEKER_LABELS\") was NOT ingested (expected 1, got: $R20B) -- seeker and the engine are disconnected"
+fi
+
+# (c) the ingested issue must actually REACH the fixer path. Proven via the
+# read-only `plan` dry-run CLI — its own docstring says "Mutates NOTHING". No
+# PR, no push, no network; this is the dry-run path this section exercises for
+# the seeker -> queue -> fixer proof. It must appear in pick order at severity
+# "high" (the `bug` label; "seeker"/"maintainer" carry no severity of their own)
+# routed to fix+PR — NOT parked, since "high" sits below the default "critical"
+# approval floor (DEFAULT_APPROVAL_SEVERITY).
+PLAN20="$(HEIMDALL_HOME="$S20B_HOME" "$CMD" plan --repo "$SEEKER_SLUG" 2>&1)"
+if [ "$(jget "$PLAN20" '.plan | length')" = "1" ] \
+   && grep -q '#202$' <<<"$(jget "$PLAN20" '.plan[0].issue')" \
+   && [ "$(jget "$PLAN20" '.plan[0].severity')" = "high" ] \
+   && [ "$(jget "$PLAN20" '.plan[0].action')" = "WOULD: fix + GATE + PR (via issue-loop run-once)" ]; then
+  ok "plan (read-only dry-run) shows the seeker-filed issue reaching the fixer: $(jget "$PLAN20" '.plan[0].issue') severity=high action=fix+GATE+PR"
+else
+  bad "plan did not route the seeker issue to the fixer: $PLAN20"
+fi
+
 echo
 echo "════════════════════════════════════════════════════════════════════════════"
 printf "maintain-loop: \033[32m%d passed\033[0m, " "$PASS"
@@ -752,4 +869,4 @@ if [ "$FAIL" -gt 0 ]; then
   exit 1
 fi
 printf "%d failed\n" "$FAIL"
-echo "ALL GREEN — budget-cap can't-burn-tokens · stop-guards · checkpoint · heartbeat · resume · disabled · approval-park · explicit-rr-authz · env-override · fresh-home-budget · fail-closed-after-usage · cloud-clone-workspace · workstation-parity · slug-traversal-refused · github-ingest · sync-error-loud · idempotent-resync · no-issues-empty-queue"
+echo "ALL GREEN — budget-cap can't-burn-tokens · stop-guards · checkpoint · heartbeat · resume · disabled · approval-park · explicit-rr-authz · env-override · fresh-home-budget · fail-closed-after-usage · cloud-clone-workspace · workstation-parity · slug-traversal-refused · github-ingest · sync-error-loud · idempotent-resync · no-issues-empty-queue · seeker-label-contract"

@@ -807,6 +807,11 @@ STOP_QUEUE_SYNC = "queue-sync-error"  # GitHub issue-list failed — LOUD, not s
 
 # The GitHub label that marks an issue as maintainer-owned work. Only OPEN issues
 # carrying this label are ingested into the queue (the maintainer's inbox).
+# agents/seeker.md's `gh issue create` always includes this label alongside
+# `bug,seeker` specifically so its own issues satisfy this filter (gh's real
+# `--label` match is a SUPERSET/AND — every requested label must be present).
+# See test/heimdall-maintain-loop.test.sh's "(20) SEEKER CONTRACT" section for
+# the falsifiable proof of that contract.
 DEFAULT_MAINTAINER_LABEL = "maintainer"
 DEFAULT_ISSUE_SYNC_LIMIT = 50
 

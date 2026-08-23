@@ -16,20 +16,31 @@ Two-phase maintenance: **seek** then **fix**.
 
 ## Connectors — GitHub issues are the DEFAULT trigger
 
-The queue is connector-fed. **GitHub issues are the default connector and trigger**:
-`issue_queue` already normalizes them into the queue that the fixer drains. Every
-other source is an *additional* connector that files issues into the SAME queue —
-they do not replace GitHub issues, they feed alongside them:
+The queue is connector-fed. **GitHub issues are the default connector and
+trigger.** Two separate consumers drain them, each with its own discovery
+mechanism — keep them straight:
 
-- **GitHub issues** (default) — a human or a bot opens an issue; it is normalized
-  and picked by the loop. This is the primary path.
+- **This file's own Phase 2 fixer** scans `gh issue list --label bug --state
+  open` directly (see Phase 2 below) — no `issue_queue` Python machinery is
+  involved in that path.
+- **The durable autopilot engine** (`/hmd:maintain-check` →
+  `bin/lib/maintain_loop.py`) is where `issue_queue` actually normalizes GitHub
+  issues into a severity/dedup/approval-gated queue, and it ingests ONLY OPEN
+  issues labeled `maintainer` (`DEFAULT_MAINTAINER_LABEL`).
+
+Every other source is an *additional* connector that files into the SAME GitHub
+issue tracker — they do not replace GitHub issues, they feed alongside them:
+
+- **GitHub issues** (default) — a human or a bot opens an issue; either
+  consumer above can pick it up, depending on its labels.
 - **k8s / gcloud / Sentry logs** (additional) — the seeker pulls logs, finds
-  errors, and FILES them as issues into the same queue (labeled `bug,seeker`).
-  The log-based seeker is one pluggable connector, not the only entry point.
+  errors, and FILES them as issues (labeled `bug,seeker,maintainer` — see
+  `agents/seeker.md`) so BOTH consumers above can reach them. The log-based
+  seeker is one pluggable connector, not the only entry point.
 
 Connectors stay pluggable: adding or removing a log source never orphans the
-others, and the fixer path downstream is identical regardless of which connector
-filed the issue.
+others, and each consumer's downstream path is identical regardless of which
+connector filed the issue.
 
 ## Phase 1: Seek
 
@@ -37,14 +48,19 @@ Spawn a **seeker agent** (the log-based connector) to:
 1. Pull logs from Kubernetes pods (or local logs, docker, cloud)
 2. Analyze for errors, crashes, anomalies
 3. Deduplicate by stack trace signature
-4. File GitHub issues with full context (labeled "bug,seeker") — into the same
-   queue that human-opened GitHub issues land in.
+4. File GitHub issues with full context (labeled `bug,seeker,maintainer` — see
+   `agents/seeker.md`) — into the same GitHub issue tracker that human-opened
+   issues land in. The `maintainer` label is what lets the durable autopilot
+   engine (`/hmd:maintain-check`) ingest these too, not just this file's own
+   Phase 2 fixer below.
 
 ## Phase 2: Fix
 
 Spawn a **fixer agent** to:
-1. Pick open issues from the queue (default connector: `gh issue list --label bug
-   --state open`, normalized by `issue_queue`).
+1. Pick open issues via `gh issue list --label bug --state open` directly —
+   this one-shot fixer does its own discovery. (`issue_queue` is the durable
+   autopilot engine's mechanism, not this prose pipeline's — see Connectors
+   above.)
 2. For each issue (oldest first):
    - Create a `heimdall/*` fix branch from main
    - Implement the minimal fix
