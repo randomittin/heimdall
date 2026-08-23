@@ -129,6 +129,15 @@ magick "$WORK/content.png" -background none -gravity center \
   "$HERE/hmd-logo-eye-h-mark.png" \
   || die "mark canvas extend failed" 3
 
+# ---- 6c. the dark-mode counterpart: same crop geometry, near-white fill ----------
+composite_fill "$BRAND_COLOR_DARK_BG" "$WORK/transparent-dark-bg.png"
+magick "$WORK/transparent-dark-bg.png" -crop "$TRIM_GEOM" +repage "$WORK/content-dark-bg.png" \
+  || die "dark-bg content crop failed" 3
+magick "$WORK/content-dark-bg.png" -background none -gravity center \
+  -extent "$((CONTENT_W + 2*PAD_X))x$((CONTENT_H + 2*PAD_Y))" -strip \
+  "$HERE/hmd-logo-eye-h-mark-dark-bg.png" \
+  || die "dark-bg mark canvas extend failed" 3
+
 # ---- 7. build the .iconset at every size macOS expects, then compile the .icns ---
 ICONSET="$WORK/hmd.iconset"
 mkdir -p "$ICONSET"
@@ -155,3 +164,4 @@ echo "  $HERE/hmd-logo-eye-h-transparent.png"
 echo "  $HERE/hmd-logo-eye-h-square.png"
 echo "  $HERE/hmd-logo-eye-h.icns"
 echo "  $HERE/hmd-logo-eye-h-mark.png"
+echo "  $HERE/hmd-logo-eye-h-mark-dark-bg.png"

@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="launch-docs/assets/hmd-logo-eye-h-mark-dark-bg.png">
+    <img src="launch-docs/assets/hmd-logo-eye-h-mark.png" alt="Heimdall — a watchman's eye with an H at its center" height="72">
+  </picture>
+</p>
+
 # Heimdall 🛡️
 
 **Every PR ships the runnable evidence that the fix passes.**
