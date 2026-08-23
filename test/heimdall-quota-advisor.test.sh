@@ -191,21 +191,27 @@ echo "== section 7: tier headroom is LIVE data when available, honest fallback o
 REPO_NODATA="$WORK/repo-nodata"; mkdir -p "$REPO_NODATA/.planning"
 out_nodata="$(cd "$REPO_NODATA" && "$CLI" check --text "$MSG_6PM")"
 if printf '%s' "$out_nodata" | grep -q "This repo already defaults coding work to sonnet"; then
-  ok "no tier-declarations log -> honest static fallback line (not a fabricated percentage)"
+  ok "no metrics.jsonl -> honest static fallback line (not a fabricated live percentage)"
 else
   bad "expected the fallback tier line with no log present — got: $out_nodata"
+fi
+if printf '%s' "$out_nodata" | grep -q "2026-08-23-omniroute-assessment.md"; then
+  ok "fallback cites the doc the historical 86%/14% figure actually came from"
+else
+  bad "fallback should cite the assessment doc for its historical figure — got: $out_nodata"
 fi
 
 REPO_DATA="$WORK/repo-data"; mkdir -p "$REPO_DATA/.planning"
 {
-  echo '{"class":"code","declared_tier":"sonnet"}'
-  echo '{"class":"code","declared_tier":"sonnet"}'
-  echo '{"class":"code","declared_tier":"sonnet"}'
-  echo '{"class":"review","declared_tier":"opus"}'
-} > "$REPO_DATA/.planning/tier-declarations.jsonl"
+  echo '{"ts":"2026-08-24T00:00:00Z","metric":"task","schema":1,"task_type":"code","model":"sonnet","effort":"default","outcome":"pass","final":"pass","retries":0,"escalated_to":null,"wall_secs":10,"source":"cli","session":"t1"}'
+  echo '{"ts":"2026-08-24T00:01:00Z","metric":"task","schema":1,"task_type":"code","model":"sonnet","effort":"default","outcome":"pass","final":"pass","retries":0,"escalated_to":null,"wall_secs":10,"source":"cli","session":"t1"}'
+  echo '{"ts":"2026-08-24T00:02:00Z","metric":"task","schema":1,"task_type":"code","model":"sonnet","effort":"default","outcome":"pass","final":"pass","retries":0,"escalated_to":null,"wall_secs":10,"source":"cli","session":"t1"}'
+  echo '{"ts":"2026-08-24T00:03:00Z","metric":"task","schema":1,"task_type":"review","model":"opus","effort":"default","outcome":"pass","final":"pass","retries":0,"escalated_to":null,"wall_secs":10,"source":"cli","session":"t1"}'
+  echo '{"ts":"2026-08-24T00:04:00Z","metric":"parallelism","schema":1,"agents":3}'
+} > "$REPO_DATA/.planning/metrics.jsonl"
 out_data="$(cd "$REPO_DATA" && "$CLI" check --text "$MSG_6PM")"
-if printf '%s' "$out_data" | grep -q "already runs 75% of 4 recorded tier declarations on sonnet"; then
-  ok "tier-declarations log present -> LIVE computed percentage (75% of 4), not a hardcoded number"
+if printf '%s' "$out_data" | grep -q "already runs 75% of 4 recorded task records on sonnet"; then
+  ok "metrics.jsonl present -> LIVE 75% of 4 task records (the 5th, non-task parallelism record correctly excluded)"
 else
   bad "expected a live 75%-of-4 computation — got: $out_data"
 fi
