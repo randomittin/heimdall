@@ -54,6 +54,17 @@ esac
 EOF
 chmod +x "$WORK/sysmon-fake"
 
+# a FAKE dead-code advisor: bin/heimdall-cleanup's do_advise() fires heimdall-deadcode
+# --advise unconditionally (outside the memory gate — CODE and RAM are independent axes),
+# so a real, dirty repo's dead-code findings would otherwise leak into what must be silent,
+# healthy-machine output. A clean audit prints nothing and exits 0 — this fixture mirrors
+# exactly that "nothing to report" state via the HMD_CLEANUP_DEADCODE seam.
+cat > "$WORK/deadcode-fake" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod +x "$WORK/deadcode-fake"
+
 # gc roots: EMPTY, so hmd-reclaimable is ~0MB (the "tiny hmd footprint" the message cites).
 GTMP="$WORK/gctmp-empty"; GVER="$WORK/versions-none"; mkdir -p "$GTMP"
 : > "$WORK/killed"
@@ -82,6 +93,7 @@ run_clean() {
   local json="$1" orphans="$2"; shift 2
   HMD_CLEANUP_OS=Darwin HMD_CLEANUP_SYSMON="$WORK/sysmon-fake" \
   HMD_CLEANUP_KILL_CMD="$WORK/kill-stub" \
+  HMD_CLEANUP_DEADCODE="$WORK/deadcode-fake" \
   SYSMON_JSON="$json" SYSMON_ORPHANS="$orphans" \
   HMD_GC_TMP_ROOTS="$GTMP" HMD_GC_TEMP_TTL_MIN=99999 HMD_GC_CC_VERSIONS="$GVER" \
   HEIMDALL_HOME="$WORK/home-empty" \
