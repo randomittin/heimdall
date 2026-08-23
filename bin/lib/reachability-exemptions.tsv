@@ -53,9 +53,6 @@ heimdall-queue-mcp	2026-11-08	KNOWN GAP — MCP stdio server NOT registered in .
 heimdall-registry-hygiene	2026-11-08	KNOWN GAP — self-described MONTHLY job with no in-repo scheduler (no cron, LaunchAgent or workflow calls it)
 heimdall-ast	2026-11-08	KNOWN GAP — thin CLI over the tree-sitter AST substrate (symbols/refs extraction); tested (test/treesitter-ast.test.sh drives it directly) and named in docs/analysis/token-efficiency-field-review.md as a built capability agent orientation should read through instead of whole-file Reads, but no agent prompt or dispatch path invokes it yet.
 heimdall-checkpoint-share	2026-11-08	KNOWN GAP — Shared Team Checkpoints (TEAM MODE P4) CLI: publish/read/roster/precheck/resume; no live entry point invokes it, and evals/oracles/team-checkpoint/COVERAGE.md cites a test/heimdall-checkpoint-share.test.sh that does not exist in this repo (verified via `git ls-files`). Team-mode plumbing awaiting its trigger.
-heimdall-drain	2026-11-08	KNOWN GAP — LOCAL work-queue drainer wired for real to agent-pool, heimdall-queue, session-fork and the attestation seam (see its own header); no cron, hook or dispatcher arm triggers it. heimdall-queue's only path in the graph is through this file.
-heimdall-issue-config	2026-11-08	KNOWN GAP — /hmd:maintain issue-loop plumbing, piece (e): config + credential handling. The whole composition (seeker/fixer agents plus heimdall-issue-queue and this file) is unwired together, not an isolated gap — see docs/analysis/2026-08-22-capability-census.md:176.
-heimdall-issue-queue	2026-11-08	KNOWN GAP — /hmd:maintain issue-loop plumbing, piece (b): normalize/ingest/list/pick/status/release. Heaviest test investment of any orphan in the 2026-08-22 capability census (7 test files exercise it directly), but no live trigger composes the loop end-to-end.
 heimdall-md	2026-11-08	KNOWN GAP — document-to-markdown converter "for context building" (own header); tested (test/markitdown.test.sh), degrades cleanly when markitdown is absent, but nothing in the live graph calls it yet.
 heimdall-watch	2026-11-08	KNOWN GAP — H-3 sentinel watch-mode: runs sanity/security/doc-sync sentinels on human commits via heimdall-spawn. Its own header states the intended wiring explicitly ("wire it as a pre-push hook to make security blocking") and that hook was never added. Not an accidental naming collision — bin/heimdall's watch) arm execs heimdall-watch-tui on purpose (bin/heimdall:2275), and bin/heimdall:2270, bin/heimdall-drain:3 and bin/heimdall-watch-tui:4 each separately document the two are distinct tools.
 #
@@ -78,9 +75,17 @@ heimdall-vm-bench	2026-09-07	DEAD — named only by its own bin/lib/vm_bench.py.
 # ── DEAD — the 2026-08-22 comment-stripping + dispatcher-hop-ceiling audit ───────
 # Found after bin/lib/reachability.sh stopped counting comment-only mentions as
 # invocation edges and stopped crediting bin/heimdall's dispatch table with LIVE
-# status for hops it merely selects at runtime. Both are two-corpse chains: each
-# name's only real (non-comment) caller is itself unreachable, recorded above as
-# a KNOWN GAP rather than DEAD because ITS OWN header states a concrete integration
-# plan; the chain's tail here has none of its own.
-heimdall-queue	2026-09-21	DEAD — LOCAL work-queue CLI (add/pick/complete/fail/reap/status/serve); reachable only via bin/heimdall-drain (recorded above as KNOWN GAP), which nothing yet triggers. Same two-corpse shape as heimdall-cost-report/heimdall-cost-model-refresh above.
+# status for hops it merely selects at runtime. heimdall-spawn below is a
+# two-corpse chain: its only real (non-comment) caller is itself unreachable,
+# recorded above as a KNOWN GAP rather than DEAD because ITS OWN header states a
+# concrete integration plan; the chain's tail here has none of its own.
+#
+# heimdall-queue was a second instance of the same shape, listed here alongside
+# heimdall-spawn, until 2026-08-23: the `hmd queue` dispatcher arm gave
+# bin/heimdall a real, non-comment exec path into both it and bin/heimdall-drain
+# (verified via `heimdall-deadcode --why heimdall-queue` / `--why heimdall-drain`
+# before deleting, per this file's own re-verify-before-deleting rule above, not
+# assumed from the commit message alone). That row, heimdall-drain's KNOWN GAP row
+# above, and the two heimdall-issue-* KNOWN GAP rows above (independently made
+# REACHABLE the same day via the new commands/maintain-check.md) are gone.
 heimdall-spawn	2026-09-21	DEAD — Background Spawn Framework orchestrator (spec H-3); its one real (non-comment) caller is bin/heimdall-watch (recorded above as KNOWN GAP — see that row for its own stated integration plan), which nothing yet triggers.
