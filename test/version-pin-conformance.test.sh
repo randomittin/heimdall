@@ -319,6 +319,32 @@ untracked_in_docs_analysis() {
   esac
 }
 
+# ── ISO-dated docs/analysis/ files: quoted evidence, same rule as a DATED_DIRS changelog ──────
+# The untracked check above does not cover every legitimate case: this repo also commits
+# docs/analysis/ point-in-time audit reports ON PURPOSE (four-state census, cross-cli audits,
+# ...), and some of those carry an ISO date in their OWN basename — same shape DATED_DIRS
+# already trusts (section 2 below). A dated report QUOTES the version it ran against as of
+# that date; it does not CLAIM today's. Marking it would make bin/heimdall-render-version
+# overwrite that historical fact at the next bump, forging the finding it quoted — exactly the
+# damage the ARCHIVE_DIRS comment above documents for a rendered changelog quote. Real-world
+# trigger: docs/analysis/2026-08-22-capability-census.md:2, "**Version:** v2.4.0", a fact about
+# the day of the audit, tracked in git same as any other committed analysis report.
+#
+# Filename-scoped, not directory-wide (SCAFFOLDING_DIRS overshoot risk, same as ARCHIVE_DIRS'
+# reasoning), and using the exact basename-date glob the ARCHIVE integrity check below already
+# uses, so an UNDATED tracked file (docs/analysis/INDEX.md) is untouched and still gated.
+dated_in_docs_analysis() {
+  local rel="$1"
+  case "$rel" in
+    docs/analysis/*) ;;
+    *) return 1 ;;
+  esac
+  case "${rel##*/}" in
+    *[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # sweep_root <root> <label> — print records for every published file under <root>. Relative
 # paths are emitted so records are stable across the real tree and a throwaway copy.
 sweep_root() {
@@ -595,6 +621,16 @@ VOID
   printf '\nInstall the %s release from the mirror.\n' "$SELF_TAG" >> "$TMP/docs/analysis/INDEX.md"
   assert_red "a hand-typed tag added to an already-TRACKED docs/analysis/ file" "UNMARKED"
 
+  # Mutant 19 — an ISO-dated docs/analysis/ file is quoted evidence EVEN WHEN TRACKED (unlike
+  # Mutant 18's undated INDEX.md). Proven on an EXISTING already-tracked dated fixture, not a
+  # freshly created one, so this cannot be satisfied by Mutant 17's untracked-scratch-space
+  # exemption by accident — this is the dated_in_docs_analysis() branch, and only that branch.
+  fresh_copy
+  [ -f "$TMP/docs/analysis/2026-08-19-parallel-session-resource-audit.md" ] \
+    || { echo "  ✗ SELF-TEST FAILED: fixture assumption broken — the dated docs/analysis/ fixture is no longer tracked" >&2; exit 1; }
+  printf '\nHeimdall %s is current.\n' "$SELF_VER" >> "$TMP/docs/analysis/2026-08-19-parallel-session-resource-audit.md"
+  assert_green "an unmarked current-version mention added to an ISO-dated, already-TRACKED docs/analysis/ file"
+
   echo "version-pin-conformance --self-test: PASS"
   exit 0
 fi
@@ -730,6 +766,14 @@ UNMARKED=0
 while IFS='|' read -r kind loc lineno found reason text; do
   [ "$kind" = "BAD" ] || continue
   if [ "$STRUCT_OK" -eq 1 ] && structurally_owned "$loc" "$text"; then continue; fi
+  # A dated docs/analysis/ file's mention is quoted evidence, not a live claim (see
+  # dated_in_docs_analysis() above) -- suppressed HERE, at the BAD-record verdict, not by
+  # skipping the file from sweep_root entirely, so the file's OTHER pins (if any are
+  # correctly MARKED) still show up as OK/MARK records and stay under this gate's watch.
+  # A sweep-level skip was tried and reverted: it hid two files that already carry
+  # legitimate HEIMDALL:PIN markers (2026-08-04-hn-red-team.md, 2026-08-05-dream-capability.md)
+  # from the sweep ENTIRELY, which is a coverage regression, not an exemption.
+  if [ "${loc#repo:}" != "$loc" ] && dated_in_docs_analysis "${loc#repo:}"; then continue; fi
   bad "hand-typed version pin at $loc:$lineno [$reason, tokens: ${found%,}] — nothing renders it, so it silently rots at the next bump. Mark it (HEIMDALL:PIN:TAG / :VERSION / :SHA256) so bin/heimdall-render-version rewrites it from plugin.json"
   UNMARKED=$((UNMARKED+1))
 done <<BADREC

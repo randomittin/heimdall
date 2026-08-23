@@ -331,12 +331,18 @@ echo "6. badge-rendered: no server-side signal exists, and none was invented"
 #     both shapes). The file MUST exist -- a missing file makes `! grep` succeed, which would
 #     turn a deleted badge into a silent PASS.
 EGRESS_RX='urllib\.request|urlopen|http\.client|httplib|requests\.(get|post|put|request)|socket\.(socket|create_connection)|subprocess.*curl|(^|[;&|(){}`]|\$\()[[:space:]]*((if|then|else|elif|do|while|until|!|sudo|env|exec|command|nohup|time|xargs)[[:space:]]+)*curl([[:space:]]|$)'
+# FULL-LINE comments are blanked before the scan -- same idiom, same reason, as
+# test/cp-funnel.test.sh's egress_scan(): a line whose first non-blank character is `#` cannot
+# execute anything in either shell or python, so bin/heimdall-badge's own "LIVE-ENDPOINT
+# HONESTY" comment (which quotes the `curl -sIL ...` that proved the 404, backtick and all) is
+# a mention, not egress. Scoped to WHOLE-comment lines only, so a live curl trailed by its own
+# `# comment` on the same line still trips this.
 if [ ! -f "$REPO/bin/heimdall-badge" ]; then
   bad "6a bin/heimdall-badge is MISSING -- the no-egress scan covered nothing"
-elif ! grep -qE "$EGRESS_RX" "$REPO/bin/heimdall-badge"; then
-  ok "6a bin/heimdall-badge has ZERO outbound primitives -- a badge render is invisible to the server, so no lawful stamp for it can exist"
-else
+elif sed 's/^[[:space:]]*#.*$//' "$REPO/bin/heimdall-badge" 2>/dev/null | grep -qE "$EGRESS_RX"; then
   bad "6a heimdall-badge gained a network call -- a badge-render beacon BREAKS IDENTITY.md:32-38"
+else
+  ok "6a bin/heimdall-badge has ZERO outbound primitives -- a badge render is invisible to the server, so no lawful stamp for it can exist"
 fi
 
 # 6b no funnel family for it was invented (inventing one would require new client egress).
