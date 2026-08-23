@@ -1183,43 +1183,6 @@ _keeper_loop() {
   return 0
 }
 
-# _sandbox_home — true when $HOME resolves under an OS temp root ($TMPDIR, /tmp, /var/tmp,
-# their macOS /private/* real paths, and macOS's per-user Darwin temp root — mktemp -d's own
-# territory). EXISTS BECAUSE: a hermetic install (`env -i HOME="$(mktemp -d)" ... install.sh`)
-# reaches the doctor auto-launch below through a REAL SessionStart hook fired by
-# heimdall-doctor-install's headless `claude --cc-verify` probe (install.sh §5a) — a genuine,
-# correct hook firing, NOT a test stubbing keeper-start directly. `env -i` wipes every env var
-# the harness does not explicitly re-list, so the usual test-only escape hatch (a NEW env-var
-# seam) can never reach this deep without editing that harness's allowlist — confirmed
-# empty-handed (the cc-verify probe itself sets no marker either). $HOME is therefore the only
-# signal left standing: the harness MUST set it for the sandbox to mean anything at all, so
-# unlike an added env var it can never simply go missing.
-#
-# CAUGHT LIVE (test/install-stranger.test.sh's real run_install(), post-first-fix): `env -i`
-# ALSO wipes $TMPDIR, and on macOS `mktemp -d` roots its output under the per-user Darwin temp
-# dir (/var/folders/<xx>/<hash>/T/tmp.XXXXXXXX) — a path that is neither /tmp nor /var/tmp, so
-# with $TMPDIR gone the plain path list above never recognizes it and the guard silently does
-# not fire for exactly the real trigger it exists to catch (confirmed: a real install-stranger
-# run leaked 2 live doctors after the first fix landed). `getconf DARWIN_USER_TEMP_DIR` reads
-# that same root via confstr(3) — keyed off the real uid, not an env lookup — so it survives
-# `env -i` intact and needs no cooperation from the wiped environment. Harmless elsewhere:
-# non-macOS (or a stripped-down PATH missing `getconf`) just yields an empty candidate, which
-# the loop below already skips.
-_sandbox_home() {
-  [ -n "${HOME:-}" ] || return 1
-  local h rt t darwin_tmp
-  h="$(cd "$HOME" 2>/dev/null && pwd -P)" || h="$HOME"
-  darwin_tmp="$(command -v getconf >/dev/null 2>&1 && getconf DARWIN_USER_TEMP_DIR 2>/dev/null)"
-  for t in "${TMPDIR:-}" /tmp /var/tmp /private/tmp /private/var/tmp "$darwin_tmp"; do
-    [ -n "$t" ] || continue
-    t="${t%/}"
-    rt="$(cd "$t" 2>/dev/null && pwd -P)" || rt="$t"
-    [ -n "$rt" ] || continue
-    case "$h" in "$rt"|"$rt"/*) return 0 ;; esac
-  done
-  return 1
-}
-
 # keeper-start: consent-gated, idempotent, detached spawn of ONE keeper for this session.
 _keeper_start() {
   # CONSENT OFF -> NO keeper. Mirror `off`: a best-effort retire so we are not on the wall,
@@ -1265,25 +1228,53 @@ _keeper_start() {
   # interpreter, stale throttle, enroll, roster) until presence is HEALTHY, then quiesces.
   # REUSES this already-SessionStart-wired keeper-start path (no new hooks.json edit). The
   # doctor is its OWN detached process (nohup+disown) so it outlives + runs independent of the
-  # keeper loop. SKIPPED under the keeper's beat-injection test seam (HMD_KEEPER_BEAT_BIN), an
-  # explicit HMD_DOCTOR_DISABLE, and (below) a sandbox-shaped $HOME — so hermetic tests never
-  # trigger the doctor's real network AND a throwaway sandbox HOME never gets a detached
-  # process that outlives the very directory it was born in.
+  # keeper loop. SKIPPED under the keeper's beat-injection test seam (HMD_KEEPER_BEAT_BIN) and
+  # an explicit HMD_DOCTOR_DISABLE, so hermetic tests never trigger the doctor's real network.
+  # SANDBOX GUARD. A HOME under a system temp root means this is a sandboxed
+  # install (the hermetic suites run install.sh under `env -i HOME="$(mktemp -d)"`).
+  # The sandbox is deleted when the test ends; a detached doctor is NOT, and it
+  # lives HMD_DOCTOR_MAX_SECONDS (1800) longer as an orphan. Its singleton lock is
+  # per-project and every temp HOME is a distinct project, so the lock never dedupes
+  # them: measured 32 live orphans at load 6.23 on a 10-core box, which then tripped
+  # the suites' own wall-clock watchdogs and made passing code report as hung.
+  #
+  # Why not the HMD_DOCTOR_DISABLE seam directly above: `env -i` strips every parent
+  # variable, so the harness CANNOT hand that flag to the install it launches. The
+  # existing seam still works for a caller that controls the environment; it simply
+  # cannot reach this path. That is why this guard is intrinsic and path-based rather
+  # than another opt-out variable.
+  #
+  # Path-sniffing infers intent from a string, which is a real limitation: a user
+  # whose HOME genuinely lives under a temp root loses the self-healing doctor. That
+  # is the deliberate trade — a rare degraded install beats a guaranteed process leak
+  # on every test run — and HMD_DOCTOR_ALLOW_TMP_HOME=1 exists for anyone (or any
+  # future test asserting the spawn) who needs to override it explicitly.
+  #
+  # Considered and rejected: `getconf DARWIN_USER_TEMP_DIR`. It reads this same Darwin
+  # per-user temp root through confstr(3) — a syscall keyed off the real uid, not an
+  # env lookup — so on its own it would survive env -i where a $TMPDIR-only check does
+  # not. But this function runs on a SessionStart hot path (this session's own startup
+  # got measurably faster by cutting work off it) and getconf is an external subprocess
+  # that would fire on EVERY call regardless of whether HOME is ever sandboxed, to learn
+  # a path the glob below already matches for free. It also buys nothing on Linux (no
+  # DARWIN_USER_TEMP_DIR to query there), and /var/folders/*/T/* has been Darwin's fixed
+  # per-user temp layout since it replaced bare /tmp, so a literal pattern is not chasing
+  # a moving target. Verdict: the glob stays; getconf was evaluated, not overlooked.
+  # /var/tmp/* and /private/var/tmp/* are matched for the same reason /private/tmp/* is
+  # (some shells/CI runners default TMPDIR there instead of /tmp) — one more `case` arm,
+  # still zero subprocesses either way.
+  case "${HOME:-}" in
+    /tmp/*|/private/tmp/*|/var/tmp/*|/private/var/tmp/*|/var/folders/*/T/*)
+      if [ -z "${HMD_DOCTOR_ALLOW_TMP_HOME:-}" ]; then
+        [ -n "${HMD_DEBUG:-}" ] && printf 'heimdall-presence: doctor spawn skipped, HOME is under a temp root (%s)\n' "${HOME:-}" >&2
+        return 0
+      fi
+      ;;
+  esac
   DOCTOR_BIN="$SELF_DIR/heimdall-presence-doctor"
   if [ -x "$DOCTOR_BIN" ] && [ -z "${HMD_KEEPER_BEAT_BIN:-}" ] && [ -z "${HMD_DOCTOR_DISABLE:-}" ]; then
-    # SANDBOX GUARD: $HOME under a temp root (mktemp -d) means something is going to rm -rf it
-    # the moment ITS OWN run ends — a hermetic install harness, most commonly (see
-    # test/install-stranger.test.sh -> install.sh §5a -> heimdall-doctor-install --cc-verify ->
-    # the real SessionStart hook -> here). A detached doctor (up to HMD_DOCTOR_MAX_SECONDS,
-    # default 1800s) has no way to know that on its own, so it outlives its own HOME and
-    # orphans. Observable on purpose (not a silent no-op) — it can only ever print in this one
-    # narrow case, since a real dev's $HOME is never rooted under a temp dir.
-    if _sandbox_home; then
-      printf 'presence keeper: self-heal doctor NOT auto-launched (HOME=%s is a sandbox temp dir)\n' "$HOME"
-    else
-      nohup "$DOCTOR_BIN" --bg </dev/null >/dev/null 2>&1 &
-      disown 2>/dev/null || true
-    fi
+    nohup "$DOCTOR_BIN" --bg </dev/null >/dev/null 2>&1 &
+    disown 2>/dev/null || true
   fi
   return 0
 }

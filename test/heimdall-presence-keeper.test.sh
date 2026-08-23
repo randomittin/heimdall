@@ -239,10 +239,12 @@ NPIDS="$(ls "$HEIMDALL_KEEPER_DIR"/acme_widget__D.pid 2>/dev/null | wc -l | tr -
 #    moment the caller — e.g. a hermetic install harness — exits) must NOT receive
 #    the auto-launched self-heal doctor (nohup+disown, up to HMD_DOCTOR_MAX_SECONDS
 #    of life on its own) or it orphans; a real-shaped $HOME still gets it, unchanged
-#    (proves real dev use is unaffected by the guard).
+#    (proves real dev use is unaffected by the guard). E1/E2 exercise it under plain
+#    `env` (TMPDIR inherited); E3 exercises it under `env -i` (TMPDIR wiped) — the
+#    exact shape of install-stranger.test.sh's real trigger.
 # ══════════════════════════════════════════════════════════════════════════════
 echo
-echo "E. sandbox-shaped HOME suppresses the doctor auto-launch; real-shaped HOME still gets it"
+echo "E. sandbox-shaped HOME suppresses the doctor auto-launch; real-shaped HOME still gets it (plain env and env -i both)"
 
 # Both E cases clear the pre-existing '$URL not connected' gate WITHOUT
 # HMD_KEEPER_BEAT_BIN (that seam already suppresses the doctor launch on its OWN
@@ -311,8 +313,10 @@ rm -rf "$E2_HOME"; E2_HOME=""
 # /var/tmp — so a $TMPDIR-only check misses it once $TMPDIR itself is gone. This is the exact
 # case that leaked in production: a real install-stranger run left 2 live doctors after the
 # first (TMPDIR-only) guard landed, because it drives keeper-start through env -i, not plain
-# env. getconf DARWIN_USER_TEMP_DIR (env-independent — confstr(3), keyed off the real uid) is
-# what closes it; this section is what proves that closure, not just the fix in isolation.
+# env. The landed guard closes it by matching the literal /var/folders/*/T/* path shape in a
+# `case` — env-independent not because it calls out to the OS, but because it never reads an
+# environment variable at all, only $HOME's own value, and env -i cannot strip the one variable
+# it is busy setting. This section proves that closure end-to-end, not just the match in isolation.
 E3_HOME="$(mktemp -d)"; mkdir -p "$E3_HOME/.heimdall"
 E3_DOCDIR="$E3_HOME/.heimdall/doctor"
 env -i HOME="$E3_HOME" TERM="dumb" PATH="$PATH" \
