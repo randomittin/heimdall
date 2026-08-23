@@ -1249,8 +1249,22 @@ _keeper_start() {
   # is the deliberate trade — a rare degraded install beats a guaranteed process leak
   # on every test run — and HMD_DOCTOR_ALLOW_TMP_HOME=1 exists for anyone (or any
   # future test asserting the spawn) who needs to override it explicitly.
+  #
+  # Considered and rejected: `getconf DARWIN_USER_TEMP_DIR`. It reads this same Darwin
+  # per-user temp root through confstr(3) — a syscall keyed off the real uid, not an
+  # env lookup — so on its own it would survive env -i where a $TMPDIR-only check does
+  # not. But this function runs on a SessionStart hot path (this session's own startup
+  # got measurably faster by cutting work off it) and getconf is an external subprocess
+  # that would fire on EVERY call regardless of whether HOME is ever sandboxed, to learn
+  # a path the glob below already matches for free. It also buys nothing on Linux (no
+  # DARWIN_USER_TEMP_DIR to query there), and /var/folders/*/T/* has been Darwin's fixed
+  # per-user temp layout since it replaced bare /tmp, so a literal pattern is not chasing
+  # a moving target. Verdict: the glob stays; getconf was evaluated, not overlooked.
+  # /var/tmp/* and /private/var/tmp/* are matched for the same reason /private/tmp/* is
+  # (some shells/CI runners default TMPDIR there instead of /tmp) — one more `case` arm,
+  # still zero subprocesses either way.
   case "${HOME:-}" in
-    /tmp/*|/private/tmp/*|/var/folders/*/T/*)
+    /tmp/*|/private/tmp/*|/var/tmp/*|/private/var/tmp/*|/var/folders/*/T/*)
       if [ -z "${HMD_DOCTOR_ALLOW_TMP_HOME:-}" ]; then
         [ -n "${HMD_DEBUG:-}" ] && printf 'heimdall-presence: doctor spawn skipped, HOME is under a temp root (%s)\n' "${HOME:-}" >&2
         return 0
