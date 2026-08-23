@@ -38,9 +38,17 @@ Pull logs from pods, analyze, raise issues on GitHub.
    gh issue create \
      --title "[seeker] <error type>: <brief description>" \
      --body "<structured body>" \
-     --label "bug,seeker"
+     --label "bug,seeker,maintainer"
    ```
-   
+   The `maintainer` label is required, not decorative: the durable autopilot
+   engine's GitHub ingest (`sync_queue_from_github` in
+   `bin/lib/maintain_loop.py`) only ingests OPEN issues carrying that exact
+   label (`DEFAULT_MAINTAINER_LABEL`). gh's real `--label` filter is a
+   SUPERSET/AND match (an issue must carry EVERY requested label), so dropping
+   this label silently disconnects seeker's issues from that engine again.
+   `bug` and `seeker` stay too — `bug` sets severity via `_github_severity`,
+   `seeker` is this file's own dedup/re-check marker (see step 5 below).
+
    Issue body format:
    ```markdown
    ## Source

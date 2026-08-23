@@ -28,10 +28,15 @@ A **separate**, engine-driven autopilot (`/hmd:maintain-check`, backed by
 normalized, prioritized, multi-source queue (`bin/heimdall-issue-queue`, piece b
 of the issue-resolution-loop design) — but its own GitHub sync
 (`sync_queue_from_github` in `bin/lib/maintain_loop.py`) talks to `gh` directly
-too, filtered on label `maintainer`, not `bug,seeker`. **A seeker-filed issue is
-not automatically picked up by that engine** — see `commands/maintain-check.md`
-for the gap and the manual workaround. The two pipelines are independent; running
-this one does not feed the other.
+too, filtered on label `maintainer`. **The seeker now applies that label**
+(`bug,seeker,maintainer` — see `agents/seeker.md`), so a seeker-filed issue IS
+ingested by the engine. Until 2026-08-23 it was not: seeker filed `bug,seeker`
+and the engine requested `maintainer`, and `gh`'s `--label` filter is a
+superset/AND match rather than an OR, so the two sets never intersected and the
+seek-then-fix loop had never once run end to end.
+
+The two pipelines remain independent in every other respect — this prose one
+discovers via its own `gh issue list`, and running it does not drive the engine.
 
 ## Connectors — pluggable, but not in THIS pipeline
 
