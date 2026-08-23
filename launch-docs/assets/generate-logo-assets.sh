@@ -26,6 +26,11 @@
 #                                     future square placement
 #   hmd-logo-eye-h.icns              full multi-resolution icon set built from the square
 #                                     master via iconutil, for CFBundleIconFile use
+#   hmd-logo-eye-h-mark.png          content trimmed + a small uniform breathing-room
+#                                     margin (NOT padded to square) — the wide mark as-is,
+#                                     for a README header or anywhere the source's own
+#                                     3:2-ish aspect ratio should be kept rather than
+#                                     boxed into a square
 #
 # REQUIRES: macOS `sips` + `iconutil` (built in), ImageMagick `magick` (brew). Darwin only
 #   — the outputs are macOS icon artifacts and this script's own alpha-compositing and
