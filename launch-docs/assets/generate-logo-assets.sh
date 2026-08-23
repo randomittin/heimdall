@@ -28,9 +28,16 @@
 #                                     master via iconutil, for CFBundleIconFile use
 #   hmd-logo-eye-h-mark.png          content trimmed + a small uniform breathing-room
 #                                     margin (NOT padded to square) — the wide mark as-is,
-#                                     for a README header or anywhere the source's own
-#                                     3:2-ish aspect ratio should be kept rather than
-#                                     boxed into a square
+#                                     for a README header (light backgrounds) or anywhere
+#                                     the source's own 3:2-ish aspect ratio should be kept
+#                                     rather than boxed into a square
+#   hmd-logo-eye-h-mark-dark-bg.png  same crop/margin as the mark above, but filled with
+#                                     a light near-white tone instead of near-black — the
+#                                     near-black mark is close to invisible against a dark
+#                                     README theme (e.g. GitHub dark mode's near-black
+#                                     page background), so this is the
+#                                     prefers-color-scheme:dark counterpart, not a
+#                                     separate design
 #
 # REQUIRES: macOS `sips` + `iconutil` (built in), ImageMagick `magick` (brew). Darwin only
 #   — the outputs are macOS icon artifacts and this script's own alpha-compositing and
@@ -42,9 +49,11 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SRC="$HERE/hmd-logo-eye-h.png"
-BRAND_COLOR="#1a1f2b"     # near-black from the source line art
+BRAND_COLOR="#1a1f2b"     # near-black from the source line art — light backgrounds
+BRAND_COLOR_DARK_BG="#e6e8ec" # soft near-white — for the dark-mode README mark only
 ICON_CANVAS=1024          # square master / icns base resolution
 TRIM_FUZZ="2%"            # tolerance for treating near-white as background when trimming
+MARK_PAD_PCT=6            # breathing-room margin on the README-mark, as % of its own size
 
 die() { printf 'generate-logo-assets: %s\n' "$1" >&2; exit "${2:-2}"; }
 
@@ -64,20 +73,25 @@ echo "generate-logo-assets: source $SRC"
 magick "$SRC" -colorspace Gray -negate "$WORK/mask.png" \
   || die "mask generation failed" 3
 
-# ---- 2. solid brand-color fill, same canvas size ----------------------------------
-SRC_W="$(magick identify -format '%w' "$SRC")"
-SRC_H="$(magick identify -format '%h' "$SRC")"
-magick -size "${SRC_W}x${SRC_H}" "xc:$BRAND_COLOR" "$WORK/solid.png" \
-  || die "solid fill generation failed" 3
-
-# ---- 3. composite solid fill through the mask as the alpha channel ---------------
+# ---- 2/3. composite a solid fill through the mask as the alpha channel -----------
+# composite_fill <color> <outfile> — reused for the default (near-black, light-
+# background) render and, later, the dark-mode README mark's near-white render.
 # -strip drops ImageMagick's embedded date:create/date:modify/date:timestamp tEXt
 # chunks — without it, re-running this script produces a byte-different PNG every
 # time even though every pixel is identical, which is both noisy in git diffs and
 # leaks local generation timestamps into a shipped asset.
-magick "$WORK/solid.png" "$WORK/mask.png" -alpha off -compose CopyOpacity -composite \
-  -strip "$HERE/hmd-logo-eye-h-transparent.png" \
-  || die "alpha composite failed" 3
+SRC_W="$(magick identify -format '%w' "$SRC")"
+SRC_H="$(magick identify -format '%h' "$SRC")"
+composite_fill() {
+  local color="$1" outfile="$2"
+  magick -size "${SRC_W}x${SRC_H}" "xc:$color" "$WORK/solid-$$.png" \
+    || die "solid fill generation failed ($color)" 3
+  magick "$WORK/solid-$$.png" "$WORK/mask.png" -alpha off -compose CopyOpacity -composite \
+    -strip "$outfile" \
+    || die "alpha composite failed ($color)" 3
+  rm -f "$WORK/solid-$$.png"
+}
+composite_fill "$BRAND_COLOR" "$HERE/hmd-logo-eye-h-transparent.png"
 
 # ---- 4. find the content bounding box from the ALPHA channel, not RGB ------------
 # (RGB is a uniform brand-color fill everywhere; -trim on it would see one flat color
@@ -104,6 +118,17 @@ magick "$WORK/content.png" -background none -gravity center \
   -extent "${ICON_CANVAS}x${ICON_CANVAS}" -strip "$HERE/hmd-logo-eye-h-square.png" \
   || die "square canvas extend failed" 3
 
+# ---- 6b. the README/header mark: same content crop, small uniform margin, native
+#          aspect ratio kept (not boxed into a square) ----------------------------
+CONTENT_W="$(magick identify -format '%w' "$WORK/content.png")"
+CONTENT_H="$(magick identify -format '%h' "$WORK/content.png")"
+PAD_X=$(( CONTENT_W * MARK_PAD_PCT / 100 ))
+PAD_Y=$(( CONTENT_H * MARK_PAD_PCT / 100 ))
+magick "$WORK/content.png" -background none -gravity center \
+  -extent "$((CONTENT_W + 2*PAD_X))x$((CONTENT_H + 2*PAD_Y))" -strip \
+  "$HERE/hmd-logo-eye-h-mark.png" \
+  || die "mark canvas extend failed" 3
+
 # ---- 7. build the .iconset at every size macOS expects, then compile the .icns ---
 ICONSET="$WORK/hmd.iconset"
 mkdir -p "$ICONSET"
@@ -129,3 +154,4 @@ echo "generate-logo-assets: wrote"
 echo "  $HERE/hmd-logo-eye-h-transparent.png"
 echo "  $HERE/hmd-logo-eye-h-square.png"
 echo "  $HERE/hmd-logo-eye-h.icns"
+echo "  $HERE/hmd-logo-eye-h-mark.png"
