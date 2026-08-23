@@ -63,9 +63,9 @@ chmod +x "$BIN" 2>/dev/null || true
 
 bash -n "$BIN" 2>/dev/null && ok "(10) heimdall-watch-tui passes bash -n" \
   || bad "(10) heimdall-watch-tui FAILS bash -n"
-"$PY" -m py_compile "$DATA" "$APP" "$ENTRY" 2>/tmp/wt_pyc.txt \
+"$PY" -m py_compile "$DATA" "$APP" "$ENTRY" 2>"$WORK/wt_pyc.txt" \
   && ok "(10) watch_data + watch_tui + watch_entry py_compile clean" \
-  || { bad "(10) py_compile FAILED"; cat /tmp/wt_pyc.txt; }
+  || { bad "(10) py_compile FAILED"; cat "$WORK/wt_pyc.txt"; }
 
 # ── build a fake repo with LOCAL caches (roster, feed, receipt) ──────────────
 REPO="$WORK/repo"
