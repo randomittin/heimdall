@@ -1,0 +1,251 @@
+#!/usr/bin/env bash
+# heimdall-quota-advisor — an HONEST, NEVER-AUTO-SWITCHING advisor for the
+# moment a Claude usage/session/weekly limit is hit mid-task. Prints the real
+# options and their real trade-offs; never silently reroutes anything.
+#
+# WHY THIS EXISTS
+#   The repo owner asked hmd to surface an alternative when Claude credit runs
+#   out, and named a specific third-party router (OmniRoute,
+#   github.com/diegosouzapw/OmniRoute) as one option worth mentioning. Naming
+#   it honestly — including the part of it that is genuinely dangerous — is
+#   the whole point of this file; see THE SAFETY BOUNDARY below.
+#
+# THE SAFETY BOUNDARY (read this before touching this file)
+#   OmniRoute's documented tier cascade includes a "Tier 1 Subscription
+#   (Claude Code, Codex, Copilot)" mode that repurposes a Claude Code
+#   subscription's own OAuth session as a backend for OTHER tools' traffic.
+#   Heimdall runs INSIDE Claude Code. Using that mode very likely breaches
+#   Anthropic's consumer terms for the product this very tool depends on, and
+#   enforcement lands on the OPERATOR'S ACCOUNT — not on hmd, not on
+#   OmniRoute. So this file, permanently:
+#     - never wires, enables, configures, documents-as-recommended, or
+#       defaults to OmniRoute's Tier-1 subscription-reuse mode
+#     - never enables OmniRoute's opt-in root-CA MITM decrypt mode
+#     - never routes to a provider on the strength of OmniRoute's own
+#       ToS-conflict flag alone — its own docs call that flag advisory, not a
+#       routing gate
+#     - never auto-switches ANY provider for the operator. Ever. This tool
+#       only prints options; the human acts.
+#   Full analysis: docs/analysis/2026-08-23-omniroute-assessment.md
+#
+# MUST FAIL OPEN
+#   An advisor is not a gate. A false "you are out of credit" is worse than
+#   saying nothing, so every path that cannot confidently confirm a genuine
+#   quota exhaustion prints NOTHING and exits quietly. Never guesses.
+#
+# REUSES, NEVER RE-IMPLEMENTS
+#   bin/lib/quota_stop.py              the SAME anchor+reset-clause
+#                                       classifier bin/heimdall-quota-resume
+#                                       and bin/heimdall-agent-resume already
+#                                       call — this file adds no second
+#                                       detector.
+#   .planning/QUOTA-STOP.json          the SAME durable record
+#                                       `heimdall-quota-resume record`
+#                                       writes; `status` reads it, never
+#                                       writes it.
+#   .planning/tier-declarations.jsonl  the SAME log `heimdall-tier declare`
+#                                       writes, read here (best-effort,
+#                                       never written) to state real tier
+#                                       headroom instead of a stale
+#                                       hardcoded number.
+#
+# NOT ON ANY HOOK PATH
+#   This tool is invoked on demand only (a human hitting the error, or an
+#   orchestrator that just observed one) — never from SessionStart or any
+#   other hook, so it adds zero cost to the paths those hooks already guard.
+#   If a future change ever wires it into a hook, re-measure and document the
+#   added latency there, the same way this repo already does for its other
+#   SessionStart hooks.
+#
+# USAGE
+#   heimdall-quota-advisor check [--text T | --file F] [--repo DIR]
+#                                                       (stdin if neither)
+#       Ad hoc: classify raw termination text and, only if it is confidently
+#       a Claude quota/session-limit stop, print the options. Silent + exit 1
+#       otherwise (fail open).
+#   heimdall-quota-advisor status [--repo DIR]
+#       Read the existing .planning/QUOTA-STOP.json record (written by
+#       `heimdall-quota-resume record`, if that has already run) and print
+#       the same options iff it is still an active ("waiting") stop. Silent
+#       + exit 0 if there is no record, or it was already cleared.
+#   heimdall-quota-advisor help
+#
+# EXIT
+#   check    0 fired (options printed) / 1 silent (not confidently a quota
+#            stop — the fail-open default) / 64 usage error
+#   status   0 always (fired or silent; an advisor must never break a
+#            caller)
+#   help     0
+#
+# ENV (tests only; production leaves these unset)
+#   HEIMDALL_QUOTA_NOW_EPOCH      same seam bin/heimdall-quota-resume and
+#   HEIMDALL_QUOTA_SKEW_SECONDS   bin/heimdall-agent-resume use — freezes
+#                                 "now" so the countdown text is testable
+#                                 without sleeping for real time.
+set -uo pipefail
+
+_QA_SELF="$0"
+if command -v readlink >/dev/null 2>&1; then
+  _QA_SELF="$(readlink -f "$0" 2>/dev/null || readlink "$0" 2>/dev/null || echo "$0")"
+fi
+QA_BIN_DIR="$(cd "$(dirname "$_QA_SELF")" 2>/dev/null && pwd)"
+QA_LIB_DIR="$QA_BIN_DIR/lib"
+QA_PY="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)"
+
+OMNIROUTE_URL="github.com/diegosouzapw/OmniRoute"
+OMNIROUTE_DOC="docs/analysis/2026-08-23-omniroute-assessment.md"
+
+usage() { sed -n '2,${/^[^#]/q;p;}' "$0" | sed 's/^# \{0,1\}//'; }
+
+_qa_now_epoch() { printf '%s' "${HEIMDALL_QUOTA_NOW_EPOCH:-$(date +%s 2>/dev/null || echo 0)}"; }
+_qa_skew()      { printf '%s' "${HEIMDALL_QUOTA_SKEW_SECONDS:-120}"; }
+
+# ── classification — reuses bin/lib/quota_stop.py detect(), the SAME
+#    classifier bin/heimdall-quota-resume / bin/heimdall-agent-resume call;
+#    never re-implemented here. Prints JSON on stdout; degrades to a
+#    well-formed "unknown" object (never crashes) when python3/jq/the lib is
+#    missing, so a broken environment fails OPEN (silent), not loud.
+_qa_detect() {
+  local text="$1" out
+  if [ -z "$QA_PY" ] || [ ! -r "$QA_LIB_DIR/quota_stop.py" ] || ! command -v jq >/dev/null 2>&1; then
+    printf '%s' '{"class":"unknown","resolved":false,"reset_local":null,"reset_tz":null,"reset_epoch":null}'
+    return 0
+  fi
+  out="$(printf '%s' "$text" | "$QA_PY" "$QA_LIB_DIR/quota_stop.py" detect \
+          --now "$(_qa_now_epoch)" --skew "$(_qa_skew)" 2>/dev/null)"
+  if [ -z "$out" ] || ! printf '%s' "$out" | jq -e . >/dev/null 2>&1; then
+    printf '%s' '{"class":"unknown","resolved":false,"reset_local":null,"reset_tz":null,"reset_epoch":null}'
+    return 0
+  fi
+  printf '%s' "$out"
+}
+
+# ── tier headroom — reuses .planning/tier-declarations.jsonl written by
+#    `heimdall-tier declare`; never invents a second stats source. A live
+#    percentage when the log exists and is non-empty; an honest, still-true
+#    fallback line otherwise — never a hardcoded, staleness-prone number.
+_qa_tier_headroom_line() {
+  local repo="$1" log="$repo/.planning/tier-declarations.jsonl" total sonnet pct
+  if [ -r "$log" ] && command -v jq >/dev/null 2>&1; then
+    total="$(grep -c . "$log" 2>/dev/null)"; [ -n "$total" ] || total=0
+    if [ "$total" -gt 0 ] 2>/dev/null; then
+      sonnet="$(jq -s '[.[] | select(.declared_tier=="sonnet")] | length' "$log" 2>/dev/null)"
+      case "$sonnet" in ''|*[!0-9]*) sonnet=0 ;; esac
+      pct=$((sonnet * 100 / total))
+      printf '   This repo already runs %d%% of %d recorded tier declarations on sonnet\n   (the standing default coding tier) -- likely little headroom left to drop\n   further for routine coding work. Check what is live right now: hmd tier table\n' "$pct" "$total"
+      return 0
+    fi
+  fi
+  printf '   This repo already defaults coding work to sonnet (CLAUDE.md, Model\n   routing directive) -- there is usually no cheaper coding tier below it.\n   Check what is actually declared right now: hmd tier table\n'
+}
+
+# ── the advisor message itself (shared by check + status). Ordered by
+#    HONESTY, not novelty: free-and-safe first, named-risk last.
+_qa_print_advisory() {
+  local reset_local="$1" reset_tz="$2" resolved="$3" reset_epoch="$4" repo="$5"
+  local now remain h m reset_line
+
+  if [ "$resolved" = "true" ] && [ -n "$reset_epoch" ] && [ "$reset_epoch" != "null" ]; then
+    now="$(_qa_now_epoch)"
+    if [ "$reset_epoch" -gt "$now" ] 2>/dev/null; then
+      remain=$((reset_epoch - now)); h=$((remain / 3600)); m=$(((remain % 3600) / 60))
+      reset_line="Resets $reset_local ($reset_tz) -- about ${h}h ${m}m from now."
+    else
+      reset_line="Resets $reset_local ($reset_tz) -- should be open already, try again now."
+    fi
+  else
+    reset_line="Resets $reset_local ($reset_tz) per the error text -- exact countdown unavailable; check your usage page for live status."
+  fi
+
+  cat <<EOF
+[heimdall] QUOTA EXHAUSTED -- here are your options. Nothing has been changed.
+
+1. WAIT FOR THE RESET  (free, zero risk -- the default choice)
+   $reset_line
+
+2. SWITCH TO A CHEAPER TIER for the rest of this task
+$(_qa_tier_headroom_line "$repo")
+
+3. BRING YOUR OWN API KEY
+   If you already hold a commercial account with another model provider,
+   point your tools at it directly for the rest of this session -- no proxy,
+   no reuse of this Claude session, no terms-of-service ambiguity.
+
+4. THIRD-PARTY ROUTERS EXIST -- for example OmniRoute ($OMNIROUTE_URL)
+   Full risk write-up: $OMNIROUTE_DOC
+   In one sentence: one of its modes reuses the login from THIS Claude Code
+   subscription to serve traffic for other tools, and doing that can get
+   this account suspended. hmd will not install or configure it for you --
+   naming the risk plainly is as far as an honest advisor goes.
+
+hmd never switches providers on its own. You choose -- this only informs.
+EOF
+}
+
+cmd_check() {
+  local text="" text_set=0 file="" repo="$PWD"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --text) text="${2:-}"; text_set=1; shift 2 ;;
+      --file) file="${2:-}"; shift 2 ;;
+      --repo) repo="${2:-$PWD}"; shift 2 ;;
+      *) echo "heimdall-quota-advisor: unknown arg: $1" >&2; return 64 ;;
+    esac
+  done
+  if [ "$text_set" = 1 ]; then
+    :
+  elif [ -n "$file" ]; then
+    text="$(cat "$file" 2>/dev/null)"
+  else
+    text="$(cat)"
+  fi
+  repo="$(cd "$repo" 2>/dev/null && pwd)" || repo="$PWD"
+
+  command -v jq >/dev/null 2>&1 || return 1
+
+  local out cls resolved reset_local reset_tz reset_epoch
+  out="$(_qa_detect "$text")"
+  cls="$(printf '%s' "$out" | jq -r '.class' 2>/dev/null)"
+  [ "$cls" = "quota" ] || return 1
+
+  resolved="$(printf '%s' "$out" | jq -r '.resolved' 2>/dev/null)"
+  reset_local="$(printf '%s' "$out" | jq -r '.reset_local' 2>/dev/null)"
+  reset_tz="$(printf '%s' "$out" | jq -r '.reset_tz' 2>/dev/null)"
+  reset_epoch="$(printf '%s' "$out" | jq -r '.reset_epoch' 2>/dev/null)"
+  _qa_print_advisory "$reset_local" "$reset_tz" "$resolved" "$reset_epoch" "$repo"
+  return 0
+}
+
+cmd_status() {
+  local repo="$PWD"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repo) repo="${2:-$PWD}"; shift 2 ;;
+      *) echo "heimdall-quota-advisor: unknown arg: $1" >&2; return 64 ;;
+    esac
+  done
+  repo="$(cd "$repo" 2>/dev/null && pwd)" || return 0
+
+  local state="$repo/.planning/QUOTA-STOP.json"
+  [ -f "$state" ] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+
+  local status
+  status="$(jq -r '.status' "$state" 2>/dev/null)"
+  [ "$status" = "waiting" ] || return 0
+
+  local resolved reset_local reset_tz reset_epoch
+  resolved="$(jq -r '.resolved' "$state" 2>/dev/null)"
+  reset_local="$(jq -r '.reset_local' "$state" 2>/dev/null)"
+  reset_tz="$(jq -r '.reset_tz' "$state" 2>/dev/null)"
+  reset_epoch="$(jq -r '.reset_epoch' "$state" 2>/dev/null)"
+  _qa_print_advisory "$reset_local" "$reset_tz" "$resolved" "$reset_epoch" "$repo"
+  return 0
+}
+
+case "${1:-help}" in
+  check)          shift; cmd_check "$@" ;;
+  status)         shift; cmd_status "$@" ;;
+  help|--help|-h) usage ;;
+  *) echo "Unknown command: ${1}. Try: heimdall-quota-advisor help" >&2; exit 64 ;;
+esac
