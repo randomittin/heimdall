@@ -24,15 +24,23 @@
 #   irrelevant, since launchd execs ProgramArguments directly and never consults Gatekeeper.
 #
 # DETERMINISM IS THE WHOLE POINT, AND IT IS FRAGILE ON PURPOSE.
-#   Same bash bytes + the same fixed Info.plist bytes + the same identifier always produce
-#   the same CDHash, which is what lets a grant survive an unrelated Heimdall update: a
-#   rebuild that changes nothing real changes nothing signed. But if the SOURCE bash itself
-#   changes (a macOS update), the new copy legitimately gets a NEW identity — and a Full
-#   Disk Access grant keyed to the old one silently stops applying. That is not a bug this
-#   tool can fix (TCC keys grants to identity by design) — it is a fact `build` records
-#   every time (dream-identity.json: cdhash + previous_cdhash + changed) so
-#   heimdall-dream-permission can detect the drift and ask again instead of assuming a past
-#   grant holds forever.
+#   Same bash bytes + the same fixed Info.plist bytes + the same icon bytes + the same
+#   identifier always produce the same CDHash, which is what lets a grant survive an
+#   unrelated Heimdall update: a rebuild that changes nothing real changes nothing signed.
+#   But if the SOURCE bash itself changes (a macOS update), the new copy legitimately gets
+#   a NEW identity — and a Full Disk Access grant keyed to the old one silently stops
+#   applying. That is not a bug this tool can fix (TCC keys grants to identity by design)
+#   — it is a fact `build` records every time (dream-identity.json: cdhash +
+#   previous_cdhash + changed) so heimdall-dream-permission can detect the drift and ask
+#   again instead of assuming a past grant holds forever.
+#
+#   The bundle also ships a Contents/Resources/hmd-dream.icns so the Files & Folders
+#   consent row is identifiable as hmd on sight (CFBundleIconFile/CFBundleIconName in
+#   Info.plist, see info_plist_xml() below) — added the same way the executable is:
+#   copied from a FIXED source file, at a FIXED path in the bundle, with FIXED
+#   permissions, so it changes the CDHash exactly once (the build that first added it)
+#   and never again on its own. Verified: two builds into different --out directories
+#   after this change still produce a byte-identical CDHash (test (1) below).
 #
 # THIS NEVER TOUCHES TCC. It only produces and inspects a code-signed artifact — the same
 # category of action as compiling a program. Whether Full Disk Access is ever granted to
@@ -51,6 +59,10 @@
 #   HEIMDALL_DREAM_BUNDLE_BASH  source interpreter to copy+sign (default /bin/bash — a test
 #                                seam only; the real bundle always ships whatever bash this
 #                                machine actually has)
+#   HEIMDALL_DREAM_BUNDLE_ICON  source .icns to copy into Contents/Resources (default:
+#                                launch-docs/assets/hmd-logo-eye-h.icns, resolved relative
+#                                to this script's own real path — a test seam only; the
+#                                real bundle always ships the repo's actual icon)
 #
 # EXIT
 #   0  ok · 2  usage / unsupported platform / missing tool · 3  build failure
@@ -98,19 +110,27 @@ read_field() {
     "$1" 2>/dev/null | head -1 || true
 }
 
-bundle_paths() { # bundle_paths <out-dir> — sets BUNDLE_DIR / BUNDLE_EXEC
+bundle_paths() { # bundle_paths <out-dir> — sets BUNDLE_DIR / BUNDLE_EXEC / BUNDLE_ICON
   BUNDLE_DIR="$1/$BUNDLE_NAME"
   BUNDLE_EXEC="$BUNDLE_DIR/Contents/MacOS/$EXEC_NAME"
+  BUNDLE_ICON="$BUNDLE_DIR/Contents/Resources/$ICON_NAME.icns"
 }
 
-# THE FIXED, MINIMAL Info.plist. Nine keys — every one of them a constant, none of them a
-# path or a timestamp — because determinism means the ONLY thing allowed to change the
-# signed bytes between builds is the source bash itself. CFBundleName and
-# CFBundleDisplayName are both set to the literal string "hmd-dream": LaunchServices
+# THE FIXED, MINIMAL Info.plist. Every key is a constant, none of them a path or a
+# timestamp — because determinism means the ONLY thing allowed to change the signed
+# bytes between builds is the source bash (or, now, the source icon) itself. CFBundleName
+# and CFBundleDisplayName are both set to the literal string "hmd-dream": LaunchServices
 # prefers CFBundleDisplayName, falling back to CFBundleName, so setting both to the same
 # value is what makes System Settings' Full Disk Access list show "hmd-dream" rather than
 # a raw path — verified directly (PlistBuddy -c 'Print :CFBundleDisplayName') against a
 # real build of this exact plist, not assumed from the key names.
+#
+# CFBundleIconFile (classic key, macOS appends ".icns") and CFBundleIconName (modern key,
+# normally paired with an .xcassets asset catalog — harmless and forward-compatible to
+# set here even without one, since LaunchServices falls back to CFBundleIconFile when no
+# matching asset-catalog entry exists) both point at the same "hmd-dream" resource so the
+# Files & Folders consent row is identifiable as hmd on sight instead of a generic-app
+# glyph — the entire reason this tool exists in the first place.
 info_plist_xml() {
   cat <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -125,6 +145,10 @@ info_plist_xml() {
 	<string>$EXEC_NAME</string>
 	<key>CFBundleDisplayName</key>
 	<string>$EXEC_NAME</string>
+	<key>CFBundleIconFile</key>
+	<string>$ICON_NAME</string>
+	<key>CFBundleIconName</key>
+	<string>$ICON_NAME</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleInfoDictionaryVersion</key>
@@ -160,6 +184,11 @@ cmd_build() {
   is_macos || die "hmd-dream is a macOS code-signing artifact; this host is $(uname -s)"
   command -v codesign >/dev/null 2>&1 || die "codesign not found — cannot sign the bundle"
   [ -r "$SRC_BASH" ] || die "source interpreter unreadable: $SRC_BASH"
+  # Info.plist (below) unconditionally declares CFBundleIconFile/CFBundleIconName, so a
+  # missing icon here would ship a bundle that CLAIMS an icon it doesn't have — same
+  # class of prerequisite failure as a missing source interpreter, checked upfront the
+  # same way rather than silently degrading the one thing this task exists to fix.
+  [ -r "$SRC_ICON" ] || die "icon asset unreadable: $SRC_ICON"
 
   bundle_paths "$out"
   local prev_cdhash=""
@@ -167,9 +196,15 @@ cmd_build() {
     prev_cdhash="$(read_field "$IDENT_FILE" cdhash)" || true
   fi
 
-  mkdir -p "$BUNDLE_DIR/Contents/MacOS" || die "mkdir failed: $BUNDLE_DIR" 3
+  mkdir -p "$BUNDLE_DIR/Contents/MacOS" "$BUNDLE_DIR/Contents/Resources" || die "mkdir failed: $BUNDLE_DIR" 3
   cp "$SRC_BASH" "$BUNDLE_EXEC" || die "copy failed: $SRC_BASH -> $BUNDLE_EXEC" 3
   chmod 0755 "$BUNDLE_EXEC" || die "chmod failed: $BUNDLE_EXEC" 3
+  # Fixed permissions regardless of the source file's own mode bits — codesign hashes
+  # CONTENT, not Unix permissions (already established for BUNDLE_EXEC above), but a
+  # stray permission difference across checkouts is still worth eliminating outright
+  # rather than trusting it doesn't matter every time.
+  cp "$SRC_ICON" "$BUNDLE_ICON" || die "copy failed: $SRC_ICON -> $BUNDLE_ICON" 3
+  chmod 0644 "$BUNDLE_ICON" || die "chmod failed: $BUNDLE_ICON" 3
   info_plist_xml > "$BUNDLE_DIR/Contents/Info.plist" || die "plist write failed" 3
 
   local sign_err
