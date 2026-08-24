@@ -166,7 +166,7 @@ fi
 # local-only tag / the manifest VERSION.
 H6="$(mk_dir)"; TD6="$(mk_dir)/.heimdall"
 write_cp_url "$H6" "$FAKE_URL"; write_team "$TD6" "$FAKE_SECRET"
-OUT6="$(HOME="$H6" HEIMDALL_TEAM_DIR="$TD6" "$CLI"; echo "RC=$?")"
+OUT6="$(HOME="$H6" HEIMDALL_TEAM_DIR="$TD6" "$CLI" --yes-print-secret; echo "RC=$?")"
 RC6="${OUT6##*RC=}"; BODY6="${OUT6%RC=*}"
 EMITTED_REF="$(grep -oE 'raw\.githubusercontent\.com/[^ ]+/install\.sh' <<<"$BODY6" \
                 | head -1 | sed -E 's#.*/([^/]+)/install\.sh#\1#')"
@@ -184,7 +184,7 @@ fi
 # receives) must NOT contain the secret.
 H7="$(mk_dir)"; TD7="$(mk_dir)/.heimdall"
 write_cp_url "$H7" "$FAKE_URL"; write_team "$TD7" "$FAKE_SECRET"
-OUT7="$(HOME="$H7" HEIMDALL_TEAM_DIR="$TD7" "$CLI"; echo "RC=$?")"
+OUT7="$(HOME="$H7" HEIMDALL_TEAM_DIR="$TD7" "$CLI" --yes-print-secret; echo "RC=$?")"
 RC7="${OUT7##*RC=}"; BODY7="${OUT7%RC=*}"
 # The join line is the last printed line carrying the raw installer URL.
 JOINLINE="$(grep -F 'raw.githubusercontent.com' <<<"$BODY7" | tail -1)"
