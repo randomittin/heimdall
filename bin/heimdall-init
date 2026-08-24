@@ -539,7 +539,7 @@ if [ "$PRIOR_ABS" != "$REPO/.git/hooks" ] || { [ -x "$PRIOR_ABS/pre-commit" ] ||
   printf "  ${D}chained  →${R} %s ${D}(your existing hooks still run)${R}\n" "$PRIOR_ABS"
 fi
 if [ -n "$AGENTS_WROTE" ]; then
-  printf "  ${D}AGENTS.md${R} %s ${D}— every coding agent now reads that this repo is gated${R}\n" "$AGENTS_ACTION"
+  printf "  ${D}AGENTS.md${R} %s ${D}— read by Cursor and Codex at session start; Gemini CLI reads GEMINI.md instead${R}\n" "$AGENTS_ACTION"
 else
   printf "  ${D}AGENTS.md not written — %s (hooks are installed and still enforce)${R}\n" "$(agents_fail_detail)" >&2
 fi

@@ -276,8 +276,27 @@ launch_tool() {
     _trace_order "wrap:headroom:routed:$HMD_HEADROOM_BASE_URL"
     # DISCLOSURE, not decoration. A proxy the user cannot see is the thing this
     # repo's own README refuses to ship, so being proxied is stated every time.
-    say "  ${G}✓${R} headroom ${D}generation routed via %s — judgment is not (hmd modules status headroom)${R}\n" \
-      "$HMD_HEADROOM_BASE_URL"
+    # PER-TOOL, not blanket. ANTHROPIC_BASE_URL only re-points an Anthropic API
+    # client: claude (bin/heimdall's own launch path, below) reads it. codex and
+    # gemini are OpenAI/Google CLIs with their own provider config and do NOT
+    # read this var, so it lands on their process but their generation traffic
+    # still goes straight to their real provider, unproxied — claiming "routed"
+    # there would be false. cursor/aider are unconfirmed either way, so they get
+    # a hedge instead of a claim this repo cannot back.
+    case "$tool" in
+      claude)
+        say "  ${G}✓${R} headroom ${D}generation routed via %s — judgment is not (hmd modules status headroom)${R}\n" \
+          "$HMD_HEADROOM_BASE_URL"
+        ;;
+      codex|gemini)
+        say "  ${W}·${R} headroom ${D}ANTHROPIC_BASE_URL is set, but %s does not read it — generation is NOT routed for this tool${R}\n" \
+          "$tool"
+        ;;
+      *)
+        say "  ${D}· headroom ANTHROPIC_BASE_URL set to %s — routed only if %s is configured to read it (unconfirmed)${R}\n" \
+          "$HMD_HEADROOM_BASE_URL" "$tool"
+        ;;
+    esac
   else
     _trace_order "wrap:headroom:unrouted:${HMD_HEADROOM_WHY:-chain unavailable}"
     [ -n "${HMD_HEADROOM_WHY:-}" ] && \
