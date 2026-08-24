@@ -43,6 +43,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -448,36 +449,105 @@ def build_fix_prompt(issue, orient_result):
     )
 
 
+# ── the retry wrapper (bin/lib/hmd-claude-retry.sh) — REUSE, never reimplement here ────
+#
+# hmd-claude-retry.sh was ORPHANED: nothing referenced it outside its own test, so this
+# call used a bare `subprocess.run([claude, "-p", prompt, ...])`. On a transient 529 the
+# `claude` CLI exhausts its OWN retries, exits non-zero, and this function recorded a
+# completed "fix attempt" whose output_tail was the overload banner. The wrapper already
+# encodes the fix (see its header): retry ONLY on non-zero exit + an overload marker
+# (529/overloaded/429/rate-limit/retrying/attempt N of M), with backoff; a non-zero exit
+# with NO marker is a REAL error and fails fast; exit 0 is returned verbatim. Routed via
+# `bash <wrapper>` rather than chmod +x + direct exec, so this fix ships with NO file-mode
+# change — the wrapper's own trailing CLI-mode block makes it a transparent `claude` proxy
+# when invoked this way.
+_CLAUDE_RETRY_WRAPPER = os.path.join(_HERE, "hmd-claude-retry.sh")
+
+# the wrapper's own documented env knobs (its header comment), forwarded from the parent
+# process env into the child below. NONE of these are in _fix_child_env's credential-
+# scrubbed baseline, so without this loop they would never reach the child at all.
+# HMD_CLAUDE_BIN is the wrapper's OWN "which claude" seam (resolved + set separately,
+# below — it needs this module's HEIMDALL_CLAUDE_BIN seam layered on top, not a blind
+# copy); the rest govern its backoff schedule + give-up exit code (test seam: e.g.
+# HMD_OVERLOAD_BASE_SECS=0 so a hermetic test never sleeps).
+_RETRY_OVERLOAD_ENV = (
+    "HMD_OVERLOAD_MAX_ATTEMPTS", "HMD_OVERLOAD_BASE_SECS",
+    "HMD_OVERLOAD_CAP_SECS", "HMD_OVERLOAD_EXIT",
+)
+
+
 def _run_claude_fix(issue, orient_result, repo):
     """Invoke the headless coder (claude -p) INSIDE `repo` so real edits land, and
     return an instrumentation dict recording the outcome (never the verdict — the SI-2
     gate decides that). See the section header for the empty-diff root cause + the gate.
+
+    The call is ROUTED THROUGH bin/lib/hmd-claude-retry.sh (`bash <wrapper> -p ...`) so a
+    transient overload (529/rate-limit) is retried with backoff instead of being recorded
+    as a completed fix attempt — see _CLAUDE_RETRY_WRAPPER above and the wrapper's own
+    header for the full, already-tested discrimination. This function never reimplements
+    that logic; it only routes to it and reads its exit code.
 
     Returns one of:
       {invoked:False, enabled:False, reason:'claude-fix-disabled'}          (suite default)
       {invoked:False, enabled:True,  reason:'claude-not-found', bin:...}     (no binary)
       {invoked:True,  enabled:True, exit:int, duration_ms:int,
        output_tail:str, files_changed:int|None}                             (ran)
-      {invoked:True,  enabled:True, timed_out:True, duration_ms:int}        (killed)"""
+      {invoked:True,  enabled:True, timed_out:True, duration_ms:int}        (killed)
+      {invoked:True,  enabled:True, overloaded:True, exit:int, duration_ms:int,
+       output_tail:str}      (the wrapper exhausted its retry budget on a transient
+                              overload and gave up: exit == HMD_OVERLOAD_EXIT, default 75.
+                              Distinct from the ran-case above on purpose — NEVER the
+                              fix's real output; the caller must mark the task FAILED,
+                              same as timed_out.)"""
     if not _claude_fix_enabled():
         return {"invoked": False, "enabled": False, "reason": "claude-fix-disabled"}
+    # resolve the intended claude binary BEFORE routing through the wrapper: this
+    # module's existing seam (HEIMDALL_CLAUDE_BIN — tests + the deployed maintainer's
+    # MAINTAINER_ENV_PASSTHROUGH both already set this) takes priority, then the
+    # wrapper's own native seam (HMD_CLAUDE_BIN) if a caller set that directly, else
+    # _claude_bin()'s own default ("claude" on PATH).
+    resolved_bin = (os.environ.get(CLAUDE_BIN_ENV) or os.environ.get("HMD_CLAUDE_BIN")
+                    or _claude_bin())
+    if shutil.which(resolved_bin) is None:
+        # checked up front: once routed through the wrapper, a missing binary is just a
+        # generic non-zero bash exit with no distinct signal, so this preserves the prior
+        # FileNotFoundError-derived shape instead of losing it inside the wrapper.
+        return {"invoked": False, "enabled": True, "reason": "claude-not-found",
+                "bin": resolved_bin}
     prompt = build_fix_prompt(issue, orient_result)
     argv = [
-        _claude_bin(), "-p", prompt,
+        "bash", _CLAUDE_RETRY_WRAPPER, "-p", prompt,
         "--permission-mode", "acceptEdits",
         "--allowedTools", _FIX_ALLOWED_TOOLS,
         "--output-format", "text",
     ]
+    env = _fix_child_env()  # credential-scrubbed baseline — unchanged.
+    env["HMD_CLAUDE_BIN"] = resolved_bin  # the wrapper's seam: which claude it runs.
+    # TIMEOUT-VS-RETRY-BUDGET (nested-timeout trap): the wrapper's own retry loop is NOT
+    # bounded by this call's outer timeout below — it has its own attempts/backoff. At
+    # the wrapper's BUILT-IN defaults (max=6, base=5s, cap=120s) its worst-case
+    # backoff-only total is ~180s (5+10+20+40+80, each plus <base jitter, before the
+    # last of 6 attempts) — comfortably inside CLAUDE_FIX_TIMEOUT_DEFAULT (1500s), so the
+    # two defaults do not collide. Forwarding these four knobs (present only when a
+    # caller/test already set them, e.g. HMD_OVERLOAD_BASE_SECS=0 so a hermetic test
+    # never sleeps) is what lets an operator who LOWERS HEIMDALL_FIX_TIMEOUT also lower
+    # the wrapper's own budget to preserve that invariant — without forwarding them the
+    # knobs the wrapper documents could never reach it at all, since _fix_child_env()'s
+    # allowlisted baseline carries none of them.
+    for key in _RETRY_OVERLOAD_ENV:
+        val = os.environ.get(key)
+        if val is not None:
+            env[key] = val
     t0 = time.time()
     try:
         proc = subprocess.run(
             argv, cwd=repo, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, timeout=_claude_fix_timeout(),
-            env=_fix_child_env(),  # credential-scrubbed: NO team creds reach the fix child.
+            env=env,  # credential-scrubbed: NO team creds reach the fix child.
         )
     except FileNotFoundError:
         return {"invoked": False, "enabled": True, "reason": "claude-not-found",
-                "bin": _claude_bin()}
+                "bin": resolved_bin}
     except OSError as exc:
         return {"invoked": False, "enabled": True, "reason": "claude-exec-error",
                 "detail": _scrub_fix_output(str(exc))[:200]}
@@ -491,6 +561,17 @@ def _run_claude_fix(issue, orient_result, repo):
     tail = _scrub_fix_output(combined.strip())
     if len(tail) > _FIX_TAIL_MAX:
         tail = "…" + tail[-_FIX_TAIL_MAX:]
+    try:
+        overload_exit = int(os.environ.get("HMD_OVERLOAD_EXIT", 75))
+    except (TypeError, ValueError):
+        overload_exit = 75
+    if proc.returncode == overload_exit:
+        # the wrapper exhausted its own overload budget: a DISTINCT, unambiguous outcome
+        # from a real non-zero exit — never the fix's output, caller marks task FAILED.
+        return {
+            "invoked": True, "enabled": True, "overloaded": True,
+            "exit": proc.returncode, "duration_ms": dur, "output_tail": tail,
+        }
     return {
         "invoked": True, "enabled": True, "exit": proc.returncode,
         "duration_ms": dur, "output_tail": tail,
