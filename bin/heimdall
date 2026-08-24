@@ -2187,6 +2187,24 @@ case "${1:-}" in
       echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
       exit 1
     fi
+    for _init_arg in "$@"; do
+      case "$_init_arg" in
+        -h|--help|help)
+          # heimdall-init's OWN usage() self-extracts its header with a hardcoded
+          # `sed -n '2,39p'` range (heimdall-init:59) that stops one line before
+          # its real `# Usage:` synopsis -- printing the CONTRACT text then a
+          # bare "Usage:" with nothing after it (exit 0, so nothing catches it).
+          # bin/heimdall-init is a parallel workstream's file; this arm owns its
+          # own --help text per the dispatcher contract, so it reproduces the
+          # same leading-comment-block extraction correctly and dynamically
+          # instead: every `#`-prefixed line from line 2 to the first
+          # non-comment line, not a hand-counted end line. Self-adjusts if the
+          # header ever grows or shrinks again -- the whole bug class goes away.
+          awk 'NR==1{next} /^#/{print; next} {exit}' "$INIT_BIN" | sed 's/^# \{0,1\}//'
+          exit 0
+          ;;
+      esac
+    done
     exec "$INIT_BIN" "$@"
     ;;
   verdict)
@@ -2243,18 +2261,25 @@ case "${1:-}" in
     exec "$BADGE_BIN" "$@"
     ;;
   metrics)
-    # Pass-through to heimdall-metrics: the weekly launch one-pager — WAU, teams-2+,
-    # K-factor proxy and funnel drop-offs, READ off the server-derived funnel store.
-    # Read-only and egress-free; a number that was never measured renders "unavailable"
-    # rather than 0. All args forwarded verbatim (report/--json/--k-min/--days/--home).
+    # heimdall-metrics was meant as a pass-through to a weekly launch one-pager --
+    # WAU, teams-2+, K-factor proxy and funnel drop-offs, READ off the
+    # server-derived funnel store (that underlying tracking is real -- see
+    # test/cp-funnel-walk.test.sh). It was never built: a repo-wide search turns
+    # up no heimdall-metrics binary, doc, or test anywhere -- only this arm's own
+    # comment ever named it. bin/heimdall-metric (singular, run directly -- it
+    # has no arm of its own here) is NOT a substitute: it emits local per-task
+    # routing telemetry (`task`/`where` only) and has no report/--json/--k-min/
+    # --days/--home surface -- repointing there would trade this honest,
+    # self-diagnosing failure for a confusing argparse error on a tool that
+    # answers a different question. So this stays deliberately INLINE (no
+    # dispatch target -- nothing a reinstall could ever produce) instead of a
+    # conditional pass-through implying the binary is one `curl | bash` away.
+    # It never has been.
     shift
-    METRICS_BIN="$PLUGIN_DIR/bin/heimdall-metrics"
-    if [ ! -x "$METRICS_BIN" ]; then
-      echo "  Error: heimdall-metrics not found at $METRICS_BIN" >&2
-      echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
-      exit 1
-    fi
-    exec "$METRICS_BIN" "$@"
+    echo "  hmd metrics: not shipped -- no heimdall-metrics binary exists in any release of heimdall." >&2
+    echo "  This is a planned report (WAU / K-factor / funnel drop-offs, read from the server), not a broken install -- reinstalling will not produce it." >&2
+    echo "  What exists today: heimdall-metric (singular, run directly) emits local per-task routing telemetry; 'hmd funnel' shows the local launch-funnel counters." >&2
+    exit 1
     ;;
   clip)
     # Pass-through to heimdall-clip: export a gate/wall MOMENT as a shareable card
