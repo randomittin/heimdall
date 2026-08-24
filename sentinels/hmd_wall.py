@@ -44,6 +44,11 @@ TIERS (the frozen contract from repo_roster, ranked most- to least-present):
     away         seen inside the 7-day presence window        (needs the repo team secret)
     member       a GitHub collaborator with no recent signal  (gh only, no control plane)
 
+A "member" row can still carry a real last_commit_ts — repo_roster attaches it regardless of
+tier, and the row only landed on "member" because that commit fell outside the contributed
+window (or there is none at all). _tier_ts() surfaces it as an honest, stale age; a row with
+truly no commit still gets None, never a fabricated one.
+
 Only `online` and `away` need the control plane, so a POPULATED wall works today — before a
 control-plane redeploy and before teammates update their hmd — off git + the GitHub
 collaborator list alone.
@@ -273,10 +278,14 @@ def _tier_ts(row):
 
     online/away → the last heartbeat ("away 3d" = not seen for 3 days).
     contributed → the last COMMIT  ("git 3d"  = last committed 3 days ago).
-    member      → nothing; there is no signal, which is exactly what the tier means.
+    member      → the last COMMIT too, IF repo_roster attached one. A row lands on "member"
+                  because that commit fell outside the contributed window (or there is none
+                  at all) — never because the field was dropped — so a genuine last_commit_ts
+                  here is real signal, not noise. No commit at all still returns None: there
+                  is truly nothing to date, and the caller renders a bare "mem", no age.
     """
     tier = row.get("tier")
-    if tier == "contributed":
+    if tier in ("contributed", "member"):
         return _num(row.get("last_commit_ts"))
     if tier in (PRESENT_TIER, "away"):
         return _num(row.get("last_seen_ts"))

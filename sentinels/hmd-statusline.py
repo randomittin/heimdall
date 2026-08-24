@@ -1202,15 +1202,24 @@ TEAM_STATE = {  # ledger state → (glyph, word, color) for the Row4 state segme
 
 
 def _last_seen(now, ts):
-    """A last-seen age in AT MOST 3 cells — `9m` / `59m` / `3h` / `23h` / `6d`. The team strip
-    is 8 cells wide and the offline segment spends 5 on `⊘off `, so the age must stay tiny; the
-    largest unit that fits wins. Bounded by the 7-day wall window, so `7d` is the widest case."""
+    """A last-seen age in AT MOST 3 cells — `now` / `9m` / `59m` / `3h` / `23h` / `6d` / `52w` /
+    `99y`. The team strip is 8 cells wide and the offline segment spends 5 on `⊘off `, so the
+    age must stay tiny; the largest unit that fits wins. `off`/`git` ages stay inside the 7-day
+    wall/git window in practice, but `mem` carries a member's last COMMIT with no window at all
+    — repo_roster attaches it regardless of age — so every bucket up to a clamped 99y is covered
+    too; the 3-cell budget must hold for an age of any size, not just the ones seen so far."""
     secs = max(0, int(now - ts))
+    if secs < 60:
+        return "now"
     if secs < 3600:
         return "%dm" % (secs // 60)
     if secs < 86400:
         return "%dh" % (secs // 3600)
-    return "%dd" % (secs // 86400)
+    if secs < 7 * 86400:
+        return "%dd" % (secs // 86400)
+    if secs < 365 * 86400:
+        return "%dw" % (secs // (7 * 86400))
+    return "%dy" % min(99, secs // (365 * 86400))
 
 
 # Row4 NON-PRESENT tier vocabulary — EXTENDS the offline vocabulary 9cad9a9 established
@@ -1228,7 +1237,8 @@ _ABSENT_SEG_CELLS = LAYOUT.TEAM_LABEL_W
 TEAM_TIER = {              # tier → (glyph, word, show_age)
     "away":        ("⊘", "off", True),    # a heartbeat, but stale     → `⊘off 3d`
     "contributed": ("⌁", "git", True),    # a commit, no presence ever → `⌁git 3d`
-    "member":      ("⌂", "mem", False),   # on the repo, no signal     → `⌂mem`
+    "member":      ("⌂", "mem", True),    # on the repo; ages ONLY with a real commit →
+                                           # `⌂mem 2w`, else bare `⌂mem` — never fabricated
 }
 
 
@@ -1265,8 +1275,10 @@ def _team_tier_seg(m, now):
       • the literal word survives --no-color, a mono terminal, and a colorblind viewer —
         colour alone would fail all three,
       • the age is the ONE number shown, and it is the age of the tier's OWN signal (last
-        heartbeat for `off`, last COMMIT for `git`), so the number never labels a clock it
-        did not come from. `mem` shows none, because a member has no signal to date.
+        heartbeat for `off`, last COMMIT for `git` AND for `mem` — a member can carry a real
+        commit that simply fell outside the contributed window), so the number never labels
+        a clock it did not come from. A member with no commit at all still shows bare `mem`,
+        never a fabricated age.
     An absent person must never be a subtly-different present one: a viewer who misreads this
     is the exact failure this wall exists to prevent."""
     glyph, word, show_age = TEAM_TIER.get(_tier_of(m), TEAM_TIER["member"])
