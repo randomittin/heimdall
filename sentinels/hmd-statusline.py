@@ -684,6 +684,98 @@ def active_swarm_agents():
     out.sort(key=lambda a: (a["started_at"], a["id"]))
     return out, mx
 
+def _agent_tiers_cache_path(cwd): return os.path.join(cwd, ".heimdall", ".agent-tiers-cache.json")
+
+def _agent_tiers_ttl():
+    try: return float(os.environ.get("HMD_AGENT_TIERS_TTL", "300"))
+    except Exception: return 300.0
+
+def _agent_tiers_lock_ttl():
+    try: return float(os.environ.get("HMD_AGENT_TIERS_LOCK_TTL", "30"))
+    except Exception: return 30.0
+
+def _spawn_agent_tiers_refresh(cwd):
+    """Detached, throttled, fire-and-forget refresh of the per-agent tier cache via
+    `bin/heimdall-tier agents --json` — the ONE frontmatter parser (heimdall-tier's
+    read_frontmatter), never a second one here that could quietly disagree with
+    `heimdall-tier check`'s own verdict. Mirrors _spawn_presence's stat-gate + lock
+    + detached-child + atomic-rename shape. Called ONLY from swarm_block(), itself
+    only reached once 2+ live agents already exist — the solo-agent render path
+    never calls this, never stats the cache, never forks."""
+    bin_path = os.path.join(BIN_DIR, "heimdall-tier")
+    if not os.access(bin_path, os.X_OK): return
+    now = time.time()
+    cache = _agent_tiers_cache_path(cwd); lock = cache + ".lock"
+    try:
+        fresh = os.path.exists(cache) and now - os.path.getmtime(cache) < _agent_tiers_ttl()
+        locked = os.path.exists(lock) and now - os.path.getmtime(lock) < _agent_tiers_lock_ttl()
+    except Exception:
+        return
+    if fresh or locked: return
+    try:
+        os.makedirs(os.path.join(cwd, ".heimdall"), exist_ok=True)
+        open(lock, "w").close()
+    except Exception:
+        return
+    tmp = cache + ".%d.tmp" % os.getpid()
+    cmd = ("%s agents --json --repo %s > %s 2>/dev/null && mv -f %s %s; rm -f %s %s" %
+           (shlex.quote(bin_path), shlex.quote(cwd), shlex.quote(tmp), shlex.quote(tmp),
+            shlex.quote(cache), shlex.quote(tmp), shlex.quote(lock)))
+    try:
+        subprocess.Popen(["/bin/sh", "-c", cmd], cwd=cwd, env=dict(os.environ),
+                          start_new_session=True, stdout=subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+    except Exception:
+        try: os.remove(lock)
+        except Exception: pass
+
+def agent_tier_map(cwd):
+    """Best-effort {agent_name: row} from the cached `heimdall-tier agents --json`
+    output, keyed by agent template name (e.g. 'coder', 'reviewer'). NEVER reads
+    agents/*.md itself on this path — that only happens inside the detached child
+    this kicks off when the cache is stale (see _spawn_agent_tiers_refresh). A
+    missing, stale or corrupt cache all degrade to {} — the swarm row then simply
+    omits the tier tag, the same 'no data -> no segment' contract every other
+    swarm-row field (surface, gate verdict) already follows."""
+    out = {}
+    try:
+        with open(_agent_tiers_cache_path(cwd)) as f:
+            data = json.load(f)
+    except Exception:
+        data = None
+    if isinstance(data, dict):
+        for row in data.get("agents") or []:
+            if isinstance(row, dict) and row.get("agent"):
+                out[row["agent"]] = row
+    _spawn_agent_tiers_refresh(cwd)
+    return out
+
+def _role_tier_key(role):
+    """Normalize a live agent-pool 'type' string to an agents/*.md template name:
+    strip an 'hmd:' dispatch-namespace prefix (this repo's own Agent-tool spawn
+    convention — subagent_type: 'hmd:coder', CLAUDE.md 'Parallelism') if present,
+    then lowercase/trim. A role matching neither form simply misses the tier-map
+    lookup — degrade cleanly, never guess."""
+    r = (role or "").strip()
+    if r.lower().startswith("hmd:"): r = r[4:]
+    return r.strip().lower()
+
+def _tier_tag(role, tier_map):
+    """' [tier]' for a swarm row, plus an explicitly-unapplied routing-override
+    note when one exists for that agent's class — never rendered as though it
+    were the tier actually running. '' when no cached tier data matches this
+    role (cold cache, unknown role, or the row's own declared_tier is empty)."""
+    if not tier_map: return ""
+    info = tier_map.get(_role_tier_key(role))
+    if not info: return ""
+    tier = info.get("declared_tier") or info.get("model")
+    if not tier: return ""
+    tag = f" {DIM}[{tier}]{X}"
+    ov = info.get("override")
+    if isinstance(ov, dict) and ov.get("model"):
+        tag += f"{FAINT}→{X}{AM}{ov['model']}(unapplied){X}"
+    return tag
+
 # ── the parallel-agent SWARM block: spectacle + per-agent receipt ──────────────
 # Roster   = active_swarm_agents() (bin/agent-pool, live PID only — never a ghost).
 # Surface  = the claim ledger (.planning/ledger/claims/*.json — an agent's current
@@ -785,11 +877,16 @@ def _swarm_glyph(seed, rgb=None):
 def swarm_block(cwd):
     """Build the SWARM block rows (header + one aligned row per live agent), or
     None when 1-or-fewer agents are active (→ the normal HUD is untouched). Each
-    row is spectacle + receipt: mini-sigil · role · gate glyph · current file."""
+    row is spectacle + receipt: mini-sigil · role · gate glyph · current file ·
+    cached model tier (+ an explicitly-unapplied routing-override note, if one
+    exists for that agent's class). The tier lookup is CACHE-ONLY and its
+    refresh is kicked off (detached, throttled) only from here — a solo-agent
+    render never reaches this line, so it never stats or forks for tier data."""
     agents, mx = active_swarm_agents()
     if len(agents) < 2: return None
     gate = swarm_shared("swarm-gate"); files = swarm_shared("swarm-file")
     claims = swarm_claims(cwd)
+    tier_map = agent_tier_map(cwd)
     def _lookup(m, aid): return m.get(aid) or m.get(_slug(aid))
     entries = []
     for a in agents:
@@ -808,10 +905,11 @@ def swarm_block(cwd):
         role = a["role"][:role_w].ljust(role_w)
         verdict = f"{col}{BOLD}{glyph} {word.ljust(word_w)}{X}"
         surf = f" {FAINT}·{X} {DIM}{surface}{X}" if surface else ""
+        tier_seg = _tier_tag(a["role"], tier_map)
         if v == "deny":  # the screenshot moment — bracket it red so the block reads
-            rows.append(f"{RD}▕{X}{g} {DIM}{role}{X} {verdict}{surf}{RD}▏{X}")
+            rows.append(f"{RD}▕{X}{g} {DIM}{role}{X} {verdict}{surf}{tier_seg}{RD}▏{X}")
         else:
-            rows.append(f"{g} {DIM}{role}{X} {verdict}{surf}")
+            rows.append(f"{g} {DIM}{role}{X} {verdict}{surf}{tier_seg}")
     n = len(agents)
     cap = f"/{mx}" if mx else ""
     header = f"{FAINT}── swarm {n}{cap} active ──{X}"

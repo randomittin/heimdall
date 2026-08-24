@@ -9,6 +9,7 @@ tiers above it. This command makes the declaration explicit and recorded:
     table     print the routing table as encoded
     declare   record the tier a spawn runs at (and whether it inherited one)
     check     conformance: every spawn template declares a tier (spec 3.4)
+    agents    per-agent tier/model/override report (statusline data source)
     policy    report this repo's stance on non-ZDR model tiers
 
 The two rules that shape every decision below:
@@ -387,6 +388,108 @@ def cmd_check(args):
     return 0
 
 
+# ── agents ───────────────────────────────────────────────────────────────────
+# Per-agent tier/model/override report — the statusline's ONLY data source for
+# showing "which agent runs on which tier". Reuses read_frontmatter()/load_table()
+# so there is still exactly one frontmatter parser and one tier table in this
+# repo; a second parser in sentinels/hmd-statusline.py could quietly disagree
+# with `heimdall-tier check`'s own verdict.
+
+def _load_overrides(repo):
+    """{class_name: override_dict} from .planning/routing-overrides.json, or {}.
+
+    Missing file, unreadable file, or malformed JSON all mean "no overrides" —
+    never an error. That file is written by heimdall-self-improve, a pipeline
+    this command does not otherwise touch, and its only claim here is the one
+    CLAUDE.md's model-routing section already establishes: nothing in the
+    selection path reads it, so an override recorded there is real but INERT.
+    """
+    path = os.path.join(repo, '.planning', 'routing-overrides.json')
+    try:
+        with open(path) as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    overrides = data.get('overrides')
+    return overrides if isinstance(overrides, dict) else {}
+
+
+def cmd_agents(args):
+    """Report every agents/*.md template's declared tier/model/class, plus any
+    routing-overrides.json entry for its class — surfaced but explicitly marked
+    NOT in effect, since nothing in the selection path applies it.
+
+    Unlike `check`, this is a REPORT, not a gate: it never fails closed. Its
+    consumer is a statusline cache that must degrade to "nothing to show"
+    rather than block a render, so a missing agents/ dir, an unmapped agent
+    name, or a corrupt overrides file all produce a best-effort row set and
+    exit 0 — never a nonzero conformance verdict.
+    """
+    table = load_table()
+    repo = repo_root(args.repo)
+    agents_dir = os.path.join(repo, 'agents')
+    paths = sorted(glob.glob(os.path.join(agents_dir, '*.md')))
+    overrides = _load_overrides(repo)
+
+    rows = []
+    for path in paths:
+        fields = read_frontmatter(path)
+        name = fields.get('name') or os.path.basename(path)[:-3]
+        declared = fields.get('tier') or None
+        model = fields.get('model') or None
+        cls = table['agents'].get(name)
+
+        row = {
+            'agent': name,
+            'class': cls,
+            'declared_tier': declared,
+            'model': model,
+            'inherit': declared == INHERIT,
+            'override': None,
+        }
+        ov = overrides.get(cls) if cls else None
+        if isinstance(ov, dict) and ov.get('model'):
+            # 'in_effect' is a hardcoded False, not a per-row computation: the
+            # repo-wide fact (verified by grep across bin/heimdall-model-resolve,
+            # bin/heimdall-tier and agents/*.md) is that NOTHING reads this file.
+            # Note the file's own "applied" key is a write TIMESTAMP, not an
+            # is-it-live flag — echoing it here under a name like "applied"
+            # would silently relabel a timestamp as a boolean, so this uses its
+            # own distinct field instead of touching that key at all.
+            row['override'] = {
+                'model': ov.get('model'),
+                'status': ov.get('status'),
+                'reason': ov.get('reason'),
+                'in_effect': False,
+            }
+        rows.append(row)
+
+    out = {
+        'schema': 'heimdall.tier-agents/1',
+        'generated_at': datetime.now(timezone.utc).isoformat(),
+        'agents': rows,
+        # Static repo-wide truth, not derived per-run: no code path wires
+        # routing-overrides.json into model selection today (see CLAUDE.md
+        # "Model routing" / the module docstring above).
+        'overrides_wired': False,
+    }
+
+    if args.json:
+        json.dump(out, sys.stdout, sort_keys=True)
+        sys.stdout.write('\n')
+        return 0
+
+    print('PER-AGENT MODEL TIER  (%s)' % os.path.relpath(agents_dir, repo))
+    for row in rows:
+        ov = row['override']
+        ov_txt = ('  [override pending: %s — NOT applied]' % ov['model']) if ov else ''
+        print('  %-22s %-8s class=%-18s%s'
+              % (row['agent'], row['declared_tier'] or '?', row['class'] or '?', ov_txt))
+    return 0
+
+
 # ── policy ───────────────────────────────────────────────────────────────────
 
 def cmd_policy(args):
@@ -435,6 +538,11 @@ def main(argv):
     p_check = sub.add_parser('check', help='conformance: every template declares a tier')
     p_check.add_argument('--repo', help='repo root to check')
     p_check.set_defaults(func=cmd_check)
+
+    p_agents = sub.add_parser('agents', help='per-agent tier/model/override report')
+    p_agents.add_argument('--repo', help='repo root to report on')
+    p_agents.add_argument('--json', action='store_true', help='emit machine-readable rows')
+    p_agents.set_defaults(func=cmd_agents)
 
     p_policy = sub.add_parser('policy', help="report this repo's non-ZDR stance")
     p_policy.add_argument('--repo', help='repo root to report on')
