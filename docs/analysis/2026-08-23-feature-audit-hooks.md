@@ -49,33 +49,33 @@ multiple distinct commands with materially different evidence). Grouped by event
 
 ### PreToolUse (5 matchers, 14 sub-behaviors)
 
-| Matcher | Sub-behavior | Command | Exists? | Evidence of firing | Verdict |
-|---|---|---|---|---|---|
-| `Bash` | git-verb guard | `heimdall-git-guard` | Y | No git-verb Bash command ran in the checked session window — a session-scoped check only, **not** proof this never fires historically (the repo's whole workflow is agents running `git add`/`git commit --no-verify` constantly). | REGISTERED-NOT-FIRED (caveat: session-scoped check only) |
-| `Bash` | secret scan on commit | `secret-scan` | Y | No `git commit` ran in the checked session window — same caveat. | REGISTERED-NOT-FIRED (caveat: session-scoped check only) |
-| `Bash` | push: quality-gate chain | `heimdall-state check-quality-gates` → `secret-scan --require` → `heimdall-selfscan` | Y | Push is correctly never attempted (forbidden by this audit's own safety rules) — never fires, by design. | REGISTERED-NOT-FIRED (expected — push never exercised) |
-| `Bash` | push: native-hook dedup guard | inline `core.hooksPath`/`.heimdall/hooks/pre-push` check | n/a (inline) | `core.hooksPath=.heimdall/hooks` but `.heimdall/hooks/` is **absent** in this fresh worktree → dedup evaluates false → inline fallback would run. This is CLAUDE.md's own documented expected behavior for a fresh worktree ("coverage unchanged, inline check still runs") — a working fallback, not a bug. | **LIKELY-FIRES** (as designed) |
-| `Bash` | push: oracle falsify loop | `falsify` | Y | Run directly (permitted; push itself was not): `changelog-bash32` golden PASS, mutant KILLED, score 1.0000. | **FIRES** (mechanism proven) |
-| `Bash` | push: corpus regression | `corpus run` | Y | Run directly: 13/13 caught, 100%; wrote `evals/corpus/CORPUS-STATUS.md` (41 lines, real). `git status --short` immediately after came back completely empty — no residue left in the tree. | **FIRES** (mechanism proven) |
-| `Bash` | parallelism tracking (always) | `parallelism-tracker check Bash` | Y | Live state file `$TMPDIR/heimdall-parallel/default.state` (+ `.lock`), mtime today. | **FIRES** |
-| `Read\|Grep\|Glob` | parallelism tracking | `parallelism-tracker check <tool>` | Y | Same state file, updated in real time by this audit's own Read calls. | **FIRES** |
-| `Agent` | named-agent notice (advisory) | `heimdall-precheck-agent` | Y | 69 distinct transcripts match the notice string; 43 match "mailbox-resident" (targeted literal check, not a grep-as-evidence count). Confirmed: warns on stderr, `allow(){ exit 0; }` — never blocks. | **FIRES** |
-| `Agent` | brief-adoption gate (real deny path) — **not in original scope, found during audit** | `heimdall-precheck-agent` (separate code path, same script) | Y | Source-confirmed real `exit 2` + prompt rewrite via `hookSpecificOutput.updatedInput` for the NON_VERIFIED case. Not exercised this session (no Agent spawn triggered it). **Important: this is a genuinely different code path from the named-agent notice above — "the named-agent notice never blocks" is true and confirmed; "heimdall-precheck-agent never blocks" would be false.** | **LIKELY-FIRES** |
-| `Write\|Edit` | stub-shape scanner | `bin/lib/heimdall-stub-patterns.sh` | Y | Functional test run live: a `pass`-only function body was correctly flagged. | **FIRES** |
-| `Edit\|MultiEdit\|Write` | wip-commit checkpoint | `heimdall-precheck-edit` → `heimdall-wip-commit` | Y | `.planning/ledger/checkpoints` holds 61 real entries. | **FIRES** |
-| `Edit\|MultiEdit\|Write` | claim-ledger collision warning — **not in original scope, found during audit** | `heimdall-precheck-edit` → `heimdall-claim` | Y | `.planning/ledger/{claims,collisions,conflicts}` all populated with real entries. | **FIRES** |
-| `Edit\|MultiEdit\|Write` | worktree-hooks-gap self-heal — **not in original scope, found during audit** | `heimdall-precheck-edit` → `heimdall-hooks-link` | Y | Explains the live gap found above (`core.hooksPath` set, `.heimdall/hooks/` absent in this worktree). | **LIKELY-FIRES** |
+| Matcher | Sub-behavior | Command | Exists? | Evidence of firing | Latency | Verdict |
+|---|---|---|---|---|---|---|
+| `Bash` | git-verb guard | `heimdall-git-guard` | Y | No git-verb Bash command ran in the checked session window — a session-scoped check only, **not** proof this never fires historically (the repo's whole workflow is agents running `git add`/`git commit --no-verify` constantly). | not measured (latency scope = SessionStart only, per brief) | REGISTERED-NOT-FIRED (caveat: session-scoped check only) |
+| `Bash` | secret scan on commit | `secret-scan` | Y | No `git commit` ran in the checked session window — same caveat. | not measured (see above) | REGISTERED-NOT-FIRED (caveat: session-scoped check only) |
+| `Bash` | push: quality-gate chain | `heimdall-state check-quality-gates` → `secret-scan --require` → `heimdall-selfscan` | Y | Push is correctly never attempted (forbidden by this audit's own safety rules) — never fires, by design. | not measured (see above) | REGISTERED-NOT-FIRED (expected — push never exercised) |
+| `Bash` | push: native-hook dedup guard | inline `core.hooksPath`/`.heimdall/hooks/pre-push` check | n/a (inline) | `core.hooksPath=.heimdall/hooks` but `.heimdall/hooks/` is **absent** in this fresh worktree → dedup evaluates false → inline fallback would run. This is CLAUDE.md's own documented expected behavior for a fresh worktree ("coverage unchanged, inline check still runs") — a working fallback, not a bug. | not measured (see above) | **LIKELY-FIRES** (as designed) |
+| `Bash` | push: oracle falsify loop | `falsify` | Y | Run directly (permitted; push itself was not): `changelog-bash32` golden PASS, mutant KILLED, score 1.0000. | not measured (see above) | **FIRES** (mechanism proven) |
+| `Bash` | push: corpus regression | `corpus run` | Y | Run directly: 13/13 caught, 100%; wrote `evals/corpus/CORPUS-STATUS.md` (41 lines, real). `git status --short` immediately after came back completely empty — no residue left in the tree. | not measured (see above) | **FIRES** (mechanism proven) |
+| `Bash` | parallelism tracking (always) | `parallelism-tracker check Bash` | Y | Live state file `$TMPDIR/heimdall-parallel/default.state` (+ `.lock`), mtime today. | not measured (see above) | **FIRES** |
+| `Read\|Grep\|Glob` | parallelism tracking | `parallelism-tracker check <tool>` | Y | Same state file, updated in real time by this audit's own Read calls. | not measured (see above) | **FIRES** |
+| `Agent` | named-agent notice (advisory) | `heimdall-precheck-agent` | Y | 69 distinct transcripts match the notice string; 43 match "mailbox-resident" (targeted literal check, not a grep-as-evidence count). Confirmed: warns on stderr, `allow(){ exit 0; }` — never blocks. | not measured (see above) | **FIRES** |
+| `Agent` | brief-adoption gate (real deny path) — **not in original scope, found during audit** | `heimdall-precheck-agent` (separate code path, same script) | Y | Source-confirmed real `exit 2` + prompt rewrite via `hookSpecificOutput.updatedInput` for the NON_VERIFIED case. Not exercised this session (no Agent spawn triggered it). **Important: this is a genuinely different code path from the named-agent notice above — "the named-agent notice never blocks" is true and confirmed; "heimdall-precheck-agent never blocks" would be false.** | not measured (see above) | **LIKELY-FIRES** |
+| `Write\|Edit` | stub-shape scanner | `bin/lib/heimdall-stub-patterns.sh` | Y | Functional test run live: a `pass`-only function body was correctly flagged. | not measured (see above) | **FIRES** |
+| `Edit\|MultiEdit\|Write` | wip-commit checkpoint | `heimdall-precheck-edit` → `heimdall-wip-commit` | Y | `.planning/ledger/checkpoints` holds 61 real entries. | not measured (see above) | **FIRES** |
+| `Edit\|MultiEdit\|Write` | claim-ledger collision warning — **not in original scope, found during audit** | `heimdall-precheck-edit` → `heimdall-claim` | Y | `.planning/ledger/{claims,collisions,conflicts}` all populated with real entries. | not measured (see above) | **FIRES** |
+| `Edit\|MultiEdit\|Write` | worktree-hooks-gap self-heal — **not in original scope, found during audit** | `heimdall-precheck-edit` → `heimdall-hooks-link` | Y | Explains the live gap found above (`core.hooksPath` set, `.heimdall/hooks/` absent in this worktree). | not measured (see above) | **LIKELY-FIRES** |
 
 ### PostToolUse (4 matchers, 6 sub-behaviors)
 
-| Matcher | Sub-behavior | Command | Exists? | Evidence of firing | Verdict |
-|---|---|---|---|---|---|
-| `Bash` | corpus failure capture | `corpus-capture` | Y | Confirmed no-op **by design**: only acts on a `report.json` with `status=="fail"`; zero `report.json` anywhere in the worktree right now (each oracle generates one transiently on demand). Correctly idle, not broken. | REGISTERED-NOT-FIRED (legitimate no-op) |
-| `Write\|Edit\|MultiEdit\|NotebookEdit` | edit logging | `edit-tracker log` | Y | Live-run by the auditor: `edit-tracker log Read bin/parallel-gate` → "1 files, 1 operations … [ok]". | **FIRES** (live-verified) |
-| `Write\|Edit\|MultiEdit\|NotebookEdit` | dirty-state marking | `heimdall-state mark-dirty` | Y | Dispatch confirmed in source; `heimdall-state.json` currently reads `dirty:false/idle` — a default snapshot, not proof of a recent mutation (correctly not run live: shared cwd-relative file). | **LIKELY-FIRES** |
-| `Write\|Edit\|MultiEdit\|NotebookEdit` | auto-checkpoint commit | `heimdall-autocommit "auto-checkpoint"` | Y | **12 real `heimdall: auto-checkpoint (N files)` commits found in git history** (`db0d0a3`, `d6e661d`, `35830f9`, +9 more) — historical evidence beyond this session. | **FIRES** |
-| `Write\|Edit` (backgrounded) | context sync | `heimdall-context-sync sync` | Y | Dispatch + exact call-site args confirmed in source. Correctly not run live (writes inside the repo). No sync/throttle marker artifact found. | **LIKELY-FIRES** |
-| `Bash` | journal commit | `heimdall-journal-hook commit` | Y | `.planning/journal/` holds 4 real files spanning 2026-08-18 to 2026-08-23. | **FIRES** |
+| Matcher | Sub-behavior | Command | Exists? | Evidence of firing | Latency | Verdict |
+|---|---|---|---|---|---|---|
+| `Bash` | corpus failure capture | `corpus-capture` | Y | Confirmed no-op **by design**: only acts on a `report.json` with `status=="fail"`; zero `report.json` anywhere in the worktree right now (each oracle generates one transiently on demand). Correctly idle, not broken. | not measured (latency scope = SessionStart only, per brief) | REGISTERED-NOT-FIRED (legitimate no-op) |
+| `Write\|Edit\|MultiEdit\|NotebookEdit` | edit logging | `edit-tracker log` | Y | Live-run by the auditor: `edit-tracker log Read bin/parallel-gate` → "1 files, 1 operations … [ok]". | not measured (see above) | **FIRES** (live-verified) |
+| `Write\|Edit\|MultiEdit\|NotebookEdit` | dirty-state marking | `heimdall-state mark-dirty` | Y | Dispatch confirmed in source; `heimdall-state.json` currently reads `dirty:false/idle` — a default snapshot, not proof of a recent mutation (correctly not run live: shared cwd-relative file). | not measured (see above) | **LIKELY-FIRES** |
+| `Write\|Edit\|MultiEdit\|NotebookEdit` | auto-checkpoint commit | `heimdall-autocommit "auto-checkpoint"` | Y | **12 real `heimdall: auto-checkpoint (N files)` commits found in git history** (`db0d0a3`, `d6e661d`, `35830f9`, +9 more) — historical evidence beyond this session. | not measured (see above) | **FIRES** |
+| `Write\|Edit` (backgrounded) | context sync | `heimdall-context-sync sync` | Y | Dispatch + exact call-site args confirmed in source. Correctly not run live (writes inside the repo). No sync/throttle marker artifact found. | not measured (see above) | **LIKELY-FIRES** |
+| `Bash` | journal commit | `heimdall-journal-hook commit` | Y | `.planning/journal/` holds 4 real files spanning 2026-08-18 to 2026-08-23. | not measured (see above) | **FIRES** |
 
 ### SessionStart (8 entries, 12 sub-behaviors) — none of the 8 entries gate on `.source`
 
@@ -118,18 +118,18 @@ off the synchronous path.
 
 ### SessionEnd (2 entries, 10 sub-behaviors)
 
-| Entry | Sub-behavior | fg/bg | Exists? | Evidence of firing | Verdict |
-|---|---|---|---|---|---|
-| 1 | `heimdall-presence keeper-stop` | fg | Y | Trivial, low-risk; not deeply probed. | **LIKELY-FIRES** |
-| 2 | `heimdall-checkpoint write` | fg | Y | Guard is satisfiable (`.planning/` + `heimdall-state.json` both exist) but `CHECKPOINT.md` is **absent** from the worktree. | REGISTERED-NOT-FIRED |
-| 2 | `parallelism-tracker grade` | fg | Y | Run live: "82 batched/268 turns, ratio 0.31, 402 calls." | **FIRES** |
-| 2 | `verify-edits --quick` | fg | Y | Run live: "ledger present, 0 edits." | **FIRES** |
-| 2 | `heimdall-autocommit "session-end checkpoint"` | fg | Y | 73× "session-end checkpoint" commits found in `git log --all` (repo-wide). | **FIRES** |
-| 2 | `heimdall-cleanup --auto`/`heimdall-gc`/`heimdall-reap-idle` | bg | Y | Real deletions — excluded from live execution by this audit's own rules. | **NOT VERIFIED** (excluded by safety rules) |
-| 2 | `heimdall-reel record` | bg | Y | Guard satisfiable but `.planning/reels/` is **absent**, zero `run-*` artifacts. | REGISTERED-NOT-FIRED |
-| 2 | `summary-card --receipt` | bg | Y | stdout-only per source (no disk write) — not independently verifiable without a live run. | **LIKELY-FIRES** (unverifiable by design) |
-| 2 | `heimdall-context-sync sync` | bg | Y | The `hmd/context` orphan branch exists with a real commit `77a7da4c`. | **FIRES** |
-| 2 | `sentinels/hmd-farewell.sh` | fg | Y (8231 bytes, executable) | stdout-only per source — not independently verifiable without a live run. | **LIKELY-FIRES** (unverifiable by design) |
+| Entry | Sub-behavior | fg/bg | Exists? | Evidence of firing | Latency | Verdict |
+|---|---|---|---|---|---|---|
+| 1 | `heimdall-presence keeper-stop` | fg | Y | Trivial, low-risk; not deeply probed. | not measured (latency scope = SessionStart only, per brief) | **LIKELY-FIRES** |
+| 2 | `heimdall-checkpoint write` | fg | Y | Guard is satisfiable (`.planning/` + `heimdall-state.json` both exist) but `CHECKPOINT.md` is **absent** from the worktree. | see "fake timeout" flag below — this is one of the 4 bins in the unbounded chain | REGISTERED-NOT-FIRED |
+| 2 | `parallelism-tracker grade` | fg | Y | Run live: "82 batched/268 turns, ratio 0.31, 402 calls." | see "fake timeout" flag below | **FIRES** |
+| 2 | `verify-edits --quick` | fg | Y | Run live: "ledger present, 0 edits." | see "fake timeout" flag below | **FIRES** |
+| 2 | `heimdall-autocommit "session-end checkpoint"` | fg | Y | 73× "session-end checkpoint" commits found in `git log --all` (repo-wide). | see "fake timeout" flag below | **FIRES** |
+| 2 | `heimdall-cleanup --auto`/`heimdall-gc`/`heimdall-reap-idle` | bg | Y | Real deletions — excluded from live execution by this audit's own rules. | n/a (backgrounded) | **NOT VERIFIED** (excluded by safety rules) |
+| 2 | `heimdall-reel record` | bg | Y | Guard satisfiable but `.planning/reels/` is **absent**, zero `run-*` artifacts. | n/a (backgrounded) | REGISTERED-NOT-FIRED |
+| 2 | `summary-card --receipt` | bg | Y | stdout-only per source (no disk write) — not independently verifiable without a live run. | n/a (backgrounded) | **LIKELY-FIRES** (unverifiable by design) |
+| 2 | `heimdall-context-sync sync` | bg | Y | The `hmd/context` orphan branch exists with a real commit `77a7da4c`. | n/a (backgrounded) | **FIRES** |
+| 2 | `sentinels/hmd-farewell.sh` | fg | Y (8231 bytes, executable) | stdout-only per source — not independently verifiable without a live run. | not measured | **LIKELY-FIRES** (unverifiable by design) |
 
 **Big flag — the SessionEnd timeout is fake safety.** `command -v timeout` and `command -v gtimeout` both fail
 (`rc=1`, confirmed absent on this machine). The hook's own `_hmd_to()` wrapper falls back to `else "$@"` when
