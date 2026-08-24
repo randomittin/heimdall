@@ -137,7 +137,7 @@ The public key ships in this repo at `release/heimdall-signing.pub`, so that com
 clone. [`SIGNING.md`](SIGNING.md) has the full model — including the bundled pure-python verifier
 for machines with no `minisign` binary, and the fail-closed behavior of the auto-updater.
 
-**Prerequisites:** Claude Code 1.0+ · Git · `jq` (`brew install jq`)
+**Prerequisites:** Claude Code 1.0+ · Git · `jq` (`brew install jq`) — `install.sh` itself completes without `jq` (every call site there guards with `command -v jq`), but most `hmd` subcommands hard-require it afterward, so install it up front
 
 hmd is itself a Claude Code plugin, so Claude Code is what installs and runs it. If Cursor CLI's `agent` (`cursor-agent`) is also on `PATH`, `hmd init` gates that host too — see [Also gates Cursor CLI](#also-gates-cursor-cli).
 
