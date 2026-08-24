@@ -382,6 +382,112 @@ HELP_OUT="$("$AR" help 2>&1)"; HELP_RC=$?
   && ok "help exits 0 and identifies itself" \
   || bad "help contract broken (rc=$HELP_RC)"
 
+# ═════════════════════════════════════════════════════════════════════════════
+# (10) CAUSE CLASSIFICATION — overloaded / quota / network / context-overflow /
+#      unknown, each fixtured with real notification text, proving the
+#      classifier routes each to the correct retry_now verdict. The single
+#      most load-bearing property: a genuine failure (unknown) must NEVER be
+#      marked retry_now=true — see the FALSIFIER below.
+# ═════════════════════════════════════════════════════════════════════════════
+
+# -- quota: cause.class mirrors quota.suspected exactly, no second detector --
+[ "$(report_field "$REPO" "$R_KQ" .cause.class)" = "quota" ] \
+  && ok "killed + quota-phrase summary -> cause.class = quota (mirrors quota.suspected)" \
+  || bad "expected cause.class=quota for R_KQ, got '$(report_field "$REPO" "$R_KQ" .cause.class)'"
+[ "$(report_field "$REPO" "$R_KQ" .cause.retry_now)" = "false" ] \
+  && ok "quota cause -> retry_now=false (retry is useless until the reset time)" \
+  || bad "expected cause.retry_now=false for quota, got '$(report_field "$REPO" "$R_KQ" .cause.retry_now)'"
+
+# -- unknown/genuine failure: the generic stack-trace summary, no transient signal --
+[ "$(report_field "$REPO" "$R_FG" .cause.class)" = "unknown" ] \
+  && ok "generic stack-trace summary -> cause.class = unknown (no transient signal)" \
+  || bad "expected cause.class=unknown for R_FG, got '$(report_field "$REPO" "$R_FG" .cause.class)'"
+[ "$(report_field "$REPO" "$R_FG" .cause.retry_now)" = "false" ] \
+  && ok "FALSIFIER: a genuine/unknown failure is NEVER marked retry_now=true" \
+  || bad "FALSIFIER FAILED: unknown-cause agent was marked retry_now=true — would auto-retry a real bug"
+
+# -- no signal at all (orphaned/hung): cause.class is JSON null, never a guess --
+[ "$(report_field "$REPO" "$R_HUNG" .cause.class)" = "null" ] \
+  && ok "hung agent (no notification ever fired): cause.class is null, not a guessed value" \
+  || bad "expected cause.class=null for hung agent, got '$(report_field "$REPO" "$R_HUNG" .cause.class)'"
+[ "$(report_field "$REPO" "$R_HUNG" .cause.retry_now)" = "false" ] \
+  && ok "no-signal cause -> retry_now=false (fail open: never recommend a retry with no evidence)" \
+  || bad "expected cause.retry_now=false with no signal, got '$(report_field "$REPO" "$R_HUNG" .cause.retry_now)'"
+
+# -- network: reuses R_NOWT's existing "connection refused" text, no worktree --
+[ "$(report_field "$REPO" "$R_NOWT" .cause.class)" = "network" ] \
+  && ok "'connection refused to internal service' -> cause.class = network" \
+  || bad "expected cause.class=network for R_NOWT, got '$(report_field "$REPO" "$R_NOWT" .cause.class)'"
+[ "$(report_field "$REPO" "$R_NOWT" .cause.retry_now)" = "true" ] \
+  && ok "network cause -> retry_now=true (transient, safe to retry)" \
+  || bad "expected cause.retry_now=true for network, got '$(report_field "$REPO" "$R_NOWT" .cause.retry_now)'"
+[ "$(report_field "$REPO" "$R_NOWT" .cause.attempts)" = "null" ] \
+  && ok "network cause with no worktree recorded -> attempts is null (nothing to bound against)" \
+  || bad "expected cause.attempts=null for a no-worktree network agent, got '$(report_field "$REPO" "$R_NOWT" .cause.attempts)'"
+
+# -- context overflow: the task's own quoted real-world example --
+R_CTX="arctxoverflow0000011"
+mk_agent "$R_CTX" 10 end
+mk_notif2 "$R_CTX" failed "Prompt is too long · automatic compaction failed"
+[ "$(report_field "$REPO" "$R_CTX" .cause.class)" = "context_overflow" ] \
+  && ok "'Prompt is too long · automatic compaction failed' -> cause.class = context_overflow" \
+  || bad "expected cause.class=context_overflow for R_CTX, got '$(report_field "$REPO" "$R_CTX" .cause.class)'"
+[ "$(report_field "$REPO" "$R_CTX" .cause.retry_now)" = "false" ] \
+  && ok "context_overflow -> retry_now=false (identical prompt would overflow again — needs narrower scope, not a retry)" \
+  || bad "expected cause.retry_now=false for context_overflow, got '$(report_field "$REPO" "$R_CTX" .cause.retry_now)'"
+
+# -- overloaded, and the bounded-retry-with-backoff mechanism (needs a real worktree) --
+WT2="$WORK/agent-worktree-overload"
+mkdir -p "$WT2"
+git -C "$WT2" init -q -b main >/dev/null 2>&1
+printf '.planning/*\n' > "$WT2/.gitignore"
+git -C "$WT2" add .gitignore
+git -C "$WT2" -c user.email=t@t -c user.name=t commit -q -m init
+git -C "$WT2" checkout -q -b worktree-agent-rovl >/dev/null 2>&1
+R_OVL="arboverloaded00000010"
+mk_agent_wt "$R_OVL" 10 end "$WT2" "worktree-agent-rovl" "Retry-bounding fixture"
+OVERLOAD_TEXT='Agent terminated early due to an API error: 529 {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}'
+mk_notif2 "$R_OVL" killed "$OVERLOAD_TEXT"
+
+OVL_A1="$(HMD_AGENT_RESUME_MAX_ATTEMPTS=2 "$AR" report --json --repo "$REPO" --id "$R_OVL" 2>/dev/null)"
+[ "$(printf '%s' "$OVL_A1" | jq -r '.[0].cause.class')" = "overloaded" ] \
+  && ok "529/overloaded_error summary -> cause.class = overloaded" \
+  || bad "expected cause.class=overloaded for R_OVL, got: $(printf '%s' "$OVL_A1" | jq -c '.[0].cause')"
+[ "$(printf '%s' "$OVL_A1" | jq -r '.[0].cause.retry_now')" = "true" ] && [ "$(printf '%s' "$OVL_A1" | jq -r '.[0].cause.attempts')" = "1" ] \
+  && ok "overloaded, attempt 1/2: retry_now=true, attempts=1" \
+  || bad "attempt 1 wrong: $(printf '%s' "$OVL_A1" | jq -c '.[0].cause')"
+
+OVL_A2="$(HMD_AGENT_RESUME_MAX_ATTEMPTS=2 "$AR" report --json --repo "$REPO" --id "$R_OVL" 2>/dev/null)"
+[ "$(printf '%s' "$OVL_A2" | jq -r '.[0].cause.retry_now')" = "true" ] && [ "$(printf '%s' "$OVL_A2" | jq -r '.[0].cause.attempts')" = "2" ] \
+  && ok "overloaded, attempt 2/2: still retry_now=true (cap not exceeded yet)" \
+  || bad "attempt 2 wrong: $(printf '%s' "$OVL_A2" | jq -c '.[0].cause')"
+
+OVL_A3="$(HMD_AGENT_RESUME_MAX_ATTEMPTS=2 "$AR" report --json --repo "$REPO" --id "$R_OVL" 2>/dev/null)"
+[ "$(printf '%s' "$OVL_A3" | jq -r '.[0].cause.retry_now')" = "false" ] && [ "$(printf '%s' "$OVL_A3" | jq -r '.[0].cause.attempts_exhausted')" = "true" ] \
+  && ok "FALSIFIER: 3rd attempt against a cap of 2 flips to retry_now=false, attempts_exhausted=true — retries are bounded, not infinite" \
+  || bad "FALSIFIER FAILED: retry cap did not stop a 3rd attempt: $(printf '%s' "$OVL_A3" | jq -c '.[0].cause')"
+
+git -C "$WT2" commit -q --allow-empty -m "progress landed"
+OVL_A4="$(HMD_AGENT_RESUME_MAX_ATTEMPTS=2 "$AR" report --json --repo "$REPO" --id "$R_OVL" 2>/dev/null)"
+[ "$(printf '%s' "$OVL_A4" | jq -r '.[0].cause.retry_now')" = "true" ] && [ "$(printf '%s' "$OVL_A4" | jq -r '.[0].cause.attempts')" = "1" ] \
+  && ok "a real commit landing on the worktree resets the attempt counter to 1 (forward progress, not a stuck loop)" \
+  || bad "expected attempts to reset after a new commit, got: $(printf '%s' "$OVL_A4" | jq -c '.[0].cause')"
+
+[ "$(report_field "$REPO" "$R_OVL" .resume_brief.dirty)" = "0" ] \
+  && ok "retry-bookkeeping file (.planning/RESUME-ATTEMPTS.json) is gitignored — never inflates this worktree's own dirty count" \
+  || bad "bookkeeping file leaked into dirty count: $(report_field "$REPO" "$R_OVL" .resume_brief.dirty)"
+
+# -- the payload text itself carries the cause + action, human-readable --
+PAYLOAD_OVL="$(report_field "$REPO" "$R_OVL" .payload)"
+printf '%s' "$PAYLOAD_OVL" | grep -q "^Cause: overloaded" \
+  && ok "payload names the cause explicitly (overloaded)" \
+  || bad "payload missing the Cause: line for overloaded"
+
+PAYLOAD_FG="$(report_field "$REPO" "$R_FG" .payload)"
+printf '%s' "$PAYLOAD_FG" | grep -qi "do not auto-retry" \
+  && ok "payload for an unknown/genuine failure explicitly says not to auto-retry" \
+  || bad "payload for a genuine failure missing the do-not-auto-retry instruction"
+
 echo
 echo "  ${PASS} passed, ${FAIL} failed"
 [ "$FAIL" -eq 0 ] || exit 1

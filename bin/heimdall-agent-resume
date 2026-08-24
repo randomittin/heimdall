@@ -41,6 +41,12 @@
 #                              SessionStart hook calls THIS tool's
 #                              `resume-hint` as a best-effort, independent
 #                              second signal — see its cmd_resume_hint.
+#   bin/heimdall-quota-advisor owns QUOTA-only options-advice (wait for
+#                              reset / cheaper tier / BYOK / router-with-
+#                              warning) once a stop is confirmed — a sibling
+#                              consumer of the SAME quota_stop.py, invoked
+#                              on-demand only, never from a hook. Not a cause
+#                              classifier and not called from here.
 #
 # WHICH STATES COUNT AS "INTERRUPTED" (default: failed,killed,orphaned,hung) ──
 #   failed/killed — the harness DID enqueue a <task-notification> before the
@@ -80,6 +86,60 @@
 #           notification could not be located). Reported as "unknown", never
 #           guessed from state alone.
 #
+# CAUSE CLASSIFICATION — beyond quota: overloaded / network / context-overflow
+#   / unknown. Quota is ONE of five interruption causes; "retry" means
+#   something different for each, so `report`'s output also carries a
+#   `.cause` object ({class, retry_now, action, attempts, max_attempts,
+#   backoff_secs, attempts_exhausted}):
+#     overloaded — Anthropic 529/overloaded_error (or a bare 429/rate-limit
+#                  with no quota reset clause). Transient: retry_now=true,
+#                  with a bounded, backed-off attempt count (see below).
+#                  Vocabulary mirrors bin/lib/hmd-claude-retry.sh's own
+#                  _hmd_is_overload_text — same signal, cited not re-derived.
+#     quota      — exactly quota.suspected == true, above. retry_now=false;
+#                  no second detector, no duplicated reset-time math.
+#     network    — connection-reset/refused/timeout/DNS-failure vocabulary.
+#                  Transient: retry_now=true, same bounded-attempt treatment
+#                  as overloaded (and shares its attempt counter).
+#     context_overflow — "prompt is too long" / "automatic compaction
+#                  failed" / context-window text. retry_now=false: retrying
+#                  the IDENTICAL prompt fails IDENTICALLY — this needs a
+#                  narrower scope or a fresh agent, never a same-shape retry.
+#                  Never counted against the retry-attempt cap.
+#     unknown    — real termination text existed and matched none of the
+#                  above: a possible genuine bug. retry_now=false, always —
+#                  auto-retrying a real failure wastes tokens and hides it.
+#   class is JSON null (not the string "unknown") when there is no text at
+#   all to classify — the same null-vs-false honesty split as
+#   quota.suspected above, for the identical reason (orphaned/hung agents
+#   never had a notification to classify in the first place).
+#
+#   BOUNDED RETRY, PER WORKTREE — an unbounded backoff loop against a hard
+#   outage is an infinite loop, so overloaded/network attempts are capped,
+#   explicitly (default 5, HMD_AGENT_RESUME_MAX_ATTEMPTS). The counter lives
+#   at <worktree>/.planning/RESUME-ATTEMPTS.json — same directory and same
+#   gitignored-runtime-state contract as bin/heimdall-quota-resume's own
+#   .planning/QUOTA-STOP.json (a repo without that gitignore convention will
+#   see this file as an untracked/dirty entry in resume_brief — harmless,
+#   same exposure QUOTA-STOP.json already has in the orchestrator's own
+#   repo). Keyed by the worktree's OWN HEAD sha: a HEAD that has moved since
+#   the last recorded attempt is real forward progress, so the count resets
+#   to a fresh attempt 1 instead of compounding toward the cap forever. Only
+#   incremented by `report` (a deliberate, about-to-act call) — never by the
+#   cheap `resume-hint` SessionStart path. Fails OPEN on any git/fs error or
+#   a missing/unrecorded worktree: attempts/max_attempts/backoff_secs/
+#   attempts_exhausted all report JSON null (nothing to bound against) and
+#   retry_now stays true — this is advisory bookkeeping, not a safety gate,
+#   and must never block a legitimate retry recommendation on a filesystem
+#   hiccup.
+#
+#   THE CEILING — same honesty as THE HONEST BOUNDARY above: this can tell
+#   you which bucket an interruption falls in and whether retrying is worth
+#   trying, with a bounded recommendation. It cannot itself retry anything —
+#   no hook or script here can call SendMessage or respawn a dead subagent;
+#   that is still a live orchestrator's action, same as everything else in
+#   this file.
+#
 # USAGE
 #   heimdall-agent-resume list   [--json] [--repo DIR] [--states s1,s2,...]
 #   heimdall-agent-resume report [--json] [--repo DIR] [--states ...]
@@ -101,6 +161,11 @@
 #                                 reused verbatim for the detect() calls here.
 #   HMD_AGENT_RESUME_AGENTS_BIN   override path to heimdall-agents (tests)
 #   HMD_AGENT_RESUME_BRIEF_BIN    override path to heimdall-resume-brief (tests)
+#   HMD_AGENT_RESUME_MAX_ATTEMPTS       retry-recommendation cap per worktree
+#                                       for overloaded/network causes
+#                                       (default 5; see CAUSE CLASSIFICATION).
+#   HMD_AGENT_RESUME_BACKOFF_BASE_SECS  backoff base seconds (default 2).
+#   HMD_AGENT_RESUME_BACKOFF_CAP_SECS   backoff cap seconds (default 60).
 set -uo pipefail
 
 _AR_SELF="$0"
@@ -153,6 +218,130 @@ _classify_text() {
     }' 2>/dev/null && return 0
   fi
   printf '%s' '{"suspected":false,"reset_local":null,"reset_tz":null,"resolved":null,"reset_epoch":null}'
+}
+
+# ── cause classification (extends the quota-only classifier above with
+#    overloaded/network/context-overflow detection + a bounded, per-worktree
+#    retry recommendation — see the CAUSE CLASSIFICATION header section).
+#    Reuses the quota verdict _classify_text already computed; never
+#    re-invokes quota_stop.py a second time. Patterns mirror
+#    bin/lib/hmd-claude-retry.sh's own _hmd_is_overload_text (529/overloaded/
+#    429/rate-limit) — same vocabulary, cited not re-derived.
+_OVERLOAD_RE='529|overloaded(_error)?|"overloaded"|too many requests|429|rate.?limit'
+_NETWORK_RE='econnreset|etimedout|ehostunreach|enetunreach|epipe|connection reset|connection refused|socket hang up|network error|getaddrinfo|dns lookup failed'
+_CTXOVERFLOW_RE='prompt is too long|context window|maximum context length|context length exceeded|automatic compaction failed|too many tokens'
+
+# _resume_attempts_bump <worktree> <cause_class> -> prints the NEW attempt
+# count (a bare integer, always) on stdout. Persists to
+# <worktree>/.planning/RESUME-ATTEMPTS.json. Keyed by the worktree's OWN HEAD
+# sha: a HEAD that has moved since the last recorded attempt is real forward
+# progress, so the count resets to a fresh attempt 1 instead of compounding
+# toward the cap forever. Fails OPEN on any git/fs error: prints 0 rather
+# than ever blocking a legitimate retry recommendation on a filesystem
+# hiccup — this is advisory bookkeeping, not a safety gate.
+_resume_attempts_bump() {
+  local wt="$1" cls="$2" f head prev_head prev_attempts new_attempts
+  head="$(git -C "$wt" rev-parse HEAD 2>/dev/null || true)"
+  [ -n "$head" ] || { echo 0; return 0; }
+  f="$wt/.planning/RESUME-ATTEMPTS.json"
+
+  prev_head=""; prev_attempts=0
+  if [ -f "$f" ]; then
+    prev_head="$(jq -r '.head_sha // ""' "$f" 2>/dev/null || true)"
+    prev_attempts="$(jq -r '.attempts // 0' "$f" 2>/dev/null || echo 0)"
+    [ -n "$prev_attempts" ] || prev_attempts=0
+  fi
+
+  if [ "$prev_head" = "$head" ]; then
+    new_attempts=$((prev_attempts + 1))
+  else
+    new_attempts=1
+  fi
+
+  if mkdir -p "$wt/.planning" 2>/dev/null; then
+    jq -n --arg h "$head" --argjson a "$new_attempts" --arg c "$cls" \
+      '{head_sha:$h, attempts:$a, cause_class:$c}' > "$f.tmp.$$" 2>/dev/null \
+      && mv "$f.tmp.$$" "$f" 2>/dev/null || rm -f "$f.tmp.$$" 2>/dev/null
+  fi
+  echo "$new_attempts"
+}
+
+# _classify_cause <text> <quota_suspected: "true"|"false"|"null"> <worktree>
+# -> JSON {class, retry_now, action, attempts, max_attempts, backoff_secs,
+# attempts_exhausted} on stdout. class is JSON null (not the string
+# "unknown") when there is no text at all to classify from — mirrors
+# quota.suspected's null-vs-false honesty distinction exactly (see QUOTA
+# CLASSIFICATION HONESTY above). retry_now is false for every class except a
+# not-yet-exhausted overloaded/network.
+_classify_cause() {
+  local text="$1" quota_suspected="$2" wt="$3"
+  local max base cap
+  max="${HMD_AGENT_RESUME_MAX_ATTEMPTS:-5}"
+  base="${HMD_AGENT_RESUME_BACKOFF_BASE_SECS:-2}"
+  cap="${HMD_AGENT_RESUME_BACKOFF_CAP_SECS:-60}"
+
+  if [ -z "$text" ]; then
+    jq -n '{class:null, retry_now:false,
+      action:"no termination text available to classify (orphaned/hung — session ended without a notification); inspect manually",
+      attempts:null, max_attempts:null, backoff_secs:null, attempts_exhausted:null}'
+    return 0
+  fi
+
+  if [ "$quota_suspected" = "true" ]; then
+    jq -n '{class:"quota", retry_now:false,
+      action:"do not retry now — wait for the reset time above (see heimdall-quota-resume status / heimdall-quota-advisor status)",
+      attempts:null, max_attempts:null, backoff_secs:null, attempts_exhausted:null}'
+    return 0
+  fi
+
+  local cls
+  if printf '%s' "$text" | grep -qiE "$_CTXOVERFLOW_RE" 2>/dev/null; then
+    cls="context_overflow"
+  elif printf '%s' "$text" | grep -qiE "$_OVERLOAD_RE" 2>/dev/null; then
+    cls="overloaded"
+  elif printf '%s' "$text" | grep -qiE "$_NETWORK_RE" 2>/dev/null; then
+    cls="network"
+  else
+    cls="unknown"
+  fi
+
+  case "$cls" in
+    context_overflow)
+      jq -n '{class:"context_overflow", retry_now:false,
+        action:"do not retry as-is — the identical prompt will overflow again; resume with a narrower scope or a fresh agent",
+        attempts:null, max_attempts:null, backoff_secs:null, attempts_exhausted:null}'
+      ;;
+    unknown)
+      jq -n '{class:"unknown", retry_now:false,
+        action:"no transient-failure signal found — treat as a possible genuine failure and review manually; do not auto-retry",
+        attempts:null, max_attempts:null, backoff_secs:null, attempts_exhausted:null}'
+      ;;
+    overloaded|network)
+      if [ -n "$wt" ] && _worktree_exists "$wt"; then
+        local attempts exhausted retry action shift_n backoff
+        attempts="$(_resume_attempts_bump "$wt" "$cls")"
+        [ -n "$attempts" ] || attempts=0
+        if [ "$attempts" -gt "$max" ] 2>/dev/null; then
+          exhausted="true"; retry="false"; backoff=0
+          action="retry budget exhausted (${attempts}/${max} attempts on this worktree with no forward progress) — escalate to a human instead of retrying again"
+        else
+          exhausted="false"; retry="true"
+          shift_n=0; [ "$attempts" -gt 1 ] && shift_n=$((attempts - 1))
+          [ "$shift_n" -gt 20 ] && shift_n=20
+          backoff=$(( base * (1 << shift_n) )); [ "$backoff" -gt "$cap" ] && backoff="$cap"
+          action="transient $cls — safe to retry now (attempt ${attempts}/${max}, ~${backoff}s exponential backoff+jitter)"
+        fi
+        jq -n --arg c "$cls" --argjson rn "$retry" --arg a "$action" \
+              --argjson att "$attempts" --argjson mx "$max" --argjson bo "$backoff" --argjson ex "$exhausted" \
+          '{class:$c, retry_now:$rn, action:$a, attempts:$att, max_attempts:$mx, backoff_secs:$bo, attempts_exhausted:$ex}'
+      else
+        jq -n --arg c "$cls" \
+          '{class:$c, retry_now:true,
+            action:"transient (no worktree recorded for this agent, so retry attempts are not bounded here — exercise judgment)",
+            attempts:null, max_attempts:null, backoff_secs:null, attempts_exhausted:null}'
+      fi
+      ;;
+  esac
 }
 
 # Pull the LAST <summary>…</summary> for a specific task-id out of a set of
@@ -260,6 +449,7 @@ _payload_for() {
       (if .quota.suspected == true and .quota.reset_local != null
        then " (resets " + .quota.reset_local + " " + (.quota.reset_tz // "") + ")"
        else "" end)) as $quota |
+    ("Cause: " + (.cause.class // "none (orphaned/hung, no notification text)") + " — " + .cause.action) as $cause |
     (if .worktree_path == null then
        "No isolated worktree recorded for this agent (not spawned with worktree isolation)."
      elif (.resume_brief == null) then
@@ -275,7 +465,7 @@ _payload_for() {
         then " — AT RISK if this worktree is discarded: " + (.resume_brief.dirty_files | join(", "))
         else " (clean)" end)
      end) as $wt |
-    $hdr + "\n" + $task + "\n" + $quota + "\n" + $wt + "\n" +
+    $hdr + "\n" + $task + "\n" + $quota + "\n" + $cause + "\n" + $wt + "\n" +
     "Resume from this state — do not restart from scratch."
   '
 }
@@ -319,7 +509,7 @@ cmd_report() {
     done
   fi
 
-  local combined_all="" obj id wt qtext qjson brief combined payload
+  local combined_all="" obj id wt qtext qjson qsuspected cause brief combined payload
   while IFS= read -r obj; do
     [ -n "$obj" ] || continue
     id="$(printf '%s' "$obj" | jq -r '.id')"
@@ -327,6 +517,8 @@ cmd_report() {
 
     qtext="$(_notif_summary_for "$id" "$parents")"
     qjson="$(_classify_text "$qtext")"
+    qsuspected="$(printf '%s' "$qjson" | jq -r '.suspected')"
+    cause="$(_classify_cause "$qtext" "$qsuspected" "$wt")"
 
     if [ -n "$wt" ] && _worktree_exists "$wt"; then
       brief="$(_brief_json "$wt" "$base" "$run_tests")"
@@ -336,8 +528,8 @@ cmd_report() {
       brief='null'
     fi
 
-    combined="$(jq -n --argjson base "$obj" --argjson quota "$qjson" --argjson brief "$brief" \
-      '$base + {quota: $quota, resume_brief: $brief}')"
+    combined="$(jq -n --argjson base "$obj" --argjson quota "$qjson" --argjson brief "$brief" --argjson cause "$cause" \
+      '$base + {quota: $quota, resume_brief: $brief, cause: $cause}')"
     payload="$(printf '%s' "$combined" | _payload_for)"
     combined="$(printf '%s' "$combined" | jq -c --arg payload "$payload" '. + {payload: $payload}')"
     combined_all="$combined_all$combined"$'\n'
@@ -379,6 +571,7 @@ cmd_resume_hint() {
   printf '%s' "$rows" | jq -r '.[] | "  • " + .id + "  [" + .state + "]  " + (.description // "no description")' 2>/dev/null
   echo "  Full resume payload (git state, safe-to-skip commits, dirty files):"
   echo "    heimdall-agent-resume report --repo \"$repo\""
+  echo "  That report also classifies WHY each one stopped (quota/overloaded/network/context-limit/unknown) — an unknown cause is never auto-retried."
   echo "  Once handled, silence an entry: heimdall-agents reap"
   return 0
 }
