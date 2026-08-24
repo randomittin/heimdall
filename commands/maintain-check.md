@@ -124,13 +124,21 @@ issues labeled **`maintainer`** and normalizes them via `bin/lib/issue_queue.py`
 It talks to `gh` directly with its own bot-token auth — it does **not** go
 through `bin/lib/connectors/` or `bin/heimdall-issue-config`, even for GitHub.
 
-**Not implemented: automatic ingestion of seeker-filed issues.** `/hmd:maintain`'s
-seeker agent (`agents/seeker.md`) files issues labeled `bug,seeker` — a different
-label than the `maintainer` label this engine's sync filters on. An issue the
-seeker just filed is invisible to the next `/hmd:maintain-check` cycle until a
-human (or the seeker) also adds the `maintainer` label. The two maintenance
-mechanisms in this repo — this engine, and `commands/maintain.md`'s prose
-seek/fix pipeline — do not compose automatically today.
+**Fixed 2026-08-23: seeker-filed issues now reach this engine.** `/hmd:maintain`'s
+seeker agent (`agents/seeker.md`) files issues labeled `bug,seeker,maintainer` —
+the `maintainer` label is included specifically so this engine's
+`sync_queue_from_github()` (which filters on `maintainer`) ingests them. Before
+2026-08-23, seeker filed only `bug,seeker`, and `gh`'s `--label` filter is an
+AND/superset match rather than an OR, so the two label sets never intersected and
+a seeker-filed issue was invisible to this engine — the seek-then-fix loop had
+never once run end to end. See `commands/maintain.md` ("This pipeline vs the
+engine-driven autopilot") for the full history.
+
+The two maintenance mechanisms now compose automatically for issue *ingestion*.
+They remain separate code paths for the *fix* step: this engine drives a headless
+`claude -p` fix directly (`bin/lib/issue_loop.py`'s `default_fix_runner`), while
+`commands/maintain.md`'s prose pipeline spawns `hmd:fixer` (its Phase 2) — the two
+fix implementations are not unified.
 
 To feed a **non-GitHub** source (slack, email, corpus) into this same queue by
 hand — verified end-to-end 2026-08-23 against synthetic local data, no network:

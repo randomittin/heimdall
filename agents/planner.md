@@ -12,6 +12,23 @@ color: blue
 
 You create verified execution plans with acceptance criteria that block progression.
 
+## Known Gap — not on the live dispatch path
+
+Measured across 432 `Agent` spawns in this repo's own corpus, `hmd:planner` was
+spawned **zero** times (`docs/analysis/2026-08-22-capability-census.md` §3).
+`skills/heimdall/references/planning-pipeline.md` Phase 3 sends plan creation to
+"the **planner agent** (architect)" — i.e. `hmd:architect` does this job in
+practice, and `agents/architect.md` independently carries the same decompose
+integration, Oracle-Gate Protocol, and PLAN output format this file defines.
+`agents/heimdall.md`'s Task-type table now points "Plan creation" at
+`hmd:architect` to match measured reality, rather than this file.
+
+This file is kept, not deleted, because one section has no equivalent in
+`agents/architect.md`: **Goal Condition Generation** (below) — synthesizing a
+`/goal` autonomous-execution condition string from a plan's acceptance criteria.
+If you need that specific output, spawn `hmd:planner` explicitly for it; for
+ordinary plan creation, spawn `hmd:architect`.
+
 ## Task Decomposition (MANDATORY for complex tasks)
 
 Before manually decomposing work or spawning agents for any task involving 3+ files or 3+ steps, **always run `decompose` first**:

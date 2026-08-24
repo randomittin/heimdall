@@ -189,6 +189,82 @@ After completion, run:
   heimdall-state set '.plan.sub_projects[INDEX].status' '"complete"'
 ```
 
+## Database Architect Agent
+
+```
+Design/modify the data layer for [SUB-PROJECT NAME] in the [PROJECT] project.
+
+Scope:
+- [Tables/models/migrations touched]
+- [Specific queries needing optimization]
+
+Context:
+- [paste `heimdall-brief build --task ... --symbols ... --files ...` output]
+- [Current schema/ORM in use]
+- [Known scale — row counts, query volume, if relevant to index/migration strategy]
+
+Constraints:
+- Migrations MUST be reversible (up + down)
+- Zero-downtime pattern: additive first -> backfill -> switch -> drop old
+- Index every FK column; flag any endpoint making >5 queries (N+1)
+
+Output: schema w/ columns+types+constraints+indexes, migration list (reversible: yes/no),
+query optimization table (current vs optimized + improvement).
+```
+
+Route here instead of `hmd:coder` whenever the detected domain is "database —
+schemas, migrations, queries, ORMs" (`agents/heimdall.md` §2a).
+
+## Incident Responder Agent
+
+Use only when the Magic Keywords trigger (`agents/heimdall.md` §2c: "incident" /
+"down" / "broken" / "urgent") or production impact is confirmed — not for routine
+bug reports, which go through `hmd:fixer` or `hmd:coder` instead.
+
+```
+Production incident for [PROJECT]: [ONE-LINE SYMPTOM].
+
+Known so far:
+- [User-facing impact, scope, when it started]
+- [Recent deploys/config changes/cron jobs in the window]
+
+Protocol: TRIAGE (<2 min, severity SEV1-4) -> DIAGNOSE (logs, metrics, git bisect)
+-> MITIGATE (rollback/flag-off/scale/circuit-break) -> FIX (root cause + test)
+-> POSTMORTEM (blameless, w/ action items).
+
+Rules: never guess, verify w/ data. Never make an unrevertable change. Communicate
+status every 15 min during the active incident.
+```
+
+## Seeker Agent
+
+```
+Agent(subagent_type: "hmd:seeker", description: "scan logs, file bug issues", run_in_background: true)
+```
+
+Scans a log source (k8s pods / local / docker / cloud) for errors, crashes, and
+anomalies, deduplicates by stack-trace signature, and files GitHub issues labeled
+`bug,seeker,maintainer` (the `maintainer` label is required so
+`/hmd:maintain-check`'s engine ingests them — see `agents/seeker.md`).
+
+Context:
+- [Log source and access method]
+- [Any known-noisy error patterns to exclude]
+
+## Fixer Agent
+
+```
+Agent(subagent_type: "hmd:fixer", description: "pick oldest open bug issue, fix, PR", run_in_background: true)
+```
+
+Picks the oldest open issue labeled `bug` or `seeker`, creates a `heimdall/*` fix
+branch, implements the minimal fix, attests real test-exit evidence (SI-2), and
+opens a PR ONLY via `bin/heimdall-issue-pr open` (scoped bot token — never pushes
+main, never merges; a human merges).
+
+For multiple unrelated issues: spawn one `hmd:fixer` per issue, each
+`run_in_background: true` and `isolation: worktree`, so branches don't conflict.
+
 ## Parallel Role Team Template
 
 For large tasks requiring 3+ parallel workers.
