@@ -133,6 +133,25 @@
 #   and must never block a legitimate retry recommendation on a filesystem
 #   hiccup.
 #
+#   OVERLOAD -> PRESSURE, THE ONE OUTBOUND SIDE EFFECT — an `overloaded`
+#   classification is the ONLY overload signal hmd has at all (it cannot read
+#   the harness's HTTP responses; see bin/heimdall-pressure's own header).
+#   `report` forwards exactly the FIRST `overloaded` classification at a given
+#   worktree HEAD to `heimdall-pressure record --kind overloaded_error`,
+#   reusing _resume_attempts_bump's own RESUME-ATTEMPTS.json as the
+#   exactly-once marker: it fires only when the freshly-bumped `attempts`
+#   equals 1 (this HEAD was never bumped before), so a repeated `report` call
+#   for the SAME dead agent (a status refresh, a statusline poll, a human
+#   re-running it) sees attempts>=2 and is skipped — one death, one event,
+#   never more. A real NEW death after forward progress (a fresh commit
+#   resets attempts to 1 — see BOUNDED RETRY above) legitimately records
+#   again, because it IS a new overload observation. `network` is
+#   deliberately NOT wired the same way here (out of scope for this change;
+#   it would need its own exactly-once marker). Fire-and-forget: heimdall-
+#   pressure is contractually never-fail and is never called with --strict,
+#   so its absence or failure can never change this tool's own exit code or
+#   `.cause` output shape.
+#
 #   THE CEILING — same honesty as THE HONEST BOUNDARY above: this can tell
 #   you which bucket an interruption falls in and whether retrying is worth
 #   trying, with a bounded recommendation. It cannot itself retry anything —
@@ -161,6 +180,8 @@
 #                                 reused verbatim for the detect() calls here.
 #   HMD_AGENT_RESUME_AGENTS_BIN   override path to heimdall-agents (tests)
 #   HMD_AGENT_RESUME_BRIEF_BIN    override path to heimdall-resume-brief (tests)
+#   HMD_AGENT_RESUME_PRESSURE_BIN override path to heimdall-pressure (tests) —
+#                                 see "OVERLOAD -> PRESSURE" below.
 #   HMD_AGENT_RESUME_MAX_ATTEMPTS       retry-recommendation cap per worktree
 #                                       for overloaded/network causes
 #                                       (default 5; see CAUSE CLASSIFICATION).
@@ -175,6 +196,7 @@ AR_BIN_DIR="$(cd "$(dirname "$_AR_SELF")" 2>/dev/null && pwd)"
 AR_LIB_DIR="$AR_BIN_DIR/lib"
 AGENTS_BIN="${HMD_AGENT_RESUME_AGENTS_BIN:-$AR_BIN_DIR/heimdall-agents}"
 BRIEF_BIN="${HMD_AGENT_RESUME_BRIEF_BIN:-$AR_BIN_DIR/heimdall-resume-brief}"
+PRESSURE_BIN="${HMD_AGENT_RESUME_PRESSURE_BIN:-$AR_BIN_DIR/heimdall-pressure}"
 AR_PY="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)"
 
 command -v jq >/dev/null 2>&1 || { echo "error: jq is required" >&2; exit 2; }
@@ -342,6 +364,42 @@ _classify_cause() {
       fi
       ;;
   esac
+}
+
+# _record_pressure_if_fresh_overload <cause_json> <repo> — the ONE outbound
+# side effect this tool has: forwards an `overloaded` cause classification to
+# `heimdall-pressure record`, so the AIMD spawn-pressure controller
+# (bin/lib/pressure_control.py) sees the only overload signal hmd actually
+# has. See "OVERLOAD -> PRESSURE" in the header for the exactly-once design:
+# fires only when the cause's own `.attempts` is exactly 1 — the fresh/first
+# bump of _resume_attempts_bump's RESUME-ATTEMPTS.json at this worktree's
+# current HEAD — so a repeated `report` call for the SAME dead agent never
+# double-records. `attempts` is JSON null whenever there was no worktree to
+# key a durable marker off of (see _classify_cause's `else` branch above);
+# null != "1", so that case is silently skipped rather than guessed at — no
+# marker, no record, exactly as the exactly-once contract demands.
+#
+# Fire-and-forget: never writes to stdout (so it can never corrupt the cause
+# JSON _classify_cause already produced), never allowed to affect this tool's
+# own exit code, and never passes --strict — heimdall-pressure is
+# contractually never-fail, and its absence or failure must stay invisible to
+# every caller of `report`.
+_record_pressure_if_fresh_overload() {
+  local cause_json="$1" repo="$2" cls attempts
+  cls="$(printf '%s' "$cause_json" | jq -r '.class' 2>/dev/null)"
+  [ "$cls" = "overloaded" ] || return 0
+  attempts="$(printf '%s' "$cause_json" | jq -r '.attempts' 2>/dev/null)"
+  [ "$attempts" = "1" ] || return 0
+  [ -x "$PRESSURE_BIN" ] || return 0
+  # --repo is a GLOBAL flag on heimdall-pressure's own parser (added to the
+  # top-level ArgumentParser before add_subparsers()) — it MUST precede the
+  # subcommand name. `record --kind K --repo D` is rejected by argparse as
+  # "unrecognized arguments" (the record subparser only knows --kind/
+  # --source), which the never-fail contract below swallows silently. Argument
+  # ORDER here is load-bearing, not stylistic — see
+  # test/heimdall-agent-resume-pressure.test.sh for the regression proof.
+  "$PRESSURE_BIN" --repo "$repo" record --kind overloaded_error --source agent-resume >/dev/null 2>&1 || true
+  return 0
 }
 
 # Pull the LAST <summary>…</summary> for a specific task-id out of a set of
@@ -519,6 +577,7 @@ cmd_report() {
     qjson="$(_classify_text "$qtext")"
     qsuspected="$(printf '%s' "$qjson" | jq -r '.suspected')"
     cause="$(_classify_cause "$qtext" "$qsuspected" "$wt")"
+    _record_pressure_if_fresh_overload "$cause" "$repo"
 
     if [ -n "$wt" ] && _worktree_exists "$wt"; then
       brief="$(_brief_json "$wt" "$base" "$run_tests")"

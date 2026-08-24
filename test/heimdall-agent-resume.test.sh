@@ -78,6 +78,17 @@ export HMD_AGENT_REAPED_FILE="$REAPED"
 # Session alive by default (matches production's common case): only an
 # explicit per-call override flips this for the orphaned-agent assertions.
 export HMD_AGENT_LIVE_SLUGS="$SLUG"
+# R_OVL below deliberately manufactures an `overloaded` cause classification
+# (to test the bounded-retry mechanism), which now ALSO fires exactly one
+# real outbound call: `heimdall-pressure record` (see "OVERLOAD -> PRESSURE"
+# in bin/heimdall-agent-resume's own header). That call writes to
+# $HOME/.heimdall/pressure-state.json — pointing the override at a path that
+# is never created keeps `[ -x "$PRESSURE_BIN" ]` false, so the call is a
+# guaranteed no-op here and this file's own "HOME never touched" contract
+# (see header) stays true. The actual pressure-integration behavior is
+# covered separately, hermetically, in
+# test/heimdall-agent-resume-pressure.test.sh.
+export HMD_AGENT_RESUME_PRESSURE_BIN="$WORK/no-heimdall-pressure-here"
 
 set_mtime() {
   local f="$1" e="$2" ts
