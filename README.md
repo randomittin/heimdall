@@ -64,7 +64,9 @@ Three paths. Each is labelled with what it actually does to your machine — pic
 | `~/.claude/settings.json` | Adds `statusLine` + `subagentStatusLine`, and registers the plugin under `enabledPlugins` / `extraKnownMarketplaces`. Honors `$CLAUDE_CONFIG_DIR`, and never clobbers a `statusLine` you set yourself |
 | `~/.zshrc` / `~/.bashrc` / `~/.profile` | One appended `export PATH=…` line for `~/.local/bin` — only when it is not already on `PATH` |
 | `~/Library/LaunchAgents/com.heimdall.dream.plist` | **macOS only** — a nightly 03:00 LaunchAgent (`com.heimdall.dream`) that runs the overnight sweep with no session open and survives logout and reboot. Opt out with `HEIMDALL_NO_DREAM_SCHEDULE=1` |
-| `~/.heimdall/team.json` | An auto-minted solo **team secret** — a bearer capability. Treat it like a credential |
+| `~/.heimdall/team.json` | An auto-minted solo **team secret**, written by the post-install health check on every run (`heimdall-doctor-install`, deliberately pinned to `$HOME`) whether or not you supplied a team invite. A bearer capability — treat it like a credential |
+
+One thing that table leaves out because it does not fit "outside the repo": pasting a team invite (`HEIMDALL_TEAM_SECRET='<secret>' curl -fsSL … | bash`) writes a SECOND, real team.json inside whatever repo your shell was in when you ran the installer — `<repo>/.heimdall/team.json`, resolved from that shell's git toplevel at install time, never `~/.heimdall` (`ensure_team_secret`, `install.sh:520-537`). Measured the same way as the table above: a throwaway git-toplevel cwd distinct from `$HOME` got the file; the throwaway `$HOME` did not.
 
 No sudo. Idempotent — re-run to upgrade. `hmd uninstall` reverses all of it.
 
