@@ -43,18 +43,35 @@
 # stdout write. A "⚠ contains your team secret" caveat prints above the join so the
 # dev knows what they are sharing. (gitleaks/secret-scan stays clean: no literal.)
 #
+# NON-TTY REFUSAL. This command's entire job is to print a live bearer secret, so
+# it refuses to do that for a caller that cannot plausibly be a human reading a
+# screen: when stdout is not a terminal (piped, redirected, or captured by an
+# agent harness — `[ -t 1 ]` is false), it prints what the command does and how a
+# human at a terminal gets the join, then exits 4 — the secret itself is withheld.
+# Pass --yes-print-secret to override for legitimate non-interactive use (CI,
+# scripted enrollment); the override is a deliberate flag ONLY, never inferable
+# from an env var that might already be set in the caller's environment. A human
+# at a real TTY sees NO change in behavior (same one-liner, same exit 0), but
+# still gets a one-line reminder: this is a live bearer credential — anyone who
+# can read your screen or scrollback can join your team.
+#
 # CLEAN DEGRADE. No team configured for this repo -> a helpful "run heimdall-team
 # new" message and exit 0 (never a traceback). `--qr` renders a scannable QR of the
 # join ONLY if `qrencode` is present; it degrades silently when absent.
 #
 # Usage:
-#   heimdall-invite            print the one-command team-join for a teammate
-#   heimdall-invite --qr       also render a QR of the join (needs `qrencode`)
-#   -h | --help                this help
+#   heimdall-invite               print the one-command team-join for a teammate
+#   heimdall-invite --qr          also render a QR of the join (needs `qrencode`)
+#   heimdall-invite --yes-print-secret
+#                                 print even when stdout is not a TTY (CI /
+#                                 scripted enrollment — a deliberate opt-in)
+#   -h | --help                   this help
 #
 # Exit: 0 on the happy + degrade paths (offline/unconfigured is normal); 2 on a bad
 # flag; 3 when the resolved install ref does NOT resolve on origin (refuses to
-# print a silent-404 join — the owner must push/tag/publish first).
+# print a silent-404 join — the owner must push/tag/publish first); 4 when stdout
+# is not a TTY and --yes-print-secret was not passed (refuses to print a live
+# secret to a non-human caller).
 set -uo pipefail
 
 # ── resolve this script's own dir (RELOCATABLE — symlink-followed, no baked path).
@@ -74,14 +91,16 @@ MANIFEST="$PLUGIN_ROOT/.claude-plugin/plugin.json"
 [ -f "$BIN_DIR/lib/cp-consent.sh" ] && . "$BIN_DIR/lib/cp-consent.sh"
 DEFAULT_CP_URL="${HEIMDALL_DEFAULT_CP_URL:-}"
 
-usage() { sed -n '2,46p' "$SELF" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,74p' "$SELF" | sed 's/^# \{0,1\}//'; }
 
 # ── argv ───────────────────────────────────────────────────────────────────────
 WANT_QR=""
+YES_PRINT_SECRET=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    -h|--help) usage; exit 0 ;;
-    --qr)      WANT_QR=1; shift ;;
+    -h|--help)          usage; exit 0 ;;
+    --qr)               WANT_QR=1; shift ;;
+    --yes-print-secret) YES_PRINT_SECRET=1; shift ;;
     *) echo "heimdall-invite: unexpected argument: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
@@ -133,6 +152,39 @@ PYEOF
 
 SECRET="$(read_team_secret)"
 [ -n "$SECRET" ] || no_team   # a team.json with no secret is not an invitable team.
+
+# ── refuse to print a live bearer secret to a caller that is not a human at a
+# terminal. House style for the primitive: `[ -t 1 ]` (bin/heimdall-team,
+# bin/heimdall-demo, bin/heimdall, bin/lib/select.sh all gate the same way).
+# --yes-print-secret is the ONLY override — a deliberate flag, never inferable
+# from an env var that could already be set in the caller's environment (see the
+# argv loop above: YES_PRINT_SECRET is unconditionally reset to "" there, so an
+# ambient env var of the same name cannot leak through). Placed right after
+# SECRET resolves (before any network/ref-resolution work) so the refusal is
+# instant and the --qr path is covered too (it only ever runs after this point).
+# The no-team degrade path above already returned, so by the time this runs
+# there IS a live secret to protect.
+refuse_nontty() {
+  cat >&2 <<MSG
+heimdall-invite: REFUSING to print your live team secret — stdout is not a
+terminal, so this looks like a script, an agent, or CI reading it, not a human
+at a screen. This command's entire job is to print a bearer credential
+(HEIMDALL_TEAM_SECRET); handing it to a non-interactive caller with no
+confirmation is how a secret ends up in a log or a transcript nobody meant to
+write it to.
+
+Run this at an interactive terminal to get the join one-liner:
+
+    heimdall-invite
+
+If this really is a deliberate, non-interactive use (CI, scripted enrollment),
+opt in explicitly:
+
+    heimdall-invite --yes-print-secret
+MSG
+  exit 4
+}
+[ -t 1 ] || [ -n "$YES_PRINT_SECRET" ] || refuse_nontty
 
 # ── resolve the GLOBAL control-plane URL (not secret) from ~/.heimdall/cp-endpoint.json
 read_cfg_url() {
@@ -297,6 +349,7 @@ JOIN_FMT='( set -o pipefail; f="$(mktemp "${TMPDIR:-/tmp}/heimdall-install.XXXXX
 JOIN="$(printf "$JOIN_FMT" "$INSTALL_URL" "$URL" "$SECRET")"
 printf 'Share this ONE command with a teammate to put them on your team:\n\n'
 printf '\xe2\x9a\xa0 contains your team secret — share only with teammates\n\n'
+printf '\xe2\x9a\xa0 this is a LIVE bearer credential — anyone who can read your screen or scrollback can join your team\n\n'
 printf '%s\n' "$JOIN"
 
 # ── optional QR of the join. Only if `qrencode` is present; degrade silently when

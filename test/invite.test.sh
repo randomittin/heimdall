@@ -83,7 +83,7 @@ fi
 # ── (b) FULL JOIN (team secret + cp url) ────────────────────────────────────────
 H1="$(mk_dir)"; TD1="$(mk_dir)/.heimdall"
 write_cp_url "$H1" "$FAKE_URL"; write_team "$TD1" "$FAKE_SECRET"
-OUT1="$(HOME="$H1" HEIMDALL_TEAM_DIR="$TD1" "$CLI"; echo "RC=$?")"
+OUT1="$(HOME="$H1" HEIMDALL_TEAM_DIR="$TD1" "$CLI" --yes-print-secret; echo "RC=$?")"
 RC1="${OUT1##*RC=}"; BODY1="${OUT1%RC=*}"
 if [ "$RC1" -eq 0 ] \
    && grep -qF "curl -fsSL --proto '=https' https://raw.githubusercontent.com/" <<<"$BODY1" \
@@ -103,7 +103,7 @@ fi
 # ── (c) URL-DEFAULT JOIN (team secret, no cp url) ───────────────────────────────
 H2="$(mk_dir)"; TD2="$(mk_dir)/.heimdall"   # H2 has NO cp-endpoint.json
 write_team "$TD2" "$FAKE_SECRET"
-OUT2="$(HOME="$H2" HEIMDALL_TEAM_DIR="$TD2" "$CLI"; echo "RC=$?")"
+OUT2="$(HOME="$H2" HEIMDALL_TEAM_DIR="$TD2" "$CLI" --yes-print-secret; echo "RC=$?")"
 RC2="${OUT2##*RC=}"; BODY2="${OUT2%RC=*}"
 if [ "$RC2" -eq 0 ] \
    && grep -qF "HEIMDALL_TEAM_SECRET='$FAKE_SECRET'" <<<"$BODY2" \
@@ -135,7 +135,7 @@ fi
 # owns — the CLI must add no log/cache/tracked file carrying the secret.
 H4="$(mk_dir)"; TD4="$(mk_dir)/.heimdall"
 write_cp_url "$H4" "$FAKE_URL"; write_team "$TD4" "$FAKE_SECRET"
-HOME="$H4" HEIMDALL_TEAM_DIR="$TD4" "$CLI" >/dev/null 2>&1
+HOME="$H4" HEIMDALL_TEAM_DIR="$TD4" "$CLI" --yes-print-secret >/dev/null 2>&1
 HITS="$(grep -rlF "$FAKE_SECRET" "$H4" "$TD4" 2>/dev/null | grep -vF "$TD4/team.json" || true)"
 if [ -z "$HITS" ]; then
   ok "(e) secret written to stdout ONLY — no extra file carries it"
@@ -150,7 +150,7 @@ fi
 H5="$(mk_dir)"; TD5="$(mk_dir)/.heimdall"
 write_cp_url "$H5" "$FAKE_URL"; write_team "$TD5" "$FAKE_SECRET"
 OUT5="$(HOME="$H5" HEIMDALL_TEAM_DIR="$TD5" HEIMDALL_REF="v99.99.99" \
-        HEIMDALL_INVITE_ASSUME_HTTP="404" "$CLI" 2>&1; echo "RC=$?")"
+        HEIMDALL_INVITE_ASSUME_HTTP="404" "$CLI" --yes-print-secret 2>&1; echo "RC=$?")"
 RC5="${OUT5##*RC=}"; BODY5="${OUT5%RC=*}"
 if [ "$RC5" -ne 0 ] \
    && ! grep -qE "raw\.githubusercontent\.com/[^ ]+/v99\.99\.99/install\.sh -o" <<<"$BODY5" \
@@ -166,7 +166,7 @@ fi
 # local-only tag / the manifest VERSION.
 H6="$(mk_dir)"; TD6="$(mk_dir)/.heimdall"
 write_cp_url "$H6" "$FAKE_URL"; write_team "$TD6" "$FAKE_SECRET"
-OUT6="$(HOME="$H6" HEIMDALL_TEAM_DIR="$TD6" "$CLI"; echo "RC=$?")"
+OUT6="$(HOME="$H6" HEIMDALL_TEAM_DIR="$TD6" "$CLI" --yes-print-secret; echo "RC=$?")"
 RC6="${OUT6##*RC=}"; BODY6="${OUT6%RC=*}"
 EMITTED_REF="$(grep -oE 'raw\.githubusercontent\.com/[^ ]+/install\.sh' <<<"$BODY6" \
                 | head -1 | sed -E 's#.*/([^/]+)/install\.sh#\1#')"
@@ -184,7 +184,7 @@ fi
 # receives) must NOT contain the secret.
 H7="$(mk_dir)"; TD7="$(mk_dir)/.heimdall"
 write_cp_url "$H7" "$FAKE_URL"; write_team "$TD7" "$FAKE_SECRET"
-OUT7="$(HOME="$H7" HEIMDALL_TEAM_DIR="$TD7" "$CLI"; echo "RC=$?")"
+OUT7="$(HOME="$H7" HEIMDALL_TEAM_DIR="$TD7" "$CLI" --yes-print-secret; echo "RC=$?")"
 RC7="${OUT7##*RC=}"; BODY7="${OUT7%RC=*}"
 # The join line is the last printed line carrying the raw installer URL.
 JOINLINE="$(grep -F 'raw.githubusercontent.com' <<<"$BODY7" | tail -1)"
