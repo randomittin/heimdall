@@ -10,7 +10,7 @@ Usage:
   agent-pool release <agent-id>               Mark agent as done
   agent-pool beat <agent-id>                   Refresh agent heartbeat (last_active)
   agent-pool status                           Show pool state as JSON
-  agent-pool should-scale                     Exit 0 if should scale up, 1 if not
+  agent-pool should-scale                     Exit 0 if should scale up, 1 if not (pressure-capped)
   agent-pool active                           List active agents
   agent-pool wait                             Block until a slot is available
   agent-pool resize <max>                     Change max pool size
@@ -20,6 +20,14 @@ Environment:
   HMD_AGENT_STALE_SECS   Stale-idle threshold in seconds (default 900). An active
                          agent whose last_active is older than this is reaped by
                          health-check EVEN IF its pid is still alive (hung fork).
+
+should-scale additionally consults bin/lib/pressure_control.py (if present) so a
+scale-up recommendation is capped under recent OBSERVED API pressure (529s /
+connection resets, reported by a caller elsewhere — see that module's docstring).
+It is an upper bound on scale-up only, never a replacement for the utilization
+logic above and never a trigger for scale-down. Fails open (behaves exactly as
+if no pressure were known) if the module or its state is missing, corrupt, or
+raises — see HMD_PRESSURE_* in pressure_control.py for the AIMD tunables.
 """
 import sys, os, json, time, fcntl, argparse
 from pathlib import Path
@@ -87,6 +95,27 @@ def active_agents(pool):
 def utilization(pool):
     n = len(active_agents(pool))
     return n / pool["max_agents"] if pool["max_agents"] > 0 else 1.0
+
+def _pressure_recommend(ceiling):
+    """Best-effort read of bin/lib/pressure_control's AIMD recommendation for
+    `ceiling`. Mirrors bin/heimdall-pressure's own bin/lib locator
+    (heimdall-pressure:_pressure_control) — except OPTIONAL here: agent-pool's
+    core job is spawning, pressure-awareness is an enhancement layered on top
+    of it, so ANY problem (missing module, absent/corrupt state, an
+    unexpected exception) fails open to "no pressure known" — (ceiling,
+    None, {"pressure_known": False}), i.e. exactly what a caller with
+    pressure_control never installed would see — rather than ever blocking or
+    crashing a scaling decision. pressure_control.recommend() already fails
+    open internally; this wraps the import itself so a missing/broken module
+    degrades the same way."""
+    try:
+        lib_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib")
+        if lib_dir not in sys.path:
+            sys.path.insert(0, lib_dir)
+        import pressure_control
+        return pressure_control.recommend(ceiling)
+    except Exception:
+        return ceiling, None, {"pressure_known": False}
 
 @locked
 def cmd_init(args):
@@ -175,6 +204,15 @@ def cmd_should_scale(_args):
         elapsed = (datetime.now(timezone.utc) - datetime.fromisoformat(last)).total_seconds()
         cooled = elapsed >= cooldown
     if util >= pool["scale_up_threshold"] and cooled:
+        # Pressure is an UPPER BOUND on the utilization signal above, never a
+        # replacement for it: it can only suppress a scale-up utilization has
+        # already earned, never manufacture one on its own, and it never
+        # touches the scale-down branch below. Fails open on any problem —
+        # see _pressure_recommend.
+        effective, reason, _detail = _pressure_recommend(pool["max_agents"])
+        if reason is not None:
+            print(f"No scaling: pressure-capped at {effective}/{pool['max_agents']} ({reason})")
+            sys.exit(1)
         pool["last_scale_event"] = now_iso()
         save_pool(pool)
         act = len(active_agents(pool))
