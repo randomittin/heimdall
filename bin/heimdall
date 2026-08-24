@@ -2187,6 +2187,24 @@ case "${1:-}" in
       echo "  Reinstall: curl -fsSL https://runheimdall.dev/install | bash" >&2
       exit 1
     fi
+    for _init_arg in "$@"; do
+      case "$_init_arg" in
+        -h|--help|help)
+          # heimdall-init's OWN usage() self-extracts its header with a hardcoded
+          # `sed -n '2,39p'` range (heimdall-init:59) that stops one line before
+          # its real `# Usage:` synopsis -- printing the CONTRACT text then a
+          # bare "Usage:" with nothing after it (exit 0, so nothing catches it).
+          # bin/heimdall-init is a parallel workstream's file; this arm owns its
+          # own --help text per the dispatcher contract, so it reproduces the
+          # same leading-comment-block extraction correctly and dynamically
+          # instead: every `#`-prefixed line from line 2 to the first
+          # non-comment line, not a hand-counted end line. Self-adjusts if the
+          # header ever grows or shrinks again -- the whole bug class goes away.
+          awk 'NR==1{next} /^#/{print; next} {exit}' "$INIT_BIN" | sed 's/^# \{0,1\}//'
+          exit 0
+          ;;
+      esac
+    done
     exec "$INIT_BIN" "$@"
     ;;
   verdict)
