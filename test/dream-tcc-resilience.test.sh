@@ -417,6 +417,7 @@ HEIMDALL_LAUNCH_AGENTS_DIR="$LA7" \
 HEIMDALL_HOME="$HH7" \
 HEIMDALL_DREAM_LOG="$WORK/logs7/dream.log" \
 LAUNCHCTL="$SHIM" \
+HEIMDALL_DREAM_BUNDLE_ICON="$ROOT/launch-docs/assets/hmd-logo-eye-h.icns" \
   "$CANON/bin/heimdall-dream-schedule" install --repo "$SREPO7" >/dev/null 2>&1 || true
 
 if [ -f "$PLIST7" ]; then
