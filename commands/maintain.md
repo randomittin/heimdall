@@ -55,7 +55,11 @@ unconfigured one degrades to `fetch` returning `[]`, never a crash.
 
 ## Phase 1: Seek
 
-Spawn a **seeker agent** (the log-based connector) to:
+```
+Agent(subagent_type: "hmd:seeker", description: "scan logs, file bug issues", run_in_background: true)
+```
+
+`hmd:seeker` (the log-based connector):
 1. Pull logs from Kubernetes pods (or local logs, docker, cloud)
 2. Analyze for errors, crashes, anomalies
 3. Deduplicate by stack trace signature
@@ -64,7 +68,11 @@ Spawn a **seeker agent** (the log-based connector) to:
 
 ## Phase 2: Fix
 
-Spawn a **fixer agent** to:
+```
+Agent(subagent_type: "hmd:fixer", description: "pick oldest open bug issue, fix, PR", run_in_background: true)
+```
+
+`hmd:fixer`:
 1. Pick open issues directly from GitHub: `gh issue list --label bug --state
    open` (no `issue_queue` involved — see "This pipeline vs the engine-driven
    autopilot" above).
@@ -76,6 +84,15 @@ Spawn a **fixer agent** to:
      scoped bot token) — the fixer NEVER pushes a branch or opens a PR by hand,
      NEVER pushes to main, NEVER merges. Autonomy ends at PR-open; a human merges.
 3. Move to next issue
+
+Multiple unrelated issues queued: spawn one `hmd:fixer` per issue, each
+`run_in_background: true` and `isolation: worktree`, so fix branches don't
+collide (`agents/fixer.md` "Parallelism — MANDATORY").
+
+Note: the separate engine-driven autopilot (`/hmd:maintain-check`) does NOT spawn
+`hmd:fixer` — its own `bin/lib/issue_loop.py` drives a headless `claude -p` fix
+step directly (`default_fix_runner` / `_run_claude_fix`). The two "fix a bug"
+implementations are not unified; `hmd:fixer` only runs via this manual command.
 
 ## Phase 3: Auto (scheduled)
 

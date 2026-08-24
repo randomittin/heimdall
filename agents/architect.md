@@ -116,7 +116,7 @@ Always produce a structured plan:
 ### Task: <task-name>
 - **Wave:** [1|2|3...]
 - **Dependencies:** [list of task names, or "none"]
-- **Agent:** `hmd:coder` | `hmd:design` | `hmd:test-runner` | `hmd:docs-writer` | `hmd:lint-quality` | `hmd:reviewer` | `hmd:verifier` (NAMESPACED — bare names fail dispatch)
+- **Agent:** `hmd:coder` | `hmd:design` | `hmd:database-architect` | `hmd:test-runner` | `hmd:docs-writer` | `hmd:lint-quality` | `hmd:reviewer` | `hmd:verifier` (NAMESPACED — bare names fail dispatch). Use `hmd:database-architect` for any task whose domain is "database — schemas, migrations, queries, ORMs" instead of routing it to `hmd:coder`.
 - **Model + effort:** `opus` + `max` | `opus` + `high` | `sonnet` + `default` | `haiku` + `low` (see Model & Effort Assignment below)
 - **Read first:** [exact file paths the agent must Read before editing]
 - **Files:** Create: `<paths>`. Modify: `<path>:<line-range>`.

@@ -395,14 +395,16 @@ Spawn the right agent for each task.
 |---|---|---|
 | Architecture/planning | `hmd:architect` | Read-only analysis, designs before building |
 | Feature implementation | `hmd:coder` | Full tools, git worktree isolation |
+| Database schema/migration/query work | `hmd:database-architect` | Schema design, migration strategy, index/query optimization, N+1 detection |
 | UI/UX design | `hmd:design` | Visual design, components, accessibility, design systems |
 | Test writing/running | `hmd:test-runner` | Focused on test bench maintenance |
 | Lint/style enforcement | `hmd:lint-quality` | Fast (Haiku), mechanical checks |
 | Documentation | `hmd:docs-writer` | Focused on docs, no code changes |
 | Code review | `hmd:reviewer` | Deep review before merge/push |
-| Plan creation | `hmd:planner` | Creates wave-grouped plans with acceptance criteria |
+| Plan creation | `hmd:architect` | Measured practice: `skills/heimdall/references/planning-pipeline.md` Phase 3 spawns architect for this ("planner agent (architect)"), and `agents/architect.md` independently carries the same decompose/oracle-gate/PLAN-output logic. `hmd:planner` duplicates it but is not on the live dispatch path — see the KNOWN-GAP note at the top of `agents/planner.md` |
 | Plan verification | `hmd:reviewer` | Checks plan completeness and criteria runnability |
-| Wave execution | `hmd:coder` (or type-specific) | Executes one task within a wave, fresh context |
+| Wave execution, >3 parallel tasks needing coordination | `hmd:wave-executor` | Byzantine-consensus conflict resolution, merge-tree preview, work-stealing across the wave |
+| Wave execution, ≤3 independent tasks | `hmd:coder` per task | Simpler wave — spawn one coder per task directly, no coordinator overhead |
 | Post-execution verification | `hmd:verifier` + `hmd:reviewer` | Runs all acceptance criteria, confirms coverage |
 
 Full roster (all require `hmd:` prefix): `hmd:architect`, `hmd:planner`, `hmd:wave-executor`, `hmd:verifier`, `hmd:coder`, `hmd:design`, `hmd:security-auditor`, `hmd:database-architect`, `hmd:incident-responder`, `hmd:reviewer`, `hmd:test-runner`, `hmd:docs-writer`, `hmd:lint-quality`, `hmd:seeker`, `hmd:fixer`.
