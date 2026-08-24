@@ -33,20 +33,45 @@ open-bounded (tokenless) — nothing for a user to pass or see.
    for the control-plane `url`, then mirrors the canonical README installer
    one-liner for the repo/ref.
 
-2. **Relay the join verbatim.** Pass the printed one-liner straight to the dev —
-   do NOT paraphrase, wrap, or alter it. The teammate runs it as-is.
+2. **Expect a non-interactive refusal — that is correct, not a bug.** Because you
+   (the assistant) capture this command's output rather than reading it off a live
+   screen, the CLI cannot tell "an assistant relaying to a trusted dev" apart from
+   any other non-human reader of a transcript — so by default it refuses (exit 4)
+   and prints guidance instead of the join. This is the fix for the exact incident
+   this command used to cause: an agent ran this CLI, and a live bearer secret got
+   written into a session transcript on disk.
 
-3. **Honor the secret caveat.** The CLI prints a
-   `⚠ contains your team secret — share only with teammates` caveat above the
-   command. Keep that warning attached when you relay it.
+   - Do **NOT** pass `--yes-print-secret` to force output. That override exists for
+     a human operator's OWN deliberate non-interactive use (CI, scripted
+     enrollment) — never for an assistant to invoke on a user's behalf just to make
+     the command produce text.
+   - Relay the refusal instead: tell the dev to run `heimdall-invite` themselves,
+     at their own terminal, to get the join. That is the only path that should ever
+     show the live secret.
 
-4. **On the "not configured" message**, the dev has no team minted for this repo
+3. **Relay the join verbatim** — only when the CLI actually printed one (a human
+   ran it themselves at a real terminal, per step 2, and is now pasting the
+   result). Pass it straight to the dev — do NOT paraphrase, wrap, or alter it. The
+   teammate runs it as-is.
+
+4. **Honor both secret warnings.** The CLI prints a
+   `⚠ contains your team secret — share only with teammates` caveat AND a
+   `⚠ this is a LIVE bearer credential — anyone who can read your screen or
+   scrollback can join your team` warning above the command. Keep both attached
+   when you relay it.
+
+5. **On the "not configured" message**, the dev has no team minted for this repo
    yet. The CLI prints how to mint one (`heimdall-team new`, writes
    `<repo>/.heimdall/team.json`, 0600) and exits 0 — relay that guidance; there is
-   nothing to invite to yet.
+   nothing to invite to yet. (Unaffected by the non-interactive refusal — there is
+   no secret yet to withhold.)
 
 ## Constraints
 
+- **Never pass `--yes-print-secret` on a user's behalf.** It exists so a human
+  operator can deliberately opt in to non-interactive printing (CI, scripted
+  enrollment) — never so an assistant can route around the refusal to get output.
+  Hitting the refusal is the CLI working as designed; relay it, don't override it.
 - **The team secret is a bearer capability.** It is this team's own secret,
   deliberately shared with a teammate — the CLI prints it to the terminal ONLY and
   NEVER writes it to a tracked/committed file, a log, or anything in the repo. Do
@@ -66,10 +91,14 @@ open-bounded (tokenless) — nothing for a user to pass or see.
 
 Dev: "add Sam to my team"
 → `heimdall-invite`
-→ relay the printed `curl … | HEIMDALL_CP_URL='…' HEIMDALL_TEAM_SECRET='…' bash`
-  line plus the `⚠ … share only with teammates` caveat.
+→ typical result: refused (exit 4) because this runs non-interactively — relay
+  the guidance and tell the dev to run `heimdall-invite` themselves at their own
+  terminal.
+→ if the dev instead pastes output from their OWN terminal session, relay the
+  printed `curl … | HEIMDALL_CP_URL='…' HEIMDALL_TEAM_SECRET='…' bash` line plus
+  both `⚠` warnings verbatim.
 
 Dev: "give me a QR my teammate can scan"
-→ `heimdall-invite --qr`
+→ `heimdall-invite --qr` (same non-interactive refusal applies)
 → relay the one-liner and the rendered QR (or just the one-liner if `qrencode`
   isn't installed).

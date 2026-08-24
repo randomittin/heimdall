@@ -91,7 +91,7 @@ MANIFEST="$PLUGIN_ROOT/.claude-plugin/plugin.json"
 [ -f "$BIN_DIR/lib/cp-consent.sh" ] && . "$BIN_DIR/lib/cp-consent.sh"
 DEFAULT_CP_URL="${HEIMDALL_DEFAULT_CP_URL:-}"
 
-usage() { sed -n '2,46p' "$SELF" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,74p' "$SELF" | sed 's/^# \{0,1\}//'; }
 
 # ── argv ───────────────────────────────────────────────────────────────────────
 WANT_QR=""

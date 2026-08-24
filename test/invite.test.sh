@@ -83,7 +83,7 @@ fi
 # ── (b) FULL JOIN (team secret + cp url) ────────────────────────────────────────
 H1="$(mk_dir)"; TD1="$(mk_dir)/.heimdall"
 write_cp_url "$H1" "$FAKE_URL"; write_team "$TD1" "$FAKE_SECRET"
-OUT1="$(HOME="$H1" HEIMDALL_TEAM_DIR="$TD1" "$CLI"; echo "RC=$?")"
+OUT1="$(HOME="$H1" HEIMDALL_TEAM_DIR="$TD1" "$CLI" --yes-print-secret; echo "RC=$?")"
 RC1="${OUT1##*RC=}"; BODY1="${OUT1%RC=*}"
 if [ "$RC1" -eq 0 ] \
    && grep -qF "curl -fsSL --proto '=https' https://raw.githubusercontent.com/" <<<"$BODY1" \
@@ -103,7 +103,7 @@ fi
 # ── (c) URL-DEFAULT JOIN (team secret, no cp url) ───────────────────────────────
 H2="$(mk_dir)"; TD2="$(mk_dir)/.heimdall"   # H2 has NO cp-endpoint.json
 write_team "$TD2" "$FAKE_SECRET"
-OUT2="$(HOME="$H2" HEIMDALL_TEAM_DIR="$TD2" "$CLI"; echo "RC=$?")"
+OUT2="$(HOME="$H2" HEIMDALL_TEAM_DIR="$TD2" "$CLI" --yes-print-secret; echo "RC=$?")"
 RC2="${OUT2##*RC=}"; BODY2="${OUT2%RC=*}"
 if [ "$RC2" -eq 0 ] \
    && grep -qF "HEIMDALL_TEAM_SECRET='$FAKE_SECRET'" <<<"$BODY2" \
@@ -135,7 +135,7 @@ fi
 # owns — the CLI must add no log/cache/tracked file carrying the secret.
 H4="$(mk_dir)"; TD4="$(mk_dir)/.heimdall"
 write_cp_url "$H4" "$FAKE_URL"; write_team "$TD4" "$FAKE_SECRET"
-HOME="$H4" HEIMDALL_TEAM_DIR="$TD4" "$CLI" >/dev/null 2>&1
+HOME="$H4" HEIMDALL_TEAM_DIR="$TD4" "$CLI" --yes-print-secret >/dev/null 2>&1
 HITS="$(grep -rlF "$FAKE_SECRET" "$H4" "$TD4" 2>/dev/null | grep -vF "$TD4/team.json" || true)"
 if [ -z "$HITS" ]; then
   ok "(e) secret written to stdout ONLY — no extra file carries it"
@@ -150,7 +150,7 @@ fi
 H5="$(mk_dir)"; TD5="$(mk_dir)/.heimdall"
 write_cp_url "$H5" "$FAKE_URL"; write_team "$TD5" "$FAKE_SECRET"
 OUT5="$(HOME="$H5" HEIMDALL_TEAM_DIR="$TD5" HEIMDALL_REF="v99.99.99" \
-        HEIMDALL_INVITE_ASSUME_HTTP="404" "$CLI" 2>&1; echo "RC=$?")"
+        HEIMDALL_INVITE_ASSUME_HTTP="404" "$CLI" --yes-print-secret 2>&1; echo "RC=$?")"
 RC5="${OUT5##*RC=}"; BODY5="${OUT5%RC=*}"
 if [ "$RC5" -ne 0 ] \
    && ! grep -qE "raw\.githubusercontent\.com/[^ ]+/v99\.99\.99/install\.sh -o" <<<"$BODY5" \
