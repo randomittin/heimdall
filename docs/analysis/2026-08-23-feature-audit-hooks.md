@@ -34,6 +34,12 @@
   (autocompact thrashing) even after being re-scoped once with explicit output-bounding instructions; rather than
   retry a third time with the same failing shape, that section was completed directly, one single-purpose,
   output-discarded command at a time.
+- **Interpretation note on deliverable shape.** The task asked for exactly two tables (Hooks, Skills). Table 1
+  below is split into 6 sub-tables, one per hook event, because a single undifferentiated 45-row table proved
+  unreadable given how much the evidence text varies by event. Every row still carries the requested column set —
+  command · exists? · evidence of firing · latency · verdict — plus a per-event identifier column (entry/matcher)
+  in place of a repeated "event" column, since the event is already the section heading. This is a readability
+  choice, not a scope reduction: all 45 sub-behaviors and the full requested column set are present.
 
 ## Table 1 — Hooks
 
@@ -202,3 +208,14 @@ this audit's safety rules exclude.
    inventory: a claim-ledger collision warning, a worktree-hooks-gap self-heal (which explains why this fresh
    worktree's native pre-push hook isn't wired — `core.hooksPath` is set but `.heimdall/hooks/` doesn't exist here
    yet), and the brief-adoption deny path in finding #5.
+7. **Finding #2 reproduced live a second time, with real (not hypothetical) impact, while this report was being
+   edited.** Immediately after adding this report's Latency column, the compaction that produced this session's
+   context summary triggered another `SessionStart:compact` → unconditional `edit-tracker clear`+`init` fire
+   (confirmed by the hook's own stdout: "Edit ledger cleared."). The next `bin/verify-edits --quick` call failed
+   outright: `NOT VERIFIED — ledger/git mismatch`, exit 2 — ledger claimed 0 edits this session while
+   `git diff --stat` showed 36 insertions/36 deletions already sitting in this very file. Unlike the SessionStart
+   incident logged in the table above (ledger happened to be empty already, so nothing was actually lost that
+   time), this time real, already-landed edits were rendered invisible to the ledger — precisely the failure mode
+   finding #2 predicts, caught in the act rather than inferred. No data was lost, because git stayed authoritative
+   throughout and the file content was never in question — only the ledger's own count was false for that window.
+   Recovered via the tool's own suggested remedy, `edit-tracker init`.
