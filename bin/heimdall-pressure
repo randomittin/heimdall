@@ -1,0 +1,359 @@
+#!/usr/bin/env python3
+# heimdall-pressure — CONTROL for the 529 overloaded bit.
+#
+# THE ASK (repo owner, verbatim): "you'd also need to create a capability to
+# control the 529 overloaded bit." hmd spawns up to 10 parallel agents by
+# policy (bin/agent-pool DEFAULTS["max_agents"]) and the orchestrator's own
+# prompt pushes hard toward maximum parallelism (agents/heimdall.md). When the
+# API is capacity-pressured, hmd is contributing ten simultaneous request
+# streams to the thing that is overloaded, then treating the resulting 529 as
+# bad luck. This is CONTROL, not recovery: it turns OBSERVED pressure into a
+# reduced spawn recommendation, and recovers once pressure clears.
+#
+# THE HONEST LIMIT: hmd cannot see the harness's HTTP responses. It learns
+# about a 529/overloaded_error or a connection reset ONLY from an agent's own
+# death/report message, relayed by a caller who noticed (nothing here
+# intercepts a live request). This is a FEEDBACK CONTROLLER ON SPAWN
+# DECISIONS, informed by recent observed failures — never a circuit breaker on
+# requests in flight. See bin/lib/pressure_control.py's module docstring for
+# the full AIMD (additive-increase/multiplicative-decrease) design and the
+# stated observation threshold.
+#
+# THE RECORD (one JSON object per line, appended to .planning/metrics.jsonl,
+# same ledger bin/heimdall-metric writes to — shape borrowed deliberately
+# rather than inventing a new one):
+#   ts            ISO-8601 UTC emit time
+#   metric        always "pressure" (the discriminator, parallel to "task")
+#   schema        record schema version
+#   kind          overloaded_error | connection_reset
+#   window_count  events in the observation window at record time
+#   threshold     the breach threshold at record time (env-overridable, so a
+#                 changed knob is visible in the audit trail, not just today's
+#                 behaviour)
+#   breached      whether THIS event tipped the window over threshold
+#   factor        the AIMD multiplier immediately after this record
+#   source        which lane emitted it (cli | session-fork | ...)
+#   session       the session id, when the environment exposes one
+#
+# This ledger is WRITE-ONLY from the hot path's perspective — recommend()
+# never reads it, only the small cached state file under
+# ~/.heimdall/pressure-state.json (see resolve_state_file() in
+# pressure_control.py). That split is what keeps `recommend` O(1) regardless
+# of how much pressure history has ever accumulated: the ledger is the durable
+# audit trail; the state file is the fast operational cache.
+#
+# DESIGN CONSTRAINTS mirrored from bin/heimdall-metric (test/heimdall-metric.
+# test.sh's own documented contract) because a pressure record is telemetry
+# with the same shape of risk:
+#   * NEVER FAILS A CALLER over telemetry. `record`/`recommend`/`status`/
+#     `reset`/`where` exit 0 on every failure path unless --strict (tests
+#     only). `retry-delay` clamps malformed numeric input rather than erroring
+#     — a backoff calculator that errors mid-retry-loop is its own paper cut.
+#   * NO SECRETS, NO PROMPT CONTENT. `kind` is membership-validated against a
+#     two-value vocabulary; `source`/`session` are slugged exactly like
+#     heimdall-metric's own free-text fields.
+#   * CHEAP. One os.write() to an O_APPEND fd for the ledger line, one
+#     lockless read of a small JSON file for `recommend` — see
+#     pressure_control.py for why the read path takes no lock.
+#
+# Usage:
+#   heimdall-pressure record --kind overloaded_error|connection_reset
+#                             [--repo DIR] [--source SLUG] [--strict]
+#   heimdall-pressure recommend --ceiling N [--json]
+#   heimdall-pressure status [--ceiling N] [--json]
+#   heimdall-pressure reset
+#   heimdall-pressure retry-delay --attempt N [--base SECS] [--cap SECS] [--seed N]
+#   heimdall-pressure where [--repo DIR]
+#   -h | --help
+#
+# Exit status: 0 always on record/recommend/status/reset/where/retry-delay (by
+# design). With --strict on `record`: 2 usage/rejected input, 3 write failure.
+
+import contextlib
+import json
+import os
+import sys
+
+SCHEMA_VERSION = 1
+
+EFFORT_MAX = 16  # source/session slug cap, matches bin/heimdall-metric's own
+
+
+def _now():
+    import time
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _slug(value, cap):
+    """Lowercase, collapse every non [a-z0-9_-] run to a single '-', trim,
+    cap. Identical contract to bin/heimdall-metric's _slug — the only door
+    free text comes through, so also the privacy control."""
+    if value is None:
+        return ""
+    out = []
+    prev_dash = False
+    for ch in str(value).lower():
+        if ("a" <= ch <= "z") or ("0" <= ch <= "9") or ch == "_":
+            out.append(ch)
+            prev_dash = False
+        elif not prev_dash and out:
+            out.append("-")
+            prev_dash = True
+        if len(out) >= cap:
+            break
+    return "".join(out).strip("-_")[:cap]
+
+
+class Rejected(Exception):
+    """Input the emitter refuses to record (bad --kind, malformed usage)."""
+
+
+def _pressure_control():
+    """Import the AIMD engine. Unlike agent-pool's OPTIONAL defensive import
+    (agent-pool's core job is spawning; pressure is an enhancement to it, so
+    agent-pool fails open if this is missing), this CLI's entire purpose IS
+    pressure_control — if it cannot be imported, there is nothing for this
+    tool to do, so that failure is reported plainly rather than faked."""
+    lib_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib")
+    if lib_dir not in sys.path:
+        sys.path.insert(0, lib_dir)
+    import pressure_control
+    return pressure_control
+
+
+def _metrics_path(repo):
+    planning = os.environ.get("HEIMDALL_PLANNING_DIR")
+    if not planning:
+        planning = os.path.join(repo, ".planning")
+    return os.path.join(planning, "metrics.jsonl")
+
+
+def _json_str(value):
+    """Minimal JSON string escaper — byte-identical approach to
+    bin/heimdall-metric's own, so a `.planning/metrics.jsonl` reader parses
+    both "metric" families with the same expectations."""
+    out = ['"']
+    for ch in value:
+        if ch == '"' or ch == "\\":
+            out.append("\\" + ch)
+        elif ch == "\n":
+            out.append("\\n")
+        elif ch == "\r":
+            out.append("\\r")
+        elif ch == "\t":
+            out.append("\\t")
+        elif ch < " " or ch == "\x7f":
+            out.append("\\u%04x" % ord(ch))
+        else:
+            out.append(ch)
+    out.append('"')
+    return "".join(out)
+
+
+def _append(path, raw):
+    """ONE os.write() to an O_APPEND fd. No lock, no read-modify-write, no
+    fsync — identical rationale to bin/heimdall-metric's _append: O_APPEND
+    seeks to EOF atomically under the kernel's file lock, so concurrent
+    agents cannot clobber or interleave each other's lines."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    try:
+        os.write(fd, raw)
+    finally:
+        os.close(fd)
+
+
+def _ledger_line(kind, result, source):
+    session = _slug(os.environ.get("CLAUDE_SESSION_ID")
+                    or os.environ.get("SESSION_ID") or "", EFFORT_MAX) or "default"
+    parts = [
+        '"ts":%s' % _json_str(_now()),
+        '"metric":"pressure"',
+        '"schema":%d' % SCHEMA_VERSION,
+        '"kind":%s' % _json_str(kind),
+        '"window_count":%d' % result["window_count"],
+        '"threshold":%d' % result["threshold"],
+        '"breached":%s' % ("true" if result["breached"] else "false"),
+        '"factor":%s' % json.dumps(round(float(result["factor"]), 3)),
+        '"source":%s' % _json_str(_slug(source, EFFORT_MAX) or "cli"),
+        '"session":%s' % _json_str(session),
+    ]
+    return ("{" + ",".join(parts) + "}\n").encode("utf-8")
+
+
+def cmd_record(args):
+    pc = _pressure_control()
+    kind = _slug(args.kind, 32)
+    if kind not in pc.PRESSURE_KINDS:
+        exc = Rejected("--kind must be one of %s, got %r"
+                       % ("|".join(pc.PRESSURE_KINDS), args.kind))
+        if args.strict:
+            sys.stderr.write("error: %s\n" % exc)
+            return 2
+        return 0  # never fail a caller reporting pressure, even a malformed report
+
+    try:
+        result = pc.record_event(kind)
+    except Exception as exc:
+        if args.strict:
+            sys.stderr.write("error: %s\n" % exc)
+            return 3
+        return 0  # the AIMD state write failing is never the caller's problem
+
+    # Ledger append is best-effort ON TOP of the (already-succeeded) state
+    # update above — audit trail, not the operational path. A ledger failure
+    # never demotes an otherwise-successful record, even under --strict.
+    with contextlib.suppress(OSError):
+        path = _metrics_path(args.repo)
+        if os.path.isdir(os.path.dirname(path)):
+            _append(path, _ledger_line(kind, result, args.source))
+
+    print("recorded: %s (window=%d/%d factor=%.3f%s)" % (
+        kind, result["window_count"], result["threshold"], result["factor"],
+        " BREACH" if result["breached"] else "",
+    ))
+    return 0
+
+
+def cmd_recommend(args):
+    pc = _pressure_control()
+    effective, reason, detail = pc.recommend(args.ceiling)
+    if args.json:
+        out = dict(detail)
+        out["ceiling"] = args.ceiling
+        out["recommended_max"] = effective
+        out["reduced"] = effective < args.ceiling
+        out["reason"] = reason
+        print(json.dumps(out, sort_keys=True))
+    else:
+        print(effective)
+    return 0
+
+
+def cmd_status(args):
+    pc = _pressure_control()
+    effective, reason, detail = pc.recommend(args.ceiling)
+    if args.json:
+        out = dict(detail)
+        out["ceiling"] = args.ceiling
+        out["recommended_max"] = effective
+        out["reduced"] = effective < args.ceiling
+        out["reason"] = reason
+        out["window_secs"] = pc.window_secs()
+        out["threshold"] = pc.threshold()
+        print(json.dumps(out, sort_keys=True))
+        return 0
+
+    print("heimdall-pressure status")
+    print("  pressure known:   %s" % detail.get("pressure_known", False))
+    print("  factor:           %s" % detail.get("factor", 1.0))
+    print("  ceiling:          %d" % args.ceiling)
+    print("  recommended max:  %d" % effective)
+    print("  reduced:          %s" % (effective < args.ceiling))
+    if reason:
+        print("  reason:           %s" % reason)
+    return 0
+
+
+def cmd_reset(args):
+    pc = _pressure_control()
+    pc.reset_state()
+    print("reset: pressure state cleared")
+    return 0
+
+
+def cmd_retry_delay(args):
+    pc = _pressure_control()
+    rng = None
+    if args.seed is not None:
+        import random
+        rng = random.Random(args.seed).random
+    delay = pc.retry_delay(args.attempt, base=args.base, cap=args.cap, rng=rng)
+    print(delay)
+    return 0
+
+
+def cmd_where(args):
+    print(_metrics_path(args.repo))
+    return 0
+
+
+def build_parser():
+    import argparse
+
+    class _Parser(argparse.ArgumentParser):
+        """argparse exits 2 on a usage error, which would fail a caller's
+        task over a CLI typo. Route usage errors through Rejected instead so
+        the never-fails contract covers a malformed call exactly like a
+        failed write — identical rationale to bin/heimdall-metric's own
+        _Parser. -h/--help still exits normally."""
+
+        def error(self, message):
+            raise Rejected(message)
+
+    ap = _Parser(
+        prog="heimdall-pressure",
+        description="Control for the 529-overloaded bit: record observed API "
+                    "pressure, get an AIMD-adjusted spawn-count recommendation. "
+                    "A feedback controller on spawn decisions, never a circuit "
+                    "breaker on live requests. Never fails the caller.")
+    ap.add_argument("--repo", default=".", help="repo root, for the audit ledger (default: cwd)")
+    ap.add_argument("--strict", action="store_true",
+                    help="surface record failures (tests only; callers never pass this)")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    r = sub.add_parser("record", help="record ONE observed pressure signal")
+    r.add_argument("--kind", required=True, help="overloaded_error | connection_reset")
+    r.add_argument("--source", default="cli", help="emitting lane slug")
+    r.set_defaults(fn=cmd_record)
+
+    rec = sub.add_parser("recommend", help="print the pressure-adjusted spawn recommendation")
+    rec.add_argument("--ceiling", type=int, required=True, help="operator-configured max (e.g. agent-pool's max_agents)")
+    rec.add_argument("--json", action="store_true", help="emit full detail as JSON")
+    rec.set_defaults(fn=cmd_recommend)
+
+    s = sub.add_parser("status", help="show current AIMD state + a recommendation")
+    s.add_argument("--ceiling", type=int, default=10, help="ceiling to evaluate against for display (default: 10)")
+    s.add_argument("--json", action="store_true", help="emit as JSON")
+    s.set_defaults(fn=cmd_status)
+
+    rs = sub.add_parser("reset", help="clear cached pressure state (idempotent)")
+    rs.set_defaults(fn=cmd_reset)
+
+    rd = sub.add_parser("retry-delay", help="full-jitter exponential backoff delay, in seconds")
+    rd.add_argument("--attempt", type=int, required=True, help="1-based attempt number")
+    rd.add_argument("--base", type=float, default=1.0, help="base delay in seconds (default: 1.0)")
+    rd.add_argument("--cap", type=float, default=60.0, help="max delay in seconds (default: 60.0)")
+    rd.add_argument("--seed", type=int, default=None, help="deterministic jitter seed (tests only)")
+    rd.set_defaults(fn=cmd_retry_delay)
+
+    w = sub.add_parser("where", help="print the audit ledger path")
+    w.set_defaults(fn=cmd_where)
+
+    return ap
+
+
+def main(argv):
+    strict = "--strict" in argv
+    try:
+        args = build_parser().parse_args(argv)
+    except Rejected as exc:
+        if strict:
+            sys.stderr.write("error: %s\n" % exc)
+            return 2
+        return 0  # a malformed call is a no-op, never the caller's problem
+    args.repo = os.path.abspath(args.repo)
+    return args.fn(args)
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main(sys.argv[1:]))
+    except BrokenPipeError:
+        raise SystemExit(0)
+    except SystemExit:
+        raise
+    except Exception as exc:  # last-resort guard: telemetry never breaks a task
+        if "--strict" in sys.argv:
+            sys.stderr.write("error: %s\n" % exc)
+            raise SystemExit(3)
+        raise SystemExit(0)
