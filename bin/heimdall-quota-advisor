@@ -134,7 +134,8 @@ _qa_detect() {
 #    and an honest, doc-cited fallback otherwise — never a hardcoded,
 #    staleness-prone number presented as current.
 _qa_tier_headroom_line() {
-  local repo="$1" log="$repo/.planning/metrics.jsonl" total sonnet pct
+  local repo="$1"
+  local log="$repo/.planning/metrics.jsonl" total sonnet pct
   if [ -r "$log" ] && command -v jq >/dev/null 2>&1; then
     total="$(jq -s '[.[] | select(.metric=="task" and .model)] | length' "$log" 2>/dev/null)"
     case "$total" in ''|*[!0-9]*) total=0 ;; esac
