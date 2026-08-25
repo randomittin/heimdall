@@ -181,6 +181,28 @@
 #   that is still a live orchestrator's action, same as everything else in
 #   this file.
 #
+#   SUBAGENTSTOP CANNOT REACH THE ORCHESTRATOR — SETTLED, DO NOT RE-RUN THIS.
+#   A dying subagent's SubagentStop hook cannot deliver its retryable cause to
+#   a LIVE orchestrator at the instant of death. Evidence: decompiling the
+#   Claude Code CLI binary (`strings -a`, v2.1.220) surfaces the platform's
+#   OWN per-event doc comments — `Stop`'s additionalContext is "delivered to
+#   the model; the conversation continues" while `SubagentStop`'s is
+#   "delivered to the subagent; the subagent continues" (different delivery
+#   target, platform-stated). Structurally, HOOK_EVENT_REGISTRY maps `Stop`
+#   and `SubagentStop` to the SAME handler — SubagentStop is Stop-for-a-
+#   subagent, not orchestrator-facing. (TeammateIdle is no substitute either:
+#   scoped to agent-teams, not generic Task spawns.) What DOES work, observed
+#   live: a SessionStart hook's output DOES reach the orchestrator — exactly
+#   how this tool's own `resume-hint` gets read today, via
+#   heimdall-quota-resume's wiring (~24ms measured). Its limit is timing, not
+#   delivery: fires at the NEXT session start, never the instant of death.
+#   VERSION CAVEAT, stated not hidden: the binary evidence is from CLI
+#   2.1.220; this comment was written under a session pinning 2.1.241 —
+#   judged low-risk (core hook-delivery plumbing) but real and not
+#   re-verified at the newer version. Two follow-on questions stay explicitly
+#   OPEN, not resolved — see
+#   .planning/skills/subagent-stop-delivery-scope.md.
+#
 # USAGE
 #   heimdall-agent-resume list   [--json] [--repo DIR] [--states s1,s2,...]
 #   heimdall-agent-resume report [--json] [--repo DIR] [--states ...]
