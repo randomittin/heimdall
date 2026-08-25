@@ -1,0 +1,676 @@
+#!/usr/bin/env python3
+# heimdall-portable-brief — turns .planning/CHECKPOINT.md into a PORTABLE
+# CONTEXT BRIEF safe to hand to a fallback (possibly non-Claude, possibly
+# third-party/public-trust) model, WITHOUT replaying the conversation.
+#
+# WHY THIS EXISTS: spend is dominated by turns x context, and the large
+# majority of tokens are served from Anthropic's prompt cache. Switching
+# providers on quota exhaustion means a cold cache regardless, so replaying
+# the whole conversation to a fallback model is the wrong move twice over
+# (expensive AND slow to rebuild). Instead, hand the fallback model the
+# EXISTING checkpoint that bin/heimdall-checkpoint already writes. This tool
+# does the one thing that checkpoint cannot safely do on its own: scrub it
+# for a reader that is not trusted with this repo's secrets, and bound its
+# size for a reader with unknown context-window economics.
+#
+# THIS TOOL NEVER TRANSMITS ANYTHING ITSELF. It only writes (--out) and/or
+# prints (stdout) a brief. Sending it anywhere — to a fallback model, to a
+# routing layer, to a file a human then copies by hand — is a decision made
+# outside this tool, by a human operator or a separate routing layer. This
+# statement is repeated in the emitted brief's own header for exactly the
+# same reason a security notice belongs on the artifact, not just in the
+# tool that made it.
+#
+# DELTA against bin/heimdall-brief: heimdall-brief resolves code SYMBOLS,
+# FILES, and CAPSULES for a new coding task (bin/heimdall-graph /
+# bin/heimdall-capsule, confidence-marked, fail-closed on an unresolved
+# ref). It has no concept of .planning/CHECKPOINT.md, no scrubbing, no size
+# budget, and never runs against session/resume state. This tool solves a
+# different problem — checkpoint PORTABILITY and SAFETY for an untrusted
+# reader — and duplicates none of heimdall-brief's job. Both happen to use a
+# `build` subcommand; that is a deliberate convention match, not a merge.
+#
+# TWO DIFFERENT "NEVER" RULES, KEPT DELIBERATELY SEPARATE:
+#   - Process-level NEVER-FAIL (matches bin/heimdall-metric /
+#     bin/heimdall-pressure): a missing or unreadable checkpoint must never
+#     crash this tool. It degrades to an honest, explicit empty/partial
+#     result at exit 0.
+#   - Content-level FAIL-CLOSED (the opposite instinct, on purpose): any
+#     section this tool cannot CONFIDENTLY classify as safe is EXCLUDED,
+#     never included. Excluding useful context degrades the fallback
+#     model's answer; including a secret cannot be undone. When in doubt,
+#     the content is dropped — the PROCESS still exits cleanly either way.
+#
+# EXIT CODES (a deliberate, documented departure from heimdall-metric /
+# heimdall-pressure's "exit 0 unless --strict" convention): this is a
+# directly-invoked, payload-producing CLI (like bin/heimdall-brief), not a
+# fire-and-forget hook telemetry emitter. A typo in its arguments should be
+# visible to whoever/whatever just typed it, not silently swallowed.
+#   0 = success, INCLUDING an honest empty/partial result (missing
+#       checkpoint, unreadable checkpoint, zero classifiable sections).
+#   1 = this tool's own failure: an --out path could not be written, or an
+#       internal bug was caught by the bottom-of-file guard. Silently
+#       claiming success when a human explicitly asked for a saved file
+#       and did not get one would be a lie.
+#   2 = CLI usage error (bad/missing arguments) — argparse's native
+#       default, deliberately left un-overridden.
+#
+# SIZE BUDGETING IS BYTE-BASED, NOT TOKEN-BASED, on purpose: token
+# boundaries are tokenizer/model-specific, and this brief is explicitly for
+# an UNKNOWN model. Bytes are the one unit every reader agrees on. The
+# manifest also prints a rough bytes-to-tokens conversion for operators who
+# need to reason in token terms.
+#
+# KNOWN, DOCUMENTED LIMITATIONS (see also the final agent report for this
+# task):
+#   - The heading whitelist below is string-matched against the EXACT
+#     section headings bin/heimdall-checkpoint emits today. This tool does
+#     not (and per its scope, must not) modify heimdall-checkpoint; a future
+#     rewording of one of those headings there would silently drop that
+#     section into "unclassifiable" here rather than erroring loudly. That
+#     is the correct failure direction (fail closed, not fail open), but it
+#     is a real coupling worth knowing about.
+#   - Local absolute file paths (e.g. `/Users/<name>/...` inside Worktree
+#     ledger / Held-branches text) are deliberately NOT scrubbed. They are
+#     outside the five required categories, and scrubbing them would gut
+#     those sections' entire purpose (they are inherently built from local
+#     paths). This is a judgment call, not an oversight — flagged here and
+#     in the shipping report for whoever owns the fallback-provider trust
+#     boundary to revisit if it turns out to matter.
+#   - The size-budget packer is whole-section, priority-ordered, and
+#     greedy — not a byte-perfect knapsack. It is guaranteed to fit the
+#     budget (see the tightening loop in pack_and_render) except in one
+#     honestly-reported pathological case: a budget too small even for the
+#     manifest text alone, where the manifest is never truncated (the
+#     trade-off explanation matters more than hitting the number) and the
+#     overshoot is stated in plain text instead.
+
+import argparse
+import datetime
+import json
+import os
+import re
+import sys
+
+DEFAULT_BUDGET = 16000
+MANIFEST_ENTRY_CAP = 20
+TRUNCATION_MARKER = "\n\n[...truncated to fit the portable-brief size budget...]"
+
+# Exact marker strings bin/heimdall-checkpoint uses to delimit its mechanical
+# "auto zone" (confirmed against bin/heimdall-checkpoint's own BEGIN_MARK /
+# END_MARK constants). Everything outside these markers is human/LLM-authored
+# manual content (e.g. via /hmd:save) and is NEVER trusted by heading text
+# alone — see classify_sections().
+BEGIN_MARK = "<!-- heimdall-auto-checkpoint:begin -->"
+END_MARK = "<!-- heimdall-auto-checkpoint:end -->"
+
+# (heading prefix, internal slug, priority). Lower priority number = packed
+# first when the size budget is tight. 0 is the resume contract itself —
+# the six "what must never be lost" answers bin/heimdall-checkpoint's own
+# completeness gate already treats as the top-priority, never-lose payload.
+# Matched by .startswith() against the trimmed heading text of a section
+# that lives INSIDE the recognized auto zone — heading text matching one of
+# these prefixes OUTSIDE the auto zone does not count (see
+# classify_sections): a manual section that happens to reuse a trusted
+# heading string is still excluded, because zone membership is checked too.
+WHITELIST = [
+    ("What must never be lost", "resume-contract", 0),
+    ("Auto-checkpoint", "auto-checkpoint-header", 1),
+    ("Gate state", "gate-state", 2),
+    ("Failing eval oracle gates", "failing-gates", 2),
+    ("Uncommitted changes", "uncommitted-changes", 3),
+    ("Recent commits", "recent-commits", 4),
+    ("Resume", "resume-instructions", 5),
+    ("Worktree ledger", "worktree-ledger", 6),
+    ("This session's edited files", "session-edits", 6),
+]
+
+# ---------------------------------------------------------------------------
+# Content-level scrub rules. ANY match on a candidate section's full text
+# (heading + body) excludes the WHOLE section — never a partial redaction of
+# just the matched span, since a partial redaction risks leaving adjacent
+# sensitive context intact. Grounded in this repo's own real terminology
+# (bin/heimdall-team, bin/heimdall-invite, conventions.md R8,
+# bin/secret-scan) plus generic, widely-recognized credential shapes.
+# ---------------------------------------------------------------------------
+
+SCRUB_CATEGORIES = [
+    "credential-or-token",
+    "team-secret-or-derived",
+    "dotenv-assignment",
+    "internal-infra-identifier",
+    "security-incident-keyword",
+]
+
+_CRED_PATTERNS = [
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"\bASIA[0-9A-Z]{16}\b"),
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
+    re.compile(r"\bsk-[A-Za-z0-9]{10,}\b"),
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b"),
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"),
+    re.compile(r"\bAIza[0-9A-Za-z_-]{20,}\b"),
+    re.compile(r"\bBearer\s+[A-Za-z0-9._-]{10,}"),
+    re.compile(
+        r"(?i)\b(?:api[_-]?key|secret|password|passwd|token)\b\s*[:=]\s*"
+        r"['\"]?[A-Za-z0-9/+_.-]{8,}['\"]?"
+    ),
+]
+
+_TEAM_SECRET_PATTERNS = [
+    re.compile(r"(?i)HEIMDALL_TEAM_SECRET"),
+    re.compile(r"(?i)\bteam_secret\b"),
+    re.compile(r"(?i)\bteam_id\s*[:=]\s*[0-9a-f]{32}\b"),
+]
+
+_DOTENV_LINE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{2,}=\S+$", re.MULTILINE)
+
+_INFRA_PATTERNS = [
+    re.compile(r"\b10\.\d{1,3}\.\d{1,3}\.\d{1,3}\b"),
+    re.compile(r"\b172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}\b"),
+    re.compile(r"\b192\.168\.\d{1,3}\.\d{1,3}\b"),
+    re.compile(r"\b[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)*\.(?:internal|corp|lan)\b"),
+    re.compile(r"\.svc\.cluster\.local\b"),
+    re.compile(r"\barn:aws:[a-zA-Z0-9:_/-]+"),
+]
+
+_INCIDENT_STRONG = re.compile(
+    r"(?i)(?:security incident|security-remediation|incident response|data breach)"
+)
+_LEAK_WORD = re.compile(r"(?i)(?:leak(?:ed|age)?|expos(?:ed|ure)|compromis(?:ed|e)|breach(?:ed)?)")
+_SENSITIVE_NOUN = re.compile(r"(?i)(?:credential|secret|key|token|password)")
+
+
+def scrub_reasons(text):
+    """Return the list of SCRUB_CATEGORIES that fire against text. Empty
+    list means nothing matched — NOT the same as "confirmed safe"; see
+    classify_sections for the separate unclassifiable-by-zone/heading path.
+    """
+    reasons = []
+    if any(p.search(text) for p in _CRED_PATTERNS):
+        reasons.append("credential-or-token")
+    if any(p.search(text) for p in _TEAM_SECRET_PATTERNS):
+        reasons.append("team-secret-or-derived")
+    dotenv_hits = _DOTENV_LINE.findall(text)
+    if len(dotenv_hits) >= 3 or (len(dotenv_hits) >= 1 and ".env" in text):
+        reasons.append("dotenv-assignment")
+    if any(p.search(text) for p in _INFRA_PATTERNS):
+        reasons.append("internal-infra-identifier")
+    if _INCIDENT_STRONG.search(text) or (_LEAK_WORD.search(text) and _SENSITIVE_NOUN.search(text)):
+        reasons.append("security-incident-keyword")
+    return reasons
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint discovery, zone splitting, section parsing.
+# ---------------------------------------------------------------------------
+
+
+def byte_len(s):
+    return len(s.encode("utf-8", errors="replace"))
+
+
+def read_checkpoint(path):
+    """Never raises. Returns (text, mtime_iso, error). error is None on
+    success, else a short human-readable reason ('not found' /
+    'unreadable: ...') — the never-fail-caller contract for this tool's one
+    external input.
+    """
+    if not path or not os.path.isfile(path):
+        return None, None, "not found"
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            text = f.read()
+        mtime = datetime.datetime.fromtimestamp(
+            os.path.getmtime(path), tz=datetime.timezone.utc
+        ).isoformat()
+        return text, mtime, None
+    except OSError as exc:
+        return None, None, f"unreadable: {exc}"
+
+
+def split_zones(text):
+    """Returns (auto_zone_text, manual_zone_text, zone_found).
+
+    Fails closed on ambiguity: if the markers are missing, out of order, or
+    a second begin-marker appears before the matched end-marker (an
+    ambiguous/duplicated boundary), the ENTIRE file is treated as manual /
+    untrusted content rather than guessing which part is mechanical.
+    """
+    b = text.find(BEGIN_MARK)
+    e = text.find(END_MARK)
+    if b == -1 or e == -1 or e <= b:
+        return "", text, False
+    if text.find(BEGIN_MARK, b + 1) != -1 and text.find(BEGIN_MARK, b + 1) < e:
+        return "", text, False
+    auto_zone = text[b + len(BEGIN_MARK) : e]
+    manual_zone = text[:b] + text[e + len(END_MARK) :]
+    return auto_zone, manual_zone, True
+
+
+_HEADING_RE = re.compile(r"^(#{1,6})[ \t]+(.*?)[ \t]*$", re.MULTILINE)
+
+
+def parse_sections(zone_text):
+    """Split zone_text into an ordered list of {heading, body} dicts on
+    Markdown heading lines (any level 1-6, matching whatever level
+    bin/heimdall-checkpoint used for that section). Content before the
+    first heading becomes one {heading: None, body: preamble} entry,
+    silently dropped later if blank.
+    """
+    matches = list(_HEADING_RE.finditer(zone_text))
+    sections = []
+    if not matches:
+        preamble = zone_text.strip()
+        if preamble:
+            sections.append({"heading": None, "body": preamble})
+        return sections
+    if matches[0].start() > 0:
+        preamble = zone_text[: matches[0].start()].strip()
+        if preamble:
+            sections.append({"heading": None, "body": preamble})
+    for i, m in enumerate(matches):
+        heading = m.group(2).strip()
+        body_start = m.end()
+        body_end = matches[i + 1].start() if i + 1 < len(matches) else len(zone_text)
+        body = zone_text[body_start:body_end].strip("\n")
+        sections.append({"heading": heading, "body": body})
+    return sections
+
+
+def classify_heading(heading):
+    if heading is None:
+        return None
+    for prefix, slug, priority in WHITELIST:
+        if heading.startswith(prefix):
+            return slug, priority
+    return None
+
+
+def classify_sections(auto_sections, manual_sections):
+    """Three-layer trust decision, in order:
+      1. zone membership (auto_sections vs manual_sections, decided by the
+         caller via split_zones — manual sections NEVER pass, regardless of
+         heading text or how benign the content looks);
+      2. heading whitelist (only for auto-zone sections);
+      3. content-level scrub_reasons() on every section that survives 1+2.
+    Returns (candidates, scrub_excluded, unclassified).
+    """
+    candidates = []
+    scrub_excluded = []
+    unclassified = []
+    order = 0
+
+    for sec in auto_sections:
+        order += 1
+        heading = sec["heading"]
+        body = sec["body"]
+        display_name = heading if heading else "(untitled section)"
+        match = classify_heading(heading)
+        if match is None:
+            unclassified.append({"name": display_name})
+            continue
+        slug, priority = match
+        full_text = f"{heading}\n{body}"
+        reasons = scrub_reasons(full_text)
+        if reasons:
+            heading_alone_hit = bool(scrub_reasons(heading))
+            shown = "[REDACTED HEADING]" if heading_alone_hit else display_name
+            scrub_excluded.append({"name": shown, "reasons": reasons})
+            continue
+        candidates.append(
+            {
+                "name": display_name,
+                "slug": slug,
+                "priority": priority,
+                "order": order,
+                "heading": heading,
+                "body": body,
+            }
+        )
+
+    for sec in manual_sections:
+        heading = sec["heading"]
+        display_name = heading if heading else "(untitled manual section)"
+        unclassified.append({"name": display_name})
+
+    return candidates, scrub_excluded, unclassified
+
+
+def resume_key_note(checkpoint_path, checkpoint_error):
+    """One fail-open, informational-only line: whether RESUME-KEY.json sits
+    alongside the checkpoint and how many of the 6 never-lose answers it
+    recorded. Never affects inclusion/exclusion decisions above — it is
+    purely a pointer for the operator, using required-reading material
+    (bin/lib/resume-contract.sh's 6-field contract) without coupling to its
+    per-field labels.
+    """
+    if checkpoint_error:
+        return "Resume-key: not checked (no checkpoint was found)."
+    rk_path = os.path.join(os.path.dirname(checkpoint_path) or ".", "RESUME-KEY.json")
+    try:
+        with open(rk_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        n = len(data.get("answers", []))
+        return f"Resume-key: {rk_path} present, {n}/6 never-lose answers recorded (informational only)."
+    except Exception:
+        return (
+            f"Resume-key: not found or unreadable at {rk_path} "
+            "(informational only; does not affect inclusion)."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Manifest + document rendering, and the size-budget packer.
+# ---------------------------------------------------------------------------
+
+
+def _format_list(entries, cap=MANIFEST_ENTRY_CAP):
+    lines = [f"- {e}" for e in entries[:cap]]
+    remaining = len(entries) - cap
+    if remaining > 0:
+        lines.append(f"  ... +{remaining} more")
+    return lines
+
+
+def build_manifest(
+    checkpoint_path,
+    checkpoint_mtime,
+    checkpoint_error,
+    budget,
+    actual_size,
+    included,
+    scrub_excluded,
+    unclassified,
+    budget_excluded,
+    truncated_name,
+    overshoot_note,
+    resume_note,
+):
+    lines = ["=== PORTABLE BRIEF MANIFEST ==="]
+    lines.append(f"Generated: {datetime.datetime.now(datetime.timezone.utc).isoformat()}")
+    if checkpoint_error:
+        lines.append(f"Source checkpoint: NOT FOUND ({checkpoint_error}: {checkpoint_path})")
+    else:
+        lines.append(f"Source checkpoint: {checkpoint_path} (mtime: {checkpoint_mtime})")
+    lines.append(
+        f"Size budget: {budget} bytes | Actual size: {actual_size} bytes "
+        f"(~{actual_size // 4} tokens at a rough ~4 bytes/token)"
+    )
+    lines.append("")
+    lines.append("This tool NEVER transmits this brief anywhere. It only writes/prints it.")
+    lines.append("Sending it (or not) to any model or provider is a separate decision made")
+    lines.append("by a human operator or a routing layer outside this tool.")
+    lines.append("")
+
+    lines.append(f"-- INCLUDED ({len(included)}) --")
+    if included:
+        entries = []
+        for c in included:
+            suffix = " [TRUNCATED TO FIT BUDGET]" if c["name"] == truncated_name else ""
+            entries.append(f"{c['name']} ({byte_len(c['body'])} bytes, priority {c['priority']}){suffix}")
+        lines.extend(_format_list(entries))
+    else:
+        lines.append("- (none)")
+    lines.append("")
+
+    lines.append(f"-- EXCLUDED: scrub, content matched a sensitive pattern ({len(scrub_excluded)}) --")
+    if scrub_excluded:
+        entries = [f"{e['name']} — category: {', '.join(e['reasons'])}" for e in scrub_excluded]
+        lines.extend(_format_list(entries))
+    else:
+        lines.append("- (none)")
+    lines.append("")
+
+    lines.append(
+        f"-- EXCLUDED: unclassifiable, outside recognized checkpoint structure ({len(unclassified)}) --"
+    )
+    if unclassified:
+        lines.extend(_format_list([e["name"] for e in unclassified]))
+    else:
+        lines.append("- (none)")
+    lines.append("")
+
+    lines.append(f"-- EXCLUDED: budget, dropped to fit the size budget ({len(budget_excluded)}) --")
+    if budget_excluded:
+        entries = [
+            f"{c['name']} ({byte_len(c['body'])} bytes, priority {c['priority']})"
+            for c in budget_excluded
+        ]
+        lines.extend(_format_list(entries))
+    else:
+        lines.append("- (none)")
+
+    if overshoot_note:
+        lines.append("")
+        lines.append(overshoot_note)
+
+    lines.append("")
+    lines.append(resume_note)
+    lines.append("")
+    lines.append("Rule: any section this tool cannot confidently classify as safe is EXCLUDED,")
+    lines.append("never included. Ambiguity always resolves to exclusion, not inclusion.")
+    lines.append(f"Scrub categories checked: {', '.join(SCRUB_CATEGORIES)}")
+    lines.append("=== END MANIFEST ===")
+    return "\n".join(lines) + "\n"
+
+
+def render_section(cand):
+    return f"## {cand['heading']}\n\n{cand['body']}\n"
+
+
+def pack_and_render(
+    header,
+    checkpoint_path,
+    checkpoint_mtime,
+    checkpoint_error,
+    budget,
+    all_candidates,
+    scrub_excluded,
+    unclassified,
+    resume_note,
+    body_intro,
+):
+    """Whole-section, priority-ordered GREEDY packer — not a byte-perfect
+    knapsack (a documented, acceptable simplification: this is a
+    commit-as-soon-as-it-works tool, and priority order already puts the
+    never-lose resume contract first). Guaranteed to terminate (bounded
+    loops) and guaranteed to fit `budget` except the one honestly-reported
+    pathological case where the manifest text alone exceeds it.
+    """
+
+    def render(included_now, budget_excluded_now, truncated_name_now, overshoot_note_now):
+        body_text = body_intro + "".join(render_section(c) + "\n" for c in included_now)
+        # Fixed-point sizing: the manifest reports "actual size", but actual
+        # size depends on the manifest's own text (digit-count of the size
+        # number itself shifts byte length by a byte or two). Converges in
+        # at most a couple of iterations in practice; 4 is a generous cap,
+        # never an infinite loop.
+        size_guess = 0
+        doc = ""
+        for _ in range(4):
+            manifest = build_manifest(
+                checkpoint_path,
+                checkpoint_mtime,
+                checkpoint_error,
+                budget,
+                size_guess,
+                included_now,
+                scrub_excluded,
+                unclassified,
+                budget_excluded_now,
+                truncated_name_now,
+                overshoot_note_now,
+                resume_note,
+            )
+            doc = header + manifest + "\n# Included Context\n\n" + body_text
+            new_size = byte_len(doc)
+            if new_size == size_guess:
+                break
+            size_guess = new_size
+        return doc, size_guess
+
+    included = sorted(all_candidates, key=lambda c: (c["priority"], c["order"]))
+    budget_excluded = []
+    doc, size = render(included, budget_excluded, None, None)
+
+    guard = len(included) + 1
+    while size > budget and included and guard > 0:
+        guard -= 1
+        dropped = included.pop()  # ascending priority sort -> last = lowest priority
+        budget_excluded.append(dropped)
+        doc, size = render(included, budget_excluded, None, None)
+
+    if size <= budget:
+        return doc, size
+
+    if all_candidates:
+        top = sorted(all_candidates, key=lambda c: (c["priority"], c["order"]))[0]
+        rest_excluded = [c for c in all_candidates if c is not top]
+        _, empty_size = render([], rest_excluded, None, None)
+        room = budget - empty_size - byte_len(TRUNCATION_MARKER)
+        if room > 200:
+            raw = top["body"].encode("utf-8", errors="replace")[:room]
+            top_trunc = dict(top)
+            top_trunc["body"] = raw.decode("utf-8", errors="ignore") + TRUNCATION_MARKER
+            doc, size = render([top_trunc], rest_excluded, top["name"], None)
+            if size <= budget:
+                return doc, size
+
+    note = (
+        f"NOTE: actual size below still exceeds the requested budget of {budget} bytes "
+        "even with the minimum possible content -- the manifest text itself is the "
+        "overhead. Raise --budget-bytes if this brief must fit a hard limit."
+    )
+    doc, size = render([], all_candidates, None, note)
+    return doc, size
+
+
+HEADER_TEMPLATE = """# Portable Context Brief
+
+Generated by bin/heimdall-portable-brief from a Heimdall project checkpoint.
+This document is a SCRUBBED, SIZE-BOUNDED excerpt intended for handoff to a
+fallback model (possibly non-Claude, possibly a third-party/public-trust
+provider) when the primary provider is unavailable, WITHOUT replaying the
+full conversation history.
+
+THIS TOOL NEVER TRANSMITS THIS DOCUMENT ANYWHERE. It only writes and/or
+prints it. Sending it (or not) to any model or provider is a separate
+decision made by a human operator or a routing layer outside this tool.
+
+Read the manifest below before sending this anywhere -- it states exactly
+what was included, what was scrubbed, what was unclassifiable, and what was
+dropped to fit the size budget.
+
+"""
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def cmd_build(args):
+    repo = args.repo or "."
+    checkpoint_path = args.checkpoint or os.path.join(repo, ".planning", "CHECKPOINT.md")
+    text, mtime, error = read_checkpoint(checkpoint_path)
+
+    if error:
+        candidates, scrub_excluded, unclassified = [], [], []
+        body_intro = (
+            "_No checkpoint content was available -- the source checkpoint was "
+            f"NOT FOUND at: {checkpoint_path}. This is an honest empty result: "
+            "heimdall-portable-brief never fails its caller over a missing or "
+            "unreadable checkpoint._\n\n"
+        )
+    else:
+        auto_text, manual_text, zone_found = split_zones(text)
+        auto_sections = parse_sections(auto_text) if zone_found else []
+        manual_sections = parse_sections(manual_text if zone_found else text)
+        candidates, scrub_excluded, unclassified = classify_sections(auto_sections, manual_sections)
+        body_intro = ""
+
+    resume_note = resume_key_note(checkpoint_path, error)
+    doc, _size = pack_and_render(
+        HEADER_TEMPLATE,
+        checkpoint_path,
+        mtime,
+        error,
+        args.budget_bytes,
+        candidates,
+        scrub_excluded,
+        unclassified,
+        resume_note,
+        body_intro,
+    )
+
+    sys.stdout.write(doc)
+
+    if args.out:
+        try:
+            with open(args.out, "w", encoding="utf-8") as f:
+                f.write(doc)
+        except OSError as exc:
+            sys.stderr.write(f"heimdall-portable-brief: could not write --out {args.out}: {exc}\n")
+            return 1
+
+    return 0
+
+
+def build_arg_parser():
+    p = argparse.ArgumentParser(
+        prog="heimdall-portable-brief",
+        description=(
+            "Turn a Heimdall .planning/CHECKPOINT.md into a scrubbed, "
+            "size-bounded portable context brief for a fallback model. "
+            "This tool never transmits the brief anywhere -- it only "
+            "writes/prints it."
+        ),
+    )
+    sub = p.add_subparsers(dest="command", required=True)
+
+    b = sub.add_parser("build", help="build a portable brief from a checkpoint")
+    b.add_argument(
+        "--repo",
+        default=".",
+        help="repo root (default: .); checkpoint defaults to <repo>/.planning/CHECKPOINT.md",
+    )
+    b.add_argument(
+        "--checkpoint",
+        default=None,
+        help="explicit checkpoint path (overrides the --repo derivation)",
+    )
+    b.add_argument(
+        "--budget-bytes",
+        type=int,
+        default=DEFAULT_BUDGET,
+        help=f"max output size in bytes (default: {DEFAULT_BUDGET})",
+    )
+    b.add_argument("--out", default=None, help="also write the brief to this file")
+    b.set_defaults(func=cmd_build)
+
+    return p
+
+
+def main(argv):
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main(sys.argv[1:]))
+    except BrokenPipeError:
+        raise SystemExit(0)
+    except SystemExit:
+        raise
+    except Exception as exc:
+        # Defensive guard, mirroring bin/heimdall-metric / bin/heimdall-pressure's
+        # bottom-of-file pattern. An internal bug must never look like a
+        # successful, honest empty result (exit 0) -- that would misrepresent
+        # risk to a caller relying on this tool's exit code. Exit 1: distinct
+        # from argparse's own usage-error exit 2, and from the intentional
+        # honest-empty exit-0 paths inside cmd_build.
+        sys.stderr.write(f"heimdall-portable-brief: internal error: {exc}\n")
+        raise SystemExit(1)
