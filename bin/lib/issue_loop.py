@@ -378,11 +378,20 @@ def _claude_fix_timeout():
         return CLAUDE_FIX_TIMEOUT_DEFAULT
 
 
-def _scrub_fix_output(text):
-    """Redact token-ish substrings from the recorded fix output-tail (safe to persist)."""
+def _scrub_fix_output(text, extra_secrets=None):
+    """Redact token-ish substrings from the recorded fix output-tail (safe to
+    persist). extra_secrets additionally redacts EXACT known secret strings with
+    no fixed shape a regex could catch — e.g. an OmniRoute/operator fallback key,
+    which could be any format at all (raw hex, a JWT, a vendor-prefixed token…).
+    A fallback route's key value must never leak into a log or error message; the
+    pattern-based scrub below only catches Anthropic/GitHub-shaped secrets."""
     if not text:
         return ""
-    return _FIX_SECRET_SCRUB.sub("[REDACTED]", text)
+    scrubbed = _FIX_SECRET_SCRUB.sub("[REDACTED]", text)
+    for secret in extra_secrets or ():
+        if secret:
+            scrubbed = scrubbed.replace(secret, "[REDACTED]")
+    return scrubbed
 
 
 def _changed_file_count(repo):
@@ -476,6 +485,169 @@ _RETRY_OVERLOAD_ENV = (
 )
 
 
+# ── OMNIROUTE EXHAUSTION FALLBACK — bin/heimdall-fallback is the policy gate ──────────
+#
+# FALLBACK-ONLY, never a routing default. docs/analysis/2026-08-25-headroom-inpath-
+# measurement.md: cache is 91-95% of the value a Claude Code session gets from Headroom's
+# proxy (127.0.0.1:8787, already in-path for all normal traffic on the deployed
+# maintainer); compression is 0.35%. OmniRoute drops cache_control for the backends it
+# actually routes to, so sending HEALTHY traffic through it would trade the 91-95% away to
+# save the 0.35%. This wiring engages ONLY when bin/heimdall-fallback check's exit code
+# says ROUTE (0) — see that binary's own header for the full safety boundary (Tier-1
+# credential-absence via OmniRoute's own DB, operator-owned key only, loopback-only
+# endpoint, fail-closed on any doubt).
+#
+# THE GATE DECIDES, NOT THIS MODULE: exit 0 is the ONLY signal that means route. 1
+# (REFUSE), 2 (WAIT), an unreadable/missing gate binary, and any other exit all mean
+# "spawn exactly as today" — never re-derived, never guessed. _omniroute_route_overlay is
+# the ONE function that reads the verdict; every other helper here answers to it.
+#
+# EXHAUSTION vs. OVERLOAD, kept genuinely separate (the gate's own header says the same
+# from its side): a transient 529 is retried by hmd-claude-retry.sh's OWN backoff/marker
+# logic above, completely untouched by any of this. The gate is consulted exactly ONCE per
+# fix invocation, BEFORE the wrapper ever runs, independent of whether THIS call will
+# overload — routing is a pre-condition on the operator's own opt-in state
+# (heimdall-fallback set on|auto, never flipped by hmd itself), never a reaction to a 529.
+# This code structurally cannot conflate the two: it never inspects the wrapper's outcome
+# (proc.returncode, the overload shape) to decide whether to route — that decision is
+# fully made before argv/env are even built.
+_FALLBACK_GATE_BIN = os.path.join(_bindir(), "heimdall-fallback")
+
+
+def _fallback_gate_check(repo):
+    """Run heimdall-fallback check --repo <repo> and return its exit code, or None
+    when the gate binary is missing or the call itself raises. BOTH collapse to
+    "do not route" in the caller — never to a guess about what the exit code would
+    have been. This is the ONLY place this module reads the gate's verdict signal;
+    the exit code IS the verdict (the gate's own contract), never re-derived here."""
+    if not os.path.isfile(_FALLBACK_GATE_BIN):
+        return None
+    try:
+        proc = subprocess.run(
+            [_FALLBACK_GATE_BIN, "--repo", repo, "check"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        return None
+    return proc.returncode
+
+
+def _fallback_gate_status(repo):
+    """Fetch the gate's NON-SECRET routing config via heimdall-fallback status
+    --json — its own documented, secret-free read surface (operator_key_env is a
+    NAME, never a value). Never parses .heimdall/fallback.json directly: that would
+    re-implement the gate's own fail-closed config load. Returns None on any failure
+    (missing binary, non-zero exit, unparseable JSON, non-dict) — the caller treats
+    that exactly like a REFUSE, never as license to invent defaults."""
+    if not os.path.isfile(_FALLBACK_GATE_BIN):
+        return None
+    try:
+        proc = subprocess.run(
+            [_FALLBACK_GATE_BIN, "--repo", repo, "status", "--json"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+        )
+    except OSError:
+        return None
+    if proc.returncode != 0:
+        return None
+    return _parse_json(proc.stdout)
+
+
+def _omniroute_route_overlay(repo):
+    """THE routing decision. Consult the gate; branch ONLY on its exit code:
+
+      0 (ROUTE)  -> read the NON-SECRET config (status --json) + the operator's OWN key
+                    value (from the env var NAMED by operator_key_env) + the ANTHROPIC_MODEL
+                    already pinned in THIS process's env (the same one the gate's own
+                    preflight just verified carries a provider/ prefix) -> build the child
+                    env overlay and a secret-free announcement.
+      1 (REFUSE) -> (None, None): spawn exactly as today.
+      2 (WAIT)   -> (None, None): a preflight check is currently failing; never route blind.
+      anything else (missing/erroring gate binary, unexpected code) -> (None, None): fails
+      CLOSED, mirroring the gate's own "must fail closed" contract.
+
+    Never invents a model string from target_provider alone, never reads
+    .heimdall/fallback.json directly, never logs the key value — it is threaded straight
+    from os.environ into the returned overlay dict and nowhere else."""
+    rc = _fallback_gate_check(repo)
+    if rc != 0:
+        return None, None  # REFUSE, WAIT, or an unreadable/missing gate: no route.
+
+    conf = _fallback_gate_status(repo)
+    if not isinstance(conf, dict):
+        return None, None  # gate said ROUTE but its own config read failed: no route.
+
+    key_env = conf.get("operator_key_env") or ""
+    endpoint = conf.get("endpoint") or ""
+    key_value = os.environ.get(key_env) if key_env else None
+    # reused VERBATIM from this process's own env — the exact value the gate's
+    # anthropic_model_pinned preflight check just validated carries a provider/
+    # prefix. Never reconstructed from target_provider; the gate owns that check.
+    model = os.environ.get("ANTHROPIC_MODEL") or ""
+    if not (key_value and endpoint and model):
+        # the gate's own preflight already required all three non-empty for a ROUTE
+        # verdict; an empty read here means something changed between the two calls
+        # (or status/config disagree with check). Fail closed rather than route on a
+        # partial config, no matter how that gap opened.
+        return None, None
+
+    overlay = {
+        "ANTHROPIC_BASE_URL": endpoint,
+        "ANTHROPIC_AUTH_TOKEN": key_value,
+        "ANTHROPIC_MODEL": model,
+    }
+    provider = conf.get("target_provider") or "(unnamed provider)"
+    announcement = (
+        "hmd-fallback: Claude capacity exhausted -- ROUTING this fix attempt to "
+        "OmniRoute (provider=%s endpoint=%s model=%s). Operator-owned key only, never "
+        "a Claude/Anthropic credential -- see docs/analysis/2026-08-25-omniroute-*.md."
+        % (provider, endpoint, model)
+    )
+    return overlay, announcement
+
+
+_FALLBACK_METRIC_BIN = os.path.join(_bindir(), "heimdall-metric")
+
+
+def _record_fallback_metric(repo):
+    """Best-effort, NEVER --strict, NEVER affects the fix outcome — mirrors
+    _emit_telemetry's own never-raises contract. bin/heimdall-metric's task schema
+    is built for the internal haiku/sonnet/opus routing ladder, which a third-party
+    fallback provider is not on at all, so this deliberately uses the documented
+    honest carve-out: --model unknown (recorded as null — "no live model-tier
+    signal", never the literal string) and omits --outcome entirely (a routing
+    event has no pass/fail of its own to report). --type names the event; --source
+    names this emitter. A missing binary or any failure is swallowed — the metric
+    is a durable trace of a fallback route, never a gate on one."""
+    if not os.path.isfile(_FALLBACK_METRIC_BIN):
+        return
+    try:
+        subprocess.run(
+            [_FALLBACK_METRIC_BIN, "--repo", repo, "task",
+             "--type", "omniroute-fallback", "--model", "unknown",
+             "--source", "issue-loop"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5,
+        )
+    except Exception:  # noqa: BLE001 — telemetry must never break the fix
+        return
+
+
+def _attach_fallback_note(result, overlay):
+    """Attach a small, NON-SECRET record of the routing decision to a fix result —
+    reversible + observable beyond the stderr announcement and the metric line.
+    Only attached when a route actually fired: the no-route path stays BYTE-
+    IDENTICAL to the pre-fallback result shape, matching 'otherwise leave the spawn
+    exactly as it is today.' Never carries ANTHROPIC_AUTH_TOKEN — endpoint + model
+    only, both already non-secret by the gate's own design."""
+    if overlay is not None:
+        result["fallback"] = {
+            "routed": True,
+            "endpoint": overlay.get("ANTHROPIC_BASE_URL"),
+            "model": overlay.get("ANTHROPIC_MODEL"),
+        }
+    return result
+
+
 def _run_claude_fix(issue, orient_result, repo):
     """Invoke the headless coder (claude -p) INSIDE `repo` so real edits land, and
     return an instrumentation dict recording the outcome (never the verdict — the SI-2
@@ -486,6 +658,14 @@ def _run_claude_fix(issue, orient_result, repo):
     as a completed fix attempt — see _CLAUDE_RETRY_WRAPPER above and the wrapper's own
     header for the full, already-tested discrimination. This function never reimplements
     that logic; it only routes to it and reads its exit code.
+
+    Before spawning, this function ALSO consults a second, independent gate —
+    bin/heimdall-fallback check — to decide whether THIS spawn should be pointed at
+    OmniRoute instead of Anthropic-direct (genuine capacity exhaustion, operator opt-in
+    only; see _omniroute_route_overlay above). That decision is orthogonal to the
+    overload-retry wrapper: it fires once, before argv/env are built, and never reacts
+    to a 529 — exhaustion and overload stay two different conditions with two different
+    mechanisms, never conflated.
 
     Returns one of:
       {invoked:False, enabled:False, reason:'claude-fix-disabled'}          (suite default)
@@ -498,7 +678,14 @@ def _run_claude_fix(issue, orient_result, repo):
                               overload and gave up: exit == HMD_OVERLOAD_EXIT, default 75.
                               Distinct from the ran-case above on purpose — NEVER the
                               fix's real output; the caller must mark the task FAILED,
-                              same as timed_out.)"""
+                              same as timed_out.)
+
+    Every shape above the disabled/not-found pair MAY additionally carry:
+      fallback: {routed:True, endpoint:str, model:str}   (bin/heimdall-fallback said
+                ROUTE for this attempt.) ABSENT entirely on the (far more common)
+                no-route path — that path's shape is BYTE-IDENTICAL to before this
+                wiring existed. Never carries the operator's key value; endpoint/model
+                are already non-secret by the gate's own design."""
     if not _claude_fix_enabled():
         return {"invoked": False, "enabled": False, "reason": "claude-fix-disabled"}
     # resolve the intended claude binary BEFORE routing through the wrapper: this
@@ -523,6 +710,20 @@ def _run_claude_fix(issue, orient_result, repo):
     ]
     env = _fix_child_env()  # credential-scrubbed baseline — unchanged.
     env["HMD_CLAUDE_BIN"] = resolved_bin  # the wrapper's seam: which claude it runs.
+
+    # ── exhaustion fallback: the gate decides, never this function ───────────────
+    fallback_overlay, fallback_announce = _omniroute_route_overlay(repo)
+    if fallback_overlay is not None:
+        # never hand a live Claude/Anthropic credential to a third-party endpoint —
+        # credential ABSENCE is the load-bearing control this whole feature rests on
+        # (docs/analysis/2026-08-25-omniroute-credential-isolation.md), so the ONE
+        # claude auth var _fix_child_env selected is dropped before the OmniRoute
+        # vars go in, never layered alongside them.
+        for auth_key in _FIX_AUTH_ENV_ORDER:
+            env.pop(auth_key, None)
+        env.update(fallback_overlay)
+        sys.stderr.write(fallback_announce + "\n")  # loud, secret-free.
+        _record_fallback_metric(repo)  # best-effort, never --strict.
     # TIMEOUT-VS-RETRY-BUDGET (nested-timeout trap): the wrapper's own retry loop is NOT
     # bounded by this call's outer timeout below — it has its own attempts/backoff. At
     # the wrapper's BUILT-IN defaults (max=6, base=5s, cap=120s) its worst-case
@@ -538,6 +739,7 @@ def _run_claude_fix(issue, orient_result, repo):
         val = os.environ.get(key)
         if val is not None:
             env[key] = val
+    secrets = [fallback_overlay.get("ANTHROPIC_AUTH_TOKEN")] if fallback_overlay else None
     t0 = time.time()
     try:
         proc = subprocess.run(
@@ -546,19 +748,25 @@ def _run_claude_fix(issue, orient_result, repo):
             env=env,  # credential-scrubbed: NO team creds reach the fix child.
         )
     except FileNotFoundError:
-        return {"invoked": False, "enabled": True, "reason": "claude-not-found",
-                "bin": resolved_bin}
+        return _attach_fallback_note(
+            {"invoked": False, "enabled": True, "reason": "claude-not-found",
+             "bin": resolved_bin},
+            fallback_overlay)
     except OSError as exc:
-        return {"invoked": False, "enabled": True, "reason": "claude-exec-error",
-                "detail": _scrub_fix_output(str(exc))[:200]}
+        return _attach_fallback_note(
+            {"invoked": False, "enabled": True, "reason": "claude-exec-error",
+             "detail": _scrub_fix_output(str(exc), secrets)[:200]},
+            fallback_overlay)
     except subprocess.TimeoutExpired:
-        return {"invoked": True, "enabled": True, "timed_out": True,
-                "duration_ms": int((time.time() - t0) * 1000)}
+        return _attach_fallback_note(
+            {"invoked": True, "enabled": True, "timed_out": True,
+             "duration_ms": int((time.time() - t0) * 1000)},
+            fallback_overlay)
     dur = int((time.time() - t0) * 1000)
     combined = proc.stdout or ""
     if proc.stderr:
         combined += "\n[stderr] " + proc.stderr
-    tail = _scrub_fix_output(combined.strip())
+    tail = _scrub_fix_output(combined.strip(), secrets)
     if len(tail) > _FIX_TAIL_MAX:
         tail = "…" + tail[-_FIX_TAIL_MAX:]
     try:
@@ -568,15 +776,15 @@ def _run_claude_fix(issue, orient_result, repo):
     if proc.returncode == overload_exit:
         # the wrapper exhausted its own overload budget: a DISTINCT, unambiguous outcome
         # from a real non-zero exit — never the fix's output, caller marks task FAILED.
-        return {
+        return _attach_fallback_note({
             "invoked": True, "enabled": True, "overloaded": True,
             "exit": proc.returncode, "duration_ms": dur, "output_tail": tail,
-        }
-    return {
+        }, fallback_overlay)
+    return _attach_fallback_note({
         "invoked": True, "enabled": True, "exit": proc.returncode,
         "duration_ms": dur, "output_tail": tail,
         "files_changed": _changed_file_count(repo),
-    }
+    }, fallback_overlay)
 
 
 # ── attest + GATE: REUSE SI-2, read the verdict from the RECORDED REAL EXIT ────
