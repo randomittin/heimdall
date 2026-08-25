@@ -1,0 +1,196 @@
+#!/usr/bin/env bash
+# hmd-exec — single dispatcher for "run a headless coding task."
+#
+# THE GAP IT CLOSES. Every autonomous hmd path (decompose, session-fork, the maintainer
+# loop, the fallback-routed fix child, ...) independently shells out to `claude -p`. That
+# means "run a headless coding task" has N slightly-different call shapes instead of one,
+# and swapping the harness under any of them means editing N places. This introduces the
+# ONE seam: a caller asks hmd-exec to run a task; hmd-exec picks a backend and runs it.
+#
+# WAVE 1 (this file, today): ONE backend — `claude-code` — and it is BYTE-IDENTICAL to the
+# direct `hmd_claude_retry`/`claude -p` spawn it replaces. Nothing about behaviour changes;
+# only the seam exists now. See docs/analysis/2026-08-25-harness-independence-design.md
+# (Stage 0/1) for the staged path this sets up.
+#
+# WAVE 2 (NOT this file): a `--backend api` runner that talks to the Anthropic API directly,
+# with no Claude Code dependency. That backend is NOT implemented here — see "THE WAVE-2
+# SEAM" below for the documented contract it must satisfy. Selecting it today fails loudly
+# and explains why; it is a real, finished rejection path, not a stub pretending to work.
+#
+# USAGE:
+#   hmd-exec [--backend NAME] [--strict] run <claude-shaped argv...>
+#   hmd-exec [--backend NAME] backends
+#   hmd-exec -h | --help
+#
+#   Global flags come before the subcommand (matches bin/heimdall-pressure /
+#   bin/heimdall-metric / bin/heimdall-fallback). Everything after the `run` token is
+#   passed through to the backend byte-for-byte, UNEXAMINED by hmd-exec's own parser —
+#   so a prompt that happens to contain text shaped like an hmd-exec flag (e.g. a prompt
+#   discussing "--backend") is never misparsed: hmd-exec stops looking for its own flags
+#   the instant it consumes the `run` token.
+#
+# BACKEND SELECTION — explicit and observable (repo convention: never guess silently):
+#   * Explicit: `--backend NAME` / `--backend=NAME`, else $HMD_EXEC_BACKEND, else
+#     "claude-code". Precedence is flag > env > default, same order as MODEL/WORK_DIR
+#     resolution in bin/session-fork.
+#   * Observable: every dispatch announces `hmd-exec: backend=<name>` on STDERR (never
+#     stdout — callers do `output=$(hmd-exec ...)` and stdout must stay exactly the
+#     wrapped task's real output, nothing else). `hmd-exec backends` lists the full
+#     roster + implementation status + which one is currently selected, for humans/CI.
+#   * An UNKNOWN --backend value is ALWAYS a hard, loud failure (exit 2), unconditionally
+#     — this is a deliberate divergence from heimdall-pressure/metric/fallback's "argument
+#     errors are a soft 0 unless --strict" convention. Those three tools are side-channel
+#     telemetry/gates: their stdout is never the actual task's payload, so a silent no-op
+#     costs a missed log line at worst. hmd-exec's stdout ON SUCCESS *is* the task's real
+#     output — silently substituting a default backend (or worse, a silent no-op with
+#     exit 0 and empty stdout) is exactly the swallowed-failure class
+#     bin/lib/hmd-claude-retry.sh's own header exists to prevent. Correctness here always
+#     outranks convention parity.
+#
+# --strict: accepted for CLI-shape parity with the three tools above (global flag, opt-in,
+#   tests-only). Its ONE real effect: `run` with zero passthrough args (a caller bug — no
+#   task was actually given) is rejected under --strict, and tolerated (passed through
+#   anyway) by default, matching those tools' "never fail a caller over a usage edge case"
+#   default. It does NOT gate backend-name validation — see above for why that stays
+#   unconditional.
+#
+# THE WAVE-2 SEAM — a documented interface, not an unimplemented function. A future
+# `api` backend receiving the argv after `run` (shaped like
+# `-p <prompt> [--model <id>] [--output-format <fmt>] [--permission-mode <mode>]
+#  [--allowedTools <csv>]`) must, to be a drop-in replacement for `claude-code`:
+#   1. Treat `-p <prompt>` as the task; flags it has no equivalent for may be ignored,
+#      but `-p`'s argument must never be misinterpreted as anything but the task prompt.
+#   2. On success, write ONLY the task's final answer to stdout — no banners, no logs
+#      merged in (callers capture stdout verbatim as `output=$(hmd-exec ...)`).
+#   3. Exit 0 on success. On a transient/overload-shaped failure after exhausting its own
+#      retry budget, exit with $HMD_OVERLOAD_EXIT (default 75) so existing callers that
+#      branch on that sentinel keep working unmodified. Any OTHER non-zero exit is a real,
+#      fail-fast error — never silently retried, never masked.
+#   4. Retry/backoff strategy is the backend's own concern; hmd-exec imposes no HOW, only
+#      the exit-code/stdout shape above.
+# Implementing that backend is Wave 2 work — deliberately not started here.
+set -eo pipefail
+
+SELF="$0"
+if command -v readlink &>/dev/null; then
+  SELF="$(readlink -f "$0" 2>/dev/null || readlink "$0" 2>/dev/null || echo "$0")"
+fi
+PLUGIN_DIR="$(cd "$(dirname "$SELF")/.." && pwd)"
+
+_HMD_EXEC_BACKENDS="claude-code api"
+
+usage() {
+  cat <<'EOF'
+hmd-exec — single dispatcher for a headless coding task (Wave 1: seam only; the
+claude-code backend is byte-identical to today's direct `claude -p` spawns).
+
+Usage:
+  hmd-exec [--backend NAME] [--strict] run <claude-shaped argv...>
+  hmd-exec [--backend NAME] backends
+  hmd-exec -h | --help
+
+Global flags (before the subcommand):
+  --backend NAME   which backend runs the task: claude-code (default) | api
+                    (default also settable via $HMD_EXEC_BACKEND)
+  --strict         tests only; see the header comment for exactly what this gates
+
+Subcommands:
+  run <argv...>    dispatch a headless coding task to the selected backend.
+                    Everything after `run` is passed through byte-for-byte.
+  backends         list available backends, status, and which one is selected.
+
+Backends:
+  claude-code   (default, implemented) — shells to `claude -p` via the existing
+                529-discriminating retry wrapper (bin/lib/hmd-claude-retry.sh).
+                Reused verbatim, never reimplemented.
+  api           (documented wave-2 seam, NOT implemented) — see the header
+                comment in this file and
+                docs/analysis/2026-08-25-harness-independence-design.md (Stage 1).
+EOF
+}
+
+BACKEND="${HMD_EXEC_BACKEND:-claude-code}"
+STRICT=0
+SAW_SUBCOMMAND=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --backend) BACKEND="${2:?--backend needs a NAME}"; shift 2 ;;
+    --backend=*) BACKEND="${1#--backend=}"; shift ;;
+    --strict) STRICT=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    run)
+      SAW_SUBCOMMAND="run"
+      shift
+      break
+      ;;
+    backends)
+      SAW_SUBCOMMAND="backends"
+      shift
+      break
+      ;;
+    *)
+      echo "hmd-exec: unknown option or missing subcommand: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [ -z "$SAW_SUBCOMMAND" ]; then
+  echo "hmd-exec: missing subcommand (expected 'run' or 'backends')" >&2
+  usage >&2
+  exit 2
+fi
+
+if [ "$SAW_SUBCOMMAND" = "backends" ]; then
+  for b in $_HMD_EXEC_BACKENDS; do
+    if [ "$b" = "claude-code" ]; then
+      note="implemented, default"
+    else
+      note="documented seam, NOT implemented (wave 2)"
+    fi
+    [ "$b" = "$BACKEND" ] && note="$note [selected]"
+    printf '%s — %s\n' "$b" "$note"
+  done
+  exit 0
+fi
+
+# SAW_SUBCOMMAND = run. Everything left in "$@" is the backend's argv, untouched.
+if [ "$STRICT" -eq 1 ] && [ $# -eq 0 ]; then
+  echo "hmd-exec: --strict run given zero task args — no task to run" >&2
+  exit 2
+fi
+
+printf 'hmd-exec: backend=%s\n' "$BACKEND" >&2
+
+case "$BACKEND" in
+  claude-code)
+    # shellcheck source=lib/hmd-claude-retry.sh
+    . "$PLUGIN_DIR/bin/lib/hmd-claude-retry.sh"
+    # `|| rc=$?` (never a bare call) is load-bearing, not style: hmd_claude_retry's own
+    # retry loop does an UNPROTECTED `out="$(...)"; rc=$?` internally. Under this script's
+    # `set -e`, calling the function bare lets the first overloaded attempt's non-zero
+    # status trip errexit before the library's own retry logic ever runs — verified
+    # empirically that bin/decompose has exactly this latent bug today (bare call under
+    # its own `set -e`: the first 529 kills the script instead of retrying). Wrapping the
+    # call so its status is "tested" suspends errexit for the whole call, matching the
+    # protected style bin/session-fork already uses safely.
+    rc=0
+    hmd_claude_retry "$@" || rc=$?
+    exit "$rc"
+    ;;
+  api)
+    {
+      echo "hmd-exec: backend 'api' is a documented wave-2 seam, not yet implemented."
+      echo "  See the header comment in bin/hmd-exec and"
+      echo "  docs/analysis/2026-08-25-harness-independence-design.md (Stage 1)."
+      echo "  Use --backend claude-code (the default) for now."
+    } >&2
+    exit 2
+    ;;
+  *)
+    echo "hmd-exec: unknown backend '$BACKEND' (available: $_HMD_EXEC_BACKENDS)" >&2
+    exit 2
+    ;;
+esac

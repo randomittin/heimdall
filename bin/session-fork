@@ -16,11 +16,6 @@ MAX_PARALLEL="${HEIMDALL_MAX_PARALLEL:-${SUPERX_MAX_PARALLEL:-10}}"
 SM="$PLUGIN_DIR/bin/shared-memory"
 AP="$PLUGIN_DIR/bin/agent-pool"
 
-# overload self-heal: retry+backoff around every `claude -p` spawn, loud clean failure
-# on exhaustion (never `|| true` an overload into fake output). See lib/hmd-claude-retry.sh.
-# shellcheck source=lib/hmd-claude-retry.sh
-. "$PLUGIN_DIR/bin/lib/hmd-claude-retry.sh"
-
 usage() {
   cat <<'EOF'
 session-fork — Spawn parallel Claude sessions for independent sub-tasks
@@ -68,10 +63,12 @@ Task: $prompt"
   (
     cd "$WORK_DIR"
     local output rc=0 status_word
-    # Overload-resilient spawn: retries a transient 529/overload with backoff, fails fast
-    # on a real error, and returns a distinct non-zero exit on give-up. `|| rc=$?` captures
-    # the code without tripping `set -e` — the old `|| true` silently masked failures.
-    output=$(hmd_claude_retry -p "$full_prompt" --model "$MODEL" --output-format text) || rc=$?
+    # Overload-resilient spawn, routed through the hmd-exec dispatcher (Wave 1 seam — see
+    # docs/analysis/2026-08-25-harness-independence-design.md): still retries a transient
+    # 529/overload with backoff, fails fast on a real error, and returns a distinct
+    # non-zero exit on give-up. `|| rc=$?` captures the code without tripping `set -e` —
+    # the old `|| true` silently masked failures.
+    output=$("$PLUGIN_DIR/bin/hmd-exec" run -p "$full_prompt" --model "$MODEL" --output-format text) || rc=$?
     if [ "$rc" -eq 0 ]; then
       echo "$output" > "$RESULTS_DIR/outputs/${task_id}.txt"
       status_word="done"

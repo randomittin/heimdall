@@ -9,10 +9,6 @@ if command -v readlink &>/dev/null; then
 fi
 PLUGIN_DIR="$(cd "$(dirname "$SELF")/.." && pwd)"
 
-# overload self-heal: retry+backoff around the `claude -p` decomposition spawn.
-# shellcheck source=lib/hmd-claude-retry.sh
-. "$PLUGIN_DIR/bin/lib/hmd-claude-retry.sh"
-
 usage() {
   cat <<'EOF'
 decompose — Break tasks into dependency-ordered parallel sub-tasks
@@ -75,6 +71,16 @@ ${CONTEXT:+\nCONTEXT:\n$CONTEXT}
 
 $FORMAT_INSTRUCTION"
 
-# Call Claude for decomposition (overload-resilient: retries transient 529/overload with
-# backoff, fails loudly on give-up instead of the old `2>/dev/null` silent-empty output).
-hmd_claude_retry -p "$PROMPT" --model "$("$PLUGIN_DIR/bin/heimdall-model-resolve" sonnet)"
+# Call Claude for decomposition via the hmd-exec dispatcher — the single seam every
+# headless-task caller now shares (Wave 1: docs/analysis/2026-08-25-harness-independence-
+# design.md). Still overload-resilient underneath (hmd-exec's claude-code backend retries
+# transient 529/overload with backoff and fails loudly on give-up, never the old
+# `2>/dev/null` silent-empty output) — but now as a separate PROCESS, not a sourced
+# function: that boundary is what fixes a latent bug this migration exposed. The old
+# direct, in-process `hmd_claude_retry` call ran bare under this script's own `set -e`,
+# so the retry library's internal unprotected `out="$(...)"; rc=$?` never even got a
+# chance to run — the first overloaded attempt tripped errexit and killed decompose
+# outright instead of retrying. Dispatching through hmd-exec sidesteps that entirely:
+# the retry loop now runs inside hmd-exec's own process, behind its own protected
+# `|| rc=$?` call, and only the final exit code crosses back into decompose.
+"$PLUGIN_DIR/bin/hmd-exec" run -p "$PROMPT" --model "$("$PLUGIN_DIR/bin/heimdall-model-resolve" sonnet)"
