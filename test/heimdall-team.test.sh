@@ -3,12 +3,37 @@
 # (bin/heimdall-team), the CLIENT side of multi-tenant team presence.
 #
 # Proves, against the REAL CLI with a temp HEIMDALL_TEAM_DIR (no git needed) and
-# NO network:
+# NO network. Both are pinned by test seams, not by luck: `detect_visibility` is
+# forced via HEIMDALL_FORCE_VISIBILITY (the same seam test/heimdall-team-default.
+# test.sh and test/heimdall-telemetry.test.sh use) so `new`'s outcome never
+# depends on the ambient repo's real GitHub visibility, `gh` auth, or the
+# ~/.heimdall/vis-cache/ TTL cache of whatever repo happens to be checked out at
+# CWD; and `new`'s heimdall-invite subprocess has its `git ls-remote` + raw-URL
+# HTTP probe replaced by the same network-free seams test/invite.test.sh:52-58
+# uses (HEIMDALL_INVITE_PUBLISHED_TAGS / _BRANCHES / _ASSUME_HTTP). Without both,
+# this suite silently inherits whatever the operator's machine/network state
+# happens to be — see the incident this header now documents in git blame.
+#
+# A THIRD, unrelated dependency bit this suite the same day the two above were
+# fixed: heimdall-invite refuses to print the live team secret when ITS stdout
+# is not a terminal (`[ -t 1 ]` — a security fix; see bin/heimdall-invite's NON-
+# TTY REFUSAL). cmd_new (bin/heimdall-team) forwards ITS OWN `[ -t 1 ]` decision
+# to invite as the literal --yes-print-secret flag (same idiom as cmd_auto's
+# HMD_TEAM_AUTO_LOUD loud-mode check, bin/heimdall-team ~line 761). Because THIS
+# harness captures `new`'s stdout via command substitution, every call below is
+# non-tty by default — exactly the safe case (b3) proves. (b2)'s happy path
+# instead simulates a human via HEIMDALL_TEAM_ASSUME_TTY, heimdall-team's own
+# test-only stand-in for `[ -t 1 ]` (NOT invite's --yes-print-secret, which
+# stays a deliberate flag only and is never itself settable via env).
 #
 #   (a) SYNTAX        — `bash -n` parses clean.
 #   (b) NEW           — `new` writes a 0600 team.json carrying a 43-char base64url
-#                       secret + prints the heimdall-invite join one-liner
-#                       (HEIMDALL_TEAM_SECRET) + a secret caveat. Exit 0.
+#                       secret; AT A TERMINAL (simulated: HEIMDALL_TEAM_ASSUME_TTY)
+#                       it also prints the heimdall-invite join one-liner
+#                       (HEIMDALL_TEAM_SECRET) + a secret caveat. WITHOUT a
+#                       terminal (this harness's own default) the live secret is
+#                       NEVER printed — heimdall-invite's non-tty refusal, held.
+#                       Exit 0 either way; only the PRINT is gated, never the mint.
 #   (c) NO-CLOBBER    — a 2nd `new` REFUSES to overwrite an existing team without
 #                       --force (exit 2, secret unchanged); `--force` re-mints.
 #   (d) SHOW          — `show` (+ --json) prints the NON-SECRET team_id that
@@ -36,6 +61,30 @@ CLI="$ROOT/bin/heimdall-team"
 PY="$(command -v python3 || command -v python || true)"
 [ -n "$PY" ] || { echo "FATAL: python not found" >&2; exit 2; }
 [ -x "$CLI" ] || { echo "FATAL: $CLI missing/!exec" >&2; exit 2; }
+
+# Hermeticity seams — MUST be set before any `$CLI new` call. Without
+# HEIMDALL_FORCE_VISIBILITY, `detect_visibility` (bin/heimdall-team) walks up
+# from CWD to find a git repo and may consult `gh api` / a live curl probe /
+# ~/.heimdall/vis-cache/<slug> — all real, ambient, cross-session state that has
+# nothing to do with this suite. A repo the operator happens to be sitting in
+# that resolves "private" flips `new` onto the commit-branch instead of the
+# invite-one-liner branch it's meant to exercise here (and that branch's own
+# `git add -f` silently no-ops on this suite's out-of-repo team.json, so nothing
+# is even committed) — reproduced deterministically via
+# `HEIMDALL_FORCE_VISIBILITY=private bash test/heimdall-team.test.sh`. "public"
+# is the value that exercises the invite one-liner (b) documents; same seam as
+# test/heimdall-team-default.test.sh:106 and test/heimdall-telemetry.test.sh:281.
+# Without HEIMDALL_INVITE_PUBLISHED_TAGS/_BRANCHES/_ASSUME_HTTP, `new`'s
+# heimdall-invite subprocess does a real `git ls-remote` against origin plus a
+# real HTTPS probe of raw.githubusercontent.com for the resolved ref — a
+# transient miss (a just-cut release tag not yet propagated to the raw-content
+# CDN, a proxy, a network blip) makes heimdall-invite refuse (exit 3, nothing on
+# stdout), which reads identically to a broken join line. Same seams as
+# test/invite.test.sh:52-58.
+export HEIMDALL_FORCE_VISIBILITY="public"
+export HEIMDALL_INVITE_PUBLISHED_TAGS="v0.0.1"
+export HEIMDALL_INVITE_PUBLISHED_BRANCHES="main"
+export HEIMDALL_INVITE_ASSUME_HTTP="200"
 
 PASS=0
 FAIL=0
@@ -80,9 +129,13 @@ else
   bad "(a) bash -n found a syntax error in heimdall-team"
 fi
 
-# ── (b) NEW mints a 0600 team.json + prints the join ─────────────────────────
+# ── (b) NEW mints a 0600 team.json + prints the join AT A TERMINAL ───────────
+# HEIMDALL_TEAM_ASSUME_TTY=1 simulates "a human is watching" for THIS call only
+# (a per-command env prefix, scoped exactly like HEIMDALL_TEAM_DIR below — never
+# exported suite-wide, or every other call in this file would stop exercising
+# the non-tty refusal (b3) below exists to prove).
 TD1="$WORK/repo1/.heimdall"
-NEW_OUT="$(HEIMDALL_TEAM_DIR="$TD1" "$CLI" new 2>"$WORK/new1.err"; echo "RC=$?")"
+NEW_OUT="$(HEIMDALL_TEAM_ASSUME_TTY=1 HEIMDALL_TEAM_DIR="$TD1" "$CLI" new 2>"$WORK/new1.err"; echo "RC=$?")"
 RC="${NEW_OUT##*RC=}"; BODY="${NEW_OUT%RC=*}"
 TJ1="$TD1/team.json"
 S1="$(secret_of "$TJ1")"
@@ -94,10 +147,32 @@ fi
 if grep -q "HEIMDALL_TEAM_SECRET=" <<<"$BODY" \
    && grep -qF "curl -fsSL --proto '=https' https://raw.githubusercontent.com/" <<<"$BODY" \
    && grep -qi "team secret" <<<"$BODY"; then
-  ok "(b2) new printed the heimdall-invite join one-liner (HEIMDALL_TEAM_SECRET) + a secret caveat"
+  ok "(b2) new (at a terminal) printed the heimdall-invite join one-liner (HEIMDALL_TEAM_SECRET) + a secret caveat"
 else
   bad "(b2) new did not print the join one-liner + caveat:
 $BODY"
+fi
+
+# ── (b3) SECURITY — the SAME new, but with NO tty (this harness's own default,
+# since it captures stdout via command substitution — no seam needed to prove
+# it): the live secret must NEVER be printed. Asserted explicitly, with the
+# real minted secret checked for literal absence, so a future change to
+# cmd_new's forwarding logic cannot silently reintroduce the leak heimdall-
+# invite's non-tty refusal exists to prevent. The failure branch deliberately
+# never echoes the secret itself (booleans only), same discipline as (d2) above.
+TD1_NOTTY="$WORK/repo1-notty/.heimdall"
+NEW_NOTTY="$(HEIMDALL_TEAM_DIR="$TD1_NOTTY" "$CLI" new 2>"$WORK/new1-notty.err"; echo "RC=$?")"
+RC1N="${NEW_NOTTY##*RC=}"; BODY1N="${NEW_NOTTY%RC=*}"
+TJ1N="$TD1_NOTTY/team.json"
+S1N="$(secret_of "$TJ1N")"
+ERR1N="$(cat "$WORK/new1-notty.err" 2>/dev/null || true)"
+if [ "$RC1N" -eq 0 ] && [ "${#S1N}" -eq 43 ] \
+   && ! grep -qF -- "$S1N" <<<"$BODY1N" \
+   && ! grep -q "HEIMDALL_TEAM_SECRET=" <<<"$BODY1N" \
+   && grep -qi "REFUSING to print your live team secret" <<<"$ERR1N"; then
+  ok "(b3) new WITHOUT a tty never printed the live secret (heimdall-invite refused)"
+else
+  bad "(b3) SECURITY: new without a tty must never print the secret (rc=$RC1N, secret-in-stdout=$(grep -qF -- "$S1N" <<<"$BODY1N" && echo YES-LEAKED || echo no), refusal-seen=$(grep -qi "REFUSING to print your live team secret" <<<"$ERR1N" && echo yes || echo no))"
 fi
 
 # ── (c) NO-CLOBBER without --force; --force re-mints ─────────────────────────
@@ -126,7 +201,7 @@ if [ -n "$EXPECT_TID" ] && [ "$JSON_TID" = "$EXPECT_TID" ] && grep -qF "$EXPECT_
 else
   bad "(d1) show team_id mismatch (expect=$EXPECT_TID json=$JSON_TID txt=$SHOW_TXT)"
 fi
-if ! grep -qF "$S1c" <<<"$SHOW_TXT$SHOW_JSON"; then
+if ! grep -qF -- "$S1c" <<<"$SHOW_TXT$SHOW_JSON"; then
   ok "(d2) show NEVER prints the secret (text + --json)"
 else
   bad "(d2) show LEAKED the secret"

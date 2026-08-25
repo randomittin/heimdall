@@ -80,13 +80,18 @@
 # private repo — committed (tracked; the private-repo access boundary is the
 # control, not the file mode). The secret NEVER crosses the argv of a child
 # process (argv shows in `ps`) — it travels bash->python via the ENVIRONMENT only
-# — and is never logged. `new` prints it once (the owner must see it to share);
-# `show` never prints it; `join` takes it as this CLI's own argv (the documented
-# entry point) but re-exposes it to nothing.
+# — and is never logged. `new` prints it once, but ONLY to a human at a terminal
+# (forwarded from heimdall-invite's own non-tty refusal — see cmd_new below;
+# NEVER to a non-interactive caller); `show` never prints it; `join` takes it as
+# this CLI's own argv (the documented entry point) but re-exposes it to nothing.
 #
 # Store: <git toplevel of $PWD>/.heimdall/team.json. HEIMDALL_TEAM_DIR overrides
 # the dir wholesale (tests + non-git trees). HEIMDALL_FORCE_VISIBILITY overrides
 # visibility detection (private|public|indeterminate) — TEST-ONLY, undocumented.
+# HEIMDALL_TEAM_ASSUME_TTY stands in for cmd_new's own `[ -t 1 ]` when deciding
+# whether to authorize heimdall-invite to print the secret it just minted —
+# TEST-ONLY, undocumented; changes only whether that PRINT is allowed, never
+# what gets written to team.json.
 #
 # Exit: 0 ok; 2 usage / refuse-clobber / weak-secret / IO error; non-zero on a
 # commit PRIVACY REFUSAL (public repo or privacy unverifiable).
@@ -957,7 +962,24 @@ EOF
     printf '\xe2\x9a\xa0 the line below contains your TEAM SECRET — share only with teammates\n'
     printf '  (public repo: distribute out-of-band; never commit a bearer secret)\n\n'
     if [ -x "$INVITE_CLI" ]; then
-      "$INVITE_CLI" || true
+      # FORWARD our own tty decision — do not blanket-authorize. heimdall-invite
+      # refuses to print the live secret when ITS stdout is not a terminal
+      # (`[ -t 1 ]`; --yes-print-secret is the only override — see bin/heimdall-
+      # invite's NON-TTY REFUSAL). Direct-execed with no pipe, invite's stdout
+      # already inherits ours, so passing the flag here is a no-op for a real
+      # human (same `[ -t 1 ]` result either way, identical output) — it only
+      # matters so the decision is explicit and testable rather than an accident
+      # of "we never pipe this call": HEIMDALL_TEAM_ASSUME_TTY is the test-only
+      # stand-in for "a human is watching", same `[ -t 1 ]`-or-env-seam idiom as
+      # cmd_auto's loud-mode check above (HMD_TEAM_AUTO_LOUD). The override we
+      # hand invite is ALWAYS the literal --yes-print-secret flag, never an env
+      # var — invite's own anti-leak contract requires a deliberate flag, and
+      # this preserves it.
+      if { [ -t 1 ] || [ -n "${HEIMDALL_TEAM_ASSUME_TTY:-}" ]; }; then
+        "$INVITE_CLI" --yes-print-secret || true
+      else
+        "$INVITE_CLI" || true
+      fi
     fi
   fi
   return 0
