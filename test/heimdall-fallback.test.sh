@@ -45,15 +45,24 @@ write_cfg() {
   printf '%s' "$2" > "$(cfg_path "$1")"
 }
 # make_omniroute_db <db_file> [provider] [mode]
-# Creates OmniRoute's provider_connections table (provider, mode columns) in a
-# fresh/existing sqlite file -- CREATE TABLE IF NOT EXISTS so repeated calls
-# against the same file can layer multiple rows. Schema shape sourced from
-# docs/analysis/2026-08-25-omniroute-credential-isolation.md S3 (the "SELECT
-# provider, COUNT(*) ... GROUP BY provider" query) plus S1a/residual-risk-2's
-# "mode: cliproxyapi" vocabulary for the mode column -- the audit did not
-# quote a full CREATE TABLE, so `mode` here is this suite's own
-# best-documented-signal fixture, matching exactly what bin/heimdall-fallback
-# itself queries.
+# Creates the two OmniRoute tables this tool queries in a fresh/existing
+# sqlite file -- CREATE TABLE IF NOT EXISTS so repeated calls against the
+# same file can layer multiple rows.
+#   provider_connections (id, provider, mode): shape sourced from
+#     docs/analysis/2026-08-25-omniroute-credential-isolation.md S3 (the
+#     "SELECT provider, COUNT(*) ... GROUP BY provider" query). Its own
+#     `mode` column here is this suite's pre-existing fixture convenience,
+#     NOT queried by bin/heimdall-fallback for anything (see below).
+#   upstream_proxy_config (id, provider_id, mode, fallback_backend): the
+#     REAL delegated-sidecar table, columns READ via PRAGMA table_info
+#     against a live OmniRoute 3.8.51 (d82b682) install, not inferred.
+#     Always created empty here (0 rows), matching that live install's own
+#     state; a test that needs a delegating row calls add_proxy_config_row
+#     (below) afterward. provider_connections has NO 'mode' column on a real
+#     install (confirmed: 46 real columns, zero named 'mode') -- an earlier
+#     version of bin/heimdall-fallback's no_delegated_sidecar check queried
+#     it there by mistake and always passed vacuously; fixed to query
+#     upstream_proxy_config instead (see SIDECAR_DELEGATING_MODES).
 make_omniroute_db() {
   local db="$1" provider="${2:-}" mode="${3:-}"
   python3 -c "
@@ -61,11 +70,33 @@ import sqlite3, sys
 db, provider, mode = sys.argv[1], sys.argv[2], sys.argv[3]
 conn = sqlite3.connect(db)
 conn.execute('CREATE TABLE IF NOT EXISTS provider_connections (id INTEGER PRIMARY KEY, provider TEXT, mode TEXT)')
+conn.execute(\"CREATE TABLE IF NOT EXISTS upstream_proxy_config (id INTEGER PRIMARY KEY, provider_id TEXT, mode TEXT NOT NULL DEFAULT 'native', fallback_backend TEXT NOT NULL DEFAULT 'cliproxyapi')\")
 if provider:
     conn.execute('INSERT INTO provider_connections (provider, mode) VALUES (?, ?)', (provider, mode or None))
 conn.commit()
 conn.close()
 " "$db" "$provider" "$mode"
+}
+
+# add_proxy_config_row <db_file> <provider_id> <mode> [fallback_backend]
+# Inserts one upstream_proxy_config row -- for the delegated-sidecar-in-DB
+# falsifiers. `mode` vocabulary ('native'|'cliproxyapi'|'dario'|'fallback')
+# and the fallback_backend column are sourced verbatim from the live
+# install's own src/lib/db/migrations/138_dario_fallback_backend.sql: "mode
+# is a free TEXT column already ('native' | 'cliproxyapi' | 'dario' |
+# 'fallback')"; fallback_backend selects which embedded proxy (cliproxyapi or
+# dario, default 'cliproxyapi') handles the retry leg when mode='fallback'.
+add_proxy_config_row() {
+  local db="$1" provider_id="$2" mode="$3" backend="${4:-cliproxyapi}"
+  python3 -c "
+import sqlite3, sys
+db, provider_id, mode, backend = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+conn = sqlite3.connect(db)
+conn.execute(\"CREATE TABLE IF NOT EXISTS upstream_proxy_config (id INTEGER PRIMARY KEY, provider_id TEXT, mode TEXT NOT NULL DEFAULT 'native', fallback_backend TEXT NOT NULL DEFAULT 'cliproxyapi')\")
+conn.execute('INSERT INTO upstream_proxy_config (provider_id, mode, fallback_backend) VALUES (?, ?, ?)', (provider_id, mode, backend))
+conn.commit()
+conn.close()
+" "$db" "$provider_id" "$mode" "$backend"
 }
 
 # Hermetic default for the whole suite: nothing here is actually listening on
@@ -95,7 +126,16 @@ make_omniroute_db "$TIER1_CLAUDE_DB" claude
 TIER1_CLAUDEWEB_DB="$(mktemp "${TMPDIR:-/tmp}/hmd-fallback-test-t1web.XXXXXX")"
 make_omniroute_db "$TIER1_CLAUDEWEB_DB" claude-web
 SIDECAR_MODE_DB="$(mktemp "${TMPDIR:-/tmp}/hmd-fallback-test-sidecar.XXXXXX")"
-make_omniroute_db "$SIDECAR_MODE_DB" local-sidecar cliproxyapi
+make_omniroute_db "$SIDECAR_MODE_DB"
+add_proxy_config_row "$SIDECAR_MODE_DB" local-sidecar cliproxyapi
+NO_PROXY_CONFIG_TABLE_DB="$(mktemp "${TMPDIR:-/tmp}/hmd-fallback-test-noproxytable.XXXXXX")"
+python3 -c "
+import sqlite3
+conn = sqlite3.connect('$NO_PROXY_CONFIG_TABLE_DB')
+conn.execute('CREATE TABLE provider_connections (id INTEGER PRIMARY KEY, provider TEXT, mode TEXT)')
+conn.commit()
+conn.close()
+"
 MALFORMED_DB="$(mktemp "${TMPDIR:-/tmp}/hmd-fallback-test-malformed.XXXXXX")"
 printf 'not a sqlite database, just text' > "$MALFORMED_DB"
 
@@ -456,6 +496,367 @@ out="$(fb --repo "$R" check)"
 echo "$out" | grep -q "OK.*no_delegated_sidecar" \
   && ok "19c. no sidecar dir, clean DB -> no_delegated_sidecar PASSES" \
   || bad "19c. got: $out"
+
+# ── 20. NEW: state=on is a CAPABILITY-TIER decision -- haiku-tier task ROUTES ─
+R="$(fresh_repo)"
+export HMD_FB_TEST_KEY="x"
+export ANTHROPIC_MODEL="anthropic/claude-3-5-sonnet-20241022"
+write_cfg "$R" '{
+  "state": "on",
+  "operator_key_env": "HMD_FB_TEST_KEY",
+  "endpoint": "http://127.0.0.1:20128",
+  "omniroute_db_path": "'"$CLEAN_DB"'",
+  "target_provider": "self-hosted-mixtral"
+}'
+export HEIMDALL_FALLBACK_ASSUME_REACHABLE=1
+out="$(fb --repo "$R" check --tier haiku)"; rc=$?
+export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
+unset ANTHROPIC_MODEL
+[ "$rc" -eq 0 ] && echo "$out" | grep -q "VERDICT: ROUTE" \
+  && ok "20. falsifier (a): state=on + --tier haiku + passing preflight -> ROUTE" \
+  || bad "20. rc=$rc out='$out'"
+unset HMD_FB_TEST_KEY
+
+# ── 21. NEW: state=on + sonnet-tier or adjudication task -> does NOT route ───
+for T in sonnet opus reviewer verifier security-auditor; do
+  R="$(fresh_repo)"
+  export HMD_FB_TEST_KEY="x"
+  export ANTHROPIC_MODEL="anthropic/claude-3-5-sonnet-20241022"
+  write_cfg "$R" '{
+    "state": "on",
+    "operator_key_env": "HMD_FB_TEST_KEY",
+    "endpoint": "http://127.0.0.1:20128",
+    "omniroute_db_path": "'"$CLEAN_DB"'",
+    "target_provider": "self-hosted-mixtral"
+  }'
+  export HEIMDALL_FALLBACK_ASSUME_REACHABLE=1
+  out="$(fb --repo "$R" check --tier "$T")"; rc=$?
+  export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
+  unset ANTHROPIC_MODEL
+  [ "$rc" -eq 1 ] && echo "$out" | grep -q "VERDICT: REFUSE" && echo "$out" | grep -q "FAIL.*tier_eligible" \
+    && ok "21. falsifier (b): state=on + --tier $T + passing preflight -> REFUSE (not low-level)" \
+    || bad "21. tier=$T rc=$rc out='$out'"
+  unset HMD_FB_TEST_KEY
+done
+
+# ── 22. NEW: state=switch routes EVERYTHING, tier-blind, only if preflight passes ─
+for T in "" haiku sonnet opus reviewer; do
+  R="$(fresh_repo)"
+  export HMD_FB_TEST_KEY="x"
+  export ANTHROPIC_MODEL="anthropic/claude-3-5-sonnet-20241022"
+  write_cfg "$R" '{
+    "state": "switch",
+    "operator_key_env": "HMD_FB_TEST_KEY",
+    "endpoint": "http://127.0.0.1:20128",
+    "omniroute_db_path": "'"$CLEAN_DB"'",
+    "target_provider": "self-hosted-mixtral"
+  }'
+  export HEIMDALL_FALLBACK_ASSUME_REACHABLE=1
+  if [ -n "$T" ]; then
+    out="$(fb --repo "$R" check --tier "$T")"; rc=$?
+  else
+    out="$(fb --repo "$R" check)"; rc=$?
+  fi
+  export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
+  unset ANTHROPIC_MODEL
+  [ "$rc" -eq 0 ] && echo "$out" | grep -q "VERDICT: ROUTE" \
+    && ok "22. falsifier (c): state=switch + tier='$T' + passing preflight -> ROUTE (tier-blind)" \
+    || bad "22. tier='$T' rc=$rc out='$out'"
+  unset HMD_FB_TEST_KEY
+done
+
+# ── 23. NEW: state=switch NEVER bypasses safety -- failing Tier-1 -> REFUSE ──
+R="$(fresh_repo)"
+export HMD_FB_TEST_KEY="x"
+export ANTHROPIC_MODEL="anthropic/claude-3-5-sonnet-20241022"
+write_cfg "$R" '{
+  "state": "switch",
+  "operator_key_env": "HMD_FB_TEST_KEY",
+  "endpoint": "http://127.0.0.1:20128",
+  "omniroute_db_path": "'"$TIER1_CLAUDE_DB"'",
+  "target_provider": "self-hosted-mixtral"
+}'
+export HEIMDALL_FALLBACK_ASSUME_REACHABLE=1
+out="$(fb --repo "$R" check)"; rc=$?
+out_tier="$(fb --repo "$R" check --tier haiku)"; rc_tier=$?
+export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
+unset ANTHROPIC_MODEL
+[ "$rc" -eq 1 ] && echo "$out" | grep -q "VERDICT: REFUSE" && echo "$out" | grep -q "FAIL.*tier1_credential_absent" \
+  && [ "$rc_tier" -eq 1 ] && echo "$out_tier" | grep -q "VERDICT: REFUSE" \
+  && ok "23. falsifier (d): state=switch + failing Tier-1 check -> still REFUSE (no state bypasses safety)" \
+  || bad "23. rc=$rc rc_tier=$rc_tier out='$out'"
+unset HMD_FB_TEST_KEY
+
+# ── 24. NEW: falsifier (e): a corrupt or near-miss state string still reads off ─
+R="$(fresh_repo)"
+write_cfg "$R" '{"state": "Switch"}'
+out="$(fb --repo "$R" status)"
+echo "$out" | grep -Eq 'state:[[:space:]]+off' \
+  && ok "24a. falsifier (e): wrong-case 'Switch' -> reads off, never switch" \
+  || bad "24a. got: $out"
+
+R="$(fresh_repo)"
+write_cfg "$R" '{"state": "switching"}'
+out="$(fb --repo "$R" status)"
+echo "$out" | grep -Eq 'state:[[:space:]]+off' \
+  && ok "24b. falsifier (e): near-miss 'switching' -> reads off, never switch" \
+  || bad "24b. got: $out"
+
+R="$(fresh_repo)"
+write_cfg "$R" '{"state": "switch", "mitm_enabled": true}'
+out="$(fb --repo "$R" status)"
+fb --repo "$R" check >/dev/null 2>&1; rc=$?
+echo "$out" | grep -Eq 'state:[[:space:]]+off' && echo "$out" | grep -qi "forbidden" && [ "$rc" -ne 0 ] \
+  && ok "24c. falsifier (e): state=switch + forbidden MITM key -> forced to off, check never ROUTEs" \
+  || bad "24c. got: $out (check rc=$rc)"
+
+# ── 25. NEW: backward compat -- bare `check` (no --tier) under on stays tier-blind ─
+R="$(fresh_repo)"
+export HMD_FB_TEST_KEY="x"
+export ANTHROPIC_MODEL="anthropic/claude-3-5-sonnet-20241022"
+write_cfg "$R" '{
+  "state": "on",
+  "operator_key_env": "HMD_FB_TEST_KEY",
+  "endpoint": "http://127.0.0.1:20128",
+  "omniroute_db_path": "'"$CLEAN_DB"'",
+  "target_provider": "self-hosted-mixtral"
+}'
+export HEIMDALL_FALLBACK_ASSUME_REACHABLE=1
+out="$(fb --repo "$R" check)"; rc=$?
+export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
+unset ANTHROPIC_MODEL
+[ "$rc" -eq 0 ] && echo "$out" | grep -q "VERDICT: ROUTE" \
+  && ok "25. backward compat: bare check (no --tier) under on + passing preflight -> ROUTE, exactly like before this change (bin/lib/issue_loop.py's own call shape)" \
+  || bad "25. rc=$rc out='$out'"
+unset HMD_FB_TEST_KEY
+
+# ── 26. NEW: set switch persists across invocations ─────────────────────────
+R="$(fresh_repo)"
+fb --repo "$R" set switch >/dev/null
+out="$(fb --repo "$R" status)"
+echo "$out" | grep -Eq 'state:[[:space:]]+switch' \
+  && ok "26. set switch persists to disk and is read back by a fresh invocation" \
+  || bad "26. got: $out"
+
+# ── 27. NEW: switch is UNMISTAKABLE in both status renderings and in check ───
+R="$(fresh_repo)"
+write_cfg "$R" '{"state": "switch"}'
+out_text="$(fb --repo "$R" status)"
+out_json="$(fb --repo "$R" status --json)"
+echo "$out_text" | grep -q "SWITCH" \
+  && printf '%s' "$out_json" | python3 -c "import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get('full_switch') is True else 1)" \
+  && ok "27a. status text loudly flags switch (contains 'SWITCH'); status --json carries full_switch:true" \
+  || bad "27a. text='$out_text' json='$out_json'"
+
+R2="$(fresh_repo)"
+write_cfg "$R2" '{"state": "on"}'
+out_text2="$(fb --repo "$R2" status)"
+out_json2="$(fb --repo "$R2" status --json)"
+! echo "$out_text2" | grep -q "SWITCH" \
+  && printf '%s' "$out_json2" | python3 -c "import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get('full_switch') is False else 1)" \
+  && ok "27b. state=on -> no SWITCH banner in text, full_switch:false in json (no false alarm)" \
+  || bad "27b. text='$out_text2' json='$out_json2'"
+
+R3="$(fresh_repo)"
+write_cfg "$R3" '{"state": "switch"}'
+out_check="$(fb --repo "$R3" check 2>&1)"
+echo "$out_check" | grep -q "SWITCH" \
+  && ok "27c. check's own VERDICT line also loudly flags switch" \
+  || bad "27c. got: $out_check"
+
+# ── 28. NEW: an invalid --tier value is rejected the same way set nonsense is ─
+R="$(fresh_repo)"
+out="$(fb --repo "$R" check --tier nonsense-tier 2>&1)"; rc=$?
+[ "$rc" -eq 0 ] \
+  && ok "28a. check --tier <bad-value>, no --strict -> exit 0 (never-fail-caller)" \
+  || bad "28a. rc=$rc out='$out'"
+fb --repo "$R" --strict check --tier nonsense-tier >/dev/null 2>&1; rc=$?
+[ "$rc" -ne 0 ] && ok "28b. same call WITH --strict -> nonzero (opt-in strictness)" \
+  || bad "28b. rc=$rc, want nonzero"
+
+# ── 29. NEW: no-auth pinned provider needs NO operator key -> reaches ROUTE ──
+R="$(fresh_repo)"
+export ANTHROPIC_MODEL="anthropic/claude-3-5-sonnet-20241022"
+write_cfg "$R" '{
+  "state": "on",
+  "endpoint": "http://127.0.0.1:20128",
+  "omniroute_db_path": "'"$CLEAN_DB"'",
+  "target_provider": "opencode"
+}'
+export HEIMDALL_FALLBACK_ASSUME_REACHABLE=1
+out="$(fb --repo "$R" check)"; rc=$?
+export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
+unset ANTHROPIC_MODEL
+[ "$rc" -eq 0 ] && echo "$out" | grep -q "VERDICT: ROUTE" && echo "$out" | grep -q "OK.*operator_key" && echo "$out" | grep -qi "keyless" \
+  && ok "29. no-auth target_provider ('opencode') with NO key configured -> ROUTE, operator_key passes and says why" \
+  || bad "29. rc=$rc out='$out'"
+
+# ── 30. NEW: a key-REQUIRING provider with no key configured still REFUSEs ──
+R="$(fresh_repo)"
+export ANTHROPIC_MODEL="anthropic/claude-3-5-sonnet-20241022"
+write_cfg "$R" '{
+  "state": "on",
+  "endpoint": "http://127.0.0.1:20128",
+  "omniroute_db_path": "'"$CLEAN_DB"'",
+  "target_provider": "self-hosted-mixtral"
+}'
+export HEIMDALL_FALLBACK_ASSUME_REACHABLE=1
+out="$(fb --repo "$R" check)"; rc=$?
+export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
+unset ANTHROPIC_MODEL
+[ "$rc" -eq 1 ] && echo "$out" | grep -q "VERDICT: REFUSE" && echo "$out" | grep -q "FAIL.*operator_key" \
+  && ok "30. key-requiring target_provider with NO key configured -> REFUSE (operator_key fails, unaffected by no-auth logic)" \
+  || bad "30. rc=$rc out='$out'"
+
+# ── 31. NEW: no-auth does NOT weaken target_provider_allowed's separate ToS gate ─
+R="$(fresh_repo)"
+export ANTHROPIC_MODEL="anthropic/claude-3-5-sonnet-20241022"
+write_cfg "$R" '{
+  "state": "on",
+  "endpoint": "http://127.0.0.1:20128",
+  "omniroute_db_path": "'"$CLEAN_DB"'",
+  "target_provider": "duckduckgo-web"
+}'
+export HEIMDALL_FALLBACK_ASSUME_REACHABLE=1
+out="$(fb --repo "$R" check)"; rc=$?
+export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
+unset ANTHROPIC_MODEL
+[ "$rc" -eq 1 ] && echo "$out" | grep -q "VERDICT: REFUSE" && echo "$out" | grep -q "OK.*operator_key" \
+  && echo "$out" | grep -q "FAIL.*target_provider_allowed" \
+  && ok "31. no-auth provider that is ALSO ToS-deny-listed ('duckduckgo-web') -> operator_key passes keyless, but target_provider_allowed still REFUSEs independently" \
+  || bad "31. rc=$rc out='$out'"
+
+# ── 32. NEW: operator can DECLARE an additional no-auth provider via config ──
+R="$(fresh_repo)"
+export ANTHROPIC_MODEL="anthropic/claude-3-5-sonnet-20241022"
+write_cfg "$R" '{
+  "state": "on",
+  "endpoint": "http://127.0.0.1:20128",
+  "omniroute_db_path": "'"$CLEAN_DB"'",
+  "target_provider": "my-future-noauth-provider",
+  "noauth_providers": ["my-future-noauth-provider"]
+}'
+export HEIMDALL_FALLBACK_ASSUME_REACHABLE=1
+out="$(fb --repo "$R" check)"; rc=$?
+export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
+unset ANTHROPIC_MODEL
+[ "$rc" -eq 0 ] && echo "$out" | grep -q "VERDICT: ROUTE" && echo "$out" | grep -q "OK.*operator_key" \
+  && ok "32a. operator-declared noauth_providers addition -> operator_key passes keyless for a provider not in the built-in list" \
+  || bad "32a. rc=$rc out='$out'"
+
+R2="$(fresh_repo)"
+export ANTHROPIC_MODEL="anthropic/claude-3-5-sonnet-20241022"
+write_cfg "$R2" '{
+  "state": "on",
+  "endpoint": "http://127.0.0.1:20128",
+  "omniroute_db_path": "'"$CLEAN_DB"'",
+  "target_provider": "my-future-noauth-provider"
+}'
+export HEIMDALL_FALLBACK_ASSUME_REACHABLE=1
+out2="$(fb --repo "$R2" check)"; rc2=$?
+export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
+unset ANTHROPIC_MODEL
+[ "$rc2" -eq 1 ] && echo "$out2" | grep -q "FAIL.*operator_key" \
+  && ok "32b. WITHOUT the config declaration, the same undeclared provider still requires a key (no guessing)" \
+  || bad "32b. rc=$rc2 out='$out2'"
+
+# ── 33. NEW: no-auth provider still refuses a Claude/Anthropic-named key_env ─
+R="$(fresh_repo)"
+export ANTHROPIC_API_KEY="not-actually-used"
+export ANTHROPIC_MODEL="anthropic/claude-3-5-sonnet-20241022"
+write_cfg "$R" '{
+  "state": "on",
+  "operator_key_env": "ANTHROPIC_API_KEY",
+  "endpoint": "http://127.0.0.1:20128",
+  "omniroute_db_path": "'"$CLEAN_DB"'",
+  "target_provider": "opencode"
+}'
+export HEIMDALL_FALLBACK_ASSUME_REACHABLE=1
+out="$(fb --repo "$R" check)"; rc=$?
+export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
+unset ANTHROPIC_MODEL
+unset ANTHROPIC_API_KEY
+[ "$rc" -eq 1 ] && echo "$out" | grep -q "FAIL.*operator_key" && echo "$out" | grep -qi "Claude/Anthropic" \
+  && ok "33. no-auth target_provider does NOT waive the Claude/Anthropic operator_key_env ban" \
+  || bad "33. rc=$rc out='$out'"
+
+# ── 34. NEW (schema fix): correct table is upstream_proxy_config, not
+# provider_connections -- a live OmniRoute 3.8.51 (d82b682) install confirmed
+# provider_connections has NO 'mode' column (46 real columns, zero named
+# 'mode'); mode/fallback_backend live on upstream_proxy_config
+# (src/lib/db/migrations/138_dario_fallback_backend.sql). These sections
+# prove the CORRECTED query's behavior directly (falsifiers a/b/c/d).
+#
+# 34c was originally "table missing -> FAILS closed", full stop. Reverted:
+# test/issue-loop-claude-fix-fallback.test.sh's case (c) -- a real caller's
+# own hermetic fixture, not owned by this file and never to be edited to fit
+# -- carries exactly this DB shape (provider_connections present,
+# upstream_proxy_config absent, predating migration
+# 138_dario_fallback_backend.sql) and legitimately expects a ROUTE verdict.
+# A missing table backed by a readable provider_connections is a structural
+# fact ("this schema has no delegated-sidecar concept"), not an unknown, so
+# it now PASSES; 34d replaces the lost fail-closed coverage with a DB that is
+# genuinely unreadable (provider_connections fails too), which still FAILS
+# closed exactly as before. ─────────────────────────────────────────────────
+
+R="$(fresh_repo)"
+write_cfg "$R" '{"state": "auto", "omniroute_db_path": "'"$SIDECAR_MODE_DB"'"}'
+out="$(fb --repo "$R" check)"
+echo "$out" | grep -q "FAIL.*no_delegated_sidecar" && echo "$out" | grep -qi "cliproxyapi"   && ok "34a. falsifier: upstream_proxy_config row with mode='cliproxyapi' (CORRECT table) -> no_delegated_sidecar FAILS"   || bad "34a. got: $out"
+
+R="$(fresh_repo)"
+write_cfg "$R" '{"state": "auto", "omniroute_db_path": "'"$CLEAN_DB"'"}'
+out="$(fb --repo "$R" check)"
+echo "$out" | grep -q "OK  .*no_delegated_sidecar"   && ok "34b. falsifier: upstream_proxy_config table present but EMPTY -> no_delegated_sidecar PASSES"   || bad "34b. got: $out"
+
+R="$(fresh_repo)"
+write_cfg "$R" '{"state": "auto", "omniroute_db_path": "'"$NO_PROXY_CONFIG_TABLE_DB"'"}'
+out="$(fb --repo "$R" check)"
+echo "$out" | grep -q "OK  .*no_delegated_sidecar" && echo "$out" | grep -qi "schema predates"   && ok "34c. falsifier: DB missing upstream_proxy_config table entirely, but provider_connections IS present/queryable -> PASSES (schema predates the delegated-sidecar migration; this is the exact DB shape issue-loop-claude-fix-fallback's own case (c) fixture depends on)"   || bad "34c. got: $out"
+
+R="$(fresh_repo)"
+write_cfg "$R" '{"state": "auto", "omniroute_db_path": "'"$MALFORMED_DB"'"}'
+out="$(fb --repo "$R" check)"
+echo "$out" | grep -q "FAIL.*no_delegated_sidecar" && echo "$out" | grep -qi "could not be queried for upstream_proxy_config"   && ok "34d. falsifier: a genuinely unreadable/malformed DB (provider_connections ALSO fails) -> no_delegated_sidecar still FAILS closed (never a silent pass)"   || bad "34d. got: $out"
+
+# ── 35. NEW: mode='dario' is ALSO a delegated sidecar -- header point 1d
+# already named Dario explicitly, but the OLD code's SIDECAR_CONNECTION_MODE
+# was a single literal string ('cliproxyapi') that never covered it, even
+# independent of the wrong-table bug. ───────────────────────────────────────
+DARIO_DB="$(mktemp "${TMPDIR:-/tmp}/hmd-fallback-test-dario.XXXXXX")"
+make_omniroute_db "$DARIO_DB"
+add_proxy_config_row "$DARIO_DB" some-provider dario
+R="$(fresh_repo)"
+write_cfg "$R" '{"state": "auto", "omniroute_db_path": "'"$DARIO_DB"'"}'
+out="$(fb --repo "$R" check)"
+echo "$out" | grep -q "FAIL.*no_delegated_sidecar" && echo "$out" | grep -qi "dario"   && ok "35. falsifier: upstream_proxy_config row with mode='dario' -> no_delegated_sidecar FAILS (names Dario)"   || bad "35. got: $out"
+
+# ── 36. NEW: mode='fallback' delegates its retry leg to EITHER cliproxyapi
+# or dario (migration 138's own wording) -- both backends still FAIL. ──────
+FALLBACK_CPA_DB="$(mktemp "${TMPDIR:-/tmp}/hmd-fallback-test-fallback-cpa.XXXXXX")"
+make_omniroute_db "$FALLBACK_CPA_DB"
+add_proxy_config_row "$FALLBACK_CPA_DB" some-provider fallback cliproxyapi
+R="$(fresh_repo)"
+write_cfg "$R" '{"state": "auto", "omniroute_db_path": "'"$FALLBACK_CPA_DB"'"}'
+out="$(fb --repo "$R" check)"
+echo "$out" | grep -q "FAIL.*no_delegated_sidecar"   && ok "36a. falsifier: mode='fallback', fallback_backend='cliproxyapi' -> no_delegated_sidecar FAILS"   || bad "36a. got: $out"
+
+FALLBACK_DARIO_DB="$(mktemp "${TMPDIR:-/tmp}/hmd-fallback-test-fallback-dario.XXXXXX")"
+make_omniroute_db "$FALLBACK_DARIO_DB"
+add_proxy_config_row "$FALLBACK_DARIO_DB" some-provider fallback dario
+R="$(fresh_repo)"
+write_cfg "$R" '{"state": "auto", "omniroute_db_path": "'"$FALLBACK_DARIO_DB"'"}'
+out="$(fb --repo "$R" check)"
+echo "$out" | grep -q "FAIL.*no_delegated_sidecar" && echo "$out" | grep -qi "dario"   && ok "36b. falsifier: mode='fallback', fallback_backend='dario' -> no_delegated_sidecar FAILS, names dario"   || bad "36b. got: $out"
+
+# ── 37. NEW: an explicit mode='native' row is NOT a delegated sidecar ──────
+NATIVE_DB="$(mktemp "${TMPDIR:-/tmp}/hmd-fallback-test-native.XXXXXX")"
+make_omniroute_db "$NATIVE_DB"
+add_proxy_config_row "$NATIVE_DB" some-provider native
+R="$(fresh_repo)"
+write_cfg "$R" '{"state": "auto", "omniroute_db_path": "'"$NATIVE_DB"'"}'
+out="$(fb --repo "$R" check)"
+echo "$out" | grep -q "OK  .*no_delegated_sidecar"   && ok "37. an explicit mode='native' row is NOT a delegated sidecar -> PASSES"   || bad "37. got: $out"
 
 echo "--------------------------------------------------------------------"
 printf 'heimdall-fallback: %d passed, %d failed\n' "$PASS" "$FAIL"

@@ -52,10 +52,24 @@ boundary from a different angle):
           with "prefer" in its name (S3, "must not do" #6).
        d. no_delegated_sidecar -- no delegated sidecar (CLIProxyAPI, or
           Dario -- OmniRoute's own source names it a "Claude-subscription
-          proxy") may be installed. A `mode: "cliproxyapi"` connection can
-          reach a Claude subscription while OmniRoute's own DB holds no
-          Tier-1 token at all, which would make check (a) alone insufficient
-          (S1a path 8, residual risk 2).
+          proxy") may be configured. A `mode` of 'cliproxyapi', 'dario', or
+          'fallback' on an upstream_proxy_config row can reach a Claude
+          subscription while OmniRoute's own provider_connections table
+          holds no Tier-1 token at all, which would make check (a) alone
+          insufficient (S1a path 8, residual risk 2). Confirmed against a
+          live OmniRoute 3.8.51 (d82b682) install that this lives on
+          upstream_proxy_config, NOT provider_connections (which has no
+          `mode` column at all) -- see SIDECAR_DELEGATING_MODES. An
+          upstream_proxy_config table that does not exist AT ALL is a PASS,
+          never a FAIL, when provider_connections (check (a), just above) is
+          itself readable -- a schema predating migration
+          138_dario_fallback_backend.sql structurally cannot have a
+          delegated sidecar, which is a stronger, positive fact than
+          "unknown". Genuine unreadability (provider_connections ALSO
+          failing) still fails closed exactly as every other branch here
+          does -- see run_preflight's own comment for the full reasoning,
+          and test/issue-loop-claude-fix-fallback.test.sh's case (c) for the
+          real caller whose own hermetic fixture is exactly this DB shape.
      Fail closed on all four: refusing is always safer than proceeding on an
      unknown.
   2. NEVER enable OmniRoute's opt-in root-CA MITM ("TPROXY") decrypt mode. A
@@ -90,6 +104,59 @@ boundary from a different angle):
      silently by load_config()'s allowlist copy; cmd_check additionally
      warns on stderr if it finds one, so that silence is never mistaken for
      the field having done something.
+  8. FOUR STATES, one safety boundary. `off` (default, never route), `on` (a
+     CAPABILITY-TIER routing decision -- route only LOW-LEVEL work, never an
+     exhaustion reaction), `auto` (the ORIGINAL exhaustion/pre-exhaustion
+     reaction -- route only when preflight passes, else WAIT rather than
+     block), and `switch` (route EVERYTHING, tier-blind, still gated by the
+     same preflight as every other state). None of the four ever changes
+     WHETHER routing is safe -- points 1-7 above apply identically in all
+     four; `switch` changes WHAT routes, never whether a failing
+     Tier-1/model-pin/sidecar/ToS check is survivable. "Low-level" reuses
+     this repo's OWN existing task-tier vocabulary rather than inventing a
+     second one -- see agents/heimdall.md's Model Routing table (haiku:
+     "lint, format, rename, simple config") and CLAUDE.md's "Model routing
+     (2026-08-11 directive)" (opus reserved for adjudication:
+     reviewer/verifier/security-auditor; sonnet is the default coding tier).
+     `on` maps to the haiku tier ONLY -- sonnet (default coding) and the
+     adjudication roles (always opus; capability is load-bearing there) NEVER
+     route under `on`, regardless of how the caller spells the tier. `check
+     --tier T` (T in haiku|sonnet|opus|reviewer|verifier|security-auditor,
+     the last three being direct adjudication-role aliases for opus) asks
+     this per-task question; bare `check` (no --tier) asks the ORIGINAL,
+     tier-blind question and is completely unaffected by this whole
+     paragraph -- see bin/lib/issue_loop.py, the one existing caller, which
+     is preserved byte-for-byte (it never passes --tier).
+  9. `switch` MUST be unmistakable. It is the only state that risks
+     quality-sensitive work landing on a provider with no no-train guarantee
+     (docs/analysis/2026-08-25-headroom-inpath-measurement.md's 337x
+     prompt-cache-vs-compression gap is why routing HEALTHY traffic through
+     OmniRoute is a real cost, not a free option). `status` and `check` both
+     print an explicit, impossible-to-miss warning whenever state is
+     'switch' -- never folded quietly into the normal state line.
+  10. A no-auth/free target_provider needs NO operator_key_env, and that is
+      NOT a gap -- it mirrors OmniRoute's own architecture. Credential
+      resolution reads provider_connections for every provider EXCEPT a
+      fixed set served via a synthetic "noauth" connection instead
+      (NOAUTH_PROVIDERS, sourced verbatim from docs/analysis/2026-08-25-
+      omniroute-credential-isolation.md's own citation of OmniRoute source;
+      `claude`/`claude-web` are explicitly NOT in it, so this can never
+      collide with point 1's Tier-1 boundary). The operator_key check passes
+      keylessly ONLY for a target_provider in that list, or one the operator
+      has explicitly named in config's `noauth_providers` -- an
+      addition-only declaration for a provider this tool's hardcoded list
+      has not caught up with yet, never a guess this tool makes on its own.
+      Two things stay true regardless: (a) even a no-auth provider still
+      refuses an operator_key_env naming a Claude/Anthropic credential
+      (point 4 is absolute, not conditioned on necessity), and (b)
+      target_provider_allowed's OWN ToS deny-list check is completely
+      independent -- a provider can be no-auth AND still refused (e.g.
+      `duckduckgo-web` is in both lists). Keyless routes are OmniRoute's
+      free/no-auth tier, the SAME weakest-contractual-terms category the
+      ToS-conflict flag in point 3 exists for
+      (docs/analysis/2026-08-23-omniroute-assessment.md) -- `status` and
+      `check` both say this once, plainly, whenever it applies, so the
+      operator sees it without having to remember it.
 
 MUST FAIL CLOSED -- the deliberate inverse of heimdall-quota-advisor's "MUST
 FAIL OPEN". The advisor's job is to never cry wolf: an uncertain exhaustion
@@ -120,10 +187,18 @@ latter. It has no opinion on retries and must never be consulted for one.
 
 USAGE
 -----
-  heimdall-fallback status [--json]     current state + would-preflight-pass, secret-free
-  heimdall-fallback set {off,on,auto}   persist a new state (off is always safe)
-  heimdall-fallback check               run the preflight; exit code IS the verdict
-  heimdall-fallback where               print the config file path
+  heimdall-fallback status [--json]            current state + would-preflight-pass, secret-free
+  heimdall-fallback set {off,on,auto,switch}   persist a new state (off is always safe)
+  heimdall-fallback check [--tier T]           run the preflight; exit code IS the verdict.
+                                                --tier asks a CAPABILITY-TIER question (only
+                                                meaningful under state=on; T is one of haiku,
+                                                sonnet, opus, or an adjudication-role alias --
+                                                reviewer, verifier, security-auditor -- for
+                                                opus). Omit --tier for the ORIGINAL, tier-blind
+                                                question every existing caller
+                                                (bin/lib/issue_loop.py) already asks -- see
+                                                header point 8.
+  heimdall-fallback where                      print the config file path
 
 Global flags (before the subcommand -- matches bin/heimdall-pressure /
 bin/heimdall-metric):
@@ -135,9 +210,12 @@ CONFIG  <repo>/.heimdall/fallback.json -- gitignored by the blanket
 field below defaults to the safe value:
   {
     "schema": 1,
-    "state": "off",                        # off | on | auto -- anything else reads as off
+    "state": "off",                        # off | on | auto | switch -- anything else
+                                            # reads as off (header point 6)
     "operator_key_env": "",                # NAME of an env var holding the operator's
-                                            # OWN OmniRoute/provider key -- never a value
+                                            # OWN OmniRoute/provider key -- never a value.
+                                            # NOT required when target_provider is a
+                                            # no-auth/free provider -- see header point 10
     "endpoint": "http://127.0.0.1:20128",  # must resolve local; OmniRoute's documented
                                             # default self-hosted gateway port
     "omniroute_db_path": "",               # path to OmniRoute's own SQLite DB; empty ->
@@ -148,19 +226,28 @@ field below defaults to the safe value:
                                             # $CLIPROXYAPI_CONFIG_DIR or ~/.cli-proxy-api
                                             # (delegated-sidecar check -- header point 1d)
     "target_provider": "",                 # provider name; checked against the deny list
-    "tos_flagged_providers": []            # operator ADDITIONS to the built-in deny
+    "tos_flagged_providers": [],           # operator ADDITIONS to the built-in deny
                                             # list only -- can never remove a built-in
+    "noauth_providers": []                 # operator ADDITIONS to the built-in no-auth
+                                            # (keyless) provider list only -- see header
+                                            # point 10; never removes a built-in entry
   }
 
 EXIT CODES
   status, where : always 0 (never-fail-caller telemetry reads)
   set           : 0 (even on bad input) unless --strict -> 2 usage / 3 write-fail
-  check         : 0 = ROUTE  (every preflight check passed)
-                  1 = REFUSE (state is 'off', OR state is 'on' and a preflight
-                              check failed)
+  check         : 0 = ROUTE  (every preflight check passed; under state=on with
+                              --tier given, the tier must also resolve to haiku)
+                  1 = REFUSE (state is 'off'; OR state is 'on' and a preflight
+                              check failed, or --tier was given and does not
+                              resolve to haiku; OR state is 'switch' and a
+                              preflight check failed)
                   2 = WAIT   (state is 'auto' and a preflight check failed --
-                              print the reasons, do not route blind)
-  argument-parsing errors (any subcommand) : 0 unless --strict -> 2
+                              print the reasons, do not route blind; tier is
+                              NEVER consulted here -- auto is an exhaustion
+                              reaction, not a capability decision)
+  argument-parsing errors (any subcommand, including an unrecognized --tier
+  value) : 0 unless --strict -> 2
   unexpected internal error (outer safety net; check() fails closed on its
   own and should never actually reach this) : 0 unless --strict -> 3
 """
@@ -175,7 +262,7 @@ import sys
 import urllib.parse
 
 SCHEMA = 1
-VALID_STATES = ("off", "on", "auto")
+VALID_STATES = ("off", "on", "auto", "switch")
 
 DEFAULT_CFG = {
     "schema": SCHEMA,
@@ -186,6 +273,7 @@ DEFAULT_CFG = {
     "cliproxyapi_dir": "",
     "target_provider": "",
     "tos_flagged_providers": [],
+    "noauth_providers": [],
 }
 
 # Sourced verbatim from docs/analysis/2026-08-23-omniroute-assessment.md,
@@ -200,6 +288,35 @@ BUILTIN_TOS_FLAGGED_PROVIDERS = frozenset({
     "mistral", "openrouter", "nvidia", "cerebras", "cohere",
     "huggingface", "vertex", "baidu", "tencent", "doubao",
 })
+
+# Providers OmniRoute serves via a SYNTHETIC "noauth" connection instead of a
+# provider_connections credential row -- sourced verbatim (READ, not guessed)
+# from docs/analysis/2026-08-25-omniroute-credential-isolation.md's own
+# citation of OmniRoute's NOAUTH_PROVIDERS / no-auth WEB_COOKIE_PROVIDERS
+# list. `claude`/`claude-web` are explicitly NOT in it (that doc's own
+# emphasis), so this can never collide with the Tier-1 boundary above. An
+# operator key is genuinely not required to route to one of these -- that is
+# a property of OmniRoute's own architecture, not a gap in this tool. See
+# header point 10.
+NOAUTH_PROVIDERS = frozenset({
+    "devin-cli-agentic", "opencode", "duckduckgo-web", "cloudflare-playground",
+    "felo-web", "theoldllm", "chipotle", "veoaifree-web", "auggie", "zcode",
+    "codex-app-server", "uncloseai", "aihorde",
+})
+
+# One-time, plain explanation surfaced in BOTH `status` and `check` whenever
+# the pinned target_provider resolves to a no-auth route (never nagged, never
+# repeated beyond the one line) -- the owner's own framing: keyless does not
+# mean risk-free, it means OmniRoute's free/no-auth tier, the same weakest-
+# contractual-terms category the ToS-conflict flag exists for (see
+# docs/analysis/2026-08-23-omniroute-assessment.md and header point 10).
+NOAUTH_ROUTE_NOTE_FMT = (
+    "target_provider '%s' is served keyless via OmniRoute's own no-auth "
+    "connection path -- no operator key is required. Keyless routes are "
+    "OmniRoute's free/no-auth tier, the same weakest-contractual-terms "
+    "category the ToS-conflict deny list exists for; target_provider_allowed "
+    "still applies independently and is not weakened by this."
+)
 
 # Any of these keys appearing in an on-disk config (any value) is how
 # OmniRoute's MITM mode or a blind trust of its advisory ToS flag would be
@@ -222,17 +339,54 @@ LOCAL_HOSTNAMES = frozenset({"localhost", "127.0.0.1", "::1"})
 # OAuth and a claude.ai session cookie respectively). See header point 1a.
 TIER1_DB_PROVIDERS = ("claude", "claude-web")
 
-# A provider_connections row in this mode routes through a delegated sidecar
-# (CLIProxyAPI) using its own dedicated key -- OmniRoute itself can hold zero
-# Tier-1 tokens while this is still true. See header point 1d, audit S1a
-# path 8 and residual risk 2.
-SIDECAR_CONNECTION_MODE = "cliproxyapi"
+# upstream_proxy_config.mode values that mean the retry/primary leg for a
+# provider is handled by a delegated sidecar (CLIProxyAPI or Dario) rather
+# than OmniRoute's own native call -- OmniRoute itself can hold zero Tier-1
+# tokens while this is still true. See header point 1d, audit S1a path 8 and
+# residual risk 2. Sourced verbatim from a live OmniRoute 3.8.51 (d82b682)
+# install's own src/lib/db/migrations/138_dario_fallback_backend.sql: "mode
+# is a free TEXT column already ('native' | 'cliproxyapi' | 'dario' |
+# 'fallback')" -- 'native' is the only non-delegating value; 'fallback' means
+# the RETRY leg goes to whichever of cliproxyapi/dario `fallback_backend`
+# names (default 'cliproxyapi'), so it is delegating regardless of which
+# backend it names. This check ignores the row's own `enabled` flag on
+# purpose -- fail-closed treats a configured-but-disabled delegation the same
+# as an active one, since re-enabling it is a single flag flip this tool does
+# not control or continuously observe. NOTE this is the table/column the
+# check ACTUALLY queries -- provider_connections (queried above for Tier-1)
+# has no 'mode' column on a real install at all (confirmed: 46 real columns,
+# zero named 'mode'); an earlier version of this check queried it there by
+# mistake, inferred from the audit's prose rather than the real schema, and
+# always passed vacuously.
+SIDECAR_DELEGATING_MODES = frozenset({"cliproxyapi", "dario", "fallback"})
 
 # Values that count as "the widening flag is off" for
 # OMNIROUTE_PREFER_CLAUDE_CODE_FOR_UNPREFIXED_CLAUDE_MODELS -- unset and
 # every common falsy spelling. Anything else (including "1", "true", "yes")
 # fails the check. See header point 1c.
 _ENV_FLAG_OFF_VALUES = frozenset({"", "0", "false", "no", "off"})
+
+# "Low-level" reuses THIS repo's existing task-tier vocabulary rather than
+# inventing a second one -- agents/heimdall.md's Model Routing table (haiku:
+# "lint, format, rename, simple config, doc-sync") and CLAUDE.md's "Model
+# routing (2026-08-11 directive)" (opus reserved for adjudication: reviewer,
+# verifier, security-auditor; sonnet is the default coding tier). See header
+# point 8. The adjudication roles are direct opus aliases so "adjudication
+# never routes under on" is an explicit, testable guarantee, not an accident
+# of opus's tier string alone. NOTE: .planning/settings.json's
+# `model_routing` field (an alternate source the original brief also named)
+# does not exist anywhere in this repo -- confirmed by direct search; this
+# vocabulary comes from agents/heimdall.md and CLAUDE.md instead, the only
+# place it is actually defined.
+TIER_ALIASES = {
+    "haiku": "haiku",
+    "sonnet": "sonnet",
+    "opus": "opus",
+    "reviewer": "opus",
+    "verifier": "opus",
+    "security-auditor": "opus",
+}
+LOW_LEVEL_TIER = "haiku"
 
 
 class Rejected(Exception):
@@ -279,6 +433,10 @@ def load_config(repo):
         cfg["tos_flagged_providers"] = [p for p in cfg["tos_flagged_providers"] if isinstance(p, str)]
     else:
         cfg["tos_flagged_providers"] = []
+    if isinstance(cfg.get("noauth_providers"), list):
+        cfg["noauth_providers"] = [p for p in cfg["noauth_providers"] if isinstance(p, str)]
+    else:
+        cfg["noauth_providers"] = []
     for key in ("operator_key_env", "endpoint", "target_provider", "omniroute_db_path", "cliproxyapi_dir"):
         if not isinstance(cfg.get(key), str):
             cfg[key] = DEFAULT_CFG[key]
@@ -363,6 +521,27 @@ def _resolve_cliproxyapi_dir(cfg):
     return os.path.expanduser(os.path.join("~", ".cli-proxy-api"))
 
 
+def _resolve_noauth_providers(cfg):
+    """The built-in NOAUTH_PROVIDERS set plus any operator ADDITIONS from
+    config's `noauth_providers` -- same additions-only shape as
+    tos_flagged_providers (config can never remove a built-in entry, only
+    name one more). An addition is the operator's own factual declaration
+    ("I know this specific provider is keyless") for a provider this tool's
+    hardcoded, sourced list has not caught up with yet -- never a guess this
+    tool makes on its own. See header point 10."""
+    return NOAUTH_PROVIDERS | {
+        p.strip().lower() for p in cfg.get("noauth_providers", []) if isinstance(p, str)
+    }
+
+
+def _target_provider_is_noauth(cfg):
+    """Whether cfg's pinned target_provider is a no-auth route -- see
+    _resolve_noauth_providers and header point 10. An empty target_provider
+    is never no-auth (nothing is pinned to check)."""
+    provider = (cfg.get("target_provider") or "").strip().lower()
+    return bool(provider) and provider in _resolve_noauth_providers(cfg)
+
+
 def _open_omniroute_db_ro(path):
     """Open OmniRoute's SQLite DB strictly read-only via a URI connection --
     this tool must never create or mutate the operator's real database, not
@@ -431,18 +610,24 @@ def run_preflight(cfg):
     checks.append((
         "state",
         state != "off",
-        "" if state != "off" else "fallback state is 'off' (heimdall-fallback set on|auto)",
+        "" if state != "off" else "fallback state is 'off' (heimdall-fallback set on|auto|switch)",
     ))
 
     key_env = cfg.get("operator_key_env") or ""
-    if not key_env:
-        checks.append(("operator_key", False, "no operator_key_env configured -- an operator-owned key is required"))
-    elif any(marker in key_env.upper() for marker in FORBIDDEN_KEY_ENV_MARKERS):
+    target_provider_raw = cfg.get("target_provider") or ""
+    if key_env and any(marker in key_env.upper() for marker in FORBIDDEN_KEY_ENV_MARKERS):
+        # Absolute regardless of no-auth status -- see header point 4/10: the
+        # Claude Code OAuth session may never be reused as a fallback key,
+        # even for a provider that would otherwise need no key at all.
         checks.append((
             "operator_key", False,
             "operator_key_env '%s' names a Claude/Anthropic credential -- the Claude Code "
             "OAuth session may never be reused as a fallback key" % key_env,
         ))
+    elif _target_provider_is_noauth(cfg):
+        checks.append(("operator_key", True, NOAUTH_ROUTE_NOTE_FMT % target_provider_raw))
+    elif not key_env:
+        checks.append(("operator_key", False, "no operator_key_env configured -- an operator-owned key is required"))
     elif not os.environ.get(key_env):
         checks.append(("operator_key", False, "env var '%s' (operator_key_env) is not set" % key_env))
     else:
@@ -478,8 +663,8 @@ def run_preflight(cfg):
         )
         sidecar_db_ok = False
         sidecar_db_reason = (
-            "OmniRoute DB not found at '%s' -- cannot query for a cliproxyapi-mode "
-            "connection row, so a delegated sidecar cannot be ruled out" % db_path
+            "OmniRoute DB not found at '%s' -- cannot query upstream_proxy_config for a "
+            "delegated-sidecar row, so a delegated sidecar cannot be ruled out" % db_path
         )
     else:
         provider_rows, provider_err = _query_omniroute(
@@ -504,27 +689,87 @@ def run_preflight(cfg):
             tier1_ok = True
             tier1_reason = ""
 
-        mode_rows, mode_err = _query_omniroute(
+        # upstream_proxy_config, NOT provider_connections -- confirmed against
+        # a live OmniRoute 3.8.51 (d82b682) install: provider_connections has
+        # 46 real columns and none named 'mode'. mode/fallback_backend live on
+        # upstream_proxy_config (src/lib/db/migrations/138_dario_fallback_
+        # backend.sql). See SIDECAR_DELEGATING_MODES for the mode vocabulary.
+        #
+        # The table's mere ABSENCE is deliberately NOT the same failure mode
+        # as "this DB could not be read". test/issue-loop-claude-fix-
+        # fallback.test.sh's case (c) -- a real, existing caller's own
+        # hermetic fixture, which this tool does not own and must not edit to
+        # fit -- carries a provider_connections-only DB that legitimately
+        # predates migration 138_dario_fallback_backend.sql. A missing table
+        # is a structural fact about a DB's schema VERSION, not an unknown,
+        # whenever it is accompanied by independent positive evidence that
+        # this really is a readable, on-topic OmniRoute DB: the
+        # tier1_credential_absent query against provider_connections, just
+        # above, having itself succeeded (provider_err is None) is exactly
+        # that evidence. Only when that positive evidence is ALSO missing
+        # (provider_connections itself unreadable, so this DB cannot even be
+        # confirmed as a genuine OmniRoute DB) does an absent
+        # upstream_proxy_config fall back to failing closed on genuine
+        # uncertainty, exactly as every other branch here does.
+        table_rows, table_err = _query_omniroute(
             db_path,
-            "SELECT COUNT(*) FROM provider_connections WHERE mode = ?",
-            (SIDECAR_CONNECTION_MODE,),
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='upstream_proxy_config'",
         )
-        if mode_err is not None:
+        if table_err is not None:
             sidecar_db_ok = False
             sidecar_db_reason = (
-                "OmniRoute DB at '%s' could not be queried for a delegated-sidecar "
-                "connection (%s) -- cannot positively rule one out" % (db_path, mode_err)
+                "OmniRoute DB at '%s' could not be queried for upstream_proxy_config's "
+                "existence (%s) -- cannot positively rule out a delegated sidecar" % (db_path, table_err)
             )
-        elif mode_rows and mode_rows[0][0] > 0:
-            sidecar_db_ok = False
-            sidecar_db_reason = (
-                "OmniRoute DB has %d connection(s) in '%s' mode -- a delegated sidecar can "
-                "hold a Claude credential independently of OmniRoute's own token storage"
-                % (mode_rows[0][0], SIDECAR_CONNECTION_MODE)
-            )
+        elif not table_rows:
+            if provider_err is None:
+                sidecar_db_ok = True
+                sidecar_db_reason = (
+                    "upstream_proxy_config does not exist in this OmniRoute DB (schema "
+                    "predates migration 138_dario_fallback_backend.sql) -- "
+                    "provider_connections is present and queryable, confirming this is a "
+                    "genuine (if older) OmniRoute DB whose schema has no delegated-sidecar "
+                    "concept at all, so none can exist"
+                )
+            else:
+                sidecar_db_ok = False
+                sidecar_db_reason = (
+                    "OmniRoute DB at '%s' has no upstream_proxy_config table AND "
+                    "provider_connections is also unreadable (%s) -- cannot confirm this "
+                    "is a genuine OmniRoute DB, so a delegated sidecar cannot be ruled "
+                    "out" % (db_path, provider_err)
+                )
         else:
-            sidecar_db_ok = True
-            sidecar_db_reason = ""
+            proxy_rows, proxy_err = _query_omniroute(
+                db_path,
+                "SELECT provider_id, mode, fallback_backend FROM upstream_proxy_config "
+                "WHERE mode IN (%s)" % ", ".join("?" for _ in SIDECAR_DELEGATING_MODES),
+                tuple(SIDECAR_DELEGATING_MODES),
+            )
+            if proxy_err is not None:
+                sidecar_db_ok = False
+                sidecar_db_reason = (
+                    "OmniRoute DB at '%s' could not be queried for a delegated-sidecar "
+                    "connection in upstream_proxy_config (%s) -- cannot positively rule "
+                    "one out" % (db_path, proxy_err)
+                )
+            elif proxy_rows:
+                found = ", ".join(
+                    "%s (mode=%s%s)" % (
+                        pid, m, (", fallback_backend=%s" % fb) if m == "fallback" else "",
+                    )
+                    for pid, m, fb in proxy_rows
+                )
+                sidecar_db_ok = False
+                sidecar_db_reason = (
+                    "OmniRoute DB has %d upstream_proxy_config row(s) delegating to an "
+                    "embedded proxy (%s) -- a delegated sidecar (CLIProxyAPI or Dario) can "
+                    "hold a Claude credential independently of OmniRoute's own token "
+                    "storage" % (len(proxy_rows), found)
+                )
+            else:
+                sidecar_db_ok = True
+                sidecar_db_reason = ""
 
     checks.append(("tier1_credential_absent", tier1_ok, tier1_reason))
 
@@ -583,8 +828,31 @@ def run_preflight(cfg):
     return checks
 
 
-def _verdict(state, checks):
-    if all(ok for _, ok, _ in checks):
+def _tier_routes_under_on(tier):
+    """Whether a task of the given TIER is eligible for `on`'s capability-tier
+    routing decision. `on` maps to the haiku tier only -- see header point 8,
+    agents/heimdall.md's Model Routing table, and CLAUDE.md's 2026-08-11
+    model-routing directive. tier=None means the caller asked the ORIGINAL,
+    tier-blind question (bin/lib/issue_loop.py, preserved unchanged) and is
+    always eligible, exactly like every state before `on` was redefined."""
+    if tier is None:
+        return True
+    return TIER_ALIASES.get(tier) == LOW_LEVEL_TIER
+
+
+def _verdict(state, checks, tier=None):
+    """state decides ROUTE vs REFUSE vs WAIT; `on` additionally consults the
+    task TIER now that it is a capability-tier routing decision, not an
+    exhaustion reaction (auto keeps that job, unchanged, and never consults
+    tier -- see header point 8). `switch` never WAITs: it is an explicit
+    always-try state, so a failing preflight is a REFUSE, exactly like `on`,
+    never a silent wait (header point 9). run_preflight's checks always run
+    in full regardless of state or tier -- nothing here is ever a
+    short-circuit (header point 1)."""
+    preflight_ok = all(ok for _, ok, _ in checks)
+    if state == "on" and not _tier_routes_under_on(tier):
+        return "REFUSE", 1
+    if preflight_ok:
         return "ROUTE", 0
     if state == "auto":
         return "WAIT", 2
@@ -597,26 +865,42 @@ def cmd_status(args):
     would_pass = all(ok for _, ok, _ in checks)
     key_env = cfg.get("operator_key_env") or ""
     key_present = bool(key_env) and bool(os.environ.get(key_env))
+    is_switch = cfg["state"] == "switch"
+    switch_warning = (
+        "FULL SWITCH: every task, every tier, routes to OmniRoute when preflight passes -- "
+        "capability tier is never consulted and there is no no-train guarantee on this path"
+        if is_switch else None
+    )
+    target_provider = cfg.get("target_provider") or ""
+    noauth_note = NOAUTH_ROUTE_NOTE_FMT % target_provider if _target_provider_is_noauth(cfg) else None
     if args.json:
         payload = {
             "state": cfg["state"],
+            "full_switch": is_switch,
             "would_preflight_pass": would_pass,
             "operator_key_env": key_env,
             "operator_key_configured": key_present,
             "endpoint": cfg.get("endpoint", ""),
-            "target_provider": cfg.get("target_provider", ""),
+            "target_provider": target_provider,
             "corrupt": corrupt_reason,
+            "switch_warning": switch_warning,
+            "noauth_route": noauth_note,
         }
         print(json.dumps(payload, sort_keys=True))
     else:
         print("heimdall-fallback status")
-        print("  state:                 %s" % cfg["state"])
+        state_line = cfg["state"]
+        if is_switch:
+            state_line += "   *** %s ***" % switch_warning
+        print("  state:                 %s" % state_line)
         print("  would preflight pass:  %s" % ("yes" if would_pass else "no"))
         print("  operator key:          %s (%s)" % (key_env or "(unset)", "configured" if key_present else "absent"))
         print("  endpoint:              %s" % (cfg.get("endpoint") or "(unset)"))
-        print("  target provider:       %s" % (cfg.get("target_provider") or "(unset)"))
+        print("  target provider:       %s" % (target_provider or "(unset)"))
         if corrupt_reason:
             print("  NOTE: on-disk config was corrupt (%s) -- reset to safe defaults (state=off)" % corrupt_reason)
+        if noauth_note:
+            print("  NOTE: %s" % noauth_note)
     return 0
 
 
@@ -639,17 +923,46 @@ def cmd_check(args):
     try:
         cfg, _ = load_config(args.repo)
         checks = run_preflight(cfg)
-        verdict, rc = _verdict(cfg["state"], checks)
-        print("heimdall-fallback check -- VERDICT: %s" % verdict)
+        state = cfg["state"]
+        tier = getattr(args, "tier", None)
+        preflight_ok = all(ok for _, ok, _ in checks)
+        tier_ok = _tier_routes_under_on(tier) if state == "on" else True
+        verdict, rc = _verdict(state, checks, tier=tier)
+
+        header = "heimdall-fallback check -- VERDICT: %s" % verdict
+        if state == "switch":
+            header += ("  *** SWITCH STATE: every task, every tier, routes to OmniRoute -- "
+                       "capability tier is NOT consulted ***")
+        print(header)
+
         for name, ok, reason in checks:
             line = "  [%s] %s" % ("OK  " if ok else "FAIL", name)
-            if not ok and reason:
+            if reason:
                 line += " -- %s" % reason
             print(line)
+
+        if state == "on" and tier is not None:
+            resolved = TIER_ALIASES.get(tier, tier)
+            line = "  [%s] tier_eligible (tier=%s)" % ("OK  " if tier_ok else "FAIL", tier)
+            if not tier_ok:
+                line += (
+                    " -- '%s' resolves to the '%s' tier; state=on is a capability-tier "
+                    "routing decision and only routes '%s'-tier work (lint, format, "
+                    "rename, simple config, doc-sync -- agents/heimdall.md's Model "
+                    "Routing table); default coding work (sonnet) and adjudication "
+                    "(reviewer/verifier/security-auditor, always opus) never route "
+                    "under 'on'" % (tier, resolved, LOW_LEVEL_TIER)
+                )
+            print(line)
+
         if verdict == "WAIT":
             print("  (state=auto: preflight failed -> waiting rather than routing blind)")
-        elif verdict == "REFUSE" and cfg["state"] != "off":
-            print("  (state=%s but a required check failed -> refusing rather than proceeding unsafely)" % cfg["state"])
+        elif verdict == "REFUSE" and state == "on" and preflight_ok and not tier_ok:
+            print("  (state=on, preflight passed, but tier is not low-level -> refusing; "
+                  "'on' routes haiku-tier work only, not an exhaustion reaction)")
+        elif verdict == "REFUSE" and state != "off":
+            print("  (state=%s but a required check failed -> refusing rather than proceeding unsafely)" % state)
+
         note = _blocked_providers_note(args.repo)
         if note:
             sys.stderr.write("heimdall-fallback check: WARNING: %s\n" % note)
@@ -682,7 +995,14 @@ def build_parser():
     sp_set = sub.add_parser("set", help="persist a new fallback state")
     sp_set.add_argument("value", choices=VALID_STATES)
 
-    sub.add_parser("check", help="run the preflight; exit code is the verdict (0=ROUTE 1=REFUSE 2=WAIT)")
+    sp_check = sub.add_parser("check", help="run the preflight; exit code is the verdict (0=ROUTE 1=REFUSE 2=WAIT)")
+    sp_check.add_argument(
+        "--tier", default=None, choices=sorted(TIER_ALIASES),
+        help="task tier/role for state=on's capability-tier routing decision "
+             "(haiku|sonnet|opus, or an adjudication-role alias -- reviewer|"
+             "verifier|security-auditor -- for opus). Omit for the original, "
+             "tier-blind question (bin/lib/issue_loop.py's own call shape).",
+    )
     sub.add_parser("where", help="print the config file path")
 
     return p
