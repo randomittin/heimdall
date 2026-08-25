@@ -134,10 +134,25 @@
 #   hiccup.
 #
 #   OVERLOAD -> PRESSURE, THE ONE OUTBOUND SIDE EFFECT — an `overloaded`
-#   classification is the ONLY overload signal hmd has at all (it cannot read
-#   the harness's HTTP responses; see bin/heimdall-pressure's own header).
-#   `report` forwards exactly the FIRST `overloaded` classification at a given
-#   worktree HEAD to `heimdall-pressure record --kind overloaded_error`,
+#   classification is the ONLY overload signal hmd has from a LIVE request
+#   (it cannot read the harness's live HTTP responses; see bin/heimdall-
+#   pressure's own header — recorded session transcripts are a DIFFERENT
+#   story, see bin/heimdall-529-scan, a separate read-only tool not wired
+#   in here). But `overloaded` (broad, for retry_now purposes — see
+#   _OVERLOAD_RE above, which intentionally also matches 429/rate-limit/
+#   "too many requests" text, mirroring bin/lib/hmd-claude-retry.sh's own
+#   bucketing) is not itself a genuine backend-distress signal: a 429 is
+#   self-inflicted and recovers on its own once THIS caller's rate drops, a
+#   529 means the backend itself is degraded — the identical distinction
+#   bin/lib/pressure_control.py's own PRESSURE_KINDS comment and
+#   bin/heimdall-529-scan's classify() both already draw independently. So
+#   the FORWARD below is gated on a second, narrower match over the SAME
+#   text — `_GENUINE_OVERLOAD_RE` (529/"overloaded"/"overloaded_error",
+#   excluding 429/rate-limit/too-many-requests) — while retry_now/attempts/
+#   backoff above stay driven by the broader `_OVERLOAD_RE` alone, unchanged.
+#   `report` forwards exactly the FIRST classification that is BOTH
+#   `overloaded` AND genuine-overload-text at a given worktree HEAD to
+#   `heimdall-pressure record --kind overloaded_error`,
 #   reusing _resume_attempts_bump's own RESUME-ATTEMPTS.json as the
 #   exactly-once marker: it fires only when the freshly-bumped `attempts`
 #   equals 1 (this HEAD was never bumped before), so a repeated `report` call
@@ -294,6 +309,16 @@ _classify_text() {
 #    bin/lib/hmd-claude-retry.sh's own _hmd_is_overload_text (529/overloaded/
 #    429/rate-limit) — same vocabulary, cited not re-derived.
 _OVERLOAD_RE='529|overloaded(_error)?|"overloaded"|too many requests|429|rate.?limit'
+# Narrower than _OVERLOAD_RE ON PURPOSE — used ONLY to gate the pressure
+# FORWARD in _record_pressure_if_fresh_overload below, never for retry_now/
+# attempts/backoff classification above (that stays on the broader
+# _OVERLOAD_RE unchanged). Deliberately excludes 429/"too many requests"/
+# rate-limit: a self-inflicted, per-caller admission-control signal, not
+# backend distress — the identical exclusion, identical reasoning, as
+# bin/lib/pressure_control.py's PRESSURE_KINDS comment and
+# bin/heimdall-529-scan's classify() (both independently exclude rate_limit/
+# 429 from counting as capacity pressure).
+_GENUINE_OVERLOAD_RE='529|overloaded(_error)?|"overloaded"'
 _NETWORK_RE='econnreset|etimedout|ehostunreach|enetunreach|epipe|connection reset|connection refused|socket hang up|network error|getaddrinfo|dns lookup failed'
 _CTXOVERFLOW_RE='prompt is too long|context window|maximum context length|context length exceeded|automatic compaction failed|too many tokens'
 
@@ -410,12 +435,16 @@ _classify_cause() {
   esac
 }
 
-# _record_pressure_if_fresh_overload <cause_json> <repo> — the ONE outbound
-# side effect this tool has: forwards an `overloaded` cause classification to
-# `heimdall-pressure record`, so the AIMD spawn-pressure controller
-# (bin/lib/pressure_control.py) sees the only overload signal hmd actually
-# has. See "OVERLOAD -> PRESSURE" in the header for the exactly-once design:
-# fires only when the cause's own `.attempts` is exactly 1 — the fresh/first
+# _record_pressure_if_fresh_overload <cause_json> <repo> <text> — the ONE
+# outbound side effect this tool has: forwards an `overloaded` cause
+# classification to `heimdall-pressure record`, so the AIMD spawn-pressure
+# controller (bin/lib/pressure_control.py) sees the only overload signal hmd
+# actually has. See "OVERLOAD -> PRESSURE" in the header for the exactly-once
+# design AND for why `cls == "overloaded"` alone is not enough: <text> (the
+# same qtext _classify_cause was given) must ALSO match _GENUINE_OVERLOAD_RE
+# — a bare 429/rate-limit death classifies `overloaded` for retry_now
+# purposes but must never reach the AIMD controller as capacity pressure.
+# Fires only when the cause's own `.attempts` is exactly 1 — the fresh/first
 # bump of _resume_attempts_bump's RESUME-ATTEMPTS.json at this worktree's
 # current HEAD — so a repeated `report` call for the SAME dead agent never
 # double-records. `attempts` is JSON null whenever there was no worktree to
@@ -429,9 +458,10 @@ _classify_cause() {
 # contractually never-fail, and its absence or failure must stay invisible to
 # every caller of `report`.
 _record_pressure_if_fresh_overload() {
-  local cause_json="$1" repo="$2" cls attempts
+  local cause_json="$1" repo="$2" text="$3" cls attempts
   cls="$(printf '%s' "$cause_json" | jq -r '.class' 2>/dev/null)"
   [ "$cls" = "overloaded" ] || return 0
+  printf '%s' "$text" | grep -qiE "$_GENUINE_OVERLOAD_RE" 2>/dev/null || return 0
   attempts="$(printf '%s' "$cause_json" | jq -r '.attempts' 2>/dev/null)"
   [ "$attempts" = "1" ] || return 0
   [ -x "$PRESSURE_BIN" ] || return 0
@@ -621,7 +651,7 @@ cmd_report() {
     qjson="$(_classify_text "$qtext")"
     qsuspected="$(printf '%s' "$qjson" | jq -r '.suspected')"
     cause="$(_classify_cause "$qtext" "$qsuspected" "$wt")"
-    _record_pressure_if_fresh_overload "$cause" "$repo"
+    _record_pressure_if_fresh_overload "$cause" "$repo" "$qtext"
 
     if [ -n "$wt" ] && _worktree_exists "$wt"; then
       brief="$(_brief_json "$wt" "$base" "$run_tests")"
