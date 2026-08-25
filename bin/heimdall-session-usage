@@ -27,15 +27,36 @@ process receiving fresh stdin — structurally cannot reach that number, and
 the one file that could bridge the gap (sentinels/hmd-statusline.py) is out
 of this tool's ownership by explicit instruction.
 
-Per that finding, this tool NEVER reports a percentage of Anthropic's real
-quota, and NEVER invents a token-count proxy dressed as one — "a hardcoded
-token guess dressed as '95% of limit' would be worse than no trigger" is the
-standard this was built to. Instead it reports an honest, OPERATOR-CONFIGURED
-CONSUMPTION ADVISORY: tokens + requests actually observed in the CURRENT
-session's own transcript within a recent window, compared against a budget
-the operator sets explicitly (HEIMDALL_SESSION_TOKEN_BUDGET). Every field
+PHASE 2 BRIDGE — 2026-08-25. sentinels/hmd-statusline.py (out of this tool's
+ownership, but its output is not) now persists an ALLOWLISTED snapshot of
+rate_limits.{five_hour,seven_day} to ~/.heimdall/rate-limits.json on every
+live statusline render (best-effort; a true no-op when rate_limits is absent
+from stdin). This tool reads that file when present AND FRESH — freshness is
+judged SOLELY by resets_at, never a fixed TTL: an observation whose
+resets_at has already passed is treated as ABSENT, never as a low reading,
+because a 5-hour window that has rolled over says nothing about the new
+window's usage. When a fresh real observation exists, verdict/percent are
+computed from it (source="real") instead of the operator budget; otherwise
+this falls back to the Phase-1 budget-consumption advisory below
+(source="budget"), unchanged. Override the read path with --rate-limit-file
+/ env HEIMDALL_RATE_LIMIT_STATE (tests use this to avoid the real global
+file; a fresh Claude Code install with no statusline render yet has no file
+there either, and falls back exactly the same way).
+
+Per that finding, this tool never INVENTS a token-count proxy dressed as
+Anthropic's real quota — "a hardcoded token guess dressed as '95% of limit'
+would be worse than no trigger" is the standard this was built to, and stays
+true. What Phase 2 above changes is narrower: when a REAL observation of
+that quota has been persisted by the statusline (not invented, not
+estimated — copied verbatim from Claude Code's own harness) and is still
+fresh, this tool reports THAT instead of a proxy. Absent a fresh real
+observation, it falls back to an honest, OPERATOR-CONFIGURED CONSUMPTION
+ADVISORY: tokens + requests actually observed in the CURRENT session's own
+transcript within a recent window, compared against a budget the operator
+sets explicitly (HEIMDALL_SESSION_TOKEN_BUDGET). Every budget-path field
 name says "budget" (operator-set), never "limit" (Anthropic-real) — the two
-are not interchangeable anywhere in this file or its output.
+are never conflated in a single field anywhere in this file's output;
+`source` always says which one produced the current verdict.
 
 FOUR VERDICT STATES, ON PURPOSE — collapsing "unknown" into either neighbor
 is exactly the failure mode this tool exists to prevent:
@@ -96,6 +117,10 @@ BUDGET_ENV = "HEIMDALL_SESSION_TOKEN_BUDGET"
 WINDOW_ENV = "HEIMDALL_SESSION_USAGE_WINDOW_SECS"
 MAXBYTES_ENV = "HEIMDALL_SESSION_USAGE_MAX_BYTES"
 THRESHOLD_ENV = "HEIMDALL_SESSION_USAGE_THRESHOLD_PCT"
+RATE_LIMIT_STATE_ENV = "HEIMDALL_RATE_LIMIT_STATE"
+
+SOURCE_REAL = "real"
+SOURCE_BUDGET = "budget"
 
 UNCONFIGURED = "unconfigured"
 UNKNOWN = "unknown"
@@ -110,12 +135,18 @@ USAGE_KEYS = (
 )
 
 NOTE = (
-    "percent_of_budget is NOT Anthropic's real usage percentage. That figure "
-    "(rate_limits.five_hour.used_percentage) is real but is only delivered "
-    "via the statusline hook's live stdin, with no CLI or on-disk access "
-    "path (verified 2026-08-25 — see module docstring). This is consumption "
-    "measured from this session's own transcript against an "
-    "OPERATOR-CONFIGURED budget, nothing more."
+    "percent_of_budget is NOT Anthropic's real usage percentage. This is "
+    "consumption measured from this session's own transcript against an "
+    "OPERATOR-CONFIGURED budget, nothing more. (No fresh real rate_limits "
+    "observation was available — see 'source' and module docstring PHASE 2.)"
+)
+
+REAL_NOTE = (
+    "percent_real IS Anthropic's real rate_limits.five_hour.used_percentage, "
+    "bridged from a live statusline render persisted to disk (see module "
+    "docstring PHASE 2) and still fresh (its resets_at has not passed). "
+    "verdict/crossed above are driven by this real figure, not the operator "
+    "budget — percent_of_budget is still reported alongside it, unchanged."
 )
 
 
@@ -299,8 +330,63 @@ def compute_verdict(measured, budget, threshold_pct):
     return (CROSSED if pct >= threshold_pct else UNDER), pct
 
 
+def _rate_limit_state_path(override):
+    """CLI flag > env > default, same precedence shape as every other option in this
+    file. Default is GLOBAL (~/.heimdall/rate-limits.json), matching
+    sentinels/hmd-statusline.py's own _rate_limit_state_path — Anthropic's rate limit
+    is an account concept, not a per-repo one."""
+    if override:
+        return override
+    env = os.environ.get(RATE_LIMIT_STATE_ENV)
+    if env:
+        return env
+    return os.path.expanduser(os.path.join("~", ".heimdall", "rate-limits.json"))
+
+
+def read_real_usage(path, now):
+    """Read a statusline-persisted rate_limits.five_hour snapshot ->
+    {"used_percentage", "resets_at", "observed_at"} or None. None covers every failure
+    mode identically (no path, unreadable, malformed JSON, not a dict, missing
+    five_hour, missing/invalid used_percentage) — this tool degrades to the budget path
+    on ANY of them, never a crash, matching the NEVER-FAILS CONTRACT above.
+
+    CRITICAL (the freshness property this bridge exists to get right): resets_at
+    missing/invalid -> None (freshness indeterminate, so treat as absent) AND
+    resets_at <= now -> None (the 5-hour window already rolled over — an EXPIRED
+    observation is ABSENT, never a low reading; surfacing a stale 3% after the window
+    reset would be a worse lie than reporting nothing). Freshness is judged SOLELY by
+    resets_at, never a fixed TTL — an observation is good for exactly as long as Claude
+    Code itself said the window would last, no more, no less.
+    """
+    if not path:
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    five = payload.get("five_hour")
+    if not isinstance(five, dict):
+        return None
+    up = five.get("used_percentage")
+    if not isinstance(up, (int, float)) or isinstance(up, bool):
+        return None
+    ra = five.get("resets_at")
+    if not isinstance(ra, (int, float)) or isinstance(ra, bool):
+        return None
+    if ra <= now:
+        return None
+    observed_at = payload.get("observed_at")
+    if not isinstance(observed_at, (int, float)) or isinstance(observed_at, bool):
+        observed_at = None
+    return {"used_percentage": float(up), "resets_at": float(ra), "observed_at": observed_at}
+
+
 def cmd_status(args):
     start = time.monotonic()
+    now_wall = time.time()
     budget = args.budget if args.budget is not None else _env_float(BUDGET_ENV, None)
     threshold = args.threshold if args.threshold is not None else _env_float(THRESHOLD_ENV, DEFAULT_THRESHOLD_PCT)
     window = args.window_secs if args.window_secs is not None else _env_int(WINDOW_ENV, DEFAULT_WINDOW_SECS)
@@ -309,16 +395,36 @@ def cmd_status(args):
     max_bytes = max(1, max_bytes)
     session_id = args.session_id or os.environ.get("CLAUDE_CODE_SESSION_ID")
 
+    rate_limit_path = _rate_limit_state_path(args.rate_limit_file)
+    real = read_real_usage(rate_limit_path, now_wall)
+
     cutoff = datetime.now(timezone.utc) - timedelta(seconds=window)
     path = args.file or resolve_transcript_path(args.repo, session_id)
     measured = measure(path, cutoff.timestamp(), max_bytes)
-    verdict, pct = compute_verdict(measured, budget, threshold)
+    budget_verdict, budget_pct = compute_verdict(measured, budget, threshold)
+
+    if real is not None:
+        source = SOURCE_REAL
+        percent_real = round(real["used_percentage"], 2)
+        verdict = CROSSED if real["used_percentage"] >= threshold else UNDER
+        note = REAL_NOTE
+    else:
+        source = SOURCE_BUDGET
+        percent_real = None
+        verdict = budget_verdict
+        note = NOTE
+
     latency_ms = round((time.monotonic() - start) * 1000, 2)
 
     result = {
         "verdict": verdict,
         "crossed": verdict == CROSSED,
-        "percent_of_budget": round(pct, 2) if pct is not None else None,
+        "source": source,
+        "percent_of_budget": round(budget_pct, 2) if budget_pct is not None else None,
+        "percent_real": percent_real,
+        "real_usage_resets_at": real["resets_at"] if real is not None else None,
+        "real_usage_observed_at": real["observed_at"] if real is not None else None,
+        "rate_limit_state_path": rate_limit_path,
         "threshold_pct": threshold,
         "budget_tokens": budget,
         "budget_configured": budget is not None and budget > 0,
@@ -334,30 +440,34 @@ def cmd_status(args):
         "window_truncated_by_byte_cap": measured["truncated"],
         "max_bytes": max_bytes,
         "latency_ms": latency_ms,
-        "note": NOTE,
+        "note": note,
     }
 
     if args.json:
         print(json.dumps(result, sort_keys=True))
     else:
-        print("heimdall-session-usage: verdict=%s" % verdict)
-        if result["budget_configured"]:
+        print("heimdall-session-usage: verdict=%s (source=%s)" % (verdict, source))
+        if source == SOURCE_REAL:
+            print("  real quota: %.2f%% of Anthropic's five-hour limit (threshold %.1f%%)" % (percent_real, threshold))
+            print("  resets_at: %s" % result["real_usage_resets_at"])
+        elif result["budget_configured"]:
             print("  budget: %s tokens (operator-configured via %s)" % (budget, BUDGET_ENV))
         else:
             print("  budget: NOT CONFIGURED (%s unset or <=0) - percentage is undefined, not zero" % BUDGET_ENV)
-        if pct is not None:
-            print("  observed: %d tokens / %d requests in last %ds (%.2f%% of budget, threshold %.1f%%)" % (
-                measured["tokens"], measured["requests"], window, pct, threshold))
-        else:
-            print("  observed: %d tokens / %d requests in last %ds (percentage undefined)" % (
-                measured["tokens"], measured["requests"], window))
-        if not measured["ok"]:
-            print("  transcript: UNREADABLE (%s)" % measured["reason"])
-        else:
-            print("  transcript: %s (%d bytes read%s)" % (
-                path, measured["bytes_read"], ", tail-truncated" if measured["truncated"] else ""))
+        if source == SOURCE_BUDGET:
+            if budget_pct is not None:
+                print("  observed: %d tokens / %d requests in last %ds (%.2f%% of budget, threshold %.1f%%)" % (
+                    measured["tokens"], measured["requests"], window, budget_pct, threshold))
+            else:
+                print("  observed: %d tokens / %d requests in last %ds (percentage undefined)" % (
+                    measured["tokens"], measured["requests"], window))
+            if not measured["ok"]:
+                print("  transcript: UNREADABLE (%s)" % measured["reason"])
+            else:
+                print("  transcript: %s (%d bytes read%s)" % (
+                    path, measured["bytes_read"], ", tail-truncated" if measured["truncated"] else ""))
         print("  latency: %.2fms" % latency_ms)
-        print("  NOTE: not Anthropic's real quota %% (inaccessible outside the live statusline hook) - operator-budget consumption only.")
+        print("  NOTE: %s" % note)
 
     return 1 if verdict == CROSSED else 0
 
@@ -398,6 +508,7 @@ def build_parser():
     s.add_argument("--threshold", type=float, default=None, help="percent-of-budget that counts as crossed (default: %.1f, env %s)" % (DEFAULT_THRESHOLD_PCT, THRESHOLD_ENV))
     s.add_argument("--window-secs", type=int, default=None, help="how far back to sum usage, in seconds (default: %d, env %s)" % (DEFAULT_WINDOW_SECS, WINDOW_ENV))
     s.add_argument("--max-bytes", type=int, default=None, help="cap on bytes read from the tail of the transcript (default: %d, env %s)" % (DEFAULT_MAX_BYTES, MAXBYTES_ENV))
+    s.add_argument("--rate-limit-file", dest="rate_limit_file", default=None, help="read a real rate_limits snapshot from this file instead of the resolved default (default: env %s, else ~/.heimdall/rate-limits.json; tests use this)" % RATE_LIMIT_STATE_ENV)
     s.add_argument("--json", action="store_true", help="emit result as one JSON object")
     s.set_defaults(fn=cmd_status)
 

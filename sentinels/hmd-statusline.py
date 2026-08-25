@@ -1001,6 +1001,77 @@ def five_hour_pct(data):
         return None
     return v
 
+# ── rate-limit persistence (best-effort bridge for bin/heimdall-session-usage) ──
+# Claude Code's own harness-computed rate_limits.{five_hour,seven_day} arrive ONLY on
+# THIS hook's live stdin (see bin/heimdall-session-usage's module docstring, PHASE 1
+# FINDING — no CLI/`/usage` equivalent, no on-disk cache). This statusline process is
+# therefore the only code in the repo that ever sees them, so it persists an
+# ALLOWLISTED snapshot to disk, letting a standalone CLI invocation read a recent
+# observation instead of nothing. Never a blanket stdin dump (stdin can carry
+# transcript/session content) — ONLY the two numeric rate-limit fields per window plus
+# an observation timestamp. Best-effort: wrapped so a failure here can NEVER slow or
+# break what renders (matches this module's own NEVER-FAILS contract: always exits 0,
+# never writes stderr).
+RATE_LIMIT_STATE_ENV = "HEIMDALL_RATE_LIMIT_STATE"
+
+def _rate_limit_state_path():
+    """GLOBAL by default (~/.heimdall/rate-limits.json) — Anthropic's rate limit is an
+    account/session concept, not a per-repo one, so (unlike HEIMDALL_STATE's cwd-scoped
+    default two lines above main()) this must NOT default under the stdin cwd: a
+    developer's quota is shared across every repo/worktree at once.
+    HEIMDALL_RATE_LIMIT_STATE overrides for tests/power users."""
+    override = os.environ.get(RATE_LIMIT_STATE_ENV)
+    if override:
+        return override
+    return os.path.expanduser(os.path.join("~", ".heimdall", "rate-limits.json"))
+
+def _window_snapshot(data, window):
+    """rate_limits.<window>.{used_percentage,resets_at} -> {"used_percentage": float,
+    "resets_at": float} or None. resets_at is OPTIONAL (seven_day does not always carry
+    one) but used_percentage is required — mirrors five_hour_pct's own null-safety
+    exactly, never fabricates a value for either key."""
+    rl = data.get("rate_limits")
+    if not isinstance(rl, dict):
+        return None
+    w = rl.get(window)
+    if not isinstance(w, dict):
+        return None
+    up = w.get("used_percentage")
+    if not isinstance(up, (int, float)) or isinstance(up, bool):
+        return None
+    snap = {"used_percentage": float(up)}
+    ra = w.get("resets_at")
+    if isinstance(ra, (int, float)) and not isinstance(ra, bool):
+        snap["resets_at"] = float(ra)
+    return snap
+
+def persist_rate_limits(data, now):
+    """Best-effort, allowlist-only persist of rate_limits to disk. Writes NOTHING when
+    both windows are absent — a run with no rate_limits in stdin is a true no-op,
+    silent and harmless. Never raises: ANY failure (permissions, disk full, a race with
+    another concurrent render) is swallowed via contextlib.suppress — the same idiom
+    this module's own top-level fallback already uses — so the render path is never
+    affected. Called before all rendering in main(); must never be able to slow or
+    break what the operator sees."""
+    with contextlib.suppress(Exception):
+        five = _window_snapshot(data, "five_hour")
+        seven = _window_snapshot(data, "seven_day")
+        if five is None and seven is None:
+            return
+        payload = {"observed_at": now}
+        if five is not None:
+            payload["five_hour"] = five
+        if seven is not None:
+            payload["seven_day"] = seven
+        path = _rate_limit_state_path()
+        d = os.path.dirname(path)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        tmp = path + ".%d.tmp" % os.getpid()
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(json.dumps(payload, sort_keys=True))
+        os.replace(tmp, path)
+
 def _team_hue(seed, sigil):
     """A '#rrggbb' recolor hue for a teammate's cluster sigil: the entry's OWN sigil hex
     if it carries a valid one, else the seed's VIVID sigil accent (sigil_accent_color — the
@@ -1988,6 +2059,8 @@ def main():
     if data is None:
         _fallback(cols)
         return
+
+    persist_rate_limits(data, float(os.environ.get("HMD_NOW") or time.time()))
 
     ws = data.get("workspace") or {}
     cwd = ws.get("current_dir") or data.get("cwd") or os.getcwd()

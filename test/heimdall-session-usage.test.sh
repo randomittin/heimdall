@@ -34,6 +34,10 @@ bad() { FAIL=$((FAIL+1)); echo "FAIL: $1"; }
 
 # never let a real running session / a real operator budget leak into these tests
 unset CLAUDE_CODE_SESSION_ID HEIMDALL_SESSION_TOKEN_BUDGET HEIMDALL_SESSION_USAGE_THRESHOLD_PCT HEIMDALL_SESSION_USAGE_WINDOW_SECS HEIMDALL_SESSION_USAGE_MAX_BYTES
+# never let a real developer's real ~/.heimdall/rate-limits.json (persisted by a live
+# statusline render elsewhere on this machine) leak into cases 1-15, which never pass
+# --rate-limit-file and must all stay on the pre-Phase-2 budget path exactly as before.
+export HEIMDALL_RATE_LIMIT_STATE="$WORK/unused-rate-limits.json"
 
 now_ts() {
   python3 -c "from datetime import datetime, timezone; print(datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000Z'))"
@@ -179,6 +183,39 @@ if [ "$rc_under" -eq 0 ] && [ "$rc_unknown" -eq 0 ] && [ "$rc_unconf" -eq 0 ] &&
 else
   bad "case15 under=$rc_under unknown=$rc_unknown unconf=$rc_unconf crossed=$rc_crossed"
 fi
+
+echo "=== 16. fresh real rate-limit snapshot -> source=real, correct verdict ==="
+d=$(case_dir c16); f="$d/t.jsonl"; rl="$d/rate-limits.json"
+usage_line "$(now_ts)" 10 10 > "$f"
+python3 -c "
+import json, time
+json.dump({'observed_at': time.time(), 'five_hour': {'used_percentage': 97.5, 'resets_at': time.time() + 3600}}, open('$rl', 'w'))
+"
+out=$(python3 "$BIN" status --file "$f" --rate-limit-file "$rl" --budget 1000000 --json); rc=$?
+if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q '"source": "real"' && printf '%s' "$out" | grep -q '"percent_real": 97.5' && printf '%s' "$out" | grep -q '"verdict": "crossed"'; then ok; else bad "case16 rc=$rc out=$out"; fi
+
+echo "=== 17. EXPIRED real snapshot (low %) must NOT mask a crossed budget verdict — expired is ABSENT, never a low reading ==="
+d=$(case_dir c17); f="$d/t.jsonl"; rl="$d/rate-limits.json"
+usage_line "$(now_ts)" 900 60 > "$f"   # 960/1000 = 96% of budget -> crossed
+python3 -c "
+import json, time
+json.dump({'observed_at': time.time() - 7200, 'five_hour': {'used_percentage': 3.0, 'resets_at': time.time() - 60}}, open('$rl', 'w'))
+"
+out=$(python3 "$BIN" status --file "$f" --rate-limit-file "$rl" --budget 1000 --json); rc=$?
+if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q '"source": "budget"' && printf '%s' "$out" | grep -q '"percent_real": null' && printf '%s' "$out" | grep -q '"verdict": "crossed"'; then ok; else bad "case17 rc=$rc out=$out"; fi
+
+echo "=== 18. absent rate-limit file -> budget fallback, percent_real null ==="
+d=$(case_dir c18); f="$d/t.jsonl"
+usage_line "$(now_ts)" 100 50 > "$f"
+out=$(python3 "$BIN" status --file "$f" --rate-limit-file "$d/does-not-exist.json" --budget 1000 --json); rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q '"source": "budget"' && printf '%s' "$out" | grep -q '"percent_real": null' && printf '%s' "$out" | grep -q '"verdict": "under"'; then ok; else bad "case18 rc=$rc out=$out"; fi
+
+echo "=== 19. malformed rate-limit file never crashes -> budget fallback, valid JSON ==="
+d=$(case_dir c19); f="$d/t.jsonl"; rl="$d/rate-limits.json"
+usage_line "$(now_ts)" 100 50 > "$f"
+printf 'not json {{{' > "$rl"
+out=$(python3 "$BIN" status --file "$f" --rate-limit-file "$rl" --budget 1000 --json); rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | python3 -c "import json,sys; json.load(sys.stdin)" 2>/dev/null && printf '%s' "$out" | grep -q '"source": "budget"'; then ok; else bad "case19 rc=$rc out=$out"; fi
 
 echo ""
 echo "RESULT: $PASS passed, $FAIL failed"
