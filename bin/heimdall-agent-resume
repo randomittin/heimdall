@@ -145,9 +145,31 @@
 #   re-running it) sees attempts>=2 and is skipped — one death, one event,
 #   never more. A real NEW death after forward progress (a fresh commit
 #   resets attempts to 1 — see BOUNDED RETRY above) legitimately records
-#   again, because it IS a new overload observation. `network` is
-#   deliberately NOT wired the same way here (out of scope for this change;
-#   it would need its own exactly-once marker). Fire-and-forget: heimdall-
+#   again, because it IS a new overload observation. `network` STAYS
+#   unwired too — but not for the reason once given here ("it would need
+#   its own exactly-once marker": wrong, corrected below). The marker above
+#   needs no new field to also serve `network`: one _classify_cause call
+#   yields exactly one class, so a `cls == "network" && attempts == "1"`
+#   gate would key off this SAME RESUME-ATTEMPTS.json marker without ever
+#   colliding with the `overloaded` gate for the same death. The real
+#   reason is signal quality, checked directly against
+#   bin/lib/pressure_control.py: connection_reset and overloaded_error feed
+#   the IDENTICAL AIMD window/threshold with no per-kind weighting (see its
+#   record_event()). But where _OVERLOAD_RE (529/429/"overloaded") is
+#   obtainable ONLY from a completed HTTP round-trip where the remote
+#   server itself signals distress, _NETWORK_RE (econnreset/etimedout/
+#   epipe/getaddrinfo/dns lookup failed/...) is exactly what the
+#   OPERATOR's own wifi/VPN/laptop-sleep/local DNS resolver produces, with
+#   no server involvement at all. hmd spawns up to 10 agents from ONE
+#   machine over ONE shared network link, so a single local blip is
+#   trivially likely to hit 3+ concurrent agents AT ONCE — satisfying
+#   threshold()'s breach "for real" while carrying zero actual
+#   API-capacity signal. That inverts what threshold=3 is meant to filter
+#   (pressure_control.py's own docstring: real pressure correlates because
+#   agents share a remote backend, not a local link) — a spurious throttle
+#   off one wifi drop is worse than no signal, so `network` stays unwired
+#   on purpose; see test/heimdall-agent-resume-pressure.test.sh for the
+#   regression proof this cannot quietly flip. Fire-and-forget: heimdall-
 #   pressure is contractually never-fail and is never called with --strict,
 #   so its absence or failure can never change this tool's own exit code or
 #   `.cause` output shape.

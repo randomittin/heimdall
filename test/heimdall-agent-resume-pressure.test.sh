@@ -18,10 +18,17 @@
 #   2. CAUSE-GATED, NOT DEATH-GATED. A `task-failure`/`unknown` death (a real
 #      bug, not transient pressure) must record NOTHING — this hook fires on
 #      the classification, never on the mere fact that an agent died.
-#   3. `network` STAYS UNWIRED (deliberately out of scope for this change,
-#      see bin/heimdall-agent-resume's own header) — a `connection_reset`-
-#      shaped classification must ALSO record nothing, proving this isn't
-#      secretly keying off "any transient cause".
+#   3. `network` STAYS UNWIRED, ON PURPOSE — not a deferral but a signal-
+#      quality decision (full evidence in bin/heimdall-agent-resume's own
+#      header: connection_reset and overloaded_error share one unweighted
+#      AIMD window, but a network death routinely means the OPERATOR's own
+#      link dropped — not that the API is pressured — and hmd's own
+#      concurrent agents all share that one local link). A
+#      `connection_reset`-shaped classification must record nothing,
+#      checked below at BOTH the no-worktree case and the exact
+#      attempts==1 boundary the overload path itself fires on — proving
+#      this isn't secretly keying off "any transient cause" and cannot
+#      quietly regress.
 #   4. NEVER LOAD-BEARING. heimdall-pressure absent or actively failing must
 #      never change heimdall-agent-resume's own exit code or `.cause` shape —
 #      a telemetry integration must never become a new way for `report` to
@@ -247,7 +254,8 @@ RC="$("$AR" report --json --repo "$REPO" --id "$R_FAIL" 2>/dev/null)"
   && ok "(c) FALSIFIER: a task-failure/unknown death records NOTHING — no pressure state file created at all" \
   || bad "(c) FALSIFIER FAILED: a task-failure death created pressure state: $(cat "$(state_file)" 2>/dev/null)"
 
-# ── bonus: network stays deliberately unwired (out of scope for this change) ──
+# ── network, part 1/2: no-worktree case — deliberately unwired ON PURPOSE
+# (signal quality, not scope; see bin/heimdall-agent-resume's own header) ──
 export HOME; HOME="$WORK/home-net"
 R_NET="arpressnet00000003"
 mk_agent "$R_NET" 10
@@ -259,6 +267,29 @@ RN="$("$AR" report --json --repo "$REPO" --id "$R_NET" 2>/dev/null)"
 [ ! -f "$(state_file)" ] \
   && ok "network cause stays deliberately unwired: no pressure event recorded" \
   || bad "GUARD BROKEN: a network cause recorded a pressure event — network was supposed to stay unwired"
+
+# ── network, part 2/2, THE STRONG CASE: a REAL worktree, freshly bumped to
+# the EXACT attempts==1 boundary _record_pressure_if_fresh_overload treats
+# as "fire" for `overloaded`. This is the boundary a future "just add
+# network here too" patch would most plausibly get wrong — proving the
+# guard holds even under the identical condition that fires the overload
+# path, not just the weaker no-worktree/attempts=null case above. ─────────
+export HOME; HOME="$WORK/home-net-real"
+WT_NET="$WORK/wt-network-real"
+mk_worktree "$WT_NET" "worktree-agent-rnetreal"
+R_NETREAL="arpressnetreal000006"
+mk_agent_wt "$R_NETREAL" 10 "$WT_NET" "worktree-agent-rnetreal" "Pressure fixture network-real"
+mk_notif2 "$R_NETREAL" killed "$NETWORK_TEXT"
+RNR="$("$AR" report --json --repo "$REPO" --id "$R_NETREAL" 2>/dev/null)"
+[ "$(printf '%s' "$RNR" | jq -r '.[0].cause.class')" = "network" ] \
+  && ok "network+real-worktree fixture classifies as network" \
+  || bad "expected cause.class=network, got $(printf '%s' "$RNR" | jq -c '.[0].cause')"
+[ "$(printf '%s' "$RNR" | jq -r '.[0].cause.attempts')" = "1" ] \
+  && ok "network+real-worktree: attempts=1 — the EXACT boundary that fires the overloaded path" \
+  || bad "expected cause.attempts=1, got $(printf '%s' "$RNR" | jq -r '.[0].cause.attempts')"
+[ ! -f "$(state_file)" ] \
+  && ok "FALSIFIER: network at attempts=1 (the overload path's own fire condition) still records nothing" \
+  || bad "GUARD BROKEN: network at attempts=1 recorded a pressure event — network must stay unwired even at the fire boundary"
 
 # ═════════════════════════════════════════════════════════════════════════
 # (d) NEVER LOAD-BEARING: heimdall-pressure absent, then actively failing —
