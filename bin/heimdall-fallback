@@ -9,14 +9,18 @@ opts in -- route work to a locally-hosted OmniRoute gateway using the
 OPERATOR'S OWN third-party API keys. See
 docs/analysis/2026-08-23-omniroute-assessment.md for the full risk analysis
 (verdict: do NOT integrate directly; every constraint below is sourced from
-that doc, none invented here).
+that doc, none invented here). The Tier-1 boundary specifically is enforced
+per docs/analysis/2026-08-25-omniroute-credential-isolation.md's positive-
+verification design (see run_preflight): there is no config flag anywhere in
+OmniRoute that disables Tier-1, so this tool verifies the real structural
+control -- credential ABSENCE -- instead of trusting a self-attested boolean.
 
 THIS TOOL IS POLICY ONLY. It computes state, config, and the safety-gate
 verdict. It does NOT implement transport -- it never calls OmniRoute, never
 rewrites a request, never speaks to anything but its own local reachability
-probe. The seam a future transport layer must consult is `check`'s exit
-code. Nothing else in this repo may treat "the operator flipped a config
-flag" as license to skip this gate.
+probe and OmniRoute's own SQLite DB (read-only). The seam a future transport
+layer must consult is `check`'s exit code. Nothing else in this repo may
+treat "the operator flipped a config flag" as license to skip this gate.
 
 THE SAFETY BOUNDARY (mirrors bin/heimdall-quota-advisor's own header -- that
 tool prints options for a human; this one gates an unattended fallback, same
@@ -25,9 +29,35 @@ boundary from a different angle):
      Subscription (Claude Code, Codex, Copilot)" mode -- it repurposes a
      Claude Code / Codex / Copilot subscription's own auth as a backend for
      arbitrary routed traffic (assessment doc, "Tier 1 Subscription"
-     section). If this tool cannot POSITIVELY verify Tier-1 is disabled, it
-     REFUSES. Fail closed here specifically: refusing is always safer than
-     proceeding on an unknown.
+     section). There is no config flag that disables Tier-1 -- none exists in
+     OmniRoute to positively verify (docs/analysis/2026-08-25-omniroute-
+     credential-isolation.md, S6) -- so this tool instead positively verifies
+     the actual structural control, credential ABSENCE, across four
+     independent checks, ALL required, none short-circuiting another:
+       a. tier1_credential_absent -- no `provider_connections` row for
+          provider 'claude' or 'claude-web' in OmniRoute's own SQLite DB (the
+          real gate; S2-S3). An absent or unreadable DB is NOT a pass -- it
+          is a FAIL, because absence-of-evidence is not evidence-of-absence
+          for an externally-owned database this tool does not control.
+       b. anthropic_model_pinned -- ANTHROPIC_MODEL must be set AND carry an
+          explicit `provider/` prefix. Claude Code emits bare `claude-*` ids
+          when this is unset, and OmniRoute has an explicit routing branch
+          that matches a bare `claude-*` id to provider `claude` (S5). The
+          pin is the second line of defense behind (a), never a substitute
+          for it.
+       c. prefer_claude_code_flag_off --
+          OMNIROUTE_PREFER_CLAUDE_CODE_FOR_UNPREFIXED_CLAUDE_MODELS must stay
+          unset/false. Default is false; this is a Tier-1 WIDENING knob, the
+          opposite polarity from what an operator would expect of a variable
+          with "prefer" in its name (S3, "must not do" #6).
+       d. no_delegated_sidecar -- no delegated sidecar (CLIProxyAPI, or
+          Dario -- OmniRoute's own source names it a "Claude-subscription
+          proxy") may be installed. A `mode: "cliproxyapi"` connection can
+          reach a Claude subscription while OmniRoute's own DB holds no
+          Tier-1 token at all, which would make check (a) alone insufficient
+          (S1a path 8, residual risk 2).
+     Fail closed on all four: refusing is always safer than proceeding on an
+     unknown.
   2. NEVER enable OmniRoute's opt-in root-CA MITM ("TPROXY") decrypt mode. A
      config that mentions it in any form (see FORBIDDEN_CONFIG_KEYS) is
      treated as corrupt and forced back to state=off.
@@ -52,6 +82,14 @@ boundary from a different angle):
   6. `off` is the default for a fresh install AND for any absent or corrupt
      config. A corrupt config must never be silently read as `on` -- see
      load_config()'s fail-closed parse.
+  7. NEVER treat OmniRoute's `blockedProviders` setting as evidence of
+     anything. Its own UI copy is "Hide specific providers from the
+     /v1/models response" -- it is consulted only in model-listing/search
+     paths and is never read by getProviderCredentials() (S3 point 1, S6). A
+     same-named key placed in THIS tool's own config is already dropped
+     silently by load_config()'s allowlist copy; cmd_check additionally
+     warns on stderr if it finds one, so that silence is never mistaken for
+     the field having done something.
 
 MUST FAIL CLOSED -- the deliberate inverse of heimdall-quota-advisor's "MUST
 FAIL OPEN". The advisor's job is to never cry wolf: an uncertain exhaustion
@@ -102,7 +140,13 @@ field below defaults to the safe value:
                                             # OWN OmniRoute/provider key -- never a value
     "endpoint": "http://127.0.0.1:20128",  # must resolve local; OmniRoute's documented
                                             # default self-hosted gateway port
-    "tier1_disabled": false,               # must be literal `true` to pass preflight
+    "omniroute_db_path": "",               # path to OmniRoute's own SQLite DB; empty ->
+                                            # $DATA_DIR/storage.sqlite or ~/.omniroute/
+                                            # storage.sqlite (positive Tier-1 credential
+                                            # check -- see header point 1a)
+    "cliproxyapi_dir": "",                 # path to CLIProxyAPI's config dir; empty ->
+                                            # $CLIPROXYAPI_CONFIG_DIR or ~/.cli-proxy-api
+                                            # (delegated-sidecar check -- header point 1d)
     "target_provider": "",                 # provider name; checked against the deny list
     "tos_flagged_providers": []            # operator ADDITIONS to the built-in deny
                                             # list only -- can never remove a built-in
@@ -126,6 +170,7 @@ import ipaddress
 import json
 import os
 import socket
+import sqlite3
 import sys
 import urllib.parse
 
@@ -137,7 +182,8 @@ DEFAULT_CFG = {
     "state": "off",
     "operator_key_env": "",
     "endpoint": "http://127.0.0.1:20128",
-    "tier1_disabled": False,
+    "omniroute_db_path": "",
+    "cliproxyapi_dir": "",
     "target_provider": "",
     "tos_flagged_providers": [],
 }
@@ -169,6 +215,24 @@ FORBIDDEN_CONFIG_KEYS = frozenset({
 FORBIDDEN_KEY_ENV_MARKERS = ("ANTHROPIC", "CLAUDE")
 
 LOCAL_HOSTNAMES = frozenset({"localhost", "127.0.0.1", "::1"})
+
+# Tier-1 subscription providers in OmniRoute's own provider_connections table
+# -- docs/analysis/2026-08-25-omniroute-credential-isolation.md S3's sweep
+# list narrowed to the two that are the SAME Anthropic account (Claude Code
+# OAuth and a claude.ai session cookie respectively). See header point 1a.
+TIER1_DB_PROVIDERS = ("claude", "claude-web")
+
+# A provider_connections row in this mode routes through a delegated sidecar
+# (CLIProxyAPI) using its own dedicated key -- OmniRoute itself can hold zero
+# Tier-1 tokens while this is still true. See header point 1d, audit S1a
+# path 8 and residual risk 2.
+SIDECAR_CONNECTION_MODE = "cliproxyapi"
+
+# Values that count as "the widening flag is off" for
+# OMNIROUTE_PREFER_CLAUDE_CODE_FOR_UNPREFIXED_CLAUDE_MODELS -- unset and
+# every common falsy spelling. Anything else (including "1", "true", "yes")
+# fails the check. See header point 1c.
+_ENV_FLAG_OFF_VALUES = frozenset({"", "0", "false", "no", "off"})
 
 
 class Rejected(Exception):
@@ -211,13 +275,11 @@ def load_config(repo):
             cfg[key] = raw[key]
     if cfg.get("state") not in VALID_STATES:
         cfg["state"] = "off"
-    if not isinstance(cfg.get("tier1_disabled"), bool):
-        cfg["tier1_disabled"] = False
     if isinstance(cfg.get("tos_flagged_providers"), list):
         cfg["tos_flagged_providers"] = [p for p in cfg["tos_flagged_providers"] if isinstance(p, str)]
     else:
         cfg["tos_flagged_providers"] = []
-    for key in ("operator_key_env", "endpoint", "target_provider"):
+    for key in ("operator_key_env", "endpoint", "target_provider", "omniroute_db_path", "cliproxyapi_dir"):
         if not isinstance(cfg.get(key), str):
             cfg[key] = DEFAULT_CFG[key]
     return cfg, None
@@ -269,6 +331,94 @@ def _endpoint_reachable(endpoint):
         return False
 
 
+def _resolve_omniroute_db_path(cfg):
+    """Where to find OmniRoute's own SQLite DB for the credential-absence
+    check (docs/analysis/2026-08-25-omniroute-credential-isolation.md S3).
+    Priority: explicit cfg field -> DATA_DIR env var (OmniRoute's own
+    override, src/lib/dataPaths.ts) -> the documented default ~/.omniroute.
+    XDG_CONFIG_HOME is a second documented override but its exact path-join
+    semantics are not confirmed in the audit, so it is deliberately not
+    replicated here -- an unresolved limitation, not a silent guess."""
+    configured = cfg.get("omniroute_db_path") or ""
+    if configured:
+        return os.path.expanduser(configured)
+    data_dir = os.environ.get("DATA_DIR") or ""
+    if data_dir:
+        return os.path.join(os.path.expanduser(data_dir), "storage.sqlite")
+    return os.path.expanduser(os.path.join("~", ".omniroute", "storage.sqlite"))
+
+
+def _resolve_cliproxyapi_dir(cfg):
+    """Where CLIProxyAPI's own config directory would live if installed --
+    the one real filesystem->Claude-credential route (audit S1a, path 8).
+    Priority mirrors CLIProxyAPI's own resolution order exactly: cfg field ->
+    CLIPROXYAPI_CONFIG_DIR env var -> ~/.cli-proxy-api default (quoted
+    verbatim from OmniRoute's own cliProxyConfigDir())."""
+    configured = cfg.get("cliproxyapi_dir") or ""
+    if configured:
+        return os.path.expanduser(configured)
+    env_dir = os.environ.get("CLIPROXYAPI_CONFIG_DIR") or ""
+    if env_dir:
+        return os.path.expanduser(env_dir)
+    return os.path.expanduser(os.path.join("~", ".cli-proxy-api"))
+
+
+def _open_omniroute_db_ro(path):
+    """Open OmniRoute's SQLite DB strictly read-only via a URI connection --
+    this tool must never create or mutate the operator's real database, not
+    even by the accidental create-if-missing default of sqlite3.connect()."""
+    uri = "file:%s?mode=ro" % urllib.parse.quote(path)
+    return sqlite3.connect(uri, uri=True, timeout=1.0)
+
+
+def _query_omniroute(path, sql, params=()):
+    """Run one read-only query against the OmniRoute DB. Returns (rows,
+    error) -- error is None on success, and rows is None whenever error is
+    set. A failed connect (e.g. not a SQLite file at all) and a failed
+    execute (e.g. a missing table/column) collapse to this same shape --
+    callers must always fail closed on error, never treat None rows as an
+    empty result."""
+    try:
+        conn = _open_omniroute_db_ro(path)
+    except sqlite3.Error as exc:
+        return None, str(exc)
+    try:
+        rows = conn.execute(sql, params).fetchall()
+        return rows, None
+    except sqlite3.Error as exc:
+        return None, str(exc)
+    finally:
+        conn.close()
+
+
+def _blocked_providers_note(repo):
+    """blockedProviders is an OmniRoute DASHBOARD setting that hides a
+    provider from /v1/models -- it is NEVER consulted by
+    getProviderCredentials() and never stops routing (docs/analysis/2026-08-
+    25-omniroute-credential-isolation.md S3, S6). If an operator has placed a
+    same-named key in THIS tool's own config -- most plausibly believing it
+    acts as a kill switch here -- load_config()'s allowlist copy already
+    drops it silently (it is not a DEFAULT_CFG key); this returns a warning
+    string so that silence is never mistaken for the field having done
+    something. See header point 7."""
+    path = _cfg_path(repo)
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    for key in ("blockedProviders", "blocked_providers"):
+        if key in raw:
+            return (
+                "config key '%s' is set but is never evidence of anything here -- it "
+                "only hides a provider from OmniRoute's /v1/models listing and is not "
+                "consulted by credential resolution; it has been ignored" % key
+            )
+    return None
+
+
 def run_preflight(cfg):
     """Every gated check runs and reports independently, in a fixed order --
     a failure at 3am names exactly what to fix, never just "preflight
@@ -314,14 +464,108 @@ def run_preflight(cfg):
         reachable_reason = "skipped -- endpoint is not local (see endpoint_local)"
     checks.append(("endpoint_reachable", reachable_ok, reachable_reason))
 
-    tier1_ok = cfg.get("tier1_disabled") is True
+    # -- Tier-1 credential-absence + delegated-sidecar-in-DB share one DB open
+    # (docs/analysis/2026-08-25-omniroute-credential-isolation.md S3/S6; see
+    # header point 1a/1d). Absent or unreadable DB is a FAIL for BOTH, never
+    # a silent pass -- see header point 1.
+    db_path = _resolve_omniroute_db_path(cfg)
+    if not os.path.exists(db_path):
+        tier1_ok = False
+        tier1_reason = (
+            "OmniRoute DB not found at '%s' -- absence is not proof of an empty "
+            "table, so this refuses rather than passing an unverifiable check "
+            "(docs/analysis/2026-08-25-omniroute-credential-isolation.md S3)" % db_path
+        )
+        sidecar_db_ok = False
+        sidecar_db_reason = (
+            "OmniRoute DB not found at '%s' -- cannot query for a cliproxyapi-mode "
+            "connection row, so a delegated sidecar cannot be ruled out" % db_path
+        )
+    else:
+        provider_rows, provider_err = _query_omniroute(
+            db_path,
+            "SELECT DISTINCT provider FROM provider_connections WHERE provider IN (?, ?)",
+            TIER1_DB_PROVIDERS,
+        )
+        if provider_err is not None:
+            tier1_ok = False
+            tier1_reason = (
+                "OmniRoute DB at '%s' is unreadable or malformed (%s) -- an unreadable "
+                "DB can never positively verify credential absence" % (db_path, provider_err)
+            )
+        elif provider_rows:
+            found = ", ".join(sorted(row[0] for row in provider_rows))
+            tier1_ok = False
+            tier1_reason = (
+                "OmniRoute DB has an active Tier-1 provider_connections row (%s) -- "
+                "Tier-1 repurposes that credential as a routed backend" % found
+            )
+        else:
+            tier1_ok = True
+            tier1_reason = ""
+
+        mode_rows, mode_err = _query_omniroute(
+            db_path,
+            "SELECT COUNT(*) FROM provider_connections WHERE mode = ?",
+            (SIDECAR_CONNECTION_MODE,),
+        )
+        if mode_err is not None:
+            sidecar_db_ok = False
+            sidecar_db_reason = (
+                "OmniRoute DB at '%s' could not be queried for a delegated-sidecar "
+                "connection (%s) -- cannot positively rule one out" % (db_path, mode_err)
+            )
+        elif mode_rows and mode_rows[0][0] > 0:
+            sidecar_db_ok = False
+            sidecar_db_reason = (
+                "OmniRoute DB has %d connection(s) in '%s' mode -- a delegated sidecar can "
+                "hold a Claude credential independently of OmniRoute's own token storage"
+                % (mode_rows[0][0], SIDECAR_CONNECTION_MODE)
+            )
+        else:
+            sidecar_db_ok = True
+            sidecar_db_reason = ""
+
+    checks.append(("tier1_credential_absent", tier1_ok, tier1_reason))
+
+    anthropic_model = os.environ.get("ANTHROPIC_MODEL") or ""
+    if not anthropic_model:
+        checks.append((
+            "anthropic_model_pinned", False,
+            "ANTHROPIC_MODEL is not set -- Claude Code emits bare claude-* model IDs by "
+            "default, which OmniRoute has an explicit branch to route to provider 'claude' "
+            "if a connection exists (docs/analysis/2026-08-25-omniroute-credential-"
+            "isolation.md S5)",
+        ))
+    elif "/" not in anthropic_model:
+        checks.append((
+            "anthropic_model_pinned", False,
+            "ANTHROPIC_MODEL='%s' has no explicit provider/ prefix -- an unprefixed id is "
+            "exactly the bare form OmniRoute's routing branch matches" % anthropic_model,
+        ))
+    else:
+        checks.append(("anthropic_model_pinned", True, ""))
+
+    prefer_flag = os.environ.get("OMNIROUTE_PREFER_CLAUDE_CODE_FOR_UNPREFIXED_CLAUDE_MODELS") or ""
+    prefer_off = prefer_flag.strip().lower() in _ENV_FLAG_OFF_VALUES
     checks.append((
-        "tier1_disabled", tier1_ok,
-        "" if tier1_ok else
-        "Tier-1 Subscription mode is not POSITIVELY verified disabled -- refusing per "
-        "docs/analysis/2026-08-23-omniroute-assessment.md (Tier-1 repurposes Claude "
-        "Code/Codex/Copilot auth as a routed backend)",
+        "prefer_claude_code_flag_off", prefer_off,
+        "" if prefer_off else
+        "OMNIROUTE_PREFER_CLAUDE_CODE_FOR_UNPREFIXED_CLAUDE_MODELS='%s' -- this is a Tier-1 "
+        "WIDENING knob (opposite polarity from what an operator would expect), default "
+        "false, must stay off" % prefer_flag,
     ))
+
+    sidecar_dir = _resolve_cliproxyapi_dir(cfg)
+    if os.path.exists(sidecar_dir):
+        checks.append((
+            "no_delegated_sidecar", False,
+            "CLIProxyAPI directory exists at '%s' -- a delegated sidecar (CLIProxyAPI or "
+            "Dario, OmniRoute's own 'Claude-subscription proxy') can hold a Claude "
+            "credential independently of OmniRoute's own DB state" % sidecar_dir,
+        ))
+    else:
+        checks.append(("no_delegated_sidecar", sidecar_db_ok, sidecar_db_reason))
 
     provider = (cfg.get("target_provider") or "").strip().lower()
     deny = BUILTIN_TOS_FLAGGED_PROVIDERS | {p.strip().lower() for p in cfg.get("tos_flagged_providers", [])}
@@ -406,6 +650,9 @@ def cmd_check(args):
             print("  (state=auto: preflight failed -> waiting rather than routing blind)")
         elif verdict == "REFUSE" and cfg["state"] != "off":
             print("  (state=%s but a required check failed -> refusing rather than proceeding unsafely)" % cfg["state"])
+        note = _blocked_providers_note(args.repo)
+        if note:
+            sys.stderr.write("heimdall-fallback check: WARNING: %s\n" % note)
         return rc
     except Exception as exc:
         # check() must fail CLOSED. Any internal error is indistinguishable
