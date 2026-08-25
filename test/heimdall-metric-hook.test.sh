@@ -323,6 +323,95 @@ RC_NOBIN=0
 ( cd "$NOPLUGIN_SANDBOX" && export CLAUDE_PLUGIN_ROOT="$NOPLUGIN_SANDBOX"; printf '%s' "$PAYLOAD" | bash "$HOOK_CMD_FILE" >/dev/null 2>&1 ) || RC_NOBIN=$?
 [ "$RC_NOBIN" -eq 0 ] && ok "missing heimdall-metric-hook binary at CLAUDE_PLUGIN_ROOT exits 0 (fail-open)" || bad "missing-binary case exited $RC_NOBIN, expected 0"
 
+# --- 9. outcome derived from agent_transcript_path — conservative, fail-only -
+# Fixture transcripts are CONSTRUCTED here, never real operator transcripts:
+# real ones are non-reproducible and could leak session content (same rule
+# bin/heimdall-529-scan's own test suite follows). Shape grounded in
+# docs/analysis/2026-08-25-hook-delivery-spike.md (Finding 2's confirmed
+# "Exit code 137" tool_result) and docs/analysis/2026-08-25-transcript-529-
+# detection.md (structural-field-over-prose methodology).
+TRANSCRIPTS="$SANDBOX/transcripts"
+mkdir -p "$TRANSCRIPTS"
+
+KILLED_TRANSCRIPT="$TRANSCRIPTS/killed.jsonl"
+cat > "$KILLED_TRANSCRIPT" <<'EOF'
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"sleep 240"}}]}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"Exit code 137","is_error":true}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"DONE"}]}}
+EOF
+
+CLEAN_TRANSCRIPT="$TRANSCRIPTS/clean.jsonl"
+cat > "$CLEAN_TRANSCRIPT" <<'EOF'
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_2","name":"Bash","input":{"command":"ls"}}]}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_2","content":"file1.txt\nfile2.txt","is_error":false}]}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_3","content":"Exit code 1","is_error":true}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"DONE. All good."}]}}
+EOF
+
+MALFORMED_TRANSCRIPT="$TRANSCRIPTS/malformed.jsonl"
+printf 'not json at all {{{\nrandom garbage line\n' > "$MALFORMED_TRANSCRIPT"
+
+# (a) FALSIFIABILITY PROOF: a killed-tool transcript must never yield
+# outcome=pass — and since the marker is unambiguous, must yield the honest
+# outcome=fail rather than leaving it to chance which side of "not pass" it's on.
+BEFORE=$(lines_now)
+PAYLOAD=$(jq -cn --arg tp "$KILLED_TRANSCRIPT" '{agent_type:"coder", last_assistant_message:"DONE", agent_transcript_path:$tp}')
+run_hook "$PAYLOAD"
+AFTER=$(lines_now)
+if [ "$AFTER" -eq $((BEFORE+1)) ]; then
+  REC=$(tail -1 "$METRICS")
+  OUT=$(printf '%s' "$REC" | jq -r '.outcome')
+  [ "$OUT" != "pass" ] && ok "killed-tool transcript + last_assistant_message=DONE never yields outcome=pass (got: $OUT)" \
+    || bad "FALSIFIED: killed-tool transcript fabricated outcome=pass despite a SIGKILL marker: $REC"
+  [ "$OUT" = "fail" ] && ok "killed-tool transcript (is_error:true, 'Exit code 137') correctly recorded as outcome=fail" \
+    || bad "killed-tool transcript did not record outcome=fail (got: $OUT): $REC"
+else
+  bad "killed-tool transcript case: expected $((BEFORE+1)) lines, got $AFTER"
+fi
+
+# (b) NO REGRESSION: a clean transcript — including an is_error:true tool
+# result for an ORDINARY (non-signal) exit code — still records outcome=null,
+# exactly as before this feature existed. Proves the detector keys on the
+# 128-192 signal-exit range, not merely on is_error:true or the substring
+# "Exit code".
+BEFORE=$(lines_now)
+PAYLOAD=$(jq -cn --arg tp "$CLEAN_TRANSCRIPT" '{agent_type:"coder", last_assistant_message:"DONE. All good.", agent_transcript_path:$tp}')
+run_hook "$PAYLOAD"
+AFTER=$(lines_now)
+if [ "$AFTER" -eq $((BEFORE+1)) ]; then
+  OUT=$(tail -1 "$METRICS" | jq -r '.outcome')
+  [ "$OUT" = "null" ] && ok "clean transcript (incl. an ordinary 'Exit code 1' tool error) still records outcome=null — no regression, no over-triggering on ordinary tool failures" \
+    || bad "clean transcript fabricated a non-null outcome: $OUT"
+else
+  bad "clean-transcript case: expected $((BEFORE+1)) lines, got $AFTER"
+fi
+
+# (c) FALSIFIABILITY PROOF: missing/malformed agent_transcript_path never
+# fabricates an outcome and never breaks the hook (exit 0 throughout) — the
+# record still lands (task_type/model/effort unaffected), only the outcome
+# piece is silently skipped.
+CASE_LABELS=("nonexistent-path" "empty-path" "malformed-content" "a-directory")
+CASE_PATHS=("$TRANSCRIPTS/does-not-exist.jsonl" "" "$MALFORMED_TRANSCRIPT" "$TRANSCRIPTS")
+i=0
+while [ $i -lt ${#CASE_PATHS[@]} ]; do
+  CASE_PATH="${CASE_PATHS[$i]}"
+  CASE_LABEL="${CASE_LABELS[$i]}"
+  BEFORE=$(lines_now)
+  PAYLOAD=$(jq -cn --arg tp "$CASE_PATH" '{agent_type:"coder", last_assistant_message:"DONE", agent_transcript_path:$tp}')
+  RC=0
+  ( cd "$SANDBOX" && export CLAUDE_PLUGIN_ROOT="$PLUGIN"; printf '%s' "$PAYLOAD" | bash "$HOOK_CMD_FILE" >/dev/null 2>"$SANDBOX/stderr.log" ) || RC=$?
+  AFTER=$(lines_now)
+  [ "$RC" -eq 0 ] && ok "agent_transcript_path case '$CASE_LABEL' exits 0" || bad "agent_transcript_path case '$CASE_LABEL' exited $RC, expected 0"
+  if [ "$AFTER" -eq $((BEFORE+1)) ]; then
+    OUT=$(tail -1 "$METRICS" | jq -r '.outcome')
+    [ "$OUT" = "null" ] && ok "agent_transcript_path case '$CASE_LABEL' still records, outcome=null (never fabricated from absent/bad evidence)" \
+      || bad "agent_transcript_path case '$CASE_LABEL' fabricated a non-null outcome: $OUT"
+  else
+    bad "agent_transcript_path case '$CASE_LABEL': expected $((BEFORE+1)) lines, got $AFTER"
+  fi
+  i=$((i+1))
+done
+
 # --- collateral check: every other live hook event still present -------------
 for EVENT in UserPromptSubmit PreToolUse PostToolUse SessionStart SessionEnd; do
   N=$(jq -r --arg e "$EVENT" '(.hooks[$e] // []) | length' "$HOOKS")

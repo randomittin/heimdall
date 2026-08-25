@@ -39,15 +39,17 @@
 #               below, never guessed at.
 #   effort    — REAL: SubagentStop's own `effort.level` field, when present.
 #               Omitted (not defaulted) when absent.
-#   outcome   — REMOVED, 2026-08-23. Checked against the official Claude Code
-#               hooks reference: SubagentStop's payload carries NO
-#               success/failure/termination-reason field of any kind — only
-#               agent_type, last_assistant_message, and event plumbing
-#               (session_id, transcript paths, stop_hook_active, ...). It is
-#               also undocumented whether SubagentStop even fires reliably
-#               when a subagent is killed by a quota/turn limit rather than
-#               finishing cleanly. The only thing resembling a verdict is
-#               last_assistant_message text — the AGENT'S OWN CLAIM, not
+#   outcome   — Fail-only, and only from real transcript evidence, never from
+#               last_assistant_message. Two eras below, both kept documented
+#               because era 1's reasoning is exactly why era 2 stays narrow.
+#
+#               ERA 1 (outcome removed entirely, 2026-08-23): checked against
+#               the official Claude Code hooks reference, SubagentStop's
+#               payload carries NO success/failure/termination-reason field
+#               of any kind — only agent_type, last_assistant_message, and
+#               event plumbing (session_id, transcript paths,
+#               stop_hook_active, ...). The only thing resembling a verdict
+#               was last_assistant_message text — the AGENT'S OWN CLAIM, not
 #               something this event can verify. This hook used to grep the
 #               first 3 lines of that message for a Status Contract token
 #               (DONE/DONE_WITH_CONCERNS -> pass, NEEDS_CONTEXT/BLOCKED ->
@@ -59,14 +61,42 @@
 #               coder.md, a self-declared DONE is a claim the agent might be
 #               wrong about, which is exactly the "did acceptance criteria
 #               pass" fact a hook cannot truthfully observe. Recording it
-#               anyway poisons the one number self-improve/dream route on: an
-#               agent killed mid-task by a session limit is NOT a pass. A
-#               record with task_type/model/effort but no outcome is still
-#               useful — it proves the hook fired and shows real per-tier
-#               usage volume — it just cannot feed a pass-rate comparison.
-#               Verified outcome belongs to whoever can actually check
-#               acceptance criteria: an orchestrator, calling
-#               `heimdall-metric task --outcome ...` itself once it knows.
+#               anyway poisons the one number self-improve/dream route on.
+#               last_assistant_message is STILL never inspected for outcome
+#               below — that conclusion did not change.
+#
+#               This bullet used to also say it was undocumented whether
+#               SubagentStop fires reliably on a killed (not clean) subagent.
+#               RESOLVED, 2026-08-25:
+#               docs/analysis/2026-08-25-hook-delivery-spike.md (Finding 2)
+#               SIGKILLed a subagent's own foreground tool call directly and
+#               observed SubagentStop fire ~2s later for that same agent_id.
+#               It fires even when death is external and the subagent's own
+#               code never runs another instruction — the firing logic lives
+#               in the parent process, not in anything the dying subagent
+#               cooperates with.
+#
+#               ERA 2 (fail-only outcome, ADDED 2026-08-25): that same spike
+#               found the payload DOES carry a path to real evidence after
+#               all — just not in a top-level field. `agent_transcript_path`
+#               points at the dying subagent's OWN transcript, and a tool
+#               call killed by a signal leaves a `tool_result` there with
+#               `is_error:true` and content naming a 128+signal exit code
+#               (137 for SIGKILL — the exact value the spike observed live).
+#               _kill_outcome() below reads that, bounded and fail-open. When
+#               it finds that structural marker, this hook adds `--outcome
+#               fail` — a verified fact ("this agent's run included a killed
+#               tool call"), not a guess. When it does NOT find the marker,
+#               outcome is STILL omitted (null/unknown), exactly as in era 1:
+#               absence of a kill marker is not evidence of a clean pass, so
+#               this hook NEVER emits `--outcome pass`, under any condition,
+#               from any signal. A record with task_type/model/effort but no
+#               outcome remains just as useful as in era 1 — it proves the
+#               hook fired and shows real per-tier usage volume — it just
+#               cannot feed a pass-rate comparison. A verified PASS still
+#               belongs to whoever can actually check acceptance criteria: an
+#               orchestrator, calling `heimdall-metric task --outcome pass
+#               ...` itself once it knows.
 #   wall_secs, retries, escalated_to — DELIBERATELY OMITTED in this version.
 #               SubagentStop is a single, self-sufficient event with no
 #               correlated start-time or retry-count reachable from it without
@@ -91,6 +121,67 @@ fi
 BIN_DIR="$(cd "$(dirname "$SELF")" && pwd)"
 PLUGIN_DIR="$(cd "$BIN_DIR/.." && pwd)"
 METRIC_BIN="$BIN_DIR/heimdall-metric"
+
+# Bound on bytes read from a subagent's own transcript when checking for a
+# non-clean-termination marker (see _kill_outcome below). Transcripts in this
+# repo run tens to hundreds of KB; a kill's own tool_result sits within a
+# handful of lines of the SubagentStop event that follows it ~2s later
+# (measured: docs/analysis/2026-08-25-hook-delivery-spike.md, Finding 2), so
+# a bounded tail finds it without ever reading a whole file. Override only
+# for tests.
+TRANSCRIPT_TAIL_BYTES="${HMD_METRIC_HOOK_TRANSCRIPT_TAIL_BYTES:-65536}"
+
+# _kill_outcome <agent_transcript_path> — prints "fail" (and nothing else) on
+# stdout iff the tail of that transcript shows STRUCTURAL evidence a tool
+# call this agent was running was killed by a signal: a `type:"user"` record
+# whose message.content carries a tool_result with `is_error:true` and
+# content naming an exit code in the 128-192 "128+signal" range (137 =
+# SIGKILL, 143 = SIGTERM, ... — the POSIX convention, and the exact value
+# confirmed live in docs/analysis/2026-08-25-hook-delivery-spike.md). This is
+# a real, verified-from-evidence "fail", never a guess — same structural-
+# field-over-prose-regex approach as bin/heimdall-529-scan's classify().
+#
+# Prints NOTHING in every other case — path empty/missing/not a regular
+# file/unreadable, no jq, or a tail with no such marker — and NEVER prints
+# "pass": absence of a kill marker is not proof of a clean success (the
+# marker only exists for the failure case), so the caller must treat empty
+# output as "unknown", exactly like the null `outcome` this hook already
+# emitted before this function existed (see the `outcome` header bullet).
+#
+# Bounded and fail-open at every step, same contract as the rest of this
+# file: a `tail`/`jq`/`grep` failure anywhere in the pipeline degrades to "no
+# output", never a non-zero exit propagated to the caller.
+_kill_outcome() {
+  local path="$1"
+  [ -n "$path" ] || return 0
+  [ -f "$path" ] || return 0    # excludes missing paths, dirs, pipes, devices
+  [ -r "$path" ] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+
+  # tail -n +2 always drops exactly the byte-capped first line. This is safe
+  # unconditionally, not just a conservative bias: transcript line 1 is
+  # always the opening turn, and a tool_result (what we key on) can never be
+  # the first line of any transcript — it requires a preceding tool_use.
+  if tail -c "$TRANSCRIPT_TAIL_BYTES" "$path" 2>/dev/null \
+      | tail -n +2 \
+      | jq -R -r '
+          try (
+            (. | fromjson) as $r
+            | select($r.type == "user")
+            | ($r.message.content // [])[]?
+            | select(.type == "tool_result" and .is_error == true)
+            | (if (.content | type) == "string" then .content
+               elif (.content | type) == "array" then
+                 ([.content[]? | (.text // "")] | join(" "))
+               else "" end)
+          ) catch empty
+        ' 2>/dev/null \
+      | grep -Eqi 'exit[[:space:]]code[[:space:]:]*(12[89]|1[3-8][0-9]|19[0-2])([^0-9]|$)' 2>/dev/null
+  then
+    printf 'fail\n'
+  fi
+  return 0
+}
 
 cmd_stop() {
   local target_repo="."
@@ -151,9 +242,14 @@ cmd_stop() {
 
   [ -x "$METRIC_BIN" ] || return 0
 
+  local transcript_path outcome
+  transcript_path="$(printf '%s' "$input" | jq -r '.agent_transcript_path // empty' 2>/dev/null)"
+  outcome="$(_kill_outcome "$transcript_path")"
+
   local args=(task --model "$model" --source subagentstop)
   [ -n "$task_type" ] && args+=(--type "$task_type")
   [ -n "$effort" ] && args+=(--effort "$effort")
+  [ "$outcome" = "fail" ] && args+=(--outcome fail)
   "$METRIC_BIN" --repo "$target_repo" "${args[@]}" >/dev/null 2>&1 || true
   return 0
 }
