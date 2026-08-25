@@ -1,0 +1,347 @@
+#!/usr/bin/env python3
+"""bin/heimdall-529-scan — READ-ONLY scan of Claude Code session transcripts
+for real API-overload / connection-pressure events.
+
+THE QUESTION THIS ANSWERS: bin/lib/pressure_control.py documents an honest
+ceiling — hmd cannot see the harness's live HTTP responses, so it only ever
+learns of a 529 via record_event() being called by some external observer
+(an agent noticing its own death, a wrapper script noticing a failed call).
+This tool is that external observer, built from empirical measurement (see
+docs/analysis/2026-08-25-transcript-529-detection.md) that Claude Code ITSELF
+writes a stable, structured marker into its own transcripts the moment an API
+call fails: a synthetic (model:"<synthetic>") assistant-role JSONL record
+carrying `isApiErrorMessage: true`, `apiErrorStatus` (int|null), and `error`
+(one of "rate_limit" | "server_error" | "oauth_org_not_allowed"). That is a
+stable field to key on, NOT fragile regex over prose — measured proof: a raw
+text search for the literal string "overloaded_error" produced 31/31 false
+positives in one transcript file, while the real 529 events in this corpus
+don't even contain that string (they carry `"error":"server_error"` plus
+`"apiErrorStatus":529`).
+
+CLASSIFICATION (mirrors bin/lib/pressure_control.py's PRESSURE_KINDS —
+"overloaded_error", "connection_reset" — deliberately using the identical two
+strings so a future caller can pipe an event's "kind" straight into
+`heimdall-pressure record --kind <kind>` with no translation step):
+  isApiErrorMessage is not True                       -> ignored
+  error != "server_error"                             -> ignored (excludes
+                                                          rate_limit/429 and
+                                                          oauth_org_not_allowed/403
+                                                          — neither is a capacity
+                                                          signal; counting them
+                                                          would corrupt the AIMD
+                                                          controller)
+  error == "server_error", apiErrorStatus is None     -> "connection_reset"
+  error == "server_error", apiErrorStatus >= 500      -> "overloaded_error"
+
+NON-GOAL, ON PURPOSE: this tool NEVER calls `heimdall-pressure record` itself.
+It is read-only and idempotent — running it twice over the same window reports
+the same events twice; it never mutates pressure state. Wiring its JSON output
+into the AIMD controller is a decision left to a future caller, not made here.
+
+BOUNDED WORK, ON PURPOSE: never scans the whole transcript corpus. A file
+whose own mtime is older than the cutoff is skipped without being opened; a
+cutoff comes from --since (absolute) or --window-secs (relative, default 300s
+/ 5 minutes, env HMD_529_SCAN_WINDOW_SECS) — see cmd_scan().
+
+NEVER-FAILS CONTRACT (matches bin/heimdall-pressure and bin/heimdall-metric):
+missing transcripts directory, an unreadable file, or a malformed JSON line
+all degrade to "skip it and keep going" — never a crash, never a non-zero
+exit, unless the caller opts in with --strict.
+"""
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+DEFAULT_WINDOW_SECS = 300
+SERVER_ERROR = "server_error"
+
+
+class Rejected(Exception):
+    """Input this tool refuses to act on (bad --since, bad CLI usage) —
+    caught by main()/cmd_scan(), never propagates to a crash."""
+
+
+def _env_int(name, default):
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(float(raw))
+    except (TypeError, ValueError):
+        return default
+
+
+def window_secs_default():
+    return max(1, _env_int("HMD_529_SCAN_WINDOW_SECS", DEFAULT_WINDOW_SECS))
+
+
+def _parse_ts(raw):
+    """Parse a Claude Code transcript timestamp (ISO-8601, 'Z' suffix,
+    millisecond precision, e.g. "2026-08-24T05:34:02.808Z"). None on
+    anything unparseable — fail open, same contract as pressure_control.py's
+    own timestamp parsing (bin/lib/pressure_control.py)."""
+    if not raw or not isinstance(raw, str):
+        return None
+    text = raw.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(text)
+    except (TypeError, ValueError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _slugify_path(path):
+    """Best-effort reconstruction of Claude Code's own ~/.claude/projects/
+    directory naming: every character outside [A-Za-z0-9] becomes '-'
+    (verified against this repo's own project directory while building this
+    tool). This is a guess at an undocumented, internal Claude Code naming
+    convention, not a stable public contract — pass --dir explicitly to
+    bypass it entirely."""
+    return re.sub(r"[^A-Za-z0-9]", "-", path)
+
+
+def _git_common_dir(repo):
+    """`git rev-parse --git-common-dir`'s stdout, or None on any failure
+    (not a repo, git missing, timeout — all fold to the same None so the
+    caller has one fallback branch, not several)."""
+    try:
+        out = subprocess.run(
+            ["git", "-C", repo, "rev-parse", "--git-common-dir"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode == 0 and out.stdout.strip():
+        return out.stdout.strip()
+    return None
+
+
+def _canonical_repo_root(repo):
+    """The MAIN repo working directory, even when called from inside a git
+    worktree. `git rev-parse --git-common-dir` always resolves to the shared
+    .git directory regardless of which worktree invoked it — verified
+    empirically: from inside a worktree it points at the MAIN repo's .git,
+    while `--show-toplevel` would have returned the worktree's own path
+    instead (the wrong answer for finding "the" transcript directory, since
+    Task/Agent-spawned subagents all log to the same top-level project
+    directory regardless of their own worktree cwd). Falls back to the given
+    repo path on any error (not a git repo, git missing, etc.) — never
+    raises."""
+    git_dir = _git_common_dir(repo)
+    if git_dir is None:
+        return os.path.abspath(repo)
+    if not os.path.isabs(git_dir):
+        git_dir = os.path.join(repo, git_dir)
+    return os.path.dirname(os.path.abspath(git_dir))
+
+
+def resolve_dir(repo):
+    root = _canonical_repo_root(repo)
+    return str(Path.home() / ".claude" / "projects" / _slugify_path(root))
+
+
+def classify(record):
+    """None, or one of pressure_control.PRESSURE_KINDS — see module
+    docstring for the exact field mapping and why rate_limit/
+    oauth_org_not_allowed are deliberately excluded."""
+    if not isinstance(record, dict):
+        return None
+    if record.get("isApiErrorMessage") is not True:
+        return None
+    if record.get("error") != SERVER_ERROR:
+        return None
+    status = record.get("apiErrorStatus")
+    if status is None:
+        return "connection_reset"
+    try:
+        status = int(status)
+    except (TypeError, ValueError):
+        return None
+    return "overloaded_error" if status >= 500 else None
+
+
+def _iter_jsonl_files(directory):
+    d = Path(directory)
+    if not d.is_dir():
+        return []
+    try:
+        return sorted(d.glob("*.jsonl"))
+    except OSError:
+        return []
+
+
+def scan(directory, cutoff):
+    """Read-only. Returns (events, stats). NEVER raises — every failure mode
+    (missing dir, unreadable file, malformed line) degrades to 'skip and
+    keep going', counted in stats rather than surfaced as an error."""
+    cutoff_ts = cutoff.timestamp()
+    events = []
+    stats = {
+        "files_scanned": 0,
+        "files_skipped_stale": 0,
+        "files_unreadable": 0,
+        "lines_scanned": 0,
+        "lines_malformed": 0,
+    }
+    for path in _iter_jsonl_files(directory):
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            stats["files_unreadable"] += 1
+            continue
+        if mtime < cutoff_ts:
+            stats["files_skipped_stale"] += 1
+            continue
+        try:
+            fh = open(path, "r", encoding="utf-8", errors="replace")
+        except OSError:
+            stats["files_unreadable"] += 1
+            continue
+        stats["files_scanned"] += 1
+        with fh:
+            for raw_line in fh:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                stats["lines_scanned"] += 1
+                try:
+                    record = json.loads(line)
+                except (ValueError, TypeError):
+                    stats["lines_malformed"] += 1
+                    continue
+                kind = classify(record)
+                if kind is None:
+                    continue
+                ts = _parse_ts(record.get("timestamp"))
+                if ts is None or ts.timestamp() < cutoff_ts:
+                    continue
+                events.append({
+                    "kind": kind,
+                    "timestamp": record.get("timestamp"),
+                    "sessionId": record.get("sessionId"),
+                    "requestId": record.get("requestId"),
+                    "apiErrorStatus": record.get("apiErrorStatus"),
+                    "file": path.name,
+                })
+    events.sort(key=lambda e: e["timestamp"] or "")
+    return events, stats
+
+
+def cmd_scan(args):
+    try:
+        if args.since is not None:
+            cutoff = _parse_ts(args.since)
+            if cutoff is None:
+                raise Rejected("--since must be an ISO-8601 timestamp, got %r" % (args.since,))
+        else:
+            window = args.window_secs if args.window_secs is not None else window_secs_default()
+            cutoff = datetime.now(timezone.utc) - timedelta(seconds=max(1, window))
+    except Rejected as exc:
+        if args.strict:
+            sys.stderr.write("error: %s\n" % exc)
+            return 2
+        return 0  # never fail a caller over a malformed scan request; no-op
+
+    directory = args.dir or resolve_dir(args.repo)
+    events, stats = scan(directory, cutoff)
+    by_kind = {"overloaded_error": 0, "connection_reset": 0}
+    for e in events:
+        by_kind[e["kind"]] = by_kind.get(e["kind"], 0) + 1
+
+    result = dict(stats)
+    result["dir"] = directory
+    result["since"] = cutoff.isoformat()
+    result["count"] = len(events)
+    result["by_kind"] = by_kind
+    result["events"] = events
+
+    if args.json:
+        print(json.dumps(result, sort_keys=True))
+    else:
+        print("heimdall-529-scan: dir=%s since=%s" % (directory, result["since"]))
+        print("  files: %d scanned, %d skipped(stale), %d unreadable" % (
+            stats["files_scanned"], stats["files_skipped_stale"], stats["files_unreadable"]))
+        print("  lines: %d scanned, %d malformed" % (stats["lines_scanned"], stats["lines_malformed"]))
+        print("  events: %d total (overloaded_error=%d connection_reset=%d)" % (
+            len(events), by_kind["overloaded_error"], by_kind["connection_reset"]))
+        for e in events:
+            print("    %s  %-16s status=%s session=%s" % (
+                e["timestamp"], e["kind"], e["apiErrorStatus"], e["sessionId"]))
+    return 0
+
+
+def cmd_where(args):
+    directory = args.dir or resolve_dir(args.repo)
+    print(directory)
+    return 0
+
+
+def build_parser():
+    class _Parser(argparse.ArgumentParser):
+        """argparse would normally exit 2 straight to the process on a usage
+        error; route it through Rejected instead so the never-fails contract
+        covers a malformed invocation too (mirrors bin/heimdall-pressure's
+        own _Parser)."""
+
+        def error(self, message):
+            raise Rejected(message)
+
+    ap = _Parser(
+        prog="heimdall-529-scan",
+        description="READ-ONLY, idempotent scan of Claude Code session "
+                    "transcripts for real API-overload/connection-pressure "
+                    "records. Never calls `heimdall-pressure record` itself. "
+                    "Never fails a caller.")
+    ap.add_argument("--repo", default=".", help="repo root, used to derive the default --dir (default: cwd)")
+    ap.add_argument("--strict", action="store_true", help="surface rejected input as a real exit code (tests only; normal callers never pass this)")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("scan", help="scan recent transcript records for overload/pressure events")
+    s.add_argument("--dir", default=None, help="transcripts directory (default: derived from --repo)")
+    s.add_argument("--since", default=None, help="ISO-8601 cutoff; overrides --window-secs")
+    s.add_argument("--window-secs", type=int, default=None,
+                   help="how far back to look, in seconds (default: %d, env HMD_529_SCAN_WINDOW_SECS)" % DEFAULT_WINDOW_SECS)
+    s.add_argument("--json", action="store_true", help="emit full detail as one JSON object")
+    s.set_defaults(fn=cmd_scan)
+
+    w = sub.add_parser("where", help="print the resolved transcripts directory and exit")
+    w.add_argument("--dir", default=None)
+    w.set_defaults(fn=cmd_where)
+
+    return ap
+
+
+def main(argv):
+    strict = "--strict" in argv
+    try:
+        args = build_parser().parse_args(argv)
+    except Rejected as exc:
+        if strict:
+            sys.stderr.write("error: %s\n" % exc)
+            return 2
+        return 0
+    args.repo = os.path.abspath(args.repo)
+    return args.fn(args)
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main(sys.argv[1:]))
+    except BrokenPipeError:
+        raise SystemExit(0)
+    except SystemExit:
+        raise
+    except Exception as exc:  # last-resort guard: a scanner must never crash its caller
+        if "--strict" in sys.argv:
+            sys.stderr.write("error: %s\n" % exc)
+            raise SystemExit(3)
+        raise SystemExit(0)
