@@ -192,6 +192,34 @@ echo "  (latency: 500x recommend() empty=${t_empty}s after-100-events=${t_loaded
 [ "$ratio_ok" = "1" ] && ok "14. recommend() cost does not scale with recorded-event history (no ledger scan)" \
   || bad "14. cost grew with history: empty=$t_empty loaded=$t_loaded"
 
+# ── 15. 429/rate_limit stays OUT of PRESSURE_KINDS -- investigated, not assumed ─
+# bin/heimdall-529-scan's own transcript mining (118 sessions) found this
+# operator's corpus is 52 rate_limit/429 events vs a handful of real 529s. A
+# 429 is self-inflicted (this caller's own rate) and recovers predictably;
+# overloaded_error/connection_reset mean the BACKEND is degraded and recovery
+# is not under this caller's control -- different enough that mixing them
+# into one AIMD window would corrupt it (see bin/lib/pressure_control.py's
+# PRESSURE_KINDS comment, and bin/heimdall-529-scan's classify(), which
+# reaches the identical exclusion independently). Pinned here so a future
+# agent cannot silently widen PRESSURE_KINDS or start routing 429s through
+# the unweighted overloaded_error bucket without this test forcing the
+# decision to be conscious.
+export HOME; HOME="$(fresh_home)"
+kinds_ok="$(python3 -c "
+import sys; sys.path.insert(0, '$REPO/bin/lib')
+import pressure_control as pc
+print(1 if pc.PRESSURE_KINDS == ('overloaded_error', 'connection_reset') else 0)
+")"
+[ "$kinds_ok" = "1" ] && ok "15a. PRESSURE_KINDS is exactly (overloaded_error, connection_reset) -- no rate_limit member" \
+  || bad "15a. PRESSURE_KINDS shape changed -- update this test deliberately if that was an intended decision"
+pp record --kind rate_limit >/dev/null 2>"$HOME/err.log"; rc=$?
+out="$(pp recommend --ceiling 10)"
+[ "$rc" -eq 0 ] && [ "$out" = "10" ] && ok "15b. --kind rate_limit rejected, no --strict -> exit 0, no state change (a 429 never enters the window)" \
+  || bad "15b. rc=$rc recommend='$out'"
+pp --strict record --kind rate_limit >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 2 ] && ok "15c. --kind rate_limit WITH --strict -> exit 2 (same opt-in strictness as any unrecognized kind)" \
+  || bad "15c. rc=$rc, want 2"
+
 echo "--------------------------------------------------------------------"
 printf 'RESULT: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

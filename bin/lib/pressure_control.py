@@ -82,6 +82,27 @@ from pathlib import Path
 
 SCHEMA_VERSION = 1
 
+# 429/rate_limit is DELIBERATELY not a member here, investigated and decided
+# 2026-08-25 against this repo's own transcript corpus (bin/heimdall-529-scan:
+# 118 sessions, 72 real API-error records, 52 of them rate_limit/429 vs a
+# handful of real server_error/529s). A 429 is a self-inflicted, per-caller
+# admission-control signal -- "you are sending too fast" -- that recovers
+# predictably as soon as THIS caller's own rate drops. overloaded_error and
+# connection_reset mean the opposite: the BACKEND itself is degraded, and
+# recovery is NOT under any single caller's control. Folding a 429 into this
+# window would let ordinary self-inflicted rate-limiting trigger the same
+# fleet-protective halving meant for real, uncontrollable capacity pressure --
+# and would let 429 noise dilute a genuine overload signal's weight the other
+# way. bin/heimdall-529-scan already reaches the identical conclusion
+# independently (its own classify() drops rate_limit/429 before it would ever
+# need a kind for it, reasoning stated there as "counting them would corrupt
+# the AIMD controller"). No caller can supply a "rate_limit" kind today, and
+# none should be able to by accident: if a caller ever gains a reliable way to
+# attribute a 429 and a real product decision is made to feed it into this
+# controller, it belongs here as its OWN kind with its OWN threshold/
+# decrease/recovery tuning -- never silently folded into overloaded_error's
+# bucket, and never given today's unweighted treatment by default. See
+# test/heimdall-pressure.test.sh section 15 for the falsifiable pin.
 PRESSURE_KINDS = ("overloaded_error", "connection_reset")
 
 MAX_WINDOW_EVENTS = 200  # defensive bound on stored timestamps; not a policy knob.
