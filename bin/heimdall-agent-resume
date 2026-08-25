@@ -458,9 +458,10 @@ _classify_cause() {
 # contractually never-fail, and its absence or failure must stay invisible to
 # every caller of `report`.
 _record_pressure_if_fresh_overload() {
-  local cause_json="$1" repo="$2" cls attempts
+  local cause_json="$1" repo="$2" text="$3" cls attempts
   cls="$(printf '%s' "$cause_json" | jq -r '.class' 2>/dev/null)"
   [ "$cls" = "overloaded" ] || return 0
+  printf '%s' "$text" | grep -qiE "$_GENUINE_OVERLOAD_RE" 2>/dev/null || return 0
   attempts="$(printf '%s' "$cause_json" | jq -r '.attempts' 2>/dev/null)"
   [ "$attempts" = "1" ] || return 0
   [ -x "$PRESSURE_BIN" ] || return 0
@@ -650,7 +651,7 @@ cmd_report() {
     qjson="$(_classify_text "$qtext")"
     qsuspected="$(printf '%s' "$qjson" | jq -r '.suspected')"
     cause="$(_classify_cause "$qtext" "$qsuspected" "$wt")"
-    _record_pressure_if_fresh_overload "$cause" "$repo"
+    _record_pressure_if_fresh_overload "$cause" "$repo" "$qtext"
 
     if [ -n "$wt" ] && _worktree_exists "$wt"; then
       brief="$(_brief_json "$wt" "$base" "$run_tests")"
