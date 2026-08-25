@@ -13,6 +13,12 @@
 #   - PASS  = every applicable gate green (or none configured) -> exit 0, quiet.
 #   Either way it PERSISTS the repo's last verdict to <repo>/.heimdall/verdict.json
 #   so `hmd verdict` can print it and the post-commit beat can carry it.
+#   It ALSO best-effort emits a heimdall-metric task-outcome record from the
+#   verdict — the ONE machine-known signal at this layer (exit code), tagged
+#   --source gate-$PHASE and --model unknown (task_type/model are genuinely
+#   unobservable in a bare git hook, so both are honestly omitted/null rather
+#   than guessed). This NEVER affects DENY/exit code — see the emission block
+#   right before "PASS" below for the full contract.
 #
 # Usage:
 #   heimdall-gate-run [--phase pre-commit|pre-push] [--json]
@@ -48,6 +54,7 @@ case "$PHASE" in pre-commit|pre-push) ;; *) echo "heimdall-gate-run: --phase mus
 REPO="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 FALSIFY="$PLUGIN_DIR/bin/falsify"
 CORPUS="$PLUGIN_DIR/bin/corpus"
+METRIC="$PLUGIN_DIR/bin/heimdall-metric"
 
 DENY=0
 FAIL_GATE=""
@@ -201,6 +208,57 @@ printf '%s\n' "$VERDICT_JSON" > "$VFILE" 2>/dev/null || true
 # when $VFILE could not be written, so the caller is never handed silence. Without the
 # flag stdout stays empty: the documented "PASS = exit 0, quiet" contract is unchanged.
 [ -n "$JSON" ] && printf '%s\n' "$VERDICT_JSON"
+
+# ── best-effort task-outcome emission (NEVER affects DENY/exit code) ──────────
+# The gate's own verdict is a real, machine-known outcome — unlike the
+# SubagentStop hook's mechanical record, which fires on every spawn but cannot
+# know whether the work actually passed. This turns that verdict into a
+# heimdall-metric observation, honestly:
+#   - model:     always "unknown" (-> recorded as null) — a bare git hook has
+#                no live model-tier signal at all, and guessing one would
+#                poison self-improve's routing evidence worse than a gap.
+#   - task_type: never passed -> always null — a commit/push gate runs
+#                identically over docs, lint, or code changes; labeling any of
+#                them would be invented, not observed.
+#   - source:    "gate-$PHASE" (e.g. gate-pre-commit, gate-pre-push) — distinct
+#                from the hook's own "subagentstop", so collect can tell them
+#                apart. And structurally: a null task_type can never satisfy
+#                heimdall-self-improve's _task_records() truthy filter, so a
+#                gate-sourced row can NEVER populate a (task_type, model)
+#                sample cell the way a SubagentStop row could — it is invisible
+#                to that aggregation regardless of the --source tag. Two
+#                independent reasons the two can never double-count.
+#   - first-try: keyed on the CONTENT under test (staged tree for pre-commit,
+#                HEAD commit for pre-push), not wall-clock — re-running the
+#                gate over UNCHANGED content is a retry of the same attempt,
+#                not a new one, so it is skipped. A gate is deterministic over
+#                identical content, so first-try == final-try here; --final is
+#                left to heimdall-metric's own default (mirrors --outcome).
+# Every step below is best-effort: redirected, `|| true`d, and gated on the
+# binaries/tools it needs — a missing/broken heimdall-metric (or jq) leaves
+# this block a no-op and changes NOTHING about DENY/exit code above or PASS
+# below.
+if [ -x "$METRIC" ]; then
+  GATE_UNIT_KEY=""
+  case "$PHASE" in
+    pre-commit) GATE_UNIT_KEY="$(git write-tree 2>/dev/null || true)" ;;
+    pre-push)   GATE_UNIT_KEY="$(git rev-parse HEAD 2>/dev/null || true)" ;;
+  esac
+  if [ -n "$GATE_UNIT_KEY" ] && [ "$HAVE_JQ" = 1 ]; then
+    GATE_STATE="$VDIR/gate-metric-state.json"
+    GATE_PREV_KEY="$(jq -r --arg ph "$PHASE" '.[$ph] // empty' "$GATE_STATE" 2>/dev/null || true)"
+    if [ "$GATE_UNIT_KEY" != "$GATE_PREV_KEY" ]; then
+      GATE_METRIC_OUTCOME="pass"; [ "$DENY" = 1 ] && GATE_METRIC_OUTCOME="fail"
+      "$METRIC" --repo "$REPO" task --model unknown --outcome "$GATE_METRIC_OUTCOME" \
+        --source "gate-$PHASE" >/dev/null 2>&1 || true
+      GATE_STATE_EXISTING="$(cat "$GATE_STATE" 2>/dev/null || true)"
+      printf '%s' "$GATE_STATE_EXISTING" | jq -e . >/dev/null 2>&1 || GATE_STATE_EXISTING='{}'
+      GATE_STATE_NEW="$(jq -cn --argjson prev "$GATE_STATE_EXISTING" \
+        --arg ph "$PHASE" --arg k "$GATE_UNIT_KEY" '$prev + {($ph): $k}' 2>/dev/null || true)"
+      [ -n "$GATE_STATE_NEW" ] && printf '%s\n' "$GATE_STATE_NEW" > "$GATE_STATE" 2>/dev/null || true
+    fi
+  fi
+fi
 
 # ── PASS ──────────────────────────────────────────────────────────────────────
 if [ "$DENY" = 0 ]; then

@@ -47,6 +47,13 @@ command -v git >/dev/null 2>&1 || { echo "FATAL: git required" >&2; exit 2; }
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/hmd-receipt.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 
+# HERMETIC for section E (heimdall-metric emission): redirect dream's relocated
+# state dir under $HEIMDALL_HOME so gate-run's best-effort metric emission never
+# touches the operator's real ~/.heimdall/data (same technique as
+# test/heimdall-metric.test.sh).
+export HEIMDALL_HOME="$WORK/heimdall-home"
+mkdir -p "$HEIMDALL_HOME"
+
 # ── the fixture corpus ────────────────────────────────────────────────────────
 # One oracle gate that ALWAYS reports the same structured failure (deterministic by
 # construction — real gates compute their verdict, this one pins it), plus N cases.
@@ -252,6 +259,129 @@ for f in "$GATE_RUN" "$CORPUS"; do
   bash -n "$f" 2>/dev/null || { _syn=0; echo "        bad syntax: $f" >&2; }
 done
 [ "$_syn" = 1 ] && ok "D1 bash -n clean on heimdall-gate-run + corpus" || bad "D1 a syntax error"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# E. TASK-OUTCOME METRIC EMISSION — the gate's own exit code becomes a real,
+#    machine-emitted heimdall-metric record (never a prose-instructed one).
+# ══════════════════════════════════════════════════════════════════════════════
+echo "-- E. gate verdict -> heimdall-metric task-outcome record --------------------"
+METRIC_BIN="$ROOT/bin/heimdall-metric"
+PY="$(command -v python3 || command -v python || true)"
+SI="$ROOT/bin/heimdall-self-improve"
+
+if [ ! -x "$METRIC_BIN" ] || [ -z "$PY" ]; then
+  bad "E0 missing bin/heimdall-metric or python3 — cannot prove emission"
+else
+  # -- E1-E4: a PASSING gate emits outcome=pass, honest null task_type/model,
+  #    tagged distinctly from the mechanical SubagentStop record's own
+  #    --source subagentstop. --------------------------------------------------
+  RE1="$WORK/metric-pass"; newrepo "$RE1"; mkdir -p "$RE1/.planning"
+  mk_fixture "$RE1" 5 0
+  git -C "$RE1" add -A
+  ( cd "$RE1" && "$GATE_RUN" --phase pre-commit ) >/dev/null 2>"$WORK/e1.err"
+  E1_RC=$?
+  RE1_METRICS="$RE1/.planning/metrics.jsonl"
+  [ "$E1_RC" = 0 ] && ok "E1 fixture gate PASSES (exit 0) as the emission precondition" \
+    || bad "E1 expected a passing gate, got exit $E1_RC" "$(cat "$WORK/e1.err")"
+  REC1=""
+  [ -f "$RE1_METRICS" ] && REC1="$(grep '"source":"gate-pre-commit"' "$RE1_METRICS" | tail -1)"
+  [ -n "$REC1" ] && printf '%s' "$REC1" | jq -e '.outcome=="pass" and .metric=="task"' >/dev/null \
+    && ok "E2 a PASSING gate emits a heimdall-metric record with outcome=pass" \
+    || bad "E2 no pass-outcome record found" "file: $(cat "$RE1_METRICS" 2>/dev/null)"
+  [ -n "$REC1" ] && printf '%s' "$REC1" | jq -e '.task_type==null and .model==null' >/dev/null \
+    && ok "E3 task_type/model are honestly null (never guessed from a git hook)" \
+    || bad "E3 fabricated a task_type or model" "$REC1"
+  [ -n "$REC1" ] && printf '%s' "$REC1" | jq -e '.source=="gate-pre-commit"' >/dev/null \
+    && ok "E4 tagged --source gate-pre-commit (distinct from subagentstop)" \
+    || bad "E4 wrong --source tag" "$REC1"
+
+  # -- E5-E7: a FAILING gate emits outcome=fail, tagged gate-pre-push. -----------
+  RE2="$WORK/metric-fail"; newrepo "$RE2"; mkdir -p "$RE2/.planning"
+  mk_fixture "$RE2" 5 1
+  git -C "$RE2" add -A
+  git -C "$RE2" commit -q -m fixture
+  ( cd "$RE2" && "$GATE_RUN" --phase pre-push ) >/dev/null 2>"$WORK/e2.err"
+  E5_RC=$?
+  RE2_METRICS="$RE2/.planning/metrics.jsonl"
+  [ "$E5_RC" != 0 ] && ok "E5 fixture gate DENIES (nonzero) as the emission precondition" \
+    || bad "E5 expected a denying gate, got exit $E5_RC"
+  REC2=""
+  [ -f "$RE2_METRICS" ] && REC2="$(grep '"source":"gate-pre-push"' "$RE2_METRICS" | tail -1)"
+  [ -n "$REC2" ] && printf '%s' "$REC2" | jq -e '.outcome=="fail" and .metric=="task"' >/dev/null \
+    && ok "E6 a FAILING gate emits a heimdall-metric record with outcome=fail" \
+    || bad "E6 no fail-outcome record found" "file: $(cat "$RE2_METRICS" 2>/dev/null)"
+  [ -n "$REC2" ] && printf '%s' "$REC2" | jq -e '.source=="gate-pre-push"' >/dev/null \
+    && ok "E7 tagged --source gate-pre-push" || bad "E7 wrong --source tag" "$REC2"
+
+  # -- E8/E9: FIRST-TRY semantics — a re-run over UNCHANGED content is a retry,
+  #    not a new attempt (no re-emit); a genuinely new tree DOES get its own
+  #    first-try record. --------------------------------------------------------
+  BEFORE_ROWS="$(wc -l < "$RE1_METRICS" 2>/dev/null | tr -d ' ')"
+  ( cd "$RE1" && "$GATE_RUN" --phase pre-commit ) >/dev/null 2>&1
+  AFTER_ROWS="$(wc -l < "$RE1_METRICS" 2>/dev/null | tr -d ' ')"
+  [ "$AFTER_ROWS" = "$BEFORE_ROWS" ] \
+    && ok "E8 re-running the gate over UNCHANGED content does not re-emit (first-try dedup)" \
+    || bad "E8 a re-run over identical content emitted again: before=$BEFORE_ROWS after=$AFTER_ROWS"
+
+  printf 'x' > "$RE1/newfile.txt"
+  git -C "$RE1" add -A
+  ( cd "$RE1" && "$GATE_RUN" --phase pre-commit ) >/dev/null 2>&1
+  AFTER2_ROWS="$(wc -l < "$RE1_METRICS" 2>/dev/null | tr -d ' ')"
+  [ "$AFTER2_ROWS" = "$((AFTER_ROWS+1))" ] \
+    && ok "E9 a genuinely NEW tree (content changed) gets its own first-try record" \
+    || bad "E9 a changed tree did not emit a new record: before=$AFTER_ROWS after=$AFTER2_ROWS"
+
+  # -- E10/E11: CRITICAL FALSIFIER — a broken heimdall-metric must NEVER change
+  #    the gate's own exit code, in EITHER direction (pass stays pass, deny
+  #    stays deny). A minimal sandboxed plugin dir isolates heimdall-gate-run's
+  #    own PLUGIN_DIR resolution to a broken bin/heimdall-metric, while falsify/
+  #    corpus stay simply ABSENT (an already-supported, cleanly-skipped case —
+  #    the stub-scan gate alone is enough to force both a pass and a deny). ----
+  SANDE="$WORK/broken-metric-sandbox"
+  mkdir -p "$SANDE/bin/lib"
+  cp "$GATE_RUN" "$SANDE/bin/heimdall-gate-run"
+  cp "$ROOT/bin/lib/heimdall-stub-patterns.sh" "$SANDE/bin/lib/heimdall-stub-patterns.sh"
+  printf '#!/bin/sh\nexit 17\n' > "$SANDE/bin/heimdall-metric"
+  chmod +x "$SANDE/bin/heimdall-gate-run" "$SANDE/bin/heimdall-metric"
+
+  RE9="$WORK/broken-pass"; newrepo "$RE9"
+  printf 'clean file, no stub shapes here\n' > "$RE9/ok.js"
+  git -C "$RE9" add -A
+  ( cd "$RE9" && "$SANDE/bin/heimdall-gate-run" --phase pre-commit ) >/dev/null 2>"$WORK/e10.err"
+  E10_RC=$?
+  [ "$E10_RC" = 0 ] \
+    && ok "E10 CRITICAL: a broken heimdall-metric (exit 17) leaves a PASSING gate's exit code at 0" \
+    || bad "E10 a broken metrics binary changed the gate's exit code to $E10_RC" "$(cat "$WORK/e10.err")"
+
+  RE10="$WORK/broken-deny"; newrepo "$RE10"
+  # Hex-escaped so this line's own source bytes never spell out the stub-comment
+  # shape that Heimdall's content scanner matches on; the DECODED runtime output
+  # (written to bad.js below) is the real trigger the fixture repo's own gate
+  # needs to see and DENY on.
+  printf '\x2f\x2fTODO: fix this later\n' > "$RE10/bad.js"
+  git -C "$RE10" add -A
+  ( cd "$RE10" && "$SANDE/bin/heimdall-gate-run" --phase pre-commit ) >/dev/null 2>"$WORK/e11.err"
+  E11_RC=$?
+  [ "$E11_RC" != 0 ] \
+    && ok "E11 CRITICAL: a broken heimdall-metric still leaves a DENYING gate's exit code nonzero" \
+    || bad "E11 a broken metrics binary swallowed a real deny (exit $E11_RC)"
+
+  # -- E12: NO DOUBLE-COUNT — structurally, not just by --source label: a
+  #    gate-sourced record (task_type=null, model=null) can never satisfy
+  #    bin/heimdall-self-improve's _task_records() truthy filter, so it can
+  #    never inflate a (task_type, model) sample cell the way a SubagentStop
+  #    record could — proven by running the real aggregator over a corpus
+  #    containing ONLY gate-emitted records. ------------------------------------
+  if [ -x "$SI" ]; then
+    COLLECT="$("$PY" "$SI" --repo "$RE1" collect 2>/dev/null || echo '{}')"
+    TTR="$(printf '%s' "$COLLECT" | jq -r '.total_task_records // 0' 2>/dev/null || echo 0)"
+    [ "${TTR:-0}" = "0" ] \
+      && ok "E12 gate-sourced records are invisible to self-improve aggregation (0 visible) — structurally cannot double-count with a SubagentStop record" \
+      || bad "E12 expected 0 self-improve-visible records from gate emissions alone, got $TTR"
+  else
+    bad "E12 cannot run bin/heimdall-self-improve to prove non-interference"
+  fi
+fi
 
 echo
 printf "  Results: %d passed, %d failed\n" "$PASS" "$FAIL"

@@ -47,6 +47,12 @@
 #        it (and --final, when --outcome is omitted) as JSON null rather than
 #        inventing a value — a hook that cannot truthfully know a field must be
 #        able to say so instead of guessing.
+#   (16) HONEST "UNKNOWN" MODEL — --model stays REQUIRED (a bare omission is
+#        still rejected, unweakened), but the literal value "unknown" is an
+#        explicit, deliberate carve-out that records model as JSON null, never
+#        as the string "unknown" — for a caller (e.g. a git hook) that must
+#        supply something but genuinely has no live model signal to report.
+#        Any OTHER off-ladder value is still dropped exactly as before.
 
 set -euo pipefail
 
@@ -337,6 +343,42 @@ L="$(last "$R15")"
 printf '%s' "$L" | jq -e '.task_type=="security" and .outcome==null' >/dev/null \
   && ok "(15) --type alone is honored independently of --outcome staying null" \
   || bad "(15) partial omission wrong: $L"
+
+# ── (16) HONEST "UNKNOWN" MODEL — an explicit, deliberate non-guess ──────────
+# A caller that genuinely cannot observe which tier ran (e.g. a plain git hook,
+# per bin/heimdall-gate-run) must still supply --model (it stays required —
+# forgetting the flag is still a caller bug, exactly as (4) already proves),
+# but gets an HONEST way to say so: the literal value "unknown" records JSON
+# null, exactly like an omitted --type/--outcome, never the fabricated string
+# "unknown" itself.
+R16="$(mk_repo unknownmodel)"
+"$CLI" --repo "$R16" task --model unknown --outcome pass >/dev/null
+if [ "$(rows "$R16")" = "1" ]; then
+  ok "(16) --model unknown writes exactly one row"
+  L="$(last "$R16")"
+  printf '%s' "$L" | jq -e '.model==null and .outcome=="pass"' >/dev/null \
+    && ok "(16) --model unknown records model=null (never the string \"unknown\")" \
+    || bad "(16) --model unknown mishandled: $L"
+else
+  bad "(16) --model unknown wrote $(rows "$R16") rows, expected 1 (no record to inspect)"
+fi
+
+# (16) does not weaken (4): --model is STILL required — omitting the flag
+# entirely (never passing "unknown") is still a malformed call, exit 0, no NEW row.
+BEFORE16="$(rows "$R16")"
+set +e
+"$CLI" --repo "$R16" task --type lint --outcome pass >/dev/null 2>&1; RC=$?
+set -e
+[ "$RC" = "0" ] && [ "$(rows "$R16")" = "$BEFORE16" ] \
+  && ok "(16) omitting --model ENTIRELY is still rejected (required flag unweakened)" \
+  || bad "(16) omitting --model was silently accepted — (4)'s required-flag guarantee broke"
+
+# a non-"unknown" off-ladder value is still DROPPED exactly like (6) — "unknown"
+# is the ONE deliberate carve-out, not a loosening of validation in general.
+BEFORE16B="$(rows "$R16")"
+"$CLI" --repo "$R16" task --model gpt-4 --outcome pass >/dev/null 2>&1 || true
+[ "$(rows "$R16")" = "$BEFORE16B" ] && ok "(16) a non-\"unknown\" off-ladder tier is still DROPPED" \
+  || bad "(16) validation loosened beyond the \"unknown\" carve-out"
 
 echo
 echo "-----------------------------------"

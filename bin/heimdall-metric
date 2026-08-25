@@ -17,6 +17,9 @@
 #   schema        record schema version
 #   task_type     WHAT KIND of work (slug, <=32 chars) — the routing subject
 #   model         WHICH TIER ran it: haiku | sonnet | opus — the routing variable
+#                 (or the literal "unknown" at the CLI, recorded as null — an
+#                 honest carve-out for a caller with no live model signal, e.g.
+#                 a plain git hook; --model itself stays REQUIRED either way)
 #   effort        the effort level the tier ran at (slug, <=16 chars)
 #   outcome       pass | fail — did the acceptance criteria pass ON THE FIRST TRY
 #                 at this tier. THIS IS THE COMPARABLE SCALAR routing is graded on
@@ -64,9 +67,13 @@
 #     are the keys the consumer ROUTES on — an off-ladder value would silently
 #     poison the evidence. `task_type`/`effort`/`source` are shape-validated
 #     (slug) rather than membership-validated, because their vocabularies grow.
+#     The ONE deliberate carve-out: the literal --model unknown records model
+#     as null rather than being rejected — an honest "cannot observe" from a
+#     caller (e.g. a plain git hook) with no live model-tier signal at all,
+#     distinct from a typo'd/off-ladder value, which is still dropped as before.
 #
 # Usage:
-#   heimdall-metric task --type SLUG --model haiku|sonnet|opus --outcome pass|fail
+#   heimdall-metric task --type SLUG --model haiku|sonnet|opus|unknown --outcome pass|fail
 #                        [--effort SLUG] [--final pass|fail] [--retries N]
 #                        [--escalated-to haiku|sonnet|opus] [--wall-secs N]
 #                        [--source SLUG] [--repo DIR] [--strict]
@@ -231,7 +238,9 @@ def _build(args):
             raise Rejected("--type must contain [a-z0-9_-] when provided")
 
     model = _slug(args.model, EFFORT_MAX)
-    if model not in TIERS:
+    if model == "unknown":
+        model = None    # honest carve-out — caller genuinely cannot observe the tier
+    elif model not in TIERS:
         raise Rejected("--model must be one of %s, got %r" % ("|".join(TIERS), args.model))
 
     if args.outcome is None:
@@ -271,7 +280,7 @@ def _build(args):
         '"metric":"task"',
         '"schema":%d' % SCHEMA_VERSION,
         '"task_type":%s' % (_json_str(task_type) if task_type else "null"),
-        '"model":%s' % _json_str(model),
+        '"model":%s' % (_json_str(model) if model else "null"),
         '"effort":%s' % _json_str(effort),
         '"outcome":%s' % (_json_str(outcome) if outcome else "null"),
         '"final":%s' % (_json_str(final) if final else "null"),
@@ -376,7 +385,9 @@ def build_parser():
                    help="task type slug (the routing subject): lint, docs, code, ... "
                         "omit when the caller cannot know it honestly (recorded as null)")
     t.add_argument("--model", required=True,
-                   help="tier that ran it: %s" % "|".join(TIERS))
+                   help="tier that ran it: %s — or the literal \"unknown\" when "
+                        "genuinely unobservable (recorded as null, never the "
+                        "string \"unknown\"); the flag itself stays required" % "|".join(TIERS))
     t.add_argument("--outcome", default=None,
                    help="pass|fail — acceptance criteria ON THE FIRST TRY at this tier; "
                         "omit when unknowable at emit time (recorded as null)")
