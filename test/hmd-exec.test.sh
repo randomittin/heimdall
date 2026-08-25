@@ -16,8 +16,10 @@
 #      under `set -e` trips errexit on the first overloaded attempt and never retries);
 #   D: does NOT give up loudly (distinct exit code) when overload never clears;
 #   E: retries a REAL (non-overload) error instead of failing fast;
-#   F: mis-implements the documented wave-2 `api` seam as a silent no-op instead of a
-#      loud, explicit "not implemented" rejection;
+#   F: the (now-implemented) wave-2 `api` backend fails to refuse loudly and
+#      distinctly for either structural refusal case -- tool-use requested via
+#      --allowedTools, or no gate ROUTE verdict -- or `backends` fails to list it
+#      as implemented rather than as an unimplemented seam;
 #   G: silently accepts a missing subcommand or corrupts stdout with its own banners.
 set -uo pipefail
 
@@ -97,7 +99,7 @@ check "A announces the backend on STDERR, not stdout"   "grep -q 'backend=claude
 echo "Case B — unknown --backend is rejected:"
 reset_case success
 rcB=0; outB="$("$EXEC" --backend nonesuch run -p "x" 2>"$WORK/b.err")" || rcB=$?
-check "B exits non-zero"                                "[ '$rcB' -ne 0 ]"
+check "B exits exactly 2 (unconditional, never soft-exits)" "[ '$rcB' -eq 2 ]"
 check "B never invoked claude at all"                   "[ '$(count)' -eq 0 ]"
 check "B names the bad backend in the error"            "grep -q \"unknown backend 'nonesuch'\" '$WORK/b.err'"
 check "B lists the available backends"                  "grep -q 'claude-code' '$WORK/b.err'"
@@ -134,17 +136,39 @@ check "E propagates claude's real exit (1)"             "[ '$rcE' -eq 1 ]"
 check "E called claude exactly once (fail fast)"        "[ '$(count)' -eq 1 ]"
 check "E surfaced the real error text on stderr"        "grep -qi 'invalid prompt' '$WORK/e.err'"
 
-# ── Case F: the wave-2 `api` seam is a documented rejection, not a silent no-op ──
-echo "Case F — api backend is a loud, documented not-yet-implemented seam:"
+# ── Case F: the (now-implemented) wave-2 `api` backend refuses loudly, per reason ──
+echo "Case F — api backend refuses loudly and distinctly, per structural reason:"
 reset_case success
-rcF=0; outF="$("$EXEC" --backend api run -p "x" 2>"$WORK/f.err")" || rcF=$?
-check "F exits non-zero (never a silent success)"       "[ '$rcF' -ne 0 ]"
-check "F never invoked claude at all"                   "[ '$(count)' -eq 0 ]"
-check "F produced NO stdout (no fake output)"           "[ -z \"\$outF\" ]"
-check "F names it a wave-2 seam, not a generic error"   "grep -qi 'wave-2 seam' '$WORK/f.err'"
-check "F points at the design doc"                      "grep -q 'harness-independence-design.md' '$WORK/f.err'"
-check "F is listed by \`backends\` as a real, named option" "\"$EXEC\" backends | grep -q '^api '"
-check "F is distinguished from an unknown-name rejection" "! grep -qi \"unknown backend\" '$WORK/f.err'"
+F_NOGATE_REPO="$WORK/no-gate-repo"
+mkdir -p "$F_NOGATE_REPO"
+
+# F1: --allowedTools non-empty -> the capability-refusal exit (3), before any gate
+# or network call at all -- claude is never invoked, neither is the fallback gate.
+rcF1=0
+outF1="$(HMD_API_BACKEND_REPO="$F_NOGATE_REPO" "$EXEC" --backend api run -p "x" --allowedTools "Edit,Write,Read" 2>"$WORK/f1.err")" || rcF1=$?
+check "F1 --allowedTools -> the capability-refusal exit (3)" "[ '$rcF1' -eq 3 ]"
+check "F1 produced NO stdout (no fake output)"            "[ -z \"\$outF1\" ]"
+check "F1 names tool-use as the reason"                   "grep -qi 'tool-use' '$WORK/f1.err'"
+check "F1 never invoked claude at all"                    "[ '$(count)' -eq 0 ]"
+
+# F2: no gate ROUTE verdict (no .heimdall/fallback.json -> fail-closed state=off
+# default) -> the routing-refusal exit (4), distinct from F1's exit 3.
+rcF2=0
+outF2="$(HMD_API_BACKEND_REPO="$F_NOGATE_REPO" "$EXEC" --backend api run -p "x" 2>"$WORK/f2.err")" || rcF2=$?
+check "F2 no ROUTE verdict -> the routing-refusal exit (4)" "[ '$rcF2' -eq 4 ]"
+check "F2 produced NO stdout (no fake output)"            "[ -z \"\$outF2\" ]"
+check "F2 names heimdall-fallback and ROUTE as the reason" "grep -q 'heimdall-fallback' '$WORK/f2.err' && grep -q 'ROUTE' '$WORK/f2.err'"
+check "F2 never invoked claude at all"                    "[ '$(count)' -eq 0 ]"
+check "F2's exit is distinct from F1's (4 != 3)"          "[ '$rcF2' -ne '$rcF1' ]"
+
+# F3: `backends` lists api as implemented/completion-only, never as a seam.
+outBackends="$("$EXEC" backends)"
+check "F3 backends lists api as implemented"              "printf '%s\n' \"\$outBackends\" | grep -q '^api — implemented, completion-only'"
+check "F3 backends does NOT call it a seam"               "! printf '%s\n' \"\$outBackends\" | grep -qi 'seam'"
+
+# F4: neither structural refusal is misreported as an unknown-backend rejection.
+check "F4 F1 is distinguished from an unknown-backend rejection" "! grep -qi 'unknown backend' '$WORK/f1.err'"
+check "F4 F2 is distinguished from an unknown-backend rejection" "! grep -qi 'unknown backend' '$WORK/f2.err'"
 
 # ── Case G: CLI-shape sanity (missing subcommand, --strict, help) ──────────────
 echo "Case G — CLI shape (missing subcommand / --strict / help):"

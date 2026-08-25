@@ -12,10 +12,14 @@
 # only the seam exists now. See docs/analysis/2026-08-25-harness-independence-design.md
 # (Stage 0/1) for the staged path this sets up.
 #
-# WAVE 2 (NOT this file): a `--backend api` runner that talks to the Anthropic API directly,
-# with no Claude Code dependency. That backend is NOT implemented here — see "THE WAVE-2
-# SEAM" below for the documented contract it must satisfy. Selecting it today fails loudly
-# and explains why; it is a real, finished rejection path, not a stub pretending to work.
+# WAVE 2 (bin/lib/hmd_api_backend.py): a `--backend api` runner that talks to an
+# Anthropic-shaped /v1/messages endpoint directly, with no Claude Code dependency. It is a
+# COMPLETION-ONLY backend, by deliberate, documented choice: no tool-use, no file edits, no
+# bash, no multi-step loop. It refuses loudly (exit 3) whenever a caller's --allowedTools
+# says the task needs tool-use, and refuses loudly (exit 4) whenever bin/heimdall-fallback's
+# gate does not return a ROUTE verdict for the calling repo — no default route, no bypass.
+# See "THE WAVE-2 SEAM" below for the contract, and bin/lib/hmd_api_backend.py's own header
+# for the full, honest "what this cannot do" list.
 #
 # USAGE:
 #   hmd-exec [--backend NAME] [--strict] run <claude-shaped argv...>
@@ -54,10 +58,11 @@
 #   default. It does NOT gate backend-name validation — see above for why that stays
 #   unconditional.
 #
-# THE WAVE-2 SEAM — a documented interface, not an unimplemented function. A future
-# `api` backend receiving the argv after `run` (shaped like
+# THE WAVE-2 SEAM — the interface bin/lib/hmd_api_backend.py implements. To be a drop-in
+# replacement for `claude-code` for the tasks it CAN do, a backend receiving the argv after
+# `run` (shaped like
 # `-p <prompt> [--model <id>] [--output-format <fmt>] [--permission-mode <mode>]
-#  [--allowedTools <csv>]`) must, to be a drop-in replacement for `claude-code`:
+#  [--allowedTools <csv>]`) must:
 #   1. Treat `-p <prompt>` as the task; flags it has no equivalent for may be ignored,
 #      but `-p`'s argument must never be misinterpreted as anything but the task prompt.
 #   2. On success, write ONLY the task's final answer to stdout — no banners, no logs
@@ -68,7 +73,11 @@
 #      fail-fast error — never silently retried, never masked.
 #   4. Retry/backoff strategy is the backend's own concern; hmd-exec imposes no HOW, only
 #      the exit-code/stdout shape above.
-# Implementing that backend is Wave 2 work — deliberately not started here.
+# bin/lib/hmd_api_backend.py satisfies all four AND adds its own, honestly-documented
+# refusal paths (no tool-use capability, no route without the fallback gate's ROUTE
+# verdict) — see that file's header for the full contract, including exit codes 2-4 which
+# are additive detail on top of the "any other nonzero = real error" rule above, never a
+# replacement for it.
 set -eo pipefail
 
 SELF="$0"
@@ -103,9 +112,12 @@ Backends:
   claude-code   (default, implemented) — shells to `claude -p` via the existing
                 529-discriminating retry wrapper (bin/lib/hmd-claude-retry.sh).
                 Reused verbatim, never reimplemented.
-  api           (documented wave-2 seam, NOT implemented) — see the header
-                comment in this file and
-                docs/analysis/2026-08-25-harness-independence-design.md (Stage 1).
+  api           (implemented, completion-only) — a single Anthropic-shaped
+                /v1/messages call via bin/lib/hmd_api_backend.py, routed only
+                through bin/heimdall-fallback's gate (no gate ROUTE verdict = no
+                call, no bypass). NO tool-use: refuses (exit 3) any task whose
+                --allowedTools is non-empty. See that file's header for the full
+                "what this cannot do" list.
 EOF
 }
 
@@ -145,11 +157,11 @@ fi
 
 if [ "$SAW_SUBCOMMAND" = "backends" ]; then
   for b in $_HMD_EXEC_BACKENDS; do
-    if [ "$b" = "claude-code" ]; then
-      note="implemented, default"
-    else
-      note="documented seam, NOT implemented (wave 2)"
-    fi
+    case "$b" in
+      claude-code) note="implemented, default" ;;
+      api)         note="implemented, completion-only (no tool-use; see bin/lib/hmd_api_backend.py)" ;;
+      *)           note="unknown backend (no status registered)" ;;
+    esac
     [ "$b" = "$BACKEND" ] && note="$note [selected]"
     printf '%s — %s\n' "$b" "$note"
   done
@@ -181,13 +193,12 @@ case "$BACKEND" in
     exit "$rc"
     ;;
   api)
-    {
-      echo "hmd-exec: backend 'api' is a documented wave-2 seam, not yet implemented."
-      echo "  See the header comment in bin/hmd-exec and"
-      echo "  docs/analysis/2026-08-25-harness-independence-design.md (Stage 1)."
-      echo "  Use --backend claude-code (the default) for now."
-    } >&2
-    exit 2
+    # A completion-only backend (bin/lib/hmd_api_backend.py's own header explains the
+    # (a)-vs-(b) choice in full). `exec` hands off the process image directly, so its
+    # exit code IS this script's exit code — no `|| rc=$?` dance needed here, unlike
+    # the claude-code case above, because there is no bash retry loop's errexit
+    # interaction to protect against: any retrying happens inside the python process.
+    exec "$PLUGIN_DIR/bin/lib/hmd_api_backend.py" "$@"
     ;;
   *)
     echo "hmd-exec: unknown backend '$BACKEND' (available: $_HMD_EXEC_BACKENDS)" >&2
