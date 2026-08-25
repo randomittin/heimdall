@@ -16,15 +16,22 @@
 # Exit codes:
 #   0  PASS (or WARN) — verification ran and the edits check out
 #   1  FAIL           — verification ran and found problems
-#   2  NON-VERIFIED   — verification could NOT establish the truth. Either the
-#                       session edit ledger is absent (the PostToolUse
-#                       edit-tracker hook never fired), OR the ledger claims
+#   2  NON-VERIFIED   — verification could NOT establish the truth. One of:
+#                       (a) the session edit ledger is absent (the PostToolUse
+#                       edit-tracker hook never fired); (b) the ledger claims
 #                       zero edits while git shows an uncommitted, dirty
-#                       working tree — a contradiction that means the ledger
-#                       cannot be trusted (e.g. something reset it mid-session;
-#                       see the ledger-git cross-check below). Distinct from 1
-#                       so "nothing was checked" can never be mistaken for
-#                       "everything is fine".
+#                       working tree, a contradiction that means the ledger
+#                       cannot be trusted (see the ledger-git cross-check
+#                       below); or (c) `edit-tracker clears` shows this
+#                       ledger was reset mid-session while it held real
+#                       entries — a resume/compact SessionStart firing `clear`
+#                       unconditionally (no gate on `source`), or a concurrent
+#                       agent sharing this session id and ledger, can each
+#                       destroy entries another part of the session already
+#                       logged, committed or not (see the mid-session-clear
+#                       cross-check below). Distinct from 1 so "nothing was
+#                       checked" can never be mistaken for "everything is
+#                       fine".
 set -euo pipefail
 
 PLUGIN_DIR="${CLAUDE_PLUGIN_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
@@ -100,6 +107,30 @@ if [ "$ledger_present" -eq 0 ]; then
   exit 2
 fi
 
+# Mid-session clear evidence: `edit-tracker clear` records "<ts>|<entries_lost>"
+# whenever it wiped a ledger that held real entries (bin/edit-tracker.c
+# do_clear()). hooks.json's SessionStart hook fires `edit-tracker clear`
+# UNCONDITIONALLY on every session-start event — startup, resume, AND compact
+# alike, with no gate on `source` (confirmed by reading hooks/hooks.json: the
+# SessionStart command never inspects its own stdin JSON before calling
+# clear). Concurrent agents that share one $CLAUDE_CODE_SESSION_ID share one
+# ledger file too (confirmed directly: a sibling worktree agent's edits have
+# been observed landing in this exact session's ledger) — so ANY one of them
+# starting, resuming, or compacting can clear entries another is still relying
+# on. clears_lost > 0 means the ledger's current contents are a
+# KNOWN-INCOMPLETE record, not a trustworthy one, regardless of what it
+# currently shows.
+clear_events=$("$TRACKER" clears 2>/dev/null || true)
+clears_lost=0
+if [ -n "$clear_events" ]; then
+  while IFS='|' read -r clear_ts clear_n; do
+    case "$clear_n" in
+      ''|*[!0-9]*) ;;
+      *) clears_lost=$((clears_lost + clear_n)) ;;
+    esac
+  done <<< "$clear_events"
+fi
+
 paths=$("$TRACKER" paths 2>/dev/null || true)
 if [ -z "$paths" ]; then
   # --- ledger-git cross-check: begin ---
@@ -158,6 +189,56 @@ if [ -z "$paths" ]; then
     fi
   fi
   # --- ledger-git cross-check: end ---
+  # --- mid-session-clear cross-check: begin ---
+  # Runs only once the git-dirty check above has NOT already exited: a dirty
+  # tree is the stronger, more specific signal (it names the actual
+  # uncommitted diff), so it wins when both are true — this preserves the
+  # existing ledger/git mismatch banner and reason for that exact scenario.
+  # What THIS check catches that the git-dirty one structurally cannot: entries
+  # lost to a mid-session clear that were ALREADY COMMITTED before the clear
+  # ran, leaving the tree clean and the ledger silent about work that
+  # genuinely happened. (Deliberately phrased as "ledger/git mismatch" here,
+  # not the exact reason-string below, so a grep for that string still finds
+  # only the one place it is actually emitted.)
+  if [ "$clears_lost" -gt 0 ]; then
+    if [ "$MODE" = "--json" ]; then
+      echo "{"
+      echo "  \"verdict\": \"NON_VERIFIED\","
+      echo "  \"reason\": \"ledger-cleared-mid-session\","
+      echo "  \"ledger\": \"$ledger_file\","
+      echo "  \"entries_lost\": $clears_lost,"
+      echo "  \"files_edited\": null,"
+      echo "  \"checks_passed\": 0,"
+      echo "  \"checks_failed\": 0,"
+      echo "  \"warnings\": 0,"
+      echo "  \"paths\": []"
+      echo "}"
+      exit 2
+    fi
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "[heimdall] verify-edits: NOT VERIFIED — ledger cleared mid-session"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "This session's edit ledger reports ZERO edits:"
+    echo "  $ledger_file"
+    echo ""
+    echo "...but it was reset at least once while it held real entries"
+    echo "($clears_lost total lost). That happens when hooks.json's SessionStart"
+    echo "hook fires \`edit-tracker clear\` on a resume/compact boundary, not"
+    echo "just a true fresh session start — or when a concurrent agent sharing"
+    echo "this ledger starts, resumes, or compacts."
+    echo ""
+    echo "Edits made before that clear are gone from this ledger even if they"
+    echo "are already committed. Treat this session's edit history as"
+    echo "UNVERIFIED, not zero."
+    echo ""
+    echo "Fix: find out why the clear fired (hooks.json's SessionStart ->"
+    echo "edit-tracker clear has no gate on \`source\`). To resume tracking:"
+    echo "  $TRACKER init"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "VERDICT: NON-VERIFIED"
+    exit 2
+  fi
+  # --- mid-session-clear cross-check: end ---
   # Ledger PRESENT + zero entries, and git agrees (clean, or nothing to check
   # it against) => the session genuinely made no edits: a real pass. Under
   # --json that must still be a JSON payload — this is the most-hit --json
@@ -179,6 +260,133 @@ if [ -z "$paths" ]; then
 fi
 
 file_count=$(echo "$paths" | wc -l | tr -d ' ')
+
+# --- mid-session-clear cross-check (full-report): begin ---
+# Mid-session clear evidence applies here too: a NON-empty ledger can still be
+# an incomplete one if it was cleared earlier in the same session and only
+# picked up new entries afterward. "Some edits verified" is not the same claim
+# as "ALL of this session's edits are accounted for" — say so instead of
+# silently verifying a partial set as if it were the whole session. This is
+# the exact shape of the originally reported defect: a ledger showing ONE
+# operation (e.g. a scratchpad write) while a real 89-line source edit and a
+# new test file, logged earlier in the same session, had already been wiped.
+if [ "$clears_lost" -gt 0 ]; then
+  if [ "$MODE" = "--json" ]; then
+    echo "{"
+    echo "  \"verdict\": \"NON_VERIFIED\","
+    echo "  \"reason\": \"ledger-cleared-mid-session\","
+    echo "  \"ledger\": \"$ledger_file\","
+    echo "  \"entries_lost\": $clears_lost,"
+    echo "  \"files_edited\": $file_count,"
+    echo "  \"checks_passed\": 0,"
+    echo "  \"checks_failed\": 0,"
+    echo "  \"warnings\": 0,"
+    echo "  \"paths\": []"
+    echo "}"
+    exit 2
+  fi
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "[heimdall] verify-edits: NOT VERIFIED — ledger cleared mid-session"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "This ledger currently tracks $file_count file(s), but it was reset at"
+  echo "least once mid-session while holding real entries ($clears_lost total"
+  echo "lost). This report can only cover what was logged AFTER that clear —"
+  echo "edits made before it are not included here, verified or not."
+  echo ""
+  echo "Fix: find out why the clear fired (hooks.json's SessionStart ->"
+  echo "edit-tracker clear has no gate on \`source\`, so it re-fires on"
+  echo "resume/compact — or a concurrent agent sharing this ledger cleared it)."
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "VERDICT: NON-VERIFIED"
+  exit 2
+fi
+# --- mid-session-clear cross-check (full-report): end ---
+
+# --- untracked-git-diff cross-check: begin ---
+# A non-empty ledger is not proof of a COMPLETE one: any file edited via a raw
+# Bash command (sed/cat/heredoc/cp — not a Write/Edit/MultiEdit/NotebookEdit
+# tool call) never reaches `edit-tracker log`, because the PostToolUse hook
+# only matches those four tool names. This environment's own guidance steers
+# agents toward exactly that raw-Bash path, so the gap is the common case, not
+# a corner case. Cross-check the ledger's claimed paths against git's own
+# dirty/staged file list: any file git considers changed that the ledger never
+# logged is proof, not suspicion, that the ledger is an incomplete record —
+# regardless of how many OTHER files it did catch correctly.
+canon_path() {
+  # Resolve a file path to its canonical absolute form (collapses double
+  # slashes and resolves symlinked ancestors — e.g. macOS's $TMPDIR ends in
+  # "/", and /tmp is itself a symlink to /private/tmp) so a byte-exact
+  # compare against git's own already-canonical toplevel path doesn't
+  # false-positive on the same file reached two different textual ways.
+  _d=$(dirname -- "$1"); _b=$(basename -- "$1")
+  _cd=$(cd "$_d" 2>/dev/null && pwd -P)
+  if [ -n "$_cd" ]; then
+    printf '%s/%s' "$_cd" "$_b"
+  else
+    printf '%s' "$1"
+  fi
+}
+untracked_dirty=""
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  toplevel=$(git rev-parse --show-toplevel 2>/dev/null || true)
+  git_files=$( { git diff --name-only 2>/dev/null; git diff --cached --name-only 2>/dev/null; } | sort -u || true)
+  if [ -n "$git_files" ] && [ -n "$toplevel" ]; then
+    paths_canon=""
+    if [ -n "$paths" ]; then
+      while IFS= read -r p; do
+        [ -z "$p" ] && continue
+        paths_canon="$paths_canon
+$(canon_path "$p")"
+      done <<< "$paths"
+    fi
+    while IFS= read -r gf; do
+      [ -z "$gf" ] && continue
+      case "$gf" in
+        /*) gfabs="$gf" ;;
+        *) gfabs="$toplevel/$gf" ;;
+      esac
+      gfcanon=$(canon_path "$gfabs")
+      if ! printf '%s\n' "$paths_canon" | grep -qxF "$gfcanon"; then
+        untracked_dirty="$untracked_dirty
+$gf"
+      fi
+    done <<< "$git_files"
+  fi
+fi
+if [ -n "$untracked_dirty" ]; then
+  if [ "$MODE" = "--json" ]; then
+    echo "{"
+    echo "  \"verdict\": \"NON_VERIFIED\","
+    echo "  \"reason\": \"untracked-git-diff\","
+    echo "  \"ledger\": \"$ledger_file\","
+    echo "  \"files_edited\": $file_count,"
+    echo "  \"checks_passed\": 0,"
+    echo "  \"checks_failed\": 0,"
+    echo "  \"warnings\": 0,"
+    echo "  \"paths\": []"
+    echo "}"
+    exit 2
+  fi
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "[heimdall] verify-edits: NOT VERIFIED — untracked edits outside the ledger"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "This ledger tracks $file_count file(s), but git shows real changes to"
+  echo "file(s) the ledger never logged:"
+  printf '%s\n' "$untracked_dirty"
+  echo ""
+  echo "A file edited via a raw shell command (sed/cat/heredoc/cp) rather than"
+  echo "the Write/Edit/MultiEdit/NotebookEdit tools never reaches"
+  echo "\`edit-tracker log\` — the PostToolUse hook only matches those four."
+  echo "This report can only cover what the ledger actually saw, and that is"
+  echo "provably not everything that changed."
+  echo ""
+  echo "Fix: log the missed file(s) manually to resume tracking:"
+  echo "  $TRACKER log Edit <path>"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "VERDICT: NON-VERIFIED"
+  exit 2
+fi
+# --- untracked-git-diff cross-check: end ---
 
 # ── Check 1: File existence ──
 missing=""

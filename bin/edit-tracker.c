@@ -8,14 +8,31 @@
  *   paths                   — print unique edited paths, one per line.
  *   init                    — create the ledger dir + empty session ledger.
  *   status                  — "present <path>" (exit 0) | "absent <path>" (exit 3).
- *   clear                   — reset session ledger to empty (stays present).
+ *   clear                   — reset session ledger to empty (stays present). If
+ *                             the ledger held real entries, their count is
+ *                             recorded to a sibling .clears file first — see
+ *                             `clears` below. Never truncates silently.
+ *   clears                  — print recorded clear-events, one per line
+ *                             ("<ts_ms>|<entries_lost>"), or nothing if this
+ *                             session's ledger was never cleared while it held
+ *                             entries. Lets consumers (bin/verify-edits) tell
+ *                             "genuinely zero edits" apart from "edits
+ *                             happened, then the ledger got wiped mid-session"
+ *                             — e.g. hooks.json's SessionStart hook fires
+ *                             `edit-tracker clear` unconditionally on every
+ *                             resume/compact, not just a true fresh start, and
+ *                             concurrent agents that share one session id
+ *                             share one ledger file too.
  *
  * The ledger file's EXISTENCE is proof the tracker ran. An ABSENT ledger means
  * the PostToolUse hook never fired, so "no edits" is unknowable — consumers
  * (see bin/verify-edits) must report that as NON-VERIFIED, never as a pass.
  *
- * State: line-based ledger at $TMPDIR/heimdall-edits/$SESSION_ID.log
- * Each line: timestamp_ms|tool|filepath
+ * State: line-based ledger at $TMPDIR/heimdall-edits/$SESSION_ID.log, plus a
+ * sibling, append-only $TMPDIR/heimdall-edits/$SESSION_ID.clears audit trail
+ * written only by `clear` when it actually destroys non-empty history.
+ *   Ledger line: timestamp_ms|tool|filepath
+ *   Clears line: timestamp_ms|entries_lost
  *
  * Cold start: ~1ms (static binary, no interpreter).
  *
@@ -84,6 +101,14 @@ static void lock_path(char *out, size_t cap) {
     char dir[512];
     ledger_dir(dir, sizeof(dir));
     snprintf(out, cap, "%s/%s.lock", dir, session_id());
+}
+
+/* Sibling audit trail for `clear` — see do_clear()/do_clears() and the header
+ * comment above. Never truncated, never cleared by anything in this program. */
+static void clears_path(char *out, size_t cap) {
+    char dir[512];
+    ledger_dir(dir, sizeof(dir));
+    snprintf(out, cap, "%s/%s.clears", dir, session_id());
 }
 
 /* The ledger file's EXISTENCE is the tracker's proof-of-life. It is created at
@@ -259,15 +284,92 @@ static int do_summary(void) {
     return 0;
 }
 
+/* Reset the session ledger to empty. Before destroying anything, count how
+ * many entries are about to be lost UNDER THE SAME LOCK do_log() uses, so a
+ * concurrent logger cannot race a torn count. If that count is > 0, append
+ * "<ts_ms>|<entries_lost>" to a separate, NEVER-cleared <session>.clears file
+ * first — see do_clears() and bin/verify-edits, which use it to tell
+ * "genuinely fresh session, nothing to lose" apart from "this ledger held
+ * real history and something (a resume/compact SessionStart firing `clear`
+ * unconditionally — see hooks/hooks.json — or a concurrent sibling agent
+ * sharing this same session id and ledger) destroyed it mid-session". A clear
+ * on an absent/already-empty ledger is a genuine fresh start and must leave
+ * the .clears trail untouched — that silence IS the "nothing was lost"
+ * signal. */
 static int do_clear(void) {
-    char lp[1024], lk[1024];
+    char dir[512], lp[1024], lk[1024], cp[1024];
+    ledger_dir(dir, sizeof(dir));
     ledger_path(lp, sizeof(lp));
     lock_path(lk, sizeof(lk));
+    clears_path(cp, sizeof(cp));
+
+    if (mkdir_p(dir) != 0) {
+        fprintf(stderr, "edit-tracker: cannot create ledger dir %s: %s\n",
+                dir, strerror(errno));
+        return 1;
+    }
+
+    int lock_fd = open(lk, O_RDWR | O_CREAT, 0644);
+    if (lock_fd < 0) return 1;
+    if (flock(lock_fd, LOCK_EX) != 0) { close(lock_fd); return 1; }
+
+    long lost = 0;
+    FILE *rf = fopen(lp, "r");
+    if (rf) {
+        char line[4096];
+        while (fgets(line, sizeof(line), rf)) lost++;
+        fclose(rf);
+    }
+
     unlink(lp);
-    unlink(lk);
-    /* Re-create empty: a cleared session is TRACKED-and-empty, not untracked. */
-    if (do_init() != 0) return 1;
+
+    if (lost > 0) {
+        FILE *cf = fopen(cp, "a");
+        if (cf) {
+            fprintf(cf, "%lld|%ld\n", now_ms(), lost);
+            fclose(cf);
+        }
+    }
+
+    /* Re-create empty while still holding the lock: a cleared session is
+     * TRACKED-and-empty, not untracked, and no window opens where a
+     * concurrent status/log call could see it as absent. */
+    int fd = open(lp, O_WRONLY | O_CREAT, 0644);
+    if (fd < 0) {
+        fprintf(stderr, "edit-tracker: cannot recreate ledger %s: %s\n",
+                lp, strerror(errno));
+        flock(lock_fd, LOCK_UN);
+        close(lock_fd);
+        return 1;
+    }
+    close(fd);
+
+    flock(lock_fd, LOCK_UN);
+    close(lock_fd);
+
     printf("Edit ledger cleared.\n");
+    if (lost > 0) {
+        printf("%ld prior entr%s recorded in %s (mid-session clear, not a fresh start).\n",
+               lost, lost == 1 ? "y" : "ies", cp);
+    }
+    return 0;
+}
+
+/* Print recorded clear-events, one per line ("<ts_ms>|<entries_lost>"), or
+ * nothing if this session's ledger was never cleared while holding entries.
+ * Absence is a valid, common answer (most sessions never lose anything) —
+ * fail open like do_paths(), never an error. */
+static int do_clears(void) {
+    char cp[1024];
+    clears_path(cp, sizeof(cp));
+    FILE *f = fopen(cp, "r");
+    if (!f) return 0;
+
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        fputs(line, stdout);
+    }
+    fclose(f);
     return 0;
 }
 
@@ -308,7 +410,7 @@ static int do_paths(void) {
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        fprintf(stderr, "usage: edit-tracker log <tool> <path> | list | summary | paths | status | init | clear\n");
+        fprintf(stderr, "usage: edit-tracker log <tool> <path> | list | summary | paths | status | init | clear | clears\n");
         return 1;
     }
     if (strcmp(argv[1], "log") == 0) {
@@ -324,7 +426,8 @@ int main(int argc, char **argv) {
     if (strcmp(argv[1], "summary") == 0) return do_summary();
     if (strcmp(argv[1], "paths") == 0) return do_paths();
     if (strcmp(argv[1], "clear") == 0) return do_clear();
+    if (strcmp(argv[1], "clears") == 0) return do_clears();
 
-    fprintf(stderr, "usage: edit-tracker log <tool> <path> | list | summary | paths | clear\n");
+    fprintf(stderr, "usage: edit-tracker log <tool> <path> | list | summary | paths | clear | clears\n");
     return 1;
 }
