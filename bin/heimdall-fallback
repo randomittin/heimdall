@@ -158,25 +158,48 @@ boundary from a different angle):
       `check` both say this once, plainly, whenever it applies, so the
       operator sees it without having to remember it.
 
-  11. state=="auto" ALSO best-effort-consults bin/heimdall-session-usage's own
-      ~95%-of-session-limit pre-exhaustion verdict and prints it as a plain
-      [INFO] line -- purely informational, NEVER a gated check and never part
-      of the `checks` list _verdict() reads. Crossing that threshold
-      authorizes nothing on its own: every preflight check above (Tier-1,
-      model pin, sidecar, provider allow-list, all of it) still has to pass
-      before `check` will ever print VERDICT: ROUTE, exactly as if this
-      consultation did not exist. heimdall-session-usage's own verdict is one
-      of four: "unconfigured" / "unknown" / "under" / "crossed" -- all four
-      are load-bearing and kept textually distinct on purpose. In particular,
-      "unknown" (tool missing, timed out, or returned something this cannot
-      parse) is NEVER treated as "under": the crossed-only branch is an
-      explicit `verdict == "crossed"` allow-list, not a `verdict != "under"`
-      deny-list, so an unrecognized reading can never be silently promoted
-      into looking like a confirmed threshold-crossing, or silently folded
-      into looking like a confirmed under-threshold reading either. Best
-      effort, no exceptions: a missing, non-executable, timed-out or
-      malformed heimdall-session-usage collapses to "unknown" and changes
-      nothing else -- see _session_pre_exhaustion_verdict().
+  11. state=="auto" is the one state that is actually exhaustion-gated.
+      It best-effort-consults bin/heimdall-session-usage's own
+      ~95%-of-session-limit pre-exhaustion verdict and treats it as a
+      SECOND, NECESSARY condition for ROUTE: `check` prints VERDICT: ROUTE
+      under auto only when the preflight passes AND heimdall-session-usage
+      reports "crossed". A passing preflight with capacity still available
+      (verdict "under") WAITs instead of routing -- there is no reason to
+      route off Anthropic while quota remains, and doing so anyway is pure
+      cost/latency loss (cache is 91-95% of the value and OmniRoute drops
+      cache_control; see
+      docs/analysis/2026-08-25-headroom-inpath-measurement.md). This is a
+      NECESSARY condition ADDED to the existing gate, never a substitute for
+      it: crossing 95% still authorizes nothing on its own -- every
+      preflight check above (Tier-1, model pin, sidecar, provider
+      allow-list, all of it) still has to pass first, exactly as before; a
+      failing preflight WAITs regardless of session_usage, crossed or not.
+
+      heimdall-session-usage's own verdict is one of four: "unconfigured" /
+      "unknown" / "under" / "crossed" -- all four are load-bearing and kept
+      textually distinct on purpose. ROUTE requires an explicit `verdict ==
+      "crossed"` allow-list match, never a `verdict != "under"` deny-list --
+      so "unconfigured" and "unknown" can never be silently promoted into
+      looking like a confirmed threshold-crossing. "unknown" (tool missing,
+      timed out, or returned something this cannot parse) is deliberately
+      treated the SAME as "under" for the routing decision -- both WAIT --
+      but for a DIFFERENT, explicitly reasoned cause (see the dedicated
+      `session_verdict == "unknown"` branch in _verdict()): when capacity
+      cannot be measured at all, routing off Anthropic on the strength of a
+      signal that was never confirmed would be exactly the fail-OPEN
+      behavior this file exists to avoid (see "MUST FAIL CLOSED" below, and
+      tier1_credential_absent / no_delegated_sidecar's identical "absence is
+      not proof" reasoning). Waiting on "unknown" risks a delayed fallback
+      if the measurement stays broken; routing on "unknown" risks burning
+      fallback-provider capacity, and a cold/degraded cache, while Anthropic
+      quota may still have been available -- this file already fails closed
+      everywhere else, so it fails closed here too. "unknown" is NEVER read
+      as "under" -- it stays its own reasoned branch with its own [INFO]
+      wording; the two simply arrive at the same WAIT outcome by separate,
+      explicit paths, not by being conflated into one. Best effort, no
+      exceptions: a missing, non-executable, timed-out or malformed
+      heimdall-session-usage collapses to "unknown" and changes nothing else
+      about the OTHER checks -- see _session_pre_exhaustion_verdict().
 
 MUST FAIL CLOSED -- the deliberate inverse of heimdall-quota-advisor's "MUST
 FAIL OPEN". The advisor's job is to never cry wolf: an uncertain exhaustion
@@ -344,7 +367,9 @@ NOAUTH_ROUTE_NOTE_FMT = (
 # be read as "under", so the note text below is deliberately distinct for
 # every one of the four, and _session_pre_exhaustion_verdict() only ever
 # returns a value from this exact tuple -- any other outcome it sees
-# collapses to "unknown" there, never invents a fifth state here.
+# collapses to "unknown" there, never invents a fifth state here. "crossed"
+# is the ONE value _verdict() allow-lists as a necessary (not sufficient)
+# condition for ROUTE under auto -- see _verdict() itself.
 SESSION_USAGE_VERDICTS = ("unconfigured", "unknown", "under", "crossed")
 SESSION_USAGE_NOTE_FMT = {
     "crossed": (
@@ -639,17 +664,27 @@ def _blocked_providers_note(repo):
 
 def _session_pre_exhaustion_verdict(repo):
     """Best-effort consult of bin/heimdall-session-usage's own pre-exhaustion
-    verdict (~95% of session limit) for state=="auto"'s [INFO] line -- see
-    header point 11. Every failure mode (missing binary, non-executable,
-    timeout, non-JSON stdout, a JSON body with no recognized "verdict") is
-    swallowed HERE, locally, and collapses to the tool's own pre-existing
-    "unknown" bucket -- never a fifth state, and never left to escape to
-    cmd_check's outer fail-closed net, which would incorrectly turn an
-    already-computed ROUTE/WAIT into a REFUSE; this consultation must never
-    change any other check's verdict. heimdall-session-usage's own `status`
-    exits 1 for a genuine CROSSED verdict -- that is not an error, so success
-    is judged by whether stdout parses as JSON with a recognized "verdict",
-    never by the return code.
+    verdict (~95% of session limit) -- see header point 11. Feeds TWO things
+    for state=="auto": the [INFO] line, AND _verdict()'s own ROUTE-vs-WAIT
+    decision, where "crossed" is a necessary (not sufficient) condition for
+    ROUTE. It does NOT feed anything for off/on/switch -- those states never
+    call this function at all (see cmd_check).
+
+    Every failure mode (missing binary, non-executable, timeout, non-JSON
+    stdout, a JSON body with no recognized "verdict") is swallowed HERE,
+    locally, and collapses to the tool's own pre-existing "unknown" bucket --
+    never a fifth state, and never left to escape to cmd_check's outer
+    fail-closed net, which would incorrectly turn an already-computed
+    ROUTE/WAIT into a REFUSE. This consultation must never change any
+    *individual preflight check's* own ok/detail -- each of those is computed
+    independently in run_preflight() and is untouched by this function.
+    _verdict()'s overall ROUTE/WAIT decision under auto is a separate,
+    additional gate this function's return value DOES feed -- that is the
+    entire point of it existing (header point 11), not a side effect to
+    guard against. heimdall-session-usage's own `status` exits 1 for a
+    genuine CROSSED verdict -- that is not an error, so success is judged by
+    whether stdout parses as JSON with a recognized "verdict", never by the
+    return code.
     """
     exe = os.environ.get("HEIMDALL_FALLBACK_SESSION_USAGE_BIN") or os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "heimdall-session-usage"
@@ -913,22 +948,56 @@ def _tier_routes_under_on(tier):
     return TIER_ALIASES.get(tier) == LOW_LEVEL_TIER
 
 
-def _verdict(state, checks, tier=None):
+def _verdict(state, checks, tier=None, session_verdict=None):
     """state decides ROUTE vs REFUSE vs WAIT; `on` additionally consults the
     task TIER now that it is a capability-tier routing decision, not an
-    exhaustion reaction (auto keeps that job, unchanged, and never consults
-    tier -- see header point 8). `switch` never WAITs: it is an explicit
+    exhaustion reaction (auto keeps that job -- see header point 8 -- and
+    still never consults tier). `switch` never WAITs: it is an explicit
     always-try state, so a failing preflight is a REFUSE, exactly like `on`,
     never a silent wait (header point 9). run_preflight's checks always run
     in full regardless of state or tier -- nothing here is ever a
-    short-circuit (header point 1)."""
+    short-circuit (header point 1).
+
+    `auto` is the one state that is actually exhaustion-gated (header point
+    11): a passing preflight is NECESSARY but no longer SUFFICIENT for ROUTE
+    under auto -- it additionally requires session_verdict == "crossed".
+    Both conditions are necessary; neither is sufficient alone: a failing
+    preflight WAITs regardless of session_verdict (95% crossed authorizes
+    nothing on its own), and a passing preflight with session_verdict in
+    {"under", "unconfigured", "unknown", None} WAITs instead of routing
+    (capacity remains, or cannot be confirmed low, so there is nothing to
+    react to yet). off/on/switch never read session_verdict at all -- callers
+    pass None for them and this function never inspects it outside the
+    `state == "auto"` branch below.
+    """
     preflight_ok = all(ok for _, ok, _ in checks)
     if state == "on" and not _tier_routes_under_on(tier):
         return "REFUSE", 1
+    if state == "auto":
+        if not preflight_ok:
+            return "WAIT", 2
+        if session_verdict == "crossed":
+            return "ROUTE", 0
+        if session_verdict == "unknown":
+            # Capacity could not be measured at all (tool missing, timed out,
+            # or unparseable -- see _session_pre_exhaustion_verdict). Waiting
+            # risks a delayed fallback if the measurement stays broken;
+            # routing risks burning fallback-provider capacity, and a cold or
+            # degraded cache (header point 11's headroom-measurement
+            # citation), while Anthropic quota may still have been available.
+            # This file fails closed everywhere else (see "MUST FAIL CLOSED"
+            # below; tier1_credential_absent and no_delegated_sidecar make
+            # the identical "cannot verify -> cannot proceed" call), so it
+            # fails closed here too: WAIT, never ROUTE, on an unmeasurable
+            # signal. This is its own branch, not a fallthrough into
+            # "under" -- see header point 11 for why the two are kept
+            # separately reasoned even though both WAIT.
+            return "WAIT", 2
+        # "under" (capacity confirmed NOT low) or "unconfigured" (tracking
+        # never set up): neither is evidence of anything to react to.
+        return "WAIT", 2
     if preflight_ok:
         return "ROUTE", 0
-    if state == "auto":
-        return "WAIT", 2
     return "REFUSE", 1
 
 
@@ -1000,7 +1069,8 @@ def cmd_check(args):
         tier = getattr(args, "tier", None)
         preflight_ok = all(ok for _, ok, _ in checks)
         tier_ok = _tier_routes_under_on(tier) if state == "on" else True
-        verdict, rc = _verdict(state, checks, tier=tier)
+        session_verdict = _session_pre_exhaustion_verdict(args.repo) if state == "auto" else None
+        verdict, rc = _verdict(state, checks, tier=tier, session_verdict=session_verdict)
 
         header = "heimdall-fallback check -- VERDICT: %s" % verdict
         if state == "switch":
@@ -1015,7 +1085,6 @@ def cmd_check(args):
             print(line)
 
         if state == "auto":
-            session_verdict = _session_pre_exhaustion_verdict(args.repo)
             print("  [INFO] session_usage -- %s" % SESSION_USAGE_NOTE_FMT[session_verdict])
 
         if state == "on" and tier is not None:
@@ -1032,8 +1101,11 @@ def cmd_check(args):
                 )
             print(line)
 
-        if verdict == "WAIT":
+        if verdict == "WAIT" and not preflight_ok:
             print("  (state=auto: preflight failed -> waiting rather than routing blind)")
+        elif verdict == "WAIT" and preflight_ok:
+            print("  (state=auto: preflight passed but session_usage verdict is not "
+                  "crossed -> waiting rather than routing while capacity remains)")
         elif verdict == "REFUSE" and state == "on" and preflight_ok and not tier_ok:
             print("  (state=on, preflight passed, but tier is not low-level -> refusing; "
                   "'on' routes haiku-tier work only, not an exhaustion reaction)")

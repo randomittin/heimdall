@@ -885,11 +885,12 @@ out="$(fb --repo "$R" check)"
 echo "$out" | grep -q "OK  .*no_delegated_sidecar"   && ok "37. an explicit mode='native' row is NOT a delegated sidecar -> PASSES"   || bad "37. got: $out"
 
 # ── 38. NEW: state=auto + heimdall-session-usage reporting CROSSED, with a
-# fully-passing preflight -> still ROUTE (unchanged from today), and the new
-# best-effort consultation surfaces an explicit, non-gating [INFO] line. This
-# is the "in addition to existing behaviour" case: the checks above are what
-# already produce ROUTE; crossing pre-exhaustion authorizes nothing new by
-# itself, it only gets reported. ────────────────────────────────────────────
+# fully-passing preflight -> ROUTE. Under the 2026-08-26 correction, "crossed"
+# is now a NECESSARY (not sufficient) second condition for ROUTE under auto,
+# alongside the preflight -- this is the case where BOTH are met. Crossing
+# pre-exhaustion still authorizes nothing BY ITSELF (see test 42: crossed with
+# a failing preflight still WAITs); it is a gate ADDED to the existing checks,
+# never a bypass of them. ───────────────────────────────────────────────────
 R="$(fresh_repo)"
 export HMD_FB_TEST_KEY="x"
 export ANTHROPIC_MODEL="anthropic/claude-3-5-sonnet-20241022"
@@ -970,6 +971,77 @@ garbage_fail_lines="$(printf '%s\n' "$out_garbage" | grep '\[FAIL\]' | sort)"
 [ "$baseline_fail_lines" = "$garbage_fail_lines" ] && [ -n "$baseline_fail_lines" ] \
   && ok "40c. every OTHER check's FAIL line is byte-identical whether heimdall-session-usage is missing or returns garbage" \
   || bad "40c. baseline='$baseline_fail_lines' garbage='$garbage_fail_lines'"
+
+# ── 41. NEW (2026-08-26 correction): state=auto + a FULLY PASSING preflight
+# + heimdall-session-usage reporting "under" -> WAIT (exit 2), NOT ROUTE.
+# This is the assertion that would have caught the original gap: before this
+# correction, auto ROUTEd whenever the preflight passed, regardless of
+# session_verdict, which made auto behave like switch instead of like an
+# exhaustion reaction. Proves capacity remaining is now a real reason to
+# WAIT rather than route off Anthropic while quota is still available. ──────
+R="$(fresh_repo)"
+export HMD_FB_TEST_KEY="x"
+export ANTHROPIC_MODEL="anthropic/claude-3-5-sonnet-20241022"
+write_cfg "$R" '{
+  "state": "auto",
+  "operator_key_env": "HMD_FB_TEST_KEY",
+  "endpoint": "http://127.0.0.1:20128",
+  "omniroute_db_path": "'"$CLEAN_DB"'",
+  "target_provider": "self-hosted-mixtral"
+}'
+export HEIMDALL_FALLBACK_ASSUME_REACHABLE=1
+export HEIMDALL_FALLBACK_SESSION_USAGE_BIN="$(make_fake_session_usage '{"verdict":"under","crossed":false,"source":"budget"}')"
+out="$(fb --repo "$R" check)"; rc=$?
+unset HEIMDALL_FALLBACK_SESSION_USAGE_BIN
+export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
+unset ANTHROPIC_MODEL
+unset HMD_FB_TEST_KEY
+[ "$rc" -eq 2 ] && echo "$out" | grep -q "VERDICT: WAIT" && ! echo "$out" | grep -q "VERDICT: ROUTE" \
+  && ok "41. auto + passing preflight + session-usage UNDER -> WAIT, NOT route (capacity remains)" \
+  || bad "41. got rc=$rc out='$out'"
+
+# ── 42. NEW (2026-08-26 correction): state=auto + a FAILING preflight +
+# heimdall-session-usage reporting CROSSED -> still WAIT, never ROUTE. Proves
+# crossing the 95% threshold authorizes nothing on its own: even a confirmed
+# pre-exhaustion signal cannot overcome a failing preflight check. ──────────
+R="$(fresh_repo)"
+write_cfg "$R" '{"state": "auto"}'
+export HEIMDALL_FALLBACK_SESSION_USAGE_BIN="$(make_fake_session_usage '{"verdict":"crossed","crossed":true,"source":"budget"}')"
+out="$(fb --repo "$R" check)"; rc=$?
+unset HEIMDALL_FALLBACK_SESSION_USAGE_BIN
+[ "$rc" -eq 2 ] && echo "$out" | grep -q "VERDICT: WAIT" && ! echo "$out" | grep -q "VERDICT: ROUTE" \
+  && ok "42. auto + failing preflight + session-usage CROSSED -> still WAIT, crossing 95% authorizes nothing alone" \
+  || bad "42. got rc=$rc out='$out'"
+
+# ── 43. NEW (2026-08-26 correction): state=auto + a FULLY PASSING preflight
+# + heimdall-session-usage reporting "unknown" -> WAIT (exit 2), NOT ROUTE.
+# Complements test 39 (which used a non-passing-preflight config and only
+# checked [INFO] wording): proves an unmeasurable signal does not
+# accidentally enable ROUTE now that the gate is real. Fail-closed choice,
+# reasoned in _verdict() itself (header point 11): waiting on "unknown" risks
+# a delayed fallback if the measurement stays broken; routing on "unknown"
+# risks burning fallback-provider capacity, and a cold/degraded cache, while
+# Anthropic quota may still have been available. ────────────────────────────
+R="$(fresh_repo)"
+export HMD_FB_TEST_KEY="x"
+export ANTHROPIC_MODEL="anthropic/claude-3-5-sonnet-20241022"
+write_cfg "$R" '{
+  "state": "auto",
+  "operator_key_env": "HMD_FB_TEST_KEY",
+  "endpoint": "http://127.0.0.1:20128",
+  "omniroute_db_path": "'"$CLEAN_DB"'",
+  "target_provider": "self-hosted-mixtral"
+}'
+export HEIMDALL_FALLBACK_ASSUME_REACHABLE=1
+export HEIMDALL_FALLBACK_SESSION_USAGE_BIN="$(make_fake_session_usage '{"verdict":"unknown","crossed":false,"source":"budget"}')"
+out="$(fb --repo "$R" check)"; rc=$?
+unset HEIMDALL_FALLBACK_SESSION_USAGE_BIN
+export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
+unset ANTHROPIC_MODEL
+unset HMD_FB_TEST_KEY
+[ "$rc" -eq 2 ] && echo "$out" | grep -q "VERDICT: WAIT" && ! echo "$out" | grep -q "VERDICT: ROUTE" \
+  && ok "43. auto + passing preflight + session-usage UNKNOWN -> WAIT, NOT route (fails closed on unmeasurable capacity)" \
+  || bad "43. got rc=$rc out='$out'"
 
 echo "--------------------------------------------------------------------"
 printf 'heimdall-fallback: %d passed, %d failed\n' "$PASS" "$FAIL"
