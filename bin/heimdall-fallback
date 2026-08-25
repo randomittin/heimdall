@@ -1,0 +1,473 @@
+#!/usr/bin/env python3
+"""heimdall-fallback -- quota-exhaustion fallback POLICY gate (state, config,
+and the safety gate only -- no transport).
+
+WHY THIS EXISTS
+---------------
+When Claude capacity is exhausted mid-task, hmd may -- ONLY if the operator
+opts in -- route work to a locally-hosted OmniRoute gateway using the
+OPERATOR'S OWN third-party API keys. See
+docs/analysis/2026-08-23-omniroute-assessment.md for the full risk analysis
+(verdict: do NOT integrate directly; every constraint below is sourced from
+that doc, none invented here).
+
+THIS TOOL IS POLICY ONLY. It computes state, config, and the safety-gate
+verdict. It does NOT implement transport -- it never calls OmniRoute, never
+rewrites a request, never speaks to anything but its own local reachability
+probe. The seam a future transport layer must consult is `check`'s exit
+code. Nothing else in this repo may treat "the operator flipped a config
+flag" as license to skip this gate.
+
+THE SAFETY BOUNDARY (mirrors bin/heimdall-quota-advisor's own header -- that
+tool prints options for a human; this one gates an unattended fallback, same
+boundary from a different angle):
+  1. NEVER enable, configure, or route through OmniRoute's "Tier 1
+     Subscription (Claude Code, Codex, Copilot)" mode -- it repurposes a
+     Claude Code / Codex / Copilot subscription's own auth as a backend for
+     arbitrary routed traffic (assessment doc, "Tier 1 Subscription"
+     section). If this tool cannot POSITIVELY verify Tier-1 is disabled, it
+     REFUSES. Fail closed here specifically: refusing is always safer than
+     proceeding on an unknown.
+  2. NEVER enable OmniRoute's opt-in root-CA MITM ("TPROXY") decrypt mode. A
+     config that mentions it in any form (see FORBIDDEN_CONFIG_KEYS) is
+     treated as corrupt and forced back to state=off.
+  3. NEVER route on OmniRoute's own ToS-conflict flag alone. OmniRoute's docs
+     call that flag advisory, not a routing gate, and still route through
+     flagged providers by default. hmd applies its OWN gate instead: a
+     provider in BUILTIN_TOS_FLAGGED_PROVIDERS (sourced from the assessment
+     doc's Section 2) is never a fallback target, full stop. Config may only
+     ADD providers to that list, never remove or override a built-in one.
+  4. Operator's own API keys ONLY. This tool never reads, reuses, or forwards
+     the Claude Code OAuth session -- it only checks whether an
+     operator-named env var is SET (see run_preflight's "operator_key"
+     check). It never reads the value, and an operator_key_env that names a
+     Claude/Anthropic credential is itself a preflight failure (see
+     FORBIDDEN_KEY_ENV_MARKERS).
+  5. NEVER print or log a secret. Every subcommand reports key PRESENCE
+     ("configured" / "absent") only, never a value. Follows the non-TTY
+     secret-refusal precedent in bin/heimdall-invite (secrets withheld by
+     default, never inferred from an ambient variable of the same name) --
+     this tool goes further still: it has no print-the-secret override at
+     all, because it never has a reason to print one.
+  6. `off` is the default for a fresh install AND for any absent or corrupt
+     config. A corrupt config must never be silently read as `on` -- see
+     load_config()'s fail-closed parse.
+
+MUST FAIL CLOSED -- the deliberate inverse of heimdall-quota-advisor's "MUST
+FAIL OPEN". The advisor's job is to never cry wolf: an uncertain exhaustion
+signal must stay silent (exit quietly, print nothing). This tool's job is
+the opposite: an uncertain SAFETY signal must never say "safe to route". Any
+internal error, missing field, or unparsable config resolves to the LEAST
+permissive verdict available for the current state (REFUSE under off/on,
+WAIT under auto) -- never to ROUTE. Two inverse philosophies for two
+different problems, not a contradiction: one gates a print statement, the
+other gates unattended, keyed network egress.
+
+NO AUTO-SWITCH CONTRADICTION. heimdall-quota-advisor documents that it
+"never auto-switches ANY provider for the operator. Ever." This tool's
+`on`/`auto` states do not contradict that: (a) `off` is the default
+everywhere, so a fresh install has zero auto-switch behavior anywhere in
+this repo; (b) `on`/`auto` are reachable ONLY via an explicit
+`heimdall-fallback set on|auto` the operator runs themselves -- hmd never
+flips this on its own; (c) this tool does not even perform a switch -- it
+only computes whether a future transport layer would be ALLOWED to.
+
+EXHAUSTION vs. OVERLOAD -- NOT THE SAME THING, NOT HANDLED HERE. A transient
+529 / overloaded_error / 429 is a RETRYABLE condition with its own mechanism
+(exponential backoff in bin/lib/hmd-claude-retry.sh, feeding the AIMD spawn
+throttle in bin/lib/pressure_control.py). Genuine quota/session exhaustion is
+a different condition entirely (classified by bin/lib/quota_stop.py,
+surfaced via bin/heimdall-quota-advisor). This tool concerns ONLY the
+latter. It has no opinion on retries and must never be consulted for one.
+
+USAGE
+-----
+  heimdall-fallback status [--json]     current state + would-preflight-pass, secret-free
+  heimdall-fallback set {off,on,auto}   persist a new state (off is always safe)
+  heimdall-fallback check               run the preflight; exit code IS the verdict
+  heimdall-fallback where               print the config file path
+
+Global flags (before the subcommand -- matches bin/heimdall-pressure /
+bin/heimdall-metric):
+  --repo PATH   repo root containing .heimdall/ (default: .)
+  --strict      tests only; callers never pass this
+
+CONFIG  <repo>/.heimdall/fallback.json -- gitignored by the blanket
+`.heimdall/*` rule in .gitignore; no committed .example needed since every
+field below defaults to the safe value:
+  {
+    "schema": 1,
+    "state": "off",                        # off | on | auto -- anything else reads as off
+    "operator_key_env": "",                # NAME of an env var holding the operator's
+                                            # OWN OmniRoute/provider key -- never a value
+    "endpoint": "http://127.0.0.1:20128",  # must resolve local; OmniRoute's documented
+                                            # default self-hosted gateway port
+    "tier1_disabled": false,               # must be literal `true` to pass preflight
+    "target_provider": "",                 # provider name; checked against the deny list
+    "tos_flagged_providers": []            # operator ADDITIONS to the built-in deny
+                                            # list only -- can never remove a built-in
+  }
+
+EXIT CODES
+  status, where : always 0 (never-fail-caller telemetry reads)
+  set           : 0 (even on bad input) unless --strict -> 2 usage / 3 write-fail
+  check         : 0 = ROUTE  (every preflight check passed)
+                  1 = REFUSE (state is 'off', OR state is 'on' and a preflight
+                              check failed)
+                  2 = WAIT   (state is 'auto' and a preflight check failed --
+                              print the reasons, do not route blind)
+  argument-parsing errors (any subcommand) : 0 unless --strict -> 2
+  unexpected internal error (outer safety net; check() fails closed on its
+  own and should never actually reach this) : 0 unless --strict -> 3
+"""
+
+import argparse
+import ipaddress
+import json
+import os
+import socket
+import sys
+import urllib.parse
+
+SCHEMA = 1
+VALID_STATES = ("off", "on", "auto")
+
+DEFAULT_CFG = {
+    "schema": SCHEMA,
+    "state": "off",
+    "operator_key_env": "",
+    "endpoint": "http://127.0.0.1:20128",
+    "tier1_disabled": False,
+    "target_provider": "",
+    "tos_flagged_providers": [],
+}
+
+# Sourced verbatim from docs/analysis/2026-08-23-omniroute-assessment.md,
+# Section 2 (providers whose ToS explicitly prohibit proxy/resale use). This
+# is hmd's OWN gate -- see header point 3 -- and config may only ADD to it,
+# never override or shrink it.
+BUILTIN_TOS_FLAGGED_PROVIDERS = frozenset({
+    "groq", "fireworks", "together", "siliconflow", "kiro",
+    "blackbox", "friendliai", "modal", "nlpcloud", "ai21", "agy",
+    "coze", "iflytek", "duckduckgo-web", "featherless-ai", "amazon-q",
+    "qwen-web", "t3-web", "muse-spark-web",
+    "mistral", "openrouter", "nvidia", "cerebras", "cohere",
+    "huggingface", "vertex", "baidu", "tencent", "doubao",
+})
+
+# Any of these keys appearing in an on-disk config (any value) is how
+# OmniRoute's MITM mode or a blind trust of its advisory ToS flag would be
+# spelled. Their mere presence marks the whole config corrupt. See header
+# points 2 and 3.
+FORBIDDEN_CONFIG_KEYS = frozenset({
+    "mitm", "mitm_enabled", "tproxy", "tproxy_enabled",
+    "root_ca", "decrypt_mode", "trust_omniroute_tos_flag",
+})
+
+# An operator_key_env naming a Claude/Anthropic/Claude-Code credential is
+# never "the operator's own third-party key" -- see header point 4.
+FORBIDDEN_KEY_ENV_MARKERS = ("ANTHROPIC", "CLAUDE")
+
+LOCAL_HOSTNAMES = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+class Rejected(Exception):
+    """Raised by _Parser.error() instead of argparse's default sys.exit(2)."""
+
+
+class _Parser(argparse.ArgumentParser):
+    def error(self, message):
+        raise Rejected(message)
+
+
+def _cfg_path(repo):
+    return os.path.join(repo, ".heimdall", "fallback.json")
+
+
+def load_config(repo):
+    """Fail-closed config load. Absent, unreadable, non-dict, or containing a
+    FORBIDDEN_CONFIG_KEYS entry all resolve to a fresh DEFAULT_CFG copy
+    (state off) -- never a partially-trusted merge. See header point 6.
+    Returns (cfg, corrupt_reason); corrupt_reason is None when the on-disk
+    config (or its absence) was clean.
+    """
+    path = _cfg_path(repo)
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except FileNotFoundError:
+        return dict(DEFAULT_CFG), None
+    except (OSError, ValueError):
+        return dict(DEFAULT_CFG), "config file is unreadable or not valid JSON"
+    if not isinstance(raw, dict):
+        return dict(DEFAULT_CFG), "config is not a JSON object"
+    forbidden_present = sorted(k for k in raw if k in FORBIDDEN_CONFIG_KEYS)
+    if forbidden_present:
+        return dict(DEFAULT_CFG), "config contains forbidden key(s): " + ", ".join(forbidden_present)
+
+    cfg = dict(DEFAULT_CFG)
+    for key in DEFAULT_CFG:
+        if key in raw:
+            cfg[key] = raw[key]
+    if cfg.get("state") not in VALID_STATES:
+        cfg["state"] = "off"
+    if not isinstance(cfg.get("tier1_disabled"), bool):
+        cfg["tier1_disabled"] = False
+    if isinstance(cfg.get("tos_flagged_providers"), list):
+        cfg["tos_flagged_providers"] = [p for p in cfg["tos_flagged_providers"] if isinstance(p, str)]
+    else:
+        cfg["tos_flagged_providers"] = []
+    for key in ("operator_key_env", "endpoint", "target_provider"):
+        if not isinstance(cfg.get(key), str):
+            cfg[key] = DEFAULT_CFG[key]
+    return cfg, None
+
+
+def save_config(repo, cfg):
+    path = _cfg_path(repo)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(cfg, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+    os.replace(tmp, path)
+
+
+def _is_local_endpoint(endpoint):
+    try:
+        parsed = urllib.parse.urlparse(endpoint)
+    except ValueError:
+        return False
+    host = parsed.hostname
+    if not host:
+        return False
+    if host.lower() in LOCAL_HOSTNAMES:
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _endpoint_reachable(endpoint):
+    """Real loopback TCP probe -- stdlib socket only, nothing else.
+    Overridable ONLY for hermetic tests via
+    HEIMDALL_FALLBACK_ASSUME_REACHABLE (nothing outside
+    test/heimdall-fallback.test.sh sets this in this repo)."""
+    override = os.environ.get("HEIMDALL_FALLBACK_ASSUME_REACHABLE")
+    if override is not None:
+        return override == "1"
+    try:
+        parsed = urllib.parse.urlparse(endpoint)
+        host = parsed.hostname
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        if not host:
+            return False
+        with socket.create_connection((host, port), timeout=0.75):
+            return True
+    except OSError:
+        return False
+
+
+def run_preflight(cfg):
+    """Every gated check runs and reports independently, in a fixed order --
+    a failure at 3am names exactly what to fix, never just "preflight
+    failed". Order mirrors the header's numbered safety boundary. Returns a
+    list of (name, ok, reason) triples; reason is "" when ok is True.
+    """
+    checks = []
+
+    state = cfg.get("state")
+    checks.append((
+        "state",
+        state != "off",
+        "" if state != "off" else "fallback state is 'off' (heimdall-fallback set on|auto)",
+    ))
+
+    key_env = cfg.get("operator_key_env") or ""
+    if not key_env:
+        checks.append(("operator_key", False, "no operator_key_env configured -- an operator-owned key is required"))
+    elif any(marker in key_env.upper() for marker in FORBIDDEN_KEY_ENV_MARKERS):
+        checks.append((
+            "operator_key", False,
+            "operator_key_env '%s' names a Claude/Anthropic credential -- the Claude Code "
+            "OAuth session may never be reused as a fallback key" % key_env,
+        ))
+    elif not os.environ.get(key_env):
+        checks.append(("operator_key", False, "env var '%s' (operator_key_env) is not set" % key_env))
+    else:
+        checks.append(("operator_key", True, ""))
+
+    endpoint = cfg.get("endpoint") or ""
+    local_ok = bool(endpoint) and _is_local_endpoint(endpoint)
+    checks.append((
+        "endpoint_local", local_ok,
+        "" if local_ok else "endpoint '%s' is not a loopback address -- fallback only ever "
+                             "targets a locally-hosted gateway" % (endpoint or "(empty)"),
+    ))
+
+    if local_ok:
+        reachable_ok = _endpoint_reachable(endpoint)
+        reachable_reason = "" if reachable_ok else "endpoint '%s' is not reachable (is the local gateway running?)" % endpoint
+    else:
+        reachable_ok = False
+        reachable_reason = "skipped -- endpoint is not local (see endpoint_local)"
+    checks.append(("endpoint_reachable", reachable_ok, reachable_reason))
+
+    tier1_ok = cfg.get("tier1_disabled") is True
+    checks.append((
+        "tier1_disabled", tier1_ok,
+        "" if tier1_ok else
+        "Tier-1 Subscription mode is not POSITIVELY verified disabled -- refusing per "
+        "docs/analysis/2026-08-23-omniroute-assessment.md (Tier-1 repurposes Claude "
+        "Code/Codex/Copilot auth as a routed backend)",
+    ))
+
+    provider = (cfg.get("target_provider") or "").strip().lower()
+    deny = BUILTIN_TOS_FLAGGED_PROVIDERS | {p.strip().lower() for p in cfg.get("tos_flagged_providers", [])}
+    if not provider:
+        checks.append(("target_provider_allowed", False, "no target_provider configured"))
+    elif provider in deny:
+        checks.append((
+            "target_provider_allowed", False,
+            "target_provider '%s' is on the ToS-conflict deny list -- hmd never routes to "
+            "it regardless of OmniRoute's own advisory flag" % provider,
+        ))
+    else:
+        checks.append(("target_provider_allowed", True, ""))
+
+    return checks
+
+
+def _verdict(state, checks):
+    if all(ok for _, ok, _ in checks):
+        return "ROUTE", 0
+    if state == "auto":
+        return "WAIT", 2
+    return "REFUSE", 1
+
+
+def cmd_status(args):
+    cfg, corrupt_reason = load_config(args.repo)
+    checks = run_preflight(cfg)
+    would_pass = all(ok for _, ok, _ in checks)
+    key_env = cfg.get("operator_key_env") or ""
+    key_present = bool(key_env) and bool(os.environ.get(key_env))
+    if args.json:
+        payload = {
+            "state": cfg["state"],
+            "would_preflight_pass": would_pass,
+            "operator_key_env": key_env,
+            "operator_key_configured": key_present,
+            "endpoint": cfg.get("endpoint", ""),
+            "target_provider": cfg.get("target_provider", ""),
+            "corrupt": corrupt_reason,
+        }
+        print(json.dumps(payload, sort_keys=True))
+    else:
+        print("heimdall-fallback status")
+        print("  state:                 %s" % cfg["state"])
+        print("  would preflight pass:  %s" % ("yes" if would_pass else "no"))
+        print("  operator key:          %s (%s)" % (key_env or "(unset)", "configured" if key_present else "absent"))
+        print("  endpoint:              %s" % (cfg.get("endpoint") or "(unset)"))
+        print("  target provider:       %s" % (cfg.get("target_provider") or "(unset)"))
+        if corrupt_reason:
+            print("  NOTE: on-disk config was corrupt (%s) -- reset to safe defaults (state=off)" % corrupt_reason)
+    return 0
+
+
+def cmd_set(args):
+    # args.value is already constrained to VALID_STATES by argparse's own
+    # choices= validation (raises Rejected -> handled in main() -> exit 0
+    # unless --strict, exit 2). Nothing left to validate here.
+    cfg, _ = load_config(args.repo)
+    cfg["state"] = args.value
+    try:
+        save_config(args.repo, cfg)
+    except OSError as exc:
+        sys.stderr.write("heimdall-fallback set: failed to write config: %s\n" % exc)
+        return 3 if args.strict else 0
+    print("state set to '%s'" % args.value)
+    return 0
+
+
+def cmd_check(args):
+    try:
+        cfg, _ = load_config(args.repo)
+        checks = run_preflight(cfg)
+        verdict, rc = _verdict(cfg["state"], checks)
+        print("heimdall-fallback check -- VERDICT: %s" % verdict)
+        for name, ok, reason in checks:
+            line = "  [%s] %s" % ("OK  " if ok else "FAIL", name)
+            if not ok and reason:
+                line += " -- %s" % reason
+            print(line)
+        if verdict == "WAIT":
+            print("  (state=auto: preflight failed -> waiting rather than routing blind)")
+        elif verdict == "REFUSE" and cfg["state"] != "off":
+            print("  (state=%s but a required check failed -> refusing rather than proceeding unsafely)" % cfg["state"])
+        return rc
+    except Exception as exc:
+        # check() must fail CLOSED. Any internal error is indistinguishable
+        # from "unsafe to route" -- refuse loudly, never fall through to a
+        # bare success. See header's "MUST FAIL CLOSED".
+        sys.stderr.write("heimdall-fallback check: internal error, refusing: %s\n" % exc)
+        return 1
+
+
+def cmd_where(args):
+    print(_cfg_path(args.repo))
+    return 0
+
+
+def build_parser():
+    p = _Parser(
+        prog="heimdall-fallback",
+        description="Quota-exhaustion fallback policy gate (state/config/safety only -- no transport).",
+    )
+    p.add_argument("--repo", default=".", help="repo root containing .heimdall/ (default: .)")
+    p.add_argument("--strict", action="store_true", help="tests only; callers never pass this")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sp_status = sub.add_parser("status", help="current state + whether preflight would pass (secret-free)")
+    sp_status.add_argument("--json", action="store_true")
+
+    sp_set = sub.add_parser("set", help="persist a new fallback state")
+    sp_set.add_argument("value", choices=VALID_STATES)
+
+    sub.add_parser("check", help="run the preflight; exit code is the verdict (0=ROUTE 1=REFUSE 2=WAIT)")
+    sub.add_parser("where", help="print the config file path")
+
+    return p
+
+
+def main(argv):
+    parser = build_parser()
+    strict = "--strict" in argv
+    try:
+        args = parser.parse_args(argv)
+    except Rejected as exc:
+        sys.stderr.write("heimdall-fallback: %s\n" % exc)
+        return 2 if strict else 0
+    args.repo = os.path.abspath(args.repo)
+    handlers = {
+        "status": cmd_status,
+        "set": cmd_set,
+        "check": cmd_check,
+        "where": cmd_where,
+    }
+    return handlers[args.cmd](args)
+
+
+if __name__ == "__main__":
+    _argv = sys.argv[1:]
+    _strict = "--strict" in _argv
+    try:
+        sys.exit(main(_argv))
+    except BrokenPipeError:
+        sys.exit(0)
+    except SystemExit:
+        raise
+    except Exception as _exc:
+        sys.stderr.write("heimdall-fallback: unexpected error: %s\n" % _exc)
+        sys.exit(3 if _strict else 0)
