@@ -488,6 +488,22 @@ OVL_A4="$(HMD_AGENT_RESUME_MAX_ATTEMPTS=2 "$AR" report --json --repo "$REPO" --i
   && ok "retry-bookkeeping file (.planning/RESUME-ATTEMPTS.json) is gitignored — never inflates this worktree's own dirty count" \
   || bad "bookkeeping file leaked into dirty count: $(report_field "$REPO" "$R_OVL" .resume_brief.dirty)"
 
+# -- a bare 429/rate-limit death classifies overloaded too, with IDENTICAL
+#    retry semantics to a genuine 529/overloaded_error death (falsifier (c):
+#    proving 429 was NOT silently made non-retryable when the pressure-
+#    forward gate was narrowed to genuine-overload text only — see
+#    test/heimdall-agent-resume-pressure.test.sh for the pressure-side proof
+#    that this SAME text correctly records no pressure event) --
+R_RL="arratelimit0000012"
+mk_agent "$R_RL" 10 end in_process_teammate ratelimitfixture
+mk_notif2 "$R_RL" failed "Agent terminated early due to an API error: 429 Too Many Requests · rate limit exceeded, retry after 20s"
+[ "$(report_field "$REPO" "$R_RL" .cause.class)" = "overloaded" ] \
+  && ok "bare 429/rate-limit summary -> cause.class = overloaded (same bucket as 529, on purpose)" \
+  || bad "expected cause.class=overloaded for R_RL, got '$(report_field "$REPO" "$R_RL" .cause.class)'"
+[ "$(report_field "$REPO" "$R_RL" .cause.retry_now)" = "true" ] \
+  && ok "FALSIFIER (c): 429 cause -> retry_now=true, unchanged (not silently made non-retryable)" \
+  || bad "FALSIFIER FAILED: 429 cause retry_now should be true, got '$(report_field "$REPO" "$R_RL" .cause.retry_now)'"
+
 # -- the payload text itself carries the cause + action, human-readable --
 PAYLOAD_OVL="$(report_field "$REPO" "$R_OVL" .payload)"
 printf '%s' "$PAYLOAD_OVL" | grep -q "^Cause: overloaded" \

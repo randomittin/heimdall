@@ -292,6 +292,55 @@ RNR="$("$AR" report --json --repo "$REPO" --id "$R_NETREAL" 2>/dev/null)"
   || bad "GUARD BROKEN: network at attempts=1 recorded a pressure event — network must stay unwired even at the fire boundary"
 
 # ═════════════════════════════════════════════════════════════════════════
+# RATE-LIMIT/429 STAYS UNWIRED TOO — same signal-quality reasoning as
+# `network` above, different root cause: _OVERLOAD_RE classifies a bare
+# 429/"too many requests"/rate-limit death as cause.class="overloaded" ON
+# PURPOSE (429 is exactly as retryable as 529 from the caller's own point of
+# view — retry_now/attempts/backoff must treat it identically; see
+# test/heimdall-agent-resume.test.sh's own R_RL fixture for that proof). But
+# a 429 is a SELF-INFLICTED, per-caller admission-control signal, not
+# backend distress — the same exclusion bin/lib/pressure_control.py's
+# PRESSURE_KINDS comment and bin/heimdall-529-scan's classify() both already
+# draw independently. Proven at both the weak (no-worktree) case and the
+# exact attempts==1 fire boundary, mirroring the network proof above.
+# ═════════════════════════════════════════════════════════════════════════
+RATE_LIMIT_TEXT="Agent terminated early due to an API error: 429 Too Many Requests · rate limit exceeded, retry after 20s"
+
+export HOME; HOME="$WORK/home-rl"
+R_RL="arpressratelim000007"
+mk_agent "$R_RL" 10
+mk_notif2 "$R_RL" failed "$RATE_LIMIT_TEXT"
+RRL="$("$AR" report --json --repo "$REPO" --id "$R_RL" 2>/dev/null)"
+[ "$(printf '%s' "$RRL" | jq -r '.[0].cause.class')" = "overloaded" ] \
+  && ok "bare 429/rate-limit fixture STILL classifies overloaded (retry semantics unchanged)" \
+  || bad "expected cause.class=overloaded for a bare 429, got $(printf '%s' "$RRL" | jq -c '.[0].cause')"
+[ ! -f "$(state_file)" ] \
+  && ok "FALSIFIER (a): a death whose text carries ONLY a 429/rate-limit marker records NO overloaded_error pressure event" \
+  || bad "GUARD BROKEN: a bare 429/rate-limit death recorded a pressure event — 429 must never be counted as backend capacity pressure"
+
+# ── the strong case: a REAL worktree, freshly bumped to the EXACT
+# attempts==1 boundary the overload path itself fires on — proving the
+# guard isn't just "no worktree means no marker to fire from" but a real
+# text-based discrimination that holds even when every OTHER condition for
+# firing is satisfied. ──────────────────────────────────────────────────
+export HOME; HOME="$WORK/home-rl-real"
+WT_RL="$WORK/wt-ratelimit-real"
+mk_worktree "$WT_RL" "worktree-agent-rrlreal"
+R_RLREAL="arpressratelimreal008"
+mk_agent_wt "$R_RLREAL" 10 "$WT_RL" "worktree-agent-rrlreal" "Pressure fixture rate-limit-real"
+mk_notif2 "$R_RLREAL" killed "$RATE_LIMIT_TEXT"
+RRLR="$("$AR" report --json --repo "$REPO" --id "$R_RLREAL" 2>/dev/null)"
+[ "$(printf '%s' "$RRLR" | jq -r '.[0].cause.class')" = "overloaded" ] \
+  && ok "429+real-worktree fixture classifies overloaded" \
+  || bad "expected cause.class=overloaded, got $(printf '%s' "$RRLR" | jq -c '.[0].cause')"
+[ "$(printf '%s' "$RRLR" | jq -r '.[0].cause.retry_now')" = "true" ] && [ "$(printf '%s' "$RRLR" | jq -r '.[0].cause.attempts')" = "1" ] \
+  && ok "429+real-worktree: retry_now=true, attempts=1 — bounded-retry bookkeeping is IDENTICAL to a genuine 529 (falsifier (c))" \
+  || bad "expected retry_now=true, attempts=1 for a bare 429, got $(printf '%s' "$RRLR" | jq -c '.[0].cause')"
+[ ! -f "$(state_file)" ] \
+  && ok "FALSIFIER: 429 at attempts=1 (the overload path's own fire condition) still records nothing" \
+  || bad "GUARD BROKEN: a bare 429 at attempts=1 recorded a pressure event — 429 must stay unwired even at the fire boundary"
+
+# ═════════════════════════════════════════════════════════════════════════
 # (d) NEVER LOAD-BEARING: heimdall-pressure absent, then actively failing —
 # heimdall-agent-resume must still exit 0 with its normal .cause shape.
 # ═════════════════════════════════════════════════════════════════════════
