@@ -21,6 +21,9 @@
 #                     stop a live keeper).
 #   W (worktrees)     a MERGED agent worktree is reaped via heimdall-reap-idle; an
 #                     UNMERGED one is KEPT (delegates, never duplicates the logic).
+#   H (stop-hook)     an OLD stop-hook marker for a DEAD session is reaped; an OLD
+#                     marker for a LIVE session is KEPT; non-marker files in the
+#                     stop-hook dir are NEVER touched.
 #   R (run)           `run` is idempotent (a 2nd run exits 0) and NON-FATAL (a broken
 #                     sub-step never aborts the others) and prints a receipt of counts.
 #
@@ -54,8 +57,9 @@ VIS="$HOME_DIR/vis-cache"
 LOGS="$HOME_DIR/logs"
 LEDGER="$HOME_DIR/ledger"
 PKI="$HOME_DIR/pki"
+STOP_HOOK="$HOME_DIR/stop-hook"
 TMPR="$WORK/tmp"
-mkdir -p "$KEEPER_DIR" "$SIGIL" "$VIS" "$LOGS" "$LEDGER" "$PKI" "$TMPR"
+mkdir -p "$KEEPER_DIR" "$SIGIL" "$VIS" "$LOGS" "$LEDGER" "$PKI" "$STOP_HOOK" "$TMPR"
 
 export HEIMDALL_HOME="$HOME_DIR"
 export HEIMDALL_KEEPER_DIR="$KEEPER_DIR"
@@ -104,6 +108,18 @@ touch "$VIS/old_project"; touch -t "$OLD" "$VIS/old_project"
 printf 'A%.0s' $(seq 1 200) > "$LOGS/big.log"        # >50B, fresh -> rotate
 printf 'x\n'                > "$LOGS/old.log"; touch -t "$OLD" "$LOGS/old.log"
 printf 'y\n'                > "$LOGS/fresh.log"       # small + fresh -> keep
+
+# ── stop-hook markers (old dead-session marker reaped, live-session kept, fresh kept) ────
+# The pidfiles already established above carry session names in their filenames:
+#   DEAD_PID pidfile: proj__deadsess.pid  -> session id "deadsess"
+#   LIVE_PID pidfile: proj__livesess.pid  -> session id "livesess"
+# Create markers for both; mark the dead-session one as old, the live-session one as old
+# (should be kept anyway), and a fresh one. Also create a non-marker file to ensure it's
+# not touched.
+: > "$STOP_HOOK/reminded-deadsess";         touch -t "$OLD" "$STOP_HOOK/reminded-deadsess"
+: > "$STOP_HOOK/reminded-livesess";         touch -t "$OLD" "$STOP_HOOK/reminded-livesess"
+: > "$STOP_HOOK/reminded-freshsession"      # fresh marker for a non-live session
+touch "$STOP_HOOK/important_state.json"     # non-marker file, must never be touched
 
 # ── worktree fixture (merged reaped, unmerged kept) ─────────────────────────────
 R="$WORK/repo"
@@ -172,6 +188,20 @@ if command -v git >/dev/null 2>&1; then
     bad "W: FALSIFIER — reaped UNMERGED work"
   fi
 fi
+
+# H — stop-hook markers
+[ ! -e "$STOP_HOOK/reminded-deadsess" ] \
+  && ok "H: old stop-hook marker for a DEAD session reaped" \
+  || bad "H: old dead-session marker survived"
+[ -e "$STOP_HOOK/reminded-livesess" ] \
+  && ok "H: old stop-hook marker for a LIVE session KEPT (never delete live session marker)" \
+  || bad "H: FALSIFIER — reaped a LIVE session's stop-hook marker"
+[ -e "$STOP_HOOK/reminded-freshsession" ] \
+  && ok "H: fresh stop-hook marker KEPT (below TTL)" \
+  || bad "H: fresh marker was deleted"
+[ -e "$STOP_HOOK/important_state.json" ] \
+  && ok "H: non-marker file in stop-hook dir KEPT (only markers are swept)" \
+  || bad "H: FALSIFIER — swept a non-marker file in stop-hook dir"
 
 # receipt
 echo "$RECEIPT" | grep -qiE 'freed|worktree|temp' \

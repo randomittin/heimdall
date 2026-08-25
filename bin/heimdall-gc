@@ -35,6 +35,10 @@
 #        • ~/.heimdall/.sigil-cache/*.sig + vis-cache/*  older than the cache TTL
 #          (both are content-addressed + self-healing — safe to purge; the .srcver
 #          self-heal sidecar is preserved).
+#        • ~/.heimdall/stop-hook/reminded-*  per-session reminder markers older than the
+#          stop-hook TTL. A marker keyed by a LIVE session (a live keeper names it in its
+#          pidfile) is KEPT regardless of age — never delete a live session's reminder
+#          marker. Old markers for dead sessions are reaped.
 #        • ~/.heimdall/logs/*  — an oversize log is ROTATED in place (truncated to its
 #          last lines, kept); an old + small log is deleted. Recent logs are kept.
 #      NEVER deleted (defense-in-depth name/path guard, on TOP of only ever scanning
@@ -69,14 +73,15 @@
 #               [--repo <path>] [--home <dir>]
 #
 # Test/override seams (env):
-#   HEIMDALL_HOME           runtime home root (default ~/.heimdall)
-#   HEIMDALL_KEEPER_DIR     keeper pidfile dir (default <home>/presence-keeper)
-#   HMD_GC_TMP_ROOTS        space-separated temp roots to sweep (default "/tmp $TMPDIR")
-#   HMD_GC_TEMP_TTL_MIN     temp-file TTL in minutes   (default 60)
-#   HMD_GC_CACHE_TTL_HOURS  sigil/vis cache TTL in hours(default 24)
-#   HMD_GC_LOG_MAX_BYTES    log rotate threshold bytes (default 1048576)
-#   HMD_GC_LOG_TAIL_LINES   lines kept when rotating    (default 200)
-#   HMD_GC_LOG_TTL_HOURS    old-log delete TTL in hours (default 168)
+#   HEIMDALL_HOME            runtime home root (default ~/.heimdall)
+#   HEIMDALL_KEEPER_DIR      keeper pidfile dir (default <home>/presence-keeper)
+#   HMD_GC_TMP_ROOTS         space-separated temp roots to sweep (default "/tmp $TMPDIR")
+#   HMD_GC_TEMP_TTL_MIN      temp-file TTL in minutes   (default 60)
+#   HMD_GC_CACHE_TTL_HOURS   sigil/vis cache TTL in hours (default 24)
+#   HMD_GC_STOP_HOOK_TTL_HOURS  stop-hook marker TTL in hours (default 24)
+#   HMD_GC_LOG_MAX_BYTES     log rotate threshold bytes (default 1048576)
+#   HMD_GC_LOG_TAIL_LINES    lines kept when rotating    (default 200)
+#   HMD_GC_LOG_TTL_HOURS     old-log delete TTL in hours (default 168)
 #   HMD_GC_CC_VERSIONS      claude versions dir (default ~/.local/share/claude/versions)
 #   HMD_GC_CC_BIN           claude launcher symlink (default ~/.local/bin/claude)
 #   HMD_GC_CC_LOCKS         claude lock dir (default ~/.local/state/claude/locks)
@@ -118,6 +123,7 @@ KEEPER_DIR="${HEIMDALL_KEEPER_DIR:-$HMD_HOME/presence-keeper}"
 SIGIL_CACHE="$HMD_HOME/.sigil-cache"
 VIS_CACHE="$HMD_HOME/vis-cache"
 LOGS_DIR="$HMD_HOME/logs"
+STOP_HOOK_DIR="$HMD_HOME/stop-hook"
 
 if [ -n "${HMD_GC_TMP_ROOTS:-}" ]; then
   TMP_ROOTS="$HMD_GC_TMP_ROOTS"
@@ -133,6 +139,7 @@ CC_KEEP="${HMD_GC_CC_KEEP:-2}"
 
 TEMP_TTL_MIN="${HMD_GC_TEMP_TTL_MIN:-60}"
 CACHE_TTL_HOURS="${HMD_GC_CACHE_TTL_HOURS:-24}"
+STOP_HOOK_TTL_HOURS="${HMD_GC_STOP_HOOK_TTL_HOURS:-24}"
 LOG_MAX_BYTES="${HMD_GC_LOG_MAX_BYTES:-1048576}"
 LOG_TAIL_LINES="${HMD_GC_LOG_TAIL_LINES:-200}"
 LOG_TTL_HOURS="${HMD_GC_LOG_TTL_HOURS:-168}"
@@ -147,6 +154,7 @@ LOGS_ROTATED=0
 CCV_REAPED=0
 CCV_BYTES=0
 CCV_KEPT=0
+STOP_HOOK_REAPED=0
 
 # ── helpers ──────────────────────────────────────────────────────────────────────
 _report() { [ "$QUIET" = 1 ] && return 0; printf '[gc:%s] %s\n' "$1" "$2" >&2; }
@@ -312,6 +320,9 @@ gc_temp() {
 
   # 3c. logs: rotate oversize (keep), delete old + small.
   gc_logs
+
+  # 3d. stop-hook markers: session reminder markers past TTL (non-live are safe to reap).
+  gc_stop_hook_markers
   return 0
 }
 
@@ -340,6 +351,41 @@ gc_logs() {
       _reap_file "$log"
     fi
   done
+  return 0
+}
+
+# ── 3d. STOP-HOOK MARKERS (per-session reminder markers, old + non-live are safe to reap) ──
+gc_stop_hook_markers() {
+  [ -d "$STOP_HOOK_DIR" ] || return 0
+  local live_sids marker sid keep stop_hook_ttl_min=$((STOP_HOOK_TTL_HOURS * 60))
+  live_sids="$(_live_session_ids)"
+
+  # sweep for markers past the TTL that don't match a live session.
+  while IFS= read -r marker; do
+    [ -n "$marker" ] || continue
+    [ -f "$marker" ] || continue
+    # extract session id from filename: reminded-<session_id>
+    sid="${marker##*/reminded-}"
+    [ -n "$sid" ] || continue
+    # check if this session is live
+    keep=0
+    if [ -n "$live_sids" ]; then
+      while IFS= read -r lsid; do
+        [ -n "$lsid" ] || continue
+        [ "$sid" = "$lsid" ] && { keep=1; break; }
+      done <<< "$live_sids"
+    fi
+    if [ "$keep" = 1 ]; then
+      _report "temp" "keep live-session stop-hook marker: $sid"
+      continue
+    fi
+    # not live — check age and reap if past TTL.
+    if [ -n "$(find "$marker" -maxdepth 0 -type f -mmin +"$stop_hook_ttl_min" 2>/dev/null)" ]; then
+      _report "temp" "reap old stop-hook marker: ${marker##*/}"
+      [ "$DRYRUN" != 1 ] && rm -f "$marker" 2>/dev/null || true
+      STOP_HOOK_REAPED=$((STOP_HOOK_REAPED + 1))
+    fi
+  done < <(find "${STOP_HOOK_DIR%/}/" -maxdepth 1 -type f -name 'reminded-*' 2>/dev/null)
   return 0
 }
 
@@ -444,9 +490,9 @@ print_receipt() {
   [ "$QUIET" = 1 ] && return 0
   local kb=$(((TEMP_BYTES + 512) / 1024))
   local ccmb=$(((CCV_BYTES + 524288) / 1048576))
-  printf 'heimdall-gc%s: freed %d worktree(s), %d orphan pidfile(s) (kept %d live keeper(s)), %d temp file(s) ~%dKB, %d log(s) rotated, %d retired claude version(s) ~%dMB (kept %d in use)\n' \
+  printf 'heimdall-gc%s: freed %d worktree(s), %d orphan pidfile(s) (kept %d live keeper(s)), %d temp file(s) ~%dKB, %d stop-hook marker(s), %d log(s) rotated, %d retired claude version(s) ~%dMB (kept %d in use)\n' \
     "$([ "$DRYRUN" = 1 ] && printf ' (dry-run)')" \
-    "$WT_REAPED" "$PROC_REAPED" "$PROC_KEPT_LIVE" "$TEMP_REAPED" "$kb" "$LOGS_ROTATED" \
+    "$WT_REAPED" "$PROC_REAPED" "$PROC_KEPT_LIVE" "$TEMP_REAPED" "$kb" "$STOP_HOOK_REAPED" "$LOGS_ROTATED" \
     "$CCV_REAPED" "$ccmb" "$CCV_KEPT"
 }
 
