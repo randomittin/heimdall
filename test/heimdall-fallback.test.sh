@@ -99,6 +99,29 @@ conn.close()
 " "$db" "$provider_id" "$mode" "$backend"
 }
 
+# make_fake_session_usage <json-body>
+# Writes a standalone, directly-executable fake heimdall-session-usage that
+# ignores every argument and just prints the given JSON body to stdout,
+# exit 0 -- for HEIMDALL_FALLBACK_SESSION_USAGE_BIN, the test-only override
+# seam bin/heimdall-fallback's own _session_pre_exhaustion_verdict() reads
+# (mirrors HEIMDALL_FALLBACK_ASSUME_REACHABLE's existing pattern above).
+# Exit 0 is deliberate and unconditional: heimdall-fallback's real
+# consultation only trusts stdout JSON, never the exit code, since the real
+# tool's own `status` exits 1 for a genuine CROSSED verdict -- that is not an
+# error, so a fixture that only ever exits 0 cannot accidentally exercise
+# the wrong (exit-code-driven) path.
+make_fake_session_usage() {
+  local json="$1"
+  local dir; dir="$(mktemp -d "${TMPDIR:-/tmp}/hmd-fallback-test-fake-su.XXXXXX")"
+  printf '%s' "$json" > "$dir/body.json"
+  {
+    printf '#!/bin/sh\n'
+    printf 'cat "%s/body.json"\n' "$dir"
+  } > "$dir/heimdall-session-usage"
+  chmod +x "$dir/heimdall-session-usage"
+  printf '%s/heimdall-session-usage' "$dir"
+}
+
 # Hermetic default for the whole suite: nothing here is actually listening on
 # a local gateway port, so "not reachable" is the honest baseline. Sections
 # that need a PASSING reachability check override to "1" for their own scope
@@ -115,6 +138,9 @@ export CLIPROXYAPI_CONFIG_DIR="/nonexistent-heimdall-fallback-test-cliproxyapi"
 # change several sections' expected verdicts.
 unset ANTHROPIC_MODEL
 unset OMNIROUTE_PREFER_CLAUDE_CODE_FOR_UNPREFIXED_CLAUDE_MODELS
+# Nothing outside this suite ever sets this; a real operator shell has never
+# heard of it, but unset it anyway to match the hermetic style above.
+unset HEIMDALL_FALLBACK_SESSION_USAGE_BIN
 
 # Shared, read-only fixture DBs -- the tool only ever opens these via
 # mode=ro, so reuse across many sections below is safe (nothing mutates
@@ -857,6 +883,93 @@ R="$(fresh_repo)"
 write_cfg "$R" '{"state": "auto", "omniroute_db_path": "'"$NATIVE_DB"'"}'
 out="$(fb --repo "$R" check)"
 echo "$out" | grep -q "OK  .*no_delegated_sidecar"   && ok "37. an explicit mode='native' row is NOT a delegated sidecar -> PASSES"   || bad "37. got: $out"
+
+# ── 38. NEW: state=auto + heimdall-session-usage reporting CROSSED, with a
+# fully-passing preflight -> still ROUTE (unchanged from today), and the new
+# best-effort consultation surfaces an explicit, non-gating [INFO] line. This
+# is the "in addition to existing behaviour" case: the checks above are what
+# already produce ROUTE; crossing pre-exhaustion authorizes nothing new by
+# itself, it only gets reported. ────────────────────────────────────────────
+R="$(fresh_repo)"
+export HMD_FB_TEST_KEY="x"
+export ANTHROPIC_MODEL="anthropic/claude-3-5-sonnet-20241022"
+write_cfg "$R" '{
+  "state": "auto",
+  "operator_key_env": "HMD_FB_TEST_KEY",
+  "endpoint": "http://127.0.0.1:20128",
+  "omniroute_db_path": "'"$CLEAN_DB"'",
+  "target_provider": "self-hosted-mixtral"
+}'
+export HEIMDALL_FALLBACK_ASSUME_REACHABLE=1
+export HEIMDALL_FALLBACK_SESSION_USAGE_BIN="$(make_fake_session_usage '{"verdict":"crossed","crossed":true,"source":"budget"}')"
+out="$(fb --repo "$R" check)"; rc=$?
+unset HEIMDALL_FALLBACK_SESSION_USAGE_BIN
+export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
+unset ANTHROPIC_MODEL
+unset HMD_FB_TEST_KEY
+[ "$rc" -eq 0 ] && echo "$out" | grep -q "VERDICT: ROUTE" && echo "$out" | grep -qi "CROSSED" \
+  && ok "38. auto + session-usage CROSSED + passing preflight -> still ROUTE, and check reports the crossed signal" \
+  || bad "38. rc=$rc out='$out'"
+
+# ── 39. NEW: heimdall-session-usage reporting "unknown" must never be treated
+# as "under" -- proven by an explicit allow-list check (verdict == "crossed"),
+# never a deny-list one (verdict != "under"): an "unknown" reading must never
+# satisfy the crossed-only branch, and its own wording must never borrow a
+# confirmed "under" reading's text it has no evidence for. ──────────────────
+R="$(fresh_repo)"
+write_cfg "$R" '{"state": "auto"}'
+export HEIMDALL_FALLBACK_SESSION_USAGE_BIN="$(make_fake_session_usage '{"verdict":"unknown","crossed":false,"source":"budget"}')"
+out_unknown="$(fb --repo "$R" check)"
+unset HEIMDALL_FALLBACK_SESSION_USAGE_BIN
+echo "$out_unknown" | grep -qi "CROSSED" \
+  && bad "39a. an 'unknown' session-usage reading must NEVER trigger the crossed-only line: out='$out_unknown'" \
+  || ok "39a. 'unknown' session-usage reading does not trigger the crossed-only line"
+
+echo "$out_unknown" | grep -qi "could not be determined" \
+  && ok "39b. 'unknown' gets its own honest wording (not silently folded into 'under')" \
+  || bad "39b. out='$out_unknown'"
+
+R2="$(fresh_repo)"
+write_cfg "$R2" '{"state": "auto"}'
+export HEIMDALL_FALLBACK_SESSION_USAGE_BIN="$(make_fake_session_usage '{"verdict":"under","crossed":false,"source":"budget"}')"
+out_under="$(fb --repo "$R2" check)"
+unset HEIMDALL_FALLBACK_SESSION_USAGE_BIN
+echo "$out_under" | grep -qi "could not be determined" \
+  && bad "39c. a genuine 'under' reading must not use unknown's 'could not be determined' wording: out='$out_under'" \
+  || ok "39c. 'under' and 'unknown' produce genuinely distinct wording, not a shared fallback string"
+
+# ── 40. NEW: a missing/broken heimdall-session-usage is best-effort ONLY --
+# must never crash `check`, and must never change any of the OTHER checks'
+# own ok/reason values. ──────────────────────────────────────────────────────
+R="$(fresh_repo)"
+write_cfg "$R" '{
+  "state": "auto",
+  "omniroute_db_path": "/nonexistent-heimdall-fallback-test/omniroute/storage.sqlite",
+  "cliproxyapi_dir": "/nonexistent-heimdall-fallback-test/cli-proxy-api"
+}'
+export HEIMDALL_FALLBACK_SESSION_USAGE_BIN="/nonexistent-heimdall-fallback-test/no-such-heimdall-session-usage"
+out_missing="$(fb --repo "$R" check)"; rc_missing=$?
+unset HEIMDALL_FALLBACK_SESSION_USAGE_BIN
+[ "$rc_missing" -eq 2 ] && echo "$out_missing" | grep -q "VERDICT: WAIT" \
+  && ok "40a. a missing heimdall-session-usage binary does not crash check -- same WAIT verdict as always" \
+  || bad "40a. rc=$rc_missing out='$out_missing'"
+
+export HEIMDALL_FALLBACK_SESSION_USAGE_BIN="$(make_fake_session_usage 'not valid json {{{')"
+out_garbage="$(fb --repo "$R" check)"; rc_garbage=$?
+unset HEIMDALL_FALLBACK_SESSION_USAGE_BIN
+[ "$rc_garbage" -eq 2 ] && echo "$out_garbage" | grep -q "VERDICT: WAIT" \
+  && ok "40b. malformed (non-JSON) heimdall-session-usage output does not crash check -- same WAIT verdict" \
+  || bad "40b. rc=$rc_garbage out='$out_garbage'"
+
+# The preflight FAIL lines themselves must be byte-identical regardless of
+# whether the session-usage consultation succeeded, failed, or was missing --
+# it is informational-only and structurally cannot touch run_preflight's own
+# checks list.
+baseline_fail_lines="$(printf '%s\n' "$out_missing" | grep '\[FAIL\]' | sort)"
+garbage_fail_lines="$(printf '%s\n' "$out_garbage" | grep '\[FAIL\]' | sort)"
+[ "$baseline_fail_lines" = "$garbage_fail_lines" ] && [ -n "$baseline_fail_lines" ] \
+  && ok "40c. every OTHER check's FAIL line is byte-identical whether heimdall-session-usage is missing or returns garbage" \
+  || bad "40c. baseline='$baseline_fail_lines' garbage='$garbage_fail_lines'"
 
 echo "--------------------------------------------------------------------"
 printf 'heimdall-fallback: %d passed, %d failed\n' "$PASS" "$FAIL"

@@ -158,6 +158,26 @@ boundary from a different angle):
       `check` both say this once, plainly, whenever it applies, so the
       operator sees it without having to remember it.
 
+  11. state=="auto" ALSO best-effort-consults bin/heimdall-session-usage's own
+      ~95%-of-session-limit pre-exhaustion verdict and prints it as a plain
+      [INFO] line -- purely informational, NEVER a gated check and never part
+      of the `checks` list _verdict() reads. Crossing that threshold
+      authorizes nothing on its own: every preflight check above (Tier-1,
+      model pin, sidecar, provider allow-list, all of it) still has to pass
+      before `check` will ever print VERDICT: ROUTE, exactly as if this
+      consultation did not exist. heimdall-session-usage's own verdict is one
+      of four: "unconfigured" / "unknown" / "under" / "crossed" -- all four
+      are load-bearing and kept textually distinct on purpose. In particular,
+      "unknown" (tool missing, timed out, or returned something this cannot
+      parse) is NEVER treated as "under": the crossed-only branch is an
+      explicit `verdict == "crossed"` allow-list, not a `verdict != "under"`
+      deny-list, so an unrecognized reading can never be silently promoted
+      into looking like a confirmed threshold-crossing, or silently folded
+      into looking like a confirmed under-threshold reading either. Best
+      effort, no exceptions: a missing, non-executable, timed-out or
+      malformed heimdall-session-usage collapses to "unknown" and changes
+      nothing else -- see _session_pre_exhaustion_verdict().
+
 MUST FAIL CLOSED -- the deliberate inverse of heimdall-quota-advisor's "MUST
 FAIL OPEN". The advisor's job is to never cry wolf: an uncertain exhaustion
 signal must stay silent (exit quietly, print nothing). This tool's job is
@@ -258,6 +278,7 @@ import json
 import os
 import socket
 import sqlite3
+import subprocess
 import sys
 import urllib.parse
 
@@ -317,6 +338,24 @@ NOAUTH_ROUTE_NOTE_FMT = (
     "category the ToS-conflict deny list exists for; target_provider_allowed "
     "still applies independently and is not weakened by this."
 )
+
+# Best-effort session-usage pre-exhaustion consultation for state=="auto" --
+# see header point 11. Four verdicts, all load-bearing: "unknown" must never
+# be read as "under", so the note text below is deliberately distinct for
+# every one of the four, and _session_pre_exhaustion_verdict() only ever
+# returns a value from this exact tuple -- any other outcome it sees
+# collapses to "unknown" there, never invents a fifth state here.
+SESSION_USAGE_VERDICTS = ("unconfigured", "unknown", "under", "crossed")
+SESSION_USAGE_NOTE_FMT = {
+    "crossed": (
+        "pre-exhaustion threshold CROSSED (~95% of session limit) -- the "
+        "checks above are still the ONLY thing that decides ROUTE/WAIT/"
+        "REFUSE; this authorizes nothing on its own"
+    ),
+    "under": "under the pre-exhaustion threshold",
+    "unconfigured": "tracking not configured (see heimdall-session-usage)",
+    "unknown": "could not be determined -- NOT assumed to be under threshold",
+}
 
 # Any of these keys appearing in an on-disk config (any value) is how
 # OmniRoute's MITM mode or a blind trust of its advisory ToS flag would be
@@ -596,6 +635,40 @@ def _blocked_providers_note(repo):
                 "consulted by credential resolution; it has been ignored" % key
             )
     return None
+
+
+def _session_pre_exhaustion_verdict(repo):
+    """Best-effort consult of bin/heimdall-session-usage's own pre-exhaustion
+    verdict (~95% of session limit) for state=="auto"'s [INFO] line -- see
+    header point 11. Every failure mode (missing binary, non-executable,
+    timeout, non-JSON stdout, a JSON body with no recognized "verdict") is
+    swallowed HERE, locally, and collapses to the tool's own pre-existing
+    "unknown" bucket -- never a fifth state, and never left to escape to
+    cmd_check's outer fail-closed net, which would incorrectly turn an
+    already-computed ROUTE/WAIT into a REFUSE; this consultation must never
+    change any other check's verdict. heimdall-session-usage's own `status`
+    exits 1 for a genuine CROSSED verdict -- that is not an error, so success
+    is judged by whether stdout parses as JSON with a recognized "verdict",
+    never by the return code.
+    """
+    exe = os.environ.get("HEIMDALL_FALLBACK_SESSION_USAGE_BIN") or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "heimdall-session-usage"
+    )
+    try:
+        proc = subprocess.run(
+            [exe, "--repo", repo, "status", "--json"],
+            capture_output=True, text=True, timeout=3,
+        )
+    except Exception:
+        return "unknown"
+    try:
+        payload = json.loads(proc.stdout)
+    except (ValueError, TypeError):
+        return "unknown"
+    verdict = payload.get("verdict") if isinstance(payload, dict) else None
+    if verdict not in SESSION_USAGE_VERDICTS:
+        return "unknown"
+    return verdict
 
 
 def run_preflight(cfg):
@@ -940,6 +1013,10 @@ def cmd_check(args):
             if reason:
                 line += " -- %s" % reason
             print(line)
+
+        if state == "auto":
+            session_verdict = _session_pre_exhaustion_verdict(args.repo)
+            print("  [INFO] session_usage -- %s" % SESSION_USAGE_NOTE_FMT[session_verdict])
 
         if state == "on" and tier is not None:
             resolved = TIER_ALIASES.get(tier, tier)
