@@ -179,6 +179,16 @@
         ]
       }
     ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; HOOK=\"$PLUGIN/hooks/heimdall-metric-reminder.sh\"; if [ -x \"$HOOK\" ]; then \"$HOOK\" --repo \"${CLAUDE_PROJECT_DIR:-.}\"; fi; exit 0"
+          }
+        ]
+      }
+    ],
     "SessionEnd": [
       {
         "hooks": [
