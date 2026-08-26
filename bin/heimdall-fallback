@@ -77,10 +77,17 @@ boundary from a different angle):
      treated as corrupt and forced back to state=off.
   3. NEVER route on OmniRoute's own ToS-conflict flag alone. OmniRoute's docs
      call that flag advisory, not a routing gate, and still route through
-     flagged providers by default. hmd applies its OWN gate instead: a
-     provider in BUILTIN_TOS_FLAGGED_PROVIDERS (sourced from the assessment
-     doc's Section 2) is never a fallback target, full stop. Config may only
-     ADD providers to that list, never remove or override a built-in one.
+     flagged providers by default. hmd applies its OWN gate instead:
+     target_provider_allowed refuses any provider named in config's
+     `tos_flagged_providers`, added to a BUILTIN_TOS_FLAGGED_PROVIDERS
+     starting set that is EMPTY by design (owner decision, 2026-08-26 -- see
+     that set's own comment for the full reasoning: the prior ~30-entry set
+     was sourced from the assessment doc's Section 2, a table built for
+     OmniRoute's free-tier POOLED-credential routing, not this tool's
+     operator's-own-key model, and copying it verbatim left the fallback
+     feature permanently inert). Config may still only ADD to this set,
+     never remove or override an entry that IS present -- an operator who
+     wants a provider denied still names it in `tos_flagged_providers`.
   4. Operator's own API keys ONLY. This tool never reads, reuses, or forwards
      the Claude Code OAuth session -- it only checks whether an
      operator-named env var is SET (see run_preflight's "operator_key"
@@ -150,8 +157,10 @@ boundary from a different angle):
       refuses an operator_key_env naming a Claude/Anthropic credential
       (point 4 is absolute, not conditioned on necessity), and (b)
       target_provider_allowed's OWN ToS deny-list check is completely
-      independent -- a provider can be no-auth AND still refused (e.g.
-      `duckduckgo-web` is in both lists). Keyless routes are OmniRoute's
+      independent -- a provider can be no-auth AND still operator-denied
+      (e.g. an operator who lists `duckduckgo-web` in `tos_flagged_providers`
+      still gets it refused even though it is also in NOAUTH_PROVIDERS --
+      see test/heimdall-fallback.test.sh). Keyless routes are OmniRoute's
       free/no-auth tier, the SAME weakest-contractual-terms category the
       ToS-conflict flag in point 3 exists for
       (docs/analysis/2026-08-23-omniroute-assessment.md) -- `status` and
@@ -320,18 +329,55 @@ DEFAULT_CFG = {
     "noauth_providers": [],
 }
 
-# Sourced verbatim from docs/analysis/2026-08-23-omniroute-assessment.md,
-# Section 2 (providers whose ToS explicitly prohibit proxy/resale use). This
-# is hmd's OWN gate -- see header point 3 -- and config may only ADD to it,
-# never override or shrink it.
-BUILTIN_TOS_FLAGGED_PROVIDERS = frozenset({
-    "groq", "fireworks", "together", "siliconflow", "kiro",
-    "blackbox", "friendliai", "modal", "nlpcloud", "ai21", "agy",
-    "coze", "iflytek", "duckduckgo-web", "featherless-ai", "amazon-q",
-    "qwen-web", "t3-web", "muse-spark-web",
-    "mistral", "openrouter", "nvidia", "cerebras", "cohere",
-    "huggingface", "vertex", "baidu", "tencent", "doubao",
-})
+# EMPTY BY DESIGN (owner decision, 2026-08-26). hmd's OWN gate is unchanged --
+# target_provider_allowed still refuses any provider named in
+# `tos_flagged_providers` (deny = this set | config's additions, see
+# run_preflight below) -- only the STARTING set that field adds to has
+# changed, from ~30 entries to none. Config may still only ADD to this set,
+# never remove or override an entry that IS present: an operator who wants a
+# specific provider denied still lists it in `tos_flagged_providers` and it
+# is refused exactly as before -- see header point 3.
+#
+# WHY: the previous ~30-entry set was copied verbatim from
+# docs/analysis/2026-08-23-omniroute-assessment.md, Section 2 -- a table
+# OmniRoute's own maintainers built to flag providers whose ToS prohibits
+# being PROXIED/RESOLD through OmniRoute's free-tier, POOLED-credential
+# routing (e.g. groq: "prohibits reselling, sublicensing, or distributing
+# API access"; together: "prohibits transferring, distributing, reselling...
+# on a s[tandalone basis]"). That is a real conflict for OmniRoute's free
+# tier, but this tool never touches OmniRoute's shared credentials at all --
+# header point 4 is OPERATOR'S OWN API keys ONLY, a direct pinned request
+# through a locally-hosted gateway the operator runs themselves. Copying the
+# free-tier table into THIS tool's deny list conflated "OmniRoute's free-tier
+# PROXIED access to provider X" with "provider X itself": using the
+# operator's own key against, say, Mistral's official first-party API is not
+# a ToS conflict with anyone. docs/analysis/2026-08-25-omniroute-credential-
+# isolation.md S5 independently found this exact shape to be the
+# structurally CLEAN one -- its own worked example is a pinned
+# `mistral/mistral-large-latest` request, which "never enters the
+# multi-provider candidate pool" and (chatCore.ts:2733) has "no other target
+# to fail over to," i.e. it cannot cascade into Tier-1 either. With the old
+# table covering nearly every real provider name by design (the assessment
+# doc flagged ~30 across its "caution" and lower-confidence tiers),
+# target_provider_allowed could never pass and the fallback feature was
+# permanently inert regardless of an operator's own choice. The operator
+# turns fallback on EXPLICITLY (`heimdall-fallback set on|auto|switch` is a
+# deliberate act hmd never performs itself -- see "NO AUTO-SWITCH
+# CONTRADICTION" above) and has already accepted the data-handling tradeoff
+# (2026-08-23-omniroute-assessment.md's disqualifier-1 finding; the
+# credential-isolation doc's own "OUT OF SCOPE" explicitly declines to
+# re-litigate "data-handling/no-train/retention posture of Mistral or LLM7 --
+# owner has explicitly accepted that risk"). A built-in list overriding that
+# explicit, informed choice is hmd deciding for the operator.
+#
+# WHAT THIS DOES NOT TOUCH: the Tier-1 boundary -- tier1_credential_absent,
+# anthropic_model_pinned, prefer_claude_code_flag_off, and
+# no_delegated_sidecar (header point 1a-1d) -- is what actually protects the
+# operator's own Anthropic account, and none of those four checks reads this
+# set at all. See test/heimdall-fallback.test.sh's dedicated falsifiers
+# proving a `claude` provider_connections row is still refused, and
+# state=switch still REFUSEs on a failing Tier-1 check, with this set empty.
+BUILTIN_TOS_FLAGGED_PROVIDERS = frozenset()
 
 # Providers OmniRoute serves via a SYNTHETIC "noauth" connection instead of a
 # provider_connections credential row -- sourced verbatim (READ, not guessed)

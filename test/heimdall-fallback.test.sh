@@ -318,7 +318,12 @@ echo "$out" | grep -q "FAIL.*endpoint_local" && echo "$out" | grep -qi "loopback
   || bad "9. got: $out"
 unset HMD_FB_TEST_KEY
 
-# ── 10. ToS deny-list blocks a builtin-flagged provider, names it ───────────
+# ── 10. operator-configured tos_flagged_providers entry blocks a provider,
+# names it. UPDATED 2026-08-26: BUILTIN_TOS_FLAGGED_PROVIDERS is now EMPTY by
+# design (owner decision -- see bin/heimdall-fallback's own comment on that
+# set), so 'groq' is no longer built-in-denied; this now proves the
+# OPERATOR-CONFIGURABLE override mechanism instead, which survives that
+# change untouched (acceptance criterion (b)). ──────────────────────────────
 R="$(fresh_repo)"
 export HMD_FB_TEST_KEY="x"
 export ANTHROPIC_MODEL="anthropic/claude-3-5-sonnet-20241022"
@@ -327,14 +332,15 @@ write_cfg "$R" '{
   "operator_key_env": "HMD_FB_TEST_KEY",
   "endpoint": "http://127.0.0.1:20128",
   "omniroute_db_path": "'"$CLEAN_DB"'",
-  "target_provider": "groq"
+  "target_provider": "groq",
+  "tos_flagged_providers": ["groq"]
 }'
 export HEIMDALL_FALLBACK_ASSUME_REACHABLE=1
 out="$(fb --repo "$R" check)"
 export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
 unset ANTHROPIC_MODEL
 echo "$out" | grep -q "FAIL.*target_provider_allowed" && echo "$out" | grep -q "groq" \
-  && ok "10. builtin ToS-flagged provider (groq) -> refused and named in the reason" \
+  && ok "10. operator-configured tos_flagged_providers entry (groq) -> refused and named in the reason (built-in deny list is empty by default since 2026-08-26; the override mechanism still works)" \
   || bad "10. got: $out"
 unset HMD_FB_TEST_KEY
 
@@ -734,14 +740,19 @@ unset ANTHROPIC_MODEL
   && ok "30. key-requiring target_provider with NO key configured -> REFUSE (operator_key fails, unaffected by no-auth logic)" \
   || bad "30. rc=$rc out='$out'"
 
-# ── 31. NEW: no-auth does NOT weaken target_provider_allowed's separate ToS gate ─
+# ── 31. no-auth does NOT weaken target_provider_allowed's separate ToS gate.
+# UPDATED 2026-08-26: the built-in deny list is now empty by design, so
+# 'duckduckgo-web' needs an explicit operator tos_flagged_providers entry to
+# be denied here -- this now proves BOTH that the override mechanism works
+# AND that no-auth status never weakens it, on the same provider. ──────────
 R="$(fresh_repo)"
 export ANTHROPIC_MODEL="anthropic/claude-3-5-sonnet-20241022"
 write_cfg "$R" '{
   "state": "on",
   "endpoint": "http://127.0.0.1:20128",
   "omniroute_db_path": "'"$CLEAN_DB"'",
-  "target_provider": "duckduckgo-web"
+  "target_provider": "duckduckgo-web",
+  "tos_flagged_providers": ["duckduckgo-web"]
 }'
 export HEIMDALL_FALLBACK_ASSUME_REACHABLE=1
 out="$(fb --repo "$R" check)"; rc=$?
@@ -749,7 +760,7 @@ export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
 unset ANTHROPIC_MODEL
 [ "$rc" -eq 1 ] && echo "$out" | grep -q "VERDICT: REFUSE" && echo "$out" | grep -q "OK.*operator_key" \
   && echo "$out" | grep -q "FAIL.*target_provider_allowed" \
-  && ok "31. no-auth provider that is ALSO ToS-deny-listed ('duckduckgo-web') -> operator_key passes keyless, but target_provider_allowed still REFUSEs independently" \
+  && ok "31. no-auth provider that is operator-deny-listed ('duckduckgo-web' in tos_flagged_providers) -> operator_key passes keyless, but target_provider_allowed still REFUSEs independently" \
   || bad "31. rc=$rc out='$out'"
 
 # ── 32. NEW: operator can DECLARE an additional no-auth provider via config ──
@@ -1042,6 +1053,106 @@ unset HMD_FB_TEST_KEY
 [ "$rc" -eq 2 ] && echo "$out" | grep -q "VERDICT: WAIT" && ! echo "$out" | grep -q "VERDICT: ROUTE" \
   && ok "43. auto + passing preflight + session-usage UNKNOWN -> WAIT, NOT route (fails closed on unmeasurable capacity)" \
   || bad "43. got rc=$rc out='$out'"
+
+# ── 44. NEW (2026-08-26 deny-list-emptied correction): a real provider name
+# formerly on the built-in ToS deny list now PASSES target_provider_allowed
+# by default, and the SAME provider can still be denied by an explicit
+# operator tos_flagged_providers entry -- proving both halves of the owner's
+# decision (empty default + working override) on one provider (acceptance
+# criteria (a) and (b)). ─────────────────────────────────────────────────────
+R="$(fresh_repo)"
+write_cfg "$R" '{
+  "state": "auto",
+  "omniroute_db_path": "'"$CLEAN_DB"'",
+  "target_provider": "mistral"
+}'
+out="$(fb --repo "$R" check)"
+echo "$out" | grep -q "OK.*target_provider_allowed" && ! echo "$out" | grep -q "FAIL.*target_provider_allowed" \
+  && ok "44a. falsifier: a real provider ('mistral') formerly on the built-in deny list now PASSES target_provider_allowed by default" \
+  || bad "44a. got: $out"
+
+R2="$(fresh_repo)"
+write_cfg "$R2" '{
+  "state": "auto",
+  "omniroute_db_path": "'"$CLEAN_DB"'",
+  "target_provider": "mistral",
+  "tos_flagged_providers": ["mistral"]
+}'
+out2="$(fb --repo "$R2" check)"
+echo "$out2" | grep -q "FAIL.*target_provider_allowed" && echo "$out2" | grep -q "mistral" \
+  && ok "44b. same provider ('mistral'), operator explicitly adds it to tos_flagged_providers -> target_provider_allowed FAILS, named (the override mechanism survives an empty built-in default)" \
+  || bad "44b. got: $out2"
+
+# ── 45. NEW: target_provider_allowed's completeness check is untouched by the
+# deny-list change -- an EMPTY target_provider still FAILS, always (this is a
+# completeness check, not a policy one; emptying the deny list must never
+# turn "nothing pinned" into a pass) (acceptance criterion (c)). ────────────
+R="$(fresh_repo)"
+write_cfg "$R" '{
+  "state": "auto",
+  "omniroute_db_path": "'"$CLEAN_DB"'",
+  "target_provider": ""
+}'
+out="$(fb --repo "$R" check)"
+echo "$out" | grep -q "FAIL.*target_provider_allowed" && echo "$out" | grep -qi "no target_provider configured" \
+  && ok "45. empty target_provider still FAILS target_provider_allowed (completeness check, unaffected by the deny-list default)" \
+  || bad "45. got: $out"
+
+# ── 46. NEW (the one that matters): with the built-in deny list EMPTY, a
+# config whose target_provider is a provider that USED TO be built-in-denied
+# (so target_provider_allowed now legitimately PASSES) still gets REFUSEd
+# overall, because the OmniRoute DB carries a live 'claude' Tier-1 row --
+# proving tier1_credential_absent (the check that actually protects the
+# operator's Anthropic account) is completely independent of, and unweakened
+# by, this change (acceptance criterion (d)). ───────────────────────────────
+R="$(fresh_repo)"
+export HMD_FB_TEST_KEY="x"
+export ANTHROPIC_MODEL="anthropic/claude-3-5-sonnet-20241022"
+write_cfg "$R" '{
+  "state": "on",
+  "operator_key_env": "HMD_FB_TEST_KEY",
+  "endpoint": "http://127.0.0.1:20128",
+  "omniroute_db_path": "'"$TIER1_CLAUDE_DB"'",
+  "target_provider": "mistral"
+}'
+export HEIMDALL_FALLBACK_ASSUME_REACHABLE=1
+out="$(fb --repo "$R" check)"; rc=$?
+export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
+unset ANTHROPIC_MODEL
+[ "$rc" -eq 1 ] && echo "$out" | grep -q "VERDICT: REFUSE" \
+  && echo "$out" | grep -q "OK.*target_provider_allowed" \
+  && echo "$out" | grep -q "FAIL.*tier1_credential_absent" && echo "$out" | grep -qi "claude" \
+  && ok "46. falsifier: deny list empty (target_provider_allowed now PASSES for 'mistral'), but OmniRoute DB has a live 'claude' Tier-1 row -> still REFUSE overall, tier1_credential_absent FAILS independently" \
+  || bad "46. rc=$rc out='$out'"
+unset HMD_FB_TEST_KEY
+
+# ── 47. NEW: state=switch + failing Tier-1 check is still REFUSE, even for a
+# target_provider the (now-empty) deny list would otherwise allow -- switch's
+# tier-blind, always-try semantics never bypass the Tier-1 boundary (header
+# point 9: switch changes WHAT routes, never whether a failing Tier-1 check
+# is survivable). Complements test 23, which proves the same thing with a
+# provider that was never on the old deny list either way (acceptance
+# criterion (e)). ────────────────────────────────────────────────────────────
+R="$(fresh_repo)"
+export HMD_FB_TEST_KEY="x"
+export ANTHROPIC_MODEL="anthropic/claude-3-5-sonnet-20241022"
+write_cfg "$R" '{
+  "state": "switch",
+  "operator_key_env": "HMD_FB_TEST_KEY",
+  "endpoint": "http://127.0.0.1:20128",
+  "omniroute_db_path": "'"$TIER1_CLAUDE_DB"'",
+  "target_provider": "cohere"
+}'
+export HEIMDALL_FALLBACK_ASSUME_REACHABLE=1
+out="$(fb --repo "$R" check)"; rc=$?
+export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
+unset ANTHROPIC_MODEL
+[ "$rc" -eq 1 ] && echo "$out" | grep -q "VERDICT: REFUSE" \
+  && echo "$out" | grep -q "OK.*target_provider_allowed" \
+  && echo "$out" | grep -q "FAIL.*tier1_credential_absent" \
+  && ok "47. falsifier: state=switch + target_provider ('cohere') now allowed by the empty deny list + failing Tier-1 check -> still REFUSE (no state, and no deny-list change, ever bypasses Tier-1 safety)" \
+  || bad "47. rc=$rc out='$out'"
+unset HMD_FB_TEST_KEY
 
 echo "--------------------------------------------------------------------"
 printf 'heimdall-fallback: %d passed, %d failed\n' "$PASS" "$FAIL"
