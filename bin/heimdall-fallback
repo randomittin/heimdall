@@ -210,6 +210,37 @@ boundary from a different angle):
       heimdall-session-usage collapses to "unknown" and changes nothing else
       about the OTHER checks -- see _session_pre_exhaustion_verdict().
 
+  12. `arm` (heimdall-fallback arm [--provider P] [--state auto|on|switch])
+      exists so "turn fallback on" does not mean "hand the operator a
+      hand-edited JSON file and a checklist" -- see cmd_arm. It
+      self-provisions everything it can HONESTLY justify: a target_provider
+      (auto-picking a no-auth one from NOAUTH_PROVIDERS when nothing usable
+      is already configured, reusing an already-valid existing one, or
+      validating an operator-supplied --provider) and the matching
+      operator_key_env (always empty for a no-auth target; for a keyed
+      target, REUSED from an already-configured, already-populated,
+      non-Claude env var -- never invented) -- then writes state. It obeys
+      every constraint above with no exception carved out for itself: it
+      refuses outright, and leaves the on-disk config byte-for-byte
+      UNCHANGED, for a claude/claude-web target (point 1 -- arm enforces
+      this itself, since target_provider is never cross-checked against
+      TIER1_DB_PROVIDERS anywhere else in this file; the Tier-1 boundary is
+      enforced by reading OmniRoute's own DB, not by inspecting this
+      field), a ToS-denied target (point 3), a keyed target with no usable
+      key (point 4 -- arm never invents a credential), or when no honest
+      no-auth candidate remains. It cannot perform the two genuinely
+      unavoidable manual steps -- exporting ANTHROPIC_MODEL into the
+      PARENT shell (no child process can mutate the environment of the
+      process that launched it; there is no syscall for that) and starting
+      the OmniRoute gateway itself (bin/heimdall-fallback is a policy gate,
+      never a transport -- see the module's opening line -- so starting a
+      long-running service is squarely someone else's job) -- so it prints
+      the exact `export` line and the gateway's real reachability instead
+      of pretending either is already done. It always ends by calling the
+      exact same run_preflight/_verdict path `check` uses, against
+      whatever is now on disk, and returns that exact exit code -- arm is
+      self-verifying, never a "trust me" tool.
+
 MUST FAIL CLOSED -- the deliberate inverse of heimdall-quota-advisor's "MUST
 FAIL OPEN". The advisor's job is to never cry wolf: an uncertain exhaustion
 signal must stay silent (exit quietly, print nothing). This tool's job is
@@ -250,6 +281,11 @@ USAGE
                                                 question every existing caller
                                                 (bin/lib/issue_loop.py) already asks -- see
                                                 header point 8.
+  heimdall-fallback arm [--provider P]          self-provision target_provider +
+                        [--state auto|on|switch]  operator_key_env (never inventing a
+                                                credential) and write state, then run
+                                                check and report its verdict. See header
+                                                point 12.
   heimdall-fallback where                      print the config file path
 
 Global flags (before the subcommand -- matches bin/heimdall-pressure /
@@ -298,6 +334,13 @@ EXIT CODES
                               print the reasons, do not route blind; tier is
                               NEVER consulted here -- auto is an exhaustion
                               reaction, not a capability decision)
+  arm           : mirrors check's own contract exactly -- 0 = ROUTE, 1 = REFUSE,
+                  2 = WAIT -- because arm always ends by running that exact
+                  preflight against whatever config is now on disk (the one it
+                  just wrote, or the untouched original if it refused to write).
+                  A write failure during arm -> 3 if --strict, else 0 (never-
+                  fail-caller, matching set's own contract for the same failure
+                  mode).
   argument-parsing errors (any subcommand, including an unrecognized --tier
   value) : 0 unless --strict -> 2
   unexpected internal error (outer safety net; check() fails closed on its
@@ -1048,6 +1091,7 @@ def _verdict(state, checks, tier=None, session_verdict=None):
 
 
 def cmd_status(args):
+    config_path = _cfg_path(args.repo)
     cfg, corrupt_reason = load_config(args.repo)
     checks = run_preflight(cfg)
     would_pass = all(ok for _, ok, _ in checks)
@@ -1064,6 +1108,7 @@ def cmd_status(args):
     if args.json:
         payload = {
             "state": cfg["state"],
+            "config_path": config_path,
             "full_switch": is_switch,
             "would_preflight_pass": would_pass,
             "operator_key_env": key_env,
@@ -1077,6 +1122,7 @@ def cmd_status(args):
         print(json.dumps(payload, sort_keys=True))
     else:
         print("heimdall-fallback status")
+        print("  config:                %s" % config_path)
         state_line = cfg["state"]
         if is_switch:
             state_line += "   *** %s ***" % switch_warning
@@ -1096,6 +1142,7 @@ def cmd_set(args):
     # args.value is already constrained to VALID_STATES by argparse's own
     # choices= validation (raises Rejected -> handled in main() -> exit 0
     # unless --strict, exit 2). Nothing left to validate here.
+    config_path = _cfg_path(args.repo)
     cfg, _ = load_config(args.repo)
     cfg["state"] = args.value
     try:
@@ -1103,12 +1150,14 @@ def cmd_set(args):
     except OSError as exc:
         sys.stderr.write("heimdall-fallback set: failed to write config: %s\n" % exc)
         return 3 if args.strict else 0
+    print("  config:                %s" % config_path)
     print("state set to '%s'" % args.value)
     return 0
 
 
 def cmd_check(args):
     try:
+        config_path = _cfg_path(args.repo)
         cfg, _ = load_config(args.repo)
         checks = run_preflight(cfg)
         state = cfg["state"]
