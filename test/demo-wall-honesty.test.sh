@@ -66,6 +66,61 @@ bad() { printf '  \033[31mFAIL\033[0m %s\n' "$1"; FAIL=$((FAIL+1)); }
 # gate rather than hang CI.
 run() { perl -e 'alarm shift; exec @ARGV' "$@"; }
 
+# Portable path stamp: mtime + size, BSD stat then GNU stat (mirrors
+# test/checkpoint-autosave.test.sh:55's mtime_of()), falling back to a zeroed
+# stamp — never a silent drop — so a file that vanishes between find and stat
+# still shows up as a changed line instead of disappearing invisibly.
+stamp_of() { stat -f '%N %m %z' "$1" 2>/dev/null || stat -c '%n %Y %s' "$1" 2>/dev/null || printf '%s 0 0\n' "$1"; }
+
+# Full recursive (path, mtime, size) snapshot of the real ~/.heimdall, used by
+# C3 below instead of a bare top-directory mtime compare.
+#
+# WHY A DIRECTORY-MTIME COMPARE IS NOT ENOUGH: this machine's live statusline
+# (refreshInterval: 2s in the operator's Claude Code settings) and its hooks
+# are entirely unrelated to this seeder, yet both legitimately write under the
+# real ~/.heimdall on their own schedule:
+#   - sentinels/hmd-statusline.py's persist_rate_limits() writes
+#     ~/.heimdall/rate-limits.json via tmp+os.replace() on every render.
+#   - the PreToolUse ctx-meter hook writes ~/.heimdall/ctx/<session-id>.json
+#     on every tool call (bin/heimdall-ctx-meter notice).
+#   - the statusline's throttled presence beat drives bin/heimdall-status-json,
+#     which writes ~/.heimdall/ledger/status.json via the same tmp+rename
+#     pattern (opposite tmp-name order: <path>.tmp.<pid> vs rate-limits'
+#     <path>.<pid>.tmp).
+# A tmp+rename INSIDE a directory bumps that directory's OWN mtime too (not
+# just the file's) — so a bare `ls -lTd ~/.heimdall` before/after false-
+# positived on all three, none of which have anything to do with the seeder
+# (confirmed by grep: none of these paths appear anywhere in
+# bin/heimdall-seed-demo-wall).
+#
+# THE FIX IS A FULL SNAPSHOT DIFF, NOT A LOOSER CHECK: this walks every path
+# under ~/.heimdall and stamps each one — STRICTLY MORE sensitive than the old
+# check (a write to ANY file anywhere in the tree now fails C3, including an
+# in-place content overwrite with no rename at all, which the old directory-
+# mtime compare would have missed entirely) except for the three writers named
+# above, excluded BY EXACT PATH — never a wildcarded directory — so a genuine
+# escape into a sibling file, even right next to rate-limits.json or inside
+# ledger/, still fails the gate. ctx/ is the one subtree excluded wholesale,
+# because it is inherently dynamic (a new file per Claude Code session, not a
+# fixed name) — it is independently hook-driven and the seeder never
+# references it either.
+home_heimdall_snapshot() {
+  [ -d "$HOME/.heimdall" ] || return 0
+  local rl="$HOME/.heimdall/rate-limits.json"
+  local lg="$HOME/.heimdall/ledger/status.json"
+  local lgdir="$HOME/.heimdall/ledger"
+  local ctx="$HOME/.heimdall/ctx"
+  find "$HOME/.heimdall" -mindepth 1 2>/dev/null | sort | while IFS= read -r f; do
+    case "$f" in
+      "$rl"|"$rl".*.tmp) continue ;;  # statusline rate-limit persister
+      "$lg"|"$lg".tmp.*) continue ;;  # heimdall-status-json persister
+      "$lgdir") continue ;;           # the rename above also bumps ledger/'s own mtime
+      "$ctx"|"$ctx"/*) continue ;;    # per-session ctx-meter hook writes
+    esac
+    stamp_of "$f"
+  done
+}
+
 NODE="$(command -v node || true)"
 PY="$(command -v python3 || command -v python || true)"
 JQ="$(command -v jq || true)"
@@ -163,13 +218,15 @@ grep -q 'HEIMDALL_SEED_LIVE_CONFIRM' "$LIVE_OUT" 2>/dev/null \
   && ok "C2 the refusal names the exact opt-in, so going live is deliberate not discovered" \
   || bad "C2 the refusal does not name \$HEIMDALL_SEED_LIVE_CONFIRM"
 
-# The real presence state must be untouched by any exercise above.
-HOME_STAMP_BEFORE="$(ls -lTd "$HOME/.heimdall" 2>/dev/null | awk '{print $6,$7,$8,$9}')"
+# The real presence state must be untouched by any exercise above. Snapshot
+# every path under ~/.heimdall (see home_heimdall_snapshot() above for why a
+# bare directory-mtime compare is not enough on this machine).
+HOME_STAMP_BEFORE="$(home_heimdall_snapshot)"
 run 120 bash "$SEEDER" --count 3 >/dev/null 2>&1
-HOME_STAMP_AFTER="$(ls -lTd "$HOME/.heimdall" 2>/dev/null | awk '{print $6,$7,$8,$9}')"
+HOME_STAMP_AFTER="$(home_heimdall_snapshot)"
 [ "$HOME_STAMP_BEFORE" = "$HOME_STAMP_AFTER" ] \
-  && ok "C3 a dry-run leaves the real ~/.heimdall mtime unchanged" \
-  || bad "C3 the real ~/.heimdall was modified by a dry-run ('$HOME_STAMP_BEFORE' -> '$HOME_STAMP_AFTER')"
+  && ok "C3 a dry-run leaves the real ~/.heimdall untouched (full recursive snapshot)" \
+  || bad "C3 the real ~/.heimdall was modified by a dry-run: $(diff <(printf '%s' "$HOME_STAMP_BEFORE") <(printf '%s' "$HOME_STAMP_AFTER"))"
 
 if [ -d "$HOME/.heimdall" ] && grep -rqs "$SEED_PROJECT" "$HOME/.heimdall" 2>/dev/null; then
   bad "C4 the demo project '$SEED_PROJECT' leaked into the real ~/.heimdall"
