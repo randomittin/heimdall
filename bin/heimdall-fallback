@@ -437,6 +437,40 @@ NOAUTH_PROVIDERS = frozenset({
     "codex-app-server", "uncloseai", "aihorde",
 })
 
+# Tool-use capability of the no-auth providers, used ONLY to order arm's
+# self-pick so the happy path does not default-select a provider that cannot
+# do the work. Sourced from docs/analysis/2026-08-26-omniroute-gateway-start.md,
+# which traced OmniRoute's own provider registry.
+#
+# HONESTY BOUNDARY, and it matters: only the two sets below are EVIDENCED.
+# Everything not listed here inherits an *unverified optimistic default* from
+# OmniRoute's own capability heuristic -- several such providers are
+# reverse-engineered consumer web UIs where real native tool support is
+# doubtful. So a provider ranking best here is "not known to be incapable",
+# NOT "measured capable". Never render this ordering as a capability promise.
+NOAUTH_TOOLS_DENIED = frozenset({
+    # explicit `tools` entry in `unsupportedParams` in its own registry entry
+    "aihorde",
+    # video-only, not a chat surface at all
+    "veoaifree-web",
+})
+NOAUTH_TOOLS_EMULATED = frozenset({
+    # "emulated" tool use: prompt-injected then text-parsed, not native
+    "devin-cli-agentic", "duckduckgo-web",
+})
+
+
+def _arm_provider_rank(provider):
+    """Deterministic preference rank for arm's self-pick: prefer providers not
+    known to be incapable, then emulated, then explicitly denied. Ties break
+    alphabetically so the pick stays reproducible (a nondeterministic default
+    would make `arm` unauditable)."""
+    if provider in NOAUTH_TOOLS_DENIED:
+        return 2
+    if provider in NOAUTH_TOOLS_EMULATED:
+        return 1
+    return 0
+
 # One-time, plain explanation surfaced in BOTH `status` and `check` whenever
 # the pinned target_provider resolves to a no-auth route (never nagged, never
 # repeated beyond the one line) -- the owner's own framing: keyless does not
@@ -1313,7 +1347,10 @@ def _arm_select_provider(args, cfg):
     deny = BUILTIN_TOS_FLAGGED_PROVIDERS | {
         p.strip().lower() for p in cfg.get("tos_flagged_providers", []) if isinstance(p, str)
     }
-    candidates = sorted(p for p in noauth if p not in deny and p not in TIER1_DB_PROVIDERS)
+    candidates = sorted(
+        (p for p in noauth if p not in deny and p not in TIER1_DB_PROVIDERS),
+        key=lambda p: (_arm_provider_rank(p), p),
+    )
     if not candidates:
         return None, None, False, (
             "no honest no-auth provider is available to self-provision -- every known "

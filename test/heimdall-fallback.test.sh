@@ -1157,7 +1157,7 @@ unset HMD_FB_TEST_KEY
 
 # ── 48. NEW: `arm`, given nothing pre-configured, self-provisions a no-auth
 # target_provider (deterministic: sorted() over the no-auth candidates picks
-# "aihorde" first) with an EMPTY operator_key_env (never inventing a
+# capability-ranked first pick "auggie") with an EMPTY operator_key_env (never inventing a
 # credential for a route that needs none -- header point 10/12), writes
 # state, and -- once the two genuinely-manual preconditions arm cannot
 # perform itself (ANTHROPIC_MODEL export, gateway already running) are
@@ -1175,9 +1175,9 @@ export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
 unset ANTHROPIC_MODEL
 cfg_out="$(cat "$(cfg_path "$R")")"
 [ "$rc" -eq 0 ] && echo "$out" | grep -q "VERDICT: ROUTE" \
-  && echo "$cfg_out" | grep -q '"target_provider": "aihorde"' \
+  && echo "$cfg_out" | grep -q '"target_provider": "auggie"' \
   && echo "$cfg_out" | grep -q '"operator_key_env": ""' \
-  && ok "48. arm with nothing pre-configured self-provisions no-auth 'aihorde' with an EMPTY operator_key_env and reaches VERDICT: ROUTE end-to-end" \
+  && ok "48. arm with nothing pre-configured self-provisions no-auth 'auggie' with an EMPTY operator_key_env and reaches VERDICT: ROUTE end-to-end" \
   || bad "48. rc=$rc out='$out' cfg='$cfg_out'"
 
 # ── 49. NEW: that same arm run's stdout carries the mandatory operator
@@ -1195,7 +1195,7 @@ export ANTHROPIC_MODEL="anthropic/claude-3-5-sonnet-20241022"
 out="$(fb --repo "$R" arm --state on)"
 export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
 unset ANTHROPIC_MODEL
-echo "$out" | grep -q "export ANTHROPIC_MODEL=aihorde/" \
+echo "$out" | grep -q "export ANTHROPIC_MODEL=auggie/" \
   && echo "$out" | grep -qi "cannot" \
   && echo "$out" | grep -qi "gateway:.*reachable" \
   && ok "49. arm's own output names the unavoidable 'export ANTHROPIC_MODEL=' step, explains why arm itself cannot do it, and reports real gateway reachability" \
@@ -1251,7 +1251,7 @@ write_cfg "$R" '{
 }'
 out="$(fb --repo "$R" arm --state on)"
 cfg_out="$(cat "$(cfg_path "$R")")"
-echo "$cfg_out" | grep -q '"target_provider": "aihorde"' \
+echo "$cfg_out" | grep -q '"target_provider": "auggie"' \
   && ! echo "$cfg_out" | grep -q '"target_provider": "claude"' \
   && ! echo "$cfg_out" | grep -q '"target_provider": "claude-web"' \
   && ok "52. arm never reuses/preserves a pre-existing claude target_provider -- overwrites it away to a safe no-auth pick" \
@@ -1282,7 +1282,7 @@ echo "$out_status1" | grep -qF "$(cfg_path "$R1")" \
 # field from DEFAULT_CFG), and arm REUSES an already-valid existing
 # target_provider from such a config rather than silently re-picking a
 # different one -- "opencode" is deliberately NOT the deterministic
-# first-sorted no-auth candidate ("aihorde" is), so reuse and re-pick are
+# capability-ranked first no-auth candidate ("auggie" is), so reuse and re-pick are
 # actually distinguishable outcomes here, not the same string by accident. ──
 R="$(fresh_repo)"
 write_cfg "$R" '{"state": "auto", "target_provider": "opencode"}'
@@ -1297,7 +1297,7 @@ cfg_out="$(cat "$(cfg_path "$R")")"
 [ "$rc_arm" -eq 1 ] && echo "$out_arm" | grep -q "target_provider:.*opencode" \
   && echo "$out_arm" | grep -q "VERDICT: REFUSE" \
   && echo "$cfg_out" | grep -q '"target_provider": "opencode"' \
-  && ok "54b. arm reuses the already-valid, non-default 'opencode' target_provider from a partial/old-schema config rather than re-picking the deterministic default ('aihorde') -- its own trailing check REFUSEs (this partial config has no working omniroute_db_path), proving arm actually ran rather than silently no-op'ing" \
+  && ok "54b. arm reuses the already-valid, non-default 'opencode' target_provider from a partial/old-schema config rather than re-picking the deterministic default ('auggie') -- its own trailing check REFUSEs (this partial config has no working omniroute_db_path), proving arm actually ran rather than silently no-op'ing" \
   || bad "54b. rc=$rc_arm out='$out_arm' cfg='$cfg_out'"
 
 # ── 55. NEW: arm never touches OmniRoute's own DB -- it is a config-file
@@ -1314,9 +1314,43 @@ db_before="$(md5 -q "$CLEAN_DB" 2>/dev/null || md5sum "$CLEAN_DB" | awk '{print 
 fb --repo "$R" arm --state on >/dev/null
 db_after="$(md5 -q "$CLEAN_DB" 2>/dev/null || md5sum "$CLEAN_DB" | awk '{print $1}')"
 cfg_out="$(cat "$(cfg_path "$R")")"
-[ "$db_before" = "$db_after" ] && echo "$cfg_out" | grep -q '"target_provider": "aihorde"' \
+[ "$db_before" = "$db_after" ] && echo "$cfg_out" | grep -q '"target_provider": "auggie"' \
   && ok "55. arm never modifies OmniRoute's own DB -- fixture byte-for-byte unchanged after arm actually ran and wrote its self-picked target_provider" \
   || bad "55. db_before=$db_before db_after=$db_after cfg='$cfg_out'"
+
+# ── 56. NEW: arm's self-pick is CAPABILITY-RANKED, never plain alphabetical.
+# Regression guard for a real defect: the first implementation sorted no-auth
+# candidates alphabetically, which lands on "aihorde" -- the one no-auth
+# provider whose own OmniRoute registry entry lists `tools` in
+# unsupportedParams. So the happy path default-armed the single provider
+# guaranteed to refuse the tool-use every heimdall agent needs. Assert the
+# self-pick avoids BOTH known-incapable providers (explicit tools denial, and
+# the video-only one) rather than asserting one hardcoded name, so this keeps
+# its teeth if the provider list grows. ─────────────────────────────────────
+R="$(fresh_repo)"
+write_cfg "$R" '{}'
+fb --repo "$R" arm --state on >/dev/null
+picked="$(sed -n 's/.*"target_provider": "\([^"]*\)".*/\1/p' "$(cfg_path "$R")")"
+case "$picked" in
+  aihorde|veoaifree-web)
+    bad "56. arm default-picked known-incapable provider '$picked' (tools denied / not a chat surface) -- capability ranking regressed to alphabetical" ;;
+  "")
+    bad "56. arm wrote no target_provider at all" ;;
+  *)
+    ok "56. arm's default self-pick ('$picked') avoids the known-incapable no-auth providers -- capability-ranked, not alphabetical" ;;
+esac
+
+# ── 57. NEW: an explicit --provider choice still WINS over the capability
+# ranking. The ranking orders arm's OWN pick; it must never override an
+# operator who deliberately names a provider, including a known-incapable one
+# (that is the operator's call to make, and silently substituting a different
+# provider than the one they typed would be worse than obeying them). ───────
+R="$(fresh_repo)"
+write_cfg "$R" '{}'
+fb --repo "$R" arm --provider aihorde --state on >/dev/null
+grep -q '"target_provider": "aihorde"' "$(cfg_path "$R")" \
+  && ok "57. an explicit --provider aihorde is honoured verbatim -- capability ranking governs arm's own pick, never an operator's stated choice" \
+  || bad "57. explicit --provider aihorde was not honoured: cfg='$(cat "$(cfg_path "$R")")'"
 
 echo "--------------------------------------------------------------------"
 printf 'heimdall-fallback: %d passed, %d failed\n' "$PASS" "$FAIL"
