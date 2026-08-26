@@ -653,17 +653,31 @@ thread, stop = cp_boot.start_tick_thread(
     home=home, interval=0.5, on_tick=lambda fired: fired_log.extend(fired))
 out["tick_thread_started"] = thread is not None
 
-# wait several intervals for an autonomous tick to land the due schedule's dispatch.
+# wait several intervals for an autonomous tick to land the due schedule's dispatch AND
+# for the tick driver's on_tick callback to report it (the run-log proof just below). These
+# are TWO DIFFERENT observations of the SAME tick, not one: the audit write happens INSIDE
+# run_tick() (cp_boot.py), but on_tick() only fires once run_tick() fully RETURNS — which
+# includes an unconditional, lazily-first-imported `import cp_maintainer_runner` AFTER the
+# dispatch loop (cp_boot.run_tick). On an idle box that gap is sub-millisecond and never
+# observable at this loop's 0.25s poll granularity; under real system load (e.g. a parallel
+# test sweep) it can stretch past it — the audit condition trips, the loop used to break
+# immediately, and `fired_log` was read before on_tick had run (a confirmed reproduction:
+# an injected delay at that exact point in run_tick reproduces this suite's flake byte for
+# byte). So the wait stays open, on the SAME bounded deadline, until BOTH conditions hold —
+# a real bounded wait-for-condition, not a fixed sleep, and no weakening of the assertion:
+# if on_tick genuinely never reports it, the loop still times out and the check still fails.
 deadline = time.time() + 12
 after = before
+fired_sync_queue = False
 while time.time() < deadline:
     after = len(Au.search(event="dispatch", action_type="sync-queue", home=home))
-    if after > before:
+    fired_sync_queue = any(f.get("action_type") == "sync-queue" for f in fired_log)
+    if after > before and fired_sync_queue:
         break
     time.sleep(0.25)
 out["dispatch_after"] = after
 out["autonomous_fired"] = len(fired_log)
-out["fired_sync_queue"] = any(f.get("action_type") == "sync-queue" for f in fired_log)
+out["fired_sync_queue"] = fired_sync_queue
 
 if stop is not None:
     stop.set()
