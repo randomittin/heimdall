@@ -186,10 +186,18 @@ hooks stay Claude Code regardless of fallback state (see
    - **`check`** → run `heimdall-fallback check` (forward `--tier <T>` if the
      user named one); report the verdict and every failing check's reason.
    - **`on` / `auto` / `switch`** → this arms real routing through a
-     third-party provider using the operator's own key. State that plainly,
-     then run `heimdall-fallback set <value>` followed immediately by
-     `heimdall-fallback check`, and show whether it would actually route —
-     never report "armed" without also showing the preflight result.
+     third-party provider. State that plainly, then run
+     `heimdall-fallback arm --state <value>` — it self-provisions a
+     target_provider (and operator_key_env, for a keyed one) and reports the
+     resulting verdict in one step. Relay arm's own output verbatim,
+     including the `export ANTHROPIC_MODEL=` line if it prints one — that
+     step genuinely cannot be automated. Only fall back to the manual
+     `heimdall-fallback set <value>` + `heimdall-fallback check` sequence if
+     arm refuses and the operator wants to supply their own provider/key by
+     hand; never report "armed" without also showing the preflight result.
+   - **`arm`** → run `heimdall-fallback arm` (forward `--provider <p>` /
+     `--state <s>` if the operator named either), and relay its full output
+     verbatim, including any REFUSED reason.
    - **`off`** → run `heimdall-fallback set off`. Always safe, no
      confirmation needed.
    - **`where`** → run `heimdall-fallback where` and print the path.
@@ -207,8 +215,9 @@ Dev: "why isn't fallback routing?"
   named failing checks, not just "it's off."
 
 Dev: "let fallback handle lint/format when Claude's busy"
-→ walk the setup sequence above, ending in `heimdall-fallback set on`, then
-  confirm with `check --tier haiku`.
+→ `heimdall-fallback arm --state on`, relay its output verbatim (including
+  the mandatory `export ANTHROPIC_MODEL=` line), then confirm with
+  `check --tier haiku`.
 
 Dev: "turn fallback off"
 → `heimdall-fallback set off`.
