@@ -1154,6 +1154,204 @@ unset ANTHROPIC_MODEL
   || bad "47. rc=$rc out='$out'"
 unset HMD_FB_TEST_KEY
 
+
+# ── 48. NEW: `arm`, given nothing pre-configured, self-provisions a no-auth
+# target_provider (deterministic: sorted() over the no-auth candidates picks
+# capability-ranked first pick "auggie") with an EMPTY operator_key_env (never inventing a
+# credential for a route that needs none -- header point 10/12), writes
+# state, and -- once the two genuinely-manual preconditions arm cannot
+# perform itself (ANTHROPIC_MODEL export, gateway already running) are
+# simulated as already done by the operator -- its own trailing check
+# reaches VERDICT: ROUTE. Proves arm's own self-provisioned fields are
+# actually sufficient, not just present. ─────────────────────────────────────
+R="$(fresh_repo)"
+write_cfg "$R" '{
+  "omniroute_db_path": "'"$CLEAN_DB"'"
+}'
+export HEIMDALL_FALLBACK_ASSUME_REACHABLE=1
+export ANTHROPIC_MODEL="anthropic/claude-3-5-sonnet-20241022"
+out="$(fb --repo "$R" arm --state on)"; rc=$?
+export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
+unset ANTHROPIC_MODEL
+cfg_out="$(cat "$(cfg_path "$R")")"
+[ "$rc" -eq 0 ] && echo "$out" | grep -q "VERDICT: ROUTE" \
+  && echo "$cfg_out" | grep -q '"target_provider": "auggie"' \
+  && echo "$cfg_out" | grep -q '"operator_key_env": ""' \
+  && ok "48. arm with nothing pre-configured self-provisions no-auth 'auggie' with an EMPTY operator_key_env and reaches VERDICT: ROUTE end-to-end" \
+  || bad "48. rc=$rc out='$out' cfg='$cfg_out'"
+
+# ── 49. NEW: that same arm run's stdout carries the mandatory operator
+# guidance for the ONE step arm genuinely cannot perform -- the export line
+# (naming the provider it picked) and WHY a child process cannot do this for
+# the parent shell -- and separately reports the gateway's real reachability
+# (it does not start the gateway itself; see docs/analysis/2026-08-26-
+# omniroute-gateway-start.md, owned by another agent, never this tool). ─────
+R="$(fresh_repo)"
+write_cfg "$R" '{
+  "omniroute_db_path": "'"$CLEAN_DB"'"
+}'
+export HEIMDALL_FALLBACK_ASSUME_REACHABLE=1
+export ANTHROPIC_MODEL="anthropic/claude-3-5-sonnet-20241022"
+out="$(fb --repo "$R" arm --state on)"
+export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
+unset ANTHROPIC_MODEL
+echo "$out" | grep -q "export ANTHROPIC_MODEL=auggie/" \
+  && echo "$out" | grep -qi "cannot" \
+  && echo "$out" | grep -qi "gateway:.*reachable" \
+  && ok "49. arm's own output names the unavoidable 'export ANTHROPIC_MODEL=' step, explains why arm itself cannot do it, and reports real gateway reachability" \
+  || bad "49. out='$out'"
+
+# ── 50. NEW: arm --provider naming a KEYED provider with no usable key
+# anywhere (no operator_key_env configured, nothing to reuse) REFUSES --
+# never invents a credential (header point 4/12) -- leaves the on-disk
+# config byte-for-byte UNCHANGED, and its own trailing check still reports
+# the true (REFUSE) verdict against that untouched config rather than going
+# silent on the refusal. ─────────────────────────────────────────────────────
+R="$(fresh_repo)"
+write_cfg "$R" '{"state": "off"}'
+before="$(cat "$(cfg_path "$R")")"
+out="$(fb --repo "$R" arm --provider mistral --state on)"; rc=$?
+after="$(cat "$(cfg_path "$R")")"
+[ "$rc" -eq 1 ] && echo "$out" | grep -q "REFUSED" && echo "$out" | grep -qi "never invents a credential" \
+  && echo "$out" | grep -q "VERDICT: REFUSE" && [ "$before" = "$after" ] \
+  && ok "50. arm --provider mistral (keyed, no usable key anywhere) REFUSES, config left byte-for-byte unchanged, trailing check still reports the true REFUSE verdict" \
+  || bad "50. rc=$rc out='$out' before='$before' after='$after'"
+
+# ── 51a/51b. NEW: arm --provider claude / claude-web REFUSE outright, naming
+# the Tier-1 boundary -- arm enforces this itself (target_provider is never
+# cross-checked against TIER1_DB_PROVIDERS anywhere else in this file; the
+# Tier-1 boundary is otherwise only enforced by reading OmniRoute's own live
+# DB, not by inspecting this config field -- see header point 12). ─────────
+R="$(fresh_repo)"
+out="$(fb --repo "$R" arm --provider claude)"; rc=$?
+[ "$rc" -eq 1 ] && echo "$out" | grep -qi "Tier-1" && echo "$out" | grep -q "REFUSED" \
+  && ! grep -q '"target_provider": "claude"' "$(cfg_path "$R")" 2>/dev/null \
+  && ok "51a. arm --provider claude REFUSES with Tier-1 language, never written to disk" \
+  || bad "51a. rc=$rc out='$out'"
+
+R="$(fresh_repo)"
+out="$(fb --repo "$R" arm --provider claude-web)"; rc=$?
+[ "$rc" -eq 1 ] && echo "$out" | grep -qi "Tier-1" && echo "$out" | grep -q "REFUSED" \
+  && ! grep -q '"target_provider": "claude-web"' "$(cfg_path "$R")" 2>/dev/null \
+  && ok "51b. arm --provider claude-web REFUSES with Tier-1 language, never written to disk" \
+  || bad "51b. rc=$rc out='$out'"
+
+# ── 52. NEW (the defensive case): a config that ALREADY has target_provider
+# "claude" on disk (e.g. a hand-edited or pre-existing bad config) -- arm run
+# with NO --provider must never reuse or preserve it. It overwrites away
+# from claude to a safe no-auth pick instead of refusing outright, which is
+# the same self-provisioning promise as the nothing-configured case (48) --
+# but the on-disk file must never again contain claude/claude-web as
+# target_provider once arm has run. ─────────────────────────────────────────
+R="$(fresh_repo)"
+write_cfg "$R" '{
+  "state": "on",
+  "target_provider": "claude",
+  "omniroute_db_path": "'"$CLEAN_DB"'"
+}'
+out="$(fb --repo "$R" arm --state on)"
+cfg_out="$(cat "$(cfg_path "$R")")"
+echo "$cfg_out" | grep -q '"target_provider": "auggie"' \
+  && ! echo "$cfg_out" | grep -q '"target_provider": "claude"' \
+  && ! echo "$cfg_out" | grep -q '"target_provider": "claude-web"' \
+  && ok "52. arm never reuses/preserves a pre-existing claude target_provider -- overwrites it away to a safe no-auth pick" \
+  || bad "52. out='$out' cfg='$cfg_out'"
+
+# ── 53. NEW: repo-path disclosure (the second bug this work fixes) -- every
+# subcommand that reads or writes THIS repo's config must say which repo's
+# config it acted on. Two distinct repos must show two distinct, correct
+# paths -- never a cached or shared value. ──────────────────────────────────
+R1="$(fresh_repo)"
+R2="$(fresh_repo)"
+out_status1="$(fb --repo "$R1" status)"
+out_status2="$(fb --repo "$R2" status)"
+out_set1="$(fb --repo "$R1" set on)"
+out_check1="$(fb --repo "$R1" check)"
+echo "$out_status1" | grep -qF "$(cfg_path "$R1")" \
+  && echo "$out_status2" | grep -qF "$(cfg_path "$R2")" \
+  && ! echo "$out_status1" | grep -qF "$(cfg_path "$R2")" \
+  && echo "$out_set1" | grep -qF "$(cfg_path "$R1")" \
+  && echo "$out_check1" | grep -qF "$(cfg_path "$R1")" \
+  && ok "53. status/set/check each print the exact resolved config path, correctly distinct per repo" \
+  || bad "53. status1='$out_status1' status2='$out_status2' set1='$out_set1' check1='$out_check1'"
+
+# ── 54. NEW: a partial, old-schema config (missing noauth_providers,
+# omniroute_db_path, cliproxyapi_dir -- exactly this repo's own real
+# .heimdall/fallback.json shape before this schema grew those keys) never
+# crashes check (load_config's key-by-key defaulting fills every missing
+# field from DEFAULT_CFG), and arm REUSES an already-valid existing
+# target_provider from such a config rather than silently re-picking a
+# different one -- "opencode" is deliberately NOT the deterministic
+# capability-ranked first no-auth candidate ("auggie" is), so reuse and re-pick are
+# actually distinguishable outcomes here, not the same string by accident. ──
+R="$(fresh_repo)"
+write_cfg "$R" '{"state": "auto", "target_provider": "opencode"}'
+out_check="$(fb --repo "$R" check 2>&1)"; rc_check=$?
+[ "$rc_check" -ne 3 ] && ! echo "$out_check" | grep -qi "traceback" \
+  && echo "$out_check" | grep -q "VERDICT:" \
+  && ok "54a. a partial/old-schema config (missing noauth_providers/omniroute_db_path/cliproxyapi_dir) does not crash check" \
+  || bad "54a. rc=$rc_check out='$out_check'"
+
+out_arm="$(fb --repo "$R" arm --state on)"; rc_arm=$?
+cfg_out="$(cat "$(cfg_path "$R")")"
+[ "$rc_arm" -eq 1 ] && echo "$out_arm" | grep -q "target_provider:.*opencode" \
+  && echo "$out_arm" | grep -q "VERDICT: REFUSE" \
+  && echo "$cfg_out" | grep -q '"target_provider": "opencode"' \
+  && ok "54b. arm reuses the already-valid, non-default 'opencode' target_provider from a partial/old-schema config rather than re-picking the deterministic default ('auggie') -- its own trailing check REFUSEs (this partial config has no working omniroute_db_path), proving arm actually ran rather than silently no-op'ing" \
+  || bad "54b. rc=$rc_arm out='$out_arm' cfg='$cfg_out'"
+
+# ── 55. NEW: arm never touches OmniRoute's own DB -- it is a config-file
+# writer only (header point 12's own "never adds a provider_connections row"
+# promise). Point omniroute_db_path at a real fixture DB, run arm, and prove
+# the fixture file is byte-for-byte unchanged (arm never even opens it --
+# tier1_credential_absent, which DOES read it, runs read-only, inside the
+# trailing check, and that is the only DB touch in this whole path). ────────
+R="$(fresh_repo)"
+write_cfg "$R" '{
+  "omniroute_db_path": "'"$CLEAN_DB"'"
+}'
+db_before="$(md5 -q "$CLEAN_DB" 2>/dev/null || md5sum "$CLEAN_DB" | awk '{print $1}')"
+fb --repo "$R" arm --state on >/dev/null
+db_after="$(md5 -q "$CLEAN_DB" 2>/dev/null || md5sum "$CLEAN_DB" | awk '{print $1}')"
+cfg_out="$(cat "$(cfg_path "$R")")"
+[ "$db_before" = "$db_after" ] && echo "$cfg_out" | grep -q '"target_provider": "auggie"' \
+  && ok "55. arm never modifies OmniRoute's own DB -- fixture byte-for-byte unchanged after arm actually ran and wrote its self-picked target_provider" \
+  || bad "55. db_before=$db_before db_after=$db_after cfg='$cfg_out'"
+
+# ── 56. NEW: arm's self-pick is CAPABILITY-RANKED, never plain alphabetical.
+# Regression guard for a real defect: the first implementation sorted no-auth
+# candidates alphabetically, which lands on "aihorde" -- the one no-auth
+# provider whose own OmniRoute registry entry lists `tools` in
+# unsupportedParams. So the happy path default-armed the single provider
+# guaranteed to refuse the tool-use every heimdall agent needs. Assert the
+# self-pick avoids BOTH known-incapable providers (explicit tools denial, and
+# the video-only one) rather than asserting one hardcoded name, so this keeps
+# its teeth if the provider list grows. ─────────────────────────────────────
+R="$(fresh_repo)"
+write_cfg "$R" '{}'
+fb --repo "$R" arm --state on >/dev/null
+picked="$(sed -n 's/.*"target_provider": "\([^"]*\)".*/\1/p' "$(cfg_path "$R")")"
+case "$picked" in
+  aihorde|veoaifree-web)
+    bad "56. arm default-picked known-incapable provider '$picked' (tools denied / not a chat surface) -- capability ranking regressed to alphabetical" ;;
+  "")
+    bad "56. arm wrote no target_provider at all" ;;
+  *)
+    ok "56. arm's default self-pick ('$picked') avoids the known-incapable no-auth providers -- capability-ranked, not alphabetical" ;;
+esac
+
+# ── 57. NEW: an explicit --provider choice still WINS over the capability
+# ranking. The ranking orders arm's OWN pick; it must never override an
+# operator who deliberately names a provider, including a known-incapable one
+# (that is the operator's call to make, and silently substituting a different
+# provider than the one they typed would be worse than obeying them). ───────
+R="$(fresh_repo)"
+write_cfg "$R" '{}'
+fb --repo "$R" arm --provider aihorde --state on >/dev/null
+grep -q '"target_provider": "aihorde"' "$(cfg_path "$R")" \
+  && ok "57. an explicit --provider aihorde is honoured verbatim -- capability ranking governs arm's own pick, never an operator's stated choice" \
+  || bad "57. explicit --provider aihorde was not honoured: cfg='$(cat "$(cfg_path "$R")")'"
+
 echo "--------------------------------------------------------------------"
 printf 'heimdall-fallback: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

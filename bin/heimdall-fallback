@@ -210,6 +210,37 @@ boundary from a different angle):
       heimdall-session-usage collapses to "unknown" and changes nothing else
       about the OTHER checks -- see _session_pre_exhaustion_verdict().
 
+  12. `arm` (heimdall-fallback arm [--provider P] [--state auto|on|switch])
+      exists so "turn fallback on" does not mean "hand the operator a
+      hand-edited JSON file and a checklist" -- see cmd_arm. It
+      self-provisions everything it can HONESTLY justify: a target_provider
+      (auto-picking a no-auth one from NOAUTH_PROVIDERS when nothing usable
+      is already configured, reusing an already-valid existing one, or
+      validating an operator-supplied --provider) and the matching
+      operator_key_env (always empty for a no-auth target; for a keyed
+      target, REUSED from an already-configured, already-populated,
+      non-Claude env var -- never invented) -- then writes state. It obeys
+      every constraint above with no exception carved out for itself: it
+      refuses outright, and leaves the on-disk config byte-for-byte
+      UNCHANGED, for a claude/claude-web target (point 1 -- arm enforces
+      this itself, since target_provider is never cross-checked against
+      TIER1_DB_PROVIDERS anywhere else in this file; the Tier-1 boundary is
+      enforced by reading OmniRoute's own DB, not by inspecting this
+      field), a ToS-denied target (point 3), a keyed target with no usable
+      key (point 4 -- arm never invents a credential), or when no honest
+      no-auth candidate remains. It cannot perform the two genuinely
+      unavoidable manual steps -- exporting ANTHROPIC_MODEL into the
+      PARENT shell (no child process can mutate the environment of the
+      process that launched it; there is no syscall for that) and starting
+      the OmniRoute gateway itself (bin/heimdall-fallback is a policy gate,
+      never a transport -- see the module's opening line -- so starting a
+      long-running service is squarely someone else's job) -- so it prints
+      the exact `export` line and the gateway's real reachability instead
+      of pretending either is already done. It always ends by calling the
+      exact same run_preflight/_verdict path `check` uses, against
+      whatever is now on disk, and returns that exact exit code -- arm is
+      self-verifying, never a "trust me" tool.
+
 MUST FAIL CLOSED -- the deliberate inverse of heimdall-quota-advisor's "MUST
 FAIL OPEN". The advisor's job is to never cry wolf: an uncertain exhaustion
 signal must stay silent (exit quietly, print nothing). This tool's job is
@@ -250,6 +281,11 @@ USAGE
                                                 question every existing caller
                                                 (bin/lib/issue_loop.py) already asks -- see
                                                 header point 8.
+  heimdall-fallback arm [--provider P]          self-provision target_provider +
+                        [--state auto|on|switch]  operator_key_env (never inventing a
+                                                credential) and write state, then run
+                                                check and report its verdict. See header
+                                                point 12.
   heimdall-fallback where                      print the config file path
 
 Global flags (before the subcommand -- matches bin/heimdall-pressure /
@@ -298,6 +334,13 @@ EXIT CODES
                               print the reasons, do not route blind; tier is
                               NEVER consulted here -- auto is an exhaustion
                               reaction, not a capability decision)
+  arm           : mirrors check's own contract exactly -- 0 = ROUTE, 1 = REFUSE,
+                  2 = WAIT -- because arm always ends by running that exact
+                  preflight against whatever config is now on disk (the one it
+                  just wrote, or the untouched original if it refused to write).
+                  A write failure during arm -> 3 if --strict, else 0 (never-
+                  fail-caller, matching set's own contract for the same failure
+                  mode).
   argument-parsing errors (any subcommand, including an unrecognized --tier
   value) : 0 unless --strict -> 2
   unexpected internal error (outer safety net; check() fails closed on its
@@ -393,6 +436,40 @@ NOAUTH_PROVIDERS = frozenset({
     "felo-web", "theoldllm", "chipotle", "veoaifree-web", "auggie", "zcode",
     "codex-app-server", "uncloseai", "aihorde",
 })
+
+# Tool-use capability of the no-auth providers, used ONLY to order arm's
+# self-pick so the happy path does not default-select a provider that cannot
+# do the work. Sourced from docs/analysis/2026-08-26-omniroute-gateway-start.md,
+# which traced OmniRoute's own provider registry.
+#
+# HONESTY BOUNDARY, and it matters: only the two sets below are EVIDENCED.
+# Everything not listed here inherits an *unverified optimistic default* from
+# OmniRoute's own capability heuristic -- several such providers are
+# reverse-engineered consumer web UIs where real native tool support is
+# doubtful. So a provider ranking best here is "not known to be incapable",
+# NOT "measured capable". Never render this ordering as a capability promise.
+NOAUTH_TOOLS_DENIED = frozenset({
+    # explicit `tools` entry in `unsupportedParams` in its own registry entry
+    "aihorde",
+    # video-only, not a chat surface at all
+    "veoaifree-web",
+})
+NOAUTH_TOOLS_EMULATED = frozenset({
+    # "emulated" tool use: prompt-injected then text-parsed, not native
+    "devin-cli-agentic", "duckduckgo-web",
+})
+
+
+def _arm_provider_rank(provider):
+    """Deterministic preference rank for arm's self-pick: prefer providers not
+    known to be incapable, then emulated, then explicitly denied. Ties break
+    alphabetically so the pick stays reproducible (a nondeterministic default
+    would make `arm` unauditable)."""
+    if provider in NOAUTH_TOOLS_DENIED:
+        return 2
+    if provider in NOAUTH_TOOLS_EMULATED:
+        return 1
+    return 0
 
 # One-time, plain explanation surfaced in BOTH `status` and `check` whenever
 # the pinned target_provider resolves to a no-auth route (never nagged, never
@@ -1048,6 +1125,7 @@ def _verdict(state, checks, tier=None, session_verdict=None):
 
 
 def cmd_status(args):
+    config_path = _cfg_path(args.repo)
     cfg, corrupt_reason = load_config(args.repo)
     checks = run_preflight(cfg)
     would_pass = all(ok for _, ok, _ in checks)
@@ -1064,6 +1142,7 @@ def cmd_status(args):
     if args.json:
         payload = {
             "state": cfg["state"],
+            "config_path": config_path,
             "full_switch": is_switch,
             "would_preflight_pass": would_pass,
             "operator_key_env": key_env,
@@ -1077,6 +1156,7 @@ def cmd_status(args):
         print(json.dumps(payload, sort_keys=True))
     else:
         print("heimdall-fallback status")
+        print("  config:                %s" % config_path)
         state_line = cfg["state"]
         if is_switch:
             state_line += "   *** %s ***" % switch_warning
@@ -1096,6 +1176,7 @@ def cmd_set(args):
     # args.value is already constrained to VALID_STATES by argparse's own
     # choices= validation (raises Rejected -> handled in main() -> exit 0
     # unless --strict, exit 2). Nothing left to validate here.
+    config_path = _cfg_path(args.repo)
     cfg, _ = load_config(args.repo)
     cfg["state"] = args.value
     try:
@@ -1103,12 +1184,14 @@ def cmd_set(args):
     except OSError as exc:
         sys.stderr.write("heimdall-fallback set: failed to write config: %s\n" % exc)
         return 3 if args.strict else 0
+    print("  config:                %s" % config_path)
     print("state set to '%s'" % args.value)
     return 0
 
 
 def cmd_check(args):
     try:
+        config_path = _cfg_path(args.repo)
         cfg, _ = load_config(args.repo)
         checks = run_preflight(cfg)
         state = cfg["state"]
@@ -1122,6 +1205,7 @@ def cmd_check(args):
         if state == "switch":
             header += ("  *** SWITCH STATE: every task, every tier, routes to OmniRoute -- "
                        "capability tier is NOT consulted ***")
+        print("  config:                %s" % config_path)
         print(header)
 
         for name, ok, reason in checks:
@@ -1170,6 +1254,181 @@ def cmd_check(args):
         return 1
 
 
+def _arm_validate_provider(provider, cfg):
+    """Whether `provider` is something arm may EVER select or reuse as
+    target_provider -- independent of run_preflight's own
+    target_provider_allowed check (which only runs AFTER a value is already
+    on disk). Never claude/claude-web (header point 1 -- arm enforces this
+    itself since target_provider is never cross-checked against
+    TIER1_DB_PROVIDERS anywhere else in this file) and never on the
+    ToS-conflict deny list (header point 3)."""
+    p = (provider or "").strip().lower()
+    if not p:
+        return False, "empty target_provider"
+    if p in TIER1_DB_PROVIDERS:
+        return False, (
+            "'%s' is a Tier-1 subscription provider (claude/claude-web) -- arm never "
+            "configures fallback to route to the operator's OWN Claude subscription; "
+            "that is the exact boundary this whole tool exists to hold (header point 1)"
+            % p
+        )
+    deny = BUILTIN_TOS_FLAGGED_PROVIDERS | {
+        p2.strip().lower() for p2 in cfg.get("tos_flagged_providers", []) if isinstance(p2, str)
+    }
+    if p in deny:
+        return False, "'%s' is on the ToS-conflict deny list (tos_flagged_providers)" % p
+    return True, ""
+
+
+def _arm_usable_key_env(cfg):
+    """Whether cfg's OWN operator_key_env is already usable as-is: named,
+    not a Claude/Anthropic marker (header point 4), and actually populated
+    in this shell's environment. arm reuses this verbatim -- it never
+    invents a credential."""
+    key_env = cfg.get("operator_key_env") or ""
+    if not key_env:
+        return None
+    if any(marker in key_env.upper() for marker in FORBIDDEN_KEY_ENV_MARKERS):
+        return None
+    if not os.environ.get(key_env):
+        return None
+    return key_env
+
+
+def _arm_select_provider(args, cfg):
+    """Pick (or validate) the target_provider + operator_key_env pair arm
+    will write. Returns (provider, key_env, ok, reason); when ok is False,
+    provider/key_env are both None and reason explains the refusal -- arm
+    never arms a state it cannot justify."""
+    noauth = _resolve_noauth_providers(cfg)
+
+    requested = (args.provider or "").strip().lower()
+    if requested:
+        ok, reason = _arm_validate_provider(requested, cfg)
+        if not ok:
+            return None, None, False, reason
+        if requested in noauth:
+            return requested, "", True, ""
+        key_env = _arm_usable_key_env(cfg)
+        if key_env is not None:
+            return requested, key_env, True, ""
+        configured = cfg.get("operator_key_env") or ""
+        if not configured:
+            return None, None, False, (
+                "'%s' is a keyed provider and needs operator_key_env -- arm never "
+                "invents a credential. Set \"operator_key_env\": \"<YOUR_ENV_VAR_NAME>\" "
+                "in %s to the NAME of an env var holding your OWN %s API key, export "
+                "that var, then re-run arm" % (requested, _cfg_path(args.repo), requested)
+            )
+        if any(m in configured.upper() for m in FORBIDDEN_KEY_ENV_MARKERS):
+            return None, None, False, (
+                "operator_key_env '%s' names a Claude/Anthropic credential -- the "
+                "Claude Code session can never be reused as a fallback key (header "
+                "point 4)" % configured
+            )
+        return None, None, False, (
+            "operator_key_env '%s' is configured but env var '%s' is not set in this "
+            "shell -- export it, then re-run arm" % (configured, configured)
+        )
+
+    existing = (cfg.get("target_provider") or "").strip().lower()
+    if existing:
+        ok, _reason = _arm_validate_provider(existing, cfg)
+        if ok:
+            if existing in noauth:
+                return existing, "", True, ""
+            key_env = _arm_usable_key_env(cfg)
+            if key_env is not None:
+                return existing, key_env, True, ""
+        # existing target_provider is denied, Tier-1, or keyed-without-a-usable-key
+        # -- fall through to auto-picking a no-auth provider rather than refusing
+        # outright.
+
+    deny = BUILTIN_TOS_FLAGGED_PROVIDERS | {
+        p.strip().lower() for p in cfg.get("tos_flagged_providers", []) if isinstance(p, str)
+    }
+    candidates = sorted(
+        (p for p in noauth if p not in deny and p not in TIER1_DB_PROVIDERS),
+        key=lambda p: (_arm_provider_rank(p), p),
+    )
+    if not candidates:
+        return None, None, False, (
+            "no honest no-auth provider is available to self-provision -- every known "
+            "no-auth provider is denied by tos_flagged_providers. Specify --provider "
+            "explicitly with a keyed provider (and a configured, populated "
+            "operator_key_env) instead"
+        )
+    return candidates[0], "", True, ""
+
+
+def cmd_arm(args):
+    """Self-provision target_provider + operator_key_env and write state,
+    then run the exact same preflight `check` runs and return its verdict --
+    see header point 12. Never invents a credential, never touches
+    claude/claude-web, never writes an unjustified state. Cannot perform two
+    genuinely manual steps (exporting ANTHROPIC_MODEL into the PARENT shell,
+    and starting the OmniRoute gateway itself) so it reports them instead of
+    pretending either is already done."""
+    config_path = _cfg_path(args.repo)
+    cfg, corrupt_reason = load_config(args.repo)
+    print("heimdall-fallback arm")
+    print("  config:                %s" % config_path)
+    if corrupt_reason:
+        print("  NOTE: on-disk config was corrupt (%s) -- reset to safe defaults "
+              "(state=off) before arming" % corrupt_reason)
+
+    provider, key_env, ok, reason = _arm_select_provider(args, cfg)
+    if not ok:
+        sys.stderr.write("heimdall-fallback arm: refusing -- %s\n" % reason)
+        print("  REFUSED:               %s" % reason)
+        print("  state left UNCHANGED (%s) -- arm never arms a state it cannot justify"
+              % cfg.get("state"))
+    else:
+        is_noauth = provider in _resolve_noauth_providers(cfg)
+        cfg["target_provider"] = provider
+        cfg["operator_key_env"] = key_env
+        cfg["state"] = args.state
+        try:
+            save_config(args.repo, cfg)
+        except OSError as exc:
+            sys.stderr.write("heimdall-fallback arm: failed to write config: %s\n" % exc)
+            print("  REFUSED:               failed to write config: %s" % exc)
+            return 3 if args.strict else 0
+        print("  target_provider:       %s (%s)" % (provider, "no-auth/keyless" if is_noauth else "keyed"))
+        print("  operator_key_env:      %s" % (
+            "(none needed -- keyless route)" if is_noauth
+            else "%s (reused from an already-configured, already-populated env var -- "
+                 "arm never invents a credential)" % key_env
+        ))
+        print("  state:                 %s" % args.state)
+
+    endpoint = cfg.get("endpoint") or DEFAULT_CFG["endpoint"]
+    if _is_local_endpoint(endpoint):
+        if _endpoint_reachable(endpoint):
+            print("  gateway:               reachable at %s" % endpoint)
+        else:
+            print("  gateway:               NOT REACHABLE at %s -- arm does not start "
+                  "the OmniRoute gateway itself; start it, then re-run "
+                  "'heimdall-fallback check'" % endpoint)
+    else:
+        print("  gateway:               endpoint '%s' is not a loopback address -- fix "
+              "'endpoint' in %s" % (endpoint, config_path))
+
+    model_provider = provider if ok else "<provider>"
+    print()
+    print("  ONE STEP ARM CANNOT DO FOR YOU -- run this yourself:")
+    print("    export ANTHROPIC_MODEL=%s/<model-id>" % model_provider)
+    print("    A child process (this command) cannot set an environment variable in")
+    print("    the shell that launched it -- there is no syscall for that, so this")
+    print("    line must be run BY YOU, in that shell (add it to your shell profile")
+    print("    to persist it across sessions). Replace <model-id> with an actual")
+    print("    model id the target provider serves -- check OmniRoute's own")
+    print("    /v1/models listing; arm cannot know that id for you.")
+    print()
+
+    return cmd_check(args)
+
+
 def cmd_where(args):
     print(_cfg_path(args.repo))
     return 0
@@ -1198,6 +1457,21 @@ def build_parser():
              "verifier|security-auditor -- for opus). Omit for the original, "
              "tier-blind question (bin/lib/issue_loop.py's own call shape).",
     )
+    sp_arm = sub.add_parser(
+        "arm",
+        help="self-provision target_provider + operator_key_env (never inventing a "
+             "credential) and write state, then run check and report its verdict",
+    )
+    sp_arm.add_argument(
+        "--provider", default=None,
+        help="explicit target_provider to validate and use (default: reuse an "
+             "already-valid configured one, else auto-pick a no-auth provider)",
+    )
+    sp_arm.add_argument(
+        "--state", default="auto", choices=("auto", "on", "switch"),
+        help="fallback state to write once provisioning succeeds (default: auto)",
+    )
+
     sub.add_parser("where", help="print the config file path")
 
     return p
@@ -1216,6 +1490,7 @@ def main(argv):
         "status": cmd_status,
         "set": cmd_set,
         "check": cmd_check,
+        "arm": cmd_arm,
         "where": cmd_where,
     }
     return handlers[args.cmd](args)

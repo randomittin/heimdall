@@ -8,7 +8,7 @@
 # fix (commands/fallback.md):
 #   1. The file exists with the correct frontmatter (name: fallback,
 #      argument-hint, disable-model-invocation: true — it changes real state).
-#   2. It documents the real subcommand set: status / set / check / where.
+#   2. It documents the real subcommand set: status / set / check / arm / where.
 #   3. THE CORRECTION THAT MATTERS MOST: there is NO `heimdall-fallback
 #      config` subcommand. build_parser() in bin/heimdall-fallback defines
 #      exactly four subparsers; an earlier, unverified assumption asserted a
@@ -60,7 +60,7 @@ if grep -qE '^disable-model-invocation:[[:space:]]*true[[:space:]]*$' "$CMD_MD";
 else bad "fallback.md does not set disable-model-invocation: true"; fi
 
 # ── 2. the real subcommand set is documented ────────────────────────────────
-for SUB in status set check where; do
+for SUB in status set check arm where; do
   if grep -q "heimdall-fallback $SUB" "$CMD_MD"; then
     ok "fallback.md documents the real 'heimdall-fallback $SUB' subcommand"
   else
@@ -88,13 +88,32 @@ fi
 # Cross-check against the live source so this claim cannot silently go stale.
 if [ -x "$FALLBACK_BIN" ]; then
   SUBCOUNT="$(grep -c 'add_parser(' "$FALLBACK_BIN" || true)"
-  if [ "$SUBCOUNT" = "4" ]; then
-    ok "bin/heimdall-fallback still defines exactly 4 subparsers (status/set/check/where) — the doc's 'no config subcommand' claim still holds"
+  if [ "$SUBCOUNT" = "5" ]; then
+    ok "bin/heimdall-fallback still defines exactly 5 subparsers (status/set/check/arm/where) — the doc's 'no config subcommand' claim still holds"
   else
-    bad "bin/heimdall-fallback now defines $SUBCOUNT subparser(s) (expected 4) — re-check fallback.md's 'no config subcommand' claim against the live source"
+    bad "bin/heimdall-fallback now defines $SUBCOUNT subparser(s) (expected 5) — re-check fallback.md's 'no config subcommand' claim against the live source"
   fi
 else
   bad "bin/heimdall-fallback is missing or not executable — cannot cross-check the subparser count"
+fi
+
+# ── 3b. `arm` self-provisioning is documented: never invents a credential,
+#       the mandatory ANTHROPIC_MODEL export guidance, and that arm does not
+#       start the gateway itself ────────────────────────────────────────────
+if grep -qi 'never invents a credential' "$CMD_MD"; then
+  ok "fallback.md documents that arm never invents a credential"
+else
+  bad "fallback.md does not state that arm never invents a credential"
+fi
+if grep -qF 'export ANTHROPIC_MODEL=' "$CMD_MD"; then
+  ok "fallback.md shows the export ANTHROPIC_MODEL= guidance arm prints"
+else
+  bad "fallback.md missing the export ANTHROPIC_MODEL= guidance"
+fi
+if grep -qiE 'does not start the.*gateway|never starts the.*gateway' "$CMD_MD"; then
+  ok "fallback.md states arm does not start the OmniRoute gateway itself"
+else
+  bad "fallback.md missing the 'arm does not start the gateway' caveat"
 fi
 
 # ── 4. the four states, in operator language ────────────────────────────────
