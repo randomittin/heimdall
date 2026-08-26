@@ -224,3 +224,76 @@ No `provider_connections` row added (§3 count still `0`). No credential added. 
 source modified. `management-password.txt` / `server.env` contents never read or printed (§4).
 Only heimdall-repo file touched: this doc. `bin/` and `commands/` untouched. Exit codes quoted are
 each command's own (§3), never a pipeline tail's.
+
+---
+
+## CORRECTION (2026-08-26, orchestrator): the `nohup` start was NOT durable
+
+The section above documents a `nohup env -C ... npm run dev` start as durable. **It is not, and
+this was proven empirically the same day.** When the Claude Code session hit its API usage
+limit, the harness tore down the background process group and the gateway died with it:
+
+```
+ps -p 99168        -> no such process
+lsof -iTCP:20128   -> (empty)
+curl .../health    -> exit 7, connection refused
+```
+
+`nohup` protects against SIGHUP. It does not protect against the process group being killed,
+which is what actually happened. Any start method owned by the agent session dies with that
+session — the durability has to live *outside* the session.
+
+### The actual durable start: a launchd user agent
+
+`~/Library/LaunchAgents/dev.runheimdall.omniroute.plist`, loaded with:
+
+```sh
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.runheimdall.omniroute.plist
+launchctl print     gui/$(id -u)/dev.runheimdall.omniroute   # state = running
+launchctl bootout   gui/$(id -u)/dev.runheimdall.omniroute   # stop
+```
+
+Key properties, each load-bearing:
+- `KeepAlive: true` — restarts on crash, so a segfault no longer means a dead gateway.
+- `RunAtLoad: true` — survives reboot.
+- `HOST=127.0.0.1` — loopback ONLY. OmniRoute has no Host-header allowlist (see the
+  credential-isolation analysis), so a `0.0.0.0` bind would be a real exposure. Verified after
+  boot: `TCP 127.0.0.1:20128 (LISTEN)`, never `0.0.0.0`.
+- `OMNIROUTE_USE_TURBOPACK=0` — webpack, avoiding the turbopack native-addon segfault.
+- Explicit `PATH` to `~/.nvm/versions/node/v24.13.0/bin` — launchd gets no interactive shell,
+  so nvm's auto-switch never fires and ambient `node` would be v20.20.0.
+
+**Cold-boot time is ~10 minutes**, not seconds. The webpack dev compile sits at
+`Compiling /instrumentation ...` with the log frozen and ~10% CPU for most of it. That looks
+wedged and is not — do not kill it and retry, which only restarts the same 10-minute compile.
+Poll `/api/monitoring/health` for 200 rather than trusting the log to advance.
+
+### Verified after the launchd boot
+- `curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:20128/api/monitoring/health` → `200`
+- bind is `127.0.0.1:20128` only
+- `SELECT COUNT(*) FROM provider_connections WHERE provider IN ('claude','claude-web')` → `0`
+  (Tier-1 invariant intact)
+- `POST /api/auth/login {"password":"CHANGEME"}` → `401 {"error":"Invalid password"}` — the
+  rotated management password is live. The bootstrap log still prints
+  `INITIAL_PASSWORD is not set — using default 'CHANGEME'`; that warning is **inert noise**,
+  because `INITIAL_PASSWORD` is only consulted when no bcrypt hash is persisted, and one is
+  (`key_value`, `namespace='settings'`, `key='password'`, 62 bytes, prefix `"$2b` — a
+  JSON-quoted bcrypt hash).
+  - Method note: a first probe with `--max-time 8` returned `000`/exit 28. That is a TIMEOUT,
+    not a rejection, and proves nothing — bcrypt at 12 rounds plus a cold Next.js route
+    compile exceeds 8s. Only the `--max-time 45` retry returning a real `401` is evidence.
+  - Method note 2: a first check of the hash using `LIKE '$2%'` reported `NOT-A-BCRYPT-HASH`.
+    That was a bad query, not a finding — the stored value is JSON-encoded so it begins with a
+    `"` character. Nearly logged as a security regression; wasn't one.
+
+### Remaining gap: the gateway is up but cannot serve inference yet
+- `GET /v1/models` → **401**. `key_value` has `requireLogin=true` and `api_keys` has **0** rows,
+  so the token-authenticated `/v1/*` surface has no key to accept.
+- `provider_connections` is **0**, so even authenticated there is no connection to route through.
+- Consequence: `heimdall-fallback arm` correctly prints `export ANTHROPIC_MODEL=auggie/<model-id>`
+  but **that model id cannot currently be resolved**, because the listing that would provide it
+  is behind the 401 above. `arm` is not wrong to ask for it; the id genuinely does not exist yet.
+- Closing this needs two management-plane actions (mint an API key, create a no-auth provider
+  connection). Both are credential-plane changes gated behind the management password, and are
+  deliberately NOT taken autonomously — see the autonomy rule that security-sensitive decisions
+  are never auto-approved.
