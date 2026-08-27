@@ -122,6 +122,42 @@ make_fake_session_usage() {
   printf '%s/heimdall-session-usage' "$dir"
 }
 
+# run_capture <cmd...> -- runs a command with stdout and stderr captured
+# SEPARATELY (never merged into one stream) into globals CAP_OUT/CAP_ERR/
+# CAP_RC/CAP_OUT_BYTES. Load-bearing for base-url/token-file sections below:
+# both commands' entire safety contract is "stdout stays byte-empty on every
+# refusal", and a plain `$(cmd 2>&1)` capture can never prove that -- it would
+# silently fold a stderr reason line into the very stream being asserted
+# empty. CAP_OUT_BYTES is a real byte count via `wc -c` against the raw
+# redirected file (not `${#CAP_OUT}`, which would undercount -- command
+# substitution strips trailing newlines, so a lone "\n" on stdout would read
+# as length 0 in CAP_OUT but is not actually zero bytes on the wire).
+run_capture() {
+  local outfile errfile
+  outfile="$(mktemp "${TMPDIR:-/tmp}/hmd-fallback-test-stdout.XXXXXX")"
+  errfile="$(mktemp "${TMPDIR:-/tmp}/hmd-fallback-test-stderr.XXXXXX")"
+  "$@" >"$outfile" 2>"$errfile"
+  CAP_RC=$?
+  CAP_OUT="$(cat "$outfile")"
+  CAP_OUT_BYTES="$(wc -c < "$outfile" | tr -d ' ')"
+  CAP_ERR="$(cat "$errfile")"
+  rm -f "$outfile" "$errfile"
+}
+
+# abs_tmpfile <name> -- mktemp a file and return its CANONICAL absolute path
+# (cd+pwd on its dirname, exactly like fresh_repo() above and for the same
+# documented reason: a trailing-slash TMPDIR -- the macOS norm fresh_repo()'s
+# own comment calls out -- leaves a "//" in mktemp's raw output that Python's
+# os.path.abspath (via normpath) collapses but a naive string does not. Only
+# needed where a test compares the tool's printed path against this literal
+# string; a test that only checks refuse/pass behavior can mktemp directly.
+abs_tmpfile() {
+  local raw dir
+  raw="$(mktemp "${TMPDIR:-/tmp}/$1.XXXXXX")"
+  dir="$(cd "$(dirname "$raw")" && pwd)"
+  printf '%s/%s' "$dir" "$(basename "$raw")"
+}
+
 # Hermetic default for the whole suite: nothing here is actually listening on
 # a local gateway port, so "not reachable" is the honest baseline. Sections
 # that need a PASSING reachability check override to "1" for their own scope
@@ -1380,6 +1416,239 @@ fb --repo "$R" arm --provider auggie --state on >/dev/null
 grep -q '"target_provider": "auggie"' "$(cfg_path "$R")" \
   && ok "57. an explicit --provider auggie is honoured verbatim -- usability ranking governs arm's own pick, never an operator's stated choice" \
   || bad "57. explicit --provider auggie was not honoured: cfg='$(cat "$(cfg_path "$R")")'"
+
+# ── 59. base-url: a ROUTE verdict prints the exact configured endpoint on
+# stdout and exits 0. Reuses test 12's fully-passing recipe verbatim so a
+# ROUTE here is the SAME config already proven to make `check` say ROUTE. ──
+R="$(fresh_repo)"
+export HMD_FB_TEST_KEY="x"
+export ANTHROPIC_MODEL="anthropic/claude-3-5-sonnet-20241022"
+write_cfg "$R" '{
+  "state": "on",
+  "operator_key_env": "HMD_FB_TEST_KEY",
+  "endpoint": "http://127.0.0.1:20128",
+  "omniroute_db_path": "'"$CLEAN_DB"'",
+  "target_provider": "self-hosted-mixtral"
+}'
+export HEIMDALL_FALLBACK_ASSUME_REACHABLE=1
+run_capture fb --repo "$R" base-url
+export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
+unset ANTHROPIC_MODEL
+[ "$CAP_RC" -eq 0 ] && [ "$CAP_OUT" = "http://127.0.0.1:20128" ] \
+  && ok "59. base-url on a ROUTE verdict prints exactly the configured endpoint, exit 0" \
+  || bad "59. rc=$CAP_RC out='$CAP_OUT' err='$CAP_ERR'"
+unset HMD_FB_TEST_KEY
+
+# ── 60. base-url: a REFUSE verdict (exit 1) leaves stdout BYTE-EMPTY. THE
+# load-bearing property in this file: `hmd route` does
+# `url="$(heimdall-fallback base-url)"` and unconditionally exports whatever
+# comes back, so a reason string leaking onto stdout on a REFUSE path would
+# be exported as a base URL and point a live session at garbage.
+# Mutation-verified: with cmd_base_url's `sys.stderr.write(...)` on the
+# `rc != 0` branch changed to `sys.stdout.write(...)`, this is one of the
+# tests that fails (CAP_OUT_BYTES becomes nonzero -- see commit message for
+# the full list, since every non-ROUTE base-url test shares this branch). ──
+R="$(fresh_repo)"
+write_cfg "$R" '{"state": "on"}'
+run_capture fb --repo "$R" base-url
+[ "$CAP_RC" -eq 1 ] && [ "$CAP_OUT_BYTES" -eq 0 ] \
+  && ok "60. base-url on a REFUSE verdict: exit 1 AND stdout is byte-empty (reason goes to stderr only)" \
+  || bad "60. rc=$CAP_RC out_bytes=$CAP_OUT_BYTES out='$CAP_OUT' err='$CAP_ERR'"
+
+# ── 61. base-url: a WAIT verdict (exit 2) also leaves stdout byte-empty --
+# same contract as REFUSE; `hmd route` must never treat a stalled decision as
+# license to read a base URL either. Same recipe as test 4a (state=auto,
+# nothing else configured -> failing preflight -> WAIT, never ROUTE). ─────
+R="$(fresh_repo)"
+write_cfg "$R" '{"state": "auto"}'
+run_capture fb --repo "$R" base-url
+[ "$CAP_RC" -eq 2 ] && [ "$CAP_OUT_BYTES" -eq 0 ] \
+  && ok "61. base-url on a WAIT verdict: exit 2 AND stdout is byte-empty" \
+  || bad "61. rc=$CAP_RC out_bytes=$CAP_OUT_BYTES out='$CAP_OUT' err='$CAP_ERR'"
+
+# ── 62. base-url: with no config file at all (default state=off), stdout is
+# byte-empty and exit is non-zero. fresh_repo() alone, no write_cfg call --
+# .heimdall/fallback.json genuinely does not exist on disk. ────────────────
+R="$(fresh_repo)"
+run_capture fb --repo "$R" base-url
+[ "$CAP_RC" -ne 0 ] && [ "$CAP_OUT_BYTES" -eq 0 ] \
+  && ok "62. base-url with no config file at all: exit non-zero, stdout byte-empty" \
+  || bad "62. rc=$CAP_RC out_bytes=$CAP_OUT_BYTES out='$CAP_OUT' err='$CAP_ERR'"
+
+# ── 63. base-url: endpoint configured to a NON-loopback URL refuses, stdout
+# byte-empty. WHICH LAYER CATCHES THIS: run_preflight's own `endpoint_local`
+# check (shared via _routing_decision, exactly like `check`) fails FIRST and
+# makes the overall verdict REFUSE before cmd_base_url's own body ever runs.
+# cmd_base_url's SECOND, redundant `_is_local_endpoint` guard (right after
+# `if rc != 0: return rc`) is unreachable through config alone: _verdict()
+# only returns ROUTE when preflight_ok is True, which requires run_preflight's
+# own endpoint_local entry to already be True, computed by that SAME
+# _is_local_endpoint() call -- so this test proves the preflight layer, not
+# cmd_base_url's belt-and-suspenders one; asserting stderr names
+# endpoint_local (not some unrelated check) is what pins that down. ────────
+R="$(fresh_repo)"
+export HMD_FB_TEST_KEY="x"
+export ANTHROPIC_MODEL="anthropic/claude-3-5-sonnet-20241022"
+write_cfg "$R" '{
+  "state": "on",
+  "operator_key_env": "HMD_FB_TEST_KEY",
+  "endpoint": "http://evil.example.com:80",
+  "omniroute_db_path": "'"$CLEAN_DB"'",
+  "target_provider": "self-hosted-mixtral"
+}'
+export HEIMDALL_FALLBACK_ASSUME_REACHABLE=1
+run_capture fb --repo "$R" base-url
+export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
+unset ANTHROPIC_MODEL
+[ "$CAP_RC" -ne 0 ] && [ "$CAP_OUT_BYTES" -eq 0 ] && printf '%s' "$CAP_ERR" | grep -q "endpoint_local" \
+  && ok "63. base-url with a non-loopback endpoint: refuses (caught by run_preflight's endpoint_local before cmd_base_url's own body runs), stdout byte-empty" \
+  || bad "63. rc=$CAP_RC out_bytes=$CAP_OUT_BYTES out='$CAP_OUT' err='$CAP_ERR'"
+unset HMD_FB_TEST_KEY
+
+# ── 64. anti-drift guard: base-url and check must NEVER disagree on exit
+# code for the same config, because both are computed by the one shared
+# _routing_decision()/run_preflight() path on purpose (commit 6de9093's own
+# stated reason: "two independent copies of a routing decision is how a
+# wrapper starts routing while the gate says REFUSE"). Three configs
+# spanning all three verdicts, each checked with the SAME --repo args. ────
+R="$(fresh_repo)"
+export HMD_FB_TEST_KEY="x"
+export ANTHROPIC_MODEL="anthropic/claude-3-5-sonnet-20241022"
+write_cfg "$R" '{
+  "state": "on",
+  "operator_key_env": "HMD_FB_TEST_KEY",
+  "endpoint": "http://127.0.0.1:20128",
+  "omniroute_db_path": "'"$CLEAN_DB"'",
+  "target_provider": "self-hosted-mixtral"
+}'
+export HEIMDALL_FALLBACK_ASSUME_REACHABLE=1
+fb --repo "$R" check >/dev/null 2>&1; rc_check=$?
+fb --repo "$R" base-url >/dev/null 2>&1; rc_burl=$?
+export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
+unset ANTHROPIC_MODEL
+[ "$rc_check" -eq "$rc_burl" ] && [ "$rc_check" -eq 0 ] \
+  && ok "64a. ROUTE config: check and base-url agree (both exit $rc_check)" \
+  || bad "64a. check=$rc_check base-url=$rc_burl (want both 0)"
+unset HMD_FB_TEST_KEY
+
+R="$(fresh_repo)"
+write_cfg "$R" '{"state": "on"}'
+fb --repo "$R" check >/dev/null 2>&1; rc_check=$?
+fb --repo "$R" base-url >/dev/null 2>&1; rc_burl=$?
+[ "$rc_check" -eq "$rc_burl" ] && [ "$rc_check" -eq 1 ] \
+  && ok "64b. REFUSE config: check and base-url agree (both exit $rc_check)" \
+  || bad "64b. check=$rc_check base-url=$rc_burl (want both 1)"
+
+R="$(fresh_repo)"
+write_cfg "$R" '{"state": "auto"}'
+fb --repo "$R" check >/dev/null 2>&1; rc_check=$?
+fb --repo "$R" base-url >/dev/null 2>&1; rc_burl=$?
+[ "$rc_check" -eq "$rc_burl" ] && [ "$rc_check" -eq 2 ] \
+  && ok "64c. WAIT config: check and base-url agree (both exit $rc_check)" \
+  || bad "64c. check=$rc_check base-url=$rc_burl (want both 2)"
+
+# ── 65. token-file: a 0600 file -> stdout is its absolute path, exit 0. ────
+R="$(fresh_repo)"
+tokf="$(abs_tmpfile hmd-fallback-test-token)"
+printf 'not-a-real-token-value' > "$tokf"
+chmod 600 "$tokf"
+write_cfg "$R" '{"gateway_token_file": "'"$tokf"'"}'
+run_capture fb --repo "$R" token-file
+[ "$CAP_RC" -eq 0 ] && [ "$CAP_OUT" = "$tokf" ] \
+  && ok "65. token-file with a 0600 file prints its absolute path, exit 0" \
+  || bad "65. rc=$CAP_RC out='$CAP_OUT' want='$tokf' err='$CAP_ERR'"
+
+# ── 66. token-file: the file's CONTENTS never appear on stdout or stderr --
+# cmd_token_file only ever os.stat()s the file for its mode; it must never
+# read or log its bytes. Write a distinctive sentinel and grep both streams
+# (captured SEPARATELY by run_capture, then checked together here since
+# "leaked to EITHER stream" is the failure this guards). ───────────────────
+R="$(fresh_repo)"
+tokf="$(mktemp "${TMPDIR:-/tmp}/hmd-fallback-test-token.XXXXXX")"
+printf 'SENTINEL_TOKEN_DO_NOT_LEAK_4417' > "$tokf"
+chmod 600 "$tokf"
+write_cfg "$R" '{"gateway_token_file": "'"$tokf"'"}'
+run_capture fb --repo "$R" token-file
+if printf '%s\n%s' "$CAP_OUT" "$CAP_ERR" | grep -qF "SENTINEL_TOKEN_DO_NOT_LEAK_4417"; then
+  bad "66. token file CONTENTS leaked into stdout or stderr: out='$CAP_OUT' err='$CAP_ERR'"
+else
+  ok "66. token-file never emits the token file's contents on stdout or stderr"
+fi
+
+# ── 67. token-file: mode 0644 (world-readable) refuses -- exit non-zero,
+# stdout byte-empty, stderr names the mode. Mutation-verified: with the
+# whole `if mode & 0o077:` guard disabled (e.g. `if False:`), this test is
+# one of the two that fail (see commit message for the exact mutation and
+# both tests it flips -- this one and 68). ─────────────────────────────────
+R="$(fresh_repo)"
+tokf="$(mktemp "${TMPDIR:-/tmp}/hmd-fallback-test-token.XXXXXX")"
+printf 'not-a-real-token-value' > "$tokf"
+chmod 644 "$tokf"
+write_cfg "$R" '{"gateway_token_file": "'"$tokf"'"}'
+run_capture fb --repo "$R" token-file
+[ "$CAP_RC" -ne 0 ] && [ "$CAP_OUT_BYTES" -eq 0 ] && printf '%s' "$CAP_ERR" | grep -q "0644" \
+  && ok "67. token-file refuses a 0644 file: exit non-zero, stdout byte-empty, stderr names the mode" \
+  || bad "67. rc=$CAP_RC out_bytes=$CAP_OUT_BYTES err='$CAP_ERR'"
+
+# ── 68. token-file: mode 0640 (group-readable only, no world bits) ALSO
+# refuses -- proves the check is `mode & 0o077` (any group OR world bit), not
+# just world bits. Mutation-verified: narrowing `mode & 0o077` to
+# `mode & 0o007` (world-bits only) makes ONLY this test fail -- 0640's group
+# bit (0o040) is invisible to a world-only mask, so it would wrongly pass,
+# while test 67's 0644 still has a world-read bit and keeps refusing by
+# coincidence even under that narrower mutation (see commit message). ─────
+R="$(fresh_repo)"
+tokf="$(mktemp "${TMPDIR:-/tmp}/hmd-fallback-test-token.XXXXXX")"
+printf 'not-a-real-token-value' > "$tokf"
+chmod 640 "$tokf"
+write_cfg "$R" '{"gateway_token_file": "'"$tokf"'"}'
+run_capture fb --repo "$R" token-file
+[ "$CAP_RC" -ne 0 ] && [ "$CAP_OUT_BYTES" -eq 0 ] && printf '%s' "$CAP_ERR" | grep -q "0640" \
+  && ok "68. token-file refuses a 0640 (group-readable) file too -- the check is mode & 0o077, not world-bits-only" \
+  || bad "68. rc=$CAP_RC out_bytes=$CAP_OUT_BYTES err='$CAP_ERR'"
+
+# ── 69. token-file: gateway_token_file unset/empty -> refuses, stdout
+# byte-empty. Two cases: key absent entirely, and key present but "". ──────
+R="$(fresh_repo)"
+write_cfg "$R" '{}'
+run_capture fb --repo "$R" token-file
+[ "$CAP_RC" -ne 0 ] && [ "$CAP_OUT_BYTES" -eq 0 ] \
+  && ok "69a. token-file with gateway_token_file entirely absent from config -> refuses, stdout byte-empty" \
+  || bad "69a. rc=$CAP_RC out_bytes=$CAP_OUT_BYTES err='$CAP_ERR'"
+
+R="$(fresh_repo)"
+write_cfg "$R" '{"gateway_token_file": ""}'
+run_capture fb --repo "$R" token-file
+[ "$CAP_RC" -ne 0 ] && [ "$CAP_OUT_BYTES" -eq 0 ] \
+  && ok "69b. token-file with gateway_token_file explicitly empty -> refuses, stdout byte-empty" \
+  || bad "69b. rc=$CAP_RC out_bytes=$CAP_OUT_BYTES err='$CAP_ERR'"
+
+# ── 70. token-file: configured path does not exist on disk -> refuses,
+# stdout byte-empty. ────────────────────────────────────────────────────────
+R="$(fresh_repo)"
+write_cfg "$R" '{"gateway_token_file": "/nonexistent-heimdall-fallback-test/token/does/not/exist"}'
+run_capture fb --repo "$R" token-file
+[ "$CAP_RC" -ne 0 ] && [ "$CAP_OUT_BYTES" -eq 0 ] && printf '%s' "$CAP_ERR" | grep -q "does not exist" \
+  && ok "70. token-file with a configured path that does not exist -> refuses, stdout byte-empty" \
+  || bad "70. rc=$CAP_RC out_bytes=$CAP_OUT_BYTES err='$CAP_ERR'"
+
+# ── 71. token-file: a ~-prefixed path is expanded. Creates a real 0600 file
+# under $HOME (a fresh, uniquely-named directory, cleaned up immediately
+# after) since expansion only means something for a path that could
+# plausibly resolve under the real home directory. ─────────────────────────
+home_dir="$(mktemp -d "$HOME/hmd-fallback-test-tilde.XXXXXX")"
+tokf_home="$home_dir/token"
+printf 'not-a-real-token-value' > "$tokf_home"
+chmod 600 "$tokf_home"
+rel="~/$(basename "$home_dir")/token"
+R="$(fresh_repo)"
+write_cfg "$R" '{"gateway_token_file": "'"$rel"'"}'
+run_capture fb --repo "$R" token-file
+want="$(cd "$home_dir" && pwd)/token"
+[ "$CAP_RC" -eq 0 ] && [ "$CAP_OUT" = "$want" ] \
+  && ok "71. token-file expands a ~-prefixed gateway_token_file path" \
+  || bad "71. rc=$CAP_RC out='$CAP_OUT' want='$want' err='$CAP_ERR'"
+rm -rf "$home_dir"
 
 echo "--------------------------------------------------------------------"
 printf 'heimdall-fallback: %d passed, %d failed\n' "$PASS" "$FAIL"
