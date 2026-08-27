@@ -15,6 +15,10 @@
 # HOW THIS RUNS HERMETICALLY. HMD_HEADROOM_BIN points the chain at a recorder instead of
 # the real `headroom`, and the tool being "launched" is a script that dumps its own
 # environment and exits. No network, no ML model, no real proxy, no real editor.
+# Guarantees 10 onward additionally PATH-shadow a FAKE `heimdall-fallback` ahead of the
+# real one to dictate the fallback verdict a test wants; the real `.heimdall/fallback.json`
+# and any real OmniRoute gateway are never touched, and no guarantee below makes a
+# network call.
 #
 # Guarantees proved:
 #   1. The binary exists, is executable, parses, and is REACHABLE from the router
@@ -36,6 +40,35 @@
 #      the property that makes it safe to put on every launch in any directory, and it
 #      is the one that separates `hmd route` from `hmd wrap`.
 #   9. --status answers "am I routed right now" without launching anything.
+#
+# Commit 6de9093 added a FALLBACK PRECEDENCE block: `heimdall-fallback base-url` /
+# `token-file` now feed ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN, and the fallback gate
+# wins over headroom when it says ROUTE. Guarantees 10-21 cover that seam:
+#  10. FAIL-OPEN, named: with no .heimdall/fallback.json at all, the launch is
+#      unchanged — headroom still routes, the child still launches.
+#  11. FAIL-OPEN: with `heimdall-fallback` absent from PATH entirely (not merely
+#      unconfigured), the launch still succeeds and still takes the headroom path.
+#  12. FAIL-OPEN: a non-loopback or garbage `base-url` stdout (a wrong host, plain
+#      text, a traceback line) is never exported as ANTHROPIC_BASE_URL — only a
+#      literal loopback URL is trusted.
+#  13. PRECEDENCE: when the fallback gate says ROUTE, it wins over a live headroom
+#      proxy — the two re-point the same variable and are mutually exclusive.
+#  14. The stderr disclosure on that path names the fallback destination and says
+#      headroom compression is OFF for the session.
+#  15. TOKEN: on the fallback path, ANTHROPIC_AUTH_TOKEN equals the configured
+#      token file's own contents.
+#  16. TOKEN: that value never appears in the route command's OWN stdout or
+#      stderr — only in the child's environment.
+#  17. TOKEN: on a launch NOT routed to the fallback, a pre-set ANTHROPIC_AUTH_TOKEN
+#      that byte-matches the token file is dropped before the child ever sees it.
+#  18. TOKEN: on the same kind of launch, a pre-set ANTHROPIC_AUTH_TOKEN that does
+#      NOT match the token file (an operator's real key) passes through untouched
+#      — the pair to 17, and the one that catches an over-broad unset.
+#  19. --url answers for the fallback destination too, when the gate says ROUTE.
+#  20. --status names the fallback route and its URL, when the gate says ROUTE.
+#  21. On the fallback path, ANTHROPIC_MODEL is pinned from `heimdall-fallback model`
+#      (commit 81e252d) only when the operator left it unset; an operator-set
+#      ANTHROPIC_MODEL is never overridden.
 #
 # Usage:  bash test/heimdall-route.test.sh   (exit 0 = every guarantee holds)
 set -uo pipefail
@@ -326,6 +359,317 @@ if [ -n "${PID1:-}" ]; then
   esac
 else
   bad "guarantee 9 skipped — no live fixture proxy"
+fi
+
+# ── fixtures for guarantees 10+ (commit 6de9093's FALLBACK PRECEDENCE block) ─────────
+# Guarantees 10-20 prove the seam `hmd route` now has onto `heimdall-fallback
+# base-url`/`token-file`: it must fail open, it must never trust garbage on stdout as a
+# URL, it must actually win precedence over headroom when the gate says ROUTE, and it
+# must move a gateway token without ever leaking it or crossing it into the wrong
+# audience. Guarantees 13-20 PATH-shadow a FAKE heimdall-fallback ahead of the real one;
+# 10-12 exercise the real one (or its deliberate absence) against a config-free sandbox.
+# Nothing here reads the real .heimdall/fallback.json, touches a real OmniRoute gateway,
+# or makes a network call.
+
+# A loopback URL string bin/heimdall-route only ever pattern-matches and exports; it is
+# never dialed by anything in this suite (faketool just dumps its own env and exits), so
+# it needs no real listener behind it.
+FB_URL="http://127.0.0.1:65432"
+
+# The fake heimdall-fallback: one script, entirely driven by env vars set immediately
+# before each invocation, so it serves every guarantee below without being rewritten.
+#   FBSTUB_URL / FBSTUB_URL_RC               -> base-url's stdout / exit code
+#   FBSTUB_TOKEN_FILE / FBSTUB_TOKEN_FILE_RC -> token-file's stdout / exit code
+#   FBSTUB_MODEL / FBSTUB_MODEL_RC           -> model's stdout / exit code
+# Empty FBSTUB_URL (resp. FBSTUB_TOKEN_FILE, FBSTUB_MODEL) means "print nothing", same
+# as the real tool's own fail-closed contract. An unhandled subcommand (e.g. a real
+# `heimdall-fallback` that has not grown `model` yet) falls to the catch-all below,
+# which is deliberately harmless: stderr only, never a hang or a crash — proving the
+# fail-open contract holds even against a heimdall-fallback that predates this seam.
+FBSTUB_DIR="$TMP/fbstub"; mkdir -p "$FBSTUB_DIR"
+cat > "$FBSTUB_DIR/heimdall-fallback" <<'EOSH'
+#!/usr/bin/env bash
+set -uo pipefail
+case " $* " in
+  *" base-url "*)
+    [ -n "${FBSTUB_URL:-}" ] && printf '%s\n' "$FBSTUB_URL"
+    exit "${FBSTUB_URL_RC:-0}" ;;
+  *" token-file "*)
+    [ -n "${FBSTUB_TOKEN_FILE:-}" ] && printf '%s\n' "$FBSTUB_TOKEN_FILE"
+    exit "${FBSTUB_TOKEN_FILE_RC:-0}" ;;
+  *" model "*)
+    [ -n "${FBSTUB_MODEL:-}" ] && printf '%s\n' "$FBSTUB_MODEL"
+    exit "${FBSTUB_MODEL_RC:-0}" ;;
+  *)
+    printf 'fake-heimdall-fallback: unhandled args: %s\n' "$*" >&2
+    exit 2 ;;
+esac
+EOSH
+chmod +x "$FBSTUB_DIR/heimdall-fallback"
+
+# A 0600 gateway-token file holding a sentinel value. Must reach the child's
+# ANTHROPIC_AUTH_TOKEN on the fallback path, must never appear on the route command's
+# own stdout/stderr, and must never ride along to a launch it is not the audience for.
+TOKEN_SENTINEL="SENTINEL_ROUTE_TOKEN_9922"
+TOKFILE="$TMP/gateway-token"
+printf '%s' "$TOKEN_SENTINEL" > "$TOKFILE"
+chmod 600 "$TOKFILE"
+
+# `heimdall-fallback` genuinely absent from PATH: built by DROPPING every PATH entry
+# that resolves it, rather than assuming it lives at some fixed system path — the real
+# binary's install location is not this test's business.
+NOFB_PATH=""
+_old_ifs="$IFS"
+IFS=':'
+for _d in $PATH; do
+  [ -n "$_d" ] || continue
+  [ -x "$_d/heimdall-fallback" ] && continue
+  NOFB_PATH="${NOFB_PATH:+$NOFB_PATH:}$_d"
+done
+IFS="$_old_ifs"
+
+# check_garbage_rejected LABEL GARBAGE_STDOUT STUB_EXIT — guarantee 12's body, reused
+# for three garbage shapes. HEADROOM_PORT is a dead port, so the only correct outcome
+# is that ANTHROPIC_BASE_URL is ABSENT from the child — never the garbage value.
+check_garbage_rejected() {
+  local label="$1" garbage="$2" rc="$3"
+  local envfile="$TMP/env12-$1" outfile="$TMP/out12-$1" errfile="$TMP/err12-$1"
+  # HMD_MODULES_STATE is the EMPTY state (module not installed), not MODSTATE: this
+  # isolates the garbage-rejection property from headroom's own chain, which would
+  # otherwise legitimately fork a fresh proxy onto PORT_UNUSED (a genuinely free port)
+  # and set ANTHROPIC_BASE_URL to ITS OWN url, unrelated to the garbage under test here.
+  FBSTUB_URL="$garbage" FBSTUB_URL_RC="$rc" PATH="$FBSTUB_DIR:$TOOLDIR:$PATH" \
+    FAKETOOL_ENV_FILE="$envfile" HMD_HEADROOM_BIN="$FAKE_BIN" HMD_MODULES_STATE="$EMPTY_STATE" \
+    HEIMDALL_HOME="$TMP/home12-$1" HEADROOM_PORT="$PORT_UNUSED" \
+    "$ROUTE" faketool >"$outfile" 2>"$errfile"
+  if grep -q "^ANTHROPIC_BASE_URL=" "$envfile" 2>/dev/null; then
+    bad "garbage base-url ($label: '$garbage') leaked into the child: $(grep '^ANTHROPIC_BASE_URL=' "$envfile")"
+  else
+    ok "garbage base-url ($label) rejected — no ANTHROPIC_BASE_URL reached the child"
+  fi
+}
+
+echo
+echo "10 — FAIL-OPEN, named: with no .heimdall/fallback.json the launch is unchanged"
+NOFB_REPO="$TMP/no-fallback-config-repo"; mkdir -p "$NOFB_REPO"
+ENV10="$TMP/env10"
+if [ -n "${PID1:-}" ]; then
+  ( cd "$NOFB_REPO" && PATH="$TOOLDIR:$PATH" FAKETOOL_ENV_FILE="$ENV10" \
+      HMD_HEADROOM_BIN="$FAKE_BIN" HMD_MODULES_STATE="$MODSTATE" \
+      HEIMDALL_HOME="$TMP/home10" HEADROOM_PORT="$PORT1" \
+      "$ROUTE" faketool >"$TMP/out10" 2>"$TMP/err10" )
+  RC10=$?
+  [ "$RC10" = "0" ] && ok "no fallback.json: the child still launches (exit 0)" \
+    || bad "no fallback.json: launch failed (rc=$RC10): $(cat "$TMP/err10")"
+  grep -q "^ANTHROPIC_BASE_URL=http://127.0.0.1:$PORT1$" "$ENV10" 2>/dev/null \
+    && ok "no fallback.json: headroom path taken unchanged (pre-6de9093 behavior)" \
+    || bad "no fallback.json: headroom path was not taken: $(grep '^ANTHROPIC_BASE_URL=' "$ENV10" 2>/dev/null || echo '<absent>')"
+else
+  bad "guarantee 10 skipped — no live fixture proxy"
+fi
+
+echo
+echo "11 — FAIL-OPEN: with heimdall-fallback absent from PATH entirely, the launch still succeeds"
+if PATH="$NOFB_PATH" command -v heimdall-fallback >/dev/null 2>&1; then
+  bad "guarantee 11 setup is broken — heimdall-fallback is still resolvable on the trimmed PATH"
+else
+  ok "setup check: heimdall-fallback is genuinely unresolvable on the trimmed PATH"
+fi
+ENV11="$TMP/env11"
+if [ -n "${PID1:-}" ]; then
+  PATH="$TOOLDIR:$NOFB_PATH" FAKETOOL_ENV_FILE="$ENV11" \
+    HMD_HEADROOM_BIN="$FAKE_BIN" HMD_MODULES_STATE="$MODSTATE" \
+    HEIMDALL_HOME="$TMP/home11" HEADROOM_PORT="$PORT1" \
+    "$ROUTE" faketool >"$TMP/out11" 2>"$TMP/err11"
+  RC11=$?
+  [ "$RC11" = "0" ] && ok "heimdall-fallback absent from PATH: the tool still launches (exit 0)" \
+    || bad "heimdall-fallback absent from PATH: launch failed (rc=$RC11): $(cat "$TMP/err11")"
+  grep -q "^ANTHROPIC_BASE_URL=http://127.0.0.1:$PORT1$" "$ENV11" 2>/dev/null \
+    && ok "heimdall-fallback absent from PATH: headroom path is still taken" \
+    || bad "heimdall-fallback absent from PATH: headroom path was not taken: $(grep '^ANTHROPIC_BASE_URL=' "$ENV11" 2>/dev/null || echo '<absent>')"
+else
+  bad "guarantee 11 skipped — no live fixture proxy"
+fi
+
+echo
+echo "12 — FAIL-OPEN: a non-loopback or garbage base-url is never exported as ANTHROPIC_BASE_URL"
+check_garbage_rejected "wrong-host"     "http://evil.example.com"            0
+check_garbage_rejected "plain-garbage"  "not a url"                          1
+check_garbage_rejected "traceback-line" "Traceback (most recent call last):" 2
+
+echo
+echo "13 — PRECEDENCE: the fallback gate wins over a live headroom proxy"
+ENV13="$TMP/env13"
+if [ -n "${PID1:-}" ]; then
+  FBSTUB_URL="$FB_URL" FBSTUB_URL_RC=0 PATH="$FBSTUB_DIR:$TOOLDIR:$PATH" \
+    FAKETOOL_ENV_FILE="$ENV13" HMD_HEADROOM_BIN="$FAKE_BIN" HMD_MODULES_STATE="$MODSTATE" \
+    HEIMDALL_HOME="$TMP/home13" HEADROOM_PORT="$PORT1" \
+    "$ROUTE" faketool >"$TMP/out13" 2>"$TMP/err13"
+  RC13=$?
+  [ "$RC13" = "0" ] && ok "fallback beats a live headroom proxy: the tool still ran (exit 0)" \
+    || bad "fallback+live-headroom launch failed (rc=$RC13): $(cat "$TMP/err13")"
+  grep -q "^ANTHROPIC_BASE_URL=$FB_URL$" "$ENV13" 2>/dev/null \
+    && ok "the child got the FALLBACK url ($FB_URL), not headroom's" \
+    || bad "expected ANTHROPIC_BASE_URL=$FB_URL, got: $(grep '^ANTHROPIC_BASE_URL=' "$ENV13" 2>/dev/null || echo '<absent>')"
+  if grep -q "^ANTHROPIC_BASE_URL=http://127.0.0.1:$PORT1$" "$ENV13" 2>/dev/null; then
+    bad "the child got headroom's URL even though the fallback gate said ROUTE"
+  else
+    ok "headroom's own URL (http://127.0.0.1:$PORT1) was NOT used"
+  fi
+else
+  bad "guarantee 13 skipped — no live fixture proxy"
+fi
+
+echo
+echo "14 — PRECEDENCE: the stderr disclosure names the fallback destination and says compression is OFF"
+if [ -n "${PID1:-}" ]; then
+  grep -q "$FB_URL" "$TMP/err13" 2>/dev/null \
+    && ok "stderr names the fallback destination ($FB_URL)" \
+    || bad "stderr never named the fallback destination: $(cat "$TMP/err13" 2>/dev/null)"
+  grep -qi "compression is off" "$TMP/err13" 2>/dev/null \
+    && ok "stderr says headroom compression is OFF for this session" \
+    || bad "stderr did not disclose compression is off: $(cat "$TMP/err13" 2>/dev/null)"
+else
+  bad "guarantee 14 skipped — no live fixture proxy"
+fi
+
+echo
+echo "15 — TOKEN: the fallback path passes the token file's own contents as ANTHROPIC_AUTH_TOKEN"
+ENV15="$TMP/env15"
+if [ -n "${PID1:-}" ]; then
+  FBSTUB_URL="$FB_URL" FBSTUB_URL_RC=0 FBSTUB_TOKEN_FILE="$TOKFILE" FBSTUB_TOKEN_FILE_RC=0 \
+    PATH="$FBSTUB_DIR:$TOOLDIR:$PATH" FAKETOOL_ENV_FILE="$ENV15" \
+    HMD_HEADROOM_BIN="$FAKE_BIN" HMD_MODULES_STATE="$MODSTATE" \
+    HEIMDALL_HOME="$TMP/home15" HEADROOM_PORT="$PORT1" \
+    "$ROUTE" faketool >"$TMP/out15" 2>"$TMP/err15"
+  RC15=$?
+  [ "$RC15" = "0" ] && ok "fallback+token launch succeeded (exit 0)" \
+    || bad "fallback+token launch failed (rc=$RC15): $(cat "$TMP/err15")"
+  grep -q "^ANTHROPIC_AUTH_TOKEN=$TOKEN_SENTINEL$" "$ENV15" 2>/dev/null \
+    && ok "the child's ANTHROPIC_AUTH_TOKEN equals the token file's contents" \
+    || bad "child ANTHROPIC_AUTH_TOKEN missing or wrong: $(grep '^ANTHROPIC_AUTH_TOKEN=' "$ENV15" 2>/dev/null || echo '<absent>')"
+else
+  bad "guarantee 15 skipped — no live fixture proxy"
+fi
+
+echo
+echo "16 — TOKEN: the token value never appears in the route command's own stdout or stderr"
+if [ -n "${PID1:-}" ]; then
+  if grep -q "$TOKEN_SENTINEL" "$TMP/out15" 2>/dev/null; then
+    bad "the token sentinel leaked onto stdout: $(cat "$TMP/out15")"
+  else
+    ok "the token sentinel never appears on stdout"
+  fi
+  if grep -q "$TOKEN_SENTINEL" "$TMP/err15" 2>/dev/null; then
+    bad "the token sentinel leaked onto stderr: $(cat "$TMP/err15")"
+  else
+    ok "the token sentinel never appears on stderr"
+  fi
+else
+  bad "guarantee 16 skipped — no live fixture proxy"
+fi
+
+echo
+echo "17 — TOKEN: a NON-fallback launch drops a pre-set token that byte-matches the token file"
+ENV17="$TMP/env17"
+# HMD_MODULES_STATE is the EMPTY state here too, for the same reason as guarantee 12:
+# PORT_UNUSED is a genuinely free port, and an "installed" module would let headroom's
+# own chain fork a fresh proxy onto it and set ANTHROPIC_BASE_URL — noise this group has
+# no interest in. What guarantee 17 asserts is ANTHROPIC_AUTH_TOKEN, unaffected either way.
+FBSTUB_URL="" FBSTUB_URL_RC=1 FBSTUB_TOKEN_FILE="$TOKFILE" FBSTUB_TOKEN_FILE_RC=0 \
+  ANTHROPIC_AUTH_TOKEN="$TOKEN_SENTINEL" \
+  PATH="$FBSTUB_DIR:$TOOLDIR:$PATH" FAKETOOL_ENV_FILE="$ENV17" \
+  HMD_HEADROOM_BIN="$FAKE_BIN" HMD_MODULES_STATE="$EMPTY_STATE" \
+  HEIMDALL_HOME="$TMP/home17" HEADROOM_PORT="$PORT_UNUSED" \
+  "$ROUTE" faketool >"$TMP/out17" 2>"$TMP/err17"
+RC17=$?
+[ "$RC17" = "0" ] && ok "non-fallback launch with a matching token still runs (exit 0)" \
+  || bad "non-fallback launch failed (rc=$RC17): $(cat "$TMP/err17")"
+if grep -q "^ANTHROPIC_AUTH_TOKEN=" "$ENV17" 2>/dev/null; then
+  bad "the matching gateway token rode along to a non-fallback launch: $(grep '^ANTHROPIC_AUTH_TOKEN=' "$ENV17")"
+else
+  ok "the matching gateway token was dropped — the child has no ANTHROPIC_AUTH_TOKEN"
+fi
+
+echo
+echo "18 — TOKEN: a NON-fallback launch passes through a pre-set token that does NOT match"
+ENV18="$TMP/env18"
+REAL_TOKEN="sk-ant-operator-real-token-ABCDEF"
+# Same EMPTY_STATE reasoning as guarantees 12 and 17.
+FBSTUB_URL="" FBSTUB_URL_RC=1 FBSTUB_TOKEN_FILE="$TOKFILE" FBSTUB_TOKEN_FILE_RC=0 \
+  ANTHROPIC_AUTH_TOKEN="$REAL_TOKEN" \
+  PATH="$FBSTUB_DIR:$TOOLDIR:$PATH" FAKETOOL_ENV_FILE="$ENV18" \
+  HMD_HEADROOM_BIN="$FAKE_BIN" HMD_MODULES_STATE="$EMPTY_STATE" \
+  HEIMDALL_HOME="$TMP/home18" HEADROOM_PORT="$PORT_UNUSED" \
+  "$ROUTE" faketool >"$TMP/out18" 2>"$TMP/err18"
+RC18=$?
+[ "$RC18" = "0" ] && ok "non-fallback launch with an operator's own token still runs (exit 0)" \
+  || bad "non-fallback launch failed (rc=$RC18): $(cat "$TMP/err18")"
+grep -q "^ANTHROPIC_AUTH_TOKEN=$REAL_TOKEN$" "$ENV18" 2>/dev/null \
+  && ok "the operator's own (non-matching) token passed through untouched" \
+  || bad "the operator's own token was altered or dropped: $(grep '^ANTHROPIC_AUTH_TOKEN=' "$ENV18" 2>/dev/null || echo '<absent>')"
+
+echo
+echo "19 — --url prints the fallback URL, not headroom's, when the gate says ROUTE"
+if [ -n "${PID1:-}" ]; then
+  OUT19="$(FBSTUB_URL="$FB_URL" FBSTUB_URL_RC=0 PATH="$FBSTUB_DIR:$TOOLDIR:$PATH" \
+           HMD_HEADROOM_BIN="$FAKE_BIN" HMD_MODULES_STATE="$MODSTATE" \
+           HEIMDALL_HOME="$TMP/home19" HEADROOM_PORT="$PORT1" "$ROUTE" --url 2>"$TMP/err19")"
+  RC19=$?
+  [ "$RC19" = "0" ] && [ "$OUT19" = "$FB_URL" ] \
+    && ok "--url printed the fallback URL ($OUT19) and exited 0" \
+    || bad "--url printed '$OUT19' (rc=$RC19), expected $FB_URL with rc=0"
+else
+  bad "guarantee 19 skipped — no live fixture proxy"
+fi
+
+echo
+echo "20 — --status names the fallback route and its URL, when the gate says ROUTE"
+if [ -n "${PID1:-}" ]; then
+  ST20="$(FBSTUB_URL="$FB_URL" FBSTUB_URL_RC=0 PATH="$FBSTUB_DIR:$TOOLDIR:$PATH" \
+          HMD_HEADROOM_BIN="$FAKE_BIN" HMD_MODULES_STATE="$MODSTATE" \
+          HEIMDALL_HOME="$TMP/home20" HEADROOM_PORT="$PORT1" "$ROUTE" --status 2>/dev/null)"
+  case "$ST20" in
+    *"ROUTED TO FALLBACK"*"$FB_URL"*) ok "--status reports: $ST20" ;;
+    *) bad "--status did not name the fallback route: '$ST20'" ;;
+  esac
+else
+  bad "guarantee 20 skipped — no live fixture proxy"
+fi
+
+echo
+echo "21 — MODEL: the fallback path pins ANTHROPIC_MODEL when unset, never when set"
+if [ -n "${PID1:-}" ]; then
+  ENV21A="$TMP/env21a"
+  ( unset ANTHROPIC_MODEL
+    FBSTUB_URL="$FB_URL" FBSTUB_URL_RC=0 FBSTUB_MODEL="oc/test-model" FBSTUB_MODEL_RC=0 \
+      PATH="$FBSTUB_DIR:$TOOLDIR:$PATH" FAKETOOL_ENV_FILE="$ENV21A" \
+      HMD_HEADROOM_BIN="$FAKE_BIN" HMD_MODULES_STATE="$MODSTATE" \
+      HEIMDALL_HOME="$TMP/home21a" HEADROOM_PORT="$PORT1" \
+      "$ROUTE" faketool >"$TMP/out21a" 2>"$TMP/err21a" )
+  RC21A=$?
+  [ "$RC21A" = "0" ] && ok "fallback+unset-model launch succeeded (exit 0)" \
+    || bad "fallback+unset-model launch failed (rc=$RC21A): $(cat "$TMP/err21a")"
+  grep -q '^ANTHROPIC_MODEL=oc/test-model$' "$ENV21A" 2>/dev/null \
+    && ok "an unset ANTHROPIC_MODEL is pinned from heimdall-fallback model" \
+    || bad "ANTHROPIC_MODEL was not pinned: $(grep '^ANTHROPIC_MODEL=' "$ENV21A" 2>/dev/null || echo '<absent>')"
+
+  ENV21B="$TMP/env21b"
+  PRESET_MODEL="claude-operator-pinned-model"
+  ANTHROPIC_MODEL="$PRESET_MODEL" \
+    FBSTUB_URL="$FB_URL" FBSTUB_URL_RC=0 FBSTUB_MODEL="oc/test-model" FBSTUB_MODEL_RC=0 \
+    PATH="$FBSTUB_DIR:$TOOLDIR:$PATH" FAKETOOL_ENV_FILE="$ENV21B" \
+    HMD_HEADROOM_BIN="$FAKE_BIN" HMD_MODULES_STATE="$MODSTATE" \
+    HEIMDALL_HOME="$TMP/home21b" HEADROOM_PORT="$PORT1" \
+    "$ROUTE" faketool >"$TMP/out21b" 2>"$TMP/err21b"
+  RC21B=$?
+  [ "$RC21B" = "0" ] && ok "fallback+preset-model launch succeeded (exit 0)" \
+    || bad "fallback+preset-model launch failed (rc=$RC21B): $(cat "$TMP/err21b")"
+  grep -q "^ANTHROPIC_MODEL=$PRESET_MODEL$" "$ENV21B" 2>/dev/null \
+    && ok "an operator-set ANTHROPIC_MODEL was NOT overridden by heimdall-fallback model" \
+    || bad "the operator's ANTHROPIC_MODEL was overridden: $(grep '^ANTHROPIC_MODEL=' "$ENV21B" 2>/dev/null || echo '<absent>')"
+else
+  bad "guarantee 21 skipped — no live fixture proxy"
 fi
 
 echo
