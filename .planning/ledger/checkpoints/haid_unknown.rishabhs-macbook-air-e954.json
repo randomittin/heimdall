@@ -1,0 +1,14 @@
+{
+  "active_goal": "[dropped]",
+  "branch": "main",
+  "claimed_surfaces": [],
+  "haid": "haid:unknown.rishabhs-macbook-air-e954",
+  "head_sha": "87727f8",
+  "human": "unknown",
+  "phase": "unknown",
+  "progress_pct": 0,
+  "resumable": true,
+  "schema": "team_checkpoint_v1",
+  "task_ref": "[dropped]",
+  "updated_at": "2026-08-26T04:11:34Z"
+}
