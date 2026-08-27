@@ -26,8 +26,16 @@
 # ones that are not git repos at all. `hmd wrap` remains the deliberate, reversible,
 # per-repo act it always was; this is the launch-time routing half on its own.
 #
-# It sets ONE variable on ONE child: ANTHROPIC_BASE_URL. HTTPS_PROXY / ALL_PROXY are
-# never set here, for the reason bin/lib/hmd-headroom-chain.sh states at length — they
+# It sets ANTHROPIC_BASE_URL on ONE child, and on the fallback path ONLY (see FALLBACK
+# PRECEDENCE below) also ANTHROPIC_AUTH_TOKEN, read from a 0600 file the operator minted
+# — because OmniRoute enforces requireLogin on its inference surface, so a routed child
+# without a token gets 401 and the fallback is decorative. That token is dropped again on
+# any launch that is NOT routed to the fallback, so a bearer credential for a local
+# gateway can never ride along to api.anthropic.com. This paragraph used to read "ONE
+# variable on ONE child"; that stopped being true when the fallback path landed, and a
+# header asserting a narrower blast radius than the code has is worse than no header.
+# HTTPS_PROXY / ALL_PROXY are still never set here, for the reason
+# bin/lib/hmd-headroom-chain.sh states at length — they
 # would route the control plane, enrollment, presence and team traffic through a
 # rewriter, and that is how a compression proxy becomes a man-in-the-middle on signed
 # bytes. Judgment is unaffected: hmd_gate_exec scrubs ANTHROPIC_BASE_URL and the whole
@@ -93,10 +101,27 @@ case "${1:-}" in
   -h|--help|help|'')
     usage; exit 0 ;;
   --url)
+    # The fallback gate outranks headroom on a real launch, so --url must answer for the
+    # same destination a launch would use -- otherwise a shell function or editor config
+    # built on `hmd route --url` points somewhere the actual session does not go.
+    if command -v heimdall-fallback >/dev/null 2>&1; then
+      _fb="$(heimdall-fallback --repo "$PWD" base-url 2>/dev/null || true)"
+      case "$_fb" in
+        http://127.0.0.1:*|http://localhost:*) printf '%s\n' "$_fb"; exit 0 ;;
+      esac
+    fi
     if route_now; then printf '%s\n' "$HMD_HEADROOM_BASE_URL"; exit 0; fi
     printf '%s\n' "${HMD_HEADROOM_WHY:-no reason reported}" >&2
     exit 1 ;;
   --status)
+    if command -v heimdall-fallback >/dev/null 2>&1; then
+      _fb="$(heimdall-fallback --repo "$PWD" base-url 2>/dev/null || true)"
+      case "$_fb" in
+        http://127.0.0.1:*|http://localhost:*)
+          printf 'ROUTED TO FALLBACK — OmniRoute at %s; headroom compression is OFF while the fallback gate says ROUTE\n' "$_fb"
+          exit 0 ;;
+      esac
+    fi
     if chain_available; then hmd_headroom_report "$PLUGIN_DIR"; printf '\n'
     else printf 'NOT ROUTED — the headroom chain library is missing from this install\n'; fi
     exit 0 ;;
@@ -113,6 +138,73 @@ REAL="$(command -v "$TOOL" 2>/dev/null || true)"
 if [ -z "$REAL" ]; then
   printf '  %s is not installed (not found on PATH)\n' "$TOOL" >&2
   exit 127
+fi
+
+# ── FALLBACK PRECEDENCE ──────────────────────────────────────────────────────────────
+# Headroom and the OmniRoute fallback gate both re-point ANTHROPIC_BASE_URL, so they are
+# mutually exclusive on any one launch. When the gate says ROUTE, the gate WINS and
+# compression is dropped for that session. Two reasons, and neither is a preference:
+#
+#   1. ROUTE only ever happens because the operator's Claude capacity is gone. A
+#      compressed request to a provider that cannot be reached is worth nothing; an
+#      uncompressed request to one that can is worth the whole session. Degraded-but-
+#      running beats optimized-but-dead.
+#   2. Headroom compresses on the way OUT and the PROVIDER receives the compressed form
+#      — nothing decodes it before the model reads it (bin/lib/hmd-headroom-chain.sh
+#      states this at length). Fallback targets are OmniRoute's free/no-auth tier, i.e.
+#      markedly weaker models than Claude. Handing a weaker model a compressed prompt is
+#      the worst moment to be spending its comprehension on decompression.
+#
+# Chaining (claude -> headroom -> omni) was the alternative and is deliberately NOT done:
+# the chain pins HMD_HEADROOM_UPSTREAM to https://api.anthropic.com and REFUSES a proxy
+# pointing anywhere else, and that refusal is a measured invariant ("no new destination"
+# is verified from the running process, not asserted). Widening it to admit a second
+# destination would trade a real security property for a compression saving on the one
+# code path where compression matters least.
+#
+# The decision is NOT re-derived here. `heimdall-fallback base-url` runs the identical
+# preflight `check` runs and prints a URL only on ROUTE — two copies of a routing
+# decision is how a wrapper starts routing while the gate says REFUSE. Absent gate,
+# absent config, any non-ROUTE verdict, any internal error: stdout is empty, this block
+# does nothing, and the Headroom path below runs exactly as it did before.
+FALLBACK_URL=""
+FALLBACK_TOKEN_FILE=""
+if command -v heimdall-fallback >/dev/null 2>&1; then
+  FALLBACK_URL="$(heimdall-fallback --repo "$PWD" base-url 2>/dev/null || true)"
+  case "$FALLBACK_URL" in
+    http://127.0.0.1:*|http://localhost:*|http://'['::1']':*) ;;
+    *) FALLBACK_URL="" ;;   # never export anything that is not a loopback URL
+  esac
+fi
+
+if [ -n "$FALLBACK_URL" ]; then
+  FALLBACK_TOKEN_FILE="$(heimdall-fallback --repo "$PWD" token-file 2>/dev/null || true)"
+  if [ -n "$FALLBACK_TOKEN_FILE" ] && [ -r "$FALLBACK_TOKEN_FILE" ]; then
+    # Read into the child's env only. Never echoed, never logged, never in argv.
+    ANTHROPIC_AUTH_TOKEN="$(cat "$FALLBACK_TOKEN_FILE")"
+    export ANTHROPIC_AUTH_TOKEN
+  fi
+  printf "  ${G}✓${R} ${D}fallback: generation routed to OmniRoute at %s — headroom compression is OFF for this session (hmd fallback check)${R}\n" \
+    "$FALLBACK_URL" >&2
+  if [ -z "${ANTHROPIC_MODEL:-}" ]; then
+    printf "  ${D}· fallback: ANTHROPIC_MODEL is not set — OmniRoute will receive bare claude-* ids${R}\n" >&2
+  fi
+  export ANTHROPIC_BASE_URL="$FALLBACK_URL"
+  exec "$REAL" "$@"
+fi
+
+# Not routing to the fallback. If a gateway token is sitting in the environment (an outer
+# shell that WAS routed, a manual export), it must not ride along to api.anthropic.com:
+# it is a bearer credential for a different service and Anthropic is not its audience.
+# Compared against the token file's own contents so only that exact value is dropped —
+# an operator's real Anthropic token in the same variable is left untouched.
+if command -v heimdall-fallback >/dev/null 2>&1 && [ -n "${ANTHROPIC_AUTH_TOKEN:-}" ]; then
+  _tf="$(heimdall-fallback --repo "$PWD" token-file 2>/dev/null || true)"
+  if [ -n "$_tf" ] && [ -r "$_tf" ] && [ "$ANTHROPIC_AUTH_TOKEN" = "$(cat "$_tf")" ]; then
+    unset ANTHROPIC_AUTH_TOKEN
+    printf "  ${D}· fallback: dropped the OmniRoute gateway token from this unrouted launch (wrong audience)${R}\n" >&2
+  fi
+  unset _tf
 fi
 
 if route_now && [ -n "${HMD_HEADROOM_BASE_URL:-}" ]; then

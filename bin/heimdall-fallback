@@ -370,6 +370,13 @@ DEFAULT_CFG = {
     "target_provider": "",
     "tos_flagged_providers": [],
     "noauth_providers": [],
+    # PATH ONLY, never a secret. The OmniRoute gateway enforces requireLogin on
+    # its /v1/* inference surface, so a routed child needs a gateway token in
+    # ANTHROPIC_AUTH_TOKEN. Storing the PATH here (and the token in a 0600 file
+    # the operator minted themselves) keeps this config secret-free -- the same
+    # rule operator_key_env follows: hmd records WHERE a credential lives, never
+    # the credential. `token-file` refuses a path that is group/world-readable.
+    "gateway_token_file": "",
 }
 
 # EMPTY BY DESIGN (owner decision, 2026-08-26). hmd's OWN gate is unchanged --
@@ -1452,6 +1459,87 @@ def cmd_arm(args):
     return cmd_check(args)
 
 
+def _routing_decision(args):
+    """The verdict, computed exactly as cmd_check computes it. Returns
+    (rc, endpoint, reason). Shared so `base-url` can never drift from
+    `check` -- two independent copies of a routing decision is how a gate
+    starts saying ROUTE while the real gate says REFUSE."""
+    cfg, _ = load_config(args.repo)
+    checks = run_preflight(cfg)
+    state = cfg["state"]
+    session_verdict = _session_pre_exhaustion_verdict(args.repo) if state == "auto" else None
+    verdict, rc = _verdict(state, checks, tier=getattr(args, "tier", None),
+                           session_verdict=session_verdict)
+    failed = [name for name, ok, _ in checks if not ok]
+    reason = "verdict=%s (state=%s)" % (verdict, state)
+    if failed:
+        reason += "; failing checks: %s" % ", ".join(failed)
+    elif state == "auto" and session_verdict != "crossed":
+        reason += "; session_usage=%s (auto routes only on 'crossed')" % session_verdict
+    return rc, (cfg.get("endpoint") or ""), reason
+
+
+def cmd_base_url(args):
+    """Print the OmniRoute base URL on stdout IFF the verdict is ROUTE, and
+    print NOTHING to stdout otherwise -- the seam `hmd route` consumes in a
+    command substitution.
+
+    FAILS CLOSED for the same reason `check` does, and one stricter rule on
+    top: stdout stays EMPTY on every non-ROUTE path, including an internal
+    error. A caller does `url="$(heimdall-fallback base-url)"` and exports
+    whatever it gets; a reason string, a traceback line or a partial verdict
+    leaking onto stdout would be exported as a base URL and would silently
+    point a live session at garbage. Reasons go to stderr, always."""
+    try:
+        rc, endpoint, reason = _routing_decision(args)
+        if rc != 0:
+            sys.stderr.write("heimdall-fallback base-url: not routing -- %s\n" % reason)
+            return rc
+        if not endpoint or not _is_local_endpoint(endpoint):
+            # Unreachable via the preflight (endpoint_local is a check), but a
+            # base URL is too dangerous to emit on an assumption.
+            sys.stderr.write(
+                "heimdall-fallback base-url: refusing -- verdict is ROUTE but endpoint "
+                "%r is not a loopback address\n" % endpoint)
+            return 1
+        sys.stdout.write("%s\n" % endpoint)
+        return 0
+    except Exception as exc:
+        sys.stderr.write("heimdall-fallback base-url: refusing -- internal error: %s\n" % exc)
+        return 1
+
+
+def cmd_token_file(args):
+    """Print the PATH of the gateway token file, never its contents.
+
+    Refuses a file whose mode is group- or world-readable. A gateway token is
+    a bearer credential for a surface that can reach third-party providers;
+    handing back a path to a 0644 file would launder a real permission defect
+    into a routed session. Silent on stdout whenever it refuses, same contract
+    as base-url."""
+    try:
+        cfg, _ = load_config(args.repo)
+        path = (cfg.get("gateway_token_file") or "").strip()
+        if not path:
+            sys.stderr.write("heimdall-fallback token-file: no gateway_token_file configured\n")
+            return 1
+        path = os.path.abspath(os.path.expanduser(path))
+        if not os.path.isfile(path):
+            sys.stderr.write("heimdall-fallback token-file: %s does not exist\n" % path)
+            return 1
+        mode = os.stat(path).st_mode & 0o777
+        if mode & 0o077:
+            sys.stderr.write(
+                "heimdall-fallback token-file: refusing %s -- mode %04o is group/world "
+                "readable; a bearer token must be 0600 (chmod 600 it)\n" % (path, mode))
+            return 1
+        sys.stdout.write("%s\n" % path)
+        return 0
+    except Exception as exc:
+        sys.stderr.write("heimdall-fallback token-file: refusing -- internal error: %s\n" % exc)
+        return 1
+
+
 def cmd_where(args):
     print(_cfg_path(args.repo))
     return 0
@@ -1495,6 +1583,22 @@ def build_parser():
         help="fallback state to write once provisioning succeeds (default: auto)",
     )
 
+    sp_burl = sub.add_parser(
+        "base-url",
+        help="print the OmniRoute base URL iff the verdict is ROUTE (stdout stays "
+             "empty otherwise); the seam `hmd route` consumes",
+    )
+    sp_burl.add_argument(
+        "--tier", default=None, choices=sorted(TIER_ALIASES),
+        help="same tier argument `check` takes, for state=on's tier decision",
+    )
+
+    sub.add_parser(
+        "token-file",
+        help="print the PATH (never the contents) of the configured gateway token "
+             "file, refusing a path that is not 0600",
+    )
+
     sub.add_parser("where", help="print the config file path")
 
     return p
@@ -1514,6 +1618,8 @@ def main(argv):
         "set": cmd_set,
         "check": cmd_check,
         "arm": cmd_arm,
+        "base-url": cmd_base_url,
+        "token-file": cmd_token_file,
         "where": cmd_where,
     }
     return handlers[args.cmd](args)
