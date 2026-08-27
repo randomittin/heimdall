@@ -186,8 +186,22 @@ if [ -n "$FALLBACK_URL" ]; then
   fi
   printf "  ${G}✓${R} ${D}fallback: generation routed to OmniRoute at %s — headroom compression is OFF for this session (hmd fallback check)${R}\n" \
     "$FALLBACK_URL" >&2
+  # Pin the model when the operator has not. Without this, an unattended `auto`
+  # launch could only ever emit bare claude-* ids — which is precisely what the
+  # gate's anthropic_model_pinned check refuses to route with, so `auto` was
+  # structurally unable to fire in a normal session. The gate itself supplies the
+  # id (`heimdall-fallback model`), which refuses anything unprefixed or pointing
+  # at claude/claude-web, so this can never pin Tier-1. An operator-set
+  # ANTHROPIC_MODEL is never overridden.
   if [ -z "${ANTHROPIC_MODEL:-}" ]; then
-    printf "  ${D}· fallback: ANTHROPIC_MODEL is not set — OmniRoute will receive bare claude-* ids${R}\n" >&2
+    _fbmodel="$(heimdall-fallback --repo "$PWD" model 2>/dev/null || true)"
+    if [ -n "$_fbmodel" ]; then
+      export ANTHROPIC_MODEL="$_fbmodel"
+      printf "  ${D}· fallback: pinned ANTHROPIC_MODEL=%s (hmd fallback model)${R}\n" "$_fbmodel" >&2
+    else
+      printf "  ${D}· fallback: ANTHROPIC_MODEL is not set and no fallback_model is configured — OmniRoute will receive bare claude-* ids${R}\n" >&2
+    fi
+    unset _fbmodel
   fi
   export ANTHROPIC_BASE_URL="$FALLBACK_URL"
   exec "$REAL" "$@"
