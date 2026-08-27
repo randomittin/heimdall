@@ -377,6 +377,13 @@ DEFAULT_CFG = {
     # rule operator_key_env follows: hmd records WHERE a credential lives, never
     # the credential. `token-file` refuses a path that is group/world-readable.
     "gateway_token_file": "",
+    # The model id hmd pins on a routed child when the operator has not pinned
+    # one themselves. EMPTY BY DEFAULT, and an empty value changes nothing: the
+    # anthropic_model_pinned check fails exactly as it always did. Set it (or let
+    # `arm` resolve it) and `auto` becomes genuinely automatic -- see
+    # _model_pin_reject_reason for why an unset ANTHROPIC_MODEL was, until this
+    # field existed, an unconditional veto on every unattended launch.
+    "fallback_model": "",
 }
 
 # EMPTY BY DESIGN (owner decision, 2026-08-26). hmd's OWN gate is unchanged --
@@ -859,6 +866,45 @@ def _session_pre_exhaustion_verdict(repo):
     return verdict
 
 
+TIER1_MODEL_PREFIXES = ("claude", "claude-web")
+
+
+def _model_pin_reject_reason(model, origin):
+    """-> a reason string if `model` is unsafe to route with, else None.
+
+    `origin` names where the id came from, so the message tells the operator
+    which knob to fix.
+
+    Two rejections, and the second one closes a real hole this check had. The
+    documented intent is that a bare `claude-*` id must never reach OmniRoute,
+    because OmniRoute has an explicit branch matching it to provider 'claude'.
+    The original test for that was `"/" not in model` -- which accepts
+    `claude/sonnet` and `claude-web/anything`, i.e. the provider prefix that
+    names the Tier-1 subscription EXPLICITLY sails through the check that
+    exists to keep Tier-1 out. tier1_credential_absent is the primary defense
+    and would still hold, but a second line of defense that admits the exact
+    id it is defending against is not a second line of defense.
+
+    Only the provider SEGMENT is matched, never a substring: an id like
+    `anthropic/claude-3-5-sonnet` names provider `anthropic` (a paid API key,
+    not the operator's subscription) and is legitimate. Matching 'claude'
+    anywhere in the string would reject it, which is why the split is on the
+    first '/' and compared exactly.
+    """
+    model = (model or "").strip()
+    if not model:
+        return None  # caller decides what "absent" means; not this function's job
+    if "/" not in model:
+        return ("%s='%s' has no explicit provider/ prefix -- an unprefixed id is exactly "
+                "the bare form OmniRoute's routing branch matches" % (origin, model))
+    provider_segment = model.split("/", 1)[0].strip().lower()
+    if provider_segment in TIER1_MODEL_PREFIXES:
+        return ("%s='%s' names Tier-1 provider '%s' explicitly -- routing fallback traffic "
+                "at the operator's OWN Claude subscription is the exact boundary this tool "
+                "exists to hold" % (origin, model, provider_segment))
+    return None
+
+
 def run_preflight(cfg):
     """Every gated check runs and reports independently, in a fixed order --
     a failure at 3am names exactly what to fix, never just "preflight
@@ -1034,23 +1080,38 @@ def run_preflight(cfg):
 
     checks.append(("tier1_credential_absent", tier1_ok, tier1_reason))
 
-    anthropic_model = os.environ.get("ANTHROPIC_MODEL") or ""
-    if not anthropic_model:
-        checks.append((
-            "anthropic_model_pinned", False,
-            "ANTHROPIC_MODEL is not set -- Claude Code emits bare claude-* model IDs by "
-            "default, which OmniRoute has an explicit branch to route to provider 'claude' "
-            "if a connection exists (docs/analysis/2026-08-25-omniroute-credential-"
-            "isolation.md S5)",
-        ))
-    elif "/" not in anthropic_model:
-        checks.append((
-            "anthropic_model_pinned", False,
-            "ANTHROPIC_MODEL='%s' has no explicit provider/ prefix -- an unprefixed id is "
-            "exactly the bare form OmniRoute's routing branch matches" % anthropic_model,
-        ))
+    # An id the OPERATOR pinned outranks a configured one: their explicit choice is
+    # never silently overridden, and if it is unsafe they get told so rather than
+    # having hmd quietly substitute its own.
+    anthropic_model = (os.environ.get("ANTHROPIC_MODEL") or "").strip()
+    configured_model = (cfg.get("fallback_model") or "").strip()
+    if anthropic_model:
+        reason = _model_pin_reject_reason(anthropic_model, "ANTHROPIC_MODEL")
+        checks.append(("anthropic_model_pinned", reason is None, reason or ""))
+    elif configured_model:
+        # ANTHROPIC_MODEL is unset, but hmd will export fallback_model on the routed
+        # child before exec (see the FALLBACK PRECEDENCE block in bin/heimdall-route),
+        # so the child never emits a bare claude-* id. The safety property the check
+        # defends is satisfied by hmd doing the pinning -- so this PASSES, and it is
+        # the whole reason `state=auto` can now fire unattended.
+        reason = _model_pin_reject_reason(configured_model, "fallback_model")
+        if reason is None:
+            checks.append((
+                "anthropic_model_pinned", True,
+                "ANTHROPIC_MODEL is unset, but fallback_model='%s' is configured and hmd "
+                "pins it on the routed child before exec" % configured_model,
+            ))
+        else:
+            checks.append(("anthropic_model_pinned", False, reason))
     else:
-        checks.append(("anthropic_model_pinned", True, ""))
+        checks.append((
+            "anthropic_model_pinned", False,
+            "ANTHROPIC_MODEL is not set and no fallback_model is configured -- Claude Code "
+            "emits bare claude-* model IDs by default, which OmniRoute has an explicit "
+            "branch to route to provider 'claude' if a connection exists "
+            "(docs/analysis/2026-08-25-omniroute-credential-isolation.md S5). Set "
+            "fallback_model (or run `arm`) to let hmd pin one for you",
+        ))
 
     prefer_flag = os.environ.get("OMNIROUTE_PREFER_CLAUDE_CODE_FOR_UNPREFIXED_CLAUDE_MODELS") or ""
     prefer_off = prefer_flag.strip().lower() in _ENV_FLAG_OFF_VALUES
@@ -1540,6 +1601,33 @@ def cmd_token_file(args):
         return 1
 
 
+def cmd_model(args):
+    """Print the model id hmd should pin on a routed child, or NOTHING.
+
+    Same stdout contract as base-url and for the same reason: `hmd route` reads
+    this in a command substitution and exports the result as ANTHROPIC_MODEL. A
+    reason string or a traceback on stdout would become the model id of a live
+    session. Refuses any id _model_pin_reject_reason rejects -- notably a
+    `claude/` or `claude-web/` prefix -- so this seam can never be the thing
+    that points fallback traffic back at the operator's own subscription.
+    """
+    try:
+        cfg, _ = load_config(args.repo)
+        model = (cfg.get("fallback_model") or "").strip()
+        if not model:
+            sys.stderr.write("heimdall-fallback model: no fallback_model configured\n")
+            return 1
+        reason = _model_pin_reject_reason(model, "fallback_model")
+        if reason is not None:
+            sys.stderr.write("heimdall-fallback model: refusing -- %s\n" % reason)
+            return 1
+        sys.stdout.write("%s\n" % model)
+        return 0
+    except Exception as exc:
+        sys.stderr.write("heimdall-fallback model: refusing -- internal error: %s\n" % exc)
+        return 1
+
+
 def cmd_where(args):
     print(_cfg_path(args.repo))
     return 0
@@ -1599,6 +1687,12 @@ def build_parser():
              "file, refusing a path that is not 0600",
     )
 
+    sub.add_parser(
+        "model",
+        help="print the model id hmd pins on a routed child (stdout stays empty if "
+             "none is configured or the configured one is unsafe)",
+    )
+
     sub.add_parser("where", help="print the config file path")
 
     return p
@@ -1620,6 +1714,7 @@ def main(argv):
         "arm": cmd_arm,
         "base-url": cmd_base_url,
         "token-file": cmd_token_file,
+        "model": cmd_model,
         "where": cmd_where,
     }
     return handlers[args.cmd](args)
