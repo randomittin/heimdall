@@ -437,39 +437,62 @@ NOAUTH_PROVIDERS = frozenset({
     "codex-app-server", "uncloseai", "aihorde",
 })
 
-# Tool-use capability of the no-auth providers, used ONLY to order arm's
-# self-pick so the happy path does not default-select a provider that cannot
-# do the work. Sourced from docs/analysis/2026-08-26-omniroute-gateway-start.md,
-# which traced OmniRoute's own provider registry.
+# Usability ranking inputs for arm's self-pick, so the happy path does not
+# default-select a no-auth provider that cannot actually serve a request.
+# Every set below is read DIRECTLY off the provider's own entry in OmniRoute's
+# src/shared/constants/providers/noauth.ts -- named fields, not inference:
 #
-# HONESTY BOUNDARY, and it matters: only the two sets below are EVIDENCED.
-# Everything not listed here inherits an *unverified optimistic default* from
-# OmniRoute's own capability heuristic -- several such providers are
-# reverse-engineered consumer web UIs where real native tool support is
-# doubtful. So a provider ranking best here is "not known to be incapable",
-# NOT "measured capable". Never render this ordering as a capability promise.
-NOAUTH_TOOLS_DENIED = frozenset({
-    # explicit `tools` entry in `unsupportedParams` in its own registry entry
-    "aihorde",
-    # video-only, not a chat surface at all
-    "veoaifree-web",
+#   serviceKinds        -- ["video"] is not a chat surface at all
+#   isLocalCli: true    -- OmniRoute shells out to a binary that must be
+#                          installed AND separately authenticated on this
+#                          machine (e.g. `auggie login`). "No API key stored
+#                          by OmniRoute" is not the same as "works keyless".
+#   hasFree: false      -- no free tier, so keyless routing has nothing to use
+#   toolCalling         -- "emulated" means prompt-injected then text-parsed,
+#                          not native tool calling
+#
+# CORRECTION, recorded deliberately: an earlier revision of this block claimed
+# `aihorde` carries an explicit `tools` denial via unsupportedParams. That is
+# FALSE and was propagated from a subagent report without being checked.
+# `unsupportedParams` is a per-MODEL field resolved through
+# open-sse/config/providerRegistry.ts, which contains NO aihorde entry at all,
+# so the lookup returns empty and aihorde's tool capability falls through to
+# the same optimistic heuristic as everything else. There is no provider-level
+# tools denial for any no-auth provider. aihorde is in fact hasFree:true,
+# non-localCli, llm -- a legitimate tier-0 candidate.
+#
+# HONESTY BOUNDARY: `toolCalling` is unset for most entries, and unset means
+# OmniRoute's optimistic heuristic, NOT measured support. Several tier-0
+# providers are reverse-engineered consumer web UIs where real native tool
+# calling is doubtful. Ranking first means "nothing in the registry says it is
+# unusable", never "measured capable". Do not render this as a capability
+# promise.
+NOAUTH_NOT_LLM = frozenset({
+    "veoaifree-web",          # serviceKinds: ["video"]
+})
+NOAUTH_LOCAL_CLI = frozenset({
+    "devin-cli-agentic", "auggie", "zcode", "codex-app-server",
+})
+NOAUTH_NO_FREE_TIER = frozenset({
+    "devin-cli-agentic", "auggie", "zcode", "codex-app-server",
 })
 NOAUTH_TOOLS_EMULATED = frozenset({
-    # "emulated" tool use: prompt-injected then text-parsed, not native
     "devin-cli-agentic", "duckduckgo-web",
 })
 
 
 def _arm_provider_rank(provider):
-    """Deterministic preference rank for arm's self-pick: prefer providers not
-    known to be incapable, then emulated, then explicitly denied. Ties break
-    alphabetically so the pick stays reproducible (a nondeterministic default
-    would make `arm` unauditable)."""
-    if provider in NOAUTH_TOOLS_DENIED:
+    """Deterministic usability rank for arm's self-pick (lower is better).
+    Ties break alphabetically so the pick stays reproducible -- a
+    nondeterministic default would make `arm` unauditable."""
+    if provider in NOAUTH_NOT_LLM:
+        return 3
+    if provider in NOAUTH_LOCAL_CLI or provider in NOAUTH_NO_FREE_TIER:
         return 2
     if provider in NOAUTH_TOOLS_EMULATED:
         return 1
     return 0
+
 
 # One-time, plain explanation surfaced in BOTH `status` and `check` whenever
 # the pinned target_provider resolves to a no-auth route (never nagged, never
