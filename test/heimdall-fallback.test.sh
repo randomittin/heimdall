@@ -1650,6 +1650,191 @@ want="$(cd "$home_dir" && pwd)/token"
   || bad "71. rc=$CAP_RC out='$CAP_OUT' want='$want' err='$CAP_ERR'"
 rm -rf "$home_dir"
 
+# ── 72. anthropic_model_pinned: the NEW default-off baseline. With
+# ANTHROPIC_MODEL unset AND fallback_model absent/empty, the check FAILS and
+# names BOTH halves of why -- proving the fallback_model feature is opt-in:
+# an operator who does nothing sees exactly the pre-existing unconditional
+# veto. Two cases: key entirely absent from config, and key present but "". ─
+R="$(fresh_repo)"
+write_cfg "$R" '{"state": "auto"}'
+unset ANTHROPIC_MODEL
+out="$(fb --repo "$R" check)"
+echo "$out" | grep -q "FAIL.*anthropic_model_pinned" && echo "$out" | grep -qi "ANTHROPIC_MODEL is not set" && echo "$out" | grep -qi "no fallback_model is configured" \
+  && ok "72a. ANTHROPIC_MODEL unset, fallback_model absent from config -> anthropic_model_pinned FAILS, names both halves" \
+  || bad "72a. got: $out"
+
+R="$(fresh_repo)"
+write_cfg "$R" '{"state": "auto", "fallback_model": ""}'
+unset ANTHROPIC_MODEL
+out="$(fb --repo "$R" check)"
+echo "$out" | grep -q "FAIL.*anthropic_model_pinned" && echo "$out" | grep -qi "ANTHROPIC_MODEL is not set" && echo "$out" | grep -qi "no fallback_model is configured" \
+  && ok "72b. ANTHROPIC_MODEL unset, fallback_model explicitly '' -> anthropic_model_pinned FAILS, names both halves" \
+  || bad "72b. got: $out"
+
+# ── 73. anthropic_model_pinned: ANTHROPIC_MODEL unset AND fallback_model set
+# to a safe, prefixed id -> PASSES. This is the whole point of the feature:
+# hmd pins fallback_model on the routed child before exec (bin/heimdall-route's
+# FALLBACK PRECEDENCE block), so state=auto can fire genuinely unattended. ──
+R="$(fresh_repo)"
+write_cfg "$R" '{"state": "auto", "fallback_model": "oc/big-pickle"}'
+unset ANTHROPIC_MODEL
+out="$(fb --repo "$R" check)"
+echo "$out" | grep -q "OK.*anthropic_model_pinned" \
+  && ok "73. ANTHROPIC_MODEL unset, fallback_model='oc/big-pickle' (safe, prefixed) -> anthropic_model_pinned PASSES" \
+  || bad "73. got: $out"
+
+# ── 74. anthropic_model_pinned: ANTHROPIC_MODEL unset AND fallback_model set
+# to an UNPREFIXED id -> FAILS. An unprefixed fallback_model is exactly the
+# bare form OmniRoute's routing branch matches, so hmd pinning it would
+# recreate the exact hole this check exists to close. ──────────────────────
+R="$(fresh_repo)"
+write_cfg "$R" '{"state": "auto", "fallback_model": "big-pickle"}'
+unset ANTHROPIC_MODEL
+out="$(fb --repo "$R" check)"
+echo "$out" | grep -q "FAIL.*anthropic_model_pinned" && echo "$out" | grep -qi "no explicit provider/ prefix" \
+  && ok "74. ANTHROPIC_MODEL unset, fallback_model='big-pickle' (unprefixed) -> anthropic_model_pinned FAILS" \
+  || bad "74. got: $out"
+
+# ── 75. anthropic_model_pinned: fallback_model='claude/sonnet' -> FAILS,
+# reason names Tier-1. Mutation-verified: with `if provider_segment in
+# TIER1_MODEL_PREFIXES:` changed to `if False:` (the Tier-1 branch made
+# unreachable), this test is the one that fails -- see commit message. ─────
+R="$(fresh_repo)"
+write_cfg "$R" '{"state": "auto", "fallback_model": "claude/sonnet"}'
+unset ANTHROPIC_MODEL
+out="$(fb --repo "$R" check)"
+echo "$out" | grep -q "FAIL.*anthropic_model_pinned" && echo "$out" | grep -qi "Tier-1" \
+  && ok "75. fallback_model='claude/sonnet' -> anthropic_model_pinned FAILS, names Tier-1" \
+  || bad "75. got: $out"
+
+# ── 76. anthropic_model_pinned: fallback_model='claude-web/anything' -> FAILS,
+# same Tier-1 boundary as test 75, covering the SECOND entry in
+# TIER1_MODEL_PREFIXES so a fix that only special-cases 'claude' would still
+# be caught. ─────────────────────────────────────────────────────────────────
+R="$(fresh_repo)"
+write_cfg "$R" '{"state": "auto", "fallback_model": "claude-web/anything"}'
+unset ANTHROPIC_MODEL
+out="$(fb --repo "$R" check)"
+echo "$out" | grep -q "FAIL.*anthropic_model_pinned" && echo "$out" | grep -qi "Tier-1" \
+  && ok "76. fallback_model='claude-web/anything' -> anthropic_model_pinned FAILS, names Tier-1" \
+  || bad "76. got: $out"
+
+# ── 77. PRECEDENCE (load-bearing): an operator-set ANTHROPIC_MODEL outranks
+# fallback_model. With ANTHROPIC_MODEL set to an UNSAFE value and
+# fallback_model set to a SAFE one, the check still FAILS -- hmd must never
+# silently substitute its own configured id for an operator's explicit bad
+# one. Two flavors of "unsafe": unprefixed, and an explicit claude/ id.
+# Mutation-verified: with the `if anthropic_model: / elif configured_model:`
+# branches swapped so the configured id is consulted FIRST, both sub-tests
+# below flip to PASS (fallback_model's safe id wins) -- see commit message. ─
+R="$(fresh_repo)"
+write_cfg "$R" '{"state": "auto", "fallback_model": "oc/big-pickle"}'
+export ANTHROPIC_MODEL="big-pickle"
+out="$(fb --repo "$R" check)"
+unset ANTHROPIC_MODEL
+echo "$out" | grep -q "FAIL.*anthropic_model_pinned" && echo "$out" | grep -q "ANTHROPIC_MODEL='big-pickle'" \
+  && ok "77a. ANTHROPIC_MODEL='big-pickle' (unsafe, unprefixed) + fallback_model='oc/big-pickle' (safe) -> still FAILS on ANTHROPIC_MODEL, never substitutes fallback_model" \
+  || bad "77a. got: $out"
+
+R="$(fresh_repo)"
+write_cfg "$R" '{"state": "auto", "fallback_model": "oc/big-pickle"}'
+export ANTHROPIC_MODEL="claude/x"
+out="$(fb --repo "$R" check)"
+unset ANTHROPIC_MODEL
+echo "$out" | grep -q "FAIL.*anthropic_model_pinned" && echo "$out" | grep -qi "Tier-1" && echo "$out" | grep -q "ANTHROPIC_MODEL='claude/x'" \
+  && ok "77b. ANTHROPIC_MODEL='claude/x' (unsafe, explicit Tier-1) + fallback_model='oc/big-pickle' (safe) -> still FAILS on ANTHROPIC_MODEL, never substitutes fallback_model" \
+  || bad "77b. got: $out"
+
+# ── 78. anthropic_model_pinned: ANTHROPIC_MODEL=anthropic/claude-3-5-sonnet-
+# 20241022 -> PASSES. Provider segment is 'anthropic' (a paid API key), not
+# Tier-1 -- proves the match is on the provider SEGMENT (split on the first
+# '/'), never a 'claude' substring anywhere in the id. Mutation-verified:
+# with the segment split replaced by a substring test (`"claude" in model`),
+# this is the test that fails -- the model id contains "claude" inside the
+# model-name half, which an over-broad substring match would wrongly reject
+# even though the provider segment is 'anthropic'. See commit message. ─────
+R="$(fresh_repo)"
+write_cfg "$R" '{"state": "auto"}'
+export ANTHROPIC_MODEL="anthropic/claude-3-5-sonnet-20241022"
+out="$(fb --repo "$R" check)"
+unset ANTHROPIC_MODEL
+echo "$out" | grep -q "OK.*anthropic_model_pinned" \
+  && ok "78. ANTHROPIC_MODEL='anthropic/claude-3-5-sonnet-20241022' -> anthropic_model_pinned PASSES (provider segment, not a substring match)" \
+  || bad "78. got: $out"
+
+# ── 79. anthropic_model_pinned: case-insensitivity. fallback_model=
+# 'CLAUDE/sonnet' -> FAILS exactly like the lowercase form (test 75) -- the
+# provider segment is lowercased before the Tier-1 comparison. ─────────────
+R="$(fresh_repo)"
+write_cfg "$R" '{"state": "auto", "fallback_model": "CLAUDE/sonnet"}'
+unset ANTHROPIC_MODEL
+out="$(fb --repo "$R" check)"
+echo "$out" | grep -q "FAIL.*anthropic_model_pinned" && echo "$out" | grep -qi "Tier-1" \
+  && ok "79. fallback_model='CLAUDE/sonnet' (mixed case) -> anthropic_model_pinned FAILS, case is not a bypass" \
+  || bad "79. got: $out"
+
+# ── 80. model: a safe configured fallback_model prints EXACTLY that id on
+# stdout, exit 0. Same stdout contract as base-url (tests 59-64) and for the
+# same reason: `hmd route` reads this in a command substitution and exports
+# the result as ANTHROPIC_MODEL verbatim. ───────────────────────────────────
+R="$(fresh_repo)"
+write_cfg "$R" '{"fallback_model": "oc/big-pickle"}'
+run_capture fb --repo "$R" model
+[ "$CAP_RC" -eq 0 ] && [ "$CAP_OUT" = "oc/big-pickle" ] \
+  && ok "80. model with a safe configured fallback_model prints exactly that id, exit 0" \
+  || bad "80. rc=$CAP_RC out='$CAP_OUT' err='$CAP_ERR'"
+
+# ── 81. model: fallback_model absent/empty -> refuses, stdout BYTE-EMPTY.
+# Two cases, mirroring the token-file absent/empty pair (tests 69a/69b).
+# Mutation-verified: with cmd_model's `sys.stderr.write(...)` on the
+# `if not model:` branch changed to `sys.stdout.write(...)`, 81a/81b are the
+# tests that fail (CAP_OUT_BYTES becomes nonzero) -- see commit message. ───
+R="$(fresh_repo)"
+write_cfg "$R" '{}'
+run_capture fb --repo "$R" model
+[ "$CAP_RC" -ne 0 ] && [ "$CAP_OUT_BYTES" -eq 0 ] \
+  && ok "81a. model with fallback_model entirely absent from config -> refuses, stdout byte-empty" \
+  || bad "81a. rc=$CAP_RC out_bytes=$CAP_OUT_BYTES out='$CAP_OUT' err='$CAP_ERR'"
+
+R="$(fresh_repo)"
+write_cfg "$R" '{"fallback_model": ""}'
+run_capture fb --repo "$R" model
+[ "$CAP_RC" -ne 0 ] && [ "$CAP_OUT_BYTES" -eq 0 ] \
+  && ok "81b. model with fallback_model explicitly empty -> refuses, stdout byte-empty" \
+  || bad "81b. rc=$CAP_RC out_bytes=$CAP_OUT_BYTES out='$CAP_OUT' err='$CAP_ERR'"
+
+# ── 82. model: fallback_model='claude/sonnet' -> refuses, stdout byte-empty,
+# stderr names Tier-1. `hmd route` must never export a Tier-1 id just
+# because it happened to be configured. ─────────────────────────────────────
+R="$(fresh_repo)"
+write_cfg "$R" '{"fallback_model": "claude/sonnet"}'
+run_capture fb --repo "$R" model
+[ "$CAP_RC" -ne 0 ] && [ "$CAP_OUT_BYTES" -eq 0 ] && printf '%s' "$CAP_ERR" | grep -qi "Tier-1" \
+  && ok "82. model with fallback_model='claude/sonnet' -> refuses, stdout byte-empty, stderr names Tier-1" \
+  || bad "82. rc=$CAP_RC out_bytes=$CAP_OUT_BYTES out='$CAP_OUT' err='$CAP_ERR'"
+
+# ── 83. model: fallback_model unprefixed -> refuses, stdout byte-empty. ────
+R="$(fresh_repo)"
+write_cfg "$R" '{"fallback_model": "big-pickle"}'
+run_capture fb --repo "$R" model
+[ "$CAP_RC" -ne 0 ] && [ "$CAP_OUT_BYTES" -eq 0 ] \
+  && ok "83. model with fallback_model='big-pickle' (unprefixed) -> refuses, stdout byte-empty" \
+  || bad "83. rc=$CAP_RC out_bytes=$CAP_OUT_BYTES out='$CAP_OUT' err='$CAP_ERR'"
+
+# ── 84. model NEVER reads ANTHROPIC_MODEL: it reports what hmd WOULD PIN,
+# not what is already set. With ANTHROPIC_MODEL set to a fully valid,
+# prefixed id and fallback_model empty, `model` still refuses with
+# stdout byte-empty -- proving cmd_model consults cfg['fallback_model']
+# only, never os.environ['ANTHROPIC_MODEL']. ───────────────────────────────
+R="$(fresh_repo)"
+write_cfg "$R" '{"fallback_model": ""}'
+export ANTHROPIC_MODEL="anthropic/claude-3-5-sonnet-20241022"
+run_capture fb --repo "$R" model
+unset ANTHROPIC_MODEL
+[ "$CAP_RC" -ne 0 ] && [ "$CAP_OUT_BYTES" -eq 0 ] \
+  && ok "84. model with ANTHROPIC_MODEL set (valid) but fallback_model empty -> still refuses, stdout byte-empty (model never reads ANTHROPIC_MODEL)" \
+  || bad "84. rc=$CAP_RC out_bytes=$CAP_OUT_BYTES out='$CAP_OUT' err='$CAP_ERR'"
+
 echo "--------------------------------------------------------------------"
 printf 'heimdall-fallback: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
