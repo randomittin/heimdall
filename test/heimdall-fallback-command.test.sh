@@ -8,10 +8,11 @@
 # fix (commands/fallback.md):
 #   1. The file exists with the correct frontmatter (name: fallback,
 #      argument-hint, disable-model-invocation: true — it changes real state).
-#   2. It documents the real subcommand set: status / set / check / arm / where.
+#   2. It documents the real subcommand set: status / set / check / arm /
+#      base-url / token-file / model / where.
 #   3. THE CORRECTION THAT MATTERS MOST: there is NO `heimdall-fallback
 #      config` subcommand. build_parser() in bin/heimdall-fallback defines
-#      exactly four subparsers; an earlier, unverified assumption asserted a
+#      exactly eight subparsers; an earlier, unverified assumption asserted a
 #      `config target_provider <x>` subcommand existed. This test locks in
 #      the truth two ways — the doc must say plainly that no config
 #      subcommand exists (target_provider/operator_key_env are set by
@@ -28,6 +29,14 @@
 #      cache-miss money even against a free provider.
 #   6. It does not overstate scope: model-independent via OmniRoute, NOT
 #      harness-independent (the harness stays Claude Code either way).
+#   7. It documents the three subcommands added since: `base-url`,
+#      `token-file`, and `model` — programmatic seams bin/heimdall-route
+#      consumes directly, not everyday operator commands — including each
+#      one's real stdout contract (ROUTE-only for base-url, path-never-
+#      contents plus a group/world-readable refusal for token-file).
+#   8. It documents the `fallback_model` config field: empty by default,
+#      blocking `auto` from ever reaching ROUTE unattended until set, and
+#      that an operator-set ANTHROPIC_MODEL always outranks it.
 #
 # EXIT: 0 = all assertions pass; 1 = any FAIL.
 set -uo pipefail
@@ -59,8 +68,9 @@ if grep -qE '^disable-model-invocation:[[:space:]]*true[[:space:]]*$' "$CMD_MD";
   ok "fallback.md sets disable-model-invocation: true (state-changing command)"
 else bad "fallback.md does not set disable-model-invocation: true"; fi
 
-# ── 2. the real subcommand set is documented ────────────────────────────────
-for SUB in status set check arm where; do
+# ── 2. the real subcommand set is documented (5 operator-facing + 3 seams
+#       bin/heimdall-route consumes directly: base-url/token-file/model) ───
+for SUB in status set check arm base-url token-file model where; do
   if grep -q "heimdall-fallback $SUB" "$CMD_MD"; then
     ok "fallback.md documents the real 'heimdall-fallback $SUB' subcommand"
   else
@@ -88,10 +98,10 @@ fi
 # Cross-check against the live source so this claim cannot silently go stale.
 if [ -x "$FALLBACK_BIN" ]; then
   SUBCOUNT="$(grep -c 'add_parser(' "$FALLBACK_BIN" || true)"
-  if [ "$SUBCOUNT" = "5" ]; then
-    ok "bin/heimdall-fallback still defines exactly 5 subparsers (status/set/check/arm/where) — the doc's 'no config subcommand' claim still holds"
+  if [ "$SUBCOUNT" = "8" ]; then
+    ok "bin/heimdall-fallback still defines exactly 8 subparsers (status/set/check/arm/base-url/token-file/model/where) — the doc's 'no config subcommand' claim still holds"
   else
-    bad "bin/heimdall-fallback now defines $SUBCOUNT subparser(s) (expected 5) — re-check fallback.md's 'no config subcommand' claim against the live source"
+    bad "bin/heimdall-fallback now defines $SUBCOUNT subparser(s) (expected 8) — re-check fallback.md's 'no config subcommand' claim against the live source"
   fi
 else
   bad "bin/heimdall-fallback is missing or not executable — cannot cross-check the subparser count"
@@ -152,6 +162,47 @@ else bad "fallback.md does not carry the model-vs-harness-independence scope cav
 if grep -q 'docs/analysis/2026-08-25-harness-independence-design.md' "$CMD_MD"; then
   ok "fallback.md cites the harness-independence design doc"
 else bad "fallback.md does not cite docs/analysis/2026-08-25-harness-independence-design.md"; fi
+
+# ── 8. the three seams (base-url/token-file/model) are documented with their
+#       real behavioral contracts, and framed as programmatic seams rather
+#       than everyday operator commands ─────────────────────────────────────
+if grep -qiE 'only when the verdict is route' "$CMD_MD" && grep -qiE 'stdout stays byte-empty' "$CMD_MD"; then
+  ok "fallback.md documents base-url prints a URL only on ROUTE and stays byte-empty otherwise"
+else
+  bad "fallback.md does not document base-url's ROUTE-only / byte-empty-otherwise stdout contract"
+fi
+
+if grep -qiE 'never its contents' "$CMD_MD" && grep -qiE 'group/world-readable' "$CMD_MD"; then
+  ok "fallback.md documents token-file prints only a path and refuses a group/world-readable file"
+else
+  bad "fallback.md does not document token-file's path-only / group-world-readable-refusal contract"
+fi
+
+if grep -qF 'prints the model id hmd pins on a routed' "$CMD_MD"; then
+  ok "fallback.md documents what the model subcommand prints"
+else
+  bad "fallback.md does not document the model subcommand's purpose"
+fi
+
+if grep -qiE 'not everyday commands|not an operator-invoked subcommand' "$CMD_MD"; then
+  ok "fallback.md frames base-url/token-file/model as seams bin/heimdall-route consumes, not everyday operator commands"
+else
+  bad "fallback.md does not frame base-url/token-file/model as internal seams rather than operator commands"
+fi
+
+# ── 9. fallback_model: empty by default, blocks auto until set, and an
+#       operator-set ANTHROPIC_MODEL always outranks it ─────────────────────
+if grep -qiE 'empty by default' "$CMD_MD" && grep -qiE 'auto.*can only ever wait' "$CMD_MD"; then
+  ok "fallback.md documents fallback_model is empty by default and blocks auto from routing while empty"
+else
+  bad "fallback.md does not document fallback_model's empty-by-default / auto-blocking behavior"
+fi
+
+if grep -qiE 'operator-set.*ANTHROPIC_MODEL.*always outranks' "$CMD_MD"; then
+  ok "fallback.md documents that an operator-set ANTHROPIC_MODEL always outranks fallback_model"
+else
+  bad "fallback.md does not document ANTHROPIC_MODEL's precedence over fallback_model"
+fi
 
 echo
 echo "  Results: $PASS passed, $FAIL failed"
