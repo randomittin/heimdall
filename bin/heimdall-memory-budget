@@ -1,0 +1,516 @@
+#!/usr/bin/env python3
+"""heimdall-memory-budget — memory-aware cap on how many MORE agents may be
+spawned right now.
+
+THE ASK (repo owner, verbatim): "Whatever memory is available, only spawn as
+many agents as occupy ~80% of it. E.g. machine has 16G; 6G used by other
+processes; 4G used by other HMD agents; available = 6G; HMD may then use at
+most 80% of 6G = 4.8G for new agents."
+
+    budget_mb = floor(available_mb * reserve_pct)
+    slots     = floor(budget_mb / per_agent_mb)
+
+THE GAP THIS CLOSES: bin/agent-pool's existing cap (max_agents) is a bare
+COUNT. A count alone is blind to host memory pressure -- it will happily
+"acquire" agent #6 on a box with 1.7GB genuinely free and ~450MB per agent,
+and #6 starts swapping. This tool is a SECOND, INDEPENDENT, memory-aware cap
+that bin/agent-pool's cmd_acquire consults IN ADDITION TO (never instead of)
+the count-based limit -- mirroring how bin/lib/pressure_control.py is a
+second, independent cap consulted by cmd_should_scale. Two unrelated signals,
+two unrelated ceilings, same "consult, never replace" shape.
+
+NOT bin/heimdall-memory. That file is the unrelated Verified-Memory CLI
+(attestation/claims store). This is a completely separate concern -- how
+much RAM is free right now -- and lives as its own binary on purpose.
+
+"AVAILABLE" IS NOT "TOTAL" AND NOT "TOTAL MINUS USED" -- this distinction is
+the entire point of the tool:
+  * macOS: available = (free + inactive + speculative + purgeable) pages,
+    at vm_stat's OWN reported page size -- NEVER hardcode 4096. Apple
+    Silicon reports 16384; hardcoding 4096 is a silent 4x error, hardcoding
+    16384 would just be a different unverified assumption. "inactive" and
+    "speculative" pages are reclaimable without I/O and "purgeable" is
+    explicitly discardable -- all three are genuinely available to a new
+    process even though a naive "free pages only" count would miss them,
+    which is exactly why a naive total-minus-used estimate overstates how
+    tight a machine really is.
+  * Linux: available = /proc/meminfo's OWN "MemAvailable" field, read
+    directly. The kernel already computes this (accounting for reclaimable
+    slab, page cache that can be dropped, etc.) far more accurately than
+    any free+cached arithmetic this script could reconstruct itself.
+
+FAIL OPEN, LOUDLY, ON STDERR -- a DELIBERATE, DOCUMENTED divergence from
+this repo's normal "gates fail closed" rule (see CLAUDE.md Quality Gates).
+This is a resource GOVERNOR, not a correctness gate: refusing to spawn an
+agent because memory COULD NOT be measured is strictly worse than spawning
+one when memory genuinely is tight -- "couldn't measure" usually means
+"unfamiliar platform" or "tool missing", not "machine is actually out of
+memory". Do NOT "fix" this to fail closed; that is exactly the regression
+this comment exists to head off. See probe()'s two `except` arms and every
+cmd_* function's fail-open branch.
+
+Exit codes:
+  status:     always 0 (best-effort report; the "measured" field says
+              whether the numbers are real or a fail-open sentinel).
+  slots:      always 0. Prints ONE integer to stdout, nothing else, ever.
+  can-spawn:  0  if the requested --count more agents fit (or memory is
+                 unmeasurable -- fails open).
+              1  if they do not fit. The reason goes to STDERR ONLY --
+                 stdout is BYTE-EMPTY on this path, by contract (callers do
+                 `x="$(heimdall-memory-budget can-spawn)"` and must never
+                 see prose land in $x).
+
+Required env overrides (hermetic tests; also usable operationally to pin a
+number rather than measure it):
+  HMD_MEM_TOTAL_MB        total system memory, MB
+  HMD_MEM_AVAILABLE_MB    genuinely-free memory, MB
+  HMD_MEM_PER_AGENT_MB    per-agent memory estimate, MB
+  HMD_MEM_RESERVE_PCT     reserve factor, e.g. 0.80
+
+Test-only seams (an operator never sets these; they exist so this file's own
+test suite can be hermetic without touching the real host or the real
+persisted state):
+  HMD_MEM_SIMULATE_UNMEASURABLE   any non-empty value -> force the fail-open path
+  HMD_MEM_PLATFORM                force "darwin"/"linux" instead of sys.platform
+  HMD_MEM_VMSTAT_RAW               literal vm_stat(1) TEXT, replaces shelling out
+  HMD_MEM_PROC_MEMINFO             PATH to a /proc/meminfo-shaped file
+  HMD_MEM_PS_ROWS                  PATH to a "RSS_KB COMM" lines file, replaces `ps`
+  HMD_MEM_STATE_FILE               PATH, replaces .planning/memory-budget-state.json
+
+An env var set to the EMPTY STRING is treated identically to unset (the test
+harness always exports every HMD_MEM_* var, blank when not in use for a
+given case) -- see _env().
+
+Usage:
+  heimdall-memory-budget status [--json]
+  heimdall-memory-budget slots
+  heimdall-memory-budget can-spawn [--count N]
+"""
+import contextlib
+import json
+import os
+import re
+import subprocess
+import sys
+
+UNMEASURABLE_SLOTS = 999999  # fail-open sentinel: "no cap, could not measure"
+FLOOR_PER_AGENT_MB = 450     # from the measured 448MB real peak RSS seed sample
+DEFAULT_RESERVE_PCT = 0.80
+
+
+def _env(name):
+    """Env var value, or None for unset OR empty-string (see module docstring
+    -- the test harness always exports every HMD_MEM_* var, blank meaning
+    'do not override this dimension')."""
+    v = os.environ.get(name)
+    return v if v not in (None, "") else None
+
+
+def _env_float(name):
+    v = _env(name)
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+class Unmeasurable(Exception):
+    """Raised internally when a REAL (non-override) measurement could not be
+    completed -- unknown platform, tool missing, unparsable output. Always
+    caught by probe(); never escapes this file. Never raised for a
+    perfectly-valid-but-extreme override (e.g. RESERVE_PCT=0) -- that is a
+    deliberate operator choice, not a measurement failure."""
+
+
+# ── platform detection ────────────────────────────────────────────────────
+
+def _platform():
+    forced = _env("HMD_MEM_PLATFORM")
+    if forced:
+        return forced.strip().lower()
+    return sys.platform.lower()
+
+
+# ── macOS: vm_stat + sysctl ───────────────────────────────────────────────
+
+def _vmstat_text():
+    override = _env("HMD_MEM_VMSTAT_RAW")
+    if override is not None:
+        return override
+    try:
+        out = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=5)
+    except OSError as exc:
+        raise Unmeasurable("vm_stat unavailable: %s" % exc) from exc
+    if out.returncode != 0 or not out.stdout:
+        raise Unmeasurable("vm_stat exited %s with no output" % out.returncode)
+    return out.stdout
+
+
+def _darwin_available_mb():
+    text = _vmstat_text()
+    # The page size MUST come from vm_stat's OWN header line -- never a
+    # hardcoded constant. Apple Silicon reports 16384; a hardcoded 4096
+    # would silently under-report available memory by 4x.
+    m = re.search(r"page size of (\d+) bytes", text)
+    if not m:
+        raise Unmeasurable("could not parse page size from vm_stat output")
+    page_size = int(m.group(1))
+
+    def field(label):
+        mm = re.search(re.escape(label) + r":\s*(\d+)", text)
+        if not mm:
+            raise Unmeasurable("vm_stat missing field %r" % label)
+        return int(mm.group(1))
+
+    # Genuinely free = free + inactive + speculative + purgeable pages. NOT
+    # total-minus-used (that would count "active"/"wired" pages as unusable
+    # forever, when in reality inactive/speculative/purgeable are reclaimable
+    # without I/O and purgeable is explicitly discardable on demand).
+    pages = (field("Pages free") + field("Pages inactive")
+             + field("Pages speculative") + field("Pages purgeable"))
+    return (pages * page_size) / (1024.0 * 1024.0)
+
+
+def _darwin_total_mb():
+    try:
+        out = subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True, text=True, timeout=5)
+    except OSError as exc:
+        raise Unmeasurable("sysctl unavailable: %s" % exc) from exc
+    if out.returncode != 0 or not out.stdout.strip():
+        raise Unmeasurable("sysctl -n hw.memsize failed")
+    try:
+        memsize_bytes = int(out.stdout.strip())
+    except ValueError as exc:
+        raise Unmeasurable("sysctl hw.memsize unparsable: %s" % exc) from exc
+    return memsize_bytes / (1024.0 * 1024.0)
+
+
+# ── Linux: /proc/meminfo ──────────────────────────────────────────────────
+
+def _meminfo_text():
+    path = _env("HMD_MEM_PROC_MEMINFO") or "/proc/meminfo"
+    try:
+        with open(path) as f:
+            return f.read()
+    except OSError as exc:
+        raise Unmeasurable("cannot read %s: %s" % (path, exc)) from exc
+
+
+def _meminfo_field_kb(text, label):
+    m = re.search(r"^" + re.escape(label) + r":\s*(\d+)", text, re.MULTILINE)
+    if not m:
+        raise Unmeasurable("meminfo missing field %r" % label)
+    return int(m.group(1))
+
+
+def _linux_total_mb():
+    return _meminfo_field_kb(_meminfo_text(), "MemTotal") / 1024.0
+
+
+def _linux_available_mb():
+    # MemAvailable is the KERNEL's own reclaimable-memory estimate -- more
+    # accurate than any free+cached arithmetic reconstructed here. Used
+    # DIRECTLY, never rederived.
+    return _meminfo_field_kb(_meminfo_text(), "MemAvailable") / 1024.0
+
+
+# ── total / available dispatch (override-first) ───────────────────────────
+
+def _total_mb():
+    override = _env_float("HMD_MEM_TOTAL_MB")
+    if override is not None:
+        return override
+    plat = _platform()
+    if plat == "darwin":
+        return _darwin_total_mb()
+    if plat == "linux":
+        return _linux_total_mb()
+    raise Unmeasurable("unsupported platform: %r" % plat)
+
+
+def _available_mb():
+    override = _env_float("HMD_MEM_AVAILABLE_MB")
+    if override is not None:
+        return override
+    plat = _platform()
+    if plat == "darwin":
+        return _darwin_available_mb()
+    if plat == "linux":
+        return _linux_available_mb()
+    raise Unmeasurable("unsupported platform: %r" % plat)
+
+
+# ── per-agent estimate: rolling high-water mark, persisted under .planning/ ─
+
+def _state_file():
+    override = _env("HMD_MEM_STATE_FILE")
+    if override:
+        return override
+    bin_dir = os.path.dirname(os.path.realpath(__file__))
+    repo_root = os.path.dirname(bin_dir)
+    return os.path.join(repo_root, ".planning", "memory-budget-state.json")
+
+
+def _load_persisted_estimate_mb():
+    """The last persisted high-water-mark estimate, or None on ANY problem
+    (missing file, corrupt JSON, wrong shape) -- a broken state file must
+    NEVER break this CLI, it just means 'nothing persisted yet'."""
+    try:
+        with open(_state_file()) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    try:
+        val = data.get("per_agent_mb_estimate")
+        return float(val) if val is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _persist_estimate_mb(value):
+    """Best-effort atomic write (tmp + rename, matching bin/agent-pool's own
+    save_pool()). Persistence is a nice-to-have cache, never a correctness
+    requirement -- any failure here is swallowed, not raised (mirrors
+    bin/heimdall-pressure's own best-effort ledger-append idiom)."""
+    path = _state_file()
+    with contextlib.suppress(OSError):
+        d = os.path.dirname(path)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"schema": 1, "per_agent_mb_estimate": value}, f)
+        os.replace(tmp, path)
+
+
+def _ps_lines():
+    override = _env("HMD_MEM_PS_ROWS")
+    if override:
+        try:
+            with open(override) as f:
+                return f.read().splitlines()
+        except OSError:
+            return []
+    try:
+        out = subprocess.run(["ps", "-axo", "rss=,comm="], capture_output=True, text=True, timeout=5)
+    except OSError:
+        return []
+    if out.returncode != 0:
+        return []
+    return out.stdout.splitlines()
+
+
+def _sample_claude_rss_kb():
+    """RSS (KB) of every currently-running process whose command name
+    mentions "claude" (case-insensitive) -- an unrelated process (e.g.
+    chrome) must never contribute, however large its own RSS is."""
+    kb_values = []
+    for line in _ps_lines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split(None, 1)
+        if len(parts) != 2:
+            continue
+        rss_raw, comm = parts
+        if "claude" not in comm.lower():
+            continue
+        try:
+            kb_values.append(int(rss_raw))
+        except ValueError:
+            continue
+    return kb_values
+
+
+def _per_agent_mb():
+    """Per-agent memory estimate, MB. Override wins outright (no persistence
+    touch at all, so overridden test/operator runs never read or write the
+    state file). Otherwise: a ROLLING HIGH-WATER MARK -- max(persisted
+    estimate, the conservative floor, the biggest currently-observed claude
+    RSS) -- using MAX, never mean: a mean under-reserves, and a spawn that
+    exceeds the real per-agent footprint causes swapping, which is worse
+    than leaving one slot unused. The estimate only ever grows; a smaller
+    sample later never lowers it back down."""
+    override = _env_float("HMD_MEM_PER_AGENT_MB")
+    if override is not None:
+        return override
+    persisted = _load_persisted_estimate_mb() or 0.0
+    samples_kb = _sample_claude_rss_kb()
+    sample_mb = (max(samples_kb) / 1024.0) if samples_kb else 0.0
+    candidate = max(persisted, float(FLOOR_PER_AGENT_MB), sample_mb)
+    _persist_estimate_mb(candidate)
+    return candidate
+
+
+def _reserve_pct():
+    v = _env_float("HMD_MEM_RESERVE_PCT")
+    if v is None or v <= 0:
+        return DEFAULT_RESERVE_PCT
+    return v
+
+
+# ── the one function every subcommand calls ───────────────────────────────
+
+def probe():
+    """Full memory-budget reading. NEVER raises -- fails open to
+    measured=False + a large no-cap sentinel on ANY problem, per the
+    fail-open divergence documented in the module docstring."""
+    if _env("HMD_MEM_SIMULATE_UNMEASURABLE"):
+        return {
+            "measured": False,
+            "total_mb": None, "available_mb": None, "hmd_used_mb": None,
+            "per_agent_mb": None, "reserve_pct": _reserve_pct(),
+            "budget_mb": None, "slots": UNMEASURABLE_SLOTS,
+            "warning": "memory unmeasurable (HMD_MEM_SIMULATE_UNMEASURABLE set); "
+                       "failing open, no cap applied",
+        }
+    try:
+        available_mb = int(_available_mb())
+        total_mb = int(_total_mb())
+        reserve_pct = _reserve_pct()
+        per_agent_mb = int(_per_agent_mb())
+        claude_samples_kb = _sample_claude_rss_kb()
+        hmd_used_mb = int(sum(claude_samples_kb) / 1024.0) if claude_samples_kb else 0
+
+        # Truncate available_mb to whole MB FIRST, then apply the reserve
+        # factor to that integer (a tiny epsilon absorbs float multiplication
+        # noise, e.g. 6144 * 0.8 landing a hair off 4915.2 either way,
+        # without ever being large enough to cross a real integer boundary).
+        budget_mb = int(available_mb * reserve_pct + 1e-9)
+        slots = (budget_mb // per_agent_mb) if per_agent_mb > 0 else 0
+        slots = max(0, slots)
+
+        return {
+            "measured": True,
+            "total_mb": total_mb, "available_mb": available_mb,
+            "hmd_used_mb": hmd_used_mb,
+            "per_agent_mb": per_agent_mb, "reserve_pct": reserve_pct,
+            "budget_mb": budget_mb, "slots": slots,
+            "warning": None,
+        }
+    except Unmeasurable as exc:
+        return {
+            "measured": False,
+            "total_mb": None, "available_mb": None, "hmd_used_mb": None,
+            "per_agent_mb": None, "reserve_pct": _reserve_pct(),
+            "budget_mb": None, "slots": UNMEASURABLE_SLOTS,
+            "warning": "memory unmeasurable (%s); failing open, no cap applied" % exc,
+        }
+    except Exception as exc:
+        # Belt-and-suspenders (mirrors pressure_control.recommend()'s own
+        # "ANY unexpected error degrades, never crashes" arm): a bug in this
+        # governor's own code must never be the reason a legitimate spawn is
+        # refused.
+        return {
+            "measured": False,
+            "total_mb": None, "available_mb": None, "hmd_used_mb": None,
+            "per_agent_mb": None, "reserve_pct": _reserve_pct(),
+            "budget_mb": None, "slots": UNMEASURABLE_SLOTS,
+            "warning": "memory unmeasurable (unexpected error: %s); failing open, "
+                       "no cap applied" % exc,
+        }
+
+
+# ── subcommands ────────────────────────────────────────────────────────────
+
+def cmd_status(args):
+    p = probe()
+    if args.json:
+        print(json.dumps(p, sort_keys=True))
+        if p["warning"]:
+            sys.stderr.write("warning: %s\n" % p["warning"])
+        return 0
+
+    print("heimdall-memory-budget status")
+    print("  measured:         %s" % p["measured"])
+    if p["measured"]:
+        print("  total_mb:         %d" % p["total_mb"])
+        print("  available_mb:     %d" % p["available_mb"])
+        print("  hmd_used_mb:      %d" % p["hmd_used_mb"])
+        print("  reserve_pct:      %s" % p["reserve_pct"])
+        print("  budget_mb:        %d" % p["budget_mb"])
+        print("  per_agent_mb:     %d" % p["per_agent_mb"])
+        print("  slots_free:       %d" % p["slots"])
+    else:
+        print("  slots_free:       %d (fail-open sentinel -- no cap)" % p["slots"])
+    if p["warning"]:
+        sys.stderr.write("warning: %s\n" % p["warning"])
+    return 0
+
+
+def cmd_slots(_args):
+    p = probe()
+    if p["warning"]:
+        sys.stderr.write("warning: %s\n" % p["warning"])
+    print(p["slots"])
+    return 0
+
+
+def cmd_can_spawn(args):
+    p = probe()
+    if not p["measured"]:
+        sys.stderr.write("warning: %s\n" % p["warning"])
+        return 0  # fail open: never block a spawn when memory can't be measured
+    if args.count <= p["slots"]:
+        return 0
+    sys.stderr.write(
+        "refusing: %d more agent(s) requested but only %d slot(s) free "
+        "(budget=%dMB / per_agent=%dMB, available=%dMB x reserve=%s)\n"
+        % (args.count, p["slots"], p["budget_mb"], p["per_agent_mb"],
+           p["available_mb"], p["reserve_pct"])
+    )
+    return 1
+
+
+def build_parser():
+    import argparse
+
+    ap = argparse.ArgumentParser(
+        prog="heimdall-memory-budget",
+        description="Memory-aware cap on how many more agents may be spawned right now.")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("status", help="show the full memory-budget reading")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_status)
+
+    sl = sub.add_parser("slots", help="print ONLY the integer slot count")
+    sl.set_defaults(fn=cmd_slots)
+
+    cs = sub.add_parser("can-spawn", help="exit 0 if --count more agents fit, else 1")
+    cs.add_argument("--count", type=int, default=1)
+    cs.set_defaults(fn=cmd_can_spawn)
+
+    return ap
+
+
+def main(argv):
+    args = build_parser().parse_args(argv)
+    return args.fn(args)
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main(sys.argv[1:]))
+    except BrokenPipeError:
+        raise SystemExit(0)
+    except SystemExit:
+        raise
+    except Exception as exc:
+        # Last-resort guard: an unexpected bug in THIS tool must never look
+        # indistinguishable from "at capacity" to a caller parsing our exit
+        # code. slots/can-spawn fail open; a `status` crash this deep would
+        # be a real bug worth seeing, so it is allowed to fall through to a
+        # normal Python traceback + exit 1 only for that one subcommand.
+        cmd = sys.argv[1] if len(sys.argv) > 1 else None
+        sys.stderr.write("warning: heimdall-memory-budget internal error, failing open: %s\n" % exc)
+        if cmd == "slots":
+            print(UNMEASURABLE_SLOTS)
+            raise SystemExit(0)
+        if cmd == "can-spawn":
+            raise SystemExit(0)
+        raise SystemExit(1)
