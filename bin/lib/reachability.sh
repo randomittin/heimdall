@@ -161,6 +161,20 @@ reach_subjects() {
 # tracked gap, not this function's job) — see is_comment_aware() below. A name that only
 # ever appears after a real comment marker is a mention, not an invocation, and must not
 # read as an edge.
+#
+# PYTHON DOCSTRINGS ARE PROSE TOO, AND '#'-AWARENESS ALONE DOES NOT SEE THEM. A file
+# is_py (FILENAME ends in .py, OR its first line is a `#!...python` shebang — most of
+# this repo's bin/ Python tools are extensionless) gets a SECOND, separate strip pass
+# (pystrip() below), because a triple-quoted string is a string literal, never a '#'
+# comment, so strip_comment() never touches it. The content of a triple-quoted
+# ('"'"''"'"''"'"' or \"\"\") block is dropped before tokenizing ONLY when it opens as a BARE
+# EXPRESSION STATEMENT — the physical line, leading whitespace stripped, STARTS with
+# the delimiter. That is what a real docstring looks like syntactically, and it is the
+# one shape an executed string can never take: `SCRIPT = \"\"\"#!/bin/sh` opens
+# mid-line, after `SCRIPT = `, so its close is still tracked (a bare docstring
+# immediately after it must not be confused for a continuation of it) but its CONTENT
+# is left untouched and keeps tokenizing normally — a real invocation can live inside a
+# string a program builds and runs, and this pass must never blind the scanner to that.
 reach_extract_tokens() {
   local root="$1" scanset="$2"
   ( cd "$root" \
@@ -195,6 +209,66 @@ reach_extract_tokens() {
         }
         return out
       }
+      # py_find_triple_open LINE — the first position of a genuine triple-quote run
+      # (three IDENTICAL quote characters back to back, either flavor) anywhere in
+      # LINE; sets py_delim_found to whichever 3-char delimiter matched. 0 if none.
+      function py_find_triple_open(line,    i, n, c) {
+        n = length(line)
+        for (i = 1; i <= n - 2; i++) {
+          c = substr(line, i, 1)
+          if ((c == DQ || c == SQ) && substr(line, i, 3) == (c c c)) {
+            py_delim_found = c c c
+            return i
+          }
+        }
+        return 0
+      }
+      # pystrip LINE — python-docstring-aware filter, called ONLY for is_py files,
+      # ahead of the generic comment-stripper. Mutates the persistent in_pytriple /
+      # pytriple_delim / pytriple_strip trio (reset at FNR==1, exactly like
+      # in_heredoc/heredoc_term) and sets pytriple_skip when the whole physical line
+      # is prose and must emit no tokens at all.
+      #
+      # Content is blanked (pytriple_strip=1) ONLY for a region that opened as a bare
+      # expression statement. Any other opening — assigned to a name, passed to a
+      # call, mid-expression — is tracked ONLY so its real close is recognized for
+      # what it is, never mistaken for a fresh bare-docstring open; its content is
+      # left completely untouched either way.
+      function pystrip(line,    stripped, delim, tail, idx, after, p) {
+        pytriple_skip = 0
+        if (in_pytriple) {
+          idx = index(line, pytriple_delim)
+          if (idx > 0) {
+            after = substr(line, idx + 3)
+            in_pytriple = 0
+            pytriple_delim = ""
+            if (pytriple_strip) return after
+            return line
+          }
+          if (pytriple_strip) { pytriple_skip = 1; return "" }
+          return line
+        }
+        stripped = line
+        sub(/^[ \t]+/, "", stripped)
+        if (substr(stripped, 1, 3) == DQ3 || substr(stripped, 1, 3) == SQ3) {
+          delim = substr(stripped, 1, 3)
+          tail = substr(stripped, 4)
+          idx = index(tail, delim)
+          if (idx > 0) return substr(tail, idx + 3)
+          in_pytriple = 1; pytriple_delim = delim; pytriple_strip = 1
+          pytriple_skip = 1
+          return ""
+        }
+        p = py_find_triple_open(line)
+        if (p > 0) {
+          delim = py_delim_found
+          tail = substr(line, p + 3)
+          if (!(index(tail, delim) > 0)) {
+            in_pytriple = 1; pytriple_delim = delim; pytriple_strip = 0
+          }
+        }
+        return line
+      }
       function emit(fname, line,    rest, tok) {
         rest = line
         while (match(rest, /[A-Za-z0-9_.-]+/)) {
@@ -205,9 +279,14 @@ reach_extract_tokens() {
       }
       BEGIN {
         SQ = sprintf("%c", 39); DQ = sprintf("%c", 34)
+        DQ3 = DQ DQ DQ; SQ3 = SQ SQ SQ
         heretok_re = "<<-?[ \t]*[" SQ DQ "]?[A-Za-z_][A-Za-z0-9_]*[" SQ DQ "]?"
       }
-      FNR == 1 { in_heredoc = 0; heredoc_term = ""; heredoc_striptabs = 0; aware = is_comment_aware(FILENAME) }
+      FNR == 1 {
+        in_heredoc = 0; heredoc_term = ""; heredoc_striptabs = 0; aware = is_comment_aware(FILENAME)
+        is_py = (FILENAME ~ /\.py$/) || ($0 ~ /^#!.*python/)
+        in_pytriple = 0; pytriple_delim = ""; pytriple_strip = 0
+      }
       {
         line = $0
         if (in_heredoc) {
@@ -215,6 +294,10 @@ reach_extract_tokens() {
           if (heredoc_striptabs) sub(/^\t+/, "", chk)
           if (chk == heredoc_term) in_heredoc = 0
           emit(FILENAME, line); next
+        }
+        if (is_py) {
+          line = pystrip(line)
+          if (pytriple_skip) next
         }
         if (aware) {
           if (match(line, heretok_re)) {
