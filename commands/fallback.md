@@ -187,6 +187,41 @@ route fallback traffic back at the operator's own Claude subscription.
    misses. `auto` exists so that cost is paid only once Claude would
    otherwise be blocked, not by default.
 
+## What gets sent when fallback routes
+
+When state is `on`/`auto`/`switch` and a task actually routes, the request
+goes to the configured third-party provider — not to Anthropic — and it
+carries this session's local context along with it. A live end-to-end run
+measured this directly: one routed request carried roughly 41,000 tokens of
+local session context.
+
+That figure is a measurement from one real run — not a cap or a guarantee — a
+larger accumulated session sends more, not less. The receiving model
+demonstrably retained what it was sent: it volunteered unrelated local details
+from the session context back in its own reply, unprompted.
+
+This is opt-in exposure, not exposure by default. `off` is the default on
+every fresh install and on any corrupted config (see above).
+
+And fallback config is per-repo — `heimdall-route` calls `heimdall-fallback
+--repo "$PWD"`, reading and writing `<repo>/.heimdall/fallback.json`, so
+arming fallback in one repo never arms it in another. Nothing routes, and
+nothing leaves the operator's normal trust boundary, until an operator
+explicitly runs `heimdall-fallback set on|auto|switch` (or `arm`) in that
+specific repo.
+
+Exposure scales with whatever is sitting in the context window at the moment
+a task actually routes, not with the size of the repo or the provider.
+Prefer routing small, self-contained tasks — ones that don't need broad
+repo context — through fallback, rather than deep multi-file work carried on
+a long, accumulated session: a short, independent task sends little; a long
+accumulated session sends everything it has built up.
+
+None of this touches the Tier-1 boundary described above: no state,
+including `switch`, ever routes a request at the operator's own Claude
+subscription — that boundary is identical across all four states and
+unaffected by anything in this section.
+
 ## What this does not change
 
 OmniRoute makes hmd **model**-independent — which model answers a request.

@@ -37,6 +37,13 @@
 #   8. It documents the `fallback_model` config field: empty by default,
 #      blocking `auto` from ever reaching ROUTE unattended until set, and
 #      that an operator-set ANTHROPIC_MODEL always outranks it.
+#   9. It documents what gets sent when fallback actually routes: local
+#      session context goes to the third-party provider (not Anthropic),
+#      with the measured ~41k-tokens-in-one-request datapoint stated as a
+#      measurement rather than a cap; that this is opt-in and safe by
+#      default because fallback config is per-repo and `off` is the
+#      default; and the practical guidance to route small, self-contained
+#      tasks rather than long accumulated sessions to minimize exposure.
 #
 # EXIT: 0 = all assertions pass; 1 = any FAIL.
 set -uo pipefail
@@ -202,6 +209,58 @@ if grep -qiE 'operator-set.*ANTHROPIC_MODEL.*always outranks' "$CMD_MD"; then
   ok "fallback.md documents that an operator-set ANTHROPIC_MODEL always outranks fallback_model"
 else
   bad "fallback.md does not document ANTHROPIC_MODEL's precedence over fallback_model"
+fi
+
+
+# ── 10. "What gets sent when fallback routes": the measured context-exposure
+#        section — what leaves, why it's opt-in/per-repo, and how to
+#        minimize it ─────────────────────────────────────────────────────────
+if grep -qi 'what gets sent when fallback routes' "$CMD_MD"; then
+  ok "fallback.md has a section documenting what gets sent when fallback routes"
+else
+  bad "fallback.md missing a section documenting what gets sent when fallback routes"
+fi
+
+if grep -qE '41,?000 tokens' "$CMD_MD"; then
+  ok "fallback.md states the measured ~41k-tokens-in-one-request datapoint"
+else
+  bad "fallback.md does not state the measured ~41k-tokens context-exposure datapoint"
+fi
+
+if grep -qi 'measurement' "$CMD_MD" && grep -qiE 'not a cap|not a guarantee' "$CMD_MD"; then
+  ok "fallback.md frames the 41k-token figure as a measurement, not a cap or guarantee"
+else
+  bad "fallback.md does not frame the 41k-token figure as a measurement rather than a cap/guarantee"
+fi
+
+if grep -qiE 'volunteered unrelated local details' "$CMD_MD"; then
+  ok "fallback.md documents that the receiving model retained and echoed back unrelated local context (as a class, no specifics)"
+else
+  bad "fallback.md does not document that the receiving model retained/echoed unrelated local context"
+fi
+
+if grep -qiE 'fallback config is per-repo' "$CMD_MD" && grep -qF -e '--repo "$PWD"' "$CMD_MD"; then
+  ok "fallback.md documents fallback config is per-repo (heimdall-route calls heimdall-fallback --repo \"\$PWD\")"
+else
+  bad "fallback.md does not document that fallback config is per-repo"
+fi
+
+if grep -qiE 'opt-in exposure, not exposure by default' "$CMD_MD"; then
+  ok "fallback.md states plainly that this exposure is opt-in, not on by default"
+else
+  bad "fallback.md does not plainly state the exposure is opt-in rather than default"
+fi
+
+if grep -qiE 'prefer routing small, self-contained tasks' "$CMD_MD"; then
+  ok "fallback.md gives the practical guidance to route small, self-contained tasks to minimize exposure"
+else
+  bad "fallback.md missing the practical minimize-exposure guidance (route small, self-contained tasks)"
+fi
+
+if grep -qiE "none of this touches the Tier-1 boundary" "$CMD_MD"; then
+  ok "fallback.md cross-references the Tier-1 boundary rather than restating the full mechanism"
+else
+  bad "fallback.md does not cross-reference the Tier-1 boundary from the new context-exposure section"
 fi
 
 echo
