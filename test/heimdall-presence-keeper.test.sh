@@ -276,9 +276,27 @@ echo "E. sandbox-shaped HOME suppresses the doctor auto-launch; real-shaped HOME
 # whole file, so an undecided fresh HOME resolves $URL to that dead port with NO
 # real egress — and if the doctor DOES launch, it dials that same dead port and
 # this test kills it within ~1s regardless (HMD_DOCTOR_MAX_CYCLES/MAX_SECONDS=1).
-wait_pid_file() {  # $1 = glob -> prints the first match's content once one appears (~2s bound)
+wait_pid_file() {  # $1 = glob -> prints the first match's content once one appears (~10s bound)
+  # Widened 2026-08-28 from a ~2s bound (20 x 0.1s) to ~10s (100 x 0.1s): E2 measured 2-of-3
+  # solo passes / 1 FAIL at host load avg 4.82/10 cores. Root cause is doctor SPAWN latency,
+  # not a too-fast pidfile removal: `keeper-start` forks the doctor via nohup right before it
+  # returns, and the doctor's own _bg_loop does a `$PRESENCE status` subprocess round-trip
+  # BEFORE it ever writes its pidfile — bash startup + that extra fork/exec is exactly what
+  # degrades under host CPU contention, and it sits entirely between "test starts polling" and
+  # "pidfile exists". This stays a poll-until-true (never a fixed sleep): a fast doctor still
+  # returns on the very first 0.1s iteration, so the common/unloaded path pays nothing extra —
+  # only a genuinely slow spawn gets the room it needs. 10s matches this corpus's own
+  # convention for the identical class of race (test/cp-jobs.test.sh, test/cp-integration.test.sh
+  # poll background/durable state with 10-12s deadlines). E1b/E3 (proving the doctor NEVER
+  # appears) inherit the same longer bound on purpose, not by accident: once written, the
+  # pidfile persists for a SECOND `$PRESENCE status` call plus the entire run_chain (interpreter
+  # resolve, crypto check, enroll attempt, roster verify) — several more subprocess spawns, so
+  # it can only get MORE observable under the same load, never less — so if the guard ever
+  # regressed, a leaked doctor would face this identical spawn delay, and the absence check must
+  # stay at least as patient as the presence check or a real regression could hide behind a
+  # timeout that gives up before a slow-but-real leak ever shows its pidfile.
   local i=0 f
-  while [ "$i" -lt 20 ]; do
+  while [ "$i" -lt 100 ]; do
     for f in $1; do [ -f "$f" ] && { cat "$f" 2>/dev/null; return 0; }; done
     i=$((i + 1)); sleep 0.1 2>/dev/null || sleep 1
   done

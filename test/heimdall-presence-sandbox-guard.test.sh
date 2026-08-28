@@ -75,9 +75,16 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-wait_pid_file() {  # $1 = glob -> prints first match's content once one appears (~2s bound)
+wait_pid_file() {  # $1 = glob -> prints first match's content once one appears (~10s bound)
+  # Widened 2026-08-28 from ~2s to ~10s in lockstep with heimdall-presence-keeper.test.sh's
+  # Section E (byte-identical helper, same doctor-spawn-latency race under host load — see
+  # that file's copy of this function for the full measurement + rationale). Still
+  # poll-until-true: a fast doctor returns on the first 0.1s iteration, so run_case's "spawn"
+  # cases (5, 6) pay nothing extra; the "skip" cases (1-4) now wait the same longer bound
+  # before concluding absence, which correctness requires, not just symmetry — a regressed
+  # guard would leak a doctor subject to this SAME load-dependent spawn delay.
   local i=0 f
-  while [ "$i" -lt 20 ]; do
+  while [ "$i" -lt 100 ]; do
     for f in $1; do [ -f "$f" ] && { cat "$f" 2>/dev/null; return 0; }; done
     i=$((i + 1)); sleep 0.1 2>/dev/null || sleep 1
   done
