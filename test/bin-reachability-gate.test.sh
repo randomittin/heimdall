@@ -628,6 +628,81 @@ if printf '%s' "$DC_JSON_OUT" | grep -q '"class_live":[0-9]' \
 else
   bad "heimdall-deadcode --json is missing one or more caller-class keys: $DC_JSON_OUT"
 fi
+# ══════════════════════════════════════════════════════════════════════════════
+# 5. PYTHON DOCSTRING FALSIFIER — a bare module/function docstring statement that
+#    merely NAMES another tool in prose must not manufacture a reachability edge to
+#    it; the SAME triple-quoted text, once ASSIGNED TO A VARIABLE (not standing
+#    alone as a bare expression statement), legitimately can hold a real invocation
+#    and MUST still create one.
+#
+#    This is the exact shape of the heimdall-memory-budget / heimdall-memory bug:
+#    bin/heimdall-memory-budget's own module docstring says "NOT bin/heimdall-memory"
+#    in prose, and the pre-fix tokenizer read that prose as an edge, making the
+#    dead, intentionally-exempted heimdall-memory CLI read reachable. See
+#    bin/lib/reachability.sh's reach_extract_tokens header comment for the exact
+#    rule this proves. The mentioner files are named WITHOUT a .py extension, on
+#    purpose, so this also pins the shebang-detection path (`#!...python`), not
+#    just the `.py`-suffix path.
+# ══════════════════════════════════════════════════════════════════════════════
+PYSANDBOX="$(mktemp -d "${TMPDIR:-/tmp}/hmd-reach-py-XXXXXX")"
+mkdir -p "$PYSANDBOX/bin" "$PYSANDBOX/hooks"
+printf '#!/bin/sh\nexit 0\n' > "$PYSANDBOX/bin/docstring-only-target"
+printf '#!/bin/sh\nexit 0\n' > "$PYSANDBOX/bin/assigned-string-target"
+# A bare module-level docstring statement mentioning docstring-only-target in
+# prose — this must NOT create an edge to it.
+cat > "$PYSANDBOX/bin/py-docstring-mentioner" <<'PYEOF'
+#!/usr/bin/env python3
+"""py-docstring-mentioner -- mirrors bin/docstring-only-target for parity.
+
+NOT bin/docstring-only-target. Naming it here in prose must not count as
+calling it.
+"""
+import sys
+sys.exit(0)
+PYEOF
+# The SAME shape, but the triple-quoted text is ASSIGNED to a variable rather
+# than standing alone as a bare expression statement — a real invocation could
+# legitimately live inside one of these, so this one MUST still create an edge.
+cat > "$PYSANDBOX/bin/py-assigned-mentioner" <<'PYEOF'
+#!/usr/bin/env python3
+"""py-assigned-mentioner -- has a normal bare docstring too, naming nothing."""
+import subprocess
+
+_SCRIPT = """#!/bin/sh
+bin/assigned-string-target --check
+"""
+
+
+def run():
+    return subprocess.run(["true"])
+PYEOF
+chmod +x "$PYSANDBOX"/bin/*
+printf '{"hooks":{"X":"run bin/py-docstring-mentioner now","Y":"run bin/py-assigned-mentioner now"}}\n' \
+  > "$PYSANDBOX/hooks/hooks.json"
+
+PYWORK="$WORK/py-sandbox"
+reach_build "$PYSANDBOX" "$PYWORK"
+PY_RC=$?
+PY_DEAD="$(reach_dead "$PYWORK")"
+
+if [ "$PY_RC" -eq 0 ]; then
+  ok "docstring falsifier: engine builds a closure over the python-docstring synthetic tree"
+else
+  bad "docstring falsifier: engine REFUSED the python-docstring synthetic tree (rc=$PY_RC) — §5 proves nothing"
+fi
+
+if grep -qx "docstring-only-target" <<<"$PY_DEAD"; then
+  ok "docstring falsifier: a name mentioned only inside a BARE module-docstring statement creates NO edge (stays unreachable)"
+else
+  bad "docstring falsifier: bin/docstring-only-target reads REACHABLE — a bare docstring prose mention is being tokenized as a real invocation again"
+fi
+
+if ! grep -qx "assigned-string-target" <<<"$PY_DEAD"; then
+  ok "docstring falsifier: the SAME triple-quoted shape, once ASSIGNED to a variable, DOES create an edge (a real invocation can legitimately live inside one)"
+else
+  bad "docstring falsifier: bin/assigned-string-target reads UNREACHABLE — a variable-assigned triple-quoted string is being stripped like a bare docstring, which would blind the scanner to real invocations hidden inside one"
+fi
+
 printf "\n  bin-reachability-gate: %d passed, %d failed  (scanned %s executables)\n" \
   "$PASS" "$FAIL" "$TOTAL_BINS"
 [ "$FAIL" -eq 0 ] || exit 1
