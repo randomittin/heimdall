@@ -452,7 +452,16 @@ else
   # FALSIFIER: a copy with the SHA swapped for a different (still well-formed)
   # 40-hex string no longer matches — proving this check reads the real bytes.
   DRIFT="$TMP/pin-drift-manifest.json"
-  sed "s/$PIN_SHA/0000000000000000000000000000000000000000/" "$MANIFEST" > "$DRIFT"
+  # The `g` flag is load-bearing: $PIN_SHA appears MORE THAN ONCE on the same
+  # line in the shipped manifest (pin_provenance names it twice — once for the
+  # GitHub commit lookup, again for the ?ref= contents-API call). Without `g`,
+  # sed's s/// only replaces the FIRST match per line, silently leaving the
+  # second occurrence on that line intact — which is exactly how this fixture
+  # previously failed to drift at all.
+  sed "s/$PIN_SHA/0000000000000000000000000000000000000000/g" "$MANIFEST" > "$DRIFT"
+  [ "$(sha_file "$MANIFEST")" != "$(sha_file "$DRIFT")" ] \
+    && ok "the drift fixture is genuinely different bytes from the shipped manifest — the sed substitution took" \
+    || bad "the drift fixture is byte-identical to the shipped manifest — the sed substitution did not take at all"
   grep -q "$PIN_SHA" "$DRIFT" \
     && bad "the drift fixture still contains the real pin — the sed substitution did not take" \
     || ok "RED ARM: a manifest with the pin swapped for a different SHA no longer matches — a drifted manifest would FAIL this gate"
@@ -673,14 +682,55 @@ else
   # orchestrator, not a silent pass. HOME/TMPDIR/CWD are all throwaway; nothing
   # here can reach /Users/rj/omniroute or ~/.omniroute.
   SAFE_HOME="$TMP/home-o9"; mkdir -p "$SAFE_HOME"
-  grep -qE '/Users/[^/]+/omniroute([^-]|$)' "$INSTALLER" \
-    && bad "FINDING: the installer's source hardcodes a path under /Users/*/omniroute — that is the operator's LIVE install and must never be touched by an install script" \
-    || ok "the installer's source does not hardcode an operator's live /Users/*/omniroute path"
 
   run_installer() { # <path> [extra env...]
     ( cd "$TMP" && env -i PATH="$1" HOME="$SAFE_HOME" TMPDIR="$TMP" "${@:2}" \
         perl -e 'alarm 30; exec @ARGV' bash "$INSTALLER" < /dev/null ) 2>&1
   }
+
+  # BEHAVIOURAL, not a source grep: a static grep for '/Users/*/omniroute' in
+  # the installer's SOURCE was a false positive — the default
+  # INSTALL_DIR="${INSTALL_DIR:-$HOME/omniroute}" is exactly what the option is
+  # documented to default to, and clone_and_pin() (bin/heimdall-omniroute-install)
+  # REFUSES at runtime the instant that path already exists and is not a git
+  # checkout — which is precisely the shape of a live, non-git production
+  # install (verified live against /Users/rj/omniroute during investigation;
+  # this suite itself never touches that real path, only a throwaway fixture
+  # under $TMP that reproduces the same SHAPE: existing, non-git).
+  FIXTURE_NONGIT="$TMP/fixture-existing-nongit"; mkdir -p "$FIXTURE_NONGIT"
+  printf 'not a git checkout\n' > "$FIXTURE_NONGIT/some-file"
+
+  # A PATH that satisfies check_preconditions in full (real node v24, real git,
+  # real openssl/sqlite3/curl/lsof/npm) so the run reaches clone_and_pin at all.
+  # git is still the safe, network-free stub from write_stub_git — never real
+  # git — and every other real binary here is only ever existence-checked
+  # (`command -v`) before the refusal below fires; none of them get invoked.
+  FULL_PRECOND_PATH="$TMP/path-full-precond"; mkdir -p "$FULL_PRECOND_PATH"
+  cp "$NODE_NEW_PATH/node" "$FULL_PRECOND_PATH/node"; chmod +x "$FULL_PRECOND_PATH/node"
+  for c in bash sh env grep sed perl dirname mktemp readlink rm mkdir openssl sqlite3 curl lsof npm; do
+    src="$(command -v "$c" 2>/dev/null)"; [ -n "$src" ] && ln -sf "$src" "$FULL_PRECOND_PATH/$c" 2>/dev/null
+  done
+  write_stub_git "$FULL_PRECOND_PATH" "0000000000000000000000000000000000000000"
+
+  OUT9F1="$(run_installer "$FULL_PRECOND_PATH" INSTALL_DIR="$FIXTURE_NONGIT")"; RC9F1=$?
+  [ "$RC9F1" -ne 0 ] \
+    && ok "the real installer refuses when INSTALL_DIR already exists and is not a git checkout (exit $RC9F1)" \
+    || bad "the real installer proceeded against an existing non-git INSTALL_DIR — it should refuse (this is the live-gateway protection)"
+  grep -qi 'already exists and is not a git checkout' <<<"$OUT9F1" \
+    && ok "the refusal names the reason: not a git checkout" \
+    || bad "the refusal did not name 'not a git checkout': $OUT9F1"
+
+  # RED ARM / falsifier: an ABSENT INSTALL_DIR must NOT trip this specific
+  # refusal — it proceeds into clone_and_pin's clone step (the same safe,
+  # stubbed git; never real git) and instead fails later, on the post-checkout
+  # pin mismatch the stub is deliberately configured to produce. This proves
+  # the assertion above discriminates on INSTALL_DIR's actual shape rather than
+  # refusing unconditionally regardless of what INSTALL_DIR points at.
+  FIXTURE_ABSENT="$TMP/fixture-absent-$$"
+  OUT9F2="$(run_installer "$FULL_PRECOND_PATH" INSTALL_DIR="$FIXTURE_ABSENT")"; RC9F2=$?
+  grep -qi 'already exists and is not a git checkout' <<<"$OUT9F2" \
+    && bad "RED-ARM CHECK FAILED: an absent INSTALL_DIR still tripped the 'not a git checkout' refusal — the check above is not discriminating" \
+    || ok "RED ARM: an absent INSTALL_DIR does not trip the same refusal (it fails later instead, on the stubbed pin mismatch)"
 
   # PATH here intentionally carries only the stub node plus symlinked coreutils
   # from O8's fixture — reused so this section makes no new assumption beyond O8's.
