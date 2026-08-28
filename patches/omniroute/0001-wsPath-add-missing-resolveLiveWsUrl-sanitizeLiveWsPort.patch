@@ -1,0 +1,75 @@
+--- a/src/shared/utils/wsPath.ts
++++ b/src/shared/utils/wsPath.ts
+@@ -53,3 +53,72 @@
+ export function getLiveWsPath(): string {
+   return deriveLiveWsPath(resolveLiveWsPublicUrl() ?? undefined);
+ }
++
++/** Options for {@link resolveLiveWsUrl}. */
++export interface ResolveLiveWsUrlOptions {
++  /** A caller-supplied URL (the hook's `wsUrl` prop). Wins over everything. */
++  explicit?: string | null;
++  /** Operator-declared public URL echoed by the handshake. Wins over the port. */
++  handshakeUrl?: string | null;
++  /** The port the live server reports it is ACTUALLY listening on (#11331). */
++  handshakePort?: number | null;
++  /** The upgrade path the live server reports. */
++  handshakePath?: string | null;
++  /** The compiled-in fallback, used when the handshake adds nothing. */
++  defaultUrl: string;
++}
++
++/**
++ * Narrow an untrusted `live.port` from the handshake JSON to a usable port.
++ *
++ * The value crosses a network boundary, so it is `unknown`: accept a number or
++ * a numeric string, and reject anything that cannot be a TCP port (0, negative,
++ * >65535, fractional, NaN, empty/non-numeric strings, and non-scalars).
++ */
++export function sanitizeLiveWsPort(value: unknown): number | null {
++  let port: number;
++  if (typeof value === "number") {
++    port = value;
++  } else if (typeof value === "string" && value.trim() !== "") {
++    port = Number(value);
++  } else {
++    return null;
++  }
++  if (!Number.isInteger(port)) return null;
++  if (port < 1 || port > 65535) return null;
++  return port;
++}
++
++/**
++ * Pick the WebSocket URL the dashboard should dial.
++ *
++ * Precedence, most specific first: an explicit caller URL, then the operator's
++ * declared public URL from the handshake, then the compiled-in default with the
++ * handshake's reported port/path patched over it.
++ *
++ * `NEXT_PUBLIC_*` is inlined at BUILD time, so a prebuilt image carries the
++ * wrong port; the handshake is the only way an operator's `LIVE_WS_PORT` can
++ * reach the client (#11331). When the handshake contributes nothing usable the
++ * default is returned VERBATIM -- never re-serialized -- so a caller's exact
++ * string survives. An unparseable default is returned as-is rather than
++ * throwing: a bad URL must degrade to "cannot connect", never crash the hook.
++ */
++export function resolveLiveWsUrl(options: ResolveLiveWsUrlOptions): string {
++  const { explicit, handshakeUrl, handshakePort, handshakePath, defaultUrl } = options;
++  if (typeof explicit === "string" && explicit.length > 0) return explicit;
++  if (typeof handshakeUrl === "string" && handshakeUrl.length > 0) return handshakeUrl;
++
++  const port = sanitizeLiveWsPort(handshakePort);
++  const path =
++    typeof handshakePath === "string" && handshakePath.startsWith("/") ? handshakePath : null;
++  if (port === null && path === null) return defaultUrl;
++
++  try {
++    const url = new URL(defaultUrl);
++    if (port !== null) url.port = String(port);
++    if (path !== null) url.pathname = path;
++    return url.toString();
++  } catch {
++    return defaultUrl;
++  }
++}
