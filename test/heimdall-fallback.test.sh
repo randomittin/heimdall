@@ -1928,6 +1928,47 @@ printf '%s' "$BOUND_OUT" | grep -q '^rc=False' \
   && ok "86. liveness probe honours HEIMDALL_FALLBACK_PROBE_TIMEOUT: wedged server refused in ${BOUND_SECS}s, not hung" \
   || bad "86. bound output: $BOUND_OUT"
 
+
+# ── 87. The liveness probe is IMMUNE to ambient proxy variables. ──────────
+# Hazard introduced by the TCP->HTTP rewrite, not present before it: urllib's
+# default opener installs a ProxyHandler that honours http_proxy/HTTPS_PROXY,
+# so an ambient proxy var would route a LOOPBACK probe through a third party
+# and a dead proxy would report a healthy gateway as unreachable. A raw TCP
+# connect could never be diverted this way. Caught by the omniroute module's
+# non-interactive-passthrough invariant.
+#
+# Falsifiable both ways: the live server must still be reachable WITH the
+# proxy vars set (a probe hardwired to False would pass the dead-port half
+# alone), and the dead port must still be unreachable.
+PROXY_OUT="$(env -u HEIMDALL_FALLBACK_ASSUME_REACHABLE \
+  http_proxy=http://127.0.0.1:9 HTTP_PROXY=http://127.0.0.1:9 \
+  https_proxy=http://127.0.0.1:9 HTTPS_PROXY=http://127.0.0.1:9 \
+  ALL_PROXY=http://127.0.0.1:9 python3 - "$CLI" <<'PYPROXY'
+import http.server, socketserver, sys, threading
+ns = {"__name__": "fb"}
+exec(compile(open(sys.argv[1], encoding="utf-8").read(), sys.argv[1], "exec"), ns)
+
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+    def log_message(self, *a): pass
+
+srv = socketserver.TCPServer(("127.0.0.1", 0), H)
+srv.daemon_threads = True
+threading.Thread(target=srv.serve_forever, daemon=True).start()
+print("live=%s" % ns["_endpoint_reachable"]("http://127.0.0.1:%d" % srv.server_address[1]))
+print("dead=%s" % ns["_endpoint_reachable"]("http://127.0.0.1:1"))
+PYPROXY
+)"
+printf '%s' "$PROXY_OUT" | grep -q '^live=True$' \
+  && ok "87a. liveness probe ignores ambient proxy vars: a live loopback server stays reachable with http_proxy/HTTPS_PROXY/ALL_PROXY set to a dead proxy" \
+  || bad "87a. proxy output: $PROXY_OUT"
+
+printf '%s' "$PROXY_OUT" | grep -q '^dead=False$' \
+  && ok "87b. proxy immunity does not blanket-pass: nothing bound is still unreachable with the same vars set" \
+  || bad "87b. proxy output: $PROXY_OUT"
+
 echo "--------------------------------------------------------------------"
 printf 'heimdall-fallback: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

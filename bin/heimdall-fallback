@@ -752,7 +752,15 @@ def _endpoint_reachable(endpoint):
         return False
     req = urllib.request.Request(endpoint, method="GET")
     req.add_header("User-Agent", "heimdall-fallback-liveness/1")
-    opener = urllib.request.build_opener(_NoRedirect)
+    # ProxyHandler({}) DISABLES proxying outright. build_opener() would
+    # otherwise install a default ProxyHandler that honours http_proxy /
+    # HTTPS_PROXY from the environment, so an ambient proxy var would send
+    # this probe through a third party -- and a dead or unrelated proxy
+    # would report a perfectly healthy loopback gateway as unreachable.
+    # The endpoint here is loopback by construction; it must never leave
+    # the machine. The old TCP-connect probe could not be diverted this
+    # way, so this is a hazard the HTTP rewrite introduced and must close.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
     try:
         with opener.open(req, timeout=_probe_timeout()):
             return True
