@@ -136,6 +136,31 @@ Verified end-to-end against a live local OmniRoute gateway:
    actually crosses ~95% — that's correct behavior, not a bug). `check`'s
    exit code IS the verdict: `0` = ROUTE, `1` = REFUSE, `2` = WAIT.
 
+## Automatic model pinning — the `fallback_model` config field
+
+There is another field worth knowing about in that same JSON config file
+(alongside `target_provider` and `operator_key_env`, set the same way — by
+editing that JSON file directly): `fallback_model`.
+
+**It is empty by default.** While it is empty, and the operator has not
+exported `ANTHROPIC_MODEL` themselves, the preflight's `anthropic_model_pinned`
+check FAILS. A passing preflight is required before `auto` can ever reach
+`ROUTE`, so `auto` can only ever WAIT, indefinitely, on a fresh install —
+this is not a bug: an unpinned session emits bare `claude-*` model ids,
+exactly the form OmniRoute has an explicit branch to route back to provider
+`claude`, the one thing this tool exists to prevent.
+
+Setting `fallback_model` to a safe `<provider>/<model>` id (e.g.
+`oc/big-pickle`; `heimdall-fallback arm` can also resolve one for you) is
+what makes unattended `auto` genuinely automatic: `bin/heimdall-route` exports it as `ANTHROPIC_MODEL` on the routed child, right before exec. An operator-set `ANTHROPIC_MODEL` always outranks it — it is only exported when
+`ANTHROPIC_MODEL` is not already set in that shell, never overriding an
+explicit operator choice, safe or not.
+
+`fallback_model` is held to the identical safety rule as `ANTHROPIC_MODEL`
+itself: an id with no explicit `provider/` prefix, or one naming `claude`/
+`claude-web` explicitly, is refused — `fallback_model` can never be used to
+route fallback traffic back at the operator's own Claude subscription.
+
 ## Keys — no-auth needs none; keyed needs the env var NAME, never the key
 
 - A no-auth provider (OmniRoute serves it over a synthetic keyless
@@ -169,6 +194,34 @@ It does not make hmd **harness**-independent: the agent loop, tools, and
 hooks stay Claude Code regardless of fallback state (see
 `docs/analysis/2026-08-25-harness-independence-design.md`).
 
+## Seams `bin/heimdall-route` consumes directly — not everyday commands
+
+`base-url`, `token-file`, and `model` exist for `bin/heimdall-route` to call
+in a command substitution when it launches a real child process — `status`,
+`check`, and `arm` above are the operator-facing surface; these three are
+documented here for completeness and for debugging a routed launch that
+behaved unexpectedly.
+
+- **`heimdall-fallback base-url [--tier <t>]`** (same `--tier` vocabulary as `check`) — prints the OmniRoute base URL on stdout **only when the verdict is ROUTE**; on `REFUSE`, `WAIT`, or any internal error, stdout stays byte-empty and the reason goes to stderr only. `bin/heimdall-route` runs
+  `url="$(heimdall-fallback base-url)"` and exports whatever comes back — a
+  reason string or a traceback leaking onto stdout here would be exported as
+  a base URL and silently point a live session at garbage, so this seam
+  holds a stricter stdout contract than `check` itself.
+- **`heimdall-fallback token-file`** — prints the **path** of the configured
+  `gateway_token_file`, never its contents. It refuses — empty stdout, exit
+  non-zero — a file that is unconfigured, missing, or **group/world-readable**
+  (a bearer token must be `chmod 600`). `bin/heimdall-route` reads the path
+  this prints, then reads that file itself, to populate
+  `ANTHROPIC_AUTH_TOKEN` on the routed child; the token's contents never
+  pass through this tool.
+- **`heimdall-fallback model`** — prints the model id hmd pins on a routed
+  child, or nothing. See "Automatic model pinning" above for the
+  `fallback_model` field it reads and the safety rule it enforces.
+
+None of the three are reachable through the `/hmd:fallback` slash command's
+own argument parsing below (see Instructions) — they are a programmatic seam
+`bin/heimdall-route` calls directly, not an operator-invoked subcommand.
+
 ## Other subcommands
 
 - `heimdall-fallback set off` — disarm immediately; always safe.
@@ -176,6 +229,9 @@ hooks stay Claude Code regardless of fallback state (see
   ask whether a task of THIS tier may route (only changes the answer under
   `on`; every other state ignores `--tier`).
 - `heimdall-fallback status --json` — same fields, machine-readable.
+- `heimdall-fallback base-url` / `token-file` / `model` — programmatic seams
+  `bin/heimdall-route` consumes directly; see "Seams `bin/heimdall-route`
+  consumes directly" above.
 
 ## Instructions
 
