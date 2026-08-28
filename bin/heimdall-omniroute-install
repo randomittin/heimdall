@@ -1,0 +1,558 @@
+#!/usr/bin/env bash
+# heimdall-omniroute-install — non-interactive, idempotent, fail-closed installer
+# for OmniRoute (github.com/diegosouzapw/OmniRoute), hmd's local fallback gateway.
+# This is the command `hmd modules add omniroute` invokes as its `installs_via.fetch`
+# (see modules/omniroute/manifest.json, owned separately from this file).
+#
+# WHAT IT DOES, IN ORDER:
+#   1. Preconditions   — git, npm, node v24, openssl, sqlite3, curl, lsof present.
+#   2. Clone + pin      — clone upstream, checkout the EXACT pinned commit, verify
+#                         `git rev-parse HEAD` against the pin (hard failure if not).
+#                         `.git` is KEPT: diffability against the pinned upstream
+#                         commit is load-bearing for patches/omniroute/README.md and
+#                         every OmniRoute security doc under docs/analysis/.
+#   3. Patch            — apply patches/omniroute/*.patch in sorted order via
+#                         `git apply -p1`. Idempotent: a patch already applied is
+#                         detected and skipped, never re-applied and never a failure.
+#   4. npm ci           — deterministic install from the lockfile.
+#   5. Build            — node v24, OMNIROUTE_USE_TURBOPACK=0 (turbopack segfaults;
+#                         webpack is the proven path), output verified in
+#                         `.build/next` (BUILD_ID, routes/prerender/build manifests,
+#                         required-server-files.json, server/, static/). A zero exit
+#                         from npm is NOT treated as proof — the files are checked.
+#   6. Runtime bootstrap — some runtime files ($DATA_DIR/server.env,
+#                         $DATA_DIR/storage.sqlite + schema) are created by
+#                         OmniRoute's own code the first time any entrypoint
+#                         touches them, not by this installer. If they are not
+#                         already present, a throwaway boot-then-stop cycle
+#                         brings them into existence, on an explicitly free port
+#                         chosen so it can never collide with a separately-running
+#                         instance (e.g. the production gateway on :20128).
+#   7. Security         — generate a 256-bit management password (`openssl rand -hex
+#                         32`), apply it via upstream's own
+#                         `bin/reset-password.mjs --password-stdin` (never an `.env`
+#                         edit — see docs/analysis/2026-08-25-omniroute-install.md
+#                         §4: INITIAL_PASSWORD is only consulted before a bcrypt hash
+#                         is persisted, so an env edit after that point is inert).
+#                         Idempotent: a password already provisioned and strong is
+#                         not rotated again. `chmod 0600` on every secret-bearing
+#                         env file: $DATA_DIR/server.env (bootstrap-generated
+#                         JWT_SECRET/STORAGE_ENCRYPTION_KEY/API_KEY_SECRET — a
+#                         dotfile/DATA_DIR path, checked explicitly rather than by
+#                         glob), $INSTALL_DIR/.env, $DATA_DIR/.env, and any
+#                         $INSTALL_DIR/*.env. Finally, verify Tier-1 is dead: query
+#                         `provider_connections` for any row whose provider is
+#                         `claude`/`claude-web` — FAIL LOUDLY and refuse to complete
+#                         if one exists.
+#   8. Summary          — print what was installed; print NO secrets, ever.
+#
+# OVERRIDES (env vars; all optional, defaults match the documented live install):
+#   INSTALL_DIR               where OmniRoute is cloned (default: $HOME/omniroute)
+#   DATA_DIR                  OmniRoute's runtime data dir (default: $HOME/.omniroute)
+#   OMNIROUTE_NODE_BIN         explicit node-v24 bin dir (skips auto-detection)
+#   OMNIROUTE_NPM_CI_TIMEOUT   seconds before `npm ci` is killed (default: 1200)
+#   OMNIROUTE_BUILD_TIMEOUT    seconds before the build is killed (default: 900)
+#   OMNIROUTE_BOOTSTRAP_PORT   loopback port for the throwaway bootstrap boot
+#                              (default: 20228 — NOT the production 20128)
+#   OMNIROUTE_BOOTSTRAP_TIMEOUT seconds to wait for the bootstrap boot to become
+#                              healthy (default: 90)
+#
+# SAFETY: this script refuses to touch an existing INSTALL_DIR that is not either
+# (a) absent, or (b) already a git checkout at the exact pinned commit. Anything
+# else — including a non-git directory, which describes the CURRENT live
+# `/Users/rj/omniroute` as of this writing — is refused outright. This is
+# deliberate, load-bearing defense in depth: it means even a caller that forgets to
+# override INSTALL_DIR cannot have this script mutate a live, in-service checkout.
+# Never run this against a directory serving live traffic; always point INSTALL_DIR
+# / DATA_DIR at a throwaway location for anything but a real, intended install.
+#
+# USAGE:
+#   heimdall-omniroute-install            run the full install (idempotent)
+#   heimdall-omniroute-install -h|--help  this help
+#
+# EXIT: 0 on a verified-complete install. Non-zero on any failure — every failure
+# path fails closed (an unverifiable check is a failure, never a pass) and prints
+# an actionable, self-contained final line even under an outer harness that only
+# surfaces the last few lines of output.
+set -uo pipefail
+
+# ── self-path (RELOCATABLE) ──────────────────────────────────────────────────
+SELF="$0"
+if command -v readlink >/dev/null 2>&1; then
+  SELF="$(readlink -f "$0" 2>/dev/null || readlink "$0" 2>/dev/null || echo "$0")"
+fi
+BIN_DIR="$(cd "$(dirname "$SELF")" 2>/dev/null && pwd)"
+PLUGIN_ROOT="$(cd "$BIN_DIR/.." 2>/dev/null && pwd)"
+
+usage() { sed -n '2,76p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+  "") ;;
+  *) printf 'heimdall-omniroute-install: unknown arg: %s\n' "$1" >&2; exit 2 ;;
+esac
+
+# ── constants ─────────────────────────────────────────────────────────────────
+OMNIROUTE_REPO_URL="https://github.com/diegosouzapw/OmniRoute"
+OMNIROUTE_PIN="d82b68274c75c14d258b4898a34edc25d9712b87"   # v3.8.51
+PATCH_DIR="$PLUGIN_ROOT/patches/omniroute"
+
+INSTALL_DIR="${INSTALL_DIR:-$HOME/omniroute}"
+DATA_DIR="${DATA_DIR:-$HOME/.omniroute}"
+BUILD_DIR="$INSTALL_DIR/.build/next"
+SECRET_FILE="$DATA_DIR/management-password.txt"
+
+NPM_CI_TIMEOUT="${OMNIROUTE_NPM_CI_TIMEOUT:-1200}"
+BUILD_TIMEOUT="${OMNIROUTE_BUILD_TIMEOUT:-900}"
+BOOTSTRAP_PORT="${OMNIROUTE_BOOTSTRAP_PORT:-20228}"
+BOOTSTRAP_TIMEOUT="${OMNIROUTE_BOOTSTRAP_TIMEOUT:-90}"
+
+SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/heimdall-omniroute-install.XXXXXX")" || {
+  printf 'heimdall-omniroute-install: cannot create a scratch dir\n' >&2
+  exit 1
+}
+trap 'rm -rf "$SCRATCH"' EXIT
+
+LOCKED_FILES_SUMMARY=""
+NODE_BIN_DIR=""
+RUN_PATH="$PATH"
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+info() { printf '  %s\n' "$*"; }
+warn() { printf '%s\n' "$*" >&2; }
+die()  { warn "heimdall-omniroute-install: $*"; exit 1; }
+
+# Bounded background run of a named shell function (avoids string-quoting hazards
+# a `bash -c "$string"` form would have around paths/PATH values). No `timeout(1)`
+# on macOS, so this polls + kills at the deadline — mirrors run_capped in
+# bin/heimdall-doctor-install.
+run_capped_fn() { # secs outfile fn
+  local secs="$1" out="$2" fn="$3"
+  "$fn" >"$out" 2>&1 &
+  local pid=$! i=0
+  while kill -0 "$pid" 2>/dev/null; do
+    sleep 1; i=$((i + 1))
+    if [ "$i" -ge "$secs" ]; then
+      kill -9 "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+      return 124
+    fi
+  done
+  wait "$pid"
+}
+
+# ── Phase 1: preconditions ────────────────────────────────────────────────────
+# Detects node v24 honestly (ambient PATH, then the documented nvm path, then any
+# other nvm-managed v24.x) before ever falling back to a hardcoded assumption —
+# and even the hardcoded fallback is verified, never trusted blind.
+resolve_node24() {
+  local v d
+  v="$(node --version 2>/dev/null || true)"
+  case "$v" in
+    v24.*) NODE_BIN_DIR=""; return 0 ;;
+  esac
+
+  if [ -n "${OMNIROUTE_NODE_BIN:-}" ]; then
+    if [ -x "${OMNIROUTE_NODE_BIN}/node" ]; then
+      v="$("${OMNIROUTE_NODE_BIN}/node" --version 2>/dev/null || true)"
+      case "$v" in
+        v24.*) NODE_BIN_DIR="$OMNIROUTE_NODE_BIN"; return 0 ;;
+      esac
+    fi
+    die "OMNIROUTE_NODE_BIN=$OMNIROUTE_NODE_BIN does not contain a working node v24 (found: '${v:-not found}')"
+  fi
+
+  local cand="$HOME/.nvm/versions/node/v24.13.0/bin"
+  if [ -x "$cand/node" ]; then
+    v="$("$cand/node" --version 2>/dev/null || true)"
+    case "$v" in
+      v24.*) NODE_BIN_DIR="$cand"; return 0 ;;
+    esac
+  fi
+
+  for d in "$HOME"/.nvm/versions/node/v24.*; do
+    [ -x "$d/bin/node" ] || continue
+    v="$("$d/bin/node" --version 2>/dev/null || true)"
+    case "$v" in
+      v24.*) NODE_BIN_DIR="$d/bin"; return 0 ;;
+    esac
+  done
+
+  die "node v24 not found: ambient node is '${v:-absent}', no working install at $cand, and no v24.x under \$HOME/.nvm/versions/node. Install with: nvm install 24.13.0 (or set OMNIROUTE_NODE_BIN to a v24 bin dir)."
+}
+
+check_preconditions() {
+  resolve_node24
+  RUN_PATH="${NODE_BIN_DIR:+$NODE_BIN_DIR:}$PATH"
+
+  local missing=() name bin
+  for name in git:git openssl:openssl sqlite3:sqlite3 curl:curl lsof:lsof; do
+    bin="${name#*:}"
+    command -v "$bin" >/dev/null 2>&1 || missing+=("$bin")
+  done
+  if ! PATH="$RUN_PATH" command -v npm >/dev/null 2>&1; then
+    missing+=("npm (expected alongside node v24 at ${NODE_BIN_DIR:-ambient PATH})")
+  fi
+
+  if [ "${#missing[@]}" -gt 0 ]; then
+    warn "missing required tools:"
+    for name in "${missing[@]}"; do warn "  - $name"; done
+    die "install the tools listed above and re-run"
+  fi
+}
+
+# ── Phase 2: clone + pin verification ────────────────────────────────────────
+clone_and_pin() {
+  if [ -d "$INSTALL_DIR/.git" ]; then
+    local head
+    head="$(git -C "$INSTALL_DIR" rev-parse HEAD 2>/dev/null || true)"
+    if [ "$head" = "$OMNIROUTE_PIN" ]; then
+      info "install dir already at pinned commit $OMNIROUTE_PIN — skipping clone"
+      return 0
+    fi
+    die "install dir $INSTALL_DIR exists and is a git checkout at $head, NOT the pinned commit $OMNIROUTE_PIN. Refusing to modify an existing checkout that may be in use. Remove it or point INSTALL_DIR elsewhere."
+  elif [ -e "$INSTALL_DIR" ]; then
+    die "install dir $INSTALL_DIR already exists and is not a git checkout. Refusing to overwrite — this is what protects a live, non-git install (e.g. the current production gateway) from this script. Point INSTALL_DIR elsewhere."
+  fi
+
+  mkdir -p "$(dirname "$INSTALL_DIR")" || die "cannot create the parent directory of $INSTALL_DIR"
+  git clone --quiet "$OMNIROUTE_REPO_URL" "$INSTALL_DIR" || die "git clone failed for $OMNIROUTE_REPO_URL -> $INSTALL_DIR"
+  if ! git -C "$INSTALL_DIR" checkout --quiet "$OMNIROUTE_PIN"; then
+    rm -rf "$INSTALL_DIR"
+    die "checkout of pinned commit $OMNIROUTE_PIN failed; rolled back $INSTALL_DIR"
+  fi
+
+  local head
+  head="$(git -C "$INSTALL_DIR" rev-parse HEAD 2>/dev/null || true)"
+  if [ "$head" != "$OMNIROUTE_PIN" ]; then
+    rm -rf "$INSTALL_DIR"
+    die "post-checkout HEAD is '$head', expected '$OMNIROUTE_PIN' — refusing an unverified tree; rolled back $INSTALL_DIR"
+  fi
+  info "cloned $OMNIROUTE_REPO_URL at $OMNIROUTE_PIN -> $INSTALL_DIR (.git kept)"
+}
+
+# ── Phase 3: patches (idempotent) ────────────────────────────────────────────
+apply_patches() {
+  if [ ! -d "$PATCH_DIR" ]; then
+    warn "no patch directory at $PATCH_DIR — nothing to apply"
+    return 0
+  fi
+  local patches=("$PATCH_DIR"/*.patch)
+  if [ ! -e "${patches[0]}" ]; then
+    warn "no *.patch files found in $PATCH_DIR — nothing to apply"
+    return 0
+  fi
+
+  local p base
+  for p in "${patches[@]}"; do
+    base="$(basename "$p")"
+    if git -C "$INSTALL_DIR" apply --check -p1 "$p" 2>/dev/null; then
+      git -C "$INSTALL_DIR" apply -p1 "$p" || die "patch $base failed to apply after a successful --check (unexpected — tree changed mid-run?)"
+      info "applied $base"
+    elif git -C "$INSTALL_DIR" apply --check -R -p1 "$p" 2>/dev/null; then
+      info "$base already applied — skipping (idempotent)"
+    else
+      die "patch $base does not apply cleanly to $INSTALL_DIR, and is not already applied — the tree may have diverged from the pinned commit"
+    fi
+    # Unified verification for both branches above: the patch's own changes must
+    # be provably present now, not merely "the apply step didn't error."
+    git -C "$INSTALL_DIR" apply --check -R -p1 "$p" 2>/dev/null \
+      || die "verification failed: $base's changes are not present in $INSTALL_DIR after apply"
+  done
+}
+
+# ── Phase 4/5: npm ci + build, with artifact verification ────────────────────
+artifacts_present() {
+  local f
+  for f in "$BUILD_DIR/BUILD_ID" "$BUILD_DIR/routes-manifest.json" \
+           "$BUILD_DIR/prerender-manifest.json" "$BUILD_DIR/build-manifest.json" \
+           "$BUILD_DIR/required-server-files.json"; do
+    [ -s "$f" ] || return 1
+  done
+  [ -d "$BUILD_DIR/server" ] && [ -d "$BUILD_DIR/static" ]
+}
+
+verify_build_artifacts() {
+  local required_files=(
+    "$BUILD_DIR/BUILD_ID" "$BUILD_DIR/routes-manifest.json"
+    "$BUILD_DIR/prerender-manifest.json" "$BUILD_DIR/build-manifest.json"
+    "$BUILD_DIR/required-server-files.json"
+  )
+  local required_dirs=("$BUILD_DIR/server" "$BUILD_DIR/static")
+  local f d missing=0
+  for f in "${required_files[@]}"; do
+    [ -s "$f" ] || { warn "missing/empty build artifact: $f"; missing=1; }
+  done
+  for d in "${required_dirs[@]}"; do
+    [ -d "$d" ] || { warn "missing build directory: $d"; missing=1; }
+  done
+  [ "$missing" -eq 0 ] || die "build reported success but required .build/next artifacts are missing under $BUILD_DIR — a zero exit is not proof of a working build"
+  info "build artifacts verified in $BUILD_DIR"
+}
+
+_npm_ci_step() {
+  cd "$INSTALL_DIR" || return 90
+  PATH="$RUN_PATH" npm ci
+}
+
+run_npm_ci() {
+  info "npm ci in $INSTALL_DIR (bounded at ${NPM_CI_TIMEOUT}s)…"
+  local log="$SCRATCH/npm-ci.log"
+  run_capped_fn "$NPM_CI_TIMEOUT" "$log" _npm_ci_step
+  local rc=$?
+  if [ "$rc" -eq 124 ]; then
+    warn "npm ci exceeded ${NPM_CI_TIMEOUT}s — last 30 lines:"
+    warn "$(tail -30 "$log")"
+    die "npm ci timed out after ${NPM_CI_TIMEOUT}s in $INSTALL_DIR"
+  elif [ "$rc" -ne 0 ]; then
+    warn "npm ci failed (exit $rc) — last 30 lines:"
+    warn "$(tail -30 "$log")"
+    die "npm ci failed with exit $rc in $INSTALL_DIR"
+  fi
+  [ -d "$INSTALL_DIR/node_modules" ] || die "npm ci exited 0 but $INSTALL_DIR/node_modules does not exist — refusing to trust the exit code alone"
+  info "npm ci completed"
+}
+
+_build_step() {
+  cd "$INSTALL_DIR" || return 90
+  PATH="$RUN_PATH" OMNIROUTE_USE_TURBOPACK=0 npm run build
+}
+
+run_build() {
+  info "npm run build in $INSTALL_DIR (webpack — OMNIROUTE_USE_TURBOPACK=0, bounded at ${BUILD_TIMEOUT}s)…"
+  local log="$SCRATCH/build.log"
+  run_capped_fn "$BUILD_TIMEOUT" "$log" _build_step
+  local rc=$?
+  if [ "$rc" -eq 124 ]; then
+    warn "build exceeded ${BUILD_TIMEOUT}s — last 40 lines:"
+    warn "$(tail -40 "$log")"
+    die "npm run build timed out after ${BUILD_TIMEOUT}s in $INSTALL_DIR"
+  elif [ "$rc" -ne 0 ]; then
+    warn "build failed (exit $rc) — last 40 lines:"
+    warn "$(tail -40 "$log")"
+    die "npm run build failed with exit $rc in $INSTALL_DIR"
+  fi
+  verify_build_artifacts
+}
+
+build_omniroute() {
+  if [ -d "$INSTALL_DIR/node_modules" ] && artifacts_present; then
+    info "node_modules and .build/next artifacts already present — skipping npm ci + build"
+    verify_build_artifacts   # always verify for real, even on the fast path
+  else
+    run_npm_ci
+    run_build
+  fi
+}
+
+# ── Phase 6: runtime bootstrap (only if needed) ──────────────────────────────
+# server.env and DATA_DIR/storage.sqlite (+ schema) are created by OmniRoute's own
+# bootstrap code the first time any entrypoint touches them — not by this
+# installer. If they are already present (any prior boot, by this script or an
+# operator), this is a no-op. Otherwise, bring them into existence with a
+# throwaway boot-then-stop cycle on an EXPLICITLY free, non-production port.
+port_is_free() {
+  ! lsof -tiTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1
+}
+
+_bootstrap_step() {
+  cd "$INSTALL_DIR" || return 90
+  PATH="$RUN_PATH" OMNIROUTE_USE_TURBOPACK=0 HOST=127.0.0.1 PORT="$BOOTSTRAP_PORT" \
+    DATA_DIR="$DATA_DIR" npm run start
+}
+
+ensure_runtime_bootstrapped() {
+  if [ -f "$DATA_DIR/storage.sqlite" ] && [ -f "$DATA_DIR/server.env" ]; then
+    info "runtime files already present ($DATA_DIR/storage.sqlite, $DATA_DIR/server.env) — skipping bootstrap boot"
+    return 0
+  fi
+
+  info "runtime files not present yet — bootstrapping with a throwaway boot on 127.0.0.1:$BOOTSTRAP_PORT"
+  port_is_free "$BOOTSTRAP_PORT" || die "bootstrap port $BOOTSTRAP_PORT is already in use — refusing to guess around a possible live instance. Set OMNIROUTE_BOOTSTRAP_PORT to a free port and re-run."
+
+  mkdir -p "$DATA_DIR" || die "cannot create data dir $DATA_DIR"
+
+  local log="$SCRATCH/bootstrap.log"
+  _bootstrap_step >"$log" 2>&1 &
+  local pid=$!
+
+  local i=0 ready=0
+  while [ "$i" -lt "$BOOTSTRAP_TIMEOUT" ]; do
+    if curl -sf -o /dev/null "http://127.0.0.1:$BOOTSTRAP_PORT/api/monitoring/health" 2>/dev/null; then
+      ready=1
+      break
+    fi
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 1
+    i=$((i + 1))
+  done
+
+  local stop_pids
+  stop_pids="$(lsof -tiTCP:"$BOOTSTRAP_PORT" -sTCP:LISTEN 2>/dev/null || true)"
+  [ -n "$stop_pids" ] && kill $stop_pids 2>/dev/null
+  wait "$pid" 2>/dev/null
+
+  if [ "$ready" -ne 1 ]; then
+    warn "bootstrap boot never became healthy — last 40 lines:"
+    warn "$(tail -40 "$log")"
+    die "bootstrap boot did not become healthy within ${BOOTSTRAP_TIMEOUT}s on 127.0.0.1:$BOOTSTRAP_PORT"
+  fi
+  [ -f "$DATA_DIR/storage.sqlite" ] || die "bootstrap boot reported healthy but $DATA_DIR/storage.sqlite still does not exist"
+  [ -f "$DATA_DIR/server.env" ] || die "bootstrap boot reported healthy but $DATA_DIR/server.env still does not exist (expected: JWT_SECRET/STORAGE_ENCRYPTION_KEY/API_KEY_SECRET auto-generated on first boot — scripts/build/bootstrap-env.mjs)"
+  info "bootstrap boot succeeded and was stopped cleanly"
+}
+
+# ── Phase 7: security provisioning ───────────────────────────────────────────
+looks_strong() {
+  local f="$1" content
+  [ -s "$f" ] || return 1
+  content="$(cat "$f" 2>/dev/null || true)"
+  printf '%s' "$content" | grep -qE '^[0-9a-f]{64}$'
+}
+
+rotate_management_password() {
+  if [ -f "$SECRET_FILE" ] && looks_strong "$SECRET_FILE"; then
+    chmod 0600 "$SECRET_FILE" 2>/dev/null || true
+    info "management password already provisioned at $SECRET_FILE (0600, strong) — not rotating"
+    return 0
+  fi
+
+  local pw
+  pw="$(openssl rand -hex 32)" || die "openssl rand failed while generating the management password"
+  [ -n "$pw" ] || die "openssl rand produced empty output"
+
+  mkdir -p "$DATA_DIR" || die "cannot create data dir $DATA_DIR"
+  local tmp
+  tmp="$(mktemp "$DATA_DIR/.mgmt-pw.XXXXXX")" || die "cannot create a temp file for the password handoff"
+  chmod 0600 "$tmp" || { rm -f "$tmp"; die "cannot chmod 0600 the temp password file"; }
+  printf '%s' "$pw" > "$tmp" || { rm -f "$tmp"; die "cannot write the temp password file"; }
+
+  local log="$SCRATCH/reset-password.log"
+  (
+    cd "$INSTALL_DIR" || exit 90
+    DATA_DIR="$DATA_DIR" PATH="$RUN_PATH" node bin/reset-password.mjs --password-stdin < "$tmp"
+  ) >"$log" 2>&1
+  local rc=$?
+  pw=""
+  if [ "$rc" -ne 0 ]; then
+    rm -f "$tmp"
+    warn "reset-password.mjs failed (exit $rc) — last 20 lines:"
+    warn "$(tail -20 "$log")"
+    die "reset-password.mjs failed with exit $rc — management password was NOT rotated"
+  fi
+  if ! grep -qi "success" "$log"; then
+    rm -f "$tmp"
+    warn "reset-password.mjs exited 0 but did not report success — last 20 lines:"
+    warn "$(tail -20 "$log")"
+    die "reset-password.mjs did not confirm success — refusing to trust exit code 0 alone"
+  fi
+
+  mv -f "$tmp" "$SECRET_FILE" || die "cannot move the rotated password into place at $SECRET_FILE"
+  chmod 0600 "$SECRET_FILE" || die "cannot chmod 0600 $SECRET_FILE"
+  info "management password rotated -> $SECRET_FILE (0600, never printed)"
+}
+
+lock_down_secret_files() {
+  local hit=0 names=""
+  local envf
+  for envf in "$INSTALL_DIR"/*.env; do
+    [ -f "$envf" ] || continue
+    chmod 0600 "$envf" || die "cannot chmod 0600 $envf"
+    names="$names $envf"
+    hit=1
+  done
+  # The glob above never catches these — bash's default (non-dotglob) *.env
+  # pattern cannot match a dotfile, but the runtime's real secret-bearing files
+  # ARE dotfiles / DATA_DIR-scoped, confirmed by reading
+  # scripts/build/bootstrap-env.mjs and the live production install directly:
+  #   - $DATA_DIR/server.env  bootstrap-generated JWT_SECRET, STORAGE_ENCRYPTION_KEY,
+  #                           STORAGE_ENCRYPTION_KEY_VERSION, API_KEY_SECRET —
+  #                           written with writeFileSync and no explicit mode, so
+  #                           OmniRoute itself does NOT lock this down.
+  #   - $INSTALL_DIR/.env,
+  #     $DATA_DIR/.env        "preferred config" dotfiles (same module's
+  #                           getPreferredEnvFilePath() candidates) — the current
+  #                           live production install's real secrets live in
+  #                           exactly this dotfile, not a *.env-glob-matching name.
+  local extra
+  for extra in "$DATA_DIR/server.env" "$INSTALL_DIR/.env" "$DATA_DIR/.env"; do
+    [ -f "$extra" ] || continue
+    chmod 0600 "$extra" || die "cannot chmod 0600 $extra"
+    names="$names $extra"
+    hit=1
+  done
+  if [ "$hit" -eq 1 ]; then
+    info "locked to 0600:$names"
+    LOCKED_FILES_SUMMARY="$names"
+  else
+    die "no secret-bearing env file found (checked $INSTALL_DIR/*.env, $DATA_DIR/server.env, $INSTALL_DIR/.env, $DATA_DIR/.env) — expected at least $DATA_DIR/server.env once runtime bootstrap has run"
+  fi
+  chmod 0600 "$SECRET_FILE" 2>/dev/null || true
+}
+
+verify_tier1_dead() {
+  local db="$DATA_DIR/storage.sqlite"
+  [ -f "$db" ] || die "Tier-1 check: expected database not found at $db — cannot verify credential isolation, refusing to proceed"
+
+  local tables
+  tables="$(sqlite3 "$db" ".tables" 2>&1)" || die "Tier-1 check: cannot read $db as a SQLite database ($tables) — refusing to proceed"
+
+  if ! printf '%s' "$tables" | tr -s ' \t' '\n\n' | grep -qx "provider_connections"; then
+    info "Tier-1 check: provider_connections table does not exist yet in $db — structurally zero rows, PASS"
+    return 0
+  fi
+
+  local count
+  count="$(sqlite3 "$db" "SELECT COUNT(*) FROM provider_connections WHERE provider IN ('claude','claude-web');" 2>&1)"
+  case "$count" in
+    ''|*[!0-9]*)
+      die "Tier-1 check: could not parse a row count from sqlite3 (\"$count\") — refusing to proceed" ;;
+  esac
+  if [ "$count" -ne 0 ]; then
+    die "TIER-1 VIOLATION: $count provider_connections row(s) with provider in (claude, claude-web) found in $db. OmniRoute could repurpose a Claude/Claude Code credential. Remove the connection(s) via the OmniRoute dashboard (Settings > Providers) and re-run. Refusing to complete install."
+  fi
+  info "Tier-1 check: 0 claude/claude-web rows in provider_connections — PASS"
+}
+
+provision_security() {
+  ensure_runtime_bootstrapped
+  rotate_management_password
+  lock_down_secret_files
+  verify_tier1_dead
+}
+
+# ── Phase 8: summary (NO secrets, ever) ───────────────────────────────────────
+print_summary() {
+  cat <<EOF
+
+OmniRoute installed and provisioned.
+
+  Source          $INSTALL_DIR
+                  pinned at $OMNIROUTE_PIN (.git kept — diffable against upstream)
+  Data dir        $DATA_DIR
+  Build output    $BUILD_DIR
+                  verified: BUILD_ID, routes/prerender/build manifests,
+                  required-server-files.json, server/, static/
+  Management pw   rotated, stored at $SECRET_FILE (mode 0600) — never printed here.
+                  Read it yourself: cat $SECRET_FILE
+  Locked to 0600  $LOCKED_FILES_SUMMARY, plus $SECRET_FILE
+  Tier-1 check    VERIFIED — no claude/claude-web row in provider_connections
+
+  This installer does not start a persistent service. To run it:
+    cd $INSTALL_DIR
+    PATH="${NODE_BIN_DIR:+$NODE_BIN_DIR:}\$PATH" OMNIROUTE_USE_TURBOPACK=0 \\
+      HOST=127.0.0.1 DATA_DIR=$DATA_DIR npm run start
+
+EOF
+}
+
+# ── main ──────────────────────────────────────────────────────────────────────
+main() {
+  check_preconditions
+  clone_and_pin
+  apply_patches
+  build_omniroute
+  provision_security
+  print_summary
+}
+
+main
