@@ -47,6 +47,23 @@ TMP="$(mktemp -d -t "presence-sandbox-guard.XXXXXX")"
 export HEIMDALL_KEEPER_DIR="$TMP/keeper"; mkdir -p "$HEIMDALL_KEEPER_DIR"
 PROJECT="acme/sandboxguard"
 CASE_HOMES=""
+# Case 5's real-fixture HOME lives here — outside the repo (never trips the tree-integrity
+# guard's root-litter check; see test/tree-integrity-guard.test.sh) and outside every temp-root
+# glob the sandbox guard itself checks (bin/heimdall-presence's case "${HOME:-}" in /tmp/*|
+# /private/tmp/*|/var/tmp/*|/private/var/tmp/*|/var/folders/*/T/*), so it still classifies as
+# real dev use. A prior version anchored it under $REPO directly, relying solely on this
+# script's own EXIT trap to remove it — but an untrappable SIGKILL (run-all.sh's timeout_run
+# TERM's the whole process group, waits 2s, then KILLs it; SIGKILL cannot be caught regardless
+# of what the trap says) left it behind INSIDE the scanned tree, tripping "TREE INTEGRITY
+# VIOLATION" on the next full run. $HOME below is this script's own real ambient HOME — nothing
+# above reassigns it (unlike heimdall-presence-keeper.test.sh, which throws its own $HOME away
+# for the rest of that file).
+FIXTURE_CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/hmd-test"
+mkdir -p "$FIXTURE_CACHE" 2>/dev/null || true
+# Best-effort stale-fixture sweep (never fails the suite, hence the trailing || true): a run
+# that got SIGKILLed before its own EXIT trap could fire leaves its fixture dir sitting here —
+# sweep any leftovers now so they cannot accumulate across suite invocations.
+rm -rf "$FIXTURE_CACHE"/.hmd-test-fixture-sandboxguard.* 2>/dev/null || true
 cleanup() {
   for pf in "$HEIMDALL_KEEPER_DIR"/*.pid; do
     [ -f "$pf" ] || continue
@@ -132,10 +149,11 @@ run_case "3 /tmp/env-i" "$H3" skip strip
 H4="$(mktemp -d /var/tmp/hmd-sbxguard.XXXXXX)"; CASE_HOMES="$CASE_HOMES $H4"; mkdir -p "$H4/.heimdall"
 run_case "4 /var/tmp/env-i" "$H4" skip strip
 
-# 5. NEGATIVE CONTROL — a real fixture HOME under the repo checkout, never under any OS temp
-#    root by construction. Proves the (now-wider) glob does not over-match real dev use: the
-#    doctor must STILL auto-launch exactly as it did before this guard ever existed.
-H5="$REPO/.hmd-test-fixture-sandboxguard.$$"; CASE_HOMES="$CASE_HOMES $H5"; mkdir -p "$H5/.heimdall"
+# 5. NEGATIVE CONTROL — a real fixture HOME under FIXTURE_CACHE (outside the repo checkout AND
+#    outside every OS-temp-root glob the guard checks; see FIXTURE_CACHE's own comment above).
+#    Proves the (now-wider) glob does not over-match real dev use: the doctor must STILL
+#    auto-launch exactly as it did before this guard ever existed.
+H5="$FIXTURE_CACHE/.hmd-test-fixture-sandboxguard.$$"; CASE_HOMES="$CASE_HOMES $H5"; mkdir -p "$H5/.heimdall"
 run_case "5 real-fixture-home/plain (negative control)" "$H5" spawn plain
 
 # 6. ESCAPE HATCH — a sandbox-shaped HOME, but HMD_DOCTOR_ALLOW_TMP_HOME=1 explicitly overrides

@@ -56,8 +56,30 @@ TMP="$(mktemp -d -t "presence-keeper.XXXXXX")"
 export HEIMDALL_HOME="$TMP/home"          # cp_presence local backend home
 export HEIMDALL_KEEPER_DIR="$TMP/keeper"  # keeper pidfile home (never ~/.heimdall in tests)
 mkdir -p "$HEIMDALL_HOME" "$HEIMDALL_KEEPER_DIR"
+# Capture the REAL developer HOME before the next line throws it away for the rest of this
+# script. Section E's "real-shaped HOME" fixture (E2) must be rooted outside any OS temp root
+# AND outside the repo checkout (test/run-all.sh's tree-integrity guard scans the repo root for
+# untracked litter) — reading $HOME after the fakehome export below would resolve under
+# $TMP/fakehome, itself a temp-rooted path, defeating the "real-shaped" fixture's whole point.
+REAL_HOME="${HOME:-}"
 # HOME is a throwaway so a stray global presence-off/config never bleeds in from the dev box.
 export HOME="$TMP/fakehome"; mkdir -p "$HOME/.heimdall"
+# Section E's real-shaped fixture (E2) lives under here: outside the repo (never trips the
+# tree-integrity guard — see test/tree-integrity-guard.test.sh) and outside every temp-root
+# glob the sandbox guard itself checks (bin/heimdall-presence's case "${HOME:-}" in /tmp/*|
+# /private/tmp/*|/var/tmp/*|/private/var/tmp/*|/var/folders/*/T/*), so it still classifies as
+# real dev use. A prior version anchored E2 under $REPO directly, relying solely on this
+# script's own EXIT trap to remove it — but an untrappable SIGKILL (run-all.sh's timeout_run
+# TERM's the whole process group, waits 2s, then KILLs it; SIGKILL cannot be caught regardless
+# of what the trap says) left it behind INSIDE the scanned tree, tripping "TREE INTEGRITY
+# VIOLATION" on the next full run. Moving it here means a hard kill can still leak the
+# directory, but never into the repo.
+FIXTURE_CACHE="${XDG_CACHE_HOME:-$REAL_HOME/.cache}/hmd-test"
+mkdir -p "$FIXTURE_CACHE" 2>/dev/null || true
+# Best-effort stale-fixture sweep (never fails the suite, hence the trailing || true): a run
+# that got SIGKILLed before its own EXIT trap could fire leaves its fixture dir sitting here —
+# sweep any leftovers now so they cannot accumulate across suite invocations.
+rm -rf "$FIXTURE_CACHE"/.hmd-test-fixture-keeper-e2.* 2>/dev/null || true
 # Section E's three extra fixture homes — pre-declared (not just assigned in Section E) so
 # `cleanup` below can safely reference them under `set -u` even if the script exits before
 # Section E ever runs (an unset-variable reference inside a trap would itself abort mid-cleanup).
@@ -287,10 +309,11 @@ fi
 case "$DOC_PID_E1" in ''|*[!0-9]*) : ;; *) kill "$DOC_PID_E1" 2>/dev/null || true ;; esac
 rm -rf "$E1_HOME"; E1_HOME=""
 
-# E2: REAL-shaped HOME (a fixture dir under the repo checkout — never under any OS
-# temp root by construction) -> keeper-start's autoenroll MUST still launch the
-# doctor exactly as before the guard existed (proves real dev use is unaffected).
-E2_HOME="$REPO/.hmd-test-fixture-keeper-e2.$$"; mkdir -p "$E2_HOME/.heimdall"
+# E2: REAL-shaped HOME (a fixture dir under FIXTURE_CACHE — outside the repo checkout AND
+# outside every OS-temp-root glob the guard itself checks; see FIXTURE_CACHE's own comment
+# above) -> keeper-start's autoenroll MUST still launch the doctor exactly as before the guard
+# existed (proves real dev use is unaffected).
+E2_HOME="$FIXTURE_CACHE/.hmd-test-fixture-keeper-e2.$$"; mkdir -p "$E2_HOME/.heimdall"
 E2_DOCDIR="$E2_HOME/.heimdall/doctor"
 env -u HMD_KEEPER_BEAT_BIN -u HMD_DOCTOR_DISABLE HOME="$E2_HOME" \
   HEIMDALL_DOCTOR_DIR="$E2_DOCDIR" HMD_DOCTOR_MAX_CYCLES=1 HMD_DOCTOR_MAX_SECONDS=1 HMD_DOCTOR_BACKOFF=0 \
