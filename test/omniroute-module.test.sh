@@ -350,9 +350,9 @@ else
       HEIMDALL_LATEST_OVERRIDE="9.9.9" HEIMDALL_INSTALLED_OVERRIDE="9.9.9" \
       HEIMDALL_AUTOUPDATE_DRYRUN=1 HEIMDALL_MODULE_RECONCILE_DRYRUN=1 \
       "$AUTOUPD" check >/dev/null 2>&1
-  grep -q 'would-acquire' "$RCHOME/autoupdate.log" 2>/dev/null \
-    && bad "reconcile tried to acquire an opted-out module" \
-    || ok "reconcile does not try to re-install the opted-out module"
+  grep -qE 'reconcile: omniroute would-acquire' "$RCHOME/autoupdate.log" 2>/dev/null \
+    && bad "reconcile tried to acquire the opted-out omniroute module" \
+    || ok "reconcile does not try to re-install the opted-out omniroute module"
 
   # optin — reversible, and cleanly so.
   OUT4B="$(hmd4 optin omniroute 2>&1)"; RC4B=$?
@@ -547,7 +547,16 @@ cat > "$NODE_OLD_PATH/node" <<'EOF'
 [ "$1" = "--version" ] && echo "v18.19.0"
 EOF
 chmod +x "$NODE_OLD_PATH/node"
-for c in bash sh env grep sed perl; do
+# dirname/mktemp/readlink/rm are added on top of O8's original coreutils list
+# specifically so O9 (below) can drive the REAL installer far enough to reach
+# its node-version guard: heimdall-omniroute-install resolves its own SELF path
+# (readlink/dirname) and allocates a SCRATCH dir (mktemp) before check_preconditions
+# ever runs, and without these four the real installer dies on a raw "dirname:
+# command not found" / "cannot create a scratch dir" error instead of ever
+# reaching — let alone naming — the node check. None of this reaches git clone:
+# resolve_node24 dies (HOME here is always a fresh, git-clone-free sandbox with
+# no ~/.nvm) before check_preconditions' tool loop or clone_and_pin ever run.
+for c in bash sh env grep sed perl dirname mktemp readlink rm; do
   src="$(command -v "$c" 2>/dev/null)"; [ -n "$src" ] && ln -sf "$src" "$NODE_OLD_PATH/$c" 2>/dev/null
 done
 write_stub_git "$NODE_OLD_PATH" "2222222222222222222222222222222222222222"
