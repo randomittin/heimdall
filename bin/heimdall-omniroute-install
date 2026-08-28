@@ -84,7 +84,7 @@ fi
 BIN_DIR="$(cd "$(dirname "$SELF")" 2>/dev/null && pwd)"
 PLUGIN_ROOT="$(cd "$BIN_DIR/.." 2>/dev/null && pwd)"
 
-usage() { sed -n '2,72p' "$SELF" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,76p' "$SELF" | sed 's/^# \{0,1\}//'; }
 
 case "${1:-}" in
   -h|--help) usage; exit 0 ;;
@@ -361,8 +361,8 @@ _bootstrap_step() {
 }
 
 ensure_runtime_bootstrapped() {
-  if [ -f "$DATA_DIR/storage.sqlite" ] && [ -f "$INSTALL_DIR/server.env" ]; then
-    info "runtime files already present ($DATA_DIR/storage.sqlite, $INSTALL_DIR/server.env) — skipping bootstrap boot"
+  if [ -f "$DATA_DIR/storage.sqlite" ] && [ -f "$DATA_DIR/server.env" ]; then
+    info "runtime files already present ($DATA_DIR/storage.sqlite, $DATA_DIR/server.env) — skipping bootstrap boot"
     return 0
   fi
 
@@ -397,6 +397,7 @@ ensure_runtime_bootstrapped() {
     die "bootstrap boot did not become healthy within ${BOOTSTRAP_TIMEOUT}s on 127.0.0.1:$BOOTSTRAP_PORT"
   fi
   [ -f "$DATA_DIR/storage.sqlite" ] || die "bootstrap boot reported healthy but $DATA_DIR/storage.sqlite still does not exist"
+  [ -f "$DATA_DIR/server.env" ] || die "bootstrap boot reported healthy but $DATA_DIR/server.env still does not exist (expected: JWT_SECRET/STORAGE_ENCRYPTION_KEY/API_KEY_SECRET auto-generated on first boot — scripts/build/bootstrap-env.mjs)"
   info "bootstrap boot succeeded and was stopped cleanly"
 }
 
@@ -451,19 +452,39 @@ rotate_management_password() {
 }
 
 lock_down_secret_files() {
-  local envf hit=0 names=""
+  local hit=0 names=""
+  local envf
   for envf in "$INSTALL_DIR"/*.env; do
     [ -f "$envf" ] || continue
     chmod 0600 "$envf" || die "cannot chmod 0600 $envf"
-    names="$names $(basename "$envf")"
+    names="$names $envf"
+    hit=1
+  done
+  # The glob above never catches these — bash's default (non-dotglob) *.env
+  # pattern cannot match a dotfile, but the runtime's real secret-bearing files
+  # ARE dotfiles / DATA_DIR-scoped, confirmed by reading
+  # scripts/build/bootstrap-env.mjs and the live production install directly:
+  #   - $DATA_DIR/server.env  bootstrap-generated JWT_SECRET, STORAGE_ENCRYPTION_KEY,
+  #                           STORAGE_ENCRYPTION_KEY_VERSION, API_KEY_SECRET —
+  #                           written with writeFileSync and no explicit mode, so
+  #                           OmniRoute itself does NOT lock this down.
+  #   - $INSTALL_DIR/.env,
+  #     $DATA_DIR/.env        "preferred config" dotfiles (same module's
+  #                           getPreferredEnvFilePath() candidates) — the current
+  #                           live production install's real secrets live in
+  #                           exactly this dotfile, not a *.env-glob-matching name.
+  local extra
+  for extra in "$DATA_DIR/server.env" "$INSTALL_DIR/.env" "$DATA_DIR/.env"; do
+    [ -f "$extra" ] || continue
+    chmod 0600 "$extra" || die "cannot chmod 0600 $extra"
+    names="$names $extra"
     hit=1
   done
   if [ "$hit" -eq 1 ]; then
-    info "locked to 0600:$names (under $INSTALL_DIR)"
+    info "locked to 0600:$names"
     LOCKED_FILES_SUMMARY="$names"
   else
-    warn "no *.env file found under $INSTALL_DIR to lock down (unexpected once runtime bootstrap has run)"
-    LOCKED_FILES_SUMMARY="(none found)"
+    die "no secret-bearing env file found (checked $INSTALL_DIR/*.env, $DATA_DIR/server.env, $INSTALL_DIR/.env, $DATA_DIR/.env) — expected at least $DATA_DIR/server.env once runtime bootstrap has run"
   fi
   chmod 0600 "$SECRET_FILE" 2>/dev/null || true
 }
@@ -513,7 +534,7 @@ OmniRoute installed and provisioned.
                   required-server-files.json, server/, static/
   Management pw   rotated, stored at $SECRET_FILE (mode 0600) — never printed here.
                   Read it yourself: cat $SECRET_FILE
-  Locked to 0600  $LOCKED_FILES_SUMMARY (under $INSTALL_DIR), plus $SECRET_FILE
+  Locked to 0600  $LOCKED_FILES_SUMMARY, plus $SECRET_FILE
   Tier-1 check    VERIFIED — no claude/claude-web row in provider_connections
 
   This installer does not start a persistent service. To run it:
