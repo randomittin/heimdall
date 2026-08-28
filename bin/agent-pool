@@ -20,6 +20,13 @@ Environment:
   HMD_AGENT_STALE_SECS   Stale-idle threshold in seconds (default 900). An active
                          agent whose last_active is older than this is reaped by
                          health-check EVEN IF its pid is still alive (hung fork).
+  HMD_AGENT_POOL_MEMORY_GATE   Opt-in (default OFF). When set to any value other
+                         than "", "0", or "false", acquire additionally consults
+                         bin/heimdall-memory-budget's slot count as a SECOND,
+                         independent cap alongside max_agents: effective capacity
+                         becomes min(max_agents, memory slots). Off by default so
+                         existing count-only behavior is unchanged unless an
+                         operator opts in.
 
 should-scale additionally consults bin/lib/pressure_control.py (if present) so a
 scale-up recommendation is capped under recent OBSERVED API pressure (529s /
@@ -28,8 +35,17 @@ It is an upper bound on scale-up only, never a replacement for the utilization
 logic above and never a trigger for scale-down. Fails open (behaves exactly as
 if no pressure were known) if the module or its state is missing, corrupt, or
 raises — see HMD_PRESSURE_* in pressure_control.py for the AIMD tunables.
+
+acquire additionally consults bin/heimdall-memory-budget (only when
+HMD_AGENT_POOL_MEMORY_GATE is enabled) so a spawn can be refused when host RAM
+is tight EVEN THOUGH max_agents has not been reached — a bare count is blind to
+memory pressure; measured host RAM is a second, independent signal alongside
+it, never a replacement for it. Fails open (behaves exactly as if the gate were
+disabled) if heimdall-memory-budget is missing, errors, times out, or its own
+measurement is itself unmeasurable — see that tool's module docstring for why
+IT fails open internally too.
 """
-import sys, os, json, time, fcntl, argparse
+import sys, os, json, time, fcntl, argparse, subprocess
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -117,6 +133,34 @@ def _pressure_recommend(ceiling):
     except Exception:
         return ceiling, None, {"pressure_known": False}
 
+def memory_gate_enabled():
+    """Whether cmd_acquire additionally consults heimdall-memory-budget's slot
+    count as a second, independent cap layered on top of max_agents. OFF by
+    default (opt-in), mirroring HMD_AGENT_STALE_SECS's own env-var shape --
+    existing callers (and existing tests) that never set this var see
+    byte-identical acquire behavior."""
+    raw = os.environ.get("HMD_AGENT_POOL_MEMORY_GATE")
+    return raw not in (None, "", "0", "false", "False")
+
+def _memory_slots():
+    """Best-effort read of bin/heimdall-memory-budget's `slots` integer.
+    Mirrors _pressure_recommend's fail-open shape for a second, unrelated,
+    independent ceiling (host RAM vs. observed API pressure): ANY problem
+    (binary missing, non-zero exit, unparsable stdout, timeout, permission
+    error) degrades to None -- "memory unknown, do not additionally cap" --
+    never blocks or crashes an acquire. heimdall-memory-budget already fails
+    open internally (see its own module docstring); this wraps invocation of
+    it so a missing/broken binary degrades the exact same way."""
+    try:
+        script = os.path.join(os.path.dirname(os.path.realpath(__file__)), "heimdall-memory-budget")
+        out = subprocess.run([sys.executable, script, "slots"],
+                             capture_output=True, text=True, timeout=5)
+        if out.returncode != 0:
+            return None
+        return int(out.stdout.strip())
+    except Exception:
+        return None
+
 @locked
 def cmd_init(args):
     pool = load_pool()
@@ -138,6 +182,14 @@ def cmd_acquire(args):
     if len(act) >= pool["max_agents"]:
         print(f"At capacity ({pool['max_agents']}). Cannot acquire.", file=sys.stderr)
         sys.exit(2)
+    if memory_gate_enabled():
+        # SECOND, independent cap: effective capacity is min(max_agents,
+        # memory slots). Never replaces the count check above -- only ever
+        # tightens it further, and only when the operator opted in.
+        slots = _memory_slots()
+        if slots is not None and len(act) >= slots:
+            print(f"At memory capacity (slots={slots}, active={len(act)}). Cannot acquire.", file=sys.stderr)
+            sys.exit(2)
     ts = now_iso()
     entry = {
         "type": args.type, "status": "active",
