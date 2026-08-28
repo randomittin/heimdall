@@ -670,11 +670,10 @@ else
 
   run_installer() { # <path> [extra env...]
     ( cd "$TMP" && env -i PATH="$1" HOME="$SAFE_HOME" TMPDIR="$TMP" "${@:2}" \
-        alarm_run 30 bash "$INSTALLER" < /dev/null ) 2>&1
+        perl -e 'alarm 30; exec @ARGV' bash "$INSTALLER" < /dev/null ) 2>&1
   }
 
-  OUT9A="$(run_installer "$NODE_OLD_PATH:$INSTALLER_PATH_HELPER" )"; RC9A=$?
-  # PATH above intentionally carries only the stub node plus symlinked coreutils
+  # PATH here intentionally carries only the stub node plus symlinked coreutils
   # from O8's fixture — reused so this section makes no new assumption beyond O8's.
   OUT9A="$(run_installer "$NODE_OLD_PATH")"; RC9A=$?
   if [ "$RC9A" -eq 0 ]; then
@@ -711,7 +710,14 @@ echo "using credential: $OMNIROUTE_PASSWORD"
 exit 1
 EOF
 chmod +x "$LEAKY"
-LEAK_OUT="$(env "${SECRET_ENV[@]}" alarm_run 10 bash "$LEAKY" 2>&1)"
+# NOTE: SECRET_ENV is an array built from expansion, not literal VAR=val tokens
+# written in the source — bash only recognizes a LITERAL "name=value" word as a
+# temporary-environment assignment prefix; an expanded array element does not
+# qualify, so without `env` these would be misparsed as an attempt to RUN a
+# program literally named "OMNIROUTE_PASSWORD=...". `env` (a real external
+# binary) is what actually applies them, and unlike the old alarm_run function,
+# perl is a real binary too, so this composes correctly.
+LEAK_OUT="$(env "${SECRET_ENV[@]}" perl -e 'alarm 10; exec @ARGV' bash "$LEAKY" 2>&1)"
 grep -qF "$SECRET_MARKER" <<<"$LEAK_OUT" \
   && ok "RED ARM: the marker-leak detector correctly catches a script that echoes a secret env var" \
   || bad "the detector missed an intentional secret leak — the check is not discriminating"
@@ -720,7 +726,7 @@ grep -qF "$SECRET_MARKER" <<<"$LEAK_OUT" \
 CLEAN_OUT="$(env "${SECRET_ENV[@]}" PATH="$GIT_RIGHTSHA_PATH" \
   OMNIROUTE_CLONE_DIR="$TMP/clone-secrets" OMNIROUTE_UPSTREAM="https://example.invalid/omniroute" \
   OMNIROUTE_PIN_SHA="$PIN_SHA" OMNIROUTE_PROVIDERS_FILE="$TMP/no-such-providers.json" \
-  alarm_run 20 bash "$REF" 2>&1)"
+  perl -e 'alarm 20; exec @ARGV' bash "$REF" 2>&1)"
 grep -qF "$SECRET_MARKER" <<<"$CLEAN_OUT" \
   && bad "the reference installer leaked the secret marker" \
   || ok "GREEN ARM: the reference installer's stdout+stderr are byte-free of the marker"
@@ -728,9 +734,9 @@ grep -qF "$SECRET_MARKER" <<<"$CLEAN_OUT" \
 if [ "$HAVE_INSTALLER" -eq 0 ]; then
   skip "the real-installer secrets probe needs bin/heimdall-omniroute-install — not present yet"
 else
-  REAL_SEC_OUT="$(env "${SECRET_ENV[@]}" PATH="$NODE_OLD_PATH" HOME="$TMP/home-o10" TMPDIR="$TMP" \
-    alarm_run 30 bash "$INSTALLER" < /dev/null 2>&1)"
   mkdir -p "$TMP/home-o10"
+  REAL_SEC_OUT="$(env "${SECRET_ENV[@]}" PATH="$NODE_OLD_PATH" HOME="$TMP/home-o10" TMPDIR="$TMP" \
+    perl -e 'alarm 30; exec @ARGV' bash "$INSTALLER" < /dev/null 2>&1)"
   grep -qF "$SECRET_MARKER" <<<"$REAL_SEC_OUT" \
     && bad "the REAL installer printed the planted secret marker to stdout/stderr" \
     || ok "the real installer's captured stdout+stderr on its refusal path are byte-free of the marker"
