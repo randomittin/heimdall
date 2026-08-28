@@ -466,7 +466,7 @@ else
   # sed's s/// only replaces the FIRST match per line, silently leaving the
   # second occurrence on that line intact — which is exactly how this fixture
   # previously failed to drift at all.
-  sed "s/$PIN_SHA/0000000000000000000000000000000000000000/" "$MANIFEST" > "$DRIFT"
+  sed "s/$PIN_SHA/0000000000000000000000000000000000000000/g" "$MANIFEST" > "$DRIFT"
   [ "$(sha_file "$MANIFEST")" != "$(sha_file "$DRIFT")" ] \
     && ok "the drift fixture is genuinely different bytes from the shipped manifest — the sed substitution took" \
     || bad "the drift fixture is byte-identical to the shipped manifest — the sed substitution did not take at all"
