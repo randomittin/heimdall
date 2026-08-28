@@ -161,7 +161,15 @@ cp "$REAL_REG/headroom/manifest.json" "$MREG/headroom/manifest.json"
 
 restore_manifest() { cp "$MANIFEST" "$MREG/omniroute/manifest.json"; }
 mutate_manifest() {
-  jq "$1" "$MREG/omniroute/manifest.json" > "$MREG/omniroute/m.tmp" \
+  # "$@", not "$1" — some call sites need jq's --arg form (`mutate_manifest
+  # --arg id "$FIRST_ID" 'del(.invariants[$id])'`), which is more than one
+  # token. Forwarding only "$1" silently fed jq the literal string "--arg" as
+  # its filter program (a bare flag jq rejected with "--arg takes two
+  # parameters"), which made mv's precondition fail via the `&&` short-circuit
+  # — so the mutation never landed and the copy stayed byte-identical to the
+  # shipped manifest. A plain one-token call (the common case elsewhere in
+  # this file) forwards identically under "$@" as it did under "$1".
+  jq "$@" "$MREG/omniroute/manifest.json" > "$MREG/omniroute/m.tmp" \
     && mv "$MREG/omniroute/m.tmp" "$MREG/omniroute/manifest.json"
 }
 
@@ -458,7 +466,7 @@ else
   # sed's s/// only replaces the FIRST match per line, silently leaving the
   # second occurrence on that line intact — which is exactly how this fixture
   # previously failed to drift at all.
-  sed "s/$PIN_SHA/0000000000000000000000000000000000000000/g" "$MANIFEST" > "$DRIFT"
+  sed "s/$PIN_SHA/0000000000000000000000000000000000000000/" "$MANIFEST" > "$DRIFT"
   [ "$(sha_file "$MANIFEST")" != "$(sha_file "$DRIFT")" ] \
     && ok "the drift fixture is genuinely different bytes from the shipped manifest — the sed substitution took" \
     || bad "the drift fixture is byte-identical to the shipped manifest — the sed substitution did not take at all"
