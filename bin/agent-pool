@@ -45,7 +45,13 @@ disabled) if heimdall-memory-budget is missing, errors, times out, or its own
 measurement is itself unmeasurable — see that tool's module docstring for why
 IT fails open internally too.
 """
-import sys, os, json, time, fcntl, argparse, subprocess
+import sys
+import os
+import json
+import time
+import fcntl
+import argparse
+import subprocess
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -203,10 +209,12 @@ def cmd_acquire(args):
 def cmd_release(args):
     pool = load_pool()
     if not pool:
-        print("Pool not initialized.", file=sys.stderr); sys.exit(1)
+        print("Pool not initialized.", file=sys.stderr)
+        sys.exit(1)
     agent = pool["agents"].get(args.agent_id)
     if not agent:
-        print(f"Agent {args.agent_id} not found.", file=sys.stderr); sys.exit(1)
+        print(f"Agent {args.agent_id} not found.", file=sys.stderr)
+        sys.exit(1)
     agent["status"] = "done"
     agent["finished_at"] = now_iso()
     if agent.get("started_at"):
@@ -220,10 +228,12 @@ def cmd_release(args):
 def cmd_beat(args):
     pool = load_pool()
     if not pool:
-        print("Pool not initialized.", file=sys.stderr); sys.exit(1)
+        print("Pool not initialized.", file=sys.stderr)
+        sys.exit(1)
     agent = pool["agents"].get(args.agent_id)
     if not agent:
-        print(f"Agent {args.agent_id} not found.", file=sys.stderr); sys.exit(1)
+        print(f"Agent {args.agent_id} not found.", file=sys.stderr)
+        sys.exit(1)
     ts = now_iso()
     agent["last_active"] = ts
     save_pool(pool)
@@ -233,7 +243,8 @@ def cmd_beat(args):
 def cmd_status(_args):
     pool = load_pool()
     if not pool:
-        print("{}"); return
+        print("{}")
+        return
     act = active_agents(pool)
     out = {
         "active_count": len(act), "max_agents": pool["max_agents"],
@@ -247,7 +258,8 @@ def cmd_status(_args):
 def cmd_should_scale(_args):
     pool = load_pool()
     if not pool:
-        print("Pool not initialized.", file=sys.stderr); sys.exit(1)
+        print("Pool not initialized.", file=sys.stderr)
+        sys.exit(1)
     util = utilization(pool)
     cooldown = pool.get("cooldown_seconds", 30)
     last = pool.get("last_scale_event")
@@ -293,7 +305,8 @@ def cmd_wait(_args):
     while time.time() - start < timeout:
         pool = load_pool()
         if not pool:
-            print("Pool not initialized.", file=sys.stderr); sys.exit(1)
+            print("Pool not initialized.", file=sys.stderr)
+            sys.exit(1)
         if len(active_agents(pool)) < pool["max_agents"]:
             print("Slot available.")
             return
@@ -305,7 +318,8 @@ def cmd_wait(_args):
 def cmd_resize(args):
     pool = load_pool()
     if not pool:
-        print("Pool not initialized.", file=sys.stderr); sys.exit(1)
+        print("Pool not initialized.", file=sys.stderr)
+        sys.exit(1)
     old = pool["max_agents"]
     pool["max_agents"] = args.max
     save_pool(pool)
@@ -327,7 +341,8 @@ def _idle_secs(info, now):
 def cmd_health_check(_args):
     pool = load_pool()
     if not pool:
-        print("Pool not initialized.", file=sys.stderr); sys.exit(1)
+        print("Pool not initialized.", file=sys.stderr)
+        sys.exit(1)
     threshold = stale_threshold_secs()
     now = datetime.now(timezone.utc)
     dead, stale = [], []
@@ -409,7 +424,8 @@ def main():
 
     args = p.parse_args()
     if not args.cmd:
-        p.print_help(); sys.exit(1)
+        p.print_help()
+        sys.exit(1)
     args.func(args)
 
 if __name__ == "__main__":
