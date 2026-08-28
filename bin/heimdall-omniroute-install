@@ -20,10 +20,11 @@
 #                         `.build/next` (BUILD_ID, routes/prerender/build manifests,
 #                         required-server-files.json, server/, static/). A zero exit
 #                         from npm is NOT treated as proof — the files are checked.
-#   6. Runtime bootstrap — some runtime files (server.env, storage.sqlite + schema)
-#                         are created by OmniRoute's own code the first time any
-#                         entrypoint touches them, not by this installer. If they
-#                         are not already present, a throwaway boot-then-stop cycle
+#   6. Runtime bootstrap — some runtime files ($DATA_DIR/server.env,
+#                         $DATA_DIR/storage.sqlite + schema) are created by
+#                         OmniRoute's own code the first time any entrypoint
+#                         touches them, not by this installer. If they are not
+#                         already present, a throwaway boot-then-stop cycle
 #                         brings them into existence, on an explicitly free port
 #                         chosen so it can never collide with a separately-running
 #                         instance (e.g. the production gateway on :20128).
@@ -34,12 +35,15 @@
 #                         §4: INITIAL_PASSWORD is only consulted before a bcrypt hash
 #                         is persisted, so an env edit after that point is inert).
 #                         Idempotent: a password already provisioned and strong is
-#                         not rotated again. `chmod 0600` every `*.env` file at the
-#                         install root (server.env carries JWT_SECRET,
-#                         STORAGE_ENCRYPTION_KEY, API_KEY_SECRET). Finally, verify
-#                         Tier-1 is dead: query `provider_connections` for any row
-#                         whose provider is `claude`/`claude-web` — FAIL LOUDLY and
-#                         refuse to complete if one exists.
+#                         not rotated again. `chmod 0600` on every secret-bearing
+#                         env file: $DATA_DIR/server.env (bootstrap-generated
+#                         JWT_SECRET/STORAGE_ENCRYPTION_KEY/API_KEY_SECRET — a
+#                         dotfile/DATA_DIR path, checked explicitly rather than by
+#                         glob), $INSTALL_DIR/.env, $DATA_DIR/.env, and any
+#                         $INSTALL_DIR/*.env. Finally, verify Tier-1 is dead: query
+#                         `provider_connections` for any row whose provider is
+#                         `claude`/`claude-web` — FAIL LOUDLY and refuse to complete
+#                         if one exists.
 #   8. Summary          — print what was installed; print NO secrets, ever.
 #
 # OVERRIDES (env vars; all optional, defaults match the documented live install):
