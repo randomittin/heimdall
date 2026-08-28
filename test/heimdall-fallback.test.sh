@@ -1835,6 +1835,99 @@ unset ANTHROPIC_MODEL
   && ok "84. model with ANTHROPIC_MODEL set (valid) but fallback_model empty -> still refuses, stdout byte-empty (model never reads ANTHROPIC_MODEL)" \
   || bad "84. rc=$CAP_RC out_bytes=$CAP_OUT_BYTES out='$CAP_OUT' err='$CAP_ERR'"
 
+
+# ── 85. LIVENESS PROBE IS HTTP, NOT TCP. ──────────────────────────────────
+# Regression guard for the defect that made `check` print [OK]
+# endpoint_reachable while every real call to the gateway timed out: the
+# probe did a bare TCP connect, and a wedged server (or a webpack dev
+# server still compiling the route) completes the handshake while never
+# answering a single HTTP request.
+#
+# Falsifiable in BOTH directions on purpose. A probe hardwired to False
+# would pass the wedged case alone, so the live cases must also pass; a
+# probe hardwired to True (the old TCP-only behaviour) fails the wedged
+# case. 401/307 are asserted reachable because this answers "is anything
+# serving HTTP here", never "is this request authorized".
+#
+# TWO deliberate exceptions to this suite's conventions, both scoped to
+# these two cases and neither leaking to any other test:
+#   1. `env -u HEIMDALL_FALLBACK_ASSUME_REACHABLE` -- every other test
+#      stubs the probe out via that override, which is exactly what must
+#      NOT happen here: stubbing it would test the stub, not the probe.
+#   2. The header comment says this suite never makes a real network
+#      syscall. These bind an ephemeral LOOPBACK socket. Nothing leaves
+#      the machine, no DNS, no external host -- but it is a real socket,
+#      and testing an HTTP probe without one would be testing nothing.
+PROBE_OUT="$(env -u HEIMDALL_FALLBACK_ASSUME_REACHABLE python3 - "$CLI" <<'PYPROBE'
+import http.server, socket, socketserver, sys, threading
+ns = {"__name__": "fb"}
+exec(compile(open(sys.argv[1], encoding="utf-8").read(), sys.argv[1], "exec"), ns)
+reachable = ns["_endpoint_reachable"]
+
+class H(http.server.BaseHTTPRequestHandler):
+    CODE = 200
+    def do_GET(self):
+        self.send_response(self.CODE)
+        if self.CODE == 307:
+            self.send_header("Location", "http://example.invalid/")
+        self.end_headers()
+    def log_message(self, *a): pass
+
+def serve(code):
+    h = type("H%d" % code, (H,), {"CODE": code})
+    srv = socketserver.TCPServer(("127.0.0.1", 0), h)
+    srv.daemon_threads = True
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv.server_address[1]
+
+for code in (200, 401, 307):
+    print("live%d=%s" % (code, reachable("http://127.0.0.1:%d" % serve(code))))
+
+# wedged: accepts TCP, never writes a byte back
+ls = socket.socket()
+ls.bind(("127.0.0.1", 0))
+ls.listen(5)
+threading.Thread(target=lambda: [ls.accept() for _ in range(9)], daemon=True).start()
+print("wedged=%s" % reachable("http://127.0.0.1:%d" % ls.getsockname()[1]))
+# nothing bound at all
+print("dead=%s" % reachable("http://127.0.0.1:1"))
+PYPROBE
+)"
+printf '%s' "$PROBE_OUT" | grep -q '^live200=True$' \
+  && printf '%s' "$PROBE_OUT" | grep -q '^live401=True$' \
+  && printf '%s' "$PROBE_OUT" | grep -q '^live307=True$' \
+  && ok "85a. liveness probe: a server answering 200/401/307 is reachable (non-2xx still proves liveness)" \
+  || bad "85a. probe output: $PROBE_OUT"
+
+printf '%s' "$PROBE_OUT" | grep -q '^wedged=False$' \
+  && ok "85b. liveness probe: a server that accepts TCP but never answers HTTP is NOT reachable (old TCP-only probe returned True here)" \
+  || bad "85b. probe output: $PROBE_OUT"
+
+printf '%s' "$PROBE_OUT" | grep -q '^dead=False$' \
+  && ok "85c. liveness probe: nothing bound -> not reachable" \
+  || bad "85c. probe output: $PROBE_OUT"
+
+# ── 86. The probe is BOUNDED. A wedged server must not hang the gate. ─────
+BOUND_OUT="$(env -u HEIMDALL_FALLBACK_ASSUME_REACHABLE HEIMDALL_FALLBACK_PROBE_TIMEOUT=1 python3 - "$CLI" <<'PYBOUND'
+import socket, sys, threading, time
+ns = {"__name__": "fb"}
+exec(compile(open(sys.argv[1], encoding="utf-8").read(), sys.argv[1], "exec"), ns)
+ls = socket.socket()
+ls.bind(("127.0.0.1", 0))
+ls.listen(5)
+threading.Thread(target=lambda: [ls.accept() for _ in range(9)], daemon=True).start()
+t = time.time()
+r = ns["_endpoint_reachable"]("http://127.0.0.1:%d" % ls.getsockname()[1])
+print("rc=%s elapsed=%.2f" % (r, time.time() - t))
+PYBOUND
+)"
+BOUND_SECS="$(printf '%s' "$BOUND_OUT" | sed -n 's/.*elapsed=\([0-9.]*\).*/\1/p')"
+printf '%s' "$BOUND_OUT" | grep -q '^rc=False' \
+  && [ -n "$BOUND_SECS" ] \
+  && awk -v s="$BOUND_SECS" 'BEGIN{exit !(s < 5)}' \
+  && ok "86. liveness probe honours HEIMDALL_FALLBACK_PROBE_TIMEOUT: wedged server refused in ${BOUND_SECS}s, not hung" \
+  || bad "86. bound output: $BOUND_OUT"
+
 echo "--------------------------------------------------------------------"
 printf 'heimdall-fallback: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

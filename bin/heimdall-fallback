@@ -351,11 +351,13 @@ import argparse
 import ipaddress
 import json
 import os
-import socket
 import sqlite3
 import subprocess
 import sys
+import http.client
+import urllib.error
 import urllib.parse
+import urllib.request
 
 SCHEMA = 1
 VALID_STATES = ("off", "on", "auto", "switch")
@@ -693,8 +695,49 @@ def _is_local_endpoint(endpoint):
         return False
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Never follow a redirect while probing liveness.
+
+    A 3xx already proves the server is answering HTTP, and following it
+    could bounce the probe onto a slow or off-box URL -- which would turn a
+    bounded local check into an unbounded one."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _probe_timeout():
+    """Seconds to wait for response HEADERS. Deliberately tight.
+
+    This is a routing gate, not a health dashboard: a gateway that cannot
+    answer a loopback request within this budget is not usable as a
+    fallback, so timing out and refusing to route is the CORRECT verdict,
+    not a false alarm."""
+    raw = os.environ.get("HEIMDALL_FALLBACK_PROBE_TIMEOUT") or ""
+    try:
+        val = float(raw)
+    except ValueError:
+        return 3.0
+    return val if val > 0 else 3.0
+
+
 def _endpoint_reachable(endpoint):
-    """Real loopback TCP probe -- stdlib socket only, nothing else.
+    """Real HTTP liveness probe -- stdlib only.
+
+    A TCP connect is NOT sufficient and used to be what this did. A wedged
+    server -- or a webpack dev server still compiling the route -- completes
+    the TCP handshake while never answering a single HTTP request. That is
+    exactly the state that made this check report [OK] while every real
+    call to the gateway timed out. So: send an actual request and require
+    response HEADERS back.
+
+    ANY HTTP status counts as alive. 307/401/404 all prove something is
+    serving HTTP here; this answers "is anything answering", never "is this
+    request authorized" -- so the probe is sent UNAUTHENTICATED, which also
+    means the gateway token is never transmitted by a liveness check.
+
+    Fails CLOSED: timeout, refusal, or malformed reply -> False.
+
     Overridable ONLY for hermetic tests via
     HEIMDALL_FALLBACK_ASSUME_REACHABLE (nothing outside
     test/heimdall-fallback.test.sh sets this in this repo)."""
@@ -703,13 +746,20 @@ def _endpoint_reachable(endpoint):
         return override == "1"
     try:
         parsed = urllib.parse.urlparse(endpoint)
-        host = parsed.hostname
-        port = parsed.port or (443 if parsed.scheme == "https" else 80)
-        if not host:
+        if not parsed.hostname:
             return False
-        with socket.create_connection((host, port), timeout=0.75):
+    except ValueError:
+        return False
+    req = urllib.request.Request(endpoint, method="GET")
+    req.add_header("User-Agent", "heimdall-fallback-liveness/1")
+    opener = urllib.request.build_opener(_NoRedirect)
+    try:
+        with opener.open(req, timeout=_probe_timeout()):
             return True
-    except OSError:
+    except urllib.error.HTTPError:
+        # 4xx/5xx/3xx: the server answered HTTP. That is liveness.
+        return True
+    except (urllib.error.URLError, http.client.HTTPException, OSError):
         return False
 
 
