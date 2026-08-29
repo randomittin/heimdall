@@ -29,7 +29,6 @@ set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$SELF_DIR/.." && pwd)"
-TRACKER="$REPO/bin/edit-tracker"
 VERIFY="$REPO/bin/verify-edits"
 
 PASS=0; FAIL=0
@@ -45,16 +44,32 @@ trap 'rm -rf "$SANDBOX"' EXIT
 SID="ledger-presence-test"
 LEDGER="$SANDBOX/heimdall-edits/$SID.log"
 
+# Isolated "plugin root" so EVERY rebuild — ours below, and verify-edits' own
+# rebuild-if-stale check inside vfy() — lands on a throwaway copy, never on
+# the committed $REPO/bin/edit-tracker. A test must not mutate a tracked file
+# (test/run-all.sh's tree-integrity check); building in place here used to
+# trip it whenever §8 armed the "source newer than binary" path by touching
+# the real edit-tracker.c.
+PLUGIN_SANDBOX="$SANDBOX/plugin"
+mkdir -p "$PLUGIN_SANDBOX/bin"
+cp "$REPO/bin/edit-tracker.c" "$PLUGIN_SANDBOX/bin/edit-tracker.c"
+TRACKER="$PLUGIN_SANDBOX/bin/edit-tracker"
+SRC="$PLUGIN_SANDBOX/bin/edit-tracker.c"
+
 # Build from source so we test the current .c, not a stale artifact.
-if ! clang -O2 -Wall -Wextra -o "$TRACKER" "$REPO/bin/edit-tracker.c" 2>/dev/null; then
+if ! clang -O2 -Wall -Wextra -o "$TRACKER" "$SRC" 2>/dev/null; then
   bad "edit-tracker.c failed to build"
   echo "RESULT: $PASS passed, $FAIL failed"; exit 1
 fi
 ok "edit-tracker.c builds clean (clang -O2 -Wall -Wextra)"
 
-# Run tracker/verify with the sandbox ledger root.
+# Run tracker/verify with the sandbox ledger root AND a sandboxed plugin root:
+# CLAUDE_PLUGIN_ROOT makes verify-edits resolve its OWN copy of edit-tracker
+# from $PLUGIN_SANDBOX (see bin/verify-edits's PLUGIN_DIR), so its internal
+# rebuild-if-stale check also stays inside $SANDBOX instead of touching the
+# repo's tracked binary.
 trk()  { env TMPDIR="$SANDBOX" CLAUDE_CODE_SESSION_ID="$SID" "$TRACKER" "$@"; }
-vfy()  { env TMPDIR="$SANDBOX" CLAUDE_CODE_SESSION_ID="$SID" "$VERIFY" "$@"; }
+vfy()  { env TMPDIR="$SANDBOX" CLAUDE_CODE_SESSION_ID="$SID" CLAUDE_PLUGIN_ROOT="$PLUGIN_SANDBOX" "$VERIFY" "$@"; }
 
 # ── 1. STATE: LEDGER ABSENT ──
 rm -rf "$SANDBOX/heimdall-edits"
@@ -275,8 +290,8 @@ if ! command -v python3 >/dev/null 2>&1; then
   bad "python3 unavailable — cannot verify --json payload purity"
 else
   # Force the rebuild path: make the source newer than the binary.
-  touch "$REPO/bin/edit-tracker.c"
-  [ "$REPO/bin/edit-tracker.c" -nt "$TRACKER" ] \
+  touch "$SRC"
+  [ "$SRC" -nt "$TRACKER" ] \
     && ok "rebuild path armed (edit-tracker.c newer than the binary)" \
     || bad "could not arm the rebuild path — the next assertions prove nothing"
 
@@ -295,7 +310,7 @@ else
                     || bad "rebuild path: expected exit 2, got $jbrc"
 
   # 8b. rebuild path + PRESENT ledger with a real edit: the normal payload too.
-  touch "$REPO/bin/edit-tracker.c"
+  touch "$SRC"
   trk init >/dev/null 2>&1
   trk log Write "$EDITED" >/dev/null 2>&1
   jbuild2="$(vfy --json 2>/dev/null)"; jb2rc=$?
@@ -315,7 +330,7 @@ else
   # 8d. the chatter is not merely deleted — it still reaches STDERR, so a human
   #     rebuilding the tracker is still told. Silencing it would trade one bug
   #     for a quieter one.
-  touch "$REPO/bin/edit-tracker.c"
+  touch "$SRC"
   errout="$(vfy --json 2>&1 >/dev/null)"
   case "$errout" in
     *"Building"*) ok "rebuild path: build chatter still reported on STDERR" ;;
