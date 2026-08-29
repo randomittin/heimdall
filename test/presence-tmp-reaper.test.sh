@@ -81,6 +81,23 @@ _set_mtime_ago() {
   touch -t "$ts" "$file"
 }
 
+# _make_scratch_bin NAME SED_EXPR — build a mutated scratch copy of heimdall-presence
+# inside a bin/-shaped directory, with bin/lib symlinked to the REAL lib dir, never as
+# a bare loose file. heimdall-presence resolves its sibling lib dir relative to its OWN
+# path (SELF_DIR -> $REPO/bin/lib, the only $REPO use in the whole script); a bare-file
+# copy breaks that resolution, which trips the unrelated offline-degrade guard
+# (`[ -f "$LIB/cp_auth.py" ] || ... emit_empty_roster`) before the mutation under test
+# ever runs — masking the real result and silently invalidating the red-proof. Echoes
+# the scratch binary's path.
+_make_scratch_bin() {
+  local name="$1" sed_expr="$2" dir="$WORK/scratch-$name"
+  mkdir -p "$dir/bin"
+  ln -s "$REPO/bin/lib" "$dir/bin/lib"
+  sed "$sed_expr" "$BIN" > "$dir/bin/heimdall-presence"
+  chmod +x "$dir/bin/heimdall-presence"
+  echo "$dir/bin/heimdall-presence"
+}
+
 # run_roster STATE_DIR [OUTFILE] [BIN_PATH] — invoke the real `roster`
 # subcommand (whose first act, on this code path, is the reaper) against a
 # fully sandboxed HOME + per-repo state dir. Exit code is intentionally
@@ -162,9 +179,7 @@ fi
 
 echo
 echo "── 6. RED-PROOF: disabling the reaper flips proof 1 to FAILING ──"
-DISABLED_BIN="$WORK/heimdall-presence.disabled"
-sed 's/^_reap_roster_cache_tmps() {$/_reap_roster_cache_tmps() { return 0; #DISABLED-FOR-TEST/' "$BIN" > "$DISABLED_BIN"
-chmod +x "$DISABLED_BIN"
+DISABLED_BIN="$(_make_scratch_bin disabled 's/^_reap_roster_cache_tmps() {$/_reap_roster_cache_tmps() { return 0; #DISABLED-FOR-TEST/')"
 if grep -q 'DISABLED-FOR-TEST' "$DISABLED_BIN"; then
   ok "mutation applied: reaper neutered in the scratch copy"
 else
@@ -182,9 +197,7 @@ fi
 
 echo
 echo "── 7. RED-PROOF: widening the age floor to 0 flips proof 2 to FAILING ──"
-AGE0_BIN="$WORK/heimdall-presence.age0"
-sed 's/^_ROSTER_TMP_ORPHAN_AGE_S=120.*/_ROSTER_TMP_ORPHAN_AGE_S=0/' "$BIN" > "$AGE0_BIN"
-chmod +x "$AGE0_BIN"
+AGE0_BIN="$(_make_scratch_bin age0 's/^_ROSTER_TMP_ORPHAN_AGE_S=120.*/_ROSTER_TMP_ORPHAN_AGE_S=0/')"
 if grep -q '^_ROSTER_TMP_ORPHAN_AGE_S=0$' "$AGE0_BIN"; then
   ok "mutation applied: age floor widened to 0 in the scratch copy"
 else
