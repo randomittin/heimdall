@@ -896,8 +896,10 @@ def _session_pre_exhaustion_verdict(repo):
     call this function at all (see cmd_check).
 
     Returns a (verdict, window) TUPLE. `window` (2026-08-29, heimdall-
-    session-usage PHASE 3) names WHICH observation crossed -- "five_hour" /
-    "seven_day" / "both" -- or None. It is METADATA ONLY: _verdict()'s
+    session-usage PHASE 3; extended 2026-08-30 PHASE 4) names WHICH
+    observation(s) crossed -- "five_hour" / "seven_day" / "both" /
+    "reactive_429" / "five_hour+reactive_429" / "seven_day+reactive_429" /
+    "all" -- or None. It is METADATA ONLY: _verdict()'s
     ROUTE/WAIT/REFUSE decision reacts to `verdict` alone, exactly as before;
     `window` is surfaced only in cmd_check's [INFO] line so an operator can
     see which limit actually crossed. A missing/unrecognized "window" (a
