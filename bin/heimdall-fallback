@@ -101,8 +101,8 @@ boundary from a different angle):
      this tool goes further still: it has no print-the-secret override at
      all, because it never has a reason to print one.
   6. `off` is the default for a fresh install AND for any absent or corrupt
-     config. A corrupt config must never be silently read as `on` -- see
-     load_config()'s fail-closed parse.
+     config. A corrupt config must never be silently read as anything but
+     `off` -- see load_config()'s fail-closed parse.
   7. NEVER treat OmniRoute's `blockedProviders` setting as evidence of
      anything. Its own UI copy is "Hide specific providers from the
      /v1/models response" -- it is consulted only in model-listing/search
@@ -111,29 +111,26 @@ boundary from a different angle):
      silently by load_config()'s allowlist copy; cmd_check additionally
      warns on stderr if it finds one, so that silence is never mistaken for
      the field having done something.
-  8. FOUR STATES, one safety boundary. `off` (default, never route), `on` (a
-     CAPABILITY-TIER routing decision -- route only LOW-LEVEL work, never an
-     exhaustion reaction), `auto` (the ORIGINAL exhaustion/pre-exhaustion
-     reaction -- route only when preflight passes, else WAIT rather than
-     block), and `switch` (route EVERYTHING, tier-blind, still gated by the
-     same preflight as every other state). None of the four ever changes
-     WHETHER routing is safe -- points 1-7 above apply identically in all
-     four; `switch` changes WHAT routes, never whether a failing
-     Tier-1/model-pin/sidecar/ToS check is survivable. "Low-level" reuses
-     this repo's OWN existing task-tier vocabulary rather than inventing a
-     second one -- see agents/heimdall.md's Model Routing table (haiku:
-     "lint, format, rename, simple config") and CLAUDE.md's "Model routing
-     (2026-08-11 directive)" (opus reserved for adjudication:
-     reviewer/verifier/security-auditor; sonnet is the default coding tier).
-     `on` maps to the haiku tier ONLY -- sonnet (default coding) and the
-     adjudication roles (always opus; capability is load-bearing there) NEVER
-     route under `on`, regardless of how the caller spells the tier. `check
-     --tier T` (T in haiku|sonnet|opus|reviewer|verifier|security-auditor,
-     the last three being direct adjudication-role aliases for opus) asks
-     this per-task question; bare `check` (no --tier) asks the ORIGINAL,
-     tier-blind question and is completely unaffected by this whole
-     paragraph -- see bin/lib/issue_loop.py, the one existing caller, which
-     is preserved byte-for-byte (it never passes --tier).
+  8. THREE STATES, one safety boundary. `off` (default, never route), `auto`
+     (the exhaustion/pre-exhaustion reaction -- route only when preflight
+     passes AND heimdall-session-usage confirms the ~95% threshold is
+     crossed, else WAIT rather than block -- see point 11), and `switch`
+     (route EVERYTHING, tier-blind, still gated by the same preflight as
+     every other state). None of the three ever changes WHETHER routing is
+     safe -- points 1-7 above apply identically in all three; `switch`
+     changes WHAT routes, never whether a failing Tier-1/model-pin/sidecar/
+     ToS check is survivable.
+
+     REMOVED (owner directive, 2026-08-28): a fourth state, `on`, used to
+     exist as a CAPABILITY-TIER routing decision -- haiku-tier work only, via
+     `check --tier T` -- entirely independent of exhaustion. That was a
+     genuine, distinct capability, not a switch/auto near-duplicate: no
+     surviving state offers a tier-restricted routing option, so this
+     capability is gone, not renamed. `set on` / `arm --state on` are now
+     REJECTED outright (argparse choices), naming the three valid states. A
+     persisted `state: "on"` from before this change migrates to `off` on
+     load -- never `auto` -- since `auto` is tier-blind and could grant MORE
+     routing than `on`'s haiku-tier-only gate ever did (see load_config()).
   9. `switch` MUST be unmistakable. It is the only state that risks
      quality-sensitive work landing on a provider with no no-train guarantee
      (docs/analysis/2026-08-25-headroom-inpath-measurement.md's 337x
@@ -210,7 +207,7 @@ boundary from a different angle):
       heimdall-session-usage collapses to "unknown" and changes nothing else
       about the OTHER checks -- see _session_pre_exhaustion_verdict().
 
-  12. `arm` (heimdall-fallback arm [--provider P] [--state auto|on|switch])
+  12. `arm` (heimdall-fallback arm [--provider P] [--state auto|switch])
       exists so "turn fallback on" does not mean "hand the operator a
       hand-edited JSON file and a checklist" -- see cmd_arm. It
       self-provisions everything it can HONESTLY justify: a target_provider
@@ -246,19 +243,19 @@ FAIL OPEN". The advisor's job is to never cry wolf: an uncertain exhaustion
 signal must stay silent (exit quietly, print nothing). This tool's job is
 the opposite: an uncertain SAFETY signal must never say "safe to route". Any
 internal error, missing field, or unparsable config resolves to the LEAST
-permissive verdict available for the current state (REFUSE under off/on,
+permissive verdict available for the current state (REFUSE under off/switch,
 WAIT under auto) -- never to ROUTE. Two inverse philosophies for two
 different problems, not a contradiction: one gates a print statement, the
 other gates unattended, keyed network egress.
 
 NO AUTO-SWITCH CONTRADICTION. heimdall-quota-advisor documents that it
 "never auto-switches ANY provider for the operator. Ever." This tool's
-`on`/`auto` states do not contradict that: (a) `off` is the default
+`auto`/`switch` states do not contradict that: (a) `off` is the default
 everywhere, so a fresh install has zero auto-switch behavior anywhere in
-this repo; (b) `on`/`auto` are reachable ONLY via an explicit
-`heimdall-fallback set on|auto` the operator runs themselves -- hmd never
-flips this on its own; (c) this tool does not even perform a switch -- it
-only computes whether a future transport layer would be ALLOWED to.
+this repo; (b) `auto`/`switch` are reachable ONLY via an explicit
+`heimdall-fallback set auto|switch` the operator runs themselves -- hmd
+never flips this on its own; (c) this tool does not even perform a switch --
+it only computes whether a future transport layer would be ALLOWED to.
 
 EXHAUSTION vs. OVERLOAD -- NOT THE SAME THING, NOT HANDLED HERE. A transient
 529 / overloaded_error / 429 is a RETRYABLE condition with its own mechanism
