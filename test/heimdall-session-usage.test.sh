@@ -60,6 +60,16 @@ unset CLAUDE_CODE_SESSION_ID HEIMDALL_SESSION_TOKEN_BUDGET HEIMDALL_SESSION_USAG
 # statusline render elsewhere on this machine) leak into cases 1-15, which never pass
 # --rate-limit-file and must all stay on the pre-Phase-2 budget path exactly as before.
 export HEIMDALL_RATE_LIMIT_STATE="$WORK/unused-rate-limits.json"
+# PHASE 4 (2026-08-30): same hermeticity guard for the reactive-429 marker --
+# a real ~/.heimdall/429-marker.json written by actual bin/lib/hmd-claude-
+# retry.sh usage on this machine must never leak into cases 1-28, none of
+# which pass --reactive-429-file and must all stay completely unaffected by
+# PHASE 4. Both HEIMDALL_429_MARKER_FILE (the direct override
+# bin/heimdall-session-usage reads) and HEIMDALL_HOME (its fallback default's
+# own base) are neutralized to nonexistent paths under $WORK -- belt and
+# suspenders, matching HEIMDALL_RATE_LIMIT_STATE just above.
+export HEIMDALL_429_MARKER_FILE="$WORK/unused-429-marker.json"
+export HEIMDALL_HOME="$WORK/unused-heimdall-home"
 
 now_ts() {
   python3 -c "from datetime import datetime, timezone; print(datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000Z'))"
@@ -93,6 +103,29 @@ case_dir() {
   d="$WORK/$1"
   mkdir -p "$d"
   printf '%s' "$d"
+}
+
+# epoch_offset <seconds ago (negative = in the future)> -> unix epoch float,
+# for hand-building a bin/heimdall-429-mark-shaped marker file with exact
+# control over freshness/staleness -- PHASE 4 cases below.
+epoch_offset() {
+  python3 -c "import time, sys; print(time.time() - float(sys.argv[1]))" "$1"
+}
+
+# write_marker <path> <marked_at epoch float> [reason] -> hand-builds a
+# bin/heimdall-429-mark-shaped marker JSON file directly, independent of that
+# tool's own writer, so a bug in ONE never masks or spuriously fails the
+# OTHER's tests. See test/heimdall-429-mark.test.sh for the recorder's own
+# dedicated coverage.
+write_marker() {
+  python3 -c "
+import json, sys
+path, marked_at = sys.argv[1], float(sys.argv[2])
+payload = {'marked_at': marked_at}
+if len(sys.argv) > 3 and sys.argv[3]:
+    payload['reason'] = sys.argv[3]
+json.dump(payload, open(path, 'w'))
+" "$1" "$2" "${3:-}"
 }
 
 echo "=== 1. below threshold -> under ==="
