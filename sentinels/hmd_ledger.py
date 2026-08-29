@@ -473,15 +473,19 @@ def _read_source(repo=None):
 
 
 # ── public entry ───────────────────────────────────────────────────────────
-def read_status(session_id):
+def read_status(session_id, repo=None):
     """Return the normalized ledger dict for the statusline, served through the per-session
-    5s cache. On a cache HIT (< 5s) the cached dict is returned without touching the source
-    status.json; on a MISS the source (or legacy) is read, normalized, cached, and returned.
-    Never raises — degrades to SAFE_DEFAULT on any fault."""
+    5s cache. `repo` is the tree being rendered — hmd-statusline.py passes its stdin `cwd`
+    through — and defaults to os.getcwd() so every pre-existing single-argument call site
+    (this module's own CLI below, direct test invocations) keeps resolving a sensible tree
+    without being forced onto the new argument. On a cache HIT (< 5s) the cached dict is
+    returned without touching either source file; on a MISS the per-repo mirror (falling
+    back to the legacy global mirror, then the oldest single-verdict file) is read,
+    normalized, cached, and returned. Never raises — degrades to SAFE_DEFAULT on any fault."""
     cached = _cache_get(session_id)
     if cached is not None:
         return cached
-    data = _read_source()
+    data = _read_source(repo if repo is not None else os.getcwd())
     _cache_put(session_id, data)
     return data
 
