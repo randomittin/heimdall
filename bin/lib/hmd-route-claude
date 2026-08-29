@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# hmd-route-claude — per-spawn fallback-gate seam for the headless dispatcher's
+# claude-code backend (see bin/lib/hmd-claude-retry.sh's HMD_CLAUDE_BIN override).
+#
+# WHY THIS EXISTS. An in-process agent can never be re-routed mid-session — there is
+# no syscall that mutates a running process's environment. But every headless spawn in
+# this repo starts a brand-new process, and a new process can re-read the routing gate
+# fresh, every time. This file is that fresh read: point HMD_CLAUDE_BIN at it and every
+# headless spawner (session-fork, the drain loop, the issue-fix loop, decompose,
+# benchmark, heimdall-tokens, ...) gets gated per-spawn, for free, with no per-caller
+# change. See docs/superpowers/plans/2026-08-29-agent-fallback-coverage.md, Wave 1
+# Task 1.2, option (c).
+#
+# CONTRACT (non-negotiable):
+#   - Judgment never travels the routed branch. If this spawn is marked judgment —
+#     HMD_JUDGMENT is truthy, or HMD_AGENT_TYPE names an adjudication role — this file
+#     pins the real Anthropic endpoint ITSELF and launches the real binary directly. It
+#     does not trust an outer scrub to have already happened.
+#   - Generation (the default) asks the routing binary fresh, this spawn only. No
+#     verdict is ever cached across invocations of this file.
+#   - A REFUSE/WAIT verdict, or a missing routing binary, leaves the launch BYTE-
+#     IDENTICAL to the unrouted call this shim replaces — this file only ever adds a
+#     hop, it never degrades one.
+#   - Any plumbing failure here fails OPEN onto the real claude binary — a broken shim
+#     must never block a spawn.
+set -uo pipefail
+
+HRC_SELF="$0"
+if command -v readlink >/dev/null 2>&1; then
+  HRC_SELF="$(readlink -f "$0" 2>/dev/null || readlink "$0" 2>/dev/null || echo "$0")"
+fi
+HRC_LIB_DIR="$(cd "$(dirname "$HRC_SELF")" && pwd)"
+HRC_PLUGIN_DIR="$(cd "$HRC_LIB_DIR/../.." && pwd)"
+
+# Resolved the same way the routing binary resolves its own target: `command -v` from
+# this non-interactive shell never sees a user's `.zshrc` shell function (e.g.
+# `claude() { hmd route claude "$@"; }`), only a real PATH entry — so this can never
+# recurse back into the chain it is itself a link of.
+_hrc_real_claude() {
+  command -v claude 2>/dev/null || true
+}
+
+# _hrc_is_judgment — true when this spawn must never be routed or compressed.
+_hrc_is_judgment() {
+  case "${HMD_JUDGMENT:-}" in
+    ""|0|false) : ;;
+    *) return 0 ;;
+  esac
+  # bin/lib/hmd-adjudication-set.sh (Wave 1 Task 1.1, a sibling seam) defines
+  # hmd_is_adjudication(). Sourced defensively: absent or broken, this check simply
+  # contributes nothing and the HMD_JUDGMENT check above remains fully independent.
+  if . "$HRC_LIB_DIR/hmd-adjudication-set.sh" 2>/dev/null; then
+    if command -v hmd_is_adjudication >/dev/null 2>&1; then
+      hmd_is_adjudication "${HMD_AGENT_TYPE:-}" && return 0
+    fi
+  fi
+  return 1
+}
+
+# _hrc_route_bin — resolve the routing binary, repo-relative first, then PATH. Prints
+# the path and returns 0, or prints nothing and returns 1 (fail-open case).
+_hrc_route_bin() {
+  local candidate="$HRC_PLUGIN_DIR/bin/heimdall-route"
+  if [ -x "$candidate" ]; then
+    printf '%s\n' "$candidate"
+    return 0
+  fi
+  candidate="$(command -v heimdall-route 2>/dev/null || true)"
+  if [ -n "$candidate" ]; then
+    printf '%s\n' "$candidate"
+    return 0
+  fi
+  return 1
+}
+
+# --print-endpoint — introspection only, never launches anything. Mirrors the existing
+# `heimdall-route --url` pattern: prints the endpoint this invocation would pin or
+# route to, hermetically, with no real launch and no real binary required.
+if [ "${1:-}" = "--print-endpoint" ]; then
+  if _hrc_is_judgment; then
+    if . "$HRC_LIB_DIR/hmd-gate-endpoint.sh" 2>/dev/null; then
+      printf '%s\n' "$HMD_PROVIDER_BASE_URL"
+      exit 0
+    fi
+    echo "hmd-route-claude: gate-endpoint library unreadable" >&2
+    exit 1
+  fi
+  if HRC_ROUTE_BIN="$(_hrc_route_bin)"; then
+    exec "$HRC_ROUTE_BIN" --url
+  fi
+  exit 1
+fi
+
+REAL_CLAUDE="$(_hrc_real_claude)"
+if [ -z "$REAL_CLAUDE" ]; then
+  echo "hmd-route-claude: no 'claude' binary on PATH" >&2
+  exit 127
+fi
+
+if _hrc_is_judgment; then
+  if . "$HRC_LIB_DIR/hmd-gate-endpoint.sh" 2>/dev/null; then
+    # Apply hmd_gate_exec's own pin ourselves, via a real, direct `exec` (never routed
+    # through `env`, so no wrapper process is left supervising the real one). Same
+    # scrub list and same hardcoded provider constant, both sourced from that file and
+    # never re-declared here — this cannot silently drift from the one true list.
+    for _hrc_var in $_HMD_GATE_ROUTING_VARS; do
+      unset "$_hrc_var"
+    done
+    export ANTHROPIC_BASE_URL="$HMD_PROVIDER_BASE_URL"
+    exec "$REAL_CLAUDE" "$@"
+  fi
+  # Fail open: judgment library unreadable — launch unrouted rather than block a spawn.
+  exec "$REAL_CLAUDE" "$@"
+fi
+
+# Generation (default path): consult the routing binary fresh, this spawn only.
+if HRC_ROUTE_BIN="$(_hrc_route_bin)"; then
+  exec "$HRC_ROUTE_BIN" claude "$@"
+fi
+
+# No routing binary resolvable — fail open onto the unrouted real binary, exactly the
+# call this shim replaces.
+exec "$REAL_CLAUDE" "$@"
