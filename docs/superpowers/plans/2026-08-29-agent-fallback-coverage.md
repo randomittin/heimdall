@@ -3,7 +3,9 @@
 **Date:** 2026-08-29
 **Owner directive, verbatim:** *"you need to ensure fallback covers agents as well and also supports multiple agents mode -- if not there then build it"*
 **Status:** DESIGN ONLY. No implementation in this document. No push.
-**Sibling measurement doc:** `docs/analysis/2026-08-29-agent-fallback-seams.md` — **DID NOT EXIST when this plan was written.** Every claim below is tagged MEASURED (I ran it in this session), READ (I read the source), or UNVERIFIED. **Every UNVERIFIED claim must be re-checked against the sibling's measurements before Wave 1 starts.** UNVERIFIED claims are collected in one place in §0.4 so the re-check is a checklist, not a re-read.
+**Plan verification:** the fresh-context reviewer pass (`hmd:reviewer` grading plan-vs-spec) was **NOT run** — the authoring agent had no `Agent` tool in its toolset, so it could not spawn one. **This plan has not been independently reviewed and must be before Wave 1 dispatch.** Self-check performed instead: every file path and test-suite name cited in an acceptance criterion was existence-checked; one bad citation was found and corrected (`test/hmd-statusline.test.sh` does not exist — Task 2.3 now cites `test/heimdall-statusline-{gauge,perf-budget,width}.test.sh`).
+
+**Sibling measurement doc:** `docs/analysis/2026-08-29-agent-fallback-seams.md` — **DID NOT EXIST when this plan was written** (checked twice, at the start and at the end of authoring). Every claim below is tagged MEASURED (I ran it in this session), READ (I read the source), or UNVERIFIED. **Every UNVERIFIED claim must be re-checked against the sibling's measurements before Wave 1 starts.** UNVERIFIED claims are collected in one place in §0.4 so the re-check is a checklist, not a re-read.
 
 ---
 
@@ -304,8 +306,9 @@ Task 1.1 must not ship without 1.2 (a deny with no alternative path is a dead en
   - [ ] `bash -c 'printf "{\"five_hour\":{\"used_percentage\":10.0,\"resets_at\":9999999999},\"seven_day\":{\"used_percentage\":10.0,\"resets_at\":1},\"observed_at\":1}" > /tmp/rl.json; bin/heimdall-session-usage check --rate-limit-file /tmp/rl.json --json | grep -q "\"verdict\": \"under\""'` — a stale `seven_day` never fabricates a crossing
   - [ ] `bash test/heimdall-session-usage.test.sh` exits 0 (existing suite, unmodified — a regression guard)
   - [ ] `bash test/heimdall-fallback.test.sh` exits 0 (existing suite, unmodified)
+  - [ ] `bash test/heimdall-statusline-rate-limit-persist.test.sh` exits 0 (existing suite, unmodified — guards the producer of the `seven_day` field this task starts consuming)
   - [ ] `bash -c 'grep -q "verdict == \"crossed\"\|== CROSSED" bin/heimdall-fallback'` — the exact-match allow-list survives
-- **Verify:** `bash test/heimdall-session-usage.test.sh && bash test/heimdall-fallback.test.sh && bash test/session-usage-seven-day.test.sh`
+- **Verify:** `bash test/heimdall-session-usage.test.sh && bash test/heimdall-fallback.test.sh && bash test/heimdall-statusline-rate-limit-persist.test.sh && bash test/session-usage-seven-day.test.sh`
 - **Done when:** a weekly exhaustion with a fresh five-hour window produces `crossed:seven_day` and the gate routes, and no stale reading ever produces `crossed`.
 - **Risks & Mitigation:** A widened verdict vocabulary silently widens routing → the allow-list stays an exact `== "crossed"` string match (asserted by criterion 6); `window` is metadata for the operator message, never a routing input. `seven_day` with no `resets_at` trusted forever → bounded `observed_at + 18000s` TTL, asserted by criterion 3.
 
@@ -345,8 +348,10 @@ Task 1.1 must not ship without 1.2 (a deny with no alternative path is a dead en
   - [ ] `bash -c 'grep -q "def fallback_route_seg" sentinels/hmd-statusline.py'`
   - [ ] `bash -c 'ANTHROPIC_BASE_URL=http://127.0.0.1:20128 python3 sentinels/hmd-statusline.py </dev/null 2>/dev/null | grep -qi "free"'`
   - [ ] `bash -c 'ANTHROPIC_BASE_URL= python3 sentinels/hmd-statusline.py </dev/null 2>/dev/null; exit 0'` — never crashes when unrouted
-  - [ ] `bash test/hmd-statusline.test.sh` exits 0 (existing suite, regression guard)
-- **Verify:** `bash test/hmd-statusline.test.sh && bash -c 'ANTHROPIC_BASE_URL=http://127.0.0.1:20128 python3 sentinels/hmd-statusline.py </dev/null 2>/dev/null | grep -qi free'`
+  - [ ] `bash test/heimdall-statusline-gauge.test.sh` exits 0 (existing suite, unmodified — guards the rate-limit gauge row this segment sits beside)
+  - [ ] `bash test/heimdall-statusline-perf-budget.test.sh` exits 0 (existing suite, unmodified — guards the per-render cost risk in this task's risk row)
+  - [ ] `bash test/heimdall-statusline-width.test.sh` exits 0 (existing suite, unmodified — guards the "segment crowds the line out" risk)
+- **Verify:** `bash test/heimdall-statusline-gauge.test.sh && bash test/heimdall-statusline-perf-budget.test.sh && bash test/heimdall-statusline-width.test.sh && bash -c 'ANTHROPIC_BASE_URL=http://127.0.0.1:20128 python3 sentinels/hmd-statusline.py </dev/null 2>/dev/null | grep -qi free'`
 - **Done when:** a routed session shows the free-tier indicator on every statusline render, and an unrouted one shows nothing new.
 - **Risks & Mitigation:** Statusline renders on every turn; a slow check costs every turn → the check is a string comparison against an env var already in the process, with no subprocess and no file read. Segment crowds the line out → it renders only when routed, which is the rare state.
 
