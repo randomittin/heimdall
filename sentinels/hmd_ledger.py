@@ -7,7 +7,11 @@ bin/heimdall-status-json / an extended hmd-gate-event.sh). Its single public ent
 is `read_status(session_id)`, which returns a NORMALIZED dict the statusline renders
 directly, served through a per-session 5-second file cache.
 
-SOURCE (spec §6):  ${HEIMDALL_HOME:-~/.heimdall}/ledger/status.json
+SOURCE (spec §6; per-repo since the mirror-race fix — docs/analysis/2026-08-29-statusline-
+roster-inflation.md):
+    ${HEIMDALL_HOME:-~/.heimdall}/ledger/repos/<repo_key>.json   preferred: one file PER repo
+    ${HEIMDALL_HOME:-~/.heimdall}/ledger/status.json             legacy: machine-global, kept
+                                                                  as a migration fallback only
     {
       "daemon": <bool|str>,                         # liveness (informational)
       "gates":  [{"id","state","detail"}, ...],     # the check/circle/cross render feed
@@ -15,12 +19,19 @@ SOURCE (spec §6):  ${HEIMDALL_HOME:-~/.heimdall}/ledger/status.json
       "team":   [{"user","sigil","branch","state","ts"}, ...],  # presence mirror
       "repo":   "<abs repo root>"                   # WHICH repo team[] is the roster OF
     }
+<repo_key> comes from repo_key() below (SHA256[:16] of the realpath'd git root). The writer
+(bin/heimdall-status-json) imports this exact function so the two sides can never compute
+different paths for the same tree — see repo_key()'s docstring for why a hash was chosen
+over a sanitized path string.
 
-SCOPE (why `repo` exists). This source is ONE machine-global file, but `team` is only ever
-the roster of ONE project — whichever repo's keeper wrote it last. Two live sessions in two
-repos fight over the single slot, so a reader in repo A can be handed repo B's roster. This
-module CARRIES the stamp and never interprets it; the renderer compares it against the tree
-it is painting. An absent stamp means UNKNOWN scope, never "all repos".
+SCOPE (why `repo` is STILL carried, even though the mirror is per-repo now). The legacy
+global path above is a REAL fallback tier — an install whose writer has not beaten once
+since this fix landed, or an explicit HMD_STATUS_OUT/--out override — so a foreign repo's
+roster can still transiently reach a reader through it, same as before this fix. `team` is
+only ever the roster of ONE project regardless of which tier answered. This module CARRIES
+the stamp and never interprets it; the renderer compares it against the tree it is painting.
+An absent stamp means UNKNOWN scope, never "all repos" — `_ledger_in_scope` in
+hmd-statusline.py stays as defense-in-depth for exactly this tier.
 
 NORMALIZED RETURN SHAPE (what read_status hands the statusline):
     {
@@ -60,6 +71,7 @@ are atomic (tmp + os.replace) and never raise.
 stdlib only.
 """
 
+import hashlib
 import json
 import os
 import re
@@ -111,6 +123,58 @@ def _legacy_path():
     """The old single-verdict source (back-compat). Honors HEIMDALL_STATE exactly like
     hmd-statusline.py's gate_state(), else <cwd>/.heimdall/statusline.json."""
     return os.environ.get("HEIMDALL_STATE") or os.path.join(os.getcwd(), ".heimdall", "statusline.json")
+
+
+def _git_root(path):
+    """Walk up from `path` looking for a `.git` marker (a dir, for a normal checkout, or a
+    `gitdir:` FILE, for a linked worktree) and stop at the directory that has one — mirrors
+    hmd-statusline.py's _git_branch() walk (minus the HEAD parse) so the per-repo key below
+    never forks `git` on the statusline's hot path. realpath'd first so a symlinked cwd and
+    its resolved twin always hash to the SAME key — the same realpath-before-compare
+    convention _ledger_in_scope() already uses in hmd-statusline.py. No `.git` found within
+    64 levels (or any error resolving `path`) -> the realpath'd (or abspath'd) starting dir
+    itself, so callers always get a stable, hashable anchor rather than None."""
+    try:
+        d = os.path.realpath(path or ".")
+    except Exception:
+        d = os.path.abspath(path or ".")
+    start = d
+    for _ in range(64):
+        gitpath = os.path.join(d, ".git")
+        if os.path.isdir(gitpath) or os.path.isfile(gitpath):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    return start
+
+
+def repo_key(repo):
+    """THE single place the per-repo mirror key is derived. Imported by BOTH sides — this
+    reader and bin/heimdall-status-json's writer heredoc (via the same sys.path.insert onto
+    this sentinels/ dir it already uses for hmd_sigil) — so the two can never independently
+    drift onto different keys for the same tree.
+
+    SHA256 of the realpath'd git root, truncated to 16 hex chars (64 bits), NOT a sanitized
+    path string: a lossy substitution like `/` -> `-` collides two genuinely different repos
+    (`/a/b-c` and `/a/b/c` both become `-a-b-c`), and an unbounded path risks a filesystem
+    filename-length limit on a deeply nested checkout. 64 bits of a cryptographic digest
+    makes an accidental collision across every repo ever hashed on one machine astronomically
+    unlikely, and human-readability is not needed here — the mirror file's own `repo` field
+    already carries the readable path for anyone inspecting it by hand."""
+    root = _git_root(repo or os.getcwd())
+    return hashlib.sha256(root.encode("utf-8", "surrogateescape")).hexdigest()[:16]
+
+
+def status_path_for(repo):
+    """Per-repo mirror path: ${HEIMDALL_HOME:-~/.heimdall}/ledger/repos/<repo_key>.json.
+    Structurally replaces the single machine-global slot every repo's presence keeper used
+    to fight over (docs/analysis/2026-08-29-statusline-roster-inflation.md) with one file
+    PER repo, so that race is impossible by construction rather than merely detected after
+    the fact by _ledger_in_scope's scope check (which stays, as defense-in-depth — see the
+    module docstring's SCOPE section)."""
+    return os.path.join(_home(), "ledger", "repos", repo_key(repo) + ".json")
 
 
 def _cache_dir():
@@ -370,35 +434,41 @@ def _cache_put(session_id, data):
 
 
 # ── the source read (uncached) ────────────────────────────────────────────
-def _read_source():
-    """Read + normalize the ledger source. status.json present & parseable → normalize it;
-    present but malformed/non-dict → SAFE_DEFAULT (corrupt live source); absent → the legacy
-    fallback, else SAFE_DEFAULT. Never raises."""
-    sp = _status_path()
-    if os.path.exists(sp):
-        try:
+def _read_source(repo=None):
+    """Read + normalize the ledger source. Tries the PER-REPO mirror first (structurally
+    race-free — see repo_key()/status_path_for()), then the legacy machine-global mirror
+    (an install whose writer has not beaten since this fix landed, or an explicit
+    HMD_STATUS_OUT/--out override), stopping at the FIRST of the two that exists. status.json
+    present & parseable → normalize it; present but malformed/non-dict → SAFE_DEFAULT (a
+    corrupt LIVE source — deliberately does NOT fall through to the next tier, so a corrupt
+    per-repo mirror can never silently paint a different repo's stale global roster); every
+    tier absent → the legacy single-verdict fallback, else SAFE_DEFAULT. Never raises."""
+    for sp in (status_path_for(repo), _status_path()):
+      if not os.path.exists(sp):
+          continue
+      try:
             with open(sp) as f:
                 d = json.load(f)
-        except Exception:
-            return dict(SAFE_DEFAULT)         # malformed live source → safe default
-        if not isinstance(d, dict):
-            return dict(SAFE_DEFAULT)
-        gates_raw = d.get("gates")
-        gates = [normalize_gate(g) for g in gates_raw] if isinstance(gates_raw, list) else []
-        members, overflow = filter_team(d.get("team"))
-        return {
-            "daemon": _norm_daemon(d.get("daemon")),
-            "gates": gates,
-            "verdict": _norm_verdict(d.get("verdict")),
-            "team": members,
-            "team_overflow": overflow,
-            # WHICH repo team[] is the roster of. Carried, never interpreted here: this reader
-            # has no idea which tree is being rendered. The renderer compares it against the
-            # tree it is painting and drops the mirror when they differ. Absent/unusable → ""
-            # (UNKNOWN), which the renderer fails CLOSED on.
-            "repo": str(d.get("repo") or ""),
-        }
-    legacy = _map_legacy()                    # new file absent → try the legacy single-verdict
+      except Exception:
+          return dict(SAFE_DEFAULT)         # malformed live source → safe default
+      if not isinstance(d, dict):
+          return dict(SAFE_DEFAULT)
+      gates_raw = d.get("gates")
+      gates = [normalize_gate(g) for g in gates_raw] if isinstance(gates_raw, list) else []
+      members, overflow = filter_team(d.get("team"))
+      return {
+          "daemon": _norm_daemon(d.get("daemon")),
+          "gates": gates,
+          "verdict": _norm_verdict(d.get("verdict")),
+          "team": members,
+          "team_overflow": overflow,
+          # WHICH repo team[] is the roster of. Carried, never interpreted here: this reader
+          # has no idea which tree is being rendered. The renderer compares it against the
+          # tree it is painting and drops the mirror when they differ. Absent/unusable → ""
+          # (UNKNOWN), which the renderer fails CLOSED on.
+          "repo": str(d.get("repo") or ""),
+      }
+    legacy = _map_legacy()          # both mirror tiers absent → try the legacy single-verdict
     return legacy if legacy is not None else dict(SAFE_DEFAULT)
 
 
