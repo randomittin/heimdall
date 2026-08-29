@@ -180,6 +180,12 @@ case "$BACKEND" in
   claude-code)
     # shellcheck source=lib/hmd-claude-retry.sh
     . "$PLUGIN_DIR/bin/lib/hmd-claude-retry.sh"
+    # Per-spawn fallback-gate seam (Wave 1 Task 1.2): default HMD_CLAUDE_BIN to the
+    # routing shim so every claude-code spawn re-consults the gate fresh, per process.
+    # `: "${VAR:=...}"` only assigns when unset/empty, so a caller-set HMD_CLAUDE_BIN —
+    # the pre-existing test seam (test/hmd-exec.test.sh) — is never overridden.
+    : "${HMD_CLAUDE_BIN:="$PLUGIN_DIR/bin/lib/hmd-route-claude"}"
+    export HMD_CLAUDE_BIN
     # `|| rc=$?` (never a bare call) is load-bearing, not style: hmd_claude_retry's own
     # retry loop does an UNPROTECTED `out="$(...)"; rc=$?` internally. Under this script's
     # `set -e`, calling the function bare lets the first overloaded attempt's non-zero
