@@ -271,6 +271,51 @@ _bump_activity_stamp() {
 }
 # epoch-seconds mtime of $1 (macOS `stat -f %m` / GNU `stat -c %Y`); empty if absent.
 _stamp_mtime() { [ -f "$1" ] || return 0; stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || true; }
+
+# ── roster-cache tmp reaper (housekeeping only; never touches the live cache) ──
+# `<state>/.roster-cache.json` is produced by piping THIS script's own `roster
+# --json` output through a caller-side write-to-temp-then-rename (see
+# sentinels/hmd-statusline.py's _spawn_presence: `roster --json > tmp && mv -f
+# tmp cache`). When that shell is killed between the write and the rename — a
+# hard timeout, a killed render, a reboot — `.roster-cache.json.<pid>.tmp` is
+# orphaned forever; nothing else ever globs for it. Measured on this repo:
+# hundreds accumulate over weeks. Mirrors bin/lib/repo_roster.py's
+# _reap_orphan_tmps(): AGE is the PRIMARY discriminator (a real writer opens,
+# dumps and renames in one breath — nothing legitimate holds a temp for
+# _ROSTER_TMP_ORPHAN_AGE_S seconds), a liveness check on the embedded pid is
+# only a secondary guard for the narrow window UNDER that age — using this
+# file's own `_keeper_alive`-style `kill -0` idiom, so a concurrent writer
+# mid-rename is never touched. STRICT SHAPE ONLY: the glob plus an explicit
+# all-digits check on the embedded token, so this can never match the real
+# `.roster-cache.json` or any unrelated file. FAILS OPEN throughout — reaping
+# is housekeeping, never correctness; any error here must never break
+# presence or the statusline it feeds.
+_ROSTER_TMP_ORPHAN_AGE_S=120   # matches repo_roster.py's _TMP_ORPHAN_AGE_S
+_reap_roster_cache_tmps() {
+  local dir="${1:-$PRES_STATE_DIR}"
+  [ -n "${dir:-}" ] && [ -d "$dir" ] || return 0
+  (
+    shopt -s nullglob
+    local base="$dir/.roster-cache.json" f name middle mtime age pid now
+    now="$(date +%s 2>/dev/null)" || exit 0
+    case "$now" in ''|*[!0-9]*) exit 0 ;; esac
+    for f in "$base".*.tmp; do
+      name="$(basename "$f" 2>/dev/null)" || continue
+      middle="${name#.roster-cache.json.}"; middle="${middle%.tmp}"
+      case "$middle" in ''|*[!0-9]*) continue ;; esac      # not our shape — leave it alone
+      mtime="$(_stamp_mtime "$f" 2>/dev/null)"
+      case "$mtime" in ''|*[!0-9]*) continue ;; esac        # gone/unreadable — leave it alone
+      age=$(( now - mtime )); pid="$middle"
+      if [ "$age" -lt "$_ROSTER_TMP_ORPHAN_AGE_S" ] && kill -0 "$pid" 2>/dev/null; then
+        continue    # young AND a live writer owns it — never touch a concurrent write
+      fi
+      rm -f -- "$f" 2>/dev/null
+    done
+    exit 0
+  ) 2>/dev/null
+  return 0
+}
+
 # The activity_ts the NEXT beat will send: HMD_ACTIVITY_TS override > now (bumping the stamp)
 # when this beat carries an ACTIVE verdict > the existing stamp mtime (carried forward by a bare
 # keeper/daemon beat) > empty (no known activity -> the server derives IDLE). Printed by the
@@ -1329,7 +1374,7 @@ case "$SUB" in
   keeper-loop)  # INTERNAL: run one keeper loop in-process. Used by keeper-start's detached
                 # spawn and by the falsifier test to drive N deterministic cycles.
     _keeper_loop "$(_keeper_pidfile)" "${INTERVAL:-${HMD_KEEPER_INTERVAL:-20}}" ;;
-  roster) run_client roster ;;   # OFF = invisible, NOT blind: an opted-out dev still SEES the wall.
+  roster) _reap_roster_cache_tmps; run_client roster ;;   # OFF = invisible, NOT blind: an opted-out dev still SEES the wall.
   retire) run_client retire ;;   # emit ONE signed retire beat (used by `off`; exposed for tooling).
   connect)
     # OPT IN to the live control plane (the affirmative decision). Persist {connected, url}
