@@ -507,7 +507,7 @@ _RETRY_OVERLOAD_ENV = (
 # logic above, completely untouched by any of this. The gate is consulted exactly ONCE per
 # fix invocation, BEFORE the wrapper ever runs, independent of whether THIS call will
 # overload — routing is a pre-condition on the operator's own opt-in state
-# (heimdall-fallback set on|auto, never flipped by hmd itself), never a reaction to a 529.
+# (heimdall-fallback set auto|switch, never flipped by hmd itself), never a reaction to a 529.
 # This code structurally cannot conflate the two: it never inspects the wrapper's outcome
 # (proc.returncode, the overload shape) to decide whether to route — that decision is
 # fully made before argv/env are even built.
