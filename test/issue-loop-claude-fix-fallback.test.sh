@@ -198,8 +198,15 @@ fi
 [ "$(jget "$OUT_B" '.fallback')" = "null" ] && ok "b: no .fallback note attached" || bad "b: unexpected .fallback note (got: $OUT_B)"
 
 echo "== (d) gate binary MISSING (config alone would otherwise ROUTE) -> no routing =="
+# state=switch, not auto: switch is the deterministic, tier-blind ROUTE state (still
+# gated by the full preflight) -- the only surviving state that reliably yields exit 0
+# with nothing else configured. auto additionally requires session-usage to confirm the
+# ~95% exhaustion threshold before it will route, which this fixture never sets up, so
+# it would WAIT for reasons unrelated to the missing binary and this case would no
+# longer isolate what it claims to prove ("config alone would otherwise ROUTE"). ('on'
+# was removed -- owner directive: only off/auto/switch survive.)
 set_cfg '{
-  "state": "on",
+  "state": "switch",
   "operator_key_env": "HMD_FIX_FALLBACK_TEST_KEY",
   "endpoint": "http://127.0.0.1:20128",
   "omniroute_db_path": "'"$CLEAN_DB"'",
@@ -235,8 +242,14 @@ fi
 
 echo "== (c) gate ROUTE -> child env carries the gate's endpoint/model, loud stderr announcement =="
 echo "== (e) the operator key VALUE never appears anywhere in the recorded result =="
+# state=switch (not auto): this case needs a deterministic ROUTE (rc=0) purely from the
+# preflight it already sets up (reachable, clean DB, pinned model) -- switch is the only
+# surviving state that routes tier-blind once preflight passes. auto would additionally
+# gate on live session-usage crossing the ~95% exhaustion threshold, which nothing here
+# configures, making the ROUTE this case asserts on non-deterministic. ('on' was removed
+# -- owner directive: only off/auto/switch survive.)
 set_cfg '{
-  "state": "on",
+  "state": "switch",
   "operator_key_env": "HMD_FIX_FALLBACK_TEST_KEY",
   "endpoint": "http://127.0.0.1:20128",
   "omniroute_db_path": "'"$CLEAN_DB"'",
