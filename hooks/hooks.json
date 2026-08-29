@@ -71,6 +71,15 @@
             "command": "INPUT=$(cat); PLUGIN=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; printf '%s' \"$INPUT\" | \"$PLUGIN/bin/heimdall-precheck-edit\" || true"
           }
         ]
+      },
+      {
+        "matcher": "Read|Grep|Glob|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "P=\"${CLAUDE_PLUGIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}\"; G=\"$P/bin/secret-read-guard\"; [ -x \"$G\" ] || exit 0; exec \"$G\""
+          }
+        ]
       }
     ],
     "PostToolUse": [
