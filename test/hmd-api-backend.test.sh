@@ -202,7 +202,7 @@ write_gate_config() {
   cat > "$repo/.heimdall/fallback.json" <<CFGEOF
 {
   "schema": 1,
-  "state": "on",
+  "state": "switch",
   "operator_key_env": "",
   "endpoint": "$endpoint",
   "omniroute_db_path": "$db",
