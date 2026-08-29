@@ -42,6 +42,25 @@
 # 22. seven_day with no resets_at AND no usable payload observed_at can't
 #     prove its own freshness -> treated as absent, never a crash, never a
 #     fabricated crossing
+# PHASE 4 -- reactive HTTP-429 marker (2026-08-30, bin/heimdall-429-mark),
+# cases 29-44:
+#  29. fresh marker ALONE (no budget, no real snapshot) promotes an
+#      otherwise-unconfigured verdict all the way to crossed
+#  30. fresh marker promotes an otherwise-UNDER budget verdict -> crossed --
+#      the literal production scenario (reported under while quota is gone)
+#  31. an EXPIRED marker (age > the 900s TTL) does NOT promote -- proves the
+#      TTL actually expires, not merely that absence is handled
+#  32-37. absent / malformed marker content (bad JSON, non-dict, missing
+#      key, non-numeric, bool-typed marked_at) -> never crashes, never a
+#      fabricated crossing
+#  38. marked_at in the FUTURE (clock skew) -> rejected (negative age)
+#  39. an EXPIRED marker never masks OR mislabels an independently-crossed
+#      five_hour verdict -- window stays plain 'five_hour'
+#  40-42. window naming for every reactive combination:
+#      five_hour+reactive_429 / seven_day+reactive_429 / all
+#  43-44. --reactive-429-file (CLI) outranks HEIMDALL_429_MARKER_FILE (env),
+#      which is itself honored absent a CLI flag -- same precedence shape as
+#      every other path override in this file
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -361,6 +380,134 @@ json.dump({'five_hour': {'used_percentage': 10.0, 'resets_at': time.time() + 360
 "
 out=$(python3 "$BIN" status --file "$f" --rate-limit-file "$rl" --budget 1000000 --json); rc=$?
 if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q '"verdict": "under"' && printf '%s' "$out" | grep -q '"window": null' && printf '%s' "$out" | grep -q '"percent_real_seven_day": null'; then ok; else bad "case28 rc=$rc out=$out"; fi
+
+echo "=== 29. PHASE 4: fresh reactive-429 marker ALONE (no budget, no real snapshot) promotes unconfigured -> crossed, window=reactive_429 ==="
+d=$(case_dir c29); f="$d/t.jsonl"; mk="$d/429-marker.json"
+usage_line "$(now_ts)" 100 50 > "$f"
+write_marker "$mk" "$(epoch_offset 30)"
+out=$(python3 "$BIN" status --file "$f" --reactive-429-file "$mk" --json); rc=$?
+if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q '"verdict": "crossed"' && printf '%s' "$out" | grep -q '"window": "reactive_429"' && printf '%s' "$out" | grep -q '"reactive_429_marked": true'; then ok; else bad "case29 rc=$rc out=$out"; fi
+
+echo "=== 30. PHASE 4: fresh reactive-429 marker promotes an otherwise-UNDER budget verdict -> crossed (the literal production scenario) ==="
+d=$(case_dir c30); f="$d/t.jsonl"; mk="$d/429-marker.json"
+usage_line "$(now_ts)" 10 10 > "$f"
+write_marker "$mk" "$(epoch_offset 1)"
+out=$(python3 "$BIN" status --file "$f" --budget 1000000 --reactive-429-file "$mk" --json); rc=$?
+if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q '"verdict": "crossed"' && printf '%s' "$out" | grep -q '"window": "reactive_429"' && printf '%s' "$out" | grep -q '"source": "budget"'; then ok; else bad "case30 rc=$rc out=$out"; fi
+
+echo "=== 31. PHASE 4: EXPIRED reactive-429 marker (age > 900s TTL) does NOT promote -- stays under (proves the TTL actually expires) ==="
+d=$(case_dir c31); f="$d/t.jsonl"; mk="$d/429-marker.json"
+usage_line "$(now_ts)" 10 10 > "$f"
+write_marker "$mk" "$(epoch_offset 901)"
+out=$(python3 "$BIN" status --file "$f" --budget 1000000 --reactive-429-file "$mk" --json); rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q '"verdict": "under"' && printf '%s' "$out" | grep -q '"window": null' && printf '%s' "$out" | grep -q '"reactive_429_marked": false'; then ok; else bad "case31 rc=$rc out=$out"; fi
+
+echo "=== 32. PHASE 4: marker file entirely ABSENT -> not crossed, no crash, valid JSON ==="
+d=$(case_dir c32); f="$d/t.jsonl"
+usage_line "$(now_ts)" 10 10 > "$f"
+out=$(python3 "$BIN" status --file "$f" --budget 1000000 --reactive-429-file "$d/does-not-exist.json" --json); rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | python3 -c "import json,sys; json.load(sys.stdin)" 2>/dev/null && printf '%s' "$out" | grep -q '"reactive_429_marked": false' && printf '%s' "$out" | grep -q '"reactive_429_marked_at": null'; then ok; else bad "case32 rc=$rc out=$out"; fi
+
+echo "=== 33. PHASE 4: malformed marker file (not valid JSON) -> not crossed, no crash ==="
+d=$(case_dir c33); f="$d/t.jsonl"; mk="$d/429-marker.json"
+usage_line "$(now_ts)" 10 10 > "$f"
+printf 'not json {{{' > "$mk"
+out=$(python3 "$BIN" status --file "$f" --budget 1000000 --reactive-429-file "$mk" --json); rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | python3 -c "import json,sys; json.load(sys.stdin)" 2>/dev/null && printf '%s' "$out" | grep -q '"reactive_429_marked": false'; then ok; else bad "case33 rc=$rc out=$out"; fi
+
+echo "=== 34. PHASE 4: marker file valid JSON but not an object (a list) -> not crossed, no crash ==="
+d=$(case_dir c34); f="$d/t.jsonl"; mk="$d/429-marker.json"
+usage_line "$(now_ts)" 10 10 > "$f"
+printf '[1, 2, 3]' > "$mk"
+out=$(python3 "$BIN" status --file "$f" --budget 1000000 --reactive-429-file "$mk" --json); rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q '"reactive_429_marked": false'; then ok; else bad "case34 rc=$rc out=$out"; fi
+
+echo "=== 35. PHASE 4: marker object missing 'marked_at' entirely -> not crossed, no crash ==="
+d=$(case_dir c35); f="$d/t.jsonl"; mk="$d/429-marker.json"
+usage_line "$(now_ts)" 10 10 > "$f"
+printf '{"reason": "hmd-claude-retry"}' > "$mk"
+out=$(python3 "$BIN" status --file "$f" --budget 1000000 --reactive-429-file "$mk" --json); rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q '"reactive_429_marked": false'; then ok; else bad "case35 rc=$rc out=$out"; fi
+
+echo "=== 36. PHASE 4: marker 'marked_at' is a non-numeric string -> not crossed, no crash ==="
+d=$(case_dir c36); f="$d/t.jsonl"; mk="$d/429-marker.json"
+usage_line "$(now_ts)" 10 10 > "$f"
+printf '{"marked_at": "not-a-number"}' > "$mk"
+out=$(python3 "$BIN" status --file "$f" --budget 1000000 --reactive-429-file "$mk" --json); rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q '"reactive_429_marked": false'; then ok; else bad "case36 rc=$rc out=$out"; fi
+
+echo "=== 37. PHASE 4: marker 'marked_at' is a JSON boolean (true) -- bool is a python int subclass, must still be rejected -> not crossed ==="
+d=$(case_dir c37); f="$d/t.jsonl"; mk="$d/429-marker.json"
+usage_line "$(now_ts)" 10 10 > "$f"
+printf '{"marked_at": true}' > "$mk"
+out=$(python3 "$BIN" status --file "$f" --budget 1000000 --reactive-429-file "$mk" --json); rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q '"reactive_429_marked": false'; then ok; else bad "case37 rc=$rc out=$out"; fi
+
+echo "=== 38. PHASE 4: marker 'marked_at' in the FUTURE (clock skew) -> age<0 rejected, not crossed ==="
+d=$(case_dir c38); f="$d/t.jsonl"; mk="$d/429-marker.json"
+usage_line "$(now_ts)" 10 10 > "$f"
+write_marker "$mk" "$(epoch_offset -500)"
+out=$(python3 "$BIN" status --file "$f" --budget 1000000 --reactive-429-file "$mk" --json); rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q '"reactive_429_marked": false'; then ok; else bad "case38 rc=$rc out=$out"; fi
+
+echo "=== 39. PHASE 4: five_hour ALREADY crossed alone + an EXPIRED reactive marker -> verdict stays crossed via five_hour, window stays 'five_hour' ==="
+d=$(case_dir c39); f="$d/t.jsonl"; rl="$d/rate-limits.json"; mk="$d/429-marker.json"
+usage_line "$(now_ts)" 10 10 > "$f"
+python3 -c "
+import json, time
+json.dump({'observed_at': time.time(), 'five_hour': {'used_percentage': 99.0, 'resets_at': time.time() + 3600}}, open('$rl', 'w'))
+"
+write_marker "$mk" "$(epoch_offset 901)"
+out=$(python3 "$BIN" status --file "$f" --rate-limit-file "$rl" --reactive-429-file "$mk" --budget 1000000 --json); rc=$?
+if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q '"verdict": "crossed"' && printf '%s' "$out" | grep -q '"window": "five_hour"' && printf '%s' "$out" | grep -q '"reactive_429_marked": false'; then ok; else bad "case39 rc=$rc out=$out"; fi
+
+echo "=== 40. PHASE 4: five_hour crossed + FRESH reactive marker -> window='five_hour+reactive_429' ==="
+d=$(case_dir c40); f="$d/t.jsonl"; rl="$d/rate-limits.json"; mk="$d/429-marker.json"
+usage_line "$(now_ts)" 10 10 > "$f"
+python3 -c "
+import json, time
+json.dump({'observed_at': time.time(), 'five_hour': {'used_percentage': 99.0, 'resets_at': time.time() + 3600}}, open('$rl', 'w'))
+"
+write_marker "$mk" "$(epoch_offset 5)"
+out=$(python3 "$BIN" status --file "$f" --rate-limit-file "$rl" --reactive-429-file "$mk" --budget 1000000 --json); rc=$?
+if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q '"window": "five_hour+reactive_429"'; then ok; else bad "case40 rc=$rc out=$out"; fi
+
+echo "=== 41. PHASE 4: seven_day crossed (five_hour under) + FRESH reactive marker -> window='seven_day+reactive_429' ==="
+d=$(case_dir c41); f="$d/t.jsonl"; rl="$d/rate-limits.json"; mk="$d/429-marker.json"
+usage_line "$(now_ts)" 10 10 > "$f"
+python3 -c "
+import json, time
+json.dump({'observed_at': time.time(), 'five_hour': {'used_percentage': 10.0, 'resets_at': time.time() + 3600}, 'seven_day': {'used_percentage': 99.0, 'resets_at': time.time() + 500000}}, open('$rl', 'w'))
+"
+write_marker "$mk" "$(epoch_offset 5)"
+out=$(python3 "$BIN" status --file "$f" --rate-limit-file "$rl" --reactive-429-file "$mk" --budget 1000000 --json); rc=$?
+if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q '"window": "seven_day+reactive_429"'; then ok; else bad "case41 rc=$rc out=$out"; fi
+
+echo "=== 42. PHASE 4: five_hour AND seven_day AND reactive marker all fresh/crossed -> window='all' ==="
+d=$(case_dir c42); f="$d/t.jsonl"; rl="$d/rate-limits.json"; mk="$d/429-marker.json"
+usage_line "$(now_ts)" 10 10 > "$f"
+python3 -c "
+import json, time
+json.dump({'observed_at': time.time(), 'five_hour': {'used_percentage': 96.0, 'resets_at': time.time() + 3600}, 'seven_day': {'used_percentage': 97.0, 'resets_at': time.time() + 500000}}, open('$rl', 'w'))
+"
+write_marker "$mk" "$(epoch_offset 5)"
+out=$(python3 "$BIN" status --file "$f" --rate-limit-file "$rl" --reactive-429-file "$mk" --budget 1000000 --json); rc=$?
+if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q '"window": "all"'; then ok; else bad "case42 rc=$rc out=$out"; fi
+
+echo "=== 43. PHASE 4: --reactive-429-file (CLI flag) takes precedence over HEIMDALL_429_MARKER_FILE (env) ==="
+d=$(case_dir c43); f="$d/t.jsonl"; mk_env="$d/env-429-marker.json"; mk_cli="$d/cli-429-marker.json"
+usage_line "$(now_ts)" 10 10 > "$f"
+write_marker "$mk_env" "$(epoch_offset 901)"
+write_marker "$mk_cli" "$(epoch_offset 5)"
+out=$(HEIMDALL_429_MARKER_FILE="$mk_env" python3 "$BIN" status --file "$f" --budget 1000000 --reactive-429-file "$mk_cli" --json); rc=$?
+if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q '"verdict": "crossed"' && printf '%s' "$out" | grep -q '"window": "reactive_429"'; then ok; else bad "case43(cli-wins-over-env) rc=$rc out=$out"; fi
+
+echo "=== 44. PHASE 4: HEIMDALL_429_MARKER_FILE env var honored when no --reactive-429-file flag given ==="
+d=$(case_dir c44); f="$d/t.jsonl"; mk="$d/429-marker.json"
+usage_line "$(now_ts)" 10 10 > "$f"
+write_marker "$mk" "$(epoch_offset 5)"
+out=$(HEIMDALL_429_MARKER_FILE="$mk" python3 "$BIN" status --file "$f" --budget 1000000 --json); rc=$?
+if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q '"verdict": "crossed"' && printf '%s' "$out" | grep -q '"window": "reactive_429"'; then ok; else bad "case44 rc=$rc out=$out"; fi
 
 echo ""
 echo "RESULT: $PASS passed, $FAIL failed"
