@@ -80,7 +80,11 @@ GENERIC_ASSIGN = re.compile(
     r"private[_\-]?key|access[_\-]?key|client[_\-]?secret|auth[_\-]?token)"
     r"[A-Za-z0-9_.\-]*)"
     r"\s*[:=]\s*"
-    r"(?P<q>[\"']?)(?P<val>[^\s\"',;)}\]]{16,})(?P=q)",
+    # Brackets, parens and quotes are excluded from the value: an issued
+    # credential never contains them, but a function call does. Without this,
+    # `private_key = rsa.generate_private_key(public_exponent=65537)` is a
+    # 3-character-class, high-entropy "value".
+    r"(?P<q>[\"']?)(?P<val>[^\s\"',;(){}\[\]]{16,})(?P=q)",
     re.IGNORECASE,
 )
 
@@ -132,6 +136,21 @@ def charset_classes(s: str) -> int:
     )
 
 
+def looks_machine_generated(s: str) -> bool:
+    """True when the value mixes character classes the way issued keys do.
+
+    An issued credential is essentially always either mixed-case or
+    alphanumeric-with-digits. A snake_case identifier is neither, which is what
+    separates a real key from `AUTH_TOKEN_KEY = 'auth_token_storage_key'` — a
+    22-character, entropy-3.6 value that a naive threshold happily flags.
+    """
+    has_lower = bool(re.search(r"[a-z]", s))
+    has_upper = bool(re.search(r"[A-Z]", s))
+    has_digit = bool(re.search(r"[0-9]", s))
+    has_alpha = has_lower or has_upper
+    return (has_digit and has_alpha) or (has_lower and has_upper)
+
+
 def is_template_or_placeholder(value: str) -> bool:
     """True when the value is plainly a reference/template, not a credential."""
     low = value.lower()
@@ -161,6 +180,8 @@ def generic_value_is_secretlike(value: str) -> bool:
         return False
     # Real keys mix character classes; dictionary words and identifiers do not.
     if charset_classes(value) < 2:
+        return False
+    if not looks_machine_generated(value):
         return False
     return shannon_entropy(value) >= MIN_GENERIC_ENTROPY
 
