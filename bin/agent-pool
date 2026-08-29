@@ -57,6 +57,22 @@ from datetime import datetime, timezone
 
 def _resolve_pool_file():
     # Default to ~/.heimdall; adopt a pre-existing ~/.superx pool file for back-compat.
+    # HEIMDALL_HOME -- the repo-wide state-home override seam every other Heimdall
+    # tool honors (hmd-claude-retry.sh, issue_loop.py, maintain_loop.py's own
+    # checkpoint/queue state, ...) -- takes precedence when set, so a hermetic
+    # caller (a test's throwaway HOME, or a maintainer run scoped to one repo)
+    # gets its OWN pool file instead of silently colliding with the shared, real
+    # ~/.heimdall/agent-pool.json every concurrently-running agent on the machine
+    # reads/writes. A stuck real pool (stale entries past max_agents) then wedges
+    # `agent-pool wait` for its full 300s timeout on every hermetic caller too --
+    # see test/heimdall-maintain-loop.test.sh's FAIL-SAFE flip, which reaches a
+    # real run_once cycle and calls this via maintain_loop.py's _pool_acquire.
+    # Unset -> byte-identical to the prior behavior. The ~/.superx legacy-migration
+    # fallback stays real-machine-only: it must never leak into a scoped
+    # HEIMDALL_HOME's fresh, empty pool.
+    override = os.environ.get("HEIMDALL_HOME")
+    if override:
+        return Path(override) / "agent-pool.json"
     new = Path.home() / ".heimdall" / "agent-pool.json"
     legacy = Path.home() / ".superx" / "agent-pool.json"
     if not new.exists() and legacy.exists():
