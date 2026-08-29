@@ -242,6 +242,18 @@ fire "$SANDBOX/bin/heimdall-precheck-agent" "$(payload hmd:reviewer)" "https://a
 [ "$RC" -eq 0 ] && ok "ANTHROPIC_BASE_URL=https://api.anthropic.com + hmd:reviewer -> allowed (exit 0, no false positive)" \
                 || bad "ANTHROPIC_BASE_URL=https://api.anthropic.com case -> exit $RC, expected 0"
 
+# the OTHER two loopback shapes the fix's case statement matches besides
+# 127.* (already covered above via $FAKE_URL) -- localhost and bracketed
+# IPv6 ::1 -- each proven to actually deny, not just parse, so the case
+# statement's extra branches are exercised, not merely present.
+fire "$SANDBOX/bin/heimdall-precheck-agent" "$(payload hmd:reviewer)" "http://localhost:8787" 1 ""
+[ "$RC" -eq 2 ] && ok "ANTHROPIC_BASE_URL=http://localhost:8787 + hmd:reviewer -> denied (exit 2, localhost loopback shape)" \
+                || bad "ANTHROPIC_BASE_URL=http://localhost:8787 case -> exit $RC, expected 2"
+
+fire "$SANDBOX/bin/heimdall-precheck-agent" "$(payload hmd:reviewer)" "http://[::1]:8787" 1 ""
+[ "$RC" -eq 2 ] && ok "ANTHROPIC_BASE_URL=http://[::1]:8787 + hmd:reviewer -> denied (exit 2, bracketed IPv6 ::1 loopback shape)" \
+                || bad "ANTHROPIC_BASE_URL=http://[::1]:8787 case -> exit $RC, expected 2"
+
 # malformed JSON under confirmed fallback: disclosure (env-only) still fires, deny (payload-dependent) fails open
 fire "$SANDBOX/bin/heimdall-precheck-agent" '{not json' "$FAKE_URL" 0 "$FAKE_URL"
 [ "$RC" -eq 0 ] && ok "malformed JSON under confirmed fallback -> allowed (exit 0, fails open on the payload)" \
