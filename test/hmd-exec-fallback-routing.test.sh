@@ -60,6 +60,16 @@ ROUTING_KEYS="$_HMD_GATE_ROUTING_VARS
 ANTHROPIC_MODEL
 ANTHROPIC_AUTH_TOKEN"
 
+# Neutralize whatever routing/proxy state happens to be ambient in the environment
+# actually running this suite (e.g. a real local OmniRoute gateway or headroom proxy
+# on the dev machine). Every "untouched" assertion below must compare against a
+# KNOWN-clean starting point, not whatever this machine happens to already export —
+# otherwise a real ambient ANTHROPIC_BASE_URL would leak through a REFUSE/missing-
+# binary case and be mistaken for a shim defect it is not.
+for _hcfr_key in $ROUTING_KEYS; do
+  unset "$_hcfr_key"
+done
+
 extract_key() { # extract_key <env-dump-file> <KEY>
   grep "^$2=" "$1" 2>/dev/null || true
 }
