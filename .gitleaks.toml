@@ -50,8 +50,31 @@ description = "Heimdall's own secret-detection fixtures — test material, not r
 # docs/superpowers/specs/heimdall-fixture-secret-convention.md forbids. A commit
 # SHA is immutable, so this entry can never mask a FUTURE leak, in this file or
 # any other. test/public-repo-no-secrets.test.sh remains fully armed.
+#
+# db0606d + 21edaeb ("wip: 6 edit-op checkpoint") are the same situation, from
+# 2026-08-29. Building the paste-secret filter and the secret-read guard required
+# credential-SHAPED fixtures, and both files first landed carrying static literals:
+# db0606d -> 2x private-key in test/secret-read-guard.test.sh (the literal itself
+# reads FAKEFAKEFAKE); 21edaeb -> 1x private-key + 2x generic-api-key in
+# test/paste-secret-filter.test.sh. None is a credential; all five are test material
+# for detectors whose whole job is to catch this shape.
+#
+# The tree is fixed FORWARD to the convention: every one of those five is now
+# assembled at RUNTIME from individually-non-matching fragments (case 2), verified
+# byte-exact by script rather than by eye, with both suites still green (67/0 and
+# 47/0). `gitleaks detect --no-git` over the working tree finds none of them. Only
+# the immutable historical blobs remain, and only a history rewrite could remove
+# them -- which would rewrite every SHA after them across 450+ unpushed commits, a
+# far larger risk than naming two SHAs here.
+#
+# Same reasoning as 1b9994c, and worth restating because it is the whole point: a
+# SHA is immutable, so these entries can NEVER mask a future leak -- not in these
+# two files, not anywhere. Both fixture files stay fully armed against anything
+# committed from here on.
 commits = [
   '''1b9994c25e794b75069dcc8a47dc1c6dc43c13a0''',
+  '''db0606d79298d4d2682574eece05298501d16eea''',
+  '''21edaeb769584ca2abfec1c22cd6de316f8ed78f''',
 ]
 
 # Paths are matched against the file path of each finding. Each entry is a
