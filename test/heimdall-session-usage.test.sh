@@ -20,6 +20,28 @@
 # 13. env-var defaults (HEIMDALL_SESSION_TOKEN_BUDGET / _THRESHOLD_PCT) honored
 # 14. zero in-window usage on a readable file -> under (0%), never unknown
 # 15. exit-code contract: 0 for under/unknown/unconfigured, 1 for crossed
+# 16. fresh real rate-limit snapshot (five_hour) -> source=real, verdict driven
+#     by the real figure; an EXPIRED one is ABSENT, never a low reading, and
+#     never masks a crossed budget verdict
+# 17. absent/malformed rate-limit file -> clean fallback to the budget path,
+#     never a crash
+# 18. seven_day is an independent, ADDITIVE crossed condition (2026-08-29):
+#     its own threshold check, its own freshness rule (resets_at when present,
+#     else observed_at + a bounded TTL when absent -- never five_hour's rule
+#     reused)
+# 19. verdict reports WHICH window crossed via a new 'window' field
+#     (five_hour / seven_day / both / null) -- metadata only, never a fifth
+#     verdict value; 'crossed' stays a plain boolean of the same 4-state verdict
+# 20. a seven_day reading stale by EITHER freshness rule (expired resets_at, or
+#     an absent one whose TTL fallback has elapsed) never fabricates a crossing
+#     and never masks a genuine five_hour crossing -- falsified both ways
+# 21. five_hour absent/expired entirely does not stop a fresh, crossed
+#     seven_day from being reported (source=real, window=seven_day) -- the
+#     literal production scenario this task exists for (weekly limit crossed
+#     independent of the five-hour one)
+# 22. seven_day with no resets_at AND no usable payload observed_at can't
+#     prove its own freshness -> treated as absent, never a crash, never a
+#     fabricated crossing
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -216,6 +238,96 @@ usage_line "$(now_ts)" 100 50 > "$f"
 printf 'not json {{{' > "$rl"
 out=$(python3 "$BIN" status --file "$f" --rate-limit-file "$rl" --budget 1000 --json); rc=$?
 if [ "$rc" -eq 0 ] && printf '%s' "$out" | python3 -c "import json,sys; json.load(sys.stdin)" 2>/dev/null && printf '%s' "$out" | grep -q '"source": "budget"'; then ok; else bad "case19 rc=$rc out=$out"; fi
+
+echo "=== 20. seven_day CROSSED while five_hour UNDER (both fresh via resets_at) -> verdict=crossed, window=seven_day ==="
+d=$(case_dir c20); f="$d/t.jsonl"; rl="$d/rate-limits.json"
+usage_line "$(now_ts)" 10 10 > "$f"
+python3 -c "
+import json, time
+json.dump({'observed_at': time.time(), 'five_hour': {'used_percentage': 10.0, 'resets_at': time.time() + 3600}, 'seven_day': {'used_percentage': 99.0, 'resets_at': time.time() + 500000}}, open('$rl', 'w'))
+"
+out=$(python3 "$BIN" status --file "$f" --rate-limit-file "$rl" --budget 1000000 --json); rc=$?
+if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q '"source": "real"' && printf '%s' "$out" | grep -q '"verdict": "crossed"' && printf '%s' "$out" | grep -q '"window": "seven_day"'; then ok; else bad "case20 rc=$rc out=$out"; fi
+
+echo "=== 21. five_hour CROSSED while seven_day UNDER (both fresh) -> verdict=crossed, window=five_hour (pre-existing five-hour-alone behavior unchanged) ==="
+d=$(case_dir c21); f="$d/t.jsonl"; rl="$d/rate-limits.json"
+usage_line "$(now_ts)" 10 10 > "$f"
+python3 -c "
+import json, time
+json.dump({'observed_at': time.time(), 'five_hour': {'used_percentage': 99.0, 'resets_at': time.time() + 3600}, 'seven_day': {'used_percentage': 10.0, 'resets_at': time.time() + 500000}}, open('$rl', 'w'))
+"
+out=$(python3 "$BIN" status --file "$f" --rate-limit-file "$rl" --budget 1000000 --json); rc=$?
+if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q '"verdict": "crossed"' && printf '%s' "$out" | grep -q '"window": "five_hour"' && printf '%s' "$out" | grep -q '"percent_real": 99.0'; then ok; else bad "case21 rc=$rc out=$out"; fi
+
+echo "=== 22. BOTH windows crossed -> window=both ==="
+d=$(case_dir c22); f="$d/t.jsonl"; rl="$d/rate-limits.json"
+usage_line "$(now_ts)" 10 10 > "$f"
+python3 -c "
+import json, time
+json.dump({'observed_at': time.time(), 'five_hour': {'used_percentage': 96.0, 'resets_at': time.time() + 3600}, 'seven_day': {'used_percentage': 97.0, 'resets_at': time.time() + 500000}}, open('$rl', 'w'))
+"
+out=$(python3 "$BIN" status --file "$f" --rate-limit-file "$rl" --budget 1000000 --json); rc=$?
+if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q '"verdict": "crossed"' && printf '%s' "$out" | grep -q '"window": "both"'; then ok; else bad "case22 rc=$rc out=$out"; fi
+
+echo "=== 23. STALE seven_day (expired resets_at) must NOT fabricate a crossing -- five_hour fresh+under -> verdict=under ==="
+d=$(case_dir c23); f="$d/t.jsonl"; rl="$d/rate-limits.json"
+usage_line "$(now_ts)" 10 10 > "$f"
+python3 -c "
+import json
+json.dump({'observed_at': 1, 'five_hour': {'used_percentage': 10.0, 'resets_at': 9999999999}, 'seven_day': {'used_percentage': 10.0, 'resets_at': 1}}, open('$rl', 'w'))
+"
+out=$(python3 "$BIN" status --file "$f" --rate-limit-file "$rl" --budget 1000000 --json); rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q '"verdict": "under"' && printf '%s' "$out" | grep -q '"window": null'; then ok; else bad "case23 rc=$rc out=$out"; fi
+
+echo "=== 24. seven_day with NO resets_at at all, fresh via observed_at+TTL fallback, CROSSED -> window=seven_day (fires when it should) ==="
+d=$(case_dir c24); f="$d/t.jsonl"; rl="$d/rate-limits.json"
+usage_line "$(now_ts)" 10 10 > "$f"
+python3 -c "
+import json, time
+json.dump({'observed_at': time.time() - 30, 'five_hour': {'used_percentage': 10.0, 'resets_at': time.time() + 3600}, 'seven_day': {'used_percentage': 98.0}}, open('$rl', 'w'))
+"
+out=$(python3 "$BIN" status --file "$f" --rate-limit-file "$rl" --budget 1000000 --json); rc=$?
+if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q '"verdict": "crossed"' && printf '%s' "$out" | grep -q '"window": "seven_day"' && printf '%s' "$out" | grep -q '"percent_real_seven_day": 98.0'; then ok; else bad "case24 rc=$rc out=$out"; fi
+
+echo "=== 25. seven_day with NO resets_at, STALE via TTL (observed_at 6h ago > 18000s bound) -- must NOT fire even though the number alone would cross (does not fire when it should not) ==="
+d=$(case_dir c25); f="$d/t.jsonl"; rl="$d/rate-limits.json"
+usage_line "$(now_ts)" 10 10 > "$f"
+python3 -c "
+import json, time
+json.dump({'observed_at': time.time() - 21600, 'five_hour': {'used_percentage': 10.0, 'resets_at': time.time() + 3600}, 'seven_day': {'used_percentage': 99.0}}, open('$rl', 'w'))
+"
+out=$(python3 "$BIN" status --file "$f" --rate-limit-file "$rl" --budget 1000000 --json); rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q '"verdict": "under"' && printf '%s' "$out" | grep -q '"percent_real_seven_day": null' && printf '%s' "$out" | grep -q '"window": null'; then ok; else bad "case25 rc=$rc out=$out"; fi
+
+echo "=== 26. seven_day key entirely absent (pre-Phase-3 snapshot) -> unaffected, no crash, window=null ==="
+d=$(case_dir c26); f="$d/t.jsonl"; rl="$d/rate-limits.json"
+usage_line "$(now_ts)" 10 10 > "$f"
+python3 -c "
+import json, time
+json.dump({'observed_at': time.time(), 'five_hour': {'used_percentage': 10.0, 'resets_at': time.time() + 3600}}, open('$rl', 'w'))
+"
+out=$(python3 "$BIN" status --file "$f" --rate-limit-file "$rl" --budget 1000000 --json); rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q '"verdict": "under"' && printf '%s' "$out" | grep -q '"window": null' && printf '%s' "$out" | grep -q '"percent_real_seven_day": null'; then ok; else bad "case26 rc=$rc out=$out"; fi
+
+echo "=== 27. five_hour key ENTIRELY ABSENT, seven_day fresh+CROSSED -> source=real, percent_real=null, window=seven_day (the literal production scenario: weekly limit crossed independent of five-hour) ==="
+d=$(case_dir c27); f="$d/t.jsonl"; rl="$d/rate-limits.json"
+usage_line "$(now_ts)" 10 10 > "$f"
+python3 -c "
+import json, time
+json.dump({'observed_at': time.time(), 'seven_day': {'used_percentage': 99.0, 'resets_at': time.time() + 500000}}, open('$rl', 'w'))
+"
+out=$(python3 "$BIN" status --file "$f" --rate-limit-file "$rl" --budget 1000000 --json); rc=$?
+if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q '"source": "real"' && printf '%s' "$out" | grep -q '"percent_real": null' && printf '%s' "$out" | grep -q '"window": "seven_day"' && printf '%s' "$out" | grep -q '"percent_real_seven_day": 99.0'; then ok; else bad "case27 rc=$rc out=$out"; fi
+
+echo "=== 28. seven_day with no resets_at AND no usable top-level observed_at -> can't prove freshness -> treated as absent, no crash ==="
+d=$(case_dir c28); f="$d/t.jsonl"; rl="$d/rate-limits.json"
+usage_line "$(now_ts)" 10 10 > "$f"
+python3 -c "
+import json, time
+json.dump({'five_hour': {'used_percentage': 10.0, 'resets_at': time.time() + 3600}, 'seven_day': {'used_percentage': 99.0}}, open('$rl', 'w'))
+"
+out=$(python3 "$BIN" status --file "$f" --rate-limit-file "$rl" --budget 1000000 --json); rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q '"verdict": "under"' && printf '%s' "$out" | grep -q '"window": null' && printf '%s' "$out" | grep -q '"percent_real_seven_day": null'; then ok; else bad "case28 rc=$rc out=$out"; fi
 
 echo ""
 echo "RESULT: $PASS passed, $FAIL failed"

@@ -58,6 +58,30 @@ name says "budget" (operator-set), never "limit" (Anthropic-real) — the two
 are never conflated in a single field anywhere in this file's output;
 `source` always says which one produced the current verdict.
 
+PHASE 3 — 2026-08-29. MEASURED IN PRODUCTION: five agents died on HTTP 429
+while this tool reported UNDER at ~0% of the five_hour limit, because the
+limit that had actually been exhausted was a SESSION limit and a WEEKLY one
+("resets Sep 5") — windows this tool never looked at. rate_limits.seven_day
+was already being persisted by sentinels/hmd-statusline.py (confirmed by
+test/heimdall-statusline-rate-limit-persist.test.sh, case 1) and simply never
+read. This phase reads it as a SECOND, INDEPENDENT, ADDITIVE crossed
+condition alongside five_hour — never a replacement for it, never a
+reinterpretation of the existing four verdict states. `crossed` still means
+exactly what it meant before; a new `window` field says WHICH observation(s)
+crossed ("five_hour" / "seven_day" / "both" / null), as metadata only — it is
+never itself consulted by any routing decision, only reported.
+
+seven_day gets its OWN freshness rule, not five_hour's reused: resets_at is
+preferred and, when present, judged exactly like five_hour (expired ->
+absent, never a low reading). But resets_at is confirmed OPTIONAL on the wire
+for this window (the same persist test's case 1 writes a seven_day reading
+with no resets_at at all and asserts it persists anyway) — so when it is
+absent, freshness falls back to this payload's own observed_at plus a bounded
+TTL (SEVEN_DAY_STALE_TTL_SECS). An observed_at that is itself missing or
+invalid cannot prove freshness either way, so THAT also degrades to absent —
+failing toward "no signal" rather than risking a fabricated crossing, the
+same standard PHASE 2 above already holds five_hour to.
+
 FOUR VERDICT STATES, ON PURPOSE — collapsing "unknown" into either neighbor
 is exactly the failure mode this tool exists to prevent:
   unconfigured — no operator budget set; a percentage is mathematically
@@ -112,6 +136,7 @@ from pathlib import Path
 DEFAULT_WINDOW_SECS = 18000  # 5h — matches Claude Code's own five_hour rate-limit window
 DEFAULT_MAX_BYTES = 8 * 1024 * 1024  # 8 MiB tail cap
 DEFAULT_THRESHOLD_PCT = 95.0  # the operator's own stated target, not invented here
+SEVEN_DAY_STALE_TTL_SECS = 18000  # fallback freshness bound ONLY when seven_day carries no resets_at of its own (PHASE 3)
 
 BUDGET_ENV = "HEIMDALL_SESSION_TOKEN_BUDGET"
 WINDOW_ENV = "HEIMDALL_SESSION_USAGE_WINDOW_SECS"
@@ -144,9 +169,12 @@ NOTE = (
 REAL_NOTE = (
     "percent_real IS Anthropic's real rate_limits.five_hour.used_percentage, "
     "bridged from a live statusline render persisted to disk (see module "
-    "docstring PHASE 2) and still fresh (its resets_at has not passed). "
-    "verdict/crossed above are driven by this real figure, not the operator "
-    "budget — percent_of_budget is still reported alongside it, unchanged."
+    "docstring PHASE 2) and still fresh (its resets_at has not passed). When "
+    "a seven_day snapshot is ALSO fresh (module docstring PHASE 3), "
+    "percent_real_seven_day carries that figure and 'window' names which "
+    "one crossed (five_hour / seven_day / both) — verdict/crossed above are "
+    "driven by whichever real figure(s) are fresh, never the operator "
+    "budget; percent_of_budget is still reported alongside it, unchanged."
 )
 
 
@@ -343,20 +371,65 @@ def _rate_limit_state_path(override):
     return os.path.expanduser(os.path.join("~", ".heimdall", "rate-limits.json"))
 
 
-def read_real_usage(path, now):
-    """Read a statusline-persisted rate_limits.five_hour snapshot ->
-    {"used_percentage", "resets_at", "observed_at"} or None. None covers every failure
-    mode identically (no path, unreadable, malformed JSON, not a dict, missing
-    five_hour, missing/invalid used_percentage) — this tool degrades to the budget path
-    on ANY of them, never a crash, matching the NEVER-FAILS CONTRACT above.
+def _parse_window(window, now, payload_observed_at, stale_ttl_secs):
+    """Parse ONE rate-limit window ({"used_percentage", "resets_at"?}) into
+    {"used_percentage": float, "resets_at": float|None} or None. None covers
+    every failure/staleness mode identically (not a dict, missing/invalid
+    used_percentage, expired, or unprovably fresh) — matching the
+    NEVER-FAILS CONTRACT: absent is always the safe default, never a crash,
+    never a fabricated crossing.
 
-    CRITICAL (the freshness property this bridge exists to get right): resets_at
-    missing/invalid -> None (freshness indeterminate, so treat as absent) AND
-    resets_at <= now -> None (the 5-hour window already rolled over — an EXPIRED
-    observation is ABSENT, never a low reading; surfacing a stale 3% after the window
-    reset would be a worse lie than reporting nothing). Freshness is judged SOLELY by
-    resets_at, never a fixed TTL — an observation is good for exactly as long as Claude
-    Code itself said the window would last, no more, no less.
+    Two freshness rules, selected by stale_ttl_secs:
+
+      stale_ttl_secs is None — five_hour's rule (PHASE 2): resets_at is
+        MANDATORY. Missing/invalid resets_at, or an expired one
+        (resets_at <= now), is ABSENT — never a low reading. No TTL
+        fallback; a window that already rolled over says nothing about the
+        new window's usage.
+
+      stale_ttl_secs is a number — seven_day's rule (PHASE 3): resets_at is
+        PREFERRED but confirmed OPTIONAL on the wire (see
+        test/heimdall-statusline-rate-limit-persist.test.sh case 1, which
+        persists a seven_day reading with no resets_at at all). When
+        present, judged exactly like five_hour's mandatory rule (expired ->
+        absent). When absent, freshness falls back to the PAYLOAD's own
+        observed_at + stale_ttl_secs — and an unknown/invalid
+        payload_observed_at can't prove freshness either, so it is ALSO
+        treated as absent (fail toward absence, never toward a fabricated
+        crossing).
+    """
+    if not isinstance(window, dict):
+        return None
+    up = window.get("used_percentage")
+    if not isinstance(up, (int, float)) or isinstance(up, bool):
+        return None
+    ra = window.get("resets_at")
+    if isinstance(ra, (int, float)) and not isinstance(ra, bool):
+        if ra <= now:
+            return None
+        return {"used_percentage": float(up), "resets_at": float(ra)}
+    if stale_ttl_secs is None:
+        return None
+    if not isinstance(payload_observed_at, (int, float)) or isinstance(payload_observed_at, bool):
+        return None
+    if now - payload_observed_at > stale_ttl_secs:
+        return None
+    return {"used_percentage": float(up), "resets_at": None}
+
+
+def read_real_usage(path, now):
+    """Read a statusline-persisted rate_limits snapshot ->
+    {"five_hour": {...}|None, "seven_day": {...}|None, "observed_at": float|None}
+    or None. None covers every whole-file failure mode identically (no path,
+    unreadable, malformed JSON, not a dict) AND the case where BOTH windows
+    parse to None — this tool degrades to the budget path on any of them,
+    never a crash, matching the NEVER-FAILS CONTRACT above.
+
+    Returning a dict as soon as EITHER window is present+fresh (rather than
+    requiring both, or requiring five_hour specifically) is the whole point
+    of PHASE 3: a fresh, crossed seven_day must be reported even when
+    five_hour is absent/expired, and vice versa — see module docstring
+    PHASE 3 for the production incident this fixes.
     """
     if not path:
         return None
@@ -367,21 +440,14 @@ def read_real_usage(path, now):
         return None
     if not isinstance(payload, dict):
         return None
-    five = payload.get("five_hour")
-    if not isinstance(five, dict):
-        return None
-    up = five.get("used_percentage")
-    if not isinstance(up, (int, float)) or isinstance(up, bool):
-        return None
-    ra = five.get("resets_at")
-    if not isinstance(ra, (int, float)) or isinstance(ra, bool):
-        return None
-    if ra <= now:
-        return None
     observed_at = payload.get("observed_at")
     if not isinstance(observed_at, (int, float)) or isinstance(observed_at, bool):
         observed_at = None
-    return {"used_percentage": float(up), "resets_at": float(ra), "observed_at": observed_at}
+    five = _parse_window(payload.get("five_hour"), now, observed_at, None)
+    seven = _parse_window(payload.get("seven_day"), now, observed_at, SEVEN_DAY_STALE_TTL_SECS)
+    if five is None and seven is None:
+        return None
+    return {"five_hour": five, "seven_day": seven, "observed_at": observed_at}
 
 
 def cmd_status(args):
@@ -403,14 +469,36 @@ def cmd_status(args):
     measured = measure(path, cutoff.timestamp(), max_bytes)
     budget_verdict, budget_pct = compute_verdict(measured, budget, threshold)
 
+    crossed_window = None
+    percent_real = None
+    percent_real_seven_day = None
+    five_resets_at = None
+    seven_resets_at = None
+
     if real is not None:
         source = SOURCE_REAL
-        percent_real = round(real["used_percentage"], 2)
-        verdict = CROSSED if real["used_percentage"] >= threshold else UNDER
+        five = real["five_hour"]
+        seven = real["seven_day"]
+        five_crossed = False
+        seven_crossed = False
+        if five is not None:
+            percent_real = round(five["used_percentage"], 2)
+            five_resets_at = five["resets_at"]
+            five_crossed = five["used_percentage"] >= threshold
+        if seven is not None:
+            percent_real_seven_day = round(seven["used_percentage"], 2)
+            seven_resets_at = seven["resets_at"]
+            seven_crossed = seven["used_percentage"] >= threshold
+        if five_crossed and seven_crossed:
+            crossed_window = "both"
+        elif seven_crossed:
+            crossed_window = "seven_day"
+        elif five_crossed:
+            crossed_window = "five_hour"
+        verdict = CROSSED if (five_crossed or seven_crossed) else UNDER
         note = REAL_NOTE
     else:
         source = SOURCE_BUDGET
-        percent_real = None
         verdict = budget_verdict
         note = NOTE
 
@@ -420,9 +508,12 @@ def cmd_status(args):
         "verdict": verdict,
         "crossed": verdict == CROSSED,
         "source": source,
+        "window": crossed_window,
         "percent_of_budget": round(budget_pct, 2) if budget_pct is not None else None,
         "percent_real": percent_real,
-        "real_usage_resets_at": real["resets_at"] if real is not None else None,
+        "percent_real_seven_day": percent_real_seven_day,
+        "real_usage_resets_at": five_resets_at,
+        "real_usage_seven_day_resets_at": seven_resets_at,
         "real_usage_observed_at": real["observed_at"] if real is not None else None,
         "rate_limit_state_path": rate_limit_path,
         "threshold_pct": threshold,
@@ -448,8 +539,16 @@ def cmd_status(args):
     else:
         print("heimdall-session-usage: verdict=%s (source=%s)" % (verdict, source))
         if source == SOURCE_REAL:
-            print("  real quota: %.2f%% of Anthropic's five-hour limit (threshold %.1f%%)" % (percent_real, threshold))
-            print("  resets_at: %s" % result["real_usage_resets_at"])
+            if percent_real is not None:
+                print("  real quota: %.2f%% of Anthropic's five-hour limit (threshold %.1f%%)" % (percent_real, threshold))
+                print("  resets_at: %s" % result["real_usage_resets_at"])
+            else:
+                print("  real quota: five-hour figure absent/expired -- see seven_day below")
+            if percent_real_seven_day is not None:
+                print("  real quota: %.2f%% of Anthropic's seven-day (weekly) limit (threshold %.1f%%)" % (percent_real_seven_day, threshold))
+                print("  seven_day resets_at: %s" % result["real_usage_seven_day_resets_at"])
+            if crossed_window is not None:
+                print("  CROSSED WINDOW: %s" % crossed_window)
         elif result["budget_configured"]:
             print("  budget: %s tokens (operator-configured via %s)" % (budget, BUDGET_ENV))
         else:

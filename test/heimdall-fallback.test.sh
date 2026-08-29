@@ -1127,6 +1127,50 @@ unset HMD_FB_TEST_KEY
   && ok "43. auto + passing preflight + session-usage UNKNOWN -> WAIT, NOT route (fails closed on unmeasurable capacity)" \
   || bad "43. got rc=$rc out='$out'"
 
+# ── 43b/43c/43d (NEW 2026-08-29, heimdall-session-usage PHASE 3): the
+# session-usage payload can now carry a "window" field (five_hour / seven_day
+# / both) alongside "crossed" -- metadata only, never a routing input (that
+# stays session_verdict=="crossed", untouched). These prove: (b) it fires --
+# a crossed+window payload surfaces the window in [INFO]; (c) a pre-Phase-3
+# legacy payload (test 38's own fixture: crossed, no "window" key at all)
+# renders identically to before, no crash, no stray "None"; (d) it does NOT
+# fire somewhere it shouldn't -- an adversarial non-crossed payload that still
+# carries a "window" key must never let that leak into the [INFO] line. ────
+R="$(fresh_repo)"
+export HMD_FB_TEST_KEY="x"
+export ANTHROPIC_MODEL="anthropic/claude-3-5-sonnet-20241022"
+write_cfg "$R" '{
+  "state": "auto",
+  "operator_key_env": "HMD_FB_TEST_KEY",
+  "endpoint": "http://127.0.0.1:20128",
+  "omniroute_db_path": "'"$CLEAN_DB"'",
+  "target_provider": "self-hosted-mixtral"
+}'
+export HEIMDALL_FALLBACK_ASSUME_REACHABLE=1
+export HEIMDALL_FALLBACK_SESSION_USAGE_BIN="$(make_fake_session_usage '{"verdict":"crossed","crossed":true,"source":"real","window":"seven_day","percent_real_seven_day":99.0}')"
+out="$(fb --repo "$R" check)"; rc=$?
+unset HEIMDALL_FALLBACK_SESSION_USAGE_BIN
+[ "$rc" -eq 0 ] && echo "$out" | grep -q "VERDICT: ROUTE" && echo "$out" | grep -q "(window: seven_day)" \
+  && ok "43b. session-usage crossed+window=seven_day -> [INFO] names the window" \
+  || bad "43b. got rc=$rc out='$out'"
+
+export HEIMDALL_FALLBACK_SESSION_USAGE_BIN="$(make_fake_session_usage '{"verdict":"crossed","crossed":true,"source":"budget"}')"
+out="$(fb --repo "$R" check)"; rc=$?
+unset HEIMDALL_FALLBACK_SESSION_USAGE_BIN
+[ "$rc" -eq 0 ] && echo "$out" | grep -q "VERDICT: ROUTE" && ! echo "$out" | grep -q "(window:" && ! echo "$out" | grep -q " None" \
+  && ok "43c. legacy crossed payload with no 'window' key -> unchanged [INFO], no crash, no stray None" \
+  || bad "43c. got rc=$rc out='$out'"
+
+export HEIMDALL_FALLBACK_SESSION_USAGE_BIN="$(make_fake_session_usage '{"verdict":"under","crossed":false,"source":"real","window":"five_hour"}')"
+out="$(fb --repo "$R" check)"; rc=$?
+unset HEIMDALL_FALLBACK_SESSION_USAGE_BIN
+export HEIMDALL_FALLBACK_ASSUME_REACHABLE=0
+unset ANTHROPIC_MODEL
+unset HMD_FB_TEST_KEY
+[ "$rc" -eq 2 ] && echo "$out" | grep -q "VERDICT: WAIT" && ! echo "$out" | grep -q "(window:" \
+  && ok "43d. adversarial non-crossed payload still carrying a 'window' key -> never surfaces (window: never fires when it should not)" \
+  || bad "43d. got rc=$rc out='$out'"
+
 # ── 44. NEW (2026-08-26 deny-list-emptied correction): a real provider name
 # formerly on the built-in ToS deny list now PASSES target_provider_allowed
 # by default, and the SAME provider can still be denied by an explicit
