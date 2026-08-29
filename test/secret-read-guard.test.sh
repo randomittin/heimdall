@@ -62,7 +62,7 @@ mk ".env.template"                     "FAKE_SECRET=your-key-here"
 mk "config.pem"                        "-----BEGIN CERTIFICATE-----\nFAKEFAKEFAKE\n-----END CERTIFICATE-----"
 mk "app.key"                           "fake-key-bytes-not-real"
 mk "app.pub"                           "ssh-rsa AAAAB3FAKEFAKEFAKE fake@fake"
-mk "id_rsa"                            "-----BEGIN OPENSSH PRIVATE KEY-----\nFAKEFAKEFAKE\n-----END OPENSSH PRIVATE KEY-----"
+mk "id_rsa"                            "fake-rsa-key-bytes"
 mk "id_rsa.pub"                        "ssh-rsa AAAAB3FAKEFAKEFAKE fake@fake"
 mk "id_ed25519"                        "fake-ed25519-key-bytes"
 mk "id_ecdsa"                          "fake-ecdsa-key-bytes"
@@ -77,13 +77,20 @@ mk ".omniroute/heimdall-fallback.key"  "fake-fallback-key"
 mk ".omniroute/management-password.txt" "fake-password"
 mk ".omniroute/server.env"             "FAKE_VAR=fake"
 mk ".heimdall/team.json"               '{"fake":"team"}'
-mk ".ssh/id_rsa"                       "-----BEGIN OPENSSH PRIVATE KEY-----\nFAKEFAKEFAKE\n-----END OPENSSH PRIVATE KEY-----"
+mk ".ssh/id_rsa"                       "fake-rsa-key-bytes"
 mk ".ssh/my_custom_key"                "fake-unknown-named-key-in-ssh-dir"
 mk ".ssh/known_hosts"                  "example.com ssh-rsa FAKEFAKEFAKE"
 mk ".ssh/id_rsa.pub"                   "ssh-rsa AAAAB3FAKEFAKEFAKE fake@fake"
 mk "ordinary.ts"                       "export const answer = 42;"
-mk "notes-with-key.txt"                "-----BEGIN OPENSSH PRIVATE KEY-----\nFAKEFAKEFAKE\n-----END OPENSSH PRIVATE KEY-----"
-mk "notes-with-rsa-key.txt"            "-----BEGIN RSA PRIVATE KEY-----\nFAKEFAKEFAKE\n-----END RSA PRIVATE KEY-----"
+# PEM banners assembled at runtime — fragments below never form a literal
+# "-----BEGIN ... PRIVATE KEY-----" run in source (heimdall-fixture-secret-convention.md).
+# These two fixtures rely on the guard's CONTENT sniff (innocuous .txt name), so the
+# runtime bytes must still contain a genuine PEM header.
+P_PB='-----BEGIN'; P_PK='PRIVATE KEY-----'; P_PE='-----END'; P_NL='\n'
+NOTES_KEY_BODY="${P_PB} OPENSSH ${P_PK}${P_NL}FAKEFAKEFAKE${P_NL}${P_PE} OPENSSH ${P_PK}"
+NOTES_RSA_BODY="${P_PB} RSA ${P_PK}${P_NL}FAKEFAKEFAKE${P_NL}${P_PE} RSA ${P_PK}"
+mk "notes-with-key.txt"                "$NOTES_KEY_BODY"
+mk "notes-with-rsa-key.txt"            "$NOTES_RSA_BODY"
 
 # ---- harness -----------------------------------------------------------
 GUARD_OUT=""; GUARD_ERR=""

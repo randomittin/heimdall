@@ -71,9 +71,12 @@ F_AWS_ID="${P_AK}IA3TZ7QW9LMNBVCXZQ"
 F_GOOGLE="${P_AI}zaSyC8kFq2mWzXcVbNjHgTrEdYuIoPaSdFgHj"
 F_SLACK="${P_XO}xb-2837465192-8374651920-QwErTyUiOpAsDfGhJkLzXc"
 F_JWT="${P_EY}JhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.${P_EY}JzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkZBS0UifQ.QWERTYuiopASDFGHjklZXCVBNm"
-F_PEM="$(printf -- '-----BEGIN RSA PRIVATE KEY-----\nMIIBOgIBAAJBAKj34GkxFhD90vcNLYLInFEX6Ppy1tPf9Cnzj4p4WGeKLs1Pt8Qu\nKUpRKfFLfRYC9AIKjbJTWit+CqvjWYzvQwECAwEAAQJAIJLixBy2qpFoS4DSmoEm\n-----END RSA PRIVATE KEY-----\n')"
-F_AWS_SECRET='wJalrXUtnFEMI/K7MDENG/bPxRfiCYzQ8kLmNpVx'
+P_PB='-----BEGIN'; P_PK='PRIVATE KEY-----'; P_PE='-----END'
+F_PEM="$(printf -- '%s RSA %s\nMIIBOgIBAAJBAKj34GkxFhD90vcNLYLInFEX6Ppy1tPf9Cnzj4p4WGeKLs1Pt8Qu\nKUpRKfFLfRYC9AIKjbJTWit+CqvjWYzvQwECAwEAAQJAIJLixBy2qpFoS4DSmoEm\n%s RSA %s\n' "$P_PB" "$P_PK" "$P_PE" "$P_PK")"
+P_AS1='wJalrXUtnFEMI/K7MDENG/'; P_AS2='bPxRfiCYzQ8kLmNpVx'
+F_AWS_SECRET="${P_AS1}${P_AS2}"
 F_DB_PASS='Xk9mPq2wLz7vNb4tRc8yHj3s'
+P_TH1='TOKEN'; P_TH2='_HASH='; P_TH3='e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
 
 scan_shapes() { # stdin = text -> shapes found, one per line
   HEIMDALL_HOME="$VAULT_DIR" python3 "$LIB" scan 2>/dev/null | cut -f1
@@ -125,7 +128,7 @@ expect_clean "uuid assigned to a token name" 'TOKEN_ID=550e8400-e29b-41d4-a716-4
 expect_clean "git sha in a command" 'git checkout adcf77e8b3c1d4f5a6b7c8d9e0f1a2b3c4d5e6f7'
 expect_clean "sha256 digest" 'sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"'
 expect_clean "hex digest under a token key name" \
-  'TOKEN_HASH=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
+  "${P_TH1}${P_TH2}${P_TH3}"
 expect_clean "lorem ipsum paragraph" \
   'Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum.'
 expect_clean "shell env-var reference"   'API_KEY=${OPENAI_API_KEY}'
