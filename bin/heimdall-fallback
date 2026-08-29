@@ -1191,27 +1191,12 @@ def run_preflight(cfg):
     return checks
 
 
-def _tier_routes_under_on(tier):
-    """Whether a task of the given TIER is eligible for `on`'s capability-tier
-    routing decision. `on` maps to the haiku tier only -- see header point 8,
-    agents/heimdall.md's Model Routing table, and CLAUDE.md's 2026-08-11
-    model-routing directive. tier=None means the caller asked the ORIGINAL,
-    tier-blind question (bin/lib/issue_loop.py, preserved unchanged) and is
-    always eligible, exactly like every state before `on` was redefined."""
-    if tier is None:
-        return True
-    return TIER_ALIASES.get(tier) == LOW_LEVEL_TIER
-
-
-def _verdict(state, checks, tier=None, session_verdict=None):
-    """state decides ROUTE vs REFUSE vs WAIT; `on` additionally consults the
-    task TIER now that it is a capability-tier routing decision, not an
-    exhaustion reaction (auto keeps that job -- see header point 8 -- and
-    still never consults tier). `switch` never WAITs: it is an explicit
-    always-try state, so a failing preflight is a REFUSE, exactly like `on`,
-    never a silent wait (header point 9). run_preflight's checks always run
-    in full regardless of state or tier -- nothing here is ever a
-    short-circuit (header point 1).
+def _verdict(state, checks, session_verdict=None):
+    """state decides ROUTE vs REFUSE vs WAIT. `switch` never WAITs: it is an
+    explicit always-try state, so a failing preflight is a REFUSE, never a
+    silent wait (header point 9). run_preflight's checks always run in full
+    regardless of state -- nothing here is ever a short-circuit (header
+    point 1).
 
     `auto` is the one state that is actually exhaustion-gated (header point
     11): a passing preflight is NECESSARY but no longer SUFFICIENT for ROUTE
@@ -1221,13 +1206,11 @@ def _verdict(state, checks, tier=None, session_verdict=None):
     nothing on its own), and a passing preflight with session_verdict in
     {"under", "unconfigured", "unknown", None} WAITs instead of routing
     (capacity remains, or cannot be confirmed low, so there is nothing to
-    react to yet). off/on/switch never read session_verdict at all -- callers
+    react to yet). off/switch never read session_verdict at all -- callers
     pass None for them and this function never inspects it outside the
     `state == "auto"` branch below.
     """
     preflight_ok = all(ok for _, ok, _ in checks)
-    if state == "on" and not _tier_routes_under_on(tier):
-        return "REFUSE", 1
     if state == "auto":
         if not preflight_ok:
             return "WAIT", 2
@@ -1327,11 +1310,9 @@ def cmd_check(args):
         cfg, _ = load_config(args.repo)
         checks = run_preflight(cfg)
         state = cfg["state"]
-        tier = getattr(args, "tier", None)
         preflight_ok = all(ok for _, ok, _ in checks)
-        tier_ok = _tier_routes_under_on(tier) if state == "on" else True
         session_verdict = _session_pre_exhaustion_verdict(args.repo) if state == "auto" else None
-        verdict, rc = _verdict(state, checks, tier=tier, session_verdict=session_verdict)
+        verdict, rc = _verdict(state, checks, session_verdict=session_verdict)
 
         header = "heimdall-fallback check -- VERDICT: %s" % verdict
         if state == "switch":
@@ -1349,28 +1330,11 @@ def cmd_check(args):
         if state == "auto":
             print("  [INFO] session_usage -- %s" % SESSION_USAGE_NOTE_FMT[session_verdict])
 
-        if state == "on" and tier is not None:
-            resolved = TIER_ALIASES.get(tier, tier)
-            line = "  [%s] tier_eligible (tier=%s)" % ("OK  " if tier_ok else "FAIL", tier)
-            if not tier_ok:
-                line += (
-                    " -- '%s' resolves to the '%s' tier; state=on is a capability-tier "
-                    "routing decision and only routes '%s'-tier work (lint, format, "
-                    "rename, simple config, doc-sync -- agents/heimdall.md's Model "
-                    "Routing table); default coding work (sonnet) and adjudication "
-                    "(reviewer/verifier/security-auditor, always opus) never route "
-                    "under 'on'" % (tier, resolved, LOW_LEVEL_TIER)
-                )
-            print(line)
-
         if verdict == "WAIT" and not preflight_ok:
             print("  (state=auto: preflight failed -> waiting rather than routing blind)")
         elif verdict == "WAIT" and preflight_ok:
             print("  (state=auto: preflight passed but session_usage verdict is not "
                   "crossed -> waiting rather than routing while capacity remains)")
-        elif verdict == "REFUSE" and state == "on" and preflight_ok and not tier_ok:
-            print("  (state=on, preflight passed, but tier is not low-level -> refusing; "
-                  "'on' routes haiku-tier work only, not an exhaustion reaction)")
         elif verdict == "REFUSE" and state != "off":
             print("  (state=%s but a required check failed -> refusing rather than proceeding unsafely)" % state)
 
@@ -1570,8 +1534,7 @@ def _routing_decision(args):
     checks = run_preflight(cfg)
     state = cfg["state"]
     session_verdict = _session_pre_exhaustion_verdict(args.repo) if state == "auto" else None
-    verdict, rc = _verdict(state, checks, tier=getattr(args, "tier", None),
-                           session_verdict=session_verdict)
+    verdict, rc = _verdict(state, checks, session_verdict=session_verdict)
     failed = [name for name, ok, _ in checks if not ok]
     reason = "verdict=%s (state=%s)" % (verdict, state)
     if failed:
@@ -1689,14 +1652,8 @@ def build_parser():
     sp_set = sub.add_parser("set", help="persist a new fallback state")
     sp_set.add_argument("value", choices=VALID_STATES)
 
-    sp_check = sub.add_parser("check", help="run the preflight; exit code is the verdict (0=ROUTE 1=REFUSE 2=WAIT)")
-    sp_check.add_argument(
-        "--tier", default=None, choices=sorted(TIER_ALIASES),
-        help="task tier/role for state=on's capability-tier routing decision "
-             "(haiku|sonnet|opus, or an adjudication-role alias -- reviewer|"
-             "verifier|security-auditor -- for opus). Omit for the original, "
-             "tier-blind question (bin/lib/issue_loop.py's own call shape).",
-    )
+    sub.add_parser("check", help="run the preflight; exit code is the verdict (0=ROUTE 1=REFUSE 2=WAIT)")
+
     sp_arm = sub.add_parser(
         "arm",
         help="self-provision target_provider + operator_key_env (never inventing a "
@@ -1708,18 +1665,14 @@ def build_parser():
              "already-valid configured one, else auto-pick a no-auth provider)",
     )
     sp_arm.add_argument(
-        "--state", default="auto", choices=("auto", "on", "switch"),
+        "--state", default="auto", choices=("auto", "switch"),
         help="fallback state to write once provisioning succeeds (default: auto)",
     )
 
-    sp_burl = sub.add_parser(
+    sub.add_parser(
         "base-url",
         help="print the OmniRoute base URL iff the verdict is ROUTE (stdout stays "
              "empty otherwise); the seam `hmd route` consumes",
-    )
-    sp_burl.add_argument(
-        "--tier", default=None, choices=sorted(TIER_ALIASES),
-        help="same tier argument `check` takes, for state=on's tier decision",
     )
 
     sub.add_parser(
