@@ -313,6 +313,64 @@ reach_extract_tokens() {
       }' 2>/dev/null )
 }
 
+# reach_module_installer_tokens ROOT — "bin/heimdall-modules:<token>" for every token
+# found in EXACTLY the two manifest fields bin/heimdall-modules itself reads as
+# instructions to execute or resolve: installs_via.fetch and installs_via.artifact_path.
+# Emitted in the SAME "referrer:token" shape reach_extract_tokens produces, so the
+# result flows through reach_build's existing name-matching awk filter completely
+# unchanged — no second edge format, no second matching rule to keep in sync.
+#
+# THE REFERRER IS bin/heimdall-modules, DELIBERATELY NEVER THE MANIFEST FILE ITSELF.
+# manifest_path() (bin/heimdall-modules:208) names every modules/<name>/manifest.json.
+# acquire_upstream() reads `.installs_via.fetch` (:876) and actually RUNS it (:926,
+# `capture "$fetch" ...`) for an "upstream" module; install_module() branches on
+# `.installs_via.kind` (:980) and, for a "local" module, reads
+# `.installs_via.artifact_path` (:984) and actually USES it as a file path —
+# existence-checked (:989) and hashed against the pin (:994). Those two fields, and
+# only those two, are genuinely, mechanically executed. bin/heimdall-modules is
+# already an independently-reachable node (its own `modules)` case is dispatched
+# from bin/heimdall:2359) — this function only ever ADDS outgoing edges from it,
+# never invents its liveness.
+#
+# EVERYTHING ELSE IN A MANIFEST MUST STAY INVISIBLE TO THIS GRAPH. A module manifest
+# carries a lot of prose and embedded programs that are never install steps:
+# upstream_note / permission_class_note commentary, and — concretely, not
+# hypothetically — invariants.*.command fields, which are themselves whole
+# shell/python programs free to mention any bin/ name in the repo for design-parity
+# commentary. modules/headroom/manifest.json is exactly this shape: its
+# round-trip-fidelity invariant literally does `import verified_memory as vm`, and
+# its wires[] prose separately names `bin/lib/verified_memory.py` by path while
+# describing what a grep once found. A first attempt at this fix seeded the WHOLE
+# manifest file as a reach_root_seeds() root instead of reading it narrowly, and that
+# swept both of those in: the manifest, now a root, tokenized as raw JSON prose,
+# manufactured an edge to bin/lib/verified_memory.py, whose own
+# `argparse(prog="heimdall-memory")` self-reference then manufactured a SECOND edge
+# onward to bin/heimdall-memory — reviving an intentionally DEAD, exempted CLI (see
+# reachability-exemptions.tsv) on nothing more than two cosmetic self-references
+# chained together. That attempt never reached main and is not the shape below.
+# Reading exactly two named fields by KEY, via jq, is what keeps the edge honest:
+# exactly what bin/heimdall-modules reads, never anything a manifest merely ships
+# alongside.
+reach_module_installer_tokens() {
+  local root="$1" mf fetch apath v
+  command -v jq >/dev/null 2>&1 || return 0
+  [ -d "$root/modules" ] || return 0
+  ( cd "$root" 2>/dev/null || exit 0
+    find modules -mindepth 2 -maxdepth 2 -type f -name 'manifest.json' 2>/dev/null
+  ) | while IFS= read -r mf; do
+    [ -f "$root/$mf" ] || continue
+    fetch="$(jq -r '.installs_via.fetch // empty' "$root/$mf" 2>/dev/null)"
+    apath="$(jq -r '.installs_via.artifact_path // empty' "$root/$mf" 2>/dev/null)"
+    for v in "$fetch" "$apath"; do
+      [ -n "$v" ] || continue
+      printf '%s' "$v" | LC_ALL=C grep -oE '[A-Za-z0-9_.-]+' | while IFS= read -r tok; do
+        printf 'bin/heimdall-modules:%s\n' "$tok"
+      done
+    done
+  done
+  return 0
+}
+
 # reach_build ROOT WORKDIR — one grep pass over the tree, then a BFS from the seeds.
 # Writes WORKDIR/{nodes,names,seeds,scanset,hits,edges,live,subjects,dead}.
 reach_build() {
@@ -350,7 +408,15 @@ reach_build() {
   # 24 LIVE bins were LIVE only via a comment-fed path. Matches are whole leftmost-
   # longest tokens, so a name occurring INSIDE a longer token comes back as that longer
   # token and fails the exact compare, same as before.
-  reach_extract_tokens "$root" "$w/scanset" \
+  #
+  # reach_module_installer_tokens is merged into the SAME stream, ahead of the SAME
+  # filter, so a module's installs_via.fetch / installs_via.artifact_path get exactly
+  # the same name-matching and dot-splitting treatment as everything else — see that
+  # function's own header for why its edges are attributed to bin/heimdall-modules and
+  # not to the manifest file it reads them from.
+  { reach_extract_tokens "$root" "$w/scanset"
+    reach_module_installer_tokens "$root"
+  } \
     | LC_ALL=C awk -v namesf="$w/names" '
     BEGIN { while ((getline l < namesf) > 0) nm[l] = 1 }
     {
