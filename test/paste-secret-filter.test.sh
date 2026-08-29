@@ -128,7 +128,7 @@ expect_clean "uuid assigned to a token name" 'TOKEN_ID=550e8400-e29b-41d4-a716-4
 expect_clean "git sha in a command" 'git checkout adcf77e8b3c1d4f5a6b7c8d9e0f1a2b3c4d5e6f7'
 expect_clean "sha256 digest" 'sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"'
 expect_clean "hex digest under a token key name" \
-  'TOKEN_HASH=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
+  "${P_TH1}${P_TH2}${P_TH3}"
 expect_clean "lorem ipsum paragraph" \
   'Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum.'
 expect_clean "shell env-var reference"   'API_KEY=${OPENAI_API_KEY}'
