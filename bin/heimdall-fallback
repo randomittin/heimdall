@@ -598,11 +598,22 @@ def load_config(repo):
     FORBIDDEN_CONFIG_KEYS entry all resolve to a fresh DEFAULT_CFG copy
     (state off) -- never a partially-trusted merge. See header point 6. A
     persisted state of 'on' (removed; see header point 8) migrates to 'off',
-    never 'auto' -- 'auto' is tier-blind and could grant MORE routing than
-    'on' ever did, so landing there silently would be a real capability
-    increase for an operator who never asked for one. Returns (cfg,
-    corrupt_reason); corrupt_reason is None when the on-disk config (or its
-    absence) was clean.
+    the same landing every other invalid/corrupt state value already gets
+    below -- never 'auto' or 'switch', both of which are live states an
+    operator now has to choose deliberately. 'on', as its one real caller
+    (bin/lib/issue_loop.py) ever actually exercised it -- never passing a
+    tier argument -- computed the identical ROUTE/REFUSE outcome 'switch'
+    and 'off' still compute today, so nothing is silently made MORE
+    permissive by landing on 'off'; the capability genuinely lost ('on'
+    refusing non-low-tier work outright) had zero live callers to begin
+    with. 'auto' is not a safer synonym for 'off' here -- it is a
+    differently-natured, exhaustion-reactive gate (header point 11) that
+    would silently substitute session-usage judgment for the tier judgment
+    'on' actually made, and it can WAIT indefinitely rather than give a
+    clear answer when usage cannot be confirmed crossed, which is a worse
+    landing for a config that used to resolve cleanly either way. Returns
+    (cfg, corrupt_reason); corrupt_reason is None when the on-disk config
+    (or its absence) was clean.
     """
     path = _cfg_path(repo)
     try:
@@ -626,14 +637,19 @@ def load_config(repo):
     raw_state = cfg.get("state")
     if raw_state == "on":
         # 'on' was removed (owner directive: only off/auto/switch survive).
-        # Migrate to 'off', the SAFE direction, never 'auto': fail toward
-        # LESS egress, not more -- see the docstring above and header point 8.
+        # Migrate to 'off' -- the same uniform landing every other invalid
+        # state value already gets a few lines below -- rather than guessing
+        # a replacement state on the operator's behalf; see the docstring
+        # above and header point 8.
         cfg["state"] = "off"
         state_corrupt_reason = (
             "state 'on' no longer exists (removed; valid states are now "
-            "off/auto/switch) -- migrated to 'off' rather than 'auto', since "
-            "'auto' could grant MORE routing than 'on' ever did; run "
-            "'heimdall-fallback set auto' or 'set switch' to re-arm"
+            "off/auto/switch) -- migrated to 'off' rather than picking a "
+            "replacement for you: 'on' routed exactly like 'switch' whenever "
+            "it actually routed, so this loses no egress, but choosing "
+            "'auto' or 'switch' is now yours to make, not this tool's "
+            "guess; run 'heimdall-fallback set auto' or 'set switch' to "
+            "re-arm"
         )
     elif raw_state not in VALID_STATES:
         cfg["state"] = "off"
