@@ -61,14 +61,14 @@ fi
 
 # ── FAKE fixtures, assembled at runtime ─────────────────────────────────────
 # Split so that neither half matches a credential regex on its own.
-P_SK='sk-'; P_GH='gh'; P_AK='AK'; P_AI='AI'; P_XO='xo'; P_EY='ey'
+P_SK='sk-'; P_GH='gh'; P_GHP='git'; P_AK='AK'; P_AI='AI'; P_XO='xo'; P_EY='ey'
 F_ANTHROPIC="${P_SK}ant-api03-QQvbPtRk7wLmXn2yZa8FcJdE4hUgS1oI9pTrNbVxKwMyAeCzDfGhJkLnPqRsTuVwXyZaBcDeFgHiJkLmNoPq"
 F_OPENAI_PROJ="${P_SK}proj-7fKq2mWzXcVbNjHgTrEdYuIoPaSdFgHjKlZxCvBnMq"
 F_OPENAI_BARE="${P_SK}7fKq2mWzXcVbNjHgTrEdYuIoPaSdFgHjKlZxCvBn"
 F_GITHUB="${P_GH}p_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
-F_GITHUB_PAT="${P_GH}itub_pat_11ABCDE0zQwErTyUiOpAsDfGhJkLzXcVbNm1234567890qwertyuiopasdfghjklzxcvb"
+F_GITHUB_PAT="${P_GHP}hub_pat_11ABCDE0zQwErTyUiOpAsDfGhJkLzXcVbNm1234567890qwertyuiopasdfghjklzxcvb"
 F_AWS_ID="${P_AK}IA3TZ7QW9LMNBVCXZQ"
-F_GOOGLE="${P_AI}zaSyC8kFq2mWzXcVbNjHgTrEdYuIoPaSdFgH"
+F_GOOGLE="${P_AI}zaSyC8kFq2mWzXcVbNjHgTrEdYuIoPaSdFgHj"
 F_SLACK="${P_XO}xb-2837465192-8374651920-QwErTyUiOpAsDfGhJkLzXc"
 F_JWT="${P_EY}JhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.${P_EY}JzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkZBS0UifQ.QWERTYuiopASDFGHjklZXCVBNm"
 F_PEM="$(printf -- '-----BEGIN RSA PRIVATE KEY-----\nMIIBOgIBAAJBAKj34GkxFhD90vcNLYLInFEX6Ppy1tPf9Cnzj4p4WGeKLs1Pt8Qu\nKUpRKfFLfRYC9AIKjbJTWit+CqvjWYzvQwECAwEAAQJAIJLixBy2qpFoS4DSmoEm\n-----END RSA PRIVATE KEY-----\n')"

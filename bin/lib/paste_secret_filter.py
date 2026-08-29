@@ -93,6 +93,11 @@ MIN_GENERIC_ENTROPY = 3.6
 
 UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 PURE_HEX_RE = re.compile(r"^[0-9a-fA-F]{16,}$")
+# A dotted version string is digit+alpha, three character classes and ~3.9
+# bits/char — it clears every other guard. `TOKEN_LIB_VERSION=1.24.7-beta.3+build`
+# is a false positive without this, and version pins next to token/secret key
+# names are everywhere in lockfiles and CI config.
+VERSION_RE = re.compile(r"^v?[0-9]+(\.[0-9]+)+([.\-+][A-Za-z0-9.\-+]*)?$")
 
 # Substrings that mark a value as a reference, a template, or a documentation
 # placeholder rather than a real credential.
@@ -175,6 +180,8 @@ def generic_value_is_secretlike(value: str) -> bool:
     # measure and are ubiquitous in ordinary code. Excluding them costs us
     # hex-shaped secrets; that trade is documented and deliberate.
     if UUID_RE.match(value) or PURE_HEX_RE.match(value):
+        return False
+    if VERSION_RE.match(value):
         return False
     if value.isdigit():
         return False
