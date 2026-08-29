@@ -1,0 +1,236 @@
+#!/usr/bin/env python3
+"""bin/heimdall-429-mark -- the REACTIVE quota-exhaustion recorder.
+
+THE GAP THIS CLOSES -- see docs/analysis/2026-08-29-fallback-did-not-fire-
+rootcause.md for the full measured incident (three production kills on
+2026-08-29). bin/heimdall-session-usage's "real" signal (rate_limits.
+five_hour / .seven_day) is a STATUSLINE SNAPSHOT: it only updates when the
+statusline renders, it never observes the SESSION limit at all, and it can be
+minutes stale at the moment a spawn needs the decision. All three kills
+happened with that signal reporting "under" while the actual HTTP calls were
+being refused with 429. The one signal that is always correctly timed and
+always available is the 429 itself. This tool exists to remember one: an
+observed 429 marks the gate crossed for a bounded TTL so the NEXT spawn
+(read via bin/heimdall-session-usage PHASE 4) routes around Anthropic instead
+of repeating the same failure.
+
+WHAT THIS TOOL IS NOT: it cannot save the request that just failed (the
+marker is written AFTER the 429 is observed); it does not itself decide to
+route anything (see bin/heimdall-fallback -- this only ever feeds one
+INDEPENDENT, ADDITIVE input into heimdall-session-usage's verdict; every
+preflight check heimdall-fallback runs, including the adjudication fence, is
+completely unaffected); and it cannot distinguish a real exhaustion from a
+transient rate-limit blip on the first mark alone -- see the TTL discussion
+below for how that risk is bounded, not eliminated.
+
+COVERAGE, STATED PLAINLY: the only caller wired to this tool today is
+bin/lib/hmd-claude-retry.sh, which observes 429s from SUBPROCESS `claude -p`
+spawns. An IN-PROCESS Agent-tool spawn's 429 is reported by the harness to
+the orchestrator as a task-notification, never to a hook -- nothing in this
+repo can observe that from inside a hook or a subprocess. Marking that case
+is the ORCHESTRATOR's job: call `heimdall-429-mark mark` yourself the moment
+you see a spawn die on HTTP 429. This is a deliberate, documented gap, not
+an oversight -- see bin/heimdall-session-usage's own PHASE 4 docstring for
+the reader side of this same contract.
+
+NEVER-FAILS CONTRACT (matches bin/heimdall-metric exactly -- see that file's
+own header and CLAUDE.md "Code Quality"): `mark` is telemetry, not work. A
+bad flag, an unwritable $HEIMDALL_HOME, a read-only filesystem, a full disk --
+every failure mode is a SILENT no-op at exit 0, so a broken recorder can
+never take down the retry loop that calls it. `--strict` (tests only; real
+callers never pass it) surfaces a failure as a real exit code instead.
+
+IDEMPOTENT: `mark` always OVERWRITES the marker with a fresh timestamp
+(tmp-file + os.replace -- matches sentinels/hmd-statusline.py's own
+persist_rate_limits() atomic-write pattern for this exact class of small
+state file). Calling it 50 times during a retry storm is exactly as correct
+as calling it once: each call simply refreshes the TTL window.
+
+TTL -- DEFAULT_TTL_SECS below, and why 900s (15 minutes), neither longer nor
+shorter: this only has to bridge ONE gap -- the time between "a 429 was
+observed" and "the next spawn attempt reads the marker" -- not the whole
+remaining exhaustion window (five_hour/seven_day already cover the
+longer-lived picture once the statusline catches up; see
+heimdall-session-usage PHASE 2/3). Measured against bin/lib/hmd-claude-
+retry.sh's own worst case: HMD_OVERLOAD_MAX_ATTEMPTS=6 with exponential
+backoff capped at HMD_OVERLOAD_CAP_SECS=120 gives up in well under 5 minutes
+end to end, so 900s comfortably covers that plus realistic orchestrator
+dispatch/poll latency before the next spawn attempt. It deliberately does
+NOT try to cover "hours" -- the calling task's own non-negotiable is that a
+single transient 429 (which can be ordinary rate-limit backoff, not real
+exhaustion) must never pin the gate open for hours. If exhaustion is real
+and ongoing, the next request keeps hitting 429 and keeps refreshing the
+marker -- the TTL only has to survive the GAP between marks, not the whole
+outage.
+"""
+import argparse
+import json
+import os
+import re
+import sys
+import time
+
+DEFAULT_TTL_SECS = 900  # 15 min -- see module docstring TTL section above
+MARKER_FILE_ENV = "HEIMDALL_429_MARKER_FILE"
+REASON_MAX = 64
+
+
+class Rejected(Exception):
+    """Bad CLI usage -- caught by main(), never a crash (never-fails contract)."""
+
+
+def _slug(value, cap):
+    if value is None:
+        return None
+    text = re.sub(r"[^a-z0-9_-]+", "-", str(value).strip().lower()).strip("-")
+    return text[:cap] or None
+
+
+def _default_home():
+    return os.environ.get("HEIMDALL_HOME") or os.path.join(os.path.expanduser("~"), ".heimdall")
+
+
+def marker_path(override):
+    """CLI flag > env > default $HEIMDALL_HOME/429-marker.json -- same
+    override precedence as every other path in this repo (e.g.
+    heimdall-session-usage's --rate-limit-file / HEIMDALL_RATE_LIMIT_STATE)."""
+    if override:
+        return override
+    env = os.environ.get(MARKER_FILE_ENV)
+    if env:
+        return env
+    return os.path.join(_default_home(), "429-marker.json")
+
+
+def cmd_mark(args):
+    path = marker_path(args.file)
+    payload = {"marked_at": time.time()}
+    reason = _slug(args.reason, REASON_MAX)
+    if reason:
+        payload["reason"] = reason
+    try:
+        d = os.path.dirname(path)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        tmp = path + ".%d.tmp" % os.getpid()
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(json.dumps(payload, sort_keys=True))
+        os.replace(tmp, path)
+    except OSError as exc:
+        if args.strict:
+            sys.stderr.write("error: could not write marker: %s\n" % exc)
+            return 3
+        return 0  # never-fails contract: a marker write failing is a no-op
+    return 0
+
+
+def cmd_check(args):
+    path = marker_path(args.file)
+    ttl = args.ttl_secs if args.ttl_secs is not None else DEFAULT_TTL_SECS
+    now = time.time()
+    marked_at = None
+    reason = None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        if isinstance(payload, dict):
+            v = payload.get("marked_at")
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                marked_at = float(v)
+            r = payload.get("reason")
+            if isinstance(r, str):
+                reason = r
+    except (OSError, ValueError):
+        marked_at = None
+
+    age = None
+    fresh = False
+    if marked_at is not None:
+        age = now - marked_at
+        fresh = 0 <= age <= ttl
+
+    result = {
+        "fresh": fresh,
+        "marked_at": marked_at,
+        "age_secs": round(age, 2) if age is not None else None,
+        "ttl_secs": ttl,
+        "reason": reason,
+        "marker_path": path,
+    }
+    if args.json:
+        print(json.dumps(result, sort_keys=True))
+    elif fresh:
+        print("heimdall-429-mark: FRESH -- 429 observed %.0fs ago (ttl %ds)%s" % (
+            age, ttl, (" reason=%s" % reason) if reason else ""))
+    elif marked_at is not None:
+        print("heimdall-429-mark: EXPIRED -- 429 observed %.0fs ago (ttl %ds)" % (age, ttl))
+    else:
+        print("heimdall-429-mark: no marker at %s" % path)
+    return 0 if fresh else 1
+
+
+def cmd_where(args):
+    print(marker_path(args.file))
+    return 0
+
+
+def build_parser():
+    class _Parser(argparse.ArgumentParser):
+        def error(self, message):
+            raise Rejected(message)
+
+    ap = _Parser(
+        prog="heimdall-429-mark",
+        description="Record (or check) a reactive HTTP-429 quota-exhaustion "
+                    "marker consumed by bin/heimdall-session-usage PHASE 4. "
+                    "Never fails a caller -- see module docstring.")
+    ap.add_argument("--strict", action="store_true",
+                     help="surface rejected input / write failures as real exit codes (tests only)")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    m = sub.add_parser("mark", help="record (refresh) the marker, timestamped now")
+    m.add_argument("--file", default=None,
+                    help="marker file path override (default: env %s, else "
+                         "$HEIMDALL_HOME/429-marker.json)" % MARKER_FILE_ENV)
+    m.add_argument("--reason", default=None,
+                    help="free-text provenance, slugged and capped (e.g. 'hmd-claude-retry')")
+    m.set_defaults(fn=cmd_mark)
+
+    c = sub.add_parser("check", help="report whether a fresh marker exists")
+    c.add_argument("--file", default=None)
+    c.add_argument("--ttl-secs", dest="ttl_secs", type=int, default=None,
+                    help="freshness bound in seconds (default: %d)" % DEFAULT_TTL_SECS)
+    c.add_argument("--json", action="store_true")
+    c.set_defaults(fn=cmd_check)
+
+    w = sub.add_parser("where", help="print the resolved marker path and exit")
+    w.add_argument("--file", default=None)
+    w.set_defaults(fn=cmd_where)
+
+    return ap
+
+
+def main(argv):
+    strict = "--strict" in argv
+    try:
+        args = build_parser().parse_args(argv)
+    except Rejected as exc:
+        if strict:
+            sys.stderr.write("error: %s\n" % exc)
+            return 2
+        return 0
+    return args.fn(args)
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main(sys.argv[1:]))
+    except BrokenPipeError:
+        raise SystemExit(0)
+    except SystemExit:
+        raise
+    except Exception as exc:
+        if "--strict" in sys.argv:
+            sys.stderr.write("error: %s\n" % exc)
+            raise SystemExit(3)
+        raise SystemExit(0)
