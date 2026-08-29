@@ -84,12 +84,16 @@ stamp_of() { stat -f '%N %m %z' "$1" 2>/dev/null || stat -c '%n %Y %s' "$1" 2>/d
 #   - the PreToolUse ctx-meter hook writes ~/.heimdall/ctx/<session-id>.json
 #     on every tool call (bin/heimdall-ctx-meter notice).
 #   - the statusline's throttled presence beat drives bin/heimdall-status-json,
-#     which writes ~/.heimdall/ledger/status.json via the same tmp+rename
-#     pattern (opposite tmp-name order: <path>.tmp.<pid> vs rate-limits'
-#     <path>.<pid>.tmp).
+#     which writes ~/.heimdall/ledger/repos/<repo_key>.json (one file PER repo,
+#     since the mirror-race fix in docs/analysis/2026-08-29-statusline-roster-
+#     inflation.md — repo_key() lives in sentinels/hmd_ledger.py) via the same
+#     tmp+rename pattern (opposite tmp-name order: <path>.tmp.<pid> vs
+#     rate-limits' <path>.<pid>.tmp), falling back to the legacy
+#     ~/.heimdall/ledger/status.json only for an unmigrated install or an
+#     explicit HMD_STATUS_OUT/--out override.
 # A tmp+rename INSIDE a directory bumps that directory's OWN mtime too (not
 # just the file's) — so a bare `ls -lTd ~/.heimdall` before/after false-
-# positived on all three, none of which have anything to do with the seeder
+# positived on all of these, none of which have anything to do with the seeder
 # (confirmed by grep: none of these paths appear anywhere in
 # bin/heimdall-seed-demo-wall).
 #
@@ -97,24 +101,28 @@ stamp_of() { stat -f '%N %m %z' "$1" 2>/dev/null || stat -c '%n %Y %s' "$1" 2>/d
 # under ~/.heimdall and stamps each one — STRICTLY MORE sensitive than the old
 # check (a write to ANY file anywhere in the tree now fails C3, including an
 # in-place content overwrite with no rename at all, which the old directory-
-# mtime compare would have missed entirely) except for the three writers named
-# above, excluded BY EXACT PATH — never a wildcarded directory — so a genuine
-# escape into a sibling file, even right next to rate-limits.json or inside
-# ledger/, still fails the gate. ctx/ is the one subtree excluded wholesale,
-# because it is inherently dynamic (a new file per Claude Code session, not a
-# fixed name) — it is independently hook-driven and the seeder never
-# references it either.
+# mtime compare would have missed entirely) except for the writers named
+# above. The FIXED-name writers are excluded BY EXACT PATH — never a
+# wildcarded directory — so a genuine escape into a sibling file, even right
+# next to rate-limits.json or the legacy ledger/status.json, still fails the
+# gate. ctx/ and ledger/repos/ are the two subtrees excluded wholesale,
+# because each is inherently dynamic (a new file per Claude Code session, or
+# per repo on this machine, not a fixed name) — both are independently
+# hook/keeper-driven and the seeder never references either.
 home_heimdall_snapshot() {
   [ -d "$HOME/.heimdall" ] || return 0
   local rl="$HOME/.heimdall/rate-limits.json"
   local lg="$HOME/.heimdall/ledger/status.json"
   local lgdir="$HOME/.heimdall/ledger"
+  local lgrepos="$HOME/.heimdall/ledger/repos"
   local ctx="$HOME/.heimdall/ctx"
   find "$HOME/.heimdall" -mindepth 1 2>/dev/null | sort | while IFS= read -r f; do
     case "$f" in
       "$rl"|"$rl".*.tmp) continue ;;  # statusline rate-limit persister
-      "$lg"|"$lg".tmp.*) continue ;;  # heimdall-status-json persister
+      "$lg"|"$lg".tmp.*) continue ;;  # heimdall-status-json persister (legacy global mirror)
       "$lgdir") continue ;;           # the rename above also bumps ledger/'s own mtime
+      "$lgrepos"|"$lgrepos"/*) continue ;;  # heimdall-status-json persister (per-repo mirror:
+                                             # dynamic per-repo filename, like ctx/ below)
       "$ctx"|"$ctx"/*) continue ;;    # per-session ctx-meter hook writes
     esac
     stamp_of "$f"
