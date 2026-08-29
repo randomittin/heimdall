@@ -119,16 +119,21 @@ done
 # --- 5. the hook command really logs, for every covered tool -----------------
 # Run the actual command string from hooks.json against a representative
 # PostToolUse payload, in an isolated ledger root, and assert the path lands.
+SANDBOX="$(mktemp -d "${TMPDIR:-/tmp}/edit-hook-matcher.XXXXXX")"
+trap 'rm -rf "$SANDBOX"' EXIT
+
+# Never rebuild onto the tracked $REPO/bin/edit-tracker — a test must not
+# mutate a committed binary (test/run-all.sh's tree-integrity check flags
+# exactly that). If the real one isn't usable, build a throwaway copy inside
+# the sandbox instead and point TRACKER at it.
 if [ ! -x "$TRACKER" ] && [ -f "$REPO/bin/edit-tracker.c" ]; then
-  clang -O2 -Wall -Wextra -o "$TRACKER" "$REPO/bin/edit-tracker.c" 2>/dev/null || true
+  clang -O2 -Wall -Wextra -o "$SANDBOX/edit-tracker" "$REPO/bin/edit-tracker.c" 2>/dev/null || true
+  [ -x "$SANDBOX/edit-tracker" ] && TRACKER="$SANDBOX/edit-tracker"
 fi
 
 if [ ! -x "$TRACKER" ]; then
   bad "bin/edit-tracker is not executable — cannot prove end-to-end logging"
 else
-  SANDBOX="$(mktemp -d "${TMPDIR:-/tmp}/edit-hook-matcher.XXXXXX")"
-  trap 'rm -rf "$SANDBOX"' EXIT
-
   HOOK_CMD="$SANDBOX/hook-cmd.sh"
   jq -r '
     [.hooks.PostToolUse[]

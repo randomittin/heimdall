@@ -62,12 +62,17 @@ if [ ! -f "$HOOKS" ]; then
   echo "  missing $HOOKS" >&2
   exit 1
 fi
-if [ ! -x "$TRACKER" ] && [ -f "$REPO/bin/edit-tracker.c" ]; then
-  clang -O2 -Wall -Wextra -o "$TRACKER" "$REPO/bin/edit-tracker.c" 2>/dev/null || true
-fi
-
 SANDBOX="$(mktemp -d "${TMPDIR:-/tmp}/hook-payload-escaping.XXXXXX")"
 trap 'rm -rf "$SANDBOX"' EXIT
+
+# Never rebuild onto the tracked $REPO/bin/edit-tracker — a test must not
+# mutate a committed binary (test/run-all.sh's tree-integrity check flags
+# exactly that). If the real one isn't usable, build a throwaway copy inside
+# the sandbox instead and point TRACKER at it.
+if [ ! -x "$TRACKER" ] && [ -f "$REPO/bin/edit-tracker.c" ]; then
+  clang -O2 -Wall -Wextra -o "$SANDBOX/edit-tracker" "$REPO/bin/edit-tracker.c" 2>/dev/null || true
+  [ -x "$SANDBOX/edit-tracker" ] && TRACKER="$SANDBOX/edit-tracker"
+fi
 
 # The content must hold REAL newlines and tabs. Claude Code JSON-encodes the file
 # body, so a real 0x0A becomes the two-character escape \n inside the payload —
