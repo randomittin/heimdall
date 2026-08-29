@@ -208,16 +208,51 @@ case "$ERR" in
 esac
 case "$ERR" in *OmniRoute*) ok "disclosure still fires for a generation spawn (unconditional per spec)" ;; *) bad "disclosure did not fire for a generation spawn under confirmed fallback" ;; esac
 
-# not routed: heimdall-fallback itself reports no ROUTE verdict (rc=1, empty stdout)
+# gate=WAIT (fake rc=1, empty stdout -- heimdall-fallback itself reports no
+# CURRENT ROUTE verdict) but ANTHROPIC_BASE_URL still points at the gateway --
+# this is the exact stale-inherited-env regression found by live orchestrator
+# testing, NOT caught by this suite's own first version (which asserted
+# "allowed" here). See RED-PROOF (c) below for proof the OLD verdict-keyed
+# trigger really did get this wrong. The fix denies it because the env var
+# itself, not a freshly re-verified verdict, is what actually routes an
+# in-process subagent's calls.
 fire "$SANDBOX/bin/heimdall-precheck-agent" "$(payload hmd:reviewer)" "$FAKE_URL" 1 ""
-[ "$RC" -eq 0 ] && ok "not-routed (fake rc=1) + hmd:reviewer -> allowed (exit 0)" \
-                || bad "not-routed + hmd:reviewer -> exit $RC, expected 0"
-case "$ERR" in *"BIFROST"*) bad "disclosure wrongly fired when not routed" ;; *) ok "no disclosure when not routed" ;; esac
+[ "$RC" -eq 2 ] && ok "gate=WAIT (fake rc=1) + ANTHROPIC_BASE_URL=gateway + hmd:reviewer -> denied (exit 2) [stale-env regression, fixed]" \
+                || bad "gate=WAIT + gateway env + hmd:reviewer -> exit $RC, expected 2 (stale-env regression NOT fixed)"
+case "$ERR" in *"BIFROST"*) ok "disclosure fires when gate=WAIT but env still points at the gateway" ;; *) bad "disclosure missing when gate=WAIT but env still points at the gateway" ;; esac
 
-# not routed: ANTHROPIC_BASE_URL simply does not match whatever heimdall-fallback reports
+# same gate=WAIT + gateway-env condition, but a GENERATION type -> still allowed
+fire "$SANDBOX/bin/heimdall-precheck-agent" "$(payload hmd:coder)" "$FAKE_URL" 1 ""
+[ "$RC" -eq 0 ] && ok "gate=WAIT + gateway env + hmd:coder (generation) -> allowed (exit 0)" \
+                || bad "gate=WAIT + gateway env + hmd:coder -> exit $RC, expected 0"
+
+# ANTHROPIC_BASE_URL unset entirely -- never loopback-shaped, must never deny,
+# regardless of what a (fake) heimdall-fallback would say if asked.
+fire "$SANDBOX/bin/heimdall-precheck-agent" "$(payload hmd:reviewer)" "" 0 "$FAKE_URL"
+[ "$RC" -eq 0 ] && ok "ANTHROPIC_BASE_URL unset + hmd:reviewer -> allowed (exit 0, no false positive)" \
+                || bad "ANTHROPIC_BASE_URL unset + hmd:reviewer -> exit $RC, expected 0"
+case "$ERR" in *"BIFROST"*) bad "disclosure wrongly fired with ANTHROPIC_BASE_URL unset" ;; *) ok "no disclosure with ANTHROPIC_BASE_URL unset" ;; esac
+
+# ANTHROPIC_BASE_URL is the real api.anthropic.com -- never loopback-shaped,
+# must never deny. The single most important false positive this fence must
+# avoid: a non-routed session must never have its adjudication spawns
+# refused. frc=0/furl=$FAKE_URL on purpose: proves the deny decision no longer
+# depends at all on what a fresh heimdall-fallback call would claim.
 fire "$SANDBOX/bin/heimdall-precheck-agent" "$(payload hmd:reviewer)" "https://api.anthropic.com" 0 "$FAKE_URL"
-[ "$RC" -eq 0 ] && ok "ANTHROPIC_BASE_URL mismatched vs fresh base-url + hmd:reviewer -> allowed (exit 0)" \
-                || bad "mismatched-URL case -> exit $RC, expected 0"
+[ "$RC" -eq 0 ] && ok "ANTHROPIC_BASE_URL=https://api.anthropic.com + hmd:reviewer -> allowed (exit 0, no false positive)" \
+                || bad "ANTHROPIC_BASE_URL=https://api.anthropic.com case -> exit $RC, expected 0"
+
+# the OTHER two loopback shapes the fix's case statement matches besides
+# 127.* (already covered above via $FAKE_URL) -- localhost and bracketed
+# IPv6 ::1 -- each proven to actually deny, not just parse, so the case
+# statement's extra branches are exercised, not merely present.
+fire "$SANDBOX/bin/heimdall-precheck-agent" "$(payload hmd:reviewer)" "http://localhost:8787" 1 ""
+[ "$RC" -eq 2 ] && ok "ANTHROPIC_BASE_URL=http://localhost:8787 + hmd:reviewer -> denied (exit 2, localhost loopback shape)" \
+                || bad "ANTHROPIC_BASE_URL=http://localhost:8787 case -> exit $RC, expected 2"
+
+fire "$SANDBOX/bin/heimdall-precheck-agent" "$(payload hmd:reviewer)" "http://[::1]:8787" 1 ""
+[ "$RC" -eq 2 ] && ok "ANTHROPIC_BASE_URL=http://[::1]:8787 + hmd:reviewer -> denied (exit 2, bracketed IPv6 ::1 loopback shape)" \
+                || bad "ANTHROPIC_BASE_URL=http://[::1]:8787 case -> exit $RC, expected 2"
 
 # malformed JSON under confirmed fallback: disclosure (env-only) still fires, deny (payload-dependent) fails open
 fire "$SANDBOX/bin/heimdall-precheck-agent" '{not json' "$FAKE_URL" 0 "$FAKE_URL"
@@ -303,6 +338,54 @@ if [ "$RC" -eq 2 ]; then
   ok "RED-PROOF (b): always-fence mutant WRONGLY denies hmd:coder (generation) under confirmed fallback (exit 2) -- proves section 3's pass-through is a real type-based discrimination, not always-allow"
 else
   bad "RED-PROOF (b) did not go red: mutant B exited $RC (expected 2) — the pass-through in section 3 may not be discriminating on type at all"
+fi
+
+# ── 6. RED-PROOF (c): the env-keyed TRIGGER itself, not just the deny/pass-
+# through decisions downstream of it. Mutant C reconstructs the OLD
+# verdict-keyed trigger this file's first version shipped with: it swaps only
+# the span between the real hook's own "-- env-loopback trigger (the fix) --"
+# and "-- end env-loopback trigger --" markers for a fresh heimdall-fallback
+# query + exact-match against ANTHROPIC_BASE_URL -- the same shape the real
+# fence had before this fix, expressed as a mutation of the CURRENT shipped
+# file rather than a separately-maintained copy, so it can never drift from
+# what the real trigger actually looks like. Proves the new gate=WAIT
+# assertions above are not vacuous: they must go RED against the OLD trigger.
+MUTANT_C="$SANDBOX/bin/mutant-c-verdict-keyed-trigger"
+awk '
+  /^    # -- env-loopback trigger \(the fix\) --$/ {
+    print
+    print "    ADJ_ENV_URL=\"$(\"$ADJ_FALLBACK_BIN\" --repo \"$PWD\" base-url 2>/dev/null)\" # MUTANT-C-verdict-keyed"
+    print "    ADJ_TRIGGERED=0"
+    print "    [ -n \"$ADJ_ENV_URL\" ] && [ \"$ADJ_ENV_URL\" = \"${ANTHROPIC_BASE_URL:-}\" ] && ADJ_TRIGGERED=1"
+    skip=1
+    next
+  }
+  /^    # -- end env-loopback trigger --$/ { skip=0; print; next }
+  skip { next }
+  { print }
+' "$REAL_HOOK" > "$MUTANT_C"
+chmod +x "$MUTANT_C"
+
+if bash -n "$MUTANT_C" 2>/dev/null; then
+  ok "mutant C (verdict-keyed trigger) parses (bash -n) — the red-proof below tests real behavior, not a syntax error"
+else
+  bad "mutant C (verdict-keyed trigger) FAILED bash -n — red-proof below would be meaningless"
+fi
+if grep -q 'MUTANT-C-verdict-keyed' "$MUTANT_C"; then
+  ok "mutant C actually replaced the env-loopback trigger (mutation applied, not a no-op edit)"
+else
+  bad "mutant C's awk substitution did not apply — the env-loopback trigger is still present"
+fi
+
+# The exact stale-env regression scenario from section 3 above (gate=WAIT,
+# ANTHROPIC_BASE_URL still the gateway, hmd:reviewer) must WRONGLY pass
+# against the OLD verdict-keyed mutant -- proving the new gate=WAIT
+# assertions are a real regression test, not vacuously true.
+fire "$MUTANT_C" "$(payload hmd:reviewer)" "$FAKE_URL" 1 ""
+if [ "$RC" -eq 0 ]; then
+  ok "RED-PROOF (c): verdict-keyed mutant WRONGLY allows hmd:reviewer when gate=WAIT but ANTHROPIC_BASE_URL still points at the gateway (exit 0) -- proves the env-keyed trigger, not the old fresh-verdict one, is why the real hook denies this case"
+else
+  bad "RED-PROOF (c) did not go red: verdict-keyed mutant exited $RC (expected 0) — may not faithfully reconstruct the old bug"
 fi
 
 echo "--------------------------------------------------------------------"
