@@ -205,6 +205,19 @@ RECORDER_ENV_FILE="$WORK/baseline.env"
   "$FAKEBIN/claude" -p "baseline task" --output-format text
 )
 
+# CJ -- judgment branch fails open (byte-identical to the unrouted baseline, not
+# merely "no crash") when bin/lib/hmd-gate-endpoint.sh is unreadable -- the
+# fixture's lib/ dir holds only the shim itself, never that library, so this
+# forces the "Fail open: judgment library unreadable" branch for real.
+RECORDER_ENV_FILE="$WORK/cj.env"
+( export RECORDER_ENV_FILE
+  export PATH="$FAKEBIN"
+  export HMD_JUDGMENT=1
+  unset HMD_AGENT_TYPE 2>/dev/null
+  "$FIXTURE_SHIM" -p "baseline task" --output-format text >/dev/null 2>&1
+)
+assert_untouched "CJ judgment fails open, byte-identical to baseline, when gate-endpoint lib is unreadable" "$WORK/baseline.env" "$RECORDER_ENV_FILE"
+
 # C2 -- REFUSE/WAIT verdict leaves the child env byte-identical (key-for-key) to the
 # unrouted baseline above.
 : > "$ROUTE_CALL_LOG"
