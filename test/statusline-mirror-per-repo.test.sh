@@ -131,16 +131,23 @@ write_mirror() {
     run_with_alarm 10 "$WRITER" >/dev/null 2>&1 )
 }
 
-# pyread WS REPO SESSION — hmd_ledger.read_status(SESSION, repo=REPO) with
+# pyread WS REPO SESSION NOW — hmd_ledger.read_status(SESSION, repo=REPO) with
 # HEIMDALL_HOME=WS, in an isolated env (mirrors test/heimdall-ledger-reader.test.sh's
-# pyrun isolation) so nothing leaks from this test's OWN real session/identity env.
+# pyrun isolation — including the real $HOME being cleared, closing that reference
+# helper's one gap: _self_ids() would otherwise fall through to the REAL ~/.heimdall for
+# identity.json) so nothing leaks from this test's OWN real session/identity env.
 # SESSION must be unique per distinct expectation within a shared WS — read_status caches
 # per session_id for 5s, and a reused id across two different repos in the same WS would
 # read back the FIRST call's cached answer instead of exercising a fresh read.
+# NOW must land within OFFLINE_WINDOW (7 days) of the write's HMD_STATUS_NOW/ts, else
+# hmd_ledger.filter_team() honestly drops the synthetic entry as beyond-window-stale —
+# that is a REAL, correct part of the contract (see heimdall-ledger-reader.test.sh's own
+# section 5), not something to relax; passing a NOW close to the write-time NOW here
+# simply keeps the fixture inside the window, same as any real recent heartbeat would be.
 pyread() {
-  local ws="$1" repo="$2" sess="$3"
-  run_with_alarm 10 env -i PATH="$PATH" LANG="${LANG:-en_US.UTF-8}" \
-    HEIMDALL_HOME="$ws" HMD_STATUSLINE_TMP="$ws/tmp-cache" \
+  local ws="$1" repo="$2" sess="$3" now="$4"
+  run_with_alarm 10 env -i PATH="$PATH" LANG="${LANG:-en_US.UTF-8}" HOME="$ws" \
+    HEIMDALL_HOME="$ws" HMD_STATUSLINE_TMP="$ws/tmp-cache" HMD_NOW="$now" \
     "$PY" -c "
 import sys, json
 sys.path.insert(0, '$ROOT/sentinels')
@@ -195,8 +202,8 @@ else
 fi
 
 # reader closure: the SAME key the writer used is what the reader resolves for each tree.
-OUT_READ_A="$(pyread "$WS1" "$REPO_A" "sess-headline-a")"
-OUT_READ_B="$(pyread "$WS1" "$REPO_B" "sess-headline-b")"
+OUT_READ_A="$(pyread "$WS1" "$REPO_A" "sess-headline-a" 1000)"
+OUT_READ_B="$(pyread "$WS1" "$REPO_B" "sess-headline-b" 1001)"
 READ_A_USER="$(printf '%s' "$OUT_READ_A" | jq -r '.team[0].user // empty' 2>/dev/null)"
 READ_B_USER="$(printf '%s' "$OUT_READ_B" | jq -r '.team[0].user // empty' 2>/dev/null)"
 [ "$READ_A_USER" = "alice-mirror-test" ] && ok "read_status(repo=A) resolves A's own roster (alice)" || bad "read_status(repo=A) got '$READ_A_USER': $OUT_READ_A"
@@ -248,7 +255,7 @@ cat > "$LEGACY_PATH" <<JSON
 JSON
 LEGACY_BEFORE="$(cat "$LEGACY_PATH")"
 
-OUT_L1="$(pyread "$WS3" "$REPO_L" "sess-legacy-1")"
+OUT_L1="$(pyread "$WS3" "$REPO_L" "sess-legacy-1" 5000)"
 GOT_L1_USER="$(printf '%s' "$OUT_L1" | jq -r '.team[0].user // empty' 2>/dev/null)"
 [ "$GOT_L1_USER" = "legacy-user" ] \
   && ok "no per-repo mirror yet -> reader falls back to the legacy global mirror (old roster, not a blank wall)" \
@@ -268,7 +275,7 @@ PERREPO_PATH="$(repo_key_path "$REPO_L" "$WS3")"
 [ -f "$LEGACY_PATH" ] && ok "the legacy global file still exists once the per-repo mirror exists (no destructive migration)" \
   || bad "the legacy file was deleted -- migration must never delete it"
 
-OUT_L2="$(pyread "$WS3" "$REPO_L" "sess-legacy-2")"
+OUT_L2="$(pyread "$WS3" "$REPO_L" "sess-legacy-2" 6000)"
 GOT_L2_USER="$(printf '%s' "$OUT_L2" | jq -r '.team[0].user // empty' 2>/dev/null)"
 [ "$GOT_L2_USER" = "dave" ] && ok "once the per-repo mirror exists it takes precedence over the legacy global fallback" \
   || bad "per-repo mirror did not win over the legacy fallback: $OUT_L2"
@@ -291,7 +298,7 @@ CORRUPT_PATH="$(repo_key_path "$REPO_C" "$WS4")"
 mkdir -p "$(dirname "$CORRUPT_PATH")"
 printf '{"daemon": true, "team": [ { "user": "truncated-mid-wr' > "$CORRUPT_PATH"
 
-OUT_CORRUPT="$(pyread "$WS4" "$REPO_C" "sess-corrupt-1" 2>&1)"
+OUT_CORRUPT="$(pyread "$WS4" "$REPO_C" "sess-corrupt-1" 9000 2>&1)"
 if printf '%s' "$OUT_CORRUPT" | grep -qi "traceback"; then
   bad "corrupt mirror raised a traceback: $OUT_CORRUPT"
 else

@@ -1,23 +1,12 @@
 #!/usr/bin/env bash
 # heimdall-status-json — the LEDGER STATUS PRODUCER for the HMD statusline (Spec v1 §6).
 #
-# WHAT IT IS. The statusline reads ONE JSON file per refresh, written PER REPO under
-# ~/.heimdall/ledger/repos/<repo_key>.json (sentinels/hmd_ledger.py's repo_key() /
-# status_path_for() — the SAME function this writer imports, so it and the reader can never
-# derive different paths for the same tree) — and never shells out to a dozen probes on the
-# hot path. THIS bin is the single writer of that file. It folds four REAL, already-existing
-# sources into the schema the statusline reads and writes the result ATOMICALLY (temp +
-# rename), so a mid-refresh read never sees a partial file. It is cheap and bounded — the
-# statusline caches the read for ~5s; this only has to be fast enough to keep that cache warm
-# on the presence beat.
-#
-# WHY PER-REPO. Before this, every repo's keeper on a machine wrote the SAME single global
-# path (~/.heimdall/ledger/status.json) — a last-writer-wins slot two concurrent repos fought
-# over, so a reader in repo A could transiently be handed repo B's roster (see
-# docs/analysis/2026-08-29-statusline-roster-inflation.md). Keying the mirror per repo makes
-# that race impossible by construction; the old global path is kept ONLY as a migration
-# fallback (an install whose writer has not beaten since this fix landed, or an explicit
-# HMD_STATUS_OUT/--out override) — see hmd_ledger.py's module docstring for the reader side.
+# WHAT IT IS. The statusline reads ONE JSON file per refresh — ~/.heimdall/ledger/status.json
+# — and never shells out to a dozen probes on the hot path. THIS bin is the single writer of
+# that file. It folds four REAL, already-existing sources into the schema the statusline reads
+# and writes the result ATOMICALLY (temp + rename), so a mid-refresh read never sees a partial
+# file. It is cheap and bounded — the statusline caches the read for ~5s; this only has to be
+# fast enough to keep that cache warm on the presence beat.
 #
 # THE CONTRACT (Spec v1 §6). One object, five keys:
 #   {
@@ -27,10 +16,12 @@
 #     "team":   [ {"user":"<h>","sigil":"#RRGGBB","branch":<str|null>,"state":"<st>","ts":<epoch>}, ... ],
 #     "repo":   "<abs repo root>"     # WHICH repo team[] is the roster OF
 #   }
-#   - repo: kept even though the mirror is per-repo now — it is what lets a reader that ever
-#     falls back to the legacy global tier tell "this roster is mine" from "someone else's":
-#     it renders team[] only when the stamp is its own tree, and shows NOTHING when the stamp
-#     is absent or foreign. Without it the wall painted other repos' people as present here.
+#   - repo: this file lives at ONE machine-global path, but team[] is only ever the roster of
+#     ONE project — whichever repo's keeper wrote it last. Two live sessions in two repos
+#     therefore FIGHT over this single slot. Stamping the repo is what lets the statusline
+#     tell "this roster is mine" from "this roster is someone else's": it renders team[] only
+#     when the stamp is its own tree, and shows NOTHING when the stamp is absent or foreign.
+#     Without it the wall painted other repos' people as present on this project's wall.
 #   - gates[].state: pass/running/deny -> the statusline renders the check/spinner/cross glyphs.
 #   - team[] entries carry a heartbeat ts, the teammate's sigil hue (deterministic identity
 #     color), a branch (null until presence broadcasts one — see below), and a wall state.
@@ -67,11 +58,7 @@
 #   heimdall-status-json [--out <path>] [--print]
 #   -h, --help
 # Env seams (also used by the wiring + tests):
-#   HMD_STATUS_OUT            explicit output path override — wins outright over the default
-#                             per-repo path (default: $HEIMDALL_HOME/ledger/repos/<repo_key>.json,
-#                             via sentinels/hmd_ledger.py's status_path_for(); falls back to the
-#                             legacy $HEIMDALL_HOME/ledger/status.json only when python3 is
-#                             unavailable)
+#   HMD_STATUS_OUT            output path (default $HEIMDALL_HOME/ledger/status.json)
 #   HEIMDALL_HOME             runtime home (default ~/.heimdall)
 #   HEIMDALL_KEEPER_DIR       keeper pidfile dir (default $HEIMDALL_HOME/presence-keeper)
 #   HMD_STATUS_VERDICT_FILE   verdict.json path (default <repo>/.heimdall/verdict.json)
@@ -104,15 +91,7 @@ while [ $# -gt 0 ]; do
 done
 
 HMD_HOME="${HEIMDALL_HOME:-$HOME/.heimdall}"
-# OUT_EXPLICIT is non-empty ONLY when the caller asked for a specific path (--out or
-# HMD_STATUS_OUT); it always wins outright. Absent that, the DEFAULT is now a per-repo path
-# (sentinels/hmd_ledger.py's status_path_for(), computed once REPO is known, below) instead
-# of the old single machine-global $HMD_HOME/ledger/status.json — see that module's
-# repo_key()/status_path_for() docstrings for why. The no-python branch below cannot import
-# that helper, so it keeps writing the legacy global path — an already-degraded, best-effort
-# branch (no sigils, no repo stamp either) on a codebase that requires python3 pervasively
-# elsewhere, so losing per-repo isolation there too is an accepted, explicitly-noted gap.
-OUT_EXPLICIT="${OUT_OVERRIDE:-${HMD_STATUS_OUT:-}}"
+OUT="${OUT_OVERRIDE:-${HMD_STATUS_OUT:-$HMD_HOME/ledger/status.json}}"
 KEEPER_DIR="${HEIMDALL_KEEPER_DIR:-$HMD_HOME/presence-keeper}"
 REPO="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 VERDICT_FILE="${HMD_STATUS_VERDICT_FILE:-$REPO/.heimdall/verdict.json}"
@@ -149,15 +128,12 @@ fi
 # ── assemble + atomic-write (python: import the sigil core for the identity hue) ──
 PY="$(command -v python3 || command -v python || true)"
 if [ -z "$PY" ]; then
-  # No python -> we cannot derive sigil hues OR import hmd_ledger's per-repo key. Still honor
-  # the never-write-garbage contract: emit a schema-valid file with an empty team (honest —
-  # the hue source is unavailable), at the legacy GLOBAL path (an explicit override still
-  # wins). The "repo" stamp is deliberately OMITTED here rather than interpolated: this
-  # branch has no JSON encoder, and a repo path containing a quote or backslash would emit
-  # invalid JSON and cost the reader the gates and verdict too. An absent stamp reads as
-  # UNKNOWN scope, which the statusline fails CLOSED on — and team[] is empty here anyway,
-  # so nothing is lost.
-  OUT="${OUT_EXPLICIT:-$HMD_HOME/ledger/status.json}"
+  # No python -> we cannot derive sigil hues. Still honor the never-write-garbage contract:
+  # emit a schema-valid file with an empty team (honest — the hue source is unavailable).
+  # The "repo" stamp is deliberately OMITTED here rather than interpolated: this branch has no
+  # JSON encoder, and a repo path containing a quote or backslash would emit invalid JSON and
+  # cost the reader the gates and verdict too. An absent stamp reads as UNKNOWN scope, which
+  # the statusline fails CLOSED on — and team[] is empty here anyway, so nothing is lost.
   mkdir -p "$(dirname "$OUT")" 2>/dev/null || true
   tmp="$OUT.tmp.$$"
   printf '{"daemon":"%s","gates":[],"verdict":{"state":"pending","label":"PENDING"},"team":[]}\n' \
@@ -171,8 +147,7 @@ HMD_DAEMON="$DAEMON" \
 HMD_VERDICT_FILE="$VERDICT_FILE" \
 HMD_ROSTER_JSON="$ROSTER_JSON" \
 HMD_REPO="$REPO" \
-HMD_OUT_EXPLICIT="$OUT_EXPLICIT" \
-HMD_HOME_DEFAULT="$HMD_HOME" \
+HMD_OUT="$OUT" \
 HMD_NOW="$NOW" \
 HMD_PRINT="$PRINT" \
 "$PY" - <<'PYEOF'
@@ -196,24 +171,6 @@ try:
 except Exception:
     def sigil_hex(seed):
         return None
-
-# status_path_for is the ONE place (sentinels/hmd_ledger.py) the per-repo mirror key is
-# derived — imported here (same sys.path.insert as hmd_sigil above, sibling module in the
-# same dir) so this writer and the statusline reader can never independently drift onto
-# different paths for the same tree. Import defensive, matching hmd_sigil above: if the
-# module is ever unavailable, the writer degrades to the legacy global path rather than
-# crashing (never fail to write status.json at all).
-try:
-    import hmd_ledger  # noqa: E402
-
-    def default_out(repo, home):
-        try:
-            return hmd_ledger.status_path_for(repo)
-        except Exception:
-            return os.path.join(home, "ledger", "status.json")
-except Exception:
-    def default_out(repo, home):
-        return os.path.join(home, "ledger", "status.json")
 
 
 def read_verdict(path):
@@ -339,22 +296,18 @@ def main():
         now = 0.0
     gates, verdict = read_verdict(os.environ.get("HMD_VERDICT_FILE", ""))
     team = read_team(os.environ.get("HMD_ROSTER_JSON", "[]"), now)
-    repo = os.environ.get("HMD_REPO", "") or ""
     status = {
         "daemon": os.environ.get("HMD_DAEMON", "down") or "down",
         "gates": gates,
         "verdict": verdict,
         "team": team,
-        # WHICH repo team[] describes. The mirror is now WRITTEN per-repo (see out_path
-        # below), but the stamp is kept regardless — it is what lets a reader that ever falls
-        # back to the legacy global tier (an unwritten install, or an explicit override) tell
-        # "this roster is mine" from "this roster is someone else's".
-        "repo": repo,
+        # WHICH repo team[] describes. This file is machine-global and single-slot, so it can
+        # only ever truthfully be the roster of ONE tree; naming that tree is what stops a
+        # reader in a DIFFERENT tree from rendering these people as its own.
+        "repo": os.environ.get("HMD_REPO", "") or "",
     }
     text = json.dumps(status, sort_keys=True) + "\n"
-    out_explicit = os.environ.get("HMD_OUT_EXPLICIT", "")
-    out_path = out_explicit or default_out(repo, os.environ.get("HMD_HOME_DEFAULT", ""))
-    atomic_write(out_path, text)
+    atomic_write(os.environ["HMD_OUT"], text)
     if os.environ.get("HMD_PRINT") == "1":
         sys.stdout.write(text)
     return 0
