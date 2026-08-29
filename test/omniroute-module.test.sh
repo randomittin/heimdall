@@ -153,6 +153,22 @@ cp "$REAL_CLASSES"/*.json "$MREG/_classes/"
 if [ "$HAVE_MANIFEST" -eq 1 ]; then
   mkdir -p "$MREG/omniroute"
   cp "$MANIFEST" "$MREG/omniroute/manifest.json"
+  # The shipped manifest declares a real preflight.disk_mb (16384 -- see
+  # docs/analysis/2026-08-29-omniroute-disk-footprint.md) that can legitimately
+  # exceed free space on a disk-constrained CI/test machine, and per
+  # module_preflight.sh a manifest-declared disk_mb always wins over
+  # HMD_PREFLIGHT_DISK_FLOOR_MB below. Overriding it here, once, up front --
+  # never deleting the key -- keeps every subtest exercising a manifest that
+  # still HAS a real preflight block (the true shape) while staying
+  # disk-size-independent, this suite's own stated intent (see
+  # HMD_PREFLIGHT_DISK_FLOOR_MB=1 above). MANIFEST_BASELINE, not $MANIFEST, is
+  # what restore_manifest() and every "byte-identical" check below compare
+  # against from this point on, since this override is a deliberate, explicit
+  # part of this run's baseline, not a mutation under test.
+  jq '.preflight.disk_mb = 1' "$MREG/omniroute/manifest.json" > "$MREG/omniroute/m.tmp" \
+    && mv "$MREG/omniroute/m.tmp" "$MREG/omniroute/manifest.json"
+  MANIFEST_BASELINE="$MREG/omniroute/manifest.baseline.json"
+  cp "$MREG/omniroute/manifest.json" "$MANIFEST_BASELINE"
 fi
 # headroom rides along in the same temp registry for the O3 contrast — it is
 # real, shipped, default_included:true, consent_waived:true.

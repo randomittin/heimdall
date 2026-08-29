@@ -20,7 +20,20 @@
 #                         `.build/next` (BUILD_ID, routes/prerender/build manifests,
 #                         required-server-files.json, server/, static/). A zero exit
 #                         from npm is NOT treated as proof — the files are checked.
-#   6. Runtime bootstrap — some runtime files ($DATA_DIR/server.env,
+#   6. Reclaim space    — delete `.build/next/cache` (Next's build-time compiler
+#                         cache) and `.build/next/standalone` (a self-contained
+#                         bundle for a PM2-style deployment this installer does not
+#                         use — see scripts/build/colocate-standalone.mjs's own doc
+#                         comment). Both are provably unread by `npm run start` for
+#                         this deployment: scripts/dev/run-next.mjs runs Next's
+#                         programmatic server against the project root and never
+#                         references `standalone` anywhere in that file, and `lsof`
+#                         on the live production process shows zero open handles
+#                         into either directory (see
+#                         docs/analysis/2026-08-29-omniroute-disk-footprint.md).
+#                         Best-effort and non-fatal: a failed reclaim never fails
+#                         the install. Opt out with OMNIROUTE_KEEP_BUILD_CACHE=1.
+#   7. Runtime bootstrap — some runtime files ($DATA_DIR/server.env,
 #                         $DATA_DIR/storage.sqlite + schema) are created by
 #                         OmniRoute's own code the first time any entrypoint
 #                         touches them, not by this installer. If they are not
@@ -28,7 +41,7 @@
 #                         brings them into existence, on an explicitly free port
 #                         chosen so it can never collide with a separately-running
 #                         instance (e.g. the production gateway on :20128).
-#   7. Security         — generate a 256-bit management password (`openssl rand -hex
+#   8. Security         — generate a 256-bit management password (`openssl rand -hex
 #                         32`), apply it via upstream's own
 #                         `bin/reset-password.mjs --password-stdin` (never an `.env`
 #                         edit — see docs/analysis/2026-08-25-omniroute-install.md
@@ -44,7 +57,7 @@
 #                         `provider_connections` for any row whose provider is
 #                         `claude`/`claude-web` — FAIL LOUDLY and refuse to complete
 #                         if one exists.
-#   8. Summary          — print what was installed; print NO secrets, ever.
+#   9. Summary          — print what was installed; print NO secrets, ever.
 #
 # OVERRIDES (env vars; all optional, defaults match the documented live install):
 #   INSTALL_DIR               where OmniRoute is cloned (default: $HOME/omniroute)
@@ -56,6 +69,9 @@
 #                              (default: 20228 — NOT the production 20128)
 #   OMNIROUTE_BOOTSTRAP_TIMEOUT seconds to wait for the bootstrap boot to become
 #                              healthy (default: 90)
+#   OMNIROUTE_KEEP_BUILD_CACHE keep `.build/next/{cache,standalone}` after a
+#                              successful build instead of reclaiming the space
+#                              (default: unset — reclaim runs)
 #
 # SAFETY: this script refuses to touch an existing INSTALL_DIR that is not either
 # (a) absent, or (b) already a git checkout at the exact pinned commit. Anything
@@ -334,6 +350,37 @@ run_build() {
   verify_build_artifacts
 }
 
+# `.build/next/cache` (Next's build-time compiler cache) and
+# `.build/next/standalone` (a self-contained bundle meant for a PM2-style
+# deployment — see scripts/build/colocate-standalone.mjs's own doc comment)
+# are both unused by THIS deployment's runtime. Proven two ways, not assumed:
+# (1) scripts/dev/run-next.mjs — what `npm run start` actually execs — calls
+#     Next's programmatic API against the project root and never references
+#     `standalone` anywhere in that file; and (2) `lsof -p <pid>` against the
+#     live production process shows zero open handles into either directory.
+# See docs/analysis/2026-08-29-omniroute-disk-footprint.md for the full proof.
+# An absent cache is safe by construction: it is the state of every brand-new
+# clone before its first build, so the build tooling already handles it.
+reclaim_build_space() {
+  if [ "${OMNIROUTE_KEEP_BUILD_CACHE:-0}" = "1" ]; then
+    info "OMNIROUTE_KEEP_BUILD_CACHE=1 — leaving $BUILD_DIR/cache and $BUILD_DIR/standalone in place"
+    return 0
+  fi
+
+  local target reclaimed=0 sz
+  for target in "$BUILD_DIR/cache" "$BUILD_DIR/standalone"; do
+    [ -d "$target" ] || continue
+    sz="$(du -sh "$target" 2>/dev/null | cut -f1)"
+    if rm -rf "$target" 2>/dev/null; then
+      info "reclaimed $target (${sz:-unknown size}) — unused by \`npm run start\`; set OMNIROUTE_KEEP_BUILD_CACHE=1 to keep it"
+      reclaimed=1
+    else
+      warn "could not remove $target — leaving it in place (non-fatal, disk hygiene only)"
+    fi
+  done
+  [ "$reclaimed" -eq 1 ] || info "no build cache/standalone directories found to reclaim"
+}
+
 build_omniroute() {
   if [ -d "$INSTALL_DIR/node_modules" ] && artifacts_present; then
     info "node_modules and .build/next artifacts already present — skipping npm ci + build"
@@ -342,6 +389,7 @@ build_omniroute() {
     run_npm_ci
     run_build
   fi
+  reclaim_build_space
 }
 
 # ── Phase 6: runtime bootstrap (only if needed) ──────────────────────────────
