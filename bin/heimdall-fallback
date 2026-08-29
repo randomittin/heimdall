@@ -407,7 +407,7 @@ DEFAULT_CFG = {
 # doc flagged ~30 across its "caution" and lower-confidence tiers),
 # target_provider_allowed could never pass and the fallback feature was
 # permanently inert regardless of an operator's own choice. The operator
-# turns fallback on EXPLICITLY (`heimdall-fallback set on|auto|switch` is a
+# turns fallback on EXPLICITLY (`heimdall-fallback set auto|switch` is a
 # deliberate act hmd never performs itself -- see "NO AUTO-SWITCH
 # CONTRADICTION" above) and has already accepted the data-handling tradeoff
 # (2026-08-23-omniroute-assessment.md's disqualifier-1 finding; the
@@ -600,18 +600,25 @@ def load_config(repo):
     persisted state of 'on' (removed; see header point 8) migrates to 'off',
     the same landing every other invalid/corrupt state value already gets
     below -- never 'auto' or 'switch', both of which are live states an
-    operator now has to choose deliberately. 'on', as its one real caller
-    (bin/lib/issue_loop.py) ever actually exercised it -- never passing a
-    tier argument -- computed the identical ROUTE/REFUSE outcome 'switch'
-    and 'off' still compute today, so nothing is silently made MORE
-    permissive by landing on 'off'; the capability genuinely lost ('on'
-    refusing non-low-tier work outright) had zero live callers to begin
-    with. 'auto' is not a safer synonym for 'off' here -- it is a
+    operator now has to choose deliberately. This is NOT a lossless landing:
+    'on', as its one real caller (bin/lib/issue_loop.py) ever actually
+    exercised it -- never passing a tier argument -- ROUTEd whenever
+    preflight passed, exactly like 'switch' still does today. 'off' is not
+    that same outcome: off's own "state" check in run_preflight() fails
+    unconditionally whenever state=='off', so a migrated config can never
+    ROUTE again until the operator explicitly re-arms to 'auto' or 'switch'
+    -- 'on's tier-blind ROUTE path is genuinely gone. That loss is
+    deliberate: 'off' is the one landing guaranteed to never silently hand
+    out MORE routing than the operator had, at the cost of not preserving
+    what they did have. The OTHER capability 'on' offered -- refusing
+    non-low-tier work outright regardless of preflight -- had zero live
+    callers to begin with, so that half really does cost nobody anything.
+    'auto' is not a safer substitute for 'off' here either -- it is a
     differently-natured, exhaustion-reactive gate (header point 11) that
     would silently substitute session-usage judgment for the tier judgment
     'on' actually made, and it can WAIT indefinitely rather than give a
-    clear answer when usage cannot be confirmed crossed, which is a worse
-    landing for a config that used to resolve cleanly either way. Returns
+    clear answer when usage cannot be confirmed crossed, a worse landing
+    than a config that now resolves cleanly (REFUSE) every time. Returns
     (cfg, corrupt_reason); corrupt_reason is None when the on-disk config
     (or its absence) was clean.
     """
@@ -645,11 +652,12 @@ def load_config(repo):
         state_corrupt_reason = (
             "state 'on' no longer exists (removed; valid states are now "
             "off/auto/switch) -- migrated to 'off' rather than picking a "
-            "replacement for you: 'on' routed exactly like 'switch' whenever "
-            "it actually routed, so this loses no egress, but choosing "
-            "'auto' or 'switch' is now yours to make, not this tool's "
-            "guess; run 'heimdall-fallback set auto' or 'set switch' to "
-            "re-arm"
+            "replacement for you: 'off' is a hard, unconditional refuse "
+            "(see run_preflight's own state check), so 'on's prior "
+            "tier-blind ROUTE is genuinely gone here, not preserved -- "
+            "deliberate, since 'off' is the one landing guaranteed to "
+            "never hand out MORE routing than you had; run "
+            "'heimdall-fallback set auto' or 'set switch' to re-arm"
         )
     elif raw_state not in VALID_STATES:
         cfg["state"] = "off"
@@ -974,7 +982,7 @@ def run_preflight(cfg):
     checks.append((
         "state",
         state != "off",
-        "" if state != "off" else "fallback state is 'off' (heimdall-fallback set on|auto|switch)",
+        "" if state != "off" else "fallback state is 'off' (heimdall-fallback set auto|switch)",
     ))
 
     key_env = cfg.get("operator_key_env") or ""
