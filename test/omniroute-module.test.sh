@@ -175,7 +175,7 @@ fi
 mkdir -p "$MREG/headroom"
 cp "$REAL_REG/headroom/manifest.json" "$MREG/headroom/manifest.json"
 
-restore_manifest() { cp "$MANIFEST" "$MREG/omniroute/manifest.json"; }
+restore_manifest() { cp "$MANIFEST_BASELINE" "$MREG/omniroute/manifest.json"; }
 mutate_manifest() {
   # "$@", not "$1" — some call sites need jq's --arg form (`mutate_manifest
   # --arg id "$FIRST_ID" 'del(.invariants[$id])'`), which is more than one
@@ -225,7 +225,7 @@ else
     && ok "RED ARM: the mutated copy now reads consent_waived:true — the check discriminates" \
     || bad "the mutation did not take on consent_waived"
   restore_manifest
-  [ "$(sha_file "$MANIFEST")" = "$(sha_file "$MREG/omniroute/manifest.json")" ] \
+  [ "$(sha_file "$MANIFEST_BASELINE")" = "$(sha_file "$MREG/omniroute/manifest.json")" ] \
     && ok "GREEN ARM: restored — the working copy is byte-identical to the shipped manifest again" \
     || bad "restore did not return the copy to the shipped bytes"
 fi
@@ -329,7 +329,7 @@ else
     && bad "the waived copy still prompted" || ok "the waived copy is not prompted"
   "$MODS" --registry "$MREG" --state "$FSTATE" remove omniroute >/dev/null 2>&1
   restore_manifest
-  [ "$(sha_file "$MANIFEST")" = "$(sha_file "$MREG/omniroute/manifest.json")" ] \
+  [ "$(sha_file "$MANIFEST_BASELINE")" = "$(sha_file "$MREG/omniroute/manifest.json")" ] \
     && ok "GREEN ARM: restored — the copy is byte-identical to the shipped manifest again" \
     || bad "restore did not return the copy to the shipped bytes"
 fi
@@ -455,7 +455,7 @@ else
   else
     bad "could not find a manifest-kind traffic-proxy invariant covered by the shipped manifest to falsify against"
   fi
-  [ "$(sha_file "$MANIFEST")" = "$(sha_file "$MREG/omniroute/manifest.json")" ] \
+  [ "$(sha_file "$MANIFEST_BASELINE")" = "$(sha_file "$MREG/omniroute/manifest.json")" ] \
     && ok "GREEN ARM: restored — the working copy is byte-identical to the shipped manifest again" \
     || bad "restore did not return the copy to the shipped bytes"
 fi
