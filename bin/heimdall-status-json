@@ -197,6 +197,24 @@ except Exception:
     def sigil_hex(seed):
         return None
 
+# status_path_for is the ONE place (sentinels/hmd_ledger.py) the per-repo mirror key is
+# derived — imported here (same sys.path.insert as hmd_sigil above, sibling module in the
+# same dir) so this writer and the statusline reader can never independently drift onto
+# different paths for the same tree. Import defensive, matching hmd_sigil above: if the
+# module is ever unavailable, the writer degrades to the legacy global path rather than
+# crashing (never fail to write status.json at all).
+try:
+    import hmd_ledger  # noqa: E402
+
+    def default_out(repo, home):
+        try:
+            return hmd_ledger.status_path_for(repo)
+        except Exception:
+            return os.path.join(home, "ledger", "status.json")
+except Exception:
+    def default_out(repo, home):
+        return os.path.join(home, "ledger", "status.json")
+
 
 def read_verdict(path):
     """Fold the recorded gate-run verdict.json into (gates[], verdict{}). Every field is read
@@ -321,18 +339,22 @@ def main():
         now = 0.0
     gates, verdict = read_verdict(os.environ.get("HMD_VERDICT_FILE", ""))
     team = read_team(os.environ.get("HMD_ROSTER_JSON", "[]"), now)
+    repo = os.environ.get("HMD_REPO", "") or ""
     status = {
         "daemon": os.environ.get("HMD_DAEMON", "down") or "down",
         "gates": gates,
         "verdict": verdict,
         "team": team,
-        # WHICH repo team[] describes. This file is machine-global and single-slot, so it can
-        # only ever truthfully be the roster of ONE tree; naming that tree is what stops a
-        # reader in a DIFFERENT tree from rendering these people as its own.
-        "repo": os.environ.get("HMD_REPO", "") or "",
+        # WHICH repo team[] describes. The mirror is now WRITTEN per-repo (see out_path
+        # below), but the stamp is kept regardless — it is what lets a reader that ever falls
+        # back to the legacy global tier (an unwritten install, or an explicit override) tell
+        # "this roster is mine" from "this roster is someone else's".
+        "repo": repo,
     }
     text = json.dumps(status, sort_keys=True) + "\n"
-    atomic_write(os.environ["HMD_OUT"], text)
+    out_explicit = os.environ.get("HMD_OUT_EXPLICIT", "")
+    out_path = out_explicit or default_out(repo, os.environ.get("HMD_HOME_DEFAULT", ""))
+    atomic_write(out_path, text)
     if os.environ.get("HMD_PRINT") == "1":
         sys.stdout.write(text)
     return 0

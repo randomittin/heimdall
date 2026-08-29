@@ -444,30 +444,30 @@ def _read_source(repo=None):
     per-repo mirror can never silently paint a different repo's stale global roster); every
     tier absent → the legacy single-verdict fallback, else SAFE_DEFAULT. Never raises."""
     for sp in (status_path_for(repo), _status_path()):
-      if not os.path.exists(sp):
-          continue
-      try:
+        if not os.path.exists(sp):
+            continue
+        try:
             with open(sp) as f:
                 d = json.load(f)
-      except Exception:
-          return dict(SAFE_DEFAULT)         # malformed live source → safe default
-      if not isinstance(d, dict):
-          return dict(SAFE_DEFAULT)
-      gates_raw = d.get("gates")
-      gates = [normalize_gate(g) for g in gates_raw] if isinstance(gates_raw, list) else []
-      members, overflow = filter_team(d.get("team"))
-      return {
-          "daemon": _norm_daemon(d.get("daemon")),
-          "gates": gates,
-          "verdict": _norm_verdict(d.get("verdict")),
-          "team": members,
-          "team_overflow": overflow,
-          # WHICH repo team[] is the roster of. Carried, never interpreted here: this reader
-          # has no idea which tree is being rendered. The renderer compares it against the
-          # tree it is painting and drops the mirror when they differ. Absent/unusable → ""
-          # (UNKNOWN), which the renderer fails CLOSED on.
-          "repo": str(d.get("repo") or ""),
-      }
+        except Exception:
+            return dict(SAFE_DEFAULT)         # malformed live source → safe default
+        if not isinstance(d, dict):
+            return dict(SAFE_DEFAULT)
+        gates_raw = d.get("gates")
+        gates = [normalize_gate(g) for g in gates_raw] if isinstance(gates_raw, list) else []
+        members, overflow = filter_team(d.get("team"))
+        return {
+            "daemon": _norm_daemon(d.get("daemon")),
+            "gates": gates,
+            "verdict": _norm_verdict(d.get("verdict")),
+            "team": members,
+            "team_overflow": overflow,
+            # WHICH repo team[] is the roster of. Carried, never interpreted here: this reader
+            # has no idea which tree is being rendered. The renderer compares it against the
+            # tree it is painting and drops the mirror when they differ. Absent/unusable → ""
+            # (UNKNOWN), which the renderer fails CLOSED on.
+            "repo": str(d.get("repo") or ""),
+        }
     legacy = _map_legacy()          # both mirror tiers absent → try the legacy single-verdict
     return legacy if legacy is not None else dict(SAFE_DEFAULT)
 
