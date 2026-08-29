@@ -222,11 +222,20 @@ expect_block "Bash: cat \$SECRET_KEY_FILE (unresolvable + sensitivity hint)" \
 expect_allow "Bash: cat \$LOGFILE (unresolvable, no sensitivity hint)" \
   "$GUARD" "$(bash_payload 'cat $LOGFILE')"
 
-NO_JQ_PATH="/usr/bin:/bin"
-if PATH="$NO_JQ_PATH" command -v jq >/dev/null 2>&1; then
-  bad "fail-open/no-jq check: jq unexpectedly present on $NO_JQ_PATH -- cannot isolate, counting as FAIL not silently skipped"
+# Build a PATH that has every OTHER dependency the guard needs (bash, cat,
+# grep, sed, awk, head, readlink, env) but deliberately NOT jq, regardless of
+# where jq happens to live on this host (a hardcoded "/usr/bin:/bin lacks
+# jq" assumption broke on a machine that ships jq there).
+NOJQ_BIN="$TMP/.nojq-bin"
+mkdir -p "$NOJQ_BIN"
+for t in bash cat grep sed awk head readlink env; do
+  real="$(command -v "$t" 2>/dev/null || true)"
+  [ -n "$real" ] && ln -sf "$real" "$NOJQ_BIN/$t"
+done
+if PATH="$NOJQ_BIN" command -v jq >/dev/null 2>&1; then
+  bad "fail-open/no-jq check: jq unexpectedly resolvable via the isolated PATH -- cannot isolate, counting as FAIL not silently skipped"
 else
-  OUT="$(printf '%s' "$(read_payload .env)" | env PATH="$NO_JQ_PATH" "$GUARD" 2>/dev/null)"
+  OUT="$(printf '%s' "$(read_payload .env)" | PATH="$NOJQ_BIN" "$GUARD" 2>/dev/null)"
   rc=$?
   if [ "$rc" -eq 0 ]; then
     ok "guard fails OPEN (rc=0) when its own jq dependency is unavailable"
