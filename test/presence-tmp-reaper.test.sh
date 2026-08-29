@@ -90,7 +90,11 @@ _set_mtime_ago() {
 # ever runs — masking the real result and silently invalidating the red-proof. Echoes
 # the scratch binary's path.
 _make_scratch_bin() {
-  local name="$1" sed_expr="$2" dir="$WORK/scratch-$name"
+  # NOTE: `dir` must NOT be assigned in the same `local` as `name` -- referencing
+  # $name inside the very declaration that creates it is unbound under `set -u`,
+  # which silently aborted the mutation and made both red-proofs meaningless.
+  local name="$1" sed_expr="$2"
+  local dir="$WORK/scratch-$name"
   mkdir -p "$dir/bin"
   ln -s "$REPO/bin/lib" "$dir/bin/lib"
   sed "$sed_expr" "$BIN" > "$dir/bin/heimdall-presence"
