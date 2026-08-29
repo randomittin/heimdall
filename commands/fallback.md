@@ -213,7 +213,7 @@ And fallback config is per-repo — `heimdall-route` calls `heimdall-fallback
 --repo "$PWD"`, reading and writing `<repo>/.heimdall/fallback.json`, so
 arming fallback in one repo never arms it in another. Nothing routes, and
 nothing leaves the operator's normal trust boundary, until an operator
-explicitly runs `heimdall-fallback set on|auto|switch` (or `arm`) in that
+explicitly runs `heimdall-fallback set auto|switch` (or `arm`) in that
 specific repo.
 
 Exposure scales with whatever is sitting in the context window at the moment
@@ -225,7 +225,7 @@ accumulated session sends everything it has built up.
 
 None of this touches the Tier-1 boundary described above: no state,
 including `switch`, ever routes a request at the operator's own Claude
-subscription — that boundary is identical across all four states and
+subscription — that boundary is identical across all three states and
 unaffected by anything in this section.
 
 ## What this does not change
@@ -243,7 +243,7 @@ in a command substitution when it launches a real child process — `status`,
 documented here for completeness and for debugging a routed launch that
 behaved unexpectedly.
 
-- **`heimdall-fallback base-url [--tier <t>]`** (same `--tier` vocabulary as `check`) — prints the OmniRoute base URL on stdout **only when the verdict is ROUTE**; on `REFUSE`, `WAIT`, or any internal error, stdout stays byte-empty and the reason goes to stderr only. `bin/heimdall-route` runs
+- **`heimdall-fallback base-url`** — prints the OmniRoute base URL on stdout **only when the verdict is ROUTE**; on `REFUSE`, `WAIT`, or any internal error, stdout stays byte-empty and the reason goes to stderr only. `bin/heimdall-route` runs
   `url="$(heimdall-fallback base-url)"` and exports whatever comes back — a
   reason string or a traceback leaking onto stdout here would be exported as
   a base URL and silently point a live session at garbage, so this seam
@@ -266,9 +266,6 @@ own argument parsing below (see Instructions) — they are a programmatic seam
 ## Other subcommands
 
 - `heimdall-fallback set off` — disarm immediately; always safe.
-- `heimdall-fallback check --tier <haiku|sonnet|opus|reviewer|verifier|security-auditor>` —
-  ask whether a task of THIS tier may route (only changes the answer under
-  `on`; every other state ignores `--tier`).
 - `heimdall-fallback status --json` — same fields, machine-readable.
 - `heimdall-fallback base-url` / `token-file` / `model` — programmatic seams
   `bin/heimdall-route` consumes directly; see "Seams `bin/heimdall-route`
@@ -280,9 +277,9 @@ own argument parsing below (see Instructions) — they are a programmatic seam
    - **Empty or `status`** → run `heimdall-fallback status`; if it shows
      `would preflight pass: no`, also run `heimdall-fallback check` and
      report the specific failing checks in plain language.
-   - **`check`** → run `heimdall-fallback check` (forward `--tier <T>` if the
-     user named one); report the verdict and every failing check's reason.
-   - **`on` / `auto` / `switch`** → this arms real routing through a
+   - **`check`** → run `heimdall-fallback check`; report the verdict and
+     every failing check's reason.
+   - **`auto` / `switch`** → this arms real routing through a
      third-party provider. State that plainly, then run
      `heimdall-fallback arm --state <value>` — it self-provisions a
      target_provider (and operator_key_env, for a keyed one) and reports the
@@ -292,13 +289,16 @@ own argument parsing below (see Instructions) — they are a programmatic seam
      `heimdall-fallback set <value>` + `heimdall-fallback check` sequence if
      arm refuses and the operator wants to supply their own provider/key by
      hand; never report "armed" without also showing the preflight result.
+   - **`on`** → refuse: `on` was removed (owner directive) and no longer
+     exists. Say so plainly and offer `auto` or `switch` instead — never
+     silently substitute one.
    - **`arm`** → run `heimdall-fallback arm` (forward `--provider <p>` /
      `--state <s>` if the operator named either), and relay its full output
      verbatim, including any REFUSED reason.
    - **`off`** → run `heimdall-fallback set off`. Always safe, no
      confirmation needed.
    - **`where`** → run `heimdall-fallback where` and print the path.
-   - Anything else → show the four-state table above and ask what they want.
+   - Anything else → show the three-state table above and ask what they want.
 2. Never fabricate a "would pass" verdict — always run `status`/`check`
    fresh and relay their real output.
 3. Never invent a `target_provider` or `operator_key_env` value — if the
@@ -311,10 +311,9 @@ Dev: "why isn't fallback routing?"
 → `heimdall-fallback status`, then `check` if it's not passing → relay the
   named failing checks, not just "it's off."
 
-Dev: "let fallback handle lint/format when Claude's busy"
-→ `heimdall-fallback arm --state on`, relay its output verbatim (including
-  the mandatory `export ANTHROPIC_MODEL=` line), then confirm with
-  `check --tier haiku`.
+Dev: "route to a third-party model once Claude capacity is nearly exhausted"
+→ `heimdall-fallback arm --state auto`, relay its output verbatim (including
+  the mandatory `export ANTHROPIC_MODEL=` line), then confirm with `check`.
 
 Dev: "turn fallback off"
 → `heimdall-fallback set off`.
