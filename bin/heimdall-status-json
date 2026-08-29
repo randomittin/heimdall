@@ -91,9 +91,44 @@ while [ $# -gt 0 ]; do
 done
 
 HMD_HOME="${HEIMDALL_HOME:-$HOME/.heimdall}"
-OUT="${OUT_OVERRIDE:-${HMD_STATUS_OUT:-$HMD_HOME/ledger/status.json}}"
 KEEPER_DIR="${HEIMDALL_KEEPER_DIR:-$HMD_HOME/presence-keeper}"
 REPO="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+
+# PER-REPO MIRROR PATH (the mirror-race fix, docs/analysis/2026-08-29-statusline-roster-
+# inflation.md). The default output is one file PER REPO, never the machine-global
+# ledger/status.json: that single slot was last-writer-wins across every repo on the box,
+# so another project's roster could render on this project's statusline.
+#
+# The key is NOT computed here. It comes from hmd_ledger.mirror_path() -- the same function
+# the READER uses -- so writer and reader can never drift onto different paths for one tree.
+# Deriving it independently in bash is exactly the bug this fix exists to remove.
+#
+# Falls back to the legacy global path ONLY if that import fails, so a broken sentinels/
+# degrades to the old behaviour rather than writing nowhere and blanking the statusline.
+_default_out() {
+  # PY is resolved further down the file, so pick an interpreter locally here.
+  local py; py="$(command -v python3 || command -v python || true)"
+  [ -n "$py" ] || return 0
+  "$py" - "$REPO" "$SIGIL_CORE_DIR" <<'PYOUT' 2>/dev/null
+import os, sys
+repo, sdir = sys.argv[1], sys.argv[2]
+if sdir:
+    sys.path.insert(0, sdir)
+try:
+    import hmd_ledger
+    sys.stdout.write(hmd_ledger.status_path_for(repo))
+except Exception:
+    pass
+PYOUT
+}
+if [ -n "${OUT_OVERRIDE:-}" ]; then
+  OUT="$OUT_OVERRIDE"
+elif [ -n "${HMD_STATUS_OUT:-}" ]; then
+  OUT="$HMD_STATUS_OUT"
+else
+  OUT="$(_default_out)"
+  [ -n "$OUT" ] || OUT="$HMD_HOME/ledger/status.json"
+fi
 VERDICT_FILE="${HMD_STATUS_VERDICT_FILE:-$REPO/.heimdall/verdict.json}"
 NOW="${HMD_STATUS_NOW:-$(date +%s 2>/dev/null || echo 0)}"
 
