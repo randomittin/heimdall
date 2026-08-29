@@ -190,3 +190,34 @@ evals/benchmark/results.jsonl
 # alone closes the recurrence hole — see test/heimdall-scratch-gitignore.test.sh.
 *.tmp.*
 *.[0-9]*.tmp
+
+# ── Credential filenames (security audit 2026-08-29, sub-finding under §4) ────
+# The gitleaks staged-diff gate (bin/secret-scan) already blocks a secret's
+# CONTENT at commit time. This is the second, independent layer: it stops the
+# FILE being staged at all. Defence in depth on purpose -- the scanner catches
+# what it recognizes, these rules catch the file regardless of what is inside.
+# Verified before adding: zero currently-tracked files match any rule here, so
+# nothing already in the repo is newly hidden by them.
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+!.env.dist
+*.pem
+*.p12
+*.pfx
+*.jks
+*.keystore
+id_rsa
+id_dsa
+id_ecdsa
+id_ed25519
+!*.pub
+credentials.json
+secrets.json
+service-account*.json
+# NOTE: no bare `*.key` rule. It collides with legitimate non-secret uses
+# (translation keys, fixture data, *.key template files) and this repo has none
+# tracked today -- a rule that starts silently hiding new files is worse than
+# the gap it closes. secret-scan still covers the content of any such file.
