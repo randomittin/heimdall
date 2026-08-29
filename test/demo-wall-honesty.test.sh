@@ -91,6 +91,15 @@ stamp_of() { stat -f '%N %m %z' "$1" 2>/dev/null || stat -c '%n %Y %s' "$1" 2>/d
 #     rate-limits' <path>.<pid>.tmp), falling back to the legacy
 #     ~/.heimdall/ledger/status.json only for an unmigrated install or an
 #     explicit HMD_STATUS_OUT/--out override.
+#   - the statusline's swarm_shared() (sentinels/hmd-statusline.py) opens
+#     ~/.heimdall/shared-memory.db read-only (`mode=ro`) every render to read
+#     bin/shared-memory's namespaced snapshot. SQLite's WAL protocol still
+#     requires a reader to record its lock in the -shm index and can touch
+#     -wal on transaction start/end, so shared-memory.db-shm's mtime advances
+#     on a fixed ~2s cadence (confirmed: `stat -f %m` on that file alone,
+#     sampled every 2s with nothing else running, ticks every sample) even
+#     though the connection never writes a row. The main .db file's content
+#     is untouched by this reader — only the two WAL side-files move.
 # A tmp+rename INSIDE a directory bumps that directory's OWN mtime too (not
 # just the file's) — so a bare `ls -lTd ~/.heimdall` before/after false-
 # positived on all of these, none of which have anything to do with the seeder
@@ -108,7 +117,9 @@ stamp_of() { stat -f '%N %m %z' "$1" 2>/dev/null || stat -c '%n %Y %s' "$1" 2>/d
 # gate. ctx/ and ledger/repos/ are the two subtrees excluded wholesale,
 # because each is inherently dynamic (a new file per Claude Code session, or
 # per repo on this machine, not a fixed name) — both are independently
-# hook/keeper-driven and the seeder never references either.
+# hook/keeper-driven and the seeder never references either. shared-memory.db
+# itself (the actual data) is NOT excluded — only its two WAL side-files are,
+# by exact name — so a real write of demo data into that DB still fails C3.
 home_heimdall_snapshot() {
   [ -d "$HOME/.heimdall" ] || return 0
   local rl="$HOME/.heimdall/rate-limits.json"
@@ -116,6 +127,8 @@ home_heimdall_snapshot() {
   local lgdir="$HOME/.heimdall/ledger"
   local lgrepos="$HOME/.heimdall/ledger/repos"
   local ctx="$HOME/.heimdall/ctx"
+  local smshm="$HOME/.heimdall/shared-memory.db-shm"
+  local smwal="$HOME/.heimdall/shared-memory.db-wal"
   find "$HOME/.heimdall" -mindepth 1 2>/dev/null | sort | while IFS= read -r f; do
     case "$f" in
       "$rl"|"$rl".*.tmp) continue ;;  # statusline rate-limit persister
@@ -124,6 +137,7 @@ home_heimdall_snapshot() {
       "$lgrepos"|"$lgrepos"/*) continue ;;  # heimdall-status-json persister (per-repo mirror:
                                              # dynamic per-repo filename, like ctx/ below)
       "$ctx"|"$ctx"/*) continue ;;    # per-session ctx-meter hook writes
+      "$smshm"|"$smwal") continue ;;  # statusline swarm_shared()'s read-only WAL reader lock
     esac
     stamp_of "$f"
   done
