@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# heimdall-scrub-claude-mem — SessionStart hook entry point for the C-1 fix.
+#
+# If claude-mem's worker daemon is CURRENTLY running with a contaminated (routing or
+# fallback-credential) environment, restart it clean — same argv, scrubbed env. Leaves an
+# already-clean daemon, or no daemon at all, untouched. See bin/lib/hmd-claude-mem-scrub.sh
+# for the full design and the reasoning behind what this deliberately does not do.
+#
+# Usage (wired from hooks.json SessionStart — see the coder's final report for the exact
+# entry, since hooks.json is not edited from here):
+#   bin/heimdall-scrub-claude-mem
+#
+# A SessionStart hook must never block the session over this: real errors are logged to
+# stderr, the process always exits 0. Run `hmd_claude_mem_scrub_if_contaminated` directly
+# (source the lib) if you need its distinguishing exit code (0=clean/absent, 1=scrubbed).
+set -uo pipefail
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$SELF_DIR/lib/hmd-claude-mem-scrub.sh"
+
+hmd_claude_mem_scrub_if_contaminated || true
+exit 0
