@@ -43,10 +43,14 @@
 #   2. The warning is ACTIONABLE: it names TaskStop (the cleanup the spawner now
 #      owns), the orphan-finder, the mailbox cause, and the no-result consequence.
 #   3. Nothing in the named-agent notice path blocks: no exit 2 anywhere in
-#      that code, on any input, ever. (The same delegate script also runs an
-#      unrelated brief-adoption gate with its own legitimate exit 2, for a
-#      NON_VERIFIED protocol store — a different concern, out of this
-#      suite's scope; structural checks below are scoped to exclude it.)
+#      that code, on any input, ever. (The same delegate script also runs one
+#      or more unrelated LATER sections — currently an adjudication fallback
+#      fence (Wave 1 Task 1.1) and a brief-adoption gate with its own
+#      legitimate exit 2, for a NON_VERIFIED protocol store — different
+#      concerns, out of this suite's scope; structural checks below scope to
+#      the named-agent section by stopping at the next section marker,
+#      whichever section that turns out to be, so a future section added the
+#      same way does not need this file edited again.)
 #   4. An ordinary unnamed spawn is silent — a warning on every spawn is noise,
 #      and noise gets muted, which is how a signal dies.
 #   5. HEIMDALL_ALLOW_NAMED_AGENT=1 SUPPRESSES the warning ("I know what I'm
@@ -372,14 +376,18 @@ $(cat "$refpath")"
   fi
 done
 
-# bin/heimdall-precheck-agent is DUAL-purpose: the named-agent notice (R13,
-# this suite) and an unrelated brief-adoption gate with its own legitimate
-# exit 2 (NON_VERIFIED protocol store) and its own jq calls. Checking the
-# whole resolved chain would let the brief-adoption gate's real exit 2 trip
-# the "no exit 2" assertion, and its unrelated jq calls would make the
-# printf|jq assertion pass no matter what the named-agent code does. Scope to
-# the named-agent section only, via the script's own section markers.
-NAMED_SECTION=$(sed -n '/^# -- named-agent notice -/,/^# -- brief-adoption gate -/p' <<<"$RESOLVED" | sed '$d')
+# bin/heimdall-precheck-agent is MULTI-purpose: the named-agent notice (R13,
+# this suite) plus one or more unrelated LATER sections — currently an
+# adjudication fallback fence (Wave 1 Task 1.1) ahead of a brief-adoption gate
+# — each with its own legitimate exit 2 (NON_VERIFIED protocol store, or an
+# adjudication-under-fallback deny) and its own jq calls. Checking the whole
+# resolved chain would let a later section's real exit 2 trip the "no exit 2"
+# assertion, and its unrelated jq calls would make the printf|jq assertion
+# pass no matter what the named-agent code does. Scope to the named-agent
+# section only, via the script's own section markers — stop at the FIRST
+# later marker, not a specific hardcoded one, so this stays correct no matter
+# which section ends up adjacent next.
+NAMED_SECTION=$(sed -n '/^# -- named-agent notice -/,/^# --/p' <<<"$RESOLVED" | sed '$d')
 
 if [ -z "$NAMED_SECTION" ]; then
   bad "could not isolate the named-agent-notice section from the resolved hook chain — structural checks below would be vacuous, skipping them"
@@ -393,8 +401,9 @@ else
 
   # The load-bearing downgrade assertion. A behavioural test can only sample the
   # payloads it thought of; this one proves no input at all can produce a block,
-  # in the named-agent path specifically — the delegate's unrelated
-  # brief-adoption gate has its own legitimate exit 2 and must not trip this.
+  # in the named-agent path specifically — the delegate's unrelated LATER
+  # sections (adjudication fallback fence, brief-adoption gate) have their own
+  # legitimate exit 2s and must not trip this.
   if grep -qE 'exit[[:space:]]+2' <<<"$NAMED_SECTION"; then
     bad "named-agent notice contains an 'exit 2' — some input path can still DENY a spawn over R13"
   else
