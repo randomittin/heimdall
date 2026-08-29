@@ -39,6 +39,16 @@
 #   HMD_CLAUDE_BIN              claude binary to invoke (default `claude`). TEST seam.
 #   HMD_OVERLOAD_LOG            log file (default $HEIMDALL_HOME/overload-heal.log).
 #   HEIMDALL_HOME               state home (default ~/.heimdall).
+#   HMD_429_MARK_BIN            bin/heimdall-429-mark override (default: sibling ../heimdall-429-mark). TEST seam.
+#
+# REACTIVE QUOTA-EXHAUSTION MARK (2026-08-30): a confirmed 429/rate-limit signal
+# (narrower than the overload marker above -- see _hmd_is_429_text) calls
+# bin/heimdall-429-mark, which bin/heimdall-session-usage reads as a bounded-TTL
+# crossed condition so the NEXT spawn routes to the fallback instead of
+# repeating the same failure. Best-effort: a missing/broken recorder cannot
+# affect this retry loop. See docs/analysis/2026-08-29-fallback-did-not-fire-
+# rootcause.md for why this exists and what it does not cover (in-process
+# Agent-tool spawns need the ORCHESTRATOR to call the recorder directly).
 
 # double-source guard (functions are idempotent; skip re-defining on re-source).
 [ -n "${_HMD_CLAUDE_RETRY_SH:-}" ] && return 0 2>/dev/null || true
@@ -60,6 +70,28 @@ _hmd_overload_log() {
 _hmd_is_overload_text() {
   printf '%s' "$1" | grep -qiE \
     '529|overloaded(_error)?|too many requests|429|rate.?limit|retrying( in)?|attempt[[:space:]]+[0-9]+/[0-9]+'
+}
+
+# NARROWER than _hmd_is_overload_text above, on purpose: this one gates the
+# reactive quota-exhaustion marker (bin/heimdall-429-mark), so it must isolate
+# a 429/rate-limit signal (account/session quota -- the ONLY thing that
+# marker should ever mean) from a bare "529"/"overloaded_error"/"retrying"/
+# "attempt N/M" signal (server capacity, unrelated to the operator's own
+# quota). A 529 recovery banner must never falsely arm the exhaustion marker.
+# See docs/analysis/2026-08-29-fallback-did-not-fire-rootcause.md.
+_hmd_is_429_text() {
+  printf '%s' "$1" | grep -qiE '429|too many requests|rate.?limit'
+}
+
+# resolve the recorder binary: env override (tests), else sibling of this
+# file's own bin/lib -> ../heimdall-429-mark (repo layout, not PATH lookup --
+# this file is sourced from arbitrary cwds).
+_hmd_429_mark_bin() {
+  if [ -n "${HMD_429_MARK_BIN:-}" ]; then
+    printf '%s' "$HMD_429_MARK_BIN"
+    return 0
+  fi
+  printf '%s/../heimdall-429-mark' "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 }
 
 # hmd_claude_retry <claude-args…> — invoke claude, retry transient overload with
@@ -97,6 +129,16 @@ $err"
       printf '%s\n' "$out"
       [ -n "$err" ] && printf '%s\n' "$err" >&2
       return "$rc"
+    fi
+
+    # overload confirmed. If it's specifically a 429/rate-limit signal (account
+    # quota, not generic server overload), record it: the NEXT spawn's
+    # heimdall-session-usage read picks this up as a reactive, TTL-bounded
+    # crossed condition (PHASE 4) instead of waiting on the statusline
+    # snapshot to catch up. Best-effort, defensively guarded -- a missing or
+    # broken recorder must never affect this retry loop either way.
+    if _hmd_is_429_text "$combined"; then
+      "$(_hmd_429_mark_bin)" mark --reason hmd-claude-retry >/dev/null 2>&1 || true
     fi
 
     # overload confirmed. budget exhausted? -> loud, distinct, non-silent give-up.
