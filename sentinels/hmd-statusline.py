@@ -2111,7 +2111,7 @@ def main():
     # cwd, not the process cwd) so Row3 reflects the real gate verdict — matching the
     # old gate_state(cwd) lookup. An explicit HEIMDALL_STATE (tests) always wins.
     os.environ.setdefault("HEIMDALL_STATE", os.path.join(cwd, ".heimdall", "statusline.json"))
-    ledger = LEDGER.read_status(session_id)
+    ledger = LEDGER.read_status(session_id, repo=cwd)
     gates = ledger.get("gates") or []
     tier = LAYOUT.width_tier(cols)
 
