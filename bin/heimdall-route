@@ -203,6 +203,45 @@ if [ -n "$FALLBACK_URL" ]; then
     fi
     unset _fbmodel
   fi
+  # Declare the fallback model's REAL context window. Claude Code does not recognize
+  # `oc/*` ids, so it warns on every routed launch and silently assumes 200k. Measured
+  # against the live gateway (`GET /v1/models` -> oc/big-pickle.context_length = 200000),
+  # that assumption is CORRECT -- nothing was ever being truncated. So this silences a
+  # false alarm; it does not change the window.
+  #
+  # Only set when the operator has not already chosen a value, and only from the value
+  # the gateway itself reports -- never a hardcoded guess, because a wrong number here
+  # would cause real truncation rather than a cosmetic warning. If the gateway cannot be
+  # asked, leave it unset and accept the warning: a noisy launch is strictly better than
+  # a fabricated context bound.
+  if [ -z "${CLAUDE_CODE_MAX_CONTEXT_TOKENS:-}" ] && [ -n "${ANTHROPIC_MODEL:-}" ]; then
+    _ctx="$(
+      _tf2="$(heimdall-fallback --repo "$PWD" token-file 2>/dev/null || true)"
+      [ -n "$_tf2" ] && [ -r "$_tf2" ] || exit 0
+      curl -s --max-time 5 -H "Authorization: Bearer $(cat "$_tf2")" \
+        "$FALLBACK_URL/v1/models" 2>/dev/null |
+      python3 -c '
+import json,sys,os
+want = os.environ.get("ANTHROPIC_MODEL","")
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for m in (d.get("data") or d.get("models") or []):
+    if str(m.get("id") or "") == want:
+        n = m.get("context_length")
+        if isinstance(n, int) and n > 0:
+            sys.stdout.write(str(n))
+        break
+' 2>/dev/null
+    )"
+    case "${_ctx:-}" in
+      ''|*[!0-9]*) : ;;
+      *) export CLAUDE_CODE_MAX_CONTEXT_TOKENS="$_ctx"
+         printf "  ${D}· fallback: declared context window %s (from the gateway's own /v1/models)${R}\n" "$_ctx" >&2 ;;
+    esac
+    unset _ctx
+  fi
   export ANTHROPIC_BASE_URL="$FALLBACK_URL"
   exec "$REAL" "$@"
 fi
