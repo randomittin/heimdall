@@ -941,7 +941,8 @@ def _session_pre_exhaustion_verdict(repo):
     if verdict not in SESSION_USAGE_VERDICTS:
         return "unknown", None
     window = payload.get("window") if isinstance(payload, dict) else None
-    if window not in ("five_hour", "seven_day", "both"):
+    if window not in ("five_hour", "seven_day", "both", "reactive_429",
+                       "five_hour+reactive_429", "seven_day+reactive_429", "all"):
         window = None
     return verdict, window
 
