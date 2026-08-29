@@ -153,13 +153,29 @@ cp "$REAL_CLASSES"/*.json "$MREG/_classes/"
 if [ "$HAVE_MANIFEST" -eq 1 ]; then
   mkdir -p "$MREG/omniroute"
   cp "$MANIFEST" "$MREG/omniroute/manifest.json"
+  # The shipped manifest declares a real preflight.disk_mb (16384 -- see
+  # docs/analysis/2026-08-29-omniroute-disk-footprint.md) that can legitimately
+  # exceed free space on a disk-constrained CI/test machine, and per
+  # module_preflight.sh a manifest-declared disk_mb always wins over
+  # HMD_PREFLIGHT_DISK_FLOOR_MB below. Overriding it here, once, up front --
+  # never deleting the key -- keeps every subtest exercising a manifest that
+  # still HAS a real preflight block (the true shape) while staying
+  # disk-size-independent, this suite's own stated intent (see
+  # HMD_PREFLIGHT_DISK_FLOOR_MB=1 above). MANIFEST_BASELINE, not $MANIFEST, is
+  # what restore_manifest() and every "byte-identical" check below compare
+  # against from this point on, since this override is a deliberate, explicit
+  # part of this run's baseline, not a mutation under test.
+  jq '.preflight.disk_mb = 1' "$MREG/omniroute/manifest.json" > "$MREG/omniroute/m.tmp" \
+    && mv "$MREG/omniroute/m.tmp" "$MREG/omniroute/manifest.json"
+  MANIFEST_BASELINE="$MREG/omniroute/manifest.baseline.json"
+  cp "$MREG/omniroute/manifest.json" "$MANIFEST_BASELINE"
 fi
 # headroom rides along in the same temp registry for the O3 contrast — it is
 # real, shipped, default_included:true, consent_waived:true.
 mkdir -p "$MREG/headroom"
 cp "$REAL_REG/headroom/manifest.json" "$MREG/headroom/manifest.json"
 
-restore_manifest() { cp "$MANIFEST" "$MREG/omniroute/manifest.json"; }
+restore_manifest() { cp "$MANIFEST_BASELINE" "$MREG/omniroute/manifest.json"; }
 mutate_manifest() {
   # "$@", not "$1" — some call sites need jq's --arg form (`mutate_manifest
   # --arg id "$FIRST_ID" 'del(.invariants[$id])'`), which is more than one
@@ -209,7 +225,7 @@ else
     && ok "RED ARM: the mutated copy now reads consent_waived:true — the check discriminates" \
     || bad "the mutation did not take on consent_waived"
   restore_manifest
-  [ "$(sha_file "$MANIFEST")" = "$(sha_file "$MREG/omniroute/manifest.json")" ] \
+  [ "$(sha_file "$MANIFEST_BASELINE")" = "$(sha_file "$MREG/omniroute/manifest.json")" ] \
     && ok "GREEN ARM: restored — the working copy is byte-identical to the shipped manifest again" \
     || bad "restore did not return the copy to the shipped bytes"
 fi
@@ -313,7 +329,7 @@ else
     && bad "the waived copy still prompted" || ok "the waived copy is not prompted"
   "$MODS" --registry "$MREG" --state "$FSTATE" remove omniroute >/dev/null 2>&1
   restore_manifest
-  [ "$(sha_file "$MANIFEST")" = "$(sha_file "$MREG/omniroute/manifest.json")" ] \
+  [ "$(sha_file "$MANIFEST_BASELINE")" = "$(sha_file "$MREG/omniroute/manifest.json")" ] \
     && ok "GREEN ARM: restored — the copy is byte-identical to the shipped manifest again" \
     || bad "restore did not return the copy to the shipped bytes"
 fi
@@ -439,7 +455,7 @@ else
   else
     bad "could not find a manifest-kind traffic-proxy invariant covered by the shipped manifest to falsify against"
   fi
-  [ "$(sha_file "$MANIFEST")" = "$(sha_file "$MREG/omniroute/manifest.json")" ] \
+  [ "$(sha_file "$MANIFEST_BASELINE")" = "$(sha_file "$MREG/omniroute/manifest.json")" ] \
     && ok "GREEN ARM: restored — the working copy is byte-identical to the shipped manifest again" \
     || bad "restore did not return the copy to the shipped bytes"
 fi
